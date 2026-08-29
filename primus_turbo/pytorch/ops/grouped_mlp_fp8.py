@@ -12,6 +12,7 @@ from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     ScalingGranularity,
+    ScalingRecipe,
 )
 from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensor,
@@ -168,7 +169,10 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
                 block_size=config.block_size,
             )
 
-        fc1_act, fc1_out = grouped_gemm_fp8_glu_impl(
+        # The activation is quantised inside the GLU op: it feeds nothing but the
+        # quantiser, so it stages there rather than here, where a later kernel can fold
+        # the conversion into the epilogue and drop the [M, I] round trip for good.
+        fc1_out, act_fp8, act_scale_inv = grouped_gemm_fp8_glu_impl(
             quantized_x.qdata,
             quantized_w1.qdata,
             quantized_x.scale_inv,
@@ -178,25 +182,19 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
             trans_a=False,
             trans_b=trans_w1,
             out_dtype=out_dtype,
-            granularity=config.granularity.value,
             num_cu=num_cu,
-            activation=activation,
             probs=probs,
-        )
-
-        quantized_act = QuantizedTensor.quantize(
-            fc1_act,
-            x_dtype,
-            config.granularity,
-            axis=-1,
-            block_size=config.block_size,
-            group_lens=group_lens,
+            config=config,
+            out_quant_dtype=x_dtype,
+            out_row_scaling_recipe=ScalingRecipe(),
+            out_col_scaling_recipe=ScalingRecipe(),
+            activation=activation,
         )
 
         fc2_out = grouped_gemm_fp8_impl(
-            quantized_act.qdata,
+            act_fp8,
             quantized_w2.qdata,
-            quantized_act.scale_inv,
+            act_scale_inv,
             quantized_w2.scale_inv,
             group_lens,
             group_offs,
@@ -211,11 +209,11 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
 
         ctx.save_for_backward(
             quantized_x.qdata,
-            quantized_act.qdata,
+            act_fp8,
             quantized_w1.qdata,
             quantized_w2.qdata,
             quantized_x.scale_inv,
-            quantized_act.scale_inv,
+            act_scale_inv,
             quantized_w1.scale_inv,
             quantized_w2.scale_inv,
             fc1_out,
@@ -287,9 +285,9 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
         )
 
         # fc2 dgrad (grad_out @ w2^T) with the activation gradient fused into its
-        # epilogue, giving the pre-activation gradient directly. The probs
+        # epilogue, giving the pre-activation gradient directly, quantised. The probs
         # scaling and grad_probs both ride along inside that epilogue.
-        grad_fc1_out, grad_probs = grouped_gemm_fp8_dglu_impl(
+        grad_probs, grad_fc1_out_fp8, grad_fc1_out_scale_inv = grouped_gemm_fp8_dglu_impl(
             quantized_grad_out.qdata,
             w2_fp8,
             quantized_grad_out.scale_inv,
@@ -299,27 +297,21 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
             trans_a=False,
             trans_b=not ctx.trans_w2,
             out_dtype=ctx.out_dtype,
-            granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
-            activation=ctx.activation,
             probs=probs,
             intermediate=fc1_out,
-        )
-
-        quantized_grad_fc1_out = QuantizedTensor.quantize(
-            grad_fc1_out,
-            grad_out_dtype,
-            ctx.config.granularity,
-            axis=-1,
-            block_size=ctx.config.block_size,
-            group_lens=group_lens,
+            config=ctx.config,
+            out_quant_dtype=grad_out_dtype,
+            out_row_scaling_recipe=ScalingRecipe(),
+            out_col_scaling_recipe=ScalingRecipe(),
+            activation=ctx.activation,
         )
 
         # grad_x = grad_fc1_out @ w1^T
         grad_x = grouped_gemm_fp8_impl(
-            quantized_grad_fc1_out.qdata,
+            grad_fc1_out_fp8,
             w1_fp8,
-            quantized_grad_fc1_out.scale_inv,
+            grad_fc1_out_scale_inv,
             w1_scale_inv,
             group_lens,
             group_offs,
@@ -334,9 +326,9 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
         # grad_w1 = x^T @ grad_fc1_out
         grad_w1 = _grouped_gemm_fp8_variable_k_impl_wrapper(
             x_fp8,
-            quantized_grad_fc1_out.qdata,
+            grad_fc1_out_fp8,
             x_scale_inv,
-            quantized_grad_fc1_out.scale_inv,
+            grad_fc1_out_scale_inv,
             group_lens,
             group_offs,
             trans_a=True,

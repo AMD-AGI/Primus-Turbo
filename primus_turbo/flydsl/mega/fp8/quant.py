@@ -59,9 +59,9 @@ from flydsl.expr.typing import Vector as Vec
 from primus_turbo.flydsl.utils.gemm_helper import (
     _PRESHUF_KT,
     build_preshuffle_ab_kernel,
-    ceildiv,
     run_compiled,
 )
+from primus_turbo.flydsl.utils.prims import ceildiv
 
 MXFP8_BLOCK = 32  # mxfp8 block (elements per E8M0 scale)
 MXFP8_VEC = 8  # sub-vector width for the bf16 load / f32 compute

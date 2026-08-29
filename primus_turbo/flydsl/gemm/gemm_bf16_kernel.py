@@ -29,7 +29,6 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     S2RLoaderBf16,
     S2RLoaderTrBf16,
     StoreCBf16,
-    ceildiv,
     compute_global_swizzle_bf16,
     compute_global_swizzle_nn_bf16,
     make_fp16_bf16_buffer_tensor,
@@ -37,6 +36,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     wait_barrier,
     xcd_remap_pid,
 )
+from primus_turbo.flydsl.utils.prims import ceildiv
 
 # isort: on
 

@@ -58,6 +58,7 @@ show_missing = true
 omit = [
     "primus_turbo/triton/*",
     "primus_turbo/flydsl/*",
+    "primus_turbo/gluon/*",
 ]
 
 [tool.coverage.paths]

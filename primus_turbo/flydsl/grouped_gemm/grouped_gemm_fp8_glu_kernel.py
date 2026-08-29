@@ -130,7 +130,7 @@ def _autotune_glu(build, cands, mk_probe):
     return best
 
 
-def grouped_gemm_fp8_glu_tensorwise_flydsl_kernel(
+def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
     a: "torch.Tensor",
     b: "torch.Tensor",
     a_scale: "torch.Tensor",
@@ -291,7 +291,7 @@ class GradProbsPartialSpec(NamedTuple):
 def grouped_gemm_fp8_dglu_grad_probs_partial_spec(
     a: "torch.Tensor", b: "torch.Tensor"
 ) -> GradProbsPartialSpec:
-    """The buffer :func:`grouped_gemm_fp8_dglu_tensorwise_flydsl_kernel` expects.
+    """The buffer :func:`grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel` expects.
 
     ``grad_probs_partial.sum(0)`` is the gradient wrt ``probs``. Allocating and
     folding stay with the caller, so this module owns neither.
@@ -314,7 +314,7 @@ def grouped_gemm_fp8_dglu_grad_probs_partial_spec(
     return GradProbsPartialSpec(shape=(n_blocks * 2, M_total), needs_zero=True)
 
 
-def grouped_gemm_fp8_dglu_tensorwise_flydsl_kernel(
+def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
     a: "torch.Tensor",
     b: "torch.Tensor",
     a_scale: "torch.Tensor",

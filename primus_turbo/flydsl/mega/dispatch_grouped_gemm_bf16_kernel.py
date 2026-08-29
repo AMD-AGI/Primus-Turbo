@@ -37,7 +37,6 @@ from primus_turbo.flydsl.mega.dispatch_prologue_kernel import (
     dispatch_prologue_flydsl_kernel,
 )
 from primus_turbo.flydsl.mega.ep_intranode import _BLOCK_THREADS, dispatch_bf16_tile
-from primus_turbo.flydsl.mega.prims import cast, ld, read_clock, spin_timed_out
 from primus_turbo.flydsl.mega.symm_buffer import (
     TOKEN_DTYPE,
     SymBuffer,
@@ -53,6 +52,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     make_value_attrs,
     xcd_remap_pid,
 )
+from primus_turbo.flydsl.utils.prims import cast, ld, read_clock, spin_timed_out
 
 
 @functools.lru_cache(maxsize=1)

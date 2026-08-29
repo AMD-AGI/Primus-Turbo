@@ -128,7 +128,7 @@ python benchmark/ops/training/bench_mega_moe.py --mode grouped_gemm_combine --mo
 | Dispatch + grouped GEMM kernel | `primus_turbo/flydsl/mega/dispatch_grouped_gemm_bf16_kernel.py` |
 | Grouped GEMM + combine kernel | `primus_turbo/flydsl/mega/grouped_gemm_combine_bf16_kernel.py` |
 | Dispatch prologue (routing tables) | `primus_turbo/flydsl/mega/dispatch_prologue_kernel.py` |
-| SwiGLU fwd/bwd | `primus_turbo/flydsl/mega/swiglu_kernel.py` |
+| SwiGLU fwd/bwd | `primus_turbo/flydsl/utils/swiglu_kernel.py` |
 | Cross-rank tiles (dispatch/combine/reduce) | `primus_turbo/flydsl/mega/ep_intranode.py` |
 
 ## Acknowledgements
