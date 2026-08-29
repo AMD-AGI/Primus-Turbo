@@ -267,6 +267,12 @@ def patch(arm):
     elif arm == "nofill":  # PRICING ONLY (dQ wrong): the a16 image zeroing off, odo pass kept
         odo = bwd.build_flash_attn_bwd_odo_module
         bwd.build_flash_attn_bwd_odo_module = lambda **kw: odo(**{**kw, "fill_img": False})
+    elif arm == "noperm":  # PRICING ONLY (dQ wrong): the a16 un-permute pass dropped
+        bwd._unpermute_dq_a16 = lambda *a2, **kw: None
+    elif arm == "noatom":  # PRICING ONLY (dQ wrong): a16's atomics become stores, same bytes
+        bwd._A16_NOATOM = 1
+    elif arm == "qtratom":  # PRICING ONLY (dQ wrong): the a16 atomic stream at 1/4 its bytes
+        bwd._A16_NOATOM = 2
     elif arm.startswith("mod:"):  # module-level constants (e.g. mod:_A16_UC=2)
         for kv in arm[4:].split(","):
             k, v = kv.split("=")

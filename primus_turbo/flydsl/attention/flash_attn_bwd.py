@@ -57,6 +57,10 @@ _LOG2E = host_math.log2(host_math.e)
 # A whole campaign read that 2x as a kernel bug. Warm, the touch map is 1,2,3,...,n_bands per
 # q block: the emission is a perfect causal partition and always was.
 _A16_TAG = int(_dbg_os.environ.get("PT_A16_TAG", "0"))
+# PRICING ONLY (dQ wrong): emit the a16 dQ payload as a plain store at the SAME addresses,
+# so the arm subtracts the TCC read-modify-write and keeps every issued byte. The gap
+# between it and the deployed atomic is the whole price of accumulating in place.
+_A16_NOATOM = int(_dbg_os.environ.get("PT_A16_NOATOM", "0"))
 # Warp specialisation (splitting the head-step across a wave pair by role) is
 # register-walled: each role's live set needs more than half the 512-dword pool, so the
 # pair cannot co-reside two waves per SIMD, and no register donor closes the gap.
@@ -96,6 +100,10 @@ _MFMA_TIE_CONS = ("=a,v,v,0", "=a,a,v,0", "=a,v,a,0", "=v,v,v,0", "=a,a,a,0")
 # is VGPR-lean, so it is disabled here. On the four-wave fused body it is not even a
 # knob -- the compiler's own split is already byte-identical across the range tried.
 _DKDV_AGPR = 0
+
+# GEMM3 kstep prefetch ring depth that covers a whole BLOCK_KV=256 band (256/PV_K_STEP).
+# The builder clamps g3d to G3_KSTEPS, so this asks for "the entire band in flight".
+_G3D_FULL_BAND = 8
 
 # Pads dQ split-K band groups off a power-of-two stride so QDESC's same-row groups do not co-alias. D128 only.
 _WSQ_BAND_PAD = 1 << 20
@@ -3551,6 +3559,17 @@ def build_flash_attn_bwd_dkdv_module(
                                 [fx.Int32((0x4000 + (_w // 2) * 16 + 2 * (_w % 2)) * 0x10001)],
                                 fx.Int32,
                             ).broadcast_to(4)
+                        if const_expr(_A16_NOATOM == 2 and _w):
+                            continue  # PRICING ONLY: the dQ stream at a quarter of its bytes
+                        if const_expr(_A16_NOATOM == 1):
+                            buffer_ops.buffer_store(
+                                _pk.shuffle(_pk, [_w]).bitcast(elem_dtype).ir_value(),
+                                wsq16_rsrc,
+                                _raw(_a16),
+                                offset_is_bytes=True,
+                                soffset_bytes=_step * _w,
+                            )
+                            continue
                         rocdl.raw_ptr_buffer_atomic_fadd(
                             _pk.shuffle(_pk, [_w]).bitcast(elem_dtype).ir_value(),
                             wsq16_rsrc,
@@ -6292,15 +6311,29 @@ def _get_bwd(
             # store registers are gone): +0.46% on the folded D64 body, -0.62% here (four
             # readings, two independent batches, every one below its own control).
             mfma_tie=2 if a16 else 0,
-            # The tied dK chain's A operand goes to the A heap too ("=a,a,v,0"): outputs are
-            # bit-identical, but the transpose fragment it reads no longer has to be
-            # materialised in the arch heap for that one use. Screened per constraint at THIS
-            # allocation -- the other spellings spill or cost instructions.
-            mfma_tie_cons=1 if a16 else 0,
+            # The tied dK chain's A operand class, screened per constraint at THIS allocation.
+            # D128 keeps "=a,a,v,0": the transpose fragment it reads no longer has to be
+            # materialised in the arch heap for that one use, which its full file needs.
+            # D64's file is not full, and there the plain "=a,v,v,0" is strictly the better
+            # allocation -- 459/203 against 461/205, 12793 instructions against 12833, 175
+            # v_accvgpr_read against 185, spill 0 either way, outputs bit-identical. The
+            # remaining three spellings all cost: "=a,v,a,0" and "=a,a,a,0" push
+            # v_accvgpr_write past 830, and "=v,v,v,0" (a VGPR accumulator) is worse still at
+            # 308 reads plus 180 v_accvgpr_mov. Four readings across two drift-corrected
+            # batches, every one below its own control, mean -0.39%.
+            mfma_tie_cons=(1 if D == 128 else 0) if a16 else 0,
             g3_dbat=2 if (_fuse_d128 and not _pair) else None,
             g3_kreg=_fuse_wide and not _pair,
             k_reg=not _pair,
-            g3d=2 if _pair else None,
+            # GEMM3's kstep prefetch ring. _pair keeps its screened depth 2; on the D64 a16
+            # body ask for the FULL band (the builder caps g3d at G3_KSTEPS), so every one of
+            # the band's transpose-reads is in flight before the first is consumed. This is
+            # the one arm of the "hold more fragments in flight" family the D64 register file
+            # funds for nothing: the dkdv ISA comes back 461 vgpr / 205 agpr / spill 0 with
+            # only the schedule moved (md5 differs, instruction mix does not), where pf_ring
+            # is +29.9% and dma_grp=2 does not build. Depth 6 -> 8 is -0.24% over five
+            # drift-corrected pairs. D128's file is full and keeps the default depth.
+            g3d=2 if _pair else (_G3D_FULL_BAND if (a16 and D == 64) else None),
             # The dQ partial store is this path's one uncovered burst: emitted inside GEMM3 it
             # lands where the carrier wave has no MFMA left to hide it, and at one wave per SIMD
             # there is no sibling wave to cover it either. Hand it to the head-step hook instead,
