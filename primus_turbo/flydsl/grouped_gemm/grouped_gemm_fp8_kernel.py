@@ -74,6 +74,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     resolve_accum_out,
     shear_mbias,
     spin_flag_eq,
+    store_quadrants_peeled,
     wait_barrier,
     xcd_remap_pid,
     xcd_remap_pid_u,
@@ -101,9 +102,12 @@ _WG_INTERLEAVE = True
 
 # Epilogue store schedules for the grouped NT/NN bodies (`nt_esplit`/`nn_esplit`, see
 # _store_split): the tile's four accumulator quadrants (0=c00, 1=c01, 2=c10, 3=c11) split into
-# barrier-separated store batches. 0 reproduces the single 128-store burst; 4 is the deployed one.
+# barrier-separated store batches. The batch order is column-band major in all of them; what
+# differs is how many barriers align the eight waves' write streams. 0 is one burst; 3 keeps
+# only the barrier at the column-band jump; 4 also splits the two row halves of a band.
 _NN_E_SCHED = {
     0: ((), (0, 2, 1, 3)),
+    3: ((), (0, 2), (1, 3)),
     4: ((), (0,), (2,), (1,), (3,)),
 }
 # Cache-policy immediate for a row-merged C store (sc0 | nt): keeps write-once output out of L2
@@ -923,7 +927,7 @@ def _compile_grouped_nt(
     cap_cu: int = -1,  # >0: cap grid to this many WGs (= reserve device CUs for comm-compute overlap). <=0: use the full device CU count.
     N: int = 0,  # compile-time output width (0 = unknown): lets _col_safe prove the epilogue's column OOB select dead. Part of the autotune cache key
     n_stride: int = 0,  # >0: padded N row-count pitch for B_T (stored at [G,n_stride,KS], real width fed via N/c_n)
-    nt_esplit: int = 4,  # epilogue store schedule (see _NN_E_SCHED), the twin of the NN dgrad's nn_esplit. 0 = one 128-store burst
+    nt_esplit: int = 3,  # epilogue store schedule (see _NN_E_SCHED), the twin of the NN dgrad's nn_esplit. NT wants one barrier per column band; the NN twin wants one per quadrant. 0 = one 128-store burst
     beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
     glu: bool = False,  # fuse a SwiGLU epilogue: B_T is [2I, K] gate||up, the tile pairs the two bands in registers and writes l1 [M,2I] + act [M,I]
     glu_i: int = 0,  # gate half width I (required when glu); N is this same I, i.e. the activation's width
@@ -1906,24 +1910,65 @@ def _grouped_block_mn(
 
 _WGRAD_XCD_HW = 8  # gfx950 dispatcher: workgroup bid runs on XCD bid % _WGRAD_XCD_HW
 _WGRAD_XCD_RCP_SHIFT = 16  # fixed-point reciprocal of the compile-time swizzle divisors
+# A width-w band re-reads its w rhs column slabs on every row, so they have to fit the XCD's own
+# L2 slice: w * BLOCK_N * rows_per_group <= 4 MB gives w <= 4 at the sizes this operator runs.
+_WGRAD_XCD_BAND_MAX = 4
+
+
+def _wgrad_rcp_ok(d, xmax):
+    """True when ``_wgrad_xcd_div``'s fixed-point reciprocal for ``d`` is exact over [0, xmax].
+    The geometry search has to replay this: an inexact rectangle trips the assert while tracing,
+    which surfaces as a build abort with no fallback rather than as a slow candidate."""
+    if d <= 0 or xmax < 0:
+        return False
+    m = -(-(1 << _WGRAD_XCD_RCP_SHIFT) // d)
+    return all((v * m) >> _WGRAD_XCD_RCP_SHIFT == v // d for v in range(xmax + 1))
+
+
+def _wgrad_xcd_geom_ok(h, w, n_blocks_m, tiles_per_group, gp=1, nxcd=_WGRAD_XCD_HW):
+    """All three of ``_wgrad_xcd_tile``'s compile-time divisors admit an exact reciprocal."""
+    per, rem = divmod(gp * tiles_per_group, nxcd)
+    k = nxcd // gp
+    cbs, bsz = n_blocks_m * w, h * w
+    return (
+        _wgrad_rcp_ok(cbs, per * k + rem)
+        and _wgrad_rcp_ok(bsz, cbs - 1)
+        and (h == 1 or _wgrad_rcp_ok(h, bsz - 1))
+    )
 
 
 def _wgrad_xcd_aff_geom(n_blocks_m, n_blocks_n, tiles_per_group, nxcd=_WGRAD_XCD_HW):
     """(h, w) for the XCD-affine wgrad swizzle, or None when the grid is too small. Reorders each
     XCD's residue class into a contiguous width-w column band (h>1 reuses A-slabs); the rectangle's
-    two sides are CONCURRENT operand streams, so its run is set by the LARGER side, not their sum."""
+    two sides are CONCURRENT operand streams, so its run is set by the LARGER side, not their sum.
+
+    Width is capped at ``_WGRAD_XCD_BAND_MAX`` for L2 capacity. Two shapes the cap alone gets
+    wrong, both measured: it drops to a width-1 band when ``n_blocks_n`` has no other divisor
+    under the cap, and it settles for a narrower band when its own optimum has no exact
+    reciprocal. Either is worse than the uncapped band, so both fall back."""
     sz = tiles_per_group // nxcd
     if sz < 2 or n_blocks_m < 2 or n_blocks_n < 2:
         return None
-    best = None
-    for w in (d for d in range(1, n_blocks_n + 1) if n_blocks_n % d == 0):
-        rows = min(n_blocks_m, -(-sz // w))
-        cols = w * -(-sz // (n_blocks_m * w))
-        key = (max(rows, cols), rows + cols, w)
-        if best is None or key < best[0]:
-            best = (key, w, rows)
-    _, w, rows = best
-    return (2 if w > 1 and rows % 2 == 0 and n_blocks_m % 2 == 0 else 1), w
+
+    def _best(cap, legal):
+        best = None
+        for w in (d for d in range(1, min(n_blocks_n, cap) + 1) if n_blocks_n % d == 0):
+            rows = min(n_blocks_m, -(-sz // w))
+            cols = w * -(-sz // (n_blocks_m * w))
+            h = 2 if w > 1 and rows % 2 == 0 and n_blocks_m % 2 == 0 else 1
+            if legal and not _wgrad_xcd_geom_ok(h, w, n_blocks_m, tiles_per_group, nxcd=nxcd):
+                continue
+            # Ties break to the WIDER band: under the cap several widths can score the same
+            # rectangle, and the narrow end of such a tie is the measured-worst arm.
+            key = (max(rows, cols), rows + cols, -w)
+            if best is None or key < best[0]:
+                best = (key, h, w)
+        return best
+
+    capped, ideal = _best(_WGRAD_XCD_BAND_MAX, True), _best(_WGRAD_XCD_BAND_MAX, False)
+    if capped is None or capped[2] == 1 or (ideal is not None and capped[2] != ideal[2]):
+        capped = _best(n_blocks_n, True)
+    return None if capped is None else (capped[1], capped[2])
 
 
 def _wgrad_band_is_xcd_aff(n_blocks_m, n_blocks_n, group_m, group_n, nxcd=_WGRAD_XCD_HW):
@@ -2747,6 +2792,7 @@ def _wholeloop_asm_3buf(
     b_halves=2,  # 2 = full 256-col tile (b0,b1); 1 = b0-only (skip fully-masked b-half1 + c01/c11)
     nval_can_be_zero=False,  # variable-K: guard the do-while main loop with an nval==0 entry
     # branch so groups shorter than n_phases run only the fused tail (no wasted K-blocks).
+    return_frags=False,  # also hand back the last phase's refilled srcA/srcB frags (peel-last)
 ):
     from functools import reduce
     from math import gcd
@@ -3054,7 +3100,14 @@ def _wholeloop_asm_3buf(
 
     r = _llvm.inline_asm(ir.Type.parse(st), ins, asm, cons, has_side_effects=True)
     o = [Vec(_llvm.extractvalue(ir.Type.parse("vector<4xf32>"), r, [q])) for q in range_constexpr(NT)]
-    return [o[qi * nq : (qi + 1) * nq] for qi in range(n_quads)]
+    acc_out = [o[qi * nq : (qi + 1) * nq] for qi in range(n_quads)]
+    if not return_frags:
+        return acc_out
+    # Every phase ends by refilling the frags for the block AFTER the ones it accumulated, so on
+    # exit they hold K-block nval+tail_nval -- the block the caller peeled off the trip count.
+    _fty = ir.Type.parse("vector<8xi32>")
+    frags = [Vec(_llvm.extractvalue(_fty, r, [NT + f])) for f in range_constexpr(ntmp)]
+    return acc_out, frags
 
 
 def _wholeloop_tile_3buf(
@@ -3100,8 +3153,11 @@ def _wholeloop_tile_3buf(
     a_halves=2,  # 2 = full a0+a1; 1 = a0-only (last <=128-valid M-block boundary skip)
     b_halves=2,  # 2 = full b0+b1; 1 = b0-only (last <=128-valid N-block boundary skip)
     nval_can_be_zero=False,  # see _wholeloop_asm_3buf
+    peel_last=False,  # caller dropped one K-block from nval/tail_nval; emit it here with the store
+    peel_lag=1,  # row-tiles the peeled C store trails its own MFMAs by
 ):
     assert not a_plain or a_row_stride is not None, "a_plain=True requires a_row_stride"
+    assert not peel_last or do_store, "peel_last emits the store"
     assert a_halves in (1, 2) and b_halves in (1, 2)
     a_cur0, a_cur1 = lds.A_lds_cur_0, lds.A_lds_cur_1
     a_next0, a_next1 = lds.A_lds_next_0, lds.A_lds_next_1
@@ -3213,7 +3269,26 @@ def _wholeloop_tile_3buf(
         a_halves=a_halves,
         b_halves=b_halves,
         nval_can_be_zero=nval_can_be_zero,
+        return_frags=peel_last,
     )
+    if peel_last:
+        res, frags = res
+        store_quadrants_peeled(
+            mfma,
+            store_c,
+            res,
+            frags,
+            nta,
+            ntb,
+            a_halves,
+            b_halves,
+            base_row,
+            base_col,
+            lds_block_m,
+            lds_block_n,
+            lag=peel_lag,
+        )
+        return res
     if not do_store:
         return res
     if a_halves == 2 and b_halves == 2:
@@ -3297,6 +3372,7 @@ def _wave4_do_tile_tn(
     C_M=None,
     C_N=None,
     cstore_aux=-1,
+    wl_peel=0,  # 0 = off; N = peel the last K-block and trail its C store by N row-tiles
 ):
     # Pad-both: A/B stay at padded OUT_M/OUT_N; C is written at the tight C_M/C_N (else padded).
     if C_M is None:
@@ -3357,6 +3433,15 @@ def _wave4_do_tile_tn(
             _buffer_ops.extract_base_index(WS)
             + arith.index_cast(T.index, _shift) * arith.index(C_N * _obytes),
             _buffer_ops.extract_base_index(C),
+        )
+    # Peel-last: the final K-block leaves the whole loop and is re-emitted in the epilogue so the
+    # C store hides in its MFMA shadow. A beta=1 body keeps the pipelined read-back epilogue.
+    _peel = wl_peel > 0 and not swap_n and not beta_is_one and fold_band is None
+    if _peel:
+        # An empty group has k_iters==0; the peeled block then reads the prologue's out-of-range
+        # g2s, which lands zeros in LDS exactly as a short final K-block already relies on.
+        k_iters = fx.Int32(
+            _readfirstlane_i32(arith.select(k_iters > fx.Int32(0), k_iters - fx.Int32(1), fx.Int32(0)))
         )
     # main loop takes the largest multiple of 6; the remainder (0..5) is the in-asm fused tail.
     n6 = (k_iters // 6) * 6
@@ -3508,6 +3593,8 @@ def _wave4_do_tile_tn(
         a_halves=a_halves,
         b_halves=b_halves,
         nval_can_be_zero=True,  # variable-K: groups with k_iters<6 run tail-only
+        peel_last=_peel,
+        peel_lag=wl_peel,
     )
 
 
@@ -3723,6 +3810,7 @@ def _compile_grouped_tn_wgrad_4wave(
     n_real: int = 0,  # >0: real K extent; with c_tight, C collapses onto [G, m_real, n_real]
     c_tight: bool = False,  # C output has the real (tight) pitch, not the padded OUT_M/OUT_N
     cstore_aux: int = -1,  # cache-policy aux for the dW C store: -1 = pick from the store width (see _store_aux), 0 = default policy
+    wl_peel: int = 1,  # peel the last K-block out of the whole loop; N = C store lags N row-tiles
     _probe: int = 0,
 ):
     """4-wave (occ=1) grouped TN wgrad dW[g]=A[g]^T@B[g], variable-K per group. 256x256
@@ -3780,13 +3868,19 @@ def _compile_grouped_tn_wgrad_4wave(
             and N_BLOCKS_M % group_m == 0
             and N_BLOCKS_N % group_n == 0
             and group_m * group_n <= TILES_PER_GROUP // _XCD_K
+            and _wgrad_xcd_geom_ok(group_m, group_n, N_BLOCKS_M, TILES_PER_GROUP, _XCD_GP, _XCD_K)
         ), f"bad xcd_aff geometry ({group_m},{group_n}) for {N_BLOCKS_M}x{N_BLOCKS_N}"
     _TILE_ROT = 0 if _XCD_AFF is not None else (_WG_TILE_ROT if TILES_PER_GROUP > _WG_TILE_ROT else 0)
     # Split pieces run the plain map over a single group, so their band spans all XCDs (gp=1). A
     # piece is the whole of a cut launch's work and wants its own tile->XCD rectangle: the band
     # tuned for the plain tiles is not the one that suits a piece (measured, collapsed-only).
     _HEAD_HW = _WGRAD_HEAD_HW or (group_m, group_n)
-    if N_BLOCKS_M % _HEAD_HW[0] or N_BLOCKS_N % _HEAD_HW[1] or TILES_PER_GROUP % (_HEAD_HW[0] * _HEAD_HW[1]):
+    if (
+        N_BLOCKS_M % _HEAD_HW[0]
+        or N_BLOCKS_N % _HEAD_HW[1]
+        or TILES_PER_GROUP % (_HEAD_HW[0] * _HEAD_HW[1])
+        or not _wgrad_xcd_geom_ok(*_HEAD_HW, N_BLOCKS_M, TILES_PER_GROUP)
+    ):
         _HEAD_HW = (group_m, group_n)  # the override must tile the grid; otherwise keep the band
     _HEAD_AFF = (*_HEAD_HW, 1) if _XCD_AFF is not None else None
     _HEAD_ROT = _HEAD_AFF is not None and _WGRAD_HEAD_ROT and _wgrad_xcd_rot_ok(TILES_PER_GROUP, 1)
@@ -4014,6 +4108,7 @@ def _compile_grouped_tn_wgrad_4wave(
                 C_M=_C_M,
                 C_N=_C_N,
                 cstore_aux=cstore_aux,
+                wl_peel=wl_peel,
             )
 
         # The tile id travels as an ARGUMENT and every dynamic branch body holds a CALL only: a
@@ -4536,9 +4631,17 @@ def _wgrad_4wave_cands(OUT_M, OUT_N, G, ncu, block=256):
         # several groups absorbed the extra operand rows; with one group per super-block it goes LAST
         # and must beat the geometry by the hysteresis rather than winning on dispatch order.
         h = 2 * aff[0]
-        if n_blocks_m % h == 0 and h * aff[1] <= tiles_per_group // xcd_k:
+        if (
+            n_blocks_m % h == 0
+            and h * aff[1] <= tiles_per_group // xcd_k
+            and _wgrad_xcd_geom_ok(h, aff[1], n_blocks_m, tiles_per_group, nxcd=xcd_k)
+        ):
             cands += ((h, aff[1], 1, 1, 3, True),)
-    return cands
+        # The short last-M-block body is worth 1.4% on the capped affine head at OUT_M=5760 --
+        # just inside _WGRAD_RACE_MARGIN, so the race picks it only some runs. Lead with it and
+        # keep the gated head as a challenger that must beat the margin (pitfalls/06 static lead).
+        cands = (aff_c + (3, True),) + cands
+    return tuple(dict.fromkeys(cands))
 
 
 def _autotune_wgrad_dispatch(

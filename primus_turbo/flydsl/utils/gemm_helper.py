@@ -823,16 +823,25 @@ class StoreCPerTensor:
             add = fx.Float32(arith.select(_raw(self.accum_mask), _raw(add), _raw(fx.Float32(0.0))))
         return val + add
 
-    def store(self, c_frag, base_row, base_col, prev=None):
+    def row_band(self, base_row):
+        """The row-band SRD this store writes through, hoisted so a caller that emits one
+        row-tile at a time can share one descriptor across a quadrant's row-tiles."""
+        return make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, self.out_bytes)
+
+    def _rows(self, rows):
+        return range_constexpr(self.n_tiles_a) if rows is None else rows
+
+    def store(self, c_frag, base_row, base_col, prev=None, rows=None, rsrc=None):
         scale = self._scale()
         if const_expr(self.beta_is_one) and prev is None:
             prev = self.prefetch(base_row, base_col)
         if self.trans:
             return self._store_trans(c_frag, base_row, base_col, scale, prev)
         # buffer_store row-band path (int64-safe); the band SRD is pinned to SGPRs inside.
-        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, self.out_bytes)
+        if rsrc is None:
+            rsrc = self.row_band(base_row)
         col0 = base_col + self.lane_id % 16
-        for ti in range_constexpr(self.n_tiles_a):
+        for ti in self._rows(rows):
             row_local = ti * 16 + (self.lane_id // 16) * 4  # relative to base_row
             # One byte address per row: the fragment column step rides the store's 12-bit immediate.
             row_off = [((row_local + i) * self.c_cols + col0) * self.out_bytes for i in range_constexpr(4)]
@@ -909,11 +918,12 @@ class StoreCPerTensorRowN(StoreCPerTensor):
         self.merge_row = (self.lane_id // 32) * 8
         self.merge_col = self.lane_id % 32
 
-    def store(self, c_frag, base_row, base_col, prev=None):
+    def store(self, c_frag, base_row, base_col, prev=None, rows=None, rsrc=None):
         scale = self._scale()
         if const_expr(self.beta_is_one) and prev is None:
             prev = self.prefetch(base_row, base_col)
-        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
+        if rsrc is None:
+            rsrc = self.row_band(base_row)
         lane0 = self.merge_row * self.c_cols + base_col + self.merge_col
         # A lane owns column base_col + p*32 + merge_col on every row of the run, so one compare
         # per run guards the whole ti sweep where col_safe cannot prove it dead (rows ride the
@@ -922,7 +932,7 @@ class StoreCPerTensorRowN(StoreCPerTensor):
             None if self.col_safe else (base_col + p * 32 + self.merge_col) < self.c_cols
             for p in range_constexpr(self.n_tiles_b // 2)
         ]
-        for ti in range_constexpr(self.n_tiles_a):
+        for ti in self._rows(rows):
             vecs = [
                 (Vec(c_frag[self.c_idx_fn(ti, tj)]) * scale)
                 if self.scaled
@@ -1359,6 +1369,71 @@ def _store_quadrants(store_c, c00, c01, c10, c11, base_row, base_col, LDS_BLOCK_
         if i + 1 < len(quads):
             nxt = store_c.prefetch(quads[i + 1][1], quads[i + 1][2])
         store_c.store(frag, r, c, prev=cur)
+
+
+def _sched_nop(n):
+    """``s_nop`` pad. An inline-asm MFMA result is invisible to the backend hazard recognizer,
+    so a VALU consumer emitted right behind one needs its wait states spelled out."""
+    _llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string="\n".join(["s_nop 15"] * n),
+        constraints="",
+        has_side_effects=True,
+    )
+
+
+def store_quadrants_peeled(
+    mfma,
+    store_c,
+    acc,
+    frags,
+    nta,
+    ntb,
+    a_halves,
+    b_halves,
+    base_row,
+    base_col,
+    LDS_BLOCK_M,
+    LDS_BLOCK_N,
+    lag=1,
+):
+    """Peel-last epilogue: the whole loop hands back the final K-block's srcA/srcB fragments
+    instead of consuming them, so that block's MFMAs are emitted here row-tile major and every
+    row-tile's C store rides in the shadow of the MFMAs ``lag`` row-tiles later.
+
+    ``sched_barrier(0)`` in front of each store group pins its issue distance -- the MFMAs are
+    inline asm and opaque to the scheduler -- and the trailing ``s_nop`` pad covers the row-tiles
+    left over at the end, which have no following MFMA to hide their accumulator write->read.
+    """
+    fa = [frags[p * nta : (p + 1) * nta] for p in range_constexpr(a_halves)]
+    fb0 = a_halves * nta
+    fb = [frags[fb0 + p * ntb : fb0 + (p + 1) * ntb] for p in range_constexpr(b_halves)]
+    bands = {}
+
+    def _emit_store(u):
+        ah, bh, ti = u
+        r = base_row + ah * LDS_BLOCK_M
+        if ah not in bands:
+            bands[ah] = store_c.row_band(r)
+        rocdl.sched_barrier(0)
+        store_c.store(
+            acc[ah * b_halves + bh], r, base_col + bh * LDS_BLOCK_N, rows=(ti,), rsrc=bands[ah]
+        )
+
+    pend = []
+    for ah in range_constexpr(a_halves):
+        for bh in range_constexpr(b_halves):
+            q = acc[ah * b_halves + bh]
+            for ti in range_constexpr(nta):
+                for tj in range_constexpr(ntb):
+                    q[mfma.idx(ti, tj)] = mfma._do_mma(fa[ah][ti], fb[bh][tj], q[mfma.idx(ti, tj)])
+                pend.append((ah, bh, ti))
+                if len(pend) > lag:
+                    _emit_store(pend.pop(0))
+    _sched_nop(2)
+    for u in pend:
+        _emit_store(u)
 
 
 def _a_tail_mask_vec(lane_id, r):
