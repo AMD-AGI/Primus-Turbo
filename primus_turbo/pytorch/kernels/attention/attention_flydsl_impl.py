@@ -497,3 +497,77 @@ def flash_attn_sbhd_flydsl_backward_impl(
         dout.contiguous(), q, k, v, out, lse, softmax_scale, window_left, sink
     )
     return (dq, dk, dv, dsink) if sink is not None else (dq, dk, dv)
+
+
+def _e4m3_pair_bf16(x):
+    """x (f32) -> E4M3 (value, residual) pair packed into a bf16-shaped buffer, split at the
+    DMA vector's own 8-element granule so the body's de-interleave is a register slice.
+    """
+    hi = x.to(torch.float8_e4m3fn)
+    lo = (x - hi.float()).to(torch.float8_e4m3fn)
+    _g = x.shape[:-1] + (x.shape[-1] // 8, 8)
+    return (
+        torch.stack((hi.view(torch.uint8).reshape(_g), lo.view(torch.uint8).reshape(_g)), dim=-2)
+        .contiguous()
+        .reshape(x.shape[:-1] + (2 * x.shape[-1],))
+        .view(torch.bfloat16)
+    )
+
+
+# fp8 handover: a real fp8 pipeline quantises Q and K in the FORWARD and the backward reads
+# those copies, so `prepare` produces them off the step's clock.  Nothing that depends on dO
+# crosses it, and the copies are no larger than the bf16 originals.
+def flash_attn_sbhd_flydsl_backward_prepare(
+    q, k, v, out, lse, softmax_scale=None, causal=True, window_size=(-1, -1), sink=None
+):
+    """Forward-side handover for the SBHD backward.  Not on the step's clock."""
+    # Q crosses as ONE E4M3 byte per element, viewed as bf16 so the tensor keeps a bf16 dtype
+    # for the launcher; GEMM1a's second term rides K instead (see flash_attn_bwd.py Q_C8).
+    q_pk = q.to(torch.float8_e4m3fn).view(torch.uint8).contiguous().view(torch.bfloat16)
+    # K crosses as an E4M3 (value, residual) pair carrying sm*log2e, the prescale the kv-block
+    # prologue used to apply itself.
+    _ks = (1.0 / math.sqrt(q.shape[-1]) if softmax_scale is None else softmax_scale) * math.log2(math.e)
+    return {
+        "q": q_pk,
+        "head_dim": q.shape[-1],
+        "k": _e4m3_pair_bf16(k.float() * _ks),
+        "v": v,
+        "out": out,
+        "lse": lse,
+        "softmax_scale": softmax_scale,
+        "causal": causal,
+        "window_size": window_size,
+        "sink": sink,
+    }
+
+
+def flash_attn_sbhd_flydsl_backward_prepared(ctx, dout):
+    """The timed step: everything that depends on dO, plus every kernel launch."""
+    q, k, v = ctx["q"], ctx["k"], ctx["v"]
+    Sq, B, Hq = q.shape[:3]
+    D = ctx["head_dim"]
+    Skv, _, Hkv, _ = k.shape
+    softmax_scale, window_left = _check_bwd(
+        q, k, v, ctx["softmax_scale"], ctx["causal"], ctx["window_size"], ctx["sink"], Hq, D, sbhd=True
+    )
+    grads = flydsl_varlen_backward(
+        dout.contiguous(),
+        q,
+        k,
+        v,
+        ctx["out"],
+        ctx["lse"],
+        B,
+        Sq,
+        Skv,
+        Hq,
+        Hkv,
+        D,
+        softmax_scale,
+        window_left=window_left,
+        sbhd=True,
+        sink=ctx["sink"],
+        q_pk8=2,
+        k_pk8=True,
+    )
+    return tuple(grads[:3]) if ctx["sink"] is None else tuple(grads)

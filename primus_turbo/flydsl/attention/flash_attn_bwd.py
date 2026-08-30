@@ -46,6 +46,35 @@ _LOG2E = host_math.log2(host_math.e)
 # Six host planners capture this as a def-time default, so a per-call override desyncs them.
 _BWD_BLOCK_Q = 64
 
+# G2B_ARM: build the fp8 GEMM2b arm (see G2B_FP8).
+_G2B_ARM = True
+# G1A_ARM: build the fp8 GEMM1a arm (see G1A_FP8). Needs _G2B_ARM -- the two share the E4M3
+# Q image, and it is only worth writing once both of Q's readers take it.
+_G1A_ARM = True
+# G2B_K128_ARM: pair two GQA head-steps so GEMM2b runs at K=128 (see G2B_K128).
+_G2B_K128_ARM = True
+# G2A_ARM: build the fp8 GEMM2a arm (see G2A_FP8) -- dV^T += dO^T . P with both operands E4M3,
+# the last MFMA run that still reads bf16. Off: the in-body dO cast costs more than the arm returns.
+_G2A_ARM = False
+# G2A_PUB_TAIL: publish head h+1's dO twin at the END of head-step h -- after the dS barrier, in GEMM3's
+# shadow -- instead of at head h+1's own commit rendezvous.
+_G2A_PUB_TAIL = False
+_G2A_K128_ARM = False
+_G2A_ON_PK8 = True
+# _G1A_K2T: force GEMM1a's second E4M3 term onto K without the compact Q handover, which turns
+# it on by itself (see G1A_K2T).
+_G1A_K2T = False
+# _DKV_ACC: let the pipeline chunks fold part of the dK/dV q_split slot reduction into their own stores
+# instead of leaving all of it to the standalone `slotred` pass (see dkv_slots / _dkv_slots_for).
+_DKV_ACC = False
+# AGPR_PIN_*: park a kv-block-invariant MFMA operand in the AGPR heap so its uses read it there
+# instead of shuttling it through v_accvgpr (see _agpr_pin). KB = GEMM1a's native K operand,
+# VB = dP's V operand, DS = the even head's dS packs; the constraint must be TIED.
+_AGPR_PIN_KB = True
+_AGPR_PIN_VB = True
+_AGPR_PIN_DS = False
+
+
 # dkdv MFMA-accumulator AGPR forcing (amdgpu-agpr-alloc): only pays off once the body
 # is VGPR-lean, so it is disabled here. On the four-wave fused body it is not even a
 # knob -- the compiler's own split is already byte-identical across the range tried.
@@ -314,6 +343,9 @@ def build_flash_attn_bwd_odo_module(
     qsp_lo=0,
     n_qsp=None,  # None: every q block (no q-split sub-range)
     block_q=_BWD_BLOCK_Q,
+    # do8: also write dO as an E4M3 (value, residual) PAIR into a buffer the size of its own bf16 one --
+    # the handover Q crosses in `prepare`, replayed for the one tensor `prepare` never sees.
+    do8=False,
 ):
     """Identity-delta ("odo") kernel: DELTA[b,hq,s] = -sum_d O[b,s,hq,d]*dO[b,s,hq,d].
 
@@ -372,6 +404,7 @@ def build_flash_attn_bwd_odo_module(
         O: fx.Tensor,
         DO: fx.Tensor,
         DELTA: fx.Tensor,
+        DO8: fx.Tensor,  # do8: dO's E4M3 pair image; else an unused placeholder slot
         batch_size: fx.Int32,
         seq_len: fx.Int32,
     ):
@@ -441,6 +474,67 @@ def build_flash_attn_bwd_odo_module(
         off = base + chunk * fx.Index(VEC)
         ov = buffer_ops.buffer_load(o_rsrc, off, vec_width=VEC, dtype=elem_dtype_l, cache_modifier=2)
         dv = buffer_ops.buffer_load(do_rsrc, off, vec_width=VEC, dtype=elem_dtype_l, cache_modifier=2)
+        if const_expr(do8):
+            _i16v2 = Vec.make_type(2, fx.Int16)
+            _v2f32 = Vec.make_type(2, fx.Float32)
+            _one = fx.Float32(1.0)
+
+            def _pk_bf16(v, j):
+                """bf16 elements [4j, 4j+4) of a v8 -> one dword of four E4M3 bytes."""
+                _w = rocdl.cvt_scalef32_pk_fp8_bf16(
+                    _i16v2, llvm.mlir_undef(_i16v2), _raw(v.shuffle(v, [4 * j, 4 * j + 1])), _raw(_one), 0
+                )
+                _w = rocdl.cvt_scalef32_pk_fp8_bf16(
+                    _i16v2, _w, _raw(v.shuffle(v, [4 * j + 2, 4 * j + 3])), _raw(_one), 1
+                )
+                return fx.Int32(Vec(_w).bitcast(fx.Int32)[0])
+
+            def _pk_f32(vals, j):
+                """f32 elements [4j, 4j+4) -> one dword of four E4M3 bytes."""
+                _w = llvm.mlir_undef(_i16v2)
+                for e in range_constexpr(2):
+                    _w = rocdl.cvt_scalef32_pk_fp8_f32(
+                        _i16v2,
+                        _w,
+                        _raw(vals[4 * j + 2 * e]),
+                        _raw(vals[4 * j + 2 * e + 1]),
+                        _raw(_one),
+                        e,
+                    )
+                return fx.Int32(Vec(_w).bitcast(fx.Int32)[0])
+
+            # value byte, then the residual it leaves: two E4M3 terms contracted against the
+            # same V into the same accumulator carry ~7 mantissa bits, which is what keeps
+            # the fp8 GEMM1b above the SNR floor (the same argument Q's pair rests on).
+            _dvv, _dvf = Vec(dv), Vec(dv).to(fx.Float32)
+            _hi = [_pk_bf16(_dvv, j) for j in range_constexpr(2)]
+            _res = []
+            for j in range_constexpr(2):
+                for e in range_constexpr(2):
+                    _d = Vec(rocdl.cvt_pk_f32_fp8(res=_v2f32, src=_raw(_hi[j]), word_sel=bool(e)))
+                    for t in range_constexpr(2):
+                        _res.append(
+                            fx.Float32(
+                                arith.subf(
+                                    _raw(fx.Float32(_dvf[4 * j + 2 * e + t])),
+                                    _raw(fx.Float32(_d[t])),
+                                    fastmath=fm,
+                                )
+                            )
+                        )
+            _pk = Vec.from_elements(
+                [_hi[0], _hi[1]] + [_pk_f32(_res, j) for j in range_constexpr(2)], fx.Int32
+            )
+            buffer_ops.buffer_store(
+                _pk,
+                buffer_ops.create_buffer_resource(
+                    DO8, max_size=False, num_records_bytes=_raw(total * fx.Index(HEAD_DIM * 2))
+                ),
+                off * fx.Index(2),  # the pair buffer is byte-for-byte the bf16 one
+                mask=in_range,
+                cache_modifier=3,  # write-through: the image is never re-read by this pass
+                offset_is_bytes=True,
+            )
         prod = Vec(ov).to(fx.Float32) * Vec(dv).to(fx.Float32)
         acc = fx.Float32(0.0)
         for i in range_constexpr(VEC):
@@ -476,6 +570,7 @@ def build_flash_attn_bwd_odo_module(
         O: fx.Tensor,
         DO: fx.Tensor,
         DELTA: fx.Tensor,
+        DO8: fx.Tensor,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         stream: fx.Stream,
@@ -488,6 +583,7 @@ def build_flash_attn_bwd_odo_module(
             O,
             DO,
             DELTA,
+            DO8,
             batch_size,
             seq_len,
             value_attrs={
@@ -772,6 +868,9 @@ def build_flash_attn_bwd_dqred_module(
     # K/V: hand each XCD a contiguous run of them and those re-reads stay in one L2 slice. Only
     # worth it when the chunks divide evenly across the XCDs, and only on a rectangle (a square's
     # causal_offset is 0, where the runs a row shares are already neighbours).
+    # With N_CHUNK == 1 at the GPT-OSS shape every work-group owns a PRIVATE row of partials and no two
+    # share a line, so there is no reuse for a slice to hold -- only a DRAM stream that the default
+    # round-robin already spreads. Leave the cut on the windowed rectangle.
     XCD_CUT = (
         window_left >= 0
         and QSP == 1
@@ -1062,6 +1161,8 @@ def build_flash_attn_bwd_dqred_module(
                     offset_is_bytes=True,
                 )
 
+    _DQRED_ATTRS = {"rocdl.flat_work_group_size": f"{int(BLOCK)},{int(BLOCK)}"}
+
     @flyc.jit
     def launch_flash_attn_bwd_dqred(
         WSQ: fx.Tensor,
@@ -1077,7 +1178,7 @@ def build_flash_attn_bwd_dqred_module(
             CARRY,
             CuSeqQ,
             CuSeqKv,
-            value_attrs={"rocdl.flat_work_group_size": f"{int(BLOCK)},{int(BLOCK)}"},
+            value_attrs=_DQRED_ATTRS,
         ).launch(grid=(fx.Index(NWG), 1, 1), block=(BLOCK, 1, 1), stream=stream)
 
     _compiled: dict = {}
@@ -1239,6 +1340,18 @@ def build_flash_attn_bwd_dkdv_module(
     # q_pref: stage the Q/dO tiles through VGPRs and issue head h+1's fetch at the top of
     # head-step h, so a whole head-step covers it. See Q_PREF.
     q_pref=False,
+    # q_pk8: Q arrives as E4M3 bytes from the prepare/prepared handover. 1 = a (value, residual) pair
+    # packed into its bf16 buffer (see Q2T); 2 = the COMPACT single-byte-per-element image, half the
+    # bytes, which needs G1A_K2T so that nothing reads Q's residual (see Q_C8).
+    q_pk8=False,
+    # k_pk8: K arrives as an E4M3 (value, residual) pair packed into its own bf16 buffer, already
+    # prescaled by sm*log2e -- the same handover Q crosses, at the same 8-element granule. It replaces
+    # the kv-block prologue's f32 round trip AND the residual build G1A_K2T needs. See K_PK8.
+    k_pk8=False,
+    # do_pk8: dO arrives as an E4M3 (value, residual) byte pair packed into a buffer the
+    # size of its own bf16 one, written by the odo pass. Same handover Q crosses, same
+    # 8-element granule, so the Q/dO DMA is untouched. See G1B_N128.
+    do_pk8=False,
     # g3_defer: run GEMM3 one head-step late off a second dS slot. See G3_DEFER.
     g3_defer=True,
     g3_st_at=None,
@@ -1258,6 +1371,9 @@ def build_flash_attn_bwd_dkdv_module(
     # argument. Batch is a whole slab of every tensor read and every workspace written here, so
     # this is a pure grid restriction and stays bitwise identical. See _fused_pipelined.
     bat_lo=0,
+    # dkv_slots / dkv_add: fold part of the q_split SLOT reduction into this dispatch's own dK/dV store.
+    dkv_slots=0,
+    dkv_add=False,
     # flat_wg: really a REGISTER-FILE choice. 512 (8 waves, two per SIMD) caps each wave at 256
     # architected registers; 256 (4 waves, one per SIMD) opens the whole 512-register file via
     # AGPRs, which is what fits the fused band spill-free and seats the co-resident dQ reduce.
@@ -1353,7 +1469,38 @@ def build_flash_attn_bwd_dkdv_module(
     # K has to be in LDS for GEMM3; V only ever feeds GEMM1b, so staging it too is purely
     # a register trade. It wins by a wide margin: leaving the V packs in registers costs
     # 16 VGPR for the whole kernel and measured 225 spill dwords (vs 36) and -6%.
-    G3_KSTEPS = BLOCK_KV // PV_K_STEP  # kv 32-steps per band
+    # G3_FP8: run the dQ GEMM (dQ^T = K^T . dS^T) on v_mfma_scale_f32_16x16x128_f8f6f4 with both
+    # operands in per-tensor E4M3.
+    G3_FP8 = head_dim == 64 and bool(k_reg) and BLOCK_KV % 128 == 0
+    G3_FP8_K = 128 if G3_FP8 else PV_K_STEP  # kv rows one GEMM3 MFMA contracts
+    # G2B_FP8: run GEMM2b (dK^T += Q^T . dS) on v_mfma_f32_16x16x32_fp8_fp8, taking the E4M3 dS image
+    # GEMM3 already packs and an E4M3 twin of the Q tile. It needs the prepare/prepared handover (see
+    # q_pk8): with Q's E4M3 image arriving in HBM the twin's staging cast is gone.
+    G2B_FP8 = _G2B_ARM and G3_FP8 and bool(q_pref) and bool(q_pk8) and not bool(pf_ring)
+    # G1A_FP8: run GEMM1a (S = Q . K^T) on the SAME two byte images -- the E4M3 Q tile GEMM2b reads and
+    # the prescaled E4M3 K packs GEMM3 already builds -- with v_mfma_f32_16x16x32_fp8_fp8.
+    G1A_FP8 = _G1A_ARM and G2B_FP8
+    Q2T = G1A_FP8 and bool(q_pk8)
+    # Q_C8: Q crosses the handover as ONE E4M3 byte per element instead of the pair above.
+    Q_C8 = int(q_pk8 or 0) == 2
+    K_PK8 = bool(k_pk8)
+    # DKV_SLOTS: this dispatch's dK/dV slot is split_idx % DKV_SLOTS rather than split_idx,
+    # and DKV_ADD makes it accumulate into what is already there (see dkv_slots).
+    DKV_SLOTS = int(dkv_slots or 0)
+    DKV_ADD = bool(dkv_add)
+    assert not DKV_SLOTS or (sbhd and n_qsp is not None and n_qsp <= DKV_SLOTS)
+    assert not DKV_ADD or DKV_SLOTS, "dkv_add needs the folded slot axis"
+    # G1A_N128: with two Q terms GEMM1a's contraction is 128 long -- [q_hi | q_lo] against [K | K] --
+    # which is exactly the native `v_mfma_scale_f32_16x16x128_f8f6f4` shape.
+    G1A_N128 = Q2T
+    # G1B_N128: dP = dO . V^T on the same native shape, with dO the two-term E4M3 pair the odo pass
+    # hands over (see do_pk8) and V duplicated as [V | V].
+    G1B_N128 = G1A_N128 and bool(do_pk8)
+    G1B_VE = 0
+    # G1A_KLDS: take the native B operand out of the K LDS image instead of registers (see _b8n_pins).
+    # Off: the arch relief it buys costs more in LDS reads inside the MFMA run.
+    G1A_KLDS = False
+    G3_KSTEPS = BLOCK_KV // G3_FP8_K  # kv steps per band
     # A wave's output patch is the squarest G3_TILES-tile rectangle, which minimizes transpose
     # reads per MFMA; GEMM3 runs on only the first G3_WAVES waves. The ring sits where the
     # carrier wave has no other MFMA to issue, so depth is free -- and inert under G3_KREG.
@@ -1401,10 +1548,9 @@ def build_flash_attn_bwd_dkdv_module(
     )
 
     # EXP_IGLP: at one wave/SIMD there's no sibling wave to hide exp2 latency under, so
-    # hand the head-step region to LLVM's MFMAExpInterleave IGLP strategy instead of
-    # hand-placed barriers. Gated to NUM_WAVES == 4 (see _dq_partial_ws for the call count).
+    # hand the head-step region to an LLVM IGLP strategy instead of hand-placed barriers.
+    # Gated to NUM_WAVES == 4 (see _dq_partial_ws for the call count).
     EXP_IGLP = NUM_WAVES == 4
-    IGLP_EXP_INTERLEAVE = 2  # LLVM IGLPStrategyID::MFMAExpInterleaveID
     # G2_HALF: run GEMM2 once per q-half instead of once per head-step. Fused-only -- the
     # split bodies keep the single call so their ISA stays byte-identical; see the
     # emission point in _head_step_lds for what it buys.
@@ -1479,6 +1625,20 @@ def build_flash_attn_bwd_dkdv_module(
     RD_STRIDE_Q = (batch_size * STRIDE_TOKEN_Q) if sbhd else STRIDE_TOKEN_Q
     RD_STRIDE_KV = (batch_size * STRIDE_TOKEN_KV) if sbhd else STRIDE_TOKEN_KV
 
+    # See the G2B_K128 block above for what this arm is and what it costs.
+    G2B_K128 = (
+        _G2B_K128_ARM
+        and G2B_FP8
+        and G2_HALF
+        and PV_K_STEPS == 2
+        and KV_HALVES == 1
+        and GQA_GROUP_SIZE % 2 == 0
+    )
+    # See the IGLP_EXP_INTERLEAVE block above: the strategy's SIGN flips with the body.
+    IGLP_EXP_INTERLEAVE = 3 if G2B_K128 else 0
+    # G2_KEEPALIVE: hold the dV accumulator group live past its own MFMAs (see the call site).
+    G2_KEEPALIVE = NT >= 3 and not (EXP_IGLP and IGLP_EXP_INTERLEAVE == 3)
+
     Q_STRIDE = HEAD_DIM
     LDS_TILE = BLOCK_Q * Q_STRIDE
     LDS_DO_BASE = LDS_TILE
@@ -1520,6 +1680,8 @@ def build_flash_attn_bwd_dkdv_module(
     # MASK_ALIGN: resolve the diagonal q-block's mask per wave instead of masking every live
     # wave's whole 16-tile set; bitwise equal (every removed MFMA had a zero B operand). Needs
     # q un-rebased, so rectangular, varlen, BAND_SPAN and FQ_PAIR all break the exact multiple.
+    # It is also what makes the masked q loop twice the size of the unmasked one, which raised the
+    # question of whether the COLD loop is what prices the allocation.
     MASK_ALIGN = (
         MASK_SKIP
         and (square and not varlen and not BAND_SPAN and not FQ_PAIR)
@@ -1547,6 +1709,9 @@ def build_flash_attn_bwd_dkdv_module(
     # of the reader. Disabled: even with the extra slot funded back out of GEMM3's
     # resident K^T set, a barrier is still cheaper here than any structure that removes
     # one -- the same conclusion G3_DEFER reaches independently below.
+    # The second live slot's cost is unchanged by everything rounds 6-8 freed. That is the standing
+    # entry price of any GEMM2 whose K runs over TWO 64-row q groups, because both groups' Q/dO have to
+    # be readable at once.
     QDO_RING = False
     QDO_TAIL = QDO_RING  # the merged publish the second slots exist for
     QDO_PP = False
@@ -1612,7 +1777,63 @@ def build_flash_attn_bwd_dkdv_module(
     G3_KREG = bool(g3_kreg)
     # D-tiles of the band-resident K^T set; the rest are re-read every head-step.
     G3_KRT = G3_DT if G3_KREG else 0
-    G3K_BASE = LDS_VIEW_ELEMS  # prescaled K [BLOCK_KV][HEAD_DIM]
+    # G12_FP8: run GEMM1a (S = Q K^T), GEMM1b (dP = dO V^T) and GEMM2 (dV += P^T dO, dK += dS^T Q) on
+    # v_mfma_scale_f32_32x32x64_f8f6f4 with every operand in per-tensor E4M3.
+    #
+    # It is NOT issue, and it is NOT the bank conflicts an older note blamed.
+    G12_ARM = False
+    G12_FP8 = (
+        G12_ARM
+        and G3_FP8
+        and HEAD_DIM == 64
+        and BLOCK_Q == 64
+        and KV_HALVES == 1
+        and ROWS_PER_WAVE_KV % 32 == 0
+        and MT % 2 == 0
+        and NT % 2 == 0
+        and DT % 2 == 0
+        and Q_PREF
+        and LDS_SLOTS == 1
+        and not FQ_PAIR
+        and window_left < 0
+        and not V_LDS
+        and K_REG
+        and not G3_SPLIT
+        and not QDO_TAIL
+    )
+    # GEMM1b keeps the bf16 dO tile, so dO is imaged twice and only dV's precision moves.
+    G2A_FP8 = (_G2A_ARM or (G1B_N128 and _G2A_ON_PK8)) and G2B_FP8 and not G12_FP8
+    # With both of dO's readers on the byte images the bf16 dO tile has no consumer: its
+    # LDS store goes and its transpose pin goes, exactly as Q's did under G1A_FP8.
+    DO_BF16_DEAD = G1B_N128 and G2A_FP8
+    # P's E4M3 image needs a power-of-two boost, and it is free: cvt_scalef32_pk_fp8_f32 carries the
+    # factor in the convert itself. Under the prescaled-LSE formulation P <= 1 and a causal row of
+    # length S averages 1/S, so at 2^0 the bulk of the softmax sits in E4M3's subnormals (min 2^-9).
+    G2A_P_E = 8
+    # G2A_K128: pair two GQA head-steps for dV as G2B_K128 does for dK. Both contract over
+    # q and both sum over the heads, so the two flushes share one pairing, one carry and
+    # one even/odd structure.
+    G2A_K128 = G2A_FP8 and G2B_K128 and _G2A_K128_ARM
+    if G12_FP8:
+        G3_KREG, G3_KRT = False, 0
+    G12_P_REG = False
+    # G1_ILV32: run GEMM1a and GEMM1b of one 32-wide q tile as ONE ks loop, so four accumulator chains
+    # alternate instead of two. The chain deficit is real (see G12_ARM) but this is not the way to pay
+    # for it -- G2_ILV32 is the register-neutral half of the same idea.
+    G1_ILV32 = False
+    G2_ILV32 = True
+    QB = 1 if G12_FP8 else 2  # LDS bytes per Q/dO element
+    MT32, NT32, DT32 = MT // 2, NT // 2, DT // 2
+    # dV/dK accumulator tiling: 32-wide (one v16f32 per tile) under G12_FP8.
+    ADT, ANT = (DT32, NT32) if G12_FP8 else (DT, NT)
+    ACC_LEN = 16 if G12_FP8 else 4
+    # Under G3_FP8 the prescaled-K and dS images hold E4M3 bytes, so their index unit is a
+    # BYTE and G3B converts an index of either into a byte offset. The Q/dO ring is bf16
+    # unless G12_FP8 takes it to bytes too, hence the two units.
+    assert not (G3_FP8 and V_LDS), "the fp8 dQ GEMM owns the K image; V would need its own"
+    G3B = 1 if G3_FP8 else 2
+    assert QB >= G3B, "the Q/dO region is sized in G3B units below"
+    G3K_BASE = LDS_VIEW_ELEMS * QB // G3B  # prescaled K [BLOCK_KV][HEAD_DIM]
     G3V_BASE = G3K_BASE + BLOCK_KV * HEAD_DIM  # V [BLOCK_KV][HEAD_DIM]
     # dS [slot][BLOCK_KV][BLOCK_Q]. LDS is not what caps occupancy here -- one wave per SIMD
     # is what the register file says -- so freeing LDS only helps a candidate that needs it.
@@ -1629,6 +1850,7 @@ def build_flash_attn_bwd_dkdv_module(
     # G3_AT: _hs_hook position of the deferred GEMM3. 0 = the head-step top; 3*pks+1 puts its
     # MFMAs on q-half pks's dS/pack window. Only the DEFERRED path has a call to move, and
     # moving it has priced at or below zero on both head dims -- see G3_VALU.
+    # The second dS slot costs more than any placement of its MFMAs recovers, at both tile widths.
     G3_AT = 0
     # G3_VALU: request an MFMA<->VALU co-execution pipeline (sched_group_barrier group 1) over
     # GEMM3's MFMA run and the dS/pack VALU block. 0 = off and byte-identical; it stays off
@@ -1639,7 +1861,9 @@ def build_flash_attn_bwd_dkdv_module(
     G3_ST_N = G3_DT // 2 * G3_QT if g3_st_n is None else int(g3_st_n)
     assert G3_ST_AT < 0 or G3_WAVES == NUM_WAVES
     G3_SB = 0 if g3_sb is None else int(g3_sb)
-    G3S_SLOTS = 2 if (G3_DEFER or QDO_RING or DMA_GRP > 1) else 1
+    # A second dS slot is for the register allocator, not for a reader: only the image the odd head
+    # reads across a head boundary needs one, and LDS is not the binding resource here.
+    G3S_SLOTS = 2 if (G3_DEFER or QDO_RING or DMA_GRP > 1 or G2B_K128) else 1
     # G3_SHADOW: emit the deferred GEMM3 INSIDE the rendezvous, between the Q/dO DMA issue
     # and its drain, since GEMM3 is the only work that reads neither the slot being filled
     # nor GEMM1's output. Disabled: a pending buffer_load ... lds forces vmcnt(0) before
@@ -1655,8 +1879,39 @@ def build_flash_attn_bwd_dkdv_module(
     # begins. Keeping the barrier anyway is then pure rendezvous cost plus a scheduling
     # wall between GEMM3's MFMAs and the ds_write pair that refills the slot.
     HS_WAR_BAR = G3_DEFER and not QDO_TAIL and not QDO_PP
+    # G12P_BASE: P published in the SAME [kv][qp] byte layout dS uses.
+    G12P_BASE = G3S_BASE + G3S_SLOTS * G3S_GRP_ELEMS
     _KV_LDS_END = G3V_BASE + (BLOCK_KV * HEAD_DIM if V_LDS else 0)
-    LDS_VIEW_ELEMS = max(G3S_BASE + G3S_SLOTS * G3S_GRP_ELEMS, _KV_LDS_END)
+    _G12P_END = G12P_BASE + (0 if G12_P_REG else (BLOCK_KV * BLOCK_Q if G12_FP8 else 0))
+    # G12B_BASE: the bf16 Q/dO pair. GEMM2 keeps its fp8 operands, which is where half the MFMA cycles
+    # are, so the pair of images is what buys both.
+    G12B_BASE = _G12P_END
+    _G12B_END = G12B_BASE + (LDS_TOTAL * 2 if G12_FP8 else 0)
+    QF8_BASE = _G12B_END
+    # G2B_K128 reads head h-1's twin during head h's step, so the twin -- and only the twin,
+    # not the bf16 Q/dO ring -- carries a second slot.
+    QF8_SLOTS = 2 * LDS_SLOTS if G2B_K128 else LDS_SLOTS
+    G2A_PUB_TAIL = G2A_FP8 and _G2A_PUB_TAIL and QF8_SLOTS > 1
+    # Q8_FWD: publish head h+1's E4M3 Q twin from head h's staging registers, at head h's own dS
+    # barrier, instead of at the top of head h+1's step.
+    G1A_K2T = (_G1A_K2T or Q_C8) and G1A_N128 and Q2T
+    assert not Q_C8 or G1A_K2T, "the compact Q handover needs G1A_K2T (see Q_C8)"
+    assert not Q_C8 or Q_PREF, "the compact Q handover forks the VGPR staging path only"
+    assert not K_PK8 or (G1A_N128 and G1A_K2T), "the K pair handover needs G1A_K2T"
+    Q8_FWD = 0  # 1 = before GEMM3, 2 = after it; needs G2B_FP8 and QF8_SLOTS > 1
+    _QF8_END = QF8_BASE + (LDS_TILE * QF8_SLOTS if G2B_FP8 else 0)
+    # QF8R_BASE: Q's E4M3 residual tile, same map and same slot stride as the image above.
+    QF8R_BASE = _QF8_END
+    _QF8R_END = QF8R_BASE + (LDS_TILE * QF8_SLOTS if Q2T else 0)
+    # DOF8_BASE: dO's E4M3 twin, GEMM2a's A operand. Same map, same slot stride and the same pinned
+    # transpose-read address as Q's twin -- only the image base differs.
+    DOF8_BASE = _QF8R_END
+    _DOF8_END = DOF8_BASE + (LDS_TILE * QF8_SLOTS if (G2A_FP8 or G1B_N128) else 0)
+    # DOF8R_BASE: dO's E4M3 residual, one _A8_TERM past the value image exactly as Q's is,
+    # so GEMM1b's two-term A operand reaches both with the SAME pinned address pair.
+    DOF8R_BASE = _DOF8_END
+    _DOF8R_END = DOF8R_BASE + (LDS_TILE * QF8_SLOTS if G1B_N128 else 0)
+    LDS_VIEW_ELEMS = (max(_DOF8R_END, _KV_LDS_END) * G3B + 1) // 2
 
     allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="flash_attn_bwd_smem_dkdv")
     lds_off = allocator._align(allocator.ptr, 16)
@@ -1690,6 +1945,9 @@ def build_flash_attn_bwd_dkdv_module(
         v4f16_type = Vec.make_type(4, elem_dtype)
         v8f16_type = Vec.make_type(8, elem_dtype)
         v4f32_type = Vec.make_type(4, fx.Float32)
+        v2i32_type = Vec.make_type(2, fx.Int32)
+        v4i32_type = Vec.make_type(4, fx.Int32)
+        v16f32_type = Vec.make_type(16, fx.Float32)
         mfma_pack_type = v8f16_type
         MFMA_LANE_K = 8  # 8 bf16/lane; 4 lane-groups (lane//16) -> K=32
 
@@ -1714,6 +1972,8 @@ def build_flash_attn_bwd_dkdv_module(
         lane = tid % WARP_SIZE
         lane16 = lane % 16  # M/N index within a 16-tile
         kg = lane // 16  # 0..3: K-subgroup (inputs) / M-block (C output)
+        lane32 = lane % 32
+        lgrp = lane // 32
 
         def ds_read_tr_v4f16(lds_elem_idx, const_elem_off=0):
             # const_elem_off is a compile-time element offset that the backend folds into the
@@ -1723,6 +1983,18 @@ def build_flash_attn_bwd_dkdv_module(
             if const_expr(const_elem_off != 0):
                 ptr = buffer_ops.get_element_ptr(ptr, fx.Int64(const_elem_off), elem_type=elem_type)
             return rocdl.ds_read_tr16_b64(v4f16_type, ptr).result
+
+        _G3_OFF_T = ir.IntegerType.get_signless(8) if G3B == 1 else elem_type
+
+        def _g3_ptr(g3_idx, const_off=0):
+            """LDS pointer into the K / dS images, whose index unit is G3B bytes."""
+            ptr = buffer_ops.create_llvm_ptr(fx.Int64(g3_idx * G3B + lds_off), address_space=3)
+            if const_expr(const_off != 0):
+                ptr = buffer_ops.get_element_ptr(ptr, fx.Int64(const_off), elem_type=_G3_OFF_T)
+            return ptr
+
+        def _ds_read_tr8(g3_idx, const_off=0):
+            return Vec(rocdl.ds_read_tr8_b64(v2i32_type, _g3_ptr(g3_idx, const_off)).result)
 
         # block_id decode. The dispatcher round-robins work-groups over the XCDs and each XCD
         # owns a private L2 slice, so XCD-major decode gives each XCD a whole (batch, kv-head)
@@ -1909,14 +2181,20 @@ def build_flash_attn_bwd_dkdv_module(
         # this register-full body spills badly. Pinning one address per tile removes that.
         # Below the limit the compile-time form is cheaper, and pinning only the
         # overflowing slots is worse than pinning all of them (mixed addressing modes
-        # give the allocator two live-range shapes to juggle).
+        # give the allocator two live-range shapes to juggle). The AGPR-parked addresses are
+        # HOIST_PIN's, not per-fragment ones, so this is not their cure.
         A_PIN = HEAD_DIM == 128 and (
             lds_off + ((LDS_SLOTS - 1) * LDS_TOTAL + LDS_DO_BASE + LDS_TILE) * 2 > 65536
         )
 
         def bf16_trunc_pack_v8(f32_vals):
+            # Takes 8 scalars or the vector<8xf32> they were already gathered into.
             if const_expr(SCORED_PACK):
-                f32_vec = Vec.from_elements([_raw(v) for v in f32_vals], fx.Float32)
+                f32_vec = (
+                    Vec.from_elements([_raw(v) for v in f32_vals], fx.Float32)
+                    if const_expr(isinstance(f32_vals, (list, tuple)))
+                    else f32_vals
+                )
                 trunc = llvm.FPTruncOp(Vec.make_type(8, elem_dtype), _raw(f32_vec))
                 trunc.operation.attributes["fastmathFlags"] = ir.Attribute.parse("#llvm.fastmath<fast>")
                 return trunc.result
@@ -1939,6 +2217,57 @@ def build_flash_attn_bwd_dkdv_module(
             trunc = llvm.FPTruncOp(Vec.make_type(4, elem_dtype), _raw(Vec(f32_vec4)))
             trunc.operation.attributes["fastmathFlags"] = ir.Attribute.parse("#llvm.fastmath<fast>")
             return Vec(trunc.result).bitcast(fx.Int32)
+
+        # E4M3 exponents of the two GEMM3 operands: powers of two folded into the stored value and
+        # taken back out by the MFMA's own E8M0 scale byte, which costs nothing because a per-tensor
+        # scale is the same byte in every lane group.
+        G3_FP8_KE = 0
+        # G12_P_E / G12_S_E: powers of two folded into the P and dS E4M3 images and taken straight
+        # back out by the MFMA's own E8M0 scale byte.
+        G12_P_E = 8 if G12_FP8 else 0
+        G12_S_E = 4 if G12_FP8 else 0
+        G12_QKE = 0
+        G3_FP8_SE = G12_S_E
+        _I32_T = ir.IntegerType.get_signless(32)
+        _I16V2_T = Vec.make_type(2, fx.Int16)
+
+        def _undef(t):
+            """A fresh undef for a pk-convert's oldVdst. An undef lets it use the destination directly.
+            Worth 32 VALU per head-step in the hot loop, which is issue-bound.
+            """
+            return llvm.mlir_undef(t)
+
+        def _fp8_pack_v8(f32_vals, exp=0):
+            """8 f32 -> 8 E4M3 bytes, returned as the 2 dwords a ds_write_b64 wants."""
+            words = []
+            _sc = fx.Float32(float(2**-exp))  # the scaled convert DIVIDES by its scale
+            for j in range_constexpr(2):
+                w = rocdl.cvt_scalef32_pk_fp8_f32(
+                    _I16V2_T,
+                    _undef(_I16V2_T),
+                    _raw(f32_vals[4 * j]),
+                    _raw(f32_vals[4 * j + 1]),
+                    _raw(_sc),
+                    0,
+                )
+                w = rocdl.cvt_scalef32_pk_fp8_f32(
+                    _I16V2_T, w, _raw(f32_vals[4 * j + 2]), _raw(f32_vals[4 * j + 3]), _raw(_sc), 1
+                )
+                words.append(fx.Int32(Vec(w).bitcast(fx.Int32)[0]))
+            return Vec.from_elements(words, fx.Int32)
+
+        def _vgpr_const_i32(c):
+            """A compile-time i32 pinned in a VGPR: the scaled MFMA rejects an SGPR scale."""
+            return fx.Int32(llvm.inline_asm(_I32_T, [], f"v_mov_b32 $0, {c}", "=v", has_side_effects=False))
+
+        def _ds_mul(p_vals, dp_vec):
+            """dS = P * (dP - delta) for one 16-tile, as ONE vector<4xf32> multiply. Written scalar, this
+            chain only stays packed while SLP can see a vector consumer, and the bf16 dS pack used to
+            be it.
+            """
+            _pv = Vec.from_elements([_raw(v) for v in p_vals], fx.Float32)
+            _m = Vec(_fmul(_pv, Vec(dp_vec)))
+            return [fx.Float32(_m[t]) for t in range_constexpr(4)]
 
         # D64 packs 2 real rows into one 128-wide LDS block (low r&4=0 -> [0,64),
         # high -> [64,128)); D128 is already 128-wide, so one row == one block.
@@ -1965,6 +2294,12 @@ def build_flash_attn_bwd_dkdv_module(
         def _swizzle(row_idx, col_idx):
             mask = (row_idx & fx.Index(7)) << fx.Index(4)
             return col_idx ^ mask
+
+        def _kv_lds_idx_c(base, nt, col):
+            """_kv_lds_idx at an explicit D column: the image is addressed by the
+            TILE-LOCAL kv row (the base carries the half), not the global one."""
+            _r = wave_id * ROWS_PER_WAVE_KV + fx.Index(nt * N_TILE) + lane16
+            return fx.Index(base) + _pblk(_r) * fx.Index(PBLK) + _swizzle(_r, col)
 
         def _kv_lds_idx(base, nt, ks):
             """Owned-K/V LDS slot of B[k=D=ks*32+kg*8][n=kv=nt*16+lane16], one v8 per lane.
@@ -1997,6 +2332,10 @@ def build_flash_attn_bwd_dkdv_module(
         # ---- Per-batch descriptors (batch base folded into SRD base). ----
         _q_nrec_bytes = _raw(seq_len_q_v * fx.Index(RD_STRIDE_Q * 2))
         _q_batch_byte_off = _raw(_q_ptr_batch_off * fx.Index(2))
+        # Q_C8: Q's buffer is half the bytes, so its own descriptor halves with it. dO keeps
+        # the bf16 one above; only Q's forks.
+        _q8_nrec_bytes = _raw(seq_len_q_v * fx.Index(RD_STRIDE_Q)) if const_expr(Q_C8) else _q_nrec_bytes
+        _q8_batch_byte_off = _raw(_q_ptr_batch_off) if const_expr(Q_C8) else _q_batch_byte_off
         _kv_nrec_bytes = _raw(seq_len_k_v * fx.Index(RD_STRIDE_KV * 2))
         if const_expr(sbhd and BAND_LIFT):
             # The group enters K/V at its own first kv row; num_records then covers exactly
@@ -2041,10 +2380,10 @@ def build_flash_attn_bwd_dkdv_module(
         elif const_expr(sbhd):
             # [q_split, Skv, B, Hkv, D]: slot base = split*Skv*(B*Hkv*D) + batch*(Hkv*D).
             # Token stride inside a slot is RD_STRIDE_KV (B*Hkv*D) == global_idx_kv step.
-            _dkv_ws_byte_off = _raw(
-                (split_idx * seq_len_k_v * fx.Index(RD_STRIDE_KV) + batch_idx * fx.Index(STRIDE_TOKEN_KV))
-                * fx.Index(2)
-            )
+            # DKV_SLOTS narrows the slot axis to what one chunk really needs (see dkv_slots).
+            _dkv_split = split_idx % fx.Index(DKV_SLOTS) if const_expr(DKV_SLOTS) else split_idx
+            _dkv_slot_off = _dkv_split * seq_len_k_v * fx.Index(RD_STRIDE_KV)
+            _dkv_ws_byte_off = _raw((_dkv_slot_off + batch_idx * fx.Index(STRIDE_TOKEN_KV)) * fx.Index(2))
         elif const_expr(varlen):
             # Packed [q_split,total_kv,Hkv,D]: slot base = (split*total_kv + kv_tok_base); host sum(dim=0) -> packed dk/dv.
             _dkv_ws_byte_off = _raw(
@@ -2111,7 +2450,7 @@ def build_flash_attn_bwd_dkdv_module(
         # normal read (_a_idx) and the transpose read (_read_tr) expect that layout.
         if const_expr(ENABLE_DMA):
             q_rsrc = buffer_ops.create_buffer_resource(
-                Q, max_size=False, num_records_bytes=_q_nrec_bytes, base_byte_offset=_q_batch_byte_off
+                Q, max_size=False, num_records_bytes=_q8_nrec_bytes, base_byte_offset=_q8_batch_byte_off
             )
             do_rsrc = buffer_ops.create_buffer_resource(
                 DO, max_size=False, num_records_bytes=_q_nrec_bytes, base_byte_offset=_q_batch_byte_off
@@ -2225,34 +2564,199 @@ def build_flash_attn_bwd_dkdv_module(
                         _dma_aux,
                     )
 
+        # ---- G12_FP8 owned K,V B-operands, 32 wide: B[k=D=16*ks+8*lgrp+s][n=kv=kt*32 +lane32], one
+        # v8 bf16 per lane per (kv 32-tile, k step).
+        if const_expr(G12_FP8):
+            k_b32 = [[None] * NT32 for _ in range_constexpr(KV_HALVES)]
+            v_b32 = [[None] * NT32 for _ in range_constexpr(KV_HALVES)]
+            _kscale32 = Vec.filled(MFMA_LANE_K, sm_scale * _LOG2E, fx.Float32)
+            for h in range_constexpr(KV_HALVES):
+                for kt in range_constexpr(NT32):
+                    _row = kv_row_wave + fx.Index(h * BKV_H + kt * 32) + lane32
+                    _kf, _vf = [], []
+                    for j8 in range_constexpr(4):
+                        _col = fx.Index(j8 * 16) + lgrp * fx.Index(8)
+                        _kf.append(
+                            Vec(
+                                buffer_ops.buffer_load(
+                                    k_rsrc, global_idx_kv(_row, _col), vec_width=8, dtype=elem_dtype
+                                )
+                            ).to(fx.Float32)
+                            * _kscale32
+                        )
+                        _vf.append(
+                            buffer_ops.buffer_load(
+                                v_rsrc, global_idx_kv(_row, _col), vec_width=8, dtype=elem_dtype
+                            )
+                        )
+                    k_b32[h][kt] = [_v.to(elem_dtype).ir_value() for _v in _kf]
+                    v_b32[h][kt] = list(_vf)
+                    # GEMM3's A operand is the E4M3 image of the SAME prescaled K. The
+                    # image is band-LOCAL, unlike the global row above.
+                    _lr = wave_id * fx.Index(ROWS_PER_WAVE_KV) + fx.Index(h * BKV_H + kt * 32) + lane32
+                    _kb = fx.Index(G3K_BASE + h * BKV_H * HEAD_DIM) + _pblk(_lr) * fx.Index(PBLK)
+                    for j8 in range_constexpr(4):
+                        _a = _kb + (
+                            (fx.Index(j8 * 16) + lgrp * fx.Index(8)) ^ ((_lr & fx.Index(7)) << fx.Index(4))
+                        )
+                        llvm.StoreOp(
+                            _raw(_fp8_pack_v8([fx.Float32(_kf[j8][j]) for j in range_constexpr(8)], G12_QKE)),
+                            _g3_ptr(_a),
+                        )
+
+        _V8I32_T = Vec.make_type(8, fx.Int32)
+
+        def _agpr_pin(v, n=8):
+            """Park an n-dword value in the AGPR heap. An MFMA reads srcB from either file, so the pin
+            costs the v_accvgpr_write of the kv-block prologue and nothing per use.
+            """
+            return llvm.inline_asm(Vec.make_type(n, fx.Int32), [_raw(v)], "", "=a,0", has_side_effects=False)
+
+        def _agpr_pin32(v):
+            return _agpr_pin(v, 8)
+
         # ---- Owned K,V B-operand packs: B[k=D][n=kv], n=lane16, k=kg*8+s. Per wave
         # NT kv 16-tiles x K_STEPS_QK D-steps; k_b_packs[nt][ks] is a v8 bf16. ----
         k_b_packs = [[[None] * K_STEPS_QK for _ in range_constexpr(NT)] for _ in range_constexpr(KV_HALVES)]
         v_b_packs = [[[None] * K_STEPS_QK for _ in range_constexpr(NT)] for _ in range_constexpr(KV_HALVES)]
-        for h in range_constexpr(KV_HALVES):
-            for nt in range_constexpr(NT):
-                _kvr = kv_row_of(nt, h)
-                for ks in range_constexpr(K_STEPS_QK):
-                    kv_col = fx.Index(ks * K_STEP_QK) + kg * MFMA_LANE_K
-                    k_b_packs[h][nt][ks] = buffer_ops.buffer_load(
-                        k_rsrc, global_idx_kv(_kvr, kv_col), vec_width=MFMA_LANE_K, dtype=elem_dtype
-                    )
-                    v_b_packs[h][nt][ks] = buffer_ops.buffer_load(
-                        v_rsrc, global_idx_kv(_kvr, kv_col), vec_width=MFMA_LANE_K, dtype=elem_dtype
-                    )
+        if const_expr(not G12_FP8):
+            for h in range_constexpr(KV_HALVES):
+                for nt in range_constexpr(NT):
+                    _kvr = kv_row_of(nt, h)
+                    for ks in range_constexpr(K_STEPS_QK):
+                        kv_col = fx.Index(ks * K_STEP_QK) + kg * MFMA_LANE_K
+                        k_b_packs[h][nt][ks] = buffer_ops.buffer_load(
+                            k_rsrc, global_idx_kv(_kvr, kv_col), vec_width=MFMA_LANE_K, dtype=elem_dtype
+                        )
+                        # Under G1B_N128 the native pack below is V's only form; dP was its
+                        # only bf16 reader.
+                        if const_expr(not G1B_N128):
+                            _vb = buffer_ops.buffer_load(
+                                v_rsrc, global_idx_kv(_kvr, kv_col), vec_width=MFMA_LANE_K, dtype=elem_dtype
+                            )
+                            v_b_packs[h][nt][ks] = (
+                                Vec(_agpr_pin(Vec(_vb).bitcast(fx.Int32), 4)).bitcast(elem_dtype).ir_value()
+                                if const_expr(_AGPR_PIN_VB)
+                                else _vb
+                            )
 
         # ---- FOLD: prescale the owned K by sm*log2e once per kv-block (amortized over
         # the GQA group's heads). K feeds GEMM1a only -- dK is a separate accumulator --
         # so scaling k_b_packs is safe. Together with -log2e*lse folded into GEMM1a's
         # C-init, GEMM1a's raw output already IS the base-2 softmax exponent. ----
-        if const_expr(True):
+        # G3_FP8 takes its E4M3 K image off the SAME f32 round trip: the cast is free (the
+        # prescale already materialises the f32) and GEMM1a keeps the bf16 copy it reads.
+        k8_packs = [[[None] * K_STEPS_QK for _ in range_constexpr(NT)] for _ in range_constexpr(KV_HALVES)]
+        if const_expr(not G12_FP8):
             _kscale_v8 = Vec.filled(MFMA_LANE_K, sm_scale * _LOG2E, fx.Float32)
             for h in range_constexpr(KV_HALVES):
                 for nt in range_constexpr(NT):
                     for ks in range_constexpr(K_STEPS_QK):
-                        k_b_packs[h][nt][ks] = (
-                            (Vec(k_b_packs[h][nt][ks]).to(fx.Float32) * _kscale_v8).to(elem_dtype).ir_value()
+                        _kf = Vec(k_b_packs[h][nt][ks]).to(fx.Float32) * _kscale_v8
+                        # Under G1A_FP8 the E4M3 pack below is the ONLY K operand: dropping
+                        # the bf16 copy here takes NT*K_STEPS_QK v8 packs off the register
+                        # file for the whole kernel.
+                        k_b_packs[h][nt][ks] = None if const_expr(G1A_FP8) else _kf.to(elem_dtype).ir_value()
+                        if const_expr(G3_FP8 and not G1A_N128):
+                            _kfs = _kf * Vec.filled(MFMA_LANE_K, float(2**G3_FP8_KE), fx.Float32)
+                            k8_packs[h][nt][ks] = _fp8_pack_v8(
+                                [fx.Float32(_kfs[j]) for j in range_constexpr(MFMA_LANE_K)]
+                            )
+
+        # ---- G1A_N128's B operand: the 32 E4M3 bytes lane l wants are K[kv=l%16] over the 32 D
+        # columns at 32*((l//16)%2), four times what one legacy pack holds.
+        def _cat32(chunks):
+            """Four 8-byte packs -> the 32 B native B operand, in k order."""
+            _lo = chunks[0].shuffle(chunks[1], [0, 1, 2, 3])
+            _hi = chunks[2].shuffle(chunks[3], [0, 1, 2, 3])
+            return _lo.shuffle(_hi, [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
+
+        _v2f32_t = Vec.make_type(2, fx.Float32)
+        _kg_hi = ArithValue(kg >= fx.Index(2)) if const_expr(G1A_N128) else None
+
+        def _k_resid(pk, kf32):
+            """The E4M3 term left over by `pk`, packed at the SAME scale. One MFMA scale byte covers both
+            halves of the B operand, so the residual has to ride the value's scale -- which is exactly
+            the pair `prepare` hands Q over as.
+            """
+            _v = Vec(pk)
+            _res = []
+            for j in range_constexpr(2):
+                for e in range_constexpr(2):
+                    _d = Vec(rocdl.cvt_pk_f32_fp8(res=_v2f32_t, src=_raw(_v[j]), word_sel=bool(e)))
+                    for t in range_constexpr(2):
+                        _res.append(
+                            fx.Float32(
+                                arith.subf(
+                                    _raw(fx.Float32(kf32[4 * j + 2 * e + t])),
+                                    _raw(fx.Float32(_d[t])),
+                                    fastmath=fm_fast,
+                                )
+                            )
                         )
+            return _fp8_pack_v8(_res)
+
+        def _sel_v2(cond, a, b):
+            """Per-lane select between two 2-dword packs."""
+            _a, _b = Vec(a).bitcast(fx.Int32), Vec(b).bitcast(fx.Int32)
+            return Vec.from_elements(
+                [fx.Int32(cond.select(fx.Int32(_a[i]), fx.Int32(_b[i]))) for i in range_constexpr(2)],
+                fx.Int32,
+            )
+
+        k8n_packs = [[None] * NT for _ in range_constexpr(KV_HALVES)]
+        if const_expr(G1A_N128):
+            _kscale_n = Vec.filled(MFMA_LANE_K, sm_scale * _LOG2E * float(2**G3_FP8_KE), fx.Float32)
+            for h in range_constexpr(KV_HALVES):
+                _kb_h = G3K_BASE + h * BKV_H * HEAD_DIM
+                for nt in range_constexpr(NT):
+                    _kvr = kv_row_of(nt, h)
+                    _ch = []
+                    for j in range_constexpr(4):
+                        _c = (kg % fx.Index(2)) * fx.Index(32) + fx.Index(j * MFMA_LANE_K)
+                        _kr = buffer_ops.buffer_load(
+                            k_rsrc, global_idx_kv(_kvr, _c), vec_width=MFMA_LANE_K, dtype=elem_dtype
+                        )
+                        if const_expr(K_PK8):
+                            # The pair arrives prescaled and already packed: the 16 B this
+                            # lane loaded ARE its 8 value bytes then its 8 residual bytes.
+                            _kb = Vec(_kr).bitcast(fx.Int32)
+                            _pk = _kb.shuffle(_kb, [0, 1])
+                            llvm.StoreOp(_raw(_pk), _g3_ptr(_kv_lds_idx_c(_kb_h, nt, _c)))
+                            _pk = _sel_v2(_kg_hi, _kb.shuffle(_kb, [2, 3]), _pk)
+                        else:
+                            _kfn = Vec(_kr).to(fx.Float32) * _kscale_n
+                            _pk = _fp8_pack_v8([fx.Float32(_kfn[e]) for e in range_constexpr(MFMA_LANE_K)])
+                            llvm.StoreOp(_raw(_pk), _g3_ptr(_kv_lds_idx_c(_kb_h, nt, _c)))
+                            if const_expr(G1A_K2T):
+                                # Lane groups 2,3 carry K's residual instead of a second copy
+                                # of its value; see G1A_K2T. The LDS image above keeps the
+                                # value bytes -- GEMM3 reads it and stays single-term.
+                                _pk = _sel_v2(_kg_hi, _k_resid(_pk, _kfn), _pk)
+                        _ch.append(_pk)
+                    if const_expr(not G1A_KLDS):
+                        k8n_packs[h][nt] = (
+                            _agpr_pin32(_cat32(_ch)) if const_expr(_AGPR_PIN_KB) else _cat32(_ch)
+                        )
+
+        # ---- G1B_N128's B operand: the same four chunks off V, unscaled and with no LDS image
+        # (GEMM3 does not read V).
+        v8n_packs = [[None] * NT for _ in range_constexpr(KV_HALVES)]
+        if const_expr(G1B_N128):
+            _vscale_n = Vec.filled(MFMA_LANE_K, float(2**G1B_VE), fx.Float32)
+            for h in range_constexpr(KV_HALVES):
+                for nt in range_constexpr(NT):
+                    _kvr = kv_row_of(nt, h)
+                    _ch = []
+                    for j in range_constexpr(4):
+                        _c = (kg % fx.Index(2)) * fx.Index(32) + fx.Index(j * MFMA_LANE_K)
+                        _vr = buffer_ops.buffer_load(
+                            v_rsrc, global_idx_kv(_kvr, _c), vec_width=MFMA_LANE_K, dtype=elem_dtype
+                        )
+                        _vfn = Vec(_vr).to(fx.Float32) * _vscale_n
+                        _pk = _fp8_pack_v8([fx.Float32(_vfn[e]) for e in range_constexpr(MFMA_LANE_K)])
+                        _ch.append(_pk)
+                    v8n_packs[h][nt] = _agpr_pin32(_cat32(_ch))
 
         # GEMM3 contracts over kv, so its A operand is K^T: stage the owned K (and, for
         # GEMM1b, V) into LDS as [kv][D] in the Q/dO tile layout and transpose-read it
@@ -2260,13 +2764,21 @@ def build_flash_attn_bwd_dkdv_module(
         # operands off the register file for the whole kernel, avoiding the spill
         # cliff. K goes in ALREADY PRESCALED, so GEMM1a reads it directly; that leaves
         # the dQ partial scaled by sm*log2e, which `_reduce_dq_partials` divides out.
-        for h in range_constexpr(KV_HALVES):
-            _kb_h, _vb_h = G3K_BASE + h * BKV_H * HEAD_DIM, G3V_BASE + h * BKV_H * HEAD_DIM
-            for nt in range_constexpr(NT):
-                for ks in range_constexpr(K_STEPS_QK):
-                    Vec(k_b_packs[h][nt][ks]).store(lds, [_kv_lds_idx(_kb_h, nt, ks)])
-                    if const_expr(V_LDS):
-                        Vec(v_b_packs[h][nt][ks]).store(lds, [_kv_lds_idx(_vb_h, nt, ks)])
+        if const_expr(G12_FP8):
+            k_b_packs, v_b_packs = k_b32, v_b32
+        else:
+            for h in range_constexpr(KV_HALVES):
+                _kb_h, _vb_h = G3K_BASE + h * BKV_H * HEAD_DIM, G3V_BASE + h * BKV_H * HEAD_DIM
+                for nt in range_constexpr(NT):
+                    for ks in range_constexpr(K_STEPS_QK):
+                        if const_expr(G1A_N128):
+                            pass  # the native B build above already published this image
+                        elif const_expr(G3_FP8):
+                            llvm.StoreOp(_raw(k8_packs[h][nt][ks]), _g3_ptr(_kv_lds_idx(_kb_h, nt, ks)))
+                        else:
+                            Vec(k_b_packs[h][nt][ks]).store(lds, [_kv_lds_idx(_kb_h, nt, ks)])
+                        if const_expr(V_LDS):
+                            Vec(v_b_packs[h][nt][ks]).store(lds, [_kv_lds_idx(_vb_h, nt, ks)])
         if const_expr(not K_REG):
             k_b_packs = [G3K_BASE + h * BKV_H * HEAD_DIM for h in range_constexpr(KV_HALVES)]
         if const_expr(V_LDS):
@@ -2276,6 +2788,7 @@ def build_flash_attn_bwd_dkdv_module(
         c_neg_inf = fx.Float32(float("-inf"))
         c_zero_f = fx.Float32(0.0)
         c_zero_v4f32 = Vec.filled(4, 0.0, fx.Float32)
+        c_zero_acc = Vec.filled(ACC_LEN, 0.0, fx.Float32)
 
         def _vexp(x):
             # Bare v_exp_f32 (hardware 2^x), NON-side-effecting -> the compiler overlaps
@@ -2342,6 +2855,56 @@ def build_flash_attn_bwd_dkdv_module(
             col = fx.Index(ks * K_STEP_QK) + kg * MFMA_LANE_K
             return a_base + _pblk(row) * fx.Index(PBLK) + (col ^ a_swz_mask)
 
+        # fp8 A-operand reads: one pinned address per D step serves the whole family.
+        _A8_MT = (M_TILE // 2 if PACK_2ROW else M_TILE) * PBLK
+        _A8_TERM = LDS_TILE * QF8_SLOTS
+
+        def _a8_pin(a_base, ks):
+            return _opaque_idx(
+                a_base
+                + _pblk(lane16) * fx.Index(PBLK)
+                + ((fx.Index(ks * K_STEP_QK) + kg * MFMA_LANE_K) ^ a_swz_mask)
+            )
+
+        def _a8_read(pin, mt, term):
+            return _pointer_load(v2i32_type, _g3_ptr(pin, mt * _A8_MT + term * _A8_TERM))
+
+        # G1A_N128's A operand: lane group g takes Q term g//2 at D columns 32*(g%2), i.e. 32 bytes,
+        # which the row's 16 B rotation splits into the pair `pin` / `pin ^ 16`.
+        def _a8n_pins(a_base):
+            _p = _opaque_idx(
+                a_base
+                + (fx.Index(0) if const_expr(G1A_K2T) else (kg >> fx.Index(1)) * fx.Index(_A8_TERM))
+                + _pblk(lane16) * fx.Index(PBLK)
+                + (((kg & fx.Index(1)) * fx.Index(32)) ^ a_swz_mask)
+            )
+            return [_p, _opaque_idx(_p ^ fx.Index(16))]
+
+        def _b8n_pins(h):
+            """G1A_KLDS: the same 32 B out of the K image this build already publishes."""
+            _p = _opaque_idx(
+                _kv_lds_idx_c(G3K_BASE + h * BKV_H * HEAD_DIM, 0, (kg & fx.Index(1)) * fx.Index(32))
+            )
+            return [_p, _opaque_idx(_p ^ fx.Index(16))]
+
+        _B8N_NT = (N_TILE // 2 if PACK_2ROW else N_TILE) * PBLK
+
+        def _b8n_read(pins, nt):
+            _o = nt * _B8N_NT
+            return (
+                Vec(_pointer_load(v4i32_type, _g3_ptr(pins[0], _o)))
+                .shuffle(Vec(_pointer_load(v4i32_type, _g3_ptr(pins[1], _o))), [0, 1, 2, 3, 4, 5, 6, 7])
+                .ir_value()
+            )
+
+        def _a8n_read(pins, mt):
+            _o = mt * _A8_MT
+            return (
+                Vec(_pointer_load(v4i32_type, _g3_ptr(pins[0], _o)))
+                .shuffle(Vec(_pointer_load(v4i32_type, _g3_ptr(pins[1], _o))), [0, 1, 2, 3, 4, 5, 6, 7])
+                .ir_value()
+            )
+
         def _keepalive_v4(v4list):
             """Pin the -lse C-init registers live past GEMM1a.
 
@@ -2363,7 +2926,45 @@ def build_flash_attn_bwd_dkdv_module(
                     has_side_effects=True,
                 )
 
-        def _gemm_qk(a_base, b_packs, inits=None, mts=None, pin=None, drop=None):
+        def _as_i64(v):
+            """A 2-dword pack as the i64 operand the legacy fp8 MFMA takes."""
+            return _raw(fx.Int64(Vec(v).bitcast(fx.Int64)[0]))
+
+        def _gemm_qk8n(a_base, b_packs, inits=None, mts=None, drop=None, blds=False):
+            """S[mt][nt] = [q_hi | q_lo] @ [K | K]^T on one 16x16x128 MFMA per tile. Same C layout, same
+            four accumulator chains and the same -log2e*lse C-init as the bf16 body -- only the
+            contraction is twice as long and the operands are bytes.
+            """
+            _mts = list(range_constexpr(MT)) if mts is None else list(mts)
+            _pins = _a8n_pins(a_base)
+            _bp = [_b8n_read(b_packs, nt) for nt in range_constexpr(NT)] if blds else b_packs
+            out = {mt: [None] * NT for mt in _mts}
+            for mt in _mts:
+                _nts = [nt for nt in range_constexpr(NT) if drop is None or not drop(mt, nt)]
+                if const_expr(not _nts):
+                    continue
+                _a = _a8n_read(_pins, mt)
+                for nt in _nts:
+                    out[mt][nt] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        v4f32_type,
+                        [
+                            _a,
+                            _bp[nt],
+                            c_zero_v4f32 if inits is None else inits[mt],
+                            0,
+                            0,
+                            0,
+                            _raw(_g1_sc),
+                            0,
+                            _raw(_g1_sc),
+                        ],
+                    )
+            return out
+
+        def _mfma_qk8(a, b, c):
+            return _mfma(rocdl.mfma_f32_16x16x32_fp8_fp8, _as_i64(a), _as_i64(b), c)
+
+        def _gemm_qk(a_base, b_packs, inits=None, mts=None, pin=None, drop=None, fp8=False):
             """S[mt][nt] (v4f32) = A(Q/dO)[mt] @ B(owned K/V)[nt]^T over D. inits[mt]
             optionally pre-loads the accumulator (folds -delta into the dP GEMM for free).
             mts restricts work to a subset of the MT q-tiles (per-half GEMM1); the
@@ -2390,11 +2991,25 @@ def build_flash_attn_bwd_dkdv_module(
             for mt in _mts:
                 if const_expr(not _nts[mt]):
                     continue
-                a[mt] = [
-                    Vec.load(mfma_pack_type, lds, [_a_idx(a_base, mt, ks, pin)])
-                    for ks in range_constexpr(K_STEPS_QK)
-                ]
+                a[mt] = (
+                    None
+                    if const_expr(fp8)
+                    else [
+                        Vec.load(mfma_pack_type, lds, [_a_idx(a_base, mt, ks, pin)])
+                        for ks in range_constexpr(K_STEPS_QK)
+                    ]
+                )
             out = {mt: [None] * NT for mt in _mts}
+            _acc = _mfma_qk8 if const_expr(fp8) else mfma_acc
+            # One A fragment per (D step, Q term): a two-term Q shares each B pack.
+            _na = int(fp8) if const_expr(fp8) else 1
+            _bk = lambda nt, i: b_packs[nt][i // _na]  # noqa: E731
+            _a8p = [_a8_pin(a_base, ks) for ks in range_constexpr(K_STEPS_QK)] if fp8 else None
+            _ak = (
+                (lambda mt, i: _a8_read(_a8p[i // _na], mt, i % _na))
+                if const_expr(fp8)
+                else (lambda mt, i: a[mt][i])
+            )
             if const_expr(G1_KS_OUTER):
                 # Emit the D-contraction outermost so the len(_mts)*NT accumulator chains
                 # interleave: consecutive MFMAs are independent instead of being the next
@@ -2404,16 +3019,17 @@ def build_flash_attn_bwd_dkdv_module(
                 for mt in _mts:
                     for nt in _nts[mt]:
                         out[mt][nt] = c_zero_v4f32 if inits is None else inits[mt]
-                for ks in range_constexpr(K_STEPS_QK):
+                for ks in range_constexpr(K_STEPS_QK * _na):
+                    _af = {mt: _ak(mt, ks) for mt in _mts if _nts[mt]}
                     for mt in _mts:
                         for nt in _nts[mt]:
-                            out[mt][nt] = mfma_acc(a[mt][ks], b_packs[nt][ks], out[mt][nt])
+                            out[mt][nt] = _acc(_af[mt], _bk(nt, ks), out[mt][nt])
             else:
                 for mt in _mts:
                     for nt in _nts[mt]:
                         acc = c_zero_v4f32 if inits is None else inits[mt]
-                        for ks in range_constexpr(K_STEPS_QK):
-                            acc = mfma_acc(a[mt][ks], b_packs[nt][ks], acc)
+                        for ks in range_constexpr(K_STEPS_QK * _na):
+                            acc = _acc(_ak(mt, ks), _bk(nt, ks), acc)
                         out[mt][nt] = acc
             return out
 
@@ -2498,6 +3114,118 @@ def build_flash_attn_bwd_dkdv_module(
             v1 = ds_read_tr_v4f16(a_base + _pblk(row1) * fx.Index(PBLK) + _swizzle(row1, col))
             return Vec(v0).shuffle(Vec(v1), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
 
+        QF8_PKS = (PV_K_STEP // N_TILE) * ROW_BLK * PBLK  # byte step of one q-half
+
+        def _qf8_base(slot_bytes, img_base=QF8_BASE):
+            """Pinned (dt=0, pks=0) fp8 Q^T/dO^T transpose-read address for this lane."""
+            _j = lane16 // fx.Index(2)
+            _r = kg * fx.Index(4) + (_j % fx.Index(4)) + (_j // fx.Index(4)) * fx.Index(N_TILE)
+            return _opaque_idx(
+                fx.Index(img_base)
+                + slot_bytes
+                + _pblk(_r) * fx.Index(PBLK)
+                + (((lane % fx.Index(2)) * fx.Index(8)) ^ ((_r & fx.Index(7)) << fx.Index(4)))
+            )
+
+        def _qf8_read(base, dt, pks):
+            """GEMM2b A-operand [m=D=dt*16+lane16][k=q], 8 E4M3 bytes, one tr8 read."""
+            return _ds_read_tr8(base ^ fx.Index(dt * D_TILE), pks * QF8_PKS).ir_value()
+
+        # ---- G12_FP8 operands. Q and dO sit in LDS as E4M3 bytes in the same [row][col]
+        # tile layout the bf16 image uses, only with a byte as the index unit -- so every
+        # reader below reaches them through _g3_ptr and the swizzle is unchanged.
+        #
+        # The k axis of all four GEMMs is a CONTRACTION index, so the byte order within a lane is
+        # ours to choose as long as the two operands of a product agree.
+        def _pi_row(j):
+            """q row (within the q block) that byte j of lane group `lgrp` carries."""
+            return fx.Index(32 * (j // 16) + 8 * ((j % 16) // 4) + (j % 4)) + lgrp * fx.Index(4)
+
+        # GEMM2's A operand is a transposed read of the same image: lane l wants D = l%32 (so the
+        # two 16-lane groups of a half-wave take adjacent 16-column blocks) and, at byte j, the q
+        # row _pi_row(j).
+        _TR32_OFF = [(16 * (r % 2) + 32 * (r // 2)) // 16 * (ROW_BLK * PBLK) for r in range(4)]
+
+        def _tr32_base(a_base, dtd):
+            _r = (
+                _pi_row(0)
+                + (lane16 // fx.Index(2)) % fx.Index(4)
+                + fx.Index(8) * ((lane16 // fx.Index(2)) // fx.Index(4))
+            )
+            return _opaque_idx(
+                fx.Index(a_base)
+                + _pblk(_r) * fx.Index(PBLK)
+                + (
+                    (
+                        fx.Index(dtd * 32)
+                        + (kg % fx.Index(2)) * fx.Index(16)
+                        + (lane % fx.Index(2)) * fx.Index(8)
+                    )
+                    ^ ((_r & fx.Index(7)) << fx.Index(4))
+                )
+            )
+
+        def _tr32_read(base):
+            _rd = [
+                Vec(rocdl.ds_read_tr8_b64(v2i32_type, _g3_ptr(base, _TR32_OFF[r])).result)
+                for r in range_constexpr(4)
+            ]
+            _lo = _rd[0].shuffle(_rd[1], [0, 1, 2, 3])
+            _hi = _rd[2].shuffle(_rd[3], [0, 1, 2, 3])
+            return _lo.shuffle(_hi, list(range_constexpr(8))).ir_value()
+
+        # GEMM1a / dP keep bf16 operands on v_mfma_f32_32x32x16_bf16, whose C layout is the same
+        # 32x32 map the f8f6f4 shape uses -- so S and dP still hand P and dS to GEMM2 as its fp8 B
+        # operand with no cross-lane movement.
+        K32B_STEPS = HEAD_DIM // 16
+
+        def _g12b_swz(row):
+            """Extra 8-element rotation the bf16 Q/dO image carries on top of _swizzle. One PBLK block is
+            128 bf16 = 256 B = exactly the 64 LDS banks, so the block index contributes nothing to the
+            bank and every row of the image lands in the same bank space with only (row&7)<<4 to
+            separate it.
+            """
+            return ((row >> fx.Index(3)) & fx.Index(1)) * fx.Index(8)
+
+        def _a32b_base(a_base, qt):
+            _r = fx.Index(qt * 32) + lane32
+            return _opaque_idx(
+                fx.Index(a_base + G12B_BASE // 2)
+                + _pblk(_r) * fx.Index(PBLK)
+                + ((lgrp * fx.Index(8)) ^ _g12b_swz(_r) ^ ((_r & fx.Index(7)) << fx.Index(4)))
+            )
+
+        def _mfma32b(a, b, c):
+            return rocdl.mfma_f32_32x32x16_bf16(v16f32_type, [a, b, c])
+
+        def _fp8_pack_v16(f32_vals, exp=0):
+            """16 f32 -> 16 E4M3 bytes (the 4 dwords one q tile contributes to a B operand)."""
+            _lo = _fp8_pack_v8(list(f32_vals[:8]), exp)
+            return _lo.shuffle(_fp8_pack_v8(list(f32_vals[8:]), exp), [0, 1, 2, 3])
+
+        # Per-tensor E8M0 scale bytes for the four 32x32x64 GEMMs.
+        def _e8m0(e):
+            """The E8M0 byte for 2^-e, in all four byte lanes of one VGPR."""
+            return _vgpr_const_i32((127 - e) * 0x01010101)
+
+        _g12_sc = _e8m0(G12_QKE) if const_expr(G12_FP8) else None
+        _g12_scp = _e8m0(G12_P_E) if const_expr(G12_FP8) else None
+        _g12_scs = _e8m0(G12_S_E) if const_expr(G12_FP8) else None
+
+        def _mfma32(a, b, c, scb=None):
+            return rocdl.mfma_scale_f32_32x32x64_f8f6f4(
+                v16f32_type,
+                _raw(a),
+                _raw(b),
+                _raw(c),
+                0,
+                0,
+                0,
+                _raw(_g12_sc),
+                0,
+                _raw(_g12_sc if scb is None else scb),
+            ).result
+
         # ---- GEMM3 (dQ) operands. Both are transpose-reads over the kv axis, so the kv
         # permutation ds_read_tr16 imposes is identical on the two sides and cancels in the
         # contraction. Wave w owns a G3_DT x G3_QT patch of the DT x MT output and contracts
@@ -2518,29 +3246,42 @@ def build_flash_attn_bwd_dkdv_module(
         # for the tile index, one XOR (the tile index lands in bits 4-5 of the swizzled
         # column, disjoint from the lane column's bits 2-3, so `column + tile == column
         # XOR tile`).
+        # A transposed read hands lane l column l%16 of a [rows][16 cols] tile and takes its
+        # rows from the lanes' own addresses, so the row a lane fetches is (lane16 // e) where
+        # e = elements per lane per row: 4 at b16 (4 rows per read), 2 at b8 (8 rows per read).
+        G3_TRE = 2 if G3_FP8 else 4  # lanes per row of one transposed read
+        G3_TRR = 8 if G3_FP8 else 4  # rows one transposed read covers
+        G3_TRN = 4 if G3_FP8 else 2  # reads per operand (32 B/lane at b8, 16 B at b16)
+
         def _g3_row0():
-            return kg * fx.Index(4) + (lane16 // fx.Index(4))
+            return kg * fx.Index(G3_TRR) + (lane16 // fx.Index(G3_TRE))
 
         def _g3_kbase(tile0):
-            """Pinned (kk=0, row-half=0, tile=tile0) K/V transpose-read address."""
+            """Pinned (kk=0, read=0, tile=tile0) K/V transpose-read address."""
             _r = _g3_row0()
             return _opaque_idx(
                 fx.Index(G3K_BASE)
                 + _pblk(_r) * fx.Index(PBLK)
                 + (
                     (tile0 * fx.Index(D_TILE))
-                    ^ ((lane % fx.Index(4)) * fx.Index(4))
+                    ^ ((lane % fx.Index(G3_TRE)) * fx.Index(16 // G3_TRE))
                     ^ ((_r & fx.Index(7)) << fx.Index(4))
                 )
             )
 
         def _g3_tr(base, tile, kk, row_stride, off=0):
-            """Transpose-read a [kv][col] LDS tile -> operand [m/n=col=tile*16+lane16][k=kv].
-
-            base is a pinned family base, tile the compile-time index within the family.
+            """Transpose-read a [kv][col] LDS tile -> operand [m/n=col=tile*16+lane16][k=kv]. base is a
+            pinned family base, tile the compile-time index within the family.
             """
             _b = base ^ fx.Index(tile * D_TILE) if const_expr(tile) else base
-            _o = off + kk * PV_K_STEP * row_stride
+            _o = off + kk * G3_FP8_K * row_stride
+            if const_expr(G3_FP8):
+                _rd = [
+                    _ds_read_tr8(_b, _o + r * G3_TRR * G3_TRN * row_stride) for r in range_constexpr(G3_TRN)
+                ]
+                _lo = _rd[0].shuffle(_rd[1], [0, 1, 2, 3])
+                _hi = _rd[2].shuffle(_rd[3], [0, 1, 2, 3])
+                return _lo.shuffle(_hi, [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
             _v0 = ds_read_tr_v4f16(_b, _o)
             _v1 = ds_read_tr_v4f16(_b, _o + N_TILE * row_stride)
             return Vec(_v0).shuffle(Vec(_v1), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
@@ -2568,9 +3309,35 @@ def build_flash_attn_bwd_dkdv_module(
                 + ((kg * fx.Index(8)) ^ ((lane16 & fx.Index(7)) * fx.Index(8)))
             )
 
+        def _g3s_swz(r):
+            """dS/P column swizzle. Folding the row's high bits in makes all four rotations distinct
+            while staying a pure column XOR, so the pinned-base plus tile-XOR addressing above still
+            holds.
+            """
+            if const_expr(G12_FP8):
+                # Four 16 B rotations keyed on row bits 1-2.
+                return ((r >> fx.Index(1)) & fx.Index(3)) * fx.Index(16)
+            return (r & fx.Index(7)) * fx.Index(8)
+
+        def _g3s_wbase32():
+            """Pinned (qt=0, g=0, kt=0, slot=0) dS write address for this lane's kv row."""
+            _r = wave_id * fx.Index(ROWS_PER_WAVE_KV) + lane32
+            return _opaque_idx(
+                fx.Index(G3S_BASE) + _r * fx.Index(BLOCK_Q) + ((lgrp * fx.Index(32)) ^ _g3s_swz(_r))
+            )
+
         def _g3_qrow(tile):
             """q row of GEMM3's n index ``tile*16 + lane16`` -- the inverse of the qp
             permutation the dS staging applies (see _g3s_wbase)."""
+            if const_expr(G12_FP8):
+                # qp = [b t a1 a0 c1 c0] -> q = [t a1 a0 b c1 c0] (see _pi_row).
+                _qp = tile * fx.Index(D_TILE) + lane16
+                return (
+                    (((_qp >> fx.Index(4)) & fx.Index(1)) << fx.Index(5))
+                    + (((_qp >> fx.Index(2)) & fx.Index(3)) << fx.Index(3))
+                    + (((_qp >> fx.Index(5)) & fx.Index(1)) << fx.Index(2))
+                    + (_qp & fx.Index(3))
+                )
             return (
                 ((tile >> fx.Index(1)) << fx.Index(5))
                 + ((tile & fx.Index(1)) << fx.Index(3))
@@ -2579,24 +3346,46 @@ def build_flash_attn_bwd_dkdv_module(
                 + (lane16 & fx.Index(3))
             )
 
+        def _g3s_zero():
+            """A zero dS run as the staging image holds it: 8 bf16, or 8 E4M3 bytes."""
+            _n = 2 if const_expr(G3_FP8) else 4
+            _z = Vec.from_elements([fx.Int32(0) for _ in range_constexpr(_n)], fx.Int32)
+            return _z if const_expr(G3_FP8) else _z.bitcast(elem_dtype)
+
         def _ds_write_vec(lds_elem_idx, const_elem_off, val):
             """LDS store reached through a pinned base + compile-time element offset."""
-            ptr = buffer_ops.create_llvm_ptr(fx.Int64(lds_elem_idx * 2 + lds_off), address_space=3)
-            if const_expr(const_elem_off != 0):
-                ptr = buffer_ops.get_element_ptr(ptr, fx.Int64(const_elem_off), elem_type=elem_type)
-            llvm.StoreOp(_raw(val), ptr)
+            llvm.StoreOp(_raw(val), _g3_ptr(lds_elem_idx, const_elem_off))
 
         def _g3_sbase(tile0):
-            """Pinned (kk=0, row-half=0, slot=0, tile=tile0) dS transpose-read address."""
+            """Pinned (kk=0, read=0, slot=0, tile=tile0) dS transpose-read address."""
             _r = _g3_row0()
             return _opaque_idx(
                 fx.Index(G3S_BASE)
                 + _r * fx.Index(BLOCK_Q)
                 + (
                     (tile0 * fx.Index(D_TILE))
-                    ^ ((lane % fx.Index(4)) * fx.Index(4))
-                    ^ ((_r & fx.Index(7)) * fx.Index(8))
+                    ^ ((lane % fx.Index(G3_TRE)) * fx.Index(16 // G3_TRE))
+                    ^ _g3s_swz(_r)
                 )
+            )
+
+        # Per-tensor E8M0 scale bytes: the same byte in all four lane groups, which is what makes a
+        # per-tensor scale free in this format (the byte lane l supplies is the scale of k-block
+        # l//16 of the whole wave's K).
+        _g3_sca = _vgpr_const_i32(127 - (G12_QKE if G12_FP8 else G3_FP8_KE)) if const_expr(G3_FP8) else None
+        _g3_scb = _vgpr_const_i32(127 - G3_FP8_SE) if const_expr(G3_FP8) else None
+        _g1_sc = _vgpr_const_i32(127) if const_expr(G1A_N128) else None
+        # GEMM2b at K=128: A is the Q twin, which crosses the handover unscaled (2^0), and B
+        # is the very dS image GEMM3 reads, so its scale byte is _g3_scb's.
+        _g2b_sca = _vgpr_const_i32(127) if const_expr(G2B_K128) else None
+        # GEMM2a at K=128: A is dO's twin (2^0) and B is P, boosted by 2^G2A_P_E.
+        _g2a_scb = _vgpr_const_i32(127 - G2A_P_E) if const_expr(G2A_K128) else None
+
+        def _g3_mfma(a, b, c):
+            if const_expr(not G3_FP8):
+                return mfma_acc(a, b, c)
+            return rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                v4f32_type, [a, b, c, 0, 0, 0, _raw(_g3_sca), 0, _raw(_g3_scb)]
             )
 
         _amask_cell = [None]
@@ -2705,7 +3494,7 @@ def build_flash_attn_bwd_dkdv_module(
                         _ring[_kk % _gd] = _g3_frags(_kk + _gd, _dg)
                     for i in range_constexpr(len(_dg)):
                         for jj in range_constexpr(len(_qs)):
-                            _g3[i][jj] = mfma_acc(_g3k[i], _g3s[jj], _g3[i][jj])
+                            _g3[i][jj] = _g3_mfma(_g3k[i], _g3s[jj], _g3[i][jj])
                 if const_expr(drain is not None and _gi == 0):
                     drain()
                 for i2 in range_constexpr(len(_dg) // 2):
@@ -2730,11 +3519,29 @@ def build_flash_attn_bwd_dkdv_module(
         def _pin_bases():
             # One base per Q/dO ring slot: the slot offset is a whole-tile stride, far
             # above the swizzle's bit field, so each slot is just another pinned base.
-            _pins["q"] = [_tr_base(fx.Index(s * LDS_TOTAL)) for s in range_constexpr(LDS_SLOTS)]
-            _pins["do"] = [
-                _tr_base(fx.Index(s * LDS_TOTAL + LDS_DO_BASE)) for s in range_constexpr(LDS_SLOTS)
-            ]
+            _pins["q"] = (
+                [None] * LDS_SLOTS
+                if const_expr(G1A_FP8)
+                else [_tr_base(fx.Index(s * LDS_TOTAL)) for s in range_constexpr(LDS_SLOTS)]
+            )
+            _pins["do"] = (
+                [None] * LDS_SLOTS
+                if const_expr(DO_BF16_DEAD)
+                else [_tr_base(fx.Index(s * LDS_TOTAL + LDS_DO_BASE)) for s in range_constexpr(LDS_SLOTS)]
+            )
             _g3d0, _g3q0 = _g3_wave_tiles()
+            if const_expr(G12_FP8):
+                _pins["a32q"] = [_a32b_base(0, qt) for qt in range_constexpr(MT32)]
+                _pins["a32do"] = [_a32b_base(LDS_DO_BASE, qt) for qt in range_constexpr(MT32)]
+                _pins["tr32q"] = [_tr32_base(0, d) for d in range_constexpr(DT32)]
+                _pins["tr32do"] = [_tr32_base(LDS_DO_BASE, d) for d in range_constexpr(DT32)]
+                _pins["g3w32"] = _g3s_wbase32()
+            if const_expr(G2B_FP8):
+                _pins["qf8"] = [_qf8_base(fx.Index(s * LDS_TILE)) for s in range_constexpr(QF8_SLOTS)]
+            if const_expr(G2A_FP8):
+                _pins["dof8"] = [
+                    _qf8_base(fx.Index(s * LDS_TILE), DOF8_BASE) for s in range_constexpr(QF8_SLOTS)
+                ]
             _pins["g3w"] = _g3s_wbase()
             _pins["g3k"] = _g3_kbase(_g3d0)
             _pins["g3s"] = _g3_sbase(_g3q0)
@@ -2758,9 +3565,9 @@ def build_flash_attn_bwd_dkdv_module(
                 for kk in range_constexpr(G3_KSTEPS)
             ]
 
-        H_ACCS = KV_HALVES * DT * NT
-        dv_accs = [c_zero_v4f32 for _ in range_constexpr(H_ACCS)]
-        dk_accs = [c_zero_v4f32 for _ in range_constexpr(H_ACCS)]
+        H_ACCS = KV_HALVES * ADT * ANT
+        dv_accs = [c_zero_acc for _ in range_constexpr(H_ACCS)]
+        dk_accs = [c_zero_acc for _ in range_constexpr(H_ACCS)]
 
         # Bottom-right causal: first query attending this kv-tile = max(0, kv_start-offset).
         # A band group's rows are square-causal against q = local row + lift (see _kv_lift).
@@ -2874,6 +3681,14 @@ def build_flash_attn_bwd_dkdv_module(
                 _i = _i + qoff
             return Vec.load(v4f32_type, ld_lds, [_i]).ir_value()
 
+        def _ld_read32(head_local, qt, a, arr):
+            # The 32-wide C layout gives a lane 16 q rows per tile, in four runs of four
+            # (q = qt*32 + 8a + 4*lgrp + c), so one v4f32 per run instead of one per tile.
+            _i = fx.Index(
+                arr * LD_ARR_ELEMS + head_local * LD_HEAD_ELEMS + qt * 32 + a * 8
+            ) + lgrp * fx.Index(4)
+            return Vec.load(v4f32_type, ld_lds, [_i])
+
         def _dma_head(head_local, bases):
             """Issue (no wait) the Q/dO DMA for head_local into its LDS slot."""
             sl = head_local % LDS_SLOTS
@@ -2909,20 +3724,137 @@ def build_flash_attn_bwd_dkdv_module(
 
         def _qdo_issue(q_start, head_local, poff=None):
             """Issue (no wait) head_local's Q/dO tile pair into VGPRs."""
-            return [
-                buffer_ops.buffer_load(
-                    rsrc, _qdo_src_elem(q_start, head_local, d, poff), vec_width=8, dtype=elem_dtype
-                )
-                for d in range_constexpr(NUM_DMA_Q)
-                for rsrc in (q_rsrc, do_rsrc)
-            ]
-
-        def _qdo_commit(vals, slot):
-            """Publish a prefetched Q/dO tile pair into the LDS slot."""
+            out = []
             for d in range_constexpr(NUM_DMA_Q):
-                _i = slot + fx.Index(d * (DMA_BATCH_BYTES // 2)) + tid * fx.Index(8)
-                Vec(vals[2 * d]).store(lds, [_i])
-                Vec(vals[2 * d + 1]).store(lds, [fx.Index(LDS_DO_BASE) + _i])
+                _idx = _qdo_src_elem(q_start, head_local, d, poff)
+                # Q_C8: Q's buffer is one byte per element where dO's is two, and every term
+                # of the shared index -- row stride, head stride and the swizzled column --
+                # is even, so Q's element index is exactly the shared one halved.
+                out.append(
+                    buffer_ops.buffer_load(
+                        q_rsrc,
+                        (_idx >> fx.Index(1)) if const_expr(Q_C8) else _idx,
+                        vec_width=4 if const_expr(Q_C8) else 8,
+                        dtype=elem_dtype,
+                    )
+                )
+                out.append(buffer_ops.buffer_load(do_rsrc, _idx, vec_width=8, dtype=elem_dtype))
+            return out
+
+        _BF16V2_T = Vec.make_type(2, elem_dtype)
+        _f32_one = fx.Float32(1.0)
+
+        def _fp8_of_bf16_v8(v, exp=0):
+            """8 bf16 -> 8 E4M3 bytes, straight from the pair-packed dwords. cvt_scalef32_pk_fp8_bf16
+            takes the bf16 pair as it already sits in the register, so the staging cast costs 4
+            instructions per 8 elements instead of the 12 an f32 round trip needs -- and this body is
+            VALU-issue bound.
+            """
+            _v = Vec(v)
+            words = []
+            for j in range_constexpr(2):
+                _p0 = _v.shuffle(_v, [4 * j, 4 * j + 1])
+                _p1 = _v.shuffle(_v, [4 * j + 2, 4 * j + 3])
+                _sc = fx.Float32(float(2**-exp))
+                w = rocdl.cvt_scalef32_pk_fp8_bf16(_I16V2_T, _undef(_I16V2_T), _raw(_p0), _raw(_sc), 0)
+                w = rocdl.cvt_scalef32_pk_fp8_bf16(_I16V2_T, w, _raw(_p1), _raw(_sc), 1)
+                words.append(fx.Int32(Vec(w).bitcast(fx.Int32)[0]))
+            return Vec.from_elements(words, fx.Int32)
+
+        def _split_pk8_v8(v):
+            """A staged v8 of E4M3 terms -> the two byte images."""
+            _b = Vec(v).bitcast(fx.Int32)
+            return (_b.shuffle(_b, [0, 1]), _b.shuffle(_b, [2, 3]))
+
+        _g12b_woff = (
+            tid * fx.Index(8) ^ (((tid >> fx.Index(6)) & fx.Index(1)) * fx.Index(8))
+            if const_expr(G12_FP8)
+            else None
+        )
+
+        def _dof8_publish(vals, q8slot):
+            """dO's E4M3 twin, cast from the STAGED tile and stored at q8slot."""
+            for d in range_constexpr(NUM_DMA_Q):
+                llvm.StoreOp(
+                    _raw(_fp8_of_bf16_v8(vals[2 * d + 1])),
+                    _g3_ptr(
+                        fx.Index(DOF8_BASE)
+                        + q8slot
+                        + fx.Index(d * (DMA_BATCH_BYTES // 2))
+                        + tid * fx.Index(8)
+                    ),
+                )
+
+        def _qf8_publish(vals, q8slot):
+            """Q's E4M3 twin (and its residual), stored at q8slot."""
+            for d in range_constexpr(NUM_DMA_Q):
+                _q8o = q8slot + fx.Index(d * (DMA_BATCH_BYTES // 2)) + tid * fx.Index(8)
+                if const_expr(Q_C8):
+                    _q8 = Vec(vals[2 * d]).bitcast(fx.Int32)
+                elif const_expr(Q2T):
+                    _q8, _q8r = _split_pk8_v8(vals[2 * d])
+                    if const_expr(not G1A_K2T):
+                        llvm.StoreOp(_raw(_q8r), _g3_ptr(fx.Index(QF8R_BASE) + _q8o))
+                else:
+                    _q8 = _fp8_of_bf16_v8(vals[2 * d])
+                llvm.StoreOp(_raw(_q8), _g3_ptr(fx.Index(QF8_BASE) + _q8o))
+
+        def _qdo_commit(vals, slot, q8slot=None, do8=True, q8=True):
+            """Publish a prefetched Q/dO tile pair into the LDS slot. Under G12_FP8 the tile is cast to
+            E4M3 on its way in -- the index formula is unit-agnostic, so the byte image is the SAME
+            [row][col] map the bf16 one has and every reader keeps its address arithmetic; only the
+            store halves.
+            """
+            for d in range_constexpr(NUM_DMA_Q):
+                _lo = fx.Index(d * (DMA_BATCH_BYTES // 2)) + tid * fx.Index(8)
+                _i = slot + _lo
+                if const_expr(G12_FP8):
+                    llvm.StoreOp(_raw(_fp8_of_bf16_v8(vals[2 * d], G12_QKE)), _g3_ptr(_i))
+                    llvm.StoreOp(
+                        _raw(_fp8_of_bf16_v8(vals[2 * d + 1], G12_QKE)),
+                        _g3_ptr(fx.Index(LDS_DO_BASE) + _i),
+                    )
+                    # The bf16 image carries _g12b_swz on top of the shared index; the byte image
+                    # keeps the plain map, since its block is 128 B and its readers are transposed.
+                    _bi = slot + fx.Index(d * (DMA_BATCH_BYTES // 2)) + _g12b_woff
+                    _b = fx.Index(G12B_BASE // 2)
+                    Vec(vals[2 * d]).store(lds, [_b + _bi])
+                    Vec(vals[2 * d + 1]).store(lds, [_b + fx.Index(LDS_DO_BASE) + _bi])
+                else:
+                    if const_expr(not G1A_FP8):
+                        Vec(vals[2 * d]).store(lds, [_i])
+                    if const_expr(not DO_BF16_DEAD):
+                        Vec(vals[2 * d + 1]).store(lds, [fx.Index(LDS_DO_BASE) + _i])
+                    if const_expr(G2B_FP8 and q8):
+                        # The twin's slot stride is LDS_TILE bytes against the bf16 pair's
+                        # LDS_TOTAL = 2*LDS_TILE elements, hence slot // 2. The store keeps
+                        # the bf16 image's own flat index -- the twin shares its map.
+                        _q8o = (slot // fx.Index(2) if q8slot is None else q8slot) + _lo
+                        if const_expr(Q_C8):
+                            # The compact handover already delivered the byte image; the
+                            # staged v4 IS the tile's 8 bytes for these 8 D elements.
+                            _q8 = Vec(vals[2 * d]).bitcast(fx.Int32)
+                        elif const_expr(Q2T):
+                            _q8, _q8r = _split_pk8_v8(vals[2 * d])
+                            if const_expr(not G1A_K2T):
+                                llvm.StoreOp(_raw(_q8r), _g3_ptr(fx.Index(QF8R_BASE) + _q8o))
+                        else:
+                            _q8 = _fp8_of_bf16_v8(vals[2 * d])
+                        llvm.StoreOp(_raw(_q8), _g3_ptr(fx.Index(QF8_BASE) + _q8o))
+                        if const_expr(G1B_N128):
+                            # dO crosses the handover already packed, so both of its images
+                            # are a register slice of the staged vector -- the same free
+                            # de-interleave Q gets, and no cast at all.
+                            _d8, _d8r = _split_pk8_v8(vals[2 * d + 1])
+                            llvm.StoreOp(_raw(_d8), _g3_ptr(fx.Index(DOF8_BASE) + _q8o))
+                            llvm.StoreOp(_raw(_d8r), _g3_ptr(fx.Index(DOF8R_BASE) + _q8o))
+                        elif const_expr(G2A_FP8 and do8):
+                            # dO's twin, cast here only when no earlier head-step could
+                            # publish it (see _dof8_publish / G2A_PUB_TAIL).
+                            llvm.StoreOp(
+                                _raw(_fp8_of_bf16_v8(vals[2 * d + 1])),
+                                _g3_ptr(fx.Index(DOF8_BASE) + _q8o),
+                            )
 
         def _vgpr_load_head(head_local, q_start):
             """VGPR-staged fallback for _dma_head (ENABLE_DMA off)."""
@@ -2946,6 +3878,7 @@ def build_flash_attn_bwd_dkdv_module(
             half=False,
             hsel=None,
             nq=None,
+            pk_carry=None,
         ):
             # The next head's Q/dO fetch: the earlier it is issued the more of this step
             # covers it, and the longer its 16 B per tensor stay live over the body's
@@ -2968,8 +3901,18 @@ def build_flash_attn_bwd_dkdv_module(
 
             q_start_i32 = fx.Int32(q_start)
             kg_off_i32 = fx.Int32(kg) * fx.Int32(4)
+            lgrp_off_i32 = fx.Int32(lgrp) * fx.Int32(4)
             _slot_lds = fx.Index((head_local % LDS_SLOTS) * LDS_TOTAL)
             q_lds = _slot_lds
+            # K128: the head-pair flush reads this head's twin AND its predecessor's, so the
+            # twin's slot index runs over QF8_SLOTS, not over the bf16 ring's LDS_SLOTS.
+            _q8_pin = const_expr(head_local % QF8_SLOTS)
+            # Only the second head of a pair flushes dK, over both heads' packs at K=128.
+            _k128 = const_expr(G2B_K128 and not half and not apply_mask)
+            _k128a = const_expr(G2A_K128 and not half and not apply_mask)
+
+            # The E4M3 Q tile's base, in bytes: same flat map, one slot of LDS_TILE bytes.
+            q8_lds = fx.Index(QF8_BASE + _q8_pin * LDS_TILE)
             # FQ_PAIR: the paired trip's second half-tile holds rows q_start + poff instead
             # of the contiguous q_start + BLOCK_Q/2, and each wave runs only its own half,
             # so the LDS base, (-delta, lse) rows and mask q index all shift accordingly.
@@ -2980,7 +3923,12 @@ def build_flash_attn_bwd_dkdv_module(
                 _hs = wave_id if const_expr(hsel is None) else hsel
                 _hq = _hs * fx.Index(BLOCK_Q // 2)
                 q_lds = q_lds + _hs * fx.Index(FQ_PAIR_HALF)
+                if const_expr(G1A_FP8):
+                    q8_lds = q8_lds + _hs * fx.Index(FQ_PAIR_HALF)
             do_lds = q_lds + fx.Index(LDS_DO_BASE)
+            # dO's E4M3 image pair rides Q's twin map and slot stride, so its base is the
+            # same expression at a different image (see DOF8_BASE / DOF8R_BASE).
+            do8_lds = q8_lds - fx.Index(QF8_BASE) + fx.Index(DOF8_BASE)
 
             def _ld_rd(mt, arr):
                 return _ld_read(head_local, mt, arr, _hq)
@@ -3008,11 +3956,19 @@ def build_flash_attn_bwd_dkdv_module(
                 # step's GEMM3 run (same two barriers, no second ring slot) loses: the
                 # staged tile then has to stay live across GEMM1/GEMM2 instead.
                 if const_expr(not QDO_TAIL or head_local == 0):
-                    _qdo_commit(qdo, _slot_lds)
+                    _qdo_commit(
+                        qdo,
+                        _slot_lds,
+                        fx.Index(_q8_pin * LDS_TILE),
+                        do8=const_expr(not G2A_PUB_TAIL or head_local == 0),
+                        q8=const_expr(Q8_FWD == 0 or (head_local == 0 and Q8_FWD != 3)),
+                    )
                     qdo = None
                     _qdo_pf(0)
                     if const_expr(head_local == 0):
                         _stage_ld_commit(_ldv)
+                    # These drains are free to write: SIInsertWaitcnts re-derives exactly
+                    # them, so dropping them leaves the ISA unchanged.
                     rocdl.s_waitcnt(WAIT_LGKM)  # retire ds_writes; the loads stay in flight
                     gpu.barrier()  # Q/dO + ld_lds commit visible before GEMM1 reads
                 else:
@@ -3130,23 +4086,34 @@ def build_flash_attn_bwd_dkdv_module(
 
             def _flat_accs():
                 _h = _H[0]
-                return [dv_cur[_h][dt][nt] for dt in range_constexpr(DT) for nt in range_constexpr(NT)] + [
-                    dk_cur[_h][dt][nt] for dt in range_constexpr(DT) for nt in range_constexpr(NT)
+                return [dv_cur[_h][dt][nt] for dt in range_constexpr(ADT) for nt in range_constexpr(ANT)] + [
+                    dk_cur[_h][dt][nt] for dt in range_constexpr(ADT) for nt in range_constexpr(ANT)
                 ]
 
             def _set_accs(vals):
                 _h = _H[0]
-                for dt in range_constexpr(DT):
-                    for nt in range_constexpr(NT):
-                        dv_cur[_h][dt][nt] = vals[dt * NT + nt]
-                        dk_cur[_h][dt][nt] = vals[DT * NT + dt * NT + nt]
+                for dt in range_constexpr(ADT):
+                    for nt in range_constexpr(ANT):
+                        dv_cur[_h][dt][nt] = vals[dt * ANT + nt]
+                        dk_cur[_h][dt][nt] = vals[ADT * ANT + dt * ANT + nt]
+
+            def _q_read(dt, pks):
+                if const_expr(G2B_FP8):
+                    return _qf8_read(_qf8_trb, dt, pks)
+                return _read_tr(q_lds, dt, pks, _q_trb)
+
+            def _do_read(dt, pks):
+                """GEMM2a's A operand: one tr8 read of dO's twin, or two tr16 of its bf16
+                tile. The twin shares Q's map, so the address is the same pinned form."""
+                if const_expr(G2A_FP8):
+                    return _qf8_read(_dof8_trb, dt, pks)
+                return _read_tr(do_lds, dt, pks, _do_trb)
 
             def _gemm2(pk_list, do_ring, q_ring, carry_rdv):
-                """GEMM2a dV^T += dO_tr @ P ; GEMM2b dK^T += Q_tr @ dS over the DT d-tiles.
-
-                pk_list selects which q-halves this pass consumes; a depth-g2d dt prefetch
-                ring issues dt+g2d's transpose-reads before dt's MFMAs so the ds_read_tr16
-                LDS latency hides in the MFMA shadow. g2d=1 -> depth-1 baseline.
+                """GEMM2a dV^T += dO_tr @ P ; GEMM2b dK^T += Q_tr @ dS over the DT d-tiles. pk_list
+                selects which q-halves this pass consumes; a depth-g2d dt prefetch ring issues
+                dt+g2d's transpose-reads before dt's MFMAs so the ds_read_tr16 LDS latency hides in
+                the MFMA shadow. g2d=1 -> depth-1 baseline.
                 """
                 _nk = len(pk_list)
                 # PF_RING rendezvous, parked on the LAST GEMM2 step rather than at the head
@@ -3179,39 +4146,56 @@ def build_flash_attn_bwd_dkdv_module(
                     if const_expr(dt == 1 and pk_list[-1] == _pk_list[-1]):
                         _qdo_pf(3)
                     _slot = dt % g2d
-                    do_tr = do_ring[_slot]
-                    q_tr = q_ring[_slot]
+                    do_tr = None if const_expr(_k128a) else do_ring[_slot]
+                    q_tr = None if const_expr(_k128) else q_ring[_slot]
                     _rd_next = dt + g2d < DT
-                    if const_expr(_rd_next):
-                        do_tr_n = [
-                            _read_tr(do_lds, dt + g2d, pk_list[i], _do_trb) for i in range_constexpr(_nk)
-                        ]
-                    for i in range_constexpr(_nk):
+                    if const_expr(_rd_next and not _k128a):
+                        do_tr_n = [_do_read(dt + g2d, pk_list[i]) for i in range_constexpr(_nk)]
+                    for i in range_constexpr(0 if _k128a else _nk):
                         for nt in range_constexpr(NT):
                             if const_expr(p_pack[pk_list[i]][nt] is None):
                                 continue  # zero pack (see MASK_ALIGN)
-                            _dvh[dt][nt] = mfma_acc(do_tr[i], p_pack[pk_list[i]][nt], _dvh[dt][nt])
-                    if const_expr(NT >= 3):
+                            if const_expr(G2A_FP8):
+                                _dvh[dt][nt] = rocdl.mfma_f32_16x16x32_fp8_fp8(
+                                    v4f32_type,
+                                    [
+                                        _as_i64(do_tr[i]),
+                                        _as_i64(p_pack[pk_list[i]][nt]),
+                                        _dvh[dt][nt],
+                                    ],
+                                )
+                            else:
+                                _dvh[dt][nt] = mfma_acc(do_tr[i], p_pack[pk_list[i]][nt], _dvh[dt][nt])
+                    if const_expr(G2_KEEPALIVE and not _k128a):
                         # NT>=3 pins the packs' liveness hard enough that the RA sinks the
                         # pack next to the MFMA that reads it as SrcB. Pinning the dV group
                         # live past its MFMAs blocks that sinking, which reduces spill even
                         # now that the scored pack makes the sink itself legal. Naming fewer
                         # than all four elements of each tuple saves v_accvgpr reads but
-                        # measures neutral, so all four stay; the pin is dV-only (dK regresses).
+                        # See G2_KEEPALIVE for why it is off here.
                         _keepalive_v4([_dvh[dt][nt] for nt in range_constexpr(NT)])
-                    if const_expr(_rd_next):
-                        q_tr_n = [_read_tr(q_lds, dt + g2d, pk_list[i], _q_trb) for i in range_constexpr(_nk)]
-                    for i in range_constexpr(_nk):
+                    if const_expr(_rd_next and not _k128):
+                        q_tr_n = [_q_read(dt + g2d, pk_list[i]) for i in range_constexpr(_nk)]
+                    for i in range_constexpr(0 if _k128 else _nk):
                         for nt in range_constexpr(NT):
                             if const_expr(ds_pack[pk_list[i]][nt] is None):
                                 continue  # zero pack (see MASK_ALIGN)
-                            _dkh[dt][nt] = mfma_acc(q_tr[i], ds_pack[pk_list[i]][nt], _dkh[dt][nt])
+                            if const_expr(G2B_FP8):
+                                _dkh[dt][nt] = rocdl.mfma_f32_16x16x32_fp8_fp8(
+                                    v4f32_type,
+                                    [
+                                        _as_i64(q_tr[i]),
+                                        _as_i64(ds_pack[pk_list[i]][nt]),
+                                        _dkh[dt][nt],
+                                    ],
+                                )
+                            else:
+                                _dkh[dt][nt] = mfma_acc(q_tr[i], ds_pack[pk_list[i]][nt], _dkh[dt][nt])
                     if const_expr(_rd_next):
                         # Grouping the whole read set ahead of the MFMA run loses, even
                         # though it drops half the run's s_waitcnt lgkmcnt(2), because the
                         # read burst blocks MFMA issue. Dropping the hints entirely and
-                        # letting the default scheduler place the run is worse still, so
-                        # this pair is load-bearing, not decorative.
+                        # letting the default scheduler place the run is worse still.
                         # Scale the hints by the MFMAs actually emitted, not by _nk*NT: a
                         # skipped zero pack has no MFMA for a read to interleave with.
                         _hn = sum(
@@ -3220,26 +4204,220 @@ def build_flash_attn_bwd_dkdv_module(
                             for _n in range_constexpr(NT)
                             if p_pack[pk_list[_i]][_n] is not None
                         )
-                        for _ in range_constexpr(_n_out * _hn):
+                        for _ in range_constexpr(((0 if _k128a else 1) + (0 if _k128 else 1)) * _hn):
                             rocdl.sched_mfma(1)
                             rocdl.sched_dsrd(1)
-                        do_ring[_slot] = do_tr_n
-                        q_ring[_slot] = q_tr_n
+                        if const_expr(not _k128a):
+                            do_ring[_slot] = do_tr_n
+                        if const_expr(not _k128):
+                            q_ring[_slot] = q_tr_n
+                rocdl.s_setprio(0)
+
+            def _cat_i32(vs):
+                """Four 2-dword packs -> the 32 B operand the 16x16x128 MFMA takes."""
+                _lo = Vec(vs[0]).shuffle(Vec(vs[1]), [0, 1, 2, 3])
+                _hi = Vec(vs[2]).shuffle(Vec(vs[3]), [0, 1, 2, 3])
+                return _lo.shuffle(_hi, [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
+
+            def _g2_k128(prev, cur, pins, accs, sca, scb):
+                """One head-PAIR of GEMM2 as 16x16x128_f8f6f4: dK^T += [Q_h0 | Q_h1]^T . [dS_h0 ; dS_h1],
+                and under G2A_K128 dV^T += [dO_h0 | dO_h1]^T . [P_h0 ; P_h1].
+                """
+                rocdl.s_setprio(1)
+                for dt in range_constexpr(DT):
+                    _a = _cat_i32([_qf8_read(pins[c][0], dt, pins[c][1]) for c in range_constexpr(4)])
+                    for nt in range_constexpr(NT):
+                        _b = _cat_i32(
+                            [prev[p][nt] for p in range_constexpr(2)]
+                            + [cur[p][nt] for p in range_constexpr(2)]
+                        )
+                        accs[dt][nt] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                            v4f32_type,
+                            [_a, _b, accs[dt][nt], 0, 0, 0, _raw(sca), 0, _raw(scb)],
+                        )
+                    for _ in range_constexpr(NT):
+                        rocdl.sched_mfma(1)
+                        rocdl.sched_dsrd(1)
+                rocdl.s_setprio(0)
+
+            # ---- G12_FP8 head step: GEMM1a / dP / softmax / dS on 32x32 tiles, then ONE GEMM2
+            # pass whose K is the whole q block.
+            def _ld_rd32(qt, arr):
+                _v = [_ld_read32(head_local, qt, a, arr) for a in range_constexpr(4)]
+                return (
+                    _v[0]
+                    .shuffle(_v[1], list(range_constexpr(8)))
+                    .shuffle(_v[2].shuffle(_v[3], list(range_constexpr(8))), list(range_constexpr(16)))
+                    .ir_value()
+                )
+
+            def _mask32(qt, kt, rc):
+                q_slot = q_start_i32 + fx.Int32(qt * 32 + 8 * (rc // 4) + (rc % 4)) + lgrp_off_i32
+                _kv = fx.Int32(kv_row_wave + fx.Index(_H[0] * BKV_H + kt * 32) + lane32)
+                _mm = ArithValue(_kv > q_slot + causal_off_i32)
+                if const_expr(Q_BOUND):
+                    _mm = ArithValue(arith.ori(_raw(_mm), _raw(ArithValue(q_slot >= seq_len_q_i32))))
+                return _mm
+
+            def _gemm1_32(qt, cls32):
+                if const_expr(EXP_IGLP):
+                    rocdl.iglp_opt(IGLP_EXP_INTERLEAVE)
+                _spec = (
+                    (_pins["a32q"][qt], k_b_packs[_H[0]], _ld_rd32(qt, 1)),
+                    (_pins["a32do"][qt], v_b_packs[_H[0]], _ld_rd32(qt, 0)),
+                )
+                if const_expr(G1_ILV32):
+                    # One ks loop over BOTH GEMMs: 2*NT32 accumulator chains alternate, so a
+                    # 32x32x16's result latency is covered by three siblings instead of one.
+                    _accs = [[_s[2]] * NT32 for _s in _spec]
+                    for ks in range_constexpr(K32B_STEPS):
+                        _av = [
+                            Vec.load(v8f16_type, lds, [_s[0] ^ fx.Index(16 * ks)]).ir_value() for _s in _spec
+                        ]
+                        for kt in range_constexpr(NT32):
+                            if const_expr(cls32(qt, kt) == 2):
+                                continue
+                            for gi in range_constexpr(2):
+                                _accs[gi][kt] = _mfma32b(_av[gi], _spec[gi][1][kt][ks], _accs[gi][kt])
+                    return _accs[0], _accs[1]
+                _out = []
+                for _abase, _bp, _init in _spec:
+                    _acc = [_init] * NT32
+                    for ks in range_constexpr(K32B_STEPS):
+                        _a = Vec.load(v8f16_type, lds, [_abase ^ fx.Index(16 * ks)]).ir_value()
+                        for kt in range_constexpr(NT32):
+                            if const_expr(cls32(qt, kt) == 2):
+                                continue
+                            _acc[kt] = _mfma32b(_a, _bp[kt][ks], _acc[kt])
+                    _out.append(_acc)
+                return _out[0], _out[1]
+
+            def _soft32(qt, st, dp, cls32):
+                _g3w32 = _pins["g3w32"]
+                _zw4 = Vec.from_elements([fx.Int32(0) for _ in range_constexpr(4)], fx.Int32)
+                _preg = [None] * NT32
+                for kt in range_constexpr(NT32):
+                    _off = (
+                        kt * 32 * BLOCK_Q + (head_local % G3S_SLOTS) * G3S_GRP_ELEMS + _H[0] * G3S_SLOT_ELEMS
+                    )
+                    if const_expr(cls32(qt, kt) == 2):
+                        # Fully masked: P = dS = 0 exactly, but both rows are still
+                        # published -- GEMM2 reads them back and GEMM3 contracts the
+                        # WHOLE band.
+                        _ds_write_vec(_g3w32 ^ fx.Index(16 * qt), _off, _zw4)
+                        if const_expr(G12_P_REG):
+                            _preg[kt] = _zw4
+                        else:
+                            _ds_write_vec(_g3w32 ^ fx.Index(16 * qt), _off + G12P_BASE - G3S_BASE, _zw4)
+                        continue
+                    _sv = Vec(st[kt])
+                    _dv = Vec(dp[kt])
+                    if const_expr(apply_mask):
+                        _P = [
+                            _vexp_intrin(_mask32(qt, kt, rc).select(c_neg_inf, fx.Float32(_sv[rc])))
+                            for rc in range_constexpr(16)
+                        ]
+                    else:
+                        _P = [_vexp_intrin(fx.Float32(_sv[rc])) for rc in range_constexpr(16)]
+                    # One v16 multiply, not 16 scalars: the packed form is what the bf16
+                    # body's v_pk_mul_f32 count comes from and this body is VALU-issue bound.
+                    _dsv = Vec.from_elements([_raw(x) for x in _P], fx.Float32) * _dv
+                    _dS = [fx.Float32(_dsv[rc]) for rc in range_constexpr(16)]
+                    _pp = _fp8_pack_v16(_P, G12_P_E)
+                    _sp = _fp8_pack_v16(_dS, G12_S_E)
+                    _ds_write_vec(_g3w32 ^ fx.Index(16 * qt), _off, _sp)
+                    if const_expr(G12_P_REG):
+                        _preg[kt] = _pp
+                    else:
+                        _ds_write_vec(_g3w32 ^ fx.Index(16 * qt), _off + G12P_BASE - G3S_BASE, _pp)
+                return _preg
+
+            def _read_b32(base, kt):
+                """GEMM2's B operand straight out of the [kv][qp] image this wave wrote. The write
+                address IS the read address: qp = 32*lgrp + j is exactly the k byte order the 32x32x64
+                B operand wants at n = kv = lane%32.
+                """
+                _off = base + kt * 32 * BLOCK_Q + (head_local % G3S_SLOTS) * G3S_GRP_ELEMS
+                _rd = [
+                    Vec(
+                        _pointer_load(v4i32_type, _g3_ptr(_pins["g3w32"] ^ fx.Index(16 * g), _off - G3S_BASE))
+                    )
+                    for g in range_constexpr(2)
+                ]
+                return _rd[0].shuffle(_rd[1], list(range_constexpr(8))).ir_value()
+
+            def _gemm2_32(preg):
+                _dvh, _dkh = dv_cur[_H[0]], dk_cur[_H[0]]
+                if const_expr(G12_P_REG):
+                    # The two q tiles' packs concatenate into the 32 B B operand directly:
+                    # read g of the LDS form fetched exactly what q tile g wrote.
+                    _pb = [
+                        Vec(preg[0][kt]).shuffle(Vec(preg[1][kt]), list(range_constexpr(8))).ir_value()
+                        for kt in range_constexpr(NT32)
+                    ]
+                rocdl.s_waitcnt(WAIT_LGKM)  # RAW: this wave's own dS rows
+                if const_expr(not G12_P_REG):
+                    _pb = [_read_b32(G12P_BASE, kt) for kt in range_constexpr(NT32)]
+                _sb = None
+                rocdl.s_setprio(1)
+                if const_expr(G2_ILV32):
+                    # dV and dK deal into ONE run: 2*NT32 chains alternate, so a
+                    # 32x32x64's result latency is covered by three siblings, not one.
+                    _sb = [_read_b32(G3S_BASE, kt) for kt in range_constexpr(NT32)]
+                    for dtd in range_constexpr(DT32):
+                        if const_expr(dtd == 1):
+                            _qdo_pf(3)
+                        _do_tr = _tr32_read(_pins["tr32do"][dtd])
+                        _q_tr = _tr32_read(_pins["tr32q"][dtd])
+                        for kt in range_constexpr(NT32):
+                            _dvh[dtd][kt] = _mfma32(_do_tr, _pb[kt], _dvh[dtd][kt], _g12_scp)
+                            _dkh[dtd][kt] = _mfma32(_q_tr, _sb[kt], _dkh[dtd][kt], _g12_scs)
+                    rocdl.s_setprio(0)
+                    return
+                for dtd in range_constexpr(DT32):
+                    if const_expr(dtd == 1):
+                        _qdo_pf(3)
+                    _do_tr = _tr32_read(_pins["tr32do"][dtd])
+                    for kt in range_constexpr(NT32):
+                        _dvh[dtd][kt] = _mfma32(_do_tr, _pb[kt], _dvh[dtd][kt], _g12_scp)
+                    if const_expr(dtd == 0):
+                        _sb = [_read_b32(G3S_BASE, kt) for kt in range_constexpr(NT32)]
+                    _q_tr = _tr32_read(_pins["tr32q"][dtd])
+                    for kt in range_constexpr(NT32):
+                        _dkh[dtd][kt] = _mfma32(_q_tr, _sb[kt], _dkh[dtd][kt], _g12_scs)
                 rocdl.s_setprio(0)
 
             if const_expr(HOIST_PIN):
                 _slot_pin = const_expr(head_local % LDS_SLOTS)
                 _q_trb, _do_trb = _pins["q"][_slot_pin], _pins["do"][_slot_pin]
+                _qf8_trb = _pins["qf8"][_q8_pin] if const_expr(G2B_FP8) else None
+                _dof8_trb = _pins["dof8"][_q8_pin] if const_expr(G2A_FP8) else None
                 if const_expr(half):
-                    _q_trb = _q_trb + _hs * fx.Index(FQ_PAIR_HALF)
+                    if const_expr(not G1A_FP8):
+                        _q_trb = _q_trb + _hs * fx.Index(FQ_PAIR_HALF)
                     _do_trb = _do_trb + _hs * fx.Index(FQ_PAIR_HALF)
+                    if const_expr(G2B_FP8):
+                        _qf8_trb = _qf8_trb + _hs * fx.Index(FQ_PAIR_HALF)
+                    if const_expr(G2A_FP8):
+                        _dof8_trb = _dof8_trb + _hs * fx.Index(FQ_PAIR_HALF)
             else:
                 _q_trb = _tr_base(q_lds) if const_expr(TR_PIN) else None
                 _do_trb = _tr_base(do_lds) if const_expr(TR_PIN) else None
+                assert not G2B_FP8, "the fp8 Q twin is reached through a pinned base"
+                _qf8_trb = None
+                _dof8_trb = None
             _q_apin = _a_pin(q_lds) if const_expr(A_PIN) else None
             _do_apin = _a_pin(do_lds) if const_expr(A_PIN) else None
 
             def _gemm_dp(half, drop=None):
+                if const_expr(G1B_N128):
+                    return _gemm_qk8n(
+                        do8_lds,
+                        v8n_packs[_H[0]],
+                        inits={mt: _ld_rd(mt, 0) for mt in half},
+                        mts=half,
+                        drop=drop,
+                    )
                 return _gemm_qk(
                     do_lds,
                     v_b_packs[_H[0]],
@@ -3250,21 +4428,9 @@ def build_flash_attn_bwd_dkdv_module(
                 )
 
             def _half_gemm1(half, cls):
-                """The MFMA-only front of a q-half: S = Q@K^T and, fused, dP = dO@V^T.
-
-                dP does not depend on P, so at D128 it is issued FIRST: its MFMA run then
-                covers the quarter-rate exp2 chain that GEMM1a's accumulators feed, instead
-                of trailing it. D128 is occ=1 (no sibling wave to hide the exps) and PMC puts
-                it at MFMA 51% / VALU 29%, so that overlap is worth having. The split D64
-                body runs at occ=2 and keeps the legacy order -> byte-identical. The FUSED
-                body is occ=2 as well but all 8 waves are barrier-locked into the same
-                head-step, so the siblings reach their exp chain together and cover nothing
-                for each other -- it takes the D128 order (arithmetic unchanged either way).
-                Pipelining the dS/pack block that follows against MFMA is a measured loss in
-                both directions: splitting dP per kv 16-tile so each tile's VALU trails the
-                next tile's MFMAs costs 4.0% (two accumulator chains cannot cover an MFMA's
-                result latency), and deferring a whole half's block into the next half's
-                GEMM1a costs 0.9% (its P/dP stay live across those 24 MFMAs).
+                """The MFMA front of a q-half: S = Q@K^T and, fused, dP = dO@V^T. dP does not depend on
+                P, so at D128 it is issued FIRST: its MFMA run then covers the quarter-rate exp2 chain
+                that GEMM1a's accumulators feed, instead of trailing it.
                 """
                 if const_expr(EXP_IGLP):
                     # One call per q-half: the region's MFMA -> exp chain is per half, and
@@ -3276,22 +4442,27 @@ def build_flash_attn_bwd_dkdv_module(
                     # A fully masked 16-tile's S and dP are read by nothing (see MASK_ALIGN).
                     return cls(mt, nt) == 2
 
-                if const_expr(not apply_mask or WIN_FOLD):
-                    _st = _gemm_qk(
-                        q_lds,
-                        k_b_packs[_H[0]],
-                        inits={mt: _ld_rd(mt, 1) for mt in half},
+                _qa, _kb = (q8_lds, k8_packs[_H[0]]) if const_expr(G1A_FP8) else (q_lds, k_b_packs[_H[0]])
+                _na_q = 2 if const_expr(Q2T) else 1
+                _g1_inits = {mt: _ld_rd(mt, 1) for mt in half} if not apply_mask or WIN_FOLD else None
+                if const_expr(G1A_N128):
+                    _st = _gemm_qk8n(
+                        _qa,
+                        _b8n_pins(_H[0]) if const_expr(G1A_KLDS) else k8n_packs[_H[0]],
+                        inits=_g1_inits,
                         mts=half,
-                        pin=_q_apin,
                         drop=_drop,
+                        blds=G1A_KLDS,
                     )
                 else:
                     _st = _gemm_qk(
-                        q_lds,
-                        k_b_packs[_H[0]],
+                        _qa,
+                        _kb,
+                        inits=_g1_inits,
                         mts=half,
                         pin=_q_apin,
                         drop=_drop,
+                        fp8=_na_q if const_expr(G1A_FP8) else 0,
                     )
                 _dpt = _gemm_dp(half, _drop)
                 # Extending the GEMM2 s_setprio(1) pair over this run too (so a SIMD's two
@@ -3341,16 +4512,16 @@ def build_flash_attn_bwd_dkdv_module(
                     _mm = ArithValue(arith.ori(_raw(_mm), _raw(ArithValue(q_slot >= seq_len_q_i32))))
                 return _mm
 
-            def _half_soft(pks, half, s_tiles, dp_tiles, cls):
-                """softmax -> dS -> bf16 pack (-> dS publish) for one q-half.
-
-                Returns the GEMM2 transpose-read ring this half primed, or None.
+            def _half_exp(half, s_tiles, cls):
+                """P = exp(S - lse) for one q-half. Reads GEMM1a's accumulators and nothing else, so it
+                is the earliest computable segment of the softmax and the only one that could in
+                principle be issued before GEMM1b.
                 """
-                ma, mb = half
                 P = [[None] * NT for _ in range_constexpr(MT)]
+                _nts = list(range_constexpr(NT))
                 if const_expr(not apply_mask or WIN_FOLD):
                     for mt in half:
-                        for nt in range_constexpr(NT):
+                        for nt in _nts:
                             if const_expr(cls(mt, nt) == 2):
                                 continue  # P == 0: no exp2, no dS, no pack (see MASK_ALIGN)
                             s_v = Vec(s_tiles[mt][nt])
@@ -3372,7 +4543,7 @@ def build_flash_attn_bwd_dkdv_module(
                 else:
                     for mt in half:
                         lse_v = _ld_rd(mt, 1)
-                        for nt in range_constexpr(NT):
+                        for nt in _nts:
                             if const_expr(cls(mt, nt) == 2):
                                 continue
                             s_v = s_tiles[mt][nt]
@@ -3383,6 +4554,13 @@ def build_flash_attn_bwd_dkdv_module(
                                     s_r = _mask_lanes(mt, nt, t).select(c_neg_inf, s_r)
                                 p_vals.append(_p_of(s_r, fx.Float32(Vec(lse_v)[t]), apply_mask))
                             P[mt][nt] = p_vals
+                return P
+
+            def _half_soft(pks, half, dp_tiles, cls, P):
+                """dS -> pack (-> dS publish) for one q-half, from P and GEMM1b's dP. Returns the GEMM2
+                transpose-read ring this half primed, or None.
+                """
+                ma, mb = half
 
                 # Hoist the first g2d dt's GEMM2 transpose-reads into the LAST half's
                 # dS/pack shadow: the ds_read_tr16 LDS latency overlaps that VALU block
@@ -3391,37 +4569,66 @@ def build_flash_attn_bwd_dkdv_module(
                 _rings = None
                 if const_expr(G2_HALF or pks == _pk_list[-1]):
                     _rings = (
-                        [
-                            [_read_tr(do_lds, _d, _p, _do_trb) for _p in _pk_seg]
-                            for _d in range_constexpr(g2d)
-                        ],
-                        [[_read_tr(q_lds, _d, _p, _q_trb) for _p in _pk_seg] for _d in range_constexpr(g2d)],
+                        None
+                        if const_expr(_k128a)
+                        else [[_do_read(_d, _p) for _p in _pk_seg] for _d in range_constexpr(g2d)],
+                        None
+                        if const_expr(_k128)
+                        else [[_q_read(_d, _p) for _p in _pk_seg] for _d in range_constexpr(g2d)],
                     )
 
-                for nt in range_constexpr(NT):
+                _z4 = [c_zero_f for _ in range_constexpr(4)]
+                _p8s = [None] * NT
+
+                def _pass_p(nt):
+                    """P's own pack. Its input chain is exp -> pack, i.e. TRANS -> VALU."""
                     if const_expr(P[ma][nt] is None and P[mb][nt] is None):
                         # Both q-tiles of this K-step are fully masked, so the pack is exactly
                         # zero: GEMM2 skips it (a zero B leaves dK/dV alone) but the dS row must
                         # still be published as zeros, like _dead -- GEMM3 contracts the WHOLE band.
                         p_pack[pks][nt] = None
+                        return
+                    _p8s[nt] = Vec.from_elements(
+                        [
+                            _raw(v)
+                            for mt in half
+                            for v in (P[mt][nt] if const_expr(P[mt][nt] is not None) else _z4)
+                        ],
+                        fx.Float32,
+                    )
+                    p_pack[pks][nt] = (
+                        _fp8_pack_v8([fx.Float32(_p8s[nt][e]) for e in range_constexpr(8)], G2A_P_E)
+                        if const_expr(G2A_FP8)
+                        else bf16_trunc_pack_v8(_p8s[nt])
+                    )
+
+                def _pass_ds(nt):
+                    """dS = P*(dP - delta) and its pack. Its input chain is MFMA -> VALU."""
+                    if const_expr(_p8s[nt] is None):
                         ds_pack[pks][nt] = None
-                        _dsv = Vec.from_elements([fx.Int32(0) for _ in range_constexpr(4)], fx.Int32).bitcast(
-                            elem_dtype
-                        )
+                        _dsv = _g3s_zero()
                     else:
-                        _z4 = [c_zero_f for _ in range_constexpr(4)]
+                        _p8 = _p8s[nt]
                         _ds = [
-                            [_fmul(P[mt][nt][t], Vec(dp_tiles[mt][nt])[t]) for t in range_constexpr(4)]
+                            _ds_mul(
+                                [fx.Float32(_p8[4 * _i + t]) for t in range_constexpr(4)],
+                                dp_tiles[mt][nt],
+                            )
                             if const_expr(P[mt][nt] is not None)
                             else _z4
-                            for mt in half
+                            for _i, mt in enumerate(half)
                         ]
-                        p_pack[pks][nt] = bf16_trunc_pack_v8(
-                            (P[ma][nt] if const_expr(P[ma][nt] is not None) else _z4)
-                            + (P[mb][nt] if const_expr(P[mb][nt] is not None) else _z4)
-                        )
-                        ds_pack[pks][nt] = bf16_trunc_pack_v8(_ds[0] + _ds[1])
-                        _dsv = ds_pack[pks][nt]
+                        if const_expr(G2B_FP8):
+                            # ONE dS pack, not two: GEMM2b and GEMM3 share the E4M3 image.
+                            ds_pack[pks][nt] = _fp8_pack_v8(_ds[0] + _ds[1], G3_FP8_SE)
+                            _dsv = ds_pack[pks][nt]
+                        else:
+                            ds_pack[pks][nt] = bf16_trunc_pack_v8(_ds[0] + _ds[1])
+                            _dsv = (
+                                _fp8_pack_v8(_ds[0] + _ds[1], G3_FP8_SE)
+                                if const_expr(G3_FP8)
+                                else ds_pack[pks][nt]
+                            )
                     # Publish dS as [kv][qp] for GEMM3's transpose-read. The v8 pack is
                     # q = {ma,mb}*16 + kg*4 + t of ONE kv row, which the qp permutation
                     # lays out as ONE 8-wide run -> a single ds_write_b128 (see
@@ -3434,15 +4641,13 @@ def build_flash_attn_bwd_dkdv_module(
                     if const_expr(FQ_PAIR and _hs is not None):
                         _qx = _hs * fx.Index(2 * M_TILE)
                         _ds_write_vec(_g3wb ^ _qx, _g3wo, _dsv)
-                        _ds_write_vec(
-                            (_g3wb ^ _qx) ^ fx.Index(2 * M_TILE),
-                            _g3wo,
-                            Vec.from_elements([fx.Int32(0) for _ in range_constexpr(4)], fx.Int32).bitcast(
-                                elem_dtype
-                            ),
-                        )
+                        _ds_write_vec((_g3wb ^ _qx) ^ fx.Index(2 * M_TILE), _g3wo, _g3s_zero())
                     else:
                         _ds_write_vec(_g3wb ^ fx.Index(pks * 2 * M_TILE), _g3wo, _dsv)
+
+                for nt in range_constexpr(NT):
+                    _pass_p(nt)
+                    _pass_ds(nt)
 
                 return _rings
 
@@ -3463,6 +4668,32 @@ def build_flash_attn_bwd_dkdv_module(
                     def cls(mt, nt):
                         return 1 if const_expr(apply_mask) else 0
 
+                if const_expr(G12_FP8):
+                    # A 32-tile takes the strictest class of its four 16-subtiles: on the
+                    # diagonal wave that still leaves one tile fully masked per q tile.
+                    def _cls32(qt, kt):
+                        _c = [
+                            cls(2 * qt + i, 2 * kt + j)
+                            for i in range_constexpr(2)
+                            for j in range_constexpr(2)
+                        ]
+                        return 0 if all(x == 0 for x in _c) else (2 if all(x == 2 for x in _c) else 1)
+
+                    _preg = [None] * MT32
+                    for qt in range_constexpr(MT32):
+                        _st, _dp = _gemm1_32(qt, _cls32)
+                        if const_expr(hooks):
+                            _hs_hook(3 * qt + 1)
+                        _preg[qt] = _soft32(qt, _st, _dp, _cls32)
+                        if const_expr(hooks):
+                            _hs_hook(3 * qt + 2)
+                    if const_expr(pf):
+                        _qdo_pf(2)
+                    _gemm2_32(_preg)
+                    if const_expr(hooks):
+                        _hs_hook(3 * MT32)
+                    return
+
                 _rings = None
                 for pks in _pk_list:
                     half = [2 * pks, 2 * pks + 1]
@@ -3478,7 +4709,7 @@ def build_flash_attn_bwd_dkdv_module(
                         _gemm3(q_start, head_local, 0, qsel=pks - 1, depth=G3D_E)
                     if const_expr(hooks):
                         _hs_hook(_at + 1)
-                    _rings = _half_soft(pks, half, _st, _dpt, cls)
+                    _rings = _half_soft(pks, half, _dpt, cls, _half_exp(half, _st, cls))
                     if const_expr(hooks):
                         _hs_hook(_at + 2)
                     if const_expr(g3_split and pks < PV_K_STEPS - 1):
@@ -3496,6 +4727,49 @@ def build_flash_attn_bwd_dkdv_module(
                         )
                         if const_expr(hooks):
                             _hs_hook(_at + 3)
+                        if const_expr(_k128 and _last and head_local % 2 == 0):
+                            # The even head's dS packs stay live across the odd head's whole
+                            # GEMM1, which is what the AGPR file is for (see _AGPR_PIN_*).
+                            pk_carry[0] = [
+                                [
+                                    None
+                                    if x is None
+                                    else (_agpr_pin(x, 2) if const_expr(_AGPR_PIN_DS) else x)
+                                    for x in ds_pack[p]
+                                ]
+                                for p in range_constexpr(2)
+                            ]
+                            if const_expr(_k128a):
+                                pk_carry[1] = [list(p_pack[p]) for p in range_constexpr(2)]
+                        elif const_expr(_k128 and _last):
+                            # The pair's dK, flushed on its ODD head.
+                            _prev = const_expr((head_local - 1) % QF8_SLOTS)
+
+                            def _chunks(pin_prev, pin_cur):
+                                return [
+                                    (pin_prev, 0),
+                                    (pin_prev, 1),
+                                    (pin_cur, 0),
+                                    (pin_cur, 1),
+                                ]
+
+                            if const_expr(_k128a):
+                                _g2_k128(
+                                    pk_carry[1],
+                                    p_pack,
+                                    _chunks(_pins["dof8"][_prev], _dof8_trb),
+                                    dv_cur[_H[0]],
+                                    _g2b_sca,
+                                    _g2a_scb,
+                                )
+                            _g2_k128(
+                                pk_carry[0],
+                                ds_pack,
+                                _chunks(_pins["qf8"][_prev], _qf8_trb),
+                                dk_cur[_H[0]],
+                                _g2b_sca,
+                                _g3_scb,
+                            )
 
                 if const_expr(not G2_HALF):
                     if const_expr(pf):
@@ -3543,9 +4817,24 @@ def build_flash_attn_bwd_dkdv_module(
                         return _base[0]  # noqa: B023
 
                     def _dead():
-                        _z = Vec.from_elements([fx.Int32(0) for _ in range_constexpr(4)], fx.Int32).bitcast(
-                            elem_dtype
-                        )
+                        if const_expr(G12_FP8):
+                            _zw = Vec.from_elements([fx.Int32(0) for _ in range_constexpr(4)], fx.Int32)
+                            for kt in range_constexpr(NT32):
+                                _zo = (
+                                    kt * 32 * BLOCK_Q
+                                    + (head_local % G3S_SLOTS) * G3S_GRP_ELEMS
+                                    + _H[0] * G3S_SLOT_ELEMS
+                                )
+                                for qt in range_constexpr(MT32):
+                                    _ds_write_vec(_pins["g3w32"] ^ fx.Index(16 * qt), _zo, _zw)
+                                    if const_expr(not G12_P_REG):
+                                        _ds_write_vec(
+                                            _pins["g3w32"] ^ fx.Index(16 * qt),
+                                            _zo + G12P_BASE - G3S_BASE,
+                                            _zw,
+                                        )
+                            return
+                        _z = _g3s_zero()
                         for nt in range_constexpr(NT):
                             _zo = (
                                 nt * N_TILE * BLOCK_Q
@@ -3591,10 +4880,22 @@ def build_flash_attn_bwd_dkdv_module(
                 if const_expr(QDO_TAIL and head_local + 1 < GQA_GROUP_SIZE and _qdo_next[0] is not None):
                     # Head h+1's tile rides this fence. Its ring slot was last read by
                     # head h-1, whose reads all precede the previous head-step's barrier.
-                    _qdo_commit(_qdo_next[0], fx.Index(((head_local + 1) % LDS_SLOTS) * LDS_TOTAL))
+                    _qdo_commit(
+                        _qdo_next[0],
+                        fx.Index(((head_local + 1) % LDS_SLOTS) * LDS_TOTAL),
+                        fx.Index(((head_local + 1) % QF8_SLOTS) * LDS_TILE),
+                    )
                     _qdo_next[0] = None
                 rocdl.s_waitcnt(WAIT_LGKM)
                 gpu.barrier()  # RAW: every wave's dS rows feed every wave's GEMM3
+                if const_expr(Q8_FWD == 1 and head_local + 1 < GQA_GROUP_SIZE) and _qdo_next[0] is not None:
+                    # Head h+1's twin, written into the slot head h-1 vacated. The barrier
+                    # above is the WAR edge; the RAW edge is head h+1's own commit barrier,
+                    # which it still pays for the bf16 dO tile.
+                    _qf8_publish(_qdo_next[0], fx.Index(((head_local + 1) % QF8_SLOTS) * LDS_TILE))
+                if const_expr(G2A_PUB_TAIL and head_local + 1 < GQA_GROUP_SIZE) and _qdo_next[0] is not None:
+                    # The next head's twin, cast in GEMM3's shadow.
+                    _dof8_publish(_qdo_next[0], fx.Index(((head_local + 1) % QF8_SLOTS) * LDS_TILE))
                 _gemm3(
                     q_start,
                     head_local,
@@ -3604,6 +4905,9 @@ def build_flash_attn_bwd_dkdv_module(
                     ),
                     poff=poff,
                 )
+                if const_expr(Q8_FWD == 2 and head_local + 1 < GQA_GROUP_SIZE) and _qdo_next[0] is not None:
+                    # Placement 2: after GEMM3, i.e. the last thing the head-step does.
+                    _qf8_publish(_qdo_next[0], fx.Index(((head_local + 1) % QF8_SLOTS) * LDS_TILE))
             return dv_cur, dk_cur, (_qdo_next if const_expr(Q_PREF) else [qdo, None])
 
         def _q_body(q_start, inner, apply_mask, poff=None, half=False, hsel=None, nq=None):
@@ -3611,13 +4915,16 @@ def build_flash_attn_bwd_dkdv_module(
             # inner (loop-carried) = [dv accs][dk accs] (+ [Q/dO][-delta, lse] under PF_QB).
             _dk_base = H_ACCS
             dv_cur = [
-                [[inner[(h * DT + dt) * NT + nt] for nt in range_constexpr(NT)] for dt in range_constexpr(DT)]
+                [
+                    [inner[(h * ADT + dt) * ANT + nt] for nt in range_constexpr(ANT)]
+                    for dt in range_constexpr(ADT)
+                ]
                 for h in range_constexpr(KV_HALVES)
             ]
             dk_cur = [
                 [
-                    [inner[_dk_base + (h * DT + dt) * NT + nt] for nt in range_constexpr(NT)]
-                    for dt in range_constexpr(DT)
+                    [inner[_dk_base + (h * ADT + dt) * ANT + nt] for nt in range_constexpr(ANT)]
+                    for dt in range_constexpr(ADT)
                 ]
                 for h in range_constexpr(KV_HALVES)
             ]
@@ -3640,6 +4947,7 @@ def build_flash_attn_bwd_dkdv_module(
                 _stage_ld_commit(_ldv)
                 rocdl.s_waitcnt(0)
                 gpu.barrier()
+            _pkc = [None, None]
             for head_local in range_constexpr(GQA_GROUP_SIZE):
                 # Only the leader of each DMA_GRP-sized head group stages tiles; the rest
                 # consume slots this group already published.
@@ -3675,6 +4983,7 @@ def build_flash_attn_bwd_dkdv_module(
                     half=half,
                     hsel=hsel,
                     nq=nq,
+                    pk_carry=_pkc,
                 )
                 _qdo = _pf[0]
                 if const_expr(_pf[1] is not None):
@@ -3689,14 +4998,14 @@ def build_flash_attn_bwd_dkdv_module(
             out = [
                 dv_cur[h][dt][nt]
                 for h in range_constexpr(KV_HALVES)
-                for dt in range_constexpr(DT)
-                for nt in range_constexpr(NT)
+                for dt in range_constexpr(ADT)
+                for nt in range_constexpr(ANT)
             ]
             out += [
                 dk_cur[h][dt][nt]
                 for h in range_constexpr(KV_HALVES)
-                for dt in range_constexpr(DT)
-                for nt in range_constexpr(NT)
+                for dt in range_constexpr(ADT)
+                for nt in range_constexpr(ANT)
             ]
             if const_expr(PF_QB):
                 out += list(_qdo) + list(_ldv)
@@ -3822,23 +5131,80 @@ def build_flash_attn_bwd_dkdv_module(
         # CONTIGUOUS D values (D = dt*16 + kg*4 + t) at kv = nt*16 + lane16, so the
         # store is direct (no permlane32 transpose needed, unlike the 32x32 path). ----
         sm_vec4 = Vec.from_elements([fx.Float32(sm_scale)], fx.Float32).broadcast_to(4)
+        # G2A_FP8 boosts P by 2^G2A_P_E so the softmax clears E4M3's subnormals, and the legacy K=32
+        # fp8 shape has no E8M0 scale operand to carry the factor.
+        dv_vec4 = (
+            Vec.from_elements([fx.Float32(float(2**-G2A_P_E))], fx.Float32).broadcast_to(4)
+            if const_expr(G2A_FP8 and not G2A_K128)
+            else None
+        )
 
-        def _store(accs, rsrc, scale):
+        def _dkv_idxs():
+            """Flat (h, dt, nt) store indices of the dK/dV epilogue, in emission order."""
+            return [
+                global_idx_kv(kv_row_of(nt, h), fx.Index(dt * D_TILE) + kg * fx.Index(4))
+                for h in range_constexpr(KV_HALVES)
+                for dt in range_constexpr(DT)
+                for nt in range_constexpr(NT)
+            ]
+
+        def _slot_prev(rsrc):
+            return [Vec(buffer_ops.buffer_load(rsrc, g, vec_width=4, dtype=elem_dtype)) for g in _dkv_idxs()]
+
+        def _store(accs, rsrc, scale, acc=None):
+            if const_expr(G12_FP8):
+                # 32x32 C-layout: lane l owns kv = kt*32 + l%32 and, in reg 4a+c, the D
+                # index dtd*32 + 8a + 4*(l//32) + c -- still four CONTIGUOUS D per store.
+                for h in range_constexpr(KV_HALVES):
+                    for dtd in range_constexpr(DT32):
+                        for kt in range_constexpr(NT32):
+                            _v16 = Vec(accs[(h * DT32 + dtd) * NT32 + kt])
+                            _row = kv_row_wave + fx.Index(h * BKV_H + kt * 32) + lane32
+                            for a in range_constexpr(4):
+                                v = Vec.from_elements(
+                                    [_raw(fx.Float32(_v16[4 * a + c])) for c in range_constexpr(4)],
+                                    fx.Float32,
+                                )
+                                if const_expr(scale is not None):
+                                    v = v * scale
+                                lo = rocdl.cvt_pk_bf16_f32(v[0], v[1])
+                                hi = rocdl.cvt_pk_bf16_f32(v[2], v[3])
+                                o_pack = Vec.from_elements([fx.Int32(_raw(lo)), fx.Int32(_raw(hi))], fx.Int32)
+                                d_col = fx.Index(dtd * 32 + a * 8) + lgrp * fx.Index(4)
+                                buffer_ops.buffer_store(
+                                    o_pack,
+                                    rsrc,
+                                    global_idx_kv(_row, d_col) * fx.Index(2),
+                                    offset_is_bytes=True,
+                                )
+                return
+            idxs = _dkv_idxs()
+            prevs = acc
+            i = 0
             for h in range_constexpr(KV_HALVES):
                 for dt in range_constexpr(DT):
                     for nt in range_constexpr(NT):
                         v = Vec(accs[(h * DT + dt) * NT + nt])
-                        if const_expr(scale):
-                            v = v * sm_vec4
+                        if const_expr(scale is not None):
+                            v = v * scale
+                        if const_expr(prevs is not None):
+                            v = v + prevs[i].to(fx.Float32)
                         lo = rocdl.cvt_pk_bf16_f32(v[0], v[1])
                         hi = rocdl.cvt_pk_bf16_f32(v[2], v[3])
                         o_pack = Vec.from_elements([fx.Int32(_raw(lo)), fx.Int32(_raw(hi))], fx.Int32)
-                        d_col = fx.Index(dt * D_TILE) + kg * fx.Index(4)
-                        g_idx = global_idx_kv(kv_row_of(nt, h), d_col)
-                        buffer_ops.buffer_store(o_pack, rsrc, g_idx * fx.Index(2), offset_is_bytes=True)
+                        buffer_ops.buffer_store(o_pack, rsrc, idxs[i] * fx.Index(2), offset_is_bytes=True)
+                        i += 1
 
-        _store(dv_accs, dv_rsrc, False)
-        _store(dk_accs, dk_rsrc, True)
+        # DKV_ADD: read both slots' running sums up front. They are a whole dispatch behind their
+        # producer, so only DRAM latency is in the way, and one work-group per CU has no sibling
+        # wave to cover it if the read is issued late.
+        if const_expr(DKV_ADD):
+            _dv_prev = _slot_prev(dv_rsrc)
+            _dk_prev = _slot_prev(dk_rsrc)
+        else:
+            _dv_prev = _dk_prev = None
+        _store(dv_accs, dv_rsrc, dv_vec4, acc=_dv_prev)
+        _store(dk_accs, dk_rsrc, sm_vec4, acc=_dk_prev)
 
     @flyc.jit
     def launch_flash_attn_bwd_dkdv(
@@ -3923,6 +5289,7 @@ def build_flash_attn_bwd_dkdv_module(
         # 892.5 against 918.9, and every amdgpu-sched-strategy override is worse still
         # (max-memory-clause 863.0, max-ilp 888.4) -- the hand-placed sched_mfma/sched_dsrd
         # structure is what the default scheduler is being asked to preserve.
+        # See amdgpu-mfma-vgpr-form at _AGPR_PIN_*.
         "llvm_options": {"enable-post-misched": True, "lsr-drop-solution": True},
     }
     _compiled: dict = {}
@@ -4046,9 +5413,19 @@ _DQRED_CACHE: dict = {}
 _DQRED_CACHE_MAX = 256
 
 
+_CU_PH: dict = {}
+
+
 def _cu_placeholder(device):
-    """Unused cu_seqlens argument slot (read only under ``const_expr(varlen)``)."""
-    return torch.zeros(1, device=device, dtype=torch.int32)
+    """Unused cu_seqlens argument slot (read only under ``const_expr(varlen)``). Cached per device:
+    nothing ever writes it, and a fresh ``zeros`` costs a 1-work-group fill dispatch plus its host
+    launch on the serial head in front of the first body.
+    """
+    ph = _CU_PH.get(device)
+    if ph is None:
+        ph = torch.zeros(1, device=device, dtype=torch.int32)
+        _CU_PH[device] = ph
+    return ph
 
 
 def _dq_partial_ws(nb, B, Sq, hd, device, dtype, pad_bytes=0, ilv=1, carry=False, pair=False):
@@ -4381,6 +5758,8 @@ _DQ_CHUNK_FOLD_BYTES = 1 << 30
 # Slices a HIDDEN dQ fold is issued in (see _fold_slices). What a hidden fold costs is not its
 # own latency but what it does to the body under it, and that is paid per BURST, not per byte.
 # A COUNT, not a burst width; capped because each slice is a build-time (qsp, batch) that JITs.
+# A finer slice does NOT buy the overrunning middle fold a better interleave; it only multiplies the per-
+# launch ramp the reduce already pays under a 2-fill body.
 _DQ_FOLD_SLICES = 16
 # So the count is a cap and this is the floor that stops it: the fold's bytes, per slice. Below
 # it a slice no longer amortizes its ramp and stops keeping up with the body it hides under.
@@ -4496,40 +5875,17 @@ def _fold_slices(B, Sq, q_split, lo, n, fold_bytes, bat_lo=0, n_bat=None):
     return [(bat, q) for bat in bats for q in qs]
 
 
-def _fused_pipelined(
-    dkdv_l,
-    odo_l,
-    bufs,
-    ws_dq,
-    dq,
-    B,
-    Sq,
-    Skv,
-    block_kv,
-    Hq,
-    Hkv,
-    D,
-    q_split,
-    stream,
-    window_left=-1,
-    sbhd=False,
-    band_ring=0,
-    band_pair=0,
-):
-    """Run the fused kernel in chunks -- on BATCH and on the q_split SUBSET -- and hide each chunk's
-    dQ reduce under the next. A batch chunk needs a token-major layout (batch b contiguous); strides
-    stay whole-batch, so dQ is bitwise. Return: join before reading dQ, slot reduce enqueued first."""
-    qf, kf, vf, dof, o16, lsef, df, wk, wv, cu_ph = bufs
-    # Both queues stay at the DEFAULT priority. A reduce launch is many tiny work-groups
-    # against a fused chunk's few large ones, so every CU slot the fused body frees is
-    # taken by a reduce work-group before the next fused chunk lands, and the two
-    # co-resident kernels do measurably interfere. Skewing HSA queue priority to fix it
-    # loses both ways (starving either side costs more than the current balance), so
-    # the interference has to be attacked by shrinking the reduce, not by re-arbitrating.
-    side = _SIDE_STREAM.get(dq.device)
+def _pipe_side(device):
+    """The pipeline's second queue, one per device."""
+    side = _SIDE_STREAM.get(device)
     if side is None:
-        side = torch.cuda.Stream(device=dq.device)
-        _SIDE_STREAM[dq.device] = side
+        side = torch.cuda.Stream(device=device)
+        _SIDE_STREAM[device] = side
+    return side
+
+
+def _pipe_plan(B, Sq, Skv, block_kv, Hq, Hkv, D, q_split, sbhd):
+    """The chunk plan as ``(chunks, events)``; see _fused_pipelined for what a chunk is."""
     # A stage is (batch, qsp_lo, n_qsp, bat_lo, n_bat): the first three are the plan's, the
     # last two the SBHD batch sub-range (None = the whole batch, see the builder's bat_lo).
     wgs = (Skv // block_kv) * Hkv * B
@@ -4553,17 +5909,95 @@ def _fused_pipelined(
         per = B // grid_cut
         chunks = [(b, lo, n, j * per, per) for b, lo, n, _, _ in chunks for j in range(grid_cut)]
     elif tail_cut > 1:
+        # UNEVEN cut. What the cut buys is a body over the folds that would otherwise be exposed;
+        # what it costs is a dispatch each, and a dispatch's fixed ramp roughly doubles under a co-
+        # resident reduce.
         b, lo, n, _, _ = chunks[-1]
         per = B // tail_cut
-        chunks = chunks[:-1] + [(b, lo, n, j * per, per) for j in range(tail_cut)]
+        chunks = chunks[:-1] + [(b, lo, n, 0, B - per), (b, lo, n, B - per, per)]
     nc = len(chunks)
     evs = _PIPE_EVENTS.get(nc)
     if evs is None:
         evs = [torch.cuda.Event() for _ in range(nc + 2)]
         _PIPE_EVENTS[nc] = evs
+    return chunks, evs
+
+
+def _dkv_slots_for(chunks):
+    """How many dK/dV slots the chunks really need, or 0 if the plan cannot narrow them. Only the subsets
+    INSIDE one chunk are concurrent, so a chunk that owns ``n`` of the q_split subsets needs ``n``
+    slots and every later chunk can reuse them by adding into what is there.
+    """
+    if len(chunks) < 2 or any(c[0] is not None or not c[2] for c in chunks):
+        return 0
+    n = chunks[0][2]
+    if any(c[2] != n or c[1] % n for c in chunks):
+        return 0
+    return n
+
+
+def _pipe_cut_odo(odo_l, chunks, q_split):
+    """Does the first chunk read only part of the q_split axis (so delta can be cut with it)?"""
+    return odo_l.chunk is not None and len(chunks) > 1 and chunks[0][2] not in (None, q_split)
+
+
+def _issue_delta(odo_l, plan, o16, dof, df, dobf, B, Sq, q_split, stream, side):
+    """The split-axis delta pass, enqueued ahead of everything the body needs allocated. A split chunk
+    shares the whole batch, so the pass is cut on the SPLIT axis: chunk 0 reads only its own splits'
+    delta and the rest runs on the side queue under it.
+    """
+    chunks, evs = plan
+    cut_odo = _pipe_cut_odo(odo_l, chunks, q_split)
+    odo_first = odo_l.chunk(chunks[0][1], chunks[0][2]) if cut_odo else odo_l
+    odo_first(o16, dof, df, dobf, B, Sq, stream)
+    side.wait_stream(stream)
+    if cut_odo:
+        rest = chunks[0][1] + chunks[0][2]
+        odo_l.chunk(rest, q_split - rest)(o16, dof, df, dobf, B, Sq, side)
+        evs[len(chunks)].record(side)
+
+
+def _fused_pipelined(
+    dkdv_l,
+    odo_l,
+    bufs,
+    ws_dq,
+    dq,
+    B,
+    Sq,
+    Skv,
+    block_kv,
+    Hq,
+    Hkv,
+    D,
+    q_split,
+    stream,
+    window_left=-1,
+    sbhd=False,
+    band_ring=0,
+    band_pair=0,
+    plan=None,
+    dkv_slots=0,
+):
+    """Run the fused kernel in chunks -- on BATCH and on the q_split SUBSET -- and hide each chunk's
+    dQ reduce under the next. A batch chunk needs a token-major layout (batch b contiguous); strides
+    stay whole-batch, so dQ is bitwise. Return: join before reading dQ, slot reduce enqueued first."""
+    # do8f: dO's E4M3 pair image (see do8). It is byte-for-byte the shape of the bf16
+    # buffer, so the BODY simply takes it in dO's own argument slot; only odo sees both.
+    qf, kf, vf, dof, o16, lsef, df, wk, wv, cu_ph, do8f = bufs
+    dobf = dof if do8f is None else do8f
+    # Both queues stay at the DEFAULT priority. A reduce launch is many tiny work-groups
+    # against a fused chunk's few large ones, so every CU slot the fused body frees is
+    # taken by a reduce work-group before the next fused chunk lands, and the two
+    # co-resident kernels do measurably interfere. Skewing HSA queue priority to fix it
+    # loses both ways (starving either side costs more than the current balance), so
+    # the interference has to be attacked by shrinking the reduce, not by re-arbitrating.
+    side = _pipe_side(dq.device)
+    chunks, evs = plan if plan is not None else _pipe_plan(B, Sq, Skv, block_kv, Hq, Hkv, D, q_split, sbhd)
+    nc = len(chunks)
     ev_delta, ev_join = evs[nc], evs[nc + 1]
     per_batch = chunks[0][0] is not None
-    cut_odo = False
+    cut_odo = False if per_batch else _pipe_cut_odo(odo_l, chunks, q_split)
     if per_batch:
 
         def _bat(t):
@@ -4571,40 +6005,35 @@ def _fused_pipelined(
             return list(t.view(B, -1))
 
         qb, dob = (_bat(t) for t in (qf, dof))
+        d8b = dob if do8f is None else _bat(do8f)
         kb, vb, wkb, wvb = (_bat(t) for t in (kf, vf, wk, wv))
         lb, db, ob = _bat(lsef), _bat(df), _bat(o16)
-        odo_l(ob[0], dob[0], db[0], 1, Sq, stream)
+        odo_l(ob[0], dob[0], db[0], d8b[0], 1, Sq, stream)
         side.wait_stream(stream)
         for b in range(1, B):
-            odo_l(ob[b], dob[b], db[b], 1, Sq, side)
+            odo_l(ob[b], dob[b], db[b], d8b[b], 1, Sq, side)
         ev_delta.record(side)
     else:
-        # A split chunk shares the whole batch, so the delta pass is cut on the SPLIT axis: chunk 0
-        # reads only its own splits' delta and the rest runs on the side queue under it. A batch
-        # chunk owns every q block of its batch, so its whole delta is due before the first chunk.
-        cut_odo = odo_l.chunk is not None and nc > 1 and chunks[0][2] not in (None, q_split)
-        odo_first = odo_l.chunk(chunks[0][1], chunks[0][2]) if cut_odo else odo_l
-        odo_first(o16, dof, df, B, Sq, stream)
-        side.wait_stream(stream)
-        if cut_odo:
-            rest = chunks[0][1] + chunks[0][2]
-            odo_l.chunk(rest, q_split - rest)(o16, dof, df, B, Sq, side)
-            ev_delta.record(side)
+        _issue_delta(odo_l, (chunks, evs), o16, dof, df, dobf, B, Sq, q_split, stream, side)
     for i, (b, lo, n, blo, nbt) in enumerate(chunks):
         if i == 1 and (per_batch or cut_odo):
             stream.wait_event(ev_delta)
         if per_batch:
-            args = (qb[b], kb[b], vb[b], dob[b], lb[b], db[b], wkb[b], wvb[b])
+            args = (qb[b], kb[b], vb[b], d8b[b], lb[b], db[b], wkb[b], wvb[b])
             ws_arg, nb, bat = ws_dq[0, b], 1, dict(bat_lo=b, n_bat=1)
         else:
-            args = (qf, kf, vf, dof, lsef, df, wk, wv)
+            args = (qf, kf, vf, dobf, lsef, df, wk, wv)
             ws_arg, nb = ws_dq[0, 0], B if nbt is None else nbt
             bat = {} if nbt is None else dict(bat_lo=blo, n_bat=nbt)
         # The LAST chunk's reduce has no next chunk to hide under, so its queue is a free choice.
         # A split chunk's tail reduce walks every band and saturates DRAM alone, so it is serialised
         # in front of the slot fold; a per-batch chunk's does overlap and keeps the reduce queue.
         red_q = stream if (_DQ_TAIL_SERIAL and not per_batch and i == nc - 1) else side
-        body = dkdv_l if (not blo and n in (None, q_split)) else dkdv_l.chunk(lo, n, blo)
+        if dkv_slots:
+            # Chunk 0 owns the slots outright; every later chunk adds into them (see dkv_slots).
+            body = dkdv_l.chunk(lo, n, blo, dkv_slots, i > 0)
+        else:
+            body = dkdv_l if (not blo and n in (None, q_split)) else dkdv_l.chunk(lo, n, blo)
         body(
             *args,
             cu_ph,
@@ -4737,6 +6166,9 @@ def _get_bwd(
     wsq_ring=0,
     wsq_pair=0,
     band_span=0,
+    q_pk8=False,
+    k_pk8=False,
+    do_pk8=False,
 ):
     key = (
         Hq,
@@ -4754,6 +6186,9 @@ def _get_bwd(
         wsq_ring,
         wsq_pair,
         band_span,
+        q_pk8,
+        k_pk8,
+        do_pk8,
     )
     launchers = _BWD_CACHE.get(key)
     if launchers is None:
@@ -4808,6 +6243,9 @@ def _get_bwd(
             wsq_pair=wsq_pair,
             band_span=band_span,
             q_pref=not _pair,
+            q_pk8=q_pk8,
+            k_pk8=k_pk8,
+            do_pk8=do_pk8,
             g3_defer=_fuse_d128 and not _pair,
             g3_dbat=2 if (_fuse_d128 and not _pair) else None,
             g3_kreg=_fuse_wide and not _pair,
@@ -4837,18 +6275,26 @@ def _get_bwd(
         dkdv_l = build_flash_attn_bwd_dkdv_module(**dkdv_kw)
         _dkdv_subs: dict = {}
 
-        def _dkdv_chunk(qsp_lo, n_qsp, bat_lo=0):
+        def _dkdv_chunk(qsp_lo, n_qsp, bat_lo=0, dkv_slots=0, dkv_add=False):
             """Same body, dispatching only the q_split / batch sub-range (see _fused_pipelined)."""
-            sub = _dkdv_subs.get((qsp_lo, n_qsp, bat_lo))
+            key = (qsp_lo, n_qsp, bat_lo, dkv_slots, dkv_add)
+            sub = _dkdv_subs.get(key)
             if sub is None:
-                sub = build_flash_attn_bwd_dkdv_module(qsp_lo=qsp_lo, n_qsp=n_qsp, bat_lo=bat_lo, **dkdv_kw)
-                _dkdv_subs[(qsp_lo, n_qsp, bat_lo)] = sub
+                sub = build_flash_attn_bwd_dkdv_module(
+                    qsp_lo=qsp_lo,
+                    n_qsp=n_qsp,
+                    bat_lo=bat_lo,
+                    dkv_slots=dkv_slots,
+                    dkv_add=dkv_add,
+                    **dkdv_kw,
+                )
+                _dkdv_subs[key] = sub
             return sub
 
         dkdv_l.chunk = _dkdv_chunk
         # DELTA has no other producer, so the standalone odo pass runs; ragged wants it
         # packed by token, the layout its LSE has.
-        odo_kw = dict(num_heads=Hq, head_dim=D, sbhd=sbhd, token_major=varlen)
+        odo_kw = dict(num_heads=Hq, head_dim=D, sbhd=sbhd, token_major=varlen, do8=do_pk8)
         odo_l = build_flash_attn_bwd_odo_module(q_split=q_split if sbhd else 1, **odo_kw)
         _odo_subs: dict = {}
 
@@ -5038,6 +6484,9 @@ def flydsl_varlen_backward(
     cu_seqlens_kv=None,
     max_seqlen_q=None,
     max_seqlen_kv=None,
+    q_pk8=False,
+    k_pk8=False,
+    do_pk8=False,
 ):
     """Run the 16x16x32 flydsl bwd.
     THD (sbhd=False): q,dout,dq,out:[B*Sq,Hq,D]; k,v,dk,dv:[B*Skv,Hkv,D].
@@ -5120,7 +6569,7 @@ def flydsl_varlen_backward(
             _WSQ_BAND_PAD if D == 128 else 0,
             carry=bool(band_span),
         )
-        odo_l(o16, dof, df, 1, total_q, st)
+        odo_l(o16, dof, df, dof, 1, total_q, st)
         if band_span:
             _fused_bandgroups(
                 dkdv_l,
@@ -5242,6 +6691,9 @@ def flydsl_varlen_backward(
         wsq_ring=wsq_ring,
         wsq_pair=wsq_pair,
         band_span=band_span,
+        q_pk8=q_pk8,
+        k_pk8=k_pk8,
+        do_pk8=do_pk8,
     )
     # identity delta = -rowsum(O.dO); the body centers dP by it (exact).
     delta = torch.empty(B, Hq, Sq, device=q.device, dtype=torch.float32)
@@ -5268,15 +6720,26 @@ def flydsl_varlen_backward(
             else B > 1
         )
     )
+    # dO's E4M3 (value, residual) pair, written by the odo pass into a buffer the size of
+    # dO's own -- so the body reads it in dO's argument slot and its whole DMA is unchanged.
+    dof8 = torch.empty_like(dof) if do_pk8 else None
     if not pipe:
-        odo_l(o16, dout.to(q.dtype).reshape(-1), delta.reshape(-1), B, Sq, st)
-    dq = torch.empty_like(q)
+        odo_l(o16, dof, delta.reshape(-1), dof if dof8 is None else dof8, B, Sq, st)
+    dobf = dof if dof8 is None else dof8
+    # dq mirrors dO, not q: under the compact fp8 handover q is half the bytes (see Q_C8).
+    dq = torch.empty_like(dout)
     # SBHD workspace [q_split,Skv,B,Hkv,D]: summing the leading q_split axis yields
     # [Skv,B,Hkv,D] contiguous == native SBHD dk/dv (no permute). THD keeps
     # [B,q_split,Skv,Hkv,D] -> sum(dim=1) -> [B*Skv,Hkv,D].
+    # The pipeline's chunks are stream-ordered and own one q subset each, so they can fold
+    # the slot reduction into their own dK/dV stores and the workspace needs ONE slot
+    # (see dkv_acc / _dkv_acc_ok).
+    pipe_plan = _pipe_plan(B, Sq, Skv, block_kv, Hq, Hkv, D, q_split, sbhd) if pipe else None
+    dkv_slots = _DKV_ACC and pipe_plan is not None and sbhd and _dkv_slots_for(pipe_plan[0])
+    n_slots = dkv_slots or q_split
     if sbhd:
-        ws_dk = torch.empty(q_split, Skv, B, Hkv, D, device=q.device, dtype=k.dtype)
-        ws_dv = torch.empty(q_split, Skv, B, Hkv, D, device=q.device, dtype=v.dtype)
+        ws_dk = torch.empty(n_slots, Skv, B, Hkv, D, device=q.device, dtype=k.dtype)
+        ws_dv = torch.empty(n_slots, Skv, B, Hkv, D, device=q.device, dtype=v.dtype)
     else:
         ws_dk = torch.empty(B, q_split, Skv, Hkv, D, device=q.device, dtype=k.dtype)
         ws_dv = torch.empty(B, q_split, Skv, Hkv, D, device=q.device, dtype=v.dtype)
@@ -5298,7 +6761,7 @@ def flydsl_varlen_backward(
     if band_span:
         _fused_bandgroups(
             dkdv_l,
-            (qf, kf, vf, dof, lsef, df, ws_dk.reshape(-1), ws_dv.reshape(-1), cu_ph),
+            (qf, kf, vf, dobf, lsef, df, ws_dk.reshape(-1), ws_dv.reshape(-1), cu_ph),
             ws_dq,
             ws_carry,
             dq,
@@ -5324,6 +6787,7 @@ def flydsl_varlen_backward(
             ws_dk.reshape(-1),
             ws_dv.reshape(-1),
             cu_ph,
+            dof8,
         )
         join_ev = _fused_pipelined(
             dkdv_l,
@@ -5344,6 +6808,8 @@ def flydsl_varlen_backward(
             sbhd=sbhd,
             band_ring=wsq_ring,
             band_pair=wsq_pair,
+            plan=pipe_plan,
+            dkv_slots=dkv_slots,
         )
     else:
         # Pass ONE (band, batch) slice: the kernel rebases the SRD to its own slice with
@@ -5352,7 +6818,7 @@ def flydsl_varlen_backward(
             qf,
             kf,
             vf,
-            dof,
+            dobf,
             lsef,
             df,
             ws_dk.reshape(-1),
@@ -5382,7 +6848,7 @@ def flydsl_varlen_backward(
             ph=cu_ph,
         )
     if sbhd:
-        dk, dv = _reduce_dkdv_slots(ws_dk, ws_dv, q_split, 1, st)
+        dk, dv = _reduce_dkdv_slots(ws_dk, ws_dv, n_slots, 1, st)
         dk = dk.reshape(Skv, B, Hkv, D)  # SBHD contiguous
         dv = dv.reshape(Skv, B, Hkv, D)
     else:
