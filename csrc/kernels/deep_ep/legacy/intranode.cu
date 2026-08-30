@@ -59,11 +59,16 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         //  - `per_rank_buffer[rank][i, j]` means the number of tokens from rank i to rank j
         //  - `per_expert_buffer[rank][i, j]` means the number of tokens from rank i to local expert j
         int num_experts_per_rank = num_experts / kNumRanks;
+        // [agent modifed]: plain stores -> st_na_global. These land in a *peer's* comm
+        // buffer; upstream relies on the `sys` fence in the barrier below to push them out
+        // of L2, and this port has no such fence (AGENT_CONTEXT.md R5), so the store itself
+        // has to carry `sc0 sc1`. Same for every access to this buffer further down --
+        // mixing a plain write with a bypassing read would read straight past it.
         if (thread_id < kNumRanks) {
-            per_rank_buffer[rank * kNumRanks + thread_id] = num_tokens_per_rank[thread_id];
+            st_na_global(per_rank_buffer + rank * kNumRanks + thread_id, num_tokens_per_rank[thread_id]);
             #pragma unroll
             for (int i = 0; i < num_experts_per_rank; ++i)
-                per_expert_buffer[rank * num_experts_per_rank + i] = num_tokens_per_expert[thread_id * num_experts_per_rank + i];
+                st_na_global(per_expert_buffer + rank * num_experts_per_rank + i, num_tokens_per_expert[thread_id * num_experts_per_rank + i]);
         }
 
         // Wait for all ranks to be finished
@@ -75,9 +80,11 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         if (thread_id < kNumRanks) {
             #pragma unroll
             for (int i = 1; i < kNumRanks; ++i)
-                local_per_rank_buffer[i * kNumRanks + thread_id] += local_per_rank_buffer[(i - 1) * kNumRanks + thread_id];
+                st_na_global(local_per_rank_buffer + i * kNumRanks + thread_id,
+                             ld_nc_global(local_per_rank_buffer + i * kNumRanks + thread_id) +
+                                 ld_nc_global(local_per_rank_buffer + (i - 1) * kNumRanks + thread_id));
             if (thread_id == rank)
-                *moe_recv_counter_mapped = local_per_rank_buffer[(kNumRanks - 1) * kNumRanks + rank];
+                *moe_recv_counter_mapped = ld_nc_global(local_per_rank_buffer + (kNumRanks - 1) * kNumRanks + rank);
         }
 
         // Sum per-experts counts and return to CPU
@@ -86,7 +93,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             int sum = 0;
             #pragma unroll
             for (int i = 0; i < kNumRanks; ++i)
-                sum += local_per_expert_buffer[i * num_experts_per_rank + thread_id];
+                sum += ld_nc_global(local_per_expert_buffer + i * num_experts_per_rank + thread_id);
             sum = (sum + expert_alignment - 1) / expert_alignment * expert_alignment;
             moe_recv_expert_counter_mapped[thread_id] = sum;
         }
@@ -97,12 +104,12 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         // Copy rank size prefix matrix to another tensor
         #pragma unroll
         for (int i = thread_id; i < kNumRanks * kNumRanks; i += num_threads)
-            rank_prefix_matrix_copy[i] = local_per_rank_buffer[i];
+            rank_prefix_matrix_copy[i] = ld_nc_global(local_per_rank_buffer + i);
 
         // Extra memset for later communication queue
         #pragma unroll
         for (int i = thread_id; i < num_memset_int; i += num_threads)
-            local_per_expert_buffer[i] = 0;
+            st_na_global(local_per_expert_buffer + i, 0);
 
         // Barrier
         barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
@@ -191,11 +198,13 @@ __global__ void cached_notify_dispatch(
     auto thread_id = static_cast<int>(threadIdx.x), num_threads = static_cast<int>(blockDim.x);
     auto ptr = static_cast<int*>(buffer_ptrs[rank]);
     #pragma unroll
+    // [agent modifed]: plain stores -> st_na_global. Peers read this queue with `sc0 sc1`
+    // loads, which bypass L2, so a plain store left there would never be seen.
     for (int i = thread_id; i < kNumRanks * kNumRanks; i += num_threads)
-        ptr[i] = rank_prefix_matrix[i];
+        st_na_global(ptr + i, rank_prefix_matrix[i]);
     #pragma unroll
     for (int i = thread_id; i < num_memset_int; i += num_threads)
-        ptr[kNumRanks * kNumRanks + i] = 0;
+        st_na_global(ptr + kNumRanks * kNumRanks + i, 0);
 
     // Barrier after cleaning
     barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
@@ -680,8 +689,9 @@ __global__ void cached_notify_combine(
         auto thread_id = static_cast<int>(threadIdx.x), num_threads = static_cast<int>(blockDim.x);
         auto ptr = static_cast<int*>(buffer_ptrs[rank]);
         #pragma unroll
+        // [agent modifed]: plain store -> st_na_global, same reason as cached_notify_dispatch
         for (int i = thread_id; i < num_memset_int; i += num_threads)
-            ptr[i] = 0;
+            st_na_global(ptr + i, 0);
 
         // Barrier after cleaning
         barrier_block<kNumRanks>(barrier_signal_ptrs, rank);

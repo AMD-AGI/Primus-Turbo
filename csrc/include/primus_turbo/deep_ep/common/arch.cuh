@@ -140,10 +140,14 @@ __device__ __forceinline__ lane_mask_t emulated_warp_mask() {
 }
 
 // Compiler-only barrier on AMD; no hardware instruction is emitted.
+// [agent modifed]: wavefront-scope acquire/release fences -> signal fences. A
+// wavefront-scope fence emits no instruction anyway (the wave is lockstep), it only
+// pins the scheduler, which is exactly what a signal fence is -- and this port bans
+// acquire/release everywhere (see the coherence rule in legacy/utils.cuh).
 __device__ __forceinline__ void syncwarp() {
-    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
     __builtin_amdgcn_wave_barrier();
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +200,7 @@ __device__ __forceinline__ void sync_threads_global() {
     __syncthreads();
 }
 
-// [agent modifed]: `bar.sync`'s implicit fence -> wait_all_vmem() + __threadfence_block().
+// [agent modifed]: `bar.sync`'s implicit fence -> wait_all_vmem().
 // A workgroup fence emits no vmcnt wait on CDNA (every wave shares the CU's L1), so a
 // sibling wave's payload store could still be in flight when the publishing wave moves
 // the channel tail. The vmcnt wait is what each wave contributes to the handoff: it
@@ -204,7 +208,6 @@ __device__ __forceinline__ void sync_threads_global() {
 // payload has landed and the tail store may go out relaxed (see legacy/utils.cuh).
 __device__ __forceinline__ void barrier_arrive_fence() {
     wait_all_vmem();
-    __threadfence_block();
 }
 
 #define sync_barrier_init()               PRIMUS_TURBO_BARRIER_SYNC_INIT()

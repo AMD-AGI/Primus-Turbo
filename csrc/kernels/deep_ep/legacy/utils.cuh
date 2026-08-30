@@ -85,17 +85,21 @@ __device__ __forceinline__ void trap() {
     abort();  // [agent modifed]: asm("trap;") -> abort()
 }
 
-// [agent modifed]: PTX fences -> __threadfence*, the AMDGPU spelling of the same scopes
+// [agent modifed]: PTX fences -> wait_all_vmem(), i.e. s_waitcnt only.
+// __threadfence_system()/__threadfence() are acq_rel fences in all but name: they add
+// `buffer_wbl2`/`buffer_inv` to push the payload through this XCD's L2. Every shared
+// access on this port carries `sc0 sc1` and never lands in L2, so the L2 maintenance
+// has nothing to do and only the ordering half -- draining the wave -- is real.
 __device__ __forceinline__ void memory_fence() {
-    __threadfence_system();
+    wait_all_vmem();
 }
 
 __device__ __forceinline__ void memory_fence_gpu() {
-    __threadfence();
+    wait_all_vmem();
 }
 
 __device__ __forceinline__ void memory_fence_cta() {
-    __threadfence_block();
+    wait_all_vmem();
 }
 
 // [agent modifed]: new -- the `coherent` access family, upstream has no counterpart.
@@ -281,8 +285,12 @@ __device__ __forceinline__ void st_release_sys_global(const dtype_t* ptr, dtype_
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
 }
 
+// [agent modifed]: `release` -> s_waitcnt + relaxed, same reasoning as the sys-scope
+// pair above; at workgroup scope the release adds nothing but the drain anyway.
 __device__ __forceinline__ void st_release_cta(const int* ptr, int val) {
-    __hip_atomic_store(const_cast<int*>(ptr), val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_WORKGROUP);
+    wait_all_vmem();
+    __hip_atomic_store(const_cast<int*>(ptr), val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
 }
 
 // [agent modifed]: `acquire` -> s_waitcnt + relaxed, the mirror of the store above.
@@ -297,20 +305,36 @@ __device__ __forceinline__ dtype_t ld_acquire_sys_global(const dtype_t* ptr) {
     return ret;
 }
 
+// [agent modifed]: `acquire` -> s_waitcnt + relaxed, mirror of ld_acquire_sys_global.
 __device__ __forceinline__ int ld_acquire_global(const int* ptr) {
-    return __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+    wait_all_vmem();
+    int ret = __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    return ret;
 }
 
+// [agent modifed]: `release` -> s_waitcnt + relaxed; the RMW itself is unchanged.
 __device__ __forceinline__ int atomic_add_release_sys_global(const int* ptr, int value) {
-    return __hip_atomic_fetch_add(const_cast<int*>(ptr), value, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    wait_all_vmem();
+    int ret = __hip_atomic_fetch_add(const_cast<int*>(ptr), value, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    return ret;
 }
 
+// [agent modifed]: `release` -> s_waitcnt + relaxed.
 __device__ __forceinline__ int atomic_add_release_global(const int* ptr, int value) {
-    return __hip_atomic_fetch_add(const_cast<int*>(ptr), value, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    wait_all_vmem();
+    int ret = __hip_atomic_fetch_add(const_cast<int*>(ptr), value, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    return ret;
 }
 
+// [agent modifed]: `acquire` -> s_waitcnt + relaxed.
 __device__ __forceinline__ int ld_acquire_cta(const int* ptr) {
-    return __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_WORKGROUP);
+    wait_all_vmem();
+    int ret = __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    return ret;
 }
 
 // [agent modifed]: `L1::no_allocate` has no AMDGPU spelling; agent-scope relaxed
@@ -392,16 +416,23 @@ __device__ __forceinline__ void st_na_relaxed(const int4* ptr, int4 val) {
     *const_cast<int4*>(ptr) = val;
 }
 
+// [agent modifed]: `release` -> s_waitcnt + relaxed, as everywhere else on this port.
 __device__ __forceinline__ void st_na_release(const int* ptr, int val) {
-    __hip_atomic_store(const_cast<int*>(ptr), val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    wait_all_vmem();
+    __hip_atomic_store(const_cast<int*>(ptr), val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
 }
 
 __device__ __forceinline__ void st_na_release(const uint32_t* ptr, uint32_t val) {
-    __hip_atomic_store(const_cast<uint32_t*>(ptr), val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    wait_all_vmem();
+    __hip_atomic_store(const_cast<uint32_t*>(ptr), val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
 }
 
 __device__ __forceinline__ void st_na_release(const uint64_t* ptr, uint64_t val) {
-    __hip_atomic_store(const_cast<uint64_t*>(ptr), val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    wait_all_vmem();
+    __hip_atomic_store(const_cast<uint64_t*>(ptr), val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
 }
 
 // [agent modifed]: `st.global.L1::no_allocate` -> st_coherent_sys_global. Upstream's
@@ -565,13 +596,20 @@ __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int ran
 }
 
 // [agent modifed]: shared-memory CAS/exch PTX -> __hip_atomic_* on the LDS pointer
+// [agent modifed]: `acquire` -> s_waitcnt + relaxed; the lock guards LDS state, so the
+// lgkmcnt half of the drain is what actually orders it.
 __forceinline__ __device__ int atomic_cas_cta_acquire(int* addr, int x, int y) {
-    __hip_atomic_compare_exchange_strong(addr, &x, y, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_WORKGROUP);
+    __hip_atomic_compare_exchange_strong(addr, &x, y, __ATOMIC_RELAXED, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+    wait_all_vmem();
     return x;
 }
 
+// [agent modifed]: `release` -> s_waitcnt + relaxed.
 __forceinline__ __device__ int atomic_exch_cta_release(int* addr, int x) {
-    return __hip_atomic_exchange(addr, x, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_WORKGROUP);
+    wait_all_vmem();
+    int ret = __hip_atomic_exchange(addr, x, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    return ret;
 }
 
 __forceinline__ __device__ void acquire_lock(int* mutex) {

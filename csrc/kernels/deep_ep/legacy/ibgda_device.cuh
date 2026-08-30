@@ -157,7 +157,8 @@ __device__ static __forceinline__ void ibgda_submit_requests(nvshmemi_ibgda_devi
     uint64_t new_wqe_idx = base_wqe_idx + num_wqes;
 
     // WQE writes must be finished first
-    __threadfence();
+    // [agent modifed]: __threadfence() -> memory_fence_gpu(), i.e. s_waitcnt only
+    memory_fence_gpu();
 
     unsigned long long int* ready_idx =
         (unsigned long long int*)(state->use_async_postsend ? qp->tx_wq.prod_idx : &mvars->tx_wq.ready_head);
