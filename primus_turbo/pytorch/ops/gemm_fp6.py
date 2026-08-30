@@ -58,8 +58,9 @@ class FP6GemmMXFunction(torch.autograd.Function):
         out_dtype: torch.dtype,
         config: Float6QuantConfig,
     ):
-        supported, reason = check_mxfp6_support()
-        assert supported, reason
+        supported, reason = check_mxfp6_support(a.device)
+        if not supported:
+            raise RuntimeError(reason)
 
         m, k = a.shape
         n = b.shape[0]
@@ -148,16 +149,25 @@ def gemm_fp6(
     if config is None:
         config = Float6QuantConfig()
 
-    assert a.ndim == 2 and b.ndim == 2, "Only 2D tensors are supported"
-    assert not trans_a and trans_b, (
-        "MXFP6 only supports the NT layout (trans_a=False, trans_b=True): the packed "
-        f"layout fixes the contraction axis when quantizing, not at GEMM time. Got "
-        f"trans_a={trans_a}, trans_b={trans_b}."
-    )
-    assert a.shape[1] == b.shape[1], (
-        f"K mismatch: a is {tuple(a.shape)} and b is {tuple(b.shape)}; with trans_b=True "
-        "both must share their last dimension."
-    )
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError(f"Only 2D tensors are supported, got a={a.ndim}D and b={b.ndim}D")
+    if trans_a or not trans_b:
+        raise ValueError(
+            "MXFP6 only supports the NT layout (trans_a=False, trans_b=True): the packed "
+            f"layout fixes the contraction axis when quantizing, not at GEMM time. Got "
+            f"trans_a={trans_a}, trans_b={trans_b}."
+        )
+    if a.device != b.device:
+        raise ValueError(
+            f"MXFP6 GEMM operands must share one device, got a on {a.device} and b on {b.device}."
+        )
+    if a.dtype != b.dtype:
+        raise TypeError(f"MXFP6 GEMM operands must share one dtype, got a={a.dtype} and b={b.dtype}.")
+    if a.shape[1] != b.shape[1]:
+        raise ValueError(
+            f"K mismatch: a is {tuple(a.shape)} and b is {tuple(b.shape)}; with trans_b=True "
+            "both must share their last dimension."
+        )
 
     # Every one of M, N and K has to be a multiple of 256, which is stricter than the
     # single-GEMM rule (M/N % 256, K % 128) that GEMMFP6AITERBackend.can_handle applies.
@@ -168,22 +178,25 @@ def gemm_fp6(
     m, k = a.shape
     n = b.shape[0]
     misaligned = {name: dim for name, dim in (("M", m), ("N", n), ("K", k)) if dim % MXFP6_TILE_SIZE}
-    assert not misaligned, (
-        f"MXFP6 training requires M, N and K to be multiples of {MXFP6_TILE_SIZE}, but "
-        f"{', '.join(f'{n_}={d}' for n_, d in misaligned.items())} "
-        f"{'is' if len(misaligned) == 1 else 'are'} not. K is included because the "
-        f"backward GEMMs use it as an output dimension (dgrad computes an M x K result "
-        f"and wgrad an N x K one)."
-    )
-    assert fuse_bgrad_accum_pattern is None, (
-        "fuse_bgrad_accum_pattern is not supported for MXFP6 yet, got "
-        f"{fuse_bgrad_accum_pattern!r}. The A6W6 entry point has no beta=1 accumulate "
-        "epilogue, so wgrad cannot write main_grad in place."
-    )
+    if misaligned:
+        raise ValueError(
+            f"MXFP6 training requires M, N and K to be multiples of {MXFP6_TILE_SIZE}, but "
+            f"{', '.join(f'{n_}={d}' for n_, d in misaligned.items())} "
+            f"{'is' if len(misaligned) == 1 else 'are'} not. K is included because the "
+            f"backward GEMMs use it as an output dimension (dgrad computes an M x K result "
+            f"and wgrad an N x K one)."
+        )
+    if fuse_bgrad_accum_pattern is not None:
+        raise NotImplementedError(
+            "fuse_bgrad_accum_pattern is not supported for MXFP6 yet, got "
+            f"{fuse_bgrad_accum_pattern!r}. The A6W6 entry point has no beta=1 accumulate "
+            "epilogue, so wgrad cannot write main_grad in place."
+        )
 
     if out_dtype is None:
         out_dtype = torch.bfloat16
-    assert out_dtype == torch.bfloat16, f"MXFP6 only supports a bf16 output, got {out_dtype}."
+    if out_dtype != torch.bfloat16:
+        raise ValueError(f"MXFP6 only supports a bf16 output, got {out_dtype}.")
 
     if config.granularity != ScalingGranularity.MX_BLOCKWISE:
         raise ValueError(f"Unsupported MXFP6 ScalingGranularity: {config.granularity}")
