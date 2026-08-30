@@ -105,7 +105,7 @@ except Exception:  # pragma: no cover - depends on torch version
 
 from .flex._config import _ALIBI_TOL
 from .flex._dispatch import _dispatch_document_varlen, require_varlen_sink_support
-from .flex._layout import from_backend_layout, to_backend_layout
+from .flex._layout import from_backend_layout, to_backend_layout_qkv
 from .flex._mask_classify import _classify_block_mask
 from .flex._routing import _dispatch_custom, choose_backend
 from .flex._score_mod import _cached_detect_alibi_slopes, _cached_detect_softcap, _is_identity_score_mod
@@ -634,7 +634,7 @@ def flex_attention(
 
         # The fp8 entry lowers onto the Triton kernel, which hardcodes layout="bshd"
         # and asserts q/k/v are contiguous. The zero-copy bhsd passthrough that the
-        # bf16 path uses (to_backend_layout) is deliberately not used here: it hands
+        # bf16 path uses (to_backend_layout_qkv) is deliberately not used here: it hands
         # the backend a [B,S,H,D]-shaped *view* over bhsd bytes, which
         # ``_infer_qkv_format`` reports as "bhsd" and ``flash_attn_fp8_func`` then
         # permutes again -- a second transpose that the Triton path does not want.
@@ -679,9 +679,9 @@ def flex_attention(
     # bhsd -> the backend's [B,S,H,D] logical shape. transpose(1, 2) is a view; the
     # backend reads the real memory order out of the strides and addresses bhsd
     # natively, so this normally copies nothing (see flex/_layout.py).
-    q_be = to_backend_layout(query)
-    k_be = to_backend_layout(key)
-    v_be = to_backend_layout(value)
+    # Converted as a triple, not one by one: the backend asserts that q, k and v all
+    # report the same memory order, so the passthrough decision has to be joint.
+    q_be, k_be, v_be = to_backend_layout_qkv(query, key, value)
 
     out = flash_attn_func(
         q_be,
