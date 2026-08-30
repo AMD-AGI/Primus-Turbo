@@ -8,9 +8,14 @@ import pytest
 import torch
 
 from primus_turbo.pytorch.core.low_precision import (
+    MXFP6_GUARD_K_TILES,
+    MXFP6_K_TILE_SIZE,
+    MXFP6_PACKED_TILE_BYTES,
     MXFP6_PROLOGUE_BIAS_GELU,
     MXFP6_PROLOGUE_BIAS_GELU_BACKWARD,
     MXFP6_PROLOGUE_IDENTITY,
+    MXFP6_SCALE_TILE_BYTES,
+    MXFP6_TILE_SIZE,
     Float6QuantConfig,
     Format,
     ScaleDtype,
@@ -40,6 +45,18 @@ SNR_THRESHOLD_DB = 24
 
 
 def _skip_if_unsupported():
+    """Skip a test that needs the A6W6 kernels, which exist only on gfx950.
+
+    Call this only when the test actually runs a kernel. CI has no gfx950 runner -- the
+    PyTorch lane is gfx942, as it is for the MXFP4 and MXFP8 suites -- so a test that
+    calls this is a test CI never executes, and every one of them that did not need to
+    is coverage given away for nothing.
+
+    A good deal of this file's surface is decided before any kernel is reached: the
+    argument validation in ``gemm_fp6``, the blob validation in ``_validate_blobs``, the
+    pack-size arithmetic, the eager prologue reference, and the aiter half of the
+    capability check. Those are grouped at the end of this file and must stay ungated.
+    """
     supported, reason = check_mxfp6_support()
     if not supported:
         pytest.skip(reason)
@@ -742,13 +759,6 @@ def test_mxfp6_guard_tiles_are_never_read():
     """
     _skip_if_unsupported()
     from primus_turbo.common.aiter_utils import get_aiter
-    from primus_turbo.pytorch.core.low_precision import (
-        MXFP6_GUARD_K_TILES,
-        MXFP6_K_TILE_SIZE,
-        MXFP6_PACKED_TILE_BYTES,
-        MXFP6_SCALE_TILE_BYTES,
-        MXFP6_TILE_SIZE,
-    )
 
     m = n = 512
     k = 1024
@@ -771,62 +781,6 @@ def test_mxfp6_guard_tiles_are_never_read():
         view[:, n_k_tiles:, :] = 0xFF
 
     assert torch.equal(gemm(a_p, b_p, a_s, b_s, m, n, k), baseline)
-
-
-def test_gemm_fp6_rejects_unsupported():
-    _skip_if_unsupported()
-    a = torch.randn((256, 512), dtype=torch.bfloat16, device="cuda:0")
-    b = torch.randn((256, 512), dtype=torch.bfloat16, device="cuda:0")
-
-    # The packed layout fixes the contraction axis, so no layout but NT exists.
-    with pytest.raises(ValueError, match="NT layout"):
-        gemm_fp6(a, b, trans_a=True)
-    with pytest.raises(ValueError, match="NT layout"):
-        gemm_fp6(a, b, trans_b=False)
-    # The A6W6 asm only writes bf16.
-    with pytest.raises(ValueError, match="bf16 output"):
-        gemm_fp6(a, b, out_dtype=torch.float16)
-    # No beta=1 epilogue, so wgrad cannot accumulate into main_grad.
-    with pytest.raises(NotImplementedError, match="fuse_bgrad_accum_pattern"):
-        gemm_fp6(a, b, fuse_bgrad_accum_pattern="megatron")
-    with pytest.raises(ValueError, match="K mismatch"):
-        gemm_fp6(a, torch.randn((256, 256), dtype=torch.bfloat16, device="cuda:0"))
-
-
-@pytest.mark.parametrize(
-    "m,n,k",
-    [
-        (100, 256, 256),  # M
-        (256, 100, 256),  # N
-        (256, 256, 128),  # K: legal for one GEMM, illegal once backward runs
-    ],
-)
-def test_gemm_fp6_requires_256_alignment_on_all_dims(m, n, k):
-    """K must be a multiple of 256, not just 128.
-
-    A single forward GEMM is happy with K % 128, but the backward GEMMs use K as an
-    output dimension (dgrad produces M x K, wgrad produces N x K), which subjects it to
-    the 256 rule. The check belongs at the autograd entry point so a bad shape fails at
-    the call site instead of part-way through backward.
-    """
-    _skip_if_unsupported()
-    a = torch.randn((m, k), dtype=torch.bfloat16, device="cuda:0")
-    b = torch.randn((n, k), dtype=torch.bfloat16, device="cuda:0")
-    with pytest.raises(ValueError, match="multiples of 256"):
-        gemm_fp6(a, b)
-
-
-def test_float6_quant_config_rejects_unsupported():
-    # MXFP6 has no un-rotated / 2D-block / SR variants; each must fail loudly rather
-    # than being silently ignored.
-    with pytest.raises(NotImplementedError, match="use_gradient_sr"):
-        Float6QuantConfig(use_gradient_sr=True)
-    with pytest.raises(ValueError, match="E2M3"):
-        Float6QuantConfig(format=Format.E2M1_X2)
-    with pytest.raises(ValueError, match="block_size"):
-        Float6QuantConfig(block_size=16)
-    with pytest.raises(ValueError, match="MX_BLOCKWISE"):
-        Float6QuantConfig(granularity=ScalingGranularity.ROWWISE)
 
 
 def test_gemm_fp6_alignment_gate():
@@ -913,50 +867,25 @@ def test_mxfp6_rejects_operands_on_different_devices():
         gemm_fp6(a, b)
 
 
-def test_check_mxfp6_support_is_device_aware():
-    """The check must answer about the operand's device, not the ambient one."""
+def test_check_mxfp6_support_accepts_a_gfx950_device():
+    """The check must answer about the operand's device, not the ambient one.
+
+    The rejecting half of this contract needs no gfx950 and lives with the other
+    hardware-independent tests, in ``test_check_mxfp6_support_rejects_a_cpu_device``.
+    """
     _skip_if_unsupported()
     supported, _ = check_mxfp6_support(torch.device("cuda", 0))
     assert supported
-    supported, reason = check_mxfp6_support(torch.device("cpu"))
-    assert not supported and "ROCm device" in reason
 
 
-def test_check_mxfp6_support_survives_a_missing_aiter(monkeypatch):
-    """A capability predicate that raises cannot be used to decide anything.
+def test_gemm_fp6_impl_wires_in_blob_validation():
+    """The validator has to be reached through the real op, not merely exist.
 
-    ``get_aiter`` raises ImportError when aiter is absent, which used to escape from
-    here and turn a graceful "MXFP6 unavailable" into a crash at import-adjacent time.
-    """
-    _skip_if_unsupported()
-    from primus_turbo.pytorch.kernels.quantization import mxfp6_pack
-
-    def no_aiter():
-        raise ImportError("aiter is not installed")
-
-    monkeypatch.setattr(mxfp6_pack, "get_aiter", no_aiter)
-    supported, reason = mxfp6_pack.check_mxfp6_support()
-    assert not supported
-    assert "aiter is not installed" in reason
-
-
-def test_check_mxfp6_support_names_the_missing_a6w6_symbols(monkeypatch):
-    _skip_if_unsupported()
-    from primus_turbo.pytorch.kernels.quantization import mxfp6_pack
-
-    monkeypatch.setattr(mxfp6_pack, "get_aiter", lambda: object())
-    supported, reason = mxfp6_pack.check_mxfp6_support()
-    assert not supported
-    for attr in ("quant_mxfp6_gemm", "gemm_a6w6", "mxfp6_gemm_pack_size"):
-        assert attr in reason
-
-
-def test_gemm_fp6_impl_rejects_malformed_blobs():
-    """Blob validation is the last point at which a wrong M/N/K is detectable.
-
-    The blobs carry no shape and no dtype, so past this boundary the kernel simply
-    derives strides from whatever dimensions it was handed and reads off the end of a
-    blob that is too short.
+    The enumeration of malformed blobs is in ``test_validate_blobs_rejects_malformed_operands``,
+    which needs no hardware. What can only be checked here is that a genuine packed pair
+    still passes and that a wrong K is caught on the way to the kernel rather than
+    becoming an out-of-bounds read: the blobs carry no shape, so past this boundary the
+    kernel derives strides from whatever dimensions it was handed.
     """
     _skip_if_unsupported()
     m = n = 256
@@ -967,21 +896,13 @@ def test_gemm_fp6_impl_rejects_malformed_blobs():
     b_p, b_s = quantize_mxfp6_row(b)
     g = ScalingGranularity.MX_BLOCKWISE.value
 
-    def run(a_p=a_p, a_s=a_s, b_p=b_p, b_s=b_s, m=m, n=n, k=k):
+    def run(k=k):
         return torch.ops.primus_turbo.gemm_fp6_impl(a_p, a_s, b_p, b_s, m, n, k, torch.bfloat16, g)
 
     run()  # the well-formed call has to keep working
 
     with pytest.raises(ValueError, match="does not match"):
         run(k=256)
-    with pytest.raises(ValueError, match="positive dimensions"):
-        run(m=0)
-    with pytest.raises(TypeError, match="uint8"):
-        run(a_p=a_p.view(torch.int8))
-    with pytest.raises(ValueError, match="1-D"):
-        run(a_p=a_p.view(2, -1))
-    with pytest.raises(ValueError, match="contiguous"):
-        run(a_p=a_p[::2])
 
 
 def test_low_level_gemm_accepts_the_k128_that_training_rejects():
@@ -1160,3 +1081,318 @@ def test_gemm_fp6_impl_fake_matches_real():
             blob(a_p), blob(a_s), blob(b_p), blob(b_s), m, n, k, torch.bfloat16, g
         )
     assert fake.shape == real.shape and fake.dtype == real.dtype and fake.device == real.device
+
+
+###############################################################################
+# Hardware-independent contracts.
+#
+# Everything below runs wherever torch imports: no gfx950, no aiter, no GPU. That makes
+# this the only part of the file CI executes today, since the PyTorch lane is gfx942.
+# Nothing here may call _skip_if_unsupported() -- see its docstring -- and nothing here
+# may reach a kernel, which is what keeps that true.
+###############################################################################
+
+
+def test_gemm_fp6_rejects_unsupported():
+    """Every argument contract of the wrapper, on CPU.
+
+    All of these are decided before ``FP6GemmMXFunction.apply``, so the hardware never
+    comes into it. Should someone move one of these checks into forward, past the
+    capability check, this stops raising ValueError and starts raising RuntimeError,
+    which is the failure worth having.
+    """
+    a = torch.randn((256, 512), dtype=torch.bfloat16)
+    b = torch.randn((256, 512), dtype=torch.bfloat16)
+
+    # The packed layout fixes the contraction axis, so no layout but NT exists.
+    with pytest.raises(ValueError, match="NT layout"):
+        gemm_fp6(a, b, trans_a=True)
+    with pytest.raises(ValueError, match="NT layout"):
+        gemm_fp6(a, b, trans_b=False)
+    # The A6W6 asm only writes bf16.
+    with pytest.raises(ValueError, match="bf16 output"):
+        gemm_fp6(a, b, out_dtype=torch.float16)
+    # No beta=1 epilogue, so wgrad cannot accumulate into main_grad.
+    with pytest.raises(NotImplementedError, match="fuse_bgrad_accum_pattern"):
+        gemm_fp6(a, b, fuse_bgrad_accum_pattern="megatron")
+    with pytest.raises(ValueError, match="K mismatch"):
+        gemm_fp6(a, torch.randn((256, 256), dtype=torch.bfloat16))
+    with pytest.raises(ValueError, match="2D"):
+        gemm_fp6(a.unsqueeze(0), b)
+    with pytest.raises(TypeError, match="one dtype"):
+        gemm_fp6(a, b.to(torch.float16))
+
+
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (100, 256, 256),  # M
+        (256, 100, 256),  # N
+        (256, 256, 128),  # K: legal for one GEMM, illegal once backward runs
+    ],
+)
+def test_gemm_fp6_requires_256_alignment_on_all_dims(m, n, k):
+    """K must be a multiple of 256, not just 128.
+
+    A single forward GEMM is happy with K % 128, but the backward GEMMs use K as an
+    output dimension (dgrad produces M x K, wgrad produces N x K), which subjects it to
+    the 256 rule. The check belongs at the autograd entry point so a bad shape fails at
+    the call site instead of part-way through backward.
+    """
+    a = torch.randn((m, k), dtype=torch.bfloat16)
+    b = torch.randn((n, k), dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="multiples of 256"):
+        gemm_fp6(a, b)
+
+
+def test_float6_quant_config_rejects_unsupported():
+    # MXFP6 has no un-rotated / 2D-block / SR variants; each must fail loudly rather
+    # than being silently ignored.
+    with pytest.raises(NotImplementedError, match="use_gradient_sr"):
+        Float6QuantConfig(use_gradient_sr=True)
+    with pytest.raises(ValueError, match="E2M3"):
+        Float6QuantConfig(format=Format.E2M1_X2)
+    with pytest.raises(ValueError, match="block_size"):
+        Float6QuantConfig(block_size=16)
+    with pytest.raises(ValueError, match="MX_BLOCKWISE"):
+        Float6QuantConfig(granularity=ScalingGranularity.ROWWISE)
+
+
+def test_float6_quant_config_is_hashable():
+    """Hashable, like Float4QuantConfig and Float8QuantConfig.
+
+    Nothing in the MXFP6 path hashes it -- the ops take blobs, not a config -- but both
+    siblings are hashable, and one that silently is not becomes a puzzle the first time a
+    config lands in a set or a cache key.
+    """
+    assert hash(Float6QuantConfig()) == hash(Float6QuantConfig())
+    assert len({Float6QuantConfig(), Float6QuantConfig()}) == 1
+
+
+def test_check_mxfp6_support_rejects_a_cpu_device():
+    """A CPU operand is refused for being on the wrong device, whatever the host is.
+
+    The accepting half needs gfx950 and lives in
+    ``test_check_mxfp6_support_accepts_a_gfx950_device``.
+    """
+    supported, reason = check_mxfp6_support(torch.device("cpu"))
+    assert not supported and "ROCm device" in reason
+
+
+def test_check_aiter_a6w6_survives_a_missing_aiter(monkeypatch):
+    """A capability predicate that raises cannot be used to decide anything.
+
+    ``get_aiter`` raises ImportError when aiter is absent, which used to escape from
+    here and turn a graceful "MXFP6 unavailable" into a crash at import-adjacent time.
+    """
+    from primus_turbo.pytorch.kernels.quantization import mxfp6_pack
+
+    def no_aiter():
+        raise ImportError("aiter is not installed")
+
+    monkeypatch.setattr(mxfp6_pack, "get_aiter", no_aiter)
+    supported, reason = mxfp6_pack._check_aiter_a6w6()
+    assert not supported
+    assert "aiter is not installed" in reason
+
+
+def test_check_aiter_a6w6_names_the_missing_symbols_and_the_minimum_commit(monkeypatch):
+    """An aiter too old to have A6W6 has to say so, and say what would fix it.
+
+    Naming the symbols is what distinguishes "your aiter predates A6W6" from the several
+    other ways MXFP6 can be unavailable, and the commit is the only actionable form of
+    the requirement: the pinned tag does not contain it, so no version tells the user
+    what to install.
+    """
+    from primus_turbo.pytorch.kernels.quantization import mxfp6_pack
+
+    monkeypatch.setattr(mxfp6_pack, "get_aiter", lambda: object())
+    supported, reason = mxfp6_pack._check_aiter_a6w6()
+    assert not supported
+    for attr in ("quant_mxfp6_gemm", "gemm_a6w6", "mxfp6_gemm_pack_size"):
+        assert attr in reason
+    assert mxfp6_pack.MXFP6_MIN_AITER_COMMIT in reason
+
+
+def test_check_aiter_a6w6_accepts_an_aiter_with_every_symbol(monkeypatch):
+    """The probe must pass on a module that has the three names and nothing else.
+
+    Without this the two rejection tests above are satisfied by a predicate that never
+    returns True at all.
+    """
+    from primus_turbo.pytorch.kernels.quantization import mxfp6_pack
+
+    class FakeAiter:
+        quant_mxfp6_gemm = gemm_a6w6 = mxfp6_gemm_pack_size = staticmethod(lambda *a, **k: None)
+
+    monkeypatch.setattr(mxfp6_pack, "get_aiter", lambda: FakeAiter())
+    assert mxfp6_pack._check_aiter_a6w6() == (True, "")
+
+
+@pytest.mark.parametrize(
+    "rows,k,row_tiles,k_tiles",
+    [
+        (256, 128, 1, 1),
+        (256, 512, 1, 4),
+        (512, 512, 2, 4),
+        (100, 100, 1, 1),  # both padded up to one whole tile
+        (257, 129, 2, 2),  # one element past a tile in each direction
+    ],
+)
+def test_mxfp6_pack_sizes_include_the_guard_tiles(rows, k, row_tiles, k_tiles):
+    """Blob sizes are row-tiles x (k-tiles + guard) x tile-bytes, with both dims padded.
+
+    The guard tiles are the part worth pinning. Their contents are never read, but the
+    assembly derives its row-tile stride from ``k/128 + 2``, so a blob sized without them
+    leaves every stride wrong -- a silent wrong-answer bug rather than a crash. The
+    equivalent test against aiter's own sizer needs aiter; this one pins the arithmetic
+    itself, which is what the validator in ``_validate_blobs`` computes from.
+    """
+    tiles = row_tiles * (k_tiles + MXFP6_GUARD_K_TILES)
+    assert mxfp6_pack_sizes(rows, k) == (
+        tiles * MXFP6_PACKED_TILE_BYTES,
+        tiles * MXFP6_SCALE_TILE_BYTES,
+    )
+
+
+def test_mxfp6_data_region_drops_the_guard_tiles():
+    """The comparison view must exclude exactly the uninitialised trailing tiles.
+
+    Bit-exactness assertions go through this. If it returned the whole blob they would
+    compare the guard tiles too, which the packers never write, so two calls on identical
+    input would disagree at random.
+    """
+    rows, k = 512, 512
+    operand_bytes, scale_bytes = mxfp6_pack_sizes(rows, k)
+    n_row_tiles, n_k_tiles = rows // MXFP6_TILE_SIZE, k // MXFP6_K_TILE_SIZE
+
+    operand = torch.zeros(operand_bytes, dtype=torch.uint8)
+    region = mxfp6_data_region(operand, rows, k)
+    assert region.shape == (n_row_tiles, n_k_tiles, MXFP6_PACKED_TILE_BYTES)
+
+    scale = torch.zeros(scale_bytes, dtype=torch.uint8)
+    scale_region = mxfp6_data_region(scale, rows, k, is_scale=True)
+    assert scale_region.shape == (n_row_tiles, n_k_tiles, MXFP6_SCALE_TILE_BYTES)
+
+    # Writing every guard byte must leave the data region untouched.
+    operand.view(n_row_tiles, n_k_tiles + MXFP6_GUARD_K_TILES, MXFP6_PACKED_TILE_BYTES)[:, n_k_tiles:, :] = (
+        0xFF
+    )
+    assert not mxfp6_data_region(operand, rows, k).any()
+
+
+@pytest.mark.parametrize(
+    "m,expected",
+    [
+        (1, 4),  # padded up to one 256-row pack tile, which is four col-sum tiles
+        (256, 4),
+        (257, 8),  # one row past the pack tile costs a whole further tile
+        (16384, 256),
+        (16385, 260),
+    ],
+)
+def test_mxfp6_col_sum_rows_counts_one_partial_per_64_row_tile(m, expected):
+    """Rows of the bias-gradient partial buffer: m padded to 256-row pack tiles, over 64.
+
+    Must agree with ``mxfp6_col_sum_rows`` in quantization.h. It is the padding that
+    makes this worth pinning -- the count follows the launch grid, not the logical M, so
+    the buffer for an unaligned M is larger than the shape alone suggests and a version
+    that reasoned from m directly would under-allocate it.
+    """
+    assert mxfp6_col_sum_rows(m) == expected
+
+
+def test_mxfp6_apply_prologue_identity_returns_the_input_untouched():
+    """Identity must not copy, or the fused path is being compared against a different tensor."""
+    x = torch.randn((8, 16))
+    assert mxfp6_apply_prologue(x, None, None, MXFP6_PROLOGUE_IDENTITY) is x
+
+
+def test_mxfp6_apply_prologue_broadcasts_bias_along_the_last_axis():
+    x = torch.randn((8, 16))
+    bias = torch.randn((16,))
+    got = mxfp6_apply_prologue(x, None, bias, MXFP6_PROLOGUE_BIAS_GELU)
+    torch.testing.assert_close(got, torch.nn.functional.gelu(x + bias, approximate="tanh"))
+
+
+def test_mxfp6_apply_prologue_bias_is_optional():
+    x = torch.randn((8, 16))
+    got = mxfp6_apply_prologue(x, None, None, MXFP6_PROLOGUE_BIAS_GELU)
+    torch.testing.assert_close(got, torch.nn.functional.gelu(x, approximate="tanh"))
+
+
+def test_mxfp6_apply_prologue_backward_differentiates_the_forward():
+    """The backward mode must be the derivative of the forward one it is paired with.
+
+    Checked against autograd rather than against ``aten.gelu_backward``, which is what
+    the reference itself calls: comparing it to its own implementation would pass however
+    wrong the pairing of modes was.
+    """
+    x = torch.randn((8, 16), dtype=torch.float64, requires_grad=True)
+    bias = torch.randn((16,), dtype=torch.float64, requires_grad=True)
+    grad_out = torch.randn((8, 16), dtype=torch.float64)
+
+    mxfp6_apply_prologue(x, None, bias, MXFP6_PROLOGUE_BIAS_GELU).backward(grad_out)
+    got = mxfp6_apply_prologue(x.detach(), grad_out, bias.detach(), MXFP6_PROLOGUE_BIAS_GELU_BACKWARD)
+    torch.testing.assert_close(got, x.grad)
+
+
+def test_mxfp6_apply_prologue_rejects_a_backward_without_its_incoming_gradient():
+    x = torch.randn((8, 16))
+    with pytest.raises(ValueError, match="aux"):
+        mxfp6_apply_prologue(x, None, None, MXFP6_PROLOGUE_BIAS_GELU_BACKWARD)
+
+
+def test_mxfp6_apply_prologue_rejects_an_unknown_mode():
+    """An unrecognised mode must not fall through to the identity.
+
+    The modes are plain ints crossing into the kernel, so a caller that passes a stale
+    or mistyped one has to hear about it rather than silently get no epilogue.
+    """
+    x = torch.randn((8, 16))
+    with pytest.raises(ValueError, match="unknown MXFP6 prologue mode"):
+        mxfp6_apply_prologue(x, None, None, 99)
+
+
+def test_validate_blobs_rejects_malformed_operands():
+    """Every malformed-blob case, against fabricated blobs on CPU.
+
+    The blobs are opaque byte streams carrying neither shape nor dtype, so this is the
+    last point at which a wrong M/N/K is detectable at all: past it the kernel derives
+    strides from whatever dimensions it was handed and reads off the end of a blob that
+    is too short. None of that reasoning involves the hardware, and the sizes come from
+    ``mxfp6_pack_sizes``, so the cases can be built without a packer.
+    """
+    from primus_turbo.pytorch.kernels.gemm.gemm_fp6_impl import _validate_blobs
+
+    m = n = 256
+    k = 512
+    (a_bytes, a_scale_bytes) = mxfp6_pack_sizes(m, k)
+    (b_bytes, b_scale_bytes) = mxfp6_pack_sizes(n, k)
+    a = torch.zeros(a_bytes, dtype=torch.uint8)
+    a_scale = torch.zeros(a_scale_bytes, dtype=torch.uint8)
+    b = torch.zeros(b_bytes, dtype=torch.uint8)
+    b_scale = torch.zeros(b_scale_bytes, dtype=torch.uint8)
+
+    def run(a=a, a_scale=a_scale, b=b, b_scale=b_scale, m=m, n=n, k=k):
+        _validate_blobs(a, a_scale, b, b_scale, m, n, k)
+
+    run()  # the well-formed set has to keep passing
+
+    with pytest.raises(ValueError, match="does not match"):
+        run(k=256)
+    with pytest.raises(ValueError, match="positive dimensions"):
+        run(m=0)
+    with pytest.raises(ValueError, match="positive dimensions"):
+        run(n=-1)
+    with pytest.raises(TypeError, match="uint8"):
+        run(a=a.view(torch.int8))
+    with pytest.raises(ValueError, match="1-D"):
+        run(a=a.view(2, -1))
+    with pytest.raises(ValueError, match="contiguous"):
+        run(a=a[::2])
+    # The scale blobs are checked as strictly as the operands.
+    with pytest.raises(TypeError, match="uint8"):
+        run(b_scale=b_scale.view(torch.int8))
+    with pytest.raises(ValueError, match="does not match"):
+        run(b_scale=b_scale[:-1].contiguous())
