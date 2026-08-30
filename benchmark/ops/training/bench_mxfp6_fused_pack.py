@@ -16,7 +16,7 @@ Two questions, both of which the fusion has to answer before it is worth shippin
    against the path it replaces -- an eager epilogue writing bf16 to HBM followed by a
    pack that reads it back -- not against the pack alone.
 
-Run with: python benchmarks/bench_mxfp6_fused_pack.py
+Run with: python benchmark/ops/training/bench_mxfp6_fused_pack.py
 """
 
 import argparse
