@@ -52,6 +52,16 @@ Nothing below it runs, and nothing above it is required in order to run. The rep
 declared pin `v0.1.14.post1` predates that merge, so MXFP6 reports itself unsupported
 until AITER is upgraded.
 
+Enforcement is by probing for those three symbols, not by comparing versions. The minimum
+is a commit on `main` rather than a release, a source build reports whatever `git describe`
+produced, and a fork can carry any version string it likes, so no version test can decide
+the question; the symbols can. `MXFP6_MIN_AITER_COMMIT` in `mxfp6_pack.py` holds the commit
+so that the error message, this document and any future CI lane read it from one place.
+
+A consequence worth knowing: MXFP6 necessarily runs ahead of the repository pin, so the
+generic `check_aiter_version_once` reports a newer AITER without offering the install
+command for the pin, which for an MXFP6 user would be advice to break their build.
+
 The performance tier adds non-temporal-store kernel variants and a tuned table for Flux
 projection shapes. Primus-Turbo picks that up with no code change -- it names no kernel and
 no config table, and AITER merges the tuned rows internally -- so it is a recommendation
@@ -157,6 +167,38 @@ HBM, then a pack that reads it back) at Flux 12B MLP shapes. Record the AITER re
 alongside any numbers: GEMM throughput at those shapes is a property of AITER's tuned table
 rather than of Primus-Turbo, so an unstamped result goes stale when the pin advances.
 
+## Differences from MXFP4
+
+This is the canonical list. The `Float6QuantConfig` and `gemm_fp6` docstrings point here
+rather than restating it, so new entries belong here.
+
+MXFP4 steers its quantizers with a `ScalingRecipe` because it has real choices to make: two
+backends, two layouts, stochastic rounding, 2D blocking, and RHT on one of the three GEMM
+directions. MXFP6 has one of everything, so each FP4 knob has exactly one value here.
+
+| MXFP4 knob | MXFP6 | Why |
+| ---------- | ----- | --- |
+| `use_rht` | always on | The 32-point Hadamard is fused into the packer and AITER ships no un-rotated entry point. MXFP4 enables its 16-point RHT for wgrad only, where the transform is a pass it would otherwise skip; MXFP6's rides a gather the packer runs regardless, on a bandwidth-bound kernel. |
+| `use_2d_block` | never | Scaling is strictly per-1x32 along the contraction axis, so a 2D block has no meaning. |
+| `use_sr` | never | Not implemented; see below. |
+| `shuffle_scale` / `shuffle_out` | not applicable | `mxfp6_c0c1_256_padk2` is the only layout A6W6 reads. |
+| `use_preshuffle` | not applicable | Same: the layout is part of the format, not an option applied on top of it. |
+
+Structural differences that are not knobs:
+
+- **No `is_fp6_dtype`.** There is no torch FP6 dtype. Operands are `uint8` blobs, so
+  `is_fp8_dtype` and `is_fp4_dtype` have no counterpart here.
+- **No `ScalingRecipe`, no `QuantizedTensor`.** A blob carries neither shape nor recipe, so
+  there is nowhere to record one and nothing downstream that could check it.
+- **Quantization is dual-direction and fused.** MXFP4 quantizes one tensor at a time with a
+  recipe per direction; the MXFP6 packer reads the input once and emits both directions,
+  plus an optional bias-GELU epilogue and bias-gradient partials. On Flux 12B the
+  materialised transpose this replaces was 82% of the MXFP6-vs-MXFP4 step-time gap, so the
+  divergence is the point rather than an accident.
+- **No autotuning.** `gemm_fp6_impl` does not go through `AutoKernelDispatcher`. There is
+  one backend to choose between, and the dispatcher keys on operand shapes that opaque
+  blobs do not carry.
+
 ## Not implemented yet
 
 These are tracked follow-ups, not oversights. MXFP6 does not have MXFP4 parity.
@@ -168,8 +210,32 @@ These are tracked follow-ups, not oversights. MXFP6 does not have MXFP4 parity.
   wgrad cannot write `main_grad` in place. `fuse_bgrad_accum_pattern` raises
   `NotImplementedError`.
 - **`grouped_mlp_fp6`.** There is no grouped MXFP6 MoE path.
+- **`dequantize_fp6`.** Not simply unwritten: it is not the mirror of `dequantize_fp4`.
+  Decoding a packed blob yields `x H` rather than `x`, because the rotation is applied at
+  pack time. Recovering `x` means applying the normalised transform a second time, which
+  works since it is self-inverse, but no kernel does that today.
 - **Stochastic rounding.** With three mantissa bits the MXFP4 motivation largely does not
   apply. `Float6QuantConfig(use_gradient_sr=True)` raises `NotImplementedError`.
+
+## Testing
+
+`tests/pytorch/ops/test_gemm_fp6.py` covers numerics, bit-exactness against AITER and the
+API contracts, and needs a gfx950 machine for most of it:
+
+```bash
+pytest tests/pytorch/ops/test_gemm_fp6.py
+```
+
+CI does not run that part. Its PyTorch lane is gfx942, which is also where the MXFP4 and
+MXFP8 suites stand -- they gate on `check_mxfp4_support` / `check_mxfp8_support` and skip
+there too -- so a gfx950 lane is what would close the gap, for all of them at once rather
+than for MXFP6 alone.
+
+What does run anywhere is grouped at the end of that file: the `gemm_fp6` argument
+contracts, `_validate_blobs`, the pack-size and guard-tile arithmetic, the eager prologue
+reference, and the AITER half of the capability check, none of which reach a kernel.
+`tests/pytorch/core/test_aiter_utils.py` is hardware-independent in the same way. Keep them
+so; the docstring on `_skip_if_unsupported` explains what belongs on each side of the line.
 
 ## Implementation map
 
@@ -181,3 +247,4 @@ These are tracked follow-ups, not oversights. MXFP6 does not have MXFP4 parity.
 | [`csrc/kernels/quantization/quantization_mxfp6_gfx950.cu`](../csrc/kernels/quantization/quantization_mxfp6_gfx950.cu) | Fused dual packer with Hadamard, E2M3 conversion, optional epilogue |
 | [`csrc/pytorch/quantization/quantization_mxfp6.cpp`](../csrc/pytorch/quantization/quantization_mxfp6.cpp) | Torch bindings and their shape/dtype/device checks |
 | [`tests/pytorch/ops/test_gemm_fp6.py`](../tests/pytorch/ops/test_gemm_fp6.py) | Correctness, bit-exactness against AITER, contracts |
+| [`tests/pytorch/core/test_aiter_utils.py`](../tests/pytorch/core/test_aiter_utils.py) | The AITER version check's advice, in both directions |
