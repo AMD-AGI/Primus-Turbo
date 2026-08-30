@@ -8,17 +8,22 @@
 
 Mirrors :mod:`primus_turbo.pytorch.ops.gemm_fp4` closely enough to be a drop-in at the
 Megatron call site (``gemm_fp6(x, weight, trans_a=False, trans_b=True, ...)``), but the
-MXFP6 packed layout removes most of FP4's knobs:
+MXFP6 packed layout removes most of FP4's knobs: there is no ``preshuffle``, no
+``ScalingRecipe``, and no ``QuantizedTensor`` fast path for reusing a pre-quantized
+weight across microbatches. ``docs/README_MXFP6.md`` is the canonical mapping of what
+FP4 offers against what MXFP6 does instead, and of which gaps are deferred rather than
+closed by the format.
 
-- No ``preshuffle``. The A6W6 kernels read the packed C0/C1 tile blob directly, so there
-  is no un-shuffled layout to opt out of -- the layout is the format.
-- No ``ScalingRecipe``. The 32-point Hadamard rotation is mandatory and fused into the
-  packer (the GEMM depends on it cancelling between operands), scaling is strictly
-  per-1x32 along the contraction axis so a 2D block is meaningless, and stochastic
-  rounding is not implemented.
-- No ``QuantizedTensor`` fast path yet, so a pre-quantized weight is not reused across
-  microbatches the way FP4 allows. Because MXFP6 blobs are opaque and carry no shape,
-  that needs the ``PackedQuantizedTensor`` wrapper before it can be wired up.
+This function is a convenience wrapper. A caller that owns its own autograd can drive
+:func:`gemm_fp6_impl` directly, in which case none of the validation below runs and the
+only contracts in force are ``_validate_blobs`` and ``GEMMFP6AITERBackend.can_handle``.
+Anything that has to hold for every MXFP6 GEMM belongs in those two rather than here.
+
+Unlike ``gemm_fp4`` this needs no ``@torch._dynamo.disable``. FP4 builds
+``QuantizedTensor`` subclasses inside forward and Dynamo cannot recover their inner
+tensors; MXFP6's operands are plain tensors behind custom ops with hand-written fakes.
+``test_gemm_fp6_torch_compile_backward`` compiles this function and checks the backward
+against a high-precision reference, so the property is pinned rather than incidental.
 
 The three GEMM directions contract over different dimensions, so each operand is needed
 packed along two different axes. For ``out = a @ b.T`` with ``a[M, K]``, ``b[N, K]``:

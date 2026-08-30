@@ -73,6 +73,13 @@ def check_mxfp8_support() -> Tuple[bool, str]:
     )
 
 
+# MXFP6's equivalent is check_mxfp6_support, in
+# primus_turbo/pytorch/kernels/quantization/mxfp6_pack.py. It cannot live here: unlike
+# the four above it is not a compute-capability test, and answering needs get_aiter()
+# and the extension op table, neither of which core may import. It returns the same
+# (bool, reason) pair, and additionally takes the device to answer about.
+
+
 ###################################################
 
 try:
@@ -289,21 +296,20 @@ class Float4QuantConfig:
         return self.granularity == ScalingGranularity.MX_BLOCKWISE and self.scale_dtype == ScaleDtype.E8M0
 
 
-@dataclass
+# Validates with typed exceptions rather than the asserts the two configs above use.
+# That is the newer convention -- asserts vanish under -O, and a bad quant config should
+# not degrade into a silently wrong kernel -- but migrating FP8/FP4 is out of scope here.
+@dataclass(unsafe_hash=True)  # hashable like its siblings; see the registration note below
 class Float6QuantConfig:
     """MXFP6 (E2M3) quantization config.
 
-    Deliberately narrower than ``Float4QuantConfig``, because MXFP6 has far fewer
-    degrees of freedom:
+    Deliberately narrower than ``Float4QuantConfig``: the 32-point Hadamard rotation is
+    mandatory and fused into the packer, scaling is strictly per-1x32 along the
+    contraction axis, and the packed C0/C1 tile blob is the only layout the A6W6 kernels
+    accept. So none of FP4's recipe flags has a second value here to select between.
 
-    - The 32-point Hadamard rotation is **mandatory**, not a recipe flag. It is fused
-      into the packer and the GEMM relies on it cancelling between the two operands
-      (``(A H)(B H)^T == A B^T``), so there is no un-rotated MXFP6 to opt into.
-    - Scaling is strictly per-1x32 along the contraction axis, so a 2D block has no
-      meaning.
-    - There is no un-shuffled layout to choose. The A6W6 kernels read the packed
-      C0/C1 tile blob directly, so the layout is part of the format rather than an
-      option applied on top of it.
+    ``docs/README_MXFP6.md`` carries the knob-by-knob mapping against MXFP4 and is the
+    canonical list; put new entries there rather than here.
     """
 
     format: Format = Format.E2M3
@@ -311,8 +317,11 @@ class Float6QuantConfig:
     strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
     scale_dtype: ScaleDtype = ScaleDtype.E8M0
     block_size: int = MXFP6_BLOCK_SIZE
-    # Accepted but not yet implemented; asserted off rather than silently ignored, so
-    # a caller asking for SR gets an error instead of round-to-nearest.
+    # Accepted but not yet implemented; rejected below rather than silently ignored, so
+    # a caller asking for SR gets an error instead of round-to-nearest. Kept even though
+    # it can only hold one value, unlike the Primus-side knob that was dropped for exactly
+    # that reason: this one mirrors Float4QuantConfig, where its absence would read as
+    # "MXFP6 stochastic-rounds by default" rather than "MXFP6 has no SR".
     use_gradient_sr: bool = False
 
     def __post_init__(self):
@@ -349,7 +358,12 @@ class Float6QuantConfig:
 # than being flattened into scalars. A "value" type is specialized into the compiled
 # graph and guarded on equality, which is what a static recipe wants. Note the schema
 # admits these only as required parameters: neither a default nor an Optional of an
-# opaque type is inferrable. Float6QuantConfig is absent because the MXFP6 ops take
-# packed blobs rather than a config, so it never crosses a custom-op boundary.
+# opaque type is inferrable.
+#
+# Float6QuantConfig is absent because the MXFP6 ops take packed blobs rather than a
+# config, so it never crosses a custom-op boundary. The same fact is why it has no
+# __fx_repr__: that method exists only for the FX codegen this registration drives, so
+# on an unregistered class it would be dead on arrival. Add the two together if
+# PackedQuantizedTensor ever puts a config on an op signature.
 for _opaque_cls in (Float8QuantConfig, Float4QuantConfig, ScalingRecipe):
     register_opaque_type(_opaque_cls, typ="value")
