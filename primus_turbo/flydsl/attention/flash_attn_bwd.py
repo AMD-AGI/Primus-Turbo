@@ -103,6 +103,44 @@ _NUM_XCD = 8
 # gfx950 compute units. Only used to ask whether a dispatch is narrower than the machine.
 _NUM_CU = 256
 
+# In-body region cycle census (diagnostic; inert and ISA-byte-identical at 0). 1 timestamps
+# only the q-loop trip, which costs 1.6% of wall; 2 adds a boundary per head-step region and
+# costs 9.2%, because s_memtime retires on lgkmcnt and so drains LDS at every mark -- level 2
+# therefore prices each region SERIALISED, which is what naming the dependency chain wants.
+# The record file rides the unused cu_seqlens placeholder (see _cu_placeholder), one 32 B
+# entry per work-group, and _CENSUS_OUT holds that tensor. Driver: _cen_r6.py.
+# Measured on the deployed D64 body, unmasked q-blocks, share of a 33.4k-cycle trip:
+#   pub 5.7 | gemm1 18.4 | exp 4.3 | dspack 32.1 | gemm2 25.4 | fence 1.4 | gemm3 12.5
+_CENSUS = int(os.environ.get("FLYDSL_ATTN_CENSUS", "0"))
+_CENSUS_REGIONS = ("pub", "gemm1", "exp", "dspack", "gemm2", "fence", "gemm3", "step")
+_CENSUS_OUT: list = []
+# Per-work-group span probe (diagnostic; inert and ISA-byte-identical at 0). One 16 B record per
+# work-group on the same placeholder the census uses: entry and exit s_memrealtime (a constant-rate
+# counter, so it compares ACROSS work-groups where s_memtime does not), the grid size that names the
+# pipeline chunk, and the band the work-group ran. It answers the one question the wall cannot: how
+# much of a dkdv dispatch is work and how much is makespan slack. Driver: _span_r7.py.
+# Measured on the GPT-OSS D64 shape, the three pipeline chunks: sum(span) / (NCU * makespan) =
+# 94.9 / 94.6 / 93.8 per cent, and band 0's span is 7.5x band 28's -- so ~5% of dkdv is idle CU.
+# The concurrency profile says WHERE: 95-100% of the array is busy for nineteen twentieths of each
+# chunk window and only the last twentieth collapses (82 / 51 / 26%). The idle is a dispatch DRAIN,
+# not a steady under-subscription -- and it is measured NOT convertible, twice: raising utilisation
+# to 97.8 / 96.2 / 94.7 with _BAND_SLOW lengthened sum(span) by the same amount it saved (makespan
+# flat, wall -0.54%), and overlapping the drains outright by alternating the chunk bodies across two
+# queues cost -6.1%, because a body-only window is exactly what the dQ fold pipeline hides under.
+# Replaying the measured spans through a greedy list-schedule closes the axis: the model reproduces
+# each measured makespan to 2.5%, and against ideal 255577 / 189741 / 65435 it gives 263492 / 196516
+# / 68652 in dispatch order, 256984 / 191232 / 66996 under LPT and 256056 / 191209 / 67114 with the
+# bands paired b <-> nb-1-b. Pairing is TIED with LPT (worse on the third chunk), so equalising the
+# work-group spans -- the one construction left on this axis -- is worth what LPT was worth, and LPT
+# was measured. Any further makespan work has to make sum(span) smaller, not the schedule tighter.
+_WGSPAN = int(os.environ.get("FLYDSL_ATTN_WGSPAN", "0"))
+# Dispatch order of the dkdv grid's band axis (see the block_id decode). Longest-processing-time
+# ordering, so it is the makespan lever the probe above points at. On the scored B=4 shape it is
+# -0.54% (four paired points against four), because eight work-groups per CU already leave the
+# dispatcher enough to balance with; where that freedom is scarce it pays -- the B=2 guard reads
+# +1.7% and the sliding-window guard +6.3%. Off, because the scored cell is the one it loses.
+_BAND_SLOW = int(os.environ.get("FLYDSL_ATTN_BAND_SLOW", "0"))
+
 
 def _wsq_ilv(nb, B, Sq, hd, elem_bytes=2):
     """Bands per interleaved dQ partial row: a power of two dividing nb (see _WSQ_BAND_ILV)."""
@@ -1706,7 +1744,17 @@ def build_flash_attn_bwd_dkdv_module(
     # Bands per phase group: the phases keep the gathered bands off each OTHER's dQ partial
     # rows. How many bands pile onto one q block is set by the dwell -- a work-group holds a
     # q block for GQA_GROUP_SIZE head-steps -- so this has to track the group, not a constant.
-    QDESC_R = max(1, GQA_GROUP_SIZE // 2)
+    # The dwell is the WHOLE group, not half of it: a work-group that starts a band at phase r
+    # is still on that q block GQA_GROUP_SIZE head-steps later, so only GQA_GROUP_SIZE distinct
+    # phases actually separate two bands for their whole dwell. Half the group leaves band b and
+    # band b + GQA_GROUP_SIZE//2 overlapping on the same partial rows for the second half of
+    # every dwell. Measured on the GPT-OSS D64 cell, min-of-30 through the scored handover,
+    # eight arm points against fifteen interleaved base points across four remote calls:
+    # GQA_GROUP_SIZE//2 -> GQA_GROUP_SIZE is +0.7% paired (+1.3% on bench.sh, 1113.5 -> 1128.2),
+    # positive in every one of the six pairings. More phases than the dwell buys nothing --
+    # 2*GQA_GROUP_SIZE reads +0.16% and 4*GQA_GROUP_SIZE +0.18%, both inside the noise floor --
+    # and fewer costs: GQA_GROUP_SIZE//2 is -0.45%/-0.50% measured back against this default.
+    QDESC_R = max(1, GQA_GROUP_SIZE)
     # GEMM1 ks-outer: the four kv tiles of one k-step first, so consecutive MFMAs write
     # different accumulators and issue without waiting -- the default at D128, where one wave
     # per SIMD has no sibling to hide that. D64 takes ks-inner; the dwords freed fund the reduce.
@@ -1723,7 +1771,11 @@ def build_flash_attn_bwd_dkdv_module(
     # one -- the same conclusion G3_DEFER reaches independently below.
     # The second live slot's cost is unchanged by everything rounds 6-8 freed. That is the standing
     # entry price of any GEMM2 whose K runs over TWO 64-row q groups, because both groups' Q/dO have to
-    # be readable at once.
+    # be readable at once. Re-measured on the D64 fused body with the ring funded purely out of LDS
+    # (86016 -> 118784 B, no register donor): the head-step's barrier pair does collapse -- 33
+    # s_barrier -> 19, MFMA histogram byte-identical, +13 VGPR -- and the wall is -3.1% over three
+    # paired points. Removing 14 of 33 barriers is a LOSS on this body, so the fence count is not a
+    # pool here; the tile's ds_write moving to the end of the step is what it costs.
     QDO_RING = False
     QDO_TAIL = QDO_RING  # the merged publish the second slots exist for
     QDO_PP = False
@@ -1910,7 +1962,20 @@ def build_flash_attn_bwd_dkdv_module(
     assert not Q_C8 or G1A_K2T, "the compact Q handover needs G1A_K2T (see Q_C8)"
     assert not Q_C8 or Q_PREF, "the compact Q handover forks the VGPR staging path only"
     assert not K_PK8 or (G1A_N128 and G1A_K2T), "the K pair handover needs G1A_K2T"
-    Q8_FWD = 0  # 1 = before GEMM3, 2 = after it; needs G2B_FP8 and QF8_SLOTS > 1
+    # Q8_FWD: where head h+1's E4M3 Q twin is written. 0 = with its own bf16 commit, at the
+    # top of head-step h+1; 2 = at the END of head-step h, after GEMM3. The in-body cycle
+    # census (see _CENSUS) prices the publish region at 5.8% of the trip and GEMM3 at 12.9%
+    # for only ~40% of its cycles in MFMA, so placement 2 moves the cast into slots GEMM3
+    # leaves idle. Needs QF8_SLOTS > 1: the slot head h+1 is given was last read by head
+    # h-1, and head h's dS RAW barrier sits between that read and this write, so the WAR
+    # edge holds; the RAW edge is head h+1's own commit barrier. 1 (before GEMM3) measures
+    # -0.7%; 2 measures +0.42% over 5 arm and 10 base points in two calls.
+    # Q8_FWD: where head h+1's E4M3 Q twin is written. 0 = with its own bf16 commit at the
+    # top of head-step h+1. Both forwarded placements were measured on the four-wave D64
+    # body: 1 (before GEMM3) -0.7%, 2 (after GEMM3, into the slots the census shows GEMM3
+    # leaving idle) +0.42% on the paired driver but FLAT on bench.sh -- 1119.7 against
+    # 1120.0 over 3 and 4 readings. Register-, MFMA- and barrier-neutral either way.
+    Q8_FWD = 0  # 1 = before GEMM3, 2 = after it
     _QF8_END = QF8_BASE + (LDS_TILE * QF8_SLOTS if G2B_FP8 else 0)
     # QF8R_BASE: Q's E4M3 residual tile, same map and same slot stride as the image above.
     QF8R_BASE = _QF8_END
@@ -2035,8 +2100,19 @@ def build_flash_attn_bwd_dkdv_module(
                 _slot = _slot // fx.Index(N_QSP)
             else:
                 split_idx = fx.Index(QSP_LO)
-            kv_tile_idx = _slot % num_kv_tiles
-            _u = _slot // num_kv_tiles
+            if const_expr(_BAND_SLOW):
+                # Band SLOWEST instead of fastest: the dispatcher hands work-groups out in
+                # block_id order and under causal masking band b runs the q blocks at or above
+                # it, so a band-ascending queue is longest-processing-time-first. The
+                # XCD -> kv-head map above is untouched -- only which of the two remaining axes
+                # moves faster -- so the L2 story the fast-band order was chosen for still holds.
+                # See _WGSPAN: the deployed order leaves ~5% of dkdv as makespan slack.
+                _nu = fx.Index(gpu.grid_dim.x) // (fx.Index(NUM_XCD * N_QSP) * num_kv_tiles)
+                _u = _slot % _nu
+                kv_tile_idx = _slot // _nu
+            else:
+                kv_tile_idx = _slot % num_kv_tiles
+                _u = _slot // num_kv_tiles
             _bkv = _u * fx.Index(NUM_XCD) + _xcd
             kv_head_idx = _bkv % NUM_HEADS_KV
             batch_idx = _bkv // NUM_HEADS_KV
@@ -2243,6 +2319,59 @@ def build_flash_attn_bwd_dkdv_module(
         _I32_T = ir.IntegerType.get_signless(32)
         _I16V2_T = Vec.make_type(2, fx.Int16)
 
+        # ---- In-body region cycle census (see _CENSUS). One s_memtime per boundary; the
+        # counter comes back on lgkmcnt, so a boundary is also a full LDS drain. That makes
+        # the arm a SERIALISED price of each region, not a picture of the shipped schedule
+        # -- which is exactly what is wanted when asking which region owns the chain. ----
+        _NCEN = len(_CENSUS_REGIONS)
+        _cen = [None] * _NCEN
+        _cen_t = [None]
+
+        def _cen_now():
+            _t = llvm.inline_asm(
+                ir.IntegerType.get_signless(64),
+                [],
+                "s_memtime $0\ns_waitcnt lgkmcnt(0)",
+                "=s",
+                has_side_effects=True,
+            )
+            return fx.Int32(arith.trunci(_I32_T, _t))
+
+        def _rt_now():
+            """The constant-rate REF_CLK counter. s_memtime is the shader clock and is per-SE, so
+            only this one can be differenced between two work-groups."""
+            _t = llvm.inline_asm(
+                ir.IntegerType.get_signless(64),
+                [],
+                "s_memrealtime $0\ns_waitcnt lgkmcnt(0)",
+                "=s",
+                has_side_effects=True,
+            )
+            return fx.Int32(arith.trunci(_I32_T, _t))
+
+        def _cen_open(on):
+            """Start a census trip: zero the region sums and take the base timestamp. `on`
+            keeps the instrument off the masked q-blocks, whose regions are emitted inside
+            an scf.if that an accumulator cannot cross."""
+            for _i in range_constexpr(_NCEN):
+                _cen[_i] = None
+            if const_expr(not (_CENSUS and on)):
+                return
+            for _i in range_constexpr(_NCEN):
+                _cen[_i] = fx.Int32(0)
+            _cen_t[0] = _cen_now()
+            _cen[_NCEN - 1] = _cen_t[0]
+
+        def _cen_mark(reg):
+            """Charge everything since the last mark to region `reg`. Level 1 keeps only the
+            two trip-boundary timestamps, which prices the trip at ~zero perturbation; level 2
+            adds the per-region boundaries and with them one lgkmcnt drain each."""
+            if const_expr(_CENSUS < 2 or _cen[reg] is None):
+                return
+            _t = _cen_now()
+            _cen[reg] = _cen[reg] + (_t - _cen_t[0])
+            _cen_t[0] = _t
+
         def _undef(t):
             """A fresh undef for a pk-convert's oldVdst. An undef lets it use the destination directly.
             Worth 32 VALU per head-step in the hot loop, which is issue-bound.
@@ -2443,6 +2572,31 @@ def build_flash_attn_bwd_dkdv_module(
             num_records_bytes=_raw(_wsq_slice),
             base_byte_offset=_raw(_wsq_base),
         )
+        # Census sink: the head of the same workspace, one 32 B record per work-group.
+        # num_records clips every thread but tid 0, so the dump needs no predicate.
+        if const_expr(_CENSUS or _WGSPAN):
+            cen_rsrc = buffer_ops.create_buffer_resource(
+                CuSeqQ,
+                max_size=False,
+                num_records_bytes=_raw(fx.Index(1 << 20)),
+                base_byte_offset=_raw(fx.Index(0)),
+            )
+
+            def _cen_dump():
+                _t = _cen_now()
+                _cen[_NCEN - 1] = _t - _cen[_NCEN - 1]
+                _off = block_id * fx.Index(4 * _NCEN + 4) + tid * fx.Index(1 << 28)
+                for _i in range_constexpr(_NCEN):
+                    buffer_ops.buffer_store(
+                        _raw(_cen[_i]), cen_rsrc, _off + fx.Index(4 * _i), offset_is_bytes=True
+                    )
+
+        # Span probe: entry stamp. The exit record carries the band index with it, which is
+        # what sets a work-group's q-block count under causal masking.
+        _span = [None]
+        if const_expr(_WGSPAN):
+            _span[0] = _rt_now()
+
         _lse_per_batch = seq_len_q_v * fx.Index(NUM_HEADS_Q)
         _lse_nrec_bytes = _raw(_lse_per_batch * fx.Index(4))
         if const_expr(varlen):
@@ -4030,6 +4184,7 @@ def build_flash_attn_bwd_dkdv_module(
                     if const_expr(head_local == 0):
                         _stage_ld_commit(_ldv)
                 gpu.barrier()  # DMA + ld_lds commit visible before GEMM1 reads
+            _cen_mark(0)
 
             _g3_pend = []
             _g3_call = []
@@ -4717,11 +4872,17 @@ def build_flash_attn_bwd_dkdv_module(
                     if const_expr(g3_split and pks > 0 and G3_SPL_AT == 0):
                         _gemm3(q_start, head_local, 0, qsel=pks - 1, depth=G3D_E)
                     _st, _dpt = _half_gemm1(half, cls)
+                    _cen_mark(1)
                     if const_expr(g3_split and pks > 0 and G3_SPL_AT == 1):
                         _gemm3(q_start, head_local, 0, qsel=pks - 1, depth=G3D_E)
                     if const_expr(hooks):
                         _hs_hook(_at + 1)
-                    _rings = _half_soft(pks, half, _dpt, cls, _half_exp(half, _st, cls))
+                    _P = _half_exp(half, _st, cls)
+                    _cen_mark(2)
+                    # Legal only where this pass is dV-only: with _k128 the dK half of GEMM2
+                    # is the head-pair flush at the end of the step, so nothing here reads dS.
+                    _rings = _half_soft(pks, half, _dpt, cls, _P)
+                    _cen_mark(3)
                     if const_expr(hooks):
                         _hs_hook(_at + 2)
                     if const_expr(g3_split and pks < PV_K_STEPS - 1):
@@ -4739,6 +4900,7 @@ def build_flash_attn_bwd_dkdv_module(
                         )
                         if const_expr(hooks):
                             _hs_hook(_at + 3)
+                        _cen_mark(4)
                         if const_expr(_k128 and _last and G2_K128_SOLO):
                             # One head step owns all four packs: split them into the two halves
                             # _g2_k128 already expects and flush on every head.
@@ -4815,6 +4977,7 @@ def build_flash_attn_bwd_dkdv_module(
                         _rings[1],
                         const_expr(PF_RING and mid_pf is not None),
                     )
+                    _cen_mark(4)
 
             for _h in range_constexpr(KV_HALVES):
                 if const_expr(_h):
@@ -4923,6 +5086,7 @@ def build_flash_attn_bwd_dkdv_module(
                     _qdo_next[0] = None
                 rocdl.s_waitcnt(WAIT_LGKM)
                 gpu.barrier()  # RAW: every wave's dS rows feed every wave's GEMM3
+                _cen_mark(5)
                 if const_expr(Q8_FWD == 1 and head_local + 1 < GQA_GROUP_SIZE) and _qdo_next[0] is not None:
                     # Head h+1's twin, written into the slot head h-1 vacated. The barrier
                     # above is the WAR edge; the RAW edge is head h+1's own commit barrier,
@@ -4943,6 +5107,7 @@ def build_flash_attn_bwd_dkdv_module(
                 if const_expr(Q8_FWD == 2 and head_local + 1 < GQA_GROUP_SIZE) and _qdo_next[0] is not None:
                     # Placement 2: after GEMM3, i.e. the last thing the head-step does.
                     _qf8_publish(_qdo_next[0], fx.Index(((head_local + 1) % QF8_SLOTS) * LDS_TILE))
+            _cen_mark(6)
             return dv_cur, dk_cur, (_qdo_next if const_expr(Q_PREF) else [qdo, None])
 
         def _q_body(q_start, inner, apply_mask, poff=None, half=False, hsel=None, nq=None):
@@ -4983,6 +5148,7 @@ def build_flash_attn_bwd_dkdv_module(
                 rocdl.s_waitcnt(0)
                 gpu.barrier()
             _pkc = [None, None]
+            _cen_open(not apply_mask)
             for head_local in range_constexpr(GQA_GROUP_SIZE):
                 # Only the leader of each DMA_GRP-sized head group stages tiles; the rest
                 # consume slots this group already published.
@@ -5030,6 +5196,8 @@ def build_flash_attn_bwd_dkdv_module(
                 rocdl.s_waitcnt(WAIT_LGKM)
                 gpu.barrier()  # RAW: every wave's dS rows feed every wave's GEMM3
                 _gemm3(q_start, GQA_GROUP_SIZE - 1, (GQA_GROUP_SIZE - 1) % G3S_SLOTS)
+            if const_expr(_CENSUS and _cen[0] is not None):
+                _cen_dump()
             out = [
                 dv_cur[h][dt][nt]
                 for h in range_constexpr(KV_HALVES)
@@ -5240,6 +5408,17 @@ def build_flash_attn_bwd_dkdv_module(
             _dv_prev = _dk_prev = None
         _store(dv_accs, dv_rsrc, dv_vec4, acc=_dv_prev)
         _store(dk_accs, dk_rsrc, sm_vec4, acc=_dk_prev)
+        if const_expr(_WGSPAN):
+            # num_records clips every thread but tid 0, so the dump needs no predicate.
+            # The three pipeline chunks share one buffer and their block_id ranges overlap, so
+            # each takes a region keyed on the compile-time pair that names it.
+            _reg = int(QSP_LO != 0) + int(BAT_LO != 0)
+            _rec = [_span[0], _rt_now(), fx.Int32(gpu.grid_dim.x), fx.Int32(kv_tile_idx)]
+            _soff = block_id * fx.Index(16) + fx.Index(_reg * (1 << 15)) + tid * fx.Index(1 << 28)
+            for _i in range_constexpr(4):
+                buffer_ops.buffer_store(
+                    _raw(_rec[_i]), cen_rsrc, _soff + fx.Index(4 * _i), offset_is_bytes=True
+                )
 
     @flyc.jit
     def launch_flash_attn_bwd_dkdv(
@@ -5321,9 +5500,13 @@ def build_flash_attn_bwd_dkdv_module(
         # Backward is VALU/exp2-issue-bound with the MFMA pipe mostly idle; post-RA
         # misched hides the gradient-GEMM MFMAs in the exp2/reduce VALU shadow.
         # post-misched is load-bearing on the four-wave fused body: dropping it measures
-        # 892.5 against 918.9, and every amdgpu-sched-strategy override is worse still
-        # (max-memory-clause 863.0, max-ilp 888.4) -- the hand-placed sched_mfma/sched_dsrd
-        # structure is what the default scheduler is being asked to preserve.
+        # 892.5 against 918.9, and every amdgpu-sched-strategy override is worse -- the
+        # hand-placed sched_mfma/sched_dsrd structure is what the default scheduler is being
+        # asked to preserve. Re-priced on the 1119 TF/s body (the numbers above are from one
+        # that ran 22% slower, and the penalty has largely evaporated with it): against a
+        # five-point base of 1120.1, max-ilp is 1116.2 = -0.35% (ISA 11877 lines / waitcnt
+        # 685 / vgpr 433) and max-memory-clause -0.51% (11951 / 708 / 430), not the -3.3% and
+        # -6.0% recorded. Still both negative, so the verdict stands and the margin does not.
         # See amdgpu-mfma-vgpr-form at _AGPR_PIN_*.
         "llvm_options": {"enable-post-misched": True, "lsr-drop-solution": True},
     }
@@ -5458,8 +5641,10 @@ def _cu_placeholder(device):
     """
     ph = _CU_PH.get(device)
     if ph is None:
-        ph = torch.zeros(1, device=device, dtype=torch.int32)
+        ph = torch.zeros((1 << 18) if (_CENSUS or _WGSPAN) else 1, device=device, dtype=torch.int32)
         _CU_PH[device] = ph
+        if _CENSUS or _WGSPAN:
+            _CENSUS_OUT[:] = [ph]
     return ph
 
 
