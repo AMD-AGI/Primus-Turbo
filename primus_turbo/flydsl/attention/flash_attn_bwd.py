@@ -66,7 +66,15 @@ _G2A_ON_PK8 = True
 _G1A_K2T = False
 # _DKV_ACC: let the pipeline chunks fold part of the dK/dV q_split slot reduction into their own stores
 # instead of leaving all of it to the standalone `slotred` pass (see dkv_slots / _dkv_slots_for).
-_DKV_ACC = False
+# On the GPT-OSS D64 plan this narrows the slot axis from q_split=4 to 2, which is both half the
+# slot workspace and half of what the SERIAL `slotred` tail (1.1% of the wall, and the last thing
+# in the step) has left to fold. Worth +0.76% over eight in-process paired points (six wins, two
+# ties, no losses); the effect is under the node's 1.5% single-reading spread, so it only shows up
+# paired. Safe by construction rather than by luck: every chunk BODY is issued on the caller's
+# stream in plan order (only the dQ folds alternate queues), so chunk 0 owns the slots outright
+# and each later chunk's read-modify-write sees a completed predecessor -- one writer at a time,
+# fixed order, bitwise reproducible.
+_DKV_ACC = True
 # AGPR_PIN_*: park a kv-block-invariant MFMA operand in the AGPR heap so its uses read it there
 # instead of shuttling it through v_accvgpr (see _agpr_pin). KB = GEMM1a's native K operand,
 # VB = dP's V operand, DS = the even head's dS packs; the constraint must be TIED.
@@ -5773,7 +5781,14 @@ _DQ_PIPE_FILLS = 4
 # The pipeline's chunks alternate across two queues: they are independent (disjoint dk/dv slots
 # and dQ partial rows) so the next chunk can fill what the current one is draining. Below:
 # whether the last SPLIT chunk's dQ reduce stays on the caller's stream, in front of the slot fold.
-_DQ_TAIL_SERIAL = True
+# OFF: the tail reduce goes to the side queue, which lets the dK/dV slot fold -- the last thing in
+# the step and, since dkv_acc narrowed the slot axis, a small one -- issue behind the last body
+# instead of behind the tail reduce. The two touch disjoint tensors, so this is a pure stream
+# assignment and dQ/dK/dV stay bitwise what the serial order produced. Worth +0.40% over nine
+# paired points in three separate remote calls (every call positive), against a base that swings
+# 1.5% on a byte-identical tree -- it only shows up paired. The note this replaces was written
+# when the fold still spanned all four q_split slots.
+_DQ_TAIL_SERIAL = False
 # Fills of the CU array one piece of a BATCH-CUT tail must be worth. The last chunk's fold is
 # pure exposure and a batch cut re-stages nothing, but it is taken at the WIDE band only: a unit
 # of body absorbs 1/(2*BLOCK_KV) of partial bytes, so at 128 the body it moves under pays more.
