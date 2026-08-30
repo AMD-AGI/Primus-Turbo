@@ -25,6 +25,17 @@ def is_gfx950() -> bool:
     return get_device_compute_capability() == (9, 5)
 
 
+def is_gfx950_device(device: torch.device) -> bool:
+    """gfx950 check against the device an operand actually lives on.
+
+    ``is_gfx950()`` reads the ambient current device, which answers the wrong question
+    for an operand placed on another GPU: on a mixed-architecture host it can admit a
+    tensor the kernel cannot run on, and under a non-default current device it can
+    reject one it can.
+    """
+    return _get_device_compute_capability(device) == (9, 5)
+
+
 def is_gfx942() -> bool:
     return get_device_compute_capability() == (9, 4)
 

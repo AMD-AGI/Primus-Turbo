@@ -11,6 +11,7 @@
 // ordinary .cpp symbols would still compile and reference a kernel nothing defined.
 
 #include <ATen/hip/HIPContext.h>
+#include <c10/core/DeviceGuard.h>
 #include <torch/extension.h>
 
 #include "../extensions.h"
@@ -64,8 +65,11 @@ at::Tensor empty_blob(const int64_t bytes, const at::Tensor &like) {
 
 std::vector<at::Tensor> run(const at::Tensor &input, const MXFP6Direction direction) {
     check_input(input);
-    const int64_t M = input.size(0);
-    const int64_t N = input.size(1);
+    // Allocate and launch on the operand's device rather than the ambient one, which the
+    // caller is under no obligation to have set.
+    const c10::DeviceGuard device_guard(input.device());
+    const int64_t          M = input.size(0);
+    const int64_t          N = input.size(1);
 
     const bool want_row = direction != MXFP6Direction::Col;
     const bool want_col = direction != MXFP6Direction::Row;
@@ -125,6 +129,9 @@ MXFP6Prologue prologue_from_mode(const int64_t mode) {
 // The bias is a broadcast vector, so check_input's 2D and %32 rules do not apply to it.
 void check_bias(const at::Tensor &bias, const at::Tensor &input, const int64_t N) {
     PRIMUS_TURBO_CHECK(bias.is_cuda(), "Bias must be a CUDA tensor");
+    PRIMUS_TURBO_CHECK(bias.device() == input.device(),
+                       "Bias must be on the input's device: input is on ", input.device().str(),
+                       " and bias on ", bias.device().str());
     PRIMUS_TURBO_CHECK(bias.dim() == 1, "Bias must be 1D, got ", bias.dim(), "D");
     PRIMUS_TURBO_CHECK(bias.is_contiguous(), "Bias must be contiguous");
     PRIMUS_TURBO_CHECK(bias.scalar_type() == input.scalar_type(),
@@ -137,14 +144,18 @@ std::vector<at::Tensor> run_fused(const at::Tensor &input, const c10::optional<a
                                   const c10::optional<at::Tensor> &bias,
                                   const MXFP6Prologue prologue, const bool want_col_sum) {
     check_input(input);
-    const int64_t M = input.size(0);
-    const int64_t N = input.size(1);
+    const c10::DeviceGuard device_guard(input.device());
+    const int64_t          M = input.size(0);
+    const int64_t          N = input.size(1);
 
     const bool wants_aux = prologue == MXFP6Prologue::BiasGeluBackward;
     PRIMUS_TURBO_CHECK(wants_aux == aux.has_value(),
                        "aux is required by the backward prologue and unused otherwise");
     if (aux.has_value()) {
         check_input(*aux);
+        PRIMUS_TURBO_CHECK(aux->device() == input.device(),
+                           "aux must be on the input's device: input is on ", input.device().str(),
+                           " and aux on ", aux->device().str());
         PRIMUS_TURBO_CHECK(aux->sizes() == input.sizes(), "aux must have the input's shape");
         PRIMUS_TURBO_CHECK(aux->scalar_type() == input.scalar_type(),
                            "aux dtype must match the input's");
