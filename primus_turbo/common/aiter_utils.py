@@ -11,7 +11,7 @@ requires the amd-aiter release below; it is not on PyPI, so install from git tag
 """
 
 import importlib.metadata
-from typing import NoReturn
+from typing import NoReturn, Optional
 
 from primus_turbo.common.logger import logger
 
@@ -39,34 +39,63 @@ def _installed_aiter_version():
         return None
 
 
-def _versions_match(installed: str, expected: str) -> bool:
-    # Ignore any local/dev suffix (e.g. an editable checkout's "+g1234567").
+def _version_order(installed: str, expected: str) -> Optional[int]:
+    """-1, 0 or 1 for installed older than / equal to / newer than expected.
+
+    None when the two cannot be ordered, either because a version does not parse or
+    because ``packaging`` is absent, in which case only equality is decidable. Any
+    local or dev suffix is ignored (e.g. an editable checkout's "+g1234567").
+    """
     try:
         from packaging.version import InvalidVersion, Version
 
         try:
-            return Version(installed).public == Version(expected).public
+            a = Version(Version(installed).public)
+            b = Version(Version(expected).public)
         except InvalidVersion:
-            return False
+            return None
     except ImportError:
-        return installed.split("+")[0] == expected
+        return 0 if installed.split("+")[0] == expected else None
+    return (a > b) - (a < b)
 
 
 def check_aiter_version_once():
-    """Warn once if the installed aiter version differs from the pin."""
+    """Warn once if the installed aiter is not the pinned release.
+
+    Only an *older* aiter is told to install the pin. Operators whose kernels landed
+    after the pinned release need a newer one -- MXFP6's A6W6 entry points are the
+    current example -- and handing that user the pin would be telling them to install
+    an aiter their operator cannot run on.
+
+    This never decides anything: whether a given operator's kernels are actually
+    present is settled by probing for its symbols, because a version string cannot
+    express "contains commit X" and a fork can carry any version it likes.
+    """
     global _version_checked
     if _version_checked:
         return
     _version_checked = True
 
     installed = _installed_aiter_version()
-    if installed and not _versions_match(installed, AITER_VERSION):
+    if installed is None:
+        return
+    order = _version_order(installed, AITER_VERSION)
+    if order == 0:
+        return
+    if order is None or order < 0:
         logger.warning(
             "aiter version mismatch: installed=%s, expected=%s; behavior/perf may differ. "
             "To match, run:\n  %s",
             installed,
             AITER_VERSION,
             _AITER_PIP_INSTALL,
+            once=True,
+        )
+    else:
+        logger.info(
+            "aiter %s is newer than the pinned %s; behavior/perf may differ from what CI covers.",
+            installed,
+            AITER_VERSION,
             once=True,
         )
 
