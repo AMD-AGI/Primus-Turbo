@@ -227,6 +227,14 @@ def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled):
     return offsets
 
 
+def pair_n_row(r, tile_rows):
+    """Operand row feeding LDS row ``r`` under the column-pair permutation
+    ``16*t + m -> 2*m + t`` inside every ``tile_rows``-row block."""
+    half = tile_rows // 2
+    blk, q = (r // tile_rows) * tile_rows, r % tile_rows
+    return blk + (q % half) * 2 + q // half
+
+
 def compute_global_swizzle_pair_n(lane_id, wave_id, K, n_rounds, tile_rows):
     """compute_global_swizzle(preshuffled=False) with the operand row feeding each LDS row
     permuted ``16*t + m -> 2*m + t`` inside every ``tile_rows``-row block, so a wave's two
@@ -234,22 +242,22 @@ def compute_global_swizzle_pair_n(lane_id, wave_id, K, n_rounds, tile_rows):
     epilogue folds the pair into one dword store (``StoreCPerTensorQuadN``). Only the global
     source row moves: the LDS row, its XOR bank key and the whole s2r read side are untouched,
     and a direct-to-LDS g2s takes an arbitrary per-lane global offset for free."""
-    half = tile_rows // 2
     offsets = []
     n_waves = fx.block_dim.x // 64
     for round in range_constexpr(n_rounds):
         row = lane_id // 8 + wave_id * 8 + round * (n_waves * 8)
         col = (lane_id % 8) * 16
         r, c = swizzle_128(row, col)
-        blk, q = (r // tile_rows) * tile_rows, r % tile_rows
-        offsets.append((blk + (q % half) * 2 + q // half) * K + c)
+        offsets.append(pair_n_row(r, tile_rows) * K + c)
     return offsets
 
 
-def compute_global_swizzle_shear(lane_id, wave_id, K, n_rounds, m_row, ksm, up):
+def compute_global_swizzle_shear(lane_id, wave_id, K, n_rounds, m_row, ksm, up, pair_rows=0):
     """compute_global_swizzle(preshuffled=False) with every row's 128B fetch snapped to its
     enclosing cache line, for a row pitch whose ``K % 128 == ksm != 0`` (raw K-block straddles
-    two lines). ``S2RLoaderShear`` reassembles each K-block from two consecutive windows."""
+    two lines). ``S2RLoaderShear`` reassembles each K-block from two consecutive windows:
+    ``up`` snaps the window forward (partner = k-1), else backward (partner = k+1).
+    ``pair_rows`` > 0 applies ``pair_n_row`` first, i.e. shears the column-paired operand."""
     assert ksm % 16 == 0 and 0 < ksm < 128
     mbias = (m_row * fx.Int32(ksm)) % fx.Int32(128)
     offsets = []
@@ -258,7 +266,9 @@ def compute_global_swizzle_shear(lane_id, wave_id, K, n_rounds, m_row, ksm, up):
         row = lane_id // 8 + wave_id * 8 + round * (n_waves * 8)
         col = (lane_id % 8) * 16
         r, c = swizzle_128(row, col)
-        sh = ((m_row + row) * fx.Int32(ksm)) % fx.Int32(128)
+        if const_expr(pair_rows):
+            r = pair_n_row(r, pair_rows)
+        sh = ((m_row + r) * fx.Int32(ksm)) % fx.Int32(128)
         disp = ((fx.Int32(128) - sh) % fx.Int32(128)) if const_expr(up) else (fx.Int32(0) - sh)
         offsets.append(r * K + c + mbias + disp)
     return offsets
@@ -336,8 +346,6 @@ class _S2RLoaderBase:
         self.wave_idx = wave_idx
         self.n_tiles = n_tiles
 
-
-class S2RLoader(_S2RLoaderBase):
     def _vec_load_16xf8(self, lds_src, offset):
         off_tup = fx.make_int_tuple(offset)
         ptr_off = fx.add_offset(lds_src.ptr, off_tup)
@@ -345,6 +353,8 @@ class S2RLoader(_S2RLoaderBase):
         view = fx.make_view(i8_iter, fx.make_layout(16, 1))
         return view.load()
 
+
+class S2RLoader(_S2RLoaderBase):
     def load(self, lds_src, preshuffled=False):
         frag = []
         for i in range_constexpr(self.n_tiles):
@@ -387,31 +397,120 @@ class S2RLoader(_S2RLoaderBase):
 
 class S2RLoaderShear(S2RLoader):
     """S2RLoader twin for an operand fetched with ``compute_global_swizzle_shear``: each
-    K-block's bytes are split across window k and its partner (k-1 or k+1 per ``up``), both
-    already resident. ``ksm == 64`` folds the splice into the XOR bank-swizzle key for free."""
+    K-block's bytes are split across window k and its partner (k-1 for ``up``, else k+1), both
+    already resident. ``ksm == 64`` folds the splice into the XOR bank-swizzle key for free.
+    ``pair_n`` mirrors the g2s side's ``pair_rows``: that permutation puts all even source rows
+    in the low half of every 32-row block, so a fragment's rows share the parity of its tile
+    index and the whole splice folds into compile-time constants."""
 
-    def __init__(self, wave_idx, n_tiles, m_row, ksm, up):
+    def __init__(self, wave_idx, n_tiles, m_row, ksm, up, pair_n=False):
         super().__init__(wave_idx, n_tiles)
-        assert ksm == 64 and up, "only the round-up 64B shear is implemented"
+        assert ksm == 64, "only the 64B shear is implemented"
+        assert not pair_n or n_tiles % 2 == 0, "pair_n parity needs an even tile count"
         self.m_row = m_row
+        self.up = up
+        self.pair_n = pair_n
 
     def load(self, lds_cur, lds_partner):
         delta = fx.Int32(fx.ptrtoint(lds_partner.ptr)) - fx.Int32(fx.ptrtoint(lds_cur.ptr))
-        # n_tiles*16 and i*16 are even, so a fragment row's parity is the lane's parity.
-        odd = ((self.m_row + self.lane_id) & fx.Int32(1)) == fx.Int32(1)
-        sh = arith.select(odd, fx.Int32(64), fx.Int32(0))
-        pdelta = arith.select(odd, delta, fx.Int32(0))
+        if const_expr(not self.pair_n):
+            # n_tiles*16 and i*16 are even, so a fragment row's parity is the lane's parity.
+            odd = ((self.m_row + self.lane_id) & fx.Int32(1)) == fx.Int32(1)
+            sh = arith.select(odd, fx.Int32(64), fx.Int32(0))
+            pdelta = arith.select(odd, delta, fx.Int32(0))
+        # The partner supplies the half of the K-block the shifted window pushed out.
+        pstep = 0 if self.up else 1
         frag = []
         for i in range_constexpr(self.n_tiles):
             halves = []
             row = self.wave_idx * (self.n_tiles * 16) + i * 16 + self.lane_id % 16
+            if const_expr(self.pair_n):
+                sh = 64 if i % 2 else 0
+                pdelta = delta if i % 2 else None
             key = (lds_row_swizzle(row, 8) * 16) ^ sh
             for step in range_constexpr(2):
                 col = (self.lane_id // 16) * 16 + step * 64
                 offset = row * 128 + (col ^ key)
-                if const_expr(step == 0):
+                if const_expr(step == pstep and pdelta is not None):
                     offset = offset + pdelta
                 v = self._vec_load_16xf8(lds_cur, offset)
+                halves.append(v.bitcast(fx.Int32))
+            frag.append(pack_i32x4_i32x8(halves[0], halves[1]))
+        return frag
+
+
+def split_pool_key(p):
+    """XOR bank key for row ``p`` of a parity-split pool. Keyed on the source row ``2p`` so both
+    parity halves share one key per row and a fragment still spans the eight distinct keys the
+    interleaved pool gave it."""
+    return lds_row_swizzle(p * 2, 8) * 16
+
+
+def compute_global_swizzle_split(lane_id, wave_id, K, m_row, ksm, odd, up):
+    """Global offsets for one parity half of a sheared operand pool: LDS row ``p`` of a 64-row
+    half holds source row ``2p + e``, ``e`` chosen so the absolute row ``m_row + row`` is odd
+    (``odd``) or even. At a ``K % 128 == ksm`` pitch only odd absolute rows straddle a cache
+    line, so splitting by parity turns the partner window into a 64-row carry -- the even half
+    never needs a third slot. ``up`` snaps each straddling window forward, i.e. partner = window
+    k-1, which is what ``S2RLoaderSplit`` re-assembles. One offset covers the whole half, so the
+    g2s costs one instruction per half where the interleaved pool cost one per LDS round."""
+    assert ksm == 64, "only the 64B shear is implemented"
+    assert up, "the distance-2 ring only holds the k-1 partner"
+    p = lane_id // 8 + wave_id * 8
+    col = (lane_id % 8) * 16
+    par = m_row & fx.Int32(1)
+    e = (fx.Int32(1) - par) if const_expr(odd) else par
+    mbias = (m_row * fx.Int32(ksm)) % fx.Int32(128)
+    disp = fx.Int32(128 - ksm) if const_expr(odd) else fx.Int32(0)
+    return [(p * 2 + e) * K + (col ^ split_pool_key(p)) + mbias + disp]
+
+
+class S2RLoaderSplit(_S2RLoaderBase):
+    """Reader for an operand held as two 64-row parity halves (``compute_global_swizzle_split``).
+    The even half is line-aligned and read straight from the current window; the odd half's
+    window is snapped forward 64B, so its fragment splices the partner (k-1) window's upper half
+    with the current window's lower half -- the same XOR-64 fold ``S2RLoaderShear`` uses, over a
+    carry that holds only the rows which straddle. ``pair_n`` mirrors the g2s side of the
+    column-pair permutation: parity is then the tile index, so every splice constant is
+    compile-time and the pool split *is* the permutation."""
+
+    def __init__(self, wave_idx, n_tiles, m_row, ksm, pair_n=False):
+        super().__init__(wave_idx, n_tiles)
+        assert ksm == 64, "only the 64B shear is implemented"
+        assert not pair_n or n_tiles % 2 == 0, "pair_n parity needs an even tile count"
+        self.m_row = m_row
+        self.pair_n = pair_n
+
+    def load(self, ev_cur, od_cur, od_prev):
+        base = fx.Int32(fx.ptrtoint(ev_cur.ptr))
+        d_cur = fx.Int32(fx.ptrtoint(od_cur.ptr)) - base
+        d_pv = fx.Int32(fx.ptrtoint(od_prev.ptr)) - base
+        if const_expr(not self.pair_n):
+            # n_tiles*16 and i*16 are even, so a fragment row's parity is the lane's parity.
+            odd = ((self.m_row + self.lane_id) & fx.Int32(1)) == fx.Int32(1)
+            sh = arith.select(odd, fx.Int32(64), fx.Int32(0))
+            o_cur = arith.select(odd, d_cur, fx.Int32(0))
+            o_pv = arith.select(odd, d_pv, fx.Int32(0))
+        frag = []
+        for i in range_constexpr(self.n_tiles):
+            if const_expr(self.pair_n):
+                sh = 64 if i % 2 else 0
+                o_cur = d_cur if i % 2 else None
+                o_pv = d_pv if i % 2 else None
+                # pair_n feeds tile i of a 32-row block with source row 2*(lane%16) + i.
+                p = self.wave_idx * (self.n_tiles * 8) + (i // 2) * 16 + self.lane_id % 16
+            else:
+                p = (self.wave_idx * (self.n_tiles * 16) + i * 16 + self.lane_id % 16) // 2
+            key = split_pool_key(p) ^ sh
+            halves = []
+            for step in range_constexpr(2):
+                col = (self.lane_id // 16) * 16 + step * 64
+                offset = p * 128 + (col ^ key)
+                # up-shear: the partner supplies the low half of the K-block (step 0).
+                pd = o_pv if const_expr(step == 0) else o_cur
+                if const_expr(pd is not None):
+                    offset = offset + pd
+                v = self._vec_load_16xf8(ev_cur, offset)
                 halves.append(v.bitcast(fx.Int32))
             frag.append(pack_i32x4_i32x8(halves[0], halves[1]))
         return frag

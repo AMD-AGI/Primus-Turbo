@@ -47,6 +47,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     Mfma16x16x128,
     S2RLoader,
     S2RLoaderShear,
+    S2RLoaderSplit,
     S2RLoaderTr,
     StoreCPerTensor,
     StoreCPerTensorCShuffle,
@@ -67,6 +68,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     compute_global_swizzle_nn,
     compute_global_swizzle_pair_n,
     compute_global_swizzle_shear,
+    compute_global_swizzle_split,
     make_fp8_buffer_tensor_rebased,
     make_row_band_resource,
     make_value_attrs,
@@ -923,6 +925,8 @@ def _compile_grouped_nt(
     nt_dist2: bool = True,  # True = uniform distance-2 mainloop (A1@k+2 like mx, one wait_barrier/iter, no vmcnt throttle) + runtime half-N padding-quadrant skip. False = legacy A1@k+1 + vmcnt drain
     nt_kshear: bool = True,  # KS % 128 == 64: fetch A's line-aligned window per row instead of its raw K-block, so no row's 128B load splits a cache line. Off = legacy split loads
     nt_pair_n: bool = True,  # permute B_T's rows into LDS so a lane's two n-fragments are adjacent output columns and one dword store replaces both buffer_store_short. Off = per-column scalar store
+    nt_bshear: bool = True,  # KS % 128 == 64: spend the shear's 3rd LDS slot pair on B_T instead of A
+    nt_pshear: bool = True,  # KS % 128 == 64: split every pool by row parity so both K-major operands get a 64-row partner carry inside the same LDS
     persistent: bool = True,  # True = scf.for tile loop (fixed grid, cap_cu reserves CUs); False = one tile/WG + s_endpgm over-launch guard (full-device default)
     cap_cu: int = -1,  # >0: cap grid to this many WGs (= reserve device CUs for comm-compute overlap). <=0: use the full device CU count.
     N: int = 0,  # compile-time output width (0 = unknown): lets _col_safe prove the epilogue's column OOB select dead. Part of the autotune cache key
@@ -1006,12 +1010,12 @@ def _compile_grouped_nt(
     # (two L1->L2 requests). Fetching each row's enclosing line restores one request/row; the
     # halves then rotate over 3 LDS slots, which needs the CShuffle pool's LDS. Only the dist2
     # body carries the splice; the legacy dist1 one reads its A fragment from a single slot.
-    _kshear = nt_kshear and nt_dist2 and KS % BLOCK_K == 64 and not store_cshuffle
+    _shear_ok = nt_kshear and nt_dist2 and KS % BLOCK_K == 64 and not store_cshuffle
     # The splice addressing costs ~4 arch VGPRs on a body already at 252/256, so the scored
     # MFMA path spills 2 dwords to scratch -- and scratch shares vmcnt with the g2s traffic,
     # which would void the partial loop drain. Mode-3 in-place MFMA keeps the accumulators in
     # the arch file with explicit tied live ranges: 232 VGPRs, no spill, no AGPR alloc.
-    _asm_mode = ("2" if acc_mode == "agpr" else "3") if agpr_inplace else ("3" if _kshear else None)
+    _asm_mode = ("2" if acc_mode == "agpr" else "3") if agpr_inplace else ("3" if _shear_ok else None)
     # A lane's two n-fragments sit 16 output columns apart, so each leaves as its own 2B store:
     # 32B per fragment row, half the 64B TCP->TCC write grain. Permuting B_T's rows on the way
     # into LDS makes the pair adjacent columns, so one dword store covers both and the write
@@ -1031,6 +1035,24 @@ def _compile_grouped_nt(
     # Non-temporal only on the paired-column store, which is the one that covers a full 64B write
     # grain; the per-column fallback and the narrow boundary body keep the default policy.
     _cstore_aux = (_MERGED_STORE_AUX if _ntpair else 0) if cstore_aux < 0 else cstore_aux
+    # B_T's rows sit on the same straddling K pitch as A's and cost the larger half of the tax,
+    # but a second sheared operand would need a second 3rd-slot pair and LDS is already at the
+    # cap. So point the existing pair at B_T instead of A: same up-shear (partner = window k-1,
+    # distance 2, so vmcnt/drain/barrier counts are untouched), same total LDS. The gate needs
+    # _ntpair because that row permutation sorts even and odd source rows into the halves of a
+    # 32-row block, which makes the splice parity compile-time per fragment, and K % BLOCK_K == 64
+    # because the last window's partner half is past K and only mask_a_tail zeroes it.
+    _pair_ok = _shear_ok and _ntpair and K % BLOCK_K == 64 and NS % 2 == 0 and BLOCK_N % 2 == 0
+    # Narrow carry. Only rows whose absolute index is odd straddle a line at this pitch, so a
+    # pool split by row parity needs the 3rd (partner) slot on its odd half alone: 5 half-slots
+    # per pool instead of 3 whole ones, which shears BOTH K-major operands inside the same
+    # 163840 B. The g2s batch is untouched -- one instruction per parity half replaces one per
+    # LDS round -- so the per-iteration issue count, vmcnt drain and barrier string all match
+    # the shipped body byte for byte, and cross-round rule R1 does not fire.
+    _pshear = nt_pshear and _pair_ok and N_LDS_STEPS_A == 2 and N_LDS_STEPS_B == 2 and a_lds_size == b_lds_size
+    _bshear = nt_bshear and _pair_ok and not _pshear
+    # One operand at a time: the prev pair belongs to whichever of A / B_T is sheared.
+    _kshear = _shear_ok and not _bshear and not _pshear
 
     _ss_anns = {
         "A_lds_cur_0": fx.Array[fx.Float8E4M3FN, a_lds_size, 16],
@@ -1050,8 +1072,29 @@ def _compile_grouped_nt(
         "B_lds_cur_1": fx.Array[fx.Float8E4M3FN, b_lds_size, 16],
         "B_lds_next_0": fx.Array[fx.Float8E4M3FN, b_lds_size, 16],
         "B_lds_next_1": fx.Array[fx.Float8E4M3FN, b_lds_size, 16],
+        # The same pair as A's, moved: a_lds_size == b_lds_size, so LDS is unchanged.
+        **(
+            {
+                "B_lds_prev_0": fx.Array[fx.Float8E4M3FN, b_lds_size, 16],
+                "B_lds_prev_1": fx.Array[fx.Float8E4M3FN, b_lds_size, 16],
+            }
+            if _bshear
+            else {}
+        ),
         "C_lds_shuffle": fx.Array[_cshuf_ty, _cshuf_alloc, 16],
     }
+    if _pshear:
+        # Even halves ping-pong over 2 slots (they never read a partner); odd halves rotate
+        # over 3. 4 pools x 5 half-slots is exactly the interleaved layout's 4 x 2 + 1 x 2
+        # whole slots, so LDS stays at the cap with both operands sheared.
+        _ss_anns = {
+            f"{op}_{par}_{slot}{h}": fx.Array[fx.Float8E4M3FN, a_lds_size // 2, 16]
+            for op in ("A", "B")
+            for h in (0, 1)
+            for par, slots in (("ev", ("c", "n")), ("od", ("p", "c", "n")))
+            for slot in slots
+        }
+        _ss_anns["C_lds_shuffle"] = fx.Array[_cshuf_ty, _cshuf_alloc, 16]
     SharedStorage = fx.struct(type("SharedStorage", (), {"__annotations__": _ss_anns}))
 
     @flyc.kernel(known_block_size=[512, 1, 1])
@@ -1138,19 +1181,32 @@ def _compile_grouped_nt(
                 local, m_start, m_end, n_blocks, BLOCK_M, group_m, group_n, n_blocks_c=_nb_c, unsigned=True
             )
 
-            a_cur0 = lds.A_lds_cur_0
-            a_cur1 = lds.A_lds_cur_1
-            a_next0 = lds.A_lds_next_0
-            a_next1 = lds.A_lds_next_1
-            # Sheared: a third slot per half carries the partner (k-1) window, and the
-            # distance-2 fill lands in it once its splice has been consumed. Unsheared it
-            # aliases cur, which reproduces the original 2-slot fill-into-the-read-slot.
-            a_prev0 = lds.A_lds_prev_0 if const_expr(_kshear) else a_cur0
-            a_prev1 = lds.A_lds_prev_1 if const_expr(_kshear) else a_cur1
-            b_cur0 = lds.B_lds_cur_0
-            b_cur1 = lds.B_lds_cur_1
-            b_next0 = lds.B_lds_next_0
-            b_next1 = lds.B_lds_next_1
+            if const_expr(_pshear):
+                # A pool half is the pair (even rows, odd rows). Only odd absolute rows straddle,
+                # so only the odd half carries a third slot; ``prev`` keeps the even half of
+                # ``cur`` aliased, which is the unsheared fill-into-the-read-slot on that parity.
+                a_cur0, a_cur1 = (lds.A_ev_c0, lds.A_od_c0), (lds.A_ev_c1, lds.A_od_c1)
+                a_next0, a_next1 = (lds.A_ev_n0, lds.A_od_n0), (lds.A_ev_n1, lds.A_od_n1)
+                a_prev0, a_prev1 = (lds.A_ev_c0, lds.A_od_p0), (lds.A_ev_c1, lds.A_od_p1)
+                b_cur0, b_cur1 = (lds.B_ev_c0, lds.B_od_c0), (lds.B_ev_c1, lds.B_od_c1)
+                b_next0, b_next1 = (lds.B_ev_n0, lds.B_od_n0), (lds.B_ev_n1, lds.B_od_n1)
+                b_prev0, b_prev1 = (lds.B_ev_c0, lds.B_od_p0), (lds.B_ev_c1, lds.B_od_p1)
+            else:
+                a_cur0 = lds.A_lds_cur_0
+                a_cur1 = lds.A_lds_cur_1
+                a_next0 = lds.A_lds_next_0
+                a_next1 = lds.A_lds_next_1
+                # Sheared: a third slot per half carries the partner (k-1) window, and the
+                # distance-2 fill lands in it once its splice has been consumed. Unsheared it
+                # aliases cur, which reproduces the original 2-slot fill-into-the-read-slot.
+                a_prev0 = lds.A_lds_prev_0 if const_expr(_kshear) else a_cur0
+                a_prev1 = lds.A_lds_prev_1 if const_expr(_kshear) else a_cur1
+                b_cur0 = lds.B_lds_cur_0
+                b_cur1 = lds.B_lds_cur_1
+                b_next0 = lds.B_lds_next_0
+                b_next1 = lds.B_lds_next_1
+                b_prev0 = lds.B_lds_prev_0 if const_expr(_bshear) else b_cur0
+                b_prev1 = lds.B_lds_prev_1 if const_expr(_bshear) else b_cur1
 
             lane_id = fx.thread_idx.x % 64
             wave_id = fx.thread_idx.x // 64
@@ -1164,10 +1220,12 @@ def _compile_grouped_nt(
             m_total = _m_total_v if const_expr(_sgo) else _readfirstlane_i32(_m_total_v)
             a_base = uindex(m_row) * arith.index(KS)
             a_nrec = (uindex(m_total) - uindex(m_row)) * arith.index(KS)
-            if const_expr(_kshear):
+            if const_expr(_kshear or _pshear):
                 # The shear rounds each row's fetch up to its enclosing line, past the tile's
                 # first row, so the SRD base drops back by that much and every A offset adds
                 # it again (m_row*KS == 0 => the bias is 0, so the base never goes negative).
+                # The split needs the same bias: it picks each half's parity off m_row, and its
+                # window -1 offsets are only non-negative once the bias is folded in.
                 _mb = shear_mbias(m_row, KS % BLOCK_K)
                 a_base = a_base - uindex(_mb)
                 a_nrec = a_nrec + uindex(_mb)
@@ -1202,7 +1260,14 @@ def _compile_grouped_nt(
             a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
             b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
-            if const_expr(_kshear):
+            _ksm = KS % BLOCK_K
+            if const_expr(_pshear):
+                # Two 64-row parity halves per pool: the even one line-aligned, the odd one
+                # snapped forward 64B so its partner is window k-1. Distance 2, so the drain,
+                # vmcnt and barrier counts are the unsheared body's.
+                gl_off_a = compute_global_swizzle_split(lane_id, wave_id, KS, m_row, _ksm, odd=False, up=True)
+                gl_off_a_od = compute_global_swizzle_split(lane_id, wave_id, KS, m_row, _ksm, odd=True, up=True)
+            elif const_expr(_kshear):
                 # LDS_BLOCK_M is even, so the A1 half's rows have the same line offset as the
                 # A0 half's: one offset list and one reader serve both.
                 gl_off_a = compute_global_swizzle_shear(
@@ -1212,11 +1277,30 @@ def _compile_grouped_nt(
                 gl_off_a = compute_global_swizzle(lane_id, wave_id, KS, N_LDS_ROUNDS, preshuffled=False)
             gl_off_b = compute_global_swizzle(lane_id, wave_id, KS, N_LDS_ROUNDS, preshuffled=False)
             # Column-paired B rows for the full/half bodies; the narrow one keeps gl_off_b.
-            gl_off_b_p = (
-                compute_global_swizzle_pair_n(lane_id, wave_id, KS, N_LDS_ROUNDS, N_TILES_B * 16)
-                if const_expr(_ntpair)
-                else gl_off_b
-            )
+            if const_expr(_pshear):
+                # The tile's B row base is gi*NS + block_n*BLOCK_N with both terms even, so it is
+                # already line-aligned and needs no SRD bias. The parity split *is* the column
+                # pairing: half ``e`` row p holds source row 2p+e, the row pair_n_row feeds tile e.
+                gl_off_b_p = compute_global_swizzle_split(lane_id, wave_id, KS, fx.Int32(0), _ksm, odd=False, up=True)
+                gl_off_b_od = compute_global_swizzle_split(lane_id, wave_id, KS, fx.Int32(0), _ksm, odd=True, up=True)
+            elif const_expr(_bshear):
+                # The tile's B row base is gi*NS + block_n*BLOCK_N with both terms even, so it is
+                # already line-aligned and each row's own line offset follows the permuted source
+                # row alone: m_row = 0, hence no SRD bias either (shear_mbias(0) == 0).
+                gl_off_b_p = compute_global_swizzle_shear(
+                    lane_id,
+                    wave_id,
+                    KS,
+                    N_LDS_ROUNDS,
+                    fx.Int32(0),
+                    KS % BLOCK_K,
+                    up=True,
+                    pair_rows=N_TILES_B * 16,
+                )
+            elif const_expr(_ntpair):
+                gl_off_b_p = compute_global_swizzle_pair_n(lane_id, wave_id, KS, N_LDS_ROUNDS, N_TILES_B * 16)
+            else:
+                gl_off_b_p = gl_off_b
 
             # _asm_mode: None = scored intrinsic MMA, "2" = AGPR in-place, "3" = VGPR in-place.
             mfma = _build_mfma(
@@ -1227,33 +1311,91 @@ def _compile_grouped_nt(
                 asm_mode=_asm_mode,
             )
 
-            a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
+            # A split half takes one g2s instruction where the interleaved pool took one per LDS
+            # round, so the batch size per operand half is unchanged.
+            _nsa = 1 if const_expr(_pshear) else N_LDS_STEPS_A
+            _nsb = 1 if const_expr(_pshear) else N_LDS_STEPS_B
+            a_g2s = G2SLoader(a_div, gl_off_a, _nsa, F8_IR_t, wave_id)
             # Window -1 rides the offsets rather than a negative soffset (A0's k base is 0).
             a_pv_g2s = (
-                G2SLoader(a_div, [o - fx.Int32(BLOCK_K) for o in gl_off_a], N_LDS_STEPS_A, F8_IR_t, wave_id)
+                G2SLoader(a_div, [o - fx.Int32(BLOCK_K) for o in gl_off_a], _nsa, F8_IR_t, wave_id)
                 if const_expr(_kshear)
                 else a_g2s
             )
-            b_g2s = G2SLoader(b_div, gl_off_b_p, N_LDS_STEPS_B, F8_IR_t, wave_id)
-            a_s2r = (
-                S2RLoaderShear(wave_m, N_TILES_A, m_row, KS % BLOCK_K, up=True)
-                if const_expr(_kshear)
-                else S2RLoader(wave_m, N_TILES_A)
+            b_g2s = G2SLoader(b_div, gl_off_b_p, _nsb, F8_IR_t, wave_id)
+            # Window -1 rides the offsets, as A's does: the B0 half's k base is 0.
+            b_pv_g2s = (
+                G2SLoader(b_div, [o - fx.Int32(BLOCK_K) for o in gl_off_b_p], _nsb, F8_IR_t, wave_id)
+                if const_expr(_bshear)
+                else b_g2s
             )
-            b_s2r = S2RLoader(wave_n, N_TILES_B)
+            if const_expr(_pshear):
+                # Odd halves only: they alone carry a partner, and their snapped window starts
+                # past byte 128, so the window -1 offsets stay non-negative.
+                a_od_g2s = G2SLoader(a_div, gl_off_a_od, 1, F8_IR_t, wave_id)
+                b_od_g2s = G2SLoader(b_div, gl_off_b_od, 1, F8_IR_t, wave_id)
+                a_od_pv_g2s = G2SLoader(a_div, [o - fx.Int32(BLOCK_K) for o in gl_off_a_od], 1, F8_IR_t, wave_id)
+                b_od_pv_g2s = G2SLoader(b_div, [o - fx.Int32(BLOCK_K) for o in gl_off_b_od], 1, F8_IR_t, wave_id)
+            a_s2r = (
+                S2RLoaderSplit(wave_m, N_TILES_A, m_row, _ksm)
+                if const_expr(_pshear)
+                else (
+                    S2RLoaderShear(wave_m, N_TILES_A, m_row, KS % BLOCK_K, up=True)
+                    if const_expr(_kshear)
+                    else S2RLoader(wave_m, N_TILES_A)
+                )
+            )
+            b_s2r = (
+                S2RLoaderSplit(wave_n, N_TILES_B, fx.Int32(0), _ksm, pair_n=True)
+                if const_expr(_pshear)
+                else (
+                    S2RLoaderShear(wave_n, N_TILES_B, fx.Int32(0), KS % BLOCK_K, up=True, pair_n=True)
+                    if const_expr(_bshear)
+                    else S2RLoader(wave_n, N_TILES_B)
+                )
+            )
+
+            def _g2s_a(dst, off):
+                """One A half's g2s batch: one instruction per parity half when split, one per
+                LDS round otherwise -- the same instruction count either way."""
+                if const_expr(_pshear):
+                    a_g2s.load(dst[0], off)
+                    a_od_g2s.load(dst[1], off)
+                else:
+                    a_g2s.load(dst, off)
 
             def _ld_a(cur, prev):
                 """A fragment; the sheared reader splices the current and partner windows."""
+                if const_expr(_pshear):
+                    return a_s2r.load(cur[0], cur[1], prev[1])
                 if const_expr(_kshear):
                     return a_s2r.load(cur, prev)
                 return a_s2r.load(cur)
 
+            def _rot_split(prev, cur, nxt):
+                """Advance a parity-split half by a phase: the even pool ping-pongs over 2 slots,
+                the odd one rotates over 3, and ``prev``'s even entry stays aliased to the new
+                ``cur`` so one fill target serves both parities."""
+                return (nxt[0], cur[1]), (nxt[0], nxt[1]), (cur[0], prev[1])
+
             def _rot_a(prev, cur, nxt):
                 """Advance one A half by a phase: 3-slot rotate when sheared, otherwise the
                 original 2-slot swap with ``prev`` kept aliased to the slot being read."""
+                if const_expr(_pshear):
+                    return _rot_split(prev, cur, nxt)
                 if const_expr(_kshear):
                     return cur, nxt, prev
                 return nxt, nxt, cur
+
+            def _rot_b(prev, cur, nxt):
+                """B twin of _rot_a: 3-slot rotate when B_T carries the shear, else the
+                original 2-slot swap with ``prev`` aliased to the slot being read."""
+                if const_expr(_pshear):
+                    return _rot_split(prev, cur, nxt)
+                if const_expr(_bshear):
+                    return cur, nxt, prev
+                return nxt, nxt, cur
+
             if const_expr(glu):
                 store_c = StoreCSwiGLU(
                     A_scale,
@@ -1375,6 +1517,31 @@ def _compile_grouped_nt(
                     a_c0, a_c1, a_n0, a_n1 = a_cur0, a_cur1, a_next0, a_next1
                     a_p0, a_p1 = a_prev0, a_prev1
                     b_c0, b_c1, b_n0, b_n1 = b_cur0, b_cur1, b_next0, b_next1
+                    b_p0, b_p1 = b_prev0, b_prev1
+                    _bsh = _bshear and not _bnd  # the narrow body keeps the unpermuted offsets
+                    _psh = _pshear and not _bnd  # ditto: one column-tile per wave has no pair
+
+                    def _ld_b(cur, prev):
+                        """B fragment; the sheared reader splices the current and partner windows."""
+                        if const_expr(_bnd and _pshear):
+                            # The narrow body's 64 unpermuted rows are exactly one split half, so
+                            # it reads the odd one straight and never splices.
+                            return _bs2r.load(cur[1])
+                        if const_expr(_psh):
+                            return _bs2r.load(cur[0], cur[1], prev[1])
+                        if const_expr(_bsh):
+                            return _bs2r.load(cur, prev)
+                        return _bs2r.load(cur)
+
+                    def _g2s_b(dst, off):
+                        """B twin of _g2s_a; the narrow body fills only the 64-row odd half."""
+                        if const_expr(_bnd):
+                            _bg2s.load(dst[1] if const_expr(_pshear) else dst, off)
+                        elif const_expr(_pshear):
+                            _bg2s.load(dst[0], off)
+                            b_od_g2s.load(dst[1], off)
+                        else:
+                            _bg2s.load(dst, off)
 
                     c00 = [_mm.zero_value] * _nacc
                     c10 = [_mm.zero_value] * _nacc
@@ -1382,39 +1549,56 @@ def _compile_grouped_nt(
                         c01 = [_mm.zero_value] * _nacc
                         c11 = [_mm.zero_value] * _nacc
 
-                    _bg2s.load(b_c0, B0_gl_offset + 0 * BLOCK_K)
-                    a_g2s.load(a_c0, A0_gl_offset + 0 * BLOCK_K)
+                    _g2s_b(b_c0, B0_gl_offset + 0 * BLOCK_K)
+                    _g2s_a(a_c0, A0_gl_offset + 0 * BLOCK_K)
                     if const_expr(_full):
-                        _bg2s.load(b_c1, B1_gl_offset + 0 * BLOCK_K)
-                    a_g2s.load(a_c1, A1_gl_offset + 0 * BLOCK_K)
+                        _g2s_b(b_c1, B1_gl_offset + 0 * BLOCK_K)
+                    _g2s_a(a_c1, A1_gl_offset + 0 * BLOCK_K)
+                    if const_expr(_psh):
+                        # Window -1 carries k-block 0's low bytes for the rows the shear displaces.
+                        # Split, only the odd half straddles, so only it takes the extra fill --
+                        # two per operand, exactly what one sheared whole pool cost before.
+                        b_od_pv_g2s.load(b_p0[1], B0_gl_offset + 0 * BLOCK_K)
+                        if const_expr(_full):
+                            b_od_g2s.load(b_p1[1], B1_gl_offset - 1 * BLOCK_K)
+                    if const_expr(_pshear):
+                        a_od_pv_g2s.load(a_p0[1], A0_gl_offset + 0 * BLOCK_K)
+                        a_od_g2s.load(a_p1[1], A1_gl_offset - 1 * BLOCK_K)
                     if const_expr(_kshear):
                         # Window -1 carries k-block 0's low bytes for the rows the shear displaces.
                         a_pv_g2s.load(a_p0, A0_gl_offset + 0 * BLOCK_K)
                         a_g2s.load(a_p1, A1_gl_offset - 1 * BLOCK_K)
+                    if const_expr(_bsh):
+                        # Same window -1, on the operand that now carries the shear.
+                        b_pv_g2s.load(b_p0, B0_gl_offset + 0 * BLOCK_K)
+                        if const_expr(_full):
+                            _bg2s.load(b_p1, B1_gl_offset - 1 * BLOCK_K)
                     if const_expr(persistent):
                         rocdl.s_barrier()
                     else:
                         if wave_m == 1:
                             rocdl.s_barrier()
                     wait_barrier(_nd)
-                    _bg2s.load(b_n0, B0_gl_offset + 1 * BLOCK_K)
-                    a_g2s.load(a_n0, A0_gl_offset + 1 * BLOCK_K)
+                    _g2s_b(b_n0, B0_gl_offset + 1 * BLOCK_K)
+                    _g2s_a(a_n0, A0_gl_offset + 1 * BLOCK_K)
                     if const_expr(_full):
-                        _bg2s.load(b_n1, B1_gl_offset + 1 * BLOCK_K)
-                    a_g2s.load(a_n1, A1_gl_offset + 1 * BLOCK_K)
+                        _g2s_b(b_n1, B1_gl_offset + 1 * BLOCK_K)
+                    _g2s_a(a_n1, A1_gl_offset + 1 * BLOCK_K)
                     wait_barrier(_nd)
 
                     for k in range_constexpr(K_ITERS - 2):
-                        b0_frag = _bs2r.load(b_c0)
+                        b0_frag = _ld_b(b_c0, b_p0)
                         a0_frag = _ld_a(a_c0, a_p0)
                         if const_expr(_full):
-                            b1_frag = _bs2r.load(b_c1)
+                            b1_frag = _ld_b(b_c1, b_p1)
                         rocdl.s_barrier()
                         rocdl.s_setprio(1)
                         c00 = _mm.call(a0_frag, b0_frag, c00)
                         rocdl.s_setprio(0)
                         rocdl.s_barrier()
-                        _bg2s.load(b_c0, B0_gl_offset + (k + 2) * BLOCK_K)
+                        # Sheared: b_p0 held window k-1, spliced into the c00 mfma above, so it is
+                        # the slot this distance-2 fill reuses. Unsheared it is b_c0, unchanged.
+                        _g2s_b(b_p0, B0_gl_offset + (k + 2) * BLOCK_K)
                         if const_expr(_full):
                             rocdl.s_barrier()
                             rocdl.s_setprio(1)
@@ -1424,15 +1608,15 @@ def _compile_grouped_nt(
                         a1_frag = _ld_a(a_c1, a_p1)
                         # Sheared: a_p0 held window k-1, spliced into the c00/c01 mfma above,
                         # so it is the slot this distance-2 fill reuses. Unsheared it is a_c0.
-                        a_g2s.load(a_p0, A0_gl_offset + (k + 2) * BLOCK_K)
+                        _g2s_a(a_p0, A0_gl_offset + (k + 2) * BLOCK_K)
                         rocdl.s_barrier()
                         rocdl.s_setprio(1)
                         c10 = _mm.call(a1_frag, b0_frag, c10)
                         rocdl.s_setprio(0)
                         rocdl.s_barrier()
                         if const_expr(_full):
-                            _bg2s.load(b_c1, B1_gl_offset + (k + 2) * BLOCK_K)
-                        a_g2s.load(a_p1, A1_gl_offset + (k + 2) * BLOCK_K)
+                            _g2s_b(b_p1, B1_gl_offset + (k + 2) * BLOCK_K)
+                        _g2s_a(a_p1, A1_gl_offset + (k + 2) * BLOCK_K)
                         wait_barrier(_nd)
                         if const_expr(_full):
                             rocdl.s_setprio(1)
@@ -1441,11 +1625,11 @@ def _compile_grouped_nt(
                             rocdl.s_barrier()
                         a_p0, a_c0, a_n0 = _rot_a(a_p0, a_c0, a_n0)
                         a_p1, a_c1, a_n1 = _rot_a(a_p1, a_c1, a_n1)
-                        b_c0, b_n0 = b_n0, b_c0
-                        b_c1, b_n1 = b_n1, b_c1
+                        b_p0, b_c0, b_n0 = _rot_b(b_p0, b_c0, b_n0)
+                        b_p1, b_c1, b_n1 = _rot_b(b_p1, b_c1, b_n1)
 
                     # Tail step K_ITERS-2: every stage already issued (distance 2), read only.
-                    b0_frag = _bs2r.load(b_c0)
+                    b0_frag = _ld_b(b_c0, b_p0)
                     a0_frag = _ld_a(a_c0, a_p0)
                     rocdl.s_barrier()
                     rocdl.s_setprio(1)
@@ -1453,7 +1637,7 @@ def _compile_grouped_nt(
                     rocdl.s_setprio(0)
                     rocdl.s_barrier()
                     if const_expr(_full):
-                        b1_frag = _bs2r.load(b_c1)
+                        b1_frag = _ld_b(b_c1, b_p1)
                         rocdl.s_barrier()
                         rocdl.s_setprio(1)
                         c01 = _mm.call(a0_frag, b1_frag, c01)
@@ -1472,12 +1656,12 @@ def _compile_grouped_nt(
                         rocdl.s_barrier()
                     a_p0, a_c0, a_n0 = _rot_a(a_p0, a_c0, a_n0)
                     a_p1, a_c1, a_n1 = _rot_a(a_p1, a_c1, a_n1)
-                    b_c0, b_n0 = b_n0, b_c0
-                    b_c1, b_n1 = b_n1, b_c1
+                    b_p0, b_c0, b_n0 = _rot_b(b_p0, b_c0, b_n0)
+                    b_p1, b_c1, b_n1 = _rot_b(b_p1, b_c1, b_n1)
 
                     # Tail step K_ITERS-1: last stage issued a K-iter ago -> drain then read; K-tail mask applies to the final iter only.
                     wait_barrier(0)
-                    b0_frag = _bs2r.load(b_c0)
+                    b0_frag = _ld_b(b_c0, b_p0)
                     a0_frag = _ld_a(a_c0, a_p0)
                     a0_frag = mask_a_tail(a0_frag, lane_id, K_TAIL)
                     rocdl.s_setprio(1)
@@ -1485,7 +1669,7 @@ def _compile_grouped_nt(
                     rocdl.s_setprio(0)
                     rocdl.s_barrier()
                     if const_expr(_full):
-                        b1_frag = _bs2r.load(b_c1)
+                        b1_frag = _ld_b(b_c1, b_p1)
                         rocdl.s_barrier()
                         rocdl.s_setprio(1)
                         c01 = _mm.call(a0_frag, b1_frag, c01)
