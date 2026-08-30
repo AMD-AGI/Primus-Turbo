@@ -52,7 +52,9 @@ def quantize_fp8_tensorwise_pad_impl(
     return x_fp8, scale_inv
 
 
-def quantize_fp8_tensorwise_impl(x: torch.Tensor, out_dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+def quantize_fp8_tensorwise_impl(
+    x: torch.Tensor, out_dtype: torch.dtype
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-tensor fp8 cast leaving the operand at its own K, for callers that address the row
     pitch themselves instead of taking ``quantize_fp8_tensorwise_pad_impl``'s padded path.
 

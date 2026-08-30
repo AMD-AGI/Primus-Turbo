@@ -1114,7 +1114,9 @@ def _compile_grouped_nt(
     # 163840 B. The g2s batch is untouched -- one instruction per parity half replaces one per
     # LDS round -- so the per-iteration issue count, vmcnt drain and barrier string all match
     # the shipped body byte for byte, and cross-round rule R1 does not fire.
-    _pshear = nt_pshear and _pair_ok and N_LDS_STEPS_A == 2 and N_LDS_STEPS_B == 2 and a_lds_size == b_lds_size
+    _pshear = (
+        nt_pshear and _pair_ok and N_LDS_STEPS_A == 2 and N_LDS_STEPS_B == 2 and a_lds_size == b_lds_size
+    )
     _bshear = nt_bshear and _pair_ok and not _pshear
     # One operand at a time: the prev pair belongs to whichever of A / B_T is sheared.
     _kshear = _shear_ok and not _bshear and not _pshear
@@ -1331,7 +1333,9 @@ def _compile_grouped_nt(
                 # snapped forward 64B so its partner is window k-1. Distance 2, so the drain,
                 # vmcnt and barrier counts are the unsheared body's.
                 gl_off_a = compute_global_swizzle_split(lane_id, wave_id, KS, m_row, _ksm, odd=False, up=True)
-                gl_off_a_od = compute_global_swizzle_split(lane_id, wave_id, KS, m_row, _ksm, odd=True, up=True)
+                gl_off_a_od = compute_global_swizzle_split(
+                    lane_id, wave_id, KS, m_row, _ksm, odd=True, up=True
+                )
             elif const_expr(_kshear):
                 # LDS_BLOCK_M is even, so the A1 half's rows have the same line offset as the
                 # A0 half's: one offset list and one reader serve both.
@@ -1346,8 +1350,12 @@ def _compile_grouped_nt(
                 # The tile's B row base is gi*NS + block_n*BLOCK_N with both terms even, so it is
                 # already line-aligned and needs no SRD bias. The parity split *is* the column
                 # pairing: half ``e`` row p holds source row 2p+e, the row pair_n_row feeds tile e.
-                gl_off_b_p = compute_global_swizzle_split(lane_id, wave_id, KS, fx.Int32(0), _ksm, odd=False, up=True)
-                gl_off_b_od = compute_global_swizzle_split(lane_id, wave_id, KS, fx.Int32(0), _ksm, odd=True, up=True)
+                gl_off_b_p = compute_global_swizzle_split(
+                    lane_id, wave_id, KS, fx.Int32(0), _ksm, odd=False, up=True
+                )
+                gl_off_b_od = compute_global_swizzle_split(
+                    lane_id, wave_id, KS, fx.Int32(0), _ksm, odd=True, up=True
+                )
             elif const_expr(_bshear):
                 # The tile's B row base is gi*NS + block_n*BLOCK_N with both terms even, so it is
                 # already line-aligned and each row's own line offset follows the permuted source
@@ -1399,8 +1407,12 @@ def _compile_grouped_nt(
                 # past byte 128, so the window -1 offsets stay non-negative.
                 a_od_g2s = G2SLoader(a_div, gl_off_a_od, 1, F8_IR_t, wave_id)
                 b_od_g2s = G2SLoader(b_div, gl_off_b_od, 1, F8_IR_t, wave_id)
-                a_od_pv_g2s = G2SLoader(a_div, [o - fx.Int32(BLOCK_K) for o in gl_off_a_od], 1, F8_IR_t, wave_id)
-                b_od_pv_g2s = G2SLoader(b_div, [o - fx.Int32(BLOCK_K) for o in gl_off_b_od], 1, F8_IR_t, wave_id)
+                a_od_pv_g2s = G2SLoader(
+                    a_div, [o - fx.Int32(BLOCK_K) for o in gl_off_a_od], 1, F8_IR_t, wave_id
+                )
+                b_od_pv_g2s = G2SLoader(
+                    b_div, [o - fx.Int32(BLOCK_K) for o in gl_off_b_od], 1, F8_IR_t, wave_id
+                )
             a_s2r = (
                 S2RLoaderSplit(wave_m, N_TILES_A, m_row, _ksm)
                 if const_expr(_pshear)

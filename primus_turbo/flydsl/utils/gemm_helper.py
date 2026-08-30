@@ -1516,9 +1516,7 @@ def store_quadrants_peeled(
         if ah not in bands:
             bands[ah] = store_c.row_band(r)
         rocdl.sched_barrier(0)
-        store_c.store(
-            acc[ah * b_halves + bh], r, base_col + bh * LDS_BLOCK_N, rows=(ti,), rsrc=bands[ah]
-        )
+        store_c.store(acc[ah * b_halves + bh], r, base_col + bh * LDS_BLOCK_N, rows=(ti,), rsrc=bands[ah])
 
     pend = []
     for ah in range_constexpr(a_halves):
