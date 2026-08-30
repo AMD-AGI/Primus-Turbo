@@ -64,10 +64,10 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     S2RLoaderTr16x32Bf16Wide,
     StoreCBf16,
     _i64,
+    _readfirstlane_i32,
     compute_global_swizzle_nn_bf16_wide,
     emit_for,
     emit_if_then,
-    expert_group_tile_decode,
     group_m_tile_decode,
     make_bf16_buffer_tensor_rebased,
     make_bf16_fp16_tile_tensor,
@@ -464,6 +464,28 @@ def _row_starts(total_m: int, block_m: int, device) -> torch.Tensor:
     return torch.arange(0, total_m, block_m, device=device, dtype=torch.int64)
 
 
+def m_tile_upper_bound(total_m: int, block_m: int, groups: int) -> int:
+    """Tiles the M axis can need, from the shape alone: cutting at expert boundaries costs at
+    most one short tile per expert, so this holds for any group lengths."""
+    return (total_m + block_m - 1) // block_m + groups
+
+
+def build_m_tile_table(group_lens, group_offs, block_m: int, upper: int) -> torch.Tensor:
+    """(expert, first row, row count) per M tile, one expert per tile, built on device."""
+    lens = group_lens.to(torch.int64)
+    offs = group_offs.to(torch.int64)
+    blocks = (lens + (block_m - 1)) // block_m
+    first = torch.cumsum(blocks, 0) - blocks
+    total = first[-1] + blocks[-1]
+    idx = torch.arange(upper, device=lens.device, dtype=torch.int64)
+    g = (torch.searchsorted(first, idx, right=True) - 1).clamp_(min=0, max=lens.numel() - 1)
+    local = idx - first[g]
+    live = idx < total
+    rows = torch.where(live, (lens[g] - local * block_m).clamp_(min=0, max=block_m), torch.zeros_like(idx))
+    start = torch.where(live, offs[g] + local * block_m, torch.zeros_like(idx))
+    return torch.stack([g, start, rows], dim=1).to(torch.int32).contiguous()
+
+
 def _ptr_only_view(t: torch.Tensor) -> torch.Tensor:
     return t.contiguous().view(torch.int32)
 
@@ -536,7 +558,7 @@ _COMPILED_GROUPED_NT_CACHE = {}
 
 
 def _compile_grouped_bf16_nt(
-    TOTAL_M,
+    M_TILES,
     N,
     K,
     G,
@@ -550,14 +572,12 @@ def _compile_grouped_bf16_nt(
     nt_vmcnt=3,
     out_fp16=False,
 ):
-    # A tile never straddles two experts, so its group follows from its row block and the grid is static.
-    assert TOTAL_M % BLOCK_M == 0, "TOTAL_M must be a multiple of BLOCK_M (padded token runs)"
-    N_BLOCKS_M = TOTAL_M // BLOCK_M
+    # Tiles are cut per expert (build_m_tile_table), so none straddles two whatever the lengths.
+    N_BLOCKS_M = M_TILES
     N_BLOCKS_N = (N + BLOCK_N - 1) // BLOCK_N
     TOTAL_TILES = N_BLOCKS_M * N_BLOCKS_N
     B_GRP = N * K  # elements of one expert's weight slab
     assert GROUP_M >= 1 and GROUP_M & (GROUP_M - 1) == 0, "GROUP_M must be a power of two"
-    assert G < 64, f"expert_group_tile_decode holds the G+1 offsets in one wave (got G={G})"
     SharedStorage = _make_shared_storage(BLOCK_M, BLOCK_N)
 
     @flyc.kernel(known_block_size=[512, 1, 1])
@@ -565,30 +585,38 @@ def _compile_grouped_bf16_nt(
         A: fx.Tensor,
         B: fx.Tensor,
         C: fx.Tensor,
-        group_offs: fx.Tensor,
+        m_tiles: fx.Tensor,
         c_n: fx.Int32,
     ):
         _ = str(fx.thread_idx.x)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        mt_base = fx.Int64(_ptrtoint(_get_iter(m_tiles)))
         tile = xcd_band_remap_pid(fx.block_idx.x, TOTAL_TILES, num_xcd, xcd_band)
-        # Restarting the walk per expert keeps each super-tile on one weight slab and yields the owner.
-        block_m, block_n, g_idx = expert_group_tile_decode(
-            group_offs, fx.thread_idx.x % fx.Int32(64), tile, G, N_BLOCKS_N, BLOCK_M, GROUP_M
-        )
-        m_row = block_m * BLOCK_M
+        block_m, block_n = group_m_tile_decode(tile, N_BLOCKS_M, N_BLOCKS_N, GROUP_M)
+        _e = block_m * fx.Int32(3)
+        g_idx = _load_i32(mt_base, _e)
+        m_row = _load_i32(mt_base, _e + fx.Int32(1))
+        # Wave-uniform: these three feed SRD bases and record counts, and a buffer descriptor
+        # built from a per-lane value is garbage -- which is how the row count first showed up,
+        # as a non-deterministic wrong answer rather than a fault.
+        m_rows = _readfirstlane_i32(_load_i32(mt_base, _e + fx.Int32(2)))
 
         a_base = fx.Int64(_ptrtoint(_get_iter(A)))
         b_base = fx.Int64(_ptrtoint(_get_iter(B)))
         c_base = fx.Int64(_ptrtoint(_get_iter(C)))
-        a_tile = make_bf16_fp16_tile_tensor(a_base, _i64(m_row) * fx.Int64(K * 2), BLOCK_M * K)
+        # Sized by the tile's own rows: the last tile of a run is short, and a fixed BLOCK_M
+        # window would read past the end of A for the final expert.
+        a_tile = make_bf16_fp16_tile_tensor(a_base, _i64(m_row) * fx.Int64(K * 2), m_rows * fx.Int32(K))
         b_tile = make_bf16_fp16_tile_tensor(b_base, _i64(g_idx) * fx.Int64(B_GRP * 2), B_GRP)
-        c_tile = make_bf16_fp16_tile_tensor(c_base, _i64(m_row) * fx.Int64(2) * _i64(c_n), BLOCK_M * N)
+        c_tile = make_bf16_fp16_tile_tensor(
+            c_base, _i64(m_row) * fx.Int64(2) * _i64(c_n), m_rows * fx.Int32(N)
+        )
 
         gemm_bf16_nt_tile(
             a_tile,
             b_tile,
             c_tile,
-            fx.Int32(BLOCK_M),  # the run is block-aligned, so the tile owns a full BLOCK_M
+            m_rows,  # a short run ends in a tile that stores fewer than BLOCK_M rows
             c_n,
             lds,
             fx.Int32(0),  # A/C are already rebased onto this tile's rows
@@ -610,7 +638,7 @@ def _compile_grouped_bf16_nt(
         A: fx.Tensor,
         B: fx.Tensor,
         C: fx.Tensor,
-        group_offs: fx.Tensor,
+        m_tiles: fx.Tensor,
         c_n: fx.Int32,
         stream: fx.Stream,
     ):
@@ -618,7 +646,7 @@ def _compile_grouped_bf16_nt(
             A,
             B,
             C,
-            group_offs,
+            m_tiles,
             c_n,
             value_attrs=make_value_attrs(waves_per_eu, agpr_alloc, "512,512"),
         ).launch(grid=(TOTAL_TILES, 1, 1), block=(512, 1, 1), stream=stream)
@@ -646,20 +674,21 @@ def grouped_gemm_bf16_nt_flydsl_kernel(
     assert Kb == K, f"b K={Kb} != a K={K}"
     out = torch.empty(TOTAL_M, N, device=a.device, dtype=out_dtype)
     offs = group_offs if group_offs.dtype == torch.int64 else group_offs.to(torch.int64)
-    # The tile resolves its row block and expert itself; a host-built table is one more launch.
+    m_upper = m_tile_upper_bound(TOTAL_M, BLOCK_M, G)
+    m_tiles = build_m_tile_table(offs[1:] - offs[:-1], offs, BLOCK_M, m_upper)
     args = (
         _ptr_only_view(a),
         flyc.from_torch_tensor(b.reshape(-1)),
         flyc.from_torch_tensor(out),
-        offs,
+        m_tiles.reshape(-1),
         N,
         torch.cuda.current_stream(),
     )
-    key = (TOTAL_M, N, K, G, BLOCK_M, BLOCK_N, GROUP_M, num_xcd, xcd_band, out_dtype)
+    key = (m_upper, N, K, G, BLOCK_M, BLOCK_N, GROUP_M, num_xcd, xcd_band, out_dtype)
     compiled = _COMPILED_GROUPED_NT_CACHE.get(key)
     if compiled is None:
         launch = _compile_grouped_bf16_nt(
-            TOTAL_M,
+            m_upper,
             N,
             K,
             G,
@@ -680,7 +709,7 @@ _COMPILED_GROUPED_NN_CACHE = {}
 
 
 def _compile_grouped_bf16_nn(
-    TOTAL_M,
+    M_TILES,
     N,
     K,
     G,
@@ -694,8 +723,7 @@ def _compile_grouped_bf16_nn(
     nt_vmcnt=3,
     out_fp16=False,
 ):
-    assert TOTAL_M % BLOCK_M == 0, "TOTAL_M must be a multiple of BLOCK_M (padded token runs)"
-    N_BLOCKS_M = TOTAL_M // BLOCK_M
+    N_BLOCKS_M = M_TILES
     N_BLOCKS_N = (N + BLOCK_N - 1) // BLOCK_N
     TOTAL_TILES = N_BLOCKS_M * N_BLOCKS_N
     B_GRP = N * K  # elements of one expert's weight slab
@@ -706,31 +734,38 @@ def _compile_grouped_bf16_nn(
         A: fx.Tensor,
         B: fx.Tensor,
         C: fx.Tensor,
-        block_expert: fx.Tensor,
+        m_tiles: fx.Tensor,
         c_n: fx.Int32,
     ):
         _ = str(fx.thread_idx.x)
-        be_base = fx.Int64(_ptrtoint(_get_iter(block_expert)))
+        mt_base = fx.Int64(_ptrtoint(_get_iter(m_tiles)))
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         tile = xcd_band_remap_pid(fx.block_idx.x, TOTAL_TILES, num_xcd, xcd_band)
         block_m, block_n = group_m_tile_decode(tile, N_BLOCKS_M, N_BLOCKS_N, GROUP_M)
-        m_row = block_m * BLOCK_M
-
-        # Owning expert precomputed once per call: a per-workgroup rescan of G costs more than the K loop.
-        g_idx = _load_i32(be_base, block_m)
+        _e = block_m * fx.Int32(3)
+        g_idx = _load_i32(mt_base, _e)
+        m_row = _load_i32(mt_base, _e + fx.Int32(1))
+        # Wave-uniform: these three feed SRD bases and record counts, and a buffer descriptor
+        # built from a per-lane value is garbage -- which is how the row count first showed up,
+        # as a non-deterministic wrong answer rather than a fault.
+        m_rows = _readfirstlane_i32(_load_i32(mt_base, _e + fx.Int32(2)))
 
         a_base = fx.Int64(_ptrtoint(_get_iter(A)))
         b_base = fx.Int64(_ptrtoint(_get_iter(B)))
         c_base = fx.Int64(_ptrtoint(_get_iter(C)))
-        a_tile = make_bf16_fp16_tile_tensor(a_base, _i64(m_row) * fx.Int64(K * 2), BLOCK_M * K)
+        # Sized by the tile's own rows: the last tile of a run is short, and a fixed BLOCK_M
+        # window would read past the end of A for the final expert.
+        a_tile = make_bf16_fp16_tile_tensor(a_base, _i64(m_row) * fx.Int64(K * 2), m_rows * fx.Int32(K))
         b_tile = make_bf16_fp16_tile_tensor(b_base, _i64(g_idx) * fx.Int64(B_GRP * 2), B_GRP)
-        c_tile = make_bf16_fp16_tile_tensor(c_base, _i64(m_row) * fx.Int64(2) * _i64(c_n), BLOCK_M * N)
+        c_tile = make_bf16_fp16_tile_tensor(
+            c_base, _i64(m_row) * fx.Int64(2) * _i64(c_n), m_rows * fx.Int32(N)
+        )
 
         gemm_bf16_nn_tile(
             a_tile,
             b_tile,
             c_tile,
-            fx.Int32(BLOCK_M),  # the run is block-aligned, so the tile owns a full BLOCK_M
+            m_rows,  # a short run ends in a tile that stores fewer than BLOCK_M rows
             c_n,
             lds,
             fx.Int32(0),  # A/C are already rebased onto this tile's rows
@@ -751,7 +786,7 @@ def _compile_grouped_bf16_nn(
         A: fx.Tensor,
         B: fx.Tensor,
         C: fx.Tensor,
-        block_expert: fx.Tensor,
+        m_tiles: fx.Tensor,
         c_n: fx.Int32,
         stream: fx.Stream,
     ):
@@ -759,7 +794,7 @@ def _compile_grouped_bf16_nn(
             A,
             B,
             C,
-            block_expert,
+            m_tiles,
             c_n,
             value_attrs=make_value_attrs(waves_per_eu, agpr_alloc, "512,512"),
         ).launch(grid=(TOTAL_TILES, 1, 1), block=(512, 1, 1), stream=stream)
@@ -789,22 +824,21 @@ def grouped_gemm_bf16_nn_flydsl_kernel(
         GROUP_M = 8 if K * N * a.element_size() > 24 << 20 else 4
     out = torch.empty(TOTAL_M, N, device=a.device, dtype=out_dtype)
     offs = group_offs if group_offs.dtype == torch.int64 else group_offs.to(torch.int64)
-    block_expert = torch.searchsorted(
-        offs[1:], _row_starts(TOTAL_M, BLOCK_M, a.device), right=True, out_int32=True
-    )
+    m_upper = m_tile_upper_bound(TOTAL_M, BLOCK_M, G)
+    m_tiles = build_m_tile_table(offs[1:] - offs[:-1], offs, BLOCK_M, m_upper)
     args = (
         _ptr_only_view(a),
         flyc.from_torch_tensor(b.reshape(-1)),
         flyc.from_torch_tensor(out),
-        block_expert,
+        m_tiles.reshape(-1),
         N,
         torch.cuda.current_stream(),
     )
-    key = (TOTAL_M, N, K, G, BLOCK_M, BLOCK_N, GROUP_M, num_xcd, xcd_band, out_dtype)
+    key = (m_upper, N, K, G, BLOCK_M, BLOCK_N, GROUP_M, num_xcd, xcd_band, out_dtype)
     compiled = _COMPILED_GROUPED_NN_CACHE.get(key)
     if compiled is None:
         launch = _compile_grouped_bf16_nn(
-            TOTAL_M,
+            m_upper,
             N,
             K,
             G,
