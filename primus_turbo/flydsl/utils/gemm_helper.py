@@ -2071,12 +2071,17 @@ class _S2RLoaderBf16(_S2RLoaderBase):
 
 
 class _MfmaBf16:
-    """Grouped bf16 mfma: accumulate n_tiles_a x n_tiles_b output tiles. The k-sub
+    """Grouped 16-bit-float mfma: accumulate n_tiles_a x n_tiles_b output tiles. The k-sub
     count is taken from each operand's fragment list (len(a[i])), so the atom's
-    (m, n, inst_k) is the only shape this class needs -- no BLOCK_K coupling."""
+    (m, n, inst_k) is the only shape this class needs -- no BLOCK_K coupling.
 
-    def __init__(self, n_tiles_a, n_tiles_b, m, n, inst_k):
-        self.atom = fx.make_mma_atom(fx.rocdl.MFMA(m, n, inst_k, fx.BFloat16))
+    ``elem_ty`` picks the operand format: BFloat16 -> mfma_*_bf16, Float16 -> mfma_*_f16. The
+    two have the same shape, lane mapping and f32 accumulator, so everything feeding this --
+    the g2s, the LDS image, the ds_read_tr_b16 fragments -- is a 16-bit bit-mover either way
+    and needs no parallel path."""
+
+    def __init__(self, n_tiles_a, n_tiles_b, m, n, inst_k, elem_ty=fx.BFloat16):
+        self.atom = fx.make_mma_atom(fx.rocdl.MFMA(m, n, inst_k, elem_ty))
         acc_len = m * n // 64  # f32 accum lanes per wave
         self.accum_type = Vec.make_type(acc_len, fx.Float32)
         self.zero_value = Vec.filled(acc_len, 0.0, fx.Float32)
@@ -2104,13 +2109,13 @@ class _MfmaBf16:
 
 
 class Mfma32x32x16(_MfmaBf16):
-    def __init__(self, n_tiles_a, n_tiles_b):
-        super().__init__(n_tiles_a, n_tiles_b, 32, 32, 16)
+    def __init__(self, n_tiles_a, n_tiles_b, elem_ty=fx.BFloat16):
+        super().__init__(n_tiles_a, n_tiles_b, 32, 32, 16, elem_ty)
 
 
 class Mfma16x16x32(_MfmaBf16):
-    def __init__(self, n_tiles_a, n_tiles_b):
-        super().__init__(n_tiles_a, n_tiles_b, 16, 16, 32)
+    def __init__(self, n_tiles_a, n_tiles_b, elem_ty=fx.BFloat16):
+        super().__init__(n_tiles_a, n_tiles_b, 16, 16, 32, elem_ty)
 
 
 class S2RLoaderTr16x32Bf16Wide(_S2RLoaderBf16):

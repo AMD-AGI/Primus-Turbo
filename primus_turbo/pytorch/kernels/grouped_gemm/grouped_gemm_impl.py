@@ -371,6 +371,16 @@ class GroupedGEMMTritonBackend(KernelBackend):
         )
 
 
+def _cap_cu(num_cu: int | None, device: torch.device) -> int:
+    """Turn the dispatcher's CU count into a budget the kernels act on. Callers routinely pass
+    the full device count meaning "no limit", and honouring that literally would launch a
+    persistent grid where the tuned one-tile-per-WG launch is both simpler and faster, so it
+    reads as 0."""
+    if num_cu is None or num_cu >= _num_cus(device):
+        return 0
+    return int(num_cu)
+
+
 class GroupedGEMMFlyDSLBackend(KernelBackend):
     """FlyDSL bf16 grouped GEMM backend (gfx950).
 
@@ -400,11 +410,10 @@ class GroupedGEMMFlyDSLBackend(KernelBackend):
         # No work-stealing variant, and the grid is sized from the tile count, so a CU budget
         # could only be ignored -- better to decline than to accept and not honour it.
         supported &= schedule in _NON_WS_SUPPORTED_SCHEDULES
-        # A num_cu at the full device count is not a budget, and callers pass it that way.
-        supported &= num_cu is None or num_cu >= _num_cus(a.device)
         supported &= a.dim() == 2 and b.dim() == 3
-        # bf16 operands only; the fp16 pair has no path through these kernels.
-        supported &= a.dtype == torch.bfloat16 and b.dtype == torch.bfloat16
+        # Both 16-bit float formats: same pipeline, the mfma atom picks bf16 vs f16. Mixed
+        # operand types have no atom, so the pair has to agree.
+        supported &= a.dtype in (torch.bfloat16, torch.float16) and b.dtype == a.dtype
         supported &= not trans_a
         return supported
 
@@ -426,7 +435,7 @@ class GroupedGEMMFlyDSLBackend(KernelBackend):
         )
 
         kernel = grouped_gemm_bf16_nt_flydsl_kernel if trans_b else grouped_gemm_bf16_nn_flydsl_kernel
-        return kernel(a, b, group_offs, out_dtype=a.dtype)
+        return kernel(a, b, group_offs, out_dtype=a.dtype, cap_cu=_cap_cu(num_cu, a.device))
 
 
 _GROUPED_GEMM_BACKENDS = {
@@ -523,10 +532,8 @@ class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
         # This backend has no beta=1 accumulate epilogue.
         supported &= not inplace_add_to_out
         supported &= schedule in _NON_WS_SUPPORTED_SCHEDULES
-        # A num_cu at the full device count is not a budget, and callers pass it that way.
-        supported &= num_cu is None or num_cu >= _num_cus(a.device)
         supported &= a.dim() == 2 and b.dim() == 2 and a.shape[0] == b.shape[0]
-        supported &= a.dtype == torch.bfloat16 and b.dtype == torch.bfloat16
+        supported &= a.dtype in (torch.bfloat16, torch.float16) and b.dtype == a.dtype
         supported &= trans_a and not trans_b
         # Measured boundary: clean through G=65, wrong past it (G=80 and G=96 both fail).
         # 64 is the conservative cut, and matches the expert bound the NT path documents.
@@ -560,6 +567,7 @@ class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
             masked_k=group_lens,
             out_dtype=a.dtype,
             trans_c=trans_c,
+            cap_cu=_cap_cu(num_cu, a.device),
         )
 
 

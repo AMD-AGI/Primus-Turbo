@@ -114,6 +114,26 @@ def _tail_quad_conds(q_row, q_col, out_m, out_n, half_m, half_n, mask_m, mask_n)
     return conds
 
 
+# bf16 and fp16 run the same pipeline; only the mfma operand format differs.
+_F16 = (torch.bfloat16, torch.float16)
+
+
+def _ab_ty(dtype: torch.dtype):
+    """Operand format for the mfma atom. Cf. the fp8 kernels' _ea/_eb: the format is a type
+    the tile carries, not a boolean it has to re-derive."""
+    return fx.Float16 if dtype == torch.float16 else fx.BFloat16
+
+
+def _grid_x(total_tiles: int, cap_cu: int) -> int:
+    """WGs to launch: one per tile unless a CU budget caps it, in which case a fixed grid of
+    that many strides the tile space. Both operands are host ints, so this is a plain min --
+    the fp8 kernel needs arith.select only because its tile count is a runtime value."""
+    if cap_cu <= 0:
+        return total_tiles
+    ncus = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    return min(total_tiles, int(cap_cu), ncus)
+
+
 @ASTRewriter.transform
 def grouped_gemm_bf16_variable_k_tile(
     A,
@@ -133,6 +153,8 @@ def grouped_gemm_bf16_variable_k_tile(
     OUT_N,
     BLOCK_M,
     BLOCK_N,
+    persistent=False,
+    ab_ty=fx.BFloat16,
     out_fp16=False,
     c_cache_modifier=0,
     trans_c=False,
@@ -184,7 +206,7 @@ def grouped_gemm_bf16_variable_k_tile(
     NTA16 = N_TILES_A * 2
     NTB16 = (BLOCK_N // 16) // (2 * N_WAVE_N)
     N_ACCUMS16 = NTA16 * NTB16
-    mfma = Mfma16x16x32(NTA16, NTB16)
+    mfma = Mfma16x16x32(NTA16, NTB16, ab_ty)
     a_s2r = S2RLoaderTr16x32Bf16Wide(wave_m, NTA16, chunk_stride=lds_chunk_stride)
     b_s2r = S2RLoaderTr16x32Bf16Wide(wave_n, NTB16, chunk_stride=lds_chunk_stride)
     ACC_VEC_N = 4
@@ -238,7 +260,11 @@ def grouped_gemm_bf16_variable_k_tile(
         a_g2s.load(lds.A_lds_cur_0, a0_off + 0 * a_k_step)
         b_g2s.load(lds.B_lds_cur_1, b1_off + 0 * b_k_step)
         a_g2s.load(lds.A_lds_cur_1, a1_off + 0 * a_k_step)
-        if wave_m == 1:
+        # Divergent only holds for one tile per WG; a persistent loop needs every wave to
+        # stop before the next tile's g2s reuses this LDS. Cf. dense_mma_pipeline_bf16.
+        if const_expr(persistent):
+            rocdl.s_barrier()
+        elif wave_m == 1:
             rocdl.s_barrier()
         wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
         b_g2s.load(lds.B_lds_next_0, b0_off + 1 * b_k_step)
@@ -360,13 +386,17 @@ def _compile_grouped_bf16_wgrad(
     num_xcd=8,
     waves_per_eu=2,
     agpr_alloc=0,
+    ab_ty=fx.BFloat16,
     out_fp16=False,
     trans_c=False,
     # One padded chunk splits the tr16 reader's four lane groups off a single bank half: 128 mod 256.
     lds_chunk_stride=1152,
     group_m=1,
     xcd_band=24,
+    cap_cu=0,
 ):
+    # See _compile_grouped_bf16_nt: cap_cu = 0 keeps the tuned one-tile-per-WG launch.
+    persistent = cap_cu > 0
     N_BLOCKS_M = (OUT_M + BLOCK_M - 1) // BLOCK_M
     N_BLOCKS_N = (OUT_N + BLOCK_N - 1) // BLOCK_N
     TILES_PER_GROUP = N_BLOCKS_M * N_BLOCKS_N
@@ -389,45 +419,55 @@ def _compile_grouped_bf16_wgrad(
         go_base = fx.Int64(_ptrtoint(_get_iter(group_k_offsets)))
         gk_base = fx.Int64(_ptrtoint(_get_iter(masked_k)))
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        pid = fx.block_idx.x
         # Dispatch order ranked in the prologue by a lane-resident descending rank, not a host argsort.
+        # Tile-independent, so it is hoisted above the persistent loop and ranked once.
         lane = fx.Int32(fx.thread_idx.x) % fx.Int32(64)
         in_g = lane < fx.Int32(G)
         k_lane = _load_i32(gk_base, arith.select(in_g, lane, fx.Int32(0)) * fx.Int32(2))
         order_rank = wave_rank_desc_stable(arith.select(in_g, k_lane, fx.Int32(-1)), lane, G)
 
-        # Band-cyclic XCD assignment: runs short enough to stay inside one expert, so skew spreads.
-        tile = xcd_band_remap_pid(pid, TOTAL, num_xcd, xcd_band)
-        group_idx = wave_lane_with_rank(order_rank, tile // TILES_PER_GROUP)
-        local_tile = tile % TILES_PER_GROUP
-        if const_expr(trans_c):
-            block_n, block_m = group_m_tile_decode(local_tile, N_BLOCKS_N, N_BLOCKS_M, group_m)
+        # Free function for the same ast-rewriter reason as the NT kernel.
+        def _do_tile(pid):
+            # Band-cyclic XCD assignment: runs short enough to stay inside one expert, so skew spreads.
+            tile = xcd_band_remap_pid(pid, TOTAL, num_xcd, xcd_band)
+            group_idx = wave_lane_with_rank(order_rank, tile // TILES_PER_GROUP)
+            local_tile = tile % TILES_PER_GROUP
+            if const_expr(trans_c):
+                block_n, block_m = group_m_tile_decode(local_tile, N_BLOCKS_N, N_BLOCKS_M, group_m)
+            else:
+                block_m, block_n = group_m_tile_decode(local_tile, N_BLOCKS_M, N_BLOCKS_N, group_m)
+            m_start = _load_i64_as_i32(go_base, group_idx)
+            m_end = m_start + _load_i64_as_i32(gk_base, group_idx)
+            grouped_gemm_bf16_variable_k_tile(
+                A,
+                B,
+                C,
+                group_idx,
+                block_m,
+                block_n,
+                m_start,
+                m_end,
+                lds,
+                out_m_rt,
+                out_n_rt,
+                G=G,
+                OUT_M=OUT_M,
+                OUT_N=OUT_N,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                ab_ty=ab_ty,
+                out_fp16=out_fp16,
+                trans_c=trans_c,
+                lds_chunk_stride=lds_chunk_stride,
+                mask_m=MASK_M,
+                persistent=persistent,
+            )
+
+        if const_expr(persistent):
+            for t in range(fx.block_idx.x, TOTAL, fx.grid_dim.x):
+                _do_tile(t)
         else:
-            block_m, block_n = group_m_tile_decode(local_tile, N_BLOCKS_M, N_BLOCKS_N, group_m)
-        m_start = _load_i64_as_i32(go_base, group_idx)
-        m_end = m_start + _load_i64_as_i32(gk_base, group_idx)
-        grouped_gemm_bf16_variable_k_tile(
-            A,
-            B,
-            C,
-            group_idx,
-            block_m,
-            block_n,
-            m_start,
-            m_end,
-            lds,
-            out_m_rt,
-            out_n_rt,
-            G=G,
-            OUT_M=OUT_M,
-            OUT_N=OUT_N,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            out_fp16=out_fp16,
-            trans_c=trans_c,
-            lds_chunk_stride=lds_chunk_stride,
-            mask_m=MASK_M,
-        )
+            _do_tile(fx.block_idx.x)
 
     @flyc.jit
     def launch_grouped_variable_k(
@@ -440,7 +480,7 @@ def _compile_grouped_bf16_wgrad(
         out_n_rt: fx.Int32,
         stream: fx.Stream,
     ):
-        grid_x = fx.Int32(TOTAL)
+        grid_x = fx.Int32(_grid_x(TOTAL, cap_cu))
         kernel_grouped_variable_k(
             A,
             B,
@@ -504,11 +544,14 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
     group_m: int = 4,
     # Band-cyclic run length in tiles; it tracks co-residency rather than grid divisibility.
     xcd_band: int = 32,
+    # CUs this launch may occupy; None/0 = the whole device, which keeps the tuned
+    # one-tile-per-WG launch. A real budget switches to a capped persistent grid.
+    cap_cu: int = 0,
     trans_c: bool = False,
 ) -> torch.Tensor:
     """Variable-K grouped wgrad: out[g]=a[g_rows].T@b[g_rows], K=[offsets[g],offsets[g]+masked_k[g])."""
     assert a.dim() == 2 and b.dim() == 2 and a.shape[0] == b.shape[0]
-    assert a.dtype == torch.bfloat16 and b.dtype == torch.bfloat16
+    assert a.dtype in _F16 and b.dtype == a.dtype, f"16-bit float operands only, got {a.dtype}/{b.dtype}"
     OUT_M = a.shape[1]
     OUT_N = b.shape[1]
     G = group_k_offsets.numel() - 1
@@ -533,7 +576,7 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
         OUT_N,
         torch.cuda.current_stream(),
     )
-    key = (OUT_M, OUT_N, G, BLOCK_M, BLOCK_N, num_xcd, group_m, xcd_band, out_fp16, trans_c)
+    key = (OUT_M, OUT_N, G, BLOCK_M, BLOCK_N, num_xcd, group_m, xcd_band, a.dtype, out_fp16, trans_c, cap_cu)
     compiled = _COMPILED_GROUPED_GEMM_CACHE.get(key)
     if compiled is None:
         launch = _compile_grouped_bf16_wgrad(
@@ -543,10 +586,12 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             num_xcd=num_xcd,
+            ab_ty=_ab_ty(a.dtype),
             out_fp16=out_fp16,
             trans_c=trans_c,
             group_m=group_m,
             xcd_band=xcd_band,
+            cap_cu=cap_cu,
         )
         compiled = flyc.compile(launch, *args)
         _COMPILED_GROUPED_GEMM_CACHE[key] = compiled
@@ -570,8 +615,14 @@ def _compile_grouped_bf16_nt(
     waves_per_eu=2,
     agpr_alloc=0,
     nt_vmcnt=3,
+    ab_ty=fx.BFloat16,
     out_fp16=False,
+    cap_cu=0,
 ):
+    # cap_cu > 0 reserves CUs for a co-running kernel: a fixed grid of cap_cu WGs strides the
+    # tile space instead of one WG per tile. cap_cu = 0 keeps the one-tile-per-WG launch the
+    # full-device path was tuned on, byte for byte.
+    persistent = cap_cu > 0
     # Tiles are cut per expert (build_m_tile_table), so none straddles two whatever the lengths.
     N_BLOCKS_M = M_TILES
     N_BLOCKS_N = (N + BLOCK_N - 1) // BLOCK_N
@@ -591,47 +642,59 @@ def _compile_grouped_bf16_nt(
         _ = str(fx.thread_idx.x)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         mt_base = fx.Int64(_ptrtoint(_get_iter(m_tiles)))
-        tile = xcd_band_remap_pid(fx.block_idx.x, TOTAL_TILES, num_xcd, xcd_band)
-        block_m, block_n = group_m_tile_decode(tile, N_BLOCKS_M, N_BLOCKS_N, GROUP_M)
-        _e = block_m * fx.Int32(3)
-        g_idx = _load_i32(mt_base, _e)
-        m_row = _load_i32(mt_base, _e + fx.Int32(1))
-        # Wave-uniform: these three feed SRD bases and record counts, and a buffer descriptor
-        # built from a per-lane value is garbage -- which is how the row count first showed up,
-        # as a non-deterministic wrong answer rather than a fault.
-        m_rows = _readfirstlane_i32(_load_i32(mt_base, _e + fx.Int32(2)))
 
-        a_base = fx.Int64(_ptrtoint(_get_iter(A)))
-        b_base = fx.Int64(_ptrtoint(_get_iter(B)))
-        c_base = fx.Int64(_ptrtoint(_get_iter(C)))
-        # Sized by the tile's own rows: the last tile of a run is short, and a fixed BLOCK_M
-        # window would read past the end of A for the final expert.
-        a_tile = make_bf16_fp16_tile_tensor(a_base, _i64(m_row) * fx.Int64(K * 2), m_rows * fx.Int32(K))
-        b_tile = make_bf16_fp16_tile_tensor(b_base, _i64(g_idx) * fx.Int64(B_GRP * 2), B_GRP)
-        c_tile = make_bf16_fp16_tile_tensor(
-            c_base, _i64(m_row) * fx.Int64(2) * _i64(c_n), m_rows * fx.Int32(N)
-        )
+        # Free function, not inlined at the call: the ast-rewriter would otherwise collect the
+        # loaders built inside it as scf.for iter_args. Same reason as the fp8 kernel's _do_tile.
+        def _do_tile(pid):
+            tile = xcd_band_remap_pid(pid, TOTAL_TILES, num_xcd, xcd_band)
+            block_m, block_n = group_m_tile_decode(tile, N_BLOCKS_M, N_BLOCKS_N, GROUP_M)
+            _e = block_m * fx.Int32(3)
+            g_idx = _load_i32(mt_base, _e)
+            m_row = _load_i32(mt_base, _e + fx.Int32(1))
+            # Wave-uniform: these three feed SRD bases and record counts, and a buffer descriptor
+            # built from a per-lane value is garbage -- which is how the row count first showed up,
+            # as a non-deterministic wrong answer rather than a fault.
+            m_rows = _readfirstlane_i32(_load_i32(mt_base, _e + fx.Int32(2)))
 
-        gemm_bf16_nt_tile(
-            a_tile,
-            b_tile,
-            c_tile,
-            m_rows,  # a short run ends in a tile that stores fewer than BLOCK_M rows
-            c_n,
-            lds,
-            fx.Int32(0),  # A/C are already rebased onto this tile's rows
-            block_n,
-            K=K,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            n_blocks=N_BLOCKS_N,
-            GROUP_M=GROUP_M,
-            num_xcd=num_xcd,
-            out_fp16=out_fp16,
-            nt_vmcnt=nt_vmcnt,
-            pair_n=N % 2 == 0 and not out_fp16,
-            n_tail=N % BLOCK_N,
-        )
+            a_base = fx.Int64(_ptrtoint(_get_iter(A)))
+            b_base = fx.Int64(_ptrtoint(_get_iter(B)))
+            c_base = fx.Int64(_ptrtoint(_get_iter(C)))
+            # Sized by the tile's own rows: the last tile of a run is short, and a fixed BLOCK_M
+            # window would read past the end of A for the final expert.
+            a_tile = make_bf16_fp16_tile_tensor(a_base, _i64(m_row) * fx.Int64(K * 2), m_rows * fx.Int32(K))
+            b_tile = make_bf16_fp16_tile_tensor(b_base, _i64(g_idx) * fx.Int64(B_GRP * 2), B_GRP)
+            c_tile = make_bf16_fp16_tile_tensor(
+                c_base, _i64(m_row) * fx.Int64(2) * _i64(c_n), m_rows * fx.Int32(N)
+            )
+
+            gemm_bf16_nt_tile(
+                a_tile,
+                b_tile,
+                c_tile,
+                m_rows,  # a short run ends in a tile that stores fewer than BLOCK_M rows
+                c_n,
+                lds,
+                fx.Int32(0),  # A/C are already rebased onto this tile's rows
+                block_n,
+                K=K,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                n_blocks=N_BLOCKS_N,
+                GROUP_M=GROUP_M,
+                num_xcd=num_xcd,
+                ab_ty=ab_ty,
+                out_fp16=out_fp16,
+                nt_vmcnt=nt_vmcnt,
+                pair_n=N % 2 == 0 and not out_fp16,
+                n_tail=N % BLOCK_N,
+                persistent=persistent,
+            )
+
+        if const_expr(persistent):
+            for t in range(fx.block_idx.x, TOTAL_TILES, fx.grid_dim.x):
+                _do_tile(t)
+        else:
+            _do_tile(fx.block_idx.x)
 
     @flyc.jit
     def launch_grouped_nt(
@@ -649,7 +712,7 @@ def _compile_grouped_bf16_nt(
             m_tiles,
             c_n,
             value_attrs=make_value_attrs(waves_per_eu, agpr_alloc, "512,512"),
-        ).launch(grid=(TOTAL_TILES, 1, 1), block=(512, 1, 1), stream=stream)
+        ).launch(grid=(_grid_x(TOTAL_TILES, cap_cu), 1, 1), block=(512, 1, 1), stream=stream)
 
     return launch_grouped_nt
 
@@ -666,9 +729,12 @@ def grouped_gemm_bf16_nt_flydsl_kernel(
     # Band-cyclic XCD partition: a compact patch of one expert's B slab, still sampling the token range.
     num_xcd: int = 8,
     xcd_band: int = 32,
+    # CUs this launch may occupy; None/0 = the whole device, which keeps the tuned
+    # one-tile-per-WG launch. A real budget switches to a capped persistent grid.
+    cap_cu: int = 0,
 ) -> torch.Tensor:
     """Grouped NT forward: out[rows] = a[rows] @ b[g]^T for the expert g owning each row run."""
-    assert a.dim() == 2 and b.dim() == 3 and a.dtype == b.dtype == torch.bfloat16
+    assert a.dim() == 2 and b.dim() == 3 and a.dtype == b.dtype and a.dtype in _F16
     TOTAL_M, K = a.shape
     G, N, Kb = b.shape
     assert Kb == K, f"b K={Kb} != a K={K}"
@@ -684,7 +750,7 @@ def grouped_gemm_bf16_nt_flydsl_kernel(
         N,
         torch.cuda.current_stream(),
     )
-    key = (m_upper, N, K, G, BLOCK_M, BLOCK_N, GROUP_M, num_xcd, xcd_band, out_dtype)
+    key = (m_upper, N, K, G, BLOCK_M, BLOCK_N, GROUP_M, num_xcd, xcd_band, a.dtype, out_dtype, cap_cu)
     compiled = _COMPILED_GROUPED_NT_CACHE.get(key)
     if compiled is None:
         launch = _compile_grouped_bf16_nt(
@@ -697,6 +763,8 @@ def grouped_gemm_bf16_nt_flydsl_kernel(
             GROUP_M=GROUP_M,
             num_xcd=num_xcd,
             xcd_band=xcd_band,
+            cap_cu=cap_cu,
+            ab_ty=_ab_ty(a.dtype),
             out_fp16=out_dtype == torch.float16,
         )
         compiled = flyc.compile(launch, *args)
@@ -721,8 +789,12 @@ def _compile_grouped_bf16_nn(
     waves_per_eu=2,
     agpr_alloc=0,
     nt_vmcnt=3,
+    ab_ty=fx.BFloat16,
     out_fp16=False,
+    cap_cu=0,
 ):
+    # See _compile_grouped_bf16_nt: cap_cu = 0 keeps the tuned one-tile-per-WG launch.
+    persistent = cap_cu > 0
     N_BLOCKS_M = M_TILES
     N_BLOCKS_N = (N + BLOCK_N - 1) // BLOCK_N
     TOTAL_TILES = N_BLOCKS_M * N_BLOCKS_N
@@ -740,46 +812,57 @@ def _compile_grouped_bf16_nn(
         _ = str(fx.thread_idx.x)
         mt_base = fx.Int64(_ptrtoint(_get_iter(m_tiles)))
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        tile = xcd_band_remap_pid(fx.block_idx.x, TOTAL_TILES, num_xcd, xcd_band)
-        block_m, block_n = group_m_tile_decode(tile, N_BLOCKS_M, N_BLOCKS_N, GROUP_M)
-        _e = block_m * fx.Int32(3)
-        g_idx = _load_i32(mt_base, _e)
-        m_row = _load_i32(mt_base, _e + fx.Int32(1))
-        # Wave-uniform: these three feed SRD bases and record counts, and a buffer descriptor
-        # built from a per-lane value is garbage -- which is how the row count first showed up,
-        # as a non-deterministic wrong answer rather than a fault.
-        m_rows = _readfirstlane_i32(_load_i32(mt_base, _e + fx.Int32(2)))
 
-        a_base = fx.Int64(_ptrtoint(_get_iter(A)))
-        b_base = fx.Int64(_ptrtoint(_get_iter(B)))
-        c_base = fx.Int64(_ptrtoint(_get_iter(C)))
-        # Sized by the tile's own rows: the last tile of a run is short, and a fixed BLOCK_M
-        # window would read past the end of A for the final expert.
-        a_tile = make_bf16_fp16_tile_tensor(a_base, _i64(m_row) * fx.Int64(K * 2), m_rows * fx.Int32(K))
-        b_tile = make_bf16_fp16_tile_tensor(b_base, _i64(g_idx) * fx.Int64(B_GRP * 2), B_GRP)
-        c_tile = make_bf16_fp16_tile_tensor(
-            c_base, _i64(m_row) * fx.Int64(2) * _i64(c_n), m_rows * fx.Int32(N)
-        )
+        # Free function for the same ast-rewriter reason as the NT kernel.
+        def _do_tile(pid):
+            tile = xcd_band_remap_pid(pid, TOTAL_TILES, num_xcd, xcd_band)
+            block_m, block_n = group_m_tile_decode(tile, N_BLOCKS_M, N_BLOCKS_N, GROUP_M)
+            _e = block_m * fx.Int32(3)
+            g_idx = _load_i32(mt_base, _e)
+            m_row = _load_i32(mt_base, _e + fx.Int32(1))
+            # Wave-uniform: these three feed SRD bases and record counts, and a buffer descriptor
+            # built from a per-lane value is garbage -- which is how the row count first showed up,
+            # as a non-deterministic wrong answer rather than a fault.
+            m_rows = _readfirstlane_i32(_load_i32(mt_base, _e + fx.Int32(2)))
 
-        gemm_bf16_nn_tile(
-            a_tile,
-            b_tile,
-            c_tile,
-            m_rows,  # a short run ends in a tile that stores fewer than BLOCK_M rows
-            c_n,
-            lds,
-            fx.Int32(0),  # A/C are already rebased onto this tile's rows
-            block_n,
-            K=K,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            n_blocks=N_BLOCKS_N,
-            GROUP_M=GROUP_M,
-            num_xcd=num_xcd,
-            out_fp16=out_fp16,
-            nt_vmcnt=nt_vmcnt,
-            n_tail=N % BLOCK_N,
-        )
+            a_base = fx.Int64(_ptrtoint(_get_iter(A)))
+            b_base = fx.Int64(_ptrtoint(_get_iter(B)))
+            c_base = fx.Int64(_ptrtoint(_get_iter(C)))
+            # Sized by the tile's own rows: the last tile of a run is short, and a fixed BLOCK_M
+            # window would read past the end of A for the final expert.
+            a_tile = make_bf16_fp16_tile_tensor(a_base, _i64(m_row) * fx.Int64(K * 2), m_rows * fx.Int32(K))
+            b_tile = make_bf16_fp16_tile_tensor(b_base, _i64(g_idx) * fx.Int64(B_GRP * 2), B_GRP)
+            c_tile = make_bf16_fp16_tile_tensor(
+                c_base, _i64(m_row) * fx.Int64(2) * _i64(c_n), m_rows * fx.Int32(N)
+            )
+
+            gemm_bf16_nn_tile(
+                a_tile,
+                b_tile,
+                c_tile,
+                m_rows,  # a short run ends in a tile that stores fewer than BLOCK_M rows
+                c_n,
+                lds,
+                fx.Int32(0),  # A/C are already rebased onto this tile's rows
+                block_n,
+                K=K,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                n_blocks=N_BLOCKS_N,
+                GROUP_M=GROUP_M,
+                num_xcd=num_xcd,
+                ab_ty=ab_ty,
+                out_fp16=out_fp16,
+                nt_vmcnt=nt_vmcnt,
+                n_tail=N % BLOCK_N,
+                persistent=persistent,
+            )
+
+        if const_expr(persistent):
+            for t in range(fx.block_idx.x, TOTAL_TILES, fx.grid_dim.x):
+                _do_tile(t)
+        else:
+            _do_tile(fx.block_idx.x)
 
     @flyc.jit
     def launch_grouped_nn(
@@ -797,7 +880,7 @@ def _compile_grouped_bf16_nn(
             m_tiles,
             c_n,
             value_attrs=make_value_attrs(waves_per_eu, agpr_alloc, "512,512"),
-        ).launch(grid=(TOTAL_TILES, 1, 1), block=(512, 1, 1), stream=stream)
+        ).launch(grid=(_grid_x(TOTAL_TILES, cap_cu), 1, 1), block=(512, 1, 1), stream=stream)
 
     return launch_grouped_nn
 
@@ -813,9 +896,12 @@ def grouped_gemm_bf16_nn_flydsl_kernel(
     GROUP_M: int = 0,
     num_xcd: int = 8,
     xcd_band: int = 32,
+    # CUs this launch may occupy; None/0 = the whole device, which keeps the tuned
+    # one-tile-per-WG launch. A real budget switches to a capped persistent grid.
+    cap_cu: int = 0,
 ) -> torch.Tensor:
     """Grouped NN: out[rows] = a[rows] @ b[g] for the expert g owning each row run."""
-    assert a.dim() == 2 and b.dim() == 3 and a.dtype == b.dtype == torch.bfloat16
+    assert a.dim() == 2 and b.dim() == 3 and a.dtype == b.dtype and a.dtype in _F16
     TOTAL_M, K = a.shape
     G, Kb, N = b.shape
     assert Kb == K, f"b K={Kb} != a K={K}"
@@ -834,7 +920,7 @@ def grouped_gemm_bf16_nn_flydsl_kernel(
         N,
         torch.cuda.current_stream(),
     )
-    key = (m_upper, N, K, G, BLOCK_M, BLOCK_N, GROUP_M, num_xcd, xcd_band, out_dtype)
+    key = (m_upper, N, K, G, BLOCK_M, BLOCK_N, GROUP_M, num_xcd, xcd_band, a.dtype, out_dtype, cap_cu)
     compiled = _COMPILED_GROUPED_NN_CACHE.get(key)
     if compiled is None:
         launch = _compile_grouped_bf16_nn(
@@ -847,6 +933,8 @@ def grouped_gemm_bf16_nn_flydsl_kernel(
             GROUP_M=GROUP_M,
             num_xcd=num_xcd,
             xcd_band=xcd_band,
+            cap_cu=cap_cu,
+            ab_ty=_ab_ty(a.dtype),
             out_fp16=out_dtype == torch.float16,
         )
         compiled = flyc.compile(launch, *args)

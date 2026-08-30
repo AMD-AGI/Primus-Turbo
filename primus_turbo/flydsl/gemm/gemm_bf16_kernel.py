@@ -96,6 +96,7 @@ def dense_mma_pipeline_bf16(
     n_tiles_b=None,
     wave_hi=None,
     col_safe=False,
+    persistent=False,
 ):
     """Shared 4-quadrant pipelined MMA loop and store epilogue for the fixed-K bf16 tile.
     Keyword flags select the feed and epilogue variants a ragged N needs; each is explained at
@@ -167,7 +168,12 @@ def dense_mma_pipeline_bf16(
         b_g2s.load(b_cur1, B1_gl_offset + 0 * b_k_step)
     a_g2s.load(a_cur1, A1_gl_offset + 0 * a_k_step)
 
-    if WAVE_HI == 1:
+    # One tile per WG: only the high half has to wait here, and the divergence is harmless
+    # because the WG ends right after. Inside a persistent tile loop it is not -- the next
+    # tile's g2s would overrun LDS the other waves are still reading -- so every wave stops.
+    if const_expr(persistent):
+        rocdl.s_barrier()
+    elif WAVE_HI == 1:
         rocdl.s_barrier()
     wait_barrier(N_LDS_STEPS_A + B1_STEPS)
 
@@ -359,6 +365,8 @@ def gemm_bf16_nt_tile(
     n_blocks=None,
     GROUP_M=1,
     num_xcd=8,
+    persistent=False,
+    ab_ty=fx.BFloat16,
     out_fp16=False,
     nt_vmcnt=3,
     b_group_base=None,
@@ -412,6 +420,8 @@ def gemm_bf16_nt_tile(
     gl_off_a = compute_global_swizzle_bf16(lane_id, wave_id, K, N_LDS_ROUNDS)
     gl_off_b = compute_global_swizzle_bf16(lane_id, wave_id, K, N_LDS_ROUNDS)
 
+    # The g2s/LDS type only sizes the addressing (2 bytes either way); the operand format is
+    # decided by the mfma atom, so fp16 rides the bf16 staging untouched.
     a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, fx.BFloat16.ir_type, wave_id)
     b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, fx.BFloat16.ir_type, wave_id)
     _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
@@ -435,7 +445,7 @@ def gemm_bf16_nt_tile(
             b_g2s,
             S2RLoader16x16Bf16(w_m, n_a16),
             S2RLoader16x16Bf16(w_n, n_b16),
-            Mfma16x16x32(n_a16, n_b16),
+            Mfma16x16x32(n_a16, n_b16, ab_ty),
             store_c,
             A0_gl_offset,
             A1_gl_offset,
@@ -458,6 +468,7 @@ def gemm_bf16_nt_tile(
             n_tiles_b=n_b16,
             wave_hi=wave_m,
             col_safe=col_safe,
+            persistent=persistent,
         )
 
     TAIL_QUADS = 0 if n_tail is None else ceildiv(n_tail, 32)
@@ -489,6 +500,8 @@ def _gemm_bf16_nn_tn_tile_impl(
     n_blocks=None,
     GROUP_M=1,
     num_xcd=8,
+    persistent=False,
+    ab_ty=fx.BFloat16,
     out_fp16=False,
     nt_vmcnt=3,
     b_group_base=None,
@@ -566,7 +579,7 @@ def _gemm_bf16_nn_tn_tile_impl(
             b_g2s,
             a_s2r,
             S2RLoaderTr16x32Bf16Wide(w_n, n_b16),
-            Mfma16x16x32(n_a16, n_b16),
+            Mfma16x16x32(n_a16, n_b16, ab_ty),
             store_c,
             A0_gl_offset,
             A1_gl_offset,
@@ -588,6 +601,7 @@ def _gemm_bf16_nn_tn_tile_impl(
             n_tiles_b=n_b16,
             wave_hi=wave_hi,
             col_safe=col_safe,
+            persistent=persistent,
         )
 
     # Fork a ragged N on the workgroup-uniform column index: barriers stay matched and a feed half drops.
@@ -622,6 +636,8 @@ def gemm_bf16_nn_tile(
     n_blocks=None,
     GROUP_M=1,
     num_xcd=8,
+    persistent=False,
+    ab_ty=fx.BFloat16,
     out_fp16=False,
     nt_vmcnt=3,
     b_group_base=None,
@@ -644,6 +660,8 @@ def gemm_bf16_nn_tile(
         n_blocks=n_blocks,
         GROUP_M=GROUP_M,
         num_xcd=num_xcd,
+        persistent=persistent,
+        ab_ty=ab_ty,
         out_fp16=out_fp16,
         nt_vmcnt=nt_vmcnt,
         b_group_base=b_group_base,
@@ -668,6 +686,8 @@ def gemm_bf16_tn_tile(
     n_blocks=None,
     GROUP_M=1,
     num_xcd=8,
+    persistent=False,
+    ab_ty=fx.BFloat16,
     out_fp16=False,
     nt_vmcnt=3,
     b_group_base=None,
@@ -688,6 +708,8 @@ def gemm_bf16_tn_tile(
         n_blocks=n_blocks,
         GROUP_M=GROUP_M,
         num_xcd=num_xcd,
+        persistent=persistent,
+        ab_ty=ab_ty,
         out_fp16=out_fp16,
         nt_vmcnt=nt_vmcnt,
         b_group_base=b_group_base,
