@@ -1010,6 +1010,137 @@ def test_low_level_gemm_accepts_the_k128_that_training_rejects():
         gemm_fp6(a, b)
 
 
+# 1/sqrt(32) rounded to bf16, which is what the packer's Hadamard multiplies by. Exact
+# in binary (181 * 2**-10), so the model below stays exact too.
+_HADAMARD32_NORM = 0.1767578125
+
+
+def _e2m3_levels():
+    """Every non-negative E2M3 value paired with its encoding, ascending.
+
+    Written from the format rather than from the kernel: 1 sign, 2 exponent bits with
+    bias 1, 3 mantissa bits, no inf and no NaN. Exponent field 0 is subnormal with an
+    implicit leading zero, so the levels run 0, 1/8, ... 7/8 and then 1.0 to 7.5.
+    """
+    levels = [
+        (m / 8.0 if e == 0 else (1.0 + m / 8.0) * 2.0 ** (e - 1), (e << 3) | m)
+        for e in range(4)
+        for m in range(8)
+    ]
+    return sorted(levels)
+
+
+def _round_to_e2m3(x):
+    """Round-to-nearest-even against the E2M3 level set, saturating at 7.5."""
+    levels = _e2m3_levels()
+    sign = -1.0 if x < 0 else 1.0
+    ax = abs(x)
+    if ax >= levels[-1][0]:
+        return sign * levels[-1][0], levels[-1][1]
+    for (lo_v, lo_c), (hi_v, hi_c) in zip(levels, levels[1:]):
+        if lo_v <= ax <= hi_v:
+            below, above = ax - lo_v, hi_v - ax
+            if below < above:
+                value, code = lo_v, lo_c
+            elif above < below:
+                value, code = hi_v, hi_c
+            else:
+                value, code = (lo_v, lo_c) if lo_c % 2 == 0 else (hi_v, hi_c)
+            return sign * value, code
+    raise AssertionError(f"{x} is not bracketed by the E2M3 level set")
+
+
+def _pack_constant_group(a):
+    """Model the packer for one 32-group whose inputs are all ``a``.
+
+    The butterfly collapses a constant group to ``[32a, 0 x 31]``, so the group has a
+    single nonzero which is necessarily its own amax. The MX scale is
+    ``2 ** (floor(log2(amax)) - 2)``, so ``value / scale`` always lands in ``[4, 8)``.
+
+    Returns the dequantized value, its code, the ratio that was rounded, and the scale.
+    """
+    import math
+
+    value = 32.0 * a * _HADAMARD32_NORM
+    if value == 0.0:
+        return 0.0, 0, 0.0, 1.0
+    _, exponent = math.frexp(abs(value))  # abs(value) = mantissa * 2**exponent
+    scale = 2.0 ** (exponent - 1 - 2)
+    ratio = value / scale
+    quantized, code = _round_to_e2m3(ratio)
+    return quantized * scale, code, ratio, scale
+
+
+def test_production_packer_rounds_e2m3_to_nearest_even():
+    """Pin the packer's E2M3 rounding against an independently written model.
+
+    Reads the packed codes back through the GEMM rather than by decoding the blob.
+    A row of a constant ``a`` collapses to one nonzero per 32-group at index 0, so
+    against a weight whose rows are all ones -- which collapses the same way -- the
+    dot product over one group is just the two dequantized values multiplied. With
+    K/32 groups the whole output is ``(K / 32) * q_a * q_b``, and every factor is an
+    E2M3 value times a power of two, so the bf16 result is exact rather than rounded.
+
+    Two honest limits. The single nonzero is always its own amax, so ``value / scale``
+    only ever lands in ``[4, 8)``: this covers the top octave, at step 0.5, not the
+    subnormals. And an exact tie is unreachable through this path at all, because every
+    post-Hadamard value carries the factor ``181 * 2**-10`` from the bf16-rounded
+    ``1/sqrt(32)`` while every midpoint is dyadic. The test therefore drives the closest
+    approach to each midpoint that a bf16 input can produce, and records the distance.
+    """
+    _skip_if_unsupported()
+    m = n = k = 256
+    groups = k // 32
+    device = "cuda:0"
+
+    midpoints = [4.25, 4.75, 5.25, 5.75, 6.25, 6.75, 7.25]
+    candidates = torch.arange(1.0, 2.0, 1.0 / 128, dtype=torch.float32).to(torch.bfloat16).float().tolist()
+
+    # For each midpoint, the bf16 input whose ratio comes closest to it from either side.
+    probes = []
+    for mid in midpoints:
+        for side in (-1, 1):
+            best = min(
+                (c for c in candidates if side * (_pack_constant_group(c)[2] - mid) > 0),
+                key=lambda c: abs(_pack_constant_group(c)[2] - mid),
+            )
+            probes.append((best, mid))
+    # Plus saturation. The scale tracks the amax, so the ratio stays in [4, 8) and the
+    # sliver above 7.5 is the only way to overflow E2M3: it has to clamp, not wrap.
+    saturating = [c for c in candidates if _pack_constant_group(c)[2] > 7.5]
+    assert saturating, "no bf16 input in [1, 2) drives the ratio past the E2M3 maximum"
+    probes.append((saturating[0], None))
+
+    a = torch.zeros((m, k), dtype=torch.bfloat16, device=device)
+    for row, (value, _) in enumerate(probes):
+        a[row].fill_(value)
+    b = torch.ones((n, k), dtype=torch.bfloat16, device=device)
+
+    a_p, a_s = quantize_mxfp6_row(a)
+    b_p, b_s = quantize_mxfp6_row(b)
+    out = torch.ops.primus_turbo.gemm_fp6_impl(
+        a_p, a_s, b_p, b_s, m, n, k, torch.bfloat16, ScalingGranularity.MX_BLOCKWISE.value
+    )
+
+    q_b, _, _, _ = _pack_constant_group(1.0)
+    for row, (value, mid) in enumerate(probes):
+        q_a, code, ratio, scale = _pack_constant_group(value)
+        expected = groups * q_a * q_b
+        got = out[row, 0].item()
+        distance = "n/a (saturating)" if mid is None else f"{abs(ratio - mid):.6g} from {mid}"
+        print(
+            f"input={value!r} scale={scale} ratio={ratio:.9g} -> code={code} value={q_a / scale} ({distance})"
+        )
+        assert got == expected, (
+            f"input {value!r}: packer produced {got}, model expects {expected} "
+            f"(ratio {ratio:.9g}, code {code}, scale {scale})"
+        )
+
+    # The saturating probe must land on the top code, not wrap to a small one.
+    _, sat_code, sat_ratio, _ = _pack_constant_group(saturating[0])
+    assert sat_ratio > 7.5 and sat_code == _e2m3_levels()[-1][1]
+
+
 def test_gemm_fp6_impl_fake_matches_real():
     """A wrong GEMM fake mis-allocates the output under torch.compile."""
     _skip_if_unsupported()
