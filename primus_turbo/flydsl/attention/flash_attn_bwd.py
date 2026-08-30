@@ -120,6 +120,9 @@ _WR_SKIP = int(_dbg_os.environ.get("PT_WR_SKIP", "0"))
 # accumulators then have to stay live across two passes. Both D64 register donors are priced.
 _BWD_BLOCK_Q = 64
 
+# Scope of the MFMAExpInterleave IGLP request (see EXP_IGLP_AT). 0 = per q-half.
+_EXP_IGLP_AT = int(_dbg_os.environ.get("PT_EXP_IGLP_AT", "0"))
+
 # Register constraints for the tied-operand MFMA (see mfma_tied). The A/B operand
 # class is what varies; the output is tied to C in every spelling.
 _MFMA_TIE_CONS = ("=a,v,v,0", "=a,a,v,0", "=a,v,a,0", "=v,v,v,0", "=a,a,a,0")
@@ -1872,6 +1875,11 @@ def build_flash_attn_bwd_dkdv_module(
     # so there is no read ring left for the depth to size). Do not read a wall difference
     # between those arms as a result; it is the same binary.
     G3D = min(6 if g3d is None else int(g3d), G3_KSTEPS)
+    # The accvgpr staging tax was kept on an unresolved number (mean -0.18% over six drift-
+    # corrected readings) and is RESOLVED on the native-dQ body: both donors are large and
+    # both go the wrong way, so the deployed tie=3 / dv_pin=False stands. `kw:mfma_tie=0`
+    # reads 5.3017 / 5.3257 against interpolated controls 5.2313 / 5.2108 = +1.35 / +2.20%,
+    # 0/2; `kw:dv_pin=1` reads 5.5943 / 5.6111 against 5.2313 / 5.2072 = +6.9 / +7.8%, 0/2.
     MFMA_TIE = int(mfma_tie or 0)
     MFMA_TIE_CONS = _MFMA_TIE_CONS[int(mfma_tie_cons)]
     DV_PIN = (NT >= 3) if dv_pin is None else bool(dv_pin)
@@ -1922,6 +1930,16 @@ def build_flash_attn_bwd_dkdv_module(
     # hand-placed barriers. Gated to NUM_WAVES == 4 (see _dq_partial_ws for the call count).
     EXP_IGLP = NUM_WAVES == 4
     IGLP_EXP_INTERLEAVE = 2  # LLVM IGLPStrategyID::MFMAExpInterleaveID
+    # EXP_IGLP_AT: which region the strategy is handed. 0 = one call per q-half, so the
+    # mutation only ever sees that half's 16 GEMM1b MFMAs against its 32 half-rate exps --
+    # a shadow exactly the size of the thing it has to hide. 1 = one call per head-step,
+    # whose region also holds GEMM2 and the undeferred GEMM3, so a half's exp chain can be
+    # dealt MFMAs from outside its own half. Widening it BUILDS (vgpr 465, spill 0, +40
+    # instructions) and does not pay: 5.2037 / 5.2589 against drift-interpolated controls
+    # 5.2085 / 5.2326 = -0.09 / +0.50%, mean +0.20%, 1/2 -- the seventh position-only lever
+    # on this pool to price at <= 0 (the `no_exp` subtraction says the pool is 6.01%, so what
+    # is missing is a mechanism that is not position). 0 is deployed.
+    EXP_IGLP_AT = _EXP_IGLP_AT
     # G2_HALF: run GEMM2 once per q-half instead of once per head-step. Fused-only -- the
     # split bodies keep the single call so their ISA stays byte-identical; see the
     # emission point in _head_step_lds for what it buys.
@@ -2349,7 +2367,7 @@ def build_flash_attn_bwd_dkdv_module(
     # the whole round trip into the atomic burst instead of pipelining it.
     G3T_SLOTS = 1
     G3T_BASE = 0
-    if A16_NAT:
+    if A16_NAT == 1:
         G3T_BASE = (LDS_VIEW_ELEMS + 7) // 8 * 8
         LDS_VIEW_ELEMS = G3T_BASE + G3T_WAVE * NUM_WAVES * G3T_SLOTS
 
@@ -2687,14 +2705,15 @@ def build_flash_attn_bwd_dkdv_module(
             mask = (row_idx & fx.Index(7)) << fx.Index(4)
             return col_idx ^ mask
 
-        def _kv_lds_idx(base, nt, ks):
+        def _kv_lds_idx(base, nt, ks, col=None):
             """Owned-K/V LDS slot of B[k=D=ks*32+kg*8][n=kv=nt*16+lane16], one v8 per lane.
 
             Same [row][col] Q/dO tile layout as the Q/dO DMA, so writer and reader share
-            this one address and the fragment round-trips bit-exactly.
+            this one address and the fragment round-trips bit-exactly. ``col`` overrides the
+            lane's D column, which is what the native-dQ K copy stages (see G3_DPERM).
             """
             _r = wave_id * ROWS_PER_WAVE_KV + fx.Index(nt * N_TILE) + lane16
-            _c = fx.Index(ks * K_STEP_QK) + kg * fx.Index(MFMA_LANE_K)
+            _c = fx.Index(ks * K_STEP_QK) + kg * fx.Index(MFMA_LANE_K) if col is None else col
             return fx.Index(base) + _pblk(_r) * fx.Index(PBLK) + _swizzle(_r, _c)
 
         def _coop_load(src_ptr, base, tile_start, q_head):
@@ -3044,11 +3063,31 @@ def build_flash_attn_bwd_dkdv_module(
             for nt in range_constexpr(NT):
                 for ks in range_constexpr(K_STEPS_QK):
                     if const_expr(A16_NAT == 2):
-                        Vec(
+                        # G3_DPERM: native dQ needs GEMM3's n index to run d in EVEN-then-ODD
+                        # order, so column p of this copy holds d = 2*(p%16) + p//16 of its
+                        # 32-d group (see _g3_nat). A lane owns 8 CONSECUTIVE d, whose even
+                        # and odd halves land on two consecutive 4-runs -- so the v8 store
+                        # splits into two v4 stores and nothing else about the copy moves.
+                        _kv8 = Vec(
                             (Vec(k_b_packs[h][nt][ks]).to(fx.Float32) * _g3ks_v8)
                             .to(elem_dtype)
                             .ir_value()
-                        ).store(lds, [_kv_lds_idx(_kb_h, nt, ks)])
+                        )
+                        for hf in range_constexpr(2):
+                            Vec(
+                                _kv8.shuffle(_kv8, [hf, hf + 2, hf + 4, hf + 6]).ir_value()
+                            ).store(
+                                lds,
+                                [
+                                    _kv_lds_idx(
+                                        _kb_h,
+                                        nt,
+                                        ks,
+                                        fx.Index(ks * K_STEP_QK + hf * D_TILE)
+                                        + kg * fx.Index(MFMA_LANE_K // 2),
+                                    )
+                                ],
+                            )
                         if const_expr(V_LDS):
                             Vec(v_b_packs[h][nt][ks]).store(lds, [_kv_lds_idx(_vb_h, nt, ks)])
                         continue
@@ -3546,18 +3585,23 @@ def build_flash_attn_bwd_dkdv_module(
                 )
 
             # ---- N3: native SBHD dQ emission (a16_nat) ----------------------------------
-            # Per emission the wave owns 16 q rows x 32 d of dQ, held as
+            # A packed-bf16 atomic issues one line RMW per DISTINCT line per instruction, so
+            # what the emission costs is how many q rows its 64 lanes span. With GEMM3 in its
+            # store orientation (n = q) a wave holds
             #   lane = kg*16 + r  ->  q row r ;  dword w -> d-pair (w>>1)*8 + kg*2 + (w&1)
-            # so a native atomic's 64 lanes touch 16 q rows, i.e. 16 line RMWs -- which is
-            # exactly the +150% the naive form measured (a store coalesces across lanes, a
-            # buffer_atomic_pk_add_bf16 issues one line RMW per distinct line per instruction).
-            # One LDS round trip re-lays it as
-            #   lane = g*16 + p   ->  d-pair p of q row 4g + o   (o = the dword index)
-            # so an instruction's 64 lanes cover FOUR whole 64 B rows: 4 lines, the same as
-            # the image gets, and dQ is then written in place with no un-permute pass at all.
-            # The patch is stored d-pair-major with r fastest, so the read is one
-            # ds_read_b128 (o = 0..3 are four consecutive dwords) and the write is four
-            # ds_write_b32 at compile-time offsets off one pinned per-lane base.
+            # i.e. 16 q rows = 16 lines per instruction, which is the +150% the naive native
+            # form measured. A16_NAT == 2 fixes that in the CONTRACTION instead of after it:
+            # GEMM3 swaps its A and B operands (see the mfma_dq call below -- same atom, same
+            # 16x16x32 shape, same fp32 accumulation) so C comes out as [m=q][n=d], and the
+            # K copy it reads is staged with its d columns in even-then-odd order (G3_DPERM).
+            # A lane then holds
+            #   lane = kg*16 + p  ->  d-pair p of q rows 4g+w   (w = the dword index)
+            # with the pair's two halves sitting in the even-d and the odd-d accumulator of
+            # the same lane: 4 whole 64 B rows per instruction, the same as the image gets,
+            # and the pack is one cvt_pk with no cross-lane step at all. A16_NAT == 1 keeps
+            # the older LDS round trip (four ds_write_b32 out, one ds_read_b128 back) and is
+            # PRICING ONLY -- it measured the transpose alone at +1.72%, which is exactly the
+            # cost the operand swap deletes.
             _G3T_WOFF = tuple(2 * G3T_SP * (8 * (w >> 1) + (w & 1)) for w in range(4))
 
             def _g3t_wbase(slot):
@@ -3935,14 +3979,22 @@ def build_flash_attn_bwd_dkdv_module(
                         _ring[_kk % _gd] = _g3_frags(_kk + _gd, _dg)
                     for i in range_constexpr(len(_dg)):
                         for jj in range_constexpr(len(_qs)):
-                            _g3[i][jj] = mfma_dq(_g3k[i], _g3s[jj], _g3[i][jj])
+                            if const_expr(A16_NAT == 2):
+                                # Native dQ wants C laid out as [m=q][n=d]: the SAME atom,
+                                # same shape, same fp32 accumulation, with A and B swapped
+                                # (the two fragments already share one register layout).
+                                # That puts 16 d of one q row on the 16 lanes of a group,
+                                # which is what makes the emission a plain pack (see _g3_nat).
+                                _g3[i][jj] = mfma_dq(_g3s[jj], _g3k[i], _g3[i][jj])
+                            else:
+                                _g3[i][jj] = mfma_dq(_g3k[i], _g3s[jj], _g3[i][jj])
                 if const_expr(drain is not None and _gi == 0):
                     drain()
                 # Native dQ stages its whole group into LDS before gathering ANY of it back:
                 # one lgkmcnt drain then covers every emission of the group instead of one per
                 # emission, which is what keeps the transpose off the atomic burst's critical
                 # path (the DS pipe is in-order, so a per-emission read would serialise).
-                _nat_grp = [] if const_expr(A16_NAT and st_sink is None) else None
+                _nat_grp = [] if const_expr(A16_NAT == 1 and st_sink is None) else None
                 for i2 in range_constexpr(len(_dg) // 2):
                     i = 2 * i2
                     for jj in range_constexpr(len(_qs)):
@@ -3956,6 +4008,22 @@ def build_flash_attn_bwd_dkdv_module(
                                 st_sink.append(
                                     lambda a=_lo, b=_hi, _i=_gd0, _j=j: _g3_atomic(a, b, _i, _j)
                                 )
+                            continue
+                        if const_expr(A16_NAT == 2):
+                            # The pair's two accumulators hold the EVEN and the ODD d of one
+                            # 32-d group at the same q row, so the atomic's dword is one
+                            # cvt_pk of the two -- no cross-lane step, no LDS patch, and the
+                            # instruction still covers 4 whole 64 B rows.
+                            _ev, _od = Vec(_g3[i][jj]), Vec(_g3[i + 1][jj])
+                            _tv = Vec(
+                                bf16_trunc_pack_v8(
+                                    [
+                                        fx.Float32((_ev if w % 2 == 0 else _od)[w // 2])
+                                        for w in range_constexpr(8)
+                                    ]
+                                )
+                            ).bitcast(fx.Int32)
+                            _g3_nat(_tv, _gd0, j)
                             continue
                         _g3p = bf16_trunc_scored_v4(_g3[i][jj]).shuffle(
                             bf16_trunc_scored_v4(_g3[i + 1][jj]), [0, 1, 2, 3]
@@ -4571,7 +4639,7 @@ def build_flash_attn_bwd_dkdv_module(
                 result latency), and deferring a whole half's block into the next half's
                 GEMM1a costs 0.9% (its P/dP stay live across those 24 MFMAs).
                 """
-                if const_expr(EXP_IGLP):
+                if const_expr(EXP_IGLP and EXP_IGLP_AT == 0):
                     # One call per q-half: the region's MFMA -> exp chain is per half, and
                     # two calls is where the register outcome lands right (see EXP_IGLP).
                     # Not a tuning hint but a load-bearing one: with the strategy off the body costs
@@ -4771,6 +4839,11 @@ def build_flash_attn_bwd_dkdv_module(
                     def cls(mt, nt):
                         return 1 if const_expr(apply_mask) else 0
 
+                if const_expr(EXP_IGLP and EXP_IGLP_AT == 1):
+                    # Head-step scope: the mutation's region then also holds GEMM2 and the
+                    # undeferred GEMM3, so a half's exp chain can be dealt MFMAs from
+                    # outside its own half (see EXP_IGLP_AT).
+                    rocdl.iglp_opt(IGLP_EXP_INTERLEAVE)
                 _rings = None
                 for pks in _pk_list:
                     half = [2 * pks, 2 * pks + 1]
@@ -5498,7 +5571,20 @@ _A16_MIN_BAT = 4
 # 143.6 us of 2875.0, i.e. 5.0%, more than twice the target cell's share. The batch axis cannot
 # reach it (one boundary at B=2 is +0.86 / +0.27 / +0.27%), so collecting it needs a cut on a
 # different axis, and the delta pass -- which is per q block, not per band -- is the candidate.
-_A16_MAX_CHUNKS = 4
+#
+# ★★ THE SECOND BOUNDARY IS NOW THE LAST ONE, because native dQ deleted one of the two riders.
+# Everything above was measured while each chunk after the first hosted a delta AND an
+# un-permute; with _A16_NAT == 2 there is no un-permute, so the fourth chunk is paying its
+# boundary for a passenger that does not exist. Re-priced on the native binary (b4, min-of-20,
+# palindromic, drift-interpolated, canary +40.5% VALID):
+#
+#   _A16_BAT_CHUNKS=2   5.1465 / 5.1709 against 5.2090 / 5.2160  = -1.20 / -0.86%   2/2
+#   _A16_BAT_CHUNKS=1   5.2481 / 5.2193 against 5.2220 / 5.2104  = +0.50 / +0.17%   0/2
+#
+# So the cut still pays -- one boundary is worth having, the deltas of batches 1..3 still need
+# a body to ride -- and the count that was right with two riders is one too many with one.
+# ⇒ a rider-count change re-opens the boundary count; they are not independent knobs.
+_A16_MAX_CHUNKS = 2
 # ⊘ The dk/dv slot fold does NOT join the ride, and this is the round-12 arm that says so.
 # It looked like the obvious next passenger: measured per-kernel with _r12_expose.py -- which
 # attributes each unit of the busy union to the kernels covering it, so a kernel's EXCLUSIVE
@@ -5533,41 +5619,47 @@ _A16_MAX_CHUNKS = 4
 # 4 lines by transposing the accumulator across the wave through LDS first (4 x ds_write_b32
 # out, 1 x ds_read_b128 back per emission), which red line 2 puts explicitly in scope: the
 # atom is untouched and the permutation is applied AFTER it has produced its accumulator.
-#   0 = the deployed image + un-permute;  1 = PRICING ONLY (transpose in, address unchanged,
-#   dQ wrong, so the wall prices the round trip alone);  2 = native.
+#   0 = the image + un-permute;  1 = PRICING ONLY (the old LDS transpose in, address unchanged,
+#   dQ wrong, so the wall prices the round trip alone);  2 = native, and the DEPLOYED value.
 #
-# ★★ BUILT, CORRECT, AND PRICED -- AND IT IS A WASH, SO IT SHIPS OFF. Both halves measured on
-# the clean channel (4/64/8/8192/64, min-of-30, one process per arm, cache off, palindromic,
-# control interpolated between its neighbours, canary mod:_A16_BLOCK_KV=128 = +41% VALID):
+# ★★ HISTORY, because it is the whole argument for the shape this now has. The first native
+# build re-laid the accumulator through an LDS round trip and was a WASH, so it shipped off
+# (clean channel, 4/64/8/8192/64, min-of-30, one process per arm, cache off, palindromic,
+# control interpolated between its neighbours, canary mod:_A16_BLOCK_KV=128 VALID):
 #
 #   arm                                             b4 wall vs its own control
 #   NAT=1  transpose only, image emission kept      +1.89 / +1.54  = +1.72%
 #   NAT=2  transpose + native address, no pass      +0.41 / +0.49  = +0.45%   4/4 unfavourable
-#   NAT=2 at the b2 cell                            -0.32/-0.44/+0.79/+0.21 = +0.06%, 2/4
 #
-# The scheme itself works exactly as designed -- `buffer_atomic` stays 128 with 4 cache lines
-# each (the naive native form's 16 lines were r3's +150%), spill stays 0, and dQ comes out
-# MORE accurate than the image path (snr_d64 dq 47.5 -> 49.29 dB, because the 1/log2e now
-# rides GEMM3's LDS K copy instead of re-rounding the accumulated bf16 sum).
+# ★ Two numbers came out of that and both still hold. (1) Deleting the un-permute is worth
+# 1.72 - 0.45 = **1.27%** at b4, where the exposure ledger predicted only 0.53% (28 us of
+# exclusive time): the extra 0.74% is the body's own tax for running beside the pass's 536 MB,
+# i.e. a hidden pass is NOT free. (2) The LDS route costs 1.72% for three LDS instructions per
+# four emitted dwords, and that is its FLOOR -- the write groups four d-pairs of one q row and
+# the read groups four q rows of one d-pair, which are orthogonal, so no layout or swizzle
+# makes both sides one wide instruction.
 #
-# ★ Two numbers worth carrying. (1) Deleting the un-permute is worth 1.72 - 0.45 = **1.27%**
-# at b4, where the exposure ledger predicted only 0.53% (28 us of exclusive time). The extra
-# 0.74% is the body's own tax for running beside the pass's 536 MB -- i.e. a hidden pass is
-# NOT free, and r11's "the body is flat across the cut" is a statement about the cut, not
-# about the rider. (2) The cross-lane transpose costs 1.72% for three LDS instructions per
-# four emitted dwords (2 ds_write2_b32 out, 1 ds_read_b128 back; +259 instructions total),
-# and that is the FLOOR of the LDS route: the write groups four d-pairs of one q row and the
-# read groups four q rows of one d-pair, which are orthogonal, so no layout or swizzle makes
-# both sides one wide instruction.
+# ★★ THE ROUND TRIP IS GONE, AND IT WAS NOT A CROSS-LANE PROBLEM AT ALL. The exit note here
+# used to nominate a `quad_perm` DPP as the cheap transpose. It is not needed and would not
+# have been cheap: within a 16-lane group only half the lanes can own an aligned d-pair, so a
+# DPP form has to select between two accumulators by lane parity and costs ~8 extra VALU per
+# four dwords -- about what the LDS route costs. What the emission actually wanted was for the
+# CONTRACTION to hand it the pair, and that is free: swap GEMM3's A and B operands so C is
+# [m=q][n=d] (same atom, same shape, same fp32 accumulate -- red line 2 is explicit that this
+# is in scope), and stage the K copy GEMM3 reads with its d columns in even-then-odd order
+# (G3_DPERM, two v4 stores per band instead of one v8). The even-d and the odd-d accumulator
+# of one lane are then exactly the atomic's dword, and the pack is one `v_cvt_pk_bf16_f32`.
+# The whole q-address map the LDS patch used to produce falls out of the C layout unchanged.
 #
-# ⇒ The next lever is a cross-lane form that is not an LDS round trip, and the ISA says which
-# one. GEMM3 currently contracts with n = q (lane16 -> q row, kg -> d block), which is why a
-# q row's 16 d sit on four lanes. Emitting dQ^T instead -- n = d, m = q -- puts 16 CONSECUTIVE
-# d of one q row on the 16 lanes of a group, and pairing them into dwords is then the single
-# `quad_perm:[1,0,3,2]` DPP that methodology/07 prices at one op per two output values
-# instead of three LDS ops per four. That is a GEMM3 operand restructure, not a knob, and it
-# is worth 1.27% at b4 and ~1.7% at b2 if its cross-lane cost lands under ~0.5%.
-_A16_NAT = int(_dbg_os.environ.get("PT_A16_NAT", "0"))
+#   b4 4/4 favourable, mean -0.99% (drift-interpolated; canary +40.6% VALID)
+#   b2 4/4 favourable, mean -1.44% (canary +37.6% VALID)
+#
+# `buffer_atomic` stays 128 with 4 cache lines each (the naive native form's 16 lines were
+# r3's +150%), spill stays 0, vgpr 461 -> 465, instr 12702 -> 12718 -- +16 against the image
+# path's, i.e. the transpose is not paid for anywhere -- and dQ comes out MORE accurate than
+# the image path (snr_d64 dq 47.5 -> 49.3 dB, because the 1/log2e now rides GEMM3's LDS K copy
+# instead of re-rounding the accumulated bf16 sum). D128 dumps byte-identical.
+_A16_NAT = int(_dbg_os.environ.get("PT_A16_NAT", "2"))
 _A16_EVENTS: dict = {}
 
 
