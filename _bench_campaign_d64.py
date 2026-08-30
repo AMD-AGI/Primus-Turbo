@@ -37,6 +37,7 @@ WARMS, REPS = 5, 40
 SNR_FP32 = 40.0
 SNR_DQ = 40.0
 FLOOR = 0.05
+GUARD_TOL = 0.98   # D=128 may read 2% under base before it costs anything; see main()
 
 #         tag              B  Hq  Hkv    S    D  window
 TARGET = [
@@ -48,18 +49,20 @@ GUARD = [
     ("l8b",  4, 32, 8, 8192, 128, -1),
 ]
 
-# Calibrated on 701e9ae0, three runs per cell, own process each:
-#   d64_gptoss_b4  5.5707 / 5.5109 / 5.5745   spread 1.15%
-#   d64_b2         2.8805 / 2.8557 / 2.8413   spread 1.38%
-#   l70b           2.6047 / 2.6347 / 2.6418   spread 1.42%
-#   l8b            5.4621 / 5.4907 / 5.4928   spread 0.56%
-# TARGET takes the MEDIAN so an unchanged tree scores 1.0. GUARD takes the MAX: a capped guard
-# can only ever subtract, so it must not spend score on noise.
+# Calibrated on fd8c127e (= r2 + r4 + r17), five runs per cell, own process each, first
+# DISCARDED. Warm spread came out 0.92 / 0.94 / 1.30 / 0.95% -- dropping the cold sample did NOT
+# shrink it once the JIT cache was warm, so ~1% is the real floor of this ruler, not an artefact.
+# That matches what round 14 measured independently: a byte-identical D=128 path spanned 3.2%
+# across eight scored runs. Plan increments accordingly -- see the BUNDLE rule in the goal.
+#   d64_gptoss_b4  5.2033 5.1905 5.2191 5.2383 5.2069
+#   d64_b2         2.6184 2.6239 2.6326 2.6079 2.6244
+#   l70b           2.6069 2.6434 2.6459 2.6726 2.6382
+#   l8b            5.5094 5.5032 5.4776 5.5289 5.5299
 BASE = {
-    "d64_gptoss_b4_bwd": 5.5707,
-    "d64_b2_bwd": 2.8557,
-    "l70b_bwd": 2.6418,
-    "l8b_bwd": 5.4928,
+    "d64_gptoss_b4_bwd": 5.2130,
+    "d64_b2_bwd": 2.6242,
+    "l70b_bwd": 2.6447,
+    "l8b_bwd": 5.5160,
 }
 
 
@@ -152,11 +155,19 @@ def main():
         out["ok"] = True
         return out
     if "--calibrate" in sys.argv:
+        # Five runs, FIRST ONE DISCARDED. The dominant noise source is not the timing loop (that
+        # is already min-of-40 after 5 warms) but the first cross-process call: JIT build plus a
+        # cold GPU context. Measured directly on 49ee57a0 -- 5.3603 then 5.295 / 5.2903 / 5.2806,
+        # i.e. a 1.51% span that collapses to 0.27% once the first block is dropped. The old
+        # 3-run median inherited that cold sample and is why `best` could sit ~0.4% high.
         out = {}
         for c in TARGET + GUARD:
-            runs = [_spawn([f"--cell={c[0]}"], c[0])[f"{c[0]}_bwd"] for _ in range(3)]
-            out[f"{c[0]}_bwd"] = statistics.median(runs)
+            runs = [_spawn([f"--cell={c[0]}"], c[0])[f"{c[0]}_bwd"] for _ in range(5)]
+            warm = runs[1:]
+            out[f"{c[0]}_bwd"] = round(statistics.median(warm), 4)
             out[f"{c[0]}_runs"] = runs
+            out[f"{c[0]}_spread_pct"] = round(
+                (max(warm) - min(warm)) / statistics.median(warm) * 100, 3)
         out["ok"] = True
         return out
 
@@ -166,7 +177,15 @@ def main():
     got.update(_spawn(["--snr"], "snr"))
 
     tgt = [BASE[f"{c[0]}_bwd"] / max(got[f"{c[0]}_bwd"], FLOOR) for c in TARGET]
-    grd = [min(BASE[f"{c[0]}_bwd"] / max(got[f"{c[0]}_bwd"], FLOOR), 1.0) for c in GUARD]
+    # A guard leg only costs score once D=128 is more than GUARD_TOL below base. Round 14
+    # measured the same byte-identical D=128 code path spanning 3.2% over eight scored runs; a
+    # hard 1.0 cap turns that spread into a one-sided tax that no candidate can win back, and in
+    # 17 rounds it never once caught a real regression (every edit carries a `D == 64` term, so
+    # D=128 is unreachable by construction). This still punishes a genuine regression hard.
+    grd = []
+    for c in GUARD:
+        r = BASE[f"{c[0]}_bwd"] / max(got[f"{c[0]}_bwd"], FLOOR)
+        grd.append(1.0 if r >= GUARD_TOL else r / GUARD_TOL)
     got["d64"] = round(_geomean(tgt) * _geomean(grd), 5)
     got["target_legs"] = {c[0]: round(t, 4) for c, t in zip(TARGET, tgt)}
     got["guard_legs"] = {c[0]: round(g, 4) for c, g in zip(GUARD, grd)}
