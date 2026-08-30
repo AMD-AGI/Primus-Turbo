@@ -56,24 +56,21 @@ from primus_turbo.pytorch.core.low_precision import (
     MXFP6_TILE_SIZE,
 )
 
+# Only the two names re-exported through primus_turbo.pytorch.ops.quantization. The
+# packers and their helpers stay internal: they traffic in AITER's packed blob layout,
+# which is not ours to keep stable, and the blobs carry no shape for a caller to check.
 __all__ = [
     "check_mxfp6_support",
-    "mxfp6_apply_prologue",
-    "mxfp6_col_sum_rows",
-    "mxfp6_data_region",
     "mxfp6_pack_sizes",
-    "quantize_mxfp6_col",
-    "quantize_mxfp6_dual",
-    "quantize_mxfp6_fused_dual",
-    "quantize_mxfp6_row",
 ]
 
 _A6W6_REQUIRED_ATTRS = ("quant_mxfp6_gemm", "gemm_a6w6", "mxfp6_gemm_pack_size")
 
 _MISSING_A6W6_HINT = (
-    "The installed aiter has no MXFP6 (A6W6) support. It arrived in "
-    "https://github.com/ROCm/aiter/pull/4859, which is not in the pinned release, so "
-    "an aiter built from a branch containing that PR is required."
+    "The installed aiter has no MXFP6 (A6W6) support. It merged in "
+    "https://github.com/ROCm/aiter/pull/4859 as commit "
+    "0c2b0f77b2ff6d13c677d12466abf87299f8b260, which is newer than the pinned release, "
+    "so an aiter at or after that commit is required."
 )
 
 _MISSING_PACKER_HINT = (
@@ -87,25 +84,42 @@ def _ceil(x: int, m: int) -> int:
     return -(-x // m) * m
 
 
-def check_mxfp6_support() -> Tuple[bool, str]:
-    """Return whether MXFP6 can run here, and why not if it cannot."""
-    from primus_turbo.pytorch.core.utils import is_gfx950
+def check_mxfp6_support(device: Optional[torch.device] = None) -> Tuple[bool, str]:
+    """Return whether MXFP6 can run on ``device``, and why not if it cannot.
 
-    if not is_gfx950():
-        return False, "MXFP6 requires gfx950 (MI350/MI355): the A6W6 kernels are gfx950 asm."
+    ``device`` defaults to the current CUDA device. Pass an operand's device to ask the
+    question about where that operand actually lives.
+
+    This never raises. It is the predicate callers use to decide whether to attempt
+    MXFP6 at all, so an absent aiter has to come back as ``(False, reason)`` rather than
+    as the ImportError ``get_aiter`` raises on its own.
+    """
+    from primus_turbo.pytorch.core.utils import is_gfx950_device
+
+    if not torch.cuda.is_available():
+        return False, "MXFP6 requires a ROCm GPU, and torch reports no device available."
+    device = torch.device(device) if device is not None else torch.device("cuda", torch.cuda.current_device())
+    if device.type != "cuda":
+        return False, f"MXFP6 operands must live on a ROCm device, got {device}."
+    if not is_gfx950_device(device):
+        return False, f"MXFP6 requires gfx950 (MI350/MI355): the A6W6 kernels are gfx950 asm. Got {device}."
     # The three packer ops share one build guard, so any of them answers for the set.
     if not hasattr(torch.ops.primus_turbo_cpp_extension, "quantize_mxfp6_dual"):
         return False, _MISSING_PACKER_HINT
-    aiter = get_aiter()
+    try:
+        aiter = get_aiter()
+    except ImportError as exc:
+        return False, f"{_MISSING_A6W6_HINT} ({exc})"
     missing = [a for a in _A6W6_REQUIRED_ATTRS if not hasattr(aiter, a)]
     if missing:
         return False, f"{_MISSING_A6W6_HINT} (missing: {', '.join(missing)})"
     return True, ""
 
 
-def _assert_supported() -> None:
-    ok, reason = check_mxfp6_support()
-    assert ok, reason
+def _require_supported(device: Optional[torch.device] = None) -> None:
+    ok, reason = check_mxfp6_support(device)
+    if not ok:
+        raise RuntimeError(reason)
 
 
 def mxfp6_pack_sizes(rows: int, k: int) -> Tuple[int, int]:
@@ -139,14 +153,17 @@ def mxfp6_data_region(blob: torch.Tensor, rows: int, k: int, *, is_scale: bool =
 
 
 def _check_input(x: torch.Tensor, block_size: int) -> None:
-    assert x.ndim == 2, f"MXFP6 quantization expects a 2D tensor, got {x.ndim}D"
-    assert x.dtype in (torch.bfloat16, torch.float16, torch.float32), (
-        f"MXFP6 quantization expects bf16/fp16/fp32 input, got {x.dtype}"
-    )
-    assert block_size == MXFP6_BLOCK_SIZE, (
-        f"MXFP6 scaling is strictly per-1x{MXFP6_BLOCK_SIZE} along the contraction "
-        f"axis, so block_size must be {MXFP6_BLOCK_SIZE}, got {block_size}"
-    )
+    if x.ndim != 2:
+        raise ValueError(f"MXFP6 quantization expects a 2D tensor, got {x.ndim}D")
+    # Not fp32: the native check_input accepts only BFloat16 and Half, and only those
+    # two templates are instantiated, so fp32 would otherwise fail deep in the binding.
+    if x.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError(f"MXFP6 quantization expects bf16 or fp16 input, got {x.dtype}")
+    if block_size != MXFP6_BLOCK_SIZE:
+        raise ValueError(
+            f"MXFP6 scaling is strictly per-1x{MXFP6_BLOCK_SIZE} along the contraction "
+            f"axis, so block_size must be {MXFP6_BLOCK_SIZE}, got {block_size}"
+        )
 
 
 def quantize_mxfp6_row(
@@ -157,7 +174,7 @@ def quantize_mxfp6_row(
     Returns ``(operand_blob, scale_blob)``, both 1-D uint8. Rows are padded to 256 and
     C to 128 inside the blob; the logical shape is the caller's to remember.
     """
-    _assert_supported()
+    _require_supported(x.device)
     _check_input(x, block_size)
     packed, scale = torch.ops.primus_turbo_cpp_extension.quantize_mxfp6(x.contiguous(), 1)
     return packed, scale
@@ -171,7 +188,7 @@ def quantize_mxfp6_col(
     Equivalent to ``quantize_mxfp6_row(x.T)``, but the packer reads ``x`` in place rather
     than materialising the transpose.
     """
-    _assert_supported()
+    _require_supported(x.device)
     _check_input(x, block_size)
     packed, scale = torch.ops.primus_turbo_cpp_extension.quantize_mxfp6(x.contiguous(), 0)
     return packed, scale
@@ -189,7 +206,7 @@ def quantize_mxfp6_dual(
     One pass over ``x``: the fused kernel stages each tile once and packs it along both
     axes, which is the whole reason this beats calling the row packer twice.
     """
-    _assert_supported()
+    _require_supported(x.device)
     _check_input(x, block_size)
     row_p, row_s, col_p, col_s = torch.ops.primus_turbo_cpp_extension.quantize_mxfp6_dual(x.contiguous())
     return row_p, row_s, col_p, col_s
@@ -224,7 +241,8 @@ def mxfp6_apply_prologue(
     if mode == MXFP6_PROLOGUE_BIAS_GELU:
         return torch.nn.functional.gelu(pre, approximate="tanh")
     if mode == MXFP6_PROLOGUE_BIAS_GELU_BACKWARD:
-        assert aux is not None, "the backward prologue needs the incoming gradient"
+        if aux is None:
+            raise ValueError("the backward prologue needs the incoming gradient in aux")
         return torch.ops.aten.gelu_backward(aux, pre, approximate="tanh")
     raise ValueError(f"unknown MXFP6 prologue mode {mode}")
 
@@ -265,8 +283,15 @@ def quantize_mxfp6_fused_dual(
     -- it is a different (tree-ordered, fp32-accumulated) summation of the same values.
     The fifth return is a degenerate empty tensor when not requested.
     """
-    _assert_supported()
+    _require_supported(x.device)
     _check_input(x, block_size)
+
+    for name, operand in (("aux", aux), ("bias", bias)):
+        if operand is not None and operand.device != x.device:
+            raise ValueError(
+                f"MXFP6 fused pack needs every operand on one device: x is on "
+                f"{x.device} but {name} is on {operand.device}."
+            )
 
     x = x.contiguous()
     if aux is not None:

@@ -1023,7 +1023,8 @@ def quantize_mxfp6_impl(
         quantize_mxfp6_row,
     )
 
-    assert x.dim() == 2, f"MXFP6 quantization expects a 2D tensor, got {x.dim()}D"
+    if x.dim() != 2:
+        raise ValueError(f"MXFP6 quantization expects a 2D tensor, got {x.dim()}D")
     if axis in (1, -1):
         return quantize_mxfp6_row(x, block_size)
     if axis in (0, -2):
@@ -1039,7 +1040,8 @@ def quantize_mxfp6_impl_meta(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import mxfp6_pack_sizes
 
-    assert x.dim() == 2, f"MXFP6 quantization expects a 2D tensor, got {x.dim()}D"
+    if x.dim() != 2:
+        raise ValueError(f"MXFP6 quantization expects a 2D tensor, got {x.dim()}D")
     rows, cols = x.shape
     if axis in (0, -2):
         rows, cols = cols, rows
@@ -1072,7 +1074,8 @@ def quantize_mxfp6_dual_impl_meta(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import mxfp6_pack_sizes
 
-    assert x.dim() == 2, f"MXFP6 quantization expects a 2D tensor, got {x.dim()}D"
+    if x.dim() != 2:
+        raise ValueError(f"MXFP6 quantization expects a 2D tensor, got {x.dim()}D")
     rows, cols = x.shape
     row_operand, row_scale = mxfp6_pack_sizes(rows, cols)
     col_operand, col_scale = mxfp6_pack_sizes(cols, rows)

@@ -316,26 +316,33 @@ class Float6QuantConfig:
     use_gradient_sr: bool = False
 
     def __post_init__(self):
-        assert self.granularity == ScalingGranularity.MX_BLOCKWISE, (
-            "Float6QuantConfig currently only supports MX_BLOCKWISE granularity"
-        )
-        assert self.format == Format.E2M3, "Format must be E2M3 for Float6QuantConfig"
+        if self.granularity != ScalingGranularity.MX_BLOCKWISE:
+            raise ValueError(
+                f"Float6QuantConfig currently only supports MX_BLOCKWISE granularity, got {self.granularity}"
+            )
+        if self.format != Format.E2M3:
+            raise ValueError(f"Format must be E2M3 for Float6QuantConfig, got {self.format}")
 
         mx_support_block_size = [MXFP6_BLOCK_SIZE]
-        assert self.block_size in mx_support_block_size, (
-            f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
-        )
+        if self.block_size not in mx_support_block_size:
+            raise ValueError(
+                f"block_size should be {mx_support_block_size} when granularity is "
+                f"MX_BLOCKWISE, got {self.block_size}"
+            )
 
         mx_support_scale_dtype = ScaleDtype.E8M0
-        assert self.scale_dtype == mx_support_scale_dtype, (
-            f"scale_dtype should be {mx_support_scale_dtype} when granularity is MX_BLOCKWISE"
-        )
+        if self.scale_dtype != mx_support_scale_dtype:
+            raise ValueError(
+                f"scale_dtype should be {mx_support_scale_dtype} when granularity is "
+                f"MX_BLOCKWISE, got {self.scale_dtype}"
+            )
 
-        assert not self.use_gradient_sr, (
-            "use_gradient_sr is not implemented for MXFP6 yet. With 3 mantissa bits the "
-            "MXFP4 motivation for stochastic rounding largely does not apply; remove this "
-            "assert together with the SR path in the packer."
-        )
+        if self.use_gradient_sr:
+            raise NotImplementedError(
+                "use_gradient_sr is not implemented for MXFP6 yet. With 3 mantissa bits the "
+                "MXFP4 motivation for stochastic rounding largely does not apply; remove this "
+                "check together with the SR path in the packer."
+            )
 
 
 # Lets a config travel through a torch.library custom op as a single argument rather

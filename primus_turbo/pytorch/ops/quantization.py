@@ -15,6 +15,10 @@ from primus_turbo.pytorch.core.low_precision import (
     ScalingRecipe,
     float4_e2m1fn_x2,
 )
+from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import (
+    check_mxfp6_support,
+    mxfp6_pack_sizes,
+)
 from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     dequant_fp8_blockwise_for_weight_impl,
     dequant_fp8_blockwise_impl,
@@ -46,6 +50,11 @@ __all__ = [
     "grouped_dequantize_fp8",
     "grouped_quantize_fp4",
     "grouped_dequantize_fp4",
+    # MXFP6 exposes only capability detection and blob sizing. The packers stay internal:
+    # they traffic in AITER's packed layout, and their blobs carry no shape, so they are
+    # not a contract this package can keep stable. Reach MXFP6 through gemm_fp6.
+    "check_mxfp6_support",
+    "mxfp6_pack_sizes",
 ]
 
 
