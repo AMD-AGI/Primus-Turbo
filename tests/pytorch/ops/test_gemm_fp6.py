@@ -779,17 +779,17 @@ def test_gemm_fp6_rejects_unsupported():
     b = torch.randn((256, 512), dtype=torch.bfloat16, device="cuda:0")
 
     # The packed layout fixes the contraction axis, so no layout but NT exists.
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="NT layout"):
         gemm_fp6(a, b, trans_a=True)
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="NT layout"):
         gemm_fp6(a, b, trans_b=False)
     # The A6W6 asm only writes bf16.
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="bf16 output"):
         gemm_fp6(a, b, out_dtype=torch.float16)
     # No beta=1 epilogue, so wgrad cannot accumulate into main_grad.
-    with pytest.raises(AssertionError):
+    with pytest.raises(NotImplementedError, match="fuse_bgrad_accum_pattern"):
         gemm_fp6(a, b, fuse_bgrad_accum_pattern="megatron")
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="K mismatch"):
         gemm_fp6(a, torch.randn((256, 256), dtype=torch.bfloat16, device="cuda:0"))
 
 
@@ -812,20 +812,20 @@ def test_gemm_fp6_requires_256_alignment_on_all_dims(m, n, k):
     _skip_if_unsupported()
     a = torch.randn((m, k), dtype=torch.bfloat16, device="cuda:0")
     b = torch.randn((n, k), dtype=torch.bfloat16, device="cuda:0")
-    with pytest.raises(AssertionError, match="multiples of 256"):
+    with pytest.raises(ValueError, match="multiples of 256"):
         gemm_fp6(a, b)
 
 
 def test_float6_quant_config_rejects_unsupported():
     # MXFP6 has no un-rotated / 2D-block / SR variants; each must fail loudly rather
     # than being silently ignored.
-    with pytest.raises(AssertionError):
+    with pytest.raises(NotImplementedError, match="use_gradient_sr"):
         Float6QuantConfig(use_gradient_sr=True)
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="E2M3"):
         Float6QuantConfig(format=Format.E2M1_X2)
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="block_size"):
         Float6QuantConfig(block_size=16)
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="MX_BLOCKWISE"):
         Float6QuantConfig(granularity=ScalingGranularity.ROWWISE)
 
 
@@ -848,3 +848,184 @@ def test_gemm_fp6_alignment_gate():
     assert not GEMMFP6AITERBackend.can_handle(*args, 256, 100, 512, torch.bfloat16, g)
     assert not GEMMFP6AITERBackend.can_handle(*args, 256, 256, 100, torch.bfloat16, g)
     assert not GEMMFP6AITERBackend.can_handle(*args, 256, 256, 512, torch.float16, g)
+
+
+@pytest.mark.parametrize("m,n,k", [(256, 512, 256), (512, 256, 512)])
+def test_gemm_fp6_torch_compile_backward(m, n, k):
+    """Forward and backward must trace and run under torch.compile.
+
+    The packers and the GEMM are opaque custom ops with hand-written fakes, so a wrong
+    fake shows up here rather than in eager: inductor allocates from the fake and the
+    kernel then writes somewhere else. Checked against a high-precision reference so a
+    graph that traces but computes the wrong thing does not pass either.
+    """
+    _skip_if_unsupported()
+    device = "cuda:0"
+    dtype = torch.bfloat16
+
+    a = torch.randn((m, k), dtype=dtype, device=device, requires_grad=True)
+    b = torch.randn((n, k), dtype=dtype, device=device, requires_grad=True)
+    a_ref = a.detach().clone().requires_grad_()
+    b_ref = b.detach().clone().requires_grad_()
+
+    c_ref = a_ref @ b_ref.T
+    c_ref.backward(torch.ones_like(c_ref))
+
+    compiled = torch.compile(gemm_fp6, backend="inductor")
+    c = compiled(a, b, trans_a=False, trans_b=True, out_dtype=dtype)
+    c.backward(torch.ones_like(c))
+
+    for name, ref, got in (("C", c_ref, c), ("AGrad", a_ref.grad, a.grad), ("BGrad", b_ref.grad, b.grad)):
+        assert got.shape == ref.shape, f"{name} shape {tuple(got.shape)} != {tuple(ref.shape)}"
+        assert torch.isfinite(got).all(), f"{name} has non-finite entries"
+        snr = compute_snr(ref, got)
+        print(f"compiled {name}-SNR: {snr:.2f} dB")
+        assert snr > SNR_THRESHOLD_DB, f"{name} snr too low: {snr:.2f} dB"
+
+
+def test_mxfp6_packers_reject_fp32_input():
+    """fp32 must be refused at the Python boundary.
+
+    Only the bf16 and fp16 templates are instantiated, so an fp32 tensor previously got
+    as far as the binding's own dtype check and failed there with a less specific error.
+    """
+    _skip_if_unsupported()
+    x = torch.randn((256, 512), dtype=torch.float32, device="cuda:0")
+    for pack in (quantize_mxfp6_row, quantize_mxfp6_col, quantize_mxfp6_dual, quantize_mxfp6_fused_dual):
+        with pytest.raises(TypeError, match="bf16 or fp16"):
+            pack(x)
+
+
+def test_mxfp6_rejects_operands_on_different_devices():
+    """Every operand of one call has to live on one device."""
+    _skip_if_unsupported()
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs at least two GPUs")
+
+    x = torch.randn((256, 512), dtype=torch.bfloat16, device="cuda:0")
+    bias = torch.randn((512,), dtype=torch.bfloat16, device="cuda:1")
+    with pytest.raises(ValueError, match="one device"):
+        quantize_mxfp6_fused_dual(x, None, bias, MXFP6_PROLOGUE_BIAS_GELU)
+
+    a = torch.randn((256, 256), dtype=torch.bfloat16, device="cuda:0")
+    b = torch.randn((256, 256), dtype=torch.bfloat16, device="cuda:1")
+    with pytest.raises(ValueError, match="one device"):
+        gemm_fp6(a, b)
+
+
+def test_check_mxfp6_support_is_device_aware():
+    """The check must answer about the operand's device, not the ambient one."""
+    _skip_if_unsupported()
+    supported, _ = check_mxfp6_support(torch.device("cuda", 0))
+    assert supported
+    supported, reason = check_mxfp6_support(torch.device("cpu"))
+    assert not supported and "ROCm device" in reason
+
+
+def test_check_mxfp6_support_survives_a_missing_aiter(monkeypatch):
+    """A capability predicate that raises cannot be used to decide anything.
+
+    ``get_aiter`` raises ImportError when aiter is absent, which used to escape from
+    here and turn a graceful "MXFP6 unavailable" into a crash at import-adjacent time.
+    """
+    _skip_if_unsupported()
+    from primus_turbo.pytorch.kernels.quantization import mxfp6_pack
+
+    def no_aiter():
+        raise ImportError("aiter is not installed")
+
+    monkeypatch.setattr(mxfp6_pack, "get_aiter", no_aiter)
+    supported, reason = mxfp6_pack.check_mxfp6_support()
+    assert not supported
+    assert "aiter is not installed" in reason
+
+
+def test_check_mxfp6_support_names_the_missing_a6w6_symbols(monkeypatch):
+    _skip_if_unsupported()
+    from primus_turbo.pytorch.kernels.quantization import mxfp6_pack
+
+    monkeypatch.setattr(mxfp6_pack, "get_aiter", lambda: object())
+    supported, reason = mxfp6_pack.check_mxfp6_support()
+    assert not supported
+    for attr in ("quant_mxfp6_gemm", "gemm_a6w6", "mxfp6_gemm_pack_size"):
+        assert attr in reason
+
+
+def test_gemm_fp6_impl_rejects_malformed_blobs():
+    """Blob validation is the last point at which a wrong M/N/K is detectable.
+
+    The blobs carry no shape and no dtype, so past this boundary the kernel simply
+    derives strides from whatever dimensions it was handed and reads off the end of a
+    blob that is too short.
+    """
+    _skip_if_unsupported()
+    m = n = 256
+    k = 512
+    a = torch.randn((m, k), dtype=torch.bfloat16, device="cuda:0")
+    b = torch.randn((n, k), dtype=torch.bfloat16, device="cuda:0")
+    a_p, a_s = quantize_mxfp6_row(a)
+    b_p, b_s = quantize_mxfp6_row(b)
+    g = ScalingGranularity.MX_BLOCKWISE.value
+
+    def run(a_p=a_p, a_s=a_s, b_p=b_p, b_s=b_s, m=m, n=n, k=k):
+        return torch.ops.primus_turbo.gemm_fp6_impl(a_p, a_s, b_p, b_s, m, n, k, torch.bfloat16, g)
+
+    run()  # the well-formed call has to keep working
+
+    with pytest.raises(ValueError, match="does not match"):
+        run(k=256)
+    with pytest.raises(ValueError, match="positive dimensions"):
+        run(m=0)
+    with pytest.raises(TypeError, match="uint8"):
+        run(a_p=a_p.view(torch.int8))
+    with pytest.raises(ValueError, match="1-D"):
+        run(a_p=a_p.view(2, -1))
+    with pytest.raises(ValueError, match="contiguous"):
+        run(a_p=a_p[::2])
+
+
+def test_low_level_gemm_accepts_the_k128_that_training_rejects():
+    """The two alignment contracts differ on purpose.
+
+    One forward GEMM is correct with K a multiple of 128, but ``gemm_fp6`` demands 256
+    because its backward GEMMs use K as an output dimension. Pinning both halves keeps
+    a future "cleanup" from unifying them.
+    """
+    _skip_if_unsupported()
+    from primus_turbo.pytorch.kernels.gemm.gemm_fp6_impl import GEMMFP6AITERBackend
+
+    m = n = 256
+    k = 128
+    a = torch.randn((m, k), dtype=torch.bfloat16, device="cuda:0")
+    b = torch.randn((n, k), dtype=torch.bfloat16, device="cuda:0")
+    a_p, a_s = quantize_mxfp6_row(a)
+    b_p, b_s = quantize_mxfp6_row(b)
+    g = ScalingGranularity.MX_BLOCKWISE
+
+    assert GEMMFP6AITERBackend.can_handle(a_p, a_s, b_p, b_s, m, n, k, torch.bfloat16, g)
+    out = torch.ops.primus_turbo.gemm_fp6_impl(a_p, a_s, b_p, b_s, m, n, k, torch.bfloat16, g.value)
+    assert out.shape == (m, n) and torch.isfinite(out).all()
+
+    with pytest.raises(ValueError, match="multiples of 256"):
+        gemm_fp6(a, b)
+
+
+def test_gemm_fp6_impl_fake_matches_real():
+    """A wrong GEMM fake mis-allocates the output under torch.compile."""
+    _skip_if_unsupported()
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    m, n, k = 256, 512, 256
+    a = torch.randn((m, k), dtype=torch.bfloat16, device="cuda:0")
+    b = torch.randn((n, k), dtype=torch.bfloat16, device="cuda:0")
+    a_p, a_s = quantize_mxfp6_row(a)
+    b_p, b_s = quantize_mxfp6_row(b)
+    g = ScalingGranularity.MX_BLOCKWISE.value
+
+    real = torch.ops.primus_turbo.gemm_fp6_impl(a_p, a_s, b_p, b_s, m, n, k, torch.bfloat16, g)
+    with FakeTensorMode():
+        blob = lambda t: torch.empty(t.shape, dtype=t.dtype, device=t.device)  # noqa: E731
+        fake = torch.ops.primus_turbo.gemm_fp6_impl(
+            blob(a_p), blob(a_s), blob(b_p), blob(b_s), m, n, k, torch.bfloat16, g
+        )
+    assert fake.shape == real.shape and fake.dtype == real.dtype and fake.device == real.device
