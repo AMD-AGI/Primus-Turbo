@@ -1626,13 +1626,17 @@ def build_flash_attn_bwd_dkdv_module(
     RD_STRIDE_KV = (batch_size * STRIDE_TOKEN_KV) if sbhd else STRIDE_TOKEN_KV
 
     # See the G2B_K128 block above for what this arm is and what it costs.
+    # G2_K128_SOLO: at BLOCK_Q = 128 one head step's own q axis is already the 128 the native
+    # MFMA contracts, so GEMM2 reaches the shape WITHOUT pairing two GQA head steps -- no carry
+    # across the odd/even step, no doubled Q image, and no even-group requirement.
+    G2_K128_SOLO = PV_K_STEPS == 4
     G2B_K128 = (
         _G2B_K128_ARM
         and G2B_FP8
         and G2_HALF
-        and PV_K_STEPS == 2
+        and (PV_K_STEPS == 2 or G2_K128_SOLO)
         and KV_HALVES == 1
-        and GQA_GROUP_SIZE % 2 == 0
+        and (GQA_GROUP_SIZE % 2 == 0 or G2_K128_SOLO)
     )
     # See the IGLP_EXP_INTERLEAVE block above: the strategy's SIGN flips with the body.
     IGLP_EXP_INTERLEAVE = 3 if G2B_K128 else 0
@@ -1890,7 +1894,7 @@ def build_flash_attn_bwd_dkdv_module(
     QF8_BASE = _G12B_END
     # G2B_K128 reads head h-1's twin during head h's step, so the twin -- and only the twin,
     # not the bf16 Q/dO ring -- carries a second slot.
-    QF8_SLOTS = 2 * LDS_SLOTS if G2B_K128 else LDS_SLOTS
+    QF8_SLOTS = 2 * LDS_SLOTS if (G2B_K128 and not G2_K128_SOLO) else LDS_SLOTS
     G2A_PUB_TAIL = G2A_FP8 and _G2A_PUB_TAIL and QF8_SLOTS > 1
     # Q8_FWD: publish head h+1's E4M3 Q twin from head h's staging registers, at head h's own dS
     # barrier, instead of at the top of head h+1's step.
@@ -4727,7 +4731,30 @@ def build_flash_attn_bwd_dkdv_module(
                         )
                         if const_expr(hooks):
                             _hs_hook(_at + 3)
-                        if const_expr(_k128 and _last and head_local % 2 == 0):
+                        if const_expr(_k128 and _last and G2_K128_SOLO):
+                            # One head step owns all four packs: split them into the two halves
+                            # _g2_k128 already expects and flush on every head.
+                            def _chunks_solo(pin_cur):
+                                return [(pin_cur, 0), (pin_cur, 1), (pin_cur, 2), (pin_cur, 3)]
+
+                            if const_expr(_k128a):
+                                _g2_k128(
+                                    [p_pack[0], p_pack[1]],
+                                    [p_pack[2], p_pack[3]],
+                                    _chunks_solo(_dof8_trb),
+                                    dv_cur[_H[0]],
+                                    _g2b_sca,
+                                    _g2a_scb,
+                                )
+                            _g2_k128(
+                                [ds_pack[0], ds_pack[1]],
+                                [ds_pack[2], ds_pack[3]],
+                                _chunks_solo(_qf8_trb),
+                                dk_cur[_H[0]],
+                                _g2b_sca,
+                                _g3_scb,
+                            )
+                        elif const_expr(_k128 and _last and head_local % 2 == 0):
                             # The even head's dS packs stay live across the odd head's whole
                             # GEMM1, which is what the AGPR file is for (see _AGPR_PIN_*).
                             pk_carry[0] = [
