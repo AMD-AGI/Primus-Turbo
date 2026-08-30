@@ -42,7 +42,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from primus_turbo.common.aiter_utils import get_aiter
+from primus_turbo.common.aiter_utils import AITER_GIT_TAG, get_aiter
 from primus_turbo.pytorch.core.low_precision import (
     MXFP6_BLOCK_SIZE,
     MXFP6_COL_SUM_TILE_M,
@@ -64,13 +64,22 @@ __all__ = [
     "mxfp6_pack_sizes",
 ]
 
+# The A6W6 entry points merged after the aiter release Primus-Turbo pins, so MXFP6 is
+# the one operator that needs a newer aiter than AITER_GIT_TAG. Nothing checks this
+# commit directly: no version string can express "contains commit X" -- the tag predates
+# it, a source build reports whatever git describe says, and a fork can carry any version
+# -- so the requirement is enforced by probing for the symbols in _A6W6_REQUIRED_ATTRS.
+# This constant is here so CI, docs and the error message read the minimum from one place.
+MXFP6_MIN_AITER_COMMIT = "0c2b0f77b2ff6d13c677d12466abf87299f8b260"
+
 _A6W6_REQUIRED_ATTRS = ("quant_mxfp6_gemm", "gemm_a6w6", "mxfp6_gemm_pack_size")
 
 _MISSING_A6W6_HINT = (
     "The installed aiter has no MXFP6 (A6W6) support. It merged in "
-    "https://github.com/ROCm/aiter/pull/4859 as commit "
-    "0c2b0f77b2ff6d13c677d12466abf87299f8b260, which is newer than the pinned release, "
-    "so an aiter at or after that commit is required."
+    f"https://github.com/ROCm/aiter/pull/4859 as commit {MXFP6_MIN_AITER_COMMIT}, which "
+    f"is newer than the pinned release ({AITER_GIT_TAG}), so an aiter at or after that "
+    "commit is required:\n"
+    f'  pip install "amd-aiter @ git+https://github.com/ROCm/aiter.git@{MXFP6_MIN_AITER_COMMIT}"'
 )
 
 _MISSING_PACKER_HINT = (
@@ -84,11 +93,34 @@ def _ceil(x: int, m: int) -> int:
     return -(-x // m) * m
 
 
+def _check_aiter_a6w6() -> Tuple[bool, str]:
+    """Whether the installed aiter exposes the A6W6 entry points MXFP6 needs.
+
+    Split out from ``check_mxfp6_support`` because it is the half of that question with
+    nothing to do with the hardware: it is settled by what is importable, so it stays
+    answerable -- and testable -- on a machine that could never run the kernels.
+
+    Like its caller this never raises. ``get_aiter`` raises when aiter is absent, and an
+    absent aiter is an answer here rather than an error.
+    """
+    try:
+        aiter = get_aiter()
+    except ImportError as exc:
+        return False, f"{_MISSING_A6W6_HINT} ({exc})"
+    missing = [a for a in _A6W6_REQUIRED_ATTRS if not hasattr(aiter, a)]
+    if missing:
+        return False, f"{_MISSING_A6W6_HINT} (missing: {', '.join(missing)})"
+    return True, ""
+
+
 def check_mxfp6_support(device: Optional[torch.device] = None) -> Tuple[bool, str]:
     """Return whether MXFP6 can run on ``device``, and why not if it cannot.
 
     ``device`` defaults to the current CUDA device. Pass an operand's device to ask the
-    question about where that operand actually lives.
+    question about where that operand actually lives. MXFP6 is the only one of these
+    predicates that takes a device; ``check_mxfp4_support`` and the FP8 ones in
+    ``core/low_precision.py`` answer for the ambient device only. This one lives here
+    rather than beside them because it needs ``get_aiter()`` and the extension op table.
 
     This never raises. It is the predicate callers use to decide whether to attempt
     MXFP6 at all, so an absent aiter has to come back as ``(False, reason)`` rather than
@@ -106,14 +138,7 @@ def check_mxfp6_support(device: Optional[torch.device] = None) -> Tuple[bool, st
     # The three packer ops share one build guard, so any of them answers for the set.
     if not hasattr(torch.ops.primus_turbo_cpp_extension, "quantize_mxfp6_dual"):
         return False, _MISSING_PACKER_HINT
-    try:
-        aiter = get_aiter()
-    except ImportError as exc:
-        return False, f"{_MISSING_A6W6_HINT} ({exc})"
-    missing = [a for a in _A6W6_REQUIRED_ATTRS if not hasattr(aiter, a)]
-    if missing:
-        return False, f"{_MISSING_A6W6_HINT} (missing: {', '.join(missing)})"
-    return True, ""
+    return _check_aiter_a6w6()
 
 
 def _require_supported(device: Optional[torch.device] = None) -> None:
