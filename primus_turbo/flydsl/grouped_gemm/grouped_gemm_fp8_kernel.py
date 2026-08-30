@@ -219,6 +219,7 @@ def _compile_grouped_nn(
     i64_traverse: bool = False,  # B[K,N] traversal via per-load i64 SRD re-base (lifts G*K*n < 2^32 cap)
     nn_halfn: bool = True,  # skip the all-OOB b1 half (c01/c11 mfma+store) on the last N-block when c_n%BLOCK_N in (0, LDS_BLOCK_N]
     nn_halfn_noload: bool = False,  # (with nn_halfn) also drop the all-OOB b1 g2s loads + s2r; that half body then pays a full vmcnt(0) per K-iter since its halved g2s count makes the graded drain racy
+    nn_bnd_narrow: bool = True,  # (with nn_halfn) run the boundary block at one B column-tile per wave when its valid width fits half the b0 pool: quarter-width mfma/reads/stores on the same g2s and the same drain
     cstore_aux: int = -1,  # cache-policy aux for the dx C store: keeps write-once dx out of L2 so the reused weight B stays resident. -1 = pick from the store width (see _cstore_aux), 0 = default policy
     nn_loop_tr_vmcnt: int = -1,  # steady-state B transpose-read g2s drain hint. -1 = none: the per-K-iter rendezvous below already covers every main-loop LDS read, so an extra vmcnt only throttles g2s
     N: int = 0,  # compile-time output width (0 = unknown): lets _col_safe prove the epilogue's column OOB select dead. Part of the autotune cache key
@@ -244,7 +245,6 @@ def _compile_grouped_nn(
 
     N_TILES_A = BLOCK_M // 64
     N_TILES_B = BLOCK_N // 128
-    N_ACCUMS = N_TILES_A * N_TILES_B
     LDS_BLOCK_M = BLOCK_M // 2
     LDS_BLOCK_N = BLOCK_N // 2
     N_LDS_STEPS_A = LDS_BLOCK_M // 64
@@ -255,6 +255,22 @@ def _compile_grouped_nn(
     # Known N: scalar epilogue columns are always < N, so the per-element OOB compare is dead (mask kept when N % LDS_BLOCK_N != 0).
     _col_safe = N > 0 and (N % BLOCK_N == 0 or (nn_halfn and N % LDS_BLOCK_N == 0))
     _nb_c = ceildiv(N, BLOCK_N) if N > 0 else 0  # compile-time N-block count (0 = take it from c_n)
+    # Boundary-N body width, in B column-tiles per wave (N_TILES_B=2 is the full tile), the NN
+    # twin of the NT fwd's _bnd_ntb. When the last N-block's valid width fits the lower half of
+    # the b0 LDS pool, its upper 64 columns are pure padding, so one column-tile per wave covers
+    # it. dglu never narrows (its second pool is the up band, not padding columns), the noload
+    # half body owns nq==0, and the CShuffle epilogue has no narrow store.
+    _bnd_narrow = (
+        nn_bnd_narrow
+        and nn_halfn
+        and not nn_halfn_noload
+        and not dglu
+        and not store_cshuffle
+        and N_TILES_B == 2
+        and N > 0
+        and 0 < N % BLOCK_N <= LDS_BLOCK_N // 2
+    )
+    _bnd_ntb = 1 if _bnd_narrow else N_TILES_B
     # Pad-both: B carries a padded N pitch NS; only the real N columns are computed/stored.
     NS = n_stride if n_stride else N
     assert n_stride == 0 or NS >= N > 0, f"n_stride={n_stride} must be >= real N={N}"
@@ -278,7 +294,7 @@ def _compile_grouped_nn(
     _rowmerge = nn_row_merge and not out_fp16 and not store_cshuffle and not dglu and N_TILES_B % 2 == 0
     # dx is written once and never re-read, so the merged store marks it non-temporal and leaves
     # L2 to the reused B. The merge is the precondition: at the unmerged 32B write width the same
-    # hint costs +7.9% on N=K=2880, a half-line write that skips L2 having nothing to coalesce with.
+    # hint regresses, since a half-line write skips L2 with nothing to coalesce with.
     _cstore_aux = (_MERGED_STORE_AUX if _rowmerge else 0) if cstore_aux < 0 else cstore_aux
     if dglu:
         assert glu_i > 0 and not store_cshuffle and not beta_is_one
@@ -561,6 +577,44 @@ def _compile_grouped_nn(
                     beta_is_one=beta_is_one,
                 )
 
+            if const_expr(_bnd_ntb < N_TILES_B):
+                # Narrow twin of (mfma, b_s2r, store_c) for the 64-column boundary body: one B
+                # column-tile per wave instead of two. B's g2s and its LDS layout are untouched,
+                # so only the transpose reads, the mfma columns and the stores narrow, and the
+                # loop's vmcnt/barrier sequence stays the half body's (pitfalls/05: never move
+                # synchronization in a boundary variant). tile_stride is the per-wave column span;
+                # width keeps compute_global_swizzle_nn's 128, which is what makes these reads a
+                # subset of the same map instead of a new one.
+                mfma_b = _build_mfma(
+                    N_TILES_A,
+                    _bnd_ntb,
+                    cbsz,
+                    blgp,
+                    asm_mode=("2" if acc_mode == "agpr" else "3") if agpr_inplace else None,
+                )
+                b_s2r_b = S2RLoaderTr(
+                    wave_n,
+                    _bnd_ntb,
+                    _bnd_ntb * 16,
+                    inline_asm=(agpr_inplace and acc_mode == "agpr"),
+                    wswz=_nnwz,
+                )
+                # A single column-tile has no pair for the row merge, so this body keeps the scalar
+                # store; at its 32B write width the non-temporal hint costs, so it takes no aux.
+                store_c_b = StoreCPerTensor(
+                    A_scale,
+                    B_scale,
+                    C,
+                    m_end,
+                    c_n,
+                    mfma_b.idx,
+                    N_TILES_A,
+                    _bnd_ntb,
+                    _out_ty,
+                    col_safe=_col_safe,
+                    beta_is_one=beta_is_one,
+                )
+
             # Before-mfma scheduling barrier; after-mfma barriers stay real (gfx950 mfma-src/ds-read VGPR-overlap race).
             def _ibar():
                 if const_expr(sched_schedbar):
@@ -577,10 +631,18 @@ def _compile_grouped_nn(
 
             # Runtime half-N skip: on the boundary block the b1 column half is all-OOB; the nq==1 body drops only its mfma+stores, leaving g2s/barriers unchanged (race-free).
             def _do_body(nq):
-                _full = nq == 2  # nq==2 full; nq in {0,1} half (skip c01/c11 mfma+store)
+                _full = nq == 2  # nq==2 full; nq in {0,1,3} half (skip c01/c11 mfma+store)
+                _bnd = nq == 3  # nq==3 narrow half body: one B column-tile per wave (64 columns)
                 _ld_b1 = nq != 0  # nq==0 half-noload: drop the all-OOB b1 g2s too
                 # Half body (nq==1): b1 transpose reads are dead; its g2s is re-aimed at b0 so loads become L2 hits instead of wasted HBM past c_n.
                 _b1_off = B1_gl_offset if _full else B0_gl_offset
+                # Narrow body: half of b0's columns are padding, so its mfma/read/store twins cover
+                # one column-tile per wave and its accumulator count halves with them.
+                _mm = mfma_b if _bnd else mfma
+                _bs2r = b_s2r_b if _bnd else b_s2r
+                _st = store_c_b if _bnd else store_c
+                _bcol = block_n * BLOCK_N + wave_n * (_bnd_ntb * 16) if _bnd else base_col
+                _nacc = N_TILES_A * (_bnd_ntb if _bnd else N_TILES_B)
                 # Half-body drain: lowering allowed in-flight only over-drains; gfx950 retires vmcnt out of order so drop one issue group for slack.
                 _wi = _w2 = _w1 = (0) if nq == 0 else (N_LDS_STEPS_A + N_LDS_STEPS_B)
                 # Graded drain: attach vmcnt to phase-trailing barriers that already separate a fill from its reader; nq==0 keeps the fully-drained rendezvous.
@@ -605,10 +667,10 @@ def _compile_grouped_nn(
                 b_cur1 = lds.B_lds_cur_1
                 b_next0 = lds.B_lds_next_0
                 b_next1 = lds.B_lds_next_1
-                c00 = [mfma.zero_value] * N_ACCUMS
-                c01 = [mfma.zero_value] * N_ACCUMS
-                c10 = [mfma.zero_value] * N_ACCUMS
-                c11 = [mfma.zero_value] * N_ACCUMS
+                c00 = [_mm.zero_value] * _nacc
+                c01 = [_mm.zero_value] * _nacc
+                c10 = [_mm.zero_value] * _nacc
+                c11 = [_mm.zero_value] * _nacc
 
                 b_g2s.load(b_cur0, B0_gl_offset + arith.index(0 * BLOCK_K) * cn_i)
                 a_g2s.load(a_cur0, A0_gl_offset + 0 * BLOCK_K)
@@ -636,12 +698,12 @@ def _compile_grouped_nn(
                     # b0's reads stay in flight: a0 is read after them and lgkm retires in order,
                     # so the wait the backend must emit for a0 (it feeds the first mfma) already
                     # covers the asm prefix; draining here only exposes b0's latency ahead of a0.
-                    b0_frag = b_s2r.load(b_cur0, vmcnt=nn_loop_tr_vmcnt, drain=not _elgk)
+                    b0_frag = _bs2r.load(b_cur0, vmcnt=nn_loop_tr_vmcnt, drain=not _elgk)
                     a0_frag = _ld_a(a_cur0, a_prev0)
                     a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
                     _ibar()
                     rocdl.s_setprio(1)
-                    c00 = mfma.call(a0_frag, b0_frag, c00)
+                    c00 = _mm.call(a0_frag, b0_frag, c00)
                     rocdl.s_setprio(0)
                     _dbar()
                     if const_expr(_full):
@@ -649,17 +711,17 @@ def _compile_grouped_nn(
                         # issue now (keeping the g2s and the barrier as latency cover) and
                         # drain per tile inside the mfma column below.
                         if const_expr(_elgk):
-                            b1_raw = _nn_b_tr_issue(b_s2r, b_cur1, nn_loop_tr_vmcnt)
+                            b1_raw = _nn_b_tr_issue(_bs2r, b_cur1, nn_loop_tr_vmcnt)
                         else:
-                            b1_frag = b_s2r.load(b_cur1, vmcnt=nn_loop_tr_vmcnt)
+                            b1_frag = _bs2r.load(b_cur1, vmcnt=nn_loop_tr_vmcnt)
                     b_g2s.load(b_cur0, B0_gl_offset + arith.index((k + 2) * BLOCK_K) * cn_i)
                     _ibar()
                     rocdl.s_setprio(1)
                     if const_expr(_full):
                         if const_expr(_elgk):
-                            c01, b1_frag = _nn_b_tr_mfma(mfma, b1_raw, a0_frag, c01)
+                            c01, b1_frag = _nn_b_tr_mfma(_mm, b1_raw, a0_frag, c01)
                         else:
-                            c01 = mfma.call(a0_frag, b1_frag, c01)
+                            c01 = _mm.call(a0_frag, b1_frag, c01)
                     rocdl.s_setprio(0)
                     _dbar()
                     a1_frag = _ld_a(a_cur1, a_prev1)
@@ -668,7 +730,7 @@ def _compile_grouped_nn(
                     a_g2s.load(a_prev0, A0_gl_offset + (k + 2) * BLOCK_K)
                     _ibar()
                     rocdl.s_setprio(1)
-                    c10 = mfma.call(a1_frag, b0_frag, c10)
+                    c10 = _mm.call(a1_frag, b0_frag, c10)
                     rocdl.s_setprio(0)
                     rocdl.s_barrier()
                     if const_expr(_ld_b1):
@@ -679,7 +741,7 @@ def _compile_grouped_nn(
                         _ibar()
                     rocdl.s_setprio(1)
                     if const_expr(_full):
-                        c11 = mfma.call(a1_frag, b1_frag, c11)
+                        c11 = _mm.call(a1_frag, b1_frag, c11)
                     rocdl.s_setprio(0)
                     _dbar()
                     if _nt_vmcnt >= 0:
@@ -696,42 +758,42 @@ def _compile_grouped_nn(
                     b_cur1, b_next1 = b_next1, b_cur1
 
                 k = K_ITERS - 2
-                b0_frag = b_s2r.load(b_cur0, drain=not _elgk)
+                b0_frag = _bs2r.load(b_cur0, drain=not _elgk)
                 a0_frag = _ld_a(a_cur0, a_prev0)
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
-                c00 = mfma.call(a0_frag, b0_frag, c00)
+                c00 = _mm.call(a0_frag, b0_frag, c00)
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
                 if const_expr(_full):
                     if const_expr(_elgk):
-                        b1_raw = _nn_b_tr_issue(b_s2r, b_cur1)
+                        b1_raw = _nn_b_tr_issue(_bs2r, b_cur1)
                     else:
-                        b1_frag = b_s2r.load(b_cur1)
+                        b1_frag = _bs2r.load(b_cur1)
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
                 if const_expr(_full):
                     if const_expr(_elgk):
-                        c01, b1_frag = _nn_b_tr_mfma(mfma, b1_raw, a0_frag, c01)
+                        c01, b1_frag = _nn_b_tr_mfma(_mm, b1_raw, a0_frag, c01)
                     else:
-                        c01 = mfma.call(a0_frag, b1_frag, c01)
+                        c01 = _mm.call(a0_frag, b1_frag, c01)
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
                 a1_frag = _ld_a(a_cur1, a_prev1)
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
-                c10 = mfma.call(a1_frag, b0_frag, c10)
+                c10 = _mm.call(a1_frag, b0_frag, c10)
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
                 # This stage feeds the last phase's c00, past the c11 mfma below and the slot
                 # rotate, so its reads ride the next a0 fragment's wait with a whole mfma group
                 # of cover.
-                b0_frag = b_s2r.load(b_next0, drain=not _elgk)
+                b0_frag = _bs2r.load(b_next0, drain=not _elgk)
                 a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
                 if const_expr(_full):
-                    c11 = mfma.call(a1_frag, b1_frag, c11)
+                    c11 = _mm.call(a1_frag, b1_frag, c11)
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
                 a_prev0, a_cur0, a_next0 = _rot_a(a_prev0, a_cur0, a_next0)
@@ -743,30 +805,30 @@ def _compile_grouped_nn(
                 a0_frag = mask_a_tail(a0_frag, lane_id, K_TAIL)
                 wait_barrier(0)
                 rocdl.s_setprio(1)
-                c00 = mfma.call(a0_frag, b0_frag, c00)
+                c00 = _mm.call(a0_frag, b0_frag, c00)
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
                 if const_expr(_full):
                     if const_expr(_elgk):
-                        b1_raw = _nn_b_tr_issue(b_s2r, b_cur1)
+                        b1_raw = _nn_b_tr_issue(_bs2r, b_cur1)
                     else:
-                        b1_frag = b_s2r.load(b_cur1)
+                        b1_frag = _bs2r.load(b_cur1)
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
                 if const_expr(_full):
                     if const_expr(_elgk):
-                        c01, b1_frag = _nn_b_tr_mfma(mfma, b1_raw, a0_frag, c01)
+                        c01, b1_frag = _nn_b_tr_mfma(_mm, b1_raw, a0_frag, c01)
                     else:
-                        c01 = mfma.call(a0_frag, b1_frag, c01)
+                        c01 = _mm.call(a0_frag, b1_frag, c01)
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
                 a1_frag = _ld_a(a_cur1, a_prev1)
                 a1_frag = mask_a_tail(a1_frag, lane_id, K_TAIL)
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
-                c10 = mfma.call(a1_frag, b0_frag, c10)
+                c10 = _mm.call(a1_frag, b0_frag, c10)
                 if const_expr(_full):
-                    c11 = mfma.call(a1_frag, b1_frag, c11)
+                    c11 = _mm.call(a1_frag, b1_frag, c11)
                 rocdl.s_setprio(0)
                 # Epilogue store schedule: batching each quadrant behind a barrier keeps all
                 # waves inside one row/column band (contiguous columns) instead of one spread
@@ -777,11 +839,11 @@ def _compile_grouped_nn(
                     # past I, so it contributes nothing and the epilogue skips it.
                     _hi0 = c01 if const_expr(_full) else None
                     _hi1 = c11 if const_expr(_full) else None
-                    store_c.store_pair(c00, _hi0, base_row, base_col, LDS_BLOCK_N)
-                    store_c.store_pair(c10, _hi1, base_row + LDS_BLOCK_M, base_col, LDS_BLOCK_N)
+                    _st.store_pair(c00, _hi0, base_row, _bcol, LDS_BLOCK_N)
+                    _st.store_pair(c10, _hi1, base_row + LDS_BLOCK_M, _bcol, LDS_BLOCK_N)
                 else:
                     _store_split(
-                        store_c,
+                        _st,
                         (
                             (c00, 0, 0),
                             (c01, 0, LDS_BLOCK_N),
@@ -789,7 +851,7 @@ def _compile_grouped_nn(
                             (c11, LDS_BLOCK_M, LDS_BLOCK_N),
                         ),
                         base_row,
-                        base_col,
+                        _bcol,
                         _esplit,
                         _full,
                     )
@@ -802,8 +864,11 @@ def _compile_grouped_nn(
                 arith.select(_lastw <= fx.Int32(LDS_BLOCK_N), fx.Int32(1), fx.Int32(0)),
                 fx.Int32(0),
             )
-            # nn_halfn=False forces the full body; default True skips the all-OOB b1 half on the boundary block.
-            _half_nq = 0 if const_expr(nn_halfn_noload) else 1
+            # nn_halfn=False forces the full body; default True skips the all-OOB b1 half on the
+            # boundary block, narrowed to one column-tile per wave (nq==3) where the remainder fits
+            # it: c_n equals the compiled N (both come from the one autotune key), so the runtime
+            # predicate can only fire on a block whose valid width is <= that narrow span.
+            _half_nq = 0 if const_expr(nn_halfn_noload) else (3 if const_expr(_bnd_narrow) else 1)
             if const_expr(nn_halfn):
                 if _readfirstlane_i32(_is_half) == fx.Int32(1):
                     _do_body(_half_nq)
@@ -4821,9 +4886,9 @@ def _wgrad_4wave_cands(OUT_M, OUT_N, G, ncu, block=256):
             and _wgrad_xcd_geom_ok(h, aff[1], n_blocks_m, tiles_per_group, nxcd=xcd_k)
         ):
             cands += ((h, aff[1], 1, 1, 3, True),)
-        # The short last-M-block body is worth 1.4% on the capped affine head at OUT_M=5760 --
-        # just inside _WGRAD_RACE_MARGIN, so the race picks it only some runs. Lead with it and
-        # keep the gated head as a challenger that must beat the margin (pitfalls/06 static lead).
+        # The short last-M-block body is a real win on the capped affine head, but just inside
+        # _WGRAD_RACE_MARGIN, so the race picks it only some runs. Lead with it and keep the
+        # gated head as a challenger that must beat the margin (pitfalls/06 static lead).
         cands = (aff_c + (3, True),) + cands
     return tuple(dict.fromkeys(cands))
 

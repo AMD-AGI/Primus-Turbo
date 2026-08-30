@@ -54,9 +54,12 @@ def quantize_fp8_tensorwise_pad_impl(
 
 def quantize_fp8_tensorwise_impl(x: torch.Tensor, out_dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-tensor fp8 cast leaving the operand at its own K, for callers that address the row
-    pitch themselves instead of taking ``quantize_fp8_tensorwise_pad_impl``'s padded path."""
-    x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(x.contiguous(), out_dtype)
-    return x_fp8, scale_inv
+    pitch themselves instead of taking ``quantize_fp8_tensorwise_pad_impl``'s padded path.
+
+    ``k_align=1`` is required here, not just the default: the cpp op's schema default is
+    128, which would silently pad K to a multiple of 128 (e.g. 2880 -> 2944 for gpt-oss-20b's
+    down-proj) and break the caller's own-K contract instead of leaving it alone."""
+    return quantize_fp8_tensorwise_pad_impl(x, out_dtype, pad_n=False, k_align=1)
 
 
 def quantize_fp8_rowwise_impl(
