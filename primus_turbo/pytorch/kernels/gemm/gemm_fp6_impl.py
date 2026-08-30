@@ -39,7 +39,8 @@ from primus_turbo.pytorch.core.low_precision import (
     MXFP6_TILE_SIZE,
     ScalingGranularity,
 )
-from primus_turbo.pytorch.core.utils import is_gfx950
+from primus_turbo.pytorch.core.utils import is_gfx950_device
+from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import mxfp6_pack_sizes
 
 _torch_custom_op_wrapper = torch.library.custom_op
 
@@ -66,7 +67,7 @@ class GEMMFP6AITERBackend(KernelBackend):
         granularity: ScalingGranularity,
         **kwargs,
     ) -> bool:
-        supported = is_gfx950()
+        supported = is_gfx950_device(a.device)
         supported &= granularity in GEMMFP6AITERBackend.SUPPORTED_GRANULARITIES
         # The A6W6 asm only writes bf16.
         supported &= out_dtype in GEMMFP6AITERBackend.SUPPORTED_OUT_DTYPES
@@ -116,6 +117,53 @@ def _resolve_backend() -> BackendType:
     return BackendType.AITER
 
 
+def _validate_blobs(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    m: int,
+    n: int,
+    k: int,
+) -> None:
+    """Reject malformed packed operands before they reach AITER.
+
+    The blobs are opaque byte streams carrying neither shape nor dtype, so a wrong
+    M/N/K is invisible to every check downstream of here: the kernel derives its strides
+    from the dimensions it was handed and reads whatever lies past the end of a blob
+    that is too short. Sizing them with the same helper the packer used is the only
+    point at which that is catchable from Python.
+    """
+    for name, blob in (("a", a), ("a_scale", a_scale), ("b", b), ("b_scale", b_scale)):
+        if blob.dtype != torch.uint8:
+            raise TypeError(f"MXFP6 GEMM operand {name} must be a uint8 blob, got {blob.dtype}.")
+        if blob.ndim != 1:
+            raise ValueError(f"MXFP6 GEMM operand {name} must be a 1-D blob, got {blob.ndim}-D.")
+        if not blob.is_contiguous():
+            raise ValueError(f"MXFP6 GEMM operand {name} must be contiguous.")
+
+    devices = {blob.device for blob in (a, a_scale, b, b_scale)}
+    if len(devices) != 1:
+        raise ValueError(f"MXFP6 GEMM operands must share one device, got {sorted(str(d) for d in devices)}.")
+
+    for name, dim in (("M", m), ("N", n), ("K", k)):
+        if dim <= 0:
+            raise ValueError(f"MXFP6 GEMM needs positive dimensions, got {name}={dim}.")
+
+    # a is the [M, K] operand and b the [N, K] one, in every direction: the backward
+    # GEMMs permute which logical tensor plays which role but not this relationship.
+    for name, (operand, scale), (want_operand, want_scale) in (
+        ("a", (a, a_scale), mxfp6_pack_sizes(m, k)),
+        ("b", (b, b_scale), mxfp6_pack_sizes(n, k)),
+    ):
+        if operand.numel() != want_operand or scale.numel() != want_scale:
+            raise ValueError(
+                f"MXFP6 GEMM operand {name} does not match M={m} N={n} K={k}: expected "
+                f"{want_operand} operand and {want_scale} scale bytes, got "
+                f"{operand.numel()} and {scale.numel()}."
+            )
+
+
 @_torch_custom_op_wrapper("primus_turbo::gemm_fp6_impl", mutates_args=(), device_types="cuda")
 def gemm_fp6_impl(
     a: torch.Tensor,
@@ -129,6 +177,7 @@ def gemm_fp6_impl(
     granularity: int,
 ) -> torch.Tensor:
     granularity_enum = ScalingGranularity(granularity)
+    _validate_blobs(a, a_scale, b, b_scale, m, n, k)
     backend = _resolve_backend()
     impl = _GEMM_FP6_BACKENDS[backend].impl
 
