@@ -77,6 +77,15 @@ SUPPORT_STATUS: Dict[str, Any] = {
         # over the whole sequence, and an unverifiable mask raises instead of silently
         # running dense attention.
         "all_visible_probe_corner_reverified": "full_confirmed_over_whole_sequence_or_raise",
+        # A band whose edges lie *outside* the probed corner is now recovered instead of
+        # refused. The corner cannot show an edge it does not contain (|q-kv| <= 640 on
+        # S=1024 fills a 512x512 corner completely, and L=640/R=64 shows only the right
+        # edge), so each edge is binary-searched on the row where it is not clipped --
+        # the last query row for the left edge, the first for the right -- and the band
+        # is then rebuilt over the whole sequence and compared bit for bit. An edge that
+        # reaches the end of the sequence is unbounded and is reported as -1, the
+        # kernel's own convention. A band that drifts with position still raises.
+        "band_edges_beyond_probe": "edges_binary_searched_on_unclipped_rows_then_verified_exactly",
     },
     # Classification (block_mask probe) and score_mod (ALiBi/soft-cap) detection are
     # memoised by object identity (weakref) so reusing the same block_mask / score_mod

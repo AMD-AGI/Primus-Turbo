@@ -115,18 +115,46 @@ def test_classify_holey_band_unsupported():
         _classify_block_mask(_DummyBlockMask(mask_mod), B=1, H=1, q_len=32, kv_len=32)
 
 
-def test_classify_band_wider_than_probe_unsupported():
-    # Left edge parked on the probe boundary: on the truncated grid this is
-    # indistinguishable from any wider left edge, so refuse instead of guessing. The
-    # narrow right edge keeps the probe from being all-visible, which would classify as
-    # a full mask before the band logic is ever reached.
+def test_classify_band_whose_left_edge_exceeds_the_probe():
+    # Left edge parked past the probe boundary: on the truncated grid it is
+    # indistinguishable from any wider left edge, so the corner alone cannot answer.
+    # It is answerable from mask_mod, though -- the last query row is where a wide left
+    # edge is not clipped -- and the recovered band is rebuilt over the whole sequence
+    # before it is believed. Here the left edge reaches the start of the sequence, i.e.
+    # it is unbounded, which the kernel spells -1.
     long_len = 4096
 
     def mask_mod(b, h, q, kv):
         return ((q - kv) <= long_len) & ((kv - q) <= 2)
 
+    cfg = _classify_block_mask(_DummyBlockMask(mask_mod), B=1, H=1, q_len=long_len, kv_len=long_len)
+    assert cfg["kind"] == "sliding_window"
+    assert cfg["causal"] is False
+    assert cfg["window_size"] == (-1, 2)
+
+
+def test_classify_band_with_both_edges_past_the_probe():
+    # Neither edge is inside the probed corner and the corner is not all-visible
+    # either; both come from mask_mod and both are verified exactly.
+    n = 4096
+    bm = _DummyBlockMask(lambda b, h, q, kv: (q - kv <= 1500) & (kv - q <= 700))
+    cfg = _classify_block_mask(bm, B=1, H=1, q_len=n, kv_len=n)
+    assert cfg["kind"] == "sliding_window"
+    assert cfg["causal"] is False
+    assert cfg["window_size"] == (1500, 700)
+
+
+def test_band_that_widens_with_position_is_still_refused():
+    # A band recovered from two rows would be a lie here: the width grows with the
+    # query index, so no single window_size describes it. The whole-sequence rebuild
+    # is what catches this.
+    n = 2048
+
+    def mask_mod(b, h, q, kv):
+        return (q - kv <= 600 + q // 4) & (kv - q <= 600)
+
     with pytest.raises(NotImplementedError):
-        _classify_block_mask(_DummyBlockMask(mask_mod), B=1, H=1, q_len=long_len, kv_len=long_len)
+        _classify_block_mask(_DummyBlockMask(mask_mod), B=1, H=1, q_len=n, kv_len=n)
 
 
 def test_classify_position_dependent_band_unsupported():
@@ -561,13 +589,41 @@ def test_classify_identity_mask_is_a_degenerate_band_not_packing():
 
 
 def test_all_visible_probe_corner_does_not_silently_become_full():
-    # The probed corner is entirely visible, but the mask closes past the probe limit.
-    # Answering "full attention" on the strength of the corner would silently train a
-    # different model, so this must raise instead.
+    # The probed corner is entirely visible, but the mask closes past the probe limit:
+    # a band of +-2000 covers a 512x512 corner completely. Answering "full attention"
+    # on the strength of the corner would silently train a different model. The band is
+    # recoverable and exactly expressible, so it is recovered -- what must never happen
+    # is "full".
     n = 4096
     block_mask = _DummyBlockMask(lambda b, h, q, kv: (q - kv <= 2000) & (kv - q <= 2000))
+    cfg = _classify_block_mask(block_mask, B=1, H=1, q_len=n, kv_len=n)
+    assert cfg["kind"] == "sliding_window"
+    assert cfg["window_size"] == (2000, 2000)
+
+
+def test_all_visible_probe_corner_that_is_not_expressible_still_raises():
+    # Same corner, but past the probe the mask is neither full, nor packing, nor a
+    # translation-invariant band. Nothing to lower onto, so it must raise.
+    n = 2048
+
+    def mask_mod(b, h, q, kv):
+        return (q - kv <= 900 + (q % 7)) & (kv - q <= 900)
+
     with pytest.raises(NotImplementedError, match="fully visible"):
-        _classify_block_mask(block_mask, B=1, H=1, q_len=n, kv_len=n)
+        _classify_block_mask(_DummyBlockMask(mask_mod), B=1, H=1, q_len=n, kv_len=n)
+
+
+def test_packed_documents_with_a_wide_window_are_not_flattened_into_a_band():
+    # The corner is all-visible (document 0 outlives it and the window covers it), and
+    # a plain +-640 band would rebuild that corner perfectly -- but it would also let
+    # every query attend across document boundaries. The document locator must win.
+    seg = [700, 800, 548]
+    bm = _doc_window_block_mask(seg, causal=False, left=640, right=640)
+    cfg = _classify_block_mask(bm, B=1, H=1, q_len=sum(seg), kv_len=sum(seg))
+    assert cfg["kind"] == "document"
+    assert cfg["causal"] is False
+    assert cfg["window_size"] == (640, 640)
+    assert cfg["doc_seglens"] == seg
 
 
 def test_genuinely_full_mask_still_classifies_as_full_past_the_probe():

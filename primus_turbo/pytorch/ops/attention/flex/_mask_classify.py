@@ -174,26 +174,33 @@ def _verify_packed_pattern(
 
 
 def _document_window_candidates(mask_mod: Callable, *, n: int, seg_lens: List[int]) -> List[Tuple[int, int]]:
-    """Guess within-document window edges from two whole rows of the longest document.
+    """Guess within-document window edges from three whole rows of the longest document.
 
     Once a packed sequence outgrows the probe grid the window edge cannot be read off
     the probed corner -- but it can be read off a full row, and guessing is harmless
     here because :func:`_verify_packed_pattern` rebuilds the entire mask from the guess
     before anything is routed.
 
-    Two rows, because one is not enough for both shapes: the *middle* token of the
-    longest document is the only place a bidirectional band shows both of its edges (the
-    last token always reports ``right=0``), while the *last* token is where a causal
-    window has the most room to reach its full extent (the middle token reports
-    ``min(W, offset_into_document)``). A document shorter than the window clips the
-    reading either way; the clipped candidate then fails to verify and we refuse, rather
-    than route a half-sized window and silently drop the rest of the context.
+    Three rows, because no single one of them shows both edges at full extent. A
+    document truncates every reading at its own ends, so each edge has to be read where
+    that truncation cannot reach it: the **last** token of the document for the left
+    edge, the **first** token for the right edge, and the **middle** token for the
+    common case where the window is narrow enough that one row shows both. The pair
+    ``(max left seen, max right seen)`` is offered as a candidate alongside the raw
+    per-row readings -- that is the one that recovers a wide bidirectional window, e.g.
+    +-640 inside an 800-token document, where the middle row reports a clipped
+    ``(400, 399)`` and each end row reports one real edge and one zero.
+
+    A window wider than the document itself clips every reading; the clipped candidates
+    then fail to verify and we refuse, rather than route a half-sized window and
+    silently drop the rest of the context.
     """
     longest = max(range(len(seg_lens)), key=lambda i: seg_lens[i])
     start = sum(seg_lens[:longest])
     end = start + seg_lens[longest]
     out: List[Tuple[int, int]] = []
-    for q_star in dict.fromkeys((start + (end - start) // 2, end - 1)):
+    max_left = max_right = -1
+    for q_star in dict.fromkeys((start + (end - start) // 2, end - 1, start)):
         row = _probe_mask_row(mask_mod, int(q_star), n)
         visible = row.nonzero().flatten()
         if visible.numel() == 0:
@@ -202,8 +209,12 @@ def _document_window_candidates(mask_mod: Callable, *, n: int, seg_lens: List[in
         right = int(visible.max().item()) - q_star
         if left < 0 or right < 0:
             continue
+        max_left = max(max_left, left)
+        max_right = max(max_right, right)
         if (left, right) not in out:
             out.append((left, right))
+    if max_left >= 0 and (max_left, max_right) not in out:
+        out.append((max_left, max_right))
     return out
 
 
@@ -428,6 +439,60 @@ def _locate_left_window(mask_mod: Callable, *, q_len: int, kv_len: int) -> Optio
     return window
 
 
+def _locate_band_edges(mask_mod: Callable, *, q_len: int, kv_len: int) -> Optional[Tuple[int, int]]:
+    """Recover a band ``-R <= q - kv <= L`` whose edges lie *past* the probe grid.
+
+    The probed corner cannot show an edge it does not contain: a band of +-640 on a
+    1024-long sequence fills the whole 512x512 corner, so the corner says "full" and a
+    band of L=640, R=64 says "left edge somewhere beyond 511". Both are exactly
+    ``window_size``-expressible, and both used to be refused.
+
+    Each edge is read where it has the most room to show itself, which is not the same
+    row for the two of them: the **last** query row is the only place a wide *left*
+    edge is not clipped by the start of the sequence, and the **first** row is the only
+    place a wide *right* edge is not clipped by its end. Within a genuine band each row
+    is one contiguous run, so a binary search on the True->False flip finds the edge in
+    ~log2(S) probes; an edge that never flips is unbounded and is returned as ``-1``,
+    the kernel's own convention.
+
+    That reading is a hypothesis and nothing more. The caller must hand it to
+    :func:`_verify_packed_pattern`, which rebuilds the band over the whole sequence and
+    compares it bit for bit -- so a mask that merely *starts* like a band, or one whose
+    band drifts with position, still ends up refused rather than approximated.
+    """
+    if q_len != kv_len:
+        return None  # a translation-invariant band is square self-attention
+    n = q_len
+    if n <= 1 or n > _DOC_EXACT_VERIFY_LIMIT:
+        return None
+    last = n - 1
+    if not _call_mask_mod(mask_mod, 0, 0, last, last):
+        return None  # a hole on the diagonal: not a band at all
+
+    def _edge(q_pos: int, sign: int) -> int:
+        """Largest ``d >= 0`` with ``mask_mod(q_pos, q_pos + sign*d)`` visible, or -1
+        if the run reaches the end of the sequence (unbounded on that side)."""
+        far = q_pos if sign < 0 else last - q_pos
+        if far <= 0:
+            return -1
+        if _call_mask_mod(mask_mod, 0, 0, q_pos, q_pos + sign * far):
+            return -1  # visible all the way out: no edge inside this sequence
+        lo, hi = 0, far  # visible at lo, invisible at hi
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if _call_mask_mod(mask_mod, 0, 0, q_pos, q_pos + sign * mid):
+                lo = mid
+            else:
+                hi = mid
+        return lo
+
+    left = _edge(last, -1)  # reaching back from the final query
+    right = _edge(0, +1)  # reaching forward from the first query
+    if left == 0 and right == 0:
+        return None  # diagonal only; not something window_size describes usefully
+    return left, right
+
+
 def _classify_band_mask(
     mask: torch.Tensor,
     *,
@@ -482,13 +547,37 @@ def _classify_band_mask(
         if mask_mod is None:
             return None
         # An edge that lands on the last probed offset may really be larger and merely
-        # clipped by the grid, so refuse rather than guess.
+        # clipped by the grid. The corner cannot settle it either way, so go back to
+        # mask_mod: read each edge from the row where it is not clipped, then rebuild
+        # the whole band and compare bit for bit. Only if that fails do we refuse.
         if left >= q_probe - 1 or right >= kv_probe - 1:
+            edges = _locate_band_edges(mask_mod, q_len=q_len, kv_len=kv_len)
+            if edges is not None:
+                wide_left, wide_right = edges
+                single_doc = torch.zeros(q_len, dtype=torch.int64)
+                if _verify_packed_pattern(
+                    mask_mod, n=q_len, doc_id=single_doc, causal=False, window=(wide_left, wide_right)
+                ):
+                    return {
+                        "kind": "sliding_window",
+                        "causal": False,
+                        "window_size": (wide_left, wide_right),
+                    }
+            blocks = _locate_document_blocks(mask_mod, q_len=q_len, kv_len=kv_len, causal_hint=False)
+            if blocks is not None:
+                return {
+                    "kind": "document",
+                    "causal": blocks["causal"],
+                    "window_size": blocks["window_size"],
+                    "doc_seglens": blocks["seglens"],
+                }
             raise NotImplementedError(
-                f"Turbo flex compat layer detected a band mask whose edge may exceed the probe "
-                f"limit {_MASK_PROBE_LIMIT}; the window size could not be verified. Please express "
-                "the window explicitly via create_block_mask on a shorter probe, or use the "
-                "codegen path."
+                f"Turbo flex compat layer detected a band mask whose edge exceeds the probe "
+                f"limit {_MASK_PROBE_LIMIT}, and the edges recovered from mask_mod over the whole "
+                f"{q_len}x{kv_len} sequence do not rebuild it exactly (nor is it document "
+                "packing). Refusing rather than running the corner's band everywhere. Please "
+                "express the window explicitly via window_size on the direct entry points, or "
+                "use the codegen path."
             )
         if q_len == kv_len and q_len <= _DOC_EXACT_VERIFY_LIMIT:
             # Affordable: rebuild the band over the whole sequence and compare bit for
@@ -639,11 +728,28 @@ def _classify_probed_mask(
             }
         if _verify_full_mask(mask_mod, q_len=q_len, kv_len=kv_len):
             return {"kind": "full", "causal": False, "window_size": (-1, -1)}
+        # Not full and not packed. One shape still fits: a band so wide that both of
+        # its edges fall outside the probed corner (|q-kv| <= 640 on S=1024 fills a
+        # 512x512 corner completely). Its edges are recoverable from mask_mod and the
+        # band is verified over the whole sequence before it is believed.
+        edges = _locate_band_edges(mask_mod, q_len=q_len, kv_len=kv_len)
+        if edges is not None:
+            wide_left, wide_right = edges
+            single_doc = torch.zeros(q_len, dtype=torch.int64)
+            if _verify_packed_pattern(
+                mask_mod, n=q_len, doc_id=single_doc, causal=False, window=(wide_left, wide_right)
+            ):
+                return {
+                    "kind": "sliding_window",
+                    "causal": False,
+                    "window_size": (wide_left, wide_right),
+                }
         raise NotImplementedError(
             f"Turbo flex compat layer: the probed {q_probe}x{kv_probe} corner of this "
             f"block_mask is fully visible, but the mask is not fully visible over the "
-            f"whole {q_len}x{kv_len} sequence and does not match bidirectional document "
-            "packing. Patterns that only begin to restrict past the probe limit "
+            f"whole {q_len}x{kv_len} sequence, does not match bidirectional document "
+            "packing, and is not a wide band around the diagonal either. Patterns that "
+            "only begin to restrict past the probe limit "
             f"{_MASK_PROBE_LIMIT} cannot be verified, and guessing 'full attention' here "
             "would train the wrong model. Please express the pattern with is_causal / "
             "window_size / cu_seqlens on the direct entry points."
