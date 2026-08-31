@@ -327,7 +327,12 @@ class DenseAttnFwdTritonBackend(KernelBackend):
         # Validated on gfx1250 only; widen once another arch has numbers.
         if not is_gfx1250():
             return False
-        if k is None or v is None or qkv_format != "bshd":
+        # Any layout is fine: the tensors are always shaped [b, s, h, d] and qkv_format only
+        # names the byte order, which the adapter normalises with .contiguous(). Gating on
+        # "bshd" looked safe but only ever passed by accident -- _infer_qkv_format cannot tell
+        # sbhd from bshd at b == 1, so a batch of one slipped through and any larger batch was
+        # refused.
+        if k is None or v is None:
             return False
         # No kernel support for these; returning True would compute a wrong answer silently.
         if bias is not None or alibi_slopes is not None:

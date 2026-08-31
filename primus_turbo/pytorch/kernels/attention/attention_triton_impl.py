@@ -757,12 +757,14 @@ def dense_backward(
         softmax_scale = q.shape[-1] ** -0.5
     one = torch.ones(1, device=q.device, dtype=torch.float32)
     seqlen_q, seqlen_k = q.shape[1], k.shape[1]
+    # The kernel asserts all of these are contiguous, and q/k/v arrive as the caller saved
+    # them -- which is sbhd-ordered bytes whenever qkv_format said so.
     dq, dk, dv = attention_triton_backward_impl(
         do.contiguous(),
-        q,
-        k,
-        v,
-        o,
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        o.contiguous(),
         one,
         one,
         one,
