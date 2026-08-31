@@ -95,11 +95,14 @@ SUPPORT_STATUS: Dict[str, Any] = {
     # S=1024 rising to 19.2 ms at S=8192 for document packing, whose recognition
     # verifies the reconstruction exactly over the whole sequence. At S=8192 that is
     # ~10x the attention kernel it precedes. A warm hit is ~0.3 us.
-    # NOTE: the cache is keyed by object *identity*. Rebuilding block_mask every step
-    # (natural for THD, whose boundaries change every step) never hits it and pays the
-    # cold cost every step, host-side and in front of the kernel.
-    # clear_classification_cache() resets it (tests / cold-cache benchmarks).
-    "classification_cache": "memoised_by_block_mask_and_score_mod_object_identity_weakref",
+    # NOTE: the primary key is object *identity* (weakref). A factory that rebuilds
+    # mask_mod every step (natural for THD, whose boundaries change every step) would
+    # never hit that, so there is a second, content-addressed level: _fn_fingerprint
+    # keys on the function's code object plus its closure cell values, and only when
+    # every cell holds a hashable scalar -- unfingerprintable mask_mods fall back to
+    # identity and simply pay the cold cost. Bounded at 256 entries; overflow clears.
+    # clear_classification_cache() resets both levels (tests / cold-cache benchmarks).
+    "classification_cache": "identity_weakref_plus_mask_mod_closure_fingerprint_fallback",
     # Turbo-extension explicit args (superset of the torch signature; both default
     # None so a torch-style call is unchanged and remains a drop-in replacement).
     "turbo_extension_args": {
@@ -107,7 +110,8 @@ SUPPORT_STATUS: Dict[str, Any] = {
         # bypasses the score_mod detector and is live on this build.
         "alibi_slopes": "live_explicit_bypasses_score_mod_detection",
         # Interface is in place but gated: softcap>0 raises NotImplementedError
-        # (aiter dense fwd/bwd lack the param); 0/None means disabled (no-op).
+        # (no trainable aiter fwd+bwd pair implements it -- see unsupported_paths
+        # for the surveyed layer-by-layer state); 0/None means disabled (no-op).
         "softcap": "interface_ready_but_gated_positive_softcap_raises",
         # Attention dropout probability (0<=p<1) -> flash_attn_func(dropout_p=...);
         # live on this build. 0.0 (default) disables it (drop-in, no-op).
@@ -141,9 +145,25 @@ SUPPORT_STATUS: Dict[str, Any] = {
         "arbitrary_score_mod": "path_b_codegen_stub_only",
         "arbitrary_mask_mod": "path_b_codegen_stub_only",
         # Recognised (via _detect_softcap) or requested explicitly, but blocked at
-        # the kernel layer: the aiter dense fwd/bwd on this build expose no softcap
-        # parameter, so a soft-cap hard-errors instead of silently ignoring the cap.
-        "softcap": "detected_or_explicit_but_blocked_aiter_dense_kernel_has_no_softcap_param",
+        # the kernel layer, so a soft-cap hard-errors instead of silently ignoring it.
+        # The block is NOT one missing python argument -- surveyed on this build:
+        #   * CK ck_tile FORWARD has it (block/variants.hpp LogitsSoftCapParams; tanh
+        #     is the compile-time default, softsign selectable), and aiter's dense
+        #     binding passes a literal `0.0, // logits_soft_cap` at
+        #     csrc/py_itfs_ck/mha_fwd_kernels.cu. So dense fwd is binding-only work.
+        #   * CK ck_tile BACKWARD has none: fmha_bwd_kernel.hpp contains no soft cap,
+        #     and neither do aiter's mha_bwd_kernels.cu / mha_varlen_bwd_kernels.cu.
+        #     dS needs the tanh derivative; that math does not exist yet.
+        #   * aiter's varlen python fwd takes logits_soft_cap, but
+        #     FlashAttnVarlenFunc.backward never passes it and returns None for its
+        #     gradient slot -- capped forward, uncapped gradients.
+        #   * asm/v3 is disqualified by `logits_soft_cap == 0.0` in the fwd chooser;
+        #     the triton kernels that do implement it are inference-only
+        #     (unified_attention, mha_v3, whose backward raises NotImplementedError).
+        # Enabling forward alone would train capped logits against uncapped gradients
+        # -- the exact silent-drop failure this layer exists to prevent. So the gate
+        # stays until a trainable fwd+bwd pair supports it.
+        "softcap": "detected_or_explicit_but_blocked_no_trainable_aiter_fwd_bwd_pair_implements_softcap",
         # fp8 lands on the Triton kernel family, which has no sink parameter, asserts
         # bias is None and window_size == (-1,-1), has no dropout_p in its backward,
         # never reads `deterministic`, emits a [B,H,2*Sq] LSE, and has no varlen entry.

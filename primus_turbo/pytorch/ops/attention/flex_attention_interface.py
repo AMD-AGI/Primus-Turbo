@@ -469,21 +469,38 @@ def flex_attention(
         )
 
     # ---- single softcap enablement point --------------------------------------
-    # softcap (explicit or detected) is blocked at the kernel layer on this build:
-    # the aiter dense fwd/bwd expose no softcap parameter.
-    # Centralising the "softcap>0 -> raise" here (never silently dropping the cap)
-    # keeps a single switch to flip once the kernel supports it.
-    # TODO(softcap): once upstream aiter dense fwd+bwd supports it, thread through to
+    # softcap (explicit or detected) is blocked at the kernel layer on this build.
+    # Surveyed rather than assumed -- the state is asymmetric between fwd and bwd:
+    #   forward   CK ck_tile implements it (ops/fmha/block/variants.hpp,
+    #             LogitsSoftCapParams; tanh is the compile-time default, softsign
+    #             selectable via CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT) and
+    #             aiter's dense binding passes a literal `0.0, // logits_soft_cap`
+    #             (csrc/py_itfs_ck/mha_fwd_kernels.cu). Binding-only work.
+    #   backward  nothing implements it. CK's fmha_bwd_kernel.hpp has no soft cap at
+    #             all, nor do aiter's mha_bwd_kernels.cu / mha_varlen_bwd_kernels.cu;
+    #             dS needs the tanh derivative and that math is not written. aiter's
+    #             own varlen python fwd DOES take logits_soft_cap while
+    #             FlashAttnVarlenFunc.backward neither passes it nor returns a
+    #             gradient for it -- capped forward, uncapped gradients.
+    # So this cannot be unblocked by exposing one forward argument: doing that alone
+    # would train capped logits against uncapped gradients, which is precisely the
+    # silent-drop failure this layer exists to prevent. Both an explicit softcap and
+    # one detected from score_mod raise here; we never degrade to a path that ignores
+    # the cap, and we do not accept a forward-only cap either.
+    # TODO(softcap): once a trainable aiter fwd+bwd PAIR supports it, thread through to
     #   flash_attn_func(softcap=...): drop this guard and pass effective_softcap at the
-    #   flash_attn_func call below -- a one-line switch to enable.
+    #   flash_attn_func call below -- a one-line switch to enable. Enabling on a
+    #   forward-only kernel is NOT sufficient; check the backward before flipping.
     if effective_softcap > 0.0:
         raise NotImplementedError(
             "Turbo flex compat layer: the softcap interface is in place "
-            f"(cap~={effective_softcap:.4g}), but it is blocked by this build's aiter dense fwd/bwd "
-            "kernels, which lack a softcap parameter; it will take "
-            "effect once upstream kernels support it. To avoid silently dropping the cap and "
-            "producing wrong results, both an explicit softcap and a soft-cap detected from "
-            "score_mod raise here -- we never degrade to a path that ignores the cap."
+            f"(cap~={effective_softcap:.4g}), but no trainable aiter fwd+bwd pair on this build "
+            "implements it. The dense forward could expose it (CK has the tanh variant; aiter "
+            "hardcodes logits_soft_cap=0.0 in the binding), but no backward -- CK's fmha_bwd, "
+            "aiter's mha_bwd/mha_varlen_bwd, and the trainable triton backward kernels all lack "
+            "it, so gradients would be computed without the cap. To avoid silently dropping the "
+            "cap -- or, worse, capping the forward while leaving the backward uncapped -- both an "
+            "explicit softcap and a soft-cap detected from score_mod raise here."
         )
 
     # ---- fp8 gate --------------------------------------------------------------
@@ -696,9 +713,10 @@ def flex_attention(
         deterministic=deterministic,
         return_lse=return_lse,
         sink=sink,
-        # TODO(softcap): once upstream aiter dense fwd+bwd supports it, pass softcap=effective_softcap
-        #   here and delete the softcap guard above -- a one-line enable (effective_softcap is
-        #   currently always 0.0).
+        # TODO(softcap): once a trainable upstream aiter fwd+bwd PAIR supports it, pass
+        #   softcap=effective_softcap here and delete the softcap guard above -- a one-line
+        #   enable (effective_softcap is currently always 0.0). A forward-only kernel does
+        #   not qualify: see the survey in the guard above.
     )
 
     # ``_return_bshd`` (private, used by flex_attention_bshd) hands the backend's native
