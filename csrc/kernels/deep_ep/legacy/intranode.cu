@@ -59,13 +59,13 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         //  - `per_rank_buffer[rank][i, j]` means the number of tokens from rank i to rank j
         //  - `per_expert_buffer[rank][i, j]` means the number of tokens from rank i to local expert j
         int num_experts_per_rank = num_experts / kNumRanks;
-        // ROCm: plain stores -> st_na_global, every access to a peer's comm buffer
+        // ROCm: plain stores -> st_coherent_sys_global, every access to a peer's comm buffer
         // must carry `sc0 sc1` or a bypassing reader reads straight past it
         if (thread_id < kNumRanks) {
-            st_na_global(per_rank_buffer + rank * kNumRanks + thread_id, num_tokens_per_rank[thread_id]);
+            st_coherent_sys_global(per_rank_buffer + rank * kNumRanks + thread_id, num_tokens_per_rank[thread_id]);
             #pragma unroll
             for (int i = 0; i < num_experts_per_rank; ++i)
-                st_na_global(per_expert_buffer + rank * num_experts_per_rank + i, num_tokens_per_expert[thread_id * num_experts_per_rank + i]);
+                st_coherent_sys_global(per_expert_buffer + rank * num_experts_per_rank + i, num_tokens_per_expert[thread_id * num_experts_per_rank + i]);
         }
 
         // Wait for all ranks to be finished
@@ -77,11 +77,11 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         if (thread_id < kNumRanks) {
             #pragma unroll
             for (int i = 1; i < kNumRanks; ++i)
-                st_na_global(local_per_rank_buffer + i * kNumRanks + thread_id,
-                             ld_nc_global(local_per_rank_buffer + i * kNumRanks + thread_id) +
-                                 ld_nc_global(local_per_rank_buffer + (i - 1) * kNumRanks + thread_id));
+                st_coherent_sys_global(local_per_rank_buffer + i * kNumRanks + thread_id,
+                             ld_coherent_sys_global(local_per_rank_buffer + i * kNumRanks + thread_id) +
+                                 ld_coherent_sys_global(local_per_rank_buffer + (i - 1) * kNumRanks + thread_id));
             if (thread_id == rank)
-                *moe_recv_counter_mapped = ld_nc_global(local_per_rank_buffer + (kNumRanks - 1) * kNumRanks + rank);
+                *moe_recv_counter_mapped = ld_coherent_sys_global(local_per_rank_buffer + (kNumRanks - 1) * kNumRanks + rank);
         }
 
         // Sum per-experts counts and return to CPU
@@ -90,7 +90,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             int sum = 0;
             #pragma unroll
             for (int i = 0; i < kNumRanks; ++i)
-                sum += ld_nc_global(local_per_expert_buffer + i * num_experts_per_rank + thread_id);
+                sum += ld_coherent_sys_global(local_per_expert_buffer + i * num_experts_per_rank + thread_id);
             sum = (sum + expert_alignment - 1) / expert_alignment * expert_alignment;
             moe_recv_expert_counter_mapped[thread_id] = sum;
         }
@@ -100,12 +100,12 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         // Copy rank size prefix matrix to another tensor
         #pragma unroll
         for (int i = thread_id; i < kNumRanks * kNumRanks; i += num_threads)
-            rank_prefix_matrix_copy[i] = ld_nc_global(local_per_rank_buffer + i);
+            rank_prefix_matrix_copy[i] = ld_coherent_sys_global(local_per_rank_buffer + i);
 
         // Extra memset for later communication queue
         #pragma unroll
         for (int i = thread_id; i < num_memset_int; i += num_threads)
-            st_na_global(local_per_expert_buffer + i, 0);
+            st_coherent_sys_global(local_per_expert_buffer + i, 0);
 
         // Barrier
         barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
@@ -192,12 +192,12 @@ __global__ void cached_notify_dispatch(
     auto thread_id = static_cast<int>(threadIdx.x), num_threads = static_cast<int>(blockDim.x);
     auto ptr = static_cast<int*>(buffer_ptrs[rank]);
     #pragma unroll
-    // ROCm: plain stores -> st_na_global, peers read this queue with `sc0 sc1` loads
+    // ROCm: plain stores -> st_coherent_sys_global, peers read this queue with `sc0 sc1` loads
     for (int i = thread_id; i < kNumRanks * kNumRanks; i += num_threads)
-        st_na_global(ptr + i, rank_prefix_matrix[i]);
+        st_coherent_sys_global(ptr + i, rank_prefix_matrix[i]);
     #pragma unroll
     for (int i = thread_id; i < num_memset_int; i += num_threads)
-        st_na_global(ptr + kNumRanks * kNumRanks + i, 0);
+        st_coherent_sys_global(ptr + kNumRanks * kNumRanks + i, 0);
 
     // Barrier after cleaning
     barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
@@ -389,18 +389,18 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                     auto shifted_x = x + token_idx * hidden_int4;
                     // ROCm: unroll 5 -> 2 on wave64, 5 overshoots hidden_int4 for
                     // hidden <= 2048 and drops the whole vectorised loop
-                    // ROCm: st_na_global -> st_na_wave_global, wave-uniform base keeps the dwordx4
+                    // ROCm: plain store -> st_coherent_sys_x4, lane-contiguous keeps the dwordx4
 #if defined(__gfx942__) || defined(__gfx950__)
-                    UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_channel_x_buffers, shifted_x, __ldg, st_na_wave_global);
+                    UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_channel_x_buffers, shifted_x, __ldg, st_coherent_sys_x4);
 #else
-                    UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_channel_x_buffers, shifted_x, __ldg, st_na_wave_global);
+                    UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_channel_x_buffers, shifted_x, __ldg, st_coherent_sys_x4);
 #endif
 
                     // Copy source index
-                    // ROCm: plain store -> st_na_global, this and the metadata stores below
-                    // all write a peer's comm buffer
+                    // ROCm: plain store -> st_coherent_sys_global, this and the metadata stores
+                    // below all write a peer's comm buffer
                     if (elect_one_sync())
-                        st_na_global(channel_src_idx_buffers.buffer() + dst_slot_idx, static_cast<int>(token_idx));
+                        st_coherent_sys_global(channel_src_idx_buffers.buffer() + dst_slot_idx, static_cast<int>(token_idx));
 
                     // Copy `topk_idx` and `topk_weights` with transformed index
                     if (lane_id < num_topk) {
@@ -409,14 +409,14 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                             recv_expert_end = (responsible_rank + 1) * num_experts_per_rank;
                         auto idx_value = __ldg(topk_idx + token_idx * num_topk + lane_id);
                         idx_value = (idx_value >= recv_expert_begin and idx_value < recv_expert_end) ? idx_value - recv_expert_begin : -1;
-                        // ROCm: plain store -> st_na_global
-                        st_na_global(channel_topk_idx_buffers.buffer() + dst_slot_idx * num_topk + lane_id, idx_value);
+                        // ROCm: plain store -> st_coherent_sys_global
+                        st_coherent_sys_global(channel_topk_idx_buffers.buffer() + dst_slot_idx * num_topk + lane_id, idx_value);
 
                         // Top-k weights
                         auto weight_value = __ldg(topk_weights + token_idx * num_topk + lane_id);
                         weight_value = (idx_value >= 0) ? weight_value : 0.0f;
-                        // ROCm: plain store -> st_na_global
-                        st_na_global(channel_topk_weights_buffers.buffer() + dst_slot_idx * num_topk + lane_id, weight_value);
+                        // ROCm: plain store -> st_coherent_sys_global
+                        st_coherent_sys_global(channel_topk_weights_buffers.buffer() + dst_slot_idx * num_topk + lane_id, weight_value);
                     }
 
                     // Copy `x_scales`
@@ -424,8 +424,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                     // ROCm: 32 -> WARP_SIZE
                     for (int i = lane_id; i < num_scales; i += WARP_SIZE) {
                         auto offset = token_idx * scale_token_stride + i * scale_hidden_stride;
-                        // ROCm: plain store -> st_na_global
-                        st_na_global(channel_x_scales_buffers.buffer() + dst_slot_idx * num_scales + i, __ldg(x_scales + offset));
+                        // ROCm: plain store -> st_coherent_sys_global
+                        st_coherent_sys_global(channel_x_scales_buffers.buffer() + dst_slot_idx * num_scales + i, __ldg(x_scales + offset));
                     }
                 }
 
@@ -527,11 +527,14 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                 __syncwarp();
 #else
                 // ROCm: unroll 5 -> 2 on wave64, same stride problem as the sender above
-                // ROCm: *_global -> *_wave_global, wave-uniform base keeps the dwordx4
+                // ROCm: ld -> ld_coherent_sys_x4, the source is what a peer wrote here.
+                // The destination is our own `recv_x`, so it takes a plain store: no peer
+                // reads it and the launch boundary publishes it.
+                auto st_recv_x = [](int4* dst, const int4& value) { *dst = value; };
 #if defined(__gfx942__) || defined(__gfx950__)
-                UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_recv_x_int4, shifted_buffer_x_int4, ld_nc_wave_global, st_na_wave_global);
+                UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_recv_x_int4, shifted_buffer_x_int4, ld_coherent_sys_x4, st_recv_x);
 #else
-                UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_recv_x_int4, shifted_buffer_x_int4, ld_nc_wave_global, st_na_wave_global);
+                UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_recv_x_int4, shifted_buffer_x_int4, ld_coherent_sys_x4, st_recv_x);
 #endif
 #endif
             }
@@ -542,7 +545,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                  // ROCm: 32 -> WARP_SIZE
                  chunk_idx += WARP_SIZE * num_recv_warps_per_rank)
                 recv_src_idx[total_offset + chunk_idx - cached_channel_head_idx] =
-                    ld_nc_global(channel_src_idx_buffers.buffer() + chunk_idx % num_recv_buffer_tokens);
+                    ld_coherent_sys_global(channel_src_idx_buffers.buffer() + chunk_idx % num_recv_buffer_tokens);
 
             // Copy `topk_idx` and `topk_weights`
             #pragma unroll 4
@@ -552,8 +555,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                 int token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens;
                 auto recv_idx = static_cast<int64_t>(total_offset + chunk_idx) * num_topk + token_topk_idx;
                 auto buffer_idx = token_idx_in_buffer * num_topk + token_topk_idx;
-                recv_topk_idx[recv_idx] = ld_nc_global(channel_topk_idx_buffers.buffer() + buffer_idx);
-                recv_topk_weights[recv_idx] = ld_nc_global(channel_topk_weights_buffers.buffer() + buffer_idx);
+                recv_topk_idx[recv_idx] = ld_coherent_sys_global(channel_topk_idx_buffers.buffer() + buffer_idx);
+                recv_topk_weights[recv_idx] = ld_coherent_sys_global(channel_topk_weights_buffers.buffer() + buffer_idx);
             }
 
             // Copy `x_scales`
@@ -563,7 +566,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                 int chunk_idx = i / num_scales, scales_idx = i % num_scales;
                 int token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens;
                 recv_x_scales[static_cast<int64_t>(total_offset + chunk_idx) * num_scales + scales_idx] =
-                    ld_nc_global(channel_x_scales_buffers.buffer() + token_idx_in_buffer * num_scales + scales_idx);
+                    ld_coherent_sys_global(channel_x_scales_buffers.buffer() + token_idx_in_buffer * num_scales + scales_idx);
             }
 
             // Move queue
@@ -683,9 +686,9 @@ __global__ void cached_notify_combine(
         auto thread_id = static_cast<int>(threadIdx.x), num_threads = static_cast<int>(blockDim.x);
         auto ptr = static_cast<int*>(buffer_ptrs[rank]);
         #pragma unroll
-        // ROCm: plain store -> st_na_global, same reason as cached_notify_dispatch
+        // ROCm: plain store -> st_coherent_sys_global, same reason as cached_notify_dispatch
         for (int i = thread_id; i < num_memset_int; i += num_threads)
-            st_na_global(ptr + i, 0);
+            st_coherent_sys_global(ptr + i, 0);
 
         // Barrier after cleaning
         barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
@@ -877,22 +880,23 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                 auto shifted_x = x_int4 + (token_idx + i) * hidden_int4;
                 // ROCm: unroll 4 -> 2 on wave64, 4 leaves hidden <= 2048 with a
                 // single un-pipelined pass
-                // ROCm: *_global -> *_wave_global, wave-uniform base keeps the dwordx4
+                // ROCm: ld -> __ldg like the dispatch sender, the source is our own
+                // `x`. Only the destination is a peer's buffer, and it keeps `sc0 sc1`.
 #if defined(__gfx942__) || defined(__gfx950__)
-                UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_x_buffers, shifted_x, ld_nc_wave_global, st_na_wave_global);
+                UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_x_buffers, shifted_x, __ldg, st_coherent_sys_x4);
 #else
-                UNROLLED_WARP_COPY(4, lane_id, hidden_int4, shifted_x_buffers, shifted_x, ld_nc_wave_global, st_na_wave_global);
+                UNROLLED_WARP_COPY(4, lane_id, hidden_int4, shifted_x_buffers, shifted_x, __ldg, st_coherent_sys_x4);
 #endif
 
                 // Send source index
-                // ROCm: plain store -> st_na_global, peer buffer, see the dispatch sender
+                // ROCm: plain store -> st_coherent_sys_global, peer buffer, see the dispatch sender
                 if (elect_one_sync())
-                    st_na_global(channel_src_idx_buffers.buffer() + dst_slot_idx, __ldg(src_idx + token_idx + i));
+                    st_coherent_sys_global(channel_src_idx_buffers.buffer() + dst_slot_idx, __ldg(src_idx + token_idx + i));
 
                 // Send `topk_weights`
-                // ROCm: plain store -> st_na_global
+                // ROCm: plain store -> st_coherent_sys_global
                 if (num_topk > 0 and lane_id < num_topk)
-                    st_na_global(channel_topk_weights_buffers.buffer() + dst_slot_idx * num_topk + lane_id,
+                    st_coherent_sys_global(channel_topk_weights_buffers.buffer() + dst_slot_idx * num_topk + lane_id,
                                  __ldg(topk_weights + (token_idx + i) * num_topk + lane_id));
             }
             token_idx += num_round_tokens;
@@ -994,7 +998,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                 // Read expected head
                 int expected_head = -1;
                 if (lane_id < kNumRanks)
-                    expected_head = ld_nc_global(send_head + token_idx * kNumRanks + lane_id);
+                    // ROCm: ld -> __ldg, `send_head` is our own tensor from dispatch
+                    expected_head = __ldg(send_head + token_idx * kNumRanks + lane_id);
 
                 auto start_time = clock64();
                 // ROCm: __any_sync(0xffffffff, ..) -> __any, the whole wave participates
@@ -1043,9 +1048,10 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
 
                     // Read buffers
                     int4 recv_value_int4[kNumRanks];
+                    // ROCm: ld -> ld_coherent_sys_x4, a peer wrote this and the lanes are contiguous
                     #pragma unroll
                     for (int j = 0; j < num_topk_ranks; ++j)
-                        recv_value_int4[j] = ld_nc_global(channel_x_buffers[topk_ranks[j]].buffer() + slot_indices[j] * hidden_int4 + i);
+                        recv_value_int4[j] = ld_coherent_sys_x4(channel_x_buffers[topk_ranks[j]].buffer() + slot_indices[j] * hidden_int4 + i);
 
                     // Reduce bias
                     float values[kDtypePerInt4];
@@ -1105,7 +1111,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                     float value = 0;
                     #pragma unroll
                     for (int i = 0; i < num_topk_ranks; ++i)
-                        value += ld_nc_global(channel_topk_weights_buffers[topk_ranks[i]].buffer() + slot_indices[i] * num_topk + lane_id);
+                        value += ld_coherent_sys_global(channel_topk_weights_buffers[topk_ranks[i]].buffer() + slot_indices[i] * num_topk + lane_id);
                     recv_topk_weights[token_idx * num_topk + lane_id] = value;
                 }
 

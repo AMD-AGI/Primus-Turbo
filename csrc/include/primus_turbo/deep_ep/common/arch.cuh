@@ -96,18 +96,22 @@ __device__ __forceinline__ void sync_threads_global() {
 #if defined(__GFX12__) || defined(__GFX11__)
 #error "deep_ep: CPol encoding for GFX11/GFX12 is not implemented yet"
 #endif
+// The value an access needs to be system-scope, i.e. `sc0 sc1` in a disassembly.
 // ROCm: FlyDSL's 19 minus `nt`, the peer reads the buffer back immediately
-static constexpr int kCPolSys = 1 | 16;  // sc0|sc1 -- visible to peers
+static constexpr int kSystemScopeCachePolicy = 1 | 16;
 
 // ROCm: new, a buffer op is how CPol reaches the instruction at full width.
-// Precondition: the base must be wave-uniform and the per-lane delta non-negative
-// and under 4 GiB. Divergent bases belong on the atomic flavour in legacy/utils.cuh.
+// Precondition: the base must be wave-uniform and the per-lane delta non-negative.
+// Divergent bases belong on the atomic flavour in legacy/utils.cuh. `num_records`
+// is the hardware bound on that delta: it turns a precondition violation into a
+// zero read / dropped store instead of an access 4 GiB away from the buffer.
 
-// ROCm: buffer resource word 3 must be gfx9 DATA_FORMAT=32, 0 is silently dropped
+// ROCm: buffer resource word 3, DATA_FORMAT=7 | NUM_FORMAT=4 like LLVM's
+// makeBufferRsrc(). Measured: word 3 of 0 makes every load return 0.
 #if defined(__GFX12__) || defined(__GFX11__)
 #error "deep_ep: buffer resource word 3 for GFX11/GFX12 is not implemented yet"
 #endif
-static constexpr int kBufferRsrcWord3 = 0x00020000;
+static constexpr int kBufferRsrcWord3 = (7 << 12) | (4 << 15);
 template <int kBytes> struct BufferChunk;
 template <> struct BufferChunk<16> { using type = int __attribute__((ext_vector_type(4))); };
 template <> struct BufferChunk<8>  { using type = int __attribute__((ext_vector_type(2))); };
@@ -115,47 +119,51 @@ template <> struct BufferChunk<4>  { using type = int; };
 template <> struct BufferChunk<2>  { using type = short; };
 template <> struct BufferChunk<1>  { using type = signed char; };
 
-__device__ __forceinline__ auto make_wave_rsrc(const void* ptr, uint32_t& voffset) {
+// `num_records` counts bytes from the base, stride 0 leaves it unswizzled
+__device__ __forceinline__ auto make_wave_rsrc(const void* ptr, uint32_t num_records,
+                                               uint32_t& voffset) {
     auto     addr = reinterpret_cast<uintptr_t>(ptr);
     uint32_t lo   = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(addr));
     uint32_t hi   = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(addr >> 32));
     auto     base = (static_cast<uint64_t>(hi) << 32) | lo;
     voffset       = static_cast<uint32_t>(addr - base);
     return __builtin_amdgcn_make_buffer_rsrc(
-        reinterpret_cast<void*>(base), static_cast<int16_t>(0), 0xffffffffu, kBufferRsrcWord3);
+        reinterpret_cast<void*>(base), static_cast<int16_t>(0), num_records, kBufferRsrcWord3);
 }
 
-template <int kCPol, int kBytes>
-__device__ __forceinline__ typename BufferChunk<kBytes>::type buffer_ld_chunk(const void* ptr) {
+template <int kCachePolicy, int kBytes>
+__device__ __forceinline__ typename BufferChunk<kBytes>::type buffer_ld_chunk(const void* ptr,
+                                                                              uint32_t num_records) {
     uint32_t voffset;
-    auto     rsrc = make_wave_rsrc(ptr, voffset);
+    auto     rsrc = make_wave_rsrc(ptr, num_records, voffset);
     if constexpr (kBytes == 16)
-        return __builtin_amdgcn_raw_buffer_load_b128(rsrc, voffset, 0, kCPol);
+        return __builtin_amdgcn_raw_buffer_load_b128(rsrc, voffset, 0, kCachePolicy);
     else if constexpr (kBytes == 8)
-        return __builtin_amdgcn_raw_buffer_load_b64(rsrc, voffset, 0, kCPol);
+        return __builtin_amdgcn_raw_buffer_load_b64(rsrc, voffset, 0, kCachePolicy);
     else if constexpr (kBytes == 4)
-        return __builtin_amdgcn_raw_buffer_load_b32(rsrc, voffset, 0, kCPol);
+        return __builtin_amdgcn_raw_buffer_load_b32(rsrc, voffset, 0, kCachePolicy);
     else if constexpr (kBytes == 2)
-        return __builtin_amdgcn_raw_buffer_load_b16(rsrc, voffset, 0, kCPol);
+        return __builtin_amdgcn_raw_buffer_load_b16(rsrc, voffset, 0, kCachePolicy);
     else
-        return __builtin_amdgcn_raw_buffer_load_b8(rsrc, voffset, 0, kCPol);
+        return __builtin_amdgcn_raw_buffer_load_b8(rsrc, voffset, 0, kCachePolicy);
 }
 
-template <int kCPol, int kBytes>
+template <int kCachePolicy, int kBytes>
 __device__ __forceinline__ void buffer_st_chunk(void* ptr,
-                                                typename BufferChunk<kBytes>::type val) {
+                                                typename BufferChunk<kBytes>::type val,
+                                                uint32_t                           num_records) {
     uint32_t voffset;
-    auto     rsrc = make_wave_rsrc(ptr, voffset);
+    auto     rsrc = make_wave_rsrc(ptr, num_records, voffset);
     if constexpr (kBytes == 16)
-        __builtin_amdgcn_raw_buffer_store_b128(val, rsrc, voffset, 0, kCPol);
+        __builtin_amdgcn_raw_buffer_store_b128(val, rsrc, voffset, 0, kCachePolicy);
     else if constexpr (kBytes == 8)
-        __builtin_amdgcn_raw_buffer_store_b64(val, rsrc, voffset, 0, kCPol);
+        __builtin_amdgcn_raw_buffer_store_b64(val, rsrc, voffset, 0, kCachePolicy);
     else if constexpr (kBytes == 4)
-        __builtin_amdgcn_raw_buffer_store_b32(val, rsrc, voffset, 0, kCPol);
+        __builtin_amdgcn_raw_buffer_store_b32(val, rsrc, voffset, 0, kCachePolicy);
     else if constexpr (kBytes == 2)
-        __builtin_amdgcn_raw_buffer_store_b16(val, rsrc, voffset, 0, kCPol);
+        __builtin_amdgcn_raw_buffer_store_b16(val, rsrc, voffset, 0, kCachePolicy);
     else
-        __builtin_amdgcn_raw_buffer_store_b8(val, rsrc, voffset, 0, kCPol);
+        __builtin_amdgcn_raw_buffer_store_b8(val, rsrc, voffset, 0, kCachePolicy);
 }
 
 // ---------------------------------------------------------------------------

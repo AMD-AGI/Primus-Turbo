@@ -85,8 +85,9 @@ __device__ __forceinline__ void memory_fence_cta() {
 }
 
 // ROCm: new, the `coherent` family carries cache modifiers and no ordering: `sc1` for
-// GPU-wide visibility, `sc0 sc1` for peers. The `*_wave_global` flavour keeps the full
-// dwordx4 but needs a wave-uniform base, the plain one takes any pointer at 8 bytes.
+// GPU-wide visibility, `sc0 sc1` for peers. The `*_x4` flavour keeps the full dwordx4
+// but the wave's lanes must cover one element each, ascending from a shared base; the
+// plain one takes any pointer at 8 bytes.
 template <int kMaxBytes, typename dtype_t>
 struct CoherentChunk {
     static constexpr int kBytes = (kMaxBytes >= 16 and alignof(dtype_t) >= 16) ? 16
@@ -142,8 +143,13 @@ __device__ __forceinline__ void st_coherent_impl(const dtype_t* ptr, const dtype
         __hip_atomic_store(dst + i, src[i], __ATOMIC_RELAXED, kScope);
 }
 
-template <int kCPol, typename dtype_t>
-__device__ __forceinline__ dtype_t ld_coherent_wave_impl(const dtype_t* ptr) {
+// The wave reads one `dtype_t` per lane at consecutive addresses (UNROLLED_WARP_COPY),
+// so the furthest lane sits (WARP_SIZE - 1) elements past the base
+template <typename dtype_t>
+static constexpr uint32_t kWaveSpanBytes = WARP_SIZE * sizeof(dtype_t);
+
+template <int kCachePolicy, typename dtype_t>
+__device__ __forceinline__ dtype_t ld_coherent_x4_impl(const dtype_t* ptr) {
     constexpr int kBytes = CoherentChunk<16, dtype_t>::kBytes;
     using chunk_t        = typename BufferChunk<kBytes>::type;
     dtype_t ret;
@@ -151,19 +157,19 @@ __device__ __forceinline__ dtype_t ld_coherent_wave_impl(const dtype_t* ptr) {
     auto    dst = reinterpret_cast<chunk_t*>(&ret);
 #pragma unroll
     for (int i = 0; i < CoherentChunk<16, dtype_t>::kCount; ++i)
-        dst[i] = buffer_ld_chunk<kCPol, kBytes>(src + i);
+        dst[i] = buffer_ld_chunk<kCachePolicy, kBytes>(src + i, kWaveSpanBytes<dtype_t>);
     return ret;
 }
 
-template <int kCPol, typename dtype_t>
-__device__ __forceinline__ void st_coherent_wave_impl(const dtype_t* ptr, const dtype_t& val) {
+template <int kCachePolicy, typename dtype_t>
+__device__ __forceinline__ void st_coherent_x4_impl(const dtype_t* ptr, const dtype_t& val) {
     constexpr int kBytes = CoherentChunk<16, dtype_t>::kBytes;
     using chunk_t        = typename BufferChunk<kBytes>::type;
     auto src = reinterpret_cast<const chunk_t*>(&val);
     auto dst = reinterpret_cast<chunk_t*>(const_cast<dtype_t*>(ptr));
 #pragma unroll
     for (int i = 0; i < CoherentChunk<16, dtype_t>::kCount; ++i)
-        buffer_st_chunk<kCPol, kBytes>(dst + i, src[i]);
+        buffer_st_chunk<kCachePolicy, kBytes>(dst + i, src[i], kWaveSpanBytes<dtype_t>);
 }
 
 template <typename dtype_t>
@@ -187,13 +193,13 @@ __device__ __forceinline__ void st_coherent_sys_global(const dtype_t* ptr, const
 }
 
 template <typename dtype_t>
-__device__ __forceinline__ dtype_t ld_coherent_sys_wave_global(const dtype_t* ptr) {
-    return ld_coherent_wave_impl<kCPolSys>(ptr);
+__device__ __forceinline__ dtype_t ld_coherent_sys_x4(const dtype_t* ptr) {
+    return ld_coherent_x4_impl<kSystemScopeCachePolicy>(ptr);
 }
 
 template <typename dtype_t>
-__device__ __forceinline__ void st_coherent_sys_wave_global(const dtype_t* ptr, const dtype_t& val) {
-    st_coherent_wave_impl<kCPolSys>(ptr, val);
+__device__ __forceinline__ void st_coherent_sys_x4(const dtype_t* ptr, const dtype_t& val) {
+    st_coherent_x4_impl<kSystemScopeCachePolicy>(ptr, val);
 }
 
 // ROCm: PTX ld/st with ordering -> __hip_atomic_*, scope sys/gpu/cta -> SYSTEM/AGENT/WORKGROUP
@@ -201,33 +207,26 @@ __device__ __forceinline__ void st_relaxed_sys_global(const int* ptr, int val) {
     __hip_atomic_store(const_cast<int*>(ptr), val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-// ROCm: `st.release.sys` -> a system release fence, then the coherent store.
-// The fence carries the ordering, `sc0 sc1` carries the visibility.
+// ROCm: `st.release.sys` -> a release store at system scope
 template <typename dtype_t>
 __device__ __forceinline__ void st_release_sys_global(const dtype_t* ptr, dtype_t val) {
-    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
-    st_coherent_sys_global(ptr, val);
+    __hip_atomic_store(const_cast<dtype_t*>(ptr), val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-// ROCm: `st.release.cta` -> workgroup release fence + relaxed store
+// ROCm: `st.release.cta` -> a release store at workgroup scope
 __device__ __forceinline__ void st_release_cta(const int* ptr, int val) {
-    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
-    __hip_atomic_store(const_cast<int*>(ptr), val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+    __hip_atomic_store(const_cast<int*>(ptr), val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_WORKGROUP);
 }
 
-// ROCm: `ld.acquire.sys` -> the coherent load, then a system acquire fence
+// ROCm: `ld.acquire.sys` -> an acquire load at system scope
 template <typename dtype_t>
 __device__ __forceinline__ dtype_t ld_acquire_sys_global(const dtype_t* ptr) {
-    dtype_t ret = ld_coherent_sys_global(ptr);
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
-    return ret;
+    return __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-// ROCm: `ld.acquire.gpu` -> mirror of ld_acquire_sys_global at agent scope
+// ROCm: `ld.acquire.gpu` -> the same at agent scope
 __device__ __forceinline__ int ld_acquire_global(const int* ptr) {
-    int ret = ld_coherent_global(ptr);
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
-    return ret;
+    return __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 // ROCm: `atom.release.*` -> the RMW's own release ordering
@@ -278,16 +277,17 @@ __device__ __forceinline__ int64_t ld_volatile_global(const volatile uint64_t* p
     return static_cast<int64_t>(__hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM));
 }
 
-// ROCm: `ld.global.nc.*` -> ld_coherent_sys_global, every caller reads a peer's write
+// ROCm: `ld.global.nc` / `st.global.L1::no_allocate` are cache hints on a plain access,
+// which is the opposite of what a peer's buffer needs here -- no ROCm access carries both.
+// The upstream names stay as the API surface but have no body: every caller names what it
+// wants instead, the `coherent` family for a peer and `__ldg` / a plain store for our own
+// memory. Instantiating either one is the error.
+template <typename dtype_t>
+struct kHasNoRocmMapping : std::false_type {};
+
 template <typename dtype_t>
 __device__ __forceinline__ dtype_t ld_nc_global(const dtype_t* ptr) {
-    return ld_coherent_sys_global(ptr);
-}
-
-// ROCm: new, wave-uniform-base variant of ld_nc_global that keeps the dwordx4
-template <typename dtype_t>
-__device__ __forceinline__ dtype_t ld_nc_wave_global(const dtype_t* ptr) {
-    return ld_coherent_sys_wave_global(ptr);
+    EP_STATIC_ASSERT(kHasNoRocmMapping<dtype_t>::value, "ld_nc_global: pick ld_coherent_sys_global/_x4 for a peer's buffer, __ldg for our own");
 }
 
 // ROCm: st.relaxed.gpu.global -> relaxed agent-scope store
@@ -312,32 +312,23 @@ __device__ __forceinline__ void st_na_relaxed(const int4* ptr, int4 val) {
     *const_cast<int4*>(ptr) = val;
 }
 
-// ROCm: `st.release.gpu.L1::no_allocate` -> agent release fence + coherent store
+// ROCm: `st.release.gpu.L1::no_allocate` -> a release store at agent scope
 __device__ __forceinline__ void st_na_release(const int* ptr, int val) {
-    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
-    st_coherent_global(ptr, val);
+    __hip_atomic_store(const_cast<int*>(ptr), val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 __device__ __forceinline__ void st_na_release(const uint32_t* ptr, uint32_t val) {
-    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
-    st_coherent_global(ptr, val);
+    __hip_atomic_store(const_cast<uint32_t*>(ptr), val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
 }
 
 __device__ __forceinline__ void st_na_release(const uint64_t* ptr, uint64_t val) {
-    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
-    st_coherent_global(ptr, val);
+    __hip_atomic_store(const_cast<uint64_t*>(ptr), val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
 }
 
-// ROCm: `st.global.L1::no_allocate` -> st_coherent_sys_global, most callers write a peer's buffer
+// ROCm: the store half of the pair above, same reasoning, same empty body
 template <typename dtype_t>
 __device__ __forceinline__ void st_na_global(const dtype_t* ptr, const dtype_t& value) {
-    st_coherent_sys_global(ptr, value);
-}
-
-// ROCm: new, wave-uniform-base variant of st_na_global
-template <typename dtype_t>
-__device__ __forceinline__ void st_na_wave_global(const dtype_t* ptr, const dtype_t& value) {
-    st_coherent_sys_wave_global(ptr, value);
+    EP_STATIC_ASSERT(kHasNoRocmMapping<dtype_t>::value, "st_na_global: pick st_coherent_sys_global/_x4 for a peer's buffer, a plain store for our own");
 }
 
 // ROCm: lg2.approx/ex2.approx -> the v_log_f32/v_exp_f32 builtins
