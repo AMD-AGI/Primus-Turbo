@@ -273,6 +273,7 @@ def build_flash_attn_bwd_odo_module(
     bat_all=None,
     # The dQ image is batch-outer while O is SBHD, so a sub-range addresses it as slabs.
     img_slab=False,
+    img_sbhd=False,  # the image IS dQ, in O's own layout, so a sub-range needs no slab remap
 ):
     """Identity-delta ("odo") kernel: DELTA[b,hq,s] = -sum_d O[b,s,hq,d]*dO[b,s,hq,d].
 
@@ -326,7 +327,9 @@ def build_flash_attn_bwd_odo_module(
     BAT_LO = int(bat_lo)
     IMG_SLAB = bool(img_slab)
     assert bat_all is None or (sbhd and not token_major), "odo batch sub-range is SBHD-only"
-    assert not (FILL_IMG and bat_all is not None and not IMG_SLAB), "sub-range fill needs img_slab"
+    assert not (FILL_IMG and bat_all is not None and not IMG_SLAB and not img_sbhd), (
+        "sub-range fill needs img_slab"
+    )
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
     def flash_attn_bwd_odo_kernel(
@@ -1320,6 +1323,7 @@ def build_flash_attn_bwd_dkdv_module(
     # wsq_a16: add dQ into a band-less bf16 image with atomics instead of split-K partials;
     # the caller owes the zeroing and the un-permute (see _DQ_A16, FILL_IMG).
     wsq_a16=False,
+    a16_native=False,  # a16 dQ emitted straight into dQ's own SBHD layout, D64 only (see _g3_nat)
     # band_span: >0 = this launch owns ONE GROUP of that many kv bands (see _band_span_for).
     # K/V/DK/DV still span the whole kv axis; the group's first kv row arrives as a device
     # scalar in the CuSeqKv slot, and seq_len_k is the group's own extent, so the grid, the
@@ -1439,6 +1443,10 @@ def build_flash_attn_bwd_dkdv_module(
     WSQ_PAIR = int(wsq_pair)
     assert not WSQ_PAIR or (not WSQ_RING and window_left < 0 and WSQ_PAIR % 2 == 0)
     WSQ_A16 = bool(wsq_a16)
+    A16_NATIVE = bool(a16_native)
+    assert not A16_NATIVE or (WSQ_A16 and head_dim == 64 and sbhd and not varlen), (
+        "native dQ is a16 D64 SBHD only"
+    )
     # A band group only shifts where this launch's kv rows sit; every other assumption of the
     # body has to still hold, so it rides the plain full-causal path only -- square SBHD, or
     # ragged (whose bands are per segment).
@@ -2058,14 +2066,14 @@ def build_flash_attn_bwd_dkdv_module(
             mask = (row_idx & fx.Index(7)) << fx.Index(4)
             return col_idx ^ mask
 
-        def _kv_lds_idx(base, nt, ks):
+        def _kv_lds_idx(base, nt, ks, col=None):
             """Owned-K/V LDS slot of B[k=D=ks*32+kg*8][n=kv=nt*16+lane16], one v8 per lane.
 
-            Same [row][col] Q/dO tile layout as the Q/dO DMA, so writer and reader share
-            this one address and the fragment round-trips bit-exactly.
+            Same [row][col] Q/dO tile layout as the Q/dO DMA, so the fragment round-trips
+            bit-exactly; ``col`` overrides the lane's D column for the native-dQ K copy.
             """
             _r = wave_id * ROWS_PER_WAVE_KV + fx.Index(nt * N_TILE) + lane16
-            _c = fx.Index(ks * K_STEP_QK) + kg * fx.Index(MFMA_LANE_K)
+            _c = fx.Index(ks * K_STEP_QK) + kg * fx.Index(MFMA_LANE_K) if col is None else col
             return fx.Index(base) + _pblk(_r) * fx.Index(PBLK) + _swizzle(_r, _c)
 
         def _coop_load(src_ptr, base, tile_start, q_head):
@@ -2182,16 +2190,20 @@ def build_flash_attn_bwd_dkdv_module(
         )
         if const_expr(WSQ_A16):
             _wsq16_slice = seq_len_q_v * fx.Index(NUM_HEADS_Q * HEAD_DIM * 2)
-            wsq16_rsrc = buffer_ops.create_buffer_resource(
-                WSQ,
-                max_size=False,
-                num_records_bytes=_raw(_wsq16_slice),
-                base_byte_offset=_raw(
-                    (q_tok_base * fx.Index(NUM_HEADS_Q * HEAD_DIM * 2))
-                    if const_expr(varlen)
-                    else (batch_idx * _wsq16_slice)
-                ),
-            )
+            if const_expr(A16_NATIVE):
+                # WSQ *is* dQ: its SBHD rows span every batch, so the batch is an address term.
+                wsq16_rsrc = buffer_ops.create_buffer_resource(WSQ, max_size=True)
+            else:
+                wsq16_rsrc = buffer_ops.create_buffer_resource(
+                    WSQ,
+                    max_size=False,
+                    num_records_bytes=_raw(_wsq16_slice),
+                    base_byte_offset=_raw(
+                        (q_tok_base * fx.Index(NUM_HEADS_Q * HEAD_DIM * 2))
+                        if const_expr(varlen)
+                        else (batch_idx * _wsq16_slice)
+                    ),
+                )
         _lse_per_batch = seq_len_q_v * fx.Index(NUM_HEADS_Q)
         _lse_nrec_bytes = _raw(_lse_per_batch * fx.Index(4))
         if const_expr(varlen):
@@ -2360,10 +2372,34 @@ def build_flash_attn_bwd_dkdv_module(
         # operands off the register file for the whole kernel, avoiding the spill
         # cliff. K goes in ALREADY PRESCALED, so GEMM1a reads it directly; that leaves
         # the dQ partial scaled by sm*log2e, which `_reduce_dq_partials` divides out.
+        if const_expr(A16_NATIVE):
+            assert K_REG, "native dQ folds 1/log2e into GEMM3's LDS K copy, which needs K_REG"
+            _g3ks_v8 = Vec.filled(MFMA_LANE_K, 1.0 / _LOG2E, fx.Float32)
         for h in range_constexpr(KV_HALVES):
             _kb_h, _vb_h = G3K_BASE + h * BKV_H * HEAD_DIM, G3V_BASE + h * BKV_H * HEAD_DIM
             for nt in range_constexpr(NT):
                 for ks in range_constexpr(K_STEPS_QK):
+                    if const_expr(A16_NATIVE):
+                        # Native dQ runs GEMM3's n index d EVEN-then-ODD, so the v8 splits.
+                        _kv8 = Vec(
+                            (Vec(k_b_packs[h][nt][ks]).to(fx.Float32) * _g3ks_v8).to(elem_dtype).ir_value()
+                        )
+                        for hf in range_constexpr(2):
+                            Vec(_kv8.shuffle(_kv8, [hf, hf + 2, hf + 4, hf + 6]).ir_value()).store(
+                                lds,
+                                [
+                                    _kv_lds_idx(
+                                        _kb_h,
+                                        nt,
+                                        ks,
+                                        fx.Index(ks * K_STEP_QK + hf * D_TILE)
+                                        + kg * fx.Index(MFMA_LANE_K // 2),
+                                    )
+                                ],
+                            )
+                        if const_expr(V_LDS):
+                            Vec(v_b_packs[h][nt][ks]).store(lds, [_kv_lds_idx(_vb_h, nt, ks)])
+                        continue
                     Vec(k_b_packs[h][nt][ks]).store(lds, [_kv_lds_idx(_kb_h, nt, ks)])
                     if const_expr(V_LDS):
                         Vec(v_b_packs[h][nt][ks]).store(lds, [_kv_lds_idx(_vb_h, nt, ks)])
@@ -2785,6 +2821,37 @@ def build_flash_attn_bwd_dkdv_module(
                         0,
                     )
 
+            def _g3_nat(_tv, i, j):
+                """Add this emission's 16 B into dQ at its own native SBHD address.
+
+                C is [m=q][n=d] and SBHD puts consecutive q a whole B*Hq*D apart, so the
+                dword index is a uniform soffset and every lane term folds into a voffset.
+                """
+                _t = _g3q0 + fx.Index(j * G3_SPL_STRIDE)
+                _row = (
+                    q_start
+                    + ((_t >> fx.Index(1)) << fx.Index(5))
+                    + ((_t & fx.Index(1)) << fx.Index(3))
+                    + ((kg & fx.Index(1)) << fx.Index(4))
+                    + ((kg >> fx.Index(1)) << fx.Index(2))
+                )
+                _e0 = (
+                    ((_row * fx.Index(batch_size) + batch_idx) * fx.Index(NUM_HEADS_Q) + _g3qh)
+                    * fx.Index(HEAD_DIM)
+                    + ((_g3d0 + fx.Index(i)) >> fx.Index(1)) * fx.Index(32)
+                    + lane16 * fx.Index(2)
+                )
+                _adr = ArithValue(_raw(_e0 * fx.Index(2))).index_cast(fx.Int32.ir_type)
+                _rstep = batch_size * NUM_HEADS_Q * HEAD_DIM * 2
+                for _w in range_constexpr(4):
+                    rocdl.raw_ptr_buffer_atomic_fadd(
+                        _tv.shuffle(_tv, [_w]).bitcast(elem_dtype).ir_value(),
+                        wsq16_rsrc,
+                        _adr,
+                        _rstep * _w,
+                        0,
+                    )
+
             for _gi in range_constexpr(len(_dgs)):
                 _dg = _dgs[_gi]
                 _g3 = [[c_zero_v4f32 for _ in _qs] for _ in range_constexpr(len(_dg))]
@@ -2795,7 +2862,11 @@ def build_flash_attn_bwd_dkdv_module(
                         _ring[_kk % _gd] = _g3_frags(_kk + _gd, _dg)
                     for i in range_constexpr(len(_dg)):
                         for jj in range_constexpr(len(_qs)):
-                            _g3[i][jj] = mfma_dq(_g3k[i], _g3s[jj], _g3[i][jj])
+                            if const_expr(A16_NATIVE):
+                                # Same atom/shape/accumulation, A and B swapped: C is [m=q][n=d].
+                                _g3[i][jj] = mfma_dq(_g3s[jj], _g3k[i], _g3[i][jj])
+                            else:
+                                _g3[i][jj] = mfma_dq(_g3k[i], _g3s[jj], _g3[i][jj])
                 if const_expr(drain is not None and _gi == 0):
                     drain()
                 for i2 in range_constexpr(len(_dg) // 2):
@@ -2803,6 +2874,19 @@ def build_flash_attn_bwd_dkdv_module(
                     for jj in range_constexpr(len(_qs)):
                         j = _qs[jj]
                         _gd0 = _dg[i]
+                        if const_expr(A16_NATIVE):
+                            # The pair holds the even and the odd d of one q row's 32-d group.
+                            _ev, _od = Vec(_g3[i][jj]), Vec(_g3[i + 1][jj])
+                            _tv = Vec(
+                                bf16_trunc_pack_v8(
+                                    [
+                                        fx.Float32((_ev if w % 2 == 0 else _od)[w // 2])
+                                        for w in range_constexpr(8)
+                                    ]
+                                )
+                            ).bitcast(fx.Int32)
+                            _g3_nat(_tv, _gd0, j)
+                            continue
                         _g3p = bf16_trunc_scored_v4(_g3[i][jj]).shuffle(
                             bf16_trunc_scored_v4(_g3[i + 1][jj]), [0, 1, 2, 3]
                         )
@@ -4094,7 +4178,7 @@ _A16_Q_SPLIT_G8 = 4
 _A16_OVERLAP = 2
 _A16_CHUNK_WGS = 512
 _A16_MIN_BAT = 4
-_A16_MAX_CHUNKS = 4
+_A16_MAX_CHUNKS = 2
 _A16_EVENTS: dict = {}
 
 
@@ -4834,6 +4918,7 @@ def _get_bwd(
     )
     launchers = _BWD_CACHE.get(key)
     if launchers is None:
+        _nat = a16 and D == 64
         common = dict(
             num_heads=Hq,
             head_dim=D,
@@ -4913,6 +4998,7 @@ def _get_bwd(
             g1_ks_outer=None,
             agpr=_DKDV_AGPR,
             wsq_a16=a16,
+            a16_native=_nat,
             **common,
         )
         dkdv_l = build_flash_attn_bwd_dkdv_module(**dkdv_kw)
@@ -4958,7 +5044,8 @@ def _get_bwd(
                     q_split=q_split if sbhd else 1,
                     bat_lo=bat_lo,
                     bat_all=batch_size,
-                    img_slab=True,
+                    img_slab=not _nat,
+                    img_sbhd=_nat,
                     **odo_kw,
                 )
                 _odo_bats[bat_lo] = sub
@@ -5375,7 +5462,8 @@ def flydsl_varlen_backward(
     )
     # The odo pass is what zeroes the image, so the image has to exist before it.
     dq = torch.empty_like(q)
-    img = _a16_image(B, Sq, Hq, D, q.device, q.dtype) if a16 else None
+    a16_nat = a16 and D == 64  # dQ ITSELF is the image, so no separate image and no un-permute
+    img = (dq.view(-1) if a16_nat else _a16_image(B, Sq, Hq, D, q.device, q.dtype)) if a16 else None
     dof16 = dout.to(q.dtype).reshape(-1)
     if not pipe and not a16:
         odo_l(o16, dof16, delta.reshape(-1), B, Sq, st, img=img)
@@ -5426,8 +5514,12 @@ def flydsl_varlen_backward(
             for _body in _bodies:
                 _body(*_bufs, _per, Sq, Skv, 0, st)
             img.zero_()
-        _unp = lambda strm, lo, n: _unpermute_dq_a16(
-            img, dq, B, Sq, Hq, D, 1.0 / _LOG2E, strm, sbhd=sbhd, bat_lo=lo, n_bat=n
+        _unp = (
+            (lambda strm, lo, n: None)
+            if a16_nat
+            else lambda strm, lo, n: _unpermute_dq_a16(
+                img, dq, B, Sq, Hq, D, 1.0 / _LOG2E, strm, sbhd=sbhd, bat_lo=lo, n_bat=n
+            )
         )
         if _nbc == 1 or not _A16_OVERLAP:
             odo_l(o16, dof16, df, B, Sq, st, img=img)
