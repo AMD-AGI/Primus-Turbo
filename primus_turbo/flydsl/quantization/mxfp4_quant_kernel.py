@@ -25,8 +25,6 @@ Numerics reproduce ``csrc/kernels/quantization/quantization_mxfp4.cu`` exactly:
     groups), bit-identical to the C++ distributed ds_swizzle version.
 """
 
-import os
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, buffer_ops, math, range_constexpr, rocdl
@@ -37,68 +35,6 @@ from flydsl.expr.utils.arith import _to_raw as _raw
 from primus_turbo.flydsl.utils.gemm_helper import xcd_remap_pid
 
 _OOB = 0x7FFFFFFF  # word offset past any SRD -> buffer_load returns 0 / buffer_store dropped
-
-# ---- fused NT B-scale preshuffle (packed layout written in place) -------------------
-# The E8M0 this kernel emits for a weight operand is consumed by EXACTLY one thing: the
-# grouped NT GEMM (ROW_SC -> fwd's b_scale, COL_SC -> dgrad's b_scale), and only after the
-# merged preshuffle's B segment has repacked it into the lane-contiguous layout
-# `ScaleS2RPacked` reads. That segment is a pure ~33 MB read + 36 MB write round trip of a
-# tensor this kernel has just written -- so write the packed layout directly and the
-# segment's 1107 workgroups (x2 launches per operator) are DELETED, exactly the way C23's
-# `df` deleted the A segment.
-#
-# Packed byte address of the E8M0 for (operand row `row`, 32-element block `c`), per expert:
-#     off = ((wi*KK + kk)*256 + g*64 + r*4 + last) * 4 + t
-#     grp = row//64, t = (row%64)//16, r = row%16
-#     rr  = (grp//2)%2, wi = 2*(grp//4) + grp%2          # inverse of _mxfp4_grp_from(mode=1)
-#     kk  = c//8,  sb = (c//4)%2,  g = c%4,  last = 2*rr + sb
-# (forward map of the preshuffle's B segment; verified byte-identical against the shipped
-# kernel over both shipped geometries before any timing was taken.)
-# FLYDSL_NT_BSFUSE=0 reverts BOTH this and the GEMM's b_pre_grid=0, which must agree.
-_BSFUSE_ENV = os.environ.get("FLYDSL_NT_BSFUSE", "0") == "1"
-
-
-def bsc_pack_geom(rows, kbytes):
-    """(N_SCALE, K128, KK, nbytes) of the packed NT B-scale layout for one expert.
-
-    ``rows`` = the operand's free-dim rows, ``kbytes`` = E8M0 bytes per row (= K_op/32).
-    Mirrors the GEMM's own N_SCALE = ceil(rows,256)*256 and K128 = ceil(K_op,256)*256/128.
-    """
-    rows = int(rows)
-    kbytes = int(kbytes)
-    K256 = ((kbytes * 32 + 255) // 256) * 256
-    K128 = K256 // 128
-    N_SCALE = ((rows + 255) // 256) * 256
-    return N_SCALE, K128, K128 // 2, N_SCALE * K128 * 4
-
-
-def bsc_fused(rows, kbytes):
-    """True when the B-scale is emitted in the packed NT layout. The GEMM applies the
-    SAME predicate (plus a numel check) on its own (N, k_real/32); the two must agree."""
-    if not _BSFUSE_ENV:
-        return False
-    rows, kbytes = int(rows), int(kbytes)
-    if rows <= 0 or kbytes <= 0 or rows % 64 or kbytes % 4:
-        return False
-    _NS, _K128, _KK, nbytes = bsc_pack_geom(rows, kbytes)
-    # the packed tensor must be a DIFFERENT size from the canonical one, so the consumer
-    # can tell the two apart by numel with no side channel.
-    return nbytes != rows * kbytes
-
-
-def _bsc_off(row, c, KK):
-    """Device-side packed BYTE offset (within one expert) for E8M0 (row, block c)."""
-    I32 = fx.Int32
-    grp = row >> I32(6)
-    t = (row >> I32(4)) & I32(3)
-    r = row & I32(15)
-    rr = (grp >> I32(1)) & I32(1)
-    wi = ((grp >> I32(2)) << I32(1)) | (grp & I32(1))
-    kk = c >> I32(3)
-    sb = (c >> I32(2)) & I32(1)
-    g = c & I32(3)
-    dw = (wi * I32(KK) + kk) * I32(256) + g * I32(64) + r * I32(4) + I32(2) * rr + sb
-    return (dw << I32(2)) + t
 
 
 BLK = 256
@@ -448,8 +384,6 @@ def _emit_dual_body(
     col_sr=False,
     sr_seed=None,
     sr_gbid=None,
-    rpk=None,
-    cpk=None,
 ):
     """Emit one fused-dual tile (rowwise + colwise-transpose mxfp4 cast) for block
     ``bid``. ``row_2d``/``col_2d`` pick the C++ ``USE_2D_BLOCK`` amax geometry; the
@@ -496,9 +430,9 @@ def _emit_dual_body(
     if batched:
         rsrc = _srd(X, gx, 4, R * (C >> 1) * 4)
         orsrc = _srd(ROW_OUT, gro, 4, R * (cpad >> 3) * 4)
-        rscrsrc = _srd(ROW_SC, grsc, 1, fx.Int32(rpk[3]) if rpk else R * (cpad >> 5))
+        rscrsrc = _srd(ROW_SC, grsc, 1, R * (cpad >> 5))
         corsrc = _srd(COL_OUT, gco, 4, C * (rpad >> 3) * 4)
-        cscrsrc = _srd(COL_SC, gcsc, 1, fx.Int32(cpk[3]) if cpk else C * (rpad >> 5))
+        cscrsrc = _srd(COL_SC, gcsc, 1, C * (rpad >> 5))
         gx = gro = grsc = gco = gcsc = 0  # expert bases folded into the SRDs above
     else:
         r0i = arith.index_cast(T.index, r0)
@@ -578,7 +512,7 @@ def _emit_dual_body(
             grow = _row0 + r_row
             gcmb = cblk * _RMBC + cmb
             ob = grow * (cpad >> 3) + gcmb * 4 + gro
-            sc = _bsc_off(grow, gcmb, rpk[2]) if rpk else grow * (cpad >> 5) + gcmb + grsc
+            sc = grow * (cpad >> 5) + gcmb + grsc
             if padded:
                 wok = gcmb < (cpad >> 5)  # rows always valid (R%64==0)
                 ob = arith.select(wok, ob, fx.Int32(_OOB))
@@ -602,7 +536,7 @@ def _emit_dual_body(
             grow = _row0 + r_row
             gcmb = cblk * (_TC // 32) + cmb
             ob = grow * (cpad >> 3) + gcmb * 4 + gro
-            sc = _bsc_off(grow, gcmb, rpk[2]) if rpk else grow * (cpad >> 5) + gcmb + grsc
+            sc = grow * (cpad >> 5) + gcmb + grsc
             if padded:
                 wok = gcmb < (cpad >> 5)  # rows always valid (R%64==0)
                 ob = arith.select(wok, ob, fx.Int32(_OOB))
@@ -642,7 +576,7 @@ def _emit_dual_body(
             gcol = _col0 + c_col
             gmmb = rblk * _RMB + mmb
             cob = gcol * (rpad >> 3) + gmmb * 4 + gco
-            csoff = _bsc_off(gcol, gmmb, cpk[2]) if cpk else gcol * (rpad >> 5) + gmmb + gcsc
+            csoff = gcol * (rpad >> 5) + gmmb + gcsc
             if padded:
                 cok = gcol < C  # col-out has real-C rows; drop pad-K rows
                 cob = arith.select(cok, cob, fx.Int32(_OOB))
@@ -661,7 +595,7 @@ def _emit_dual_body(
             gcol = _col0 + c_col
             gmmb = rblk * _RMB + mmb
             cob = gcol * (rpad >> 3) + gmmb * 4 + gco
-            csoff = _bsc_off(gcol, gmmb, cpk[2]) if cpk else gcol * (rpad >> 5) + gmmb + gcsc
+            csoff = gcol * (rpad >> 5) + gmmb + gcsc
             if padded:
                 cok = gcol < C  # col-out has real-C rows; drop pad-K rows
                 cob = arith.select(cok, cob, fx.Int32(_OOB))
@@ -840,8 +774,6 @@ def _build_dual3_kernel(
     col_locality=False,
     row_sr=False,
     col_sr=False,
-    rpk=None,
-    cpk=None,
 ):
     _DualSS = _make_dual_struct(bool(row_2d or col_2d))
 
@@ -892,11 +824,9 @@ def _build_dual3_kernel(
             # these into per-expert int64 SRD bases.
             gx=arith.index_cast(T.index, g) * arith.index_cast(T.index, R * (C >> 1)),
             gro=arith.index_cast(T.index, g) * arith.index_cast(T.index, R * (cpad >> 3)),
-            grsc=arith.index_cast(T.index, g)
-            * arith.index_cast(T.index, fx.Int32(rpk[3]) if rpk else R * (cpad >> 5)),
+            grsc=arith.index_cast(T.index, g) * arith.index_cast(T.index, R * (cpad >> 5)),
             gco=arith.index_cast(T.index, g) * arith.index_cast(T.index, C * (rpad >> 3)),
-            gcsc=arith.index_cast(T.index, g)
-            * arith.index_cast(T.index, fx.Int32(cpk[3]) if cpk else C * (rpad >> 5)),
+            gcsc=arith.index_cast(T.index, g) * arith.index_cast(T.index, C * (rpad >> 5)),
             gmul=G,
             padded=padded,
             ncblk=ncblk,
@@ -909,8 +839,6 @@ def _build_dual3_kernel(
             col_sr=col_sr,
             sr_seed=SR_SEED,
             sr_gbid=_pid,
-            rpk=rpk,
-            cpk=cpk,
         )
 
     return _dual3_kernel
@@ -925,12 +853,8 @@ def _build_dual3_launch(
     col_locality=False,
     row_sr=False,
     col_sr=False,
-    rpk=None,
-    cpk=None,
 ):
-    kern = _build_dual3_kernel(
-        row_rht, col_rht, row_2d, col_2d, padded, col_locality, row_sr, col_sr, rpk, cpk
-    )
+    kern = _build_dual3_kernel(row_rht, col_rht, row_2d, col_2d, padded, col_locality, row_sr, col_sr)
 
     @flyc.jit
     def _dual3_launch(X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, C, G, CP, RP, SR_SEED, grid_x, stream):
@@ -969,9 +893,6 @@ def get_dual3_cast(N, K, G, row_rht, col_rht, row_2d=False, col_2d=False, row_sr
     tr, tc = _pick_tile_geom(int(N), int(K))
     padded = (K % tc != 0) or (N % 128 != 0)
     col_locality = int(K) > int(N)  # K>N: combine transpose stores (col-out)
-    # packed NT B-scale geometry (row operand is [N, Kp], col operand is [K, Np])
-    rpk = bsc_pack_geom(N, Kp // 32) if bsc_fused(N, Kp // 32) else None
-    cpk = bsc_pack_geom(K, Np // 32) if bsc_fused(K, Np // 32) else None
     lk = (
         bool(row_rht),
         bool(col_rht),
@@ -982,7 +903,7 @@ def get_dual3_cast(N, K, G, row_rht, col_rht, row_2d=False, col_2d=False, row_sr
         bool(row_sr),
         bool(col_sr),
     )
-    lk = lk + (tr, tc, rpk, cpk)
+    lk = lk + (tr, tc)
     _saved = (_TR, _TC)
     _set_tile_geom(tr, tc)
     raw = _DUAL3_LAUNCH.get(lk)
@@ -996,8 +917,6 @@ def get_dual3_cast(N, K, G, row_rht, col_rht, row_2d=False, col_2d=False, row_sr
             col_locality,
             bool(row_sr),
             bool(col_sr),
-            rpk,
-            cpk,
         )
         _DUAL3_LAUNCH[lk] = raw
     key = (int(N), int(K), int(G), *lk)
@@ -1011,21 +930,13 @@ def get_dual3_cast(N, K, G, row_rht, col_rht, row_2d=False, col_2d=False, row_sr
         # trace-only tensors (shapes drive the compile, contents never read)
         x = torch.empty((G, N, K // 2), dtype=torch.int32, device="cuda")
         ro = torch.empty((G, N, Kp // 8), dtype=torch.int32, device="cuda")
-        rs = (
-            torch.empty(G * rpk[3], dtype=torch.uint8, device="cuda")
-            if rpk
-            else torch.empty((G, N, Kp // 32), dtype=torch.uint8, device="cuda")
-        )
+        rs = torch.empty((G, N, Kp // 32), dtype=torch.uint8, device="cuda")
         co = torch.empty((G, K, Np // 8), dtype=torch.int32, device="cuda")
-        cs = (
-            torch.empty(G * cpk[3], dtype=torch.uint8, device="cuda")
-            if cpk
-            else torch.empty((G, K, Np // 32), dtype=torch.uint8, device="cuda")
-        )
+        cs = torch.empty((G, K, Np // 32), dtype=torch.uint8, device="cuda")
         ncblk = ((K + tc - 1) // tc) if padded else (K // tc)
         grid_x = (N // tr) * ncblk * G
         fn = flyc.compile(raw, x, ro, rs, co, cs, N, K, G, Kp, Np, 0, grid_x, torch.cuda.current_stream())
-        ent = (fn, grid_x, Kp, Np, padded, rpk, cpk)
+        ent = (fn, grid_x, Kp, Np, padded)
         _DUAL3_COMPILED[key] = ent
     _set_tile_geom(*_saved)
     return ent
@@ -1043,9 +954,7 @@ def flydsl_dual_quant_batched(
     G, N, K = x3d.shape
     dev = x3d.device
     x_i32 = x3d.contiguous().view(torch.int32)  # [G, N, K/2]
-    fn, grid_x, Kp, Np, padded, rpk, cpk = get_dual3_cast(
-        N, K, G, row_rht, col_rht, row_2d, col_2d, row_sr, col_sr
-    )
+    fn, grid_x, Kp, Np, padded = get_dual3_cast(N, K, G, row_rht, col_rht, row_2d, col_2d, row_sr, col_sr)
     # Outputs sized on K_pad/N_pad; the pad regions must read back all-0 to match the HIP
     # dual (the GEMM contracts over the PADDED extent, so pad garbage would corrupt it).
     # Zeroing the whole buffer to achieve that costs ~570 MB of memset per weight quant
@@ -1053,28 +962,15 @@ def flydsl_dual_quant_batched(
     # Allocate uninitialised and zero only the tail slices past the real K / N extent.
     ro = torch.empty((G, N, Kp // 8), dtype=torch.int32, device=dev)
     co = torch.empty((G, K, Np // 8), dtype=torch.int32, device=dev)
-    # Packed NT B-scale: the tile grid covers only the REAL rows/cols, so the slots the
-    # preshuffle used to zero (the 256-row pad quartet, and the E8M0 columns past the real
-    # extent) are never stored to -- allocate zeroed instead of adding a fill dispatch.
-    rs = (
-        torch.zeros(G * rpk[3], dtype=torch.uint8, device=dev)
-        if rpk
-        else torch.empty((G, N, Kp // 32), dtype=torch.uint8, device=dev)
-    )
-    cs = (
-        torch.zeros(G * cpk[3], dtype=torch.uint8, device=dev)
-        if cpk
-        else torch.empty((G, K, Np // 32), dtype=torch.uint8, device=dev)
-    )
+    rs = torch.empty((G, N, Kp // 32), dtype=torch.uint8, device=dev)
+    cs = torch.empty((G, K, Np // 32), dtype=torch.uint8, device=dev)
     if padded:
         if Kp != K:
             ro[..., K // 8 :].zero_()
-            if rpk is None:
-                rs[..., K // 32 :].zero_()
+            rs[..., K // 32 :].zero_()
         if Np != N:
             co[..., N // 8 :].zero_()
-            if cpk is None:
-                cs[..., N // 32 :].zero_()
+            cs[..., N // 32 :].zero_()
     sr_seed = _next_sr_seed() if (row_sr or col_sr) else 0
     fn(x_i32, ro, rs, co, cs, N, K, G, Kp, Np, sr_seed, grid_x, torch.cuda.current_stream())
     return (
