@@ -18,6 +18,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from primus_turbo.common.logger import logger
+
 from ._cache import _CACHE_MISS, _CLASSIFY_CACHE, _cache_get, _cache_put
 from ._config import _DOC_EXACT_VERIFY_LIMIT, _DOC_VERIFY_CHUNK, _MASK_PROBE_LIMIT
 from ._probe import (
@@ -1012,4 +1014,24 @@ def _classify_block_mask(
         return cached
     cfg = _classify_block_mask_uncached(block_mask, B=B, H=H, q_len=q_len, kv_len=kv_len)
     _cache_put(_CLASSIFY_CACHE, block_mask, key, cfg)
+    # A cache miss is exactly "a mask/shape this process has not classified before",
+    # so this fires once per unique (block_mask, shape) rather than once per call.
+    #
+    # Without it the run is unauditable: the only flex-related lines in a training
+    # log are Primus's own config echo, and that echo is byte-identical whether the
+    # compat layer ran or was silently bypassed -- which is how a whole round of
+    # end-to-end measurements was once collected against plain TE attention without
+    # anyone noticing. Say out loud what the mask was classified as.
+    #
+    # rank=0 so 8 ranks do not print the same line 8 times; once=True dedupes on the
+    # fully-formatted message, so a *different* classification still gets its own
+    # line. Formatted eagerly for that reason -- this is the cold path, and the
+    # probe it follows costs milliseconds, so the f-string is free.
+    logger.info(
+        f"flex: classified block_mask as kind={cfg.get('kind')!r} "
+        f"causal={cfg.get('causal')} window_size={cfg.get('window_size')} "
+        f"(B={B}, H={H}, q_len={q_len}, kv_len={kv_len})",
+        once=True,
+        rank=0,
+    )
     return cfg

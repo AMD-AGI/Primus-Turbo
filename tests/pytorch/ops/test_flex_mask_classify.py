@@ -722,3 +722,65 @@ def test_window_that_changes_past_the_probe_is_refused():
 
     with pytest.raises(NotImplementedError):
         _classify_block_mask(_DummyBlockMask(mask_mod), B=1, H=1, q_len=_S, kv_len=_S)
+
+
+# --- T29: the classification has to be visible in the log -------------------
+# A training run's only flex-related output used to be Primus's config echo, which
+# is byte-identical whether the compat layer ran or was bypassed entirely. These
+# tests pin the line that makes a run auditable.
+
+
+def _capture_classify_logs(monkeypatch):
+    """Record every ``logger.info`` the classifier emits, fully formatted."""
+    from primus_turbo.common import logger as logger_mod
+
+    seen = []
+    monkeypatch.setattr(logger_mod.logger, "info", lambda msg, *a, **kw: seen.append((msg, kw)), raising=True)
+    return seen
+
+
+def test_classification_is_logged_once_per_unique_mask(monkeypatch):
+    seen = _capture_classify_logs(monkeypatch)
+    block_mask = _DummyBlockMask(lambda b, h, q, kv: (q >= kv) & ((q - kv) <= 64))
+
+    cfg = _classify_block_mask(block_mask, B=1, H=1, q_len=256, kv_len=256)
+    assert cfg["kind"] == "sliding_window_causal"
+    assert len(seen) == 1
+    msg, kwargs = seen[0]
+    # The three things a reader needs to tell one route from another.
+    assert "sliding_window_causal" in msg
+    assert "window_size=(64, 0)" in msg
+    assert "q_len=256" in msg
+    # rank=0 so 8 ranks do not print the same line 8 times.
+    assert kwargs.get("rank") == 0
+    assert kwargs.get("once") is True
+
+    # Second call is a cache hit: no second line. The log must not grow per step.
+    _classify_block_mask(block_mask, B=1, H=1, q_len=256, kv_len=256)
+    assert len(seen) == 1
+
+
+def test_a_different_classification_gets_its_own_line(monkeypatch):
+    # once=True dedupes on the formatted message, so distinct results must not
+    # suppress each other -- otherwise only the first layer's mask is ever visible.
+    seen = _capture_classify_logs(monkeypatch)
+    _classify_block_mask(_DummyBlockMask(lambda b, h, q, kv: q >= kv), B=1, H=1, q_len=256, kv_len=256)
+    _classify_block_mask(_DummyBlockMask(lambda b, h, q, kv: True), B=1, H=1, q_len=256, kv_len=256)
+    assert len(seen) == 2
+    assert seen[0][0] != seen[1][0]
+    assert "'causal'" in seen[0][0]
+    assert "'full'" in seen[1][0]
+
+
+def test_a_refused_mask_logs_nothing(monkeypatch):
+    # The refusal is already loud (NotImplementedError); a log line claiming a
+    # classification that never happened would be worse than silence.
+    seen = _capture_classify_logs(monkeypatch)
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        width = torch.where(q_idx < 1024, 64, 32)
+        return (q_idx >= kv_idx) & ((q_idx - kv_idx) <= width)
+
+    with pytest.raises(NotImplementedError):
+        _classify_block_mask(_DummyBlockMask(mask_mod), B=1, H=1, q_len=_S, kv_len=_S)
+    assert seen == []
