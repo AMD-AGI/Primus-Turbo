@@ -1257,6 +1257,7 @@ def grouped_gemm_fp8_glu_impl(
     out_row_scaling_recipe: ScalingRecipe,
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
+    k_align: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """fc1 grouped GEMM with the GLU activation and its quantisation fused in.
 
@@ -1297,7 +1298,7 @@ def grouped_gemm_fp8_glu_impl(
         grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel,
     )
     from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
-        quantize_fp8_tensorwise_impl,
+        quantize_fp8_tensorwise_pad_impl,
     )
 
     grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
@@ -1315,7 +1316,10 @@ def grouped_gemm_fp8_glu_impl(
         num_cu=num_cu,
     )
 
-    act_fp8, act_scale_inv = quantize_fp8_tensorwise_impl(act, out_quant_dtype)
+    # k_align pads the activation's I -> Ip (fc2's contraction K), copy-free: the
+    # quantiser writes the padded buffer directly and zeroes the tail, so w2's own
+    # padded-K contraction reads zeros there and fc2 stays bitwise-identical.
+    act_fp8, act_scale_inv = quantize_fp8_tensorwise_pad_impl(act, out_quant_dtype, k_align=k_align)
     return intermediate, act_fp8, act_scale_inv
 
 
@@ -1338,6 +1342,7 @@ def grouped_gemm_fp8_dglu_impl(
     out_row_scaling_recipe: ScalingRecipe,
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
+    i_real: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """fc2 dgrad with the GLU activation gradient and its quantisation fused in.
 
@@ -1365,19 +1370,21 @@ def grouped_gemm_fp8_dglu_impl(
     assert a.shape[1] >= 129, "a.shape[1] must be >= 129 for grouped_gemm_fp8_dglu_impl"
 
     M = a.shape[0]
-    N = b.shape[1] if trans_b else b.shape[2]
+    # b is w2 padded to Ip on its I axis; i_real recovers the tight I so out/grad
+    # stay [M, 2I] and the entry feeds the padded Ip as an N storage pitch (n_stride).
+    N = i_real if i_real is not None else (b.shape[1] if trans_b else b.shape[2])
 
     from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_glu_kernel import (
         grouped_gemm_fp8_dglu_grad_probs_partial_spec,
         grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel,
     )
     from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
-        quantize_fp8_tensorwise_impl,
+        quantize_fp8_tensorwise_pad_impl,
     )
 
     out = torch.empty((M, N * 2), device=a.device, dtype=out_dtype)
     grad_probs_partial = _alloc_grad_probs_partial(
-        grouped_gemm_fp8_dglu_grad_probs_partial_spec(a, b), a.device
+        grouped_gemm_fp8_dglu_grad_probs_partial_spec(a, b, i_real=N), a.device
     )
     grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
         a,
@@ -1392,9 +1399,10 @@ def grouped_gemm_fp8_dglu_impl(
         trans_b=trans_b,
         activation=activation,
         num_cu=num_cu,
+        i_real=i_real,
     )
 
-    out_fp8, out_scale_inv = quantize_fp8_tensorwise_impl(out, out_quant_dtype)
+    out_fp8, out_scale_inv = quantize_fp8_tensorwise_pad_impl(out, out_quant_dtype, k_align=1)
     return torch.sum(grad_probs_partial, dim=0), out_fp8, out_scale_inv
 
 
@@ -1416,6 +1424,7 @@ def grouped_gemm_fp8_glu_impl_meta(
     out_row_scaling_recipe: ScalingRecipe,
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
+    k_align: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     _check_glu_dispatch(config, trans_a)
     _check_out_recipes(out_row_scaling_recipe, out_col_scaling_recipe)
@@ -1429,11 +1438,14 @@ def grouped_gemm_fp8_glu_impl_meta(
         torch.bfloat16,
     ], f"out_dtype must be float16 or bfloat16, got {out_dtype}"
 
-    # b holds gate||up, so its N is twice the activation's width.
+    # b holds gate||up, so its N is twice the activation's width. The activation is
+    # padded to Ip = ceil(I, k_align) for fc2's contraction.
     m = a.shape[0]
     n = b.shape[1] if trans_b else b.shape[2]
+    ni = n // 2
+    ni = ((ni + k_align - 1) // k_align) * k_align
     intermediate = torch.empty((m, n), device=a.device, dtype=out_dtype)
-    act = torch.empty((m, n // 2), device=a.device, dtype=out_quant_dtype)
+    act = torch.empty((m, ni), device=a.device, dtype=out_quant_dtype)
     # Tensorwise: one scalar scale over the whole activation.
     act_scale_inv = torch.empty((), device=a.device, dtype=torch.float32)
     return intermediate, act, act_scale_inv
@@ -1458,6 +1470,7 @@ def grouped_gemm_fp8_dglu_impl_meta(
     out_row_scaling_recipe: ScalingRecipe,
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
+    i_real: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     _check_glu_dispatch(config, trans_a)
     _check_out_recipes(out_row_scaling_recipe, out_col_scaling_recipe)
@@ -1473,8 +1486,9 @@ def grouped_gemm_fp8_dglu_impl_meta(
 
     # This is the dgrad wrt the activation, so the gate||up gradient it writes
     # is twice as wide. grad_probs is per-row and always fp32, whatever out_dtype is.
+    # i_real recovers the tight I when b is padded on its I axis.
     m = a.shape[0]
-    n = b.shape[1] if trans_b else b.shape[2]
+    n = i_real if i_real is not None else (b.shape[1] if trans_b else b.shape[2])
     grad_probs = torch.empty((m,), device=a.device, dtype=torch.float32)
     grad_intermediate = torch.empty((m, n * 2), device=a.device, dtype=out_quant_dtype)
     # Tensorwise: one scalar scale over the whole gradient.
