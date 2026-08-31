@@ -11,15 +11,12 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""flash_attn backward kernel builders for FlyDSL (gfx950 / MI355X).
+"""flash_attn backward kernel builders for FlyDSL (gfx950 / MI355X): odo, dkdv, dq.
 
-Three deterministic kernels -- odo (identity delta), dkdv (KV-outer), dq
-(Q-outer). Each work-group owns one output tile and writes it once, so there
-are no float atomics. Built on the verified forward machine.
+Bitwise deterministic except the a16 dQ path (see _DQ_A16), which accumulates dQ atomically.
 """
 
 import math as host_math
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -28,7 +25,6 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr import math as fmath
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
 from flydsl.expr.utils.arith import _to_raw as _raw
@@ -38,18 +34,18 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from primus_turbo.flydsl.utils.gemm_helper import xcd_remap_pid
 
 _LOG2E = host_math.log2(host_math.e)
-# Warp specialisation (splitting the head-step across a wave pair by role) is
-# register-walled: each role's live set needs more than half the 512-dword pool, so the
-# pair cannot co-reside two waves per SIMD, and no register donor closes the gap.
-# q rows one dkdv work-group folds per q-loop step. 128 halves the (band, q-block) trips but
-# no register form that fits the co-residency line funds it while keeping the Q_PREF staging.
-# Six host planners capture this as a def-time default, so a per-call override desyncs them.
+# q rows one dkdv work-group folds per q-loop step. A wider tile, and warp specialisation,
+# are both register-walled: neither leaves room to co-reside two waves per SIMD.
 _BWD_BLOCK_Q = 64
+
+_MFMA_TIE_CONS = ("=a,v,v,0", "=a,a,v,0")
 
 # dkdv MFMA-accumulator AGPR forcing (amdgpu-agpr-alloc): only pays off once the body
 # is VGPR-lean, so it is disabled here. On the four-wave fused body it is not even a
 # knob -- the compiler's own split is already byte-identical across the range tried.
 _DKDV_AGPR = 0
+
+_G3D_FULL_BAND = 8
 
 # Pads dQ split-K band groups off a power-of-two stride so QDESC's same-row groups do not co-alias. D128 only.
 _WSQ_BAND_PAD = 1 << 20
@@ -58,8 +54,6 @@ _WSQ_BAND_PAD = 1 << 20
 _WSQ_BAND_ILV = 8
 # DPP quad_perm:[1,0,3,2], swaps a value between the two halves of every lane pair.
 _QUAD_SWAP = 0xB1
-# LLVMSchedGroupMask::VALU. flydsl's rocdl module exports the MFMA / DS / VMEM masks but
-# not this one; the forward kernel drives its exp and VALU blocks with the same value.
 _SCHED_VALU_MASK = 0x002
 # gfx950: 8 XCDs each with a private L2 slice, picked by block_id % _NUM_XCD.
 _NUM_XCD = 8
@@ -80,13 +74,7 @@ def _wsq_ilv(nb, B, Sq, hd, elem_bytes=2):
 # asks for none -- capacity, not speed, is what still needs the Q-outer dq kernel there. Past
 # the cap the band axis is walked in groups (see _band_span_for) and the reduce carries the
 # running fp32 sum from group to group, so the footprint follows the cap instead of the context.
-# A smaller cap hands the next group a running sum to re-read one more time, and the reduce
-# is already band-traffic bound, so that shows up about one for one: at the GPT-OSS 8K shape
-# 3 GiB reads 876 TFLOP/s against the whole axis's 990, and llama-70B D128 gives up 22%.
-# Capacity is therefore bought by LAYOUT first (see _wsq_pair_ok and _wsq_ring_for, both free)
-# and only then by this cap, which stays where it was. Keep an environment override for a
-# deployment that has to trade the throughput back for the last GiB.
-_WSQ_BUDGET_BYTES = int(os.environ.get("PRIMUS_TURBO_ATTN_WSQ_BUDGET_GIB", "16")) << 30
+_WSQ_BUDGET_BYTES = 16 << 30
 
 
 def _band_span_for(n_bands, band_bytes, ilv, whole=True, axis_bytes=None):
@@ -108,8 +96,6 @@ def _band_span_for(n_bands, band_bytes, ilv, whole=True, axis_bytes=None):
     the same run, whose makespan is the longest walk in it. Rounding the span down to a run
     beats every span between two runs by more than the extra pass it costs.
     """
-    # axis_bytes: what the whole axis really costs, which the causal fold halves
-    # (see _wsq_pair_ok). Only the fit test uses it; a span is still counted in bands.
     if (n_bands * band_bytes if axis_bytes is None else axis_bytes) <= _WSQ_BUDGET_BYTES:
         return 0
     if not whole:
@@ -123,20 +109,8 @@ def _band_span_for(n_bands, band_bytes, ilv, whole=True, axis_bytes=None):
 
 def _wsq_ring_for(n_bands, block_kv, window_left, ilv, block_q=_BWD_BLOCK_Q):
     """Band groups the dQ partial workspace keeps live; 0 = one group per band.
-
-    A finite window bounds how far along the band axis a q BLOCK's dQ slot travels: the body
-    takes or drops a q block whole, so the blocks one band writes reach at most (W+block_q)
-    rows past it. Bands further apart than that write DISJOINT rows, so letting them share a
-    slot keeps one writer per slot -- the property the fixed-order fp32 reduce rests on -- and
-    changes neither what is written nor the ascending order it is read back in. Only the
-    workspace shrinks, from the band axis to the window; the group, not the band, is the unit
-    because interleaved bands share a row (see _wsq_ilv).
-
-    Opened on the WINDOW rather than on the byte count, because the slots a window skips cost
-    neither descriptor nor page walk: at the GPT-OSS 8K shape the byte gate left a 0.6 ms
-    kernel holding the whole 16 GiB axis whenever the cap was wide enough to allow it, and
-    opening the ring there measures 0.6175 -> 0.6092 ms against 1.25 GiB.
-    """
+    A finite window bounds how far a q block's dQ slot travels, so bands further apart write
+    DISJOINT rows and may share a slot -- one writer per slot, which the fixed-order reduce needs."""
     if window_left < 0:
         return 0
     span = (window_left + block_q - 1) // block_kv + 2
@@ -146,18 +120,8 @@ def _wsq_ring_for(n_bands, block_kv, window_left, ilv, block_q=_BWD_BLOCK_Q):
 
 def _wsq_pair_ok(n_bands, ilv, block_kv, Sq, Skv, window_left, sbhd, band_span, ring):
     """Band groups, when group g and group ng-g can share one slab; 0 = each keeps its own.
-
-    Under full causal a kv band takes only the q rows at or below it, so group g never writes
-    the first g*ilv*BLOCK_KV rows of its slab -- measured: the untouched fraction is exactly
-    g/ng -- and the reduce skips the same rows. Group ng-g needs (ng-g)*ilv*BLOCK_KV rows,
-    which is that dead prefix EXACTLY, so the two fold into one slab with the high group
-    shifted down by its own first row. The axis then costs ng//2+1 slabs and the same bytes
-    in flight, which is the one lever here that buys capacity without buying traffic.
-
-    Square and dense only: a window bounds the span itself (see _wsq_ring_for), a ragged
-    launch has no single diagonal, and a band GROUP pass holds one contiguous run whose
-    partners live in another pass. An odd ng would leave a group without a partner.
-    """
+    Under full causal the slab prefix group g never writes is EXACTLY the rows group ng-g needs, so
+    the two fold into one slab; a window, a ragged launch or a band-group pass has no such diagonal."""
     if not sbhd or window_left >= 0 or band_span or ring or Sq != Skv:
         return 0
     ng = n_bands // ilv
@@ -200,10 +164,8 @@ def _cu_band_rows(cu_kv, n_bands, span):
 
 def _qsp_absolute(head_dim, block_kv, q_split, block_q=_BWD_BLOCK_Q):
     """Whether the dkdv body must key its q_split subsets on the ABSOLUTE q block index.
-
-    The band-relative walk and the reduce's ``(q/BLOCK_Q) % q_split`` map coincide only when
-    a band is a whole number of split strides; re-phasing restores it when they do not.
-    """
+    The band-relative walk and the reduce's ``(q/BLOCK_Q) % q_split`` map coincide only when a
+    band is a whole number of split strides; re-phasing restores it when they do not."""
     return head_dim == 128 and q_split > 1 and (block_kv // block_q) % q_split != 0
 
 
@@ -255,14 +217,10 @@ def _cached_launch(cache, jit_fn, hints, args, kwargs):
     return fn(*args)
 
 
-def _if_wave(cond, vals, then_fn, else_fn, else_yields=False):
+def _if_wave(cond, vals, then_fn, else_fn):
     """scf.if threading ``vals`` through both arms, for a wave-uniform ``cond``.
-
-    Built directly rather than with a traced ``if``: the tracer only carries plain
-    named variables across a dynamic branch, and these are lists of accumulators.
-    ``else_yields`` takes the else arm's own return list instead of ``vals``, which
-    is what nesting one of these inside another's arm needs.
-    """
+    Built directly rather than traced: the tracer only carries plain named variables across a
+    dynamic branch, and these are lists."""
     from flydsl._mlir.dialects import scf
 
     _v = [_raw(v) for v in vals]
@@ -272,8 +230,8 @@ def _if_wave(cond, vals, then_fn, else_fn, else_yields=False):
     if not op.regions[1].blocks:
         op.regions[1].blocks.append()
     with ir.InsertionPoint(op.regions[1].blocks[0]):
-        _e = else_fn()
-        scf.YieldOp([_raw(x) for x in _e] if else_yields else _v)
+        else_fn()
+        scf.YieldOp(_v)
     return list(op.results)
 
 
@@ -307,13 +265,14 @@ def build_flash_attn_bwd_odo_module(
     sbhd=False,  # SBHD [S,B,H,D] native O/dO layout (seq-step = B*H*D)
     token_major=False,  # True: DELTA is packed [S,Hq] (the ragged layout, see below)
     spw=8,  # q rows per work-group tile (the rest of the tile is q-heads)
-    # q_split/qsp_lo/n_qsp mirror the fused body's q-loop split, so delta for splits
-    # [qsp_lo, qsp_lo+n_qsp) only has to exist before the chunk consuming them launches
-    # (see _fused_pipelined). SBHD only -- the ragged path cuts by segment instead.
     q_split=1,
     qsp_lo=0,
     n_qsp=None,  # None: every q block (no q-split sub-range)
-    block_q=_BWD_BLOCK_Q,
+    fill_img=False,
+    bat_lo=0,
+    bat_all=None,
+    # The dQ image is batch-outer while O is SBHD, so a sub-range addresses it as slabs.
+    img_slab=False,
 ):
     """Identity-delta ("odo") kernel: DELTA[b,hq,s] = -sum_d O[b,s,hq,d]*dO[b,s,hq,d].
 
@@ -360,18 +319,21 @@ def build_flash_attn_bwd_odo_module(
     SPW = ROWS_PER_WG // HPW
     N_QSP = q_split if n_qsp is None else n_qsp
     assert 1 <= N_QSP <= q_split and 0 <= qsp_lo <= q_split - N_QSP
-    # A q block is a whole run of s-tiles, and with the s-tile the SLOWEST decode axis a q
-    # block's work-groups are a contiguous run of ids -- which is what lets a sub-range be a
-    # pure grid restriction plus a remap, with no per-thread predicate.
-    assert N_QSP == q_split or (sbhd and block_q % SPW == 0)
+    assert N_QSP == q_split or (sbhd and _BWD_BLOCK_Q % SPW == 0)
     WG_PER_STILE = NUM_HEADS_Q // HPW
-    STPB = block_q // SPW  # s-tiles per q block
+    STPB = _BWD_BLOCK_Q // SPW  # s-tiles per q block
+    FILL_IMG = bool(fill_img)
+    BAT_LO = int(bat_lo)
+    IMG_SLAB = bool(img_slab)
+    assert bat_all is None or (sbhd and not token_major), "odo batch sub-range is SBHD-only"
+    assert not (FILL_IMG and bat_all is not None and not IMG_SLAB), "sub-range fill needs img_slab"
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
     def flash_attn_bwd_odo_kernel(
         O: fx.Tensor,
         DO: fx.Tensor,
         DELTA: fx.Tensor,
+        IMG: fx.Tensor,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
     ):
@@ -390,16 +352,14 @@ def build_flash_attn_bwd_odo_module(
         tid = fx.Index(gpu.thread_idx.x)
         chunk = tid % fx.Index(LPR)
         sl = fx.Index(seq_len)
-        total = fx.Index(batch_size) * sl * fx.Index(NUM_HEADS_Q)
+        ball = fx.Index(batch_size) if bat_all is None else fx.Index(bat_all)
+        total = ball * sl * fx.Index(NUM_HEADS_Q)
         # (b, h-tile, s-tile) from the work-group id; only the s extent is dynamic, so
         # only that one division is a real (work-group uniform, hence SALU) divide.
         # The head tile is the fastest-varying axis so that NUM_HEADS_Q/HPW consecutive
         # work-groups sweep one contiguous SPW*Hq*D run of O/dO; making the s tile fastest
         # instead spreads the read stream over SPW*Hq*D-strided addresses (80 vs 68 us).
         if const_expr(N_QSP < q_split):
-            # Spread this launch's dense ids back over the q blocks its splits own, the same
-            # map the body and the dQ reduce use: block (q/block_q) belongs to split
-            # (q/block_q) % q_split (see build).
             _wg_qb = fx.Index(STPB * WG_PER_STILE) * fx.Index(batch_size)
             _qb, _in = bid // _wg_qb, bid % _wg_qb
             bid = ((_qb // fx.Index(N_QSP)) * fx.Index(q_split) + fx.Index(qsp_lo)) * _wg_qb + _in
@@ -409,6 +369,8 @@ def build_flash_attn_bwd_odo_module(
         if const_expr(sbhd):
             b = _r % fx.Index(batch_size)
             st = _r // fx.Index(batch_size)
+            if const_expr(BAT_LO):
+                b = b + fx.Index(BAT_LO)
         else:
             n_stile = (sl + fx.Index(SPW - 1)) // fx.Index(SPW)
             st = _r % n_stile
@@ -433,7 +395,7 @@ def build_flash_attn_bwd_odo_module(
         # THD packs O/dO as [B,S,Hq,D] but SBHD is [S,B,Hq,D], so the seq step is B*Hq*D
         # there. DELTA stays batch-major [B,Hq,S] in both cases.
         if const_expr(sbhd):
-            base = ((s * fx.Index(batch_size) + b) * fx.Index(NUM_HEADS_Q) + hq) * fx.Index(HEAD_DIM)
+            base = ((s * ball + b) * fx.Index(NUM_HEADS_Q) + hq) * fx.Index(HEAD_DIM)
         else:
             base = ((b * sl + s) * fx.Index(NUM_HEADS_Q) + hq) * fx.Index(HEAD_DIM)
         # This lane's 16 B slice of the row; both loads are in flight before either is used.
@@ -441,6 +403,23 @@ def build_flash_attn_bwd_odo_module(
         off = base + chunk * fx.Index(VEC)
         ov = buffer_ops.buffer_load(o_rsrc, off, vec_width=VEC, dtype=elem_dtype_l, cache_modifier=2)
         dv = buffer_ops.buffer_load(do_rsrc, off, vec_width=VEC, dtype=elem_dtype_l, cache_modifier=2)
+        if const_expr(FILL_IMG):
+            img_rsrc = buffer_ops.create_buffer_resource(
+                IMG, max_size=False, num_records_bytes=_raw(total * fx.Index(HEAD_DIM * 2))
+            )
+            if const_expr(IMG_SLAB):
+                _loc = (st * fx.Index(WG_PER_STILE) + ht) * fx.Index(BLOCK * VEC) + tid * fx.Index(VEC)
+                _slab = sl * fx.Index(NUM_HEADS_Q * HEAD_DIM)
+                img_off, img_mask = b * _slab + _loc, ArithValue(_loc < _slab)
+            else:
+                img_off, img_mask = off, in_range
+            buffer_ops.buffer_store(
+                Vec.filled(VEC, 0.0, fx.Float32).to(elem_dtype_l).ir_value(),
+                img_rsrc,
+                img_off * fx.Index(2),
+                mask=img_mask,
+                offset_is_bytes=True,
+            )
         prod = Vec(ov).to(fx.Float32) * Vec(dv).to(fx.Float32)
         acc = fx.Float32(0.0)
         for i in range_constexpr(VEC):
@@ -476,6 +455,7 @@ def build_flash_attn_bwd_odo_module(
         O: fx.Tensor,
         DO: fx.Tensor,
         DELTA: fx.Tensor,
+        IMG: fx.Tensor,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         stream: fx.Stream,
@@ -488,6 +468,7 @@ def build_flash_attn_bwd_odo_module(
             O,
             DO,
             DELTA,
+            IMG,
             batch_size,
             seq_len,
             value_attrs={
@@ -498,8 +479,10 @@ def build_flash_attn_bwd_odo_module(
 
     _compiled: dict = {}
 
-    def _launch(*args, **kwargs):
-        return _cached_launch(_compiled, launch_flash_attn_bwd_odo, None, args, kwargs)
+    def _launch(O, DO, DELTA, batch_size, seq_len, stream, img=None):
+        assert img is not None or not FILL_IMG, "fill_img build needs an img argument"
+        args = (O, DO, DELTA, DELTA if img is None else img, batch_size, seq_len, stream)
+        return _cached_launch(_compiled, launch_flash_attn_bwd_odo, None, args, {})
 
     def _compile(*args):
         return flyc.compile(launch_flash_attn_bwd_odo, *args)
@@ -739,7 +722,6 @@ def build_flash_attn_bwd_dqred_module(
     BAND_BYTES = batch_size * SQ * HD * 2 * ILV
     BAND_STRIDE = BAND_BYTES + band_pad
     PAIR = int(band_pair)
-    # Rows one band group leaves unwritten under causal, in bytes: its own first q row.
     PAIR_ROW_BYTES = ILV * block_kv * HD * 2 * ILV
     assert BAND_BYTES < (1 << 32), "band group must fit a 32-bit num_records"
     ROW0 = bat_lo * SQ
@@ -946,7 +928,7 @@ def build_flash_attn_bwd_dqred_module(
             if const_expr(RING):
                 _grp = _grp % fx.Index(RING)
             if const_expr(PAIR):
-                # The writer's fold, read back (see _wsq_pair_ok). Same two terms, same order.
+                # Mirrors the writer's fold term for term (see _wsq_pair_ok); order must match.
                 _hi = ArithValue(_grp * fx.Index(2) > fx.Index(PAIR))
                 _shift = fx.Index(_hi.select(_grp * fx.Index(PAIR_ROW_BYTES), fx.Index(0)))
                 _grp = fx.Index(_hi.select(fx.Index(PAIR) - _grp, _grp))
@@ -1177,15 +1159,126 @@ def build_flash_attn_bwd_slotred_module(
     return _launch
 
 
+_A16_BLOCK = 256
+# (batch, q tile, head) units one wave un-permutes; the pass is memory-level-parallelism bound.
+_A16_UC_D128 = 1
+_A16_UC_D64 = 4
+_DQA16_CACHE: dict = {}
+
+
+def _a16_uc(D):
+    """Un-permute units per wave; see _A16_UC_D64."""
+    return _A16_UC_D128 if D == 128 else _A16_UC_D64
+
+
+def build_flash_attn_bwd_dqa16_module(B, Sq, Hq, D, sm_scale, sbhd=True, bat_lo=0, n_bat=None):
+    """Un-permute the a16 dQ image (see ``_g3_a16``) into dQ, scaled: a pure bit permutation of the
+    flat index, no LDS and no cross-lane step. The lane map looks scrambled on the READ side on
+    purpose -- it is picked so a lane's dwords are consecutive and each store fills a write granule."""
+    gpu_arch = get_hip_arch()
+    assert gpu_arch.startswith("gfx950"), "a16 un-permute kernel targets gfx950"
+    elem_dtype = dtype_to_elem_type("bf16")
+    NPAIR = D // 32
+    assert D % 32 == 0 and Sq % 16 == 0
+    WPG = _A16_BLOCK // 64
+    UC = _a16_uc(D)
+    BAT_LO = int(bat_lo)
+    NBAT = B if n_bat is None else int(n_bat)
+    assert 0 <= BAT_LO and BAT_LO + NBAT <= B
+    NWAVE = NBAT * (Sq // 16) * Hq // UC
+    assert Hq % UC == 0 and NWAVE % WPG == 0, "uc must tile the head axis and the work-group"
+    NTILE = Sq // 16
+    IMG_B = Sq * Hq * D  # elements one batch owns
+
+    @flyc.kernel(known_block_size=[_A16_BLOCK, 1, 1])
+    def flash_attn_bwd_dqa16_kernel(IMG: fx.Tensor, DQ: fx.Tensor):
+        tid = fx.Index(gpu.thread_idx.x)
+        wid = fx.Index(gpu.block_idx.x) * fx.Index(WPG) + tid // fx.Index(64)
+        lane = tid % fx.Index(64)
+        lane16 = lane & fx.Index(15)
+        w1 = (lane >> fx.Index(5)) & fx.Index(1)
+        kgh = (lane >> fx.Index(4)) & fx.Index(1)
+        _u = wid * fx.Index(UC)
+        qh = _u % fx.Index(Hq)
+        _r = _u // fx.Index(Hq)
+        qt = _r % fx.Index(NTILE)
+        bb = _r // fx.Index(NTILE)
+        if const_expr(BAT_LO):
+            bb = bb + fx.Index(BAT_LO)
+
+        img_rsrc = buffer_ops.create_buffer_resource(IMG, max_size=True)
+        dq_rsrc = buffer_ops.create_buffer_resource(DQ, max_size=True)
+        ibase = (
+            bb * fx.Index(IMG_B)
+            + (qt * fx.Index(Hq) + qh) * fx.Index(NPAIR * 512)
+            + w1 * fx.Index(256)
+            + kgh * fx.Index(64)
+            + lane16 * fx.Index(2)
+        )
+        parts = [
+            [
+                buffer_ops.buffer_load(
+                    img_rsrc,
+                    ibase + fx.Index(c * NPAIR * 512 + p * 512 + w0 * 128 + kgl * 32),
+                    vec_width=2,
+                    dtype=elem_dtype,
+                )
+                for kgl in range_constexpr(2)
+                for w0 in range_constexpr(2)
+            ]
+            for c in range_constexpr(UC)
+            for p in range_constexpr(NPAIR)
+        ]
+        q = (
+            (qt >> fx.Index(1)) * fx.Index(32)
+            + ((lane16 >> fx.Index(2)) & fx.Index(1)) * fx.Index(16)
+            + (qt & fx.Index(1)) * fx.Index(8)
+            + (lane16 >> fx.Index(3)) * fx.Index(4)
+            + (lane16 & fx.Index(3))
+        )
+        if const_expr(sbhd):
+            _row = q * fx.Index(B) + bb
+        else:
+            _row = bb * fx.Index(Sq) + q
+        obase = (_row * fx.Index(Hq) + qh) * fx.Index(D) + w1 * fx.Index(16) + kgh * fx.Index(8)
+        sm_vec = Vec.filled(8, sm_scale, fx.Float32)
+        for j in range_constexpr(UC * NPAIR):
+            _lo = Vec(parts[j][0]).shuffle(Vec(parts[j][1]), [0, 1, 2, 3])
+            _hi = Vec(parts[j][2]).shuffle(Vec(parts[j][3]), [0, 1, 2, 3])
+            _v = _lo.shuffle(_hi, [0, 1, 2, 3, 4, 5, 6, 7])
+            buffer_ops.buffer_store(
+                (_v.to(fx.Float32) * sm_vec).to(elem_dtype).ir_value(),
+                dq_rsrc,
+                (obase + fx.Index((j // NPAIR) * D + (j % NPAIR) * 32)) * fx.Index(2),
+                offset_is_bytes=True,
+            )
+
+    @flyc.jit
+    def launch_flash_attn_bwd_dqa16(IMG: fx.Tensor, DQ: fx.Tensor, stream: fx.Stream):
+        flash_attn_bwd_dqa16_kernel(
+            IMG,
+            DQ,
+            value_attrs={"rocdl.flat_work_group_size": f"{_A16_BLOCK},{_A16_BLOCK}"},
+        ).launch(grid=(fx.Index(NWAVE // WPG), 1, 1), block=(_A16_BLOCK, 1, 1), stream=stream)
+
+    _compiled: dict = {}
+
+    def _launch(*args, **kwargs):
+        return _cached_launch(_compiled, launch_flash_attn_bwd_dqa16, None, args, kwargs)
+
+    def _compile(*args):
+        return flyc.compile(launch_flash_attn_bwd_dqa16, *args)
+
+    _launch.compile = _compile
+    return _launch
+
+
 def build_flash_attn_bwd_dkdv_module(
     num_heads,
     head_dim,
     causal=True,
     dtype_str="bf16",
     sm_scale=None,
-    # waves_per_eu is a request, not a cap: LLVM's own allocation already fixes occupancy on
-    # both bodies, so this knob and --amdgpu-num-vgpr compile byte-identical ISA. Shrinking
-    # the body's registers to widen the co-resident dQ reduce's seat costs more than it buys.
     waves_per_eu=2,
     block_kv=128,
     # block_q: q rows staged per q-loop trip (None = _BWD_BLOCK_Q). Under a left window a
@@ -1203,6 +1296,9 @@ def build_flash_attn_bwd_dkdv_module(
     # more than it saves in fences -- cutting fences is not this body's currency,
     # MFMA-run density is.
     g2d=1,
+    mfma_tie=0,
+    mfma_tie_cons=0,  # index into _MFMA_TIE_CONS
+    dv_pin=None,
     # dma_grp: how many GQA heads stage their Q/dO tiles in one shot, see _q_body.
     dma_grp=1,
     # pf_ring: double the Q/dO slot ring (2*dma_grp deep) and stage one head-group ahead,
@@ -1221,6 +1317,9 @@ def build_flash_attn_bwd_dkdv_module(
     wsq_ilv=1,  # adjacent bands sharing one partial row (see _WSQ_BAND_ILV)
     wsq_ring=0,  # >0: band groups reuse this many workspace slots (see _wsq_ring_for)
     wsq_pair=0,  # >0: total band groups, folded in pairs g / ng-g (see _wsq_pair_ok)
+    # wsq_a16: add dQ into a band-less bf16 image with atomics instead of split-K partials;
+    # the caller owes the zeroing and the un-permute (see _DQ_A16, FILL_IMG).
+    wsq_a16=False,
     # band_span: >0 = this launch owns ONE GROUP of that many kv bands (see _band_span_for).
     # K/V/DK/DV still span the whole kv axis; the group's first kv row arrives as a device
     # scalar in the CuSeqKv slot, and seq_len_k is the group's own extent, so the grid, the
@@ -1230,10 +1329,6 @@ def build_flash_attn_bwd_dkdv_module(
     # g3_kreg: hold GEMM3's whole K^T fragment set live for the band instead of reading it
     # back per head-step. K^T is head-invariant, so this is pure read removal. See G3_KREG.
     g3_kreg=False,
-    # num_xcd: the XCD-major decode's fan-out (None = _NUM_XCD), i.e. how many (batch, kv_head)
-    # groups the resident work-groups spread over. Each XCD's Q/dO image is private to its own
-    # groups, so this belongs at the physical XCD count; lowering it costs. See block_id.
-    num_xcd=None,
     g3_dbat=None,
     g3d=None,  # GEMM3 kstep prefetch ring depth (None = 6, capped by G3_KSTEPS). See G3D.
     # q_pref: stage the Q/dO tiles through VGPRs and issue head h+1's fetch at the top of
@@ -1254,13 +1349,16 @@ def build_flash_attn_bwd_dkdv_module(
     # and per-work-group work are otherwise untouched, so dQ/dK/dV stay bitwise identical.
     qsp_lo=0,
     n_qsp=None,  # None = all q_split subsets (single whole-band dispatch)
-    # bat_lo: dispatch only batches [bat_lo, bat_lo+batch_size), where batch_size is the LAUNCH
-    # argument. Batch is a whole slab of every tensor read and every workspace written here, so
-    # this is a pure grid restriction and stays bitwise identical. See _fused_pipelined.
     bat_lo=0,
-    # flat_wg: really a REGISTER-FILE choice. 512 (8 waves, two per SIMD) caps each wave at 256
-    # architected registers; 256 (4 waves, one per SIMD) opens the whole 512-register file via
-    # AGPRs, which is what fits the fused band spill-free and seats the co-resident dQ reduce.
+    # flat_wg: work-group size, and on this part it is really a REGISTER-FILE choice.
+    # 512 (8 waves) puts two waves on every SIMD, capping each at 256 architected
+    # registers; 256 (4 waves, one per SIMD) opens the whole 512-register file to a
+    # single wave via AGPRs. The wide fused band needs the second form: its wider
+    # accumulator set only fits spill-free there, and one wave per SIMD also doubles
+    # ROWS_PER_WAVE_KV so each transpose-read feeds more MFMAs. The two forms trade
+    # per-cycle efficiency against clock roughly evenly on their own; what makes the
+    # four-wave form the right pick is the registers per SIMD it leaves free, which is
+    # what lets the dQ reduce co-reside (see `_dq_partial_ws` / `_fused_pipelined`).
     flat_wg=256,
 ):
     """Build the dK/dV KV-outer backward launcher (clean mirror of the forward).
@@ -1288,7 +1386,7 @@ def build_flash_attn_bwd_dkdv_module(
 
     BLOCK_Q = _BWD_BLOCK_Q if block_q is None else int(block_q)
     WARP_SIZE = 64
-    NUM_XCD = _NUM_XCD if num_xcd is None else int(num_xcd)
+    NUM_XCD = _NUM_XCD
     BLOCK_KV = block_kv
     Q_SPLIT = q_split
     assert q_split >= 1
@@ -1300,9 +1398,6 @@ def build_flash_attn_bwd_dkdv_module(
     flat_work_group_size = flat_wg
     NUM_WAVES = flat_work_group_size // WARP_SIZE
     BLOCK_SIZE = flat_work_group_size
-    # A band is owned in KV_HALVES passes of BKV_H rows; only the dK/dV accumulators and the
-    # dS staging exist per band, everything else is sized by the pass. Splitting the pass
-    # re-reads the q-side operands once per pass, so it costs LDS read traffic (see flat_wg).
     KV_HALVES = max(1, int(kv_halves))
     assert KV_HALVES == 1 or BLOCK_KV % (KV_HALVES * NUM_WAVES * 16) == 0
     BKV_H = BLOCK_KV // KV_HALVES
@@ -1323,9 +1418,13 @@ def build_flash_attn_bwd_dkdv_module(
     K_STEPS_QK = head_dim // K_STEP_QK  # d64 -> 2
     NT = ROWS_PER_WAVE_KV // N_TILE  # kv 16-tiles per wave: 32/16 = 2
     MT = BLOCK_Q // M_TILE  # q 16-tiles: 64/16 = 4
+    # The rotation granule must stay INSIDE the tile: too wide runs a wave's dS rows into the
+    # next wave's, and only dQ goes wrong.
+    G3S_SWZ = min(BLOCK_Q, 64) // 8 - 1
     DT = head_dim // D_TILE  # D 16-tiles: 64/16 = 4
     PV_K_STEP = 32  # K=32 per GEMM2 MFMA (contract over q)
     PV_K_STEPS = BLOCK_Q // PV_K_STEP  # 64/32 = 2
+    assert PV_K_STEPS >= 1, "BLOCK_Q must cover one GEMM2 K-step (>= 2 * N_TILE q rows)"
 
     # ---- Fifth GEMM (dQ). dQ^T[m=D][n=q] = K^T @ dS^T contracts over the block's kv
     # rows, so both operands need the kv axis as the MFMA k axis: the prescaled K tile
@@ -1339,6 +1438,7 @@ def build_flash_attn_bwd_dkdv_module(
     WSQ_RING = int(wsq_ring)
     WSQ_PAIR = int(wsq_pair)
     assert not WSQ_PAIR or (not WSQ_RING and window_left < 0 and WSQ_PAIR % 2 == 0)
+    WSQ_A16 = bool(wsq_a16)
     # A band group only shifts where this launch's kv rows sit; every other assumption of the
     # body has to still hold, so it rides the plain full-causal path only -- square SBHD, or
     # ragged (whose bands are per segment).
@@ -1354,10 +1454,10 @@ def build_flash_attn_bwd_dkdv_module(
     # a register trade. It wins by a wide margin: leaving the V packs in registers costs
     # 16 VGPR for the whole kernel and measured 225 spill dwords (vs 36) and -6%.
     G3_KSTEPS = BLOCK_KV // PV_K_STEP  # kv 32-steps per band
-    # A wave's output patch is the squarest G3_TILES-tile rectangle, which minimizes transpose
-    # reads per MFMA; GEMM3 runs on only the first G3_WAVES waves. The ring sits where the
-    # carrier wave has no other MFMA to issue, so depth is free -- and inert under G3_KREG.
     G3D = min(6 if g3d is None else int(g3d), G3_KSTEPS)
+    MFMA_TIE = int(mfma_tie or 0)
+    MFMA_TIE_CONS = _MFMA_TIE_CONS[int(mfma_tie_cons)]
+    DV_PIN = (NT >= 3) if dv_pin is None else bool(dv_pin)
     G3_WAVES = min(NUM_WAVES, max(1, DT * MT // min(4, DT * MT)))  # waves carrying GEMM3
     G3_TILES = max(1, DT * MT // G3_WAVES)  # output tiles per carrier wave
     # Re-pricing GEMM3's patch shape once K^T is band-resident (G3_KRT) is bound by the
@@ -1435,10 +1535,6 @@ def build_flash_attn_bwd_dkdv_module(
     # BLOCK_Q doesn't divide BLOCK_KV (or FQ_PAIR fixes the trip count at NB) the band
     # nearest the sequence end walks past real rows and needs an explicit mask term.
     Q_BOUND = window_left >= 0 and (BLOCK_KV % BLOCK_Q != 0 or FQ_PAIR)
-    # WIN_FOLD: let the masked tiles take the lse C-init too instead of the zero one, on full
-    # causal as well as windowed. Legal only with exp_intrin, whose select+exp2 is then the
-    # accumulator read carrying the MFMA hazard wait the identity fma used to buy (see _p_of).
-    WIN_FOLD = True
     # WIN_DIST: mask off one live band-relative distance instead of a live compare pair per element.
     WIN_DIST = window_left >= 0
     # WIN_KV_BELOW: a rectangle's low kv rows fall out of every q row's window, so give their K/V
@@ -1517,28 +1613,22 @@ def build_flash_attn_bwd_dkdv_module(
     # MASK_SKIP: let a wave sit out a diagonal q-block whose kv rows it cannot see. Its
     # P and dS are zero there, so this only removes work -- the output is bitwise equal.
     MASK_SKIP = window_left < 0
-    # MASK_ALIGN: resolve the diagonal q-block's mask per wave instead of masking every live
-    # wave's whole 16-tile set; bitwise equal (every removed MFMA had a zero B operand). Needs
-    # q un-rebased, so rectangular, varlen, BAND_SPAN and FQ_PAIR all break the exact multiple.
+    # MASK_ALIGN: resolve the diagonal q-block's wave classes per wave instead of masking every
+    # live wave's whole tile set. Every MFMA it drops had an exactly-zero B operand, so dK/dV/dQ
+    # stay bitwise equal. Square-only: _kv_first_q's clamp, BAND_LIFT and FQ_PAIR re-base q.
     MASK_ALIGN = (
         MASK_SKIP
         and (square and not varlen and not BAND_SPAN and not FQ_PAIR)
         and ROWS_PER_WAVE_KV == BLOCK_Q
     )
-    # QDESC: walk the unmasked bulk of the q loop DOWNWARDS. A band's q range starts at its own
-    # kv row, so descending makes the bands converge on one q block and leaves the dQ fold
-    # denser partial rows. Windowed bands rotate phase instead, so this is full-causal only.
     QDESC = window_left < 0
-    # Bands per phase group: the phases keep the gathered bands off each OTHER's dQ partial
-    # rows. How many bands pile onto one q block is set by the dwell -- a work-group holds a
-    # q block for GQA_GROUP_SIZE head-steps -- so this has to track the group, not a constant.
-    QDESC_R = max(1, GQA_GROUP_SIZE // 2)
-    # GEMM1 ks-outer: the four kv tiles of one k-step first, so consecutive MFMAs write
-    # different accumulators and issue without waiting -- the default at D128, where one wave
-    # per SIMD has no sibling to hide that. D64 takes ks-inner; the dwords freed fund the reduce.
+    QDESC_R = 2 if (WSQ_A16 and HEAD_DIM == 128) else max(1, GQA_GROUP_SIZE // 2)
+    # GEMM1 emits ks-outer: the four kv tiles of one k-step first, so consecutive MFMAs
+    # write different accumulators and the next one issues without waiting on the last
+    # one's result. At D128 (one wave per SIMD) there is no sibling wave to cover that
+    # latency at all; at D64 it still pays, together with PF_QB.
     G1_KS_OUTER = (HEAD_DIM == 128) if g1_ks_outer is None else bool(g1_ks_outer)
     # QSP_ABS: phase the q-split onto ABSOLUTE q blocks (split s owns (q/BLOCK_Q) % Q_SPLIT == s)
-    # -- the map the reduce and pipeline sub-range cut assume (see _qsp_absolute).
     QSP_ABS = _qsp_absolute(HEAD_DIM, BLOCK_KV, Q_SPLIT, BLOCK_Q)
     # QDO_TAIL: publish head h+1's Q/dO tile at the END of head-step h instead of at its
     # own start, so the drain + barrier that already fences dS publishes BOTH and the
@@ -1578,9 +1668,6 @@ def build_flash_attn_bwd_dkdv_module(
     LD_HEAD_ELEMS = BLOCK_Q
     LD_ARR_ELEMS = GQA_GROUP_SIZE * LD_HEAD_ELEMS
     LD_ELEMS = 2 * LD_ARR_ELEMS
-    # A group with fewer than BLOCK_SIZE // BLOCK_Q heads has fewer elements to stage than the
-    # work-group has threads, so cap a head's span at one element per thread. Threads past
-    # LD_ACTIVE repeat the first ones -- same source, same LDS address, same value, idempotent.
     LD_THREADS_PER_HEAD = min(BLOCK_SIZE // GQA_GROUP_SIZE, LD_HEAD_ELEMS)
     LD_VEC = LD_HEAD_ELEMS // LD_THREADS_PER_HEAD
     LD_ACTIVE = GQA_GROUP_SIZE * LD_THREADS_PER_HEAD
@@ -1598,8 +1685,6 @@ def build_flash_attn_bwd_dkdv_module(
     # view so every reader (_a_idx / _read_tr / _kv_lds_idx / _g3s_idx) addresses them the
     # same way.
     LDS_VIEW_ELEMS = LDS_TOTAL * LDS_SLOTS
-    # Staging GEMM1b's V operand through LDS does not free the architected registers it looks
-    # like it should: LLVM keeps the packs live to feed the ds_write anyway.
     V_LDS = False
     # K_REG: GEMM3 transpose-reads the staged K tile, but GEMM1a's B operand can come
     # from the register packs that filled it instead of being re-read from LDS once per
@@ -1614,8 +1699,6 @@ def build_flash_attn_bwd_dkdv_module(
     G3_KRT = G3_DT if G3_KREG else 0
     G3K_BASE = LDS_VIEW_ELEMS  # prescaled K [BLOCK_KV][HEAD_DIM]
     G3V_BASE = G3K_BASE + BLOCK_KV * HEAD_DIM  # V [BLOCK_KV][HEAD_DIM]
-    # dS [slot][BLOCK_KV][BLOCK_Q]. LDS is not what caps occupancy here -- one wave per SIMD
-    # is what the register file says -- so freeing LDS only helps a candidate that needs it.
     G3S_BASE = G3V_BASE + (BLOCK_KV * HEAD_DIM if V_LDS else 0)
     G3S_SLOT_ELEMS = BKV_H * BLOCK_Q
     G3S_GRP_ELEMS = KV_HALVES * G3S_SLOT_ELEMS
@@ -1626,13 +1709,7 @@ def build_flash_attn_bwd_dkdv_module(
     # while the body ran eight waves per work-group and loses at four: the extra slot's
     # registers and LDS have no sibling MFMA run left to hide the retired fences under.
     G3_DEFER = bool(g3_defer)
-    # G3_AT: _hs_hook position of the deferred GEMM3. 0 = the head-step top; 3*pks+1 puts its
-    # MFMAs on q-half pks's dS/pack window. Only the DEFERRED path has a call to move, and
-    # moving it has priced at or below zero on both head dims -- see G3_VALU.
     G3_AT = 0
-    # G3_VALU: request an MFMA<->VALU co-execution pipeline (sched_group_barrier group 1) over
-    # GEMM3's MFMA run and the dS/pack VALU block. 0 = off and byte-identical; it stays off
-    # because GEMM3's MFMAs are already 1:1 with the transpose reads that feed them.
     G3_VALU = 0
     G3_MFMA = G3_DT * G3_QT * G3_KSTEPS  # MFMAs one whole GEMM3 pass emits per wave
     G3_ST_AT = -1 if g3_st_at is None else int(g3_st_at)
@@ -1702,6 +1779,24 @@ def build_flash_attn_bwd_dkdv_module(
         def mfma_acc(a, b, c):
             return _mfma(rocdl.mfma_f32_16x16x32_bf16, a, b, c)
 
+        # A GLOBAL tie is dead: v_cvt_pk_bf16_f32 cannot read AGPR, so a tied S/dP chain lands there.
+        _tie_ty = ir.Type.parse("vector<4xf32>")
+
+        def mfma_tied(a, b, c):
+            return ArithValue(
+                llvm.inline_asm(
+                    _tie_ty,
+                    [_raw(a), _raw(b), _raw(c)],
+                    "v_mfma_f32_16x16x32_bf16 $0, $1, $2, $0",
+                    MFMA_TIE_CONS,
+                    has_side_effects=False,
+                )
+            )
+
+        mfma_dv = mfma_tied if (MFMA_TIE & 1) else mfma_acc
+        mfma_dk = mfma_tied if (MFMA_TIE & 2) else mfma_acc
+        mfma_dq = mfma_acc
+
         seq_len_q_v = fx.Index(seq_len_q)
         seq_len_k_v = fx.Index(seq_len_k)
         causal_off_i32 = fx.Int32(seq_len_k) - fx.Int32(seq_len_q)
@@ -1766,9 +1861,6 @@ def build_flash_attn_bwd_dkdv_module(
                 split_idx = fx.Index(QSP_LO)
             kv_tile_idx = _rest % num_kv_tiles
             batch_idx = _rest // num_kv_tiles
-        # A batch sub-range launch keeps the decode above and shifts its result: the grid
-        # carries the COUNT (the launch's batch_size) and this carries the base, so every
-        # address downstream is the one the whole-batch launch would have formed. See bat_lo.
         if const_expr(BAT_LO):
             batch_idx = batch_idx + fx.Index(BAT_LO)
         # SHADOW seq_len_q_v/k_v to the per-segment length so downstream base/SRD/loop-bounds follow the segment (byte-identical when uniform; grid tiles were fixed from max above).
@@ -2076,10 +2168,6 @@ def build_flash_attn_bwd_dkdv_module(
         if const_expr(WSQ_RING):
             _wsq_grp = _wsq_grp % fx.Index(WSQ_RING)
         if const_expr(WSQ_PAIR):
-            # Groups above the midpoint ride their partner's dead prefix (see _wsq_pair_ok):
-            # slab ng-g, and the group's own first row lands at the slab's row 0. Folded into
-            # the descriptor base so the store's row offset stays the plain q index. The whole
-            # term is const_expr'd out when the fold is off, keeping that ISA byte-identical.
             _hi = ArithValue(_wsq_grp * fx.Index(2) > fx.Index(WSQ_PAIR))
             _wsq_shift = fx.Index(_hi.select(_wsq_grp * fx.Index(WSQ_ILV * BLOCK_KV) * _wsq_row, fx.Index(0)))
             _wsq_grp = fx.Index(_hi.select(fx.Index(WSQ_PAIR) - _wsq_grp, _wsq_grp))
@@ -2092,6 +2180,18 @@ def build_flash_attn_bwd_dkdv_module(
             num_records_bytes=_raw(_wsq_slice),
             base_byte_offset=_raw(_wsq_base),
         )
+        if const_expr(WSQ_A16):
+            _wsq16_slice = seq_len_q_v * fx.Index(NUM_HEADS_Q * HEAD_DIM * 2)
+            wsq16_rsrc = buffer_ops.create_buffer_resource(
+                WSQ,
+                max_size=False,
+                num_records_bytes=_raw(_wsq16_slice),
+                base_byte_offset=_raw(
+                    (q_tok_base * fx.Index(NUM_HEADS_Q * HEAD_DIM * 2))
+                    if const_expr(varlen)
+                    else (batch_idx * _wsq16_slice)
+                ),
+            )
         _lse_per_batch = seq_len_q_v * fx.Index(NUM_HEADS_Q)
         _lse_nrec_bytes = _raw(_lse_per_batch * fx.Index(4))
         if const_expr(varlen):
@@ -2277,45 +2377,12 @@ def build_flash_attn_bwd_dkdv_module(
         c_zero_f = fx.Float32(0.0)
         c_zero_v4f32 = Vec.filled(4, 0.0, fx.Float32)
 
-        def _vexp(x):
-            # Bare v_exp_f32 (hardware 2^x), NON-side-effecting -> the compiler overlaps
-            # it into the GEMM MFMA bubbles naturally. No ldexp (softmax diff <= 0, so
-            # 2^diff is in (0,1] and needs no range reduction).
-            return fx.Float32(
-                llvm.inline_asm(
-                    ir.F32Type.get(), [_raw(x)], "v_exp_f32 $0, $1", "=v,v", has_side_effects=False
-                )
-            )
-
-        def _vexp_after(x, dep):
-            # Same v_exp plus a DEAD input operand ($2 is unreferenced by the asm text,
-            # so nothing is emitted for it) whose only job is to order this read after
-            # `dep` -- the FOLD hazard anchor in _head_step_lds needs one compiler-visible
-            # read of the MFMA accumulator to buy the wait states for later reads.
-            return fx.Float32(
-                llvm.inline_asm(
-                    ir.F32Type.get(),
-                    [_raw(x), _raw(dep)],
-                    "v_exp_f32 $0, $1",
-                    "=v,v,v",
-                    has_side_effects=False,
-                )
-            )
-
         def _vexp_intrin(x):
-            # Backend-visible 2^x: emits the same v_exp_f32 but, being a recognised VALU
-            # op rather than opaque inline asm, it IS a compiler-visible read of the MFMA
-            # accumulator -- so it carries the MFMA->VALU hazard itself and anchors the v4
-            # at no extra instruction (replaces the v_min anchor + _vexp_after dead-operand
-            # trick with zero added VALU on the exp-issue-bound critical path).
+            # Backend-visible 2^x: unlike opaque inline asm it is a compiler-visible read of
+            # the MFMA accumulator, so it carries the MFMA->VALU hazard itself.
             return fx.Float32(
                 llvm.call_intrinsic(ir.F32Type.get(), "llvm.amdgcn.exp2.f32", [_raw(x)], [], [])
             )
-
-        def _p_of(s_r, lse_t, apply_mask):
-            assert apply_mask, "FOLD bulk uses the hazard-anchored path in _head_step_lds"
-            s_r = fmath.fma(s_r, fx.Float32(1.0), lse_t, fastmath=fm_fast)
-            return _vexp(s_r)
 
         # A-operand read (Q/dO from LDS): A[m=q=lane16][k=D=kg*8+s]. mt selects the
         # 16-q tile (row = mt*16 + lane16), ks the D 32-step (D = ks*32 + kg*8).
@@ -2368,10 +2435,6 @@ def build_flash_attn_bwd_dkdv_module(
             optionally pre-loads the accumulator (folds -delta into the dP GEMM for free).
             mts restricts work to a subset of the MT q-tiles (per-half GEMM1); the
             output is keyed by mt so [2,3] halves index correctly.
-
-            drop(mt, nt) marks a 16-tile whose result is not read at all (a fully masked
-            tile on the diagonal wave, see MASK_ALIGN): its output stays None and its
-            MFMAs are never emitted.
 
             b_packs is either a register list or, for a tile staged in LDS, its base: the
             fragments are then re-read per head-step so they are live only across this GEMM
@@ -2553,6 +2616,10 @@ def build_flash_attn_bwd_dkdv_module(
         #   qp = [a b1 b0 c d1 d0]  -> qp = 32*(mt//2) + 8*kg + 4*(mt%2) + t
         # GEMM3 contracts over kv, so the permuted n axis only permutes dQ output rows;
         # `_g3_qrow` inverts it at the partial store and every value stays bit-identical.
+        def _g3s_addr(r, qp):
+            """dS element offset of (kv row ``r``, already-swizzled q column ``qp``)."""
+            return r * fx.Index(BLOCK_Q) + qp
+
         def _g3s_wbase():
             """Pinned (nt=0, q-run=0, slot=0) dS write address for this lane's kv row.
 
@@ -2564,8 +2631,7 @@ def build_flash_attn_bwd_dkdv_module(
             _r = wave_id * fx.Index(ROWS_PER_WAVE_KV) + lane16
             return _opaque_idx(
                 fx.Index(G3S_BASE)
-                + _r * fx.Index(BLOCK_Q)
-                + ((kg * fx.Index(8)) ^ ((lane16 & fx.Index(7)) * fx.Index(8)))
+                + _g3s_addr(_r, (kg * fx.Index(8)) ^ ((lane16 & fx.Index(G3S_SWZ)) * fx.Index(8)))
             )
 
         def _g3_qrow(tile):
@@ -2591,11 +2657,11 @@ def build_flash_attn_bwd_dkdv_module(
             _r = _g3_row0()
             return _opaque_idx(
                 fx.Index(G3S_BASE)
-                + _r * fx.Index(BLOCK_Q)
-                + (
+                + _g3s_addr(
+                    _r,
                     (tile0 * fx.Index(D_TILE))
                     ^ ((lane % fx.Index(4)) * fx.Index(4))
-                    ^ ((_r & fx.Index(7)) * fx.Index(8))
+                    ^ ((_r & fx.Index(G3S_SWZ)) * fx.Index(8)),
                 )
             )
 
@@ -2695,6 +2761,30 @@ def build_flash_attn_bwd_dkdv_module(
                     offset_is_bytes=True,
                 )
 
+            def _g3_a16(_g3p, i, j):
+                """The store's own 16 B, added in as four packed-bf16 atomics. A store's lanes
+                coalesce into one line write, but an atomic is a line RMW per lane group."""
+                # Coalesced image: byte = blk*1024 + w*256 + lane*4 with blk = (qtile_g*Hq
+                # + qh)*NPAIR + dpair. build_flash_attn_bwd_dqa16_module inverts exactly this.
+                _qt = (q_start >> fx.Index(4)) + _g3q0 + fx.Index(j * G3_SPL_STRIDE)
+                _blk = (_qt * fx.Index(NUM_HEADS_Q) + _g3qh) * fx.Index(DT // 2) + (
+                    (_g3d0 + fx.Index(i)) >> fx.Index(1)
+                )
+                _a16 = ArithValue(_raw(_blk * fx.Index(1024) + lane * fx.Index(4))).index_cast(
+                    fx.Int32.ir_type
+                )
+                _step = 256
+                _pk = Vec(_g3p)
+                # An sc0 bit here would silently drop most of the atomic updates.
+                for _w in range_constexpr(4):
+                    rocdl.raw_ptr_buffer_atomic_fadd(
+                        _pk.shuffle(_pk, [_w]).bitcast(elem_dtype).ir_value(),
+                        wsq16_rsrc,
+                        _a16,
+                        _step * _w,
+                        0,
+                    )
+
             for _gi in range_constexpr(len(_dgs)):
                 _dg = _dgs[_gi]
                 _g3 = [[c_zero_v4f32 for _ in _qs] for _ in range_constexpr(len(_dg))]
@@ -2705,7 +2795,7 @@ def build_flash_attn_bwd_dkdv_module(
                         _ring[_kk % _gd] = _g3_frags(_kk + _gd, _dg)
                     for i in range_constexpr(len(_dg)):
                         for jj in range_constexpr(len(_qs)):
-                            _g3[i][jj] = mfma_acc(_g3k[i], _g3s[jj], _g3[i][jj])
+                            _g3[i][jj] = mfma_dq(_g3k[i], _g3s[jj], _g3[i][jj])
                 if const_expr(drain is not None and _gi == 0):
                     drain()
                 for i2 in range_constexpr(len(_dg) // 2):
@@ -2716,10 +2806,12 @@ def build_flash_attn_bwd_dkdv_module(
                         _g3p = bf16_trunc_scored_v4(_g3[i][jj]).shuffle(
                             bf16_trunc_scored_v4(_g3[i + 1][jj]), [0, 1, 2, 3]
                         )
+                        # Bound as a default below so a deferred store keeps its own emitter.
+                        _st_fn = _g3_a16 if const_expr(WSQ_A16) else _g3_store
                         if const_expr(st_sink is None):
-                            _g3_store(_g3p, _gd0, j)
+                            _st_fn(_g3p, _gd0, j)
                         else:
-                            st_sink.append(lambda p=_g3p, _i=_gd0, _j=j: _g3_store(p, _i, _j))
+                            st_sink.append(lambda p=_g3p, _i=_gd0, _j=j, _f=_st_fn: _f(p, _i, _j))
 
         # HOIST_PIN: the pinned bases are functions of wave_id and lane only, invariant
         # over the whole q-loop. `_opaque_idx` stops LICM from hoisting the individual
@@ -3070,9 +3162,6 @@ def build_flash_attn_bwd_dkdv_module(
                 if const_expr(G3_AT == pos and len(_g3_call) > 0):
                     _g3_call.pop()()
                 if const_expr(G3_VALU > 0 and G3_AT > 0 and pos == G3_AT + 1):
-                    # GEMM3 ran one hook back and this q-half's dS/pack block sits in the same
-                    # scheduling region, so deal its VALU out under GEMM3's MFMA run. Group 1
-                    # only -- group 0 is GEMM2's MFMA/DS_READ pipeline and would shift its pairs.
                     for _ in range_constexpr(G3_MFMA):
                         rocdl.sched_group_barrier(rocdl.mask_mfma, 1, 1)
                         rocdl.sched_group_barrier(_SCHED_VALU_MASK, G3_VALU, 1)
@@ -3190,8 +3279,8 @@ def build_flash_attn_bwd_dkdv_module(
                         for nt in range_constexpr(NT):
                             if const_expr(p_pack[pk_list[i]][nt] is None):
                                 continue  # zero pack (see MASK_ALIGN)
-                            _dvh[dt][nt] = mfma_acc(do_tr[i], p_pack[pk_list[i]][nt], _dvh[dt][nt])
-                    if const_expr(NT >= 3):
+                            _dvh[dt][nt] = mfma_dv(do_tr[i], p_pack[pk_list[i]][nt], _dvh[dt][nt])
+                    if const_expr(DV_PIN):
                         # NT>=3 pins the packs' liveness hard enough that the RA sinks the
                         # pack next to the MFMA that reads it as SrcB. Pinning the dV group
                         # live past its MFMAs blocks that sinking, which reduces spill even
@@ -3205,15 +3294,13 @@ def build_flash_attn_bwd_dkdv_module(
                         for nt in range_constexpr(NT):
                             if const_expr(ds_pack[pk_list[i]][nt] is None):
                                 continue  # zero pack (see MASK_ALIGN)
-                            _dkh[dt][nt] = mfma_acc(q_tr[i], ds_pack[pk_list[i]][nt], _dkh[dt][nt])
+                            _dkh[dt][nt] = mfma_dk(q_tr[i], ds_pack[pk_list[i]][nt], _dkh[dt][nt])
                     if const_expr(_rd_next):
                         # Grouping the whole read set ahead of the MFMA run loses, even
                         # though it drops half the run's s_waitcnt lgkmcnt(2), because the
                         # read burst blocks MFMA issue. Dropping the hints entirely and
                         # letting the default scheduler place the run is worse still, so
                         # this pair is load-bearing, not decorative.
-                        # Scale the hints by the MFMAs actually emitted, not by _nk*NT: a
-                        # skipped zero pack has no MFMA for a read to interleave with.
                         _hn = sum(
                             1
                             for _i in range_constexpr(_nk)
@@ -3269,30 +3356,19 @@ def build_flash_attn_bwd_dkdv_module(
                 if const_expr(EXP_IGLP):
                     # One call per q-half: the region's MFMA -> exp chain is per half, and
                     # two calls is where the register outcome lands right (see EXP_IGLP).
-                    # Load-bearing, not a tuning hint: any reorder of the head step must keep it.
                     rocdl.iglp_opt(IGLP_EXP_INTERLEAVE)
 
                 def _drop(mt, nt):
-                    # A fully masked 16-tile's S and dP are read by nothing (see MASK_ALIGN).
                     return cls(mt, nt) == 2
 
-                if const_expr(not apply_mask or WIN_FOLD):
-                    _st = _gemm_qk(
-                        q_lds,
-                        k_b_packs[_H[0]],
-                        inits={mt: _ld_rd(mt, 1) for mt in half},
-                        mts=half,
-                        pin=_q_apin,
-                        drop=_drop,
-                    )
-                else:
-                    _st = _gemm_qk(
-                        q_lds,
-                        k_b_packs[_H[0]],
-                        mts=half,
-                        pin=_q_apin,
-                        drop=_drop,
-                    )
+                _st = _gemm_qk(
+                    q_lds,
+                    k_b_packs[_H[0]],
+                    inits={mt: _ld_rd(mt, 1) for mt in half},
+                    mts=half,
+                    pin=_q_apin,
+                    drop=_drop,
+                )
                 _dpt = _gemm_dp(half, _drop)
                 # Extending the GEMM2 s_setprio(1) pair over this run too (so a SIMD's two
                 # waves also de-phase across GEMM1) is 7/11 then 6/11 = noise, even though it
@@ -3348,41 +3424,18 @@ def build_flash_attn_bwd_dkdv_module(
                 """
                 ma, mb = half
                 P = [[None] * NT for _ in range_constexpr(MT)]
-                if const_expr(not apply_mask or WIN_FOLD):
-                    for mt in half:
-                        for nt in range_constexpr(NT):
-                            if const_expr(cls(mt, nt) == 2):
-                                continue  # P == 0: no exp2, no dS, no pack (see MASK_ALIGN)
-                            s_v = Vec(s_tiles[mt][nt])
-                            if const_expr(cls(mt, nt) == 1):
-                                P[mt][nt] = [
-                                    _vexp_intrin(_mask_lanes(mt, nt, t).select(c_neg_inf, fx.Float32(s_v[t])))
-                                    for t in range_constexpr(4)
-                                ]
-                            elif const_expr(True):
-                                P[mt][nt] = [_vexp_intrin(fx.Float32(s_v[t])) for t in range_constexpr(4)]
-                            else:
-                                _smin_anchor = fx.Float32(
-                                    arith.minimumf(_raw(fx.Float32(s_v[0])), _raw(c_zero_f))
-                                )
-                                P[mt][nt] = [_vexp(_smin_anchor)] + [
-                                    _vexp_after(fx.Float32(s_v[t]), _smin_anchor)
-                                    for t in range_constexpr(1, 4)
-                                ]
-                else:
-                    for mt in half:
-                        lse_v = _ld_rd(mt, 1)
-                        for nt in range_constexpr(NT):
-                            if const_expr(cls(mt, nt) == 2):
-                                continue
-                            s_v = s_tiles[mt][nt]
-                            p_vals = []
-                            for t in range_constexpr(4):
-                                s_r = fx.Float32(Vec(s_v)[t])
-                                if const_expr(cls(mt, nt) == 1):
-                                    s_r = _mask_lanes(mt, nt, t).select(c_neg_inf, s_r)
-                                p_vals.append(_p_of(s_r, fx.Float32(Vec(lse_v)[t]), apply_mask))
-                            P[mt][nt] = p_vals
+                for mt in half:
+                    for nt in range_constexpr(NT):
+                        if const_expr(cls(mt, nt) == 2):
+                            continue  # P == 0: no exp2, no dS, no pack (see MASK_ALIGN)
+                        s_v = Vec(s_tiles[mt][nt])
+                        if const_expr(cls(mt, nt) == 1):
+                            P[mt][nt] = [
+                                _vexp_intrin(_mask_lanes(mt, nt, t).select(c_neg_inf, fx.Float32(s_v[t])))
+                                for t in range_constexpr(4)
+                            ]
+                        else:
+                            P[mt][nt] = [_vexp_intrin(fx.Float32(s_v[t])) for t in range_constexpr(4)]
 
                 # Hoist the first g2d dt's GEMM2 transpose-reads into the LAST half's
                 # dS/pack shadow: the ds_read_tr16 LDS latency overlaps that VALU block
@@ -3400,9 +3453,7 @@ def build_flash_attn_bwd_dkdv_module(
 
                 for nt in range_constexpr(NT):
                     if const_expr(P[ma][nt] is None and P[mb][nt] is None):
-                        # Both q-tiles of this K-step are fully masked, so the pack is exactly
-                        # zero: GEMM2 skips it (a zero B leaves dK/dV alone) but the dS row must
-                        # still be published as zeros, like _dead -- GEMM3 contracts the WHOLE band.
+                        # GEMM3 contracts the WHOLE band: a skipped zero pack still publishes zeros.
                         p_pack[pks][nt] = None
                         ds_pack[pks][nt] = None
                         _dsv = Vec.from_elements([fx.Int32(0) for _ in range_constexpr(4)], fx.Int32).bitcast(
@@ -3455,8 +3506,6 @@ def build_flash_attn_bwd_dkdv_module(
             # half's MFMA pipe is already full -- loses outright, so it is adjacency plus
             # the register relief that pays here, not interleaving for its own sake.
             def _pks_chain(pf=True, g3_split=False, hooks=False, mcls=None):
-                # mcls(mt, nt) = 0 clear / 1 masked / 2 fully masked, per 16-tile. None is
-                # the uniform "every tile like the q-block" default (see MASK_ALIGN).
                 cls = mcls
                 if const_expr(cls is None):
 
@@ -3514,9 +3563,6 @@ def build_flash_attn_bwd_dkdv_module(
                 _last_pass = const_expr(_h == KV_HALVES - 1)
                 if const_expr(MASK_SKIP and apply_mask):
                     _hs_drain()
-                    # Diagonal q-block: a wave whose kv rows all sit above the causal edge
-                    # has P = dS = 0, so it publishes exact zeros into its dS rows (GEMM3
-                    # contracts the WHOLE band) and the output stays bitwise identical.
                     if const_expr(_last_pass):
                         _qdo_pf(2)
 
@@ -3526,21 +3572,18 @@ def build_flash_attn_bwd_dkdv_module(
                         _pks_chain(pf=False)
                         return _flat_accs()
 
-                    def _arm(mcls):
+                    def _arm(mcls, _base=_base):
                         """One wave class's chain, accumulating onto the class before it."""
 
-                        # B023: `_base` is a per-iteration cell and every closure below is
-                        # consumed by the `_if_wave` calls in this same iteration, so there is
-                        # no late binding to bind. Same idiom as `_H` above.
                         def _run():
-                            _set_accs(_base[0])  # noqa: B023
+                            _set_accs(_base[0])
                             _pks_chain(pf=False, mcls=mcls)
                             return _flat_accs()
 
                         return _run
 
-                    def _keep():
-                        return _base[0]  # noqa: B023
+                    def _keep(_base=_base):
+                        return _base[0]
 
                     def _dead():
                         _z = Vec.from_elements([fx.Int32(0) for _ in range_constexpr(4)], fx.Int32).bitcast(
@@ -3564,9 +3607,6 @@ def build_flash_attn_bwd_dkdv_module(
                     _kvw = kv_row_wave if const_expr(_h == 0) else kv_row_wave + fx.Index(_h * BKV_H)
                     _cond = ArithValue(_kvw <= _q_last)
                     if const_expr(MASK_ALIGN and not half and poff is None):
-                        # One if per class, not a nested pair: each else arm yields its incoming
-                        # accumulators unchanged and coalesces away, where nesting forces fresh
-                        # values in both arms and overruns the VGPR budget the dQ reduce shares.
                         _bcond = ArithValue(_kvw + fx.Index(ROWS_PER_WAVE_KV - 1) <= _q_first)
                         _base[0] = _if_wave(_bcond, _base[0], _arm(_mc_clear), _keep)
                         _dcond = ArithValue(_kvw == _q_first)
@@ -3837,6 +3877,11 @@ def build_flash_attn_bwd_dkdv_module(
                         g_idx = global_idx_kv(kv_row_of(nt, h), d_col)
                         buffer_ops.buffer_store(o_pack, rsrc, g_idx * fx.Index(2), offset_is_bytes=True)
 
+        if const_expr(MFMA_TIE):
+            # An inline-asm MFMA is invisible to GCNHazardRecognizer, so nothing else inserts these waits.
+            rocdl.sched_barrier(0)
+            rocdl.s_nop(15)
+            rocdl.s_nop(15)
         _store(dv_accs, dv_rsrc, False)
         _store(dk_accs, dk_rsrc, True)
 
@@ -3958,9 +4003,6 @@ def _qsplit_for(Sq, window_left=-1, head_dim=64):
         # hands the SAME work to q_split times as many work-groups and multiplies the
         # dk/dv workspace. One slot avoids both the redundant prologues and the slot reduce.
         return 1
-    # q_split trades dk/dv slots, K/V re-staging and prologues against the exposed dQ-reduce
-    # tail; the amortized side grows with D per kv row while the tail stays the same share of
-    # the dQ image, hence 2 at D>=128 / 4 at D64. Inert: only moves WHICH WG writes a partial.
     if head_dim >= 128:
         return 2
     return 4
@@ -4019,8 +4061,8 @@ def _fuse_blockkv_for(Skv, D=64, window_left=-1):
     # 256 only fits because the K/V B-operands live in LDS (see `_kv_lds_idx`): it
     # doubles the dK/dV accumulators, and the packs it displaces are exactly what pays
     # for them (with the packs still in registers this spilled catastrophically). 512
-    # would halve the band count again, but its dK/dV accumulators alone spill to scratch, so
-    # widening the band is not the way to cut the split-K leg's byte count at either head dim.
+    # would halve the band count again, but its dK/dV accumulators alone exceed even the
+    # four-wave body's whole register file, so the band stays 256.
     # Register cost is `dk+dv dwords = D*block_kv/(32*waves)`; D128's non-accumulator state caps it at 128.
     if window_left >= 0:
         # A window wants the widest FILLED band; round W down to a power of two, capped by LDS/wave count.
@@ -4038,11 +4080,97 @@ def _fuse_blockkv_for(Skv, D=64, window_left=-1):
     return 256 if Skv > 1024 else 128
 
 
+# ---- a16: dQ as buffer_atomic_pk_add_bf16, no split-K workspace and no fold -----------
+# Accumulating in place makes dQ NOT bitwise reproducible, and it is affordable only because
+# the image layout puts an atomic's 64 lanes on a quarter of a plain store's cache lines.
+_DQ_A16 = True
+_A16_BLOCK_Q = 32
+# a16 only pays at a WIDE band, where a q row takes half as many atomic contributions.
+_A16_BLOCK_KV = 256
+_A16_Q_SPLIT = 2
+_A16_Q_SPLIT_G8 = 4
+# Batch chunks let the delta and un-permute passes ride under a body they do not depend on.
+# A pure GRID restriction: dK/dV stay bitwise identical and dQ keeps its summands.
+_A16_OVERLAP = 2
+_A16_CHUNK_WGS = 512
+_A16_MIN_BAT = 4
+_A16_MAX_CHUNKS = 4
+_A16_EVENTS: dict = {}
+
+
+def _a16_bat_chunks(D, B, Skv, block_kv, Hkv, q_split):
+    """How many batch sub-range launches the a16 body is dispatched in.
+    D64 only; halve while the chunk still fills the machine."""
+    if D != 64 or B < _A16_MIN_BAT:
+        return 1
+    per_bat, n = (Skv // block_kv) * Hkv * q_split, 1
+    # Evenness is correctness: each piece dispatches B // n, so a remainder would never run.
+    while n < _A16_MAX_CHUNKS and B % (n * 2) == 0 and per_bat * (B // (n * 2)) >= _A16_CHUNK_WGS:
+        n *= 2
+    return n
+
+
+def _a16_block_q(D):
+    """BLOCK_Q on the a16 path. D128-only: the narrow tile is what lets the wide BLOCK_KV allocate
+    spill-free with g3_defer; at D64 the accumulators are half the size and the wide band already
+    builds at the default tile. The image layout itself is BLOCK_Q generic."""
+    return _A16_BLOCK_Q if D == 128 else _BWD_BLOCK_Q
+
+
+def _a16_qsplit(Hq, Hkv):
+    """q_split on the a16 path; it tracks the GQA GROUP, the way QDESC_R does.
+    A work-group holds one q block for GQA_GROUP_SIZE head-steps, so a wider group piles twice as
+    many concurrent bands on one q block and wants the q axis cut twice as finely (see _get_bwd)."""
+    return _A16_Q_SPLIT_G8 if Hq // Hkv >= 8 else _A16_Q_SPLIT
+
+
+_A16_IMAGE: dict = {}
+
+
+def _dq_a16_for(B, Sq, Skv, Hq, Hkv, D, window_left, sbhd, varlen):
+    """Whether this shape takes the a16 dQ path.
+    Restricted to the dense square full-causal SBHD case: the image's flat index is a pure bit
+    permutation, so every axis has to be a power of two and the q tile has to divide Sq."""
+    return (
+        _DQ_A16
+        and D in (64, 128)
+        and sbhd
+        and not varlen
+        and window_left < 0
+        and Sq == Skv
+        and Skv % _A16_BLOCK_KV == 0
+        and Sq % (_a16_block_q(D) * _a16_qsplit(Hq, Hkv)) == 0
+        and Hq % _a16_uc(D) == 0
+        and (B * (Sq // 16) * Hq) % (_A16_BLOCK // 64 * _a16_uc(D)) == 0
+    )
+
+
+def _a16_image(B, Sq, Hq, D, device, dtype):
+    """The band-less bf16 dQ image, exactly |dQ|; cached because it is otherwise reallocated per
+    call. It must be zeroed per call since the atomics accumulate into it, and that zeroing rides
+    the odo pass (see FILL_IMG) -- only the once-per-shape priming call issues one here."""
+    key = (B, Sq, Hq, D, device, dtype)
+    img = _A16_IMAGE.get(key)
+    if img is None:
+        _A16_IMAGE.clear()
+        img = torch.empty(B * Sq * Hq * D, device=device, dtype=dtype)
+        _A16_IMAGE[key] = img
+    return img
+
+
+def _unpermute_dq_a16(img, dq, B, Sq, Hq, D, scale, stream, sbhd=True, bat_lo=0, n_bat=None):
+    key = (B, Sq, Hq, D, scale, sbhd, bat_lo, n_bat)
+    launch = _DQA16_CACHE.get(key)
+    if launch is None:
+        if len(_DQA16_CACHE) >= 16:
+            _DQA16_CACHE.clear()
+        launch = build_flash_attn_bwd_dqa16_module(B, Sq, Hq, D, scale, sbhd=sbhd, bat_lo=bat_lo, n_bat=n_bat)
+        _DQA16_CACHE[key] = launch
+    launch(img, dq.reshape(-1), stream)
+
+
 _BWD_CACHE: dict = {}
 _DQRED_CACHE: dict = {}
-# Launchers the dQ fold keeps built. ONE shape asks for slices*(chunks-1)+1 of them, so a cap
-# a single shape can reach is not a cap but a rebuild of every launcher on every call, i.e. a
-# JIT inside the timed loop. Holds several shapes' worth; no device tensor is cached here.
 _DQRED_CACHE_MAX = 256
 
 
@@ -4056,11 +4184,6 @@ def _dq_partial_ws(nb, B, Sq, hd, device, dtype, pad_bytes=0, ilv=1, carry=False
 
     Returns (workspace, carry): ``carry`` is the fp32 running dQ sum the reduce hands from one
     band group to the next, or None when the whole band axis fits one workspace.
-
-    ``pair`` folds band group g and group ng-g into one slab (see _wsq_pair_ok). Causal
-    leaves group g's first g*ilv*BLOCK_KV rows unwritten, which is exactly the row count
-    group ng-g needs, so the axis costs ng//2+1 slabs instead of ng and no extra byte
-    moves: the rows the fold reuses are ones neither the body nor the reduce ever touched.
 
     ``ilv`` adjacent bands share a row and are interleaved at D granularity rather than
     getting a slab each; ``ilv=1`` is the plain [bands, B, Sq, Hq*D]. See _WSQ_BAND_ILV
@@ -4158,18 +4281,13 @@ def _dq_partial_ws(nb, B, Sq, hd, device, dtype, pad_bytes=0, ilv=1, carry=False
 _SLOTRED_CACHE: dict = {}
 _SLOTRED_BLOCK = 256
 _SLOTRED_VEC = 8
-# Chunks one thread folds, which is also what sizes the grid. The fold is already at the DRAM
-# roofline across the legal range, so widening buys nothing and past one work-group per CU it
-# collapses; _slotred_uc only narrows below this to keep an untileable workspace off torch.
-_SLOTRED_UC_MAX = 2
 
 
 def _slotred_uc(n_elems, n_groups):
     """Widest per-thread chunk count that tiles the slots without under-filling the machine.
-    The rate is flat across the legal range (_SLOTRED_UC_MAX), so narrowing buys no speed: it
-    keeps a workspace that cannot tile at the deployed width out of torch's strided sum."""
+    None when nothing in the legal range tiles, which sends the caller to torch's strided sum."""
     unit = _SLOTRED_BLOCK * _SLOTRED_VEC
-    fits = [uc for uc in (16, 8, 4, 2, 1) if uc <= _SLOTRED_UC_MAX and n_elems % (unit * uc) == 0]
+    fits = [uc for uc in (2, 1) if n_elems % (unit * uc) == 0]
     if not fits:
         return None
     for uc in fits:
@@ -4336,9 +4454,6 @@ def _reduce_dq_partials(
         _DQRED_CACHE[key] = launcher
     # Pass ONE band slice: the descriptor is rebased per band with a 64-bit offset, and
     # the whole workspace overflows a flat memref's i32 element count.
-    # The unused cu_seqlens slot rides the CALLER's placeholder: allocating one per launch costs a
-    # fill kernel on the fused stream. It lives and dies inside one backward, so nothing is held
-    # across calls; a ragged launch has the real table in that slot and needs no placeholder.
     if ph is None and cu is None:
         ph = _cu_placeholder(dq.device)
     dqf = dq.reshape(-1)
@@ -4362,28 +4477,11 @@ _DQ_PIPE = True
 # Above it the measured spread is a few percent either way with no shape term behind it
 # (area, workspace size and band interleave all fail to predict the sign), so it stays on.
 _DQ_PIPE_AREA_FLOOR = 2048 * 2048
-# Fills of the CU array a single SBHD chunk must be worth. The body runs one work-group per CU,
-# so a narrower chunk drains the LONGEST band's walk with nothing beside it; the figure is per
-# 256-row band and scales with the band width (_dq_pipe_fills), as does what a chunk buys.
 _DQ_PIPE_FILLS = 4
-# The pipeline's chunks alternate across two queues: they are independent (disjoint dk/dv slots
-# and dQ partial rows) so the next chunk can fill what the current one is draining. Below:
-# whether the last SPLIT chunk's dQ reduce stays on the caller's stream, in front of the slot fold.
 _DQ_TAIL_SERIAL = True
-# Fills of the CU array one piece of a BATCH-CUT tail must be worth. The last chunk's fold is
-# pure exposure and a batch cut re-stages nothing, but it is taken at the WIDE band only: a unit
-# of body absorbs 1/(2*BLOCK_KV) of partial bytes, so at 128 the body it moves under pays more.
 _DQ_TAIL_CUT_FILLS = 2
-# Fold bytes one piece of a UNIFORM batch cut must still carry (see _dq_grid_cut). Cutting the
-# tail alone leaves the plan uneven -- the chunk in front keeps a whole fold over a tail PIECE --
-# so every chunk is cut, and the gate is the piece's fold BYTES, not its work-group count.
 _DQ_CHUNK_FOLD_BYTES = 1 << 30
-# Slices a HIDDEN dQ fold is issued in (see _fold_slices). What a hidden fold costs is not its
-# own latency but what it does to the body under it, and that is paid per BURST, not per byte.
-# A COUNT, not a burst width; capped because each slice is a build-time (qsp, batch) that JITs.
 _DQ_FOLD_SLICES = 16
-# So the count is a cap and this is the floor that stops it: the fold's bytes, per slice. Below
-# it a slice no longer amortizes its ramp and stops keeping up with the body it hides under.
 _DQ_FOLD_SLICE_BYTES = 1 << 27
 _SIDE_STREAM: dict = {}
 _PIPE_EVENTS: dict = {}
@@ -4446,13 +4544,7 @@ def _pipe_chunks(B, q_split, block_kv, seq_len_q, head_dim=64, sbhd=False, wgs=N
     """Pipeline stages as (batch, qsp_lo, n_qsp), in dispatch order; batch None = all; ``wgs``:
     see _dq_pipe_qsp. A split cut is legal only where every band starts on a q_split boundary or the
     body re-phases onto the absolute map (_qsp_absolute); D128's halved band is why it cuts per batch."""
-    # SBHD merges the pair after the first chunk ([1,2,1] at q_split=4) at the WIDE band only: a
-    # merged pair hides a two-subset fold under a one-subset body and a unit of body absorbs
-    # 1/(2*BLOCK_KV). The batch axis is no alternative -- a whole-batch chunk owns whole-batch partials.
     if sbhd:
-        # A shape whose one-subset chunk is under the fill rule takes the widest plan the rule
-        # does license instead of no pipeline at all (see _dq_pipe_qsp). Equal chunks: the two
-        # windows a merge trades between are the same width here, so there is nothing to trade.
         per = _dq_pipe_qsp(wgs, q_split, block_kv, B) if wgs else 1
         if per > 1:
             return [(None, s, min(per, q_split - s)) for s in range(0, q_split, per)]
@@ -4481,7 +4573,6 @@ def _fold_slices(B, Sq, q_split, lo, n, fold_bytes, bat_lo=0, n_bat=None):
     Batch axis first, then q: split ``s`` of ``q_split`` is exactly splits ``{s, s+q_split}`` of
     ``2*q_split``, so the rows are unchanged; a split that no longer tiles (_qsp_cuttable) loses a block."""
     nb = B if n_bat is None else n_bat
-    # ``n_qsp=None`` is "all q_split subsets"; name the count so a finer modulus can halve it.
     qs = [(q_split, lo, q_split if n is None else n)]
     while (
         nb * len(qs) * 2 <= _DQ_FOLD_SLICES
@@ -4530,18 +4621,11 @@ def _fused_pipelined(
     if side is None:
         side = torch.cuda.Stream(device=dq.device)
         _SIDE_STREAM[dq.device] = side
-    # A stage is (batch, qsp_lo, n_qsp, bat_lo, n_bat): the first three are the plan's, the
-    # last two the SBHD batch sub-range (None = the whole batch, see the builder's bat_lo).
     wgs = (Skv // block_kv) * Hkv * B
     plan = _pipe_chunks(B, q_split, block_kv, Sq, D, sbhd, wgs=wgs)
     chunks = [c if len(c) == 5 else tuple(c) + (0, None) for c in plan]
-    # Cut the plan on the batch axis so a fold gets a body over it that would otherwise be exposed.
-    # Legal for SBHD without slicing a tensor (the body takes bat_lo as a compile-time base) and every
-    # piece folds only rows its own body completed. _dq_grid_cut and _dq_tail_cut are alternatives.
     cuttable = sbhd and chunks[-1][0] is None
     n_tail = chunks[-1][2] or q_split
-    # Only a plan that is already uniform on the SPLIT axis can stay uniform under the cut; the
-    # merged pair (_pipe_chunks) is the one that is not, and it is chosen where no cut answers.
     uniform = len(chunks) > 1 and len({c[2] for c in chunks}) == 1
     grid_cut = (
         _dq_grid_cut(wgs, B, n_tail, block_kv, _dq_fold_bytes(B, Sq, Hq, D, Skv, block_kv, q_split, n_tail))
@@ -4579,9 +4663,6 @@ def _fused_pipelined(
             odo_l(ob[b], dob[b], db[b], 1, Sq, side)
         ev_delta.record(side)
     else:
-        # A split chunk shares the whole batch, so the delta pass is cut on the SPLIT axis: chunk 0
-        # reads only its own splits' delta and the rest runs on the side queue under it. A batch
-        # chunk owns every q block of its batch, so its whole delta is due before the first chunk.
         cut_odo = odo_l.chunk is not None and nc > 1 and chunks[0][2] not in (None, q_split)
         odo_first = odo_l.chunk(chunks[0][1], chunks[0][2]) if cut_odo else odo_l
         odo_first(o16, dof, df, B, Sq, stream)
@@ -4600,9 +4681,6 @@ def _fused_pipelined(
             args = (qf, kf, vf, dof, lsef, df, wk, wv)
             ws_arg, nb = ws_dq[0, 0], B if nbt is None else nbt
             bat = {} if nbt is None else dict(bat_lo=blo, n_bat=nbt)
-        # The LAST chunk's reduce has no next chunk to hide under, so its queue is a free choice.
-        # A split chunk's tail reduce walks every band and saturates DRAM alone, so it is serialised
-        # in front of the slot fold; a per-batch chunk's does overlap and keeps the reduce queue.
         red_q = stream if (_DQ_TAIL_SERIAL and not per_batch and i == nc - 1) else side
         body = dkdv_l if (not blo and n in (None, q_split)) else dkdv_l.chunk(lo, n, blo)
         body(
@@ -4619,9 +4697,6 @@ def _fused_pipelined(
         if red_q is not stream:
             evs[i].record(stream)
             red_q.wait_event(evs[i])
-        # A HIDDEN fold is issued in narrow slices (see _fold_slices) so the body under it is
-        # not held off by one wide burst. The EXPOSED tail has nothing to run under, so there is
-        # no burst to break up and it keeps its single launch, as does a per-batch chunk.
         fold_bytes = _dq_fold_bytes(nbt or B, Sq, Hq, D, Skv, block_kv, q_split, n)
         slices = (
             _fold_slices(B, Sq, q_split, lo, n, fold_bytes, bat_lo=blo, n_bat=nbt)
@@ -4737,6 +4812,7 @@ def _get_bwd(
     wsq_ring=0,
     wsq_pair=0,
     band_span=0,
+    a16=False,
 ):
     key = (
         Hq,
@@ -4754,6 +4830,7 @@ def _get_bwd(
         wsq_ring,
         wsq_pair,
         band_span,
+        a16,
     )
     launchers = _BWD_CACHE.get(key)
     if launchers is None:
@@ -4780,9 +4857,6 @@ def _get_bwd(
         # nothing left to interleave with: asking for one buys the body the whole
         # register budget instead (the two-wave group below is already the occupancy).
         dkdv_wpe, dkdv_dma_grp = 1 if (_fuse_wide or _swa) else 2, 1
-        # GEMM2's dt prefetch ring: depth 2 only pays at D128, and loses at D64 because the
-        # wider read burst blocks MFMA issue for more than the s_waitcnt it removes -- the
-        # objective is MFMA-run density, not fewer waits.
         dkdv_g2d = 2 if _fuse_d128 else 1
         dkdv_pf_ring = False
         # The fused body keeps V's B-operand in registers; spending the LDS that frees on
@@ -4807,19 +4881,25 @@ def _get_bwd(
             wsq_ring=wsq_ring,
             wsq_pair=wsq_pair,
             band_span=band_span,
-            q_pref=not _pair,
-            g3_defer=_fuse_d128 and not _pair,
+            q_pref=(not _pair) or a16,
+            g3_defer=_fuse_d128,
+            # Tie the dK chain to its own accumulator so the allocator stops routing it through
+            # a scratch pool. The mask is not free to change: the other bits spill.
+            mfma_tie=(3 if D == 64 else 2) if a16 else 0,
+            mfma_tie_cons=(1 if D == 128 else 0) if a16 else 0,
+            dv_pin=False if (a16 and D == 64) else None,
             g3_dbat=2 if (_fuse_d128 and not _pair) else None,
             g3_kreg=_fuse_wide and not _pair,
             k_reg=not _pair,
-            g3d=2 if _pair else None,
+            g3d=2 if _pair else (_G3D_FULL_BAND if (a16 and D == 64) else None),
             # The dQ partial store is this path's one uncovered burst: emitted inside GEMM3 it
             # lands where the carrier wave has no MFMA left to hide it, and at one wave per SIMD
             # there is no sibling wave to cover it either. Hand it to the head-step hook instead,
             # which spreads the same stores two at a time across the softmax run that follows,
             # and keep the sched_barrier so LLVM cannot sink them back into one burst.
-            g3_st_at=2 if _fuse_d128 else None,
-            g3_st_n=2 if _fuse_d128 else None,
+            g3_st_at=(0 if a16 else 2) if _fuse_d128 else None,
+            # g3_st_at and g3_st_n are ONE setting -- never move one without the other.
+            g3_st_n=(1 if a16 else 2) if _fuse_d128 else None,
             g3_sb=1 if _fuse_d128 else None,
             # A windowed band is only BLOCK_KV + W q rows wide, so the default four-wave
             # split gives each wave a single kv tile and a repeated Q/dO fragment read;
@@ -4828,10 +4908,11 @@ def _get_bwd(
             # Every knob below was independently re-swept on the FQ_PAIR body since its
             # register pressure differs from the 64-row band; verdicts held except
             # g2_half (now a loss) and block_q (now fails the ISA occupancy gate).
-            block_q=None,
+            block_q=_a16_block_q(D) if a16 else None,
             g2_half=None,
             g1_ks_outer=None,
             agpr=_DKDV_AGPR,
+            wsq_a16=a16,
             **common,
         )
         dkdv_l = build_flash_attn_bwd_dkdv_module(**dkdv_kw)
@@ -4848,7 +4929,13 @@ def _get_bwd(
         dkdv_l.chunk = _dkdv_chunk
         # DELTA has no other producer, so the standalone odo pass runs; ragged wants it
         # packed by token, the layout its LSE has.
-        odo_kw = dict(num_heads=Hq, head_dim=D, sbhd=sbhd, token_major=varlen)
+        odo_kw = dict(
+            num_heads=Hq,
+            head_dim=D,
+            sbhd=sbhd,
+            token_major=varlen,
+            fill_img=bool(a16),
+        )
         odo_l = build_flash_attn_bwd_odo_module(q_split=q_split if sbhd else 1, **odo_kw)
         _odo_subs: dict = {}
 
@@ -4861,6 +4948,23 @@ def _get_bwd(
             return sub
 
         odo_l.chunk = _odo_chunk if sbhd and q_split > 1 else None
+        _odo_bats: dict = {}
+
+        def _odo_bat(bat_lo):
+            """Same delta pass, dispatching only a batch sub-range (see _a16_bat_chunks)."""
+            sub = _odo_bats.get(bat_lo)
+            if sub is None:
+                sub = build_flash_attn_bwd_odo_module(
+                    q_split=q_split if sbhd else 1,
+                    bat_lo=bat_lo,
+                    bat_all=batch_size,
+                    img_slab=True,
+                    **odo_kw,
+                )
+                _odo_bats[bat_lo] = sub
+            return sub
+
+        odo_l.bat = _odo_bat if sbhd and a16 else None
         launchers = (dkdv_l, odo_l)
         _BWD_CACHE[key] = launchers
     return launchers
@@ -5038,6 +5142,7 @@ def flydsl_varlen_backward(
     cu_seqlens_kv=None,
     max_seqlen_q=None,
     max_seqlen_kv=None,
+    deterministic=False,
 ):
     """Run the 16x16x32 flydsl bwd.
     THD (sbhd=False): q,dout,dq,out:[B*Sq,Hq,D]; k,v,dk,dv:[B*Skv,Hkv,D].
@@ -5191,40 +5296,41 @@ def flydsl_varlen_backward(
     # full-causal ISA stays byte-identical.
     _assert_fusable(Hq, D)
     block_kv = _fuse_blockkv_for(Skv, D, window_left)
+    # Atomics accumulate in arrival order, so a caller that demands bitwise reproducibility keeps split-K.
+    a16 = not deterministic and _dq_a16_for(B, Sq, Skv, Hq, Hkv, D, window_left, sbhd, varlen)
+    if a16:
+        block_kv, q_split = _A16_BLOCK_KV, _a16_qsplit(Hq, Hkv)
     # ceil so a non-aligned Skv keeps its ragged top band (the body ceil-grids kv and
     # masks OOB keys; only the workspace band count was floor).
     n_bands = (Skv + block_kv - 1) // block_kv
     # ilv packing assumes whole band groups; a non-aligned Skv's ragged top band breaks
-    # it, so interleave only when Skv tiles the band exactly; D64 full-causal is excluded by
-    # measurement, keeping the plain slab's simpler addressing there.
+    # it, so interleave only when Skv tiles the band exactly (D128 or windowed only).
     wsq_ilv = (
-        _wsq_ilv(n_bands, B, Sq, Hq * D) if Skv % block_kv == 0 and (D == 128 or window_left >= 0) else 1
+        1
+        if a16
+        else (
+            _wsq_ilv(n_bands, B, Sq, Hq * D) if Skv % block_kv == 0 and (D == 128 or window_left >= 0) else 1
+        )
     )
     # Long context: the dQ partial workspace is bands*|dQ| and outgrows the card, so walk the
     # band axis in groups instead of asking for all of it at once (see _band_span_for).
-    # The causal fold is free, so it is priced BEFORE the levers that are not: a shape whose
-    # folded axis fits the cap keeps the whole-axis plan instead of paying a carry for bytes
-    # the fold already saved (see _wsq_pair_ok).
     _pair_ng = _wsq_pair_ok(n_bands, wsq_ilv, block_kv, Sq, Skv, window_left, sbhd, 0, 0)
     _axis_bytes = (_pair_ng // 2 + 1) * wsq_ilv * B * Sq * Hq * D * 2 if _pair_ng else None
     band_span = (
-        _band_span_for(n_bands, B * Sq * Hq * D * 2, wsq_ilv, axis_bytes=_axis_bytes)
-        if sbhd and window_left < 0 and Sq == Skv and Skv % block_kv == 0
-        else 0
+        0
+        if a16
+        else (
+            _band_span_for(n_bands, B * Sq * Hq * D * 2, wsq_ilv, axis_bytes=_axis_bytes)
+            if sbhd and window_left < 0 and Sq == Skv and Skv % block_kv == 0
+            else 0
+        )
     )
     # A window bounds the band span a q block writes, so the same footprint problem is
     # answered without any pass structure at all: the bands share slots (see _wsq_ring_for).
-    wsq_ring = _wsq_ring_for(n_bands, block_kv, window_left, wsq_ilv)
-    # Causal leaves half the axis unwritten; fold it away before any of the levers above
-    # start trading throughput for the same bytes (see _wsq_pair_ok).
+    wsq_ring = 1 if a16 else _wsq_ring_for(n_bands, block_kv, window_left, wsq_ilv)
     wsq_pair = _pair_ng if not band_span and not wsq_ring else 0
-    # A ring is a whole number of band GROUPS, so the interleave is also the smallest ring a
-    # window can ask for: at the GPT-OSS 8K shape it rounds 5 bands up to 16 and holds 4 GiB
-    # where 1.25 would do. A ring exists only because the axis did not fit, so rounding it up
-    # is the one place the interleave is spending the very bytes the ring was opened to save;
-    # drop it there. Bit-identical, and the body measures 0.6196 -> 0.6050 ms at B4 and
-    # 0.3076 -> 0.3129 at B2, against 3.2x less workspace at both.
-    if wsq_ring:
+    # A ring is whole band groups, so an interleave only rounds it up and re-spends the bytes it saved.
+    if wsq_ring and not a16:
         wsq_ilv = 1
         wsq_ring = _wsq_ring_for(n_bands, block_kv, window_left, 1)
     dkdv_l, odo_l = _get_bwd(
@@ -5242,6 +5348,7 @@ def flydsl_varlen_backward(
         wsq_ring=wsq_ring,
         wsq_pair=wsq_pair,
         band_span=band_span,
+        a16=a16,
     )
     # identity delta = -rowsum(O.dO); the body centers dP by it (exact).
     delta = torch.empty(B, Hq, Sq, device=q.device, dtype=torch.float32)
@@ -5249,14 +5356,12 @@ def flydsl_varlen_backward(
     # when the chunk's own compute dwarfs the dispatch it costs (see _DQ_PIPE_AREA_FLOOR).
     pipe = (
         _DQ_PIPE
+        and not a16  # a16 has no fold to hide, so it has nothing to pipeline against
         and not band_span  # band groups drive their own dispatch order (see _fused_bandgroups)
         # a ragged top band makes the split->q-block map band-dependent (see _pipe_chunks),
         # so a non-aligned Skv must take the single whole-batch dispatch.
         and Skv % block_kv == 0
         and Sq * (Skv if window_left < 0 else window_left + block_kv) > _DQ_PIPE_AREA_FLOOR
-        # An SBHD chunk cuts the SPLIT axis: needs q_split>1 (a window never has it) and a band-relative q
-        # walk that meets the absolute map the reduce and the cut model, by whole split strides or via
-        # _qsp_absolute; last term, too narrow a chunk to fill the CU array pays more than it hides.
         and (
             (
                 q_split > 1
@@ -5268,9 +5373,12 @@ def flydsl_varlen_backward(
             else B > 1
         )
     )
-    if not pipe:
-        odo_l(o16, dout.to(q.dtype).reshape(-1), delta.reshape(-1), B, Sq, st)
+    # The odo pass is what zeroes the image, so the image has to exist before it.
     dq = torch.empty_like(q)
+    img = _a16_image(B, Sq, Hq, D, q.device, q.dtype) if a16 else None
+    dof16 = dout.to(q.dtype).reshape(-1)
+    if not pipe and not a16:
+        odo_l(o16, dof16, delta.reshape(-1), B, Sq, st, img=img)
     # SBHD workspace [q_split,Skv,B,Hkv,D]: summing the leading q_split axis yields
     # [Skv,B,Hkv,D] contiguous == native SBHD dk/dv (no permute). THD keeps
     # [B,q_split,Skv,Hkv,D] -> sum(dim=1) -> [B*Skv,Hkv,D].
@@ -5283,19 +5391,80 @@ def flydsl_varlen_backward(
     lsef = lse_s.reshape(-1)
     df = delta.reshape(-1)
     cu_ph = _cu_placeholder(q.device)
-    ws_dq, ws_carry = _dq_partial_ws(
-        band_span or wsq_ring * wsq_ilv or n_bands,
-        B,
-        Sq,
-        Hq * D,
-        q.device,
-        q.dtype,
-        _WSQ_BAND_PAD if D == 128 else 0,
-        wsq_ilv,
-        carry=bool(band_span),
-        pair=bool(wsq_pair),
+    ws_dq, ws_carry = (
+        (None, None)
+        if a16
+        else _dq_partial_ws(
+            band_span or wsq_ring * wsq_ilv or n_bands,
+            B,
+            Sq,
+            Hq * D,
+            q.device,
+            q.dtype,
+            _WSQ_BAND_PAD if D == 128 else 0,
+            wsq_ilv,
+            carry=bool(band_span),
+            pair=bool(wsq_pair),
+        )
     )
-    if band_span:
+    if a16:
+        _bufs = (qf, kf, vf, dof, lsef, df, ws_dk.reshape(-1), ws_dv.reshape(-1), cu_ph, cu_ph, img)
+        # A compiled launcher dispatches its grid TWICE on its first call; idempotent stores
+        # never cared, but an accumulated image would double, so burn and re-zero every launcher.
+        _nbc = _a16_bat_chunks(D, B, Skv, block_kv, Hkv, q_split)
+        _per = B // _nbc
+        _bodies = [(dkdv_l if j == 0 else dkdv_l.chunk(0, None, j * _per)) for j in range(_nbc)]
+        _odos = (
+            [odo_l.bat(j * _per) for j in range(_nbc)]
+            if _nbc > 1 and _A16_OVERLAP >= 2 and odo_l.bat is not None
+            else None
+        )
+        _primed = dkdv_l.__dict__.setdefault("_a16_primed", set())
+        _pk = (B, Sq, Skv, Hq, D)
+        if _pk not in _primed:
+            _primed.add(_pk)
+            for _body in _bodies:
+                _body(*_bufs, _per, Sq, Skv, 0, st)
+            img.zero_()
+        _unp = lambda strm, lo, n: _unpermute_dq_a16(
+            img, dq, B, Sq, Hq, D, 1.0 / _LOG2E, strm, sbhd=sbhd, bat_lo=lo, n_bat=n
+        )
+        if _nbc == 1 or not _A16_OVERLAP:
+            odo_l(o16, dof16, df, B, Sq, st, img=img)
+            for _body in _bodies:
+                _body(*_bufs, _per, Sq, Skv, 0, st)
+            _unp(st, 0, None)
+        else:
+            # Only chunk 0's delta is due before any body, and a chunk's rows are final when it retires.
+            _side = _SIDE_STREAM.get(dq.device)
+            if _side is None:
+                _side = torch.cuda.Stream(device=dq.device)
+                _SIDE_STREAM[dq.device] = _side
+            _evs = _A16_EVENTS.get(_nbc)
+            if _evs is None:
+                _evs = [torch.cuda.Event() for _ in range(_nbc + 1)]
+                _A16_EVENTS[_nbc] = _evs
+            if _odos is None:
+                odo_l(o16, dof16, df, B, Sq, st, img=img)
+            else:
+                _odos[0](o16, dof16, df, _per, Sq, st, img=img)
+                _side.wait_stream(st)
+                for j in range(1, _nbc):
+                    _odos[j](o16, dof16, df, _per, Sq, _side, img=img)
+                _evs[_nbc].record(_side)
+            for j, _body in enumerate(_bodies):
+                if j == 1 and _odos is not None:
+                    st.wait_event(_evs[_nbc])  # chunks 1.. read the delta the side just made
+                _body(*_bufs, _per, Sq, Skv, 0, st)
+                if j < _nbc - 1:
+                    _evs[j].record(st)
+                    _side.wait_event(_evs[j])
+                    _unp(_side, j * _per, _per)
+                else:
+                    _unp(st, j * _per, _per)
+            _evs[_nbc - 1].record(_side)
+            st.wait_event(_evs[_nbc - 1])
+    elif band_span:
         _fused_bandgroups(
             dkdv_l,
             (qf, kf, vf, dof, lsef, df, ws_dk.reshape(-1), ws_dv.reshape(-1), cu_ph),

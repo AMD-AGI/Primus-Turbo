@@ -161,6 +161,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 ctx.causal = causal
                 ctx.window_size = window_size
                 ctx.sink = sink
+                ctx.deterministic = deterministic
                 ctx.lse_shape = (B, Sq, Hq)
             out = out_s.permute(1, 0, 2, 3)
             # kernel LSE is [B*Sq, Hq] (batch-major) -> [B, Hq, Sq]
@@ -276,6 +277,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 causal=ctx.causal,
                 window_size=ctx.window_size,
                 sink=ctx.sink,
+                deterministic=ctx.deterministic,
             )
             dq, dk, dv = (g.permute(1, 0, 2, 3) for g in grads[:3])
             # backward returns (dq,dk,dv), plus dsink when a sink was given.
@@ -652,6 +654,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 ctx.causal = causal
                 ctx.window_size = window_size
                 ctx.sink = sink
+                ctx.deterministic = deterministic
             # kernel LSE is [B*Sq, Hq] (batch-major) -> [B, Hq, Sq]
             return (out, lse.view(B, Sq, Hq).permute(0, 2, 1)) if return_lse else out
 
@@ -735,6 +738,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 causal=ctx.causal,
                 window_size=ctx.window_size,
                 sink=ctx.sink,
+                deterministic=ctx.deterministic,
             )
             # backward returns (dq,dk,dv), plus dsink when a sink was given.
             return _flash_attn_varlen_grads(*grads[:3], grads[3] if len(grads) > 3 else None)
