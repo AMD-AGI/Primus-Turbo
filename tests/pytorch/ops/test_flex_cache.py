@@ -34,6 +34,20 @@ class _NoWeakrefBlockMask:
         self.mask_mod = mask_mod
 
 
+class _NoWeakrefMaskMod:
+    """A *callable* mask_mod that cannot be weakly referenced, and has no ``__code__``.
+
+    The classification cache is keyed on the mask_mod, so this -- not the BlockMask
+    wrapper -- is what has to degrade gracefully: neither the identity cache
+    (needs a weakref) nor the fingerprint cache (needs ``__code__``) can hold it.
+    """
+
+    __slots__ = ()
+
+    def __call__(self, b, h, q_idx, kv_idx):
+        return q_idx >= kv_idx
+
+
 # ---- classify cache -------------------------------------------------------
 
 
@@ -77,13 +91,26 @@ def test_classify_cache_none_short_circuits_full():
 
 
 def test_classify_cache_skips_non_weakreferenceable():
-    # An object that cannot be weak-referenced must still classify correctly, just
-    # without caching (graceful fallback, no crash, behaviour preserved).
-    obj = _NoWeakrefBlockMask(lambda b, h, q, kv: q >= kv)
+    # A mask_mod that can be neither weak-referenced nor fingerprinted must still
+    # classify correctly, just without caching: graceful fallback, no crash,
+    # behaviour preserved.
+    obj = _NoWeakrefBlockMask(_NoWeakrefMaskMod())
     cfg1 = _classify_block_mask(obj, B=1, H=1, q_len=64, kv_len=64)
     cfg2 = _classify_block_mask(obj, B=1, H=1, q_len=64, kv_len=64)
     assert cfg1 == cfg2 == {"kind": "causal", "causal": True, "window_size": (-1, -1)}
-    assert cfg1 is not cfg2  # not cached (cannot weakref) -> recomputed
+    assert cfg1 is not cfg2  # not cached -> recomputed
+
+
+def test_a_non_weakreferenceable_block_mask_no_longer_defeats_the_cache():
+    # The wrapper's weakref-ability is irrelevant now that the key is the mask_mod.
+    # This is the whole point of the re-key: the BlockMask is rebuilt every step and
+    # must not be what the cache depends on.
+    def mask_mod(b, h, q_idx, kv_idx):
+        return q_idx >= kv_idx
+
+    cfg1 = _classify_block_mask(_NoWeakrefBlockMask(mask_mod), B=1, H=1, q_len=64, kv_len=64)
+    cfg2 = _classify_block_mask(_NoWeakrefBlockMask(mask_mod), B=1, H=1, q_len=64, kv_len=64)
+    assert cfg1 is cfg2
 
 
 def test_classify_cache_used_by_flex_attention(capture_backend, monkeypatch):
@@ -179,3 +206,109 @@ def test_clear_classification_cache_forces_recompute():
     cfg2 = _classify_block_mask(bm, B=1, H=1, q_len=64, kv_len=64)
     assert cfg1 is not cfg2  # cache cleared -> recomputed (new object)
     assert cfg1 == cfg2
+
+
+# --- T23: the cache has to survive a rebuilt BlockMask ----------------------
+# Real training calls create_block_mask every forward. Keying the classification
+# on the BlockMask wrapper meant a guaranteed miss every step: measured end to
+# end, 34-38 s of cold classify + build + compile per unique mask/shape.
+
+
+def _win(w):
+    """A factory, so each call hands out a *fresh* function object."""
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        return (q_idx >= kv_idx) & ((q_idx - kv_idx) <= w)
+
+    return mask_mod
+
+
+def _count_probes(monkeypatch):
+    """Count how many times the uncached classifier actually runs."""
+    from primus_turbo.pytorch.ops.attention.flex import _mask_classify as mc
+
+    calls = []
+    real = mc._classify_block_mask_uncached
+
+    def counting(block_mask, **kw):
+        calls.append(kw)
+        return real(block_mask, **kw)
+
+    monkeypatch.setattr(mc, "_classify_block_mask_uncached", counting, raising=True)
+    return calls
+
+
+def test_rebuilt_block_mask_around_the_same_mask_mod_still_hits(monkeypatch):
+    calls = _count_probes(monkeypatch)
+    mask_mod = _win(64)  # built once, reused -- the module-level-function case
+
+    first = _classify_block_mask(_DummyBlockMask(mask_mod), B=1, H=1, q_len=256, kv_len=256)
+    # A brand new wrapper object every step, exactly like create_block_mask-per-forward.
+    for _ in range(4):
+        again = _classify_block_mask(_DummyBlockMask(mask_mod), B=1, H=1, q_len=256, kv_len=256)
+        assert again == first
+
+    assert len(calls) == 1, "rebuilding the BlockMask must not re-probe"
+
+
+def test_a_rebuilt_mask_mod_hits_via_the_content_fingerprint(monkeypatch):
+    calls = _count_probes(monkeypatch)
+    # Fresh function object each step, same captured window: same behaviour.
+    first = _classify_block_mask(_DummyBlockMask(_win(64)), B=1, H=1, q_len=256, kv_len=256)
+    for _ in range(4):
+        assert _classify_block_mask(_DummyBlockMask(_win(64)), B=1, H=1, q_len=256, kv_len=256) == first
+    assert len(calls) == 1
+
+
+def test_a_different_captured_value_is_a_different_key(monkeypatch):
+    # The fingerprint must not collapse w=64 and w=128 onto one entry -- that would
+    # silently train the wrong mask, which is the whole class of bug this PR hunts.
+    calls = _count_probes(monkeypatch)
+    a = _classify_block_mask(_DummyBlockMask(_win(64)), B=1, H=1, q_len=256, kv_len=256)
+    b = _classify_block_mask(_DummyBlockMask(_win(128)), B=1, H=1, q_len=256, kv_len=256)
+    assert a["window_size"] == (64, 0)
+    assert b["window_size"] == (128, 0)
+    assert len(calls) == 2
+
+
+def test_a_different_shape_is_a_different_key(monkeypatch):
+    calls = _count_probes(monkeypatch)
+    mask_mod = _win(64)
+    _classify_block_mask(_DummyBlockMask(mask_mod), B=1, H=1, q_len=256, kv_len=256)
+    _classify_block_mask(_DummyBlockMask(mask_mod), B=1, H=1, q_len=512, kv_len=512)
+    assert len(calls) == 2
+
+
+def test_a_closure_over_a_mutable_is_not_fingerprinted():
+    # A list someone appends to would key equal while behaving differently. Refusing
+    # to fingerprint it falls back to identity, i.e. to the old behaviour -- correct,
+    # just not cached across rebuilds.
+    from primus_turbo.pytorch.ops.attention.flex._cache import _fn_fingerprint
+
+    bounds = [128]
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        return q_idx >= kv_idx + bounds[0]
+
+    assert _fn_fingerprint(mask_mod) is None
+
+
+def test_a_closure_over_a_tensor_is_not_fingerprinted():
+    # Pinning a tensor alive inside a process-lifetime cache key is a leak.
+    from primus_turbo.pytorch.ops.attention.flex._cache import _fn_fingerprint
+
+    captured = torch.zeros(4)
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        return q_idx >= kv_idx + int(captured.numel())
+
+    assert _fn_fingerprint(mask_mod) is None
+
+
+def test_fingerprint_cache_is_bounded():
+    from primus_turbo.pytorch.ops.attention.flex import _cache as cache_mod
+
+    cache_mod.clear_classification_cache()
+    for i in range(cache_mod._FINGERPRINT_CACHE_MAX + 5):
+        cache_mod._fingerprint_put(_win(i), (1, 1, 256, 256), {"kind": "sliding_window_causal"})
+    assert len(cache_mod._FINGERPRINT_CACHE) <= cache_mod._FINGERPRINT_CACHE_MAX

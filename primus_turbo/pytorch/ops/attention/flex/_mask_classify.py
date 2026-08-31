@@ -20,7 +20,14 @@ import torch
 
 from primus_turbo.common.logger import logger
 
-from ._cache import _CACHE_MISS, _CLASSIFY_CACHE, _cache_get, _cache_put
+from ._cache import (
+    _CACHE_MISS,
+    _CLASSIFY_CACHE,
+    _cache_get,
+    _cache_put,
+    _fingerprint_get,
+    _fingerprint_put,
+)
 from ._config import _DOC_EXACT_VERIFY_LIMIT, _DOC_VERIFY_CHUNK, _MASK_PROBE_LIMIT
 from ._probe import (
     _call_mask_mod,
@@ -999,23 +1006,34 @@ def _classify_block_mask(
 ) -> Dict[str, Any]:
     """Cached wrapper over :func:`_classify_block_mask_uncached`.
 
-    ``None`` short-circuits to full attention. Otherwise the result is memoised by
-    ``block_mask`` object identity and ``(B, H, q_len, kv_len)`` (a different object
-    or shape re-probes). Caching is a pure speedup -- it returns exactly what the
-    uncached classifier would (only successful classifications are stored; a mask
-    that raises simply re-raises next time, identical behaviour).
+    ``None`` short-circuits to full attention. Otherwise the result is memoised
+    against the ``mask_mod`` -- by object identity first, then by content
+    fingerprint for mask_mods a factory rebuilds each step -- keyed by
+    ``(B, H, q_len, kv_len)``. Caching is a pure speedup: it returns exactly what
+    the uncached classifier would, because the classifier is a function of the
+    mask_mod and the shape and of nothing else. Only successful classifications are
+    stored; a mask that raises simply re-raises next time, identical behaviour.
     """
     if block_mask is None:
         return {"kind": "full", "causal": False, "window_size": (-1, -1)}
 
     key = (B, H, q_len, kv_len)
-    cached = _cache_get(_CLASSIFY_CACHE, block_mask, key)
+    # The classifier reads only `block_mask.mask_mod` and the shape, so the mask_mod
+    # is the whole key -- the BlockMask wrapper around it contributes nothing to the
+    # answer. Keying on the wrapper meant that rebuilding it every step (which is
+    # what create_block_mask-per-forward does) missed every time.
+    mask_mod = getattr(block_mask, "mask_mod", None)
+    cached = _cache_get(_CLASSIFY_CACHE, mask_mod, key)
+    if cached is _CACHE_MISS:
+        # Identity missed: the mask_mod itself may be rebuilt each step by a factory.
+        cached = _fingerprint_get(mask_mod, key)
     if cached is not _CACHE_MISS:
         return cached
     cfg = _classify_block_mask_uncached(block_mask, B=B, H=H, q_len=q_len, kv_len=kv_len)
-    _cache_put(_CLASSIFY_CACHE, block_mask, key, cfg)
+    _cache_put(_CLASSIFY_CACHE, mask_mod, key, cfg)
+    _fingerprint_put(mask_mod, key, cfg)
     # A cache miss is exactly "a mask/shape this process has not classified before",
-    # so this fires once per unique (block_mask, shape) rather than once per call.
+    # so this fires once per unique (mask_mod, shape) rather than once per call.
     #
     # Without it the run is unauditable: the only flex-related lines in a training
     # log are Primus's own config echo, and that echo is byte-identical whether the
