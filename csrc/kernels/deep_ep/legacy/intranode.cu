@@ -246,7 +246,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                                                            int num_max_send_tokens,
                                                            int num_recv_buffer_tokens) {
     const auto num_sms = static_cast<int>(gridDim.x), sm_id = static_cast<int>(blockIdx.x);
-    const auto thread_id = static_cast<int>(threadIdx.x), lane_id = get_lane_id();
+    const auto thread_id = static_cast<int>(threadIdx.x), lane_id = static_cast<int>(__lane_id());
     const bool is_sender = sm_id % 2 == 0;
     EP_DEVICE_ASSERT(num_sms % 2 == 0);
 
@@ -437,8 +437,9 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
             // NOTES: here all warps should share the same new tail
             // ROCm: bar.sync -> sync_barrier, emulated named barrier (arch.cuh)
             sync_barrier(responsible_rank, num_threads_per_rank);
+            // ROCm: `release` dropped, the sync_barrier above already drained the payload
             if (send_warp_id_in_rank == 0 and elect_one_sync())
-                st_release_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
+                st_coherent_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
         }
     } else {
         // Workers for receiving and copying into buffer
@@ -469,10 +470,10 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                 recv_channel_offset[responsible_rank * num_channels + responsible_channel] = total_offset;
             num_tokens_to_recv -= total_offset;
         }
-        // ROCm: __shfl_sync(0xffffffff, ..) -> shfl_sync, HIP rejects a 32-bit mask
-        total_offset = shfl_sync(total_offset, 0);
+        // ROCm: __shfl_sync(0xffffffff, ..) -> __shfl, the whole wave participates
+        total_offset = __shfl(total_offset, 0);
         total_offset += rank_offset;
-        num_tokens_to_recv = shfl_sync(num_tokens_to_recv, 0);
+        num_tokens_to_recv = __shfl(num_tokens_to_recv, 0);
 
         // Shared tail indices for different warps
         __shared__ volatile int shared_channel_tail_idx[kNumRanks];
@@ -482,7 +483,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
         while (num_tokens_to_recv > 0) {
             // NOTES: unlike the sender, the receiver must ensure that the tail indices hold by different warps are the same
             while (recv_thread_id_in_rank == 0) {
-                cached_channel_tail_idx = ld_acquire_sys_global(channel_tail_idx.buffer());
+                // ROCm: `acquire` dropped, the payload loads are `sc0 sc1` and bypass every cache
+                cached_channel_tail_idx = ld_coherent_sys_global(channel_tail_idx.buffer());
 
                 // Ready to copy
                 if (cached_channel_head_idx != cached_channel_tail_idx) {
@@ -706,8 +708,8 @@ __global__ void cached_notify_combine(
             int token_idx = token_idx_tail - lane_id, expected_head = 0;
             auto current_head = (token_idx >= token_start_idx) ? __ldg(send_head + token_idx * kNumRanks + rank_id) : -1;
             for (int i = 0; i < min(kWarpSize, token_idx_tail - token_start_idx + 1); ++i) {
-                // ROCm: __shfl_sync(0xffffffff, ..) -> shfl_sync
-                const int head = shfl_sync(current_head, i);
+                // ROCm: __shfl_sync(0xffffffff, ..) -> __shfl
+                const int head = __shfl(current_head, i);
                 if (head < 0) {
                     if (lane_id == i)
                         expected_head = -last_head - 1;
@@ -773,7 +775,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                                                           int num_recv_buffer_tokens) {
     const auto num_sms = static_cast<int>(gridDim.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
-    const auto sm_id = static_cast<int>(blockIdx.x), lane_id = get_lane_id();
+    const auto sm_id = static_cast<int>(blockIdx.x), lane_id = static_cast<int>(__lane_id());
     const auto num_channels = num_sms / 2;
     const bool is_sender = sm_id % 2 == 0;
     const int responsible_channel = sm_id / 2;
@@ -899,8 +901,9 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
             // Move tail index
             // ROCm: bar.sync -> sync_barrier, emulated named barrier (arch.cuh)
             sync_barrier(send_rank_id, num_threads_per_rank);
+            // ROCm: `release` dropped, the sync_barrier above already drained the payload
             if (send_warp_id_in_rank == 0 and elect_one_sync())
-                st_release_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx);
+                st_coherent_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx);
         }
     } else {
         // Workers for receiving
@@ -941,7 +944,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                     break;
 
                 // Update queue tail
-                channel_tail_idx[lane_id] = ld_acquire_sys_global(channel_tail_idx_ptr);
+                // ROCm: `acquire` dropped, the payload loads are `sc0 sc1` and bypass every cache
+                channel_tail_idx[lane_id] = ld_coherent_sys_global(channel_tail_idx_ptr);
 
                 // Update minimum head
                 int min_head = std::numeric_limits<int>::max();
@@ -993,8 +997,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                     expected_head = ld_nc_global(send_head + token_idx * kNumRanks + lane_id);
 
                 auto start_time = clock64();
-                // ROCm: __any_sync(0xffffffff, ..) -> any_sync(kFullWarpMask, ..)
-                while (any_sync(kFullWarpMask, channel_tail_idx[lane_id] <= expected_head and expected_head >= 0)) {
+                // ROCm: __any_sync(0xffffffff, ..) -> __any, the whole wave participates
+                while (__any(channel_tail_idx[lane_id] <= expected_head and expected_head >= 0)) {
                     // Timeout check
                     if (clock64() - start_time > LEGACY_NUM_TIMEOUT_CYCLES) {
                         printf("DeepEP timeout for combine receivers, rank %d, responsible_channel = %d, expect = %d\n",
@@ -1010,8 +1014,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                 int num_topk_ranks = 0, topk_ranks[kNumRanks], slot_indices[kNumRanks];
                 #pragma unroll
                 for (int i = 0; i < kNumRanks; ++i) {
-                    // ROCm: __shfl_sync(0xffffffff, ..) -> shfl_sync
-                    auto expected_head_i = shfl_sync(expected_head, i);
+                    // ROCm: __shfl_sync(0xffffffff, ..) -> __shfl
+                    auto expected_head_i = __shfl(expected_head, i);
                     if (expected_head_i >= 0) {
                         slot_indices[num_topk_ranks] = expected_head_i % num_recv_buffer_tokens;
                         topk_ranks[num_topk_ranks++] = i;

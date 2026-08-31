@@ -29,21 +29,6 @@
         }                                                                                                                                     \
     }
 
-// ROCm: new, half-wave variant for the internode paths hard-wired to 32 lanes
-#define UNROLLED_WARP_COPY_EMULATED(UNROLL_FACTOR, LANE_ID, N, DST, SRC, LD_FUNC, ST_FUNC)                                                          \
-    {                                                                                                                                              \
-        constexpr int kLoopStride = kEmulatedWarpSize * (UNROLL_FACTOR);                                                                           \
-        typename std::remove_reference<decltype(LD_FUNC((SRC) + 0))>::type unrolled_values[(UNROLL_FACTOR)];                                       \
-        auto __src = (SRC);                                                                                                                         \
-        auto __dst = (DST);                                                                                                                         \
-        for (int __i = (LANE_ID); __i < ((N) / kLoopStride) * kLoopStride; __i += kLoopStride) {                                                   \
-            _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) unrolled_values[__j] = LD_FUNC(__src + __i + __j * kEmulatedWarpSize); \
-            _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) ST_FUNC(__dst + __i + __j * kEmulatedWarpSize, unrolled_values[__j]);  \
-        }                                                                                                                                          \
-        for (int __i = ((N) / kLoopStride) * kLoopStride + (LANE_ID); __i < (N); __i += kEmulatedWarpSize)                                         \
-            ST_FUNC(__dst + __i, LD_FUNC(__src + __i));                                                                                            \
-    }
-
 // ROCm: deep_ep::legacy -> primus_turbo::deep_ep::legacy
 namespace primus_turbo::deep_ep::legacy {
 
@@ -84,17 +69,19 @@ __device__ __forceinline__ void trap() {
     abort();  // ROCm: asm("trap;") -> abort()
 }
 
-// ROCm: PTX fences -> wait_all_vmem, `sc0 sc1` accesses never land in L2 to flush
+// ROCm: PTX fences -> __builtin_amdgcn_fence, scope "" is system.
+// Ordering lives in the fence; the cache modifier that makes a write visible at
+// all lives in the `coherent` family below. The two are independent here.
 __device__ __forceinline__ void memory_fence() {
-    wait_all_vmem();
+    __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "");
 }
 
 __device__ __forceinline__ void memory_fence_gpu() {
-    wait_all_vmem();
+    __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "agent");
 }
 
 __device__ __forceinline__ void memory_fence_cta() {
-    wait_all_vmem();
+    __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "workgroup");
 }
 
 // ROCm: new, the `coherent` family carries cache modifiers and no ordering: `sc1` for
@@ -214,61 +201,47 @@ __device__ __forceinline__ void st_relaxed_sys_global(const int* ptr, int val) {
     __hip_atomic_store(const_cast<int*>(ptr), val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-// ROCm: `release` -> s_waitcnt + relaxed, drain this wave then publish.
-// Sibling waves drain in barrier_arrive_fence(), so callers sync_barrier() first.
+// ROCm: `st.release.sys` -> a system release fence, then the coherent store.
+// The fence carries the ordering, `sc0 sc1` carries the visibility.
 template <typename dtype_t>
 __device__ __forceinline__ void st_release_sys_global(const dtype_t* ptr, dtype_t val) {
-    wait_all_vmem();
-    __hip_atomic_store(const_cast<dtype_t*>(ptr), val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+    st_coherent_sys_global(ptr, val);
 }
 
-// ROCm: `release` -> s_waitcnt + relaxed, workgroup scope
+// ROCm: `st.release.cta` -> workgroup release fence + relaxed store
 __device__ __forceinline__ void st_release_cta(const int* ptr, int val) {
-    wait_all_vmem();
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
     __hip_atomic_store(const_cast<int*>(ptr), val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
 }
 
-// ROCm: `acquire` -> s_waitcnt + relaxed, the vmcnt wait orders flag-then-payload
+// ROCm: `ld.acquire.sys` -> the coherent load, then a system acquire fence
 template <typename dtype_t>
 __device__ __forceinline__ dtype_t ld_acquire_sys_global(const dtype_t* ptr) {
-    wait_all_vmem();
-    dtype_t ret = __hip_atomic_load(const_cast<dtype_t*>(ptr), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    dtype_t ret = ld_coherent_sys_global(ptr);
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
     return ret;
 }
 
-// ROCm: `acquire` -> s_waitcnt + relaxed, mirror of ld_acquire_sys_global.
+// ROCm: `ld.acquire.gpu` -> mirror of ld_acquire_sys_global at agent scope
 __device__ __forceinline__ int ld_acquire_global(const int* ptr) {
-    wait_all_vmem();
-    int ret = __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    int ret = ld_coherent_global(ptr);
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
     return ret;
 }
 
-// ROCm: `release` -> s_waitcnt + relaxed; the RMW itself is unchanged.
+// ROCm: `atom.release.*` -> the RMW's own release ordering
 __device__ __forceinline__ int atomic_add_release_sys_global(const int* ptr, int value) {
-    wait_all_vmem();
-    int ret = __hip_atomic_fetch_add(const_cast<int*>(ptr), value, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    return ret;
+    return __hip_atomic_fetch_add(const_cast<int*>(ptr), value, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-// ROCm: `release` -> s_waitcnt + relaxed.
 __device__ __forceinline__ int atomic_add_release_global(const int* ptr, int value) {
-    wait_all_vmem();
-    int ret = __hip_atomic_fetch_add(const_cast<int*>(ptr), value, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    return ret;
+    return __hip_atomic_fetch_add(const_cast<int*>(ptr), value, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
 }
 
-// ROCm: `acquire` -> s_waitcnt + relaxed.
+// ROCm: `ld.acquire.cta` -> an acquire load, LDS/workgroup needs no cache modifier
 __device__ __forceinline__ int ld_acquire_cta(const int* ptr) {
-    wait_all_vmem();
-    int ret = __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    return ret;
+    return __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_WORKGROUP);
 }
 
 // ROCm: `L1::no_allocate` -> agent-scope relaxed, which bypasses L1 via `sc1`
@@ -339,23 +312,20 @@ __device__ __forceinline__ void st_na_relaxed(const int4* ptr, int4 val) {
     *const_cast<int4*>(ptr) = val;
 }
 
-// ROCm: `release` -> s_waitcnt + relaxed, as everywhere else on this port.
+// ROCm: `st.release.gpu.L1::no_allocate` -> agent release fence + coherent store
 __device__ __forceinline__ void st_na_release(const int* ptr, int val) {
-    wait_all_vmem();
-    __hip_atomic_store(const_cast<int*>(ptr), val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+    st_coherent_global(ptr, val);
 }
 
 __device__ __forceinline__ void st_na_release(const uint32_t* ptr, uint32_t val) {
-    wait_all_vmem();
-    __hip_atomic_store(const_cast<uint32_t*>(ptr), val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+    st_coherent_global(ptr, val);
 }
 
 __device__ __forceinline__ void st_na_release(const uint64_t* ptr, uint64_t val) {
-    wait_all_vmem();
-    __hip_atomic_store(const_cast<uint64_t*>(ptr), val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+    st_coherent_global(ptr, val);
 }
 
 // ROCm: `st.global.L1::no_allocate` -> st_coherent_sys_global, most callers write a peer's buffer
@@ -379,9 +349,9 @@ __device__ __forceinline__ float exp2f_approx(const float& x) {
     return __builtin_amdgcn_exp2f(x);
 }
 
-// ROCm: the warp primitives moved to common/arch.cuh, `elect.sync` is SM90-only
+// ROCm: `elect.sync` is SM90-only, and lane 0 is always active here
 __device__ __forceinline__ uint32_t elect_one_sync() {
-    return get_lane_id() == 0;
+    return __lane_id() == 0;
 }
 
 // ROCm: upstream's TMA block is dropped, gfx942/gfx950 have no cp.async/mbarrier
@@ -430,8 +400,8 @@ __device__ __forceinline__ dtype_t broadcast(dtype_t& ptr, int src_lane_idx) {
     int recv_int_values[sizeof(dtype_t) / sizeof(int)];
     #pragma unroll
     for (int i = 0; i < sizeof(dtype_t) / sizeof(int); ++i)
-        // ROCm: __shfl_sync(0xffffffff, ..) -> shfl_sync, HIP rejects a 32-bit mask
-        recv_int_values[i] = shfl_sync(send_int_values[i], src_lane_idx);
+        // ROCm: __shfl_sync(0xffffffff, ..) -> __shfl, the whole wave participates
+        recv_int_values[i] = __shfl(send_int_values[i], src_lane_idx);
     return *reinterpret_cast<dtype_t*>(recv_int_values);
 }
 
@@ -478,7 +448,11 @@ __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int ran
 
     // For non-sync-only cases, the memory operations by other threads in the block must be visible to the `sys` scope
     if constexpr (not kSyncOnly) {
-        memory_fence();
+        // ROCm: `memory_fence()` -> a drain. Everything this block published carries
+        // `sc0 sc1` and never entered L2, so the `buffer_wbl2` / `buffer_inv` an
+        // ACQ_REL sys fence emits write back and invalidate nothing -- and cost 21%
+        // of end-to-end bandwidth, measured. Only the drain is load-bearing.
+        wave_drain();
         __syncthreads();
     }
 
@@ -493,8 +467,8 @@ __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int ran
     auto start_time = clock64();
     while (true) {
         auto value = thread_id < kNumRanks ? ld_volatile_global(barrier_signal_ptrs[rank] + thread_id) : 0;
-        // ROCm: __all_sync(0xffffffff, ..) -> all_sync(kFullWarpMask, ..)
-        if (all_sync(kFullWarpMask, value <= 0))
+        // ROCm: __all_sync(0xffffffff, ..) -> __all, the whole wave participates
+        if (__all(value <= 0))
             break;
 
         if (clock64() - start_time > LEGACY_NUM_TIMEOUT_CYCLES and thread_id < kNumRanks) {
@@ -505,19 +479,14 @@ __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int ran
     __syncthreads();
 }
 
-// ROCm: LDS CAS/exch PTX -> __hip_atomic_*, `acquire` -> s_waitcnt + relaxed
+// ROCm: LDS CAS/exch PTX -> __hip_atomic_*, which take the ordering directly
 __forceinline__ __device__ int atomic_cas_cta_acquire(int* addr, int x, int y) {
-    __hip_atomic_compare_exchange_strong(addr, &x, y, __ATOMIC_RELAXED, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
-    wait_all_vmem();
+    __hip_atomic_compare_exchange_strong(addr, &x, y, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_WORKGROUP);
     return x;
 }
 
-// ROCm: `release` -> s_waitcnt + relaxed.
 __forceinline__ __device__ int atomic_exch_cta_release(int* addr, int x) {
-    wait_all_vmem();
-    int ret = __hip_atomic_exchange(addr, x, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    return ret;
+    return __hip_atomic_exchange(addr, x, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_WORKGROUP);
 }
 
 __forceinline__ __device__ void acquire_lock(int* mutex) {
@@ -560,36 +529,35 @@ __forceinline__ __device__ T warp_reduce(T value, Op op) {
     EP_STATIC_ASSERT(kNumLanesPerGroup == 64 or kNumLanesPerGroup == 32 or kNumLanesPerGroup == 16 or kNumLanesPerGroup == 8 or
                          kNumLanesPerGroup == 4 or kNumLanesPerGroup == 2 or kNumLanesPerGroup == 1,
                      "Invalid number of lanes");
-    // ROCm: 0xffffffff -> kFullWarpMask, HIP rejects a 32-bit mask
-    constexpr lane_mask_t mask = kFullWarpMask;
+    // ROCm: __shfl_xor_sync(0xffffffff, ..) -> __shfl_xor, the whole wave participates
     if constexpr (kIntergroupReduce) {
         if constexpr (kNumLanesPerGroup <= 1)
-            value = op(value, shfl_xor_sync(value, 1, kWarpSize, mask));
+            value = op(value, __shfl_xor(value, 1, kWarpSize));
         if constexpr (kNumLanesPerGroup <= 2)
-            value = op(value, shfl_xor_sync(value, 2, kWarpSize, mask));
+            value = op(value, __shfl_xor(value, 2, kWarpSize));
         if constexpr (kNumLanesPerGroup <= 4)
-            value = op(value, shfl_xor_sync(value, 4, kWarpSize, mask));
+            value = op(value, __shfl_xor(value, 4, kWarpSize));
         if constexpr (kNumLanesPerGroup <= 8)
-            value = op(value, shfl_xor_sync(value, 8, kWarpSize, mask));
+            value = op(value, __shfl_xor(value, 8, kWarpSize));
         if constexpr (kNumLanesPerGroup <= 16)
-            value = op(value, shfl_xor_sync(value, 16, kWarpSize, mask));
+            value = op(value, __shfl_xor(value, 16, kWarpSize));
         // ROCm: +1 step, lanes 32..63 exist on wave64
         if constexpr (kNumLanesPerGroup <= 32 and kWarpSize == 64)
-            value = op(value, shfl_xor_sync(value, 32, kWarpSize, mask));
+            value = op(value, __shfl_xor(value, 32, kWarpSize));
     } else {
         // ROCm: +1 step, same for the intra-group direction
         if constexpr (kNumLanesPerGroup >= 64)
-            value = op(value, shfl_xor_sync(value, 32, kWarpSize, mask));
+            value = op(value, __shfl_xor(value, 32, kWarpSize));
         if constexpr (kNumLanesPerGroup >= 32)
-            value = op(value, shfl_xor_sync(value, 16, kWarpSize, mask));
+            value = op(value, __shfl_xor(value, 16, kWarpSize));
         if constexpr (kNumLanesPerGroup >= 16)
-            value = op(value, shfl_xor_sync(value, 8, kWarpSize, mask));
+            value = op(value, __shfl_xor(value, 8, kWarpSize));
         if constexpr (kNumLanesPerGroup >= 8)
-            value = op(value, shfl_xor_sync(value, 4, kWarpSize, mask));
+            value = op(value, __shfl_xor(value, 4, kWarpSize));
         if constexpr (kNumLanesPerGroup >= 4)
-            value = op(value, shfl_xor_sync(value, 2, kWarpSize, mask));
+            value = op(value, __shfl_xor(value, 2, kWarpSize));
         if constexpr (kNumLanesPerGroup >= 2)
-            value = op(value, shfl_xor_sync(value, 1, kWarpSize, mask));
+            value = op(value, __shfl_xor(value, 1, kWarpSize));
     }
     return value;
 }

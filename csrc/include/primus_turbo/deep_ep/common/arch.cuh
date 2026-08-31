@@ -1,6 +1,10 @@
 #pragma once
 
-// ROCm: new file, single home for every arch-dependent choice (see ARCH_NOTES.md)
+// ROCm: new file, single home for every arch-dependent choice.
+// Rule of thumb for what belongs here: it must be architecture-dependent *and*
+// have no native HIP spelling. Cross-lane shuffles/votes/barriers do have one
+// (`__shfl`, `__any`, `__syncwarp`, ...), so they are used directly at the call
+// sites instead of being wrapped here.
 
 #include <cstdint>
 #include <hip/hip_runtime.h>
@@ -21,34 +25,9 @@ namespace primus_turbo::deep_ep {
 
 static constexpr int32_t kWarpSize = PRIMUS_TURBO_DEEPEP_WARP_SIZE;
 
-// HIP's *_sync intrinsics static_assert on a 64-bit mask, on every arch.
-using lane_mask_t = uint64_t;
-
-static constexpr lane_mask_t kFullWarpMask = ~lane_mask_t(0) >> (64 - kWarpSize);
-
-// For upstream algorithms hard-wired to 32 lanes per group
-static constexpr int32_t     kEmulatedWarpSize = 32;
-static constexpr lane_mask_t kFirstHalfMask    = 0x00000000ffffffffull;
-static constexpr lane_mask_t kSecondHalfMask   = 0xffffffff00000000ull;
-
 // ---------------------------------------------------------------------------
-// 2. Wave-local drain
+// 2. Timing and spin throttling
 // ---------------------------------------------------------------------------
-// gfx12 splits s_waitcnt into per-class counters
-#if defined(__GFX12__)
-#define PRIMUS_TURBO_WAIT_ALL_STR                                                                  \
-    "s_wait_dscnt 0\n\ts_wait_kmcnt 0\n\ts_wait_loadcnt 0\n\ts_wait_storecnt 0"
-#else
-#define PRIMUS_TURBO_WAIT_ALL_STR "s_waitcnt lgkmcnt(0) vmcnt(0)"
-#endif
-
-// Drains this wave's memory ops; sibling waves need a sync_barrier first
-__device__ __forceinline__ void wait_all_vmem() {
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    asm volatile(PRIMUS_TURBO_WAIT_ALL_STR);
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
-}
-
 // ROCm: clock64() -> the steady 100 MHz counter, CDNA has no working s_memtime
 __device__ __forceinline__ int64_t clock64() {
     return static_cast<int64_t>(wall_clock64());
@@ -65,55 +44,7 @@ __device__ __forceinline__ void spin_backoff() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Cross-lane primitives
-// ---------------------------------------------------------------------------
-// ROCm: HIP's *_sync wrappers cost a reconvergence loop, so the mask is ignored
-
-template <typename T>
-__device__ __forceinline__ T shfl_sync(const T val, int src_lane, int width = kWarpSize,
-                                       lane_mask_t mask = kFullWarpMask) {
-    return __shfl(val, src_lane, width);
-}
-
-template <typename T>
-__device__ __forceinline__ T shfl_xor_sync(const T val, int lane_mask, int width = kWarpSize,
-                                           lane_mask_t mask = kFullWarpMask) {
-    return __shfl_xor(val, lane_mask, width);
-}
-
-// __ballot spans the whole wave, so a half-wave group masks its own half
-__device__ __forceinline__ int any_sync(lane_mask_t mask, int predicate) {
-    return (__ballot(predicate) & mask) != 0;
-}
-
-__device__ __forceinline__ int all_sync(lane_mask_t mask, int predicate) {
-    return (~__ballot(predicate) & mask) == 0;
-}
-
-__device__ __forceinline__ int get_lane_id() {
-    return __lane_id();
-}
-
-// Lane id and ballot mask of the calling thread's 32-lane group
-__device__ __forceinline__ int get_emulated_lane_id() {
-    return get_lane_id() % kEmulatedWarpSize;
-}
-
-__device__ __forceinline__ lane_mask_t emulated_warp_mask() {
-    if constexpr (kWarpSize == kEmulatedWarpSize)
-        return kFullWarpMask;
-    return get_lane_id() < kEmulatedWarpSize ? kFirstHalfMask : kSecondHalfMask;
-}
-
-// ROCm: wavefront-scope fences -> signal fences, no instruction either way
-__device__ __forceinline__ void syncwarp() {
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    __builtin_amdgcn_wave_barrier();
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
-}
-
-// ---------------------------------------------------------------------------
-// 4. Named barrier (CUDA `bar.sync <id>, <count>`)
+// 3. Named barrier (CUDA `bar.sync <id>, <count>`)
 // ---------------------------------------------------------------------------
 // ROCm: `bar.sync <id>` -> an LDS arrival counter, CDNA has no named barriers.
 // The counter is monotonic and never reset, so a wave that runs ahead just raises
@@ -131,25 +62,38 @@ __device__ __forceinline__ void syncwarp() {
     {                                                                                              \
         ___bar_sync_expected += (___num_threads_per_group) / kWarpSize;                            \
         __fence;                                                                                   \
-        if (get_lane_id() == 0) {                                                                  \
+        if (__lane_id() == 0) {                                                                    \
             __hip_atomic_fetch_add(___bar_sync_count + (___bar_id), 1, __ATOMIC_RELAXED,           \
                                    __HIP_MEMORY_SCOPE_WORKGROUP);                                  \
             while (__hip_atomic_load(___bar_sync_count + (___bar_id), __ATOMIC_RELAXED,            \
                                      __HIP_MEMORY_SCOPE_WORKGROUP) < ___bar_sync_expected)         \
                 __builtin_amdgcn_s_sleep(1);                                                       \
         }                                                                                          \
-        syncwarp();                                                                                \
+        __syncwarp();                                                                              \
     }
+
+// ROCm: `bar.sync`'s implicit fence -> a wave drain, each wave drains before it votes.
+// Not a __builtin_amdgcn_fence: the only thing needed here is that this wave's own
+// accesses have landed, and every fence scope wide enough to emit `s_waitcnt vmcnt(0)`
+// also drags in `buffer_wbl2` / `buffer_inv`, which have nothing to do here -- the
+// payload carries `sc0 sc1` and never enters L2.
+__device__ __forceinline__ void wave_drain() {
+#if defined(__GFX12__)
+#error "deep_ep: gfx12 splits s_waitcnt into per-class counters, needs its own drain"
+#endif
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    __builtin_amdgcn_s_waitcnt(0);  // 0 == every counter at 0
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+}
+
+__device__ __forceinline__ void barrier_arrive_fence() {
+    wave_drain();
+}
 
 // ROCm: new, __syncthreads() alone orders only LDS on CDNA, not global stores
 __device__ __forceinline__ void sync_threads_global() {
-    wait_all_vmem();
+    wave_drain();
     __syncthreads();
-}
-
-// ROCm: `bar.sync`'s implicit fence -> wait_all_vmem, each wave drains before it votes
-__device__ __forceinline__ void barrier_arrive_fence() {
-    wait_all_vmem();
 }
 
 #define sync_barrier_init()               PRIMUS_TURBO_BARRIER_SYNC_INIT()
@@ -157,7 +101,7 @@ __device__ __forceinline__ void barrier_arrive_fence() {
                                                                     bar_id, num_threads)
 
 // ---------------------------------------------------------------------------
-// 5. Async global -> LDS copy (CUDA cp.async.bulk + mbarrier)
+// 4. Async global -> LDS copy (CUDA cp.async.bulk + mbarrier)
 // ---------------------------------------------------------------------------
 // ROCm: gfx942/gfx950 have no cp.async, so the TMA paths fall back to plain copies
 #if defined(__gfx1250__)
@@ -167,7 +111,7 @@ __device__ __forceinline__ void barrier_arrive_fence() {
 #endif
 
 // ---------------------------------------------------------------------------
-// 5b. Cache-policy bits on a data access
+// 5. Cache-policy bits on a data access
 // ---------------------------------------------------------------------------
 // ROCm: PTX cache hints -> gfx9 CPol bits, `sc0` (1) past the device, `sc1` (16)
 // past the XCD's L2. CDNA's L2 is per-XCD and does not snoop xGMI, so these bits
@@ -241,8 +185,13 @@ __device__ __forceinline__ void buffer_st_chunk(void* ptr,
 }
 
 // ---------------------------------------------------------------------------
-// 6. GPU-initiated RDMA (NVSHMEM IBGDA)
+// 6. Multi-node paths
 // ---------------------------------------------------------------------------
+// ROCm: internode is not ported yet, its kernels are upstream NVSHMEM + PTX
+#ifndef PRIMUS_TURBO_DEEPEP_HAS_INTERNODE
+#define PRIMUS_TURBO_DEEPEP_HAS_INTERNODE 0
+#endif
+
 // ROCm: IBGDA is compiled out, rocSHMEM exposes no device-side QP handle
 #ifndef PRIMUS_TURBO_DEEPEP_HAS_IBGDA
 #define PRIMUS_TURBO_DEEPEP_HAS_IBGDA 0
