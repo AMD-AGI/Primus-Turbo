@@ -94,8 +94,10 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             sum = (sum + expert_alignment - 1) / expert_alignment * expert_alignment;
             moe_recv_expert_counter_mapped[thread_id] = sum;
         }
-        // ROCm: __syncthreads() -> sync_threads_global, the reads below take other waves' stores
-        sync_threads_global();
+        // ROCm: __syncthreads() alone orders only LDS on CDNA, so drain first:
+        // the reads below take other waves' global stores
+        s_waitcnt();
+        __syncthreads();
 
         // Copy rank size prefix matrix to another tensor
         #pragma unroll
@@ -124,8 +126,10 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             if (elect_one_sync())
                 channel_prefix_matrix[dst_rank * num_channels + channel_id] = count;
         }
-        // ROCm: __syncthreads() -> sync_threads_global, thread 0 reads other waves' global stores
-        sync_threads_global();
+        // ROCm: __syncthreads() alone orders only LDS on CDNA, so drain first:
+        // thread 0 reads other waves' global stores
+        s_waitcnt();
+        __syncthreads();
 
         // Pre-compute prefix sum for all channels
         if (thread_id == 0) {
@@ -319,7 +323,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
 #endif
 
     // ROCm: new, one-time setup for the LDS named-barrier emulation (arch.cuh)
-    sync_barrier_init();
+    int bar_expected = sync_barrier_init();
 
     if (is_sender) {
         // Workers for sending
@@ -436,7 +440,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
             // Move tail index
             // NOTES: here all warps should share the same new tail
             // ROCm: bar.sync -> sync_barrier, emulated named barrier (arch.cuh)
-            sync_barrier(responsible_rank, num_threads_per_rank);
+            sync_barrier(bar_expected, responsible_rank, num_threads_per_rank);
             // ROCm: `release` dropped, the sync_barrier above already drained the payload
             if (send_warp_id_in_rank == 0 and elect_one_sync())
                 st_coherent_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
@@ -459,11 +463,11 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
         // Receive channel offset
         // ROCm: `int a, b;` -> zero-initialised, the backend exploits the UB otherwise
         int total_offset = 0, num_tokens_to_recv = 0;
-        // ROCm: empty spin body -> spin_backoff(), an unthrottled poll starves the peer's write
+        // ROCm: empty spin body -> s_sleep(), an unthrottled poll starves the peer's write
         while (lane_id == 0 and (total_offset = ld_volatile_global(channel_start_offset.buffer())) == 0)
-            spin_backoff();
+            s_sleep<1>();
         while (lane_id == 0 and (num_tokens_to_recv = ld_volatile_global(channel_end_offset.buffer())) == 0)
-            spin_backoff();
+            s_sleep<1>();
         if (lane_id == 0) {
             total_offset = -total_offset - 1, num_tokens_to_recv = -num_tokens_to_recv - 1;
             if (recv_warp_id_in_rank == 0)
@@ -504,7 +508,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
 
             // Synchronize queue tail
             // ROCm: bar.sync -> sync_barrier
-            sync_barrier(responsible_rank, num_threads_per_rank);
+            sync_barrier(bar_expected, responsible_rank, num_threads_per_rank);
             cached_channel_tail_idx = shared_channel_tail_idx[responsible_rank];
 
             // Copy data
@@ -573,7 +577,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
             cached_channel_head_idx += num_recv_tokens;
             total_offset += num_recv_tokens;
             // ROCm: bar.sync -> sync_barrier
-            sync_barrier(responsible_rank, num_threads_per_rank);
+            sync_barrier(bar_expected, responsible_rank, num_threads_per_rank);
             if (recv_warp_id_in_rank == num_recv_warps_per_rank - 1 and elect_one_sync())
                 st_relaxed_sys_global(channel_head_idx.buffer(), cached_channel_head_idx);
 
@@ -801,7 +805,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
 #endif
 
     // ROCm: new, set up the emulated named barriers (see the dispatch kernel)
-    sync_barrier_init();
+    int bar_expected = sync_barrier_init();
 
     if (is_sender) {
         // Workers for sending
@@ -904,7 +908,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
 
             // Move tail index
             // ROCm: bar.sync -> sync_barrier, emulated named barrier (arch.cuh)
-            sync_barrier(send_rank_id, num_threads_per_rank);
+            sync_barrier(bar_expected, send_rank_id, num_threads_per_rank);
             // ROCm: `release` dropped, the sync_barrier above already drained the payload
             if (send_warp_id_in_rank == 0 and elect_one_sync())
                 st_coherent_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx);
