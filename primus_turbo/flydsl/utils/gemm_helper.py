@@ -240,6 +240,19 @@ def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled):
     return offsets
 
 
+def compute_global_swizzle_fold(lane_id, wave_id, K, n_rounds, fold):
+    """compute_global_swizzle(preshuffled=False) with the row order folded inside each
+    ``fold*16``-row band (LDS row ``16*t + m`` sources band row ``fold*m + t``), so the ``fold``
+    n-fragments a lane holds land on adjacent output columns. Only the source row moves."""
+    offs = compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled=False)
+    rows_per_round = (fx.block_dim.x // 64) * 8
+    out = []
+    for r in range_constexpr(n_rounds):
+        band = (lane_id // 8 + wave_id * 8 + r * rows_per_round) % (fold * 16)
+        out.append(offs[r] + ((fold - 1) * (band % 16) - 15 * (band // 16)) * K)
+    return out
+
+
 def compute_global_swizzle_shear(lane_id, wave_id, K, n_rounds, m_row, ksm, up):
     """compute_global_swizzle(preshuffled=False) with every row's 128B fetch snapped to its
     enclosing cache line, for a row pitch whose ``K % 128 == ksm != 0`` (raw K-block straddles
@@ -1116,7 +1129,7 @@ class StoreCPerTensorQuadN(StoreCPerTensorPairN):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        assert self.n_tiles_b in (4, 8), "the interleave folds four or eight n-fragments"
+        assert self.n_tiles_b in (2, 4, 8), "the interleave folds two, four or eight n-fragments"
         assert self.col_safe, "a partial fold has no column mask"
 
     def _row_col(self, ti, i, tj, base_col):

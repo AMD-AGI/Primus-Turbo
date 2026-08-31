@@ -50,6 +50,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     S2RLoaderTr,
     StoreCPerTensor,
     StoreCPerTensorCShuffle,
+    StoreCPerTensorQuadN,
     StoreCPerTensorRowN,
     _lane_tbl_count_le,
     _lane_tbl_get,
@@ -63,6 +64,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     asm_mma_do,
     compile_with_scratch_out,
     compute_global_swizzle,
+    compute_global_swizzle_fold,
     compute_global_swizzle_nn,
     compute_global_swizzle_shear,
     make_fp8_buffer_tensor_rebased,
@@ -927,6 +929,7 @@ def _compile_grouped_nt(
     N_TILES_A = BLOCK_M // 64
     N_TILES_B = BLOCK_N // 128
     N_ACCUMS = N_TILES_A * N_TILES_B
+    N_WAVES_N = 4  # waves along N in the 2x4 wave grid (wave_n = wave_id % 4)
     LDS_BLOCK_M = BLOCK_M // 2
     LDS_BLOCK_N = BLOCK_N // 2
     N_LDS_STEPS_A = LDS_BLOCK_M // 64
@@ -949,12 +952,6 @@ def _compile_grouped_nt(
         assert nt_dist2 and not store_cshuffle, "fused GLU epilogue rides the scalar dist2 store path"
         assert not beta_is_one, "fused GLU epilogue overwrites; there is nothing to accumulate into"
     _NBLK = LDS_BLOCK_N if glu else BLOCK_N
-    # Known N makes the scalar epilogue per-element OOB select dead (nt_dist2 supplies the in-bounds half-N boundary body).
-    _col_safe = (
-        (N > 0 and N % _NBLK == 0)
-        if glu
-        else (N > 0 and (N % BLOCK_N == 0 or (nt_dist2 and N % LDS_BLOCK_N == 0)))
-    )
     _nb_c = ceildiv(N, _NBLK) if N > 0 else 0  # compile-time N-block count (0 = take it from c_n)
     # Group-offs table form (see _SGPR_GO_MAX_G): SGPR/s_buffer_load vs lane-resident gather.
     _sgo = G <= _SGPR_GO_MAX_G
@@ -968,6 +965,18 @@ def _compile_grouped_nt(
         if glu
         else (1 if (nt_dist2 and N > 0 and 0 < N % BLOCK_N <= LDS_BLOCK_N // 2) else N_TILES_B)
     )
+    # Known N makes the scalar epilogue per-element OOB select dead: either the N-blocks tile N
+    # exactly, or the (narrowed) boundary body's columns are exactly the remainder.
+    _bnd_cols = N_WAVES_N * _bnd_ntb * 16
+    _col_safe = (
+        (N > 0 and N % _NBLK == 0)
+        if glu
+        else (N > 0 and (N % BLOCK_N == 0 or (nt_dist2 and N % BLOCK_N == _bnd_cols)))
+    )
+    # Folded-N epilogue: permuting B's operand rows at the feed side is free (the g2s offset is
+    # an arbitrary per-lane constant) and puts a lane's two n-fragments on adjacent output
+    # columns, so one buffer_store_dword replaces two buffer_store_short.
+    _nt_fold = nt_dist2 and not glu and not store_cshuffle and _col_safe and N_TILES_B == 2 and not out_fp16
     NS = n_stride if n_stride else N
     assert n_stride == 0 or NS >= N > 0, f"n_stride={n_stride} must be >= real N={N}"
     _bn_rows = 2 * glu_i if glu else NS
@@ -1134,6 +1143,11 @@ def _compile_grouped_nt(
 
             gl_off_a = compute_global_swizzle(lane_id, wave_id, KS, N_LDS_ROUNDS, preshuffled=False)
             gl_off_b = compute_global_swizzle(lane_id, wave_id, KS, N_LDS_ROUNDS, preshuffled=False)
+            gl_off_bf = (
+                compute_global_swizzle_fold(lane_id, wave_id, KS, N_LDS_ROUNDS, N_TILES_B)
+                if const_expr(_nt_fold)
+                else gl_off_b
+            )
 
             # AGPR in-place accum (mode 2) when agpr_inplace -> off the VGPR file (spill-free).
             mfma = _build_mfma(
@@ -1145,7 +1159,7 @@ def _compile_grouped_nt(
             )
 
             a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
-            b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
+            b_g2s = G2SLoader(b_div, gl_off_bf, N_LDS_STEPS_B, F8_IR_t, wave_id)
             a_s2r = S2RLoader(wave_m, N_TILES_A)
             b_s2r = S2RLoader(wave_n, N_TILES_B)
             if const_expr(glu):
@@ -1183,7 +1197,7 @@ def _compile_grouped_nt(
                     beta_is_one=beta_is_one,
                 )
             else:
-                store_c = StoreCPerTensor(
+                store_c = (StoreCPerTensorQuadN if const_expr(_nt_fold) else StoreCPerTensor)(
                     A_scale,
                     B_scale,
                     C,
