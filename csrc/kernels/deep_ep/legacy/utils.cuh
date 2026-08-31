@@ -45,8 +45,8 @@
             ST_FUNC(__dst + __i, LD_FUNC(__src + __i));                                                                                            \
     }
 
-// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep
-namespace primus_turbo::deep_ep {
+// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep::legacy
+namespace primus_turbo::deep_ep::legacy {
 
 template <int kBytes>
 struct VecInt {};
@@ -713,4 +713,4 @@ __forceinline__ __device__ T warp_reduce_or(T value) {
     return warp_reduce<kNumLanesPerGroup, kIntergroupReduce, T>(value, ReduceOr<T>{});
 }
 
-}  // namespace primus_turbo::deep_ep
+}  // namespace primus_turbo::deep_ep::legacy

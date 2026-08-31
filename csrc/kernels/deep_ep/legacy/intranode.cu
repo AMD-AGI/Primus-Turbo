@@ -3,8 +3,8 @@
 #include "launch.cuh"
 #include "utils.cuh"
 
-// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep
-namespace primus_turbo::deep_ep {
+// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep::legacy
+namespace primus_turbo::deep_ep::legacy {
 
 namespace intranode {
 
@@ -1198,4 +1198,4 @@ void combine(cudaDataType_t type,
 
 }  // namespace intranode
 
-}  // namespace primus_turbo::deep_ep
+}  // namespace primus_turbo::deep_ep::legacy

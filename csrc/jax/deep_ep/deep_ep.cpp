@@ -27,7 +27,7 @@ static std::barrier g_barrier_signal(NUM_MAX_NVL_PEERS);
 static std::vector<std::unique_ptr<Buffer>> g_buffer_pool(NUM_MAX_NVL_PEERS);
 
 Buffer *get_buffer(int rank, int num_ranks, int64_t hidden_bytes,
-                   const primus_turbo::deep_ep::Config &config) {
+                   const primus_turbo::deep_ep::legacy::Config &config) {
 
     PRIMUS_TURBO_CHECK(num_ranks <= NUM_MAX_NVL_PEERS,
                        "DeepEP inproc mode only supports intranode communication on JAX "
@@ -189,7 +189,7 @@ void Buffer::Destroy() {
             // after IPC sync) never became visible to kernels, so close the
             // handles without the collective barrier.
             if (is_available()) {
-                primus_turbo::deep_ep::intranode::barrier(barrier_signal_ptrs_gpu_, nvl_rank_,
+                primus_turbo::deep_ep::legacy::intranode::barrier(barrier_signal_ptrs_gpu_, nvl_rank_,
                                                           num_nvl_ranks_, nullptr);
                 PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
             }
@@ -261,7 +261,7 @@ void Buffer::DispatchLayout(
     if (num_tokens_per_rdma_rank.has_value())
         num_tokens_per_rdma_rank_ptr = num_tokens_per_rdma_rank.value()->typed_data();
 
-    primus_turbo::deep_ep::layout::get_dispatch_layout(
+    primus_turbo::deep_ep::legacy::layout::get_dispatch_layout(
         topk_idx.typed_data(), num_tokens_per_rank->typed_data(), num_tokens_per_rdma_rank_ptr,
         num_tokens_per_expert->typed_data(), is_token_in_rank->typed_data(), num_tokens, num_topk,
         num_ranks_, num_experts, stream);
@@ -276,7 +276,7 @@ void Buffer::IntranodeDispatch(
     std::optional<ffi::Buffer<ffi::S32>> num_tokens_per_expert, int cached_num_recv_tokens,
     std::optional<ffi::Buffer<ffi::S32>> cached_rank_prefix_matrix,
     std::optional<ffi::Buffer<ffi::S32>> cached_channel_prefix_matrix, int expert_alignment,
-    int num_worst_tokens, primus_turbo::deep_ep::Config config, ffi::Result<ffi::AnyBuffer> recv_x,
+    int num_worst_tokens, primus_turbo::deep_ep::legacy::Config config, ffi::Result<ffi::AnyBuffer> recv_x,
     std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> recv_x_scales,
     std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> recv_topk_idx,
     std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> recv_topk_weights,
@@ -369,7 +369,7 @@ void Buffer::IntranodeDispatch(
         rank_prefix_matrix    = cached_rank_prefix_matrix.value();
         channel_prefix_matrix = cached_channel_prefix_matrix.value();
         // Copy rank prefix matrix and clean flags
-        primus_turbo::deep_ep::intranode::cached_notify_dispatch(
+        primus_turbo::deep_ep::legacy::intranode::cached_notify_dispatch(
             rank_prefix_matrix.value()->typed_data(), num_memset_int, buffer_ptrs_gpu_,
             barrier_signal_ptrs_gpu_, rank_, num_ranks_, stream);
     } else {
@@ -388,7 +388,7 @@ void Buffer::IntranodeDispatch(
         PRIMUS_TURBO_CHECK(channel_prefix_matrix.has_value());
         PRIMUS_TURBO_CHECK(rank_prefix_matrix.has_value());
 
-        primus_turbo::deep_ep::intranode::notify_dispatch(
+        primus_turbo::deep_ep::legacy::intranode::notify_dispatch(
             num_tokens_per_rank->typed_data(), moe_recv_counter_mapped_, num_ranks_,
             num_tokens_per_expert->typed_data(), moe_recv_expert_counter_mapped_, num_experts,
             num_tokens, is_token_in_rank.typed_data(), channel_prefix_matrix.value()->typed_data(),
@@ -457,7 +457,7 @@ void Buffer::IntranodeDispatch(
                                  sizeof(float) * num_scales // FP8 scale buffer
                              ) <= num_nvl_bytes_);
 
-    primus_turbo::deep_ep::intranode::dispatch(
+    primus_turbo::deep_ep::legacy::intranode::dispatch(
         recv_x->untyped_data(), recv_x_scales_ptr, recv_src_idx->typed_data(), recv_topk_idx_ptr,
         recv_topk_weights_ptr, recv_channel_prefix_matrix->typed_data(), send_head->typed_data(),
         x.untyped_data(), x_scales_ptr, topk_idx_ptr, topk_weights_ptr,
@@ -503,7 +503,7 @@ void Buffer::IntranodeCombine(hipStream_t stream, ffi::AnyBuffer x,
                               std::optional<ffi::AnyBuffer> bias_1, ffi::Buffer<ffi::S32> src_idx,
                               ffi::Buffer<ffi::S32> rank_prefix_matrix,
                               ffi::Buffer<ffi::S32> channel_prefix_matrix,
-                              ffi::Buffer<ffi::S32> send_head, primus_turbo::deep_ep::Config config,
+                              ffi::Buffer<ffi::S32> send_head, primus_turbo::deep_ep::legacy::Config config,
                               ffi::Result<ffi::AnyBuffer>                       recv_x,
                               std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> recv_topk_weights) {
 
@@ -545,7 +545,7 @@ void Buffer::IntranodeCombine(hipStream_t stream, ffi::AnyBuffer x,
     // Launch barrier and reset queue head and tail
     PRIMUS_TURBO_CHECK(static_cast<int64_t>(num_channels * num_ranks_ * sizeof(int) * 2) <=
                        num_nvl_bytes_);
-    primus_turbo::deep_ep::intranode::cached_notify_combine(
+    primus_turbo::deep_ep::legacy::intranode::cached_notify_combine(
         buffer_ptrs_gpu_, send_head.typed_data(), num_channels, num_recv_tokens,
         num_channels * num_ranks_ * 2, barrier_signal_ptrs_gpu_, rank_, num_ranks_, stream);
 
@@ -572,7 +572,7 @@ void Buffer::IntranodeCombine(hipStream_t stream, ffi::AnyBuffer x,
                              num_channels * num_ranks_ * config.num_max_nvl_chunked_recv_tokens *
                                  num_topk * sizeof(float) // Top-k weight buffer
                              ) <= num_nvl_bytes_);
-    primus_turbo::deep_ep::intranode::combine(
+    primus_turbo::deep_ep::legacy::intranode::combine(
         primus_turbo::jax::FFIDataTypeToHIPDataType(x.element_type()), recv_x->untyped_data(),
         recv_topk_weights_ptr, x.untyped_data(), topk_weights_ptr, bias_ptrs[0], bias_ptrs[1],
         src_idx.typed_data(), rank_prefix_matrix.typed_data(), channel_prefix_matrix.typed_data(),
@@ -594,7 +594,7 @@ void Buffer::InternodeDispatch(
     std::optional<ffi::Buffer<ffi::S32>> cached_recv_rdma_rank_prefix_sum,
     std::optional<ffi::Buffer<ffi::S32>> cached_gbl_channel_prefix_matrix,
     std::optional<ffi::Buffer<ffi::S32>> cached_recv_gbl_rank_prefix_sum, int expert_alignment,
-    int num_worst_tokens, primus_turbo::deep_ep::Config config, ffi::Result<ffi::AnyBuffer> recv_x,
+    int num_worst_tokens, primus_turbo::deep_ep::legacy::Config config, ffi::Result<ffi::AnyBuffer> recv_x,
     std::optional<ffi::Result<ffi::Buffer<ffi::F32>>>  recv_x_scales,
     std::optional<ffi::Result<ffi::Buffer<ffi::S32>>>  recv_topk_idx,
     std::optional<ffi::Result<ffi::Buffer<ffi::F32>>>  recv_topk_weights,
@@ -703,7 +703,7 @@ void Buffer::InternodeDispatch(
         num_recv_tokens      = cached_num_recv_tokens;
         num_rdma_recv_tokens = cached_num_rdma_recv_tokens;
 
-        primus_turbo::deep_ep::internode::cached_notify(
+        primus_turbo::deep_ep::legacy::internode::cached_notify(
             hidden_int4, num_scales, num_topk, num_topk, num_ranks_, num_channels, 0, nullptr,
             nullptr, nullptr, nullptr, rdma_buffer_ptr_, config.num_max_rdma_chunked_recv_tokens,
             buffer_ptrs_gpu_, config.num_max_nvl_chunked_recv_tokens, barrier_signal_ptrs_gpu_,
@@ -725,7 +725,7 @@ void Buffer::InternodeDispatch(
         PRIMUS_TURBO_CHECK(send_rdma_head.has_value());
         PRIMUS_TURBO_CHECK(send_nvl_head.has_value());
 
-        primus_turbo::deep_ep::internode::notify_dispatch(
+        primus_turbo::deep_ep::legacy::internode::notify_dispatch(
             num_tokens_per_rank->typed_data(), moe_recv_counter_mapped_, num_ranks_,
             num_tokens_per_rdma_rank->typed_data(), moe_recv_rdma_counter_mapped_,
             num_tokens_per_expert->typed_data(), moe_recv_expert_counter_mapped_, num_experts,
@@ -779,7 +779,7 @@ void Buffer::InternodeDispatch(
         recv_x_scales_ptr = recv_x_scales.value()->typed_data();
     }
 
-    primus_turbo::deep_ep::internode::dispatch(
+    primus_turbo::deep_ep::legacy::internode::dispatch(
         recv_x->untyped_data(), recv_x_scales_ptr, recv_topk_idx_ptr, recv_topk_weights_ptr,
         cached_mode ? nullptr : static_cast<void *>(recv_src_meta.value()->typed_data()),
         x.untyped_data(), x_scales_ptr, topk_idx_ptr, topk_weights_ptr,
@@ -814,7 +814,7 @@ void Buffer::InternodeCombine(
     ffi::Buffer<ffi::S32>                gbl_channel_prefix_matrix,
     std::optional<ffi::Buffer<ffi::S32>> gbl_rank_prefix_sum,
     ffi::Buffer<ffi::S32> combined_rdma_head, ffi::Buffer<ffi::S32> combined_nvl_head,
-    primus_turbo::deep_ep::Config config, ffi::Result<ffi::AnyBuffer> combined_x,
+    primus_turbo::deep_ep::legacy::Config config, ffi::Result<ffi::AnyBuffer> combined_x,
     std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> combined_topk_weights) {
 
 #ifndef DISABLE_ROCSHMEM
@@ -836,7 +836,7 @@ void Buffer::InternodeCombine(
     PRIMUS_TURBO_CHECK((hidden * ffi::ByteWidth(x.element_type())) % sizeof(int4) == 0);
     PRIMUS_TURBO_CHECK(src_meta.dimensions()[0] == num_tokens);
     PRIMUS_TURBO_CHECK(src_meta.dimensions()[1] ==
-                       primus_turbo::deep_ep::internode::get_source_meta_bytes());
+                       primus_turbo::deep_ep::legacy::internode::get_source_meta_bytes());
     PRIMUS_TURBO_CHECK(is_combined_token_in_rank.dimensions()[1] == num_ranks_);
     PRIMUS_TURBO_CHECK(rdma_channel_prefix_matrix.dimensions()[0] == num_rdma_ranks_);
     PRIMUS_TURBO_CHECK(rdma_channel_prefix_matrix.dimensions()[1] == num_channels);
@@ -873,7 +873,7 @@ void Buffer::InternodeCombine(
     PRIMUS_TURBO_CHECK(config.num_max_nvl_chunked_send_tokens <=
                        config.num_max_nvl_chunked_recv_tokens / num_rdma_ranks_);
 
-    primus_turbo::deep_ep::internode::cached_notify(
+    primus_turbo::deep_ep::legacy::internode::cached_notify(
         hidden_int4, 0, 0, num_topk, num_ranks_, num_channels, num_combined_tokens,
         combined_rdma_head.typed_data(), rdma_channel_prefix_matrix.typed_data(),
         rdma_rank_prefix_sum.typed_data(), combined_nvl_head.typed_data(), rdma_buffer_ptr_,
@@ -885,7 +885,7 @@ void Buffer::InternodeCombine(
     const int *gbl_rank_prefix_sum_ptr =
         gbl_rank_prefix_sum.has_value() ? gbl_rank_prefix_sum->typed_data() : nullptr;
 
-    primus_turbo::deep_ep::internode::combine(
+    primus_turbo::deep_ep::legacy::internode::combine(
         primus_turbo::jax::FFIDataTypeToHIPDataType(x.element_type()), combined_x->untyped_data(),
         combined_topk_weights_ptr, is_combined_token_in_rank.typed_data(), x.untyped_data(),
         topk_weights_ptr, nullptr, nullptr, combined_rdma_head.typed_data(),

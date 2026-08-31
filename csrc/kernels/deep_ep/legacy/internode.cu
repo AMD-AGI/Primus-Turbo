@@ -13,14 +13,15 @@
 #ifndef DISABLE_ROCSHMEM
 #include <rocshmem/rocshmem.hpp>
 
-// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep
-namespace primus_turbo::deep_ep {
-
 // [agent modifed]: `extern nvshmem_team_t cpu_rdma_team;` at file scope -> the rocSHMEM team
-// declared in the namespace that defines it (deep_ep/runtime.cu).
-namespace nvshmem {
+// declared in the namespace that defines it (deep_ep/runtime.cu). Must stay outside `legacy`,
+// or it declares a second, never-defined `legacy::nvshmem::cpu_rdma_team`.
+namespace primus_turbo::deep_ep::nvshmem {
 extern rocshmem::rocshmem_team_t cpu_rdma_team;
 }
+
+// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep::legacy
+namespace primus_turbo::deep_ep::legacy {
 
 namespace internode {
 
@@ -2268,7 +2269,7 @@ void combine(cudaDataType_t type,
 
 }  // namespace internode
 
-// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep, closed by the rocSHMEM gate
-}  // namespace primus_turbo::deep_ep
+// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep::legacy, closed by the rocSHMEM gate
+}  // namespace primus_turbo::deep_ep::legacy
 
 #endif  // DISABLE_ROCSHMEM

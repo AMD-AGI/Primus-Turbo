@@ -21,7 +21,7 @@
 
 namespace primus_turbo {
 
-using ::primus_turbo::deep_ep::st_na_global;
+using ::primus_turbo::deep_ep::legacy::st_na_global;
 using ::primus_turbo::dtype::bfloat16;
 using ::primus_turbo::dtype::float16;
 

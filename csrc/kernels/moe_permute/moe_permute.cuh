@@ -10,10 +10,12 @@
 #include "../deep_ep/legacy/compiled.cuh"
 #include "../deep_ep/legacy/utils.cuh"
 
-// [agent modifed]: the deep_ep primitives moved into primus_turbo::deep_ep; re-expose them so
-// the moe_permute kernels keep referring to kWarpSize / UNROLLED_WARP_COPY unqualified.
+// [agent modifed]: the deep_ep primitives moved into primus_turbo::deep_ep (arch bits) and
+// primus_turbo::deep_ep::legacy (utils.cuh); re-expose both so the moe_permute kernels keep
+// referring to kWarpSize / UNROLLED_WARP_COPY unqualified.
 namespace primus_turbo {
 using namespace deep_ep;
+using namespace deep_ep::legacy;
 }  // namespace primus_turbo
 
 static inline constexpr size_t kVsmemCacheLineSize = 128;

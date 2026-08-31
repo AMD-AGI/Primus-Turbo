@@ -6,8 +6,8 @@
 // [agent modifed]: the copy keeps upstream's legacy/ layout one level deeper
 #include "../../../kernels/deep_ep/legacy/api.cuh"
 
-// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep
-namespace primus_turbo::deep_ep {
+// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep::legacy
+namespace primus_turbo::deep_ep::legacy {
 
 template <typename dtype_t>
 dtype_t ceil_div(dtype_t a, dtype_t b) {
@@ -192,4 +192,4 @@ inline size_t get_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_ran
     return ((num_bytes + LEGACY_NUM_BUFFER_ALIGNMENT_BYTES) / LEGACY_NUM_BUFFER_ALIGNMENT_BYTES) * LEGACY_NUM_BUFFER_ALIGNMENT_BYTES;
 }
 
-}  // namespace primus_turbo::deep_ep
+}  // namespace primus_turbo::deep_ep::legacy

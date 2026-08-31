@@ -43,7 +43,7 @@ ffi::Error MoEDispatchFFI(hipStream_t stream, ffi::AnyBuffer x, ffi::Buffer<ffi:
                           ffi::Result<ffi::Buffer<ffi::S32>> recv_channel_prefix_matrix,
                           ffi::Result<ffi::Buffer<ffi::S32>> recv_src_idx,
                           ffi::Result<ffi::Buffer<ffi::S32>> send_head) {
-    auto cfg = primus_turbo::deep_ep::Config(
+    auto cfg = primus_turbo::deep_ep::legacy::Config(
         num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens,
         num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens);
 
@@ -90,7 +90,7 @@ ffi::Error MoECachedDispatchFFI(
     ffi::Result<ffi::AnyBuffer> recv_x, ffi::Result<ffi::Buffer<ffi::F32>> recv_x_scales,
     ffi::Result<ffi::Buffer<ffi::S32>> recv_channel_prefix_matrix,
     ffi::Result<ffi::Buffer<ffi::S32>> recv_src_idx, ffi::Result<ffi::Buffer<ffi::S32>> send_head) {
-    auto cfg = primus_turbo::deep_ep::Config(
+    auto cfg = primus_turbo::deep_ep::legacy::Config(
         num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens,
         num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens);
 
@@ -145,7 +145,7 @@ MoECombineFFI(hipStream_t stream, ffi::AnyBuffer x, ffi::Buffer<ffi::F32> topk_w
                           "visible devices");
     }
 
-    auto cfg = primus_turbo::deep_ep::Config(
+    auto cfg = primus_turbo::deep_ep::legacy::Config(
         num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens,
         num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens);
 
@@ -197,7 +197,7 @@ ffi::Error MoEDispatchPerProcessFFI(
                           "moe_dispatch_per_process ep_size mismatch with buffer num_ranks");
     }
 
-    auto cfg = primus_turbo::deep_ep::Config(
+    auto cfg = primus_turbo::deep_ep::legacy::Config(
         num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens,
         num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens);
 
@@ -240,7 +240,7 @@ ffi::Error MoECachedDispatchPerProcessFFI(
                           "moe_cached_dispatch_per_process ep_size mismatch with buffer num_ranks");
     }
 
-    auto cfg = primus_turbo::deep_ep::Config(
+    auto cfg = primus_turbo::deep_ep::legacy::Config(
         num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens,
         num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens);
 
@@ -277,7 +277,7 @@ ffi::Error MoECombinePerProcessFFI(
                           "moe_combine_per_process ep_size mismatch with buffer num_ranks");
     }
 
-    auto cfg = primus_turbo::deep_ep::Config(
+    auto cfg = primus_turbo::deep_ep::legacy::Config(
         num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens,
         num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens);
 
@@ -502,7 +502,7 @@ ffi::Error MoEInternodeDispatchPerProcessFFI(
                           "internode dispatch requires an initialized RDMA buffer");
     }
 
-    auto cfg = primus_turbo::deep_ep::Config(
+    auto cfg = primus_turbo::deep_ep::legacy::Config(
         num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens,
         num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens);
 
@@ -557,7 +557,7 @@ ffi::Error MoEInternodeCachedDispatchPerProcessFFI(
                           "internode cached dispatch requires an initialized RDMA buffer");
     }
 
-    auto cfg = primus_turbo::deep_ep::Config(
+    auto cfg = primus_turbo::deep_ep::legacy::Config(
         num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens,
         num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens);
 
@@ -603,7 +603,7 @@ ffi::Error MoEInternodeCombinePerProcessFFI(
                           "internode combine requires an initialized RDMA buffer");
     }
 
-    auto cfg = primus_turbo::deep_ep::Config(
+    auto cfg = primus_turbo::deep_ep::legacy::Config(
         num_sms, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens,
         num_max_rdma_chunked_send_tokens, num_max_rdma_chunked_recv_tokens);
 

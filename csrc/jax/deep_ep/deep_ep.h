@@ -75,7 +75,7 @@ public:
                            std::optional<ffi::Buffer<ffi::S32>> cached_rank_prefix_matrix,
                            std::optional<ffi::Buffer<ffi::S32>> cached_channel_prefix_matrix,
                            int expert_alignment, int num_worst_tokens,
-                           primus_turbo::deep_ep::Config config, ffi::Result<ffi::AnyBuffer> recv_x,
+                           primus_turbo::deep_ep::legacy::Config config, ffi::Result<ffi::AnyBuffer> recv_x,
                            std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> recv_x_scales,
                            std::optional<ffi::Result<ffi::Buffer<ffi::S32>>> recv_topk_idx,
                            std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> recv_topk_weights,
@@ -93,7 +93,7 @@ public:
                           std::optional<ffi::AnyBuffer> bias_1, ffi::Buffer<ffi::S32> src_idx,
                           ffi::Buffer<ffi::S32> rank_prefix_matrix,
                           ffi::Buffer<ffi::S32> channel_prefix_matrix,
-                          ffi::Buffer<ffi::S32> send_head, primus_turbo::deep_ep::Config config,
+                          ffi::Buffer<ffi::S32> send_head, primus_turbo::deep_ep::legacy::Config config,
                           ffi::Result<ffi::AnyBuffer>                       recv_x,
                           std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> recv_topk_weights);
 
@@ -110,7 +110,7 @@ public:
         std::optional<ffi::Buffer<ffi::S32>> cached_recv_rdma_rank_prefix_sum,
         std::optional<ffi::Buffer<ffi::S32>> cached_gbl_channel_prefix_matrix,
         std::optional<ffi::Buffer<ffi::S32>> cached_recv_gbl_rank_prefix_sum, int expert_alignment,
-        int num_worst_tokens, primus_turbo::deep_ep::Config config,
+        int num_worst_tokens, primus_turbo::deep_ep::legacy::Config config,
         ffi::Result<ffi::AnyBuffer>                        recv_x,
         std::optional<ffi::Result<ffi::Buffer<ffi::F32>>>  recv_x_scales,
         std::optional<ffi::Result<ffi::Buffer<ffi::S32>>>  recv_topk_idx,
@@ -135,7 +135,7 @@ public:
         ffi::Buffer<ffi::S32> rdma_rank_prefix_sum, ffi::Buffer<ffi::S32> gbl_channel_prefix_matrix,
         std::optional<ffi::Buffer<ffi::S32>> gbl_rank_prefix_sum,
         ffi::Buffer<ffi::S32> combined_rdma_head, ffi::Buffer<ffi::S32> combined_nvl_head,
-        primus_turbo::deep_ep::Config config, ffi::Result<ffi::AnyBuffer> combined_x,
+        primus_turbo::deep_ep::legacy::Config config, ffi::Result<ffi::AnyBuffer> combined_x,
         std::optional<ffi::Result<ffi::Buffer<ffi::F32>>> combined_topk_weights);
 
 private:
@@ -187,7 +187,7 @@ private:
 
 // Inproc mode: per-device buffer pool with in-process barrier sync.
 Buffer *get_buffer(int rank, int num_ranks, int64_t hidden_bytes,
-                   const primus_turbo::deep_ep::Config &config);
+                   const primus_turbo::deep_ep::legacy::Config &config);
 
 // Per-process mode: single buffer per process, IPC-synced from Python.
 Buffer             *get_per_process_buffer();

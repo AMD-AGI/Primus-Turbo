@@ -23,7 +23,9 @@ void register_deep_ep_apis(pybind11::module_& m) {
     m.attr("topk_idx_t") = pybind11::cast(c10::CppTypeToScalarType<topk_idx_t>::value);
 
     // Register legacy buffer APIs
-    register_apis(m);
+    // [agent modifed]: register_apis -> legacy::register_apis   the legacy copy lives in
+    // primus_turbo::deep_ep::legacy, this registration function stays in deep_ep.
+    legacy::register_apis(m);
 }
 
 }  // namespace primus_turbo::deep_ep

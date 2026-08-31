@@ -4,8 +4,8 @@
 #include "compiled.cuh"
 #include "launch.cuh"
 
-// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep
-namespace primus_turbo::deep_ep {
+// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep::legacy
+namespace primus_turbo::deep_ep::legacy {
 
 namespace layout {
 
@@ -153,4 +153,4 @@ void get_dispatch_layout(const topk_idx_t* topk_idx,
 
 }  // namespace layout
 
-}  // namespace primus_turbo::deep_ep
+}  // namespace primus_turbo::deep_ep::legacy

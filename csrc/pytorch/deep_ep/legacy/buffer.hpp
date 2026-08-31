@@ -21,8 +21,8 @@
 #include "../../../kernels/deep_ep/backend/api.cuh"
 #include "config.hpp"
 
-// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep
-namespace primus_turbo::deep_ep {
+// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep::legacy
+namespace primus_turbo::deep_ep::legacy {
 
 struct Buffer {
     EP_STATIC_ASSERT(LEGACY_NUM_MAX_NVL_PEERS == 8, "The number of maximum NVLink peers must be 8");
@@ -1807,4 +1807,4 @@ static void register_apis(pybind11::module_& m) {
         ;  // [agent modifed]: the trailing `;` moves past the gate
 }
 
-}  // namespace primus_turbo::deep_ep
+}  // namespace primus_turbo::deep_ep::legacy

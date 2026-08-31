@@ -7,8 +7,8 @@
 // readable and the path comes back by flipping one macro (arch.cuh).
 #if PRIMUS_TURBO_DEEPEP_HAS_IBGDA
 
-// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep
-namespace primus_turbo::deep_ep {
+// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep::legacy
+namespace primus_turbo::deep_ep::legacy {
 
 namespace internode_ll {
 
@@ -1292,6 +1292,6 @@ void clean_mask_buffer(int* mask_buffer_ptr, int num_ranks, cudaStream_t stream)
 
 }  // namespace internode_ll
 
-}  // namespace primus_turbo::deep_ep
+}  // namespace primus_turbo::deep_ep::legacy
 
 #endif  // PRIMUS_TURBO_DEEPEP_HAS_IBGDA

@@ -22,8 +22,8 @@
 
 #include "utils.cuh"
 
-// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep
-namespace primus_turbo::deep_ep {
+// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep::legacy
+namespace primus_turbo::deep_ep::legacy {
 
 EP_STATIC_ASSERT(NVSHMEMI_IBGDA_MIN_QP_DEPTH >= 64, "Invalid QP minimum depth");
 
@@ -501,6 +501,6 @@ __device__ static __forceinline__ void nvshmemi_ibgda_quiet(int dst_pe, int qp_i
     ibgda_poll_cq(qp->tx_wq.cq, prod_idx);
 }
 
-}  // namespace primus_turbo::deep_ep
+}  // namespace primus_turbo::deep_ep::legacy
 
 #endif  // PRIMUS_TURBO_DEEPEP_HAS_IBGDA

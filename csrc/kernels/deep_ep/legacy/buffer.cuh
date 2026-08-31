@@ -5,8 +5,8 @@
 
 #include "compiled.cuh"
 
-// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep
-namespace primus_turbo::deep_ep {
+// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep::legacy
+namespace primus_turbo::deep_ep::legacy {
 
 template <typename dtype_t>
 struct Buffer {
@@ -131,4 +131,4 @@ public:
     }
 };
 
-}  // namespace primus_turbo::deep_ep
+}  // namespace primus_turbo::deep_ep::legacy
