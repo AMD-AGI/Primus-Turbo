@@ -8,7 +8,7 @@
 #include "ffi.h"
 #include "jax/deep_ep/deep_ep.h"
 #include "primus_turbo/arch.h"
-#include "pytorch/deep_ep/legacy/config.hpp"
+#include <primus_turbo/deep_ep/legacy/config.hpp>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 

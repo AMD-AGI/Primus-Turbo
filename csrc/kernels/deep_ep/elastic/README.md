@@ -11,3 +11,12 @@ Upstream source: `deepseek-ai/DeepEP` `csrc/kernels/elastic/`
 Not copied yet: elastic is header-only templates driven by a JIT compiler and
 the NCCL Device API, so bringing it over pulls in `csrc/jit/` and
 `csrc/kernels/backend/` as well. That is a separate step from the V1 port.
+
+When it lands, expose only its public surface (`api.hpp`) through the shared
+include root, the way `../legacy/` does:
+
+    csrc/include/primus_turbo/deep_ep/elastic/api.hpp
+        -> ../../../../kernels/deep_ep/elastic/api.hpp
+
+Backends then use `<primus_turbo/deep_ep/elastic/api.hpp>`. The impl headers
+(`dispatch.hpp`, `combine.hpp`, ...) stay private to this directory.

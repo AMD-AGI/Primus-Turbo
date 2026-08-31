@@ -13,11 +13,13 @@
 #include <primus_turbo/deep_ep/common/compiled.cuh>
 #include <primus_turbo/deep_ep/common/exception.cuh>
 
-// ROCm: upstream's csrc/utils/ and csrc/kernels/ roots map onto the copy's layout
+// ROCm: upstream's csrc/kernels/ root -> the shared include root
+#include <primus_turbo/deep_ep/backend/api.cuh>
+#include <primus_turbo/deep_ep/legacy/api.cuh>
+
+// ROCm: upstream's csrc/utils/ root remapped onto the copy's layout
 #include "../event.hpp"
 #include "../shared_memory.hpp"
-#include "../../../kernels/deep_ep/legacy/api.cuh"
-#include "../../../kernels/deep_ep/backend/api.cuh"
 #include "config.hpp"
 
 // ROCm: deep_ep::legacy -> primus_turbo::deep_ep::legacy

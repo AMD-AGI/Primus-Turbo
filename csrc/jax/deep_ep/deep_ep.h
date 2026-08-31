@@ -10,8 +10,8 @@
 #pragma once
 
 #include "jax/ffi.h"
-#include "pytorch/deep_ep/legacy/config.hpp"
-#include "kernels/deep_ep/legacy/compiled.cuh"
+#include <primus_turbo/deep_ep/legacy/compiled.cuh>
+#include <primus_turbo/deep_ep/legacy/config.hpp>
 #include <hip/hip_runtime.h>
 #include <optional>
 #include <pybind11/pybind11.h>

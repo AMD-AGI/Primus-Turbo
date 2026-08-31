@@ -3,8 +3,8 @@
 // ROCm: include root deep_ep/ -> primus_turbo/deep_ep/
 #include <primus_turbo/deep_ep/common/exception.cuh>
 
-// ROCm: the copy keeps upstream's legacy/ layout one level deeper
-#include "../../../kernels/deep_ep/legacy/api.cuh"
+// ROCm: upstream's csrc/kernels/ root -> the shared include root
+#include <primus_turbo/deep_ep/legacy/api.cuh>
 
 // ROCm: deep_ep::legacy -> primus_turbo::deep_ep::legacy
 namespace primus_turbo::deep_ep::legacy {
