@@ -42,26 +42,26 @@ import torch
 # (@flyc.kernel needs them as globals, not closure cells). NT only (compute-only
 # PR), so the NN/TN transpose loaders (S2RLoaderTr / swizzle_nn) are not imported.
 from primus_turbo.flydsl.utils.gemm_helper import (
+    block_mn,
+    build_preshuffle_ab_kernel,
+    compile_with_scratch_out,
+    compute_global_swizzle,
     G2SLoader,
+    make_fp8_buffer_tensor_rebased,
+    make_value_attrs,
     MfmaScale16x16x128,
+    _PRESHUF_KT,
+    resolve_accum_out,
+    _robust_time,
     S2RLoader,
     ScaleBComb,
     ScaleS2R,
-    _PRESHUF_KT,
-    _robust_time,
     _store_quadrants,
-    block_mn,
-    build_preshuffle_ab_kernel,
-    ceildiv,
-    compile_with_scratch_out,
-    compute_global_swizzle,
     StoreCPerTensor,
-    make_fp8_buffer_tensor_rebased,
-    make_value_attrs,
-    resolve_accum_out,
     wait_barrier,
     xcd_remap_pid,
 )
+from primus_turbo.flydsl.utils.prims import ceildiv
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx

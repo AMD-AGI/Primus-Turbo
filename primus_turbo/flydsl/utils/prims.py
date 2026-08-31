@@ -11,13 +11,15 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
+import math as host_math
 from typing import Optional, Tuple, Union
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as std_arith
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import range_constexpr
+from flydsl.expr import arith, range_constexpr, rocdl
+from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.buffer_ops import (
     _create_i32_constant,
     _create_i64_constant,
@@ -28,10 +30,14 @@ from flydsl.expr.buffer_ops import (
     create_llvm_ptr,
     get_element_ptr,
 )
+from flydsl.expr.typing import T
+from flydsl.expr.utils.arith import ArithValue
 
 _WARP = 64
 _COPY_VEC_I32 = 4  # 4 i32 = 16 B (b128) per lane per step
 _I32_BYTES = 4  # word stride: i32-word offset -> byte address
+
+LOG2E = host_math.log2(host_math.e)  # folds a natural exp into exp2
 
 # Watchdog budget for cross-rank / grid spin loops (realtime clock cycles).
 SPIN_TIMEOUT_CYCLES = 3_000_000_000
@@ -257,3 +263,203 @@ def copy_warp(
     ]
     for o, v in zip(offs, vals):
         buffer_store(v, dst, dst_off + o, cache_modifier=store_cache_modifier)
+
+
+# ── Scalar and index arithmetic ──────────────────────────────────────────────
+
+
+def ceildiv(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def ceildiv_pow2(a, b: int):
+    """``ceildiv(a, b)`` for a power-of-two ``b`` and a non-negative device value ``a``.
+    Signed ``a // b`` lowers to arith.floordivsi (divide + remainder + sign fixup); the shift
+    is one. Use on runtime hot-path values; plain ``ceildiv`` stays for host-side ints."""
+    assert b > 0 and (b & (b - 1)) == 0
+    return (a + (b - 1)) >> (b.bit_length() - 1)
+
+
+def floordiv_pow2(a, b: int):
+    """``a // b`` for a power-of-two ``b``, shifting past what ``floordivsi`` would lower to."""
+    assert b > 0 and (b & (b - 1)) == 0
+    return a >> (b.bit_length() - 1)
+
+
+def _u32(v):
+    return _raw(fx.Int32(v) if isinstance(v, int) else v)
+
+
+def udiv(a, b):
+    """``a // b`` for device values proven non-negative (tile ids, group tile counts).
+    Python ``//`` on a device Int32 is arith.floordivsi (magic multiply plus a remainder and
+    sign fixup); the unsigned form is far cheaper on the exposed grouped tile-decode chain."""
+    return ArithValue(arith.divui(_u32(a), _u32(b)))
+
+
+def umod(a, b):
+    """``a % b`` for device values proven non-negative; see ``udiv``."""
+    return ArithValue(arith.remui(_u32(a), _u32(b)))
+
+
+def uindex(v):
+    """``arith.index_cast(T.index, v)`` for a device value proven non-negative (row/tile/group
+    offsets). The signed cast sign-extends into every derived SRD base/extent; the unsigned cast
+    zero-extends so the high half folds to zero."""
+    return ArithValue(arith.index_castui(T.index, _raw(v)))
+
+
+def _as_index(v):
+    # An extent may be a runtime value or a compile-time int; coerce both to an MLIR index.
+    return arith.index(v) if isinstance(v, int) else arith.index_cast(T.index, v)
+
+
+def _i64(v):
+    # widen an i32 runtime value to i64 (avoids overflow in worst-case base offsets)
+    return ArithValue(arith.extsi(T.i64, _unwrap_value(v)), signed=True)
+
+
+# ── Wave and lane primitives ─────────────────────────────────────────────────
+
+# gfx9 DPP controls: ROW_SHR|n shifts right by n within a 16-lane row; ROW_BCAST15/31 feed a
+# row's last lane into following rows; QUAD_SWAP exchanges within a group of four.
+_DPP_ROW_SHR = 0x110
+_DPP_ROW_BCAST15 = 0x142
+_DPP_ROW_BCAST31 = 0x143
+_DPP_QUAD_SWAP1 = 0xB1  # quad_perm:[1,0,3,2] -- exchange with the neighbouring lane
+_DPP_QUAD_SWAP2 = 0x4E  # quad_perm:[2,3,0,1] -- exchange with the lane two over
+
+
+def _res_of(op):
+    """Unwrap an op builder's single result (some rocdl builders already return one)."""
+    return op.result if hasattr(op, "result") else op
+
+
+def _readfirstlane_i32(v):
+    """Force a wave-uniform-in-value i32 into an SGPR via s_readfirstlane.
+
+    A value the compiler's divergence analysis cannot prove uniform lands in VGPRs, and a
+    buffer descriptor built from one puts every store behind a readfirstlane/saveexec
+    waterfall. Pinning the value collapses the SRD to scalar regs and drops the waterfall."""
+    return ArithValue(_res_of(rocdl.readfirstlane(res=_raw(v).type, src=_raw(v))))
+
+
+def _dpp_add_i32(acc, ctrl, row_mask=0xF):
+    """acc + DPP(acc, ctrl); masked-off and shifted-in lanes contribute 0."""
+    raw = _raw(acc)
+    r = rocdl.update_dpp(raw.type, _raw(fx.Int32(0)), raw, ctrl, row_mask, 0xF, True)
+    return acc + ArithValue(_res_of(r))
+
+
+def _dpp_add_f32(acc, ctrl, row_mask=0xF):
+    """acc + DPP(acc, ctrl) for f32; masked-off and shifted-in lanes contribute 0."""
+    raw = _raw(acc)
+    r = rocdl.update_dpp(raw.type, _raw(fx.Float32(0.0)), raw, ctrl, row_mask, 0xF, True)
+    return acc + fx.Float32(_res_of(r))
+
+
+def _row16_sum_f32(v):
+    """Sum an f32 across each 16-lane DPP row; lane 15 of the row ends with the total.
+
+    Four ROW_SHR adds, i.e. an inclusive scan whose last lane holds the row sum.
+    All full-rate VALU. The obvious alternative -- a ``gpu.shuffle`` XOR butterfly
+    -- lowers to ``ds_bpermute_b32``, one LDS crossbar op per step, and at the
+    rate a GEMM epilogue calls this that measured +0.59 ms.
+    """
+    for _sh in (1, 2, 4, 8):
+        v = _dpp_add_f32(v, _DPP_ROW_SHR + _sh)
+    return v
+
+
+def _wave_prefix_add_i32(v):
+    """Wave64 inclusive add-scan of a per-lane i32 (lane l ends with the sum of 0..l). Six DPP
+    steps replace the serial carry (bound_ctrl zeroes shifted-in lanes). Requires a full EXEC
+    mask (kernel entry)."""
+    for _sh in (1, 2, 4, 8):
+        v = _dpp_add_i32(v, _DPP_ROW_SHR + _sh)
+    v = _dpp_add_i32(v, _DPP_ROW_BCAST15, row_mask=0xA)
+    return _dpp_add_i32(v, _DPP_ROW_BCAST31, row_mask=0xC)
+
+
+def _readlane_i32(v, lane):
+    """Broadcast one lane of a per-lane i32 into an SGPR; lane must be wave-uniform."""
+    raw = _raw(v)
+    return ArithValue(_res_of(rocdl.readlane(res=raw.type, src=raw, lane=lane)))
+
+
+def _wave_count_le_i32(v, bound):
+    """Number of lanes whose per-lane i32 is <= the wave-uniform bound. One ballot plus one
+    s_bcnt1; on a monotone table this is the first lane above bound, an O(1) stand-in for a
+    G-wide boundary compare chain."""
+    m = _res_of(rocdl.ballot(res=ir.IntegerType.get_signless(64), pred=_raw(v <= bound)))
+    n = _res_of(llvm.intr_ctpop(m))
+    return ArithValue(arith.trunci(T.i32, n))
+
+
+def _lane_load_i32(rsrc, idx):
+    """One per-lane i32 gather from a buffer resource; out-of-range lanes read 0."""
+    return ArithValue(buffer_load(rsrc, idx, vec_width=1, dtype=T.i32))
+
+
+def _sload_i32(rsrc, idx):
+    """One wave-uniform i32 read on the scalar path (``s_buffer_load`` into an SGPR). The value
+    never enters the VGPR file, so a consumer waits on lgkmcnt and the read hits the scalar
+    cache, not the g2s-evicted vL1D. (Raw intrinsic: buffer_load(is_scalar=) is not universal.)"""
+    i32_t = ir.IntegerType.get_signless(32)
+    rsrc_v4 = llvm.bitcast(
+        ir.VectorType.get([4], i32_t), llvm.ptrtoint(ir.IntegerType.get_signless(128), _raw(rsrc))
+    )
+    args = [rsrc_v4, _raw(fx.Int32(idx * 4)), _raw(fx.Int32(0))]  # rsrc, byte offset, cache policy
+    return ArithValue(llvm.call_intrinsic(i32_t, "llvm.amdgcn.s.buffer.load.i32", args, [], []))
+
+
+# ── Synchronisation and LDS addressing ───────────────────────────────────────
+
+
+def wait_lgkmcnt(n=0, memory=False):
+    """Drain LDS/scalar traffic to at most ``n`` outstanding ops.
+
+    ``memory`` clobbers memory as well, which is needed wherever the drain has to order
+    against ops the asm blob does not name -- g2s copies are intrinsics, so a blob with no
+    memory effect may be scheduled ahead of them. Leave it off when a wave only reads back
+    what it alone wrote, so the drain is the whole of the ordering required.
+    """
+    llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string=f"s_waitcnt lgkmcnt({n})",
+        constraints="~{memory}" if memory else "",
+        has_side_effects=True,
+    )
+
+
+def _lds_barrier(vmcnt=None):
+    # Drain outstanding LDS writes (lgkmcnt) BEFORE the workgroup barrier, else
+    # readers may observe stale LDS (a bare s_barrier doesn't wait on ds_write).
+    # ``vmcnt`` also drains direct global-to-LDS copies, which lgkmcnt does not track:
+    # repurposing an operand pool rather than refilling it has to wait on the
+    # mainloop's last prefetch too. That form clobbers memory as well -- the g2s
+    # copies are intrinsics, and an asm blob with no memory effect could schedule
+    # ahead of them and count loads that have not been issued.
+    wait = "lgkmcnt(0)" if vmcnt is None else f"vmcnt({vmcnt}) lgkmcnt(0)"
+    llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string=f"s_waitcnt {wait}\ns_barrier",
+        constraints="" if vmcnt is None else "~{memory}",
+        has_side_effects=True,
+    )
+
+
+def _inttoptr_lds(byte_addr):
+    """Integer byte address -> !llvm.ptr<3> (LDS). Parsed per call: the type is
+    bound to the current MLIRContext and cannot be cached across compiles."""
+    return llvm.inttoptr(ir.Type.parse("!llvm.ptr<3>"), _raw(fx.Int64(byte_addr)))
+
+
+def _lds_ptr_from_i32(addr_i32, byte_offset=0):
+    """Build an LDS pointer (ptr<3>) from an i32 byte address + optional static offset."""
+    ptr = _inttoptr_lds(ArithValue(addr_i32).extui(T.i64))
+    if byte_offset != 0:
+        ptr = get_element_ptr(ptr, static_byte_offset=byte_offset)
+    return ptr

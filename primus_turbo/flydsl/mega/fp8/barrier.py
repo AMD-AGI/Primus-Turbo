@@ -20,7 +20,7 @@ from primus_turbo.flydsl.mega.fp8.prims import (
     memory_fence,
 )
 from primus_turbo.flydsl.mega.fp8.symm_buffer import SymLayout, sym_map
-from primus_turbo.flydsl.mega.prims import read_clock, spin_timed_out
+from primus_turbo.flydsl.utils.prims import read_clock, spin_timed_out
 
 # grid_sync counter layout: the low bits accumulate per-block arrivals and
 # bit 25 is the phase flag the last block flips. Requires num_blocks < 2^25.

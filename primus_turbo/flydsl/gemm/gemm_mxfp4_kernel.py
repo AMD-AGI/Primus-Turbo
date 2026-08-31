@@ -19,19 +19,16 @@ import torch
 
 # isort: off
 from primus_turbo.flydsl.utils.gemm_helper import (
-    G2SLoader,
-    ceildiv,
-    ceildiv_pow2,
     compile_with_scratch_out,
+    G2SLoader,
     make_fp8_rebased_tensor_and_srd,
     make_row_band_resource,
     resolve_accum_out,
-    udiv,
     umax,
     umin,
-    umod,
     xcd_remap_pid_u,
 )
+from primus_turbo.flydsl.utils.prims import ceildiv, ceildiv_pow2, udiv, umod
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir

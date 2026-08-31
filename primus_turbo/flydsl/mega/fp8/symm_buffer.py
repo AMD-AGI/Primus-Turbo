@@ -34,7 +34,7 @@ from flydsl.expr import Int32, Int64, struct
 from flydsl.expr.buffer_ops import buffer_load
 from flydsl.expr.typing import Constexpr
 
-from primus_turbo.flydsl.mega.prims import addr_buffer_resource
+from primus_turbo.flydsl.utils.prims import addr_buffer_resource
 
 # NOTE: SymmetricMemory is imported lazily inside SymmBuffer.__init__ to avoid a
 # circular import (importing the pytorch package pulls in fused_mega_moe, which
