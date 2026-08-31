@@ -13,7 +13,7 @@
 
 """flash_attn backward kernel builders for FlyDSL (gfx950 / MI355X): odo, dkdv, dq.
 
-Bitwise deterministic except the a16 dQ path (see _DQ_A16), which accumulates dQ atomically.
+Bitwise deterministic except the a16 dQ path (see _dq_a16_for), which accumulates dQ atomically.
 """
 
 import math as host_math
@@ -54,7 +54,6 @@ _WSQ_BAND_PAD = 1 << 20
 _WSQ_BAND_ILV = 8
 # DPP quad_perm:[1,0,3,2], swaps a value between the two halves of every lane pair.
 _QUAD_SWAP = 0xB1
-_SCHED_VALU_MASK = 0x002
 # gfx950: 8 XCDs each with a private L2 slice, picked by block_id % _NUM_XCD.
 _NUM_XCD = 8
 # gfx950 compute units. Only used to ask whether a dispatch is narrower than the machine.
@@ -271,9 +270,6 @@ def build_flash_attn_bwd_odo_module(
     fill_img=False,
     bat_lo=0,
     bat_all=None,
-    # The dQ image is batch-outer while O is SBHD, so a sub-range addresses it as slabs.
-    img_slab=False,
-    img_sbhd=False,  # the image IS dQ, in O's own layout, so a sub-range needs no slab remap
 ):
     """Identity-delta ("odo") kernel: DELTA[b,hq,s] = -sum_d O[b,s,hq,d]*dO[b,s,hq,d].
 
@@ -325,11 +321,7 @@ def build_flash_attn_bwd_odo_module(
     STPB = _BWD_BLOCK_Q // SPW  # s-tiles per q block
     FILL_IMG = bool(fill_img)
     BAT_LO = int(bat_lo)
-    IMG_SLAB = bool(img_slab)
     assert bat_all is None or (sbhd and not token_major), "odo batch sub-range is SBHD-only"
-    assert not (FILL_IMG and bat_all is not None and not IMG_SLAB and not img_sbhd), (
-        "sub-range fill needs img_slab"
-    )
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
     def flash_attn_bwd_odo_kernel(
@@ -410,12 +402,7 @@ def build_flash_attn_bwd_odo_module(
             img_rsrc = buffer_ops.create_buffer_resource(
                 IMG, max_size=False, num_records_bytes=_raw(total * fx.Index(HEAD_DIM * 2))
             )
-            if const_expr(IMG_SLAB):
-                _loc = (st * fx.Index(WG_PER_STILE) + ht) * fx.Index(BLOCK * VEC) + tid * fx.Index(VEC)
-                _slab = sl * fx.Index(NUM_HEADS_Q * HEAD_DIM)
-                img_off, img_mask = b * _slab + _loc, ArithValue(_loc < _slab)
-            else:
-                img_off, img_mask = off, in_range
+            img_off, img_mask = off, in_range
             buffer_ops.buffer_store(
                 Vec.filled(VEC, 0.0, fx.Float32).to(elem_dtype_l).ir_value(),
                 img_rsrc,
@@ -1163,18 +1150,10 @@ def build_flash_attn_bwd_slotred_module(
 
 
 _A16_BLOCK = 256
-# (batch, q tile, head) units one wave un-permutes; the pass is memory-level-parallelism bound.
-_A16_UC_D128 = 1
-_A16_UC_D64 = 4
 _DQA16_CACHE: dict = {}
 
 
-def _a16_uc(D):
-    """Un-permute units per wave; see _A16_UC_D64."""
-    return _A16_UC_D128 if D == 128 else _A16_UC_D64
-
-
-def build_flash_attn_bwd_dqa16_module(B, Sq, Hq, D, sm_scale, sbhd=True, bat_lo=0, n_bat=None):
+def build_flash_attn_bwd_dqa16_module(B, Sq, Hq, D, sm_scale):
     """Un-permute the a16 dQ image (see ``_g3_a16``) into dQ, scaled: a pure bit permutation of the
     flat index, no LDS and no cross-lane step. The lane map looks scrambled on the READ side on
     purpose -- it is picked so a lane's dwords are consecutive and each store fills a write granule."""
@@ -1184,12 +1163,8 @@ def build_flash_attn_bwd_dqa16_module(B, Sq, Hq, D, sm_scale, sbhd=True, bat_lo=
     NPAIR = D // 32
     assert D % 32 == 0 and Sq % 16 == 0
     WPG = _A16_BLOCK // 64
-    UC = _a16_uc(D)
-    BAT_LO = int(bat_lo)
-    NBAT = B if n_bat is None else int(n_bat)
-    assert 0 <= BAT_LO and BAT_LO + NBAT <= B
-    NWAVE = NBAT * (Sq // 16) * Hq // UC
-    assert Hq % UC == 0 and NWAVE % WPG == 0, "uc must tile the head axis and the work-group"
+    NWAVE = B * (Sq // 16) * Hq
+    assert NWAVE % WPG == 0, "the wave count must tile the work-group"
     NTILE = Sq // 16
     IMG_B = Sq * Hq * D  # elements one batch owns
 
@@ -1201,13 +1176,11 @@ def build_flash_attn_bwd_dqa16_module(B, Sq, Hq, D, sm_scale, sbhd=True, bat_lo=
         lane16 = lane & fx.Index(15)
         w1 = (lane >> fx.Index(5)) & fx.Index(1)
         kgh = (lane >> fx.Index(4)) & fx.Index(1)
-        _u = wid * fx.Index(UC)
+        _u = wid
         qh = _u % fx.Index(Hq)
         _r = _u // fx.Index(Hq)
         qt = _r % fx.Index(NTILE)
         bb = _r // fx.Index(NTILE)
-        if const_expr(BAT_LO):
-            bb = bb + fx.Index(BAT_LO)
 
         img_rsrc = buffer_ops.create_buffer_resource(IMG, max_size=True)
         dq_rsrc = buffer_ops.create_buffer_resource(DQ, max_size=True)
@@ -1222,14 +1195,13 @@ def build_flash_attn_bwd_dqa16_module(B, Sq, Hq, D, sm_scale, sbhd=True, bat_lo=
             [
                 buffer_ops.buffer_load(
                     img_rsrc,
-                    ibase + fx.Index(c * NPAIR * 512 + p * 512 + w0 * 128 + kgl * 32),
+                    ibase + fx.Index(p * 512 + w0 * 128 + kgl * 32),
                     vec_width=2,
                     dtype=elem_dtype,
                 )
                 for kgl in range_constexpr(2)
                 for w0 in range_constexpr(2)
             ]
-            for c in range_constexpr(UC)
             for p in range_constexpr(NPAIR)
         ]
         q = (
@@ -1239,20 +1211,17 @@ def build_flash_attn_bwd_dqa16_module(B, Sq, Hq, D, sm_scale, sbhd=True, bat_lo=
             + (lane16 >> fx.Index(3)) * fx.Index(4)
             + (lane16 & fx.Index(3))
         )
-        if const_expr(sbhd):
-            _row = q * fx.Index(B) + bb
-        else:
-            _row = bb * fx.Index(Sq) + q
+        _row = q * fx.Index(B) + bb
         obase = (_row * fx.Index(Hq) + qh) * fx.Index(D) + w1 * fx.Index(16) + kgh * fx.Index(8)
         sm_vec = Vec.filled(8, sm_scale, fx.Float32)
-        for j in range_constexpr(UC * NPAIR):
+        for j in range_constexpr(NPAIR):
             _lo = Vec(parts[j][0]).shuffle(Vec(parts[j][1]), [0, 1, 2, 3])
             _hi = Vec(parts[j][2]).shuffle(Vec(parts[j][3]), [0, 1, 2, 3])
             _v = _lo.shuffle(_hi, [0, 1, 2, 3, 4, 5, 6, 7])
             buffer_ops.buffer_store(
                 (_v.to(fx.Float32) * sm_vec).to(elem_dtype).ir_value(),
                 dq_rsrc,
-                (obase + fx.Index((j // NPAIR) * D + (j % NPAIR) * 32)) * fx.Index(2),
+                (obase + fx.Index((j % NPAIR) * 32)) * fx.Index(2),
                 offset_is_bytes=True,
             )
 
@@ -1320,10 +1289,9 @@ def build_flash_attn_bwd_dkdv_module(
     wsq_ilv=1,  # adjacent bands sharing one partial row (see _WSQ_BAND_ILV)
     wsq_ring=0,  # >0: band groups reuse this many workspace slots (see _wsq_ring_for)
     wsq_pair=0,  # >0: total band groups, folded in pairs g / ng-g (see _wsq_pair_ok)
-    # wsq_a16: add dQ into a band-less bf16 image with atomics instead of split-K partials;
-    # the caller owes the zeroing and the un-permute (see _DQ_A16, FILL_IMG).
+    # wsq_a16: atomics into a band-less bf16 image instead of split-K partials; the caller
+    # owes the zeroing and the un-permute (see _dq_a16_for, FILL_IMG).
     wsq_a16=False,
-    a16_native=False,  # a16 dQ emitted straight into dQ's own SBHD layout, D64 only (see _g3_nat)
     # band_span: >0 = this launch owns ONE GROUP of that many kv bands (see _band_span_for).
     # K/V/DK/DV still span the whole kv axis; the group's first kv row arrives as a device
     # scalar in the CuSeqKv slot, and seq_len_k is the group's own extent, so the grid, the
@@ -1443,10 +1411,7 @@ def build_flash_attn_bwd_dkdv_module(
     WSQ_PAIR = int(wsq_pair)
     assert not WSQ_PAIR or (not WSQ_RING and window_left < 0 and WSQ_PAIR % 2 == 0)
     WSQ_A16 = bool(wsq_a16)
-    A16_NATIVE = bool(a16_native)
-    assert not A16_NATIVE or (WSQ_A16 and head_dim == 64 and sbhd and not varlen), (
-        "native dQ is a16 D64 SBHD only"
-    )
+    A16_NATIVE = WSQ_A16 and head_dim == 64
     # A band group only shifts where this launch's kv rows sit; every other assumption of the
     # body has to still hold, so it rides the plain full-causal path only -- square SBHD, or
     # ragged (whose bands are per segment).
@@ -1718,8 +1683,6 @@ def build_flash_attn_bwd_dkdv_module(
     # registers and LDS have no sibling MFMA run left to hide the retired fences under.
     G3_DEFER = bool(g3_defer)
     G3_AT = 0
-    G3_VALU = 0
-    G3_MFMA = G3_DT * G3_QT * G3_KSTEPS  # MFMAs one whole GEMM3 pass emits per wave
     G3_ST_AT = -1 if g3_st_at is None else int(g3_st_at)
     G3_ST_N = G3_DT // 2 * G3_QT if g3_st_n is None else int(g3_st_n)
     assert G3_ST_AT < 0 or G3_WAVES == NUM_WAVES
@@ -1740,8 +1703,9 @@ def build_flash_attn_bwd_dkdv_module(
     # begins. Keeping the barrier anyway is then pure rendezvous cost plus a scheduling
     # wall between GEMM3's MFMAs and the ds_write pair that refills the slot.
     HS_WAR_BAR = G3_DEFER and not QDO_TAIL and not QDO_PP
-    _KV_LDS_END = G3V_BASE + (BLOCK_KV * HEAD_DIM if V_LDS else 0)
-    LDS_VIEW_ELEMS = max(G3S_BASE + G3S_SLOTS * G3S_GRP_ELEMS, _KV_LDS_END)
+    LDS_VIEW_ELEMS = max(
+        G3S_BASE + G3S_SLOTS * G3S_GRP_ELEMS, G3V_BASE + (BLOCK_KV * HEAD_DIM if V_LDS else 0)
+    )
 
     allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="flash_attn_bwd_smem_dkdv")
     lds_off = allocator._align(allocator.ptr, 16)
@@ -1803,7 +1767,6 @@ def build_flash_attn_bwd_dkdv_module(
 
         mfma_dv = mfma_tied if (MFMA_TIE & 1) else mfma_acc
         mfma_dk = mfma_tied if (MFMA_TIE & 2) else mfma_acc
-        mfma_dq = mfma_acc
 
         seq_len_q_v = fx.Index(seq_len_q)
         seq_len_k_v = fx.Index(seq_len_k)
@@ -2198,11 +2161,7 @@ def build_flash_attn_bwd_dkdv_module(
                     WSQ,
                     max_size=False,
                     num_records_bytes=_raw(_wsq16_slice),
-                    base_byte_offset=_raw(
-                        (q_tok_base * fx.Index(NUM_HEADS_Q * HEAD_DIM * 2))
-                        if const_expr(varlen)
-                        else (batch_idx * _wsq16_slice)
-                    ),
+                    base_byte_offset=_raw(batch_idx * _wsq16_slice),
                 )
         _lse_per_batch = seq_len_q_v * fx.Index(NUM_HEADS_Q)
         _lse_nrec_bytes = _raw(_lse_per_batch * fx.Index(4))
@@ -2397,8 +2356,6 @@ def build_flash_attn_bwd_dkdv_module(
                                     )
                                 ],
                             )
-                        if const_expr(V_LDS):
-                            Vec(v_b_packs[h][nt][ks]).store(lds, [_kv_lds_idx(_vb_h, nt, ks)])
                         continue
                     Vec(k_b_packs[h][nt][ks]).store(lds, [_kv_lds_idx(_kb_h, nt, ks)])
                     if const_expr(V_LDS):
@@ -2414,8 +2371,8 @@ def build_flash_attn_bwd_dkdv_module(
         c_zero_v4f32 = Vec.filled(4, 0.0, fx.Float32)
 
         def _vexp_intrin(x):
-            # Backend-visible 2^x: unlike opaque inline asm it is a compiler-visible read of
-            # the MFMA accumulator, so it carries the MFMA->VALU hazard itself.
+            # Backend-visible 2^x: a compiler-visible read of the MFMA accumulator, so unlike
+            # opaque inline asm it carries the MFMA->VALU hazard itself.
             return fx.Float32(
                 llvm.call_intrinsic(ir.F32Type.get(), "llvm.amdgcn.exp2.f32", [_raw(x)], [], [])
             )
@@ -2487,8 +2444,6 @@ def build_flash_attn_bwd_dkdv_module(
                 ]
             a = {}
             for mt in _mts:
-                if const_expr(not _nts[mt]):
-                    continue
                 a[mt] = [
                     Vec.load(mfma_pack_type, lds, [_a_idx(a_base, mt, ks, pin)])
                     for ks in range_constexpr(K_STEPS_QK)
@@ -2701,8 +2656,6 @@ def build_flash_attn_bwd_dkdv_module(
                 )
             )
 
-        _amask_cell = [None]
-
         def _gemm3(q_start, head_local, slot, drain=None, qsel=None, depth=None, st_sink=None, poff=None):
             """Run the dQ pass on its carrier waves (see G3_WAVES).
 
@@ -2864,9 +2817,9 @@ def build_flash_attn_bwd_dkdv_module(
                         for jj in range_constexpr(len(_qs)):
                             if const_expr(A16_NATIVE):
                                 # Same atom/shape/accumulation, A and B swapped: C is [m=q][n=d].
-                                _g3[i][jj] = mfma_dq(_g3s[jj], _g3k[i], _g3[i][jj])
+                                _g3[i][jj] = mfma_acc(_g3s[jj], _g3k[i], _g3[i][jj])
                             else:
-                                _g3[i][jj] = mfma_dq(_g3k[i], _g3s[jj], _g3[i][jj])
+                                _g3[i][jj] = mfma_acc(_g3k[i], _g3s[jj], _g3[i][jj])
                 if const_expr(drain is not None and _gi == 0):
                     drain()
                 for i2 in range_constexpr(len(_dg) // 2):
@@ -3245,10 +3198,6 @@ def build_flash_attn_bwd_dkdv_module(
             def _hs_hook(pos):
                 if const_expr(G3_AT == pos and len(_g3_call) > 0):
                     _g3_call.pop()()
-                if const_expr(G3_VALU > 0 and G3_AT > 0 and pos == G3_AT + 1):
-                    for _ in range_constexpr(G3_MFMA):
-                        rocdl.sched_group_barrier(rocdl.mask_mfma, 1, 1)
-                        rocdl.sched_group_barrier(_SCHED_VALU_MASK, G3_VALU, 1)
                 if const_expr(G3_ST_AT >= 0 and pos >= G3_ST_AT):
                     _hs_flush(G3_ST_N)
 
@@ -3690,7 +3639,7 @@ def build_flash_attn_bwd_dkdv_module(
                     _q_last = _q_first + fx.Index(BLOCK_Q - 1)
                     _kvw = kv_row_wave if const_expr(_h == 0) else kv_row_wave + fx.Index(_h * BKV_H)
                     _cond = ArithValue(_kvw <= _q_last)
-                    if const_expr(MASK_ALIGN and not half and poff is None):
+                    if const_expr(MASK_ALIGN):
                         _bcond = ArithValue(_kvw + fx.Index(ROWS_PER_WAVE_KV - 1) <= _q_first)
                         _base[0] = _if_wave(_bcond, _base[0], _arm(_mc_clear), _keep)
                         _dcond = ArithValue(_kvw == _q_first)
@@ -3731,7 +3680,6 @@ def build_flash_attn_bwd_dkdv_module(
             return dv_cur, dk_cur, (_qdo_next if const_expr(Q_PREF) else [qdo, None])
 
         def _q_body(q_start, inner, apply_mask, poff=None, half=False, hsel=None, nq=None):
-            _amask_cell[0] = bool(apply_mask)
             # inner (loop-carried) = [dv accs][dk accs] (+ [Q/dO][-delta, lse] under PF_QB).
             _dk_base = H_ACCS
             dv_cur = [
@@ -4165,17 +4113,15 @@ def _fuse_blockkv_for(Skv, D=64, window_left=-1):
 
 
 # ---- a16: dQ as buffer_atomic_pk_add_bf16, no split-K workspace and no fold -----------
-# Accumulating in place makes dQ NOT bitwise reproducible, and it is affordable only because
-# the image layout puts an atomic's 64 lanes on a quarter of a plain store's cache lines.
-_DQ_A16 = True
+# Accumulating in place makes dQ NOT bitwise reproducible; it is affordable because the image
+# layout puts an atomic's 64 lanes on a quarter of a plain store's cache lines.
 _A16_BLOCK_Q = 32
 # a16 only pays at a WIDE band, where a q row takes half as many atomic contributions.
 _A16_BLOCK_KV = 256
 _A16_Q_SPLIT = 2
 _A16_Q_SPLIT_G8 = 4
-# Batch chunks let the delta and un-permute passes ride under a body they do not depend on.
-# A pure GRID restriction: dK/dV stay bitwise identical and dQ keeps its summands.
-_A16_OVERLAP = 2
+# Batch chunks let the delta ride under a body it does not depend on; a pure GRID restriction,
+# so dK/dV stay bitwise identical and dQ keeps its summands.
 _A16_CHUNK_WGS = 512
 _A16_MIN_BAT = 4
 _A16_MAX_CHUNKS = 2
@@ -4216,16 +4162,14 @@ def _dq_a16_for(B, Sq, Skv, Hq, Hkv, D, window_left, sbhd, varlen):
     Restricted to the dense square full-causal SBHD case: the image's flat index is a pure bit
     permutation, so every axis has to be a power of two and the q tile has to divide Sq."""
     return (
-        _DQ_A16
-        and D in (64, 128)
+        D in (64, 128)
         and sbhd
         and not varlen
         and window_left < 0
         and Sq == Skv
         and Skv % _A16_BLOCK_KV == 0
         and Sq % (_a16_block_q(D) * _a16_qsplit(Hq, Hkv)) == 0
-        and Hq % _a16_uc(D) == 0
-        and (B * (Sq // 16) * Hq) % (_A16_BLOCK // 64 * _a16_uc(D)) == 0
+        and (B * (Sq // 16) * Hq) % (_A16_BLOCK // 64 * (4 if D == 64 else 1)) == 0
     )
 
 
@@ -4242,13 +4186,13 @@ def _a16_image(B, Sq, Hq, D, device, dtype):
     return img
 
 
-def _unpermute_dq_a16(img, dq, B, Sq, Hq, D, scale, stream, sbhd=True, bat_lo=0, n_bat=None):
-    key = (B, Sq, Hq, D, scale, sbhd, bat_lo, n_bat)
+def _unpermute_dq_a16(img, dq, B, Sq, Hq, D, scale, stream):
+    key = (B, Sq, Hq, D, scale)
     launch = _DQA16_CACHE.get(key)
     if launch is None:
         if len(_DQA16_CACHE) >= 16:
             _DQA16_CACHE.clear()
-        launch = build_flash_attn_bwd_dqa16_module(B, Sq, Hq, D, scale, sbhd=sbhd, bat_lo=bat_lo, n_bat=n_bat)
+        launch = build_flash_attn_bwd_dqa16_module(B, Sq, Hq, D, scale)
         _DQA16_CACHE[key] = launch
     launch(img, dq.reshape(-1), stream)
 
@@ -4562,7 +4506,6 @@ _DQ_PIPE = True
 # (area, workspace size and band interleave all fail to predict the sign), so it stays on.
 _DQ_PIPE_AREA_FLOOR = 2048 * 2048
 _DQ_PIPE_FILLS = 4
-_DQ_TAIL_SERIAL = True
 _DQ_TAIL_CUT_FILLS = 2
 _DQ_CHUNK_FOLD_BYTES = 1 << 30
 _DQ_FOLD_SLICES = 16
@@ -4597,7 +4540,7 @@ def _dq_tail_cut(wgs, batch, n_qsp, block_kv):
     """Batch pieces the exposed tail chunk is dispatched in (see _DQ_TAIL_CUT_FILLS).
     ``wgs`` is one subset's whole-batch grid; halving continues while a piece is still worth
     _DQ_TAIL_CUT_FILLS fills and while the batch divides EVENLY, or a remainder goes unrun."""
-    if _DQ_TAIL_CUT_FILLS <= 0 or block_kv < 256:
+    if block_kv < 256:
         return 1
     floor = _DQ_TAIL_CUT_FILLS * _NUM_CU
     cut = 1
@@ -4707,7 +4650,7 @@ def _fused_pipelined(
         _SIDE_STREAM[dq.device] = side
     wgs = (Skv // block_kv) * Hkv * B
     plan = _pipe_chunks(B, q_split, block_kv, Sq, D, sbhd, wgs=wgs)
-    chunks = [c if len(c) == 5 else tuple(c) + (0, None) for c in plan]
+    chunks = [c + (0, None) for c in plan]
     cuttable = sbhd and chunks[-1][0] is None
     n_tail = chunks[-1][2] or q_split
     uniform = len(chunks) > 1 and len({c[2] for c in chunks}) == 1
@@ -4765,7 +4708,7 @@ def _fused_pipelined(
             args = (qf, kf, vf, dof, lsef, df, wk, wv)
             ws_arg, nb = ws_dq[0, 0], B if nbt is None else nbt
             bat = {} if nbt is None else dict(bat_lo=blo, n_bat=nbt)
-        red_q = stream if (_DQ_TAIL_SERIAL and not per_batch and i == nc - 1) else side
+        red_q = stream if (not per_batch and i == nc - 1) else side
         body = dkdv_l if (not blo and n in (None, q_split)) else dkdv_l.chunk(lo, n, blo)
         body(
             *args,
@@ -4918,7 +4861,6 @@ def _get_bwd(
     )
     launchers = _BWD_CACHE.get(key)
     if launchers is None:
-        _nat = a16 and D == 64
         common = dict(
             num_heads=Hq,
             head_dim=D,
@@ -4998,7 +4940,6 @@ def _get_bwd(
             g1_ks_outer=None,
             agpr=_DKDV_AGPR,
             wsq_a16=a16,
-            a16_native=_nat,
             **common,
         )
         dkdv_l = build_flash_attn_bwd_dkdv_module(**dkdv_kw)
@@ -5044,14 +4985,12 @@ def _get_bwd(
                     q_split=q_split if sbhd else 1,
                     bat_lo=bat_lo,
                     bat_all=batch_size,
-                    img_slab=not _nat,
-                    img_sbhd=_nat,
                     **odo_kw,
                 )
                 _odo_bats[bat_lo] = sub
             return sub
 
-        odo_l.bat = _odo_bat if sbhd and a16 else None
+        odo_l.bat = _odo_bat if a16 else None
         launchers = (dkdv_l, odo_l)
         _BWD_CACHE[key] = launchers
     return launchers
@@ -5497,16 +5436,11 @@ def flydsl_varlen_backward(
     )
     if a16:
         _bufs = (qf, kf, vf, dof, lsef, df, ws_dk.reshape(-1), ws_dv.reshape(-1), cu_ph, cu_ph, img)
-        # A compiled launcher dispatches its grid TWICE on its first call; idempotent stores
-        # never cared, but an accumulated image would double, so burn and re-zero every launcher.
+        # A compiled launcher dispatches its grid TWICE on its first call, which an accumulated
+        # image would double: burn and re-zero every launcher.
         _nbc = _a16_bat_chunks(D, B, Skv, block_kv, Hkv, q_split)
         _per = B // _nbc
         _bodies = [(dkdv_l if j == 0 else dkdv_l.chunk(0, None, j * _per)) for j in range(_nbc)]
-        _odos = (
-            [odo_l.bat(j * _per) for j in range(_nbc)]
-            if _nbc > 1 and _A16_OVERLAP >= 2 and odo_l.bat is not None
-            else None
-        )
         _primed = dkdv_l.__dict__.setdefault("_a16_primed", set())
         _pk = (B, Sq, Skv, Hq, D)
         if _pk not in _primed:
@@ -5514,48 +5448,32 @@ def flydsl_varlen_backward(
             for _body in _bodies:
                 _body(*_bufs, _per, Sq, Skv, 0, st)
             img.zero_()
-        _unp = (
-            (lambda strm, lo, n: None)
-            if a16_nat
-            else lambda strm, lo, n: _unpermute_dq_a16(
-                img, dq, B, Sq, Hq, D, 1.0 / _LOG2E, strm, sbhd=sbhd, bat_lo=lo, n_bat=n
-            )
-        )
-        if _nbc == 1 or not _A16_OVERLAP:
+        if _nbc == 1:
             odo_l(o16, dof16, df, B, Sq, st, img=img)
             for _body in _bodies:
                 _body(*_bufs, _per, Sq, Skv, 0, st)
-            _unp(st, 0, None)
+            if not a16_nat:
+                _unpermute_dq_a16(img, dq, B, Sq, Hq, D, 1.0 / _LOG2E, st)
         else:
             # Only chunk 0's delta is due before any body, and a chunk's rows are final when it retires.
+            _odos = [odo_l.bat(j * _per) for j in range(_nbc)]
             _side = _SIDE_STREAM.get(dq.device)
             if _side is None:
                 _side = torch.cuda.Stream(device=dq.device)
                 _SIDE_STREAM[dq.device] = _side
-            _evs = _A16_EVENTS.get(_nbc)
-            if _evs is None:
-                _evs = [torch.cuda.Event() for _ in range(_nbc + 1)]
-                _A16_EVENTS[_nbc] = _evs
-            if _odos is None:
-                odo_l(o16, dof16, df, B, Sq, st, img=img)
-            else:
-                _odos[0](o16, dof16, df, _per, Sq, st, img=img)
-                _side.wait_stream(st)
-                for j in range(1, _nbc):
-                    _odos[j](o16, dof16, df, _per, Sq, _side, img=img)
-                _evs[_nbc].record(_side)
+            _ev = _A16_EVENTS.get(_nbc)
+            if _ev is None:
+                _ev = torch.cuda.Event()
+                _A16_EVENTS[_nbc] = _ev
+            _odos[0](o16, dof16, df, _per, Sq, st, img=img)
+            _side.wait_stream(st)
+            for j in range(1, _nbc):
+                _odos[j](o16, dof16, df, _per, Sq, _side, img=img)
+            _ev.record(_side)
             for j, _body in enumerate(_bodies):
-                if j == 1 and _odos is not None:
-                    st.wait_event(_evs[_nbc])  # chunks 1.. read the delta the side just made
+                if j == 1:
+                    st.wait_event(_ev)  # chunks 1.. read the delta the side just made
                 _body(*_bufs, _per, Sq, Skv, 0, st)
-                if j < _nbc - 1:
-                    _evs[j].record(st)
-                    _side.wait_event(_evs[j])
-                    _unp(_side, j * _per, _per)
-                else:
-                    _unp(st, j * _per, _per)
-            _evs[_nbc - 1].record(_side)
-            st.wait_event(_evs[_nbc - 1])
     elif band_span:
         _fused_bandgroups(
             dkdv_l,
