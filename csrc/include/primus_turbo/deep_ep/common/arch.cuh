@@ -14,7 +14,9 @@ namespace primus_turbo::deep_ep {
 // ---------------------------------------------------------------------------
 // 1. Wave geometry
 // ---------------------------------------------------------------------------
-// Host pass sees no arch macro, so wave32 targets need -DPRIMUS_TURBO_DEEPEP_WARP_SIZE=32
+// Host pass sees no arch macro, so wave32 targets need -DPRIMUS_TURBO_DEEPEP_WARP_SIZE=32.
+// The override keeps the long name: `-DWARP_SIZE=` would collide with the
+// same-named constants in csrc/kernels/quantization and csrc/kernels/gemm.
 #ifndef PRIMUS_TURBO_DEEPEP_WARP_SIZE
 #if defined(__GFX12__) || defined(__GFX11__)
 #define PRIMUS_TURBO_DEEPEP_WARP_SIZE 32
@@ -23,7 +25,7 @@ namespace primus_turbo::deep_ep {
 #endif
 #endif
 
-static constexpr int32_t kWarpSize = PRIMUS_TURBO_DEEPEP_WARP_SIZE;
+#define WARP_SIZE PRIMUS_TURBO_DEEPEP_WARP_SIZE
 
 // ---------------------------------------------------------------------------
 // 2. Timing and spin throttling
@@ -60,7 +62,7 @@ __device__ __forceinline__ void spin_backoff() {
 
 #define PRIMUS_TURBO_BARRIER_SYNC(__fence, ___bar_id, ___num_threads_per_group)                    \
     {                                                                                              \
-        ___bar_sync_expected += (___num_threads_per_group) / kWarpSize;                            \
+        ___bar_sync_expected += (___num_threads_per_group) / WARP_SIZE;                            \
         __fence;                                                                                   \
         if (__lane_id() == 0) {                                                                    \
             __hip_atomic_fetch_add(___bar_sync_count + (___bar_id), 1, __ATOMIC_RELAXED,           \
@@ -72,32 +74,29 @@ __device__ __forceinline__ void spin_backoff() {
         __syncwarp();                                                                              \
     }
 
-// ROCm: `bar.sync`'s implicit fence -> a wave drain, each wave drains before it votes.
-// Not a __builtin_amdgcn_fence: the only thing needed here is that this wave's own
-// accesses have landed, and every fence scope wide enough to emit `s_waitcnt vmcnt(0)`
-// also drags in `buffer_wbl2` / `buffer_inv`, which have nothing to do here -- the
-// payload carries `sc0 sc1` and never enters L2.
-__device__ __forceinline__ void wave_drain() {
+// ROCm: the instruction, named after itself -- waits for this wave's own accesses
+// to land and nothing else. That is all `bar.sync`'s implicit fence needs to be
+// here: every fence scope wide enough to emit `s_waitcnt vmcnt(0)` also drags in
+// `buffer_wbl2` / `buffer_inv`, which have nothing to write back or invalidate
+// when the payload carries `sc0 sc1` and never enters L2.
+__device__ __forceinline__ void s_waitcnt() {
 #if defined(__GFX12__)
-#error "deep_ep: gfx12 splits s_waitcnt into per-class counters, needs its own drain"
+#error "deep_ep: gfx12 splits s_waitcnt into per-class counters, needs its own spelling"
 #endif
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
     __builtin_amdgcn_s_waitcnt(0);  // 0 == every counter at 0
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
 }
 
-__device__ __forceinline__ void barrier_arrive_fence() {
-    wave_drain();
-}
-
 // ROCm: new, __syncthreads() alone orders only LDS on CDNA, not global stores
 __device__ __forceinline__ void sync_threads_global() {
-    wave_drain();
+    s_waitcnt();
     __syncthreads();
 }
 
 #define sync_barrier_init()               PRIMUS_TURBO_BARRIER_SYNC_INIT()
-#define sync_barrier(bar_id, num_threads) PRIMUS_TURBO_BARRIER_SYNC(barrier_arrive_fence(),         \
+// Each wave drains before it votes, so the group's stores have all landed on release
+#define sync_barrier(bar_id, num_threads) PRIMUS_TURBO_BARRIER_SYNC(s_waitcnt(),                    \
                                                                     bar_id, num_threads)
 
 // ---------------------------------------------------------------------------

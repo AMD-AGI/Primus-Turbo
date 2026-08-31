@@ -3,27 +3,27 @@
 #include <primus_turbo/deep_ep/common/compiled.cuh>
 #include <primus_turbo/deep_ep/common/exception.cuh>
 
-// ROCm: 32 -> kWarpSize, the loop stride is one wave of lanes
+// ROCm: 32 -> WARP_SIZE, the loop stride is one wave of lanes
 #define UNROLLED_WARP_COPY(UNROLL_FACTOR, LANE_ID, N, DST, SRC, LD_FUNC, ST_FUNC)                                                              \
     {                                                                                                                                         \
-        constexpr int kLoopStride = kWarpSize * (UNROLL_FACTOR);                                                                              \
+        constexpr int kLoopStride = WARP_SIZE * (UNROLL_FACTOR);                                                                              \
         typename std::remove_reference<decltype(LD_FUNC((SRC) + 0))>::type unrolled_values[(UNROLL_FACTOR)];                                  \
         auto __src = (SRC);                                                                                                                    \
         auto __dst = (DST);                                                                                                                    \
         for (int __i = (LANE_ID); __i < ((N) / kLoopStride) * kLoopStride; __i += kLoopStride) {                                              \
-            _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) unrolled_values[__j] = LD_FUNC(__src + __i + __j * kWarpSize);  \
-            _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) ST_FUNC(__dst + __i + __j * kWarpSize, unrolled_values[__j]);   \
+            _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) unrolled_values[__j] = LD_FUNC(__src + __i + __j * WARP_SIZE);  \
+            _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) ST_FUNC(__dst + __i + __j * WARP_SIZE, unrolled_values[__j]);   \
         }                                                                                                                                     \
         {                                                                                                                                     \
             int __i = ((N) / kLoopStride) * kLoopStride + (LANE_ID);                                                                          \
             _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) {                                                               \
-                if (__i + __j * kWarpSize < (N)) {                                                                                            \
-                    unrolled_values[__j] = LD_FUNC(__src + __i + __j * kWarpSize);                                                            \
+                if (__i + __j * WARP_SIZE < (N)) {                                                                                            \
+                    unrolled_values[__j] = LD_FUNC(__src + __i + __j * WARP_SIZE);                                                            \
                 }                                                                                                                             \
             }                                                                                                                                 \
             _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) {                                                               \
-                if (__i + __j * kWarpSize < (N)) {                                                                                            \
-                    ST_FUNC(__dst + __i + __j * kWarpSize, unrolled_values[__j]);                                                             \
+                if (__i + __j * WARP_SIZE < (N)) {                                                                                            \
+                    ST_FUNC(__dst + __i + __j * WARP_SIZE, unrolled_values[__j]);                                                             \
                 }                                                                                                                             \
             }                                                                                                                                 \
         }                                                                                                                                     \
@@ -452,7 +452,7 @@ __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int ran
         // `sc0 sc1` and never entered L2, so the `buffer_wbl2` / `buffer_inv` an
         // ACQ_REL sys fence emits write back and invalidate nothing -- and cost 21%
         // of end-to-end bandwidth, measured. Only the drain is load-bearing.
-        wave_drain();
+        s_waitcnt();
         __syncthreads();
     }
 
@@ -532,59 +532,59 @@ __forceinline__ __device__ T warp_reduce(T value, Op op) {
     // ROCm: __shfl_xor_sync(0xffffffff, ..) -> __shfl_xor, the whole wave participates
     if constexpr (kIntergroupReduce) {
         if constexpr (kNumLanesPerGroup <= 1)
-            value = op(value, __shfl_xor(value, 1, kWarpSize));
+            value = op(value, __shfl_xor(value, 1, WARP_SIZE));
         if constexpr (kNumLanesPerGroup <= 2)
-            value = op(value, __shfl_xor(value, 2, kWarpSize));
+            value = op(value, __shfl_xor(value, 2, WARP_SIZE));
         if constexpr (kNumLanesPerGroup <= 4)
-            value = op(value, __shfl_xor(value, 4, kWarpSize));
+            value = op(value, __shfl_xor(value, 4, WARP_SIZE));
         if constexpr (kNumLanesPerGroup <= 8)
-            value = op(value, __shfl_xor(value, 8, kWarpSize));
+            value = op(value, __shfl_xor(value, 8, WARP_SIZE));
         if constexpr (kNumLanesPerGroup <= 16)
-            value = op(value, __shfl_xor(value, 16, kWarpSize));
+            value = op(value, __shfl_xor(value, 16, WARP_SIZE));
         // ROCm: +1 step, lanes 32..63 exist on wave64
-        if constexpr (kNumLanesPerGroup <= 32 and kWarpSize == 64)
-            value = op(value, __shfl_xor(value, 32, kWarpSize));
+        if constexpr (kNumLanesPerGroup <= 32 and WARP_SIZE == 64)
+            value = op(value, __shfl_xor(value, 32, WARP_SIZE));
     } else {
         // ROCm: +1 step, same for the intra-group direction
         if constexpr (kNumLanesPerGroup >= 64)
-            value = op(value, __shfl_xor(value, 32, kWarpSize));
+            value = op(value, __shfl_xor(value, 32, WARP_SIZE));
         if constexpr (kNumLanesPerGroup >= 32)
-            value = op(value, __shfl_xor(value, 16, kWarpSize));
+            value = op(value, __shfl_xor(value, 16, WARP_SIZE));
         if constexpr (kNumLanesPerGroup >= 16)
-            value = op(value, __shfl_xor(value, 8, kWarpSize));
+            value = op(value, __shfl_xor(value, 8, WARP_SIZE));
         if constexpr (kNumLanesPerGroup >= 8)
-            value = op(value, __shfl_xor(value, 4, kWarpSize));
+            value = op(value, __shfl_xor(value, 4, WARP_SIZE));
         if constexpr (kNumLanesPerGroup >= 4)
-            value = op(value, __shfl_xor(value, 2, kWarpSize));
+            value = op(value, __shfl_xor(value, 2, WARP_SIZE));
         if constexpr (kNumLanesPerGroup >= 2)
-            value = op(value, __shfl_xor(value, 1, kWarpSize));
+            value = op(value, __shfl_xor(value, 1, WARP_SIZE));
     }
     return value;
 }
 
 // Convenience aliases
-// ROCm: default 32 -> kWarpSize, callers that omit it mean the whole wave
-template <int kNumLanesPerGroup = kWarpSize, bool kIntergroupReduce = false, typename T>
+// ROCm: default 32 -> WARP_SIZE, callers that omit it mean the whole wave
+template <int kNumLanesPerGroup = WARP_SIZE, bool kIntergroupReduce = false, typename T>
 __forceinline__ __device__ T warp_reduce_sum(T value) {
     return warp_reduce<kNumLanesPerGroup, kIntergroupReduce, T>(value, ReduceSum<T>{});
 }
 
-template <int kNumLanesPerGroup = kWarpSize, bool kIntergroupReduce = false, typename T>
+template <int kNumLanesPerGroup = WARP_SIZE, bool kIntergroupReduce = false, typename T>
 __forceinline__ __device__ T warp_reduce_max(T value) {
     return warp_reduce<kNumLanesPerGroup, kIntergroupReduce, T>(value, ReduceMax<T>{});
 }
 
-template <int kNumLanesPerGroup = kWarpSize, bool kIntergroupReduce = false, typename T>
+template <int kNumLanesPerGroup = WARP_SIZE, bool kIntergroupReduce = false, typename T>
 __forceinline__ __device__ T warp_reduce_min(T value) {
     return warp_reduce<kNumLanesPerGroup, kIntergroupReduce, T>(value, ReduceMin<T>{});
 }
 
-template <int kNumLanesPerGroup = kWarpSize, bool kIntergroupReduce = false, typename T>
+template <int kNumLanesPerGroup = WARP_SIZE, bool kIntergroupReduce = false, typename T>
 __forceinline__ __device__ T warp_reduce_and(T value) {
     return warp_reduce<kNumLanesPerGroup, kIntergroupReduce, T>(value, ReduceAnd<T>{});
 }
 
-template <int kNumLanesPerGroup = kWarpSize, bool kIntergroupReduce = false, typename T>
+template <int kNumLanesPerGroup = WARP_SIZE, bool kIntergroupReduce = false, typename T>
 __forceinline__ __device__ T warp_reduce_or(T value) {
     return warp_reduce<kNumLanesPerGroup, kIntergroupReduce, T>(value, ReduceOr<T>{});
 }

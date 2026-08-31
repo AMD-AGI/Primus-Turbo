@@ -516,12 +516,12 @@ __global__ void unpermute_kernel_e1(const int4 *permuted_tokens, int4 *tokens,
                                     const prob_t *permuted_probs, prob_t *probs,
                                     const int *row_id_map, const int *num_dispatched_tokens_ptr,
                                     int hidden_int4) {
-    constexpr int num_warps  = kNumThreads / kWarpSize;
+    constexpr int num_warps  = kNumThreads / WARP_SIZE;
     constexpr int row_stride = 3;
 
     const int thread_id             = static_cast<int>(threadIdx.x);
-    const int lane_id               = thread_id % kWarpSize;
-    const int warp_id               = thread_id / kWarpSize;
+    const int lane_id               = thread_id % WARP_SIZE;
+    const int warp_id               = thread_id / WARP_SIZE;
     const int num_dispatched_tokens = *num_dispatched_tokens_ptr;
 
     for (int64_t block_start = blockIdx.x * num_warps; block_start < num_dispatched_tokens;
@@ -538,7 +538,7 @@ __global__ void unpermute_kernel_e1(const int4 *permuted_tokens, int4 *tokens,
             UNROLLED_WARP_COPY(4, lane_id, hidden_int4, dst, src, __ldg, st_nt_int4);
         } else {
             const int4 zero4 = make_int4(0, 0, 0, 0);
-            for (int64_t j = lane_id; j < hidden_int4; j += kWarpSize)
+            for (int64_t j = lane_id; j < hidden_int4; j += WARP_SIZE)
                 st_nt_int4(dst + j, zero4);
         }
 
@@ -683,7 +683,7 @@ void unpermute_impl(const dtype_t *permuted_tokens, dtype_t *tokens, const prob_
     // unpermute_kernel_e1 hard-codes probs row width 1 (multihot only); topk path uses num_topk at
     // E=1.
     if (num_local_experts == 1 && effective_probs_stride == 1) {
-        constexpr int num_warps_e1  = kE1NumThreads / kWarpSize;
+        constexpr int num_warps_e1  = kE1NumThreads / WARP_SIZE;
         const int     blocks_needed = (num_dispatched_max + num_warps_e1 - 1) / num_warps_e1;
         const int     e1_grid       = blocks_needed;
         unpermute_kernel_e1<kE1NumThreads, dtype_t, prob_t>
