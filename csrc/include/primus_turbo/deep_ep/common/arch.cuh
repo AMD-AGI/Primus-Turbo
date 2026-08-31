@@ -14,18 +14,11 @@ namespace primus_turbo::deep_ep {
 // ---------------------------------------------------------------------------
 // 1. Wave geometry
 // ---------------------------------------------------------------------------
-// Host pass sees no arch macro, so wave32 targets need -DPRIMUS_TURBO_DEEPEP_WARP_SIZE=32.
-// The override keeps the long name: `-DWARP_SIZE=` would collide with the
-// same-named constants in csrc/kernels/quantization and csrc/kernels/gemm.
-#ifndef PRIMUS_TURBO_DEEPEP_WARP_SIZE
 #if defined(__GFX12__) || defined(__GFX11__)
-#define PRIMUS_TURBO_DEEPEP_WARP_SIZE 32
+#define WARP_SIZE 32
 #else
-#define PRIMUS_TURBO_DEEPEP_WARP_SIZE 64
+#define WARP_SIZE 64
 #endif
-#endif
-
-#define WARP_SIZE PRIMUS_TURBO_DEEPEP_WARP_SIZE
 
 // ---------------------------------------------------------------------------
 // 2. Timing and spin throttling
@@ -33,11 +26,6 @@ namespace primus_turbo::deep_ep {
 // ROCm: clock64() -> the steady 100 MHz counter, CDNA has no working s_memtime
 __device__ __forceinline__ int64_t clock64() {
     return static_cast<int64_t>(wall_clock64());
-}
-
-// ROCm: __nanosleep -> s_sleep, the ns argument is dropped
-__device__ __forceinline__ void nanosleep(int ns) {
-    __builtin_amdgcn_s_sleep(16);
 }
 
 // ROCm: new, an unthrottled flag spin starves the peer's xGMI write and hangs
@@ -100,17 +88,7 @@ __device__ __forceinline__ void sync_threads_global() {
                                                                     bar_id, num_threads)
 
 // ---------------------------------------------------------------------------
-// 4. Async global -> LDS copy (CUDA cp.async.bulk + mbarrier)
-// ---------------------------------------------------------------------------
-// ROCm: gfx942/gfx950 have no cp.async, so the TMA paths fall back to plain copies
-#if defined(__gfx1250__)
-#define PRIMUS_TURBO_HAS_ASYNC_COPY 1
-#else
-#define PRIMUS_TURBO_HAS_ASYNC_COPY 0
-#endif
-
-// ---------------------------------------------------------------------------
-// 5. Cache-policy bits on a data access
+// 4. Cache-policy bits on a data access
 // ---------------------------------------------------------------------------
 // ROCm: PTX cache hints -> gfx9 CPol bits, `sc0` (1) past the device, `sc1` (16)
 // past the XCD's L2. CDNA's L2 is per-XCD and does not snoop xGMI, so these bits
@@ -118,9 +96,8 @@ __device__ __forceinline__ void sync_threads_global() {
 #if defined(__GFX12__) || defined(__GFX11__)
 #error "deep_ep: CPol encoding for GFX11/GFX12 is not implemented yet"
 #endif
-// ROCm: FlyDSL's 18/19 minus `nt`, the peer reads the buffer back immediately
-static constexpr int kCPolAgent = 16;      // sc1       -- visible GPU-wide
-static constexpr int kCPolSys   = 1 | 16;  // sc1|sc0   -- visible to peers
+// ROCm: FlyDSL's 19 minus `nt`, the peer reads the buffer back immediately
+static constexpr int kCPolSys = 1 | 16;  // sc0|sc1 -- visible to peers
 
 // ROCm: new, a buffer op is how CPol reaches the instruction at full width.
 // Precondition: the base must be wave-uniform and the per-lane delta non-negative
@@ -150,7 +127,6 @@ __device__ __forceinline__ auto make_wave_rsrc(const void* ptr, uint32_t& voffse
 
 template <int kCPol, int kBytes>
 __device__ __forceinline__ typename BufferChunk<kBytes>::type buffer_ld_chunk(const void* ptr) {
-    using chunk_t = typename BufferChunk<kBytes>::type;
     uint32_t voffset;
     auto     rsrc = make_wave_rsrc(ptr, voffset);
     if constexpr (kBytes == 16)
@@ -168,7 +144,6 @@ __device__ __forceinline__ typename BufferChunk<kBytes>::type buffer_ld_chunk(co
 template <int kCPol, int kBytes>
 __device__ __forceinline__ void buffer_st_chunk(void* ptr,
                                                 typename BufferChunk<kBytes>::type val) {
-    using chunk_t = typename BufferChunk<kBytes>::type;
     uint32_t voffset;
     auto     rsrc = make_wave_rsrc(ptr, voffset);
     if constexpr (kBytes == 16)
@@ -184,7 +159,7 @@ __device__ __forceinline__ void buffer_st_chunk(void* ptr,
 }
 
 // ---------------------------------------------------------------------------
-// 6. Multi-node paths
+// 5. Multi-node paths
 // ---------------------------------------------------------------------------
 // ROCm: internode is not ported yet, its kernels are upstream NVSHMEM + PTX
 #ifndef PRIMUS_TURBO_DEEPEP_HAS_INTERNODE
