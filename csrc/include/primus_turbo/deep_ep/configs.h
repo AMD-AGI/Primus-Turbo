@@ -83,10 +83,20 @@ static inline int get_num_cpu_timeout_secs() {
     return timeout;
 }
 
+// The cheap fence replaces the release store's system-scope write-back with a per-wave s_waitcnt
+// (st_release_sys_global in the deep_ep utils header). That waitcnt covers only the wave that
+// publishes the channel tail, while the payload rows are written by the other waves of the group,
+// and the RELAXED store drops the write-back the receiver needs -- so a receiver can see the new
+// tail while those rows still sit in the sender's L2 and read the previous round's contents
+// instead. Measured on gfx950 (EP=8, DSv3, intranode dispatch): 7 of 8 short runs carried 1-6
+// corrupted rows out of 8192, and 50-iter bf16 loss landed at 6.2066 against a 4.5206 DeepEP-off
+// reference. The corruption is silent -- it lands in gradients -- so it must not be what a caller
+// gets by default. The plain release store costs 2.7% more per step; set
+// PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE=0 to take the cheap fence back, and its hazard with it.
 inline static bool is_enable_cheap_fence() {
     char const *v = std::getenv("PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE");
     if (!v || v[0] == '\0')
-        return true;
+        return false;
     return std::stoi(v) == 0;
 }
 

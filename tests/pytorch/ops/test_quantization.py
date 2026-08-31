@@ -129,6 +129,22 @@ def test_quantize_fp8_tensorwise_amax_correctness(orig_dtype, dest_dtype, granul
         **get_tolerances(dest_dtype),
     )
 
+    # Opt-in K/N pad computes amax over the real data, so it keeps the tight scale, leaves the
+    # real block byte-identical, and zero-fills the widened tail (aligned dims make it a no-op).
+    N_dim, K_dim = shape
+    x_fp8_pad, x_scale_inv_pad = quantize_fp8(
+        x, dest_dtype, granularity=granularity, pad_align_last=128, pad_align_penultimate=128
+    )
+    Np = ((N_dim + 127) // 128) * 128
+    Kp = ((K_dim + 127) // 128) * 128
+    assert tuple(x_fp8_pad.shape) == (Np, Kp)
+    torch.testing.assert_close(x_scale_inv_pad, x_scale_inv, rtol=0, atol=0)
+    torch.testing.assert_close(
+        x_fp8_pad[:N_dim, :K_dim].to(torch.float32), x_fp8.to(torch.float32), rtol=0, atol=0
+    )
+    assert (x_fp8_pad[N_dim:, :].to(torch.float32) != 0).sum() == 0
+    assert (x_fp8_pad[:, K_dim:].to(torch.float32) != 0).sum() == 0
+
 
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
