@@ -375,9 +375,14 @@ def _attn_fwd_inner(
             qk_scaled += alibi_block
         # get max scores so far
         m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
+        # A sliding window can mask a whole block out for a row, unlike a causal mask, which
+        # always leaves the diagonal. Then m_ij stays -inf and (-inf) - (-inf) is NaN, which
+        # poisons the accumulator for the rest of the loop. Shift by 0 instead: every entry is
+        # -inf, so p comes out 0 and the row contributes nothing, which is the answer.
+        m_ij_shift = tl.where(m_ij == float("-inf"), 0.0, m_ij)
 
         # scale and subtract max
-        q_shifted = qk_scaled - m_ij[:, None]
+        q_shifted = qk_scaled - m_ij_shift[:, None]
         if RETURN_SCORES:
             # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
             scores_scaled_shifted_mask = (OFFS_M[:, None] < actual_seqlen_q) & (
@@ -413,7 +418,9 @@ def _attn_fwd_inner(
         # -- update output accumulator --
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
         # store the diff in maxes to adjust acc and li as we discover new maxes
-        m_diff = m_i - m_ij
+        # Same guard on the rescale: with both maxima still -inf there is nothing to rescale
+        # (acc and l_i are zero), so alpha must be 1 rather than NaN.
+        m_diff = tl.where(m_ij == float("-inf"), 0.0, m_i - m_ij)
         if USE_EXP2:
             alpha = tl.math.exp2(m_diff * RCP_LN2)
         else:
