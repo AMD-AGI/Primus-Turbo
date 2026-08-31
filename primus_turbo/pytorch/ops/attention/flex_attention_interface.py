@@ -48,8 +48,11 @@ Design notes
   default to off (``None`` / ``0.0``), so a torch-style call is byte-for-byte
   unchanged and this stays a drop-in replacement.
 * Softcap is detected and accepted in the signature but currently **blocked at the
-  kernel layer** (the aiter dense fwd/bwd on this build expose no softcap
-  parameter), so it raises rather than dropping the cap.
+  kernel layer**: no trainable aiter fwd+bwd pair on this build implements it (the
+  dense forward *could* -- CK has the tanh variant and aiter hardcodes
+  ``logits_soft_cap=0.0`` in the binding -- but no backward does). It raises rather
+  than dropping the cap, and a forward-only kernel would not be enough to lift the
+  gate: that would leave the gradients uncapped.
 
 
 Relationship to PyTorch
@@ -257,10 +260,10 @@ def flex_attention(
     * ``softcap`` (``Optional[float]``, default ``None``): logits soft-cap
       (``cap*tanh(score/cap)``, Gemma2/Grok). ``None`` or ``0`` means disabled
       (no-op). A positive value currently raises ``NotImplementedError`` -- the
-      interface is in place, but it is blocked at the kernel layer (the aiter
-      dense fwd/bwd on this build expose no softcap parameter). It will take
-      effect once the upstream kernel adds the
-      parameter.
+      interface is in place, but no trainable aiter fwd+bwd pair on this build
+      implements the cap. It will take effect once upstream ships a matched
+      forward *and* backward; a forward-only kernel does not qualify, since the
+      gradients would then be computed without the cap.
     * ``dropout_p`` (``float``, default ``0.0``): attention-dropout probability
       threaded straight to ``flash_attn_func(dropout_p=...)``. Requires
       ``0 <= p < 1`` (``0`` disables dropout, the drop-in default). As in
@@ -415,7 +418,8 @@ def flex_attention(
         if not callable(score_mod):
             raise ValueError("Turbo flex compat layer requires score_mod to be callable or None.")
         # Detect a pure logits soft-cap (cap*tanh(score/cap)) first. It cannot run
-        # on the fixed dense kernels (no softcap param on this build), and the
+        # on the fixed dense kernels (no trainable fwd+bwd pair implements the cap
+        # on this build -- see the gate below for the survey), and the
         # ALiBi detector below only probes score=0 -- where a soft-cap looks like
         # a zero-slope no-op -- so probing it first avoids silently dropping the
         # cap. A soft-cap+ALiBi (or other) composition is not a pure soft-cap and
@@ -863,9 +867,11 @@ def flex_attention_varlen(
         dim (reuses the dense validator).
     softcap : float, optional
         Logits soft-cap. ``None``/``0`` disables it (no-op); a positive value raises
-        ``NotImplementedError`` (blocked at the kernel layer on this build -- the
-        varlen backward has no softcap parameter -- exactly like the dense entry, so
-        the cap is never silently dropped).
+        ``NotImplementedError``, exactly like the dense entry, so the cap is never
+        silently dropped. Note the asymmetry this guards against: aiter's varlen
+        *forward* does take ``logits_soft_cap``, but its backward neither passes it
+        nor returns a gradient for it, so accepting a cap here would cap the forward
+        and leave the gradients uncapped.
     deterministic : bool, default False
         Threaded straight to ``flash_attn_varlen_func(deterministic=...)``; same knob,
         same meaning and same backend guarantees as a direct varlen call. ``False``
@@ -910,17 +916,22 @@ def flex_attention_varlen(
         )
 
     # softcap (explicit) is blocked at the kernel layer on this build exactly like the
-    # dense entry: the aiter varlen backward exposes no softcap parameter, so a
-    # positive cap hard-errors rather than being silently
-    # dropped. None/0 is a no-op (drop-in default).
+    # dense entry -- and here the asymmetry is live rather than hypothetical: aiter's
+    # varlen forward DOES accept and apply logits_soft_cap, while
+    # FlashAttnVarlenFunc.backward neither passes it to _flash_attn_varlen_backward
+    # nor returns a gradient for it (`None,  # logits_soft_cap`). Forwarding a cap
+    # here would therefore run a capped forward against uncapped gradients, which is
+    # worse than dropping it: the loss still falls and nothing errors. So a positive
+    # cap hard-errors. None/0 is a no-op (drop-in default).
     effective_softcap = _normalise_explicit_softcap(softcap)
     if effective_softcap > 0.0:
         raise NotImplementedError(
             "Turbo flex varlen entry: the softcap interface is in place "
-            f"(cap~={effective_softcap:.4g}), but it is blocked by this build's aiter kernels (the "
-            "varlen backward lacks a softcap parameter). To avoid "
-            "silently dropping the cap and producing wrong results, softcap>0 raises here -- we "
-            "never degrade to a path that ignores the cap."
+            f"(cap~={effective_softcap:.4g}), but it is blocked by this build's aiter kernels: the "
+            "varlen forward accepts logits_soft_cap while the varlen backward neither takes it nor "
+            "returns a gradient for it, so a cap would apply to the forward only. To avoid "
+            "silently dropping the cap -- or capping the forward against uncapped gradients -- "
+            "softcap>0 raises here; we never degrade to a path that ignores the cap."
         )
 
     # Lazy import so pure classification / validation (and this module's import) does

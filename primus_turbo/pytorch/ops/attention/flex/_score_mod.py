@@ -120,9 +120,11 @@ def _detect_softcap(
 
     Detected explicitly for two reasons on this build:
 
-    * The fixed Turbo dense kernels expose **no** softcap parameter (aiter dense
-      ``mha_fwd``/``fmha_v3_fwd``/``mha_bwd`` lack it),
-      so a soft-cap cannot be silently dropped.
+    * No trainable Turbo/aiter fwd+bwd pair on this build implements the cap: the
+      dense python bindings ``mha_fwd``/``fmha_v3_fwd``/``mha_bwd`` have no such
+      parameter, and no backward anywhere (CK ``fmha_bwd``, aiter's
+      ``mha_bwd``/``mha_varlen_bwd``, the trainable triton backward kernels)
+      implements it. So a soft-cap must be recognised rather than silently dropped.
     * :func:`_detect_alibi_slopes` only ever probes ``score=0``, where
       ``cap*tanh(0)=0``; a soft-cap would therefore be misread as a zero-slope
       (no-op) bias and handed to Turbo *without* the cap -- a silently wrong
