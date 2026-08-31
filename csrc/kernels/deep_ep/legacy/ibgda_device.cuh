@@ -7,9 +7,7 @@
 //  - nvshmem/src/include/non_abi/device/pt-to-pt/ibgda_device.cuh
 #pragma once
 
-// [agent modifed]: new -- whole-file arch gate. IBGDA rings IB doorbells from the
-// device through NVSHMEM internals; rocSHMEM has no device-side QP handle, so
-// there is nothing to emulate. See PRIMUS_TURBO_DEEPEP_HAS_IBGDA in arch.cuh.
+// ROCm: new, whole-file arch gate, rocSHMEM has no device-side QP handle
 #include <primus_turbo/deep_ep/common/arch.cuh>
 
 #if PRIMUS_TURBO_DEEPEP_HAS_IBGDA
@@ -22,7 +20,7 @@
 
 #include "utils.cuh"
 
-// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep::legacy
+// ROCm: deep_ep::legacy -> primus_turbo::deep_ep::legacy
 namespace primus_turbo::deep_ep::legacy {
 
 EP_STATIC_ASSERT(NVSHMEMI_IBGDA_MIN_QP_DEPTH >= 64, "Invalid QP minimum depth");
@@ -157,7 +155,7 @@ __device__ static __forceinline__ void ibgda_submit_requests(nvshmemi_ibgda_devi
     uint64_t new_wqe_idx = base_wqe_idx + num_wqes;
 
     // WQE writes must be finished first
-    // [agent modifed]: __threadfence() -> memory_fence_gpu(), i.e. s_waitcnt only
+    // ROCm: __threadfence() -> memory_fence_gpu(), i.e. s_waitcnt only
     memory_fence_gpu();
 
     unsigned long long int* ready_idx =

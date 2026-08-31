@@ -2,7 +2,7 @@
 
 #include "compiled.cuh"
 
-// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep::legacy
+// ROCm: deep_ep::legacy -> primus_turbo::deep_ep::legacy
 namespace primus_turbo::deep_ep::legacy {
 
 // Layout kernels

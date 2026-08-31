@@ -1,19 +1,8 @@
 #pragma once
 
-// [agent modifed]: port of upstream `csrc/utils/shared_memory.hpp`. Two deviations,
-// both forced by the driver surface:
-//   - the `use_fabric` path (CUmemFabricHandle + the cuMem* VMM API through
-//     lazy_driver.hpp) has no HIP counterpart, so only upstream's own IPC branch
-//     is kept and `use_fabric` is rejected at construction.
-//   - the allocation size is remembered here, because a HIP IPC handle carries no
-//     size field for `get_mem_handle` to fill in from the driver.
-//
-// The buffer is ordinary cached device memory, as upstream. Peers do read it over
-// xGMI, which CDNA's L2 does not snoop, but coherence is the *accessor's* job on
-// this arch, not the allocation's: see the `coherent` family in
-// kernels/deep_ep/legacy/utils.cuh. An uncached allocation cannot substitute for
-// it -- MTYPE applies to the owner's page tables only, so a peer's IPC mapping
-// does not inherit it and the peer's own writes would still sit in its L2.
+// ROCm: port of upstream csrc/utils/shared_memory.hpp. `use_fabric` has no HIP
+// counterpart and is rejected, and the allocation size is remembered here because a
+// HIP IPC handle carries none. Coherence is the accessor's job (see legacy/utils.cuh).
 
 #include <hip/hip_runtime.h>
 
@@ -21,7 +10,7 @@
 
 #include <primus_turbo/deep_ep/common/exception.cuh>
 
-// [agent modifed]: deep_ep::shared_memory -> primus_turbo::deep_ep::shared_memory
+// ROCm: deep_ep::shared_memory -> primus_turbo::deep_ep::shared_memory
 namespace primus_turbo::deep_ep::shared_memory {
 
 union MemHandleInner {

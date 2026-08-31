@@ -1,6 +1,6 @@
 #pragma once
 
-// [agent modifed]: include root deep_ep/ -> primus_turbo/deep_ep/
+// ROCm: include root deep_ep/ -> primus_turbo/deep_ep/
 #include <primus_turbo/deep_ep/common/compiled.cuh>
 
 #define LEGACY_NUM_MAX_NVL_PEERS 8
@@ -16,6 +16,5 @@
 #define LEGACY_NUM_WAIT_NANOSECONDS 500
 
 #define LEGACY_NUM_CPU_TIMEOUT_SECS 100
-// [agent modifed]: 200G -> 10G   upstream counts SM clocks; clock64() here is the
-// 100 MHz steady counter (arch.cuh), so keep the same ~100 s budget in its units.
+// ROCm: 200G -> 10G, clock64() here is the 100 MHz steady counter (arch.cuh)
 #define LEGACY_NUM_TIMEOUT_CYCLES 10000000000ull  // 10G ticks @100MHz ~= 100s

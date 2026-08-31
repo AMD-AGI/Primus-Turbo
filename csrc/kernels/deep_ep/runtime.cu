@@ -20,12 +20,9 @@
 #include <rocshmem/rocshmem.hpp>
 #endif
 
-// [agent modifed]: the intranode::barrier kernel that used to live here is gone -- the legacy
-// copy brought upstream's own definition in legacy/intranode.cu, and two definitions of the
-// same symbol do not link.
+// ROCm: the local intranode::barrier kernel is dropped, legacy/intranode.cu defines it
 
-// [agent modifed]: namespace internode -> nvshmem, and the signatures now match
-// backend/api.cuh (which is upstream's own spelling for this backend).
+// ROCm: namespace internode -> nvshmem, signatures now match backend/api.cuh
 namespace primus_turbo::deep_ep::nvshmem {
 
 #ifndef DISABLE_ROCSHMEM
@@ -40,9 +37,7 @@ std::vector<uint8_t> get_unique_id() {
     return result;
 }
 
-// [agent modifed]: `bool low_latency_mode` -> `const int& team_split_stride`. Upstream passes
-// the NVL peer count when it wants the sub-RDMA team and 0 otherwise, so the stride carries
-// both pieces of information the old boolean did.
+// ROCm: `bool low_latency_mode` -> `const int& team_split_stride`, the NVL peer count or 0
 int init(const std::vector<uint8_t> &root_unique_id_val, const int &rank, const int &num_ranks,
          const int &team_split_stride) {
     rocshmem::rocshmem_uniqueid_t  root_unique_id;
@@ -78,8 +73,7 @@ void free(void *ptr) {
     rocshmem::rocshmem_free(ptr);
 }
 
-// [agent modifed]: rocSHMEM has no on-stream barrier, so both of upstream's flavours collapse
-// onto the blocking host one; the caller already synchronizes the stream around it.
+// ROCm: rocSHMEM has no on-stream barrier, both flavours use the blocking host one
 void barrier(const bool &with_cpu_sync, const std::optional<cudaStream_t> &stream_opt) {
     if (stream_opt.has_value())
         PRIMUS_TURBO_CHECK_HIP(hipStreamSynchronize(stream_opt.value()));
@@ -94,9 +88,7 @@ void finalize() {
     rocshmem::rocshmem_finalize();
 }
 #else
-// [agent modifed]: new -- without rocSHMEM the RDMA path cannot exist, but the legacy buffer
-// still references these symbols, so they resolve to a clear runtime error instead of a
-// link failure. Intranode (`num_rdma_bytes == 0`) never reaches them.
+// ROCm: new, stubs so the RDMA symbols fail at runtime instead of at link time
 [[noreturn]] static void no_rocshmem() {
     PRIMUS_TURBO_CHECK(false and "rocSHMEM is disabled at compile time, the RDMA path is unavailable");
     __builtin_unreachable();

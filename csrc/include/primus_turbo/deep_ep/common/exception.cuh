@@ -1,6 +1,6 @@
 #pragma once
 
-// [agent modifed]: need hipError_t / hipGetErrorName for the checks below
+// ROCm: need hipError_t / hipGetErrorName for the checks below
 #include <hip/hip_runtime.h>
 
 #include <exception>
@@ -45,13 +45,13 @@ public:
     do {                                                                                   \
         if (not(cond)) {                                                                   \
             printf("Assertion failed: %s:%d, condition: %s\n", __FILE__, __LINE__, #cond); \
-            abort(); /* [agent modifed]: asm("trap;") -> abort(), PTX has no AMDGPU form */ \
+            abort(); /* ROCm: asm("trap;") -> abort(), PTX has no AMDGPU form */ \
         }                                                                                  \
     } while (0)
 #endif
 
 #ifndef EP_UNIFIED_ASSERT
-#ifdef __HIP_DEVICE_COMPILE__ // [agent modifed]: __CUDA_ARCH__ -> HIP device pass
+#ifdef __HIP_DEVICE_COMPILE__ // ROCm: __CUDA_ARCH__ -> HIP device pass
 #define EP_UNIFIED_ASSERT(cond) EP_DEVICE_ASSERT(cond)
 #else
 #define EP_UNIFIED_ASSERT(cond) EP_HOST_ASSERT(cond)
@@ -62,7 +62,7 @@ public:
 #define CUDA_RUNTIME_CHECK(cmd) \
 do { \
     const auto e = (cmd); \
-    if (e != hipSuccess) { /* [agent modifed]: cuda* -> hip* runtime API */ \
+    if (e != hipSuccess) { /* ROCm: cuda* -> hip* runtime API */ \
         std::stringstream ss; \
         ss << static_cast<int>(e) << " (" << hipGetErrorName(e) << ", " << hipGetErrorString(e) << ")"; \
         throw EPException("HIP runtime", __FILE__, __LINE__, ss.str()); \

@@ -7,20 +7,16 @@
 #include "launch.cuh"
 #include "utils.cuh"
 
-// [agent modifed]: new -- NVSHMEM -> rocSHMEM for every device-side transfer.
-// setup.py only defines DISABLE_ROCSHMEM when no rocSHMEM install is found; in
-// that case this whole TU compiles away, exactly like the low-latency one.
+// ROCm: new, NVSHMEM -> rocSHMEM, the whole TU compiles away without it
 #ifndef DISABLE_ROCSHMEM
 #include <rocshmem/rocshmem.hpp>
 
-// [agent modifed]: `extern nvshmem_team_t cpu_rdma_team;` at file scope -> the rocSHMEM team
-// declared in the namespace that defines it (deep_ep/runtime.cu). Must stay outside `legacy`,
-// or it declares a second, never-defined `legacy::nvshmem::cpu_rdma_team`.
+// ROCm: cpu_rdma_team -> the rocSHMEM team, declared outside `legacy` where runtime.cu defines it
 namespace primus_turbo::deep_ep::nvshmem {
 extern rocshmem::rocshmem_team_t cpu_rdma_team;
 }
 
-// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep::legacy
+// ROCm: deep_ep::legacy -> primus_turbo::deep_ep::legacy
 namespace primus_turbo::deep_ep::legacy {
 
 namespace internode {
@@ -97,8 +93,7 @@ __forceinline__ __device__ int translate_dst_rdma_rank(const int dst_rdma_rank, 
 
 template <bool kLowLatencyMode>
 __forceinline__ __device__ void nvshmem_sync_with_same_gpu_idx(const rocshmem::rocshmem_team_t& rdma_team) {
-    // [agent modifed]: nvshmem_sync/nvshmem_sync_all -> rocshmem barriers   rocSHMEM has no
-    // quiet-free sync, and its barrier_all does not honour the OpenSHMEM team argument.
+    // ROCm: nvshmem_sync* -> rocshmem barriers, rocSHMEM has no quiet-free team sync
     kLowLatencyMode ? void(rocshmem::rocshmem_ctx_barrier(rocshmem::ROCSHMEM_CTX_DEFAULT, rdma_team))
                     : rocshmem::rocshmem_barrier_all();
 }
@@ -131,7 +126,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
                                 int rank,
                                 const rocshmem::rocshmem_team_t rdma_team) {
     auto sm_id = static_cast<int>(blockIdx.x);
-    // [agent modifed]: 32 -> kWarpSize   wave64 on CDNA; same for every `/ 32` below
+    // ROCm: 32 -> kWarpSize, same for every `/ 32` below
     auto thread_id = static_cast<int>(threadIdx.x), warp_id = thread_id / kWarpSize, lane_id = get_lane_id();
     auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / kWarpSize;
 
@@ -146,9 +141,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
 
         // waiting for all previous inflight wrs to complete,
         // in case of rewriting cleared rdma_buffer
-        // [agent modifed]: the per-QP ibgda_quiet sweep is dropped   rocSHMEM exposes no QP
-        // handle, every kernel that issues puts already quiets its own context before exiting,
-        // and the barrier below quiets whatever is left.
+        // ROCm: the per-QP ibgda_quiet sweep is dropped, rocSHMEM exposes no QP handle
         __syncthreads();
 
         if (thread_id == kWarpSize)
@@ -182,9 +175,8 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         // TODO: overlap EP barrier and NVL cleaning
         for (int i = warp_id; i < kNumRDMARanks; i += num_warps) {
             if (i != rdma_rank) {
-                // [agent modifed]: nvshmemi_ibgda_put_nbi_warp -> scalar rocshmem_int_put_nbi on
-                // lane 0. The wave-collective variant needs a workgroup context this kernel does
-                // not own, and the payload here is only a handful of ints.
+                // ROCm: ibgda_put_nbi_warp -> scalar rocshmem_int_put_nbi on lane 0,
+                // the wave-collective variant needs a workgroup context this kernel lacks
                 if (lane_id == 0)
                     rocshmem::rocshmem_int_put_nbi(rdma_recv_num_tokens_mixed.recv_buffer(rdma_rank),
                                                    rdma_recv_num_tokens_mixed.send_buffer(i),
@@ -203,9 +195,8 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         __syncthreads();
 
         // Wait previous operations to be finished
-        // [agent modifed]: nvshmemi_ibgda_quiet(per QP) -> rocshmem_quiet() on the very lanes that
-        // issued the puts; rocSHMEM only drains the calling thread's context, so the lane set must
-        // match the send loop above rather than upstream's `thread_id < kNumRDMARanks`.
+        // ROCm: per-QP ibgda_quiet -> rocshmem_quiet on the lanes that issued the puts,
+        // rocSHMEM only drains the calling thread's context
         for (int i = warp_id; i < kNumRDMARanks; i += num_warps)
             if (i != rdma_rank and lane_id == 0)
                 rocshmem::rocshmem_quiet();
@@ -255,8 +246,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
                 recv_rdma_rank_prefix_sum[i] = sum;
             }
             if (num_worst_tokens == 0) {
-                // [agent modifed]: empty spin body -> spin_backoff()   same CDNA starvation
-                // as the intranode flag spins (see arch.cuh)
+                // ROCm: empty spin body -> spin_backoff(), same starvation as the intranode spins
                 while (ld_volatile_global(moe_recv_rdma_counter_mapped) != -1)
                     spin_backoff();
                 *moe_recv_rdma_counter_mapped = sum;
@@ -460,11 +450,10 @@ constexpr int get_num_topk_rdma_ranks(int num_rdma_ranks) {
 template <bool kLowLatencyMode,
           int kNumRDMARanks,
           bool kCachedMode,
-          // [agent modifed]: `int kNumTMABytesPerWarp,` dropped -- the TMA staging area it sized
-          // is gone (see the TMA note below), so the parameter had no reader left.
+          // ROCm: `int kNumTMABytesPerWarp,` dropped with the TMA staging area it sized
           int kNumDispatchRDMASenderWarps,
           int kNumTopkRDMARanks = get_num_topk_rdma_ranks(kNumRDMARanks)>
-// [agent modifed]: 32 -> kWarpSize   block geometry follows the wave size
+// ROCm: 32 -> kWarpSize, block geometry follows the wave size
 __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + LEGACY_NUM_MAX_NVL_PEERS) * kWarpSize), 1)
     dispatch(int4* recv_x,
              float* recv_x_scales,
@@ -510,14 +499,11 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + LEGACY_NUM
     const bool is_forwarder = sm_id % 2 == 0;
     const auto rdma_rank = rank / LEGACY_NUM_MAX_NVL_PEERS, nvl_rank = rank % LEGACY_NUM_MAX_NVL_PEERS;
 
-    // [agent modifed]: the ibgda_get_state() QP-count check is dropped, and a per-workgroup
-    // rocSHMEM context takes its place -- that context is what the wave-collective puts below
-    // need, and rocSHMEM never exposes a queue-pair count to check.
+    // ROCm: the ibgda QP-count check -> a per-workgroup rocSHMEM context for the puts below
     __shared__ rocshmem::rocshmem_ctx_t ctx;
     rocshmem::rocshmem_wg_ctx_create(0, &ctx);
 
-    // [agent modifed]: new -- CDNA has no named barriers, so the `barrier.sync <id>` lambdas
-    // below run on the LDS emulation in common/arch.cuh, which needs this one-time setup.
+    // ROCm: new, one-time setup for the LDS named-barrier emulation (arch.cuh)
     sync_barrier_init();
 
     const auto role_meta = [=]() -> std::pair<WarpRole, int> {
@@ -589,15 +575,11 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + LEGACY_NUM
     __shared__ int rdma_send_channel_lock[kNumRDMARanks];
     __shared__ int rdma_send_channel_tail[kNumRDMARanks];
     __shared__ uint32_t rdma_send_channel_window[kNumRDMARanks];
-    // [agent modifed]: barrier.sync -> sync_barrier (LDS emulation); the lambda now captures by
-    // reference because the emulation lives in this scope's shared arrays.
+    // ROCm: barrier.sync -> sync_barrier, the lambda captures by reference for the LDS arrays
     auto sync_rdma_sender_smem = [&]() { sync_barrier(0, (kNumDispatchRDMASenderWarps + 1) * kWarpSize); };
 
     // TMA stuffs
-    // [agent modifed]: the whole TMA staging area is gone. Unlike everywhere else in DeepEP this
-    // path has no DISABLE_SM90_FEATURES fallback, and gfx942/gfx950 have neither cp.async.bulk nor
-    // mbarrier, so the two copies below became plain warp copies (arch.cuh 5). The dynamic shared
-    // memory would not fit anyway: 16 KiB per NVL peer is 128 KiB against a 64 KiB LDS.
+    // ROCm: the TMA staging area is dropped, the two copies below are plain warp copies
 
     // Forward warp synchronization
     __shared__ volatile int forward_channel_head[LEGACY_NUM_MAX_NVL_PEERS][kNumRDMARanks];
@@ -634,8 +616,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + LEGACY_NUM
 
             // Issue RDMA for non-local ranks
             if (dst_rdma_rank != rdma_rank) {
-                // [agent modifed]: nvshmemi_ibgda_put_nbi_warp -> rocshmem_ctx_int_put_nbi_wave.
-                // rocSHMEM picks the queue itself, so the channel/QP argument disappears.
+                // ROCm: ibgda_put_nbi_warp -> rocshmem_ctx_int_put_nbi_wave, no QP argument
                 rocshmem::rocshmem_ctx_int_put_nbi_wave(ctx,
                                                         rdma_channel_meta.recv_buffer(rdma_rank),
                                                         rdma_channel_meta.send_buffer(dst_rdma_rank),
@@ -643,8 +624,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + LEGACY_NUM
                                                         translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank));
             }
         }
-        // [agent modifed]: new -- the meta put must land before the senders start streaming data;
-        // NVSHMEM's ibgda put is ordered against the later ones, rocSHMEM's is not.
+        // ROCm: new, rocSHMEM does not order this meta put against the later data puts
         rocshmem::rocshmem_ctx_quiet(ctx);
         sync_rdma_sender_smem();
 
@@ -696,8 +676,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + LEGACY_NUM
             void* dst_send_buffers[kNumTopkRDMARanks];
             #pragma unroll
             for (int i = 0, slot_idx; i < kNumRDMARanks; ++i)
-                // [agent modifed]: __shfl_sync -> shfl_sync   HIP's masked shuffle adds a
-                // reconvergence loop and a mask assert on every call; see common/arch.cuh 3.
+                // ROCm: __shfl_sync -> shfl_sync, HIP's masked shuffle costs a reconvergence loop
                 if ((slot_idx = shfl_sync(rdma_tail_idx, i)) >= 0) {
                     slot_idx = slot_idx % num_max_rdma_chunked_recv_tokens;
                     topk_ranks[num_topk_ranks] = i;
@@ -804,9 +783,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + LEGACY_NUM
         // Iterate all RDMA ranks
         int last_issued_tail = 0;
         auto start_time = clock64();
-        // [agent modifed]: __any_sync/__all_sync(0xffffffff, ..) -> any_sync/all_sync(kFullWarpMask, ..)
-        // everywhere in this file: the mask has to widen to 64 lanes, and HIP's __*_sync wrappers
-        // carry a reconvergence loop DeepEP's inner loops cannot afford. See common/arch.cuh 3.
+        // ROCm: __any_sync/__all_sync(0xffffffff, ..) -> any_sync/all_sync(kFullWarpMask, ..), file-wide
         while (any_sync(kFullWarpMask, num_tokens_to_send > 0)) {
             // Timeout check
             if (clock64() - start_time > LEGACY_NUM_TIMEOUT_CYCLES and lane_id < kNumRDMARanks) {
@@ -848,9 +825,8 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + LEGACY_NUM
                         reinterpret_cast<uint64_t>(rdma_channel_data.recv_buffer(rdma_rank) + dst_slot_idx * num_bytes_per_token);
                     const auto src_ptr =
                         reinterpret_cast<uint64_t>(rdma_channel_data.send_buffer(dst_rdma_rank) + dst_slot_idx * num_bytes_per_token);
-                    // [agent modifed]: nvshmemi_ibgda_put_nbi_warp -> rocshmem_ctx_schar_put_nbi_wave
-                    // plus an explicit quiet -- rocSHMEM will not order the tail bump below against
-                    // this payload on its own, while IBGDA puts them on the same QP.
+                    // ROCm: ibgda_put_nbi_warp -> rocshmem_ctx_schar_put_nbi_wave plus a quiet,
+                    // rocSHMEM does not order the tail bump below against this payload
                     rocshmem::rocshmem_ctx_schar_put_nbi_wave(ctx,
                                                               reinterpret_cast<signed char*>(dst_ptr),
                                                               reinterpret_cast<const signed char*>(src_ptr),
@@ -867,8 +843,8 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + LEGACY_NUM
                 if (lane_id == dst_rdma_rank) {
                     last_issued_tail += num_tokens_to_issue;
                     num_tokens_to_send -= num_tokens_to_issue;
-                    // [agent modifed]: nvshmemi_ibgda_amo_nonfetch_add -> rocshmem_ctx_ulong_atomic_add.
-                    // rocSHMEM routes a self-targeted atomic locally, so the `is_local_copy` flag goes.
+                    // ROCm: ibgda_amo_nonfetch_add -> rocshmem_ctx_ulong_atomic_add, which routes
+                    // a self-targeted atomic locally, so `is_local_copy` goes
                     rocshmem::rocshmem_ctx_ulong_atomic_add(ctx,
                                                             rdma_channel_tail.buffer(rdma_rank),
                                                             num_tokens_to_issue,
@@ -1014,9 +990,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + LEGACY_NUM
                 auto dst_shifted = nvl_channel_x.buffer() + dst_slot_idx * num_bytes_per_token;
 
                 // Copy data
-                // [agent modifed]: TMA round trip -> UNROLLED_WARP_COPY   same bytes, staged in
-                // registers instead of shared memory. `num_bytes_per_token` is int4-aligned by
-                // construction (see get_num_bytes_per_token).
+                // ROCm: TMA round trip -> UNROLLED_WARP_COPY, staged in registers instead of LDS
                 UNROLLED_WARP_COPY(5,
                                    lane_id,
                                    num_bytes_per_token / static_cast<int>(sizeof(int4)),
@@ -1047,9 +1021,8 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + LEGACY_NUM
             forward_channel_retired[dst_nvl_rank] = true;
     } else if (warp_role == WarpRole::kForwarderCoordinator and target_rank == 0) {
         // Extra warps for forwarder coordinator should exit directly
-        // [agent modifed]: `if (target_rank > 0) return;` -> folded into the branch condition.
-        // rocshmem_wg_ctx_destroy at the end of the kernel is a workgroup collective, so no wave
-        // may leave early any more.
+        // ROCm: `if (target_rank > 0) return;` folded into the condition, the ctx destroy
+        // at the end of the kernel is a workgroup collective
 
         // Forward warp coordinator
         EP_STATIC_ASSERT(kNumRDMARanks <= kWarpSize, "Invalid number of RDMA peers");
@@ -1077,7 +1050,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + LEGACY_NUM
             // Update remote head
             if (min_head != std::numeric_limits<int>::max() and min_head >= last_head + num_max_rdma_chunked_send_tokens and
                 lane_id < kNumRDMARanks) {
-                // [agent modifed]: nvshmemi_ibgda_amo_nonfetch_add -> rocshmem_ctx_ulong_atomic_add
+                // ROCm: ibgda_amo_nonfetch_add -> rocshmem_ctx_ulong_atomic_add
                 rocshmem::rocshmem_ctx_ulong_atomic_add(ctx,
                                                         rdma_channel_head.buffer(rdma_rank),
                                                         min_head - last_head,
@@ -1086,7 +1059,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + LEGACY_NUM
             }
 
             // Nanosleep and let other warps work
-            // [agent modifed]: __nanosleep -> nanosleep (s_sleep); see common/arch.cuh 2
+            // ROCm: __nanosleep -> nanosleep (s_sleep), see common/arch.cuh
             nanosleep(LEGACY_NUM_WAIT_NANOSECONDS);
         }
     } else {
@@ -1166,9 +1139,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + LEGACY_NUM
                 (lane_id == meta.src_rdma_rank) ? (total_offset += 1) : 0;
 
                 // Copy data
-                // [agent modifed]: TMA round trip -> UNROLLED_WARP_COPY. With the shared-memory
-                // staging gone the `scale_aligned` fast path has nothing left to fuse, so scales
-                // always take the plain copy below.
+                // ROCm: TMA round trip -> UNROLLED_WARP_COPY, so scales always take the plain copy
                 UNROLLED_WARP_COPY(5,
                                    lane_id,
                                    hidden_int4,
@@ -1217,8 +1188,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + LEGACY_NUM
     }
 
     // Clean unused `recv_topk_idx` as -1
-    // [agent modifed]: `if (is_forwarder) return;` -> folded into the condition, same reason as
-    // the forwarder coordinator above.
+    // ROCm: `if (is_forwarder) return;` folded into the condition, see the coordinator above
     if (num_worst_tokens > 0 and not is_forwarder) {
         // get the actual number of num_recv_tokens on the current rank
         int num_recv_tokens = recv_gbl_rank_prefix_sum[num_ranks - 1];
@@ -1232,7 +1202,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + LEGACY_NUM
             recv_topk_idx[i] = -1;
     }
 
-    // [agent modifed]: new -- release the per-workgroup rocSHMEM context created at entry
+    // ROCm: new, release the per-workgroup rocSHMEM context created at entry
     rocshmem::rocshmem_wg_ctx_destroy(&ctx);
 }
 
@@ -1275,8 +1245,7 @@ void dispatch(void* recv_x,
               int num_channels,
               bool low_latency_mode) {
     constexpr int kNumDispatchRDMASenderWarps = 7;
-    // [agent modifed]: the kNumTMABytesPerWarp / smem_size pair is dropped along with the TMA
-    // staging area; 16 KiB per NVL peer is 128 KiB against a 64 KiB LDS anyway.
+    // ROCm: the kNumTMABytesPerWarp / smem_size pair is dropped with the TMA staging area
 
     // Make sure never OOB
     EP_HOST_ASSERT(static_cast<int64_t>(num_scales) * scale_hidden_stride < std::numeric_limits<int>::max());
@@ -1335,7 +1304,7 @@ void dispatch(void* recv_x,
 #undef DISPATCH_LAUNCH_CASE
 }
 
-// [agent modifed]: `int kNumTMABytesPerWarp` dropped together with the TMA batching below
+// ROCm: `int kNumTMABytesPerWarp` dropped with the TMA batching below
 template <bool kLowLatencyMode>
 __global__ void cached_notify(const int rdma_clean_offset,
                               const int rdma_num_int_clean,
@@ -1353,12 +1322,12 @@ __global__ void cached_notify(const int rdma_clean_offset,
                               int rank,
                               int num_ranks,
                               bool is_cached_dispatch,
-                              // [agent modifed]: nvshmem_team_t -> rocshmem::rocshmem_team_t
+                              // ROCm: nvshmem_team_t -> rocshmem::rocshmem_team_t
                               const rocshmem::rocshmem_team_t rdma_team) {
     auto sm_id = static_cast<int>(blockIdx.x);
     auto thread_id = static_cast<int>(threadIdx.x);
     auto num_threads = static_cast<int>(blockDim.x);
-    // [agent modifed]: 32 -> kWarpSize
+    // ROCm: 32 -> kWarpSize
     auto num_warps = num_threads / kWarpSize;
     auto warp_id = thread_id / kWarpSize;
     auto lane_id = get_lane_id();
@@ -1369,13 +1338,11 @@ __global__ void cached_notify(const int rdma_clean_offset,
 
     // Using two SMs, which clean the RDMA/NVL buffer respectively
     if (sm_id == 0) {
-        // [agent modifed]: the per-QP nvshmemi_ibgda_quiet sweep is dropped -- rocSHMEM exposes no
-        // queue pairs, the dispatch/combine kernels already quiet their own contexts before exiting,
-        // and the rocSHMEM barrier below drains whatever is left.
+        // ROCm: the per-QP ibgda_quiet sweep is dropped, rocSHMEM exposes no queue pairs
         __syncthreads();
 
         // Barrier for RDMA
-        // [agent modifed]: 32 -> kWarpSize   (same rewrite on the second barrier below)
+        // ROCm: 32 -> kWarpSize (same rewrite on the second barrier below)
         if (thread_id == kWarpSize)
             nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
 
@@ -1404,7 +1371,7 @@ __global__ void cached_notify(const int rdma_clean_offset,
             return;
 
         EP_DEVICE_ASSERT(num_warps >= num_channels);
-        // [agent modifed]: 32 -> kWarpSize   one lane per RDMA rank
+        // ROCm: 32 -> kWarpSize, one lane per RDMA rank
         EP_DEVICE_ASSERT(num_rdma_ranks <= kWarpSize);
 
         // Iterate in reverse order
@@ -1431,10 +1398,7 @@ __global__ void cached_notify(const int rdma_clean_offset,
         EP_DEVICE_ASSERT(rdma_channel_prefix_matrix != nullptr and rdma_rank_prefix_sum != nullptr);
         EP_STATIC_ASSERT(LEGACY_NUM_MAX_NVL_PEERS <= kWarpSize, "Too many NVL peers");
 
-        // [agent modifed]: the TMA batch staging (tma_load_1d -> patch in LDS -> tma_store_1d) is
-        // replaced by the plain in-place global walk. gfx942/gfx950 have neither cp.async.bulk nor
-        // mbarrier, and unlike the rest of DeepEP this path carries no DISABLE_SM90_FEATURES
-        // fallback; the loop only touches one int per lane per token, so staging buys nothing.
+        // ROCm: the TMA batch staging -> a plain in-place global walk
         if (lane_id < LEGACY_NUM_MAX_NVL_PEERS and warp_id < num_channels) {
             for (int dst_rdma_rank = sm_id - 2; dst_rdma_rank < num_rdma_ranks; dst_rdma_rank += num_channels * 2 - 2) {
                 // Iterate in reverse order
@@ -1480,8 +1444,7 @@ void cached_notify(int hidden_int4,
                    int64_t num_nvl_bytes,
                    bool is_cached_dispatch,
                    bool low_latency_mode) {
-    // [agent modifed]: 32 -> kWarpSize, and the TMA byte budget is dropped. `num_warps` was only
-    // read by smem_size, so it goes too.
+    // ROCm: 32 -> kWarpSize, and the TMA byte budget goes with `num_warps`
     const int num_threads = std::max(128, kWarpSize * num_channels);
     const auto num_rdma_ranks = num_ranks / LEGACY_NUM_MAX_NVL_PEERS;
 
@@ -1527,11 +1490,10 @@ void cached_notify(int hidden_int4,
                   nvshmem::cpu_rdma_team);
 }
 
-// [agent modifed]: kUseTMA / kNumStages / kNumTMALoadBytes and the smem_ptr + tma_phase arguments
-// are dropped along with the TMA reduction below; every caller now takes the plain branch that
-// upstream already provides. See the note at the reduction itself.
-// [agent modifed]: combine_token and combine below run on emulated 32-lane warps (arch.cuh 1), so
-// every literal 32 in them becomes kEmulatedWarpSize and every shuffle carries that width.
+// ROCm: the kUseTMA parameters and the smem_ptr + tma_phase arguments are dropped with
+// the TMA reduction below, every caller takes upstream's plain branch.
+// ROCm: combine_token and combine run on emulated 32-lane warps, so every literal 32
+// in them becomes kEmulatedWarpSize.
 template <int kNumRanks,
           bool kMaybeWithBias,
           typename dtype_t,
@@ -1563,9 +1525,8 @@ __device__ int combine_token(bool is_token_in_rank,
             topk_ranks[num_topk_ranks++] = i;
         }
     EP_DEVICE_ASSERT(num_topk_ranks <= kMaxNumRanks);
-    // [agent modifed]: the `if constexpr (kUseTMA)` reduction (a two-stage tma_load_1d prefetch
-    // into LDS plus a tma_store_1d writeback) is deleted rather than disabled -- gfx942/gfx950 have
-    // neither cp.async.bulk nor mbarrier, and even a discarded constexpr branch has to name them.
+    // ROCm: the `if constexpr (kUseTMA)` reduction is deleted, a discarded constexpr
+    // branch would still have to name cp.async.bulk and mbarrier
 
     // Reduce data
     {
@@ -1633,7 +1594,7 @@ template <bool kLowLatencyMode,
           int kNumRDMARanks,
           typename dtype_t,
           int kNumCombineForwarderWarps,
-          // [agent modifed]: the two kNumTMABytes* parameters are dropped with the TMA staging
+          // ROCm: the two kNumTMABytes* parameters are dropped with the TMA staging
           int kNumTopkRDMARanks = get_num_topk_rdma_ranks(kNumRDMARanks),
           int kNumWarpsPerForwarder = (kNumCombineForwarderWarps / kNumRDMARanks > 0) ? kNumCombineForwarderWarps / kNumRDMARanks : 1,
           int kNumForwarders = kNumRDMARanks* kNumWarpsPerForwarder,
@@ -1668,7 +1629,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * kEmulatedWarpSize, 1) c
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / kEmulatedWarpSize;
     const auto thread_id = static_cast<int>(threadIdx.x), lane_id = get_emulated_lane_id();
-    // [agent modifed]: new -- ballot mask of this thread's 32-lane group, replacing 0xffffffff
+    // ROCm: new, ballot mask of this thread's 32-lane group, replacing 0xffffffff
     const auto warp_mask = emulated_warp_mask();
     const auto num_channels = static_cast<int>(gridDim.x) / 2, channel_id = sm_id / 2;
     const bool is_forwarder_sm = sm_id % 2 == 1;
@@ -1679,8 +1640,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * kEmulatedWarpSize, 1) c
     const auto hidden_bytes = hidden_int4 * sizeof(int4);
     const auto num_bytes_per_token = get_num_bytes_per_token(hidden_int4, 0, 0, num_topk);
 
-    // [agent modifed]: new -- rocSHMEM context and the LDS named-barrier emulation, both workgroup
-    // collectives, so they have to be set up before the warps take on their roles.
+    // ROCm: new, both are workgroup collectives, so they precede the warp role split
     __shared__ rocshmem::rocshmem_ctx_t ctx;
     rocshmem::rocshmem_wg_ctx_create(0, &ctx);
     sync_barrier_init();
@@ -1733,8 +1693,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * kEmulatedWarpSize, 1) c
         auto nvl_channel_tail = AsymBuffer<int>(dst_buffer_ptr, kNumRDMARanks, LEGACY_NUM_MAX_NVL_PEERS, channel_id, num_channels, nvl_rank)
                                     .advance_also(local_buffer_ptr);
 
-        // [agent modifed]: the per-sender TMA staging buffer is gone; the token is copied
-        // global -> global below instead of global -> LDS -> global.
+        // ROCm: the per-sender TMA staging buffer is dropped, the token is copied global -> global
 
         // Get tasks for each RDMA lane
         int token_start_idx = 0, token_end_idx = 0;
@@ -1812,8 +1771,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * kEmulatedWarpSize, 1) c
                     // Load data
                     auto shifted_x_buffers = nvl_channel_x.buffer() + dst_slot_idx * num_bytes_per_token;
                     auto shifted_x = x + token_idx * hidden_int4;
-                    // [agent modifed]: TMA round trip -> direct global copy; the staging buffer only
-                    // existed to batch the store, and the meta/weight tails are written in place.
+                    // ROCm: TMA round trip -> direct global copy
                     UNROLLED_WARP_COPY_EMULATED(5, lane_id, hidden_int4, reinterpret_cast<int4*>(shifted_x_buffers),
                                                 shifted_x, ld_nc_global, st_na_global);
 
@@ -1831,7 +1789,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * kEmulatedWarpSize, 1) c
             }
 
             // Move queue tail
-            // [agent modifed]: tma_store_wait -> wait_all_vmem   the copies above are plain stores now
+            // ROCm: tma_store_wait -> wait_all_vmem, the copies above are plain stores now
             wait_all_vmem();
             __syncwarp();
             if (lane_id < kNumRDMARanks and is_lane_ready)
@@ -1866,8 +1824,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * kEmulatedWarpSize, 1) c
         __shared__ volatile bool forwarder_retired[kNumForwarders];
         __shared__ volatile int rdma_receiver_rdma_head[kNumRDMAReceivers][kNumRDMARanks];
         __shared__ volatile bool rdma_receiver_retired[kNumRDMAReceivers];
-        // [agent modifed]: barrier.sync -> sync_barrier (LDS emulation, common/arch.cuh 4); the
-        // lambdas capture by reference because the emulation lives in this kernel's shared arrays.
+        // ROCm: barrier.sync -> sync_barrier, the lambdas capture by reference for the LDS arrays
         auto sync_forwarder_smem = [&]() { sync_barrier(0, (kNumForwarders + 1) * kEmulatedWarpSize); };
         auto sync_rdma_receiver_smem = [&]() { sync_barrier(1, (kNumRDMAReceivers + 1) * kEmulatedWarpSize); };
 
@@ -1882,14 +1839,13 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * kEmulatedWarpSize, 1) c
                 if (kNumWarpsPerForwarder == 1) {
                     __syncwarp();
                 } else {
-                    // [agent modifed]: bar.sync -> sync_barrier; ids 2.. are per destination RDMA rank
+                    // ROCm: bar.sync -> sync_barrier, ids 2.. are per destination RDMA rank
                     sync_barrier(dst_rdma_rank + 2, kNumWarpsPerForwarder * kEmulatedWarpSize);
                 }
             };
             EP_STATIC_ASSERT(kNumWarpsPerForwarder == 1 or kNumRDMARanks + 2 <= 16, "Barriers are not enough");
 
-            // [agent modifed]: the forwarder's TMA staging area is gone; combine_token now
-            // reduces straight out of the NVL buffers.
+            // ROCm: the forwarder's TMA staging area is dropped, combine_token reduces from NVL
 
             // Advance to the corresponding NVL buffer
             nvl_channel_x.advance(dst_rdma_rank * num_max_nvl_chunked_recv_tokens_per_rdma * num_bytes_per_token);
@@ -2018,9 +1974,8 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * kEmulatedWarpSize, 1) c
                             reinterpret_cast<uint64_t>(rdma_channel_data.recv_buffer(rdma_rank) + rdma_slot_idx * num_bytes_per_token);
                         const auto src_ptr =
                             reinterpret_cast<uint64_t>(rdma_channel_data.send_buffer(dst_rdma_rank) + rdma_slot_idx * num_bytes_per_token);
-                        // [agent modifed]: nvshmemi_ibgda_put_nbi_warp -> scalar
-                        // rocshmem_ctx_schar_put_nbi on lane 0 plus a quiet. The wave-collective
-                        // variant is off limits here: a forwarder warp is only half a wave.
+                        // ROCm: ibgda_put_nbi_warp -> scalar rocshmem_ctx_schar_put_nbi on lane 0
+                        // plus a quiet, a forwarder warp is only half a wave
                         if (lane_id == 0)
                             rocshmem::rocshmem_ctx_schar_put_nbi(ctx, reinterpret_cast<signed char*>(dst_ptr),
                                                                  reinterpret_cast<const signed char*>(src_ptr), num_bytes_per_msg,
@@ -2032,8 +1987,8 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * kEmulatedWarpSize, 1) c
 
                     // Write new RDMA tail
                     __syncwarp();
-                    // [agent modifed]: nvshmemi_ibgda_amo_nonfetch_add -> rocshmem_ctx_ulong_atomic_add,
-                    // and elect_one_sync (physical lane 0) -> lane_id == 0 (emulated lane 0).
+                    // ROCm: ibgda_amo_nonfetch_add -> rocshmem_ctx_ulong_atomic_add, and
+                    // elect_one_sync -> emulated lane 0
                     if (lane_id == 0) {
                         rocshmem::rocshmem_ctx_ulong_atomic_add(ctx, rdma_channel_tail.buffer(rdma_rank), num_chunked_tokens,
                                                                 translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank));
@@ -2043,7 +1998,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * kEmulatedWarpSize, 1) c
 
             // Retired
             __syncwarp();
-            // [agent modifed]: elect_one_sync (physical lane 0) -> emulated lane 0
+            // ROCm: elect_one_sync (physical lane 0) -> emulated lane 0
             if (lane_id == 0)
                 forwarder_retired[warp_id] = true;
         } else if (warp_role == WarpRole::kRDMAReceiver) {
@@ -2148,7 +2103,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * kEmulatedWarpSize, 1) c
                             min_head = min(min_head, rdma_receiver_rdma_head[i][dst_rdma_rank]);
                     if (min_head != std::numeric_limits<int>::max() and min_head >= last_rdma_head + num_max_rdma_chunked_send_tokens and
                         lane_id < kNumRDMARanks) {
-                        // [agent modifed]: nvshmemi_ibgda_amo_nonfetch_add -> rocshmem_ctx_ulong_atomic_add
+                        // ROCm: ibgda_amo_nonfetch_add -> rocshmem_ctx_ulong_atomic_add
                         rocshmem::rocshmem_ctx_ulong_atomic_add(ctx, rdma_channel_head.buffer(rdma_rank),
                                                                 min_head - last_rdma_head,
                                                                 translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank));
@@ -2169,13 +2124,13 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * kEmulatedWarpSize, 1) c
                 }
 
                 // Nanosleep and let other warps work
-                // [agent modifed]: __nanosleep -> nanosleep (s_sleep); see common/arch.cuh 2
+                // ROCm: __nanosleep -> nanosleep (s_sleep), see common/arch.cuh
             nanosleep(LEGACY_NUM_WAIT_NANOSECONDS);
             }
         }
     }
 
-    // [agent modifed]: new -- release the per-workgroup rocSHMEM context created at entry
+    // ROCm: new, release the per-workgroup rocSHMEM context created at entry
     rocshmem::rocshmem_wg_ctx_destroy(&ctx);
 }
 
@@ -2208,10 +2163,8 @@ void combine(cudaDataType_t type,
              cudaStream_t stream,
              int num_channels,
              bool low_latency_mode) {
-    // [agent modifed]: 24 -> 16 forwarder warps, and the TMA byte budgets are dropped. A block is
-    // (kNumForwarders + 1) emulated warps; 25 of them would be 25 * 32 = 800 threads only because
-    // the warps are half-waves, and 24 leaves kNumWarpsPerForwarder odd (3) at 8 RDMA ranks, which
-    // would let one physical wave straddle two sync_large_warp groups. 16 keeps it even (or 1).
+    // ROCm: 24 -> 16 forwarder warps, 24 leaves kNumWarpsPerForwarder odd at 8 RDMA ranks
+    // and lets one physical wave straddle two sync_large_warp groups
     constexpr int kNumCombineForwarderWarps = 16;
 
 #define COMBINE_LAUNCH_CASE(num_rdma_ranks)                                           \
@@ -2259,7 +2212,7 @@ void combine(cudaDataType_t type,
                    std::max(num_max_rdma_chunked_send_tokens, num_max_nvl_chunked_send_tokens));
     EP_HOST_ASSERT(num_max_nvl_chunked_recv_tokens / num_rdma_ranks - num_warps_per_forwarder >= num_max_nvl_chunked_send_tokens);
     EP_HOST_ASSERT(num_max_rdma_chunked_send_tokens >= num_warps_per_forwarder);
-    // [agent modifed]: CUDA_R_16BF -> HIP_R_16BF (see launch.cuh SWITCH_TYPES)
+    // ROCm: CUDA_R_16BF -> HIP_R_16BF (see launch.cuh SWITCH_TYPES)
     EP_HOST_ASSERT(type == HIP_R_16BF);
 
     SETUP_LAUNCH_CONFIG(num_channels * 2, (num_forwarder_warps + 1) * kEmulatedWarpSize, stream);
@@ -2269,7 +2222,7 @@ void combine(cudaDataType_t type,
 
 }  // namespace internode
 
-// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep::legacy, closed by the rocSHMEM gate
+// ROCm: deep_ep::legacy -> primus_turbo::deep_ep::legacy, closed by the rocSHMEM gate
 }  // namespace primus_turbo::deep_ep::legacy
 
 #endif  // DISABLE_ROCSHMEM

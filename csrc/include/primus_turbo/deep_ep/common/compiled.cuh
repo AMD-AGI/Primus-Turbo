@@ -1,8 +1,6 @@
 #pragma once
 
-// [agent modifed]: new -- ROCm can only take upstream's non-SM90 branch (no TMA,
-// no mbarrier, no cluster launch). Defining it here rather than in setup.py keeps
-// the switch next to the aliases it belongs with, and picks up every legacy TU.
+// ROCm: new, force upstream's non-SM90 branch for every legacy TU
 #ifndef DISABLE_SM90_FEATURES
 #define DISABLE_SM90_FEATURES
 #endif
@@ -32,46 +30,39 @@
 #endif
 
 #include <cstdint>
-// [agent modifed]: cuda_bf16.h/cuda_runtime.h -> HIP equivalents
+// ROCm: cuda_bf16.h/cuda_runtime.h -> HIP equivalents
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp8.h>
 #include <hip/hip_runtime.h>
 
-// [agent modifed]: new block -- the CUDA vocabulary the legacy sources use.
-// The torch ROCm CUDAExtension auto-hipifies the whole csrc/ tree, so almost every
-// CUDA spelling (cudaStream_t, cudaIpc*, __nv_bfloat16, ...) is already translated for
-// free; aliasing them here is worse than useless, because hipify rewrites the macro's
-// own left-hand side too and `#define hipGetDeviceProperties hipGetDeviceProperties`
-// clobbers HIP's own R0600 remap. Only the names hipify does NOT know stay below.
+// ROCm: new, alias only the CUDA spellings hipify does not translate
 #ifndef PRIMUS_TURBO_DEEPEP_NO_CUDA_ALIASES
-// bf16 vocabulary: hipify maps the `__nv_` prefixed spellings, not the bare ones.
 using nv_bfloat16  = __hip_bfloat16;
 using nv_bfloat162 = __hip_bfloat162;
 #endif
 
-// [agent modifed]: DISABLE_SM90_FEATURES branch is the only one ROCm can take
-// (no FP8 conversion intrinsics, no TMA); keep upstream's fallback typedefs.
+// ROCm: keep upstream's DISABLE_SM90_FEATURES fallback typedefs
 #define __NV_E4M3 0
 #define __NV_E5M2 1
 typedef int     __nv_fp8_interpretation_t;
 typedef int     __nv_fp8x4_e4m3;
 typedef uint8_t __nv_fp8_storage_t;
 
-// [agent modifed]: CUDART_VERSION>=13000 branch is CUDA-only; keep the struct
+// ROCm: CUDART_VERSION>=13000 branch is CUDA-only; keep the struct
 struct alignas(32) longlong4_t { long long x, y, z, w; };
 __device__ __forceinline__ longlong4_t make_longlong4_t(
     const long long& x, const long long& y, const long long& z, const long long& w) {
     return {x, y, z, w};
 }
 
-// [agent modifed]: pull in the arch traits (wave size, named barrier, waitcnt)
+// ROCm: pull in the arch traits (wave size, named barrier, waitcnt)
 #include <primus_turbo/deep_ep/common/arch.cuh>
 
 #ifndef EP_NUM_TOPK_IDX_BITS
 #define EP_NUM_TOPK_IDX_BITS 64
 #endif
 
-// [agent modifed]: deep_ep -> primus_turbo::deep_ep
+// ROCm: deep_ep -> primus_turbo::deep_ep
 namespace primus_turbo::deep_ep {
 
 #ifndef DISABLE_SM90_FEATURES

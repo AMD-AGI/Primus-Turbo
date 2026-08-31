@@ -5,14 +5,11 @@
  **************************************************************************************************/
 
 #pragma once
-// [agent modifed]: deep_ep/utils.cuh moved under deep_ep/legacy/ with the legacy copy, and it
-// now expects the legacy constants (LEGACY_*) from its sibling header instead of the caller.
+// ROCm: deep_ep/utils.cuh moved under deep_ep/legacy/ and now needs its sibling header
 #include "../deep_ep/legacy/compiled.cuh"
 #include "../deep_ep/legacy/utils.cuh"
 
-// [agent modifed]: the deep_ep primitives moved into primus_turbo::deep_ep (arch bits) and
-// primus_turbo::deep_ep::legacy (utils.cuh); re-expose both so the moe_permute kernels keep
-// referring to kWarpSize / UNROLLED_WARP_COPY unqualified.
+// ROCm: re-expose both deep_ep namespaces so the kernels below stay unqualified
 namespace primus_turbo {
 using namespace deep_ep;
 using namespace deep_ep::legacy;

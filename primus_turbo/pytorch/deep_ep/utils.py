@@ -2,7 +2,7 @@ import torch
 import torch.distributed as dist
 from typing import Any, Optional, Tuple, Callable
 
-# [agent modifed]: deep_ep._C -> the Turbo extension's deep_ep submodule
+# ROCm: deep_ep._C -> the Turbo extension's deep_ep submodule
 # noinspection PyUnresolvedReferences
 from primus_turbo.pytorch._C.deep_ep import EventHandle
 
@@ -98,10 +98,7 @@ class EventOverlap:
         self._release_handle_by_call = False
 
 
-# [agent modifed]: upstream keeps these two in `deep_ep/utils/envs.py`, which is not copied here
-# (it pulls in the NCCL comm handle and the NVML/ibstat probes). Only the two checks the legacy
-# buffer calls are ported, and the NVLink one keeps the Turbo port's no-op body -- xGMI P2P is
-# not queryable through pynvml.
+# ROCm: only the two checks the legacy buffer calls are ported from upstream envs.py
 def check_nvlink_connections(group: dist.ProcessGroup) -> None:
     """
     Check NVLink connection between every pair of GPUs.

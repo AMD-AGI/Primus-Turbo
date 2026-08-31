@@ -3,12 +3,12 @@ import torch
 import torch.distributed as dist
 from typing import Callable, List, Tuple, Optional, Union
 
-# [agent modifed]: deep_ep._C -> the Turbo extension's deep_ep submodule
+# ROCm: deep_ep._C -> the Turbo extension's deep_ep submodule
 # noinspection PyUnresolvedReferences
 import primus_turbo.pytorch._C.deep_ep as _C
 # noinspection PyUnresolvedReferences
 from primus_turbo.pytorch._C.deep_ep import Config, EventHandle
-# [agent modifed]: upstream's utils/ package is a single utils.py here (see the note in it)
+# ROCm: upstream's utils/ package is a single utils.py here
 from ..utils import EventOverlap, check_nvlink_connections, check_torch_deterministic
 
 

@@ -1,10 +1,7 @@
 #pragma once
 
-// [agent modifed]: cut-down port of upstream `csrc/kernels/backend/api.cuh`. Upstream also
-// declares the NCCL symmetric-memory context and the CUDA-driver batched write/wait helpers
-// there; the legacy buffer only ever calls the six entry points below, and the rest would drag
-// in <nccl_device.h> plus the JIT runtime. The `nvshmem` spelling is kept so the legacy host
-// sources stay verbatim -- the bodies live in ../runtime.cu and talk to rocSHMEM.
+// ROCm: cut-down port of upstream backend/api.cuh, only the six entry points the
+// legacy buffer calls. The `nvshmem` spelling stays, the bodies are in ../runtime.cu.
 
 #include <cstddef>
 #include <cstdint>

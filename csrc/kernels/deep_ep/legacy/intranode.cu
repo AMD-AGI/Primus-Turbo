@@ -3,7 +3,7 @@
 #include "launch.cuh"
 #include "utils.cuh"
 
-// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep::legacy
+// ROCm: deep_ep::legacy -> primus_turbo::deep_ep::legacy
 namespace primus_turbo::deep_ep::legacy {
 
 namespace intranode {
@@ -18,7 +18,7 @@ void barrier(int** barrier_signal_ptrs, int rank, int num_ranks, cudaStream_t st
 LAUNCH_KERNEL(&cfg, barrier<ranks>, barrier_signal_ptrs, rank); \
 break
 
-    // [agent modifed]: 32 -> kWarpSize   one wave, whatever a wave is here
+    // ROCm: 32 -> kWarpSize
     SETUP_LAUNCH_CONFIG(1, kWarpSize, stream);
     SWITCH_RANKS(BARRIER_LAUNCH_CASE);
 #undef BARRIER_LAUNCH_CASE
@@ -42,7 +42,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
                                 int rank) {
     auto sm_id = static_cast<int>(blockIdx.x);
     auto thread_id = static_cast<int>(threadIdx.x), num_threads = static_cast<int>(blockDim.x);
-    // [agent modifed]: 32 -> kWarpSize
+    // ROCm: 32 -> kWarpSize
     auto lane_id = thread_id % kWarpSize, warp_id = thread_id / kWarpSize, num_warps = num_threads / kWarpSize;
 
     if (sm_id == 0) {
@@ -59,11 +59,8 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         //  - `per_rank_buffer[rank][i, j]` means the number of tokens from rank i to rank j
         //  - `per_expert_buffer[rank][i, j]` means the number of tokens from rank i to local expert j
         int num_experts_per_rank = num_experts / kNumRanks;
-        // [agent modifed]: plain stores -> st_na_global. These land in a *peer's* comm
-        // buffer; upstream relies on the `sys` fence in the barrier below to push them out
-        // of L2, and this port has no such fence (AGENT_CONTEXT.md R5), so the store itself
-        // has to carry `sc0 sc1`. Same for every access to this buffer further down --
-        // mixing a plain write with a bypassing read would read straight past it.
+        // ROCm: plain stores -> st_na_global, every access to a peer's comm buffer
+        // must carry `sc0 sc1` or a bypassing reader reads straight past it
         if (thread_id < kNumRanks) {
             st_na_global(per_rank_buffer + rank * kNumRanks + thread_id, num_tokens_per_rank[thread_id]);
             #pragma unroll
@@ -97,8 +94,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             sum = (sum + expert_alignment - 1) / expert_alignment * expert_alignment;
             moe_recv_expert_counter_mapped[thread_id] = sum;
         }
-        // [agent modifed]: __syncthreads() -> sync_threads_global(); the reads below take
-        // `local_per_rank_buffer` from other waves, which the plain barrier does not retire.
+        // ROCm: __syncthreads() -> sync_threads_global, the reads below take other waves' stores
         sync_threads_global();
 
         // Copy rank size prefix matrix to another tensor
@@ -121,16 +117,14 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
 
             // Iterate over tokens
             int count = 0;
-            // [agent modifed]: 32 -> kWarpSize
+            // ROCm: 32 -> kWarpSize
             for (int64_t i = token_start_idx + lane_id; i < token_end_idx; i += kWarpSize)
                 count += is_token_in_rank[i * kNumRanks + dst_rank];
             count = warp_reduce_sum(count);
             if (elect_one_sync())
                 channel_prefix_matrix[dst_rank * num_channels + channel_id] = count;
         }
-        // [agent modifed]: __syncthreads() -> sync_threads_global(); thread 0 reads back the
-        // per-channel counts other waves just stored to *global* memory, and the plain
-        // barrier leaves those stores in flight, giving a stale prefix sum.
+        // ROCm: __syncthreads() -> sync_threads_global, thread 0 reads other waves' global stores
         sync_threads_global();
 
         // Pre-compute prefix sum for all channels
@@ -198,8 +192,7 @@ __global__ void cached_notify_dispatch(
     auto thread_id = static_cast<int>(threadIdx.x), num_threads = static_cast<int>(blockDim.x);
     auto ptr = static_cast<int*>(buffer_ptrs[rank]);
     #pragma unroll
-    // [agent modifed]: plain stores -> st_na_global. Peers read this queue with `sc0 sc1`
-    // loads, which bypass L2, so a plain store left there would never be seen.
+    // ROCm: plain stores -> st_na_global, peers read this queue with `sc0 sc1` loads
     for (int i = thread_id; i < kNumRanks * kNumRanks; i += num_threads)
         st_na_global(ptr + i, rank_prefix_matrix[i]);
     #pragma unroll
@@ -266,7 +259,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
 
     int num_experts_per_rank = num_experts / kNumRanks;
     EP_DEVICE_ASSERT(num_experts_per_rank > 0 or num_topk == 0);
-    // [agent modifed]: 32 -> kWarpSize   the bound is "one lane per topk slot"
+    // ROCm: 32 -> kWarpSize, one lane per topk slot
     EP_DEVICE_ASSERT(num_topk <= kWarpSize);
     EP_DEVICE_ASSERT((topk_idx == nullptr) == (topk_weights == nullptr));
     EP_DEVICE_ASSERT((recv_topk_idx == nullptr) == (recv_topk_weights == nullptr));
@@ -325,13 +318,12 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
     __syncwarp();
 #endif
 
-    // [agent modifed]: new -- CDNA has no named barriers, so `bar.sync <id>` below runs on
-    // the LDS counter emulation in common/arch.cuh, which needs this one-time setup.
+    // ROCm: new, one-time setup for the LDS named-barrier emulation (arch.cuh)
     sync_barrier_init();
 
     if (is_sender) {
         // Workers for sending
-        // [agent modifed]: 32 -> kWarpSize (this block)
+        // ROCm: 32 -> kWarpSize (this block)
         constexpr int num_send_warps = kNumThreads / kWarpSize;
         constexpr int num_send_warps_per_rank = num_send_warps / kNumRanks;
         const auto send_thread_id = thread_id;
@@ -359,9 +351,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
             // Check destination queue emptiness, or wait a buffer to be released (rare cases)
             // NOTES: the head index received by different warps may not be the same
             auto start_time = clock64();
-            // [agent modifed]: `elect_one_sync()` -> `lane_id == 0` in the loop head, i.e. the
-            // upstream shape kept verbatim. Hoisting the spin into an `if` puts a `while (true)`
-            // inside divergent control flow, which the structurizer is free to reshape.
+            // ROCm: elect_one_sync() -> `lane_id == 0` in the loop head, keeping the spin
+            // out of divergent control flow the structurizer may reshape
             while (lane_id == 0) {
                 // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
                 int num_used_slots = cached_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer());
@@ -396,18 +387,18 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                     // Copy data
                     auto shifted_channel_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
                     auto shifted_x = x + token_idx * hidden_int4;
-                    // [agent modifed]: unroll 5 -> 2   the copy stride is kWarpSize * unroll, and
-                    // wave64 doubles it: at unroll 5 the stride (320 int4) exceeds hidden_int4 for
-                    // hidden <= 2048, so the vectorised loop never runs and everything falls into
-                    // the scalar tail. 2 keeps the CUDA stride (160 -> 128) within reach.
-                    // [agent modifed]: st_na_global -> st_na_wave_global   wave-uniform base, keeps the dwordx4
+                    // ROCm: unroll 5 -> 2 on wave64, 5 overshoots hidden_int4 for
+                    // hidden <= 2048 and drops the whole vectorised loop
+                    // ROCm: st_na_global -> st_na_wave_global, wave-uniform base keeps the dwordx4
+#if defined(__gfx942__) || defined(__gfx950__)
                     UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_channel_x_buffers, shifted_x, __ldg, st_na_wave_global);
+#else
+                    UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_channel_x_buffers, shifted_x, __ldg, st_na_wave_global);
+#endif
 
                     // Copy source index
-                    // [agent modifed]: plain store -> st_na_global   this and the three metadata
-                    // stores below all write a *peer's* comm buffer, exactly like the payload
-                    // copy above; only the payload went through the hook upstream because on
-                    // NVIDIA a plain store is already peer-visible.
+                    // ROCm: plain store -> st_na_global, this and the metadata stores below
+                    // all write a peer's comm buffer
                     if (elect_one_sync())
                         st_na_global(channel_src_idx_buffers.buffer() + dst_slot_idx, static_cast<int>(token_idx));
 
@@ -418,22 +409,22 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                             recv_expert_end = (responsible_rank + 1) * num_experts_per_rank;
                         auto idx_value = __ldg(topk_idx + token_idx * num_topk + lane_id);
                         idx_value = (idx_value >= recv_expert_begin and idx_value < recv_expert_end) ? idx_value - recv_expert_begin : -1;
-                        // [agent modifed]: plain store -> st_na_global
+                        // ROCm: plain store -> st_na_global
                         st_na_global(channel_topk_idx_buffers.buffer() + dst_slot_idx * num_topk + lane_id, idx_value);
 
                         // Top-k weights
                         auto weight_value = __ldg(topk_weights + token_idx * num_topk + lane_id);
                         weight_value = (idx_value >= 0) ? weight_value : 0.0f;
-                        // [agent modifed]: plain store -> st_na_global
+                        // ROCm: plain store -> st_na_global
                         st_na_global(channel_topk_weights_buffers.buffer() + dst_slot_idx * num_topk + lane_id, weight_value);
                     }
 
                     // Copy `x_scales`
                     #pragma unroll
-                    // [agent modifed]: 32 -> kWarpSize
+                    // ROCm: 32 -> kWarpSize
                     for (int i = lane_id; i < num_scales; i += kWarpSize) {
                         auto offset = token_idx * scale_token_stride + i * scale_hidden_stride;
-                        // [agent modifed]: plain store -> st_na_global
+                        // ROCm: plain store -> st_na_global
                         st_na_global(channel_x_scales_buffers.buffer() + dst_slot_idx * num_scales + i, __ldg(x_scales + offset));
                     }
                 }
@@ -444,14 +435,14 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
 
             // Move tail index
             // NOTES: here all warps should share the same new tail
-            // [agent modifed]: bar.sync -> sync_barrier   emulated named barrier (arch.cuh)
+            // ROCm: bar.sync -> sync_barrier, emulated named barrier (arch.cuh)
             sync_barrier(responsible_rank, num_threads_per_rank);
             if (send_warp_id_in_rank == 0 and elect_one_sync())
                 st_release_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
         }
     } else {
         // Workers for receiving and copying into buffer
-        // [agent modifed]: 32 -> kWarpSize (this block)
+        // ROCm: 32 -> kWarpSize (this block)
         constexpr int num_recv_warps = kNumThreads / kWarpSize;
         constexpr int num_recv_warps_per_rank = num_recv_warps / kNumRanks;
         const auto recv_thread_id = thread_id;
@@ -465,11 +456,9 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
         int rank_offset = responsible_rank > 0 ? rank_prefix_matrix[(responsible_rank - 1) * kNumRanks + rank] : 0;
 
         // Receive channel offset
-        // [agent modifed]: `int a, b;` -> zero-initialised   non-lane-0 reads the uninitialised
-        // copy before the shuffle below, which is UB the AMDGPU backend is free to exploit
+        // ROCm: `int a, b;` -> zero-initialised, the backend exploits the UB otherwise
         int total_offset = 0, num_tokens_to_recv = 0;
-        // [agent modifed]: empty spin body -> spin_backoff()   an unthrottled system-scope
-        // poll starves the peer's write on CDNA and hangs here forever (see arch.cuh)
+        // ROCm: empty spin body -> spin_backoff(), an unthrottled poll starves the peer's write
         while (lane_id == 0 and (total_offset = ld_volatile_global(channel_start_offset.buffer())) == 0)
             spin_backoff();
         while (lane_id == 0 and (num_tokens_to_recv = ld_volatile_global(channel_end_offset.buffer())) == 0)
@@ -480,7 +469,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                 recv_channel_offset[responsible_rank * num_channels + responsible_channel] = total_offset;
             num_tokens_to_recv -= total_offset;
         }
-        // [agent modifed]: __shfl_sync(0xffffffff, ..) -> shfl_sync   32-bit mask is rejected by HIP
+        // ROCm: __shfl_sync(0xffffffff, ..) -> shfl_sync, HIP rejects a 32-bit mask
         total_offset = shfl_sync(total_offset, 0);
         total_offset += rank_offset;
         num_tokens_to_recv = shfl_sync(num_tokens_to_recv, 0);
@@ -512,7 +501,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
             }
 
             // Synchronize queue tail
-            // [agent modifed]: bar.sync -> sync_barrier
+            // ROCm: bar.sync -> sync_barrier
             sync_barrier(responsible_rank, num_threads_per_rank);
             cached_channel_tail_idx = shared_channel_tail_idx[responsible_rank];
 
@@ -535,23 +524,27 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                 }
                 __syncwarp();
 #else
-                // [agent modifed]: unroll 5 -> 2   same wave64 stride problem as the sender above
-                // [agent modifed]: *_global -> *_wave_global   wave-uniform base, keeps the dwordx4
+                // ROCm: unroll 5 -> 2 on wave64, same stride problem as the sender above
+                // ROCm: *_global -> *_wave_global, wave-uniform base keeps the dwordx4
+#if defined(__gfx942__) || defined(__gfx950__)
                 UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_recv_x_int4, shifted_buffer_x_int4, ld_nc_wave_global, st_na_wave_global);
+#else
+                UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_recv_x_int4, shifted_buffer_x_int4, ld_nc_wave_global, st_na_wave_global);
+#endif
 #endif
             }
 
             // Copy `src_idx`
             #pragma unroll 4
             for (int chunk_idx = cached_channel_head_idx + recv_thread_id_in_rank; chunk_idx < cached_channel_tail_idx;
-                 // [agent modifed]: 32 -> kWarpSize
+                 // ROCm: 32 -> kWarpSize
                  chunk_idx += kWarpSize * num_recv_warps_per_rank)
                 recv_src_idx[total_offset + chunk_idx - cached_channel_head_idx] =
                     ld_nc_global(channel_src_idx_buffers.buffer() + chunk_idx % num_recv_buffer_tokens);
 
             // Copy `topk_idx` and `topk_weights`
             #pragma unroll 4
-            // [agent modifed]: 32 -> kWarpSize
+            // ROCm: 32 -> kWarpSize
             for (int idx = recv_thread_id_in_rank; idx < num_recv_tokens * num_topk; idx += kWarpSize * num_recv_warps_per_rank) {
                 int chunk_idx = idx / num_topk, token_topk_idx = idx % num_topk;
                 int token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens;
@@ -563,7 +556,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
 
             // Copy `x_scales`
             #pragma unroll 4
-            // [agent modifed]: 32 -> kWarpSize
+            // ROCm: 32 -> kWarpSize
             for (int i = recv_thread_id_in_rank; i < num_recv_tokens * num_scales; i += kWarpSize * num_recv_warps_per_rank) {
                 int chunk_idx = i / num_scales, scales_idx = i % num_scales;
                 int token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens;
@@ -574,7 +567,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
             // Move queue
             cached_channel_head_idx += num_recv_tokens;
             total_offset += num_recv_tokens;
-            // [agent modifed]: bar.sync -> sync_barrier
+            // ROCm: bar.sync -> sync_barrier
             sync_barrier(responsible_rank, num_threads_per_rank);
             if (recv_warp_id_in_rank == num_recv_warps_per_rank - 1 and elect_one_sync())
                 st_relaxed_sys_global(channel_head_idx.buffer(), cached_channel_head_idx);
@@ -625,8 +618,7 @@ void dispatch(void* recv_x,
               int num_sms,
               int num_max_send_tokens,
               int num_recv_buffer_tokens) {
-    // [agent modifed]: 768 -> 1024   768/wave64 = 12 waves, not divisible by 8 ranks;
-    // the kernel asserts num_send_warps % kNumRanks == 0, so widen the block to 16 waves.
+    // ROCm: 768 -> 1024, 12 waves is not divisible by 8 ranks, 16 is
     constexpr int kNumThreads = 1024;
     constexpr int kNumTMABytesPerWarp = 8192;
 #ifndef DISABLE_SM90_FEATURES
@@ -689,7 +681,7 @@ __global__ void cached_notify_combine(
         auto thread_id = static_cast<int>(threadIdx.x), num_threads = static_cast<int>(blockDim.x);
         auto ptr = static_cast<int*>(buffer_ptrs[rank]);
         #pragma unroll
-        // [agent modifed]: plain store -> st_na_global, same reason as cached_notify_dispatch
+        // ROCm: plain store -> st_na_global, same reason as cached_notify_dispatch
         for (int i = thread_id; i < num_memset_int; i += num_threads)
             st_na_global(ptr + i, 0);
 
@@ -698,7 +690,7 @@ __global__ void cached_notify_combine(
     } else {
         const auto channel_id = sm_id - 1;
         const auto thread_id = static_cast<int>(threadIdx.x);
-        // [agent modifed]: 32 -> kWarpSize (this block)
+        // ROCm: 32 -> kWarpSize (this block)
         const auto rank_id = thread_id / kWarpSize;
         const auto lane_id = thread_id % kWarpSize;
         if (rank_id >= kNumRanks)
@@ -714,7 +706,7 @@ __global__ void cached_notify_combine(
             int token_idx = token_idx_tail - lane_id, expected_head = 0;
             auto current_head = (token_idx >= token_start_idx) ? __ldg(send_head + token_idx * kNumRanks + rank_id) : -1;
             for (int i = 0; i < min(kWarpSize, token_idx_tail - token_start_idx + 1); ++i) {
-                // [agent modifed]: __shfl_sync(0xffffffff, ..) -> shfl_sync
+                // ROCm: __shfl_sync(0xffffffff, ..) -> shfl_sync
                 const int head = shfl_sync(current_head, i);
                 if (head < 0) {
                     if (lane_id == i)
@@ -750,7 +742,7 @@ void cached_notify_combine(void** buffer_ptrs,
                   rank);                        \
     break
 
-    // [agent modifed]: 32 -> kWarpSize   one wave per rank
+    // ROCm: 32 -> kWarpSize, one wave per rank
     const int num_threads = std::max(128, kWarpSize * num_ranks);
     EP_HOST_ASSERT(num_ranks <= num_threads);
     EP_HOST_ASSERT(num_threads <= 1024);
@@ -785,12 +777,12 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
     const auto num_channels = num_sms / 2;
     const bool is_sender = sm_id % 2 == 0;
     const int responsible_channel = sm_id / 2;
-    // [agent modifed]: 32 -> kWarpSize
+    // ROCm: 32 -> kWarpSize
     EP_DEVICE_ASSERT(num_topk <= kWarpSize);
 
     constexpr int kDtypePerInt4 = sizeof(int4) / sizeof(dtype_t);
     int hidden_int4 = hidden * sizeof(dtype_t) / sizeof(int4);
-    // [agent modifed]: 32 -> kWarpSize   this is the per-wave store granularity
+    // ROCm: 32 -> kWarpSize, the per-wave store granularity
     int hidden_int4_aligned = align_down(hidden_int4, kWarpSize);
     auto x_int4 = reinterpret_cast<const int4*>(x);
     auto bias_0_int4 = reinterpret_cast<const int4*>(bias_0);
@@ -803,13 +795,13 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
     auto tma_buffer = smem_buffer + (thread_id / 32) * kNumTMABytesPerWarp;
 #endif
 
-    // [agent modifed]: new -- set up the emulated named barriers (see the dispatch kernel)
+    // ROCm: new, set up the emulated named barriers (see the dispatch kernel)
     sync_barrier_init();
 
     if (is_sender) {
         // Workers for sending
         // Several warps are responsible for a single rank
-        // [agent modifed]: 32 -> kWarpSize (this block)
+        // ROCm: 32 -> kWarpSize (this block)
         constexpr int num_send_warps_per_rank = (kNumThreads / kWarpSize) / kNumRanks;
         constexpr int num_send_warps = num_send_warps_per_rank * kNumRanks;
         const auto num_threads_per_rank = num_send_warps_per_rank * kWarpSize;
@@ -856,8 +848,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
             // Check destination queue emptiness, or wait a buffer to be released (rare cases)
             auto start_time = clock64();
             int num_round_tokens = min(num_max_send_tokens, token_end_idx - static_cast<int>(token_idx));
-            // [agent modifed]: `elect_one_sync()` -> `lane_id == 0` in the loop head, see the
-            // dispatch sender above -- the upstream shape kept verbatim.
+            // ROCm: elect_one_sync() -> `lane_id == 0` in the loop head, see the dispatch sender
             while (lane_id == 0) {
                 // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
                 int num_used_slots = current_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer());
@@ -873,8 +864,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
             __syncwarp();
 
             // Send by chunk
-            // [agent modifed]: `#pragma unroll` -> `unroll 2`   the body holds a copy loop, so a
-            // full unroll of this runtime-bounded loop only bloats the sender's inner code
+            // ROCm: `#pragma unroll` -> `unroll 2`, a full unroll only bloats the sender
             #pragma unroll 2
             for (int i = send_warp_id_in_rank; i < num_round_tokens; i += num_send_warps_per_rank) {
                 // Get an empty slot
@@ -883,18 +873,22 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                 // Copy data
                 auto shifted_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
                 auto shifted_x = x_int4 + (token_idx + i) * hidden_int4;
-                // [agent modifed]: unroll 4 -> 2   wave64 doubles the copy stride, so 4 leaves
-                // hidden <= 2048 with a single un-pipelined pass; 2 restores two passes
-                // [agent modifed]: *_global -> *_wave_global   wave-uniform base, keeps the dwordx4
+                // ROCm: unroll 4 -> 2 on wave64, 4 leaves hidden <= 2048 with a
+                // single un-pipelined pass
+                // ROCm: *_global -> *_wave_global, wave-uniform base keeps the dwordx4
+#if defined(__gfx942__) || defined(__gfx950__)
                 UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_x_buffers, shifted_x, ld_nc_wave_global, st_na_wave_global);
+#else
+                UNROLLED_WARP_COPY(4, lane_id, hidden_int4, shifted_x_buffers, shifted_x, ld_nc_wave_global, st_na_wave_global);
+#endif
 
                 // Send source index
-                // [agent modifed]: plain store -> st_na_global   peer buffer, see the dispatch sender
+                // ROCm: plain store -> st_na_global, peer buffer, see the dispatch sender
                 if (elect_one_sync())
                     st_na_global(channel_src_idx_buffers.buffer() + dst_slot_idx, __ldg(src_idx + token_idx + i));
 
                 // Send `topk_weights`
-                // [agent modifed]: plain store -> st_na_global
+                // ROCm: plain store -> st_na_global
                 if (num_topk > 0 and lane_id < num_topk)
                     st_na_global(channel_topk_weights_buffers.buffer() + dst_slot_idx * num_topk + lane_id,
                                  __ldg(topk_weights + (token_idx + i) * num_topk + lane_id));
@@ -903,7 +897,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
             current_channel_tail_idx += num_round_tokens;
 
             // Move tail index
-            // [agent modifed]: bar.sync -> sync_barrier   emulated named barrier (arch.cuh)
+            // ROCm: bar.sync -> sync_barrier, emulated named barrier (arch.cuh)
             sync_barrier(send_rank_id, num_threads_per_rank);
             if (send_warp_id_in_rank == 0 and elect_one_sync())
                 st_release_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx);
@@ -911,7 +905,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
     } else {
         // Workers for receiving
         // One warp for moving the queue head, others for reduction
-        // [agent modifed]: 32 -> kWarpSize (this block)
+        // ROCm: 32 -> kWarpSize (this block)
         constexpr int num_recv_warps = kNumThreads / kWarpSize;
         const auto recv_warp_id = thread_id / kWarpSize;
         EP_DEVICE_ASSERT(kNumRanks <= kWarpSize and kNumThreads > kWarpSize);
@@ -927,8 +921,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
             warp_channel_head_idx[recv_warp_id][lane_id] = 0;
         if (thread_id < kNumRanks)
             channel_tail_idx[thread_id] = 0;
-        // [agent modifed]: bar.sync 0, kNumThreads -> __syncthreads()   this one already spans
-        // the whole block, so the plain hardware barrier is exact and cheaper than the emulation.
+        // ROCm: bar.sync 0, kNumThreads -> __syncthreads(), this one spans the whole block
         __syncthreads();
 
         if (thread_id < kWarpSize) {
@@ -940,9 +933,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
             while (lane_id < kNumRanks) {
                 // Check retired
                 bool retired = true;
-                // [agent modifed]: `#pragma unroll` -> `#pragma unroll 2`. Fully unrolling this
-                // spin body costs 15 flat loads with `sc0 sc1` per iteration (the LDS flags are
-                // `volatile`), which starves the head publish below.
+                // ROCm: `#pragma unroll` -> `unroll 2`, a full unroll starves the head publish
                 #pragma unroll 2
                 for (int i = 1; i < num_recv_warps; ++i)
                     retired = retired and warp_retired[i];
@@ -954,7 +945,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
 
                 // Update minimum head
                 int min_head = std::numeric_limits<int>::max();
-                // [agent modifed]: `#pragma unroll` -> `#pragma unroll 2`, same reason as above
+                // ROCm: `#pragma unroll` -> `unroll 2`, same reason as above
                 #pragma unroll 2
                 for (int i = 1; i < num_recv_warps; ++i)
                     if (not warp_retired[i])
@@ -1002,7 +993,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                     expected_head = ld_nc_global(send_head + token_idx * kNumRanks + lane_id);
 
                 auto start_time = clock64();
-                // [agent modifed]: __any_sync(0xffffffff, ..) -> any_sync(kFullWarpMask, ..)
+                // ROCm: __any_sync(0xffffffff, ..) -> any_sync(kFullWarpMask, ..)
                 while (any_sync(kFullWarpMask, channel_tail_idx[lane_id] <= expected_head and expected_head >= 0)) {
                     // Timeout check
                     if (clock64() - start_time > LEGACY_NUM_TIMEOUT_CYCLES) {
@@ -1019,7 +1010,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                 int num_topk_ranks = 0, topk_ranks[kNumRanks], slot_indices[kNumRanks];
                 #pragma unroll
                 for (int i = 0; i < kNumRanks; ++i) {
-                    // [agent modifed]: __shfl_sync(0xffffffff, ..) -> shfl_sync
+                    // ROCm: __shfl_sync(0xffffffff, ..) -> shfl_sync
                     auto expected_head_i = shfl_sync(expected_head, i);
                     if (expected_head_i >= 0) {
                         slot_indices[num_topk_ranks] = expected_head_i % num_recv_buffer_tokens;
@@ -1037,7 +1028,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                 constexpr int kNumStages = 8;
                 EP_STATIC_ASSERT(kNumStages * 32 * sizeof(int4) <= kNumTMABytesPerWarp, "Invalid count");
                 #pragma unroll
-                // [agent modifed]: 32 -> kWarpSize
+                // ROCm: 32 -> kWarpSize
                 for (int i = lane_id; i < hidden_int4; i += kWarpSize) {
                     // Read bias
                     // TODO: make it as a template
@@ -1149,7 +1140,7 @@ void combine(cudaDataType_t type,
              int num_sms,
              int num_max_send_tokens,
              int num_recv_buffer_tokens) {
-    // [agent modifed]: 768 -> 1024   same wave-count divisibility reason as dispatch
+    // ROCm: 768 -> 1024, same wave-count divisibility reason as dispatch
     constexpr int kNumThreads = 1024;
     constexpr int kNumTMABytesPerWarp = 4096;
 #ifndef DISABLE_SM90_FEATURES
@@ -1188,7 +1179,7 @@ void combine(cudaDataType_t type,
 
     // Even-numbered blocks for sending, odd-numbered blocks for receiving
     EP_HOST_ASSERT(num_sms % 2 == 0);
-    // [agent modifed]: 32 -> kWarpSize
+    // ROCm: 32 -> kWarpSize
     EP_HOST_ASSERT(kNumThreads >= num_ranks * kWarpSize);
     SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
     SWITCH_TYPES(COMBINE_DTYPE_LAUNCH_CASE);

@@ -101,8 +101,7 @@
     }                                                      \
     while (false)
 
-// [agent modifed]: CUDA_R_16BF -> HIP_R_16BF. hipify translates this enumerator only in some
-// files, so the spelling is pinned here instead of relying on it.
+// ROCm: CUDA_R_16BF -> HIP_R_16BF, hipify does not translate it in every file
 #define SWITCH_TYPES(case_macro)                          \
     switch (type) {                                       \
         case HIP_R_16BF:                                  \

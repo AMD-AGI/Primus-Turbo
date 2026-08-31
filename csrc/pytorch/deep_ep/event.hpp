@@ -3,10 +3,10 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <memory>
 
-// [agent modifed]: include root deep_ep/ -> primus_turbo/deep_ep/
+// ROCm: include root deep_ep/ -> primus_turbo/deep_ep/
 #include <primus_turbo/deep_ep/common/exception.cuh>
 
-// [agent modifed]: deep_ep -> primus_turbo::deep_ep
+// ROCm: deep_ep -> primus_turbo::deep_ep
 namespace primus_turbo::deep_ep {
 
 struct EventHandle {

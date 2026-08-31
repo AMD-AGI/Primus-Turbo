@@ -1,11 +1,11 @@
 #pragma once
 
-// [agent modifed]: include root deep_ep/ -> primus_turbo/deep_ep/
+// ROCm: include root deep_ep/ -> primus_turbo/deep_ep/
 #include <primus_turbo/deep_ep/common/exception.cuh>
 
 #include "compiled.cuh"
 
-// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep::legacy
+// ROCm: deep_ep::legacy -> primus_turbo::deep_ep::legacy
 namespace primus_turbo::deep_ep::legacy {
 
 template <typename dtype_t>

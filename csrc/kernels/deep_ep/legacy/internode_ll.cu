@@ -2,12 +2,10 @@
 #include "ibgda_device.cuh"
 #include "launch.cuh"
 
-// [agent modifed]: new -- whole-file arch gate; the low-latency kernels are pure
-// IBGDA. Gated here rather than removed so the diff against upstream stays
-// readable and the path comes back by flipping one macro (arch.cuh).
+// ROCm: new, whole-file arch gate, the low-latency kernels are pure IBGDA
 #if PRIMUS_TURBO_DEEPEP_HAS_IBGDA
 
-// [agent modifed]: deep_ep::legacy -> primus_turbo::deep_ep::legacy
+// ROCm: deep_ep::legacy -> primus_turbo::deep_ep::legacy
 namespace primus_turbo::deep_ep::legacy {
 
 namespace internode_ll {

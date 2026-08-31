@@ -279,8 +279,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // ********* DeepEP *********
-    // [agent modifed]: the inline class_<Buffer> block is replaced by the legacy copy's own
-    // registration (csrc/pytorch/deep_ep/python_api.cpp), which mirrors upstream's module body.
+    // ROCm: the inline class_<Buffer> block -> deep_ep/python_api.cpp's registration
     auto deep_ep_module =
         m.def_submodule("deep_ep", "DeepEP: an efficient expert-parallel communication library");
     primus_turbo::deep_ep::register_deep_ep_apis(deep_ep_module);

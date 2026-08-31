@@ -1,16 +1,13 @@
 #include <pybind11/pybind11.h>
 #include <torch/python.h>
 
-// [agent modifed]: include root deep_ep/ -> primus_turbo/deep_ep/
+// ROCm: include root deep_ep/ -> primus_turbo/deep_ep/
 #include <primus_turbo/deep_ep/common/compiled.cuh>
 
-// [agent modifed]: "jit/api.hpp" and "elastic/buffer.hpp" are dropped -- the JIT runtime is
-// elastic-only and elastic/ is a placeholder here (see its README).
+// ROCm: "jit/api.hpp" and "elastic/buffer.hpp" are dropped, elastic/ is a placeholder
 #include "legacy/buffer.hpp"
 
-// [agent modifed]: `PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)` -> a plain registration function.
-// Turbo already owns the one module entry point (csrc/pytorch/bindings_pytorch.cpp); DeepEP
-// hangs off it as the `deep_ep` submodule, which is what upstream's module became here.
+// ROCm: PYBIND11_MODULE -> a registration function, Turbo owns the module entry point
 namespace primus_turbo::deep_ep {
 
 void register_deep_ep_apis(pybind11::module_& m) {
@@ -23,8 +20,7 @@ void register_deep_ep_apis(pybind11::module_& m) {
     m.attr("topk_idx_t") = pybind11::cast(c10::CppTypeToScalarType<topk_idx_t>::value);
 
     // Register legacy buffer APIs
-    // [agent modifed]: register_apis -> legacy::register_apis   the legacy copy lives in
-    // primus_turbo::deep_ep::legacy, this registration function stays in deep_ep.
+    // ROCm: register_apis -> legacy::register_apis, this function stays in deep_ep
     legacy::register_apis(m);
 }
 

@@ -20,8 +20,7 @@
 
 #include "primus_turbo/common.h"
 
-// [agent modifed]: including the legacy buffer here pulled its whole pybind surface into every
-// pytorch TU; only the submodule registration is actually needed (deep_ep/python_api.cpp).
+// ROCm: only the submodule registration is needed, not the whole pybind surface
 namespace primus_turbo::deep_ep {
 void register_deep_ep_apis(pybind11::module_& m);
 }  // namespace primus_turbo::deep_ep
