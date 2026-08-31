@@ -1,10 +1,16 @@
 ###############################################################################
+# SPDX-License-Identifier: Apache-2.0
+#
 # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2025 FlyDSL Project Contributors
-# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL); see LICENSE-APACHE for the Apache-2.0 terms.
 #
-# See LICENSE for license information.
+# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL)
+# Modified by the Primus-Turbo team.
+#
+# This file is distributed under the Apache License 2.0 (see LICENSE-APACHE),
+# not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
+
 """Pure-FlyDSL MXFP4 activation quant kernels (no ``import torch`` at module top).
 
 Bit-exact replacement for the C++ ``quantize_mxfp4_dual`` for the scored
@@ -826,8 +832,16 @@ def get_dual_cast(R, C, row_rht, col_rht, row_2d=False, col_2d=False, row_sr=Fal
 # occupancy-starved and drops to ~2.5 TB/s). Reuses _emit_dual_body per-tile with
 # per-expert base offsets; SRDs cover the whole 3D (gmul=G). ----
 def _build_dual3_kernel(
-    row_rht, col_rht, row_2d=False, col_2d=False, padded=False, col_locality=False, row_sr=False,
-    col_sr=False, rpk=None, cpk=None
+    row_rht,
+    col_rht,
+    row_2d=False,
+    col_2d=False,
+    padded=False,
+    col_locality=False,
+    row_sr=False,
+    col_sr=False,
+    rpk=None,
+    cpk=None,
 ):
     _DualSS = _make_dual_struct(bool(row_2d or col_2d))
 
@@ -903,8 +917,16 @@ def _build_dual3_kernel(
 
 
 def _build_dual3_launch(
-    row_rht, col_rht, row_2d=False, col_2d=False, padded=False, col_locality=False, row_sr=False,
-    col_sr=False, rpk=None, cpk=None
+    row_rht,
+    col_rht,
+    row_2d=False,
+    col_2d=False,
+    padded=False,
+    col_locality=False,
+    row_sr=False,
+    col_sr=False,
+    rpk=None,
+    cpk=None,
 ):
     kern = _build_dual3_kernel(
         row_rht, col_rht, row_2d, col_2d, padded, col_locality, row_sr, col_sr, rpk, cpk
