@@ -29,11 +29,15 @@ namespace primus_turbo::pytorch {
 
 std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
                                                 const at::ScalarType      dest_dtype,
-                                                c10::optional<at::Tensor> scale_opt);
+                                                c10::optional<at::Tensor> scale_opt,
+                                                const int64_t             padding_align_size,
+                                                const int64_t pad_penultimate_align_size);
 
 std::vector<at::Tensor> quantize_fp8_tensorwise_meta(const at::Tensor          input,
                                                      const at::ScalarType      dest_dtype,
-                                                     c10::optional<at::Tensor> scale_opt);
+                                                     c10::optional<at::Tensor> scale_opt,
+                                                     const int64_t             padding_align_size,
+                                                     const int64_t pad_penultimate_align_size);
 
 std::vector<at::Tensor> quantize_fp8_blockwise_segment_m_row_col(const at::Tensor     input,
                                                                  const at::ScalarType dest_dtype,
@@ -243,12 +247,14 @@ at::Tensor hipblaslt_gemm_fp8_meta(at::Tensor A, at::Tensor scaleA_inv, at::Tens
 
 at::Tensor hipblaslt_gemm_fp4(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
                               at::Tensor scaleB_inv, const at::ScalarType out_dtype, bool transA,
-                              bool transB, bool transC, const std::string &granularity);
+                              bool transB, bool transC, const std::string &granularity,
+                              const double beta, c10::optional<at::Tensor> out);
 
 at::Tensor hipblaslt_gemm_fp4_meta(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
                                    at::Tensor scaleB_inv, const at::ScalarType out_dtype,
                                    bool transA, bool transB, bool transC,
-                                   const std::string &granularity);
+                                   const std::string &granularity, const double beta,
+                                   c10::optional<at::Tensor> out);
 
 at::Tensor ck_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tensor &b_scales,
                        const bool transA, const bool transB, at::ScalarType out_dtype,

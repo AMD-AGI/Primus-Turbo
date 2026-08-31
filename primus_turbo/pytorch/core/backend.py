@@ -75,6 +75,7 @@ class BackendType(Enum):
     # in all arch configurations but are guarded on __gfx950__ and must be capability-gated before
     # launch (see is_gfx950()/hipkittens_attn_supported).
     HIPKITTENS = auto()
+    GLUON = auto()
 
 
 @dataclass
@@ -456,7 +457,6 @@ class TuneCache:
 
 
 def _format_kwargs(kwargs: Dict[str, Any]) -> str:
-
     def _format_value(v):
         if isinstance(v, torch.Tensor):
             return f"Tensor(shape={v.shape}, dtype={v.dtype})"

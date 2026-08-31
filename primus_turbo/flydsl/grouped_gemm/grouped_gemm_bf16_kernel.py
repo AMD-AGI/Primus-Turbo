@@ -63,7 +63,6 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     Mfma16x16x32,
     S2RLoaderTr16x32Bf16Wide,
     StoreCBf16,
-    _i64,
     _readfirstlane_i32,
     compute_global_swizzle_nn_bf16_wide,
     emit_for,
@@ -77,6 +76,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     wave_rank_desc_stable,
     xcd_band_remap_pid,
 )
+from primus_turbo.flydsl.utils.prims import _i64
 
 
 def _load_i32(base, offset):

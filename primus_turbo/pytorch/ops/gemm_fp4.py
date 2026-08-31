@@ -349,10 +349,11 @@ def gemm_fp4(
             into the wgrad GEMM epilogue, so backward writes ``b.main_grad``
             directly instead of returning a gradient the framework then adds.
             ``"megatron"`` is the only supported pattern; ``b`` must carry
-            ``main_grad`` / ``grad_added_to_main_grad``. FlyDSL is the only backend
-            with the FP4 accumulate epilogue, so this requires ``use_preshuffle=False``
-            and a ``main_grad`` in the weight's own dtype (its store is 16-bit).
-            Defaults to None (no fusion).
+            ``main_grad`` / ``grad_added_to_main_grad``. The accumulate epilogue is
+            carried by the hipBLASLt and FlyDSL backends, so this requires
+            ``use_preshuffle=False``. hipBLASLt accumulates into an fp32 / bf16 / fp16
+            ``main_grad``; FlyDSL needs it in the weight's own dtype (its store is
+            16-bit). Defaults to None (no fusion).
 
     Returns:
         torch.Tensor: Output matrix with shape (M, N)
@@ -395,8 +396,9 @@ def gemm_fp4(
         out_dtype = torch.promote_types(a_data.dtype, b_data.dtype)
 
     assert not (fuse_bgrad_accum_pattern is not None and config.use_preshuffle), (
-        "fuse_bgrad_accum_pattern requires use_preshuffle=False: only the FlyDSL backend "
-        "carries the FP4 beta=1 wgrad epilogue, and it takes raw (non-preshuffled) E8M0 scales."
+        "fuse_bgrad_accum_pattern requires use_preshuffle=False: the FP4 beta=1 wgrad epilogue "
+        "lives in the hipBLASLt and FlyDSL backends, both of which take raw (non-preshuffled) "
+        "E8M0 scales; the AITER preshuffled path has no accumulate epilogue."
     )
 
     if config.granularity == ScalingGranularity.MX_BLOCKWISE:

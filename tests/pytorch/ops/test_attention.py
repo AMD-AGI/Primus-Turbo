@@ -6,6 +6,10 @@
 
 import math
 import os
+import subprocess
+import sys
+from fractions import Fraction
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -16,6 +20,10 @@ from primus_turbo.pytorch.core.backend import (
     PrecisionType,
 )
 from primus_turbo.pytorch.core.utils import is_gfx950
+from primus_turbo.pytorch.kernels.attention import attention_gluon_impl, attention_impl
+from primus_turbo.pytorch.kernels.attention.attention_impl import (
+    resolve_flash_attn_backend,
+)
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     F8_FWD_MAX,
     attention_triton_backward_impl,
@@ -34,12 +42,725 @@ from primus_turbo.triton.attention.sparse_mla import (
     sparse_mla_bwd_triton,
     sparse_mla_fwd_triton,
 )
+
+# Pytest discovers the imported fixtures in this test module.
+from tests.pytorch.ops.gluon_helper import (  # noqa: F401
+    _GLUON_CORRECTNESS_CASES,
+    WORKERS,
+    _fake_gluon_raw,
+    _fake_public_gluon_launcher,
+    _fake_public_gluon_tensors,
+    _gfx950_device_for_test,
+    _gluon_attention_fp32_reference,
+    _gluon_cuda_device,
+    _gluon_tensors,
+    _GluonTensor,
+    _has_gfx950,
+    _make_gluon_runtime_inputs,
+    _mock_gfx950_properties,
+    _pinned_gluon_backend,
+    _require_exact_gfx950,
+    _resolve_gluon,
+    _run_worker,
+)
 from tests.pytorch.ref.attention_ref import (
     AttnConfig,
     attention_vanilla_forward_pytorch_ref_impl,
     attention_with_sink_ref_impl,
 )
 from tests.pytorch.test_utils import compute_snr, pinned_backend_takes
+
+
+def test_gluon_resolve_unpinned_uses_aiter_before_gluon(mock_gfx950_properties, monkeypatch):
+    # FlyDSL imports this helper into attention_impl. Keep this dispatcher-only
+    # test independent of the process's current CUDA device and its cached props.
+    monkeypatch.setattr(attention_impl, "get_device_compute_capability", lambda: (9, 5))
+    q, k, v = _gluon_tensors()
+
+    # Noncausal calls are valid Gluon input but intentionally ineligible for FlyDSL.
+    assert (
+        resolve_flash_attn_backend(
+            varlen=False,
+            user_backend=None,
+            q=q,
+            k=k,
+            v=v,
+            causal=False,
+        )
+        == BackendType.AITER
+    )
+
+
+@pytest.mark.parametrize(("storage", "qkv_format"), [("bshd", "bshd"), ("bhsd", "bhsd")])
+def test_gluon_resolve_pinned_accepts_supported_input(storage, qkv_format, mock_gfx950_properties):
+    q, k, v = _gluon_tensors(storage=storage)
+
+    assert _resolve_gluon(q, k, v, causal=False, qkv_format=qkv_format) == BackendType.GLUON
+
+
+@pytest.mark.parametrize(
+    ("name", "build"),
+    [
+        ("non_cuda", lambda: _gluon_tensors(device=None)),
+        ("non_gfx950", lambda: _gluon_tensors()),
+        (
+            "mixed_devices",
+            lambda: (
+                _GluonTensor((2, 3, 8, 64)),
+                _GluonTensor((2, 4, 2, 64), device="cuda:1"),
+                _GluonTensor((2, 4, 2, 64)),
+            ),
+        ),
+        (
+            "mixed_dtype",
+            lambda: (
+                _GluonTensor((2, 3, 8, 64)),
+                _GluonTensor((2, 4, 2, 64), dtype=torch.bfloat16),
+                _GluonTensor((2, 4, 2, 64)),
+            ),
+        ),
+        ("unsupported_dtype", lambda: _gluon_tensors(dtype=torch.float32)),
+        (
+            "kv_shape_mismatch",
+            lambda: (
+                _GluonTensor((2, 3, 8, 64)),
+                _GluonTensor((2, 4, 2, 64)),
+                _GluonTensor((2, 5, 2, 64)),
+            ),
+        ),
+        (
+            "zero_dimension",
+            lambda: _gluon_tensors(q_shape=(0, 3, 8, 64), kv_shape=(0, 4, 2, 64)),
+        ),
+        (
+            "head_dim_over_limit",
+            lambda: _gluon_tensors(q_shape=(2, 3, 8, 257), kv_shape=(2, 4, 2, 257)),
+        ),
+        (
+            "invalid_gqa",
+            lambda: _gluon_tensors(q_shape=(2, 3, 7, 64), kv_shape=(2, 4, 2, 64)),
+        ),
+        ("sbhd", lambda: _gluon_tensors(storage="sbhd")),
+        ("noncontiguous", lambda: _gluon_tensors(storage="noncontiguous")),
+    ],
+)
+def test_gluon_eligibility_refuses_invalid_tensor_contract(name, build, mock_gfx950_properties, monkeypatch):
+    q, k, v = build()
+    if name == "non_gfx950":
+        monkeypatch.setattr(
+            torch.cuda,
+            "get_device_properties",
+            lambda device: SimpleNamespace(gcnArchName="gfx942:sramecc+:xnack-"),
+        )
+
+    with pytest.raises(ValueError, match="cannot handle the given inputs"):
+        _resolve_gluon(q, k, v, causal=False)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"dropout_p": 0.1},
+        {"softmax_scale": "not-a-real-scalar"},
+        {"bias": object()},
+        {"alibi_slopes": object()},
+        {"sink": object()},
+        {"window_size": (1, -1)},
+        {"return_softmax": True},
+        pytest.param({"causal": True}, id="causal-sq-gt-skv"),
+        {"needs_backward": True},
+    ],
+)
+def test_gluon_eligibility_refuses_unsupported_call_features(kwargs, mock_gfx950_properties):
+    q, k, v = _gluon_tensors(q_shape=(2, 5, 8, 64), kv_shape=(2, 4, 2, 64))
+    kwargs.setdefault("causal", False)
+
+    with pytest.raises(ValueError, match="cannot handle the given inputs"):
+        _resolve_gluon(q, k, v, **kwargs)
+
+
+def test_gluon_wrapper_bshd_returns_contiguous_output_on_current_stream(gluon_cuda_device, fake_gluon_raw):
+    q = torch.empty((2, 3, 8, 64), device=gluon_cuda_device, dtype=torch.float16)
+    k = torch.empty((2, 5, 2, 64), device=gluon_cuda_device, dtype=torch.float16)
+    v = torch.empty_like(k)
+    caller_stream = torch.cuda.Stream(device=gluon_cuda_device)
+
+    with torch.cuda.stream(caller_stream):
+        out, lse = attention_gluon_impl.flash_attn_gluon_forward_impl(
+            q,
+            k,
+            v,
+            softmax_scale=Fraction(1, 4),
+            causal=True,
+            qkv_format="bshd",
+        )
+    caller_stream.synchronize()
+
+    assert out.shape == (2, 3, 8, 64)
+    assert out.stride() == (1536, 512, 64, 1)
+    assert out.is_contiguous()
+    assert out.dtype == torch.float16
+    assert out.device == gluon_cuda_device
+    assert torch.all(out == 1.25)
+    assert lse.shape == (2, 8, 3)
+    assert lse.dtype == torch.float32
+    assert lse.device == gluon_cuda_device
+    assert torch.all(lse == 0.25)
+    assert fake_gluon_raw == [
+        {
+            "shapes": (q.shape, k.shape, v.shape),
+            "strides": (q.stride(), k.stride(), v.stride()),
+            "contiguous": (True, True, True),
+            "scale_type": float,
+            "stream": caller_stream,
+        }
+    ]
+
+
+def test_gluon_wrapper_bhsd_preserves_physical_layout_and_defaults_scale(gluon_cuda_device, fake_gluon_raw):
+    q = torch.empty((2, 8, 3, 64), device=gluon_cuda_device, dtype=torch.bfloat16).transpose(1, 2)
+    k = torch.empty((2, 2, 5, 64), device=gluon_cuda_device, dtype=torch.bfloat16).transpose(1, 2)
+    v = torch.empty_like(k.transpose(1, 2)).transpose(1, 2)
+
+    out, lse = attention_gluon_impl.flash_attn_gluon_forward_impl(
+        q, k, v, softmax_scale=None, causal=False, qkv_format="bhsd"
+    )
+
+    assert out.shape == (2, 3, 8, 64)
+    assert out.stride() == (1536, 64, 192, 1)
+    assert not out.is_contiguous()
+    assert out.dtype == torch.bfloat16
+    assert out.device == gluon_cuda_device
+    assert torch.all(out == 0.125)
+    assert lse.shape == (2, 8, 3)
+    assert lse.dtype == torch.float32
+    assert lse.device == gluon_cuda_device
+    assert torch.all(lse == 0.125)
+    assert fake_gluon_raw[0]["shapes"] == (
+        torch.Size((2, 8, 3, 64)),
+        torch.Size((2, 2, 5, 64)),
+        torch.Size((2, 2, 5, 64)),
+    )
+    assert fake_gluon_raw[0]["strides"] == (
+        (1536, 192, 64, 1),
+        (640, 320, 64, 1),
+        (640, 320, 64, 1),
+    )
+    assert fake_gluon_raw[0]["contiguous"] == (True, True, True)
+
+
+@pytest.mark.parametrize(
+    ("qkv_format", "expected_stride"),
+    [("bshd", (1536, 512, 64, 1)), ("bhsd", (1536, 64, 192, 1))],
+)
+def test_gluon_fake_matches_eager_metadata_and_exact_strides(qkv_format, expected_stride):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        if qkv_format == "bshd":
+            q = torch.empty((2, 3, 8, 64), device="cuda", dtype=torch.float16)
+            k = torch.empty((2, 5, 2, 64), device="cuda", dtype=torch.float16)
+        else:
+            q = torch.empty((2, 8, 3, 64), device="cuda", dtype=torch.float16).transpose(1, 2)
+            k = torch.empty((2, 2, 5, 64), device="cuda", dtype=torch.float16).transpose(1, 2)
+        v = torch.empty_like(k)
+
+        out, lse = attention_gluon_impl.flash_attn_gluon_forward_impl(
+            q, k, v, softmax_scale=None, causal=False, qkv_format=qkv_format
+        )
+
+    assert out.shape == (2, 3, 8, 64)
+    assert out.stride() == expected_stride
+    assert out.dtype == q.dtype
+    assert out.device == q.device
+    assert lse.shape == (2, 8, 3)
+    assert lse.dtype == torch.float32
+    assert lse.device == q.device
+
+
+def test_gluon_compile_preserves_bshd_singleton_batch_stride(gluon_cuda_device, fake_gluon_raw):
+    q = torch.empty((5, 1, 8, 64), device=gluon_cuda_device, dtype=torch.float16).permute(1, 0, 2, 3)
+    k = torch.empty((7, 1, 2, 64), device=gluon_cuda_device, dtype=torch.float16).permute(1, 0, 2, 3)
+    v = torch.empty_like(k)
+
+    def forward(query, key, value):
+        out, _ = attention_gluon_impl.flash_attn_gluon_forward_impl(
+            query,
+            key,
+            value,
+            softmax_scale=None,
+            causal=False,
+            qkv_format="bshd",
+        )
+        return out, out.stride(0)
+
+    eager_out, eager_stride = forward(q, k, v)
+    torch._dynamo.reset()
+    try:
+        compiled_forward = torch.compile(forward, backend="eager", fullgraph=True)
+        compiled_out, compiled_stride = compiled_forward(q, k, v)
+    finally:
+        torch._dynamo.reset()
+
+    assert q.stride() == (512, 512, 64, 1)
+    assert eager_out.stride() == (512, 512, 64, 1)
+    assert compiled_out.stride() == (512, 512, 64, 1)
+    assert eager_stride == 512
+    assert compiled_stride == 512
+
+
+def test_gluon_wrapper_rejects_invalid_format_before_dispatch():
+    q = torch.empty((1, 2, 4, 8), dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="qkv_format must be 'bshd' or 'bhsd'"):
+        attention_gluon_impl.flash_attn_gluon_forward_impl(q, q, q, qkv_format="sbhd")
+
+
+@pytest.mark.parametrize(
+    ("qkv_format", "bad_storage", "error_match"),
+    [
+        ("bshd", "bhsd_view", "storage does not match"),
+        ("bhsd", "bshd_contiguous", "storage does not match"),
+        ("bshd", "inner_stride", "unit stride"),
+    ],
+)
+def test_gluon_wrapper_rejects_invalid_public_storage(qkv_format, bad_storage, error_match):
+    if qkv_format == "bshd":
+        q = torch.empty((1, 2, 4, 8), dtype=torch.float16)
+        k = torch.empty_like(q)
+        v = torch.empty_like(q)
+    else:
+        q = torch.empty((1, 4, 2, 8), dtype=torch.float16).transpose(1, 2)
+        k = torch.empty((1, 4, 2, 8), dtype=torch.float16).transpose(1, 2)
+        v = torch.empty((1, 4, 2, 8), dtype=torch.float16).transpose(1, 2)
+
+    if bad_storage == "bhsd_view":
+        k = torch.empty((1, 4, 2, 8), dtype=torch.float16).transpose(1, 2)
+    elif bad_storage == "bshd_contiguous":
+        k = torch.empty((1, 2, 4, 8), dtype=torch.float16)
+    else:
+        k = torch.empty((1, 2, 4, 16), dtype=torch.float16)[..., ::2]
+
+    with pytest.raises(ValueError, match=error_match):
+        attention_gluon_impl.flash_attn_gluon_forward_impl(q, k, v, qkv_format=qkv_format)
+
+
+def test_gluon_wrapper_import_does_not_load_raw_kernel():
+    raw_module = "primus_turbo.gluon.attention.f16_fa_gfx950_rotated_4cluster"
+    code = (
+        "import importlib, sys; "
+        "importlib.import_module('primus_turbo.pytorch.kernels.attention.attention_gluon_impl'); "
+        f"assert {raw_module!r} not in sys.modules"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=os.getcwd(),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_gluon_compiler_capability_error_names_gluon_and_triton(monkeypatch):
+    import_error = ModuleNotFoundError(
+        "No module named 'triton.experimental.gluon'",
+        name="triton.experimental.gluon",
+    )
+
+    def unavailable_raw_module(module_name):
+        assert module_name == "primus_turbo.gluon.attention.f16_fa_gfx950_rotated_4cluster"
+        raise import_error
+
+    monkeypatch.setattr(attention_gluon_impl, "_import_module", unavailable_raw_module)
+    monkeypatch.setitem(sys.modules, "triton", SimpleNamespace(__version__="test-triton-9.9"))
+
+    with pytest.raises(RuntimeError) as error:
+        attention_gluon_impl._load_flash_attn_gluon_raw()
+
+    message = str(error.value)
+    assert "Gluon" in message
+    assert "Triton test-triton-9.9" in message
+    assert "triton.experimental.gluon" in message
+    assert "CDNA4" in message
+    assert error.value.__cause__ is import_error
+
+
+def test_gluon_forward_only_allows_requires_grad_inputs_under_no_grad(fake_public_gluon_launcher):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        q, k, v = _fake_public_gluon_tensors((True, True, True))
+
+        with torch.no_grad():
+            out = flash_attn_func(q, k, v, causal=False)
+
+    assert out.shape == q.shape
+    assert out.requires_grad is False
+
+
+def test_gluon_grad_mode_rejects_backward_before_launch(fake_public_gluon_launcher):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode(), torch.enable_grad():
+        q, k, v = _fake_public_gluon_tensors((False, True, False))
+
+        with pytest.raises(ValueError, match="backend GLUON cannot handle the given inputs"):
+            flash_attn_func(q, k, v, causal=False)
+
+
+def test_gluon_return_lse_preserves_the_public_return_contract(fake_public_gluon_launcher):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode(), torch.enable_grad():
+        q, k, v = _fake_public_gluon_tensors()
+        result = flash_attn_func(q, k, v, causal=False, return_lse=True)
+
+    assert isinstance(result, tuple)
+    assert len(result) == 2
+    out, lse = result
+    assert out.shape == q.shape
+    assert lse.shape == (2, 8, 3)
+
+
+def test_gluon_return_attn_probs_is_strictly_rejected_before_launch(
+    fake_public_gluon_launcher,
+):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode(), torch.enable_grad():
+        q, k, v = _fake_public_gluon_tensors()
+
+        with pytest.raises(ValueError, match="backend GLUON cannot handle the given inputs"):
+            flash_attn_func(q, k, v, causal=False, return_attn_probs=True)
+
+
+def test_gluon_lifecycle_direct_apply_rejects_backward_before_launch_under_optimize():
+    script = r"""
+import torch
+from primus_turbo.pytorch.core.backend import BackendType
+from primus_turbo.pytorch.ops.attention import flash_attn_interface
+
+launches = []
+def launch(*args, **kwargs):
+    launches.append((args, kwargs))
+    return torch.empty_like(args[0]), torch.empty((1, 1, 1))
+
+flash_attn_interface.flash_attn_gluon_forward_impl = launch
+q = torch.empty((1, 1, 1, 8), dtype=torch.float16, requires_grad=True)
+k = torch.empty_like(q)
+v = torch.empty_like(q)
+try:
+    flash_attn_interface.FlashAttnFunc.apply(
+        q, k, v, 0.0, None, False, (-1, -1), None, None,
+        False, False, False, True, 1, None, "bshd", BackendType.GLUON,
+    )
+except RuntimeError as error:
+    if str(error) != "gluon flash-attn is forward-only; Q/K/V backward is not implemented":
+        raise AssertionError("optimized direct Gluon apply used the wrong error")
+else:
+    raise AssertionError("optimized direct Gluon apply did not reject backward")
+if launches:
+    raise AssertionError("optimized direct Gluon apply reached the launcher")
+print("optimized Gluon direct apply rejected before launch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-O", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert result.stdout.strip() == "optimized Gluon direct apply rejected before launch"
+
+
+@pytest.mark.parametrize(
+    (
+        "dtype",
+        "qkv_format",
+        "causal",
+        "seqlen_q",
+        "seqlen_kv",
+        "num_heads_q",
+        "num_heads_kv",
+        "head_dim",
+        "softmax_scale",
+    ),
+    _GLUON_CORRECTNESS_CASES,
+)
+def test_gluon_correctness_gfx950(
+    dtype,
+    qkv_format,
+    causal,
+    seqlen_q,
+    seqlen_kv,
+    num_heads_q,
+    num_heads_kv,
+    head_dim,
+    softmax_scale,
+):
+    device = _gfx950_device_for_test()
+    generator = torch.Generator(device=device).manual_seed(20260818)
+    q, k, v = _make_gluon_runtime_inputs(
+        batch=1,
+        seqlen_q=seqlen_q,
+        seqlen_kv=seqlen_kv,
+        num_heads_q=num_heads_q,
+        num_heads_kv=num_heads_kv,
+        head_dim=head_dim,
+        qkv_format=qkv_format,
+        dtype=dtype,
+        device=device,
+        generator=generator,
+    )
+    _require_exact_gfx950(q)
+
+    with torch.no_grad():
+        output_ref, lse_ref = _gluon_attention_fp32_reference(
+            q,
+            k,
+            v,
+            softmax_scale,
+            causal,
+        )
+        with _pinned_gluon_backend():
+            output, lse = flash_attn_func(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                return_lse=True,
+            )
+    torch.cuda.synchronize(device)
+
+    assert output.device == q.device
+    assert output.dtype == dtype
+    assert output.shape == q.shape
+    assert lse.device == q.device
+    assert lse.dtype == torch.float32
+    assert lse.shape == (1, num_heads_q, seqlen_q)
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(lse).all()
+    output_snr = compute_snr(output_ref, output)
+    assert output_snr > 40.0, f"Gluon output SNR {output_snr:.2f} dB is not above 40 dB"
+    torch.testing.assert_close(output.float(), output_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "qkv_format", "seqlen"),
+    [
+        pytest.param(torch.float16, "bshd", 384, id="fp16-bshd-s384"),
+        pytest.param(torch.bfloat16, "bhsd", 512, id="bf16-bhsd-s512"),
+    ],
+)
+def test_gluon_short_causal_compile_boundaries_gfx950(dtype, qkv_format, seqlen):
+    """The aligned D128 causal specialization compiles at S384/S512."""
+    device = _gfx950_device_for_test()
+    generator = torch.Generator(device=device).manual_seed(20260818)
+    q, k, v = _make_gluon_runtime_inputs(
+        batch=1,
+        seqlen_q=seqlen,
+        seqlen_kv=seqlen,
+        num_heads_q=64,
+        num_heads_kv=64,
+        head_dim=128,
+        qkv_format=qkv_format,
+        dtype=dtype,
+        device=device,
+        generator=generator,
+    )
+    _require_exact_gfx950(q)
+
+    with torch.no_grad():
+        output_ref, lse_ref = _gluon_attention_fp32_reference(q, k, v, None, True)
+        with _pinned_gluon_backend():
+            output, lse = flash_attn_func(q, k, v, causal=True, return_lse=True)
+    torch.cuda.synchronize(device)
+
+    assert output.shape == q.shape
+    assert lse.shape == (1, 64, seqlen)
+    assert compute_snr(output_ref, output) > 40.0
+    torch.testing.assert_close(output.float(), output_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    ("qkv_format", "expected_output_stride"),
+    [
+        pytest.param("bshd", (18944, 512, 64, 1), id="bshd"),
+        pytest.param("bhsd", (18944, 64, 2368, 1), id="bhsd"),
+    ],
+)
+@pytest.mark.filterwarnings("error:Dynamo detected a call to a .*lru_cache.*attention_impl\\.py")
+def test_gluon_compile_fullgraph_values_and_exact_strides_gfx950(
+    qkv_format,
+    expected_output_stride,
+):
+    device = _gfx950_device_for_test()
+    generator = torch.Generator(device=device).manual_seed(20260818)
+    q, k, v = _make_gluon_runtime_inputs(
+        batch=2,
+        seqlen_q=37,
+        seqlen_kv=53,
+        num_heads_q=8,
+        num_heads_kv=2,
+        head_dim=64,
+        qkv_format=qkv_format,
+        dtype=torch.float16,
+        device=device,
+        generator=generator,
+    )
+    _require_exact_gfx950(q)
+
+    def forward(query, key, value):
+        return flash_attn_func(
+            query,
+            key,
+            value,
+            softmax_scale=0.19,
+            causal=False,
+            return_lse=True,
+        )
+
+    previous_backend = GlobalBackendManager._attn_backend
+    GlobalBackendManager._attn_backend = None if previous_backend is None else dict(previous_backend)
+    GlobalBackendManager.set_attn_backend(
+        BackendType.GLUON,
+        PrecisionType.BF16_FP16_FP32,
+    )
+    torch._dynamo.reset()
+    try:
+        with torch.no_grad():
+            eager_output, eager_lse = forward(q, k, v)
+            attention_impl._GFX950_DEVICE_CACHE.clear()
+            compiled_forward = torch.compile(forward, fullgraph=True)
+            compiled_output, compiled_lse = compiled_forward(q, k, v)
+        torch.cuda.synchronize(device)
+    finally:
+        GlobalBackendManager._attn_backend = previous_backend
+        torch._dynamo.reset()
+
+    assert q.stride() == expected_output_stride
+    assert eager_output.stride() == expected_output_stride
+    assert compiled_output.stride() == expected_output_stride
+    assert eager_lse.stride() == (296, 37, 1)
+    assert compiled_lse.stride() == (296, 37, 1)
+    assert torch.isfinite(eager_output).all()
+    assert torch.isfinite(eager_lse).all()
+    torch.testing.assert_close(compiled_output, eager_output, rtol=0, atol=0)
+    torch.testing.assert_close(compiled_lse, eager_lse, rtol=0, atol=0)
+
+
+def test_gluon_non_default_stream_uses_q_device_gfx950():
+    device_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    target_device = _gfx950_device_for_test(prefer_nonzero=device_count >= 2)
+    original_device_index = torch.cuda.current_device()
+    original_target_stream = torch.cuda.current_stream(target_device)
+    launch_stream = torch.cuda.Stream(device=target_device)
+    other_device_index = next(
+        (index for index in range(device_count) if index != target_device.index),
+        target_device.index,
+    )
+
+    try:
+        torch.cuda.set_device(target_device)
+        torch.cuda.set_stream(launch_stream)
+        assert torch.cuda.current_stream(target_device) == launch_stream
+        assert launch_stream != original_target_stream
+
+        generator = torch.Generator(device=target_device).manual_seed(20260818)
+        q, k, v = _make_gluon_runtime_inputs(
+            batch=1,
+            seqlen_q=37,
+            seqlen_kv=53,
+            num_heads_q=16,
+            num_heads_kv=4,
+            head_dim=64,
+            qkv_format="bshd",
+            dtype=torch.float16,
+            device=target_device,
+            generator=generator,
+        )
+        _require_exact_gfx950(q)
+        with torch.no_grad():
+            output_ref, lse_ref = _gluon_attention_fp32_reference(q, k, v, 0.2, True)
+
+        if device_count >= 2:
+            torch.cuda.set_device(other_device_index)
+            assert torch.cuda.current_device() != q.device.index
+
+        with torch.no_grad(), _pinned_gluon_backend():
+            output, lse = flash_attn_func(
+                q,
+                k,
+                v,
+                softmax_scale=0.2,
+                causal=True,
+                return_lse=True,
+            )
+
+        expected_current_device = other_device_index if device_count >= 2 else target_device.index
+        assert torch.cuda.current_device() == expected_current_device
+        launch_stream.synchronize()
+
+        assert {q.device, k.device, v.device, output.device, lse.device} == {target_device}
+        assert torch.isfinite(output).all()
+        assert torch.isfinite(lse).all()
+        assert compute_snr(output_ref, output) > 40.0
+        torch.testing.assert_close(output.float(), output_ref, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-2)
+    finally:
+        torch.cuda.set_device(target_device)
+        torch.cuda.set_stream(original_target_stream)
+        torch.cuda.set_device(original_device_index)
+
+
+@pytest.mark.deterministic
+def test_gluon_repeatability_is_bitwise_after_warmup_gfx950():
+    device = _gfx950_device_for_test()
+    generator = torch.Generator(device=device).manual_seed(20260818)
+    q, k, v = _make_gluon_runtime_inputs(
+        batch=1,
+        seqlen_q=128,
+        seqlen_kv=257,
+        num_heads_q=16,
+        num_heads_kv=4,
+        head_dim=128,
+        qkv_format="bhsd",
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    _require_exact_gfx950(q)
+
+    with torch.no_grad(), _pinned_gluon_backend():
+        flash_attn_func(q, k, v, causal=False, return_lse=True)
+        torch.cuda.synchronize(device)
+        repeated = [flash_attn_func(q, k, v, causal=False, return_lse=True) for _ in range(3)]
+        torch.cuda.synchronize(device)
+
+    first_output, first_lse = repeated[0]
+    assert torch.isfinite(first_output).all()
+    assert torch.isfinite(first_lse).all()
+    for output, lse in repeated[1:]:
+        assert torch.equal(output, first_output), "Gluon output changed bitwise after warmup"
+        assert torch.equal(lse, first_lse), "Gluon LSE changed bitwise after warmup"
+
+
+@pytest.mark.skipif(
+    not _has_gfx950(),
+    reason="Gluon FA forward runtime coverage requires an exact gfx950 device",
+)
+@pytest.mark.parametrize("case", WORKERS)
+def test_gluon_causal_regression_in_isolated_process(case: str) -> None:
+    result = _run_worker(case)
+    assert result.returncode == 0, result.stdout
+    assert "PASS" in result.stdout, result.stdout
+
 
 test_cases = [
     AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=32, num_head_kv=32, head_dim_qk=128, head_dim_v=128),

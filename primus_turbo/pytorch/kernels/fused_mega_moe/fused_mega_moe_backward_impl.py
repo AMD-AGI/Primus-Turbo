@@ -17,8 +17,8 @@ from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
 from primus_turbo.flydsl.mega import (
     dispatch_grouped_gemm_bf16_flydsl_kernel,
     grouped_gemm_combine_bf16_flydsl_kernel,
-    swiglu_backward_flydsl_kernel,
 )
+from primus_turbo.flydsl.utils.swiglu_kernel import swiglu_backward_flydsl_kernel
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
     BackendChoice,

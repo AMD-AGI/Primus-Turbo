@@ -19,14 +19,14 @@ import torch
 
 # isort: off
 from primus_turbo.flydsl.utils.gemm_helper import (
-    G2SLoader,
-    ceildiv,
     compile_with_scratch_out,
+    G2SLoader,
     make_fp8_rebased_tensor_and_srd,
     make_row_band_resource,
     resolve_accum_out,
     xcd_remap_pid,
 )
+from primus_turbo.flydsl.utils.prims import ceildiv
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -552,6 +552,19 @@ class MfmaScaleFp4:
         _NOD = len(split[0]) if _SPLIT else 0
         if _SPLIT:
             assert n_sub == 2 and nbuf == 2 and nbuf_b == 2 and nsa % 2 == 0 and nsb % 2 == 0
+        # K-loop shape: half_k + even trip count peels the final unroll-2 iteration (the loop stops
+        # two phases early); an odd trip count peels its phase A instead; an odd trailing 128-K
+        # block with no peel runs as an MFMA-only tail.
+        _KPEEL = half_k and not _COOP and (ki is not None) and (ki >= 4) and not (ki & 1)
+        _OPEEL = _CST and half_k and not _COOP and (ki is not None) and (ki >= 5) and bool(ki & 1)
+        _has_loop = (ki is None) or (ki >= 2)
+        _has_tail = (ki is not None) and bool(ki & 1) and not _OPEEL
+        # Accumulator init folded into the first MFMA's src2 immediate 0: the head phase is peeled
+        # so every quad's opening MFMA writes instead of accumulating, which drops the 256-dword
+        # AGPR pre-clear (one VALU per accumulator dword) from every tile's prologue.  Needs the
+        # accumulators pinned to named AGPRs (_CST); a runtime trip count that skips the head
+        # keeps an explicit clear on that branch alone (emit_acc_clear).
+        _ZACC = _CST and (_has_loop or _has_tail)
         if key not in _cache:
             o_acc = list(range(NT))
             t_a = NT
@@ -590,6 +603,9 @@ class MfmaScaleFp4:
             nout += _NCDV
             o_npv = nout  # runtime peel: hw-loop bound = trip count - 2
             if _RTPEEL:
+                nout += 1
+            o_par = nout  # runtime dispatch: parity scratch, never the loop bound
+            if _RUNTIME:
                 nout += 1
             # scale temp accessors (group: 0=A-g0, 1=A-g1, 2=BL, 3=BR; slot=grp*n_sub+s)
             # _scb[0] = ping-pong scale-set base (0 or nsct), set per phase.
@@ -889,7 +905,7 @@ class MfmaScaleFp4:
                 def flush(self):
                     return self.emit(None, 1 << 30)
 
-            def emit_inplace(nxt_buf, g2sl, half=False, drop_s=False, refill=True, cstq=None):
+            def emit_inplace(nxt_buf, g2sl, half=False, drop_s=False, refill=True, cstq=None, zero=False):
                 # NEXT-K in-place refill, blocked-diagonal (4 A-rows x 8 N-cols); GAVOID: g2s in no-refill slots.
                 bm, bn = 4, 8
                 ncol = 2 * ntb
@@ -922,16 +938,20 @@ class MfmaScaleFp4:
                     bt = tb + ji * n_sub + s
                     sat = sa_t(s, ii // 4)
                     sbt = sbfn(s)
+                    # A quad's opening k sub-step (cells run s-ascending per quad) may take the
+                    # src2 immediate 0 instead of its own accumulator: same result bit for bit,
+                    # and it makes the pre-loop AGPR clear dead.
+                    acc_in = "0" if (zero and s == 0) else f"${q}"
                     if _TACC:  # acc = C^T: src0<->src1, scales, op_sel[0]<->op_sel[1]
                         osel = f"op_sel:[{ob & 1},{oa & 1},0] op_sel_hi:[{(ob >> 1) & 1},{(oa >> 1) & 1},0]"
                         mline = (
-                            f"v_mfma_scale_f32_16x16x128_f8f6f4 ${q}, ${bt}, ${at}, ${q}, "
+                            f"v_mfma_scale_f32_16x16x128_f8f6f4 ${q}, ${bt}, ${at}, {acc_in}, "
                             f"${sbt}, ${sat} {osel} cbsz:4 blgp:4"
                         )
                     else:
                         osel = f"op_sel:[{oa & 1},{ob & 1},0] op_sel_hi:[{(oa >> 1) & 1},{(ob >> 1) & 1},0]"
                         mline = (
-                            f"v_mfma_scale_f32_16x16x128_f8f6f4 ${q}, ${at}, ${bt}, ${q}, "
+                            f"v_mfma_scale_f32_16x16x128_f8f6f4 ${q}, ${at}, ${bt}, {acc_in}, "
                             f"${sat}, ${sbt} {osel} cbsz:4 blgp:4"
                         )
                     mlist.append((mline, at, bt, sat, sbt))
@@ -1056,9 +1076,6 @@ class MfmaScaleFp4:
                     ]
                 return r + emit_g2s(1, o_ta, o_tbl, o_tbr, only_rg=1, b_only=_bo)
 
-            # prologue: half_k + even trip count peels the final unroll-2 iteration (loop stops two phases early).
-            _KPEEL = half_k and not _COOP and (ki is not None) and (ki >= 4) and not (ki & 1)
-            _OPEEL = _CST and half_k and not _COOP and (ki is not None) and (ki >= 5) and bool(ki & 1)
             L = [
                 f"s_mov_b32 ${o_cnt}, {2 if (_KPEEL or _OPEEL) else 0}",
                 f"s_mov_b32 ${o_sa}, ${i_sa0}",
@@ -1107,7 +1124,7 @@ class MfmaScaleFp4:
 
             if _has_loop:
                 # unroll-2 body (phase A even-k, phase B odd-k); scale loads lead the mfma stream.
-                def emit_phase_a(half):
+                def emit_phase_a(half, zero=False):
                     # phase A: consume set0; g2s P+2 -> LDS0, ds_read P+1 (LDS1) -> set1.
                     _scb[0] = 0
                     if _COOP:
@@ -1117,15 +1134,42 @@ class MfmaScaleFp4:
                     _gA = emit_g2s(0, o_sa, o_sbl, o_sbr, half and half_g2s)
                     if _ROT:  # rotate first (phase A's own g2s dest is the new head)
                         _gA = emit_rot() + mix_g2s(_gA, emit_bases(0))
-                    return _scA + emit_inplace(1, _gA, half) + _scv_adv()
+                    return _scA + emit_inplace(1, _gA, half, zero=zero) + _scv_adv()
 
-                def emit_loop(lbl, half):
+                def emit_bsoff():
+                    # phase B's g2s soffsets (this pair's odd 256-K block)
+                    return [
+                        f"s_add_u32 ${o_ta}, ${o_sa}, ${i_kstep}",
+                        f"s_add_u32 ${o_tbl}, ${o_sbl}, ${i_kstep}",
+                        f"s_add_u32 ${o_tbr}, ${o_sbr}, ${i_kstep}",
+                    ]
+
+                def emit_acc_clear(lo, hi):
+                    # Explicit clear for accumulators no src2-immediate MFMA reaches (see emit_head).
+                    return [
+                        f"v_accvgpr_write_b32 a{4 * q + e}, 0"
+                        for q in range_constexpr(lo, hi)
+                        for e in range_constexpr(4)
+                    ]
+
+                def emit_head(half, l_head=7):
+                    """Peeled copy of the first phase A with the accumulators written rather than
+                    accumulated, then a jump into the loop body at phase B.  The dynamic phase
+                    order (A B A B ...) and the trip count are unchanged, so every soffset/ring
+                    rotation still advances exactly once per phase."""
+                    B = emit_phase_a(half, zero=True)
+                    if half and _has_tail:
+                        # The R half sits out this body but the shared tail still accumulates into it.
+                        B += emit_acc_clear(nq, NT)
+                    return B + [_ipend] + emit_bsoff() + [f"s_branch {l_head}f"]
+
+                def emit_loop(lbl, half, l_head=7):
                     B = [f"{lbl}:"]
                     B += emit_phase_a(half)
                     B.append(_ipend)
-                    B.append(f"s_add_u32 ${o_ta}, ${o_sa}, ${i_kstep}")
-                    B.append(f"s_add_u32 ${o_tbl}, ${o_sbl}, ${i_kstep}")
-                    B.append(f"s_add_u32 ${o_tbr}, ${o_sbr}, ${i_kstep}")
+                    B += emit_bsoff()
+                    if _ZACC:
+                        B.append(f"{l_head}:")  # loop entry for the peeled head phase A
                     # phase B: consume set1; g2s P+2 -> LDS1, ds_read P+1 (LDS0) -> set0.
                     _scb[0] = nsct
                     if _COOP:
@@ -1230,12 +1274,19 @@ class MfmaScaleFp4:
                     B += _CST_HAZ + cq.flush()
                     return B
 
-                def emit_peel_rt(half, lbl):
+                def emit_peel_rt(half, lbl, l_clr=8, l_end=9, l_head=7, l_body=None):
                     """Hw-loop stopped two phases early plus the peeled copy, for a runtime trip
                     count. The peel consumes k-blocks already in LDS, so it issues no g2s and
-                    an in-flight store cannot serialise a wait through the unified vmcnt."""
-                    B = [f"s_cmp_lt_u32 ${i_nval}, 4", f"s_cbranch_scc1 {lbl}f"]
-                    B += emit_loop("2" if half else "1", half)
+                    an in-flight store cannot serialise a wait through the unified vmcnt.
+                    A trip count too small for the loop also skips the src2-immediate head, so
+                    that branch clears the accumulators itself."""
+                    B = [
+                        f"s_cmp_lt_u32 ${i_nval}, 4",
+                        f"s_cbranch_scc1 {l_clr if _ZACC else lbl}f",
+                    ]
+                    if _ZACC:
+                        B += emit_head(half, l_head)
+                    B += emit_loop(l_body if l_body is not None else ("2" if half else "1"), half, l_head)
                     B.append(f"{lbl}:")
                     B.append(f"s_waitcnt vmcnt(0) lgkmcnt({_ELGK})")
                     B.append("s_barrier")
@@ -1244,13 +1295,26 @@ class MfmaScaleFp4:
                     B.append(f"s_waitcnt vmcnt(0) lgkmcnt({_ELGK})")
                     _scb[0] = nsct
                     B += emit_inplace(0, [], half, refill=False, cstq=CstSched())
+                    if _ZACC:
+                        # kept out of line so the loop-taken path never fetches through it
+                        B += (
+                            [f"s_branch {l_end}f", f"{l_clr}:"]
+                            + emit_acc_clear(0, nq if half else NT)
+                            + [f"s_branch {lbl}b", f"{l_end}:"]
+                        )
                     return B
 
                 def emit_runtime_zero(half):
-                    """Drain speculative prologue traffic and materialize zero accumulators."""
+                    """Drain speculative prologue traffic and materialize zero accumulators.
+
+                    An empty group runs no MFMA at all, so nothing has written the
+                    accumulators -- not even the src2-immediate head.  They have to be
+                    cleared explicitly before the store drains them, or the group writes
+                    out whatever the previous tile left in the AGPRs."""
                     B = ["s_waitcnt vmcnt(0) lgkmcnt(0)"]
                     if not _CST:
                         return B
+                    B += emit_acc_clear(0, nq if half else NT)
                     cq = CstSched()
                     mi = 0
                     for ii in range(nta):
@@ -1260,10 +1324,30 @@ class MfmaScaleFp4:
                                 mi += 1
                     return B + _CST_HAZ + cq.flush()
 
-                def emit_runtime_odd_tail(half):
-                    """Consume the staged final phase-A block without issuing a refill."""
+                def emit_runtime_odd_tail(half, no_loop=False):
+                    """Consume the staged final phase-A block without issuing a refill.
+
+                    Set 0 already holds this block's scales on both entries -- the nval=1 one
+                    still carries the prologue's set, and the loop runs an even phase count
+                    here, so the ring lands back on set 0 with its last prefetch aimed at this
+                    block (the compile-time odd tail relies on the same thing).  Reloading them
+                    is not merely redundant: the load goes to the OTHER ping-pong set, which
+                    nothing below reads, and it is still in flight when the block ends, so the
+                    next tile a wg_tiles>1 workgroup walks gets its own set overwritten under
+                    it -- rare, timing-dependent, and it surfaces as inf in that tile's C.
+
+                    ``no_loop`` marks the nval=1 entry: it has not run the src2-immediate head,
+                    so under _ZACC the accumulators have to be materialized here.  Without
+                    _ZACC they arrive as tied zero operands and need no clear."""
                     _scb[0] = 0
-                    return ["s_waitcnt vmcnt(0) lgkmcnt(0)"] + emit_inplace(
+                    B = ["s_waitcnt vmcnt(0) lgkmcnt(0)"]
+                    if no_loop and _ZACC:
+                        B += emit_acc_clear(0, nq if half else NT)
+                    # The g2s that staged this block is per-wave: s_waitcnt retires only the
+                    # issuing wave's loads, while the ds_reads below consume LDS the whole
+                    # workgroup filled.
+                    B.append("s_barrier")
+                    return B + emit_inplace(
                         0,
                         [],
                         half,
@@ -1274,28 +1358,50 @@ class MfmaScaleFp4:
                 def emit_runtime(half, tag):
                     """Uniform zero/even/odd dispatcher for a raw count of 256-K phases."""
                     bound = o_npv if _RTPEEL else o_sct
-                    base = 10 if half else 5
-                    zero, even, odd_tail, even_peel, done = range(base, base + 5)
+                    base = 30 if half else 5
+                    (
+                        zero,
+                        even,
+                        odd_tail,
+                        even_peel,
+                        done,
+                        odd_one,
+                        p_clr,
+                        p_end,
+                        h_odd,
+                        h_even,
+                        h_peel,
+                        b_odd,
+                        b_even,
+                        b_peel,
+                    ) = range(base, base + 14)
                     B = [
                         f"s_cmp_eq_u32 ${i_nval}, 0",
                         f"s_cbranch_scc1 {zero}f",
-                        f"s_and_b32 ${bound}, ${i_nval}, 1",
-                        f"s_cmp_eq_u32 ${bound}, 0",
+                        f"s_and_b32 ${o_par}, ${i_nval}, 1",
+                        f"s_cmp_eq_u32 ${o_par}, 0",
                         f"s_cbranch_scc1 {even}f",
                         f"s_sub_u32 ${bound}, ${i_nval}, 1",
                         f"s_cmp_eq_u32 ${bound}, 0",
-                        f"s_cbranch_scc1 {odd_tail}f",
+                        f"s_cbranch_scc1 {odd_one}f",
                     ]
-                    B += emit_loop("2" if half else "1", half)
+                    # nval >= 3 and odd: the loop runs, so it needs the same accumulator
+                    # init every other branch gets.  Under the 512-row contract nval was
+                    # always even and this path was unreachable, so it never had one.
+                    if _ZACC:
+                        B += emit_head(half, h_odd)
+                    B += emit_loop(b_odd, half, h_odd)
                     B.append(f"{odd_tail}:")
                     B += emit_runtime_odd_tail(half)
+                    B += [f"s_branch {done}f", f"{odd_one}:"]
+                    B += emit_runtime_odd_tail(half, no_loop=True)
                     B += [f"s_branch {done}f", f"{even}:"]
                     if _RTPEEL:
                         B.append(f"s_sub_u32 ${bound}, ${i_nval}, 2")
-                        B += emit_peel_rt(half, even_peel)
+                        B += emit_peel_rt(half, even_peel, p_clr, p_end, h_peel, b_peel)
                     else:
                         B.append(f"s_mov_b32 ${bound}, ${i_nval}")
-                        B += emit_loop("2" if half else "1", half)
+                        B += emit_loop(b_even, half, h_even)
                     B += [f"s_branch {done}f", f"{zero}:"]
                     B += emit_runtime_zero(half)
                     B.append(f"{done}:")
@@ -1316,7 +1422,7 @@ class MfmaScaleFp4:
                 def emit_body(lbl, half):
                     if _RUNTIME:
                         return emit_runtime(half, lbl)
-                    B = emit_loop("2" if half else "1", half)
+                    B = (emit_head(half) if _ZACC else []) + emit_loop("2" if half else "1", half)
                     if _KPEEL:
                         B += _peel(half)
                     elif _OPEEL:
@@ -1360,6 +1466,9 @@ class MfmaScaleFp4:
                                         _bt = _tb + _ji * n_sub + _s
                                         _sat = sa_t(_s, _ii // 4)
                                         _sbt = _sbfn(_s)
+                                        # tail-only body (no loop ran): its opening sub-step is the
+                                        # quad's first MFMA, so it can carry the src2 immediate 0.
+                                        _ai = "0" if (_ZACC and not _has_loop and _s == 0) else f"${_q}"
                                         if _TACC:  # acc = C^T (swap operands/scales/op_sel)
                                             _osel = (
                                                 f"op_sel:[{_ob & 1},{_oa & 1},0] "
@@ -1367,7 +1476,7 @@ class MfmaScaleFp4:
                                             )
                                             L.append(
                                                 f"v_mfma_scale_f32_16x16x128_f8f6f4 ${_q}, ${_bt}, "
-                                                f"${_at}, ${_q}, ${_sbt}, ${_sat} {_osel} cbsz:4 blgp:4"
+                                                f"${_at}, {_ai}, ${_sbt}, ${_sat} {_osel} cbsz:4 blgp:4"
                                             )
                                         else:
                                             _osel = (
@@ -1376,7 +1485,7 @@ class MfmaScaleFp4:
                                             )
                                             L.append(
                                                 f"v_mfma_scale_f32_16x16x128_f8f6f4 ${_q}, ${_at}, "
-                                                f"${_bt}, ${_q}, ${_sat}, ${_sbt} {_osel} cbsz:4 blgp:4"
+                                                f"${_bt}, {_ai}, ${_sat}, ${_sbt} {_osel} cbsz:4 blgp:4"
                                             )
                                         if _cq is not None:
                                             if _s == _nst - 1:
@@ -1407,6 +1516,7 @@ class MfmaScaleFp4:
                 + ((["=&s"] + ["=&v"] * 8) if _CST else [])  # fused store scratch
                 + [f"=&{{v{_CDV + j}}}" for j in range(_NCDV)]  # wide store data pool
                 + (["=&s"] if _RTPEEL else [])  # runtime peel loop bound
+                + (["=&s"] if _RUNTIME else [])  # runtime dispatch parity scratch
                 + ["v"] * ((nbuf + 2 * nbuf_b) * n_sub)  # a(nbuf)/bl/br(nbuf_b) ds_read bases
                 + ["s"] * (nbuf + 2 * nbuf_b)  # g2s dest bases
                 + ["v"] * (nsa + nsb)  # voffsets
@@ -1422,8 +1532,8 @@ class MfmaScaleFp4:
                 + (["v"] * 2 if _ROT else [])  # odd-ring per-lane slot strides
                 + (["s", "s", "v", "s"] if _CST else [])  # C SRDs (L,R), voffset, row bytes
                 + (["v"] * (2 * nbuf_b * n_sub) if _BSPL else [])  # even-region B bases
-                + [str(q) for q in o_acc]
-            )  # tied accs
+                + ([] if _ZACC else [str(q) for q in o_acc])  # tied accs (src2 imm 0 instead)
+            )
             st = (
                 "!llvm.struct<("
                 + ", ".join(
@@ -1434,6 +1544,7 @@ class MfmaScaleFp4:
                     + ["i32"] * (9 if _CST else 0)
                     + ["i32"] * _NCDV
                     + ["i32"] * (1 if _RTPEEL else 0)
+                    + ["i32"] * (1 if _RUNTIME else 0)
                 )
                 + ")>"
             )
@@ -1490,10 +1601,11 @@ class MfmaScaleFp4:
                 for _b in range_constexpr(nbuf_b):
                     for _s in range_constexpr(n_sub):
                         ins.append(_raw(_fr[_b][_s]))
-        for q in range_constexpr(nq):
-            ins.append(_raw(cL[q]))
-        for q in range_constexpr(nq):
-            ins.append(_raw(cR[q]))
+        if not _ZACC:
+            for q in range_constexpr(nq):
+                ins.append(_raw(cL[q]))
+            for q in range_constexpr(nq):
+                ins.append(_raw(cR[q]))
         r = _llvm.inline_asm(ir.Type.parse(st), ins, asm, cons, has_side_effects=True)
         o = [Vec(_llvm.extractvalue(ir.Type.parse("vector<4xf32>"), r, [q])) for q in range_constexpr(nq * 2)]
         return o[:nq], o[nq:]

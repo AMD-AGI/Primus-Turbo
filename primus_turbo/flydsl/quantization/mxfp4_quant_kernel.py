@@ -190,6 +190,51 @@ def _microblock_amax(vf):
     return amax
 
 
+# ---- packed-pair microblock (bf16 source, no RHT / no SR) ----------------------
+# The 16-bit source never has to be widened to f32: bf16->f32 is exact, so both the
+# amax and the fp4 cvt can run straight on the packed LDS word. That removes the
+# per-element extract and halves the abs+max tree, the two biggest VALU blocks of the
+# cast (96 of the 104 VALU per microblock measured in the ISA; 50 after).
+_ABS16X2 = 0x7FFF7FFF  # clears both sign bits of a packed 16-bit-float pair
+
+
+def _packed_amax_bits(words):
+    """f32 bit-pattern of max|v| over the 2*len(words) bf16 packed in ``words``.
+    Bit-identical to the int-max over the unpacked abs f32 bits: clearing the sign
+    leaves the magnitude order equal to the unsigned 16-bit integer order, and the
+    bf16->f32 widening (<<16) is monotone, so the max commutes with both. Reducing on
+    the pair (v_pk_max_u16) halves both the abs mask and the max tree."""
+    v = [Vec.from_elements([w & _ABS16X2], fx.Int32).bitcast(fx.Int16) for w in words]
+    m = v[0]
+    for i in range_constexpr(1, len(v)):
+        m = arith.maxui(m, v[i])
+    m32 = fx.Int32(m.bitcast(fx.Int32)[0])
+    return _imax(m32 & 0xFFFF, m32 >> 16) << 16
+
+
+def _cvt_microblock_bf16(words, scale_native_f32):
+    """``len(words)`` packed bf16 pairs (element 2i in the low half of word i) -> fp4 i32
+    words, same packing / dst_sel chaining as ``_cvt_microblock_to_fp4``. The bf16 form
+    of the cvt consumes the LDS word directly, so the pair is never widened to f32."""
+    out = []
+    for wi in range_constexpr(len(words) // 4):
+        acc = fx.Int32(0)
+        for pair in range_constexpr(4):
+            src = Vec.from_elements([words[wi * 4 + pair]], fx.Int32).bitcast(fx.BFloat16)
+            acc = fx.Int32(
+                rocdl.cvt_scalef32_pk_fp4_bf16(T.i32, _raw(acc), _raw(src), scale_native_f32, pair)
+            )
+        out.append(acc)
+    return out
+
+
+def _finish_microblock_bf16(words):
+    """Packed-pair fast path of ``_finish_microblock``: packed bf16 words -> (fp4 i32
+    words, scale_e8m0 i8-ready i32). bf16 source only, no RHT, no SR."""
+    native_bits, biased = _compute_scale_native(_packed_amax_bits(words))
+    return _cvt_microblock_bf16(words, arith.bitcast(T.f32, native_bits)), biased
+
+
 def _finish_microblock(vbits, use_rht, seed=None):
     """32 f32-bit i32 values -> (4 fp4 i32 words, scale_e8m0 i8-ready i32).
     ``seed`` (i32 Value) enables stochastic rounding in the final cvt (amax/scale
@@ -804,9 +849,10 @@ def flydsl_dual_quant_batched(
     dev = x3d.device
     x_i32 = x3d.contiguous().view(torch.int32)  # [G, N, K/2]
     fn, grid_x, Kp, Np, padded = get_dual3_cast(N, K, G, row_rht, col_rht, row_2d, col_2d, row_sr, col_sr)
-    # Masked loads make the kernel write the complete K_pad row-output tail. Only
-    # the col-output N_pad suffix has no producer threads, so allocate without a
-    # full-tensor memset and clear that small unwritten suffix explicitly.
+    # Outputs sized on K_pad/N_pad and must match the HIP dual (pad regions all-0).
+    # The masked loads already make the kernel write the whole K_pad row-output tail, so
+    # only the col-output N_pad suffix is left without producer threads: allocate without
+    # a full-tensor memset and clear that small suffix instead (from #468).
     ro = torch.empty((G, N, Kp // 8), dtype=torch.int32, device=dev)
     rs = torch.empty((G, N, Kp // 32), dtype=torch.uint8, device=dev)
     co = torch.empty((G, K, Np // 8), dtype=torch.int32, device=dev)
