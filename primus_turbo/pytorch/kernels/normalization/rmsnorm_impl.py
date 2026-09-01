@@ -79,7 +79,10 @@ def _pick_bwd_config(H: int, B: int) -> Tuple[str, int, int, int, int]:
     rows_per_program = max(1, B // _num_cus())
     wide_row = H >= 16384 or (BLOCK_H == 8192 and H <= 8192)
     half_wave = rows_per_program <= 13 and wide_row
-    grid = min(B, _num_cus() // 2 if half_wave else _num_cus())
+    # Otherwise two programs a CU: with one apiece nothing covers its own tail. Capped
+    # so the extra partials still reach the Triton finalize instead of a torch reduce.
+    full_wave = min(2 * _num_cus(), _FINALIZE_TRITON_MAX_PARTS)
+    grid = min(B, _num_cus() // 2 if half_wave else full_wave)
     return "grid", BLOCK_H, grid, 0, 0
 
 

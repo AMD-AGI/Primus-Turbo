@@ -22,7 +22,7 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensorPair,
     check_quantized_tensor,
 )
-from primus_turbo.pytorch.core.utils import is_gfx942
+from primus_turbo.pytorch.core.utils import is_gfx942, is_gfx950
 from primus_turbo.pytorch.kernels.gemm.gemm_fp8_impl import (
     gemm_fp8_accum_impl,
     gemm_fp8_impl,
@@ -41,8 +41,19 @@ from primus_turbo.pytorch.ops.utils import (
 __all__ = ["gemm_fp8"]
 
 
-def _deter_use_nt_layout_gemm_in_bwd(trans_a: bool, trans_b: bool):
+def _default_gemm_backend() -> int:
+    """Dense FP8 GEMM default, mirroring the grouped path: FlyDSL owns gfx950."""
+    return BackendType.FLYDSL.value if is_gfx950() else BackendType.HIPBLASLT.value
+
+
+def _deter_use_nt_layout_gemm_in_bwd(trans_a: bool, trans_b: bool, backend: int, fuse_bgrad_accum: bool):
     if is_gfx942():
+        return False
+
+    # FlyDSL runs the per-tensor NN/TN layouts natively, so backward reads the forward's
+    # own operands instead of a transposed copy of each. A fused wgrad is excluded: its
+    # beta=1 epilogue sends it to hipBLASLt, whose non-NT gemm is not optimized here.
+    if backend == BackendType.FLYDSL.value and not fuse_bgrad_accum:
         return False
 
     # NOTE: the non-NT layout gemm is not optimized for mi350/mi450.
@@ -107,8 +118,11 @@ class FP8GemmTensorFunction(torch.autograd.Function):
         config: Float8QuantConfig,
         fuse_bgrad_accum_pattern: Union[None, str] = None,
     ):
-        use_nt_layout_gemm_in_bwd = _deter_use_nt_layout_gemm_in_bwd(trans_a, trans_b)
         fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
+        backend = _default_gemm_backend()
+        use_nt_layout_gemm_in_bwd = _deter_use_nt_layout_gemm_in_bwd(
+            trans_a, trans_b, backend, fuse_bgrad_accum
+        )
 
         if isinstance(a, QuantizedTensor):
             quantized_a = a
@@ -158,7 +172,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             out_dtype,
             False,
             granularity=config.granularity.value,
-            default_backend=BackendType.HIPBLASLT.value,
+            default_backend=backend,
         )
 
         if use_nt_layout_gemm_in_bwd:
@@ -180,6 +194,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
         ctx.use_nt_layout_gemm_in_bwd = use_nt_layout_gemm_in_bwd
         ctx.fuse_bgrad_accum = fuse_bgrad_accum
         ctx.main_grad = main_grad
+        ctx.backend = backend
 
         return out
 
@@ -194,6 +209,9 @@ class FP8GemmTensorFunction(torch.autograd.Function):
             a_fp8, a_scale_inv, b_fp8, b_scale_inv = ctx.saved_tensors
 
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
+        # Only hipBLASLt and Triton carry the beta=1 epilogue, so a fused wgrad keeps
+        # the backend whose accumulate path forward already sized its operands for.
+        wgrad_backend = BackendType.HIPBLASLT.value if ctx.fuse_bgrad_accum else ctx.backend
 
         quantized_grad_out = QuantizedTensor.quantize(
             grad_out,
@@ -213,7 +231,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
                 ctx.out_dtype,
                 False,
                 granularity=ctx.config.granularity.value,
-                default_backend=BackendType.HIPBLASLT.value,
+                default_backend=ctx.backend,
             )
         else:
             a_grad = gemm_fp8_impl(
@@ -226,7 +244,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
                 ctx.out_dtype,
                 ctx.trans_a,
                 granularity=ctx.config.granularity.value,
-                default_backend=BackendType.HIPBLASLT.value,
+                default_backend=ctx.backend,
             )
 
         if ctx.use_nt_layout_gemm_in_bwd:
@@ -242,7 +260,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
                 ctx.out_dtype,
                 ctx.trans_b,
                 granularity=ctx.config.granularity.value,
-                default_backend=BackendType.HIPBLASLT.value,
+                default_backend=wgrad_backend,
                 inplace_add_to_out=ctx.fuse_bgrad_accum,
                 out=ctx.main_grad,
             )
@@ -257,7 +275,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
                 ctx.out_dtype,
                 ctx.trans_b,
                 granularity=ctx.config.granularity.value,
-                default_backend=BackendType.HIPBLASLT.value,
+                default_backend=wgrad_backend,
                 inplace_add_to_out=ctx.fuse_bgrad_accum,
                 out=ctx.main_grad,
             )

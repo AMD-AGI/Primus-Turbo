@@ -449,7 +449,11 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
                 cbsz=cbsz,
                 blgp=blgp,
                 store_cshuffle=False,
-                sched_schedbar=False,
+                # As in the forward twin: the before-mfma rendezvous is redundant here, the
+                # after-mfma barriers already separate a fill from its reader. This entry
+                # carries the fused epilogue's whole-WG store, so the runtime sync it drops
+                # is the one the profile shows the waves idling on.
+                sched_schedbar=True,
                 persistent=_capped,
                 cap_cu=(num_cu if _capped else -1),
                 N=I,

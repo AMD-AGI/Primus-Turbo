@@ -249,6 +249,23 @@ def make_row_id_map(
     return row_id_map, tokens_per_expert
 
 
+def _row_block_size(*widths: int) -> int:
+    """The block for the one-program-per-token gather/scatter kernels below.
+
+    The row width decides this outright, so it is computed rather than raced: sweeping
+    the deployed width is monotone in the block up to a whole row in one program
+    (H=2880 permute: 365.9 / 301.0 / 218.8 us at 1024 / 2048 / 4096), and a timing race
+    between arms that far apart only adds a per-process chance of picking a worse one.
+    Capped so a wide row still splits across programs instead of one huge block.
+    """
+    return min(4096, triton.next_power_of_2(max(widths)))
+
+
+# num_warps for those kernels: 4 lanes-worth per element at a whole-row block, measured
+# against 8 and 16 (permute 218.8 / 271.9 / 353.9 us).
+_ROW_NUM_WARPS = 4
+
+
 @triton.jit
 def _permute_kernel(
     # pointers
@@ -324,23 +341,6 @@ def _permute_kernel(
             tl.store(output_ptr + output_off, inp, mask=mask)
 
 
-try:
-    _permute_kernel = triton.autotune(
-        configs=[
-            triton.Config({"BLOCK_SIZE": 64}),
-            triton.Config({"BLOCK_SIZE": 128}),
-            triton.Config({"BLOCK_SIZE": 256}),
-            triton.Config({"BLOCK_SIZE": 512}),
-            triton.Config({"BLOCK_SIZE": 1024}),
-            triton.Config({"BLOCK_SIZE": 2048}),
-            triton.Config({"BLOCK_SIZE": 4096}),
-        ],
-        key=["hidden_size"],
-    )(_permute_kernel)
-except RuntimeError:
-    pass
-
-
 def permute_with_mask_map(
     inp: torch.Tensor,
     row_id_map: torch.Tensor,
@@ -387,9 +387,9 @@ def permute_with_mask_map(
     else:
         permuted_scale = None
 
-    # pylint: disable=unnecessary-lambda-assignment
-    def grid(META):
-        return (num_tokens, triton.cdiv(hidden_size, META["BLOCK_SIZE"]))
+    # The scale rides the same block, so it has to be wide enough for both.
+    block_size = _row_block_size(hidden_size, scale_hidden_dim if scale is not None else 0)
+    grid = (num_tokens, triton.cdiv(hidden_size, block_size))
 
     _permute_kernel[grid](
         inp,
@@ -417,6 +417,8 @@ def permute_with_mask_map(
         permuted_scale.stride(1) if permuted_scale is not None else None,
         PERMUTE_PROBS=probs is not None,
         PERMUTE_SCALE=scale is not None,
+        BLOCK_SIZE=block_size,
+        num_warps=_ROW_NUM_WARPS,
     )
     return output, permuted_scale, permuted_probs
 
@@ -503,23 +505,6 @@ def _unpermute_kernel(
     tl.store(output_ptr + output_off, accumulator, mask=mask)
 
 
-try:
-    _unpermute_kernel = triton.autotune(
-        configs=[
-            triton.Config({"BLOCK_SIZE": 64}),
-            triton.Config({"BLOCK_SIZE": 128}),
-            triton.Config({"BLOCK_SIZE": 256}),
-            triton.Config({"BLOCK_SIZE": 512}),
-            triton.Config({"BLOCK_SIZE": 1024}),
-            triton.Config({"BLOCK_SIZE": 2048}),
-            triton.Config({"BLOCK_SIZE": 4096}),
-        ],
-        key=["hidden_size"],
-    )(_unpermute_kernel)
-except RuntimeError:
-    pass
-
-
 def unpermute_with_mask_map(
     inp: torch.Tensor,
     row_id_map: torch.Tensor,
@@ -556,9 +541,8 @@ def unpermute_with_mask_map(
     else:
         unpermuted_probs = None
 
-    # pylint: disable=unnecessary-lambda-assignment
-    def grid(META):
-        return (num_tokens, triton.cdiv(hidden_size, META["BLOCK_SIZE"]))
+    block_size = _row_block_size(hidden_size)
+    grid = (num_tokens, triton.cdiv(hidden_size, block_size))
 
     _unpermute_kernel[grid](
         inp,
@@ -583,6 +567,8 @@ def unpermute_with_mask_map(
         PROBS_LOAD_WIDTH=triton.next_power_of_2(num_experts),
         WITH_MERGING_PROBS=merging_probs is not None,
         PERMUTE_PROBS=permuted_probs is not None,
+        BLOCK_SIZE=block_size,
+        num_warps=_ROW_NUM_WARPS,
     )
     return output, unpermuted_probs
 

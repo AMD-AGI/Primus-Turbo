@@ -2399,7 +2399,10 @@ def _autotune_np_dispatch(
             persistent=False,
             agpr_inplace=True,
             store_cshuffle=False,
-            sched_schedbar=False,
+            # As on the persistent config below: the before-mfma rendezvous is redundant on NN
+            # (the after-mfma barriers already separate a fill from its reader), and dropping the
+            # runtime WG sync is worth ~1% of the MoE MLP step. NT keeps its real barrier.
+            sched_schedbar=True,
             nt_vmcnt=-1,
             i64_traverse=i64_tr,
             N=N,
