@@ -2,6 +2,19 @@
 // Only the host launchers survive as stubs, so the symbols fail at call time, not at link time.
 #include <primus_turbo/deep_ep/common/arch.cuh>
 
+#include "api.cuh"
+
+// ROCm: hoisted out of the guard -- Config::get_nvl_buffer_size_hint needs this on the
+// pure-intranode path too, so it must not be a stub. Upstream returns `sizeof(SourceMeta)`;
+// the EP_STATIC_ASSERT next to that struct below pins the two together.
+namespace primus_turbo::deep_ep::legacy::internode {
+
+int get_source_meta_bytes() {
+    return 2 * sizeof(int);
+}
+
+}  // namespace primus_turbo::deep_ep::legacy::internode
+
 #if PRIMUS_TURBO_DEEPEP_HAS_INTERNODE
 
 #include <functional>
@@ -46,9 +59,8 @@ struct SourceMeta {
 
 EP_STATIC_ASSERT(sizeof(SourceMeta) % sizeof(int) == 0, "Invalid size of `SourceMeta`");
 
-int get_source_meta_bytes() {
-    return sizeof(SourceMeta);
-}
+// ROCm: `get_source_meta_bytes` is defined above the guard, this keeps it honest
+EP_STATIC_ASSERT(sizeof(SourceMeta) == 2 * sizeof(int), "Invalid size of `SourceMeta`");
 
 __host__ __device__ __forceinline__ int get_num_bytes_per_token(int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights) {
     return static_cast<int>(align_up(hidden_int4 * sizeof(int4) + sizeof(SourceMeta) + num_scales * sizeof(float) +
@@ -2402,12 +2414,6 @@ namespace internode {
 [[noreturn]] static void no_internode() {
     EP_HOST_ASSERT(false and "deep_ep internode is not ported to ROCm yet");
     __builtin_unreachable();
-}
-
-// ROCm: not a stub -- Config::get_nvl_buffer_size_hint needs this on the intranode path too.
-// Mirrors upstream's `sizeof(SourceMeta)`, i.e. two ints.
-int get_source_meta_bytes() {
-    return 2 * sizeof(int);
 }
 
 void notify_dispatch(const int* num_tokens_per_rank,
