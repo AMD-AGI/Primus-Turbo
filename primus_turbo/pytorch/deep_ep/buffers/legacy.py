@@ -377,10 +377,10 @@ class Buffer:
 
         # Internode
         if self.runtime.get_num_rdma_ranks() > 1:
-            assert num_worst_tokens == 0, 'Internode dispatch does not support `num_worst_tokens > 0`'
+            # ROCm: dropped `assert num_worst_tokens == 0`, the no-CPU-sync path now works internode too
             return self.internode_dispatch(x, handle, num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank,
-                                           num_tokens_per_expert, topk_idx, topk_weights, expert_alignment, config, previous_event,
-                                           async_finish, allocate_on_comm_stream)
+                                           num_tokens_per_expert, topk_idx, topk_weights, expert_alignment, num_worst_tokens,
+                                           config, previous_event, async_finish, allocate_on_comm_stream)
 
         # Launch the kernel with cached or non-cached mode
         x, x_scales = x if isinstance(x, tuple) else (x, None)
@@ -461,6 +461,7 @@ class Buffer:
                            num_tokens_per_rank: Optional[torch.Tensor] = None, num_tokens_per_rdma_rank: Optional[torch.Tensor] = None,
                            is_token_in_rank: Optional[torch.Tensor] = None, num_tokens_per_expert: Optional[torch.Tensor] = None,
                            topk_idx: Optional[torch.Tensor] = None, topk_weights: Optional[torch.Tensor] = None, expert_alignment: int = 1,
+                           num_worst_tokens: int = 0,
                            config: Optional[Config] = None,
                            previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
                            allocate_on_comm_stream: bool = False) -> \
@@ -497,7 +498,8 @@ class Buffer:
                 x, x_scales, topk_idx, topk_weights,
                 num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank, num_tokens_per_expert,
                 0, 0, None, None, None, None,
-                expert_alignment, 0, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+                expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish,
+                allocate_on_comm_stream)
             handle = (is_token_in_rank, rdma_channel_prefix_matrix, gbl_channel_prefix_matrix, recv_rdma_channel_prefix_matrix,
                       recv_rdma_rank_prefix_sum, recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, recv_src_meta, send_rdma_head,
                       send_nvl_head)

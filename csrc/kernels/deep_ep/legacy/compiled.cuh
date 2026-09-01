@@ -13,6 +13,8 @@
 
 #define LEGACY_FINISHED_SUM_TAG 1024
 #define LEGACY_NUM_WAIT_NANOSECONDS 500
+// ROCm: __nanosleep -> s_sleep, whose unit is ~64 shader clocks; 16 ticks ~= 500ns at 2GHz
+#define LEGACY_NUM_WAIT_TICKS 16
 
 #define LEGACY_NUM_CPU_TIMEOUT_SECS 100
 // ROCm: 200G -> 10G, clock64() here is the 100 MHz steady counter (arch.cuh)

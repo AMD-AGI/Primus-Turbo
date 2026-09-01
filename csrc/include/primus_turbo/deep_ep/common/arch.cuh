@@ -153,9 +153,13 @@ __device__ __forceinline__ void buffer_st_chunk(void* ptr,
 // ---------------------------------------------------------------------------
 // 5. Multi-node paths
 // ---------------------------------------------------------------------------
-// ROCm: internode is not ported yet, its kernels are upstream NVSHMEM + PTX
+// ROCm: internode rides on rocSHMEM, so it follows whether rocSHMEM was found at build time
 #ifndef PRIMUS_TURBO_DEEPEP_HAS_INTERNODE
+#ifdef DISABLE_ROCSHMEM
 #define PRIMUS_TURBO_DEEPEP_HAS_INTERNODE 0
+#else
+#define PRIMUS_TURBO_DEEPEP_HAS_INTERNODE 1
+#endif
 #endif
 
 // ROCm: IBGDA is compiled out, rocSHMEM exposes no device-side QP handle

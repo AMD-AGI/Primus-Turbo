@@ -1083,31 +1083,46 @@ public:
                                        num_nvl_bytes,
                                        low_latency_mode);
 
-            // Synchronize total received tokens and tokens per expert
-            auto start_time = std::chrono::high_resolution_clock::now();
-            while (true) {
-                // Read total count
-                num_recv_tokens = static_cast<int>(*moe_recv_counter);
-                num_rdma_recv_tokens = static_cast<int>(*moe_recv_rdma_counter);
+            // ROCm: upstream forwards `num_worst_tokens` to the kernels but never skips the
+            // CPU sync here, so the no-sync path is dead. Mirror the intranode branch above.
+            if (num_worst_tokens > 0) {
+                // No CPU sync, just allocate the worst case
+                num_recv_tokens = num_worst_tokens;
+                num_rdma_recv_tokens = num_worst_tokens;
 
-                // Read per-expert count
-                bool ready = (num_recv_tokens >= 0) and (num_rdma_recv_tokens >= 0);
-                for (int i = 0; i < num_local_experts and ready; ++i)
-                    ready &= moe_recv_expert_counter[i] >= 0;
+                // Must be forward with top-k stuffs
+                EP_HOST_ASSERT(topk_idx.has_value());
+                EP_HOST_ASSERT(topk_weights.has_value());
+            } else {
+                // Synchronize total received tokens and tokens per expert
+                auto start_time = std::chrono::high_resolution_clock::now();
+                while (true) {
+                    // Read total count
+                    num_recv_tokens = static_cast<int>(*moe_recv_counter);
+                    num_rdma_recv_tokens = static_cast<int>(*moe_recv_rdma_counter);
 
-                if (ready)
-                    break;
+                    // Read per-expert count
+                    bool ready = (num_recv_tokens >= 0) and (num_rdma_recv_tokens >= 0);
+                    for (int i = 0; i < num_local_experts and ready; ++i)
+                        ready &= moe_recv_expert_counter[i] >= 0;
 
-                // Timeout check
-                if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::high_resolution_clock::now() - start_time).count() >
-                    LEGACY_NUM_CPU_TIMEOUT_SECS) {
-                    printf("Global rank: %d, num_recv_tokens: %d, num_rdma_recv_tokens: %d\n", rank, num_recv_tokens, num_rdma_recv_tokens);
-                    for (int i = 0; i < num_local_experts; ++i)
-                        printf("moe_recv_expert_counter[%d]: %d\n", i, moe_recv_expert_counter[i]);
-                    throw std::runtime_error("DeepEP error: timeout (dispatch CPU)");
+                    if (ready)
+                        break;
+
+                    // Timeout check
+                    if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::high_resolution_clock::now() - start_time)
+                            .count() > LEGACY_NUM_CPU_TIMEOUT_SECS) {
+                        printf("Global rank: %d, num_recv_tokens: %d, num_rdma_recv_tokens: %d\n",
+                               rank,
+                               num_recv_tokens,
+                               num_rdma_recv_tokens);
+                        for (int i = 0; i < num_local_experts; ++i)
+                            printf("moe_recv_expert_counter[%d]: %d\n", i, moe_recv_expert_counter[i]);
+                        throw std::runtime_error("DeepEP error: timeout (dispatch CPU)");
+                    }
                 }
+                num_recv_tokens_per_expert_list = std::vector<int>(moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
             }
-            num_recv_tokens_per_expert_list = std::vector<int>(moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
         }
 
         // Allocate new tensors
