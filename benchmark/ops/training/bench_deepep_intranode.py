@@ -15,8 +15,8 @@ import pandas as pd
 import torch
 import torch.distributed as dist
 from config import BATCH_SIZE_LIST, gen_deepep_test_cases, get_platform_info
-from deep_ep.test_intranode import test_main
-from deep_ep.utils import get_deep_ep_backend, init_dist
+from deep_ep.legacy.test_intranode import test_main
+from deep_ep.utils.envs import get_deep_ep_backend, init_dist
 from tabulate import tabulate
 
 

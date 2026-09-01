@@ -17,18 +17,16 @@ import time
 import torch
 import torch.distributed as dist
 
-from .utils import (
-    bench,
-    bench_kineto,
+from ..utils.envs import get_deep_ep_backend, init_dist
+from ..utils.math import (
     calc_diff,
     create_grouped_scores,
-    get_deep_ep_backend,
     hash_tensor,
-    init_dist,
     inplace_unique,
     per_token_cast_back,
     per_token_cast_to_fp8,
 )
+from ..utils.testing import bench, bench_kineto
 
 
 # noinspection PyShadowingNames

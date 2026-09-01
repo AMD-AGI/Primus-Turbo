@@ -16,15 +16,9 @@ import time
 import torch
 import torch.distributed as dist
 
-from .utils import (
-    bench,
-    calc_diff,
-    get_deep_ep_backend,
-    init_dist,
-    inplace_unique,
-    per_token_cast_back,
-    per_token_cast_to_fp8,
-)
+from ..utils.envs import get_deep_ep_backend, init_dist
+from ..utils.math import calc_diff, inplace_unique, per_token_cast_back, per_token_cast_to_fp8
+from ..utils.testing import bench
 
 
 # noinspection PyShadowingNames
