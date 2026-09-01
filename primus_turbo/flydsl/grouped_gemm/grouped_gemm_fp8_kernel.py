@@ -1213,7 +1213,13 @@ def _compile_grouped_nt(
             c10_frag = [mfma.zero_value] * N_ACCUMS
             c11_frag = [mfma.zero_value] * N_ACCUMS
 
-            # Per-mfma scheduling barrier; sched_schedbar swaps it for a compile-time sched_barrier(0). Prologue/cross-iter/epilog barriers stay real.
+            # Before-mfma scheduling barrier; sched_schedbar swaps it for a compile-time
+            # sched_barrier(0). After-mfma barriers stay real, as on the NN twin: each one
+            # separates an LDS fill from the read it overwrites, and they also hold off the
+            # ds_read that would land on the registers an in-flight mfma is still sourcing.
+            # Demoting them was measured at +1.80% on the mlp unit -- the rendezvous is
+            # holding the waves in convoy, so removing it costs more than it saves.
+            # Prologue/tail/epilog barriers stay real.
             def _ibar():
                 if const_expr(sched_schedbar):
                     rocdl.sched_barrier(0)
@@ -1304,25 +1310,31 @@ def _compile_grouped_nt(
                     wait_barrier(_nd)
 
                     for k in range_constexpr(K_ITERS - 2):
+                        # Every ds_read of the iteration is issued here, above the first mfma.
+                        # What follows a mfma group is then only global->LDS fills, and those
+                        # write LDS rather than registers, so no later instruction can land on
+                        # a source an in-flight mfma is still reading -- which leaves the WAR
+                        # edges of all four pools as the only real rendezvous the iteration
+                        # needs, and one barrier covers every one of them.
                         b0_frag = _bs2r.load(b_c0)
                         a0_frag = a_s2r.load(a_c0)
                         if const_expr(_full):
                             b1_frag = _bs2r.load(b_c1)
-                        rocdl.s_barrier()
+                        _ibar()
                         rocdl.s_setprio(1)
                         c00 = _mm.call(a0_frag, b0_frag, c00)
                         rocdl.s_setprio(0)
                         rocdl.s_barrier()
                         _bg2s.load(b_c0, B0_gl_offset + (k + 2) * BLOCK_K)
                         if const_expr(_full):
-                            rocdl.s_barrier()
+                            _ibar()
                             rocdl.s_setprio(1)
                             c01 = _mm.call(a0_frag, b1_frag, c01)
                             rocdl.s_setprio(0)
                             rocdl.s_barrier()
                         a1_frag = a_s2r.load(a_c1)
                         a_g2s.load(a_c0, A0_gl_offset + (k + 2) * BLOCK_K)
-                        rocdl.s_barrier()
+                        _ibar()
                         rocdl.s_setprio(1)
                         c10 = _mm.call(a1_frag, b0_frag, c10)
                         rocdl.s_setprio(0)
@@ -1341,23 +1353,24 @@ def _compile_grouped_nt(
                         b_c0, b_n0 = b_n0, b_c0
                         b_c1, b_n1 = b_n1, b_c1
 
-                    # Tail step K_ITERS-2: every stage already issued (distance 2), read only.
+                    # Tail step K_ITERS-2: every stage already issued (distance 2), read only
+                    # -- so these barriers carry no WAR edge, only the mfma-src fence.
                     b0_frag = _bs2r.load(b_c0)
                     a0_frag = a_s2r.load(a_c0)
-                    rocdl.s_barrier()
+                    _ibar()
                     rocdl.s_setprio(1)
                     c00 = _mm.call(a0_frag, b0_frag, c00)
                     rocdl.s_setprio(0)
                     rocdl.s_barrier()
                     if const_expr(_full):
                         b1_frag = _bs2r.load(b_c1)
-                        rocdl.s_barrier()
+                        _ibar()
                         rocdl.s_setprio(1)
                         c01 = _mm.call(a0_frag, b1_frag, c01)
                         rocdl.s_setprio(0)
                         rocdl.s_barrier()
                     a1_frag = a_s2r.load(a_c1)
-                    rocdl.s_barrier()
+                    _ibar()
                     rocdl.s_setprio(1)
                     c10 = _mm.call(a1_frag, b0_frag, c10)
                     rocdl.s_setprio(0)
@@ -1383,14 +1396,14 @@ def _compile_grouped_nt(
                     rocdl.s_barrier()
                     if const_expr(_full):
                         b1_frag = _bs2r.load(b_c1)
-                        rocdl.s_barrier()
+                        _ibar()
                         rocdl.s_setprio(1)
                         c01 = _mm.call(a0_frag, b1_frag, c01)
                         rocdl.s_setprio(0)
                         rocdl.s_barrier()
                     a1_frag = a_s2r.load(a_c1)
                     a1_frag = mask_a_tail(a1_frag, lane_id, K_TAIL)
-                    rocdl.s_barrier()
+                    _ibar()
                     rocdl.s_setprio(1)
                     c10 = _mm.call(a1_frag, b0_frag, c10)
                     if const_expr(_full):
