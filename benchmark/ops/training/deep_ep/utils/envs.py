@@ -4,8 +4,7 @@
 # Modification Copyright© 2025 Advanced Micro Devices, Inc. All rights reserved.
 #
 # Derived from DeepEP (https://github.com/deepseek-ai/DeepEP), deep_ep/utils/envs.py.
-# The NVIDIA-only probes (NVLink/RDMA speeds, domain sizes) are dropped, and
-# `get_deep_ep_backend` is new: it picks between upstream DeepEP and Turbo.
+# The NVIDIA-only probes (NVLink/RDMA speeds, domain sizes) are dropped.
 #
 # See LICENSE for license information.
 ###############################################################################
@@ -21,17 +20,6 @@ import torch.distributed as dist
 _local_rank = None
 _local_seed = 0
 _global_seed = 0
-
-
-def get_deep_ep_backend(backend: str):
-    if backend == "deep_ep":
-        import deep_ep
-    elif backend == "turbo":
-        from primus_turbo.pytorch import deep_ep
-    else:
-        raise ValueError(f"Invalid backend: {backend}")
-
-    return deep_ep
 
 
 def init_seed(global_seed: int) -> None:

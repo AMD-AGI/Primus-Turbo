@@ -11,12 +11,22 @@
 ###############################################################################
 
 import argparse
+import sys
 import time
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
 
-from ..utils.envs import get_deep_ep_backend, init_dist
+# noinspection PyUnresolvedReferences
+from primus_turbo.pytorch import deep_ep
+
+# Allow `python <this file>`, not just `python -m deep_ep.legacy.<test>`
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "deep_ep.legacy"
+
+from ..utils.envs import init_dist
 from ..utils.math import calc_diff, inplace_unique, per_token_cast_back, per_token_cast_to_fp8
 from ..utils.testing import bench
 
@@ -28,13 +38,13 @@ def test_main(
     local_rank: int,
     num_ranks: int,
     rank: int,
-    buffer,
+    buffer: deep_ep.Buffer,
     group: dist.ProcessGroup,
 ):
     # Settings
     num_tokens, hidden = args.num_tokens, args.hidden
     num_topk, num_experts = args.num_topk, args.num_experts
-    deep_ep = get_deep_ep_backend(args.backend)
+
     assert num_experts % num_ranks == 0
     if local_rank == 0:
         print(f"[config] num_tokens={num_tokens}, hidden={hidden}, num_topk={num_topk}", flush=True)
@@ -333,7 +343,6 @@ def test_main(
 def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
     test_ll_compatibility, num_rdma_bytes = False, 0
-    deep_ep = get_deep_ep_backend(args.backend)
     if test_ll_compatibility:
         ll_num_tokens, ll_hidden, ll_num_experts, _ll_num_topk = 16, 5120, 256, 9
         num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(
@@ -370,7 +379,6 @@ if __name__ == "__main__":
     parser.add_argument("--hidden", type=int, default=7168, help="Hidden dimension size (default: 7168)")
     parser.add_argument("--num-topk", type=int, default=8, help="Number of top-k experts (default: 8)")
     parser.add_argument("--num-experts", type=int, default=256, help="Number of experts (default: 256)")
-    parser.add_argument("--backend", type=str, default="turbo", help="Backend to use (default: deep_ep)")
     args = parser.parse_args()
 
     num_processes = args.num_processes

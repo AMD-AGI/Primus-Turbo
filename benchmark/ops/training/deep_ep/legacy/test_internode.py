@@ -12,12 +12,22 @@
 
 import argparse
 import os
+import sys
 import time
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
 
-from ..utils.envs import get_deep_ep_backend, init_dist
+# noinspection PyUnresolvedReferences
+from primus_turbo.pytorch import deep_ep
+
+# Allow `python <this file>`, not just `python -m deep_ep.legacy.<test>`
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "deep_ep.legacy"
+
+from ..utils.envs import init_dist
 from ..utils.math import (
     calc_diff,
     create_grouped_scores,
@@ -38,14 +48,13 @@ def test_main(
     num_ranks: int,
     num_nodes: int,
     rank: int,
-    buffer,
+    buffer: deep_ep.Buffer,
     group: dist.ProcessGroup,
     skip_benchmark: bool = False,
 ):
     # Settings
     num_tokens, hidden = args.num_tokens, args.hidden
     num_topk_groups, num_topk, num_experts = args.num_topk_groups, args.num_topk, args.num_experts
-    deep_ep = get_deep_ep_backend(args.backend)
 
     assert num_experts % num_ranks == 0 and num_local_ranks == 8
     if local_rank == 0:
@@ -411,8 +420,6 @@ def test_main(
 def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     num_nodes = int(os.getenv("WORLD_SIZE", 1))
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
-
-    deep_ep = get_deep_ep_backend(args.backend)
     num_sms = 32
 
     buffer = deep_ep.Buffer(group, int(2e9), int(1e9), low_latency_mode=False, explicitly_destroy=True)
@@ -493,7 +500,6 @@ if __name__ == "__main__":
         help="Pressure test mode. 0: don't do pressure test, 1: do pressure test without benchmarks, 2: do pressure test with benchmarks",
     )
     parser.add_argument("--num-experts", type=int, default=256, help="Number of experts (default: 256")
-    parser.add_argument("--backend", type=str, default="turbo", help="Backend to use (default: turbo)")
     args = parser.parse_args()
 
     # Set default `num_topk_groups` if not provided

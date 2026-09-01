@@ -16,8 +16,10 @@ import torch
 import torch.distributed as dist
 from config import BATCH_SIZE_LIST, gen_deepep_test_cases, get_platform_info
 from deep_ep.legacy.test_intranode import test_main
-from deep_ep.utils.envs import get_deep_ep_backend, init_dist
+from deep_ep.utils.envs import init_dist
 from tabulate import tabulate
+
+from primus_turbo.pytorch import deep_ep
 
 
 def profile_intranode(
@@ -108,8 +110,6 @@ def benchmark_intranode(local_rank: int, num_local_ranks: int, args: argparse.Na
 
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
 
-    deep_ep = get_deep_ep_backend(args.backend)
-
     buffer = deep_ep.Buffer(group, int(2e9), 0, low_latency_mode=False, explicitly_destroy=True)
 
     test_cases = gen_deepep_test_cases()
@@ -133,7 +133,6 @@ def benchmark_intranode(local_rank: int, num_local_ranks: int, args: argparse.Na
                     hidden=hidden,
                     num_topk=num_topk,
                     num_experts=num_experts,
-                    backend=args.backend,
                 )
 
                 dispatch_time_ms, dispatch_bw, combine_time_ms, combine_bw, correct = profile_intranode(
@@ -221,7 +220,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-processes", type=int, default=8, help="Number of processes to spawn (default: 8)"
     )
-    parser.add_argument("--backend", type=str, default="turbo", help="Backend to use (default: turbo)")
     parser.add_argument("--num-sms", type=int, default=64, help="Number of SMs to use (default: 32)")
     parser.add_argument(
         "--output",

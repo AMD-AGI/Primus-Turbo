@@ -327,6 +327,5 @@ tasks:
   - label: deep_ep_intranode
     group: deepep
     script: bench_deepep_intranode.py
-    args: [--backend, turbo]
     output: deep_ep_intranode_turbo_benchmark.csv
     gpus: 8
