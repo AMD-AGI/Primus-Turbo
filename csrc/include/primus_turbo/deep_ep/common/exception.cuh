@@ -1,6 +1,5 @@
 #pragma once
 
-// ROCm: need hipError_t / hipGetErrorName for the checks below
 #include <hip/hip_runtime.h>
 
 #include <exception>

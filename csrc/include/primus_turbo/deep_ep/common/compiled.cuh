@@ -30,7 +30,6 @@
 #endif
 
 #include <cstdint>
-// ROCm: cuda_bf16.h/cuda_runtime.h -> HIP equivalents
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp8.h>
 #include <hip/hip_runtime.h>
@@ -55,14 +54,12 @@ __device__ __forceinline__ longlong4_t make_longlong4_t(
     return {x, y, z, w};
 }
 
-// ROCm: pull in the arch traits (wave size, named barrier, waitcnt)
 #include <primus_turbo/deep_ep/common/arch.cuh>
 
 #ifndef EP_NUM_TOPK_IDX_BITS
 #define EP_NUM_TOPK_IDX_BITS 64
 #endif
 
-// ROCm: deep_ep -> primus_turbo::deep_ep
 namespace primus_turbo::deep_ep {
 
 #ifndef DISABLE_SM90_FEATURES

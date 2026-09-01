@@ -1,7 +1,6 @@
 #include <pybind11/pybind11.h>
 #include <torch/python.h>
 
-// ROCm: include root deep_ep/ -> primus_turbo/deep_ep/
 #include <primus_turbo/deep_ep/common/compiled.cuh>
 
 // ROCm: "jit/api.hpp" and "elastic/buffer.hpp" are dropped, elastic/ is a placeholder
@@ -20,7 +19,6 @@ void register_deep_ep_apis(pybind11::module_& m) {
     m.attr("topk_idx_t") = pybind11::cast(c10::CppTypeToScalarType<topk_idx_t>::value);
 
     // Register legacy buffer APIs
-    // ROCm: register_apis -> legacy::register_apis, this function stays in deep_ep
     legacy::register_apis(m);
 }
 

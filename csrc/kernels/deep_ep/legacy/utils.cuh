@@ -29,7 +29,6 @@
         }                                                                                                                                     \
     }
 
-// ROCm: deep_ep::legacy -> primus_turbo::deep_ep::legacy
 namespace primus_turbo::deep_ep::legacy {
 
 template <int kBytes>
@@ -69,9 +68,7 @@ __device__ __forceinline__ void trap() {
     abort();  // ROCm: asm("trap;") -> abort()
 }
 
-// ROCm: PTX fences -> __builtin_amdgcn_fence, scope "" is system.
-// Ordering lives in the fence; the cache modifier that makes a write visible at
-// all lives in the `coherent` family below. The two are independent here.
+// ROCm: PTX fences -> __builtin_amdgcn_fence, scope "" is system
 __device__ __forceinline__ void memory_fence() {
     __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "");
 }
@@ -84,10 +81,8 @@ __device__ __forceinline__ void memory_fence_cta() {
     __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "workgroup");
 }
 
-// ROCm: new, the `coherent` family carries cache modifiers and no ordering: `sc1` for
-// GPU-wide visibility, `sc0 sc1` for peers. The `*_x4` flavour keeps the full dwordx4
-// but the wave's lanes must cover one element each, ascending from a shared base; the
-// plain one takes any pointer at 8 bytes.
+// ROCm: new, cache modifiers with no ordering: `sc1` GPU-wide, `sc0 sc1` for a peer.
+// `*_x4` keeps the full dwordx4 but needs one ascending element per lane; the plain one is 8 bytes.
 template <int kMaxBytes, typename dtype_t>
 struct CoherentChunk {
     static constexpr int kBytes = (kMaxBytes >= 16 and alignof(dtype_t) >= 16) ? 16
@@ -143,8 +138,7 @@ __device__ __forceinline__ void st_coherent_impl(const dtype_t* ptr, const dtype
         __hip_atomic_store(dst + i, src[i], __ATOMIC_RELAXED, kScope);
 }
 
-// The wave reads one `dtype_t` per lane at consecutive addresses (UNROLLED_WARP_COPY),
-// so the furthest lane sits (WARP_SIZE - 1) elements past the base
+// One element per lane at consecutive addresses, so the furthest lane is WARP_SIZE - 1 past the base
 template <typename dtype_t>
 static constexpr uint32_t kWaveSpanBytes = WARP_SIZE * sizeof(dtype_t);
 
@@ -277,11 +271,8 @@ __device__ __forceinline__ int64_t ld_volatile_global(const volatile uint64_t* p
     return static_cast<int64_t>(__hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM));
 }
 
-// ROCm: `ld.global.nc` / `st.global.L1::no_allocate` are cache hints on a plain access,
-// which is the opposite of what a peer's buffer needs here -- no ROCm access carries both.
-// The upstream names stay as the API surface but have no body: every caller names what it
-// wants instead, the `coherent` family for a peer and `__ldg` / a plain store for our own
-// memory. Instantiating either one is the error.
+// ROCm: `ld.global.nc` / `st.global.L1::no_allocate` have no ROCm spelling that also carries
+// cache modifiers, so the names stay as API surface and every caller picks what it wants
 template <typename dtype_t>
 struct kHasNoRocmMapping : std::false_type {};
 
@@ -325,7 +316,7 @@ __device__ __forceinline__ void st_na_release(const uint64_t* ptr, uint64_t val)
     __hip_atomic_store(const_cast<uint64_t*>(ptr), val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
 }
 
-// ROCm: the store half of the pair above, same reasoning, same empty body
+// ROCm: the store half of the pair above
 template <typename dtype_t>
 __device__ __forceinline__ void st_na_global(const dtype_t* ptr, const dtype_t& value) {
     EP_STATIC_ASSERT(kHasNoRocmMapping<dtype_t>::value, "st_na_global: pick st_coherent_sys_global/_x4 for a peer's buffer, a plain store for our own");
@@ -439,10 +430,7 @@ __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int ran
 
     // For non-sync-only cases, the memory operations by other threads in the block must be visible to the `sys` scope
     if constexpr (not kSyncOnly) {
-        // ROCm: `memory_fence()` -> a drain. Everything this block published carries
-        // `sc0 sc1` and never entered L2, so the `buffer_wbl2` / `buffer_inv` an
-        // ACQ_REL sys fence emits write back and invalidate nothing -- and cost 21%
-        // of end-to-end bandwidth, measured. Only the drain is load-bearing.
+        // ROCm: `memory_fence()` -> a drain, what this block published carries `sc0 sc1`
         s_waitcnt();
         __syncthreads();
     }

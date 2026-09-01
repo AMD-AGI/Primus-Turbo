@@ -2,27 +2,22 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDADataType.h>
-// ROCm: cuda_runtime.h -> hip_runtime.h
 #include <hip/hip_runtime.h>
 #include <torch/python.h>
 
 #include <chrono>
 #include <memory>
 
-// ROCm: include root deep_ep/ -> primus_turbo/deep_ep/
 #include <primus_turbo/deep_ep/common/compiled.cuh>
 #include <primus_turbo/deep_ep/common/exception.cuh>
 
-// ROCm: upstream's csrc/kernels/ root -> the shared include root
 #include <primus_turbo/deep_ep/backend/api.cuh>
 #include <primus_turbo/deep_ep/legacy/api.cuh>
 
-// ROCm: upstream's csrc/utils/ root remapped onto the copy's layout
 #include "../event.hpp"
 #include "../shared_memory.hpp"
 #include "config.hpp"
 
-// ROCm: deep_ep::legacy -> primus_turbo::deep_ep::legacy
 namespace primus_turbo::deep_ep::legacy {
 
 struct Buffer {
@@ -155,8 +150,8 @@ public:
         CUDA_RUNTIME_CHECK(cudaMalloc(&workspace, LEGACY_NUM_WORKSPACE_BYTES));
         CUDA_RUNTIME_CHECK(cudaMemsetAsync(workspace, 0, LEGACY_NUM_WORKSPACE_BYTES, comm_stream));
 
-        // ROCm: hipHostGetDevicePointer takes void** only, so the call sites cast
         // MoE counter
+        // ROCm: hipHostGetDevicePointer takes void** only, so the call sites cast
         CUDA_RUNTIME_CHECK(cudaMallocHost(&moe_recv_counter, sizeof(int64_t), cudaHostAllocMapped));
         CUDA_RUNTIME_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&moe_recv_counter_mapped), const_cast<int*>(moe_recv_counter), 0));
         *moe_recv_counter = -1;

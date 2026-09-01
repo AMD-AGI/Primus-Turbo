@@ -5,7 +5,6 @@
 // ROCm: new, whole-file arch gate, the low-latency kernels are pure IBGDA
 #if PRIMUS_TURBO_DEEPEP_HAS_IBGDA
 
-// ROCm: deep_ep::legacy -> primus_turbo::deep_ep::legacy
 namespace primus_turbo::deep_ep::legacy {
 
 namespace internode_ll {

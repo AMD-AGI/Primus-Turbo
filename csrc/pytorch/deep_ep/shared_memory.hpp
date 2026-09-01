@@ -1,8 +1,7 @@
 #pragma once
 
-// ROCm: port of upstream csrc/utils/shared_memory.hpp. `use_fabric` has no HIP
-// counterpart and is rejected, and the allocation size is remembered here because a
-// HIP IPC handle carries none. Coherence is the accessor's job (see legacy/utils.cuh).
+// ROCm: port of upstream csrc/utils/shared_memory.hpp, `use_fabric` has no HIP counterpart.
+// The allocation size is kept here because a HIP IPC handle carries none.
 
 #include <hip/hip_runtime.h>
 
@@ -10,7 +9,6 @@
 
 #include <primus_turbo/deep_ep/common/exception.cuh>
 
-// ROCm: deep_ep::shared_memory -> primus_turbo::deep_ep::shared_memory
 namespace primus_turbo::deep_ep::shared_memory {
 
 union MemHandleInner {

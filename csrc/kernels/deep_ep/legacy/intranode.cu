@@ -3,7 +3,6 @@
 #include "launch.cuh"
 #include "utils.cuh"
 
-// ROCm: deep_ep::legacy -> primus_turbo::deep_ep::legacy
 namespace primus_turbo::deep_ep::legacy {
 
 namespace intranode {
@@ -59,8 +58,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         //  - `per_rank_buffer[rank][i, j]` means the number of tokens from rank i to rank j
         //  - `per_expert_buffer[rank][i, j]` means the number of tokens from rank i to local expert j
         int num_experts_per_rank = num_experts / kNumRanks;
-        // ROCm: plain stores -> st_coherent_sys_global, every access to a peer's comm buffer
-        // must carry `sc0 sc1` or a bypassing reader reads straight past it
+        // ROCm: plain stores -> st_coherent_sys_global, a peer's comm buffer needs `sc0 sc1`
         if (thread_id < kNumRanks) {
             st_coherent_sys_global(per_rank_buffer + rank * kNumRanks + thread_id, num_tokens_per_rank[thread_id]);
             #pragma unroll
@@ -94,8 +92,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             sum = (sum + expert_alignment - 1) / expert_alignment * expert_alignment;
             moe_recv_expert_counter_mapped[thread_id] = sum;
         }
-        // ROCm: __syncthreads() alone orders only LDS on CDNA, so drain first:
-        // the reads below take other waves' global stores
+        // ROCm: __syncthreads() orders only LDS on CDNA, so drain the global stores first
         s_waitcnt();
         __syncthreads();
 
@@ -126,8 +123,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             if (elect_one_sync())
                 channel_prefix_matrix[dst_rank * num_channels + channel_id] = count;
         }
-        // ROCm: __syncthreads() alone orders only LDS on CDNA, so drain first:
-        // thread 0 reads other waves' global stores
+        // ROCm: __syncthreads() orders only LDS on CDNA, so drain the global stores first
         s_waitcnt();
         __syncthreads();
 
@@ -355,8 +351,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
             // Check destination queue emptiness, or wait a buffer to be released (rare cases)
             // NOTES: the head index received by different warps may not be the same
             auto start_time = clock64();
-            // ROCm: elect_one_sync() -> `lane_id == 0` in the loop head, keeping the spin
-            // out of divergent control flow the structurizer may reshape
+            // ROCm: elect_one_sync() -> `lane_id == 0` in the loop head, keeps the spin uniform
             while (lane_id == 0) {
                 // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
                 int num_used_slots = cached_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer());
@@ -391,8 +386,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                     // Copy data
                     auto shifted_channel_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
                     auto shifted_x = x + token_idx * hidden_int4;
-                    // ROCm: unroll 5 -> 2 on wave64, 5 overshoots hidden_int4 for
-                    // hidden <= 2048 and drops the whole vectorised loop
+                    // ROCm: unroll 5 -> 2 on wave64, 5 overshoots hidden_int4 and drops the loop
                     // ROCm: plain store -> st_coherent_sys_x4, lane-contiguous keeps the dwordx4
 #if defined(__gfx942__) || defined(__gfx950__)
                     UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_channel_x_buffers, shifted_x, __ldg, st_coherent_sys_x4);
@@ -401,8 +395,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
 #endif
 
                     // Copy source index
-                    // ROCm: plain store -> st_coherent_sys_global, this and the metadata stores
-                    // below all write a peer's comm buffer
+                    // ROCm: plain store -> st_coherent_sys_global, this and the stores below are peer buffers
                     if (elect_one_sync())
                         st_coherent_sys_global(channel_src_idx_buffers.buffer() + dst_slot_idx, static_cast<int>(token_idx));
 
@@ -531,9 +524,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                 __syncwarp();
 #else
                 // ROCm: unroll 5 -> 2 on wave64, same stride problem as the sender above
-                // ROCm: ld -> ld_coherent_sys_x4, the source is what a peer wrote here.
-                // The destination is our own `recv_x`, so it takes a plain store: no peer
-                // reads it and the launch boundary publishes it.
+                // ROCm: ld -> ld_coherent_sys_x4, a peer wrote the source; `recv_x` is our own
                 auto st_recv_x = [](int4* dst, const int4& value) { *dst = value; };
 #if defined(__gfx942__) || defined(__gfx950__)
                 UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_recv_x_int4, shifted_buffer_x_int4, ld_coherent_sys_x4, st_recv_x);
@@ -882,10 +873,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                 // Copy data
                 auto shifted_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
                 auto shifted_x = x_int4 + (token_idx + i) * hidden_int4;
-                // ROCm: unroll 4 -> 2 on wave64, 4 leaves hidden <= 2048 with a
-                // single un-pipelined pass
-                // ROCm: ld -> __ldg like the dispatch sender, the source is our own
-                // `x`. Only the destination is a peer's buffer, and it keeps `sc0 sc1`.
+                // ROCm: unroll 4 -> 2 on wave64, 4 leaves hidden <= 2048 un-pipelined
+                // ROCm: ld -> __ldg, the source is our own `x`; only the destination is a peer's
 #if defined(__gfx942__) || defined(__gfx950__)
                 UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_x_buffers, shifted_x, __ldg, st_coherent_sys_x4);
 #else

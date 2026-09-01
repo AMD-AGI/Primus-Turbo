@@ -1,10 +1,8 @@
-// ROCm: include root deep_ep/ -> primus_turbo/deep_ep/
 #include <primus_turbo/deep_ep/common/exception.cuh>
 
 #include "compiled.cuh"
 #include "launch.cuh"
 
-// ROCm: deep_ep::legacy -> primus_turbo::deep_ep::legacy
 namespace primus_turbo::deep_ep::legacy {
 
 namespace layout {

@@ -2,7 +2,6 @@
 
 #include "compiled.cuh"
 
-// ROCm: deep_ep::legacy -> primus_turbo::deep_ep::legacy
 namespace primus_turbo::deep_ep::legacy {
 
 // Layout kernels

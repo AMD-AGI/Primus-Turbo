@@ -1,7 +1,5 @@
-// ROCm: internode is not ported yet. Everything below the guard is the upstream
-// text verbatim (DeepEP@01dc3aa csrc/kernels/legacy/internode.cu) -- it needs
-// NVSHMEM and PTX, so it does not build here. Only the host launchers survive,
-// as stubs, so the symbols fail at call time instead of at link time.
+// ROCm: internode is not ported, below the guard is upstream verbatim and needs NVSHMEM + PTX.
+// Only the host launchers survive as stubs, so the symbols fail at call time, not at link time.
 #include <primus_turbo/deep_ep/common/arch.cuh>
 
 #if PRIMUS_TURBO_DEEPEP_HAS_INTERNODE
@@ -2397,7 +2395,6 @@ void combine(cudaDataType_t type,
 
 #include "api.cuh"
 
-// ROCm: deep_ep::legacy -> primus_turbo::deep_ep::legacy
 namespace primus_turbo::deep_ep::legacy {
 
 namespace internode {

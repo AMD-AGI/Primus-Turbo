@@ -22,7 +22,7 @@
 
 // ROCm: the local intranode::barrier kernel is dropped, legacy/intranode.cu defines it
 
-// ROCm: namespace internode -> nvshmem, signatures now match backend/api.cuh
+// ROCm: signatures now match backend/api.cuh
 namespace primus_turbo::deep_ep::nvshmem {
 
 #ifndef DISABLE_ROCSHMEM

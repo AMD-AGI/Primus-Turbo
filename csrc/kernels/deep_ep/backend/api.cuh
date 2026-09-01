@@ -1,7 +1,6 @@
 #pragma once
 
-// ROCm: cut-down port of upstream backend/api.cuh, only the six entry points the
-// legacy buffer calls. The `nvshmem` spelling stays, the bodies are in ../runtime.cu.
+// ROCm: cut-down port of upstream backend/api.cuh, only what the legacy buffer calls
 
 #include <cstddef>
 #include <cstdint>

@@ -5,11 +5,9 @@
  **************************************************************************************************/
 
 #pragma once
-// ROCm: deep_ep/utils.cuh moved under deep_ep/legacy/ and now needs its sibling header
 #include "../deep_ep/legacy/compiled.cuh"
 #include "../deep_ep/legacy/utils.cuh"
 
-// ROCm: re-expose both deep_ep namespaces so the kernels below stay unqualified
 namespace primus_turbo {
 using namespace deep_ep;
 using namespace deep_ep::legacy;

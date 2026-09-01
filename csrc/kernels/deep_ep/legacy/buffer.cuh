@@ -1,11 +1,9 @@
 #pragma once
 
-// ROCm: include root deep_ep/ -> primus_turbo/deep_ep/
 #include <primus_turbo/deep_ep/common/exception.cuh>
 
 #include "compiled.cuh"
 
-// ROCm: deep_ep::legacy -> primus_turbo::deep_ep::legacy
 namespace primus_turbo::deep_ep::legacy {
 
 template <typename dtype_t>
