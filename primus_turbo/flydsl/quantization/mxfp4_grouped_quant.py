@@ -40,6 +40,7 @@ from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import (
     _cvt_microblock_to_fp4,
     _microblock_amax_f,
     _microblock_vf,
+    _mxfp4_scale_rounding_bias,
     _next_sr_seed,
     _sr_hash,
     vf_exp_up,
@@ -272,6 +273,7 @@ def compile_grouped_mxfp4_qdual(
         COL_SC: fx.Tensor,  # uint8 [N, M_pad_col/32]
         META: fx.Tensor,  # int32 [NBM, 2] = (in_rebase, in_end), filled by ``pre``
         SR_SEED: fx.Int32,  # per-launch stochastic-rounding seed (0 when SR off)
+        SCALE_ROUNDING_BIAS: fx.Int32,
     ):
         # Fused dual tile (one BM x BK tile / WG, one microblock/thread). The per-tile
         # group metadata (in_rebase = abs input row of local 0, in_end = group input end)
@@ -377,7 +379,9 @@ def compile_grouped_mxfp4_qdual(
                         rbits.append(_half_to_f32bits((v4[j] >> 16) & 0xFFFF, is_fp16))  # high 16b
                 vf = _microblock_vf(rbits, row_rht, fold_scale=True)
                 native_bits, rbiased = _compute_scale_native(
-                    _microblock_amax_f(vf), exp_up=vf_exp_up(row_rht)
+                    _microblock_amax_f(vf),
+                    SCALE_ROUNDING_BIAS,
+                    exp_up=vf_exp_up(row_rht),
                 )
                 grow = in_rebase + r_row
                 gcmb = bkc * I32(_CMB) + r_cmb
@@ -413,7 +417,9 @@ def compile_grouped_mxfp4_qdual(
                     ]
                     cvf = _microblock_vf(cbits, col_rht, fold_scale=True)
                     cnative, cbiased = _compute_scale_native(
-                        _microblock_amax_f(cvf), exp_up=vf_exp_up(col_rht)
+                        _microblock_amax_f(cvf),
+                        SCALE_ROUNDING_BIAS,
+                        exp_up=vf_exp_up(col_rht),
                     )
                     c_col = cw * I32(2) + I32(chalf)
                     gcol = bkc * I32(BK) + c_col
@@ -455,12 +461,13 @@ def compile_grouped_mxfp4_qdual(
         OC: fx.Tensor,
         META: fx.Tensor,
         SR_SEED: fx.Int32,
+        SCALE_ROUNDING_BIAS: fx.Int32,
         stream: fx.Stream,
     ):
         # ``pre`` (NBM threads, ~3 workgroups) does the O(G) padded-offset scan once per
         # padded-M block and emits the padded lens/offs; ``kern`` reads two dwords of it.
         pre(GO, LC, OC, META).launch(grid=(_PRE_GRID, 1, 1), block=(_PRE_BLK, 1, 1), stream=stream)
-        kern(X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, META, SR_SEED).launch(
+        kern(X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, META, SR_SEED, SCALE_ROUNDING_BIAS).launch(
             grid=(NBM * NBK, 1, 1), block=(nth, 1, 1), stream=stream
         )
 
@@ -557,7 +564,21 @@ def grouped_quant_mxfp4_raw(
             row_sr=bool(row_sr),
             col_sr=bool(col_sr),
         )
-        comp = _flyc.compile(launch, xi, roi, rsc, coi, col_sc, go, lc, oc, meta, 0, stream)
+        comp = _flyc.compile(
+            launch,
+            xi,
+            roi,
+            rsc,
+            coi,
+            col_sc,
+            go,
+            lc,
+            oc,
+            meta,
+            0,
+            1 << 21,
+            stream,
+        )
         # The cache key includes total_M (a per-step token count), so a broad shape sweep
         # accumulates many compiled quant kernels -> bound it (the live ``comp`` is kept by
         # the local ref, so dropping the dict frees the rest). Real workloads stay under it.
@@ -566,7 +587,20 @@ def grouped_quant_mxfp4_raw(
             gc.collect()
         _GQ_MXFP4_CACHE[key] = comp
     sr_seed = _next_sr_seed() if (row_sr or col_sr) else 0
-    comp(xi, roi, rsc, coi, col_sc, go, lc, oc, meta, sr_seed, stream)
+    comp(
+        xi,
+        roi,
+        rsc,
+        coi,
+        col_sc,
+        go,
+        lc,
+        oc,
+        meta,
+        sr_seed,
+        _mxfp4_scale_rounding_bias(),
+        stream,
+    )
 
     e8 = getattr(torch, "float8_e8m0fnu", torch.uint8)
     return (
