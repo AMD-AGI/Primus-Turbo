@@ -77,15 +77,9 @@ def _s_setprio(val):
 
 
 def _dualwave_sync_barrier():
-    rocdl.sched_barrier(0)
+    # No sched_barrier fence around the rendezvous: s_barrier already orders memory, so the
+    # fences only stopped register-only work (exp2, MFMA) from covering the wait.
     rocdl.s_barrier()
-    rocdl.sched_barrier(0)
-
-
-def _s_nop(x):
-    if not isinstance(x, int) or not 0 <= x <= 15:
-        raise ValueError("s_nop immediate must be a Python int in [0, 15]")
-    llvm.inline_asm(ir.Type.parse("!llvm.void"), [], f"s_nop {x}", "", has_side_effects=True)
 
 
 def _ds_read_tr16_b64(traits, result_type, base_ptr, imm_bytes, buf_id):
@@ -218,21 +212,6 @@ def _packed_o_128_vec(traits, v_o, dc, g, lane_div_32, elem_dtype):
     w2 = is_hi_half.select(as_mlir_value(d0_b), y0_a)
     w3 = is_hi_half.select(as_mlir_value(d1_b), y1_a)
     return Vec.from_elements([fx.Int32(w) for w in (w0, w1, w2, w3)], fx.Int32)
-
-
-def _anchor_v_o(traits, v_o):
-    """Pin v_o accumulators at the current source position."""
-    acc_irs = [as_mlir_value(v_o[dc]) for dc in range_constexpr(traits.D_CHUNKS)]
-    ret_ty = ir.Type.parse(f"!llvm.struct<({', '.join(['vector<16xf32>'] * traits.D_CHUNKS)})>")
-    constraints = ",".join(["=v"] * traits.D_CHUNKS + [str(i) for i in range(traits.D_CHUNKS)])
-    ret = llvm.inline_asm(
-        ret_ty,
-        acc_irs,
-        "",
-        constraints,
-        has_side_effects=True,
-    )
-    return [llvm.extractvalue(acc_irs[dc].type, ret, [dc]) for dc in range_constexpr(traits.D_CHUNKS)]
 
 
 def _anchor_v_p(traits, v_p, elem_dtype):
@@ -942,71 +921,42 @@ class DualwaveKernelContext:
     def floor_masked_max(self, row_max):
         return _fmax(row_max, self.c_neg_floor, self.fm_fast)
 
-    def exp2(self, v_s, start, length):
-        if const_expr(start == 0):
-            s_lo = [Vec(v_s[0])[r] for r in range_constexpr(16)]
-            lo_partial = []
-            for r in range_constexpr(16):
-                lo_partial.append(rocdl.exp2(T.f32, as_mlir_value(s_lo[r])))
-            return Vec.from_elements(lo_partial, fx.Float32).ir_value(), v_s[1]
-        lo_partial = [Vec(v_s[0])[r] for r in range_constexpr(16)]
-        hi_full = []
-        for r in range_constexpr(16):
-            hi_full.append(rocdl.exp2(T.f32, as_mlir_value(Vec(v_s[1])[r])))
-        return lo_partial, hi_full
-
-    def cast_p_and_sum(self, l_row, v_p):
-        """Pack P to bf16 and fold the tile into the row sum; the MFMA path feeds the packs
-        themselves to a ones-matrix MFMA so numerator and denominator see the same bf16 values.
-        Each 16-kv pack is one 16x16x32 MFMA against the ones A operand, which also folds the
-        half-wave partner, so no permlane pair reduce is left; the fence keeps the packs from
-        being hoisted and the scored fptrunc supplies the wait states."""
-        v_p = self.cast_p(v_p)
-        p_lo_packs, p_hi_packs = v_p
-        _sched_barrier(0)
-        for pks in range_constexpr(self.traits.PV_K_STEPS):
-            for pack in (p_lo_packs[pks], p_hi_packs[pks]):
-                l_row = _mfma_acc(
-                    self.rowsum_ones_a,
-                    pack,
-                    l_row,
-                    self.rowsum_mma_atom,
-                    self.rowsum_acc_vec_type,
-                )
-        return v_p, l_row
-
     def finish_row_sum(self, l_row):
         """Take the row sum out of the MFMA accumulator; D element 0 holds this lane's q."""
         return Vec(l_row)[0]
 
-    def cast_p(self, v_p):
-        traits = self.traits
+    def _pack_v8(self, f32_vals):
+        """Pack eight exponentiated scores into one bf16 MFMA operand."""
         elem_dtype = self.elem_dtype
+        if const_expr(self.traits.DTYPE_STR == "bf16"):
+            # A vector fptrunc still selects v_cvt_pk_bf16_f32 pairwise, but as a scored op:
+            # the backend places the pack-to-MFMA wait states itself, so consumers need no
+            # hand fence (inline asm hides the VGPR def from GCNHazardRecognizer).
+            f32_vec = Vec.from_elements([as_mlir_value(v) for v in f32_vals], fx.Float32)
+            trunc_op = llvm.FPTruncOp(Vec.make_type(8, elem_dtype), as_mlir_value(f32_vec))
+            trunc_op.operation.attributes["fastmathFlags"] = ir.Attribute.parse("#llvm.fastmath<fast>")
+            return trunc_op.result
+        f16_vals = []
+        for i in range_constexpr(8):
+            f16_vals.append(fx.Float32(f32_vals[i]).to(elem_dtype))
+        return Vec.from_elements(f16_vals, elem_dtype).ir_value()
 
-        def _pack_v8(f32_vals):
-            if const_expr(traits.DTYPE_STR == "bf16"):
-                # A vector fptrunc still selects v_cvt_pk_bf16_f32 pairwise, but as a scored op:
-                # the backend places the pack-to-MFMA wait states itself, so consumers need no
-                # hand fence (inline asm hides the VGPR def from GCNHazardRecognizer).
-                f32_vec = Vec.from_elements([as_mlir_value(v) for v in f32_vals], fx.Float32)
-                trunc_op = llvm.FPTruncOp(Vec.make_type(8, elem_dtype), as_mlir_value(f32_vec))
-                trunc_op.operation.attributes["fastmathFlags"] = ir.Attribute.parse("#llvm.fastmath<fast>")
-                return trunc_op.result
-            f16_vals = []
-            for i in range_constexpr(8):
-                f16_vals.append(fx.Float32(f32_vals[i]).to(elem_dtype))
-            return Vec.from_elements(f16_vals, elem_dtype).ir_value()
-
-        lo_partial_list, hi_full = v_p
-        p_lo_packs = []
-        p_hi_packs = []
-        for pks in range_constexpr(traits.PV_K_STEPS):
-            p_base = pks * 8
-            lo_slice = [lo_partial_list[p_base + s] for s in range_constexpr(8)]
-            hi_slice = hi_full[p_base : p_base + 8]
-            p_lo_packs.append(_pack_v8(lo_slice))
-            p_hi_packs.append(_pack_v8(hi_slice))
-        return p_lo_packs, p_hi_packs
+    def softmax_half(self, l_row, v_s_half):
+        """Exp2, pack and row-sum one kv half where it is produced: a fixed reference max makes
+        the halves independent, so the stage carries packs instead of raw f32. The sum comes off
+        the packs, so numerator and denominator see the same bf16 values."""
+        flat = [rocdl.exp2(T.f32, as_mlir_value(Vec(v_s_half)[r])) for r in range_constexpr(16)]
+        packs = [self._pack_v8(flat[i * 8 : i * 8 + 8]) for i in range_constexpr(self.traits.PV_K_STEPS)]
+        _sched_barrier(0)
+        for pack in packs:
+            l_row = _mfma_acc(
+                self.rowsum_ones_a,
+                pack,
+                l_row,
+                self.rowsum_mma_atom,
+                self.rowsum_acc_vec_type,
+            )
+        return packs, l_row
 
     def safe_l_inv(self, l_row):
         l_inv = rocdl.rcp(T.f32, as_mlir_value(l_row))
