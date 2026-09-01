@@ -8,7 +8,8 @@
 
 The kernels are stride-aware on both batch and hidden dims so callers can pass
 non-contiguous views (e.g. ``hidden_states.reshape(-1, H)`` on a strided
-fp16/bf16 tensor) without forcing a ``.contiguous()`` copy.
+fp16/bf16 tensor) without forcing a ``.contiguous()`` copy. ``ROW_GROUP`` widens
+that to layouts a flatten cannot express at all -- see ``_row_off``.
 
 Backward formulation (standard):
     grad_x = (grad_out * gamma * rstd) - x * rstd^3 * mean(grad_out * gamma * x) / H
@@ -24,6 +25,11 @@ program over its ``ROWS_PER_BLOCK`` rows, so the partial buffer is
 ``(num_programs, H)`` instead of ``(B, H)``. This is essential at small-H,
 huge-B shapes (e.g. q_norm in MoE attention) where ``(B, H)`` would otherwise
 cost an unreasonable amount of workspace memory.
+
+The forwards can also leave the abs-max of ``y`` behind as one non-negative fp32
+partial per program, reduced in registers under the store's own predicate. A
+tensorwise fp8 quantiser downstream finalises those instead of re-reading ``y``;
+a max is exact and order-independent, so the scale is unchanged.
 """
 
 from __future__ import annotations
@@ -40,6 +46,57 @@ _GRID_STRIDE_BWD_CONFIGS = [
 ]
 
 
+@triton.jit
+def _row_off(row, stride_g, stride_r, ROW_GROUP: tl.constexpr):
+    """Element offset of ``row``, allowing rows to come in groups.
+
+    ``ROW_GROUP == 0`` is the plain case and lowers to exactly ``row * stride_r``.
+    Otherwise ``ROW_GROUP`` consecutive rows sit ``stride_r`` apart inside a slab and
+    the slabs are ``stride_g`` apart: the layout of e.g. ``qkv[:, :AO].view(S, B, HQ, HD)``,
+    which is a legal view of the projection but has no single row stride, so
+    ``reshape(-1, HD)`` would materialise a full contiguous copy of it.
+    """
+    if ROW_GROUP == 0:
+        return row * stride_r
+    return (row // ROW_GROUP) * stride_g + (row % ROW_GROUP) * stride_r
+
+
+@triton.jit
+def _amax_fold(acc, Y_ptr, AMAX_ptr, slot, AMAX: tl.constexpr):
+    """Leave the abs-max of this program's output at ``AMAX_ptr[slot]``, one fp32 each.
+
+    Takes the fp32 ``acc`` that is about to be stored rather than the narrowed value, so the
+    fold adds a reduction and nothing else -- no second copy of the block. Rounding to the
+    store dtype is monotone over magnitudes and commutes with abs, so rounding the max of
+    ``acc`` is the same float as the max of the values that land in memory, which is what a
+    streaming pass over the output would have found. Lanes outside ``H`` hold 0 here, having
+    been loaded with ``other=0.0``, and a max over magnitudes ignores those.
+
+    A plain store, not an atomic into a shared slot: these grids run one program per row, so
+    a norm dispatches tens of thousands of them, and an atomic per program costs 30-45 ns
+    each at that width (measured 148 -> 1629 us on the residual forward). The cross-program
+    max is left to `amax_reduce_kernel`, which is the shape the cpp finalise wants anyway.
+    """
+    if AMAX:
+        a = tl.max(tl.abs(acc))
+        tl.store(AMAX_ptr + slot, a.to(Y_ptr.dtype.element_ty).to(tl.float32))
+
+
+@triton.jit
+def amax_reduce_kernel(SRC_ptr, DST_ptr, n, BLOCK: tl.constexpr):
+    """Fold ``n`` per-program abs-max partials down to ``ceil(n / BLOCK)`` of them.
+
+    The cpp tensorwise cast finalises a bounded number of partials and a forward leaves one
+    per program, so this brings the count under that bound. One contiguous chunk per program:
+    a single coalesced pass over a few hundred KB, against the whole tensor the streaming
+    amax would have re-read.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    v = tl.load(SRC_ptr + offs, mask=offs < n, other=0.0)
+    tl.store(DST_ptr + pid, tl.max(v))
+
+
 # ---------------------------------------------------------------------------
 # Forward — one row per program.
 # ---------------------------------------------------------------------------
@@ -49,6 +106,8 @@ def rmsnorm_fwd_kernel(
     G_ptr,
     Y_ptr,
     RSTD_ptr,
+    AMAX_ptr,
+    stride_xg,
     stride_xb,
     stride_xh,
     stride_yb,
@@ -56,11 +115,13 @@ def rmsnorm_fwd_kernel(
     H: tl.constexpr,
     eps,
     BLOCK_H: tl.constexpr,
+    ROW_GROUP: tl.constexpr = 0,
+    AMAX: tl.constexpr = False,
     ZERO_CENTERED: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_H)
-    x_ptrs = X_ptr + row * stride_xb + offs * stride_xh
+    x_ptrs = X_ptr + _row_off(row, stride_xg, stride_xb, ROW_GROUP) + offs * stride_xh
     y_ptrs = Y_ptr + row * stride_yb + offs * stride_yh
     g_ptrs = G_ptr + offs
     mask = offs < H
@@ -72,9 +133,10 @@ def rmsnorm_fwd_kernel(
     if ZERO_CENTERED:
         # zero-centered gamma: effective gain is (1 + g), computed in fp32.
         g = g + 1.0
-    y = (x * rstd * g).to(Y_ptr.dtype.element_ty)
-    tl.store(y_ptrs, y, mask=mask)
+    acc = x * rstd * g
+    tl.store(y_ptrs, acc.to(Y_ptr.dtype.element_ty), mask=mask)
     tl.store(RSTD_ptr + row, rstd)
+    _amax_fold(acc, Y_ptr, AMAX_ptr, row, AMAX)
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +148,8 @@ def rmsnorm_fwd_kernel_multi_row(
     G_ptr,
     Y_ptr,
     RSTD_ptr,
+    AMAX_ptr,
+    stride_xg,
     stride_xb,
     stride_xh,
     stride_yb,
@@ -95,6 +159,8 @@ def rmsnorm_fwd_kernel_multi_row(
     eps,
     BLOCK_H: tl.constexpr,
     ROWS_PER_BLOCK: tl.constexpr,
+    ROW_GROUP: tl.constexpr = 0,
+    AMAX: tl.constexpr = False,
     ZERO_CENTERED: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
@@ -105,7 +171,8 @@ def rmsnorm_fwd_kernel_multi_row(
     h_offs = tl.arange(0, BLOCK_H)
     h_mask = h_offs < H
 
-    x_ptrs = X_ptr + row_offs[:, None] * stride_xb + h_offs[None, :] * stride_xh
+    x_row = _row_off(row_offs, stride_xg, stride_xb, ROW_GROUP)
+    x_ptrs = X_ptr + x_row[:, None] + h_offs[None, :] * stride_xh
     y_ptrs = Y_ptr + row_offs[:, None] * stride_yb + h_offs[None, :] * stride_yh
     g_ptrs = G_ptr + h_offs
 
@@ -118,9 +185,10 @@ def rmsnorm_fwd_kernel_multi_row(
 
     var = tl.sum(x * x, axis=1) / H
     rstd = tl.rsqrt(var + eps)
-    y = (x * rstd[:, None] * g[None, :]).to(Y_ptr.dtype.element_ty)
-    tl.store(y_ptrs, y, mask=full_mask)
+    acc = x * rstd[:, None] * g[None, :]
+    tl.store(y_ptrs, acc.to(Y_ptr.dtype.element_ty), mask=full_mask)
     tl.store(RSTD_ptr + row_offs, rstd, mask=row_mask)
+    _amax_fold(acc, Y_ptr, AMAX_ptr, pid, AMAX)
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +202,7 @@ def rmsnorm_fwd_residual_kernel(
     Y_ptr,
     XPR_ptr,
     RSTD_ptr,
+    AMAX_ptr,
     stride_xb,
     stride_xh,
     stride_rb,
@@ -145,6 +214,7 @@ def rmsnorm_fwd_residual_kernel(
     H: tl.constexpr,
     eps,
     BLOCK_H: tl.constexpr,
+    AMAX: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_H)
@@ -163,9 +233,10 @@ def rmsnorm_fwd_residual_kernel(
     var = tl.sum(xpr * xpr, axis=0) / H
     rstd = tl.rsqrt(var + eps)
     g = tl.load(g_ptrs, mask=mask, other=0.0).to(tl.float32)
-    y = (xpr * rstd * g).to(Y_ptr.dtype.element_ty)
-    tl.store(y_ptrs, y, mask=mask)
+    acc = xpr * rstd * g
+    tl.store(y_ptrs, acc.to(Y_ptr.dtype.element_ty), mask=mask)
     tl.store(RSTD_ptr + row, rstd)
+    _amax_fold(acc, Y_ptr, AMAX_ptr, row, AMAX)
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +250,7 @@ def rmsnorm_fwd_residual_kernel_multi_row(
     Y_ptr,
     XPR_ptr,
     RSTD_ptr,
+    AMAX_ptr,
     stride_xb,
     stride_xh,
     stride_rb,
@@ -192,6 +264,7 @@ def rmsnorm_fwd_residual_kernel_multi_row(
     eps,
     BLOCK_H: tl.constexpr,
     ROWS_PER_BLOCK: tl.constexpr,
+    AMAX: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     row_start = pid * ROWS_PER_BLOCK
@@ -217,9 +290,10 @@ def rmsnorm_fwd_residual_kernel_multi_row(
 
     var = tl.sum(xpr * xpr, axis=1) / H
     rstd = tl.rsqrt(var + eps)
-    y = (xpr * rstd[:, None] * g[None, :]).to(Y_ptr.dtype.element_ty)
-    tl.store(y_ptrs, y, mask=full_mask)
+    acc = xpr * rstd[:, None] * g[None, :]
+    tl.store(y_ptrs, acc.to(Y_ptr.dtype.element_ty), mask=full_mask)
     tl.store(RSTD_ptr + row_offs, rstd, mask=row_mask)
+    _amax_fold(acc, Y_ptr, AMAX_ptr, pid, AMAX)
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +308,7 @@ def rmsnorm_bwd_kernel_multi_row(
     RSTD_ptr,
     DX_ptr,
     DG_PART_ptr,
+    stride_xg,
     stride_xb,
     stride_xh,
     stride_dyb,
@@ -245,6 +320,7 @@ def rmsnorm_bwd_kernel_multi_row(
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
     ROWS_PER_BLOCK: tl.constexpr,
+    ROW_GROUP: tl.constexpr = 0,
     ZERO_CENTERED: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
@@ -254,7 +330,8 @@ def rmsnorm_bwd_kernel_multi_row(
     h_offs = tl.arange(0, BLOCK_H)
     h_mask = h_offs < H
 
-    x_ptrs = X_ptr + row_offs[:, None] * stride_xb + h_offs[None, :] * stride_xh
+    x_row = _row_off(row_offs, stride_xg, stride_xb, ROW_GROUP)
+    x_ptrs = X_ptr + x_row[:, None] + h_offs[None, :] * stride_xh
     dy_ptrs = DY_ptr + row_offs[:, None] * stride_dyb + h_offs[None, :] * stride_dyh
     dx_ptrs = DX_ptr + row_offs[:, None] * stride_dxb + h_offs[None, :] * stride_dxh
     dgp_ptrs = DG_PART_ptr + pid * stride_dgp + h_offs
@@ -298,6 +375,7 @@ def rmsnorm_bwd_kernel_grid_stride(
     RSTD_ptr,
     DX_ptr,
     DG_PART_ptr,
+    stride_xg,
     stride_xb,
     stride_xh,
     stride_dyb,
@@ -309,6 +387,7 @@ def rmsnorm_bwd_kernel_grid_stride(
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
     num_programs: tl.constexpr,
+    ROW_GROUP: tl.constexpr = 0,
     ZERO_CENTERED: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
@@ -323,7 +402,7 @@ def rmsnorm_bwd_kernel_grid_stride(
     dg_acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
 
     for row in range(pid, B, num_programs):
-        x_ptrs = X_ptr + row * stride_xb + h_offs * stride_xh
+        x_ptrs = X_ptr + _row_off(row, stride_xg, stride_xb, ROW_GROUP) + h_offs * stride_xh
         dy_ptrs = DY_ptr + row * stride_dyb + h_offs * stride_dyh
         dx_ptrs = DX_ptr + row * stride_dxb + h_offs * stride_dxh
 
@@ -369,6 +448,7 @@ def rmsnorm_bwd_residual_kernel_grid_stride(
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
     num_programs: tl.constexpr,
+    HAS_DXPR: tl.constexpr = True,
 ):
     pid = tl.program_id(0)
     h_offs = tl.arange(0, BLOCK_H)
@@ -380,19 +460,19 @@ def rmsnorm_bwd_residual_kernel_grid_stride(
     for row in range(pid, B, num_programs):
         xpr_ptrs = XPR_ptr + row * stride_xprb + h_offs * stride_xprh
         dy_ptrs = DY_ptr + row * stride_dyb + h_offs * stride_dyh
-        dxpr_ptrs = DXPR_ptr + row * stride_dxprb + h_offs * stride_dxprh
         dx_ptrs = DX_ptr + row * stride_dxb + h_offs * stride_dxh
 
         xpr = tl.load(xpr_ptrs, mask=h_mask, other=0.0).to(tl.float32)
         dy = tl.load(dy_ptrs, mask=h_mask, other=0.0).to(tl.float32)
-        dxpr = tl.load(dxpr_ptrs, mask=h_mask, other=0.0).to(tl.float32)
         rstd = tl.load(RSTD_ptr + row).to(tl.float32)
 
         x_hat = xpr * rstd
         dxhat = dy * g
         m = tl.sum(dxhat * x_hat, axis=0) / H
-        dx_norm = (dxhat - x_hat * m) * rstd
-        dx = dx_norm + dxpr
+        dx = (dxhat - x_hat * m) * rstd
+        if HAS_DXPR:
+            dxpr_ptrs = DXPR_ptr + row * stride_dxprb + h_offs * stride_dxprh
+            dx += tl.load(dxpr_ptrs, mask=h_mask, other=0.0).to(tl.float32)
         tl.store(dx_ptrs, dx.to(DX_ptr.dtype.element_ty), mask=h_mask)
 
         dg_acc += dy * x_hat
@@ -452,6 +532,7 @@ def rmsnorm_bwd_residual_kernel_multi_row(
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
     ROWS_PER_BLOCK: tl.constexpr,
+    HAS_DXPR: tl.constexpr = True,
 ):
     pid = tl.program_id(0)
     row_start = pid * ROWS_PER_BLOCK
@@ -462,7 +543,6 @@ def rmsnorm_bwd_residual_kernel_multi_row(
 
     xpr_ptrs = XPR_ptr + row_offs[:, None] * stride_xprb + h_offs[None, :] * stride_xprh
     dy_ptrs = DY_ptr + row_offs[:, None] * stride_dyb + h_offs[None, :] * stride_dyh
-    dxpr_ptrs = DXPR_ptr + row_offs[:, None] * stride_dxprb + h_offs[None, :] * stride_dxprh
     dx_ptrs = DX_ptr + row_offs[:, None] * stride_dxb + h_offs[None, :] * stride_dxh
     dgp_ptrs = DG_PART_ptr + pid * stride_dgp + h_offs
     g_ptrs = G_ptr + h_offs
@@ -470,15 +550,16 @@ def rmsnorm_bwd_residual_kernel_multi_row(
     full_mask = row_mask[:, None] & h_mask[None, :]
     xpr = tl.load(xpr_ptrs, mask=full_mask, other=0.0).to(tl.float32)
     dy = tl.load(dy_ptrs, mask=full_mask, other=0.0).to(tl.float32)
-    dxpr = tl.load(dxpr_ptrs, mask=full_mask, other=0.0).to(tl.float32)
     g = tl.load(g_ptrs, mask=h_mask, other=0.0).to(tl.float32)
     rstd = tl.load(RSTD_ptr + row_offs, mask=row_mask, other=0.0).to(tl.float32)
 
     x_hat = xpr * rstd[:, None]
     dxhat = dy * g[None, :]
     m = tl.sum(dxhat * x_hat, axis=1) / H
-    dx_norm = (dxhat - x_hat * m[:, None]) * rstd[:, None]
-    dx = dx_norm + dxpr
+    dx = (dxhat - x_hat * m[:, None]) * rstd[:, None]
+    if HAS_DXPR:
+        dxpr_ptrs = DXPR_ptr + row_offs[:, None] * stride_dxprb + h_offs[None, :] * stride_dxprh
+        dx += tl.load(dxpr_ptrs, mask=full_mask, other=0.0).to(tl.float32)
 
     tl.store(dx_ptrs, dx.to(DX_ptr.dtype.element_ty), mask=full_mask)
 

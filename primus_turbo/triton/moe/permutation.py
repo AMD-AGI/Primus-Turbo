@@ -265,6 +265,25 @@ def _row_block_size(*widths: int) -> int:
 # against 8 and 16 (permute 218.8 / 271.9 / 353.9 us).
 _ROW_NUM_WARPS = 4
 
+# Everything these two kernels move is streamed: a row is read once, written once, and
+# neither kernel looks at it again. Three of the four row accesses are hinted
+# non-allocating so they stop evicting lines the rest of the hierarchy still wants -- at
+# the deployed width the pair runs 0.4094 -> 0.3218 ms, byte-identical (H=2880, 32768
+# tokens, topk 4). About half of that survives a consumer: with a streaming read of each
+# output appended, the chain is 0.8967 of the unhinted one against 0.7841 for the kernels
+# alone. The permuted scale keeps the default policy -- unlike the activations it is small
+# enough to stay resident for whoever reads it next.
+#
+# Pick these with both kernels running. Measured one at a time each has the whole cache to
+# itself and the ranking inverts: the unpermute's store hint reads as a 2% loss alone and
+# is worth 13% here, and the permute's load is the one access that wants the default, which
+# an isolated reading gets backwards.
+#
+# The routing loop keeps its plain form. `num_stages` does hide the dependent row_id_map
+# load (permute 168.1 -> 163.6 us) but pipelining the padded slot's two-sided predicated
+# store returns different bytes at trip counts the deployed routing never produces, and
+# `loop_unroll_factor` reassociates the merging-probs accumulation; both are worth under 4 us.
+
 
 @triton.jit
 def _permute_kernel(
@@ -334,11 +353,11 @@ def _permute_kernel(
             if prob == 0.0:
                 # for routing_map padding
                 # dst_row != -1 and prob == 0.0 means that this slot is padded
-                tl.store(output_ptr + output_off, 0.0, mask=mask)
+                tl.store(output_ptr + output_off, 0.0, mask=mask, cache_modifier=".cs")
             else:
-                tl.store(output_ptr + output_off, inp, mask=mask)
+                tl.store(output_ptr + output_off, inp, mask=mask, cache_modifier=".cs")
         else:
-            tl.store(output_ptr + output_off, inp, mask=mask)
+            tl.store(output_ptr + output_off, inp, mask=mask, cache_modifier=".cs")
 
 
 def permute_with_mask_map(
@@ -475,7 +494,7 @@ def _unpermute_kernel(
     for idx in tl.range(n_routed):
         src_row = tl.load(row_id_map_ptr + pid_t * stride_row_id_map_token + idx * stride_row_id_map_expert)
         input_off = src_row * stride_input_token + current_offset * stride_input_hidden
-        inp = tl.load(input_ptr + input_off, mask=mask)
+        inp = tl.load(input_ptr + input_off, mask=mask, cache_modifier=".cg")
         inp = inp.to(compute_type)
         if WITH_MERGING_PROBS:
             expert_idx = tl.load(
@@ -502,7 +521,7 @@ def _unpermute_kernel(
                 tl.store(unpermuted_probs_ptr + unpermuted_prob_off, prob)
     accumulator = accumulator.to(data_type)
     output_off = pid_t * stride_output_token + current_offset * stride_output_hidden
-    tl.store(output_ptr + output_off, accumulator, mask=mask)
+    tl.store(output_ptr + output_off, accumulator, mask=mask, cache_modifier=".cs")
 
 
 def unpermute_with_mask_map(

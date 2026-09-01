@@ -9,11 +9,16 @@
 from __future__ import annotations
 
 import functools
+import math
 from typing import Optional, Tuple
 
 import torch
 
+from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+    FP8_AMAX_MAX_PARTIALS,
+)
 from primus_turbo.triton.normalization.rmsnorm_kernel import (
+    amax_reduce_kernel,
     rmsnorm_bwd_finalize_kernel,
     rmsnorm_bwd_kernel_grid_stride,
     rmsnorm_bwd_kernel_multi_row,
@@ -33,6 +38,22 @@ def _next_pow2(x: int) -> int:
     return p
 
 
+def _amax_finalize(partials: torch.Tensor) -> torch.Tensor:
+    """Bring per-program partials within what the cpp tensorwise cast accepts.
+
+    Untouched when the grid already fits, so only the one-row-per-program widths pay the
+    extra pass -- over a few hundred KB, not over the tensor itself.
+    """
+    n = partials.numel()
+    if n <= FP8_AMAX_MAX_PARTIALS:
+        return partials
+    BLOCK = _next_pow2((n + FP8_AMAX_MAX_PARTIALS - 1) // FP8_AMAX_MAX_PARTIALS)
+    grid = (n + BLOCK - 1) // BLOCK
+    out = torch.empty(grid, device=partials.device, dtype=torch.float32)
+    amax_reduce_kernel[(grid,)](partials, out, n, BLOCK=BLOCK, num_warps=1, num_stages=1)
+    return out
+
+
 def _reshape_batch_hidden(x: torch.Tensor, H: int) -> torch.Tensor:
     """Flatten to [B, H] without forcing a contiguous copy.
 
@@ -42,6 +63,37 @@ def _reshape_batch_hidden(x: torch.Tensor, H: int) -> torch.Tensor:
     if x.shape[-1] != H:
         raise ValueError(f"last dim mismatch: expected H={H}, got shape={tuple(x.shape)}")
     return x.reshape(-1, H)
+
+
+def _row_layout(x: torch.Tensor, H: int) -> Tuple[torch.Tensor, int, int, int, int]:
+    """Address ``x``'s rows where they lie, so a strided view needs no flatten copy.
+
+    Returns ``(base, B, stride_g, stride_row, row_group)`` as ``_row_off`` wants them:
+    ``base`` is the tensor the kernels index from, and ``row_group`` is 0 whenever a single
+    row stride reaches every row.
+
+    ``reshape(-1, H)`` only returns a view when the leading dims are contiguous among
+    themselves. The per-head norms break that -- they read ``qkv[:, :AO].view(S, B, HQ, HD)``
+    straight out of the projection, whose rows come in slabs -- so the flatten silently
+    materialises the whole tensor before the kernel has read a byte.
+    """
+    if x.shape[-1] != H:
+        raise ValueError(f"last dim mismatch: expected H={H}, got shape={tuple(x.shape)}")
+    dims, strides = list(x.shape[:-1]), list(x.stride()[:-1])
+    if not dims:
+        return x, 1, 0, 0, 0
+    B = math.prod(dims)
+    # Rows collapse onto one stride exactly where each dim's stride spans the dim inside it.
+    breaks = [i for i in range(len(dims) - 1) if strides[i] != strides[i + 1] * dims[i + 1]]
+    if not breaks:
+        return x, B, 0, strides[-1], 0
+    if len(breaks) == 1:
+        j = breaks[0] + 1
+        group = math.prod(dims[j:])
+        if group > 1:
+            return x, B, strides[j - 1], strides[-1], group
+    x2 = _reshape_batch_hidden(x, H)
+    return x2, B, 0, x2.stride(0), 0
 
 
 def _pick_config(H: int, B: int) -> Tuple[int, int, int, int]:
@@ -117,46 +169,55 @@ def _finalize_dgamma(dg_partial: torch.Tensor, gamma_dtype: torch.dtype) -> torc
 
 
 def rmsnorm_fwd_impl(
-    x: torch.Tensor, gamma: torch.Tensor, eps: float, zero_centered: bool = False
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int, int]:
+    x: torch.Tensor, gamma: torch.Tensor, eps: float, zero_centered: bool = False, amax_out: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int, int, Optional[torch.Tensor]]:
     """Forward launcher.
 
-    Returns ``(y, x2, rstd, BLOCK_H, ROWS, num_warps, num_stages)``. ``x2`` is a
-    [B, H] view of ``x`` (no copy) saved for backward. ``rstd`` is the per-row
-    reciprocal std needed by backward.
+    Returns ``(y, x2, rstd, BLOCK_H, ROWS, num_warps, num_stages, amax)``. ``x2`` is the
+    tensor the kernel read ``x``'s rows from -- usually ``x`` itself, addressed in place --
+    and is saved for backward, which re-derives the same layout from it. ``rstd`` is the
+    per-row reciprocal std needed by backward. ``amax`` is the fp32 abs-max partials of
+    ``y`` when ``amax_out``, else None.
     """
     H = gamma.shape[0]
-    x2 = _reshape_batch_hidden(x, H)
-    B = x2.shape[0]
-    y = torch.empty_like(x2)
+    x2, B, sxg, sxb, row_group = _row_layout(x, H)
+    y = torch.empty((B, H), device=x.device, dtype=x.dtype)
     rstd = torch.empty(B, device=x.device, dtype=torch.float32)
     BLOCK_H, ROWS, num_warps, num_stages = _pick_config(H, B)
+    grid = (B if ROWS == 1 else (B + ROWS - 1) // ROWS,)
+    # One partial per program, every slot written, so it needs no pre-zeroing.
+    amax = torch.empty(grid[0], device=x.device, dtype=torch.float32) if amax_out else None
     if ROWS == 1:
-        rmsnorm_fwd_kernel[(B,)](
+        rmsnorm_fwd_kernel[grid](
             x2,
             gamma,
             y,
             rstd,
-            x2.stride(0),
-            x2.stride(1),
+            amax,
+            sxg,
+            sxb,
+            x2.stride(-1),
             y.stride(0),
             y.stride(1),
             H=H,
             eps=eps,
             BLOCK_H=BLOCK_H,
+            ROW_GROUP=row_group,
+            AMAX=amax_out,
             ZERO_CENTERED=zero_centered,
             num_warps=num_warps,
             num_stages=num_stages,
         )
     else:
-        grid = ((B + ROWS - 1) // ROWS,)
         rmsnorm_fwd_kernel_multi_row[grid](
             x2,
             gamma,
             y,
             rstd,
-            x2.stride(0),
-            x2.stride(1),
+            amax,
+            sxg,
+            sxb,
+            x2.stride(-1),
             y.stride(0),
             y.stride(1),
             B=B,
@@ -164,11 +225,15 @@ def rmsnorm_fwd_impl(
             eps=eps,
             BLOCK_H=BLOCK_H,
             ROWS_PER_BLOCK=ROWS,
+            ROW_GROUP=row_group,
+            AMAX=amax_out,
             ZERO_CENTERED=zero_centered,
             num_warps=num_warps,
             num_stages=num_stages,
         )
-    return y, x2, rstd, BLOCK_H, ROWS, num_warps, num_stages
+    if amax is not None:
+        amax = _amax_finalize(amax)
+    return y, x2, rstd, BLOCK_H, ROWS, num_warps, num_stages, amax
 
 
 def rmsnorm_bwd_impl(
@@ -182,11 +247,15 @@ def rmsnorm_bwd_impl(
     num_stages: int,
     zero_centered: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Backward launcher. Returns (dx [B, H], dgamma [H])."""
+    """Backward launcher. Returns (dx [B, H], dgamma [H]).
+
+    ``x2`` is what the forward saved; ``_row_layout`` is idempotent on its own output, so
+    re-deriving here reproduces the forward's addressing without threading it through ctx.
+    """
     H = gamma.shape[0]
-    B = x2.shape[0]
+    x2, B, sxg, sxb, row_group = _row_layout(x2, H)
     dy2 = _reshape_batch_hidden(dy, H)
-    dx = torch.empty_like(x2)
+    dx = torch.empty((B, H), device=x2.device, dtype=x2.dtype)
     mode, BLOCK_H, GR, num_warps, num_stages = _pick_bwd_config(H, B)
     if mode == "multi":
         ROWS = GR
@@ -199,8 +268,9 @@ def rmsnorm_bwd_impl(
             rstd,
             dx,
             dg_partial,
-            x2.stride(0),
-            x2.stride(1),
+            sxg,
+            sxb,
+            x2.stride(-1),
             dy2.stride(0),
             dy2.stride(1),
             dx.stride(0),
@@ -210,6 +280,7 @@ def rmsnorm_bwd_impl(
             H=H,
             BLOCK_H=BLOCK_H,
             ROWS_PER_BLOCK=ROWS,
+            ROW_GROUP=row_group,
             ZERO_CENTERED=zero_centered,
             num_warps=num_warps,
             num_stages=num_stages,
@@ -224,8 +295,9 @@ def rmsnorm_bwd_impl(
             rstd,
             dx,
             dg_partial,
-            x2.stride(0),
-            x2.stride(1),
+            sxg,
+            sxb,
+            x2.stride(-1),
             dy2.stride(0),
             dy2.stride(1),
             dx.stride(0),
@@ -235,6 +307,7 @@ def rmsnorm_bwd_impl(
             H=H,
             BLOCK_H=BLOCK_H,
             num_programs=num_programs,
+            ROW_GROUP=row_group,
             ZERO_CENTERED=zero_centered,
         )
     dg = _finalize_dgamma(dg_partial, gamma.dtype)
@@ -242,13 +315,14 @@ def rmsnorm_bwd_impl(
 
 
 def rmsnorm_fwd_residual_impl(
-    x: torch.Tensor, residual: torch.Tensor, gamma: torch.Tensor, eps: float
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int, int]:
+    x: torch.Tensor, residual: torch.Tensor, gamma: torch.Tensor, eps: float, amax_out: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int, int, Optional[torch.Tensor]]:
     """Fused (x + residual) -> rmsnorm forward.
 
-    Returns ``(y, x_plus_r, rstd, BLOCK_H, ROWS, num_warps, num_stages)``. Both
+    Returns ``(y, x_plus_r, rstd, BLOCK_H, ROWS, num_warps, num_stages, amax)``. Both
     ``y`` and ``x_plus_r`` are returned in [B, H] layout (caller is expected to
-    reshape back to the original logical shape if needed).
+    reshape back to the original logical shape if needed). ``amax`` is the fp32 abs-max
+    partials of ``y`` when ``amax_out``, else None.
     """
     H = gamma.shape[0]
     x2 = _reshape_batch_hidden(x, H)
@@ -258,14 +332,18 @@ def rmsnorm_fwd_residual_impl(
     x_plus_r = torch.empty_like(x2)
     rstd = torch.empty(B, device=x.device, dtype=torch.float32)
     BLOCK_H, ROWS, num_warps, num_stages = _pick_config(H, B)
+    grid = (B if ROWS == 1 else (B + ROWS - 1) // ROWS,)
+    # One partial per program, every slot written, so it needs no pre-zeroing.
+    amax = torch.empty(grid[0], device=x.device, dtype=torch.float32) if amax_out else None
     if ROWS == 1:
-        rmsnorm_fwd_residual_kernel[(B,)](
+        rmsnorm_fwd_residual_kernel[grid](
             x2,
             r2,
             gamma,
             y,
             x_plus_r,
             rstd,
+            amax,
             x2.stride(0),
             x2.stride(1),
             r2.stride(0),
@@ -277,11 +355,11 @@ def rmsnorm_fwd_residual_impl(
             H=H,
             eps=eps,
             BLOCK_H=BLOCK_H,
+            AMAX=amax_out,
             num_warps=num_warps,
             num_stages=num_stages,
         )
     else:
-        grid = ((B + ROWS - 1) // ROWS,)
         rmsnorm_fwd_residual_kernel_multi_row[grid](
             x2,
             r2,
@@ -289,6 +367,7 @@ def rmsnorm_fwd_residual_impl(
             y,
             x_plus_r,
             rstd,
+            amax,
             x2.stride(0),
             x2.stride(1),
             r2.stride(0),
@@ -302,10 +381,13 @@ def rmsnorm_fwd_residual_impl(
             eps=eps,
             BLOCK_H=BLOCK_H,
             ROWS_PER_BLOCK=ROWS,
+            AMAX=amax_out,
             num_warps=num_warps,
             num_stages=num_stages,
         )
-    return y, x_plus_r, rstd, BLOCK_H, ROWS, num_warps, num_stages
+    if amax is not None:
+        amax = _amax_finalize(amax)
+    return y, x_plus_r, rstd, BLOCK_H, ROWS, num_warps, num_stages, amax
 
 
 def rmsnorm_bwd_residual_impl(
@@ -327,12 +409,11 @@ def rmsnorm_bwd_residual_impl(
     H = gamma.shape[0]
     B = x_plus_r.shape[0]
     dy2 = _reshape_batch_hidden(dy, H)
-    if dxpr is None:
-        # When ``x_plus_r`` is unused downstream, autograd may hand us None.
-        # Substitute zeros so the kernel sees a valid pointer.
-        dxpr2 = torch.zeros_like(x_plus_r)
-    else:
-        dxpr2 = _reshape_batch_hidden(dxpr, H)
+    # When ``x_plus_r`` is unused downstream, autograd hands us None. Rather than filling a
+    # whole tensor with zeros for the kernel to read back and add, drop the term at compile
+    # time and pass ``x_plus_r`` as a stand-in pointer the kernel never dereferences.
+    has_dxpr = dxpr is not None
+    dxpr2 = _reshape_batch_hidden(dxpr, H) if has_dxpr else x_plus_r
     dx = torch.empty_like(x_plus_r)
     mode, BLOCK_H, GR, num_warps, num_stages = _pick_bwd_config(H, B)
     if mode == "multi":
@@ -360,6 +441,7 @@ def rmsnorm_bwd_residual_impl(
             H=H,
             BLOCK_H=BLOCK_H,
             ROWS_PER_BLOCK=ROWS,
+            HAS_DXPR=has_dxpr,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -387,6 +469,7 @@ def rmsnorm_bwd_residual_impl(
             H=H,
             BLOCK_H=BLOCK_H,
             num_programs=num_programs,
+            HAS_DXPR=has_dxpr,
         )
     dg = _finalize_dgamma(dg_partial, gamma.dtype)
     return dx, dg

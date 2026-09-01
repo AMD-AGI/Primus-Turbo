@@ -23,6 +23,9 @@ from primus_turbo.pytorch.kernels.normalization.rmsnorm_impl import (
     rmsnorm_fwd_impl,
     rmsnorm_fwd_residual_impl,
 )
+from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+    attach_fp8_amax_partials,
+)
 
 __all__ = ["rmsnorm", "rmsnorm_residual"]
 
@@ -37,7 +40,7 @@ class _RMSNormFunction(torch.autograd.Function):
             f"rmsnorm: last dim of x ({orig_shape[-1]}) must equal gamma.shape[0] ({H})"
         )
 
-        y, x2, rstd, BLOCK_H, ROWS, num_warps, num_stages = rmsnorm_fwd_impl(x, gamma, eps, zero_centered)
+        y, x2, rstd, BLOCK_H, ROWS, num_warps, num_stages, _ = rmsnorm_fwd_impl(x, gamma, eps, zero_centered)
 
         ctx.save_for_backward(x2, gamma, rstd)
         ctx.eps = eps
@@ -78,9 +81,24 @@ class _RMSNormResidualFunction(torch.autograd.Function):
         orig_shape = x.shape
         H = gamma.shape[0]
         assert orig_shape[-1] == H
+        # Leave an unused output's cotangent as None instead of a zero tensor: callers that
+        # consume only ``y`` are the common case, and the backward would otherwise allocate,
+        # fill and read back a whole tensor of zeros just to add it to dx.
+        ctx.set_materialize_grads(False)
 
-        y, x_plus_r, rstd, BLOCK_H, ROWS, num_warps, num_stages = rmsnorm_fwd_residual_impl(
-            x, residual, gamma, eps
+        # Reduce the output's abs-max while it is still in registers and publish it, so a
+        # tensorwise fp8 cast downstream finalises those partials instead of streaming the
+        # whole tensor again for the same scalar. A max is exact and order-independent and
+        # the reduction rides the store's own predicate, so the scale is the same float
+        # either way; a consumer that is not such a cast just ignores them.
+        #
+        # Only this variant folds. It opens a transformer block, so its output is the
+        # projection input a quantiser reads next, and its forward already moves four
+        # tensors per row, which hides the reduction: 147.2 -> 153.1 us against 34.7 us of
+        # `tensorwise_amax_partial` deleted. The plain forward moves two, so the same fold
+        # shows up in full (95.0 -> 111.4 us) and wants a consumer to be worth it.
+        y, x_plus_r, rstd, BLOCK_H, ROWS, num_warps, num_stages, amax = rmsnorm_fwd_residual_impl(
+            x, residual, gamma, eps, amax_out=True
         )
 
         ctx.save_for_backward(x_plus_r, gamma, rstd)
@@ -90,11 +108,17 @@ class _RMSNormResidualFunction(torch.autograd.Function):
         ctx.ROWS = ROWS
         ctx.num_warps = num_warps
         ctx.num_stages = num_stages
-        return y.reshape(orig_shape), x_plus_r.reshape(orig_shape)
+        out = y.reshape(orig_shape)
+        attach_fp8_amax_partials(out, amax)
+        return out, x_plus_r.reshape(orig_shape)
 
     @staticmethod
     def backward(ctx, grad_y: torch.Tensor, grad_xpr: torch.Tensor):
         x_plus_r, gamma, rstd = ctx.saved_tensors
+        if grad_y is None:
+            # Nothing flows through the norm itself, so dgamma is zero and dx is whatever
+            # came back through x_plus_r.
+            return grad_xpr, grad_xpr, torch.zeros_like(gamma), None
         dx, dg = rmsnorm_bwd_residual_impl(
             grad_y,
             grad_xpr,

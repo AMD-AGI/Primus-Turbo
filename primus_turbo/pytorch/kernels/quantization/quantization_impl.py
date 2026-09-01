@@ -38,6 +38,39 @@ def ceil_div(a, b):
     return (a + b - 1) // b
 
 
+# Where a producer kernel leaves the abs-max of a tensor it just wrote, for the tensorwise
+# fp8 cast that reads it next. Carried on the tensor rather than passed down a call chain
+# because producer and consumer are separate ops: the norm returns a tensor, and it is
+# `gemm_fp8` further down that decides to quantise it.
+_FP8_AMAX_PARTIALS_ATTR = "_turbo_fp8_amax_partials"
+
+# Most partials the cpp tensorwise cast will finalise (`tensorwise_amax_workspace_elems()`,
+# which it hard-checks). A producer leaving one per program runs well past this and has to
+# fold its own down first.
+FP8_AMAX_MAX_PARTIALS = 2048
+
+
+def attach_fp8_amax_partials(x: torch.Tensor, partials: torch.Tensor) -> None:
+    """Publish ``partials`` as the abs-max of ``x``, for the next tensorwise fp8 cast.
+
+    This is a handoff, not a cache: the producer reduces the tensor on the way out every
+    time it runs, so there is nothing to miss on and nothing that survives to a later step.
+    Stamped with ``x._version`` so an in-place write to ``x`` afterwards drops the partials
+    instead of scaling by a stale amax -- and dropping them only restores the streaming
+    pass, which is always correct.
+    """
+    setattr(x, _FP8_AMAX_PARTIALS_ATTR, (partials, x._version))
+
+
+def take_fp8_amax_partials(x: torch.Tensor) -> Optional[torch.Tensor]:
+    """The partials published for ``x``, or None if there are none or ``x`` has changed."""
+    published = getattr(x, _FP8_AMAX_PARTIALS_ATTR, None)
+    if published is None:
+        return None
+    partials, version = published
+    return partials if version == x._version else None
+
+
 def quantize_fp8_tensorwise_pad_impl(
     x: torch.Tensor,
     out_dtype: torch.dtype,
@@ -52,7 +85,10 @@ def quantize_fp8_tensorwise_pad_impl(
     ``amax_partials`` skips the pass that re-reads ``x`` for its abs-amax: whoever wrote
     ``x`` reduced it on the way out and left the result here, as non-negative float32
     partials (the cpp op bounds how many). A max is exact and order-independent, so the
-    scale -- and the fp8 output -- are unchanged."""
+    scale -- and the fp8 output -- are unchanged. Callers that do not pass them explicitly
+    still get the fold when the producer published them on ``x`` itself."""
+    if amax_partials is None:
+        amax_partials = take_fp8_amax_partials(x)
     x = x.contiguous()
     pad_n_align = 128 if pad_n else 1
     x_fp8, scale_inv = torch.ops.primus_turbo_cpp_extension.quantize_fp8_tensorwise(
