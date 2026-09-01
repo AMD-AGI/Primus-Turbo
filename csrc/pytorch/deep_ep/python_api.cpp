@@ -13,7 +13,8 @@ void register_deep_ep_apis(pybind11::module_& m) {
     m.doc() = "DeepEP: an efficient expert-parallel communication library";
 
     // Whether support FP8 and TMA features
-    m.def("is_sm90_compiled", []() { return kEnableSM90Features; });
+    // ROCm: callers only read this as "FP8 available", and CDNA has FP8 without TMA
+    m.def("is_sm90_compiled", []() { return kEnableFP8Features; });
 
     // The integer type of top-k indices
     m.attr("topk_idx_t") = pybind11::cast(c10::CppTypeToScalarType<topk_idx_t>::value);

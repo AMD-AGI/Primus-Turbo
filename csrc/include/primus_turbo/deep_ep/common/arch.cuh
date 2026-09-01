@@ -163,4 +163,18 @@ __device__ __forceinline__ void buffer_st_chunk(void* ptr,
 #define PRIMUS_TURBO_DEEPEP_HAS_IBGDA 0
 #endif
 
+// ---------------------------------------------------------------------------
+// 6. FP8 capability
+// ---------------------------------------------------------------------------
+// ROCm: upstream's DISABLE_SM90_FEATURES gates TMA and FP8 together. CDNA has no TMA, so
+// the flag stays set and the kernels keep taking upstream's non-SM90 branch -- but FP8 is
+// there, so the two have to be split. This one only says "the caller may hand us FP8".
+//
+// Arch-independent because the ported intranode path never interprets the bytes: dispatch
+// and combine move opaque payload plus a separate `float` scale tensor, so gfx942's fnuz
+// e4m3 and gfx950's OCP e4m3 both just ride through. The encode/decode that *does* care
+// lives in internode_ll.cu (hard-coded `__NV_E4M3`), and that file is compiled out --
+// porting it means picking the format per arch, not reusing this flag.
+constexpr bool kEnableFP8Features = true;
+
 } // namespace primus_turbo::deep_ep
