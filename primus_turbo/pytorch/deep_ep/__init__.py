@@ -10,7 +10,7 @@
 
 ###############################################################################
 
-from primus_turbo.pytorch._C.deep_ep import Config
+from primus_turbo.pytorch._C.deep_ep import Config, topk_idx_t
 
 from .buffers.legacy import Buffer
 from .utils import EventOverlap

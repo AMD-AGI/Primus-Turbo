@@ -31,6 +31,7 @@ from .utils import (
 )
 
 
+# noinspection PyShadowingNames
 def test_main(
     args: argparse.Namespace,
     num_sms: int,
@@ -66,7 +67,7 @@ def test_main(
     group_idx = torch.topk(group_scores, k=num_topk_groups, dim=-1, sorted=False).indices
     masked_scores = create_grouped_scores(scores, group_idx, num_nodes)
     topk_idx = torch.topk(masked_scores, num_topk, dim=-1, largest=True, sorted=False)[1]
-
+    topk_idx = topk_idx.to(deep_ep.topk_idx_t)
     topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device="cuda") * rank
     topk_weights_pure_rand = torch.randn((num_tokens, num_topk), dtype=torch.float32, device="cuda")
     rank_idx = topk_idx // (num_experts // num_ranks)
@@ -256,8 +257,11 @@ def test_main(
                             check_data(recv_x, recv_gbl_rank_prefix_sum)
 
                     # Test combine
+                    bias_0 = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+                    bias_1 = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
                     combine_args = {
                         "x": recv_x,
+                        "bias": (bias_0, bias_1),
                         "handle": handle,
                         "config": config,
                         "async_finish": async_mode,
@@ -268,7 +272,9 @@ def test_main(
                         combine_args.update({"previous_event": buffer.capture()})
                     combined_x, combined_topk_weights, event = buffer.combine(**combine_args)
                     event.current_stream_wait() if async_mode else ()
-                    check_x = combined_x.float() / is_token_in_rank.sum(dim=1).unsqueeze(1)
+                    check_x = (combined_x.float() - bias_0.float() - bias_1.float()) / is_token_in_rank.sum(
+                        dim=1
+                    ).unsqueeze(1)
                     ref_x = x_pure_rand if is_rand else x
                     assert calc_diff(check_x, ref_x) < 5e-4 if current_x is x_pure_rand_e4m3 else 5e-6
                     if with_topk:
@@ -403,6 +409,7 @@ def test_main(
     return hash_value
 
 
+# noinspection PyUnboundLocalVariable,PyShadowingNames
 def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     num_nodes = int(os.getenv("WORLD_SIZE", 1))
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
@@ -488,6 +495,7 @@ if __name__ == "__main__":
         help="Pressure test mode. 0: don't do pressure test, 1: do pressure test without benchmarks, 2: do pressure test with benchmarks",
     )
     parser.add_argument("--num-experts", type=int, default=256, help="Number of experts (default: 256")
+    parser.add_argument("--backend", type=str, default="turbo", help="Backend to use (default: turbo)")
     args = parser.parse_args()
 
     # Set default `num_topk_groups` if not provided
