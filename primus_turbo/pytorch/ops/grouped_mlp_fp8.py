@@ -19,6 +19,7 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensorPair,
     check_quantized_tensor,
 )
+from primus_turbo.pytorch.core.utils import is_gfx950
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_fp8_dglu_impl,
     grouped_gemm_fp8_glu_impl,
@@ -44,6 +45,19 @@ __all__ = [
 _SUPPORTED_ACTIVATIONS = ("silu",)
 
 
+# Pad the fp8 grouped-MLP contraction/feature dims to 128. gpt-oss-20b runs
+# H = I = 2880, and 2880 % 128 == 64: an unpadded fp8 GEMM splits every
+# cache line across two L1->L2 requests (+50% traffic) for identical MFMA math.
+# Padding H (fc1/fc2 K and the fc2-output N) and the fc2 contraction I up to
+# the next multiple recovers the aligned access; real-shape recovery keeps the
+# stored tensors tight, so this is copy-free on the padded quantiser buffers.
+_FP8_PAD_ALIGN = 128
+
+
+def _default_gemm_backend() -> int:
+    return BackendType.FLYDSL.value if is_gfx950() else BackendType.TRITON.value
+
+
 def _grouped_gemm_fp8_variable_k_impl_wrapper(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -60,6 +74,8 @@ def _grouped_gemm_fp8_variable_k_impl_wrapper(
     default_backend: int,
     inplace_add_to_out: bool = False,
     out: Optional[torch.Tensor] = None,
+    m_real: Optional[int] = None,
+    n_real: Optional[int] = None,
 ) -> Optional[torch.Tensor]:
     """Run the variable-K wgrad GEMM, accumulating into ``out`` when asked to.
 
@@ -79,6 +95,8 @@ def _grouped_gemm_fp8_variable_k_impl_wrapper(
         granularity=granularity,
         num_cu=num_cu,
         default_backend=default_backend,
+        m_real=m_real,
+        n_real=n_real,
     )
 
     if not inplace_add_to_out:
@@ -139,6 +157,7 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
                 axis=-1,
                 block_size=config.block_size,
                 group_lens=group_lens,
+                pad_align_last=_FP8_PAD_ALIGN,
             )
 
         if isinstance(w1, QuantizedTensor):
@@ -153,6 +172,7 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
                 config.granularity,
                 axis=-1,
                 block_size=config.block_size,
+                pad_align_last=_FP8_PAD_ALIGN,
             )
 
         if isinstance(w2, QuantizedTensor):
@@ -167,6 +187,8 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
                 config.granularity,
                 axis=-1,
                 block_size=config.block_size,
+                pad_align_penultimate=_FP8_PAD_ALIGN,
+                pad_align_last=_FP8_PAD_ALIGN,
             )
 
         # The activation is quantised inside the GLU op: it feeds nothing but the
@@ -189,8 +211,17 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
             out_row_scaling_recipe=ScalingRecipe(),
             out_col_scaling_recipe=ScalingRecipe(),
             activation=activation,
+            # Pad the fused activation's I -> Ip so fc2's contraction matches w2's
+            # padded I; copy-free (the quantiser writes the padded buffer directly).
+            k_align=_FP8_PAD_ALIGN,
         )
 
+        # padN+padK recovers the tight fc2 output (N = H) from the padded w2, and
+        # routes fc2 through FLYDSL so the padded contraction is actually consumed.
+        h_real = quantized_x.shape[-1]
+        # Tight I (fc2 contraction), for dglu/grad_w2 to recover from padded Ip.
+        i_real = quantized_w2.shape[-1]
+        fc2_n_pitch = quantized_w2.qdata.shape[-2] if trans_w2 else quantized_w2.qdata.shape[-1]
         fc2_out = grouped_gemm_fp8_impl(
             act_fp8,
             quantized_w2.qdata,
@@ -203,8 +234,9 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
             out_dtype=out_dtype,
             granularity=config.granularity.value,
             num_cu=num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=_default_gemm_backend(),
             maybe_pre_sync=True,
+            n_real=h_real if h_real != fc2_n_pitch else None,
         )
 
         ctx.save_for_backward(
@@ -227,6 +259,8 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
         ctx.config = config
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
+        ctx.h_real = h_real
+        ctx.i_real = i_real
         ctx.fuse_w1_accum = fuse_w1_accum
         ctx.fuse_w2_accum = fuse_w2_accum
         # Kept off save_for_backward on purpose: the wgrad GEMM writes into these
@@ -263,7 +297,15 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
             axis=-1,
             block_size=ctx.config.block_size,
             group_lens=group_lens,
+            pad_align_last=_FP8_PAD_ALIGN,
         )
+        # H is padded on the fc2-output side (grad_out last, w2 penult, x/w1
+        # contraction); real recovers tight H on every GEMM whose output or wgrad
+        # feature is H. I stays tight in M1, so its real is left None.
+        h_real = ctx.h_real
+        i_real = ctx.i_real
+        default_backend = _default_gemm_backend()
+        go_pitch = quantized_grad_out.qdata.shape[-1]
 
         # grad_w2 = act^T @ grad_out, both operands already in hand.
         grad_w2 = _grouped_gemm_fp8_variable_k_impl_wrapper(
@@ -279,9 +321,12 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=default_backend,
             inplace_add_to_out=ctx.fuse_w2_accum,
             out=ctx.w2_main_grad,
+            m_real=h_real if h_real != go_pitch else None,
+            # a = act, padded on its I axis; n_real recovers the tight I (grad_w2 N).
+            n_real=i_real if i_real != act_fp8.shape[-1] else None,
         )
 
         # fc2 dgrad (grad_out @ w2^T) with the activation gradient fused into its
@@ -305,9 +350,14 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
             out_row_scaling_recipe=ScalingRecipe(),
             out_col_scaling_recipe=ScalingRecipe(),
             activation=ctx.activation,
+            # w2 (b) is padded on its I axis to w2_fp8.shape[-1]; i_real recovers the
+            # tight I so grad_fc1_out stays [M, 2I] and the padded Ip rides as n_stride.
+            i_real=i_real if i_real != w2_fp8.shape[-1] else None,
         )
 
-        # grad_x = grad_fc1_out @ w1^T
+        # grad_x = grad_fc1_out @ w1^T; output feature N = H (padded on w1), recovered.
+        gx_trans_b = not ctx.trans_w1
+        gx_n_pitch = w1_fp8.shape[-2] if gx_trans_b else w1_fp8.shape[-1]
         grad_x = grouped_gemm_fp8_impl(
             grad_fc1_out_fp8,
             w1_fp8,
@@ -316,11 +366,12 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
             group_lens,
             group_offs,
             trans_a=False,
-            trans_b=not ctx.trans_w1,
+            trans_b=gx_trans_b,
             out_dtype=ctx.out_dtype,
             granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=default_backend,
+            n_real=h_real if h_real != gx_n_pitch else None,
         )
 
         # grad_w1 = x^T @ grad_fc1_out
@@ -337,9 +388,11 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ctx.config.granularity.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=default_backend,
             inplace_add_to_out=ctx.fuse_w1_accum,
             out=ctx.w1_main_grad,
+            m_real=None,
+            n_real=h_real if h_real != x_fp8.shape[-1] else None,
         )
 
         return (

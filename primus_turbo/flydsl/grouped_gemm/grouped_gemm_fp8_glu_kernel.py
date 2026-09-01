@@ -202,6 +202,12 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
                 BLOCK_M=256,
                 BLOCK_N=256,
                 nt_vmcnt=3,
+                # "vgpr" keeps the accumulator in VGPR (mma mode 3) so the fused
+                # SwiGLU epilogue -- its only consumer -- reads it as a VALU source
+                # without the v_accvgpr_read shuffle an AGPR accumulator would need.
+                # The NT feed is S2RLoader, not transpose asm, so the register budget
+                # is unchanged.
+                acc_mode="vgpr",
                 # Raced per shape over _GLU_NT_CANDS, not defaulted: taking the
                 # plain entry's row-major default literally cost 0.66 ms of L2
                 # reuse at I=5760 (8.2 GB of extra HBM reads).
@@ -289,7 +295,7 @@ class GradProbsPartialSpec(NamedTuple):
 
 
 def grouped_gemm_fp8_dglu_grad_probs_partial_spec(
-    a: "torch.Tensor", b: "torch.Tensor"
+    a: "torch.Tensor", b: "torch.Tensor", i_real: "int | None" = None
 ) -> GradProbsPartialSpec:
     """The buffer :func:`grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel` expects.
 
@@ -309,7 +315,8 @@ def grouped_gemm_fp8_dglu_grad_probs_partial_spec(
         ``shape`` is ``(n_blocks * 2, M_total)``, float32.
     """
     M_total = a.shape[0]
-    I = b.shape[2]
+    # The reduction spans the real I, not the padded storage pitch b.shape[2].
+    I = i_real if i_real is not None else b.shape[2]
     n_blocks = -(-I // _DGLU_BLOCK_N)
     return GradProbsPartialSpec(shape=(n_blocks * 2, M_total), needs_zero=True)
 
@@ -328,6 +335,7 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
     *,
     activation: str = "silu",
     num_cu: "int | None" = None,
+    i_real: "int | None" = None,
 ) -> "torch.Tensor":
     """FlyDSL fc2 dgrad with the SwiGLU gradient fused into its epilogue.
 
@@ -359,7 +367,14 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
     assert not trans_b, "FlyDSL fused dGLU is NN only: pass b as [G, K, I]"
     assert a.ndim == 2 and b.ndim == 3 and intermediate.ndim == 2
     M_total, K = a.shape
-    G, K_b, I = b.shape
+    G, K_b, N_pitch = b.shape
+    # b (w2) may be padded on its I axis to N_pitch; i_real is the tight I. The
+    # kernel reads B at the N_pitch storage stride (n_stride) but computes,
+    # indexes intermediate, and stores dl1 at the real I width.
+    if i_real is not None and i_real != N_pitch:
+        n_stride, I = N_pitch, i_real
+    else:
+        n_stride, I = 0, N_pitch
     assert K == K_b, f"K mismatch a={K} b={K_b}"
     assert intermediate.shape == (M_total, 2 * I), (
         f"intermediate must be [{M_total}, {2 * I}], got {tuple(intermediate.shape)}"
@@ -368,7 +383,7 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
 
     out_dtype = intermediate.dtype
     assert out.shape == (M_total, 2 * I) and out.dtype == out_dtype
-    partial_shape = grouped_gemm_fp8_dglu_grad_probs_partial_spec(a, b).shape
+    partial_shape = grouped_gemm_fp8_dglu_grad_probs_partial_spec(a, b, i_real=I).shape
     assert grad_probs_partial.shape == partial_shape and grad_probs_partial.dtype == torch.float32, (
         f"grad_probs_partial must be {list(partial_shape)} float32, got "
         f"{list(grad_probs_partial.shape)} {grad_probs_partial.dtype}; "
@@ -382,7 +397,7 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
     cbsz = 1 if a.dtype == torch.float8_e5m2 else 0
     blgp = 1 if b.dtype == torch.float8_e5m2 else 0
     _capped = num_cu is not None and num_cu > 0
-    ckey = (I, K, G, out_fp16, cbsz, blgp, num_cu if _capped else 0)
+    ckey = (I, K, G, out_fp16, cbsz, blgp, num_cu if _capped else 0, n_stride)
 
     launch = _GROUPED_DGLU_CACHE.get(ckey)
     if launch is None:
@@ -408,6 +423,7 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
                 persistent=_capped,
                 cap_cu=(num_cu if _capped else -1),
                 N=I,
+                n_stride=n_stride,
                 dglu=True,
                 glu_i=I,
                 # Non-temporal, as in the forward, but this only pays because the
