@@ -201,6 +201,7 @@ def _varlen_backward_op(
     softmax_scale: float,
     window_left: int,
     sink: Optional[torch.Tensor],
+    deterministic: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     Hq, D = q.shape[1], q.shape[2]
     Hkv = k.shape[1]
@@ -231,6 +232,7 @@ def _varlen_backward_op(
             softmax_scale,
             window_left=window_left,
             sink=sink,
+            deterministic=deterministic,
         )
         return _pad_dsink(grads, lse)
 
@@ -266,6 +268,7 @@ def _varlen_backward_op(
                 D,
                 softmax_scale,
                 window_left=window_left,
+                deterministic=deterministic,
             )
             dq[q0:q1] = dqs
             dk[k0:k1] = dks
@@ -296,6 +299,7 @@ def _varlen_backward_op(
         cu_seqlens_kv=cu_seqlens_k,
         max_seqlen_q=max_sq,
         max_seqlen_kv=max_skv,
+        deterministic=deterministic,
     )
     return _pad_dsink(grads, lse)
 
@@ -315,6 +319,7 @@ def _varlen_backward_op_fake(
     softmax_scale,
     window_left,
     sink,
+    deterministic,
 ):
     dsink_shape = (q.shape[1],) if sink is not None else (0,)
     return (
@@ -340,6 +345,7 @@ def flash_attn_varlen_flydsl_backward_impl(
     causal=True,
     window_size=(-1, -1),
     sink=None,
+    deterministic=False,
 ):
     """Deterministic 16x16x32 THD backward. ``lse`` is packed [total_q,Hq] fp32 as the
     forward emits it. Returns dQ, dK/dV (and dsink [Hq] fp32 with a ``sink``, uniform path
@@ -360,6 +366,7 @@ def flash_attn_varlen_flydsl_backward_impl(
         softmax_scale,
         window_left,
         sink,
+        bool(deterministic),
     )
     return (dq, dk, dv, dsink) if dsink.numel() else (dq, dk, dv)
 
@@ -436,6 +443,7 @@ def _sbhd_backward_op(
     softmax_scale: float,
     window_left: int,
     sink: Optional[torch.Tensor],
+    deterministic: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     Sq, B, Hq, D = q.shape
     Skv, _, Hkv, _ = k.shape
@@ -458,13 +466,14 @@ def _sbhd_backward_op(
         window_left=window_left,
         sbhd=True,
         sink=sink,
+        deterministic=deterministic,
     )
     dsink = grads[3] if len(grads) > 3 else lse.new_empty((0,))
     return grads[0], grads[1], grads[2], dsink
 
 
 @_sbhd_backward_op.register_fake
-def _sbhd_backward_op_fake(dout, q, k, v, out, lse, softmax_scale, window_left, sink):
+def _sbhd_backward_op_fake(dout, q, k, v, out, lse, softmax_scale, window_left, sink, deterministic):
     dsink_shape = (q.shape[2],) if sink is not None else (0,)
     return (
         torch.empty_like(q),
@@ -485,15 +494,16 @@ def flash_attn_sbhd_flydsl_backward_impl(
     causal=True,
     window_size=(-1, -1),
     sink=None,
+    deterministic=False,
 ):
-    """SBHD deterministic 16x16x32 backward; ``lse`` is [B,Hq,Sq] fp32 natural-log. No
-    permute/copy -- SBHD is addressed natively and the dk/dv workspace is laid out so the
-    slot reduction is contiguous. Returns dQ, dK/dV (and dsink [Hq] fp32 with a ``sink``)."""
+    """SBHD 16x16x32 backward; ``lse`` is [B,Hq,Sq] fp32 natural-log. SBHD is addressed natively,
+    with no permute or copy. ``deterministic`` puts dQ on the reproducible split-K path instead of
+    the atomic image. Returns dQ, dK/dV (and dsink [Hq] fp32 with a ``sink``)."""
     Hq, D = q.shape[2], q.shape[3]
     softmax_scale, window_left = _check_bwd(
         q, k, v, softmax_scale, causal, window_size, sink, Hq, D, sbhd=True
     )
     dq, dk, dv, dsink = _sbhd_backward_op(
-        dout.contiguous(), q, k, v, out, lse, softmax_scale, window_left, sink
+        dout.contiguous(), q, k, v, out, lse, softmax_scale, window_left, sink, bool(deterministic)
     )
     return (dq, dk, dv, dsink) if sink is not None else (dq, dk, dv)
