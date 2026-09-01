@@ -8,6 +8,7 @@
  **************************************************************************************************/
 
 #include "primus_turbo/common.h"
+#include <primus_turbo/deep_ep/backend/api.cuh>
 #include <primus_turbo/deep_ep/legacy/api.cuh>
 #include <atomic>
 #include <barrier>
@@ -15,6 +16,7 @@
 #include <cstring>
 #include <hip/hip_runtime.h>
 #include <memory>
+#include <type_traits>
 #include <pybind11/functional.h>
 
 #include "jax/deep_ep/deep_ep.h"
@@ -22,16 +24,21 @@
 
 namespace primus_turbo::jax::deep_ep {
 
-static std::barrier g_barrier_signal(NUM_MAX_NVL_PEERS);
+// ROCm: JAX has x64 off by default, so topk_idx stays int32 on the Python side.
+// The JAX build passes -DEP_NUM_TOPK_IDX_BITS=32 to match; see setup.py.
+static_assert(std::is_same_v<primus_turbo::deep_ep::topk_idx_t, int32_t>,
+              "JAX DeepEP requires -DEP_NUM_TOPK_IDX_BITS=32");
 
-static std::vector<std::unique_ptr<Buffer>> g_buffer_pool(NUM_MAX_NVL_PEERS);
+static std::barrier g_barrier_signal(LEGACY_NUM_MAX_NVL_PEERS);
+
+static std::vector<std::unique_ptr<Buffer>> g_buffer_pool(LEGACY_NUM_MAX_NVL_PEERS);
 
 Buffer *get_buffer(int rank, int num_ranks, int64_t hidden_bytes,
                    const primus_turbo::deep_ep::legacy::Config &config) {
 
-    PRIMUS_TURBO_CHECK(num_ranks <= NUM_MAX_NVL_PEERS,
+    PRIMUS_TURBO_CHECK(num_ranks <= LEGACY_NUM_MAX_NVL_PEERS,
                        "DeepEP inproc mode only supports intranode communication on JAX "
-                       "(num_ranks must be <= NUM_MAX_NVL_PEERS); use per_process mode for "
+                       "(num_ranks must be <= LEGACY_NUM_MAX_NVL_PEERS); use per_process mode for "
                        "internode runs.");
 
     int device_id = -1;
@@ -62,26 +69,26 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
     : num_nvl_bytes_(num_nvl_bytes), num_rdma_bytes_(num_rdma_bytes), rank_(rank),
       num_ranks_(num_ranks), explicitly_destroy_(explicitly_destroy) {
     // Metadata memory
-    int64_t barrier_signal_bytes     = NUM_MAX_NVL_PEERS * sizeof(int);
-    int64_t buffer_ptr_bytes         = NUM_MAX_NVL_PEERS * sizeof(void *);
-    int64_t barrier_signal_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(int *);
+    int64_t barrier_signal_bytes     = LEGACY_NUM_MAX_NVL_PEERS * sizeof(int);
+    int64_t buffer_ptr_bytes         = LEGACY_NUM_MAX_NVL_PEERS * sizeof(void *);
+    int64_t barrier_signal_ptr_bytes = LEGACY_NUM_MAX_NVL_PEERS * sizeof(int *);
 
     // Common checks
-    PRIMUS_TURBO_CHECK(num_nvl_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0 and
+    PRIMUS_TURBO_CHECK(num_nvl_bytes % LEGACY_NUM_BUFFER_ALIGNMENT_BYTES == 0 and
                        (num_nvl_bytes <= std::numeric_limits<int>::max() or num_rdma_bytes == 0));
-    PRIMUS_TURBO_CHECK(num_rdma_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0 and
+    PRIMUS_TURBO_CHECK(num_rdma_bytes % LEGACY_NUM_BUFFER_ALIGNMENT_BYTES == 0 and
                        (num_rdma_bytes <= std::numeric_limits<int>::max()));
     PRIMUS_TURBO_CHECK(0 <= rank and rank < num_ranks and
-                       (num_ranks <= NUM_MAX_NVL_PEERS * NUM_MAX_RDMA_PEERS));
-    PRIMUS_TURBO_CHECK(num_ranks < NUM_MAX_NVL_PEERS or num_ranks % NUM_MAX_NVL_PEERS == 0);
+                       (num_ranks <= LEGACY_NUM_MAX_NVL_PEERS * LEGACY_NUM_MAX_RDMA_PEERS));
+    PRIMUS_TURBO_CHECK(num_ranks < LEGACY_NUM_MAX_NVL_PEERS or num_ranks % LEGACY_NUM_MAX_NVL_PEERS == 0);
     if (num_rdma_bytes > 0)
-        PRIMUS_TURBO_CHECK(num_ranks > NUM_MAX_NVL_PEERS);
+        PRIMUS_TURBO_CHECK(num_ranks > LEGACY_NUM_MAX_NVL_PEERS);
 
     // Get ranks
     PRIMUS_TURBO_CHECK_HIP(hipGetDevice(&device_id_));
-    rdma_rank_ = rank / NUM_MAX_NVL_PEERS, nvl_rank_ = rank % NUM_MAX_NVL_PEERS;
-    num_rdma_ranks_ = std::max(1, num_ranks / NUM_MAX_NVL_PEERS),
-    num_nvl_ranks_  = std::min(num_ranks, NUM_MAX_NVL_PEERS);
+    rdma_rank_ = rank / LEGACY_NUM_MAX_NVL_PEERS, nvl_rank_ = rank % LEGACY_NUM_MAX_NVL_PEERS;
+    num_rdma_ranks_ = std::max(1, num_ranks / LEGACY_NUM_MAX_NVL_PEERS),
+    num_nvl_ranks_  = std::min(num_ranks, LEGACY_NUM_MAX_NVL_PEERS);
 
 #ifdef DISABLE_ROCSHMEM
     PRIMUS_TURBO_CHECK(num_rdma_ranks_ == 1,
@@ -121,8 +128,8 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
 
     // Workspace is reserved for future low-latency kernels. Current JAX DeepEP dispatch/combine
     // paths do not use it, so keep the allocation disabled for now.
-    // PRIMUS_TURBO_CHECK_HIP(hipMalloc(&workspace_, NUM_WORKSPACE_BYTES));
-    // PRIMUS_TURBO_CHECK_HIP(hipMemset(workspace_, 0, NUM_WORKSPACE_BYTES));
+    // PRIMUS_TURBO_CHECK_HIP(hipMalloc(&workspace_, LEGACY_NUM_WORKSPACE_BYTES));
+    // PRIMUS_TURBO_CHECK_HIP(hipMemset(workspace_, 0, LEGACY_NUM_WORKSPACE_BYTES));
 
     // MoE counter
     PRIMUS_TURBO_CHECK_HIP(hipHostMalloc(&moe_recv_counter_, sizeof(int64_t), hipHostAllocMapped));
@@ -133,11 +140,11 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
 
     // MoE expert-level counter
     PRIMUS_TURBO_CHECK_HIP(hipHostMalloc(&moe_recv_expert_counter_,
-                                         sizeof(int) * NUM_MAX_LOCAL_EXPERTS, hipHostAllocMapped));
+                                         sizeof(int) * LEGACY_NUM_MAX_LOCAL_EXPERTS, hipHostAllocMapped));
     PRIMUS_TURBO_CHECK_HIP(
         hipHostGetDevicePointer(reinterpret_cast<void **>(&moe_recv_expert_counter_mapped_),
                                 const_cast<int *>(moe_recv_expert_counter_), 0));
-    for (int i = 0; i < NUM_MAX_LOCAL_EXPERTS; ++i)
+    for (int i = 0; i < LEGACY_NUM_MAX_LOCAL_EXPERTS; ++i)
         moe_recv_expert_counter_[i] = -1;
 
     // MoE RDMA-level counter
@@ -207,11 +214,11 @@ void Buffer::Destroy() {
 #ifndef DISABLE_ROCSHMEM
     if (rocshmem_initialized_) {
         PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
-        primus_turbo::deep_ep::internode::barrier();
+        primus_turbo::deep_ep::rocshmem::barrier(true);
         if (rdma_buffer_ptr_ != nullptr) {
-            primus_turbo::deep_ep::internode::free(rdma_buffer_ptr_);
+            primus_turbo::deep_ep::rocshmem::free(rdma_buffer_ptr_);
         }
-        primus_turbo::deep_ep::internode::finalize();
+        primus_turbo::deep_ep::rocshmem::finalize();
         rdma_buffer_ptr_      = nullptr;
         rocshmem_initialized_ = false;
     }
@@ -317,7 +324,7 @@ void Buffer::IntranodeDispatch(
         PRIMUS_TURBO_CHECK(num_tokens_per_expert->dimensions().size() == 1);
         PRIMUS_TURBO_CHECK(num_tokens_per_expert->dimensions()[0] % num_ranks_ == 0);
         PRIMUS_TURBO_CHECK(num_tokens_per_expert->dimensions()[0] / num_ranks_ <=
-                           NUM_MAX_LOCAL_EXPERTS);
+                           LEGACY_NUM_MAX_LOCAL_EXPERTS);
         PRIMUS_TURBO_CHECK(num_tokens_per_rank->dimensions().size() == 1 and
                            num_tokens_per_rank->dimensions()[0] == num_ranks_);
     }
@@ -420,7 +427,7 @@ void Buffer::IntranodeDispatch(
                 // Timeout check
                 if (std::chrono::duration_cast<std::chrono::seconds>(
                         std::chrono::high_resolution_clock::now() - start_time)
-                        .count() > get_num_cpu_timeout_secs())
+                        .count() > LEGACY_NUM_CPU_TIMEOUT_SECS)
                     throw std::runtime_error("DeepEP error: CPU recv timeout");
             }
         }
@@ -488,9 +495,9 @@ void Buffer::Sync() {
 
     // Copy all buffer and barrier signal pointers to GPU
     PRIMUS_TURBO_CHECK_HIP(hipMemcpy(buffer_ptrs_gpu_, buffer_ptrs_,
-                                     sizeof(void *) * NUM_MAX_NVL_PEERS, hipMemcpyHostToDevice));
+                                     sizeof(void *) * LEGACY_NUM_MAX_NVL_PEERS, hipMemcpyHostToDevice));
     PRIMUS_TURBO_CHECK_HIP(hipMemcpy(barrier_signal_ptrs_gpu_, barrier_signal_ptrs_,
-                                     sizeof(int *) * NUM_MAX_NVL_PEERS, hipMemcpyHostToDevice));
+                                     sizeof(int *) * LEGACY_NUM_MAX_NVL_PEERS, hipMemcpyHostToDevice));
     PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
 
     // Ready to use
@@ -614,7 +621,7 @@ void Buffer::InternodeDispatch(
 #ifndef DISABLE_ROCSHMEM
     const int num_channels = config.num_sms / 2;
     PRIMUS_TURBO_CHECK(config.num_sms % 2 == 0);
-    PRIMUS_TURBO_CHECK(0 < num_rdma_ranks_ && num_rdma_ranks_ <= NUM_MAX_RDMA_PEERS);
+    PRIMUS_TURBO_CHECK(0 < num_rdma_ranks_ && num_rdma_ranks_ <= LEGACY_NUM_MAX_RDMA_PEERS);
 
     bool cached_mode = cached_rdma_channel_prefix_matrix.has_value();
     if (cached_mode) {
@@ -647,7 +654,7 @@ void Buffer::InternodeDispatch(
         PRIMUS_TURBO_CHECK(num_tokens_per_expert->dimensions().size() == 1);
         PRIMUS_TURBO_CHECK(num_tokens_per_expert->dimensions()[0] % num_ranks_ == 0);
         PRIMUS_TURBO_CHECK(num_tokens_per_expert->dimensions()[0] / num_ranks_ <=
-                           NUM_MAX_LOCAL_EXPERTS);
+                           LEGACY_NUM_MAX_LOCAL_EXPERTS);
     }
 
     PRIMUS_TURBO_CHECK(x.dimensions().size() == 2);
@@ -760,7 +767,7 @@ void Buffer::InternodeDispatch(
 
                 if (std::chrono::duration_cast<std::chrono::seconds>(
                         std::chrono::high_resolution_clock::now() - start_time)
-                        .count() > get_num_cpu_timeout_secs())
+                        .count() > LEGACY_NUM_CPU_TIMEOUT_SECS)
                     throw std::runtime_error("DeepEP error: timeout (internode dispatch CPU)");
             }
         }
@@ -845,7 +852,7 @@ void Buffer::InternodeCombine(
     PRIMUS_TURBO_CHECK(gbl_channel_prefix_matrix.dimensions()[1] == num_channels);
     PRIMUS_TURBO_CHECK(combined_rdma_head.dimensions()[0] == num_combined_tokens);
     PRIMUS_TURBO_CHECK(combined_rdma_head.dimensions()[1] == num_rdma_ranks_);
-    PRIMUS_TURBO_CHECK(combined_nvl_head.dimensions()[1] == NUM_MAX_NVL_PEERS);
+    PRIMUS_TURBO_CHECK(combined_nvl_head.dimensions()[1] == LEGACY_NUM_MAX_NVL_PEERS);
     PRIMUS_TURBO_CHECK(combined_x->dimensions().size() == 2);
     PRIMUS_TURBO_CHECK(combined_x->dimensions()[0] == num_combined_tokens);
     PRIMUS_TURBO_CHECK(combined_x->dimensions()[1] == hidden);
@@ -942,10 +949,10 @@ void Buffer::SyncFromIPCHandles(const std::vector<std::optional<pybind11::bytear
             }
 
             PRIMUS_TURBO_CHECK_HIP(hipMemcpy(buffer_ptrs_gpu_, buffer_ptrs_,
-                                             sizeof(void *) * NUM_MAX_NVL_PEERS,
+                                             sizeof(void *) * LEGACY_NUM_MAX_NVL_PEERS,
                                              hipMemcpyHostToDevice));
             PRIMUS_TURBO_CHECK_HIP(hipMemcpy(barrier_signal_ptrs_gpu_, barrier_signal_ptrs_,
-                                             sizeof(int *) * NUM_MAX_NVL_PEERS,
+                                             sizeof(int *) * LEGACY_NUM_MAX_NVL_PEERS,
                                              hipMemcpyHostToDevice));
             PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
         } catch (...) {
@@ -967,18 +974,18 @@ void Buffer::SyncFromIPCHandles(const std::vector<std::optional<pybind11::bytear
         PRIMUS_TURBO_CHECK(root_unique_id_opt.has_value());
         auto                 root_unique_id_str = root_unique_id_opt->cast<std::string>();
         std::vector<uint8_t> root_unique_id(root_unique_id_str.begin(), root_unique_id_str.end());
-        PRIMUS_TURBO_CHECK(rdma_rank_ == primus_turbo::deep_ep::internode::init(
-                                             root_unique_id, rdma_rank_, num_rdma_ranks_, false));
+        PRIMUS_TURBO_CHECK(rdma_rank_ == primus_turbo::deep_ep::rocshmem::init(
+                                             root_unique_id, rdma_rank_, num_rdma_ranks_, 0));
         rocshmem_initialized_ = true;
-        primus_turbo::deep_ep::internode::barrier();
+        primus_turbo::deep_ep::rocshmem::barrier(true);
 
         rdma_buffer_ptr_ =
-            primus_turbo::deep_ep::internode::alloc(num_rdma_bytes_, NUM_BUFFER_ALIGNMENT_BYTES);
+            primus_turbo::deep_ep::rocshmem::alloc(num_rdma_bytes_, LEGACY_NUM_BUFFER_ALIGNMENT_BYTES);
         PRIMUS_TURBO_CHECK(rdma_buffer_ptr_ != nullptr,
                            "rocshmem_malloc returned NULL: symmetric heap exhausted or not "
                            "initialised on this PE");
         PRIMUS_TURBO_CHECK_HIP(hipMemset(rdma_buffer_ptr_, 0, num_rdma_bytes_));
-        primus_turbo::deep_ep::internode::barrier();
+        primus_turbo::deep_ep::rocshmem::barrier(true);
         PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
     }
 #endif

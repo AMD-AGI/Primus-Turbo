@@ -361,6 +361,12 @@ def get_common_flags():
         cxx_flags.append("-DBUILD_HIPKITTENS_BACKEND")
         nvcc_flags.append("-DBUILD_HIPKITTENS_BACKEND")
 
+    # DeepEP top-k index width. JAX has x64 off by default so its topk_idx stays
+    # int32; torch uses int64. libprimus_turbo_kernels is shared, so one width wins.
+    topk_idx_bits = 32 if (BUILD_JAX and not BUILD_TORCH) else 64
+    cxx_flags.append(f"-DEP_NUM_TOPK_IDX_BITS={topk_idx_bits}")
+    nvcc_flags.append(f"-DEP_NUM_TOPK_IDX_BITS={topk_idx_bits}")
+
     # Max Jobs
     max_jobs = int(os.getenv("MAX_JOBS", "64"))
     nvcc_flags.append(f"-parallel-jobs={max_jobs}")

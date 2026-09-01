@@ -2404,8 +2404,10 @@ namespace internode {
     __builtin_unreachable();
 }
 
+// ROCm: not a stub -- Config::get_nvl_buffer_size_hint needs this on the intranode path too.
+// Mirrors upstream's `sizeof(SourceMeta)`, i.e. two ints.
 int get_source_meta_bytes() {
-    no_internode();
+    return 2 * sizeof(int);
 }
 
 void notify_dispatch(const int* num_tokens_per_rank,

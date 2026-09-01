@@ -1,6 +1,7 @@
 #pragma once
 
 // ROCm: cut-down port of upstream backend/api.cuh, only what the legacy buffer calls
+// ROCm: upstream's `nvshmem` namespace is `rocshmem` here, the transport is rocSHMEM
 
 #include <cstddef>
 #include <cstdint>
@@ -9,7 +10,7 @@
 
 #include "../legacy/compiled.cuh"
 
-namespace primus_turbo::deep_ep::nvshmem {
+namespace primus_turbo::deep_ep::rocshmem {
 
 std::vector<uint8_t> get_unique_id();
 
@@ -26,4 +27,4 @@ void barrier(const bool& with_cpu_sync, const std::optional<cudaStream_t>& strea
 
 void finalize();
 
-}  // namespace primus_turbo::deep_ep::nvshmem
+}  // namespace primus_turbo::deep_ep::rocshmem

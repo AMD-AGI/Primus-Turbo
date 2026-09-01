@@ -141,9 +141,9 @@ public:
 private:
     // NVLink Buffer
     int64_t           num_nvl_bytes_;
-    hipIpcMemHandle_t ipc_handles_[NUM_MAX_NVL_PEERS] = {};
+    hipIpcMemHandle_t ipc_handles_[LEGACY_NUM_MAX_NVL_PEERS] = {};
     bool              ipc_synced_                     = false;
-    void             *buffer_ptrs_[NUM_MAX_NVL_PEERS] = {nullptr};
+    void             *buffer_ptrs_[LEGACY_NUM_MAX_NVL_PEERS] = {nullptr};
     void            **buffer_ptrs_gpu_                = nullptr;
 
     // NVSHMEM Buffer
@@ -166,7 +166,7 @@ private:
     bool destroyed_ = false;
 
     // Barrier signals
-    int  *barrier_signal_ptrs_[NUM_MAX_NVL_PEERS] = {nullptr};
+    int  *barrier_signal_ptrs_[LEGACY_NUM_MAX_NVL_PEERS] = {nullptr};
     int **barrier_signal_ptrs_gpu_                = nullptr;
 
     // Workspace reserved for future low-latency kernels.

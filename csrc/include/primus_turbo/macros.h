@@ -115,7 +115,7 @@ inline std::string hipblas_status_to_string(hipblasStatus_t status) {
 #define PRIMUS_TURBO_CHECK_ROCSHMEM(expr)                                                          \
     do {                                                                                           \
         const auto status_PRIMUS_TURBO_CHECK_ROCSHMEM = (expr);                                    \
-        if (status_PRIMUS_TURBO_CHECK_ROCSHMEM != rocshmem::ROCSHMEM_SUCCESS) {                    \
+        if (status_PRIMUS_TURBO_CHECK_ROCSHMEM != ::rocshmem::ROCSHMEM_SUCCESS) {                  \
             PRIMUS_TURBO_ERROR("rocSHMEM Error: ",                                                 \
                                std::to_string((int) status_PRIMUS_TURBO_CHECK_ROCSHMEM));          \
         }                                                                                          \

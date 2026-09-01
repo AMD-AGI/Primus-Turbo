@@ -210,7 +210,7 @@ public:
 
     pybind11::bytearray get_local_nvshmem_unique_id() const {
         EP_HOST_ASSERT(rdma_rank == 0 and "Only RDMA rank 0 can get NVSHMEM unique ID");
-        const auto unique_id = nvshmem::get_unique_id();
+        const auto unique_id = rocshmem::get_unique_id();
         return {reinterpret_cast<const char*>(unique_id.data()), unique_id.size()};
     }
 
@@ -263,11 +263,11 @@ public:
             std::memcpy(root_unique_id.data(), root_unique_id_str.c_str(), root_unique_id_opt->size());
             auto nvshmem_rank = low_latency_mode ? rank : rdma_rank;
             auto num_nvshmem_ranks = low_latency_mode ? num_ranks : num_rdma_ranks;
-            EP_HOST_ASSERT(nvshmem_rank == nvshmem::init(root_unique_id, nvshmem_rank, num_nvshmem_ranks,
+            EP_HOST_ASSERT(nvshmem_rank == rocshmem::init(root_unique_id, nvshmem_rank, num_nvshmem_ranks,
                                                          low_latency_mode ? LEGACY_NUM_MAX_NVL_PEERS : 0));
 
             // Allocate
-            rdma_buffer_ptr = nvshmem::alloc(num_rdma_bytes, LEGACY_NUM_BUFFER_ALIGNMENT_BYTES);
+            rdma_buffer_ptr = rocshmem::alloc(num_rdma_bytes, LEGACY_NUM_BUFFER_ALIGNMENT_BYTES);
 
             // Clean buffer (mainly for low-latency mode)
             CUDA_RUNTIME_CHECK(cudaMemset(rdma_buffer_ptr, 0, num_rdma_bytes));
@@ -276,14 +276,14 @@ public:
             if (enable_shrink) {
                 int num_mask_buffer_bytes = num_ranks * sizeof(int);
                 int num_sync_buffer_bytes = num_ranks * sizeof(int);
-                mask_buffer_ptr = static_cast<int*>(nvshmem::alloc(num_mask_buffer_bytes, LEGACY_NUM_BUFFER_ALIGNMENT_BYTES));
-                sync_buffer_ptr = static_cast<int*>(nvshmem::alloc(num_sync_buffer_bytes, LEGACY_NUM_BUFFER_ALIGNMENT_BYTES));
+                mask_buffer_ptr = static_cast<int*>(rocshmem::alloc(num_mask_buffer_bytes, LEGACY_NUM_BUFFER_ALIGNMENT_BYTES));
+                sync_buffer_ptr = static_cast<int*>(rocshmem::alloc(num_sync_buffer_bytes, LEGACY_NUM_BUFFER_ALIGNMENT_BYTES));
                 CUDA_RUNTIME_CHECK(cudaMemset(mask_buffer_ptr, 0, num_mask_buffer_bytes));
                 CUDA_RUNTIME_CHECK(cudaMemset(sync_buffer_ptr, 0, num_sync_buffer_bytes));
             }
 
             // Barrier
-            nvshmem::barrier(true);
+            rocshmem::barrier(true);
             CUDA_RUNTIME_CHECK(cudaDeviceSynchronize());
         }
 
@@ -316,13 +316,13 @@ public:
         // Free NVSHMEM
         if (is_available() and num_rdma_bytes > 0) {
             CUDA_RUNTIME_CHECK(cudaDeviceSynchronize());
-            nvshmem::barrier(true);
-            nvshmem::free(rdma_buffer_ptr);
+            rocshmem::barrier(true);
+            rocshmem::free(rdma_buffer_ptr);
             if (enable_shrink) {
-                nvshmem::free(mask_buffer_ptr);
-                nvshmem::free(sync_buffer_ptr);
+                rocshmem::free(mask_buffer_ptr);
+                rocshmem::free(sync_buffer_ptr);
             }
-            nvshmem::finalize();
+            rocshmem::finalize();
         }
 
         // Free workspace and MoE counter

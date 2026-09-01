@@ -68,15 +68,11 @@ PYBIND11_MODULE(_C, m) {
 
     // DeepEP Config
     pybind11::class_<primus_turbo::deep_ep::legacy::Config>(m, "Config")
-        .def(pybind11::init<int, int, int, int, int>(), pybind11::arg("num_sms") = DEFAULT_NUM_CU,
-             pybind11::arg("num_max_nvl_chunked_send_tokens") =
-                 DEFAULT_NUM_MAX_XGMI_CHUNKED_SEND_TOKENS,
-             pybind11::arg("num_max_nvl_chunked_recv_tokens") =
-                 DEFAULT_NUM_MAX_XGMI_CHUNKED_RECV_TOKENS,
-             pybind11::arg("num_max_rdma_chunked_send_tokens") =
-                 DEFAULT_NUM_MAX_RDMA_CHUNKED_SEND_TOKENS,
-             pybind11::arg("num_max_rdma_chunked_recv_tokens") =
-                 DEFAULT_NUM_MAX_RDMA_CHUNKED_RECV_TOKENS)
+        .def(pybind11::init<int, int, int, int, int>(), pybind11::arg("num_sms") = 20,
+             pybind11::arg("num_max_nvl_chunked_send_tokens")  = 6,
+             pybind11::arg("num_max_nvl_chunked_recv_tokens")  = 256,
+             pybind11::arg("num_max_rdma_chunked_send_tokens") = 6,
+             pybind11::arg("num_max_rdma_chunked_recv_tokens") = 256)
         .def_readonly("num_sms", &primus_turbo::deep_ep::legacy::Config::num_sms)
         .def_readonly("num_max_nvl_chunked_send_tokens",
                       &primus_turbo::deep_ep::legacy::Config::num_max_nvl_chunked_send_tokens)
@@ -137,7 +133,7 @@ PYBIND11_MODULE(_C, m) {
     dep_m.def("per_process_buffer_nvl_bytes", &dep::per_process_buffer_nvl_bytes);
 #ifndef DISABLE_ROCSHMEM
     dep_m.def("get_unique_id", []() -> pybind11::bytes {
-        auto uid = primus_turbo::deep_ep::internode::get_unique_id();
+        auto uid = primus_turbo::deep_ep::rocshmem::get_unique_id();
         return {reinterpret_cast<const char *>(uid.data()), uid.size()};
     });
     dep_m.def(
