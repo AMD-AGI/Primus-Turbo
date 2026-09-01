@@ -388,7 +388,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                     auto shifted_x = x + token_idx * hidden_int4;
                     // ROCm: unroll 5 -> 2 on wave64, 5 overshoots hidden_int4 and drops the loop
                     // ROCm: plain store -> st_coherent_sys_x4, lane-contiguous keeps the dwordx4
-#if defined(__gfx942__) || defined(__gfx950__)
+#if defined(PRIMUS_TURBO_GFX942) || defined(PRIMUS_TURBO_GFX950)
                     UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_channel_x_buffers, shifted_x, __ldg, st_coherent_sys_x4);
 #else
                     UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_channel_x_buffers, shifted_x, __ldg, st_coherent_sys_x4);
@@ -526,7 +526,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                 // ROCm: unroll 5 -> 2 on wave64, same stride problem as the sender above
                 // ROCm: ld -> ld_coherent_sys_x4, a peer wrote the source; `recv_x` is our own
                 auto st_recv_x = [](int4* dst, const int4& value) { *dst = value; };
-#if defined(__gfx942__) || defined(__gfx950__)
+#if defined(PRIMUS_TURBO_GFX942) || defined(PRIMUS_TURBO_GFX950)
                 UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_recv_x_int4, shifted_buffer_x_int4, ld_coherent_sys_x4, st_recv_x);
 #else
                 UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_recv_x_int4, shifted_buffer_x_int4, ld_coherent_sys_x4, st_recv_x);
@@ -618,8 +618,13 @@ void dispatch(void* recv_x,
               int num_sms,
               int num_max_send_tokens,
               int num_recv_buffer_tokens) {
-    // ROCm: 768 -> 1024, 12 waves is not divisible by 8 ranks, 16 is
+    // ROCm: 768 -> 1024, each rank gets its own wave group and 768 is 12 wave64
+    // groups, which 8 ranks do not divide. Host code, so this keys on the build macro.
+#if defined(PRIMUS_TURBO_GFX942) || defined(PRIMUS_TURBO_GFX950)
     constexpr int kNumThreads = 1024;
+#else
+    constexpr int kNumThreads = 768;  // wave32, upstream's count already divides
+#endif
     constexpr int kNumTMABytesPerWarp = 8192;
 #ifndef DISABLE_SM90_FEATURES
     constexpr int smem_size = kNumTMABytesPerWarp * (kNumThreads / 32);
@@ -875,7 +880,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
                 auto shifted_x = x_int4 + (token_idx + i) * hidden_int4;
                 // ROCm: unroll 4 -> 2 on wave64, 4 leaves hidden <= 2048 un-pipelined
                 // ROCm: ld -> __ldg, the source is our own `x`; only the destination is a peer's
-#if defined(__gfx942__) || defined(__gfx950__)
+#if defined(PRIMUS_TURBO_GFX942) || defined(PRIMUS_TURBO_GFX950)
                 UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_x_buffers, shifted_x, __ldg, st_coherent_sys_x4);
 #else
                 UNROLLED_WARP_COPY(4, lane_id, hidden_int4, shifted_x_buffers, shifted_x, __ldg, st_coherent_sys_x4);
@@ -1144,7 +1149,11 @@ void combine(cudaDataType_t type,
              int num_max_send_tokens,
              int num_recv_buffer_tokens) {
     // ROCm: 768 -> 1024, same wave-count divisibility reason as dispatch
+#if defined(PRIMUS_TURBO_GFX942) || defined(PRIMUS_TURBO_GFX950)
     constexpr int kNumThreads = 1024;
+#else
+    constexpr int kNumThreads = 768;
+#endif
     constexpr int kNumTMABytesPerWarp = 4096;
 #ifndef DISABLE_SM90_FEATURES
     constexpr int smem_size = kNumTMABytesPerWarp * (kNumThreads / 32);
