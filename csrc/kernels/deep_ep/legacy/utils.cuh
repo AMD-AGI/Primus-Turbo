@@ -331,9 +331,14 @@ __device__ __forceinline__ float exp2f_approx(const float& x) {
     return __builtin_amdgcn_exp2f(x);
 }
 
+// ROCm: `mov.s32 %laneid` -> __lane_id(), which is wave64 here
+__forceinline__ __device__ int get_lane_id() {
+    return static_cast<int>(__lane_id());
+}
+
 // ROCm: `elect.sync` is SM90-only, and lane 0 is always active here
 __device__ __forceinline__ uint32_t elect_one_sync() {
-    return __lane_id() == 0;
+    return get_lane_id() == 0;
 }
 
 // ROCm: upstream's TMA block is dropped, gfx942/gfx950 have no cp.async/mbarrier
