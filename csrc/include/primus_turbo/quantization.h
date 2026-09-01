@@ -26,6 +26,15 @@ void quantize_tensorwise_amax_scale_impl(const FType *x, const int64_t n, const 
                                          float *amax, float *scale, float *scale_inv,
                                          float *workspace, hipStream_t stream);
 
+// The finalise half of the above on partials a producer already left behind, so the
+// tensor is never re-read. Each of the `count` partials is a non-negative abs-max over
+// some part of the tensor; a max reduction is exact and order-independent, so the scale
+// is bit-identical to the full two-launch path. `count` is capped at
+// `tensorwise_amax_workspace_elems()`, the reduction's compile-time width.
+void tensorwise_scale_from_partials_impl(const float *partials, const int32_t count,
+                                         const float q_max, float *amax, float *scale,
+                                         float *scale_inv, hipStream_t stream);
+
 // *************** Quantize ***************
 template <typename FType, typename QType, typename ComputeType = float>
 void quantize_tensorwise_impl(const FType *x, const float *scale, QType *y, const int64_t n,

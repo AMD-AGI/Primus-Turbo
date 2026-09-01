@@ -45,11 +45,14 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
                                                 const at::ScalarType      dest_dtype,
                                                 c10::optional<at::Tensor> scale_opt,
                                                 const int64_t             padding_align_size,
-                                                const int64_t pad_penultimate_align_size) {
+                                                const int64_t pad_penultimate_align_size,
+                                                c10::optional<at::Tensor> amax_partials_opt) {
     PRIMUS_TURBO_CHECK(input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf ||
                        input.scalar_type() == at::kFloat);
     PRIMUS_TURBO_CHECK(is_torch_fp8(dest_dtype));
     PRIMUS_TURBO_CHECK(input.is_contiguous(), "input must be contiguous");
+    PRIMUS_TURBO_CHECK(!(scale_opt.has_value() && amax_partials_opt.has_value()),
+                       "scale_opt and amax_partials are alternatives, not a pair");
     auto stream = at::cuda::getCurrentCUDAStream();
 
     const int64_t K    = input.size(-1);
@@ -65,17 +68,33 @@ std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
         // Whole-tensor abs-amax over the real (unpadded) data -> scalar scale. scale and
         // scale_inv get their own allocations (not a packed workspace view) so the returned
         // scale_inv stays 16-byte aligned for torch.compile's cudagraph output-alignment assert.
-        scale                 = torch::empty({}, input.options().dtype(at::kFloat));
-        scale_inv             = torch::empty({}, input.options().dtype(at::kFloat));
-        const int64_t w       = tensorwise_amax_workspace_elems();
-        at::Tensor    ws      = torch::empty({w + 1}, input.options().dtype(at::kFloat));
-        float        *wsp     = ws.data_ptr<float>();
-        const float   fp8_max = get_float8_max(dest_dtype);
-        TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), InT, {
-            quantize_tensorwise_amax_scale_impl<InT>(
-                reinterpret_cast<const InT *>(input.data_ptr()), input.numel(), fp8_max, wsp + w,
-                scale.data_ptr<float>(), scale_inv.data_ptr<float>(), wsp, stream);
-        });
+        scale               = torch::empty({}, input.options().dtype(at::kFloat));
+        scale_inv           = torch::empty({}, input.options().dtype(at::kFloat));
+        const int64_t w     = tensorwise_amax_workspace_elems();
+        const bool    fused = amax_partials_opt.has_value();
+        // The streaming pass fills w partials and reports the amax past them; the fused
+        // path brings its own partials and needs the amax slot alone.
+        at::Tensor  ws      = torch::empty({fused ? 1 : w + 1}, input.options().dtype(at::kFloat));
+        float      *amaxp   = ws.data_ptr<float>() + (fused ? 0 : w);
+        const float fp8_max = get_float8_max(dest_dtype);
+        if (fused) {
+            // The kernel that produced `input` already reduced it, so only the finalise
+            // half is left, over the same values and the same reduction.
+            const at::Tensor &partials = amax_partials_opt.value();
+            PRIMUS_TURBO_CHECK(partials.scalar_type() == at::kFloat && partials.is_contiguous() &&
+                                   partials.numel() >= 1 && partials.numel() <= w,
+                               "amax_partials must be 1 to ", w, " contiguous float32 elements");
+            tensorwise_scale_from_partials_impl(
+                partials.data_ptr<float>(), static_cast<int32_t>(partials.numel()), fp8_max, amaxp,
+                scale.data_ptr<float>(), scale_inv.data_ptr<float>(), stream);
+        } else {
+            TORCH_TYPE_SWITCH_FP16_BF16_FP32(input.scalar_type(), InT, {
+                quantize_tensorwise_amax_scale_impl<InT>(
+                    reinterpret_cast<const InT *>(input.data_ptr()), input.numel(), fp8_max, amaxp,
+                    scale.data_ptr<float>(), scale_inv.data_ptr<float>(), ws.data_ptr<float>(),
+                    stream);
+            });
+        }
     }
 
     // Output: last dim K -> Kp (Kp == K when padding_align_size divides K).
