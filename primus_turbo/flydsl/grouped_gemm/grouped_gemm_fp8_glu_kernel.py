@@ -33,6 +33,7 @@ from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_kernel import (
     _compile_grouped_nn,
     _compile_grouped_nt,
 )
+from primus_turbo.flydsl.utils.gemm_epilogue_helper import AMAX_PARTIAL_SLOTS
 
 _GROUPED_GLU_CACHE: dict = {}
 
@@ -144,6 +145,7 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
     activation: str = "silu",
     out_dtype=torch.bfloat16,
     num_cu: "int | None" = None,
+    amax_partial: "torch.Tensor | None" = None,
 ) -> "tuple[torch.Tensor, torch.Tensor]":
     """FlyDSL fc1 grouped fp8 GEMM with a fused SwiGLU epilogue, matching the Triton entry.
 
@@ -165,6 +167,10 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
         intermediate_out: [M_total, 2I] buffer receiving ``l1``. Both are the
             caller's to allocate: every slot is written, so neither needs
             initialising.
+        amax_partial: optional zeroed float32 [``AMAX_PARTIAL_SLOTS``] receiving
+            ``act``'s abs-max, folded a work group at a time. Passing it saves the
+            tensorwise quantiser a whole read of ``act``; the value is the same one
+            that pass would have found, a max being exact and order-independent.
 
     Returns:
         ``(act_out, intermediate_out)``.
@@ -181,6 +187,12 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
     assert probs.ndim == 1 and probs.shape[0] == M_total and probs.dtype == torch.float32
 
     act, l1 = act_out, intermediate_out
+    _amax = amax_partial is not None
+    if _amax:
+        assert amax_partial.shape == (AMAX_PARTIAL_SLOTS,) and amax_partial.dtype == torch.float32, (
+            f"amax_partial must be [{AMAX_PARTIAL_SLOTS}] float32, got "
+            f"{list(amax_partial.shape)} {amax_partial.dtype}"
+        )
     assert act.shape == (M_total, I) and act.dtype == out_dtype and act.device == a.device
     assert l1.shape == (M_total, N2) and l1.dtype == out_dtype and l1.device == a.device
 
@@ -190,7 +202,7 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
     cbsz = 1 if a.dtype == torch.float8_e5m2 else 0
     blgp = 1 if b.dtype == torch.float8_e5m2 else 0
     _capped = num_cu is not None and num_cu > 0
-    ckey = (I, K, G, out_fp16, cbsz, blgp, num_cu if _capped else 0)
+    ckey = (I, K, G, out_fp16, cbsz, blgp, num_cu if _capped else 0, _amax)
 
     launch = _GROUPED_GLU_CACHE.get(ckey)
     if launch is None:
@@ -235,6 +247,7 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
                 # (aux=16) costs 1.5x, so this is not a monotone knob.
                 cstore_aux=2,
                 glu_act_aux=2,
+                glu_amax=_amax,
             )
 
         def _probe():
@@ -245,6 +258,10 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
                 l1_c = torch.empty((M_c, N2), device=a.device, dtype=out_dtype)
                 act_c = torch.empty((M_c, I), device=a.device, dtype=out_dtype)
                 probs_c = torch.ones(M_c, device=a.device, dtype=torch.float32)
+                # Aliased to act when the amax is off, matching the kernel's unused slots.
+                amax_c = (
+                    torch.zeros(AMAX_PARTIAL_SLOTS, device=a.device, dtype=torch.float32) if _amax else act_c
+                )
             except torch.cuda.OutOfMemoryError:
                 return None
             return (
@@ -253,6 +270,7 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
                 l1_c,
                 act_c,
                 probs_c,
+                amax_c,
                 a_scale.float().reshape(1),
                 b_scale.float().reshape(1),
                 _balanced_group_offs(M_c, G, a.device),
@@ -272,6 +290,7 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
             l1,
             act,
             probs,
+            amax_partial if _amax else act,
             a_scale.float().reshape(1),
             b_scale.float().reshape(1),
             go32,
@@ -336,6 +355,7 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
     activation: str = "silu",
     num_cu: "int | None" = None,
     i_real: "int | None" = None,
+    amax_partial: "torch.Tensor | None" = None,
 ) -> "torch.Tensor":
     """FlyDSL fc2 dgrad with the SwiGLU gradient fused into its epilogue.
 
@@ -359,6 +379,10 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
         grad_probs_partial: float32 buffer receiving the grad_probs partials, as
             :func:`grouped_gemm_fp8_dglu_grad_probs_partial_spec` describes it --
             including that it has to arrive zeroed.
+        amax_partial: optional zeroed float32 [``AMAX_PARTIAL_SLOTS``] receiving
+            ``dl1``'s abs-max, folded a work group at a time. Passing it saves the
+            tensorwise quantiser a whole read of ``dl1``; the value is the same one
+            that pass would have found, a max being exact and order-independent.
 
     Returns:
         ``out``, for call-site convenience.
@@ -390,6 +414,12 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
         "size it with grouped_gemm_fp8_dglu_grad_probs_partial_spec"
     )
     dl1 = out
+    _amax = amax_partial is not None
+    if _amax:
+        assert amax_partial.shape == (AMAX_PARTIAL_SLOTS,) and amax_partial.dtype == torch.float32, (
+            f"amax_partial must be [{AMAX_PARTIAL_SLOTS}] float32, got "
+            f"{list(amax_partial.shape)} {amax_partial.dtype}"
+        )
 
     _go64 = group_offs if group_offs.dtype == torch.int64 else group_offs.to(torch.int64)
     go32 = _go64.view(torch.int32)
@@ -397,7 +427,7 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
     cbsz = 1 if a.dtype == torch.float8_e5m2 else 0
     blgp = 1 if b.dtype == torch.float8_e5m2 else 0
     _capped = num_cu is not None and num_cu > 0
-    ckey = (I, K, G, out_fp16, cbsz, blgp, num_cu if _capped else 0, n_stride)
+    ckey = (I, K, G, out_fp16, cbsz, blgp, num_cu if _capped else 0, n_stride, _amax)
 
     launch = _GROUPED_DGLU_CACHE.get(ckey)
     if launch is None:
@@ -425,6 +455,7 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
                 N=I,
                 n_stride=n_stride,
                 dglu=True,
+                dglu_amax=_amax,
                 glu_i=I,
                 # Non-temporal, as in the forward, but this only pays because the
                 # banded epilogue's accesses are whole lines: at 64 bytes a store
@@ -446,6 +477,10 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
                 dl1_c = torch.empty((M_c, 2 * I), device=a.device, dtype=out_dtype)
                 probs_c = torch.ones(M_c, device=a.device, dtype=torch.float32)
                 grad_probs_c = torch.zeros((partial_shape[0], M_c), device=a.device, dtype=torch.float32)
+                # Aliased to dl1 when the amax is off, matching the kernel's unused slots.
+                amax_c = (
+                    torch.zeros(AMAX_PARTIAL_SLOTS, device=a.device, dtype=torch.float32) if _amax else dl1_c
+                )
             except torch.cuda.OutOfMemoryError:
                 return None
             return (
@@ -458,6 +493,7 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
                 l1_c,
                 probs_c,
                 grad_probs_c,
+                amax_c,
                 M_c,
                 I,
                 M_c,
@@ -479,6 +515,7 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
             intermediate,
             probs,
             grad_probs_partial,
+            amax_partial if _amax else dl1,
             M_total,
             I,
             M_total,

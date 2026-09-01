@@ -371,6 +371,30 @@ def _row16_sum_f32(v):
     return v
 
 
+def _dpp_max_f32(acc, ctrl, row_mask=0xF):
+    """max(acc, DPP(acc, ctrl)) for f32; masked-off and shifted-in lanes contribute 0.
+
+    Zero is the identity only over non-negative values, which is what the callers
+    reduce: an abs-max.
+    """
+    raw = _raw(acc)
+    r = rocdl.update_dpp(raw.type, _raw(fx.Float32(0.0)), raw, ctrl, row_mask, 0xF, True)
+    return fx.Float32(_res_of(arith.MaxNumFOp(raw, _res_of(r))))
+
+
+def _wave_max_f32(v):
+    """Max a non-negative f32 across the whole wave; lane 63 ends with the total.
+
+    The scan shape of :func:`_wave_prefix_add_i32` with max for add. Requires a full
+    EXEC mask, so a lane whose value should not count has to be zeroed first rather
+    than branched around.
+    """
+    for _sh in (1, 2, 4, 8):
+        v = _dpp_max_f32(v, _DPP_ROW_SHR + _sh)
+    v = _dpp_max_f32(v, _DPP_ROW_BCAST15, row_mask=0xA)
+    return _dpp_max_f32(v, _DPP_ROW_BCAST31, row_mask=0xC)
+
+
 def _wave_prefix_add_i32(v):
     """Wave64 inclusive add-scan of a per-lane i32 (lane l ends with the sum of 0..l). Six DPP
     steps replace the serial carry (bound_ctrl zeroes shifted-in lanes). Requires a full EXEC

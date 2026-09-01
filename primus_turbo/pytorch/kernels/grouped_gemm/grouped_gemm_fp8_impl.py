@@ -1297,10 +1297,14 @@ def grouped_gemm_fp8_glu_impl(
     from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_glu_kernel import (
         grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel,
     )
+    from primus_turbo.flydsl.utils.gemm_epilogue_helper import AMAX_PARTIAL_SLOTS
     from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
         quantize_fp8_tensorwise_pad_impl,
     )
 
+    # The epilogue reduces act on the way out and leaves the abs-max here, so the
+    # quantiser below skips the pass that would read all of act back for it.
+    amax_partial = torch.zeros(AMAX_PARTIAL_SLOTS, device=a.device, dtype=torch.float32)
     grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
         a,
         b,
@@ -1314,12 +1318,15 @@ def grouped_gemm_fp8_glu_impl(
         activation=activation,
         out_dtype=out_dtype,
         num_cu=num_cu,
+        amax_partial=amax_partial,
     )
 
     # k_align pads the activation's I -> Ip (fc2's contraction K), copy-free: the
     # quantiser writes the padded buffer directly and zeroes the tail, so w2's own
     # padded-K contraction reads zeros there and fc2 stays bitwise-identical.
-    act_fp8, act_scale_inv = quantize_fp8_tensorwise_pad_impl(act, out_quant_dtype, k_align=k_align)
+    act_fp8, act_scale_inv = quantize_fp8_tensorwise_pad_impl(
+        act, out_quant_dtype, k_align=k_align, amax_partials=amax_partial
+    )
     return intermediate, act_fp8, act_scale_inv
 
 
@@ -1378,6 +1385,7 @@ def grouped_gemm_fp8_dglu_impl(
         grouped_gemm_fp8_dglu_grad_probs_partial_spec,
         grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel,
     )
+    from primus_turbo.flydsl.utils.gemm_epilogue_helper import AMAX_PARTIAL_SLOTS
     from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
         quantize_fp8_tensorwise_pad_impl,
     )
@@ -1386,6 +1394,9 @@ def grouped_gemm_fp8_dglu_impl(
     grad_probs_partial = _alloc_grad_probs_partial(
         grouped_gemm_fp8_dglu_grad_probs_partial_spec(a, b, i_real=N), a.device
     )
+    # The epilogue reduces dl1 on the way out and leaves the abs-max here, so the
+    # quantiser below skips the pass that would read all of dl1 back for it.
+    amax_partial = torch.zeros(AMAX_PARTIAL_SLOTS, device=a.device, dtype=torch.float32)
     grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
         a,
         b,
@@ -1400,9 +1411,12 @@ def grouped_gemm_fp8_dglu_impl(
         activation=activation,
         num_cu=num_cu,
         i_real=i_real,
+        amax_partial=amax_partial,
     )
 
-    out_fp8, out_scale_inv = quantize_fp8_tensorwise_pad_impl(out, out_quant_dtype, k_align=1)
+    out_fp8, out_scale_inv = quantize_fp8_tensorwise_pad_impl(
+        out, out_quant_dtype, k_align=1, amax_partials=amax_partial
+    )
     return torch.sum(grad_probs_partial, dim=0), out_fp8, out_scale_inv
 
 
