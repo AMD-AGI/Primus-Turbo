@@ -420,7 +420,7 @@ def test_main(
 def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     num_nodes = int(os.getenv("WORLD_SIZE", 1))
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
-    num_sms = 32
+    num_sms = int(os.getenv("DEEP_EP_TEST_NUM_SMS", "32"))
 
     buffer = deep_ep.Buffer(group, int(2e9), int(1e9), low_latency_mode=False, explicitly_destroy=True)
 

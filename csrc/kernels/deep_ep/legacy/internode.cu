@@ -74,7 +74,9 @@ __host__ __device__ __forceinline__ int get_num_bytes_per_token(int hidden_int4,
                                      sizeof(int4)));
 }
 
-__host__ __device__ __forceinline__ std::pair<int, int> get_rdma_clean_meta(int hidden_int4,
+// ROCm: `int` -> `int64_t`. The payload region already scales past 2 GB at 32 channels,
+// and this offset points just past it, so a 32-bit pair silently wraps.
+__host__ __device__ __forceinline__ std::pair<int64_t, int64_t> get_rdma_clean_meta(int hidden_int4,
                                                                             int num_scales,
                                                                             int num_topk_idx,
                                                                             int num_topk_weights,
@@ -82,13 +84,14 @@ __host__ __device__ __forceinline__ std::pair<int, int> get_rdma_clean_meta(int 
                                                                             int num_rdma_recv_buffer_tokens,
                                                                             int num_channels) {
     // Return `int32_t` offset and count to clean
-    return {(get_num_bytes_per_token(hidden_int4, num_scales, num_topk_idx, num_topk_weights) * num_rdma_recv_buffer_tokens *
-             num_rdma_ranks * 2 * num_channels) /
+    return {(static_cast<int64_t>(get_num_bytes_per_token(hidden_int4, num_scales, num_topk_idx, num_topk_weights)) *
+             num_rdma_recv_buffer_tokens * num_rdma_ranks * 2 * num_channels) /
                 sizeof(int),
-            (LEGACY_NUM_MAX_NVL_PEERS * 2 + 4) * num_rdma_ranks * 2 * num_channels};
+            static_cast<int64_t>(LEGACY_NUM_MAX_NVL_PEERS * 2 + 4) * num_rdma_ranks * 2 * num_channels};
 }
 
-__host__ __device__ __forceinline__ std::pair<int, int> get_nvl_clean_meta(int hidden_int4,
+// ROCm: `int` -> `int64_t`, same overflow as `get_rdma_clean_meta`
+__host__ __device__ __forceinline__ std::pair<int64_t, int64_t> get_nvl_clean_meta(int hidden_int4,
                                                                            int num_scales,
                                                                            int num_topk_idx,
                                                                            int num_topk_weights,
@@ -101,10 +104,10 @@ __host__ __device__ __forceinline__ std::pair<int, int> get_nvl_clean_meta(int h
     EP_STATIC_ASSERT(sizeof(SourceMeta) % sizeof(int) == 0, "Invalid size of `SourceMeta`");
 
     return {
-        (num_nvl_recv_buffer_tokens * get_num_bytes_per_token(hidden_int4, num_scales, num_topk_idx, num_topk_weights) * num_nvl_ranks *
-         num_channels) /
+        (static_cast<int64_t>(num_nvl_recv_buffer_tokens) *
+         get_num_bytes_per_token(hidden_int4, num_scales, num_topk_idx, num_topk_weights) * num_nvl_ranks * num_channels) /
             sizeof(int),
-        num_nvl_ranks * (2 * num_rdma_ranks + 2) * num_channels,
+        static_cast<int64_t>(num_nvl_ranks) * (2 * num_rdma_ranks + 2) * num_channels,
     };
 }
 
@@ -134,10 +137,10 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
                                 int num_worst_tokens,
                                 int num_channels,
                                 int expert_alignment,
-                                const int rdma_clean_offset,
-                                const int rdma_num_int_clean,
-                                const int nvl_clean_offset,
-                                const int nvl_num_int_clean,
+                                const int64_t rdma_clean_offset,
+                                const int64_t rdma_num_int_clean,
+                                const int64_t nvl_clean_offset,
+                                const int64_t nvl_num_int_clean,
                                 int* rdma_channel_prefix_matrix,
                                 int* recv_rdma_rank_prefix_sum,
                                 int* gbl_channel_prefix_matrix,
@@ -176,7 +179,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         // ROCm: plain stores -> st_coherent_sys_global, the readers of these slots use `sc0 sc1`
         EP_DEVICE_ASSERT(rdma_recv_num_tokens_mixed.total_bytes <= rdma_clean_offset * sizeof(int));
         #pragma unroll
-        for (int i = thread_id; i < rdma_num_int_clean; i += num_threads)
+        for (int64_t i = thread_id; i < rdma_num_int_clean; i += num_threads)
             st_coherent_sys_global(rdma_buffer_ptr_int + rdma_clean_offset + i, 0);
 
         // Copy to send buffer
@@ -232,7 +235,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
                          nvl_clean_offset * sizeof(int));
         // ROCm: plain stores -> st_coherent_sys_global, NVL peers read these slots with `sc0 sc1`
         #pragma unroll
-        for (int i = thread_id; i < nvl_num_int_clean; i += num_threads)
+        for (int64_t i = thread_id; i < nvl_num_int_clean; i += num_threads)
             st_coherent_sys_global(nvl_buffer_ptr_int + nvl_clean_offset + i, 0);
 
         // Reduce number of tokens per expert into the NVL send buffer
@@ -454,8 +457,8 @@ void notify_dispatch(const int* num_tokens_per_rank,
                                              true);
     EP_HOST_ASSERT((rdma_clean_meta.first + rdma_clean_meta.second) * sizeof(int) <= num_rdma_bytes);
     EP_HOST_ASSERT((nvl_clean_meta.first + nvl_clean_meta.second) * sizeof(int) <= num_nvl_bytes);
-    EP_HOST_ASSERT(num_rdma_bytes < std::numeric_limits<int>::max());
-    EP_HOST_ASSERT(num_nvl_bytes < std::numeric_limits<int>::max());
+    // ROCm: the `< INT_MAX` pair is gone -- both buffers are laid out per channel, so at
+    // `num_sms == 64` they are past 2 GB by construction. Every offset is int64_t now.
 
     // Launch kernel
     SETUP_LAUNCH_CONFIG(1 + num_rdma_ranks, kNumThreads, stream);
@@ -512,8 +515,10 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + LEGACY_NUM
     enum class WarpRole { kRDMASender, kRDMASenderCoordinator, kRDMAAndNVLForwarder, kForwarderCoordinator, kNVLReceivers };
 
     // ROCm: new, rocSHMEM device calls need a workgroup context, and creating one is collective
+    // A non-zero return means the pool ran dry -- `ctx` is then garbage and every put on it
+    // faults, so say so here instead of dying on a stray address. Raise ROCSHMEM_MAX_NUM_CONTEXTS.
     __shared__ rocshmem_ctx_t ctx;
-    ::rocshmem::rocshmem_wg_ctx_create(0, &ctx);
+    EP_DEVICE_ASSERT(::rocshmem::rocshmem_wg_ctx_create(0, &ctx) == 0);
 
     const auto num_sms = static_cast<int>(gridDim.x);
     const auto sm_id = static_cast<int>(blockIdx.x);
@@ -1368,10 +1373,10 @@ void dispatch(void* recv_x,
 
 // ROCm: `kNumTMABytesPerWarp` is gone with the TMA path, the scan runs straight on global
 template <bool kLowLatencyMode>
-__global__ void cached_notify(const int rdma_clean_offset,
-                              const int rdma_num_int_clean,
-                              const int nvl_clean_offset,
-                              const int nvl_num_int_clean,
+__global__ void cached_notify(const int64_t rdma_clean_offset,
+                              const int64_t rdma_num_int_clean,
+                              const int64_t nvl_clean_offset,
+                              const int64_t nvl_num_int_clean,
                               int* combined_rdma_head,
                               int num_combined_tokens,
                               int num_channels,
@@ -1415,14 +1420,14 @@ __global__ void cached_notify(const int rdma_clean_offset,
         // ROCm: plain stores -> st_coherent_sys_global, the readers of these slots use `sc0 sc1`
         auto rdma_buffer_ptr_int = static_cast<int*>(rdma_buffer_ptr);
         #pragma unroll
-        for (int i = thread_id; i < rdma_num_int_clean; i += num_threads)
+        for (int64_t i = thread_id; i < rdma_num_int_clean; i += num_threads)
             st_coherent_sys_global(rdma_buffer_ptr_int + rdma_clean_offset + i, 0);
 
         // Clean NVL buffer
         auto nvl_buffer_ptr_int = static_cast<int*>(buffer_ptrs[nvl_rank]);
         // ROCm: plain stores -> st_coherent_sys_global, NVL peers read these slots with `sc0 sc1`
         #pragma unroll
-        for (int i = thread_id; i < nvl_num_int_clean; i += num_threads)
+        for (int64_t i = thread_id; i < nvl_num_int_clean; i += num_threads)
             st_coherent_sys_global(nvl_buffer_ptr_int + nvl_clean_offset + i, 0);
         // ROCm: __syncthreads() orders only LDS on CDNA, so drain the cleans first
         s_waitcnt();
@@ -1437,22 +1442,27 @@ __global__ void cached_notify(const int rdma_clean_offset,
         if (is_cached_dispatch)
             return;
 
-        EP_DEVICE_ASSERT(num_warps >= num_channels);
         EP_DEVICE_ASSERT(num_rdma_ranks <= 32);
 
         // Iterate in reverse order
-        if (lane_id < num_rdma_ranks and warp_id < num_channels) {
-            int token_start_idx, token_end_idx;
-            get_channel_task_range(num_combined_tokens, num_channels, warp_id, token_start_idx, token_end_idx);
+        // ROCm: upstream gives every channel its own warp, which needs `32 * num_channels`
+        // threads. A wave is twice as wide here, so that formula blows past the 1024-thread
+        // block limit at `num_sms == 64`. Stride over the channels instead: the block stays
+        // legal for any channel count and each wave still owns a whole channel at a time.
+        if (lane_id < num_rdma_ranks) {
+            for (int channel_id = warp_id; channel_id < num_channels; channel_id += num_warps) {
+                int token_start_idx, token_end_idx;
+                get_channel_task_range(num_combined_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
 
-            // NOTES: `1 << 25` is a heuristic large number
-            int last_head = 1 << 25;
-            for (int token_idx = token_end_idx - 1; token_idx >= token_start_idx; --token_idx) {
-                auto current_head = __ldg(combined_rdma_head + token_idx * num_rdma_ranks + lane_id);
-                if (current_head < 0) {
-                    combined_rdma_head[token_idx * num_rdma_ranks + lane_id] = -last_head - 1;
-                } else {
-                    last_head = current_head;
+                // NOTES: `1 << 25` is a heuristic large number
+                int last_head = 1 << 25;
+                for (int token_idx = token_end_idx - 1; token_idx >= token_start_idx; --token_idx) {
+                    auto current_head = __ldg(combined_rdma_head + token_idx * num_rdma_ranks + lane_id);
+                    if (current_head < 0) {
+                        combined_rdma_head[token_idx * num_rdma_ranks + lane_id] = -last_head - 1;
+                    } else {
+                        last_head = current_head;
+                    }
                 }
             }
         }
@@ -1460,28 +1470,31 @@ __global__ void cached_notify(const int rdma_clean_offset,
         if (is_cached_dispatch)
             return;
 
-        EP_DEVICE_ASSERT(num_warps >= num_channels);
         EP_DEVICE_ASSERT(rdma_channel_prefix_matrix != nullptr and rdma_rank_prefix_sum != nullptr);
         EP_STATIC_ASSERT(LEGACY_NUM_MAX_NVL_PEERS <= 32, "Too many NVL peers");
 
         // ROCm: the TMA staging of `combined_nvl_head` is dropped -- the scan is one int per
         // lane per token either way, so batching it through shared memory buys nothing here
-        if (lane_id < LEGACY_NUM_MAX_NVL_PEERS and warp_id < num_channels) {
-            for (int dst_rdma_rank = sm_id - 2; dst_rdma_rank < num_rdma_ranks; dst_rdma_rank += num_channels * 2 - 2) {
-                // Iterate in reverse order
-                int token_start_idx = warp_id == 0 ? 0 : rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + warp_id - 1];
-                int token_end_idx = rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + warp_id];
-                int shift = dst_rdma_rank == 0 ? 0 : rdma_rank_prefix_sum[dst_rdma_rank - 1];
-                token_start_idx += shift, token_end_idx += shift;
+        // ROCm: channel-strided for the same 1024-thread reason as the branch above
+        if (lane_id < LEGACY_NUM_MAX_NVL_PEERS) {
+            for (int channel_id = warp_id; channel_id < num_channels; channel_id += num_warps) {
+                for (int dst_rdma_rank = sm_id - 2; dst_rdma_rank < num_rdma_ranks; dst_rdma_rank += num_channels * 2 - 2) {
+                    // Iterate in reverse order
+                    int token_start_idx =
+                        channel_id == 0 ? 0 : rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id - 1];
+                    int token_end_idx = rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id];
+                    int shift = dst_rdma_rank == 0 ? 0 : rdma_rank_prefix_sum[dst_rdma_rank - 1];
+                    token_start_idx += shift, token_end_idx += shift;
 
-                // NOTES: `1 << 25` is a heuristic large number
-                int last_head = 1 << 25;
-                for (int token_idx = token_end_idx - 1; token_idx >= token_start_idx; --token_idx) {
-                    auto current_head = __ldg(combined_nvl_head + token_idx * LEGACY_NUM_MAX_NVL_PEERS + lane_id);
-                    if (current_head < 0) {
-                        combined_nvl_head[token_idx * LEGACY_NUM_MAX_NVL_PEERS + lane_id] = -last_head - 1;
-                    } else {
-                        last_head = current_head;
+                    // NOTES: `1 << 25` is a heuristic large number
+                    int last_head = 1 << 25;
+                    for (int token_idx = token_end_idx - 1; token_idx >= token_start_idx; --token_idx) {
+                        auto current_head = __ldg(combined_nvl_head + token_idx * LEGACY_NUM_MAX_NVL_PEERS + lane_id);
+                        if (current_head < 0) {
+                            combined_nvl_head[token_idx * LEGACY_NUM_MAX_NVL_PEERS + lane_id] = -last_head - 1;
+                        } else {
+                            last_head = current_head;
+                        }
                     }
                 }
             }
@@ -1511,8 +1524,9 @@ void cached_notify(int hidden_int4,
                    int64_t num_nvl_bytes,
                    bool is_cached_dispatch,
                    bool low_latency_mode) {
-    // ROCm: 32 -> WARP_SIZE, the kernel still needs one wave per channel
-    const int num_threads = std::max(128, WARP_SIZE * num_channels);
+    // ROCm: 32 -> WARP_SIZE, but clamped -- a wave is twice as wide, so the upstream formula
+    // asks for 2048 threads at `num_sms == 64`. The kernel strides over channels instead.
+    const int num_threads = std::min(1024, std::max(128, WARP_SIZE * num_channels));
     const auto num_rdma_ranks = num_ranks / LEGACY_NUM_MAX_NVL_PEERS;
 
     // Get clean meta
@@ -1529,8 +1543,8 @@ void cached_notify(int hidden_int4,
                                              is_cached_dispatch);
     EP_HOST_ASSERT((rdma_clean_meta.first + rdma_clean_meta.second) * sizeof(int) <= num_rdma_bytes);
     EP_HOST_ASSERT((nvl_clean_meta.first + nvl_clean_meta.second) * sizeof(int) <= num_nvl_bytes);
-    EP_HOST_ASSERT(num_rdma_bytes < std::numeric_limits<int>::max());
-    EP_HOST_ASSERT(num_nvl_bytes < std::numeric_limits<int>::max());
+    // ROCm: the `< INT_MAX` pair is gone -- both buffers are laid out per channel, so at
+    // `num_sms == 64` they are past 2 GB by construction. Every offset is int64_t now.
     EP_HOST_ASSERT(num_channels * 2 > 3);
 
     // Launch kernel
@@ -1718,8 +1732,10 @@ __global__ void __launch_bounds__(kNumCombineBlockWarps * WARP_SIZE, 1) combine(
     const bool is_forwarder_sm = sm_id % 2 == 1;
 
     // ROCm: new, rocSHMEM device calls need a workgroup context, and creating one is collective
+    // A non-zero return means the pool ran dry -- `ctx` is then garbage and every put on it
+    // faults, so say so here instead of dying on a stray address. Raise ROCSHMEM_MAX_NUM_CONTEXTS.
     __shared__ rocshmem_ctx_t ctx;
-    ::rocshmem::rocshmem_wg_ctx_create(0, &ctx);
+    EP_DEVICE_ASSERT(::rocshmem::rocshmem_wg_ctx_create(0, &ctx) == 0);
 
     // ROCm: `barrier.sync <id>` -> sync_barrier, an LDS arrival counter (arch.cuh). Must run
     // before the role split, `sync_barrier_init` is a whole-block sync.

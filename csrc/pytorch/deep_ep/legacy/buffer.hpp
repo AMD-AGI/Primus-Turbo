@@ -105,10 +105,11 @@ public:
 
         // Common checks
         EP_STATIC_ASSERT(LEGACY_NUM_BUFFER_ALIGNMENT_BYTES % sizeof(int4) == 0, "Invalid alignment");
-        EP_HOST_ASSERT(num_nvl_bytes % LEGACY_NUM_BUFFER_ALIGNMENT_BYTES == 0 and
-                       (num_nvl_bytes <= std::numeric_limits<int>::max() or num_rdma_bytes == 0));
-        EP_HOST_ASSERT(num_rdma_bytes % LEGACY_NUM_BUFFER_ALIGNMENT_BYTES == 0 and
-                       (low_latency_mode or num_rdma_bytes <= std::numeric_limits<int>::max()));
+        // ROCm: the `<= INT_MAX` clauses are gone. Both buffers are laid out per channel, so
+        // internode at `num_sms == 64` needs more than 2 GB of NVL by construction; the offsets
+        // that used to be 32-bit (the clean meta) are int64_t now. `int4` counts still fit.
+        EP_HOST_ASSERT(num_nvl_bytes % LEGACY_NUM_BUFFER_ALIGNMENT_BYTES == 0);
+        EP_HOST_ASSERT(num_rdma_bytes % LEGACY_NUM_BUFFER_ALIGNMENT_BYTES == 0);
         EP_HOST_ASSERT(num_nvl_bytes / sizeof(int4) < std::numeric_limits<int>::max());
         EP_HOST_ASSERT(num_rdma_bytes / sizeof(int4) < std::numeric_limits<int>::max());
         EP_HOST_ASSERT(0 <= rank and rank < num_ranks and (num_ranks <= LEGACY_NUM_MAX_NVL_PEERS * LEGACY_NUM_MAX_RDMA_PEERS or low_latency_mode));
