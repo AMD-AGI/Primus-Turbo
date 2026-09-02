@@ -4545,24 +4545,52 @@ def _autotune_wgrad_dispatch(
 
         return prod
 
+    def _try_4wave(cfg):
+        """Compile+launch ``cfg`` on the balanced probe. None if the output is non-finite."""
+        cand = _compile_4wave(*cfg)
+        for mp in mps:
+            cand(*mp[0])
+            torch.cuda.synchronize()
+            if not torch.isfinite(mp[1].view(-1)[:1024].float()).all().item():
+                return None
+        return cand
+
+    print(
+        f"[wgrad-autotune] OUT=({OUT_M},{OUT_N}) real=({m_real},{n_real}) G={G} "
+        f"M_total={M_total} i64={i64_traverse} tight={c_tight} fp32={out_fp32} cands={wave4_cands}",
+        flush=True,
+    )
     prod = None
     best_cfg = None
-    if not i64_traverse:
-        try:
-            cfg0 = wave4_cands[0]
-            cand = _compile_4wave(*cfg0)
-            ok = True
-            for mp in mps:
-                cand(*mp[0])
-                torch.cuda.synchronize()
-                if not torch.isfinite(mp[1].view(-1)[:1024].float()).all().item():
-                    ok = False
+    errors = []
+    # i64 huge shapes skip persist 4-wave on padded C (masked is the ref). Tight C cannot
+    # use masked, so still try 4-wave there -- better a clear raise than a padded-pitch store.
+    skip_4wave = i64_traverse and not c_tight
+    if not skip_4wave:
+        for cfg in wave4_cands:
+            try:
+                cand = _try_4wave(cfg)
+            except Exception as exc:
+                errors.append((cfg, f"{type(exc).__name__}: {exc}"))
+                if not c_tight:
                     break
-            if ok:
-                prod, best_cfg = cand, cfg0
-        except Exception:
-            prod = None
+                continue
+            if cand is not None:
+                prod, best_cfg = cand, cfg
+                print(f"[wgrad-autotune] persist-ref {cfg}", flush=True)
+                break
+            errors.append((cfg, "non-finite"))
+            if not c_tight:
+                break
     if prod is None:  # i64 huge shape or 4-wave failed to compile/produced NaN -> masked ref
+        if c_tight:
+            raise RuntimeError(
+                "wgrad persist 4-wave cannot serve a tight C "
+                f"(padded-pitch masked store into real-extent buffer). "
+                f"OUT=({OUT_M},{OUT_N}) real=({m_real},{n_real}) G={G} "
+                f"M_total={M_total} i64={i64_traverse} fp32={out_fp32} "
+                f"cands={wave4_cands} errors={errors}"
+            )
         prod = _build_masked(False)
         best_cfg = None
         for mp in mps:
@@ -4592,7 +4620,7 @@ def _autotune_wgrad_dispatch(
         return worst
 
     best_s = _score(prod)
-    race = wave4_cands if best_cfg is None else wave4_cands[1:]
+    race = tuple(cfg for cfg in wave4_cands if cfg != best_cfg)
     for cfg in race:
         try:
             l = _compile_4wave(*cfg)
@@ -4605,6 +4633,12 @@ def _autotune_wgrad_dispatch(
         if s is not None and (best_s is None or s < best_s * _WGRAD_RACE_MARGIN):
             best_s, best_cfg = s, cfg
     if best_cfg is None:
+        if c_tight:
+            raise RuntimeError(
+                "wgrad persist 4-wave race left no tight-C winner "
+                f"OUT=({OUT_M},{OUT_N}) real=({m_real},{n_real}) G={G} "
+                f"M_total={M_total} i64={i64_traverse} fp32={out_fp32} errors={errors}"
+            )
         return _build_masked
     _cfg = best_cfg
     return lambda beta_is_one: _compile_4wave(*_cfg, beta_is_one=beta_is_one)
