@@ -3480,6 +3480,18 @@ def _wgrad_flag_rows(ntiles, out_n, elem_bytes=2):
     return ceildiv(ntiles * 4, out_n * elem_bytes)
 
 
+def _wgrad_split_head_ids(tiles_per_group, total, ncu, nb, nxcd=_WGRAD_XCD_HW):
+    """Slice-head dispatch ids for ``nb``, matching ``_compile_grouped_tn_wgrad_4wave``.
+    Must be ``<= total`` so the head fits one grid-stride turn; otherwise the 4-wave
+    factory asserts and autotune falls through to masked (which cannot serve a tight C)."""
+    if nb <= 1:
+        return 0
+    sp_a = (nb - 1) * tiles_per_group
+    sp_2x = ceildiv(2 * sp_a, nxcd) * nxcd
+    sp_lead = sp_a if tiles_per_group < ncu and sp_2x <= total else 0
+    return ceildiv(sp_a + sp_lead, nxcd) * nxcd
+
+
 def _wgrad_split_geom(tiles_per_group, total, ncu):
     """Compile-time deep-K split geometry ``(NB, BANDS, FIRE, HOLD)`` shared by factory and host
     entry: NB token chunks, BANDS = NB-1 scratch bands, FIRE/HOLD the cut/promote bars. NB == 1
@@ -3491,6 +3503,13 @@ def _wgrad_split_geom(tiles_per_group, total, ncu):
     nb = _WGRAD_SPLIT_NB_MIN
     while nb < _WGRAD_SPLIT_NB and tiles_per_group * nb < _WGRAD_SPLIT_FILL * ncu:
         nb *= 2
+    # FILL may ask for NB=8 on a 144-tile down-proj; with few local experts (EP>1, G=4)
+    # that head is larger than G*tiles and the 4-wave persist compile fails. Lower NB
+    # until the head fits; below NB_MIN the split is a no-op so disable it.
+    while nb > 1 and _wgrad_split_head_ids(tiles_per_group, total, ncu, nb) > total:
+        nb //= 2
+    if nb < _WGRAD_SPLIT_NB_MIN:
+        return 1, 0, 0, 0
     return nb, nb - 1, _WGRAD_SPLIT_FIRE, _WGRAD_SPLIT_HOLD
 
 
