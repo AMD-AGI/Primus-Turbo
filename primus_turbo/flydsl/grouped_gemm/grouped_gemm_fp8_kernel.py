@@ -183,6 +183,16 @@ def _num_cus():
     return _NUM_CUS_CACHE
 
 
+def _cap_reserves_cus(num_cu) -> bool:
+    """Whether ``num_cu`` actually holds CUs back for something else.
+
+    The persistent fixed grid exists to leave CUs free for communication; a cap at or above
+    the device's own CU count leaves nothing free, so it buys none of that and still pays the
+    scf.for tile loop instead of the straight-line one-tile body.
+    """
+    return num_cu is not None and 0 < num_cu < _num_cus()
+
+
 def _compile_grouped_nn(
     *,
     K: int,
@@ -546,7 +556,12 @@ def _compile_grouped_nn(
 
             # Before-mfma scheduling barrier; after-mfma barriers stay real (gfx950 mfma-src/ds-read VGPR-overlap race).
             def _ibar():
-                if const_expr(sched_schedbar):
+                # Demoting a real rendezvous to a compile-time fence is only safe under
+                # the tile loop, which holds the waves in convoy across iterations. With
+                # one tile per work group there is no loop and a fill overtakes a reader
+                # of the same LDS pool: measured as a run-to-run difference in a tenth of
+                # the MoE gradients at the deployed shape.
+                if const_expr(sched_schedbar and persistent):
                     rocdl.sched_barrier(0)
                 else:
                     rocdl.s_barrier()
@@ -1221,7 +1236,12 @@ def _compile_grouped_nt(
             # holding the waves in convoy, so removing it costs more than it saves.
             # Prologue/tail/epilog barriers stay real.
             def _ibar():
-                if const_expr(sched_schedbar):
+                # Demoting a real rendezvous to a compile-time fence is only safe under
+                # the tile loop, which holds the waves in convoy across iterations. With
+                # one tile per work group there is no loop and a fill overtakes a reader
+                # of the same LDS pool: measured as a run-to-run difference in a tenth of
+                # the MoE gradients at the deployed shape.
+                if const_expr(sched_schedbar and persistent):
                     rocdl.sched_barrier(0)
                 else:
                     rocdl.s_barrier()
@@ -2365,11 +2385,12 @@ def _np_regime(trans_b, N, K, G, M_total):
 
 
 def _autotune_np_dispatch(
-    trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime, beta_is_one=False, n_stride=0
+    trans_b, N, K, G, out_fp16, cbsz, blgp, args, regime, beta_is_one=False, n_stride=0, race=True
 ):
     """Race the NT/NN candidates on balanced synthetic tensors, cached per static
     (op,N,K,G,dtype,regime), never per M_total. regime==1 -> fixed bm128. Candidates carry the
-    caller's ``beta_is_one``; the probe owns its buffer and zeroes it per launch (C = 0 + acc)."""
+    caller's ``beta_is_one``; the probe owns its buffer and zeroes it per launch (C = 0 + acc).
+    ``race=False`` takes cand[0], the static optimum, without building a probe at all."""
     # NN B[K,N] traversal: re-base B SRD per load in i64 when the per-group span K*N reaches 2^32 fp8.
     i64_tr = (not trans_b) and (K * max(N, n_stride) >= 2**32)
 
@@ -2428,6 +2449,27 @@ def _autotune_np_dispatch(
     if not trans_b and regime == 1:
         # small-M dgrad: BLOCK_M=128 doubles the M-tiles and wins here, so a single config, no autotune.
         return mk(128, 1, 0, 0)
+
+    # <=4 candidates/op, all measured-competitive: arms that lose on the deployed shapes lose on
+    # every distribution, so they only spend a candidate slot and hand the race a chance to pick
+    # a loser. cand[0] is the static optimum; NT deep-K keeps its own arms (unmeasured family,
+    # xcd1 is its group-major lever).
+    if trans_b:
+        cands = list(_NP_8WAVE_CANDS)
+        if N <= K and K >= _NP_LARGE_K:
+            cands.append((256, 1, 4, 0))
+        elif G * N * K > _NP_B_LLC:
+            lead = _NP_DRAM_WIDE_CAND if N > K else _NP_DRAM_NARROW_CAND
+            cands = [lead] + [c for c in cands if c != lead] + [_NP_STATIC_CAND]
+        else:
+            cands.insert(0, _NP_STATIC_CAND)
+    else:
+        # dgrad NN: N-bands do not help (deep-K transpose-load core), so diversity is in (num_xcd, group_m).
+        cands = [_NP_STATIC_CAND, (256, 8, 4, 0)]
+
+    if not race:
+        return mk(*cands[0])
+
     a_live, b_i8, out_live = args[0], args[1], args[2]
     mps = []
     # Production-magnitude fp8 probe A: fp8 GEMM wall time is data-magnitude/DVFS sensitive, so an all-zero probe would misrank candidates.
@@ -2446,23 +2488,6 @@ def _autotune_np_dispatch(
                 None,
             ]
         )
-
-    # <=4 candidates/op, all measured-competitive: arms that lose on the deployed shapes lose on
-    # every distribution, so they only spend a candidate slot and hand the race a chance to pick
-    # a loser. cand[0] is the static optimum; NT deep-K keeps its own arms (unmeasured family,
-    # xcd1 is its group-major lever).
-    if trans_b:
-        cands = list(_NP_8WAVE_CANDS)
-        if N <= K and K >= _NP_LARGE_K:
-            cands.append((256, 1, 4, 0))
-        elif G * N * K > _NP_B_LLC:
-            lead = _NP_DRAM_WIDE_CAND if N > K else _NP_DRAM_NARROW_CAND
-            cands = [lead] + [c for c in cands if c != lead] + [_NP_STATIC_CAND]
-        else:
-            cands.insert(0, _NP_STATIC_CAND)
-    else:
-        # dgrad NN: N-bands do not help (deep-K transpose-load core), so diversity is in (num_xcd, group_m).
-        cands = [_NP_STATIC_CAND, (256, 8, 4, 0)]
 
     def _score(launch):
         """Geomean of the launch time at every canonical M, or None if it drifts/NaNs at
@@ -2495,12 +2520,6 @@ def _autotune_np_dispatch(
         s = _score(l)  # numeric guard folded in: None -> skip
         if s is not None and s < bs * 0.985:  # adopt only past the noise margin (geomean)
             best, bs = l, s
-
-    # Hand the allocator back the probes, as the fused entry's race already does: they run to
-    # a gigabyte a side at the canonical M, and a race left holding them makes the next one in
-    # the same process mis-pick an arm.
-    mps.clear()
-    torch.cuda.empty_cache()
     return best
 
 
@@ -2545,9 +2564,15 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
     grp_agpr = _GROUPED_AGPR
     nt_group_m = _GROUPED_NT_GROUPM  # 0 = row-major; the autotune sweeps group_m per shape
     op = "nt" if trans_b else "nn"
-    # num_cu<=0: whole device via non-persistent nt8w/nn8w (one tile/WG). num_cu>0: reserve CUs -> persistent fixed grid. M_total is in the key.
-    capped = num_cu is not None and num_cu > 0
+    # No reservation: whole device via non-persistent nt8w/nn8w (one tile/WG). A cap that really
+    # reserves CUs -> persistent fixed grid. M_total is in the key.
+    capped = _cap_reserves_cus(num_cu)
     nonpersist = not capped
+    # A cap that covers the whole device reaches the same non-persistent body but pins its config
+    # rather than racing for it. The race holds a gigabyte a side of probe while it scores, and the
+    # fused GLU/dGLU races sharing the process were measured to mis-pick an arm under that pressure
+    # and stay 2x slow for the rest of it. cand[0] is the static optimum for this shape family.
+    race_np = num_cu is None or num_cu <= 0
     # NK autotune key excludes M_total; a coarse M-derived regime bucket covers every M_total (see _np_regime).
     regime = _np_regime(trans_b, N, K, G, M_total) if nonpersist else 0
     at_key = (
@@ -2561,6 +2586,7 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
         regime,
         nonpersist,
         num_cu if capped else 0,
+        race_np,
         beta_is_one,
         n_stride,
     )
@@ -2581,7 +2607,9 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
     entry = _GROUPED_AT_CACHE.get(at_key)
     if entry is None:
         if nonpersist:
-            # num_cu<=0 (full device): autotune the non-persistent nt8w/nn8w swizzle (straight-line one-tile/WG body, no scf.for penalty).
+            # Whole device: the non-persistent nt8w/nn8w swizzle (straight-line one-tile/WG body, no
+            # scf.for penalty), raced when the caller named no cap and pinned when it capped at the
+            # device's own CU count.
             launch = _autotune_np_dispatch(
                 trans_b,
                 N,
@@ -2594,6 +2622,7 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
                 regime,
                 beta_is_one=beta_is_one,
                 n_stride=n_stride,
+                race=race_np,
             )
         else:
             # Single persistent prod config (no autotune); reached only when num_cu>0 reserves CUs. Default goes to nt8w/nn8w.
