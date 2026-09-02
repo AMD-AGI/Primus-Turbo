@@ -38,6 +38,7 @@ from primus_turbo.flydsl.utils.prims import (
     _lds_ptr_from_i32,
     _readfirstlane_i32,
     _readlane_i32,
+    _res_of,
     _sload_i32,
     _u32,
     _wave_count_le_i32,
@@ -177,7 +178,8 @@ def make_bf16_fp16_tile_tensor(base_i64, byte_offset, elems):
     int64 (keeps per-lane voffset int32 past a >4GB pool). Returns a plain global view;
     the caller feeds it straight to gemm_tile, so the nt_tile API stays unchanged."""
     ptr_ty = PointerType.get(elem_ty=fx.BFloat16.ir_type, address_space=AddressSpace.Global, alignment=16)
-    tile_ptr = fx.inttoptr(ptr_ty, base_i64 + byte_offset)
+    # A VMEM-loaded base reads as divergent even though it is wave-uniform, which would wrap every `buffer_load ... lds` in a per-lane waterfall.
+    tile_ptr = fx.inttoptr(ptr_ty, _readfirstlane_i32(base_i64 + byte_offset))
     return fx.make_view(tile_ptr, fx.make_layout(elems, 1))
 
 
@@ -271,9 +273,7 @@ class G2SLoader:
         self.n_load_steps = n_load_steps
         self.wave_id = wave_id
         self.n_waves = fx.block_dim.x // 64
-        # Per-wave LDS chunk stride. A padded stride (e.g. 1056) un-aligns the
-        # chunk base across LDS banks to cut transpose-read bank conflicts; the
-        # read side (S2RLoaderTr) must use the same value.
+        # Padding the per-wave chunk stride moves a transposed read's four lane groups off one bank half; reader and LDS pool must agree.
         self.chunk_stride = chunk_stride
         # i64-traversal mode. None -> the K-offset rides the 32-bit soffset (caps the operand
         # span at < 2^32 fp8). A (arg_i8, fp8_ir_t, base_elems, num_records_bytes) tuple re-bases
@@ -601,6 +601,27 @@ class ScaleS2R:
 
 
 # gfx9 DPP controls: ROW_SHR|n shifts right by n within a 16-lane row; ROW_BCAST15/31 feed a row's last lane into following rows.
+def wave_rank_desc_stable(v, lane, n_entries):
+    """Descending, tie-stable rank of a wave-resident i32 table (lane i holds entry i):
+    ``rank_j = #{i: v_i > v_j} + #{i < j: v_i == v_j}``, the permutation a stable descending
+    argsort produces. Lanes past ``n_entries`` must hold a value below every real entry."""
+    one, zero = fx.Int32(1), fx.Int32(0)
+    rank = zero
+    for i in range_constexpr(n_entries):
+        vi = _readlane_i32(v, i)
+        rank = rank + arith.select(vi > v, one, zero)
+        rank = rank + arith.select(vi == v, arith.select(fx.Int32(i) < lane, one, zero), zero)
+    return rank
+
+
+def wave_lane_with_rank(rank, slot):
+    """The one lane whose rank equals the wave-uniform ``slot``.  The ballot mask is one-hot,
+    so a population count of the mask minus one is its bit index -- no s_ff1 intrinsic."""
+    m = _res_of(rocdl.ballot(res=ir.IntegerType.get_signless(64), pred=_raw(rank == slot)))
+    n = _res_of(_llvm.intr_ctpop(_raw(ArithValue(m) - fx.Int64(1))))
+    return ArithValue(arith.trunci(T.i32, n))
+
+
 # SGPR-resident int32 table (entry i in its own SGPR): small-table twin of the lane-resident
 # table. Lookup/prefix-sum are O(n_entries) SALU, so it pays only while the table is short --
 # but keeps the whole group scan off the vector path (no gather, no DPP scan, no readlane).
@@ -1423,6 +1444,54 @@ def xcd_remap_pid(pid, total_pids, num_xcd):
     return offset + local
 
 
+def group_m_tile_decode(tile, n_blocks_m, n_blocks_n, group_m):
+    """Decode a tile id to (block_m, block_n), walking ``group_m`` row blocks before advancing
+    the column block so co-resident workgroups share B column blocks. Shrunk to a divisor of
+    n_blocks_m so the last super-tile is not ragged; group_m <= 1 is the plain row-major decode."""
+    while group_m > 1 and n_blocks_m % group_m:
+        group_m //= 2  # shrink to a divisor so the last super-tile is not ragged
+    if group_m <= 1:
+        return tile // n_blocks_n, tile % n_blocks_n
+    in_group = tile % (group_m * n_blocks_n)
+    block_m = group_m * (tile // (group_m * n_blocks_n)) + in_group % group_m
+    return block_m, in_group // group_m
+
+
+def expert_group_tile_decode(group_offs, lane, tile, G, n_blocks_n, block_m_size, group_m):
+    """Tile -> (block_m, block_n, expert) with every super-tile held by one expert, so none
+    straddles two weight slabs; same tile set as ``group_m_tile_decode`` in a different order.
+    ``group_m`` is a power of two and the offsets are block-aligned, as padded token runs are."""
+    rsrc = create_buffer_resource(group_offs, max_size=False, num_records_bytes=(G + 1) * 8)
+    row0 = floordiv_pow2(_lane_tbl_load(rsrc, lane, G + 1, stride=2)[0], block_m_size)
+    # Lane g holds the first tile of expert g; the table rises with g (an empty expert ties
+    # with its successor and the ballot's last hit skips it), so one ballot finds the owner.
+    first = fx.Int32(arith.select(lane < fx.Int32(G), row0 * n_blocks_n, fx.Int32(0x7FFFFFFF)))
+    g_idx = _readfirstlane_i32(_wave_count_le_i32(first, tile) - fx.Int32(1))
+    m_base = _readlane_i32(row0, g_idx)
+    n_rows = _readlane_i32(row0, g_idx + fx.Int32(1)) - m_base
+    u = tile - _readlane_i32(first, g_idx)  # tile index within this expert
+
+    span = group_m * n_blocks_n
+    n_full = n_rows & fx.Int32(-group_m)  # rows covered by full super-tiles
+    row_of = u // span  # super-tile row within this expert
+    in_group = u - row_of * span
+    m_full = row_of * group_m + in_group % group_m
+    # Shorter trailing super-tile: same column-block-major walk over the leftover rows.
+    v = u - n_full * n_blocks_n
+    m_tail, n_tail = fx.Int32(0), v  # one leftover row: the walk is that row's columns
+    for w in range_constexpr(2, group_m):
+        hit = (n_rows & fx.Int32(group_m - 1)) == fx.Int32(w)
+        m_tail = fx.Int32(arith.select(hit, v % w, m_tail))
+        n_tail = fx.Int32(arith.select(hit, v // w, n_tail))
+    full = u < n_full * n_blocks_n
+    block_m = m_base + fx.Int32(arith.select(full, m_full, n_full + m_tail))
+    # Serpentine columns: an odd super-tile row walks the column blocks backwards so neighbouring rows meet on the same B block.  Tile order only.
+    band = fx.Int32(arith.select(full, row_of, floordiv_pow2(n_full, group_m)))
+    block_n = fx.Int32(arith.select(full, in_group // group_m, n_tail))
+    flipped = fx.Int32(n_blocks_n - 1) - block_n
+    return block_m, fx.Int32(arith.select((band & fx.Int32(1)) == fx.Int32(1), flipped, block_n)), g_idx
+
+
 def xcd_remap_pid_u(pid, total_pids, num_xcd):
     """``xcd_remap_pid`` on ids proven non-negative: same bijection, unsigned divides (a mask
     and a shift for pow2 num_xcd, vs a floor-div fixup each), a separate entry point so signed
@@ -1959,14 +2028,22 @@ def make_fp16_bf16_buffer_tensor(arg):
     return fx.rocdl.make_buffer_tensor(arg, max_size=False)
 
 
-def compute_global_swizzle_bf16(lane_id, wave_id, K, n_rounds):
+def compute_global_swizzle_bf16(lane_id, wave_id, K, n_rounds, row_step=1, pair_span=0):
+    """Per-lane global element offsets feeding one LDS chunk of a [rows, K] operand.
+    ``row_step`` strides the global row and ``pair_span`` permutes it within a group, both so a
+    reader holds even and odd output columns; neither changes the rows a chunk fetches."""
     offsets = []
     n_waves = fx.block_dim.x // 64
     for r in range_constexpr(n_rounds):
         row = lane_id // 8 + wave_id * 8 + r * (n_waves * 8)
         col_byte = (lane_id % 8) * 16
         _, c = swizzle_128(row, col_byte)
-        offsets.append(row * K + c // 2)
+        g_row = row
+        if const_expr(pair_span):
+            half = pair_span // 2
+            t = row % pair_span
+            g_row = (row - t) + (t % half) * 2 + t // half
+        offsets.append(g_row * (row_step * K) + c // 2)
     return offsets
 
 
@@ -1981,6 +2058,22 @@ def compute_global_swizzle_nn_bf16(lane_id, wave_id, c_n, n_steps):
         n_tile = idx // 4
         ks = idx % 4
         offsets.append((ks * 16 + kk) * c_n + n_tile * 32 + n_in)
+    return offsets
+
+
+def compute_global_swizzle_nn_bf16_wide(lane_id, wave_id, c_n, n_steps):
+    """``compute_global_swizzle_nn_bf16`` re-laned so one G2S instruction covers fewer, wider
+    k-rows: enough lanes per row to fill a cache line, cutting requests for the same bytes.
+    It permutes the tr16 pieces but not their contents; ``S2RLoaderTr16x32Bf16Wide`` reads it."""
+    offsets = []
+    n_waves = fx.block_dim.x // 64
+    kloc = (lane_id // 2) % 8
+    n_in = (lane_id // 16) * 16 + (lane_id % 2) * 8
+    for step in range_constexpr(n_steps):
+        idx = wave_id + step * n_waves
+        n64 = idx // 8
+        ks8 = idx % 8
+        offsets.append((ks8 * 8 + kloc) * c_n + n64 * 64 + n_in)
     return offsets
 
 
@@ -2015,51 +2108,40 @@ def _lds_xpose_tr16(wr_ptr, rd_ptr, val, byte_offset=0):
     return Vec(op.result).bitcast(fx.BFloat16)
 
 
-def _read_tr16_sub(base_i32, sub16, row_off):
-    """One tr16 sub-block (512 elems/block): packed double-read, the pair 128 bytes
-    apart, at sub16*512 + row_off, then assembled."""
-    ptr = _lds_ptr_from_i32(base_i32 + (sub16 * 512 + row_off) * 2)
+def _read_tr16_sub(base_i32, sub16, row_off, chunk_stride=1024):
+    """One tr16 sub-block: packed double-read, the pair 128 bytes apart, then assembled.
+    A sub-block is one G2S per-wave chunk, so it starts at sub16*chunk_stride bytes -- a
+    padded stride must reach here or the read lands off the write."""
+    ptr = _lds_ptr_from_i32(base_i32 + sub16 * chunk_stride + row_off * 2)
     r0, r1 = _packed_ds_read_tr16(ptr, [0, 128])
     return r0.shuffle(r1, list(range(8)))
 
 
 class _S2RLoaderBf16(_S2RLoaderBase):
-    """Shared skeleton for the bf16 operand loaders (cf. _MfmaBf16): n_tiles output
-    tiles, each a list of k-sub fragments. Subclasses supply the per-sub offset table
-    and _tile(), which holds the LDS address math -- transposed ds_read_tr_b16 or
-    swizzled buffer load (too different to share beyond this loop)."""
+    """Shared skeleton for the bf16 operand loaders (cf. _MfmaBf16): n_tiles output tiles, each
+    a list of k-sub fragments. Subclasses supply the per-sub offset table and _tile(), whose LDS
+    address math -- transposed ds_read_tr_b16 or swizzled load -- is too different to share."""
 
     def load(self, lds_src):
         return [self._tile(lds_src, i) for i in range_constexpr(self.n_tiles)]
 
 
-class S2RLoaderTrBf16(_S2RLoaderBf16):
-    """mfma_f32_32x32x16 operand via ds_read_tr_b16 transpose. Like S2RLoaderTr's
-    _K_BASE, _SUB lists the tr16 sub-block of each inst_k=16 mfma step (consecutive
-    here); its length is both the sub count and the per-tile block stride."""
-
-    _SUB = (0, 1, 2, 3)
-
-    def _tile(self, lds_src, i):
-        m, kblk = self.lane_id % 32, self.lane_id // 32
-        row_off = (m // 16) * 256 + kblk * 128 + (m % 16) * 4
-        base_i32 = fx.Int32(fx.ptrtoint(lds_src.ptr))
-        sub0 = (self.wave_idx * self.n_tiles + i) * len(self._SUB)
-        return [
-            _read_tr16_sub(base_i32, sub0 + self._SUB[c], row_off) for c in range_constexpr(len(self._SUB))
-        ]
-
-
 class _MfmaBf16:
-    """Grouped bf16 mfma: accumulate n_tiles_a x n_tiles_b output tiles. The k-sub
+    """Grouped 16-bit-float mfma: accumulate n_tiles_a x n_tiles_b output tiles. The k-sub
     count is taken from each operand's fragment list (len(a[i])), so the atom's
-    (m, n, inst_k) is the only shape this class needs -- no BLOCK_K coupling."""
+    (m, n, inst_k) is the only shape this class needs -- no BLOCK_K coupling.
 
-    def __init__(self, n_tiles_a, n_tiles_b, m, n, inst_k):
-        self.atom = fx.make_mma_atom(fx.rocdl.MFMA(m, n, inst_k, fx.BFloat16))
+    ``elem_ty`` picks the operand format: BFloat16 -> mfma_*_bf16, Float16 -> mfma_*_f16. The
+    two have the same shape, lane mapping and f32 accumulator, so everything feeding this --
+    the g2s, the LDS image, the ds_read_tr_b16 fragments -- is a 16-bit bit-mover either way
+    and needs no parallel path."""
+
+    def __init__(self, n_tiles_a, n_tiles_b, m, n, inst_k, elem_ty=fx.BFloat16):
+        self.atom = fx.make_mma_atom(fx.rocdl.MFMA(m, n, inst_k, elem_ty))
         acc_len = m * n // 64  # f32 accum lanes per wave
         self.accum_type = Vec.make_type(acc_len, fx.Float32)
         self.zero_value = Vec.filled(acc_len, 0.0, fx.Float32)
+        self.acc_len = acc_len
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
 
@@ -2067,46 +2149,62 @@ class _MfmaBf16:
         return i * self.n_tiles_b + j
 
     def call(self, a, b, c):
+        """a-tile outer, k-sub middle, b-tile inner: same instructions and chains, only the
+        issue order, but it shortens the accumulator revisit distance and an a fragment's life.
+        gfx950 forwards an accumulate chain at full rate, so the short distance costs no nops."""
         assert len(a) == self.n_tiles_a
         assert len(b) == self.n_tiles_b
         for i in range_constexpr(self.n_tiles_a):
-            for j in range_constexpr(self.n_tiles_b):
-                acc = c[self.idx(i, j)]
-                for ks in range_constexpr(len(a[i])):
-                    acc = fly_dialect.mma_atom_call_ssa([self.accum_type], self.atom, a[i][ks], b[j][ks], acc)
-                c[self.idx(i, j)] = acc
+            for ks in range_constexpr(len(a[0])):
+                for j in range_constexpr(self.n_tiles_b):
+                    t = self.idx(i, j)
+                    c[t] = fly_dialect.mma_atom_call_ssa(
+                        [self.accum_type], self.atom, a[i][ks], b[j][ks], c[t]
+                    )
         return c
 
 
 class Mfma32x32x16(_MfmaBf16):
-    def __init__(self, n_tiles_a, n_tiles_b):
-        super().__init__(n_tiles_a, n_tiles_b, 32, 32, 16)
+    def __init__(self, n_tiles_a, n_tiles_b, elem_ty=fx.BFloat16):
+        super().__init__(n_tiles_a, n_tiles_b, 32, 32, 16, elem_ty)
 
 
 class Mfma16x16x32(_MfmaBf16):
-    def __init__(self, n_tiles_a, n_tiles_b):
-        super().__init__(n_tiles_a, n_tiles_b, 16, 16, 32)
+    def __init__(self, n_tiles_a, n_tiles_b, elem_ty=fx.BFloat16):
+        super().__init__(n_tiles_a, n_tiles_b, 16, 16, 32, elem_ty)
 
 
-class S2RLoaderTr16x32Bf16(_S2RLoaderBf16):
-    """mfma_f32_16x16x32 operand via ds_read_tr_b16 transpose. Like S2RLoaderTr's
-    _K_BASE, _SUB lists the tr16 sub-block offset of each inst_k=32 mfma step (each
-    spans two tr16 blocks); _BLOCK is the tr16 blocks per n32-region. Both baked in."""
+class S2RLoaderTr16x32Bf16Wide(_S2RLoaderBf16):
+    """mfma_f32_16x16x32 operand via ds_read_tr_b16, reading what
+    ``compute_global_swizzle_nn_bf16_wide`` wrote; chunk_stride must match that writer's.
+    One asm block per operand, not per tile, so the scheduler can move the reads as a unit."""
 
     _SUB = (0, 2)
-    _BLOCK = 4
 
-    def _tile(self, lds_src, i):
+    def __init__(self, wave_idx, n_tiles, chunk_stride=1024):
+        super().__init__(wave_idx, n_tiles)
+        assert n_tiles in (1, 2, 4), "a load must not straddle a 4-tile chunk group"
+        self.chunk_stride = chunk_stride
+
+    def load(self, lds_src):
         octet, mm = self.lane_id // 16, self.lane_id % 16
         s_in_pair, kb = octet // 2, octet % 2
-        row_off = kb * 128 + mm * 4
+        base_tile = self.wave_idx * self.n_tiles
+        sub0 = (base_tile // 4) * 8 + 2 * s_in_pair + kb
+        row0 = (base_tile % 4) * 128 + mm * 4  # fold the quarter-chunk offset into the row
+        step = 2 * (self._SUB[1] - self._SUB[0]) * self.chunk_stride
         base_i32 = fx.Int32(fx.ptrtoint(lds_src.ptr))
-        orig_tile = self.wave_idx * self.n_tiles + i
-        n32_block, g16 = orig_tile // 2, orig_tile % 2
-        row = g16 * 256 + row_off  # fold g16 block offset into row
+        ptr = _lds_ptr_from_i32(base_i32 + sub0 * self.chunk_stride + row0 * 2)
+        offs = []
+        for i in range_constexpr(self.n_tiles):
+            offs += [i * 256, i * 256 + 128, i * 256 + step, i * 256 + step + 128]
+        r = _packed_ds_read_tr16(ptr, offs)
         return [
-            _read_tr16_sub(base_i32, n32_block * self._BLOCK + self._SUB[c] + s_in_pair, row)
-            for c in range_constexpr(len(self._SUB))
+            [
+                r[4 * i].shuffle(r[4 * i + 1], list(range(8))),
+                r[4 * i + 2].shuffle(r[4 * i + 3], list(range(8))),
+            ]
+            for i in range_constexpr(self.n_tiles)
         ]
 
 
@@ -2117,22 +2215,29 @@ def _load8_bf16(lds_src, byte_off):
     return v.bitcast(fx.BFloat16)
 
 
-class S2RLoaderBf16(_S2RLoaderBf16):
-    """mfma_f32_32x32x16 operand (swizzled, non-transposed). Mirroring S2RLoaderTr,
-    _K_BASE lists the K-column (elems) of each inst_k=16 sub of a 32-row tile; its
-    length is the sub count -- no BLOCK_K needed."""
+class S2RLoader16x16Bf16(_S2RLoaderBf16):
+    """mfma_f32_16x16x32 operand, swizzled and non-transposed.  The atom spreads 64 lanes
+    over 16 rows x 4 k-chunks, so a sub is one ds_read_b128 and halving the tile while
+    doubling ``n_tiles`` keeps the read count and the bytes unchanged."""
 
-    _K_BASE = (0, 16, 32, 48)
+    _K_BASE = (0, 32)
 
     def _tile(self, lds_src, i):
-        m, kblk = self.lane_id % 32, self.lane_id // 32
-        row = self.wave_idx * (self.n_tiles * 32) + i * 32 + m
+        m, kblk = self.lane_id % 16, self.lane_id // 16
+        row = self.wave_idx * (self.n_tiles * 16) + i * 16 + m
         subs = []
         for c in range_constexpr(len(self._K_BASE)):
             col_byte = (self._K_BASE[c] + kblk * 8) * 2
             _, cs = swizzle_128(row, col_byte)
             subs.append(_load8_bf16(lds_src, row * 128 + cs))
         return subs
+
+
+def _pack_out_pair(x0, x1, out_ty):
+    """Two f32 accumulator values -> one dword holding them side by side in ``out_ty``."""
+    if const_expr(out_ty is fx.Float16):
+        return Vec.from_elements([x0.to(fx.Float16), x1.to(fx.Float16)], fx.Float16).bitcast(fx.Int32)[0]
+    return rocdl.cvt_pk_bf16_f32(x0, x1)
 
 
 class StoreCBf16:
@@ -2156,6 +2261,7 @@ class StoreCBf16:
             if cache_modifier
             else None
         )
+        self.c_base = _buffer_ops.extract_base_index(C)  # byte base address
         self.oob = fx.Int32(c_rows * c_cols)  # out-of-bounds sink index
 
     def _store_masked(self, value, c_index, valid):
@@ -2179,18 +2285,68 @@ class StoreCBf16:
                 row = base_row + ti * 32 + (r // 4) * 8 + m_hi + (r % 4)
                 self._store_masked(acc[r], row * self.c_cols + col, col_valid)
 
-    def store16(self, c_frag, base_row, base_col):
-        n = self.lane_id % 16
-        m_hi = (self.lane_id // 16) * 4
-        col = base_col + n
-        col_valid = col < self.c_cols
-        for ti in range_constexpr(len(c_frag)):
-            acc = Vec(c_frag[ti])
+    def store_band_pair16(self, frag_even, frag_odd, base_row, base_col, n_tiles_b, mask_cols=True):
+        """Two 16x16 accumulators on neighbouring output columns (the feed interleaved the LDS
+        column halves), packed into one dword store per row so a column tile's 16-lane run is 64
+        contiguous bytes -- gfx950's write-request granularity.  ``n_tiles_b`` counts column tiles."""
+        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
+        n_tiles_a = len(frag_even) // n_tiles_b
+        lane_col = self.lane_id % 16
+        row_bytes = self.c_cols * 2
+        col_ok = [
+            (base_col + (j * 16 + lane_col) * 2 < self.c_cols) if mask_cols else None
+            for j in range_constexpr(n_tiles_b)
+        ]
+        base_off = ((self.lane_id // 16) * 4) * row_bytes + (base_col + lane_col * 2) * 2
+        for ti in range_constexpr(n_tiles_a):
             for r in range_constexpr(4):
-                row = base_row + ti * 16 + m_hi + r
-                self._store_masked(acc[r], row * self.c_cols + col, col_valid)
+                # One address per row; the column-tile step folds into the store immediate.
+                off = base_off + (ti * 16 + r) * row_bytes
+                for j in range_constexpr(n_tiles_b):
+                    t = ti * n_tiles_b + j
+                    packed = _pack_out_pair(Vec(frag_even[t])[r], Vec(frag_odd[t])[r], self.out_ty)
+                    buffer_store(
+                        Vec.from_elements([packed], fx.Int32).bitcast(self.out_ty),
+                        rsrc,
+                        off + j * 64,
+                        mask=col_ok[j],
+                        cache_modifier=self.cache_modifier,
+                        offset_is_bytes=True,
+                    )
 
-    def store_trans16(self, c_frag, group_idx, base_m, base_n, out_m, out_n):
+    def store_band16(
+        self, c_frags, base_row, base_col, col_step, n_tiles_a, n_tiles_b, row_bound, mask_n=False
+    ):
+        """Every accumulator quadrant sharing a row run, stored through one row-band SRD rather
+        than per-element index arithmetic: bounding the resource lets the hardware drop the ragged
+        rows.  The band base is wave-uniform, so the SRD stays in SGPRs and stores do not waterfall."""
+        rsrc = make_row_band_resource(self.c_base, base_row, row_bound, self.c_cols, 2)
+        lane_col = self.lane_id % 16
+        col_ok = [
+            (base_col + q * col_step + lane_col < self.c_cols) if mask_n else None
+            for q in range(len(c_frags))
+        ]
+        row_bytes = self.c_cols * 2
+        base_off = ((self.lane_id // 16) * 4) * row_bytes + (base_col + lane_col) * 2
+        for ti in range_constexpr(n_tiles_a):
+            for r in range_constexpr(4):
+                # One address per row; both column steps fold into the store immediate.
+                off = base_off + (ti * 16 + r) * row_bytes
+                for q in range_constexpr(len(c_frags)):
+                    for j in range_constexpr(n_tiles_b):
+                        val = Vec(c_frags[q][ti * n_tiles_b + j])[r].to(self.out_ty)
+                        buffer_store(
+                            val,
+                            rsrc,
+                            off + q * col_step * 2 + j * 32,
+                            mask=col_ok[q],
+                            cache_modifier=self.cache_modifier,
+                            offset_is_bytes=True,
+                        )
+
+    def store_trans16(self, c_frag, group_idx, base_m, base_n, out_m, out_n, mask_m=False):
+        """mask_m additionally drops m past out_m; needed only when OUT_M is not a BLOCK_M
+        multiple, where an unmasked tail would spill into the next column's row run."""
         n = self.lane_id % 16
         m_hi = (self.lane_id // 16) * 4
         glob_n = base_n + n
@@ -2200,7 +2356,8 @@ class StoreCBf16:
             acc = Vec(c_frag[ti])
             for r in range_constexpr(4):
                 m = base_m + ti * 16 + m_hi + r
-                self._store_masked(acc[r], row_base + m, n_valid)
+                valid = arith.andi(n_valid, m < out_m) if mask_m else n_valid
+                self._store_masked(acc[r], row_base + m, valid)
 
 
 # MXFP4 kernel helpers: lane-table group search (with its DPP scan primitives),

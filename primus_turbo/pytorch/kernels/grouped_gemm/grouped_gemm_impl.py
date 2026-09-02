@@ -373,10 +373,78 @@ class GroupedGEMMTritonBackend(KernelBackend):
         )
 
 
+def _cap_cu(num_cu: int | None, device: torch.device) -> int:
+    """Turn the dispatcher's CU count into a budget the kernels act on. Callers routinely pass
+    the full device count meaning "no limit", and honouring that literally would launch a
+    persistent grid where the tuned one-tile-per-WG launch is both simpler and faster, so it
+    reads as 0."""
+    if num_cu is None or num_cu >= _num_cus(device):
+        return 0
+    return int(num_cu)
+
+
+class GroupedGEMMFlyDSLBackend(KernelBackend):
+    """FlyDSL bf16 grouped GEMM backend (gfx950).
+
+    M-grouped operator, both directions of the forward pair:
+      - trans_b=True  -> NT, b is [G, N, K] (forward)
+      - trans_b=False -> NN, b is [G, K, N] (dgrad)
+
+    Tiles are cut per expert rather than on a global row-block grid, so neither the token
+    count nor the per-expert run lengths have to land on the tile boundary.
+    """
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        num_cu: int | None,
+        schedule: str = "static",
+        **kwargs,
+    ) -> bool:
+        supported = True
+        # gfx950 (CDNA4) only: the body is built on mfma_f32_16x16x32_bf16.
+        supported &= is_gfx950()
+        # No work-stealing variant, and the grid is sized from the tile count, so a CU budget
+        # could only be ignored -- better to decline than to accept and not honour it.
+        supported &= schedule in _NON_WS_SUPPORTED_SCHEDULES
+        supported &= a.dim() == 2 and b.dim() == 3
+        # Both 16-bit float formats: same pipeline, the mfma atom picks bf16 vs f16. Mixed
+        # operand types have no atom, so the pair has to agree.
+        supported &= a.dtype in (torch.bfloat16, torch.float16) and b.dtype == a.dtype
+        supported &= not trans_a
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        num_cu: int | None,
+        schedule: str = "static",
+        **kwargs,
+    ) -> torch.Tensor:
+        from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
+            grouped_gemm_bf16_nn_flydsl_kernel,
+            grouped_gemm_bf16_nt_flydsl_kernel,
+        )
+
+        kernel = grouped_gemm_bf16_nt_flydsl_kernel if trans_b else grouped_gemm_bf16_nn_flydsl_kernel
+        return kernel(a, b, group_offs, out_dtype=a.dtype, cap_cu=_cap_cu(num_cu, a.device))
+
+
 _GROUPED_GEMM_BACKENDS = {
     BackendType.CK: BackendEntry(GroupedGEMMCKBackend),
     BackendType.HIPBLASLT: BackendEntry(GroupedGEMMHipblasltBackend, autotune=False),
     BackendType.TRITON: BackendEntry(GroupedGEMMTritonBackend),
+    BackendType.FLYDSL: BackendEntry(GroupedGEMMFlyDSLBackend),
 }
 
 
@@ -434,10 +502,82 @@ class GroupedGEMMVariableKTritonBackend(KernelBackend):
         )
 
 
+class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
+    """FlyDSL bf16 variable-K grouped GEMM backend (gfx950).
+
+    wgrad: C[g] = a[offs[g] : offs[g] + lens[g]]^T @ b[the same rows] -- the contraction
+    length varies per group. The kernel walks it with a runtime scf.for and reads the group
+    table on-device, so a padded ``group_offs`` paired with the true ``group_lens`` costs no
+    host sync.
+
+    """
+
+    MAX_G = 64
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        trans_c: bool,
+        num_cu: int | None,
+        schedule: str = "static",
+        inplace_add_to_out: bool = False,
+        **kwargs,
+    ) -> bool:
+        supported = True
+        # gfx950 (CDNA4) only: the body is built on mfma_f32_16x16x32_bf16.
+        supported &= is_gfx950()
+        # This backend has no beta=1 accumulate epilogue.
+        supported &= not inplace_add_to_out
+        supported &= schedule in _NON_WS_SUPPORTED_SCHEDULES
+        supported &= a.dim() == 2 and b.dim() == 2 and a.shape[0] == b.shape[0]
+        supported &= a.dtype in (torch.bfloat16, torch.float16) and b.dtype == a.dtype
+        supported &= trans_a and not trans_b
+        # Measured boundary: clean through G=65, wrong past it (G=80 and G=96 both fail).
+        # 64 is the conservative cut, and matches the expert bound the NT path documents.
+        supported &= group_lens.numel() <= GroupedGEMMVariableKFlyDSLBackend.MAX_G
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        trans_c: bool,
+        num_cu: int | None,
+        schedule: str = "static",
+        **kwargs,
+    ) -> torch.Tensor:
+        from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
+            grouped_gemm_bf16_variable_k_flydsl_kernel,
+        )
+
+        # trans_c is native here -- the store writes the transposed tile -- so unlike the CK
+        # and Triton backends there is no operand swap. group_lens goes in as the per-group
+        # valid contraction length, which is what lets group_offs carry padding.
+        return grouped_gemm_bf16_variable_k_flydsl_kernel(
+            a,
+            b,
+            group_offs,
+            masked_k=group_lens,
+            out_dtype=a.dtype,
+            trans_c=trans_c,
+            cap_cu=_cap_cu(num_cu, a.device),
+        )
+
+
 _GROUPED_GEMM_VARIABLE_K_BACKENDS = {
     BackendType.CK: BackendEntry(GroupedGEMMVariableKCKBackend),
     BackendType.HIPBLASLT: BackendEntry(GroupedGEMMVariableKHipblasltBackend, autotune=False),
     BackendType.TRITON: BackendEntry(GroupedGEMMVariableKTritonBackend),
+    BackendType.FLYDSL: BackendEntry(GroupedGEMMVariableKFlyDSLBackend),
 }
 
 
