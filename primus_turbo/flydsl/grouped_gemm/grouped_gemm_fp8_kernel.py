@@ -679,11 +679,9 @@ def _compile_grouped_nn(
                     rocdl.s_setprio(0)
                     _dbar()
                     if const_expr(_full):
-                        # a0 is resident here, so nothing scored follows to carry b1's wait:
-                        # issue now (keeping the g2s and the barrier as latency cover) and
-                        # drain per tile inside the mfma column below. Issuing earlier, inside
-                        # c00's column, buys mfma cover and measures worse: the read burst
-                        # pushes that column's mfma issue apart.
+                        # a0 is resident here, so nothing scored follows to carry b1's wait: issue
+                        # now (keeping the g2s and barrier as cover) and drain inside the mfma
+                        # column below -- issuing earlier, inside c00's column, measures worse.
                         if const_expr(_elgk):
                             b1_raw = _nn_b_tr_issue(_bs2r, b_cur1, nn_loop_tr_vmcnt)
                         else:
@@ -838,10 +836,9 @@ def _compile_grouped_nn(
                 arith.select(_lastw <= fx.Int32(LDS_BLOCK_N), fx.Int32(1), fx.Int32(0)),
                 fx.Int32(0),
             )
-            # nn_halfn=False forces the full body; default True skips the all-OOB b1 half on the boundary block.
-            # _bnd_ntb<N_TILES_B narrows the SAME branch instead of adding a third body: c_n equals
-            # the compiled N (both come from the one autotune key), so _is_half can only fire on a
-            # block whose valid width is <= the narrow span.
+            # nn_halfn=False forces the full body; default True skips the all-OOB b1 half on the boundary
+            # block. _bnd_ntb<N_TILES_B narrows that same branch (nq=3) instead of adding a new one: c_n
+            # equals the compiled N, so _is_half can only fire on a block whose width fits the narrow span.
             _half_nq = 3 if const_expr(_bnd_ntb < N_TILES_B) else (0 if const_expr(nn_halfn_noload) else 1)
             if const_expr(nn_halfn):
                 if _readfirstlane_i32(_is_half) == fx.Int32(1):
