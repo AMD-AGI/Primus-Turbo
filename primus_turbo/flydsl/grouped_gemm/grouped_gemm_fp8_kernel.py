@@ -2412,11 +2412,13 @@ def _autotune_np_dispatch(
             persistent=False,
             agpr_inplace=True,
             store_cshuffle=False,
-            # As on the persistent config below: the before-mfma rendezvous is redundant on NN
-            # (the after-mfma barriers already separate a fill from its reader), and dropping the
-            # runtime WG sync is worth ~1% of the MoE MLP step. NT keeps its real barrier.
-            sched_schedbar=True,
-            nt_vmcnt=-1,
+            # Unlike the persistent config below, this body keeps its real before-mfma barrier.
+            # Dropping it here is a race, not a saving: with one tile per WG the waves are not held
+            # in convoy by a tile loop, so a fill can overtake a reader of the same LDS pool. It
+            # showed as ~1e-2 last-bit drift on a few hundred dgrad rows over ragged groups, and
+            # restoring the barrier is also 0.24% FASTER on the MoE MLP unit.
+            sched_schedbar=False,
+            nt_vmcnt=3,
             i64_traverse=i64_tr,
             N=N,
             beta_is_one=beta_is_one,
@@ -2494,6 +2496,11 @@ def _autotune_np_dispatch(
         if s is not None and s < bs * 0.985:  # adopt only past the noise margin (geomean)
             best, bs = l, s
 
+    # Hand the allocator back the probes, as the fused entry's race already does: they run to
+    # a gigabyte a side at the canonical M, and a race left holding them makes the next one in
+    # the same process mis-pick an arm.
+    mps.clear()
+    torch.cuda.empty_cache()
     return best
 
 

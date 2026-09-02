@@ -110,18 +110,41 @@ def _row_layout(x: torch.Tensor, H: int) -> Tuple[torch.Tensor, int, int, int, i
     return x2, B, 0, x2.stride(0), 0
 
 
-def _pick_config(H: int, B: int) -> Tuple[int, int, int, int]:
-    """Return (BLOCK_H, ROWS_PER_BLOCK, num_warps, num_stages) for fwd."""
+# Rows a narrow-row forward program takes, bounding its per-lane register footprint the
+# way `_pick_bwd_config`'s own cap does.
+_FWD_ROWS_CAP = 64
+
+
+def _pick_config(H: int, B: int, streams: int = 2) -> Tuple[int, int, int, int]:
+    """Return (BLOCK_H, ROWS_PER_BLOCK, num_warps, num_stages) for fwd.
+
+    ``streams`` is how many row-width tensors the kernel moves -- 2 for the plain forward
+    (x in, y out), 4 for the fused-residual one -- which is what decides how many lanes
+    are worth spending on a masked block.
+    """
     BLOCK_H = _next_pow2(H)
     if BLOCK_H <= 256 and B >= 4096:
-        ROWS = 16 if BLOCK_H <= 128 else 8
+        # ROWS x BLOCK_H over num_warps*64 lanes is the per-lane element count, and that
+        # is what sets the load width: at BLOCK_H=64 a 16-row block gives 4 elements a
+        # lane, so every access lowers to dwordx2 and the kernel reads 4.78 TB/s where
+        # the same machine's wide-row norms reach 6.1. Take ROWS the way the backward
+        # already does -- from B, so the program count still covers the CUs -- which puts
+        # the q/k widths on dwordx4. Rows are independent, so this is bit-identical.
+        ROWS = min(_FWD_ROWS_CAP, max(1, _next_pow2(B // max(1, _num_cus() // 2)))) if BLOCK_H <= 128 else 8
         return BLOCK_H, ROWS, 4, 2
     if BLOCK_H <= 256:
         return BLOCK_H, 1, 1, 1
     if BLOCK_H <= 1024:
         return BLOCK_H, 1, 4, 2
     if BLOCK_H <= 4096:
-        return BLOCK_H, 1, 8, 2
+        # Whole warps of a masked block have no live lane at all -- H=2880 in a 4096 block
+        # leaves two of eight -- and they still issue. Halving them deletes 28.5% of the
+        # plain forward's SQ_INSTS_VALU at identical SQ_INSTS_VMEM and runs its dispatch
+        # 15.2% faster. The 4-stream residual variant is a different regime: it already
+        # moves 6.1 TB/s, so it needs the lanes to keep its loads in flight rather than
+        # the issue slots back, and the same change costs it 4.2%.
+        wide = streams > 2 or H > BLOCK_H * 3 // 4
+        return BLOCK_H, 1, (8 if wide else 4), 2
     return BLOCK_H, 1, 16, 2
 
 
@@ -379,7 +402,8 @@ def rmsnorm_fwd_residual_impl(
     y = torch.empty_like(x2)
     x_plus_r = torch.empty_like(x2)
     rstd = torch.empty(B, device=x.device, dtype=torch.float32)
-    BLOCK_H, ROWS, num_warps, num_stages = _pick_config(H, B)
+    # Four row-width streams: x and residual in, y and x_plus_r out.
+    BLOCK_H, ROWS, num_warps, num_stages = _pick_config(H, B, streams=4)
     grid = (B if ROWS == 1 else (B + ROWS - 1) // ROWS,)
     # One partial per program, every slot written, so it needs no pre-zeroing.
     amax = torch.empty(grid[0], device=x.device, dtype=torch.float32) if amax_out else None

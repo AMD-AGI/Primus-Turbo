@@ -279,10 +279,19 @@ _ROW_NUM_WARPS = 4
 # is worth 13% here, and the permute's load is the one access that wants the default, which
 # an isolated reading gets backwards.
 #
-# The routing loop keeps its plain form. `num_stages` does hide the dependent row_id_map
-# load (permute 168.1 -> 163.6 us) but pipelining the padded slot's two-sided predicated
-# store returns different bytes at trip counts the deployed routing never produces, and
-# `loop_unroll_factor` reassociates the merging-probs accumulation; both are worth under 4 us.
+# Both routing loops keep their plain form. `num_stages` does hide the dependent
+# row_id_map load (permute 168.1 -> 163.6 us) but pipelining the padded slot's two-sided
+# predicated store returns different bytes at trip counts the deployed routing never
+# produces, and `loop_unroll_factor` reassociates the merging-probs accumulation; both are
+# worth under 4 us.
+#
+# The unpermute's gather looks like it should want the unroll more than the permute's
+# store does -- 89.8% of its wave cycles are WAIT_ANY and it runs 5.65 TB/s against the
+# permute's 6.63 on the same bytes -- but it does not. `loop_unroll_factor=4` there gives
+# byte-identical SQ_INSTS_VALU/VMEM and cuts SQ_WAIT_ANY 584M -> 285M (-51%), and the
+# dispatch still moved -3.6% against the untouched permute's -4.4% in the same collection.
+# With 131072 waves resident the per-wave wait was already covered; what is left is the
+# read locality of four scattered 5760 B rows, which the routing decides, not this loop.
 
 
 @triton.jit

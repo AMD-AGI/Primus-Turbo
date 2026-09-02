@@ -201,6 +201,9 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
     out_fp16 = out_dtype == torch.float16
     cbsz = 1 if a.dtype == torch.float8_e5m2 else 0
     blgp = 1 if b.dtype == torch.float8_e5m2 else 0
+    # Unlike the plain entry, a full-device num_cu still takes the persistent grid here: the
+    # fused epilogue does not survive the one-tile-per-WG body (measured, ~10% of the MoE
+    # gradients differ run to run at a ragged group layout), so the cap is read literally.
     _capped = num_cu is not None and num_cu > 0
     ckey = (I, K, G, out_fp16, cbsz, blgp, num_cu if _capped else 0, _amax)
 
@@ -429,6 +432,9 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
     out_fp16 = out_dtype == torch.float16
     cbsz = 1 if a.dtype == torch.float8_e5m2 else 0
     blgp = 1 if b.dtype == torch.float8_e5m2 else 0
+    # Unlike the plain entry, a full-device num_cu still takes the persistent grid here: the
+    # fused epilogue does not survive the one-tile-per-WG body (measured, ~10% of the MoE
+    # gradients differ run to run at a ragged group layout), so the cap is read literally.
     _capped = num_cu is not None and num_cu > 0
     ckey = (I, K, G, out_fp16, cbsz, blgp, num_cu if _capped else 0, n_stride, _amax)
 
