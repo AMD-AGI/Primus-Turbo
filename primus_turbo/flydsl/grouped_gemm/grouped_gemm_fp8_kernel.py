@@ -241,11 +241,9 @@ def _compile_grouped_nn(
     N_WAVES_N = 4  # waves along N in the 2x4 wave grid (wave_n = wave_id % 4)
     a_lds_size = LDS_BLOCK_M * BLOCK_K
     b_lds_size = LDS_BLOCK_N * BLOCK_K
-    # Boundary-N body width, in B column-tiles per wave (N_TILES_B is the full tile). When the
-    # last N-block's valid width fits the lower half of the b0 LDS pool, b0's upper columns are
-    # padding too, so one column-tile per wave covers it: the NT twin's _bnd_ntb, on the runtime
-    # half-N branch this path already has. dglu never narrows -- its second quadrant is the up
-    # band's partner, folded into grad_probs rather than dropped.
+    # Boundary-N body width in B column-tiles per wave (ports the NT twin's _bnd_ntb): when the
+    # last N-block's valid width fits half the b0 pool, one column-tile per wave covers it.
+    # dglu never narrows -- its second quadrant is the up band's partner, not padding.
     _bnd_ntb = (
         1
         if (nn_bnd and nn_halfn and not dglu and N > 0 and 0 < N % BLOCK_N <= LDS_BLOCK_N // 2)
@@ -568,12 +566,9 @@ def _compile_grouped_nn(
             _nt_vmcnt = nt_vmcnt
 
             if const_expr(_bnd_ntb < N_TILES_B):
-                # Narrow twin of (mfma, b_s2r, store_c) for the boundary body: one B column-tile
-                # per wave, so the four waves read exactly the b0 pool's first _bnd_cols columns
-                # -- the last N-block's real width -- and its padding half costs no ds_read, no
-                # mfma and no store. The g2s stays whole (same offsets, same issue count): the
-                # graded drain is calibrated on how many loads a phase issues, and narrowing the
-                # fill is a partial-drain race (pitfalls/04) measured worth 0 anyway.
+                # Narrow twin of (mfma, b_s2r, store_c): one B column-tile per wave, covering
+                # exactly the boundary block's real width so the padding half costs no ds_read,
+                # mfma or store. The g2s fill stays whole -- narrowing it would race the drain.
                 mfma_b = _build_mfma(
                     N_TILES_A,
                     _bnd_ntb,
@@ -1876,12 +1871,9 @@ _WGRAD_XCD_RCP_SHIFT = 16  # fixed-point reciprocal of the compile-time swizzle 
 
 
 def _wgrad_xcd_aff_geom(n_blocks_m, n_blocks_n, tiles_per_group, nxcd=_WGRAD_XCD_HW, wwin=()):
-    """(h, w) for the XCD-affine wgrad swizzle, or None when the grid is too small. Reorders each
-    XCD's residue class into a contiguous width-w column band (h>1 reuses A-slabs); the rectangle's
-    two sides are CONCURRENT operand streams, so its run is set by the LARGER side, not their sum.
-    ``wwin`` caps that width (see _WGRAD_AFF_W): a rectangle wider than the window is re-solved
-    inside it, so the window only ever NARROWS a band. A width the grid cannot offer leaves the
-    balanced geometry alone rather than collapsing it to a single column."""
+    """(h, w) for the XCD-affine wgrad swizzle, or None when the grid is too small (h>1 reuses
+    A-slabs; the rectangle's two CONCURRENT operand-stream sides are sized by the LARGER one).
+    ``wwin`` (see _WGRAD_AFF_W) only narrows that width, re-solving inside it when the grid offers it."""
     sz = tiles_per_group // nxcd
     if sz < 2 or n_blocks_m < 2 or n_blocks_n < 2:
         return None
@@ -4470,10 +4462,9 @@ _WGRAD_AFF_ROUNDS = 8
 # Reciprocal of the wall fraction a boundary body costs once the launch is that deep: a cheap tile
 # frees its CU early and the WG that refills it runs out of L2 phase with its neighbours (_HALF_N).
 _WGRAD_BND_PHASE_INV = 20
-# N-blocks an XCD-affine band may span. A class walks its rectangle N-block-fastest, so the width
-# is the B stripes it cycles through per A slab; past a few stripes they stop being co-resident in
-# the XCD's L2 slice and the balanced rectangle's wider side stops paying. Caps the width without
-# ever collapsing a band, so a grid whose divisors miss the window keeps its own geometry.
+# N-blocks an XCD-affine band may span: past a few B stripes per A slab they stop being
+# co-resident in the XCD's L2 slice, so the balanced rectangle's wider side stops paying.
+# Caps the width without ever collapsing a band; a grid whose divisors miss it keeps its own.
 _WGRAD_AFF_W = (3, 4)
 # Margin a candidate must beat the standing best by to take its place (see _autotune_wgrad_dispatch).
 _WGRAD_RACE_MARGIN = 0.985
