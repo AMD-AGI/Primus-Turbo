@@ -50,6 +50,17 @@ from primus_turbo.flydsl.utils.prims import (
 )
 
 
+def umin(a, b):
+    """``min(a, b)`` for device values proven non-negative; the signed form costs a compare
+    plus a select where the unsigned one is a single instruction."""
+    return ArithValue(arith.minui(_u32(a), _u32(b)))
+
+
+def umax(a, b):
+    """``max(a, b)`` for device values proven non-negative; see ``umin``."""
+    return ArithValue(arith.maxui(_u32(a), _u32(b)))
+
+
 def resolve_accum_out(out, beta, shape, device, out_dtype):
     """Validate an optional caller-owned ``out``, or allocate one.
 
@@ -1414,14 +1425,19 @@ def xcd_remap_pid(pid, total_pids, num_xcd):
 
 def xcd_remap_pid_u(pid, total_pids, num_xcd):
     """``xcd_remap_pid`` on ids proven non-negative: same bijection, unsigned divides (a mask
-    and a shift for pow2 num_xcd, vs a floor-div fixup each on the signed path). A separate
-    entry point so the signed callers keep byte-identical ISA."""
+    and a shift for pow2 num_xcd, vs a floor-div fixup each), a separate entry point so signed
+    callers keep byte-identical ISA, and a host-known ``total_pids`` folds the slice math away."""
     if num_xcd <= 1:
         return pid
-    per_xcd = udiv(total_pids, num_xcd)  # floor
-    rem = total_pids - per_xcd * num_xcd
     xcd = umod(pid, num_xcd)
     local = udiv(pid, num_xcd)
+    if isinstance(total_pids, int):
+        per_xcd, rem = total_pids // num_xcd, total_pids % num_xcd
+        if rem == 0:
+            return xcd * per_xcd + local
+    else:
+        per_xcd = udiv(total_pids, num_xcd)  # floor
+        rem = total_pids - per_xcd * num_xcd
     offset = xcd * per_xcd + ArithValue(arith.minui(_u32(xcd), _u32(rem)))
     return offset + local
 
