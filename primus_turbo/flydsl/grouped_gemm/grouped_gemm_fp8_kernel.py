@@ -38,6 +38,7 @@ from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from primus_turbo.common.logger import logger
 from primus_turbo.flydsl.utils.gemm_epilogue_helper import (
     StoreCdSwiGLUCShuffle,
     StoreCSwiGLU,
@@ -4555,10 +4556,11 @@ def _autotune_wgrad_dispatch(
                 return None
         return cand
 
-    print(
+    logger.warning(
         f"[wgrad-autotune] OUT=({OUT_M},{OUT_N}) real=({m_real},{n_real}) G={G} "
         f"M_total={M_total} i64={i64_traverse} tight={c_tight} fp32={out_fp32} cands={wave4_cands}",
-        flush=True,
+        once=True,
+        rank=0,
     )
     prod = None
     best_cfg = None
@@ -4577,7 +4579,7 @@ def _autotune_wgrad_dispatch(
                 continue
             if cand is not None:
                 prod, best_cfg = cand, cfg
-                print(f"[wgrad-autotune] persist-ref {cfg}", flush=True)
+                logger.warning(f"[wgrad-autotune] persist-ref {cfg}", once=True, rank=0)
                 break
             errors.append((cfg, "non-finite"))
             if not c_tight:
@@ -4635,7 +4637,7 @@ def _autotune_wgrad_dispatch(
     if best_cfg is None:
         if c_tight:
             raise RuntimeError(
-                "wgrad persist 4-wave race left no tight-C winner "
+                "wgrad persist 4-wave race left no tight-C winner. "
                 f"OUT=({OUT_M},{OUT_N}) real=({m_real},{n_real}) G={G} "
                 f"M_total={M_total} i64={i64_traverse} fp32={out_fp32} errors={errors}"
             )
