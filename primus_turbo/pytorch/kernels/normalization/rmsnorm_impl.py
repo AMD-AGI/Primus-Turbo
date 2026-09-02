@@ -19,6 +19,7 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
 )
 from primus_turbo.triton.normalization.rmsnorm_kernel import (
     amax_reduce_kernel,
+    dgamma_reduce_kernel,
     rmsnorm_bwd_finalize_kernel,
     rmsnorm_bwd_kernel_grid_stride,
     rmsnorm_bwd_kernel_multi_row,
@@ -29,6 +30,19 @@ from primus_turbo.triton.normalization.rmsnorm_kernel import (
     rmsnorm_fwd_residual_kernel,
     rmsnorm_fwd_residual_kernel_multi_row,
 )
+
+# Cache policy for the passes that stream. A norm reads each input row once and writes
+# each output row once, and nothing in the launch re-reads either, so the lines they
+# would otherwise keep resident only evict what the surrounding operators are still
+# using. Raced inside the projection chain rather than on the kernels alone, which
+# mis-ranks this class of change.
+_FWD_LD_CM = ""
+_FWD_ST_CM = ".cs"
+_BWD_LD_CM = ".cg"
+_BWD_ST_CM = ".cs"
+
+# Programs per CU for the grid-stride backward.
+_BWD_GRID_MULT = 2
 
 
 def _next_pow2(x: int) -> int:
@@ -131,26 +145,52 @@ def _pick_bwd_config(H: int, B: int) -> Tuple[str, int, int, int, int]:
     rows_per_program = max(1, B // _num_cus())
     wide_row = H >= 16384 or (BLOCK_H == 8192 and H <= 8192)
     half_wave = rows_per_program <= 13 and wide_row
-    # Otherwise two programs a CU: with one apiece nothing covers its own tail. Capped
-    # so the extra partials still reach the Triton finalize instead of a torch reduce.
-    full_wave = min(2 * _num_cus(), _FINALIZE_TRITON_MAX_PARTS)
+    # Otherwise several programs a CU: with one apiece nothing covers its own tail.
+    full_wave = _BWD_GRID_MULT * _num_cus()
     grid = min(B, _num_cus() // 2 if half_wave else full_wave)
     return "grid", BLOCK_H, grid, 0, 0
 
 
-# Above this many partials the Triton finalize loses badly to a torch
-# reduction: it parallelizes over H only (ceil(H/BLOCK_H) programs) and walks
-# n_parts serially, so a tall, narrow buffer leaves the GPU idle.
-# The multi-row backward emits ceil(B / ROWS_PER_BLOCK) partials, which reaches
-# the tall regime for q_norm/k_norm (B in the millions, H=128).
+# Above this many partials the finalize is handed a walk it does serially: it
+# parallelizes over H only (ceil(H/BLOCK_H) programs) and steps n_parts inside one
+# program, so a tall, narrow buffer leaves the GPU idle. The multi-row backward emits
+# ceil(B / ROWS_PER_BLOCK) partials, which reaches the tall regime for q_norm/k_norm
+# (B in the millions, H=64). `_narrow_dgamma_partials` folds those down first.
 _FINALIZE_TRITON_MAX_PARTS = 512
+
+
+def _narrow_dgamma_partials(dg_partial: torch.Tensor) -> torch.Tensor:
+    """Fold a tall partial buffer down to what the finalize parallelises well over.
+
+    The multi-row backward emits one slab per program, which for the per-head norms
+    (B in the millions, H=64) is tens of thousands of them. One extra pass over a few MB
+    is worth far more than handing the finalize a walk it does serially, and it keeps the
+    reduction inside the launch instead of a torch reduce that also has to cast.
+    """
+    n_parts, H = dg_partial.shape
+    rows = _next_pow2((n_parts + _FINALIZE_TRITON_MAX_PARTS - 1) // _FINALIZE_TRITON_MAX_PARTS)
+    n_out = (n_parts + rows - 1) // rows
+    BLOCK_H = min(256, _next_pow2(H))
+    out = torch.empty(n_out, H, device=dg_partial.device, dtype=torch.float32)
+    dgamma_reduce_kernel[((H + BLOCK_H - 1) // BLOCK_H, n_out)](
+        dg_partial,
+        out,
+        n_parts,
+        H=H,
+        BLOCK_H=BLOCK_H,
+        BLOCK_N=min(64, rows),
+        ROWS_PER_PROG=rows,
+        num_warps=4,
+        num_stages=1,
+    )
+    return out
 
 
 def _finalize_dgamma(dg_partial: torch.Tensor, gamma_dtype: torch.dtype) -> torch.Tensor:
     """Reduce (n_parts, H) fp32 partials to dgamma[H]."""
+    if dg_partial.shape[0] > _FINALIZE_TRITON_MAX_PARTS:
+        dg_partial = _narrow_dgamma_partials(dg_partial)
     n_parts, H = dg_partial.shape
-    if n_parts > _FINALIZE_TRITON_MAX_PARTS:
-        return dg_partial.sum(dim=0).to(gamma_dtype)
     dg = torch.empty(H, device=dg_partial.device, dtype=gamma_dtype)
     BLOCK_H = 64 if H >= 64 else _next_pow2(H)
     BLOCK_N = 64 if n_parts >= 64 else _next_pow2(max(n_parts, 1))
@@ -205,6 +245,8 @@ def rmsnorm_fwd_impl(
             ROW_GROUP=row_group,
             AMAX=amax_out,
             ZERO_CENTERED=zero_centered,
+            LD_CM=_FWD_LD_CM,
+            ST_CM=_FWD_ST_CM,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -228,6 +270,8 @@ def rmsnorm_fwd_impl(
             ROW_GROUP=row_group,
             AMAX=amax_out,
             ZERO_CENTERED=zero_centered,
+            LD_CM=_FWD_LD_CM,
+            ST_CM=_FWD_ST_CM,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -282,6 +326,8 @@ def rmsnorm_bwd_impl(
             ROWS_PER_BLOCK=ROWS,
             ROW_GROUP=row_group,
             ZERO_CENTERED=zero_centered,
+            LD_CM=_BWD_LD_CM,
+            ST_CM=_BWD_ST_CM,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -309,6 +355,8 @@ def rmsnorm_bwd_impl(
             num_programs=num_programs,
             ROW_GROUP=row_group,
             ZERO_CENTERED=zero_centered,
+            LD_CM=_BWD_LD_CM,
+            ST_CM=_BWD_ST_CM,
         )
     dg = _finalize_dgamma(dg_partial, gamma.dtype)
     return dx, dg
@@ -356,6 +404,8 @@ def rmsnorm_fwd_residual_impl(
             eps=eps,
             BLOCK_H=BLOCK_H,
             AMAX=amax_out,
+            LD_CM=_FWD_LD_CM,
+            ST_CM=_FWD_ST_CM,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -382,6 +432,8 @@ def rmsnorm_fwd_residual_impl(
             BLOCK_H=BLOCK_H,
             ROWS_PER_BLOCK=ROWS,
             AMAX=amax_out,
+            LD_CM=_FWD_LD_CM,
+            ST_CM=_FWD_ST_CM,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -400,11 +452,15 @@ def rmsnorm_bwd_residual_impl(
     ROWS: int,
     num_warps: int,
     num_stages: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Backward launcher for the residual variant. Returns ``(dx [B, H], dgamma [H])``.
+    dual_dx: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    """Backward launcher for the residual variant. Returns ``(dx, dx_residual, dgamma)``.
 
-    Caller is expected to return the same ``dx`` for both ``x`` and ``residual``
-    inputs because the upstream ``+`` has Jacobian ``[I, I]``.
+    ``x`` and ``residual`` take the same gradient, the upstream ``+`` having Jacobian
+    ``[I, I]``. Returning one tensor for both makes autograd copy it before it can hand
+    it to the second consumer, and at this width the copy costs more than storing the
+    block twice while it is still in registers, so ``dual_dx`` writes a second output
+    instead. ``dx_residual`` is None when it is off.
     """
     H = gamma.shape[0]
     B = x_plus_r.shape[0]
@@ -415,6 +471,8 @@ def rmsnorm_bwd_residual_impl(
     has_dxpr = dxpr is not None
     dxpr2 = _reshape_batch_hidden(dxpr, H) if has_dxpr else x_plus_r
     dx = torch.empty_like(x_plus_r)
+    # Same stand-in trick: off, the kernel never dereferences the second output pointer.
+    dxr = torch.empty_like(x_plus_r) if dual_dx else dx
     mode, BLOCK_H, GR, num_warps, num_stages = _pick_bwd_config(H, B)
     if mode == "multi":
         ROWS = GR
@@ -427,6 +485,7 @@ def rmsnorm_bwd_residual_impl(
             gamma,
             rstd,
             dx,
+            dxr,
             dg_partial,
             x_plus_r.stride(0),
             x_plus_r.stride(1),
@@ -442,6 +501,9 @@ def rmsnorm_bwd_residual_impl(
             BLOCK_H=BLOCK_H,
             ROWS_PER_BLOCK=ROWS,
             HAS_DXPR=has_dxpr,
+            DUAL_DX=dual_dx,
+            LD_CM=_BWD_LD_CM,
+            ST_CM=_BWD_ST_CM,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -455,6 +517,7 @@ def rmsnorm_bwd_residual_impl(
             gamma,
             rstd,
             dx,
+            dxr,
             dg_partial,
             x_plus_r.stride(0),
             x_plus_r.stride(1),
@@ -470,6 +533,9 @@ def rmsnorm_bwd_residual_impl(
             BLOCK_H=BLOCK_H,
             num_programs=num_programs,
             HAS_DXPR=has_dxpr,
+            DUAL_DX=dual_dx,
+            LD_CM=_BWD_LD_CM,
+            ST_CM=_BWD_ST_CM,
         )
     dg = _finalize_dgamma(dg_partial, gamma.dtype)
-    return dx, dg
+    return dx, (dxr if dual_dx else None), dg

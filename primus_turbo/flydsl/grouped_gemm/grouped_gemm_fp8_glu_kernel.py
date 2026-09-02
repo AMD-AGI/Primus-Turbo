@@ -241,12 +241,15 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
                 N=I,
                 glu=True,
                 glu_i=I,
-                # Non-temporal on both output streams, worth 1.11x: 4.4 GB that
-                # nothing here reads again would otherwise evict the A/B tiles the
-                # next mainloop wants. Bit 1 is the one that pays -- bit 4
-                # (aux=16) costs 1.5x, so this is not a monotone knob.
-                cstore_aux=2,
-                glu_act_aux=2,
+                # Default cache policy on both output streams. Non-temporal (aux=2)
+                # was worth 1.11x while a lane pair wrote 32 B, where the run was
+                # half a line either way; with the row-merged store each run is a
+                # 64 B half-line and evicting it early splits the 128 B line it
+                # shares, which cost 8.7 M extra DRAM writes (44.1 M against 35.4 M
+                # requests) -- the store's width, not the tensor's reuse, decides
+                # this sign. Both streams back at default put them 1:1.
+                cstore_aux=0,
+                glu_act_aux=0,
                 glu_amax=_amax,
             )
 

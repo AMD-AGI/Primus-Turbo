@@ -119,7 +119,10 @@ class _RMSNormResidualFunction(torch.autograd.Function):
             # Nothing flows through the norm itself, so dgamma is zero and dx is whatever
             # came back through x_plus_r.
             return grad_xpr, grad_xpr, torch.zeros_like(gamma), None
-        dx, dg = rmsnorm_bwd_residual_impl(
+        # Jacobian of add() is [I, I], so x and residual take the same gradient. Handing
+        # back one tensor twice makes autograd clone it for the second consumer, a full
+        # read plus write of [B, H]; the kernel emits both while the block is in registers.
+        dx, dxr, dg = rmsnorm_bwd_residual_impl(
             grad_y,
             grad_xpr,
             x_plus_r,
@@ -129,10 +132,9 @@ class _RMSNormResidualFunction(torch.autograd.Function):
             ctx.ROWS,
             ctx.num_warps,
             ctx.num_stages,
+            dual_dx=True,
         )
-        dx_out = dx.reshape(ctx.orig_shape)
-        # Jacobian of add() is [I, I] -> both x and residual get the same grad.
-        return dx_out, dx_out, dg, None
+        return dx.reshape(ctx.orig_shape), dxr.reshape(ctx.orig_shape), dg, None
 
 
 def rmsnorm(

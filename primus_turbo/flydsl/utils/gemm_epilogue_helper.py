@@ -67,6 +67,7 @@ from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import (
 from primus_turbo.flydsl.utils.gemm_helper import (
     S2RLoaderTr,
     StoreCPerTensor,
+    _permlane16_swap,
     make_row_band_resource,
 )
 from primus_turbo.flydsl.utils.prims import (
@@ -769,6 +770,15 @@ class StoreCSwiGLU(StoreCPerTensor, _EpilogueAmax):
         self.lane_drop = bool(ilv) and not (col_safe or band_drop)
         assert not self.lane_drop or glu_i % ilv == 0
         assert ilv or not cst, "the in-loop store needs the interleaved column map"
+        # Row-merged stores: with the plain column map a lane owns one column per n-fragment,
+        # so a fragment's 16 lanes leave 32 B of a 64 B write run and the run only closes if
+        # L2 merges the next fragment's store into it. Packing each fragment by row pair and
+        # swapping the odd fragment into the other 32-lane half closes the run in one store
+        # instead -- the halving StoreCPerTensorRowN already does for the plain stores. The
+        # interleaved map hands a lane adjacent columns and vectorises instead, so it opts out.
+        self.row_merge = not ilv and n_tiles_b % 2 == 0 and out_ty is fx.BFloat16
+        self.merge_row = (self.lane_id // 32) * 8  # rows a merged run steps by 16-lane group
+        self.merge_col = self.lane_id % 32  # column within the merged 32-wide run
         assert not (amax_partial is not None and skip_act), "no act store, so no act amax"
         self._amax_init(amax_partial, amax_pid)
         _prow = _as_index(c_rows)
@@ -848,13 +858,17 @@ class StoreCSwiGLU(StoreCPerTensor, _EpilogueAmax):
         NTB = self.n_tiles_b
         masked = const_expr(not (self.col_safe or self.band_drop or self.lane_drop))
         lane_ok = (col0 < fx.Int32(self.glu_i)) if const_expr(self.lane_drop) else None
+        # A merged run covers the columns of both fragments of a pair, so its predicate is the
+        # run's own first column rather than either fragment's.
+        mcol0 = base_col + self.merge_col
         amax_acc = fx.Float32(0.0)
         for ti in range_constexpr(self.n_tiles_a):
             row_local = ti * 16 + (self.lane_id // 16) * 4
             # probs varies with the row alone, so it is hoisted off the column loop.
             pr = [self._probs(base_row + row_local + i) for i in range_constexpr(4)]
-            l1_off = [((row_local + i) * self.c_cols + col0) * 2 for i in range_constexpr(4)]
-            act_off = [((row_local + i) * self.glu_i + col0) * 2 for i in range_constexpr(4)]
+            if const_expr(not self.row_merge):  # the merged path addresses off its own run base
+                l1_off = [((row_local + i) * self.c_cols + col0) * 2 for i in range_constexpr(4)]
+                act_off = [((row_local + i) * self.glu_i + col0) * 2 for i in range_constexpr(4)]
             valid = [(col0 + tj * dcol) < self.glu_i if masked else lane_ok for tj in range_constexpr(NTB)]
             gv, uv = [], []
             for tj in range_constexpr(NTB):
@@ -899,20 +913,67 @@ class StoreCSwiGLU(StoreCPerTensor, _EpilogueAmax):
                         if const_expr(fold):
                             _fold(v, i, tj)
 
+            def _emit_merged(rsrc, stride, col_off, val_fn, aux, fold=False):
+                """One stream, one whole write run at a time.
+
+                Each fragment's four rows pack into two dwords by row pair, one
+                ``v_permlane16_swap_b32`` per pair moves the odd fragment's dword into the
+                other 32-lane half, and the resulting store's 32 lanes cover the run both
+                fragments used to half-fill. Values, their predicate and the abs-max fold
+                are all taken before the swap, so only the address changes.
+                """
+                lane0 = self.merge_row * stride + mcol0 + col_off
+                for p in range_constexpr(NTB // 2):
+                    dw = [
+                        [
+                            self._pack(val_fn(2 * p + q, 2 * h), val_fn(2 * p + q, 2 * h + 1))
+                            for h in range_constexpr(2)
+                        ]
+                        for q in range_constexpr(2)
+                    ]
+                    if const_expr(fold):
+                        for q in range_constexpr(2):
+                            for h in range_constexpr(2):
+                                pv = Vec.from_elements([fx.Int32(dw[q][h])], fx.Int32).bitcast(self.out_ty)
+                                for e in range_constexpr(2):
+                                    _fold(pv[e], 2 * h + e, 2 * p + q)
+                    run_ok = ((mcol0 + p * 32) < fx.Int32(self.glu_i)) if masked else None
+                    for h in range_constexpr(2):
+                        for v, r in zip(_permlane16_swap(dw[0][h], dw[1][h]), (0, 4)):
+                            pair = Vec.from_elements([fx.Int32(v)], fx.Int32).bitcast(self.out_ty)
+                            for e in range_constexpr(2):
+                                row = ti * 16 + r + 2 * h + e
+                                _buffer_ops.buffer_store(
+                                    pair[e],
+                                    rsrc,
+                                    (lane0 + row * stride) * 2 + p * 64,
+                                    mask=run_ok,
+                                    cache_modifier=aux,
+                                    offset_is_bytes=True,
+                                )
+
             def _act(tj, i, gv=gv, uv=uv, pr=pr):
                 return gv[tj][i] * _sigmoid_rcp(gv[tj][i]) * uv[tj][i] * pr[i]
 
             if const_expr(not self.cst):
-                _emit(l1_rs, l1_off, lambda tj, i, gv=gv: gv[tj][i], self.store_aux)
-                _emit(
-                    l1_rs,
-                    [o + self.glu_i * 2 for o in l1_off],
-                    lambda tj, i, uv=uv: uv[tj][i],
-                    self.store_aux,
-                )
+                if const_expr(self.row_merge):
+                    _emit_merged(l1_rs, self.c_cols, 0, lambda tj, i, gv=gv: gv[tj][i], self.store_aux)
+                    _emit_merged(
+                        l1_rs, self.c_cols, self.glu_i, lambda tj, i, uv=uv: uv[tj][i], self.store_aux
+                    )
+                else:
+                    _emit(l1_rs, l1_off, lambda tj, i, gv=gv: gv[tj][i], self.store_aux)
+                    _emit(
+                        l1_rs,
+                        [o + self.glu_i * 2 for o in l1_off],
+                        lambda tj, i, uv=uv: uv[tj][i],
+                        self.store_aux,
+                    )
             if const_expr(not self.skip_act):
                 fold = const_expr(self.amax_rs is not None)
-                if const_expr(bool(self.ilv)):
+                if const_expr(self.row_merge):
+                    _emit_merged(act_rs, self.glu_i, 0, _act, self.act_aux, fold=fold)
+                elif const_expr(bool(self.ilv)):
                     # Interleaved fragments put a lane's NTB columns side by side, so a row
                     # leaves as one request instead of NTB two-byte ones.
                     for i in range_constexpr(4):
@@ -1066,6 +1127,11 @@ class StoreCdSwiGLUCShuffle(_EpilogueAmax):
         wave_m = self.wave_id // 4
         row_stride = self.BAND_COLS + self.row_pad
         group_base = wave_m * (16 * row_stride)
+        # row_stride is a multiple of the 64 LDS banks, so the four row groups one lane
+        # sweep stages collide four ways (measured 12.77% of LDS cycles). Clearing it with
+        # a row-group XOR on the column left the unit unchanged -- the staging is off the
+        # critical path, WAIT_ANY only moved 42.0% -> 41.6% -- so the banks are not the
+        # thing to fix here.
         band_col0 = base_col - wave_n * self.Cc  # block_n * BLOCK_N
         # A lane sums its own 8 columns, then the 16 lanes of its DPP row fold
         # into lane 15. The 32 lanes covering a row straddle two such rows;
@@ -1098,7 +1164,8 @@ class StoreCdSwiGLUCShuffle(_EpilogueAmax):
             # the barrier. They depend on nothing in LDS, and at one workgroup per
             # CU there are only eight waves to keep requests in flight -- right at
             # the concurrency this needs to saturate HBM -- so their latency wants
-            # the staging writes and the barrier to hide under.
+            # the staging writes and the barrier to hide under. Issuing them a whole
+            # band further ahead was measured 0.55% slower on the mlp unit.
             rows_in = [wave_n * 4 + c * 2 + self.lane_id // 32 for c in range_constexpr(2)]
             eoffs = [r * self.c_cols + gcol for r in rows_in]
             loaded = [(self._l1v(l1_rs, e, valid), self._l1v(l1_rs, e + self.glu_i, valid)) for e in eoffs]
