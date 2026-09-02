@@ -878,9 +878,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + LEGACY_NUM
                     auto dst_slot_idx = synced_last_issued_tail % num_max_rdma_chunked_recv_tokens;
                     EP_DEVICE_ASSERT(dst_slot_idx + num_tokens_to_issue <= num_max_rdma_chunked_recv_tokens);
                     const size_t num_bytes_per_msg = num_bytes_per_token * num_tokens_to_issue;
-                    // ROCm: IBGDA warp put -> rocSHMEM wave put. No fence/quiet before the tail
-                    // AMO below: both ride this context's RC queue pair to the same PE, and RC
-                    // delivers WQEs in order. Draining here costs ~30% of dispatch bandwidth.
+                    // ROCm: IBGDA warp put -> rocSHMEM wave put
                     ::rocshmem::rocshmem_ctx_schar_put_nbi_wave(
                         ctx,
                         reinterpret_cast<signed char*>(rdma_channel_data.recv_buffer(rdma_rank) + dst_slot_idx * num_bytes_per_token),
@@ -888,6 +886,10 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + LEGACY_NUM
                                                              dst_slot_idx * num_bytes_per_token),
                         num_bytes_per_msg,
                         translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank));
+                    // ROCm: new, `nvshmemi_ibgda_rma` keeps the payload and the tail AMO on one QP,
+                    // a rocSHMEM context may stripe them over several. Without this drain the
+                    // receiver can see the tail move before the data lands.
+                    ::rocshmem::rocshmem_ctx_quiet(ctx);
                 } else {
                     // Lighter fence for local RDMA rank
                     memory_fence();
@@ -2097,9 +2099,7 @@ __global__ void __launch_bounds__(kNumCombineBlockWarps * WARP_SIZE, 1) combine(
                     if (dst_rdma_rank != rdma_rank) {
                         auto rdma_slot_idx = token_start_idx % num_max_rdma_chunked_recv_tokens;
                         const size_t num_bytes_per_msg = num_chunked_tokens * num_bytes_per_token;
-                        // ROCm: IBGDA warp put -> rocSHMEM wave put. No fence/quiet before the tail
-                        // AMO below: both ride this context's RC queue pair to the same PE, and RC
-                        // delivers WQEs in order.
+                        // ROCm: IBGDA warp put -> rocSHMEM wave put
                         ::rocshmem::rocshmem_ctx_schar_put_nbi_wave(
                             ctx,
                             reinterpret_cast<signed char*>(rdma_channel_data.recv_buffer(rdma_rank) + rdma_slot_idx * num_bytes_per_token),
@@ -2107,6 +2107,8 @@ __global__ void __launch_bounds__(kNumCombineBlockWarps * WARP_SIZE, 1) combine(
                                                                  rdma_slot_idx * num_bytes_per_token),
                             num_bytes_per_msg,
                             translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank));
+                        // ROCm: new, same QP-striping hazard as the dispatch sender above
+                        ::rocshmem::rocshmem_ctx_quiet(ctx);
                     } else {
                         memory_fence();
                     }
