@@ -44,7 +44,7 @@ from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import mxfp6_pack_size
 
 _torch_custom_op_wrapper = torch.library.custom_op
 
-__all__ = ["GEMMFP6AITERBackend", "gemm_fp6_impl"]
+__all__ = ["GEMMFP6AITERBackend", "gemm_fp6_impl", "gemm_fp6_out_impl"]
 
 
 class GEMMFP6AITERBackend(KernelBackend):
@@ -217,3 +217,78 @@ def gemm_fp6_impl_meta(
     # Pure arithmetic on purpose: this must not reach into AITER, whose kernel
     # selection does lru_cached pandas lookups that SymInts would break.
     return torch.empty(m, n, dtype=out_dtype, device=a.device)
+
+
+def _pad_k(k: int) -> int:
+    """K rounded up to AITER's A6W6 K tile, which is what the asm expects."""
+    return (k + MXFP6_K_TILE_SIZE - 1) // MXFP6_K_TILE_SIZE * MXFP6_K_TILE_SIZE
+
+
+@_torch_custom_op_wrapper(
+    "primus_turbo::gemm_fp6_out_impl", mutates_args=("out",), device_types="cuda"
+)
+def gemm_fp6_out_impl(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    out: torch.Tensor,
+    m: int,
+    n: int,
+    k: int,
+    granularity: int,
+) -> None:
+    """``out[M, N] = A[M, K] @ B[N, K].T``, writing into a caller-owned buffer.
+
+    This exists so a weight gradient can land straight in ``param.main_grad`` instead of
+    being allocated and then added in by Megatron's DDP hook. Two things make that safe
+    to do here but not in general:
+
+    - The A6W6 asm stores with beta=0, so this **overwrites** ``out`` rather than
+      accumulating into it. It is therefore only correct for the last (or only)
+      microbatch of a step. The caller owns that decision.
+    - ``gemm_a6w6`` normally allocates a tile-padded output and slices the result, so a
+      caller-provided buffer is only writable when the launch needs no padding. Hence the
+      exact-alignment requirement below, which is stricter than ``can_handle``'s
+      padding-waste guard.
+    """
+    granularity_enum = ScalingGranularity(granularity)
+    _validate_blobs(a, a_scale, b, b_scale, m, n, k)
+
+    if granularity_enum not in GEMMFP6AITERBackend.SUPPORTED_GRANULARITIES:
+        raise ValueError(f"MXFP6 out-GEMM needs MX_BLOCKWISE scaling, got {granularity_enum}.")
+    if out.dtype not in GEMMFP6AITERBackend.SUPPORTED_OUT_DTYPES:
+        raise TypeError(f"MXFP6 out-GEMM writes bf16 only, got out dtype {out.dtype}.")
+    if out.ndim != 2 or tuple(out.shape) != (m, n):
+        raise ValueError(f"MXFP6 out-GEMM expects a 2-D [{m}, {n}] out, got {tuple(out.shape)}.")
+    if not out.is_contiguous():
+        raise ValueError("MXFP6 out-GEMM needs a contiguous out; the asm writes it directly.")
+    if out.device != a.device:
+        raise ValueError(f"MXFP6 out-GEMM out is on {out.device}, operands on {a.device}.")
+    if m % MXFP6_TILE_SIZE != 0 or n % MXFP6_TILE_SIZE != 0:
+        raise ValueError(
+            f"MXFP6 out-GEMM needs M and N exact multiples of {MXFP6_TILE_SIZE} so the launch "
+            f"needs no padding and can write out in place, got M={m} N={n}."
+        )
+    if not is_gfx950_device(a.device):
+        raise RuntimeError("MXFP6 out-GEMM requires gfx950.")
+
+    aiter = get_aiter()
+    config = aiter.get_GEMM_A6W6_config(m, n, k)
+    kernel_name = str(config["kernelName"]) if config is not None else None
+    aiter.gemm_a6w6_asm(a, b, a_scale, b_scale, out, _pad_k(k), kernel_name)
+
+
+@gemm_fp6_out_impl.register_fake
+def gemm_fp6_out_impl_meta(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    out: torch.Tensor,
+    m: int,
+    n: int,
+    k: int,
+    granularity: int,
+) -> None:
+    return None
