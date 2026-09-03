@@ -38,6 +38,7 @@ from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from primus_turbo.common.logger import logger
 from primus_turbo.flydsl.utils.gemm_epilogue_helper import (
     StoreCdSwiGLUCShuffle,
     StoreCSwiGLU,
@@ -3480,6 +3481,18 @@ def _wgrad_flag_rows(ntiles, out_n, elem_bytes=2):
     return ceildiv(ntiles * 4, out_n * elem_bytes)
 
 
+def _wgrad_split_head_ids(tiles_per_group, total, ncu, nb, nxcd=_WGRAD_XCD_HW):
+    """Slice-head dispatch ids for ``nb``, matching ``_compile_grouped_tn_wgrad_4wave``.
+    Must be ``<= total`` so the head fits one grid-stride turn; otherwise the 4-wave
+    factory asserts and autotune falls through to masked (which cannot serve a tight C)."""
+    if nb <= 1:
+        return 0
+    sp_a = (nb - 1) * tiles_per_group
+    sp_2x = ceildiv(2 * sp_a, nxcd) * nxcd
+    sp_lead = sp_a if tiles_per_group < ncu and sp_2x <= total else 0
+    return ceildiv(sp_a + sp_lead, nxcd) * nxcd
+
+
 def _wgrad_split_geom(tiles_per_group, total, ncu):
     """Compile-time deep-K split geometry ``(NB, BANDS, FIRE, HOLD)`` shared by factory and host
     entry: NB token chunks, BANDS = NB-1 scratch bands, FIRE/HOLD the cut/promote bars. NB == 1
@@ -3491,6 +3504,13 @@ def _wgrad_split_geom(tiles_per_group, total, ncu):
     nb = _WGRAD_SPLIT_NB_MIN
     while nb < _WGRAD_SPLIT_NB and tiles_per_group * nb < _WGRAD_SPLIT_FILL * ncu:
         nb *= 2
+    # FILL may ask for NB=8 on a 144-tile down-proj; with few local experts (EP>1, G=4)
+    # that head is larger than G*tiles and the 4-wave persist compile fails. Lower NB
+    # until the head fits; below NB_MIN the split is a no-op so disable it.
+    while nb > 1 and _wgrad_split_head_ids(tiles_per_group, total, ncu, nb) > total:
+        nb //= 2
+    if nb < _WGRAD_SPLIT_NB_MIN:
+        return 1, 0, 0, 0
     return nb, nb - 1, _WGRAD_SPLIT_FIRE, _WGRAD_SPLIT_HOLD
 
 
@@ -4526,24 +4546,53 @@ def _autotune_wgrad_dispatch(
 
         return prod
 
+    def _try_4wave(cfg):
+        """Compile+launch ``cfg`` on the balanced probe. None if the output is non-finite."""
+        cand = _compile_4wave(*cfg)
+        for mp in mps:
+            cand(*mp[0])
+            torch.cuda.synchronize()
+            if not torch.isfinite(mp[1].view(-1)[:1024].float()).all().item():
+                return None
+        return cand
+
+    logger.warning(
+        f"[wgrad-autotune] OUT=({OUT_M},{OUT_N}) real=({m_real},{n_real}) G={G} "
+        f"M_total={M_total} i64={i64_traverse} tight={c_tight} fp32={out_fp32} cands={wave4_cands}",
+        once=True,
+        rank=0,
+    )
     prod = None
     best_cfg = None
-    if not i64_traverse:
-        try:
-            cfg0 = wave4_cands[0]
-            cand = _compile_4wave(*cfg0)
-            ok = True
-            for mp in mps:
-                cand(*mp[0])
-                torch.cuda.synchronize()
-                if not torch.isfinite(mp[1].view(-1)[:1024].float()).all().item():
-                    ok = False
+    errors = []
+    # i64 huge shapes skip persist 4-wave on padded C (masked is the ref). Tight C cannot
+    # use masked, so still try 4-wave there -- better a clear raise than a padded-pitch store.
+    skip_4wave = i64_traverse and not c_tight
+    if not skip_4wave:
+        for cfg in wave4_cands:
+            try:
+                cand = _try_4wave(cfg)
+            except Exception as exc:
+                errors.append((cfg, f"{type(exc).__name__}: {exc}"))
+                if not c_tight:
                     break
-            if ok:
-                prod, best_cfg = cand, cfg0
-        except Exception:
-            prod = None
+                continue
+            if cand is not None:
+                prod, best_cfg = cand, cfg
+                logger.warning(f"[wgrad-autotune] persist-ref {cfg}", once=True, rank=0)
+                break
+            errors.append((cfg, "non-finite"))
+            if not c_tight:
+                break
     if prod is None:  # i64 huge shape or 4-wave failed to compile/produced NaN -> masked ref
+        if c_tight:
+            raise RuntimeError(
+                "wgrad persist 4-wave cannot serve a tight C "
+                f"(padded-pitch masked store into real-extent buffer). "
+                f"OUT=({OUT_M},{OUT_N}) real=({m_real},{n_real}) G={G} "
+                f"M_total={M_total} i64={i64_traverse} fp32={out_fp32} "
+                f"cands={wave4_cands} errors={errors}"
+            )
         prod = _build_masked(False)
         best_cfg = None
         for mp in mps:
@@ -4573,7 +4622,7 @@ def _autotune_wgrad_dispatch(
         return worst
 
     best_s = _score(prod)
-    race = wave4_cands if best_cfg is None else wave4_cands[1:]
+    race = tuple(cfg for cfg in wave4_cands if cfg != best_cfg)
     for cfg in race:
         try:
             l = _compile_4wave(*cfg)
@@ -4586,6 +4635,12 @@ def _autotune_wgrad_dispatch(
         if s is not None and (best_s is None or s < best_s * _WGRAD_RACE_MARGIN):
             best_s, best_cfg = s, cfg
     if best_cfg is None:
+        if c_tight:
+            raise RuntimeError(
+                "wgrad persist 4-wave race left no tight-C winner. "
+                f"OUT=({OUT_M},{OUT_N}) real=({m_real},{n_real}) G={G} "
+                f"M_total={M_total} i64={i64_traverse} fp32={out_fp32} errors={errors}"
+            )
         return _build_masked
     _cfg = best_cfg
     return lambda beta_is_one: _compile_4wave(*_cfg, beta_is_one=beta_is_one)
