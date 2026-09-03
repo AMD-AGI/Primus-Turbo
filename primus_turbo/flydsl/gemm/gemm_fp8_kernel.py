@@ -47,6 +47,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     StoreCPerTensorQuadN,
     wait_barrier,
     xcd_remap_pid,
+    xcd_window_mn,
     XPOSE_SLOT,
     XPOSE_SLOTS,
 )
@@ -1124,6 +1125,7 @@ class _Tn4Geom(NamedTuple):
     bn: int
     pools: tuple
     bstep: int
+    mstep: int = 0  # mfma issue-order row block; 0 = 2
     # Boundaries taking a wait state, "<before><after>" over m (mfma), d (ds_read), g (g2s).
     pad: tuple = ("mm", "md", "mg", "dm", "dd", "dg", "gm", "gd", "gg")
     wgrid: tuple = (2, 2)  # a square split shares both operands' reads four ways, not one side's
@@ -2004,7 +2006,10 @@ _NT4_SQUARE = _Tn4Geom(
     256,
     256,
     ((0, 128, 2), (0, 128, 2), (1, 128, 3), (1, 128, 3)),
-    0,
+    # One whole accumulator block per issue step, so each srcA fragment feeds every column it
+    # ever reaches before the next one is read; on NT's plain reads that beats the diagonal.
+    8,
+    mstep=4,
     drain_lgkm=6,  # NT's plain reads leave fewer in flight than the transpose path's
 )
 _NT4_ASM_CACHE: dict = {}
@@ -2046,8 +2051,10 @@ def _nt4_fold_gl_off(lane_id, wave_id, K, n_rounds, gq, fold):
 
 def _tn4_mfma_order(geom, nt, nb, na, nacc, ap, bp, bcol, qoff, pools):
     """(accumulator, srcA, srcB) of one phase's mfma, in issue order: the srcA pool is outer
-    because this mfma is srcA-movement sensitive, and the diagonal spreads the refills."""
-    bm, bn = 2, geom.bstep or nb // 2
+    because this mfma is srcA-movement sensitive. ``mstep``/``bstep`` size the block the diagonal
+    walks; one block covering the whole accumulator set drops the diagonal, which is what the
+    plain-B geometry measures fastest."""
+    bm, bn = geom.mstep or 2, geom.bstep or nb // 2
     n_row_steps, n_col_steps = nt // bm, nb // bn
     for d in range(n_row_steps + n_col_steps - 1):
         for iib in range(n_row_steps):
@@ -2065,7 +2072,9 @@ def _tn4_mfma_order(geom, nt, nb, na, nacc, ap, bp, bcol, qoff, pools):
                         )
 
 
-def _dense_nt_wave4_asm(geom, k_iters, cbsz, blgp, fold, tr_b=False, b_kstep=_TN4_BLOCK_K, carry=False):
+def _dense_nt_wave4_asm(
+    geom, k_iters, cbsz, blgp, fold, tr_b=False, b_kstep=_TN4_BLOCK_K, carry=False
+):
     """Bare-asm K body for one NT output tile; ``carry`` hands the closing fills to the next tile."""
     key = (geom, k_iters, cbsz, blgp, fold, tr_b, b_kstep, carry)
     if key in _NT4_ASM_CACHE:
@@ -2254,7 +2263,10 @@ def _dense_nt_wave4_asm(geom, k_iters, cbsz, blgp, fold, tr_b=False, b_kstep=_TN
             L += loop_block(n_main - phases - xtra)
         if xtra:
             L += pass_block(False, False, n_spec)
-        L += ["s_waitcnt vmcnt(0) lgkmcnt(0)", "s_barrier"]
+        # Entry to the closing phases. The pass that just ran already ended on the graded drain
+        # and barrier the main loop's back edge relies on, so grade this rendezvous the same way
+        # the phases do rather than draining the fill pipeline that is feeding the next tile.
+        L += [f"s_waitcnt vmcnt({n_flight(tail - 1 if carry else k_iters)}) lgkmcnt(0)", "s_barrier"]
         for j in range(tail - 1):
             L += phase_block(j, left=(tail - 1 - j) if carry else None)
     else:
@@ -2288,10 +2300,44 @@ def _dense_nt_wave4_asm(geom, k_iters, cbsz, blgp, fold, tr_b=False, b_kstep=_TN
     return _NT4_ASM_CACHE[key]
 
 
-def _nt4_tile_window(d, M, N, K, NBM, NBN, group_m, group_n, num_xcd, geom, tr_b):
+def _nt4_window_ok(raster, NBM, NBN, n_tile, n_wg, num_xcd, tr_b):
+    """Whether ``xcd_window_mn``'s aligned per-step rectangle tiles this grid."""
+    if raster <= 0 or tr_b or num_xcd <= 1 or n_tile % n_wg or n_wg % num_xcd or NBM % num_xcd:
+        return False
+    slots = n_wg // num_xcd
+    return not (slots % raster or (NBM // num_xcd) % raster or NBN % (slots // raster))
+
+
+def _nt4_raster(NBM, NBN, group_m, n_tile, n_wg, num_xcd, tr_b):
+    """Pick the aligned window, or 0 to keep the GROUP_M raster.
+
+    A super-row is ``group_m*NBN`` tiles and an XCD takes ``slots`` of them per step, so the step
+    straddles two super-rows unless one divides the other; a straddling step pulls two half-width
+    windows into the XCD's L2 instead of one whole one. Where the super-row already divides
+    evenly there is nothing to fix, and the emitted mapping stays bit-identical. Otherwise take
+    the squarest legal rectangle -- a step reads ``win_m + slots/win_m`` operand slabs, and a
+    rectangle far out of square measured worse than the ragged window it replaces."""
+    if num_xcd <= 1 or n_wg % num_xcd:
+        return 0
+    slots = n_wg // num_xcd
+    if (group_m * NBN) % slots == 0:
+        return 0
+    ok = [
+        w
+        for w in range(1, slots + 1)
+        if max(w, slots // w) <= 2 * min(w, slots // w)
+        and _nt4_window_ok(w, NBM, NBN, n_tile, n_wg, num_xcd, tr_b)
+    ]
+    return min(ok, key=lambda w: (w + slots // w, w), default=0)
+
+
+def _nt4_tile_window(d, M, N, K, NBM, NBN, group_m, group_n, num_xcd, geom, tr_b, raster=0, n_wg=0):
     """One dispatch id's operand windows, num_records bounded so read-ahead past the tile drops."""
-    pid = xcd_remap_pid(d, NBM * NBN, num_xcd)
-    block_m, block_n = block_mn(pid, fx.Int32(NBM), fx.Int32(NBN), group_m, group_n)
+    if raster:
+        block_m, block_n = xcd_window_mn(d, n_wg, NBM, NBN, num_xcd, raster)
+    else:
+        pid = xcd_remap_pid(d, NBM * NBN, num_xcd)
+        block_m, block_n = block_mn(pid, fx.Int32(NBM), fx.Int32(NBN), group_m, group_n)
     bm_off = _readfirstlane_i32(block_m) * fx.Int32(geom.bm)
     bn_off = _readfirstlane_i32(block_n) * fx.Int32(geom.bn)
     a_base = arith.index_cast(T.index, bm_off) * arith.index(K)
@@ -2394,6 +2440,8 @@ def _dense_nt_wave4_tile(
     group_m,
     group_n,
     num_xcd,
+    raster,
+    n_wg,
     store_aux,
     lds,
     geom,
@@ -2427,7 +2475,7 @@ def _dense_nt_wave4_tile(
     n_waves = _tn4_nthr(geom) // 64
     carry = d_next is not None
     cbuf = _nt4_carry_bufs(pools, carry, K_ITERS, _tn4_phases(geom))
-    wargs = (M, N, K, NBM, NBN, group_m, group_n, num_xcd, geom, tr_b)
+    wargs = (M, N, K, NBM, NBN, group_m, group_n, num_xcd, geom, tr_b, raster, n_wg)
     bm_off, bn_off, win = _nt4_tile_window(d, *wargs)
 
     s2r = {}
@@ -2482,11 +2530,8 @@ def _dense_nt_wave4_tile(
         col_safe=col_safe,
         store_aux=store_aux,
         beta_is_one=beta_is_one,
-        **(
-            {"lds_xpose": _nt4_xpose_lds(pools[0], pool_lds[0], wave_id, n_waves), "scale": scale}
-            if line_n
-            else {}
-        ),
+        scale=scale,
+        **({"lds_xpose": _nt4_xpose_lds(pools[0], pool_lds[0], wave_id, n_waves)} if line_n else {}),
     )
 
     g2s = _nt4_g2s(A, B, win, pools, gl_off, wave_id)
@@ -2527,7 +2572,9 @@ def _dense_nt_wave4_tile(
     ins += [fx.Int32(_nt4_buf_off(p, b, K, b_kstep, tr_b)) for i, p in enumerate(pools) for b in cbuf[i]]
     nacc = sum(p.tiles for p in apool) * sum(p.tiles for p in bpool)  # over the pools it reads
 
-    asm, cons, st, peel = _dense_nt_wave4_asm(geom, K_ITERS, cbsz, blgp, fold, tr_b, b_kstep, carry)
+    asm, cons, st, peel = _dense_nt_wave4_asm(
+        geom, K_ITERS, cbsz, blgp, fold, tr_b, b_kstep, carry
+    )
     r = _llvm.inline_asm(ir.Type.parse(st), [arith._to_raw(v) for v in ins], asm, cons, has_side_effects=True)
     acc_ty = ir.Type.parse("vector<4xf32>")
     res = [Vec(_llvm.extractvalue(acc_ty, r, [q])) for q in range_constexpr(nacc)]
@@ -2598,6 +2645,8 @@ def _dense_nt_wave4_tile(
             for m in ahead:  # a group wider than the slots the unit offered
                 emit_mfma(m)
     else:
+        # A store reads accumulators the peel's mfma have just written, so it trails by one
+        # group; the barrier keeps the next group's mfma from clobbering them first.
         for i in range_constexpr(len(unit)):
             for m in grp[i]:
                 emit_mfma(m)
@@ -2616,6 +2665,7 @@ def _compile_dense_wave4(
     group_m: int = 4,
     group_n: int = 0,
     num_xcd: int = 8,
+    raster: int = -1,  # aligned per-step XCD window, win_m block rows; -1 = pick, 0 = GROUP_M
     geom=_NT4_SQUARE,
     cbsz: int = 0,  # srcA fp8 fmt: 0=E4M3, 1=E5M2
     blgp: int = 0,  # srcB fp8 fmt: 0=E4M3, 1=E5M2
@@ -2653,6 +2703,13 @@ def _compile_dense_wave4(
     # The ring needs a closing phase outside the shared loop body to redirect, and a successor
     # to redirect into: a beta=1 tile loop runs once, and K_ITERS%phases==1 peels nothing.
     carry = ring and tiles_per_wg > 1 and _nt4_spec_phases(K_ITERS, phases, max(p.nbuf for p in _pools)) >= 1
+    # The aligned per-step window needs the tile loop to be a clean grid walk and the rectangle to
+    # tile both axes; anything else keeps the GROUP_M raster. Plain-B only, as the transposed-B
+    # body reads its column block through a different global swizzle.
+    if raster < 0:
+        raster = _nt4_raster(NBM, NBN, group_m, n_tile, n_wg, num_xcd, tr_b)
+    elif not _nt4_window_ok(raster, NBM, NBN, n_tile, n_wg, num_xcd, tr_b):
+        raster = 0
     _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
 
     SharedStorage = fx.struct(
@@ -2703,6 +2760,8 @@ def _compile_dense_wave4(
             group_m=group_m,
             group_n=group_n,
             num_xcd=num_xcd,
+            raster=raster,
+            n_wg=n_wg,
             store_aux=_CSTORE_AUX,
             lds=lds,
             geom=geom,
@@ -2724,8 +2783,17 @@ def _compile_dense_wave4(
             tr_b=tr_b,
         )
 
+        # The output scale is loop-invariant, and it is a global load: emitted inside the tile
+        # loop its first use pins an s_waitcnt vmcnt(0) into every epilogue, which drains the
+        # fills the closing phases just issued for the next tile. Load it ahead of the prime so
+        # its own wait has nothing else in flight. Only on the plain-B path: the transposed-B
+        # body has no register headroom to keep the value live across the tile loop.
+        scale = None if tr_b else load_per_tensor_scale(A_scale, B_scale)
+
         if const_expr(carry):
-            w0 = _nt4_tile_window(fx.block_idx.x, M, N, K, NBM, NBN, group_m, group_n, num_xcd, geom, tr_b)
+            w0 = _nt4_tile_window(
+                fx.block_idx.x, M, N, K, NBM, NBN, group_m, group_n, num_xcd, geom, tr_b, raster, n_wg
+            )
             _nt4_prime(
                 _pools,
                 [getattr(lds, f"p{i}") for i in range(len(_pools))],
@@ -2735,8 +2803,6 @@ def _compile_dense_wave4(
                 _TN4_BLOCK_K * N if tr_b else _TN4_BLOCK_K,
                 tr_b,
             )
-
-        scale = load_per_tensor_scale(A_scale, B_scale) if carry else None
 
         for t in range(fx.Int32(0), fx.Int32(tiles_per_wg), fx.Int32(1)):
             d = fx.block_idx.x + t * n_wg

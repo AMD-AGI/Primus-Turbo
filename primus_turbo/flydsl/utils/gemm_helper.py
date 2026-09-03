@@ -719,6 +719,7 @@ class StoreCPerTensor:
         rd_base=None,
         rd_rows=None,
         rd_shift=None,
+        scale=None,
     ):
         self.beta_is_one = beta_is_one
         self.c_rows = c_rows
@@ -747,8 +748,13 @@ class StoreCPerTensor:
         # Optional f32->f32 epilogue node chain (bias/act), post-scale pre-cast.
         self.elem_fn = elem_fn
         self.scaled = A_scale is not None
+        # a_scale*b_scale is loop-invariant, so a caller that emits this store inside a tile
+        # loop should hoist the load and pass the value: the load is what forces a full
+        # s_waitcnt vmcnt(0) at the first use, and inside a loop that drains every fill the
+        # previous phases issued for the next tile.
+        self._scale_pre = scale
         self.c_base = _buffer_ops.extract_base_index(C) if c_base is None else c_base  # byte base address
-        if self.scaled:
+        if self.scaled and scale is None:
             gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=4)  # 1 fp32
             gSB = fx.rocdl.make_buffer_tensor(B_scale, max_size=False, num_records_bytes=4)  # 1 fp32
             self.sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
@@ -762,11 +768,14 @@ class StoreCPerTensor:
         return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
 
     def _scale(self):
-        """a_scale*b_scale, loaded once per emitting block so the quadrant stores share one
+        """a_scale*b_scale. A value the caller hoisted out of its tile loop is used as is;
+        otherwise it is loaded once per emitting block so the quadrant stores share one
         instance instead of re-issuing both scalar loads. Cached per MLIR block: sibling regions
         each get their own load, since a value in one does not dominate a use in another."""
         if not self.scaled:
             return None
+        if self._scale_pre is not None:
+            return self._scale_pre
         blk = ir.InsertionPoint.current.block
         if self._scale_v is None or self._scale_v[0] != blk:
             self._scale_v = (blk, self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div))
@@ -1047,14 +1056,13 @@ class StoreCPerTensorLineN(StoreCPerTensorPairN):
 
     stages_lds = True
 
-    def __init__(self, *args, lds_xpose, scale, **kwargs):
+    def __init__(self, *args, lds_xpose, **kwargs):
         super().__init__(*args, **kwargs)
         assert self.n_tiles_b % 4 == 0, "a line run gathers four n-fragments"
         assert self.col_safe, "a whole-line run has no column mask"
         lane16 = self.lane_id % 16
         quad = lane16 % 4
         self.line_col = quad * 16 + (lane16 // 4) * 4
-        self.scale = scale
         blk = (self.lane_id // 16) * 128
         self._xp_wr = _lds_ptr_from_i32(lds_xpose + blk + quad * 32 + (lane16 // 4) * 8)
         self._xp_rd = _lds_ptr_from_i32(lds_xpose + blk + lane16 * 8)
@@ -1083,7 +1091,7 @@ class StoreCPerTensorLineN(StoreCPerTensorPairN):
             self._retire()
 
     def store(self, c_frag, base_row, base_col, prev=None, tap=None):
-        scale = self.scale
+        scale = self._scale()
         if const_expr(self.beta_is_one) and prev is None:
             prev = self.prefetch(base_row, base_col)
         rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
@@ -1830,6 +1838,29 @@ def block_mn(pid, num_pid_m, n_blocks, GM, GN):
     rem_m = num_pid_m - fpm
     gsm = arith.select(rem_m < GM, rem_m, fx.Int32(GM))
     return fpm + (pig % gsm), pig // gsm
+
+
+def xcd_window_mn(d, n_wg, num_pid_m, n_blocks, num_xcd, win_m):
+    """Tile-id -> (block_m, block_n) for a persistent tile loop whose id is ``wg + step*n_wg``.
+
+    A plain GROUP_M raster fixes the super-row width but not where a super-row starts relative
+    to the slots one XCD owns, so whenever ``GM*n_blocks`` does not divide those slots a step
+    straddles two super-rows and its operand footprint jumps from ``GM + slots/GM`` slabs to
+    twice the smaller side. Here the step's window is an aligned ``win_m x (slots/win_m)``
+    rectangle instead, so every step costs the same. Windows advance along n first, which keeps
+    a workgroup's A slab addressed for a whole row of them. Bijection over the tile range;
+    the caller must check ``num_xcd | num_pid_m``, ``win_m | num_pid_m/num_xcd``,
+    ``win_m | slots`` and ``slots/win_m | n_blocks``."""
+    slots = n_wg // num_xcd
+    win_n = slots // win_m
+    rows = num_pid_m // num_xcd
+    n_win_n = n_blocks // win_n
+    wg = d % n_wg
+    step = d // n_wg
+    return (
+        (wg % num_xcd) * rows + (step // n_win_n) * win_m + (wg // num_xcd) % win_m,
+        (step % n_win_n) * win_n + (wg // num_xcd) // win_m,
+    )
 
 
 def make_row_band_resource(c_base, base_row, c_rows, c_cols, elem_bytes, span_rows=None):
