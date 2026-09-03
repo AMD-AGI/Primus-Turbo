@@ -786,6 +786,10 @@ class StoreCPerTensor:
         """Element address of the value at fragment (ti, tj), row ``i`` of this lane's four."""
         return (ti * 16 + (self.lane_id // 16) * 4 + i) * self.c_cols + base_col + tj * 16 + self.lane_id % 16
 
+    def _col_of(self, ti, i, tj, base_col):
+        """N coordinate of the value at fragment (ti, tj): what a column mask is taken over."""
+        return base_col + tj * 16 + self.lane_id % 16
+
     def _read_back(self, rsrc, ti, i, tj, base_row, base_col):
         """One beta=1 read-back load. ``trans`` swaps the fragment axes (row = N, col = M), so
         the element still lands at C[m, n] and the N bound moves with (ti, i) instead of tj."""
@@ -793,7 +797,7 @@ class StoreCPerTensor:
             n = base_row + ti * 16 + (self.lane_id // 16) * 4 + i  # base_row is the N origin here
             off = (tj * 16 + self.lane_id % 16) * self.c_cols + n
         else:
-            n = base_col + tj * 16 + self.lane_id % 16
+            n = self._col_of(ti, i, tj, base_col)
             off = self._row_col(ti, i, tj, base_col)
         return _buffer_ops.buffer_load(
             rsrc,
@@ -1111,18 +1115,59 @@ class StoreCPerTensorLineN(StoreCPerTensorPairN):
 
 class StoreCPerTensorQuadN(StoreCPerTensorPairN):
     """PairN for a kernel whose n-fragments arrived column-interleaved, so a lane already holds
-    the adjacent columns and one unmasked store folds them with no cross-lane step. The caller
-    owns the interleave; the tile must be column-safe."""
+    the adjacent columns and one store folds them with no cross-lane step. The caller owns the
+    interleave; a tile that is not column-safe needs N to be a whole number of runs, since the
+    mask a folded store can carry is one per run."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert self.n_tiles_b in (4, 8), "the interleave folds four or eight n-fragments"
-        assert self.col_safe, "a partial fold has no column mask"
 
     def _row_col(self, ti, i, tj, base_col):
         """The fold hands this lane a whole run of columns, so tj steps by one, not by a tile."""
         row = ti * 16 + (self.lane_id // 16) * 4 + i
         return row * self.c_cols + base_col + (self.lane_id % 16) * self.n_tiles_b + tj
+
+    def _col_of(self, ti, i, tj, base_col):
+        return base_col + (self.lane_id % 16) * self.n_tiles_b + tj
+
+    def prefetch(self, base_row, base_col):
+        """The fold gives a lane a contiguous run, so the beta=1 read-back rides the run the
+        store writes: one vector load per four columns instead of one per column, which fetched
+        the same line four times over."""
+        if not const_expr(self.beta_is_one):
+            return None
+        if self.rd_base is not None or self.rd_shift is not None:
+            return super().prefetch(base_row, base_col)
+        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, self.out_bytes)
+        col0 = base_col + (self.lane_id % 16) * self.n_tiles_b
+        w = 4  # buffer_load's widest element count
+        mask = None if self.col_safe else col0 < self.c_cols
+        runs = [
+            [
+                [
+                    Vec(
+                        _buffer_ops.buffer_load(
+                            rsrc,
+                            (ti * 16 + (self.lane_id // 16) * 4 + i) * self.c_cols + col0 + h * w,
+                            vec_width=w,
+                            dtype=self.out_ty.ir_type,
+                            mask=mask,
+                        )
+                    )
+                    for h in range_constexpr(self.n_tiles_b // w)
+                ]
+                for i in range_constexpr(4)
+            ]
+            for ti in range_constexpr(self.n_tiles_a)
+        ]
+        return [  # _accum indexes [ti][tj][i] and takes the raw element
+            [
+                [_raw(runs[ti][i][tj // w][tj % w]) for i in range_constexpr(4)]
+                for tj in range_constexpr(self.n_tiles_b)
+            ]
+            for ti in range_constexpr(self.n_tiles_a)
+        ]
 
     def store(self, c_frag, base_row, base_col, prev=None):
         scale = self._scale()
@@ -1130,6 +1175,7 @@ class StoreCPerTensorQuadN(StoreCPerTensorPairN):
             prev = self.prefetch(base_row, base_col)
         rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
         col0 = base_col + (self.lane_id % 16) * self.n_tiles_b
+        run_ok = None if self.col_safe else col0 < self.c_cols  # a run is whole in or whole out
         for ti in range_constexpr(self.n_tiles_a):
             row_local = ti * 16 + (self.lane_id // 16) * 4  # relative to base_row
             vecs = [
@@ -1146,6 +1192,7 @@ class StoreCPerTensorQuadN(StoreCPerTensorPairN):
                     Vec.from_elements(dw, fx.Int32).bitcast(self.out_ty),
                     rsrc,
                     ((row_local + i) * self.c_cols + col0) * 2,  # i32-small within band
+                    mask=run_ok,
                     cache_modifier=self.store_aux,
                     offset_is_bytes=True,
                 )
