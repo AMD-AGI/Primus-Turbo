@@ -72,6 +72,7 @@ from flydsl.expr.typing import Vector as Vec
 _CSTORE_AUX = 2
 
 _PICK_RAMP_ITERS = 200  # throwaway launches before timing: the leading candidate else pays the ramp
+_PICK_PASSES = 3  # reversed round trips over the candidates; one does not resolve the dense bands
 
 
 @functools.lru_cache(maxsize=256)
@@ -2085,7 +2086,7 @@ def _dense_nt_wave4_asm(geom, k_iters, cbsz, blgp, fold, tr_b=False, b_kstep=_TN
     n_main = (k_iters // phases) * phases
     tail = k_iters - n_main
     assert n_main >= phases, "the NT whole-loop needs a K of at least one main-loop pass"
-    assert not (carry and tail), "a carried ring needs the trip to end on a whole pass"
+    n_spec = _nt4_spec_phases(k_iters, phases)
     pad = geom.pad
     ds_sep = f"\n{_TN4_ISSUE_PAD}\n" if "d" in pad else "\n"
     g2s_sep = f"\n{_TN4_ISSUE_PAD}\n" if "g" in pad else "\n"
@@ -2121,8 +2122,8 @@ def _dense_nt_wave4_asm(geom, k_iters, cbsz, blgp, fold, tr_b=False, b_kstep=_TN
     i_rsrc_a, i_rsrc_b = take(1)[0], take(1)[0]
     i_rsrc2 = [take(1)[0], take(1)[0]] if carry else []
     i_soff0 = take(npool)
-    cbuf = _nt4_carry_bufs(pools, carry)
-    i_pfsoff = [take(len(b)) for b in cbuf]
+    cbuf = _nt4_carry_bufs(pools, carry, k_iters, phases)
+    i_pfsoff = [dict(zip(b, take(len(b)))) for b in cbuf]
     i_gl = [gl[_tn4_gl_key(p)] for p in pools]
     i_rsrc = [(i_rsrc_a, i_rsrc_b)[p.side] for p in pools]
     i_pfrsrc = [i_rsrc2[p.side] for p in pools] if carry else []
@@ -2150,13 +2151,14 @@ def _dense_nt_wave4_asm(geom, k_iters, cbsz, blgp, fold, tr_b=False, b_kstep=_TN
         return "0" if init else f"${q}"
 
     def carried(p, left):
-        # Past the last phase a fill would fetch a K-block nothing reads; a successor takes it.
-        return carry and pools[p].nbuf > left
+        # Past the last phase a fill would fetch a K-block nothing reads; a successor takes it,
+        # but only from a phase the emitter peeled out of the shared main-loop body.
+        return carry and left <= min(pools[p].nbuf - 1, n_spec)
 
     def emit_g2s(wbuf, left):
         order = [(p, st) for st in range(pools[0].steps) for p in ap]
         order += [(p, st) for p in bp for st in range(pools[p].steps)]
-        assert all(not carried(p, left) or wbuf[p] < len(i_pfsoff[p]) for p, _st in order), (
+        assert all(not carried(p, left) or wbuf[p] in i_pfsoff[p] for p, _st in order), (
             "a carried fill must aim at a buffer the next tile top leaves alone"
         )
         return [
@@ -2199,7 +2201,9 @@ def _dense_nt_wave4_asm(geom, k_iters, cbsz, blgp, fold, tr_b=False, b_kstep=_TN
     tailp = [i for i, p in enumerate(pools) if p.nbuf > 2]
     assert tailp == list(range(npool - len(tailp), npool)), "deep pools must be issued last"
     assert all(phases % p.nbuf == 0 for p in pools), "a pass must end on every pool's buf 0"
-    n_out = sum(pools[i].steps for i in tailp)
+    # The tile top primes buffer-major, so the prologue may leave outstanding exactly the fills
+    # aimed past buffer 1; everything phase 0 reads has to have landed by then.
+    n_out = sum(p.steps * sum(1 for b in t if b > 1) for p, t in zip(pools, _nt4_top_bufs(pools, cbuf)))
 
     def n_flight(lf):
         """Fills the phase drain may leave outstanding: the trailing run nothing later waits on."""
@@ -2247,7 +2251,7 @@ def _dense_nt_wave4_asm(geom, k_iters, cbsz, blgp, fold, tr_b=False, b_kstep=_TN
             L += loop_block(n_main - phases)
         L += ["s_waitcnt vmcnt(0) lgkmcnt(0)", "s_barrier"]
         for j in range(tail - 1):
-            L += phase_block(j)
+            L += phase_block(j, left=(tail - 1 - j) if carry else None)
     else:
         _tl = phases - 1 if carry else None
         L += pass_block(True, n_main == phases, _tl if n_main == phases else None)
@@ -2333,9 +2337,27 @@ def _nt4_prime(pools, pool_lds, g2s, bufs, K, b_kstep, tr_b):
                 )
 
 
-def _nt4_carry_bufs(pools, carry):
-    """Buffers the closing phases hand on: all but the last, whose K-block this trip still reads."""
-    return [list(range(p.nbuf - 1)) if carry else [] for p in pools]
+def _nt4_spec_phases(k_iters, phases):
+    """Closing phases the emitter can specialise, counted as ``left`` (phases still to run, the
+    peel included). Everything before them sits in the shared main-loop body, which cannot carry
+    because it is entered once per pass."""
+    tail = k_iters % phases
+    return (tail - 1) if tail else (phases - 1)
+
+
+def _nt4_carry_bufs(pools, carry, k_iters, phases):
+    """Buffers the closing phases hand on. A phase whose fill would fetch a K-block past this
+    tile's end writes the successor's buffer instead; which buffer that is follows from the phase
+    index alone, so any K aligns as long as the tile top primes whichever one is left over."""
+    if not carry:
+        return [[] for _ in pools]
+    spec = _nt4_spec_phases(k_iters, phases)
+    return [sorted((k_iters - 1 - l) % p.nbuf for l in range(1, min(p.nbuf, spec + 1))) for p in pools]
+
+
+def _nt4_top_bufs(pools, cbuf):
+    """Buffers the tile top primes itself: whatever the closing phases did not hand over."""
+    return [[b for b in range(p.nbuf) if b not in c] for p, c in zip(pools, cbuf)]
 
 
 def _nt4_xpose_lds(p, lds, wave_id, n_waves):
@@ -2355,6 +2377,8 @@ def _dense_nt_wave4_tile(
     N,
     K,
     K_ITERS,
+    k_tail,
+    lane_id,
     NBM,
     NBN,
     group_m,
@@ -2392,7 +2416,7 @@ def _dense_nt_wave4_tile(
     pool_lds = [getattr(lds, f"p{i}") for i in range(len(pools))]
     n_waves = _tn4_nthr(geom) // 64
     carry = d_next is not None
-    cbuf = _nt4_carry_bufs(pools, carry)
+    cbuf = _nt4_carry_bufs(pools, carry, K_ITERS, _tn4_phases(geom))
     wargs = (M, N, K, NBM, NBN, group_m, group_n, num_xcd, geom, tr_b)
     bm_off, bn_off, win = _nt4_tile_window(d, *wargs)
 
@@ -2423,6 +2447,10 @@ def _dense_nt_wave4_tile(
     a_step = apool[0].tiles * bpool[0].tiles // (split * nfold)
     mfma = Mfma16x16x128(a_step, nfold)
     line_n = not fold and col_safe and nfold % 4 == 0
+    if fold:
+        # A folded store carries one column mask per lane run, so a run must never straddle
+        # N: every column origin the store is handed has to be a whole number of runs.
+        assert geom.bn % fold == 0 and (nfold * 16) % fold == 0 and (npg * bpool[0].width) % fold == 0
     store_c = (
         StoreCPerTensorQuadN
         if fold
@@ -2453,7 +2481,7 @@ def _dense_nt_wave4_tile(
 
     g2s = _nt4_g2s(A, B, win, pools, gl_off, wave_id)
     _lds_barrier()
-    top = [[p.nbuf - 1] if carry else list(range(p.nbuf)) for p in pools]
+    top = _nt4_top_bufs(pools, cbuf)
     _nt4_prime(pools, pool_lds, g2s, top, K, b_kstep, tr_b)
     wait_barrier(sum(p.steps * sum(1 for b in t if b) for p, t in zip(pools, top)))
 
@@ -2499,6 +2527,11 @@ def _dense_nt_wave4_tile(
     frag_ty = ir.Type.parse("vector<8xi32>")
     n_frag = sum(p.tiles for p in apool + bpool)
     frg = [Vec(_llvm.extractvalue(frag_ty, r, [nacc + f])) for f in range_constexpr(n_frag)]
+    # Both NT operands are K-contiguous, so a partial last K-block over-reads into the next
+    # row instead of past the SRD. Zeroing A's out-of-range K columns drops those terms.
+    if k_tail:
+        na = sum(p.tiles for p in apool)
+        frg[:na] = mask_a_tail(frg[:na], lane_id, k_tail)
     if store_c.stages_lds:
         _lds_barrier()
 
@@ -2584,15 +2617,18 @@ def _compile_dense_wave4(
     ring: bool = False,  # carry the pool fills across the tile boundary
 ):
     """Whole-loop dense NT (``tr_b=False``) or NN over ``geom``'s macro tile: a resident
-    workgroup per CU walks a column of tiles. K must be whole BLOCK_K blocks -- a partial one
-    would need the read-ahead to mask, and the 8-wave kernel carries the native K-tail."""
+    workgroup per CU walks a column of tiles. A partial last BLOCK_K block is fine: both
+    operands are K-contiguous, so its over-read lands in the next row rather than out of the
+    SRD, and the peel masks A's out-of-range K columns (see _dense_nt_wave4_tile)."""
     BM, BN = geom.bm, geom.bn
     NTHR = _tn4_nthr(geom)
     phases = _tn4_phases(geom)
     # The whole-line epilogue interleaves the n-fragments by permuting B's global row order,
-    # which a K-major B cannot be given; the fold must also divide the wave's n-extent.
+    # which a K-major B cannot be given; the fold must also divide the wave's n-extent. A
+    # ragged column window is fine as long as N is a whole number of runs: the folded store
+    # then masks per run, and the dropped runs' operands were never in range to begin with.
     _bt = sum(p.tiles for p in _tn4_pools(geom) if p.side == geom.gl_side)
-    fold = 0 if tr_b else (geom.fold if col_safe and _bt % geom.fold == 0 else 0)
+    fold = 0 if tr_b else (geom.fold if N % geom.fold == 0 and _bt % geom.fold == 0 else 0)
     _pools = _nt4_pools(geom, fold)
     NBM, NBN = ceildiv(M, BM), ceildiv(N, BN)
     n_tile = NBM * NBN
@@ -2601,10 +2637,12 @@ def _compile_dense_wave4(
     # in twice, so beta=1 gives up residency and takes one tile per group.
     tiles_per_wg = 1 if beta_is_one else ceildiv(n_tile, min(n_tile, _dense_num_cus()))
     n_wg = ceildiv(n_tile, tiles_per_wg)
-    K_ITERS = K // _TN4_BLOCK_K
-    assert K % _TN4_BLOCK_K == 0, "the dense whole loop has no K-tail path"
+    K_ITERS = ceildiv(K, _TN4_BLOCK_K)
+    K_TAIL = K % _TN4_BLOCK_K
     assert K_ITERS >= phases, "the dense whole loop needs a K of at least one main-loop pass"
-    carry = ring and K_ITERS % phases == 0
+    # The ring needs a closing phase outside the shared loop body to redirect, and a successor
+    # to redirect into: a beta=1 tile loop runs once, and K_ITERS%phases==1 peels nothing.
+    carry = ring and tiles_per_wg > 1 and _nt4_spec_phases(K_ITERS, phases) >= 1
     _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
 
     SharedStorage = fx.struct(
@@ -2648,6 +2686,8 @@ def _compile_dense_wave4(
             N=N,
             K=K,
             K_ITERS=K_ITERS,
+            k_tail=K_TAIL,
+            lane_id=lane_id,
             NBM=NBM,
             NBN=NBN,
             group_m=group_m,
@@ -2680,7 +2720,7 @@ def _compile_dense_wave4(
                 _pools,
                 [getattr(lds, f"p{i}") for i in range(len(_pools))],
                 _nt4_g2s(A, B, w0[2], _pools, gl_off, wave_id),
-                _nt4_carry_bufs(_pools, True),
+                _nt4_carry_bufs(_pools, True, K_ITERS, phases),
                 K,
                 _TN4_BLOCK_K * N if tr_b else _TN4_BLOCK_K,
                 tr_b,
@@ -2719,7 +2759,7 @@ def _compile_dense_wave4(
     return launch_dense_wave4
 
 
-_compile_dense_nt_wave4 = functools.partial(_compile_dense_wave4, tr_b=False, ring=False)
+_compile_dense_nt_wave4 = functools.partial(_compile_dense_wave4, tr_b=False, ring=True)
 _compile_dense_nn_wave4 = functools.partial(_compile_dense_wave4, tr_b=True, ring=True)
 
 
@@ -2811,16 +2851,18 @@ def _dense_race(cache, key, args, layout, builders, beta_is_one):
 
 
 def _pick_dense_candidate(cands, args):
-    """Fastest of ``cands`` = [[launch, cfg, compiled, factory], ...], sampled twice with the second
-    pass reversed and kept at its min, behind a throwaway pass: the leading candidates sit
-    closer than one sample's spread, so otherwise clock drift and warm-up do the ranking."""
+    """Fastest of ``cands`` = [[launch, cfg, compiled, factory], ...], sampled over reversed
+    passes and kept at its min, behind a throwaway pass: the leading candidates sit closer than
+    one sample's spread, so otherwise clock drift and warm-up do the ranking. One round trip of
+    a two-sample median does not resolve them -- it re-picked a different band on half the dense
+    shapes from run to run, which costs more than the bands are apart."""
     for _ in range(_PICK_RAMP_ITERS):
         cands[0][2](*args)
     torch.cuda.synchronize()
     order = list(range(len(cands)))
     ts = [float("inf")] * len(cands)
-    for i in order + order[::-1]:
-        ts[i] = min(ts[i], _robust_time(cands[i][2], args, warmup=2, reps=2, iters=40))
+    for i in (order + order[::-1]) * _PICK_PASSES:
+        ts[i] = min(ts[i], _robust_time(cands[i][2], args, warmup=2, reps=3, iters=40))
     return cands[min(order, key=ts.__getitem__)]
 
 
@@ -2948,7 +2990,7 @@ def _autotune_nt_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False, beta_is
     """NT candidates for the shape, raced on first call (see _dense_race). The 8-wave tiles are
     joined by the 4-wave whole-loop on the long-K shapes whose steady state pays for it."""
     pair_n, col_safe = N % 2 == 0 and not out_fp16, N % 256 == 0
-    w4 = K % _TN4_BLOCK_K == 0 and K // _TN4_BLOCK_K >= _NT4_MIN_K_ITERS
+    w4 = ceildiv(K, _TN4_BLOCK_K) >= _NT4_MIN_K_ITERS
     wide = 4 * 256 * K > _NT_BAND_L2_BYTES  # GROUP_M * BLOCK_M * K of the leading cfg
     builders = [
         (
