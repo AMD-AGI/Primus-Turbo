@@ -931,6 +931,57 @@ def test_low_level_gemm_accepts_the_k128_that_training_rejects():
         gemm_fp6(a, b)
 
 
+def test_bias_falls_back_to_a_separate_add_on_an_older_aiter():
+    """A bias must be honoured whether or not the installed aiter can fold it.
+
+    This is what lets callers pass a bias unconditionally, and lets Primus carry no aiter
+    version knowledge and no env var: the choice is made here, and both branches compute
+    the same thing. They are not bitwise equal, and that difference is the point -- the
+    fallback rounds to bf16 and then adds in bf16, where the epilogue adds into the fp32
+    accumulator and rounds once -- so the check is that each branch matches *its own*
+    reference exactly, rather than that the branches match each other.
+    """
+    _skip_if_unsupported()
+    from primus_turbo.pytorch.kernels.gemm import gemm_fp6_impl as impl_mod
+    from primus_turbo.pytorch.kernels.quantization import mxfp6_pack
+
+    if not mxfp6_pack.aiter_has_bias_epilogue():
+        pytest.skip("installed aiter has no bias epilogue, so there are not two paths to compare")
+
+    m = n = k = 256
+    a = torch.randn((m, k), dtype=torch.bfloat16, device="cuda:0")
+    b = torch.randn((n, k), dtype=torch.bfloat16, device="cuda:0")
+    a_p, a_s = quantize_mxfp6_row(a)
+    b_p, b_s = quantize_mxfp6_row(b)
+    bias = torch.randn((n,), dtype=torch.bfloat16, device="cuda:0")
+    g = ScalingGranularity.MX_BLOCKWISE.value
+
+    def run():
+        return torch.ops.primus_turbo.gemm_fp6_impl(a_p, a_s, b_p, b_s, m, n, k, torch.bfloat16, g, bias)
+
+    unbiased = torch.ops.primus_turbo.gemm_fp6_impl(a_p, a_s, b_p, b_s, m, n, k, torch.bfloat16, g, None)
+
+    fused = run()
+    assert not torch.equal(fused, unbiased), "the bias never reached the kernel"
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(impl_mod, "aiter_has_bias_epilogue", lambda: False)
+    try:
+        fallback = run()
+    finally:
+        monkeypatch.undo()
+
+    # The fallback is the pre-epilogue behaviour, so it must reproduce it exactly.
+    assert torch.equal(fallback, unbiased + bias)
+
+    # And the two branches must agree to within that one rounding step.
+    def ulp(t):
+        return torch.exp2(torch.floor(torch.log2(t.float().abs().clamp_min(1e-30))) - 7.0)
+
+    diff = (fused.float() - fallback.float()).abs()
+    assert bool((diff <= ulp(unbiased) + ulp(fallback)).all())
+
+
 # 1/sqrt(32) rounded to bf16, which is what the packer's Hadamard multiplies by. Exact
 # in binary (181 * 2**-10), so the model below stays exact too.
 _HADAMARD32_NORM = 0.1767578125
@@ -1227,6 +1278,99 @@ def test_check_aiter_a6w6_accepts_an_aiter_with_every_symbol(monkeypatch):
 
     monkeypatch.setattr(mxfp6_pack, "get_aiter", lambda: FakeAiter())
     assert mxfp6_pack._check_aiter_a6w6() == (True, "")
+
+
+@pytest.fixture
+def bias_epilogue_probe():
+    """Hand back the bias-epilogue probe with its cache cleared on both sides.
+
+    The probe is cached because the forward path calls it once per GEMM, so a test that
+    fakes an aiter would otherwise read a real answer cached by an earlier test -- or,
+    worse, leave a fake answer cached for a later one.
+    """
+    from primus_turbo.pytorch.kernels.quantization import mxfp6_pack
+
+    mxfp6_pack.aiter_has_bias_epilogue.cache_clear()
+    yield mxfp6_pack
+    mxfp6_pack.aiter_has_bias_epilogue.cache_clear()
+
+
+def test_bias_epilogue_probe_reads_the_signature_not_the_symbol(bias_epilogue_probe):
+    """The capability is a *parameter*, so the probe cannot be a ``hasattr`` check.
+
+    ``gemm_a6w6`` exists either way -- what an older aiter lacks is the ``bias`` argument
+    on it -- which is the whole reason this probe differs in kind from the symbol probe
+    above. A fake with the symbol but not the parameter is exactly the case that a
+    ``hasattr`` implementation would get wrong, and it is the case that actually ships.
+    """
+    mxfp6_pack = bias_epilogue_probe
+
+    class OldAiter:
+        @staticmethod
+        def gemm_a6w6(a, b, a_scale, b_scale, m, n, k):
+            return None
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(mxfp6_pack, "get_aiter", lambda: OldAiter())
+    assert mxfp6_pack.aiter_has_bias_epilogue() is False
+    monkeypatch.undo()
+
+    class NewAiter:
+        @staticmethod
+        def gemm_a6w6(a, b, a_scale, b_scale, m, n, k, bias=None):
+            return None
+
+    mxfp6_pack.aiter_has_bias_epilogue.cache_clear()
+    monkeypatch.setattr(mxfp6_pack, "get_aiter", lambda: NewAiter())
+    assert mxfp6_pack.aiter_has_bias_epilogue() is True
+    monkeypatch.undo()
+
+
+@pytest.mark.parametrize(
+    "fake_aiter",
+    [
+        pytest.param(ImportError, id="aiter-absent"),
+        pytest.param(object, id="no-gemm-a6w6"),
+        pytest.param(print, id="signature-not-introspectable"),
+    ],
+)
+def test_bias_epilogue_probe_answers_no_rather_than_raising(bias_epilogue_probe, fake_aiter, monkeypatch):
+    """Every way of failing to answer must come back False.
+
+    False is the safe answer: it costs one extra pass over the output and computes the
+    same thing. Raising, or answering True on a module the probe could not read, turns a
+    missing optimisation into a broken training run.
+    """
+    mxfp6_pack = bias_epilogue_probe
+
+    if fake_aiter is ImportError:
+
+        def get_aiter():
+            raise ImportError("aiter is not installed")
+
+    elif fake_aiter is object:
+        get_aiter = object
+    else:
+        # A builtin has no introspectable signature, which stands in for aiter exposing
+        # the entry point from a C extension.
+        get_aiter = lambda: type("CAiter", (), {"gemm_a6w6": print})  # noqa: E731
+
+    monkeypatch.setattr(mxfp6_pack, "get_aiter", get_aiter)
+    assert mxfp6_pack.aiter_has_bias_epilogue() is False
+
+
+def test_bias_epilogue_min_commit_is_a_full_sha():
+    """The constant is only useful if it can be fed to pip, which needs a full sha.
+
+    Same reason ``MXFP6_MIN_AITER_COMMIT`` is full-length: an abbreviated sha is not
+    resolvable by ``pip install git+...@`` and this is the only actionable form of the
+    requirement, since no version string contains it.
+    """
+    from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import (
+        MXFP6_BIAS_EPILOGUE_MIN_AITER_COMMIT as sha,
+    )
+
+    assert len(sha) == 40 and all(c in "0123456789abcdef" for c in sha)
 
 
 @pytest.mark.parametrize(
