@@ -2086,7 +2086,7 @@ def _dense_nt_wave4_asm(geom, k_iters, cbsz, blgp, fold, tr_b=False, b_kstep=_TN
     n_main = (k_iters // phases) * phases
     tail = k_iters - n_main
     assert n_main >= phases, "the NT whole-loop needs a K of at least one main-loop pass"
-    n_spec = _nt4_spec_phases(k_iters, phases)
+    n_spec = _nt4_spec_phases(k_iters, phases, max(p.nbuf for p in pools) if carry else 1)
     pad = geom.pad
     ds_sep = f"\n{_TN4_ISSUE_PAD}\n" if "d" in pad else "\n"
     g2s_sep = f"\n{_TN4_ISSUE_PAD}\n" if "g" in pad else "\n"
@@ -2246,9 +2246,14 @@ def _dense_nt_wave4_asm(geom, k_iters, cbsz, blgp, fold, tr_b=False, b_kstep=_TN
     # accumulating, sparing the zero-init; the closing phase is peeled the other way and
     # handed back, its mfma the window an occ=1 epilogue has nowhere else to sink into.
     if tail:
+        # One more pass out of the loop body when the K-tail alone peels fewer closing phases
+        # than the deepest pool has buffers to hand on (_nt4_spec_phases).
+        xtra = phases if n_spec > tail - 1 else 0
         L += pass_block(True, False)
-        if n_main > phases:
-            L += loop_block(n_main - phases)
+        if n_main > phases + xtra:
+            L += loop_block(n_main - phases - xtra)
+        if xtra:
+            L += pass_block(False, False, n_spec)
         L += ["s_waitcnt vmcnt(0) lgkmcnt(0)", "s_barrier"]
         for j in range(tail - 1):
             L += phase_block(j, left=(tail - 1 - j) if carry else None)
@@ -2337,12 +2342,17 @@ def _nt4_prime(pools, pool_lds, g2s, bufs, K, b_kstep, tr_b):
                 )
 
 
-def _nt4_spec_phases(k_iters, phases):
+def _nt4_spec_phases(k_iters, phases, deep=1):
     """Closing phases the emitter can specialise, counted as ``left`` (phases still to run, the
     peel included). Everything before them sits in the shared main-loop body, which cannot carry
-    because it is entered once per pass."""
+    because it is entered once per pass. A K-tail shorter than the deepest pool would leave that
+    pool short of carry, so one more pass is unrolled out of the loop whenever K can spare it."""
     tail = k_iters % phases
-    return (tail - 1) if tail else (phases - 1)
+    if not tail:
+        return phases - 1
+    if tail < deep and k_iters - tail >= 2 * phases:
+        return tail - 1 + phases
+    return tail - 1
 
 
 def _nt4_carry_bufs(pools, carry, k_iters, phases):
@@ -2351,7 +2361,7 @@ def _nt4_carry_bufs(pools, carry, k_iters, phases):
     index alone, so any K aligns as long as the tile top primes whichever one is left over."""
     if not carry:
         return [[] for _ in pools]
-    spec = _nt4_spec_phases(k_iters, phases)
+    spec = _nt4_spec_phases(k_iters, phases, max(p.nbuf for p in pools))
     return [sorted((k_iters - 1 - l) % p.nbuf for l in range(1, min(p.nbuf, spec + 1))) for p in pools]
 
 
@@ -2642,7 +2652,7 @@ def _compile_dense_wave4(
     assert K_ITERS >= phases, "the dense whole loop needs a K of at least one main-loop pass"
     # The ring needs a closing phase outside the shared loop body to redirect, and a successor
     # to redirect into: a beta=1 tile loop runs once, and K_ITERS%phases==1 peels nothing.
-    carry = ring and tiles_per_wg > 1 and _nt4_spec_phases(K_ITERS, phases) >= 1
+    carry = ring and tiles_per_wg > 1 and _nt4_spec_phases(K_ITERS, phases, max(p.nbuf for p in _pools)) >= 1
     _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
 
     SharedStorage = fx.struct(
