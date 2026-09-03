@@ -26,6 +26,12 @@ void quantize_tensorwise_amax_scale_impl(const FType *x, const int64_t n, const 
                                          float *amax, float *scale, float *scale_inv,
                                          float *workspace, hipStream_t stream);
 
+// Finalise a producer's partials instead of re-reading the tensor; a max is exact,
+// so the scale is bit-identical to the two-launch path.
+void tensorwise_scale_from_partials_impl(const float *partials, const int32_t count,
+                                         const float q_max, float *amax, float *scale,
+                                         float *scale_inv, hipStream_t stream);
+
 // *************** Quantize ***************
 template <typename FType, typename QType, typename ComputeType = float>
 void quantize_tensorwise_impl(const FType *x, const float *scale, QType *y, const int64_t n,
