@@ -1376,3 +1376,40 @@ def test_grouped_gemm_fp8_mx_fused_grad_accum(ori_dtype, backend):
         backend=backend,
         main_grad_dtype=main_grad_dtype,
     )
+
+
+@pytest.mark.gfx1250
+@pytest.mark.parametrize("granularity", [ScalingGranularity.TENSORWISE, ScalingGranularity.ROWWISE])
+@pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
+@pytest.mark.parametrize("NK", [(4096, 4096), (4096, 2048), (1024, 1024)])
+def test_grouped_gemm_fp8_tn_no_nan(NK, format, granularity):
+    """Regression: the TN (trans_b=True) FP8 grouped GEMM must not produce NaN.
+
+    gfx1250 selected BLOCK_K=128 for the TN layout and miscompiled at that tile size,
+    emitting NaN at every output column divisible by 8 from finite inputs. Marked
+    ``gfx1250`` so it survives the whole-suite skip for that arch.
+    """
+    device = "cuda:0"
+    B, M = 32, 32
+    N, K = NK
+    torch.manual_seed(42)
+
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=True).to(device)
+    a = torch.randn((B * M, K), dtype=torch.bfloat16, device=device)
+    b = torch.randn((B, N, K), dtype=torch.bfloat16, device=device)  # [B, N, K] => TN
+
+    config = Float8QuantConfig(format=format, granularity=granularity)
+    out = grouped_gemm_fp8(a, b, group_lens, trans_b=True, config=config)
+
+    bad = ~torch.isfinite(out)
+    if bad.any():
+        cols = torch.nonzero(bad.any(dim=0)).flatten()
+        pytest.fail(
+            f"{int(bad.sum())} non-finite values from finite inputs; "
+            f"{cols.numel()} columns affected, all divisible by 8: "
+            f"{bool((cols % 8 == 0).all())}"
+        )
+
+    out_ref = grouped_gemm_ref(a, b, group_lens, True)
+    snr_threshold = 25 if format == Format.E4M3 else 20
+    assert compute_snr(out_ref, out) > snr_threshold, "out_snr too low"
