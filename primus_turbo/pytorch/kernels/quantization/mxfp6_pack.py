@@ -38,6 +38,8 @@ one. Comparisons against the old path call ``aiter.quant_mxfp6_gemm`` directly, 
 the better oracle anyway -- it does not route through the code under test.
 """
 
+import functools
+import inspect
 from typing import Optional, Tuple
 
 import torch
@@ -88,9 +90,46 @@ _MISSING_PACKER_HINT = (
     "build configured for other archs cannot pack MXFP6 even when it runs on gfx950."
 )
 
+# The A6W6 bias epilogue landed later still, so it is a *second* and independent aiter
+# capability: an aiter new enough for MXFP6 at all may predate it. It is optional rather
+# than required, because it is an optimisation -- an aiter without it computes the same
+# result one extra pass over the output, which is what MXFP6 did before it existed. So
+# unlike _A6W6_REQUIRED_ATTRS this is not part of check_mxfp6_support; a missing bias
+# epilogue must not make MXFP6 report itself unsupported.
+MXFP6_BIAS_EPILOGUE_MIN_AITER_COMMIT = "08481f1b22e7ea28b59223ee2e7f857f6a4677bb"
+
 
 def _ceil(x: int, m: int) -> int:
     return -(-x // m) * m
+
+
+@functools.lru_cache(maxsize=1)
+def aiter_has_bias_epilogue() -> bool:
+    """Whether ``aiter.gemm_a6w6`` can fold a bias into its store epilogue.
+
+    Probed rather than version-checked for the same reason ``_check_aiter_a6w6`` probes:
+    no version string can express "contains commit X". Probed by *parameter* rather than
+    by symbol, because the entry point is the same one either way -- what changed is its
+    signature -- so ``hasattr`` cannot tell the two apart.
+
+    Cached because the answer cannot change within a process and the forward path asks
+    once per GEMM: ``inspect.signature`` costs more than it looks, and a Flux 12B step
+    makes a few hundred of these calls. Tests that fake an aiter must ``cache_clear()``.
+    """
+    try:
+        aiter = get_aiter()
+    except ImportError:
+        return False
+    fn = getattr(aiter, "gemm_a6w6", None)
+    if fn is None:
+        return False
+    try:
+        return "bias" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        # A C extension, or a wrapper with no introspectable signature. Answering "no"
+        # costs one pass over the output; answering "yes" wrongly is a TypeError at the
+        # first GEMM, so the conservative answer is the correct one here.
+        return False
 
 
 def _check_aiter_a6w6() -> Tuple[bool, str]:

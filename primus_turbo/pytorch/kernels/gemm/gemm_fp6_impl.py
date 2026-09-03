@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""MXFP6 (E2M3) GEMM: ``out[M, N] = A[M, K] @ B[N, K].T``.
+"""MXFP6 (E2M3) GEMM: ``out[M, N] = A[M, K] @ B[N, K].T (+ bias[N])``.
 
 The signature deliberately diverges from ``gemm_fp4_impl``. FP4 passes strided operands
 plus separate scales and derives M/N/K from the shapes, with ``trans_a`` / ``trans_b``
@@ -22,6 +22,12 @@ selecting a layout. Here both operands are opaque 1-D blobs in AITER's
 AITER is the only backend. HipBLASLt has no MXFP6 entry point, and FlyDSL cannot express
 an FP6 B operand at all (its ``b_dtype`` branches only fp8-or-fp4, so a "fp6" B silently
 takes the fp4 path) -- it is A6W4, never A6W6.
+
+The optional ``bias`` is folded into the A6W6 store epilogue, where it is free: that asm
+is store-bound rather than VALU-bound, so it saves the whole of the separate elementwise
+pass a caller would otherwise do. Whether the installed aiter can do this is a capability
+we probe, not a switch we expose -- an older aiter gets the separate pass added here, so
+callers pass a bias unconditionally and never branch on aiter's version themselves.
 """
 
 import torch
@@ -40,7 +46,10 @@ from primus_turbo.pytorch.core.low_precision import (
     ScalingGranularity,
 )
 from primus_turbo.pytorch.core.utils import is_gfx950_device
-from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import mxfp6_pack_sizes
+from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import (
+    aiter_has_bias_epilogue,
+    mxfp6_pack_sizes,
+)
 
 _torch_custom_op_wrapper = torch.library.custom_op
 
@@ -92,9 +101,22 @@ class GEMMFP6AITERBackend(KernelBackend):
         k: int,
         out_dtype: torch.dtype,
         granularity: ScalingGranularity,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del out_dtype, granularity  # already gated by can_handle
-        return get_aiter().gemm_a6w6(a, b, a_scale, b_scale, m, n, k)
+        aiter = get_aiter()
+        if bias is None:
+            # Kept as a call with no bias argument at all, rather than bias=None, so that
+            # an aiter predating the epilogue takes exactly the path it always did.
+            return aiter.gemm_a6w6(a, b, a_scale, b_scale, m, n, k)
+        if not aiter_has_bias_epilogue():
+            # Same result, one extra pass over the output: this is what MXFP6 did before
+            # the epilogue existed. Adding in bf16 after the GEMM rounds twice where the
+            # epilogue rounds once, so the two differ by up to a last-bit step -- the
+            # epilogue being the more accurate. That is a property of which aiter is
+            # installed, not of anything the caller chose, so it is not switchable here.
+            return aiter.gemm_a6w6(a, b, a_scale, b_scale, m, n, k) + bias
+        return aiter.gemm_a6w6(a, b, a_scale, b_scale, m, n, k, bias=bias)
 
 
 _GEMM_FP6_BACKENDS = {
@@ -175,9 +197,12 @@ def gemm_fp6_impl(
     k: int,
     out_dtype: torch.dtype,
     granularity: int,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     granularity_enum = ScalingGranularity(granularity)
     _validate_blobs(a, a_scale, b, b_scale, m, n, k)
+    if bias is not None and (bias.dim() != 1 or bias.numel() != n):
+        raise ValueError(f"MXFP6 GEMM bias must be a 1D tensor of length N={n}, got {tuple(bias.shape)}.")
     backend = _resolve_backend()
     impl = _GEMM_FP6_BACKENDS[backend].impl
 
@@ -199,7 +224,9 @@ def gemm_fp6_impl(
             f"a bf16 output, MX_BLOCKWISE scaling, and M/N a multiple of "
             f"{MXFP6_TILE_SIZE} with K a multiple of {MXFP6_K_TILE_SIZE}."
         )
-    return impl.execute(**kwargs)
+    # bias is not part of the can_handle key: it is added in the store epilogue and does not
+    # change which shapes a backend supports.
+    return impl.execute(**kwargs, bias=bias)
 
 
 @gemm_fp6_impl.register_fake
@@ -213,6 +240,7 @@ def gemm_fp6_impl_meta(
     k: int,
     out_dtype: torch.dtype,
     granularity: int,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # Pure arithmetic on purpose: this must not reach into AITER, whose kernel
     # selection does lru_cached pandas lookups that SymInts would break.
