@@ -71,6 +71,10 @@ from flydsl.expr.typing import Vector as Vec
 
 # `nt` aux bit: C is write-once, so caching it evicts the A/B band the L2 swizzle keeps.
 _CSTORE_AUX = 2
+# `sc0|sc1|nt`: device scope on top, for an epilogue every workgroup reaches at the same
+# instant. Only pays when the burst is actually contended -- see _cstore_aux.
+_CSTORE_AUX_BURST = 19
+_CSTORE_BURST_FILL = (7, 8)  # least CU fill, as a fraction, at which the wide scope wins
 
 _PICK_RAMP_ITERS = 200  # throwaway launches before timing: the leading candidate else pays the ramp
 _PICK_PASSES = 3  # reversed round trips over the candidates; one does not resolve the dense bands
@@ -1874,6 +1878,17 @@ def _dense_num_cus():
     return _NUM_CUS
 
 
+def _cstore_aux(beta_is_one, tiles_per_wg, n_wg):
+    """C store cache policy. One tile per workgroup lands every epilogue in the same instant, so
+    a beta=1 tile's read-modify-write arrives device-wide as one burst with no successor tile to
+    hide it behind; past ~7/8 CU fill that burst outruns the near cache and the wider store scope
+    measures faster. Below it the idle CUs absorb the burst and the longer path only costs."""
+    num, den = _CSTORE_BURST_FILL
+    if beta_is_one and tiles_per_wg == 1 and n_wg * den >= _dense_num_cus() * num:
+        return _CSTORE_AUX_BURST
+    return _CSTORE_AUX
+
+
 def _compile_dense_tn_wave4(
     M: int,
     N: int,
@@ -2049,6 +2064,16 @@ _NT4_RECT = _Tn4Geom(
     mstep=2,
     drain_lgkm=6,
 )
+# A block the extent does not divide still issues its dead quadrants' mfma: only the operand
+# fetches and the stores are dropped, by the num_records clamp. So an extent with a smaller
+# exact tile is better served by it, and the freed work shortens every workgroup's own path
+# rather than idling some -- 2880 rows are 15 of these against 11.25 of the square's.
+_NT4_M192 = _NT4_SQUARE._replace(
+    bm=192,
+    pools=((0, 96, 2), (0, 96, 2), (1, 128, 3), (1, 128, 3)),
+    mstep=3,  # still one whole accumulator block per issue step, as above: mstep == nt
+)
+_NT4_GEOMS = (_NT4_SQUARE, _NT4_M192)
 _NT4_ASM_CACHE: dict = {}
 _NT4_BAND = 64  # B rows one wave's four n-fragments span in a pool
 
@@ -2089,6 +2114,32 @@ def _nt4_pools(geom, fold):
         p.gq = i % npg
         p.gcol = p.col - p.gq * p.width
     return pools
+
+
+def _nt4_wg_path(M, N, geom, beta_is_one, ncu):
+    """(workgroups, mfma a workgroup issues per K block) of the whole loop over ``geom``. The
+    second is the critical path every workgroup walks, which is what the wall follows: freeing
+    work on only some of them returns about half as much (the idle CUs come back as clock)."""
+    n_tile = ceildiv(M, geom.bm) * ceildiv(N, geom.bn)
+    tiles_per_wg = 1 if beta_is_one else ceildiv(n_tile, min(n_tile, ncu))
+    pools = _tn4_pools(geom)
+    nacc = sum(p.tiles for p in pools if p.side == 0) * sum(p.tiles for p in pools if p.side == 1)
+    return ceildiv(n_tile, tiles_per_wg), tiles_per_wg * nacc
+
+
+def _nt4_geom(M, N, beta_is_one):
+    """Macro tile for the shape: the square one, unless a smaller tile divides both extents
+    exactly, still fits the CUs in one pass, and leaves every workgroup a shorter path."""
+    ncu = _dense_num_cus()
+    best = _NT4_SQUARE
+    path = _nt4_wg_path(M, N, best, beta_is_one, ncu)[1]
+    for g in _NT4_GEOMS[1:]:
+        if M % g.bm or N % g.bn:  # a tile the shape pads gains nothing by being smaller
+            continue
+        wg, p = _nt4_wg_path(M, N, g, beta_is_one, ncu)
+        if wg <= ncu and p < path:
+            best, path = g, p
+    return best
 
 
 def _nt4_fold_gl_off(lane_id, wave_id, K, n_rounds, gq, fold):
@@ -2752,7 +2803,7 @@ def _compile_dense_wave4(
     group_n: int = 0,
     num_xcd: int = 8,
     raster: int = -1,  # aligned per-step XCD window, win_m block rows; -1 = pick, 0 = GROUP_M
-    geom=_NT4_SQUARE,
+    geom=None,  # None = pick the macro tile the shape divides best, see _nt4_geom
     cbsz: int = 0,  # srcA fp8 fmt: 0=E4M3, 1=E5M2
     blgp: int = 0,  # srcB fp8 fmt: 0=E4M3, 1=E5M2
     out_fp16: bool = False,
@@ -2766,6 +2817,7 @@ def _compile_dense_wave4(
     workgroup per CU walks a column of tiles. A partial last BLOCK_K block is fine: both
     operands are K-contiguous, so its over-read lands in the next row rather than out of the
     SRD, and the peel masks A's out-of-range K columns (see _dense_nt_wave4_tile)."""
+    geom = geom or _nt4_geom(M, N, beta_is_one)
     BM, BN = geom.bm, geom.bn
     NTHR = _tn4_nthr(geom)
     phases = _tn4_phases(geom)
@@ -2848,7 +2900,7 @@ def _compile_dense_wave4(
             num_xcd=num_xcd,
             raster=raster,
             n_wg=n_wg,
-            store_aux=_CSTORE_AUX,
+            store_aux=_cstore_aux(beta_is_one, tiles_per_wg, n_wg),
             lds=lds,
             geom=geom,
             A=A,
