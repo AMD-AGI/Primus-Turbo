@@ -74,7 +74,12 @@ _CSTORE_AUX = 2
 # `sc0|sc1|nt`: device scope on top, for an epilogue every workgroup reaches at the same
 # instant. Only pays when the burst is actually contended -- see _cstore_aux.
 _CSTORE_AUX_BURST = 19
-_CSTORE_BURST_FILL = (7, 8)  # least CU fill, as a fraction, at which the wide scope wins
+# C bytes in one device-wide beta=1 burst at or above which the wide scope wins. Measured over
+# three macro tiles and four workgroup counts: 22.5 / 24.0 MiB cost +0.4 / +2.2%, while
+# 28.0 / 30.0 / 32.0 MiB win 1.2 / 2.0 / 4.7%. Per XCD the crossover is ~3.3 MiB of C against
+# an 8 MiB L2 slice, i.e. the point where the burst stops fitting beside the operand band.
+_CSTORE_BURST_BYTES = 26 << 20
+_CSTORE_OUT_BYTES = 2  # both output dtypes are 16-bit; C's bytes per element
 
 _PICK_RAMP_ITERS = 200  # throwaway launches before timing: the leading candidate else pays the ramp
 _PICK_PASSES = 3  # reversed round trips over the candidates; one does not resolve the dense bands
@@ -1878,13 +1883,14 @@ def _dense_num_cus():
     return _NUM_CUS
 
 
-def _cstore_aux(beta_is_one, tiles_per_wg, n_wg):
+def _cstore_aux(beta_is_one, tiles_per_wg, n_wg, tile_bytes):
     """C store cache policy. One tile per workgroup lands every epilogue in the same instant, so
     a beta=1 tile's read-modify-write arrives device-wide as one burst with no successor tile to
-    hide it behind; past ~7/8 CU fill that burst outruns the near cache and the wider store scope
-    measures faster. Below it the idle CUs absorb the burst and the longer path only costs."""
-    num, den = _CSTORE_BURST_FILL
-    if beta_is_one and tiles_per_wg == 1 and n_wg * den >= _dense_num_cus() * num:
+    hide it behind. Once that burst outgrows the L2 it outruns the near cache and the wider store
+    scope measures faster; below it the cache absorbs the burst and the longer path only costs.
+    The predicate is the burst's bytes, not the CU fill: two 240-workgroup beta=1 shapes land on
+    opposite sides of it because their macro tiles carry different amounts of C."""
+    if beta_is_one and tiles_per_wg == 1 and n_wg * tile_bytes >= _CSTORE_BURST_BYTES:
         return _CSTORE_AUX_BURST
     return _CSTORE_AUX
 
@@ -2073,7 +2079,24 @@ _NT4_M192 = _NT4_SQUARE._replace(
     pools=((0, 96, 2), (0, 96, 2), (1, 128, 3), (1, 128, 3)),
     mstep=3,  # still one whole accumulator block per issue step, as above: mstep == nt
 )
-_NT4_GEOMS = (_NT4_SQUARE, _NT4_M192)
+# The same on both axes at once, for a shape neither extent divides: 5120 rows are 16 of
+# these and 2880 columns 15, against 20 and 11.25 of the square's. The workgroup count is
+# unchanged, so the shorter path (64 accumulators to 60) comes off every one of them rather
+# than idling some, and bm+bn is still 512 so a K block moves the same operand bytes. Six
+# n-fragments do not divide the epilogue's fold, so the store is the paired one; no tile
+# that divides 2880 can avoid that, since a fold of four needs a B group of 128 columns and
+# 2880 has no divisor that is a multiple of 128.
+_NT4_W320 = _NT4_SQUARE._replace(
+    bm=320,
+    bn=192,
+    pools=((0, 160, 2), (0, 160, 2), (1, 192, 3)),
+    bstep=6,
+    mstep=5,  # still one whole accumulator block per issue step, as above: mstep == nt
+    # One store unit per fragment row. A coarser split holds a whole quadrant's beta=1
+    # read-back live at once, which is 120 values here and spills; this keeps it to 24.
+    store_split_flat=5,
+)
+_NT4_GEOMS = (_NT4_SQUARE, _NT4_M192, _NT4_W320)
 _NT4_ASM_CACHE: dict = {}
 _NT4_BAND = 64  # B rows one wave's four n-fragments span in a pool
 
@@ -2900,7 +2923,7 @@ def _compile_dense_wave4(
             num_xcd=num_xcd,
             raster=raster,
             n_wg=n_wg,
-            store_aux=_cstore_aux(beta_is_one, tiles_per_wg, n_wg),
+            store_aux=_cstore_aux(beta_is_one, tiles_per_wg, n_wg, BM * BN * _CSTORE_OUT_BYTES),
             lds=lds,
             geom=geom,
             A=A,
