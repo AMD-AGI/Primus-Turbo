@@ -24,14 +24,15 @@ from primus_turbo.pytorch.core.backend import (
     KernelBackend,
     TuneCache,
 )
+from primus_turbo.pytorch.kernels.fused_mega_moe.staged_contract import (
+    BF16_HANDLE_SCHEMA,
+)
 
 _SUPPORTED_DTYPES = (torch.bfloat16,)
 
 # dispatch handle layout (see dispatch_prologue return + pool_src_slot snapshot):
 # 0-5 send/dispatch tables + tile_to_expert, 6 real_count_per_expert,
 # 7 num_tokens_per_expert_prefix, 8 num_tile_blocks, 9-11 combine_recv_*, 12 pool_src_slot.
-_HANDLE_LEN = 13
-_H_NUM_TILE_BLOCKS = 8
 
 
 class FusedMegaMoEForwardFlyDSLBackend(KernelBackend):
@@ -77,7 +78,10 @@ class FusedMegaMoEForwardFlyDSLBackend(KernelBackend):
         )
 
         # bound swiglu by THIS handle's tile count (per-forward, not shared symm)
-        act = swiglu_flydsl_kernel(l1_out, num_tile_blocks=handle[_H_NUM_TILE_BLOCKS])
+        act = swiglu_flydsl_kernel(
+            l1_out,
+            num_tile_blocks=BF16_HANDLE_SCHEMA.get(handle, "tile_count"),
+        )
 
         # fused grouped L2 GEMM + combine PUSH + topk reduce
         y, _ = grouped_gemm_combine_bf16_flydsl_kernel(
@@ -90,7 +94,7 @@ class FusedMegaMoEForwardFlyDSLBackend(KernelBackend):
         )
 
         # ABI guard: catch a kernel return-order change loudly.
-        assert len(handle) == _HANDLE_LEN, f"dispatch handle len {len(handle)} != {_HANDLE_LEN}; ABI changed"
+        BF16_HANDLE_SCHEMA.validate(handle)
         return (
             y,
             l1_out,
@@ -197,7 +201,7 @@ def _fused_mega_moe_forward_meta(
         i32(),  # 9-11 combine_recv_dst_rank/start_row/count
         i32(),  # 12 pool_src_slot
     ]
-    assert len(handle) == _HANDLE_LEN
+    BF16_HANDLE_SCHEMA.validate(handle)
     return y, l1_out, dispatch_weights_in_buf, handle
 
 

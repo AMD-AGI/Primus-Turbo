@@ -19,11 +19,9 @@ from primus_turbo.flydsl.utils.swiglu_kernel import (
     swiglu_backward_flydsl_kernel,
     swiglu_flydsl_kernel,
 )
-
-# dispatch handle layout (see dispatch_prologue ABI).
-_H_NUM_TILE_BLOCKS = 8
-_H_REAL_COUNT_PER_EXPERT = 6
-_H_NUM_TOKENS_PER_EXPERT_PREFIX = 7
+from primus_turbo.pytorch.kernels.fused_mega_moe.staged_contract import (
+    BF16_HANDLE_SCHEMA,
+)
 
 
 def fused_mega_moe_stage2_forward_impl(
@@ -37,7 +35,11 @@ def fused_mega_moe_stage2_forward_impl(
     topk_idx = topk_idx.to(torch.int64)
 
     # bound swiglu by THIS handle's tile count (per-forward, not shared symm)
-    act = swiglu_flydsl_kernel(l1_out, num_tile_blocks=handle[_H_NUM_TILE_BLOCKS])
+    handle = BF16_HANDLE_SCHEMA.validate(handle)
+    act = swiglu_flydsl_kernel(
+        l1_out,
+        num_tile_blocks=BF16_HANDLE_SCHEMA.get(handle, "tile_count"),
+    )
 
     # fused grouped L2 GEMM + combine PUSH + topk reduce
     y, _ = grouped_gemm_combine_bf16_flydsl_kernel(
@@ -60,8 +62,9 @@ def fused_mega_moe_stage2_backward_impl(
     group,
 ):
     """L2 dgrad (nn) + SwiGLU^T + dW2. Returns ``(grad_l1, grad_gate, dW2)``."""
-    real_count_per_expert = handle[_H_REAL_COUNT_PER_EXPERT]
-    num_tokens_per_expert_prefix = handle[_H_NUM_TOKENS_PER_EXPERT_PREFIX]
+    handle = BF16_HANDLE_SCHEMA.validate(handle)
+    real_count_per_expert = BF16_HANDLE_SCHEMA.get(handle, "real_count_per_expert")
+    num_tokens_per_expert_prefix = BF16_HANDLE_SCHEMA.get(handle, "group_offsets")
 
     dy = grad_y.contiguous().to(torch.bfloat16)
 
@@ -81,7 +84,7 @@ def fused_mega_moe_stage2_backward_impl(
         scale=dispatch_weights,
         return_gate=True,
         return_act_w=True,
-        num_tile_blocks=handle[_H_NUM_TILE_BLOCKS],
+        num_tile_blocks=BF16_HANDLE_SCHEMA.get(handle, "tile_count"),
     )
 
     # dW2 = dispatched(dy)^ @ act_weighted (variable-K)

@@ -4,17 +4,21 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Mega MoE autograd ops with an MXFP8 forward and a partial-fp8 backward.
+"""Mega MoE staged autograd ops with an MXFP8 forward and backward.
 
-The fp8 counterpart of ``fused_mega_moe``, with the same two entry points:
+The production MXFP8 API is split at ``l1`` (pre-SwiGLU):
 
-  * ``fused_mega_moe_fp8`` -- one fully fused op (dispatch+fc1+SwiGLU+fc2+combine).
-  * ``fused_mega_moe_fp8_stage1`` / ``fused_mega_moe_fp8_stage2`` -- the same math split into two
-    autograd edges at ``l1`` (pre-SwiGLU), so w1 and w2 can be separate DDP gradient boundaries.
-    Stage state rides a ``_Fp8StageState`` side channel rather than the ops' args/returns.
+  * ``fused_mega_moe_fp8_stage1`` owns dispatch + fc1 and ``w1``.
+  * ``fused_mega_moe_fp8_stage2`` owns SwiGLU + fc2 + combine and ``w2``.
 
-Pass ``w1`` / ``w2`` as the high-precision weights; their mxfp8 quant is maintained inside the
-impls, keyed on ``w._version``. The op is NOT CUDA-graph capturable.
+The shared ``StageState`` contract carries the logical route state while the
+MXFP8-specific payload carries quantized backward operands. A fully fused
+MXFP8 entry point is intentionally not exported until its dW1 pool lifetime
+race is removed.
+
+Pass ``w1`` / ``w2`` as high-precision weights; their MXFP8 packs are
+maintained by the generation-aware weight cache. The op is not CUDA-graph
+capturable.
 """
 
 from typing import Optional
@@ -27,6 +31,11 @@ from primus_turbo.pytorch.kernels.fused_mega_moe import (
     fused_mega_moe_stage1_forward_fp8_impl,
     fused_mega_moe_stage2_backward_fp8_impl,
     fused_mega_moe_stage2_forward_fp8_impl,
+)
+from primus_turbo.pytorch.kernels.fused_mega_moe.staged_contract import (
+    MegaMoEPrecision,
+    StageState,
+    make_route_state,
 )
 
 # This op file exports only its own final API (the autograd Function + its wrapper). Everything else
@@ -43,8 +52,8 @@ __all__ = [
 ]
 
 
-class _Fp8StageState:
-    """Side channel carrying non-differentiable fp8 operands between stage1 and stage2.
+class _Fp8StageState(StageState):
+    """MXFP8 payload carried between the two staged autograd edges.
 
     The bf16 split threads everything through op args/returns, but the fp8 backward cannot: its
     fused SwiGLU^T emits grad_l1 ONLY as the two quantized operands the L1 dgrad and dW1 consume
@@ -63,6 +72,7 @@ class _Fp8StageState:
     __slots__ = ("pool_x_colwise", "colwise_meta", "grad_l1_rowwise_fp8", "grad_l1_colwise_fp8")
 
     def __init__(self):
+        super().__init__(MegaMoEPrecision.MXFP8)
         self.pool_x_colwise = None
         self.colwise_meta = None
         self.grad_l1_rowwise_fp8 = None
@@ -109,6 +119,7 @@ class FusedMegaMoEFP8Stage1Function(torch.autograd.Function):
                 topk_weights,
                 save_bwd=save_bwd,
             )
+            state.set_route(make_route_state(MegaMoEPrecision.MXFP8, dispatch_weights, handle))
             state.pool_x_colwise = pool_x_colwise
             state.colwise_meta = colwise_meta
 
@@ -137,6 +148,8 @@ class FusedMegaMoEFP8Stage1Function(torch.autograd.Function):
             state = ctx.state
             if state.grad_l1_rowwise_fp8 is None:  # stage2.backward never ran -> nothing to do
                 return (None,) * 6
+            route = state.require_route()
+            route.assert_same_handle(ctx.handle)
             (w1,) = ctx.saved_tensors
 
             dx, grad_topk_weights, dW1 = fused_mega_moe_stage1_backward_fp8_impl(
@@ -146,7 +159,7 @@ class FusedMegaMoEFP8Stage1Function(torch.autograd.Function):
                 state.pool_x_colwise,
                 state.colwise_meta,
                 w1,
-                ctx.handle,
+                route.handle,
                 ctx.group,
                 ctx.topk_idx,
                 ctx.num_tokens,
@@ -178,6 +191,7 @@ class FusedMegaMoEFP8Stage2Function(torch.autograd.Function):
                 "w2 must be a 3D bf16 CUDA tensor"
             )
             handle = tuple(handle)
+            state.require_route().assert_same_handle(handle)
 
             y = fused_mega_moe_stage2_forward_fp8_impl(
                 l1,
@@ -209,6 +223,8 @@ class FusedMegaMoEFP8Stage2Function(torch.autograd.Function):
                 return (None,) * n_in
             l1, dispatch_weights, w2 = ctx.saved_tensors
             state = ctx.state
+            route = state.require_route()
+            route.assert_same_handle(handle)
 
             (
                 grad_l1_rowwise_fp8,
@@ -220,7 +236,7 @@ class FusedMegaMoEFP8Stage2Function(torch.autograd.Function):
                 l1,
                 dispatch_weights,
                 w2,
-                handle,
+                route.handle,
                 ctx.group,
                 state.colwise_meta,
             )

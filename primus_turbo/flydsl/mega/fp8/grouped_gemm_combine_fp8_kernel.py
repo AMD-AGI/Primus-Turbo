@@ -11,14 +11,12 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""Fused BF16 GEMM (mxfp8 epilogue quant) + FP8 combine PUSH + FP8-dequant reduce (FlyDSL).
+"""MXFP8 GEMM + FP8 combine PUSH + FP8-dequant reduce (FlyDSL).
 
-EXPERIMENTAL DEAD-END (not wired into any forward path). Bit-correct (cos 0.9996 vs bf16 fused)
-but ~0.76x (slower) than `grouped_gemm_combine_bf16`, and has an intermittent reduce-flag liveness
-stall under back-to-back timing calls. Kept only as a reference for the exhausted fp8-L2-combine
-approach. See NOTES_mxfp8_fused_gemm_combine_perf.md: the mxfp8 quant of the L2 GEMM output is
-expensive compute wherever placed (combine / separate role / this epilogue) and exceeds the combine
-byte-savings, so fp8 gives no fused-L2 win. Production L2 = bf16 fused; use fp8 at L1 only.
+This backend is used by the staged MXFP8 MegaMoE path for the L2 forward and
+L1 backward-dgrad directions. It remains a separate precision-specific kernel
+because its epilogue, FP8 payload layout and reduce protocol differ from the
+BF16 combine kernel.
 
 3-role L2 down-proj pipeline. The GEMM epilogue quantizes its f32 MFMA accumulators to
 mxfp8 (per-1x32 E8M0) IN-REGISTER via a 32-lane butterfly amax (a 32x32 MFMA tile == one

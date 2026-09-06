@@ -27,16 +27,15 @@ from primus_turbo.pytorch.core.backend import (
     KernelBackend,
     TuneCache,
 )
+from primus_turbo.pytorch.kernels.fused_mega_moe.staged_contract import (
+    BF16_HANDLE_SCHEMA,
+)
 
 _SUPPORTED_DTYPES = (torch.bfloat16,)
 
 # dispatch handle layout (see dispatch_prologue return + pool_src_slot snapshot):
 # 0-5 send/dispatch tables + tile_to_expert, 6 real_count_per_expert,
 # 7 num_tokens_per_expert_prefix, 8 num_tile_blocks, 9-11 combine_recv_*, 12 pool_src_slot.
-_HANDLE_LEN = 13
-_H_NUM_TILE_BLOCKS = 8
-_H_REAL_COUNT_PER_EXPERT = 6
-_H_NUM_TOKENS_PER_EXPERT_PREFIX = 7
 
 
 class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
@@ -72,9 +71,9 @@ class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
     ):
 
         # ABI guard: catch a kernel return-order change loudly.
-        assert len(handle) == _HANDLE_LEN, f"dispatch handle len {len(handle)} != {_HANDLE_LEN}; ABI changed"
-        real_count_per_expert = handle[_H_REAL_COUNT_PER_EXPERT]
-        num_tokens_per_expert_prefix = handle[_H_NUM_TOKENS_PER_EXPERT_PREFIX]
+        handle = BF16_HANDLE_SCHEMA.validate(handle)
+        real_count_per_expert = BF16_HANDLE_SCHEMA.get(handle, "real_count_per_expert")
+        num_tokens_per_expert_prefix = BF16_HANDLE_SCHEMA.get(handle, "group_offsets")
         in_handle = tuple(handle)
 
         # int64 end-to-end (combine reads topk i64)
@@ -98,7 +97,7 @@ class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
             return_gate=True,
             return_act_w=True,
             # bound by THIS handle's tile count (per-forward, not shared symm)
-            num_tile_blocks=handle[_H_NUM_TILE_BLOCKS],
+            num_tile_blocks=BF16_HANDLE_SCHEMA.get(handle, "tile_count"),
         )
 
         dW2 = grouped_gemm_bf16_variable_k_flydsl_kernel(

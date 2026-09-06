@@ -27,6 +27,9 @@ from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_fp8_weights import (
     _w1_fp8_cached,
     _w1t_combine_fp8_cached,
 )
+from primus_turbo.pytorch.kernels.fused_mega_moe.staged_contract import (
+    MXFP8_HANDLE_SCHEMA,
+)
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_fp8_variable_k_impl,
 )
@@ -118,7 +121,9 @@ def prepare_dw1_pool_operand_fp8(
     it there consumes the view instead of the clone the backward would need, and keeps the requant
     off the backward critical path. ``meta`` is reused by the dual-quant, dW1 and dW2."""
     meta = colwise_grouped_meta(
-        handle[_HANDLE_GROUP_LENS], handle[_HANDLE_GROUP_OFFS], pool_rows=pool_x_fp8[0].shape[0]
+        MXFP8_HANDLE_SCHEMA.get(handle, "group_lens"),
+        MXFP8_HANDLE_SCHEMA.get(handle, "group_offsets"),
+        pool_rows=pool_x_fp8[0].shape[0],
     )
     pool_colwise = colwise_requant_mxfp8_grouped_fp8in_flydsl(
         pool_x_fp8[0],
@@ -127,13 +132,6 @@ def prepare_dw1_pool_operand_fp8(
         meta=meta,
     )[:2]
     return pool_colwise, meta
-
-
-_HANDLE_GROUP_LENS = 9  # fp8 dispatch handle index: per-local-expert real token counts
-_HANDLE_GROUP_OFFS = 10  # ... and their prefix over the block_m-padded pool
-
-# fp8 dispatch handle: dispatch_prologue's 11 tables + num_tile_blocks appended by the L1 kernel.
-_HANDLE_LEN = 14
 
 
 def fused_mega_moe_stage1_forward_fp8_impl(
@@ -160,7 +158,7 @@ def fused_mega_moe_stage1_forward_fp8_impl(
         topk_idx=topk_idx,
         topk_weights=topk_weights,
     )
-    assert len(handle) == _HANDLE_LEN, f"fp8 dispatch handle len {len(handle)} != {_HANDLE_LEN}; ABI changed"
+    handle = MXFP8_HANDLE_SCHEMA.validate(handle)
 
     pool_x_colwise, colwise_meta = (
         prepare_dw1_pool_operand_fp8(pool_x_fp8, handle) if save_bwd else (None, None)

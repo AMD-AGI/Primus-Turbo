@@ -12,9 +12,11 @@ from primus_turbo.flydsl.mega import (
     dispatch_grouped_gemm_bf16_flydsl_kernel,
     grouped_gemm_combine_bf16_flydsl_kernel,
 )
-
-# dispatch handle layout (see dispatch_prologue ABI).
-_HANDLE_LEN = 13
+from primus_turbo.pytorch.kernels.fused_mega_moe.staged_contract import (
+    BF16_HANDLE_SCHEMA,
+    MegaMoEPrecision,
+    make_route_state,
+)
 
 
 def fused_mega_moe_stage1_forward_impl(
@@ -37,8 +39,13 @@ def fused_mega_moe_stage1_forward_impl(
         topk_weights=topk_weights,
         layout="nt",
     )
-    assert len(handle) == _HANDLE_LEN, f"dispatch handle len {len(handle)} != {_HANDLE_LEN}; ABI changed"
-    return l1_out, dispatch_weights_in_buf.clone(), tuple(handle)
+    route = make_route_state(
+        MegaMoEPrecision.BF16,
+        dispatch_weights_in_buf.clone(),
+        handle,
+    )
+    assert len(route.handle) == BF16_HANDLE_SCHEMA.length
+    return l1_out, route.dispatch_weights, route.handle
 
 
 def fused_mega_moe_stage1_backward_impl(
@@ -57,13 +64,14 @@ def fused_mega_moe_stage1_backward_impl(
     Returns ``(dx, grad_topk_weights, dW1)``. ``grad_gate`` (from stage2's
     SwiGLU^T) is scattered into ``grad_topk_weights`` by the combine kernel.
     """
+    route_handle = BF16_HANDLE_SCHEMA.validate(handle)
     topk_indices_flat = topk_idx.to(torch.int64).contiguous().view(-1)
 
     # L1 dgrad (grad_l1 @ w1, nn) + combine PUSH + dx reduce + grad_gate scatter
     dx, grad_topk_weights_flat = grouped_gemm_combine_bf16_flydsl_kernel(
         grad_l1,
         w1,
-        handle,
+        route_handle,
         topk_indices=topk_indices_flat,
         topk_weights=None,
         grad_gate=grad_gate,
@@ -75,7 +83,7 @@ def fused_mega_moe_stage1_backward_impl(
         saved_x,
         grad_l1,
         group,
-        handle=handle,
+        handle=route_handle,
         layout="tn",
         trans_c=True,
     )

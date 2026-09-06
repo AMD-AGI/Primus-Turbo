@@ -30,14 +30,12 @@ from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_fp8_weights import (
     _w2_fp8_cached,
     _w2t_fp8_cached,
 )
+from primus_turbo.pytorch.kernels.fused_mega_moe.staged_contract import (
+    MXFP8_HANDLE_SCHEMA,
+)
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_fp8_variable_k_impl,
 )
-
-_HANDLE_GROUP_LENS = 9  # fp8 dispatch handle index: per-local-expert real token counts
-_HANDLE_GROUP_OFFS = 10  # ... and their prefix over the block_m-padded pool
-
-_H_NUM_TILE_BLOCKS = 11  # fp8 dispatch handle index of num_tile_blocks (device real-tile count)
 
 # The L1 comm/preshuffle split is left to the dispatch kernel's signature default, whose measured
 # pair is that direction's. L2 combine 32 beats 48 by ~5% on EP8 T=8192 DSv3.
@@ -97,10 +95,14 @@ def fused_mega_moe_stage2_forward_fp8_impl(
     topk_weights: torch.Tensor,
 ) -> torch.Tensor:
     """SwiGLU + mxfp8 quant + grouped fc2 GEMM + combine (nt). Returns y."""
+    handle = MXFP8_HANDLE_SCHEMA.validate(handle)
     topk_idx = topk_idx.to(torch.int64)
 
     # bound swiglu by THIS handle's tile count (per-forward, not shared symm)
-    act_fp8, act_a_sp = swiglu_mxfp8_flydsl_kernel(l1, handle[_H_NUM_TILE_BLOCKS])
+    act_fp8, act_a_sp = swiglu_mxfp8_flydsl_kernel(
+        l1,
+        MXFP8_HANDLE_SCHEMA.get(handle, "tile_count"),
+    )
 
     w2q, w2s = _w2_fp8_cached(w2)
 
@@ -131,8 +133,9 @@ def fused_mega_moe_stage2_backward_fp8_impl(
     stage1's L1 dgrad, the colwise pair its dW1. ``colwise_meta`` is stage1's, reused here so the
     dual-quant and dW2 skip a second D2H of the same group offsets.
     """
-    group_lens = handle[_HANDLE_GROUP_LENS]
-    group_offs = handle[_HANDLE_GROUP_OFFS]
+    handle = MXFP8_HANDLE_SCHEMA.validate(handle)
+    group_lens = MXFP8_HANDLE_SCHEMA.get(handle, "group_lens")
+    group_offs = MXFP8_HANDLE_SCHEMA.get(handle, "group_offsets")
     dy = grad_y.contiguous().to(torch.bfloat16)
 
     # L2 dgrad: dispatch(dy) + fc2 -> grad_swiglu + the dispatched-dy pool (the dW2 `a` operand)
