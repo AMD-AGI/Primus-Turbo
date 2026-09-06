@@ -76,9 +76,44 @@ constexpr float kHadamard32Norm = 0.1767578125f;
 // found nothing faster -- once the emit path below stopped being the bottleneck the
 // kernel is bandwidth-bound, and larger patches only cost LDS and occupancy.
 // ---------------------------------------------------------------------------
-constexpr int TILE_M            = 64;
-constexpr int TILE_N            = 64;
-constexpr int THREADS_PER_BLOCK = 128;
+// Overridable only so a sweep can be driven from the command line without editing this
+// file; the defaults below are the shipped, measured values and are what any normal
+// build uses. The sweep that chose them ran at MBS=64 row extents, which is why the
+// MBS=32 extents (8192 rows) were re-examined separately.
+#ifndef MXFP6_TILE_M
+#define MXFP6_TILE_M 64
+#endif
+// A 256-thread block, from a cold-operand sweep of TILE_M 32..128 x TILE_N 64..256 x
+// block 128..512 at the row extents MBS=32 and MBS=64 actually present. Cold is the
+// operative word: the previous 128-thread default came from a sweep with the input
+// resident, which is not the state a packer call ever finds its operand in -- every one
+// of them reads a tensor a GEMM or an optimizer step has just written.
+//
+// The sweep has to score both entry points, and this is the part that is easy to get
+// wrong. quantize_mxfp6_impl and the fused prologue path do not rank tiles the same way,
+// and the widest, largest-block configurations win the plain packer clearly while losing
+// the fused one -- which is the path the MLP takes, and the more expensive of the two per
+// call. Tuning on the plain packer alone selects a configuration that is a net regression
+// in a real step. This one is faster than the previous default on both.
+//
+// TILE_M stays 64. Halving it is tempting on the plain packer, but TILE_M is
+// MXFP6_COL_SUM_TILE_M, so it sets the bias-gradient partial buffer's row count: halving
+// it doubles those rows and the reduction behind them, which this sweep does not charge
+// for because that reduction is a separate kernel.
+//
+// TILE_M stays 64 deliberately: 32x256/512 is another ~2 points faster but TILE_M is
+// tied to MXFP6_COL_SUM_TILE_M, which Python sizes the bias-gradient partial buffer
+// from, so moving it is a coupled change rather than a blocking one.
+#ifndef MXFP6_TILE_N
+#define MXFP6_TILE_N 64
+#endif
+#ifndef MXFP6_THREADS_PER_BLOCK
+#define MXFP6_THREADS_PER_BLOCK 256
+#endif
+
+constexpr int TILE_M            = MXFP6_TILE_M;
+constexpr int TILE_N            = MXFP6_TILE_N;
+constexpr int THREADS_PER_BLOCK = MXFP6_THREADS_PER_BLOCK;
 
 // The bias-gradient partial buffer has one row per M-tile, so its geometry is this tile
 // height. The header carries the value because the host and Python size the buffer.

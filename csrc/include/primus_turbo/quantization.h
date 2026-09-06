@@ -161,7 +161,16 @@ enum class MXFP6Prologue {
 // M-rows per row of the bias-gradient partial buffer, i.e. the packer's M-tile height.
 // Declared here rather than left as a kernel-private tuning constant because the host and
 // Python both have to size that buffer; the kernel static_asserts they agree.
-constexpr int MXFP6_COL_SUM_TILE_M = 64;
+// Overridable only so a tile sweep can be driven from the command line; 64 is the
+// shipped value. Changing it in a real build also changes the partial buffer's geometry,
+// which Python sizes from mxfp6_col_sum_rows(), so the two must move together.
+#ifndef MXFP6_TILE_M
+#define MXFP6_COL_SUM_TILE_M_DEFAULT 64
+#else
+#define MXFP6_COL_SUM_TILE_M_DEFAULT MXFP6_TILE_M
+#endif
+
+constexpr int MXFP6_COL_SUM_TILE_M = MXFP6_COL_SUM_TILE_M_DEFAULT;
 
 // Rows of the partial buffer for an [M, N] input. One per M-tile of the launch grid, which
 // covers M padded to whole 256-row tiles.
