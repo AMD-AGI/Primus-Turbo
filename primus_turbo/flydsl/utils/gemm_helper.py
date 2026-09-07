@@ -240,6 +240,20 @@ def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled):
     return offsets
 
 
+def compute_global_swizzle_pair(lane_id, wave_id, K, n_rounds):
+    """compute_global_swizzle(preshuffled=False) with the operand rows run through the involution
+    ``16*t + m -> 2*m + t`` inside each 32-row block. The LDS row is untouched, so the bank key and
+    every s2r read stay bit-identical while a lane's two n-fragments become adjacent output columns."""
+    offsets = []
+    n_waves = fx.block_dim.x // 64
+    for round in range_constexpr(n_rounds):
+        row = lane_id // 8 + wave_id * 8 + round * (n_waves * 8)
+        col = (lane_id % 8) * 16
+        _, c = swizzle_128(row, col)  # bank key stays on the LDS row
+        offsets.append(((row // 32) * 32 + (row % 16) * 2 + (row % 32) // 16) * K + c)
+    return offsets
+
+
 def compute_global_swizzle_shear(lane_id, wave_id, K, n_rounds, m_row, ksm, up):
     """compute_global_swizzle(preshuffled=False) with every row's 128B fetch snapped to its
     enclosing cache line, for a row pitch whose ``K % 128 == ksm != 0`` (raw K-block straddles
@@ -782,9 +796,13 @@ class StoreCPerTensor:
         pair = Vec.from_elements([lo.to(self.out_ty), hi.to(self.out_ty)], self.out_ty)
         return arith._to_raw(pair.bitcast(fx.Int32)[0])
 
+    def _frag_col(self, tj, base_col):
+        """Output column of fragment ``tj`` for this lane; the pairing subclass interleaves it."""
+        return base_col + tj * 16 + self.lane_id % 16
+
     def _row_col(self, ti, i, tj, base_col):
         """Element address of the value at fragment (ti, tj), row ``i`` of this lane's four."""
-        return (ti * 16 + (self.lane_id // 16) * 4 + i) * self.c_cols + base_col + tj * 16 + self.lane_id % 16
+        return (ti * 16 + (self.lane_id // 16) * 4 + i) * self.c_cols + self._frag_col(tj, base_col)
 
     def _read_back(self, rsrc, ti, i, tj, base_row, base_col):
         """One beta=1 read-back load. ``trans`` swaps the fragment axes (row = N, col = M), so
@@ -793,7 +811,7 @@ class StoreCPerTensor:
             n = base_row + ti * 16 + (self.lane_id // 16) * 4 + i  # base_row is the N origin here
             off = (tj * 16 + self.lane_id % 16) * self.c_cols + n
         else:
-            n = base_col + tj * 16 + self.lane_id % 16
+            n = self._frag_col(tj, base_col)
             off = self._row_col(ti, i, tj, base_col)
         return _buffer_ops.buffer_load(
             rsrc,
@@ -961,6 +979,54 @@ class StoreCPerTensorRowN(StoreCPerTensor):
                         pair[e],
                         rsrc,
                         (lane0 + row * self.c_cols) * 2 + p * 64,
+                        cache_modifier=self.store_aux,
+                        offset_is_bytes=True,
+                    )
+
+
+class StoreCPerTensorPairCol(StoreCPerTensor):
+    """Paired-column scalar store for an operand fed through ``compute_global_swizzle_pair``: the
+    involution already put a lane's two n-fragments on adjacent columns, so one packed dword
+    replaces two 2-byte stores with no cross-lane traffic."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert self.n_tiles_b % 2 == 0, "the pair is written as a unit"
+        assert not self.trans, "written for the untransposed fragment axes"
+        assert self.out_bytes == 2, "the pair leaves as one packed dword"
+
+    def _frag_col(self, tj, base_col):
+        return base_col + (tj // 2) * 32 + (self.lane_id % 16) * 2 + tj % 2
+
+    def store(self, c_frag, base_row, base_col, prev=None):
+        scale = self._scale()
+        if const_expr(self.beta_is_one) and prev is None:
+            prev = self.prefetch(base_row, base_col)
+        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
+        col0 = base_col + (self.lane_id % 16) * 2
+        for ti in range_constexpr(self.n_tiles_a):
+            row_local = ti * 16 + (self.lane_id // 16) * 4  # relative to base_row
+            row_off = [((row_local + i) * self.c_cols + col0) * 2 for i in range_constexpr(4)]
+            for p in range_constexpr(self.n_tiles_b // 2):
+                # base_col is 32-aligned, so an even c_cols makes a pair's two columns valid or invalid together.
+                pair_ok = None if self.col_safe else (col0 + p * 32 + 1) < self.c_cols
+                vecs = [
+                    (Vec(c_frag[self.c_idx_fn(ti, 2 * p + h)]) * scale)
+                    if self.scaled
+                    else Vec(c_frag[self.c_idx_fn(ti, 2 * p + h)])
+                    for h in range_constexpr(2)
+                ]
+                for i in range_constexpr(4):
+                    lo, hi = vecs[0][i], vecs[1][i]
+                    if self.elem_fn is not None:
+                        lo, hi = self.elem_fn(lo), self.elem_fn(hi)
+                    lo = self._accum(lo, prev, ti, 2 * p, i)
+                    hi = self._accum(hi, prev, ti, 2 * p + 1, i)
+                    _buffer_ops.buffer_store(
+                        self._pack(lo, hi),
+                        rsrc,
+                        row_off[i] if p == 0 else row_off[i] + p * 64,
+                        mask=pair_ok,
                         cache_modifier=self.store_aux,
                         offset_is_bytes=True,
                     )
@@ -1864,6 +1930,31 @@ def _robust_time(launch, args, warmup=250, reps=5, iters=50):
         ts.append(e0.elapsed_time(e1) / iters)
     ts.sort()
     return ts[len(ts) // 2]
+
+
+def _robust_ab_ratio(base, cand, args, warmup=125, reps=3, iters=50):
+    """Median of per-rep cand/base time ratios, both timed inside ONE measurement window: separate
+    windows make whichever runs first pay the DVFS ramp, which outruns the adoption margin. Each rep
+    is a palindrome (base, cand, cand, base) because the ramp term is odd in the slot index."""
+    for _ in range(warmup):
+        base(*args)
+        cand(*args)
+    torch.cuda.synchronize()
+    rs = []
+    for _ in range(reps):
+        ts = []
+        for launch in (base, cand, cand, base):
+            e0 = torch.cuda.Event(enable_timing=True)
+            e1 = torch.cuda.Event(enable_timing=True)
+            e0.record()
+            for _ in range(iters):
+                launch(*args)
+            e1.record()
+            torch.cuda.synchronize()
+            ts.append(e0.elapsed_time(e1) / iters)
+        rs.append((ts[1] + ts[2]) / (ts[0] + ts[3]))
+    rs.sort()
+    return rs[len(rs) // 2]
 
 
 # E8M0 scale preshuffle (FlyDSL, LDS-tiled): raw E8M0 [DIM,K//32] -> preshuffled int32.
