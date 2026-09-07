@@ -85,7 +85,11 @@ def _make_kernel(
 ):
     K = hidden_size
     is_tn = layout == "tn"
-    SharedStorage = _make_shared_storage(BLOCK_M, BLOCK_N)
+    # The variable-K wgrad tile indexes this LDS at its own lds_chunk_stride, so the
+    # allocation and the tile call have to read the same constant; a mismatch silently
+    # runs the g2s/s2r pair off the end of each chunk.
+    LDS_CHUNK_STRIDE = 1024
+    SharedStorage = _make_shared_storage(BLOCK_M, BLOCK_N, chunk_stride=LDS_CHUNK_STRIDE)
     assert num_max_pool_tokens % BLOCK_M == 0, "num_max_pool_tokens must be a multiple of BLOCK_M"
     if is_tn:
         OUT_M, OUT_N = hidden_size, out_features
@@ -248,6 +252,7 @@ def _make_kernel(
                     BLOCK_M=BLOCK_M,
                     BLOCK_N=BLOCK_N,
                     out_fp16=out_fp16,
+                    lds_chunk_stride=LDS_CHUNK_STRIDE,
                 )
         else:
             tile_index = block_index - comm_block_count
