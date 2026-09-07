@@ -30,8 +30,8 @@ from primus_turbo.flydsl.gemm.gemm_bf16_kernel import gemm_bf16_tile
 
 # The slot-gather wgrad owns this LDS frame (512-elem tr16 blocks); at the default
 # chunk_stride it is byte-identical to the dense tiles', so one frame serves both.
-from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_slot_wgrad_kernel import (
-    _make_shared_storage,
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
+    _make_slot_wgrad_shared_storage,
     gemm_bf16_variable_k_tile,
 )
 from primus_turbo.flydsl.mega.dispatch_prologue_kernel import (
@@ -95,7 +95,7 @@ def _make_kernel(
     is_tn = layout == "tn"
     # tn stages its slot table in LDS (+16 KiB, still 1 WG/CU), which moves the
     # in-K-loop slot lookup off the in-order vmcnt queue and into the lgkm domain.
-    SharedStorage = _make_shared_storage(BLOCK_M, BLOCK_N, slot_lds=is_tn)
+    SharedStorage = _make_slot_wgrad_shared_storage(BLOCK_M, BLOCK_N, slot_lds=is_tn)
     assert num_max_pool_tokens % BLOCK_M == 0, "num_max_pool_tokens must be a multiple of BLOCK_M"
     if is_tn:
         OUT_M, OUT_N = hidden_size, out_features
@@ -570,7 +570,7 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         source_slot_kind,
         _recv_dst_rank,
         _recv_start_row,
-        combine_recv_count,
+        _recv_count,
         _pool_src_slot,
         _dedup_key_row,
         expert_send_dst_rank,
@@ -578,7 +578,7 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         expert_send_offset,
         dispatched_token_idx,
         num_tokens_per_expert_prefix,
-        _real_count_per_expert,
+        real_count_per_expert,
     ) = handle
     num_comm = expert_send_dst_rank.numel()
     num_ranks = symm.world
@@ -609,10 +609,10 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         output = torch.empty(out_shape, device=x.device, dtype=out_dtype)
         weight_arg, output_arg = rhs.contiguous(), output.view(-1)
         # Bound the wgrad K-contraction to each expert's REAL (unpadded) token count so the
-        # GEMM never reads stale block-padding rows (the dW1 floor). real[e] = sum over source
-        # ranks of the combine recv counts (seg = e*num_ranks + src). Passed via the TILE arg,
-        # which the tn path otherwise ignores. Bounds-clamped buffers zero the partial tail tile.
-        real_count = combine_recv_count.view(G, num_ranks).sum(dim=1).to(torch.int32).contiguous()
+        # GEMM never reads stale block-padding rows (the dW1 floor). The prologue already
+        # writes it as handle's real_count_per_expert. Passed via the TILE arg, which the tn
+        # path otherwise ignores. Bounds-clamped buffers zero the partial tail tile.
+        real_count = real_count_per_expert.to(torch.int32).contiguous()
         tile_arg, num_tile_arg, group_offs_arg = (
             real_count,
             num_tile_blocks,
@@ -673,4 +673,6 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         num_topk=int(symm.num_topk),
         stream=torch.cuda.current_stream(),
     )
-    return output, symm.dispatch_token_pool, symm.weight_recv_buf, handle
+    # clone: weight_recv_buf aliases the shared symm buffer and the next dispatch
+    # overwrites it, so callers above this layer must never see the buffer view.
+    return output, symm.dispatch_token_pool, symm.weight_recv_buf.clone(), handle

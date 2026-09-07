@@ -25,7 +25,7 @@ def fused_mega_moe_stage1_forward_impl(
     # int64 end-to-end (combine reads topk i64)
     topk_idx = topk_idx.to(torch.int64)
 
-    l1_out, _, dispatch_weights_in_buf, handle = dispatch_grouped_gemm_bf16_flydsl_kernel(
+    l1_out, _, dispatch_weights, handle = dispatch_grouped_gemm_bf16_flydsl_kernel(
         x,
         w1,
         group,
@@ -34,7 +34,7 @@ def fused_mega_moe_stage1_forward_impl(
         topk_weights=topk_weights,
         layout="nt",
     )
-    return l1_out, dispatch_weights_in_buf.clone(), handle
+    return l1_out, dispatch_weights, handle
 
 
 def fused_mega_moe_stage1_backward_impl(

@@ -11,8 +11,8 @@ Two modes, selected with --mode:
   grouped_gemm_combine  : fused grouped GEMM + combine
 
 Self-contained: the shared reference ops (routing/weight generation, the
-CUDA-event bench helper, the prologue-driven input builders, and the per-stage
-metric/print template) live in this file too.
+dense-GEMM roofline, the CUDA-event bench helper, the prologue-driven input
+builders, and the per-stage metric/print template) live in this file too.
 """
 
 import argparse
@@ -56,10 +56,10 @@ import primus_turbo.pytorch  # noqa: E402,F401
 # primus_turbo.flydsl.* imported before primus_turbo.pytorch (kept from the
 # original mega_utils order; the two fused kernels below need pytorch first).
 from primus_turbo.flydsl.gemm.gemm_bf16_kernel import gemm_bf16_tile  # noqa: E402
-from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_slot_wgrad_kernel import (  # noqa: E402
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (  # noqa: E402
     _compile_grouped_variable_k_bf16,
     _get_compiled_dense,
-    _make_shared_storage,
+    _make_slot_wgrad_shared_storage,
 )
 from primus_turbo.flydsl.mega import (  # noqa: E402  # noqa: E402
     dispatch_grouped_gemm_bf16_flydsl_kernel,
@@ -138,7 +138,7 @@ def compile_grouped_gemm_bf16(
     dispatch kernel does over the deduped pool. Without it this baseline measures a
     strictly easier GEMM and the roofline it feeds is optimistic."""
     assert not gather or layout in ("nt", "nn"), "gather-A is only defined for nt/nn"
-    SharedStorage = _make_shared_storage(BLOCK_M, BLOCK_N)
+    SharedStorage = _make_slot_wgrad_shared_storage(BLOCK_M, BLOCK_N)
     # per-tile GEMM closure by layout (NT forward, NN dgrad, TN wgrad); grouped via b_group_base
     gemm_tile = functools.partial(gemm_bf16_tile, layout)
 
@@ -1110,7 +1110,7 @@ def combine_only(
     waves = int(os.environ.get("MEGA_COMB_WAVES") or "2")  # combine push occupancy knob
     grad_gate_arg = grad_gate.contiguous().view(-1) if with_gate else recv_count
     # dedup tables: the baseline must push the same unique rows as the fused kernel
-    assert dedup_key_row.numel() > 1, "combine_only needs the dispatch dedup tables (dedup=True)"
+    assert dedup_key_row.numel() > 1, "combine_only needs the dispatch dedup tables from the prologue"
     # task-based push (sustained per-peer): strides over num_experts recv-segments
     launch = _compile_combine_only_task(
         out_features,
