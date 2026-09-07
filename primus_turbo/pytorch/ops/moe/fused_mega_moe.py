@@ -251,7 +251,7 @@ class FusedMegaMoEStage2Function(torch.autograd.Function):
     ) -> torch.Tensor:
         with torch.profiler.record_function("fused_mega_moe_stage2_forward"):
             assert w2.is_cuda and w2.dim() == 3, "w2 must be a 3D CUDA tensor"
-            handle = tuple(handle)
+            handle = tuple(handle)  # apply() varargs deliver it as a plain tensor tuple
 
             y = fused_mega_moe_stage2_forward_impl(l1_out, w2, handle, topk_idx, topk_weights, activation)
 
@@ -270,7 +270,8 @@ class FusedMegaMoEStage2Function(torch.autograd.Function):
         """grad l1_out (via L2 dgrad + SwiGLU^T) + dW2; grad_gate rides the dispatch_weights slot."""
         with torch.profiler.record_function("fused_mega_moe_stage2_backward"):
             handle = ctx.handle
-            n_in = 7 + len(handle)
+            num_handle_tensors = len(handle)
+            n_in = 7 + num_handle_tensors
             if grad_y is None:
                 return (None,) * n_in
             l1_out, dispatch_weights, w2 = ctx.saved_tensors
@@ -289,7 +290,7 @@ class FusedMegaMoEStage2Function(torch.autograd.Function):
                 dW2.to(w2.dtype),
                 None,
                 None,
-                *((None,) * len(handle)),
+                *((None,) * num_handle_tensors),
             )
 
 

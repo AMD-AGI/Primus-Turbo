@@ -30,6 +30,28 @@ BLOCK_M = 256  # pool-block granularity + pool alignment
 TOKEN_DTYPE = torch.bfloat16
 TOKEN_ALIGNMENT = 128  # get_token_alignment_for_mega_moe
 
+# Stride, in i64 units, between adjacent combine_flag counters -- 16 == one 128B cache
+# line per counter. Densely packed, 16 block_m counters share a line, and the combine
+# handoff funnels essentially ALL of its coherence traffic onto a single line: block_m =
+# gemm_tile_index // n_blocks, so with n_blocks = 28 and one workgroup per CU the set of
+# block_m in flight at any instant spans only ~7 consecutive words, while each of those
+# block_m draws n_blocks release atomics plus a continuous sys-scope poll from the combine
+# warps. One counter per line turns that shared line into per-block_m private lines; the
+# residual n_blocks-way contention *within* one block_m is deliberately left alone.
+# The kernel indexes combine_flag as (bank + block_m) * COMBINE_FLAG_STRIDE, so this
+# constant is the single owner of the padding -- see grouped_gemm_combine_bf16_kernel.py.
+COMBINE_FLAG_STRIDE = 16
+
+# Chunk-completion counters for the chunked dispatch roles, in i64 slots. A task is split
+# row-wise across several blocks, but the expert flag must still see exactly one signal per
+# source rank, so the chunks rendezvous here and only the last one signals.
+# Never reset: each launch adds chunks_per_task, so `old % chunks_per_task` still picks a
+# unique last chunk every epoch -- which requires the chunk count on a slot to never
+# change, hence one bank of DISPATCH_CHUNK_BANK slots per layout (they tune to different
+# CU splits and would otherwise mix two moduli on the same counter).
+DISPATCH_CHUNK_BANK = 512
+DISPATCH_CHUNK_SLOTS = DISPATCH_CHUNK_BANK * 3
+
 
 def get_num_max_pool_tokens(
     num_ranks: int, num_max_tokens_per_rank: int, num_topk: int, num_experts_per_rank: int
@@ -163,7 +185,11 @@ class Workspace:
         return self.get_dispatch_flag_ptr() + align(2 * self.num_max_pool_blocks * 8, BLOCK_M)
 
     def get_reduce_flag_ptr(self):
-        return self.get_combine_flag_ptr() + align(2 * self.num_max_pool_blocks * 8, BLOCK_M)
+        # combine_flag is padded to COMBINE_FLAG_STRIDE i64 per counter (see the constant):
+        # ~33KB -> ~520KB against a multi-GB heap, and only this region's size changes.
+        return self.get_combine_flag_ptr() + align(
+            2 * self.num_max_pool_blocks * 8 * COMBINE_FLAG_STRIDE, BLOCK_M
+        )
 
     def get_expert_count_buffer_ptr(self):
         return self.get_reduce_flag_ptr() + align(2 * self.num_combine_slots * 8, BLOCK_M)
@@ -180,9 +206,13 @@ class Workspace:
     def get_combine_gate_ptr(self):
         return self.get_weight_recv_buf_ptr() + align(self.num_max_pool_tokens * 4, BLOCK_M)
 
+    def get_dispatch_chunk_ptr(self):
+        # per-task chunk rendezvous counters for the chunked dispatch comm role
+        return self.get_combine_gate_ptr() + align(self.num_max_tokens_per_rank * self.num_topk * 4, BLOCK_M)
+
     def get_end_ptr(self):
         # past the last region; on a base-0 Workspace this offset is the total heap size
-        return self.get_combine_gate_ptr() + align(self.num_max_tokens_per_rank * self.num_topk * 4, BLOCK_M)
+        return self.get_dispatch_chunk_ptr() + align(DISPATCH_CHUNK_SLOTS * 8, BLOCK_M)
 
     # Barrier: [0..15] 4 grid sync counters, [16..19] XGMI counter, [20..27] 2 signals
 
@@ -252,8 +282,13 @@ def get_symm_buffer_size_for_mega_moe(
             _tensor_from_device_ptr(
                 int(workspace.get_dispatch_flag_ptr()), (2 * workspace.num_max_pool_blocks,), torch.int64, dev
             ),
+            # padded view: must span the WHOLE region (stride included), or any caller
+            # that zeroes this slice would under-cover it and leave live counters behind
             _tensor_from_device_ptr(
-                int(workspace.get_combine_flag_ptr()), (2 * workspace.num_max_pool_blocks,), torch.int64, dev
+                int(workspace.get_combine_flag_ptr()),
+                (2 * workspace.num_max_pool_blocks * COMBINE_FLAG_STRIDE,),
+                torch.int64,
+                dev,
             ),
             _tensor_from_device_ptr(
                 int(workspace.get_reduce_flag_ptr()), (2 * workspace.num_combine_slots,), torch.int64, dev
@@ -261,6 +296,41 @@ def get_symm_buffer_size_for_mega_moe(
         )
 
     return num_bytes, slice_input_buffers
+
+
+_SYMM_HEAP_CACHE: dict = {}
+
+
+def _acquire_symm_heap(group, num_bytes: int):
+    """Grow-only per-group IPC heap.
+
+    hipIpcGetMemHandle pins the allocation for the process lifetime: hipFree then
+    returns success but reclaims nothing, so every realloc is a permanent leak.
+    Reuse the heap whenever it is already large enough.
+    """
+    from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
+
+    cached = _SYMM_HEAP_CACHE.get(group.group_name)
+    if cached is not None and not cached.is_destroyed and cached.buffer_size >= num_bytes:
+        # Reused heap carries stale flags/parity; the ctor only zeroes fresh ones.
+        cached.get_buffer(cached.rank, (cached.buffer_size,), torch.int8).zero_()
+        torch.cuda.synchronize()
+        group.barrier()
+        return cached
+
+    grown = max(int(num_bytes), cached.buffer_size if cached is not None else 0)
+    heap = SymmetricMemory(group, grown, signal_pad_size=0)
+    if cached is not None:
+        cached.destroy()
+    _SYMM_HEAP_CACHE[group.group_name] = heap
+    return heap
+
+
+def release_symm_heaps() -> None:
+    """Explicit teardown; the VRAM itself stays pinned until the process exits."""
+    for heap in _SYMM_HEAP_CACHE.values():
+        heap.destroy()
+    _SYMM_HEAP_CACHE.clear()
 
 
 class SymmBuffer:
@@ -318,10 +388,8 @@ class SymmBuffer:
         self.num_combine_slots = workspace.num_combine_slots
         self.num_tokens = self.num_max_tokens_per_rank  # back-compat alias
 
-        # allocate the single symmetric-memory heap (custom HIP IPC; ctor zeroes it, skip signal pad)
-        from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
-
-        self.symm_mem = SymmetricMemory(group, self.num_bytes, signal_pad_size=0)
+        # the single symmetric-memory heap, shared and grow-only (see _acquire_symm_heap)
+        self.symm_mem = _acquire_symm_heap(group, self.num_bytes)
         self.buffer = self.symm_mem.get_buffer(self.rank, (self.num_bytes,), torch.int8)
         heap = self.buffer
         self.group.barrier()
@@ -347,9 +415,13 @@ class SymmBuffer:
         # device epoch state (parity + per-bank expected); bumped by the device bump kernel
         self._disp_parity = torch.zeros(1, dtype=torch.int64, device="cuda")  # index into the 2 banks
         self._disp_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
+        self._disp_copy_flag = torch.zeros(
+            2 * workspace.num_max_pool_blocks, dtype=torch.int64, device="cuda"
+        )
         self._combine_parity = torch.zeros(1, dtype=torch.int64, device="cuda")
         self._combine_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
         self._reduce_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
+        self._combine_dedup_done = torch.zeros(2, dtype=torch.int64, device="cuda")
         self._sym_buffer = None  # cached so its peer-delta table stays alive with this heap
 
     def get_sym_buffer(self) -> SymBuffer:
@@ -364,10 +436,9 @@ class SymmBuffer:
         global _CURRENT_SYMM_BUFFER
         if _CURRENT_SYMM_BUFFER is self:
             _CURRENT_SYMM_BUFFER = None
-        # region views are non-owning aliases of the raw heap ptr; free the heap, then drop refs
+        # region views are non-owning aliases of the raw heap ptr; just drop refs.
+        # The heap itself stays in _SYMM_HEAP_CACHE for reuse: it cannot be freed.
         self._sym_buffer = None
-        if self.symm_mem is not None:
-            self.symm_mem.destroy()
         self.symm_mem = None
         self.buffer = None
 
