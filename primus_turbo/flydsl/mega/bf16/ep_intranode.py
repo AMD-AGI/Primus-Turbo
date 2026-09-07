@@ -89,7 +89,7 @@ _ROW_UNROLL = 4
 _GATHER_INFLIGHT = 64
 
 
-def _npass_for(arity, out_features, npass):
+def _npass_for(arity, out_features):
     """Passes needed to hold ``arity`` members' loads within the in-flight budget."""
     num_full_chunks = out_features // (_WARP * _PVEC)
     need = (arity * num_full_chunks + _GATHER_INFLIGHT - 1) // _GATHER_INFLIGHT
@@ -115,7 +115,6 @@ def dispatch_bf16_tile(
     num_topk: int = 1,
     source_rank: int = 0,
     chunk_index: Optional[fx.Int32] = None,
-    num_chunks: int = 1,
     num_chunks_dyn: Optional[fx.Int32] = None,
     chunk_bank: int = 0,
 ):
@@ -123,22 +122,21 @@ def dispatch_bf16_tile(
     assert hidden_bytes % 1024 == 0, "hidden*2 must be a multiple of 1024 bytes -> hidden % 512 == 0"
     hidden_i32 = hidden_bytes // 4  # row stride in i32 words
 
-    # A task's rows are split across num_chunks blocks; chunk c takes warp rows
-    # c*_NUM_WARPS + warp_id, striding by num_chunks*_NUM_WARPS. num_chunks == 1
-    # reproduces the single-block indexing exactly.
-    # num_chunks_dyn carries the chunk count as a runtime value so the CU split can
-    # be autotuned without recompiling (see dispatch_grouped_gemm_bf16_kernel).
-    DYN_CHUNKS = num_chunks_dyn is not None
-    CHUNKED = DYN_CHUNKS or num_chunks > 1
+    # A task's rows are split across num_chunks_dyn blocks; chunk c takes warp rows
+    # c*_NUM_WARPS + warp_id, striding by num_chunks_dyn*_NUM_WARPS. Passing no chunk
+    # reproduces the single-block indexing exactly. The chunk count is a runtime value
+    # so the CU split can be autotuned without recompiling.
+    CHUNKED = num_chunks_dyn is not None
+    # Signalling needs the chunk counter to elect a last chunk, and a parity bank.
+    assert not signal or (CHUNKED and disp_parity is not None), "signal needs chunks + disp_parity"
     warp_id = thread_index // fx.Int32(_WARP)
     if const_expr(CHUNKED):
         warp_id = chunk_index * fx.Int32(_NUM_WARPS) + warp_id
-    if const_expr(DYN_CHUNKS):
         row_stride = num_chunks_dyn * fx.Int32(_NUM_WARPS)
         row_stride_m1 = row_stride - fx.Int32(1)
     else:
-        row_stride = fx.Int32(num_chunks * _NUM_WARPS)
-        row_stride_m1 = fx.Int32(num_chunks * _NUM_WARPS - 1)
+        row_stride = fx.Int32(_NUM_WARPS)
+        row_stride_m1 = fx.Int32(_NUM_WARPS - 1)
 
     dst_rank = buffer_load(expert_send_dst_rank_res, task_index, vec_width=1, dtype=fx.T.i32())
     source_offset = buffer_load(expert_send_offset_res, task_index, vec_width=1, dtype=fx.T.i32())
@@ -202,109 +200,24 @@ def dispatch_bf16_tile(
         fx.rocdl.s_waitcnt(0)
         fx.gpu.barrier()
         if thread_index == fx.Int32(0):
-            bank = fx.Int32(0) if disp_parity is None else disp_parity * fx.Int32(num_max_pool_blocks)
-            local_expert = task_index // fx.Int32(num_ranks)
+            bank = disp_parity * fx.Int32(num_max_pool_blocks)
             # Flag slot is per-expert: all num_ranks senders share one counter.
-            flag_slot = local_expert
-            if const_expr(CHUNKED):
-                # Chunks of one task must produce exactly one expert signal, or the
-                # peers' gates would see a non-uniform count. atomic_add returns the
-                # old value, so the chunk that sees old % num_chunks == num_chunks-1
-                # is the last one in this epoch -- no counter reset needed. That needs
-                # num_chunks uniform within a launch, so concurrent users of one slot
-                # (another layout) must pass their own chunk_bank.
-                done = atomic_add(
-                    chunk_count_address, fx.Int32(chunk_bank) + task_index, fx.Int64(1), scope="agent"
-                )
-                # Any n consecutive integers hold exactly one x with x % n == n-1, so the
-                # start value is irrelevant: a launch may use a different chunk count than
-                # the previous one on the same slot, as long as it is uniform within it.
-                if const_expr(DYN_CHUNKS):
-                    nc = cast(num_chunks_dyn, fx.T.i64())
-                    is_last = done % nc == nc - fx.Int64(1)
-                else:
-                    is_last = done % fx.Int64(num_chunks) == fx.Int64(num_chunks - 1)
-                if is_last:
-                    atomic_add(dispatch_flag_address, bank + flag_slot, fx.Int64(1), scope="sys")
-            else:
-                atomic_add(dispatch_flag_address, bank + flag_slot, fx.Int64(1), scope="sys")
-
-
-@ASTRewriter.transform
-def combine_bf16_tile(
-    sym: SymBuffer,
-    workspace: Workspace,
-    thread_index: fx.Int32,
-    task_index: fx.ArithValue,
-    recv_dst_rank_res: fx.ArithValue,
-    recv_start_row_res: fx.ArithValue,
-    recv_count_res: fx.ArithValue,
-    origin_slot_res: fx.ArithValue,
-    grad_gate_res: Optional[fx.ArithValue] = None,
-    signal: bool = False,
-    epoch: Optional[fx.Int64] = None,
-    bank_offset: Optional[fx.Int32] = None,
-    with_gate: bool = False,
-):
-    # Task-based combine push: one warp sustains one peer's XGMI link (scattered dst_slot)
-    out_features = int(workspace.hidden)
-    n_slots = int(workspace.num_combine_slots)
-    comb_records = n_slots * out_features * 2
-    gate_records = n_slots * 4
-    cols_per_step = _WARP * _PVEC
-    num_full_chunks = out_features // cols_per_step
-    tail_cols = out_features % cols_per_step
-    row_words = out_features // 2
-    full_bytes = num_full_chunks * cols_per_step * 2
-    warp_id = thread_index // fx.Int32(_WARP)
-    lane_id = thread_index % fx.Int32(_WARP)
-    l2_ptr = workspace.get_l2_token_buffer_ptr()
-
-    dst_rank = buffer_load(recv_dst_rank_res, task_index, vec_width=1, dtype=fx.T.i32())
-    start_row = buffer_load(recv_start_row_res, task_index, vec_width=1, dtype=fx.T.i32())
-    count = buffer_load(recv_count_res, task_index, vec_width=1, dtype=fx.T.i32())
-    # hoist workspace-derived values before the dynamic loop (rewriter can't carry Workspace)
-    comb_addr = sym.map(workspace.get_combine_token_buffer_ptr(), dst_rank)
-    gate_addr = sym.map(workspace.get_combine_gate_ptr(), dst_rank) if with_gate else None
-    barrier_addr = sym.map(workspace.get_reduce_flag_ptr(), dst_rank) if signal else None
-
-    local_count = (count - warp_id + fx.Int32(_NUM_WARPS - 1)) // fx.Int32(_NUM_WARPS)
-    for i in range(local_count):
-        row = start_row + warp_id + i * fx.Int32(_NUM_WARPS)
-        slot = buffer_load(origin_slot_res, row, vec_width=1, dtype=fx.T.i32())
-        copy_warp(
-            comb_addr,
-            l2_ptr,
-            full_bytes,
-            dst_off=slot * fx.Int32(row_words),
-            src_off=row * fx.Int32(row_words),
-            load_cache_modifier=18,  # sc1|nt: read the same-agent GEMM stage.
-            store_cache_modifier=19,  # sc0|sc1|nt: publish to a remote agent.
-        )
-        if const_expr(tail_cols):
-            oob_index = fx.Int32(n_slots) * fx.Int32(out_features)
-            slot_base = slot * fx.Int32(out_features)
-            row_off = row * fx.Int32(out_features)
-            l2_res = create_buffer_resource_from_addr(l2_ptr, num_records_bytes=n_slots * out_features * 2)
-            peer = create_buffer_resource_from_addr(comb_addr, num_records_bytes=comb_records)
-            col = fx.Int32(num_full_chunks * cols_per_step) + lane_id * fx.Int32(_PVEC)
-            in_tail = (lane_id * fx.Int32(_PVEC)) < fx.Int32(tail_cols)
-            safe_col = arith.select(in_tail, col, fx.Int32(out_features - _PVEC))
-            tail_value = buffer_load(
-                l2_res, row_off + safe_col, vec_width=_PVEC, dtype=fx.T.bf16(), cache_modifier=18
+            flag_slot = task_index // fx.Int32(num_ranks)
+            # Chunks of one task must produce exactly one expert signal, or the
+            # peers' gates would see a non-uniform count. atomic_add returns the
+            # old value, so the chunk that sees old % num_chunks == num_chunks-1
+            # is the last one in this epoch -- no counter reset needed. That needs
+            # num_chunks uniform within a launch, so concurrent users of one slot
+            # (another layout) must pass their own chunk_bank.
+            done = atomic_add(
+                chunk_count_address, fx.Int32(chunk_bank) + task_index, fx.Int64(1), scope="agent"
             )
-            dst = arith.select(in_tail, slot_base + col, oob_index)
-            buffer_store(tail_value, peer, dst, cache_modifier=19)
-        if const_expr(with_gate):
-            gate_value = buffer_load(grad_gate_res, row, vec_width=1, dtype=fx.T.f32())
-            gate_peer = create_buffer_resource_from_addr(gate_addr, num_records_bytes=gate_records)
-            buffer_store(gate_value, gate_peer, slot, cache_modifier=19)
-
-        if const_expr(signal):
-            bank = fx.Int32(0) if bank_offset is None else bank_offset
-            # Wait for CM19 payload stores before publishing the relaxed completion flag.
-            fx.rocdl.s_waitcnt(0)
-            st(barrier_addr, bank + slot, epoch, scope="sys")
+            # Any n consecutive integers hold exactly one x with x % n == n-1, so the
+            # start value is irrelevant: a launch may use a different chunk count than
+            # the previous one on the same slot, as long as it is uniform within it.
+            nc = cast(num_chunks_dyn, fx.T.i64())
+            if done % nc == nc - fx.Int64(1):
+                atomic_add(dispatch_flag_address, bank + flag_slot, fx.Int64(1), scope="sys")
 
 
 def _member_row_resource(l2_ptr, row, present, row_bytes):
@@ -402,13 +315,13 @@ def combine_dedup_bf16_tile(
     epoch: Optional[fx.Int64] = None,
     bank_offset: Optional[fx.Int32] = None,
     with_gate: bool = False,
-    npass: int = 2,
     row_start: Optional[fx.Int32] = None,
     row_count: Optional[fx.Int32] = None,
 ):
     # DeepEP-style sender dedup: the highest pool row of a source token folds every
     # local route of that token into one weighted row and pushes it to the primary
     # slot. That makes the push exactly the inverse of dispatch's unique-row send.
+    assert not signal or (epoch is not None and bank_offset is not None), "signal needs epoch + bank"
     out_features = int(workspace.hidden)
     n_slots = int(workspace.num_combine_slots)
     num_pool_rows = int(workspace.num_max_pool_tokens)
@@ -456,7 +369,6 @@ def combine_dedup_bf16_tile(
     )
 
     row_stride = fx.Int32(_NUM_WARPS)
-    row_off = warp_id
 
     def _key(row):
         return buffer_load(sorted_slot_res, row, vec_width=1, dtype=fx.T.i32())
@@ -467,9 +379,10 @@ def combine_dedup_bf16_tile(
 
     def _push_group(row, key_base, pusher_row):
         if row == pusher_row:
-            member_rows = [
+            # Member 0 is what _pusher already loaded from this very address; reuse it.
+            member_rows = [pusher_row] + [
                 buffer_load(key_row_res, key_base + fx.Int32(k), vec_width=1, dtype=fx.T.i32())
-                for k in range_constexpr(topk)
+                for k in range_constexpr(1, topk)
             ]
             primary_row = member_rows[0]
             present = [None] * topk
@@ -508,7 +421,7 @@ def combine_dedup_bf16_tile(
                     dst_base,
                     lane_col,
                     out_features,
-                    _npass_for(1, out_features, npass),
+                    _npass_for(1, out_features),
                     oob_store,
                 )
             else:
@@ -535,7 +448,7 @@ def combine_dedup_bf16_tile(
                             dst_base,
                             lane_col,
                             out_features,
-                            _npass_for(1, out_features, npass),
+                            _npass_for(1, out_features),
                             oob_store,
                         )
                 else:
@@ -547,7 +460,7 @@ def combine_dedup_bf16_tile(
                             dst_base,
                             lane_col,
                             out_features,
-                            _npass_for(2, out_features, npass),
+                            _npass_for(2, out_features),
                             oob_store,
                         )
                     else:
@@ -559,7 +472,7 @@ def combine_dedup_bf16_tile(
                                 dst_base,
                                 lane_col,
                                 out_features,
-                                _npass_for(2, out_features, npass),
+                                _npass_for(2, out_features),
                                 oob_store,
                             )
                         else:
@@ -570,7 +483,7 @@ def combine_dedup_bf16_tile(
                                 dst_base,
                                 lane_col,
                                 out_features,
-                                _npass_for(topk, out_features, npass),
+                                _npass_for(topk, out_features),
                                 oob_store,
                             )
 
@@ -591,24 +504,23 @@ def combine_dedup_bf16_tile(
                 buffer_store(gate_value, gate_peer_res, gate_dst, cache_modifier=19)
 
             if const_expr(signal):
-                bank = fx.Int32(0) if bank_offset is None else bank_offset
                 # Wait for CM19 payload stores before publishing the relaxed flag.
                 fx.rocdl.s_waitcnt(0)
-                st(barrier_addr, bank + dst_slot, epoch, order="relaxed", scope="sys")
+                st(barrier_addr, bank_offset + dst_slot, epoch, order="relaxed", scope="sys")
 
     # Only ~58% of the rows push; the rest just pay the two-deep dependent lookup
     # (sorted_slot -> key_row) before they can be dropped. Hoisting a group's worth
     # of both loads collapses 2*U round trips into 2, same trick as dispatch.
-    local_count = (count - row_off + row_stride - fx.Int32(1)) // row_stride
+    local_count = (count - warp_id + row_stride - fx.Int32(1)) // row_stride
     n_grouped = (local_count // fx.Int32(_ROW_UNROLL)) * fx.Int32(_ROW_UNROLL)
     for i in range(0, n_grouped, _ROW_UNROLL):
-        rows = [start_row + row_off + (i + u) * row_stride for u in range_constexpr(_ROW_UNROLL)]
+        rows = [start_row + warp_id + (i + u) * row_stride for u in range_constexpr(_ROW_UNROLL)]
         key_bases = [_key(r) * fx.Int32(topk) for r in rows]
         pushers = [_pusher(b) for b in key_bases]
         for u in range_constexpr(_ROW_UNROLL):
             _push_group(rows[u], key_bases[u], pushers[u])
     for i in range(n_grouped, local_count):
-        row = start_row + row_off + i * row_stride
+        row = start_row + warp_id + i * row_stride
         key_base = _key(row) * fx.Int32(topk)
         _push_group(row, key_base, _pusher(key_base))
 
@@ -705,32 +617,6 @@ def topk_reduce_bf16_tile(
                                 scope="sys",
                                 dtype=fx.T.i64(),
                             )
-                            while flag != epoch:
-                                fx.rocdl.s_sleep(fx.Int32(_REDUCE_GATE_SLEEP))
-                                if spin_timed_out(spin_start):
-                                    # rank is a compile-time constant, baked into the format string
-                                    fx.printf(
-                                        "[MEGA rank="
-                                        + str(rank)
-                                        + " topk_reduce] combine reduce-flag stuck: "
-                                        "GEMM has not written this expert's rows; token={} slot={} expert={} "
-                                        "reduce_flag_index={} (seen_flag={} expected_epoch={})\n",
-                                        token,
-                                        slot,
-                                        topk_index,
-                                        reduce_bank + slot,
-                                        flag,
-                                        epoch,
-                                    )
-                                    spin_start = read_clock()
-                                # re-read the flag each spin iteration (MUST stay inside the while)
-                                fx.rocdl.s_waitcnt(0)
-                                flag = ld(
-                                    barrier_base,
-                                    reduce_bank + slot,
-                                    scope="sys",
-                                    dtype=fx.T.i64(),
-                                )
             # Per-warp gate -> per-warp fence; see the note at _REDUCE_GATE_SLEEP.
             fx.rocdl.sched_barrier(0)
 
@@ -769,13 +655,15 @@ def topk_reduce_bf16_tile(
         n_rem = num_vec_chunks - n_full * _WARP
         n_grouped = (n_full // _REDUCE_VEC_UNROLL) * _REDUCE_VEC_UNROLL
 
+        # B023: both helpers are called inside the same iteration that defines the
+        # values they close over, so the late-binding warning is a false positive.
         def _round(col):
             vals = []
             for j in range_constexpr(topk):
                 vals.append(
                     buffer_load(
                         comb_local_res,
-                        slot_offs[j] + col,
+                        slot_offs[j] + col,  # noqa: B023
                         vec_width=_PVEC,
                         dtype=fx.T.bf16(),
                         cache_modifier=19,  # sc0|sc1|nt: system-visible non-temporal read.
@@ -788,10 +676,10 @@ def topk_reduce_bf16_tile(
             for j in range_constexpr(topk):
                 term = fx.arith.extf(f32_vec, vals[j])
                 if const_expr(apply_weights):
-                    term = fx.arith.mulf(term, w_vecs[j])
-                term = fx.arith.select(valid[j], term, zero_vec)
+                    term = fx.arith.mulf(term, w_vecs[j])  # noqa: B023
+                term = fx.arith.select(valid[j], term, zero_vec)  # noqa: B023
                 acc = term if acc is None else fx.arith.addf(acc, term)
-            buffer_store(fx.arith.trunc_f(bf16_vec, acc), output_res, out_row + col)
+            buffer_store(fx.arith.trunc_f(bf16_vec, acc), output_res, out_row + col)  # noqa: B023
 
         # Unrolled body: issue U rounds' worth of gathers back to back, THEN consume them.
         # Each round is one dependent HBM round trip (the gather is sc0|sc1|nt, so it is
@@ -824,7 +712,8 @@ def topk_reduce_bf16_tile(
         if const_expr(signal and with_gate):
             for j in range_constexpr(topk):
                 slot = token * fx.Int32(topk) + fx.Int32(j)
-                topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i64())
+                # idxs[j] is this same load, already issued above the arrival gate.
+                topk_index = idxs[j]
                 if lane_id == fx.Int32(0):
                     gate_v = buffer_load(
                         gate_local_res, slot, vec_width=1, dtype=fx.T.f32(), cache_modifier=19

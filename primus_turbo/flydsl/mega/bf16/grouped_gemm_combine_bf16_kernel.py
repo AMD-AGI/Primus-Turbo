@@ -59,8 +59,6 @@ _NUM_WARPS = _BLOCK_THREADS // _WARP
 _LAYOUTS = ("nt", "nn", "tn")
 _LAYOUT_CODES = {name: code for code, name in enumerate(_LAYOUTS)}
 
-_COMBINE_DEDUP_NPASS = 2
-
 _NUM_REDUCE_BLOCKS = 2048
 
 _COMBINE_FLAG_SCOPE = "sys"
@@ -126,7 +124,6 @@ def _make_grouped_gemm_combine(
     layout="nt",
     apply_weights=False,
     with_gate=False,
-    dedup_npass=2,
     seg_parts=1,
     lead_gemm_blocks=0,
 ):
@@ -316,7 +313,6 @@ def _make_grouped_gemm_combine(
                                 epoch=expected_reduce_i64,
                                 bank_offset=reduce_bank,
                                 with_gate=with_gate,
-                                npass=dedup_npass,
                             )
 
             else:
@@ -524,7 +520,6 @@ def _compiled_grouped_gemm_combine(
     apply_weights: fx.Constexpr[bool],
     with_gate: fx.Constexpr[bool],
     out_fp16: fx.Constexpr[bool],
-    dedup_npass: fx.Constexpr[int],
     seg_parts: fx.Constexpr[int],
     lead_gemm_blocks: fx.Constexpr[int],
     stream: fx.Stream,
@@ -549,7 +544,6 @@ def _compiled_grouped_gemm_combine(
         _LAYOUTS[layout_code],
         apply_weights,
         with_gate,
-        dedup_npass,
         seg_parts,
         lead_gemm_blocks,
     )
@@ -662,7 +656,7 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
     d_topk_w_d = d_topk_w if with_gate else dummy
 
     # Sender-side dedup is the only combine path.
-    assert dedup_key_row.numel() > 1, "combine needs the dispatch dedup tables; run dispatch with dedup=True"
+    assert dedup_key_row.numel() > 1, "combine needs the dispatch dedup tables; handle looks like a meta one"
 
     _compiled_grouped_gemm_combine(
         act_2d,
@@ -702,7 +696,6 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
         apply_weights=bool(apply_weights),
         with_gate=bool(with_gate),
         out_fp16=False,
-        dedup_npass=int(_COMBINE_DEDUP_NPASS),
         seg_parts=int(_COMBINE_SEG_PARTS),
         lead_gemm_blocks=int(_PINNED_CONFIG[layout]["lead_gemm_blocks"]),
         stream=torch.cuda.current_stream(),
