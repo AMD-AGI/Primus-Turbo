@@ -65,7 +65,6 @@ from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (  # noqa:
 )
 from primus_turbo.flydsl.mega import (  # noqa: E402  # noqa: E402
     dispatch_grouped_gemm_bf16_flydsl_kernel,
-    dispatch_prologue_flydsl_kernel,
     grouped_gemm_combine_bf16_flydsl_kernel,
 )
 from primus_turbo.flydsl.mega.ep_intranode import (  # noqa: E402
@@ -76,8 +75,10 @@ from primus_turbo.flydsl.mega.ep_intranode import (  # noqa: E402
     dispatch_bf16_tile,
     topk_reduce_bf16_tile,
 )
-from primus_turbo.flydsl.mega.symm_buffer import (  # noqa: E402
-    BLOCK_M as _POOL_BLOCK_M,
+from primus_turbo.flydsl.mega.runtime import (  # noqa: E402
+    MegaMoEPrecision,
+    MegaPrologueFacade,
+    get_mega_runtime_registry,
 )
 from primus_turbo.flydsl.mega.symm_buffer import (  # noqa: E402
     TOKEN_DTYPE,
@@ -611,24 +612,11 @@ def _get_dispatch_handle(symm, *, T, H, E, K):
     x = torch.randn((T, H), device="cuda", dtype=torch.float32).bfloat16()
     topk_idx, topk_weight = generate_routing(T, K, E, device="cuda")
 
-    # prologue -> flat dispatch handle (same as test); resets scoreboard+barrier, cross-rank barrier. Handle IS the full prologue tuple.
-    handle = dispatch_prologue_flydsl_kernel(
-        topk_idx,
-        topk_weight,
-        sym_buffer=symm.get_sym_buffer(),
-        num_tokens=T,
-        num_topk=K,
-        num_experts=E,
-        num_ranks=symm.world,
-        rank=symm.rank,
-        experts_per_rank=E // symm.world,
-        block_m=_POOL_BLOCK_M,
-        num_max_pool_tokens=symm.num_max_pool_tokens,
-        hidden=symm.hidden,
-        num_max_tokens_per_rank=symm.num_max_tokens_per_rank,
-    )
-    # pool_src_slot is cross-rank (symm); ride it on the handle like the production path
-    handle = tuple(handle) + (symm.pool_src_slot,)
+    runtime = get_mega_runtime_registry().active(MegaMoEPrecision.BF16)
+    if runtime is None:
+        raise RuntimeError("BF16 MegaMoE runtime was not registered")
+    # The benchmark follows the same facade and handle ABI as staged production.
+    handle = MegaPrologueFacade.launch(runtime, topk_idx, topk_weight).handle
     tile_to_expert = handle[5]
     num_tile_blocks = handle[8]  # device real-tile count (prologue-written, per-forward)
     return x, topk_idx, topk_weight, handle, tile_to_expert, num_tile_blocks

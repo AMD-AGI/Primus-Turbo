@@ -33,10 +33,12 @@ from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
     grouped_gemm_bf16_variable_k_tile,
 )
-from primus_turbo.flydsl.mega.dispatch_prologue_kernel import (
-    dispatch_prologue_flydsl_kernel,
-)
 from primus_turbo.flydsl.mega.ep_intranode import _BLOCK_THREADS, dispatch_bf16_tile
+from primus_turbo.flydsl.mega.runtime import (
+    MegaMoEPrecision,
+    MegaPrologueFacade,
+    get_mega_runtime_registry,
+)
 from primus_turbo.flydsl.mega.symm_buffer import (
     TOKEN_DTYPE,
     SymBuffer,
@@ -465,26 +467,11 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
             hidden=hidden,
             intermediate_hidden=l1_weights.shape[1] // 2,
         )
+        runtime = get_mega_runtime_registry().active(MegaMoEPrecision.BF16)
+        if runtime is None:
+            raise RuntimeError("BF16 MegaMoE workspace runtime was not registered")
+        handle = MegaPrologueFacade.launch(runtime, topk_idx, topk_weights).handle
         sym_buffer = symm.get_sym_buffer()
-        handle = tuple(
-            dispatch_prologue_flydsl_kernel(
-                topk_idx,
-                topk_weights,
-                sym_buffer=sym_buffer,
-                num_tokens=num_tokens,
-                num_topk=num_topk,
-                num_experts=symm.num_experts,
-                num_ranks=symm.world,
-                rank=symm.rank,
-                experts_per_rank=experts_per_rank,
-                block_m=BM,
-                num_max_pool_tokens=symm.num_max_pool_tokens,
-                hidden=symm.hidden,
-                num_max_tokens_per_rank=symm.num_max_tokens_per_rank,
-            )
-        )
-
-        handle = handle + (symm.pool_src_slot.clone(),)
     else:
         symm = get_symm_buffer_for_mega_moe()
         sym_buffer = symm.get_sym_buffer()

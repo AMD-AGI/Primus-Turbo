@@ -26,6 +26,7 @@ from typing import Optional, Tuple
 import torch
 from torch.distributed import ProcessGroup
 
+from primus_turbo.flydsl.mega.runtime import get_mega_runtime_registry
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.kernels.fused_mega_moe import (
     fused_mega_moe_backward_impl,
@@ -38,7 +39,6 @@ from primus_turbo.pytorch.kernels.fused_mega_moe import (
 from primus_turbo.pytorch.kernels.fused_mega_moe.staged_contract import (
     MegaMoEPrecision,
     StageState,
-    make_route_state,
 )
 
 __all__ = [
@@ -187,9 +187,12 @@ class FusedMegaMoEStage1Function(torch.autograd.Function):
             l1_out, dispatch_weights, handle = fused_mega_moe_stage1_forward_impl(
                 x, w1, group, topk_idx, topk_weights
             )
+            runtime = get_mega_runtime_registry().active(MegaMoEPrecision.BF16)
+            if runtime is None:
+                raise RuntimeError("BF16 MegaMoE runtime missing after stage1 prologue")
             stage_state = StageState(
                 MegaMoEPrecision.BF16,
-                route=make_route_state(MegaMoEPrecision.BF16, dispatch_weights, handle),
+                dispatch_state=runtime.dispatch_state(handle, dispatch_weights),
             )
 
             ctx.set_materialize_grads(False)
@@ -214,7 +217,7 @@ class FusedMegaMoEStage1Function(torch.autograd.Function):
             if grad_l1 is None:
                 return (None,) * 5
             x, w1 = ctx.saved_tensors
-            handle = ctx.stage_state.require_route().handle
+            handle = ctx.stage_state.require_dispatch().handle
             dx, grad_topk_weights, dW1 = fused_mega_moe_stage1_backward_impl(
                 grad_l1,
                 x,
@@ -247,9 +250,12 @@ class FusedMegaMoEStage2Function(torch.autograd.Function):
         with torch.profiler.record_function("fused_mega_moe_stage2_forward"):
             assert w2.is_cuda and w2.dim() == 3, "w2 must be a 3D CUDA tensor"
             handle = tuple(handle)
+            runtime = get_mega_runtime_registry().active(MegaMoEPrecision.BF16)
+            if runtime is None:
+                raise RuntimeError("BF16 MegaMoE runtime missing before stage2")
             stage_state = StageState(
                 MegaMoEPrecision.BF16,
-                route=make_route_state(MegaMoEPrecision.BF16, dispatch_weights, handle),
+                dispatch_state=runtime.dispatch_state(handle, dispatch_weights),
             )
 
             y = fused_mega_moe_stage2_forward_impl(l1_out, w2, handle, topk_idx, topk_weights)
@@ -267,7 +273,7 @@ class FusedMegaMoEStage2Function(torch.autograd.Function):
     def backward(ctx, grad_y: Optional[torch.Tensor]):
         """grad l1_out (via L2 dgrad + SwiGLU^T) + dW2; grad_gate rides the dispatch_weights slot."""
         with torch.profiler.record_function("fused_mega_moe_stage2_backward"):
-            handle = ctx.stage_state.require_route().handle
+            handle = ctx.stage_state.require_dispatch().handle
             n_in = 6 + len(handle)
             if grad_y is None:
                 return (None,) * n_in
@@ -303,7 +309,6 @@ def fused_mega_moe_stage1(
     :func:`fused_mega_moe_stage2`.
     """
     l1_out, dispatch_weights, *handle = FusedMegaMoEStage1Function.apply(x, topk_idx, topk_weights, w1, group)
-    make_route_state(MegaMoEPrecision.BF16, dispatch_weights, handle)
     return l1_out, dispatch_weights, tuple(handle)
 
 

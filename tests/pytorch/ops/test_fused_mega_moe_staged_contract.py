@@ -7,11 +7,14 @@
 import pytest
 import torch
 
+from primus_turbo.flydsl.mega.runtime import MegaRuntimeRegistry
 from primus_turbo.pytorch.kernels.fused_mega_moe.staged_contract import (
     BF16_HANDLE_SCHEMA,
     MXFP8_HANDLE_SCHEMA,
     MegaMoEPrecision,
+    MegaShape,
     StageState,
+    WorkspaceRequest,
     make_route_state,
 )
 
@@ -51,3 +54,75 @@ def test_stage_state_rejects_mismatched_precision():
 
     with pytest.raises(ValueError, match="cannot carry"):
         state.set_route(route)
+
+
+class _FakeWorkspace:
+    def __init__(self, tag):
+        self.tag = tag
+        self.destroyed = False
+
+    def destroy(self):
+        self.destroyed = True
+
+
+def _request(group, precision, hidden):
+    return WorkspaceRequest(
+        process_group=group,
+        precision=precision,
+        shape=MegaShape(
+            world_size=8,
+            num_experts=256,
+            num_max_tokens_per_rank=8192,
+            num_topk=8,
+            hidden=hidden,
+            intermediate_hidden=2048,
+            num_max_pool_tokens=16384,
+        ),
+    )
+
+
+def test_registry_keeps_one_live_workspace_per_precision():
+    """A symmetric heap is multi-GB; a new shape must retire the previous one."""
+
+    group = object()
+    registry = MegaRuntimeRegistry()
+    first = _FakeWorkspace("first")
+    second = _FakeWorkspace("second")
+
+    registry.acquire(_request(group, MegaMoEPrecision.BF16, 7168), lambda: first)
+    runtime = registry.acquire(_request(group, MegaMoEPrecision.BF16, 4096), lambda: second)
+
+    assert first.destroyed
+    assert not second.destroyed
+    assert runtime.workspace is second
+    assert registry.active(MegaMoEPrecision.BF16) is runtime
+
+
+def test_registry_keeps_precisions_independent():
+    group = object()
+    registry = MegaRuntimeRegistry()
+    bf16 = _FakeWorkspace("bf16")
+    mxfp8 = _FakeWorkspace("mxfp8")
+
+    registry.acquire(_request(group, MegaMoEPrecision.BF16, 7168), lambda: bf16)
+    registry.acquire(_request(group, MegaMoEPrecision.MXFP8, 7168), lambda: mxfp8)
+
+    assert not bf16.destroyed
+    assert not mxfp8.destroyed
+    assert registry.active(MegaMoEPrecision.BF16).workspace is bf16
+    assert registry.active(MegaMoEPrecision.MXFP8).workspace is mxfp8
+
+
+def test_registry_reuses_workspace_for_same_request():
+    group = object()
+    registry = MegaRuntimeRegistry()
+    workspace = _FakeWorkspace("only")
+
+    first = registry.acquire(_request(group, MegaMoEPrecision.BF16, 7168), lambda: workspace)
+    second = registry.acquire(
+        _request(group, MegaMoEPrecision.BF16, 7168),
+        lambda: pytest.fail("factory must not run for a cached request"),
+    )
+
+    assert first is second
+    assert not workspace.destroyed

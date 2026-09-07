@@ -34,6 +34,12 @@ from flydsl.expr import Int32, Int64, struct
 from flydsl.expr.buffer_ops import buffer_load
 from flydsl.expr.typing import Constexpr
 
+from primus_turbo.flydsl.mega.runtime import (
+    MegaMoEPrecision,
+    MegaShape,
+    WorkspaceRequest,
+    get_mega_runtime_registry,
+)
 from primus_turbo.flydsl.utils.prims import addr_buffer_resource
 
 # NOTE: SymmetricMemory is imported lazily inside SymmBuffer.__init__ to avoid a
@@ -230,6 +236,7 @@ class SymmBuffer:
         self.block_m = block_m
         self.block_n = block_n
         self.use_mxfp8 = bool(use_mxfp8)
+        self.precision = MegaMoEPrecision.MXFP8
 
         slice_input_buffers, signal_spec, num_bytes, signal_bytes, meta = _build_layout_spec(
             self.world,
@@ -246,6 +253,17 @@ class SymmBuffer:
         # num_tokens / num_experts / hidden / num_max_pool_tokens / ...
         self.__dict__.update(meta)
         self.experts_per_rank = num_experts // self.world
+        self.shape = MegaShape(
+            world_size=self.world,
+            num_experts=int(num_experts),
+            num_max_tokens_per_rank=int(num_max_tokens_per_rank),
+            num_topk=int(num_topk),
+            hidden=int(hidden),
+            intermediate_hidden=int(intermediate_hidden),
+            num_max_pool_tokens=int(self.num_max_pool_tokens),
+            block_m=int(block_m),
+            block_n=int(block_n),
+        )
         # keep the allocation sizes so the global getter can size-check + reuse
         self.num_bytes = num_bytes
         self.signal_bytes = signal_bytes
@@ -405,18 +423,14 @@ class SymmBuffer:
         )
 
     def destroy(self):
-        global _CURRENT_SYMM_BUFFER
-        if _CURRENT_SYMM_BUFFER is self:
-            _CURRENT_SYMM_BUFFER = None
+        registry = getattr(self, "_mega_runtime_registry", None)
+        if registry is not None and not getattr(self, "_mega_runtime_destroying", False):
+            registry.destroy(self._mega_runtime_request)
+            return
         try:
             self.sm.destroy()
         except Exception:
             pass
-
-
-# The single live symmetric buffer, exposed globally so kernels can fetch the
-# active symmetric workspace without threading it through every call.
-_CURRENT_SYMM_BUFFER = None
 
 
 def get_symm_buffer_for_mega_moe(
@@ -441,15 +455,16 @@ def get_symm_buffer_for_mega_moe(
 
     Called with no ``group`` it returns the live buffer -- kernels fetch the workspace
     this way instead of receiving it as a parameter; raises if none exists yet."""
-    global _CURRENT_SYMM_BUFFER
+    registry = get_mega_runtime_registry()
     if group is None:
-        if _CURRENT_SYMM_BUFFER is None:
+        runtime = registry.active(MegaMoEPrecision.MXFP8)
+        if runtime is None:
             raise RuntimeError(
                 "no symmetric buffer is active; call get_symm_buffer_for_mega_moe(group, ...) first"
             )
-        return _CURRENT_SYMM_BUFFER
+        return runtime.workspace
 
-    need_bytes, _, need_signal_bytes, _ = get_symm_buffer_size_for_mega_moe(
+    need_bytes, _, need_signal_bytes, meta = get_symm_buffer_size_for_mega_moe(
         group.size(),
         num_experts,
         num_max_tokens_per_rank,
@@ -462,18 +477,26 @@ def get_symm_buffer_for_mega_moe(
         use_mxfp8=use_mxfp8,
     )
 
-    symm = _CURRENT_SYMM_BUFFER
-
-    if (
-        symm is None
-        or symm.group is not group
-        or symm.num_bytes < need_bytes
-        or symm.signal_bytes < need_signal_bytes
-        or bool(getattr(symm, "use_mxfp8", False)) != bool(use_mxfp8)
-    ):
-        if symm is not None:
-            symm.destroy()
-        symm = SymmBuffer(
+    shape = MegaShape(
+        world_size=group.size(),
+        num_experts=int(num_experts),
+        num_max_tokens_per_rank=int(num_max_tokens_per_rank),
+        num_topk=int(num_topk),
+        hidden=int(hidden),
+        intermediate_hidden=int(intermediate_hidden),
+        num_max_pool_tokens=int(meta["num_max_pool_tokens"]),
+        block_m=int(block_m),
+        block_n=int(block_n),
+    )
+    request = WorkspaceRequest(
+        process_group=group,
+        precision=MegaMoEPrecision.MXFP8,
+        shape=shape,
+        tile_config=(int(block_m), int(block_n), int(pool_mult), bool(use_mxfp8)),
+    )
+    runtime = registry.acquire(
+        request,
+        lambda: SymmBuffer(
             group,
             num_experts=num_experts,
             num_max_tokens_per_rank=num_max_tokens_per_rank,
@@ -484,9 +507,11 @@ def get_symm_buffer_for_mega_moe(
             block_n=block_n,
             pool_mult=pool_mult,
             use_mxfp8=use_mxfp8,
-        )
-        _CURRENT_SYMM_BUFFER = symm
-    return symm
+        ),
+    )
+    assert runtime.workspace.num_bytes >= need_bytes
+    assert runtime.workspace.signal_bytes >= need_signal_bytes
+    return runtime.workspace
 
 
 # ============================================================================

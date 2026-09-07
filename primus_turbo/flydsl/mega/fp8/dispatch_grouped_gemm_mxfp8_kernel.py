@@ -46,7 +46,6 @@ from flydsl.expr.typing import AddressSpace, PointerType
 from torch.distributed import ProcessGroup
 
 from primus_turbo.flydsl.mega.ep_intranode import _BLOCK_THREADS, _WARP
-from primus_turbo.flydsl.mega.fp8.dispatch_prologue import dispatch_prologue
 from primus_turbo.flydsl.mega.fp8.gemm_mxfp8_tile import (
     BLOCK_K,
     gemm_mxfp8_nt_tile,
@@ -60,6 +59,11 @@ from primus_turbo.flydsl.mega.fp8.prims import (
 )
 from primus_turbo.flydsl.mega.fp8.quant import quantize_rowwise_mxfp8_flydsl
 from primus_turbo.flydsl.mega.fp8.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
+from primus_turbo.flydsl.mega.runtime import (
+    MegaMoEPrecision,
+    MegaPrologueFacade,
+    get_mega_runtime_registry,
+)
 from primus_turbo.flydsl.utils.gemm_helper import (
     _emit_lds_repack,
     emit_for,
@@ -779,22 +783,11 @@ def dispatch_l1_fwd_mxfp8_flydsl_kernel(
         use_mxfp8=True,
     )
     sym_layout = symm.make_sym_layout()
-    handle = extend_handle(
-        dispatch_prologue(
-            topk_idx,
-            topk_weights,
-            sym_layout=sym_layout,
-            num_tokens=T,
-            num_topk=K,
-            num_experts=G * world,
-            world_size=world,
-            rank=symm.rank,
-            experts_per_rank=G,
-            block_m=BM,
-            num_max_pool_tokens=symm.num_max_pool_tokens,
-        ),
-        symm,
-    )
+    runtime = get_mega_runtime_registry().active(MegaMoEPrecision.MXFP8)
+    if runtime is None:
+        raise RuntimeError("MXFP8 MegaMoE workspace runtime was not registered")
+    dispatch_state = MegaPrologueFacade.launch(runtime, topk_idx, topk_weights)
+    handle = dispatch_state.handle
     l1 = dispatch_grouped_gemm_mxfp8(
         x,
         w1_fp8,

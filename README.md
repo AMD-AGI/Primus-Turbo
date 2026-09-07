@@ -15,6 +15,15 @@ With **High Performance**, **Full-Featured**, and **Developer-Friendly** as its 
 </p>
 Note: JAX support is under active development. Optim support is planned but not yet available.
 
+### MegaMoE runtime paths
+
+MegaMoE staged BF16 and MXFP8 share the runtime contract in
+`primus_turbo.flydsl.mega.runtime`: `MegaRuntime`, `DispatchState`,
+`StageState`, named handle schemas, the workspace registry, and the prologue
+facade. Barriers, GEMM, quantization, and the physical single-heap/two-heap
+storage remain precision-specific. The staged APIs under
+`primus_turbo.pytorch.ops.moe` are the canonical training entry points.
+
 ## 🚀 What's New
 - **[2025/12/16]** 🔥[MoE Training Best Practices on AMD GPUs](https://rocm.blogs.amd.com/software-tools-optimization/primus-moe-package/README.html)
 - **[2025/12/01]** 🔥[Efficient MoE Pre-training at Scale on 1K AMD GPUs with TorchTitan.](https://pytorch.org/blog/efficient-moe-pre-training-at-scale-with-torchtitan/)

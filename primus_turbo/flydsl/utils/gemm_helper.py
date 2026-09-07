@@ -1908,10 +1908,13 @@ def _emit_lds_repack(
     pack=1,
     kbound=None,
     k128p=None,
+    rd_cm=0,
+    st_cm=0,
 ):
     # LDS-tiled transpose body (one workgroup, one (grp,k-chunk)). rd_base/wr_base
     # (default 0) shift the flat read/write offset to a group's slab (0 = dense).
     # kbound (default K128) bounds this chunk's k index; k128p (default ceildiv(K128,pack)) is the output k-stride, so the variable-K wgrad packs each group from its own k0.
+    # rd_cm/st_cm are cache modifiers for fused peer-produced scale data.
     NT = 4
     TILE = 64 * KT
     assert KT % pack == 0 and TILE % BLK == 0 and ((KT // pack) * 64) % BLK == 0
@@ -1933,6 +1936,7 @@ def _emit_lds_repack(
             vec_width=1,
             dtype=T.i32,
             mask=(gk < KBND) & (grow < dim),
+            cache_modifier=rd_cm,
         )
         fx.make_view(fx.add_offset(tile.ptr, fx.make_int_tuple(idx)), fx.make_layout(1, 1)).store(
             Vec.from_elements([fx.Int32(dw)], fx.Int32)
@@ -1968,6 +1972,7 @@ def _emit_lds_repack(
             rout,
             ((grp * K128p + gkp) * 64 + lane) * 4 + wr_base,
             mask=(k0 + kkp * PACK) < KBND,
+            cache_modifier=st_cm,
         )
 
 

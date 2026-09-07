@@ -26,6 +26,7 @@ from typing import Optional
 import torch
 from torch.distributed import ProcessGroup
 
+from primus_turbo.flydsl.mega.runtime import get_mega_runtime_registry
 from primus_turbo.pytorch.kernels.fused_mega_moe import (
     fused_mega_moe_stage1_backward_fp8_impl,
     fused_mega_moe_stage1_forward_fp8_impl,
@@ -35,7 +36,6 @@ from primus_turbo.pytorch.kernels.fused_mega_moe import (
 from primus_turbo.pytorch.kernels.fused_mega_moe.staged_contract import (
     MegaMoEPrecision,
     StageState,
-    make_route_state,
 )
 
 # This op file exports only its own final API (the autograd Function + its wrapper). Everything else
@@ -119,7 +119,10 @@ class FusedMegaMoEFP8Stage1Function(torch.autograd.Function):
                 topk_weights,
                 save_bwd=save_bwd,
             )
-            state.set_route(make_route_state(MegaMoEPrecision.MXFP8, dispatch_weights, handle))
+            runtime = get_mega_runtime_registry().active(MegaMoEPrecision.MXFP8)
+            if runtime is None:
+                raise RuntimeError("MXFP8 MegaMoE runtime missing after stage1 prologue")
+            state.set_dispatch(runtime.dispatch_state(handle, dispatch_weights))
             state.pool_x_colwise = pool_x_colwise
             state.colwise_meta = colwise_meta
 
@@ -148,7 +151,7 @@ class FusedMegaMoEFP8Stage1Function(torch.autograd.Function):
             state = ctx.state
             if state.grad_l1_rowwise_fp8 is None:  # stage2.backward never ran -> nothing to do
                 return (None,) * 6
-            route = state.require_route()
+            route = state.require_dispatch().route
             route.assert_same_handle(ctx.handle)
             (w1,) = ctx.saved_tensors
 
@@ -191,7 +194,7 @@ class FusedMegaMoEFP8Stage2Function(torch.autograd.Function):
                 "w2 must be a 3D bf16 CUDA tensor"
             )
             handle = tuple(handle)
-            state.require_route().assert_same_handle(handle)
+            state.require_dispatch().route.assert_same_handle(handle)
 
             y = fused_mega_moe_stage2_forward_fp8_impl(
                 l1,
@@ -223,7 +226,7 @@ class FusedMegaMoEFP8Stage2Function(torch.autograd.Function):
                 return (None,) * n_in
             l1, dispatch_weights, w2 = ctx.saved_tensors
             state = ctx.state
-            route = state.require_route()
+            route = state.require_dispatch().route
             route.assert_same_handle(handle)
 
             (

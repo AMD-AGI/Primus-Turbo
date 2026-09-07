@@ -18,6 +18,13 @@ import torch
 from flydsl.expr.numeric import Int64
 from flydsl.expr.typing import AddressSpace, Pointer, PointerType, address_space_from_attr
 
+from primus_turbo.flydsl.mega.runtime import (
+    MegaMoEPrecision,
+    MegaShape,
+    WorkspaceRequest,
+    get_mega_runtime_registry,
+)
+
 
 def align(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
@@ -285,6 +292,7 @@ class SymmBuffer:
         self.num_topk = int(num_topk)
         self.hidden = int(hidden)
         self.intermediate_hidden = int(intermediate_hidden)
+        self.precision = MegaMoEPrecision.BF16
         self.key = (
             self.world,
             self.num_experts,
@@ -317,6 +325,15 @@ class SymmBuffer:
         self.num_max_pool_tokens = workspace.num_max_pool_tokens
         self.num_combine_slots = workspace.num_combine_slots
         self.num_tokens = self.num_max_tokens_per_rank  # back-compat alias
+        self.shape = MegaShape(
+            world_size=self.world,
+            num_experts=self.num_experts,
+            num_max_tokens_per_rank=self.num_max_tokens_per_rank,
+            num_topk=self.num_topk,
+            hidden=self.hidden,
+            intermediate_hidden=self.intermediate_hidden,
+            num_max_pool_tokens=self.num_max_pool_tokens,
+        )
 
         # allocate the single symmetric-memory heap (custom HIP IPC; ctor zeroes it, skip signal pad)
         from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
@@ -361,18 +378,16 @@ class SymmBuffer:
         return self._sym_buffer
 
     def destroy(self) -> None:
-        global _CURRENT_SYMM_BUFFER
-        if _CURRENT_SYMM_BUFFER is self:
-            _CURRENT_SYMM_BUFFER = None
+        registry = getattr(self, "_mega_runtime_registry", None)
+        if registry is not None and not getattr(self, "_mega_runtime_destroying", False):
+            registry.destroy(self._mega_runtime_request)
+            return
         # region views are non-owning aliases of the raw heap ptr; free the heap, then drop refs
         self._sym_buffer = None
         if self.symm_mem is not None:
             self.symm_mem.destroy()
         self.symm_mem = None
         self.buffer = None
-
-
-_CURRENT_SYMM_BUFFER = None
 
 
 def get_symm_buffer_for_mega_moe(
@@ -386,29 +401,39 @@ def get_symm_buffer_for_mega_moe(
     token_dtype: torch.dtype = TOKEN_DTYPE,
 ) -> SymmBuffer:
     """Cached per-(group, dims, dtype) SymmBuffer; no-arg call returns the active one."""
-    global _CURRENT_SYMM_BUFFER
+    registry = get_mega_runtime_registry()
     if group is None:
-        if _CURRENT_SYMM_BUFFER is None:
+        runtime = registry.active(MegaMoEPrecision.BF16)
+        if runtime is None:
             raise RuntimeError(
                 "no symmetric buffer is active; call get_symm_buffer_for_mega_moe(group, ...) first"
             )
-        return _CURRENT_SYMM_BUFFER
+        return runtime.workspace
 
     num_max_tokens_per_rank = align(int(num_max_tokens_per_rank), TOKEN_ALIGNMENT)
-    key = (
-        group.size(),
-        int(num_experts),
-        num_max_tokens_per_rank,
-        int(num_topk),
-        int(hidden),
-        int(intermediate_hidden),
-        token_dtype,
+    shape = MegaShape(
+        world_size=group.size(),
+        num_experts=int(num_experts),
+        num_max_tokens_per_rank=num_max_tokens_per_rank,
+        num_topk=int(num_topk),
+        hidden=int(hidden),
+        intermediate_hidden=int(intermediate_hidden),
+        num_max_pool_tokens=get_num_max_pool_tokens(
+            group.size(),
+            num_max_tokens_per_rank,
+            int(num_topk),
+            int(num_experts) // group.size(),
+        ),
     )
-    symm = _CURRENT_SYMM_BUFFER
-    if symm is None or symm.group is not group or symm.key != key:
-        if symm is not None:
-            symm.destroy()
-        symm = SymmBuffer(
+    request = WorkspaceRequest(
+        process_group=group,
+        precision=MegaMoEPrecision.BF16,
+        shape=shape,
+        tile_config=(str(token_dtype),),
+    )
+    runtime = registry.acquire(
+        request,
+        lambda: SymmBuffer(
             group,
             num_experts=num_experts,
             num_max_tokens_per_rank=num_max_tokens_per_rank,
@@ -416,6 +441,6 @@ def get_symm_buffer_for_mega_moe(
             hidden=hidden,
             intermediate_hidden=intermediate_hidden,
             token_dtype=token_dtype,
-        )
-        _CURRENT_SYMM_BUFFER = symm
-    return symm
+        ),
+    )
+    return runtime.workspace
