@@ -218,6 +218,8 @@ def _compile_grouped_nn(
     beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
     dglu: bool = False,  # fuse the SwiGLU gradient into the epilogue: read l1, write dl1 [M,2I] and grad_probs partials, so dact never reaches HBM
     glu_i: int = 0,  # activation width I; the GEMM's N already equals it, so no geometry changes (unlike the fwd)
+    activation: str = "silu",  # (with dglu) the GLU gate; see SUPPORTED_ACTIVATIONS
+    clamp_limit=None,  # (with dglu) clamp bound; see _glu_clamp
 ):
     """Persistent (CPU-sync-free) grouped NN dgrad: a fixed grid of WGs strides the tile
     space via scf.for, amortising per-WG fixed cost. ``group_m``/``group_n`` port the NT
@@ -509,6 +511,8 @@ def _compile_grouped_nn(
                     wave_id,
                     col_safe=_col_safe,
                     store_aux=cstore_aux,
+                    activation=activation,
+                    clamp_limit=clamp_limit,
                 )
             elif const_expr(store_cshuffle):
                 store_c = StoreCPerTensorCShuffle(
@@ -912,6 +916,8 @@ def _compile_grouped_nt(
     glu: bool = False,  # fuse a SwiGLU epilogue: B_T is [2I, K] gate||up, the tile pairs the two bands in registers and writes l1 [M,2I] + act [M,I]
     glu_i: int = 0,  # gate half width I (required when glu); N is this same I, i.e. the activation's width
     glu_act_aux: int = 0,  # aux immediate for the act store alone (it is pure streaming output, so evict-first may pay where it would not for l1)
+    activation: str = "silu",  # (with glu) the GLU gate; see SUPPORTED_ACTIVATIONS
+    clamp_limit=None,  # (with glu) clamp bound; see _glu_clamp
 ):
     """Grouped NT forward (out = a @ b^T). persistent=True: a fixed grid of WGs strides the
     tile space via scf.for (cap_cu reserves CUs for comm overlap); persistent=False: one tile
@@ -1165,6 +1171,8 @@ def _compile_grouped_nt(
                     col_safe=_col_safe,
                     store_aux=_cstore_aux,
                     act_aux=glu_act_aux,
+                    activation=activation,
+                    clamp_limit=clamp_limit,
                 )
             elif const_expr(store_cshuffle):
                 store_c = StoreCPerTensorCShuffle(

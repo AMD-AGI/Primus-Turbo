@@ -17,12 +17,19 @@ from primus_turbo.triton.activation.swiglu_kernel import (
 )
 
 
-def swiglu_fwd_with_probs(x: torch.Tensor, probs: torch.Tensor, row_mask: Optional[torch.Tensor] = None):
+def swiglu_fwd_with_probs(
+    x: torch.Tensor,
+    probs: torch.Tensor,
+    row_mask: Optional[torch.Tensor] = None,
+    clamp_limit: Optional[float] = None,
+):
     num_tokens, double_hidden_size = x.size()
 
     probs = probs.unsqueeze(-1)
 
     out = torch.empty(num_tokens, double_hidden_size // 2, dtype=x.dtype, device=x.device)
+
+    has_clamp = clamp_limit is not None
 
     if row_mask is None:
         grid = (num_tokens,)
@@ -34,7 +41,9 @@ def swiglu_fwd_with_probs(x: torch.Tensor, probs: torch.Tensor, row_mask: Option
             stride_x_token=x.stride(0),
             stride_probs_token=probs.stride(0),
             stride_out_token=out.stride(0),
+            clamp_limit=float(clamp_limit) if has_clamp else 0.0,
             LOAD_WIDTH=triton.next_power_of_2(double_hidden_size // 2),
+            HAS_CLAMP=has_clamp,
         )
     else:
         assert row_mask.is_cuda, "row_mask must be a CUDA tensor"
@@ -50,8 +59,10 @@ def swiglu_fwd_with_probs(x: torch.Tensor, probs: torch.Tensor, row_mask: Option
             stride_x_token=x.stride(0),
             stride_probs_token=probs.stride(0),
             stride_out_token=out.stride(0),
+            clamp_limit=float(clamp_limit) if has_clamp else 0.0,
             LOAD_WIDTH=triton.next_power_of_2(double_hidden_size // 2),
             BLOCK_SIZE=BLOCK_SIZE,
+            HAS_CLAMP=has_clamp,
         )
 
     return out
@@ -62,11 +73,14 @@ def swiglu_bwd_with_probs(
     x: torch.Tensor,
     probs: torch.Tensor,
     row_mask: Optional[torch.Tensor] = None,
+    clamp_limit: Optional[float] = None,
 ):
     num_tokens, hidden_size = grad_out.size()
 
     grad_x = torch.empty_like(x)
     grad_probs = torch.empty_like(probs)
+
+    has_clamp = clamp_limit is not None
 
     if row_mask is None:
         grid = (num_tokens,)
@@ -82,7 +96,9 @@ def swiglu_bwd_with_probs(
             stride_probs_token=probs.stride(0),
             stride_grad_x_token=grad_x.stride(0),
             stride_grad_probs_token=grad_probs.stride(0),
+            clamp_limit=float(clamp_limit) if has_clamp else 0.0,
             LOAD_WIDTH=triton.next_power_of_2(hidden_size),
+            HAS_CLAMP=has_clamp,
         )
     else:
         assert row_mask.is_cuda, "tokens_per_expert must be a CUDA tensor"
@@ -102,8 +118,10 @@ def swiglu_bwd_with_probs(
             stride_probs_token=probs.stride(0),
             stride_grad_x_token=grad_x.stride(0),
             stride_grad_probs_token=grad_probs.stride(0),
+            clamp_limit=float(clamp_limit) if has_clamp else 0.0,
             LOAD_WIDTH=triton.next_power_of_2(hidden_size),
             BLOCK_SIZE=BLOCK_SIZE,
+            HAS_CLAMP=has_clamp,
         )
 
     return grad_x, grad_probs

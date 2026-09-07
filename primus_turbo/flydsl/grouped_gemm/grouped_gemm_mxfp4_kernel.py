@@ -275,6 +275,8 @@ def _build_grouped_mxfp4_nt_kernel(
     dglu_act_quant=False,
     epi_row_sr=False,
     epi_col_sr=False,
+    activation="silu",  # the GLU gate; see SUPPORTED_ACTIVATIONS
+    clamp_limit=None,  # clamp bound; see _glu_clamp
 ):
     """Grouped MXFP4 NT (out = a @ b^T), per-group A rows + per-expert B, whole-loop compute.
     K is the 256-rounded scale extent; ``k_real`` (<=K, 128-multiple) is the operands' true
@@ -334,7 +336,7 @@ def _build_grouped_mxfp4_nt_kernel(
         and (not dglu)
         and ((not glu) or _GLU_BAND or (_BILV_OK and glu_i % N_TILES_BH == 0))
         and bool(_K128)
-        and (KI_LOOP % 2 == 1 or KI_LOOP >= 4)
+        and KI_LOOP >= 4
     )
     _BILV = N_TILES_BH if (_CSTORE and _BILV_OK) else 0
     _COL_SAFE = (N % _NCB == 0) if glu else (N % BLOCK_N == 0)
@@ -594,6 +596,8 @@ def _build_grouped_mxfp4_nt_kernel(
                 band_drop=(not _COL_SAFE) and _GLU_BAND,
                 cst=_CSTORE,
                 act_aux=_GLU_ACT_AUX,
+                activation=activation,
+                clamp_limit=clamp_limit,
             )
             _glu_args = (
                 None,
@@ -664,6 +668,8 @@ def _build_grouped_mxfp4_nt_kernel(
                 row_pad=_dglu_pad,
                 col_safe=_COL_SAFE,
                 store_aux=_DGLU_AUX,
+                activation=activation,
+                clamp_limit=clamp_limit,
             )
             if const_expr(dglu_act_quant):
                 _row_stride = 2 * N_TILES_BH * 16 + _dglu_pad
@@ -1001,6 +1007,8 @@ def _compile_grouped_mxfp4_nt_glu(
     dglu_epi_quant=False,
     epi_row_sr=False,
     epi_col_sr=False,
+    activation="silu",
+    clamp_limit=None,
 ):
     """The NT compile of :func:`_compile_grouped_mxfp4_nt_fused` with a fused GLU epilogue.
 
@@ -1037,6 +1045,8 @@ def _compile_grouped_mxfp4_nt_glu(
         dglu_act_quant=dglu_epi_quant,
         epi_row_sr=epi_row_sr,
         epi_col_sr=epi_col_sr,
+        activation=activation,
+        clamp_limit=clamp_limit,
     )
     ab_pre_shuf = _build_grouped_mxfp4_ab_preshuffle(
         K128, G, N_b, k128_rd, b_ilv=b_ilv, glu_i=glu_i if glu else 0

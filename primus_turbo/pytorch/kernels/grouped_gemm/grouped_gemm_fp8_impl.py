@@ -1257,6 +1257,7 @@ def grouped_gemm_fp8_glu_impl(
     out_row_scaling_recipe: ScalingRecipe,
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
+    clamp_limit: float | None = None,
     k_align: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """fc1 grouped GEMM with the GLU activation and its quantisation fused in.
@@ -1312,6 +1313,7 @@ def grouped_gemm_fp8_glu_impl(
         intermediate,
         trans_b=trans_b,
         activation=activation,
+        clamp_limit=clamp_limit,
         out_dtype=out_dtype,
         num_cu=num_cu,
     )
@@ -1342,6 +1344,7 @@ def grouped_gemm_fp8_dglu_impl(
     out_row_scaling_recipe: ScalingRecipe,
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
+    clamp_limit: float | None = None,
     i_real: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """fc2 dgrad with the GLU activation gradient and its quantisation fused in.
@@ -1398,6 +1401,7 @@ def grouped_gemm_fp8_dglu_impl(
         grad_probs_partial,
         trans_b=trans_b,
         activation=activation,
+        clamp_limit=clamp_limit,
         num_cu=num_cu,
         i_real=i_real,
     )
@@ -1424,6 +1428,7 @@ def grouped_gemm_fp8_glu_impl_meta(
     out_row_scaling_recipe: ScalingRecipe,
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
+    clamp_limit: float | None = None,
     k_align: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     _check_glu_dispatch(config, trans_a)
@@ -1470,6 +1475,7 @@ def grouped_gemm_fp8_dglu_impl_meta(
     out_row_scaling_recipe: ScalingRecipe,
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
+    clamp_limit: float | None = None,
     i_real: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     _check_glu_dispatch(config, trans_a)

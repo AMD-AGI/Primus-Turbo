@@ -37,6 +37,10 @@ from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp4_kernel import (
     _select_gmxfp4_nt_cfg,
 )
 from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import MB, _next_sr_seed
+from primus_turbo.flydsl.utils.gemm_epilogue_helper import (
+    _check_activation,
+    _check_clamp_limit,
+)
 from primus_turbo.flydsl.utils.prims import ceildiv
 
 _GMXFP4_GLU_CACHE: dict = {}  # -> [launch, compiled, n_blocks]
@@ -65,6 +69,8 @@ def _glu_entry(
     dglu_epi_quant=False,
     epi_row_sr=False,
     epi_col_sr=False,
+    activation="silu",
+    clamp_limit=None,
 ):
     """Compiled launch for one fused shape, cached on the static shape + blocking."""
     gm, xcd, gn, span, _nt = cfg
@@ -86,6 +92,8 @@ def _glu_entry(
         dglu_epi_quant,
         epi_row_sr,
         epi_col_sr,
+        activation,
+        clamp_limit,
     )
     ent = _GMXFP4_GLU_CACHE.get(key)
     if ent is None:
@@ -111,6 +119,8 @@ def _glu_entry(
             dglu_epi_quant=dglu_epi_quant,
             epi_row_sr=epi_row_sr,
             epi_col_sr=epi_col_sr,
+            activation=activation,
+            clamp_limit=clamp_limit,
         )
         ent = [launch, None, n_blocks]
         _GMXFP4_GLU_CACHE[key] = ent
@@ -169,6 +179,7 @@ def grouped_gemm_mxfp4_epi_glu_quant_flydsl_kernel(
     K: int,
     *,
     activation: str = "silu",
+    clamp_limit: "float | None" = None,
     row_use_sr: bool = False,
     col_use_sr: bool = False,
     out_dtype=torch.bfloat16,
@@ -176,7 +187,7 @@ def grouped_gemm_mxfp4_epi_glu_quant_flydsl_kernel(
     """fc1 GLU whose activation is quantised in the epilogue, never reaching bf16.
 
     Computes ``l1 = [gate|up] = a[g] @ b[g]^T`` [M, 2I] under the MX block scales, and
-    ``act = silu(gate) * up * probs`` [M, I] straight into the two MXFP4 operands the
+    ``act = f(gate) * up * probs`` [M, I] straight into the two MXFP4 operands the
     MLP actually consumes -- row-wise for fc2 and col-wise (RHT) for the wgrad --
     computed from the accumulators. Against staging ``act`` in bf16 that removes an
     [M, I] write, the quantiser's read of it, and a kernel launch.
@@ -192,13 +203,16 @@ def grouped_gemm_mxfp4_epi_glu_quant_flydsl_kernel(
     tail is handled here because a tile covers it.
 
     Args:
+        clamp_limit: pre-multiplication clamp bound, or None for no clamp; silu only.
+            See :func:`~primus_turbo.flydsl.utils.gemm_epilogue_helper._glu_clamp`.
         row_use_sr: stochastic-round the row-wise operand, seeded per micro-block from
             its linear index in the scale tensor, the same id the standalone quantiser
             uses.
         col_use_sr: the same for the col-wise operand, off a salted seed so a block the
             two share does not draw one sequence twice.
     """
-    assert activation == "silu", f"FlyDSL fused GLU implements silu only, got {activation}"
+    _check_activation(activation)
+    _check_clamp_limit(activation, clamp_limit)
     assert a.ndim == 2 and b.ndim == 3
     assert N % 2 == 0, f"fc1 width must be even (gate||up), got {N}"
     I = N // 2
@@ -222,6 +236,8 @@ def grouped_gemm_mxfp4_epi_glu_quant_flydsl_kernel(
         epi_act_quant=True,
         epi_row_sr=row_use_sr,
         epi_col_sr=col_use_sr,
+        activation=activation,
+        clamp_limit=clamp_limit,
     )
     # The col-wise operand's row stride: one 256-block per tile row, per group.
     col_rows = col_out.shape[1] * 2
@@ -303,6 +319,7 @@ def grouped_gemm_mxfp4_epi_dglu_quant_flydsl_kernel(
     K: int,
     *,
     activation: str = "silu",
+    clamp_limit: "float | None" = None,
     row_use_sr: bool = False,
     col_use_sr: bool = False,
     out_dtype=torch.bfloat16,
@@ -327,6 +344,8 @@ def grouped_gemm_mxfp4_epi_dglu_quant_flydsl_kernel(
     Args:
         N: the weight's row count per expert, i.e. ``I``.
         K: the true contraction, unpadded.
+        clamp_limit: pre-multiplication clamp bound, or None for no clamp; silu only.
+            Must match the forward's, which decided the values this differentiates.
         row_use_sr: stochastic-round the row-wise operand, as the gradient recipe
             asks. Seeded per micro-block from its linear index in the scale tensor,
             the same id the standalone quantiser uses.
@@ -336,7 +355,8 @@ def grouped_gemm_mxfp4_epi_dglu_quant_flydsl_kernel(
     Returns:
         ``(row_out, row_sc, col_out, col_sc)``.
     """
-    assert activation == "silu", f"FlyDSL fused dGLU implements silu only, got {activation}"
+    _check_activation(activation)
+    _check_clamp_limit(activation, clamp_limit)
     assert a.ndim == 2 and b.ndim == 3 and intermediate.ndim == 2
     I = N
     assert dglu_epi_quant_supported(K, I, out_dtype), (
@@ -370,6 +390,8 @@ def grouped_gemm_mxfp4_epi_dglu_quant_flydsl_kernel(
         dglu_epi_quant=True,
         epi_row_sr=row_use_sr,
         epi_col_sr=col_use_sr,
+        activation=activation,
+        clamp_limit=clamp_limit,
     )
     # The col-wise operand's row stride: one 256-block per tile row, per group.
     col_rows = col_out.shape[1] * 2
