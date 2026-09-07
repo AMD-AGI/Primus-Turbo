@@ -27,11 +27,8 @@ from primus_turbo.pytorch.core.backend import (
 
 _SUPPORTED_DTYPES = (torch.bfloat16,)
 
-# dispatch handle layout (see dispatch_prologue return + pool_src_slot snapshot):
-# 0-5 send/dispatch tables + tile_to_expert, 6 real_count_per_expert,
-# 7 num_tokens_per_expert_prefix, 8 num_tile_blocks, 9-11 combine_recv_*, 12 pool_src_slot.
-_HANDLE_LEN = 13
-_H_NUM_TILE_BLOCKS = 8
+# Flat dispatch handle; its layout lives in dispatch_prologue_kernel.py.
+_HANDLE_LEN = 15
 
 
 class FusedMegaMoEForwardFlyDSLBackend(KernelBackend):
@@ -76,8 +73,10 @@ class FusedMegaMoEForwardFlyDSLBackend(KernelBackend):
             layout=layout,
         )
 
+        num_tile_blocks, *_tables = handle
+
         # bound swiglu by THIS handle's tile count (per-forward, not shared symm)
-        act = swiglu_flydsl_kernel(l1_out, num_tile_blocks=handle[_H_NUM_TILE_BLOCKS])
+        act = swiglu_flydsl_kernel(l1_out, num_tile_blocks=num_tile_blocks)
 
         # fused grouped L2 GEMM + combine PUSH + topk reduce
         y, _ = grouped_gemm_combine_bf16_flydsl_kernel(
@@ -89,8 +88,6 @@ class FusedMegaMoEForwardFlyDSLBackend(KernelBackend):
             layout=layout,
         )
 
-        # ABI guard: catch a kernel return-order change loudly.
-        assert len(handle) == _HANDLE_LEN, f"dispatch handle len {len(handle)} != {_HANDLE_LEN}; ABI changed"
         return (
             y,
             l1_out,
@@ -178,25 +175,12 @@ def _fused_mega_moe_forward_meta(
 
     # Handle must have real length under compile: save_for_backward(..., *handle) fixes
     # its length at trace time, so an empty fake -> len-0 handle in backward. Only count
-    # and dtype matter here (opaque saved activations); real shapes come from eager. See
-    # dispatch_prologue_flydsl_kernel for the ABI (0-11) + dispatch launcher (12).
+    # and dtype matter here (opaque saved activations); real shapes come from eager.
     i32 = lambda: x.new_empty((0,), dtype=torch.int32)  # noqa: E731
     i64 = lambda: x.new_empty((0,), dtype=torch.int64)  # noqa: E731
-    handle = [
-        i32(),
-        i32(),
-        i32(),
-        i32(),  # 0-3 expert_send_dst_rank/dst_row/count/offset
-        i32(),
-        i32(),  # 4 dispatched_token_idx  5 tile_to_expert
-        i64(),
-        i64(),  # 6 real_count_per_expert  7 padded-prefix
-        i32(),  # 8 num_tile_blocks
-        i32(),
-        i32(),
-        i32(),  # 9-11 combine_recv_dst_rank/start_row/count
-        i32(),  # 12 pool_src_slot
-    ]
+    combine = [i32() for _ in range(8)]  # slot ids + tile map + kind + recv plan
+    dispatch = [i32() for _ in range(4)]  # send plan
+    handle = [i32(), *combine, *dispatch, i64(), i64()]  # tail: prefix, real_count
     assert len(handle) == _HANDLE_LEN
     return y, l1_out, dispatch_weights_in_buf, handle
 
@@ -230,9 +214,5 @@ def fused_mega_moe_forward_impl(
         topk_weights,
         layout,
     )
-    return (
-        y,
-        l1_out,
-        dispatch_weights_in_buf,
-        tuple(handle),
-    )
+    assert len(handle) == _HANDLE_LEN, f"handle has {len(handle)} tensors, expected {_HANDLE_LEN}"
+    return y, l1_out, dispatch_weights_in_buf, tuple(handle)

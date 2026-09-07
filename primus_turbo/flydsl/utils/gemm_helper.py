@@ -25,7 +25,12 @@ from flydsl.compiler.ast_rewriter import (
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr.arith import _to_raw as _raw
-from flydsl.expr.buffer_ops import buffer_store, create_buffer_resource
+from flydsl.expr.buffer_ops import (
+    buffer_load,
+    buffer_store,
+    create_buffer_resource,
+    create_llvm_ptr,
+)
 from flydsl.expr.typing import AddressSpace, PointerType, T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
@@ -296,7 +301,7 @@ class G2SLoader:
         g = make_fp8_buffer_tensor_rebased(arg_i8, fp8_t, _as_index(base_elems) + off, rem)
         return fx.logical_divide(g, fx.make_layout(1, 1)), 0
 
-    def _lds_dst_at(self, lds_dst, step, base_off=None):
+    def _lds_dst_at(self, lds_dst, step, base_off=None, size=1):
         cs = self.chunk_stride
         step_off = self.wave_id * cs + step * (self.n_waves * cs)
         base_i32 = fx.Int32(fx.ptrtoint(lds_dst.ptr))
@@ -304,7 +309,7 @@ class G2SLoader:
             base_i32 = base_i32 + base_off
         sum_i32 = base_i32 + fx.Int32(step_off)
         lds_ptr = fx.inttoptr(self.LdsPtr_t, sum_i32)
-        return fx.make_view(lds_ptr, fx.make_layout(1, 1))
+        return fx.make_view(lds_ptr, fx.make_layout(size, 1))
 
     def load(self, lds_dst, k_offset, base_off=None):
         src_div, soff = self._src_div(k_offset)
@@ -312,6 +317,271 @@ class G2SLoader:
             src = fx.slice(src_div, (None, fx.Int32(self.gl_offsets[step])))
             dst = self._lds_dst_at(lds_dst, step, base_off)
             fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(soff))
+
+
+class GatherG2SLoaderBf16(G2SLoader):
+    """BF16 global-to-LDS loader with an indirect row index.
+
+    ``slot_ids[logical_row]`` selects a physical row in ``gl_src``. The K-column
+    access remains contiguous, so each lane still issues a 128-bit direct-to-LDS
+    copy and the downstream LDS/MFMA pipeline is unchanged.
+
+    All row addressing resolves once at construction: the slot lookup and the
+    ``physical_row * K`` base collapse into a loop-invariant per-lane voffset.
+    Inside the K loop only the wave-uniform column offset changes, and it rides
+    soffset -- exactly like the contiguous loader -- so the main loop keeps zero
+    address VALU.
+    """
+
+    def __init__(
+        self,
+        gl_src,
+        gl_rc,
+        n_load_steps,
+        wave_id,
+        slot_ids,
+        row_stride,
+        logical_row_base,
+    ):
+        super().__init__(gl_src, None, n_load_steps, fx.BFloat16.ir_type, wave_id)
+        self.pool_resource = create_buffer_resource(gl_src, max_size=True)
+        # clamp to the table length: the pipeline prefetches past the loop bound and
+        # those never-consumed slot reads must return 0 (pool row 0) rather than garbage
+        self.slot_resource = create_buffer_resource(slot_ids, max_size=False)
+        self.row_stride = row_stride
+        self.row_byte_offsets = []
+        self.lds_step_offsets = []
+        for step in range_constexpr(n_load_steps):
+            row, col = gl_rc[step]
+            physical_row = buffer_load(
+                self.slot_resource,
+                logical_row_base + row,
+                vec_width=1,
+                dtype=fx.T.i32(),
+            )
+            self.row_byte_offsets.append((physical_row * fx.Int32(row_stride) + col) * fx.Int32(2))
+            step_off = self.wave_id * self.chunk_stride + step * (self.n_waves * self.chunk_stride)
+            self.lds_step_offsets.append(fx.Int32(step_off))
+
+    def load(self, lds_dst, k_offset, base_off=None):
+        # k_offset is a pure K-column offset here; the row base already lives in
+        # the precomputed voffsets.
+        soffset = fx.Int32(k_offset * 2) if isinstance(k_offset, int) else fx.Int32(k_offset) * fx.Int32(2)
+        for step in range_constexpr(self.n_load_steps):
+            lds_address = fx.Int32(fx.ptrtoint(lds_dst.ptr)) + self.lds_step_offsets[step]
+            if base_off is not None:
+                lds_address = lds_address + base_off
+            rocdl.RawPtrBufferLoadLdsOp(
+                _raw(self.pool_resource),
+                create_llvm_ptr(_raw(lds_address), 3),
+                _raw(fx.Int32(16)),
+                _raw(self.row_byte_offsets[step]),
+                _raw(soffset),
+                _raw(fx.Int32(0)),
+                _raw(fx.Int32(0)),
+            )
+
+
+class GatherVarKG2SLoaderBf16(G2SLoader):
+    """BF16 global-to-LDS loader that gathers along the contraction axis.
+
+    Used by the variable-K wgrad tile, where the pool operand is indexed by
+    token on the K axis: ``slot_ids[logical_token_row]`` picks the physical pool
+    row. The indexed axis moves with the K loop, so the slot lookup cannot be
+    hoisted out of the tile entirely the way the NT gather's can.
+
+    Instead ``voffsets`` is split out from ``load`` so the caller can batch every
+    slot lookup a chunk needs at the chunk head; leaving them inline costs a full
+    dependent VMEM round trip inside each MFMA quadrant. Both LDS halves read the
+    same tokens and differ only in output column, so one loader serves both and
+    the column rides a per-half wave-uniform soffset.
+
+    Rows past the group's real token count map to the prologue's zero slot, so
+    the partial tail tile contributes zeros without any extra masking.
+    """
+
+    def __init__(
+        self,
+        gl_src,
+        gl_rc,
+        n_load_steps,
+        wave_id,
+        slot_ids,
+        slot_len,
+        row_stride,
+        logical_row_base,
+        col_bases,
+        slot_x4=None,
+        slot_u16=False,
+    ):
+        super().__init__(gl_src, None, n_load_steps, fx.BFloat16.ir_type, wave_id)
+        self.pool_resource = create_buffer_resource(gl_src, max_size=True)
+        # Clamp to the table length. The pipeline prefetches two K steps past the loop
+        # bound, so the last group reads off the end of the table; those loads are never
+        # consumed but must still return 0 (-> pool row 0) instead of faulting. The size
+        # is passed in because a dynamic memref makes max_size=False silently a no-op.
+        self.slot_resource = create_buffer_resource(slot_ids, num_records_bytes=slot_len * fx.Int32(4))
+        self.row_byte_stride = row_stride * 2
+        # (chunk_tokens, chunk) of the interleaved slot table, or None for linear
+        self.slot_x4 = slot_x4
+        # interleaved table stored as u16 (viewed as i32), unpacked at the use site
+        self.slot_u16 = slot_u16
+        self.logical_row_base = logical_row_base
+        # steps that share a row_key read the same token: one slot load serves them
+        self.uniq_rows = []
+        self.uniq_local_rows = []
+        self.step_rows = []
+        self.col_byte_offsets = []
+        self.lds_step_offsets = []
+        key_to_idx = {}
+        for step in range_constexpr(n_load_steps):
+            key, row, col_lane, col_wave = gl_rc[step]
+            if key not in key_to_idx:
+                key_to_idx[key] = len(self.uniq_rows)
+                self.uniq_rows.append(logical_row_base + row)
+                self.uniq_local_rows.append(row)
+            self.step_rows.append(key_to_idx[key])
+            self.col_byte_offsets.append((col_wave + col_lane) * fx.Int32(2))
+            step_off = self.wave_id * self.chunk_stride + step * (self.n_waves * self.chunk_stride)
+            self.lds_step_offsets.append(fx.Int32(step_off))
+        self.soffsets = []
+        for col_base in col_bases:
+            self.soffsets.append(fx.Int32(col_base) * fx.Int32(2))
+
+    def voffsets(self, token_offset):
+        """Resolve slot -> byte row base for one K step; shared by steps and halves."""
+        row_bases = []
+        for row in self.uniq_rows:
+            physical_row = buffer_load(
+                self.slot_resource,
+                row + token_offset,
+                vec_width=1,
+                dtype=fx.T.i32(),
+            )
+            row_bases.append(physical_row * fx.Int32(self.row_byte_stride))
+        return row_bases
+
+    def voffsets_alu(self, token_offset):
+        """Probe: identity slot resolved by ALU, so no slot memory op at all.
+
+        Keeps the gather instruction form (per-k voffset VGPR, soffset holds only
+        the column base) while removing the load, so the delta against
+        ``voffsets`` is exactly what the slot load costs. Numerically identical
+        to the dense loader, hence usable under a correctness gate.
+        """
+        row_bases = []
+        for row in self.uniq_rows:
+            row_bases.append((row + token_offset) * fx.Int32(self.row_byte_stride))
+        return row_bases
+
+    def voffsets_x4(self, chunk_idx):
+        """Resolve a whole chunk of K steps with one dwordx4 per unique row.
+
+        The interleaved table stores the linear entry ``base + j*BLOCK_K + r`` at
+        ``base + r*CHUNK + j``, so the CHUNK k steps a lane walks become adjacent
+        dwords and the chunk's slot lookups collapse from CHUNK loads to one.
+        ``base`` is a multiple of CHUNK*BLOCK_K, which BLOCK_M-aligned group
+        offsets guarantee. Returns one row_bases list per k step.
+        """
+        chunk_tokens, chunk = self.slot_x4
+        steps = [[] for _ in range_constexpr(chunk)]
+        for row in self.uniq_local_rows:
+            idx = self.logical_row_base + chunk_idx * fx.Int32(chunk_tokens) + row * fx.Int32(chunk)
+            vec = Vec(buffer_load(self.slot_resource, idx, vec_width=chunk, dtype=fx.T.i32()))
+            for j in range_constexpr(chunk):
+                steps[j].append(vec[j] * fx.Int32(self.row_byte_stride))
+        return steps
+
+    def slot_pack_u16(self, chunk_idx):
+        """Load an interleaved chunk as u16: CHUNK slots in CHUNK/2 dwords per row.
+
+        Same permutation as ``voffsets_x4`` but half the width, so a k step of
+        lookahead costs half a VGPR instead of one. Window width is capped by
+        exactly that, so this is what lets the window get wider. Nothing is
+        unpacked here: ``unpack_u16`` runs at the use site to keep the derived
+        voffsets short-lived.
+        """
+        chunk_tokens, chunk = self.slot_x4
+        packs = []
+        for row in self.uniq_local_rows:
+            idx = self.logical_row_base + chunk_idx * fx.Int32(chunk_tokens) + row * fx.Int32(chunk)
+            packs.append(
+                Vec(
+                    buffer_load(
+                        self.slot_resource,
+                        idx >> fx.Int32(1),
+                        vec_width=chunk // 2,
+                        dtype=fx.T.i32(),
+                    )
+                )
+            )
+        return packs
+
+    def unpack_u16(self, packs, j):
+        """Byte row bases for k step j of a packed chunk."""
+        row_bases = []
+        for vec in packs:
+            w = vec[j // 2]
+            if j % 2:
+                w = w >> fx.Int32(16)
+            row_bases.append((w & fx.Int32(0xFFFF)) * fx.Int32(self.row_byte_stride))
+        return row_bases
+
+    def fill_lds(self, lds_dst, entry_base, pass_idx, n_waves):
+        """Stage one pass of this group's slot ids into LDS.
+
+        Resolving a slot from LDS is an lgkm-domain read, so the K loop no longer
+        has to wait on a buffer load -- and vmcnt, which retires in order, never
+        drains the outstanding pool prefetches just to service one slot.
+        ``entry_base`` is the window's first logical row; LDS is indexed relative
+        to it, so a windowed caller refills the same array in place.
+        """
+        lane_id = fx.thread_idx.x % 64
+        per_wave = 64 * 4  # 4 dwords per lane
+        per_pass = n_waves * per_wave
+        base_i32 = fx.Int32(fx.ptrtoint(lds_dst.ptr))
+        voffset = fx.Int32(lane_id) * fx.Int32(16)
+        head = pass_idx * fx.Int32(per_pass) + self.wave_id * fx.Int32(per_wave)
+        rocdl.RawPtrBufferLoadLdsOp(
+            _raw(self.slot_resource),
+            create_llvm_ptr(_raw(base_i32 + head * fx.Int32(4)), 3),
+            _raw(fx.Int32(16)),
+            _raw(voffset),
+            _raw((self.logical_row_base + entry_base + head) * fx.Int32(4)),
+            _raw(fx.Int32(0)),
+            _raw(fx.Int32(0)),
+        )
+
+    def voffsets_lds(self, lds_src, token_offset, limit):
+        """Resolve slot -> byte row base for one K step out of the staged table.
+
+        ``limit`` is the last staged entry. The pipeline looks two k steps ahead,
+        so the final chunk indexes past what was staged; those steps are always
+        multiplied by a zero tile, and clamping keeps the read inside the array.
+        """
+        base_i32 = fx.Int32(fx.ptrtoint(lds_src.ptr))
+        row_bases = []
+        for row in self.uniq_local_rows:
+            idx = ArithValue(arith.minsi(_raw(fx.Int32(row) + token_offset), _raw(limit)), signed=True)
+            physical_row = lds_load_i32(base_i32, idx * fx.Int32(4))
+            row_bases.append(physical_row * fx.Int32(self.row_byte_stride))
+        return row_bases
+
+    def load(self, lds_dst, half, row_bases, base_off=None):
+        for step in range_constexpr(self.n_load_steps):
+            voffset = row_bases[self.step_rows[step]] + self.col_byte_offsets[step]
+            lds_address = fx.Int32(fx.ptrtoint(lds_dst.ptr)) + self.lds_step_offsets[step]
+            if base_off is not None:
+                lds_address = lds_address + base_off
+            rocdl.RawPtrBufferLoadLdsOp(
+                _raw(self.pool_resource),
+                create_llvm_ptr(_raw(lds_address), 3),
+                _raw(fx.Int32(16)),
+                _raw(voffset),
+                _raw(self.soffsets[half]),
+                _raw(fx.Int32(0)),
+                _raw(fx.Int32(0)),
+            )
 
 
 def pack_i32x4_i32x8(lo, hi):
@@ -1574,6 +1844,12 @@ def _inttoptr_lds(byte_addr):
 _gep = _buffer_ops.get_element_ptr
 
 
+def lds_load_i32(base_i32, byte_off):
+    """One ds_read_b32 from LDS. Lives in the lgkm domain, unlike a buffer load."""
+    ptr = _lds_ptr_from_i32(base_i32 + byte_off)
+    return ArithValue(_llvm.LoadOp(T.i32, ptr, alignment=4).result, signed=True)
+
+
 def _packed_ds_read_tr_offsets(base_ptr, byte_offsets, vmcnt_hint=None):
     """Pack the ds_read_b64_tr_b8 reads onto ONE shared base-ptr VGPR, each at a
     compile-time immediate byte offset (1 addr VGPR instead of N avoids an
@@ -2047,10 +2323,38 @@ def compute_global_swizzle_bf16(lane_id, wave_id, K, n_rounds, row_step=1, pair_
     return offsets
 
 
-def compute_global_swizzle_nn_bf16(lane_id, wave_id, c_n, n_steps):
+def compute_global_swizzle_bf16_rc(lane_id, wave_id, n_rounds):
+    """Row/column split of compute_global_swizzle_bf16 (column in elements).
+
+    The XOR swizzle stays inside the 128-byte row window, so the row index is
+    unchanged and the gather loader can resolve rows without dividing by K."""
+    pairs = []
+    n_waves = fx.block_dim.x // 64
+    for r in range_constexpr(n_rounds):
+        row = lane_id // 8 + wave_id * 8 + r * (n_waves * 8)
+        col_byte = (lane_id % 8) * 16
+        _, c = swizzle_128(row, col_byte)
+        pairs.append((row, c // 2))
+    return pairs
+
+
+def _tr_granule_swz_kk(kk):
+    """Swap the two 128-byte-granule selector bits of the tr16 sub-block index.
+
+    The transpose readers otherwise land their four 16-lane groups at byte
+    offsets all == 0 (mod 256) -> only banks 0-31 addressed, 512 B read takes
+    4 clk instead of 2. Permuting the row bits here (with the matching kb*64
+    spacing and a [0,256] read pair) alternates the two bank halves ->
+    conflict-free 2 clk. Pure prologue-time index math."""
+    return (kk % 4) + ((kk // 4) % 2) * 8 + (kk // 8) * 4
+
+
+def compute_global_swizzle_nn_bf16(lane_id, wave_id, c_n, n_steps, swz=False):
     offsets = []
     n_waves = fx.block_dim.x // 64
     kk = (lane_id % 32) // 2
+    if swz:
+        kk = _tr_granule_swz_kk(kk)
     g = lane_id // 32
     n_in = g * 16 + (lane_id % 2) * 8
     for step in range_constexpr(n_steps):
@@ -2075,6 +2379,42 @@ def compute_global_swizzle_nn_bf16_wide(lane_id, wave_id, c_n, n_steps):
         ks8 = idx % 8
         offsets.append((ks8 * 8 + kloc) * c_n + n64 * 64 + n_in)
     return offsets
+
+
+def compute_global_swizzle_nn_bf16_rc(lane_id, wave_id, n_steps, n_waves=None, swz=False):
+    """Row/column split of compute_global_swizzle_nn_bf16.
+
+    The NN loader applies no XOR swizzle, so the fused offset is exactly
+    ``row * c_n + col``; the variable-K gather needs the two parts apart because
+    the row rides an indirection while the column stays contiguous.
+
+    Returns ``(row_key, row, col_lane, col_wave)`` per step. ``row`` is
+    ``(wave_id + step * n_waves) % 4 * 16 + kk``, so steps whose ``step *
+    n_waves`` agree mod 4 read the identical row and differ only in column;
+    ``row_key`` exposes that as a compile-time fact so a gather can resolve one
+    slot for the whole set. Pass ``n_waves`` as a Python int to enable it.
+
+    The column is returned split into ``(col_lane, col_wave)`` because the two
+    halves behave differently: ``col_lane`` varies per lane but not per step,
+    ``col_wave`` varies per step but is wave-uniform.
+    """
+    triples = []
+    if n_waves is None:
+        n_waves = fx.block_dim.x // 64
+    kk = (lane_id % 32) // 2
+    if swz:
+        kk = _tr_granule_swz_kk(kk)
+    g = lane_id // 32
+    n_in = g * 16 + (lane_id % 2) * 8
+    for step in range_constexpr(n_steps):
+        idx = wave_id + step * n_waves
+        ks = idx % 4
+        if isinstance(n_waves, int):
+            key = (step * n_waves) % 4
+        else:
+            key = step
+        triples.append((key, ks * 16 + kk, n_in, (idx // 4) * 32))
+    return triples
 
 
 def _packed_ds_read_tr16(base_ptr, byte_offsets):
@@ -2108,12 +2448,24 @@ def _lds_xpose_tr16(wr_ptr, rd_ptr, val, byte_offset=0):
     return Vec(op.result).bitcast(fx.BFloat16)
 
 
-def _read_tr16_sub(base_i32, sub16, row_off, chunk_stride=1024):
-    """One tr16 sub-block: packed double-read, the pair 128 bytes apart, then assembled.
+def _read_tr16_sub(base_i32, sub16, row_off, swz=False, sub_const=0, chunk_stride=1024):
+    """One tr16 sub-block: packed double-read, then assembled. The pair is 128 bytes
+    apart normally; with the bank swizzle (swz=True, tn path) it is 256 bytes apart and
+    the caller uses kb*64 spacing, so the four 16-lane groups straddle both bank halves
+    -> 2 clk instead of 4. See _tr_granule_swz_kk for the write-side permutation.
+
     A sub-block is one G2S per-wave chunk, so it starts at sub16*chunk_stride bytes -- a
-    padded stride must reach here or the read lands off the write."""
+    padded stride must reach here or the read lands off the write.
+
+    ``sub_const`` is a COMPILE-TIME sub-block delta. The consecutive subs of a tile
+    differ only by that constant, so folding it into the ds_read immediate instead
+    of the address VGPR leaves one shared base per tile: 1 v_add instead of 4. DS
+    ops carry a 16-bit offset and the largest fold here is 3*1024 + 256, so it
+    always encodes."""
+    pair = [0, 256] if swz else [0, 128]
+    imm = sub_const * chunk_stride
     ptr = _lds_ptr_from_i32(base_i32 + sub16 * chunk_stride + row_off * 2)
-    r0, r1 = _packed_ds_read_tr16(ptr, [0, 128])
+    r0, r1 = _packed_ds_read_tr16(ptr, [imm + p for p in pair])
     return r0.shuffle(r1, list(range(8)))
 
 
@@ -2124,6 +2476,26 @@ class _S2RLoaderBf16(_S2RLoaderBase):
 
     def load(self, lds_src):
         return [self._tile(lds_src, i) for i in range_constexpr(self.n_tiles)]
+
+
+class S2RLoaderTrBf16(_S2RLoaderBf16):
+    """mfma_f32_32x32x16 operand via ds_read_tr_b16 transpose. Like S2RLoaderTr's
+    _K_BASE, _SUB lists the tr16 sub-block of each inst_k=16 mfma step (consecutive
+    here); its length is both the sub count and the per-tile block stride."""
+
+    _SUB = (0, 1, 2, 3)
+
+    def _tile(self, lds_src, i):
+        m, kblk = self.lane_id % 32, self.lane_id // 32
+        row_off = (m // 16) * 256 + kblk * 128 + (m % 16) * 4
+        base_i32 = fx.Int32(fx.ptrtoint(lds_src.ptr))
+        sub0 = (self.wave_idx * self.n_tiles + i) * len(self._SUB)
+        # _SUB is consecutive and compile-time, so hand it to the immediate field
+        # rather than the address: all four subs then share one base VGPR.
+        return [
+            _read_tr16_sub(base_i32, sub0, row_off, sub_const=self._SUB[c])
+            for c in range_constexpr(len(self._SUB))
+        ]
 
 
 class _MfmaBf16:
@@ -2208,6 +2580,37 @@ class S2RLoaderTr16x32Bf16Wide(_S2RLoaderBf16):
         ]
 
 
+class S2RLoaderTr16x32Bf16(_S2RLoaderBf16):
+    """mfma_f32_16x16x32 operand via ds_read_tr_b16 transpose, one asm block per tile.
+    Reads the 512-elem-block image that ``compute_global_swizzle_nn_bf16`` writes, so it
+    is the variable-K wgrad counterpart of the Wide loader above (which needs the
+    chunk_stride image). Like S2RLoaderTr's _K_BASE, _SUB lists the tr16 sub-block offset
+    of each inst_k=32 mfma step (each spans two tr16 blocks); _BLOCK is the tr16 blocks
+    per n32-region. Both baked in."""
+
+    _SUB = (0, 2)
+    _BLOCK = 4
+
+    def __init__(self, *args, swz=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.swz = swz
+
+    def _tile(self, lds_src, i):
+        octet, mm = self.lane_id // 16, self.lane_id % 16
+        s_in_pair, kb = octet // 2, octet % 2
+        # kb*64 spacing pairs with the [0,256] read and the write-side kk swizzle
+        # (bank-conflict-free transpose); kb*128 is the un-swizzled default.
+        row_off = kb * (64 if self.swz else 128) + mm * 4
+        base_i32 = fx.Int32(fx.ptrtoint(lds_src.ptr))
+        orig_tile = self.wave_idx * self.n_tiles + i
+        n32_block, g16 = orig_tile // 2, orig_tile % 2
+        row = g16 * 256 + row_off  # fold g16 block offset into row
+        return [
+            _read_tr16_sub(base_i32, n32_block * self._BLOCK + self._SUB[c] + s_in_pair, row, self.swz)
+            for c in range_constexpr(len(self._SUB))
+        ]
+
+
 def _load8_bf16(lds_src, byte_off):
     i8 = fx.recast_iter(fx.Uint8, lds_src.ptr)
     p = fx.add_offset(i8, fx.make_int_tuple(byte_off))
@@ -2233,6 +2636,37 @@ class S2RLoader16x16Bf16(_S2RLoaderBf16):
         return subs
 
 
+class S2RLoaderBf16(_S2RLoaderBf16):
+    """mfma_f32_32x32x16 operand (swizzled, non-transposed). Mirroring S2RLoaderTr,
+    _K_BASE lists the K-column (elems) of each inst_k=16 sub of a 32-row tile; its
+    length is the sub count -- no BLOCK_K needed."""
+
+    _K_BASE = (0, 16, 32, 48)
+
+    def _tile(self, lds_src, i):
+        m, kblk = self.lane_id % 32, self.lane_id // 32
+        row = self.wave_idx * (self.n_tiles * 32) + i * 32 + m
+        # The three address fields are bit-disjoint, so the whole sub set is one
+        # base XOR a compile-time literal. Byte column of sub c is
+        #   col_c = _K_BASE[c]*2 + kblk*16 = c*32 + kblk*16   (bits [4,7))
+        # and the XOR swizzle S = ((row % 16) >> 1) << 4 also lives in bits [4,7),
+        # while row*128 owns bits >= 7. Hence
+        #   addr_c = row*128 + (col_c ^ S) = (row*128 + (kblk*16 ^ S)) ^ (c*32),
+        # an algebraic identity (verified bit-exact), not an approximation.
+        # Re-deriving the swizzle per sub costs the mask/shift/xor chain four times
+        # over; this pays it once per tile -- and `row` is k-invariant, so the base
+        # is hoisted out of the unrolled k-loop entirely, leaving exactly one
+        # v_xor_b32 with an inline constant per sub (c == 0 is free). The mainloop
+        # issues 24 of these reads per k-iteration on nt, and at 2 waves/SIMD there
+        # is no second wave to hide the VALU issue slots behind.
+        _, cs0 = swizzle_128(row, kblk * 16)
+        base = row * 128 + cs0
+        subs = []
+        for c in range_constexpr(len(self._K_BASE)):
+            subs.append(_load8_bf16(lds_src, base if c == 0 else base ^ (c * 32)))
+        return subs
+
+
 def _pack_out_pair(x0, x1, out_ty):
     """Two f32 accumulator values -> one dword holding them side by side in ``out_ty``."""
     if const_expr(out_ty is fx.Float16):
@@ -2241,12 +2675,18 @@ def _pack_out_pair(x0, x1, out_ty):
 
 
 class StoreCBf16:
-    def __init__(self, C, c_rows, c_cols, out_ty, cache_modifier=0):
+    def __init__(self, C, c_rows, c_cols, out_ty, cache_modifier=0, n_exact=False):
         self.c_rows = c_rows
         self.c_cols = c_cols
         self.lane_id = fx.thread_idx.x % 64
         self.out_ty = out_ty
         self.cache_modifier = cache_modifier
+        # Caller guarantee that every column this epilogue touches is in range
+        # (c_cols is an exact multiple of BLOCK_N). The column mask is then
+        # statically true, so the per-element select to the OOB sink is dead:
+        # dropping it removes one full-rate VALU op per stored element, and the
+        # 32x32 epilogue stores 128 elements per lane per tile.
+        self.n_exact = bool(n_exact)
         c_nbytes = c_rows * c_cols * 2
         # Rebuild a rank-1 view: store indices are linear, so C's host rank must not leak in.
         c_ptr_ty = PointerType.get(elem_ty=out_ty.ir_type, address_space=AddressSpace.Global, alignment=16)
@@ -2262,11 +2702,21 @@ class StoreCBf16:
             else None
         )
         self.c_base = _buffer_ops.extract_base_index(C)  # byte base address
+        # Kept so the transposed epilogue can build an SRD on demand: its packed
+        # dwordx2 path needs buffer_store even when no cache_modifier was asked for.
+        self._c_lin, self._c_nbytes = c_lin, c_nbytes
         self.oob = fx.Int32(c_rows * c_cols)  # out-of-bounds sink index
+
+    def _rsrc(self):
+        if self.c_rsrc is None:
+            self.c_rsrc = create_buffer_resource(
+                self._c_lin, max_size=False, num_records_bytes=self._c_nbytes
+            )
+        return self.c_rsrc
 
     def _store_masked(self, value, c_index, valid):
         """Store one element to c_index (masked to the OOB sink when invalid)."""
-        idx = arith.select(valid, c_index, self.oob)
+        idx = c_index if valid is None else arith.select(valid, c_index, self.oob)
         val = value.to(self.out_ty)
         if self.cache_modifier:
             buffer_store(val, self.c_rsrc, fx.Int32(idx), cache_modifier=self.cache_modifier)
@@ -2278,11 +2728,38 @@ class StoreCBf16:
         n = self.lane_id % 32
         m_hi = (self.lane_id // 32) * 4
         col = base_col + n
+        col_valid = None if self.n_exact else col < self.c_cols
+        # Strength-reduce the row addressing. The naive form issues one 32-bit
+        # `row * c_cols` multiply per element (128 per tile, quarter rate on CDNA);
+        # every row offset here differs from its neighbour by a compile-time
+        # multiple of c_cols, so the whole index set is reachable from one base
+        # plus an add chain over three precomputed strides.
+        s1 = self.c_cols
+        s8 = s1 * 8
+        s32 = s1 * 32
+        idx_ti = (base_row + m_hi) * s1 + col
+        for ti in range_constexpr(len(c_frag)):
+            acc = Vec(c_frag[ti])
+            idx_g = idx_ti
+            for g in range_constexpr(4):
+                idx_r = idx_g
+                for rr in range_constexpr(4):
+                    self._store_masked(acc[g * 4 + rr], idx_r, col_valid)
+                    idx_r = idx_r + s1
+                idx_g = idx_g + s8
+            idx_ti = idx_ti + s32
+
+    def store16(self, c_frag, base_row, base_col):
+        """Plain 16x16 epilogue: one masked element store per accumulator value.
+        The slot-gather wgrad tile uses it where no row band is available."""
+        n = self.lane_id % 16
+        m_hi = (self.lane_id // 16) * 4
+        col = base_col + n
         col_valid = col < self.c_cols
         for ti in range_constexpr(len(c_frag)):
             acc = Vec(c_frag[ti])
-            for r in range_constexpr(16):
-                row = base_row + ti * 32 + (r // 4) * 8 + m_hi + (r % 4)
+            for r in range_constexpr(4):
+                row = base_row + ti * 16 + m_hi + r
                 self._store_masked(acc[r], row * self.c_cols + col, col_valid)
 
     def store_band_pair16(self, frag_even, frag_odd, base_row, base_col, n_tiles_b, mask_cols=True):
@@ -2344,20 +2821,65 @@ class StoreCBf16:
                             offset_is_bytes=True,
                         )
 
-    def store_trans16(self, c_frag, group_idx, base_m, base_n, out_m, out_n, mask_m=False):
-        """mask_m additionally drops m past out_m; needed only when OUT_M is not a BLOCK_M
-        multiple, where an unmasked tail would spill into the next column's row run."""
+    def store_trans16(
+        self, c_frag, group_idx, base_m, base_n, out_m, out_n, mask_m=False, m_align=1, n_exact=False
+    ):
+        """Transposed 16x16 epilogue: lane holds 4 values walking ``m``, the
+        contiguous output dim.
+
+        ``mask_m`` additionally drops m past out_m; needed only when OUT_M is not a
+        BLOCK_M multiple, where an unmasked tail would spill into the next column's
+        row run.
+
+        ``m_align`` is the caller-guaranteed alignment of ``base_m`` (in elements).
+        When base_m, out_m and the intra-lane offset are all 4-aligned the four
+        values a lane holds are 4 consecutive bf16 == one 8B store, so they pack
+        into a single ``buffer_store_dwordx2``. Otherwise each of the 16 lanes in
+        a row-group issues its own 2-byte request against rows ``out_m*2`` bytes
+        apart -- 16 line requests carrying 8 useful bytes each. Packing is a
+        straight 4x cut in store requests with no transpose and no LDS.
+
+        The packed path also drops the ``glob_n < out_n`` select: it is only taken
+        when the caller has proven the N range is exact (out_n % BLOCK_N == 0),
+        where the mask is statically true. A ragged m tail (mask_m) needs the
+        per-element select, so it stays on the scalar path.
+        """
         n = self.lane_id % 16
-        m_hi = (self.lane_id // 16) * 4
+        m_hi = (self.lane_id // 16) * 4  # always 4-aligned
         glob_n = base_n + n
-        n_valid = glob_n < out_n
         row_base = (group_idx * out_n + glob_n) * out_m
-        for ti in range_constexpr(len(c_frag)):
-            acc = Vec(c_frag[ti])
-            for r in range_constexpr(4):
-                m = base_m + ti * 16 + m_hi + r
-                valid = arith.andi(n_valid, m < out_m) if mask_m else n_valid
-                self._store_masked(acc[r], row_base + m, valid)
+        packed = (
+            bool(n_exact)
+            and not mask_m
+            and self.out_ty is fx.BFloat16
+            and isinstance(out_m, int)
+            and out_m % 4 == 0
+            and isinstance(m_align, int)
+            and m_align % 4 == 0
+        )
+        if const_expr(packed):
+            rsrc = self._rsrc()
+            for ti in range_constexpr(len(c_frag)):
+                acc = Vec(c_frag[ti])
+                pk0 = fx.Int32(_raw(rocdl.cvt_pk_bf16_f32(_raw(acc[0]), _raw(acc[1]))))
+                pk1 = fx.Int32(_raw(rocdl.cvt_pk_bf16_f32(_raw(acc[2]), _raw(acc[3]))))
+                m = base_m + ti * 16 + m_hi
+                byte_off = (row_base + m) * fx.Int32(2)
+                buffer_store(
+                    _raw(Vec.from_elements([pk0, pk1], fx.Int32)),
+                    rsrc,
+                    byte_off,
+                    cache_modifier=self.cache_modifier,
+                    offset_is_bytes=True,
+                )
+        else:
+            n_valid = glob_n < out_n
+            for ti in range_constexpr(len(c_frag)):
+                acc = Vec(c_frag[ti])
+                for r in range_constexpr(4):
+                    m = base_m + ti * 16 + m_hi + r
+                    valid = arith.andi(n_valid, m < out_m) if mask_m else n_valid
+                    self._store_masked(acc[r], row_base + m, valid)
 
 
 # MXFP4 kernel helpers: lane-table group search (with its DPP scan primitives),

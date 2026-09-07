@@ -20,11 +20,6 @@ from primus_turbo.flydsl.utils.swiglu_kernel import (
     swiglu_flydsl_kernel,
 )
 
-# dispatch handle layout (see dispatch_prologue ABI).
-_H_NUM_TILE_BLOCKS = 8
-_H_REAL_COUNT_PER_EXPERT = 6
-_H_NUM_TOKENS_PER_EXPERT_PREFIX = 7
-
 
 def fused_mega_moe_stage2_forward_impl(
     l1_out: torch.Tensor,
@@ -35,9 +30,10 @@ def fused_mega_moe_stage2_forward_impl(
 ) -> torch.Tensor:
     """SwiGLU + grouped L2 GEMM + combine (nt). Returns y."""
     topk_idx = topk_idx.to(torch.int64)
+    num_tile_blocks, *_tables = handle
 
     # bound swiglu by THIS handle's tile count (per-forward, not shared symm)
-    act = swiglu_flydsl_kernel(l1_out, num_tile_blocks=handle[_H_NUM_TILE_BLOCKS])
+    act = swiglu_flydsl_kernel(l1_out, num_tile_blocks=num_tile_blocks)
 
     # fused grouped L2 GEMM + combine PUSH + topk reduce
     y, _ = grouped_gemm_combine_bf16_flydsl_kernel(
@@ -60,8 +56,7 @@ def fused_mega_moe_stage2_backward_impl(
     group,
 ):
     """L2 dgrad (nn) + SwiGLU^T + dW2. Returns ``(grad_l1, grad_gate, dW2)``."""
-    real_count_per_expert = handle[_H_REAL_COUNT_PER_EXPERT]
-    num_tokens_per_expert_prefix = handle[_H_NUM_TOKENS_PER_EXPERT_PREFIX]
+    num_tile_blocks, *_mid, num_tokens_per_expert_prefix, real_count_per_expert = handle
 
     dy = grad_y.contiguous().to(torch.bfloat16)
 
@@ -81,7 +76,7 @@ def fused_mega_moe_stage2_backward_impl(
         scale=dispatch_weights,
         return_gate=True,
         return_act_w=True,
-        num_tile_blocks=handle[_H_NUM_TILE_BLOCKS],
+        num_tile_blocks=num_tile_blocks,
     )
 
     # dW2 = dispatched(dy)^ @ act_weighted (variable-K)

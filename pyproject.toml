@@ -38,6 +38,10 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
+# B023: flydsl trace code defines helper closures over per-iteration values and
+# calls them inside the same iteration, so the late-binding warning is a false
+# positive throughout the file.
+"primus_turbo/flydsl/mega/ep_intranode.py" = ["B023"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

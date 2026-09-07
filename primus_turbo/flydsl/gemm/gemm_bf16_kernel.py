@@ -22,11 +22,13 @@ from flydsl.expr.typing import Vector as Vec
 from primus_turbo.flydsl.utils.gemm_helper import (
     BLOCK_K,
     G2SLoader,
+    GatherG2SLoaderBf16,
     Mfma16x16x32,
     S2RLoader16x16Bf16,
     S2RLoaderTr16x32Bf16Wide,
     StoreCBf16,
     compute_global_swizzle_bf16,
+    compute_global_swizzle_bf16_rc,
     compute_global_swizzle_nn_bf16_wide,
     emit_if_then,
     make_fp16_bf16_buffer_tensor,
@@ -63,6 +65,29 @@ def _quad_col_conds(base_col, lds_block_n, c_n):
     live0 = base_col < c_n
     live1 = base_col + lds_block_n < c_n
     return {(0, 0): live0, (0, 1): live1, (1, 0): live0, (1, 1): live1}
+
+
+def _make_a_g2s(
+    A, a_slot_ids, a_block_m, lane_id, wave_id, K, n_rounds, n_steps, BLOCK_M, LDS_BLOCK_M, gl_off_a=None
+):
+    """A-operand feed as a (half0, half1) loader pair for ``dense_mma_pipeline_bf16``.
+
+    Dense feeds share one loader between the halves (the halves differ only by the
+    A0/A1 offsets the pipeline already passes). A gather feed cannot: the row base
+    rides the slot table, so each half needs its own loader carrying its base row."""
+    if a_slot_ids is None:
+        if gl_off_a is None:
+            gl_off_a = compute_global_swizzle_bf16(lane_id, wave_id, K, n_rounds)
+        gA = make_fp16_bf16_buffer_tensor(A)
+        a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
+        dense = G2SLoader(a_div, gl_off_a, n_steps, fx.BFloat16.ir_type, wave_id)
+        return (dense, dense)
+    gl_rc_a = compute_global_swizzle_bf16_rc(lane_id, wave_id, n_rounds)
+    base_row = a_block_m * fx.Int32(BLOCK_M)
+    return tuple(
+        GatherG2SLoaderBf16(A, gl_rc_a, n_steps, wave_id, a_slot_ids, K, row)
+        for row in (base_row, base_row + fx.Int32(LDS_BLOCK_M))
+    )
 
 
 @ASTRewriter.transform
@@ -110,8 +135,11 @@ def dense_mma_pipeline_bf16(
     N_ACCUMS = N_TILES_A * N_TILES_B
     LDS_BLOCK_M = BLOCK_M // 2
     LDS_BLOCK_N = BLOCK_N // 2
+    # A gather feed needs a separate loader per LDS half (each carries its own row base),
+    # so a_g2s is a (half0, half1) pair; a dense feed passes the same loader twice.
+    a_g2s0, a_g2s1 = a_g2s if isinstance(a_g2s, tuple) else (a_g2s, a_g2s)
     # Drain counts are stated in loads still in flight, not derived from the block shape.
-    N_LDS_STEPS_A = a_g2s.n_load_steps
+    N_LDS_STEPS_A = a_g2s0.n_load_steps
     N_LDS_STEPS_B = b_g2s.n_load_steps
 
     a_cur0 = lds.A_lds_cur_0
@@ -163,10 +191,10 @@ def dense_mma_pipeline_bf16(
         ITER_DRAIN = N_LDS_STEPS_A
 
     b_g2s.load(b_cur0, B0_gl_offset + 0 * b_k_step)
-    a_g2s.load(a_cur0, A0_gl_offset + 0 * a_k_step)
+    a_g2s0.load(a_cur0, A0_gl_offset + 0 * a_k_step)
     if const_expr(not half_n):
         b_g2s.load(b_cur1, B1_gl_offset + 0 * b_k_step)
-    a_g2s.load(a_cur1, A1_gl_offset + 0 * a_k_step)
+    a_g2s1.load(a_cur1, A1_gl_offset + 0 * a_k_step)
 
     # One tile per WG: only the high half has to wait here, and the divergence is harmless
     # because the WG ends right after. Inside a persistent tile loop it is not -- the next
@@ -178,7 +206,7 @@ def dense_mma_pipeline_bf16(
     wait_barrier(N_LDS_STEPS_A + B1_STEPS)
 
     b_g2s.load(b_next0, B0_gl_offset + 1 * b_k_step)
-    a_g2s.load(a_next0, A0_gl_offset + 1 * a_k_step)
+    a_g2s0.load(a_next0, A0_gl_offset + 1 * a_k_step)
     if const_expr(not half_n):
         b_g2s.load(b_next1, B1_gl_offset + 1 * b_k_step)
 
@@ -187,7 +215,7 @@ def dense_mma_pipeline_bf16(
     for k in range_constexpr(K_ITERS - 2):
         b0_frag = b_s2r.load(b_cur0)
         a0_frag = a_s2r.load(a_cur0)
-        a_g2s.load(a_next1, A1_gl_offset + (k + 1) * a_k_step)
+        a_g2s1.load(a_next1, A1_gl_offset + (k + 1) * a_k_step)
         rocdl.s_barrier()
 
         rocdl.sched_barrier(0)
@@ -208,7 +236,7 @@ def dense_mma_pipeline_bf16(
             rocdl.s_barrier()
 
         a1_frag = a_s2r.load(a_cur1)
-        a_g2s.load(a_cur0, A0_gl_offset + (k + 2) * a_k_step)
+        a_g2s0.load(a_cur0, A0_gl_offset + (k + 2) * a_k_step)
         rocdl.s_barrier()
 
         rocdl.sched_barrier(0)
@@ -263,7 +291,7 @@ def dense_mma_pipeline_bf16(
     rocdl.s_barrier()
 
     b0_frag = b_s2r.load(b_next0)
-    a_g2s.load(a_next1, A1_gl_offset + (k + 1) * a_k_step)
+    a_g2s1.load(a_next1, A1_gl_offset + (k + 1) * a_k_step)
     if const_expr(not half_n):
         rocdl.s_barrier()
         rocdl.sched_barrier(0)
@@ -373,6 +401,9 @@ def gemm_bf16_nt_tile(
     c_cache_modifier=0,
     pair_n=False,
     n_tail=None,
+    n_exact=False,
+    a_slot_ids=None,
+    a_block_m=None,
 ):
     assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
     assert K % BLOCK_K == 0, f"bf16 NT needs K % {BLOCK_K} == 0 (got K={K})"
@@ -404,28 +435,35 @@ def gemm_bf16_nt_tile(
         block_m = first_pid_m + (pid_in_group % group_size_m)
         block_n = pid_in_group // group_size_m
 
-    A0_gl_offset = (block_m * BLOCK_M) * K
-    A1_gl_offset = (block_m * BLOCK_M + LDS_BLOCK_M) * K
+    if a_block_m is None:
+        a_block_m = block_m
+    if a_slot_ids is None:
+        A0_gl_offset = (a_block_m * BLOCK_M) * K
+        A1_gl_offset = (a_block_m * BLOCK_M + LDS_BLOCK_M) * K
+    else:
+        # Gather resolves the row base through slot_ids, so the pipeline's A
+        # offset is a pure K column and stays a compile-time constant.
+        A0_gl_offset = 0
+        A1_gl_offset = 0
     B0_gl_offset = (block_n * BLOCK_N) * K
     # Column-interleaved feed: LDS half 0/1 hold the block's even and odd output columns, paired at store.
     PAIR_COLS = pair_n and N_TILES_B == 1
     if b_group_base is not None:
         B0_gl_offset = B0_gl_offset + b_group_base
 
-    gA = make_fp16_bf16_buffer_tensor(A)
     gB = make_fp16_bf16_buffer_tensor(B_T)
-    a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
     b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
-    gl_off_a = compute_global_swizzle_bf16(lane_id, wave_id, K, N_LDS_ROUNDS)
     gl_off_b = compute_global_swizzle_bf16(lane_id, wave_id, K, N_LDS_ROUNDS)
 
     # The g2s/LDS type only sizes the addressing (2 bytes either way); the operand format is
     # decided by the mfma atom, so fp16 rides the bf16 staging untouched.
-    a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, fx.BFloat16.ir_type, wave_id)
+    a_g2s = _make_a_g2s(
+        A, a_slot_ids, a_block_m, lane_id, wave_id, K, N_LDS_ROUNDS, N_LDS_STEPS_A, BLOCK_M, LDS_BLOCK_M
+    )
     b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, fx.BFloat16.ir_type, wave_id)
     _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
-    store_c = StoreCBf16(C, c_m, c_n, _out_ty, cache_modifier=c_cache_modifier)
+    store_c = StoreCBf16(C, c_m, c_n, _out_ty, cache_modifier=c_cache_modifier, n_exact=n_exact)
 
     def _run(pair_cols, grid, half_n, col_safe=False, b_steps=N_LDS_STEPS_B, pair_tiles=False):
         # The bodies differ only in B's column layout, so the loader is re-pointed, not duplicated.
@@ -507,9 +545,15 @@ def _gemm_bf16_nn_tn_tile_impl(
     b_group_base=None,
     c_cache_modifier=0,
     n_tail=0,
+    n_exact=False,
+    a_slot_ids=None,
+    a_block_m=None,
 ):
     assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
     assert K % BLOCK_K == 0, f"bf16 NN/TN needs K % {BLOCK_K} == 0 (got K={K})"
+    # NN's A is [M,K] row-major like NT, so it shares the gather loader. TN's A is
+    # transposed, where the gathered index would sit on the contraction axis.
+    assert a_slot_ids is None or not a_transpose, "gather-A is only defined for the NN layout here"
     LDS_BLOCK_M = BLOCK_M // 2
     LDS_BLOCK_N = BLOCK_N // 2
     N_LDS_STEPS_A = LDS_BLOCK_M // 64
@@ -539,13 +583,21 @@ def _gemm_bf16_nn_tn_tile_impl(
         block_m = first_pid_m + (pid_in_group % group_size_m)
         block_n = pid_in_group // group_size_m
 
+    if a_block_m is None:
+        a_block_m = block_m
     if a_transpose:
         A0_gl_offset = block_m * BLOCK_M + 0
         A1_gl_offset = block_m * BLOCK_M + LDS_BLOCK_M
         a_k_step = BLOCK_K * c_m
+    elif a_slot_ids is None:
+        A0_gl_offset = (a_block_m * BLOCK_M) * K
+        A1_gl_offset = (a_block_m * BLOCK_M + LDS_BLOCK_M) * K
+        a_k_step = BLOCK_K
     else:
-        A0_gl_offset = (block_m * BLOCK_M) * K
-        A1_gl_offset = (block_m * BLOCK_M + LDS_BLOCK_M) * K
+        # Gather resolves the row base through slot_ids, so the pipeline's A
+        # offset is a pure K column and stays a compile-time constant.
+        A0_gl_offset = 0
+        A1_gl_offset = 0
         a_k_step = BLOCK_K
     B0_gl_offset = block_n * BLOCK_N + 0
     B1_gl_offset = block_n * BLOCK_N + LDS_BLOCK_N
@@ -554,20 +606,29 @@ def _gemm_bf16_nn_tn_tile_impl(
         B0_gl_offset = B0_gl_offset + b_group_base
         B1_gl_offset = B1_gl_offset + b_group_base
 
-    gA = make_fp16_bf16_buffer_tensor(A)
     gB = make_fp16_bf16_buffer_tensor(B)
-    a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
     b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
-    if a_transpose:
-        gl_off_a = compute_global_swizzle_nn_bf16_wide(lane_id, wave_id, c_m, N_LDS_STEPS_A)
-    else:
-        gl_off_a = compute_global_swizzle_bf16(lane_id, wave_id, K, N_LDS_ROUNDS)
+    gl_off_a = (
+        compute_global_swizzle_nn_bf16_wide(lane_id, wave_id, c_m, N_LDS_STEPS_A) if a_transpose else None
+    )
     gl_off_b = compute_global_swizzle_nn_bf16_wide(lane_id, wave_id, c_n, N_LDS_STEPS_B)
 
-    a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, fx.BFloat16.ir_type, wave_id)
+    a_g2s = _make_a_g2s(
+        A,
+        a_slot_ids,
+        a_block_m,
+        lane_id,
+        wave_id,
+        K,
+        N_LDS_ROUNDS,
+        N_LDS_STEPS_A,
+        BLOCK_M,
+        LDS_BLOCK_M,
+        gl_off_a=gl_off_a,
+    )
     b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, fx.BFloat16.ir_type, wave_id)
     _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
-    store_c = StoreCBf16(C, c_m, c_n, _out_ty, cache_modifier=c_cache_modifier)
+    store_c = StoreCBf16(C, c_m, c_n, _out_ty, cache_modifier=c_cache_modifier, n_exact=n_exact)
 
     def _run(grid, quad_conds, half_n, col_safe=False, b_steps=N_LDS_STEPS_B):
         n_a16, n_b16, w_m, w_n = grid
@@ -643,6 +704,9 @@ def gemm_bf16_nn_tile(
     b_group_base=None,
     c_cache_modifier=0,
     n_tail=0,
+    n_exact=False,
+    a_slot_ids=None,
+    a_block_m=None,
 ):
     _gemm_bf16_nn_tn_tile_impl(
         A,
@@ -654,6 +718,8 @@ def gemm_bf16_nn_tile(
         block_m,
         block_n,
         a_transpose=False,
+        a_slot_ids=a_slot_ids,
+        a_block_m=a_block_m,
         K=K,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
@@ -667,6 +733,7 @@ def gemm_bf16_nn_tile(
         b_group_base=b_group_base,
         c_cache_modifier=c_cache_modifier,
         n_tail=n_tail,
+        n_exact=n_exact,
     )
 
 

@@ -11,8 +11,8 @@ from typing import List, Tuple
 import torch
 from torch.distributed.distributed_c10d import _resolve_process_group
 
-from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
-    grouped_gemm_bf16_variable_k_flydsl_kernel,
+from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_slot_wgrad_kernel import (
+    grouped_gemm_variable_k_bf16,
 )
 from primus_turbo.flydsl.mega import (
     dispatch_grouped_gemm_bf16_flydsl_kernel,
@@ -29,14 +29,6 @@ from primus_turbo.pytorch.core.backend import (
 )
 
 _SUPPORTED_DTYPES = (torch.bfloat16,)
-
-# dispatch handle layout (see dispatch_prologue return + pool_src_slot snapshot):
-# 0-5 send/dispatch tables + tile_to_expert, 6 real_count_per_expert,
-# 7 num_tokens_per_expert_prefix, 8 num_tile_blocks, 9-11 combine_recv_*, 12 pool_src_slot.
-_HANDLE_LEN = 13
-_H_NUM_TILE_BLOCKS = 8
-_H_REAL_COUNT_PER_EXPERT = 6
-_H_NUM_TOKENS_PER_EXPERT_PREFIX = 7
 
 
 class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
@@ -71,11 +63,15 @@ class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
         **kwargs,
     ):
 
-        # ABI guard: catch a kernel return-order change loudly.
-        assert len(handle) == _HANDLE_LEN, f"dispatch handle len {len(handle)} != {_HANDLE_LEN}; ABI changed"
-        real_count_per_expert = handle[_H_REAL_COUNT_PER_EXPERT]
-        num_tokens_per_expert_prefix = handle[_H_NUM_TOKENS_PER_EXPERT_PREFIX]
-        in_handle = tuple(handle)
+        handle = tuple(handle)  # custom op hands it over as a list
+        # grouped-GEMM tables sit at the two ends of the handle
+        (
+            num_tile_blocks,
+            sorted_slot_ids,
+            *_mid,
+            num_tokens_per_expert_prefix,
+            real_count_per_expert,
+        ) = handle
 
         # int64 end-to-end (combine reads topk i64)
         topk_idx = topk_idx.to(torch.int64)
@@ -86,7 +82,7 @@ class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
             dy,
             w2,
             group,
-            handle=in_handle,
+            handle=handle,
             layout="nn",
         )
 
@@ -98,15 +94,19 @@ class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
             return_gate=True,
             return_act_w=True,
             # bound by THIS handle's tile count (per-forward, not shared symm)
-            num_tile_blocks=handle[_H_NUM_TILE_BLOCKS],
+            num_tile_blocks=num_tile_blocks,
         )
 
-        dW2 = grouped_gemm_bf16_variable_k_flydsl_kernel(
+        # the dispatch pool is unique-slot indexed and duplicate route rows are never
+        # materialized, so the wgrad K axis resolves them through the slot table.
+        dW2 = grouped_gemm_variable_k_bf16(
             dispatch_l2_grad,
             act_weighted,
             num_tokens_per_expert_prefix,
             masked_k=real_count_per_expert,
             trans_c=False,
+            a_slot_ids=sorted_slot_ids,
+            slot_unroll=2,
         )
 
         # L1 dgrad (grad_l1 @ w1, nn) + combine PUSH + dx reduce + grad_gate scatter
@@ -125,7 +125,7 @@ class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
             saved_x,
             grad_l1,
             group,
-            handle=in_handle,
+            handle=handle,
             layout="tn",
             trans_c=True,
         )
