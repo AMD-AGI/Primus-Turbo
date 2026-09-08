@@ -21,9 +21,12 @@ def swiglu_with_mask_fwd_kernel(
     stride_x_token,
     stride_probs_token,
     stride_out_token,
+    # clamp
+    clamp_limit,
     # metas
     LOAD_WIDTH: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    HAS_CLAMP: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
@@ -48,10 +51,15 @@ def swiglu_with_mask_fwd_kernel(
         up = tl.load(up_ptr + col_off, mask=mask).to(compute_type)
         down = tl.load(down_ptr + col_off, mask=mask).to(compute_type)
 
+        if HAS_CLAMP:
+            limit = clamp_limit.to(compute_type)
+            up = tl.minimum(up, limit)
+            down = tl.minimum(tl.maximum(down, -limit), limit)
+
         up = tl.fdiv(up, (1.0 + tl.exp(-up)))
         out = up * down
 
-        probs = tl.load(probs_ptr + row_idx * stride_probs_token)
+        probs = tl.load(probs_ptr + row_idx * stride_probs_token, mask=row_mask)
         out = out * probs
 
         tl.store(out_ptr + row_idx * stride_out_token + col_off, out.to(data_type), mask=mask)
@@ -74,9 +82,12 @@ def swiglu_with_mask_bwd_kernel(
     stride_probs_token,
     stride_grad_x_token,
     stride_grad_probs_token,
+    # clamp
+    clamp_limit,
     # metas
     LOAD_WIDTH: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    HAS_CLAMP: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
@@ -102,6 +113,13 @@ def swiglu_with_mask_bwd_kernel(
         up = tl.load(up_ptr + col_off, mask=mask).to(compute_type)
         down = tl.load(down_ptr + col_off, mask=mask).to(compute_type)
 
+        if HAS_CLAMP:
+            limit = clamp_limit.to(compute_type)
+            up_kept = up <= limit
+            down_kept = (down >= -limit) & (down <= limit)
+            up = tl.minimum(up, limit)
+            down = tl.minimum(tl.maximum(down, -limit), limit)
+
         sigmoid = tl.sigmoid(up)
         silu = sigmoid * up
 
@@ -118,12 +136,16 @@ def swiglu_with_mask_bwd_kernel(
             mask=row_mask,
         )
 
-        probs = tl.load(probs_ptr + row_idx * stride_probs_token).to(compute_type)
+        probs = tl.load(probs_ptr + row_idx * stride_probs_token, mask=row_mask).to(compute_type)
 
         grad_out_with_probs = grad_out * probs
         grad_down = grad_out_with_probs * silu
         grad_silu = sigmoid * (1.0 + up * (1.0 - sigmoid))
         grad_up = grad_out_with_probs * (down * grad_silu)
+
+        if HAS_CLAMP:
+            grad_up = tl.where(up_kept, grad_up, 0.0)
+            grad_down = tl.where(down_kept, grad_down, 0.0)
 
         tl.store(
             grad_x_ptr + row_idx * stride_grad_x_token + col_off, grad_up.to(grad_x_data_type), mask=mask
@@ -147,8 +169,11 @@ def swiglu_fwd_kernel(
     stride_x_token: tl.constexpr,
     stride_probs_token: tl.constexpr,
     stride_out_token: tl.constexpr,
+    # clamp
+    clamp_limit,
     # metas
     LOAD_WIDTH: tl.constexpr,
+    HAS_CLAMP: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
@@ -169,6 +194,11 @@ def swiglu_fwd_kernel(
 
     up = tl.load(up_ptr + col_off, mask=mask).to(compute_type)
     down = tl.load(down_ptr + col_off, mask=mask).to(compute_type)
+
+    if HAS_CLAMP:
+        limit = clamp_limit.to(compute_type)
+        up = tl.minimum(up, limit)
+        down = tl.minimum(tl.maximum(down, -limit), limit)
 
     up = tl.fdiv(up, (1.0 + tl.exp(-up)))
     out = up * down
@@ -195,8 +225,11 @@ def swiglu_bwd_kernel(
     stride_probs_token: tl.constexpr,
     stride_grad_x_token: tl.constexpr,
     stride_grad_probs_token: tl.constexpr,
+    # clamp
+    clamp_limit,
     # metas
     LOAD_WIDTH: tl.constexpr,
+    HAS_CLAMP: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
@@ -219,6 +252,13 @@ def swiglu_bwd_kernel(
     up = tl.load(up_ptr + col_off, mask=mask).to(compute_type)
     down = tl.load(down_ptr + col_off, mask=mask).to(compute_type)
 
+    if HAS_CLAMP:
+        limit = clamp_limit.to(compute_type)
+        up_kept = up <= limit
+        down_kept = (down >= -limit) & (down <= limit)
+        up = tl.minimum(up, limit)
+        down = tl.minimum(tl.maximum(down, -limit), limit)
+
     sigmoid = tl.sigmoid(up)
     silu = sigmoid * up
 
@@ -239,6 +279,10 @@ def swiglu_bwd_kernel(
     grad_down = grad_out_with_probs * silu
     grad_silu = sigmoid * (1.0 + up * (1.0 - sigmoid))
     grad_up = grad_out_with_probs * (down * grad_silu)
+
+    if HAS_CLAMP:
+        grad_up = tl.where(up_kept, grad_up, 0.0)
+        grad_down = tl.where(down_kept, grad_down, 0.0)
 
     tl.store(grad_x_ptr + row_idx * stride_grad_x_token + col_off, grad_up.to(grad_x_data_type), mask=mask)
     tl.store(

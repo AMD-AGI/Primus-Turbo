@@ -690,6 +690,7 @@ def grouped_gemm_fp4_glu_impl(
     out_row_scaling_recipe: ScalingRecipe,
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
+    clamp_limit: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """fc1 grouped MXFP4 GEMM with the GLU activation and its quantisation fused in.
 
@@ -738,6 +739,7 @@ def grouped_gemm_fp4_glu_impl(
         N,
         K,
         activation=activation,
+        clamp_limit=clamp_limit,
         row_use_sr=row_sr,
         col_use_sr=col_sr,
         out_dtype=out_dtype,
@@ -763,6 +765,7 @@ def grouped_gemm_fp4_dglu_impl(
     out_row_scaling_recipe: ScalingRecipe,
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
+    clamp_limit: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """fc2 dgrad with the GLU activation gradient and its quantisation fused in.
 
@@ -816,6 +819,7 @@ def grouped_gemm_fp4_dglu_impl(
         I,
         K,
         activation=activation,
+        clamp_limit=clamp_limit,
         row_use_sr=row_sr,
         col_use_sr=col_sr,
         out_dtype=out_dtype,
@@ -841,6 +845,7 @@ def grouped_gemm_fp4_dglu_impl_meta(
     out_row_scaling_recipe: ScalingRecipe,
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
+    clamp_limit: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     assert a.dim() == 2 and b.dim() == 3, f"a must be 2D and b 3D, got {a.shape} {b.shape}"
     assert a.dtype == float4_e2m1fn_x2 and b.dtype == float4_e2m1fn_x2, "operands must be fp4"
@@ -869,6 +874,7 @@ def grouped_gemm_fp4_glu_impl_meta(
     out_row_scaling_recipe: ScalingRecipe,
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
+    clamp_limit: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     assert a.dim() == 2 and b.dim() == 3, f"a must be 2D and b 3D, got {a.shape} {b.shape}"
     assert a.dtype == float4_e2m1fn_x2 and b.dtype == float4_e2m1fn_x2, "operands must be fp4"
