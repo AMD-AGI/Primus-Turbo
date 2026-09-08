@@ -156,6 +156,46 @@ enum class MXFP6Prologue {
     Identity,         // stage the input unchanged
     BiasGelu,         // gelu_tanh(input + bias)
     BiasGeluBackward, // d/dx gelu_tanh(input + bias) * aux, where aux is the incoming grad
+    // The QK-norm + RoPE backward, for the QKV projection's dgrad. Unlike the three above
+    // this one does not act elementwise on `input`: it *computes* the tensor to be packed
+    // out of nine operands, carried in MXFP6QkNormRopeArgs. `input` is the forward's
+    // mixed_qkv, which the prologue needs as the norm's saved input and which happens to
+    // share the packer's own [M, N] indexing.
+    //
+    // It requires TILE_N == head_dim, because the norm's row reduction runs over head_dim
+    // and a block-local reduction is the only kind this kernel can do without cross-lane
+    // traffic. That is a static_assert, not a hope.
+    QkNormRopeBackward,
+};
+
+// Operands for MXFP6Prologue::QkNormRopeBackward.
+//
+// Passed as a struct rather than as arguments because there are nine of them and the
+// kernel already takes eleven. Every pointer is required; there is no null-means-skip
+// convention here, unlike `bias` above.
+//
+// Shapes, in the packer's own 2D view of a [S, B, H, 3D] tensor -- M = S*B rows and
+// N = H*3D columns, so column n selects head h = n / (3D) and element d = n % D, with
+// (n % 3D) / D choosing q, k or v:
+//
+//   dq, dk, dv   [M, H*D]   the FMHA gradients, one per slice, contiguous per row
+//   cos, sin     [M, D]     Flux's tables are per (position, batch), which is the packer's
+//                           row exactly -- see the note in RESULTS_prologue_reduce.md on
+//                           why this rules out any reuse
+//   wq, wk       [D]        the norm weights
+//   rstd_q,k     [M*H]      one per normalised vector, indexed m * H + h
+//   dw_q, dw_k   [rows, H, D]  fp32 partials, rows = mxfp6_col_sum_rows(M). Summed over
+//                           both leading axes by the caller. Two axes rather than one
+//                           because dw is a reduction over rows *and* heads, and a block
+//                           owns one head.
+template <typename DType> struct MXFP6QkNormRopeArgs {
+    const DType *dq, *dk, *dv;
+    const DType *cos, *sin;
+    const DType *wq, *wk;
+    const float *rstd_q, *rstd_k;
+    float       *dw_q, *dw_k;
+    int32_t      num_heads;
+    int32_t      head_dim;
 };
 
 // M-rows per row of the bias-gradient partial buffer, i.e. the packer's M-tile height.
@@ -197,6 +237,32 @@ void quantize_mxfp6_fused_impl(const DType *input, const DType *aux, const DType
                                uint8_t *row_packed, uint8_t *row_scale, uint8_t *col_packed,
                                uint8_t *col_scale, float *col_sum, const int M, const int N,
                                const MXFP6Prologue prologue, hipStream_t stream);
+
+// As above for MXFP6Prologue::QkNormRopeBackward, which needs its own entry point because
+// its operands do not fit the (input, aux, bias) shape and because it runs at a different
+// tile width: head_dim, not the shipped TILE_N. `input` is mixed_qkv.
+//
+// Kept separate rather than folded into quantize_mxfp6_fused_impl with a defaulted struct
+// so that the two tile widths stay two instantiations and no existing caller's generated
+// code moves. The wider width also measured faster than the shipped one on these shapes, so
+// this is not a concession -- see packer/RESULTS_tile_ab.md.
+// Constraints, all checked at the entry point rather than assumed:
+//   * head_dim must be 128. The tile width *is* head_dim, because the norm reduces over
+//     head_dim and the kernel only reduces inside a block, so each supported head_dim is a
+//     separate instantiation and 128 is the only one built.
+//   * num_heads must be even. The kernel reads its (head, slice) off blockIdx.x, which
+//     requires the grid to be exactly num_heads * 3 tiles wide; the grid rounds N up to 256,
+//     so N = num_heads * 3 * 128 has to be a multiple of 256.
+//   * the rotary embedding must be interleaved, not half-split. The backward pairs index 2i
+//     with 2i+1, which keeps a pair inside one thread's vector; the half-split convention
+//     pairs d with d + head_dim/2, in a different thread. This one the caller must uphold --
+//     it is not visible in any argument.
+template <typename DType>
+void quantize_mxfp6_qk_norm_rope_bwd_impl(const DType *input,
+                                          const MXFP6QkNormRopeArgs<DType> &args,
+                                          uint8_t *row_packed, uint8_t *row_scale,
+                                          uint8_t *col_packed, uint8_t *col_scale, float *col_sum,
+                                          const int M, const int N, hipStream_t stream);
 
 template <typename DType>
 void quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_output,

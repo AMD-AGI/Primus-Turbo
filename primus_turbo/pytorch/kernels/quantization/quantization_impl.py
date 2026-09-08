@@ -1118,3 +1118,71 @@ def quantize_mxfp6_fused_dual_impl_meta(
     rows, cols = x.shape
     shape = (mxfp6_col_sum_rows(rows), cols) if want_col_sum else (0, 0)
     return (*blobs, torch.empty(shape, dtype=torch.float32, device=x.device))
+
+
+@torch.library.custom_op(
+    "primus_turbo::quantize_mxfp6_qk_norm_rope_bwd_impl", mutates_args=(), device_types="cuda"
+)
+def quantize_mxfp6_qk_norm_rope_bwd_impl(
+    mixed_qkv: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    wq: torch.Tensor,
+    wk: torch.Tensor,
+    rstd_q: torch.Tensor,
+    rstd_k: torch.Tensor,
+    want_col_sum: bool = False,
+) -> Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    """Dual pack of the QKV projection's dgrad with the QK-norm and RoPE backward folded in.
+
+    The gradient packed here -- ``d(mixed_qkv)`` -- never reaches HBM, which is the point:
+    the unfused path writes it in bf16 from a Triton kernel and the packer reads it straight
+    back. Returns the four blobs, the bias-gradient partial, and the two norm-weight gradient
+    partials. See ``mxfp6_pack.quantize_mxfp6_qk_norm_rope_bwd`` for the shape contract and
+    for the constraints that are the caller's to uphold.
+    """
+    from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import (
+        quantize_mxfp6_qk_norm_rope_bwd,
+    )
+
+    return quantize_mxfp6_qk_norm_rope_bwd(
+        mixed_qkv, dq, dk, dv, cos, sin, wq, wk, rstd_q, rstd_k, want_col_sum
+    )
+
+
+@quantize_mxfp6_qk_norm_rope_bwd_impl.register_fake
+def quantize_mxfp6_qk_norm_rope_bwd_impl_meta(
+    mixed_qkv: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    wq: torch.Tensor,
+    wk: torch.Tensor,
+    rstd_q: torch.Tensor,
+    rstd_k: torch.Tensor,
+    want_col_sum: bool = False,
+) -> Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import mxfp6_col_sum_rows
+
+    # The prologue changes what is packed, not the blob geometry.
+    blobs = quantize_mxfp6_dual_impl_meta(mixed_qkv)
+    rows, cols = mixed_qkv.shape
+    head_dim = wq.shape[0]
+    num_heads = cols // (3 * head_dim)
+    partial_rows = mxfp6_col_sum_rows(rows)
+    empty = lambda shape: torch.empty(shape, dtype=torch.float32, device=mixed_qkv.device)  # noqa: E731
+    return (
+        *blobs,
+        empty((partial_rows, cols) if want_col_sum else (0, 0)),
+        empty((partial_rows, num_heads, head_dim)),
+        empty((partial_rows, num_heads, head_dim)),
+    )

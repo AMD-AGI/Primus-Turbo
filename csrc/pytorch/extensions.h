@@ -105,6 +105,29 @@ std::vector<at::Tensor> quantize_mxfp6_fused_dual_meta(const at::Tensor         
                                                        const c10::optional<at::Tensor> aux,
                                                        const c10::optional<at::Tensor> bias,
                                                        const int64_t mode, const bool want_col_sum);
+
+// Dual pack of the QKV projection's dgrad, with the QK-norm and RoPE backward folded into the
+// staging read. `input` is mixed_qkv at [M, num_heads * 3 * head_dim]; dq/dk/dv are the
+// per-slice grad_outputs at [M, num_heads * head_dim]; cos/sin are [M, head_dim] and must map
+// 1:1 onto rows (a batch-shared table is rejected); wq/wk are [head_dim]; rstd_q/rstd_k are
+// fp32 [M * num_heads] as the norm's forward wrote them. head_dim is taken from wq and must be
+// 128, and num_heads must be even.
+//
+// Returns the four blobs, then the bias-gradient partial (degenerate unless `want_col_sum`),
+// then the two norm-weight-gradient partials at [rows, num_heads, head_dim] fp32, to be summed
+// over both leading axes by the caller.
+std::vector<at::Tensor>
+quantize_mxfp6_qk_norm_rope_bwd(const at::Tensor input, const at::Tensor dq, const at::Tensor dk,
+                                const at::Tensor dv, const at::Tensor cos, const at::Tensor sin,
+                                const at::Tensor wq, const at::Tensor wk, const at::Tensor rstd_q,
+                                const at::Tensor rstd_k, const bool want_col_sum);
+std::vector<at::Tensor>
+quantize_mxfp6_qk_norm_rope_bwd_meta(const at::Tensor input, const at::Tensor dq,
+                                     const at::Tensor dk, const at::Tensor dv,
+                                     const at::Tensor cos, const at::Tensor sin,
+                                     const at::Tensor wq, const at::Tensor wk,
+                                     const at::Tensor rstd_q, const at::Tensor rstd_k,
+                                     const bool want_col_sum);
 #endif // BUILD_MXFP6_BACKEND
 
 at::Tensor dequantize_fp8_rowwise(const at::Tensor input, const at::Tensor scale_inv,

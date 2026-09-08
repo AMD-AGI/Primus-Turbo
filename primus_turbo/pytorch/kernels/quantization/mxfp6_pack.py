@@ -365,3 +365,137 @@ def quantize_mxfp6_fused_dual(
 
     blobs = torch.ops.primus_turbo_cpp_extension.quantize_mxfp6_fused_dual(x, aux, bias, mode, want_col_sum)
     return tuple(blobs)
+
+
+def mxfp6_qk_norm_rope_backward_reference(
+    mixed_qkv: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    wq: torch.Tensor,
+    wk: torch.Tensor,
+    rstd_q: torch.Tensor,
+    rstd_k: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Eager reference for the tensor ``quantize_mxfp6_qk_norm_rope_bwd`` packs.
+
+    Returns ``(d_mixed_qkv, dw_q, dw_k)``. Written against the math rather than against the
+    kernel, and deliberately not sharing any code with it, so that agreement means something.
+
+    The math, per normed vector of length ``D`` (q and k only; v is copied through):
+
+    * ``dn = rope_backward(g, cos, sin)`` pairing ``2i`` with ``2i+1`` -- interleaved, which
+      is what Flux uses and what the kernel assumes;
+    * ``u = x * rstd`` with ``rstd`` as the forward computed it, not recomputed here;
+    * ``m = mean_d(dn * w * u)``;
+    * ``dx = rstd * (dn * w - u * m)``;
+    * ``dw = sum_rows(dn * u)``.
+    """
+    m, n = mixed_qkv.shape
+    d = wq.shape[0]
+    h = n // (3 * d)
+
+    qkv = mixed_qkv.float().view(m, h, 3, d)
+    out = torch.empty_like(qkv)
+    dws = []
+    for slot, (g, w, rstd) in enumerate(((dq, wq, rstd_q), (dk, wk, rstd_k))):
+        gf = g.float().view(m, h, d)
+        # rstd is [M * H] in (row, head) order, matching the norm forward's flattening.
+        r = rstd.float().view(m, h, 1)
+        c, s = cos.float().unsqueeze(1), sin.float().unsqueeze(1)  # [M, 1, D], broadcast over heads
+
+        # The rotation's backward. Adjacent pairs, so a reshape to [..., D/2, 2] isolates them.
+        g2 = gf.reshape(m, h, d // 2, 2)
+        c2 = c.reshape(m, 1, d // 2, 2)
+        s2 = s.reshape(m, 1, d // 2, 2)
+        dn = torch.stack(
+            (
+                g2[..., 0] * c2[..., 0] + g2[..., 1] * s2[..., 1],
+                g2[..., 1] * c2[..., 1] - g2[..., 0] * s2[..., 0],
+            ),
+            dim=-1,
+        ).reshape(m, h, d)
+
+        u = qkv[:, :, slot, :] * r
+        wv = w.float().view(1, 1, d)
+        mean = (dn * wv * u).mean(dim=-1, keepdim=True)
+        out[:, :, slot, :] = r * (dn * wv - u * mean)
+        dws.append((dn * u).sum(dim=0))  # [H, D], summed over rows
+
+    out[:, :, 2, :] = dv.float().view(m, h, d)
+    return out.reshape(m, n).to(mixed_qkv.dtype), dws[0], dws[1]
+
+
+def quantize_mxfp6_qk_norm_rope_bwd(
+    mixed_qkv: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    wq: torch.Tensor,
+    wk: torch.Tensor,
+    rstd_q: torch.Tensor,
+    rstd_k: torch.Tensor,
+    want_col_sum: bool = False,
+    block_size: int = MXFP6_BLOCK_SIZE,
+) -> Tuple[torch.Tensor, ...]:
+    """Dual pack of the QKV projection's dgrad with the QK-norm and RoPE backward folded in.
+
+    The gradient this packs -- ``d(mixed_qkv)`` -- is never written to HBM. Today the fused
+    norm+RoPE backward materialises it in bf16 and the packer reads it straight back; this
+    computes it from its nine operands while staging the tile that gets packed.
+
+    Returns ``(row_packed, row_scale, col_packed, col_scale, col_sum, dw_q, dw_k)``.
+    ``col_sum`` is the QKV projection's *bias* gradient partial, degenerate unless
+    ``want_col_sum``; ``dw_q``/``dw_k`` are the two norm weights' gradient partials at
+    ``[mxfp6_col_sum_rows(M), H, D]`` fp32, to be finished with ``.sum((0, 1))``. Those are
+    different tensors that happen to share a shape -- ``col_sum`` reduces the packed ``dx``
+    down columns, the ``dw`` pair reduces ``dn * u_hat`` down rows.
+
+    Shapes, all checked in the binding: ``mixed_qkv`` is ``[M, H * 3 * D]`` with q, k and v
+    interleaved per head at stride ``3D``; ``dq``/``dk``/``dv`` are ``[M, H * D]``;
+    ``cos``/``sin`` are ``[M, D]``; ``wq``/``wk`` are ``[D]``; ``rstd_q``/``rstd_k`` are fp32
+    ``[M * H]``.
+
+    Three constraints are not negotiable and only the first two are checkable:
+
+    * ``D`` must be 128 and ``H`` must be even -- the tile width *is* ``D`` because the norm's
+      reduction has to stay inside a block, and the kernel reads its ``(head, slice)`` off the
+      block index, which needs the grid to tile ``N`` exactly.
+    * ``cos``/``sin`` must have a row per row of ``mixed_qkv``. A table shared across the batch
+      is legal upstream and the Triton kernel handles it by dividing the row index; this one
+      does not divide, so the binding rejects the wrong shape rather than reading the wrong row.
+    * **the rotary embedding must be interleaved, not half-split.** Nothing in the signature
+      makes this visible and no check will catch it -- a half-split caller gets a wrong
+      gradient. ``mxfp6_qk_norm_rope_backward_reference`` documents the pairing this assumes.
+
+    Unlike the blobs from ``quantize_mxfp6_fused_dual``, these are *not* claimed bit-identical
+    to packing an eagerly computed ``d(mixed_qkv)``: the norm's row sum is reduced in the
+    kernel's own order (per-chunk fp32, finished by a lane butterfly), which is a different
+    summation of the same values than any eager reduction. It is bit-identical to packing the
+    ``dx`` that order produces, which is what ``packer/qkr_exact_test.cu`` gates.
+    """
+    _require_supported(mixed_qkv.device)
+    _check_input(mixed_qkv, block_size)
+
+    operands = {
+        "dq": dq, "dk": dk, "dv": dv, "cos": cos, "sin": sin,
+        "wq": wq, "wk": wk, "rstd_q": rstd_q, "rstd_k": rstd_k,
+    }
+    for name, operand in operands.items():
+        if operand.device != mixed_qkv.device:
+            raise ValueError(
+                f"MXFP6 QK-norm+RoPE pack needs every operand on one device: mixed_qkv is "
+                f"on {mixed_qkv.device} but {name} is on {operand.device}."
+            )
+
+    blobs = torch.ops.primus_turbo_cpp_extension.quantize_mxfp6_qk_norm_rope_bwd(
+        mixed_qkv.contiguous(),
+        *(operands[k].contiguous() for k in
+          ("dq", "dk", "dv", "cos", "sin", "wq", "wk", "rstd_q", "rstd_k")),
+        want_col_sum,
+    )
+    return tuple(blobs)
