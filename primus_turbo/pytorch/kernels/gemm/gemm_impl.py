@@ -18,6 +18,7 @@ from primus_turbo.pytorch.core.backend import (
     PrecisionType,
     TuneCache,
 )
+from primus_turbo.pytorch.core.utils import is_gfx1250
 from primus_turbo.triton.gemm.gemm_kernel import gemm_triton_kernel
 
 _COMMON_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
@@ -99,9 +100,96 @@ class GEMMTritonBackend(KernelBackend):
         return gemm_triton_kernel(a, b, trans_a, trans_b, out_dtype, trans_c, beta=beta, out=out)
 
 
+# (trans_a, trans_b) -> the FlyDSL kernel's layout name, for out = op(a) @ op(b).
+# trans_a picks A[M,K] or A[K,M]; trans_b picks B[K,N] or B[N,K]. The three
+# reachable combinations are exactly the three GEMMs a Linear issues per
+# training step -- forward, dgrad and wgrad. TT has no consumer and no kernel.
+_FLYDSL_LAYOUTS = {
+    (False, True): "nt",  # Y  = X  @ W^T
+    (False, False): "nn",  # dX = dY @ W
+    (True, False): "tn",  # dW = dY^T @ X
+}
+
+
+def _flydsl_call(a, trans_a, b, trans_b, trans_c):
+    """Normalise a gemm_impl call to ``(a, b, layout)`` for the FlyDSL kernel.
+
+    A transposed output is folded into the operands rather than rejected:
+    ``(op(a) @ op(b))^T == op(b)^T @ op(a)^T``, so ``trans_c`` is the same call
+    with the operands swapped and both flags flipped. That matters because the
+    wgrad of a Linear arrives as ``trans_c=True`` (dW has to come out [N, K] to
+    match the weight), and without this it could never reach this backend.
+
+    Returns ``None`` when the combination has no layout here.
+    """
+    if trans_c:
+        a, b, trans_a, trans_b = b, a, not trans_b, not trans_a
+    layout = _FLYDSL_LAYOUTS.get((trans_a, trans_b))
+    return None if layout is None else (a, b, layout)
+
+
+def _flydsl_gemm():
+    """Import the gfx1250 FlyDSL GEMM lazily.
+
+    This module is imported on every arch, and importing FlyDSL pulls in MLIR.
+    """
+    from primus_turbo.flydsl.gemm.gemm_gfx1250_kernel import can_run, gemm_gfx1250
+
+    return can_run, gemm_gfx1250
+
+
+class GEMMFlyDSLBackend(KernelBackend):
+    """gfx1250 WMMA GEMM. See primus_turbo/flydsl/gemm/gemm_gfx1250_kernel.py."""
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
+        **kwargs,
+    ) -> bool:
+        if not is_gfx1250():
+            return False
+        # No beta=1 epilogue, so an accumulating output has to go elsewhere.
+        if inplace_add_to_out:
+            return False
+        call = _flydsl_call(a, trans_a, b, trans_b, trans_c)
+        if call is None:
+            return False
+        if out_dtype not in _COMMON_SUPPORTED_DTYPES:
+            return False
+        ka, kb, layout = call
+        can_run, _ = _flydsl_gemm()
+        # Every remaining constraint (dtype pairing, K divisibility, LDS budget)
+        # lives with the kernel, so this cannot drift away from what it accepts.
+        return can_run(ka, kb, layout=layout, out_dtype=out_dtype)
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        ka, kb, layout = _flydsl_call(a, trans_a, b, trans_b, trans_c)
+        _, gemm_gfx1250 = _flydsl_gemm()
+        return gemm_gfx1250(ka, kb, out, layout=layout, out_dtype=out_dtype)
+
+
 _GEMM_BACKENDS = {
     BackendType.HIPBLASLT: BackendEntry(GEMMHipBLASLtBackend),
     BackendType.TRITON: BackendEntry(GEMMTritonBackend),
+    BackendType.FLYDSL: BackendEntry(GEMMFlyDSLBackend),
 }
 
 

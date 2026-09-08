@@ -73,6 +73,7 @@ from flydsl.expr.typing import T as _T
 
 __all__ = [
     "WAVE",
+    "can_run",
     "gemm_gfx1250",
     "launch_gemm_gfx1250",
     "supported_dtypes",
@@ -813,6 +814,116 @@ def _ptr(t: torch.Tensor):
 _LAYOUTS = {"nt": LAYOUT_NT, "nn": LAYOUT_NN, "tn": LAYOUT_TN}
 
 
+def _resolve(a, b, layout, scale_a, scale_b, kind, tile, m_warp, n_warp, num_buffers, group_m, out_dtype):
+    """Work out the launch configuration, or say why this call cannot run.
+
+    Returns ``(config, None)`` or ``(None, reason)``. Both :func:`gemm_gfx1250`
+    and :func:`can_run` go through here, so a caller asking "will this work?"
+    and the call itself can never disagree.
+    """
+    if a.dim() != 2 or b.dim() != 2:
+        return None, f"A and B must be 2-D, got {tuple(a.shape)}, {tuple(b.shape)}"
+    if layout not in _LAYOUTS:
+        return None, f"layout must be one of {sorted(_LAYOUTS)}, got {layout!r}"
+    if a.stride(1) != 1 or b.stride(1) != 1:
+        return None, "A and B must be row-major (innermost stride 1)"
+    layout_id = _LAYOUTS[layout]
+    # out is always [M, N]; the layout says how A and B are stored.
+    if layout_id == LAYOUT_NT:  # A[M,K] @ B[N,K]^T -- a Linear forward
+        (M, K), (N, Kb) = a.shape, b.shape
+    elif layout_id == LAYOUT_NN:  # A[M,K] @ B[K,N] -- dgrad
+        (M, K), (Kb, N) = a.shape, b.shape
+    else:  # LAYOUT_TN: A[K,M]^T @ B[K,N] -- wgrad
+        (Kb, M), (K2, N) = a.shape, b.shape
+        K, Kb = Kb, K2
+    if K != Kb:
+        return None, f"K mismatch between A and B: {K} vs {Kb} (layout={layout})"
+
+    if kind is None:
+        if a.element_size() == 1 and b.element_size() == 1:
+            suffix = _TORCH_PAIR.get((a.dtype, b.dtype))
+            base = "mxfp8" if scale_a is not None else "fp8"
+            kind = base if suffix is None else f"{base}_{suffix}"
+            if kind not in _KINDS:
+                return None, f"unsupported fp8 operand pair {a.dtype} x {b.dtype}"
+        else:
+            if a.dtype != b.dtype:
+                return None, (
+                    f"16-bit operands must share a dtype (gfx1250 has no mixed "
+                    f"16-bit WMMA), got {a.dtype} x {b.dtype}"
+                )
+            kind = _TORCH_IN.get(a.dtype)
+            if kind is None:
+                return None, f"unsupported input dtype {a.dtype}"
+    if kind not in _KINDS:
+        return None, f"unknown kind {kind!r}; expected one of {supported_dtypes()}"
+    is_mx = _KINDS[kind][4]
+    if layout_id != LAYOUT_NT and _KINDS[kind][2] != 2:
+        return None, f"{layout} is wired up for 16-bit operands only, got {kind}"
+
+    d_tile, d_mw, d_nw, d_nb, d_gm = default_config(kind, M, N, K, layout_id)
+    tile_m, tile_n, tile_k = tile or d_tile
+    m_warp = d_mw if m_warp is None else m_warp
+    n_warp = d_nw if n_warp is None else n_warp
+    num_buffers = d_nb if num_buffers is None else num_buffers
+    group_m = d_gm if group_m is None else group_m
+    if K % tile_k:
+        return None, f"K={K} must be a multiple of tile_k={tile_k}"
+    if K // tile_k < num_buffers:
+        return None, (
+            f"the {num_buffers}-buffer pipeline needs >= {num_buffers} K-tiles, "
+            f"got {K // tile_k} (K={K}, tile_k={tile_k})"
+        )
+    if is_mx:
+        if scale_a is None or scale_b is None:
+            return None, "mxfp8 needs scale_a and scale_b"
+        for nm, sc, rows in (("scale_a", scale_a, M), ("scale_b", scale_b, N)):
+            if tuple(sc.shape) != (rows, K // MX_BLOCK):
+                return None, f"{nm} must be {(rows, K // MX_BLOCK)} uint8 E8M0, got {tuple(sc.shape)}"
+    if out_dtype not in (torch.bfloat16, torch.float16):
+        return None, f"out_dtype must be bf16 or f16, got {out_dtype}"
+    return (
+        dict(
+            M=M,
+            N=N,
+            K=K,
+            kind=kind,
+            is_mx=is_mx,
+            layout_id=layout_id,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            m_warp=m_warp,
+            n_warp=n_warp,
+            num_buffers=num_buffers,
+            group_m=group_m,
+        ),
+        None,
+    )
+
+
+def can_run(
+    a,
+    b,
+    *,
+    layout="nt",
+    scale_a=None,
+    scale_b=None,
+    kind=None,
+    tile=None,
+    m_warp=None,
+    n_warp=None,
+    num_buffers=None,
+    group_m=None,
+    out_dtype=torch.bfloat16,
+) -> bool:
+    """Whether :func:`gemm_gfx1250` can serve this call. Does not touch the GPU."""
+    _, reason = _resolve(
+        a, b, layout, scale_a, scale_b, kind, tile, m_warp, n_warp, num_buffers, group_m, out_dtype
+    )
+    return reason is None
+
+
 def gemm_gfx1250(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -838,63 +949,16 @@ def gemm_gfx1250(
     ``scale_a``/``scale_b`` are treated as ``"mxfp8"``. MX scales are
     ``(M, K // 32)`` / ``(N, K // 32)`` uint8 E8M0, row-major.
     """
-    if a.dim() != 2 or b.dim() != 2:
-        raise ValueError(f"A and B must be 2-D, got {tuple(a.shape)}, {tuple(b.shape)}")
-    if layout not in _LAYOUTS:
-        raise ValueError(f"layout must be one of {sorted(_LAYOUTS)}, got {layout!r}")
-    layout_id = _LAYOUTS[layout]
-    # out is always [M, N]; the layout says how A and B are stored.
-    if layout_id == LAYOUT_NT:  # A[M,K] @ B[N,K]^T -- a Linear forward
-        (M, K), (N, Kb) = a.shape, b.shape
-    elif layout_id == LAYOUT_NN:  # A[M,K] @ B[K,N] -- dgrad
-        (M, K), (Kb, N) = a.shape, b.shape
-    else:  # LAYOUT_TN: A[K,M]^T @ B[K,N] -- wgrad
-        (Kb, M), (K2, N) = a.shape, b.shape
-        K, Kb = Kb, K2
-    if K != Kb:
-        raise ValueError(f"K mismatch between A and B: {K} vs {Kb} (layout={layout})")
-
-    if kind is None:
-        if a.element_size() == 1 and b.element_size() == 1:
-            suffix = _TORCH_PAIR.get((a.dtype, b.dtype))
-            base = "mxfp8" if scale_a is not None else "fp8"
-            kind = base if suffix is None else f"{base}_{suffix}"
-            if kind not in _KINDS:
-                raise ValueError(f"unsupported fp8 operand pair {a.dtype} x {b.dtype}")
-        else:
-            if a.dtype != b.dtype:
-                raise ValueError(
-                    f"16-bit operands must share a dtype (gfx1250 has no mixed "
-                    f"16-bit WMMA), got {a.dtype} x {b.dtype}"
-                )
-            kind = _TORCH_IN.get(a.dtype)
-            if kind is None:
-                raise ValueError(f"unsupported input dtype {a.dtype}")
-    if kind not in _KINDS:
-        raise ValueError(f"unknown kind {kind!r}; expected one of {supported_dtypes()}")
-    is_mx = _KINDS[kind][4]
-
-    d_tile, d_mw, d_nw, d_nb, d_gm = default_config(kind, M, N, K, layout_id)
-    tile_m, tile_n, tile_k = tile or d_tile
-    m_warp = d_mw if m_warp is None else m_warp
-    n_warp = d_nw if n_warp is None else n_warp
-    num_buffers = d_nb if num_buffers is None else num_buffers
-    group_m = d_gm if group_m is None else group_m
-    if K % tile_k:
-        raise ValueError(f"K={K} must be a multiple of tile_k={tile_k}")
-    if K // tile_k < num_buffers:
-        raise ValueError(
-            f"the {num_buffers}-buffer pipeline needs >= {num_buffers} K-tiles, "
-            f"got {K // tile_k} (K={K}, tile_k={tile_k})"
-        )
-    if is_mx:
-        if scale_a is None or scale_b is None:
-            raise ValueError("mxfp8 needs scale_a and scale_b")
-        for nm, s, rows in (("scale_a", scale_a, M), ("scale_b", scale_b, N)):
-            if tuple(s.shape) != (rows, K // MX_BLOCK):
-                raise ValueError(f"{nm} must be {(rows, K // MX_BLOCK)} uint8 E8M0, got {tuple(s.shape)}")
-    if out_dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError(f"out_dtype must be bf16 or f16, got {out_dtype}")
+    cfg, reason = _resolve(
+        a, b, layout, scale_a, scale_b, kind, tile, m_warp, n_warp, num_buffers, group_m, out_dtype
+    )
+    if reason is not None:
+        raise ValueError(reason)
+    M, N, K = cfg["M"], cfg["N"], cfg["K"]
+    kind, is_mx, layout_id = cfg["kind"], cfg["is_mx"], cfg["layout_id"]
+    tile_m, tile_n, tile_k = cfg["tile_m"], cfg["tile_n"], cfg["tile_k"]
+    m_warp, n_warp = cfg["m_warp"], cfg["n_warp"]
+    num_buffers, group_m = cfg["num_buffers"], cfg["group_m"]
 
     if out is None:
         out = torch.empty((M, N), dtype=out_dtype, device=a.device)

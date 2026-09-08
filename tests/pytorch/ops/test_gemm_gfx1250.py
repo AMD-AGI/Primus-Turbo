@@ -299,3 +299,56 @@ def test_training_triple():
     assert snr_db(x.float() @ w.float().T, y) > MIN_SNR_DB
     assert snr_db(dy.float() @ w.float(), dx) > MIN_SNR_DB
     assert snr_db(dy.float().T @ x.float(), dw) > MIN_SNR_DB
+
+
+# --- Primus-Turbo backend registration -------------------------------------
+
+
+def test_flydsl_call_folds_trans_c():
+    """A Linear's three training GEMMs must each reach a supported layout.
+
+    wgrad arrives as trans_c=True (dW has to come out [N, K] to match the
+    weight layout), which the kernel cannot express directly; folding it into
+    the operands is what keeps that call on this backend instead of silently
+    falling back.
+    """
+    from primus_turbo.pytorch.kernels.gemm.gemm_impl import _flydsl_call
+
+    x, w, dy = "X", "W", "dY"
+    #                     a   trans_a  b   trans_b  trans_c
+    assert _flydsl_call(x, False, w, True, False) == (x, w, "nt")  # Y  = X @ W^T
+    assert _flydsl_call(dy, False, w, False, False) == (dy, w, "nn")  # dX = dY @ W
+    assert _flydsl_call(x, True, dy, False, True) == (dy, x, "tn")  # dW = dY^T @ X
+    # TT has no kernel and must decline rather than mis-dispatch.
+    assert _flydsl_call("a", True, "b", True, False) is None
+
+
+def test_flydsl_backend_is_registered():
+    from primus_turbo.pytorch.core.backend import BackendType
+    from primus_turbo.pytorch.kernels.gemm.gemm_impl import _GEMM_BACKENDS
+
+    assert BackendType.FLYDSL in _GEMM_BACKENDS
+
+
+def test_gemm_impl_through_the_flydsl_backend():
+    """The three training GEMMs, driven through gemm_impl with FlyDSL pinned."""
+    from primus_turbo.pytorch.core.backend import BackendType
+    from primus_turbo.pytorch.kernels.gemm.gemm_impl import _GEMM_BACKENDS
+
+    m, k, n = 256, 512, 128
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    dy = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
+    impl = _GEMM_BACKENDS[BackendType.FLYDSL].impl
+
+    cases = [
+        ("fwd", (x, False, w, True, False), x.float() @ w.float().T),
+        ("dgrad", (dy, False, w, False, False), dy.float() @ w.float()),
+        ("wgrad", (x, True, dy, False, True), dy.float().T @ x.float()),
+    ]
+    for name, (a, ta, b, tb, tc), ref in cases:
+        kw = dict(a=a, trans_a=ta, b=b, trans_b=tb, out_dtype=torch.bfloat16, trans_c=tc)
+        assert impl.can_handle(**kw), f"{name} was declined by the FlyDSL backend"
+        out = impl.execute(**kw)
+        assert out.shape == ref.shape, f"{name}: {tuple(out.shape)} vs {tuple(ref.shape)}"
+        assert snr_db(ref, out) > MIN_SNR_DB, name
