@@ -234,3 +234,68 @@ def test_fp8_k64_atom(k):
     b = (torch.randn(n, k, device="cuda") / 3).to(E4M3)
     out = gemm_gfx1250(a, b)
     assert snr_db(a.float() @ b.float().T, out) > MIN_SNR_DB
+
+
+# --- operand layouts -------------------------------------------------------
+# NT is a Linear forward; NN and TN are its dgrad and wgrad, so training needs
+# all three. NN/TN stage the K-major operand in its natural layout and
+# transpose it in LDS with ds_load_tr16_b128.
+LAYOUT_SHAPES = {
+    "nt": lambda m, n, k: ((m, k), (n, k)),
+    "nn": lambda m, n, k: ((m, k), (k, n)),
+    "tn": lambda m, n, k: ((k, m), (k, n)),
+}
+
+
+def _layout_ref(layout, a, b):
+    if layout == "nt":
+        return a.float() @ b.float().T
+    if layout == "nn":
+        return a.float() @ b.float()
+    return a.float().T @ b.float()
+
+
+@pytest.mark.parametrize("layout", ["nt", "nn", "tn"])
+@pytest.mark.parametrize("shape", [(128, 128, 256), (256, 256, 512), (255, 128, 512)])
+def test_layouts(layout, shape):
+    m, n, k = shape
+    sa, sb = LAYOUT_SHAPES[layout](m, n, k)
+    a = torch.randn(*sa, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(*sb, device="cuda", dtype=torch.bfloat16)
+    out = gemm_gfx1250(a, b, layout=layout)
+    assert out.shape == (m, n)
+    assert snr_db(_layout_ref(layout, a, b), out) > MIN_SNR_DB
+
+
+def test_layouts_do_not_share_a_compiled_kernel():
+    """Every Constexpr must be part of the compiled-kernel cache key.
+
+    `layout` was once left out of a hand-written key, so an "nn" call reused
+    whatever kernel the preceding "nt" call had compiled and scored -3 dB. The
+    same shape through all three layouts, back to back, catches that.
+    """
+    m, n, k = 256, 256, 512
+    for layout in ("nt", "nn", "tn"):
+        sa, sb = LAYOUT_SHAPES[layout](m, n, k)
+        a = torch.randn(*sa, device="cuda", dtype=torch.bfloat16)
+        b = torch.randn(*sb, device="cuda", dtype=torch.bfloat16)
+        out = gemm_gfx1250(a, b, layout=layout)
+        assert snr_db(_layout_ref(layout, a, b), out) > MIN_SNR_DB, (
+            f"{layout} is wrong right after the other layouts compiled"
+        )
+
+
+def test_training_triple():
+    """The three GEMMs one Linear layer issues per training step."""
+    m, k, n = 256, 512, 128  # tokens, in_features, out_features
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    dy = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
+
+    y = gemm_gfx1250(x, w, layout="nt")  # fwd:   Y  = X @ W^T
+    dx = gemm_gfx1250(dy, w, layout="nn")  # dgrad: dX = dY @ W
+    dw = gemm_gfx1250(dy, x, layout="tn")  # wgrad: dW = dY^T @ X
+
+    assert snr_db(x.float() @ w.float().T, y) > MIN_SNR_DB
+    assert snr_db(dy.float() @ w.float(), dx) > MIN_SNR_DB
+    assert snr_db(dy.float().T @ x.float(), dw) > MIN_SNR_DB

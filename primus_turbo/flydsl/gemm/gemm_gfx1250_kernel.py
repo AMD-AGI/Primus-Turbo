@@ -62,8 +62,11 @@ from __future__ import annotations
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl._mlir import ir as _ir
 from flydsl._mlir._mlir_libs._mlirDialectsFlyROCDL import MmaOpGFX1250_WMMAType
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import Constexpr
 from flydsl.expr.typing import T as _T
@@ -152,6 +155,14 @@ MX_BLOCK = 32
 # The WMMA atom is 16x16 in M/N for every operand type on this target.
 WMMA_N_ATOM = 16
 
+# Operand layouts, named for how A and B are stored (out = op(A) @ op(B)):
+#   NT  A[M, K], B[N, K]  -- both K-contiguous. The forward pass of a Linear.
+#   NN  A[M, K], B[K, N]  -- dgrad: dX = dY @ W.
+#   TN  A[K, M], B[K, N]  -- wgrad: dW = X^T @ dY.
+# The WMMA atom wants both operands as [row, K] with K contiguous, so an
+# operand stored K-major has to be transposed on its way into LDS.
+LAYOUT_NT, LAYOUT_NN, LAYOUT_TN = 0, 1, 2
+
 
 @flyc.jit
 def launch_gemm_gfx1250(
@@ -176,6 +187,7 @@ def launch_gemm_gfx1250(
     kind_id: Constexpr[int],
     out_is_f16: Constexpr[int],
     group_m: Constexpr[int] = 8,
+    layout: Constexpr[int] = LAYOUT_NT,
 ):
     """NT GEMM: ``C[M, N] = A[M, K] @ B[N, K]^T`` on gfx1250.
 
@@ -212,11 +224,27 @@ def launch_gemm_gfx1250(
     B_ROW = tile_k + LDS_PAD
     STAGE_A = tile_m * A_ROW * elem_bytes
     STAGE_B = tile_n * B_ROW * elem_bytes
+
+    # An operand stored K-major lands in a scratch tile in its natural layout
+    # and is transposed into the [row, K] tile the MMA path above expects, so
+    # that path stays byte-identical across all three layouts.
+    a_tr = layout == LAYOUT_TN
+    b_tr = layout in (LAYOUT_NN, LAYOUT_TN)
+    assert not (a_tr or b_tr) or is_16bit, (
+        "the LDS transpose is wired up for 16-bit operands only so far; "
+        "8-bit NN/TN still needs the ds_load_tr8_b64 path"
+    )
+    TR_A_ROW = tile_m + LDS_PAD  # scratch row = the contiguous (M or N) extent
+    TR_B_ROW = tile_n + LDS_PAD
+    SCRATCH_A = tile_k * TR_A_ROW * elem_bytes if a_tr else 0
+    SCRATCH_B = tile_k * TR_B_ROW * elem_bytes if b_tr else 0
     # Per-stage MX scale planes: one E8M0 byte per MX_BLOCK K elements.
     SC_ROW = tile_k // MX_BLOCK
     STAGE_SA = tile_m * SC_ROW if is_mx else 0
     STAGE_SB = tile_n * SC_ROW if is_mx else 0
-    PITCH = STAGE_A + STAGE_B + STAGE_SA + STAGE_SB
+    SCRATCH_A_OFF = STAGE_A + STAGE_B + STAGE_SA + STAGE_SB
+    SCRATCH_B_OFF = SCRATCH_A_OFF + SCRATCH_A
+    PITCH = SCRATCH_B_OFF + SCRATCH_B
     # The epilogue restages C through the same arena, so it has to fit both.
     ARENA = max(num_buffers * PITCH, tile_m * (tile_n + 8) * 2)
     assert ARENA <= 160 * 1024, f"LDS arena {ARENA} B exceeds the 160 KiB gfx1250 budget"
@@ -300,25 +328,50 @@ def launch_gemm_gfx1250(
         gB_base = _cast(b_cls, arg_b)
         gC_base = _cast(out_cls, arg_c)
 
-        gA = _gview(gA_base, fx.Int64(blk_m) * lda64, (tile_m, tile_k), (i32_lda, 1))
-        gB = _gview(gB_base, fx.Int64(blk_n) * ldb64, (tile_n, tile_k), (i32_ldb, 1))
-
-        atomA = fx.rocdl.make_tdm_atom(
-            gA,
-            [m_oob, None],
-            strides=[lda64, None],
-            num_warps=num_waves,
-            pad_interval=tile_k,
-            pad_amount=LDS_PAD,
-        )
-        atomB = fx.rocdl.make_tdm_atom(
-            gB,
-            [n_oob, None],
-            strides=[ldb64, None],
-            num_warps=num_waves,
-            pad_interval=tile_k,
-            pad_amount=LDS_PAD,
-        )
+        # A K-major operand is fetched as a [tile_k, X] tile (its natural,
+        # contiguous global layout, which is all TDM can do -- its innermost
+        # stride is fixed at 1) and transposed in LDS afterwards. The ragged
+        # extent moves to the inner dim with it.
+        if const_expr(a_tr):
+            gA = _gview(gA_base, fx.Int64(blk_m), (tile_k, tile_m), (i32_lda, 1))
+            atomA = fx.rocdl.make_tdm_atom(
+                gA,
+                [None, m_oob],
+                strides=[lda64, None],
+                num_warps=num_waves,
+                pad_interval=tile_m,
+                pad_amount=LDS_PAD,
+            )
+        else:
+            gA = _gview(gA_base, fx.Int64(blk_m) * lda64, (tile_m, tile_k), (i32_lda, 1))
+            atomA = fx.rocdl.make_tdm_atom(
+                gA,
+                [m_oob, None],
+                strides=[lda64, None],
+                num_warps=num_waves,
+                pad_interval=tile_k,
+                pad_amount=LDS_PAD,
+            )
+        if const_expr(b_tr):
+            gB = _gview(gB_base, fx.Int64(blk_n), (tile_k, tile_n), (i32_ldb, 1))
+            atomB = fx.rocdl.make_tdm_atom(
+                gB,
+                [None, n_oob],
+                strides=[ldb64, None],
+                num_warps=num_waves,
+                pad_interval=tile_n,
+                pad_amount=LDS_PAD,
+            )
+        else:
+            gB = _gview(gB_base, fx.Int64(blk_n) * ldb64, (tile_n, tile_k), (i32_ldb, 1))
+            atomB = fx.rocdl.make_tdm_atom(
+                gB,
+                [n_oob, None],
+                strides=[ldb64, None],
+                num_warps=num_waves,
+                pad_interval=tile_k,
+                pad_amount=LDS_PAD,
+            )
 
         gSA = gSB = atomSA = atomSB = None
         if const_expr(is_mx):
@@ -358,14 +411,70 @@ def launch_gemm_gfx1250(
                 1,
             )
 
+        def scratchA_of(s):
+            return _view(fx.add_offset(_stage(s), SCRATCH_A_OFF), a_cls, (tile_k, tile_m), (TR_A_ROW, 1))
+
+        def scratchB_of(s):
+            return _view(fx.add_offset(_stage(s), SCRATCH_B_OFF), b_cls, (tile_k, tile_n), (TR_B_ROW, 1))
+
         def issue(s, kt):
             """Start the TDM fetch of K-tile ``kt`` into LDS stage ``s``."""
             kt64 = fx.Int64(kt)
-            fx.copy(atomA, gA, sA_of(s), imm_offset=kt64 * (tile_k * elem_bytes))
-            fx.copy(atomB, gB, sB_of(s), imm_offset=kt64 * (tile_k * elem_bytes))
+            # A K-major tile advances by whole rows, not by K elements.
+            if const_expr(a_tr):
+                fx.copy(atomA, gA, scratchA_of(s), imm_offset=kt64 * tile_k * lda64 * elem_bytes)
+            else:
+                fx.copy(atomA, gA, sA_of(s), imm_offset=kt64 * (tile_k * elem_bytes))
+            if const_expr(b_tr):
+                fx.copy(atomB, gB, scratchB_of(s), imm_offset=kt64 * tile_k * ldb64 * elem_bytes)
+            else:
+                fx.copy(atomB, gB, sB_of(s), imm_offset=kt64 * (tile_k * elem_bytes))
             if const_expr(is_mx):
                 fx.copy(atomSA, gSA, sSA_of(s), imm_offset=kt64 * SC_ROW)
                 fx.copy(atomSB, gSB, sSB_of(s), imm_offset=kt64 * SC_ROW)
+
+        # ---- LDS transpose (NN / TN only) -------------------------------
+        # `ds_load_tr16_b128` transposes an 8x8 block of 16-bit elements across
+        # 8 lanes: lane L of a group supplies an address, and receives, for
+        # j = 0..7, the element at offset (L % 8) from the address supplied by
+        # lane j of that group. So pointing lane L at `&src[k0 + L % 8][x0]`
+        # hands it the eight consecutive K values of column `x0 + L % 8` --
+        # which then store out as one contiguous 16-byte write.
+        def transpose_stage(src_view, src_row, dst_view, dst_row, n_x):
+            grp = tid // 8
+            r = tid % 8
+            n_groups = block // 8
+            blocks_x = n_x // 8
+            n_blocks = (tile_k // 8) * blocks_x
+            assert n_blocks % n_groups == 0, (
+                f"transpose: {n_blocks} 8x8 blocks do not divide over {n_groups} lane groups"
+            )
+            # ds_load_tr16_b128 takes a raw LDS pointer, not an fx one, and
+            # the type has to be built with a live MLIR context (so: in here).
+            lds_ptr_ty = _ir.Type.parse("!llvm.ptr<3>")
+            src_b = fx.Int32(fx.ptrtoint(fx.get_iter(src_view)))
+            dst_i8 = fx.recast_iter(
+                fx.PointerType.get(fx.Int8.ir_type, fx.get_iter(dst_view).address_space, 1),
+                fx.get_iter(dst_view),
+            )
+            for b in range_constexpr(n_blocks // n_groups):
+                idx = grp + b * n_groups
+                k0 = (idx // blocks_x) * 8
+                x0 = (idx % blocks_x) * 8
+                addr = src_b + ((k0 + r) * src_row + x0) * elem_bytes
+                v = rocdl.ds_load_tr16_b128(_T.vec(8, a_cls.ir_type), _llvm.inttoptr(lds_ptr_ty, _raw(addr)))
+                fx.ptr_store(
+                    fx.Vector(v).bitcast(fx.Int8),
+                    dst_i8 + ((x0 + r) * dst_row + k0) * elem_bytes,
+                )
+
+        def transpose_if_needed(s):
+            if const_expr(a_tr):
+                transpose_stage(scratchA_of(s), TR_A_ROW, sA_of(s), A_ROW, tile_m)
+            if const_expr(b_tr):
+                transpose_stage(scratchB_of(s), TR_B_ROW, sB_of(s), B_ROW, tile_n)
+            if const_expr(a_tr or b_tr):
+                fx.barrier()
 
         # ---- MMA -------------------------------------------------------
         # Slot 1 is the N side, slot 2 the M side -- hence `b_cls` first, and
@@ -572,11 +681,13 @@ def launch_gemm_gfx1250(
             fx.barrier()
             nxt = kt + (num_buffers - 1)
             issue(nxt % num_buffers, nxt)
+            transpose_if_needed(kt % num_buffers)
             compute(kt % num_buffers)
 
         for j in range_constexpr(num_buffers - 1):
             tdm_ops.tensor_wait((num_buffers - 2 - j) * n_ops)
             fx.barrier()
+            transpose_if_needed((n_steady + j) % num_buffers)
             compute((n_steady + j) % num_buffers)
 
         # ---- epilogue: registers -> LDS -> global (TDM, OOB-clamped) ----
@@ -657,16 +768,25 @@ def _atom_k(kind: str) -> int:
     return 64 if elem_bytes == 1 else 32
 
 
-def default_config(kind: str, M: int, N: int, K: int | None = None):
+# NN and TN stage the K-major operand twice (natural tile plus its transpose),
+# so they need a smaller tile to stay inside the 160 KiB LDS budget: at
+# 128x128x64 with two buffers, NN takes 106 KiB and TN 140 KiB.
+_TRANSPOSED_CFG = ((128, 128, 64), 2, 2, 2, 8)
+
+
+def default_config(kind: str, M: int, N: int, K: int | None = None, layout: int = LAYOUT_NT):
     """``((tile_m, tile_n, tile_k), m_warp, n_warp, num_buffers, group_m)``.
 
     With ``K`` given the tile is fitted to the problem: ``tile_k`` shrinks until
     it divides ``K`` (a K-tail is not handled, unlike a ragged M or N), and
     ``tile_n`` shrinks so a narrow output does not pay for a wide tile.
     """
-    family = "16bit" if _KINDS[kind][2] == 2 else "8bit"
-    bucket = "small" if M * N < _SMALL_TILES else "large"
-    (tile_m, tile_n, tile_k), m_warp, n_warp, nb, gm = _DEFAULT_CFG[family][bucket]
+    if layout != LAYOUT_NT:
+        (tile_m, tile_n, tile_k), m_warp, n_warp, nb, gm = _TRANSPOSED_CFG
+    else:
+        family = "16bit" if _KINDS[kind][2] == 2 else "8bit"
+        bucket = "small" if M * N < _SMALL_TILES else "large"
+        (tile_m, tile_n, tile_k), m_warp, n_warp, nb, gm = _DEFAULT_CFG[family][bucket]
 
     if K is not None:
         floor_k = _atom_k(kind)
@@ -679,7 +799,10 @@ def default_config(kind: str, M: int, N: int, K: int | None = None):
     return (tile_m, tile_n, tile_k), m_warp, n_warp, nb, gm
 
 
-# tile config -> flyc.CompiledFunction (fast dispatch; see gemm_gfx1250)
+# tile config -> flyc.CompiledFunction (fast dispatch; see gemm_gfx1250).
+# The launch takes 12 runtime arguments (pointers, sizes, strides, stream)
+# before the Constexpr block starts.
+_N_RUNTIME_ARGS = 12
 _COMPILED: dict = {}
 
 
@@ -687,11 +810,15 @@ def _ptr(t: torch.Tensor):
     return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
 
 
+_LAYOUTS = {"nt": LAYOUT_NT, "nn": LAYOUT_NN, "tn": LAYOUT_TN}
+
+
 def gemm_gfx1250(
     a: torch.Tensor,
     b: torch.Tensor,
     out: torch.Tensor | None = None,
     *,
+    layout: str = "nt",
     scale_a: torch.Tensor | None = None,
     scale_b: torch.Tensor | None = None,
     kind: str | None = None,
@@ -713,10 +840,19 @@ def gemm_gfx1250(
     """
     if a.dim() != 2 or b.dim() != 2:
         raise ValueError(f"A and B must be 2-D, got {tuple(a.shape)}, {tuple(b.shape)}")
-    M, K = a.shape
-    N, Kb = b.shape
+    if layout not in _LAYOUTS:
+        raise ValueError(f"layout must be one of {sorted(_LAYOUTS)}, got {layout!r}")
+    layout_id = _LAYOUTS[layout]
+    # out is always [M, N]; the layout says how A and B are stored.
+    if layout_id == LAYOUT_NT:  # A[M,K] @ B[N,K]^T -- a Linear forward
+        (M, K), (N, Kb) = a.shape, b.shape
+    elif layout_id == LAYOUT_NN:  # A[M,K] @ B[K,N] -- dgrad
+        (M, K), (Kb, N) = a.shape, b.shape
+    else:  # LAYOUT_TN: A[K,M]^T @ B[K,N] -- wgrad
+        (Kb, M), (K2, N) = a.shape, b.shape
+        K, Kb = Kb, K2
     if K != Kb:
-        raise ValueError(f"K mismatch: A.K={K} vs B.K={Kb}")
+        raise ValueError(f"K mismatch between A and B: {K} vs {Kb} (layout={layout})")
 
     if kind is None:
         if a.element_size() == 1 and b.element_size() == 1:
@@ -738,7 +874,7 @@ def gemm_gfx1250(
         raise ValueError(f"unknown kind {kind!r}; expected one of {supported_dtypes()}")
     is_mx = _KINDS[kind][4]
 
-    d_tile, d_mw, d_nw, d_nb, d_gm = default_config(kind, M, N, K)
+    d_tile, d_mw, d_nw, d_nb, d_gm = default_config(kind, M, N, K, layout_id)
     tile_m, tile_n, tile_k = tile or d_tile
     m_warp = d_mw if m_warp is None else m_warp
     n_warp = d_nw if n_warp is None else n_warp
@@ -787,13 +923,19 @@ def gemm_gfx1250(
         _KIND_ID[kind],
         out_is_f16,
         group_m,
+        layout_id,
     )
     # Calling the @flyc.jit function directly re-binds the signature and
     # rebuilds the cache key on every launch -- ~69 us of host time, which on
     # this GPU dominates any GEMM below roughly 4096^3. `flyc.compile` hoists
     # all of that to the first call and leaves a ~5 us dispatch. Everything
     # baked in as a constexpr has to be part of the key.
-    key = (kind, tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers, group_m, out_is_f16)
+    # Everything from tile_m on is a Constexpr and is baked into the compiled
+    # kernel, so the key is exactly that slice of the call -- taking it from
+    # `args` rather than restating it means a new Constexpr cannot be left out
+    # of the key (leaving it out once made an "nn" call silently reuse the "nt"
+    # kernel and score -3 dB).
+    key = args[_N_RUNTIME_ARGS:]
     compiled = _COMPILED.get(key)
     if compiled is None:
         # flyc.compile() also runs this first call.
