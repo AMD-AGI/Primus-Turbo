@@ -10,54 +10,41 @@
 # This file is distributed under the Apache License 2.0 (see LICENSE-APACHE),
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
-"""General dense GEMM for gfx1250 (bf16 / fp16 / fp8 / mxfp8).
+"""General dense GEMM for gfx1250 (bf16 / f16 / fp8 / mxfp8, NT / NN / TN).
 
-Attribution
------------
-Beyond the FlyDSL provenance in the header above, the gfx1250 TDM / WMMA
-pipeline idiom used here -- TDM descriptor atoms for the global->LDS stage,
-wave32 WMMA tiling, the multi-buffer K loop, and the packed-i32 register
-fragments the 8-bit paths need -- follows the Apache-2.0 gfx1250 GEMM kernels
-contributed to ROCm/aiter, in particular
-``aiter/ops/flydsl/kernels/gemm_a8w8_gfx1250.py``,
-``mxfp4_preshuffle_gfx1250_tdm.py`` and ``tdm_ops_gfx1250.py``, each carrying
+``gemm_bf16_kernel.py`` next to this file cannot run here: it emits
+``BufferCopyLDS128b``, its MMA atom is ``Mfma32x32x16`` (gfx1250 has no MFMA),
+and it assumes wave64. This is the gfx1250 counterpart -- TDM descriptor atoms
+for global->LDS, wave32 WMMA, a multi-buffer K loop.
+
+Atom shapes are narrow, and were probed against the backend rather than
+assumed. Only K is restricted; the operand types are not (see ``_KINDS``):
+
+    bf16 / f16   WMMA        16x16x32 only, and A and B must share a dtype
+    fp8          WMMA        16x16x64 or 16x16x128
+    mxfp8        WMMAScale   16x16x128, block 32
+
+The atom wants both operands as ``[row, K]`` with K contiguous. NT has that;
+NN and TN do not, so their K-major operand is staged in its natural layout and
+transposed in LDS (see ``transpose_stage``).
+
+16-bit operands ride FlyDSL's tiled-MMA, which derives the per-lane register
+mapping from the atom. 8-bit operands cannot -- allocating an 8-bit register
+fragment leaves an ``ub.poison !fly.ptr<f8E4M3FN, register>`` after rmem SSA
+promotion -- so those carry packed ``i32`` with an explicit lane mapping, as
+the gfx1250 fp8/fp4 kernels in ROCm/aiter do.
+
+Attribution: the gfx1250 TDM/WMMA pipeline idiom here follows the Apache-2.0
+gfx1250 GEMM kernels contributed to ROCm/aiter (``gemm_a8w8_gfx1250.py``,
+``mxfp4_preshuffle_gfx1250_tdm.py``, ``tdm_ops_gfx1250.py``, each
 "SPDX-License-Identifier: Apache-2.0 / Copyright (c) 2026 FlyDSL Project
-Contributors". No code is copied verbatim, from those files or from the
+Contributors"). No code is copied verbatim from those or from the
 MIT-licensed remainder of that repository.
-
-``gemm_bf16_kernel.py`` next to this file does not run on gfx1250: its
-``G2SLoader`` emits ``BufferCopyLDS128b`` (``buffer_load ... lds``), which this
-target does not have, its MMA atom is ``Mfma32x32x16`` (gfx1250 has no MFMA at
-all), and it assumes wave64. This kernel is the gfx1250 counterpart:
-
-* **TDM** (Tensor Data Mover) descriptor atoms for global->LDS, replacing the
-  old async-copy intrinsic.
-* **WMMA** instead of MFMA. The legal atom shapes on this target are narrow --
-  probed against the backend rather than assumed:
-
-  =========  ==============================  =====================
-  operand    atom                            shapes
-  =========  ==============================  =====================
-  bf16/f16   ``WMMA``                        16x16x32 *only*
-  fp8        ``WMMA``                        16x16x64 or 16x16x128
-  mxfp8      ``WMMAScale`` (block_size=32)   16x16x128
-  =========  ==============================  =====================
-
-* **wave32**: 32 lanes per wave, not 64.
-
-Layout is NT (``A[M, K] @ B[N, K]^T -> C[M, N]``, all row-major), so both
-operands are K-contiguous -- what the WMMA atoms and the TDM 2-D descriptors
-both want.
-
-16-bit operands ride FlyDSL's tiled-MMA machinery (``make_tiled_mma`` /
-``partition_*`` / ``make_fragment_*``), which derives the per-lane register
-mapping from the atom. 8-bit operands cannot: allocating a register fragment of
-an 8-bit type leaves an ``ub.poison`` ``!fly.ptr<f8E4M3FN, register>`` behind
-after rmem SSA promotion, so those paths carry the operands as packed ``i32``
-with an explicit lane mapping, as the gfx1250 fp8/fp4 kernels in ROCm/aiter do.
 """
 
 from __future__ import annotations
+
+from typing import NamedTuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -100,18 +87,17 @@ _KINDS = {
 # Hardware forms not wired up here: fp6/fp4 (sub-byte packing), i8/i4 (i32
 # accumulator), and the bf16/f16-accumulator and 32x16x128 fp4 shapes.
 
-_TORCH_IN = {
-    torch.bfloat16: "bf16",
-    torch.float16: "f16",
-    torch.float8_e4m3fn: "fp8",
-    torch.float8_e5m2: "fp8_e5m2",
-}
-
-# torch dtype pair -> kind, for the mixed fp8 pairings
-_TORCH_PAIR = {
-    (torch.float8_e4m3fn, torch.float8_e5m2): "e4m3_e5m2",
-    (torch.float8_e5m2, torch.float8_e4m3fn): "e5m2_e4m3",
-    (torch.float8_e5m2, torch.float8_e5m2): "e5m2",
+# (A dtype, B dtype) -> (unscaled kind, MX-scaled kind). Pairs absent here are
+# rejected, which is how the 16-bit operands get their "must match" rule: the
+# hardware has no bf16 x f16 WMMA, so there is no row for it.
+_E4M3, _E5M2 = torch.float8_e4m3fn, torch.float8_e5m2
+_FROM_TORCH = {
+    (torch.bfloat16, torch.bfloat16): ("bf16", None),
+    (torch.float16, torch.float16): ("f16", None),
+    (_E4M3, _E4M3): ("fp8", "mxfp8"),
+    (_E5M2, _E5M2): ("fp8_e5m2", "mxfp8_e5m2"),
+    (_E4M3, _E5M2): ("fp8_e4m3_e5m2", "mxfp8_e4m3_e5m2"),
+    (_E5M2, _E4M3): ("fp8_e5m2_e4m3", "mxfp8_e5m2_e4m3"),
 }
 
 
@@ -139,14 +125,9 @@ def _make_lds_load(bits):
     return load
 
 
-# Constexpr kind codes -- ``@flyc.jit`` specialises on ints, not strings.
-# Derived from _KINDS so the two cannot drift apart -- listing the ids by hand
-# is how the six added operand pairings first shipped unreachable.
+# @flyc.jit specialises on ints, not strings. Derived from _KINDS rather than
+# listed by hand, which is how six kinds once shipped unreachable.
 _KIND_ID = {name: i for i, name in enumerate(_KINDS)}
-KIND_BF16 = _KIND_ID["bf16"]
-KIND_F16 = _KIND_ID["f16"]
-KIND_FP8 = _KIND_ID["fp8"]
-KIND_MXFP8 = _KIND_ID["mxfp8"]
 _KIND_BY_ID = {v: (k, *_KINDS[k]) for k, v in _KIND_ID.items()}
 
 # MX block size: one E8M0 scale per 32 contiguous K elements. The gfx1250
@@ -436,11 +417,10 @@ def launch_gemm_gfx1250(
 
         # ---- LDS transpose (NN / TN only) -------------------------------
         # `ds_load_tr16_b128` transposes an 8x8 block of 16-bit elements across
-        # 8 lanes: lane L of a group supplies an address, and receives, for
-        # j = 0..7, the element at offset (L % 8) from the address supplied by
-        # lane j of that group. So pointing lane L at `&src[k0 + L % 8][x0]`
-        # hands it the eight consecutive K values of column `x0 + L % 8` --
-        # which then store out as one contiguous 16-byte write.
+        # 8 lanes (mapping measured, not documented): lane L receives, for
+        # j = 0..7, the element at offset L%8 from the address lane j supplied.
+        # So pointing lane L at `&src[k0 + L%8][x0]` hands it the eight
+        # consecutive K values of column `x0 + L%8`, one contiguous store.
         def transpose_stage(src_view, src_row, dst_view, dst_row, n_x):
             grp = tid // 8
             r = tid % 8
@@ -740,11 +720,9 @@ launch_gemm_gfx1250.compile_hints["llvm_options"] = {
 }
 
 
-# Default configs, chosen by sweeping the tile space on gfx1250. Small problems
-# want small tiles (a 256x256 tile leaves most of the GPU idle at 1024^3); large
-# ones want the biggest tile that still fits two LDS buffers. bf16 moves 2 bytes
-# per element, so its K tile is half the fp8 one at equal LDS cost.
-#   kind -> ((tile_m, tile_n, tile_k), m_warp, n_warp, num_buffers, group_m)
+# Swept on gfx1250. A 256x256 tile leaves most of the GPU idle at 1024^3, so
+# small problems take a smaller one.
+#   -> ((tile_m, tile_n, tile_k), m_warp, n_warp, num_buffers, group_m)
 _SMALL_TILES = 4096 * 4096  # M*N below this counts as "not enough tiles"
 
 _DEFAULT_CFG = {
@@ -814,6 +792,22 @@ def _ptr(t: torch.Tensor):
 _LAYOUTS = {"nt": LAYOUT_NT, "nn": LAYOUT_NN, "tn": LAYOUT_TN}
 
 
+class _Config(NamedTuple):
+    M: int
+    N: int
+    K: int
+    kind: str
+    is_mx: bool
+    layout_id: int
+    tile_m: int
+    tile_n: int
+    tile_k: int
+    m_warp: int
+    n_warp: int
+    num_buffers: int
+    group_m: int
+
+
 def _resolve(a, b, layout, scale_a, scale_b, kind, tile, m_warp, n_warp, num_buffers, group_m, out_dtype):
     """Work out the launch configuration, or say why this call cannot run.
 
@@ -840,21 +834,12 @@ def _resolve(a, b, layout, scale_a, scale_b, kind, tile, m_warp, n_warp, num_buf
         return None, f"K mismatch between A and B: {K} vs {Kb} (layout={layout})"
 
     if kind is None:
-        if a.element_size() == 1 and b.element_size() == 1:
-            suffix = _TORCH_PAIR.get((a.dtype, b.dtype))
-            base = "mxfp8" if scale_a is not None else "fp8"
-            kind = base if suffix is None else f"{base}_{suffix}"
-            if kind not in _KINDS:
-                return None, f"unsupported fp8 operand pair {a.dtype} x {b.dtype}"
-        else:
-            if a.dtype != b.dtype:
-                return None, (
-                    f"16-bit operands must share a dtype (gfx1250 has no mixed "
-                    f"16-bit WMMA), got {a.dtype} x {b.dtype}"
-                )
-            kind = _TORCH_IN.get(a.dtype)
-            if kind is None:
-                return None, f"unsupported input dtype {a.dtype}"
+        pair = _FROM_TORCH.get((a.dtype, b.dtype))
+        if pair is None:
+            return None, f"unsupported operand dtypes {a.dtype} x {b.dtype}"
+        kind = pair[scale_a is not None]
+        if kind is None:
+            return None, f"{a.dtype} has no MX-scaled form"
     if kind not in _KINDS:
         return None, f"unknown kind {kind!r}; expected one of {supported_dtypes()}"
     is_mx = _KINDS[kind][4]
@@ -954,51 +939,43 @@ def gemm_gfx1250(
     )
     if reason is not None:
         raise ValueError(reason)
-    M, N, K = cfg["M"], cfg["N"], cfg["K"]
-    kind, is_mx, layout_id = cfg["kind"], cfg["is_mx"], cfg["layout_id"]
-    tile_m, tile_n, tile_k = cfg["tile_m"], cfg["tile_n"], cfg["tile_k"]
-    m_warp, n_warp = cfg["m_warp"], cfg["n_warp"]
-    num_buffers, group_m = cfg["num_buffers"], cfg["group_m"]
-
     if out is None:
-        out = torch.empty((M, N), dtype=out_dtype, device=a.device)
-    dummy = a if not is_mx else scale_a
-
-    out_is_f16 = 1 if out.dtype == torch.float16 else 0
+        out = torch.empty((cfg.M, cfg.N), dtype=out_dtype, device=a.device)
+    # The scale pointers are unread unless the kind is MX-scaled; the kernel
+    # still needs something valid there.
+    sa = scale_a if cfg.is_mx else a
+    sb = scale_b if cfg.is_mx else a
     args = (
         _ptr(out),
         _ptr(a),
         _ptr(b),
-        _ptr(scale_a if is_mx else dummy),
-        _ptr(scale_b if is_mx else dummy),
-        M,
+        _ptr(sa),
+        _ptr(sb),
+        cfg.M,
         fx.Stream(torch.cuda.current_stream(device=a.device)),
-        N,
-        K,
+        cfg.N,
+        cfg.K,
         a.stride(0),
         b.stride(0),
         out.stride(0),
-        tile_m,
-        tile_n,
-        tile_k,
-        m_warp,
-        n_warp,
-        num_buffers,
-        _KIND_ID[kind],
-        out_is_f16,
-        group_m,
-        layout_id,
+        cfg.tile_m,
+        cfg.tile_n,
+        cfg.tile_k,
+        cfg.m_warp,
+        cfg.n_warp,
+        cfg.num_buffers,
+        _KIND_ID[cfg.kind],
+        1 if out.dtype == torch.float16 else 0,
+        cfg.group_m,
+        cfg.layout_id,
     )
-    # Calling the @flyc.jit function directly re-binds the signature and
-    # rebuilds the cache key on every launch -- ~69 us of host time, which on
-    # this GPU dominates any GEMM below roughly 4096^3. `flyc.compile` hoists
-    # all of that to the first call and leaves a ~5 us dispatch. Everything
-    # baked in as a constexpr has to be part of the key.
-    # Everything from tile_m on is a Constexpr and is baked into the compiled
-    # kernel, so the key is exactly that slice of the call -- taking it from
-    # `args` rather than restating it means a new Constexpr cannot be left out
-    # of the key (leaving it out once made an "nn" call silently reuse the "nt"
-    # kernel and score -3 dB).
+    # Calling @flyc.jit directly re-binds the signature and rebuilds its cache
+    # key on every launch: ~69 us of host time, which dominates any GEMM below
+    # roughly 4096^3. flyc.compile hoists that to the first call (~5 us
+    # dispatch). Everything from tile_m on is a Constexpr baked into the
+    # compiled kernel, so the key is that slice of the call -- taken from args
+    # rather than restated, since omitting one silently reused another
+    # layout's kernel.
     key = args[_N_RUNTIME_ARGS:]
     compiled = _COMPILED.get(key)
     if compiled is None:
