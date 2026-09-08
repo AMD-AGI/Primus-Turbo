@@ -39,7 +39,7 @@ all), and it assumes wave64. This kernel is the gfx1250 counterpart:
   operand    atom                            shapes
   =========  ==============================  =====================
   bf16/f16   ``WMMA``                        16x16x32 *only*
-  fp8        ``WMMA``                        16x16x64, 16x16x128
+  fp8        ``WMMA``                        16x16x64 or 16x16x128
   mxfp8      ``WMMAScale`` (block_size=32)   16x16x128
   =========  ==============================  =====================
 
@@ -93,9 +93,8 @@ _KINDS = {
     "mxfp8_e5m2_e4m3": (fx.Float8E5M2, fx.Float8E4M3FN, 1, 128, True),
 }
 
-# Hardware forms not wired up here: K=64 fp8 (the lane mapping below assumes
-# K=128), fp6/fp4 (sub-byte packing), i8/i4 (i32 accumulator), and the
-# bf16/f16-accumulator and 32x16x128 fp4 shapes.
+# Hardware forms not wired up here: fp6/fp4 (sub-byte packing), i8/i4 (i32
+# accumulator), and the bf16/f16-accumulator and 32x16x128 fp4 shapes.
 
 _TORCH_IN = {
     torch.bfloat16: "bf16",
@@ -150,6 +149,9 @@ _KIND_BY_ID = {v: (k, *_KINDS[k]) for k, v in _KIND_ID.items()}
 # V_WMMA_SCALE atom only accepts 32 (or 16); 128 is not a legal atom block size.
 MX_BLOCK = 32
 
+# The WMMA atom is 16x16 in M/N for every operand type on this target.
+WMMA_N_ATOM = 16
+
 
 @flyc.jit
 def launch_gemm_gfx1250(
@@ -183,6 +185,11 @@ def launch_gemm_gfx1250(
     """
     kind, a_cls, b_cls, elem_bytes, WMMA_K, is_mx = _KIND_BY_ID[kind_id]
     WMMA_M = WMMA_N = 16
+    # fp8 has both a 16x16x64 and a 16x16x128 atom; take the wider one when
+    # tile_k allows, and fall back to 64 for a K that is not a multiple of 128
+    # (DSV4 Flash's dense_down K=10944 is one). WMMAScale has only the 128 form.
+    if not is_mx and elem_bytes == 1 and tile_k % 128:
+        WMMA_K = 64
     is_16bit = elem_bytes == 2
 
     num_waves = m_warp * n_warp
@@ -466,13 +473,23 @@ def launch_gemm_gfx1250(
             for cf in c_frags:
                 cf.fill(0.0)
 
+            # A lane covers WMMA_K bytes of its row as 16-byte chunks strided
+            # by 32, the two half-waves interleaving; that is WMMA_K//32 chunks
+            # and WMMA_K//8 dwords per lane.
+            n_chunks = WMMA_K // 32
+            frag_dwords = WMMA_K // 8
+
             def _operand(base, plane_off, row, row_bytes, ks):
                 b0 = plane_off + row * row_bytes + ks * WMMA_K + kgrp * 16
-                v = [fx.Vector(lds_b128(base, b0 + 32 * j)) for j in range_constexpr(4)]
-                v01 = v[0].shuffle(v[1], list(range(8)))
-                v23 = v[2].shuffle(v[3], list(range(8)))
-                reg = fx.make_rmem_tensor(16, fx.Int32)
-                reg.store(v01.shuffle(v23, list(range(16))))
+                v = [fx.Vector(lds_b128(base, b0 + 32 * j)) for j in range_constexpr(n_chunks)]
+                if const_expr(n_chunks == 4):
+                    lo = v[0].shuffle(v[1], list(range(8)))
+                    hi = v[2].shuffle(v[3], list(range(8)))
+                    packed = lo.shuffle(hi, list(range(16)))
+                else:
+                    packed = v[0].shuffle(v[1], list(range(8)))
+                reg = fx.make_rmem_tensor(frag_dwords, fx.Int32)
+                reg.store(packed)
                 return reg
 
             def compute(s):
@@ -574,7 +591,12 @@ def launch_gemm_gfx1250(
             (tile_m, C_ROW),
             (C_ROW, 1),
         )
-        atomC = fx.rocdl.make_tdm_atom(gtC, [m_oob, tile_n], strides=[ldc64, None], num_warps=num_waves)
+        # Clamp to whichever is smaller: the columns this tile still has left
+        # in C, or the tile width (which also drops the C_ROW padding). The B
+        # load already zero-fills its out-of-range rows, so a ragged N tile
+        # accumulates zeros there and the store just drops them.
+        n_store = (n_oob < tile_n).select(n_oob, fx.Int32(tile_n))
+        atomC = fx.rocdl.make_tdm_atom(gtC, [m_oob, n_store], strides=[ldc64, None], num_warps=num_waves)
         fx.copy(atomC, sC, gtC)
         tdm_ops.tensor_wait(0)
 
@@ -627,11 +649,34 @@ _DEFAULT_CFG = {
 }
 
 
-def default_config(kind: str, M: int, N: int):
-    """``((tile_m, tile_n, tile_k), m_warp, n_warp, num_buffers, group_m)``."""
+def _atom_k(kind: str) -> int:
+    """Smallest K a single MMA atom covers, i.e. the floor for tile_k."""
+    elem_bytes, is_mx = _KINDS[kind][2], _KINDS[kind][4]
+    if is_mx:
+        return 128  # WMMAScale has no narrower form
+    return 64 if elem_bytes == 1 else 32
+
+
+def default_config(kind: str, M: int, N: int, K: int | None = None):
+    """``((tile_m, tile_n, tile_k), m_warp, n_warp, num_buffers, group_m)``.
+
+    With ``K`` given the tile is fitted to the problem: ``tile_k`` shrinks until
+    it divides ``K`` (a K-tail is not handled, unlike a ragged M or N), and
+    ``tile_n`` shrinks so a narrow output does not pay for a wide tile.
+    """
     family = "16bit" if _KINDS[kind][2] == 2 else "8bit"
     bucket = "small" if M * N < _SMALL_TILES else "large"
-    return _DEFAULT_CFG[family][bucket]
+    (tile_m, tile_n, tile_k), m_warp, n_warp, nb, gm = _DEFAULT_CFG[family][bucket]
+
+    if K is not None:
+        floor_k = _atom_k(kind)
+        while tile_k > floor_k and (K % tile_k or K // tile_k < nb):
+            tile_k //= 2
+        # A tile narrower than one WMMA per wave is pointless.
+        floor_n = n_warp * WMMA_N_ATOM
+        while tile_n > floor_n and N <= tile_n // 2:
+            tile_n //= 2
+    return (tile_m, tile_n, tile_k), m_warp, n_warp, nb, gm
 
 
 # tile config -> flyc.CompiledFunction (fast dispatch; see gemm_gfx1250)
@@ -693,14 +738,12 @@ def gemm_gfx1250(
         raise ValueError(f"unknown kind {kind!r}; expected one of {supported_dtypes()}")
     is_mx = _KINDS[kind][4]
 
-    d_tile, d_mw, d_nw, d_nb, d_gm = default_config(kind, M, N)
+    d_tile, d_mw, d_nw, d_nb, d_gm = default_config(kind, M, N, K)
     tile_m, tile_n, tile_k = tile or d_tile
     m_warp = d_mw if m_warp is None else m_warp
     n_warp = d_nw if n_warp is None else n_warp
     num_buffers = d_nb if num_buffers is None else num_buffers
     group_m = d_gm if group_m is None else group_m
-    if N % tile_n:
-        raise ValueError(f"N={N} must be a multiple of tile_n={tile_n}")
     if K % tile_k:
         raise ValueError(f"K={K} must be a multiple of tile_k={tile_k}")
     if K // tile_k < num_buffers:

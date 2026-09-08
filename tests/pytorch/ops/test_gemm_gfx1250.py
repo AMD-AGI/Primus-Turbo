@@ -171,3 +171,66 @@ def test_k_reduction_is_complete():
         assert torch.equal(out.float(), torch.full((m, n), float(k), device="cuda")), (
             f"num_buffers={nb} reduced {out[0, 0].item()} of {k}"
         )
+
+
+# Real projection shapes (K, N) from the two models this kernel targets. M is
+# the token count and is ragged by nature, so it is varied separately.
+DSV3_SHAPES = [
+    ("q_a_proj", 7168, 1536),
+    ("q_b_proj", 1536, 24576),
+    ("kv_a_proj", 7168, 576),  # N is not a multiple of any useful tile_n
+    ("kv_b_proj", 512, 32768),
+    ("o_proj", 16384, 7168),
+    ("router", 7168, 48),  # N far narrower than a tile
+    ("moe_gate_up", 7168, 2048),
+    ("moe_down", 2048, 7168),
+]
+DSV4_FLASH_SHAPES = [
+    ("kv_a_proj", 4096, 576),
+    ("router", 4096, 48),
+    ("dense_gate_up", 4096, 10944),
+    ("dense_down", 10944, 4096),  # K is a multiple of 64 but not of 128
+]
+
+
+@pytest.mark.parametrize("proj,k,n", DSV3_SHAPES + DSV4_FLASH_SHAPES)
+@pytest.mark.parametrize("dtype", ["bf16", "fp8"])
+def test_model_projection_shapes(proj, k, n, dtype):
+    """The kernel has to cover the shapes the target models actually issue.
+
+    Several of these are the reason ragged N and the 16x16x64 fp8 atom exist:
+    kv_a_proj's N=576 divides no useful tile, router's N=48 is narrower than
+    one, and DSV4 Flash's dense_down has K=10944, a multiple of 64 but not 128.
+    """
+    m = 512
+    if dtype == "bf16":
+        a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    else:
+        a = (torch.randn(m, k, device="cuda") / 3).to(E4M3)
+        b = (torch.randn(n, k, device="cuda") / 3).to(E4M3)
+    out = gemm_gfx1250(a, b)
+    assert out.shape == (m, n)
+    assert snr_db(a.float() @ b.float().T, out) > MIN_SNR_DB
+
+
+@pytest.mark.parametrize("n", [48, 129, 255, 576, 1000])
+def test_ragged_n(n):
+    """N need not divide the tile: the B load zero-fills and the C store drops."""
+    m, k = 256, 1024
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    out = gemm_gfx1250(a, b, tile=(128, 128, 64), num_buffers=2)
+    assert out.shape == (m, n)
+    assert snr_db(a.float() @ b.float().T, out) > MIN_SNR_DB
+
+
+@pytest.mark.parametrize("k", [576, 1216, 10944])
+def test_fp8_k64_atom(k):
+    """K a multiple of 64 but not 128 has to route to the 16x16x64 fp8 atom."""
+    assert k % 64 == 0 and k % 128 != 0, "test shape must force the narrow atom"
+    m, n = 256, 256
+    a = (torch.randn(m, k, device="cuda") / 3).to(E4M3)
+    b = (torch.randn(n, k, device="cuda") / 3).to(E4M3)
+    out = gemm_gfx1250(a, b)
+    assert snr_db(a.float() @ b.float().T, out) > MIN_SNR_DB
