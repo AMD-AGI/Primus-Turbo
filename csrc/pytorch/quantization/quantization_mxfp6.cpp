@@ -202,6 +202,121 @@ std::vector<at::Tensor> run_fused(const at::Tensor &input, const c10::optional<a
     return {row_p, row_s, col_p, col_s, col_sum};
 }
 
+// Shared shape/dtype/device checks for the QK-norm+RoPE operands. Every one of them is a
+// plain tensor with a shape the caller could plausibly get wrong, and a wrong shape here does
+// not fault -- it reads the wrong element and produces a gradient that looks reasonable.
+// PRIMUS_TURBO_CHECK's stringifier takes numbers and strings, not IntArrayRef, and a shape
+// mismatch is exactly the error whose message needs to carry both shapes.
+std::string shape_str(const at::IntArrayRef s) {
+    std::string out = "[";
+    for (size_t i = 0; i < s.size(); ++i)
+        out += (i ? ", " : "") + std::to_string(s[i]);
+    return out + "]";
+}
+
+void check_operand(const at::Tensor &t, const at::Tensor &input, const char *name,
+                   const at::IntArrayRef want, const at::ScalarType dtype) {
+    PRIMUS_TURBO_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
+    PRIMUS_TURBO_CHECK(t.device() == input.device(), name, " must be on the input's device: ",
+                       "input is on ", input.device().str(), " and ", name, " on ",
+                       t.device().str());
+    PRIMUS_TURBO_CHECK(t.is_contiguous(), name, " must be contiguous");
+    PRIMUS_TURBO_CHECK(t.scalar_type() == dtype, name, " has the wrong dtype");
+    PRIMUS_TURBO_CHECK(t.sizes() == want, name, " has the wrong shape: expected ",
+                       shape_str(want), ", got ", shape_str(t.sizes()));
+}
+
+std::vector<at::Tensor>
+run_qk_norm_rope_bwd(const at::Tensor &input, const at::Tensor &dq, const at::Tensor &dk,
+                     const at::Tensor &dv, const at::Tensor &cos, const at::Tensor &sin,
+                     const at::Tensor &wq, const at::Tensor &wk, const at::Tensor &rstd_q,
+                     const at::Tensor &rstd_k, const bool want_col_sum) {
+    check_input(input);
+    const c10::DeviceGuard device_guard(input.device());
+    const int64_t          M = input.size(0);
+    const int64_t          N = input.size(1);
+
+    // head_dim comes from the norm weight rather than an argument: it is the one operand whose
+    // length *is* head_dim by definition, so deriving it here means a caller cannot pass a
+    // head_dim that disagrees with the weight it also passed.
+    const int64_t head_dim = wq.size(0);
+    PRIMUS_TURBO_CHECK(head_dim > 0 && N % (3 * head_dim) == 0,
+                       "input's N must be num_heads * 3 * head_dim: N is ", N,
+                       " and head_dim (from wq) is ", head_dim);
+    const int64_t num_heads = N / (3 * head_dim);
+
+    const at::ScalarType dt = input.scalar_type();
+    // The per-slice gradients, at [M, num_heads * head_dim]. These are exactly the grad_outputs
+    // an autograd Function spanning linear_qkv -> norm -> rope receives.
+    for (const auto &[t, name] : {std::pair{std::cref(dq), "dq"}, {std::cref(dk), "dk"},
+                                  {std::cref(dv), "dv"}})
+        check_operand(t.get(), input, name, {M, num_heads * head_dim}, dt);
+    // cos/sin at [M, head_dim] is not a formality -- it is the check that the tables map 1:1
+    // onto packer rows. Flux builds them per (position, batch), which is that shape; a
+    // batch-shared [S, head_dim] table is also legal upstream and the Triton kernel handles it
+    // by dividing the row index. This kernel does not divide, so a shared table has to be
+    // rejected here rather than silently read at the wrong row.
+    check_operand(cos, input, "cos", {M, head_dim}, dt);
+    check_operand(sin, input, "sin", {M, head_dim}, dt);
+    check_operand(wq, input, "wq", {head_dim}, dt);
+    check_operand(wk, input, "wk", {head_dim}, dt);
+    // fp32 and flattened [M * num_heads]: one reciprocal RMS per normed vector, in the
+    // (position, batch, head) order the Triton forward writes it.
+    check_operand(rstd_q, input, "rstd_q", {M * num_heads}, at::kFloat);
+    check_operand(rstd_k, input, "rstd_k", {M * num_heads}, at::kFloat);
+
+    const auto [row_p_bytes, row_s_bytes] = pack_sizes(M, N); // contract N
+    const auto [col_p_bytes, col_s_bytes] = pack_sizes(N, M); // contract M
+
+    at::Tensor row_p = empty_blob(row_p_bytes, input);
+    at::Tensor row_s = empty_blob(row_s_bytes, input);
+    at::Tensor col_p = empty_blob(col_p_bytes, input);
+    at::Tensor col_s = empty_blob(col_s_bytes, input);
+
+    const int  rows      = mxfp6_col_sum_rows(static_cast<int>(M));
+    const auto fp32_opts = input.options().dtype(at::kFloat);
+    at::Tensor col_sum =
+        at::empty({want_col_sum ? rows : 0, want_col_sum ? N : 0}, fp32_opts);
+    // dw partials are not optional the way col_sum is: the norm weight always has a gradient
+    // if it requires one, and unlike the bias there is no path that produces it otherwise --
+    // the tensor it would be reduced from never reaches HBM. Summed over both leading axes by
+    // the caller, which is also where the dtype cast back to the weight's belongs.
+    at::Tensor dw_q = at::empty({rows, num_heads, head_dim}, fp32_opts);
+    at::Tensor dw_k = at::empty({rows, num_heads, head_dim}, fp32_opts);
+
+    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+
+    // One body for both dtypes. The operand struct is templated on the element type, so the
+    // alternative is either this or the whole nine-assignment block written twice.
+    auto launch = [&]<typename T>() {
+        MXFP6QkNormRopeArgs<T> args{};
+        args.dq        = reinterpret_cast<const T *>(dq.data_ptr());
+        args.dk        = reinterpret_cast<const T *>(dk.data_ptr());
+        args.dv        = reinterpret_cast<const T *>(dv.data_ptr());
+        args.cos       = reinterpret_cast<const T *>(cos.data_ptr());
+        args.sin       = reinterpret_cast<const T *>(sin.data_ptr());
+        args.wq        = reinterpret_cast<const T *>(wq.data_ptr());
+        args.wk        = reinterpret_cast<const T *>(wk.data_ptr());
+        args.rstd_q    = rstd_q.data_ptr<float>();
+        args.rstd_k    = rstd_k.data_ptr<float>();
+        args.dw_q      = dw_q.data_ptr<float>();
+        args.dw_k      = dw_k.data_ptr<float>();
+        args.num_heads = static_cast<int32_t>(num_heads);
+        args.head_dim  = static_cast<int32_t>(head_dim);
+        quantize_mxfp6_qk_norm_rope_bwd_impl<T>(
+            reinterpret_cast<const T *>(input.data_ptr()), args, row_p.data_ptr<uint8_t>(),
+            row_s.data_ptr<uint8_t>(), col_p.data_ptr<uint8_t>(), col_s.data_ptr<uint8_t>(),
+            want_col_sum ? col_sum.data_ptr<float>() : nullptr, static_cast<int>(M),
+            static_cast<int>(N), stream);
+    };
+    if (dt == at::kBFloat16)
+        launch.template operator()<dtype::bfloat16>();
+    else
+        launch.template operator()<dtype::float16>();
+
+    return {row_p, row_s, col_p, col_s, col_sum, dw_q, dw_k};
+}
+
 } // namespace
 
 std::vector<at::Tensor> quantize_mxfp6(const at::Tensor input, const int64_t axis) {
@@ -217,6 +332,20 @@ std::vector<at::Tensor> quantize_mxfp6_fused_dual(const at::Tensor              
                                                   const c10::optional<at::Tensor> bias,
                                                   const int64_t mode, const bool want_col_sum) {
     return run_fused(input, aux, bias, prologue_from_mode(mode), want_col_sum);
+}
+
+// Kept off quantize_mxfp6_fused_dual's `mode` argument on purpose. This prologue's operands do
+// not fit the (aux, bias) shape, and it runs at a different tile width, so routing it through
+// the same entry point would mean nine mostly-null optional tensors on every existing call and
+// a second tile instantiation behind a runtime branch. `prologue_from_mode` rejects mode 3 for
+// the same reason.
+std::vector<at::Tensor>
+quantize_mxfp6_qk_norm_rope_bwd(const at::Tensor input, const at::Tensor dq, const at::Tensor dk,
+                                const at::Tensor dv, const at::Tensor cos, const at::Tensor sin,
+                                const at::Tensor wq, const at::Tensor wk, const at::Tensor rstd_q,
+                                const at::Tensor rstd_k, const bool want_col_sum) {
+    return run_qk_norm_rope_bwd(input, dq, dk, dv, cos, sin, wq, wk, rstd_q, rstd_k,
+                                want_col_sum);
 }
 
 // Meta implementations. Shapes are pure arithmetic on M and N, so torch.compile can trace
@@ -252,6 +381,27 @@ std::vector<at::Tensor> quantize_mxfp6_fused_dual_meta(const at::Tensor         
     auto          out  = quantize_mxfp6_dual_meta(input);
     const int64_t rows = want_col_sum ? mxfp6_col_sum_rows(static_cast<int>(M)) : 0;
     out.push_back(at::empty({rows, want_col_sum ? N : 0}, input.options().dtype(at::kFloat)));
+    return out;
+}
+
+std::vector<at::Tensor>
+quantize_mxfp6_qk_norm_rope_bwd_meta(const at::Tensor input, const at::Tensor dq,
+                                     const at::Tensor dk, const at::Tensor dv,
+                                     const at::Tensor cos, const at::Tensor sin,
+                                     const at::Tensor wq, const at::Tensor wk,
+                                     const at::Tensor rstd_q, const at::Tensor rstd_k,
+                                     const bool want_col_sum) {
+    const int64_t M         = input.size(0);
+    const int64_t N         = input.size(1);
+    const int64_t head_dim  = wq.size(0);
+    const int64_t num_heads = head_dim > 0 ? N / (3 * head_dim) : 0;
+    const int64_t rows      = mxfp6_col_sum_rows(static_cast<int>(M));
+    const auto    fp32_opts = input.options().dtype(at::kFloat);
+
+    auto out = quantize_mxfp6_dual_meta(input);
+    out.push_back(at::empty({want_col_sum ? rows : 0, want_col_sum ? N : 0}, fp32_opts));
+    out.push_back(at::empty({rows, num_heads, head_dim}, fp32_opts));
+    out.push_back(at::empty({rows, num_heads, head_dim}, fp32_opts));
     return out;
 }
 
