@@ -494,6 +494,7 @@ def grouped_quant_mxfp4_raw(
     bk=128,
     row_sr=False,
     col_sr=False,
+    scale_rounding_mode=0,
 ):
     """FlyDSL grouped mxfp4 dual quant, drop-in for the HIP grouped_quantize_mxfp4_dual
     (non-shuffle, non-2d recipes; SR supported = unbiased, not bit-exact). Returns the 6-tuple:
@@ -598,7 +599,7 @@ def grouped_quant_mxfp4_raw(
         oc,
         meta,
         sr_seed,
-        _mxfp4_scale_rounding_bias(),
+        _mxfp4_scale_rounding_bias(scale_rounding_mode),
         stream,
     )
 

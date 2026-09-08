@@ -667,6 +667,7 @@ def grouped_quantize_mxfp4_impl(
     with_trans: bool = False,
     scaling_recipe: Optional[ScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
+    scale_rounding_mode: int = 0,
 ) -> Union[
     Tuple[
         torch.Tensor,
@@ -728,6 +729,7 @@ def grouped_quantize_mxfp4_impl(
                 scaling_recipe_for_trans.use_2d_block,
                 scaling_recipe_for_trans.use_sr,
                 scaling_recipe_for_trans.use_rht,
+                scale_rounding_mode,
             )
 
         # FlyDSL grouped dual quant (bit-exact for bf16, faster than the HIP dual) for
@@ -758,6 +760,7 @@ def grouped_quantize_mxfp4_impl(
                 scaling_recipe_for_trans.use_rht,
                 row_sr=scaling_recipe.use_sr,
                 col_sr=scaling_recipe_for_trans.use_sr,
+                scale_rounding_mode=scale_rounding_mode,
             )
             # Adapt the FlyDSL raw 6-tuple to main's 8-tuple dual contract: rowwise is
             # tight-M, so its padded layout equals the original group_lens / group_offs.
@@ -799,6 +802,7 @@ def grouped_quantize_mxfp4_impl(
                     False,  # row_rht unused: the rowwise operand is discarded here
                     scaling_recipe.use_rht,
                     col_sr=scaling_recipe.use_sr,  # rowwise discarded -> only col SR matters
+                    scale_rounding_mode=scale_rounding_mode,
                 )
             )
             return colwise_out, colwise_scale, group_lens_padded, group_offs_padded
@@ -811,6 +815,7 @@ def grouped_quantize_mxfp4_impl(
             scaling_recipe.use_2d_block,
             scaling_recipe.use_sr,
             scaling_recipe.use_rht,
+            scale_rounding_mode,
         )
 
 
@@ -876,6 +881,7 @@ def quantize_mxfp4_impl(
     with_trans: bool = False,
     scaling_recipe: Optional[ScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
+    scale_rounding_mode: int = 0,
 ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
     # NOTE: quantize fp4 kernel use the ISA which only available on cdna4.
     mxfp4_support, reason = check_mxfp4_support()
@@ -927,6 +933,7 @@ def quantize_mxfp4_impl(
                     col_2d=scaling_recipe_for_trans.use_2d_block,
                     row_sr=scaling_recipe.use_sr,
                     col_sr=scaling_recipe_for_trans.use_sr,
+                    scale_rounding_mode=scale_rounding_mode,
                 )
             if x.ndim == 2 and dual_eligible(
                 x.shape[0], x.shape[1], scaling_recipe, scaling_recipe_for_trans
@@ -940,6 +947,7 @@ def quantize_mxfp4_impl(
                     col_2d=scaling_recipe_for_trans.use_2d_block,
                     row_sr=scaling_recipe.use_sr,
                     col_sr=scaling_recipe_for_trans.use_sr,
+                    scale_rounding_mode=scale_rounding_mode,
                 )
         return torch.ops.primus_turbo_cpp_extension.quantize_mxfp4_dual(
             x,
@@ -955,6 +963,7 @@ def quantize_mxfp4_impl(
             scaling_recipe.shuffle_out,
             scaling_recipe_for_trans.shuffle_scale,
             scaling_recipe_for_trans.shuffle_out,
+            scale_rounding_mode,
         )
     else:
         return torch.ops.primus_turbo_cpp_extension.quantize_mxfp4(
@@ -967,6 +976,7 @@ def quantize_mxfp4_impl(
             scaling_recipe.use_rht,
             scaling_recipe.shuffle_scale,
             scaling_recipe.shuffle_out,
+            scale_rounding_mode,
         )
 
 

@@ -17,15 +17,13 @@
  * - Colwise output: FP4 packed (N x M/2) + E8M0 scales (N x M/32)
  **************************************************************************************************/
 
-#include <atomic>
-#include <cstdlib>
-
 #include "primus_turbo/common.h"
 #include "primus_turbo/device/reduce.cuh"
 #include "primus_turbo/device/shuffle.cuh"
 #include "primus_turbo/device/utils.cuh"
 #include "primus_turbo/memory_pack.h"
 #include "primus_turbo/quantization.h"
+#include <atomic>
 
 namespace primus_turbo {
 
@@ -61,23 +59,6 @@ constexpr int SMEM_PADDING = 2; // Padding to avoid bank conflicts
 // each kernel invocation.  Combined with a Wang hash for avalanche diffusion,
 // this gives decorrelated random bits across threads and launches.
 static std::atomic<uint32_t> global_sr_counter{0};
-
-// PRIMUS_TURBO_MXFP4_SCALE_ROUNDING selects the bias added before extracting the scale exponent:
-//   0 (default): 1/2 retained-mantissa ULP
-//   1:           1 retained-mantissa ULP
-//   2:           3/8 retained-mantissa ULP
-inline int mxfp4_scale_rounding_bias() {
-    constexpr int shift = FP32_MANTISSA_BITS - FP4_MANTISSA_BITS;
-    const char   *env   = std::getenv("PRIMUS_TURBO_MXFP4_SCALE_ROUNDING");
-    if (env == nullptr || env[0] == '\0' || (env[0] == '0' && env[1] == '\0'))
-        return 1 << (shift - 1);
-    if (env[0] == '1' && env[1] == '\0')
-        return 1 << shift;
-    if (env[0] == '2' && env[1] == '\0')
-        return 3 << (shift - 3);
-    PRIMUS_TURBO_CHECK(false, "PRIMUS_TURBO_MXFP4_SCALE_ROUNDING must be 0, 1, or 2");
-    return 1 << (shift - 1);
-}
 
 __device__ __forceinline__ uint32_t sr_hash(uint32_t seed) {
     seed = (seed ^ 61u) ^ (seed >> 16);
@@ -1151,13 +1132,14 @@ void quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_
                               int rowwise_scale_N, int rowwise_scale_M_pad, int rowwise_scale_N_pad,
                               int colwise_scale_M, int colwise_scale_N, int colwise_scale_M_pad,
                               int colwise_scale_N_pad, ScalingRecipe rowwise_recipe,
-                              ScalingRecipe colwise_recipe, hipStream_t stream) {
+                              ScalingRecipe colwise_recipe, int scale_rounding_mode,
+                              hipStream_t stream) {
     // Batched (G > 1) input is handled by replicating the per-matrix grid along
     // blockIdx.z; each z-slice quantizes one (M, N) group offset by its stride.
     dim3           grid((M_pad + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N, G);
     dim3           block(warp_size() * WARPS_PER_BLOCK);
     const uint32_t sr_seed             = global_sr_counter.fetch_add(1, std::memory_order_relaxed);
-    const int      scale_rounding_bias = mxfp4_scale_rounding_bias();
+    const int      scale_rounding_bias = detail::mxfp4_scale_rounding_bias(scale_rounding_mode);
 
     // Per-group strides into the contiguous (G, ...) output/scale buffers. FP4
     // outputs are 2-per-byte packed, so their strides use the /2 packed widths.
@@ -1252,26 +1234,26 @@ template void quantize_mxfp4_dual_impl<dtype::float16>(
     int N_pad, int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
     int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M, int colwise_scale_N,
     int colwise_scale_M_pad, int colwise_scale_N_pad, ScalingRecipe rowwise_recipe,
-    ScalingRecipe colwise_recipe, hipStream_t stream);
+    ScalingRecipe colwise_recipe, int scale_rounding_mode, hipStream_t stream);
 template void quantize_mxfp4_dual_impl<dtype::bfloat16>(
     const dtype::bfloat16 *x, dtype::float4x2_e2m1 *rowwise_output, uint8_t *rowwise_scale,
     dtype::float4x2_e2m1 *colwise_output, uint8_t *colwise_scale, int G, int M, int N, int M_pad,
     int N_pad, int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N,
     int rowwise_scale_M_pad, int rowwise_scale_N_pad, int colwise_scale_M, int colwise_scale_N,
     int colwise_scale_M_pad, int colwise_scale_N_pad, ScalingRecipe rowwise_recipe,
-    ScalingRecipe colwise_recipe, hipStream_t stream);
+    ScalingRecipe colwise_recipe, int scale_rounding_mode, hipStream_t stream);
 
 template <typename DType>
 void quantize_mxfp4_impl(const DType *input, dtype::float4x2_e2m1 *output, uint8_t *scale,
                          QuantizeMode mode, int G, int M, int N, int M_pad, int N_pad,
                          int scale_stride, int scale_N, int scale_M_pad, int scale_N_pad,
-                         ScalingRecipe recipe, hipStream_t stream) {
+                         ScalingRecipe recipe, int scale_rounding_mode, hipStream_t stream) {
     // Batched (G > 1) input replicates the per-matrix grid along blockIdx.z;
     // each z-slice quantizes one (M, N) group offset by its per-group stride.
     dim3           grid((M_pad + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N, G);
     dim3           block(warp_size() * WARPS_PER_BLOCK);
     const uint32_t sr_seed             = global_sr_counter.fetch_add(1, std::memory_order_relaxed);
-    const int      scale_rounding_bias = mxfp4_scale_rounding_bias();
+    const int      scale_rounding_bias = detail::mxfp4_scale_rounding_bias(scale_rounding_mode);
 
     // Per-group strides into the contiguous (G, ...) output/scale buffers. FP4
     // outputs are 2-per-byte packed, so their strides use the /2 packed widths.
@@ -1329,18 +1311,14 @@ void quantize_mxfp4_impl(const DType *input, dtype::float4x2_e2m1 *output, uint8
 #undef QUANTIZE_MXFP4_KERNEL_ARGS
 }
 
-template void quantize_mxfp4_impl<dtype::float16>(const dtype::float16 *x,
-                                                  dtype::float4x2_e2m1 *output, uint8_t *scale,
-                                                  QuantizeMode mode, int G, int M, int N, int M_pad,
-                                                  int N_pad, int scale_stride, int scale_N,
-                                                  int scale_M_pad, int scale_N_pad,
-                                                  ScalingRecipe recipe, hipStream_t stream);
-template void quantize_mxfp4_impl<dtype::bfloat16>(const dtype::bfloat16 *x,
-                                                   dtype::float4x2_e2m1 *output, uint8_t *scale,
-                                                   QuantizeMode mode, int G, int M, int N,
-                                                   int M_pad, int N_pad, int scale_stride,
-                                                   int scale_N, int scale_M_pad, int scale_N_pad,
-                                                   ScalingRecipe recipe, hipStream_t stream);
+template void quantize_mxfp4_impl<dtype::float16>(
+    const dtype::float16 *x, dtype::float4x2_e2m1 *output, uint8_t *scale, QuantizeMode mode, int G,
+    int M, int N, int M_pad, int N_pad, int scale_stride, int scale_N, int scale_M_pad,
+    int scale_N_pad, ScalingRecipe recipe, int scale_rounding_mode, hipStream_t stream);
+template void quantize_mxfp4_impl<dtype::bfloat16>(
+    const dtype::bfloat16 *x, dtype::float4x2_e2m1 *output, uint8_t *scale, QuantizeMode mode,
+    int G, int M, int N, int M_pad, int N_pad, int scale_stride, int scale_N, int scale_M_pad,
+    int scale_N_pad, ScalingRecipe recipe, int scale_rounding_mode, hipStream_t stream);
 
 // ============================================================================
 // Grouped MXFP4 dual (rowwise + colwise) quantization with per-group M zero-pad
@@ -1730,7 +1708,8 @@ void grouped_quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *
                                       int N, int M_pad_col, int N_pad, int rowwise_scale_stride,
                                       int colwise_scale_stride, int rowwise_scale_N,
                                       int colwise_scale_N, ScalingRecipe rowwise_recipe,
-                                      ScalingRecipe colwise_recipe, hipStream_t stream) {
+                                      ScalingRecipe colwise_recipe, int scale_rounding_mode,
+                                      hipStream_t stream) {
     PRIMUS_TURBO_CHECK(rowwise_recipe.shuffle_out == false && rowwise_recipe.shuffle_scale == false,
                        "grouped MXFP4 dual does not support shuffle");
     PRIMUS_TURBO_CHECK(colwise_recipe.shuffle_out == false && colwise_recipe.shuffle_scale == false,
@@ -1739,7 +1718,7 @@ void grouped_quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *
     dim3           grid((M_pad_col + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N);
     dim3           block(warp_size() * WARPS_PER_BLOCK);
     const uint32_t sr_seed             = global_sr_counter.fetch_add(1, std::memory_order_relaxed);
-    const int      scale_rounding_bias = mxfp4_scale_rounding_bias();
+    const int      scale_rounding_bias = detail::mxfp4_scale_rounding_bias(scale_rounding_mode);
 
 #define GROUPED_QUANTIZE_MXFP4_DUAL_ARGS                                                           \
     input, reinterpret_cast<uint8_t *>(rowwise_output), rowwise_scale,                             \
@@ -1806,13 +1785,15 @@ template void grouped_quantize_mxfp4_dual_impl<dtype::float16>(
     dtype::float4x2_e2m1 *colwise_output, uint8_t *colwise_scale, const int64_t *group_offs,
     const int64_t *group_offs_padded_colwise, int G, int total_M, int N, int M_pad_col, int N_pad,
     int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N, int colwise_scale_N,
-    ScalingRecipe rowwise_recipe, ScalingRecipe colwise_recipe, hipStream_t stream);
+    ScalingRecipe rowwise_recipe, ScalingRecipe colwise_recipe, int scale_rounding_mode,
+    hipStream_t stream);
 template void grouped_quantize_mxfp4_dual_impl<dtype::bfloat16>(
     const dtype::bfloat16 *input, dtype::float4x2_e2m1 *rowwise_output, uint8_t *rowwise_scale,
     dtype::float4x2_e2m1 *colwise_output, uint8_t *colwise_scale, const int64_t *group_offs,
     const int64_t *group_offs_padded_colwise, int G, int total_M, int N, int M_pad_col, int N_pad,
     int rowwise_scale_stride, int colwise_scale_stride, int rowwise_scale_N, int colwise_scale_N,
-    ScalingRecipe rowwise_recipe, ScalingRecipe colwise_recipe, hipStream_t stream);
+    ScalingRecipe rowwise_recipe, ScalingRecipe colwise_recipe, int scale_rounding_mode,
+    hipStream_t stream);
 
 template <typename DType, QuantizeMode MODE, bool USE_RHT, bool USE_2D_BLOCK, bool USE_SR>
 __global__ __launch_bounds__(THREADS_PER_BLOCK, 4) void grouped_quantize_mxfp4_kernel(
@@ -2072,14 +2053,15 @@ void grouped_quantize_mxfp4_impl(const DType *input, dtype::float4x2_e2m1 *outpu
                                  const int64_t *group_offs,
                                  const int64_t *group_offs_padded_colwise, QuantizeMode mode, int G,
                                  int total_M, int N, int M_pad_col, int N_pad, int scale_stride,
-                                 int scale_N, ScalingRecipe recipe, hipStream_t stream) {
+                                 int scale_N, ScalingRecipe recipe, int scale_rounding_mode,
+                                 hipStream_t stream) {
     PRIMUS_TURBO_CHECK(recipe.shuffle_out == false && recipe.shuffle_scale == false,
                        "grouped MXFP4 single does not support shuffle");
 
     dim3           grid((M_pad_col + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N);
     dim3           block(warp_size() * WARPS_PER_BLOCK);
     const uint32_t sr_seed             = global_sr_counter.fetch_add(1, std::memory_order_relaxed);
-    const int      scale_rounding_bias = mxfp4_scale_rounding_bias();
+    const int      scale_rounding_bias = detail::mxfp4_scale_rounding_bias(scale_rounding_mode);
 
 #define GROUPED_QUANTIZE_MXFP4_ARGS                                                                \
     input, reinterpret_cast<uint8_t *>(output), scale, group_offs, group_offs_padded_colwise, G,   \
@@ -2124,11 +2106,11 @@ template void grouped_quantize_mxfp4_impl<dtype::float16>(
     const dtype::float16 *input, dtype::float4x2_e2m1 *output, uint8_t *scale,
     const int64_t *group_offs, const int64_t *group_offs_padded_colwise, QuantizeMode mode, int G,
     int total_M, int N, int M_pad_col, int N_pad, int scale_stride, int scale_N,
-    ScalingRecipe recipe, hipStream_t stream);
+    ScalingRecipe recipe, int scale_rounding_mode, hipStream_t stream);
 template void grouped_quantize_mxfp4_impl<dtype::bfloat16>(
     const dtype::bfloat16 *input, dtype::float4x2_e2m1 *output, uint8_t *scale,
     const int64_t *group_offs, const int64_t *group_offs_padded_colwise, QuantizeMode mode, int G,
     int total_M, int N, int M_pad_col, int N_pad, int scale_stride, int scale_N,
-    ScalingRecipe recipe, hipStream_t stream);
+    ScalingRecipe recipe, int scale_rounding_mode, hipStream_t stream);
 
 } // namespace primus_turbo

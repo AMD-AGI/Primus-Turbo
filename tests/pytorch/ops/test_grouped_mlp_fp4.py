@@ -42,6 +42,9 @@ GATES = {"silu": F.silu, "gelu": lambda t: F.gelu(t, approximate="tanh")}
 
 CLAMP_LIMIT = 0.10
 GATE_CASES = [("silu", None), ("gelu", None), ("silu", CLAMP_LIMIT)]
+CASES = [
+    (shape, activation, clamp_limit, 0) for shape in SHAPES for activation, clamp_limit in GATE_CASES
+] + [pytest.param(SHAPES[0], "silu", None, 2, id="uos-mode2")]
 
 CLAMP_SNR_THRESHOLD = 8.0
 
@@ -91,15 +94,20 @@ def _run(fn, leaves, cotangent):
     return out.detach(), [t.grad for t in args]
 
 
-@pytest.mark.parametrize("activation,clamp_limit", GATE_CASES)
-@pytest.mark.parametrize("shape", SHAPES)
-def test_grouped_mlp_fp4(shape, activation, clamp_limit):
+@pytest.mark.parametrize("shape,activation,clamp_limit,scale_rounding_mode", CASES)
+def test_grouped_mlp_fp4(shape, activation, clamp_limit, scale_rounding_mode):
     """The fused op against the same arithmetic done eagerly, expert by expert."""
     supported, reason = check_mxfp4_support()
     if not supported:
         pytest.skip(reason)
 
     M, K, I, G = shape
+    if scale_rounding_mode == 2:
+        from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp4_glu_kernel import (
+            _GMXFP4_GLU_CACHE,
+        )
+
+        _GMXFP4_GLU_CACHE.clear()
     offs, group_lens, leaves = _mlp_leaves(M, K, I, G)
     gen = torch.Generator(device="cuda").manual_seed(7)
     # Random rather than ones: a cotangent that varies keeps a per-row term like
@@ -115,7 +123,7 @@ def test_grouped_mlp_fp4(shape, activation, clamp_limit):
             probs=p,
             trans_w1=True,
             trans_w2=True,
-            config=Float4QuantConfig(),
+            config=Float4QuantConfig(scale_rounding_mode=scale_rounding_mode),
             activation=activation,
             clamp_limit=clamp_limit,
         ),
@@ -134,3 +142,9 @@ def test_grouped_mlp_fp4(shape, activation, clamp_limit):
         assert got is not None, f"{name} was not produced"
         assert got.shape == want.shape, name
         assert compute_snr(want, got) > grad_threshold, name
+
+    if scale_rounding_mode == 2:
+        expected_bias = 3 << 19
+        keys = tuple(_GMXFP4_GLU_CACHE)
+        assert any(key[13] and key[-1] == expected_bias for key in keys), "fused GLU mode"
+        assert any(key[14] and key[-1] == expected_bias for key in keys), "fused dGLU mode"

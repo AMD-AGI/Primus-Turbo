@@ -14,11 +14,13 @@ from primus_turbo.pytorch.core.low_precision import (
     DEFAULT_BLOCK_SIZE,
     MXFP4_BLOCK_SIZE,
     MXFP8_BLOCK_SIZE,
+    Float4QuantConfig,
     ScalingGranularity,
     ScalingRecipe,
     check_mxfp4_support,
     check_mxfp8_support,
 )
+from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor, create_quantized_weight
 from primus_turbo.pytorch.ops import dequantize_fp8, quantize_fp4, quantize_fp8
 from primus_turbo.pytorch.ops.quantization import (
     dequantize_fp4,
@@ -27,8 +29,6 @@ from primus_turbo.pytorch.ops.quantization import (
 )
 from tests.pytorch.ref.quantization_ref import dequantize_fp8_ref, quantize_fp8_ref
 from tests.pytorch.test_utils import get_tolerances
-
-_MXFP4_SCALE_ROUNDING_ENV = "PRIMUS_TURBO_MXFP4_SCALE_ROUNDING"
 
 
 def _load_mxfp4_flydsl_kernel(require_gfx950=False):
@@ -53,7 +53,7 @@ def _load_mxfp4_flydsl_kernel(require_gfx950=False):
     return mxfp4_quant_kernel
 
 
-def _hip_quantize_mxfp4_dual(x, row_recipe, col_recipe):
+def _hip_quantize_mxfp4_dual(x, row_recipe, col_recipe, scale_rounding_mode=0):
     """Call the HIP oracle directly, bypassing Python backend dispatch."""
     return torch.ops.primus_turbo_cpp_extension.quantize_mxfp4_dual(
         x,
@@ -69,6 +69,7 @@ def _hip_quantize_mxfp4_dual(x, row_recipe, col_recipe):
         False,
         False,
         False,
+        scale_rounding_mode,
     )
 
 
@@ -83,26 +84,19 @@ def _assert_byte_exact(actual, expected):
         )
 
 
-def test_mxfp4_scale_rounding_mode_contract(monkeypatch):
-    """Validate every supported bias and reject representative malformed values."""
+def test_mxfp4_scale_rounding_mode_contract():
+    """Validate the config contract and its mapping to the three supported biases."""
     kernel = _load_mxfp4_flydsl_kernel()
-    for mode, expected in (
-        (None, 1 << 21),
-        ("", 1 << 21),
-        ("0", 1 << 21),
-        ("1", 1 << 22),
-        ("2", 3 << 19),
-    ):
-        if mode is None:
-            monkeypatch.delenv(_MXFP4_SCALE_ROUNDING_ENV, raising=False)
-        else:
-            monkeypatch.setenv(_MXFP4_SCALE_ROUNDING_ENV, mode)
-        assert kernel._mxfp4_scale_rounding_bias() == expected
+    assert Float4QuantConfig().scale_rounding_mode == 0
+    for mode, expected in ((0, 1 << 21), (1, 1 << 22), (2, 3 << 19)):
+        config = Float4QuantConfig(scale_rounding_mode=mode)
+        assert kernel._mxfp4_scale_rounding_bias(config.scale_rounding_mode) == expected
 
-    for mode in ("invalid", " ", "00", "-1", "3"):
-        monkeypatch.setenv(_MXFP4_SCALE_ROUNDING_ENV, mode)
-        with pytest.raises(RuntimeError, match="must be 0, 1, or 2"):
-            kernel._mxfp4_scale_rounding_bias()
+    for mode in (-1, 3, "1"):
+        with pytest.raises(AssertionError, match="must be 0, 1, or 2"):
+            Float4QuantConfig(scale_rounding_mode=mode)
+        with pytest.raises(ValueError, match="must be 0, 1, or 2"):
+            kernel._mxfp4_scale_rounding_bias(mode)
 
 
 @pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
@@ -795,8 +789,8 @@ def test_mxfp4_scale_rounding_dense_runtime_switch(monkeypatch):
     monkeypatch.setattr(kernel, "flydsl_dual_quant", traced_flydsl_dual_quant)
 
     results = {}
-    for mode in ("0", "1", "2"):
-        monkeypatch.setenv(_MXFP4_SCALE_ROUNDING_ENV, mode)
+    for mode in (0, 1, 2):
+        config = Float4QuantConfig(scale_rounding_mode=mode)
         fly = quantize_fp4_with_trans(
             x,
             turbo.float4_e2m1fn_x2,
@@ -804,27 +798,52 @@ def test_mxfp4_scale_rounding_dense_runtime_switch(monkeypatch):
             block_size=MXFP4_BLOCK_SIZE,
             scaling_recipe=recipe,
             scaling_recipe_for_trans=recipe,
+            scale_rounding_mode=config.scale_rounding_mode,
         )
-        hip = _hip_quantize_mxfp4_dual(x, recipe, recipe)
+        hip = _hip_quantize_mxfp4_dual(x, recipe, recipe, config.scale_rounding_mode)
         _assert_byte_exact(fly, hip)
         results[mode] = tuple(tensor.clone() for tensor in fly)
 
     assert traced_flydsl_dual_quant.call_count == 3
-    assert not torch.equal(results["0"][1].view(torch.uint8), results["1"][1].view(torch.uint8))
-    assert not torch.equal(results["0"][1].view(torch.uint8), results["2"][1].view(torch.uint8))
+    assert not torch.equal(results[0][1].view(torch.uint8), results[1][1].view(torch.uint8))
+    assert not torch.equal(results[0][1].view(torch.uint8), results[2][1].view(torch.uint8))
+
+    # Exercise config propagation through QuantizedTensor metadata, which prevents
+    # a cached weight from being reused under a different rounding mode.
+    config = Float4QuantConfig(scale_rounding_mode=2)
+    quantized_weight, _ = create_quantized_weight(x, turbo.float4_e2m1fn_x2, config)
+    expected_weight = quantize_fp4(
+        x,
+        turbo.float4_e2m1fn_x2,
+        granularity=config.granularity,
+        block_size=config.block_size,
+        axis=1,
+        scaling_recipe=ScalingRecipe(use_2d_block=True),
+        scale_rounding_mode=config.scale_rounding_mode,
+    )
+    _assert_byte_exact((quantized_weight.qdata, quantized_weight.scale_inv), expected_weight)
+    assert quantized_weight.scale_rounding_mode == config.scale_rounding_mode
+
+    keys, metadata = quantized_weight.__tensor_flatten__()
+    restored = QuantizedTensor.__tensor_unflatten__(
+        {key: getattr(quantized_weight, key) for key in keys},
+        metadata,
+        quantized_weight.shape,
+        quantized_weight.stride(),
+    )
+    assert restored.scale_rounding_mode == config.scale_rounding_mode
 
 
-def test_mxfp4_scale_rounding_dense_special_recipes_match_hip(monkeypatch):
+def test_mxfp4_scale_rounding_dense_special_recipes_match_hip():
     """Representative RHT and 2D-scale variants propagate the selected mode."""
     kernel = _load_mxfp4_flydsl_kernel(require_gfx950=True)
     torch.manual_seed(42)
     x = torch.randn((384, 256), device="cuda", dtype=torch.bfloat16)
 
     for mode, row_2d, col_2d, row_rht, col_rht in (
-        ("1", False, False, False, True),
-        ("2", True, True, False, False),
+        (1, False, False, False, True),
+        (2, True, True, False, False),
     ):
-        monkeypatch.setenv(_MXFP4_SCALE_ROUNDING_ENV, mode)
         row_recipe = ScalingRecipe(use_2d_block=row_2d, use_rht=row_rht)
         col_recipe = ScalingRecipe(use_2d_block=col_2d, use_rht=col_rht)
         assert kernel.dual_eligible(x.shape[0], x.shape[1], row_recipe, col_recipe)
@@ -836,11 +855,12 @@ def test_mxfp4_scale_rounding_dense_special_recipes_match_hip(monkeypatch):
             col_rht,
             row_2d=row_2d,
             col_2d=col_2d,
+            scale_rounding_mode=mode,
         )
-        _assert_byte_exact(fly, _hip_quantize_mxfp4_dual(x, row_recipe, col_recipe))
+        _assert_byte_exact(fly, _hip_quantize_mxfp4_dual(x, row_recipe, col_recipe, mode))
 
 
-def test_mxfp4_scale_rounding_batched_3d_padding_and_cache(monkeypatch):
+def test_mxfp4_scale_rounding_batched_3d_padding_and_cache():
     """Padded 3D quant caches distinct compiled variants for modes 0 and 2."""
     kernel = _load_mxfp4_flydsl_kernel(require_gfx950=True)
     recipe = ScalingRecipe(use_2d_block=True)
@@ -850,8 +870,7 @@ def test_mxfp4_scale_rounding_batched_3d_padding_and_cache(monkeypatch):
     x = block_values.repeat_interleave(MXFP4_BLOCK_SIZE).expand(2, 192, -1).contiguous()
 
     results = {}
-    for mode in ("0", "2"):
-        monkeypatch.setenv(_MXFP4_SCALE_ROUNDING_ENV, mode)
+    for mode in (0, 2):
         fly = kernel.flydsl_dual_quant_batched(
             x,
             turbo.float4_e2m1fn_x2,
@@ -859,22 +878,22 @@ def test_mxfp4_scale_rounding_batched_3d_padding_and_cache(monkeypatch):
             False,
             row_2d=True,
             col_2d=True,
+            scale_rounding_mode=mode,
         )
-        _assert_byte_exact(fly, _hip_quantize_mxfp4_dual(x, recipe, recipe))
+        _assert_byte_exact(fly, _hip_quantize_mxfp4_dual(x, recipe, recipe, mode))
         results[mode] = tuple(tensor.clone() for tensor in fly)
 
-    assert not torch.equal(results["0"][1].view(torch.uint8), results["2"][1].view(torch.uint8))
+    assert not torch.equal(results[0][1].view(torch.uint8), results[2][1].view(torch.uint8))
 
 
-def test_mxfp4_scale_rounding_hip_rejects_invalid_mode(monkeypatch):
-    """The HIP entry point uses the same strict runtime-mode parser as FlyDSL."""
+def test_mxfp4_scale_rounding_hip_rejects_invalid_mode():
+    """The HIP entry point independently rejects invalid low-level mode values."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     mxfp4_supported, reason = check_mxfp4_support()
     if not mxfp4_supported:
         pytest.skip(reason)
 
-    monkeypatch.setenv(_MXFP4_SCALE_ROUNDING_ENV, "00")
     x = torch.zeros((32, 32), device="cuda", dtype=torch.bfloat16)
     with pytest.raises(RuntimeError, match="must be 0, 1, or 2"):
         quantize_fp4(
@@ -884,15 +903,16 @@ def test_mxfp4_scale_rounding_hip_rejects_invalid_mode(monkeypatch):
             axis=1,
             block_size=MXFP4_BLOCK_SIZE,
             scaling_recipe=ScalingRecipe(),
+            scale_rounding_mode=3,
         )
 
 
-def test_grouped_mxfp4_scale_rounding_flydsl_matches_hip(monkeypatch):
+def test_grouped_mxfp4_scale_rounding_flydsl_matches_hip():
     """Irregular and empty K=256 groups preserve HIP bytes with and without RHT."""
     _load_mxfp4_flydsl_kernel(require_gfx950=True)
     from primus_turbo.flydsl.quantization import mxfp4_grouped_quant
 
-    monkeypatch.setenv(_MXFP4_SCALE_ROUNDING_ENV, "2")
+    scale_rounding_mode = 2
     group_lens_values = (0, 1, 255, 257, 511, 513)
     group_lens = torch.tensor(group_lens_values, device="cuda", dtype=torch.int64)
     group_offs = torch.cat([torch.zeros(1, device="cuda", dtype=torch.int64), group_lens.cumsum(0)])
@@ -921,6 +941,7 @@ def test_grouped_mxfp4_scale_rounding_flydsl_matches_hip(monkeypatch):
             turbo.float4_e2m1fn_x2,
             use_rht,
             use_rht,
+            scale_rounding_mode=scale_rounding_mode,
         )
         hip = torch.ops.primus_turbo_cpp_extension.grouped_quantize_mxfp4_dual(
             x,
@@ -933,6 +954,7 @@ def test_grouped_mxfp4_scale_rounding_flydsl_matches_hip(monkeypatch):
             False,
             False,
             use_rht,
+            scale_rounding_mode,
         )
 
         _assert_byte_exact(fly[:2], hip[:2])
@@ -982,10 +1004,10 @@ def test_grouped_mxfp4_scale_rounding_flydsl_matches_hip(monkeypatch):
             )
 
 
-def test_mxfp4_scale_rounding_sr_scale_parity(monkeypatch):
+def test_mxfp4_scale_rounding_sr_scale_parity():
     """SR changes samples but leaves FlyDSL and HIP scale selection byte-exact."""
     kernel = _load_mxfp4_flydsl_kernel(require_gfx950=True)
-    monkeypatch.setenv(_MXFP4_SCALE_ROUNDING_ENV, "2")
+    scale_rounding_mode = 2
 
     torch.manual_seed(123)
     x = torch.randn((384, 256), device="cuda", dtype=torch.bfloat16)
@@ -1000,6 +1022,7 @@ def test_mxfp4_scale_rounding_sr_scale_parity(monkeypatch):
         col_recipe.use_rht,
         row_sr=True,
         col_sr=True,
+        scale_rounding_mode=scale_rounding_mode,
     )
     fly2 = kernel.flydsl_dual_quant(
         x,
@@ -1008,8 +1031,9 @@ def test_mxfp4_scale_rounding_sr_scale_parity(monkeypatch):
         col_recipe.use_rht,
         row_sr=True,
         col_sr=True,
+        scale_rounding_mode=scale_rounding_mode,
     )
-    hip = _hip_quantize_mxfp4_dual(x, row_recipe, col_recipe)
+    hip = _hip_quantize_mxfp4_dual(x, row_recipe, col_recipe, scale_rounding_mode)
 
     assert not torch.equal(fly1[0].view(torch.uint8), fly2[0].view(torch.uint8))
     assert not torch.equal(fly1[2].view(torch.uint8), fly2[2].view(torch.uint8))

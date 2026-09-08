@@ -133,6 +133,11 @@ def check_quantized_tensor(
         f"QuantizedTensor block_size {quantized_tensor.block_size} does not match config "
         f"block_size {config.block_size}"
     )
+    if isinstance(config, Float4QuantConfig):
+        assert quantized_tensor.scale_rounding_mode == config.scale_rounding_mode, (
+            f"QuantizedTensor scale_rounding_mode {quantized_tensor.scale_rounding_mode} "
+            f"does not match config scale_rounding_mode {config.scale_rounding_mode}"
+        )
 
     if axis is not None:
         normalized_axis = _normalize_axis(axis, quantized_tensor.qdata.ndim)
@@ -167,6 +172,7 @@ class QuantizedTensor(torch.Tensor):
         is_grouped_tensor: bool = False,
         block_size: Optional[int] = None,
         scaling_recipe: Optional[ScalingRecipe] = None,
+        scale_rounding_mode: int = 0,
         quantized_axis: Optional[int] = None,
         requires_grad: bool = False,
     ):
@@ -188,6 +194,7 @@ class QuantizedTensor(torch.Tensor):
         self._scaling_recipe = scaling_recipe
         self._granularity = granularity
         self._block_size = block_size
+        self._scale_rounding_mode = scale_rounding_mode
 
         self._group_lens = group_lens
         self._group_offs = group_offs
@@ -214,6 +221,7 @@ class QuantizedTensor(torch.Tensor):
         group_lens: Optional[torch.Tensor] = None,
         block_size: Optional[int] = None,
         scaling_recipe: Optional[ScalingRecipe] = None,
+        scale_rounding_mode: int = 0,
         pad_align_last: int = 0,
         pad_align_penultimate: int = 0,
     ) -> "QuantizedTensor":
@@ -330,6 +338,7 @@ class QuantizedTensor(torch.Tensor):
                     block_size=block_size,
                     axis=axis,
                     scaling_recipe=scaling_recipe,
+                    scale_rounding_mode=scale_rounding_mode,
                     pad_align_last=pad_align_last,
                     pad_align_penultimate=pad_align_penultimate,
                 )
@@ -346,6 +355,7 @@ class QuantizedTensor(torch.Tensor):
                     block_size=block_size,
                     axis=axis,
                     scaling_recipe=scaling_recipe,
+                    scale_rounding_mode=scale_rounding_mode,
                 )
         else:
             data, scale_inv = cls._quantize(
@@ -355,6 +365,7 @@ class QuantizedTensor(torch.Tensor):
                 block_size=block_size,
                 axis=axis,
                 scaling_recipe=scaling_recipe,
+                scale_rounding_mode=scale_rounding_mode,
                 pad_align_last=pad_align_last,
                 pad_align_penultimate=pad_align_penultimate,
             )
@@ -370,6 +381,7 @@ class QuantizedTensor(torch.Tensor):
             granularity=granularity,
             block_size=block_size,
             scaling_recipe=scaling_recipe,
+            scale_rounding_mode=scale_rounding_mode,
             requires_grad=hp_tensor.requires_grad,
             quantized_axis=axis,
             orig_group_lens=orig_group_lens,
@@ -389,6 +401,7 @@ class QuantizedTensor(torch.Tensor):
         block_size: Optional[int] = None,
         axis: Optional[int] = None,
         scaling_recipe: Optional[ScalingRecipe] = None,
+        scale_rounding_mode: int = 0,
         pad_align_last: int = 0,
         pad_align_penultimate: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -419,6 +432,7 @@ class QuantizedTensor(torch.Tensor):
                 block_size=block_size,
                 axis=axis,
                 scaling_recipe=scaling_recipe,
+                scale_rounding_mode=scale_rounding_mode,
             )
             return data_, scale_inv
 
@@ -434,6 +448,7 @@ class QuantizedTensor(torch.Tensor):
         block_size: Optional[int] = None,
         axis: Optional[int] = None,
         scaling_recipe: Optional[ScalingRecipe] = None,
+        scale_rounding_mode: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         from primus_turbo.pytorch.ops.quantization import (
             grouped_quantize_fp4,
@@ -465,6 +480,7 @@ class QuantizedTensor(torch.Tensor):
                 block_size=block_size,
                 axis=axis,
                 scaling_recipe=scaling_recipe,
+                scale_rounding_mode=scale_rounding_mode,
             )
             return data_, scale_inv, group_lens_padded, group_offs_padded
 
@@ -519,6 +535,10 @@ class QuantizedTensor(torch.Tensor):
     @property
     def scaling_recipe(self) -> ScalingRecipe:
         return self._scaling_recipe
+
+    @property
+    def scale_rounding_mode(self) -> int:
+        return self._scale_rounding_mode
 
     @property
     def quantized_axis(self) -> int:
@@ -654,6 +674,7 @@ class QuantizedTensor(torch.Tensor):
             "_granularity": self._granularity,
             "_block_size": self._block_size,
             "_scaling_recipe": self._scaling_recipe,
+            "_scale_rounding_mode": self._scale_rounding_mode,
             "_is_grouped_tensor": self._is_grouped_tensor,
             "_quantized_axis": self._quantized_axis,
         }
@@ -673,6 +694,7 @@ class QuantizedTensor(torch.Tensor):
             granularity=metadata["_granularity"],
             block_size=metadata["_block_size"],
             scaling_recipe=metadata["_scaling_recipe"],
+            scale_rounding_mode=metadata.get("_scale_rounding_mode", 0),
             orig_group_lens=inner_tensors.get("_orig_group_lens"),
             orig_group_offs=inner_tensors.get("_orig_group_offs"),
             group_lens=inner_tensors.get("_group_lens"),
@@ -710,6 +732,7 @@ class QuantizedTensor(torch.Tensor):
             granularity=tensor._granularity,
             block_size=tensor._block_size,
             scaling_recipe=tensor._scaling_recipe,
+            scale_rounding_mode=tensor._scale_rounding_mode,
             orig_group_lens=tensor._orig_group_lens,
             orig_group_offs=tensor._orig_group_offs,
             group_lens=tensor._group_lens,
@@ -795,6 +818,7 @@ class QuantizedTensor(torch.Tensor):
             axis=-2,
             block_size=tensor._block_size,
             scaling_recipe=tensor._scaling_recipe,
+            scale_rounding_mode=tensor._scale_rounding_mode,
         )
 
     # ------------------------------------------------------------------
@@ -939,12 +963,16 @@ def create_quantized_weight(
 
         return weight_scaling_recipe
 
+    scale_rounding_mode = (
+        quant_config.scale_rounding_mode if isinstance(quant_config, Float4QuantConfig) else 0
+    )
     quantized_weight = QuantizedTensor.quantize(
         weight,
         dest_dtype=dest_dtype,
         granularity=quant_config.granularity,
         block_size=quant_config.block_size,
         scaling_recipe=_weight_scaling_recipe(quant_config),
+        scale_rounding_mode=scale_rounding_mode,
         axis=-1,
     )
 
@@ -961,6 +989,7 @@ def create_quantized_weight(
                 granularity=quant_config.granularity,
                 block_size=quant_config.block_size,
                 scaling_recipe=_weight_scaling_recipe(quant_config),
+                scale_rounding_mode=scale_rounding_mode,
                 axis=-2,
             )
         elif granularity in [ScalingGranularity.BLOCKWISE, ScalingGranularity.MX_BLOCKWISE]:
@@ -970,6 +999,7 @@ def create_quantized_weight(
                 granularity=quant_config.granularity,
                 block_size=quant_config.block_size,
                 scaling_recipe=_weight_scaling_recipe(quant_config),
+                scale_rounding_mode=scale_rounding_mode,
                 # axis=-2 means quant weight along axis 2 which will get a transposed quantized weight.
                 axis=-2,
             )

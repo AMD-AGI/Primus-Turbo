@@ -25,8 +25,6 @@ Numerics reproduce ``csrc/kernels/quantization/quantization_mxfp4.cu`` exactly:
     groups), bit-identical to the C++ distributed ds_swizzle version.
 """
 
-import os
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, buffer_ops, math, range_constexpr, rocdl
@@ -41,24 +39,13 @@ _OOB = 0x7FFFFFFF  # word offset past any SRD -> buffer_load returns 0 / buffer_
 
 BLK = 256
 MB = 32  # MXFP4 micro-block size (elements per e8m0 scale)
-_SCALE_ROUNDING_ENV = "PRIMUS_TURBO_MXFP4_SCALE_ROUNDING"
 
 
-def _mxfp4_scale_rounding_mode():
-    """Return the validated runtime UoS mode selected for MXFP4 scale rounding."""
-    mode = os.getenv(_SCALE_ROUNDING_ENV, "0")
-    if mode in ("", "0"):
-        return 0
-    if mode == "1":
-        return 1
-    if mode == "2":
-        return 2
-    raise RuntimeError(f"{_SCALE_ROUNDING_ENV} must be 0, 1, or 2")
-
-
-def _mxfp4_scale_rounding_bias():
-    """Return the host-selected E8M0 exponent rounding bias used by HIP."""
-    return (1 << 21, 1 << 22, 3 << 19)[_mxfp4_scale_rounding_mode()]
+def _mxfp4_scale_rounding_bias(mode):
+    """Map a validated ``Float4QuantConfig.scale_rounding_mode`` to its E8M0 bias."""
+    if mode not in (0, 1, 2):
+        raise ValueError("scale_rounding_mode must be 0, 1, or 2")
+    return (1 << 21, 1 << 22, 3 << 19)[mode]
 
 
 def _abs_i32(fbits):
@@ -724,7 +711,15 @@ def dual_eligible(R, C, row_recipe, col_recipe):
 
 
 def flydsl_dual_quant(
-    x_bf16, fp4_dtype, row_rht, col_rht, row_2d=False, col_2d=False, row_sr=False, col_sr=False
+    x_bf16,
+    fp4_dtype,
+    row_rht,
+    col_rht,
+    row_2d=False,
+    col_2d=False,
+    row_sr=False,
+    col_sr=False,
+    scale_rounding_mode=0,
 ):
     """Fused rowwise + colwise-transpose mxfp4 cast (one bf16 read). Returns
     (row_data, row_scale, col_data, col_scale) in C++-compatible dtypes/shapes.
@@ -749,7 +744,7 @@ def flydsl_dual_quant(
         R,
         C,
         sr_seed,
-        _mxfp4_scale_rounding_bias(),
+        _mxfp4_scale_rounding_bias(scale_rounding_mode),
         grid_x,
         torch.cuda.current_stream(),
     )
@@ -1049,7 +1044,15 @@ def get_dual3_cast(
 
 
 def flydsl_dual_quant_batched(
-    x3d, fp4_dtype, row_rht, col_rht, row_2d=False, col_2d=False, row_sr=False, col_sr=False
+    x3d,
+    fp4_dtype,
+    row_rht,
+    col_rht,
+    row_2d=False,
+    col_2d=False,
+    row_sr=False,
+    col_sr=False,
+    scale_rounding_mode=0,
 ):
     """Batched-3D fused rowwise + colwise-transpose mxfp4 dual cast for a [G,N,K]
     weight in ONE launch. Returns C++-compatible per-expert
@@ -1060,7 +1063,7 @@ def flydsl_dual_quant_batched(
     G, N, K = x3d.shape
     dev = x3d.device
     x_i32 = x3d.contiguous().view(torch.int32)  # [G, N, K/2]
-    scale_rounding_bias = _mxfp4_scale_rounding_bias()
+    scale_rounding_bias = _mxfp4_scale_rounding_bias(scale_rounding_mode)
     fn, grid_x, Kp, Np, padded = get_dual3_cast(
         N,
         K,

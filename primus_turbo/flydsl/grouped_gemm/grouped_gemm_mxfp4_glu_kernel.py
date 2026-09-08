@@ -36,7 +36,11 @@ from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp4_kernel import (
     _run_mxfp4_sched,
     _select_gmxfp4_nt_cfg,
 )
-from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import MB, _next_sr_seed
+from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import (
+    MB,
+    _mxfp4_scale_rounding_bias,
+    _next_sr_seed,
+)
 from primus_turbo.flydsl.utils.gemm_epilogue_helper import (
     _check_activation,
     _check_clamp_limit,
@@ -71,6 +75,7 @@ def _glu_entry(
     epi_col_sr=False,
     activation="silu",
     clamp_limit=None,
+    scale_rounding_bias=1 << 21,
 ):
     """Compiled launch for one fused shape, cached on the static shape + blocking."""
     gm, xcd, gn, span, _nt = cfg
@@ -94,6 +99,7 @@ def _glu_entry(
         epi_col_sr,
         activation,
         clamp_limit,
+        scale_rounding_bias,
     )
     ent = _GMXFP4_GLU_CACHE.get(key)
     if ent is None:
@@ -121,6 +127,7 @@ def _glu_entry(
             epi_col_sr=epi_col_sr,
             activation=activation,
             clamp_limit=clamp_limit,
+            epi_scale_rounding_bias=scale_rounding_bias,
         )
         ent = [launch, None, n_blocks]
         _GMXFP4_GLU_CACHE[key] = ent
@@ -182,6 +189,7 @@ def grouped_gemm_mxfp4_epi_glu_quant_flydsl_kernel(
     clamp_limit: "float | None" = None,
     row_use_sr: bool = False,
     col_use_sr: bool = False,
+    scale_rounding_mode: int = 0,
     out_dtype=torch.bfloat16,
 ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
     """fc1 GLU whose activation is quantised in the epilogue, never reaching bf16.
@@ -238,6 +246,7 @@ def grouped_gemm_mxfp4_epi_glu_quant_flydsl_kernel(
         epi_col_sr=col_use_sr,
         activation=activation,
         clamp_limit=clamp_limit,
+        scale_rounding_bias=_mxfp4_scale_rounding_bias(scale_rounding_mode),
     )
     # The col-wise operand's row stride: one 256-block per tile row, per group.
     col_rows = col_out.shape[1] * 2
@@ -322,6 +331,7 @@ def grouped_gemm_mxfp4_epi_dglu_quant_flydsl_kernel(
     clamp_limit: "float | None" = None,
     row_use_sr: bool = False,
     col_use_sr: bool = False,
+    scale_rounding_mode: int = 0,
     out_dtype=torch.bfloat16,
 ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
     """fc2 dgrad whose ``grad_l1`` is quantised in the epilogue, never reaching bf16.
@@ -392,6 +402,7 @@ def grouped_gemm_mxfp4_epi_dglu_quant_flydsl_kernel(
         epi_col_sr=col_use_sr,
         activation=activation,
         clamp_limit=clamp_limit,
+        scale_rounding_bias=_mxfp4_scale_rounding_bias(scale_rounding_mode),
     )
     # The col-wise operand's row stride: one 256-block per tile row, per group.
     col_rows = col_out.shape[1] * 2
