@@ -277,12 +277,11 @@ def _finish_microblock(vbits, use_rht, seed=None):
 
 
 # ---- fused-dual tile geometry (shared by the 2D and batched-3D kernels) ----
-# Tile rows/cols for the fused dual. _TR drives the COL_OUT write granule
-# (_TR/8 i32 per feature's R-run): at _TR=64 that is 32 bytes, i.e. every byte of
-# the 265 MB colwise weight output leaves in a sub-cacheline burst. _TR must divide
-# both shipped N (5760 and 2880) and _TR*_TC/32 must divide BLK=256.
-# _TC also sets the K tail: ceil(2880/_TC)*_TC.
-_TR = 96  # tile rows (R dim)
+# Tile rows/cols for the fused dual. The 2D eligibility contract admits every
+# R divisible by 128, so its default row tile must divide 128. Batched weight
+# quantization temporarily selects the faster 96/128-row geometry per shape via
+# _pick_tile_geom below, then restores this safe 2D/fallback geometry.
+_TR = 64  # tile rows (R dim); covers every R accepted by dual_eligible
 _TC = 256  # tile cols (C dim)
 _TCW = _TC // 2  # 128 i32 words per tile row
 _NW = _TR * _TCW  # 8192 i32 words in LDS

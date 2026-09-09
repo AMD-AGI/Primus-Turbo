@@ -703,6 +703,56 @@ def test_quantize_mxfp4_with_trans(orig_dtype, dest_dtype, B, M, N, granularity,
     torch.testing.assert_close(colwise_ref, out_colwise, **get_tolerances(dest_dtype))
 
 
+def test_mxfp4_dense_dual_covers_every_eligible_row():
+    """A dense launch must not leave tail rows unwritten for an eligible shape."""
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    if (props.major, props.minor) != (9, 5):
+        pytest.skip("FlyDSL MXFP4 quantization requires gfx950")
+
+    from primus_turbo.flydsl.quantization import mxfp4_quant_kernel as kernel
+
+    torch.manual_seed(42)
+    x = torch.randn((128, 256), device="cuda", dtype=torch.bfloat16)
+    row_recipe = ScalingRecipe()
+    col_recipe = ScalingRecipe(use_rht=True)
+
+    assert kernel.dual_eligible(x.shape[0], x.shape[1], row_recipe, col_recipe)
+    assert x.shape[0] % kernel._TR == 0
+
+    fly = kernel.flydsl_dual_quant(
+        x,
+        turbo.float4_e2m1fn_x2,
+        row_recipe.use_rht,
+        col_recipe.use_rht,
+    )
+    hip = torch.ops.primus_turbo_cpp_extension.quantize_mxfp4_dual(
+        x,
+        turbo.float4_e2m1fn_x2,
+        128,
+        row_recipe.use_2d_block,
+        row_recipe.use_sr,
+        row_recipe.use_rht,
+        col_recipe.use_2d_block,
+        col_recipe.use_sr,
+        col_recipe.use_rht,
+        False,
+        False,
+        False,
+        False,
+    )
+    for actual, expected in zip(fly, hip):
+        torch.testing.assert_close(
+            actual.view(torch.uint8),
+            expected.view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+
+
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "dest_dtype",
