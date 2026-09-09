@@ -203,7 +203,7 @@ def _amax_i32(vf):
     return Vec.from_elements([_amax_f32(vf)], fx.Float32).bitcast(fx.Int32)[0]
 
 
-def _scale_from_amax(amax_bits, log2_extra=0):
+def _scale_from_amax(amax_bits, scale_rounding_bias, log2_extra=0):
     """:func:`_compute_scale_native` with the values' own power of two folded out.
 
     ``log2_extra`` is how many powers of two the amax carries over the values the
@@ -211,14 +211,7 @@ def _scale_from_amax(amax_bits, log2_extra=0):
     e8m0 scale and the converter's divisor move by the same amount, so the fp4
     nibbles are the ones the scaled values would have produced.
     """
-    if log2_extra == 0:
-        return _compute_scale_native(amax_bits)
-    val_to_add = 1 << 21
-    extracted = ((amax_bits + val_to_add) >> 23) & 0x1FF
-    extracted = _imax(extracted - 127 - 2 - log2_extra, -127)
-    extracted = arith.select(extracted < 128, extracted, fx.Int32(128))
-    biased = extracted + 127
-    return (biased + log2_extra) << 23, biased
+    return _compute_scale_native(amax_bits, scale_rounding_bias, exp_up=log2_extra)
 
 
 class MXFP4DualQuantStore:
@@ -251,11 +244,13 @@ class MXFP4DualQuantStore:
         lds_ptr,
         wave_id,
         lane_id,
+        scale_rounding_bias,
         row_sr=False,
         col_sr=False,
         sr_seed=None,
     ):
         self.n_cols = n_cols
+        self.scale_rounding_bias = fx.Int32(scale_rounding_bias)
         self.row_sr = row_sr
         self.col_sr = col_sr
         self.sr_seed = fx.Int32(0) if sr_seed is None else sr_seed
@@ -329,7 +324,7 @@ class MXFP4DualQuantStore:
         ]
         vf = [Vec.from_elements([b], fx.Int32).bitcast(fx.Float32)[0] for b in bits]
         vf = _rht16_unscaled(vf[0:16]) + _rht16_unscaled(vf[16:32])
-        native, biased = _scale_from_amax(_amax_i32(vf), 2)
+        native, biased = _scale_from_amax(_amax_i32(vf), self.scale_rounding_bias, log2_extra=2)
         gcol = base_col + c
         ok = gcol < fx.Int32(self.n_cols)
         mblk = pad_row0 // fx.Int32(MB)
@@ -358,7 +353,7 @@ class MXFP4DualQuantStore:
                 bits.append(v4[j] << 16)
                 bits.append(v4[j] & 0xFFFF0000)
         vf = [Vec.from_elements([b], fx.Int32).bitcast(fx.Float32)[0] for b in bits]
-        native, biased = _compute_scale_native(_amax_i32(vf))
+        native, biased = _compute_scale_native(_amax_i32(vf), self.scale_rounding_bias)
         grow = grow0 + r
         gcol = base_col + mb * fx.Int32(MB)
         gblk = gcol // fx.Int32(MB)
@@ -435,6 +430,7 @@ class MXFP4DualQuantStoreDglu:
         row_stride,
         lane_id,
         wave_n,
+        scale_rounding_bias,
         row_sr=False,
         col_sr=False,
         sr_seed=None,
@@ -444,6 +440,7 @@ class MXFP4DualQuantStoreDglu:
             f"dact band it overwrites ({DGLU_BAND_ROWS * row_stride} words)"
         )
         self.glu_i = glu_i
+        self.scale_rounding_bias = fx.Int32(scale_rounding_bias)
         self.n_cols = 2 * glu_i
         self.row_sr = row_sr
         self.col_sr = col_sr
@@ -506,7 +503,7 @@ class MXFP4DualQuantStoreDglu:
         output words are one per lane.
         """
         amax = _quad_max_i32(_amax_i32(vals8))
-        native, biased = _compute_scale_native(amax)
+        native, biased = _compute_scale_native(amax, self.scale_rounding_bias)
         gblk = gcol // fx.Int32(MB)
         # The same micro-block id the standalone quantiser seeds from: its linear
         # index into the row-wise scale tensor.
@@ -597,7 +594,7 @@ class MXFP4DualQuantStoreDglu:
         ok = (base_col + local) < fx.Int32(self.glu_i)
         mblk = pad_row0 // fx.Int32(MB)
         vf = first[0] + second[0]
-        native, biased = _scale_from_amax(_imax(first[1], second[1]), 2)
+        native, biased = _scale_from_amax(_imax(first[1], second[1]), self.scale_rounding_bias, log2_extra=2)
         gcol = base_col + local + fx.Int32(st * self.glu_i)
         sc_off = gcol * fx.Int32(self.col_sc_w) + mblk
         seed = _sr_hash((self.sr_seed ^ _SR_COL_SALT) ^ sc_off) if self.col_sr else None

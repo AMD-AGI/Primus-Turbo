@@ -277,6 +277,7 @@ def _build_grouped_mxfp4_nt_kernel(
     epi_col_sr=False,
     activation="silu",  # the GLU gate; see SUPPORTED_ACTIVATIONS
     clamp_limit=None,  # clamp bound; see _glu_clamp
+    epi_scale_rounding_bias=1 << 21,
 ):
     """Grouped MXFP4 NT (out = a @ b^T), per-group A rows + per-expert B, whole-loop compute.
     K is the 256-rounded scale extent; ``k_real`` (<=K, 128-multiple) is the operands' true
@@ -631,6 +632,7 @@ def _build_grouped_mxfp4_nt_kernel(
                     fx.recast_iter(fx.Int32, lds.BL_e.ptr),
                     wave_id,
                     lane_id,
+                    epi_scale_rounding_bias,
                     row_sr=epi_row_sr,
                     col_sr=epi_col_sr,
                     sr_seed=SR_SEED,
@@ -687,6 +689,7 @@ def _build_grouped_mxfp4_nt_kernel(
                     _row_stride,
                     lane_id,
                     wave_n,
+                    epi_scale_rounding_bias,
                     row_sr=epi_row_sr,
                     col_sr=epi_col_sr,
                     sr_seed=SR_SEED,
@@ -1009,6 +1012,7 @@ def _compile_grouped_mxfp4_nt_glu(
     epi_col_sr=False,
     activation="silu",
     clamp_limit=None,
+    epi_scale_rounding_bias=1 << 21,
 ):
     """The NT compile of :func:`_compile_grouped_mxfp4_nt_fused` with a fused GLU epilogue.
 
@@ -1047,6 +1051,7 @@ def _compile_grouped_mxfp4_nt_glu(
         epi_col_sr=epi_col_sr,
         activation=activation,
         clamp_limit=clamp_limit,
+        epi_scale_rounding_bias=epi_scale_rounding_bias,
     )
     ab_pre_shuf = _build_grouped_mxfp4_ab_preshuffle(
         K128, G, N_b, k128_rd, b_ilv=b_ilv, glu_i=glu_i if glu else 0
@@ -1222,7 +1227,19 @@ def _compile_grouped_mxfp4_nt_glu(
                 gp_stride,
                 value_attrs=attrs,
             ).launch(grid=(grid_upper, 1, 1), block=(256, 1, 1), stream=stream)
-            quant_launch(ACT_Q, ROW_OUT, ROW_SC, COL_OUT, COL_SC, GO, LC, OC, SR_SEED, stream)
+            quant_launch(
+                ACT_Q,
+                ROW_OUT,
+                ROW_SC,
+                COL_OUT,
+                COL_SC,
+                GO,
+                LC,
+                OC,
+                SR_SEED,
+                fx.Int32(epi_scale_rounding_bias),
+                stream,
+            )
 
     elif glu_quant_row:
 

@@ -127,6 +127,21 @@ constexpr int   FP8E4M3_FNUZ_TARGET_MAX_POW2 = 7;
 
 constexpr int E8M0_EXPONENT_BIAS = 127;
 
+inline int mxfp4_scale_rounding_bias(const int64_t mode) {
+    constexpr int shift = FP32_MANTISSA_BITS - FP4_MANTISSA_BITS;
+    switch (mode) {
+    case 0:
+        return 1 << (shift - 1);
+    case 1:
+        return 1 << shift;
+    case 2:
+        return 3 << (shift - 3);
+    default:
+        PRIMUS_TURBO_CHECK(false, "scale_rounding_mode must be 0, 1, or 2");
+        return 1 << (shift - 1);
+    }
+}
+
 } // namespace detail
 
 template <typename DType>
@@ -137,13 +152,14 @@ void quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_
                               int rowwise_scale_N, int rowwise_scale_M_pad, int rowwise_scale_N_pad,
                               int colwise_scale_M, int colwise_scale_N, int colwise_scale_M_pad,
                               int colwise_scale_N_pad, detail::ScalingRecipe rowwise_recipe,
-                              detail::ScalingRecipe colwise_recipe, hipStream_t stream);
+                              detail::ScalingRecipe colwise_recipe, int scale_rounding_mode,
+                              hipStream_t stream);
 
 template <typename DType>
 void quantize_mxfp4_impl(const DType *input, dtype::float4x2_e2m1 *output, uint8_t *scale,
                          detail::QuantizeMode mode, int G, int M, int N, int M_pad, int N_pad,
                          int scale_stride, int scale_N, int scale_M_pad, int scale_N_pad,
-                         detail::ScalingRecipe recipe, hipStream_t stream);
+                         detail::ScalingRecipe recipe, int scale_rounding_mode, hipStream_t stream);
 
 template <typename IType, typename OType>
 void quantize_mxfp8_dual_impl(const IType *input, OType *rowwise_output, uint8_t *rowwise_scale,
@@ -186,7 +202,8 @@ void grouped_quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *
                                       int N, int M_pad_col, int N_pad, int rowwise_scale_stride,
                                       int colwise_scale_stride, int rowwise_scale_N,
                                       int colwise_scale_N, detail::ScalingRecipe rowwise_recipe,
-                                      detail::ScalingRecipe colwise_recipe, hipStream_t stream);
+                                      detail::ScalingRecipe colwise_recipe, int scale_rounding_mode,
+                                      hipStream_t stream);
 
 // Single-direction (rowwise OR colwise) grouped MXFP4 quant.
 template <typename DType>
@@ -195,7 +212,8 @@ void grouped_quantize_mxfp4_impl(const DType *input, dtype::float4x2_e2m1 *outpu
                                  const int64_t       *group_offs_padded_colwise,
                                  detail::QuantizeMode mode, int G, int total_M, int N,
                                  int M_pad_col, int N_pad, int scale_stride, int scale_N,
-                                 detail::ScalingRecipe recipe, hipStream_t stream);
+                                 detail::ScalingRecipe recipe, int scale_rounding_mode,
+                                 hipStream_t stream);
 
 // *************** Grouped Padded Layout ***************
 //
