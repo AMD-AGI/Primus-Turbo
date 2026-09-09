@@ -13,6 +13,13 @@ from torch._library.opaque_object import register_opaque_type
 
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
 
+try:
+    # torch >= 2.11 requires an opaque type to carry this metaclass; older torch has
+    # neither the module nor the requirement, where `type` changes nothing.
+    from torch._opaque_base import OpaqueBaseMeta as _OpaqueMeta
+except ImportError:  # pragma: no cover - depends on the installed torch
+    _OpaqueMeta = type
+
 __all__ = ["float8_e4m3", "float8_e5m2"]
 
 
@@ -143,7 +150,7 @@ class ScalingStrategy(Enum):
     # DELAYED_SCALING = auto() # TODO: undetermined
 
 
-class ScalingRecipe(NamedTuple):
+class _ScalingRecipeFields(NamedTuple):
     """
     Supported MXFP8/MXFP4 scaling recipe.
 
@@ -161,6 +168,14 @@ class ScalingRecipe(NamedTuple):
     # Memory Layout Shuffle
     shuffle_scale: bool = False
     shuffle_out: bool = False
+
+
+class ScalingRecipe(_ScalingRecipeFields, metaclass=_OpaqueMeta):
+    """See :class:`_ScalingRecipeFields` for the fields.
+
+    Split so the metaclass can be attached: ``class X(NamedTuple, metaclass=...)``
+    is a metaclass conflict at class creation.
+    """
 
     def __fx_repr__(self) -> Tuple[str, dict]:
         return _quant_config_fx_repr(self)
@@ -187,7 +202,7 @@ def _quant_config_fx_repr(config) -> Tuple[str, dict]:
 
 
 @dataclass(unsafe_hash=True)  # hashable so it can be an opaque custom-op argument
-class Float8QuantConfig:
+class Float8QuantConfig(metaclass=_OpaqueMeta):
     format: Format = Format.E4M3
     granularity: ScalingGranularity = ScalingGranularity.TENSORWISE
     strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
@@ -230,7 +245,7 @@ class Float8QuantConfig:
 
 
 @dataclass(unsafe_hash=True)  # hashable so it can be an opaque custom-op argument
-class Float4QuantConfig:
+class Float4QuantConfig(metaclass=_OpaqueMeta):
     format: Format = Format.E2M1_X2
     granularity: ScalingGranularity = ScalingGranularity.MX_BLOCKWISE
     strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
