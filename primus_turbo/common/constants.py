@@ -51,6 +51,9 @@ ENV_SPARSE_ATTN_BACKEND = "PRIMUS_TURBO_SPARSE_ATTN_BACKEND"
 # (e.g. "<OP>_BACKEND=HIPBLASLT") still takes precedence over it.
 # Default: "0" (disabled)
 ENV_AUTO_TUNE = "PRIMUS_TURBO_AUTO_TUNE"
+# Make a pinned backend a preference rather than a requirement (see
+# BackendChoice.allow_fallback).
+ENV_BACKEND_ALLOW_FALLBACK = "PRIMUS_TURBO_BACKEND_ALLOW_FALLBACK"
 
 # Whether Attention V3 uses FP32 atomic accumulation ("1" to enable, "0" to disable).
 # Default: "1" (enabled)

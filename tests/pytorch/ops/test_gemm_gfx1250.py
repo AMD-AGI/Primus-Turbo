@@ -352,3 +352,144 @@ def test_gemm_impl_through_the_flydsl_backend():
         out = impl.execute(**kw)
         assert out.shape == ref.shape, f"{name}: {tuple(out.shape)} vs {tuple(ref.shape)}"
         assert snr_db(ref, out) > MIN_SNR_DB, name
+
+
+# --- fp8 in every layout, and tile selection -------------------------------
+
+
+@pytest.mark.parametrize("layout", ["nt", "nn", "tn"])
+@pytest.mark.parametrize("shape", [(256, 256, 512), (512, 512, 1024), (255, 128, 512)])
+def test_fp8_layouts(layout, shape):
+    """fp8 NN/TN go through ds_load_tr8_b64, whose lane mapping is the awkward
+    two-block variant: 16 lanes transpose a 16(k)x8(x) block and the supplying
+    lanes interleave, so the K each lane offers has to be permuted to undo it.
+    Getting that wrong is silently wrong, not a crash."""
+    m, n, k = shape
+    sa, sb = LAYOUT_SHAPES[layout](m, n, k)
+    a = (torch.randn(*sa, device="cuda") / 3).to(E4M3)
+    b = (torch.randn(*sb, device="cuda") / 3).to(E4M3)
+    out = gemm_gfx1250(a, b, layout=layout)
+    assert out.shape == (m, n)
+    assert snr_db(_layout_ref(layout, a, b), out) > MIN_SNR_DB
+
+
+def test_lds_bytes_matches_the_kernel():
+    """The kernel asserts its own arena equals lds_bytes(); this checks the
+    function the autotuner filters with is the one being asserted against."""
+    for kind in ("bf16", "fp8"):
+        for layout in (gemm_mod.LAYOUT_NT, gemm_mod.LAYOUT_NN, gemm_mod.LAYOUT_TN):
+            n = gemm_mod.lds_bytes(kind, layout, 128, 128, 128, 2)
+            assert 0 < n <= gemm_mod.LDS_LIMIT * 4  # sane, not necessarily fitting
+
+
+@pytest.mark.parametrize("layout", ["nt", "nn", "tn"])
+def test_feasible_configs_all_compile(layout):
+    """Everything the analytic filter admits must actually build and be right.
+
+    The filter is what keeps tuning affordable -- it cuts thousands of configs
+    to a few dozen without compiling -- so a false positive there turns into a
+    crash mid-tune.
+    """
+    m, n, k = 256, 256, 1024
+    sa, sb = LAYOUT_SHAPES[layout](m, n, k)
+    a = (torch.randn(*sa, device="cuda") / 3).to(E4M3)
+    b = (torch.randn(*sb, device="cuda") / 3).to(E4M3)
+    ref = _layout_ref(layout, a, b)
+    cands = gemm_mod.feasible_configs("fp8", layout, m, n, k)
+    assert cands, f"no feasible config for {layout}"
+    for tile, mw, nw, nb in cands[:6]:
+        out = gemm_gfx1250(a, b, layout=layout, tile=tile, m_warp=mw, n_warp=nw, num_buffers=nb)
+        assert snr_db(ref, out) > MIN_SNR_DB, f"{tile} w{mw}x{nw} nb{nb}"
+
+
+def test_autotune_is_never_worse_than_the_default():
+    """Tuning has to beat the hand-picked config, which is only a guess.
+
+    It did not, at first: ranking candidates by operand reuse and measuring
+    only the head picked *worse* than the default in half the cases, because
+    the wave-heavy configs that actually win score lowest on that metric.
+    """
+    m, n, k = 512, 512, 1024
+    for layout in ("nn", "tn"):
+        sa, sb = LAYOUT_SHAPES[layout](m, n, k)
+        a = (torch.randn(*sa, device="cuda") / 3).to(E4M3)
+        b = (torch.randn(*sb, device="cuda") / 3).to(E4M3)
+        tile, mw, nw, nb = gemm_mod.autotune(a, b, layout=layout)
+        out = gemm_gfx1250(a, b, layout=layout, tile=tile, m_warp=mw, n_warp=nw, num_buffers=nb)
+        assert snr_db(_layout_ref(layout, a, b), out) > MIN_SNR_DB
+        # and the answer is cached, not re-measured
+        assert gemm_mod.autotune(a, b, layout=layout) == (tile, mw, nw, nb)
+
+
+# --- beta=1 accumulation, and pinned-backend fallback ----------------------
+
+
+@pytest.mark.parametrize("layout", ["nt", "nn", "tn"])
+@pytest.mark.parametrize("dtype", ["bf16", "fp8"])
+def test_accumulate(layout, dtype):
+    """out += A @ B, which is what a fused gradient accumulation needs.
+
+    Without it the wgrad of a Megatron-style step is declined, and a pinned
+    backend declining is a hard error rather than a slowdown.
+    """
+    m, n, k = 512, 256, 1024
+    sa, sb = LAYOUT_SHAPES[layout](m, n, k)
+    if dtype == "bf16":
+        a = torch.randn(*sa, device="cuda", dtype=torch.bfloat16)
+        b = torch.randn(*sb, device="cuda", dtype=torch.bfloat16)
+    else:
+        a = (torch.randn(*sa, device="cuda") / 3).to(E4M3)
+        b = (torch.randn(*sb, device="cuda") / 3).to(E4M3)
+    base = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
+    acc = base.clone()
+    gemm_gfx1250(a, b, acc, layout=layout, accumulate=True)
+    # The addend is bf16, so this rounds once more than the overwrite path.
+    assert snr_db(base.float() + _layout_ref(layout, a, b), acc) > 45.0
+
+
+def test_accumulate_needs_an_out_tensor():
+    a = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="needs an out tensor"):
+        gemm_gfx1250(a, b, accumulate=True)
+
+
+def test_pinned_backend_is_strict_by_default_and_can_fall_back():
+    """Pinning stays a requirement unless fallback is asked for.
+
+    Silently running a different backend hides the thing pinning is meant to
+    diagnose, so the default has to keep raising; a production run wants the
+    opposite, where one unsupported shape costs throughput rather than the job.
+    """
+    import os
+
+    from primus_turbo.pytorch.core.backend import (
+        BackendChoice,
+        BackendType,
+    )
+    from primus_turbo.pytorch.kernels.gemm.gemm_impl import GEMMKernelDispatcher
+
+    m, n, k = 512, 256, 1024
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    # fp32 output is something the FlyDSL kernel does not do.
+    kw = dict(a=a, trans_a=False, b=b, trans_b=True, out_dtype=torch.float32, trans_c=False)
+    default = BackendChoice(backend=BackendType.HIPBLASLT)
+
+    with pytest.raises(ValueError, match="cannot handle"):
+        GEMMKernelDispatcher.dispatch(default, BackendChoice(backend=BackendType.FLYDSL), **kw)
+
+    out = GEMMKernelDispatcher.dispatch(
+        default, BackendChoice(backend=BackendType.FLYDSL, allow_fallback=True), **kw
+    )
+    assert out.dtype == torch.float32
+
+    os.environ["PRIMUS_TURBO_BACKEND_ALLOW_FALLBACK"] = "1"
+    try:
+        out = GEMMKernelDispatcher.dispatch(default, BackendChoice(backend=BackendType.FLYDSL), **kw)
+        assert out.dtype == torch.float32
+    finally:
+        del os.environ["PRIMUS_TURBO_BACKEND_ALLOW_FALLBACK"]
+
+    with pytest.raises(ValueError, match="cannot handle"):
+        GEMMKernelDispatcher.dispatch(default, BackendChoice(backend=BackendType.FLYDSL), **kw)

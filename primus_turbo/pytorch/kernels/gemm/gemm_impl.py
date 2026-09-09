@@ -155,8 +155,7 @@ class GEMMFlyDSLBackend(KernelBackend):
     ) -> bool:
         if not is_gfx1250():
             return False
-        # No beta=1 epilogue, so an accumulating output has to go elsewhere.
-        if inplace_add_to_out:
+        if inplace_add_to_out and (out is None or not out.is_contiguous()):
             return False
         call = _flydsl_call(a, trans_a, b, trans_b, trans_c)
         if call is None:
@@ -183,7 +182,14 @@ class GEMMFlyDSLBackend(KernelBackend):
     ) -> torch.Tensor:
         ka, kb, layout = _flydsl_call(a, trans_a, b, trans_b, trans_c)
         _, gemm_gfx1250 = _flydsl_gemm()
-        return gemm_gfx1250(ka, kb, out, layout=layout, out_dtype=out_dtype)
+        return gemm_gfx1250(
+            ka,
+            kb,
+            out,
+            layout=layout,
+            out_dtype=out_dtype,
+            accumulate=inplace_add_to_out,
+        )
 
 
 _GEMM_BACKENDS = {

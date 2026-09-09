@@ -60,7 +60,9 @@ from flydsl.expr.typing import T as _T
 
 __all__ = [
     "WAVE",
+    "autotune",
     "can_run",
+    "feasible_configs",
     "gemm_gfx1250",
     "launch_gemm_gfx1250",
     "supported_dtypes",
@@ -170,6 +172,7 @@ def launch_gemm_gfx1250(
     out_is_f16: Constexpr[int],
     group_m: Constexpr[int] = 8,
     layout: Constexpr[int] = LAYOUT_NT,
+    accumulate: Constexpr[int] = 0,
 ):
     """NT GEMM: ``C[M, N] = A[M, K] @ B[N, K]^T`` on gfx1250.
 
@@ -212,10 +215,6 @@ def launch_gemm_gfx1250(
     # that path stays byte-identical across all three layouts.
     a_tr = layout == LAYOUT_TN
     b_tr = layout in (LAYOUT_NN, LAYOUT_TN)
-    assert not (a_tr or b_tr) or is_16bit, (
-        "the LDS transpose is wired up for 16-bit operands only so far; "
-        "8-bit NN/TN still needs the ds_load_tr8_b64 path"
-    )
     TR_A_ROW = tile_m + LDS_PAD  # scratch row = the contiguous (M or N) extent
     TR_B_ROW = tile_n + LDS_PAD
     SCRATCH_A = tile_k * TR_A_ROW * elem_bytes if a_tr else 0
@@ -228,8 +227,13 @@ def launch_gemm_gfx1250(
     SCRATCH_B_OFF = SCRATCH_A_OFF + SCRATCH_A
     PITCH = SCRATCH_B_OFF + SCRATCH_B
     # The epilogue restages C through the same arena, so it has to fit both.
-    ARENA = max(num_buffers * PITCH, tile_m * (tile_n + 8) * 2)
-    assert ARENA <= 160 * 1024, f"LDS arena {ARENA} B exceeds the 160 KiB gfx1250 budget"
+    C_BYTES = tile_m * (tile_n + 8) * 2
+    # beta=1 stages the existing C beside the new one and adds them in LDS.
+    ARENA = max(num_buffers * PITCH, C_BYTES * (2 if accumulate else 1))
+    assert ARENA == lds_bytes(kind, layout, tile_m, tile_n, tile_k, num_buffers, accumulate), (
+        "lds_bytes() drifted from the arena this kernel actually lays out"
+    )
+    assert ARENA <= LDS_LIMIT, f"LDS arena {ARENA} B exceeds the {LDS_LIMIT} B gfx1250 budget"
 
     n_ops = 4 if is_mx else 2  # TDM ops issued per stage
 
@@ -421,39 +425,69 @@ def launch_gemm_gfx1250(
         # j = 0..7, the element at offset L%8 from the address lane j supplied.
         # So pointing lane L at `&src[k0 + L%8][x0]` hands it the eight
         # consecutive K values of column `x0 + L%8`, one contiguous store.
-        def transpose_stage(src_view, src_row, dst_view, dst_row, n_x):
-            grp = tid // 8
-            r = tid % 8
-            n_groups = block // 8
-            blocks_x = n_x // 8
-            n_blocks = (tile_k // 8) * blocks_x
-            assert n_blocks % n_groups == 0, (
-                f"transpose: {n_blocks} 8x8 blocks do not divide over {n_groups} lane groups"
-            )
-            # ds_load_tr16_b128 takes a raw LDS pointer, not an fx one, and
-            # the type has to be built with a live MLIR context (so: in here).
+        def transpose_stage(src_view, src_row, dst_view, dst_row, n_x, elem_cls):
+            """Move a [tile_k, n_x] scratch tile into a [n_x, tile_k] compute tile.
+
+            Both transpose reads hand a lane one column of the source as a run
+            of consecutive K, which stores out as a single contiguous write.
+            The two differ in how much they move and in how the supplying lanes
+            are grouped, and both mappings were measured rather than inferred:
+
+            16-bit, `ds_load_tr16_b128`: 8 lanes transpose an 8x8 block. Lane L
+            receives, for j = 0..7, the element at offset L%8 from the address
+            lane j supplied, so pointing lane L at &src[k0 + L%8][x0] hands it
+            the eight K values of column x0 + L%8.
+
+            8-bit, `ds_load_tr8_b64`: 16 lanes transpose a 16(k) x 8(x) block,
+            and the supplying lane for output j of lane L is
+            blk*16 + (j<4 ? 0 : 8) + ((L//8)%2)*4 + j%4 -- an interleave, not a
+            straight run. Permuting the K each lane supplies by
+            [0,1,2,3, 8,9,10,11, 4,5,6,7, 12,13,14,15] undoes it, leaving each
+            lane with eight consecutive K again.
+            """
             lds_ptr_ty = _ir.Type.parse("!llvm.ptr<3>")
             src_b = fx.Int32(fx.ptrtoint(fx.get_iter(src_view)))
             dst_i8 = fx.recast_iter(
                 fx.PointerType.get(fx.Int8.ir_type, fx.get_iter(dst_view).address_space, 1),
                 fx.get_iter(dst_view),
             )
+            blocks_x = n_x // 8
+            k_per_block = 8 if is_16bit else 16
+            lanes_per_group = 8 if is_16bit else 16
+            n_groups = block // lanes_per_group
+            n_blocks = (tile_k // k_per_block) * blocks_x
+            assert n_blocks % n_groups == 0, (
+                f"transpose: {n_blocks} blocks do not divide over {n_groups} lane groups"
+            )
+            grp = tid // lanes_per_group
+            i = tid % lanes_per_group
+            r = i % 8
+            if const_expr(is_16bit):
+                k_supply, k_store = r, 0
+            else:
+                q = i // 4
+                k_supply = i + 4 * ((q & 1) - (q >> 1))
+                k_store = (i // 8) * 8
             for b in range_constexpr(n_blocks // n_groups):
                 idx = grp + b * n_groups
-                k0 = (idx // blocks_x) * 8
+                k0 = (idx // blocks_x) * k_per_block
                 x0 = (idx % blocks_x) * 8
-                addr = src_b + ((k0 + r) * src_row + x0) * elem_bytes
-                v = rocdl.ds_load_tr16_b128(_T.vec(8, a_cls.ir_type), _llvm.inttoptr(lds_ptr_ty, _raw(addr)))
+                addr = src_b + ((k0 + k_supply) * src_row + x0) * elem_bytes
+                ptr = _llvm.inttoptr(lds_ptr_ty, _raw(addr))
+                if const_expr(is_16bit):
+                    v = rocdl.ds_load_tr16_b128(_T.vec(8, elem_cls.ir_type), ptr)
+                else:
+                    v = rocdl.ds_load_tr8_b64(_T.vec(2, _T.i32), ptr)
                 fx.ptr_store(
                     fx.Vector(v).bitcast(fx.Int8),
-                    dst_i8 + ((x0 + r) * dst_row + k0) * elem_bytes,
+                    dst_i8 + ((x0 + r) * dst_row + k0 + k_store) * elem_bytes,
                 )
 
         def transpose_if_needed(s):
             if const_expr(a_tr):
-                transpose_stage(scratchA_of(s), TR_A_ROW, sA_of(s), A_ROW, tile_m)
+                transpose_stage(scratchA_of(s), TR_A_ROW, sA_of(s), A_ROW, tile_m, a_cls)
             if const_expr(b_tr):
-                transpose_stage(scratchB_of(s), TR_B_ROW, sB_of(s), B_ROW, tile_n)
+                transpose_stage(scratchB_of(s), TR_B_ROW, sB_of(s), B_ROW, tile_n, b_cls)
             if const_expr(a_tr or b_tr):
                 fx.barrier()
 
@@ -640,10 +674,7 @@ def launch_gemm_gfx1250(
                     for ni in range_constexpr(n_reps):
                         col = wnb + ni * WMMA_N + kgrp * (WMMA_N // 2)
                         h = c_frags[mi * n_reps + ni].load().to(out_cls)
-                        fx.ptr_store(
-                            h.bitcast(fx.Int8),
-                            base_ptr + (row * C_ROW + col) * 2,
-                        )
+                        fx.ptr_store(h.bitcast(fx.Int8), base_ptr + (row * C_ROW + col) * 2)
 
         # ---- K pipeline -------------------------------------------------
         # `num_buffers - 1` tiles stay in flight; a stage is consumed once the
@@ -658,6 +689,12 @@ def launch_gemm_gfx1250(
             # stage that the `issue` below is about to overwrite (the one
             # consumed last iteration). The fetch is started *before* the MMA so
             # the TDM transfer overlaps the math rather than following it.
+            #
+            # The transpose is *not* worth running a stage ahead of the MMA.
+            # That was tried: it needs a third buffer, which most tiles cannot
+            # fit, and where it did fit it measured 1.02x / 0.97x. The transpose
+            # is bound by LDS bandwidth, not by sitting in step with the MMA, so
+            # reordering buys nothing -- only moving less data would.
             tdm_ops.tensor_wait((num_buffers - 2) * n_ops)
             fx.barrier()
             nxt = kt + (num_buffers - 1)
@@ -674,9 +711,6 @@ def launch_gemm_gfx1250(
         # ---- epilogue: registers -> LDS -> global (TDM, OOB-clamped) ----
         fx.barrier()
         sC = _view(base_ptr, out_cls, (tile_m, C_ROW), (C_ROW, 1))
-        epilogue(sC)
-        fx.barrier()
-
         gtC = _gview(
             gC_base,
             fx.Int64(blk_m) * ldc64 + fx.Int64(blk_n),
@@ -689,6 +723,32 @@ def launch_gemm_gfx1250(
         # accumulates zeros there and the store just drops them.
         n_store = (n_oob < tile_n).select(n_oob, fx.Int32(tile_n))
         atomC = fx.rocdl.make_tdm_atom(gtC, [m_oob, n_store], strides=[ldc64, None], num_warps=num_waves)
+        if const_expr(accumulate):
+            # beta=1. Add in the LDS domain rather than in registers: the tile
+            # lands beside the new one and the two are summed as a flat byte
+            # range, so this needs no knowledge of the C fragment layout and is
+            # the same code for 16- and 8-bit. Doing it in registers meant
+            # reading sC back through the tiled copy, whose reverse direction
+            # does not partition the way the store does.
+            sC_prev = _view(fx.add_offset(base_ptr, C_BYTES), out_cls, (tile_m, C_ROW), (C_ROW, 1))
+            fx.copy(atomC, gtC, sC_prev)
+            tdm_ops.tensor_wait(0)
+        epilogue(sC)
+        fx.barrier()
+        if const_expr(accumulate):
+            ld128 = _make_lds_load(128)
+            n_chunk = C_BYTES // 16
+            assert n_chunk % block == 0, f"C tile {n_chunk} chunks do not divide over {block} threads"
+            cb = fx.Int32(fx.ptrtoint(base_ptr))
+            pb = cb + C_BYTES
+            for c in range_constexpr(n_chunk // block):
+                off = (tid + c * block) * 16
+                cur = fx.Vector(ld128(cb, off)).bitcast(out_cls)
+                prv = fx.Vector(ld128(pb, off)).bitcast(out_cls)
+                fx.ptr_store(
+                    (cur.to(fx.Float32) + prv.to(fx.Float32)).to(out_cls).bitcast(fx.Int8), base_ptr + off
+                )
+            fx.barrier()
         fx.copy(atomC, sC, gtC)
         tdm_ops.tensor_wait(0)
 
@@ -747,10 +807,39 @@ def _atom_k(kind: str) -> int:
     return 64 if elem_bytes == 1 else 32
 
 
+LDS_LIMIT = 160 * 1024  # per CU on gfx1250
+
+
+def lds_bytes(kind, layout_id, tile_m, tile_n, tile_k, num_buffers, accumulate=False):
+    """LDS the kernel will ask for. The launch asserts against this too, so a
+    caller pre-filtering configs cannot disagree with what actually compiles."""
+    elem_bytes, is_mx = _KINDS[kind][2], _KINDS[kind][4]
+    pad = 16 // elem_bytes
+    stage = (tile_m + tile_n) * (tile_k + pad) * elem_bytes
+    if is_mx:
+        stage += (tile_m + tile_n) * (tile_k // MX_BLOCK)
+    if layout_id == LAYOUT_TN:  # A staged twice
+        stage += tile_k * (tile_m + pad) * elem_bytes
+    if layout_id in (LAYOUT_NN, LAYOUT_TN):  # B staged twice
+        stage += tile_k * (tile_n + pad) * elem_bytes
+    # The epilogue restages C through the same arena, twice over for beta=1.
+    c_bytes = tile_m * (tile_n + 8) * 2
+    return max(num_buffers * stage, c_bytes * (2 if accumulate else 1))
+
+
+def acc_vgprs(tile_m, tile_n, m_warp, n_warp):
+    """Accumulator registers per lane. 512 is the file; the operand fragments
+    have to fit alongside."""
+    return (tile_m // m_warp // WMMA_N_ATOM) * (tile_n // n_warp // WMMA_N_ATOM) * 8
+
+
 # NN and TN stage the K-major operand twice (natural tile plus its transpose),
 # so they need a smaller tile to stay inside the 160 KiB LDS budget: at
 # 128x128x64 with two buffers, NN takes 106 KiB and TN 140 KiB.
-_TRANSPOSED_CFG = ((128, 128, 64), 2, 2, 2, 8)
+_TRANSPOSED_CFG = {
+    2: ((128, 128, 64), 2, 2, 2, 8),  # 16-bit: NN 106 KiB, TN 140 KiB
+    1: ((128, 128, 128), 2, 2, 2, 8),  # 8-bit: same LDS at twice the K
+}
 
 
 def default_config(kind: str, M: int, N: int, K: int | None = None, layout: int = LAYOUT_NT):
@@ -761,7 +850,7 @@ def default_config(kind: str, M: int, N: int, K: int | None = None, layout: int 
     ``tile_n`` shrinks so a narrow output does not pay for a wide tile.
     """
     if layout != LAYOUT_NT:
-        (tile_m, tile_n, tile_k), m_warp, n_warp, nb, gm = _TRANSPOSED_CFG
+        (tile_m, tile_n, tile_k), m_warp, n_warp, nb, gm = _TRANSPOSED_CFG[_KINDS[kind][2]]
     else:
         family = "16bit" if _KINDS[kind][2] == 2 else "8bit"
         bucket = "small" if M * N < _SMALL_TILES else "large"
@@ -787,6 +876,136 @@ _COMPILED: dict = {}
 
 def _ptr(t: torch.Tensor):
     return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
+
+
+# Tile candidates worth trying. Kept deliberately small: the expensive part of
+# tuning is the ~5-10 s FlyDSL compile per config, so the analytic filter below
+# has to do the elimination, not the benchmark.
+_TILE_MN = (128, 256)
+_WARPS = ((2, 2), (4, 2), (2, 4), (4, 4))
+_BUFFERS = (2, 3)
+
+
+def feasible_configs(kind, layout, M, N, K):
+    """Every launch config that will compile for this problem, best first.
+
+    Nothing here touches the GPU. It mirrors the kernel's own constraints --
+    LDS budget, accumulator registers, the WMMA K granularity, and the block
+    sizes the LDS transpose needs -- so the survivors all build.
+
+    Ordered by operand reuse (MMAs per fragment load) purely so the list is
+    deterministic. Do not read it as a ranking: measured, the winners were
+    often the wave-heavy configs this metric puts last -- TN's best was w4x4,
+    which reuse scores lowest of all. Benchmark the whole list.
+    """
+    layout_id = _LAYOUTS[layout] if isinstance(layout, str) else layout
+    elem_bytes = _KINDS[kind][2]
+    atom_k = _atom_k(kind)
+    a_tr = layout_id == LAYOUT_TN
+    b_tr = layout_id in (LAYOUT_NN, LAYOUT_TN)
+    # The LDS transpose moves 8x8 blocks of 16-bit or 16(k)x8(x) of 8-bit, one
+    # per lane group, and every group has to get the same number of them.
+    k_block, lanes_per_group = (8, 8) if elem_bytes == 2 else (16, 16)
+
+    out = []
+    for tile_m in _TILE_MN:
+        for tile_n in _TILE_MN:
+            if N % tile_n and tile_n > 128:
+                continue  # a ragged N tile is fine, a mostly-empty one is not
+            for tile_k in (atom_k, atom_k * 2, atom_k * 4):
+                if K % tile_k:
+                    continue
+                for m_warp, n_warp in _WARPS:
+                    waves = m_warp * n_warp
+                    if tile_m % (m_warp * WMMA_N_ATOM) or tile_n % (n_warp * WMMA_N_ATOM):
+                        continue
+                    if tile_m % waves or tile_n % waves:
+                        continue
+                    if acc_vgprs(tile_m, tile_n, m_warp, n_warp) > 512:
+                        continue
+                    bad = False
+                    for tr, extent in ((a_tr, tile_m), (b_tr, tile_n)):
+                        if not tr:
+                            continue
+                        if extent % 8 or tile_k % k_block:
+                            bad = True
+                        elif ((tile_k // k_block) * (extent // 8)) % ((waves * WAVE) // lanes_per_group):
+                            bad = True
+                    if bad:
+                        continue
+                    for nb in _BUFFERS:
+                        if K // tile_k < nb:
+                            continue
+                        if lds_bytes(kind, layout_id, tile_m, tile_n, tile_k, nb) > LDS_LIMIT:
+                            continue
+                        mr = tile_m // m_warp // WMMA_N_ATOM
+                        nr = tile_n // n_warp // WMMA_N_ATOM
+                        reuse = mr * nr / (mr + nr)
+                        out.append(((tile_m, tile_n, tile_k), m_warp, n_warp, nb, reuse))
+    out.sort(key=lambda c: -c[4])
+    return [c[:4] for c in out]
+
+
+# Tuned configs, keyed on (kind, layout, N, K). M is left out: it is the token
+# count, varies per step, and moves throughput far less than N and K do.
+_TUNED: dict = {}
+
+
+def autotune(a, b, *, layout="nt", out_dtype=torch.bfloat16, limit=None, iters=12, **kw):
+    """Benchmark the feasible configs for this problem and remember the winner.
+
+    Returns ``((tile_m, tile_n, tile_k), m_warp, n_warp, num_buffers)``.
+
+    Every feasible config is measured by default. That is 24-56 of them, which
+    the analytic filter has already cut down from thousands, and the result is
+    cached per (kind, layout, N, K). Sampling only the head of the list was
+    tried and picked worse configs than the hand-written defaults in half the
+    cases: no cheap ordering heuristic found so far predicts the winner.
+    `limit` caps the count for a quick, worse answer.
+    """
+    cfg, reason = _resolve(a, b, layout, None, None, None, None, None, None, None, None, out_dtype)
+    if reason is not None:
+        raise ValueError(reason)
+    key = (cfg.kind, layout, cfg.N, cfg.K)
+    if key in _TUNED:
+        return _TUNED[key]
+
+    best, best_cfg = 0.0, None
+    cands = feasible_configs(cfg.kind, layout, cfg.M, cfg.N, cfg.K)
+    for tile, mw, nw, nb in cands[:limit] if limit else cands:
+        try:
+
+            def call(tile=tile, mw=mw, nw=nw, nb=nb):
+                return gemm_gfx1250(
+                    a,
+                    b,
+                    layout=layout,
+                    tile=tile,
+                    m_warp=mw,
+                    n_warp=nw,
+                    num_buffers=nb,
+                    out_dtype=out_dtype,
+                    **kw,
+                )
+
+            for _ in range(3):
+                call()
+            torch.cuda.synchronize()
+            start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+            start.record()
+            for _ in range(iters):
+                call()
+            end.record()
+            torch.cuda.synchronize()
+            flops = 2 * cfg.M * cfg.N * cfg.K * iters / (start.elapsed_time(end) / 1e3)
+        except Exception:
+            continue  # a config that will not compile is not a candidate
+        if flops > best:
+            best, best_cfg = flops, (tile, mw, nw, nb)
+    if best_cfg is None:
+        raise RuntimeError(f"no feasible config for {key}")
+    _TUNED[key] = best_cfg
+    return best_cfg
 
 
 _LAYOUTS = {"nt": LAYOUT_NT, "nn": LAYOUT_NN, "tn": LAYOUT_TN}
@@ -843,8 +1062,8 @@ def _resolve(a, b, layout, scale_a, scale_b, kind, tile, m_warp, n_warp, num_buf
     if kind not in _KINDS:
         return None, f"unknown kind {kind!r}; expected one of {supported_dtypes()}"
     is_mx = _KINDS[kind][4]
-    if layout_id != LAYOUT_NT and _KINDS[kind][2] != 2:
-        return None, f"{layout} is wired up for 16-bit operands only, got {kind}"
+    if layout_id != LAYOUT_NT and _KINDS[kind][4]:
+        return None, f"{layout} has no MX-scaled form (scales are not transposed), got {kind}"
 
     d_tile, d_mw, d_nw, d_nb, d_gm = default_config(kind, M, N, K, layout_id)
     tile_m, tile_n, tile_k = tile or d_tile
@@ -923,11 +1142,16 @@ def gemm_gfx1250(
     n_warp: int | None = None,
     num_buffers: int | None = None,
     group_m: int | None = None,
+    accumulate: bool = False,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """``C = A @ B^T`` on gfx1250. NT layout, all operands row-major.
 
     ``a`` is ``(M, K)``, ``b`` is ``(N, K)``, the result is ``(M, N)``.
+
+    ``accumulate`` makes this ``out += A @ B`` rather than ``out = A @ B``
+    (the beta=1 epilogue a fused gradient accumulation needs); ``out`` must
+    then be supplied.
 
     ``kind`` selects the operand path (see :func:`supported_dtypes`); it is
     inferred from ``a.dtype`` when omitted, except that fp8 inputs carrying
@@ -939,6 +1163,8 @@ def gemm_gfx1250(
     )
     if reason is not None:
         raise ValueError(reason)
+    if accumulate and out is None:
+        raise ValueError("accumulate=True needs an out tensor to add into")
     if out is None:
         out = torch.empty((cfg.M, cfg.N), dtype=out_dtype, device=a.device)
     # The scale pointers are unread unless the kind is MX-scaled; the kernel
@@ -968,6 +1194,7 @@ def gemm_gfx1250(
         1 if out.dtype == torch.float16 else 0,
         cfg.group_m,
         cfg.layout_id,
+        1 if accumulate else 0,
     )
     # Calling @flyc.jit directly re-binds the signature and rebuilds its cache
     # key on every launch: ~69 us of host time, which dominates any GEMM below
