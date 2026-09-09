@@ -65,6 +65,17 @@ def _sink_ok(sink: Optional[torch.Tensor], num_heads_q: int) -> bool:
     return sink is None or (sink.dtype == torch.float32 and sink.numel() == num_heads_q)
 
 
+def _triton_sink_ok(sink: Optional[torch.Tensor], num_heads_q: int) -> bool:
+    """Same per-head-scalar rule as _sink_ok, but any float dtype.
+
+    The fp32 requirement there is FlyDSL's. attention_triton_impl.dense_forward casts the
+    sink itself (``sink.contiguous().float()``), so demanding fp32 here would send a bf16
+    sink -- what gpt-oss trains with -- to aiter, and on gfx1250 that means the CK path
+    this backend exists to keep clear of.
+    """
+    return sink is None or (sink.is_floating_point() and sink.numel() == num_heads_q)
+
+
 def _gqa_group_ok(num_heads_q: int, num_heads_kv: int) -> bool:
     """The deterministic dkdv backward needs G = Hq // Hkv to be a power of two in [8, 256]:
     its LDS-staged (delta, lse) load uses LD_VEC = 64 // (256 // G), which must be >= 2.
@@ -338,7 +349,7 @@ class DenseAttnFwdTritonBackend(KernelBackend):
         if bias is not None or alibi_slopes is not None:
             return False
         # A sink is one extra softmax term per head, so it must be a per-head scalar.
-        if sink is not None and not _sink_ok(sink, q.shape[2]):
+        if not _triton_sink_ok(sink, q.shape[2]):
             return False
         if dropout_p != 0.0 or return_softmax:
             return False
@@ -415,8 +426,6 @@ class DenseAttnFwdGluonBackend(KernelBackend):
         return flash_attn_gluon_forward_impl(
             q, k, v, softmax_scale=softmax_scale, causal=causal, qkv_format=qkv_format
         )
-
-
 
 
 _DENSE_FWD_BACKENDS = {

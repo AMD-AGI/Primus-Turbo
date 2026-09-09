@@ -109,6 +109,16 @@ class FlashAttnFunc(torch.autograd.Function):
     ):
         ctx.backend = backend
         if backend == BackendType.TRITON:
+            # The dispatcher only picks this backend when DenseAttnFwdTritonBackend.can_handle
+            # said yes, but FlashAttnFunc.apply is reachable directly, and these arguments have
+            # no kernel behind them here -- accepting them silently would answer a different
+            # problem than the caller asked for.
+            if dropout_p != 0.0:
+                raise ValueError("triton dense attention does not implement dropout")
+            if bias is not None or alibi_slopes is not None:
+                raise ValueError("triton dense attention does not implement bias or alibi_slopes")
+            if return_softmax:
+                raise ValueError("triton dense attention cannot return the softmax matrix")
             out, lse = triton_dense_forward(
                 q, k, v, softmax_scale=softmax_scale, causal=causal, sink=sink, window_size=window_size
             )
