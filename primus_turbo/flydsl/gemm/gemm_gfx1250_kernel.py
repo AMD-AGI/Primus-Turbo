@@ -136,6 +136,9 @@ _KIND_BY_ID = {v: (k, *_KINDS[k]) for k, v in _KIND_ID.items()}
 # V_WMMA_SCALE atom only accepts 32 (or 16); 128 is not a legal atom block size.
 MX_BLOCK = 32
 
+# out dtype -> the kernel's Constexpr code.
+_OUT_KIND = {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}
+
 # The WMMA atom is 16x16 in M/N for every operand type on this target.
 WMMA_N_ATOM = 16
 
@@ -169,7 +172,7 @@ def launch_gemm_gfx1250(
     n_warp: Constexpr[int],
     num_buffers: Constexpr[int],
     kind_id: Constexpr[int],
-    out_is_f16: Constexpr[int],
+    out_kind: Constexpr[int],
     group_m: Constexpr[int] = 8,
     layout: Constexpr[int] = LAYOUT_NT,
     accumulate: Constexpr[int] = 0,
@@ -198,7 +201,10 @@ def launch_gemm_gfx1250(
     assert tile_m % num_waves == 0 and tile_n % num_waves == 0, "TDM splits the tile's outer dim across warps"
 
     k_iters = tile_k // WMMA_K
-    out_cls = fx.Float16 if out_is_f16 else fx.BFloat16
+    # 0 bf16, 1 f16, 2 f32. The accumulator is f32 already, so an f32 output
+    # skips a conversion and only costs a wider C staging tile.
+    out_cls = (fx.BFloat16, fx.Float16, fx.Float32)[out_kind]
+    out_bytes = 4 if out_kind == 2 else 2
 
     # `num_buffers` stages, each an A tile then a B tile, K-major. The 16 B of
     # row padding is load-bearing: unpadded, a row is an exact multiple of the
@@ -227,10 +233,10 @@ def launch_gemm_gfx1250(
     SCRATCH_B_OFF = SCRATCH_A_OFF + SCRATCH_A
     PITCH = SCRATCH_B_OFF + SCRATCH_B
     # The epilogue restages C through the same arena, so it has to fit both.
-    C_BYTES = tile_m * (tile_n + 8) * 2
+    C_BYTES = tile_m * (tile_n + 8) * out_bytes
     # beta=1 stages the existing C beside the new one and adds them in LDS.
     ARENA = max(num_buffers * PITCH, C_BYTES * (2 if accumulate else 1))
-    assert ARENA == lds_bytes(kind, layout, tile_m, tile_n, tile_k, num_buffers, accumulate), (
+    assert ARENA == lds_bytes(kind, layout, tile_m, tile_n, tile_k, num_buffers, accumulate, out_bytes), (
         "lds_bytes() drifted from the arena this kernel actually lays out"
     )
     assert ARENA <= LDS_LIMIT, f"LDS arena {ARENA} B exceeds the {LDS_LIMIT} B gfx1250 budget"
@@ -568,7 +574,10 @@ def launch_gemm_gfx1250(
                     )
 
             def epilogue(sC):
-                r2s = fx.make_copy_atom(fx.UniversalCopy16b(), out_cls)
+                r2s = fx.make_copy_atom(
+                    fx.UniversalCopy32b() if out_bytes == 4 else fx.UniversalCopy16b(),
+                    out_cls,
+                )
                 thr_c = fx.make_tiled_copy_C(r2s, tiled_mma).get_slice(tid)
                 frag_out = fx.make_fragment_like(frag_C, out_cls.ir_type)
                 frag_out.store(frag_C.load().to(out_cls))
@@ -674,7 +683,7 @@ def launch_gemm_gfx1250(
                     for ni in range_constexpr(n_reps):
                         col = wnb + ni * WMMA_N + kgrp * (WMMA_N // 2)
                         h = c_frags[mi * n_reps + ni].load().to(out_cls)
-                        fx.ptr_store(h.bitcast(fx.Int8), base_ptr + (row * C_ROW + col) * 2)
+                        fx.ptr_store(h.bitcast(fx.Int8), base_ptr + (row * C_ROW + col) * out_bytes)
 
         # ---- K pipeline -------------------------------------------------
         # `num_buffers - 1` tiles stay in flight; a stage is consumed once the
@@ -810,7 +819,7 @@ def _atom_k(kind: str) -> int:
 LDS_LIMIT = 160 * 1024  # per CU on gfx1250
 
 
-def lds_bytes(kind, layout_id, tile_m, tile_n, tile_k, num_buffers, accumulate=False):
+def lds_bytes(kind, layout_id, tile_m, tile_n, tile_k, num_buffers, accumulate=False, out_bytes=2):
     """LDS the kernel will ask for. The launch asserts against this too, so a
     caller pre-filtering configs cannot disagree with what actually compiles."""
     elem_bytes, is_mx = _KINDS[kind][2], _KINDS[kind][4]
@@ -823,7 +832,7 @@ def lds_bytes(kind, layout_id, tile_m, tile_n, tile_k, num_buffers, accumulate=F
     if layout_id in (LAYOUT_NN, LAYOUT_TN):  # B staged twice
         stage += tile_k * (tile_n + pad) * elem_bytes
     # The epilogue restages C through the same arena, twice over for beta=1.
-    c_bytes = tile_m * (tile_n + 8) * 2
+    c_bytes = tile_m * (tile_n + 8) * out_bytes
     return max(num_buffers * stage, c_bytes * (2 if accumulate else 1))
 
 
@@ -1071,6 +1080,14 @@ def _resolve(a, b, layout, scale_a, scale_b, kind, tile, m_warp, n_warp, num_buf
     n_warp = d_nw if n_warp is None else n_warp
     num_buffers = d_nb if num_buffers is None else num_buffers
     group_m = d_gm if group_m is None else group_m
+    # An f32 output doubles the C staging tile, which can be what decides the
+    # arena; shrink until it fits rather than failing the launch assert.
+    ob = 4 if out_dtype == torch.float32 else 2
+    while (
+        tile_n > n_warp * WMMA_N_ATOM
+        and lds_bytes(kind, layout_id, tile_m, tile_n, tile_k, num_buffers, False, ob) > LDS_LIMIT
+    ):
+        tile_n //= 2
     if K % tile_k:
         return None, f"K={K} must be a multiple of tile_k={tile_k}"
     if K // tile_k < num_buffers:
@@ -1084,8 +1101,8 @@ def _resolve(a, b, layout, scale_a, scale_b, kind, tile, m_warp, n_warp, num_buf
         for nm, sc, rows in (("scale_a", scale_a, M), ("scale_b", scale_b, N)):
             if tuple(sc.shape) != (rows, K // MX_BLOCK):
                 return None, f"{nm} must be {(rows, K // MX_BLOCK)} uint8 E8M0, got {tuple(sc.shape)}"
-    if out_dtype not in (torch.bfloat16, torch.float16):
-        return None, f"out_dtype must be bf16 or f16, got {out_dtype}"
+    if out_dtype not in _OUT_KIND:
+        return None, f"out_dtype must be bf16, f16 or f32, got {out_dtype}"
     return (
         _Config(
             M,
@@ -1191,7 +1208,7 @@ def gemm_gfx1250(
         cfg.n_warp,
         cfg.num_buffers,
         _KIND_ID[cfg.kind],
-        1 if out.dtype == torch.float16 else 0,
+        _OUT_KIND[out.dtype],
         cfg.group_m,
         cfg.layout_id,
         1 if accumulate else 0,

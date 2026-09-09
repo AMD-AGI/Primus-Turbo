@@ -160,8 +160,8 @@ class GEMMFlyDSLBackend(KernelBackend):
         call = _flydsl_call(a, trans_a, b, trans_b, trans_c)
         if call is None:
             return False
-        if out_dtype not in _COMMON_SUPPORTED_DTYPES:
-            return False
+        if out_dtype not in _HIPBLASLT_SUPPORTED_DTYPES:
+            return False  # bf16 / f16 / f32; can_run has the final say
         ka, kb, layout = call
         can_run, _ = _flydsl_gemm()
         # Every remaining constraint (dtype pairing, K divisibility, LDS budget)

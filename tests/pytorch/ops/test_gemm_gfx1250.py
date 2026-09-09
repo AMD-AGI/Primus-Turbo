@@ -469,11 +469,12 @@ def test_pinned_backend_is_strict_by_default_and_can_fall_back():
     )
     from primus_turbo.pytorch.kernels.gemm.gemm_impl import GEMMKernelDispatcher
 
-    m, n, k = 512, 256, 1024
+    # A K that no tile_k divides. The kernel has no K tail, so it declines --
+    # unlike an fp32 output or a fused accumulation, which it now handles.
+    m, n, k = 512, 256, 1025
     a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
-    # fp32 output is something the FlyDSL kernel does not do.
-    kw = dict(a=a, trans_a=False, b=b, trans_b=True, out_dtype=torch.float32, trans_c=False)
+    kw = dict(a=a, trans_a=False, b=b, trans_b=True, out_dtype=torch.bfloat16, trans_c=False)
     default = BackendChoice(backend=BackendType.HIPBLASLT)
 
     with pytest.raises(ValueError, match="cannot handle"):
@@ -482,14 +483,36 @@ def test_pinned_backend_is_strict_by_default_and_can_fall_back():
     out = GEMMKernelDispatcher.dispatch(
         default, BackendChoice(backend=BackendType.FLYDSL, allow_fallback=True), **kw
     )
-    assert out.dtype == torch.float32
+    assert out.shape == (m, n)
 
     os.environ["PRIMUS_TURBO_BACKEND_ALLOW_FALLBACK"] = "1"
     try:
         out = GEMMKernelDispatcher.dispatch(default, BackendChoice(backend=BackendType.FLYDSL), **kw)
-        assert out.dtype == torch.float32
+        assert out.shape == (m, n)
     finally:
         del os.environ["PRIMUS_TURBO_BACKEND_ALLOW_FALLBACK"]
 
     with pytest.raises(ValueError, match="cannot handle"):
         GEMMKernelDispatcher.dispatch(default, BackendChoice(backend=BackendType.FLYDSL), **kw)
+
+
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("layout", ["nt", "nn", "tn"])
+def test_output_dtypes(out_dtype, layout):
+    """f32 out costs nothing but a wider C staging tile -- the accumulator is
+    f32 already, so it skips a conversion rather than adding one."""
+    m, n, k = 512, 256, 1024
+    sa, sb = LAYOUT_SHAPES[layout](m, n, k)
+    a = torch.randn(*sa, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(*sb, device="cuda", dtype=torch.bfloat16)
+    ref = _layout_ref(layout, a, b)
+    out = gemm_gfx1250(a, b, layout=layout, out_dtype=out_dtype)
+    assert out.dtype == out_dtype
+    # f32 keeps the accumulator exactly; the narrower ones round to their own floor.
+    floor = {torch.bfloat16: 50.0, torch.float16: 65.0, torch.float32: 100.0}[out_dtype]
+    assert snr_db(ref, out) > floor
+
+    base = torch.randn(m, n, device="cuda", dtype=out_dtype)
+    acc = base.clone()
+    gemm_gfx1250(a, b, acc, layout=layout, accumulate=True, out_dtype=out_dtype)
+    assert snr_db(base.float() + ref, acc) > floor - 5.0
