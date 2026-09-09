@@ -868,20 +868,20 @@ def _resolve(a, b, layout, scale_a, scale_b, kind, tile, m_warp, n_warp, num_buf
     if out_dtype not in (torch.bfloat16, torch.float16):
         return None, f"out_dtype must be bf16 or f16, got {out_dtype}"
     return (
-        dict(
-            M=M,
-            N=N,
-            K=K,
-            kind=kind,
-            is_mx=is_mx,
-            layout_id=layout_id,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            m_warp=m_warp,
-            n_warp=n_warp,
-            num_buffers=num_buffers,
-            group_m=group_m,
+        _Config(
+            M,
+            N,
+            K,
+            kind,
+            is_mx,
+            layout_id,
+            tile_m,
+            tile_n,
+            tile_k,
+            m_warp,
+            n_warp,
+            num_buffers,
+            group_m,
         ),
         None,
     )
