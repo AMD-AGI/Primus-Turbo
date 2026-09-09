@@ -7,9 +7,10 @@
 """Fused MXFP4 grouped MLP, driven through its public op.
 
 The op runs end to end -- output and all four gradients -- against an eager
-per-expert fp32 reference. The floor is low because MXFP4 carries ~2 mantissa
-bits and this path stacks four quantisations plus the wgrad operands' RHT, so
-the bar is here to catch a wrong answer rather than the quantisation.
+per-expert fp32 reference, for every gate it takes. The floor is low because
+MXFP4 carries ~2 mantissa bits and this path stacks four quantisations plus the
+wgrad operands' RHT, so the bar is here to catch a wrong answer rather than the
+quantisation.
 """
 
 import pytest
@@ -37,6 +38,13 @@ SNR_THRESHOLD = 10.0
 # ``glu_epi_quant_supported``.
 SHAPES = [(2048, 896, 512, 4), (2048, 1408, 320, 4), (1536, 1152, 384, 3)]
 
+GATES = {"silu": F.silu, "gelu": lambda t: F.gelu(t, approximate="tanh")}
+
+CLAMP_LIMIT = 0.10
+GATE_CASES = [("silu", None), ("gelu", None), ("silu", CLAMP_LIMIT)]
+
+CLAMP_SNR_THRESHOLD = 8.0
+
 
 def _mlp_leaves(M, K, I, G, seed=42):
     """bf16 leaves for the fused MLP, which does its own quantisation.
@@ -59,14 +67,18 @@ def _mlp_leaves(M, K, I, G, seed=42):
     return offs, offs[1:] - offs[:-1], (x, w1, w2, probs)
 
 
-def _mlp_ref(x, w1, w2, probs, offs):
-    """Per-expert fc1, silu-gated and scaled by probs, then fc2 -- all in fp32."""
+def _mlp_ref(x, w1, w2, probs, offs, activation, clamp_limit=None):
+    """Per-expert fc1, gated and scaled by probs, then fc2 -- all in fp32."""
+    gate_fn = GATES[activation]
     outs = []
     for g in range(w1.shape[0]):
         lo, hi = int(offs[g]), int(offs[g + 1])
         l1 = x[lo:hi].float() @ w1[g].float().t()
         gate, up = torch.chunk(l1, 2, dim=-1)
-        act = F.silu(gate) * up * probs[lo:hi, None].float()
+        if clamp_limit is not None:
+            gate = gate.clamp(max=clamp_limit)
+            up = up.clamp(min=-clamp_limit, max=clamp_limit)
+        act = gate_fn(gate) * up * probs[lo:hi, None].float()
         outs.append(act @ w2[g].float().t())
     return torch.cat(outs, dim=0)
 
@@ -79,8 +91,9 @@ def _run(fn, leaves, cotangent):
     return out.detach(), [t.grad for t in args]
 
 
+@pytest.mark.parametrize("activation,clamp_limit", GATE_CASES)
 @pytest.mark.parametrize("shape", SHAPES)
-def test_grouped_mlp_fp4(shape):
+def test_grouped_mlp_fp4(shape, activation, clamp_limit):
     """The fused op against the same arithmetic done eagerly, expert by expert."""
     supported, reason = check_mxfp4_support()
     if not supported:
@@ -103,16 +116,21 @@ def test_grouped_mlp_fp4(shape):
             trans_w1=True,
             trans_w2=True,
             config=Float4QuantConfig(),
-            activation="silu",
+            activation=activation,
+            clamp_limit=clamp_limit,
         ),
         leaves,
         cotangent,
     )
-    ref, ref_grads = _run(lambda x, w1, w2, p: _mlp_ref(x, w1, w2, p, offs), leaves, cotangent)
+    ref, ref_grads = _run(
+        lambda x, w1, w2, p: _mlp_ref(x, w1, w2, p, offs, activation, clamp_limit), leaves, cotangent
+    )
+
+    grad_threshold = SNR_THRESHOLD if clamp_limit is None else CLAMP_SNR_THRESHOLD
 
     assert out.shape == (M, K)
     assert compute_snr(ref, out) > SNR_THRESHOLD, "out"
     for name, got, want in zip(("grad_x", "grad_w1", "grad_w2", "grad_probs"), grads, ref_grads):
         assert got is not None, f"{name} was not produced"
         assert got.shape == want.shape, name
-        assert compute_snr(want, got) > SNR_THRESHOLD, name
+        assert compute_snr(want, got) > grad_threshold, name

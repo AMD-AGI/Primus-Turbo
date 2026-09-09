@@ -9,6 +9,9 @@ import torch
 
 from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
+from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
+    grouped_gemm_variable_k_impl,
+)
 from primus_turbo.pytorch.ops import grouped_gemm
 from tests.pytorch.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
@@ -26,7 +29,9 @@ from tests.pytorch.test_utils import compute_snr, get_tolerances
 @pytest.mark.parametrize("balance", [True, False])
 @pytest.mark.parametrize("trans_b", [True, False])
 @pytest.mark.parametrize("reduce_num_cu", [0, 16, 32])
-@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON])
+@pytest.mark.parametrize(
+    "backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, BackendType.FLYDSL]
+)
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu, backend, auto_tune):
     seed = 42
@@ -45,6 +50,11 @@ def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu, ba
 
     if backend is BackendType.HIPBLASLT and reduce_num_cu > 0:
         pytest.skip("HIPBLASLT does not support reduce_num_cu > 0")
+
+    if backend is BackendType.FLYDSL and get_device_compute_capability() != (9, 5):
+        # gfx950-only: the body is built on mfma_f32_16x16x32_bf16. An explicitly pinned
+        # backend that can_handle declines is an error, not a fallback.
+        pytest.skip("FlyDSL bf16 grouped GEMM is gfx950-only")
 
     # TODO(xiaobochen-amd): On gfx942, the hipBLASLt path can exhibit
     # intermittent/flake failures when M <= 512. This has not been reproduced on MI355.
@@ -607,3 +617,63 @@ def test_grouped_gemm_padded_tail_zeroed(dtype, trans_b, backend):
     )
 
     GlobalBackendManager.reset()
+
+
+# test_grouped_gemm_func covers the pair through autograd; this pins the variable-K op the way
+# the backward calls it, so the wgrad's own edges get their own matrix: ragged group lengths, an
+# OUT_M off the block grid, and the expert count at the cap.
+@pytest.mark.parametrize("B", [1, 4, 16, 64])
+@pytest.mark.parametrize("M", [256, 512])
+@pytest.mark.parametrize("N_K", [(512, 768), (2048, 1536), (320, 2880)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("balance", [True, False])
+@pytest.mark.parametrize("trans_c", [False, True])
+@pytest.mark.parametrize("backend", [BackendType.TRITON, BackendType.FLYDSL], ids=["TRITON", "FLYDSL"])
+def test_grouped_gemm_variable_k_backend(B, M, N_K, dtype, balance, trans_c, backend):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    if backend is BackendType.FLYDSL and get_device_compute_capability() != (9, 5):
+        pytest.skip("FlyDSL bf16 variable-K grouped GEMM is gfx950-only (mfma_f32_16x16x32_bf16)")
+
+    torch.manual_seed(42)
+    device = "cuda"
+    N, K = N_K
+
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
+    group_offs = torch.zeros(B + 1, dtype=torch.int64, device=device)
+    group_offs[1:] = group_lens.cumsum(0)
+    total_m = int(group_offs[-1].item())
+
+    a = torch.randn((total_m, N), dtype=dtype, device=device)
+    b = torch.randn((total_m, K), dtype=dtype, device=device)
+
+    GlobalBackendManager.set_grouped_gemm_backend(None)
+    GlobalBackendManager.set_auto_tune(False)
+    out = grouped_gemm_variable_k_impl(
+        a,
+        b,
+        group_lens,
+        group_offs,
+        trans_a=True,
+        trans_b=False,
+        trans_c=trans_c,
+        num_cu=None,
+        default_backend=backend.value,
+    )
+
+    ref = torch.stack(
+        [
+            (
+                a[int(group_offs[g]) : int(group_offs[g + 1])].float().T
+                @ b[int(group_offs[g]) : int(group_offs[g + 1])].float()
+            )
+            for g in range(B)
+        ]
+    ).to(dtype)
+    if trans_c:
+        ref = ref.transpose(1, 2).contiguous()
+
+    assert out.shape == ref.shape
+    snr = compute_snr(ref, out)
+    assert snr > 45.0, f"snr {snr:.2f} dB too low"
+    torch.testing.assert_close(out, ref, **get_tolerances(dtype))

@@ -54,8 +54,8 @@ def test_gemm_fp4_mx_blockwise(m, n, k, layout, format, dtype, granularity, back
         pytest.skip("AITER backend only supports bfloat16 dtype")
 
     if backend == BackendType.FLYDSL:
-        if not (m % 256 == 0 and n % 256 == 0 and k % 256 == 0):
-            pytest.skip("FlyDSL MXFP4 backend requires M/N/K all multiples of 256")
+        if not (m % 64 == 0 and n % 64 == 0 and k % 64 == 0):
+            pytest.skip("FlyDSL MXFP4 backend requires M/N/K all multiples of 64")
 
     # Skip redundant test: auto_tune is ignored when backend is explicitly specified
     if backend is not None and auto_tune:
@@ -277,8 +277,8 @@ def test_gemm_fp4_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, 
         pytest.skip("Preshuffle is only supported for AITER backend")
     if backend == BackendType.AITER and dtype != torch.bfloat16:
         pytest.skip("AITER backend only supports bfloat16 dtype")
-    if backend == BackendType.FLYDSL and not (m % 256 == 0 and n % 256 == 0 and k % 256 == 0):
-        pytest.skip("FlyDSL MXFP4 backend requires M/N/K all multiples of 256")
+    if backend == BackendType.FLYDSL and not (m % 64 == 0 and n % 64 == 0 and k % 64 == 0):
+        pytest.skip("FlyDSL MXFP4 backend requires M/N/K all multiples of 64")
 
     _run_gemm_fp4_mx_quantized_tensor_test(
         m=m,
@@ -505,8 +505,8 @@ def test_gemm_fp4_deterministic(mnk, dtype, backend):
     m, n, k = mnk
     if backend == BackendType.AITER and dtype != torch.bfloat16:
         pytest.skip("AITER backend only supports bfloat16 dtype")
-    if backend == BackendType.FLYDSL and not (m % 256 == 0 and n % 256 == 0 and k % 256 == 0):
-        pytest.skip("FlyDSL MXFP4 backend requires M/N/K all multiples of 256")
+    if backend == BackendType.FLYDSL and not (m % 64 == 0 and n % 64 == 0 and k % 64 == 0):
+        pytest.skip("FlyDSL MXFP4 backend requires M/N/K all multiples of 64")
 
     GlobalBackendManager.set_gemm_backend(backend)
     GlobalBackendManager.set_auto_tune(False)

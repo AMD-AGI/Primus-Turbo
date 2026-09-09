@@ -275,6 +275,8 @@ def _build_grouped_mxfp4_nt_kernel(
     dglu_act_quant=False,
     epi_row_sr=False,
     epi_col_sr=False,
+    activation="silu",  # the GLU gate; see SUPPORTED_ACTIVATIONS
+    clamp_limit=None,  # clamp bound; see _glu_clamp
 ):
     """Grouped MXFP4 NT (out = a @ b^T), per-group A rows + per-expert B, whole-loop compute.
     K is the 256-rounded scale extent; ``k_real`` (<=K, 128-multiple) is the operands' true
@@ -594,6 +596,8 @@ def _build_grouped_mxfp4_nt_kernel(
                 band_drop=(not _COL_SAFE) and _GLU_BAND,
                 cst=_CSTORE,
                 act_aux=_GLU_ACT_AUX,
+                activation=activation,
+                clamp_limit=clamp_limit,
             )
             _glu_args = (
                 None,
@@ -664,6 +668,8 @@ def _build_grouped_mxfp4_nt_kernel(
                 row_pad=_dglu_pad,
                 col_safe=_COL_SAFE,
                 store_aux=_DGLU_AUX,
+                activation=activation,
+                clamp_limit=clamp_limit,
             )
             if const_expr(dglu_act_quant):
                 _row_stride = 2 * N_TILES_BH * 16 + _dglu_pad
@@ -1001,6 +1007,8 @@ def _compile_grouped_mxfp4_nt_glu(
     dglu_epi_quant=False,
     epi_row_sr=False,
     epi_col_sr=False,
+    activation="silu",
+    clamp_limit=None,
 ):
     """The NT compile of :func:`_compile_grouped_mxfp4_nt_fused` with a fused GLU epilogue.
 
@@ -1037,6 +1045,8 @@ def _compile_grouped_mxfp4_nt_glu(
         dglu_act_quant=dglu_epi_quant,
         epi_row_sr=epi_row_sr,
         epi_col_sr=epi_col_sr,
+        activation=activation,
+        clamp_limit=clamp_limit,
     )
     ab_pre_shuf = _build_grouped_mxfp4_ab_preshuffle(
         K128, G, N_b, k128_rd, b_ilv=b_ilv, glu_i=glu_i if glu else 0
@@ -1759,6 +1769,9 @@ def _compile_grouped_mxfp4_wgrad_fused(
             fx.Int32(OUT_N),
             k128m,
             grid_a,
+            # Source scale rows here are always a whole number of dwords: the reduction dim is
+            # the token count, so a row is m_total/32 bytes == k128m * 4.
+            k128m * fx.Int32(4),
         ).launch(grid=(grid_a + grid_b, 1, 1), block=(_MXFP4_PRESHUF_BLK, 1, 1), stream=stream)
         gemm_k(a8, b8, C, a_sp, b_sp, GO, m_total, value_attrs=attrs).launch(
             grid=(GRID, 1, 1), block=(256, 1, 1), stream=stream

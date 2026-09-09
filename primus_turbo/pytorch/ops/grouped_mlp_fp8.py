@@ -42,7 +42,23 @@ __all__ = [
 ]
 
 
-_SUPPORTED_ACTIVATIONS = ("silu",)
+_SUPPORTED_ACTIVATIONS = ("silu", "gelu")
+
+_SUPPORTED_CLAMPABLE_ACTIVATIONS = ("silu",)
+
+
+def _check_activation(activation: str, clamp_limit: Union[None, float]) -> Union[None, float]:
+    assert activation in _SUPPORTED_ACTIVATIONS, (
+        f"Unsupported activation: {activation!r}, expected one of {_SUPPORTED_ACTIVATIONS}"
+    )
+    if clamp_limit is None:
+        return None
+    assert activation in _SUPPORTED_CLAMPABLE_ACTIVATIONS, (
+        f"clamp_limit is only supported for activation in {_SUPPORTED_CLAMPABLE_ACTIVATIONS}, got {activation!r}"
+    )
+    clamp_limit = float(clamp_limit)
+    assert clamp_limit > 0.0, f"clamp_limit must be positive, got {clamp_limit}"
+    return clamp_limit
 
 
 # Pad the fp8 grouped-MLP contraction/feature dims to 128. gpt-oss-20b runs
@@ -124,14 +140,13 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
         trans_w1: bool,
         trans_w2: bool,
         activation: str,
+        clamp_limit: Union[None, float],
         out_dtype: torch.dtype,
         config: Float8QuantConfig,
         num_cu: int | None,
         fuse_wgrad_accum_pattern: Union[None, str] = None,
     ):
-        assert activation in _SUPPORTED_ACTIVATIONS, (
-            f"Unsupported activation: {activation!r}, expected one of {_SUPPORTED_ACTIVATIONS}"
-        )
+        clamp_limit = _check_activation(activation, clamp_limit)
 
         # Each weight carries its own accumulation buffer, so the two wgrads
         # cannot share one: resolve them separately while the parameter objects
@@ -211,6 +226,7 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
             out_row_scaling_recipe=ScalingRecipe(),
             out_col_scaling_recipe=ScalingRecipe(),
             activation=activation,
+            clamp_limit=clamp_limit,
             # Pad the fused activation's I -> Ip so fc2's contraction matches w2's
             # padded I; copy-free (the quantiser writes the padded buffer directly).
             k_align=_FP8_PAD_ALIGN,
@@ -256,6 +272,7 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
         ctx.trans_w1 = trans_w1
         ctx.trans_w2 = trans_w2
         ctx.activation = activation
+        ctx.clamp_limit = clamp_limit
         ctx.config = config
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
@@ -350,6 +367,7 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
             out_row_scaling_recipe=ScalingRecipe(),
             out_col_scaling_recipe=ScalingRecipe(),
             activation=ctx.activation,
+            clamp_limit=ctx.clamp_limit,
             # w2 (b) is padded on its I axis to w2_fp8.shape[-1]; i_real recovers the
             # tight I so grad_fc1_out stays [M, 2I] and the padded Ip rides as n_stride.
             i_real=i_real if i_real != w2_fp8.shape[-1] else None,
@@ -408,6 +426,7 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
             None,  # trans_w1
             None,  # trans_w2
             None,  # activation
+            None,  # clamp_limit
             None,  # out_dtype
             None,  # config
             None,  # num_cu
@@ -439,13 +458,21 @@ def grouped_mlp_fp8(
     num_cu: int | None = None,
     fuse_wgrad_accum_pattern: Union[None, str] = None,
     activation: Union[None, str] = None,
+    clamp_limit: Union[None, float] = None,
 ) -> torch.Tensor:
+    """Grouped FP8 MLP: ``fc2(f(gate) * up * probs)`` with fc1's GLU fused into its epilogue.
+
+    Args:
+        activation: the GLU gate, one of ``("silu", "gelu")``. "gelu" is the tanh
+            approximation, i.e. ``F.gelu(approximate="tanh")``.
+        clamp_limit: DeepSeek-V4's pre-multiplication clamp bound ``L``, or None for no
+            clamp. With it the activation is ``silu(min(gate, L)) * clamp(up, -L, L)``,
+            whose backward is straight-through. Supported for "silu" only.
+    """
     if config is None:
         config = Float8QuantConfig()
 
-    assert activation in _SUPPORTED_ACTIVATIONS, (
-        f"Unsupported activation: {activation!r}, expected one of {_SUPPORTED_ACTIVATIONS}"
-    )
+    clamp_limit = _check_activation(activation, clamp_limit)
 
     assert probs is not None, "probs is required: the fused GLU epilogues always scale by it"
 
@@ -487,6 +514,7 @@ def grouped_mlp_fp8(
             trans_w1,
             trans_w2,
             activation,
+            clamp_limit,
             out_dtype,
             config,
             num_cu,

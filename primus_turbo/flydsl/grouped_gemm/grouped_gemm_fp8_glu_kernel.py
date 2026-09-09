@@ -33,7 +33,11 @@ from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_kernel import (
     _compile_grouped_nn,
     _compile_grouped_nt,
 )
-from primus_turbo.flydsl.utils.gemm_epilogue_helper import AMAX_PARTIAL_SLOTS
+from primus_turbo.flydsl.utils.gemm_epilogue_helper import (
+    AMAX_PARTIAL_SLOTS,
+    _check_activation,
+    _check_clamp_limit,
+)
 
 _GROUPED_GLU_CACHE: dict = {}
 
@@ -143,14 +147,15 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
     trans_b: bool = False,
     *,
     activation: str = "silu",
+    clamp_limit: "float | None" = None,
     out_dtype=torch.bfloat16,
     num_cu: "int | None" = None,
     amax_partial: "torch.Tensor | None" = None,
 ) -> "tuple[torch.Tensor, torch.Tensor]":
-    """FlyDSL fc1 grouped fp8 GEMM with a fused SwiGLU epilogue, matching the Triton entry.
+    """FlyDSL fc1 grouped fp8 GEMM with a fused GLU epilogue, matching the Triton entry.
 
     Computes ``l1 = [gate|up] = (a[g] @ b[g]^T) * a_scale * b_scale`` [M, 2I] and
-    ``act = silu(gate) * up * probs`` [M, I] in one launch, both in ``out_dtype``.
+    ``act = f(gate) * up * probs`` [M, I] in one launch, both in ``out_dtype``.
     ``l1`` is written because backward's dswiglu needs both halves; ``act`` is the
     only one that carries ``probs``.
 
@@ -163,6 +168,8 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
     quadrant registers, and the NN twin has no equivalent hook yet.
 
     Args:
+        clamp_limit: pre-multiplication clamp bound, or None for no clamp; silu only.
+            See :func:`~primus_turbo.flydsl.utils.gemm_epilogue_helper._glu_clamp`.
         act_out: [M_total, I] buffer receiving the activation.
         intermediate_out: [M_total, 2I] buffer receiving ``l1``. Both are the
             caller's to allocate: every slot is written, so neither needs
@@ -175,7 +182,8 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
     Returns:
         ``(act_out, intermediate_out)``.
     """
-    assert activation == "silu", f"FlyDSL fused GLU implements silu only, got {activation}"
+    _check_activation(activation)
+    _check_clamp_limit(activation, clamp_limit)
     assert trans_b, "FlyDSL fused GLU is NT only: pass b as [G, 2I, K]"
     assert a.ndim == 2 and b.ndim == 3
     M_total, K = a.shape
@@ -202,7 +210,18 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
     cbsz = 1 if a.dtype == torch.float8_e5m2 else 0
     blgp = 1 if b.dtype == torch.float8_e5m2 else 0
     _capped = num_cu is not None and num_cu > 0
-    ckey = (I, K, G, out_fp16, cbsz, blgp, num_cu if _capped else 0, _amax)
+    ckey = (
+        I,
+        K,
+        G,
+        out_fp16,
+        cbsz,
+        blgp,
+        num_cu if _capped else 0,
+        _amax,
+        activation,
+        clamp_limit,
+    )
 
     launch = _GROUPED_GLU_CACHE.get(ckey)
     if launch is None:
@@ -248,6 +267,8 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
                 cstore_aux=2,
                 glu_act_aux=2,
                 glu_amax=_amax,
+                activation=activation,
+                clamp_limit=clamp_limit,
             )
 
         def _probe():
@@ -352,11 +373,12 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
     trans_b: bool = False,
     *,
     activation: str = "silu",
+    clamp_limit: "float | None" = None,
     num_cu: "int | None" = None,
     i_real: "int | None" = None,
     amax_partial: "torch.Tensor | None" = None,
 ) -> "torch.Tensor":
-    """FlyDSL fc2 dgrad with the SwiGLU gradient fused into its epilogue.
+    """FlyDSL fc2 dgrad with the GLU gradient fused into its epilogue.
 
     Computes ``dact = (a[g] @ b[g]) * a_scale * b_scale`` and consumes it in
     registers, so ``dact`` never reaches HBM:
@@ -373,6 +395,8 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
     NN only (``trans_b=False``, b [G, K, I]).
 
     Args:
+        clamp_limit: pre-multiplication clamp bound, or None for no clamp; silu only.
+            Must match the forward's, which decided the values this differentiates.
         out: [M_total, 2I] buffer receiving ``dl1``, in ``intermediate``'s dtype,
             gate gradient in [:, :I] and up in [:, I:].
         grad_probs_partial: float32 buffer receiving the grad_probs partials, as
@@ -386,7 +410,8 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
     Returns:
         ``out``, for call-site convenience.
     """
-    assert activation == "silu", f"FlyDSL fused dGLU implements silu only, got {activation}"
+    _check_activation(activation)
+    _check_clamp_limit(activation, clamp_limit)
     assert not trans_b, "FlyDSL fused dGLU is NN only: pass b as [G, K, I]"
     assert a.ndim == 2 and b.ndim == 3 and intermediate.ndim == 2
     M_total, K = a.shape
@@ -426,7 +451,19 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
     cbsz = 1 if a.dtype == torch.float8_e5m2 else 0
     blgp = 1 if b.dtype == torch.float8_e5m2 else 0
     _capped = num_cu is not None and num_cu > 0
-    ckey = (I, K, G, out_fp16, cbsz, blgp, num_cu if _capped else 0, n_stride, _amax)
+    ckey = (
+        I,
+        K,
+        G,
+        out_fp16,
+        cbsz,
+        blgp,
+        num_cu if _capped else 0,
+        n_stride,
+        _amax,
+        activation,
+        clamp_limit,
+    )
 
     launch = _GROUPED_DGLU_CACHE.get(ckey)
     if launch is None:
@@ -462,6 +499,8 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
                 # wave, and the two have to meet in L2 to form one, which
                 # non-temporal prevents. Per-wave staging preferred aux=0.
                 cstore_aux=2,
+                activation=activation,
+                clamp_limit=clamp_limit,
             )
 
         def _probe():

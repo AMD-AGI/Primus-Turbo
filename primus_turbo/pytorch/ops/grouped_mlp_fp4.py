@@ -57,7 +57,23 @@ from primus_turbo.pytorch.ops.utils import (
 __all__ = ["grouped_mlp_fp4"]
 
 
-_SUPPORTED_ACTIVATIONS = ("silu",)
+_SUPPORTED_ACTIVATIONS = ("silu", "gelu")
+
+_SUPPORTED_CLAMPABLE_ACTIVATIONS = ("silu",)
+
+
+def _check_activation(activation: str, clamp_limit: Union[None, float]) -> Union[None, float]:
+    assert activation in _SUPPORTED_ACTIVATIONS, (
+        f"Unsupported activation: {activation!r}, expected one of {_SUPPORTED_ACTIVATIONS}"
+    )
+    if clamp_limit is None:
+        return None
+    assert activation in _SUPPORTED_CLAMPABLE_ACTIVATIONS, (
+        f"clamp_limit is only supported for activation in {_SUPPORTED_CLAMPABLE_ACTIVATIONS}, got {activation!r}"
+    )
+    clamp_limit = float(clamp_limit)
+    assert clamp_limit > 0.0, f"clamp_limit must be positive, got {clamp_limit}"
+    return clamp_limit
 
 
 def _wgrad_grouped_gemm_fp4_impl_wrapper(
@@ -150,14 +166,13 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
         trans_w1: bool,
         trans_w2: bool,
         activation: str,
+        clamp_limit: Union[None, float],
         out_dtype: torch.dtype,
         config: Float4QuantConfig,
         num_cu: int | None,
         fuse_wgrad_accum_pattern: Union[None, str] = None,
     ):
-        assert activation in _SUPPORTED_ACTIVATIONS, (
-            f"Unsupported activation: {activation!r}, expected one of {_SUPPORTED_ACTIVATIONS}"
-        )
+        clamp_limit = _check_activation(activation, clamp_limit)
         # MXFP4 has no non-NT layout, so the weights can only be given as
         # w1 [G, 2I, K] / w2 [G, K_out, I], which is what both flags being set means.
         assert trans_w1 and trans_w2, (
@@ -239,6 +254,7 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
             out_row_scaling_recipe=ScalingRecipe(),
             out_col_scaling_recipe=ScalingRecipe(use_rht=True),
             activation=activation,
+            clamp_limit=clamp_limit,
         )
 
         out = grouped_gemm_fp4_impl(
@@ -272,6 +288,7 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
             group_offs,
         )
         ctx.activation = activation
+        ctx.clamp_limit = clamp_limit
         ctx.config = config
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
@@ -358,6 +375,7 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
             out_row_scaling_recipe=ScalingRecipe(use_sr=sr),
             out_col_scaling_recipe=ScalingRecipe(use_sr=sr, use_rht=True),
             activation=ctx.activation,
+            clamp_limit=ctx.clamp_limit,
         )
         gl_offs_row, gl_lens_col, gl_offs_col = group_offs, go_lens_col, go_offs_col
 
@@ -405,6 +423,7 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
             None,  # trans_w1
             None,  # trans_w2
             None,  # activation
+            None,  # clamp_limit
             None,  # out_dtype
             None,  # config
             None,  # num_cu
@@ -434,8 +453,9 @@ def grouped_mlp_fp4(
     num_cu: int | None = None,
     fuse_wgrad_accum_pattern: Union[None, str] = None,
     activation: Union[None, str] = None,
+    clamp_limit: Union[None, float] = None,
 ) -> torch.Tensor:
-    """MoE expert MLP in MXFP4: ``fc2(silu(gate) * up * probs)`` over ``group_lens``.
+    """MoE expert MLP in MXFP4: ``fc2(f(gate) * up * probs)`` over ``group_lens``.
 
     Args:
         x: [total_m, K] activations, grouped along M. May instead be a
@@ -450,6 +470,11 @@ def grouped_mlp_fp4(
             the col-wise dgrad operand and so carries no RHT.
         probs: [total_m] float32 routing probabilities. Required -- the fused
             epilogues always scale by it and reduce its gradient.
+        activation: the gate ``f``, one of ``_SUPPORTED_ACTIVATIONS``. ``"gelu"`` is
+            the tanh approximation, i.e. ``F.gelu(approximate="tanh")``.
+        clamp_limit: DeepSeek-V4's pre-multiplication clamp bound ``L``, or None for no
+            clamp. With it the activation is ``silu(min(gate, L)) * clamp(up, -L, L)``,
+            whose backward is straight-through. Supported for ``"silu"`` only.
 
     Returns:
         [total_m, K_out] in ``out_dtype``.
@@ -457,9 +482,7 @@ def grouped_mlp_fp4(
     if config is None:
         config = Float4QuantConfig()
 
-    assert activation in _SUPPORTED_ACTIVATIONS, (
-        f"Unsupported activation: {activation!r}, expected one of {_SUPPORTED_ACTIVATIONS}"
-    )
+    clamp_limit = _check_activation(activation, clamp_limit)
     assert probs is not None, "probs is required: the fused GLU epilogues always scale by it"
 
     if group_offs is None:
@@ -500,6 +523,7 @@ def grouped_mlp_fp4(
         trans_w1,
         trans_w2,
         activation,
+        clamp_limit,
         out_dtype,
         config,
         num_cu,
