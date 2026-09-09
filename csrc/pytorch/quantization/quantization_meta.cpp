@@ -14,7 +14,8 @@ std::vector<at::Tensor> quantize_fp8_tensorwise_meta(const at::Tensor          i
                                                      const at::ScalarType      dest_dtype,
                                                      c10::optional<at::Tensor> scale_opt,
                                                      const int64_t             padding_align_size,
-                                                     const int64_t pad_penultimate_align_size) {
+                                                     const int64_t pad_penultimate_align_size,
+                                                     c10::optional<at::Tensor> amax_partials_opt) {
     PRIMUS_TURBO_CHECK(input.dim() >= 1, "input must have at least 1 dim");
     PRIMUS_TURBO_CHECK(padding_align_size >= 1, "padding_align_size must be >= 1");
     const int64_t K  = input.size(-1);

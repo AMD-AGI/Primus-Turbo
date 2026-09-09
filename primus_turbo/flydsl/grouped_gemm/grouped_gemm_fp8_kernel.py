@@ -217,6 +217,7 @@ def _compile_grouped_nn(
     nn_esplit: int = 4,  # epilogue store schedule, see _NN_E_SCHED: how the tile's four accumulator quadrants are split into barrier-separated store batches. 0 = one 128-store burst after the trailing barrier
     beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
     dglu: bool = False,  # fuse the SwiGLU gradient into the epilogue: read l1, write dl1 [M,2I] and grad_probs partials, so dact never reaches HBM
+    dglu_amax: bool = False,  # also reduce dl1's abs-amax into AMAX_PARTIAL, so the tensorwise quantiser after this kernel need not re-read dl1 for it
     glu_i: int = 0,  # activation width I; the GEMM's N already equals it, so no geometry changes (unlike the fwd)
     activation: str = "silu",  # (with dglu) the GLU gate; see SUPPORTED_ACTIVATIONS
     clamp_limit=None,  # (with dglu) clamp bound; see _glu_clamp
@@ -315,6 +316,7 @@ def _compile_grouped_nn(
         L1: fx.Tensor,  # dglu only: saved fc1 pre-activation [M,2I]; C is passed twice otherwise
         PROBS: fx.Tensor,  # dglu only: routing probs [M] fp32
         GRAD_PROBS_PARTIAL: fx.Tensor,  # dglu only: [n_blocks*2, M] fp32 grad_probs partials
+        AMAX_PARTIAL: fx.Tensor,  # dglu_amax only: [AMAX_PARTIAL_SLOTS] fp32, zeroed
         c_n: fx.Int32,
         grad_probs_stride: fx.Int32,
     ):
@@ -511,6 +513,8 @@ def _compile_grouped_nn(
                     wave_id,
                     col_safe=_col_safe,
                     store_aux=cstore_aux,
+                    amax_partial=AMAX_PARTIAL if dglu_amax else None,
+                    amax_pid=pid,
                     activation=activation,
                     clamp_limit=clamp_limit,
                 )
@@ -834,6 +838,7 @@ def _compile_grouped_nn(
             C,
             C,
             C,
+            C,
             c_n,
             fx.Int32(0),
             value_attrs=attrs,
@@ -852,6 +857,7 @@ def _compile_grouped_nn(
             L1: fx.Tensor,
             PROBS: fx.Tensor,
             GRAD_PROBS_PARTIAL: fx.Tensor,
+            AMAX_PARTIAL: fx.Tensor,
             m_total: int,
             c_n: fx.Int32,
             grad_probs_stride: fx.Int32,
@@ -875,6 +881,7 @@ def _compile_grouped_nn(
                 L1,
                 PROBS,
                 GRAD_PROBS_PARTIAL,
+                AMAX_PARTIAL,
                 c_n,
                 grad_probs_stride,
                 value_attrs=attrs,
@@ -916,6 +923,7 @@ def _compile_grouped_nt(
     glu: bool = False,  # fuse a SwiGLU epilogue: B_T is [2I, K] gate||up, the tile pairs the two bands in registers and writes l1 [M,2I] + act [M,I]
     glu_i: int = 0,  # gate half width I (required when glu); N is this same I, i.e. the activation's width
     glu_act_aux: int = 0,  # aux immediate for the act store alone (it is pure streaming output, so evict-first may pay where it would not for l1)
+    glu_amax: bool = False,  # also reduce act's abs-amax into AMAX_PARTIAL, so the tensorwise quantiser after this kernel need not re-read act for it
     activation: str = "silu",  # (with glu) the GLU gate; see SUPPORTED_ACTIVATIONS
     clamp_limit=None,  # (with glu) clamp bound; see _glu_clamp
 ):
@@ -1010,6 +1018,7 @@ def _compile_grouped_nt(
         C: fx.Tensor,  # glu: l1 [M, 2I]
         ACT: fx.Tensor,  # glu: act [M, I]. Otherwise unused -- the launch aliases it to C.
         PROBS: fx.Tensor,  # glu: routing probs [M] fp32. Otherwise unused, aliased to C.
+        AMAX_PARTIAL: fx.Tensor,  # glu_amax only: [AMAX_PARTIAL_SLOTS] fp32, zeroed
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
         group_offs: fx.Tensor,  # int32 view of int64 [G+1]; _load_go reads low word at i32[2*idx]
@@ -1171,6 +1180,8 @@ def _compile_grouped_nt(
                     col_safe=_col_safe,
                     store_aux=_cstore_aux,
                     act_aux=glu_act_aux,
+                    amax_partial=AMAX_PARTIAL if glu_amax else None,
+                    amax_pid=pid,
                     activation=activation,
                     clamp_limit=clamp_limit,
                 )
@@ -1595,6 +1606,7 @@ def _compile_grouped_nt(
             L1: fx.Tensor,
             ACT: fx.Tensor,
             PROBS: fx.Tensor,
+            AMAX_PARTIAL: fx.Tensor,
             A_scale: fx.Tensor,
             B_scale: fx.Tensor,
             group_offs: fx.Tensor,
@@ -1609,6 +1621,7 @@ def _compile_grouped_nt(
                 L1,
                 ACT,
                 PROBS,
+                AMAX_PARTIAL,
                 A_scale,
                 B_scale,
                 group_offs,
@@ -1637,6 +1650,7 @@ def _compile_grouped_nt(
             C,
             C,  # ACT unused without glu
             C,  # PROBS unused without glu
+            C,  # AMAX_PARTIAL unused without glu_amax
             A_scale,
             B_scale,
             group_offs,
