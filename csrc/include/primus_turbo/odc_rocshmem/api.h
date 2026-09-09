@@ -29,7 +29,6 @@ namespace host {
 int       rs_uid_bytes();
 void      rs_get_uid(char *out);
 void      rs_init_uid(int rank, int nranks, const char *bytes);
-void      rs_get_ctx_fields(long long *a, long long *b);
 int       rs_my_pe();
 int       rs_n_pes();
 long long rs_malloc(std::size_t n);
