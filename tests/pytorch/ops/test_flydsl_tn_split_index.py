@@ -68,9 +68,7 @@ def test_split_decode_is_a_bijection(s):
 def test_planner_windows_decode_cleanly(geom, ncu):
     """Sweep the tile counts the planner can see and check every window it settles on."""
     phases = _tn4_phases(geom)
-    windows = {
-        _dense_tn_split(tiles, 4096 // _TN4_BLOCK_K, ncu, phases) for tiles in range(1, 8 * ncu)
-    }
+    windows = {_dense_tn_split(tiles, 4096 // _TN4_BLOCK_K, ncu, phases) for tiles in range(1, 8 * ncu)}
     windows.discard(None)
     assert windows, "the planner produced no split-K window to check"
     for _, nwin, s in sorted(windows):
