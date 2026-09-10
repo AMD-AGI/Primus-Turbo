@@ -38,6 +38,7 @@ Environment variable: PRIMUS_TURBO_GROUPED_GEMM_BACKEND=TRITON activates these k
 from __future__ import annotations
 
 import functools
+import warnings
 
 import torch
 import triton
@@ -84,6 +85,131 @@ def _resolve_variable_k_out(
     return out
 
 
+class ProbeUnavailable(RuntimeError):
+    """The probe could not run; says nothing about whether the tile is sane."""
+
+
+@triton.jit
+def _fp8_block_k_probe_kernel(
+    A,
+    B,
+    C,
+    K,
+    N,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    TRANS_B: tl.constexpr,
+    CACHE_A: tl.constexpr,
+    CACHE_B: tl.constexpr,
+):
+    """fp8 matmul mirroring the real kernel's inner loop: same operand layout,
+    ``tl.multiple_of`` hints and cache modifiers, so the probe compiles the same
+    way as the config it validates."""
+    rm = tl.program_id(0) * BM + tl.arange(0, BM)
+    rn = tl.program_id(1) * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    ap = A + rm[:, None] * K + rk[None, :]
+    bp = B + (rn[None, :] * K + rk[:, None] if TRANS_B else rk[:, None] * N + rn[None, :])
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for _ in range(0, tl.cdiv(K, BK)):
+        a = tl.load(tl.multiple_of(ap, (1, 16)), cache_modifier=CACHE_A)
+        if TRANS_B:
+            b = tl.load(tl.multiple_of(bp, (16, 1)), cache_modifier=CACHE_B)
+        else:
+            b = tl.load(tl.multiple_of(bp, (1, 16)), cache_modifier=CACHE_B)
+        acc += tl.dot(a, b)
+        ap += BK
+        bp += BK if TRANS_B else BK * N
+    tl.store(C + rm[:, None] * N + rn[None, :], acc)
+
+
+def _device_arch() -> str:
+    return torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName.split(":")[0]
+
+
+# Archs where fp8 tl.dot has actually been seen to miscompile; probing elsewhere
+# costs a compile per config and can step down for unrelated reasons.
+_PROBED_ARCHS = frozenset({"gfx1250"})
+# A correct fp8 matmul measures ~92 dB here; 20 dB accepted corrupted results.
+_MIN_PROBE_SNR_DB = 60.0
+
+
+@functools.lru_cache(maxsize=256)
+def _fp8_block_k_is_sane(
+    block_k: int, block_m: int, block_n: int, trans_b: bool, cache_a: str, cache_b: str, arch: str
+) -> bool:
+    """Whether fp8 ``tl.dot`` is correct at this exact config. ``arch`` is part of
+    the cache key so one device's verdict is not reused on another.
+    Raises :class:`ProbeUnavailable` if the probe could not run at all."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    M, N, K = block_m * 2, block_n * 2, max(512, block_k * 4)
+    try:
+        gen = torch.Generator(device=device).manual_seed(0)
+        a = (torch.randn(M, K, device=device, generator=gen) * 0.3).to(torch.float8_e4m3fn)
+        b = (torch.randn(*((N, K) if trans_b else (K, N)), device=device, generator=gen) * 0.3).to(
+            torch.float8_e4m3fn
+        )
+        out = torch.empty(M, N, device=device, dtype=torch.float32)
+        _fp8_block_k_probe_kernel[(M // block_m, N // block_n)](
+            a,
+            b,
+            out,
+            K,
+            N,
+            BM=block_m,
+            BN=block_n,
+            BK=block_k,
+            TRANS_B=trans_b,
+            CACHE_A=cache_a,
+            CACHE_B=cache_b,
+        )
+        torch.cuda.synchronize()
+    except Exception as exc:
+        raise ProbeUnavailable(f"fp8 probe could not run at BLOCK_K={block_k}: {exc}") from exc
+
+    if not torch.isfinite(out).all():
+        return False
+    ref = a.float() @ (b.float().t() if trans_b else b.float())
+    snr = 10 * torch.log10(ref.norm().pow(2) / ((ref - out).norm().pow(2) + 1e-12))
+    return bool(snr > _MIN_PROBE_SNR_DB)
+
+
+def largest_sane_fp8_block_k(
+    preferred: int, block_m: int, block_n: int, trans_b: bool, cache_a: str = ".ca", cache_b: str = ".ca"
+) -> int:
+    """``preferred`` if fp8 ``tl.dot`` is correct at that config, else the largest
+    smaller power-of-two that is. The miscompile is tile- and layout-dependent, so
+    callers must pass the config that will actually run."""
+    arch = _device_arch()
+    if arch not in _PROBED_ARCHS:
+        return preferred
+
+    candidates = [bk for bk in (256, 128, 64, 32) if bk <= preferred]
+    for block_k in candidates:
+        try:
+            sane = _fp8_block_k_is_sane(block_k, block_m, block_n, trans_b, cache_a, cache_b, arch)
+        except ProbeUnavailable as exc:
+            warnings.warn(f"{exc}; using BLOCK_K={preferred} unchecked.", RuntimeWarning, stacklevel=2)
+            return preferred
+        if sane:
+            if block_k != preferred:
+                warnings.warn(
+                    f"fp8 tl.dot miscompiles at BLOCK_K={preferred} (BM={block_m}, BN={block_n}, "
+                    f"trans_b={trans_b}) on {arch} / Triton {triton.__version__}; falling back to "
+                    f"BLOCK_K={block_k}. This is a Triton codegen bug, not a config error.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            return block_k
+
+    raise RuntimeError(
+        f"fp8 tl.dot is incorrect at every BLOCK_K in {candidates} for BM={block_m}, BN={block_n}, "
+        f"trans_b={trans_b} on {arch} with Triton {triton.__version__}. Use a non-Triton "
+        "grouped-GEMM backend (PRIMUS_TURBO_GROUPED_GEMM_BACKEND=fp8:hipblaslt)."
+    )
+
+
 def offline_select_gg_fp8(M_total, G, N, K, s_ak, s_bk):
     """FP8 grouped GEMM config from MI300X bench (out_gg_fp8_persistent_full.yaml).
 
@@ -94,6 +220,7 @@ def offline_select_gg_fp8(M_total, G, N, K, s_ak, s_bk):
 
     BM, BN = 256, 256
     BK = 128 if is_tn else 64
+    BK = largest_sane_fp8_block_k(BK, BM, BN, is_tn)
 
     tiles_m_g = max(1, (avg_m + BM - 1) // BM)
     tiles_n = (N + BN - 1) // BN
@@ -296,6 +423,7 @@ def _get_gg_fp8_rw_fwd_config(
     else:
         blk_m, blk_n = 256, 256
         blk_k = 128 if (stride_ak == 1 and stride_bk == 1) else 64
+        blk_k = largest_sane_fp8_block_k(blk_k, blk_m, blk_n, stride_ak == 1 and stride_bk == 1)
         num_stages_val = 2
         cache_a, cache_b = ".ca", ".ca"
         chunk_size = 32

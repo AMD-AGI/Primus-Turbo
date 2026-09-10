@@ -46,6 +46,7 @@ def pytest_addoption(parser):
 def pytest_configure(config):
     config.addinivalue_line("markers", "multigpu: mark test as requiring multiple GPUs")
     config.addinivalue_line("markers", "deterministic: mark test as deterministic-only suite")
+    config.addinivalue_line("markers", "gfx1250: run this test on gfx1250 despite the blanket skip")
 
 
 def pytest_collection_modifyitems(config, items):
@@ -62,9 +63,12 @@ def pytest_collection_modifyitems(config, items):
         is_gfx1250 = is_gfx1250_jax()
 
     if is_gfx1250:
+        # Tests marked `gfx1250` are known to be meaningful on this arch and opt out of the
+        # blanket skip -- otherwise an arch-specific regression test can never run.
         skip_gfx1250 = pytest.mark.skip(reason="Not yet supported on gfx1250")
         for item in items:
-            item.add_marker(skip_gfx1250)
+            if item.get_closest_marker("gfx1250") is None:
+                item.add_marker(skip_gfx1250)
         return
 
     dist_only = config.getoption("--dist-only", False)
