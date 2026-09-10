@@ -719,6 +719,7 @@ class StoreCPerTensor:
         rd_base=None,
         rd_rows=None,
         rd_shift=None,
+        scale=None,
     ):
         self.beta_is_one = beta_is_one
         self.c_rows = c_rows
@@ -747,8 +748,13 @@ class StoreCPerTensor:
         # Optional f32->f32 epilogue node chain (bias/act), post-scale pre-cast.
         self.elem_fn = elem_fn
         self.scaled = A_scale is not None
+        # a_scale*b_scale is loop-invariant, so a caller that emits this store inside a tile
+        # loop should hoist the load and pass the value: the load is what forces a full
+        # s_waitcnt vmcnt(0) at the first use, and inside a loop that drains every fill the
+        # previous phases issued for the next tile.
+        self._scale_pre = scale
         self.c_base = _buffer_ops.extract_base_index(C) if c_base is None else c_base  # byte base address
-        if self.scaled:
+        if self.scaled and scale is None:
             gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=4)  # 1 fp32
             gSB = fx.rocdl.make_buffer_tensor(B_scale, max_size=False, num_records_bytes=4)  # 1 fp32
             self.sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
@@ -762,11 +768,14 @@ class StoreCPerTensor:
         return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
 
     def _scale(self):
-        """a_scale*b_scale, loaded once per emitting block so the quadrant stores share one
+        """a_scale*b_scale. A value the caller hoisted out of its tile loop is used as is;
+        otherwise it is loaded once per emitting block so the quadrant stores share one
         instance instead of re-issuing both scalar loads. Cached per MLIR block: sibling regions
         each get their own load, since a value in one does not dominate a use in another."""
         if not self.scaled:
             return None
+        if self._scale_pre is not None:
+            return self._scale_pre
         blk = ir.InsertionPoint.current.block
         if self._scale_v is None or self._scale_v[0] != blk:
             self._scale_v = (blk, self._load_scalar(self.sa_div) * self._load_scalar(self.sb_div))
@@ -786,6 +795,10 @@ class StoreCPerTensor:
         """Element address of the value at fragment (ti, tj), row ``i`` of this lane's four."""
         return (ti * 16 + (self.lane_id // 16) * 4 + i) * self.c_cols + base_col + tj * 16 + self.lane_id % 16
 
+    def _col_of(self, ti, i, tj, base_col):
+        """N coordinate of the value at fragment (ti, tj): what a column mask is taken over."""
+        return base_col + tj * 16 + self.lane_id % 16
+
     def _read_back(self, rsrc, ti, i, tj, base_row, base_col):
         """One beta=1 read-back load. ``trans`` swaps the fragment axes (row = N, col = M), so
         the element still lands at C[m, n] and the N bound moves with (ti, i) instead of tj."""
@@ -793,7 +806,7 @@ class StoreCPerTensor:
             n = base_row + ti * 16 + (self.lane_id // 16) * 4 + i  # base_row is the N origin here
             off = (tj * 16 + self.lane_id % 16) * self.c_cols + n
         else:
-            n = base_col + tj * 16 + self.lane_id % 16
+            n = self._col_of(ti, i, tj, base_col)
             off = self._row_col(ti, i, tj, base_col)
         return _buffer_ops.buffer_load(
             rsrc,
@@ -1043,14 +1056,13 @@ class StoreCPerTensorLineN(StoreCPerTensorPairN):
 
     stages_lds = True
 
-    def __init__(self, *args, lds_xpose, scale, **kwargs):
+    def __init__(self, *args, lds_xpose, **kwargs):
         super().__init__(*args, **kwargs)
         assert self.n_tiles_b % 4 == 0, "a line run gathers four n-fragments"
         assert self.col_safe, "a whole-line run has no column mask"
         lane16 = self.lane_id % 16
         quad = lane16 % 4
         self.line_col = quad * 16 + (lane16 // 4) * 4
-        self.scale = scale
         blk = (self.lane_id // 16) * 128
         self._xp_wr = _lds_ptr_from_i32(lds_xpose + blk + quad * 32 + (lane16 // 4) * 8)
         self._xp_rd = _lds_ptr_from_i32(lds_xpose + blk + lane16 * 8)
@@ -1079,7 +1091,7 @@ class StoreCPerTensorLineN(StoreCPerTensorPairN):
             self._retire()
 
     def store(self, c_frag, base_row, base_col, prev=None, tap=None):
-        scale = self.scale
+        scale = self._scale()
         if const_expr(self.beta_is_one) and prev is None:
             prev = self.prefetch(base_row, base_col)
         rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
@@ -1111,18 +1123,59 @@ class StoreCPerTensorLineN(StoreCPerTensorPairN):
 
 class StoreCPerTensorQuadN(StoreCPerTensorPairN):
     """PairN for a kernel whose n-fragments arrived column-interleaved, so a lane already holds
-    the adjacent columns and one unmasked store folds them with no cross-lane step. The caller
-    owns the interleave; the tile must be column-safe."""
+    the adjacent columns and one store folds them with no cross-lane step. The caller owns the
+    interleave; a tile that is not column-safe needs N to be a whole number of runs, since the
+    mask a folded store can carry is one per run."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert self.n_tiles_b in (4, 8), "the interleave folds four or eight n-fragments"
-        assert self.col_safe, "a partial fold has no column mask"
 
     def _row_col(self, ti, i, tj, base_col):
         """The fold hands this lane a whole run of columns, so tj steps by one, not by a tile."""
         row = ti * 16 + (self.lane_id // 16) * 4 + i
         return row * self.c_cols + base_col + (self.lane_id % 16) * self.n_tiles_b + tj
+
+    def _col_of(self, ti, i, tj, base_col):
+        return base_col + (self.lane_id % 16) * self.n_tiles_b + tj
+
+    def prefetch(self, base_row, base_col):
+        """The fold gives a lane a contiguous run, so the beta=1 read-back rides the run the
+        store writes: one vector load per four columns instead of one per column, which fetched
+        the same line four times over."""
+        if not const_expr(self.beta_is_one):
+            return None
+        if self.rd_base is not None or self.rd_shift is not None:
+            return super().prefetch(base_row, base_col)
+        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, self.out_bytes)
+        col0 = base_col + (self.lane_id % 16) * self.n_tiles_b
+        w = 4  # buffer_load's widest element count
+        mask = None if self.col_safe else col0 < self.c_cols
+        runs = [
+            [
+                [
+                    Vec(
+                        _buffer_ops.buffer_load(
+                            rsrc,
+                            (ti * 16 + (self.lane_id // 16) * 4 + i) * self.c_cols + col0 + h * w,
+                            vec_width=w,
+                            dtype=self.out_ty.ir_type,
+                            mask=mask,
+                        )
+                    )
+                    for h in range_constexpr(self.n_tiles_b // w)
+                ]
+                for i in range_constexpr(4)
+            ]
+            for ti in range_constexpr(self.n_tiles_a)
+        ]
+        return [  # _accum indexes [ti][tj][i] and takes the raw element
+            [
+                [_raw(runs[ti][i][tj // w][tj % w]) for i in range_constexpr(4)]
+                for tj in range_constexpr(self.n_tiles_b)
+            ]
+            for ti in range_constexpr(self.n_tiles_a)
+        ]
 
     def store(self, c_frag, base_row, base_col, prev=None):
         scale = self._scale()
@@ -1130,6 +1183,7 @@ class StoreCPerTensorQuadN(StoreCPerTensorPairN):
             prev = self.prefetch(base_row, base_col)
         rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
         col0 = base_col + (self.lane_id % 16) * self.n_tiles_b
+        run_ok = None if self.col_safe else col0 < self.c_cols  # a run is whole in or whole out
         for ti in range_constexpr(self.n_tiles_a):
             row_local = ti * 16 + (self.lane_id // 16) * 4  # relative to base_row
             vecs = [
@@ -1146,6 +1200,7 @@ class StoreCPerTensorQuadN(StoreCPerTensorPairN):
                     Vec.from_elements(dw, fx.Int32).bitcast(self.out_ty),
                     rsrc,
                     ((row_local + i) * self.c_cols + col0) * 2,  # i32-small within band
+                    mask=run_ok,
                     cache_modifier=self.store_aux,
                     offset_is_bytes=True,
                 )
@@ -1783,6 +1838,29 @@ def block_mn(pid, num_pid_m, n_blocks, GM, GN):
     rem_m = num_pid_m - fpm
     gsm = arith.select(rem_m < GM, rem_m, fx.Int32(GM))
     return fpm + (pig % gsm), pig // gsm
+
+
+def xcd_window_mn(d, n_wg, num_pid_m, n_blocks, num_xcd, win_m):
+    """Tile-id -> (block_m, block_n) for a persistent tile loop whose id is ``wg + step*n_wg``.
+
+    A plain GROUP_M raster fixes the super-row width but not where a super-row starts relative
+    to the slots one XCD owns, so whenever ``GM*n_blocks`` does not divide those slots a step
+    straddles two super-rows and its operand footprint jumps from ``GM + slots/GM`` slabs to
+    twice the smaller side. Here the step's window is an aligned ``win_m x (slots/win_m)``
+    rectangle instead, so every step costs the same. Windows advance along n first, which keeps
+    a workgroup's A slab addressed for a whole row of them. Bijection over the tile range;
+    the caller must check ``num_xcd | num_pid_m``, ``win_m | num_pid_m/num_xcd``,
+    ``win_m | slots`` and ``slots/win_m | n_blocks``."""
+    slots = n_wg // num_xcd
+    win_n = slots // win_m
+    rows = num_pid_m // num_xcd
+    n_win_n = n_blocks // win_n
+    wg = d % n_wg
+    step = d // n_wg
+    return (
+        (wg % num_xcd) * rows + (step // n_win_n) * win_m + (wg // num_xcd) % win_m,
+        (step % n_win_n) * win_n + (wg // num_xcd) // win_m,
+    )
 
 
 def make_row_band_resource(c_base, base_row, c_rows, c_cols, elem_bytes, span_rows=None):
