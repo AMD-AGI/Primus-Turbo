@@ -45,6 +45,12 @@ from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     attention_triton_backward_impl,
     attention_triton_forward_impl,
 )
+from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
+    dense_backward as triton_dense_backward,
+)
+from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
+    dense_forward as triton_dense_forward,
+)
 from primus_turbo.pytorch.ops.attention.attention_utils import (
     _infer_qkv_format,
     _resolve_is_v3_atomic_fp32_from_env,
@@ -102,6 +108,27 @@ class FlashAttnFunc(torch.autograd.Function):
         backend: BackendType = BackendType.AITER,
     ):
         ctx.backend = backend
+        if backend == BackendType.TRITON:
+            # The dispatcher only picks this backend when DenseAttnFwdTritonBackend.can_handle
+            # said yes, but FlashAttnFunc.apply is reachable directly, and these arguments have
+            # no kernel behind them here -- accepting them silently would answer a different
+            # problem than the caller asked for.
+            if dropout_p != 0.0:
+                raise ValueError("triton dense attention does not implement dropout")
+            if bias is not None or alibi_slopes is not None:
+                raise ValueError("triton dense attention does not implement bias or alibi_slopes")
+            if return_softmax:
+                raise ValueError("triton dense attention cannot return the softmax matrix")
+            out, lse = triton_dense_forward(
+                q, k, v, softmax_scale=softmax_scale, causal=causal, sink=sink, window_size=window_size
+            )
+            if is_grad_enabled and _any_requires_grad(q, k, v, sink):
+                ctx.save_for_backward(q, k, v, out, lse, sink)
+                ctx.softmax_scale = softmax_scale
+                ctx.causal = causal
+                ctx.window_size = window_size
+            return (out, lse) if return_lse else out
+
         if backend == BackendType.GLUON:
             if is_grad_enabled and _any_requires_grad(q, k, v):
                 raise RuntimeError("gluon flash-attn is forward-only; Q/K/V backward is not implemented")
@@ -259,6 +286,22 @@ class FlashAttnFunc(torch.autograd.Function):
             )
             dq, dk, dv = (g.permute(1, 0, 2, 3) for g in (dq, dk, dv))
             return _flash_attn_grads(dq, dk, dv, None, None)
+
+        if ctx.backend == BackendType.TRITON:
+            q, k, v, out, lse, sink = ctx.saved_tensors
+            dq, dk, dv, dsink = triton_dense_backward(
+                dout,
+                q,
+                k,
+                v,
+                out,
+                lse,
+                softmax_scale=ctx.softmax_scale,
+                causal=ctx.causal,
+                sink=sink,
+                window_size=ctx.window_size,
+            )
+            return _flash_attn_grads(dq, dk, dv, None, dsink)
 
         if ctx.backend == BackendType.FLYDSL:
             q_s, k_s, v_s, out_s, lse = ctx.saved_tensors
