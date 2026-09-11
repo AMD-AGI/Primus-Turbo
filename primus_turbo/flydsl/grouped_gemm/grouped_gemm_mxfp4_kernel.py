@@ -337,7 +337,7 @@ def _build_grouped_mxfp4_nt_kernel(
         and (not dglu)
         and ((not glu) or _GLU_BAND or (_BILV_OK and glu_i % N_TILES_BH == 0))
         and bool(_K128)
-        and (KI_LOOP % 2 == 1 or KI_LOOP >= 4)
+        and KI_LOOP >= 4
     )
     _BILV = N_TILES_BH if (_CSTORE and _BILV_OK) else 0
     _COL_SAFE = (N % _NCB == 0) if glu else (N % BLOCK_N == 0)

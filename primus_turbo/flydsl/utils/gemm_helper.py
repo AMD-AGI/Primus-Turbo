@@ -573,25 +573,36 @@ class ScaleS2R:
     pre-shuffles the raw E8M0 [DIM, K//32] so each wave's 64 lanes read 64 contiguous dwords
     with no per-lane ALU; the A-operand preshuffle comes from ``build_preshuffle_ab_kernel``."""
 
+    # ``_emit_lds_repack`` emits one fixed layout regardless of who reads it: GROUP_ROWS rows
+    # per group, GROUP_TILES dwords per lane, dword s holding row s*16 + lane%16. A wave with
+    # n_tiles < GROUP_TILES owns a sub-tile of a group, so it offsets into that layout instead
+    # of striding by its own 16*n_tiles -- the two only agree at n_tiles == GROUP_TILES.
+    GROUP_ROWS = 64
+    GROUP_TILES = GROUP_ROWS // 16
+
     def __init__(self, sp_tensor, dim, K, n_tiles, pack=1, k128p=None):
+        # Sub-tiles are contiguous per lane, so one buffer_load covers them only while a wave
+        # stays inside a single group; n_tiles past GROUP_TILES would straddle two.
+        assert n_tiles in (1, 2, 4), f"ScaleS2R n_tiles must sub-divide {self.GROUP_TILES}, got {n_tiles}"
         self.K128 = K // 128  # number of K-groups (one i32 per K-iter)
         self.PACK = pack
         self.K128p = ceildiv(self.K128, self.PACK) if k128p is None else k128p
         self.n_tiles = n_tiles
-        self.group_span = 16 * n_tiles
         self.lane = fx.thread_idx.x % 64  # == (lane//16)*16 + lane%16
-        # cdiv (not floor): a non-group_span-multiple ``dim`` (general M) still needs the
+        # cdiv (not floor): a non-GROUP_ROWS-multiple ``dim`` (general M) still needs the
         # partial last 64-row group resident so its valid rows read real scales; the
         # group's OOB rows were preshuffle-masked to 0 and StoreC drops their output.
-        nbytes = ceildiv(dim, self.group_span) * self.K128p * 64 * n_tiles * 4  # int32 records
+        nbytes = ceildiv(dim, self.GROUP_ROWS) * self.K128p * 64 * self.GROUP_TILES * 4  # int32 records
         self.rsrc = _buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
 
     def load(self, base, k, kbase=0):
         """base: runtime global row/col base for this (region, wave). Returns n_tiles i32
         (packed dword for K-group kbase + k//PACK; caller selects byte k%PACK via MFMA
         op_sel). ``kbase``: packed-K base of the group's own region (0 = global packing)."""
-        grp = base // self.group_span
-        idx = ((grp * self.K128p + k // self.PACK + kbase) * 64 + self.lane) * self.n_tiles
+        grp = base // self.GROUP_ROWS
+        idx = ((grp * self.K128p + k // self.PACK + kbase) * 64 + self.lane) * self.GROUP_TILES
+        if self.n_tiles != self.GROUP_TILES:  # a full-group wave always starts at sub-tile 0
+            idx = idx + (base % self.GROUP_ROWS) // 16  # first dword of the sub-tile it owns
         v = Vec(_buffer_ops.buffer_load(self.rsrc, idx, vec_width=self.n_tiles, dtype=T.i32))
         return [v[i].ir_value() for i in range_constexpr(self.n_tiles)]
 
@@ -1884,10 +1895,15 @@ def emit_if_then(cond, then_fn):
     ReplaceIfWithDispatch.scf_if_dispatch(cond, then_fn)
 
 
-def emit_for(stop, body):
-    """Emit a dynamic ``for i in range(stop): body(i)`` with ``i`` as a signed Int32."""
+def emit_for(stop, body, start=None, step=None):
+    """Emit a dynamic ``for i in range(start, stop, step): body(i)``, ``i`` a signed Int32.
+
+    ``start`` / ``step`` default to 0 / 1, i.e. plain ``range(stop)``."""
     InsertEmptyYieldForSCFFor.scf_for_dispatch(
-        fx.Int32(0), stop, fx.Int32(1), lambda iv, _names: body(fx.arith.ArithValue(iv, signed=True))
+        fx.Int32(0) if start is None else start,
+        stop,
+        fx.Int32(1) if step is None else step,
+        lambda iv, _names: body(fx.arith.ArithValue(iv, signed=True)),
     )
 
 
@@ -1908,11 +1924,17 @@ def _emit_lds_repack(
     pack=1,
     kbound=None,
     k128p=None,
+    comb=None,
 ):
     # LDS-tiled transpose body (one workgroup, one (grp,k-chunk)). rd_base/wr_base
     # (default 0) shift the flat read/write offset to a group's slab (0 = dense).
     # kbound (default K128) bounds this chunk's k index; k128p (default ceildiv(K128,pack)) is the output k-stride, so the variable-K wgrad packs each group from its own k0.
+    # comb (B only, default (256,128)) is the (tile-block, second-half) row stride pair: a
+    # group already interleaves the block's two 128-column halves, which is what lets the
+    # reader split one ScaleBComb load in two. Widening the second stride past the block
+    # makes those halves two distant bands -- the fused GLU's gate and up.
     NT = 4
+    CB_BLK, CB_HALF = comb if comb is not None else (256, 128)
     TILE = 64 * KT
     assert KT % pack == 0 and TILE % BLK == 0 and ((KT // pack) * 64) % BLK == 0
     KBND = K128 if kbound is None else kbound
@@ -1924,9 +1946,9 @@ def _emit_lds_repack(
         if is_a:
             grow = grp * 64 + rr  # A: rows grp*64 + (s*16+r)
         else:
-            s = rr // 16  # B-comb: row = nblk*256 + wn*32 + OFF[s] + rinner
-            off = (s % 2) * fx.Int32(16) + (s // 2) * fx.Int32(128)
-            grow = (grp // 4) * 256 + (grp % 4) * 32 + off + (rr % 16)
+            s = rr // 16  # B-comb: row = nblk*CB_BLK + wn*32 + OFF[s] + rinner
+            off = (s % 2) * fx.Int32(16) + (s // 2) * fx.Int32(CB_HALF)
+            grow = (grp // 4) * CB_BLK + (grp % 4) * 32 + off + (rr % 16)
         dw = _buffer_ops.buffer_load(
             rin,
             grow * K128 + gk + rd_base,

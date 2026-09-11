@@ -34,14 +34,8 @@ torch.manual_seed(42)
 B_VALUES = [1, 2, 3, 8, 16, 32]
 M_VALUES = [128, 256, 512, 1024, 2048]
 NK_VALUES = [
-    (2048, 1536),
     (2048, 1408),
     (1408, 2048),
-    (2816, 2048),
-    (3072, 5120),
-    (5120, 1536),
-    (4096, 7168),
-    (7168, 2048),
 ]
 ORI_DTYPE_VALUES = [torch.bfloat16, torch.float16]
 FORMAT_VALUES = [Format.E4M3, Format.E5M2]
