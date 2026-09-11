@@ -805,3 +805,97 @@ def test_gemm_fp8_mx_fused_grad_accum(dtype, format, backend):
         block_size=MXFP8_BLOCK_SIZE,
         scale_dtype=ScaleDtype.E8M0,
     )
+
+
+def _run_gemm_fp8_flydsl_tn_wgrad_split_k_test(
+    m: int,
+    n: int,
+    k: int,
+    dtype: torch.dtype,
+    format: Format,
+    repeats: int = 10,
+):
+    """FlyDSL NT forward drives a TN wgrad on gfx950; split-K must decode ids exactly.
+
+    These shapes land in a split-K window whose fixed-point reciprocal was too narrow, which
+    showed up as non-finite or launch-varying ``b.grad`` once the workspace was reused. The
+    operator check is bitwise-stable ``b.grad`` across repeats plus the usual SNR gate.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    if get_device_compute_capability() < (9, 5):
+        pytest.skip("FlyDSL dense-TN split-K wgrad is gfx950-only")
+
+    GlobalBackendManager.set_gemm_backend(BackendType.FLYDSL)
+    GlobalBackendManager.set_auto_tune(False)
+
+    try:
+        device = "cuda:0"
+        torch.manual_seed(42)
+        torch.cuda.manual_seed_all(42)
+
+        trans_a, trans_b = False, True  # NT forward; gfx950 backward wgrad is TN
+        a_shape = (m, k)
+        b_shape = (n, k)
+
+        print(f"\n[flydsl tn wgrad] M={m}, N={n}, K={k}, dtype={dtype}, format={format}, repeats={repeats}")
+
+        a0 = torch.randn(a_shape, dtype=dtype, device=device)
+        b0 = torch.randn(b_shape, dtype=dtype, device=device)
+
+        a_ref = a0.detach().clone().requires_grad_()
+        b_ref = b0.detach().clone().requires_grad_()
+        c_ref = a_ref @ b_ref.T
+        grad_c = torch.randn_like(c_ref)
+        c_ref.backward(grad_c)
+        torch.cuda.synchronize()
+
+        config = Float8QuantConfig(granularity=ScalingGranularity.TENSORWISE, format=format)
+
+        def _run_once():
+            a = a0.detach().clone().requires_grad_()
+            b = b0.detach().clone().requires_grad_()
+            c = gemm_fp8(a, b, trans_a, trans_b, dtype, config)
+            c.backward(grad_c)
+            return c.detach(), a.grad.detach(), b.grad.detach()
+
+        outs = []
+        for _ in range(repeats):
+            outs.append(_run_once())
+            torch.cuda.synchronize()
+
+        c0, da0, db0 = outs[0]
+        for i in range(1, repeats):
+            ci, dai, dbi = outs[i]
+            torch.testing.assert_close(c0, ci, rtol=0, atol=0)
+            torch.testing.assert_close(da0, dai, rtol=0, atol=0)
+            torch.testing.assert_close(db0, dbi, rtol=0, atol=0)
+
+        snr_threshold = 25 if format == Format.E4M3 else 20
+        c_snr = compute_snr(c_ref, c0)
+        a_grad_snr = compute_snr(a_ref.grad, da0)
+        b_grad_snr = compute_snr(b_ref.grad, db0)
+        print(
+            f"flydsl tn wgrad: C-SNR={c_snr:.2f} dB, AGrad-SNR={a_grad_snr:.2f} dB, "
+            f"BGrad-SNR={b_grad_snr:.2f} dB"
+        )
+        assert c_snr > snr_threshold, "c_snr too low"
+        assert a_grad_snr > snr_threshold, "a_grad_snr too low"
+        assert b_grad_snr > snr_threshold, "b_grad_snr too low"
+    finally:
+        GlobalBackendManager.reset()
+
+
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (2880, 4096, 4096),
+        (3072, 4096, 4096),
+        (4096, 2880, 4096),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("format", [Format.E4M3])
+@pytest.mark.deterministic
+def test_gemm_fp8_flydsl_tn_wgrad_split_k(m, n, k, dtype, format):
+    _run_gemm_fp8_flydsl_tn_wgrad_split_k_test(m, n, k, dtype, format)
