@@ -264,8 +264,25 @@ def shear_mbias(m_row, ksm):
     return (m_row * fx.Int32(ksm)) % fx.Int32(128)
 
 
+def g2s_lds_imm(step, lds_step):
+    """Part of a wave-major g2s step's LDS offset that fits the buffer instruction's 12-bit
+    immediate; the rest (a multiple of 4096) still has to go through M0.  ``lds_step`` 0 marks
+    the legacy step-major fill, where every step needs its own M0 write."""
+    return (step % (4096 // lds_step)) * lds_step if lds_step else 0
+
+
 class G2SLoader:
-    def __init__(self, gl_src, gl_offsets, n_load_steps, lds_dtype, wave_id, chunk_stride=1024, rebase=None):
+    def __init__(
+        self,
+        gl_src,
+        gl_offsets,
+        n_load_steps,
+        lds_dtype,
+        wave_id,
+        chunk_stride=1024,
+        rebase=None,
+        lds_step=0,
+    ):
         self.g2lds_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
         self.LdsPtr_t = fx.PointerType.get(lds_dtype, 2, 512)
         self.gl_src = gl_src
@@ -279,6 +296,10 @@ class G2SLoader:
         # span at < 2^32 fp8). A (arg_i8, fp8_ir_t, base_elems, num_records_bytes) tuple re-bases
         # the SRD per load instead (k_offset folds into the i64 base), lifting the cap.
         self.rebase = rebase
+        # Wave-major fill: this wave's chunks sit ``lds_step`` apart instead of one whole-WG
+        # step apart. ``gl_offsets`` arrives with that immediate already taken out; this path
+        # emits no immediate, so it puts it back on the soffset.
+        self.lds_step = lds_step
 
     def _src_div(self, k_offset):
         """(divided source tensor, soffset) for one load. int32 path returns the
@@ -298,7 +319,10 @@ class G2SLoader:
 
     def _lds_dst_at(self, lds_dst, step, base_off=None):
         cs = self.chunk_stride
-        step_off = self.wave_id * cs + step * (self.n_waves * cs)
+        if self.lds_step:
+            step_off = self.wave_id * (self.n_load_steps * cs) + step * cs
+        else:
+            step_off = self.wave_id * cs + step * (self.n_waves * cs)
         base_i32 = fx.Int32(fx.ptrtoint(lds_dst.ptr))
         if base_off is not None:  # runtime LDS-stage byte offset (double-buffer parity)
             base_i32 = base_i32 + base_off
@@ -311,7 +335,9 @@ class G2SLoader:
         for step in range_constexpr(self.n_load_steps):
             src = fx.slice(src_div, (None, fx.Int32(self.gl_offsets[step])))
             dst = self._lds_dst_at(lds_dst, step, base_off)
-            fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(soff))
+            imm = g2s_lds_imm(step, self.lds_step)
+            so = fx.Int32(soff) + fx.Int32(imm) if imm else fx.Int32(soff)
+            fx.copy(self.g2lds_atom, src, dst, soffset=so)
 
 
 def pack_i32x4_i32x8(lo, hi):
