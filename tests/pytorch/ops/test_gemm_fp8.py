@@ -838,9 +838,7 @@ def _run_gemm_fp8_flydsl_tn_wgrad_split_k_test(
         a_shape = (m, k)
         b_shape = (n, k)
 
-        print(
-            f"\n[flydsl tn wgrad] M={m}, N={n}, K={k}, dtype={dtype}, format={format}, repeats={repeats}"
-        )
+        print(f"\n[flydsl tn wgrad] M={m}, N={n}, K={k}, dtype={dtype}, format={format}, repeats={repeats}")
 
         a0 = torch.randn(a_shape, dtype=dtype, device=device)
         b0 = torch.randn(b_shape, dtype=dtype, device=device)
