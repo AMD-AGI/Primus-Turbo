@@ -11,7 +11,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from primus_turbo.pytorch.ops.activation import geglu_with_probs, swiglu_with_probs
+from primus_turbo.pytorch.ops.activation import (
+    geglu_with_probs,
+    swiglu_with_probs,
+)
 from tests.pytorch.test_utils import get_tolerances
 
 torch.manual_seed(42)

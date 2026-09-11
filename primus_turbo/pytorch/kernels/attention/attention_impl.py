@@ -29,7 +29,7 @@ from primus_turbo.pytorch.core.backend import (
     KernelBackend,
     TuneCache,
 )
-from primus_turbo.pytorch.core.utils import get_device_compute_capability
+from primus_turbo.pytorch.core.utils import get_device_compute_capability, is_gfx1250
 from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
     attention_aiter_forward_impl,
     attention_aiter_varlen_forward_impl,
@@ -41,6 +41,9 @@ from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
 from primus_turbo.pytorch.kernels.attention.attention_hipkittens_impl import (
     flash_attn_sbhd_hipkittens_forward_impl,
     hipkittens_attn_supported_impl,
+)
+from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
+    dense_forward as _triton_dense_forward,
 )
 
 _GFX950 = (9, 5)
@@ -60,6 +63,17 @@ def _sink_ok(sink: Optional[torch.Tensor], num_heads_q: int) -> bool:
     """A sink must be fp32 [Hq] for FlyDSL to fold it into the softmax denominator; None
     (no sink) is fine, anything else falls back to aiter."""
     return sink is None or (sink.dtype == torch.float32 and sink.numel() == num_heads_q)
+
+
+def _triton_sink_ok(sink: Optional[torch.Tensor], num_heads_q: int) -> bool:
+    """Same per-head-scalar rule as _sink_ok, but any float dtype.
+
+    The fp32 requirement there is FlyDSL's. attention_triton_impl.dense_forward casts the
+    sink itself (``sink.contiguous().float()``), so demanding fp32 here would send a bf16
+    sink -- what gpt-oss trains with -- to aiter, and on gfx1250 that means the CK path
+    this backend exists to keep clear of.
+    """
+    return sink is None or (sink.is_floating_point() and sink.numel() == num_heads_q)
 
 
 def _gqa_group_ok(num_heads_q: int, num_heads_kv: int) -> bool:
@@ -297,6 +311,58 @@ class DenseAttnFwdHipkittensBackend(KernelBackend):
         return res.permute(1, 0, 2, 3)
 
 
+class DenseAttnFwdTritonBackend(KernelBackend):
+    """Portable Triton attention: no CK, no aiter, no arch-specific extension.
+
+    The only dense backend that runs on gfx1250 -- FlyDSL and HipKittens target other archs,
+    and the aiter path reaches CK, whose fmha backward rejects the call at runtime after the
+    forward has succeeded. Narrow by construction, matching what the kernel asserts.
+    """
+
+    @staticmethod
+    def can_handle(
+        q,
+        k=None,
+        v=None,
+        dropout_p=0.0,
+        softmax_scale=None,
+        causal=True,
+        window_size=(-1, -1),
+        bias=None,
+        alibi_slopes=None,
+        sink=None,
+        qkv_format="bshd",
+        return_softmax=False,
+        **kwargs,
+    ) -> bool:
+        # Validated on gfx1250 only; widen once another arch has numbers.
+        if not is_gfx1250():
+            return False
+        # Any layout is fine: the tensors are always shaped [b, s, h, d] and qkv_format only
+        # names the byte order, which the adapter normalises with .contiguous(). Gating on
+        # "bshd" looked safe but only ever passed by accident -- _infer_qkv_format cannot tell
+        # sbhd from bshd at b == 1, so a batch of one slipped through and any larger batch was
+        # refused.
+        if k is None or v is None:
+            return False
+        # No kernel support for these; returning True would compute a wrong answer silently.
+        if bias is not None or alibi_slopes is not None:
+            return False
+        # A sink is one extra softmax term per head, so it must be a per-head scalar.
+        if not _triton_sink_ok(sink, q.shape[2]):
+            return False
+        if dropout_p != 0.0 or return_softmax:
+            return False
+        return q.dtype in (torch.bfloat16, torch.float16)
+
+    @staticmethod
+    def execute(q, k, v, softmax_scale, causal, window_size, return_lse=True, sink=None, **kwargs):
+        out, lse = _triton_dense_forward(
+            q, k, v, softmax_scale=softmax_scale, causal=causal, sink=sink, window_size=window_size
+        )
+        return (out, lse) if return_lse else out
+
+
 class DenseAttnFwdGluonBackend(KernelBackend):
     @staticmethod
     def can_handle(
@@ -367,6 +433,7 @@ _DENSE_FWD_BACKENDS = {
     BackendType.AITER: BackendEntry(DenseAttnFwdAiterBackend),
     BackendType.HIPKITTENS: BackendEntry(DenseAttnFwdHipkittensBackend),
     BackendType.GLUON: BackendEntry(DenseAttnFwdGluonBackend, autotune=False),
+    BackendType.TRITON: BackendEntry(DenseAttnFwdTritonBackend),
 }
 
 

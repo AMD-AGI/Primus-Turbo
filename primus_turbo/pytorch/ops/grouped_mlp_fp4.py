@@ -130,6 +130,7 @@ def _quantize_weight(
             block_size=MXFP4_BLOCK_SIZE,
             scaling_recipe=recipe,
             scaling_recipe_for_trans=recipe,
+            scale_rounding_mode=config.scale_rounding_mode,
         )
 
     assert not w._is_grouped_tensor, "an expert weight must not be a grouped tensor"
@@ -142,9 +143,11 @@ def _quantize_weight(
             axis=-2,
             block_size=config.block_size,
             scaling_recipe=recipe,
+            scale_rounding_mode=config.scale_rounding_mode,
         )
     else:
         assert isinstance(w_t, QuantizedTensor)
+        check_quantized_tensor(w_t, config, axis=-2, scaling_recipe=recipe)
     return w.qdata, w.scale_inv, w_t.qdata, w_t.scale_inv
 
 
@@ -213,6 +216,7 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
                 block_size=MXFP4_BLOCK_SIZE,
                 scaling_recipe=x_scaling_recipe,
                 scaling_recipe_for_trans=x_t_scaling_recipe,
+                scale_rounding_mode=config.scale_rounding_mode,
             )
         else:
             check_quantized_tensor(x, config, axis=-1, scaling_recipe=x_scaling_recipe)
@@ -227,9 +231,11 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
                     block_size=config.block_size,
                     scaling_recipe=x_t_scaling_recipe,
                     group_lens=group_lens,
+                    scale_rounding_mode=config.scale_rounding_mode,
                 )
             else:
                 assert isinstance(x_t, QuantizedTensor)
+                check_quantized_tensor(x_t, config, axis=-2, scaling_recipe=x_t_scaling_recipe)
             x_col, x_col_scale = x_t.qdata, x_t.scale_inv
 
         w1_row, w1_row_scale, w1_col, w1_col_scale = _quantize_weight(w1, w1_t, config)
@@ -337,6 +343,7 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
             block_size=ctx.config.block_size,
             scaling_recipe=ScalingRecipe(use_sr=sr),
             scaling_recipe_for_trans=ScalingRecipe(use_sr=sr, use_rht=True),
+            scale_rounding_mode=ctx.config.scale_rounding_mode,
         )
 
         # grad_w2 = gradO_col(rht=T) @ act_col(rht=T)^T, contracting M.

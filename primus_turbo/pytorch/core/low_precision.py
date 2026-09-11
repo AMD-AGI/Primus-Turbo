@@ -238,6 +238,8 @@ class Float4QuantConfig:
     block_size: int = 32
     use_gradient_sr: bool = False
     use_preshuffle: bool = False
+    # E8M0 scale exponent bias: 0=half ULP, 1=one ULP, 2=three-eighths ULP.
+    scale_rounding_mode: int = 0
 
     def __fx_repr__(self) -> Tuple[str, dict]:
         return _quant_config_fx_repr(self)
@@ -252,6 +254,7 @@ class Float4QuantConfig:
             f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
         )
         assert self.format == Format.E2M1_X2, "Format must be E2M1_X2 for Float4QuantConfig"
+        assert self.scale_rounding_mode in (0, 1, 2), "scale_rounding_mode must be 0, 1, or 2"
 
         mx_support_scale_dtype = ScaleDtype.E8M0
         assert self.scale_dtype == mx_support_scale_dtype, (
