@@ -25,9 +25,17 @@ from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T as _T
 from flydsl.expr.typing import Vector as Vec
 
-from primus_turbo.flydsl.utils.gemm_helper import make_row_band_resource, make_row_band_resource_div
+from primus_turbo.flydsl.utils.gemm_helper import (
+    group_m_tile_decode,
+    make_row_band_resource,
+    make_row_band_resource_div,
+    xcd_band_remap_pid,
+)
 
-_CM = 1  # glc: bypass L2 on output stores
+# Scale stores are byte-granular and rely on L2 merging the write masks into whole lines.
+_CM = 1  # glc
+# Data-store policy: `nt` speeds the cast up but the consuming GEMM hands it all back.
+_CMD = 1  # glc
 _OOB = 0x7FFFFFFF  # past-end buffer offset -> HW drops the access
 
 
@@ -94,6 +102,7 @@ def _store_scale(buf, buf_bytes, dword, jbyte, e8_i32, pack, ok=None, cm=_CM, ba
     else:
         # pack>1: byte-granular store (L2 byte-write-mask merges, no dword RMW) so the dword's
         # bytes from different M-block workgroups don't need a cross-CU atomicrmw. ``ok`` masks OOB.
+        # The scale plane costs LINES, not stores -- line sharing is what ``xcd_band`` cuts.
         rsrc = bo.create_buffer_resource(buf, max_size=False, num_records_bytes=I32(buf_bytes))
         byte_off = (dword << I32(2)) | jbyte
         if _has_base:
@@ -122,13 +131,10 @@ def raw_scale_int32(free, contract):
     return (nbytes + 3) // 4
 
 
-def _decode_pid(pid, nbk, nbm, swz):
-    """pid -> (br, bk). swz=False: row-major (br=pid//nbk). swz=True: column-major
-    (bk=pid//nbm) so consecutive pids vary br. Python-level (NOT in the kernel body) so the
-    compile-time branch isn't rewritten into runtime control flow by the AST rewriter."""
-    if swz:
-        bk = pid // nbm
-        return pid - bk * nbm, bk
+def _decode_pid(pid, nbk):
+    """pid -> (br, bk), row-major. The dense path walks tiles through ``group_m_tile_decode``
+    so it can trade the two output planes' run lengths off against each other; the grouped
+    path has one row block per expert slab and nothing to trade."""
     br = pid // nbk
     return br, pid - br * nbk
 
@@ -174,14 +180,27 @@ def _tile_scales(is_2d, lamax, lamaxes, lane, va, ep_sub, IRI):
     return out
 
 
+# Long-run walk for casts scattered on BOTH padded dims: krun lengthens the read and row
+# runs, an XCD-owned pid band lengthens the col write.
+_QD_KRUN = 3
+_QD_LONG_BAND = 8
+_QD_LONG_STRIDE = 8192
+
+
 def _qdual_tile_cfg(M, K, Mp, Kp):
     """Per-shape tile config for the dual-cast quant kernel (all bit-identical). Default bm=128,bk=128 gives
     BOTH ROW and COL a full 128B write burst (write-burst granularity is the limiter, not
-    occupancy). Large-K small-M (Kp>=8192, Mp<=4096) uses bm=128,bk=64 + grid swizzle to avoid
-    DRAM-channel camping."""
+    occupancy). Large-K small-M (Kp>=8192, Mp<=4096) uses bm=128,bk=64 + a column-major walk
+    to avoid DRAM-channel camping. Shapes scattered on both axes take the long-run config."""
     if Kp >= 8192 and Mp <= 4096:
-        return dict(bm=128, bk=64, pad_extra=4, grid_swz=True)
-    return dict(bm=128, bk=128, nth=1024, pad_extra=4)
+        return dict(bm=128, bk=64, pad_extra=4, grid_gm=0, krun=1, xcd_band=0)
+    bm, bk = 128, 128
+    long_run = Mp >= _QD_LONG_STRIDE and Kp >= _QD_LONG_STRIDE and (Kp // bk) % _QD_KRUN == 0
+    if long_run:
+        walk = dict(grid_gm=0, xcd_band=_QD_LONG_BAND, krun=_QD_KRUN)
+    else:
+        walk = dict(grid_gm=1, xcd_band=0, krun=1)
+    return dict(bm=bm, bk=bk, nth=1024, pad_extra=4, **walk)
 
 
 # ============================================================================
@@ -201,11 +220,16 @@ def compile_qdual(
     Kp=None,
     cm_row=_CM,
     cm_col=_CM,
+    cm_data_row=_CMD,
+    cm_data_col=_CMD,
     pad_extra=4,
-    grid_swz=False,
+    grid_gm=1,
+    xcd_band=0,
+    num_xcd=8,
     bm=64,
     bk=128,
     nth=512,
+    krun=1,
     row_2d=False,
     col_2d=False,
 ):
@@ -213,7 +237,13 @@ def compile_qdual(
     (bm*bk==16*nth); ROW half writes fp8+E8M0, COL half stages the transpose through LDS for a
     coalesced write-back (see file-header contract). Real-dim per-expert buffers (row [B,M,Kp],
     col [B,K,Mp]); each workgroup does one (batch, M-tile, K-tile), masking pad rows/cols. Tile
-    shape trades the full-128B-burst side; grid_swz = column-major pids (anti DRAM camping)."""
+    shape trades the full-128B-burst side; ``grid_gm`` is the row-block depth of the pid walk
+    (1 = row-major, 0 = column-major, k = k row blocks per column block) and
+    ``xcd_band`` (0 = off) hands each XCD runs of that many consecutive tiles, without which
+    the hardware's round-robin pid->XCD split scatters every super-tile across all eight L2s.
+    ``cm_row``/``cm_col`` are the E8M0 scale-store policies, ``cm_data_row``/``cm_data_col``
+    the fp8 data-store ones; they are separate axes (see _CMD). ``krun`` is how many consecutive
+    K-tiles one workgroup walks (see _QD_KRUN)."""
     if elt is None:
         elt = fx.BFloat16
     va, ep_sub, sat_bnd, cvt = fp8_params(out_fp8)
@@ -227,9 +257,14 @@ def compile_qdual(
     PAD_L = BKv + pad_extra
     SCMASK = (K % 4) != 0
     LMASK = (Kp != K) and not SCMASK
+    # vec8 load path when K%8==0: an 8-col block never straddles the K-pad boundary.
+    USE_V8 = (not SCMASK) and (K % 8 == 0)
     NBK = Kp // BKv
     NBM = Mp // BMv
-    NPB = NBM * NBK  # tiles per batch
+    assert NBK % krun == 0, f"krun={krun} must divide NBK={NBK}"
+    NBKG = NBK // krun  # K-tile groups: one workgroup walks krun tiles of a group
+    NPB = NBM * NBKG  # workgroups per batch
+    GRID_GM = NBM if grid_gm == 0 else min(grid_gm, NBM)
     VPR = BKv // 4
     NKB = BKv // 32
     NMB = BMv // 32
@@ -249,6 +284,7 @@ def compile_qdual(
     # col buffers K real rows; tile padding rows HW-drop via the per-batch band num_records, and the
     # scale byte stores add a boundary mask so they can't spill into the next batch. Per-batch scale
     # byte counts are dword-aligned (Kp//32, Mp//32 mult of 4) -> base_byte keeps dword-packing.
+    _use_2d = row_2d or col_2d
     PB_A_BYTES = M * (Kp // 32)
     PB_AT_BYTES = K * (Mp // 32)
     SP_A_BYTES = PB_A_BYTES * B
@@ -262,8 +298,6 @@ def compile_qdual(
         z = I32(0)
         IRI = fx.Int32.ir_type
 
-        _use_2d = row_2d or col_2d
-
         @fx.struct
         class Smem:
             tile: fx.Array[elt, BMv * PAD_L, 16]
@@ -276,7 +310,8 @@ def compile_qdual(
         pid = fx.block_idx.x
         batch = pid // I32(NPB)
         pib = pid - batch * I32(NPB)
-        br, bk = _decode_pid(pib, I32(NBK), I32(NBM), grid_swz)
+        ptile = xcd_band_remap_pid(pib, NPB, num_xcd, xcd_band)
+        br, bkg = group_m_tile_decode(ptile, NBM, NBKG, GRID_GM)
         # per-batch scale byte bases (dword-aligned; keeps the dword-packing invariant)
         base_row_b = batch * I32(PB_A_BYTES)
         base_col_b = batch * I32(PB_AT_BYTES)
@@ -284,274 +319,281 @@ def compile_qdual(
         rx = make_row_band_resource(
             bo.extract_base_index(X), batch * I32(M), (batch + I32(1)) * I32(M), I32(K), 2
         )
-        gbase = (br * I32(BMv)) * I32(K) + bk * I32(BKv)
-        # vec8 (16B) load path when K%8==0: each 8-col block is one side of the K-pad boundary, so
-        # a single masked base redirect is exact -- halves the load/LDS-fill instruction count.
-        USE_V8 = (not SCMASK) and (K % 8 == 0)
-        if USE_V8:
-            VPR8 = BKv // 8
-            ITERS8 = BMv * BKv // 8 // NTHv
-            for ls in range_constexpr(ITERS8):
-                lin = t + I32(ls * NTHv)
-                lr = lin // I32(VPR8)
-                cv = (lin - lr * I32(VPR8)) * I32(8)
-                pbase = lr * I32(PAD_L) + cv
-                ioff = gbase + lr * I32(K) + cv
-                if LMASK:
-                    ioff = (bk * I32(BKv) + cv < I32(K)).select(ioff, I32(_OOB))
-                v = bo.buffer_load(rx, ioff, vec_width=8, dtype=BF)
-                p = fx.add_offset(tile.ptr, fx.make_int_tuple(pbase))
-                fx.make_view(p, fx.make_layout(8, 1)).store(Vec(v))
-        else:
-            ITERS = BMv * BKv // 4 // NTHv
-            for ls in range_constexpr(ITERS):
-                lin = t + I32(ls * NTHv)
-                lr = lin // I32(VPR)
-                cv = (lin - lr * I32(VPR)) * I32(4)
-                pbase = lr * I32(PAD_L) + cv
-                if SCMASK:
-                    for j in range_constexpr(4):
-                        gcj = bk * I32(BKv) + cv + I32(j)
-                        vj = bo.buffer_load(
-                            rx, gbase + lr * I32(K) + cv + I32(j), vec_width=1, dtype=BF, mask=(gcj < I32(K))
-                        )
-                        pj = fx.add_offset(tile.ptr, fx.make_int_tuple(pbase + I32(j)))
-                        fx.make_view(pj, fx.make_layout(1, 1)).store(Vec.from_elements([vj], elt))
-                else:
-                    ioff = gbase + lr * I32(K) + cv
-                    if LMASK:
-                        ioff = (bk * I32(BKv) + cv < I32(K)).select(ioff, I32(_OOB))
-                    v = bo.buffer_load(rx, ioff, vec_width=4, dtype=BF)
-                    p = fx.add_offset(tile.ptr, fx.make_int_tuple(pbase))
-                    fx.make_view(p, fx.make_layout(4, 1)).store(Vec(v))
-        _llvm.inline_asm(
-            res=None,
-            operands_=[],
-            asm_string="s_waitcnt vmcnt(0) lgkmcnt(0)",
-            constraints="",
-            has_side_effects=True,
-        )
-        rocdl.s_barrier()
         half = t // I32(HALF)
         lt = t - half * I32(HALF)
-        if _use_2d:
-            # 2d-capable warp-reduce layout (HIP quantize_mxfp8_dual parity): each 64-lane warp
-            # owns one 32x32 chunk as 8 rows_in_warp x 8 threads_per_row, each thread 4 passes of
-            # 4 elems. warp_reduce_8 gives the per-32 (1D) scale, warp_reduce_64 the shared 32x32
-            # (2D-block) scale -- both via ds_bpermute, so no Phase-0 pass / extra barrier.
-            lane = t & I32(63)
-            wp = lt >> I32(6)  # warp within this half
-            riw = lane >> I32(3)  # row_in_warp 0..7
-            tir = lane & I32(7)  # thread_in_row 0..7
-            if half == z:
-                rqr = make_row_band_resource(
-                    bo.extract_base_index(Qr), batch * I32(M), (batch + I32(1)) * I32(M), I32(Kp), 1
-                )
-                for rnd in range_constexpr(ROUNDS):
-                    ci = wp + I32(rnd * NWARPS)
-                    cm2 = ci // I32(NKB)  # M-chunk 0..NMB-1
-                    cn2 = ci - cm2 * I32(NKB)  # K-chunk 0..NKB-1
-                    tcol0 = cn2 * I32(32) + (tir << I32(2))
-                    vals = []
-                    lamaxes = []
-                    lamax = F32(0.0)
-                    for p in range_constexpr(4):
-                        trow = cm2 * I32(32) + I32(p * 8) + riw
-                        pp = fx.add_offset(tile.ptr, fx.make_int_tuple(trow * I32(PAD_L) + tcol0))
-                        v4 = Vec(fx.make_view(pp, fx.make_layout(4, 1)).load()).to(F32)
-                        vals.append(v4)
-                        a = fm.absf(v4).reduce("max")
-                        lamaxes.append(a)
-                        lamax = (lamax > a).select(lamax, a)
-                    scales = _tile_scales(row_2d, lamax, lamaxes, lane, va, ep_sub, IRI)
-                    kcol = bk * I32(BKv // 32) + cn2
-                    for p in range_constexpr(4):
-                        ep_p, inv_p = scales[p]
-                        qf = vals[p] * inv_p
-                        word = I32(cvt(IRI, _sat(qf[0], sat_bnd), _sat(qf[1], sat_bnd), z, 0))
-                        word = I32(cvt(IRI, _sat(qf[2], sat_bnd), _sat(qf[3], sat_bnd), word, 1))
-                        grow = br * I32(BMv) + cm2 * I32(32) + I32(p * 8) + riw
-                        gcol = bk * I32(BKv) + cn2 * I32(32) + (tir << I32(2))
-                        # band holds M real rows/batch: grow>=M fp8 stores land OOB and HW-drop.
-                        bo.buffer_store(
-                            word, rqr, grow * I32(Kp) + gcol, cache_modifier=cm_row, offset_is_bytes=True
-                        )
-                        # one E8M0 byte per (row, 32-K-block), written by thread_in_row 0 only.
-                        dword, jbyte = _raw_scale_dword(grow, kcol, SCALEN_ROW)
-                        _store_scale(
-                            ASp,
-                            SP_A_BYTES,
-                            dword,
-                            jbyte,
-                            ep_p + I32(127),
-                            4,
-                            ok=(grow < I32(M)) & (tir == z),
-                            cm=cm_row,
-                            base_byte=base_row_b,
-                        )
-            else:
-                for rnd in range_constexpr(ROUNDS):
-                    ci = wp + I32(rnd * NWARPS)
-                    ckc = ci // I32(NMB)  # K-feature chunk 0..NKB-1
-                    cmc = ci - ckc * I32(NMB)  # M chunk 0..NMB-1
-                    m0 = cmc * I32(32) + (tir << I32(2))
-                    vals = []
-                    lamaxes = []
-                    lamax = F32(0.0)
-                    for p in range_constexpr(4):
-                        loc_c = ckc * I32(32) + I32(p * 8) + riw
-                        base = fx.add_offset(tile.ptr, fx.make_int_tuple(m0 * I32(PAD_L) + loc_c))
-                        v4 = Vec(fx.make_view(base, fx.make_layout(4, PAD_L)).load()).to(F32)
-                        vals.append(v4)
-                        a = fm.absf(v4).reduce("max")
-                        lamaxes.append(a)
-                        lamax = (lamax > a).select(lamax, a)
-                    scales = _tile_scales(col_2d, lamax, lamaxes, lane, va, ep_sub, IRI)
-                    for p in range_constexpr(4):
-                        cep_p, cinv_p = scales[p]
-                        cq = vals[p] * cinv_p
-                        word = I32(cvt(IRI, _sat(cq[0], sat_bnd), _sat(cq[1], sat_bnd), z, 0))
-                        word = I32(cvt(IRI, _sat(cq[2], sat_bnd), _sat(cq[3], sat_bnd), word, 1))
-                        loc_c = ckc * I32(32) + I32(p * 8) + riw
-                        # stage into the c-major LDS (DWPC words/K-col) for the shared coalesced
-                        # write-back; this thread's 4 M live at word (cmc*8 + thread_in_row).
-                        sp = fx.add_offset(
-                            ldsc.ptr, fx.make_int_tuple(loc_c * I32(DWPC) + cmc * I32(8) + tir)
-                        )
-                        fx.make_view(sp, fx.make_layout(1, 1)).store(Vec.from_elements([word], fx.Int32))
-                        gc = bk * I32(BKv) + loc_c
-                        mcol = br * I32(BMv // 32) + cmc
-                        dword_bc, jbyte_bc = _raw_scale_dword(gc, mcol, SCALEN_COL)
-                        _store_scale(
-                            AtSp,
-                            SP_AT_BYTES,
-                            dword_bc,
-                            jbyte_bc,
-                            cep_p + I32(127),
-                            4,
-                            ok=(gc < I32(K)) & (tir == z),
-                            cm=cm_col,
-                            base_byte=base_col_b,
-                        )
-        else:
-            if half == z:
-                row = lt // I32(NKB)
-                kb = lt - row * I32(NKB)
-                loff = row * I32(PAD_L) + kb * I32(32)
-                chunks = []
-                for i in range_constexpr(8):
-                    p = fx.add_offset(tile.ptr, fx.make_int_tuple(loff + I32(4 * i)))
-                    chunks.append(Vec(fx.make_view(p, fx.make_layout(4, 1)).load()).to(F32))
-                amax = F32(0.0)
-                for i in range_constexpr(8):
-                    a = fm.absf(chunks[i]).reduce("max")
-                    amax = (amax > a).select(amax, a)
-                grow = br * I32(BMv) + row
-                gcol0 = bk * I32(BKv) + kb * I32(32)
-                row_ok = grow < I32(M)
-                ep = _ep(amax, va, ep_sub)
-                inv = F32(1.0) / fm.exp2(ep.to(F32))
-                # band holds M real rows/batch: grow>=M fp8 stores land OOB and HW-drop.
-                rqr = make_row_band_resource(
-                    bo.extract_base_index(Qr), batch * I32(M), (batch + I32(1)) * I32(M), I32(Kp), 1
-                )
-                words = []
-                for wi in range_constexpr(8):
-                    qf = chunks[wi] * inv
-                    word = I32(cvt(IRI, _sat(qf[0], sat_bnd), _sat(qf[1], sat_bnd), z, 0))
-                    word = I32(cvt(IRI, _sat(qf[2], sat_bnd), _sat(qf[3], sat_bnd), word, 1))
-                    words.append(word)
-                row_byte0 = grow * I32(Kp) + gcol0
-                for v in range_constexpr(2):
-                    v4 = Vec.from_elements(words[4 * v : 4 * v + 4], fx.Int32)
-                    bo.buffer_store(
-                        v4.ir_value(),
-                        rqr,
-                        row_byte0 + I32(16 * v),
-                        cache_modifier=cm_row,
-                        offset_is_bytes=True,
-                    )
-                kcol = bk * I32(BKv // 32) + kb
-                dword, jbyte = _raw_scale_dword(grow, kcol, SCALEN_ROW)
-                _store_scale(
-                    ASp,
-                    SP_A_BYTES,
-                    dword,
-                    jbyte,
-                    ep + I32(127),
-                    4,
-                    ok=row_ok,
-                    cm=cm_row,
-                    base_byte=base_row_b,
-                )
-            else:
-                c = lt // I32(NMB)
-                mblk = lt - c * I32(NMB)
-                base = fx.add_offset(tile.ptr, fx.make_int_tuple(c + I32(mblk * 32) * I32(PAD_L)))
-                cv2 = Vec(fx.make_view(base, fx.make_layout(32, PAD_L)).load()).to(F32)
-                ca = fm.absf(cv2).reduce("max")
-                camax = (F32(0.0) > ca).select(F32(0.0), ca)
-                cep = _ep(camax, va, ep_sub)
-                cinv = F32(1.0) / fm.exp2(cep.to(F32))
-                cq = cv2 * cinv
-                cwords = []
-                for wi in range_constexpr(8):
-                    word = I32(cvt(IRI, _sat(cq[4 * wi + 0], sat_bnd), _sat(cq[4 * wi + 1], sat_bnd), z, 0))
-                    word = I32(
-                        cvt(IRI, _sat(cq[4 * wi + 2], sat_bnd), _sat(cq[4 * wi + 3], sat_bnd), word, 1)
-                    )
-                    cwords.append(word)
-                # stage the 8 contiguous col words as 2 vec4 LDS stores (c-major, bm M-bytes/K-col)
-                csbase = c * I32(DWPC) + mblk * I32(8)
-                for v in range_constexpr(2):
-                    sp = fx.add_offset(ldsc.ptr, fx.make_int_tuple(csbase + I32(4 * v)))
-                    fx.make_view(sp, fx.make_layout(4, 1)).store(
-                        Vec.from_elements(cwords[4 * v : 4 * v + 4], fx.Int32)
-                    )
-                gc = bk * I32(BKv) + c
-                mcol = br * I32(BMv // 32) + mblk
-                col_ok = gc < I32(K)
-                dword_bc, jbyte_bc = _raw_scale_dword(gc, mcol, SCALEN_COL)
-                _store_scale(
-                    AtSp,
-                    SP_AT_BYTES,
-                    dword_bc,
-                    jbyte_bc,
-                    cep + I32(127),
-                    4,
-                    ok=col_ok,
-                    cm=cm_col,
-                    base_byte=base_col_b,
-                )
-        _llvm.inline_asm(
-            res=None, operands_=[], asm_string="s_waitcnt lgkmcnt(0)", constraints="", has_side_effects=True
-        )
-        rocdl.s_barrier()
         # band holds K real rows/batch: transposed stores with gc>=K land OOB and HW-drop.
         raqd = make_row_band_resource(
             bo.extract_base_index(AtQd), batch * I32(K), (batch + I32(1)) * I32(K), I32(Mp), 1
         )
         mbase = br * I32(BMv)
-        for it in range_constexpr(CW_ITERS_V):
-            lo = (t + I32(it * NTHv)) * I32(4)
-            cc = lo // I32(DWPC)
-            dwi0 = lo - cc * I32(DWPC)
-            rp = fx.add_offset(ldsc.ptr, fx.make_int_tuple(lo))
-            v4 = Vec(fx.make_view(rp, fx.make_layout(4, 1)).load())
-            gc = bk * I32(BKv) + cc
-            bo.buffer_store(
-                v4.ir_value(),
-                raqd,
-                gc * I32(Mp) + mbase + dwi0 * I32(4),
-                cache_modifier=cm_col,
-                offset_is_bytes=True,
+        # Walk krun consecutive K-tiles of one M-block; existing barriers order the reuse.
+        for kr in range_constexpr(krun):
+            bk = bkg * I32(krun) + I32(kr)
+            gbase = (br * I32(BMv)) * I32(K) + bk * I32(BKv)
+            if USE_V8:
+                VPR8 = BKv // 8
+                ITERS8 = BMv * BKv // 8 // NTHv
+                for ls in range_constexpr(ITERS8):
+                    lin = t + I32(ls * NTHv)
+                    lr = lin // I32(VPR8)
+                    cv = (lin - lr * I32(VPR8)) * I32(8)
+                    pbase = lr * I32(PAD_L) + cv
+                    ioff = gbase + lr * I32(K) + cv
+                    if LMASK:
+                        ioff = (bk * I32(BKv) + cv < I32(K)).select(ioff, I32(_OOB))
+                    v = bo.buffer_load(rx, ioff, vec_width=8, dtype=BF)
+                    p = fx.add_offset(tile.ptr, fx.make_int_tuple(pbase))
+                    fx.make_view(p, fx.make_layout(8, 1)).store(Vec(v))
+            else:
+                ITERS = BMv * BKv // 4 // NTHv
+                for ls in range_constexpr(ITERS):
+                    lin = t + I32(ls * NTHv)
+                    lr = lin // I32(VPR)
+                    cv = (lin - lr * I32(VPR)) * I32(4)
+                    pbase = lr * I32(PAD_L) + cv
+                    if SCMASK:
+                        for j in range_constexpr(4):
+                            gcj = bk * I32(BKv) + cv + I32(j)
+                            vj = bo.buffer_load(
+                                rx,
+                                gbase + lr * I32(K) + cv + I32(j),
+                                vec_width=1,
+                                dtype=BF,
+                                mask=(gcj < I32(K)),
+                            )
+                            pj = fx.add_offset(tile.ptr, fx.make_int_tuple(pbase + I32(j)))
+                            fx.make_view(pj, fx.make_layout(1, 1)).store(Vec.from_elements([vj], elt))
+                    else:
+                        ioff = gbase + lr * I32(K) + cv
+                        if LMASK:
+                            ioff = (bk * I32(BKv) + cv < I32(K)).select(ioff, I32(_OOB))
+                        v = bo.buffer_load(rx, ioff, vec_width=4, dtype=BF)
+                        p = fx.add_offset(tile.ptr, fx.make_int_tuple(pbase))
+                        fx.make_view(p, fx.make_layout(4, 1)).store(Vec(v))
+            _llvm.inline_asm(
+                res=None,
+                operands_=[],
+                asm_string="s_waitcnt vmcnt(0) lgkmcnt(0)",
+                constraints="",
+                has_side_effects=True,
             )
+            rocdl.s_barrier()
+            if _use_2d:
+                # 2d-capable warp-reduce layout: one 32x32 chunk per warp, both the per-32 and
+                # the shared 32x32 scale via ds_bpermute, so no Phase-0 pass or extra barrier.
+                lane = t & I32(63)
+                wp = lt >> I32(6)  # warp within this half
+                riw = lane >> I32(3)  # row_in_warp 0..7
+                tir = lane & I32(7)  # thread_in_row 0..7
+                if half == z:
+                    rqr = make_row_band_resource(
+                        bo.extract_base_index(Qr), batch * I32(M), (batch + I32(1)) * I32(M), I32(Kp), 1
+                    )
+                    for rnd in range_constexpr(ROUNDS):
+                        ci = wp + I32(rnd * NWARPS)
+                        cm2 = ci // I32(NKB)  # M-chunk 0..NMB-1
+                        cn2 = ci - cm2 * I32(NKB)  # K-chunk 0..NKB-1
+                        tcol0 = cn2 * I32(32) + (tir << I32(2))
+                        vals = []
+                        lamaxes = []
+                        lamax = F32(0.0)
+                        for p in range_constexpr(4):
+                            trow = cm2 * I32(32) + I32(p * 8) + riw
+                            pp = fx.add_offset(tile.ptr, fx.make_int_tuple(trow * I32(PAD_L) + tcol0))
+                            v4 = Vec(fx.make_view(pp, fx.make_layout(4, 1)).load()).to(F32)
+                            vals.append(v4)
+                            a = fm.absf(v4).reduce("max")
+                            lamaxes.append(a)
+                            lamax = (lamax > a).select(lamax, a)
+                        scales = _tile_scales(row_2d, lamax, lamaxes, lane, va, ep_sub, IRI)
+                        kcol = bk * I32(BKv // 32) + cn2
+                        for p in range_constexpr(4):
+                            ep_p, inv_p = scales[p]
+                            qf = vals[p] * inv_p
+                            word = I32(cvt(IRI, _sat(qf[0], sat_bnd), _sat(qf[1], sat_bnd), z, 0))
+                            word = I32(cvt(IRI, _sat(qf[2], sat_bnd), _sat(qf[3], sat_bnd), word, 1))
+                            grow = br * I32(BMv) + cm2 * I32(32) + I32(p * 8) + riw
+                            gcol = bk * I32(BKv) + cn2 * I32(32) + (tir << I32(2))
+                            bo.buffer_store(
+                                word,
+                                rqr,
+                                grow * I32(Kp) + gcol,
+                                cache_modifier=cm_data_row,
+                                offset_is_bytes=True,
+                            )
+                            dword, jbyte = _raw_scale_dword(grow, kcol, SCALEN_ROW)
+                            _store_scale(
+                                ASp,
+                                SP_A_BYTES,
+                                dword,
+                                jbyte,
+                                ep_p + I32(127),
+                                4,
+                                ok=(grow < I32(M)) & (tir == z),
+                                cm=cm_row,
+                                base_byte=base_row_b,
+                            )
+                else:
+                    for rnd in range_constexpr(ROUNDS):
+                        ci = wp + I32(rnd * NWARPS)
+                        ckc = ci // I32(NMB)  # K-feature chunk 0..NKB-1
+                        cmc = ci - ckc * I32(NMB)  # M chunk 0..NMB-1
+                        m0 = cmc * I32(32) + (tir << I32(2))
+                        vals = []
+                        lamaxes = []
+                        lamax = F32(0.0)
+                        for p in range_constexpr(4):
+                            loc_c = ckc * I32(32) + I32(p * 8) + riw
+                            base = fx.add_offset(tile.ptr, fx.make_int_tuple(m0 * I32(PAD_L) + loc_c))
+                            v4 = Vec(fx.make_view(base, fx.make_layout(4, PAD_L)).load()).to(F32)
+                            vals.append(v4)
+                            a = fm.absf(v4).reduce("max")
+                            lamaxes.append(a)
+                            lamax = (lamax > a).select(lamax, a)
+                        scales = _tile_scales(col_2d, lamax, lamaxes, lane, va, ep_sub, IRI)
+                        for p in range_constexpr(4):
+                            cep_p, cinv_p = scales[p]
+                            cq = vals[p] * cinv_p
+                            word = I32(cvt(IRI, _sat(cq[0], sat_bnd), _sat(cq[1], sat_bnd), z, 0))
+                            word = I32(cvt(IRI, _sat(cq[2], sat_bnd), _sat(cq[3], sat_bnd), word, 1))
+                            loc_c = ckc * I32(32) + I32(p * 8) + riw
+                            # stage into the c-major LDS for the shared coalesced write-back.
+                            sp = fx.add_offset(
+                                ldsc.ptr, fx.make_int_tuple(loc_c * I32(DWPC) + cmc * I32(8) + tir)
+                            )
+                            fx.make_view(sp, fx.make_layout(1, 1)).store(Vec.from_elements([word], fx.Int32))
+                            gc = bk * I32(BKv) + loc_c
+                            mcol = br * I32(BMv // 32) + cmc
+                            dword_bc, jbyte_bc = _raw_scale_dword(gc, mcol, SCALEN_COL)
+                            _store_scale(
+                                AtSp,
+                                SP_AT_BYTES,
+                                dword_bc,
+                                jbyte_bc,
+                                cep_p + I32(127),
+                                4,
+                                ok=(gc < I32(K)) & (tir == z),
+                                cm=cm_col,
+                                base_byte=base_col_b,
+                            )
+            else:
+                if half == z:
+                    row = lt // I32(NKB)
+                    kb = lt - row * I32(NKB)
+                    loff = row * I32(PAD_L) + kb * I32(32)
+                    chunks = []
+                    for i in range_constexpr(8):
+                        p = fx.add_offset(tile.ptr, fx.make_int_tuple(loff + I32(4 * i)))
+                        chunks.append(Vec(fx.make_view(p, fx.make_layout(4, 1)).load()).to(F32))
+                    amax = F32(0.0)
+                    for i in range_constexpr(8):
+                        a = fm.absf(chunks[i]).reduce("max")
+                        amax = (amax > a).select(amax, a)
+                    grow = br * I32(BMv) + row
+                    gcol0 = bk * I32(BKv) + kb * I32(32)
+                    row_ok = grow < I32(M)
+                    ep = _ep(amax, va, ep_sub)
+                    inv = F32(1.0) / fm.exp2(ep.to(F32))
+                    rqr = make_row_band_resource(
+                        bo.extract_base_index(Qr), batch * I32(M), (batch + I32(1)) * I32(M), I32(Kp), 1
+                    )
+                    words = []
+                    for wi in range_constexpr(8):
+                        qf = chunks[wi] * inv
+                        word = I32(cvt(IRI, _sat(qf[0], sat_bnd), _sat(qf[1], sat_bnd), z, 0))
+                        word = I32(cvt(IRI, _sat(qf[2], sat_bnd), _sat(qf[3], sat_bnd), word, 1))
+                        words.append(word)
+                    row_byte0 = grow * I32(Kp) + gcol0
+                    for v in range_constexpr(2):
+                        v4 = Vec.from_elements(words[4 * v : 4 * v + 4], fx.Int32)
+                        bo.buffer_store(
+                            v4.ir_value(),
+                            rqr,
+                            row_byte0 + I32(16 * v),
+                            cache_modifier=cm_data_row,
+                            offset_is_bytes=True,
+                        )
+                    kcol = bk * I32(BKv // 32) + kb
+                    dword, jbyte = _raw_scale_dword(grow, kcol, SCALEN_ROW)
+                    _store_scale(
+                        ASp,
+                        SP_A_BYTES,
+                        dword,
+                        jbyte,
+                        ep + I32(127),
+                        4,
+                        ok=row_ok,
+                        cm=cm_row,
+                        base_byte=base_row_b,
+                    )
+                else:
+                    c = lt // I32(NMB)
+                    mblk = lt - c * I32(NMB)
+                    base = fx.add_offset(tile.ptr, fx.make_int_tuple(c + I32(mblk * 32) * I32(PAD_L)))
+                    cv2 = Vec(fx.make_view(base, fx.make_layout(32, PAD_L)).load()).to(F32)
+                    ca = fm.absf(cv2).reduce("max")
+                    camax = (F32(0.0) > ca).select(F32(0.0), ca)
+                    cep = _ep(camax, va, ep_sub)
+                    cinv = F32(1.0) / fm.exp2(cep.to(F32))
+                    cq = cv2 * cinv
+                    cwords = []
+                    for wi in range_constexpr(8):
+                        word = I32(
+                            cvt(IRI, _sat(cq[4 * wi + 0], sat_bnd), _sat(cq[4 * wi + 1], sat_bnd), z, 0)
+                        )
+                        word = I32(
+                            cvt(IRI, _sat(cq[4 * wi + 2], sat_bnd), _sat(cq[4 * wi + 3], sat_bnd), word, 1)
+                        )
+                        cwords.append(word)
+                    csbase = c * I32(DWPC) + mblk * I32(8)
+                    for v in range_constexpr(2):
+                        sp = fx.add_offset(ldsc.ptr, fx.make_int_tuple(csbase + I32(4 * v)))
+                        fx.make_view(sp, fx.make_layout(4, 1)).store(
+                            Vec.from_elements(cwords[4 * v : 4 * v + 4], fx.Int32)
+                        )
+                    gc = bk * I32(BKv) + c
+                    mcol = br * I32(BMv // 32) + mblk
+                    col_ok = gc < I32(K)
+                    dword_bc, jbyte_bc = _raw_scale_dword(gc, mcol, SCALEN_COL)
+                    _store_scale(
+                        AtSp,
+                        SP_AT_BYTES,
+                        dword_bc,
+                        jbyte_bc,
+                        cep + I32(127),
+                        4,
+                        ok=col_ok,
+                        cm=cm_col,
+                        base_byte=base_col_b,
+                    )
+            _llvm.inline_asm(
+                res=None,
+                operands_=[],
+                asm_string="s_waitcnt lgkmcnt(0)",
+                constraints="",
+                has_side_effects=True,
+            )
+            rocdl.s_barrier()
+            for it in range_constexpr(CW_ITERS_V):
+                lo = (t + I32(it * NTHv)) * I32(4)
+                cc = lo // I32(DWPC)
+                dwi0 = lo - cc * I32(DWPC)
+                rp = fx.add_offset(ldsc.ptr, fx.make_int_tuple(lo))
+                v4 = Vec(fx.make_view(rp, fx.make_layout(4, 1)).load())
+                gc = bk * I32(BKv) + cc
+                bo.buffer_store(
+                    v4.ir_value(),
+                    raqd,
+                    gc * I32(Mp) + mbase + dwi0 * I32(4),
+                    cache_modifier=cm_data_col,
+                    offset_is_bytes=True,
+                )
 
     @flyc.jit
     def launch(
         X: fx.Tensor, Qr: fx.Tensor, ASp: fx.Tensor, AtQd: fx.Tensor, AtSp: fx.Tensor, stream: fx.Stream
     ):
-        grid = B * NBM * NBK
+        grid = B * NPB
         kern(X, Qr, ASp, AtQd, AtSp).launch(grid=(grid, 1, 1), block=(NTHv, 1, 1), stream=stream)
 
     return launch
@@ -586,7 +628,9 @@ def quant_mxfp8_raw_batched(x_3d, out_dtype, row_2d=False, col_2d=False):
     AtSp = torch.empty(B * K * (Mp // 32) // 4, dtype=torch.int32, device=x_3d.device)
     stream = torch.cuda.current_stream()
 
-    key = (B, M, K, Mp, Kp, x_3d.dtype, out_dtype, row_2d, col_2d)
+    # Tile / pid-walk / store-policy are build parameters, so they belong in the cache key.
+    cfg = _qdual_tile_cfg(M, K, Mp, Kp)
+    key = (B, M, K, Mp, Kp, x_3d.dtype, out_dtype, row_2d, col_2d) + tuple(sorted(cfg.items()))
     comp = _RAW_QDUAL_BATCHED_CACHE.get(key)
     if comp is None:
         launch = compile_qdual(
@@ -599,7 +643,7 @@ def quant_mxfp8_raw_batched(x_3d, out_dtype, row_2d=False, col_2d=False):
             Kp=Kp,
             row_2d=row_2d,
             col_2d=col_2d,
-            **_qdual_tile_cfg(M, K, Mp, Kp),
+            **cfg,
         )
         comp = _flyc.compile(launch, x_3d, Qr, ASp, AtQd, AtSp, stream)
         _RAW_QDUAL_BATCHED_CACHE[key] = comp
@@ -725,7 +769,7 @@ def compile_grouped_qdual(
         ldsc = sm.ldsc
         t = fx.thread_idx.x
         pid = fx.block_idx.x
-        br, bkc = _decode_pid(pid, I32(NBK), None, False)
+        br, bkc = _decode_pid(pid, I32(NBK))
         base_m = br * I32(BMv)
 
         # ---- per-tile group metadata computed INLINE (no pad/meta prologue kernels):
