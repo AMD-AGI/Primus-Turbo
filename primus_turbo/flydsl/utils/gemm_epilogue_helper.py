@@ -11,7 +11,7 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""Fused GEMM epilogues: SwiGLU, its gradient, and MXFP4 quantisation of either.
+"""Fused GEMM epilogues: SwiGLU, its gradient, and MX quantisation of either.
 
 The epilogues here all exist to keep a tensor out of HBM. :class:`StoreCSwiGLU`
 and the two dSwiGLU stores fold the activation and its gradient into the GEMM that
@@ -42,12 +42,19 @@ For the grouped MXFP4 NT kernel (BLOCK_M = BLOCK_N = 256, N_TILES_A = 8,
 N_TILES_B = 4, ilv = 4) a wave owns 128 rows by 64 columns, so a 32-row band is 32
 values per lane and each half maps one micro-block to one lane. Nothing crosses a
 wave, so the staging drains lgkmcnt rather than taking a barrier.
+
+The MXFP8 NT kernel tiles differently -- eight waves at N_TILES_A = 4, N_TILES_B = 2 and
+no interleave, so a wave owns 64 rows by 32 columns per accumulator quadrant -- so
+:class:`MXFP8DualQuantStore` rederives the band rather than reusing the MXFP4 one. There
+the band is a whole quadrant, which is what keeps the one-block-per-lane property on both
+axes; see that class for the geometry.
 """
 
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr import buffer_ops as _buffer_ops
+from flydsl.expr import math as fm
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -609,6 +616,328 @@ class MXFP4DualQuantStoreDglu:
             mask=ok,
         )
         _buffer_ops.buffer_store(arith.trunci(T.i8, biased & 0xFF), self.col_sc, sc_off, mask=ok)
+
+
+MX8_BAND_ROWS = 64  # rows staged per pass: one accumulator quadrant, two col-wise blocks
+MX8_BAND_COLS = 32  # a wave's column span (N_TILES_B * 16), i.e. one row-wise block
+MX8_BAND_WORDS = MX8_BAND_COLS // 2  # two bf16 per i32
+# Physical row pitch. The natural 16 would put a col-wise 32-row read on two banks; 20
+# is the smallest 4-multiple (``ds_read_b128`` needs the 16B alignment) whose multiples
+# cover eight of the 32 banks, so a column read spreads exactly as wide as the XOR
+# swizzle this replaced -- see :func:`_mx8_lds_off`.
+MX8_ROW_STRIDE = 20
+MX8_LDS_WORDS_PER_WAVE = MX8_BAND_ROWS * MX8_ROW_STRIDE
+
+
+def _mx8_lds_off(row, word):
+    """Address one logical word of the band.
+
+    Padding the pitch rather than permuting within a 16-word row is what keeps this
+    free. The swizzle that used to live here XORed the word's vec4 group with two row
+    bits, which mixed a lane-derived ``word`` into a row-derived term and so denied the
+    whole address the ``ds_read``/``ds_write`` immediate-offset field: every one of the
+    68 calls a band makes re-materialised it. Profiling put ``SQ_INSTS_VALU_INT32`` at
+    38% of the epilogue's VALU on the back of that. Here ``row`` is loop-invariant
+    against ``word`` and vice versa in all three callers, so each read/write site
+    resolves to one base register plus a constant.
+    """
+    return row * fx.Int32(MX8_ROW_STRIDE) + fx.Int32(word)
+
+
+def _pair_adjacent_lanes(v, lane_id):
+    """Two lanes' f32 -> the i32 holding both as bf16, low half from the even lane.
+
+    The MXFP8 NT fragment gives a lane two columns sixteen apart, so unlike the MXFP4
+    epilogue's interleaved layout a lane never holds an adjacent pair and cannot build a
+    staging word alone. Lanes ``2k`` and ``2k+1`` do hold columns ``2k`` and ``2k+1`` of
+    the same row, and those are a quad swap apart -- so one DPP exchange turns what would
+    be two 16-bit LDS writes into one 32-bit write.
+
+    Both lanes of a pair end up with the same word, and their staging offsets collapse to
+    the same one too (``(lane % 16) // 2`` is equal across a pair), so both simply store
+    it. Masking the odd lane off would need a sink address to send its write to, which
+    costs more than the duplicate does.
+    """
+    raw = _raw(v)
+    other = ArithValue(
+        _res_of(rocdl.update_dpp(raw.type, _raw(fx.Float32(0.0)), raw, _DPP_QUAD_SWAP1, 0xF, 0xF, True))
+    )
+    even = (lane_id % fx.Int32(2)) == fx.Int32(0)
+    lo = fx.Float32(arith.select(even, raw, _raw(other)))
+    hi = fx.Float32(arith.select(even, _raw(other), raw))
+    return _bf16_pair_word(lo, hi)
+
+
+class MXFP8DualQuantStore:
+    """Row-wise + col-wise MXFP8 stores for one accumulator quadrant.
+
+    The MXFP4 twin (:class:`MXFP4DualQuantStore`) does not transfer: that kernel is four
+    waves at ``N_TILES_A/N_TILES_B = 8/4`` with an interleaved fragment, while this one is
+    eight waves at ``4/2`` with none, so a wave owns 64 rows by 32 columns per quadrant
+    rather than 128 by 64. The arithmetic is also different -- MXFP8 has no RHT and no
+    stochastic rounding here, and packs four values per i32 instead of eight, so a
+    micro-block is eight words rather than four.
+
+    What carries over is the reason for the LDS round trip. A micro-block is 32 elements on
+    both axes and a lane owns two columns sixteen apart by sixteen rows, so neither axis is
+    readable out of the fragment; the band goes through LDS once as bf16 and comes back
+    twice, along a row for one operand and down a column for the other.
+
+    The band is a whole quadrant, which is what makes both read-backs one block per lane:
+
+    * row-wise: the wave's column span *is* one micro-block, so lane ``t`` owns row ``t``.
+    * col-wise: 64 rows are two blocks, so lane ``t`` owns column ``t % 32`` of row-half
+      ``t // 32``.
+
+    Values round to bf16 on the way into LDS because the standalone quantiser reads a bf16
+    tensor; quantising from the same bf16 is what makes this byte-identical to it rather
+    than merely close.
+
+    ``row_pad_cols`` is the row-wise operand's padded width (``ceil128(I)``). The columns
+    past the real ``I`` are the quantiser's zero fill and are the caller's to zero -- this
+    writes only real ones. Because ``I`` is a 32-multiple and a wave spans 32 columns, the
+    edge always falls on a wave boundary, so the past-``I`` mask is wave-uniform.
+    """
+
+    def __init__(
+        self,
+        ROW_OUT,
+        ROW_SC,
+        COL_OUT,
+        COL_SC,
+        n_rows,
+        n_cols,
+        row_pad_cols,
+        col_pad_rows,
+        lds_ptr,
+        wave_id,
+        lane_id,
+        out_fp8="e4m3",
+        use_2d_block=False,
+    ):
+        from primus_turbo.flydsl.quantization.mxfp8_quant_flydsl import fp8_params
+
+        self.n_cols = n_cols
+        self.lane_id = lane_id
+        self.use_2d_block = use_2d_block
+        self.va, self.ep_sub, self.sat_bound, self.cvt = fp8_params(out_fp8)
+
+        # i32-word widths: 4 fp8 per word, one E8M0 byte per 32 values. The col-wise row
+        # extent depends on the group lengths, so it can arrive as an i32.
+        self.row_out_w = row_pad_cols // 4
+        self.row_sc_w = row_pad_cols // MB
+        self.col_out_w = _readfirstlane_i32(col_pad_rows // 4)
+        self.col_sc_w = _readfirstlane_i32(col_pad_rows // MB)
+
+        # Explicit extents, not max_size and not the memref shape: these arrive dynamically
+        # shaped, and an unbounded descriptor would let the ragged group tail and the
+        # past-I columns land past the tensor instead of nowhere.
+        _rows = _readfirstlane_i32(fx.Int32(n_rows))
+        self.row_out = _buffer_ops.create_buffer_resource(
+            ROW_OUT, max_size=False, num_records_bytes=_bytes(_rows * fx.Int32(row_pad_cols))
+        )
+        self.row_sc = _buffer_ops.create_buffer_resource(
+            ROW_SC, max_size=False, num_records_bytes=_bytes(_rows * fx.Int32(row_pad_cols // MB))
+        )
+        _cb = _readfirstlane_i32(fx.Int32(n_cols) * col_pad_rows)
+        _cs = _readfirstlane_i32(fx.Int32(n_cols) * (col_pad_rows // MB))
+        self.col_out = _buffer_ops.create_buffer_resource(
+            COL_OUT, max_size=False, num_records_bytes=_bytes(_cb)
+        )
+        self.col_sc = _buffer_ops.create_buffer_resource(
+            COL_SC, max_size=False, num_records_bytes=_bytes(_cs)
+        )
+
+        self.lds = lds_ptr
+        self.wave_off = wave_id * fx.Int32(MX8_LDS_WORDS_PER_WAVE)
+
+    def _scale(self, amax):
+        """``(1/scale, biased E8M0)`` for one block amax, as the quantiser computes them."""
+        from primus_turbo.flydsl.quantization.mxfp8_quant_flydsl import _e8_or_one, _ep
+
+        ep = _ep(amax, self.va, self.ep_sub)
+        # ``fm.exp2`` and a true divide, spelled exactly as the standalone quantiser spells
+        # them, and NOT the hardware v_exp_f32: a zero block's ep is -127, whose exp2 is an
+        # f32 denormal that the hardware transcendental flushes to zero, and 1/0 * 0 is the
+        # NaN that comes out as fp8 0xfe. Every pad row is a zero block.
+        # The byte goes out through arith.trunci, which takes an mlir value and not the
+        # numeric wrapper _e8_or_one hands back.
+        return fx.Float32(1.0) / fm.exp2(ep.to(fx.Float32)), ArithValue(_raw(_e8_or_one(amax, ep)))
+
+    def _word4(self, v4, inv):
+        """Four scaled f32 -> one i32 of four fp8, in the quantiser's pairing order."""
+        from primus_turbo.flydsl.quantization.mxfp8_quant_flydsl import _sat
+
+        q = [_sat(v4[j] * inv, self.sat_bound) for j in range_constexpr(4)]
+        word = fx.Int32(self.cvt(T.i32, q[0], q[1], _raw(fx.Int32(0)), 0))
+        return fx.Int32(self.cvt(T.i32, q[2], q[3], _raw(word), 1))
+
+    def _words(self, vf, inv):
+        """32 scaled f32 -> eight i32 of four fp8 each, in the quantiser's pairing order."""
+        return [self._word4(vf[4 * w : 4 * w + 4], inv) for w in range_constexpr(MB // 4)]
+
+    def _amax(self, vf):
+        """max |x| as f32; the MXFP8 scale path reads a float amax, not its bits."""
+        h = len(vf) // 2
+        pairs = [Vec.from_elements([vf[i], vf[i + h]], fx.Float32) for i in range_constexpr(h)]
+        amax = None
+        for pair in pairs:
+            neg = Vec(_res_of(arith.NegFOp(_raw(pair))))
+            abs_pair = Vec(_res_of(arith.MaxNumFOp(_raw(pair), _raw(neg))))
+            amax = abs_pair if amax is None else Vec(_res_of(arith.MaxNumFOp(_raw(amax), _raw(abs_pair))))
+        return fx.Float32(_res_of(arith.MaxNumFOp(_raw(amax[0]), _raw(amax[1]))))
+
+    def _prepare(self, runs, grow0, row_limit, row_gap):
+        """The band's values as the two axes must both see them: bf16-rounded, tail zeroed.
+
+        ``runs`` is a constexpr list of ``(block, within_base, tj, [v0..v3])``, one entry
+        per four rows a lane holds of one column -- which is what an A sub-tile hands it.
+        ``block`` indexes the band's col-wise micro-block and ``within_base`` the sub-tile's
+        row inside it; both are python ints, because a lane's row offset within the four
+        (``quad``) is the only runtime part.
+
+        Rows past ``row_limit`` -- a group's ragged tail -- become zero rather than being
+        skipped. A col-wise micro-block spans 32 rows whether or not the group fills them,
+        so leaving them alone would fold whatever the tile computed past the group into the
+        block's amax; the standalone quantiser zero-fills there and the scale has to agree.
+        """
+        quad = (self.lane_id // fx.Int32(16)) * fx.Int32(4)
+        zero = _raw(fx.Float32(0.0))
+        out = []
+        for block, within_base, tj, vals in runs:
+            # Every part but ``quad`` is constant, ``row_gap`` included: the band's blocks
+            # are what the halves are, so which one a row is in is known here.
+            grow_base = grow0 + fx.Int32(block * (MB + row_gap) + within_base)
+            ws = []
+            for i, v in enumerate(vals):
+                keep = (grow_base + quad + fx.Int32(i)) < row_limit
+                ws.append(fx.Float32(arith.select(keep, _raw(v), zero)))
+            out.append((block, within_base, tj, ws))
+        return out
+
+    def _stage(self, prepared):
+        """Write the prepared band to LDS, which both axes read it back from."""
+        # Bands reuse one buffer, so the previous band's reads have to have landed before
+        # this one's writes go over them.
+        wait_lgkmcnt(0)
+        col_word = (self.lane_id % fx.Int32(16)) // fx.Int32(2)
+        quad = (self.lane_id // fx.Int32(16)) * fx.Int32(4)
+        for block, within_base, tj, ws in prepared:
+            row_base = fx.Int32(block * MB + within_base) + quad
+            for i, w in enumerate(ws):
+                word = _pair_adjacent_lanes(w, self.lane_id)
+                off = self.wave_off + _mx8_lds_off(row_base + fx.Int32(i), col_word + fx.Int32(tj * 8))
+                _lds_store1(self.lds, off, word)
+        wait_lgkmcnt(0)
+
+    def _read_row(self, r):
+        """The 32 values of band row ``r``: the wave's whole column span, one block."""
+        bits = []
+        for q in range_constexpr(MX8_BAND_WORDS // 4):
+            v4 = _lds_load_vec4(self.lds, self.wave_off + _mx8_lds_off(r, q * 4))
+            for j in range_constexpr(4):
+                bits.append(v4[j] << 16)
+                bits.append(v4[j] & 0xFFFF0000)
+        return [Vec.from_elements([b], fx.Int32).bitcast(fx.Float32)[0] for b in bits]
+
+    def _store_rowwise(self, base_col, grow0, row_limit, amax_2d=None, row_gap=0):
+        """Lane ``t`` owns band row ``t``: 32 columns of one row, exactly one block."""
+        r = self.lane_id
+        vf = self._read_row(r)
+        inv, biased = self._scale(self._amax(vf) if amax_2d is None else amax_2d)
+        grow = grow0 + r
+        if row_gap:
+            grow = grow + (r // fx.Int32(MB)) * fx.Int32(row_gap)
+        gblk = base_col // fx.Int32(MB)
+        ok = (grow < row_limit) & (base_col < fx.Int32(self.n_cols))
+        words = self._words(vf, inv)
+        off = grow * fx.Int32(self.row_out_w) + gblk * fx.Int32(MB // 4)
+        # Eight words is two 16-byte stores; buffer_store takes at most a vec4.
+        for h in range_constexpr(2):
+            _buffer_ops.buffer_store(
+                Vec.from_elements(words[4 * h : 4 * h + 4], fx.Int32), self.row_out, off + h * 4, mask=ok
+            )
+        _buffer_ops.buffer_store(
+            arith.trunci(T.i8, biased & 0xFF),
+            self.row_sc,
+            grow * fx.Int32(self.row_sc_w) + gblk,
+            mask=ok,
+        )
+
+    def _read_col(self, c, row0):
+        """The 32 rows of band column ``c`` starting at band row ``row0``: one block."""
+        cw = c // fx.Int32(2)
+        csh = (c % fx.Int32(2)) * fx.Int32(16)
+        bits = [
+            _f32bits_from_half(
+                _lds_load1(self.lds, self.wave_off + _mx8_lds_off(row0 + fx.Int32(r), cw)),
+                csh,
+            )
+            for r in range_constexpr(MB)
+        ]
+        return [Vec.from_elements([b], fx.Int32).bitcast(fx.Float32)[0] for b in bits]
+
+    def _store_colwise(self, base_col, pad_row0, amax_2d=None, col_row_limit=None, row_gap=0):
+        """Lane ``t`` owns column ``t % 32`` of row-half ``t // 32``: 32 rows, one block.
+
+        One lane per block is the point of the transpose, not a side effect of it. A lane
+        does hold four consecutive rows of a column per sub-tile, so the block's amax is
+        reachable in registers with two xor butterflies and no LDS at all -- but then a
+        lane spans four (column, block) pairs instead of one and pays :meth:`_scale`'s
+        ``exp2`` and divide four times over. Measured 1.5% slower than the read it saves.
+
+        ``col_row_limit`` is the group's end in the col-wise operand's own row space, i.e.
+        its 128-aligned extent. It is not implied by ``row_limit``: the GEMM tiles a group
+        in whole ``BLOCK_M`` rows while the quantiser pads it to 128, so a group whose
+        length lands in the upper half of a tile leaves the last tile's final 128 rows
+        past the operand -- and those rows are the *next* group's, not spare padding.
+        """
+        c = self.lane_id % fx.Int32(MX8_BAND_COLS)
+        half = self.lane_id // fx.Int32(MX8_BAND_COLS)
+        vf = self._read_col(c, half * fx.Int32(MB))
+        inv, biased = self._scale(self._amax(vf) if amax_2d is None else amax_2d)
+        gcol = base_col + c
+        ok = gcol < fx.Int32(self.n_cols)
+        # The band rows are contiguous, the operand rows they came from need not be: an
+        # upper half from a second quadrant lands ``row_gap`` further out.
+        row0 = pad_row0 + half * fx.Int32(MB + row_gap)
+        if col_row_limit is not None:
+            ok = ok & (row0 < col_row_limit)
+        mblk = row0 // fx.Int32(MB)
+        words = self._words(vf, inv)
+        # COL_OUT is feature-major, so a column's M micro-blocks are contiguous.
+        off = gcol * fx.Int32(self.col_out_w) + mblk * fx.Int32(MB // 4)
+        for h in range_constexpr(2):
+            _buffer_ops.buffer_store(
+                Vec.from_elements(words[4 * h : 4 * h + 4], fx.Int32), self.col_out, off + h * 4, mask=ok
+            )
+        _buffer_ops.buffer_store(
+            arith.trunci(T.i8, biased & 0xFF),
+            self.col_sc,
+            gcol * fx.Int32(self.col_sc_w) + mblk,
+            mask=ok,
+        )
+
+    def store_band(self, runs, grow0, pad_row0, base_col, row_limit=None, col_row_limit=None, row_gap=0):
+        """One band: stage once, then quantise along both axes.
+
+        ``grow0`` is the band's first row in the row-wise operand's layout (per-group
+        64-aligned, as ``grouped_quant_mxfp8_raw`` writes it), ``pad_row0`` its first row
+        in the 128-aligned col-wise one, and ``base_col`` the wave's first column.
+        ``row_limit`` is the group's end row in the row-wise space, past which that
+        operand has nothing and the col-wise one has zeros; ``col_row_limit`` is the
+        group's end in the col-wise space, past which neither has anything.
+
+        ``row_gap`` lets the band's two halves come from quadrants that are not adjacent
+        in the operand: the upper half's rows sit that much further out in both operands'
+        row spaces. Zero when the band is a single quadrant of 64 contiguous rows.
+        """
+        if row_limit is None:
+            row_limit = fx.Int32(0x7FFFFFFF)
+        assert not self.use_2d_block, "2-D block scaling is not wired up yet; see design.md 5"
+        self._stage(self._prepare(runs, grow0, row_limit, row_gap))
+        self._store_colwise(base_col, pad_row0, col_row_limit=col_row_limit, row_gap=row_gap)
+        self._store_rowwise(base_col, grow0, row_limit, row_gap=row_gap)
 
 
 def _sigmoid_rcp(x):
@@ -1654,3 +1983,133 @@ class StoreCSwiGLUQuant(StoreCSwiGLU):
                 base_col=base_col,
                 row_limit=row_limit,
             )
+
+
+class StoreCSwiGLUQuantMX(StoreCSwiGLU):
+    """MXFP8 twin of :class:`StoreCSwiGLUQuant`, driving :class:`MXFP8DualQuantStore`.
+
+    The shapes are what differ. The MXFP4 band is 32 rows by 64 columns and a row arrives
+    as four sub-tiles' worth of values at once; here a wave spans 32 columns and an
+    accumulator quadrant is 64 rows, so the band *is* the quadrant -- one per call, no band
+    loop -- and a row contributes one value per n-sub-tile, which is why the staged tuple
+    carries its ``tj`` instead of a packed four.
+
+    The caller passes the gate/up pair for one quadrant, ``(c00, c01)`` or ``(c10, c11)``.
+    Those are a pair rather than two unrelated tiles only because the kernel re-based its
+    second B pool onto the up band, which is what puts both in the same lane.
+
+    ``act_hook`` re-enables the parent's bf16 activation store *alongside* the quantised
+    pair. It exists only to validate: the operands are supposed to be byte-identical to
+    what ``grouped_quant_mxfp8_raw`` makes of that same bf16, and there is no other way to
+    hand it the tensor this epilogue exists not to write.
+    """
+
+    def __init__(self, *args, quant_store=None, act_hook=False, **kwargs):
+        # skip_act: the parent's bf16 activation store is exactly what this replaces.
+        super().__init__(*args, skip_act=not act_hook, **kwargs)
+        assert quant_store is not None, "StoreCSwiGLUQuantMX needs a MXFP8DualQuantStore"
+        quad_rows = self.n_tiles_a * 16
+        assert MX8_BAND_ROWS % quad_rows == 0 and quad_rows % MB == 0, (
+            f"a {MX8_BAND_ROWS}-row band must be whole {MB}-row quadrants, got n_tiles_a={self.n_tiles_a}"
+        )
+        # A band is one quadrant at BLOCK_M=256 and two at 128. Two is what keeps both
+        # read-backs one block per lane: the col-wise blocks are 32 rows and independent,
+        # so a band's halves need not be adjacent in the operand, only whole blocks.
+        self.quads_per_band = MX8_BAND_ROWS // quad_rows
+        assert self.n_tiles_b * 16 == MX8_BAND_COLS, (
+            f"a wave spans {MX8_BAND_COLS} columns, got n_tiles_b={self.n_tiles_b}"
+        )
+        self.q = quant_store
+
+    def store_pair_quant(
+        self,
+        quads,
+        base_row,
+        base_col,
+        row_row_base,
+        row_limit,
+        col_row_base,
+        col_row_limit=None,
+    ):
+        """Activate the accumulator quadrants in registers, then quantise both axes.
+
+        ``quads`` is ``[(gate_frag, up_frag, row_off), ...]`` covering the whole tile,
+        ``row_off`` being the quadrant's rows relative to the three bases. They are
+        consumed ``quads_per_band`` at a time, so the band is one quadrant at
+        ``BLOCK_M=256`` and both halves of a two-quadrant band at 128.
+
+        The three row bases are genuinely three. ``base_row`` is the tight token index,
+        which is what ``probs`` is indexed by; ``row_row_base`` is the row-wise operand's
+        per-group 64-aligned row, and ``col_row_base`` the col-wise operand's 128-aligned
+        one. Only the GEMM knows the group, so only the GEMM can relate them.
+        """
+        per = self.quads_per_band
+        assert len(quads) % per == 0, f"{len(quads)} quadrants do not fill {per}-quadrant bands"
+        for b0 in range_constexpr(0, len(quads), per):
+            self._store_one_band(
+                quads[b0 : b0 + per],
+                base_row,
+                base_col,
+                row_row_base,
+                row_limit,
+                col_row_base,
+                col_row_limit,
+            )
+
+    def _store_one_band(
+        self, band_quads, base_row, base_col, row_row_base, row_limit, col_row_base, col_row_limit
+    ):
+        """One band's worth of quadrants: stage them together, then quantise once."""
+        quad_rows = self.n_tiles_a * 16
+        first_off = band_quads[0][2]
+        # What the upper half sits further out than its band rows say. The quadrants are
+        # evenly spaced, so one gap describes the band.
+        row_gap = (band_quads[1][2] - first_off - quad_rows) if len(band_quads) > 1 else 0
+        scale = self._scale()
+        quad = (self.lane_id // fx.Int32(16)) * fx.Int32(4)
+        runs = []
+        for qi, (gate_frag, up_frag, row_off) in enumerate(band_quads):
+            q_base_row = base_row + fx.Int32(row_off)
+            act_rs = (
+                None
+                if const_expr(self.skip_act)
+                else make_row_band_resource(
+                    self.act_base, q_base_row, self._rows_at(q_base_row, base_col), self.glu_i, 2
+                )
+            )
+            for ti in range_constexpr(self.n_tiles_a):
+                row_local = ti * 16 + quad
+                pr = [self._probs(q_base_row + row_local + fx.Int32(i)) for i in range_constexpr(4)]
+                # A sub-tile's four rows never straddle a col-wise block: its band row base
+                # is a multiple of 16 and a lane's own offset stays inside its own four.
+                band_base = qi * quad_rows + ti * 16
+                for tj in range_constexpr(self.n_tiles_b):
+                    g = Vec(gate_frag[self.c_idx_fn(ti, tj)])
+                    u = Vec(up_frag[self.c_idx_fn(ti, tj)])
+                    if self.scaled:
+                        g = g * scale  # wave-uniform scale packs to v_pk_mul_f32
+                        u = u * scale
+                    vals = []
+                    for i in range_constexpr(4):
+                        gc, uc, _, _ = _glu_clamp(g[i], u[i], self.clamp_limit)
+                        val = _glu_act(gc, self.activation) * uc * pr[i]
+                        vals.append(val)
+                        if const_expr(not self.skip_act):
+                            _buffer_ops.buffer_store(
+                                val.to(self.out_ty),
+                                act_rs,
+                                ((row_local + fx.Int32(i)) * self.glu_i + base_col + self._col(tj)) * 2,
+                                offset_is_bytes=True,
+                            )
+                    runs.append((band_base // MB, band_base % MB, tj, vals))
+        row_row_base = row_row_base + fx.Int32(first_off)
+        col_row_base = col_row_base + fx.Int32(first_off)
+        self.q.store_band(
+            runs,
+            grow0=row_row_base,
+            pad_row0=col_row_base,
+            base_col=base_col,
+            row_limit=row_limit,
+            col_row_limit=col_row_limit,
+            row_gap=row_gap,
+        )

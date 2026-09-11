@@ -16,6 +16,7 @@ from primus_turbo.pytorch.core.backend import (
     TuneCache,
 )
 from primus_turbo.pytorch.core.low_precision import (
+    MXFP8_BLOCK_SIZE,
     Float8QuantConfig,
     ScalingGranularity,
     ScalingRecipe,
@@ -1228,6 +1229,80 @@ def _check_out_recipes(row: ScalingRecipe, col: ScalingRecipe) -> None:
         )
 
 
+def _check_mx_glu_dispatch(config: Float8QuantConfig, trans_a: bool, trans_b: bool) -> None:
+    """The fused MXFP8 GLU epilogue rides the FlyDSL NT kernel, so it has one layout.
+
+    The whole config is held against ``mxfp8_scaling``, not just its granularity: the
+    epilogue emits per-1x32 E8M0 block scales, so anything else would be a different
+    kernel even at the same granularity.
+    """
+    assert config.mxfp8_scaling(), f"Fused GLU grouped MXFP8 GEMM is MX_BLOCKWISE-only, got {config}"
+    assert is_gfx950(), "Fused GLU grouped MXFP8 GEMM is only supported on gfx950"
+    assert not trans_a and trans_b, "Fused GLU grouped MXFP8 GEMM is NT only"
+
+
+def _check_mx_out_recipes(row: ScalingRecipe, col: ScalingRecipe) -> None:
+    """Hold the caller's recipes against the geometry the fused MXFP8 epilogue is built on.
+
+    The epilogue is not a general quantiser. It has no RHT, no stochastic rounding and no
+    shuffled layouts -- MXFP8's recipe surface for this path is ``use_2d_block`` alone, so
+    the other four are contract checks rather than knobs, and shapes wanting them belong
+    on the standalone quantiser.
+
+    ``use_2d_block`` is the one field the epilogue's band *could* express -- a 32x32 chunk
+    is exactly one col-wise half-band by the whole row span, so the 2-D amax is a reduction
+    over amaxes it already computes -- but it is not implemented:
+    ``MXFP8DualQuantStore.store_band`` still asserts against it, and there is no grouped
+    reference to be byte-exact against either, since ``compile_grouped_qdual`` has no 2-D
+    path. Rejecting it here is what keeps that assert honest; the alternative is an op that
+    accepts the flag and silently emits 1-D scales. See ``design.md`` section 5.
+
+    Net effect today: both recipes must be the default. The signature carries them per
+    operand because the epilogue does quantise the two on their own terms, and that is
+    where 2-D block scaling will land when it is wired up.
+    """
+    for name, recipe in (("row", row), ("col", col)):
+        assert not recipe.use_sr, f"the fused MXFP8 epilogue has no stochastic rounding, got {name}={recipe}"
+        assert not recipe.use_rht, f"the fused MXFP8 epilogue has no RHT, got {name}={recipe}"
+        assert not recipe.shuffle_scale and not recipe.shuffle_out, (
+            f"the fused MXFP8 epilogue writes unshuffled operands, got {name}={recipe}"
+        )
+        assert not recipe.use_2d_block, (
+            f"2-D block scaling is the only recipe field this epilogue could express, but it is "
+            f"not wired up yet (see design.md 5); got {name}={recipe}"
+        )
+
+
+_MX_COL_ALIGN = 128  # the col-wise operand's per-group M alignment, as the quantiser pads it
+_MX_ROW_ALIGN = 128  # and the row-wise operand's N alignment
+
+
+def _alloc_mx_act_buffers(I: int, M_pad_row: int, M_pad_col: int, quant_dtype: torch.dtype, device):
+    """The four MXFP8 operands ``grouped_quant_mxfp8_raw`` would have made.
+
+    Byte-identical geometry to the standalone quantiser, because the wgrad and fc2 consume
+    them under the same group tables it builds: the row-wise pair is laid out over the
+    per-group 64-aligned rows and padded to :data:`_MX_ROW_ALIGN` columns, the col-wise
+    pair is feature-major over an M rounded up per group to :data:`_MX_COL_ALIGN`.
+
+    Only the row-wise pad columns are filled, and the scale side with **127**, not zero:
+    the quantiser's zero fill there is a zero block, and a zero block's E8M0 is 1.0 by its
+    zero-amax safe path. The epilogue writes every real column and every padded col-wise
+    row (a group's ragged tail included, as zeros), but the columns past ``I`` belong to no
+    tile and fc2 contracts over them.
+    """
+    I_pad = -(-I // _MX_ROW_ALIGN) * _MX_ROW_ALIGN
+    e8 = getattr(torch, "float8_e8m0fnu", torch.uint8)
+    row_out = torch.empty((M_pad_row, I_pad), dtype=quant_dtype, device=device)
+    row_sc = torch.empty((M_pad_row, I_pad // MXFP8_BLOCK_SIZE), dtype=torch.uint8, device=device)
+    if I_pad != I:
+        row_out.view(torch.uint8)[:, I:].zero_()
+        row_sc[:, I // MXFP8_BLOCK_SIZE :].fill_(127)
+    col_out = torch.empty((I, M_pad_col), dtype=quant_dtype, device=device)
+    col_sc = torch.empty((I, M_pad_col // MXFP8_BLOCK_SIZE), dtype=torch.uint8, device=device)
+    return row_out, row_sc.view(e8), col_out, col_sc.view(e8)
+
+
 def _alloc_grad_probs_partial(spec, device: torch.device) -> torch.Tensor:
     """The grad_probs partial buffer a fused dgrad asked for.
 
@@ -1500,3 +1575,262 @@ def grouped_gemm_fp8_dglu_impl_meta(
     # Tensorwise: one scalar scale over the whole gradient.
     grad_scale_inv = torch.empty((), device=a.device, dtype=torch.float32)
     return grad_probs, grad_intermediate, grad_scale_inv
+
+
+@_torch_custom_op_wrapper("primus_turbo::grouped_gemm_fp8_mx_glu_impl", mutates_args=(), device_types="cuda")
+def grouped_gemm_fp8_mx_glu_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    num_cu: int | None,
+    probs: torch.Tensor,
+    config: Float8QuantConfig,
+    out_row_scaling_recipe: ScalingRecipe,
+    out_col_scaling_recipe: ScalingRecipe,
+    activation: str = "silu",
+    clamp_limit: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """fc1 grouped MXFP8 GEMM with the GLU activation and its quantisation fused in.
+
+    The activation is quantised from the accumulators instead of being written and read
+    back: what comes out is the row-wise pair fc2 contracts against and the col-wise pair
+    the wgrad does, byte-for-byte what ``grouped_quant_mxfp8_raw`` would have produced
+    from the bf16 activation.
+
+    Returns ``(intermediate, act_row, act_row_scale, act_col, act_col_scale)``, where
+    ``intermediate`` is the [M, N] pre-activation backward needs, still in ``out_dtype``.
+    The row-wise pair is laid out over the per-group 64-aligned rows, so its group table
+    is ``group_offs``; the col-wise pair's is the per-group 128-aligned one the wgrad
+    builds from the same ``group_lens``.
+
+    Unlike the MXFP4 twin, ``group_lens`` is *used*: the MXFP8 quantiser pads a group's
+    rows to 64 for the row-wise operand, so ``group_offs`` is the padded read table the
+    GEMM addresses ``a`` with, and the tight table that ``probs`` and ``intermediate`` are
+    indexed by has to be rebuilt from the lengths. See ``design.md`` section 6.
+
+    ``config`` and the recipes ride through as opaque value arguments, so torch.compile
+    bakes them into the graph and guards on their equality rather than tracing into them.
+    That is also why they carry no defaults: the schema admits an opaque type only as a
+    required parameter.
+    """
+    _check_mx_glu_dispatch(config, trans_a, trans_b)
+    _check_mx_out_recipes(out_row_scaling_recipe, out_col_scaling_recipe)
+
+    from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp8_glu_kernel import (
+        glu_epi_quant_supported,
+        grouped_gemm_mxfp8_epi_glu_quant_flydsl_kernel,
+    )
+    from primus_turbo.pytorch.ops.utils import _get_fp8_dtype
+
+    N, K = int(b.shape[1]), int(b.shape[2])
+    I, G = N // 2, int(group_lens.shape[0])
+    assert N % 2 == 0, f"fc1 width must be even (gate||up), got {N}"
+    assert glu_epi_quant_supported(K, I, out_dtype), (
+        f"the fused MXFP8 GLU quant epilogue does not cover K={K} I={I} out_dtype={out_dtype}"
+    )
+    M = int(probs.shape[0])
+
+    # The tight token table. group_offs is the quantiser's 64-aligned offs_row, which the
+    # GEMM reads a with; probs and intermediate live in the tight space.
+    group_offs_out = torch.zeros(G + 1, device=a.device, dtype=torch.int64)
+    torch.cumsum(group_lens, 0, out=group_offs_out[1:])
+
+    M_pad_row = int(a.shape[0])
+    M_pad_col = -(-(M + G * _MX_COL_ALIGN) // _MX_COL_ALIGN) * _MX_COL_ALIGN
+    quant_dtype = _get_fp8_dtype(config.format, True)
+    intermediate = torch.empty((M, N), device=a.device, dtype=out_dtype)
+    row_out, row_sc, col_out, col_sc = _alloc_mx_act_buffers(I, M_pad_row, M_pad_col, quant_dtype, a.device)
+    grouped_gemm_mxfp8_epi_glu_quant_flydsl_kernel(
+        a,
+        a_scales,
+        b,
+        b_scales,
+        probs,
+        group_offs,
+        intermediate,
+        row_out,
+        row_sc,
+        col_out,
+        col_sc,
+        N,
+        K,
+        group_offs_out=group_offs_out,
+        activation=activation,
+        clamp_limit=clamp_limit,
+        out_dtype=out_dtype,
+    )
+    return intermediate, row_out, row_sc, col_out, col_sc
+
+
+@grouped_gemm_fp8_mx_glu_impl.register_fake
+def grouped_gemm_fp8_mx_glu_impl_meta(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    num_cu: int | None,
+    probs: torch.Tensor,
+    config: Float8QuantConfig,
+    out_row_scaling_recipe: ScalingRecipe,
+    out_col_scaling_recipe: ScalingRecipe,
+    activation: str = "silu",
+    clamp_limit: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from primus_turbo.pytorch.ops.utils import _get_fp8_dtype
+
+    _check_mx_glu_dispatch(config, trans_a, trans_b)
+    _check_mx_out_recipes(out_row_scaling_recipe, out_col_scaling_recipe)
+
+    assert a.dim() == 2, f"a must be 2D, got {a.shape}"
+    assert b.dim() == 3, f"b must be 3D, got {b.shape}"
+    assert a.dtype in [float8_e4m3, float8_e5m2], f"a must be fp8, got {a.dtype}"
+    assert b.dtype in [float8_e4m3, float8_e5m2], f"b must be fp8, got {b.dtype}"
+    assert out_dtype == torch.bfloat16, f"out_dtype must be bfloat16, got {out_dtype}"
+
+    N, G = int(b.shape[1]), int(group_lens.shape[0])
+    I = N // 2
+    M, M_pad_row = int(probs.shape[0]), int(a.shape[0])
+    M_pad_col = -(-(M + G * _MX_COL_ALIGN) // _MX_COL_ALIGN) * _MX_COL_ALIGN
+    intermediate = torch.empty((M, N), device=a.device, dtype=out_dtype)
+    row_out, row_sc, col_out, col_sc = _alloc_mx_act_buffers(
+        I, M_pad_row, M_pad_col, _get_fp8_dtype(config.format, True), a.device
+    )
+    return intermediate, row_out, row_sc, col_out, col_sc
+
+
+@_torch_custom_op_wrapper("primus_turbo::grouped_gemm_fp8_mx_dglu_impl", mutates_args=(), device_types="cuda")
+def grouped_gemm_fp8_mx_dglu_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    num_cu: int | None,
+    probs: torch.Tensor,
+    intermediate: torch.Tensor,
+    config: Float8QuantConfig,
+    out_row_scaling_recipe: ScalingRecipe,
+    out_col_scaling_recipe: ScalingRecipe,
+    activation: str = "silu",
+    clamp_limit: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """fc2 dgrad with the GLU activation gradient and its quantisation fused in.
+
+    ``a @ b^T`` is the gradient wrt the activation; the epilogue consumes it against
+    ``intermediate`` in registers, so the [M, 2I] ``grad_l1`` is quantised from those
+    values instead of being written and read back.
+
+    Returns ``(grad_probs, row, row_scale, col, col_scale)``: [M] fp32 folded here from
+    the kernel's per-tile partials, then the four operands. As in the forward, the
+    row-wise pair sits on the padded rows ``group_offs`` addresses and the col-wise pair
+    on the 128-aligned table the wgrad builds from ``group_lens``.
+    """
+    _check_mx_glu_dispatch(config, trans_a, trans_b)
+    _check_mx_out_recipes(out_row_scaling_recipe, out_col_scaling_recipe)
+
+    from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp8_glu_kernel import (
+        dglu_epi_quant_supported,
+        grouped_gemm_mxfp8_dglu_grad_probs_partial_spec,
+        grouped_gemm_mxfp8_epi_dglu_quant_flydsl_kernel,
+    )
+    from primus_turbo.pytorch.ops.utils import _get_fp8_dtype
+
+    I, K = int(b.shape[1]), int(b.shape[2])
+    G = int(group_lens.shape[0])
+    assert dglu_epi_quant_supported(K, I, out_dtype), (
+        f"the fused MXFP8 dGLU quant epilogue does not cover K={K} I={I} out_dtype={out_dtype}"
+    )
+    M = int(probs.shape[0])
+
+    # group_offs is the quantiser's 64-aligned offs_row, which the GEMM reads a with;
+    # probs, intermediate and the grad_probs partials live in the tight space.
+    group_offs_out = torch.zeros(G + 1, device=a.device, dtype=torch.int64)
+    torch.cumsum(group_lens, 0, out=group_offs_out[1:])
+
+    M_pad_row = int(a.shape[0])
+    M_pad_col = -(-(M + G * _MX_COL_ALIGN) // _MX_COL_ALIGN) * _MX_COL_ALIGN
+    quant_dtype = _get_fp8_dtype(config.format, False)
+    grad_probs_partial = _alloc_grad_probs_partial(
+        grouped_gemm_mxfp8_dglu_grad_probs_partial_spec(a, b), a.device
+    )
+    row_out, row_sc, col_out, col_sc = _alloc_mx_act_buffers(
+        2 * I, M_pad_row, M_pad_col, quant_dtype, a.device
+    )
+    grouped_gemm_mxfp8_epi_dglu_quant_flydsl_kernel(
+        a,
+        a_scales,
+        b,
+        b_scales,
+        intermediate,
+        group_offs,
+        probs,
+        grad_probs_partial,
+        row_out,
+        row_sc,
+        col_out,
+        col_sc,
+        I,
+        K,
+        group_offs_out=group_offs_out,
+        activation=activation,
+        clamp_limit=clamp_limit,
+        out_dtype=out_dtype,
+    )
+    # The partials are over-allocated to the padded rows but written in the tight space.
+    return torch.sum(grad_probs_partial[:, :M], dim=0), row_out, row_sc, col_out, col_sc
+
+
+@grouped_gemm_fp8_mx_dglu_impl.register_fake
+def grouped_gemm_fp8_mx_dglu_impl_meta(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    num_cu: int | None,
+    probs: torch.Tensor,
+    intermediate: torch.Tensor,
+    config: Float8QuantConfig,
+    out_row_scaling_recipe: ScalingRecipe,
+    out_col_scaling_recipe: ScalingRecipe,
+    activation: str = "silu",
+    clamp_limit: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from primus_turbo.pytorch.ops.utils import _get_fp8_dtype
+
+    _check_mx_glu_dispatch(config, trans_a, trans_b)
+    _check_mx_out_recipes(out_row_scaling_recipe, out_col_scaling_recipe)
+
+    assert a.dim() == 2, f"a must be 2D, got {a.shape}"
+    assert b.dim() == 3, f"b must be 3D, got {b.shape}"
+    assert a.dtype in [float8_e4m3, float8_e5m2], f"a must be fp8, got {a.dtype}"
+    assert b.dtype in [float8_e4m3, float8_e5m2], f"b must be fp8, got {b.dtype}"
+    assert out_dtype == torch.bfloat16, f"out_dtype must be bfloat16, got {out_dtype}"
+
+    I, G = int(b.shape[1]), int(group_lens.shape[0])
+    M, M_pad_row = int(probs.shape[0]), int(a.shape[0])
+    M_pad_col = -(-(M + G * _MX_COL_ALIGN) // _MX_COL_ALIGN) * _MX_COL_ALIGN
+    grad_probs = torch.empty((M,), device=a.device, dtype=torch.float32)
+    row_out, row_sc, col_out, col_sc = _alloc_mx_act_buffers(
+        2 * I, M_pad_row, M_pad_col, _get_fp8_dtype(config.format, False), a.device
+    )
+    return grad_probs, row_out, row_sc, col_out, col_sc
