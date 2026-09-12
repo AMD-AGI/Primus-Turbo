@@ -710,7 +710,8 @@ class MfmaScaleFp4:
             if _CST:
                 nout += 9
             _CDV = _PINBASE + NSET * (2 * nsct + 4 * ntmp)
-            _NCDV = 18 if _CILV else 0
+            _NCBK = 2  # dedicated pack banks; the rest come from packed-out accumulators
+            _NCDV = (8 * _NCBK + 2) if _CILV else 0  # + the 2-dword AGPR shuttle scratch
             nout += _NCDV
             o_npv = nout  # runtime peel: hw-loop bound = trip count - 2
             if _RTPEEL:
@@ -950,20 +951,19 @@ class MfmaScaleFp4:
                     for e in range(4)
                 ]
 
-            def cst_wide(ii, sl, p, u):
+            def cst_wide(ii, sl, p, b):
                 # Interleaved: each C row packs to a dwordx2 via v_cvt_pk_bf16_f32.  An
                 # accumulator dword still in AGPR is shuttled over first (no VALU reads
                 # AGPR); a traded one is packed straight out of its arch VGPR.
                 q0 = sl * nq + ii * ntb
                 imm = cst_gap if sl else 0
                 rs = i_cr if sl else i_cl
-                b = _CDV + (u & 1) * 8
                 ls = []
                 for e in range(4):
                     for h in range(2):
                         d = b + 2 * e + h
                         src = []
-                        for q, t in ((q0 + 2 * h, d), (q0 + 2 * h + 1, _CDV + 16 + h)):
+                        for q, t in ((q0 + 2 * h, d), (q0 + 2 * h + 1, _CDV + 8 * _NCBK + h)):
                             r = acc_reg(q, e)
                             if r[0] == "a":
                                 ls.append(f"v_accvgpr_read_b32 v{t}, {r}")
@@ -987,7 +987,22 @@ class MfmaScaleFp4:
                     self.ln = []  # store lines of the unit being drained
                     self.cur = None
                     self.pend = {}  # interleaved: (ii, sl) -> accumulators finished
-                    self.u = 0  # interleaved: store-unit counter (data-VGPR bank)
+                    self.bk = [_CDV + 8 * j for j in range(_NCBK)]  # banks never yet stored from
+                    self.old = []  # banks already sourcing stores, oldest first
+
+                def bank(self, ii, sl):
+                    """This unit's 8-dword pack bank, and the WAR watermark it needs. A bank
+                    no store has read yet needs none, and a unit's accumulators die as it
+                    packs them, so each traded unit hands two private banks back."""
+                    if self.bk:
+                        b, wm = self.bk.pop(0), None
+                    else:  # oldest bank back: only the newer units' stores may be in flight
+                        b, wm = self.old.pop(0), min(4 * len(self.old), 60)
+                    self.old.append(b)
+                    q0 = sl * nq + ii * ntb
+                    if q0 + ntb <= _NAV:
+                        self.bk += [_ACCV + 4 * q0, _ACCV + 4 * q0 + 8]
+                    return b, wm
 
                 def done(self, mi, ii, sl, ji):
                     if _CILV:
@@ -1006,13 +1021,14 @@ class MfmaScaleFp4:
                                 break
                             _, ii, sl, ji = self.q.pop(0)
                             if _CILV:
-                                self.ln.append("s_waitcnt vmcnt(4)")
+                                _b, _wm = self.bank(ii, sl)
+                                if _wm is not None:
+                                    self.ln.append(f"s_waitcnt vmcnt({_wm})")
                             if ii != self.cur:
                                 self.ln += cst_rows(ii, ii % 2)
                                 self.cur = ii
                             if _CILV:
-                                self.ln += cst_wide(ii, sl, ii % 2, self.u)
-                                self.u += 1
+                                self.ln += cst_wide(ii, sl, ii % 2, _b)
                             else:
                                 self.ln += cst_group(ii, sl, ji, ii % 2)
                         k = min(n, len(self.ln))
@@ -1286,9 +1302,7 @@ class MfmaScaleFp4:
                     for q in range_constexpr(lo, hi):
                         for e in range_constexpr(4):
                             r = acc_reg(q, e)
-                            ls.append(
-                                f"v_accvgpr_write_b32 {r}, 0" if r[0] == "a" else f"v_mov_b32 {r}, 0"
-                            )
+                            ls.append(f"v_accvgpr_write_b32 {r}, 0" if r[0] == "a" else f"v_mov_b32 {r}, 0")
                     return ls
 
                 def emit_head(half, l_head=7):
@@ -1674,10 +1688,7 @@ class MfmaScaleFp4:
             _vtmp += ["=&v"] * _nvx  # split: rotating ds_read bases + ring offsets
             cons = ",".join(
                 (
-                    [
-                        f"={'&' if f == 'v' else ''}{{{f}[{b}:{b + 3}]}}"
-                        for f, b in map(acc_base, o_acc)
-                    ]
+                    [f"={'&' if f == 'v' else ''}{{{f}[{b}:{b + 3}]}}" for f, b in map(acc_base, o_acc)]
                     if _CST
                     else ["=a"] * NT
                 )
@@ -2911,9 +2922,7 @@ def _compile_mxfp4_tail_fused(
             # writes its ksplit partials into C_t[ksplit * m_tail, N].
             tail_kern(
                 A_t, B_T, C_t, A_scale_t, B_scale, fx.Int32(m_tail), c_n, value_attrs=tail_attrs
-            ).launch(
-                grid=(fx.Int32(m_tail // BM * ksplit) * nbn, 1, 1), block=(256, 1, 1), stream=stream
-            )
+            ).launch(grid=(fx.Int32(m_tail // BM * ksplit) * nbn, 1, 1), block=(256, 1, 1), stream=stream)
 
     return launch_mxfp4_tail
 
