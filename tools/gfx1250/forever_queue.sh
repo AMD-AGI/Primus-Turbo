@@ -7,6 +7,7 @@
 # stops being a failure mode.
 set -u
 cd /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo
+[ -n "${LEDGER:-}" ] && LEDGER_EXPLICIT=1
 LEDGER=${LEDGER:-/tmp/forever.jsonl}; touch "$LEDGER"
 H=tools/gfx1250/tune_attention.py
 export PYTHONPATH=/home/lihuzhan/code/aiter-src
@@ -18,8 +19,11 @@ export PYTHONPATH=/home/lihuzhan/code/aiter-src
 #   GPU=1 LEDGER=/tmp/wq.g1.jsonl bash tools/gfx1250/forever_queue.sh &
 if [ -n "${GPU:-}" ]; then
   export HIP_VISIBLE_DEVICES="$GPU"
-  LEDGER=${LEDGER:-/tmp/forever.g${GPU}.jsonl}
+  # LEDGER is defaulted ABOVE this block, so ${LEDGER:-...} here never fires and every
+  # stream would share one ledger. Only override when the caller did not name one.
+  [ -z "${LEDGER_EXPLICIT:-}" ] && LEDGER=/tmp/forever.g${GPU}.jsonl
   STOP_FILE=${STOP_FILE:-/tmp/wq.g${GPU}.stop}
+  PID_FILE=${LEDGER%.jsonl}.pid
   touch "$LEDGER"
 fi
 
@@ -36,6 +40,10 @@ wait_if_stopped(){
     sleep 10
   done
 }
+
+PID_FILE=${PID_FILE:-${LEDGER%.jsonl}.pid}
+echo $$ > "$PID_FILE"
+trap 'rm -f "$PID_FILE"' EXIT
 
 d(){ grep -qF "\"tag\":\"$1\"" "$LEDGER" 2>/dev/null; }
 health(){ dmesg 2>/dev/null|tail -60|grep -qE 'MES\(|GPU Hang|wait for reset ack' && return 1||return 0; }
