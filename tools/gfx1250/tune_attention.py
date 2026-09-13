@@ -317,9 +317,32 @@ def main() -> int:
     ap.add_argument("--skip-correctness", action="store_true",
                     help="time only. The loop must NOT use this: an unchecked candidate "
                          "can be fast because it computes less.")
+    ap.add_argument("--shapes", default="",
+                    help="comma-separated shapes to measure IN ONE PROCESS, e.g. "
+                         "'llama31-8b,llama31-8b-b2'. Amortises the ~10-15 s of import and "
+                         "Triton compile that otherwise dominates a sweep -- at one process "
+                         "per candidate the GPU sits at ~12%% utilisation because most of "
+                         "the wall clock is startup, not measurement. Only safe for things "
+                         "that do NOT change import-time state: shape and impl are fine, "
+                         "--tune and --fused-tune are read at import and still need their "
+                         "own process.")
     ap.add_argument("--json", default="", help="also write the result object here")
     args = ap.parse_args()
 
+    if args.shapes:
+        # Re-enter main() once per shape in this process. Everything import-time (the tune
+        # spec, the vendored config, the module graph) is already resolved and shared; only
+        # the tensors and the measurement differ.
+        rc = 0
+        for _shape in [x.strip() for x in args.shapes.split(",") if x.strip()]:
+            args.shape = _shape
+            args.shapes = ""
+            rc |= _measure(args)
+        return rc
+    return _measure(args)
+
+
+def _measure(args) -> int:
     result: dict = {
         "shape": args.shape,
         "tune": args.tune,
