@@ -271,6 +271,24 @@ def main() -> int:
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--sqnr-min", type=float, default=50.0)
+    ap.add_argument("--impl", default="turbo", choices=["turbo", "aiter"],
+                    help="turbo = Primus-Turbo's in-tree Triton backend (the PR target). "
+                         "aiter = AITER's Triton MHA, the alternative seed the plan named. "
+                         "Same shape, same fp32 reference, same SQNR gate, same timer -- the "
+                         "only way the two numbers are comparable is if everything but the "
+                         "kernel is identical code.")
+    ap.add_argument("--aiter-fwd-stages", type=int, default=0,
+                    help="override aiter's forward num_stages (0 = shipped config)")
+    ap.add_argument("--aiter-bwd-warps", type=int, default=0,
+                    help="override aiter's backward num_warps (0 = shipped config)")
+    ap.add_argument("--aiter-bwd-cfg", default="",
+                    help="override keys on aiter's fused backward config, e.g. "
+                         "'BLOCK_M1=64,BLOCK_N2=64'. NOTE the pairing constraint: the launch "
+                         "grid is sized by BLOCK_N1 and the same grid serves the dq half, "
+                         "which is tiled by BLOCK_M2, so N1 must equal M2 (and symmetrically "
+                         "M1 == N2). Breaking it yields a config that measures FASTER with "
+                         "dq silently covering half the query rows -- the four-tensor SQNR "
+                         "gate is what catches it.")
     ap.add_argument("--determinism-reps", type=int, default=0,
                     help="run fwd+bwd N times in-process and compare every output BITWISE "
                          "against rep 0. Determinism needs no fp32 reference -- dropping it "
@@ -322,12 +340,80 @@ def main() -> int:
     v = torch.randn(b, sq, hkv, d, device="cuda", dtype=dtype, requires_grad=True)
     do = torch.randn(b, sq, hq, d, device="cuda", dtype=dtype)
 
+    if args.impl == "aiter":
+        from aiter.ops.triton._triton_kernels.attention import mha as _amha
+        from aiter.ops.triton.attention.mha import flash_attn_func as _aiter_fa
+
+        base = dict(_amha._get_config(False, dtype))
+        fwd_cfg = dict(base)
+        if args.aiter_fwd_stages:
+            fwd_cfg["num_stages"] = args.aiter_fwd_stages
+
+        # The backward has no config argument -- it calls a zero-arg _get_config that is
+        # @functools.lru_cache'd. An override that does not clear the cache is SILENTLY
+        # IGNORED, and the signature of that failure is a sweep where every candidate
+        # returns the same time. Patch, clear, then assert what comes back.
+        # TWO modules matter here. The config FUNCTION lives in _triton_kernels..., but the
+        # backward WRAPPER did `from ... import _get_config` at import time, so it holds its
+        # own binding. Patching only the source module leaves the wrapper calling the
+        # original -- the override is accepted, `_get_config()` returns the new value, and
+        # the launch still uses the old one. That produced a six-config sweep with a 0.6%
+        # spread before it was caught. Patch the WRAPPER's binding.
+        from aiter.ops.triton._triton_kernels.attention import mha_onekernel_bwd as _abwd_src
+        from aiter.ops.triton.attention import mha_onekernel_bwd as _abwd_wrap
+
+        _abwd = _abwd_src
+
+        result["aiter_bwd_config_shipped"] = dict(_abwd_src._get_config())
+        if args.aiter_bwd_cfg:
+            base_bwd = _abwd_src._get_config()
+            patched = {kk: dict(vv) for kk, vv in base_bwd.items()}
+            for item in args.aiter_bwd_cfg.split(","):
+                key, value = (x.strip() for x in item.split("=", 1))
+                patched["onekernel"][key] = int(value)
+            ok = patched["onekernel"]
+            if ok.get("BLOCK_N1") != ok.get("BLOCK_M2") or ok.get("BLOCK_M1") != ok.get("BLOCK_N2"):
+                raise SystemExit(
+                    f"aiter bwd pairing violated (need N1==M2 and M1==N2): {ok}. "
+                    "That config measures fast because dq covers only part of the query axis."
+                )
+            if args.aiter_bwd_warps:
+                ok["num_warps"] = args.aiter_bwd_warps
+            _abwd_src._get_config.cache_clear()
+            _abwd_src._get_config = lambda: patched
+            _abwd_wrap._get_config = lambda: patched   # the binding the launch actually reads
+            got = _abwd_wrap._get_config()["onekernel"]
+            for item in args.aiter_bwd_cfg.split(","):
+                key, value = (x.strip() for x in item.split("=", 1))
+                if got.get(key) != int(value):
+                    raise SystemExit(f"aiter bwd override did not apply: {key}={got.get(key)}")
+            result["aiter_bwd_config"] = got
+        elif args.aiter_bwd_warps:
+            # The backward config is nested: {"preprocess_kernel": {...}, "onekernel": {...}}.
+            # num_warps lives on "onekernel"; setting it at the top level would be accepted
+            # silently and change nothing.
+            base_bwd = _abwd_src._get_config()
+            patched = {k: dict(v) for k, v in base_bwd.items()}
+            patched["onekernel"]["num_warps"] = args.aiter_bwd_warps
+            _abwd_src._get_config.cache_clear()
+            _abwd_src._get_config = lambda: patched
+            _abwd_wrap._get_config = lambda: patched
+            got = _abwd_wrap._get_config()
+            if got["onekernel"].get("num_warps") != args.aiter_bwd_warps:
+                raise SystemExit(f"aiter bwd override did not apply: {got}")
+            result["aiter_bwd_config"] = got
+
+        result["aiter_fwd_config"] = fwd_cfg
+        _impl_fwd = lambda: _aiter_fa(q, k, v, causal=causal, config=fwd_cfg)  # noqa: E731
+    else:
+        _impl_fwd = None
+
     # Pin TRITON. Without this the dispatcher picks, and a round would not know which
     # kernel it just measured.
     GlobalBackendManager.set_attn_backend(BackendType.TRITON, PrecisionType.BF16_FP16_FP32)
     try:
         if not args.skip_correctness:
-            out = flash_attn_func(q, k, v, causal=causal)
+            out = (_impl_fwd() if _impl_fwd else flash_attn_func(q, k, v, causal=causal))
             out.backward(do)
             dq, dk, dv = q.grad.clone(), k.grad.clone(), v.grad.clone()
             q.grad = k.grad = v.grad = None
@@ -393,7 +479,7 @@ def main() -> int:
             print(json.dumps(result))
             return 0
 
-        fwd = lambda: flash_attn_func(q, k, v, causal=causal)  # noqa: E731
+        fwd = _impl_fwd or (lambda: flash_attn_func(q, k, v, causal=causal))  # noqa: E731
         out = fwd()
         bwd = lambda: out.backward(do, retain_graph=True)  # noqa: E731
 

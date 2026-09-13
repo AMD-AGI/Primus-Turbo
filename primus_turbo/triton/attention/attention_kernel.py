@@ -98,6 +98,43 @@ _SWEEP_NUM_WARPS = (1, 2, 4, 8)
 _SWEEP_NUM_STAGES = (1, 2, 3)
 
 
+# dk/dv tile sizes. Separate from the autotune mechanism on purpose: BLOCK_N here sets the
+# kernel's GRID as well as its tile, so the host and the kernel must agree on one value. An
+# autotuned BLOCK_N would let Triton pick a tile the launch grid was not sized for.
+#
+# Now that the lse/delta read is indexed per row against LSE_ABI_BLOCK, BLOCK_M is free too,
+# which is what allows an asymmetric tile. aiter's Triton MHA -- 1.16x faster on the backward
+# at this shape -- uses BLOCK_M1=32, BLOCK_N1=128 for its dk/dv pass against turbo's
+# symmetric 64x64.
+_DKDV_BLOCK_ENV = "PRIMUS_TURBO_ATTN_DKDV_BLOCKS"
+
+
+def get_dkdv_blocks():
+    """(BLOCK_M, BLOCK_N) for the dk/dv pass. 'M=32,N=128' overrides; default is the
+    historic symmetric 64x64."""
+    spec = os.environ.get(_DKDV_BLOCK_ENV, "").strip()
+    m, n = FIXED_BLOCK_M, FIXED_BLOCK_N
+    if not spec or spec in ("0", "off"):
+        return m, n
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"{_DKDV_BLOCK_ENV}: expected M=..,N=.., got {item!r}")
+        key, value = (x.strip().upper() for x in item.split("=", 1))
+        if key == "M":
+            m = int(value)
+        elif key == "N":
+            n = int(value)
+        else:
+            raise ValueError(f"{_DKDV_BLOCK_ENV}: unknown key {key!r}")
+    if m <= 0 or n <= 0 or m % 16 or n % 16:
+        # The WMMA atom is 16x16x32, so both must be whole multiples of 16.
+        raise ValueError(f"{_DKDV_BLOCK_ENV}: M and N must be positive multiples of 16, got {m}x{n}")
+    return m, n
+
+
 def _parse_tune_spec(spec: str, kind: str):
     """Parse the env var into a list of kwarg dicts for triton.Config.
 
@@ -1297,6 +1334,9 @@ def _bwd_kernel_dkdv(
     max_seqlen_q,
     max_seqlen_k,
     num_block_m: tl.constexpr,
+    # Row interleave of the shared lse/delta scratch. Equals attn_fwd's BLOCK_M, which is
+    # NOT necessarily this kernel's BLOCK_M -- see the load site.
+    LSE_ABI_BLOCK: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_DMODEL_QK: tl.constexpr,
@@ -1443,6 +1483,7 @@ def _bwd_kernel_dkdv(
             log_p_scale,
             lo,
             num_block_m,
+            LSE_ABI_BLOCK,
             causal_boundary,
             USE_FP8,
             USE_EXP2,
@@ -1504,6 +1545,9 @@ def _attn_bwd_dkdv(
     log_p_scale: tl.constexpr,
     lo: tl.constexpr,
     num_block_m: tl.constexpr,
+    # Row interleave of the shared lse/delta scratch = attn_fwd's BLOCK_M, which is NOT
+    # necessarily this function's BLOCK_M. See the load site below.
+    LSE_ABI_BLOCK: tl.constexpr,
     causal_boundary: tl.constexpr,
     USE_FP8: tl.constexpr,
     USE_EXP2: tl.constexpr,
@@ -1558,10 +1602,21 @@ def _attn_bwd_dkdv(
             if WINDOW_RIGHT >= 0:
                 qk = tl.where(win_col <= win_row + WINDOW_RIGHT, qk, float("-inf"))
 
-        l_ptrs = ld_offset + (2 * start_m + tl.arange(0, 2 * BLOCK_M)) * stride_ldm
-        mask_ldm = tl.ravel(tl.join(mask_m, mask_m))
-        lds = tl.load(l_ptrs, mask=mask_ldm, other=0.0)
-        l_i = tl.gather(lds, index=tl.arange(0, BLOCK_M), axis=0)
+        # LSE and delta interleave per LSE_ABI_BLOCK rows in the shared [B, Hq, 2*Sq]
+        # scratch. That interleave is a contract between attn_fwd (which writes LSE),
+        # _bwd_preprocess_use_o (which writes delta) and _lse_delta_views on the host --
+        # it is NOT this kernel's tile size. The previous form read
+        # 2*start_m + arange(0, 2*BLOCK_M) and split the halves with two tl.gather, which
+        # silently required BLOCK_M == LSE_ABI_BLOCK: at BLOCK_M=128 it returned
+        # lse-rows 0..63 concatenated with delta-rows 0..63, no fault and no shape error,
+        # just smoothly wrong dk/dv.
+        #
+        # Indexing per row instead frees BLOCK_M, which is what lets the dk/dv pass take an
+        # asymmetric tile. It also drops the two cross-lane gathers.
+        _abi_blk = offs_m // LSE_ABI_BLOCK
+        _abi_off = offs_m % LSE_ABI_BLOCK
+        _l_idx = _abi_blk * (2 * LSE_ABI_BLOCK) + _abi_off
+        l_i = tl.load(ld_offset + _l_idx * stride_ldm, mask=mask_m, other=0.0)
 
         # compute p
         if USE_EXP2:
@@ -1582,7 +1637,7 @@ def _attn_bwd_dkdv(
             dp_descale = blk_do_descale * v_descale
             dp = dp * dp_descale
 
-        Di = tl.gather(lds, index=tl.arange(BLOCK_M, 2 * BLOCK_M), axis=0)
+        Di = tl.load(ld_offset + (_l_idx + LSE_ABI_BLOCK) * stride_ldm, mask=mask_m, other=0.0)
         ds = p * (dp - Di[:, None])
 
         if USE_FP8:

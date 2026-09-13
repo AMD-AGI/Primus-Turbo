@@ -19,6 +19,7 @@ from primus_turbo.pytorch.core.low_precision import float8_e4m3, float8_e5m2
 from primus_turbo.triton.attention.attention_kernel import (
     FIXED_BLOCK_M,
     FIXED_BLOCK_N,
+    get_dkdv_blocks,
     USE_FP8E5M2_BWD,
     _bwd_kernel_dkdv,
     _bwd_kernel_dq,
@@ -546,9 +547,14 @@ def attention_triton_backward_impl(
         F8_FWD_MAX=F8_FWD_MAX,
     )
 
+    # One source of truth for the dk/dv tile: BLOCK_N sets the grid AND the tile, so they
+    # cannot be allowed to disagree. BLOCK_M is independent of the lse/delta ABI now that
+    # the kernel indexes that scratch per row (LSE_ABI_BLOCK below).
+    dkdv_block_m, dkdv_block_n = get_dkdv_blocks()
+    dkdv_num_block_m = triton.cdiv(max_seqlen_q, dkdv_block_m)
     grid_bwd_dkdv = (
         batch_headsize_k,
-        triton.cdiv(max_seqlen_k, FIXED_BLOCK_N) if sequence_parallel else 1,
+        triton.cdiv(max_seqlen_k, dkdv_block_n) if sequence_parallel else 1,
     )
     wrap_triton(_bwd_kernel_dkdv)[grid_bwd_dkdv](
         q,
@@ -605,9 +611,16 @@ def attention_triton_backward_impl(
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
-        num_block_m=num_block_m,
-        BLOCK_M=FIXED_BLOCK_M,
-        BLOCK_N=FIXED_BLOCK_N,
+        # Loop bound for the query axis, in units of THIS kernel's BLOCK_M. The dq launch
+        # keeps the FIXED_BLOCK_M-based count; conflating them would make the dk/dv loop
+        # stop short of the sequence and leave the tail of dk/dv at its zeros init.
+        num_block_m=dkdv_num_block_m,
+        # attn_fwd's BLOCK_M, i.e. the row interleave of the shared lse/delta scratch. It is
+        # deliberately NOT this kernel's BLOCK_M -- they were the same value before the
+        # dk/dv tile was decoupled, and conflating them again silently mis-reads delta.
+        LSE_ABI_BLOCK=FIXED_BLOCK_M,
+        BLOCK_M=dkdv_block_m,
+        BLOCK_N=dkdv_block_n,
         BLOCK_DMODEL_QK=padded_d_model_qk,
         BLOCK_DMODEL_V=padded_d_model_v,
         ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
