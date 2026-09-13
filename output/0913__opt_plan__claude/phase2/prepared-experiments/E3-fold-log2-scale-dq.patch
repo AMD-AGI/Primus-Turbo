@@ -1,0 +1,40 @@
+--- /tmp/f2.bak	2026-09-13 14:28:11.132357363 +0000
++++ primus_turbo/triton/attention/fused_mha_bwd_kernel.py	2026-09-13 14:28:11.152504575 +0000
+@@ -513,18 +513,27 @@
+             qk = tl.dot(q, kT)
+             if HAS_PE:
+                 qk = tl.dot(q_pe, kT_pe, acc=qk)
+-        qk_scaled = qk * sm_scale
+-
+-        if USE_ALIBI:
+-            relative_pos_block = offs_m[:, None] + seqlen_k - seqlen_q - offs_n[None, :]
+-            alibi_block = -1 * alibi_slope * tl.abs(relative_pos_block)
+-            qk_scaled += alibi_block
+-
+-        if DEBUG_TRITON_DETAIL:
+-            print(f"qk scaled: {qk.shape}\n", qk_scaled)
++        # CHANGED vs upstream: one per-element multiply on the [BLOCK_M2, BLOCK_N2] score
++        # tile instead of two. Upstream computes qk * sm_scale and then multiplies the whole
++        # tile by RCP_LN2 again inside the exp2. sm_scale and RCP_LN2 are both tl.constexpr,
++        # so their product folds to a single constant at compile time and the tile is scaled
++        # once. m is [BLOCK_M2], so scaling it is a row op, not a tile op.
++        #
++        # NOT bitwise-neutral: (qk * s) * r and qk * (s * r) differ in the last ulp because
++        # fp32 multiplication is not associative. Gate this on SQNR, not on a hash.
+         if USE_EXP2:
+-            p = tl.math.exp2(qk_scaled * RCP_LN2 - m * RCP_LN2)
++            qk_log2 = qk * (sm_scale * RCP_LN2)
++            if USE_ALIBI:
++                relative_pos_block = offs_m[:, None] + seqlen_k - seqlen_q - offs_n[None, :]
++                # Scaled to match: alibi is added in natural-log units upstream, and this
++                # tile is now in log2 units.
++                qk_log2 += (-1 * alibi_slope * tl.abs(relative_pos_block)) * RCP_LN2
++            p = tl.math.exp2(qk_log2 - m * RCP_LN2)
+         else:
++            qk_scaled = qk * sm_scale
++            if USE_ALIBI:
++                relative_pos_block = offs_m[:, None] + seqlen_k - seqlen_q - offs_n[None, :]
++                qk_scaled += -1 * alibi_slope * tl.abs(relative_pos_block)
+             p = tl.math.exp(qk_scaled - m)
+ 
+         # Autoregressive masking.

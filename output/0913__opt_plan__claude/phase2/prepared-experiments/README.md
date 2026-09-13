@@ -54,7 +54,31 @@ dump 一次迭代的 ISA，看 Triton 的 AMD 后端是发这条指令还是退�
 
 ---
 
-## E3 — 折掉 exp 之前的三个逐元素 VALU（未写补丁）
+## E3 — 折掉 exp 之前的逐元素 VALU（**补丁已就绪**：`E3-fold-log2-scale-dq.patch`）
+
+**已写的部分**（dq 那一趟，低风险）：上游算 `qk * sm_scale`，然后在 `exp2` 里又把
+**整个 tile** 乘一次 `RCP_LN2`。两者都是 `tl.constexpr`，乘积在编译期折成一个常量，
+所以 tile 只需要缩放**一次**。`m` 是 `[BLOCK_M2]`，缩放它是行操作不是 tile 操作。
+
+在 `BLOCK_M1=32, BLOCK_N1=256` 下，每次迭代省掉一次 8192 元素的乘法。
+
+**⚠ 这个改动不是逐位中性的。** `(qk * s) * r` 和 `qk * (s * r)` 在最后一个 ulp 上不同，
+因为 fp32 乘法不满足结合律。**验收只能用 SQNR，不能用哈希比对**——这点和 E1 不同，
+E1 只是把一个加载提前，值完全相同。
+
+ALIBI 路径也一并处理了（上游的 alibi 是自然对数单位，tile 现在是 log2 单位，所以要同步缩放）。
+这条路在我们的形状上没启用，但改了就得改对。
+
+### 未写的部分（累加器初值法，更激进）
+
+把 per-row 的 LSE 偏移折进 **GEMM 累加器初值**：`tl.dot(q, kT, acc=neg_m)`，
+然后 `p = exp2(qk)`，exp 之前**零** VALU。
+
+**仅 dq 那趟合法**——那里 `m` 不随 n-tile 变化。**dkdv 那趟不合法**，`m` 随 `curr_m` 前进。
+
+**必须实测而非假设**：acc tile 是 `[BLOCK_M2, BLOCK_N2]` fp32，每次迭代都要重新初始化，
+所以收益是 3 个操作 → ~1（那个 v_mov），不是 3 → 0，除非编译器把初值折进 WMMA 的 D 操作数写回。
+先测已写好的那半，再决定值不值得做这半。
 
 **现状**：`qk_scaled = qk * sm_scale`，然后 `p = exp2(qk_scaled * RCP_LN2 - m * RCP_LN2)`
 ——每个元素 mul、mul、sub。
