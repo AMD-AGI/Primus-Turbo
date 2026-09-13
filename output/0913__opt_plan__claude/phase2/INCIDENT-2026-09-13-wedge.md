@@ -39,6 +39,33 @@ was my measurement pattern, not the queue's design.** The card is independently 
 the measurement, or have the loop poll a `STOP` sentinel between candidates so it can be
 stopped *between* kernels rather than during one.
 
+## Driver reload was attempted and is NOT possible — a reboot is genuinely required
+
+The cheaper recovery was tried before escalating to a reboot, and it fails at the first step:
+
+```
+docker stop fa-tune-0913
+  -> cannot stop container: tried to kill container, but did not receive an exit event
+lsmod | grep amdgpu
+  -> refcount still 4
+/sys/class/kfd/kfd/proc/  -> 1 process still held
+```
+
+The container's processes are stuck in D-state inside the driver, so the container will not
+exit, the `/dev/kfd` handle is never released, the module refcount never drops, and
+`modprobe -r amdgpu` cannot succeed. `rmmod -f` is not an option: force-unloading a module
+with threads still inside it risks a kernel panic, which is strictly worse than a reboot.
+
+This confirms what Phase 1 documented rather than merely repeating it.
+
+## Why this was not rebooted automatically
+
+Only the operator's own sessions are on the box, so no third party would be disrupted — but
+one of them is **a tmux session open since 04:13** whose contents are not visible from here.
+A reboot kills it, and whatever is in it cannot be recovered. That is a decision for whoever
+owns that session, not for an autonomous run, so everything below is prepared and the reboot
+is left to a human.
+
 ## Recovery
 
 1. Reboot the host.
