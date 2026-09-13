@@ -124,8 +124,18 @@ GPU 数量和占用进程改读 `/sys/class/kfd/`（纯读，不会阻塞在驱�
 
 ## 明天 4 卡机的第一优先方法改动：**先离线筛，再上卡**
 
-Triton 编译不需要 GPU。候选配置可以先编译，离线读出
-`vgpr / spill / s_set_vgpr_msb / wmma / 总指令数`，**只把不顶满 1024 VGPR 的送上卡**。
+工具已做好并验证：`tools/gfx1250/isa_screen.py`。
+**注意它只是灾难探测器，不是排序器**——对「是否灾难性 spill（>1000 条）」23 个配置里对 22 个，
+但对「是否 spill」只有 19/23，且错的三个**方向偏悲观**（`M1=64 N1=128` 一族真值 0 spill 被预测成 133）。
+**拿它做硬性拒绝会误杀好配置**，只能用来剔除 >1000 条 spill 的那一类。
+今天以 2400–3800 条 spill 收场的六个配置它全部预测正确。
+
+跑法（不需要 GPU，用同镜像起一个不挂 `/dev/kfd` 的新容器；
+`docker exec` 对 wedged 容器失效但 `docker run` 可用）：
+```bash
+docker run --rm -v /home/lihuzhan/code:/home/lihuzhan/code \
+  -w $PWD fa-tune:deps python tools/gfx1250/isa_screen.py --grid default
+```
 43 个变体里规律是二值的：vgpr ≤ 951 的 **21 个变体 spill 恰好为 0**；
 vgpr = 1024 的 **14 个全部 spill**（28 到 1814 条不等），没有中间态。
 今天那些以 1600–1900 条 spill 收场的配置每一个都烧掉了真实 GPU 分钟才被判死，
