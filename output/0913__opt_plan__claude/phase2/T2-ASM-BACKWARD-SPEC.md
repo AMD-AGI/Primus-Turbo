@@ -54,22 +54,49 @@ atomic32=1、**tile 32×128**。
 514 条原子加）。而且需要一块 **fp32 的 dq_acc 暂存**，布局 C++ 里写明：
 `(1, batch, nhead_q, seqlen_q, hdim_q)` fp32。
 
-## 调用契约
+## 调用契约（已逐字节确证，并更正了我上一版的一处错误）
 
-`tools/gfx1250/asm_bwd_abi.py` 从 ELF 里直接读出并能生成打包代码
-（`--emit-packer` 给出 44 行 `struct.pack_into`）。
+`tools/gfx1250/asm_bwd_abi.py` 从 ELF 里直接读出并能生成打包代码。
 
-**这里有个坑：两种打包约定并存。**
-- 主内核 `dqdkdv`：ELF 元数据里有逐字段偏移，**每个字段补齐到 16 字节**，共 704 B。
-- `odo` / `dq_convert`：**ELF 里没有任何字段元数据**，host 用**紧凑打包**——
-  `use_compact_fmha_bwd_kernel_args()`（`mha_bwd.cu:68`）对 gfx1250 精确返回 true。
-  odo 的布局已从 `pack_fmha_bwd_odo_args()`（`mha_bwd.cu:95`）转录进工具，
-  3 指针 + 11×u32 + 2 指针 = **84 B，与 `kernarg_segment_size` 精确吻合**，布局确证。
+### 主内核 `dqdkdv`：头文件与预编译二进制**精确吻合**
 
-**唯一剩下的未知：`dq_convert` 的 208 B 布局。** 它的打包函数不在 `mha_bwd.cu` 里，
-还没找到。这是明天上卡前要补的最后一块。
+ELF 元数据给出 44 个字段的逐字段偏移，每字段补齐 16 字节，共 704 B。
+`csrc/include/mha_bwd.h` 的 `fmha_bwd_dqdkdv_args` 算出来也是 **704 B / 44 字段，完全一致**。
+
+> **更正**：本文档上一版说「两种打包约定并存，`odo`/`dq_convert` 用紧凑打包」，
+> 并且我一度得出「头文件已与二进制漂移」的结论。**后者是错的**——那是我的解析器
+> 把一个跨行声明（`unsigned int\n    max_seqlen_dq;`）拆成了两个字段，
+> 多算了 4 字节。头文件没有漂移。
+> 名字差异（`seqlen_q` vs `seq_len_q`、`ptr_qseq` vs `ptr_seqstart_q`）纯粹是命名，
+> **共同字段的顺序完全一致**。
+
+### `dq_convert`：ELF 没有字段元数据，但反汇编把它定死了
+
+头文件的 `fmha_bwd_post_kernel_args` 算出 192 B，而 ELF 声明 208 B，差一个 16 字节槽位。
+无法从元数据得知那个槽位是什么。**但这个问题在实践中不存在**——反汇编显示
+内核实际读取的 kernarg 偏移只有：
+
+```
+0x0 0x10 0x20 0x30 0x40 0x50 0x60 0x70 0x80 0x90
+   (2 条 s_load_b64 读两个指针，8 条 s_load_b32 读八个 u32)
+```
+
+**它从不读 0xa0 / 0xb0**——那两个是 `ptr_qseq` / `ptr_qseq_padded`，varlen/group 模式才用。
+所以批模式下：**分配 208 字节清零，按头文件填前 0xa0 即可**，
+而头文件对内核真正读的每一个字段都是对的。
+
+### `odo`：这条验证路走不通，如实记录
+
+`odo` 的反汇编里 **`s_load` 条数为 0** —— 它走 gfx1250 的 **kernarg 预加载到 SGPR**，
+参数不经过 `s_load`，所以没法用「内核读了哪些偏移」来验证布局。
+它的紧凑布局依据是两点：`pack_fmha_bwd_odo_args()`（`mha_bwd.cu:95`）的转录，
+以及 3 指针 + 11×u32 + 2 指针 = **84 B 与 `kernarg_segment_size` 精确相等**。
+两者独立吻合，但**不如 `dq_convert` 那样被反汇编直接确证**。
+（`use_compact_fmha_bwd_kernel_args()` 在 `mha_bwd.cu:68` 对 gfx1250 返回 true，
+但它只作用于 `odo`；`dq_convert` 走 `sizeof(post_args)` 的补齐结构体，不是紧凑打包。）
 
 ## 明天怎么测
 
 用 `hipModuleLoad` + `hipModuleLaunchKernel` 直调这三个 `.co`，**不要 patch 装好的 aiter**
-（会污染 21.684 ms 那个参考基线）。四张量 SQNR 门照常，dq 必须先清零。
+（会污染 21.684 ms 那个参考基线）。四张量 SQNR 门照常，dq_acc 必须是 fp32 且先清零。
+**odo 的布局是三者中唯一没有被反汇编确证的，如果结果是数值垃圾，先怀疑它。**

@@ -91,7 +91,11 @@ GPU 数量和占用进程改读 `/sys/class/kfd/`（纯读，不会阻塞在驱�
       也可能因占用率太低而输。
       **不是 drop-in：一次反向要发三个内核**（odo 预处理 → 主体 → dq fp32→bf16 转换），
       需要一块 fp32 dq_acc 暂存。调用契约已由 `tools/gfx1250/asm_bwd_abi.py` 从 ELF 读出。
-      **唯一剩下的未知是 `dq_convert` 的 208 B 布局**（打包函数不在 `mha_bwd.cu` 里）。
+      **调用契约已全部确证**：`dqdkdv` 的头文件与二进制精确吻合（704 B / 44 字段）；
+      `dq_convert` 的 208 vs 192 字节差经反汇编证明无关紧要——内核只读到 0x90，
+      从不碰 varlen 的 `ptr_qseq*`，批模式下填前 0xa0 即可。
+      **`odo` 是三者中唯一没被反汇编确证的**（它走 gfx1250 kernarg 预加载，`s_load` 为 0），
+      只有 C++ 转录 + 84 B 精确相等两条独立证据。**若上卡后是数值垃圾，先怀疑 odo。**
       `aiter-src/hsa/gfx1250/fmha_v3_bwd/bwd_hd128_bf16_causal_br_a32_pssk.co` 已确认存在，
       CSV 行与生产形状逐项匹配，C++ host 五处特判 gfx1250，**只缺 Python 侧架构门**。
       注意：必须先 `dq.zero_()`（gfx1250 只有 atomic32，绕过门控直调会得到静默垃圾 dq），
