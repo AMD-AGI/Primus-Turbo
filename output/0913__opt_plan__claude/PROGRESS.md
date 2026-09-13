@@ -108,6 +108,13 @@ GPU 数量和占用进程改读 `/sys/class/kfd/`（纯读，不会阻塞在驱�
       配置相同、布局相同、sliding_window 相同）。同内核同配置，vendored 19.727 vs
       aiter 18.063，非内核开销两边都是 0.138 —— 差异在**编译产物本身**。缓存元数据已 diff 完：
       找到了一个同阶的机制候选 `waves_per_eu`（见 T1b）。7.6% 的量，优先级低于上面。
+- [ ] **T7. gfx1250 预编译 ASM **前向**（新发现，之前没人提过）。**
+      `hsa/gfx1250/fmha_fwd_bf16/fmha_bf16_pertokenBf16_hd128_128x256_mask.co` —— hd128、
+      128×256 tile、bf16、**因果变体存在**。前向占 ~17% 时间且一直没动过
+      （「0.9 ms 差距」因两种测法不一致而未确立）。
+      **先核实名字里的 `pertokenBf16` 是否要求 per-token 量化 scale**；
+      若是则不是稠密 bf16 的 drop-in。**核实前不要当成可用项。**
+      复用 `asm_bwd_abi.py` 读它的 ABI，路子和 T2 一样。
 - [ ] **T5. 非因果 / varlen / sink 覆盖。** 融合内核支持 sink 但 dsink 没接；
       varlen 在 gfx1250 上仍无 Triton 路径。
 - [ ] **T6. HipKittens udna1。** 仅在 Triton 撞到天花板后启动。见 `phase2/PLAN-4GPU-TOMORROW.md`。

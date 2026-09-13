@@ -41,7 +41,8 @@ MASK_X = MASK_Y = 0
 
 TS_KV = 128   # dqdkdv tile along k, from fmha_bwd_dqdkdv.csv
 TS_QO = 32    # dqdkdv tile along q/o
-TS_ODO = 128  # odo preprocess tile
+TS_ODO = 128  # odo preprocess tile, from fmha_bwd_odo.csv
+TS_DQ = 64    # dq_convert tile, from fmha_bwd_dq_convert.csv
 BDX = 128     # threads per workgroup on gfx1250 (mha_bwd.cu:580) -- 4 wave32s
 
 # From the ELF metadata; every field padded to 16 bytes. GENERATED -- do not
@@ -163,6 +164,120 @@ class HipModule:
             fn, grid[0], grid[1], grid[2], block[0], block[1], block[2],
             ctypes.c_uint(shared), ctypes.c_void_p(stream or 0), None, config),
             "hipModuleLaunchKernel")
+
+
+
+SYMBOLS = {
+    "odo": "_ZN5aiter23fmha_bwd_hd128_odo_bf16E",
+    "dqdkdv": "_ZN5aiter38fmha_bwd_hd128_bf16_causal_br_a32_psskE",
+    "post": "_ZN5aiter30fmha_bwd_hd128_dq_convert_bf16E",
+}
+CO = {
+    "odo": "bwd_hd128_odo_bf16.co",
+    "dqdkdv": "bwd_hd128_bf16_causal_br_a32_pssk.co",
+    "post": "bwd_hd128_dq_convert_bf16.co",
+}
+
+
+def asm_backward(q, k, v, o, do, lse, softmax_scale=None, hip=None):
+    """Run the three-kernel ASM backward. Returns (dq, dk, dv).
+
+    q/k/v/o/do are [B, S, H, D] bf16 as Primus-Turbo lays them out; lse is
+    [B, Hq, Sq] fp32, or Primus-Turbo's packed [B, Hq, 2*Sq] scratch, which is
+    gathered exactly as attention_fused_bwd_impl does rather than duplicating
+    the layout knowledge.
+
+    NEVER RUN. Written while the card was wedged; the first execution is a
+    bring-up. Risks, in order of suspicion, are in
+    output/0913__opt_plan__claude/phase2/T2-ASM-BACKWARD-SPEC.md.
+    """
+    import math
+
+    import torch
+
+    batch, seqlen_q, nhead_q, head_dim = q.shape
+    seqlen_k, nhead_k = k.shape[1], k.shape[2]
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+    for name, t in (("q", q), ("k", k), ("v", v), ("o", o), ("do", do)):
+        if not t.is_contiguous():
+            raise ValueError(f"{name} must be contiguous; the byte strides below assume it")
+
+    if lse.dim() == 3 and lse.shape[2] == 2 * seqlen_q:
+        from primus_turbo.pytorch.kernels.attention.attention_fused_bwd_impl import (
+            _packed_lse_index,
+        )
+        lse = lse.gather(2, _packed_lse_index(seqlen_q, lse.device)
+                         .view(1, 1, -1).expand(batch, nhead_q, -1))
+    lse = lse.contiguous().float()
+
+    # 514 buffer_atomic_add_f32 accumulate into this, so it must be fp32 and zeroed.
+    dq_acc = torch.zeros((batch, nhead_q, seqlen_q, head_dim), device=q.device, dtype=torch.float32)
+    delta = torch.empty((batch, nhead_q, seqlen_q), device=q.device, dtype=torch.float32)
+    dq = torch.empty_like(q)
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
+
+    def bs(t, elem):  # byte strides, in the host's (batch, seq, head) order
+        return (t.stride(0) * elem, t.stride(1) * elem, t.stride(2) * elem)
+
+    b_q, s_q, h_q = bs(q, BF16)
+    b_k, s_k, h_k = bs(k, BF16)
+    b_v, s_v, h_v = bs(v, BF16)
+    b_do, s_do, h_do = bs(do, BF16)
+    b_o, s_o, h_o = bs(o, BF16)
+    b_dk, s_dk, h_dk = bs(dk, BF16)
+    b_dv, s_dv, h_dv = bs(dv, BF16)
+    h_lsed = seqlen_q * FP32
+
+    hip = hip or HipModule()
+    f_odo = hip.function(ASM_DIR / CO["odo"], SYMBOLS["odo"])
+    f_main = hip.function(ASM_DIR / CO["dqdkdv"], SYMBOLS["dqdkdv"])
+    f_post = hip.function(ASM_DIR / CO["post"], SYMBOLS["post"])
+    stream = torch.cuda.current_stream().cuda_stream
+
+    hip.launch(f_odo, ((seqlen_q + TS_ODO - 1) // TS_ODO, nhead_q, batch), (BDX, 1, 1),
+               pack_compact(ODO_FIELDS, ODO_SIZE, {
+                   "ptr_o": o.data_ptr(), "ptr_do": do.data_ptr(), "ptr_d": delta.data_ptr(),
+                   "Hs_o": h_o, "BAs_o": b_o, "Seqs_o": s_o,
+                   "Hs_do": h_do, "BAs_do": b_do, "Seqs_do": s_do,
+                   "Hs_d": h_lsed, "BAs_d": nhead_q * h_lsed, "Seqs_d": FP32,
+                   "seqlen_q": seqlen_q, "head_dim": head_dim,
+                   "ptr_qseq": 0, "ptr_qseq_padded": 0}), stream)
+
+    gdx = (seqlen_k + TS_KV - 1) // TS_KV
+    gdx = (gdx + 1) // 2  # causal: the host halves it for mask types 1 and 2
+    main_args = {name: 0 for name, _, _ in DQDKDV_FIELDS}
+    main_args.update({
+        "ptr_dq": dq_acc.data_ptr(), "ptr_dk": dk.data_ptr(), "ptr_dv": dv.data_ptr(),
+        "ptr_q": q.data_ptr(), "ptr_k": k.data_ptr(), "ptr_v": v.data_ptr(),
+        "ptr_do": do.data_ptr(), "ptr_lse": lse.data_ptr(), "ptr_d": delta.data_ptr(),
+        "scalar": float(softmax_scale), "log2e": 1.4426950408889634,
+        "seq_len_q": seqlen_q, "seq_len_k": seqlen_k,
+        "Ts": TS_KV * s_k, "ratio": nhead_q // nhead_k,
+        "Hs_q": h_q, "BAs_q": b_q, "Seqs_q": s_q,
+        "Hs_k": h_k, "BAs_k": b_k, "Seqs_k": s_k,
+        "Hs_v": h_v, "BAs_v": b_v, "Seqs_v": s_v,
+        "Hs_do": h_do, "BAs_do": b_do, "Seqs_do": s_do,
+        "Hs_dk": h_dk, "BAs_dk": b_dk, "Seqs_dk": s_dk,
+        "Hs_dv": h_dv, "BAs_dv": b_dv, "Seqs_dv": s_dv,
+        "head_dim_q": head_dim, "head_dim_v": head_dim, "nhead_q": nhead_q,
+        "Hs_lsed": h_lsed, "max_seq_len_dq": seqlen_q,
+        "mask_x": MASK_X, "mask_y": MASK_Y,
+    })
+    hip.launch(f_main, (gdx, nhead_q, batch), (BDX, 1, 1),
+               pack_padded(DQDKDV_FIELDS, DQDKDV_SIZE, main_args), stream)
+
+    b_dq, s_dq, h_dq = bs(dq, BF16)
+    hip.launch(f_post, ((seqlen_q + TS_DQ - 1) // TS_DQ, nhead_q, batch), (BDX, 1, 1),
+               pack_padded(POST_FIELDS, POST_SIZE, {
+                   "ptr_dq_acc": dq_acc.data_ptr(), "ptr_dq": dq.data_ptr(),
+                   "Hs_dq_acc": seqlen_q * head_dim * FP32,
+                   "BAs_dq_acc": nhead_q * seqlen_q * head_dim * FP32,
+                   "Seqs_dq_acc": head_dim * FP32,
+                   "Hs_dq": h_dq, "BAs_dq": b_dq, "Seqs_dq": s_dq,
+                   "seqlen_q": seqlen_q, "head_dim": head_dim}), stream)
+    return dq, dk, dv
 
 
 def selftest() -> int:

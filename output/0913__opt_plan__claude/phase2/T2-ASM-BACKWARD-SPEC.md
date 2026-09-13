@@ -138,3 +138,36 @@ host 只在 `if (mt == 3)`（generic window）时给这两个字段赋值。我�
 3. **`dq_acc` 必须是 fp32 且清零** —— 主内核有 514 条 `buffer_atomic_add_f32`。
 4. **grid** —— `(ceil(Sk/128), nhead_q, batch)`，因果时 `gdx=(gdx+1)/2`；
    我们的形状是 `(32, 32, 4)`。block 恒为 128。
+
+---
+
+# `asm_backward()` 已实现（三次发射全部接好）
+
+最后的 tile 参数也从 CSV 确认了：`ts_odo = 128`（`fmha_bwd_odo.csv`）、
+**`ts_dq = 64`**（`fmha_bwd_dq_convert.csv`，注意**不是** 128）。
+
+`asm_backward(q, k, v, o, do, lse, softmax_scale)` 接受 Primus-Turbo 的 `[B,S,H,D]` 布局，
+LSE 支持平铺 `[B,Hq,Sq]` 或打包 `[B,Hq,2*Sq]`——打包时**复用
+`attention_fused_bwd_impl._packed_lse_index`** 来展开，而不是把布局知识抄第二份。
+内部按上面的规格分配 fp32 且清零的 `dq_acc`、发三次内核、返回 `(dq, dk, dv)`。
+
+**仍然一行没在 GPU 上跑过。**
+
+---
+
+# 顺带发现：gfx1250 还有预编译的 ASM **前向**，而且有因果版
+
+不在 TODO 里，之前没人提过：
+
+```
+hsa/gfx1250/fmha_fwd_bf16/
+  fmha_bf16_pertokenBf16_hd128_128x256.co        (mask=0)
+  fmha_bf16_pertokenBf16_hd128_128x256_mask.co   (mask=1, 因果)
+```
+
+hd128、128×256 tile、bf16，**因果变体存在**。前向在我们这里占 ~17% 的时间，
+Triton 前向此前被判定「0.9 ms 差距不成立」（两种测法不一致），所以一直没动。
+
+**但名字里的 `pertokenBf16` 需要先核实**——它可能要求 per-token 量化的 scale 输入，
+那样就不是我们的稠密 bf16 路径的 drop-in。**在核实之前不要把它当成可用项。**
+已作为 T7 记入 PROGRESS.md。
