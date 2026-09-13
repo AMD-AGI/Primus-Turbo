@@ -57,8 +57,13 @@ for E in E1-hoist-Di E3-fold-log2-scale-dq; do
   say "STEP 3  $E"
   P=$OUT/../prepared-experiments/$E.patch
   [ -f "$P" ] || { echo "  patch missing, skipping"; continue; }
-  git stash push -q primus_turbo/triton/attention/fused_mha_bwd_kernel.py 2>/dev/null
-  patch -p0 -s < "$P" || { echo "  patch did not apply -- skipping"; git stash pop -q 2>/dev/null; continue; }
+  # No git stash here. The kernel is clean at this point (a rejected patch is reverted
+  # below, an accepted one stays), so stash/pop would either be a no-op or would fight the
+  # checkout used to revert. Verified offline: both prepared patches apply, parse and revert
+  # cleanly in sequence.
+  patch -p0 -s < "$P" || { echo "  patch did not apply -- skipping"; continue; }
+  python3 -c "import ast;ast.parse(open('primus_turbo/triton/attention/fused_mha_bwd_kernel.py').read())" \
+    || { echo "  patch produced unparseable python -- reverting"; git checkout -- primus_turbo/triton/attention/fused_mha_bwd_kernel.py; continue; }
   t=$(PRIMUS_TURBO_FUSED_MHA_BWD_TUNE="$([ "$bestcfg" = shipped ] && echo "" || echo "$bestcfg")" \
       run "$E" --shape llama31-8b --impl fused --tune "fwd:num_stages=2")
   echo "  $E -> ${t:-FAILED} ms   (best so far $best)"
@@ -67,7 +72,6 @@ for E in E1-hoist-Di E3-fold-log2-scale-dq; do
   else
     echo "  reject -- reverting"; git checkout -- primus_turbo/triton/attention/fused_mha_bwd_kernel.py
   fi
-  git stash drop -q 2>/dev/null || true
 done
 
 # ---- STEP 4: confirm the winner generalises and is deterministic. ----

@@ -1,5 +1,5 @@
---- /tmp/f2.bak	2026-09-13 14:28:11.132357363 +0000
-+++ primus_turbo/triton/attention/fused_mha_bwd_kernel.py	2026-09-13 14:28:11.152504575 +0000
+--- primus_turbo/triton/attention/fused_mha_bwd_kernel.py	(original)
++++ primus_turbo/triton/attention/fused_mha_bwd_kernel.py	(patched)
 @@ -513,18 +513,27 @@
              qk = tl.dot(q, kT)
              if HAS_PE:

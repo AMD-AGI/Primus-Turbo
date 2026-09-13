@@ -1,5 +1,5 @@
---- /tmp/fused.bak	2026-09-13 13:52:01.254398477 +0000
-+++ primus_turbo/triton/attention/fused_mha_bwd_kernel.py	2026-09-13 13:52:01.274610290 +0000
+--- primus_turbo/triton/attention/fused_mha_bwd_kernel.py	(original)
++++ primus_turbo/triton/attention/fused_mha_bwd_kernel.py	(patched)
 @@ -285,6 +285,11 @@
              dropout_scale = 1.0 / (1 - dropout_p)
          # Load m before computing qk to reduce pipeline stall.
