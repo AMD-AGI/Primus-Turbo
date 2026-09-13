@@ -37,9 +37,16 @@ BLK_SLICE_FACTOR=1`，前向 `num_stages=2`。已接进 dispatcher，按 `seqlen
 - [ ] **T3. 前向那 0.9 ms。** turbo 4.15 vs aiter 3.26，两个都是 Triton。配置已扫遍
       （num_stages 2/3/4、num_warps 1/2/4/8、PRE_LOAD_V）都不动 → **是结构差异**。
       下一步：profiler 对比两个前向的内核构成，判断要不要也 vendor 前向。
-- [ ] **T4. vendored 与纯 aiter 的 1.8 ms 差**（反向 20.2 vs 18.4）。怀疑是 packed LSE
-      gather：turbo 前向写 `[B,Hq,2*Sq]` 交错，融合内核要稠密 `[B,Hq,Sq]`。
-      验证方法：profiler 看 gather 的 elementwise 耗时；若坐实，考虑让前向直接写稠密 LSE。
+- [>] **T4. vendored 与纯 aiter 的 1.85 ms 差**（反向 20.27 vs 18.42）。**四个假设已排除**：
+      - ❌ packed LSE gather —— 实测 **0.018 ms（0.08%）**，不是它
+      - ❌ 配置不同 —— vendored 默认就是冠军配置（N1=256, BSF=1），已核对源码
+      - ❌ 张量布局不同 —— out/lse 的 shape/dtype/stride/contiguous 逐项相同
+      - ❌ sliding_window 分支 —— 两边都是 0
+      **已定位到**：同一个内核、同一个配置，vendored 下 19.727 ms vs aiter 下 18.063 ms，
+      而内核之外的开销两边都是 0.138 ms。所以差异在**内核本身的编译产物**，
+      不是适配器开销。下一步查剩余 constexpr（IS_FP8 / USE_EXP2 / PE / grid），
+      或直接 diff 两条路径的 Triton 缓存元数据。
+      优先级：这是 7.6% 的量，低于 T3。
 - [ ] **T5. 非因果 / varlen / sink 覆盖。** 融合内核支持 sink，但 dsink 没接。
       varlen 在 gfx1250 上仍无 Triton 路径。
 - [ ] **T6. HipKittens udna1 路线。** `3rdparty/hipkittens/include/udna1/` 已是完整
