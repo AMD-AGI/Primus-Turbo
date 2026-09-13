@@ -68,15 +68,20 @@ GPU 数量和占用进程改读 `/sys/class/kfd/`（纯读，不会阻塞在驱�
       `PRIMUS_TURBO_FUSED_MHA_BWD_TUNE=num_warps=8`。理由：BLOCK_N1=256 + HEAD_DIM=128 +
       wave32 下，dk/dv 的 fp32 累加器占 512 VGPR/lane，加常驻 k/v 再 256 = 1024 里用掉 768，
       还没算 score tile；1 wave/SIMD + num_stages=1，占用率和流水都不提供延迟隐藏。
-      同时扫 num_warps × num_stages（寄存器压力若是瓶颈，stages=2 可能在 warps=8 下才可行）。
+      同时扫 num_warps × num_stages。**离线筛已给出编译期证据支持这一项**：
+      在冠军 tile 家族（32/256 bsf=1）内，warps=8 把 VGPR 从顶满的 1024 降到 512、
+      `s_set_vgpr_msb` 从 2,299 降到 715（**少 3.2 倍**），代价是 spill 328→426。
+      `num_stages=2` 在两种 warps 下都明显更差，与已知悬崖一致，不必优先。
       **离线 ISA 已证实寄存器压力确实是瓶颈**：冠军 vgpr 顶满 1024，spill 113/245，
       且 `s_set_vgpr_msb`（>256 VGPR 的存储体选择，纯开销）有 **1834 条 = 全部指令的 15.7%，
       是 WMMA 条数的 4.1 倍**。注意缓存里已有的 warps=8 变体（BSF=2）编译器选了 512 VGPR
       预算换占用率、**仍然 spill**，所以 warps=8 不是自动的解，要实测。
-- [ ] **T1b. `waves_per_eu` 不设（删键）。零代码改动，从未测过。**
-      同一配置 wpe=0 vs wpe=1 只差 LLIR 一行属性，却差 10,831 行机器码：
-      总指令 8,793 vs 8,983（−2.1%），`s_set_vgpr_msb` 1,689 vs 1,853（−8.9%），
-      代价是多 3 条 spill 存储。净向好但需 A/B。也是 T4 那 1.85 ms 的可信机制候选。
+- [ ] **T1b（已降级，顺手测即可）。`waves_per_eu` 不设。**
+      我之前用「10,831 行不同机器码」描述它，**那个说法误导**——diff 行数主要是重排。
+      64 配置网格里 32 对同配置对照：总指令变化**中位数 0.00%**、最大 1.32%。
+      一半的配置对这个旋钮一条指令都不差。不要再当成有希望的免费收益。
+      **但解析器的修复是必要的**：`waves_per_eu=0` 此前被当作非法值拒绝，
+      这个设置根本无法从 harness 到达（已修，见 `_ZERO_MEANS_UNSET`）。
 - [ ] **T2. aiter 预编译 gfx1250 ASM 反向探针。一小时。**
       `aiter-src/hsa/gfx1250/fmha_v3_bwd/bwd_hd128_bf16_causal_br_a32_pssk.co` 已确认存在，
       CSV 行与生产形状逐项匹配，C++ host 五处特判 gfx1250，**只缺 Python 侧架构门**。
@@ -129,6 +134,11 @@ GPU 数量和占用进程改读 `/sys/class/kfd/`（纯读，不会阻塞在驱�
 但对「是否 spill」只有 19/23，且错的三个**方向偏悲观**（`M1=64 N1=128` 一族真值 0 spill 被预测成 133）。
 **拿它做硬性拒绝会误杀好配置**，只能用来剔除 >1000 条 spill 的那一类。
 今天以 2400–3800 条 spill 收场的六个配置它全部预测正确。
+
+**64 配置全网格已跑完**（`phase2/isa/screen-default.jsonl`）：
+16/64 因 spill >1000 在碰到卡之前判死，48 个进入基准测试。
+**读表限制：不要跨 tile 家族比 `wmma` 条数**——tile 变小则每 workgroup 活少、
+workgroup 变多，筛子只在同一 tile 家族内部有排序意义。
 
 跑法（不需要 GPU，用同镜像起一个不挂 `/dev/kfd` 的新容器；
 `docker exec` 对 wedged 容器失效但 `docker run` 可用）：

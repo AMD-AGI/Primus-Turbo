@@ -24,6 +24,7 @@ Two layers live here:
 Nothing here is wired into the dispatcher; ``attention_impl.py`` is untouched.
 """
 
+import os
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -258,7 +259,8 @@ def flash_attn_onekernel_backward(
     )
 
     kernel = bwd_kernel_causal if causal else bwd_kernel_noncausal
-    kernel[grid](
+    requested = dict(config_onekernel)  # the launch pops entries out of it
+    compiled = kernel[grid](
         q,
         k,
         v,
@@ -314,6 +316,7 @@ def flash_attn_onekernel_backward(
         SLIDING_WINDOW=sliding_window,
         **config_onekernel,
     )
+    _verify_launch(compiled, requested)
 
     return delta
 
@@ -341,6 +344,46 @@ def flash_attn_onekernel_backward(
 # the loaded value by 1/ln2 itself (USE_EXP2=True). No conversion is needed.
 # If turbo's forward is ever switched to the USE_EXP2=False branch it still
 # writes natural log (`m_i + log(l_i)`), so that branch is safe too.
+
+
+_VERIFY_ENV = "PRIMUS_TURBO_FUSED_MHA_BWD_VERIFY"
+
+# Keys that are compiler options rather than kernel arguments, so they do not
+# appear in the kernel name and must be read back from the compiled artifact.
+_METADATA_KEYS = ("num_warps", "num_stages", "waves_per_eu", "matrix_instr_nonkdim")
+
+
+def _verify_launch(compiled, requested: dict) -> None:
+    """Assert the config the tuner asked for is the config that actually ran.
+
+    Opt-in via ``PRIMUS_TURBO_FUSED_MHA_BWD_VERIFY=1``; off in production.
+
+    This exists because a tuning sweep once came back completely flat and the
+    override had silently not applied. The assertion written at the time checked
+    that the config *source* returned the right values, which it did -- that is
+    not the same claim as the kernel having run with them. Tile sizes end up in
+    the kernel name, but num_warps and waves_per_eu are compiler options and
+    appear only in the compiled metadata, so they need reading back separately.
+    """
+    if os.environ.get(_VERIFY_ENV, "") not in ("1", "true", "True"):
+        return
+    name = getattr(compiled, "name", "") or ""
+    bad = []
+    for key in ("BLOCK_M1", "BLOCK_N1", "BLOCK_M2", "BLOCK_N2", "BLK_SLICE_FACTOR"):
+        if key in requested and f"{key}_{requested[key]}_" not in name + "_":
+            bad.append(f"{key}={requested[key]} not in kernel name {name!r}")
+    meta = getattr(compiled, "metadata", None)
+    for key in _METADATA_KEYS:
+        if key not in requested or meta is None:
+            continue
+        actual = getattr(meta, key, None)
+        if actual is not None and actual != requested[key]:
+            bad.append(f"{key}: asked {requested[key]}, kernel compiled with {actual}")
+    if bad:
+        raise AssertionError(
+            f"{_VERIFY_ENV}: the launched kernel does not match the requested config:\n  "
+            + "\n  ".join(bad)
+        )
 
 
 def _packed_lse_index(seqlen_q: int, device: torch.device) -> torch.Tensor:

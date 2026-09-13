@@ -1819,6 +1819,13 @@ _DEFAULT_ONEKERNEL_CONFIG = {
 }
 
 # Every value the kernel launch accepts is an integer; anything else is a typo.
+# Zero is a typo for every key except waves_per_eu, where it is Triton's
+# encoding for "do not constrain occupancy, let the backend choose". That is a
+# distinct compilation, not a disabled knob: the attribute reaches LLVM as
+# amdgpu-waves-per-eu and changes scheduling. Rejecting it as non-positive made
+# the setting unreachable from the tuning harness.
+_ZERO_MEANS_UNSET = frozenset({"waves_per_eu"})
+
 _ONEKERNEL_KEYS = frozenset(_DEFAULT_ONEKERNEL_CONFIG)
 _PREPROCESS_KEYS = frozenset(_DEFAULT_PREPROCESS_CONFIG)
 
@@ -1869,7 +1876,7 @@ def _parse_tune_spec(spec: str) -> dict:
             parsed = int(value)
         except ValueError as exc:
             raise ValueError(f"{_FUSED_BWD_TUNE_ENV}: {key} must be an integer, got {value!r}") from exc
-        if parsed <= 0:
+        if parsed < 0 or (parsed == 0 and key not in _ZERO_MEANS_UNSET):
             raise ValueError(f"{_FUSED_BWD_TUNE_ENV}: {key} must be positive, got {parsed}")
         overrides[key] = parsed
     if not overrides:

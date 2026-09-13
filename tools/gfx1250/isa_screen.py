@@ -102,7 +102,8 @@ def compile_one(fn, cfg, num_warps, num_stages, waves_per_eu):
         n = p.name
         if sig[n] == "constexpr":
             continue
-        if sig[n].startswith("*") or n.startswith("stride_") or n in ("max_seqlen_q", "max_seqlen_k", "HQ"):
+        aligned = ("max_seqlen_q", "max_seqlen_k", "HQ")
+        if sig[n].startswith("*") or n.startswith("stride_") or n in aligned:
             attrs[(i,)] = [["tt.divisibility", 16]]
     src = ASTSource(fn=fn, signature=sig, constexprs=constants, attrs=attrs)
     opts = {"num_warps": num_warps, "num_stages": num_stages,
