@@ -1,0 +1,640 @@
+{"tag":"P1|gate-s1024|N64|B1","r":{"shape": "gate-s1024", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305023.477816, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 1024, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.98594017295288, "dq": 52.1388422694112, "dk": 52.21184347587549, "dv": 52.746430041069694}, "correct": true, "fwd_ms": 0.40392500162124634, "bwd_ms": 1.1168320178985596, "fwd_tflops": 85.06464870975861, "bwd_tflops": 76.91339838342824, "total_ms": 1.520757019519806, "total_tflops": 79.0784344536335, "bwd_share": 0.7343921504641223, "per_step_ms": 48.66422462463379, "peak_mem_gib": 0.8750033378601074, "dmesg_faults_after": 0, "wall_s": 2.6481263637542725}}
+{"tag":"P1|gate-s1024|N64|B2","r":{"shape": "gate-s1024", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305027.2872307, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 1024, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.98594017295288, "dq": 52.1388422694112, "dk": 52.21184347587549, "dv": 52.746430041069694}, "correct": true, "fwd_ms": 0.40797099471092224, "bwd_ms": 1.252236008644104, "fwd_tflops": 84.22103241027325, "bwd_tflops": 68.59677035881606, "total_ms": 1.6602070033550262, "total_tflops": 72.43619864569578, "bwd_share": 0.7542649838926864, "per_step_ms": 53.12662410736084, "peak_mem_gib": 0.8750033378601074, "dmesg_faults_after": 0, "wall_s": 2.6402926445007324}}
+{"tag":"P1|gate-s1024|N128|B1","r":{"shape": "gate-s1024", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305031.1364563, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 1024, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.98594017295288, "dq": 52.13884083187917, "dk": 52.21193807191576, "dv": 52.74646834830348}, "correct": true, "fwd_ms": 0.40412598848342896, "bwd_ms": 0.9589570164680481, "fwd_tflops": 85.02234290089193, "bwd_tflops": 89.57580417564223, "total_ms": 1.363083004951477, "total_tflops": 88.2257968525409, "bwd_share": 0.7035206315276339, "per_step_ms": 43.618656158447266, "peak_mem_gib": 0.8750033378601074, "dmesg_faults_after": 0, "wall_s": 2.6680476665496826}}
+{"tag":"P1|gate-s1024|N128|B2","r":{"shape": "gate-s1024", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305035.015585, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 1024, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.98594017295288, "dq": 52.13884083187917, "dk": 52.21193807191576, "dv": 52.74646834830348}, "correct": true, "fwd_ms": 0.40116098523139954, "bwd_ms": 0.9724559783935547, "fwd_tflops": 85.65074778690268, "bwd_tflops": 88.33237475890799, "total_ms": 1.3736169636249542, "total_tflops": 87.54921311588794, "bwd_share": 0.707952802087751, "per_step_ms": 43.955742835998535, "peak_mem_gib": 0.8750033378601074, "dmesg_faults_after": 0, "wall_s": 2.629328966140747}}
+{"tag":"P1|gate-s1024|N256|B1","r":{"shape": "gate-s1024", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305038.812902, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 1024, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.98594017295288, "dq": 52.13884870960751, "dk": 52.211922967570246, "dv": 52.74652618526776}, "correct": true, "fwd_ms": 0.4012410044670105, "bwd_ms": 1.4520150423049927, "fwd_tflops": 85.63366651332619, "bwd_tflops": 59.15871627861347, "total_ms": 1.8532560467720032, "total_tflops": 64.89070115134224, "bwd_share": 0.7834940265453924, "per_step_ms": 59.3041934967041, "peak_mem_gib": 0.8750033378601074, "dmesg_faults_after": 0, "wall_s": 2.6396636962890625}}
+{"tag":"P1|gate-s1024|N256|B2","r":{"shape": "gate-s1024", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305042.5966158, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 1024, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.98594017295288, "dq": 52.13884870960751, "dk": 52.211922967570246, "dv": 52.74652618526776}, "correct": true, "fwd_ms": 0.40136098861694336, "bwd_ms": 1.7527049779891968, "fwd_tflops": 85.60806690854734, "bwd_tflops": 49.00958632441874, "total_ms": 2.15406596660614, "total_tflops": 55.82887718033788, "bwd_share": 0.8136728425038386, "per_step_ms": 68.93011093139648, "peak_mem_gib": 0.8750033378601074, "dmesg_faults_after": 0, "wall_s": 2.658137798309326}}
+{"tag":"P1|gate-s2048|N64|B1","r":{"shape": "gate-s2048", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305046.4296055, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 2048, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.86550373860068, "dq": 52.14381031296601, "dk": 52.22032219725741, "dv": 52.731444290425685}, "correct": true, "fwd_ms": 0.6324269771575928, "bwd_ms": 3.3599119186401367, "fwd_tflops": 217.31987792442317, "bwd_tflops": 102.26380690927897, "total_ms": 3.9923388957977295, "total_tflops": 120.48985562281074, "bwd_share": 0.8415898565566978, "per_step_ms": 127.75484466552734, "peak_mem_gib": 1.6250052452087402, "dmesg_faults_after": 0, "wall_s": 3.5178067684173584}}
+{"tag":"P1|gate-s2048|N64|B2","r":{"shape": "gate-s2048", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305051.1018636, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 2048, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.86550373860068, "dq": 52.14381031296601, "dk": 52.22032219725741, "dv": 52.731444290425685}, "correct": true, "fwd_ms": 0.6353909969329834, "bwd_ms": 3.496397018432617, "fwd_tflops": 216.30610779097347, "bwd_tflops": 98.27184437825358, "total_ms": 4.131788015365601, "total_tflops": 116.4232858421309, "bwd_share": 0.8462188779845325, "per_step_ms": 132.21721649169922, "peak_mem_gib": 1.6250052452087402, "dmesg_faults_after": 0, "wall_s": 3.499527931213379}}
+{"tag":"P1|gate-s2048|N128|B1","r":{"shape": "gate-s2048", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305055.7577324, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 2048, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.86550373860068, "dq": 52.14381243578426, "dk": 52.22028491807633, "dv": 52.73123988856852}, "correct": true, "fwd_ms": 0.6315060257911682, "bwd_ms": 2.5185320377349854, "fwd_tflops": 217.63680449416563, "bwd_tflops": 136.42764059853317, "total_ms": 3.1500380635261536, "total_tflops": 152.70810302956397, "bwd_share": 0.799524319054018, "per_step_ms": 100.80121803283691, "peak_mem_gib": 1.6250052452087402, "dmesg_faults_after": 0, "wall_s": 3.516436815261841}}
+{"tag":"P1|gate-s2048|N128|B2","r":{"shape": "gate-s2048", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305060.4422894, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 2048, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.86550373860068, "dq": 52.14381243578426, "dk": 52.22028491807633, "dv": 52.73123988856852}, "correct": true, "fwd_ms": 0.641601026058197, "bwd_ms": 2.6373910903930664, "fwd_tflops": 214.21249014575838, "bwd_tflops": 130.27926913516328, "total_ms": 3.2789921164512634, "total_tflops": 146.70249883754173, "bwd_share": 0.8043298052352199, "per_step_ms": 104.92774772644043, "peak_mem_gib": 1.6250052452087402, "dmesg_faults_after": 0, "wall_s": 3.4806101322174072}}
+{"tag":"P1|gate-s2048|N256|B1","r":{"shape": "gate-s2048", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305065.0897632, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 2048, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.86550373860068, "dq": 52.14381314134169, "dk": 52.220357941421575, "dv": 52.73122008932702}, "correct": true, "fwd_ms": 0.6319869756698608, "bwd_ms": 2.3990330696105957, "fwd_tflops": 217.47118020323848, "bwd_tflops": 143.22327942556115, "total_ms": 3.0310200452804565, "total_tflops": 158.7044394183445, "bwd_share": 0.7914936337508174, "per_step_ms": 96.99264144897461, "peak_mem_gib": 1.6250052452087402, "dmesg_faults_after": 0, "wall_s": 3.465205430984497}}
+{"tag":"P1|gate-s2048|N256|B2","r":{"shape": "gate-s2048", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305069.7288632, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 2048, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.86550373860068, "dq": 52.14381314134169, "dk": 52.220357941421575, "dv": 52.73122008932702}, "correct": true, "fwd_ms": 0.6282609701156616, "bwd_ms": 2.613914966583252, "fwd_tflops": 218.76092899213165, "bwd_tflops": 131.44933483782344, "total_ms": 3.2421759366989136, "total_tflops": 148.36836326710164, "bwd_share": 0.8062224313602987, "per_step_ms": 103.74962997436523, "peak_mem_gib": 1.6250052452087402, "dmesg_faults_after": 0, "wall_s": 3.4481403827667236}}
+{"tag":"P1|llama31-8b-s4096|N64|B1","r":{"shape": "llama31-8b-s4096", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305074.343458, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 4096, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.738589578825575, "dq": 52.20622487624395, "dk": 52.2936453144339, "dv": 52.6999547206426}, "correct": true, "fwd_ms": 1.4018189907073975, "bwd_ms": 11.605941772460938, "fwd_tflops": 392.1731817961588, "bwd_tflops": 118.42119852619017, "total_ms": 13.007760763168335, "total_tflops": 147.92287340156543, "bwd_share": 0.8922321054153557, "per_step_ms": 416.2483444213867, "peak_mem_gib": 3.125009059906006, "dmesg_faults_after": 0, "wall_s": 5.390580654144287}}
+{"tag":"P1|llama31-8b-s4096|N64|B2","r":{"shape": "llama31-8b-s4096", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305080.9041338, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 4096, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.738589578825575, "dq": 52.20622487624395, "dk": 52.2936453144339, "dv": 52.6999547206426}, "correct": true, "fwd_ms": 1.3724149465560913, "bwd_ms": 11.89645767211914, "fwd_tflops": 400.57550762438535, "bwd_tflops": 115.5293090262538, "total_ms": 13.268872618675232, "total_tflops": 145.01196928365022, "bwd_share": 0.8965688354996724, "per_step_ms": 424.6039237976074, "peak_mem_gib": 3.125009059906006, "dmesg_faults_after": 0, "wall_s": 5.401190519332886}}
+{"tag":"P1|llama31-8b-s4096|N128|B1","r":{"shape": "llama31-8b-s4096", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305087.473768, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 4096, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.738589578825575, "dq": 52.206226292710625, "dk": 52.293536852535354, "dv": 52.6998990605683}, "correct": true, "fwd_ms": 1.3599170446395874, "bwd_ms": 7.490697860717773, "fwd_tflops": 404.25687438434846, "bwd_tflops": 183.47950488398197, "total_ms": 8.85061490535736, "total_tflops": 217.40244821219108, "bwd_share": 0.8463477329901207, "per_step_ms": 283.21967697143555, "peak_mem_gib": 3.125009059906006, "dmesg_faults_after": 0, "wall_s": 5.269194841384888}}
+{"tag":"P1|llama31-8b-s4096|N128|B2","r":{"shape": "llama31-8b-s4096", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305093.9052896, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 4096, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.738589578825575, "dq": 52.206226292710625, "dk": 52.293536852535354, "dv": 52.6998990605683}, "correct": true, "fwd_ms": 1.388079047203064, "bwd_ms": 7.7603020668029785, "fwd_tflops": 396.0551202006405, "bwd_tflops": 177.1051594240595, "total_ms": 9.148381114006042, "total_tflops": 210.32632163325167, "bwd_share": 0.8482705267844675, "per_step_ms": 292.74819564819336, "peak_mem_gib": 3.125009059906006, "dmesg_faults_after": 0, "wall_s": 5.303049087524414}}
+{"tag":"P1|llama31-8b-s4096|N256|B1","r":{"shape": "llama31-8b-s4096", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305100.362113, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 4096, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.738589578825575, "dq": 52.20622405408382, "dk": 52.29353760996601, "dv": 52.69993941747856}, "correct": true, "fwd_ms": 1.3918039798736572, "bwd_ms": 6.5557379722595215, "fwd_tflops": 394.9951443147222, "bwd_tflops": 209.64680719938818, "total_ms": 7.947541952133179, "total_tflops": 242.1057177422694, "bwd_share": 0.8248761707385405, "per_step_ms": 254.32134246826172, "peak_mem_gib": 3.125009059906006, "dmesg_faults_after": 0, "wall_s": 5.279188871383667}}
+{"tag":"P1|llama31-8b-s4096|N256|B2","r":{"shape": "llama31-8b-s4096", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305106.8292856, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 4096, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.738589578825575, "dq": 52.20622405408382, "dk": 52.29353760996601, "dv": 52.69993941747856}, "correct": true, "fwd_ms": 1.390483021736145, "bwd_ms": 7.170780181884766, "fwd_tflops": 395.3703894935586, "bwd_tflops": 191.6652720985732, "total_ms": 8.56126320362091, "total_tflops": 224.75016861929902, "bwd_share": 0.837584362416512, "per_step_ms": 273.96042251586914, "peak_mem_gib": 3.125009059906006, "dmesg_faults_after": 0, "wall_s": 5.242852449417114}}
+{"tag":"P1|gate-b1|N64|B1","r":{"shape": "gate-b1", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305113.2510014, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 1, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.68196201032898, "dq": 52.20649569478184, "dk": 52.26292450398507, "dv": 52.676301946636634}, "correct": true, "fwd_ms": 1.3630410432815552, "bwd_ms": 11.491209983825684, "fwd_tflops": 403.3303447447549, "bwd_tflops": 119.60355233735226, "total_ms": 12.854251027107239, "total_tflops": 149.68941749700807, "bwd_share": 0.8939618465201004, "per_step_ms": 411.33603286743164, "peak_mem_gib": 1.832061767578125, "dmesg_faults_after": 0, "wall_s": 3.8003897666931152}}
+{"tag":"P1|gate-b1|N64|B2","r":{"shape": "gate-b1", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305118.201337, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 1, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.68196201032898, "dq": 52.20649569478184, "dk": 52.26292450398507, "dv": 52.676301946636634}, "correct": true, "fwd_ms": 1.3649649620056152, "bwd_ms": 11.914203643798828, "fwd_tflops": 402.76185044355617, "bwd_tflops": 115.35723039578478, "total_ms": 13.279168605804443, "total_tflops": 144.8995344307127, "bwd_share": 0.8972100586621834, "per_step_ms": 424.9333953857422, "peak_mem_gib": 1.832061767578125, "dmesg_faults_after": 0, "wall_s": 3.823946952819824}}
+{"tag":"P1|gate-b1|N128|B1","r":{"shape": "gate-b1", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305123.1955583, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 1, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.68196201032898, "dq": 52.206499062961456, "dk": 52.26264923353976, "dv": 52.67627242695296}, "correct": true, "fwd_ms": 1.3591949939727783, "bwd_ms": 7.315637111663818, "fwd_tflops": 404.47162940258033, "bwd_tflops": 187.87010806327683, "total_ms": 8.674832105636597, "total_tflops": 221.807791226041, "bwd_share": 0.843317429384066, "per_step_ms": 277.5946273803711, "peak_mem_gib": 1.832061767578125, "dmesg_faults_after": 0, "wall_s": 3.7109551429748535}}
+{"tag":"P1|gate-b1|N128|B2","r":{"shape": "gate-b1", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305128.07859, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 1, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.68196201032898, "dq": 52.206499062961456, "dk": 52.26264923353976, "dv": 52.67627242695296}, "correct": true, "fwd_ms": 1.3606369495391846, "bwd_ms": 7.448915958404541, "fwd_tflops": 404.042984481782, "bwd_tflops": 184.50866440093063, "total_ms": 8.809552907943726, "total_tflops": 218.4157775899121, "bwd_share": 0.8455498294002781, "per_step_ms": 281.9056930541992, "peak_mem_gib": 1.832061767578125, "dmesg_faults_after": 0, "wall_s": 3.682859182357788}}
+{"tag":"P1|gate-b1|N256|B1","r":{"shape": "gate-b1", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305132.924302, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 1, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.68196201032898, "dq": 52.20650349319841, "dk": 52.262636224575274, "dv": 52.67622519125936}, "correct": true, "fwd_ms": 1.347978949546814, "bwd_ms": 7.088576793670654, "fwd_tflops": 407.8370912786332, "bwd_tflops": 193.8879375542893, "total_ms": 8.436555743217468, "total_tflops": 228.0723801481319, "bwd_share": 0.8402216508045341, "per_step_ms": 269.969783782959, "peak_mem_gib": 1.832061767578125, "dmesg_faults_after": 0, "wall_s": 3.6812267303466797}}
+{"tag":"P1|gate-b1|N256|B2","r":{"shape": "gate-b1", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305137.778807, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 1, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.68196201032898, "dq": 52.20650349319841, "dk": 52.262636224575274, "dv": 52.67622519125936}, "correct": true, "fwd_ms": 1.3640429973602295, "bwd_ms": 7.785739898681641, "fwd_tflops": 403.0340795355553, "bwd_tflops": 176.52651547641932, "total_ms": 9.14978289604187, "total_tflops": 210.29409882942375, "bwd_share": 0.850920725348543, "per_step_ms": 292.79305267333984, "peak_mem_gib": 1.832061767578125, "dmesg_faults_after": 0, "wall_s": 3.713545083999634}}
+{"tag":"P1|llama31-8b-b2|N64|B1","r":{"shape": "llama31-8b-b2", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305142.7033827, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 2, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.63365311043609, "dq": 52.23344830045135, "dk": 52.29969421893557, "dv": 52.69238693188893}, "correct": true, "fwd_ms": 2.28570294380188, "bwd_ms": 10.46110725402832, "fwd_tflops": 481.03872410784425, "bwd_tflops": 262.7617710717488, "total_ms": 12.7468101978302, "total_tflops": 301.90225142530693, "bwd_share": 0.8206843195805207, "per_step_ms": 407.8979263305664, "peak_mem_gib": 3.125009059906006, "dmesg_faults_after": 0, "wall_s": 5.53107213973999}}
+{"tag":"P1|llama31-8b-b2|N64|B2","r":{"shape": "llama31-8b-b2", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305149.4326591, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 2, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.63365311043609, "dq": 52.23344830045135, "dk": 52.29969421893557, "dv": 52.69238693188893}, "correct": true, "fwd_ms": 2.2933549880981445, "bwd_ms": 11.404359817504883, "fwd_tflops": 479.4336827408536, "bwd_tflops": 241.02879192050915, "total_ms": 13.697714805603027, "total_tflops": 280.94399334711386, "bwd_share": 0.8325738985921907, "per_step_ms": 438.3268737792969, "peak_mem_gib": 3.125009059906006, "dmesg_faults_after": 0, "wall_s": 5.524074554443359}}
+{"tag":"P1|llama31-8b-b2|N128|B1","r":{"shape": "llama31-8b-b2", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305156.1464536, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 2, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.63365311043609, "dq": 52.23344830045135, "dk": 52.29969421893557, "dv": 52.69238693188893}, "correct": true, "fwd_ms": 2.2906699180603027, "bwd_ms": 10.500164985656738, "fwd_tflops": 479.99566376068987, "bwd_tflops": 261.7843694070371, "total_ms": 12.790834903717041, "total_tflops": 300.8631356892644, "bwd_share": 0.8209131823447561, "per_step_ms": 409.3067169189453, "peak_mem_gib": 3.125009059906006, "dmesg_faults_after": 0, "wall_s": 5.497997760772705}}
+{"tag":"P1|llama31-8b-b2|N128|B2","r":{"shape": "llama31-8b-b2", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305162.852818, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 2, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.63365311043609, "dq": 52.23344830045135, "dk": 52.29969421893557, "dv": 52.69238693188893}, "correct": true, "fwd_ms": 2.300445079803467, "bwd_ms": 11.339062690734863, "fwd_tflops": 477.95604312793864, "bwd_tflops": 242.41678032929693, "total_ms": 13.63950777053833, "total_tflops": 282.14293081223957, "bwd_share": 0.8313395821532149, "per_step_ms": 436.46424865722656, "peak_mem_gib": 3.125009059906006, "dmesg_faults_after": 0, "wall_s": 5.493029356002808}}
+{"tag":"P1|llama31-8b-b2|N256|B1","r":{"shape": "llama31-8b-b2", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305169.535076, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 2, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.63365311043609, "dq": 52.23344830045135, "dk": 52.29969421893557, "dv": 52.69238693188893}, "correct": true, "fwd_ms": 2.278251886367798, "bwd_ms": 10.455178260803223, "fwd_tflops": 482.6119685689997, "bwd_tflops": 262.9107797946645, "total_ms": 12.73343014717102, "total_tflops": 302.2194846744396, "bwd_share": 0.8210810551409861, "per_step_ms": 407.46976470947266, "peak_mem_gib": 3.125009059906006, "dmesg_faults_after": 0, "wall_s": 5.501532316207886}}
+{"tag":"P1|llama31-8b-b2|N256|B2","r":{"shape": "llama31-8b-b2", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305176.2088892, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 2, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.63365311043609, "dq": 52.23344830045135, "dk": 52.29969421893557, "dv": 52.69238693188893}, "correct": true, "fwd_ms": 2.2706398963928223, "bwd_ms": 11.627453804016113, "fwd_tflops": 484.2298549949303, "bwd_tflops": 236.40421331887586, "total_ms": 13.898093700408936, "total_tflops": 276.89342007406157, "bwd_share": 0.8366222055096656, "per_step_ms": 444.73899841308594, "peak_mem_gib": 3.125009059906006, "dmesg_faults_after": 0, "wall_s": 5.527986526489258}}
+{"tag":"P1|llama31-8b|N64|B1","r":{"shape": "llama31-8b", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305182.943485, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.66972664861177, "dq": 52.240793639657724, "dk": 52.30895049203725, "dv": 52.71029787716679}, "correct": true, "fwd_ms": 4.1570658683776855, "bwd_ms": 20.31001853942871, "fwd_tflops": 528.9844628827542, "bwd_tflops": 270.6820837316004, "total_ms": 24.467084407806396, "total_tflops": 314.56880052191065, "bwd_share": 0.8300955766085744, "per_step_ms": 782.9467010498047, "peak_mem_gib": 6.125009059906006, "dmesg_faults_after": 0, "wall_s": 9.158313751220703}}
+{"tag":"P1|llama31-8b|N64|B2","r":{"shape": "llama31-8b", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305193.289964, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.66972664861177, "dq": 52.240793639657724, "dk": 52.30895049203725, "dv": 52.71029787716679}, "correct": true, "fwd_ms": 4.177055835723877, "bwd_ms": 21.91606330871582, "fwd_tflops": 526.4529233114531, "bwd_tflops": 250.84606032752566, "total_ms": 26.093119144439697, "total_tflops": 294.9659391745084, "bwd_share": 0.8399173432428072, "per_step_ms": 834.9798126220703, "peak_mem_gib": 6.125009059906006, "dmesg_faults_after": 0, "wall_s": 9.162482738494873}}
+{"tag":"P1|llama31-8b|N128|B1","r":{"shape": "llama31-8b", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305203.6234226, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.66972664861177, "dq": 52.240793639657724, "dk": 52.30895049203725, "dv": 52.71029787716679}, "correct": true, "fwd_ms": 4.149415016174316, "bwd_ms": 20.15462303161621, "fwd_tflops": 529.9598249344214, "bwd_tflops": 272.76908777981487, "total_ms": 24.304038047790527, "total_tflops": 316.6791205353504, "bwd_share": 0.8292705513373924, "per_step_ms": 777.7292175292969, "peak_mem_gib": 6.125009059906006, "dmesg_faults_after": 0, "wall_s": 9.174783945083618}}
+{"tag":"P1|llama31-8b|N128|B2","r":{"shape": "llama31-8b", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305213.9991114, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.66972664861177, "dq": 52.240793639657724, "dk": 52.30895049203725, "dv": 52.71029787716679}, "correct": true, "fwd_ms": 4.158308029174805, "bwd_ms": 22.10915184020996, "fwd_tflops": 528.8264457860245, "bwd_tflops": 248.65531607058662, "total_ms": 26.267459869384766, "total_tflops": 293.0082098803362, "bwd_share": 0.8416935611645725, "per_step_ms": 840.5587158203125, "peak_mem_gib": 6.125009059906006, "dmesg_faults_after": 0, "wall_s": 9.237032175064087}}
+{"tag":"P1|llama31-8b|N256|B1","r":{"shape": "llama31-8b", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305224.4696941, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.66972664861177, "dq": 52.240793639657724, "dk": 52.30895049203725, "dv": 52.71029787716679}, "correct": true, "fwd_ms": 4.1597900390625, "bwd_ms": 20.162235260009766, "fwd_tflops": 528.6380405987024, "bwd_tflops": 272.66610412903873, "total_ms": 24.322025299072266, "total_tflops": 316.4449218267023, "bwd_share": 0.8289702445453352, "per_step_ms": 778.3048095703125, "peak_mem_gib": 6.125009059906006, "dmesg_faults_after": 0, "wall_s": 9.15496277809143}}
+{"tag":"P1|llama31-8b|N256|B2","r":{"shape": "llama31-8b", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305234.7918258, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.66972664861177, "dq": 52.240793639657724, "dk": 52.30895049203725, "dv": 52.71029787716679}, "correct": true, "fwd_ms": 4.162154197692871, "bwd_ms": 21.978435516357422, "fwd_tflops": 528.337767200202, "bwd_tflops": 250.13418879557872, "total_ms": 26.140589714050293, "total_tflops": 294.43028939378394, "bwd_share": 0.840778106262241, "per_step_ms": 836.4988708496094, "peak_mem_gib": 6.125009059906006, "dmesg_faults_after": 0, "wall_s": 9.18425965309143}}
+{"tag":"P1|gate-b8|N64|B1","r":{"shape": "gate-b8", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305245.180222, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 8, "seqlen": 4096, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.75535292188406, "dq": 52.20199209593768, "dk": 52.259688441407306, "dv": 52.72612761178416}, "correct": true, "fwd_ms": 2.408327102661133, "bwd_ms": 11.687705039978027, "fwd_tflops": 456.5458016733155, "bwd_tflops": 235.18552701644563, "total_ms": 14.09603214263916, "total_tflops": 273.00524419033394, "bwd_share": 0.8291485803741769, "per_step_ms": 451.0730285644531, "peak_mem_gib": 6.125009059906006, "dmesg_faults_after": 0, "wall_s": 8.66823410987854}}
+{"tag":"P1|gate-b8|N64|B2","r":{"shape": "gate-b8", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305255.0394158, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 8, "seqlen": 4096, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.75535292188406, "dq": 52.20199209593768, "dk": 52.259688441407306, "dv": 52.72612761178416}, "correct": true, "fwd_ms": 2.4365289211273193, "bwd_ms": 12.916463851928711, "fwd_tflops": 451.2614721056889, "bwd_tflops": 212.8120436793966, "total_ms": 15.35299277305603, "total_tflops": 250.6541072545554, "bwd_share": 0.8412994158765356, "per_step_ms": 491.29576873779297, "peak_mem_gib": 6.125009059906006, "dmesg_faults_after": 0, "wall_s": 8.747185468673706}}
+{"tag":"P1|gate-b8|N128|B1","r":{"shape": "gate-b8", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305265.0227938, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 8, "seqlen": 4096, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.75535292188406, "dq": 52.20199209593768, "dk": 52.259688441407306, "dv": 52.72612761178416}, "correct": true, "fwd_ms": 2.451551914215088, "bwd_ms": 11.690306663513184, "fwd_tflops": 448.4961633488516, "bwd_tflops": 235.1331875680611, "total_ms": 14.141858577728271, "total_tflops": 272.1205756700605, "bwd_share": 0.8266457056729455, "per_step_ms": 452.5394744873047, "peak_mem_gib": 6.125009059906006, "dmesg_faults_after": 0, "wall_s": 8.660661458969116}}
+{"tag":"P1|gate-b8|N128|B2","r":{"shape": "gate-b8", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305274.8600202, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 8, "seqlen": 4096, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.75535292188406, "dq": 52.20199209593768, "dk": 52.259688441407306, "dv": 52.72612761178416}, "correct": true, "fwd_ms": 2.428957939147949, "bwd_ms": 12.840351104736328, "fwd_tflops": 452.6680392669525, "bwd_tflops": 214.0735130230261, "total_ms": 15.269309043884277, "total_tflops": 252.0278217014235, "bwd_share": 0.840925484436324, "per_step_ms": 488.6178894042969, "peak_mem_gib": 6.125009059906006, "dmesg_faults_after": 0, "wall_s": 8.7438223361969}}
+{"tag":"P1|gate-b8|N256|B1","r":{"shape": "gate-b8", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305284.7917228, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 8, "seqlen": 4096, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.75535292188406, "dq": 52.20199209593768, "dk": 52.259688441407306, "dv": 52.72612761178416}, "correct": true, "fwd_ms": 2.4471850395202637, "bwd_ms": 11.691390037536621, "fwd_tflops": 449.2964814755258, "bwd_tflops": 235.111399124887, "total_ms": 14.138575077056885, "total_tflops": 272.1837721441069, "bwd_share": 0.8269143088194659, "per_step_ms": 452.4344024658203, "peak_mem_gib": 6.125009059906006, "dmesg_faults_after": 0, "wall_s": 8.686646223068237}}
+{"tag":"P1|gate-b8|N256|B2","r":{"shape": "gate-b8", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305294.7075112, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 8, "seqlen": 4096, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.75535292188406, "dq": 52.20199209593768, "dk": 52.259688441407306, "dv": 52.72612761178416}, "correct": true, "fwd_ms": 2.4544360637664795, "bwd_ms": 12.911776542663574, "fwd_tflops": 447.96914615438527, "bwd_tflops": 212.88929996250954, "total_ms": 15.366212606430054, "total_tflops": 250.4384649478081, "bwd_share": 0.8402705906373175, "per_step_ms": 491.7188034057617, "peak_mem_gib": 6.125009059906006, "dmesg_faults_after": 0, "wall_s": 8.71820068359375}}
+{"tag":"P1|gate-s16384|N64|B1","r":{"shape": "gate-s16384", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305304.6147683, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 1, "seqlen": 16384, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.56300613382318, "dq": 52.24805553566718, "dk": 52.3529646857815, "dv": 52.665729049795154}, "correct": true, "fwd_ms": 4.06244421005249, "bwd_ms": 19.773212432861328, "fwd_tflops": 541.3054658352063, "bwd_tflops": 278.0306011249616, "total_ms": 23.83565664291382, "total_tflops": 322.9020081022245, "bwd_share": 0.8295644097029637, "per_step_ms": 762.7410125732422, "peak_mem_gib": 5.66412353515625, "dmesg_faults_after": 0, "wall_s": 5.9953930377960205}}
+{"tag":"P1|gate-s16384|N64|B2","r":{"shape": "gate-s16384", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305311.7992418, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 1, "seqlen": 16384, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.56300613382318, "dq": 52.24805553566718, "dk": 52.3529646857815, "dv": 52.665729049795154}, "correct": true, "fwd_ms": 4.052670001983643, "bwd_ms": 21.46735191345215, "fwd_tflops": 542.6109834937594, "bwd_tflops": 256.0892540935638, "total_ms": 25.52002191543579, "total_tflops": 301.5899210406524, "bwd_share": 0.8411964529100822, "per_step_ms": 816.6407012939453, "peak_mem_gib": 5.66412353515625, "dmesg_faults_after": 0, "wall_s": 6.025946140289307}}
+{"tag":"P1|gate-s16384|N128|B1","r":{"shape": "gate-s16384", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305345.2423735, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 1, "seqlen": 16384, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.56300613382318, "dq": 52.24805553566718, "dk": 52.3529646857815, "dv": 52.665729049795154}, "correct": true, "fwd_ms": 4.058117866516113, "bwd_ms": 19.721416473388672, "fwd_tflops": 541.8825494686425, "bwd_tflops": 278.76081549711176, "total_ms": 23.779534339904785, "total_tflops": 323.66409217342215, "bwd_share": 0.8293440986476288, "per_step_ms": 760.9450988769531, "peak_mem_gib": 5.66412353515625, "dmesg_faults_after": 0, "wall_s": 5.9505016803741455}}
+{"tag":"P1|gate-s16384|N128|B2","r":{"shape": "gate-s16384", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305352.353958, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 1, "seqlen": 16384, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.56300613382318, "dq": 52.24805553566718, "dk": 52.3529646857815, "dv": 52.665729049795154}, "correct": true, "fwd_ms": 4.049866199493408, "bwd_ms": 21.434179306030273, "fwd_tflops": 542.9866438123493, "bwd_tflops": 256.48559062549793, "total_ms": 25.48404550552368, "total_tflops": 302.0156824301605, "bwd_share": 0.8410822881863244, "per_step_ms": 815.4894561767578, "peak_mem_gib": 5.66412353515625, "dmesg_faults_after": 0, "wall_s": 6.019468307495117}}
+{"tag":"P1|gate-s16384|N256|B1","r":{"shape": "gate-s16384", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305359.603113, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 1, "seqlen": 16384, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.56300613382318, "dq": 52.24805553566718, "dk": 52.3529646857815, "dv": 52.665729049795154}, "correct": true, "fwd_ms": 4.055714130401611, "bwd_ms": 19.689128875732422, "fwd_tflops": 542.2037118119675, "bwd_tflops": 279.21794679580483, "total_ms": 23.744843006134033, "total_tflops": 324.1369670224281, "bwd_share": 0.8291960014494981, "per_step_ms": 759.8349761962891, "peak_mem_gib": 5.66412353515625, "dmesg_faults_after": 0, "wall_s": 5.942253351211548}}
+{"tag":"P1|gate-s16384|N256|B2","r":{"shape": "gate-s16384", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305366.6905031, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 1, "seqlen": 16384, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.56300613382318, "dq": 52.24805553566718, "dk": 52.3529646857815, "dv": 52.665729049795154}, "correct": true, "fwd_ms": 4.047622203826904, "bwd_ms": 21.250707626342773, "fwd_tflops": 543.2876747916073, "bwd_tflops": 258.7000035737692, "total_ms": 25.298329830169678, "total_tflops": 304.2327871483988, "bwd_share": 0.840004370604739, "per_step_ms": 809.5465545654297, "peak_mem_gib": 5.66412353515625, "dmesg_faults_after": 0, "wall_s": 6.005315065383911}}
+{"tag":"P2|gate-s1024|M16","r":{"shape": "gate-s1024", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305383.7329593, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 1024, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.98594017295288, "dq": 52.13884083187917, "dk": 52.21193807191576, "dv": 52.74646834830348}, "correct": true, "fwd_ms": 0.4045659899711609, "bwd_ms": 1.0741690397262573, "fwd_tflops": 84.92987354287814, "bwd_tflops": 79.96818260735824, "total_ms": 1.4787350296974182, "total_tflops": 81.32564784957292, "bwd_share": 0.7264107620051822, "per_step_ms": 47.31952095031738, "peak_mem_gib": 0.8750033378601074, "dmesg_faults_after": 0, "wall_s": 2.6402761936187744}}
+{"tag":"P2|gate-s1024|M32","r":{"shape": "gate-s1024", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305387.547471, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 1024, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.98594017295288, "dq": 52.13884083187917, "dk": 52.21193807191576, "dv": 52.74646834830348}, "correct": true, "fwd_ms": 0.4050869941711426, "bwd_ms": 0.9348400235176086, "fwd_tflops": 84.82064065844479, "bwd_tflops": 91.88667981584551, "total_ms": 1.3399270176887512, "total_tflops": 89.75047349626226, "bwd_share": 0.6976798073152672, "per_step_ms": 42.87766456604004, "peak_mem_gib": 0.8750033378601074, "dmesg_faults_after": 0, "wall_s": 2.6808674335479736}}
+{"tag":"P2|gate-s1024|M64","r":{"shape": "gate-s1024", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305391.456759, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 1024, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.98594017295288, "dq": 52.13884083187917, "dk": 52.21193807191576, "dv": 52.74646834830348}, "correct": true, "fwd_ms": 0.398157000541687, "bwd_ms": 0.8868880271911621, "fwd_tflops": 86.2969590419208, "bwd_tflops": 96.85478130993535, "total_ms": 1.2850450277328491, "total_tflops": 93.58355675689283, "bwd_share": 0.6901610512091249, "per_step_ms": 41.12144088745117, "peak_mem_gib": 0.8750033378601074, "dmesg_faults_after": 0, "wall_s": 4.679855108261108}}
+{"tag":"P2|gate-s2048|M16","r":{"shape": "gate-s2048", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305397.3083491, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 2048, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.86550373860068, "dq": 52.14381314134169, "dk": 52.220357941421575, "dv": 52.73122008932702}, "correct": true, "fwd_ms": 0.6262580156326294, "bwd_ms": 2.84414005279541, "fwd_tflops": 219.46058979087522, "bwd_tflops": 120.80888328346897, "total_ms": 3.4703980684280396, "total_tflops": 138.61128541080922, "bwd_share": 0.8195428872180358, "per_step_ms": 111.05273818969727, "peak_mem_gib": 1.6250052452087402, "dmesg_faults_after": 0, "wall_s": 5.8524580001831055}}
+{"tag":"P2|gate-s2048|M32","r":{"shape": "gate-s2048", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305404.3390455, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 2048, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.86550373860068, "dq": 52.14381314134169, "dk": 52.220357941421575, "dv": 52.73122008932702}, "correct": true, "fwd_ms": 0.6303039789199829, "bwd_ms": 2.1335949897766113, "fwd_tflops": 218.05185762510928, "bwd_tflops": 161.04152162260883, "total_ms": 2.7638989686965942, "total_tflops": 174.04266313643447, "bwd_share": 0.7719511508710382, "per_step_ms": 88.44476699829102, "peak_mem_gib": 1.6250052452087402, "dmesg_faults_after": 0, "wall_s": 3.4776458740234375}}
+{"tag":"P2|gate-s2048|M64","r":{"shape": "gate-s2048", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305408.9930341, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 2048, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.86550373860068, "dq": 52.14381314134169, "dk": 52.220357941421575, "dv": 52.73122008932702}, "correct": true, "fwd_ms": 0.6304240226745605, "bwd_ms": 3.4502880573272705, "fwd_tflops": 218.01033673957753, "bwd_tflops": 99.5851296967257, "total_ms": 4.080712080001831, "total_tflops": 117.88048941492195, "bwd_share": 0.8455112709950667, "per_step_ms": 130.5827865600586, "peak_mem_gib": 1.6250052452087402, "dmesg_faults_after": 0, "wall_s": 8.67573857307434}}
+{"tag":"P2|llama31-8b-s4096|M16","r":{"shape": "llama31-8b-s4096", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305418.8501532, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 4096, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.738589578825575, "dq": 52.20622405408382, "dk": 52.29353760996601, "dv": 52.69993941747856}, "correct": true, "fwd_ms": 1.3733370304107666, "bwd_ms": 8.230807304382324, "fwd_tflops": 400.3065538279176, "bwd_tflops": 166.98113367181304, "total_ms": 9.60414433479309, "total_tflops": 200.34531776426633, "bwd_share": 0.8570057901529493, "per_step_ms": 307.3326187133789, "peak_mem_gib": 3.125009059906006, "dmesg_faults_after": 0, "wall_s": 5.342365980148315}}
+{"tag":"P2|llama31-8b-s4096|M32","r":{"shape": "llama31-8b-s4096", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305425.3802474, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 4096, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.738589578825575, "dq": 52.20622405408382, "dk": 52.29353760996601, "dv": 52.69993941747856}, "correct": true, "fwd_ms": 1.3778239488601685, "bwd_ms": 6.516199111938477, "fwd_tflops": 399.00294543638626, "bwd_tflops": 210.91889782832902, "total_ms": 7.894023060798645, "total_tflops": 243.74711522736956, "bwd_share": 0.8254598525684098, "per_step_ms": 252.60873794555664, "peak_mem_gib": 3.125009059906006, "dmesg_faults_after": 0, "wall_s": 5.234668493270874}}
+{"tag":"P2|llama31-8b-s4096|M64","r":{"shape": "llama31-8b-s4096", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305431.7918432, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 4096, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.738589578825575, "dq": 52.20622405408382, "dk": 52.29353760996601, "dv": 52.69993941747856}, "correct": true, "fwd_ms": 1.3883190155029297, "bwd_ms": 10.948517799377441, "fwd_tflops": 395.9866628268046, "bwd_tflops": 125.53201811464844, "total_ms": 12.336836814880371, "total_tflops": 155.96747995297676, "bwd_share": 0.887465560553709, "per_step_ms": 394.7787780761719, "peak_mem_gib": 3.125009059906006, "dmesg_faults_after": 0, "wall_s": 5.379300355911255}}
+{"tag":"P2|gate-b1|M16","r":{"shape": "gate-b1", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305438.3599575, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 1, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.68196201032898, "dq": 52.20650349319841, "dk": 52.262636224575274, "dv": 52.67622519125936}, "correct": true, "fwd_ms": 1.3580340147018433, "bwd_ms": 8.809272766113281, "fwd_tflops": 404.8174110047598, "bwd_tflops": 156.01623098865528, "total_ms": 10.167306780815125, "total_tflops": 189.24828276438993, "bwd_share": 0.8664312935590434, "per_step_ms": 325.353816986084, "peak_mem_gib": 1.832061767578125, "dmesg_faults_after": 0, "wall_s": 3.7827770709991455}}
+{"tag":"P2|gate-b1|M32","r":{"shape": "gate-b1", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305443.3629417, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 1, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.68196201032898, "dq": 52.20650349319841, "dk": 52.262636224575274, "dv": 52.67622519125936}, "correct": true, "fwd_ms": 1.3697309494018555, "bwd_ms": 7.12611198425293, "fwd_tflops": 401.36043806856486, "bwd_tflops": 192.86667649302802, "total_ms": 8.495842933654785, "total_tflops": 226.4808052166121, "bwd_share": 0.8387763333081515, "per_step_ms": 271.8669738769531, "peak_mem_gib": 1.832061767578125, "dmesg_faults_after": 0, "wall_s": 3.7119460105895996}}
+{"tag":"P2|gate-b1|M64","r":{"shape": "gate-b1", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305448.2463377, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 1, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.68196201032898, "dq": 52.20650349319841, "dk": 52.262636224575274, "dv": 52.67622519125936}, "correct": true, "fwd_ms": 1.364683985710144, "bwd_ms": 10.535979270935059, "fwd_tflops": 402.84477552649093, "bwd_tflops": 130.44725121199144, "total_ms": 11.900663256645203, "total_tflops": 161.68387484904068, "bwd_share": 0.8853270648635386, "per_step_ms": 380.8212242126465, "peak_mem_gib": 1.832061767578125, "dmesg_faults_after": 0, "wall_s": 3.772719144821167}}
+{"tag":"P2|llama31-8b-b2|M16","r":{"shape": "llama31-8b-b2", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305453.1693819, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 2, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.63365311043609, "dq": 52.23344830045135, "dk": 52.29969421893557, "dv": 52.69238693188893}, "correct": true, "fwd_ms": 2.301285982131958, "bwd_ms": 13.404874801635742, "fwd_tflops": 477.78139540805364, "bwd_tflops": 205.05816802590184, "total_ms": 15.7061607837677, "total_tflops": 245.01791050001248, "bwd_share": 0.8534787709221509, "per_step_ms": 502.5971450805664, "peak_mem_gib": 3.125009059906006, "dmesg_faults_after": 0, "wall_s": 5.573567628860474}}
+{"tag":"P2|llama31-8b-b2|M32","r":{"shape": "llama31-8b-b2", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305459.9305952, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 2, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.63365311043609, "dq": 52.23344830045135, "dk": 52.29969421893557, "dv": 52.69238693188893}, "correct": true, "fwd_ms": 2.3021678924560547, "bwd_ms": 10.463750839233398, "fwd_tflops": 477.59836777281794, "bwd_tflops": 262.69538635549, "total_ms": 12.765918731689453, "total_tflops": 301.45035215234475, "bwd_share": 0.8196629681856525, "per_step_ms": 408.5093994140625, "peak_mem_gib": 3.125009059906006, "dmesg_faults_after": 0, "wall_s": 5.468640327453613}}
+{"tag":"P2|llama31-8b-b2|M64","r":{"shape": "llama31-8b-b2", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305466.5777955, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 2, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.63365311043609, "dq": 52.23344830045135, "dk": 52.29969421893557, "dv": 52.69238693188893}, "correct": true, "fwd_ms": 2.288306951522827, "bwd_ms": 20.233261108398438, "fwd_tflops": 480.4913200321726, "bwd_tflops": 135.854475198713, "total_ms": 22.521568059921265, "total_tflops": 170.87134816621884, "bwd_share": 0.8983948655158238, "per_step_ms": 720.6901779174805, "peak_mem_gib": 3.125009059906006, "dmesg_faults_after": 0, "wall_s": 5.708403587341309}}
+{"tag":"P2|llama31-8b|M16","r":{"shape": "llama31-8b", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305473.4629145, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.66972664861177, "dq": 52.240793639657724, "dk": 52.30887559152776, "dv": 52.71029787716679}, "correct": true, "fwd_ms": 4.222283840179443, "bwd_ms": 26.17788314819336, "fwd_tflops": 520.8136967548215, "bwd_tflops": 210.00774232806552, "total_ms": 30.400166988372803, "total_tflops": 253.17562885018765, "bwd_share": 0.8611098471335915, "per_step_ms": 972.8053436279297, "peak_mem_gib": 6.125009059906006, "dmesg_faults_after": 0, "wall_s": 9.382747888565063}}
+{"tag":"P2|llama31-8b|M32","r":{"shape": "llama31-8b", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305484.0781553, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.66972664861177, "dq": 52.240793639657724, "dk": 52.30895049203725, "dv": 52.71029787716679}, "correct": true, "fwd_ms": 4.15714693069458, "bwd_ms": 20.206783294677734, "fwd_tflops": 528.9741479463621, "bwd_tflops": 272.06498227394763, "total_ms": 24.363930225372314, "total_tflops": 315.9006499869578, "bwd_share": 0.8293728929511801, "per_step_ms": 779.6457672119141, "peak_mem_gib": 6.125009059906006, "dmesg_faults_after": 0, "wall_s": 9.161684274673462}}
+{"tag":"P2|llama31-8b|M64","r":{"shape": "llama31-8b", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305494.43971, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.66972664861177, "dq": 52.240793639657724, "dk": 52.30895049203725, "dv": 52.71029787716679}, "correct": true, "fwd_ms": 4.152379035949707, "bwd_ms": 39.333106994628906, "fwd_tflops": 529.5815330232859, "bwd_tflops": 139.76923154407083, "total_ms": 43.48548603057861, "total_tflops": 176.9919597775642, "bwd_share": 0.9045111503863659, "per_step_ms": 1391.5355529785156, "peak_mem_gib": 6.125009059906006, "dmesg_faults_after": 0, "wall_s": 9.729226112365723}}
+{"tag":"P2|gate-b8|M16","r":{"shape": "gate-b8", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305505.3812346, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 8, "seqlen": 4096, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.75535292188406, "dq": 52.20199209593768, "dk": 52.259688441407306, "dv": 52.72612761178416}, "correct": true, "fwd_ms": 2.4484670162200928, "bwd_ms": 14.865943908691406, "fwd_tflops": 449.0612372934514, "bwd_tflops": 184.90444241706848, "total_ms": 17.3144109249115, "total_tflops": 222.25940656630624, "bwd_share": 0.858587911143006, "per_step_ms": 554.061149597168, "peak_mem_gib": 6.125009059906006, "dmesg_faults_after": 0, "wall_s": 8.776823282241821}}
+{"tag":"P2|gate-b8|M32","r":{"shape": "gate-b8", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305515.3701572, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 8, "seqlen": 4096, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.75535292188406, "dq": 52.20199209593768, "dk": 52.259688441407306, "dv": 52.72612761178416}, "correct": true, "fwd_ms": 2.445462942123413, "bwd_ms": 11.636467933654785, "fwd_tflops": 449.61287649743986, "bwd_tflops": 236.22108401897714, "total_ms": 14.081930875778198, "total_tflops": 273.27862429969036, "bwd_share": 0.8263403674044614, "per_step_ms": 450.62178802490234, "peak_mem_gib": 6.125009059906006, "dmesg_faults_after": 0, "wall_s": 8.64823842048645}}
+{"tag":"P2|gate-b8|M64","r":{"shape": "gate-b8", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305525.2030897, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 8, "seqlen": 4096, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.75535292188406, "dq": 52.20199209593768, "dk": 52.259688441407306, "dv": 52.72612761178416}, "correct": true, "fwd_ms": 2.447985887527466, "bwd_ms": 21.029375076293945, "fwd_tflops": 449.1494960726826, "bwd_tflops": 130.71140057502953, "total_ms": 23.47736096382141, "total_tflops": 163.91496059315233, "bwd_share": 0.8957299378196805, "per_step_ms": 751.2755508422852, "peak_mem_gib": 6.125009059906006, "dmesg_faults_after": 0, "wall_s": 8.8736412525177}}
+{"tag":"P2|gate-s16384|M16","r":{"shape": "gate-s16384", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305535.2904406, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 1, "seqlen": 16384, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.56300613382318, "dq": 52.24805553566718, "dk": 52.3529646857815, "dv": 52.665729049795154}, "correct": true, "fwd_ms": 4.066930770874023, "bwd_ms": 25.90944480895996, "fwd_tflops": 540.7083079212111, "bwd_tflops": 212.1835562056831, "total_ms": 29.976375579833984, "total_tflops": 256.75490267107955, "bwd_share": 0.86432880252508, "per_step_ms": 959.2440185546875, "peak_mem_gib": 5.66412353515625, "dmesg_faults_after": 0, "wall_s": 6.298637628555298}}
+{"tag":"P2|gate-s16384|M32","r":{"shape": "gate-s16384", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305542.8049161, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 1, "seqlen": 16384, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.56300613382318, "dq": 52.24805553566718, "dk": 52.3529646857815, "dv": 52.665729049795154}, "correct": true, "fwd_ms": 4.066289901733398, "bwd_ms": 19.744651794433594, "fwd_tflops": 540.7935264562886, "bwd_tflops": 278.43277238395615, "total_ms": 23.810941696166992, "total_tflops": 323.2371693922114, "bwd_share": 0.8292259939308501, "per_step_ms": 761.9501342773438, "peak_mem_gib": 5.66412353515625, "dmesg_faults_after": 0, "wall_s": 5.968451976776123}}
+{"tag":"P2|gate-s16384|M64","r":{"shape": "gate-s16384", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305549.9549174, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 4, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 1, "seqlen": 16384, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.56300613382318, "dq": 52.24805553566718, "dk": 52.3529646857815, "dv": 52.665729049795154}, "correct": true, "fwd_ms": 4.054152011871338, "bwd_ms": 38.88968276977539, "fwd_tflops": 542.4126300920233, "bwd_tflops": 141.36289492061988, "total_ms": 42.94383478164673, "total_tflops": 179.22436208983726, "bwd_share": 0.905594085100104, "per_step_ms": 1374.2027130126953, "peak_mem_gib": 5.66412353515625, "dmesg_faults_after": 0, "wall_s": 6.538991451263428}}
+{"tag":"P3|turbo|st1|w2","r":{"shape": "llama31-8b-b2", "tune": "fwd:num_stages=1,num_warps=2;bwd:num_warps=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789305567.6179042, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 2, "num_stages": 1}], "bwd": [{"num_warps": 2, "num_stages": 1}]}, "batch": 2, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "sqnr_db": {"out": 53.63365311043609, "dq": 52.23344830045135, "dk": 52.29969421893557, "dv": 52.69238693188893}, "correct": true, "fwd_ms": 3.493272066116333, "bwd_ms": 10.470641136169434, "fwd_tflops": 314.751215183302, "bwd_tflops": 262.52251735996464, "total_ms": 13.963913202285767, "total_tflops": 275.5882711005443, "bwd_share": 0.7498357361928807, "per_step_ms": 446.84522247314453, "peak_mem_gib": 6.125009059906006, "dmesg_faults_after": 0, "wall_s": 3.7483720779418945}}
+{"tag":"P3|aiter|st1|w2","r":null}
+{"tag":"P3|turbo|st1|w4","r":null}
+{"tag":"P3|aiter|st1|w4","r":null}
+{"tag":"P3|turbo|st1|w8","r":null}
+{"tag":"P3|aiter|st1|w8","r":null}
+{"tag":"P3|turbo|st2|w2","r":null}
+{"tag":"P3|aiter|st2|w2","r":null}
+{"tag":"P3|turbo|st2|w4","r":null}
+{"tag":"P3|aiter|st2|w4","r":null}
+{"tag":"P3|turbo|st2|w8","r":null}
+{"tag":"P3|aiter|st2|w8","r":null}
+{"tag":"P3|turbo|st3|w2","r":null}
+{"tag":"P3|aiter|st3|w2","r":null}
+{"tag":"P3|turbo|st3|w4","r":null}
+{"tag":"P3|aiter|st3|w4","r":null}
+{"tag":"P3|turbo|st3|w8","r":null}
+{"tag":"P3|aiter|st3|w8","r":null}
+{"tag":"P3|turbo|st4|w2","r":null}
+{"tag":"P3|aiter|st4|w2","r":null}
+{"tag":"P3|turbo|st4|w4","r":null}
+{"tag":"P3|aiter|st4|w4","r":null}
+{"tag":"P3|turbo|st4|w8","r":null}
+{"tag":"P3|aiter|st4|w8","r":null}
+{"tag":"P4|det|r1","r":null}
+{"tag":"P4|rep|r1|1","r":null}
+{"tag":"P4|rep|r1|2","r":null}
+{"tag":"P4|rep|r1|3","r":null}
+{"round_complete":1,"t":1789306173}
+{"tag":"P1|smoke|N64|B1","r":null}
+{"tag":"P1|smoke|N64|B2","r":null}
+{"tag":"P1|smoke|N128|B1","r":null}
+{"tag":"P1|smoke|N128|B2","r":null}
+{"tag":"P1|smoke|N256|B1","r":null}
+{"tag":"P1|smoke|N256|B2","r":null}
+{"tag":"P2|smoke|M16","r":null}
+{"tag":"P2|smoke|M32","r":null}
+{"tag":"P2|smoke|M64","r":null}
+{"tag":"P4|det|r2","r":null}
+{"tag":"P4|rep|r2|1","r":null}
+{"tag":"P4|rep|r2|2","r":null}
+{"tag":"P4|rep|r2|3","r":null}
+{"round_complete":2,"t":1789306185}
+{"tag":"P4|det|r3","r":null}
+{"tag":"P4|rep|r3|1","r":null}
+{"tag":"P4|rep|r3|2","r":null}
+{"tag":"P4|rep|r3|3","r":null}
+{"round_complete":3,"t":1789306189}
+{"tag":"P4|det|r4","r":null}
+{"tag":"P4|rep|r4|1","r":null}
+{"tag":"P4|rep|r4|2","r":null}
+{"tag":"P4|rep|r4|3","r":null}
+{"round_complete":4,"t":1789306193}
+{"tag":"P4|det|r5","r":null}
+{"tag":"P4|rep|r5|1","r":null}
+{"tag":"P4|rep|r5|2","r":null}
+{"tag":"P4|rep|r5|3","r":null}
+{"round_complete":5,"t":1789306197}
+{"tag":"P4|det|r6","r":null}
+{"tag":"P4|rep|r6|1","r":null}
+{"tag":"P4|rep|r6|2","r":null}
+{"tag":"P4|rep|r6|3","r":null}
+{"round_complete":6,"t":1789306200}
+{"tag":"P4|det|r7","r":null}
+{"tag":"P4|rep|r7|1","r":null}
+{"tag":"P4|rep|r7|2","r":null}
+{"tag":"P4|rep|r7|3","r":null}
+{"round_complete":7,"t":1789306204}
+{"tag":"P4|det|r8","r":null}
+{"tag":"P4|rep|r8|1","r":null}
+{"tag":"P4|rep|r8|2","r":null}
+{"tag":"P4|rep|r8|3","r":null}
+{"round_complete":8,"t":1789306208}
+{"tag":"P4|det|r9","r":null}
+{"tag":"P4|rep|r9|1","r":null}
+{"tag":"P4|rep|r9|2","r":null}
+{"tag":"P4|rep|r9|3","r":null}
+{"round_complete":9,"t":1789306212}
+{"tag":"P4|det|r10","r":null}
+{"tag":"P4|rep|r10|1","r":null}
+{"tag":"P4|rep|r10|2","r":null}
+{"tag":"P4|rep|r10|3","r":null}
+{"round_complete":10,"t":1789306216}
+{"tag":"P4|det|r11","r":null}
+{"tag":"P4|rep|r11|1","r":null}
+{"tag":"P4|rep|r11|2","r":null}
+{"tag":"P4|rep|r11|3","r":null}
+{"round_complete":11,"t":1789306220}
+{"tag":"P4|det|r12","r":null}
+{"tag":"P4|rep|r12|1","r":null}
+{"tag":"P4|rep|r12|2","r":null}
+{"tag":"P4|rep|r12|3","r":null}
+{"round_complete":12,"t":1789306224}
+{"tag":"P4|det|r13","r":null}
+{"tag":"P4|rep|r13|1","r":null}
+{"tag":"P4|rep|r13|2","r":null}
+{"tag":"P4|rep|r13|3","r":null}
+{"round_complete":13,"t":1789306228}
+{"tag":"P4|det|r14","r":null}
+{"tag":"P4|rep|r14|1","r":null}
+{"tag":"P4|rep|r14|2","r":null}
+{"tag":"P4|rep|r14|3","r":null}
+{"round_complete":14,"t":1789306232}
+{"tag":"P4|det|r15","r":null}
+{"tag":"P4|rep|r15|1","r":null}
+{"tag":"P4|rep|r15|2","r":null}
+{"tag":"P4|rep|r15|3","r":null}
+{"round_complete":15,"t":1789306236}
+{"tag":"P4|det|r16","r":null}
+{"tag":"P4|rep|r16|1","r":null}
+{"tag":"P4|rep|r16|2","r":null}
+{"tag":"P4|rep|r16|3","r":null}
+{"round_complete":16,"t":1789306240}
+{"tag":"P4|det|r17","r":null}
+{"tag":"P4|rep|r17|1","r":null}
+{"tag":"P4|rep|r17|2","r":null}
+{"tag":"P4|rep|r17|3","r":null}
+{"round_complete":17,"t":1789306244}
+{"tag":"P4|det|r18","r":null}
+{"tag":"P4|rep|r18|1","r":null}
+{"tag":"P4|rep|r18|2","r":null}
+{"tag":"P4|rep|r18|3","r":null}
+{"round_complete":18,"t":1789306248}
+{"tag":"P4|det|r19","r":null}
+{"tag":"P4|rep|r19|1","r":null}
+{"tag":"P4|rep|r19|2","r":null}
+{"tag":"P4|rep|r19|3","r":null}
+{"round_complete":19,"t":1789306252}
+{"tag":"P4|det|r20","r":null}
+{"tag":"P4|rep|r20|1","r":null}
+{"tag":"P4|rep|r20|2","r":null}
+{"tag":"P4|rep|r20|3","r":null}
+{"round_complete":20,"t":1789306256}
+{"tag":"P4|det|r21","r":null}
+{"tag":"P4|rep|r21|1","r":null}
+{"tag":"P4|rep|r21|2","r":null}
+{"tag":"P4|rep|r21|3","r":null}
+{"round_complete":21,"t":1789306260}
+{"tag":"P4|det|r22","r":null}
+{"tag":"P4|rep|r22|1","r":null}
+{"tag":"P4|rep|r22|2","r":null}
+{"tag":"P4|rep|r22|3","r":null}
+{"round_complete":22,"t":1789306264}
+{"tag":"P4|det|r23","r":null}
+{"tag":"P4|rep|r23|1","r":null}
+{"tag":"P4|rep|r23|2","r":null}
+{"tag":"P4|rep|r23|3","r":null}
+{"round_complete":23,"t":1789306268}
+{"tag":"P4|det|r24","r":null}
+{"tag":"P4|rep|r24|1","r":null}
+{"tag":"P4|rep|r24|2","r":null}
+{"tag":"P4|rep|r24|3","r":null}
+{"round_complete":24,"t":1789306272}
+{"tag":"P4|det|r25","r":null}
+{"tag":"P4|rep|r25|1","r":null}
+{"tag":"P4|rep|r25|2","r":null}
+{"tag":"P4|rep|r25|3","r":null}
+{"round_complete":25,"t":1789306276}
+{"tag":"P4|det|r26","r":null}
+{"tag":"P4|rep|r26|1","r":null}
+{"tag":"P4|rep|r26|2","r":null}
+{"tag":"P4|rep|r26|3","r":null}
+{"round_complete":26,"t":1789306280}
+{"tag":"P4|det|r27","r":null}
+{"tag":"P4|rep|r27|1","r":null}
+{"tag":"P4|rep|r27|2","r":null}
+{"tag":"P4|rep|r27|3","r":null}
+{"round_complete":27,"t":1789306284}
+{"tag":"P4|det|r28","r":null}
+{"tag":"P4|rep|r28|1","r":null}
+{"tag":"P4|rep|r28|2","r":null}
+{"tag":"P4|rep|r28|3","r":null}
+{"round_complete":28,"t":1789306288}
+{"tag":"P4|det|r29","r":null}
+{"tag":"P4|rep|r29|1","r":null}
+{"tag":"P4|rep|r29|2","r":null}
+{"tag":"P4|rep|r29|3","r":null}
+{"round_complete":29,"t":1789306292}
+{"tag":"P4|det|r30","r":null}
+{"tag":"P4|rep|r30|1","r":null}
+{"tag":"P4|rep|r30|2","r":null}
+{"tag":"P4|rep|r30|3","r":null}
+{"round_complete":30,"t":1789306297}
+{"tag":"P4|det|r31","r":null}
+{"tag":"P4|rep|r31|1","r":null}
+{"tag":"P4|rep|r31|2","r":null}
+{"tag":"P4|rep|r31|3","r":null}
+{"round_complete":31,"t":1789306301}
+{"tag":"P4|det|r32","r":null}
+{"tag":"P4|rep|r32|1","r":null}
+{"tag":"P4|rep|r32|2","r":null}
+{"tag":"P4|rep|r32|3","r":null}
+{"round_complete":32,"t":1789306305}
+{"tag":"P4|det|r33","r":null}
+{"tag":"P4|rep|r33|1","r":null}
+{"tag":"P4|rep|r33|2","r":null}
+{"tag":"P4|rep|r33|3","r":null}
+{"round_complete":33,"t":1789306309}
+{"tag":"P4|det|r34","r":null}
+{"tag":"P4|rep|r34|1","r":null}
+{"tag":"P4|rep|r34|2","r":null}
+{"tag":"P4|rep|r34|3","r":null}
+{"round_complete":34,"t":1789306313}
+{"tag":"P4|det|r35","r":null}
+{"tag":"P4|rep|r35|1","r":null}
+{"tag":"P4|rep|r35|2","r":null}
+{"tag":"P4|rep|r35|3","r":null}
+{"round_complete":35,"t":1789306317}
+{"tag":"P4|det|r36","r":null}
+{"tag":"P4|rep|r36|1","r":null}
+{"tag":"P4|rep|r36|2","r":null}
+{"tag":"P4|rep|r36|3","r":null}
+{"round_complete":36,"t":1789306321}
+{"tag":"P4|det|r37","r":null}
+{"tag":"P4|rep|r37|1","r":null}
+{"tag":"P4|rep|r37|2","r":null}
+{"tag":"P4|rep|r37|3","r":null}
+{"round_complete":37,"t":1789306325}
+{"tag":"P4|det|r38","r":null}
+{"tag":"P4|rep|r38|1","r":null}
+{"tag":"P4|rep|r38|2","r":null}
+{"tag":"P4|rep|r38|3","r":null}
+{"round_complete":38,"t":1789306330}
+{"tag":"P4|det|r39","r":null}
+{"tag":"P4|rep|r39|1","r":null}
+{"tag":"P4|rep|r39|2","r":null}
+{"tag":"P4|rep|r39|3","r":null}
+{"round_complete":39,"t":1789306334}
+{"tag":"P4|det|r40","r":null}
+{"tag":"P4|rep|r40|1","r":null}
+{"tag":"P4|rep|r40|2","r":null}
+{"tag":"P4|rep|r40|3","r":null}
+{"round_complete":40,"t":1789306338}
+{"tag":"P4|det|r41","r":null}
+{"tag":"P4|rep|r41|1","r":null}
+{"tag":"P4|rep|r41|2","r":null}
+{"tag":"P4|rep|r41|3","r":null}
+{"round_complete":41,"t":1789306343}
+{"tag":"P4|det|r42","r":null}
+{"tag":"P4|rep|r42|1","r":null}
+{"tag":"P4|rep|r42|2","r":null}
+{"tag":"P4|rep|r42|3","r":null}
+{"round_complete":42,"t":1789306347}
+{"tag":"P4|det|r43","r":null}
+{"tag":"P4|rep|r43|1","r":null}
+{"tag":"P4|rep|r43|2","r":null}
+{"tag":"P4|rep|r43|3","r":null}
+{"round_complete":43,"t":1789306351}
+{"tag":"P4|det|r44","r":null}
+{"tag":"P4|rep|r44|1","r":null}
+{"tag":"P4|rep|r44|2","r":null}
+{"tag":"P4|rep|r44|3","r":null}
+{"round_complete":44,"t":1789306355}
+{"tag":"P4|det|r45","r":null}
+{"tag":"P4|rep|r45|1","r":null}
+{"tag":"P4|rep|r45|2","r":null}
+{"tag":"P4|rep|r45|3","r":null}
+{"round_complete":45,"t":1789306360}
+{"tag":"P4|det|r46","r":null}
+{"tag":"P4|rep|r46|1","r":null}
+{"tag":"P4|rep|r46|2","r":null}
+{"tag":"P4|rep|r46|3","r":null}
+{"round_complete":46,"t":1789306364}
+{"tag":"P4|det|r47","r":null}
+{"tag":"P4|rep|r47|1","r":null}
+{"tag":"P4|rep|r47|2","r":null}
+{"tag":"P4|rep|r47|3","r":null}
+{"round_complete":47,"t":1789306368}
+{"tag":"P4|det|r48","r":null}
+{"tag":"P4|rep|r48|1","r":null}
+{"tag":"P4|rep|r48|2","r":null}
+{"tag":"P4|rep|r48|3","r":null}
+{"round_complete":48,"t":1789306373}
+{"tag":"P4|det|r49","r":null}
+{"tag":"P4|rep|r49|1","r":null}
+{"tag":"P4|rep|r49|2","r":null}
+{"tag":"P4|rep|r49|3","r":null}
+{"round_complete":49,"t":1789306377}
+{"tag":"P4|det|r50","r":null}
+{"tag":"P4|rep|r50|1","r":null}
+{"tag":"P4|rep|r50|2","r":null}
+{"tag":"P4|rep|r50|3","r":null}
+{"round_complete":50,"t":1789306381}
+{"tag":"P4|det|r51","r":null}
+{"tag":"P4|rep|r51|1","r":null}
+{"tag":"P4|rep|r51|2","r":null}
+{"tag":"P4|rep|r51|3","r":null}
+{"round_complete":51,"t":1789306386}
+{"tag":"P4|det|r52","r":null}
+{"tag":"P4|rep|r52|1","r":null}
+{"tag":"P4|rep|r52|2","r":null}
+{"tag":"P4|rep|r52|3","r":null}
+{"round_complete":52,"t":1789306390}
+{"tag":"P4|det|r53","r":null}
+{"tag":"P4|rep|r53|1","r":null}
+{"tag":"P4|rep|r53|2","r":null}
+{"tag":"P4|rep|r53|3","r":null}
+{"round_complete":53,"t":1789306395}
+{"tag":"P4|det|r54","r":null}
+{"tag":"P4|rep|r54|1","r":null}
+{"tag":"P4|rep|r54|2","r":null}
+{"tag":"P4|rep|r54|3","r":null}
+{"round_complete":54,"t":1789306399}
+{"tag":"P4|det|r55","r":null}
+{"tag":"P4|rep|r55|1","r":null}
+{"tag":"P4|rep|r55|2","r":null}
+{"tag":"P4|rep|r55|3","r":null}
+{"round_complete":55,"t":1789306403}
+{"tag":"P4|det|r56","r":null}
+{"tag":"P4|rep|r56|1","r":null}
+{"tag":"P4|rep|r56|2","r":null}
+{"tag":"P4|rep|r56|3","r":null}
+{"round_complete":56,"t":1789306408}
+{"tag":"P4|det|r57","r":null}
+{"tag":"P4|rep|r57|1","r":null}
+{"tag":"P4|rep|r57|2","r":null}
+{"tag":"P4|rep|r57|3","r":null}
+{"round_complete":57,"t":1789306412}
+{"tag":"P4|det|r58","r":null}
+{"tag":"P4|rep|r58|1","r":null}
+{"tag":"P4|rep|r58|2","r":null}
+{"tag":"P4|rep|r58|3","r":null}
+{"round_complete":58,"t":1789306417}
+{"tag":"P4|det|r59","r":null}
+{"tag":"P4|rep|r59|1","r":null}
+{"tag":"P4|rep|r59|2","r":null}
+{"tag":"P4|rep|r59|3","r":null}
+{"round_complete":59,"t":1789306421}
+{"tag":"P4|det|r60","r":null}
+{"tag":"P4|rep|r60|1","r":null}
+{"tag":"P4|rep|r60|2","r":null}
+{"tag":"P4|rep|r60|3","r":null}
+{"round_complete":60,"t":1789306426}
+{"tag":"P4|det|r61","r":null}
+{"tag":"P4|rep|r61|1","r":null}
+{"tag":"P4|rep|r61|2","r":null}
+{"tag":"P4|rep|r61|3","r":null}
+{"round_complete":61,"t":1789306430}
+{"tag":"P4|det|r62","r":null}
+{"tag":"P4|rep|r62|1","r":null}
+{"tag":"P4|rep|r62|2","r":null}
+{"tag":"P4|rep|r62|3","r":null}
+{"round_complete":62,"t":1789306435}
+{"tag":"P4|det|r63","r":null}
+{"tag":"P4|rep|r63|1","r":null}
+{"tag":"P4|rep|r63|2","r":null}
+{"tag":"P4|rep|r63|3","r":null}
+{"round_complete":63,"t":1789306439}
+{"tag":"P4|det|r64","r":null}
+{"tag":"P4|rep|r64|1","r":null}
+{"tag":"P4|rep|r64|2","r":null}
+{"tag":"P4|rep|r64|3","r":null}
+{"round_complete":64,"t":1789306444}
+{"tag":"P4|det|r65","r":null}
+{"tag":"P4|rep|r65|1","r":null}
+{"tag":"P4|rep|r65|2","r":null}
+{"tag":"P4|rep|r65|3","r":null}
+{"round_complete":65,"t":1789306448}
+{"tag":"P4|det|r66","r":null}
+{"tag":"P4|rep|r66|1","r":null}
+{"tag":"P4|rep|r66|2","r":null}
+{"tag":"P4|rep|r66|3","r":null}
+{"round_complete":66,"t":1789306453}
+{"tag":"P4|det|r67","r":null}
+{"tag":"P4|rep|r67|1","r":null}
+{"tag":"P4|rep|r67|2","r":null}
+{"tag":"P4|rep|r67|3","r":null}
+{"round_complete":67,"t":1789306458}
+{"tag":"P4|det|r68","r":null}
+{"tag":"P4|rep|r68|1","r":null}
+{"tag":"P4|rep|r68|2","r":null}
+{"tag":"P4|rep|r68|3","r":null}
+{"round_complete":68,"t":1789306462}
+{"tag":"P4|det|r69","r":null}
+{"tag":"P4|rep|r69|1","r":null}
+{"tag":"P4|rep|r69|2","r":null}
+{"tag":"P4|rep|r69|3","r":null}
+{"round_complete":69,"t":1789306467}
+{"tag":"P4|det|r70","r":null}
+{"tag":"P4|rep|r70|1","r":null}
+{"tag":"P4|rep|r70|2","r":null}
+{"tag":"P4|rep|r70|3","r":null}
+{"round_complete":70,"t":1789306472}
+{"tag":"P4|det|r71","r":null}
+{"tag":"P4|rep|r71|1","r":null}
+{"tag":"P4|rep|r71|2","r":null}
+{"tag":"P4|rep|r71|3","r":null}
+{"round_complete":71,"t":1789306476}
+{"tag":"P4|det|r72","r":null}
+{"tag":"P4|rep|r72|1","r":null}
+{"tag":"P4|rep|r72|2","r":null}
+{"tag":"P4|rep|r72|3","r":null}
+{"round_complete":72,"t":1789306481}
+{"tag":"P4|det|r73","r":null}
+{"tag":"P4|rep|r73|1","r":null}
+{"tag":"P4|rep|r73|2","r":null}
+{"tag":"P4|rep|r73|3","r":null}
+{"round_complete":73,"t":1789306485}
+{"tag":"P4|det|r74","r":null}
+{"tag":"P4|rep|r74|1","r":null}
+{"tag":"P4|rep|r74|2","r":null}
+{"tag":"P4|rep|r74|3","r":null}
+{"round_complete":74,"t":1789306490}
+{"tag":"P4|det|r75","r":null}
+{"tag":"P4|rep|r75|1","r":null}
+{"tag":"P4|rep|r75|2","r":null}
+{"tag":"P4|rep|r75|3","r":null}
+{"round_complete":75,"t":1789306495}
+{"tag":"P4|det|r76","r":null}
+{"tag":"P4|rep|r76|1","r":null}
+{"tag":"P4|rep|r76|2","r":null}
+{"tag":"P4|rep|r76|3","r":null}
+{"round_complete":76,"t":1789306499}
+{"tag":"P4|det|r77","r":null}
+{"tag":"P4|rep|r77|1","r":null}
+{"tag":"P4|rep|r77|2","r":null}
+{"tag":"P4|rep|r77|3","r":null}
+{"round_complete":77,"t":1789306504}
+{"tag":"P4|det|r78","r":null}
+{"tag":"P4|rep|r78|1","r":null}
+{"tag":"P4|rep|r78|2","r":null}
+{"tag":"P4|rep|r78|3","r":null}
+{"round_complete":78,"t":1789306509}
+{"tag":"P4|det|r79","r":null}
+{"tag":"P4|rep|r79|1","r":null}
+{"tag":"P4|rep|r79|2","r":null}
+{"tag":"P4|rep|r79|3","r":null}
+{"round_complete":79,"t":1789306513}
+{"tag":"P4|det|r80","r":null}
+{"tag":"P4|rep|r80|1","r":null}
+{"tag":"P4|rep|r80|2","r":null}
+{"tag":"P4|rep|r80|3","r":null}
+{"round_complete":80,"t":1789306518}
+{"tag":"P4|det|r81","r":null}
+{"tag":"P4|rep|r81|1","r":null}
+{"tag":"P4|rep|r81|2","r":null}
+{"tag":"P4|rep|r81|3","r":null}
+{"round_complete":81,"t":1789306523}
+{"tag":"P4|det|r82","r":null}
+{"tag":"P4|rep|r82|1","r":null}
+{"tag":"P4|rep|r82|2","r":null}
+{"tag":"P4|rep|r82|3","r":null}
+{"round_complete":82,"t":1789306527}
+{"tag":"P4|det|r83","r":null}
+{"tag":"P4|rep|r83|1","r":null}
+{"tag":"P4|rep|r83|2","r":null}
+{"tag":"P4|rep|r83|3","r":null}
+{"round_complete":83,"t":1789306532}
+{"tag":"P4|det|r84","r":null}
+{"tag":"P4|rep|r84|1","r":null}
+{"tag":"P4|rep|r84|2","r":null}
+{"tag":"P4|rep|r84|3","r":null}
+{"round_complete":84,"t":1789306537}
+{"tag":"P4|det|r85","r":null}
+{"tag":"P4|rep|r85|1","r":null}
+{"tag":"P4|rep|r85|2","r":null}
+{"tag":"P4|rep|r85|3","r":null}
+{"round_complete":85,"t":1789306542}
+{"tag":"P4|det|r86","r":null}
+{"tag":"P4|rep|r86|1","r":null}
+{"tag":"P4|rep|r86|2","r":null}
+{"tag":"P4|rep|r86|3","r":null}
+{"round_complete":86,"t":1789306546}
+{"tag":"P4|det|r87","r":null}
+{"tag":"P4|rep|r87|1","r":null}
+{"tag":"P4|rep|r87|2","r":null}
+{"tag":"P4|rep|r87|3","r":null}
+{"round_complete":87,"t":1789306551}
+{"tag":"P4|det|r88","r":null}
+{"tag":"P4|rep|r88|1","r":null}
+{"tag":"P4|rep|r88|2","r":null}
+{"tag":"P4|rep|r88|3","r":null}
+{"round_complete":88,"t":1789306556}
+{"tag":"P4|det|r89","r":null}
+{"tag":"P4|rep|r89|1","r":null}
+{"tag":"P4|rep|r89|2","r":null}
+{"tag":"P4|rep|r89|3","r":null}
+{"round_complete":89,"t":1789306561}
+{"tag":"P4|det|r90","r":null}
+{"tag":"P4|rep|r90|1","r":null}
+{"tag":"P4|rep|r90|2","r":null}
+{"tag":"P4|rep|r90|3","r":null}
+{"round_complete":90,"t":1789306565}
+{"tag":"P4|det|r91","r":null}
+{"tag":"P4|rep|r91|1","r":null}
+{"tag":"P4|rep|r91|2","r":null}
+{"tag":"P4|rep|r91|3","r":null}
+{"round_complete":91,"t":1789306570}
+{"tag":"P4|det|r92","r":null}
+{"tag":"P4|rep|r92|1","r":null}
+{"tag":"P4|rep|r92|2","r":null}
+{"tag":"P4|rep|r92|3","r":null}
+{"round_complete":92,"t":1789306575}
+{"tag":"P4|det|r93","r":null}
+{"tag":"P4|rep|r93|1","r":null}
+{"tag":"P4|rep|r93|2","r":null}
+{"tag":"P4|rep|r93|3","r":null}
+{"round_complete":93,"t":1789306580}
+{"tag":"P4|det|r94","r":null}
+{"tag":"P4|rep|r94|1","r":null}
+{"tag":"P4|rep|r94|2","r":null}
+{"tag":"P4|rep|r94|3","r":null}
+{"round_complete":94,"t":1789306585}
+{"tag":"P4|det|r95","r":null}
+{"tag":"P4|rep|r95|1","r":null}
+{"tag":"P4|rep|r95|2","r":null}
+{"tag":"P4|rep|r95|3","r":null}
+{"round_complete":95,"t":1789306590}
+{"tag":"P4|det|r96","r":null}
+{"tag":"P4|rep|r96|1","r":null}
+{"tag":"P4|rep|r96|2","r":null}
+{"tag":"P4|rep|r96|3","r":null}
+{"round_complete":96,"t":1789306594}
+{"tag":"P4|det|r97","r":null}
+{"tag":"P4|rep|r97|1","r":null}
+{"tag":"P4|rep|r97|2","r":null}
+{"tag":"P4|rep|r97|3","r":null}
+{"round_complete":97,"t":1789306599}
+{"tag":"P4|det|r98","r":null}
+{"tag":"P4|rep|r98|1","r":null}
+{"tag":"P4|rep|r98|2","r":null}
+{"tag":"P4|rep|r98|3","r":null}
+{"round_complete":98,"t":1789306604}
+{"tag":"P4|det|r99","r":null}
+{"tag":"P4|rep|r99|1","r":null}
+{"tag":"P4|rep|r99|2","r":null}
+{"tag":"P4|rep|r99|3","r":null}
+{"round_complete":99,"t":1789306609}
+{"tag":"P4|det|r100","r":null}
+{"tag":"P4|rep|r100|1","r":null}
+{"tag":"P4|rep|r100|2","r":null}
+{"tag":"P4|rep|r100|3","r":null}
+{"round_complete":100,"t":1789306614}
+{"tag":"P4|det|r101","r":null}
+{"tag":"P4|rep|r101|1","r":null}
+{"tag":"P4|rep|r101|2","r":null}
+{"tag":"P4|rep|r101|3","r":null}
+{"round_complete":101,"t":1789306619}
+{"tag":"P4|det|r102","r":null}
+{"tag":"P4|rep|r102|1","r":null}
+{"tag":"P4|rep|r102|2","r":null}
+{"tag":"P4|rep|r102|3","r":null}
+{"round_complete":102,"t":1789306624}
+{"tag":"P4|det|r103","r":null}
+{"tag":"P4|rep|r103|1","r":null}
+{"tag":"P4|rep|r103|2","r":null}
+{"tag":"P4|rep|r103|3","r":null}
+{"round_complete":103,"t":1789306629}
+{"tag":"P4|det|r104","r":null}
+{"tag":"P4|rep|r104|1","r":null}
+{"tag":"P4|rep|r104|2","r":null}
+{"tag":"P4|rep|r104|3","r":null}
+{"round_complete":104,"t":1789306634}
+{"tag":"P4|det|r105","r":null}
+{"tag":"P4|rep|r105|1","r":null}
+{"tag":"P4|rep|r105|2","r":null}
+{"tag":"P4|rep|r105|3","r":null}
+{"round_complete":105,"t":1789306639}
+{"tag":"P4|det|r106","r":null}
+{"tag":"P4|rep|r106|1","r":null}
+{"tag":"P4|rep|r106|2","r":null}
+{"tag":"P4|rep|r106|3","r":null}
+{"round_complete":106,"t":1789306643}
+{"tag":"P4|det|r107","r":null}
+{"tag":"P4|rep|r107|1","r":null}
+{"tag":"P4|rep|r107|2","r":null}
+{"tag":"P4|rep|r107|3","r":null}
+{"round_complete":107,"t":1789306648}
