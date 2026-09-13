@@ -24,6 +24,10 @@ from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
     attention_aiter_varlen_backward_impl,
     attention_aiter_varlen_forward_impl,
 )
+from primus_turbo.pytorch.kernels.attention.attention_fused_bwd_impl import (
+    dense_fused_backward,
+    fused_backward_eligible,
+)
 from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
     flash_attn_sbhd_flydsl_backward_impl,
     flash_attn_sbhd_flydsl_forward_impl,
@@ -289,6 +293,24 @@ class FlashAttnFunc(torch.autograd.Function):
 
         if ctx.backend == BackendType.TRITON:
             q, k, v, out, lse, sink = ctx.saved_tensors
+            # The vendored fused backward is one kernel where the in-tree path is two, and
+            # at training sequence lengths it is worth ~1.6x on the whole op (24.3 ms vs
+            # 36.4 at b=4 s=8192, against torch flex's 31.3). It declines short sequences,
+            # where its tile is a pessimisation, and anything with a sink; those keep the
+            # path that was already shipping.
+            if fused_backward_eligible(q, k.shape[1], sink):
+                dq, dk, dv = dense_fused_backward(
+                    dout,
+                    q,
+                    k,
+                    v,
+                    out,
+                    lse,
+                    softmax_scale=ctx.softmax_scale,
+                    causal=ctx.causal,
+                    window_size=ctx.window_size,
+                )
+                return _flash_attn_grads(dq, dk, dv, None, None)
             dq, dk, dv, dsink = triton_dense_backward(
                 dout,
                 q,

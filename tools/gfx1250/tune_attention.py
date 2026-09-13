@@ -72,6 +72,10 @@ if "--tune" in sys.argv:
 # Set before torch is imported; torch reads it at backend-selection time.
 os.environ.setdefault("TORCH_BLAS_PREFER_HIPBLASLT", "0")
 
+# Same reason as _TUNE_ENV above: the vendored fused backward reads its config at import.
+if "--fused-tune" in sys.argv:
+    os.environ["PRIMUS_TURBO_FUSED_MHA_BWD_TUNE"] = sys.argv[sys.argv.index("--fused-tune") + 1]
+
 # Make the checkout this script lives in the primus_turbo that gets imported.
 # Running a script puts the SCRIPT's directory on sys.path, not the repo root, so without
 # this an editable install elsewhere in the image wins and the harness silently measures a
@@ -103,6 +107,14 @@ SHAPES = {
     "llama31-8b-b2": dict(batch=2, seqlen=8192, hq=32, hkv=8, d=128),
     # Smoke: seconds, for wiring changes.
     "smoke": dict(batch=1, seqlen=1024, hq=8, hkv=2, d=128),
+    # Extra points for the shape-gate table. The tile that wins at s=8192 loses at s=1024,
+    # so the dispatcher needs the crossover, not just the endpoints. Same heads/D/dtype
+    # throughout -- only batch and sequence move, or it is a different kernel.
+    "gate-s1024": dict(batch=4, seqlen=1024, hq=32, hkv=8, d=128),
+    "gate-s2048": dict(batch=4, seqlen=2048, hq=32, hkv=8, d=128),
+    "gate-s16384": dict(batch=1, seqlen=16384, hq=32, hkv=8, d=128),
+    "gate-b1": dict(batch=1, seqlen=8192, hq=32, hkv=8, d=128),
+    "gate-b8": dict(batch=8, seqlen=4096, hq=32, hkv=8, d=128),
 }
 
 _FAULT_PATTERNS = (
@@ -281,6 +293,9 @@ def main() -> int:
                     help="override aiter's forward num_stages (0 = shipped config)")
     ap.add_argument("--aiter-bwd-warps", type=int, default=0,
                     help="override aiter's backward num_warps (0 = shipped config)")
+    ap.add_argument("--fused-tune", default="",
+                    help="override the VENDORED fused backward config (sets "
+                         "PRIMUS_TURBO_FUSED_MHA_BWD_TUNE before import)")
     ap.add_argument("--aiter-bwd-cfg", default="",
                     help="override keys on aiter's fused backward config, e.g. "
                          "'BLOCK_M1=64,BLOCK_N2=64'. NOTE the pairing constraint: the launch "

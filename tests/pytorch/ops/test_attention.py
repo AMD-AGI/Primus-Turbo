@@ -1874,3 +1874,83 @@ def test_triton_autotune_default_is_unchanged_without_the_env_var(monkeypatch):
         assert configs[0].num_warps == 4
         assert configs[0].num_stages == 1
     assert fwd[0].kwargs.get("PRE_LOAD_V") is False
+
+
+# ---------------------------------------------------------------------------
+# Vendored fused backward (gfx1250)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.gfx1250
+@pytest.mark.parametrize(
+    "seqlen,expected",
+    [(512, False), (1024, False), (2048, True), (8192, True)],
+    ids=["s512", "s1024", "s2048", "s8192"],
+)
+def test_fused_backward_gate_is_a_sequence_length_threshold(seqlen, expected):
+    """The fused backward wins at training sequence lengths and loses at short ones.
+
+    Measured on gfx1250 (total fwd+bwd, vendored path): at b=4 s=8192 its shipped N1=256
+    tile is 3.8x better than N1=32, but at s=1024 it is worse than the in-tree path because
+    that tile leaves only four K blocks. The gate encodes that crossover.
+    """
+    from primus_turbo.pytorch.kernels.attention import attention_fused_bwd_impl as fb
+
+    q = torch.empty(2, seqlen, 32, 128, dtype=torch.bfloat16)
+    assert fb.fused_backward_eligible(q, seqlen) is expected
+
+
+@pytest.mark.gfx1250
+def test_fused_backward_gate_refuses_a_sink():
+    """A sink must fall back. The fused kernel supports one, but dsink is not plumbed
+    through this adapter, and returning None for a gradient the caller asked for is worse
+    than being slower."""
+    from primus_turbo.pytorch.kernels.attention import attention_fused_bwd_impl as fb
+
+    q = torch.empty(2, 8192, 32, 128, dtype=torch.bfloat16)
+    assert fb.fused_backward_eligible(q, 8192, sink=None) is True
+    assert fb.fused_backward_eligible(q, 8192, sink=torch.empty(32)) is False
+
+
+@pytest.mark.gfx1250
+def test_fused_backward_gate_refuses_fp32():
+    from primus_turbo.pytorch.kernels.attention import attention_fused_bwd_impl as fb
+
+    assert fb.fused_backward_eligible(torch.empty(2, 8192, 32, 128, dtype=torch.float32), 8192) is False
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx1250()),
+    reason="the vendored fused backward is validated on gfx1250 only",
+)
+@pytest.mark.gfx1250
+@pytest.mark.parametrize("causal", [True, False])
+def test_fused_backward_matches_the_reference(causal):
+    """Forward+backward through the dispatcher, which routes here by sequence length."""
+    b, s, hq, hkv, d = 2, 2048, 8, 2, 128
+    dev = "cuda"
+    torch.manual_seed(0)
+    q, k, v = (
+        torch.randn(b, s, h, d, device=dev, dtype=torch.bfloat16, requires_grad=True)
+        for h in (hq, hkv, hkv)
+    )
+    grad_out = torch.randn(b, s, hq, d, device=dev, dtype=torch.bfloat16)
+
+    GlobalBackendManager.set_attn_backend(BackendType.TRITON, PrecisionType.BF16_FP16_FP32)
+    try:
+        out = flash_attn_func(q, k, v, causal=causal)
+        out.backward(grad_out)
+    finally:
+        GlobalBackendManager.set_attn_backend(None, PrecisionType.BF16_FP16_FP32)
+
+    qr, kr, vr = (t.detach().float().requires_grad_(True) for t in (q, k, v))
+    out_ref = attention_vanilla_forward_pytorch_ref_impl(qr, kr, vr, d**-0.5, causal, qkv_format="bshd")
+    out_ref.backward(grad_out.float())
+
+    # All four tensors, separately. dk/dv can be destroyed while out and dq stay perfect --
+    # that combination was actually observed on this card during tuning, and an output-only
+    # check passes it.
+    assert compute_snr(out_ref, out.float()) > 40.0
+    assert compute_snr(qr.grad, q.grad.float()) > 40.0
+    assert compute_snr(kr.grad, k.grad.float()) > 40.0
+    assert compute_snr(vr.grad, v.grad.float()) > 40.0

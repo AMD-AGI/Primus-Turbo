@@ -460,3 +460,45 @@ def dense_fused_backward(
         softmax_lse[:, :, lse_idx + FIXED_BLOCK_M] = delta.to(softmax_lse.dtype)
 
     return dq, dk, dv
+
+
+# ---------------------------------------------------------------------------
+# Eligibility
+# ---------------------------------------------------------------------------
+# The fused backward is faster than the in-tree two-kernel one by a wide margin at the
+# sequence lengths training actually uses, and SLOWER at very short ones. Measured on
+# gfx1250, vendored path, forward num_stages=2, total fwd+bwd ms (lower is better):
+#
+#   shape              N1=32    N1=64   N1=128   N1=256
+#   b1 s1024 h8         1.000    1.013    1.197    1.787      <- short: small tile wins
+#   b4 s4096           24.407   12.983    8.888    7.876
+#   b2 s8192           47.338   25.302   16.310   12.817
+#   b4 s8192           93.449   49.472   31.642   24.282      <- long: N1=256 wins by 3.8x
+#
+# The crossover is monotone in sequence length and the shipped tile is N1=256, so the gate
+# is a sequence-length threshold. At s=1024 that tile leaves only four K blocks and most of
+# it is wasted, which is why it loses there.
+_MIN_SEQLEN_FOR_FUSED = 2048
+
+
+def fused_backward_eligible(
+    q: torch.Tensor,
+    seqlen_k: int,
+    sink: Optional[torch.Tensor] = None,
+) -> bool:
+    """Whether the vendored fused backward should be preferred over the in-tree one.
+
+    Narrow by construction: anything this declines falls back to the path that was already
+    shipping, so a wrong 'no' costs performance while a wrong 'yes' could cost correctness.
+    """
+    # No sink support: the fused kernel has the machinery, but dsink is not plumbed through
+    # this adapter, and returning None for a gradient the caller asked for is worse than
+    # being slower.
+    if sink is not None:
+        return False
+    if q.dtype not in (torch.bfloat16, torch.float16):
+        return False
+    if q.dim() != 4:
+        return False
+    # Below this the shipped tile is a pessimisation -- see the table above.
+    return seqlen_k >= _MIN_SEQLEN_FOR_FUSED
