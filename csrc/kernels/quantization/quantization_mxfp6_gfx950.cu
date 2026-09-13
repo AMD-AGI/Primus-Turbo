@@ -110,6 +110,9 @@ constexpr float kHadamard32Norm = 0.1767578125f;
 #ifndef MXFP6_THREADS_PER_BLOCK
 #define MXFP6_THREADS_PER_BLOCK 256
 #endif
+#ifndef MXFP6_ASYNC_STAGE
+#define MXFP6_ASYNC_STAGE 3
+#endif
 
 constexpr int TILE_M = MXFP6_TILE_M;
 // The shipped width, and a default rather than the only value: the QK-norm+RoPE prologue's
@@ -153,6 +156,44 @@ using packed_fp6x32_t = uint32_t __attribute__((ext_vector_type(6)));
 using uint4_t         = uint32_t __attribute__((ext_vector_type(4)));
 using uint2_t         = uint32_t __attribute__((ext_vector_type(2)));
 using float16_t       = float __attribute__((ext_vector_type(16)));
+using as3_uint32_ptr  = uint32_t __attribute__((address_space(3))) *;
+using int32x4_t       = int32_t __attribute__((ext_vector_type(4)));
+
+// gfx950's buffer_load_dword ... lds path. Unlike a normal vector load it does
+// not allocate a VGPR for the payload: each lane writes its dword directly to
+// lane*4 from the wave's LDS base. Four 256-byte strips fill each wave's 1 KiB
+// share of a stage. This experiment deliberately keeps the wrapper local
+// rather than pulling the packer into a larger kernel framework.
+__device__ __forceinline__ __amdgpu_buffer_rsrc_t make_buffer_resource(const void *ptr,
+                                                                       uint32_t bytes) {
+    return __builtin_amdgcn_make_buffer_rsrc(const_cast<void *>(ptr), 0, bytes, 0x00020000);
+}
+
+__device__ __forceinline__ void async_load_lds_4(__amdgpu_buffer_rsrc_t resource,
+                                                 as3_uint32_ptr lds_base,
+                                                 int32_t byte_offset) {
+    __builtin_amdgcn_raw_ptr_buffer_load_lds(resource, lds_base, 4, byte_offset, 0, 0, 0);
+}
+
+// Clang 20's raw_ptr builtin only accepts 1/2/4-byte widths, while the LLVM
+// intrinsic and gfx950 ISA accept a 16-byte lane payload. Keep that wider
+// instruction as a separate control rather than conflating instruction width
+// with direct-to-LDS itself.
+extern "C" __device__ void llvm_amdgcn_raw_buffer_load_lds(
+    int32x4_t resource, as3_uint32_ptr lds_base, int size, int voffset, int soffset, int offset,
+    int aux) __asm("llvm.amdgcn.raw.buffer.load.lds");
+
+__device__ __forceinline__ int32x4_t make_buffer_resource_vec(const void *ptr, uint32_t bytes) {
+    const uint64_t address = reinterpret_cast<uint64_t>(ptr);
+    return int32x4_t{static_cast<int32_t>(address), static_cast<int32_t>(address >> 32),
+                     static_cast<int32_t>(bytes), 0x00020000};
+}
+
+__device__ __forceinline__ void async_load_lds_16(int32x4_t resource,
+                                                  as3_uint32_ptr lds_base,
+                                                  int32_t byte_offset) {
+    llvm_amdgcn_raw_buffer_load_lds(resource, lds_base, 16, byte_offset, 0, 0, 0);
+}
 
 // The packer's Hadamard is a bf16 dot with fp32 accumulate, so an fp16 input has to be
 // rounded through bf16 first or the codes drift from AITER's.
@@ -421,12 +462,22 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
     static_assert(TILE_N % kGroupSize == 0, "a staged patch must hold whole groups both ways");
     static_assert(TILE_N <= THREADS_PER_BLOCK,
                   "the column-sum pass assigns one column per thread");
-    constexpr int       LDS_PITCH = lds_pitch(TILE_N);
+    constexpr bool kQkr = PROLOGUE == MXFP6Prologue::QkNormRopeBackward;
+    // The direct-to-LDS instruction lays each wave's lane payloads contiguously.
+    // Use a compact pitch for that arm; the production path retains its aligned
+    // padded pitch unchanged.
+    constexpr bool kAsyncStage = MXFP6_ASYNC_STAGE && !kQkr && TILE_M == 64 &&
+                                 (TILE_N == 64 || TILE_N == 128) &&
+                                 THREADS_PER_BLOCK == 256;
+    constexpr int       LDS_PITCH = kAsyncStage ? TILE_N : lds_pitch(TILE_N);
     __shared__ uint16_t s_tile[TILE_M][LDS_PITCH];
+    // BiasGeluBackward needs its second tensor after the direct load has landed.
+    // Other instantiations pay one uint16_t, not a dormant second tile.
+    __shared__ uint16_t
+        s_aux[kAsyncStage && PROLOGUE == MXFP6Prologue::BiasGeluBackward ? TILE_M * TILE_N : 1];
 
     // The QK-norm+RoPE prologue's private state. Costs the other prologues nothing: the
     // array degenerates to one element and every pass below is `if constexpr`-dead.
-    constexpr bool kQkr          = PROLOGUE == MXFP6Prologue::QkNormRopeBackward;
     constexpr int  kChunksPerRow = TILE_N / kStageVec;
     constexpr int  kDwGroups     = THREADS_PER_BLOCK / kChunksPerRow;
     // dw partials, one float per (thread, column-it-owns). See the accumulator below for why
@@ -435,6 +486,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
 
     const int32_t tile_m = blockIdx.y * TILE_M;
     const int32_t tile_n = blockIdx.x * TILE_N;
+    const bool async_full_tile = tile_m + TILE_M <= M && tile_n + TILE_N <= N;
 
     // q, k and v are per-head slices of mixed_qkv at stride 3D, and TILE_N is D, so a block
     // lies wholly inside one of them. Spelled on blockIdx.x against the literal 3 rather
@@ -479,6 +531,270 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
      * arrival. Measurably faster than the LDS-and-two-barriers version.
      */
     float dw_acc[kQkr ? kStageVec : 1] = {};
+
+    /*
+     * Experimental TE-style two-stage global->LDS pipeline.
+     *
+     * A 64x64 patch is two independent 32x64 stages: 32 is exactly one
+     * MXFP6 group in the column direction, while each row still contains two
+     * complete groups. Four waves issue four dword direct-to-LDS loads per
+     * lane, filling one 32x64 stage (4096 bytes) with no payload VGPRs. After
+     * stage 0 lands, stage 1 is issued before stage 0's prologue/Hadamard/pack
+     * work. The next vmcnt(0) is therefore below useful work, matching the
+     * structure of Transformer Engine's two-buffer MXFP8 cast.
+     *
+     * Tail tiles retain the production staging path below. Flux's dimensions
+     * are multiples of 256, so the measured call table takes this arm on every
+     * block; the fallback keeps the general operator contract intact.
+     */
+    if constexpr (kAsyncStage && MXFP6_ASYNC_STAGE == 2) {
+        if (async_full_tile) {
+            constexpr int kStageRows = 32;
+            constexpr int kStageBytes = kStageRows * TILE_N * sizeof(uint16_t);
+            static_assert(kStageBytes == THREADS_PER_BLOCK * 16);
+
+            const auto input_resource =
+                make_buffer_resource(input, static_cast<uint32_t>(int64_t(M) * N * sizeof(DType)));
+            const auto aux_resource =
+                make_buffer_resource(aux, static_cast<uint32_t>(int64_t(M) * N * sizeof(DType)));
+
+            const int lane      = threadIdx.x & 63;
+            const int wave      = threadIdx.x >> 6;
+            const int local_m32 = threadIdx.x / (TILE_N / kStageVec);
+            const int local_n   = (threadIdx.x % (TILE_N / kStageVec)) * kStageVec;
+
+            auto issue_stage = [&](const int stage) {
+#pragma unroll
+                for (int strip = 0; strip < 4; ++strip) {
+                    // One wave instruction writes 64 contiguous dwords = 256
+                    // bytes = two compact 64-element bf16 rows.
+                    const int strip_row = wave * 8 + strip * 2 + lane / 32;
+                    const int strip_col = (lane % 32) * 2;
+                    const int global_m  = tile_m + stage * kStageRows + strip_row;
+                    const int byte_offset = static_cast<int>(
+                        (int64_t(global_m) * N + tile_n + strip_col) * sizeof(DType));
+                    const uintptr_t tile_lds_base = reinterpret_cast<uintptr_t>(
+                        &s_tile[stage * kStageRows + wave * 8 + strip * 2][0]);
+                    async_load_lds_4(input_resource,
+                                     reinterpret_cast<as3_uint32_ptr>(tile_lds_base), byte_offset);
+                    if constexpr (PROLOGUE == MXFP6Prologue::BiasGeluBackward) {
+                        const uintptr_t aux_lds_base = reinterpret_cast<uintptr_t>(
+                            &s_aux[(stage * kStageRows + wave * 8 + strip * 2) * TILE_N]);
+                        async_load_lds_4(aux_resource,
+                                         reinterpret_cast<as3_uint32_ptr>(aux_lds_base),
+                                         byte_offset);
+                    }
+                }
+            };
+
+            issue_stage(0);
+            float col_sum_acc = 0.0f;
+
+#pragma unroll
+            for (int stage = 0; stage < 2; ++stage) {
+                // Drain only the current stage before any lane reads it. Stage
+                // 1 is issued immediately afterwards and remains in flight
+                // through all of stage 0's useful work.
+                asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+                __syncthreads();
+                if (stage + 1 < 2)
+                    issue_stage(stage + 1);
+
+                if constexpr (PROLOGUE != MXFP6Prologue::Identity) {
+                    const int local_m = stage * kStageRows + local_m32;
+                    uint16_t staged[kStageVec];
+                    uint16_t aux_staged[kStageVec] = {};
+                    uint16_t bias_staged[kStageVec] = {};
+#pragma unroll
+                    for (int i = 0; i < kStageVec; ++i) {
+                        staged[i] = s_tile[local_m][local_n + i];
+                        if constexpr (PROLOGUE == MXFP6Prologue::BiasGeluBackward)
+                            aux_staged[i] =
+                                s_aux[local_m * TILE_N + local_n + i];
+                    }
+                    if (bias != nullptr)
+                        stage_vector(bias_staged, reinterpret_cast<const uint16_t *>(bias), 0,
+                                     tile_n + local_n, N);
+#pragma unroll
+                    for (int i = 0; i < kStageVec; ++i) {
+                        float x = to_float<DType>(staged[i]);
+                        if (bias != nullptr)
+                            x = round_to_dtype<DType>(x + to_float<DType>(bias_staged[i]));
+                        if constexpr (PROLOGUE == MXFP6Prologue::BiasGelu) {
+                            staged[i] = from_float<DType>(gelu_tanh(x));
+                        } else {
+                            staged[i] = from_float<DType>(
+                                gelu_tanh_backward(to_float<DType>(aux_staged[i]), x));
+                        }
+                        s_tile[local_m][local_n + i] = staged[i];
+                    }
+                    __syncthreads();
+                }
+
+                if constexpr (DO_COL_SUM) {
+                    if (threadIdx.x < TILE_N) {
+#pragma unroll
+                        for (int i = 0; i < kStageRows; ++i)
+                            col_sum_acc +=
+                                to_float<DType>(s_tile[stage * kStageRows + i][threadIdx.x]);
+                    }
+                }
+
+                constexpr int kRowGroups = DO_ROW ? kStageRows * (TILE_N / kGroupSize) : 0;
+                constexpr int kColGroups = DO_COL ? TILE_N : 0;
+                constexpr int kGroups    = kRowGroups + kColGroups;
+                static_assert(kGroups <= THREADS_PER_BLOCK);
+
+                const int slot = threadIdx.x;
+                if constexpr (DO_ROW) {
+                    if (slot < kRowGroups) {
+                        constexpr int kBlocksPerRow = TILE_N / kGroupSize;
+                        const int local_m =
+                            stage * kStageRows + slot / kBlocksPerRow;
+                        const int k_block = slot % kBlocksPerRow;
+                        const int n_offset = k_block * kGroupSize;
+                        float values[kGroupSize];
+#pragma unroll
+                        for (int i = 0; i < kGroupSize; ++i)
+                            values[i] =
+                                to_dot_operand<DType>(s_tile[local_m][n_offset + i]);
+                        mxfp6_emit_group(values, tile_m + local_m,
+                                         tile_n / kGroupSize + k_block, row_nk_pad, row_packed,
+                                         row_scale);
+                    }
+                }
+                if constexpr (DO_COL) {
+                    const int col_slot = slot - kRowGroups;
+                    if (col_slot >= 0 && col_slot < kColGroups) {
+                        float values[kGroupSize];
+#pragma unroll
+                        for (int i = 0; i < kGroupSize; ++i)
+                            values[i] = to_dot_operand<DType>(
+                                s_tile[stage * kStageRows + i][col_slot]);
+                        mxfp6_emit_group(values, tile_n + col_slot,
+                                         tile_m / kGroupSize + stage, col_nk_pad, col_packed,
+                                         col_scale);
+                    }
+                }
+            }
+
+            if constexpr (DO_COL_SUM) {
+                if (threadIdx.x < TILE_N)
+                    col_sum[static_cast<int64_t>(blockIdx.y) * N + tile_n + threadIdx.x] =
+                        col_sum_acc;
+            }
+            return;
+        }
+    }
+
+    // Control arm for the mechanism above: use the same direct-to-LDS
+    // instructions and compact layout, but issue both halves up front and
+    // retain the production whole-tile prologue/emit order. Mode 1 uses four
+    // dword instructions per lane; mode 3 uses one dwordx4. Comparing either
+    // with mode 0 prices the load mechanism; mode 2 minus mode 1 prices the
+    // staged schedule.
+    if constexpr (kAsyncStage && (MXFP6_ASYNC_STAGE == 1 || MXFP6_ASYNC_STAGE == 3)) {
+        if (async_full_tile) {
+            constexpr int kAsyncStageRows = THREADS_PER_BLOCK * kStageVec / TILE_N;
+            constexpr int kAsyncStages    = TILE_M / kAsyncStageRows;
+            constexpr int kWaveRows       = 64 * kStageVec / TILE_N;
+            static_assert(TILE_M % kAsyncStageRows == 0);
+            const auto input_resource =
+                make_buffer_resource(input, static_cast<uint32_t>(int64_t(M) * N * sizeof(DType)));
+            const auto aux_resource =
+                make_buffer_resource(aux, static_cast<uint32_t>(int64_t(M) * N * sizeof(DType)));
+            const auto input_resource_vec = make_buffer_resource_vec(
+                input, static_cast<uint32_t>(int64_t(M) * N * sizeof(DType)));
+            const auto aux_resource_vec = make_buffer_resource_vec(
+                aux, static_cast<uint32_t>(int64_t(M) * N * sizeof(DType)));
+            const int lane = threadIdx.x & 63;
+            const int wave = threadIdx.x >> 6;
+
+#pragma unroll
+            for (int stage = 0; stage < kAsyncStages; ++stage) {
+                if constexpr (MXFP6_ASYNC_STAGE == 3) {
+                    constexpr int kVecsPerRow = TILE_N / kStageVec;
+                    const int local_m = threadIdx.x / kVecsPerRow;
+                    const int local_n = (threadIdx.x % kVecsPerRow) * kStageVec;
+                    const int global_m = tile_m + stage * kAsyncStageRows + local_m;
+                    const int byte_offset = static_cast<int>(
+                        (int64_t(global_m) * N + tile_n + local_n) * sizeof(DType));
+                    const uintptr_t tile_lds_base =
+                        reinterpret_cast<uintptr_t>(
+                            &s_tile[stage * kAsyncStageRows + wave * kWaveRows][0]);
+                    async_load_lds_16(input_resource_vec,
+                                      reinterpret_cast<as3_uint32_ptr>(tile_lds_base), byte_offset);
+                    if constexpr (PROLOGUE == MXFP6Prologue::BiasGeluBackward) {
+                        const uintptr_t aux_lds_base = reinterpret_cast<uintptr_t>(
+                            &s_aux[(stage * kAsyncStageRows + wave * kWaveRows) * TILE_N]);
+                        async_load_lds_16(aux_resource_vec,
+                                          reinterpret_cast<as3_uint32_ptr>(aux_lds_base),
+                                          byte_offset);
+                    }
+                } else {
+#pragma unroll
+                    for (int strip = 0; strip < 4; ++strip) {
+                        const int strip_row = wave * 8 + strip * 2 + lane / 32;
+                        const int strip_col = (lane % 32) * 2;
+                        const int global_m  = tile_m + stage * 32 + strip_row;
+                        const int byte_offset = static_cast<int>(
+                            (int64_t(global_m) * N + tile_n + strip_col) * sizeof(DType));
+                        const uintptr_t tile_lds_base = reinterpret_cast<uintptr_t>(
+                            &s_tile[stage * 32 + wave * 8 + strip * 2][0]);
+                        async_load_lds_4(input_resource,
+                                         reinterpret_cast<as3_uint32_ptr>(tile_lds_base),
+                                         byte_offset);
+                        if constexpr (PROLOGUE == MXFP6Prologue::BiasGeluBackward) {
+                            const uintptr_t aux_lds_base = reinterpret_cast<uintptr_t>(
+                                &s_aux[(stage * 32 + wave * 8 + strip * 2) * TILE_N]);
+                            async_load_lds_4(aux_resource,
+                                             reinterpret_cast<as3_uint32_ptr>(aux_lds_base),
+                                             byte_offset);
+                        }
+                    }
+                }
+            }
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+            __syncthreads();
+
+            if constexpr (PROLOGUE != MXFP6Prologue::Identity) {
+                constexpr int VEC   = kStageVec;
+                constexpr int ELEMS = TILE_M * TILE_N;
+#pragma unroll
+                for (int base = threadIdx.x * VEC; base < ELEMS;
+                     base += THREADS_PER_BLOCK * VEC) {
+                    const int local_m = base / TILE_N;
+                    const int local_n = base % TILE_N;
+                    uint16_t staged[VEC];
+                    uint16_t aux_staged[VEC] = {};
+                    uint16_t bias_staged[VEC] = {};
+#pragma unroll
+                    for (int i = 0; i < VEC; ++i) {
+                        staged[i] = s_tile[local_m][local_n + i];
+                        if constexpr (PROLOGUE == MXFP6Prologue::BiasGeluBackward)
+                            aux_staged[i] = s_aux[local_m * TILE_N + local_n + i];
+                    }
+                    if (bias != nullptr)
+                        stage_vector(bias_staged, reinterpret_cast<const uint16_t *>(bias), 0,
+                                     tile_n + local_n, N);
+#pragma unroll
+                    for (int i = 0; i < VEC; ++i) {
+                        float x = to_float<DType>(staged[i]);
+                        if (bias != nullptr)
+                            x = round_to_dtype<DType>(x + to_float<DType>(bias_staged[i]));
+                        if constexpr (PROLOGUE == MXFP6Prologue::BiasGelu) {
+                            staged[i] = from_float<DType>(gelu_tanh(x));
+                        } else {
+                            staged[i] = from_float<DType>(
+                                gelu_tanh_backward(to_float<DType>(aux_staged[i]), x));
+                        }
+                        s_tile[local_m][local_n + i] = staged[i];
+                    }
+                }
+                __syncthreads();
+            }
+        }
+    }
 
     if constexpr (kQkr) {
         // Which slice this block owns. Inside the `if constexpr` because the operands only
@@ -589,23 +905,25 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
     // Stage the patch. Reads are coalesced along N; anything outside the logical tensor
     // becomes zero, which is what the padded region of the blob must encode.
     if constexpr (!kQkr) {
-        const auto *__restrict__ input_u16 = reinterpret_cast<const uint16_t *>(input);
-        const auto *__restrict__ aux_u16   = reinterpret_cast<const uint16_t *>(aux);
-        const auto *__restrict__ bias_u16  = reinterpret_cast<const uint16_t *>(bias);
-        constexpr int VEC                  = kStageVec;
-        constexpr int ELEMS                = TILE_M * TILE_N;
+        if (!(kAsyncStage && (MXFP6_ASYNC_STAGE == 1 || MXFP6_ASYNC_STAGE == 3) &&
+              async_full_tile)) {
+            const auto *__restrict__ input_u16 = reinterpret_cast<const uint16_t *>(input);
+            const auto *__restrict__ aux_u16   = reinterpret_cast<const uint16_t *>(aux);
+            const auto *__restrict__ bias_u16  = reinterpret_cast<const uint16_t *>(bias);
+            constexpr int VEC                  = kStageVec;
+            constexpr int ELEMS                = TILE_M * TILE_N;
 #pragma unroll
-        for (int base = threadIdx.x * VEC; base < ELEMS; base += THREADS_PER_BLOCK * VEC) {
-            const int local_m  = base / TILE_N;
-            const int local_n  = base % TILE_N;
-            const int global_m = tile_m + local_m;
-            const int global_n = tile_n + local_n;
+            for (int base = threadIdx.x * VEC; base < ELEMS; base += THREADS_PER_BLOCK * VEC) {
+                const int local_m  = base / TILE_N;
+                const int local_n  = base % TILE_N;
+                const int global_m = tile_m + local_m;
+                const int global_n = tile_n + local_n;
 
-            uint16_t staged[VEC] = {0, 0, 0, 0, 0, 0, 0, 0};
-            if (global_m < M) {
-                stage_vector(staged, input_u16, global_m, global_n, N);
+                uint16_t staged[VEC] = {0, 0, 0, 0, 0, 0, 0, 0};
+                if (global_m < M) {
+                    stage_vector(staged, input_u16, global_m, global_n, N);
 
-                if constexpr (PROLOGUE != MXFP6Prologue::Identity) {
+                    if constexpr (PROLOGUE != MXFP6Prologue::Identity) {
                     // Every operand the prologue reads comes in through stage_vector, which
                     // zero-fills past N. That is what lets the epilogue run unguarded over
                     // the whole vector: both prologues map an all-zero input to exactly
@@ -619,41 +937,47 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                     // needed a per-element bounds branch to stop gelu(0 + bias) from
                     // landing there; the branch cost 13 instructions per element in exec
                     // mask manipulation alone, more than the activation it guarded.
-                    uint16_t aux_staged[VEC] = {0, 0, 0, 0, 0, 0, 0, 0};
-                    if constexpr (PROLOGUE == MXFP6Prologue::BiasGeluBackward)
-                        stage_vector(aux_staged, aux_u16, global_m, global_n, N);
+                        uint16_t aux_staged[VEC] = {0, 0, 0, 0, 0, 0, 0, 0};
+                        if constexpr (PROLOGUE == MXFP6Prologue::BiasGeluBackward)
+                            stage_vector(aux_staged, aux_u16, global_m, global_n, N);
 
                     // One vector load, not one load per element. The bias is a single row
                     // of length N, so the row-staging helper addresses it correctly with
                     // row 0 and gives the same coalescing the input gets.
-                    uint16_t bias_staged[VEC] = {0, 0, 0, 0, 0, 0, 0, 0};
-                    if (bias_u16 != nullptr)
-                        stage_vector(bias_staged, bias_u16, 0, global_n, N);
+                        uint16_t bias_staged[VEC] = {0, 0, 0, 0, 0, 0, 0, 0};
+                        if (bias_u16 != nullptr)
+                            stage_vector(bias_staged, bias_u16, 0, global_n, N);
 #pragma unroll
-                    for (int i = 0; i < VEC; ++i) {
+                        for (int i = 0; i < VEC; ++i) {
                         // The bias-add is rounded back to DType before the activation reads
                         // it. That rounding looks redundant and is not: in the graph being
                         // replaced the add is a DType tensor op, so its result is a DType
                         // value, and carrying the sum on to the activation in fp32 instead
                         // changes 21% of the bf16 codes it produces.
-                        float x = to_float<DType>(staged[i]);
-                        if (bias_u16 != nullptr)
-                            x = round_to_dtype<DType>(x + to_float<DType>(bias_staged[i]));
-                        if constexpr (PROLOGUE == MXFP6Prologue::BiasGelu) {
-                            staged[i] = from_float<DType>(gelu_tanh(x));
-                        } else {
-                            staged[i] = from_float<DType>(
-                                gelu_tanh_backward(to_float<DType>(aux_staged[i]), x));
+                            float x = to_float<DType>(staged[i]);
+                            if (bias_u16 != nullptr)
+                                x = round_to_dtype<DType>(x + to_float<DType>(bias_staged[i]));
+                            if constexpr (PROLOGUE == MXFP6Prologue::BiasGelu) {
+                                staged[i] = from_float<DType>(gelu_tanh(x));
+                            } else {
+                                staged[i] = from_float<DType>(
+                                    gelu_tanh_backward(to_float<DType>(aux_staged[i]), x));
+                            }
                         }
                     }
                 }
-            }
 #pragma unroll
-            for (int i = 0; i < VEC; ++i)
-                s_tile[local_m][local_n + i] = staged[i];
+                for (int i = 0; i < VEC; ++i)
+                    s_tile[local_m][local_n + i] = staged[i];
+            }
         }
     }
-    __syncthreads();
+    if constexpr (kAsyncStage && (MXFP6_ASYNC_STAGE == 1 || MXFP6_ASYNC_STAGE == 3)) {
+        if (!async_full_tile)
+            __syncthreads();
+    } else {
+        __syncthreads();
+    }
 
     // Combine the weight-gradient partials. Thread t held chunk t % kChunksPerRow and
     // row-group t / kChunksPerRow, so laying its VEC floats out at that (chunk, group) puts
@@ -803,25 +1127,34 @@ template <typename DType>
 void quantize_mxfp6_impl(const DType *input, uint8_t *row_packed, uint8_t *row_scale,
                          uint8_t *col_packed, uint8_t *col_scale, const int M, const int N,
                          const MXFP6Direction direction, hipStream_t stream) {
-    const auto [row_nk_pad, col_nk_pad, grid, block] = geometry_for<kDefaultTileN>(M, N);
-    constexpr auto kNoPrologue                       = MXFP6Prologue::Identity;
+    constexpr auto kNoPrologue = MXFP6Prologue::Identity;
 
     switch (direction) {
-    case MXFP6Direction::Row:
+    case MXFP6Direction::Row: {
+        const auto [row_nk_pad, col_nk_pad, grid, block] =
+            geometry_for<kDefaultTileN>(M, N);
         quantize_mxfp6_dual_kernel<DType, true, false, kNoPrologue, false>
             <<<grid, block, 0, stream>>>(input, nullptr, nullptr, row_packed, row_scale, col_packed,
                                          col_scale, nullptr, M, N, row_nk_pad, col_nk_pad, {});
         break;
-    case MXFP6Direction::Col:
+    }
+    case MXFP6Direction::Col: {
+        const auto [row_nk_pad, col_nk_pad, grid, block] =
+            geometry_for<kDefaultTileN>(M, N);
         quantize_mxfp6_dual_kernel<DType, false, true, kNoPrologue, false>
             <<<grid, block, 0, stream>>>(input, nullptr, nullptr, row_packed, row_scale, col_packed,
                                          col_scale, nullptr, M, N, row_nk_pad, col_nk_pad, {});
         break;
-    case MXFP6Direction::Dual:
-        quantize_mxfp6_dual_kernel<DType, true, true, kNoPrologue, false>
+    }
+    case MXFP6Direction::Dual: {
+        constexpr int kIdentityTileN = 128;
+        const auto [row_nk_pad, col_nk_pad, grid, block] =
+            geometry_for<kIdentityTileN>(M, N);
+        quantize_mxfp6_dual_kernel<DType, true, true, kNoPrologue, false, kIdentityTileN>
             <<<grid, block, 0, stream>>>(input, nullptr, nullptr, row_packed, row_scale, col_packed,
                                          col_scale, nullptr, M, N, row_nk_pad, col_nk_pad, {});
         break;
+    }
     }
     PRIMUS_TURBO_CHECK_HIP(hipGetLastError());
 }
@@ -831,25 +1164,34 @@ void quantize_mxfp6_fused_impl(const DType *input, const DType *aux, const DType
                                uint8_t *row_packed, uint8_t *row_scale, uint8_t *col_packed,
                                uint8_t *col_scale, float *col_sum, const int M, const int N,
                                const MXFP6Prologue prologue, hipStream_t stream) {
-    const auto [row_nk_pad, col_nk_pad, grid, block] = geometry_for<kDefaultTileN>(M, N);
-
     // Dual only, by design: see the declaration in quantization.h.
     switch (prologue) {
-    case MXFP6Prologue::Identity:
-        launch_fused<DType, MXFP6Prologue::Identity>(grid, block, stream, input, aux, bias,
-                                                     row_packed, row_scale, col_packed, col_scale,
-                                                     col_sum, M, N, row_nk_pad, col_nk_pad);
+    case MXFP6Prologue::Identity: {
+        constexpr int kIdentityTileN = 128;
+        const auto [row_nk_pad, col_nk_pad, grid, block] =
+            geometry_for<kIdentityTileN>(M, N);
+        launch_fused<DType, MXFP6Prologue::Identity, kIdentityTileN>(
+            grid, block, stream, input, aux, bias, row_packed, row_scale, col_packed, col_scale,
+            col_sum, M, N, row_nk_pad, col_nk_pad);
         break;
-    case MXFP6Prologue::BiasGelu:
-        launch_fused<DType, MXFP6Prologue::BiasGelu>(grid, block, stream, input, aux, bias,
-                                                     row_packed, row_scale, col_packed, col_scale,
-                                                     col_sum, M, N, row_nk_pad, col_nk_pad);
+    }
+    case MXFP6Prologue::BiasGelu: {
+        constexpr int kBiasGeluTileN = 128;
+        const auto [row_nk_pad, col_nk_pad, grid, block] =
+            geometry_for<kBiasGeluTileN>(M, N);
+        launch_fused<DType, MXFP6Prologue::BiasGelu, kBiasGeluTileN>(
+            grid, block, stream, input, aux, bias, row_packed, row_scale, col_packed, col_scale,
+            col_sum, M, N, row_nk_pad, col_nk_pad);
         break;
-    case MXFP6Prologue::BiasGeluBackward:
+    }
+    case MXFP6Prologue::BiasGeluBackward: {
+        const auto [row_nk_pad, col_nk_pad, grid, block] =
+            geometry_for<kDefaultTileN>(M, N);
         launch_fused<DType, MXFP6Prologue::BiasGeluBackward>(
             grid, block, stream, input, aux, bias, row_packed, row_scale, col_packed, col_scale,
             col_sum, M, N, row_nk_pad, col_nk_pad);
         break;
+    }
     case MXFP6Prologue::QkNormRopeBackward:
         // Not reachable through this entry point, and listed rather than defaulted so that
         // adding a prologue keeps failing this switch until someone decides where it goes.
