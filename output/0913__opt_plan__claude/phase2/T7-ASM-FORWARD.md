@@ -55,3 +55,54 @@ LDS 327,680 B（整个 CU 的 320 KB）   VGPR 1024   wave32   scratch 0 B   ker
 前向占我们 ~17% 的时间，且**一直没动过**——唯一一次尝试得出「0.9 ms 差距」，
 但因为两种测法不一致（profiler 下只差 0.18 ms）而被判未确立，写进了「不要重做」清单。
 这条路径绕开了那个僵局：它不是「再测一次 Triton 前向」，是换一个实现。
+
+---
+
+# 三个待确认项的离线结论
+
+## (b) LSE 底数：**自然对数**，已确认
+
+`op_tests/test_fmha_fwd_with_sink_asm.py` 里的参考实现（第 81 行）：
+
+```python
+lse = torch.log(denom) + max_total        # 自然对数
+```
+
+而第 237-243 行把它和内核返回的 lse **直接** `checkAllclose`（rtol/atol 1e-2），
+中间没有任何底数转换。所以这个 ASM 前向写的是自然对数 LSE，
+**与 turbo / aiter 在我们这条路上的约定一致**，可以直接喂给融合反向。
+
+## 我们的形状被支持，且会选中因果那个内核
+
+host 侧的检查只有：bf16、4 维、`stride(-1)==1`、`q_head_num % kv_head_num == 0`、
+`head_dim ∈ {64,128}`、`v_head_dim == qk_head_dim`。**没有 seqlen 的整除限制。**
+我们的 `b4 s8192 hq32 hkv8 d128`（gqa=4）全部满足。
+
+内核选择（`get_heuristic_kernel_fmha_fwd_bf16`）只按 `dtype/hdim_q/hdim_v/mask` 匹配，
+所以 `is_causal=True` → `bf16,128,128,mask=1` → `fmha_bf16_pertokenBf16_hd128_128x256_mask.co`。
+（注意测试只覆盖了 `hk=4`（gqa=8），我们是 gqa=4——约束上没问题，但**没有被测过**。）
+
+## (a) JIT 构建：风险比想象的小，但有一个**新的、更麻烦的阻塞**
+
+`optCompilerConfig.json:1341` 显示这个模块只有**一个源文件**
+（`py_itfs_cu/asm_fmha_fwd_with_sink.cu`）且 `-DENABLE_CK=0`，不牵扯 CK。
+镜像里 `hipcc` 存在（`/opt/venv/bin/hipcc`），但模块**没有预编译**
+（只有 `module_aiter_core.so` 是现成的）。所以首次调用会编一个文件，量级是秒不是分钟。
+
+**但是**：尝试离线预编译时发现了一个会在明天同样发作的问题——
+
+```
+import aiter.ops.mha
+  -> aiter/ops/triton/gluon/pa_decode_gluon.py:12
+  -> ModuleNotFoundError: No module named 'jax'
+```
+
+`aiter.ops.mha` 的导入链会拉进一个 gluon 模块，而它无条件 `import jax`。
+今天 harness 用的是 `aiter.ops.triton...`，走的是另一条链，所以没碰到。
+**明天要用 T7 的 Python 入口，先得解决这个**：装 jax，或者绕开 `aiter.ops.mha`
+直接走 ctypes 入口（`module_fmha_fwd_with_sink_asm` 是 `ffi_type="ctypes"`，
+本来就不依赖 torch 扩展）。
+
+另外，离线预编译这条路本身走不通：`aiter` 导入时要靠 `rocminfo` 探测架构，
+`GPU_ARCHS` 只覆盖 `get_gfx_custom_op_core()`，**`get_gfx_runtime()` 没有覆盖开关**。
+（可以用一个打印 `gfx1250` 的 `rocminfo` 桩绕过，已验证能过架构检测这一关。）

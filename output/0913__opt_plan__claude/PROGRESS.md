@@ -116,9 +116,17 @@ GPU 数量和占用进程改读 `/sys/class/kfd/`（纯读，不会阻塞在驱�
       不用像 T2 那样手写 launcher。三点恰好对上：**布局就是 bshd**（我们的布局）、
       **`is_causal` 是参数**、**`return_lse` 给出 `[B,Hq,Sq]` fp32**——
       正是融合反向和 `asm_backward()` 要的平铺 LSE。ASM 前向+ASM 反向可直接串起来。
-      **上卡前先确认三件事**：(a) `@compile_ops` 首次调用会 JIT 编 C++ 模块，需要 hipcc
-      （这是它唯一比 T2 脆的地方）；(b) **LSE 底数约定未确认**，错了不报错只错数值；
-      (c) LSE 缓冲区总被写，`return_lse=False` 不省事。
+      **三个待确认项已离线解决两个**：(b) **LSE 是自然对数**（aiter 自己的测试用
+      `torch.log(denom)+max_total` 做参考并直接 allclose，无底数转换）——与我们的约定一致，
+      可直接喂融合反向；(c) LSE 缓冲区总被写，`return_lse=False` 不省事。
+      形状也确认支持（约束只有 bf16 / 4 维 / `stride(-1)==1` / `hq%hkv==0` /
+      `head_dim∈{64,128}`，**无 seqlen 整除限制**），且 `is_causal=True` 会选中
+      `..._mask.co`。**但注意 aiter 的测试只覆盖 gqa=8，我们是 gqa=4，没被测过。**
+      (a) JIT 只编一个源文件、`-DENABLE_CK=0`、镜像里有 hipcc，量级是秒。
+      **但发现一个新阻塞，明天会直接撞上**：`import aiter.ops.mha` 的导入链会拉进
+      `aiter/ops/triton/gluon/pa_decode_gluon.py`，它无条件 `import jax` 而镜像里没有 jax。
+      今天 harness 走 `aiter.ops.triton...` 是另一条链所以没碰到。
+      **先装 jax 或绕开 `aiter.ops.mha` 直接用 ctypes 入口**（它本来就是 `ffi_type="ctypes"`）。
 - [ ] **T5. 非因果 / varlen / sink 覆盖。** 融合内核支持 sink 但 dsink 没接；
       varlen 在 gfx1250 上仍无 Triton 路径。
 - [ ] **T6. HipKittens udna1。** 仅在 Triton 撞到天花板后启动。见 `phase2/PLAN-4GPU-TOMORROW.md`。
