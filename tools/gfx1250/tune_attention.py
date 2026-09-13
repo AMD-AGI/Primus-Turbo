@@ -271,6 +271,12 @@ def main() -> int:
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--sqnr-min", type=float, default=50.0)
+    ap.add_argument("--determinism-reps", type=int, default=0,
+                    help="run fwd+bwd N times in-process and compare every output BITWISE "
+                         "against rep 0. Determinism needs no fp32 reference -- dropping it "
+                         "makes a rep ~100x cheaper, which is what makes a >=500-rep study "
+                         "practical. Catches both a silent corruption (a rep that differs) "
+                         "and a non-deterministic accumulation (a tensor that never settles).")
     ap.add_argument("--correctness-only", action="store_true",
                     help="run the SQNR check and skip timing. For race characterisation: "
                          "repeat this many times and count failures. An intermittent wrong "
@@ -347,6 +353,39 @@ def main() -> int:
                 result["wall_s"] = time.time() - result["wall_start"]
                 print(json.dumps(result))
                 return 2
+
+        if args.determinism_reps:
+            # Bitwise, not SQNR: a tensor that is merely "close" run to run is already
+            # non-deterministic, and SQNR against a reference cannot distinguish "this
+            # kernel wobbles" from "this kernel is slightly inaccurate".
+            ref = None
+            mismatches = {"out": 0, "dq": 0, "dk": 0, "dv": 0}
+            nan_reps = 0
+            for rep in range(args.determinism_reps):
+                o = flash_attn_func(q, k, v, causal=causal)
+                o.backward(do)
+                got = {"out": o.detach().clone(), "dq": q.grad.clone(),
+                       "dk": k.grad.clone(), "dv": v.grad.clone()}
+                q.grad = k.grad = v.grad = None
+                if any(not torch.isfinite(t).all() for t in got.values()):
+                    nan_reps += 1
+                if ref is None:
+                    ref = got
+                    continue
+                for name, t in got.items():
+                    if not torch.equal(t, ref[name]):
+                        mismatches[name] += 1
+                del got
+            result["determinism"] = {
+                "reps": args.determinism_reps,
+                "bitwise_mismatch_reps": mismatches,
+                "nonfinite_reps": nan_reps,
+                "deterministic": sum(mismatches.values()) == 0 and nan_reps == 0,
+            }
+            result["ok"] = True
+            result["wall_s"] = time.time() - result["wall_start"]
+            print(json.dumps(result))
+            return 0 if result["determinism"]["deterministic"] else 3
 
         if args.correctness_only:
             result["ok"] = True
