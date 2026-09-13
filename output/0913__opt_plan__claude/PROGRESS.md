@@ -4,7 +4,7 @@
 **GPU 忙不是停下的理由 —— GPU 跑测量时，CPU 侧永远有代码/文档/下一批可以推进。**
 **永远不要以「等待」结束回合。等待前先确认：有没有一件不依赖那个等待的事可以做？**
 
-最后更新：2026-09-13 12:58 UTC
+最后更新：2026-09-13 13:22 UTC
 
 ---
 
@@ -34,10 +34,14 @@ BLK_SLICE_FACTOR=1`，前向 `num_stages=2`。已接进 dispatcher，按 `seqlen
 - [>] **T2.（进行中） 用 wq3 的密集数据校准门控阈值。** 现在 `_MIN_SEQLEN_FOR_FUSED = 2048` 是从
       s=1024/4096 两点外推的。wq3 有 s=1024/2048/4096/8192/16384 × N1∈{32,64,128,256}，
       能定出真正的交叉点。可能需要按 seqlen 分档选 N1，而不是单一阈值。
-- [ ] **T3. 前向那 0.9 ms。** turbo 4.15 vs aiter 3.26，两个都是 Triton。配置已扫遍
-      （num_stages 2/3/4、num_warps 1/2/4/8、PRE_LOAD_V）都不动 → **是结构差异**。
-      下一步：profiler 对比两个前向的内核构成，判断要不要也 vendor 前向。
-- [>] **T4. vendored 与纯 aiter 的 1.85 ms 差**（反向 20.27 vs 18.42）。**四个假设已排除**：
+- [x] **T3. 前向那 0.9 ms —— 很可能是我的测量假象，不是真实差距。**
+      profiler 下两个前向内核只差 **0.18 ms**（turbo `attn_fwd` 4.219 vs aiter 4.035），
+      而 harness 报 0.90 ms。两种方法论不一致 ⇒ **在两种方法下复现之前，不要去追它**。
+      差别：harness 每次测量前 flush L2、单次冷测；profiler 连测 10 次热流水。
+      顺带排除：**backend resolve 只要 0.002 ms/call**，不是瓶颈（原本的嫌疑之一）。
+      host 侧总开销 0.657 ms/call（占 wall 13%），其中 CPU enqueue 仅 0.258 ms。
+      结论：turbo 前向内核本身并不比 aiter 差多少，**不需要 vendor 前向**。
+- [ ] **T4. vendored 与纯 aiter 的 1.85 ms 差**（反向 20.27 vs 18.42）。**四个假设已排除**：
       - ❌ packed LSE gather —— 实测 **0.018 ms（0.08%）**，不是它
       - ❌ 配置不同 —— vendored 默认就是冠军配置（N1=256, BSF=1），已核对源码
       - ❌ 张量布局不同 —— out/lse 的 shape/dtype/stride/contiguous 逐项相同
