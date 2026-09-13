@@ -11,9 +11,23 @@ LEDGER=${LEDGER:-/tmp/forever.jsonl}; touch "$LEDGER"
 H=tools/gfx1250/tune_attention.py
 export PYTHONPATH=/home/lihuzhan/code/aiter-src
 
+# Graceful stop. Taking an exclusive measurement window by pkill -9 on this queue kills a
+# process with work in flight on the GPU, and doing that repeatedly is a plausible
+# contributor to the wedge on 2026-09-13 (see phase2/INCIDENT-2026-09-13-wedge.md).
+# Touch $STOP_FILE instead: the loop notices BETWEEN candidates, so nothing is killed
+# mid-kernel. Remove the file and relaunch to resume -- the ledger makes it idempotent.
+STOP_FILE=${STOP_FILE:-/tmp/wq.stop}
+stop_requested(){ [ -f "$STOP_FILE" ]; }
+wait_if_stopped(){
+  while stop_requested; do
+    echo "{\"paused\":1,\"t\":$(date +%s)}" >> "$LEDGER"
+    sleep 10
+  done
+}
+
 d(){ grep -qF "\"tag\":\"$1\"" "$LEDGER" 2>/dev/null; }
 health(){ dmesg 2>/dev/null|tail -60|grep -qE 'MES\(|GPU Hang|wait for reset ack' && return 1||return 0; }
-run(){ local t="$1";shift; d "$t"&&return 0
+run(){ local t="$1";shift; wait_if_stopped; d "$t"&&return 0
   health||{ echo "{\"tag\":\"$t\",\"halt\":\"dmesg fault\",\"t\":$(date +%s)}">>"$LEDGER"; sleep 300; return 0; }
   local o;o=$(timeout 1200 python3 $H "$@" 2>/dev/null|tail -1)
   case "$o" in '{'*) echo "{\"tag\":\"$t\",\"r\":$o}">>"$LEDGER";; *) echo "{\"tag\":\"$t\",\"r\":null}">>"$LEDGER";; esac; }
