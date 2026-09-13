@@ -8,6 +8,13 @@
 
 ---
 
+## ⚠ 硬件状态：卡已 wedge（2026-09-13 ~13:30 UTC）
+
+**需要重启主机**，重启后必须 `sudo modprobe amdgpu`（本节点内核参数 blacklist 了它）。
+详见 `phase2/INCIDENT-2026-09-13-wedge.md`。
+**诊断 wedge 时只能用带 timeout 的 dmesg** —— `ps ... wchan`、`rocm-smi`、以及任何遍历
+设备/进程状态的命令都会挂住。
+
 ## 当前状态
 
 | 项目 | 值 |

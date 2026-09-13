@@ -1,0 +1,997 @@
+<title>MI455X 注意力优化作战图</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap">
+<style>
+:root{
+  --paper:#F4F6F7; --surface:#FFFFFF; --surface-2:#EDF1F2;
+  --ink:#15191D; --ink-2:#3B454E; --muted:#66727C; --line:#DCE2E5;
+  --accent:#0C6A6C; --accent-2:#0A8B8E; --accent-wash:#DCECEC;
+  --critical:#A4301A; --critical-wash:#F6E2DE;
+  --warn:#7F5A00; --warn-wash:#F7ECD4;
+  --good:#1B6639; --good-wash:#DFEEE4;
+  --shadow:0 1px 2px rgba(21,25,29,.06),0 6px 18px rgba(21,25,29,.05);
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --paper:#0F1316; --surface:#171C20; --surface-2:#1E252A;
+    --ink:#E5E9EB; --ink-2:#BCC6CC; --muted:#8B979F; --line:#2A3238;
+    --accent:#4FB2B4; --accent-2:#6FC9CB; --accent-wash:#12312F;
+    --critical:#E08573; --critical-wash:#3A211B;
+    --warn:#D6A94A; --warn-wash:#33280F;
+    --good:#66B888; --good-wash:#15301F;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 6px 18px rgba(0,0,0,.3);
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#0F1316; --surface:#171C20; --surface-2:#1E252A;
+  --ink:#E5E9EB; --ink-2:#BCC6CC; --muted:#8B979F; --line:#2A3238;
+  --accent:#4FB2B4; --accent-2:#6FC9CB; --accent-wash:#12312F;
+  --critical:#E08573; --critical-wash:#3A211B;
+  --warn:#D6A94A; --warn-wash:#33280F;
+  --good:#66B888; --good-wash:#15301F;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 6px 18px rgba(0,0,0,.3);
+}
+*{box-sizing:border-box}
+body{
+  background:var(--paper); color:var(--ink);
+  font-family:"IBM Plex Sans","Noto Sans SC",system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+  font-size:16px; line-height:1.75; margin:0;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:940px; margin:0 auto; padding-inline:20px; padding-block:0 96px}
+code,.mono,.num{font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace}
+.num{font-variant-numeric:tabular-nums}
+
+/* ---- masthead ---- */
+header.mast{border-bottom:1px solid var(--line); padding-block:56px 32px; margin-bottom:48px}
+.eyebrow{font-family:"IBM Plex Mono",monospace; font-size:11.5px; letter-spacing:.16em;
+  text-transform:uppercase; color:var(--accent); margin:0 0 18px}
+h1{font-size:clamp(30px,5.2vw,46px); line-height:1.14; font-weight:700; margin:0 0 20px;
+  letter-spacing:-.02em; text-wrap:balance}
+.standfirst{font-size:19px; line-height:1.65; color:var(--ink-2); max-width:64ch; margin:0}
+.mast-meta{display:flex; flex-wrap:wrap; gap:10px 28px; margin-top:28px;
+  font-size:13px; color:var(--muted); font-family:"IBM Plex Mono",monospace}
+.mast-meta b{color:var(--ink-2); font-weight:500}
+
+/* ---- sections ---- */
+section{margin-bottom:64px; scroll-margin-top:20px}
+.sec-head{display:flex; align-items:baseline; gap:14px; margin-bottom:8px;
+  padding-bottom:12px; border-bottom:2px solid var(--ink)}
+.sec-n{font-family:"IBM Plex Mono",monospace; font-size:13px; font-weight:600;
+  color:var(--accent); letter-spacing:.04em}
+h2{font-size:26px; font-weight:600; margin:0; letter-spacing:-.012em; text-wrap:balance}
+h3{font-size:18px; font-weight:600; margin:36px 0 12px; letter-spacing:-.008em}
+p{margin:0 0 16px; max-width:68ch}
+ul,ol{max-width:68ch; padding-left:22px; margin:0 0 16px}
+li{margin-bottom:9px}
+strong{font-weight:600}
+a{color:var(--accent); text-decoration-thickness:1px; text-underline-offset:2px}
+
+/* ---- evidence tags: the doc's core structural device ---- */
+.ev{display:inline-flex; align-items:center; gap:5px; font-family:"IBM Plex Mono",monospace;
+  font-size:10.5px; font-weight:500; letter-spacing:.06em; padding:2px 7px;
+  border-radius:3px; vertical-align:2px; white-space:nowrap}
+.ev-m{background:var(--good-wash); color:var(--good)}
+.ev-d{background:var(--warn-wash); color:var(--warn)}
+.ev-q{background:var(--critical-wash); color:var(--critical)}
+.ev-legend{display:flex; flex-wrap:wrap; gap:18px; padding:16px 18px; background:var(--surface-2);
+  border-radius:6px; font-size:13.5px; color:var(--ink-2); margin-bottom:40px}
+
+/* ---- callouts ---- */
+.callout{border-left:3px solid var(--accent); background:var(--surface);
+  padding:18px 22px; border-radius:0 6px 6px 0; margin:0 0 22px; box-shadow:var(--shadow)}
+.callout.bad{border-left-color:var(--critical)}
+.callout.warnc{border-left-color:var(--warn)}
+.callout h4{margin:0 0 8px; font-size:15.5px; font-weight:600}
+.callout p:last-child{margin-bottom:0}
+
+/* ---- tables ---- */
+.tscroll{overflow-x:auto; margin:0 0 22px; border:1px solid var(--line); border-radius:6px;
+  background:var(--surface)}
+table{border-collapse:collapse; width:100%; font-size:14px; min-width:520px}
+th,td{padding:11px 14px; text-align:left; border-bottom:1px solid var(--line); vertical-align:top}
+thead th{background:var(--surface-2); font-weight:600; font-size:12px; letter-spacing:.05em;
+  text-transform:uppercase; color:var(--muted); white-space:nowrap}
+tbody tr:last-child td{border-bottom:none}
+td.n,th.n{text-align:right; font-family:"IBM Plex Mono",monospace; font-variant-numeric:tabular-nums;
+  white-space:nowrap}
+tr.hl td{background:var(--accent-wash)}
+tr.dim td{color:var(--muted)}
+
+/* ---- pills ---- */
+.pill{display:inline-block; font-size:11.5px; font-weight:600; padding:2px 9px;
+  border-radius:99px; white-space:nowrap; font-family:"IBM Plex Sans","Noto Sans SC",sans-serif}
+.p-good{background:var(--good-wash); color:var(--good)}
+.p-warn{background:var(--warn-wash); color:var(--warn)}
+.p-bad{background:var(--critical-wash); color:var(--critical)}
+
+/* ---- bar chart (single series, magnitude) ---- */
+.bars{margin:0 0 8px; display:flex; flex-direction:column; gap:10px}
+.bar-row{display:grid; grid-template-columns:minmax(130px,180px) 1fr auto; gap:14px; align-items:center}
+.bar-lab{font-family:"IBM Plex Mono",monospace; font-size:12.5px; color:var(--ink-2);
+  overflow-wrap:anywhere}
+.bar-track{background:var(--surface-2); border-radius:4px; height:22px; position:relative}
+.bar-fill{background:var(--accent); height:100%; border-radius:0 4px 4px 0; min-width:3px}
+.bar-fill.muted{background:var(--muted)}
+.bar-fill.crit{background:var(--critical)}
+.bar-val{font-family:"IBM Plex Mono",monospace; font-size:12.5px; font-variant-numeric:tabular-nums;
+  color:var(--ink); white-space:nowrap}
+figure{margin:0 0 24px}
+figcaption{font-size:13px; color:var(--muted); margin-top:12px; max-width:68ch}
+
+/* ---- phase blocks ---- */
+.phase{background:var(--surface); border:1px solid var(--line); border-radius:8px;
+  padding:22px 24px; margin-bottom:18px; box-shadow:var(--shadow)}
+.phase-top{display:flex; flex-wrap:wrap; align-items:center; gap:12px; margin-bottom:6px}
+.phase-id{font-family:"IBM Plex Mono",monospace; font-size:12px; font-weight:600;
+  background:var(--ink); color:var(--paper); padding:3px 9px; border-radius:4px}
+.phase h3{margin:0; font-size:18px}
+.phase .gate{font-size:12px; color:var(--muted); font-family:"IBM Plex Mono",monospace}
+.phase ul{margin-top:12px; margin-bottom:0}
+
+/* ---- kv grid ---- */
+.kv{display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:1px;
+  background:var(--line); border:1px solid var(--line); border-radius:6px; overflow:hidden; margin-bottom:22px}
+.kv > div{background:var(--surface); padding:14px 16px}
+.kv dt{font-size:11.5px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted);
+  margin:0 0 5px; font-weight:500}
+.kv dd{margin:0; font-family:"IBM Plex Mono",monospace; font-size:15px; font-weight:500;
+  font-variant-numeric:tabular-nums}
+
+footer{border-top:1px solid var(--line); padding-top:24px; font-size:13px; color:var(--muted)}
+@media (max-width:560px){
+  .bar-row{grid-template-columns:1fr auto; }
+  .bar-track{grid-column:1 / -1; order:3}
+}
+</style>
+
+<div class="wrap">
+
+<header class="mast">
+  <p class="eyebrow">Primus-Turbo · gfx1250 · 优化作战图</p>
+  <h1>MI455X 上的注意力，为什么慢，以及我们打算怎么办</h1>
+  <p class="standfirst">
+    MI455X 跑 Llama-3.1-8B BF16，端到端比 MI355X 慢约 7%——但它的矩阵乘法其实已经<em>快了 1.51 倍</em>。
+    差距全部落在注意力这一条软件路径上。这份文档解释这件事到底是怎么回事，纠正 JIRA 里三处与代码和实测不符的判断，
+    并给出一套分阶段、可自动跑的优化计划。
+  </p>
+  <div class="mast-meta">
+    <span><b>日期</b> 2026-09-13（含实测更新）</span>
+    <span><b>目标芯片</b> MI455X / gfx1250</span>
+    <span><b>负载</b> Llama-3.1-8B BF16 · seq 8192 · MBS=GBS=4</span>
+    <span><b>主线后端</b> Triton</span>
+  </div>
+</header>
+
+<div class="ev-legend">
+  <span><span class="ev ev-m">实测</span> 有日志或数据文件可查，本文给出出处</span>
+  <span><span class="ev ev-d">推导</span> 由实测数字算出，公式在文中</span>
+  <span><span class="ev ev-q">存疑</span> 两个来源互相矛盾，尚未定论</span>
+</div>
+
+<section>
+  <div class="sec-head"><span class="sec-n">00</span><h2>实测结果（2026-09-13 更新）</h2></div>
+  <p>
+    这份文档最初是<strong>拿到机器之前</strong>写的计划。现在已经在真卡上跑过了，
+    下面是实测数字，后面各节的分析基本都被验证，但有三处被推翻——已在文中标注。
+  </p>
+  <p>
+    <strong>另外请接着读第 00B 节。</strong>后来补做的 Round 0 对照实验给出了一个不舒服但更重要的结论：
+    我们调优后的 turbo 仍然<strong>比 aiter 现成的后端慢</strong>（36.4 vs 31.2 ms），
+    原因是结构性的。下面这几个数字仍然正确，但"1.66× 就够了"这个印象不对。
+  </p>
+
+  <div class="kv">
+    <div><dt>出厂配置</dt><dd>59.3 ms</dd></div>
+    <div><dt>调优后</dt><dd>35.7 ms</dd></div>
+    <div><dt>提升</dt><dd>1.66×</dd></div>
+    <div><dt>对照 flex</dt><dd>31.3 ms</dd></div>
+  </div>
+
+  <figure>
+    <div class="bars">
+      <div class="bar-row"><span class="bar-lab">flex（对照）</span>
+        <span class="bar-track"><span class="bar-fill muted" style="width:52.8%"></span></span>
+        <span class="bar-val">31.34 ms</span></div>
+      <div class="bar-row"><span class="bar-lab">调优后 turbo:TRITON</span>
+        <span class="bar-track"><span class="bar-fill" style="width:60.2%"></span></span>
+        <span class="bar-val">35.70 ms</span></div>
+      <div class="bar-row"><span class="bar-lab">出厂 turbo:TRITON</span>
+        <span class="bar-track"><span class="bar-fill crit" style="width:100%"></span></span>
+        <span class="bar-val">59.32 ms</span></div>
+    </div>
+    <figcaption>
+      一次前向+反向，b=4 s=8192，限频态（1100 MHz）。<span class="ev ev-m">实测</span>
+      <strong>前向已经反超 flex</strong>（4.16 vs 7.51 ms）；剩下的差距全在反向（31.5 vs 23.8 ms）。
+    </figcaption>
+  </figure>
+
+  <h3>只改了两个整数</h3>
+  <div class="tscroll">
+  <table>
+    <thead><tr><th>旋钮</th><th class="n">改动</th><th class="n">收益</th><th>数值精度</th></tr></thead>
+    <tbody>
+      <tr><td>前向 <code>num_stages</code></td><td class="n">1 → 2</td><td class="n"><b>2.4–2.6×</b>（仅前向）</td><td>逐位相同</td></tr>
+      <tr><td>反向 <code>num_warps</code></td><td class="n">4 → 2</td><td class="n"><b>1.54×</b>（仅反向）</td><td>不变</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="callout">
+    <h4>三个悬案，两个已结</h4>
+    <p>
+      <strong>① 220.6 vs 131.7 TFLOP/s 之谜 —— 是限频。</strong>
+      实测 b=2 是 129.4 TFLOP/s，b=4 是 127.8——<strong>batch 根本不影响 TFLOP/s</strong>，
+      这条假设死了。剩下的 1.70× 差距正好等于 VR 限频比。所以 c1325c7e 是在没限频的卡上测的。
+      重启<strong>没有</strong>解除限频，<code>MAX_CLK</code> 仍是 1100 MHz。
+    </p>
+    <p>
+      <strong>② JIRA 那个 <code>enable_gqa</code> 报错 —— 根因是缺 tensorboard。</strong>
+      patch runner 把依赖缺失<em>吞掉</em>当成"patch 没应用"，于是修调用点的补丁没生效。
+      装上之后 12/12 补丁全部应用成功。这是第三个与 JIRA 叙述不同的根因。
+    </p>
+    <p>
+      <strong>③ 端到端 tps —— 跑通了，但这台机器上测不出 attention。</strong>
+      turbo 245 tps vs flex 244 tps，<strong>两条路径差 0.4%</strong>——
+      说明打开 turbo <em>不是回归</em>，但也说明端到端瓶颈根本不在 attention。
+      根因见下。（另：<strong>这台机器此前从没跑通过一个 step</strong>，
+      三次历史运行 step 计数都是 0，所以本地原本就没有可回归的基线。）
+    </p>
+  </div>
+
+  <div class="callout bad">
+    <h4>端到端的真正瓶颈：这个镜像没有能用的 BLAS</h4>
+    <p>
+      排除法三步。<strong>先排除显存</strong>：开 activation checkpointing 后显存从
+      379.5 GiB 砍到 174.8 GiB，tps 反而从 245 变成 215（重算换显存，符号正确）——显存不是原因。
+    </p>
+    <p>
+      <strong>再测 GEMM</strong>（空闲卡，<code>rocm-smi</code> 确认无其它进程，bf16）：
+      8192³ 只有 <span class="num">27.4</span> TFLOP/s，几个真实训练形状都在 24–26 之间。
+    </p>
+    <p>
+      <strong>判定依据</strong>：同一张卡、同一次会话里，我们调优后的 attention 内核跑到
+      <span class="num">215</span> TFLOP/s，Phase 1 的 Triton GEMM 上限是
+      <span class="num">1002.7</span> TFLOP/s。
+      <strong>一个稠密 GEMM 比 flash-attention 慢 8 倍，这个方向本身就是反的</strong>——
+      attention 每个 FLOP 干的活更多，本该更慢。rocBLAS 离上限差约 37×。
+      而 hipBLASLt 的 gfx1250 库<strong>在镜像里根本不存在</strong>。
+    </p>
+    <p>
+      这一次性解释了全部现象：14 TFLOPS、133.7 秒/step、GPU 100% 占用却不做有用矩阵运算、
+      flex 和 turbo 只差 0.4%。也说明 <strong>JIRA 的 GEMM 数字和 19,795 tps 不可能来自这个镜像</strong>。
+      端到端验证需要一个 BLAS 能用的镜像——这是平台问题，和限频一起升级。
+    </p>
+  </div>
+
+  <div class="callout bad">
+    <h4>正确性门抓到了一个"又快又错"的配置</h4>
+    <p>
+      某个配置返回 <code>out 53.67 dB ✓、dq 52.24 dB ✓、dk −inf ✗、dv −inf ✗</code>——
+      输出和 dq <strong>完全正常</strong>，dk/dv 被毁掉。只看输出的检查会直接放过它。
+      这正是第 09 节所说"关键不是阈值，是覆盖面"的现实例证。
+      它<strong>不是必现的</strong>（75 次定向重复 0 次复现），所以是竞态而非配置错误，目前仍未定论。
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-n">00B</span><h2>Round 0 对照实验：我们自己的后端输了</h2></div>
+  <p>
+    第 08 节的计划里，Phase 1 的第一件事就是 Round 0 对照实验：把所有路径放进
+    <strong>同一个镜像、同一次会话、同一份 fp32 参考、同一个正确性门、同一个计时器</strong>里重测一遍。
+    实际执行时这一步<strong>被跳过了</strong>——直接去调 turbo 了。现在补做完，结论很直接：
+    <strong>调到最好的 turbo，仍然比 aiter 现成的后端慢。</strong>
+  </p>
+
+  <div class="tscroll">
+  <table>
+    <thead><tr>
+      <th>实现</th><th class="n">前向 ms</th><th class="n">反向 ms</th>
+      <th class="n">合计 ms</th><th class="n">TFLOP/s</th><th class="n">ms/step</th>
+    </tr></thead>
+    <tbody>
+      <tr class="hl"><td><b>aiter + 2 个整数</b></td><td class="n">3.260</td><td class="n">27.947</td><td class="n"><b>31.207</b></td><td class="n"><b>246.6</b></td><td class="n">999</td></tr>
+      <tr><td>torch flex（对照锚点）</td><td class="n">7.506</td><td class="n"><b>23.831</b></td><td class="n">31.337</td><td class="n">245.6</td><td class="n">1003</td></tr>
+      <tr><td>aiter 出厂配置</td><td class="n">6.676</td><td class="n">27.888</td><td class="n">34.565</td><td class="n">222.7</td><td class="n">1106</td></tr>
+      <tr><td><b>turbo 冠军配置（我们的）</b></td><td class="n">4.152</td><td class="n">32.252</td><td class="n">36.405</td><td class="n">211.4</td><td class="n">1165</td></tr>
+      <tr class="dim"><td>turbo 出厂配置</td><td class="n">10.673</td><td class="n">48.969</td><td class="n">59.642</td><td class="n">129.0</td><td class="n">1909</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <figure>
+    <div class="bars">
+      <div class="bar-row"><span class="bar-lab">aiter + 2 整数</span>
+        <span class="bar-track"><span class="bar-fill muted" style="width:52.3%"></span></span>
+        <span class="bar-val">31.21 ms</span></div>
+      <div class="bar-row"><span class="bar-lab">flex（对照）</span>
+        <span class="bar-track"><span class="bar-fill muted" style="width:52.5%"></span></span>
+        <span class="bar-val">31.34 ms</span></div>
+      <div class="bar-row"><span class="bar-lab">aiter 出厂配置</span>
+        <span class="bar-track"><span class="bar-fill muted" style="width:58.0%"></span></span>
+        <span class="bar-val">34.57 ms</span></div>
+      <div class="bar-row"><span class="bar-lab">turbo 冠军配置</span>
+        <span class="bar-track"><span class="bar-fill" style="width:61.0%"></span></span>
+        <span class="bar-val">36.41 ms</span></div>
+      <div class="bar-row"><span class="bar-lab">turbo 出厂配置</span>
+        <span class="bar-track"><span class="bar-fill crit" style="width:100%"></span></span>
+        <span class="bar-val">59.64 ms</span></div>
+    </div>
+    <figcaption>
+      同一次会话、同一形状、限频态（1100 MHz）。<span class="ev ev-m">实测</span>
+      参赛的四条路径在 out/dq/dk/dv <strong>四个张量上全部通过 SQNR 门</strong>，
+      没有"又快又错"的条目混进来。
+    </figcaption>
+  </figure>
+
+  <p>
+    把这张表老实读一遍：
+  </p>
+  <ul>
+    <li>我们调优后的 turbo（<span class="num">36.405</span> ms）<strong>比 aiter
+      原封不动的出厂后端还慢</strong>（<span class="num">34.565</span> ms，1.05×），
+      比同样加了两个整数的 aiter 慢 <strong>1.17×</strong>。</li>
+    <li>我们的<strong>前向确实很好</strong>：4.152 ms，比 flex 的 7.506 快 1.81×。
+      但仍比 aiter 调优后的 3.260 慢 1.27×。</li>
+    <li><strong>差距全部在反向：32.252 vs aiter 的 27.888 ms，1.16×。</strong></li>
+    <li>调优本身没白做——59.642 → 36.405 是 1.64×，和第 00 节的 1.66× 在噪声内一致。
+      它只是<strong>不足以赢</strong>。</li>
+  </ul>
+  <p>
+    校准一下噪声：冠军配置这次测 36.405 ms，第 00 节那次测 35.704 ms，相差 2.0%；
+    flex 两次都是 31.337 ms。<strong>3% 以内当噪声看，而 1.17× 远在噪声之外。</strong>
+  </p>
+
+  <div class="callout bad">
+    <h4>顺序错了，而且这个错误是有代价的</h4>
+    <p>
+      计划里白纸黑字写着 Round 0 是 Phase 1 的<em>第一步</em>，还写着它是"整个计划里性价比最高的一次探针"。
+      实际执行时它被放到了最后。<strong>这是个错误，代价是一整段工作用在了错的轴上。</strong>
+    </p>
+    <p>
+      如果第一天就做了对照实验，那两个整数照样会被找到（它们是可迁移的），
+      但花在 turbo 调度旋钮上的那些轮次——<code>waves_per_eu</code> 扫描、跳掩码改写、
+      收紧 <code>lo</code> 边界、折叠 <code>log_p_scale</code>、寄存器溢出排查——
+      本该花在真正区分两个后端的那一件事上（见下）。<strong>那些实验的结果无一例外是"持平或更差"。</strong>
+    </p>
+    <p>
+      这条经验值得写进流程：<strong>在确认"这是该调的实现"之前，不要开始调它。</strong>
+      一次对照实验只要一个会话，却能把下游全部重新定标。
+    </p>
+  </div>
+
+  <h3>为什么 aiter 的反向更快：块尺寸是不对称的</h3>
+  <p>
+    这不是调度差异，是<strong>切块方式</strong>的差异——而 turbo 目前<em>表达不了</em>这种切法。
+  </p>
+  <div class="tscroll">
+  <table>
+    <thead><tr><th></th><th>turbo 反向</th><th>aiter 反向</th></tr></thead>
+    <tbody>
+      <tr><td>dkdv 的块</td><td><code>FIXED_BLOCK_M = FIXED_BLOCK_N = 64</code></td><td><code>BLOCK_M1=32</code>，<code>BLOCK_N1=128</code></td></tr>
+      <tr><td>dq 的块</td><td>同样这两个常量</td><td><code>BLOCK_M2=128</code>，<code>BLOCK_N2=32</code></td></tr>
+      <tr class="hl"><td>形状</td><td><b>对称</b>，模块级硬编码常量</td><td><b>不对称</b>，且成对：<code>N1==M2</code>、<code>M1==N2</code></td></tr>
+      <tr><td>其他</td><td>—</td><td><code>waves_per_eu=1</code>、<code>BLK_SLICE_FACTOR=2</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>
+    aiter 的反向两半互为转置：dkdv 那一半用<strong>短的 query 块（32）配长的 key 块（128）</strong>，
+    dq 那一半反过来，<strong>长 query（128）配短 key（32）</strong>。
+    两半各自都在自己需要的那根轴上拿到了长块。而 turbo 两半共用一个 64×64 的对称块，
+    <strong>结果是两半都不合身</strong>。
+    那个成对关系（<code>N1==M2</code>、<code>M1==N2</code>）正是第 09 节那个"改 <code>BLOCK_N1</code>
+    就把 dq 算错"陷阱的同一根绳子——两半共用一个启动网格。
+  </p>
+
+  <div class="callout warnc">
+    <h4>turbo 不能简单地把 64 改成 128：那个数字是一份跨内核的接口约定</h4>
+    <p>
+      dkdv 的 <code>BLOCK_M</code> <strong>不是旋钮，是 ABI</strong>。它被四段代码同时绑住：
+      <code>attn_fwd</code> 把 LSE 写在偏移 <code>m*BLOCK_M*2</code>；
+      <code>_bwd_preprocess_use_o</code> 把 delta 写在同一个块的 <code>+BLOCK_M</code> 处；
+      host 侧的 <code>_lse_delta_views</code> 按这个布局把两份视图还原出来；
+      <code>_bwd_kernel_dkdv</code> 读 <code>2*start_m + tl.arange(0, 2*BLOCK_M)</code>
+      再用两次 <code>tl.gather</code> 拆开。
+    </p>
+    <p>
+      单独改这个常量<strong>不会崩</strong>——它会把 lse 行和 delta 行接在一起返回，
+      产出<em>平滑地错掉</em>的 dk/dv。只有四张量 SQNR 门能抓到。
+      <strong>把这套 ABI 解耦，就是目前正在做的工作</strong>，也是一切"照着 aiter 的形状试"的前提。
+    </p>
+  </div>
+
+  <p>
+    <strong>解耦成功之后能拿到多少？</strong>纯算术，不是实测：turbo 的前向（4.152 ms）
+    加上 aiter 的反向耗时（27.888 ms）＝ <span class="num">32.04</span> ms／
+    <span class="num">240.2</span> TFLOP/s <span class="ev ev-d">推导</span>，
+    离 flex 和调优后的 aiter 都只差约 3%。
+    这就是这块奖品的诚实大小：<strong>追平，不是赢。</strong>
+  </p>
+
+  <div class="callout bad">
+    <h4>更正：316.1 TFLOP/s／24.347 ms 没能复现</h4>
+    <p>
+      第 06 节那张图里"aiter Triton +2 整数 = 24.35 ms"、以及第 07 节的 316.1 TFLOP/s，
+      来自更早一次 op-evolve 测量，一直被当作 aiter 的既定水平在用。
+      <strong>它复现不了。</strong>本次实测是 <span class="num">31.207</span> ms／
+      <span class="num">246.6</span> TFLOP/s。
+    </p>
+    <p>
+      差距<strong>全部在反向</strong>：前向当时约 3.272 ms，今天 3.260——精确复现；
+      反向当时 <span class="num">21.075</span> ms，今天 <span class="num">27.947</span>，
+      差 6.872 ms，正好等于总时间的差（6.860 ms）。
+    </p>
+    <p>
+      <strong>机制：上游 aiter 自己把反向重新调过了。</strong>那个旧数字来自另一个 aiter 版本。
+      两条证据：aiter 的<em>前向</em> <code>num_stages</code> 1→2 至今精确复现
+      （6.676 → 3.260，2.05×）；而 aiter 的<em>反向</em> <code>num_warps</code> 4→2
+      在今天的 aiter main 上<strong>已经完全没用了</strong>（27.888 → 27.947，是噪声）。
+      这个旋钮在旧版本上确实是真收益，上游后来把反向换到了一个已经把它吃掉的配置上。
+    </p>
+    <p>
+      <strong>处理办法：把 24.347 ms／316.1 TFLOP/s 从所有目标和对比里撤掉。</strong>
+      aiter 在这张卡、这个时钟下的当前水平是 31.207 ms／246.6 TFLOP/s，
+      任何由 316.1 推出来的阶梯数字都要重算。
+    </p>
+  </div>
+
+  <h3>这件事改变了什么，没改变什么</h3>
+  <p><strong>改变的：</strong></p>
+  <ul>
+    <li><strong>冠军配置照样落地。</strong>它比出厂默认快 1.64×，只改两个整数、不碰一行内核代码，
+      2,300 次调用逐位确定，端到端也不是回归。它只是<strong>不再是终点线</strong>。</li>
+    <li><strong>停止在 turbo 的调度旋钮上继续投轮次。</strong>已经榨干了：
+      <code>waves_per_eu</code> 只有 0 能用（2 和 4 直接掉到 54.9／104.4 ms），
+      反向 <code>num_stages</code>&gt;1 更差，三次源码改写的结果是 −9%／持平／持平，全部回滚。
+      "dkdv 寄存器溢出"这个头号假设也被推翻——<code>num_warps</code> 2／4／8 的溢出计数都是
+      <strong>0</strong>，只有 1 才溢出（512）。所以 dkdv 卡的是<strong>每个 program 的效率，不是寄存器</strong>。</li>
+    <li><strong>下一个工作项是 LSE/delta 的 ABI 解耦。</strong>反向后面所有事都排在它后面。</li>
+    <li><strong>目标阶梯要重新定标</strong>：turbo 反向的近期现实目标是 aiter 的 <strong>27.9 ms</strong>，
+      不是 flex 的 23.8 ms。顺便记一笔：<strong>flex 的反向仍然是这张卡上最快的</strong>，
+      比 aiter 还快 1.17×，目前没人能解释为什么。</li>
+    <li><strong>"在 gfx1250 上直接派发到 aiter 的 Triton 后端"现在是一个正经选项</strong>，
+      应该和"继续自研"放在一起算账。turbo 后端真正的价值一直是
+      "一条在 gfx1250 上前向反向都正确、而且我们能改的代码路径"——
+      这个价值不因输掉对照实验而消失，但它<strong>不是一条性能论据</strong>。</li>
+  </ul>
+  <p><strong>没改变的：</strong></p>
+  <ul>
+    <li><strong>端到端那个结果的含义一个字都没变。</strong>turbo 245 tps vs flex 244 tps
+      只说明<strong>打开 turbo 不是回归</strong>，仅此而已。在这个镜像上，整条注意力路径是
+      36.4 ms × 32 = 1.16 s，占 133.7 s 一个 step 的<strong>不到 1%</strong>；
+      瓶颈是没有能用的 BLAS（rocBLAS bf16 27.4 TFLOP/s 对 1002.7 的上限）。
+      <strong>端到端在这台机器上根本察觉不到 turbo 输掉了这次对照实验</strong>，两个方向都察觉不到。</li>
+    <li><strong>限频仍然压倒一切。</strong>上面每一个数字都是 1100 MHz 下测的，
+      而 2026-09-04 同一张卡能跑 1699–1703 MHz。这条平台工单的价值高于本节任何内核结论。</li>
+    <li>已被否掉的仍然否掉：<code>sequence_parallel=False</code> 是静默算错（只算 1/128 的梯度）、
+      XCD 重映射会更慢、FlyDSL 装不上且拒绝 G=4、AITER 的 CK fmha 是 CDNA 专用。</li>
+  </ul>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-n">01</span><h2>先把 attention 是什么讲清楚</h2></div>
+  <p>
+    如果你没写过 GPU kernel，下面这三句话足够读懂全文。
+  </p>
+  <p>
+    大模型每一层都要做一次<strong>注意力（attention）</strong>：让序列里每个词去"看"它前面所有的词，
+    算出该关注谁。序列长度是 8192，所以这是一个 8192 × 8192 的关系矩阵。
+    因为词只能看前面的（叫 <strong>causal，因果掩码</strong>），实际只用算一半。
+  </p>
+  <p>
+    朴素做法要把这个巨大矩阵完整存进显存，装不下。
+    <strong>Flash Attention</strong> 的办法是切成小块（tile），算一块丢一块，只保留累加结果。
+    所以"优化 flash attention"很大程度上就是<strong>选对块的大小、选对每块用多少线程、让搬数据和算数据重叠起来</strong>。
+    本文后面反复出现的 <code>BLOCK_M</code> / <code>BLOCK_N</code> / <code>num_warps</code> / <code>num_stages</code>
+    就是这四件事的旋钮。
+  </p>
+  <p>
+    训练比推理多一步：算完还要<strong>反向传播</strong>求梯度。反向的计算量大约是前向的 <span class="num">2.5</span> 倍，
+    实测在这张卡上占了注意力总时间的 <strong>73–76%</strong> <span class="ev ev-m">实测</span>。
+    <strong>所以这场优化的主战场是反向，不是前向。</strong>后面所有轮次安排都围绕这一点。
+  </p>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-n">02</span><h2>JIRA 里需要更正的三件事</h2></div>
+  <p>
+    原始 JIRA 的方向是对的——瓶颈确实在注意力。但具体归因有三处和代码、日志对不上，
+    而这三处恰好决定了我们该做什么。
+  </p>
+
+  <div class="callout bad">
+    <h4>更正一：patch 并没有"被跳过"，它是被应用之后崩了</h4>
+    <p>
+      JIRA 说 <code>turbo_attention</code> 补丁在 MI455X 上"Skipped（条件不满足）"。
+      但那个补丁的启用条件只检查两个配置开关，<strong>完全没有架构判断、没有 aiter 检测、没有 head_dim 检测</strong>
+      （<code>attention_patches.py:22-31</code>）。在默认配置下它在 MI455X 上<strong>是被正常应用的</strong>，
+      然后在第一个训练 step 死于 <code>ModuleNotFoundError: No module named 'aiter'</code>
+      <span class="ev ev-m">实测</span>。日志里那行 "⊘ Skipped" 来自后来有人手工加的
+      <code>use_turbo_attention: false</code>——那是<em>规避手段</em>，不是<em>原因</em>。
+    </p>
+    <p>
+      这条更正的后果很实际：JIRA 的第一条请求"在 gfx1250 上启用 AITER fmha"<strong>走不通</strong>。
+      aiter 的 fmha 反向落到 CK 库，而 CK 是 CDNA 专用的；在 gfx1250 上前向能过、
+      反向会在训练中途报 <code>invalid argument for fmha_bwd</code>。这不是配置问题，是库里就没有这个架构的内核。
+    </p>
+  </div>
+
+  <div class="callout bad">
+    <h4>更正二：今天打开 turbo_attention，是性能倒退 1.85 倍</h4>
+    <p>
+      同一形状、同一份 benchmark 日志里 <span class="ev ev-m">实测</span>：flex 走完一次前向+反向是
+      <span class="num">31.508</span> ms，而 turbo 的 Triton 后端要 <span class="num">58.424</span> ms。
+      新加的 gfx1250 Triton 后端（提交 <code>c1325c7e</code>）的价值是<strong>"终于有了一条在 gfx1250 上
+      前向反向都正确、而且我们能改的代码路径"</strong>，不是性能。它现在是我们的<em>落地点</em>，不是<em>起点</em>。
+    </p>
+  </div>
+
+  <div class="callout warnc">
+    <h4>更正三：那 245 ms 的 elementwise，换内核不会让它消失</h4>
+    <p>
+      JIRA 把 245 ms 的 elementwise（"dtype cast ×492"）算进注意力的差距里。但算术不支持：
+      benchmark 里 flex 一次前向+反向的全部 elementwise 开销是
+      <span class="num">0.399</span> / <span class="num">31.857</span> ms = <strong>1.25%</strong>，
+      折算到一个 step 约 <span class="num">12.8</span> ms，不是 245 ms，差了 19 倍 <span class="ev ev-d">推导</span>。
+    </p>
+    <p>
+      它实际上是<strong>模型层里没被融合的 RoPE 位置编码</strong>（<code>xq.float()</code> /
+      <code>view_as_complex</code> / <code>type_as</code>）加上 layout 转置——因为 MI455X 的复现配置里设了
+      <code>compile.enable: false</code>。预计其中 45–85 ms 能靠一个原生 BSHD 布局的后端顺手省掉，
+      剩下 160–200 ms 需要打开 torch.compile 或写一个融合 RoPE，<strong>那是另一张单子</strong>。
+      注意：原始 trace 文件不在仓库里，"492" 这个数字在磁盘上搜不到，所以这个拆分是推导，不是实测。
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-n">03</span><h2>硬件现实：这张卡被限频了</h2></div>
+  <p>
+    这是整份计划里<strong>最重要、也最容易被忽略</strong>的一条，它决定了目标该定在哪。
+  </p>
+  <p>
+    同事的前期探测（op-evolve Phase 1）实测发现：这张卡的 <code>amdgpu</code> 在每次启动时都会打印
+    <code>GPU is throttled, expect performance decrease. VR.</code>，时钟表被截断到只剩两档
+    500 MHz 和 1100 MHz。<strong>同一张卡在 2026-09-04 还能跑到 1699–1703 MHz</strong>，
+    现在最高 1100 MHz——差约 <strong>1.65 倍</strong> <span class="ev ev-m">实测</span>。
+  </p>
+  <div class="kv">
+    <div><dt>实测 BF16 算力上限</dt><dd>1002.7 TFLOP/s</dd></div>
+    <div><dt>实测 HBM 带宽</dt><dd>6.46 TB/s</dd></div>
+    <div><dt>注意力负载下时钟</dt><dd>1067 MHz</dd></div>
+    <div><dt>注意力负载下功耗</dt><dd>1227 W / 2500 W</dd></div>
+  </div>
+  <p>
+    功耗只用到 49%，GFX 活动率却是 100%——说明<strong>这张卡跑注意力时是被时钟卡住的，不是被功耗卡住的</strong>。
+    这有一个直接推论：延迟隐藏类的优化（让搬数据和计算重叠）在这里应当<strong>按面值计分</strong>，
+    不需要像在 CDNA 上那样打折扣。
+  </p>
+  <div class="callout bad">
+    <h4>于是：JIRA 的 30k tps 目标在当前时钟下数学上不可达</h4>
+    <p>
+      30,000 tps 意味着注意力路径要从 755 ms 压到 192 ms，等效
+      <span class="num">246.29</span> TFLOP ÷ 0.192 s = <strong>1282.8 TFLOP/s</strong>
+      <span class="ev ev-d">推导</span>。
+      而实测算力上限是 1002.7 TFLOP/s——目标是上限的 <strong>128%</strong>。
+      一个注意力内核不可能超过同一块硅片同一时钟下稠密矩阵乘法的上限。
+    </p>
+    <p>
+      即使限频解除（推断上限 ~1580–1690 TFLOP/s），仍需要 76–81% 的峰值利用率，
+      而 MI355X 在同样负载上也只做到 31%。所以我们重新标定了目标，见下一节。
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-n">04</span><h2>重新标定的目标阶梯</h2></div>
+  <p>
+    用实测的算力上限重算之后，诚实的目标长这样。<strong>M3 是本计划的主目标。</strong>
+  </p>
+  <div class="tscroll">
+  <table>
+    <thead><tr>
+      <th>里程碑</th><th class="n">注意力 ms/step</th><th class="n">等效 TFLOP/s</th>
+      <th class="n">E2E tps</th><th class="n">vs MI355X</th><th>判断</th>
+    </tr></thead>
+    <tbody>
+      <tr class="dim"><td>现状（flex）</td><td class="n">755</td><td class="n">326</td><td class="n">19,795</td><td class="n">93%</td><td>基线</td></tr>
+      <tr><td><b>M1</b> 套用已知的两个整数</td><td class="n">779</td><td class="n">316</td><td class="n">~19,700</td><td class="n">92%</td><td><span class="pill p-warn">几乎白拿</span> 但限频下不涨</td></tr>
+      <tr class="hl"><td><b>M2</b> 完成调优，仍限频</td><td class="n">1142</td><td class="n">216</td><td class="n">—</td><td class="n">—</td><td><span class="pill p-good">已实测</span> 35.7 ms/call，比预估保守</td></tr>
+      <tr class="hl"><td><b>M3</b> 调优 + 解除限频</td><td class="n">~340</td><td class="n">725</td><td class="n">~25,900</td><td class="n">121%</td><td><span class="pill p-good">主目标</span></td></tr>
+      <tr><td>JIRA 原目标</td><td class="n">192</td><td class="n">1,283</td><td class="n">30,000</td><td class="n">140%</td><td><span class="pill p-bad">不可达</span> 128% 的算力上限</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="callout">
+    <h4>需要写进 ticket 的一句话</h4>
+    <p>
+      <strong>解除限频这一件事，价值约 1.65 倍，高于任何内核工作。</strong>
+      即使内核做到完美，不解除限频也拿不到与 MI355X 的平手。这应当作为一条独立的平台工单，
+      与内核优化并行推进，而不是等内核做完再说。
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-n">05</span><h2>选哪个后端：证据摆在这里</h2></div>
+  <p>
+    之前有同事建议"先用 FlyDSL，不行再考虑 Triton"。方向上可以理解——FlyDSL 是团队的战略后端，
+    在 gfx950 上有全仓库最高的实测天花板。但对<strong>这块芯片 + 这个模型</strong>，
+    有三个各自独立、任何一个都足以否决的硬阻断：
+  </p>
+  <ol>
+    <li>
+      <strong>FlyDSL 的注意力内核在非 gfx950 上是 build 时直接 raise 的</strong>，不是回退。
+      它用了 <code>ds_read_tr16_b64</code>——一条 CDNA4 专属的 LDS 转置读指令，gfx1250 上没有对应物。
+      反向的七个 builder 每一个都断言 gfx950。
+    </li>
+    <li>
+      <strong>gfx1250 构建时根本不安装 flydsl</strong>（<code>setup.py:529-535</code>，
+      注释写着 "flydsl 0.2.4 does not support gfx1250"）。
+    </li>
+    <li>
+      <strong>就算能跑，它也会拒绝我们这个模型。</strong><code>_gqa_group_ok</code> 要求
+      GQA 分组数 G = Hq/Hkv 是 [8,256] 区间的 2 的幂；Llama-3.1-8B 是 32/8 = <strong>G=4</strong>。
+      <em>FlyDSL 在任何架构上都会拒绝这个 shape</em>，MI355X 上也一样。
+    </li>
+  </ol>
+  <p>
+    另外从 gfx950 移植到 gfx1250 不是"移植"而是"重写"：wave64→wave32、MFMA→WMMA、
+    AccVGPR 消失、<code>buffer_load_lds</code>→TDM、160KB→320KB LDS。
+    FlyDSL 前向的<em>全部价值</em>是一套为 wave64 MFMA 手工排的 14-cluster 调度，一行都不转移。
+    而它在新架构上的失败模式是全仓库最差的：TDM gather 有记录在案的<strong>硬挂（需要重启机器）</strong>。
+  </p>
+
+  <h3>各后端横向对比</h3>
+  <div class="tscroll">
+  <table>
+    <thead><tr><th>后端</th><th>gfx1250 可用</th><th>有反向</th><th>接受 G=4</th><th>实测 fwd+bwd</th><th>结论</th></tr></thead>
+    <tbody>
+      <tr class="hl"><td><b>Triton</b></td><td><span class="pill p-good">是</span></td><td>是</td><td>是</td><td class="n">24.3–58.4 ms</td><td><b>主线</b></td></tr>
+      <tr><td>AITER fmha (CK)</td><td><span class="pill p-bad">否</span> CK 是 CDNA-only</td><td>运行时报错</td><td>—</td><td class="n">—</td><td>不可用</td></tr>
+      <tr><td>FlyDSL</td><td><span class="pill p-bad">否</span> build 时 raise</td><td>gfx950 only</td><td><span class="pill p-bad">否</span></td><td class="n">—</td><td>并行调研</td></tr>
+      <tr><td>HipKittens</td><td><span class="pill p-bad">否</span> 硬编码 gfx950</td><td>是</td><td>是</td><td class="n">—</td><td>不适用</td></tr>
+      <tr><td>Gluon</td><td><span class="pill p-bad">否</span> gfx950 only</td><td><span class="pill p-bad">否</span> 仅前向</td><td>—</td><td class="n">—</td><td>不适用</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>
+    <strong>决定：Triton 做主线，FlyDSL 开一条限时并行调研线。</strong>
+    并行线的目标不是产出内核，而是评估同事在 off-main 分支上已经写好的 gfx1250 FMHA
+    （<code>0c3937b6</code> 等，约 7,677 行）。<strong>重要限制（已核实）</strong>：
+    那份前向是 <code>D_qk=192 / D_v=128 varlen</code> 的 MLA 形状，<strong>不是</strong>我们的
+    D=128 稠密因果形状，所以<strong>不能直接拿来用</strong>。它真正的价值是
+    <code>wmma_gemm_bf16.py</code> 这份 gfx1250 WMMA 矩阵乘法范式，以及 TDM 异步拷贝的用法——
+    作为将来 Triton 撞到天花板时手写内核的惯用法参考。
+  </p>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-n">06</span><h2>要优化的形状，和时间花在哪</h2></div>
+  <p>
+    MBS=GBS=4 意味着一个 step 只有一个 micro-batch、没有梯度累积、没有激活重算，
+    所以一个训练 step 里注意力的调用<strong>只有一种形状</strong>，32 次前向 + 32 次反向，别无其他。
+    这让优化目标异常干净。
+  </p>
+  <div class="kv">
+    <div><dt>batch</dt><dd>4</dd></div>
+    <div><dt>序列长度 Sq = Sk</dt><dd>8192</dd></div>
+    <div><dt>Q heads / KV heads</dt><dd>32 / 8 (G=4)</dd></div>
+    <div><dt>head_dim</dt><dd>128</dd></div>
+    <div><dt>每次调用 FLOP</dt><dd>7.697 T</dd></div>
+    <div><dt>每 step 总 FLOP</dt><dd>246.29 T</dd></div>
+  </div>
+
+  <h3>各条路径实测（gfx1250 @ 1067 MHz，限频态）</h3>
+  <figure>
+    <div class="bars">
+      <div class="bar-row"><span class="bar-lab">MI355X AITER（参照）</span>
+        <span class="bar-track"><span class="bar-fill" style="width:10.2%"></span></span>
+        <span class="bar-val">9.84 ms</span></div>
+      <div class="bar-row"><span class="bar-lab">aiter Triton +2 整数 <span class="ev ev-q">已作废</span></span>
+        <span class="bar-track"><span class="bar-fill" style="width:25.2%"></span></span>
+        <span class="bar-val">24.35 ms</span></div>
+      <div class="bar-row"><span class="bar-lab">flex（当前生产路径）</span>
+        <span class="bar-track"><span class="bar-fill muted" style="width:32.6%"></span></span>
+        <span class="bar-val">31.51 ms</span></div>
+      <div class="bar-row"><span class="bar-lab">aiter Triton 出厂配置</span>
+        <span class="bar-track"><span class="bar-fill" style="width:35.3%"></span></span>
+        <span class="bar-val">34.11 ms</span></div>
+      <div class="bar-row"><span class="bar-lab">turbo:TRITON (c1325c7e)</span>
+        <span class="bar-track"><span class="bar-fill crit" style="width:60.5%"></span></span>
+        <span class="bar-val">58.42 ms</span></div>
+      <div class="bar-row"><span class="bar-lab">sdpa:FLASH (AOTriton)</span>
+        <span class="bar-track"><span class="bar-fill crit" style="width:100%"></span></span>
+        <span class="bar-val">96.58 ms</span></div>
+    </div>
+    <figcaption>
+      一次前向+反向的耗时，越短越好。形状 b=4 s=8192 hq=32 hkv=8 d=128 bf16 causal。
+      来源：<code>Primus/output/0910__fa_opt/attn_bench_gfx1250.log</code> 与 op-evolve Phase 1 E2。
+      <span class="ev ev-m">实测</span>
+      <br><strong>更正：其中 "aiter Triton +2 整数 = 24.35 ms" 这一条没能复现</strong>，
+      Round 0 对照实验重测得 <span class="num">31.21</span> ms——上游 aiter 换过反向配置。见第 00B 节。
+    </figcaption>
+  </figure>
+
+  <h3>时间在内核之间怎么分</h3>
+  <figure>
+    <div class="bars">
+      <div class="bar-row"><span class="bar-lab">_bwd_kernel_dkdv</span>
+        <span class="bar-track"><span class="bar-fill" style="width:100%"></span></span>
+        <span class="bar-val">35.92 ms · 61.5%</span></div>
+      <div class="bar-row"><span class="bar-lab">_bwd_kernel_dq</span>
+        <span class="bar-track"><span class="bar-fill" style="width:32.7%"></span></span>
+        <span class="bar-val">11.75 ms · 20.1%</span></div>
+      <div class="bar-row"><span class="bar-lab">attn_fwd</span>
+        <span class="bar-track"><span class="bar-fill" style="width:27.7%"></span></span>
+        <span class="bar-val">9.94 ms · 17.0%</span></div>
+      <div class="bar-row"><span class="bar-lab">_bwd_preprocess_use_o</span>
+        <span class="bar-track"><span class="bar-fill" style="width:0.4%"></span></span>
+        <span class="bar-val">0.06 ms · 0.1%</span></div>
+    </div>
+    <figcaption>
+      turbo:TRITON 一次前向+反向的逐内核耗时 <span class="ev ev-m">实测</span>。
+      <strong>dkdv 一个内核就占 61.5%，是第二名的 3 倍。</strong>
+      一个先花十轮优化前向的计划，是在优化 17% 的问题。
+    </figcaption>
+  </figure>
+  <p>
+    <strong>为什么偏偏是 dkdv 最难</strong>：dK/dV 天然按 key 轴切分，GQA 又把工作者数量除以 G=4；
+    而让这个内核变贵的是 query 轴，它一个工作者都补不回来。
+    所以"沿 query 轴再切一刀"应当是一等旋钮——而目前
+    <code>sequence_parallel</code> 在代码里是<strong>硬编码 True 且从未被计价</strong>。
+  </p>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-n">07</span><h2>为什么我们相信还有很大空间</h2></div>
+  <p>
+    因为这些内核的配置<strong>从来没有被搜索过一次</strong>。这不是猜测，是读代码读出来的：
+  </p>
+  <ul>
+    <li>turbo 的 Triton 内核：<code>FIXED_BLOCK_M = FIXED_BLOCK_N = 64</code> 是<strong>模块级 Python 常量</strong>，
+      不是可调参数。</li>
+    <li>前向的 "autotune" 列表里<strong>只有一个</strong>配置：<code>num_stages=1, num_warps=4</code>。
+      反向同样只有一个。<code>_bwd_preprocess_use_o</code> 连 autotune 装饰器都没有。
+      也就是说 <code>@triton.autotune</code> 在这里<strong>只是个编译缓存，从没搜索过</strong>。</li>
+    <li>aiter 那边更直接：<code>gfx1250-MHA-DEFAULT.json</code> 与
+      <code>gfx950-MHA-DEFAULT.json</code> <strong>md5 逐字节相同</strong>——它就是一份拷贝。</li>
+  </ul>
+  <p>
+    这些配置全部原样继承自 <strong>CDNA</strong> 目标（wave64 / MFMA / 64KB LDS）。
+    而 gfx1250 是 <strong>wave32 / WMMA / 320KB LDS / 256 CU</strong>。
+    在这里 <code>num_warps=4</code> 是 128 条通道而不是 256 条；
+    <code>num_stages=1</code> 意味着<strong>完全没有软件流水</strong>——
+    而这块芯片的招牌特性恰恰是异步数据搬运引擎（TDM）。
+  </p>
+  <div class="callout">
+    <h4>最有力的先验：两个整数换来 1.401 倍</h4>
+    <p>
+      同事在 aiter 的 Triton 内核上只改了两个整数——前向 <code>num_stages</code> 1→2，
+      反向 <code>num_warps</code> 4→2——耗时从 <span class="num">34.111</span> ms 降到
+      <span class="num">24.347</span> ms，<strong>其中前向单独一项就是 2.06 倍</strong>
+      （6.665 → 3.234 ms），而且 out/dq/dk/dv 四个张量的 SQNR 精确到小数点后四位都没变，
+      峰值显存还少了 33% <span class="ev ev-m">实测</span>。
+    </p>
+    <p>
+      两个不同的 Triton 注意力内核，都在出厂时带着从别的架构拷来的配置，
+      都在头两个旋钮上留了 1.4–2 倍。这是我们能拿到的校准最好的先验。
+    </p>
+    <p>
+      <strong>但这段里的 24.347 ms／316.1 TFLOP/s 已被证伪</strong>：今天重测是 31.207 ms／
+      246.6 TFLOP/s，差额全在反向（21.075 → 27.947 ms），因为上游 aiter 已经把反向重调过。
+      前向那一项（2.05×）仍然精确复现，所以"出厂配置留了大倍数"这个先验本身仍然成立。见第 00B 节。
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-n">08</span><h2>执行计划</h2></div>
+  <p>
+    分四个阶段。<strong>Phase 0 完全不需要 GPU</strong>——这台机器上可能有别人在用，
+    而且这张卡目前状态存疑，所以先把所有离线能做的做完。
+  </p>
+
+  <div class="phase">
+    <div class="phase-top"><span class="phase-id">Phase 0</span><h3>不需要 GPU 的准备工作</h3>
+      <span class="gate">现在就能开始</span></div>
+    <p><strong>0.1 修三个真实的派发 bug。</strong>这些不修，任何内核成果都到不了训练 step：</p>
+    <ul>
+      <li><code>DenseAttnFwdAiterBackend.can_handle</code> 对任何 4 维 bf16/fp16 张量无条件返回 True，
+        而回退扫描按字典插入序进行，<strong>AITER 永远排在 TRITON 前面</strong>——
+        所以 gfx1250 上那个唯一能用的 Triton 后端，默认<strong>永远不会被选中</strong>。</li>
+      <li><code>_flydsl_common_ok</code> 用 <code>compute_capability >= (9,5)</code> 判断，
+        而 gfx1250 报 <code>(12,5)</code>，<strong>这道门是通的</strong>。
+        目前只是靠 Llama-3.1-8B 的 G=4 偶然挡住；任何 G∈{8,16,…} 的模型今天就会在 gfx1250 上
+        派发到 FlyDSL 然后在 gfx950 的 JIT 里硬崩。</li>
+      <li><code>dense_backward</code> 传 dq/dk/dv=None，于是按 fp32 分配——<strong>bf16 输入拿回 fp32 梯度</strong>。
+        能抓到它的测试被 <code>tests/conftest.py</code> 在 gfx1250 上<strong>整体 skip</strong> 掉了，
+        所以这条路径至今没有任何 CI 覆盖。</li>
+    </ul>
+    <p><strong>0.2 把种子代码 vendor 进来，搭测试台。</strong>复用 op-evolve Phase 1 已有的
+      <code>E2_correct.py</code>（可用的 fp32 参考实现）和计时脚本。
+      <strong>丢掉 <code>mha_fused_bwd.py</code></strong>——它的 dk SQNR 是 −0.22 dB，误差能量超过信号能量，
+      而且更慢。</p>
+    <p><strong>0.3 写好自动调优 job 的配置。</strong>基线用 aiter 出厂配置，对照组用 flex 且
+      <strong>每一轮当场重测</strong>（不用存档值——这张卡的时钟状态正是存疑的东西）。</p>
+    <p><strong>0.4 平台线并行推进</strong>：把 VR 限频问题升级给平台/BMC 负责人。</p>
+    <p><strong>0.5 FlyDSL 限时调研（≤3 天，只读）</strong>：产出一份"可借鉴／不可借鉴"清单，不产出内核。</p>
+  </div>
+
+  <div class="phase">
+    <div class="phase-top"><span class="phase-id">Phase 1</span><h3>Round 0 对照实验</h3>
+      <span class="gate">需要一张健康的 GPU</span></div>
+    <p>
+      在<strong>同一个容器镜像、同一次会话</strong>里把四条路径重测一遍，解决两处矛盾：
+    </p>
+    <ul>
+      <li><span class="ev ev-q">存疑</span> 提交 <code>c1325c7e</code> 声称 220.6 TFLOP/s，
+        而仓库里的 benchmark 同形状测出 131.7。<strong>差 1.675 倍，和限频比 1.65 倍高度吻合</strong>——
+        很可能那次是在没限频的卡上测的。<strong>这是整个计划里性价比最高的一次探针</strong>：
+        若证实，所有绝对目标都要按 1.65 倍重写。</li>
+      <li>aiter 的 34.111 ms 和 turbo 的 58.424 ms 是在<strong>两个不同镜像</strong>上测的，从未交叉验证。</li>
+    </ul>
+  </div>
+
+  <div class="phase">
+    <div class="phase-top"><span class="phase-id">Phase 2</span><h3>自动多轮调优（约 40 轮）</h3>
+      <span class="gate">轮次顺序按实测时间占比，不按直觉</span></div>
+    <div class="tscroll">
+    <table>
+      <thead><tr><th>轮次</th><th>目标</th><th>占时间</th><th>主要旋钮</th></tr></thead>
+      <tbody>
+        <tr><td class="n">R1–R3</td><td>复现两个"白拿"的整数</td><td class="n">—</td><td>fwd <code>num_stages</code> 1→2；bwd <code>num_warps</code> 4→2</td></tr>
+        <tr class="hl"><td class="n">R4–R20</td><td><b>_bwd_kernel_dkdv</b></td><td class="n">61.5%</td><td>BLOCK 尺寸（<b>必须成对改</b>）、num_warps、num_stages、waves_per_eu、kpack、query 轴切分</td></tr>
+        <tr><td class="n">R21–R30</td><td>_bwd_kernel_dq</td><td class="n">20.1%</td><td>同上</td></tr>
+        <tr><td class="n">R31–R36</td><td>attn_fwd</td><td class="n">17.0%</td><td>tile 尺寸、PRE_LOAD_V、流水级数</td></tr>
+        <tr><td class="n">R37–R40</td><td>组合验证 + 在生产形状上确认</td><td class="n">—</td><td>—</td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p>
+      调优用 <strong>S=4096</strong> 的代理形状（恰好 1/4 成本），
+      但<strong>在代理形状上赢的配置，必须在 S=8192 上确认之后才能成为冠军</strong>。
+    </p>
+  </div>
+
+  <div class="phase">
+    <div class="phase-top"><span class="phase-id">Phase 3</span><h3>落地与端到端验证</h3>
+      <span class="gate">交付</span></div>
+    <ul>
+      <li>把调优结果落进 <code>DenseAttnFwdTritonBackend</code>：
+        把 <code>FIXED_BLOCK_M/N</code> 变成真正的可调参数，赢的配置写成 gfx1250 的配置表。</li>
+      <li>合入派发修复，收窄 gfx1250 的整体 skip，补上真正能跑的 CI 测试。</li>
+      <li>跑真实训练，用实际 step time 验证 tps——<strong>顺带回答 JIRA 的 501 ms 到底聚合了多少次调用</strong>，
+        这是解开那个至今无人能复现的 15.656 ms 的唯一干净出口。</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-n">09</span><h2>已经踩过的坑，测试台必须内建防线</h2></div>
+  <p>
+    下面每一条都是同事实际踩过、有日志为证的。它们不是"注意事项"，是<strong>必须写进代码的断言</strong>。
+  </p>
+
+  <h3>最危险的一条：有些配置"又快又错"</h3>
+  <p>
+    反向内核的启动网格由 <code>BLOCK_N1</code> 决定，但这个<em>同一个网格</em>同时喂给了 dq 那一半
+    （它按 <code>BLOCK_M2</code> 切分）。把 <code>BLOCK_N1</code> 从 128 提到 256，网格就减半，
+    <strong>dq 只覆盖了一半的 query 行</strong>：
+  </p>
+  <div class="tscroll">
+  <table>
+    <thead><tr><th>配置</th><th class="n">耗时</th><th class="n">dq SQNR</th><th class="n">dk</th><th class="n">dv</th><th>判定</th></tr></thead>
+    <tbody>
+      <tr><td>基线（gfx950 拷贝）</td><td class="n">27.744 ms</td><td class="n">52.25</td><td class="n">52.31</td><td class="n">52.73</td><td><span class="pill p-good">正确</span></td></tr>
+      <tr><td><code>BLOCK_N1=256</code> 单独改</td><td class="n">21.110 ms</td><td class="n">9.59</td><td class="n">52.31</td><td class="n">52.73</td><td><span class="pill p-bad">错，但看起来快 1.31×</span></td></tr>
+      <tr><td><code>BLOCK_M2=64,BLOCK_N2=64</code></td><td class="n">21.773 ms</td><td class="n">9.59</td><td class="n">52.31</td><td class="n">52.73</td><td><span class="pill p-bad">错，从另一侧</span></td></tr>
+      <tr class="hl"><td><code>BLOCK_N1=256</code> + <code>BLOCK_M2=256</code> 成对</td><td class="n">21.639 ms</td><td class="n">52.25</td><td class="n">52.31</td><td class="n">52.73</td><td><span class="pill p-good">真的快 1.28×</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>
+    <strong>注意 dk 和 dv 全程完好，只有 dq 坏了。</strong>
+    一个只看输出、或者只看 dk/dv 的正确性检查会<em>奖励</em>这个错误配置。
+    仓库现有 benchmark 的 max-abs 检查对所有后端都返回同一个 <code>8.011e-03</code>，
+    而且根本不看梯度——它抓不到任何一个。
+  </p>
+  <p>
+    <strong>防线：正确性检查必须对 out / dq / dk / dv 四个张量<em>分别</em>算 SQNR</strong>，
+    对 fp32 参考，阈值 50 dB（bf16 的地板约 55.6 dB，正确实现落在 52–54 dB）。
+    关键不是阈值，是<strong>覆盖面</strong>。
+  </p>
+
+  <h3>其余四条防线</h3>
+  <ul>
+    <li><strong>配置缓存</strong>：aiter 的 <code>_get_config</code> 是 <code>@lru_cache</code> 的——
+      覆盖配置不调 <code>cache_clear()</code> 会<strong>静默无效</strong>。
+      症状是一整轮 sweep 里所有配置返回同一个时间（同事真的遇到过：27.45–27.49 ms 一路平到底）。
+      每次计时前必须清缓存<em>并断言取回的配置就是设置的配置</em>。</li>
+    <li><strong>禁止 PC sampling</strong>——在包装层硬禁，不靠人自觉。三次尝试三次 GPU fault，
+      其中一次把驱动搞到 <code>wait for reset ack</code>，需要重启机器。
+      而且<strong>健康检查不能调用 <code>rocm-smi</code></strong>（它自己会卡在 D-state），
+      改用 dmesg 抓 <code>MES(</code> / <code>GPU Hang</code>。</li>
+    <li><strong>每个候选独立进程</strong>，<code>rc=139</code> 当作重试并记录次数——
+      flex 的反向有约 2/12 的概率 page fault 直接杀进程，而对照组每轮都要重测。</li>
+    <li><strong>赢在边界要自动扩范围</strong>：一个 sweep 的赢家落在参数范围端点，说明没收敛。</li>
+  </ul>
+
+  <h3>还要防"基准测试过拟合"</h3>
+  <p>
+    aiter 的配置缓存是按激活张量做 key 的，而真实训练每次 Q/K/V/dO 都是新的，
+    <strong>命中率是 0</strong>。这意味着微基准上的收益可能<em>完全不转移</em>到训练。
+    所以每个被接受的轮次都要附一条"真实训练可转移性检查"，并且 Phase 3 的端到端验证不可跳过。
+  </p>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-n">10</span><h2>另一件事：这张卡的观测能力很差</h2></div>
+  <p>
+    这会影响我们的方法选择。<code>rocprofv3</code> 在这个镜像里对 gfx1250 只列出
+    <strong>51 个硬件计数器、0 个派生指标</strong>（gfx950 有 630 个）。
+    其中实际请求的 27 个里只有 <strong>8 个返回非零</strong>，
+    而 <strong>TCC、TCP、TA、TD、EA、LDS、GL2C 这些访存相关的块完全不存在</strong>。
+  </p>
+  <p>
+    后果很直接：<strong>"这个内核是算力受限还是访存受限"这个分析在这张卡上做不了</strong>，
+    因为没有任何一级缓存或显存的字节计数器。所以我们的策略是
+    <strong>多做便宜的 A/B 实测，少做昂贵的 profiling 分析</strong>——
+    反正已知的收益形态就是"改两个整数"，那正好适合 A/B。
+  </p>
+  <div class="callout warnc">
+    <h4>一个会骗人的陷阱</h4>
+    <p>
+      如果把一个不存在的计数器和一个有效的混在一起请求，<code>rocprofv3</code> 会
+      <strong>返回 0、生成格式完全正确的 CSV</strong>，只是那个缺失的计数器<em>整列不见了</em>——
+      不是补零，是根本没有。唯一能发现它的办法是<strong>对结果列名做集合相等检查</strong>。
+    </p>
+  </div>
+  <p>
+    值得一试：宿主机的 ROCm 7.15 为 gfx1250 定义了 233 个计数器。
+    在 Phase 1 顺手跑一次 <code>GL2C_EA_RDREQ_64B</code>——如果新版 SDK 让访存计数器可用，
+    深度分析的价值会大幅回升，轮次安排要相应调整。
+  </p>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-n">11</span><h2>风险与对策</h2></div>
+  <div class="tscroll">
+  <table>
+    <thead><tr><th>风险</th><th>影响</th><th>对策</th></tr></thead>
+    <tbody>
+      <tr><td>VR 限频不解除</td><td>封顶在约 22.3k tps，拿不到 MI355X 平手</td><td>Phase 0 就升级给平台组；所有目标按限频/不限频双轨标定</td></tr>
+      <tr><td>卡再次 wedge</td><td>丢失轮次进度</td><td>禁 PC sampling；用 dmesg 做健康检查；每轮独立进程；状态全部落盘</td></tr>
+      <tr><td>基准过拟合</td><td>微基准赢了但训练不涨</td><td>每轮做可转移性检查；Phase 3 端到端验证</td></tr>
+      <tr><td>假赢（快但数值错）</td><td>污染冠军配置</td><td>四张量分别 SQNR 门 + 网格/BLOCK 配对断言</td></tr>
+      <tr><td>Triton 存在天花板</td><td>无法表达 TDM 异步拷贝、手工 LDS 分级</td><td>预估带宽 400–600 TFLOP/s；超出则升级到手写 WMMA，FlyDSL 调研的产出在此接手</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-n">12</span><h2>交付物</h2></div>
+  <ul>
+    <li><strong>本文档</strong>——分析、纠正与计划。</li>
+    <li><strong>可合入 Primus-Turbo 的 PR</strong>：派发 bug 修复 + Triton 后端真正 autotune 化 +
+      gfx1250 的 CI 测试。</li>
+    <li><strong>可复用的自动调优 job</strong>：配置 + 测试台，换形状、换算子可以重复跑。</li>
+    <li><strong>端到端 tps 验证报告</strong>，对照 MI355X 的 21,351 tps。</li>
+  </ul>
+</section>
+
+<footer>
+  <p>
+    数据来源：<code>Primus/output/0910__fa_opt/attn_bench_gfx1250.log</code>、
+    op-evolve Phase 1（<code>output/0911__fa_gfx1250_phase1/</code>，E1/E2/E3/E4）、
+    Primus-Turbo 与 Primus 仓库源码、JIRA 性能分析。
+    标注为<span class="ev ev-d">推导</span>的数字附有公式，标注为<span class="ev ev-q">存疑</span>的
+    需要在 Phase 1 用实验定论。
+  </p>
+</footer>
+
+</div>
