@@ -1,0 +1,24 @@
+--- /tmp/fused.bak	2026-09-13 13:52:01.254398477 +0000
++++ primus_turbo/triton/attention/fused_mha_bwd_kernel.py	2026-09-13 13:52:01.274610290 +0000
+@@ -285,6 +285,11 @@
+             dropout_scale = 1.0 / (1 - dropout_p)
+         # Load m before computing qk to reduce pipeline stall.
+         m = tl.load(M + offs_m * stride_deltam, mask=mask_m, other=0.0)
++        # CHANGED vs upstream: Di hoisted here from after the dv dot. It is the same
++        # [BLOCK_M] load off the same base pointer as m, needed a few lines later, and
++        # upstream's own comment above says why an early load helps. Leaving it mid-loop put
++        # a dependent scalar load on the critical path between two dots.
++        Di = tl.load(D + offs_m * stride_deltam, mask=mask_m)
+         if IS_FP8:
+             qkT = tl.dot(k, qT) * descale_q * descale_k
+         else:
+@@ -354,8 +359,7 @@
+ 
+         if DEBUG_TRITON_DETAIL and start_n == 256:
+             print(f"pT: {pT.shape}\n", pT)
+-        # D (= delta) is pre-divided by ds_scale.
+-        Di = tl.load(D + offs_m * stride_deltam, mask=mask_m)
++        # D (= delta) is pre-divided by ds_scale. Loaded early, next to m -- see above.
+         # Compute dP and dS.
+         if IS_FP8:
+             dpT = tl.dot(v, tl.trans(do)) * descale_v * descale_do

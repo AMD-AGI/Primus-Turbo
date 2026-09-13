@@ -204,6 +204,63 @@ op:
         harness. A prior backward sweep returned 27.45-27.49 ms for EVERY config,
         including grid-changing ones, and was only caught afterwards.
 
+  # ── SEED, UPDATED 2026-09-13 AFTER A DAY OF MEASUREMENT ──────────────────────────
+  # The spec above was written before hardware access and named aiter's SHIPPED config as
+  # op/baseline. That is now the wrong seed: the campaign has already moved well past it and
+  # the result is in-tree.
+  #
+  #   turbo shipped (the original seed)   59.642 ms   129.0 TFLOP/s
+  #   aiter shipped (the spec's seed)     31.107      247.4
+  #   torch flex (op/beat)                31.337      245.6
+  #   >>> SEED THIS INSTEAD <<<           24.435      315.0
+  #
+  # Use primus_turbo/triton/attention/fused_mha_bwd_kernel.py plus its adapter
+  # primus_turbo/pytorch/kernels/attention/attention_fused_bwd_impl.py. It is self-contained
+  # (no aiter import, no JIT, no runtime config discovery), its default config is the tuned
+  # champion, and it is already wired into the dispatcher behind a work-based gate.
+  #
+  # MEASUREMENT HARNESS -- do not write a new one. tools/gfx1250/tune_attention.py already
+  # provides: a four-tensor SQNR gate against a chunked fp32 reference, one process per
+  # candidate, a bitwise determinism mode, launch-level config verification, and a resumable
+  # JSONL ledger. tools/gfx1250/exclusive.sh takes a GPU window without SIGKILLing anything
+  # mid-kernel.
+  #
+  # REPORT THE BACKWARD ON BOTH FLOP BASES. This kernel issues SEVEN score-matrix GEMM
+  # passes, not FlashAttention-2's five -- it trades a pass for avoiding dq atomics. Charging
+  # it the FA-2 flop count understates real machine utilisation by 1.22x. The 20 ms backward
+  # is 385 TFLOP/s of actually-issued MFMA = 38.4% of the 1002.7 roof, and the structure's
+  # own floor is 7.68 ms, not 5.48.
+  #
+  # ── DO NOT RE-DERIVE: each of these cost real GPU time to refute ─────────────────
+  #  1. Asymmetric tiles for the in-tree UNFUSED dkdv. 64x64 is already optimal there and
+  #     aiter's 32x128 is 59% WORSE. Tile preference is a property of the kernel STRUCTURE,
+  #     not of the shape -- the same N=256 that is catastrophic unfused is the win fused.
+  #  2. sequence_parallel=False. It computes 1/128 of the gradient and leaves the rest at the
+  #     zeros init. A timing-only sweep reports it as a spectacular win.
+  #  3. The standard XCD remap. gridDim0 is already a multiple of 8, so tiles sharing a
+  #     (batch, head) already land on one XCD for free; chunking would scatter them.
+  #  4. Skipping the causal mask on non-diagonal blocks: 9% REGRESSION. The scalar branch
+  #     costs more than the compare-and-select it avoids.
+  #  5. Tightening dkdv's lo bound, and folding log_p_scale: both perf-neutral.
+  #  6. The forward "0.9 ms gap" vs aiter: does NOT reproduce under profiling (4.219 vs
+  #     4.035). Two methodologies disagree, so it is not established.
+  #  7. HipKittens' fixed-zero reference max, applied to the BACKWARD. There is no running
+  #     max in this backward -- m comes from the forward's saved LSE -- so there is nothing
+  #     to delete. Its dual (folding the LSE shift into the GEMM accumulator initialiser via
+  #     tl.dot(acc=...)) IS applicable, but only in the dq pass.
+  #  8. FlyDSL. Upstream v0.3.3 does support gfx1250 (tdm_ops, s_wait_tensorcnt,
+  #     ds_load_tr16_b128 all present) so the toolchain gate DOES clear -- but no gfx1250
+  #     attention backward exists in any tree, and Primus-Turbo's gfx950 FlyDSL backward is
+  #     5,581 lines with 106 MFMA sites whose hand-scheduling does not survive wave64->wave32.
+  #
+  # ── HIGHEST-VALUE UNTESTED KNOB ──────────────────────────────────────────────────
+  # num_warps on the FUSED kernel. It is inherited from aiter at 4 and has never been swept
+  # (the num_warps sweep in this campaign was on the in-tree unfused kernel). At BLOCK_N1=256
+  # and HEAD_DIM=128 on wave32, the dk/dv fp32 accumulators alone are 512 VGPR/lane, plus 256
+  # for the persistent k/v tiles: 768 of 1024 before any q/p/ds tile, at 1 wave/SIMD with
+  # num_stages=1 -- no latency hiding from occupancy OR pipelining. num_warps=8 halves
+  # VGPR/lane. One env var: PRIMUS_TURBO_FUSED_MHA_BWD_TUNE=num_warps=8
+
   precision_sqnr_db: 50
   # 50 dB, and the check MUST compute SQNR separately for out, dq, dk AND dv against an
   # exact fp32 reference computed over the full b=4 tensor. Justification, all measured:
