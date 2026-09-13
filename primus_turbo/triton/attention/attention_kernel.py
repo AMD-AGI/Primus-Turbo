@@ -1209,12 +1209,26 @@ def _bwd_preprocess_use_o(
 def get_autotune_bwd_configs():
     default = {"num_stages": 1, "num_warps": 4}
     pinned = _parse_tune_spec(os.environ.get(_TUNE_ENV, ""), "bwd")
+    # Autotune key: every parameter that should force a re-tune. Triton only computes the
+    # key at all when len(configs) > 1, so with the shipped single-config list this is
+    # inert -- but it stops being inert the moment a second config ships, and it was wrong:
+    # "BLOCK_DMODEL" is not a parameter of either backward kernel (they take
+    # BLOCK_DMODEL_QK / BLOCK_DMODEL_V), and Triton silently DROPS key names it does not
+    # recognise, so that entry contributed nothing while HQ/HK and the head dims that
+    # actually change the kernel were missing. Two shapes differing only in head count
+    # would have shared a tuned config.
     return _build_configs(pinned, default, default), [
-        "BLOCK_DMODEL",
+        "HQ",
+        "HK",
+        "BLOCK_DMODEL_QK",
+        "BLOCK_DMODEL_V",
         "ACTUAL_BLOCK_DMODEL_QK",
         "ACTUAL_BLOCK_DMODEL_V",
         "SEQUENCE_PARALLEL",
         "CAUSAL",
+        "WINDOW_LEFT",
+        "WINDOW_RIGHT",
+        "IS_VARLEN",
         "USE_FP8",
     ]
 
