@@ -82,7 +82,16 @@ GPU 数量和占用进程改读 `/sys/class/kfd/`（纯读，不会阻塞在驱�
       一半的配置对这个旋钮一条指令都不差。不要再当成有希望的免费收益。
       **但解析器的修复是必要的**：`waves_per_eu=0` 此前被当作非法值拒绝，
       这个设置根本无法从 harness 到达（已修，见 `_ZERO_MEANS_UNSET`）。
-- [ ] **T2. aiter 预编译 gfx1250 ASM 反向探针。一小时。**
+- [ ] **T2. aiter 预编译 gfx1250 ASM 反向探针。一小时——考古部分已离线做完，
+      见 `phase2/T2-ASM-BACKWARD-SPEC.md`，明天那一小时只用来测量。**
+      离线解剖结果：LDS **327,680 B（整个 CU 的 320 KB，每 CU 只能驻留一个 workgroup）**、
+      **零 spill**、864 条 WMMA（Triton 冠军 448）、存储体切换/WMMA 比 **1.5 对 4.1**。
+      同 tile 同 wave 数下每次发射干 1.9 倍矩阵活。**这是 Triton 表达不了的结构**
+      （它这里只分配 64 KB LDS）。注意这只是结构推断——限频态下单 workgroup 设计
+      也可能因占用率太低而输。
+      **不是 drop-in：一次反向要发三个内核**（odo 预处理 → 主体 → dq fp32→bf16 转换），
+      需要一块 fp32 dq_acc 暂存。调用契约已由 `tools/gfx1250/asm_bwd_abi.py` 从 ELF 读出。
+      **唯一剩下的未知是 `dq_convert` 的 208 B 布局**（打包函数不在 `mha_bwd.cu` 里）。
       `aiter-src/hsa/gfx1250/fmha_v3_bwd/bwd_hd128_bf16_causal_br_a32_pssk.co` 已确认存在，
       CSV 行与生产形状逐项匹配，C++ host 五处特判 gfx1250，**只缺 Python 侧架构门**。
       注意：必须先 `dq.zero_()`（gfx1250 只有 atomic32，绕过门控直调会得到静默垃圾 dq），
