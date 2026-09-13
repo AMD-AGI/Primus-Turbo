@@ -46,7 +46,14 @@ _CM = int(_os.environ.get("QKV_CM_ST", "16"))  # cache modifier on the row-major
 # from {124.2..138.3}us to {122.4..122.8}us. All 13 correctness cases + 3-repeat
 # determinism pass identically at both scopes (output bytes are cache-scope
 # invariant). See campaign goal.md P1.
-_CM_STT = int(_os.environ.get("QKV_CM_STT", "2"))
+# Round 11 added sc1 (bit4=16) on top of nt: 18 = sc1|nt. The transposed store fires
+# only after a barrier with no concurrent loads (unlike the row-major store, which is
+# interleaved with the next sub-tile's loads and wants bit1 UNSET -- see _CM below),
+# so giving it its own coherence scope costs nothing and measured +0.58% alone
+# (N=6, [2.58729,2.61282] vs the 2.59022 control) and +1.08% together with
+# _TPR_Q_BIG=16 (N=8, [2.60903,2.62657], zero overlap with the N=12 control
+# [2.57460,2.60452]). Round 12 re-confirms both alone and together at N=12.
+_CM_STT = int(_os.environ.get("QKV_CM_STT", "18"))
 _CM_LA = int(_os.environ.get("QKV_CM_LA", "3"))  # cache modifier on pass-A input loads
 # nt (bit1=2) on pass-B's dq/dk/dv loads. Round 3/6's isolated-probe measurement (fixed
 # out/out_t buffers, no allocation between reps) called this "neutral on the fused path"
@@ -88,7 +95,31 @@ B_NTH = int(_os.environ.get("QKV_B_NTH", "1024"))
 # threads per row on the pure-Q sub-tiles. tpr*16 = contiguous output bytes a row
 # gets per store and tpr*32 = contiguous input bytes it gets per load, so this is
 # the burst-length knob. 8 reproduces the round-2 geometry.
-_TPR_Q = int(_os.environ.get("QKV_TPR_Q", "8"))
+#
+# Round 11 ruler sweep (N=12 blocked, zero overlap): TPR_Q=8 -> 2.59022 (control),
+# TPR_Q=16 -> 2.60506 (+0.57%), TPR_Q=32 -> 2.51446 (-2.93%): doubling the row-major
+# store's contiguous run 128B->256B wins, but 256B->512B (plus LDS 16->64KB) loses.
+# Round 12 adds TPR_Q=24 to bound the peak (still divisible: bm*tpr_q%nth==0 at
+# BM=128/NTH=1024 requires tpr_q % 8 == 0, so 12/20 are not reachable without also
+# changing BM/NTH; 24 is the nearest achievable neighbour between the two).
+#
+# _TPR_Q_BIG is the "wide burst" candidate; _fast_spec falls back to _TPR_Q_SMALL=8
+# per-shape (not globally) whenever q_w does not divide evenly by _TPR_Q_BIG*16, so
+# a wide default does not silently shrink the kernel's own shape coverage (e.g. the
+# ruler's SMALL case q_w=16 would otherwise drop to the reference fallback at
+# TPR_Q_BIG=16, still correct but no longer exercising the fused kernel).
+_TPR_Q_BIG = int(_os.environ.get("QKV_TPR_Q_BIG", "16"))
+_TPR_Q_SMALL = 8
+
+
+def _select_tpr_q(q_w):
+    """Per-shape burst-length choice: prefer the wide `_TPR_Q_BIG` candidate when
+    `q_w` divides evenly by it (256B/512B.. contiguous runs); else fall back to the
+    original round-2 `_TPR_Q_SMALL=8` geometry so odd/small shapes still take the
+    fused fast path instead of the reference."""
+    if q_w % (_TPR_Q_BIG * 16) == 0:
+        return _TPR_Q_BIG
+    return _TPR_Q_SMALL
 
 _WR64 = (1, 2, 4, 8, 16, 32)
 
@@ -396,7 +427,7 @@ def _pack_map(pid, NBM, groups, GRID):
     return pid - bmi * I32(groups), bmi
 
 
-def compile_pack(rows, groups, q_w, kv_w, elt, fuse_t=False, bm=B_BM, nth=B_NTH):
+def compile_pack(rows, groups, q_w, kv_w, elt, fuse_t=False, bm=B_BM, nth=B_NTH, tpr_q=_TPR_Q_BIG):
     """One pass over dq/dk/dv emitting the row-major FP8 (and, with ``fuse_t``, the
     transposed FP8 too).
 
@@ -406,12 +437,14 @@ def compile_pack(rows, groups, q_w, kv_w, elt, fuse_t=False, bm=B_BM, nth=B_NTH)
     The transposed half stages the FP8 bytes in a 16 B-strip XOR-swizzled LDS tile
     (transpose_2d.cu's VEC-path swizzle) so both the store and the corner-turn
     gather are bank-conflict-free.
+
+    ``tpr_q`` is an explicit parameter (not a module global) so the caller can pick
+    it per-shape via ``_select_tpr_q`` and fold the choice into the compile cache key.
     """
     QT = groups * q_w  # dq row stride (elems)
     KT = groups * kv_w  # dk / dv row stride (elems)
     GW = q_w + 2 * kv_w  # logical cols per group
     PC = groups * GW  # packed cols
-    tpr_q = _TPR_Q
     BKQ = tpr_q * 16  # output cols a pure-Q sub-tile covers
     TPR_KV = (2 * kv_w) // 16  # 8 output B/thread on the K|V sub-tile
     NSQ = q_w // BKQ
@@ -576,14 +609,15 @@ def _fast_spec(dq, dk, dv, out_dtype):
     rows = seq * batch
     gw = q_w + 2 * kv_w
     pc = groups * gw
+    tpr_q = _select_tpr_q(q_w)
     # fast-path geometry: full 16 B strips everywhere, 128-row tiles, 2*kv_w == B_BK
-    if rows % B_BM or q_w % (_TPR_Q * 16) or (2 * kv_w) % 16 or gw % 16:
+    if rows % B_BM or q_w % (tpr_q * 16) or (2 * kv_w) % 16 or gw % 16:
         return None
     if rows * pc >= 2**31 or rows * groups * q_w >= 2**31:
         return None
     if (rows * groups * q_w) % A_VEC or (rows * groups * kv_w) % A_VEC:
         return None
-    return rows, groups, q_w, kv_w, pc
+    return rows, groups, q_w, kv_w, pc, tpr_q
 
 
 def qkv_bwd_fp8_pack_flydsl(dq, dk, dv, out_dtype):
@@ -595,7 +629,7 @@ def qkv_bwd_fp8_pack_flydsl(dq, dk, dv, out_dtype):
     spec = _fast_spec(dq, dk, dv, out_dtype)
     if spec is None:
         return _reference(dq, dk, dv, out_dtype)
-    rows, groups, q_w, kv_w, pcols = spec
+    rows, groups, q_w, kv_w, pcols, tpr_q = spec
     dev = dq.device
 
     out = torch.empty((rows, pcols), dtype=out_dtype, device=dev)
@@ -634,11 +668,11 @@ def qkv_bwd_fp8_pack_flydsl(dq, dk, dv, out_dtype):
         sc(partials, scale, scale_inv_1d, stream)
     sarg = partials if _FOLD_S else scale
 
-    pkey = (rows, groups, q_w, kv_w, dq.dtype, FUSE_T, _TPR_Q, B_BM, B_NTH)
+    pkey = (rows, groups, q_w, kv_w, dq.dtype, FUSE_T, tpr_q, B_BM, B_NTH)
     pk = _PACK_C.get(pkey)
     if pk is None:
         pk = flyc.compile(
-            compile_pack(rows, groups, q_w, kv_w, elt, fuse_t=FUSE_T),
+            compile_pack(rows, groups, q_w, kv_w, elt, fuse_t=FUSE_T, tpr_q=tpr_q),
             dq,
             dk,
             dv,
