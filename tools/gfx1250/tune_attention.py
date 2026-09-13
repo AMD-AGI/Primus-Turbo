@@ -271,7 +271,7 @@ def main() -> int:
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--sqnr-min", type=float, default=50.0)
-    ap.add_argument("--impl", default="turbo", choices=["turbo", "aiter"],
+    ap.add_argument("--impl", default="turbo", choices=["turbo", "aiter", "fused"],
                     help="turbo = Primus-Turbo's in-tree Triton backend (the PR target). "
                          "aiter = AITER's Triton MHA, the alternative seed the plan named. "
                          "Same shape, same fp32 reference, same SQNR gate, same timer -- the "
@@ -340,7 +340,27 @@ def main() -> int:
     v = torch.randn(b, sq, hkv, d, device="cuda", dtype=dtype, requires_grad=True)
     do = torch.randn(b, sq, hq, d, device="cuda", dtype=dtype)
 
-    if args.impl == "aiter":
+    if args.impl == "fused":
+        # What would actually ship: Primus-Turbo's own forward, with the vendored fused
+        # backward swapped in for the in-tree two-kernel one. Patched at the op layer rather
+        # than wired into the dispatcher, so this measures the kernel without pre-committing
+        # the dispatch change.
+        from primus_turbo.pytorch.kernels.attention.attention_fused_bwd_impl import (
+            dense_fused_backward,
+        )
+        from primus_turbo.pytorch.ops.attention import flash_attn_interface as _fai
+
+        def _fused_bwd(do_, q_, k_, v_, o_, lse_, softmax_scale=None, causal=True,
+                       sink=None, window_size=(-1, -1)):
+            dq_, dk_, dv_ = dense_fused_backward(
+                do_, q_, k_, v_, o_, lse_, softmax_scale, causal, window_size
+            )
+            return dq_, dk_, dv_, None
+
+        _fai.triton_dense_backward = _fused_bwd
+        result["impl_note"] = "turbo forward + vendored fused backward"
+        _impl_fwd = None
+    elif args.impl == "aiter":
         from aiter.ops.triton._triton_kernels.attention import mha as _amha
         from aiter.ops.triton.attention.mha import flash_attn_func as _aiter_fa
 
