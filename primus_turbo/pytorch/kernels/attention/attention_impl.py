@@ -29,12 +29,13 @@ from primus_turbo.pytorch.core.backend import (
     KernelBackend,
     TuneCache,
 )
-from primus_turbo.pytorch.core.utils import get_device_compute_capability, is_gfx1250
+from primus_turbo.pytorch.core.utils import is_gfx950, is_gfx1250
 from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
     attention_aiter_forward_impl,
     attention_aiter_varlen_forward_impl,
 )
 from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
+    FLYDSL_AVAILABLE,
     flash_attn_sbhd_flydsl_forward_impl,
     flash_attn_varlen_flydsl_forward_impl,
 )
@@ -46,7 +47,6 @@ from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     dense_forward as _triton_dense_forward,
 )
 
-_GFX950 = (9, 5)
 # Narrowest left window the FlyDSL backward is correct on. The kv band comes from the window
 # rounded down to a power of two, and the dQ reduce takes the low edge of a whole q BLOCK's
 # band range. Below BLOCK_Q=64 a band is narrower than the block, so odd bands start mid-block
@@ -101,7 +101,16 @@ def _flydsl_common_ok(
     """
     head_dim = q.shape[-1]
     return (
-        get_device_compute_capability() >= _GFX950
+        # gfx950 exactly, not ">= gfx950". Every FlyDSL FA builder hard-raises on anything
+        # else -- flash_attn_fwd.py checks gpu_arch.startswith("gfx950") because it emits
+        # ds_read_tr16_b64, a CDNA4 LDS transpose load, and the seven backward builders
+        # assert the same. The old compute-capability compare let gfx1250 through: it
+        # reports (12, 5), which is >= (9, 5). Nothing hit that yet only because
+        # _gqa_group_ok happens to refuse Llama-3.1-8B's G=4; any model with G in
+        # {8, 16, ...} would have dispatched here and raised inside a gfx950 JIT.
+        is_gfx950()
+        # Optional dependency; a build that skipped it has no FlyDSL kernels to reach.
+        and FLYDSL_AVAILABLE
         and bool(causal)
         and q.dtype == torch.bfloat16
         and head_dim in (64, 128)
@@ -122,6 +131,17 @@ def _flydsl_common_ok(
 class DenseAttnFwdAiterBackend(KernelBackend):
     @staticmethod
     def can_handle(q: torch.Tensor, **kwargs) -> bool:
+        # Not on gfx1250. aiter's fmha reaches CK, whose kernels are CDNA-only: the forward
+        # succeeds and the backward then rejects the call at runtime with "invalid argument
+        # for fmha_bwd", so the failure lands mid training step rather than at dispatch.
+        #
+        # This gate is what makes the Triton backend reachable there at all. Every other
+        # dense backend declines on gfx1250, and this one accepts any 4-D fp16/bf16 tensor,
+        # so with no arch gate it wins AutoKernelDispatcher's fallback scan -- which walks
+        # _DENSE_FWD_BACKENDS in insertion order (core/backend.py), and AITER is registered
+        # ahead of TRITON. The Triton backend was never reached by default dispatch.
+        if is_gfx1250():
+            return False
         return q.dtype in (torch.float16, torch.bfloat16) and q.ndim == 4
 
     @staticmethod

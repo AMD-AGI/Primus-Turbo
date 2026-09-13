@@ -1672,6 +1672,7 @@ def _triton_gate(monkeypatch, **kwargs):
     return attention_impl.DenseAttnFwdTritonBackend.can_handle(q, **args)
 
 
+@pytest.mark.gfx1250
 def test_triton_dense_gate_accepts_a_plain_causal_call(monkeypatch):
     assert _triton_gate(monkeypatch) is True
 
@@ -1688,17 +1689,20 @@ def test_triton_dense_gate_accepts_a_plain_causal_call(monkeypatch):
     ],
     ids=["dropout", "bias", "alibi", "return_softmax", "no_k", "no_v"],
 )
+@pytest.mark.gfx1250
 def test_triton_dense_gate_refuses_what_the_kernel_lacks(monkeypatch, unsupported):
     # Each of these would otherwise be ignored and quietly answer a different problem.
     assert _triton_gate(monkeypatch, **unsupported) is False
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.int8], ids=["fp32", "int8"])
+@pytest.mark.gfx1250
 def test_triton_dense_gate_refuses_unsupported_dtypes(monkeypatch, dtype):
     assert _triton_gate(monkeypatch, q=torch.empty(1, 8, 4, 64, dtype=dtype)) is False
 
 
 @pytest.mark.parametrize("sink_dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.gfx1250
 def test_triton_dense_gate_takes_a_sink_of_any_float_dtype(monkeypatch, sink_dtype):
     # The adapter casts the sink to fp32 itself. Requiring fp32 here would push a bf16 sink
     # -- gpt-oss trains with one -- back to aiter, i.e. to CK on gfx1250.
@@ -1706,10 +1710,12 @@ def test_triton_dense_gate_takes_a_sink_of_any_float_dtype(monkeypatch, sink_dty
 
 
 @pytest.mark.parametrize("numel", [3, 5], ids=["too_few", "too_many"])
+@pytest.mark.gfx1250
 def test_triton_dense_gate_refuses_a_sink_that_is_not_per_head(monkeypatch, numel):
     assert _triton_gate(monkeypatch, sink=torch.empty(numel, dtype=torch.float32)) is False
 
 
+@pytest.mark.gfx1250
 def test_triton_dense_gate_is_off_outside_gfx1250(monkeypatch):
     monkeypatch.setattr(attention_impl, "is_gfx1250", lambda: False)
     q = torch.empty(1, 8, 4, 64, dtype=torch.bfloat16)
@@ -1727,6 +1733,7 @@ def test_triton_dense_gate_is_off_outside_gfx1250(monkeypatch):
 )
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.gfx1250
 def test_triton_dense_backend_matches_the_reference(causal, dtype):
     """Pinned TRITON, forward and backward, against the fp32 reference."""
     b, s, hq, hkv, d = 2, 256, 8, 2, 64
@@ -1749,3 +1756,121 @@ def test_triton_dense_backend_matches_the_reference(causal, dtype):
     assert compute_snr(qr.grad, q.grad.float()) > 40.0
     assert compute_snr(kr.grad, k.grad.float()) > 40.0
     assert compute_snr(vr.grad, v.grad.float()) > 40.0
+
+
+@pytest.mark.gfx1250
+def test_aiter_dense_backend_declines_on_gfx1250(monkeypatch):
+    """AITER must refuse gfx1250 so the fallback scan can reach the Triton backend.
+
+    aiter's dense fmha reaches CK, which is CDNA-only: the forward succeeds and the
+    backward rejects the call mid training step. can_handle accepts any 4-D fp16/bf16
+    tensor, and _DENSE_FWD_BACKENDS registers AITER ahead of TRITON, so without this
+    gate AITER wins AutoKernelDispatcher's insertion-order fallback and the only backend
+    that works here is never reached.
+    """
+    q = torch.empty(4, 128, 32, 128, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(attention_impl, "is_gfx1250", lambda: True)
+    assert attention_impl.DenseAttnFwdAiterBackend.can_handle(q) is False
+
+    monkeypatch.setattr(attention_impl, "is_gfx1250", lambda: False)
+    assert attention_impl.DenseAttnFwdAiterBackend.can_handle(q) is True
+
+
+@pytest.mark.gfx1250
+def test_flydsl_dense_backend_declines_off_gfx950(monkeypatch):
+    """The FlyDSL gate must be gfx950 exactly, not a >= compute-capability compare.
+
+    Every FlyDSL FA builder hard-raises on anything but gfx950 (ds_read_tr16_b64 is a
+    CDNA4 LDS transpose load). gfx1250 reports compute capability (12, 5), so the old
+    `>= (9, 5)` compare let it through; only _gqa_group_ok refusing Llama-3.1-8B's G=4
+    kept a gfx1250 run out of a gfx950 JIT.
+    """
+    # G = 32 // 4 = 8, which _gqa_group_ok accepts -- so the arch gate is the only thing
+    # standing between this shape and a gfx950-only kernel build.
+    q = torch.empty(1, 128, 32, 128, dtype=torch.bfloat16)
+    k = v = torch.empty(1, 128, 4, 128, dtype=torch.bfloat16)
+    kw = dict(k=k, v=v, causal=True, qkv_format="sbhd")
+
+    # can_handle also requires the optional flydsl package; pin it so this test is about
+    # the arch gate and nothing else, on a host with or without flydsl installed.
+    monkeypatch.setattr(attention_impl, "FLYDSL_AVAILABLE", True)
+
+    monkeypatch.setattr(attention_impl, "is_gfx950", lambda: True)
+    assert attention_impl.DenseAttnFwdFlydslBackend.can_handle(q, **kw) is True
+
+    monkeypatch.setattr(attention_impl, "is_gfx950", lambda: False)
+    assert attention_impl.DenseAttnFwdFlydslBackend.can_handle(q, **kw) is False
+
+
+@pytest.mark.gfx1250
+def test_flydsl_dense_backend_declines_without_the_flydsl_package(monkeypatch):
+    """FlyDSL must decline when the optional flydsl package is absent.
+
+    setup.py skips installing flydsl for a gfx1250 build. Without this gate the backend
+    would accept on a gfx950 build that happened to omit it and then fail inside the
+    kernel builder rather than at dispatch.
+    """
+    q = torch.empty(1, 128, 32, 128, dtype=torch.bfloat16)
+    k = v = torch.empty(1, 128, 4, 128, dtype=torch.bfloat16)
+    kw = dict(k=k, v=v, causal=True, qkv_format="sbhd")
+
+    monkeypatch.setattr(attention_impl, "is_gfx950", lambda: True)
+    monkeypatch.setattr(attention_impl, "FLYDSL_AVAILABLE", False)
+    assert attention_impl.DenseAttnFwdFlydslBackend.can_handle(q, **kw) is False
+
+
+# ---------------------------------------------------------------------------
+# Triton tuning spec (PRIMUS_TURBO_ATTN_TRITON_TUNE)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.gfx1250
+@pytest.mark.parametrize(
+    "spec,kind,expected",
+    [
+        ("", "fwd", None),
+        ("0", "fwd", None),
+        ("sweep", "fwd", "sweep"),
+        ("num_warps=2,num_stages=2", "fwd", [{"num_warps": 2, "num_stages": 2}]),
+        ("num_warps=2,num_stages=2", "bwd", [{"num_warps": 2, "num_stages": 2}]),
+        ("fwd:num_stages=2;bwd:num_warps=2", "fwd", [{"num_stages": 2}]),
+        ("fwd:num_stages=2;bwd:num_warps=2", "bwd", [{"num_warps": 2}]),
+        ("fwd:sweep", "bwd", None),
+        ("PRE_LOAD_V=true,num_warps=8", "fwd", [{"PRE_LOAD_V": True, "num_warps": 8}]),
+    ],
+)
+def test_triton_tune_spec_parses(spec, kind, expected):
+    from primus_turbo.triton.attention import attention_kernel as ak
+
+    assert ak._parse_tune_spec(spec, kind) == expected
+
+
+@pytest.mark.gfx1250
+@pytest.mark.parametrize("spec", ["num_warps", "bogus=1", "xxx:num_warps=2", "num_warps=abc"])
+def test_triton_tune_spec_rejects_garbage(spec):
+    """A typo must raise, not fall back to the default.
+
+    Silently measuring the shipped config when a sweep asked for something else produces
+    a flat result where every candidate returns the same time -- which reads as "this
+    knob does nothing" rather than as a broken harness.
+    """
+    from primus_turbo.triton.attention import attention_kernel as ak
+
+    with pytest.raises(ValueError):
+        ak._parse_tune_spec(spec, "fwd")
+
+
+@pytest.mark.gfx1250
+def test_triton_autotune_default_is_unchanged_without_the_env_var(monkeypatch):
+    """With the env var unset the kernel must offer exactly the config it always shipped."""
+    monkeypatch.delenv("PRIMUS_TURBO_ATTN_TRITON_TUNE", raising=False)
+    from primus_turbo.triton.attention import attention_kernel as ak
+
+    fwd, _ = ak.get_autotune_fwd_configs()
+    bwd, _ = ak.get_autotune_bwd_configs()
+    for configs in (fwd, bwd):
+        assert len(configs) == 1
+        assert configs[0].num_warps == 4
+        assert configs[0].num_stages == 1
+    assert fwd[0].kwargs.get("PRE_LOAD_V") is False

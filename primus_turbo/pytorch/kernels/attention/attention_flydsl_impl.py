@@ -17,12 +17,36 @@ from typing import Optional, Tuple
 
 import torch
 
-from primus_turbo.flydsl.attention.flash_attn_bwd import (
-    flydsl_varlen_backward,
-)
-from primus_turbo.flydsl.attention.flash_attn_fwd import (
-    build_flash_attn_dualwave_swp_module,
-)
+# The flydsl package is an optional dependency: setup.py skips installing it for a
+# gfx1250 build, where these kernels cannot run anyway (they emit ds_read_tr16_b64, a
+# CDNA4 LDS transpose load, and every builder raises on a non-gfx950 arch). Importing it
+# unconditionally here made the whole attention stack unimportable on such a build --
+# attention_impl and flash_attn_interface both import this module at module scope, so a
+# missing flydsl took down flash_attn_func itself, including the Triton path that is the
+# only one that works there. Degrade to "FlyDSL declines" instead.
+try:
+    from primus_turbo.flydsl.attention.flash_attn_bwd import (
+        flydsl_varlen_backward,
+    )
+    from primus_turbo.flydsl.attention.flash_attn_fwd import (
+        build_flash_attn_dualwave_swp_module,
+    )
+
+    FLYDSL_AVAILABLE = True
+    _FLYDSL_IMPORT_ERROR: Optional[BaseException] = None
+except ImportError as exc:  # pragma: no cover - depends on how the wheel was built
+    FLYDSL_AVAILABLE = False
+    _FLYDSL_IMPORT_ERROR = exc
+
+    def _flydsl_unavailable(*args, **kwargs):
+        raise ImportError(
+            "This operator needs the optional 'flydsl' package, which is not installed. "
+            "The FlyDSL attention backend should have declined before reaching here -- "
+            "reaching this call means a backend gate is wrong."
+        ) from _FLYDSL_IMPORT_ERROR
+
+    flydsl_varlen_backward = _flydsl_unavailable
+    build_flash_attn_dualwave_swp_module = _flydsl_unavailable
 
 # Custom ops so a compiled caller sees opaque nodes instead of tracing into FlyDSL's JIT
 # build (which shells out and takes locks) -- a graph break there is what fullgraph=True

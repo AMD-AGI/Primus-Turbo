@@ -16,3 +16,8 @@ logs/
 primus_turbo/_build_info.py
 primus_turbo/_version.py
 .coverage*
+
+# GPU core dumps (ROCm writes these into cwd on an HSA abort; ~8 GB each)
+gpucore.*.gpu
+# Local measurement ledgers from tools/gfx1250/
+out/

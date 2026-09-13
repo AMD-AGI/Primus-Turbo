@@ -46,6 +46,10 @@ def pytest_addoption(parser):
 def pytest_configure(config):
     config.addinivalue_line("markers", "multigpu: mark test as requiring multiple GPUs")
     config.addinivalue_line("markers", "deterministic: mark test as deterministic-only suite")
+    config.addinivalue_line(
+        "markers",
+        "gfx1250: test is validated on gfx1250 and is exempt from the blanket gfx1250 skip",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
@@ -62,10 +66,15 @@ def pytest_collection_modifyitems(config, items):
         is_gfx1250 = is_gfx1250_jax()
 
     if is_gfx1250:
+        # Skip everything that has not been validated here, but let @pytest.mark.gfx1250
+        # through. A blanket skip over the whole suite means the arch-specific tests that
+        # do pass -- the dense Triton backend's gating and accuracy tests -- never run in
+        # CI on the one card they are written for, so nothing guards that path. Marked
+        # tests still go through the dist/deterministic filtering below.
         skip_gfx1250 = pytest.mark.skip(reason="Not yet supported on gfx1250")
         for item in items:
-            item.add_marker(skip_gfx1250)
-        return
+            if item.get_closest_marker("gfx1250") is None:
+                item.add_marker(skip_gfx1250)
 
     dist_only = config.getoption("--dist-only", False)
     deterministic_only = config.getoption("--deterministic-only", False)

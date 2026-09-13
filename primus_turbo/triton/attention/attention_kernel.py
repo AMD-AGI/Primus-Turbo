@@ -43,6 +43,8 @@
 ###############################################################################
 
 
+import os
+
 import triton
 import triton.language as tl
 
@@ -51,9 +53,127 @@ philox_seed: tl.constexpr = 0x1BF52
 philox_offset: tl.constexpr = 0x1D4B42
 
 
+# Cross-kernel ABI, NOT a free tuning knob.
+#
+# The forward writes LSE into the shared [B, Hq, Sq*2] scratch at block offset
+# ``m * BLOCK_M * 2`` and _bwd_preprocess_use_o writes delta at ``+ BLOCK_M`` of the same
+# block, so the two interleave per BLOCK_M rather than per row, and
+# attention_triton_impl._lse_delta_views reconstructs that indexing on the host. Those
+# three sites must agree on one value. Retiling the forward independently of the backward
+# preprocess silently mis-reads delta; see docs/gfx1250-attention-tuning.md for the map of
+# what is safe to retile and what is not.
 FIXED_BLOCK_M = 64
 FIXED_BLOCK_N = 64
 USE_FP8E5M2_BWD = False
+
+
+# ---------------------------------------------------------------------------
+# Tuning surface
+# ---------------------------------------------------------------------------
+# Every config below ships with one hand-picked entry inherited from the upstream
+# ROCm/triton perf-kernel, which was tuned for CDNA: wave64, MFMA, 64 KB LDS. gfx1250 is
+# wave32 with WMMA and 320 KB LDS, so num_warps=4 is 128 lanes there rather than 256, and
+# num_stages=1 means no software pipelining at all on a part whose headline feature is an
+# async data mover. @triton.autotune with a single-element list is a compile cache, not a
+# search -- this space has never been swept on this arch.
+#
+# The default stays that single config, so nothing changes for any existing caller. The
+# env var opens it up for the tuning harness:
+#
+#   PRIMUS_TURBO_ATTN_TRITON_TUNE=sweep          -> benchmark the full curated grid
+#   PRIMUS_TURBO_ATTN_TRITON_TUNE=num_warps=2,num_stages=2
+#                                                -> pin exactly one config (harness mode)
+#   PRIMUS_TURBO_ATTN_TRITON_TUNE=fwd:num_stages=2;bwd:num_warps=2
+#                                                -> pin the two halves separately
+#
+# Pinning one config is the mode an A/B round wants: Triton then compiles exactly what was
+# asked for with no benchmarking pass, so the measurement is of that config and nothing
+# else.
+_TUNE_ENV = "PRIMUS_TURBO_ATTN_TRITON_TUNE"
+
+# Scheduling knobs only -- no block size, no grid change, no memory layout. These are
+# where the measured wins on this arch have been: on aiter's Triton MHA at the same shape,
+# forward num_stages 1->2 alone was 2.06x and backward num_warps 4->2 alone was 1.32x.
+_SWEEP_NUM_WARPS = (1, 2, 4, 8)
+_SWEEP_NUM_STAGES = (1, 2, 3)
+
+
+def _parse_tune_spec(spec: str, kind: str):
+    """Parse the env var into a list of kwarg dicts for triton.Config.
+
+    ``kind`` is "fwd" or "bwd". Returns None for "use the shipped default", the string
+    "sweep" for the full grid, or a list of dicts to pin. Raises on anything it cannot
+    parse rather than silently falling back -- a typo that quietly measured the default
+    config would read as "this knob does nothing".
+    """
+    spec = (spec or "").strip()
+    if not spec or spec in ("0", "off"):
+        return None
+    if spec == "sweep":
+        return "sweep"
+
+    # "fwd:...;bwd:..." selects per half; a bare spec applies to both.
+    section = spec
+    if ";" in spec or ":" in spec:
+        chosen = None
+        for part in spec.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            if ":" not in part:
+                raise ValueError(f"{_TUNE_ENV}: expected 'fwd:...' or 'bwd:...', got {part!r}")
+            tag, body = part.split(":", 1)
+            if tag.strip() not in ("fwd", "bwd"):
+                raise ValueError(f"{_TUNE_ENV}: unknown section {tag!r}, expected 'fwd' or 'bwd'")
+            if tag.strip() == kind:
+                chosen = body.strip()
+        if chosen is None:
+            return None
+        if chosen == "sweep":
+            return "sweep"
+        section = chosen
+
+    cfg = {}
+    for item in section.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"{_TUNE_ENV}: expected key=value, got {item!r}")
+        key, value = (x.strip() for x in item.split("=", 1))
+        if key in ("num_warps", "num_stages", "waves_per_eu"):
+            cfg[key] = int(value)
+        elif key == "PRE_LOAD_V":
+            cfg[key] = value.lower() in ("1", "true", "yes")
+        else:
+            raise ValueError(f"{_TUNE_ENV}: unknown key {key!r}")
+    return [cfg]
+
+
+def _build_configs(pinned, default_kwargs, sweep_kwargs):
+    """Turn the parsed spec into triton.Config objects.
+
+    ``num_warps`` / ``num_stages`` are triton.Config's own arguments; everything else is a
+    kernel constexpr and goes in the leading dict.
+    """
+
+    def make(kwargs):
+        kwargs = dict(kwargs)
+        num_warps = kwargs.pop("num_warps", 4)
+        num_stages = kwargs.pop("num_stages", 1)
+        return triton.Config(kwargs, num_stages=num_stages, num_warps=num_warps)
+
+    if pinned is None:
+        return [make(default_kwargs)]
+    if pinned == "sweep":
+        out = []
+        for num_warps in _SWEEP_NUM_WARPS:
+            for num_stages in _SWEEP_NUM_STAGES:
+                cfg = dict(sweep_kwargs)
+                cfg.update(num_warps=num_warps, num_stages=num_stages)
+                out.append(make(cfg))
+        return out
+    return [make({**default_kwargs, **cfg}) for cfg in pinned]
 
 
 def get_shape_from_layout(
@@ -450,15 +570,9 @@ def _attn_fwd_inner(
 
 
 def get_autotune_fwd_configs():
-    return [
-        triton.Config(
-            {
-                "PRE_LOAD_V": False,
-            },
-            num_stages=1,
-            num_warps=4,
-        ),
-    ], [
+    default = {"PRE_LOAD_V": False, "num_stages": 1, "num_warps": 4}
+    pinned = _parse_tune_spec(os.environ.get(_TUNE_ENV, ""), "fwd")
+    return _build_configs(pinned, default, default), [
         "IS_CAUSAL",
         "dropout_p",
         "MAX_SEQLENS_Q",
@@ -1093,13 +1207,9 @@ def _bwd_preprocess_use_o(
 
 
 def get_autotune_bwd_configs():
-    return [
-        triton.Config(
-            {},
-            num_stages=1,
-            num_warps=4,
-        ),
-    ], [
+    default = {"num_stages": 1, "num_warps": 4}
+    pinned = _parse_tune_spec(os.environ.get(_TUNE_ENV, ""), "bwd")
+    return _build_configs(pinned, default, default), [
         "BLOCK_DMODEL",
         "ACTUAL_BLOCK_DMODEL_QK",
         "ACTUAL_BLOCK_DMODEL_V",
