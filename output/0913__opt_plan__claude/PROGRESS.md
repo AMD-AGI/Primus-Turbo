@@ -4,7 +4,7 @@
 然后更新本文件。**GPU 忙不是停下的理由**——GPU 跑测量时，CPU 侧永远有代码/文档/下一批可推进。
 **永远不要以「等待」结束回合。**
 
-最后更新：2026-09-13 14:05 UTC
+最后更新：2026-09-13（离线 ISA 分析后）
 
 ---
 
@@ -69,19 +69,27 @@ GPU 数量和占用进程改读 `/sys/class/kfd/`（纯读，不会阻塞在驱�
       wave32 下，dk/dv 的 fp32 累加器占 512 VGPR/lane，加常驻 k/v 再 256 = 1024 里用掉 768，
       还没算 score tile；1 wave/SIMD + num_stages=1，占用率和流水都不提供延迟隐藏。
       同时扫 num_warps × num_stages（寄存器压力若是瓶颈，stages=2 可能在 warps=8 下才可行）。
+      **离线 ISA 已证实寄存器压力确实是瓶颈**：冠军 vgpr 顶满 1024，spill 113/245，
+      且 `s_set_vgpr_msb`（>256 VGPR 的存储体选择，纯开销）有 **1834 条 = 全部指令的 15.7%，
+      是 WMMA 条数的 4.1 倍**。注意缓存里已有的 warps=8 变体（BSF=2）编译器选了 512 VGPR
+      预算换占用率、**仍然 spill**，所以 warps=8 不是自动的解，要实测。
+- [ ] **T1b. `waves_per_eu` 不设（删键）。零代码改动，从未测过。**
+      同一配置 wpe=0 vs wpe=1 只差 LLIR 一行属性，却差 10,831 行机器码：
+      总指令 8,793 vs 8,983（−2.1%），`s_set_vgpr_msb` 1,689 vs 1,853（−8.9%），
+      代价是多 3 条 spill 存储。净向好但需 A/B。也是 T4 那 1.85 ms 的可信机制候选。
 - [ ] **T2. aiter 预编译 gfx1250 ASM 反向探针。一小时。**
       `aiter-src/hsa/gfx1250/fmha_v3_bwd/bwd_hd128_bf16_causal_br_a32_pssk.co` 已确认存在，
       CSV 行与生产形状逐项匹配，C++ host 五处特判 gfx1250，**只缺 Python 侧架构门**。
       注意：必须先 `dq.zero_()`（gfx1250 只有 atomic32，绕过门控直调会得到静默垃圾 dq），
       且要在**脚本里**调，不要 patch 安装好的 aiter（会污染 21.684 ms 这个参考）。
-- [ ] **T3. E2/E3（见 `phase2/prepared-experiments/README.md`）。**
-      E2 消四次 `tl.trans`——先花 15 分钟 dump ISA 看后端是否发 `ds_load_tr16_b128`
-      （gfx1250 有，gfx950 只有 b64），**这一个检查决定它值 2% 还是 10%**。
-      E3 折掉 exp 前的逐元素 VALU，仅 dq 那趟可用累加器初值法。
+- [x] ~~**T3-E2. 消四次 `tl.trans`**~~ —— **已离线判死，不要上卡。** ISA 显示后端已经
+      发了 32 条 `ds_load_tr16_b128`、0 条普通 `ds_read`，转置已被免费折叠进加载指令。
+      手工消除的是一个不存在的开销。见 `phase2/isa/ISA-FINDINGS.md`。
+- [ ] **T3. E3** 折掉 exp 前的逐元素 VALU，仅 dq 那趟可用累加器初值法。
 - [ ] **T4. vendored 与纯 aiter 的 1.85 ms 差。** 已排除四个假设（gather 开销 0.018 ms、
       配置相同、布局相同、sliding_window 相同）。同内核同配置，vendored 19.727 vs
-      aiter 18.063，非内核开销两边都是 0.138 —— 差异在**编译产物本身**。下一步 diff
-      两条路径的 Triton 缓存元数据。7.6% 的量，优先级低于上面。
+      aiter 18.063，非内核开销两边都是 0.138 —— 差异在**编译产物本身**。缓存元数据已 diff 完：
+      找到了一个同阶的机制候选 `waves_per_eu`（见 T1b）。7.6% 的量，优先级低于上面。
 - [ ] **T5. 非因果 / varlen / sink 覆盖。** 融合内核支持 sink 但 dsink 没接；
       varlen 在 gfx1250 上仍无 Triton 路径。
 - [ ] **T6. HipKittens udna1。** 仅在 Triton 撞到天花板后启动。见 `phase2/PLAN-4GPU-TOMORROW.md`。
@@ -106,12 +114,25 @@ GPU 数量和占用进程改读 `/sys/class/kfd/`（纯读，不会阻塞在驱�
 7. **HipKittens 的「固定零参考最大值」用在反向** —— 这个反向**没有 running max**，
    `m` 来自前向存好的 LSE，要删的东西不存在。其对偶（把 LSE 偏移折进 GEMM 累加器初值）
    可用，但**仅 dq 那一趟**。
+9. **E2 / `tl.trans` 消除** —— 后端已发 `ds_load_tr16_b128`，转置是免费的，无可优化。
 8. **FlyDSL** —— 上游 v0.3.3 **确实支持 gfx1250**（`tdm_ops`/`s_wait_tensorcnt`/
    `ds_load_tr16_b128` 都在），所以工具链门是开的。但**任何树里都不存在 gfx1250 的 attention
    反向**，而 Primus-Turbo 的 gfx950 FlyDSL 反向是 5,581 行、106 处 MFMA，
    其手排调度在 wave64→wave32 下一条都不成立。同样人天投 udna1 期望更高（少一个外部依赖）。
 
 ---
+
+## 明天 4 卡机的第一优先方法改动：**先离线筛，再上卡**
+
+Triton 编译不需要 GPU。候选配置可以先编译，离线读出
+`vgpr / spill / s_set_vgpr_msb / wmma / 总指令数`，**只把不顶满 1024 VGPR 的送上卡**。
+43 个变体里规律是二值的：vgpr ≤ 951 的 **21 个变体 spill 恰好为 0**；
+vgpr = 1024 的 **14 个全部 spill**（28 到 1814 条不等），没有中间态。
+今天那些以 1600–1900 条 spill 收场的配置每一个都烧掉了真实 GPU 分钟才被判死，
+而它们在编译期就能看出来。
+
+**另外：卡挂了也能解剖。** `docker cp` 在 `docker exec` 失效后仍然可用，
+容器的 Triton 缓存（`/root/.triton/cache`）里有今天每一个内核的完整编译产物。
 
 ## 六条必须保留的纪律
 
