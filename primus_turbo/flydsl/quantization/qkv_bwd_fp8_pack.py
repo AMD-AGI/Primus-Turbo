@@ -48,7 +48,28 @@ _CM = int(_os.environ.get("QKV_CM_ST", "16"))  # cache modifier on the row-major
 # invariant). See campaign goal.md P1.
 _CM_STT = int(_os.environ.get("QKV_CM_STT", "2"))
 _CM_LA = int(_os.environ.get("QKV_CM_LA", "3"))  # cache modifier on pass-A input loads
-_CM_LB = int(_os.environ.get("QKV_CM_LB", "16"))  # cache modifier on pass-B input loads
+# nt (bit1=2) on pass-B's dq/dk/dv loads. Round 3/6's isolated-probe measurement (fixed
+# out/out_t buffers, no allocation between reps) called this "neutral on the fused path"
+# (124.9 -> 124.5us) or even a loss (round 2, pre-B_MAP). Round 7's BLOCKED ruler A/B
+# (bench.sh, N=24 per side, alternating-paired baseline/candidate, fresh torch.empty()
+# output allocation every call -- the real deployment regime) instead measures a huge,
+# fully non-overlapping win: score median 2.286 -> 2.587 (+13.2%), candidate_ms
+# 0.2036ms -> 0.1810ms. An 8-point bit sweep of every flag in isolation and combination
+# (0,1,2,3,4,6,8,16 -- see goal.md P1' / round-7 report) shows the effect is caused by
+# bit1 (value 2, "nt") ALONE: every value with bit1 set (2,3,6) scores ~2.59; every value
+# without it (0,1,4,8,16) scores ~2.30, regardless of sc0/sc1/the undocumented bit2/swz
+# bits. Mechanism hypothesis (not yet profiler-confirmed -- rocprofv3 aborts in this
+# container): the isolated probe reuses the same fixed out/out_t buffers with zero
+# allocator churn for its whole 40-rep loop, so whichever HBM/L2 mode a run's fixed
+# addresses land in is "sticky" for that entire process. The real ruler -- like real
+# training, where this kernel's inputs were just written by the attention backward and
+# its outputs are consumed by the very next GEMM -- allocates fresh output tensors and
+# alternates with the reference path's own very different allocation pattern every
+# call, constantly perturbing the address/cache state. Cached pass-B loads (bit1=0) are
+# apparently sensitive to that churn (landing in the slow mode almost every real call);
+# nt loads (bit1=1) are not. Prefer plain nt (2) over sc0|nt (3): same measured result,
+# one flag instead of two, matching the existing CM_STT=2 convention below.
+_CM_LB = int(_os.environ.get("QKV_CM_LB", "2"))  # cache modifier on pass-B input loads
 _B_MAP = int(_os.environ.get("QKV_B_MAP", "1"))  # pass-B block -> (row block, group) map
 _FOLD_S = int(_os.environ.get("QKV_FOLD_S", "0"))  # fold the amax->scale reduce into pass B
 # transposed-half attribution knob: 1 = LDS writes + barriers only, 2 = + corner-turn
