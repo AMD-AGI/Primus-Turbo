@@ -298,7 +298,7 @@ class FlashAttnFunc(torch.autograd.Function):
             # 36.4 at b=4 s=8192, against torch flex's 31.3). It declines short sequences,
             # where its tile is a pessimisation, and anything with a sink; those keep the
             # path that was already shipping.
-            if fused_backward_eligible(q, k.shape[1], sink):
+            if fused_backward_eligible(q, k.shape[1], sink):  # tile chosen per seqlen inside
                 dq, dk, dv = dense_fused_backward(
                     dout,
                     q,

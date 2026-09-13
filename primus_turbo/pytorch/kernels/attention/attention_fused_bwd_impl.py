@@ -392,6 +392,13 @@ def dense_fused_backward(
     """
     if q.dim() != 4:
         raise ValueError(f"dense_fused_backward expects bshd 4-D q, got shape {tuple(q.shape)}")
+    # The right K-axis tile depends on sequence length (see fused_backward_tile). Chosen per
+    # call rather than baked in: one value cannot serve s=1024 and s=16384, and the wrong one
+    # costs 1.33x at the short end.
+    _cfg = {kk: dict(vv) for kk, vv in get_fused_bwd_config().items()}
+    _tile = fused_backward_tile(k.shape[1])
+    _cfg["onekernel"]["BLOCK_N1"] = _tile
+    _cfg["onekernel"]["BLOCK_M2"] = _tile
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
 
@@ -452,6 +459,7 @@ def dense_fused_backward(
         sink=None,
         dsink=None,
         sliding_window=sliding_window,
+        config=_cfg
     )
 
     if packed and write_back_delta:
@@ -478,7 +486,39 @@ def dense_fused_backward(
 # The crossover is monotone in sequence length and the shipped tile is N1=256, so the gate
 # is a sequence-length threshold. At s=1024 that tile leaves only four K blocks and most of
 # it is wasted, which is why it loses there.
-_MIN_SEQLEN_FOR_FUSED = 2048
+# The fused backward beats the in-tree two-kernel path wherever there is enough parallel
+# work, and the right K-axis tile moves with sequence length. Measured on gfx1250, vendored
+# path, total fwd+bwd ms (lower is better), forward num_stages=2:
+#
+#   shape              seq    N1=32    N1=64   N1=128   N1=256   best   vs in-tree
+#   b4 s1024 hq32     1024    2.384    1.515    1.324    1.764   128    1.87x
+#   b4 s2048 hq32     2048    6.838    3.974    3.137    3.006   256    1.36x
+#   b4 s4096 hq32     4096   24.432   13.007    8.880    7.941   256
+#   b4 s8192 hq32     8192   93.324   49.433   31.545   24.415   256
+#   b1 s16384 hq32   16384  103.409   52.188   32.057   23.788   256
+#   b1 s1024  hq8     1024    1.000    1.013    1.197    1.787    32    0.69x  <- LOSES
+#
+# Two things to read off this. First, the tile crossover is at 1024/2048: below 2048 the
+# 256-wide tile leaves too few K blocks and 128 wins. Second -- and this corrected an
+# earlier, wrong gate -- short sequences are NOT the thing that makes the fused path lose.
+# b4 s1024 hq32 is short and the fused path still wins by 1.87x. The one shape it loses on
+# has hq=8 and batch=1, i.e. 16x less parallel work than b4/hq32 at the same length. An
+# earlier seqlen-only threshold of 2048 was generalising from that shape and was leaving
+# 1.87x on the table at s=1024.
+_FUSED_TILE_BY_SEQLEN = ((2048, 256), (0, 128))
+
+# batch * num_q_heads below this and there is not enough work to fill the machine with the
+# fused kernel's larger tiles. b1/hq8 = 8 loses; b4/hq32 = 128 wins by 1.87x at the same
+# sequence length. Set conservatively between the two measured points.
+_MIN_PARALLEL_WORK = 32
+
+
+def fused_backward_tile(seqlen_k: int) -> int:
+    """BLOCK_N1 (== BLOCK_M2) for this sequence length. See the table above."""
+    for threshold, tile in _FUSED_TILE_BY_SEQLEN:
+        if seqlen_k >= threshold:
+            return tile
+    return 128
 
 
 def fused_backward_eligible(
@@ -500,5 +540,7 @@ def fused_backward_eligible(
         return False
     if q.dim() != 4:
         return False
-    # Below this the shipped tile is a pessimisation -- see the table above.
-    return seqlen_k >= _MIN_SEQLEN_FOR_FUSED
+    batch, _, num_q_heads, _ = q.shape
+    if batch * num_q_heads < _MIN_PARALLEL_WORK:
+        return False
+    return seqlen_k >= 512

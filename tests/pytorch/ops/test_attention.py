@@ -1883,21 +1883,45 @@ def test_triton_autotune_default_is_unchanged_without_the_env_var(monkeypatch):
 
 @pytest.mark.gfx1250
 @pytest.mark.parametrize(
-    "seqlen,expected",
-    [(512, False), (1024, False), (2048, True), (8192, True)],
-    ids=["s512", "s1024", "s2048", "s8192"],
+    "batch,seqlen,heads,expected",
+    [
+        (4, 1024, 32, True),    # short but plenty of work -- 1.87x faster than the in-tree path
+        (4, 2048, 32, True),
+        (4, 8192, 32, True),
+        (1, 16384, 32, True),
+        (1, 1024, 8, False),    # the one measured loss: 16x less parallel work
+        (1, 256, 8, False),
+    ],
+    ids=["b4s1024h32", "b4s2048h32", "b4s8192h32", "b1s16384h32", "b1s1024h8", "tiny"],
 )
-def test_fused_backward_gate_is_a_sequence_length_threshold(seqlen, expected):
-    """The fused backward wins at training sequence lengths and loses at short ones.
+def test_fused_backward_gate_is_about_work_not_sequence_length(batch, seqlen, heads, expected):
+    """The gate keys on parallel work, not on sequence length alone.
 
-    Measured on gfx1250 (total fwd+bwd, vendored path): at b=4 s=8192 its shipped N1=256
-    tile is 3.8x better than N1=32, but at s=1024 it is worse than the in-tree path because
-    that tile leaves only four K blocks. The gate encodes that crossover.
+    An earlier version of this gate was a seqlen >= 2048 threshold, generalised from the one
+    shape where the fused path loses (b=1, hq=8, s=1024). That was wrong: b=4 hq=32 at the
+    same s=1024 is 1.87x FASTER fused. What separates them is batch*heads -- 8 versus 128 --
+    not the sequence length they share.
     """
     from primus_turbo.pytorch.kernels.attention import attention_fused_bwd_impl as fb
 
-    q = torch.empty(2, seqlen, 32, 128, dtype=torch.bfloat16)
+    q = torch.empty(batch, seqlen, heads, 128, dtype=torch.bfloat16)
     assert fb.fused_backward_eligible(q, seqlen) is expected
+
+
+@pytest.mark.gfx1250
+@pytest.mark.parametrize(
+    "seqlen,tile", [(512, 128), (1024, 128), (2048, 256), (8192, 256), (16384, 256)]
+)
+def test_fused_backward_tile_follows_sequence_length(seqlen, tile):
+    """BLOCK_N1 crossover sits between 1024 and 2048.
+
+    Measured (total fwd+bwd, b=4 hq=32): at s=1024, N1=128 is 1.324 ms against N1=256's
+    1.764 -- the wide tile leaves too few K blocks. At s=2048 it reverses (3.006 vs 3.137)
+    and the gap widens with length.
+    """
+    from primus_turbo.pytorch.kernels.attention import attention_fused_bwd_impl as fb
+
+    assert fb.fused_backward_tile(seqlen) == tile
 
 
 @pytest.mark.gfx1250
