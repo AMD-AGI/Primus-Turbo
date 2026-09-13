@@ -21,7 +21,10 @@
 4. `rocm-smi --showpids` 必须显示无进程、VRAM 0%
 5. 容器 `fa-tune-0913` 和镜像 `fa-tune:deps`（含全套 torchtitan 依赖）都不受影响
 
-**诊断 wedge 时只能用带 timeout 的 dmesg。** `ps ... wchan`、`rocm-smi`、
+**诊断 wedge 时只能用带 timeout 的 dmesg，而且 `timeout` 对 rocm-smi 无效**
+——sudo 父进程被杀掉，rocm-smi 子进程还活着占着管道，命令替换永不返回。
+GPU 数量和占用进程改读 `/sys/class/kfd/`（纯读，不会阻塞在驱动上）。
+另外 dmesg 要搜**整个缓冲区**，`tail -300` 会被 apparmor 日志刷掉而把挂掉的卡报成 clean。 `ps ... wchan`、`rocm-smi`、
 `docker exec`、任何遍历设备/进程状态的命令**都会挂住**。这很反直觉——
 怀疑卡挂了的时候本能想跑的命令，正是会挂住的那些。
 
