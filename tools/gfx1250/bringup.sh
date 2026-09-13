@@ -22,12 +22,26 @@ lsmod 2>/dev/null | grep -q '^amdgpu' && say "amdgpu module" "loaded" || { say "
 
 # 3. A wedge survives a modprobe but not a reboot. dmesg is the ONLY safe probe here --
 #    rocm-smi, ps with wchan, and docker exec all HANG on a wedged card.
-w=$(timeout 20 sudo -n dmesg 2>/dev/null | tail -300 | grep -cE 'MES\(|wait for reset ack|GPU Hang' || echo 0)
-[ "$w" -eq 0 ] && say "dmesg: wedge signatures" "clean" || { say "dmesg: wedge signatures" "$w FOUND -- REBOOT NEEDED"; fail=1; }
+# grep -c already prints a count; it also exits 1 when that count is zero, so a
+# `|| echo 0` appends a SECOND line and every later [ ] test sees "0\n0". Drop the
+# fallback and default the variable instead.
+# Search the WHOLE buffer, not a tail window: on a busy node the MES lines scroll out of
+# a few hundred lines within minutes (apparmor audit spam), and a tail-based check then
+# reports a wedged card as clean -- which it did on the first run of this script.
+w=$(timeout -k 5 20 sudo -n dmesg 2>/dev/null | grep -cE 'MES\(|wait for reset ack|GPU Hang'); w=${w:-0}
+if [ "$w" -eq 0 ]; then
+  say "dmesg: wedge signatures" "clean"
+else
+  say "dmesg: wedge signatures" "$w FOUND -- REBOOT NEEDED"
+  echo
+  echo "NODE WEDGED. Everything below this point either hangs or reports nothing useful"
+  echo "on a wedged card, so the remaining checks are skipped. Reboot, then modprobe amdgpu."
+  exit 1
+fi
 
 # 4. The VR throttle has returned after every reboot so far. Not fatal, but every absolute
 #    number is conditional on it, so it must be recorded rather than discovered later.
-clk=$(sudo -n cat /sys/class/drm/card*/device/pp_dpm_sclk 2>/dev/null | tr '\n' ' ')
+clk=$(timeout -k 5 15 sudo -n cat /sys/class/drm/card*/device/pp_dpm_sclk 2>/dev/null | tr '\n' ' ')
 case "$clk" in
   *2[0-9][0-9][0-9]Mhz*|*1[6-9][0-9][0-9]Mhz*) say "clock ceiling" "HEALTHY -- $clk" ;;
   *1100Mhz*) say "clock ceiling" "VR-THROTTLED 1100MHz (~1.65x low) -- $clk" ;;
@@ -36,11 +50,20 @@ esac
 
 # 5. A leftover process holding VRAM does not raise -- it makes every measurement contended
 #    and low, and a low number becomes the champion the next round must beat.
-p=$(timeout 30 sudo -n /opt/rocm/bin/rocm-smi --showpids 2>/dev/null | grep -cE '^[0-9]+' || echo 0)
+# -k: rocm-smi on a wedged card ignores SIGTERM (it is blocked in amdgpu_info_ioctl),
+# so a plain `timeout` never returns. SIGKILL after 5 more seconds is what actually
+# bounds it. This is the command that hung the first run of this script.
+# Same rocm-smi hazard as above; /sys/class/kfd/kfd/proc/ lists the processes holding the
+# device and is a directory read.
+p=$(ls /sys/class/kfd/kfd/proc/ 2>/dev/null | wc -l); p=${p:-0}
 [ "$p" -eq 0 ] && say "leftover KFD processes" "none" || { say "leftover KFD processes" "$p STILL HOLDING VRAM"; fail=1; }
 
 # 6. GPU count, for deciding how many streams to launch.
-n=$(timeout 30 sudo -n /opt/rocm/bin/rocm-smi --showid 2>/dev/null | grep -c '^GPU\[' || echo 0)
+# NOT rocm-smi: under `timeout` the sudo parent dies but the rocm-smi child survives
+# holding the pipe open, so $( ) never returns -- that is what hung this script twice.
+# KFD topology is a plain sysfs read and cannot block on the driver.
+n=$(grep -l . /sys/class/kfd/kfd/topology/nodes/*/properties 2>/dev/null | wc -l); n=${n:-0}
+n=$(awk '/gfx_target_version/ && $2 != 0 {c++} END{print c+0}' /sys/class/kfd/kfd/topology/nodes/*/properties 2>/dev/null)
 say "GPUs visible" "$n"
 
 # 7. The BLAS gap makes end-to-end tps meaningless; check whether this image has it.
