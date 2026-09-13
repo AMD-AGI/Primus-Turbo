@@ -72,6 +72,21 @@ if "--tune" in sys.argv:
 # Set before torch is imported; torch reads it at backend-selection time.
 os.environ.setdefault("TORCH_BLAS_PREFER_HIPBLASLT", "0")
 
+# Pin this process to one GPU, hard, before torch initialises.
+#
+# On a multi-GPU box the isolation has to be at the driver level, not a torch.cuda
+# device index: op-evolve has no GPU lock, and a candidate that lands on a card another
+# stream is using does not raise -- it records a low number, and that number becomes the
+# champion the next round has to beat. HIP_VISIBLE_DEVICES makes the other cards
+# invisible, so a stray allocation cannot reach them.
+#
+# Set GPU=<n> (or pass --gpu) and every stream is fenced to its own card. Torch then sees
+# exactly one device and every "cuda" below means that one.
+if "--gpu" in sys.argv:
+    os.environ["HIP_VISIBLE_DEVICES"] = sys.argv[sys.argv.index("--gpu") + 1]
+elif os.environ.get("GPU"):
+    os.environ["HIP_VISIBLE_DEVICES"] = os.environ["GPU"]
+
 # Same reason as _TUNE_ENV above: the vendored fused backward reads its config at import.
 if "--fused-tune" in sys.argv:
     os.environ["PRIMUS_TURBO_FUSED_MHA_BWD_TUNE"] = sys.argv[sys.argv.index("--fused-tune") + 1]
@@ -317,6 +332,12 @@ def main() -> int:
     ap.add_argument("--skip-correctness", action="store_true",
                     help="time only. The loop must NOT use this: an unchecked candidate "
                          "can be fast because it computes less.")
+    ap.add_argument("--gpu", default="",
+                    help="pin to this GPU via HIP_VISIBLE_DEVICES, read before torch imports. "
+                         "Driver-level rather than a torch device index, so a stray "
+                         "allocation cannot reach another stream's card -- there is no GPU "
+                         "lock, and a contended measurement does not raise, it just records "
+                         "a low number that becomes the next champion to beat.")
     ap.add_argument("--shapes", default="",
                     help="comma-separated shapes to measure IN ONE PROCESS, e.g. "
                          "'llama31-8b,llama31-8b-b2'. Amortises the ~10-15 s of import and "
@@ -362,6 +383,9 @@ def _measure(args) -> int:
     import primus_turbo
 
     result["turbo_path"] = primus_turbo.__file__
+    # Which physical card this row was measured on. Without it a 4-stream ledger cannot be
+    # audited after the fact, and per-GPU clock differences get attributed to the config.
+    result["gpu"] = os.environ.get("HIP_VISIBLE_DEVICES", "all")
     result["arch"] = torch.cuda.get_device_properties(0).gcnArchName
     result["is_gfx1250"] = bool(is_gfx1250())
     result["configs"] = assert_config_applied(args.tune)

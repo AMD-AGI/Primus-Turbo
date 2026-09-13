@@ -11,6 +11,18 @@ LEDGER=${LEDGER:-/tmp/forever.jsonl}; touch "$LEDGER"
 H=tools/gfx1250/tune_attention.py
 export PYTHONPATH=/home/lihuzhan/code/aiter-src
 
+# One stream per card. GPU=<n> fences this queue to one GPU at the driver level and gives
+# it its own ledger and STOP sentinel, so four streams run four INDEPENDENT hypotheses
+# rather than one sweep sharded four ways -- a dud then costs one stream, not the day.
+#   GPU=0 LEDGER=/tmp/wq.g0.jsonl bash tools/gfx1250/forever_queue.sh &
+#   GPU=1 LEDGER=/tmp/wq.g1.jsonl bash tools/gfx1250/forever_queue.sh &
+if [ -n "${GPU:-}" ]; then
+  export HIP_VISIBLE_DEVICES="$GPU"
+  LEDGER=${LEDGER:-/tmp/forever.g${GPU}.jsonl}
+  STOP_FILE=${STOP_FILE:-/tmp/wq.g${GPU}.stop}
+  touch "$LEDGER"
+fi
+
 # Graceful stop. Taking an exclusive measurement window by pkill -9 on this queue kills a
 # process with work in flight on the GPU, and doing that repeatedly is a plausible
 # contributor to the wedge on 2026-09-13 (see phase2/INCIDENT-2026-09-13-wedge.md).
