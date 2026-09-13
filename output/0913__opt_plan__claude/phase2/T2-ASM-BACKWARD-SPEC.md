@@ -100,3 +100,41 @@ ELF 元数据给出 44 个字段的逐字段偏移，每字段补齐 16 字节�
 用 `hipModuleLoad` + `hipModuleLaunchKernel` 直调这三个 `.co`，**不要 patch 装好的 aiter**
 （会污染 21.684 ms 那个参考基线）。四张量 SQNR 门照常，dq_acc 必须是 fp32 且先清零。
 **odo 的布局是三者中唯一没有被反汇编确证的，如果结果是数值垃圾，先怀疑它。**
+
+---
+
+# Launcher 已写好：`tools/gfx1250/asm_bwd_launcher.py`
+
+`hipModuleLoad` / `hipModuleLaunchKernel` 的 ctypes 封装 + 三个内核的参数打包。
+**一行都没在 GPU 上跑过**（卡在写它之前就已经挂了），所以明天第一次运行是 bring-up，不是测量。
+
+离线自测（`--selftest`，不需要 GPU）检查打包尺寸、偏移、字节序和 `.co` 是否存在：
+
+```
+  odo      packed 84 B (kernarg 84)      ok
+  dqdkdv   packed 704 B (kernarg 704), last field ends at 692  ok
+  scalar round-trips as float: 0.08838835  ok
+  post     packed 208 B (kernarg 208), bytes past 0x9f all zero: ok
+```
+
+**自测立刻抓到了我自己的一个错误**：第一版 `DQDKDV_FIELDS` 是手抄的，
+**悄悄漏了最后 7 个字段，其中包括 `mask_x` / `mask_y`**。
+自测之所以能抓到，只因为它打印「最后一个字段结束于哪里」——580 而不是 692。
+现在这张表**从 ELF 生成，不再手抄**。这正是 `asm_bwd_abi.py` 存在的理由，而我第一次没用它。
+
+## 最后一个未知量也解决了：`mask_x` / `mask_y` 传 0
+
+host 只在 `if (mt == 3)`（generic window）时给这两个字段赋值。我们的 CSV 行是
+`mask=2`（因果 bottom-right），走不到那个分支，而 `fmha_bwd_dqdkdv_args`
+在 `mha_bwd.cu:621` 是**未初始化声明**——也就是说 aiter 自己在这条路径上传的就是栈垃圾。
+内核显然不读它们，否则 aiter 早就坏了。因果行为在 `_causal_br_` 这个内核变体本身里。
+**传 0 安全。**
+
+## 剩余风险清单（按可疑程度排序）
+
+1. **`odo` 的紧凑布局** —— 三者中唯一没被反汇编确证的（kernarg 预加载，`s_load` 为 0）。
+2. **字节步长** —— 所有 stride 字段是**字节**不是元素（bf16 ×2、fp32 lse/delta ×4）。
+   传成元素步长不会报错，会静默读错内存。
+3. **`dq_acc` 必须是 fp32 且清零** —— 主内核有 514 条 `buffer_atomic_add_f32`。
+4. **grid** —— `(ceil(Sk/128), nhead_q, batch)`，因果时 `gdx=(gdx+1)/2`；
+   我们的形状是 `(32, 32, 4)`。block 恒为 128。
