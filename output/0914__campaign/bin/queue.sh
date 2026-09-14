@@ -77,6 +77,22 @@ while true; do
           --fused-tune "waves_per_eu=$W"
     done
     ;;
+  sweep2)
+    # Fresh grid: the champion's remaining scheduling knobs on the fused backward, at the
+    # config that now ships (ASM forward + in-thread transpose).
+    for W in 1 2 4; do for S in 1 2; do
+      run "s2|bwdw$W|s$S" --shape llama31-8b --impl asm --fused-tune "num_warps=$W,num_stages=$S"
+    done; done
+    for M in 16 32 64 128; do
+      run "s2|nkdim$M" --shape llama31-8b --impl asm --fused-tune "matrix_instr_nonkdim=$M"
+    done
+    ;;
+  shapes2)
+    # The production-adjacent shapes on the shipping path, for the dispatcher table.
+    for S in gate-s1024 gate-s2048 llama31-8b-s4096 gate-b1 llama31-8b-b2 llama31-8b gate-b8 gate-s16384; do
+      run "sh2|$S|asm" --shape $S --impl asm
+    done
+    ;;
   gate)
     # Shape-gate coverage for the dispatcher: the tile that wins at s=8192 loses at s=1024,
     # so the gate needs the crossover, not the endpoints.

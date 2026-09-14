@@ -10,7 +10,7 @@ REPO=/home/lihuzhan/code/2026_0828__primus/Primus
 OUT=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0914__campaign
 RUNDIR=/home/lihuzhan/_dbg_l8b/$TAG
 mkdir -p "$RUNDIR"
-docker exec ${E2E_ENV:-} \
+timeout 3600 docker exec ${E2E_ENV:-} \
   -e GPUS_PER_NODE=1 -e NNODES=1 -e NODE_RANK=0 -e PRIMUS_GPU_MODEL=MI455X \
   -e PRIMUS_EXP_NAME="$TAG" \
   fa-e2e bash -lc "cd $REPO && bash runner/primus-cli direct \

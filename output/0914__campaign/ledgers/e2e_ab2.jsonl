@@ -50,3 +50,7 @@
 {"tag": "ab|r16|flex", "steps": 20, "tps_median": 9546.0, "tps_min": 9426.0, "tps_max": 9984.0, "spread_pct": 5.85, "tflops_median": 552.845}
 {"tag": "ab|r17|asm", "steps": 20, "tps_median": 13923.5, "tps_min": 13879.0, "tps_max": 13946.0, "spread_pct": 0.48, "tflops_median": 806.355}
 {"tag": "ab|r17|noasm", "steps": 11, "tps_median": 13935.5, "tps_min": 13862.0, "tps_max": 13993.0, "spread_pct": 0.94, "tflops_median": 807.05}
+{"tag": "ab|r17|flex", "steps": 0, "failed": true}
+{"tag": "ab|r18|asm", "steps": 0, "failed": true}
+{"tag": "ab|r18|noasm", "steps": 0, "failed": true}
+{"tag": "ab|r18|flex", "steps": 0, "failed": true}

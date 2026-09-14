@@ -137,10 +137,22 @@ SHAPES = {
     "gate-s16384": dict(batch=1, seqlen=16384, hq=32, hkv=8, d=128),
     "gate-b1": dict(batch=1, seqlen=8192, hq=32, hkv=8, d=128),
     "gate-b8": dict(batch=8, seqlen=4096, hq=32, hkv=8, d=128),
+    # Shapes that straddle fused_backward_eligible's _MIN_PARALLEL_WORK = 32 on
+    # batch * num_q_heads. The threshold ships and has never been measured on this host;
+    # these four bracket it so the dispatch rule can be checked rather than assumed.
+    #   b1h32 = 32 (at the threshold, eligible)   b4h8  = 32 (at the threshold, eligible)
+    #   b2h8  = 16 (below, declines)              b1h8  =  8 (well below, declines)
+    "par-b1h32": dict(batch=1, seqlen=4096, hq=32, hkv=8, d=128),
+    "par-b4h8": dict(batch=4, seqlen=4096, hq=8, hkv=2, d=128),
+    "par-b2h8": dict(batch=2, seqlen=4096, hq=8, hkv=2, d=128),
+    "par-b1h8": dict(batch=1, seqlen=4096, hq=8, hkv=2, d=128),
 }
 
 _FAULT_PATTERNS = (
-    "MES(",
+    # NOT a bare "MES(": "MES(0, 0) ring buffer is full" is routine backpressure and
+    # matching it reports a healthy card as faulted. The wedge signature is MES
+    # failing to RESPOND to a message, then "wait for reset ack".
+    "failed to respond to msg",
     "GPU Hang",
     "wait for reset ack",
     "Memory access fault",

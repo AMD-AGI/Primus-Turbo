@@ -13,10 +13,16 @@
 set -u
 OUT=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0914__campaign
 STATUS=$OUT/fleet_status.json
-STALL=${STALL:-900}          # seconds without a new ledger line before a stream is "stalled"
+STALL=${STALL:-900}
+E2E_STALL=${E2E_STALL:-1500}   # one e2e round = inductor compile + 20 steps; 6 min is normal          # seconds without a new ledger line before a stream is "stalled"
 PERIOD=${PERIOD:-60}
 
-declare -A PHASE=( [0]=gate_asm [2]=gate )   # 1 = op-evolve (self-supervised), 3 = e2e loop (below)
+# Real utilisation, per card. Ledger mtime is not a liveness signal: an exhausted grid
+# still appends round_complete every cycle and keeps the file looking fresh.
+gpu_use(){ timeout 30 docker exec fa-repro rocm-smi --showuse 2>/dev/null \
+           | grep -F "GPU[$1]" | grep -F "GPU use" | awk '{print $NF}' | head -1; }
+
+declare -A PHASE=( [0]=sweep2 [2]=shapes2 [3]=fwd )   # 1 = op-evolve (self-supervised), 3 = e2e loop (below)
 
 # Own PID file, and refuse to start twice. Stopping this by `pkill -f watchdog.sh` matches the
 # killer's OWN command line and takes the caller's shell with it -- that is a documented trap
@@ -59,29 +65,24 @@ while true; do
         setsid nohup env GPU=$g PHASE=$ph bash "$OUT/bin/queue.sh" \
           > "$OUT/logs/g${g}.${ph}.log" 2>&1 < /dev/null & disown
       fi
+    elif [ -f "/tmp/campaign.g${g}.stop" ]; then
+      # Parked on purpose by exclusive.sh -- not a stall.
+      st=parked
     elif [ "$age" -gt "$STALL" ]; then
       st=stalled
       echo "STALL: gpu$g stream '$ph' has written nothing for ${age}s (threshold ${STALL}s)"
     fi
-    rows="$rows{\"gpu\":$g,\"stream\":\"$ph\",\"state\":\"$st\",\"ledger_age_s\":$age},"
+    u=$(gpu_use "$g"); u=${u:-?}
+    # An "ok" stream on a 0%-busy card is the failure this field exists to expose.
+    if [ "$st" = ok ] && [ "$u" = "0" ] && [ "$age" -gt 180 ]; then
+      st=idle
+      echo "IDLE: gpu$g stream '$ph' reports ok but the card is 0% busy and its ledger is ${age}s old -- the grid is probably exhausted"
+    fi
+    rows="$rows{\"gpu\":$g,\"stream\":\"$ph\",\"state\":\"$st\",\"ledger_age_s\":$age,\"gpu_use\":\"$u\"},"
   done
   # gpu3 reports alongside the others, or "all four cards are busy" cannot be read off the
   # status file -- which is how eight idle minutes went unnoticed.
   e3age=$(( T - $(stat -c %Y "$OUT/ledgers/e2e_ab2.jsonl" 2>/dev/null || echo "$T") ))
-
-  # GPU3's e2e loop. Not in PHASE because its ledger and restart command differ, but it is
-  # watched for the same reason: a one-shot run leaves the card idle the moment it finishes.
-  e3=$OUT/ledgers/g3.e2e.pid
-  e3st=ok; alive "$e3" || e3st=dead
-  rows="$rows{\"gpu\":3,\"stream\":\"e2e_ab\",\"state\":\"$e3st\",\"ledger_age_s\":$e3age},"
-  if ! alive "$e3"; then
-    if [ "$WEDGE" = 1 ]; then
-      echo "WEDGE: gpu3 e2e loop is dead and dmesg shows GPU faults -- NOT restarting"
-    else
-      echo "RESTART: gpu3 e2e loop died, relaunching"
-      setsid nohup bash "$OUT/bin/e2e_loop.sh" > "$OUT/logs/g3.e2e.log" 2>&1 < /dev/null & disown
-    fi
-  fi
 
   # op-evolve supervises itself; the watchdog only reports whether its loop is advancing.
   OE=$(ls -dt /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-* 2>/dev/null | head -1)

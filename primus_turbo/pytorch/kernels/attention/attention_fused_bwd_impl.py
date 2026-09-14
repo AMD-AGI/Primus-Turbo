@@ -394,31 +394,81 @@ def _verify_launch(compiled, requested: dict) -> None:
 
     Opt-in via ``PRIMUS_TURBO_FUSED_MHA_BWD_VERIFY=1``; off in production.
 
-    This exists because a tuning sweep once came back completely flat and the
-    override had silently not applied. The assertion written at the time checked
-    that the config *source* returned the right values, which it did -- that is
-    not the same claim as the kernel having run with them. Tile sizes end up in
-    the kernel name, but num_warps and waves_per_eu are compiler options and
-    appear only in the compiled metadata, so they need reading back separately.
+    This exists because a tuning sweep once came back completely flat and the override had
+    silently not applied. The assertion written at the time checked that the config *source*
+    returned the right values, which it did -- that is not the same claim as the kernel
+    having run with them.
+
+    REPAIRED 2026-09-14. The tile check read the kernel NAME, on the assumption that Triton
+    encodes constexprs there. It does not on Triton 3.6: ``compiled.name`` is exactly
+    ``bwd_kernel_causal``, so every tile check failed and turning the switch on reported a
+    violation on a perfectly good launch. A verifier that cannot introspect must say so
+    rather than cry wolf -- a defence that fires on healthy runs is one people learn to turn
+    off, which is worse than not having it.
+
+    So tiles are now read from whatever the build actually exposes, in order of preference,
+    and if none of them carries the constexprs the check reports UNVERIFIABLE instead of
+    failing. The compiler options (num_warps and friends) do live in ``compiled.metadata``
+    and are still checked strictly; those are the ones a silent override would move.
     """
     if os.environ.get(_VERIFY_ENV, "") not in ("1", "true", "True"):
         return
-    name = getattr(compiled, "name", "") or ""
-    bad = []
-    for key in ("BLOCK_M1", "BLOCK_N1", "BLOCK_M2", "BLOCK_N2", "BLK_SLICE_FACTOR"):
-        if key in requested and f"{key}_{requested[key]}_" not in name + "_":
-            bad.append(f"{key}={requested[key]} not in kernel name {name!r}")
+
     meta = getattr(compiled, "metadata", None)
+
+    def _constexprs() -> dict:
+        """Whatever mapping of constexpr name -> value this Triton build exposes."""
+        for holder, attr in ((compiled, "constants"), (meta, "constants")):
+            c = getattr(holder, attr, None) if holder is not None else None
+            if isinstance(c, dict) and c:
+                # Keys can be names, indices, or tuples of either depending on version.
+                out = {}
+                for k, v in c.items():
+                    if isinstance(k, str):
+                        out[k] = v
+                    elif isinstance(k, tuple) and k and isinstance(k[0], str):
+                        out[k[0]] = v
+                if out:
+                    return out
+        return {}
+
+    tiles = ("BLOCK_M1", "BLOCK_N1", "BLOCK_M2", "BLOCK_N2", "BLK_SLICE_FACTOR")
+    consts = _constexprs()
+    name = getattr(compiled, "name", "") or ""
+    bad, unverifiable = [], []
+    for key in tiles:
+        if key not in requested:
+            continue
+        if key in consts:
+            if consts[key] != requested[key]:
+                bad.append(f"{key}: asked {requested[key]}, kernel compiled with {consts[key]}")
+        elif f"{key}_" in name:
+            # Older builds that do put the constexpr in the name.
+            if f"{key}_{requested[key]}_" not in name + "_":
+                bad.append(f"{key}={requested[key]} not in kernel name {name!r}")
+        else:
+            unverifiable.append(key)
+
     for key in _METADATA_KEYS:
         if key not in requested or meta is None:
             continue
         actual = getattr(meta, key, None)
         if actual is not None and actual != requested[key]:
             bad.append(f"{key}: asked {requested[key]}, kernel compiled with {actual}")
+
     if bad:
         raise AssertionError(
             f"{_VERIFY_ENV}: the launched kernel does not match the requested config:\n  "
             + "\n  ".join(bad)
+        )
+    if unverifiable:
+        # Loud, but not fatal: the tiles could not be read back, so this run carries less
+        # assurance than the switch promises. Saying nothing would be the real failure.
+        print(
+            f"[{_VERIFY_ENV}] UNVERIFIABLE: this Triton build exposes neither constants nor "
+            f"named tiles, so {', '.join(unverifiable)} were not checked. Compiler options "
+            f"were checked and match.",
+            flush=True,
         )
 
 
