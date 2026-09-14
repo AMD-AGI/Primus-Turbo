@@ -71,15 +71,9 @@ from flydsl.expr.typing import Vector as Vec
 
 # `nt` aux bit: C is write-once, so caching it evicts the A/B band the L2 swizzle keeps.
 _CSTORE_AUX = 2
-# `sc0|sc1|nt`: device scope on top, for an epilogue every workgroup reaches at the same
-# instant. Only pays when the burst is actually contended -- see _cstore_aux.
-_CSTORE_AUX_BURST = 19
-# C bytes in one device-wide beta=1 burst at or above which the wide scope wins. Measured over
-# three macro tiles and four workgroup counts: 22.5 / 24.0 MiB cost +0.4 / +2.2%, while
-# 28.0 / 30.0 / 32.0 MiB win 1.2 / 2.0 / 4.7%. Per XCD the crossover is ~3.3 MiB of C against
-# an 8 MiB L2 slice, i.e. the point where the burst stops fitting beside the operand band.
-# The FlyDSL FP8 backend is gfx950-only, so this MI355X/L2-specific threshold cannot
-# leak onto GPUs with a different cache topology.
+_CSTORE_AUX_BURST = 19  # `sc0|sc1|nt`: device scope, for a burst the near cache cannot absorb
+# C bytes in one device-wide beta=1 burst at or above which the wide scope wins: about where the
+# burst stops fitting in L2 beside the operand band. gfx950-only backend, so the slice is fixed.
 _CSTORE_BURST_BYTES = 26 << 20
 _CSTORE_OUT_BYTES = 2  # both output dtypes are 16-bit; C's bytes per element
 
@@ -1880,12 +1874,9 @@ def _dense_num_cus():
 
 
 def _cstore_aux(beta_is_one, tiles_per_wg, n_wg, tile_bytes):
-    """C store cache policy. One tile per workgroup lands every epilogue in the same instant, so
-    a beta=1 tile's read-modify-write arrives device-wide as one burst with no successor tile to
-    hide it behind. Once that burst outgrows the L2 it outruns the near cache and the wider store
-    scope measures faster; below it the cache absorbs the burst and the longer path only costs.
-    The predicate is the burst's bytes, not the CU fill: two 240-workgroup beta=1 shapes land on
-    opposite sides of it because their macro tiles carry different amounts of C."""
+    """C store cache policy. One tile per workgroup puts every beta=1 read-modify-write in the
+    same instant with no successor tile to hide it behind, so the wider scope pays once that
+    burst outgrows L2. The predicate is the burst's bytes, not the workgroup count."""
     if beta_is_one and tiles_per_wg == 1 and n_wg * tile_bytes >= _CSTORE_BURST_BYTES:
         return _CSTORE_AUX_BURST
     return _CSTORE_AUX
@@ -2050,9 +2041,7 @@ _NT4_SQUARE = _Tn4Geom(
     256,
     256,
     ((0, 128, 2), (0, 128, 2), (1, 128, 3), (1, 128, 3)),
-    # One whole accumulator block per issue step, so each srcA fragment feeds every column it
-    # ever reaches before the next one is read; on NT's plain reads that beats the diagonal.
-    8,
+    8,  # a whole accumulator block per issue step, so a srcA fragment feeds every column it reaches
     mstep=4,
     drain_lgkm=6,  # NT's plain reads leave fewer in flight than the transpose path's
 )
@@ -2066,34 +2055,26 @@ _NT4_RECT = _Tn4Geom(
     mstep=2,
     drain_lgkm=6,
 )
-# A block the extent does not divide still issues its dead quadrants' mfma: only the operand
-# fetches and the stores are dropped, by the num_records clamp. So an extent with a smaller
-# exact tile is better served by it, and the freed work shortens every workgroup's own path
-# rather than idling some -- 2880 rows are 15 of these against 11.25 of the square's.
+# An M an extent does not divide still issues its dead quadrants' mfma -- the num_records clamp
+# drops only the fetches and stores -- so an exact tile shortens every workgroup's own path.
 _NT4_M192 = _NT4_SQUARE._replace(
     bm=192,
     pools=((0, 96, 2), (0, 96, 2), (1, 128, 3), (1, 128, 3)),
-    mstep=3,  # still one whole accumulator block per issue step, as above: mstep == nt
+    mstep=3,  # mstep == nt, as above
 )
-# The same on both axes at once, for a shape neither extent divides: 5120 rows are 16 of
-# these and 2880 columns 15, against 20 and 11.25 of the square's. The workgroup count is
-# unchanged, so the shorter path (64 accumulators to 60) comes off every one of them rather
-# than idling some, and bm+bn is still 512 so a K block moves the same operand bytes. Six
-# n-fragments do not divide the epilogue's fold, so the store is the paired one; no tile
-# that divides 2880 can avoid that, since a fold of four needs a B group of 128 columns and
-# 2880 has no divisor that is a multiple of 128.
+# The same on both axes, for a shape neither extent divides. bm+bn is unchanged, so a K block
+# still moves the same operand bytes; the n-fragments no longer divide the fold, hence paired.
 _NT4_W320 = _NT4_SQUARE._replace(
     bm=320,
     bn=192,
     pools=((0, 160, 2), (0, 160, 2), (1, 192, 3)),
     bstep=6,
-    mstep=5,  # still one whole accumulator block per issue step, as above: mstep == nt
-    # One store unit per fragment row. A coarser split holds a whole quadrant's beta=1
-    # read-back live at once, which is 120 values here and spills; this keeps it to 24.
-    store_split_flat=5,
+    mstep=5,  # mstep == nt, as above
+    store_split_flat=5,  # one unit per fragment row: a coarser split spills the beta=1 read-back
 )
 _NT4_ASM_CACHE: dict = {}
 _NT4_BAND = 64  # B rows one wave's four n-fragments span in a pool
+_NT4_WIN_ASPECT = 2  # widest per-step window a raster may be out of square
 
 
 def _nt4_resident(M, N, geom, ncu):
@@ -2110,9 +2091,9 @@ def _nt4_intensity(geom):
 
 
 def _nt4_geoms(M, N, beta_is_one, square_bands, rect_bands):
-    """Macro tiles eligible for the whole-loop autotune race. Main's N-narrow tile keeps
-    its coverage/intensity gate; the PR's tiles join only when they divide both extents, fit
-    within one CU pass, and shorten every workgroup's critical path versus the square tile."""
+    """Macro tiles the whole loop races for this shape. The N-narrow tile trades arithmetic
+    intensity for CU coverage, so it joins only where the coverage outweighs the operand bytes;
+    an exact tile joins only where it fits one CU pass and shortens the critical path."""
     geoms = [(_NT4_SQUARE, square_bands)]
     ncu = _dense_num_cus()
     coverage = _nt4_resident(M, N, _NT4_RECT, ncu) / _nt4_resident(M, N, _NT4_SQUARE, ncu)
@@ -2143,8 +2124,8 @@ def _nt4_pools(geom, fold):
 
 def _nt4_wg_path(M, N, geom, beta_is_one, ncu):
     """(workgroups, mfma a workgroup issues per K block) of the whole loop over ``geom``. The
-    second is the critical path every workgroup walks, which is what the wall follows: freeing
-    work on only some of them returns about half as much (the idle CUs come back as clock)."""
+    second is the critical path every workgroup walks, which is what the wall follows: work
+    freed on only some of them returns less, since the idle CUs come back as clock."""
     n_tile = ceildiv(M, geom.bm) * ceildiv(N, geom.bn)
     tiles_per_wg = 1 if beta_is_one else ceildiv(n_tile, min(n_tile, ncu))
     pools = _tn4_pools(geom)
@@ -2431,24 +2412,20 @@ def _nt4_window_ok(raster, NBM, NBN, n_tile, n_wg, num_xcd, tr_b):
 
 
 def _nt4_raster(NBM, NBN, group_m, n_tile, n_wg, num_xcd, tr_b):
-    """Pick the aligned window, or 0 to keep the GROUP_M raster.
-
-    A super-row is ``group_m*NBN`` tiles and an XCD takes ``slots`` of them per step, so the step
-    straddles two super-rows unless one divides the other; a straddling step pulls two half-width
-    windows into the XCD's L2 instead of one whole one. Where the super-row already divides
-    evenly there is nothing to fix, and the emitted mapping stays bit-identical. Otherwise take
-    the squarest legal rectangle -- a step reads ``win_m + slots/win_m`` operand slabs, and a
-    rectangle far out of square measured worse than the ragged window it replaces."""
+    """Aligned per-step window for this grid, or 0 to keep the GROUP_M raster. A step straddles
+    two ``group_m*NBN`` super-rows unless one divides the other, pulling two part-width windows
+    into the XCD's L2; where it does divide the emitted mapping is left bit-identical."""
     if num_xcd <= 1 or n_wg % num_xcd:
         return 0
     slots = n_wg // num_xcd
     super_row = group_m * NBN
     if super_row % slots == 0 or slots % super_row == 0:
         return 0
+    # A step reads win_m + slots/win_m operand slabs, so prefer the squarest legal rectangle.
     ok = [
         w
         for w in range(1, slots + 1)
-        if max(w, slots // w) <= 2 * min(w, slots // w)
+        if max(w, slots // w) <= _NT4_WIN_ASPECT * min(w, slots // w)
         and _nt4_window_ok(w, NBM, NBN, n_tile, n_wg, num_xcd, tr_b)
     ]
     return min(ok, key=lambda w: (w + slots // w, w), default=0)
@@ -2512,10 +2489,9 @@ def _nt4_prime(pools, pool_lds, g2s, bufs, K, b_kstep, tr_b):
 
 
 def _nt4_spec_phases(k_iters, phases, deep=1):
-    """Closing phases the emitter can specialise, counted as ``left`` (phases still to run, the
-    peel included). Everything before them sits in the shared main-loop body, which cannot carry
-    because it is entered once per pass. A K-tail shorter than the deepest pool would leave that
-    pool short of carry, so one more pass is unrolled out of the loop whenever K can spare it."""
+    """Closing phases the emitter can specialise, counted as ``left`` (phases still to run). The
+    rest sit in the shared loop body, which cannot carry as it is entered once per pass; a K-tail
+    shorter than the deepest pool unrolls one more pass out of the loop whenever K can spare it."""
     tail = k_iters % phases
     if not tail:
         return phases - 1
@@ -2926,11 +2902,9 @@ def _compile_dense_wave4(
             tr_b=tr_b,
         )
 
-        # The output scale is loop-invariant, and it is a global load: emitted inside the tile
-        # loop its first use pins an s_waitcnt vmcnt(0) into every epilogue, which drains the
-        # fills the closing phases just issued for the next tile. Load it ahead of the prime so
-        # its own wait has nothing else in flight. Only on the plain-B path: the transposed-B
-        # body has no register headroom to keep the value live across the tile loop.
+        # Hoisted: inside the tile loop this load's first use pins an s_waitcnt vmcnt(0) into
+        # every epilogue, draining the fills the closing phases issued for the next tile. Plain-B
+        # only, as the transposed-B body cannot keep the value live across the loop.
         scale = None if tr_b else load_per_tensor_scale(A_scale, B_scale)
 
         if const_expr(carry):
@@ -3082,9 +3056,7 @@ def _dense_race(cache, key, args, layout, builders, beta_is_one):
 def _pick_dense_candidate(cands, args):
     """Fastest of ``cands`` = [[launch, cfg, compiled, factory], ...], sampled over reversed
     passes and kept at its min, behind a throwaway pass: the leading candidates sit closer than
-    one sample's spread, so otherwise clock drift and warm-up do the ranking. One round trip of
-    a two-sample median does not resolve them -- it re-picked a different band on half the dense
-    shapes from run to run, which costs more than the bands are apart."""
+    one sample's spread, so too few passes let clock drift and warm-up do the ranking."""
     for _ in range(_PICK_RAMP_ITERS):
         cands[0][2](*args)
     torch.cuda.synchronize()

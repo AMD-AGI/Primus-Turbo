@@ -748,11 +748,7 @@ class StoreCPerTensor:
         # Optional f32->f32 epilogue node chain (bias/act), post-scale pre-cast.
         self.elem_fn = elem_fn
         self.scaled = A_scale is not None
-        # a_scale*b_scale is loop-invariant, so a caller that emits this store inside a tile
-        # loop should hoist the load and pass the value: the load is what forces a full
-        # s_waitcnt vmcnt(0) at the first use, and inside a loop that drains every fill the
-        # previous phases issued for the next tile.
-        self._scale_pre = scale
+        self._scale_pre = scale  # a_scale*b_scale a caller hoisted out of its tile loop
         self.c_base = _buffer_ops.extract_base_index(C) if c_base is None else c_base  # byte base address
         if self.scaled and scale is None:
             gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=4)  # 1 fp32
@@ -768,10 +764,9 @@ class StoreCPerTensor:
         return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
 
     def _scale(self):
-        """a_scale*b_scale. A value the caller hoisted out of its tile loop is used as is;
-        otherwise it is loaded once per emitting block so the quadrant stores share one
-        instance instead of re-issuing both scalar loads. Cached per MLIR block: sibling regions
-        each get their own load, since a value in one does not dominate a use in another."""
+        """a_scale*b_scale, a hoisted value used as is or else loaded once per emitting block so
+        the quadrant stores share one instance. Cached per MLIR block: sibling regions each get
+        their own load, since a value in one does not dominate a use in another."""
         if not self.scaled:
             return None
         if self._scale_pre is not None:
@@ -1124,8 +1119,7 @@ class StoreCPerTensorLineN(StoreCPerTensorPairN):
 class StoreCPerTensorQuadN(StoreCPerTensorPairN):
     """PairN for a kernel whose n-fragments arrived column-interleaved, so a lane already holds
     the adjacent columns and one store folds them with no cross-lane step. The caller owns the
-    interleave; a tile that is not column-safe needs N to be a whole number of runs, since the
-    mask a folded store can carry is one per run."""
+    interleave; a ragged column edge needs N to be a whole number of runs, the mask's granularity."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1841,16 +1835,9 @@ def block_mn(pid, num_pid_m, n_blocks, GM, GN):
 
 
 def xcd_window_mn(d, n_wg, num_pid_m, n_blocks, num_xcd, win_m):
-    """Tile-id -> (block_m, block_n) for a persistent tile loop whose id is ``wg + step*n_wg``.
-
-    A plain GROUP_M raster fixes the super-row width but not where a super-row starts relative
-    to the slots one XCD owns, so whenever ``GM*n_blocks`` does not divide those slots a step
-    straddles two super-rows and its operand footprint jumps from ``GM + slots/GM`` slabs to
-    twice the smaller side. Here the step's window is an aligned ``win_m x (slots/win_m)``
-    rectangle instead, so every step costs the same. Windows advance along n first, which keeps
-    a workgroup's A slab addressed for a whole row of them. Bijection over the tile range;
-    the caller must check ``num_xcd | num_pid_m``, ``win_m | num_pid_m/num_xcd``,
-    ``win_m | slots`` and ``slots/win_m | n_blocks``."""
+    """Tile-id -> (block_m, block_n) for a persistent loop whose id is ``wg + step*n_wg``, giving
+    each step an aligned ``win_m x (slots/win_m)`` window so every step costs the same. Windows
+    advance along n first; a bijection only where the caller checked the divisibility it needs."""
     slots = n_wg // num_xcd
     win_n = slots // win_m
     rows = num_pid_m // num_xcd
