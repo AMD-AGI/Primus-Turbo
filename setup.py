@@ -343,10 +343,27 @@ def get_common_flags():
         cxx_flags.append("-DBUILD_CK_BACKEND")
         nvcc_flags.append("-DBUILD_CK_BACKEND")
 
-    # HipKittens selects its architecture family from this define, and its attention kernels
-    # are written against CDNA4.
-    cxx_flags.append("-DKITTENS_CDNA4")
-    nvcc_flags.append("-DKITTENS_CDNA4")
+    # HipKittens selects its architecture family from a single define (kittens.cuh picks
+    # exactly one of KITTENS_CDNA4 / KITTENS_UDNA1 / KITTENS_CDNA3 via #if/#elif), so the
+    # define must match the arch whose kernels are actually in this build.
+    #
+    # Unconditionally defining KITTENS_CDNA4 -- as this did -- compiles a gfx1250 build
+    # against the wave64 CDNA4 headers: WARP_THREADS would be 64 on a wave32 target, and
+    # every register-tile shape trait derived from it would be wrong.
+    hk_gfx950 = "--offload-arch=gfx950" in offload_arch_list
+    hk_gfx1250 = "--offload-arch=gfx1250" in offload_arch_list
+    if hk_gfx950 and hk_gfx1250:
+        raise RuntimeError(
+            "HipKittens cannot target gfx950 and gfx1250 in one build: kittens.cuh selects a "
+            "single architecture family from a translation-unit-wide define, and the two "
+            "families differ in wave width (64 vs 32). Build them separately."
+        )
+    if hk_gfx1250:
+        cxx_flags.append("-DKITTENS_UDNA1")
+        nvcc_flags.append("-DKITTENS_UDNA1")
+    elif hk_gfx950:
+        cxx_flags.append("-DKITTENS_CDNA4")
+        nvcc_flags.append("-DKITTENS_CDNA4")
 
     # Those kernels are named *_gfx950.cu, so filter_files_by_arch drops them from a build whose
     # offload archs leave gfx950 out. Their torch entry points are ordinary .cpp and would still
@@ -357,7 +374,9 @@ def get_common_flags():
     # gfx942+gfx950 build becomes an assert-and-return and emits none of the gfx950-only atoms.
     # Without that guard it fails on
     # '__builtin_amdgcn_mfma_f32_16x16x32_bf16 needs target feature gfx950-insts'.
-    if "--offload-arch=gfx950" in offload_arch_list:
+    # gfx1250 kernels are named *_gfx1250.cu and filter_files_by_arch (see ~line 152) already
+    # dispatches on that suffix, so the backend guard just follows whichever family is selected.
+    if hk_gfx950 or hk_gfx1250:
         cxx_flags.append("-DBUILD_HIPKITTENS_BACKEND")
         nvcc_flags.append("-DBUILD_HIPKITTENS_BACKEND")
 
