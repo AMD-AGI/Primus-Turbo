@@ -2412,7 +2412,7 @@ def _mxfp4_swizzle_candidates(M, N, K):
     return cands[:3]
 
 
-def _autotune_mxfp4_config(M, N, K, args, out_fp16=False, k_real=None, row_bytes=None):
+def _autotune_mxfp4_config(M, N, K, args, out_fp16=False, k_real=None, row_bytes=None, prepacked=False):
     """Pick (group_m, group_n, num_xcds) for this (M, N, K, out dtype) by a quick timed
     sweep over ``_mxfp4_swizzle_candidates`` (<=3) on the real operands; cached per shape
     and store dtype.
@@ -2444,7 +2444,23 @@ def _autotune_mxfp4_config(M, N, K, args, out_fp16=False, k_real=None, row_bytes
     for _wlv, _elgk in _wl_opts:
         for gm, gn, xcd in _mxfp4_swizzle_candidates(M, N, K):
             try:
-                at_key = (M, N, K, k_real, row_bytes, gm, xcd, gn, _wlv, _elgk, False, False, out_fp16, False)
+                at_key = (
+                    M,
+                    N,
+                    K,
+                    k_real,
+                    row_bytes,
+                    gm,
+                    xcd,
+                    gn,
+                    _wlv,
+                    _elgk,
+                    False,
+                    False,
+                    out_fp16,
+                    False,
+                    prepacked,
+                )
                 entry = _MXFP4_AT_CACHE.get(at_key)
                 if entry is None:
                     raw = _get_mxfp4_fused_launch(
@@ -2454,6 +2470,7 @@ def _autotune_mxfp4_config(M, N, K, args, out_fp16=False, k_real=None, row_bytes
                         gn,
                         _wlv,
                         _elgk,
+                        prepacked=prepacked,
                         coop=False,
                         out_fp16=out_fp16,
                         n_tail=N % 256,
@@ -2498,10 +2515,28 @@ def _autotune_mxfp4_config(M, N, K, args, out_fp16=False, k_real=None, row_bytes
     if _try_var:
         gm0, gn0, xcd0, w0, e0 = best[:5]
         try:
-            df_compiled = _MXFP4_AT_CACHE[(M, N, K, gm0, xcd0, gn0, w0, e0, False, False, out_fp16, False)][1]
+            df_compiled = _MXFP4_AT_CACHE[
+                (M, N, K, gm0, xcd0, gn0, w0, e0, False, False, out_fp16, False, prepacked)
+            ][1]
             variants = []  # (taccw, coop, compiled)
             for _cp, _tw in ((False, True), (True, False), (True, True)):
-                vkey = (M, N, K, k_real, row_bytes, gm0, xcd0, gn0, w0, e0, _tw, _cp, out_fp16, False)
+                vkey = (
+                    M,
+                    N,
+                    K,
+                    k_real,
+                    row_bytes,
+                    gm0,
+                    xcd0,
+                    gn0,
+                    w0,
+                    e0,
+                    _tw,
+                    _cp,
+                    out_fp16,
+                    False,
+                    prepacked,
+                )
                 ventry = _MXFP4_AT_CACHE.get(vkey)
                 if ventry is None:
                     vraw = _get_mxfp4_fused_launch(
@@ -2511,6 +2546,7 @@ def _autotune_mxfp4_config(M, N, K, args, out_fp16=False, k_real=None, row_bytes
                         gn0,
                         w0,
                         e0,
+                        prepacked=prepacked,
                         taccw=_tw,
                         coop=_cp,
                         out_fp16=out_fp16,
@@ -2725,6 +2761,7 @@ def _compile_mxfp4_fused(
     k_real=None,
     row_bytes=None,
     mn=None,
+    prepacked=False,  # caller supplies scales already in the packed layout: skip the repack
 ):
     """Turbo/mxfp8-style fused @flyc.jit stub: ONE host dispatch enqueues the A scale
     preshuffle, the B scale preshuffle, then the NT GEMM on the same stream (no separate
@@ -2760,6 +2797,37 @@ def _compile_mxfp4_fused(
     _PKU, _PBLK = _mxfp4_preshuf_geom(K128)
     _PGRID = _MXFP4_PRESHUF_FO * _PBLK * _PKU  # output dwords one block packs
 
+    def _emit_gemm(A, B_T, C, A_scale, B_scale, c_m, c_n, stream):
+        # NT GEMM over the packed scales; on one stream it is ordered after any preshuffle.
+        grid_x = ceildiv(c_m, BM) * ceildiv(c_n, BN)
+        if const_expr(ksplit > 1):
+            grid_x = grid_x * fx.Int32(ksplit)  # split-K: one WG per (tile, split)
+        elif const_expr(_TPW > 1):
+            grid_x = udiv(grid_x, fx.Int32(_TPW))  # persistent: one WG per _TPW tiles
+        gemm_kern(A, B_T, C, A_scale, B_scale, c_m, c_n, value_attrs=gemm_value_attrs).launch(
+            grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream
+        )
+
+    # Two stubs, not one with a flag: same signature means the second to be traced is handed
+    # the first one's module -- preshuffle included, overwriting the caller's packed scales.
+    # Dropping the raw operands the packed path never reads makes the signatures differ.
+    if prepacked:
+
+        @flyc.jit
+        def launch_mxfp4_fused_prepacked(
+            A: fx.Tensor,
+            B_T: fx.Tensor,
+            C: fx.Tensor,
+            A_scale: fx.Tensor,
+            B_scale: fx.Tensor,
+            c_m: fx.Int32,
+            c_n: fx.Int32,
+            stream: fx.Stream,
+        ):
+            _emit_gemm(A, B_T, C, A_scale, B_scale, c_m, c_n, stream)
+
+        return launch_mxfp4_fused_prepacked
+
     @flyc.jit
     def launch_mxfp4_fused(
         A: fx.Tensor,
@@ -2794,15 +2862,7 @@ def _compile_mxfp4_fused(
             block=(_PBLK, 1, 1),
             stream=stream,
         )
-        # 3) NT GEMM (reads the just-written A_scale/B_scale ws; same stream => ordered).
-        grid_x = ceildiv(c_m, BM) * ceildiv(c_n, BN)
-        if const_expr(ksplit > 1):
-            grid_x = grid_x * fx.Int32(ksplit)  # split-K: one WG per (tile, split)
-        elif const_expr(_TPW > 1):
-            grid_x = udiv(grid_x, fx.Int32(_TPW))  # persistent: one WG per _TPW tiles
-        gemm_kern(A, B_T, C, A_scale, B_scale, c_m, c_n, value_attrs=gemm_value_attrs).launch(
-            grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream
-        )
+        _emit_gemm(A, B_T, C, A_scale, B_scale, c_m, c_n, stream)
 
     return launch_mxfp4_fused
 
@@ -2826,6 +2886,7 @@ def _compile_mxfp4_tail_fused(
     n_tail=0,
     k_real=None,
     row_bytes=None,
+    prepacked=False,
 ):
     """Tail-split stub: one host dispatch enqueues the scale preshuffle, the plain GEMM
     over the whole dispatch rounds, then a ksplit GEMM over the ragged remainder.
@@ -2893,23 +2954,24 @@ def _compile_mxfp4_tail_fused(
         qn = ceildiv(c_n, fx.Int32(256)) * fx.Int32(256)
         grid_a = ceildiv(qm * fx.Int32(K128), _PGRID)
         grid_b = ceildiv(qn * fx.Int32(K128), _PGRID)
-        pre_ab(  # the whole A and B, exactly as the single-GEMM stub: both launches read it
-            A_raw,
-            A_scale,
-            B_raw,
-            B_scale,
-            qm,
-            qn,
-            c_m,
-            c_n,
-            fx.Int32(K128),
-            grid_a,
-            fx.Int32(_sc_row),
-        ).launch(
-            grid=(grid_a + grid_b, 1, 1),
-            block=(_PBLK, 1, 1),
-            stream=stream,
-        )
+        if not prepacked:  # the whole A and B; both launches read it
+            pre_ab(
+                A_raw,
+                A_scale,
+                B_raw,
+                B_scale,
+                qm,
+                qn,
+                c_m,
+                c_n,
+                fx.Int32(K128),
+                grid_a,
+                fx.Int32(_sc_row),
+            ).launch(
+                grid=(grid_a + grid_b, 1, 1),
+                block=(_PBLK, 1, 1),
+                stream=stream,
+            )
         if const_expr(_NAX):
             # A column band: both GEMMs keep every M row, the main one stores into the
             # caller's C at its full pitch and the tail's B/B_scale are rebased to n_main.
@@ -2961,6 +3023,7 @@ def _get_mxfp4_fused_launch(
     k_real=None,
     row_bytes=None,
     mn=None,
+    prepacked=False,
 ):
     lk = (
         K,
@@ -2978,6 +3041,7 @@ def _get_mxfp4_fused_launch(
         k_real,
         row_bytes,
         mn,
+        prepacked,
     )
     launch = _MXFP4_LAUNCH_CACHE.get(lk)
     if launch is None:
@@ -2997,6 +3061,7 @@ def _get_mxfp4_fused_launch(
             k_real=k_real,
             row_bytes=row_bytes,
             mn=mn,
+            prepacked=prepacked,
         )
         _MXFP4_LAUNCH_CACHE[lk] = launch
     return launch
@@ -3211,6 +3276,8 @@ def gemm_mxfp4_flydsl_kernel(
     trans_c: bool = False,
     beta: float = 0.0,
     out: "torch.Tensor | None" = None,
+    scales_prepacked: bool = False,
+    k: "int | None" = None,
 ) -> torch.Tensor:
     """MXFP4 dense NT GEMM for gfx950: A [M, K] and B [N, K] fp4, C = a @ b^T, M/N/K on 64.
     The contraction comes from ``a_scale``/``b_scale`` (canonical E8M0, [dim, K/32]) and the
@@ -3231,8 +3298,14 @@ def gemm_mxfp4_flydsl_kernel(
     M, Kb_a = a.shape
     N, Kb_b = b.shape
     # The true contraction comes from the SCALE and only the row stride from the fp4 tensors, so a caller can seat its rows on the line without a copy.
-    K = a_scale.shape[1] * 32
-    assert b_scale.shape[1] * 32 == K, f"scale K mismatch: {a_scale.shape} vs {b_scale.shape}"
+    if scales_prepacked:
+        # A packed scale tensor is flat, so it no longer carries the contraction: the caller
+        # states it. The fp4 row stride still cannot serve -- it may be padded.
+        assert k is not None, "scales_prepacked=True requires the true K via k="
+        K = k
+    else:
+        K = a_scale.shape[1] * 32
+        assert b_scale.shape[1] * 32 == K, f"scale K mismatch: {a_scale.shape} vs {b_scale.shape}"
     assert Kb_a == Kb_b, f"row stride mismatch: a {a.shape}, b {b.shape}"
     assert K // 2 <= Kb_a <= (K + 255) // 256 * 128, (
         f"fp4 row stride {Kb_a} B is not between K/2 = {K // 2} and ceil256(K)/2 for K={K}"
@@ -3252,7 +3325,13 @@ def gemm_mxfp4_flydsl_kernel(
     Kw = (K + 255) // 256 * 256  # loop + packed-scale extent
     _k_real = None if K == Kw else K  # None keeps the aligned shapes' launch key unchanged
     _row_b = None if Kb_a == K // 2 else Kb_a
-    a_sp, b_sp = _get_mxfp4_scale_ws(M, N, Kw, a.device)
+    if scales_prepacked:
+        # The caller already holds the packed layout, so there is nothing to repack and no
+        # workspace to own: the scale tensors go straight in as the GEMM's packed operands.
+        a_sp = a_scale.contiguous().view(torch.int32).reshape(-1)
+        b_sp = b_scale.contiguous().view(torch.int32).reshape(-1)
+    else:
+        a_sp, b_sp = _get_mxfp4_scale_ws(M, N, Kw, a.device)
     # E8M0 has no memref element type and a row of K/32 bytes need not be a whole number of dwords, so the bytes go in as u8.
     a_raw = a_scale.contiguous().view(torch.uint8).reshape(-1)
     b_raw = b_scale.contiguous().view(torch.uint8).reshape(-1)
@@ -3269,6 +3348,9 @@ def gemm_mxfp4_flydsl_kernel(
     # C stays 2D (StoreCPlain re-bases per row band from C's base + c_n); a 1D M*N view
     # overflows the CABI for large M*N.
     def _args_for(target):
+        # The packed stub takes no raw scales: it has nothing to repack.
+        if scales_prepacked:
+            return (a8, b8, target, a_sp, b_sp, M, N, stream)
         return (a8, b8, target, a_raw, b_raw, a_sp, b_sp, M, N, stream)
 
     # Both autotunes launch the GEMM dozens of times. Against a beta=1 build that would
@@ -3293,7 +3375,9 @@ def gemm_mxfp4_flydsl_kernel(
         # The racer keys on the padded extent: keying on the true K would miss on every padded launch.
         cfg = _MXFP4_CFG_CACHE.get((M, N, Kw, _row_b, out_fp16))
         if cfg is None:
-            cfg = _autotune_mxfp4_config(M, N, Kw, _tune_args(), out_fp16, k_real=_k_real, row_bytes=_row_b)
+            cfg = _autotune_mxfp4_config(
+                M, N, Kw, _tune_args(), out_fp16, k_real=_k_real, row_bytes=_row_b, prepacked=scales_prepacked
+            )
         gm, gn, xcd, _wlv, _elgk, _tw, _coop = cfg
         launch = _get_mxfp4_fused_launch(
             Kw,
@@ -3308,11 +3392,12 @@ def gemm_mxfp4_flydsl_kernel(
             beta_is_one=accum,
             n_tail=N % 256,
             k_real=_k_real,
+            prepacked=scales_prepacked,
             row_bytes=_row_b,
             mn=_mxfp4_mn_specialise(M, N),
         )
         # row_bytes must be in the artifact key too: one logical shape, two allocations, two kernels.
-        at_key = (M, N, K, _row_b, gm, xcd, gn, _wlv, _elgk, _tw, _coop, out_fp16, accum)
+        at_key = (M, N, K, _row_b, gm, xcd, gn, _wlv, _elgk, _tw, _coop, out_fp16, accum, scales_prepacked)
         fused_args = _args_for(target)
         entry = _MXFP4_AT_CACHE.get(at_key)
         if entry is None:
@@ -3338,11 +3423,17 @@ def gemm_mxfp4_flydsl_kernel(
         # The epilogue twins stay off -- unvalidated with a partial store.
         cfg = _MXFP4_CFG_CACHE.get((M, N, Kw, _row_b, out_fp16))
         if cfg is None:
-            cfg = _autotune_mxfp4_config(M, N, Kw, _tune_args(), out_fp16, k_real=_k_real, row_bytes=_row_b)
+            cfg = _autotune_mxfp4_config(
+                M, N, Kw, _tune_args(), out_fp16, k_real=_k_real, row_bytes=_row_b, prepacked=scales_prepacked
+            )
         gm, gn, xcd, _wlv, _elgk = cfg[:5]
         ws = _get_mxfp4_split_ws(ksplit, M, N, out_dtype, a.device)
         cbuf = ws.view(-1)
-        sk_args = (a8, b8, cbuf, a_raw, b_raw, a_sp, b_sp, M, N, stream)
+        sk_args = (
+            (a8, b8, cbuf, a_sp, b_sp, M, N, stream)
+            if scales_prepacked
+            else (a8, b8, cbuf, a_raw, b_raw, a_sp, b_sp, M, N, stream)
+        )
         launch = _get_mxfp4_fused_launch(
             Kw,
             gm,
@@ -3354,10 +3445,11 @@ def gemm_mxfp4_flydsl_kernel(
             out_fp16=out_fp16,
             n_tail=N % 256,
             k_real=_k_real,
+            prepacked=scales_prepacked,
             row_bytes=_row_b,  # the operands' allocated row stride addresses every g2s
             mn=_mxfp4_mn_specialise(M, N),
         )
-        sk_key = (M, N, K, _row_b, gm, xcd, gn, _wlv, _elgk, ksplit, out_fp16)
+        sk_key = (M, N, K, _row_b, gm, xcd, gn, _wlv, _elgk, ksplit, out_fp16, scales_prepacked)
         entry = _MXFP4_AT_CACHE.get(sk_key)
         if entry is None:
             entry = [launch, None]
@@ -3380,7 +3472,9 @@ def gemm_mxfp4_flydsl_kernel(
         target = out if target is None else target
         cfg = _MXFP4_CFG_CACHE.get((M, N, Kw, _row_b, out_fp16))
         if cfg is None:
-            cfg = _autotune_mxfp4_config(M, N, Kw, _tune_args(), out_fp16, k_real=_k_real, row_bytes=_row_b)
+            cfg = _autotune_mxfp4_config(
+                M, N, Kw, _tune_args(), out_fp16, k_real=_k_real, row_bytes=_row_b, prepacked=scales_prepacked
+            )
         gm, gn, xcd, _wlv, _elgk = cfg[:5]  # the epilogue twins stay off under a split
         m_tail = _mxfp4_tail_rows(M, N, ksplit)
         m_main = M - m_tail
@@ -3420,6 +3514,7 @@ def gemm_mxfp4_flydsl_kernel(
             beta_is_one=accum,  # only the main GEMM can fold into C; the tail's fold does its own
             n_tail=N % 256,
             k_real=_k_real,
+            prepacked=scales_prepacked,
             row_bytes=_row_b,
         )
         tk_key = (M, N, K, _row_b, gm, xcd, gn, _wlv, _elgk, "tail", ksplit, out_fp16, accum)
@@ -3445,7 +3540,9 @@ def gemm_mxfp4_flydsl_kernel(
         target = out if target is None else target
         cfg = _MXFP4_CFG_CACHE.get((M, N, Kw, _row_b, out_fp16))
         if cfg is None:
-            cfg = _autotune_mxfp4_config(M, N, Kw, _tune_args(), out_fp16, k_real=_k_real, row_bytes=_row_b)
+            cfg = _autotune_mxfp4_config(
+                M, N, Kw, _tune_args(), out_fp16, k_real=_k_real, row_bytes=_row_b, prepacked=scales_prepacked
+            )
         gm, gn, xcd, _wlv, _elgk = cfg[:5]  # the epilogue twins stay off under a split
         n_cols = _mxfp4_tail_cols(M, N, ksplit)
         n_main = N - n_cols
@@ -3484,6 +3581,7 @@ def gemm_mxfp4_flydsl_kernel(
             n_tail=0,  # both bands end on the 256-column grid
             k_real=_k_real,
             row_bytes=_row_b,
+            prepacked=scales_prepacked,
         )
         tk_key = (M, N, K, _row_b, gm, xcd, gn, _wlv, _elgk, "ntail", ksplit, out_fp16, accum)
         entry = _MXFP4_AT_CACHE.get(tk_key)
@@ -3509,13 +3607,18 @@ def gemm_mxfp4_flydsl_kernel(
             return _exec_plain(target, accum)
         return (_exec_split, _exec_tail, _exec_ntail)[mode - 1](s, target, accum)
 
-    ks = (0, 1) if K != Kw else _MXFP4_KSPLIT_CACHE.get((M, N, K, _row_b, out_fp16))
+    # Split-K reads the scales through arms this path does not rebuild, and packed scales come
+    # out wrong there (SNR 3.65 dB), so the packed path stays unsplit until those arms are ported.
+    ks = (0, 1) if (K != Kw or scales_prepacked) else _MXFP4_KSPLIT_CACHE.get((M, N, K, _row_b, out_fp16))
     if ks is None:
         cands = _ksplit_candidates(M, N, K)
         modes = [(0, 1)] + [(1, s) for s in cands[1:]]
         # Only the smallest split gets a tail arm: at equal CU fill it moves the fewest
         # partial bytes, and the uniform arms already cover "more splits, more fill".
-        if len(cands) > 1 and _mxfp4_tail_rows(M, N, cands[1]):
+        # The tail stubs still take the raw scales, so the packed path stays on the plain one.
+        if scales_prepacked:
+            pass
+        elif len(cands) > 1 and _mxfp4_tail_rows(M, N, cands[1]):
             modes.append((2, cands[1]))
         elif len(cands) > 1 and _mxfp4_tail_cols(M, N, cands[1]):
             modes.append((3, cands[1]))
