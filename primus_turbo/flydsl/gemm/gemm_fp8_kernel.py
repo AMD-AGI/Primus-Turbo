@@ -1247,12 +1247,31 @@ def _tn4_gl_keys(pools):
     return keys
 
 
-def _dense_tn_slice_div(x, s):
-    """``x // s`` for a compile-time split-K slice factor: one shift, or one fixed-point
-    reciprocal multiply. Exact for every dividend the slice bounds reach (see _TN4_RCP_MAX)."""
+def _exact_recip(d, xmax):
+    """``(shift, mul)`` with ``(x * mul) >> shift == x // d`` for every ``0 <= x <= xmax``.
+
+    For ``mul = ceil(2**shift / d)`` and ``r = mul * d - 2**shift`` the quotient is exact iff
+    ``xmax * r < 2**shift``, so widen the shift until that holds. The narrowest one also keeps
+    the product inside the i32 multiply the caller emits."""
+    assert d > 0 and xmax >= 0, f"bad fixed-point reciprocal request d={d} xmax={xmax}"
+    for shift in range(1, 40):
+        mul = -(-(1 << shift) // d)
+        if xmax * (mul * d - (1 << shift)) < (1 << shift):
+            assert xmax * mul < (1 << 31), f"i32 reciprocal multiply overflows: d={d} xmax={xmax}"
+            return shift, mul
+    raise AssertionError(f"no exact fixed-point reciprocal for d={d} xmax={xmax}")
+
+
+def _dense_tn_slice_div(x, s, xmax):
+    """``x // s`` for a compile-time divisor: one shift, or one fixed-point reciprocal multiply.
+
+    ``xmax`` must bound the dividend, because it is what sets the shift the multiply needs to
+    stay exact. A shift too narrow for the range returns ``x // s + 1`` on its tail, which for
+    the split-K decode silently remaps a dispatch id onto a tile that is not its own."""
     if s & (s - 1) == 0:
         return fx.Int32(floordiv_pow2(x, s))
-    return fx.Int32(fx.Int32(x * (-(-(1 << 16) // s))) >> 16)
+    shift, mul = _exact_recip(s, xmax)
+    return fx.Int32(fx.Int32(x * mul) >> shift)
 
 
 def _dense_tn_tile_mn(t, NBM, NBN, group_m, group_n):
@@ -1590,7 +1609,8 @@ def _dense_tn_wave4_tile(
         lo, nwin, s = split
         win_off = fx.Int32(d) - fx.Int32(lo)
         # sid < 0 = whole tile: the ids below the window take the whole K range.
-        sid = _dense_tn_slice_div(win_off, nwin)
+        # The window's ids run [lo, lo + nwin*s), so win_off tops out at nwin*s - 1.
+        sid = _dense_tn_slice_div(win_off, nwin, nwin * s - 1)
         tile_in_window = win_off - sid * fx.Int32(nwin)
         if lo:
             pre = win_off < fx.Int32(0)
@@ -1602,12 +1622,12 @@ def _dense_tn_wave4_tile(
             t = _readfirstlane_i32(fx.Int32(lo) + tile_in_window)
             sid = fx.Int32(_readfirstlane_i32(sid))
             slice_id = sid
-        k0 = _dense_tn_slice_div(fx.Int32(K_ITERS) * slice_id, s)
+        k0 = _dense_tn_slice_div(fx.Int32(K_ITERS) * slice_id, s, K_ITERS * (s - 1))
         ki = (
             fx.Int32(
                 arith.select(
                     slice_id + fx.Int32(1) < fx.Int32(s),
-                    _dense_tn_slice_div(fx.Int32(K_ITERS) * (slice_id + fx.Int32(1)), s),
+                    _dense_tn_slice_div(fx.Int32(K_ITERS) * (slice_id + fx.Int32(1)), s, K_ITERS * s),
                     fx.Int32(K_ITERS),
                 )
             )
@@ -1829,7 +1849,7 @@ def _dense_tn_wave4_tile(
 
 
 _TN4_SPLIT_S = (2, 3, 4)  # slice factors; an odd one is fine, the slices stay co-resident
-_TN4_RCP_MAX = 1 << 15  # exactness bound on _dense_tn_slice_div's dividend
+_TN4_RCP_MAX = 1 << 15  # dividend ceiling keeping _dense_tn_slice_div's multiply inside i32
 _TN4_OUT_ALIGN = 8  # out_ty elements the split-K bands keep aligned at C's row pitch
 
 
@@ -1848,7 +1868,7 @@ def _dense_tn_split(tiles, k_iters, ncu, phases):
     best, best_rounds, best_s = 1, 1, 1
     for s in _TN4_SPLIT_S:
         if k_iters < phases * s or k_iters * (s - 1) >= _TN4_RCP_MAX:
-            continue  # every slice must keep a whole main-loop pass, and stay exactly divisible
+            continue  # every slice keeps a whole main-loop pass, and its K bound stays in i32
         rounds = _tn4_split_rounds(tiles, rem, s, ncu)
         if rounds * best_s < best_rounds * s:
             best, best_rounds, best_s = s, rounds, s
@@ -1975,7 +1995,7 @@ def _compile_dense_tn_wave4(
         """Fold the split-K window's slice bands into C, one row slab per workgroup. It runs
         the whole grid, so the fold spreads over every CU instead of only the window's."""
         tid = fx.thread_idx.x
-        wt = _dense_tn_slice_div(fx.Int32(fx.block_idx.x), _TN4_RED_WPT)
+        wt = _dense_tn_slice_div(fx.Int32(fx.block_idx.x), _TN4_RED_WPT, max(_RED_GRID - 1, 0))
         part = fx.Int32(fx.block_idx.x) - wt * fx.Int32(_TN4_RED_WPT)
         block_m, block_n = _dense_tn_tile_mn(
             _readfirstlane_i32(fx.Int32(_LO) + wt), NBM, NBN, group_m, group_n
