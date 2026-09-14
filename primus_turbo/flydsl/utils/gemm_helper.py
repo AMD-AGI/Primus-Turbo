@@ -96,6 +96,19 @@ def compile_with_scratch_out(launch, args, out_index=2):
 
 
 _PRESHUF_KT = 16  # scale-preshuffle k-tile (rows*KT dwords staged in LDS per workgroup)
+_PRESHUF_WIDE = 3  # opt-in wide repack forms; bit 0 = vector staging, bit 1 = perm_b32 packing
+
+
+def _preshuffle_wide(K128: int, KT: int, BLK: int, pack: int):
+    """Which wide forms of the repack body a build may use. Bit 0 stages ``pack`` dwords per
+    lane, so a lane's run must sit inside one row under one k bound; bit 1 is written for
+    PACK=4. Both are off for the variable-K callers, which pass their own bounds."""
+    w = _PRESHUF_WIDE
+    if pack < 2 or K128 % pack or KT % pack or (64 * KT) % (BLK * pack):
+        w &= ~1
+    if pack != 4:
+        w &= ~2
+    return w
 
 
 def scale_opsel(k, pack=1):
@@ -1908,6 +1921,8 @@ def _emit_lds_repack(
     pack=1,
     kbound=None,
     k128p=None,
+    wide=0,
+    bperm=False,
 ):
     # LDS-tiled transpose body (one workgroup, one (grp,k-chunk)). rd_base/wr_base
     # (default 0) shift the flat read/write offset to a group's slab (0 = dense).
@@ -1915,9 +1930,14 @@ def _emit_lds_repack(
     NT = 4
     TILE = 64 * KT
     assert KT % pack == 0 and TILE % BLK == 0 and ((KT // pack) * 64) % BLK == 0
+    # A vector-staged lane run spans one row under one bound, so the variable-K callers,
+    # which pass their own, keep the scalar form.
+    assert not (wide & 1) or (TILE % (BLK * pack) == 0 and kbound is None)
+    assert not (wide & 2) or pack == 4
     KBND = K128 if kbound is None else kbound
-    for i in range_constexpr(TILE // BLK):
-        idx = tid + i * BLK
+    VW = pack if (wide & 1) else 1
+    for i in range_constexpr(TILE // (BLK * VW)):
+        idx = (tid + i * BLK) * VW
         rr = idx // KT
         kk = idx % KT
         gk = k0 + kk
@@ -1925,17 +1945,22 @@ def _emit_lds_repack(
             grow = grp * 64 + rr  # A: rows grp*64 + (s*16+r)
         else:
             s = rr // 16  # B-comb: row = nblk*256 + wn*32 + OFF[s] + rinner
-            off = (s % 2) * fx.Int32(16) + (s // 2) * fx.Int32(128)
-            grow = (grp // 4) * 256 + (grp % 4) * 32 + off + (rr % 16)
+            # bperm: the scale must follow the column the fragment now carries.
+            if const_expr(bperm):
+                off = (s // 2) * fx.Int32(128) + (s % 2)
+                grow = (grp // 4) * 256 + (grp % 4) * 32 + off + (rr % 16) * 2
+            else:
+                off = (s % 2) * fx.Int32(16) + (s // 2) * fx.Int32(128)
+                grow = (grp // 4) * 256 + (grp % 4) * 32 + off + (rr % 16)
         dw = _buffer_ops.buffer_load(
             rin,
             grow * K128 + gk + rd_base,
-            vec_width=1,
+            vec_width=VW,
             dtype=T.i32,
             mask=(gk < KBND) & (grow < dim),
         )
-        fx.make_view(fx.add_offset(tile.ptr, fx.make_int_tuple(idx)), fx.make_layout(1, 1)).store(
-            Vec.from_elements([fx.Int32(dw)], fx.Int32)
+        fx.make_view(fx.add_offset(tile.ptr, fx.make_int_tuple(idx)), fx.make_layout(VW, 1)).store(
+            Vec(dw) if const_expr(VW > 1) else Vec.from_elements([fx.Int32(dw)], fx.Int32)
         )
     _lds_barrier()
     # Packed store: pack PACK consecutive K-iters into one output dword per lane (the
@@ -1951,16 +1976,31 @@ def _emit_lds_repack(
         r = lane % 16
         sh = (lane // 16) * fx.Int32(8)
         gkp = (k0 // PACK) + kkp
+        if const_expr(wide & 2):
+            # v_perm_b32 takes a byte from two dwords: two beat PACK shift-mask-or chains.
+            sel_lo = fx.Int32(0x0C0C0400) + (lane // 16) * fx.Int32(0x0101)
+            sel_hi = fx.Int32(0x04000C0C) + (lane // 16) * fx.Int32(0x01010000)
         elems = []
         for s in range_constexpr(NT):
-            packed = fx.Int32(0)
-            for bb in range_constexpr(PACK):
-                so = (s * 16 + r) * KT + (kkp * PACK + bb)
-                val = Vec(
-                    fx.make_view(fx.add_offset(tile.ptr, fx.make_int_tuple(so)), fx.make_layout(1, 1)).load()
+            so = (s * 16 + r) * KT + kkp * PACK
+            src = [
+                fx.Int32(
+                    Vec(
+                        fx.make_view(
+                            fx.add_offset(tile.ptr, fx.make_int_tuple(so + bb)), fx.make_layout(1, 1)
+                        ).load()
+                    )[0]
                 )
-                b = (fx.Int32(val[0]) >> sh) & fx.Int32(0xFF)
-                packed = packed | (b << fx.Int32(bb * 8))
+                for bb in range_constexpr(PACK)
+            ]
+            if const_expr(wide & 2):
+                lo = rocdl.perm_b32(_raw(src[1]), _raw(src[0]), _raw(sel_lo))
+                hi = rocdl.perm_b32(_raw(src[3]), _raw(src[2]), _raw(sel_hi))
+                packed = fx.Int32(lo) | fx.Int32(hi)
+            else:
+                packed = fx.Int32(0)
+                for bb in range_constexpr(PACK):
+                    packed = packed | (((src[bb] >> sh) & fx.Int32(0xFF)) << fx.Int32(bb * 8))
             elems.append(packed)
         vec = Vec.from_elements(elems, fx.Int32)
         _buffer_ops.buffer_store(
@@ -1971,13 +2011,16 @@ def _emit_lds_repack(
         )
 
 
-def build_preshuffle_ab_kernel(K128: int, KT: int = _PRESHUF_KT, BLK: int = 256, pack: int = 1):
+def build_preshuffle_ab_kernel(
+    K128: int, KT: int = _PRESHUF_KT, BLK: int = 256, pack: int = 1, bperm: bool = False
+):
     """Build the fused A (layout 1) + B-comb (layout 3) scale-preshuffle @flyc.kernel. Returns
     ``(kern, n_kt)`` where kern is a bare KernelFunction the mxfp8 GEMM factory calls inside its
     own @flyc.jit; one workgroup repacks one (group, KT-chunk) into the layout ScaleS2R consumes."""
     TILE = 64 * KT
     n_kt = ceildiv(K128, KT)
     K128p = ceildiv(K128, pack)  # packed K-groups (PACK scales / dword)
+    wide = _preshuffle_wide(K128, KT, BLK, pack)
 
     @fx.struct
     class Smem:
@@ -2008,12 +2051,37 @@ def build_preshuffle_ab_kernel(K128: int, KT: int = _PRESHUF_KT, BLK: int = 256,
         )
         if bid < a_blocks:
             _emit_lds_repack(
-                True, bid // n_kt, (bid % n_kt) * KT, tile, rin_a, rout_a, m, K128, KT, tid, BLK, pack=pack
+                True,
+                bid // n_kt,
+                (bid % n_kt) * KT,
+                tile,
+                rin_a,
+                rout_a,
+                m,
+                K128,
+                KT,
+                tid,
+                BLK,
+                pack=pack,
+                wide=wide,
             )
         if bid >= a_blocks:
             bb = bid - a_blocks
             _emit_lds_repack(
-                False, bb // n_kt, (bb % n_kt) * KT, tile, rin_b, rout_b, n, K128, KT, tid, BLK, pack=pack
+                False,
+                bb // n_kt,
+                (bb % n_kt) * KT,
+                tile,
+                rin_b,
+                rout_b,
+                n,
+                K128,
+                KT,
+                tid,
+                BLK,
+                pack=pack,
+                wide=wide,
+                bperm=bperm,
             )
 
     return kern, n_kt

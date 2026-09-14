@@ -43,6 +43,7 @@ import torch
 # PR), so the NN/TN transpose loaders (S2RLoaderTr / swizzle_nn) are not imported.
 from primus_turbo.flydsl.utils.gemm_helper import (
     block_mn,
+    build_preshuffle_ab_kernel,
     compile_with_scratch_out,
     compute_global_swizzle,
     G2SLoader,
@@ -64,7 +65,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     wait_barrier,
     xcd_remap_pid,
 )
-from primus_turbo.flydsl.utils.prims import _lds_barrier, ceildiv
+from primus_turbo.flydsl.utils.prims import ceildiv
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -610,173 +611,10 @@ def _build_mxfp8_nt_kernel(
     return kernel_mxfp8_nt, BLOCK_M, BLOCK_N, waves_per_eu
 
 
-# Dense scale preshuffle: local widened form of the shared repack (dense-only staging).
-_PRESHUF_WIDE = 3
-
-
-def _mx_preshuffle_wide(K128: int, KT: int, BLK: int, pack: int):
-    """Which wide forms of the repack body this build may use: bit 0 stages ``pack`` dwords
-    per lane, which needs a lane's run to sit inside one row and share one k bound; bit 1
-    byte-permutes the packed dword, which is written for PACK=4."""
-    w = _PRESHUF_WIDE
-    if pack < 2 or K128 % pack or KT % pack or (64 * KT) % (BLK * pack):
-        w &= ~1
-    if pack != 4:
-        w &= ~2
-    return w
-
-
-def _mx_emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, pack, wide, bperm=False):
-    # LDS-tiled transpose body: dense-only mirror, no group slab bases, no variable K.
-    NT = 4
-    TILE = 64 * KT
-    assert KT % pack == 0 and TILE % BLK == 0 and ((KT // pack) * 64) % BLK == 0
-    assert not (wide & 1) or TILE % (BLK * pack) == 0
-    assert not (wide & 2) or pack == 4
-    VW = pack if (wide & 1) else 1
-    for i in range_constexpr(TILE // (BLK * VW)):
-        idx = (tid + i * BLK) * VW
-        rr = idx // KT
-        kk = idx % KT
-        gk = k0 + kk
-        if is_a:
-            grow = grp * 64 + rr  # A: rows grp*64 + (s*16+r)
-        else:
-            s = rr // 16  # B-comb: row = nblk*256 + wn*32 + OFF[s] + rinner
-            # bperm: the scale must follow the column the fragment now carries.
-            if const_expr(bperm):
-                off = (s // 2) * fx.Int32(128) + (s % 2)
-                grow = (grp // 4) * 256 + (grp % 4) * 32 + off + (rr % 16) * 2
-            else:
-                off = (s % 2) * fx.Int32(16) + (s // 2) * fx.Int32(128)
-                grow = (grp // 4) * 256 + (grp % 4) * 32 + off + (rr % 16)
-        dw = buffer_ops.buffer_load(
-            rin,
-            grow * K128 + gk,
-            vec_width=VW,
-            dtype=T.i32,
-            mask=(gk < K128) & (grow < dim),
-        )
-        fx.make_view(fx.add_offset(tile.ptr, fx.make_int_tuple(idx)), fx.make_layout(VW, 1)).store(
-            Vec(dw) if const_expr(VW > 1) else Vec.from_elements([fx.Int32(dw)], fx.Int32)
-        )
-    _lds_barrier()
-    # Pack PACK consecutive K-iters per output dword; the reader mirrors it via op_sel.
-    PACK = pack
-    K128p = ceildiv(K128, PACK)
-    NOUTp = (KT // PACK) * 64
-    for j in range_constexpr(NOUTp // BLK):
-        ol = tid + j * BLK
-        kkp = ol // 64
-        lane = ol % 64
-        r = lane % 16
-        sh = (lane // 16) * fx.Int32(8)
-        gkp = (k0 // PACK) + kkp
-        if const_expr(wide & 2):
-            # v_perm_b32 takes a byte from two dwords: two beat PACK shift-mask-or chains.
-            sel_lo = fx.Int32(0x0C0C0400) + (lane // 16) * fx.Int32(0x0101)
-            sel_hi = fx.Int32(0x04000C0C) + (lane // 16) * fx.Int32(0x01010000)
-        elems = []
-        for s in range_constexpr(NT):
-            so = (s * 16 + r) * KT + kkp * PACK
-            src = [
-                fx.Int32(
-                    Vec(
-                        fx.make_view(
-                            fx.add_offset(tile.ptr, fx.make_int_tuple(so + bb)), fx.make_layout(1, 1)
-                        ).load()
-                    )[0]
-                )
-                for bb in range_constexpr(PACK)
-            ]
-            if const_expr(wide & 2):
-                lo = rocdl.perm_b32(_raw(src[1]), _raw(src[0]), _raw(sel_lo))
-                hi = rocdl.perm_b32(_raw(src[3]), _raw(src[2]), _raw(sel_hi))
-                packed = fx.Int32(lo) | fx.Int32(hi)
-            else:
-                packed = fx.Int32(0)
-                for bb in range_constexpr(PACK):
-                    packed = packed | (((src[bb] >> sh) & fx.Int32(0xFF)) << fx.Int32(bb * 8))
-            elems.append(packed)
-        vec = Vec.from_elements(elems, fx.Int32)
-        buffer_ops.buffer_store(
-            vec.ir_value(),
-            rout,
-            ((grp * K128p + gkp) * 64 + lane) * 4,
-            mask=(k0 + kkp * PACK) < K128,
-        )
-
-
-def _mx_build_preshuffle_ab_kernel(
-    K128: int, KT: int = _PRESHUF_KT, BLK: int = 256, pack: int = 1, bperm: bool = False
-):
-    """Build the fused A (layout 1) + B-comb (layout 3) scale-preshuffle @flyc.kernel. Returns
-    ``(kern, n_kt)`` where kern is a bare KernelFunction the mxfp8 GEMM factory calls inside its
-    own @flyc.jit; one workgroup repacks one (group, KT-chunk) into the layout ScaleS2R consumes."""
-    TILE = 64 * KT
-    n_kt = ceildiv(K128, KT)
-    K128p = ceildiv(K128, pack)  # packed K-groups (PACK scales / dword)
-    wide = _mx_preshuffle_wide(K128, KT, BLK, pack)
-
-    @fx.struct
-    class Smem:
-        tile: fx.Array[fx.Int32, TILE, 16]
-
-    @flyc.kernel(known_block_size=[BLK, 1, 1])
-    def kern(
-        a_raw: fx.Tensor,
-        b_raw: fx.Tensor,
-        a_sp: fx.Tensor,
-        b_sp: fx.Tensor,
-        m: fx.Int32,
-        n: fx.Int32,
-        a_blocks: fx.Int32,
-        a_ngrp: fx.Int32,
-        b_ngrp: fx.Int32,
-    ):
-        bid = fx.block_idx.x
-        tid = fx.thread_idx.x
-        tile = fx.SharedAllocator().allocate(Smem).peek().tile
-        rin_a = buffer_ops.create_buffer_resource(a_raw, max_size=False, num_records_bytes=m * K128 * 4)
-        rin_b = buffer_ops.create_buffer_resource(b_raw, max_size=False, num_records_bytes=n * K128 * 4)
-        rout_a = buffer_ops.create_buffer_resource(
-            a_sp, max_size=False, num_records_bytes=a_ngrp * K128p * 256 * 4
-        )
-        rout_b = buffer_ops.create_buffer_resource(
-            b_sp, max_size=False, num_records_bytes=b_ngrp * K128p * 256 * 4
-        )
-        if bid < a_blocks:
-            _mx_emit_lds_repack(
-                True, bid // n_kt, (bid % n_kt) * KT, tile, rin_a, rout_a, m, K128, KT, tid, BLK, pack, wide
-            )
-        if bid >= a_blocks:
-            bb = bid - a_blocks
-            _mx_emit_lds_repack(
-                False,
-                bb // n_kt,
-                (bb % n_kt) * KT,
-                tile,
-                rin_b,
-                rout_b,
-                n,
-                K128,
-                KT,
-                tid,
-                BLK,
-                pack,
-                wide,
-                bperm=bperm,
-            )
-
-    return kern, n_kt
-
-
-# ── Primus-Turbo host wrapper ────────────────────────────────────────────────
-
 _BLOCK_M = 256  # fixed: the A-scale preshuffle layout is bm-dependent (see _MXFP8_NT_CANDIDATES)
 _BLOCK_N = 256
 _NCU = 256  # co-resident workgroups per dispatch round (1 WG/CU at this tile's occupancy)
-_PRESHUF_BLK = 256  # preshuffle kernel block size (matches _mx_build_preshuffle_ab_kernel)
+_PRESHUF_BLK = 256  # preshuffle kernel block size (matches build_preshuffle_ab_kernel)
 
 # (K, bm, gm, xcd, gn, cbsz, blgp, out_fp16, beta1) -> launch_mxfp8_fused (preshuffle+gemm jit)
 _MXFP8_FUSED_CACHE: dict = {}
@@ -875,7 +713,7 @@ def _compile_mxfp8_fused(
     assert k_split == 1 or bm == _BLOCK_M
     # Gated: a paired run has no column mask, and the scales must match the gemm's layout.
     bperm = bool(_MX_BPERM) and col_safe and not beta_is_one
-    pre_kern, n_kt = _mx_build_preshuffle_ab_kernel(K128, pack=_MX_SCALE_PACK, bperm=bperm)
+    pre_kern, n_kt = build_preshuffle_ab_kernel(K128, pack=_MX_SCALE_PACK, bperm=bperm)
     _nt = dict(
         K=K,
         BLOCK_M=bm,
