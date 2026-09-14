@@ -43,7 +43,6 @@ import torch
 # PR), so the NN/TN transpose loaders (S2RLoaderTr / swizzle_nn) are not imported.
 from primus_turbo.flydsl.utils.gemm_helper import (
     block_mn,
-    build_preshuffle_ab_kernel,
     compile_with_scratch_out,
     compute_global_swizzle,
     G2SLoader,
@@ -61,14 +60,16 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     _store_quadrants,
     StoreCPerTensor,
     StoreCPerTensorRowN,
+    swizzle_128,
     wait_barrier,
     xcd_remap_pid,
 )
-from primus_turbo.flydsl.utils.prims import ceildiv
+from primus_turbo.flydsl.utils.prims import _lds_barrier, ceildiv
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr, rocdl
+from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
@@ -85,6 +86,68 @@ _FOLD_ROWS = 64  # C rows one fold workgroup owns
 
 # `nt` on the C store: C is write-once, so caching it evicts the A/B band L2 keeps.
 _MX_CSTORE_NT = 2
+
+# A quadrant's accumulators go final early, so its store rides an MFMA shadow; past 2
+# the store temporaries outlive an MFMA pair and VGPRs spill.
+_MX_EPI_LAP = 2  # quadrants lapped into the last K-iteration (0 = all four at the end)
+_MX_WAVE_MAP = 1  # wave_id -> (wave_m, wave_n): 1 walks the N bands per phase group
+
+_MX_BPERM = 1  # pair B rows so a lane's two n-fragments land on adjacent output columns
+
+
+def _mx_arm_key():
+    """Build-affecting module knobs: two settings must not share a compiled launch."""
+    return (_MX_EPI_LAP, _MX_WAVE_MAP, _MX_BPERM)
+
+
+def _mx_pair_rows(row):
+    """Involution inside a 32-row B block: row 16*t+m carries B row 2*m+t. Applied to the
+    fetched row only, so the LDS row (and with it the bank-swizzle key) is untouched."""
+    return (row - row % 32) + (row % 16) * 2 + (row % 32) // 16
+
+
+def _mx_b_global_swizzle(lane_id, wave_id, K, n_rounds):
+    """compute_global_swizzle(preshuffled=False) with the column-pair involution folded into
+    the fetched B row. One wave's eight rows stay inside one 32-row block, so the block base
+    is wave-uniform and the read set per workgroup is unchanged."""
+    offsets = []
+    n_waves = fx.block_dim.x // 64
+    for rnd in range_constexpr(n_rounds):
+        row = lane_id // 8 + wave_id * 8 + rnd * (n_waves * 8)
+        col = (lane_id % 8) * 16
+        _, c = swizzle_128(row, col)
+        offsets.append(_mx_pair_rows(row) * K + c)
+    return offsets
+
+
+class _MxStoreCColPair(StoreCPerTensor):
+    """C store for the paired-column B layout: a lane's two n-fragments are adjacent columns,
+    so one packed dword per fragment row already fills a write granule -- no cross-lane swap,
+    no half-dword extract. The fragment row offset is wave-uniform and rides soffset."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert self.n_tiles_b == 2, "one fragment pair per row run"
+        assert self.col_safe, "a paired column run has no column mask"
+        assert not self.trans and not self.beta_is_one, "written for the plain NT epilogue"
+
+    def store(self, c_frag, base_row, base_col, prev=None):
+        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
+        lane_off = ((self.lane_id // 16) * 4 * self.c_cols + base_col + (self.lane_id % 16) * 2) * 2
+        for ti in range_constexpr(self.n_tiles_a):
+            vecs = [Vec(c_frag[self.c_idx_fn(ti, tj)]) for tj in range_constexpr(2)]
+            for i in range_constexpr(4):
+                lo, hi = vecs[0][i], vecs[1][i]
+                if self.elem_fn is not None:
+                    lo, hi = self.elem_fn(lo), self.elem_fn(hi)
+                buffer_ops.buffer_store(
+                    fx.Int32(self._pack(lo, hi)),
+                    rsrc,
+                    lane_off,
+                    cache_modifier=self.store_aux,
+                    soffset_bytes=_raw(fx.Int32(2 * (ti * 16 + i)) * self.c_cols),
+                    offset_is_bytes=True,
+                )
 
 
 def _build_mxfp8_fold_kernel(k_split, BLOCK_M, BLOCK_N, GROUP_M, group_n, cstore_aux):
@@ -178,6 +241,7 @@ def _build_mxfp8_nt_kernel(
     col_safe: bool = False,  # N % BLOCK_N == 0: every launched tile owns all its columns
     k_split: int = 1,  # >1: tail-round arm, C is the [s, n_tail, BM, BN] partial workspace
     cstore_aux: int = 0,  # C-store cache policy (see _MX_CSTORE_NT); autotuned per shape
+    bperm: bool = False,  # B rows interleaved into column pairs (see _MX_BPERM)
 ):
     BLOCK_K = 128
     assert GROUP_M >= 1
@@ -248,6 +312,9 @@ def _build_mxfp8_nt_kernel(
         wave_id = fx.thread_idx.x // 64
         wave_m = wave_id // 4
         wave_n = wave_id % 4
+        # Keep the SIMD-mate pair on different wave_m so they share B, not the heavier A.
+        if const_expr(_MX_WAVE_MAP == 1):
+            wave_n = wave_n ^ (wave_m * 2)
         # 1D GROUP_M super-row swizzle (group_n=0) or 2D N-band (group_n>0, big-N L2
         # reuse: cuts the B re-stream). XCD-aware remap. See block_mn / xcd_remap_pid.
         # Tile-minor slice walk, so one XCD still sees the unsplit contiguous tile run.
@@ -286,7 +353,10 @@ def _build_mxfp8_nt_kernel(
         b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
         gl_off_a = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False)
-        gl_off_b = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False)
+        if const_expr(bperm):
+            gl_off_b = _mx_b_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS)
+        else:
+            gl_off_b = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False)
 
         mfma = MfmaScale16x16x128(N_TILES_A, N_TILES_B, cbsz=cbsz, blgp=blgp)
 
@@ -298,12 +368,13 @@ def _build_mxfp8_nt_kernel(
         sa_s2r = ScaleS2R(A_scale, c_m, K, SA_TILES, pack=_MX_SCALE_PACK)
         sb_s2r = ScaleBComb(B_scale, c_n, K, pack=_MX_SCALE_PACK)  # one dwordx4 = b0+b1 scales
         _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
-        # A lane's two n-fragments are 16 columns apart; merging them fills a write granule.
-        _store_cls = (
-            StoreCPerTensorRowN
-            if (col_safe and _out_ty is fx.BFloat16 and N_TILES_B % 2 == 0)
-            else StoreCPerTensor
-        )
+        # Either layout merges a lane's two n-fragments into one granule-filling run.
+        if const_expr(bperm):
+            _store_cls = _MxStoreCColPair
+        elif const_expr(col_safe and _out_ty is fx.BFloat16 and N_TILES_B % 2 == 0):
+            _store_cls = StoreCPerTensorRowN
+        else:
+            _store_cls = StoreCPerTensor
         # A k_split arm stores to a dense workspace slot, so it needs no column mask.
         if const_expr(k_split > 1):
             store_rows, store_cols = BLOCK_M, BLOCK_N
@@ -471,6 +542,13 @@ def _build_mxfp8_nt_kernel(
 
         # Step k = K_ITERS - 1 (sa*/sb* already hold scales[K_ITERS-1])
         mfma.opsel = scale_opsel(K_ITERS - 1, _MX_SCALE_PACK)
+        if const_expr(k_split > 1):
+            base_row = wave_m_offset
+            base_col = wave_n_offset
+        else:
+            base_row = block_m * BLOCK_M + wave_m_offset
+            base_col = block_n * BLOCK_N + wave_n_offset
+        lap = 0 if beta_is_one else min(_MX_EPI_LAP, 3)
         a0_frag = a_s2r.load(a_cur0)
         wait_barrier(0)
 
@@ -480,6 +558,9 @@ def _build_mxfp8_nt_kernel(
         rocdl.s_barrier()
 
         b1_frag = b_s2r.load(b_cur1)
+        if const_expr(lap > 0):
+            store_c.store(c00_frag, base_row, base_col)
+            rocdl.sched_barrier(0)
         rocdl.s_barrier()
 
         rocdl.s_setprio(1)
@@ -488,32 +569,40 @@ def _build_mxfp8_nt_kernel(
         rocdl.s_barrier()
 
         a1_frag = a_s2r.load(a_cur1)
+        if const_expr(lap > 1):
+            store_c.store(c01_frag, base_row, base_col + LDS_BLOCK_N)
+            rocdl.sched_barrier(0)
         rocdl.s_barrier()
 
         rocdl.s_setprio(1)
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, sa1, sb0)
+        if const_expr(lap > 2):
+            rocdl.s_setprio(0)
+            store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col)
+            rocdl.sched_barrier(0)
+            rocdl.s_setprio(1)
         c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, sa1, sb1)
         rocdl.s_setprio(0)
         rocdl.s_barrier()
 
-        if const_expr(k_split > 1):
-            base_row = wave_m_offset
-            base_col = wave_n_offset
+        if const_expr(lap == 0):
+            _store_quadrants(
+                store_c,
+                c00_frag,
+                c01_frag,
+                c10_frag,
+                c11_frag,
+                base_row,
+                base_col,
+                LDS_BLOCK_M,
+                LDS_BLOCK_N,
+            )
         else:
-            base_row = block_m * BLOCK_M + wave_m_offset
-            base_col = block_n * BLOCK_N + wave_n_offset
-
-        _store_quadrants(
-            store_c,
-            c00_frag,
-            c01_frag,
-            c10_frag,
-            c11_frag,
-            base_row,
-            base_col,
-            LDS_BLOCK_M,
-            LDS_BLOCK_N,
-        )
+            if const_expr(lap < 2):
+                store_c.store(c01_frag, base_row, base_col + LDS_BLOCK_N)
+            if const_expr(lap < 3):
+                store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col)
+            store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
 
     # Bare kernel (NOT a launch): the fused factory issues it + the preshuffle kernel
     # from a single @flyc.jit host stub. BLOCK_M/BLOCK_N/waves_per_eu are returned so
@@ -521,12 +610,173 @@ def _build_mxfp8_nt_kernel(
     return kernel_mxfp8_nt, BLOCK_M, BLOCK_N, waves_per_eu
 
 
+# Dense scale preshuffle: local widened form of the shared repack (dense-only staging).
+_PRESHUF_WIDE = 3
+
+
+def _mx_preshuffle_wide(K128: int, KT: int, BLK: int, pack: int):
+    """Which wide forms of the repack body this build may use: bit 0 stages ``pack`` dwords
+    per lane, which needs a lane's run to sit inside one row and share one k bound; bit 1
+    byte-permutes the packed dword, which is written for PACK=4."""
+    w = _PRESHUF_WIDE
+    if pack < 2 or K128 % pack or KT % pack or (64 * KT) % (BLK * pack):
+        w &= ~1
+    if pack != 4:
+        w &= ~2
+    return w
+
+
+def _mx_emit_lds_repack(is_a, grp, k0, tile, rin, rout, dim, K128, KT, tid, BLK, pack, wide, bperm=False):
+    # LDS-tiled transpose body: dense-only mirror, no group slab bases, no variable K.
+    NT = 4
+    TILE = 64 * KT
+    assert KT % pack == 0 and TILE % BLK == 0 and ((KT // pack) * 64) % BLK == 0
+    assert not (wide & 1) or TILE % (BLK * pack) == 0
+    assert not (wide & 2) or pack == 4
+    VW = pack if (wide & 1) else 1
+    for i in range_constexpr(TILE // (BLK * VW)):
+        idx = (tid + i * BLK) * VW
+        rr = idx // KT
+        kk = idx % KT
+        gk = k0 + kk
+        if is_a:
+            grow = grp * 64 + rr  # A: rows grp*64 + (s*16+r)
+        else:
+            s = rr // 16  # B-comb: row = nblk*256 + wn*32 + OFF[s] + rinner
+            # bperm: the scale must follow the column the fragment now carries.
+            if const_expr(bperm):
+                off = (s // 2) * fx.Int32(128) + (s % 2)
+                grow = (grp // 4) * 256 + (grp % 4) * 32 + off + (rr % 16) * 2
+            else:
+                off = (s % 2) * fx.Int32(16) + (s // 2) * fx.Int32(128)
+                grow = (grp // 4) * 256 + (grp % 4) * 32 + off + (rr % 16)
+        dw = buffer_ops.buffer_load(
+            rin,
+            grow * K128 + gk,
+            vec_width=VW,
+            dtype=T.i32,
+            mask=(gk < K128) & (grow < dim),
+        )
+        fx.make_view(fx.add_offset(tile.ptr, fx.make_int_tuple(idx)), fx.make_layout(VW, 1)).store(
+            Vec(dw) if const_expr(VW > 1) else Vec.from_elements([fx.Int32(dw)], fx.Int32)
+        )
+    _lds_barrier()
+    # Pack PACK consecutive K-iters per output dword; the reader mirrors it via op_sel.
+    PACK = pack
+    K128p = ceildiv(K128, PACK)
+    NOUTp = (KT // PACK) * 64
+    for j in range_constexpr(NOUTp // BLK):
+        ol = tid + j * BLK
+        kkp = ol // 64
+        lane = ol % 64
+        r = lane % 16
+        sh = (lane // 16) * fx.Int32(8)
+        gkp = (k0 // PACK) + kkp
+        if const_expr(wide & 2):
+            # v_perm_b32 takes a byte from two dwords: two beat PACK shift-mask-or chains.
+            sel_lo = fx.Int32(0x0C0C0400) + (lane // 16) * fx.Int32(0x0101)
+            sel_hi = fx.Int32(0x04000C0C) + (lane // 16) * fx.Int32(0x01010000)
+        elems = []
+        for s in range_constexpr(NT):
+            so = (s * 16 + r) * KT + kkp * PACK
+            src = [
+                fx.Int32(
+                    Vec(
+                        fx.make_view(
+                            fx.add_offset(tile.ptr, fx.make_int_tuple(so + bb)), fx.make_layout(1, 1)
+                        ).load()
+                    )[0]
+                )
+                for bb in range_constexpr(PACK)
+            ]
+            if const_expr(wide & 2):
+                lo = rocdl.perm_b32(_raw(src[1]), _raw(src[0]), _raw(sel_lo))
+                hi = rocdl.perm_b32(_raw(src[3]), _raw(src[2]), _raw(sel_hi))
+                packed = fx.Int32(lo) | fx.Int32(hi)
+            else:
+                packed = fx.Int32(0)
+                for bb in range_constexpr(PACK):
+                    packed = packed | (((src[bb] >> sh) & fx.Int32(0xFF)) << fx.Int32(bb * 8))
+            elems.append(packed)
+        vec = Vec.from_elements(elems, fx.Int32)
+        buffer_ops.buffer_store(
+            vec.ir_value(),
+            rout,
+            ((grp * K128p + gkp) * 64 + lane) * 4,
+            mask=(k0 + kkp * PACK) < K128,
+        )
+
+
+def _mx_build_preshuffle_ab_kernel(
+    K128: int, KT: int = _PRESHUF_KT, BLK: int = 256, pack: int = 1, bperm: bool = False
+):
+    """Build the fused A (layout 1) + B-comb (layout 3) scale-preshuffle @flyc.kernel. Returns
+    ``(kern, n_kt)`` where kern is a bare KernelFunction the mxfp8 GEMM factory calls inside its
+    own @flyc.jit; one workgroup repacks one (group, KT-chunk) into the layout ScaleS2R consumes."""
+    TILE = 64 * KT
+    n_kt = ceildiv(K128, KT)
+    K128p = ceildiv(K128, pack)  # packed K-groups (PACK scales / dword)
+    wide = _mx_preshuffle_wide(K128, KT, BLK, pack)
+
+    @fx.struct
+    class Smem:
+        tile: fx.Array[fx.Int32, TILE, 16]
+
+    @flyc.kernel(known_block_size=[BLK, 1, 1])
+    def kern(
+        a_raw: fx.Tensor,
+        b_raw: fx.Tensor,
+        a_sp: fx.Tensor,
+        b_sp: fx.Tensor,
+        m: fx.Int32,
+        n: fx.Int32,
+        a_blocks: fx.Int32,
+        a_ngrp: fx.Int32,
+        b_ngrp: fx.Int32,
+    ):
+        bid = fx.block_idx.x
+        tid = fx.thread_idx.x
+        tile = fx.SharedAllocator().allocate(Smem).peek().tile
+        rin_a = buffer_ops.create_buffer_resource(a_raw, max_size=False, num_records_bytes=m * K128 * 4)
+        rin_b = buffer_ops.create_buffer_resource(b_raw, max_size=False, num_records_bytes=n * K128 * 4)
+        rout_a = buffer_ops.create_buffer_resource(
+            a_sp, max_size=False, num_records_bytes=a_ngrp * K128p * 256 * 4
+        )
+        rout_b = buffer_ops.create_buffer_resource(
+            b_sp, max_size=False, num_records_bytes=b_ngrp * K128p * 256 * 4
+        )
+        if bid < a_blocks:
+            _mx_emit_lds_repack(
+                True, bid // n_kt, (bid % n_kt) * KT, tile, rin_a, rout_a, m, K128, KT, tid, BLK, pack, wide
+            )
+        if bid >= a_blocks:
+            bb = bid - a_blocks
+            _mx_emit_lds_repack(
+                False,
+                bb // n_kt,
+                (bb % n_kt) * KT,
+                tile,
+                rin_b,
+                rout_b,
+                n,
+                K128,
+                KT,
+                tid,
+                BLK,
+                pack,
+                wide,
+                bperm=bperm,
+            )
+
+    return kern, n_kt
+
+
 # ── Primus-Turbo host wrapper ────────────────────────────────────────────────
 
 _BLOCK_M = 256  # fixed: the A-scale preshuffle layout is bm-dependent (see _MXFP8_NT_CANDIDATES)
 _BLOCK_N = 256
 _NCU = 256  # co-resident workgroups per dispatch round (1 WG/CU at this tile's occupancy)
-_PRESHUF_BLK = 256  # preshuffle kernel block size (matches build_preshuffle_ab_kernel)
+_PRESHUF_BLK = 256  # preshuffle kernel block size (matches _mx_build_preshuffle_ab_kernel)
 
 # (K, bm, gm, xcd, gn, cbsz, blgp, out_fp16, beta1) -> launch_mxfp8_fused (preshuffle+gemm jit)
 _MXFP8_FUSED_CACHE: dict = {}
@@ -623,7 +873,9 @@ def _compile_mxfp8_fused(
     K128 = K // 128
     # The split plan and the fold both decode tile ids at _BLOCK_M.
     assert k_split == 1 or bm == _BLOCK_M
-    pre_kern, n_kt = build_preshuffle_ab_kernel(K128, pack=_MX_SCALE_PACK)
+    # Gated: a paired run has no column mask, and the scales must match the gemm's layout.
+    bperm = bool(_MX_BPERM) and col_safe and not beta_is_one
+    pre_kern, n_kt = _mx_build_preshuffle_ab_kernel(K128, pack=_MX_SCALE_PACK, bperm=bperm)
     _nt = dict(
         K=K,
         BLOCK_M=bm,
@@ -635,6 +887,7 @@ def _compile_mxfp8_fused(
         blgp=blgp,
         out_fp16=out_fp16,
         cstore_aux=cstore_aux,
+        bperm=bperm,
     )
     gemm_kern, BM, BN, wpe = _build_mxfp8_nt_kernel(beta_is_one=beta_is_one, col_safe=col_safe, **_nt)
     split_kern = _build_mxfp8_nt_kernel(col_safe=True, k_split=k_split, **_nt)[0] if k_split > 1 else None
@@ -711,7 +964,20 @@ def _get_mxfp8_fused_launch(
     k_split=1,
     cstore_aux=0,
 ):
-    fk = (K, bm, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one, col_safe, k_split, cstore_aux)
+    fk = (
+        K,
+        bm,
+        gm,
+        xcd,
+        gn,
+        cbsz,
+        blgp,
+        out_fp16,
+        beta_is_one,
+        col_safe,
+        k_split,
+        cstore_aux,
+    ) + _mx_arm_key()
     launch = _MXFP8_FUSED_CACHE.get(fk)
     if launch is None:
         launch = _compile_mxfp8_fused(
@@ -964,7 +1230,7 @@ def gemm_mxfp8_flydsl_kernel(
     args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, ws, M, N, a_blocks, a_ngrp, b_ngrp, head, tail, stream)
     # [raw, compiled]: raw for CUDA-graph capture (flyc.compile regresses under capture);
     # compiled for eager (skips per-call jit dispatch overhead). Mirrors _GROUPED_AT_CACHE.
-    at_key = (M, N, K, bm, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one, ks, aux)
+    at_key = (M, N, K, bm, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one, ks, aux) + _mx_arm_key()
     entry = _MXFP8_AT_CACHE.get(at_key)
     if entry is None:
         entry = [launch, None]

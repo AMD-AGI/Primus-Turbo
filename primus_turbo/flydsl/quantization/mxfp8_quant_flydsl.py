@@ -158,8 +158,69 @@ def _warp_reduce_max(val, lane, masks, IRI):
     return v
 
 
+_WR2 = [1]
 _WR8 = [1, 2, 4]
 _WR64 = [1, 2, 4, 8, 16, 32]
+# Lanes sharing one 32x32 block: the ROW half fixes lane bit 1, the COL half lane bit 5.
+_WR32_ROW = [1, 4, 8, 16, 32]
+_WR32_COL = [1, 2, 4, 8, 16]
+
+
+def _row_pass_scales(secp, chunks, lane, va, ep_sub, IRI):
+    """(E8M0 exponent, 1/scale) per 16B store half. With ``secp`` the lane pair sharing a
+    scale block trades partial amax, which is order-free. Plain Python: values must stay
+    in the caller's scope."""
+    F32 = fx.Float32
+    if not secp:
+        a = F32(0.0)
+        for i in range(8):
+            ai = fm.absf(chunks[i]).reduce("max")
+            a = (a > ai).select(a, ai)
+        ep = _ep(a, va, ep_sub)
+        return [(ep, F32(1.0) / fm.exp2(ep.to(F32)))] * 2
+    out = []
+    for v in range(2):
+        a = F32(0.0)
+        for i in range(4):
+            ai = fm.absf(chunks[4 * v + i]).reduce("max")
+            a = (a > ai).select(a, ai)
+        ep = _ep(_warp_reduce_max(a, lane, _WR2, IRI), va, ep_sub)
+        out.append((ep, F32(1.0) / fm.exp2(ep.to(F32))))
+    return out
+
+
+def _row_scale_slot(secp, kb, nkb, scales, z):
+    """(scale block inside the tile row, biased E8M0 byte) for the row half's scale store.
+    ``secp``: the lane's two halves sit in different blocks, so pick the lane<->block
+    bijection that needs no cross-lane move."""
+    I32 = fx.Int32
+    if not secp:
+        return kb, scales[0][0] + I32(127)
+    odd = kb & I32(1)
+    return odd * I32(nkb // 2) + (kb >> I32(1)), (odd == z).select(scales[0][0], scales[1][0]) + I32(127)
+
+
+def _blk_row_scales(is_2d, chunks, lane, va, ep_sub, IRI):
+    """(E8M0 exponent, 1/scale) for the flat 2d row half's two 16B store halves. A lane owns
+    16 columns of two rows 16 apart, so ``is_2d`` maxes over the 32 lanes that share the
+    32x32 block, and the 1d form only over the column pair completing each row's 32 block."""
+    F32 = fx.Float32
+    part = []
+    for v in range(2):
+        a = F32(0.0)
+        for i in range(4):
+            ai = fm.absf(chunks[4 * v + i]).reduce("max")
+            a = (a > ai).select(a, ai)
+        part.append(a)
+    if is_2d:
+        a = (part[0] > part[1]).select(part[0], part[1])
+        ep = _ep(_warp_reduce_max(a, lane, _WR32_ROW, IRI), va, ep_sub)
+        return [(ep, F32(1.0) / fm.exp2(ep.to(F32)))] * 2
+    out = []
+    for v in range(2):
+        ep = _ep(_warp_reduce_max(part[v], lane, _WR2, IRI), va, ep_sub)
+        out.append((ep, F32(1.0) / fm.exp2(ep.to(F32))))
+    return out
 
 
 def _tile_scales(is_2d, lamax, lamaxes, lane, va, ep_sub, IRI):
@@ -185,6 +246,11 @@ def _tile_scales(is_2d, lamax, lamaxes, lane, va, ep_sub, IRI):
 _QD_KRUN = 3
 _QD_LONG_BAND = 8
 _QD_LONG_STRIDE = 8192
+# Write-sector completion for the ROW half: at 64B write-request granularity its two 16B
+# stores each half-fill a sector, because a lane owns 32 consecutive columns.
+_QD_SEC_PAIR = True
+# Same completion for the 2d-block halves, whose stores are a lane-wide dword (see flat_2d).
+_QD_2D_FLAT = True
 
 
 def _qdual_tile_cfg(M, K, Mp, Kp):
@@ -192,15 +258,16 @@ def _qdual_tile_cfg(M, K, Mp, Kp):
     BOTH ROW and COL a full 128B write burst (write-burst granularity is the limiter, not
     occupancy). Large-K small-M (Kp>=8192, Mp<=4096) uses bm=128,bk=64 + a column-major walk
     to avoid DRAM-channel camping. Shapes scattered on both axes take the long-run config."""
+    sec = dict(sec_pair=_QD_SEC_PAIR, flat_2d=_QD_2D_FLAT)
     if Kp >= 8192 and Mp <= 4096:
-        return dict(bm=128, bk=64, pad_extra=4, grid_gm=0, krun=1, xcd_band=0)
+        return dict(bm=128, bk=64, pad_extra=4, grid_gm=0, krun=1, xcd_band=0, **sec)
     bm, bk = 128, 128
     long_run = Mp >= _QD_LONG_STRIDE and Kp >= _QD_LONG_STRIDE and (Kp // bk) % _QD_KRUN == 0
     if long_run:
         walk = dict(grid_gm=0, xcd_band=_QD_LONG_BAND, krun=_QD_KRUN)
     else:
         walk = dict(grid_gm=1, xcd_band=0, krun=1)
-    return dict(bm=bm, bk=bk, nth=1024, pad_extra=4, **walk)
+    return dict(bm=bm, bk=bk, nth=1024, pad_extra=4, **sec, **walk)
 
 
 # ============================================================================
@@ -232,6 +299,8 @@ def compile_qdual(
     krun=1,
     row_2d=False,
     col_2d=False,
+    sec_pair=False,
+    flat_2d=True,
 ):
     """Dense dual-cast mxfp8 quant, batched over B experts (B=1 = plain 2D). Tile [bm x bk]
     (bm*bk==16*nth); ROW half writes fp8+E8M0, COL half stages the transpose through LDS for a
@@ -243,7 +312,12 @@ def compile_qdual(
     the hardware's round-robin pid->XCD split scatters every super-tile across all eight L2s.
     ``cm_row``/``cm_col`` are the E8M0 scale-store policies, ``cm_data_row``/``cm_data_col``
     the fp8 data-store ones; they are separate axes (see _CMD). ``krun`` is how many consecutive
-    K-tiles one workgroup walks (see _QD_KRUN)."""
+    K-tiles one workgroup walks (see _QD_KRUN). ``sec_pair`` (see _QD_SEC_PAIR) hands each ROW
+    lane two 16B units CCOLM apart instead of one 32-column run, so a store instruction spans
+    whole 64B sectors; it needs the 4+ lanes per row of bk>=128 and the non-2d layout.
+    ``flat_2d`` (see _QD_2D_FLAT) gives the 2d-block halves the same completion by handing a
+    wave two whole 32x32 blocks instead of one chunk per warp, keeping the block amax
+    wave-local; it needs bm,bk>=64 and is bit-identical to the chunk-per-warp form."""
     if elt is None:
         elt = fx.BFloat16
     va, ep_sub, sat_bnd, cvt = fp8_params(out_fp8)
@@ -285,6 +359,11 @@ def compile_qdual(
     # scale byte stores add a boundary mask so they can't spill into the next batch. Per-batch scale
     # byte counts are dword-aligned (Kp//32, Mp//32 mult of 4) -> base_byte keeps dword-packing.
     _use_2d = row_2d or col_2d
+    FLAT2D = _use_2d and flat_2d and NKB >= 2 and NMB >= 2
+    NCP = NKB // 2  # 64-column pairs a ROW-half wave walks
+    NMP = NMB // 2  # 64-row pairs a COL-half wave walks
+    SECP = sec_pair and not _use_2d and NKB >= 4
+    CCOLM, VSTEP = (16, NKB * 16) if SECP else (32, 16)
     PB_A_BYTES = M * (Kp // 32)
     PB_AT_BYTES = K * (Mp // 32)
     SP_A_BYTES = PB_A_BYTES * B
@@ -378,7 +457,100 @@ def compile_qdual(
                 has_side_effects=True,
             )
             rocdl.s_barrier()
-            if _use_2d:
+            if FLAT2D:
+                lane = t & I32(63)
+                wv = lt >> I32(6)
+                if half == z:
+                    rb = wv // I32(NCP)
+                    cp = wv - rb * I32(NCP)
+                    rq = lane >> I32(2)
+                    qc = lane & I32(3)
+                    col0 = cp * I32(64) + qc * I32(16)
+                    row0 = rb * I32(32) + rq
+                    chunks = []
+                    for v in range_constexpr(2):
+                        loff = (row0 + I32(16 * v)) * I32(PAD_L) + col0
+                        for i in range_constexpr(4):
+                            p = fx.add_offset(tile.ptr, fx.make_int_tuple(loff + I32(4 * i)))
+                            chunks.append(Vec(fx.make_view(p, fx.make_layout(4, 1)).load()).to(F32))
+                    scales = _blk_row_scales(row_2d, chunks, lane, va, ep_sub, IRI)
+                    rqr = make_row_band_resource(
+                        bo.extract_base_index(Qr), batch * I32(M), (batch + I32(1)) * I32(M), I32(Kp), 1
+                    )
+                    kcol = bk * I32(NKB) + cp * I32(2) + (qc >> I32(1))
+                    scale_ok = (qc & I32(1)) == z
+                    for v in range_constexpr(2):
+                        ep_v, inv_v = scales[v]
+                        grow = br * I32(BMv) + row0 + I32(16 * v)
+                        words = []
+                        for i in range_constexpr(4):
+                            qf = chunks[4 * v + i] * inv_v
+                            word = I32(cvt(IRI, _sat(qf[0], sat_bnd), _sat(qf[1], sat_bnd), z, 0))
+                            word = I32(cvt(IRI, _sat(qf[2], sat_bnd), _sat(qf[3], sat_bnd), word, 1))
+                            words.append(word)
+                        bo.buffer_store(
+                            Vec.from_elements(words, fx.Int32).ir_value(),
+                            rqr,
+                            grow * I32(Kp) + bk * I32(BKv) + col0,
+                            cache_modifier=cm_data_row,
+                            offset_is_bytes=True,
+                        )
+                        dword, jbyte = _raw_scale_dword(grow, kcol, SCALEN_ROW)
+                        _store_scale(
+                            ASp,
+                            SP_A_BYTES,
+                            dword,
+                            jbyte,
+                            ep_v + I32(127),
+                            4,
+                            ok=(grow < I32(M)) & scale_ok,
+                            cm=cm_row,
+                            base_byte=base_row_b,
+                        )
+                else:
+                    ckb = wv // I32(NMP)
+                    mp = wv - ckb * I32(NMP)
+                    c = ckb * I32(32) + (lane & I32(31))
+                    mblk = mp * I32(2) + (lane >> I32(5))
+                    base = fx.add_offset(tile.ptr, fx.make_int_tuple(c + mblk * I32(32) * I32(PAD_L)))
+                    cv2 = Vec(fx.make_view(base, fx.make_layout(32, PAD_L)).load()).to(F32)
+                    ca = fm.absf(cv2).reduce("max")
+                    camax = (F32(0.0) > ca).select(F32(0.0), ca)
+                    if col_2d:
+                        camax = _warp_reduce_max(camax, lane, _WR32_COL, IRI)
+                    cep = _ep(camax, va, ep_sub)
+                    cinv = F32(1.0) / fm.exp2(cep.to(F32))
+                    cq = cv2 * cinv
+                    cwords = []
+                    for wi in range_constexpr(8):
+                        word = I32(
+                            cvt(IRI, _sat(cq[4 * wi + 0], sat_bnd), _sat(cq[4 * wi + 1], sat_bnd), z, 0)
+                        )
+                        word = I32(
+                            cvt(IRI, _sat(cq[4 * wi + 2], sat_bnd), _sat(cq[4 * wi + 3], sat_bnd), word, 1)
+                        )
+                        cwords.append(word)
+                    csbase = c * I32(DWPC) + mblk * I32(8)
+                    for v in range_constexpr(2):
+                        sp = fx.add_offset(ldsc.ptr, fx.make_int_tuple(csbase + I32(4 * v)))
+                        fx.make_view(sp, fx.make_layout(4, 1)).store(
+                            Vec.from_elements(cwords[4 * v : 4 * v + 4], fx.Int32)
+                        )
+                    gc = bk * I32(BKv) + c
+                    mcol = br * I32(BMv // 32) + mblk
+                    dword_bc, jbyte_bc = _raw_scale_dword(gc, mcol, SCALEN_COL)
+                    _store_scale(
+                        AtSp,
+                        SP_AT_BYTES,
+                        dword_bc,
+                        jbyte_bc,
+                        cep + I32(127),
+                        4,
+                        ok=gc < I32(K),
+                        cm=cm_col,
+                        base_byte=base_col_b,
+                    )
+            elif _use_2d:
                 # 2d-capable warp-reduce layout: one 32x32 chunk per warp, both the per-32 and
                 # the shared 32x32 scale via ds_bpermute, so no Phase-0 pass or extra barrier.
                 lane = t & I32(63)
@@ -480,47 +652,45 @@ def compile_qdual(
                 if half == z:
                     row = lt // I32(NKB)
                     kb = lt - row * I32(NKB)
-                    loff = row * I32(PAD_L) + kb * I32(32)
+                    ccol = kb * I32(CCOLM)
+                    loff = row * I32(PAD_L) + ccol
                     chunks = []
-                    for i in range_constexpr(8):
-                        p = fx.add_offset(tile.ptr, fx.make_int_tuple(loff + I32(4 * i)))
-                        chunks.append(Vec(fx.make_view(p, fx.make_layout(4, 1)).load()).to(F32))
-                    amax = F32(0.0)
-                    for i in range_constexpr(8):
-                        a = fm.absf(chunks[i]).reduce("max")
-                        amax = (amax > a).select(amax, a)
+                    for v in range_constexpr(2):
+                        for i in range_constexpr(4):
+                            p = fx.add_offset(tile.ptr, fx.make_int_tuple(loff + I32(v * VSTEP + 4 * i)))
+                            chunks.append(Vec(fx.make_view(p, fx.make_layout(4, 1)).load()).to(F32))
+                    scales = _row_pass_scales(SECP, chunks, t & I32(63), va, ep_sub, IRI)
                     grow = br * I32(BMv) + row
-                    gcol0 = bk * I32(BKv) + kb * I32(32)
                     row_ok = grow < I32(M)
-                    ep = _ep(amax, va, ep_sub)
-                    inv = F32(1.0) / fm.exp2(ep.to(F32))
                     rqr = make_row_band_resource(
                         bo.extract_base_index(Qr), batch * I32(M), (batch + I32(1)) * I32(M), I32(Kp), 1
                     )
                     words = []
-                    for wi in range_constexpr(8):
-                        qf = chunks[wi] * inv
-                        word = I32(cvt(IRI, _sat(qf[0], sat_bnd), _sat(qf[1], sat_bnd), z, 0))
-                        word = I32(cvt(IRI, _sat(qf[2], sat_bnd), _sat(qf[3], sat_bnd), word, 1))
-                        words.append(word)
-                    row_byte0 = grow * I32(Kp) + gcol0
+                    for v in range_constexpr(2):
+                        for i in range_constexpr(4):
+                            qf = chunks[4 * v + i] * scales[v][1]
+                            word = I32(cvt(IRI, _sat(qf[0], sat_bnd), _sat(qf[1], sat_bnd), z, 0))
+                            word = I32(cvt(IRI, _sat(qf[2], sat_bnd), _sat(qf[3], sat_bnd), word, 1))
+                            words.append(word)
+                    row_byte0 = grow * I32(Kp) + bk * I32(BKv) + ccol
                     for v in range_constexpr(2):
                         v4 = Vec.from_elements(words[4 * v : 4 * v + 4], fx.Int32)
                         bo.buffer_store(
                             v4.ir_value(),
                             rqr,
-                            row_byte0 + I32(16 * v),
+                            row_byte0 + I32(v * VSTEP),
                             cache_modifier=cm_data_row,
                             offset_is_bytes=True,
                         )
-                    kcol = bk * I32(BKv // 32) + kb
+                    sblk, e8 = _row_scale_slot(SECP, kb, NKB, scales, z)
+                    kcol = bk * I32(NKB) + sblk
                     dword, jbyte = _raw_scale_dword(grow, kcol, SCALEN_ROW)
                     _store_scale(
                         ASp,
                         SP_A_BYTES,
                         dword,
                         jbyte,
-                        ep + I32(127),
+                        e8,
                         4,
                         ok=row_ok,
                         cm=cm_row,
