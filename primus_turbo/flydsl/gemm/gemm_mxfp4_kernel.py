@@ -1265,7 +1265,10 @@ class MfmaScaleFp4:
                 L.append(f"s_waitcnt vmcnt({_NPRE}) lgkmcnt(0)")
                 L.append("s_barrier")
                 L += emit_ds(0, 0)
-                L.append("s_waitcnt vmcnt(0) lgkmcnt(0)")
+                # The k=1 fill is still the only vmem in flight and lands in the slot the loop
+                # only reads a phase later, behind its own watermark, so the first MFMA does not
+                # have to wait it out -- this publishes k=0 alone.
+                L.append(f"s_waitcnt vmcnt({_NPRE}) lgkmcnt(0)")
                 L.append("s_barrier")
             # K%256 (odd KI): the do-while processes 256-blocks in PAIRS; an odd trailing block is an MFMA tail (or _OPEEL).
             _has_loop = _RUNTIME or (ki >= 2)
