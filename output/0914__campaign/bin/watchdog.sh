@@ -62,7 +62,7 @@ while true; do
   done
   # gpu3 reports alongside the others, or "all four cards are busy" cannot be read off the
   # status file -- which is how eight idle minutes went unnoticed.
-  e3age=$(( T - $(stat -c %Y "$OUT/ledgers/e2e_ab.jsonl" 2>/dev/null || echo 0) ))
+  e3age=$(( T - $(stat -c %Y "$OUT/ledgers/e2e_ab2.jsonl" 2>/dev/null || echo "$T") ))
 
   # GPU3's e2e loop. Not in PHASE because its ledger and restart command differ, but it is
   # watched for the same reason: a one-shot run leaves the card idle the moment it finishes.

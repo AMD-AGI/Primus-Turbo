@@ -36,6 +36,8 @@ for l in log.read_bytes().decode('utf8','replace').splitlines():
     m=re.search(r'tps:\s*([\d,]+)',l);  tps.append(float(m.group(1).replace(',',''))) if m else None
     f=re.search(r'tflops:\s*([\d.]+)',l); tf.append(float(f.group(1))) if f else None
 row={"tag":tag,"steps":len(tps)}
+if len(tps) < 8:
+    row["failed"]=True          # the resume check skips only rows without this
 if len(tps)>=8:
     a=tps[-8:]
     row.update(tps_median=st.median(a), tps_min=min(a), tps_max=max(a),
@@ -51,15 +53,17 @@ while true; do
   for arm in asm noasm flex; do
     while [ -f "$STOP" ]; do sleep 10; done
     tag="ab|r$R|$arm"
-    grep -qF "\"tag\": \"$tag\"" "$LEDGER" 2>/dev/null && continue
+    # Unique per run: an orphaned pt_elastic holding the default 1234 killed 12 runs.
+    PORT=$(( 21000 + (R * 7 + $(echo "$arm" | cksum | cut -d" " -f1)) % 9000 ))
+    grep -F "\"tag\": \"$tag\"" "$LEDGER" 2>/dev/null | grep -qv '"failed": true' && continue
     CFG=repro_l8b_turbo_compile.yaml
     case "$arm" in
-      asm)   ENV="$BASE -e PYTHONPATH=$TURBO:$AITER" ;;
-      noasm) ENV="$BASE -e PYTHONPATH=$TURBO" ;;
+      asm)   ENV="$BASE -e MASTER_PORT=$PORT -e PRIMUS_TURBO_ASM_FWD_TRACE=1 -e PRIMUS_TURBO_ASM_FWD_TRACE_FILE=$OUT/logs/asm_gate.trace -e PYTHONPATH=$TURBO:$AITER" ;;
+      noasm) ENV="$BASE -e MASTER_PORT=$PORT -e PYTHONPATH=$TURBO" ;;
       # flex = attention off entirely (the v5 config sets enable_primus_turbo false), so the
       # asm/noasm/flex triple prices the ASM forward, the turbo attention stack, and the
       # GEMM fix separately instead of confounding them.
-      flex)  ENV="$BASE -e PYTHONPATH=$TURBO"; CFG=repro_l8b_bf16_mbs4_seq8k_v5_compile.yaml ;;
+      flex)  ENV="$BASE -e MASTER_PORT=$PORT -e PYTHONPATH=$TURBO"; CFG=repro_l8b_bf16_mbs4_seq8k_v5_compile.yaml ;;
     esac
     E2E_ENV="$ENV" bash "$OUT/bin/e2e.sh" "ab_${arm}_r$R" "$CFG" >/dev/null 2>&1
     summarise "$tag" "$OUT/logs/e2e.ab_${arm}_r$R.log"

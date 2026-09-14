@@ -4,6 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import os
 from typing import Optional
 
 import torch
@@ -88,6 +89,33 @@ def _any_requires_grad(*tensors) -> bool:
     return any(t is not None and t.requires_grad for t in tensors)
 
 
+# One line, once per process, naming the backend FlashAttnFunc actually took. Shares the
+# ASM gate's trace file because it answers the level above the same question: a gate that
+# never logs is either declining or never reached, and only this tells them apart. Under a
+# training launcher stdout is swallowed, so this writes to the file when one is named.
+_DISPATCH_TRACED = False
+
+
+def _trace_dispatch(backend, q, k, v) -> None:
+    global _DISPATCH_TRACED
+    if _DISPATCH_TRACED or os.environ.get("PRIMUS_TURBO_ASM_FWD_TRACE", "") in ("", "0"):
+        return
+    _DISPATCH_TRACED = True
+    line = (
+        f"[dispatch] FlashAttnFunc backend={backend} q={tuple(q.shape)} "
+        f"k={tuple(k.shape)} dtype={q.dtype} pid={os.getpid()}"
+    )
+    path = os.environ.get("PRIMUS_TURBO_ASM_FWD_TRACE_FILE", "")
+    if path:
+        try:
+            with open(path, "a") as fh:
+                fh.write(line + "\n")
+            return
+        except OSError:
+            pass
+    print(line, flush=True)
+
+
 class FlashAttnFunc(torch.autograd.Function):
     """Dense flash attention; ``backend`` picks the implementation and ctx carries it so the
     backward takes the same one. q/k/v arrive ``[b, s, h, d]``-shaped, so FlyDSL -- the one
@@ -116,6 +144,7 @@ class FlashAttnFunc(torch.autograd.Function):
         backend: BackendType = BackendType.AITER,
     ):
         ctx.backend = backend
+        _trace_dispatch(backend, q, k, v)
         if backend == BackendType.TRITON:
             # The dispatcher only picks this backend when DenseAttnFwdTritonBackend.can_handle
             # said yes, but FlashAttnFunc.apply is reachable directly, and these arguments have
