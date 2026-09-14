@@ -42,6 +42,7 @@ behaves exactly as it did before this file existed.
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -49,6 +50,37 @@ import torch
 from primus_turbo.pytorch.core.utils import is_gfx1250
 
 __all__ = ["asm_forward_eligible", "asm_dense_forward"]
+
+# Opt-in tracing. The gate is a chain of silent early returns, which is right for a hot path
+# and useless when the question is "why did this not fire in training". One line per distinct
+# reason, once each, behind an env var.
+_TRACE = os.environ.get("PRIMUS_TURBO_ASM_FWD_TRACE", "") not in ("", "0")
+# A path here writes the trace to that file instead of stdout. Under a training launcher the
+# process's stdout goes through capture layers that demonstrably swallow lines -- aiter's own
+# load banner never appeared in any e2e log -- and then "no line" cannot be told apart from
+# "the gate was never called", which is the one thing the trace exists to answer.
+_TRACE_FILE = os.environ.get("PRIMUS_TURBO_ASM_FWD_TRACE_FILE", "")
+_SEEN: set = set()
+
+
+def _say(msg: str, key: str) -> None:
+    if not _TRACE or key in _SEEN:
+        return
+    _SEEN.add(key)
+    line = f"[asm_fwd] {msg} pid={os.getpid()}"
+    if _TRACE_FILE:
+        try:
+            with open(_TRACE_FILE, "a") as fh:
+                fh.write(line + "\n")
+            return
+        except OSError:
+            pass  # fall through to stdout rather than losing the line entirely
+    print(line, flush=True)
+
+
+def _no(reason: str) -> bool:
+    _say(f"declined: {reason}", reason)
+    return False
 
 # Tri-state: None = not yet attempted, False = unavailable, callable = ready.
 _ASM_FWD = None
@@ -93,35 +125,40 @@ def asm_forward_eligible(
     The caller must ALSO confirm ``fused_backward_eligible`` -- see the module docstring.
     """
     if not is_gfx1250():
-        return False
+        return _no("not gfx1250")
     if _asm_entry() is None:
-        return False
+        return _no("aiter unavailable")
     # bf16 only. The .co set covers fp16 nowhere on this arch, and a silent dtype promotion
     # would change the numerics the SQNR gate was calibrated against.
     if q.dtype is not torch.bfloat16 or k.dtype is not q.dtype or v.dtype is not q.dtype:
-        return False
+        return _no("dtype not bf16")
     if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
-        return False
+        return _no("not 4-D")
     if not (q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1):
-        return False
+        return _no("last dim not contiguous")
     # No sink on this path: hdim 128 has no sink-carrying .co, and returning None for a
     # gradient the caller asked for is worse than being slower.
     if sink is not None:
-        return False
+        return _no("sink present")
     if dropout_p != 0.0 or bias is not None or alibi_slopes is not None:
-        return False
+        return _no("dropout/bias/alibi")
     if window_size != (-1, -1):
-        return False
+        return _no("sliding window")
     head_dim_qk = q.shape[-1]
     if head_dim_qk not in (64, 128) or v.shape[-1] != head_dim_qk:
-        return False
+        return _no("head_dim")
     hq, hkv = q.shape[2], k.shape[2]
     if hkv == 0 or hq % hkv != 0:
-        return False
+        return _no("hq % hkv")
     # Self-attention only: cross-attention shapes are not in the CSV rows these .co files
     # were built from, and an unmatched row returns without computing rather than raising.
     if q.shape[1] != k.shape[1] or k.shape[1] != v.shape[1]:
-        return False
+        return _no("not self-attention")
+    # Trace the ACCEPT too, once. Absence of a "declined" line is not evidence the path was
+    # taken: aiter's own load banner is the obvious signal and Primus exports
+    # AITER_LOG_LEVEL=ERROR, which suppresses it -- so "no aiter lines in the log" was read
+    # as "the ASM kernel never ran" when it meant nothing at all.
+    _say(f"ACCEPTED: q={tuple(q.shape)} k={tuple(k.shape)} dtype={q.dtype}", "accepted")
     return True
 
 
