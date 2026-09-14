@@ -3534,7 +3534,24 @@ def gemm_mxfp4_flydsl_kernel(
             prepacked=scales_prepacked,
             row_bytes=_row_b,
         )
-        tk_key = (M, N, K, _row_b, gm, xcd, gn, _wlv, _elgk, "tail", ksplit, out_fp16, accum)
+        # `scales_prepacked` belongs in the key: the two builds differ by whether the launch
+        # runs the preshuffle, so sharing an entry hands one of them the other's module.
+        tk_key = (
+            M,
+            N,
+            K,
+            _row_b,
+            gm,
+            xcd,
+            gn,
+            _wlv,
+            _elgk,
+            "tail",
+            ksplit,
+            out_fp16,
+            accum,
+            scales_prepacked,
+        )
         entry = _MXFP4_AT_CACHE.get(tk_key)
         if entry is None:
             entry = [launch, None]
@@ -3600,7 +3617,22 @@ def gemm_mxfp4_flydsl_kernel(
             row_bytes=_row_b,
             prepacked=scales_prepacked,
         )
-        tk_key = (M, N, K, _row_b, gm, xcd, gn, _wlv, _elgk, "ntail", ksplit, out_fp16, accum)
+        tk_key = (
+            M,
+            N,
+            K,
+            _row_b,
+            gm,
+            xcd,
+            gn,
+            _wlv,
+            _elgk,
+            "ntail",
+            ksplit,
+            out_fp16,
+            accum,
+            scales_prepacked,
+        )
         entry = _MXFP4_AT_CACHE.get(tk_key)
         if entry is None:
             entry = [launch, None]
@@ -3624,9 +3656,7 @@ def gemm_mxfp4_flydsl_kernel(
             return _exec_plain(target, accum)
         return (_exec_split, _exec_tail, _exec_ntail)[mode - 1](s, target, accum)
 
-    # Split-K reads the scales through arms this path does not rebuild, and packed scales come
-    # out wrong there (SNR 3.65 dB), so the packed path stays unsplit until those arms are ported.
-    ks = (0, 1) if (K != Kw or scales_prepacked) else _MXFP4_KSPLIT_CACHE.get((M, N, K, _row_b, out_fp16))
+    ks = (0, 1) if K != Kw else _MXFP4_KSPLIT_CACHE.get((M, N, K, _row_b, out_fp16))
     if ks is None:
         cands = _ksplit_candidates(M, N, K)
         modes = [(0, 1)] + [(1, s) for s in cands[1:]]
