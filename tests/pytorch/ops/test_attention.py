@@ -1863,7 +1863,17 @@ def test_triton_tune_spec_rejects_garbage(spec):
 
 @pytest.mark.gfx1250
 def test_triton_autotune_default_is_unchanged_without_the_env_var(monkeypatch):
-    """With the env var unset the kernel must offer exactly the config it always shipped."""
+    """With the env var unset each kernel must offer exactly ONE config: the shipped one.
+
+    The guard is about the count and the values, not about any particular number. A tuning
+    sweep sets PRIMUS_TURBO_ATTN_TRITON_TUNE, and if a swept value ever leaked into the
+    unset path then production would silently run a config that was only ever validated on
+    one shape -- which is the failure this test exists to catch.
+
+    The two halves ship different defaults, and deliberately so:
+      forward  num_warps=2, num_stages=2 -- measured on gfx1250, 5.23 -> 2.58 ms
+      backward num_warps=4, num_stages=1 -- upstream's, and measured optimal here
+    """
     monkeypatch.delenv("PRIMUS_TURBO_ATTN_TRITON_TUNE", raising=False)
     from primus_turbo.triton.attention import attention_kernel as ak
 
@@ -1871,8 +1881,8 @@ def test_triton_autotune_default_is_unchanged_without_the_env_var(monkeypatch):
     bwd, _ = ak.get_autotune_bwd_configs()
     for configs in (fwd, bwd):
         assert len(configs) == 1
-        assert configs[0].num_warps == 4
-        assert configs[0].num_stages == 1
+    assert (fwd[0].num_warps, fwd[0].num_stages) == (2, 2)
+    assert (bwd[0].num_warps, bwd[0].num_stages) == (4, 1)
     assert fwd[0].kwargs.get("PRE_LOAD_V") is False
 
 

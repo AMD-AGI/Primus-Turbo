@@ -607,7 +607,13 @@ def _attn_fwd_inner(
 
 
 def get_autotune_fwd_configs():
-    default = {"PRE_LOAD_V": False, "num_stages": 1, "num_warps": 4}
+    # num_stages 2 and num_warps 2, both changed from upstream's 1 and 4, measured on
+    # gfx1250 at b=4 s=8192 hq=32 hkv=8 d=128 bf16 causal: 5.23 -> 2.58 ms forward.
+    # num_stages carries most of it (5.23 -> 2.73, and it is a latency-hiding result, so
+    # re-check it if the clock ever changes); num_warps 4 -> 2 is the remaining 5.4%.
+    # On wave32 num_warps=2 is 64 lanes, and the forward's tile does not need more --
+    # 8 was 5.18 ms, i.e. worse than the default, so this is a well and not a slope.
+    default = {"PRE_LOAD_V": False, "num_stages": 2, "num_warps": 2}
     pinned = _parse_tune_spec(os.environ.get(_TUNE_ENV, ""), "fwd")
     return _build_configs(pinned, default, default), [
         "IS_CAUSAL",

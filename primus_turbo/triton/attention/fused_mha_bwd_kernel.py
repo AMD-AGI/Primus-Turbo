@@ -1811,7 +1811,15 @@ _DEFAULT_ONEKERNEL_CONFIG = {
     "BLOCK_M2": 256,  # CHANGED 128 -> 256 (tuned)
     "BLOCK_N2": 32,  # unchanged from upstream
     "BLK_SLICE_FACTOR": 1,  # CHANGED 2 -> 1 (tuned)
-    "waves_per_eu": 1,
+    # CHANGED 1 -> 0 ("unconstrained", see _ZERO_MEANS_UNSET below). Worth 4.2% on the
+    # backward at the production shape on an unthrottled card -- 10.292 -> 9.861 ms,
+    # median of 3 under an exclusive GPU window, run-to-run spread 0.3%, all four SQNR
+    # values unchanged. The knob was measured as neutral on 2026-09-13, but that card was
+    # VR-throttled to 1100 MHz where memory latency is 2.14x smaller in cycles; letting the
+    # backend pick the occupancy only pays once the clock is high enough for the latency to
+    # need hiding. Its neighbours are still cliffs: waves_per_eu=2 is 49.7 ms and =3 is
+    # 78.7 ms, so this is the edge of a narrow well, not a monotone trend.
+    "waves_per_eu": 0,
     "matrix_instr_nonkdim": 16,
     "num_warps": 4,
     "num_ctas": 1,
