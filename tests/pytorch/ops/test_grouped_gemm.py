@@ -51,10 +51,25 @@ def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu, ba
     if backend is BackendType.HIPBLASLT and reduce_num_cu > 0:
         pytest.skip("HIPBLASLT does not support reduce_num_cu > 0")
 
-    if backend is BackendType.FLYDSL and get_device_compute_capability() != (9, 5):
-        # gfx950-only: the body is built on mfma_f32_16x16x32_bf16. An explicitly pinned
-        # backend that can_handle declines is an error, not a fallback.
-        pytest.skip("FlyDSL bf16 grouped GEMM is gfx950-only")
+    if backend is BackendType.CK and get_device_compute_capability() == (12, 5):
+        # CK is gated off on gfx1250 twice over: setup.py force-disables the CK backend
+        # for this arch, and GroupedGEMM{,VariableK}CKBackend.can_handle carries
+        # `not is_gfx1250()`. A pinned backend that can_handle declines raises rather
+        # than falling back, so this combination cannot pass by construction.
+        pytest.skip("CK has no gfx1250 support (backend not built, and can_handle declines)")
+
+    if backend is BackendType.FLYDSL:
+        # Two ports exist: gfx950 (mfma_f32_16x16x32_bf16) and gfx1250
+        # (v_wmma_f32_16x16x32_bf16). An explicitly pinned backend that can_handle
+        # declines is an error, not a fallback, so every combination reaching the
+        # backend has to be one it accepts.
+        if get_device_compute_capability() not in ((9, 5), (12, 5)):
+            pytest.skip("FlyDSL bf16 grouped GEMM is implemented for gfx950 and gfx1250 only")
+        if reduce_num_cu > 0 and get_device_compute_capability() == (12, 5):
+            # cap_cu is not implemented on gfx1250: the kernel launches one workgroup
+            # per output tile with no persistent loop for a CU budget to bound, so
+            # can_handle declines a partial grid rather than accepting and ignoring it.
+            pytest.skip("FlyDSL gfx1250 does not support reduce_num_cu > 0 (cap_cu unimplemented)")
 
     # TODO(xiaobochen-amd): On gfx942, the hipBLASLt path can exhibit
     # intermittent/flake failures when M <= 512. This has not been reproduced on MI355.
@@ -632,8 +647,8 @@ def test_grouped_gemm_padded_tail_zeroed(dtype, trans_b, backend):
 def test_grouped_gemm_variable_k_backend(B, M, N_K, dtype, balance, trans_c, backend):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
-    if backend is BackendType.FLYDSL and get_device_compute_capability() != (9, 5):
-        pytest.skip("FlyDSL bf16 variable-K grouped GEMM is gfx950-only (mfma_f32_16x16x32_bf16)")
+    if backend is BackendType.FLYDSL and get_device_compute_capability() not in ((9, 5), (12, 5)):
+        pytest.skip("FlyDSL bf16 variable-K grouped GEMM is implemented for gfx950 and gfx1250 only")
 
     torch.manual_seed(42)
     device = "cuda"
