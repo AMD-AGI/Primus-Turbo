@@ -18,6 +18,15 @@ A [M, K] fp4 (packed 2/byte), B [N, K] fp4, C = a @ b^T. One wave per SIMD lets 
 import torch
 
 # isort: off
+from primus_turbo.flydsl.utils.gemm_epilogue_helper import (
+    DGLU_BAND_ROWS,
+    LDS_WORDS_PER_WAVE,
+    MXFP4DualQuantStore,
+    MXFP4DualQuantStoreDglu,
+    StoreCdSwiGLUQuadQuant,
+    StoreCSwiGLU,
+    StoreCSwiGLUQuant,
+)
 from primus_turbo.flydsl.utils.gemm_helper import (
     compile_with_scratch_out,
     G2SLoader,
@@ -28,7 +37,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     umin,
     xcd_remap_pid_u,
 )
-from primus_turbo.flydsl.utils.prims import ceildiv, ceildiv_pow2, udiv, umod
+from primus_turbo.flydsl.utils.prims import _lds_barrier, ceildiv, ceildiv_pow2, udiv, umod
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -1640,11 +1649,18 @@ def _build_mxfp4_gemm_kernel(
     k_real: int = None,  # operands' true contraction; K is the 256-rounded loop/scale extent
     row_bytes: int = None,  # operands' ALLOCATED row stride; defaults to the true K's width
     mn: tuple = None,  # host-known (M, N): folds the tile decode's divides and the tile bounds
+    glu: bool = False,  # fused StoreCSwiGLU; N == glu_i, B is gate||up [2I, K]
+    glu_i: int = 0,
+    glu_act_quant: bool = False,  # StoreCSwiGLUQuant; requires _CSTORE
+    dglu: bool = False,  # fused StoreCdSwiGLU; N == glu_i, B is w2_col [I, K]
+    dglu_act_quant: bool = False,  # StoreCdSwiGLUQuadQuant; dglu, no _CSTORE
+    epi_row_sr: bool = False,
+    epi_col_sr: bool = False,
 ):
     BLOCK_M = 256
     BLOCK_N = 256
     BLOCK_K = 256
-    n_pids = (ceildiv(mn[0], BLOCK_M), ceildiv(mn[1], BLOCK_N)) if mn else None
+    n_pids = None  # set after _NCB (glu tiles 128 output columns, not 256)
     # Split-K stores partials into a scratch row band that the host then reduces, so the
     # accumulate belongs to that reduce, not to this store.
     assert not (beta_is_one and ksplit > 1), "split-K accumulates in the host reduce, not the epilogue"
@@ -1680,6 +1696,8 @@ def _build_mxfp4_gemm_kernel(
         and not taccw
         and (KI >= 4)
         and (KI % 2 == 0 or _HALF_K)
+        and ((not glu) or (glu_i % 64 == 0))  # in-loop l1 store needs I on a 64-col band
+        and (not dglu)  # dglu stages through LDS after the mainloop; no in-loop C store
     )
     n_partial = n_tail != 0
     # A row of K/2 bytes off the 128-byte line costs its G2S two requests; the caller's allocation decides that.
@@ -1689,10 +1707,27 @@ def _build_mxfp4_gemm_kernel(
 
     N_TILES_A = BLOCK_M // 32  # 8: wave_m covers 128 M-rows
     LDS_BN_HALF = BLOCK_N // 2  # 128: slice width
+    # glu: output tile is 128 gate columns; the R B-pool is the matching up band at +I.
+    _NCB = LDS_BN_HALF if glu else BLOCK_N
+    _RSHIFT = glu_i if glu else LDS_BN_HALF
+    if mn is not None:
+        n_pids = (ceildiv(mn[0], BLOCK_M), ceildiv(mn[1], _NCB))
     N_TILES_BH = LDS_BN_HALF // 32  # 4: wave_n covers 64 N-cols/slice
+    assert not glu or (glu_i > 0 and not beta_is_one and ksplit == 1 and not coop and not taccw)
+    assert not glu or (mn is not None and mn[1] == glu_i), "glu needs mn=(M, I)"
+    assert not (glu and dglu)
+    assert not dglu or (glu_i > 0 and not beta_is_one and ksplit == 1 and not coop and not taccw)
+    assert not dglu or (mn is not None and mn[1] == glu_i), "dglu needs mn=(M, I)"
+    assert not glu_act_quant or (
+        glu and _CSTORE and N_TILES_A % 2 == 0 and N_TILES_BH == 4
+    ), "StoreCSwiGLUQuant needs in-loop l1 store, even n_tiles_a, n_tiles_b==4"
+    assert not dglu_act_quant or (
+        dglu and N_TILES_A % 2 == 0 and N_TILES_BH == 4 and glu_i % 32 == 0
+    ), "StoreCdSwiGLUQuadQuant needs dglu, even n_tiles_a, n_tiles_b==4, I%32==0"
+    assert not (epi_row_sr or epi_col_sr) or glu_act_quant or dglu_act_quant
     # B's g2s permutes source columns so a lane's n-fragments land adjacent and pack into dwordx2.
     _BILV = N_TILES_BH if _CSTORE else 0
-    _HALF_N = 0 < n_tail <= LDS_BN_HALF
+    _HALF_N = (not glu) and (not dglu) and (0 < n_tail <= LDS_BN_HALF)
 
     LDS_ROW_STRIDE = BPR
     a_lds_size = BLOCK_M * LDS_ROW_STRIDE  # 256 rows
@@ -1732,8 +1767,7 @@ def _build_mxfp4_gemm_kernel(
             _anns[f"SC_lds{_b}"] = fx.Array[fx.Int32, _SCBUF, 16]
     SharedStorageFp4_4w = fx.struct(type("SharedStorageFp4_4w", (), {"__annotations__": _anns}))
 
-    @flyc.kernel(known_block_size=[256, 1, 1])
-    def kernel_gemm_4w(
+    def _kernel_body(
         A: fx.Tensor,
         B_T: fx.Tensor,
         C: fx.Tensor,
@@ -1741,6 +1775,15 @@ def _build_mxfp4_gemm_kernel(
         B_scale: fx.Tensor,
         c_m: fx.Int32,
         c_n: fx.Int32,
+        ACT: fx.Tensor,
+        PROBS: fx.Tensor,
+        GRAD_PROBS,
+        AQ_OUT,
+        AQ_SC,
+        AQ_TOUT,
+        AQ_TSC,
+        aq_col_rows,
+        sr_seed,
     ):
         F8_IR_t = fx.Float8E4M3FN.ir_type
         lds = fx.SharedAllocator().allocate(SharedStorageFp4_4w).peek()
@@ -1783,12 +1826,18 @@ def _build_mxfp4_gemm_kernel(
 
         def _bind(bm, bn):
             a_base_e = arith.index_cast(T.index, bm * fx.Int32(BLOCK_M)) * arith.index(K2)
-            b_base_e = arith.index_cast(T.index, bn * fx.Int32(BLOCK_N)) * arith.index(K2)
+            if const_expr(glu):
+                # B is gate||up [2I, K]. Rebase to this tile's 128 gate columns so
+                # BL is offset 0 and BR is a residual I rows (the matching up band).
+                b_base_e = arith.index_cast(T.index, bn * fx.Int32(_NCB)) * arith.index(K2)
+                b_nrec = arith.index_cast(T.index, fx.Int32(2) * _cn) * arith.index(K2) - b_base_e
+            else:
+                b_base_e = arith.index_cast(T.index, bn * fx.Int32(BLOCK_N)) * arith.index(K2)
+                b_nrec = (
+                    arith.index_cast(T.index, _cn) - arith.index_cast(T.index, bn * fx.Int32(BLOCK_N))
+                ) * arith.index(K2)
             a_nrec = (
                 arith.index_cast(T.index, _cm) - arith.index_cast(T.index, bm * fx.Int32(BLOCK_M))
-            ) * arith.index(K2)
-            b_nrec = (
-                arith.index_cast(T.index, _cn) - arith.index_cast(T.index, bn * fx.Int32(BLOCK_N))
             ) * arith.index(K2)
             gA, _ld["rsrc_a"] = make_fp8_rebased_tensor_and_srd(A, F8_IR_t, a_base_e, a_nrec)
             gB, _ld["rsrc_b"] = make_fp8_rebased_tensor_and_srd(B_T, F8_IR_t, b_base_e, b_nrec)
@@ -1821,17 +1870,123 @@ def _build_mxfp4_gemm_kernel(
         # bf16/fp16 output: only the f32->out_ty cast in the store differs. Both the narrow
         # scalar store (generic ``.to``) and the wide TACCW store serve either dtype.
         _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
-        store_c = StoreCPlain(
-            C,
-            _c_store_rows,
-            _cn,
-            mfma.idx,
-            N_TILES_A,
-            N_TILES_BH,
-            _out_ty,
-            ilv=_BILV,
-            beta_is_one=beta_is_one,
-        )
+        if const_expr(glu):
+            _col_safe = glu_i % _NCB == 0
+            _glu_kw = dict(
+                col_safe=_col_safe,
+                ilv=_BILV,
+                band_drop=(not _col_safe) and (glu_i % 64 == 0),
+                cst=_CSTORE,
+                act_aux=2,
+            )
+            _glu_args = (
+                None,
+                None,
+                C,
+                C if const_expr(glu_act_quant) else ACT,
+                PROBS,
+                _c_store_rows,
+                glu_i,
+                mfma.idx,
+                N_TILES_A,
+                N_TILES_BH,
+                _out_ty,
+            )
+            if const_expr(glu_act_quant):
+                _q = MXFP4DualQuantStore(
+                    AQ_OUT,
+                    AQ_SC,
+                    AQ_TOUT,
+                    AQ_TSC,
+                    _cm,
+                    glu_i,
+                    ceildiv(glu_i, 128) * 128,
+                    aq_col_rows,
+                    fx.recast_iter(fx.Int32, BL_buf[0].ptr),
+                    wave_id,
+                    lane_id,
+                    row_sr=epi_row_sr,
+                    col_sr=epi_col_sr,
+                    sr_seed=sr_seed,
+                )
+                assert 4 * LDS_WORDS_PER_WAVE * 4 <= NBB * bh_lds_size
+                store_c = StoreCSwiGLUQuant(*_glu_args, quant_store=_q, **_glu_kw)
+            else:
+                store_c = StoreCSwiGLU(*_glu_args, **_glu_kw)
+        elif const_expr(dglu):
+            _ = ACT
+            _pid0 = fx.block_idx.x
+            _bm0, _bn0 = grouped_xcd_pid(
+                _pid0,
+                c_m,
+                c_n,
+                BLOCK_M,
+                _NCB,
+                group_m=group_m,
+                num_xcds=num_xcds,
+                group_n=group_n,
+                n_pids=n_pids,
+            )
+            _dglu_pad = 0 if dglu_act_quant else 4
+            _row_stride = 2 * N_TILES_BH * 16 + _dglu_pad
+            _dglu_args = (
+                C,
+                C,
+                PROBS,
+                GRAD_PROBS,
+                _bn0,
+                _cm,
+                _c_store_rows,
+                glu_i,
+                mfma.idx,
+                N_TILES_A,
+                N_TILES_BH,
+                _out_ty,
+                BL_buf[0],
+                wave_id,
+            )
+            _dglu_kw = dict(
+                row_pad=_dglu_pad,
+                col_safe=(glu_i % BLOCK_N == 0),
+                store_aux=2,
+            )
+            if const_expr(dglu_act_quant):
+                _q = MXFP4DualQuantStoreDglu(
+                    AQ_OUT,
+                    AQ_SC,
+                    AQ_TOUT,
+                    AQ_TSC,
+                    _cm,
+                    glu_i,
+                    ceildiv(2 * glu_i, 128) * 128,
+                    aq_col_rows,
+                    fx.Int32(fx.ptrtoint(BL_buf[0].ptr)),
+                    wave_m * fx.Int32(DGLU_BAND_ROWS * _row_stride),
+                    _row_stride,
+                    lane_id,
+                    wave_n,
+                    row_sr=epi_row_sr,
+                    col_sr=epi_col_sr,
+                    sr_seed=sr_seed,
+                )
+                store_c = StoreCdSwiGLUQuadQuant(*_dglu_args, quant_store=_q, **_dglu_kw)
+            else:
+                raise AssertionError("dense dglu without act quant is not wired")
+            assert store_c.lds_bytes() <= NBB * bh_lds_size
+        else:
+            _ = ACT
+            _ = PROBS
+            store_c = StoreCPlain(
+                C,
+                _c_store_rows,
+                _cn,
+                mfma.idx,
+                N_TILES_A,
+                N_TILES_BH,
+                _out_ty,
+                ilv=_BILV,
+                beta_is_one=beta_is_one,
+            )
 
         wave_m_off = wave_m * (N_TILES_A * 16)  # 0 or 128
         wave_n_off = wave_n * (N_TILES_BH * 16)  # 0 or 64
@@ -1963,7 +2118,7 @@ def _build_mxfp4_gemm_kernel(
                 c_m,
                 c_n,
                 BLOCK_M,
-                BLOCK_N,
+                _NCB,
                 group_m=group_m,
                 num_xcds=num_xcds,
                 group_n=group_n,
@@ -1972,8 +2127,11 @@ def _build_mxfp4_gemm_kernel(
             _bind(bm, bn)  # rebase the operand SRDs/loaders on this tile's A/B base (int64)
             a_off = fx.Int32(0)  # tile A row / B col bases folded into the SRDs; only br's
             bl_off = fx.Int32(0)  # LDS-half column shift survives as an int32-safe residual.
-            br_off = fx.Int32(LDS_BN_HALF * K2)
+            # glu: R pool is the up band at +I, not the next 128 output columns.
+            br_off = fx.Int32(_RSHIFT * K2)
             sa_b = fx.Int32(bm * BLOCK_M + wave_m_off)
+            # Packed-scale coordinates stay in the 256-wide layout; the glu
+            # preshuffle lays each up band where the R pool already looks.
             sbl_b = fx.Int32(bn * BLOCK_N + wave_n_off)
             sbr_b = fx.Int32(bn * BLOCK_N + LDS_BN_HALF + wave_n_off)
             return (bm, bn, a_off, bl_off, br_off, sa_b, sbl_b, sbr_b)
@@ -2045,8 +2203,12 @@ def _build_mxfp4_gemm_kernel(
                 _hn = rocdl.readfirstlane(T.i32, arith.select(o[1] == _last_n, fx.Int32(1), fx.Int32(0)))
             _cst = None
             if const_expr(_CSTORE):
-                _nvc = _cn if const_expr(n_partial) else None
-                _cst = store_c.fused_operands(*_cbase(o, _split), n_valid=_nvc)
+                if const_expr(glu):
+                    # Up band rides its own SRD (I*2 overflows the store immediate).
+                    _cst = store_c.fused_operands(*_cbase(o, _split))
+                else:
+                    _nvc = _cn if const_expr(n_partial) else None
+                    _cst = store_c.fused_operands(*_cbase(o, _split), n_valid=_nvc)
             return mfma.call_mxfp4_wholeloop(
                 a_base6,
                 bl_base6,
@@ -2082,7 +2244,7 @@ def _build_mxfp4_gemm_kernel(
                 half_n=_hn,
                 sc_buf_stride=(_SCBUF * 4),
                 cst=_cst,
-                cst_gap=LDS_BN_HALF * 2,
+                cst_gap=0 if glu else LDS_BN_HALF * 2,
                 cst_ilv=_BILV,
                 cst_nt=True,  # the folded store's rows are whole lines, so nt costs no merge
                 split=(a_od6, bl_od6, br_od6, qu_a6, qu_b6) if const_expr(_ROWSPLIT) else None,
@@ -2094,10 +2256,30 @@ def _build_mxfp4_gemm_kernel(
             base_row = bm * BLOCK_M + wave_m_off
             if const_expr(ksplit > 1):
                 base_row = base_row + _split * c_m  # write to workspace row band split*M
+            if const_expr(glu):
+                return (base_row, bn * fx.Int32(_NCB) + wave_n_off)
             return (base_row, bn * BLOCK_N + wave_n_off, bn * BLOCK_N + LDS_BN_HALF + wave_n_off)
 
         def _store(o, accL, accR, _split=None):
+            if const_expr(glu):
+                base_row, base_col_l = _cbase(o, _split)
+                if const_expr(glu_act_quant):
+                    _lds_barrier(vmcnt=0)
+                    _lds_barrier(vmcnt=0)
+                    store_c.store_pair_quant(
+                        accL, accR, base_row, base_col_l, base_row, _c_store_rows
+                    )
+                    return
+                store_c.store_pair(accL, accR, base_row, base_col_l)
+                return
             base_row, base_col_l, base_col_r = _cbase(o, _split)
+            if const_expr(dglu):
+                _lds_barrier(vmcnt=0)
+                _lds_barrier(vmcnt=0)
+                store_c.store_pair_quant(
+                    accL, accR, base_row, base_col_l, base_col_r, base_row, _c_store_rows
+                )
+                return
             _nv = _cn if const_expr(n_partial) else None
             if const_expr(_l_taccw):
                 store_c.store_tacc_wide(accL, base_row, base_col_l, n_valid=_nv)
@@ -2124,14 +2306,124 @@ def _build_mxfp4_gemm_kernel(
             o = _split_shift(_offs(_tile), _split)
             _fill(o)
             accL, accR = _compute(o, _split)
-            if const_expr(not _CSTORE):
+            if const_expr(glu) or const_expr(not _CSTORE):
                 _store(o, accL, accR, _split)
         else:
             o = _offs(fx.block_idx.x)
             _fill(o)
             accL, accR = _compute(o)
-            if const_expr(not _CSTORE):
+            if const_expr(glu) or const_expr(not _CSTORE):
                 _store(o, accL, accR)
+
+    if glu_act_quant:
+
+        @flyc.kernel(known_block_size=[256, 1, 1])
+        def kernel_gemm_4w(
+            A: fx.Tensor,
+            B_T: fx.Tensor,
+            C: fx.Tensor,
+            A_scale: fx.Tensor,
+            B_scale: fx.Tensor,
+            c_m: fx.Int32,
+            c_n: fx.Int32,
+            PROBS: fx.Tensor,
+            AQ_OUT: fx.Tensor,
+            AQ_SC: fx.Tensor,
+            AQ_TOUT: fx.Tensor,
+            AQ_TSC: fx.Tensor,
+            aq_col_rows: fx.Int32,
+            sr_seed: fx.Int32,
+        ):
+            _kernel_body(
+                A,
+                B_T,
+                C,
+                A_scale,
+                B_scale,
+                c_m,
+                c_n,
+                C,
+                PROBS,
+                None,
+                AQ_OUT,
+                AQ_SC,
+                AQ_TOUT,
+                AQ_TSC,
+                aq_col_rows,
+                sr_seed,
+            )
+
+    elif dglu_act_quant:
+
+        @flyc.kernel(known_block_size=[256, 1, 1])
+        def kernel_gemm_4w(
+            A: fx.Tensor,
+            B_T: fx.Tensor,
+            C: fx.Tensor,
+            A_scale: fx.Tensor,
+            B_scale: fx.Tensor,
+            c_m: fx.Int32,
+            c_n: fx.Int32,
+            PROBS: fx.Tensor,
+            GRAD_PROBS: fx.Tensor,
+            AQ_OUT: fx.Tensor,
+            AQ_SC: fx.Tensor,
+            AQ_TOUT: fx.Tensor,
+            AQ_TSC: fx.Tensor,
+            aq_col_rows: fx.Int32,
+            sr_seed: fx.Int32,
+        ):
+            _kernel_body(
+                A,
+                B_T,
+                C,
+                A_scale,
+                B_scale,
+                c_m,
+                c_n,
+                C,
+                PROBS,
+                GRAD_PROBS,
+                AQ_OUT,
+                AQ_SC,
+                AQ_TOUT,
+                AQ_TSC,
+                aq_col_rows,
+                sr_seed,
+            )
+
+    else:
+
+        @flyc.kernel(known_block_size=[256, 1, 1])
+        def kernel_gemm_4w(
+            A: fx.Tensor,
+            B_T: fx.Tensor,
+            C: fx.Tensor,
+            A_scale: fx.Tensor,
+            B_scale: fx.Tensor,
+            c_m: fx.Int32,
+            c_n: fx.Int32,
+            ACT: fx.Tensor,
+            PROBS: fx.Tensor,
+        ):
+            _kernel_body(
+                A,
+                B_T,
+                C,
+                A_scale,
+                B_scale,
+                c_m,
+                c_n,
+                ACT,
+                PROBS,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
 
     # agpr-alloc=256 lets the backend place the 256-f32 accumulator in AGPR;
     # waves_per_eu=1 -> the full 512-VGPR file is one wave's (no spill).
@@ -2139,7 +2431,8 @@ def _build_mxfp4_gemm_kernel(
     gemm_value_attrs = {"rocdl.flat_work_group_size": "256,256", "rocdl.waves_per_eu": OCC, **_pt}
 
     # Return the BARE kernel (NOT a launch): the fused factory issues preshuffle + this GEMM from one host stub.
-    return kernel_gemm_4w, BLOCK_M, BLOCK_N, ksplit, gemm_value_attrs, _BILV
+    # BN is the output-column step (128 under glu, 256 otherwise) so the fused stub's grid matches n_pids.
+    return kernel_gemm_4w, BLOCK_M, _NCB, ksplit, gemm_value_attrs, _BILV
 
 
 # ── Primus-Turbo host wrapper ────────────────────────────────────────────────
@@ -2382,6 +2675,13 @@ def _compile_mxfp4_fused(
     k_real=None,
     row_bytes=None,
     mn=None,
+    glu=False,
+    glu_i=0,
+    glu_act_quant=False,
+    dglu=False,
+    dglu_act_quant=False,
+    epi_row_sr=False,
+    epi_col_sr=False,
 ):
     """Turbo/mxfp8-style fused @flyc.jit stub: ONE host dispatch enqueues the A scale
     preshuffle, the B scale preshuffle, then the NT GEMM on the same stream (no separate
@@ -2409,25 +2709,23 @@ def _compile_mxfp4_fused(
         k_real=k_real,
         row_bytes=row_bytes,
         mn=mn,
+        glu=glu,
+        glu_i=glu_i,
+        glu_act_quant=glu_act_quant,
+        dglu=dglu,
+        dglu_act_quant=dglu_act_quant,
+        epi_row_sr=epi_row_sr,
+        epi_col_sr=epi_col_sr,
     )
-    pre_ab = _build_mxfp4_preshuffle_kernel_ab(b_ilv=_bilv, byte_src=_sc_row != K128 * 4, src_unit=_su)
+    pre_ab = _build_mxfp4_preshuffle_kernel_ab(
+        b_ilv=_bilv, byte_src=_sc_row != K128 * 4, src_unit=_su, glu_i=glu_i if glu else 0
+    )
     _PGRID = _MXFP4_PRESHUF_FO * _MXFP4_PRESHUF_BLK  # threads-per-block * fan-out
 
-    @flyc.jit
-    def launch_mxfp4_fused(
-        A: fx.Tensor,
-        B_T: fx.Tensor,
-        C: fx.Tensor,
-        A_raw: fx.Tensor,
-        B_raw: fx.Tensor,
-        A_scale: fx.Tensor,
-        B_scale: fx.Tensor,
-        c_m: fx.Int32,
-        c_n: fx.Int32,
-        stream: fx.Stream,
-    ):
+    def _preshuf(A_raw, A_scale, B_raw, B_scale, c_m, c_n, stream):
         qm = ceildiv(c_m, fx.Int32(256)) * fx.Int32(256)
-        qn = ceildiv(c_n, fx.Int32(256)) * fx.Int32(256)
+        qn = ceildiv(c_n * fx.Int32(2 if glu else 1), fx.Int32(256)) * fx.Int32(256)
+        rd_b = c_n * fx.Int32(2 if glu else 1)
         grid_a = ceildiv(qm * fx.Int32(K128), _PGRID)
         grid_b = ceildiv(qn * fx.Int32(K128), _PGRID)
         pre_ab(
@@ -2438,7 +2736,7 @@ def _compile_mxfp4_fused(
             qm,
             qn,
             c_m,
-            c_n,
+            rd_b,
             fx.Int32(K128),
             grid_a,
             fx.Int32(_sc_row),
@@ -2447,13 +2745,116 @@ def _compile_mxfp4_fused(
             block=(_MXFP4_PRESHUF_BLK, 1, 1),
             stream=stream,
         )
-        # 3) NT GEMM (reads the just-written A_scale/B_scale ws; same stream => ordered).
         grid_x = ceildiv(c_m, BM) * ceildiv(c_n, BN)
         if const_expr(ksplit > 1):
-            grid_x = grid_x * fx.Int32(ksplit)  # split-K: one WG per (tile, split)
-        gemm_kern(A, B_T, C, A_scale, B_scale, c_m, c_n, value_attrs=gemm_value_attrs).launch(
-            grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream
-        )
+            grid_x = grid_x * fx.Int32(ksplit)
+        return grid_x
+
+    if glu_act_quant:
+
+        @flyc.jit
+        def launch_mxfp4_fused(
+            A: fx.Tensor,
+            B_T: fx.Tensor,
+            C: fx.Tensor,
+            A_raw: fx.Tensor,
+            B_raw: fx.Tensor,
+            A_scale: fx.Tensor,
+            B_scale: fx.Tensor,
+            c_m: fx.Int32,
+            c_n: fx.Int32,
+            PROBS: fx.Tensor,
+            AQ_OUT: fx.Tensor,
+            AQ_SC: fx.Tensor,
+            AQ_TOUT: fx.Tensor,
+            AQ_TSC: fx.Tensor,
+            aq_col_rows: fx.Int32,
+            sr_seed: fx.Int32,
+            stream: fx.Stream,
+        ):
+            grid_x = _preshuf(A_raw, A_scale, B_raw, B_scale, c_m, c_n, stream)
+            gemm_kern(
+                A,
+                B_T,
+                C,
+                A_scale,
+                B_scale,
+                c_m,
+                c_n,
+                PROBS,
+                AQ_OUT,
+                AQ_SC,
+                AQ_TOUT,
+                AQ_TSC,
+                aq_col_rows,
+                sr_seed,
+                value_attrs=gemm_value_attrs,
+            ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
+
+    elif dglu_act_quant:
+
+        @flyc.jit
+        def launch_mxfp4_fused(
+            A: fx.Tensor,
+            B_T: fx.Tensor,
+            C: fx.Tensor,
+            A_raw: fx.Tensor,
+            B_raw: fx.Tensor,
+            A_scale: fx.Tensor,
+            B_scale: fx.Tensor,
+            c_m: fx.Int32,
+            c_n: fx.Int32,
+            PROBS: fx.Tensor,
+            GRAD_PROBS: fx.Tensor,
+            AQ_OUT: fx.Tensor,
+            AQ_SC: fx.Tensor,
+            AQ_TOUT: fx.Tensor,
+            AQ_TSC: fx.Tensor,
+            aq_col_rows: fx.Int32,
+            sr_seed: fx.Int32,
+            stream: fx.Stream,
+        ):
+            grid_x = _preshuf(A_raw, A_scale, B_raw, B_scale, c_m, c_n, stream)
+            gemm_kern(
+                A,
+                B_T,
+                C,
+                A_scale,
+                B_scale,
+                c_m,
+                c_n,
+                PROBS,
+                GRAD_PROBS,
+                AQ_OUT,
+                AQ_SC,
+                AQ_TOUT,
+                AQ_TSC,
+                aq_col_rows,
+                sr_seed,
+                value_attrs=gemm_value_attrs,
+            ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
+
+    else:
+
+        @flyc.jit
+        def launch_mxfp4_fused(
+            A: fx.Tensor,
+            B_T: fx.Tensor,
+            C: fx.Tensor,
+            A_raw: fx.Tensor,
+            B_raw: fx.Tensor,
+            A_scale: fx.Tensor,
+            B_scale: fx.Tensor,
+            c_m: fx.Int32,
+            c_n: fx.Int32,
+            ACT: fx.Tensor,
+            PROBS: fx.Tensor,
+            stream: fx.Stream,
+        ):
+            grid_x = _preshuf(A_raw, A_scale, B_raw, B_scale, c_m, c_n, stream)
+            gemm_kern(
+                A, B_T, C, A_scale, B_scale, c_m, c_n, ACT, PROBS, value_attrs=gemm_value_attrs
+            ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
     return launch_mxfp4_fused
 
@@ -2474,6 +2875,13 @@ def _get_mxfp4_fused_launch(
     k_real=None,
     row_bytes=None,
     mn=None,
+    glu=False,
+    glu_i=0,
+    glu_act_quant=False,
+    dglu=False,
+    dglu_act_quant=False,
+    epi_row_sr=False,
+    epi_col_sr=False,
 ):
     lk = (
         K,
@@ -2491,6 +2899,13 @@ def _get_mxfp4_fused_launch(
         k_real,
         row_bytes,
         mn,
+        glu,
+        glu_i,
+        glu_act_quant,
+        dglu,
+        dglu_act_quant,
+        epi_row_sr,
+        epi_col_sr,
     )
     launch = _MXFP4_LAUNCH_CACHE.get(lk)
     if launch is None:
@@ -2510,6 +2925,13 @@ def _get_mxfp4_fused_launch(
             k_real=k_real,
             row_bytes=row_bytes,
             mn=mn,
+            glu=glu,
+            glu_i=glu_i,
+            glu_act_quant=glu_act_quant,
+            dglu=dglu,
+            dglu_act_quant=dglu_act_quant,
+            epi_row_sr=epi_row_sr,
+            epi_col_sr=epi_col_sr,
         )
         _MXFP4_LAUNCH_CACHE[lk] = launch
     return launch
@@ -2578,7 +3000,7 @@ def _load_sc_dwords(rin, row_base, k4, n_sub, sc_row, ok, unit=1):
     return Vec.from_elements(words, fx.Int32)
 
 
-def _build_mxfp4_preshuffle_kernel_ab(b_ilv=0, byte_src=False, src_unit=1):
+def _build_mxfp4_preshuffle_kernel_ab(b_ilv=0, byte_src=False, src_unit=1, glu_i=0):
     # Merged A+B scale preshuffle: ONE grid repacks BOTH operands so the fused stub issues a
     # single preshuffle launch instead of two -> one fewer launch + gap per GEMM (bigger win
     # on small-M/N). Blocks [0, grid_a) do A (mode 0); [grid_a, ...) do B (mode 1); the A/B
@@ -2630,6 +3052,7 @@ def _build_mxfp4_preshuffle_kernel_ab(b_ilv=0, byte_src=False, src_unit=1):
         wi = e2 // KK
         k128 = kk * n_sub  # the thread's two K sub-blocks are adjacent source dwords
         base = ((wi * KK + kk) * 64 + r) * nd
+        _bq = wi // 2  # packed 128-row band pair; glu remaps B reads below
 
         dws = []
         for r_region in range_constexpr(n_rr):
@@ -2638,7 +3061,16 @@ def _build_mxfp4_preshuffle_kernel_ab(b_ilv=0, byte_src=False, src_unit=1):
             for t in range_constexpr(nd):
                 loc = arith.select(is_b, r * b_ilv + t, t * 16 + r) if b_ilv else (t * 16 + r)
                 row = grp * 64 + loc
-                _in = ok & (row < rd)
+                b_ok = row < rd
+                if const_expr(bool(glu_i)):
+                    # Packed row space alternates 128-row gate/up bands so the R pool
+                    # (a fixed 128 rows past L) lands on up for any I. r_region is
+                    # that band's parity.
+                    b_row = row - (_bq + fx.Int32(r_region)) * fx.Int32(128)
+                    b_ok = b_row < fx.Int32(glu_i)
+                    b_row = b_row + fx.Int32(r_region * glu_i)
+                    row = arith.select(is_b, b_row, row)
+                _in = ok & arith.select(is_b, b_ok, row < rd)
                 if const_expr(byte_src):
                     dws.append(
                         _load_sc_dwords(rin, row * sc_row, k128 * 4, n_sub, sc_row, _in, unit=src_unit)
@@ -2744,7 +3176,9 @@ def gemm_mxfp4_flydsl_kernel(
     # C stays 2D (StoreCPlain re-bases per row band from C's base + c_n); a 1D M*N view
     # overflows the CABI for large M*N.
     def _args_for(target):
-        return (a8, b8, target, a_raw, b_raw, a_sp, b_sp, M, N, stream)
+        # ACT/PROBS are unused on the plain path; alias C so the fused stub ABI
+        # matches the glu launch without a second kernel signature.
+        return (a8, b8, target, a_raw, b_raw, a_sp, b_sp, M, N, target, target, stream)
 
     # Both autotunes launch the GEMM dozens of times. Against a beta=1 build that would
     # fold every one of them into the caller's buffer, so tuning runs the beta=0 build
@@ -2811,7 +3245,7 @@ def gemm_mxfp4_flydsl_kernel(
         gm, gn, xcd = _mxfp4_nt_config(M, N, K)
         ws = torch.empty((ksplit * M, N), dtype=out_dtype, device=a.device)
         cbuf = ws.view(-1)
-        sk_args = (a8, b8, cbuf, a_raw, b_raw, a_sp, b_sp, M, N, stream)
+        sk_args = (a8, b8, cbuf, a_raw, b_raw, a_sp, b_sp, M, N, cbuf, cbuf, stream)
         launch = _get_mxfp4_fused_launch(
             K,
             gm,
@@ -2883,3 +3317,361 @@ def gemm_mxfp4_flydsl_kernel(
 
     out2 = _exec_split(ks, out, beta_is_one) if ks > 1 else _exec_plain(out, beta_is_one)
     return out2.t().contiguous() if trans_c else out2
+
+
+_MXFP4_GLU_AT_CACHE: dict = {}
+
+
+def gemm_mxfp4_glu_flydsl_kernel(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    l1: torch.Tensor,
+    act: torch.Tensor,
+    probs: torch.Tensor,
+    *,
+    trans_a: bool = False,
+    trans_b: bool = True,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dense MXFP4 NT GEMM + StoreCSwiGLU: A [M, K] @ B[2I, K]^T -> l1[M, 2I], act[M, I].
+
+    Same ``kernel_gemm_4w`` as :func:`gemm_mxfp4_flydsl_kernel`, with the R B-pool
+    pointed at the up band (row offset ``I``) so gate and up for one column land
+    in the same lane. ``probs`` scales ``act`` only (pass ones for a dense MLP).
+    """
+    assert a.dim() == 2 and b.dim() == 2, "a, b must be 2D"
+    assert out_dtype in (torch.bfloat16, torch.float16)
+    assert (not trans_a) and trans_b, "mxfp4 glu FlyDSL GEMM is NT only"
+    out_fp16 = out_dtype == torch.float16
+
+    M, Kb_a = a.shape
+    two_i, Kb_b = b.shape
+    assert two_i % 2 == 0, f"B rows must be 2I (gate||up), got {two_i}"
+    I = two_i // 2
+    K = a_scale.shape[1] * 32
+    assert b_scale.shape[1] * 32 == K, f"scale K mismatch: {a_scale.shape} vs {b_scale.shape}"
+    assert a_scale.shape[0] == M and b_scale.shape[0] == two_i
+    assert Kb_a == Kb_b
+    assert K // 2 <= Kb_a <= (K + 255) // 256 * 128
+    assert K % 64 == 0 and M % 64 == 0 and I % 64 == 0
+    assert l1.shape == (M, two_i) and l1.dtype == out_dtype
+    assert act.shape == (M, I) and act.dtype == out_dtype
+    assert probs.shape == (M,) and probs.dtype == torch.float32
+
+    stream = torch.cuda.current_stream()
+    _capturing = torch.cuda.is_current_stream_capturing()
+    Kw = (K + 255) // 256 * 256
+    _k_real = None if K == Kw else K
+    _row_b = None if Kb_a == K // 2 else Kb_a
+    # B-scale workspace covers gate||up (2I), not the gate width the GEMM's c_n uses.
+    a_sp, b_sp = _get_mxfp4_scale_ws(M, two_i, Kw, a.device)
+    a_raw = a_scale.contiguous().view(torch.uint8).reshape(-1)
+    b_raw = b_scale.contiguous().view(torch.uint8).reshape(-1)
+    a8 = a.contiguous().view(torch.int8)
+    b8 = b.contiguous().view(torch.int8)
+
+    gm, gn, xcd = _mxfp4_nt_config(M, I, Kw)
+    launch = _get_mxfp4_fused_launch(
+        Kw,
+        gm,
+        xcd,
+        gn,
+        10,
+        9,
+        taccw=False,
+        coop=False,
+        out_fp16=out_fp16,
+        beta_is_one=False,
+        n_tail=0,
+        k_real=_k_real,
+        row_bytes=_row_b,
+        mn=(M, I),
+        glu=True,
+        glu_i=I,
+    )
+    fused_args = (a8, b8, l1, a_raw, b_raw, a_sp, b_sp, M, I, act, probs, stream)
+    at_key = (M, I, K, _row_b, gm, xcd, gn, 10, 9, out_fp16, True)
+    entry = _MXFP4_GLU_AT_CACHE.get(at_key)
+    if entry is None:
+        entry = [launch, None]
+        _MXFP4_GLU_AT_CACHE[at_key] = entry
+    raw, compiled = entry
+    if _capturing:
+        raw(*fused_args)
+    else:
+        if compiled is None:
+            compiled = compile_with_scratch_out(raw, fused_args)
+            entry[1] = compiled
+        compiled(*fused_args)
+    return l1, act
+
+
+def dense_glu_epi_quant_supported(K: int, I: int, M: int = 0, out_dtype=torch.bfloat16) -> bool:
+    """Whether :func:`gemm_mxfp4_glu_quant_flydsl_kernel` covers this shape.
+
+    Dense ``_CSTORE`` (needed by ``StoreCSwiGLUQuant``) wants KI>=4 and an even
+    K-loop or a trailing 128-K, plus I on a 64-col band. Llama-3.1-8B
+    ``K=4096, I=14336, M=32768`` passes. Grouped ``glu_epi_quant_supported``
+    rejects this K.
+    """
+    if out_dtype != torch.bfloat16 or I % 64 or (M and M % 256):
+        return False
+    Kw = (K + 255) // 256 * 256
+    KI = Kw // 256
+    if KI < 4:
+        return False
+    if KI % 2 == 0:
+        return True
+    return ceildiv(K, 128) == 2 * KI - 1
+
+
+_MXFP4_GLU_QUANT_AT_CACHE: dict = {}
+
+
+def gemm_mxfp4_glu_quant_flydsl_kernel(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    l1: torch.Tensor,
+    probs: torch.Tensor,
+    row_out: torch.Tensor,
+    row_sc: torch.Tensor,
+    col_out: torch.Tensor,
+    col_sc: torch.Tensor,
+    *,
+    trans_a: bool = False,
+    trans_b: bool = True,
+    out_dtype: torch.dtype = torch.bfloat16,
+    row_use_sr: bool = False,
+    col_use_sr: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dense MXFP4 NT GEMM + StoreCSwiGLUQuant: act never hits BF16 HBM.
+
+    Writes ``l1[M, 2I]`` BF16 and the row/col MXFP4 pair fc2 / wgrad consume.
+    """
+    from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import _next_sr_seed
+
+    assert a.dim() == 2 and b.dim() == 2, "a, b must be 2D"
+    assert out_dtype == torch.bfloat16, "fused act quant is bf16-accumulator only"
+    assert (not trans_a) and trans_b, "mxfp4 glu FlyDSL GEMM is NT only"
+
+    M, Kb_a = a.shape
+    two_i, Kb_b = b.shape
+    assert two_i % 2 == 0, f"B rows must be 2I (gate||up), got {two_i}"
+    I = two_i // 2
+    K = a_scale.shape[1] * 32
+    assert dense_glu_epi_quant_supported(K, I, M, out_dtype), (
+        f"dense glu-quant epilogue does not cover K={K} I={I} M={M} dtype={out_dtype}"
+    )
+    assert b_scale.shape[1] * 32 == K
+    assert a_scale.shape[0] == M and b_scale.shape[0] == two_i
+    assert Kb_a == Kb_b
+    assert l1.shape == (M, two_i) and l1.dtype == out_dtype
+    assert probs.shape == (M,) and probs.dtype == torch.float32
+
+    I_pad = ceildiv(I, 128) * 128
+    M_pad = ceildiv(M, 256) * 256
+    stream = torch.cuda.current_stream()
+    _capturing = torch.cuda.is_current_stream_capturing()
+    Kw = (K + 255) // 256 * 256
+    _k_real = None if K == Kw else K
+    _row_b = None if Kb_a == K // 2 else Kb_a
+    a_sp, b_sp = _get_mxfp4_scale_ws(M, two_i, Kw, a.device)
+    a_raw = a_scale.contiguous().view(torch.uint8).reshape(-1)
+    b_raw = b_scale.contiguous().view(torch.uint8).reshape(-1)
+    a8 = a.contiguous().view(torch.int8)
+    b8 = b.contiguous().view(torch.int8)
+
+    gm, gn, xcd = _mxfp4_nt_config(M, I, Kw)
+    launch = _get_mxfp4_fused_launch(
+        Kw,
+        gm,
+        xcd,
+        gn,
+        10,
+        9,
+        taccw=False,
+        coop=False,
+        out_fp16=False,
+        beta_is_one=False,
+        n_tail=0,
+        k_real=_k_real,
+        row_bytes=_row_b,
+        mn=(M, I),
+        glu=True,
+        glu_i=I,
+        glu_act_quant=True,
+        epi_row_sr=row_use_sr,
+        epi_col_sr=col_use_sr,
+    )
+    sr_seed = _next_sr_seed() if (row_use_sr or col_use_sr) else 0
+    fused_args = (
+        a8,
+        b8,
+        l1,
+        a_raw,
+        b_raw,
+        a_sp,
+        b_sp,
+        M,
+        I,
+        probs,
+        row_out.view(torch.int32),
+        row_sc.view(torch.uint8),
+        col_out.view(torch.int32),
+        col_sc.view(torch.uint8),
+        M_pad,
+        sr_seed,
+        stream,
+    )
+    at_key = (M, I, K, _row_b, gm, xcd, gn, 10, 9, row_use_sr, col_use_sr)
+    entry = _MXFP4_GLU_QUANT_AT_CACHE.get(at_key)
+    if entry is None:
+        entry = [launch, None]
+        _MXFP4_GLU_QUANT_AT_CACHE[at_key] = entry
+    raw, compiled = entry
+    if _capturing:
+        raw(*fused_args)
+    else:
+        if compiled is None:
+            compiled = compile_with_scratch_out(raw, fused_args)
+            entry[1] = compiled
+        compiled(*fused_args)
+    del I_pad
+    return l1, row_out, row_sc, col_out, col_sc
+
+
+def dense_dglu_epi_quant_supported(K: int, I: int, M: int = 0, out_dtype=torch.bfloat16) -> bool:
+    """Whether :func:`gemm_mxfp4_dglu_quant_flydsl_kernel` covers this shape.
+
+    dGLU does not need ``_CSTORE`` (it stages after the mainloop). A row-wise
+    MX block of 32 columns must not straddle the dg/du halves of ``grad_l1``,
+    so ``I % 32 == 0``. Llama-3.1-8B ``I=14336`` passes. ``K`` is free.
+    """
+    del K
+    if out_dtype != torch.bfloat16 or I % 32 or (M and M % 256):
+        return False
+    return True
+
+
+_MXFP4_DGLU_QUANT_AT_CACHE: dict = {}
+
+
+def gemm_mxfp4_dglu_quant_flydsl_kernel(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    l1: torch.Tensor,
+    probs: torch.Tensor,
+    grad_probs: torch.Tensor,
+    row_out: torch.Tensor,
+    row_sc: torch.Tensor,
+    col_out: torch.Tensor,
+    col_sc: torch.Tensor,
+    *,
+    trans_a: bool = False,
+    trans_b: bool = True,
+    out_dtype: torch.dtype = torch.bfloat16,
+    row_use_sr: bool = False,
+    col_use_sr: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dense MXFP4 NT dgrad + dSwiGLU + dual-quant of ``grad_l1``.
+
+    ``a`` is fc2 ``dY`` row-quant, ``b`` is ``w2`` col-quant. Accumulator is
+    ``dact[M, I]``; ``grad_l1[M, 2I]`` never hits BF16 HBM.
+    """
+    from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import _next_sr_seed
+
+    assert a.dim() == 2 and b.dim() == 2, "a, b must be 2D"
+    assert out_dtype == torch.bfloat16
+    assert (not trans_a) and trans_b, "mxfp4 dglu FlyDSL GEMM is NT only"
+
+    M, Kb_a = a.shape
+    I, Kb_b = b.shape
+    K = a_scale.shape[1] * 32
+    assert dense_dglu_epi_quant_supported(K, I, M, out_dtype), (
+        f"dense dglu-quant epilogue does not cover K={K} I={I} M={M} dtype={out_dtype}"
+    )
+    assert b_scale.shape[1] * 32 == K
+    assert a_scale.shape[0] == M and b_scale.shape[0] == I
+    assert Kb_a == Kb_b
+    assert l1.shape == (M, 2 * I) and l1.dtype == out_dtype
+    assert probs.shape == (M,) and probs.dtype == torch.float32
+    n_n = ceildiv(I, 256)
+    assert grad_probs.shape == (n_n, M) and grad_probs.dtype == torch.float32
+
+    M_pad = ceildiv(M, 256) * 256
+    stream = torch.cuda.current_stream()
+    _capturing = torch.cuda.is_current_stream_capturing()
+    Kw = (K + 255) // 256 * 256
+    _k_real = None if K == Kw else K
+    _row_b = None if Kb_a == K // 2 else Kb_a
+    a_sp, b_sp = _get_mxfp4_scale_ws(M, I, Kw, a.device)
+    a_raw = a_scale.contiguous().view(torch.uint8).reshape(-1)
+    b_raw = b_scale.contiguous().view(torch.uint8).reshape(-1)
+    a8 = a.contiguous().view(torch.int8)
+    b8 = b.contiguous().view(torch.int8)
+
+    gm, gn, xcd = _mxfp4_nt_config(M, I, Kw)
+    launch = _get_mxfp4_fused_launch(
+        Kw,
+        gm,
+        xcd,
+        gn,
+        10,
+        9,
+        taccw=False,
+        coop=False,
+        out_fp16=False,
+        beta_is_one=False,
+        n_tail=I % 256,
+        k_real=_k_real,
+        row_bytes=_row_b,
+        mn=(M, I),
+        glu=False,
+        glu_i=I,
+        dglu=True,
+        dglu_act_quant=True,
+        epi_row_sr=row_use_sr,
+        epi_col_sr=col_use_sr,
+    )
+    sr_seed = _next_sr_seed() if (row_use_sr or col_use_sr) else 0
+    fused_args = (
+        a8,
+        b8,
+        l1,
+        a_raw,
+        b_raw,
+        a_sp,
+        b_sp,
+        M,
+        I,
+        probs,
+        grad_probs,
+        row_out.view(torch.int32),
+        row_sc.view(torch.uint8),
+        col_out.view(torch.int32),
+        col_sc.view(torch.uint8),
+        M_pad,
+        sr_seed,
+        stream,
+    )
+    at_key = (M, I, K, _row_b, gm, xcd, gn, 10, 9, row_use_sr, col_use_sr, "dglu")
+    entry = _MXFP4_DGLU_QUANT_AT_CACHE.get(at_key)
+    if entry is None:
+        entry = [launch, None]
+        _MXFP4_DGLU_QUANT_AT_CACHE[at_key] = entry
+    raw, compiled = entry
+    if _capturing:
+        raw(*fused_args)
+    else:
+        if compiled is None:
+            compiled = compile_with_scratch_out(raw, fused_args)
+            entry[1] = compiled
+        compiled(*fused_args)
+    return row_out, row_sc, col_out, col_sc
+

@@ -97,6 +97,10 @@ class FP4GemmMXFunction(torch.autograd.Function):
         out_dtype: torch.dtype,
         config: Float4QuantConfig,
         fuse_bgrad_accum_pattern: Union[None, str] = None,
+        a_row_pre: Optional[torch.Tensor] = None,
+        a_row_scale_pre: Optional[torch.Tensor] = None,
+        a_col_pre: Optional[torch.Tensor] = None,
+        a_col_scale_pre: Optional[torch.Tensor] = None,
     ):
         supported_mxfp4_backend, reason = check_mxfp4_support()
         assert supported_mxfp4_backend, reason
@@ -123,7 +127,14 @@ class FP4GemmMXFunction(torch.autograd.Function):
             shuffle_scale=preshuffle,
             shuffle_out=preshuffle,
         )
-        if isinstance(a, QuantizedTensor):
+        if a_row_pre is not None:
+            a_row, a_row_scale, a_col, a_col_scale = (
+                a_row_pre,
+                a_row_scale_pre,
+                a_col_pre,
+                a_col_scale_pre,
+            )
+        elif isinstance(a, QuantizedTensor):
             check_quantized_tensor(a, config, scaling_recipe=a_scaling_recipe)
             a_row, a_row_scale = a.qdata, a.scale_inv
             if a_t is None:
@@ -287,6 +298,10 @@ class FP4GemmMXFunction(torch.autograd.Function):
             None,  # out_dtype
             None,  # config
             None,  # fuse_bgrad_accum_pattern
+            None,  # a_row_pre
+            None,
+            None,
+            None,
         )
 
 
@@ -306,6 +321,7 @@ def gemm_fp4(
     out_dtype: Union[torch.dtype, None] = None,
     config: Union[Float4QuantConfig, None] = None,
     fuse_bgrad_accum_pattern: Union[None, str] = None,
+    a_prequant: Union[None, tuple] = None,
 ) -> torch.Tensor:
     """General matrix multiplication (GEMM) with FP4 quantization, supporting autograd.
 
@@ -402,8 +418,23 @@ def gemm_fp4(
     )
 
     if config.granularity == ScalingGranularity.MX_BLOCKWISE:
+        a_row_pre = a_rs_pre = a_col_pre = a_cs_pre = None
+        if a_prequant is not None:
+            a_row_pre, a_rs_pre, a_col_pre, a_cs_pre = a_prequant
         return FP4GemmMXFunction.apply(
-            a_data, b_data, a_data_t, b_data_t, trans_a, trans_b, out_dtype, config, fuse_bgrad_accum_pattern
+            a_data,
+            b_data,
+            a_data_t,
+            b_data_t,
+            trans_a,
+            trans_b,
+            out_dtype,
+            config,
+            fuse_bgrad_accum_pattern,
+            a_row_pre,
+            a_rs_pre,
+            a_col_pre,
+            a_cs_pre,
         )
     else:
         raise ValueError(f"Unsupported FP4 ScalingGranularity: {config.granularity}")
