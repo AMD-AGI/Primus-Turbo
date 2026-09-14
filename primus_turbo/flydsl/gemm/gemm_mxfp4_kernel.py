@@ -494,10 +494,11 @@ _MXFP4_ARCH_ACC = -1
 # `s_add_u32 m0`, which the wave-major row layout keeps inside 12 bits.
 _MXFP4_G2S_IMM = 3
 
-# A bare `s_barrier` in the middle of each k-phase. It carries no waitcnt, so the g2s ring's
-# watermark accounting is untouched; all it does is halve how far the four waves may drift
-# apart inside a phase, which is the sync spacing AITER's asm GEMM runs at.
-_MXFP4_MID_SYNC = 1
+# Bare `s_barrier`s spread through each k-phase. They carry no waitcnt, so the g2s ring's
+# watermark accounting is untouched; all they do is bound how far the four waves may drift
+# apart inside a phase. Two is where the shape table measures best -- one and three both
+# cost -- and it already leaves six barriers in the steady-state loop.
+_MXFP4_MID_SYNC = 2
 
 
 class MfmaScaleFp4:
@@ -1325,10 +1326,15 @@ class MfmaScaleFp4:
                     return B + [_ipend] + emit_bsoff() + [f"s_branch {l_head}f"]
 
                 def _mid_sync(lines):
-                    if not _MXFP4_MID_SYNC or len(lines) < 4:
+                    n = _MXFP4_MID_SYNC
+                    if not n or len(lines) < 2 * (n + 1):
                         return lines
-                    h = len(lines) // 2
-                    return lines[:h] + ["s_barrier"] + lines[h:]
+                    out, step = [], len(lines) // (n + 1)
+                    for i in range(n + 1):
+                        out += lines[i * step : (i + 1) * step if i < n else len(lines)]
+                        if i < n:
+                            out.append("s_barrier")
+                    return out
 
                 def emit_loop(lbl, half, l_head=7):
                     B = [f"{lbl}:"]
