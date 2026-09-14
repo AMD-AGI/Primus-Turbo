@@ -3396,6 +3396,12 @@ def gemm_mxfp4_flydsl_kernel(
                 M, N, Kw, _tune_args(), out_fp16, k_real=_k_real, row_bytes=_row_b, prepacked=scales_prepacked
             )
         gm, gn, xcd, _wlv, _elgk, _tw, _coop = cfg
+        if scales_prepacked:
+            # Both twins turn the folded C store off, and that is what decides the packed
+            # B-scale layout. A caller holding packed scales would have them reinterpreted by
+            # a later re-tune picking a twin, so the packed path pins them off, the same way
+            # a split already does.
+            _tw = _coop = False
         launch = _get_mxfp4_fused_launch(
             Kw,
             gm,
