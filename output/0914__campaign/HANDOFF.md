@@ -304,3 +304,43 @@ done
 
 同类：`pkill -f <pattern>` 会杀掉发起者自己的 shell（当天中过 4 次，
 其中一次直接终止了正在收集结果的回合）。
+
+---
+
+## 13. 收尾复测（在 GPU1 上跑，结果见 ledger）
+
+`bin/final_champion.sh`，GPU1（实测 124.8 TFLOP/s 健康），`asm` 与 `fused` 交替 3 对，
+每次 2400 秒硬上限。**结果落在 `ledgers/final_champion.jsonl`**，它在我停止后仍会跑完。
+
+读法：
+```bash
+python3 -c "
+import json
+for l in open('output/0914__campaign/ledgers/final_champion.jsonl'):
+    e=json.loads(l); r=e.get('r')
+    if not r: print(e['tag'],'FAILED'); continue
+    s=r['sqnr_db']
+    print('%-16s fwd %7.3f bwd %8.3f tot %8.3f %7.1f TF/s  SQNR %.2f/%.2f/%.2f/%.2f'%(
+      e['tag'],r['fwd_ms'],r['bwd_ms'],r['total_ms'],r['total_tflops'],
+      s['out'],s['dq'],s['dk'],s['dv']))"
+```
+
+**对照基准**：今天在四卡满载下测到的冠军是 **10.299 ms / 747 TFLOP/s**（`asm`），
+`fused`（即 aiter 不可导入时的回退）是 **12.412 ms / 620**。
+SQNR 应为 `53.62/52.24/52.31/52.71`（`asm` 那条 out 是 53.62，树内前向是 53.67）。
+
+**这次是在一张卡独占、其余卡基本空闲的条件下测的**，所以它应当不差于上面的数。
+若明显更好，说明今天所有 op 数字都被四卡满载压低了，整条阶梯要按这个比例重新标注。
+
+## 14. 当前机器状态（交接时刻）
+
+- **GPU0**：不可用，已从调度摘除。120 条 MES 超时全在它的 PCI 地址上，故障始于 uptime 14647
+- **GPU1**：跑收尾复测
+- **GPU2 / GPU3**：空闲，可用
+- **op-evolve**：已发 `stop`，会在下一个模块边界退出；`artifacts/` 完整，可 `resume`
+- **调度器**：全部停止（queue.sh / e2e_loop.sh / watchdog / cron 巡检）
+- **哨兵**：已清除，不会挡住明天的启动
+- `wait for reset ack`：**全天 0 次**
+- `amdgpu` 引用计数：24（清理前 30）；**HIP 初始化 58 秒仍未解释**，见 §10 末尾
+
+明天开工按 §10 的两步检查，然后照 §8 的排期。
