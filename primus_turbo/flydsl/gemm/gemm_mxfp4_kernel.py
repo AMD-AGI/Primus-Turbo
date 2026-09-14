@@ -494,6 +494,11 @@ _MXFP4_ARCH_ACC = -1
 # `s_add_u32 m0`, which the wave-major row layout keeps inside 12 bits.
 _MXFP4_G2S_IMM = 3
 
+# A bare `s_barrier` in the middle of each k-phase. It carries no waitcnt, so the g2s ring's
+# watermark accounting is untouched; all it does is halve how far the four waves may drift
+# apart inside a phase, which is the sync spacing AITER's asm GEMM runs at.
+_MXFP4_MID_SYNC = 1
+
 
 class MfmaScaleFp4:
     """16x16x128 f8f6f4 MFMA in fp4 mode (cbsz=4/blgp=4) with packed per-block E8M0
@@ -1319,9 +1324,15 @@ class MfmaScaleFp4:
                         B += emit_acc_clear(nq, NT)
                     return B + [_ipend] + emit_bsoff() + [f"s_branch {l_head}f"]
 
+                def _mid_sync(lines):
+                    if not _MXFP4_MID_SYNC or len(lines) < 4:
+                        return lines
+                    h = len(lines) // 2
+                    return lines[:h] + ["s_barrier"] + lines[h:]
+
                 def emit_loop(lbl, half, l_head=7):
                     B = [f"{lbl}:"]
-                    B += emit_phase_a(half)
+                    B += _mid_sync(emit_phase_a(half))
                     B.append(_ipend)
                     B += emit_bsoff()
                     if _ZACC:
@@ -1336,7 +1347,7 @@ class MfmaScaleFp4:
                     _gB = emit_g2s(1, *_bs, half and half_g2s)
                     if _ROT:
                         _gB = mix_g2s(_gB, emit_bases(1))
-                    B += _scB + emit_inplace(0, _gB, half)
+                    B += _scB + _mid_sync(emit_inplace(0, _gB, half))
                     B += _scv_adv(2 if _SCIMM else 1)
                     B.append(_ipend)
                     for _so in (o_sa, o_sbl, o_sbr):
