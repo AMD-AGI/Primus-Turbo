@@ -12,7 +12,6 @@ import torch
 import torch.nn.functional as F
 
 from primus_turbo.pytorch.ops.activation import (
-    clamped_swiglu_with_probs,
     geglu_with_probs,
     swiglu_with_probs,
 )
@@ -105,7 +104,7 @@ def test_glu_with_probs(batch_size, sequence_length, hidden_size, dtype, with_to
         func = geglu_with_probs
         ref_func = geglu_with_probs_ref
     elif act_type == "clamped_swiglu":
-        func = partial(clamped_swiglu_with_probs, clamp_limit=CLAMP_LIMIT)
+        func = partial(swiglu_with_probs, clamp_limit=CLAMP_LIMIT)
         ref_func = partial(clamped_swiglu_with_probs_ref, clamp_limit=CLAMP_LIMIT)
 
     device = "cuda"
