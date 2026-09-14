@@ -6,6 +6,7 @@
 
 from typing import Optional
 
+import os
 import torch
 
 from primus_turbo.pytorch.core.low_precision import Float8QuantConfig
@@ -17,6 +18,29 @@ from primus_turbo.pytorch.ops.attention import (
 )
 
 __all__ = ["TurboAttention"]
+
+
+# Opt out of having torch.compile trace INTO attention.
+#
+# Inductor gains nothing here and costs a great deal: the forward is either a prebuilt ASM
+# kernel or a hand-written Triton one, the backward is a single hand-tuned Triton kernel, and
+# letting inductor re-lower them means it must trace an autograd.Function containing a raw
+# Triton launch -- which it then tries to recompile through its own pipeline and fails. The
+# surrounding model still compiles; attention just becomes a graph break, which is the right
+# boundary for a kernel that is already hand-optimised.
+#
+# Off by default so nothing changes for callers who have this working today. Set
+# PRIMUS_TURBO_ATTN_NO_COMPILE=1 to take the boundary.
+def _maybe_no_compile(fn):
+    if os.environ.get("PRIMUS_TURBO_ATTN_NO_COMPILE", "") in ("", "0"):
+        return fn
+    try:
+        import torch._dynamo
+
+        return torch._dynamo.disable(fn)
+    except Exception:  # noqa: BLE001 -- never break the caller over a diagnostic switch
+        return fn
+
 
 
 class TurboAttention(torch.nn.Module):
@@ -50,6 +74,8 @@ class TurboAttention(torch.nn.Module):
 
         self.attention_fn = self.get_attention_func()
 
+
+    @_maybe_no_compile
     def forward(
         self,
         q: torch.Tensor,

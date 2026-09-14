@@ -21,7 +21,7 @@ touch "$LEDGER"; echo $$ > "$PIDF"; trap 'rm -f "$PIDF"' EXIT
 # Liveness and health use only calls that cannot block on the driver. rocm-smi, ps and
 # pgrep all hang on a wedged card -- dmesg read alone, under a hard timeout, does not.
 health(){ timeout 15 dmesg 2>/dev/null | tail -80 \
-          | grep -qE 'MES\(|GPU Hang|wait for reset ack|Memory access fault' && return 1 || return 0; }
+          | grep -qE 'failed to respond to msg|GPU Hang|wait for reset ack|Memory access fault' && return 1 || return 0; }
 paused(){ [ -f "$STOP" ]; }
 
 done_tag(){ grep -qF "\"tag\":\"$1\"" "$LEDGER" 2>/dev/null; }

@@ -32,11 +32,16 @@ alive(){ local f=$1; [ -f "$f" ] && kill -0 "$(cat "$f" 2>/dev/null)" 2>/dev/nul
 # grep -c always PRINTS a count and exits 1 when that count is zero, so `|| echo 0` appended
 # a second zero and every arithmetic test downstream failed. Let grep print; ignore its status.
 faults(){ timeout 15 dmesg 2>/dev/null | tail -200 \
-          | grep -cE 'MES\(|GPU Hang|wait for reset ack|Memory access fault'; }
+          | grep -cE 'failed to respond to msg|GPU Hang|wait for reset ack|Memory access fault'; }
+# Unrecoverable only. The driver's reset failing to complete is what needed a reboot on
+# 2026-09-13; MES timeouts alone are a degraded card that still finishes kernels.
+hard_faults(){ timeout 15 dmesg 2>/dev/null | tail -400 \
+          | grep -cE 'wait for reset ack|ring gfx timeout|GPU reset begin'; }
 
 while true; do
-  T=$(now); F=$(faults); WEDGE=0
-  [ "${F:-0}" -gt 0 ] && WEDGE=1
+  T=$(now); F=$(faults); H=$(hard_faults); WEDGE=0; DEGRADED=0
+  [ "${F:-0}" -gt 0 ] && DEGRADED=1
+  [ "${H:-0}" -gt 0 ] && WEDGE=1
   rows=""
   # Iterate the map's own keys. A hardcoded GPU list plus `set -u` means retiring a stream
   # from the map kills the watchdog on its next cycle with "PHASE[0]: unbound variable" --
@@ -89,7 +94,7 @@ while true; do
   fi
 
   cat > "$STATUS" <<JSON
-{"t":$T,"iso":"$(date -Is)","dmesg_faults":${F:-0},"wedge":$WEDGE,
+{"t":$T,"iso":"$(date -Is)","dmesg_faults":${F:-0},"hard_faults":${H:-0},"degraded":$DEGRADED,"wedge":$WEDGE,
  "streams":[${rows%,}],
  "op_evolve":{"ref":"$oe_ref","state_age_s":$oe_age}}
 JSON
