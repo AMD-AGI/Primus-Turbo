@@ -2299,7 +2299,10 @@ def _build_mxfp4_gemm_kernel(
                 cst=_cst,
                 cst_gap=LDS_BN_HALF * 2,
                 cst_ilv=_BILV,
-                cst_nt=bool(_CST_AUX),  # the folded store's rows are whole lines, so nt costs no merge
+                # The folded store is whole lines either way, so `nt` only decides whether C
+                # lands in L2.  Letting it land drains the tile-end burst lazily instead of
+                # holding the wave, which the short-K rows feel and the long-K ones do not.
+                cst_nt=False,
                 split=(a_od6, bl_od6, br_od6, qu_a6, qu_b6) if const_expr(_ROWSPLIT) else None,
                 b_base_even=b_even6,
                 apre=_APRE,
