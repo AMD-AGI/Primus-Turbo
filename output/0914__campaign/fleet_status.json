@@ -1,3 +1,3 @@
-{"t":1789353841,"iso":"2026-09-14T02:44:02+00:00","dmesg_faults":0,"wedge":0,
- "streams":[{"gpu":2,"stream":"gate","state":"ok","ledger_age_s":110}],
- "op_evolve":{"ref":"gfx1250-attn-llama31-8b-bwd-20260914-015415","state_age_s":493}}
+{"t":1789354202,"iso":"2026-09-14T02:50:02+00:00","dmesg_faults":0,"wedge":0,
+ "streams":[{"gpu":2,"stream":"gate","state":"ok","ledger_age_s":111}],
+ "op_evolve":{"ref":"gfx1250-attn-llama31-8b-bwd-20260914-015415","state_age_s":854}}

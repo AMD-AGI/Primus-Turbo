@@ -187,3 +187,29 @@ MFMA 32x32x16 wave64 的 fragment 布局上（`warp_size = 64` 硬编码在
 从 `8 <= g` 放宽到 `1 <= g`，外加 dkdv 暂存循环的一个局部索引修正。它是门放宽，不是重构。
 而我们 G=4 目前正是被这个门拒掉的——也正因为这个意外的拒绝，昨天那个
 `>= (9,5)` 会放行 gfx1250 的 bug 才一直没在本机炸出来。
+
+## 10. 端到端阶梯 —— 5.5×，且 attention 的价值**终于可测**
+
+Llama-3.1-8B、MBS=GBS=4、seq 8192、单卡、AC=none、torchtitan 0.2.2、20 步，取后 8 步中位：
+
+| 配置 | tps | TFLOP/s | s/step | 峰值显存 |
+|---|--:|--:|--:|--:|
+| flex，eager（基线） | 2,392 | 138.5 | 13.70 | 380.1 GiB |
+| flex，compile 默认 | 2,294 | 132.8 | 14.28 | 260.6 |
+| flex，compile + Triton GEMM | 9,602 | 556.1 | 3.41 | 261.8 |
+| **turbo attention + compile + Triton GEMM** | **13,204** | **764.7** | **2.48** | 259.6 |
+
+**对自家基线 5.52×。其中 GEMM 修复 4.01×，turbo attention 再乘 1.375×。**
+
+patch 状态逐条核对过，不是靠配置文件推断的：
+`compile_mt` 那一跑日志里是 `[Patch] ⊘ Skipped: torchtitan.primus_turbo.turbo_attention
+(condition not met)` 且 `use_turbo_attention: False`——确为 flex 路径；
+`turbo_mt` 是 `[Patch] ✓ Applied: torchtitan.primus_turbo.turbo_attention`，13/13 全上。
+昨天的失败模式正是「patch 因缺依赖而静默失败、日志只说 patch failed」，所以这一步不能省。
+
+**这就是昨天拿不到的东西。** 昨天 attention 占一个 step 不到 1%（35.7 ms × 32 = 1.14 s
+of 133.7 s），所以 turbo 和 flex 落在 0.4% 以内，任何内核改动都既不能被证实也不能被证伪。
+GEMM 让出关键路径后，attention 变成了 **38% 的端到端杠杆**。
+
+日志里的 MFU（178% / 245%）是 torchtitan 对这颗芯片的 `peak_flops` 设小了——
+patch 列表里就有一个 `torchtitan.peak_flops`，值需要按 gfx1250 修正。不影响 tps。
