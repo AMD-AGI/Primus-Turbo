@@ -24,7 +24,6 @@ Two layers live here:
 Nothing here is wired into the dispatcher; ``attention_impl.py`` is untouched.
 """
 
-import contextlib
 import os
 from typing import Any, Dict, Optional, Tuple
 
@@ -57,34 +56,29 @@ def _is_fp8(x: torch.Tensor) -> bool:
 
 # Triton's AMD backend lowers a transposed dot operand either through LDS or, with this
 # knob, inside the thread's own registers. This kernel transposes on nearly every dot, and
-# in-thread measured 8.80 ms against 9.72 on the production shape -- 9.4% of the backward,
+# in-thread measured 8.89 ms against 9.77 on the production shape -- 9.0% of the backward,
 # with all four SQNR values unchanged. Found independently by an op-evolve round that
 # measured it at 5.9% on its own harness.
 #
-# Scoped around the launch rather than set at import, for the reason op-evolve documented:
-# the flag is read at COMPILE time and Triton reports it in
-# get_cache_invalidating_env_vars(), so a process-wide setting silently changes how every
-# other Triton kernel in the process compiles -- including, in a benchmark, the baseline it
-# is being compared against.
+# Set at IMPORT, not scoped around the launch, and that is a deliberate reversal.
+#
+# The scoped form was tried first, for the reason op-evolve documented: the flag is read at
+# COMPILE time, Triton reports it in get_cache_invalidating_env_vars(), and a process-wide
+# setting therefore changes how every other Triton kernel in the process compiles --
+# including, inside a benchmark, the baseline being compared against.
+#
+# It does not survive torch.compile. AOTAutograd traces the backward while compiling the
+# forward, so `os.environ[...] = ...` lands inside the traced graph and dynamo raises
+# "Attempted to call function marked as skipped: posix.putenv" -- fatally, and only in a
+# compiled model, which is why no unit test saw it. @torch.compiler.disable does not help
+# either: calling a disabled function from a traced autograd.Function is its own hard error.
+#
+# So the trade is: correctness under torch.compile, at the cost of the process-wide effect
+# op-evolve warned about. That warning is about a benchmark harness that loads two
+# implementations into one process; production loads one. A harness that needs the old
+# behaviour can export the variable explicitly, which is honoured below.
 _IN_THREAD_TRANSPOSE_ENV = "TRITON_HIP_USE_IN_THREAD_TRANSPOSE"
-
-
-@contextlib.contextmanager
-def _in_thread_transpose():
-    """Set the in-thread-transpose flag for the duration of one launch.
-
-    Honours an explicit setting from the caller: a user who has deliberately exported the
-    variable, or a sweep pinning it, keeps their value.
-    """
-    prev = os.environ.get(_IN_THREAD_TRANSPOSE_ENV)
-    if prev is not None:
-        yield
-        return
-    os.environ[_IN_THREAD_TRANSPOSE_ENV] = "1"
-    try:
-        yield
-    finally:
-        os.environ.pop(_IN_THREAD_TRANSPOSE_ENV, None)
+os.environ.setdefault(_IN_THREAD_TRANSPOSE_ENV, "1")
 
 
 def flash_attn_onekernel_backward(
@@ -293,63 +287,71 @@ def flash_attn_onekernel_backward(
 
     kernel = bwd_kernel_causal if causal else bwd_kernel_noncausal
     requested = dict(config_onekernel)  # the launch pops entries out of it
-    with _in_thread_transpose():
-        compiled = kernel[grid](
-            q,
-            k,
-            v,
-            sink,
-            sm_scale,
-            do,
-            dq,
-            dk,
-            dv,
-            dsink,
-            softmax_lse,
-            delta,
-            *q_strides,
-            *k_strides,
-            *v_strides,
-            *dq_strides,
-            *dk_strides,
-            *dv_strides,
-            *delta_strides,
-            *do_strides,
-            *dropout_strides,
-            *descale_strides,
-            stride_az,
-            stride_ah,
-            num_q_heads,
-            num_k_heads,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            dropout_mask,
-            dropout_p,
-            philox_seed,
-            philox_offset,
-            alibi_slopes,
-            descale_q,
-            descale_k,
-            descale_v,
-            descale_do,
-            HEAD_DIM=BLOCK_D_MODEL_POW2,
-            ACTUAL_HEAD_DIM=v_head_dim,
-            PE_HEAD_DIM=pe_head_dim,
-            ENABLE_DROPOUT=use_dropout,
-            IS_VARLEN=IS_VARLEN,
-            USE_ALIBI=use_alibi,
-            USE_EXP2=True,
-            IS_FP8=IS_FP8,
-            FP8_MAX=FP8_MAX,
-            DEBUG_TRITON=False,
-            DEBUG_TRITON_DETAIL=False,
-            USE_INT64_STRIDES=USE_INT64_STRIDES,
-            ENABLE_SINK=sink is not None,
-            SLIDING_WINDOW=sliding_window,
-            **config_onekernel,
-        )
+    # Dynamo refuses num_ctas as a direct launch kwarg -- "Passing num_ctas directly to the
+    # Triton kernel is not supported, please use a Config in @triton.autotune instead" -- and
+    # that refusal is fatal, so the whole backward is untraceable under torch.compile while
+    # it is passed. One is Triton's own default, so dropping it when it IS one changes
+    # nothing about the launch and costs nothing. A non-default value is still forwarded,
+    # and will still fail under compile, which is the honest behaviour: that case really is
+    # unsupported rather than silently ignored.
+    if config_onekernel.get("num_ctas") == 1:
+        config_onekernel = {k: v for k, v in config_onekernel.items() if k != "num_ctas"}
+    compiled = kernel[grid](
+        q,
+        k,
+        v,
+        sink,
+        sm_scale,
+        do,
+        dq,
+        dk,
+        dv,
+        dsink,
+        softmax_lse,
+        delta,
+        *q_strides,
+        *k_strides,
+        *v_strides,
+        *dq_strides,
+        *dk_strides,
+        *dv_strides,
+        *delta_strides,
+        *do_strides,
+        *dropout_strides,
+        *descale_strides,
+        stride_az,
+        stride_ah,
+        num_q_heads,
+        num_k_heads,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_mask,
+        dropout_p,
+        philox_seed,
+        philox_offset,
+        alibi_slopes,
+        descale_q,
+        descale_k,
+        descale_v,
+        descale_do,
+        HEAD_DIM=BLOCK_D_MODEL_POW2,
+        ACTUAL_HEAD_DIM=v_head_dim,
+        PE_HEAD_DIM=pe_head_dim,
+        ENABLE_DROPOUT=use_dropout,
+        IS_VARLEN=IS_VARLEN,
+        USE_ALIBI=use_alibi,
+        USE_EXP2=True,
+        IS_FP8=IS_FP8,
+        FP8_MAX=FP8_MAX,
+        DEBUG_TRITON=False,
+        DEBUG_TRITON_DETAIL=False,
+        USE_INT64_STRIDES=USE_INT64_STRIDES,
+        ENABLE_SINK=sink is not None,
+        SLIDING_WINDOW=sliding_window,
+        **config_onekernel,
+    )
     _verify_launch(compiled, requested)
 
     return delta

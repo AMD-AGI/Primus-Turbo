@@ -60,14 +60,21 @@ _TRACE = os.environ.get("PRIMUS_TURBO_ASM_FWD_TRACE", "") not in ("", "0")
 # load banner never appeared in any e2e log -- and then "no line" cannot be told apart from
 # "the gate was never called", which is the one thing the trace exists to answer.
 _TRACE_FILE = os.environ.get("PRIMUS_TURBO_ASM_FWD_TRACE_FILE", "")
+# Resolved at import: os.getpid() is a posix builtin dynamo cannot trace, and this
+# module is reached from inside an autograd.Function that torch.compile traces.
+_PID = os.getpid()
 _SEEN: set = set()
 
 
+
 def _say(msg: str, key: str) -> None:
+    # Folded away at trace time; see the note above _TRACE.
+    if torch.compiler.is_compiling():
+        return
     if not _TRACE or key in _SEEN:
         return
     _SEEN.add(key)
-    line = f"[asm_fwd] {msg} pid={os.getpid()}"
+    line = f"[asm_fwd] {msg} pid={_PID}"
     if _TRACE_FILE:
         try:
             with open(_TRACE_FILE, "a") as fh:

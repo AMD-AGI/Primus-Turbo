@@ -94,16 +94,20 @@ def _any_requires_grad(*tensors) -> bool:
 # never logs is either declining or never reached, and only this tells them apart. Under a
 # training launcher stdout is swallowed, so this writes to the file when one is named.
 _DISPATCH_TRACED = False
+_TRACE_PID = os.getpid()  # see attention_asm_fwd_impl: not traceable inside the Function
+
 
 
 def _trace_dispatch(backend, q, k, v) -> None:
     global _DISPATCH_TRACED
+    if torch.compiler.is_compiling():
+        return
     if _DISPATCH_TRACED or os.environ.get("PRIMUS_TURBO_ASM_FWD_TRACE", "") in ("", "0"):
         return
     _DISPATCH_TRACED = True
     line = (
         f"[dispatch] FlashAttnFunc backend={backend} q={tuple(q.shape)} "
-        f"k={tuple(k.shape)} dtype={q.dtype} pid={os.getpid()}"
+        f"k={tuple(k.shape)} dtype={q.dtype} pid={_TRACE_PID}"
     )
     path = os.environ.get("PRIMUS_TURBO_ASM_FWD_TRACE_FILE", "")
     if path:
