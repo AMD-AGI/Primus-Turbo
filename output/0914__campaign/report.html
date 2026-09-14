@@ -1,280 +1,349 @@
-<title>gfx1250 Attention Day Two</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap">
+<title>gfx1250 注意力优化 第二日</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=Noto+Serif+SC:wght@400;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
 <style>
   :root{
     --paper:#f7f5f1; --raised:#fffefc; --sunk:#efece6;
     --ink:#1b1916; --ink-2:#4a463f; --ink-3:#78726a;
     --rule:#ddd7cd; --rule-2:#c9c2b5;
-    --amber:#a8530b; --amber-soft:#f2e3d2;
+    --amber:#a8530b; --amber-soft:#f2e3d2; --on-amber:#fffdf9;
     --good:#2c6e3f; --good-soft:#dfeadf;
     --bad:#9b2c22; --bad-soft:#f4e0dc;
     --mono:"IBM Plex Mono",ui-monospace,Menlo,monospace;
-    --cond:"IBM Plex Sans Condensed",system-ui,sans-serif;
-    --serif:"Source Serif 4",Georgia,serif;
+    --sans:"Noto Sans SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+    --serif:"Noto Serif SC","Songti SC",Georgia,serif;
   }
-  :root:not([data-theme="light"]){ @media (prefers-color-scheme:dark){
-    --paper:#14130f; --raised:#1d1b16; --sunk:#0e0d0a;
-    --ink:#f0ece3; --ink-2:#b9b2a5; --ink-3:#8a8377;
-    --rule:#332f28; --rule-2:#474237;
-    --amber:#e0913f; --amber-soft:#3a2a17;
-    --good:#7fbb8e; --good-soft:#1d2a20;
-    --bad:#e08a7d; --bad-soft:#301c19;
-  }}
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --paper:#14130f; --raised:#1d1b16; --sunk:#0e0d0a;
+      --ink:#f0ece3; --ink-2:#b9b2a5; --ink-3:#8a8377;
+      --rule:#332f28; --rule-2:#474237;
+      --amber:#e0913f; --amber-soft:#3a2a17; --on-amber:#14130f;
+      --good:#7fbb8e; --good-soft:#1d2a20;
+      --bad:#e08a7d; --bad-soft:#301c19;
+    }
+  }
   :root[data-theme="dark"]{
     --paper:#14130f; --raised:#1d1b16; --sunk:#0e0d0a;
     --ink:#f0ece3; --ink-2:#b9b2a5; --ink-3:#8a8377;
     --rule:#332f28; --rule-2:#474237;
-    --amber:#e0913f; --amber-soft:#3a2a17;
+    --amber:#e0913f; --amber-soft:#3a2a17; --on-amber:#14130f;
     --good:#7fbb8e; --good-soft:#1d2a20;
     --bad:#e08a7d; --bad-soft:#301c19;
   }
   *{box-sizing:border-box}
   body{background:var(--paper);color:var(--ink);font-family:var(--serif);
-       font-size:17px;line-height:1.62;padding:0 20px;padding-block:0 72px;margin:0}
-  .wrap{max-width:820px;margin:0 auto}
-  .col{max-width:66ch}
-  h1,h2,h3{font-family:var(--cond);text-wrap:balance;margin:0;line-height:1.12}
-  h1{font-size:clamp(2.1rem,6vw,3.1rem);font-weight:700;letter-spacing:-.015em}
-  h2{font-size:1.55rem;font-weight:600;margin-top:3.2rem;letter-spacing:-.005em}
-  h3{font-size:1.08rem;font-weight:600;margin-top:2rem;color:var(--ink-2)}
-  p{margin:.85rem 0}
+       font-size:16.5px;line-height:1.85;margin:0;padding:0 20px;padding-block:0 72px}
+  .wrap{max-width:840px;margin:0 auto}
+  .col{max-width:40em}
+  h1,h2,h3{font-family:var(--sans);text-wrap:balance;margin:0;line-height:1.3}
+  h1{font-size:clamp(2rem,5.6vw,2.9rem);font-weight:700;letter-spacing:-.01em;line-height:1.18}
+  h2{font-size:1.5rem;font-weight:700;margin-top:3.4rem;margin-bottom:.2rem}
+  h3{font-size:1.06rem;font-weight:500;margin-top:2.1rem;margin-bottom:.1rem;color:var(--ink-2)}
+  p{margin:.8rem 0}
   a{color:var(--amber)}
-  .eyebrow{font-family:var(--cond);font-size:.76rem;font-weight:600;letter-spacing:.14em;
-           text-transform:uppercase;color:var(--amber);margin:0 0 .5rem}
-  .lede{font-size:1.16rem;color:var(--ink-2);margin-top:1rem}
-  header{border-bottom:2px solid var(--ink);padding-block:56px 22px;margin-bottom:8px}
-  .meta{display:flex;flex-wrap:wrap;gap:8px 26px;font-family:var(--mono);font-size:.78rem;
-        color:var(--ink-3);margin-top:1.4rem}
-  code,.m{font-family:var(--mono);font-size:.88em}
-  code{background:var(--sunk);padding:.08em .34em;border-radius:2px}
-  .num{font-variant-numeric:tabular-nums}
+  .eyebrow{font-family:var(--mono);font-size:.74rem;font-weight:600;letter-spacing:.1em;
+           text-transform:uppercase;color:var(--amber);margin:0 0 .7rem}
+  .lede{font-size:1.1rem;color:var(--ink-2);margin-top:1.1rem}
+  header{border-bottom:2px solid var(--ink);padding-block:56px 24px;margin-bottom:6px}
+  .meta{display:flex;flex-wrap:wrap;gap:8px 24px;font-family:var(--mono);font-size:.76rem;
+        color:var(--ink-3);margin-top:1.5rem}
+  code{font-family:var(--mono);font-size:.86em;background:var(--sunk);
+       padding:.1em .35em;border-radius:2px;word-break:break-word}
+  .m{font-family:var(--mono);font-size:.88em}
+  b,strong{font-weight:700}
 
-  /* ladder */
-  .ladder{display:flex;flex-direction:column;gap:3px;margin:1.6rem 0 .6rem}
-  .rung{display:grid;grid-template-columns:minmax(0,1fr) 88px;align-items:center;gap:14px}
-  .rung .bar{position:relative;height:40px;background:var(--sunk);overflow:hidden}
-  .rung .fill{position:absolute;inset:0 auto 0 0;background:var(--rule-2)}
+  .ladder{display:flex;flex-direction:column;gap:10px;margin:1.8rem 0 .5rem}
+  .rung .lab{font-family:var(--sans);font-size:.94rem;font-weight:500;
+             display:flex;justify-content:space-between;gap:14px;align-items:baseline;
+             margin-bottom:5px}
+  .rung .lab .v{font-family:var(--mono);font-weight:600;white-space:nowrap;
+                font-variant-numeric:tabular-nums}
+  .rung .track{height:16px;background:var(--sunk)}
+  .rung .fill{height:100%;background:var(--rule-2)}
   .rung.win .fill{background:var(--amber)}
-  .rung .lab{position:relative;padding:0 12px;line-height:40px;font-family:var(--cond);
-             font-size:.92rem;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .rung.win .lab{color:#fff}
-  :root[data-theme="dark"] .rung.win .lab{color:#14130f}
-  @media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .rung.win .lab{color:#14130f}}
-  .rung .val{font-family:var(--mono);font-size:.92rem;font-weight:600;text-align:right}
-  .cap{font-size:.86rem;color:var(--ink-3);margin-top:.3rem}
+  .rung.win .lab{color:var(--amber)}
+  .cap{font-size:.84rem;color:var(--ink-3);margin-top:.7rem;line-height:1.7}
 
-  table{border-collapse:collapse;width:100%;font-size:.92rem;margin:1.1rem 0}
-  .scroll{overflow-x:auto}
-  th,td{text-align:left;padding:.5rem .7rem;border-bottom:1px solid var(--rule);vertical-align:top}
-  th{font-family:var(--cond);font-size:.78rem;font-weight:600;letter-spacing:.07em;
-     text-transform:uppercase;color:var(--ink-3);border-bottom:1px solid var(--rule-2)}
+  .scroll{overflow-x:auto;margin:1.2rem 0}
+  table{border-collapse:collapse;width:100%;font-size:.9rem;line-height:1.7}
+  th,td{text-align:left;padding:.55rem .7rem;border-bottom:1px solid var(--rule);vertical-align:top}
+  th{font-family:var(--sans);font-size:.78rem;font-weight:700;color:var(--ink-3);
+     border-bottom:1px solid var(--rule-2);white-space:nowrap}
   td.n{font-family:var(--mono);text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
   tr.hi td{background:var(--amber-soft)}
 
-  .tag{font-family:var(--cond);font-size:.7rem;font-weight:600;letter-spacing:.08em;
-       text-transform:uppercase;padding:.16em .5em;border-radius:2px;white-space:nowrap}
+  .tag{display:inline-block;font-family:var(--sans);font-size:.72rem;font-weight:700;
+       padding:.16em .55em;border-radius:2px;white-space:nowrap;line-height:1.5}
   .tag.ok{background:var(--good-soft);color:var(--good)}
   .tag.no{background:var(--bad-soft);color:var(--bad)}
-  .tag.wait{background:var(--sunk);color:var(--ink-3)}
 
-  .traps{list-style:none;padding:0;margin:1.2rem 0;counter-reset:t}
-  .traps li{counter-increment:t;display:grid;grid-template-columns:34px minmax(0,1fr);
-            gap:14px;padding:.85rem 0;border-top:1px solid var(--rule)}
+  .traps{list-style:none;padding:0;margin:1.4rem 0;counter-reset:t}
+  .traps li{counter-increment:t;display:grid;grid-template-columns:36px minmax(0,1fr);
+            gap:14px;padding:.9rem 0;border-top:1px solid var(--rule)}
   .traps li::before{content:counter(t,decimal-leading-zero);font-family:var(--mono);
-                    font-size:.82rem;font-weight:600;color:var(--amber);padding-top:.18em}
-  .traps b{font-family:var(--cond);font-weight:600;font-size:1rem;display:block;margin-bottom:.15rem}
-  .traps span{color:var(--ink-2);font-size:.94rem}
+                    font-size:.8rem;font-weight:600;color:var(--amber);padding-top:.45em}
+  .traps b{font-family:var(--sans);font-weight:700;font-size:1rem;display:block;margin-bottom:.2rem}
+  .traps span{color:var(--ink-2);font-size:.92rem;line-height:1.8}
 
-  .note{border-left:3px solid var(--amber);background:var(--raised);padding:.9rem 1.1rem;
-        margin:1.4rem 0;font-size:.96rem}
-  .note b{font-family:var(--cond)}
+  .note{border-left:3px solid var(--amber);background:var(--raised);
+        padding:1rem 1.2rem;margin:1.6rem 0;font-size:.95rem;line-height:1.8}
+  .note p{margin:0}
+  .note p + p{margin-top:.6rem}
 
-  .plan{display:grid;gap:2px;margin:1.2rem 0}
-  .plan .row{display:grid;grid-template-columns:26px minmax(0,1fr) auto;gap:14px;
-             align-items:baseline;padding:.8rem .9rem;background:var(--raised);
+  .plan{display:flex;flex-direction:column;gap:3px;margin:1.4rem 0}
+  .plan .row{display:grid;grid-template-columns:30px minmax(0,1fr) auto;gap:16px;
+             align-items:baseline;padding:.9rem 1rem;background:var(--raised);
              border:1px solid var(--rule)}
-  .plan .row .k{font-family:var(--mono);font-size:.8rem;color:var(--amber);font-weight:600}
-  .plan .row .t{font-family:var(--cond);font-weight:600;font-size:1rem}
-  .plan .row .d{color:var(--ink-2);font-size:.92rem;margin-top:.2rem}
-  .plan .row .g{font-family:var(--mono);font-size:.84rem;color:var(--ink-3);white-space:nowrap}
-  @media (max-width:560px){
-    .plan .row{grid-template-columns:22px minmax(0,1fr)}
-    .plan .row .g{grid-column:2;margin-top:.35rem}
-    .rung{grid-template-columns:minmax(0,1fr) 72px}
+  .plan .k{font-family:var(--mono);font-size:.8rem;color:var(--amber);font-weight:600}
+  .plan .t{font-family:var(--sans);font-weight:700;font-size:1rem;line-height:1.5}
+  .plan .d{color:var(--ink-2);font-size:.91rem;margin-top:.35rem;line-height:1.8}
+  .plan .g{font-family:var(--mono);font-size:.8rem;color:var(--ink-3);white-space:nowrap}
+  @media (max-width:600px){
+    .plan .row{grid-template-columns:26px minmax(0,1fr)}
+    .plan .g{grid-column:2;margin-top:.5rem}
   }
-  footer{margin-top:3.5rem;padding-top:1.2rem;border-top:1px solid var(--rule);
-         font-family:var(--mono);font-size:.78rem;color:var(--ink-3)}
+  footer{margin-top:3.6rem;padding-top:1.2rem;border-top:1px solid var(--rule);
+         font-family:var(--mono);font-size:.76rem;color:var(--ink-3);line-height:2}
 </style>
 
 <div class="wrap">
 <header>
-  <p class="eyebrow">Primus-Turbo &middot; gfx1250 &middot; 2026-09-14</p>
-  <h1>Attention, Day Two</h1>
-  <p class="lede col">A 1.27&times; day on the op, two real <code>torch.compile</code> bugs found, two
-  research routes closed with compile-time proof — and nine investigations whose root cause turned
-  out to be the measuring apparatus rather than the code under test.</p>
+  <p class="eyebrow">Primus-Turbo · gfx1250 · 2026-09-14</p>
+  <h1>注意力优化 第二日</h1>
+  <p class="lede col">算子层 1.27×，找出两个 <code>torch.compile</code> 下的真 bug，
+  用编译期证据关掉两条研究路线——以及九次根因落在<strong>测量装置本身</strong>、
+  而非被测代码上的调查。</p>
   <div class="meta">
-    <span>host ctheliosp-1b112-a37-1</span><span>4&times; gfx1250 &middot; 2133–2244 MHz</span>
-    <span>b4 s8192 hq32 hkv8 d128 bf16 causal</span><span>13 commits, branch-local</span>
+    <span>host ctheliosp-1b112-a37-1</span><span>4× gfx1250 · 2133–2244 MHz</span>
+    <span>b4 s8192 hq32 hkv8 d128 bf16 causal</span><span>19 commits · 未 push</span>
   </div>
 </header>
 
-<h2>Where the op landed</h2>
-<p class="col">Every rung passed the same three gates: four-tensor SQNR ≥ 50 dB against an fp32
-reference, 51/51 of the gfx1250 suite green, and a &gt; 2 % win on the production shape measured
-against the standing champion.</p>
+<h2>算子层成绩</h2>
+<p class="col">每一级都过了同样三道门：四张量 SQNR 对 fp32 参考 ≥ 50 dB、gfx1250 测试 51/51 全绿、
+在生产形状上比当时的冠军好 &gt; 2%。</p>
 
 <div class="ladder">
-  <div class="rung"><div class="bar"><div class="fill" style="width:100%"></div><div class="lab">Yesterday's champion, scaled to this clock</div></div><div class="val">13.000</div></div>
-  <div class="rung"><div class="bar"><div class="fill" style="width:95.5%"></div><div class="lab">+ waves_per_eu unset, forward num_warps 2</div></div><div class="val">12.412</div></div>
-  <div class="rung"><div class="bar"><div class="fill" style="width:86.1%"></div><div class="lab">+ aiter prebuilt gfx1250 ASM forward</div></div><div class="val">11.198</div></div>
-  <div class="rung win"><div class="bar"><div class="fill" style="width:78.7%"></div><div class="lab">+ in-thread transpose lowering</div></div><div class="val">10.235</div></div>
+  <div class="rung">
+    <div class="lab"><span>昨日冠军（折算到本机时钟）</span><span class="v">13.000 ms</span></div>
+    <div class="track"><div class="fill" style="width:100%"></div></div>
+  </div>
+  <div class="rung">
+    <div class="lab"><span>＋ <code>waves_per_eu</code> 不设、前向 <code>num_warps=2</code></span><span class="v">12.412 ms</span></div>
+    <div class="track"><div class="fill" style="width:95.5%"></div></div>
+  </div>
+  <div class="rung">
+    <div class="lab"><span>＋ aiter 预编译 gfx1250 ASM 前向</span><span class="v">11.198 ms</span></div>
+    <div class="track"><div class="fill" style="width:86.1%"></div></div>
+  </div>
+  <div class="rung win">
+    <div class="lab"><span>＋ in-thread transpose 下降方式</span><span class="v">10.235 ms</span></div>
+    <div class="track"><div class="fill" style="width:78.7%"></div></div>
+  </div>
 </div>
-<p class="cap">Total fwd + bwd, milliseconds. Bars to scale. The pure-aiter reference that stood as
-an upper bound since yesterday is 11.269 ms — passed at rung three.</p>
+<p class="cap">前向＋反向总时，条形按比例。昨天立下的「纯 aiter 调优」参考上界是 11.269 ms，
+在第三级就被越过了。</p>
 
 <div class="scroll"><table>
-  <thead><tr><th>Stage</th><th class="n">fwd</th><th class="n">bwd</th><th class="n">total</th><th class="n">TFLOP/s</th><th>commit</th></tr></thead>
+  <thead><tr><th>阶段</th><th class="n">fwd</th><th class="n">bwd</th><th class="n">total</th><th class="n">TFLOP/s</th><th>commit</th></tr></thead>
   <tbody>
-    <tr><td>Yesterday, at this clock</td><td class="n">—</td><td class="n">—</td><td class="n">13.000</td><td class="n">592</td><td class="m">—</td></tr>
-    <tr><td>Two knobs yesterday called dead</td><td class="n">2.579</td><td class="n">9.867</td><td class="n">12.412</td><td class="n">620</td><td class="m">566e7798</td></tr>
-    <tr><td>ASM forward via the dispatcher</td><td class="n">1.410</td><td class="n">9.786</td><td class="n">11.198</td><td class="n">687</td><td class="m">0e5cb743</td></tr>
-    <tr class="hi"><td><b>In-thread transpose</b></td><td class="n">1.396</td><td class="n">8.840</td><td class="n">10.235</td><td class="n">752</td><td class="m">a009599b</td></tr>
+    <tr><td>昨日冠军（折算）</td><td class="n">—</td><td class="n">—</td><td class="n">13.000</td><td class="n">592</td><td class="m">—</td></tr>
+    <tr><td>两个昨天被判死的旋钮</td><td class="n">2.579</td><td class="n">9.867</td><td class="n">12.412</td><td class="n">620</td><td class="m">566e7798</td></tr>
+    <tr><td>ASM 前向接入 dispatcher</td><td class="n">1.410</td><td class="n">9.786</td><td class="n">11.198</td><td class="n">687</td><td class="m">0e5cb743</td></tr>
+    <tr class="hi"><td><b>in-thread transpose</b></td><td class="n">1.396</td><td class="n">8.840</td><td class="n">10.235</td><td class="n">752</td><td class="m">a009599b</td></tr>
   </tbody>
 </table></div>
 
-<div class="note"><b>The contention worry did not materialise.</b> Every figure above was taken with
-all four cards loaded. Re-measured at day's end on a quiet GPU1: <span class="m num">10.235 ms /
-752.0 TFLOP/s</span> — 0.6 % from the loaded number. Four-card load widened the <em>spread</em> of any
-single run (one config was seen at both 11.2 and 17.1 ms) without moving the median. Interleaved
-A/B plus best-of-N did the job it was there to do.</p></div>
+<div class="note">
+  <p><b>对「四卡满载压低了数字」的担心没有成立。</b>上表全部在四卡满载下测得。
+  收尾时在安静的 GPU1 上复测：<span class="m">10.235 ms / 752.0 TFLOP/s</span>，与满载下只差 0.6%。</p>
+  <p>四卡满载确实让单次测量的<strong>离散度</strong>变大——同一配置见过 11.2 和 17.1 ms——
+  但<strong>中位数没有被系统性压低</strong>。「交替 A/B ＋ best-of-N」这套做法挡住了竞争的影响，
+  它做到了它该做的事。</p>
+</div>
 
-<h3>Where the win came from</h3>
-<p class="col"><code>waves_per_eu</code> unset is worth 4.2 % and yesterday's grid was not wrong
-about it — a 64-config sweep really did move the instruction count by a median of 0.00 %. The win
-simply is not in the instruction count; it is in the occupancy the backend picks when you stop
-constraining it, and at 1100 MHz there was not enough memory latency to hide for that to matter.
-It is a narrow well, not a slope: <code>waves_per_eu=2</code> measures 49.7 ms and <code>=3</code>
-measures 78.7 ms.</p>
-<p class="col">In-thread transpose lowering came from the op-evolve loop running unattended on
-GPU1, which measured it at 5.9 % on its own harness in its own process. The same round
-rediscovered <code>waves_per_eu</code> independently. Two harnesses agreeing on a knob is worth
-more than either result alone.</p>
+<h3>收益来自哪里</h3>
+<p class="col"><code>waves_per_eu</code> 不设值 4.2%，而昨天的网格并没有测错——
+64 个配置的指令数中位变化确实是 0.00%。收益不在指令数上，而在
+<strong>你不再约束占用率时后端自己选的那个值</strong>；1100 MHz 下没有足够的访存延迟需要隐藏，
+所以它在限频态确实一文不值。它是一口窄井而不是一条斜坡：
+<code>waves_per_eu=2</code> 是 49.7 ms，<code>=3</code> 是 78.7 ms。</p>
+<p class="col">in-thread transpose 来自在 GPU1 上无人值守运行的 op-evolve 循环，
+它在自己的 harness、自己的进程里测出 5.9%。同一轮还独立重新发现了 <code>waves_per_eu</code>。
+<strong>两套互不共享的 harness 在同一个旋钮上吻合，比任何一边单独的结果都值钱。</strong></p>
 
-<h2>Two real bugs in shipped code</h2>
-<p class="col">The vendored fused backward <strong>could not run under <code>torch.compile</code> at
-all</strong>. Two independent hard failures, neither a soft graph break:</p>
+<h2>产品代码里的两个真 bug</h2>
+<p class="col">树内的融合反向<strong>此前完全无法在 <code>torch.compile</code> 下运行</strong>。
+两个互相独立的硬失败，都不是软 graph break：</p>
 <div class="scroll"><table>
-  <thead><tr><th>Failure</th><th>Why it was invisible</th></tr></thead>
+  <thead><tr><th>失败</th><th>为什么一直没被发现</th></tr></thead>
   <tbody>
-    <tr><td><code>os.environ</code> write on the launch path</td><td>AOTAutograd traces the backward while compiling the forward, so the write lands inside the traced graph — <code>posix.putenv</code> is unsupported</td></tr>
-    <tr><td><code>num_ctas</code> passed as a launch kwarg</td><td>dynamo rejects it outright; <code>num_ctas=1</code> is Triton's own default, so dropping the key changes nothing</td></tr>
+    <tr><td><code>os.environ</code> 写在启动路径上</td>
+        <td>AOTAutograd 在编译前向时会追踪反向，于是这个写落进被追踪的图里，<code>posix.putenv</code> 不被支持</td></tr>
+    <tr><td><code>num_ctas</code> 直接作为 launch kwarg 传入</td>
+        <td>dynamo 直接拒绝；而 <code>num_ctas=1</code> 本就是 Triton 的默认值，等于 1 时不传，行为完全不变</td></tr>
   </tbody>
 </table></div>
-<p class="col">Both survived because the two gates have complementary blind spots: the 51 tests do
-not compile the model, and the end-to-end config carried <code>converters: []</code>, which meant
-TurboAttention was never installed and the fused backward was never on the training path.
-<strong>"torch.compile on" and "the fused backward actually running" had not been true at the same
-time until today.</strong> Fixed in <span class="m">ad67a2cc</span>.</p>
+<p class="col">两者能存活是因为两道门的盲区正好错开：51 个测试<strong>不编译模型</strong>，
+而端到端配置里的 <code>converters: []</code> 让 TurboAttention 从未被装上、融合反向从未进入训练路径。
+<strong>「torch.compile 开着」和「融合反向真的在跑」这两件事，在今天之前从未同时成立过。</strong>
+已在 <span class="m">ad67a2cc</span> 修复。</p>
 
-<h2>Platform findings that overturn yesterday</h2>
+<h2>推翻昨天的平台级结论</h2>
 <div class="scroll"><table>
-  <thead><tr><th>Yesterday</th><th>Measured today</th><th></th></tr></thead>
+  <thead><tr><th style="width:26%">昨天的说法</th><th>今天的实测</th><th></th></tr></thead>
   <tbody>
-    <tr><td>Missing gfx1250 BLAS, ~37&times; off</td><td>The library is present (46 bf16 Tensile solutions). hipBLASLt is simply <b>10.5&times; slow</b> — 113.0 TFLOP/s against a naive Triton GEMM's 1190.1 on the same tensors, same process, <code>max_abs_err 0.0</code>. Neither the load path nor <code>TORCH_BLAS_PREFER_HIPBLASLT</code> moves it by 1 %.</td><td><span class="tag no">refuted</span></td></tr>
-    <tr><td>VR throttle worth 1.65&times;</td><td><b>~1.95&times;</b> (five like-for-like rows, median 1.93). Every ceiling divides by 2.136: the 7-GEMM floor 7.68 → 3.59 ms, the "real wall" 9.2–9.9 → 4.31–4.63 ms.</td><td><span class="tag no">revised</span></td></tr>
-    <tr><td>E4 <code>num_warps=8</code> is the highest-value untested item</td><td><b>2.36&times; slower.</b> The offline ISA screen predicted VGPR dropping from a pinned 1024 to 512 with 3.2&times; fewer bank-select instructions; measured, the extra spill dominates. The register-pressure thesis for this kernel is dead.</td><td><span class="tag no">refuted</span></td></tr>
-    <tr><td>T7 blocked on a <code>jax</code> import</td><td>No such import exists. The ASM forward is 1.82&times; ours, and gqa=4 — untested upstream — is clean: per-head SQNR spans 53.54–53.72 dB across all 32 heads.</td><td><span class="tag ok">shipped</span></td></tr>
+    <tr><td>缺失 gfx1250 BLAS，慢约 37×</td>
+        <td>库<strong>在</strong>（46 个 bf16 Tensile 解）。hipBLASLt 只是<strong>慢 10.5×</strong>——同进程、同张量下
+        113.0 TFLOP/s 对一个朴素 Triton GEMM 的 1190.1，<code>max_abs_err 0.0</code>。
+        调整加载路径、翻转 <code>TORCH_BLAS_PREFER_HIPBLASLT</code>，三种组合的差异都在 1% 以内。</td>
+        <td><span class="tag no">推翻</span></td></tr>
+    <tr><td>VR 限频代价 1.65×</td>
+        <td><strong>约 1.95×</strong>（五行 like-for-like，中位 1.93）。所有天花板除以 2.136：
+        7-GEMM 下界 7.68 → <strong>3.59 ms</strong>，「真实墙」9.2–9.9 → <strong>4.31–4.63 ms</strong>。</td>
+        <td><span class="tag no">修正</span></td></tr>
+    <tr><td>E4 <code>num_warps=8</code> 是最高价值未测项</td>
+        <td><strong>慢 2.36×。</strong>离线 ISA 筛预测它能把 VGPR 从顶满的 1024 降到 512、
+        bank-select 指令少 3.2 倍；实测 spill 代价压倒收益。
+        这个内核的寄存器压力假说到此为止。</td>
+        <td><span class="tag no">推翻</span></td></tr>
+    <tr><td>T7 被 <code>jax</code> 导入阻塞</td>
+        <td>不存在这个 import。ASM 前向是树内的 <strong>1.82×</strong>；
+        上游从未测过的 gqa=4 也是干净的——32 个 query head 的 SQNR 落在 53.54–53.72 dB 的均匀带里。</td>
+        <td><span class="tag ok">已上线</span></td></tr>
   </tbody>
 </table></div>
-<p class="col"><strong>A platform-level consequence:</strong> on gfx1250, <code>torch.compile</code>
-alone is a 4 % <em>loss</em> — inductor leaves matmuls on <code>aten.mm</code>. Pinning the GEMM
-backend to Triton at the same time gives 4.01&times; end-to-end. Turning compile on without that
-pin is worse than leaving it off.</p>
+<p class="col"><strong>一条平台级推论：</strong>在 gfx1250 上，单独打开 <code>torch.compile</code>
+是 <strong>4% 的负收益</strong>——inductor 会把 matmul 留在 <code>aten.mm</code> 上。
+必须同时把 GEMM 后端钉死到 Triton，端到端才有 4.01×。
+只开 compile 不钉后端，比不开还差。</p>
 
-<h2>Routes closed, with proof</h2>
+<h2>两条已判死的路线</h2>
 <div class="scroll"><table>
-  <thead><tr><th>Route</th><th>Verdict</th><th>Evidence</th></tr></thead>
+  <thead><tr><th style="width:14%">路线</th><th style="width:12%">判定</th><th>证据</th></tr></thead>
   <tbody>
-    <tr><td>HipKittens udna1</td><td><span class="tag no">red</span></td><td>Not where predicted. <code>transpose</code> compiles and is structurally sound — its row/col layouts really are exact duals on wave32, 4608 triples checked, 0 violations. The wall is three compile-time facts: <code>reductions.cuh</code> cannot compile at all (<code>permlane32_swap</code> is gfx950-only, 7 call sites), only <code>mma_ABt</code> of three matrix entry points survives, and <code>swap_layout</code> provably covers half its registers on wave32 while being mandatory on the transpose→mma path. The GPU gate agrees: 126 of 256 elements wrong.</td></tr>
-    <tr><td>FlyDSL</td><td><span class="tag no">blocked</span></td><td>The toolchain gate is open — 0.2.4 does expose <code>tdm_ops</code>, <code>s_wait_tensorcnt</code>, <code>ds_load_tr16_b128</code>, contrary to yesterday's note — and the gfx950 forward builds and lowers through MLIR for gfx1250 after a one-line flip. But gfx1250 has <b>no MFMA</b>: <code>mfma.f32.32x32x16.bf16</code>, <code>ds.read.tr16.b64</code> and <code>permlane32.swap</code> all select on gfx950 and all give <i>Cannot select</i> on gfx1250. The schedule table is derived from the MFMA wave64 fragment map, so this is the rewrite class. 18–36 engineer-days confirmed.</td></tr>
+    <tr><td>HipKittens udna1</td><td><span class="tag no">RED</span></td>
+        <td>红在预测之外。<code>transpose</code> 本身能编译、结构上也是对的——
+        行/列寄存器布局在 wave32 下确实是精确对偶，离线穷举 4608 个三元组、0 处违例。
+        真正的墙是三条<strong>编译期</strong>事实：<code>reductions.cuh</code> 完全编不过
+        （<code>permlane32_swap</code> 是 gfx950 独有，7 个调用点）；
+        三个矩阵入口只有 <code>mma_ABt</code> 存活；
+        <code>swap_layout</code> 在 wave32 下可证明只覆盖一半寄存器，而它在 transpose→mma 路径上是必经的。
+        GPU gate 给出同样结论：256 个元素错 126 个。</td></tr>
+    <tr><td>FlyDSL</td><td><span class="tag no">BLOCKED</span></td>
+        <td>工具链门是开的——0.2.4 确实暴露了 <code>tdm_ops</code>、<code>s_wait_tensorcnt</code>、
+        <code>ds_load_tr16_b128</code>，与昨天的记录相反——gfx950 前向翻一行 arch 门后也能一路 build 并 lower 过 MLIR。
+        但 gfx1250 <strong>根本没有 MFMA</strong>：<code>mfma.f32.32x32x16.bf16</code>、
+        <code>ds.read.tr16.b64</code>、<code>permlane32.swap</code> 在 gfx950 全部选中，
+        在 gfx1250 全部 <i>Cannot select</i>。
+        调度表是从 MFMA wave64 的 fragment 布局推出来的，所以这属于「重写」而非「替换」。
+        18–36 工程日的估算确证。</td></tr>
   </tbody>
 </table></div>
 
-<h2>Nine investigations, nine measurement bugs</h2>
-<p class="col">Every time something "should have had an effect and didn't", the cause was in the
-measurement or orchestration chain — not once in the change under test. Ordered by time cost.</p>
+<h2>九次调查，九次测量问题</h2>
+<p class="col">每一次「改动应该有效果却没有」，根因都在测量或编排链路上，
+<strong>没有一次在被测的改动上</strong>。按消耗的时间排序。</p>
 
 <ol class="traps">
-  <li><b>The end-to-end runs measured the image's package, not the checkout</b><span>An editable install registers a MetaPathFinder through a <code>.pth</code>, and <code>sys.meta_path</code> is consulted before <code>sys.path</code> — so <code>PYTHONPATH</code> cannot shadow it. It was correct in every log the whole time.</span></li>
-  <li><b>Three cards idle for hours, invisible to the monitor</b><span>Liveness read the ledger's mtime, and an exhausted sweep still appends a completion line every cycle. The proxy said fresh forever. The operator noticed; the monitoring did not.</span></li>
-  <li><b>"All four cards are dead"</b><span>From a matmul with a 150 s timeout. A cold process spends ~78 s in HIP init and allocation before the first kernel. Phase-separated, the steady state is 0.0011 s — one card was dead, three were fine.</span></li>
-  <li><b>An orphaned loop fed a degraded card for 2 h 15 m</b><span>A background <code>bash</code> respawner with <code>ppid=1</code>. Three cleanups killed only its children; each reappearance was misread as "the kill pattern missed".</span></li>
-  <li><b>The ASM path "never ran"</b><span>Concluded from an absent vendor log banner. The launcher exports <code>AITER_LOG_LEVEL=ERROR</code>, which suppresses it. Absence was never evidence.</span></li>
-  <li><b>Three probe designs each killed the training run</b><span>Inside a traced <code>autograd.Function</code>, <code>os.getpid()</code>, <code>open()</code> and a <code>@torch.compiler.disable</code>d call are all fatal. A diagnostic that decides whether the program runs is not a diagnostic.</span></li>
-  <li><b>Contention produced false SQNR failures</b><span>Same config, same seed: 42–48 dB contended, 53.7–53.9 dB clean. The accuracy gate is the only correctness defence, and a false failure there discards a good config.</span></li>
-  <li><b>A sweep that ran 40 rounds doing nothing</b><span>The idempotence tag carried a round number, so it was never "already done" — once the grid was exhausted the queue re-ran that one candidate forever, looking busy.</span></li>
-  <li><b>Shell traps, four of them</b><span><code>pkill -f</code> matching the caller's own command line (four separate shells lost); <code>timeout 5 kill -0</code> running <code>/bin/kill</code> instead of the builtin; <code>kill -0</code>'s EPERM swallowed by <code>2&gt;/dev/null</code> and read as "no such process"; <code>grep -c</code> printing <code>0</code> <em>and</em> exiting 1, so <code>|| echo 0</code> yields <code>"0\n0"</code>.</span></li>
+  <li><b>所有端到端跑的都是镜像里的包，不是 checkout</b><span>editable 安装通过 <code>.pth</code> 注册了 MetaPathFinder，而 <code>sys.meta_path</code> 的查询先于 <code>sys.path</code>，所以 <code>PYTHONPATH</code> 根本压不过它。而它在每一条日志里都显示正确。</span></li>
+  <li><b>三张卡闲置数小时，监控看不见</b><span>活性判断读的是 ledger 文件的 mtime，而网格跑完的队列每轮仍会追加一行完成标记。代理永远显示「新鲜」。是操作者一眼看出来的，不是监控报出来的。</span></li>
+  <li><b>「四张卡全死了」</b><span>来自一个 150 秒超时的 matmul。一个冷进程要花约 78 秒在 HIP 初始化和分配上才轮到第一个内核。分阶段测量后，稳态是 0.0011 秒——死的是一张卡，另外三张好好的。</span></li>
+  <li><b>一个孤儿循环给降级的卡喂了 2 小时 15 分</b><span>一个 <code>ppid=1</code> 的后台 bash 重生循环。三次清理都只杀掉了它的子进程，而每次「又出现了」都被误判成「kill 的模式没匹配上」。</span></li>
+  <li><b>ASM 路径「从未被走到」</b><span>依据是日志里没有厂商的加载横幅。而 launcher 导出了 <code>AITER_LOG_LEVEL=ERROR</code>，把它压掉了。缺席从来就不是证据。</span></li>
+  <li><b>三个探针设计各自弄挂了训练</b><span>在被追踪的 <code>autograd.Function</code> 里，<code>os.getpid()</code>、<code>open()</code>、以及调用 <code>@torch.compiler.disable</code> 的函数，三者都是致命错误。会改变程序能否运行的诊断不是诊断。</span></li>
+  <li><b>抢卡会产生假的 SQNR 失败</b><span>同一配置、同一随机种子：抢卡时 42–48 dB，干净时 53.7–53.9 dB。SQNR 门是唯一的正确性防线，一次假失败就会让你丢掉一个好配置。</span></li>
+  <li><b>一个扫描空转了 40 轮</b><span>幂等 tag 里带了轮次号，于是它永远不是「已完成」——网格跑完后队列就只重复那一个候选，还一直看起来很忙。</span></li>
+  <li><b>四个 shell 陷阱</b><span><code>pkill -f</code> 会匹配到调用者自己的命令行（丢了四个 shell）；<code>timeout 5 kill -0</code> 跑的是 <code>/bin/kill</code> 而非 shell 内建，语义不同；<code>kill -0</code> 的 EPERM 被 <code>2&gt;/dev/null</code> 吞掉、读成了「进程不存在」；<code>grep -c</code> 无匹配时既打印 <code>0</code> 又返回退出码 1，于是 <code>|| echo 0</code> 产生 <code>"0\n0"</code>。</span></li>
 </ol>
 
-<div class="note"><b>The rule that would have prevented most of this:</b> before trusting any
-"is X working" signal, ask whether X can be measured directly. It usually can, and usually faster
-than building the proxy. All of this is now in the <code>gpu-kernel-campaign</code> skill.</div>
-
-<h2>Machine state at handover</h2>
-<div class="scroll"><table>
-  <thead><tr><th>Card</th><th>State</th><th class="n">4096³ bf16</th><th>Note</th></tr></thead>
-  <tbody>
-    <tr><td class="m">GPU0</td><td><span class="tag no">out</span></td><td class="n">timeout</td><td>All 120 <code>MES failed to respond</code> lines are on its PCI address; faults begin at uptime 14647, long before today's work</td></tr>
-    <tr><td class="m">GPU1</td><td><span class="tag ok">healthy</span></td><td class="n">124.8 TFLOP/s</td><td>ran the closing re-measurement</td></tr>
-    <tr><td class="m">GPU2</td><td><span class="tag ok">healthy</span></td><td class="n">123.9 TFLOP/s</td><td></td></tr>
-    <tr><td class="m">GPU3</td><td><span class="tag ok">healthy</span></td><td class="n">122.0 TFLOP/s</td><td></td></tr>
-  </tbody>
-</table></div>
-<p class="col"><code>wait for reset ack</code> — the line that forced the reboot on 2026-09-13 — was
-absent all day. <strong>No reboot is indicated; drop GPU0 from scheduling and use the other
-three.</strong> All schedulers are stopped, all sentinels cleared, op-evolve stopped at a module
-boundary with its artifacts intact and resumable.</p>
-
-<h3>One thing left unexplained</h3>
-<p class="col"><code>torch.cuda.init()</code> takes 58–172 s and scales with concurrent GPU
-processes, where it should take seconds. It sets the floor on measurement throughput — every run
-today paid ~78 s before its first kernel. Three experiments each killed one hypothesis:
-<code>AMD_LOG_LEVEL=3</code> shows the runtime's entire log spanning <b>141 milliseconds</b>, so it
-is not the ROCm runtime; <code>ROCR_VISIBLE_DEVICES</code> (which filters before enumeration and
-never touches GPU0) saves only 18 %, so it is not mainly the dead card; and three consecutive
-inits in one container give 157/130/172 s with no warming, so it is not cold library loading.
-What is left is kernel-side KFD context creation, serialised behind other processes.</p>
-
-<h2>Tomorrow, in order</h2>
-<div class="plan">
-  <div class="row"><div class="k">01</div><div><div class="t">Time <code>torch.cuda.init()</code> immediately after any reboot</div><div class="d">Seconds means GPU0's MES faults were dragging the whole driver — a hard basis for the reboot question that every judgement today only inferred. Still minutes means it is inherent to the image, and the fix is a resident worker pool instead of a fresh process per candidate.</div></div><div class="g">15 min · decides the day's throughput</div></div>
-
-  <div class="row"><div class="k">02</div><div><div class="t">Three-card cross-calibration on GPU1/2/3</div><div class="d">The closing re-measure covered one card. Accept if the three land within 3 % of each other; otherwise pin every comparison to its own card and say so in each result line.</div></div><div class="g">30 min · blocks everything else</div></div>
-
-  <div class="row"><div class="k">03</div><div><div class="t">The real end-to-end number for turbo attention</div><div class="d">Six layers already cleared, two of them product bugs now fixed. Layer seven is inductor trying to recompile our hand-written Triton kernel; <code>PRIMUS_TURBO_ATTN_NO_COMPILE=1</code> is in place but unverified. This is the one number today never produced.</div></div><div class="g">2 h · unknown, likely 1.2–1.5&times; step</div></div>
-
-  <div class="row"><div class="k">04</div><div><div class="t">T2 — aiter's prebuilt ASM backward</div><div class="d">Yesterday's accept bars are obsolete: rescaled to full clock, it must beat <b>8.840 ms</b> on the backward, and reach roughly 8.0 to justify the vendoring cost. Its 320 KB single-workgroup design was worried about for the wrong reason — memory latency in cycles is 2.14&times; larger at full clock, so low occupancy hurts <em>more</em> here, not less.</div></div><div class="g">2 h · 1.10–1.25&times; on the op if it lands</div></div>
-
-  <div class="row"><div class="k">05</div><div><div class="t">Let op-evolve keep running</div><div class="d">It has already produced a knob nobody looked for and independently confirmed one that was found by hand. Round 2 was correctly rejected on its own arithmetic — the framework's "success is an exit code, not an opinion" design is earning its keep.</div></div><div class="g">all day · 5–10% compounding</div></div>
-
-  <div class="row"><div class="k">06</div><div><div class="t">Finish the dispatch-threshold validation</div><div class="d"><code>_MIN_PARALLEL_WORK = 32</code> ships and has never been measured on this host. Four shapes bracketing it are already in the harness; one point is in (<code>par-b1h8</code>, two-kernel: bwd 1.076 ms).</div></div><div class="g">1 h · correctness, not speed</div></div>
+<div class="note">
+  <p><b>能避免其中大部分的那条规则：</b>在相信任何「X 是否在工作」的信号之前，
+  先问「有没有直接测 X 的办法」。通常有，而且通常比搭一套间接监控更快。</p>
+  <p>这些已全部整理进 <code>gpu-kernel-campaign</code> skill。</p>
 </div>
 
-<h3>Where the remaining headroom is</h3>
-<p class="col">The backward is 8.840 ms against a recomputed wall of 4.31–4.63 ms — still
-<b>1.9–2.0&times; above it</b>, the same multiple as yesterday. The forward, now on the prebuilt ASM
-kernel at 1.396 ms, is no longer the lever it was this morning. So the next real gains are
-structural and all live in the backward: the ASM backward probe, op-evolve's continuing search,
-and — only if both stall — the 5-GEMM restructure that moves the floor itself from 7.68 to
-5.48 TFLOP of issued work.</p>
-<p class="col">A caution worth carrying: the plan's claim that "well-scheduled Triton lands at
-1.3–1.5&times; of an issue-slot wall" is refuted by our own two Triton kernels, which sit at 2.0&times;
-and 2.2–2.4&times;. Treat 13 ms as a digit coincidence with the old "below 13 ms is not Triton"
-threshold, not as arrival.</p>
+<h2>交接时的机器状态</h2>
+<div class="scroll"><table>
+  <thead><tr><th>卡</th><th>状态</th><th class="n">4096³ bf16</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td class="m">GPU0</td><td><span class="tag no">摘除</span></td><td class="n">超时</td>
+        <td>今天 120 条 <code>MES failed to respond</code> 全在它的 PCI 地址上；故障始于 uptime 14647，远早于今天的工作</td></tr>
+    <tr><td class="m">GPU1</td><td><span class="tag ok">健康</span></td><td class="n">124.8 TFLOP/s</td><td>跑了收尾复测</td></tr>
+    <tr><td class="m">GPU2</td><td><span class="tag ok">健康</span></td><td class="n">123.9 TFLOP/s</td><td></td></tr>
+    <tr><td class="m">GPU3</td><td><span class="tag ok">健康</span></td><td class="n">122.0 TFLOP/s</td><td></td></tr>
+  </tbody>
+</table></div>
+<p class="col">9-13 那次被迫重启的标志 <code>wait for reset ack</code>，
+今天<strong>全天 0 次</strong>。<strong>按今天的证据不需要重启；把 GPU0 从调度里摘掉、用另外三张即可。</strong>
+所有调度器已停、哨兵已清、容器已停（0 个进程持有 <code>/dev/kfd</code>，<code>amdgpu</code>
+引用计数从 30 降到 4），op-evolve 在模块边界停下、artifacts 完整可 resume。</p>
+
+<h3>一件仍未查明的事</h3>
+<p class="col"><code>torch.cuda.init()</code> 要 58–172 秒且随并发 GPU 进程数上升，
+正常应是几秒。<strong>它是测量吞吐的地板</strong>——今天每个 run 都先付约 78 秒才轮到第一个内核。
+三个实验各排除一个假设：<code>AMD_LOG_LEVEL=3</code> 显示运行时自己的整段日志只跨
+<strong>141 毫秒</strong>，所以不是 ROCm 运行时；
+<code>ROCR_VISIBLE_DEVICES</code>（在枚举前就滤掉 GPU0）只省 18%，所以不主要是那张死卡；
+同一容器连跑三次给出 157/130/172 秒、毫无预热，所以不是冷库加载。
+剩下的解释是内核侧 KFD 上下文创建，被其他进程序列化。</p>
+
+<h2>明天的顺序</h2>
+<div class="plan">
+  <div class="row"><div class="k">01</div>
+    <div><div class="t">重启后立刻测 <code>torch.cuda.init()</code></div>
+      <div class="d">降回几秒，就证明 GPU0 的 MES 故障拖累了整个驱动——那会是「是否值得重启」的硬依据，
+      而今天关于这件事的每一次判断都只是推断。仍是分钟级，则是镜像固有开销，
+      解法是常驻 worker 池而不是每个候选起一个新进程。</div></div>
+    <div class="g">15 分钟 · 决定全天吞吐</div></div>
+
+  <div class="row"><div class="k">02</div>
+    <div><div class="t">GPU1/2/3 三卡交叉标定</div>
+      <div class="d">收尾复测只覆盖了一张卡。三卡落在彼此 3% 以内则接受、全天用一个基线；
+      否则每条结果线都要注明它绑定在哪张卡上。</div></div>
+    <div class="g">30 分钟 · 阻塞其余一切</div></div>
+
+  <div class="row"><div class="k">03</div>
+    <div><div class="t">turbo attention 的真实端到端数字</div>
+      <div class="d">六层障碍已清，其中两层是已修复的产品 bug。第七层是 inductor 试图重新编译我们手写的
+      Triton 内核；<code>PRIMUS_TURBO_ATTN_NO_COMPILE=1</code> 开关已就位但未验证。
+      这是今天唯一没拿到的关键数。</div></div>
+    <div class="g">2 小时 · 预计 1.2–1.5× step</div></div>
+
+  <div class="row"><div class="k">04</div>
+    <div><div class="t">T2 —— aiter 预编译 ASM 反向</div>
+      <div class="d">昨天的验收线已完全过时。按满频重算：必须打赢反向的 <strong>8.840 ms</strong>，
+      要值得 vendor 的代价则需接近 8.0。它那个 320 KB 单 workgroup 的设计当初被担心的方向是反的——
+      满频下访存延迟按周期算大 2.14×，低占用率在这里只会<strong>更</strong>吃亏。</div></div>
+    <div class="g">2 小时 · 落地则算子 1.10–1.25×</div></div>
+
+  <div class="row"><div class="k">05</div>
+    <div><div class="t">让 op-evolve 继续跑</div>
+      <div class="d">它已经产出了一个没人去找的旋钮，并独立确认了一个手工找到的。
+      round 2 按它自己的算术被正确拒绝——「成功是退出码不是意见」这个设计在这里体现了价值。</div></div>
+    <div class="g">全天 · 5–10% 复利</div></div>
+
+  <div class="row"><div class="k">06</div>
+    <div><div class="t">补完分发门的边界验证</div>
+      <div class="d"><code>_MIN_PARALLEL_WORK = 32</code> 已经在产品里，却从未在本机实测过。
+      四个跨阈值的形状已固化进 harness，目前测到一点
+      （<code>par-b1h8</code> 双内核路径：bwd 1.076 ms）。</div></div>
+    <div class="g">1 小时 · 正确性，非性能</div></div>
+</div>
+
+<h3>剩余空间在哪</h3>
+<p class="col">反向是 8.840 ms，对重算后的墙 4.31–4.63 ms 仍有 <strong>1.9–2.0×</strong>，
+和昨天是同一个倍数。前向换上预编译 ASM 内核后是 1.396 ms，
+已经不再是今早那个杠杆了。所以接下来的实质收益都是结构性的，且全部在反向：
+ASM 反向探针、op-evolve 的持续搜索，以及——只有前两者都停滞时——
+把下界本身从 7.68 挪到 5.48 TFLOP 发射量的 5-GEMM 重构。</p>
+<p class="col">一条需要随身带的警告：plan 里「well-scheduled Triton 落在 issue-slot 墙的 1.3–1.5×」
+这个说法，被我们自己的两个 Triton 内核证伪了——它们分别在 2.0× 和 2.2–2.4×。
+现在的 10.3 ms 与旧的那句「低于 13 ms 就不是 Triton」只是数字巧合，<strong>不是抵达</strong>。</p>
 
 <footer>
-  Full ledgers, scripts and the handoff document: <span class="m">output/0914__campaign/</span> ·
-  handoff <span class="m">HANDOFF.md</span> · lessons <span class="m">~/.claude/skills/gpu-kernel-campaign/</span>
+  完整 ledger、脚本与交接文档：<span class="m">output/0914__campaign/</span><br>
+  交接 <span class="m">HANDOFF.md</span> · 账本 <span class="m">RESULTS.md</span> ·
+  经验 <span class="m">~/.claude/skills/gpu-kernel-campaign/</span>
 </footer>
 </div>
