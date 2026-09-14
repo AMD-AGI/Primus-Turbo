@@ -213,3 +213,105 @@ GEMM 让出关键路径后，attention 变成了 **38% 的端到端杠杆**。
 
 日志里的 MFU（178% / 245%）是 torchtitan 对这颗芯片的 `peak_flops` 设小了——
 patch 列表里就有一个 `torchtitan.peak_flops`，值需要按 gfx1250 修正。不影响 tps。
+
+## 11. 抢卡会产生**假的 SQNR 失败**，不只是假的计时
+
+巡检时 ledger 里冒出三条 SQNR 失败：`llama31-8b-s4096|fused` out 43.23、
+`gate-s2048|fused` out 42.88、`gate-s1024|asm` out 48.48（门限 50）。
+干净重测（GPU0 独占窗口，各两次）全部恢复：**53.74 / 53.87 / 53.93**，可重现。
+
+原因是一个 workflow agent 留下的孤儿扫描进程（`ppid=1`）和我的独占窗口互相抢卡——
+同事的 campaign 手册里正好写过这个失败模式：「agent 子进程在被杀后变成 ppid=1 的孤儿，
+继续改你的工作树、继续占着 GPU」。
+
+**这比「抢卡记录一个偏低的数字」更危险。** SQNR 门是我们唯一的正确性防线，
+而抢卡能让它**假阳性地判死一个正确的配置**。同一配置、同一随机种子：
+抢卡时 out 落在 42–48 dB，干净时 53.7–53.9 dB。
+
+操作结论：**任何 SQNR 失败在被当成结论之前，必须在独占窗口里复现一次。**
+真失败是稳定复现的（例如 `fwd:num_stages=4` 稳定给出 out 30.3 / 16.1 / 13.5，
+三个 warp 数下都失败，那是真的坏配置）。
+
+## 12. 逐位确定性：ASM 配对和融合冠军都通过
+
+`--determinism-reps 200`，四张量逐位比较：
+
+| impl | reps | 逐位不一致 | 非有限值 | 判定 |
+|---|--:|---|--:|---|
+| ASM 前向 + 融合反向 | 200 | out/dq/dk/dv 全 0 | 0 | **确定性** |
+| 冠军（turbo 前向 + 融合反向） | 200 | out/dq/dk/dv 全 0 | 0 | **确定性** |
+
+这条要单独记，因为 `PLAN-4GPU-TOMORROW.md` 预期 ASM 路径可能需要
+「拒绝 `deterministic=True`」——理由是 fp32 atomic 的 dq 累加在运行间不确定。
+**前向这条路上不成立**：ASM 前向配融合反向是逐位确定的，不必排除出确定性测试。
+
+## 13. ASM 前向接入 dispatcher（`0e5cb743`）
+
+走真实 dispatcher（`flash_attn_func` → `BackendType.TRITON`），生产形状，GPU3，各 3 次：
+
+| | fwd | bwd | total | TFLOP/s | SQNR |
+|---|--:|--:|--:|--:|---|
+| aiter 可导入 | **1.410** | 9.786 | **11.198** | 687.3 | 53.62/52.24/52.31/52.71 |
+| aiter 不可导入 | 2.609 | 9.808 | 12.417 | 619.8 | 53.67/52.24/52.31/52.71 |
+
+**同一份二进制、同一配置**，唯一变量是 aiter 能否被 import。op 层面 9.8%。
+
+### 门的耦合是这次设计里唯一有风险的地方
+
+ASM 返回平铺 `[B,Hq,Sq]`，只有 `dense_fused_backward` 读得懂；树内双内核反向吃的是打包的
+`[B,Hq,2*Sq]`（LSE 和 delta 每 `FIXED_BLOCK_M` 行交错）。**平铺 LSE 送进双内核反向不会报错，
+会返回平滑错误的梯度。** 所以 `asm_forward_eligible` 和 `fused_backward_eligible` 必须
+同取同弃，且决定存在 ctx 上而不是在反向里重新推导。
+已在两者意见相左的 tiny 形状上验证：asm 说可以、fused 说不行，合取正确地拒绝。
+
+### 优雅退回是被意外验证的
+
+e2e 容器缺 `psutil`——aiter 的 `dist/utils` 传递依赖它，和 attention 毫无关系——
+结果是干净地退回树内前向，51/51 测试照常绿。**这条路径的可用性挂在一个与 attention
+无关的传递依赖上**，任何人把它当成必然可用之前应该知道这件事。
+
+门拒绝的情形（逐一验证）：sink（hdim 128 没有带 sink 的 `.co`）、滑动窗口、fp16、dropout、
+bias、alibi、非 gfx1250、最后一维非连续、`hq % hkv != 0`、cross-attention。
+**非因果是放行的**——实测 1.71×，SQNR 52.8/52.5/52.6/52.6。
+
+## 14. ⚠ 测量有效性事故：今天所有 e2e 跑的都不是我们的代码
+
+`§7`、`§10` 以及 commit `311e5074` 里的全部 e2e 数字，训练进程 import 的是
+**`/workspace/Primus-Turbo`——镜像里 2026-09-09 构建的 editable 安装 0.4.1.dev12**，
+不是本分支的 checkout。直接验证：
+
+```
+primus_turbo : /workspace/Primus-Turbo/primus_turbo/__init__.py
+has asm gate : False
+```
+
+后果，逐条：
+
+- **`turbo_asm` vs `turbo_noasm` 是同一份二进制。** 两臂 13,970 vs 13,930（0.3%）不是
+  「ASM 前向在训练里没收益」，而是**根本没有 ASM 前向**。训练日志里
+  `LoadKernel.*fmha` 出现 **0 次**，`[aiter]` 出现 **0 次**。
+- **§10 的 turbo vs flex 仍然是一个有效对照**（镜像里的 turbo attention vs flex），
+  但它**与本分支今天的任何改动无关**——冠军配置、`waves_per_eu`、ASM 前向都不在里面。
+- 因此 commit `311e5074` 那句「attention 是 38% 的端到端杠杆」应改为：
+  **把 attention 实现从 flex 换成（镜像版）turbo，step 从 3.41 s 降到 2.48 s**，
+  差 0.93 s，据此 flex 下 attention 约占 step 的 39%。数量级成立，但那两跑离散 19–30%，
+  精度不足以支撑「38%」这个精确说法。
+
+根因是 Python 的导入优先级，不是环境变量没传：镜像通过 `.pth` 注册了一个
+**MetaPathFinder**，而 `sys.meta_path` 的查询**先于** `sys.path`，
+所以把 checkout 放进 `PYTHONPATH` 根本压不过它。`PYTHONPATH` 本身是到位的
+（日志里能看到 `aiter-src` 在里面）——这正是它难被发现的原因。
+
+修法：在容器内 `pip uninstall -y primus_turbo`（镜像不受影响），
+再把 checkout 放 `PYTHONPATH` 首位。修完验证：
+```
+primus_turbo : /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py
+has asm gate : True
+eligible     : True
+```
+
+旧 ledger 改名为 `e2e_ab.STALE-image-primus-turbo.jsonl` 保留为证据，三臂循环改写
+`e2e_ab2.jsonl` 重新开始。
+
+**教训**：`PYTHONPATH` 到位不等于代码到位。凡是「改动应该有效果却没有」的情形，
+第一件事是打印被 import 模块的 `__file__`，不是去查改动本身。

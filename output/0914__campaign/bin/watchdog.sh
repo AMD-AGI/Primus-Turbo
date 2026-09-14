@@ -16,7 +16,7 @@ STATUS=$OUT/fleet_status.json
 STALL=${STALL:-900}          # seconds without a new ledger line before a stream is "stalled"
 PERIOD=${PERIOD:-60}
 
-declare -A PHASE=( [2]=gate )   # queue-driven GPUs; 0 = ASM probe, 1 = op-evolve, 3 = e2e
+declare -A PHASE=( [0]=gate_asm [2]=gate )   # 1 = op-evolve (self-supervised), 3 = e2e loop (below)
 
 # Own PID file, and refuse to start twice. Stopping this by `pkill -f watchdog.sh` matches the
 # killer's OWN command line and takes the caller's shell with it -- that is a documented trap
@@ -60,6 +60,23 @@ while true; do
     fi
     rows="$rows{\"gpu\":$g,\"stream\":\"$ph\",\"state\":\"$st\",\"ledger_age_s\":$age},"
   done
+  # gpu3 reports alongside the others, or "all four cards are busy" cannot be read off the
+  # status file -- which is how eight idle minutes went unnoticed.
+  e3age=$(( T - $(stat -c %Y "$OUT/ledgers/e2e_ab.jsonl" 2>/dev/null || echo 0) ))
+
+  # GPU3's e2e loop. Not in PHASE because its ledger and restart command differ, but it is
+  # watched for the same reason: a one-shot run leaves the card idle the moment it finishes.
+  e3=$OUT/ledgers/g3.e2e.pid
+  e3st=ok; alive "$e3" || e3st=dead
+  rows="$rows{\"gpu\":3,\"stream\":\"e2e_ab\",\"state\":\"$e3st\",\"ledger_age_s\":$e3age},"
+  if ! alive "$e3"; then
+    if [ "$WEDGE" = 1 ]; then
+      echo "WEDGE: gpu3 e2e loop is dead and dmesg shows GPU faults -- NOT restarting"
+    else
+      echo "RESTART: gpu3 e2e loop died, relaunching"
+      setsid nohup bash "$OUT/bin/e2e_loop.sh" > "$OUT/logs/g3.e2e.log" 2>&1 < /dev/null & disown
+    fi
+  fi
 
   # op-evolve supervises itself; the watchdog only reports whether its loop is advancing.
   OE=$(ls -dt /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-* 2>/dev/null | head -1)
