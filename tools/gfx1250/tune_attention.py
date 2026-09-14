@@ -61,15 +61,22 @@ _TUNE_ENV = "PRIMUS_TURBO_ATTN_TRITON_TUNE"
 if "--tune" in sys.argv:
     os.environ[_TUNE_ENV] = sys.argv[sys.argv.index("--tune") + 1]
 
-# Route torch's own matmuls to rocBLAS rather than hipBLASLt. Two independent reasons, and
-# the first one is fatal rather than slow: in amdprimus:gfx1250-20260910 the hipBLASLt
-# Tensile library for this arch is simply absent
-# (_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/TensileLibrary_lazy_gfx1250.dat), so
-# an fp32 matmul raises HIPBLAS_STATUS_INVALID_VALUE and the correctness reference cannot
-# run at all. Second, where hipBLASLt IS present on this part it has been measured at
-# 91.5 TFLOP/s against Triton's 1002.7 on the same tensors in the same process, so it is
-# not something the reference should be built on either way.
-# Set before torch is imported; torch reads it at backend-selection time.
+# Route torch's own matmuls to rocBLAS rather than hipBLASLt.
+#
+# CORRECTED 2026-09-14. This comment previously said the gfx1250 Tensile library "is simply
+# absent" from amdprimus:gfx1250-20260910 and that an fp32 matmul therefore raises
+# HIPBLAS_STATUS_INVALID_VALUE. That is wrong on both counts. The image ships 46 gfx1250
+# bf16 Tensile solutions under _rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/gfx1250/
+# (the build asserts >= 46 and fails otherwise), torch reports the backend as Cublaslt, and
+# nothing raises.
+#
+# The reason to keep this setting is the one that survived measurement: on this part
+# hipBLASLt is simply SLOW. Same tensors, same process, 8192^3 bf16 -- hipBLASLt 113.0
+# TFLOP/s against a naive Triton GEMM at 1190.1 with max_abs_err 0.0, a 10.5x gap. Putting
+# the tuned library first on LD_LIBRARY_PATH moves it by under 1%, and so does flipping
+# TORCH_BLAS_PREFER_HIPBLASLT between 0 and 1 -- so it is neither a packaging bug nor a
+# silent fallback to rocBLAS. Either way it is not something the fp32 reference should be
+# built on. Set before torch is imported; torch reads it at backend-selection time.
 os.environ.setdefault("TORCH_BLAS_PREFER_HIPBLASLT", "0")
 
 # Pin this process to one GPU, hard, before torch initialises.
@@ -298,7 +305,7 @@ def main() -> int:
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--sqnr-min", type=float, default=50.0)
-    ap.add_argument("--impl", default="turbo", choices=["turbo", "aiter", "fused"],
+    ap.add_argument("--impl", default="turbo", choices=["turbo", "aiter", "fused", "asm"],
                     help="turbo = Primus-Turbo's in-tree Triton backend (the PR target). "
                          "aiter = AITER's Triton MHA, the alternative seed the plan named. "
                          "Same shape, same fp32 reference, same SQNR gate, same timer -- the "
@@ -422,6 +429,42 @@ def _measure(args) -> int:
         _fai.triton_dense_backward = _fused_bwd
         result["impl_note"] = "turbo forward + vendored fused backward"
         _impl_fwd = None
+    elif args.impl == "asm":
+        # aiter's PREBUILT gfx1250 ASM forward, paired with the vendored fused backward.
+        #
+        # These two compose without an adapter, which is the whole reason this pairing is
+        # worth measuring: the ASM forward returns LSE as plain [B, Hq, Sq] fp32 in natural
+        # log, and dense_fused_backward documents exactly that as its accepted form. The
+        # in-tree two-kernel backward would NOT compose -- it consumes turbo's packed
+        # [B, Hq, 2*Sq] lse/delta scratch, where LSE and delta interleave every
+        # FIXED_BLOCK_M rows, so substituting there needs a scatter into the LSE half.
+        #
+        # Measured as an autograd Function rather than two separate timings, so the total
+        # is a measurement and not the sum of two halves taken in different sessions.
+        from aiter.ops.mha import fmha_fwd_with_sink_asm
+        from primus_turbo.pytorch.kernels.attention.attention_fused_bwd_impl import (
+            dense_fused_backward,
+        )
+
+        _asm_scale = (q.shape[-1]) ** -0.5
+
+        class _AsmFwdFusedBwd(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, q_, k_, v_):
+                o_, lse_ = fmha_fwd_with_sink_asm(q_, k_, v_, _asm_scale, causal, True)
+                ctx.save_for_backward(q_, k_, v_, o_, lse_)
+                return o_
+
+            @staticmethod
+            def backward(ctx, do_):
+                q_, k_, v_, o_, lse_ = ctx.saved_tensors
+                dq_, dk_, dv_ = dense_fused_backward(
+                    do_.contiguous(), q_, k_, v_, o_, lse_, _asm_scale, causal, (-1, -1)
+                )
+                return dq_, dk_, dv_
+
+        result["impl_note"] = "aiter prebuilt gfx1250 ASM forward + vendored fused backward"
+        _impl_fwd = lambda: _AsmFwdFusedBwd.apply(q, k, v)  # noqa: E731
     elif args.impl == "aiter":
         from aiter.ops.triton._triton_kernels.attention import mha as _amha
         from aiter.ops.triton.attention.mha import flash_attn_func as _aiter_fa
