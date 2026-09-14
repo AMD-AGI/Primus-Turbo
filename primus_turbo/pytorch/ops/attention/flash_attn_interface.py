@@ -24,6 +24,10 @@ from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
     attention_aiter_varlen_backward_impl,
     attention_aiter_varlen_forward_impl,
 )
+from primus_turbo.pytorch.kernels.attention.attention_asm_fwd_impl import (
+    asm_dense_forward,
+    asm_forward_eligible,
+)
 from primus_turbo.pytorch.kernels.attention.attention_fused_bwd_impl import (
     dense_fused_backward,
     fused_backward_eligible,
@@ -123,14 +127,35 @@ class FlashAttnFunc(torch.autograd.Function):
                 raise ValueError("triton dense attention does not implement bias or alibi_slopes")
             if return_softmax:
                 raise ValueError("triton dense attention cannot return the softmax matrix")
-            out, lse = triton_dense_forward(
-                q, k, v, softmax_scale=softmax_scale, causal=causal, sink=sink, window_size=window_size
-            )
+            # aiter's prebuilt gfx1250 ASM forward is 1.85x the in-tree one at the training
+            # shape, but it returns a PLAIN [B, Hq, Sq] LSE where the in-tree forward returns
+            # the packed [B, Hq, 2*Sq] lse/delta scratch. Only dense_fused_backward reads the
+            # plain form, so the two gates are taken together or not at all -- a plain LSE
+            # reaching the two-kernel backward would not fault, it would return smoothly
+            # wrong gradients. `use_asm_fwd` is carried on ctx so the backward cannot
+            # re-derive a different answer from tensors autograd may have reshaped.
+            use_asm_fwd = asm_forward_eligible(
+                q,
+                k,
+                v,
+                dropout_p=dropout_p,
+                bias=bias,
+                alibi_slopes=alibi_slopes,
+                sink=sink,
+                window_size=window_size,
+            ) and fused_backward_eligible(q, k.shape[1], sink)
+            if use_asm_fwd:
+                out, lse = asm_dense_forward(q, k, v, softmax_scale=softmax_scale, causal=causal)
+            else:
+                out, lse = triton_dense_forward(
+                    q, k, v, softmax_scale=softmax_scale, causal=causal, sink=sink, window_size=window_size
+                )
             if is_grad_enabled and _any_requires_grad(q, k, v, sink):
                 ctx.save_for_backward(q, k, v, out, lse, sink)
                 ctx.softmax_scale = softmax_scale
                 ctx.causal = causal
                 ctx.window_size = window_size
+                ctx.use_asm_fwd = use_asm_fwd
             return (out, lse) if return_lse else out
 
         if backend == BackendType.GLUON:
@@ -298,7 +323,9 @@ class FlashAttnFunc(torch.autograd.Function):
             # 36.4 at b=4 s=8192, against torch flex's 31.3). It declines short sequences,
             # where its tile is a pessimisation, and anything with a sink; those keep the
             # path that was already shipping.
-            if fused_backward_eligible(q, k.shape[1], sink):  # tile chosen per seqlen inside
+            # getattr, not ctx.use_asm_fwd: a ctx saved by an older forward (or by a path
+            # that never set it) still has to work.
+            if getattr(ctx, "use_asm_fwd", False) or fused_backward_eligible(q, k.shape[1], sink):
                 dq, dk, dv = dense_fused_backward(
                     dout,
                     q,
