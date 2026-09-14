@@ -204,9 +204,21 @@ PATH=/home/lihuzhan/.venv-op-evolve/bin:$PATH op-evolve status --job gfx1250-att
 
 ---
 
-## 10. ⚠ 明天开工前必须先看这一节：卡处于降级状态，有两个 D 状态进程
+## 10. ⚠ 明天开工前必须先看这一节：卡会间歇降级，且今天有一个孤儿循环在持续喂它
 
 **收尾时发现的，比今天任何性能数字都重要。**
+
+**先读这段更正**：初稿说「两个进程卡在 D 状态、卡在单向恶化、建议重启主机」。
+**两点都错了。** 那两个进程（189552、190233）在约 20 分钟后**自己退出了 D 状态**，
+后来新出现的一个也一样。卡会从 MES 超时里恢复，不是单向的。
+
+真正的问题是另一件事：**一个 `ppid=1` 的孤儿 bash 循环（PID 3020673）持续了 2 小时 15 分**，
+一个接一个地往这张降级的卡上起 `par-*` 测量。我当天清理过三次进程，
+**三次都只杀了子进程、没杀这个父循环**，于是每次都再生一个，
+而我每次都把「又出现了」误判成「kill 的模式没匹配上」，连改了三轮模式。
+`kill -TERM <pid>` 一次就解决了。
+
+所以：**没有必须重启的证据**。下面的三步检查仍然要做，但结论应按检查结果定，不要预设。
 
 ```
 189552  Ds  amdgpu_mes_reg_write_r  --shape par-b2h8  --impl turbo
@@ -230,14 +242,35 @@ PATH=/home/lihuzhan/.venv-op-evolve/bin:$PATH op-evolve status --job gfx1250-att
 模块引用计数降不下来，`modprobe -r amdgpu` 不可能成功。9-13 那次正是从这里走到
 `wait for reset ack` 的。
 
+### 收尾时的最终判定（16:28，直接测量，非推断）
+
+一个 **4096³ bf16 矩阵乘法在 GPU0 和 GPU2 上都跑不完 150 秒**（正常是毫秒级）。
+`docker exec ps`、`rocm-smi`、`torch.cuda.device_count()` 同样全部挂住。
+**卡已经不能干活了**，尽管 `wait for reset ack` 仍为 0。
+
+我在这件事上当天改了三次口：先说「D 状态、建议重启」，再说「D 状态是暂时的、收回重启建议」，
+最后才用最小 matmul 测出真相。**中间那次改口是错的**——两个进程退出 D 状态，
+我读成「卡恢复了」，实际上它们只是换了一种卡法。
+
+**当时该做的就是最后这个测试：直接问卡能不能算，而不是从进程状态推断。**
+这和今天一整天的模式一致：反复用间接信号（进程状态、ledger 时间戳、dmesg 计数、
+`rocm-smi` 读数）去推断一个可以直接测量的事实，而每一次间接推断都出过错。
+最小 matmul 三分钟就给了答案。
+
 ### 开工前三步
 
 1. `timeout 20 dmesg | grep -c 'wait for reset ack'` —— 非 0 则必须重启
 2. `docker exec fa-repro ps -eo pid,stat,wchan:22,args | grep '[t]une_attention'` ——
    看 `Ds` 还在不在。**不要用 `rocm-smi`、`pgrep -c`、`torch.cuda.device_count()`**，
    这三个今天都挂过或说过谎
-3. D 状态进程还在 → **重启主机，然后 `sudo modprobe amdgpu`**（本节点 blacklist 了它，
-   不做这步没有 `/dev/kfd`）
+3. **先跑这个，它比前两步都硬**（3 分钟，硬超时）：
+   ```bash
+   timeout 180 docker exec -e GPU=0 fa-repro bash -lc \
+     'timeout 150 python3 -c "import torch,time;t=time.time();a=torch.randn(4096,4096,device=\"cuda\",dtype=torch.bfloat16);(a@a);torch.cuda.synchronize();print(time.time()-t)"'
+   ```
+   秒级返回 = 卡可用；超时 = **重启主机，然后 `sudo modprobe amdgpu`**
+   （本节点内核参数 blacklist 了它，不做这步没有 `/dev/kfd`，torch 会报 "No CUDA GPUs are available"）。
+   **昨晚收尾时这一步是超时的。**
 
 ### 我今天在这件事上判断错了两次
 
@@ -255,3 +288,29 @@ PATH=/home/lihuzhan/.venv-op-evolve/bin:$PATH op-evolve status --job gfx1250-att
 `rocm-smi` 在容器内报四张卡显存占用**全是 0%**，而当时至少有三个进程各持有约 6 GiB。
 这个读数不可信，但我没查清是驱动降级导致、还是容器内 SMI 视图本来就受限。
 **今天 watchdog 里那个 `gpu_use` 字段就建立在这个不可信的源上**，明天要么换信号源，要么去掉它。
+
+
+---
+
+## 11. 今天没做完的（明天照 §8 的顺序做）
+
+| # | 项 | 为什么没做完 |
+|---|---|---|
+| 1 | **全机静默复测冠军** | 收尾时卡已不可用。**这仍是明天第一件事**，今天所有 op 数字都在四卡满载下取 |
+| 2 | **turbo attention 的真实端到端数字** | 连拆六层障碍（两个是产品真 bug，已修并提交），第 6 层 inductor 重编内核未过 |
+| 3 | **`_MIN_PARALLEL_WORK=32` 分发门的边界验证** | 四个跨阈值形状已固化进 `SHAPES`，只测到 `par-b1h8` 一点（turbo: bwd 1.076 / tot 1.430） |
+| 4 | **`_verify_launch` 的 tile 检查** | 已修成不再误报，但这个 Triton 版本确实读不到 tile，现报 `UNVERIFIABLE`。要恢复完整保护得换信号源 |
+
+## 12. 给明天的一条方法建议
+
+今天有八次「现象不符合预期」，**八次根因都在测量或编排链路上，零次在被测的改动上**。
+代价最大的三次，共同点是**用间接信号推断一个可以直接测量的事实**：
+
+- 用 ledger 时间戳推断「卡在不在干活」→ 队列空转时每轮仍写 `round_complete`，代理说谎，
+  三张卡闲置数小时未被发现（是操作者一眼看出来的，不是监控报出来的）
+- 用进程 D 状态推断「卡是否恢复」→ 进程退出 D 状态不等于卡能算，
+  一个 3 分钟的最小 matmul 才是答案
+- 用「日志里没有 aiter 横幅」推断「ASM 没被走到」→ 横幅被 `AITER_LOG_LEVEL=ERROR` 压掉了
+
+**建议**：任何「X 是否在工作」的判断，先问「有没有一个直接测 X 的办法」。
+通常有，而且通常比搭一套间接监控更快。
