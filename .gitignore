@@ -27,3 +27,9 @@ gpucore.*.gpu
 
 # Local measurement ledgers from tools/gfx1250/
 out/
+# 0915 scheduler runtime state: PID files and per-job container PIDs, meaningless outside
+# the session that produced them. The ledger, events and queue ARE tracked -- they are the
+# evidence every conclusion in output/0915__opt/ rests on.
+output/*/run/
+output/*/sched.pid
+output/*/STOP
