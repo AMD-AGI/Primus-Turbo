@@ -4026,17 +4026,18 @@ def _qsplit_for(Sq, window_left=-1, head_dim=64):
     # q_split fans the dK/dV KV-owner WGs across the CU grid; the optimum rises with
     # Sq before split-reduction overhead dominates. Re-swept once the fused path started
     # dispatching one batch at a time (fewer work-groups per dispatch, so list-scheduling
-    # slack matters more): 4 still wins; wider only adds dk/dv slots for the slot reduce
-    # to fold. It holds past 8192, which used to take a narrower 3 unmeasured: on the fused
-    # D128 arm that costs several percent, since a split count that tiles the q blocks is
-    # also what lets the pipeline cut them (see _qsp_cuttable).
+    # slack matters more): 4 still wins for D=64. D=128 is the opposite — see the
+    # head_dim >= 128 arm. Wider than 4 only adds dk/dv slots for the slot reduce
+    # to fold.
     if window_left >= 0:
         # Sliding window: a band's whole q range is only BLOCK_KV+W rows, so splitting it
         # hands the SAME work to q_split times as many work-groups and multiplies the
         # dk/dv workspace. One slot avoids both the redundant prologues and the slot reduce.
         return 1
     if head_dim >= 128:
-        return 2
+        # D=128 bands are 128 rows (two q blocks). q_split>1 pays _reduce_dkdv_slots
+        # that D=64 never pays. Aug 22 pair keep: 1 (9.23 vs AITER 9.29).
+        return 1
     return 4
 
 

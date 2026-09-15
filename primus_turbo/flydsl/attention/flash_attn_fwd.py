@@ -339,7 +339,6 @@ def build_flash_attn_dualwave_swp_module(
                     ctx.load_v_tile(j_idx - 2, 1)
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                     _s_setprio(1)
-                v_o = _pv_step(0, v_p_0, v_v, v_o, 0)
                 # Cross-seqlen can put a diagonal tile in v_s_1; so can SWA's lower window edge.
                 if const_expr(traits.CAUSAL and (traits.CROSS_SEQLEN or traits.WINDOW_LEFT >= 0)):
                     v_s_1 = ctx.causal_mask_prologue_if_needed(
@@ -349,9 +348,12 @@ def build_flash_attn_dualwave_swp_module(
                     )
                 else:
                     v_s_1 = ctx.scores_for_softmax(v_s_1)
-                v_o, m_row, l_row, v_p_0 = ctx.tile_rescale_o(v_o, m_row, l_row, v_s_1, v_p_0, 2)
-                for pvs in range_constexpr(1, 4):
+                # All four PV steps on the unrescaled v_p. Causal fixed-max makes
+                # tile_rescale_o a no-op; the round-trip this used to skip was
+                # scale_p between PV0 and PV1–3 (Aug 22 H11, +1.56% pair).
+                for pvs in range_constexpr(0, 4):
                     v_o = _pv_step(pvs, v_p_0, v_v, v_o, 0)
+                v_o, m_row, l_row, v_p_0 = ctx.tile_rescale_o(v_o, m_row, l_row, v_s_1, v_p_0, 2)
                 v_s_1 = ctx.shift_scores(v_s_1, m_row)
                 v_p_1 = ctx.exp2(v_s_1, 0, 16)
 
@@ -411,10 +413,9 @@ def build_flash_attn_dualwave_swp_module(
                     ctx.load_v_tile(j_idx - 1, 0)
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                     _s_setprio(1)
-                v_o = _pv_step(0, v_p_1, v_v, v_o, 1)
-                v_o, m_row, l_row, v_p_1 = ctx.tile_rescale_o(v_o, m_row, l_row, v_s_0, v_p_1, 4)
-                for pvs in range_constexpr(1, 4):
+                for pvs in range_constexpr(0, 4):
                     v_o = _pv_step(pvs, v_p_1, v_v, v_o, 1)
+                v_o, m_row, l_row, v_p_1 = ctx.tile_rescale_o(v_o, m_row, l_row, v_s_0, v_p_1, 4)
                 v_s_0 = ctx.shift_scores(v_s_0, m_row)
                 v_p_0 = ctx.exp2(v_s_0, 0, 16)
                 _sched_barrier_pairs(traits, 6, 5, 4)
