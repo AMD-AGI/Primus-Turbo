@@ -184,9 +184,14 @@ CO = {
     "post": "bwd_hd128_dq_convert_bf16.co",
 }
 
+# mask=0 in fmha_bwd_dqdkdv.csv -- same hdim, same 32x128 tile, different mangled symbol.
+# The causal object halves the x grid because the host does; the non-causal one must not.
+CO_NONCAUSAL = "bwd_hd128_bf16_a32_pssk.co"
+SYM_NONCAUSAL = "_ZN5aiter28fmha_bwd_hd128_bf16_a32_psskE"
+
 
 def asm_backward(q, k, v, o, do, lse, softmax_scale=None, hip=None, dkdv_heads="kv",
-                 co_variant=""):
+                 co_variant="", causal=True):
     """Run the three-kernel ASM backward. Returns (dq, dk, dv).
 
     q/k/v/o/do are [B, S, H, D] bf16 as Primus-Turbo lays them out; lse is
@@ -253,8 +258,13 @@ def asm_backward(q, k, v, o, do, lse, softmax_scale=None, hip=None, dkdv_heads="
     # SAME mangled symbol as the shipped one, so the ABI is unchanged and only the file
     # swaps. Neither _perf object is mentioned in any of the campaign documents -- they are
     # an unexplored free variable, not a known-better build.
-    main_co = CO["dqdkdv"].replace(".co", f"{co_variant}.co") if co_variant else CO["dqdkdv"]
-    f_main = hip.function(ASM_DIR / main_co, SYMBOLS["dqdkdv"])
+    if causal:
+        main_co, main_sym = CO["dqdkdv"], SYMBOLS["dqdkdv"]
+    else:
+        main_co, main_sym = CO_NONCAUSAL, SYM_NONCAUSAL
+    if co_variant:
+        main_co = main_co.replace(".co", f"{co_variant}.co")
+    f_main = hip.function(ASM_DIR / main_co, main_sym)
     f_post = hip.function(ASM_DIR / CO["post"], SYMBOLS["post"])
     stream = torch.cuda.current_stream().cuda_stream
 
@@ -268,7 +278,8 @@ def asm_backward(q, k, v, o, do, lse, softmax_scale=None, hip=None, dkdv_heads="
                    "ptr_qseq": 0, "ptr_qseq_padded": 0}), stream)
 
     gdx = (seqlen_k + TS_KV - 1) // TS_KV
-    gdx = (gdx + 1) // 2  # causal: the host halves it for mask types 1 and 2
+    if causal:
+        gdx = (gdx + 1) // 2  # the host halves it for mask types 1 and 2 only
     main_args = {name: 0 for name, _, _ in DQDKDV_FIELDS}
     main_args.update({
         "ptr_dq": dq_acc.data_ptr(), "ptr_dk": dk.data_ptr(), "ptr_dv": dv.data_ptr(),

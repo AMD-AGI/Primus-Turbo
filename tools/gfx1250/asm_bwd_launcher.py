@@ -35,6 +35,7 @@ _m = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_m)
 
 ASM_DIR, BDX, BF16, CO = _m.ASM_DIR, _m.BDX, _m.BF16, _m.CO
+CO_NONCAUSAL, SYM_NONCAUSAL = _m.CO_NONCAUSAL, _m.SYM_NONCAUSAL
 DQDKDV_FIELDS, DQDKDV_SIZE, FP32 = _m.DQDKDV_FIELDS, _m.DQDKDV_SIZE, _m.FP32
 HipModule, MASK_X, MASK_Y = _m.HipModule, _m.MASK_X, _m.MASK_Y
 ODO_FIELDS, ODO_SIZE = _m.ODO_FIELDS, _m.ODO_SIZE

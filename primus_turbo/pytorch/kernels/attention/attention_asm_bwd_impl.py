@@ -45,6 +45,10 @@ from primus_turbo.pytorch.core.utils import is_gfx1250
 __all__ = ["asm_backward_eligible", "asm_dense_backward"]
 
 _TRACE = os.environ.get("PRIMUS_TURBO_ASM_BWD_TRACE", "") not in ("", "0")
+# A path writes the trace there instead of stdout. Under a training launcher stdout goes
+# through capture layers that demonstrably swallow lines -- aiter's own load banner never
+# appeared in any e2e log on 0914 -- and then "no line" and "never called" look identical.
+_TRACE_FILE = os.environ.get("PRIMUS_TURBO_ASM_BWD_TRACE_FILE", "")
 # Hard off switch, mirroring PRIMUS_TURBO_ATTN_DISABLE_ASM_FWD. Without one, the only way to
 # measure what this path is worth is to make aiter unimportable, which changes the forward
 # at the same time and makes the comparison meaningless.
@@ -58,9 +62,18 @@ _LAUNCH = None
 
 
 def _say(msg: str, key: str) -> None:
-    if _TRACE and key not in _SEEN:
-        _SEEN.add(key)
-        print(f"[primus_turbo asm_bwd] {msg}", flush=True)
+    if not _TRACE or key in _SEEN:
+        return
+    _SEEN.add(key)
+    line = f"[primus_turbo asm_bwd pid={os.getpid()}] {msg}"
+    if _TRACE_FILE:
+        try:
+            with open(_TRACE_FILE, "a") as fh:
+                fh.write(line + "\n")
+            return
+        except Exception:
+            pass
+    print(line, flush=True)
 
 
 def _no(reason: str) -> bool:
@@ -135,6 +148,12 @@ def asm_backward_eligible(
         return _no(f"batch*nhead_q < {_MIN_PARALLEL_WORK_ASM}; measured a 3x loss there")
     if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
         return _no("q/k/v not contiguous; the byte strides assume it")
+    # Says so when it FIRES, not only when it declines. Silence from a decline-only trace
+    # cannot be told apart from "the gate was never reached", and under a training launcher
+    # that is exactly the question being asked -- the campaign has already lost a day to
+    # inferring that a path was live because nothing complained.
+    _say(f"engaged: b={q.shape[0]} s={q.shape[1]} hq={nhead_q} hkv={nhead_k} d={q.shape[3]}",
+         "engaged")
     return True
 
 
