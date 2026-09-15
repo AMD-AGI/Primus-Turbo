@@ -28,9 +28,10 @@ ratios against the vendored fused backward at 1100 MHz:
     b=4 s=4096 hq=8     3.232 ->  2.518 ms   1.284x
     b=1 s=1024 hq=8     0.743 ->  2.218 ms   0.335x   <-- a 3x LOSS
 
-Every winner has batch * nhead_q >= 32 and the only loser is at 8, which is the same
-threshold _MIN_PARALLEL_WORK already applies to the fused backward. That is a coincidence
-worth stating rather than relying on: the number here is measured independently.
+That table reads as a batch*nhead_q >= 32 floor, and the gate applies one. Treat it as
+provisional: it rests on a single losing measurement, taken through the harness rather than
+head-to-head, and a direct comparison of that same shape says the opposite. See the note on
+_MIN_PARALLEL_WORK_ASM below.
 """
 
 from __future__ import annotations
@@ -54,7 +55,14 @@ _TRACE_FILE = os.environ.get("PRIMUS_TURBO_ASM_BWD_TRACE_FILE", "")
 # at the same time and makes the comparison meaningless.
 _DISABLED = os.environ.get("PRIMUS_TURBO_ATTN_DISABLE_ASM_BWD", "") not in ("", "0")
 
-# batch * nhead_q below this loses to the vendored fused backward -- see the module docstring.
+# UNDER REVIEW -- this threshold was extrapolated from ONE measurement and the extrapolation
+# looks wrong. It came from b=1 s=1024 hq=8 measuring a 3x loss through the harness. A
+# head-to-head of the SAME shape in one process measures a 1.81x WIN, and holding b*nhead_q
+# at 8 while sweeping seqlen gives 1.81 / 2.04 / 2.87 / 3.10x at 1024 / 2048 / 4096 / 8192.
+# The two disagree because the harness comparison and the head-to-head do not measure the
+# same thing, and that is being re-measured with an uncontaminated reference arm before this
+# number moves. Left at 32 in the meantime: too conservative only costs speed on small
+# shapes, while too permissive would ship a regression.
 _MIN_PARALLEL_WORK_ASM = int(os.environ.get("PRIMUS_TURBO_ASM_BWD_MIN_WORK", "32"))
 
 _SEEN: set = set()

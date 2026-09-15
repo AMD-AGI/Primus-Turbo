@@ -69,6 +69,18 @@ SHAPES = {
     # matrix is 537 MB here against 34 GB at llama31-8b, which is why correctness is
     # established at this shape and only timing is taken at the production one.
     "gqa2k": dict(batch=1, seqlen=2048, hq=32, hkv=8, d=128),
+    # b*hq bisection for the eligibility floor: 8 loses 3x, 32 wins 1.28x, and nothing
+    # between them has been measured.
+    "w12": dict(batch=1, seqlen=4096, hq=12, hkv=4, d=128),
+    "w16": dict(batch=2, seqlen=4096, hq=8,  hkv=2, d=128),
+    "w24": dict(batch=3, seqlen=4096, hq=8,  hkv=2, d=128),
+    "w32": dict(batch=4, seqlen=4096, hq=8,  hkv=2, d=128),
+    # b*hq held at 8 while seqlen varies, to separate the two variables. The only measured
+    # loss so far was b1/s1024/hq8, and it was read as a b*hq floor without testing seqlen.
+    "w8s1024": dict(batch=1, seqlen=1024, hq=8, hkv=2, d=128),
+    "w8s2048": dict(batch=1, seqlen=2048, hq=8, hkv=2, d=128),
+    "w8s4096": dict(batch=1, seqlen=4096, hq=8, hkv=2, d=128),
+    "w8s8192": dict(batch=1, seqlen=8192, hq=8, hkv=2, d=128),
     "mid": dict(batch=2, seqlen=4096, hq=32, hkv=8, d=128),
     "llama31-8b": dict(batch=4, seqlen=8192, hq=32, hkv=8, d=128),
 }
@@ -219,19 +231,18 @@ def main() -> int:
         # reference: at this shape the scores matrix alone is 34 GB, and the champion is the
         # thing the acceptance line is stated against anyway. Both run in one process on one
         # card, so the comparison is apples to apples.
-        from primus_turbo.pytorch.ops.attention.flash_attn_interface import flash_attn_func
-
-        qg = q.clone().requires_grad_(True)
-        kg = k.clone().requires_grad_(True)
-        vg = v.clone().requires_grad_(True)
-        o_ref = flash_attn_func(qg, kg, vg, causal=True)
-        torch.cuda.synchronize()
-
-        def champ():
-            for g in (qg, kg, vg):
-                g.grad = None
-            o_ref.backward(do, retain_graph=True)
-            return qg.grad, kg.grad, vg.grad
+        # The reference arm calls dense_fused_backward DIRECTLY, not through flash_attn_func.
+        #
+        # This is not a style preference. Once the ASM backward went behind the dispatcher,
+        # a reference taken through flash_attn_func silently becomes the ASM backward
+        # wherever the gate engages -- so the measurement compares the thing against itself
+        # and reports a ratio near 1. It already happened: the b*hq=32 row of the floor
+        # sweep came back at 1.362x while every row below the gate's threshold, where the
+        # dispatcher still fell through to Triton, came back at 1.8-3.1x. Calling the
+        # vendored backward by name cannot be captured by a gate.
+        from primus_turbo.pytorch.kernels.attention.attention_fused_bwd_impl import (
+            dense_fused_backward,
+        )
 
         scale = 1.0 / math.sqrt(d)
         from primus_turbo.pytorch.ops.attention.flash_attn_interface import (
@@ -266,6 +277,12 @@ def main() -> int:
                 ts.append(a.elapsed_time(bb))
             ts.sort()
             return ts[len(ts) // 2]
+
+        def champ():
+            return dense_fused_backward(
+                do.contiguous(), q, k, v, o_t, lse_t,
+                softmax_scale=scale, causal=True, window_size=(-1, -1),
+            )
 
         cdq, cdk, cdv = champ()
         adq, adk, adv = asm_bwd()
