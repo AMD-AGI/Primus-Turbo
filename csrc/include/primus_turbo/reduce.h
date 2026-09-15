@@ -28,12 +28,8 @@ int64_t get_reduce_row_workspace_sizes(const int64_t &outer_len, const int64_t &
 
 template <typename ComputeType>
 int64_t get_reduce_col_workspace_sizes(const int64_t batch, const int64_t m, const int64_t n) {
-    const int BLOCK = 256;
-    // Host-side size query must not call warp_size()/HIP. JAX abstract eval
-    // runs before a device is bound; a failed HIP query used to throw
-    // "Unknown architecture". WAVE=64 is the CDNA default; on wave32 this
-    // over-allocates (fewer warps → larger buffer), which is safe.
-    const int NUM_WARP = BLOCK / 64;
+    const int BLOCK    = 256;
+    const int NUM_WARP = BLOCK / warp_size();
     const int UNROLL_M = 8;
 
     const int64_t cnt =
