@@ -62,13 +62,16 @@ def _sink_ok(sink: Optional[torch.Tensor], num_heads_q: int) -> bool:
     return sink is None or (sink.dtype == torch.float32 and sink.numel() == num_heads_q)
 
 
-def _gqa_group_ok(num_heads_q: int, num_heads_kv: int) -> bool:
+def _gqa_group_ok(num_heads_q: int, num_heads_kv: int, head_dim: int) -> bool:
     """G = Hq // Hkv must be a power of two in [1, 256], so it divides BLOCK_SIZE for the
-    dkdv backward's cooperative (delta, lse) stage. Anything else falls back to aiter."""
+    dkdv backward's cooperative (delta, lse) stage. Hq*D must also be a multiple of 128:
+    the backward's fused dQ reduce tiles 2*Hq*D and asserts on it (_assert_fusable), so a
+    shape that fails it has to be refused here rather than reaching the kernel builder.
+    Anything else falls back to aiter."""
     if num_heads_kv <= 0 or num_heads_q % num_heads_kv != 0:
         return False
     g = num_heads_q // num_heads_kv
-    return 1 <= g <= 256 and (g & (g - 1)) == 0
+    return 1 <= g <= 256 and (g & (g - 1)) == 0 and (num_heads_q * head_dim) % 128 == 0
 
 
 def _flydsl_common_ok(
@@ -207,7 +210,7 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
         # for it has to go to aiter, which does.
         if return_softmax:
             return False
-        if not _gqa_group_ok(q.shape[2], k.shape[2]) or not _sink_ok(sink, q.shape[2]):
+        if not _gqa_group_ok(q.shape[2], k.shape[2], q.shape[3]) or not _sink_ok(sink, q.shape[2]):
             return False
         return _flydsl_common_ok(q, causal, window_size, softmax_scale, dropout_p, bias, alibi_slopes)
 
@@ -480,7 +483,11 @@ class VarlenAttnFwdFlydslBackend(KernelBackend):
         **kwargs,
     ) -> bool:
         # varlen THD: q [total, Hq, D], k [total, Hkv, D].
-        if k is None or not _gqa_group_ok(q.shape[1], k.shape[1]) or not _sink_ok(sink, q.shape[1]):
+        if (
+            k is None
+            or not _gqa_group_ok(q.shape[1], k.shape[1], q.shape[2])
+            or not _sink_ok(sink, q.shape[1])
+        ):
             return False
         if not _flydsl_common_ok(q, causal, window_size, softmax_scale, dropout_p, bias, alibi_slopes):
             return False

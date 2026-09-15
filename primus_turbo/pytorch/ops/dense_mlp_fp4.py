@@ -61,7 +61,7 @@ _PROBS_ONES: dict = {}
 def _probs_ones(M: int, device) -> torch.Tensor:
     key = (M, str(device))
     t = _PROBS_ONES.get(key)
-    if t is None or t.device != device:
+    if t is None:
         t = torch.ones(M, device=device, dtype=torch.float32)
         _PROBS_ONES[key] = t
     return t
@@ -475,7 +475,12 @@ def dense_mlp_fp4(
     if out_dtype is None:
         out_dtype = x.dtype
 
-    if _fuse_act_quant(fuse_act_quant):
+    fused = _fuse_act_quant(fuse_act_quant)
+    assert x_prequant is None or fused, (
+        "x_prequant needs fuse_act_quant=True (or PRIMUS_TURBO_DENSE_MLP_FUSE_QUANT=1): the "
+        "unfused path quantizes x itself and would ignore the pre-quantized pair."
+    )
+    if fused:
         x_row_pre = x_rs_pre = x_col_pre = x_cs_pre = None
         if x_prequant is not None:
             x_row_pre, x_rs_pre, x_col_pre, x_cs_pre = x_prequant
