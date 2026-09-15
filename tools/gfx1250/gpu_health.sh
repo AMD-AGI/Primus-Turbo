@@ -65,7 +65,13 @@ health_state() {
 #
 # compute_probe STAGES the answer, because the two failure modes need opposite responses:
 #   init completes but slowly -> DEGRADED: widen timeouts and keep working
-#   init never returns        -> WEDGED:   stop dispatching, switch to CPU work
+#   init never returns        -> WEDGED:   stop dispatching, report, switch to CPU work
+#
+# On WEDGED, do NOT reload the amdgpu module. On 2026-09-15 that was tried on a card that
+# could create a context but not execute work, and the machine became unreachable -- SSH
+# included -- until a human AC-cycled it. PROGRESS.md already records that the driver's own
+# reset never completes on a wedged card. The downside of a driver-level action here is not
+# "no improvement", it is "the whole box is gone".
 # A single end-to-end matmul probe cannot tell them apart; it just times out either way.
 compute_probe() {
   local budget=${1:-600} ctr=${CTR:-fa-repro}
