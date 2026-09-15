@@ -81,6 +81,11 @@ SHAPES = {
     "w8s2048": dict(batch=1, seqlen=2048, hq=8, hkv=2, d=128),
     "w8s4096": dict(batch=1, seqlen=4096, hq=8, hkv=2, d=128),
     "w8s8192": dict(batch=1, seqlen=8192, hq=8, hkv=2, d=128),
+    # seqlen held at 1024 -- the only losing point -- while b*hq rises. If these win, the
+    # boundary is seqlen and not parallelism, and the gate should say so.
+    "s1024w32": dict(batch=4, seqlen=1024, hq=8,  hkv=2, d=128),
+    "s1024w128": dict(batch=4, seqlen=1024, hq=32, hkv=8, d=128),
+    "s1536w8": dict(batch=1, seqlen=1536, hq=8, hkv=2, d=128),
     "mid": dict(batch=2, seqlen=4096, hq=32, hkv=8, d=128),
     "llama31-8b": dict(batch=4, seqlen=8192, hq=32, hkv=8, d=128),
 }

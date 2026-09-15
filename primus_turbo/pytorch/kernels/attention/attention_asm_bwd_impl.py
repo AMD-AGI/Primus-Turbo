@@ -7,7 +7,9 @@ shipping, so this file cannot make a working configuration worse.
 Three kernel launches per backward, not one:
 
     bwd_hd128_odo_bf16            delta = rowsum(dO * O)
-    bwd_hd128_bf16_causal_br_a32_pssk   the body; 514 buffer_atomic_add_f32 into an fp32 dq_acc
+    bwd_hd128_bf16_causal_br_a32_pssk   the body (mask=0 object when non-causal, and the x
+                                        grid is halved for causal only); 514
+                                        buffer_atomic_add_f32 into an fp32 dq_acc
     bwd_hd128_dq_convert_bf16     dq_acc fp32 -> dq bf16
 
 WHY dk/dv ARE ALLOCATED PER Q HEAD. The body's grid is (kv_tiles, nhead_q, batch), so under
@@ -17,21 +19,11 @@ faulted outright at seqlen 256 (page not present) and silently corrupted at seql
 giving dk/dv about -0.3 dB while dq stayed correct at 52.2. Per q head plus a host-side
 reduction is correct at every seqlen tested from 128 to 8192.
 
-WHY THERE IS A PARALLELISM FLOOR. The reduction and the zeroed fp32 dq_acc are fixed costs,
-and the kernel wants one resident workgroup per CU across 320 KB of LDS. Measured backward
-ratios against the vendored fused backward at 1100 MHz:
-
-    b=4 s=8192 hq=32   17.675 -> 10.098 ms   1.750x
-    b=2 s=8192 hq=32    9.007 ->  6.141 ms   1.467x
-    b=4 s=4096 hq=32    5.538 ->  4.405 ms   1.257x
-    b=1 s=4096 hq=32    3.201 ->  2.497 ms   1.282x
-    b=4 s=4096 hq=8     3.232 ->  2.518 ms   1.284x
-    b=1 s=1024 hq=8     0.743 ->  2.218 ms   0.335x   <-- a 3x LOSS
-
-That table reads as a batch*nhead_q >= 32 floor, and the gate applies one. Treat it as
-provisional: it rests on a single losing measurement, taken through the harness rather than
-head-to-head, and a direct comparison of that same shape says the opposite. See the note on
-_MIN_PARALLEL_WORK_ASM below.
+WHY THERE IS A SEQUENCE-LENGTH FLOOR. Three launches, a zeroed fp32 dq_acc and a host-side
+reduction are fixed costs, and the kernel wants one resident workgroup per CU across 320 KB
+of LDS. Its own time barely moves with the work -- 0.88 / 0.91 / 1.00 / 1.34 ms from seqlen
+1024 to 8192 -- so below roughly 2048 there is not enough work to amortise it. The table and
+the reasoning are on _MIN_SEQLEN_ASM below.
 """
 
 from __future__ import annotations
@@ -55,15 +47,28 @@ _TRACE_FILE = os.environ.get("PRIMUS_TURBO_ASM_BWD_TRACE_FILE", "")
 # at the same time and makes the comparison meaningless.
 _DISABLED = os.environ.get("PRIMUS_TURBO_ATTN_DISABLE_ASM_BWD", "") not in ("", "0")
 
-# UNDER REVIEW -- this threshold was extrapolated from ONE measurement and the extrapolation
-# looks wrong. It came from b=1 s=1024 hq=8 measuring a 3x loss through the harness. A
-# head-to-head of the SAME shape in one process measures a 1.81x WIN, and holding b*nhead_q
-# at 8 while sweeping seqlen gives 1.81 / 2.04 / 2.87 / 3.10x at 1024 / 2048 / 4096 / 8192.
-# The two disagree because the harness comparison and the head-to-head do not measure the
-# same thing, and that is being re-measured with an uncontaminated reference arm before this
-# number moves. Left at 32 in the meantime: too conservative only costs speed on small
-# shapes, while too permissive would ship a regression.
-_MIN_PARALLEL_WORK_ASM = int(os.environ.get("PRIMUS_TURBO_ASM_BWD_MIN_WORK", "32"))
+# The gate is on SEQUENCE LENGTH, not parallelism. Measured head-to-head against
+# dense_fused_backward, both arms in one process (ratios are fused/asm, >1 means the ASM
+# kernel wins):
+#
+#   seqlen  b*nhead_q=8   =32     =128
+#     1024      0.660x   0.632x  0.537x     <-- loses at every parallelism, including
+#     1536      0.869x                          the production value of 128
+#     2048      1.748x   1.549x
+#     4096      2.812x   2.110x
+#     8192      3.954x            2.002x
+#
+# The ASM backward's own time is nearly constant -- 0.88 / 0.91 / 1.00 / 1.34 ms across a
+# 16x range of work -- so it has a fixed floor of roughly 0.85 ms and wins once there is
+# enough work to amortise it. dense_fused_backward at seqlen 1024 costs 0.5806 / 0.5893 /
+# 0.5785 ms at b*nhead_q of 8 / 32 / 128, i.e. flat: at that size it is latency-bound and
+# more parallelism buys nothing. That is why batch*nhead_q does not predict the crossover
+# and seqlen does.
+#
+# An earlier version of this file gated on batch*nhead_q >= 32, extrapolated from a single
+# losing measurement. It was wrong in both directions: it would have declined seqlen 8192 at
+# b*nhead_q=8, which wins 3.95x, and admitted seqlen 1024 at b*nhead_q=128, which loses.
+_MIN_SEQLEN_ASM = int(os.environ.get("PRIMUS_TURBO_ASM_BWD_MIN_SEQLEN", "2048"))
 
 _SEEN: set = set()
 _LAUNCH = None
@@ -120,9 +125,9 @@ def asm_backward_eligible(
 ) -> bool:
     """Whether the prebuilt ASM backward can serve this call.
 
-    Deliberately narrow. Only the causal bottom-right hd128 bf16 variant has been validated
-    on hardware; everything else is declined rather than guessed at, because a wrong kernarg
-    here does not raise, it reads the wrong memory.
+    Deliberately narrow: hd128 bf16 only, no sink, window, bias, alibi or dropout. Anything
+    not validated on hardware is declined rather than guessed at, because a wrong kernarg on
+    this path does not raise, it reads the wrong memory.
     """
     if _DISABLED:
         return _no("disabled by PRIMUS_TURBO_ATTN_DISABLE_ASM_BWD")
@@ -134,9 +139,8 @@ def asm_backward_eligible(
         return _no("dtype not bf16")
     if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
         return _no("not 4-D")
-    if not causal:
-        # bwd_hd128_bf16_a32_pssk (the non-causal object) exists and is unvalidated here.
-        return _no("only the causal variant is validated")
+    # Non-causal uses the mask=0 object with the x grid NOT halved; validated on 0915 at
+    # three shapes, dq 52.48-52.52 / dk 50.77-50.82 / dv 50.68-50.91 dB.
     if q.shape[-1] != 128 or k.shape[-1] != 128 or v.shape[-1] != 128:
         return _no("head_dim != 128; the .co set covers nothing else on this arch")
     if q.shape[1] != k.shape[1]:
@@ -152,8 +156,8 @@ def asm_backward_eligible(
     nhead_q, nhead_k = q.shape[2], k.shape[2]
     if nhead_q % nhead_k:
         return _no("nhead_q not a multiple of nhead_k")
-    if q.shape[0] * nhead_q < _MIN_PARALLEL_WORK_ASM:
-        return _no(f"batch*nhead_q < {_MIN_PARALLEL_WORK_ASM}; measured a 3x loss there")
+    if q.shape[1] < _MIN_SEQLEN_ASM:
+        return _no(f"seqlen < {_MIN_SEQLEN_ASM}; the fixed cost is not amortised below it")
     if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
         return _no("q/k/v not contiguous; the byte strides assume it")
     # Says so when it FIRES, not only when it declines. Silence from a decline-only trace
@@ -173,7 +177,7 @@ def asm_dense_backward(dout, q, k, v, out, lse, softmax_scale, causal=True):
     if m is None:  # pragma: no cover - guarded by the gate
         raise RuntimeError("asm_dense_backward called without the prebuilt objects")
     dq, dk, dv = m.asm_backward(
-        q, k, v, out, dout.contiguous(), lse, softmax_scale, dkdv_heads="q"
+        q, k, v, out, dout.contiguous(), lse, softmax_scale, dkdv_heads="q", causal=causal
     )
     rep = q.shape[2] // k.shape[2]
     if rep > 1:
