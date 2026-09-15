@@ -257,13 +257,14 @@ def main() -> int:
         from primus_turbo.pytorch.ops.attention.flash_attn_interface import (
             triton_dense_forward,
         )
-        o_t, lse_t = triton_dense_forward(q, k, v, softmax_scale=scale, causal=True)
+        causal = not args.no_causal
+        o_t, lse_t = triton_dense_forward(q, k, v, softmax_scale=scale, causal=causal)
         torch.cuda.synchronize()
         rep = hq // hk
 
         def asm_bwd():
             dq, dk, dv = L.asm_backward(q, k, v, o_t, do, lse_t, dkdv_heads="q",
-                                        co_variant=args.co_variant)
+                                        co_variant=args.co_variant, causal=causal)
             if rep > 1:
                 dk = dk.view(b, s, hk, rep, d).float().sum(3).to(k.dtype)
                 dv = dv.view(b, s, hk, rep, d).float().sum(3).to(v.dtype)
@@ -290,7 +291,7 @@ def main() -> int:
         def champ():
             return dense_fused_backward(
                 do.contiguous(), q, k, v, o_t, lse_t,
-                softmax_scale=scale, causal=True, window_size=(-1, -1),
+                softmax_scale=scale, causal=causal, window_size=(-1, -1),
             )
 
         cdq, cdk, cdv = champ()

@@ -191,7 +191,7 @@ SYM_NONCAUSAL = "_ZN5aiter28fmha_bwd_hd128_bf16_a32_psskE"
 
 
 def asm_backward(q, k, v, o, do, lse, softmax_scale=None, hip=None, dkdv_heads="kv",
-                 co_variant="", causal=True, grid_halve=None):
+                 co_variant="", causal=True, grid_halve=None, scratch=None):
     """Run the three-kernel ASM backward. Returns (dq, dk, dv).
 
     q/k/v/o/do are [B, S, H, D] bf16 as Primus-Turbo lays them out; lse is
@@ -224,7 +224,14 @@ def asm_backward(q, k, v, o, do, lse, softmax_scale=None, hip=None, dkdv_heads="
     lse = lse.contiguous().float()
 
     # 514 buffer_atomic_add_f32 accumulate into this, so it must be fp32 and zeroed.
-    dq_acc = torch.zeros((batch, nhead_q, seqlen_q, head_dim), device=q.device, dtype=torch.float32)
+    if scratch is not None and "dq_acc" in scratch:
+        # dq_acc must still be zeroed every call -- the 514 buffer_atomic_add_f32 accumulate
+        # into it -- but zeroing a cached block beats allocating a fresh 536 MB one per layer.
+        dq_acc = scratch["dq_acc"]
+        dq_acc.zero_()
+    else:
+        dq_acc = torch.zeros((batch, nhead_q, seqlen_q, head_dim), device=q.device,
+                             dtype=torch.float32)
     delta = torch.empty((batch, nhead_q, seqlen_q), device=q.device, dtype=torch.float32)
     dq = torch.empty_like(q)
     # Under GQA, ratio q heads share one kv head, and the main kernel's grid is
@@ -233,7 +240,12 @@ def asm_backward(q, k, v, o, do, lse, softmax_scale=None, hip=None, dkdv_heads="
     # Measured on 0915: with ratio=1 all three tensors come back at ~52 dB, while at ratio=4
     # dq stays correct and dk/dv collapse to about -0.3 dB, which is what an unsynchronised
     # 4-way overwrite of the same tile looks like.
-    if dkdv_heads == "q":
+    if scratch is not None and "dk" in scratch:
+        # Caller-supplied scratch, reused across calls. The caller is responsible for only
+        # passing dk/dv scratch when it will reduce them into fresh tensors afterwards.
+        dk = scratch["dk"]
+        dv = scratch["dv"]
+    elif dkdv_heads == "q":
         dk = torch.zeros((batch, seqlen_k, nhead_q, head_dim), device=k.device, dtype=k.dtype)
         dv = torch.zeros((batch, seqlen_k, nhead_q, head_dim), device=v.device, dtype=v.dtype)
     else:

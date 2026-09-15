@@ -73,6 +73,27 @@ _MIN_SEQLEN_ASM = int(os.environ.get("PRIMUS_TURBO_ASM_BWD_MIN_SEQLEN", "2048"))
 _SEEN: set = set()
 _LAUNCH = None
 
+# Scratch buffers, cached per (shape, device). Measured 0915: without this the op-level win
+# of 1.74x on the backward turned into a 6.8% end-to-end LOSS (1858 vs 1984 tps over 20
+# training steps). The kernel needs an fp32 dq_acc of batch*nhead_q*seqlen*head_dim -- 536 MB
+# at the production shape -- plus dk/dv allocated per q head rather than per kv head, another
+# 268 MB each. That is 1.07 GB per layer per step, about 34 GB of allocator churn across 32
+# layers, and the op-level harness never sees it because the caching allocator reuses the
+# same blocks across its iterations.
+#
+# Only SCRATCH is cached. dq and the reduced dk/dv are returned to autograd and must be
+# fresh: handing back a reused buffer would let the next layer's backward overwrite a
+# gradient that has not been accumulated yet.
+_SCRATCH: dict = {}
+
+
+def _scratch(key, shape, dtype, device):
+    buf = _SCRATCH.get(key)
+    if buf is None or buf.shape != shape or buf.dtype != dtype or buf.device != device:
+        buf = torch.empty(shape, dtype=dtype, device=device)
+        _SCRATCH[key] = buf
+    return buf
+
 
 def _say(msg: str, key: str) -> None:
     if not _TRACE or key in _SEEN:
@@ -176,13 +197,25 @@ def asm_dense_backward(dout, q, k, v, out, lse, softmax_scale, causal=True):
     m = _launcher()
     if m is None:  # pragma: no cover - guarded by the gate
         raise RuntimeError("asm_dense_backward called without the prebuilt objects")
-    dq, dk, dv = m.asm_backward(
-        q, k, v, out, dout.contiguous(), lse, softmax_scale, dkdv_heads="q", causal=causal
-    )
-    rep = q.shape[2] // k.shape[2]
+    b, s, hq, d = q.shape
+    hk = k.shape[2]
+    rep = hq // hk
+    dev = q.device
+    # dq_acc is pure scratch and always safe to reuse -- it is consumed by dq_convert and
+    # never returned. dk/dv scratch is only safe when rep > 1, because the reduction below
+    # then produces fresh output tensors; at rep == 1 there is no reduction and the buffers
+    # would be handed straight to autograd, where the next layer's backward would overwrite
+    # a gradient that has not been accumulated yet.
+    scratch = {"dq_acc": _scratch(("dq_acc", b, hq, s, d, dev), (b, hq, s, d),
+                                  torch.float32, dev)}
     if rep > 1:
-        b, s, _, d = dk.shape
-        hk = k.shape[2]
+        scratch["dk"] = _scratch(("dk", b, s, hq, d, dev), (b, s, hq, d), k.dtype, dev)
+        scratch["dv"] = _scratch(("dv", b, s, hq, d, dev), (b, s, hq, d), v.dtype, dev)
+    dq, dk, dv = m.asm_backward(
+        q, k, v, out, dout.contiguous(), lse, softmax_scale, dkdv_heads="q", causal=causal,
+        scratch=scratch,
+    )
+    if rep > 1:
         # fp32 accumulate: the partials are bf16 and summing four of them in bf16 costs
         # about 1.5 dB of SQNR for nothing.
         dk = dk.view(b, s, hk, rep, d).float().sum(3).to(k.dtype)
