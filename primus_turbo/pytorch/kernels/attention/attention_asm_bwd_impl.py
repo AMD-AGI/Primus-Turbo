@@ -47,40 +47,83 @@ _TRACE_FILE = os.environ.get("PRIMUS_TURBO_ASM_BWD_TRACE_FILE", "")
 # at the same time and makes the comparison meaningless.
 # DEFAULT OFF as of 0915. Opt in with PRIMUS_TURBO_ATTN_ENABLE_ASM_BWD=1.
 #
-# The kernel is 1.74x the vendored fused backward at the operator level, measured n=5 with
-# bit-identical SQNR, and that number is real. It is also the wrong number to ship on:
+# The kernel beats the vendored fused backward at the operator level and that is not in
+# dispute. It is still the wrong number to ship on, but the REASON changed on 0915 evening
+# once the two fixes below were finally verified on hardware. The old reason recorded here --
+# "6.78% regression from its memory footprint" -- was WRONG on both halves. Corrected:
 #
-#   20 training steps, llama-3.1-8B b=4 s=8192, only this switch differs
-#     ASM backward ON    1858 tps   mfu 34.49%
-#     ASM backward OFF   1984 tps   mfu 36.83%     <- 6.78% FASTER, at 30x the noise floor
+# WHAT THE REPLICATED MEASUREMENT SAYS (8-layer config, seed pinned, n=9 per arm).
+# The earlier single 32-layer pair (ON 1858 / OFF 1984 tps) and the first 8-layer pair
+# (ON +3.42%) are both unusable: no seed was set (torchtitan's set_determinism returns
+# WITHOUT seeding at world_size==1 when debug.seed is None, so weight init was fresh-random
+# per run), n=1 per arm, and the arms ran cold-then-hot in fixed order.
 #
-# TWO per-call costs, both invisible to operator-level timing, and I found them in the wrong
-# order. Neither is the kernel itself.
+# With debug.seed pinned and nine runs per arm, both arms turn out to be TRIMODAL:
+#
+#     ON   5901 x3 | 6011 x3 | 6420 x3      mean 6110.8   between-run sd 3.88%
+#     OFF  5822 x2 | 5936 x2 | 6327 x5      mean 6128.1   between-run sd 3.91%
+#
+# The variance is the SAME in both arms, so the multimodality belongs to e2e measurement on
+# this box, not to this kernel. Junction temp is 44.0 C and sclk 1100 MHz on every run, so it
+# is neither thermal nor clock; within a run throughput is flat (0.37%) and the scatter lives
+# entirely between processes. Mechanism unknown -- address/bank layout per process is the
+# leading guess and is NOT confirmed.
+#
+# Consequence for anyone measuring here: the run-to-run noise floor is ~3.9% and multimodal.
+# A single A/B pair cannot resolve anything smaller, and every e2e conclusion in this campaign
+# before 0915 evening was n=1. (An earlier draft of this comment claimed the ON arm was the
+# unstable one, sd 4.53% against OFF's 0.06% -- that was n=3, and those three OFF runs simply
+# happened to land in one mode. Same error, one level down.)
+#
+# Mean to mean the arms are indistinguishable: -0.28%, 0.15x the sem of the difference.
+# Mode to mode, however, ON leads consistently -- 6420/6327 = +1.5%, 6011/5936 = +1.3%,
+# 5901/5822 = +1.0% -- against an operator-level prediction of +1.36% (8 layers x 9.556 ms
+# saved over a 5.6 s step). That agreement is suggestive, NOT established: it assumes the two
+# arms' modes correspond to the same underlying system states, and the mode positions are not
+# in fact equal between arms. The overall mean washes out because the modes are sampled at
+# different rates (OFF hits its top mode 5/9, ON 3/9), a difference n=9 cannot call.
+#
+# So the default stays OFF because the end-to-end gain is UNMEASURABLE at n=9, while the path
+# costs 1 GiB of resident scratch, an eligibility gate and three .co files to maintain -- not
+# because it regresses. If the per-mode +1.2% can be nailed down (n=18 per arm, or by finding
+# and controlling the physical cause of the modes), this decision is worth revisiting.
+#
+# THE TWO PER-CALL COSTS, both invisible to operator-level timing. Neither is the kernel.
 #
 #   1. Module reload. asm_dense_backward was not passing a HipModule, so every backward built
 #      a fresh one with an empty cache and re-ran hipModuleLoad on all three .co files: 96
 #      loads per training step across 32 layers, never unloaded. Fixed (_hip below).
 #   2. Allocation. This backward needs an fp32 dq_acc the fused one does not -- that one has
-#      no atomics -- plus dk/dv per q head rather than per kv head: 1.07 GB per layer per
-#      step, ~34 GB of churn over 32 layers. Fixed (_SCRATCH below).
+#      no atomics -- plus dk/dv per q head rather than per kv head. Fixed (_SCRATCH below).
 #
-# Operator-level timing hides both the same way: 20 iterations of one call site reload three
-# modules 20 times and reuse the allocator's same blocks, which is nothing next to a
-# 32-layer step.
+# CORRECTION to what (2) costs. The old note said 1.07 GB per layer per step, ~34 GB of churn
+# over 32 layers, and that the scratch cache traded churn for peak. The per-LAYER part is
+# wrong: the _SCRATCH keys are shape-only (no layer index), so every identically-shaped layer
+# shares ONE buffer set -- dq_acc 0.500 GiB + dk/dv 0.250 GiB x2 = exactly 1.000 GiB
+# process-wide, independent of layer count. The 32-layer logs show it: ab-on and ab-off both
+# report 380.06 GiB to the byte (the ASM path cost zero extra reserved memory), and fix-on
+# with the cache reports 381.44 GiB -- a delta of 1.38 GiB, not 34. Note also that the
+# "memory:" figure in a step line is reserved_bytes.all.peak (allocator pool high-water,
+# reset each log), not live bytes, which is why the 8-layer delta (15.65 GiB at 36% occupancy,
+# where the allocator grows freely) is LARGER than the 32-layer one (1.38 GiB at 88%, where it
+# reuses) -- impossible for anything that scales with layers.
 #
-# I attributed the whole regression to (2), fixed only that, and it did not recover -- which
-# is itself the evidence that (1) was the larger of the two. Then caching the scratch traded
-# churn for peak on a config with no peak headroom: step-3 memory went 380.06 GiB (87.98%)
-# to 381.44 GiB (88.30%), the run took SIGBUS, and the dying process kept its KFD context
-# and 411 GB of VRAM until a power cycle.
+# So the SIGBUS on the 32-layer config was 1.38 GiB landing on a run already at 88.30%, not a
+# tens-of-GB footprint. Real, and a reason to keep headroom, but not the reason to default off.
 #
-# NEITHER FIX IS VERIFIED ON HARDWARE. The card was unusable when they were written. The
-# 6.78% above is the PRE-fix measurement; re-run the e2e A/B before believing anything about
-# what the fixes are worth.
+# CAUTION FOR WHOEVER TOUCHES THE OPERATOR-LEVEL NUMBERS NEXT. All four measurement entry
+# points -- tune_attention.py:529, t2_bringup.py:224/266, perfdq_diag.py:18 -- call
+# asm_backward WITHOUT hip= and WITHOUT scratch=, i.e. they still measure the UNFIXED path;
+# only the product call site below passes both. Two consequences, neither hardware-verified:
+# the recorded 1.74x understates the fixed kernel (re-measured 8.13-8.68 ms against 17.686,
+# ~2.18x), and the seqlen >= 2048 gate was derived from a ~0.85 ms fixed floor that partly
+# CONSISTED of the per-call hipModuleLoad -- so the floor should now be lower and the
+# threshold may be set too high. The nine measurements behind the gate need re-taking.
 #
-# So: correct, fast in isolation, and not shippable by default on this configuration. The
-# measurement entry points stay (--impl asmbwd, the harness switches) so the operator-level
-# result remains reproducible.
+# So: correct, faster in isolation than recorded, and not shippable by default because it is
+# not reproducible run to run. The measurement entry points stay (--impl asmbwd, the harness
+# switches) so the operator-level result remains reproducible -- but see the caution above
+# before comparing their output to anything the product path produces.
 _ENABLED = os.environ.get("PRIMUS_TURBO_ATTN_ENABLE_ASM_BWD", "") not in ("", "0")
 _DISABLED = not _ENABLED
 
@@ -219,7 +262,7 @@ def asm_backward_eligible(
     """
     if _DISABLED:
         return _no("off by default; set PRIMUS_TURBO_ATTN_ENABLE_ASM_BWD=1 to opt in "
-                   "(6.78% e2e regression from its memory footprint -- see module docstring)")
+                   "(no measurable e2e gain at n=9: -0.28%, 0.15x sem -- see module docstring)")
     if not is_gfx1250():
         return _no("not gfx1250")
     if _launcher() is None:
