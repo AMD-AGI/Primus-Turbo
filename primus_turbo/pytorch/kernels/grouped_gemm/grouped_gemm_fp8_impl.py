@@ -1257,6 +1257,7 @@ def grouped_gemm_fp8_glu_impl(
     out_row_scaling_recipe: ScalingRecipe,
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
+    clamp_limit: float | None = None,
     k_align: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """fc1 grouped GEMM with the GLU activation and its quantisation fused in.
@@ -1297,10 +1298,12 @@ def grouped_gemm_fp8_glu_impl(
     from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_glu_kernel import (
         grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel,
     )
+    from primus_turbo.flydsl.utils.gemm_epilogue_helper import AMAX_PARTIAL_SLOTS
     from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
         quantize_fp8_tensorwise_pad_impl,
     )
 
+    amax_partial = torch.zeros(AMAX_PARTIAL_SLOTS, device=a.device, dtype=torch.float32)
     grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
         a,
         b,
@@ -1312,14 +1315,18 @@ def grouped_gemm_fp8_glu_impl(
         intermediate,
         trans_b=trans_b,
         activation=activation,
+        clamp_limit=clamp_limit,
         out_dtype=out_dtype,
         num_cu=num_cu,
+        amax_partial=amax_partial,
     )
 
     # k_align pads the activation's I -> Ip (fc2's contraction K), copy-free: the
     # quantiser writes the padded buffer directly and zeroes the tail, so w2's own
     # padded-K contraction reads zeros there and fc2 stays bitwise-identical.
-    act_fp8, act_scale_inv = quantize_fp8_tensorwise_pad_impl(act, out_quant_dtype, k_align=k_align)
+    act_fp8, act_scale_inv = quantize_fp8_tensorwise_pad_impl(
+        act, out_quant_dtype, k_align=k_align, amax_partials=amax_partial
+    )
     return intermediate, act_fp8, act_scale_inv
 
 
@@ -1342,6 +1349,7 @@ def grouped_gemm_fp8_dglu_impl(
     out_row_scaling_recipe: ScalingRecipe,
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
+    clamp_limit: float | None = None,
     i_real: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """fc2 dgrad with the GLU activation gradient and its quantisation fused in.
@@ -1378,6 +1386,7 @@ def grouped_gemm_fp8_dglu_impl(
         grouped_gemm_fp8_dglu_grad_probs_partial_spec,
         grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel,
     )
+    from primus_turbo.flydsl.utils.gemm_epilogue_helper import AMAX_PARTIAL_SLOTS
     from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
         quantize_fp8_tensorwise_pad_impl,
     )
@@ -1386,6 +1395,7 @@ def grouped_gemm_fp8_dglu_impl(
     grad_probs_partial = _alloc_grad_probs_partial(
         grouped_gemm_fp8_dglu_grad_probs_partial_spec(a, b, i_real=N), a.device
     )
+    amax_partial = torch.zeros(AMAX_PARTIAL_SLOTS, device=a.device, dtype=torch.float32)
     grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
         a,
         b,
@@ -1398,11 +1408,15 @@ def grouped_gemm_fp8_dglu_impl(
         grad_probs_partial,
         trans_b=trans_b,
         activation=activation,
+        clamp_limit=clamp_limit,
         num_cu=num_cu,
         i_real=i_real,
+        amax_partial=amax_partial,
     )
 
-    out_fp8, out_scale_inv = quantize_fp8_tensorwise_pad_impl(out, out_quant_dtype, k_align=1)
+    out_fp8, out_scale_inv = quantize_fp8_tensorwise_pad_impl(
+        out, out_quant_dtype, k_align=1, amax_partials=amax_partial
+    )
     return torch.sum(grad_probs_partial, dim=0), out_fp8, out_scale_inv
 
 
@@ -1424,6 +1438,7 @@ def grouped_gemm_fp8_glu_impl_meta(
     out_row_scaling_recipe: ScalingRecipe,
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
+    clamp_limit: float | None = None,
     k_align: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     _check_glu_dispatch(config, trans_a)
@@ -1470,6 +1485,7 @@ def grouped_gemm_fp8_dglu_impl_meta(
     out_row_scaling_recipe: ScalingRecipe,
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
+    clamp_limit: float | None = None,
     i_real: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     _check_glu_dispatch(config, trans_a)

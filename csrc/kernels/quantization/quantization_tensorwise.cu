@@ -347,6 +347,15 @@ void quantize_tensorwise_amax_scale_impl(const FType *x, const int64_t n, const 
                                         AMAX_SCALE_EPS);
 }
 
+void tensorwise_scale_from_partials_impl(const float *partials, const int32_t count,
+                                         const float q_max, float *amax, float *scale,
+                                         float *scale_inv, hipStream_t stream) {
+    constexpr int32_t SCALE_BLOCK = 256;
+    tensorwise_amax_scale_kernel<SCALE_BLOCK, AMAX_MAX_BLOCKS / SCALE_BLOCK>
+        <<<1, SCALE_BLOCK, 0, stream>>>(partials, count, q_max, amax, scale, scale_inv,
+                                        AMAX_SCALE_EPS);
+}
+
 // Tensorwise quantize + K-pad
 constexpr int32_t PAD_ROW_BLOCK_SIZE = 256;
 constexpr int64_t PAD_MAX_BLOCKS     = 1 << 20;

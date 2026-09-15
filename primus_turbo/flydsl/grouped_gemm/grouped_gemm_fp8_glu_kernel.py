@@ -33,6 +33,11 @@ from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_kernel import (
     _compile_grouped_nn,
     _compile_grouped_nt,
 )
+from primus_turbo.flydsl.utils.gemm_epilogue_helper import (
+    AMAX_PARTIAL_SLOTS,
+    _check_activation,
+    _check_clamp_limit,
+)
 
 _GROUPED_GLU_CACHE: dict = {}
 
@@ -142,13 +147,15 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
     trans_b: bool = False,
     *,
     activation: str = "silu",
+    clamp_limit: "float | None" = None,
     out_dtype=torch.bfloat16,
     num_cu: "int | None" = None,
+    amax_partial: "torch.Tensor | None" = None,
 ) -> "tuple[torch.Tensor, torch.Tensor]":
-    """FlyDSL fc1 grouped fp8 GEMM with a fused SwiGLU epilogue, matching the Triton entry.
+    """FlyDSL fc1 grouped fp8 GEMM with a fused GLU epilogue, matching the Triton entry.
 
     Computes ``l1 = [gate|up] = (a[g] @ b[g]^T) * a_scale * b_scale`` [M, 2I] and
-    ``act = silu(gate) * up * probs`` [M, I] in one launch, both in ``out_dtype``.
+    ``act = f(gate) * up * probs`` [M, I] in one launch, both in ``out_dtype``.
     ``l1`` is written because backward's dswiglu needs both halves; ``act`` is the
     only one that carries ``probs``.
 
@@ -161,15 +168,22 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
     quadrant registers, and the NN twin has no equivalent hook yet.
 
     Args:
+        clamp_limit: pre-multiplication clamp bound, or None for no clamp; silu only.
+            See :func:`~primus_turbo.flydsl.utils.gemm_epilogue_helper._glu_clamp`.
         act_out: [M_total, I] buffer receiving the activation.
         intermediate_out: [M_total, 2I] buffer receiving ``l1``. Both are the
             caller's to allocate: every slot is written, so neither needs
             initialising.
+        amax_partial: optional zeroed float32 [``AMAX_PARTIAL_SLOTS``] receiving
+            ``act``'s abs-max, folded a work group at a time. Passing it saves the
+            tensorwise quantiser a whole read of ``act``; the value is the same one
+            that pass would have found, a max being exact and order-independent.
 
     Returns:
         ``(act_out, intermediate_out)``.
     """
-    assert activation == "silu", f"FlyDSL fused GLU implements silu only, got {activation}"
+    _check_activation(activation)
+    _check_clamp_limit(activation, clamp_limit)
     assert trans_b, "FlyDSL fused GLU is NT only: pass b as [G, 2I, K]"
     assert a.ndim == 2 and b.ndim == 3
     M_total, K = a.shape
@@ -181,6 +195,12 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
     assert probs.ndim == 1 and probs.shape[0] == M_total and probs.dtype == torch.float32
 
     act, l1 = act_out, intermediate_out
+    _amax = amax_partial is not None
+    if _amax:
+        assert amax_partial.shape == (AMAX_PARTIAL_SLOTS,) and amax_partial.dtype == torch.float32, (
+            f"amax_partial must be [{AMAX_PARTIAL_SLOTS}] float32, got "
+            f"{list(amax_partial.shape)} {amax_partial.dtype}"
+        )
     assert act.shape == (M_total, I) and act.dtype == out_dtype and act.device == a.device
     assert l1.shape == (M_total, N2) and l1.dtype == out_dtype and l1.device == a.device
 
@@ -190,7 +210,18 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
     cbsz = 1 if a.dtype == torch.float8_e5m2 else 0
     blgp = 1 if b.dtype == torch.float8_e5m2 else 0
     _capped = num_cu is not None and num_cu > 0
-    ckey = (I, K, G, out_fp16, cbsz, blgp, num_cu if _capped else 0)
+    ckey = (
+        I,
+        K,
+        G,
+        out_fp16,
+        cbsz,
+        blgp,
+        num_cu if _capped else 0,
+        _amax,
+        activation,
+        clamp_limit,
+    )
 
     launch = _GROUPED_GLU_CACHE.get(ckey)
     if launch is None:
@@ -235,6 +266,9 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
                 # (aux=16) costs 1.5x, so this is not a monotone knob.
                 cstore_aux=2,
                 glu_act_aux=2,
+                glu_amax=_amax,
+                activation=activation,
+                clamp_limit=clamp_limit,
             )
 
         def _probe():
@@ -245,6 +279,9 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
                 l1_c = torch.empty((M_c, N2), device=a.device, dtype=out_dtype)
                 act_c = torch.empty((M_c, I), device=a.device, dtype=out_dtype)
                 probs_c = torch.ones(M_c, device=a.device, dtype=torch.float32)
+                amax_c = (
+                    torch.zeros(AMAX_PARTIAL_SLOTS, device=a.device, dtype=torch.float32) if _amax else act_c
+                )
             except torch.cuda.OutOfMemoryError:
                 return None
             return (
@@ -253,6 +290,7 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
                 l1_c,
                 act_c,
                 probs_c,
+                amax_c,
                 a_scale.float().reshape(1),
                 b_scale.float().reshape(1),
                 _balanced_group_offs(M_c, G, a.device),
@@ -272,6 +310,7 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
             l1,
             act,
             probs,
+            amax_partial if _amax else act,
             a_scale.float().reshape(1),
             b_scale.float().reshape(1),
             go32,
@@ -334,10 +373,12 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
     trans_b: bool = False,
     *,
     activation: str = "silu",
+    clamp_limit: "float | None" = None,
     num_cu: "int | None" = None,
     i_real: "int | None" = None,
+    amax_partial: "torch.Tensor | None" = None,
 ) -> "torch.Tensor":
-    """FlyDSL fc2 dgrad with the SwiGLU gradient fused into its epilogue.
+    """FlyDSL fc2 dgrad with the GLU gradient fused into its epilogue.
 
     Computes ``dact = (a[g] @ b[g]) * a_scale * b_scale`` and consumes it in
     registers, so ``dact`` never reaches HBM:
@@ -354,16 +395,23 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
     NN only (``trans_b=False``, b [G, K, I]).
 
     Args:
+        clamp_limit: pre-multiplication clamp bound, or None for no clamp; silu only.
+            Must match the forward's, which decided the values this differentiates.
         out: [M_total, 2I] buffer receiving ``dl1``, in ``intermediate``'s dtype,
             gate gradient in [:, :I] and up in [:, I:].
         grad_probs_partial: float32 buffer receiving the grad_probs partials, as
             :func:`grouped_gemm_fp8_dglu_grad_probs_partial_spec` describes it --
             including that it has to arrive zeroed.
+        amax_partial: optional zeroed float32 [``AMAX_PARTIAL_SLOTS``] receiving
+            ``dl1``'s abs-max, folded a work group at a time. Passing it saves the
+            tensorwise quantiser a whole read of ``dl1``; the value is the same one
+            that pass would have found, a max being exact and order-independent.
 
     Returns:
         ``out``, for call-site convenience.
     """
-    assert activation == "silu", f"FlyDSL fused dGLU implements silu only, got {activation}"
+    _check_activation(activation)
+    _check_clamp_limit(activation, clamp_limit)
     assert not trans_b, "FlyDSL fused dGLU is NN only: pass b as [G, K, I]"
     assert a.ndim == 2 and b.ndim == 3 and intermediate.ndim == 2
     M_total, K = a.shape
@@ -390,6 +438,12 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
         "size it with grouped_gemm_fp8_dglu_grad_probs_partial_spec"
     )
     dl1 = out
+    _amax = amax_partial is not None
+    if _amax:
+        assert amax_partial.shape == (AMAX_PARTIAL_SLOTS,) and amax_partial.dtype == torch.float32, (
+            f"amax_partial must be [{AMAX_PARTIAL_SLOTS}] float32, got "
+            f"{list(amax_partial.shape)} {amax_partial.dtype}"
+        )
 
     _go64 = group_offs if group_offs.dtype == torch.int64 else group_offs.to(torch.int64)
     go32 = _go64.view(torch.int32)
@@ -397,7 +451,19 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
     cbsz = 1 if a.dtype == torch.float8_e5m2 else 0
     blgp = 1 if b.dtype == torch.float8_e5m2 else 0
     _capped = num_cu is not None and num_cu > 0
-    ckey = (I, K, G, out_fp16, cbsz, blgp, num_cu if _capped else 0, n_stride)
+    ckey = (
+        I,
+        K,
+        G,
+        out_fp16,
+        cbsz,
+        blgp,
+        num_cu if _capped else 0,
+        n_stride,
+        _amax,
+        activation,
+        clamp_limit,
+    )
 
     launch = _GROUPED_DGLU_CACHE.get(ckey)
     if launch is None:
@@ -425,6 +491,7 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
                 N=I,
                 n_stride=n_stride,
                 dglu=True,
+                dglu_amax=_amax,
                 glu_i=I,
                 # Non-temporal, as in the forward, but this only pays because the
                 # banded epilogue's accesses are whole lines: at 64 bytes a store
@@ -432,6 +499,8 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
                 # wave, and the two have to meet in L2 to form one, which
                 # non-temporal prevents. Per-wave staging preferred aux=0.
                 cstore_aux=2,
+                activation=activation,
+                clamp_limit=clamp_limit,
             )
 
         def _probe():
@@ -446,6 +515,9 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
                 dl1_c = torch.empty((M_c, 2 * I), device=a.device, dtype=out_dtype)
                 probs_c = torch.ones(M_c, device=a.device, dtype=torch.float32)
                 grad_probs_c = torch.zeros((partial_shape[0], M_c), device=a.device, dtype=torch.float32)
+                amax_c = (
+                    torch.zeros(AMAX_PARTIAL_SLOTS, device=a.device, dtype=torch.float32) if _amax else dl1_c
+                )
             except torch.cuda.OutOfMemoryError:
                 return None
             return (
@@ -458,6 +530,7 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
                 l1_c,
                 probs_c,
                 grad_probs_c,
+                amax_c,
                 M_c,
                 I,
                 M_c,
@@ -479,6 +552,7 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
             intermediate,
             probs,
             grad_probs_partial,
+            amax_partial if _amax else dl1,
             M_total,
             I,
             M_total,
