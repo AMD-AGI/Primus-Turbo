@@ -74,7 +74,7 @@ def pytest_collection_modifyitems(config, items):
                 "JAX default backend is CPU; Primus-Turbo JAX GPU tests require ROCm. "
                 f"devices={jax.devices()!r}. Check rocminfo / HSA (OUT_OF_RESOURCES) "
                 "and HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES."
-            )
+            ) from None
 
     if is_gfx1250:
         skip_gfx1250 = pytest.mark.skip(reason="Not yet supported on gfx1250")

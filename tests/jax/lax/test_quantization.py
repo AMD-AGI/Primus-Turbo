@@ -7,8 +7,8 @@
 import jax
 import jax.numpy as jnp
 import pytest
-
 from primus_turbo.jax._C import get_quantize_fp8_rowwise_workspace_size
+
 from primus_turbo.jax.core.low_precision import (
     ScalingGranularity,
     float8_e4m3,
