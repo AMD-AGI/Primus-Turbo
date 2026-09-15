@@ -2509,7 +2509,7 @@ def _mxfp4_preshuf_geom(k128):
     return ku, max(_MXFP4_PRESHUF_BLK // ku, 64)
 
 
-def mxfp4_packed_scale_byte(row, kblk, *, k128, b_ilv, is_b):
+def mxfp4_packed_scale_byte(row, kblk, *, k128, b_ilv, is_b, kk=None):
     """Byte offset of a canonical E8M0 scale (``row``, ``kblk`` = k // 32) in the packed layout.
 
     The scatter counterpart of the gather in ``_build_mxfp4_preshuffle_kernel_ab``. That pass
@@ -2520,7 +2520,12 @@ def mxfp4_packed_scale_byte(row, kblk, *, k128, b_ilv, is_b):
     """
     n_sub, nd, ng = 2, _MXFP4_PRESHUF_ND, _MXFP4_PRESHUF_NG
     ku, _ = _mxfp4_preshuf_geom(k128)
-    nw, kk = n_sub * ku, k128 // n_sub
+    # `kk` may be handed in as a traced value: it is the only term that varies with the
+    # shape's contraction, and keeping it out of the emitted constants lets one compiled
+    # kernel serve every shape rather than one per K.
+    nw = n_sub * ku
+    if kk is None:
+        kk = k128 // n_sub
     lit = isinstance(row, int) and isinstance(kblk, int)
     _d = (lambda a, b: a // b) if lit else udiv
     _m = (lambda a, b: a % b) if lit else umod
