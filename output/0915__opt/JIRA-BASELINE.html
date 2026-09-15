@@ -1,0 +1,532 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>gfx1250 baseline 对照 JIRA — 0915</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface-0: #f4f4f2;
+    --surface-1: #fcfcfb;
+    --surface-2: #eeeeec;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #77756f;
+    --rule: #dededa;
+    --rule-strong: #c4c3bd;
+    --series-1: #2a78d6;
+    --series-2: #eb6834;
+    --series-3: #1baf7a;
+    --good: #0ca30c;
+    --warning: #fab219;
+    --serious: #ec835a;
+    --critical: #d03b3b;
+    --warn-bg: #fdf6e3;
+    --crit-bg: #fbeceb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --surface-0: #121211;
+      --surface-1: #1a1a19;
+      --surface-2: #242423;
+      --text-primary: #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted: #96958c;
+      --rule: #333331;
+      --rule-strong: #4a4a47;
+      --series-1: #3987e5;
+      --series-2: #d95926;
+      --series-3: #199e70;
+      --warn-bg: #2a2416;
+      --crit-bg: #2e1a19;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface-0: #121211;
+    --surface-1: #1a1a19;
+    --surface-2: #242423;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #96958c;
+    --rule: #333331;
+    --rule-strong: #4a4a47;
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --warn-bg: #2a2416;
+    --crit-bg: #2e1a19;
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--surface-0);
+    color: var(--text-primary);
+    font: 15px/1.65 ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Noto Sans CJK SC",
+          "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 40px 20px 96px; }
+
+  header { border-bottom: 1px solid var(--rule-strong); padding-bottom: 20px; margin-bottom: 8px; }
+  h1 { font-size: 26px; line-height: 1.3; margin: 0 0 6px; font-weight: 650; letter-spacing: -0.01em; }
+  .sub { color: var(--text-secondary); font-size: 14px; margin: 0; }
+  .sub code { font-size: 12.5px; }
+
+  h2 {
+    font-size: 19px; margin: 44px 0 4px; font-weight: 650; letter-spacing: -0.005em;
+    padding-top: 20px; border-top: 1px solid var(--rule);
+  }
+  h2:first-of-type { border-top: none; padding-top: 0; }
+  h3 { font-size: 15.5px; margin: 26px 0 8px; font-weight: 650; }
+  .lede { color: var(--text-secondary); margin: 0 0 18px; font-size: 14.5px; }
+  p { margin: 0 0 14px; }
+  ul, ol { margin: 0 0 14px; padding-left: 22px; }
+  li { margin-bottom: 6px; }
+
+  code, .mono {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12.5px;
+  }
+  code { background: var(--surface-2); padding: 1px 5px; border-radius: 3px; }
+
+  /* ---- callouts ---- */
+  .note {
+    background: var(--surface-1); border: 1px solid var(--rule);
+    border-left: 3px solid var(--series-1);
+    padding: 14px 16px; border-radius: 4px; margin: 0 0 18px;
+    font-size: 14px;
+  }
+  .note.warn { border-left-color: var(--warning); background: var(--warn-bg); }
+  .note.crit { border-left-color: var(--critical); background: var(--crit-bg); }
+  .note-h { font-weight: 650; display: block; margin-bottom: 5px; }
+  .note p:last-child, .note ul:last-child { margin-bottom: 0; }
+
+  /* ---- stat tiles ---- */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin: 0 0 22px; }
+  .tile {
+    background: var(--surface-1); border: 1px solid var(--rule);
+    border-radius: 5px; padding: 15px 16px;
+  }
+  .tile .k { font-size: 12px; color: var(--text-muted); text-transform: none; margin-bottom: 7px; line-height: 1.4; }
+  .tile .v { font-size: 27px; font-weight: 640; line-height: 1.12; letter-spacing: -0.015em; }
+  .tile .u { font-size: 13px; font-weight: 450; color: var(--text-secondary); margin-left: 3px; }
+  .tile .n { font-size: 12px; color: var(--text-muted); margin-top: 7px; line-height: 1.45; }
+
+  /* ---- tables ---- */
+  .tw { overflow-x: auto; margin: 0 0 18px; border: 1px solid var(--rule); border-radius: 5px; background: var(--surface-1); }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+  caption {
+    text-align: left; padding: 12px 14px 10px; font-size: 13px; color: var(--text-secondary);
+    border-bottom: 1px solid var(--rule);
+  }
+  caption b { color: var(--text-primary); font-weight: 650; }
+  th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  thead th {
+    font-size: 11.5px; font-weight: 600; color: var(--text-muted);
+    border-bottom: 1px solid var(--rule-strong); white-space: nowrap;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+  .cond { color: var(--text-muted); font-size: 12px; line-height: 1.45; }
+  tr.hl td { background: var(--surface-2); }
+  td strong { font-weight: 650; }
+
+  .tag {
+    display: inline-block; font-size: 10.5px; font-weight: 600; padding: 1.5px 6px;
+    border-radius: 3px; border: 1px solid var(--rule-strong); color: var(--text-secondary);
+    white-space: nowrap; line-height: 1.5;
+  }
+  .tag.m { border-color: var(--good); color: var(--good); }
+  .tag.d { border-color: var(--series-1); color: var(--series-1); }
+  .tag.a { border-color: var(--serious); color: var(--serious); }
+  .tag.x { border-color: var(--critical); color: var(--critical); }
+
+  /* ---- bar chart ---- */
+  figure { margin: 0 0 20px; background: var(--surface-1); border: 1px solid var(--rule); border-radius: 5px; padding: 16px 18px 14px; }
+  figcaption { font-size: 13px; color: var(--text-secondary); margin-bottom: 14px; }
+  figcaption b { color: var(--text-primary); font-weight: 650; }
+  .bars { display: grid; gap: 9px; }
+  .bar-row { display: grid; grid-template-columns: minmax(120px, 190px) 1fr; gap: 12px; align-items: center; }
+  .bar-lab { font-size: 12.5px; color: var(--text-secondary); line-height: 1.35; }
+  /* grid, not flex: a 100%-width fill in a flex row pushes the value label out of the
+     container. Plot column takes the remaining space, label column sizes to its content. */
+  .bar-track { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; }
+  .bar-plot { height: 22px; display: flex; align-items: center; min-width: 0; }
+  .bar-fill { height: 15px; border-radius: 0 4px 4px 0; background: var(--series-1); min-width: 2px; }
+  .bar-fill.s2 { background: var(--series-2); }
+  .bar-fill.s3 { background: var(--series-3); }
+  .bar-fill.mute { background: var(--rule-strong); }
+  .bar-val {
+    font-size: 12.5px; font-variant-numeric: tabular-nums;
+    color: var(--text-primary); white-space: nowrap;
+  }
+  .bar-val em { font-style: normal; color: var(--text-muted); font-size: 11.5px; }
+
+  .foot { margin-top: 10px; font-size: 12px; color: var(--text-muted); line-height: 1.5; }
+
+  @media (max-width: 620px) {
+    .wrap { padding: 28px 16px 72px; }
+    h1 { font-size: 22px; }
+    .bar-row { grid-template-columns: 1fr; gap: 3px; }
+    .tile .v { font-size: 24px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>gfx1250 单卡 baseline 对照 JIRA</h1>
+  <p class="sub">
+    2026-09-15 · 本机 <code>heliosr-1b114-c07-1</code>，单卡 gfx1250，VR 限频 1100 MHz ·
+    分支 <code>dev/lhz/attn</code> · 数据来自 <code>output/0915__opt/</code> 的日志与 ledger，
+    经四路独立采集 + 对抗性交叉校验
+  </p>
+</header>
+
+<h2>一句话</h2>
+<p class="lede">
+  JIRA 提的第一条请求（<b>turbo_attention 在 gfx1250 上被 skip</b>）<b>已经解决</b>，
+  attention 算子在本机从出厂 55.785 ms 降到 11.687 ms；
+  但本机端到端数字<b>不能</b>和 JIRA 并列 —— 本机被 VR 限频到 1100 MHz，
+  且 GEMM 走的后端比同一块硅片能达到的慢 13–32 倍。
+</p>
+
+<div class="note crit">
+  <span class="note-h">读这份报告前必须知道的三件事</span>
+  <ol style="margin-bottom:0">
+    <li><b>时钟不可比。</b>本机硬限在 1100 MHz（DPM 表只有 500 / 1100 两档，重启与 AC-cycle 都不解除）。
+      同一块卡 09-04 曾跑到 1699–1703 MHz；另一台 gfx1250（<code>a37-1</code>）负载下稳在 2133–2244 MHz、
+      KFD 上限 2400 MHz。<b>JIRA 机器的时钟在 JIRA 截图和本仓库里都没有记载</b>，
+      所以本报告<b>不做任何时钟换算</b>，两列并排放、差距标注为"未换算"。</li>
+    <li><b>层数不可比。</b>本机今天大部分实验用 <b>8 层</b>模型（为了让 A/B 跑得起、并避开 32 层配置 88% 显存的悬崖）。
+      8 层每 token 的 transformer 工作量约为 32 层的四分之一，tps 因此虚高约 3–4 倍。
+      <b>所有 5800–6440 的数字都是 8 层，绝不能和 JIRA 的 32 层数字放同一列。</b></li>
+    <li><b>JIRA 两张图是两个配置。</b><code>jira_2</code> 是 seq=8192（与本机配置同形），
+      <code>jira_1</code> 是 <b>seq=4096</b>（<code>len4k</code>），且其 30,188 那一列还额外改了 batch size。
+      本报告只用 <code>jira_2</code> 做对照。</li>
+  </ol>
+</div>
+
+<h2>JIRA 的 baseline（<code>jira_2</code>，32 层 seq=8192）</h2>
+<p class="lede">Llama 3.1 8B，MBS=GBS=4，seq=8192，1 GPU，AC=none，profile step 9。</p>
+
+<div class="tw">
+<table>
+  <caption><b>JIRA 实测</b>（对方机器，n=1 profile 采样，时钟未记载）</caption>
+  <thead><tr>
+    <th>指标</th><th class="num">MI455X</th><th class="num">MI355X</th><th>说明</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>E2E 吞吐</td><td class="num">19,795 tps</td><td class="num">21,351 tps</td>
+        <td class="cond">MI455X 为 MI355X 的 92.7%</td></tr>
+    <tr><td>GEMM（每步合计）</td><td class="num">655 ms</td><td class="num">987 ms</td>
+        <td class="cond">MI455X <b>快 1.51×</b> —— GEMM 不是 MI455X 的短板</td></tr>
+    <tr class="hl"><td>FA path（每步合计）</td><td class="num">755 ms</td><td class="num">315 ms</td>
+        <td class="cond">MI455X <b>慢 440 ms</b> —— 这才是差距所在</td></tr>
+    <tr><td class="cond" style="padding-left:24px">└ 分解</td>
+        <td class="cond num">flex 501 + elem 245 + softmax 9</td><td class="cond num">AITER fmha</td>
+        <td class="cond">245 ms 的 ElementWise 主要是 flex 的副作用（dtype cast ×492），按 JIRA 的说法应算进 FA 差距</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="tw">
+<table>
+  <caption><b>JIRA 记录的栈差异</b> —— 其 Root Cause 3 自己承认"不是纯硬件对比"</caption>
+  <thead><tr><th>项</th><th>MI455X</th><th>MI355X</th></tr></thead>
+  <tbody>
+    <tr><td>Primus / TorchTitan</td><td>0.1.0</td><td>0.2.2</td></tr>
+    <tr><td><code>compile.enable</code></td><td>False</td><td>True</td></tr>
+    <tr class="hl"><td><code>turbo_attention</code></td><td><b>Skipped</b></td><td>Applied</td></tr>
+    <tr><td>FA path</td><td>Triton flex</td><td>AITER fmha (gfx950)</td></tr>
+    <tr><td>镜像</td><td><code>amdprimus/amdprimus:20260730</code></td><td><code>primus26.5.1</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note warn">
+  <span class="note-h">JIRA 自身的一处数据问题</span>
+  <p style="margin-bottom:0"><code>jira_2</code> 的 Config 行写 <b>FP16</b>，而同一张图里两个 trace 链接都标 <b>BF16</b>；
+  另外 <code>jira_1</code> 的 GEMM split-K 表给出 <code>1024×4096×32768 NT = 19.0 ms / 924 TFLOPS</code>，
+  但这两个数<b>互相对不上约 64 倍</b>（该形状 2·M·N·K ≈ 2.75e11 FLOP，19.0 ms 对应约 14.5 TFLOPS，不是 924）。
+  <b>本报告不基于这两个 TFLOPS 数字做任何对比</b> —— 分母已知有问题的比值，加多少注解都不可用。</p>
+</div>
+
+<h2>本机的 baseline</h2>
+
+<h3>可与 JIRA 同形对照的（32 层，b=4，s=8192）</h3>
+<div class="tw">
+<table>
+  <caption><b>本机端到端</b> · 1100 MHz · 32 层 · <span class="tag x">全部 n=1</span>
+    —— 见文末"测量方法学"，本机 e2e 跨运行噪声约 3.9%，这些单次结果的可信区间比看上去宽得多</caption>
+  <thead><tr>
+    <th>配置</th><th class="num">tps</th><th class="num">MFU</th><th class="num">每步</th><th>条件</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>rocBLAS（修复前的默认路径）</td><td class="num">244</td><td class="num">4.53%</td><td class="num">~135 s</td>
+        <td class="cond">3 步，未到稳态 <span class="tag m">实测</span></td></tr>
+    <tr class="hl"><td><b>hipBLASLt 修正路径</b></td><td class="num"><b>2,027</b></td><td class="num">37.62%</td><td class="num">~17 s</td>
+        <td class="cond">3 步，未到稳态 <span class="tag m">实测</span></td></tr>
+    <tr><td>hipBLASLt，ASM 反向 ON</td><td class="num">1,858</td><td class="num">34.49%</td><td class="num">17.6 s</td>
+        <td class="cond">20 步，取 step≥8 中位 <span class="tag m">实测</span></td></tr>
+    <tr><td>hipBLASLt，ASM 反向 OFF</td><td class="num">1,984</td><td class="num">36.84%</td><td class="num">16.5 s</td>
+        <td class="cond">20 步，取 step≥8 中位 <span class="tag m">实测</span></td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note">
+  <span class="note-h">诚实的定位</span>
+  <p style="margin-bottom:0">本机 32 层最好成绩约 <b>2,000 tps</b>，JIRA 的 MI455X 参照是 <b>19,795 tps</b> —— 约 10 倍差距。
+  这 10 倍<b>不是</b> gfx1250 的能力问题，而是本机环境的三个叠加因素，且这三者<b>没有被任何测量分离过</b>。见下节。</p>
+</div>
+
+<h3>不可与 JIRA 对照的（8 层，今天 A/B 实验用）</h3>
+<div class="tw">
+<table>
+  <caption><b>8 层配置</b> · 仅用于 ASM 反向 A/B 与噪声刻画 · <b>不要与 JIRA 数字并列</b></caption>
+  <thead><tr><th>臂</th><th class="num">n</th><th>各次 tps</th><th class="num">均值</th><th class="num">跨运行 sd</th></tr></thead>
+  <tbody>
+    <tr><td>ASM 反向 ON</td><td class="num">9</td>
+        <td class="mono">5901×3 | 6011×3 | 6420×3</td><td class="num">6110.8</td><td class="num">3.88%</td></tr>
+    <tr><td>ASM 反向 OFF（默认）</td><td class="num">9</td>
+        <td class="mono">5822×2 | 5936×2 | 6327×5</td><td class="num">6128.1</td><td class="num">3.91%</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>差距归因：三个成因，只有一个被测量分离出来了</h2>
+
+<div class="tiles">
+  <div class="tile">
+    <div class="k">(a) 时钟</div>
+    <div class="v">≥1.55×<span class="u">，可能 1.9–2.2×</span></div>
+    <div class="n">下界来自同一块卡自己的 1699–1703 MHz；上界参照 a37-1 的 2133–2244 MHz。
+      JIRA 机器时钟未知，<b>无法定量</b>。</div>
+  </div>
+  <div class="tile">
+    <div class="k">(b) GEMM 软件路径</div>
+    <div class="v">13.1×<span class="u">，修复前 32.5×</span></div>
+    <div class="n">同一块卡、同一时钟、同一进程、同一批张量上实测。
+      <b>与硬件、时钟、分区全部无关。</b></div>
+  </div>
+  <div class="tile">
+    <div class="k">(c) compile 关闭</div>
+    <div class="v">未测量</div>
+    <div class="n">本机 inductor 会打死 GPU，无法开启评估。JIRA 的 MI355X 开着，MI455X 关着。</div>
+  </div>
+</div>
+
+<h3>(b) 是唯一被本机内部证据锁死的那一项</h3>
+<figure>
+  <figcaption><b>同一块卡、同一 1100 MHz、同一进程、同一批张量</b>上的 8192³ bf16 GEMM —— 差异全部来自调用了哪个实现</figcaption>
+  <div class="bars">
+    <div class="bar-row">
+      <div class="bar-lab">rocBLAS<br><span class="cond">修复前的生产路径</span></div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill mute" style="width:3.1%"></div></div>
+        <span class="bar-val">27.64 <em>TFLOP/s · 39.78 ms</em></span></div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-lab">hipBLASLt<br><span class="cond">修正 Tensile 路径后</span></div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill s2" style="width:7.7%"></div></div>
+        <span class="bar-val">68.74 <em>TFLOP/s · 15.99 ms</em></span></div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-lab">Triton 手写<br><span class="cond">BM128/BN256/BK32/w8/s3</span></div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill" style="width:100%"></div></div>
+        <span class="bar-val">897.53 <em>TFLOP/s · 1.225 ms</em></span></div>
+    </div>
+  </div>
+  <p class="foot">单进程测量，median of 10 / 3 warmup / 256 MiB L2 flush。
+    rocBLAS→Triton <b>32.5×</b>；把 hipBLASLt 路径修好之后仍剩 <b>13.06×</b>。</p>
+</figure>
+
+<div class="note">
+  <span class="note-h">根因是镜像打包缺陷，不是 gfx1250 的能力上限</span>
+  <p>hipBLASLt 的加载器在 <code>library/</code> 下找 <code>TensileLibrary_lazy_gfx1250.dat</code>，
+  而包括该索引在内的 402 个文件全在 <code>library/gfx1250/</code> <b>子目录</b>里。
+  不改文件、一个环境变量即可修正：</p>
+  <p class="mono" style="margin-bottom:8px">-e HIPBLASLT_TENSILE_LIBPATH=…/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/gfx1250</p>
+  <p style="margin-bottom:0">端到端效果：本机 32 层 <b>244 → 2,027 tps（8.3×）</b>
+  <span class="tag a">两侧均为 3 步 n=1，非稳态</span>。
+  <b>建议上报镜像维护方</b> —— 一行环境变量，影响所有该镜像用户。细节见 <code>BLAS-FINDING.md</code>。</p>
+</div>
+
+<h2>Attention 算子：JIRA Request 1 已经解决</h2>
+<p class="lede">
+  JIRA 的根因第一条是 <code>turbo_attention</code> 在 MI455X 上被 skip、退回 Triton flex。
+  本机已定位并修复（<code>enable_gqa</code> 的 TypeError 导致 converter 被关掉），converter 现已打开并跑通。
+</p>
+
+<figure>
+  <figcaption><b>本机 attention 算子优化阶梯</b>（1100 MHz，算子级，b=4 s=8192 hq=32 hkv=8 d=128 bf16 causal，<b>单层单次 fwd+bwd</b>）</figcaption>
+  <div class="bars">
+    <div class="bar-row">
+      <div class="bar-lab">turbo 出厂 <code>1cb2e183</code></div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill mute" style="width:100%"></div></div>
+        <span class="bar-val">55.785 <em>ms</em></span></div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-lab">强制 Triton 前向 + 融合反向</div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill s2" style="width:39.4%"></div></div>
+        <span class="bar-val">22.001 <em>ms · 2.54×</em></span></div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-lab">ASM 前向 + 融合反向<br><span class="cond">当前默认路径</span></div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill s3" style="width:34.5%"></div></div>
+        <span class="bar-val">19.239 <em>ms · 2.90×</em></span></div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-lab">ASM 前向 + ASM 反向<br><span class="cond">可选，默认关闭</span></div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill" style="width:21.0%"></div></div>
+        <span class="bar-val">11.726 <em>ms · 4.76×</em></span></div>
+    </div>
+  </div>
+  <p class="foot">
+    全部为 AC-cycle 后重测值（n=5），SQNR 门槛 ≥50 dB。前两档的 dispersion 0.06–0.93%，后两档 0.53–0.57%。
+    <b>层数不进入算子级测量</b> —— 任何"×32 层"的换算都是算术推导，且该推导假设 32 层彼此独立无相互影响，
+    而这正是今天端到端实验<b>证伪</b>的假设。
+  </p>
+</figure>
+
+<div class="note warn">
+  <span class="note-h">为什么这里不给"对照 JIRA FA path 755 ms"的比值</span>
+  <p style="margin-bottom:0">JIRA 的 755 ms 是 32 层每步合计，来自对方机器一次 profile 采样，
+  其时钟未知；本机 11.726 ms 是 1100 MHz 下的单层单次算子测量。
+  把它乘 32 得 375 ms 再与 755 ms 相除，会同时跨越<b>时钟</b>、<b>测量口径</b>（算子 vs trace 聚合）
+  和<b>层间独立性假设</b>三道边界。<b>三道边界里有两道已知不成立</b>，所以这个比值本报告不给。</p>
+</div>
+
+<div class="tw">
+<table>
+  <caption><b>ASM 反向资格门</b>（比值 = 融合/ASM，&gt;1 表示 ASM 更快）· 算子级、仅反向 · 每格 n=2 取均值</caption>
+  <thead><tr>
+    <th>seqlen</th><th class="num">b·hq=8</th><th class="num">12</th><th class="num">16</th>
+    <th class="num">24</th><th class="num">32</th><th class="num">128</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>1024</td><td class="num">0.660×</td><td class="num">—</td><td class="num">—</td>
+        <td class="num">—</td><td class="num">0.632×</td><td class="num">0.537×</td></tr>
+    <tr><td>1536</td><td class="num">0.869×</td><td class="num">—</td><td class="num">—</td>
+        <td class="num">—</td><td class="num">—</td><td class="num">—</td></tr>
+    <tr class="hl"><td>2048</td><td class="num"><b>1.748×</b></td><td class="num">—</td><td class="num">—</td>
+        <td class="num">—</td><td class="num">1.549×</td><td class="num">—</td></tr>
+    <tr><td>4096</td><td class="num">2.812×</td><td class="num">2.025×</td><td class="num">2.571×</td>
+        <td class="num">2.235×</td><td class="num">2.110×</td><td class="num">—</td></tr>
+    <tr><td>8192</td><td class="num">3.954×</td><td class="num">—</td><td class="num">—</td>
+        <td class="num">—</td><td class="num">—</td><td class="num">2.002×</td></tr>
+  </tbody>
+</table>
+</div>
+<p class="foot" style="margin-top:-8px;margin-bottom:22px">
+  机制：ASM 反向耗时跨 16 倍工作量近乎常数（0.88 / 0.91 / 1.00 / 1.34 ms），固定地板约 0.85 ms，
+  要有足够工作量才摊得开。门槛因此定在 <code>seqlen &gt;= 2048</code>。
+  <b>注意</b>：这 9 个点是用<b>未修复</b>的调用路径测的（见下），固定地板里有一部分就是每次调用的
+  <code>hipModuleLoad</code>，修复后地板应当下降，<b>门槛很可能定高了，需要重测</b>。
+</p>
+
+<h2>今天最重要的发现是关于测量本身</h2>
+
+<div class="note crit">
+  <span class="note-h">本机 e2e 跨运行噪声约 3.9%，且是三模态 —— 此前全部 e2e 结论都建立在 n=1 上</span>
+  <p>钉住随机种子、交替顺序、每臂跑 9 次之后，<b>两个臂都呈现三个离散模态</b>，且方差几乎相同
+  （ON 3.88% / OFF 3.91%）。每次运行 junction 温度都是 44.0 °C、sclk 都是 1100 MHz，
+  所以既不是热也不是降频；run <b>内</b>平坦到 0.37%，散布全部在<b>进程之间</b>。</p>
+  <p style="margin-bottom:0"><b>任何小于 3.9% 的效应，单次 A/B 都测不出来。</b></p>
+</div>
+
+<div class="tw">
+<table>
+  <caption>今天被推翻的三条结论 —— 其中两条是当天早些时候刚写下的</caption>
+  <thead><tr><th>曾经的结论</th><th class="num">当时 n</th><th>实际</th></tr></thead>
+  <tbody>
+    <tr><td>ASM 反向「慢 6.78%，是噪声的 30 倍」</td><td class="num">1</td>
+        <td class="cond">那个「噪声」是<b>组内 step 抖动</b>，不是跨运行方差。6.78% 落在模态间距之内</td></tr>
+    <tr><td>带修复后「快 3.42%，翻盘」</td><td class="num">1</td>
+        <td class="cond">未播种（两臂模型初始化就不同）+ 冷热顺序混杂</td></tr>
+    <tr><td>「ON 不可重复 sd 4.53%，OFF 稳定 0.06%」</td><td class="num">3</td>
+        <td class="cond">那三次 OFF 碰巧落在同一模态。n=9 下 OFF 的 sd 是 <b>3.91%</b></td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>
+  未播种这一条是配置缺陷，已修：torchtitan 的 <code>set_determinism</code> 在
+  <code>world_size==1</code> 且 <code>debug.seed is None</code> 时<b>直接 return 而不播种</b>，
+  五次运行给出五个不同的 step-1 loss。现已在配置中钉死 <code>debug.seed: 1234</code>
+  （只钉种子，<b>不开</b> <code>deterministic</code> —— 后者会启用确定性算法并降速，反而污染被测量的对象）。
+</p>
+
+<h3>模态成因：已排除两项，第三项未证实</h3>
+<div class="tw">
+<table>
+  <thead><tr><th>假设</th><th>做法</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td>GEMM 层</td><td class="cond">9 个独立进程跑同样的 GEMM（方阵 / mlp / qkv）</td>
+        <td class="cond"><b>已排除。</b>跨进程 0.19% / 1.2% / 0.36%，完全稳定 <span class="tag m">实测</span></td></tr>
+    <tr><td>与 turbo attention 有关</td><td class="cond">关掉 converter 跑对照臂</td>
+        <td class="cond"><b>做不了。</b><code>converters: []</code> 会退回 Flex FA，而它内部必须
+          <code>torch.compile</code>，在本机会打死 GPU（当天第二次 AC-cycle）</td></tr>
+    <tr><td>CPU 调度 / NUMA 漂移</td><td class="cond">用 <code>taskset</code> 把进程钉到单个 NUMA 节点，n=8</td>
+        <td class="cond"><b>未证实。</b>sd 3.91% → 2.53%，高模态命中 5/9 → 1/8 —— 有效应但<b>没有消除</b>，
+          且该样本量下 sd 差异本身不可靠 <span class="tag a">证据不足</span></td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note warn">
+  <span class="note-h">附带发现：四个算子级测量入口已与产品路径分叉</span>
+  <p>只有产品调用点（<code>attention_asm_bwd_impl.py:282</code>）传 <code>hip=</code> 和 <code>scratch=</code>；
+  <code>tune_attention.py:529</code>、<code>t2_bringup.py:224/266</code>、<code>perfdq_diag.py:18</code> 都不传，
+  <b>测的仍是未修复的路径</b>。</p>
+  <p style="margin-bottom:0">两个推论，<b>均未经硬件验证</b>：记录在案的 1.74× 低估了修复后的内核（重测约 2.18×）；
+  资格门门槛可能定高了（见上表脚注）。</p>
+</div>
+
+<h2>建议的下一步</h2>
+<div class="tw">
+<table>
+  <thead><tr><th class="num">优先级</th><th>动作</th><th>理由</th></tr></thead>
+  <tbody>
+    <tr class="hl"><td class="num">1</td><td><b>把 hipBLASLt 路径错位上报镜像维护方</b></td>
+        <td class="cond">一行环境变量，影响所有使用该镜像的用户；本机端到端 8.3×。
+          今天唯一被证明有端到端价值的方向</td></tr>
+    <tr><td class="num">2</td><td><b>所有后续 e2e A/B 改用 n≥9 + 钉种子 + 交替顺序</b></td>
+        <td class="cond">否则测不出小于 3.9% 的效应。已提供
+          <code>bin/ab_replicate.sh</code> 与 <code>bin/ab_summary.py</code>（后者报<b>跨运行</b>方差）。
+          另已验证步数可从 20 砍到 10（偏差 ≤0.22%），每次运行省 53%</td></tr>
+    <tr><td class="num">3</td><td>修好四个算子级入口并重测资格门 9 个点</td>
+        <td class="cond">当前门槛建立在含 <code>hipModuleLoad</code> 的固定地板上，很可能定高</td></tr>
+    <tr><td class="num">4</td><td>把 GEMM 钉到 Triton</td>
+        <td class="cond">剩余 13× 全在这里，且 e2e 是 GEMM-bound。
+          <b>需要 <code>torch.compile</code>，而本机 inductor 会打死 GPU</b> —— 这个矛盾未解</td></tr>
+    <tr><td class="num">5</td><td>争取解除本机 VR 限频，或换台全速机器复测</td>
+        <td class="cond">时钟是三个成因里唯一无法在本机内部量化的一项</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>图例</h2>
+<p>
+  <span class="tag m">实测</span> 直接从日志/ledger 读出 &nbsp;·&nbsp;
+  <span class="tag d">推导</span> 由实测值算术推导 &nbsp;·&nbsp;
+  <span class="tag a">证据不足</span> 样本量或口径不足以支撑 &nbsp;·&nbsp;
+  <span class="tag x">警示</span> 已知不可比或已知有缺陷
+</p>
+<p class="foot">
+  数据来源：<code>output/0915__opt/{HANDOFF,E2E-AB,BLAS-FINDING,RESULTS,PERF-CO-CLOSED}.md</code>、
+  <code>ledger.jsonl</code>、<code>ledgers/</code>、<code>logs/*.log</code>；
+  JIRA 数字逐像素核对自 <code>output/0913__opt_plan__claude/jira_1.png</code> 与 <code>jira_2.png</code>。
+  全部数据经四路独立采集后各由一名独立审核者逐条回查仓库，纠正了包括
+  「把另一台双倍时钟机器 <code>a37-1</code> 的 138.64 TFLOP/s 当作本机数据」在内的多处实质错误。
+</p>
+
+</div>
+</body>
+</html>
