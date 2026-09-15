@@ -88,8 +88,32 @@ t=time.time(); b=a@a; torch.cuda.synchronize(); print(\"matmul %.2f\"%(time.time
 '" 2>/dev/null | grep -E '^(import|init|alloc|matmul) '
 }
 
+# "A job has produced no output for N minutes" has three causes that look identical in the
+# log and need different responses. Ask the card and the compiler, not the log:
+#
+#   GPU busy + no Triton cache growth  -> stuck in a kernel. This is the 0915 morning hang.
+#   GPU idle + Triton cache growing    -> cold compile, CPU-bound. Wait; it is working.
+#   GPU idle + no cache growth         -> stuck elsewhere (rendezvous, dataloader, init).
+#
+# The distinction is not academic: on 0915 a cold compile after a container rebuild looked
+# exactly like the morning's hang in the log, and treating it as a hang would have meant
+# killing a healthy run and probing a healthy card.
+stall_kind() {
+  local ctr=${CTR:-fa-repro} cache=${TRITON_CACHE:-/tmp/triton_cache_e2e}
+  local use grew
+  use=$(timeout 30 docker exec "$ctr" rocm-smi --showuse 2>/dev/null |
+        grep -oE 'GPU use \(%\): [0-9]+' | head -1 | grep -oE '[0-9]+$')
+  grew=$(timeout 25 docker exec "$ctr" bash -c \
+        "find $cache -newermt '-2 minutes' 2>/dev/null | wc -l" 2>/dev/null)
+  use=${use:-0}; grew=${grew:-0}
+  if [ "$use" -gt 50 ] && [ "$grew" -le 2 ]; then echo "KERNEL_STUCK gpu=${use}% cache_new=$grew"; return 2
+  elif [ "$grew" -gt 2 ]; then echo "COMPILING gpu=${use}% cache_new=$grew -- wait"; return 0
+  else echo "STUCK_ELSEWHERE gpu=${use}% cache_new=$grew"; return 1; fi
+}
+
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   if [ "${1:-}" = "--probe" ]; then compute_probe "${2:-600}"; exit $?; fi
+  if [ "${1:-}" = "--stall" ]; then stall_kind; exit $?; fi
   st=$(health_state "${BASE_DEGRADED:-0}" "${BASE_WEDGED:-0}"); rc=$?
   if [ "${1:-}" = "--json" ]; then
     printf '{"state":"%s","degraded":%s,"wedged":%s,"gpus":%s,"kfd_holders":%s,"sclk_mhz":%s}\n' \
