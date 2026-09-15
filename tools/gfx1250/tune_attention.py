@@ -94,6 +94,16 @@ if "--gpu" in sys.argv:
 elif os.environ.get("GPU"):
     os.environ["HIP_VISIBLE_DEVICES"] = os.environ["GPU"]
 
+# Same reason as _TUNE_ENV above: the ASM forward gate reads its off switch at import.
+#
+# This exists because there is otherwise no way to measure the Triton forward. Since the
+# dispatcher started choosing the ASM forward on its own, --impl turbo, fused and asm all
+# reach it: measured on c07-1 they are 19.222 / 19.298 / 19.285 ms, a 0.4% spread that is
+# the noise floor rather than an A/B, with a forward of ~1.55 ms where the Triton forward
+# is ~5.2 ms at this clock. Any claim about what the ASM forward is worth needs the off run.
+if "--asm-fwd" in sys.argv and sys.argv[sys.argv.index("--asm-fwd") + 1] == "off":
+    os.environ["PRIMUS_TURBO_ATTN_DISABLE_ASM_FWD"] = "1"
+
 # Same reason as _TUNE_ENV above: the vendored fused backward reads its config at import.
 if "--fused-tune" in sys.argv:
     os.environ["PRIMUS_TURBO_FUSED_MHA_BWD_TUNE"] = sys.argv[sys.argv.index("--fused-tune") + 1]
@@ -317,6 +327,11 @@ def main() -> int:
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--sqnr-min", type=float, default=50.0)
+    ap.add_argument("--asm-fwd", default="auto", choices=["auto", "off"],
+                    help="'off' forces the Triton forward by disabling the ASM gate. Read at "
+                         "import (see the top of this file), so it must be a process-level "
+                         "flag rather than a runtime one. Off-only: eligibility is a "
+                         "capability question and forcing 'on' would only move the failure.")
     ap.add_argument("--impl", default="turbo", choices=["turbo", "aiter", "fused", "asm"],
                     help="turbo = Primus-Turbo's in-tree Triton backend (the PR target). "
                          "aiter = AITER's Triton MHA, the alternative seed the plan named. "
@@ -402,6 +417,11 @@ def _measure(args) -> int:
     import primus_turbo
 
     result["turbo_path"] = primus_turbo.__file__
+    # Whether the ASM forward gate was disabled for this row. impl_note is a hardcoded string
+    # assigned from --impl before anything runs, so it labels intent, not what executed; it
+    # still says "turbo forward" on rows that took the ASM one. This field is read from the
+    # env the gate itself reads, so an A/B can be audited from the ledger alone.
+    result["asm_fwd"] = "off" if os.environ.get("PRIMUS_TURBO_ATTN_DISABLE_ASM_FWD", "") not in ("", "0") else "auto"
     # Which physical card this row was measured on. Without it a 4-stream ledger cannot be
     # audited after the fact, and per-GPU clock differences get attributed to the config.
     result["gpu"] = os.environ.get("HIP_VISIBLE_DEVICES", "all")

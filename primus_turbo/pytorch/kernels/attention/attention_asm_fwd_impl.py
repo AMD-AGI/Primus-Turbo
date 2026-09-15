@@ -55,6 +55,13 @@ __all__ = ["asm_forward_eligible", "asm_dense_forward"]
 # and useless when the question is "why did this not fire in training". One line per distinct
 # reason, once each, behind an env var.
 _TRACE = os.environ.get("PRIMUS_TURBO_ASM_FWD_TRACE", "") not in ("", "0")
+# Hard off switch, read at import like the trace flags above. Without it there is no way to
+# measure the Triton forward at all: the dispatcher takes the ASM forward whenever it is
+# eligible, so --impl turbo, fused and asm all reach the same kernel and differ by 0.4% --
+# the noise floor, not an A/B. Attributing anything to the ASM forward requires a run with
+# this set. Off-only on purpose: eligibility is a capability question, and forcing "on" past
+# a declined check would just move the failure later.
+_DISABLED = os.environ.get("PRIMUS_TURBO_ATTN_DISABLE_ASM_FWD", "") not in ("", "0")
 # A path here writes the trace to that file instead of stdout. Under a training launcher the
 # process's stdout goes through capture layers that demonstrably swallow lines -- aiter's own
 # load banner never appeared in any e2e log -- and then "no line" cannot be told apart from
@@ -131,6 +138,8 @@ def asm_forward_eligible(
 
     The caller must ALSO confirm ``fused_backward_eligible`` -- see the module docstring.
     """
+    if _DISABLED:
+        return _no("disabled by PRIMUS_TURBO_ATTN_DISABLE_ASM_FWD")
     if not is_gfx1250():
         return _no("not gfx1250")
     if _asm_entry() is None:
