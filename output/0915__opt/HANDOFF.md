@@ -59,16 +59,33 @@ hipBLASLt 修正路径后是 68.7 TF/s，Triton 是 897 TF/s，**还有 13×**�
 TransformerBlock 做 autotune 会抛 `hipErrorLaunchFailure` **并打死 GPU** ——
 **用 8 层配置试**（`repro_l8b_turbo_conv_8L.yaml`），不要在 32 层那个 88% 显存的配置上试。
 
-### 2. 搞清楚 ASM 反向的端到端回归，或者放弃它
+### 2. 带两个修复重跑 e2e A/B —— 这是最可能翻盘的一件事
 
-算子级 1.741×、端到端 −6.78%。第三轮（8 层，留显存余量）的结果决定方向：
+**做这个之前不要碰 ASM 反向的其他部分。** 代码审查在收尾时找到了第二个成因，
+而 −6.78% 那个数字是**修复之前**测的：
 
-- **若 8 层下不再落后** → 是显存压力。那么资格门可以按"显存余量"开启，
-  或者把 `dq_acc` 做成进程级单例（32 层共用一块，而不是每层一块）
-- **若 8 层下仍落后** → 不是显存。真因未知，需要从"每次调用多三次 kernel launch"
-  和"host 侧规约"两个方向查
+| 成因 | 量级 | 状态 |
+|---|---|---|
+| **模块重载** | 每步 96 次 `hipModuleLoad`，从不卸载 | 已修（进程级 `HipModule` 单例） |
+| 分配 churn | 每层 1.07 GB，每步约 34 GB | 已修（scratch 复用 + 清零） |
 
-无论哪种，**默认关闭不变**，直到有端到端正收益的证据。
+"scratch 单独修完没恢复回归"本身就是证据，说明**模块重载是两者中更大的那个**。
+两个修复都**没有硬件验证**（写它们的时候卡不可用）。
+
+```bash
+D=/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/gfx1250
+BLAS_ENV="-e HIPBLASLT_TENSILE_LIBPATH=$D" E2E_ENV="-e PRIMUS_TURBO_ATTN_ENABLE_ASM_BWD=1" \
+  bash output/0915__opt/bin/e2e.sh fix2-on repro_l8b_turbo_conv_8L.yaml
+BLAS_ENV="-e HIPBLASLT_TENSILE_LIBPATH=$D" \
+  bash output/0915__opt/bin/e2e.sh fix2-off repro_l8b_turbo_conv_8L.yaml
+```
+
+**用 8 层配置**（`repro_l8b_turbo_conv_8L.yaml`，已验证显存只占 26%）。
+32 层那个配置在 88% 显存上跑，今天两次挂卡都和它有关。
+8 层单层形状与生产逐项相同，op 级 1.741× 的参照点不变。
+
+若修复后 ON 反超 OFF，资格门就该改回默认开启（`_ENABLED` 那行）。
+若仍落后，**默认关闭不变**，并把剩余差距列为未解释。
 
 ### 3. op-evolve 优化我们自己的融合反向
 

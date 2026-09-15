@@ -54,15 +54,29 @@ _TRACE_FILE = os.environ.get("PRIMUS_TURBO_ASM_BWD_TRACE_FILE", "")
 #     ASM backward ON    1858 tps   mfu 34.49%
 #     ASM backward OFF   1984 tps   mfu 36.83%     <- 6.78% FASTER, at 30x the noise floor
 #
-# The cause is memory, not the kernel. This backward needs an fp32 dq_acc that the fused one
-# does not (that one has no atomics) plus dk/dv per q head rather than per kv head: 1.07 GB
-# per layer per step, ~34 GB of allocator churn over 32 layers. Operator-level timing never
-# sees it because the caching allocator reuses the same blocks every iteration.
+# TWO per-call costs, both invisible to operator-level timing, and I found them in the wrong
+# order. Neither is the kernel itself.
 #
-# Caching the scratch removes the churn and is NOT a fix: it trades churn for peak, and this
-# config has no peak headroom. Memory at step 3 went 380.06 GiB (87.98%) without the cache
-# to 381.44 GiB (88.30%) with it, and the run took SIGBUS -- then leaked its KFD context and
-# 411 GB of VRAM, leaving the card unable to create new contexts until a power cycle.
+#   1. Module reload. asm_dense_backward was not passing a HipModule, so every backward built
+#      a fresh one with an empty cache and re-ran hipModuleLoad on all three .co files: 96
+#      loads per training step across 32 layers, never unloaded. Fixed (_hip below).
+#   2. Allocation. This backward needs an fp32 dq_acc the fused one does not -- that one has
+#      no atomics -- plus dk/dv per q head rather than per kv head: 1.07 GB per layer per
+#      step, ~34 GB of churn over 32 layers. Fixed (_SCRATCH below).
+#
+# Operator-level timing hides both the same way: 20 iterations of one call site reload three
+# modules 20 times and reuse the allocator's same blocks, which is nothing next to a
+# 32-layer step.
+#
+# I attributed the whole regression to (2), fixed only that, and it did not recover -- which
+# is itself the evidence that (1) was the larger of the two. Then caching the scratch traded
+# churn for peak on a config with no peak headroom: step-3 memory went 380.06 GiB (87.98%)
+# to 381.44 GiB (88.30%), the run took SIGBUS, and the dying process kept its KFD context
+# and 411 GB of VRAM until a power cycle.
+#
+# NEITHER FIX IS VERIFIED ON HARDWARE. The card was unusable when they were written. The
+# 6.78% above is the PRE-fix measurement; re-run the e2e A/B before believing anything about
+# what the fixes are worth.
 #
 # So: correct, fast in isolation, and not shippable by default on this configuration. The
 # measurement entry points stay (--impl asmbwd, the harness switches) so the operator-level
