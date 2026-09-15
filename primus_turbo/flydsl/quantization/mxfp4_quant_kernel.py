@@ -807,6 +807,7 @@ def flydsl_dual_quant(
     col_sr=False,
     scale_rounding_mode=0,
     pack_row=None,
+    pack_col=None,
 ):
     """Fused rowwise + colwise-transpose mxfp4 cast (one bf16 read). Returns
     (row_data, row_scale, col_data, col_scale) in C++-compatible dtypes/shapes.
@@ -817,10 +818,17 @@ def flydsl_dual_quant(
     dev = x_bf16.device
     x_i32 = x_bf16.view(torch.int32)  # [R, C/2]
     ro = torch.empty((R, C // 8), dtype=torch.int32, device=dev)
-    rs = torch.empty((R, C // 32), dtype=torch.uint8, device=dev)
     co = torch.empty((C, R // 8), dtype=torch.int32, device=dev)
-    cs = torch.empty((C, R // 32), dtype=torch.uint8, device=dev)
-    fn, grid_x = get_dual_cast(R, C, row_rht, col_rht, row_2d, col_2d, row_sr, col_sr)
+
+    def _scale_out(pack, dim, k128):
+        # A packed slab is byte-addressed and flat; the canonical one keeps its [dim, K/32].
+        if pack is None:
+            return torch.empty((dim, k128 * 4), dtype=torch.uint8, device=dev)
+        return torch.empty((dim + 255) // 256 * 256 * k128 * 4, dtype=torch.uint8, device=dev)
+
+    rs = _scale_out(pack_row, R, C // 128)
+    cs = _scale_out(pack_col, C, R // 128)
+    fn, grid_x = get_dual_cast(R, C, row_rht, col_rht, row_2d, col_2d, row_sr, col_sr, pack_row, pack_col)
     sr_seed = _next_sr_seed() if (row_sr or col_sr) else 0
     fn(
         x_i32,
@@ -837,8 +845,10 @@ def flydsl_dual_quant(
     )
     row_data = ro.view(torch.uint8).view(fp4_dtype)  # [R, C/2] fp4
     col_data = co.view(torch.uint8).view(fp4_dtype)  # [C, R/2] fp4
-    row_scale = rs.view(torch.float8_e8m0fnu)
-    col_scale = cs.view(torch.float8_e8m0fnu)
+    # A packed slab is the GEMM's own i32 layout, so it goes back as i32 -- that is what the
+    # backend looks at to recognise it. The canonical one stays e8m0.
+    row_scale = rs.view(torch.int32) if pack_row else rs.view(torch.float8_e8m0fnu)
+    col_scale = cs.view(torch.int32) if pack_col else cs.view(torch.float8_e8m0fnu)
     return row_data, row_scale, col_data, col_scale
 
 
