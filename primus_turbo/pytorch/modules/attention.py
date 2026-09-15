@@ -82,7 +82,33 @@ class TurboAttention(torch.nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        enable_gqa: bool = False,
     ):
+        """
+        enable_gqa is accepted for torch SDPA call-signature compatibility and is
+        deliberately NOT forwarded.
+
+        torchtitan 0.2.2 passes it on every attention call, and without this parameter the
+        call raises TypeError. The workaround for that was `converters: []` in the training
+        config, which disables the primus_turbo model converter -- and the converter is what
+        actually substitutes the attention. So turbo attention was never under test
+        end-to-end: `use_turbo_attention: true` only replaces the Attention class, which the
+        converter then never installs.
+
+        Ignoring the value is correct rather than lazy. In torch SDPA the flag asks the
+        implementation to broadcast kv heads up to q heads, because SDPA cannot infer it.
+        These kernels take nhead_q and nhead_k directly and handle the grouping natively, so
+        the shapes already carry everything the flag would say. The only thing worth doing
+        with it is catching a caller whose flag and shapes disagree.
+        """
+        # Compares the whole shape rather than a head axis on purpose: this module leaves
+        # qkv_format at its "bshd" default today, but identical shapes mean no grouping under
+        # any layout, so the check cannot false-fire if that ever changes.
+        if enable_gqa and q.shape == k.shape:
+            raise ValueError(
+                f"enable_gqa=True but q and k have identical shapes {tuple(q.shape)}; "
+                "the caller and the tensors disagree about grouping"
+            )
         kwargs = dict(
             dropout_p=self.dropout_p,
             softmax_scale=self.softmax_scale,
