@@ -713,7 +713,7 @@ def _compile_mxfp8_fused(
     assert k_split == 1 or bm == _BLOCK_M
     # Gated: a paired run has no column mask, and the scales must match the gemm's layout.
     bperm = bool(_MX_BPERM) and col_safe and not beta_is_one
-    pre_kern, n_kt = build_preshuffle_ab_kernel(K128, pack=_MX_SCALE_PACK, bperm=bperm)
+    pre_kern, n_kt = build_preshuffle_ab_kernel(K128, pack=_MX_SCALE_PACK, widen=True, bperm=bperm)
     _nt = dict(
         K=K,
         BLOCK_M=bm,

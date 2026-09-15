@@ -17,9 +17,7 @@ from primus_turbo.pytorch.kernels.activation.swiglu_impl import (
     swiglu_fwd_with_probs,
 )
 
-__all__ = ["swiglu_with_probs", "geglu_with_probs", "clamped_swiglu_with_probs"]
-
-DEFAULT_CLAMP_LIMIT = 7.0
+__all__ = ["swiglu_with_probs", "geglu_with_probs"]
 
 
 class GLUWithProbs(torch.autograd.Function):
@@ -85,26 +83,23 @@ class GLUWithProbs(torch.autograd.Function):
 
 
 def swiglu_with_probs(
-    x: torch.Tensor, probs: torch.Tensor, row_mask: Union[torch.Tensor, None]
+    x: torch.Tensor,
+    probs: torch.Tensor,
+    row_mask: Union[torch.Tensor, None],
+    clamp_limit: Optional[float] = None,
 ) -> torch.Tensor:
-    return GLUWithProbs.apply(x, probs, row_mask, "silu")
+    """``silu(gate) * up * probs``, where ``gate`` / ``up`` are the halves of ``x``'s
+    last dim.
+
+    Args:
+        clamp_limit: with ``L`` given, the activation becomes
+            ``silu(min(gate, L)) * clamp(up, -L, L) * probs``. The clamp backward is
+            straight-through, matching ``torch.clamp``. None for no clamp.
+    """
+    return GLUWithProbs.apply(x, probs, row_mask, "silu", clamp_limit)
 
 
 def geglu_with_probs(
     x: torch.Tensor, probs: torch.Tensor, row_mask: Union[torch.Tensor, None]
 ) -> torch.Tensor:
     return GLUWithProbs.apply(x, probs, row_mask, "gelu")
-
-
-def clamped_swiglu_with_probs(
-    x: torch.Tensor,
-    probs: torch.Tensor,
-    row_mask: Union[torch.Tensor, None],
-    clamp_limit: float = DEFAULT_CLAMP_LIMIT,
-) -> torch.Tensor:
-    """``silu(min(gate, L)) * clamp(up, -L, L) * probs``, with ``L = clamp_limit``.
-
-    ``gate`` / ``up`` are the halves of ``x``'s last dim. The clamp backward is
-    straight-through, matching ``torch.clamp``.
-    """
-    return GLUWithProbs.apply(x, probs, row_mask, "silu", clamp_limit)
