@@ -149,8 +149,10 @@ constexpr int lds_pitch(const int tile_n) {
 struct MXFP6NoPrologueArgs {};
 
 template <typename DType, MXFP6Prologue PROLOGUE>
-using prologue_args_t = std::conditional_t<PROLOGUE == MXFP6Prologue::QkNormRopeBackward,
-                                           MXFP6QkNormRopeArgs<DType>, MXFP6NoPrologueArgs>;
+using prologue_args_t = std::conditional_t<
+    PROLOGUE == MXFP6Prologue::QkNormRopeBackward, MXFP6QkNormRopeArgs<DType>,
+    std::conditional_t<PROLOGUE == MXFP6Prologue::LnModulate, MXFP6LnModulateArgs<DType>,
+                       MXFP6NoPrologueArgs>>;
 
 using packed_fp6x32_t = uint32_t __attribute__((ext_vector_type(6)));
 using uint4_t         = uint32_t __attribute__((ext_vector_type(4)));
@@ -333,6 +335,47 @@ __device__ __forceinline__ void stage_vector(uint16_t (&dst)[kStageVec],
     }
 }
 
+// AdaLN's modulated layer norm over one staged vector, in place.
+//
+// Factored out rather than written into each staging arm because the three arms differ
+// only in how the tile reaches LDS, not in what happens to it once there -- and because
+// there is exactly one expression here whose association has to match the producing
+// kernel's, so it should exist once.
+//
+// The row statistics are read, not recomputed. They reduce over the whole hidden
+// dimension and a block only sees TILE_N of it, so recomputing is not on offer; taking
+// them also means the normalisation is bit-identical to the producer's by construction
+// rather than by agreement, leaving only the affine below to match.
+template <typename DType>
+__device__ __forceinline__ void apply_ln_modulate(uint16_t (&staged)[kStageVec],
+                                                  const MXFP6LnModulateArgs<DType> &args,
+                                                  const int32_t global_m, const int32_t global_n,
+                                                  const int32_t N) {
+    // Contraction off, deliberately. The epilogue being replaced is a sequence of tensor
+    // ops, so its multiply and its add round separately; letting the compiler fuse them
+    // into an FMA keeps one extra bit of the product and changes roughly one packed code in
+    // 10^5 -- measured, not feared. Cheap to give up: this prologue is bandwidth bound, and
+    // it is what lets the blobs be claimed bit-identical rather than close.
+#pragma clang fp contract(off)
+    const float   mean = args.mean[global_m];
+    const float   rstd = args.rstd[global_m];
+    // m = s * B + b over a power-of-two B, so the batch index is the low bits of the row.
+    const int32_t b    = global_m & args.batch_mask;
+
+    uint16_t scale_staged[kStageVec];
+    uint16_t shift_staged[kStageVec];
+    stage_vector(scale_staged, reinterpret_cast<const uint16_t *>(args.scale), b, global_n, N);
+    stage_vector(shift_staged, reinterpret_cast<const uint16_t *>(args.shift), b, global_n, N);
+
+#pragma unroll
+    for (int i = 0; i < kStageVec; ++i) {
+        const float x_hat = (to_float<DType>(staged[i]) - mean) * rstd;
+        const float sc    = to_float<DType>(scale_staged[i]);
+        const float sh    = to_float<DType>(shift_staged[i]);
+        staged[i]         = from_float<DType>(x_hat * (1.0f + sc) + sh);
+    }
+}
+
 /*
  * Quantize one 32-value group and scatter it into the packed blob.
  *
@@ -458,7 +501,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
     uint8_t *__restrict__ row_packed, uint8_t *__restrict__ row_scale,
     uint8_t *__restrict__ col_packed, uint8_t *__restrict__ col_scale, float *__restrict__ col_sum,
     const int32_t M, const int32_t N, const int32_t row_nk_pad, const int32_t col_nk_pad,
-    const prologue_args_t<DType, PROLOGUE> qkr) {
+    const prologue_args_t<DType, PROLOGUE> pargs) {
     static_assert(TILE_N % kGroupSize == 0, "a staged patch must hold whole groups both ways");
     static_assert(TILE_N <= THREADS_PER_BLOCK,
                   "the column-sum pass assigns one column per thread");
@@ -612,22 +655,29 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                             aux_staged[i] =
                                 s_aux[local_m * TILE_N + local_n + i];
                     }
-                    if (bias != nullptr)
-                        stage_vector(bias_staged, reinterpret_cast<const uint16_t *>(bias), 0,
-                                     tile_n + local_n, N);
-#pragma unroll
-                    for (int i = 0; i < kStageVec; ++i) {
-                        float x = to_float<DType>(staged[i]);
+                    if constexpr (PROLOGUE == MXFP6Prologue::LnModulate) {
+                        apply_ln_modulate<DType>(staged, pargs, tile_m + local_m,
+                                                 tile_n + local_n, N);
+                    } else {
                         if (bias != nullptr)
-                            x = round_to_dtype<DType>(x + to_float<DType>(bias_staged[i]));
-                        if constexpr (PROLOGUE == MXFP6Prologue::BiasGelu) {
-                            staged[i] = from_float<DType>(gelu_tanh(x));
-                        } else {
-                            staged[i] = from_float<DType>(
-                                gelu_tanh_backward(to_float<DType>(aux_staged[i]), x));
+                            stage_vector(bias_staged, reinterpret_cast<const uint16_t *>(bias), 0,
+                                         tile_n + local_n, N);
+#pragma unroll
+                        for (int i = 0; i < kStageVec; ++i) {
+                            float x = to_float<DType>(staged[i]);
+                            if (bias != nullptr)
+                                x = round_to_dtype<DType>(x + to_float<DType>(bias_staged[i]));
+                            if constexpr (PROLOGUE == MXFP6Prologue::BiasGelu) {
+                                staged[i] = from_float<DType>(gelu_tanh(x));
+                            } else {
+                                staged[i] = from_float<DType>(
+                                    gelu_tanh_backward(to_float<DType>(aux_staged[i]), x));
+                            }
                         }
-                        s_tile[local_m][local_n + i] = staged[i];
                     }
+#pragma unroll
+                    for (int i = 0; i < kStageVec; ++i)
+                        s_tile[local_m][local_n + i] = staged[i];
                     __syncthreads();
                 }
 
@@ -774,22 +824,29 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                         if constexpr (PROLOGUE == MXFP6Prologue::BiasGeluBackward)
                             aux_staged[i] = s_aux[local_m * TILE_N + local_n + i];
                     }
-                    if (bias != nullptr)
-                        stage_vector(bias_staged, reinterpret_cast<const uint16_t *>(bias), 0,
-                                     tile_n + local_n, N);
-#pragma unroll
-                    for (int i = 0; i < VEC; ++i) {
-                        float x = to_float<DType>(staged[i]);
+                    if constexpr (PROLOGUE == MXFP6Prologue::LnModulate) {
+                        apply_ln_modulate<DType>(staged, pargs, tile_m + local_m,
+                                                 tile_n + local_n, N);
+                    } else {
                         if (bias != nullptr)
-                            x = round_to_dtype<DType>(x + to_float<DType>(bias_staged[i]));
-                        if constexpr (PROLOGUE == MXFP6Prologue::BiasGelu) {
-                            staged[i] = from_float<DType>(gelu_tanh(x));
-                        } else {
-                            staged[i] = from_float<DType>(
-                                gelu_tanh_backward(to_float<DType>(aux_staged[i]), x));
+                            stage_vector(bias_staged, reinterpret_cast<const uint16_t *>(bias), 0,
+                                         tile_n + local_n, N);
+#pragma unroll
+                        for (int i = 0; i < VEC; ++i) {
+                            float x = to_float<DType>(staged[i]);
+                            if (bias != nullptr)
+                                x = round_to_dtype<DType>(x + to_float<DType>(bias_staged[i]));
+                            if constexpr (PROLOGUE == MXFP6Prologue::BiasGelu) {
+                                staged[i] = from_float<DType>(gelu_tanh(x));
+                            } else {
+                                staged[i] = from_float<DType>(
+                                    gelu_tanh_backward(to_float<DType>(aux_staged[i]), x));
+                            }
                         }
-                        s_tile[local_m][local_n + i] = staged[i];
                     }
+#pragma unroll
+                    for (int i = 0; i < VEC; ++i)
+                        s_tile[local_m][local_n + i] = staged[i];
                 }
                 __syncthreads();
             }
@@ -797,6 +854,9 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
     }
 
     if constexpr (kQkr) {
+        // Named locally so the body below keeps reading as the QK-norm+RoPE code it is; the
+        // kernel parameter is generic because three prologues now carry operand structs.
+        const auto &qkr = pargs;
         // Which slice this block owns. Inside the `if constexpr` because the operands only
         // exist on this instantiation -- the others are handed an empty struct.
         const DType *__restrict__ qkr_grad =
@@ -923,37 +983,47 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                 if (global_m < M) {
                     stage_vector(staged, input_u16, global_m, global_n, N);
 
-                    if constexpr (PROLOGUE != MXFP6Prologue::Identity) {
-                    // Every operand the prologue reads comes in through stage_vector, which
-                    // zero-fills past N. That is what lets the epilogue run unguarded over
-                    // the whole vector: both prologues map an all-zero input to exactly
-                    // zero, so the padded columns stage as zero on their own.
-                    //
-                    // Zero there is not cosmetic. The grid covers the operand padded to 256
-                    // on both axes and the dual pack contracts N one way and M the other,
-                    // so padding on either axis lands on a contraction axis, where a
-                    // nonzero code would add a spurious term to the dot product. An
-                    // earlier version read the bias directly as bias_u16[global_n + i] and
-                    // needed a per-element bounds branch to stop gelu(0 + bias) from
-                    // landing there; the branch cost 13 instructions per element in exec
-                    // mask manipulation alone, more than the activation it guarded.
+                    if constexpr (PROLOGUE == MXFP6Prologue::LnModulate) {
+                        // Unlike the bias/GELU prologues this one does not map a zero input
+                        // to zero -- a padded column would stage -mean * rstd rather than
+                        // the zero the blob's padding has to encode. The entry point
+                        // requires N to be a multiple of 256 so no padded column tile
+                        // exists, which is why there is no per-element guard here.
+                        apply_ln_modulate<DType>(staged, pargs, global_m, global_n, N);
+                    } else if constexpr (PROLOGUE != MXFP6Prologue::Identity) {
+                        // Every operand the prologue reads comes in through stage_vector,
+                        // which zero-fills past N. That is what lets the epilogue run
+                        // unguarded over the whole vector: both prologues map an all-zero
+                        // input to exactly zero, so the padded columns stage as zero on
+                        // their own.
+                        //
+                        // Zero there is not cosmetic. The grid covers the operand padded to
+                        // 256 on both axes and the dual pack contracts N one way and M the
+                        // other, so padding on either axis lands on a contraction axis,
+                        // where a nonzero code would add a spurious term to the dot
+                        // product. An earlier version read the bias directly as
+                        // bias_u16[global_n + i] and needed a per-element bounds branch to
+                        // stop gelu(0 + bias) from landing there; the branch cost 13
+                        // instructions per element in exec mask manipulation alone, more
+                        // than the activation it guarded.
                         uint16_t aux_staged[VEC] = {0, 0, 0, 0, 0, 0, 0, 0};
                         if constexpr (PROLOGUE == MXFP6Prologue::BiasGeluBackward)
                             stage_vector(aux_staged, aux_u16, global_m, global_n, N);
 
-                    // One vector load, not one load per element. The bias is a single row
-                    // of length N, so the row-staging helper addresses it correctly with
-                    // row 0 and gives the same coalescing the input gets.
+                        // One vector load, not one load per element. The bias is a single
+                        // row of length N, so the row-staging helper addresses it correctly
+                        // with row 0 and gives the same coalescing the input gets.
                         uint16_t bias_staged[VEC] = {0, 0, 0, 0, 0, 0, 0, 0};
                         if (bias_u16 != nullptr)
                             stage_vector(bias_staged, bias_u16, 0, global_n, N);
 #pragma unroll
                         for (int i = 0; i < VEC; ++i) {
-                        // The bias-add is rounded back to DType before the activation reads
-                        // it. That rounding looks redundant and is not: in the graph being
-                        // replaced the add is a DType tensor op, so its result is a DType
-                        // value, and carrying the sum on to the activation in fp32 instead
-                        // changes 21% of the bf16 codes it produces.
+                            // The bias-add is rounded back to DType before the activation
+                            // reads it. That rounding looks redundant and is not: in the
+                            // graph being replaced the add is a DType tensor op, so its
+                            // result is a DType value, and carrying the sum on to the
+                            // activation in fp32 instead changes 21% of the bf16 codes it
+                            // produces.
                             float x = to_float<DType>(staged[i]);
                             if (bias_u16 != nullptr)
                                 x = round_to_dtype<DType>(x + to_float<DType>(bias_staged[i]));
@@ -1003,8 +1073,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
 #pragma unroll
             for (int gr = 0; gr < kDwGroups; ++gr)
                 acc += s_dw[(chunk * kDwGroups + gr) * kStageVec + j];
-            float *__restrict__ dst = qkv_slot == 0 ? qkr.dw_q : qkr.dw_k;
-            dst[(int64_t(blockIdx.y) * qkr.num_heads + head) * TILE_N + threadIdx.x] = acc;
+            float *__restrict__ dst = qkv_slot == 0 ? pargs.dw_q : pargs.dw_k;
+            dst[(int64_t(blockIdx.y) * pargs.num_heads + head) * TILE_N + threadIdx.x] = acc;
         }
         __syncthreads();
     }
@@ -1093,15 +1163,15 @@ void launch_fused(const dim3 grid, const dim3 block, hipStream_t stream, const D
                   const DType *aux, const DType *bias, uint8_t *row_packed, uint8_t *row_scale,
                   uint8_t *col_packed, uint8_t *col_scale, float *col_sum, const int32_t M,
                   const int32_t N, const int32_t row_nk_pad, const int32_t col_nk_pad,
-                  const prologue_args_t<DType, PROLOGUE> &qkr = {}) {
+                  const prologue_args_t<DType, PROLOGUE> &pargs = {}) {
     if (col_sum != nullptr) {
         quantize_mxfp6_dual_kernel<DType, true, true, PROLOGUE, true, TILE_N>
             <<<grid, block, 0, stream>>>(input, aux, bias, row_packed, row_scale, col_packed,
-                                         col_scale, col_sum, M, N, row_nk_pad, col_nk_pad, qkr);
+                                         col_scale, col_sum, M, N, row_nk_pad, col_nk_pad, pargs);
     } else {
         quantize_mxfp6_dual_kernel<DType, true, true, PROLOGUE, false, TILE_N>
             <<<grid, block, 0, stream>>>(input, aux, bias, row_packed, row_scale, col_packed,
-                                         col_scale, nullptr, M, N, row_nk_pad, col_nk_pad, qkr);
+                                         col_scale, nullptr, M, N, row_nk_pad, col_nk_pad, pargs);
     }
 }
 
@@ -1200,6 +1270,11 @@ void quantize_mxfp6_fused_impl(const DType *input, const DType *aux, const DType
         PRIMUS_TURBO_CHECK(false,
                            "QkNormRopeBackward has its own entry point, not the fused packer");
         break;
+    case MXFP6Prologue::LnModulate:
+        // Same reason: four operands that are not (aux, bias). It does run at the shipped
+        // tile width, so the separation is about the signature alone.
+        PRIMUS_TURBO_CHECK(false, "LnModulate has its own entry point, not the fused packer");
+        break;
     }
     PRIMUS_TURBO_CHECK_HIP(hipGetLastError());
 }
@@ -1244,6 +1319,32 @@ void quantize_mxfp6_qk_norm_rope_bwd_impl(const DType *input,
     PRIMUS_TURBO_CHECK_HIP(hipGetLastError());
 }
 
+template <typename DType>
+void quantize_mxfp6_ln_modulate_impl(const DType *input, const MXFP6LnModulateArgs<DType> &args,
+                                     uint8_t *row_packed, uint8_t *row_scale, uint8_t *col_packed,
+                                     uint8_t *col_scale, float *col_sum, const int M, const int N,
+                                     hipStream_t stream) {
+    // The prologue leaves -mean * rstd where a zero-filled column should stage zero, and
+    // that column is on the column-direction blob's contraction axis. Rather than pay a
+    // per-element bounds branch in the innermost loop to mask it -- the same branch the
+    // bias path measured at 13 instructions per element and removed -- require the shape
+    // that makes padding impossible. Every AdaLN tensor in a DiT is a multiple of 256 wide.
+    PRIMUS_TURBO_CHECK(N % kTileRows == 0,
+                       "LnModulate needs N to be a multiple of 256 so the grid has no padded "
+                       "column tile");
+    // Rows past M are guarded by the staging path itself, which never runs the prologue on
+    // them, so M has no such constraint.
+    PRIMUS_TURBO_CHECK(args.batch_mask >= 0 && (args.batch_mask & (args.batch_mask + 1)) == 0,
+                       "LnModulate needs a power-of-two batch, passed as batch_mask = B - 1");
+
+    constexpr int kLnModulateTileN = 128;
+    const auto [row_nk_pad, col_nk_pad, grid, block] = geometry_for<kLnModulateTileN>(M, N);
+    launch_fused<DType, MXFP6Prologue::LnModulate, kLnModulateTileN>(
+        grid, block, stream, input, nullptr, nullptr, row_packed, row_scale, col_packed, col_scale,
+        col_sum, M, N, row_nk_pad, col_nk_pad, args);
+    PRIMUS_TURBO_CHECK_HIP(hipGetLastError());
+}
+
 template void quantize_mxfp6_impl<bfloat16>(const bfloat16 *, uint8_t *, uint8_t *, uint8_t *,
                                             uint8_t *, const int, const int, const MXFP6Direction,
                                             hipStream_t);
@@ -1270,5 +1371,15 @@ template void quantize_mxfp6_qk_norm_rope_bwd_impl<float16>(const float16 *,
                                                             uint8_t *, uint8_t *, uint8_t *,
                                                             uint8_t *, float *, const int,
                                                             const int, hipStream_t);
+
+template void quantize_mxfp6_ln_modulate_impl<bfloat16>(const bfloat16 *,
+                                                        const MXFP6LnModulateArgs<bfloat16> &,
+                                                        uint8_t *, uint8_t *, uint8_t *, uint8_t *,
+                                                        float *, const int, const int,
+                                                        hipStream_t);
+template void quantize_mxfp6_ln_modulate_impl<float16>(const float16 *,
+                                                       const MXFP6LnModulateArgs<float16> &,
+                                                       uint8_t *, uint8_t *, uint8_t *, uint8_t *,
+                                                       float *, const int, const int, hipStream_t);
 
 } // namespace primus_turbo

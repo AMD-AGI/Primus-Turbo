@@ -499,3 +499,85 @@ def quantize_mxfp6_qk_norm_rope_bwd(
         want_col_sum,
     )
     return tuple(blobs)
+
+
+def mxfp6_ln_modulate_reference(
+    x: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+) -> torch.Tensor:
+    """Eager reference for the tensor ``quantize_mxfp6_ln_modulate`` packs.
+
+    ``(x - mean) * rstd * (1 + scale) + shift``, evaluated in fp32 and rounded back to
+    ``x.dtype`` -- which is what a separate normalisation kernel would have stored for the
+    packer to read. Row ``m`` takes its modulation from batch ``m % B``, the flattening
+    ``[S, B, N] -> [S*B, N]`` read backwards.
+
+    The statistics are arguments rather than recomputed here on purpose: this is the
+    reference for the *fusion*, not for the layer norm, and the fused kernel is handed the
+    same two tensors the producing kernel computed. What has to agree is the affine and the
+    rounding.
+    """
+    m = x.shape[0]
+    b = scale.shape[0]
+    batch = torch.arange(m, device=x.device) % b
+    x_hat = (x.float() - mean[:, None]) * rstd[:, None]
+    out = x_hat * (1.0 + scale[batch].float()) + shift[batch].float()
+    return out.to(x.dtype)
+
+
+def quantize_mxfp6_ln_modulate(
+    x: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    want_col_sum: bool = False,
+    block_size: int = MXFP6_BLOCK_SIZE,
+) -> Tuple[torch.Tensor, ...]:
+    """Dual pack with AdaLN's modulated layer norm folded into the staging read.
+
+    ``x`` is the norm's **input** at ``[M, N]``, not its output: the normalised tensor is
+    exactly what this removes from HBM. The producing kernel keeps the pass that computes
+    ``mean`` and ``rstd`` -- those reduce over the whole hidden dimension, which a TILE_N-wide
+    tile cannot see -- and hands them over as fp32 ``[M]``. ``scale`` and ``shift`` are the
+    modulation at ``[B, N]``; row ``m`` uses batch ``m % B``.
+
+    Returns ``(row_packed, row_scale, col_packed, col_scale, col_sum)``, the same five as
+    ``quantize_mxfp6_fused_dual``.
+
+    Unlike the GELU prologues this one has no transcendental, so the blobs are claimed
+    **bit-identical** to ``quantize_mxfp6_dual(mxfp6_ln_modulate_reference(...))`` rather
+    than merely close, and the test gates them that way.
+
+    Two shape constraints the binding enforces, both consequences of the kernel rather than
+    of the math:
+
+    * ``B`` must be a power of two, so the batch index is the low bits of the row. gfx950 has
+      no integer divide and a runtime modulo in the innermost loop costs ~20 instructions.
+    * ``N`` must be a multiple of 256, so the launch grid has no padded column tile. The
+      other prologues tolerate one because they map a zero input to zero; this one would
+      leave ``-mean * rstd`` there, on the column blob's contraction axis.
+
+    A caller who cannot meet those keeps the unfused path: normalise, then
+    ``quantize_mxfp6_dual``.
+    """
+    _require_supported(x.device)
+    _check_input(x, block_size)
+
+    operands = {"mean": mean, "rstd": rstd, "scale": scale, "shift": shift}
+    for name, operand in operands.items():
+        if operand.device != x.device:
+            raise ValueError(
+                f"MXFP6 ln-modulate pack needs every operand on one device: x is on "
+                f"{x.device} but {name} is on {operand.device}."
+            )
+
+    blobs = torch.ops.primus_turbo_cpp_extension.quantize_mxfp6_ln_modulate(
+        x.contiguous(),
+        *(operands[k].contiguous() for k in ("mean", "rstd", "scale", "shift")),
+        want_col_sum,
+    )
+    return tuple(blobs)

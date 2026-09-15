@@ -130,6 +130,11 @@ MXFP6_SCALE_TILE_BYTES = 1024
 MXFP6_PROLOGUE_IDENTITY = 0
 MXFP6_PROLOGUE_BIAS_GELU = 1
 MXFP6_PROLOGUE_BIAS_GELU_BACKWARD = 2
+# 3 is QkNormRopeBackward and 4 is LnModulate. Neither is reachable through
+# quantize_mxfp6_fused_dual's `mode` -- their operands do not fit its (aux, bias) -- so
+# they are named here only to keep the numbering honest against the C++ enum.
+MXFP6_PROLOGUE_QK_NORM_ROPE_BACKWARD = 3
+MXFP6_PROLOGUE_LN_MODULATE = 4
 
 # M-rows per row of the packer's bias-gradient partial buffer, i.e. its M-tile height.
 # Must match MXFP6_COL_SUM_TILE_M in csrc/include/primus_turbo/quantization.h.

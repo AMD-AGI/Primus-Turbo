@@ -26,10 +26,12 @@ from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import (
     mxfp6_apply_prologue,
     mxfp6_col_sum_rows,
     mxfp6_data_region,
+    mxfp6_ln_modulate_reference,
     mxfp6_pack_sizes,
     quantize_mxfp6_col,
     quantize_mxfp6_dual,
     quantize_mxfp6_fused_dual,
+    quantize_mxfp6_ln_modulate,
     quantize_mxfp6_row,
 )
 from primus_turbo.pytorch.ops.gemm_fp6 import gemm_fp6
@@ -410,6 +412,109 @@ def _blobs_equal(got, ref, rows, cols):
         and same(got_cp, ref_cp, cols, rows)
         and same(got_cs, ref_cs, cols, rows, is_scale=True)
     )
+
+
+# ---------------------------------------------------------------------------
+# LnModulate prologue.
+#
+# Held to bit-exactness rather than to the tolerance the GELU modes get. There is no
+# transcendental here -- the prologue is a subtract, two multiplies and an add over
+# statistics it is handed rather than computes -- so any difference from the eager
+# epilogue is a bug, not a second rounding of a closed form.
+# ---------------------------------------------------------------------------
+
+
+def _ln_modulate_operands(rows, cols, batch, dtype=torch.bfloat16, device="cuda:0"):
+    """An AdaLN call's operands, with statistics taken from a real normalisation.
+
+    The statistics are computed rather than invented so the values the prologue sees have
+    the distribution a normalised tensor actually has; feeding it random mean/rstd would
+    pack a tensor with a scale range no layer norm produces and weaken the comparison.
+    """
+    x = torch.randn((rows, cols), dtype=dtype, device=device)
+    mean = x.float().mean(dim=-1)
+    rstd = torch.rsqrt(x.float().var(dim=-1, unbiased=False) + 1e-6)
+    scale = torch.randn((batch, cols), dtype=dtype, device=device)
+    shift = torch.randn((batch, cols), dtype=dtype, device=device)
+    return x, mean, rstd, scale, shift
+
+
+@pytest.mark.parametrize("rows,cols,batch", [(256, 256, 1), (512, 768, 2), (1024, 512, 32)])
+def test_ln_modulate_prologue_is_bit_exact(rows, cols, batch):
+    """The fused pack must equal packing an eagerly normalised tensor, byte for byte."""
+    _skip_if_unsupported()
+
+    x, mean, rstd, scale, shift = _ln_modulate_operands(rows, cols, batch)
+
+    got = quantize_mxfp6_ln_modulate(x, mean, rstd, scale, shift)
+    ref = quantize_mxfp6_dual(mxfp6_ln_modulate_reference(x, mean, rstd, scale, shift))
+
+    assert _blobs_equal(got, ref, rows, cols)
+
+
+def test_ln_modulate_uses_the_row_s_own_batch():
+    """Row m must take its modulation from batch m % B, not from batch 0.
+
+    Worth its own test because a wrong batch index is invisible at B = 1 and produces a
+    plausible-looking tensor at B > 1 -- the failure mode is a silently mis-modulated
+    activation, not a fault.
+    """
+    _skip_if_unsupported()
+
+    rows, cols, batch = 512, 256, 4
+    x, mean, rstd, scale, shift = _ln_modulate_operands(rows, cols, batch)
+
+    got = quantize_mxfp6_ln_modulate(x, mean, rstd, scale, shift)
+    ref = quantize_mxfp6_dual(mxfp6_ln_modulate_reference(x, mean, rstd, scale, shift))
+    assert _blobs_equal(got, ref, rows, cols)
+
+    # Broadcasting batch 0 over every row is the bug this guards against, so it must not
+    # produce the same blobs.
+    broadcast = scale[:1].expand(batch, cols).contiguous()
+    wrong = quantize_mxfp6_dual(mxfp6_ln_modulate_reference(x, mean, rstd, broadcast, shift))
+    assert not _blobs_equal(got, wrong, rows, cols)
+
+
+def test_ln_modulate_rejects_shapes_the_kernel_cannot_index():
+    """Both constraints are hard errors, not silent fallbacks.
+
+    A non-power-of-two batch would make the low-bits batch index wrong, and an N that is
+    not 256-aligned would leave -mean * rstd in a padded column that sits on the column
+    blob's contraction axis. Either one packs a plausible wrong answer, so the binding has
+    to refuse rather than proceed.
+    """
+    _skip_if_unsupported()
+
+    x, mean, rstd, scale, shift = _ln_modulate_operands(768, 256, 3)
+    with pytest.raises(Exception, match="power-of-two batch"):
+        quantize_mxfp6_ln_modulate(x, mean, rstd, scale, shift)
+
+    x, mean, rstd, scale, shift = _ln_modulate_operands(256, 384, 2)
+    with pytest.raises(Exception, match="multiple of 256"):
+        quantize_mxfp6_ln_modulate(x, mean, rstd, scale, shift)
+
+
+def test_ln_modulate_custom_op_fake_matches_real():
+    """FakeTensor shapes must match the real op or torch.compile traces wrong sizes."""
+    _skip_if_unsupported()
+
+    rows, cols, batch = 512, 512, 2
+    x, mean, rstd, scale, shift = _ln_modulate_operands(rows, cols, batch)
+    op = torch.ops.primus_turbo.quantize_mxfp6_ln_modulate_impl
+
+    for want_col_sum in (False, True):
+        real = op(x, mean, rstd, scale, shift, want_col_sum)
+        with torch._subclasses.FakeTensorMode() as fake_mode:
+            fake = op(
+                fake_mode.from_tensor(x),
+                fake_mode.from_tensor(mean),
+                fake_mode.from_tensor(rstd),
+                fake_mode.from_tensor(scale),
+                fake_mode.from_tensor(shift),
+                want_col_sum,
+            )
+        assert [t.shape for t in fake] == [t.shape for t in real]
+        assert [t.dtype for t in fake] == [t.dtype for t in real]
 
 
 def _scale_blobs_equal(got, ref, rows, cols):

@@ -128,6 +128,22 @@ quantize_mxfp6_qk_norm_rope_bwd_meta(const at::Tensor input, const at::Tensor dq
                                      const at::Tensor wq, const at::Tensor wk,
                                      const at::Tensor rstd_q, const at::Tensor rstd_k,
                                      const bool want_col_sum);
+
+// Dual pack with AdaLN's modulated layer norm folded into the staging read. `input` is the
+// norm's *input* at [M, N] -- the normalised tensor is what the fusion removes -- with
+// mean/rstd the fp32 row statistics at [M] as the producing kernel computed them, and
+// scale/shift the modulation at [B, N]. Row m carries batch m % B, which the kernel reads as
+// the low bits of m, so B must be a power of two; N must be a multiple of 256.
+//
+// Returns the four blobs and the column-sum partial (degenerate unless `want_col_sum`),
+// matching quantize_mxfp6_fused_dual.
+std::vector<at::Tensor> quantize_mxfp6_ln_modulate(const at::Tensor input, const at::Tensor mean,
+                                                   const at::Tensor rstd, const at::Tensor scale,
+                                                   const at::Tensor shift, const bool want_col_sum);
+std::vector<at::Tensor>
+quantize_mxfp6_ln_modulate_meta(const at::Tensor input, const at::Tensor mean,
+                                const at::Tensor rstd, const at::Tensor scale,
+                                const at::Tensor shift, const bool want_col_sum);
 #endif // BUILD_MXFP6_BACKEND
 
 at::Tensor dequantize_fp8_rowwise(const at::Tensor input, const at::Tensor scale_inv,

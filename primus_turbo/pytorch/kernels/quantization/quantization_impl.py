@@ -1121,6 +1121,48 @@ def quantize_mxfp6_fused_dual_impl_meta(
 
 
 @torch.library.custom_op(
+    "primus_turbo::quantize_mxfp6_ln_modulate_impl", mutates_args=(), device_types="cuda"
+)
+def quantize_mxfp6_ln_modulate_impl(
+    x: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    want_col_sum: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dual pack with AdaLN's modulated layer norm folded into the packer's staging read.
+
+    Same five outputs as ``quantize_mxfp6_fused_dual_impl``, but ``x`` is the norm's input
+    rather than its output: the normalised tensor never reaches HBM. Opaque to inductor on
+    purpose, like the other packers -- the point is that inductor no longer has a pointwise
+    kernel to emit ahead of the pack.
+    """
+    from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import quantize_mxfp6_ln_modulate
+
+    return quantize_mxfp6_ln_modulate(x, mean, rstd, scale, shift, want_col_sum)
+
+
+@quantize_mxfp6_ln_modulate_impl.register_fake
+def quantize_mxfp6_ln_modulate_impl_meta(
+    x: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    want_col_sum: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import mxfp6_col_sum_rows
+
+    # The prologue is elementwise once the statistics are in hand, so it does not touch the
+    # blob geometry.
+    blobs = quantize_mxfp6_dual_impl_meta(x)
+    rows, cols = x.shape
+    shape = (mxfp6_col_sum_rows(rows), cols) if want_col_sum else (0, 0)
+    return (*blobs, torch.empty(shape, dtype=torch.float32, device=x.device))
+
+
+@torch.library.custom_op(
     "primus_turbo::quantize_mxfp6_qk_norm_rope_bwd_impl", mutates_args=(), device_types="cuda"
 )
 def quantize_mxfp6_qk_norm_rope_bwd_impl(

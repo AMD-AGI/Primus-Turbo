@@ -166,6 +166,18 @@ enum class MXFP6Prologue {
     // and a block-local reduction is the only kind this kernel can do without cross-lane
     // traffic. That is a static_assert, not a hope.
     QkNormRopeBackward,
+    // AdaLN's modulated layer norm, for the tensor a DiT block feeds its QKV and MLP
+    // projections: (input - mean) * rstd * (1 + scale) + shift, carried in
+    // MXFP6LnModulateArgs.
+    //
+    // Elementwise on `input` like the first three, and unlike QkNormRopeBackward, but only
+    // because the row statistics arrive precomputed. It cannot compute them: mean and rstd
+    // reduce over the whole hidden dimension while a tile is TILE_N wide, so the producing
+    // kernel keeps that pass and hands the results over. What the fusion removes is that
+    // kernel's *store* of the normalised tensor and the packer's read of it back.
+    //
+    // Appended rather than inserted: the mode is an integer on the Python side.
+    LnModulate,
 };
 
 // Operands for MXFP6Prologue::QkNormRopeBackward.
@@ -196,6 +208,27 @@ template <typename DType> struct MXFP6QkNormRopeArgs {
     float       *dw_q, *dw_k;
     int32_t      num_heads;
     int32_t      head_dim;
+};
+
+// Operands for MXFP6Prologue::LnModulate, in the packer's 2D view of a [S, B, N] tensor
+// flattened to M = S*B rows:
+//
+//   mean, rstd   [M]      fp32 row statistics, as the producing kernel computed them.
+//                         Taken rather than recomputed so the fused pack reproduces that
+//                         kernel's normalisation exactly instead of a second opinion of it.
+//   scale, shift [B, N]   the modulation, per batch element. Row m carries batch
+//                         m & batch_mask, which is the flattening [S, B] -> m = s*B + b
+//                         read backwards.
+//
+// batch_mask is B - 1 and B must be a power of two, which the entry point checks. The
+// honest form of that index is m % B, but B is a runtime value and gfx950 has no integer
+// divide, so a modulo costs ~20 instructions in the innermost loop -- the same reason
+// MXFP6QkNormRopeArgs spells its head index on blockIdx.x. A non-power-of-two micro-batch
+// is rejected there rather than packed wrongly; the caller keeps the unfused path for it.
+template <typename DType> struct MXFP6LnModulateArgs {
+    const float *mean, *rstd;
+    const DType *scale, *shift;
+    int32_t      batch_mask;
 };
 
 // M-rows per row of the bias-gradient partial buffer, i.e. the packer's M-tile height.
@@ -263,6 +296,24 @@ void quantize_mxfp6_qk_norm_rope_bwd_impl(const DType *input,
                                           uint8_t *row_packed, uint8_t *row_scale,
                                           uint8_t *col_packed, uint8_t *col_scale, float *col_sum,
                                           const int M, const int N, hipStream_t stream);
+
+// As above for MXFP6Prologue::LnModulate. Separate for the same reason QkNormRopeBackward is:
+// its operands do not fit the (input, aux, bias) shape. It does run at the shipped tile
+// width, so unlike that one it adds no new tile instantiation.
+//
+// Two constraints, both checked at the entry point rather than assumed:
+//   * N must be a multiple of 256, so the grid has no padded column tile. The other
+//     prologues tolerate one because they map a zero input to zero, which is what the
+//     padded region of the blob has to encode. This one does not -- at a padded column the
+//     zero-filled scale and shift would still leave -mean * rstd -- and padding lands on a
+//     contraction axis, where a nonzero code corrupts the dot product rather than sitting
+//     harmlessly in the guard region.
+//   * B must be a power of two, for the index arithmetic described above.
+template <typename DType>
+void quantize_mxfp6_ln_modulate_impl(const DType *input, const MXFP6LnModulateArgs<DType> &args,
+                                     uint8_t *row_packed, uint8_t *row_scale, uint8_t *col_packed,
+                                     uint8_t *col_scale, float *col_sum, const int M, const int N,
+                                     hipStream_t stream);
 
 template <typename DType>
 void quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_output,
