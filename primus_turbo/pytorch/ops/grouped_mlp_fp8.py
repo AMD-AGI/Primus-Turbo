@@ -10,9 +10,11 @@ import torch
 
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import (
+    MXFP8_BLOCK_SIZE,
     Float8QuantConfig,
     ScalingGranularity,
     ScalingRecipe,
+    check_mxfp8_support,
 )
 from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensor,
@@ -24,11 +26,17 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_fp8_dglu_impl,
     grouped_gemm_fp8_glu_impl,
     grouped_gemm_fp8_impl,
+    grouped_gemm_fp8_mx_dglu_impl,
+    grouped_gemm_fp8_mx_glu_impl,
     grouped_gemm_fp8_variable_k_accum_impl,
     grouped_gemm_fp8_variable_k_impl,
 )
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     group_offs_from_lens,
+)
+from primus_turbo.pytorch.ops.quantization import (
+    grouped_quantize_fp8_with_trans,
+    quantize_fp8_with_trans,
 )
 from primus_turbo.pytorch.ops.utils import (
     _ensure_contiguous_grad_out,
@@ -434,6 +442,334 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
         )
 
 
+def _quantize_weight(
+    w: Union[torch.Tensor, QuantizedTensor],
+    w_t: Optional[QuantizedTensor],
+    config: Float8QuantConfig,
+):
+    """(row-wise, col-wise) MXFP8 operands for one 3D expert weight.
+
+    Both halves take the per-32x32 tile scale, which is weight-only; sharing one amax
+    across the tile keeps the forward and dgrad operands consistent. A cached ``w_t``
+    is taken as given; only its absence forces the col-wise pass.
+    """
+    recipe = ScalingRecipe(use_2d_block=True)
+    w_dtype = _get_fp8_dtype(config.format, True)
+    if not isinstance(w, QuantizedTensor):
+        return quantize_fp8_with_trans(
+            w,
+            w_dtype,
+            ScalingGranularity.MX_BLOCKWISE,
+            block_size=MXFP8_BLOCK_SIZE,
+            scaling_recipe=recipe,
+            scaling_recipe_for_trans=recipe,
+        )
+
+    assert not w._is_grouped_tensor, "an expert weight must not be a grouped tensor"
+    check_quantized_tensor(w, config, axis=-1, scaling_recipe=recipe)
+    if w_t is None:
+        w_t = QuantizedTensor.quantize(
+            w.dequantize(),
+            w.real_dtype,
+            config.granularity,
+            axis=-2,
+            block_size=config.block_size,
+            scaling_recipe=recipe,
+        )
+    else:
+        assert isinstance(w_t, QuantizedTensor)
+    return w.qdata, w.scale_inv, w_t.qdata, w_t.scale_inv
+
+
+class FP8GroupedMLPMXFunc(torch.autograd.Function):
+    """MXFP8 grouped MoE MLP autograd (MX_BLOCKWISE, NT-only, FlyDSL backend)."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: Union[torch.Tensor, QuantizedTensor],
+        probs: torch.Tensor,
+        w1: Union[torch.Tensor, QuantizedTensor],
+        w2: Union[torch.Tensor, QuantizedTensor],
+        x_t: Optional[QuantizedTensor],
+        w1_t: Optional[QuantizedTensor],
+        w2_t: Optional[QuantizedTensor],
+        group_lens: torch.Tensor,  # [G,] int64
+        group_offs: torch.Tensor,  # [G + 1,] int64
+        trans_w1: bool,
+        trans_w2: bool,
+        activation: str,
+        clamp_limit: Union[None, float],
+        out_dtype: torch.dtype,
+        config: Float8QuantConfig,
+        num_cu: int | None,
+        fuse_wgrad_accum_pattern: Union[None, str] = None,
+    ):
+        clamp_limit = _check_activation(activation, clamp_limit)
+        # Both flags set is what w1 [G, 2I, K] / w2 [G, K_out, I] means.
+        assert trans_w1 and trans_w2, (
+            "MXFP8 grouped MLP is NT-only: trans_w1 and trans_w2 must both be True, "
+            f"got trans_w1={trans_w1}, trans_w2={trans_w2}."
+        )
+        assert config.mxfp8_scaling(), (
+            f"MXFP8 grouped MLP needs MX_BLOCKWISE granularity with E8M0 scales, got {config}"
+        )
+        assert out_dtype == torch.bfloat16, (
+            f"the fused MXFP8 GLU epilogues are bfloat16-only, got {out_dtype}"
+        )
+        supported, reason = check_mxfp8_support()
+        assert supported, reason
+
+        assert x.ndim == 2 and w1.ndim == 3 and w2.ndim == 3
+        K, two_i = int(x.shape[-1]), int(w1.shape[-2])
+        assert two_i % 2 == 0, f"fc1 width must be even (gate||up), got {two_i}"
+        I = two_i // 2
+        assert int(w1.shape[-1]) == K, f"w1 must be [G, 2I, {K}], got {tuple(w1.shape)}"
+        assert int(w2.shape[-1]) == I, f"w2 must be [G, K_out, {I}], got {tuple(w2.shape)}"
+        for name, dim in (("K", K), ("2I", two_i), ("I", I), ("K_out", int(w2.shape[-2]))):
+            assert dim % MXFP8_BLOCK_SIZE == 0, (
+                f"{name} must be a multiple of {MXFP8_BLOCK_SIZE} (got {dim})."
+            )
+
+        # Each weight has its own accumulation buffer, so these cannot be shared.
+        fuse_w1_accum, w1_main_grad = _setup_fused_grad_accum(w1, fuse_wgrad_accum_pattern)
+        fuse_w2_accum, w2_main_grad = _setup_fused_grad_accum(w2, fuse_wgrad_accum_pattern)
+
+        M = int(probs.shape[0])
+        x_dtype = _get_fp8_dtype(config.format, True)
+        if not isinstance(x, QuantizedTensor):
+            x_row, x_row_scale, x_col, x_col_scale, _, offs_row, _, _ = grouped_quantize_fp8_with_trans(
+                x,
+                x_dtype,
+                ScalingGranularity.MX_BLOCKWISE,
+                group_lens,
+                group_offs,
+                block_size=MXFP8_BLOCK_SIZE,
+            )
+        else:
+            assert x._is_grouped_tensor, "a QuantizedTensor input must be a grouped tensor"
+            check_quantized_tensor(x, config, axis=-1)
+            x_row, x_row_scale = x.qdata, x.scale_inv
+            offs_row = x.group_offs
+            if x_t is None:
+                x_t = QuantizedTensor.quantize(
+                    x.dequantize(),
+                    x.real_dtype,
+                    config.granularity,
+                    axis=-2,
+                    block_size=config.block_size,
+                    group_lens=group_lens,
+                )
+            else:
+                assert isinstance(x_t, QuantizedTensor)
+            x_col, x_col_scale = x_t.qdata, x_t.scale_inv
+
+        w1_row, w1_row_scale, w1_col, w1_col_scale = _quantize_weight(w1, w1_t, config)
+        w2_row, w2_row_scale, w2_col, w2_col_scale = _quantize_weight(w2, w2_t, config)
+
+        # The activation is quantised inside the epilogue: it feeds nothing but the
+        # quantiser, so staging it in out_dtype would be an [M, I] round trip through HBM.
+        l1, act_row, act_row_scale, act_col, act_col_scale = grouped_gemm_fp8_mx_glu_impl(
+            x_row,
+            w1_row,
+            x_row_scale,
+            w1_row_scale,
+            group_lens,
+            offs_row,
+            trans_a=False,
+            trans_b=True,
+            out_dtype=out_dtype,
+            num_cu=num_cu,
+            probs=probs,
+            config=config,
+            out_row_scaling_recipe=ScalingRecipe(),
+            out_col_scaling_recipe=ScalingRecipe(),
+            activation=activation,
+            clamp_limit=clamp_limit,
+        )
+
+        # act_row shares x_row's padded rows, so it reads under ``offs_row`` and writes
+        # tight; the output is over-allocated to those padded rows and sliced back.
+        out = grouped_gemm_fp8_impl(
+            act_row,
+            w2_row,
+            act_row_scale,
+            w2_row_scale,
+            group_lens,
+            offs_row,
+            trans_a=False,
+            trans_b=True,
+            out_dtype=out_dtype,
+            granularity=config.granularity.value,
+            num_cu=num_cu,
+            default_backend=BackendType.FLYDSL.value,
+            group_offs_out=group_offs,
+        )[:M]
+
+        ctx.save_for_backward(
+            x_col,
+            x_col_scale,
+            act_col,
+            act_col_scale,
+            w1_col,
+            w1_col_scale,
+            w2_col,
+            w2_col_scale,
+            l1,
+            probs,
+            group_lens,
+            group_offs,
+        )
+        ctx.activation = activation
+        ctx.clamp_limit = clamp_limit
+        ctx.config = config
+        ctx.out_dtype = out_dtype
+        ctx.num_cu = num_cu
+        ctx.fuse_w1_accum = fuse_w1_accum
+        ctx.fuse_w2_accum = fuse_w2_accum
+        # Off save_for_backward: the wgrad writes these in place, which would bump the
+        # version counter saved tensors are checked against.
+        ctx.w1_main_grad = w1_main_grad
+        ctx.w2_main_grad = w2_main_grad
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        grad_out = _ensure_contiguous_grad_out(grad_out)
+        (
+            x_col,
+            x_col_scale,
+            act_col,
+            act_col_scale,
+            w1_col,
+            w1_col_scale,
+            w2_col,
+            w2_col_scale,
+            l1,
+            probs,
+            group_lens,
+            group_offs,
+        ) = ctx.saved_tensors
+
+        M = int(probs.shape[0])
+        grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
+        (
+            go_row,
+            go_row_scale,
+            go_col,
+            go_col_scale,
+            _,
+            go_offs_row,
+            go_lens_col,
+            go_offs_col,
+        ) = grouped_quantize_fp8_with_trans(
+            grad_out,
+            grad_out_dtype,
+            ScalingGranularity.MX_BLOCKWISE,
+            group_lens,
+            group_offs,
+            block_size=ctx.config.block_size,
+        )
+        default_backend = BackendType.FLYDSL.value
+
+        # grad_w2 = gradO_col @ act_col^T, contracting M.
+        grad_w2 = _grouped_gemm_fp8_variable_k_impl_wrapper(
+            go_col,
+            act_col,
+            go_col_scale,
+            act_col_scale,
+            go_lens_col,
+            go_offs_col,
+            trans_a=False,
+            trans_b=False,
+            trans_c=False,
+            out_dtype=ctx.out_dtype,
+            granularity=ctx.config.granularity.value,
+            num_cu=ctx.num_cu,
+            default_backend=default_backend,
+            inplace_add_to_out=ctx.fuse_w2_accum,
+            out=ctx.w2_main_grad,
+        )
+
+        # dgrad against w2_col, contracting K_out; the epilogue turns it into the
+        # pre-activation gradient and quantises that, so neither reaches HBM.
+        grad_probs, gl_row, gl_row_scale, gl_col, gl_col_scale = grouped_gemm_fp8_mx_dglu_impl(
+            go_row,
+            w2_col,
+            go_row_scale,
+            w2_col_scale,
+            group_lens,
+            go_offs_row,
+            trans_a=False,
+            trans_b=True,
+            out_dtype=ctx.out_dtype,
+            num_cu=ctx.num_cu,
+            probs=probs,
+            intermediate=l1,
+            config=ctx.config,
+            out_row_scaling_recipe=ScalingRecipe(),
+            out_col_scaling_recipe=ScalingRecipe(),
+            activation=ctx.activation,
+            clamp_limit=ctx.clamp_limit,
+        )
+        # grad_x = grad_l1 @ w1_col^T, contracting 2I. grad_l1 reuses gradO's tables --
+        # the two have the same M and group_lens.
+        grad_x = grouped_gemm_fp8_impl(
+            gl_row,
+            w1_col,
+            gl_row_scale,
+            w1_col_scale,
+            group_lens,
+            go_offs_row,
+            trans_a=False,
+            trans_b=True,
+            out_dtype=ctx.out_dtype,
+            granularity=ctx.config.granularity.value,
+            num_cu=ctx.num_cu,
+            default_backend=default_backend,
+            group_offs_out=group_offs,
+        )[:M]
+
+        # grad_w1 = grad_l1_col @ x_col^T, contracting M.
+        grad_w1 = _grouped_gemm_fp8_variable_k_impl_wrapper(
+            gl_col,
+            x_col,
+            gl_col_scale,
+            x_col_scale,
+            go_lens_col,
+            go_offs_col,
+            trans_a=False,
+            trans_b=False,
+            trans_c=False,
+            out_dtype=ctx.out_dtype,
+            granularity=ctx.config.granularity.value,
+            num_cu=ctx.num_cu,
+            default_backend=default_backend,
+            inplace_add_to_out=ctx.fuse_w1_accum,
+            out=ctx.w1_main_grad,
+        )
+
+        return (
+            grad_x,  # x
+            grad_probs,  # probs
+            grad_w1,  # w1
+            grad_w2,  # w2
+            None,  # x_t
+            None,  # w1_t
+            None,  # w2_t
+            None,  # group_lens
+            None,  # group_offs
+            None,  # trans_w1
+            None,  # trans_w2
+            None,  # activation
+            None,  # clamp_limit
+            None,  # out_dtype
+            None,  # config
+            None,  # num_cu
+            None,  # fuse_wgrad_accum_pattern
+        )
+
+
 @torch._dynamo.disable(
     recursive=True,
     reason=(
@@ -502,6 +838,26 @@ def grouped_mlp_fp8(
         # TENSORWISE has a single scalar scale (no col-wise trans cache needed);
         # the inner ``data_t`` is ignored if provided.
         return FP8GroupedMLPTensorFunc.apply(
+            x_data,
+            probs,
+            w1_data,
+            w2_data,
+            x_data_t,
+            w1_data_t,
+            w2_data_t,
+            group_lens,
+            group_offs,
+            trans_w1,
+            trans_w2,
+            activation,
+            clamp_limit,
+            out_dtype,
+            config,
+            num_cu,
+            fuse_wgrad_accum_pattern,
+        )
+    elif config.granularity == ScalingGranularity.MX_BLOCKWISE:
+        return FP8GroupedMLPMXFunc.apply(
             x_data,
             probs,
             w1_data,
