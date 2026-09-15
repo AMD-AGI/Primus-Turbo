@@ -2490,3 +2490,56 @@ def xcd_band_remap_pid(pid, total_pids, num_xcd, band):
     rnd = local // band
     mapped = (rnd * num_xcd + xcd) * band + (local - rnd * band)
     return arith.select(pid < (total_pids // span) * span, mapped, pid)
+
+
+_MXFP4_PRESHUF_BLK = 256
+_MXFP4_PRESHUF_NG = 4  # g bytes packed by one thread
+_MXFP4_PRESHUF_ND = 4  # (r_region, K sub-block) cells packed by one thread
+_MXFP4_PRESHUF_KU = 2
+_MXFP4_PRESHUF_FO = _MXFP4_PRESHUF_NG * _MXFP4_PRESHUF_ND  # output dwords per thread
+
+
+def _mxfp4_preshuf_geom(k128):
+    """``(cells per thread, block size)`` for the scale preshuffle. The batched cells are
+    adjacent 256-K blocks of one row set, so K/256 has to divide by KU; a K the host does
+    not know keeps the single-cell form."""
+    ku = _MXFP4_PRESHUF_KU
+    if k128 is None or ku < 2 or (k128 // 2) % ku:
+        return 1, _MXFP4_PRESHUF_BLK
+    return ku, max(_MXFP4_PRESHUF_BLK // ku, 64)
+
+
+def mxfp4_packed_scale_byte(row, kblk, *, k128, b_ilv, is_b):
+    """Byte offset of a canonical E8M0 scale (``row``, ``kblk`` = k // 32) in the packed layout.
+
+    The scatter counterpart of the gather in ``_build_mxfp4_preshuffle_kernel_ab``. That pass
+    is a pure byte permutation -- ``_mxfp4_pack_cell`` only transposes bytes, it never
+    arithmetics them -- so a producer already holding one scale byte can store it straight into
+    its packed slot and skip the repacking pass altogether. Accepts Python ints or traced
+    values; the divisors are all compile-time.
+    """
+    n_sub, nd, ng = 2, _MXFP4_PRESHUF_ND, _MXFP4_PRESHUF_NG
+    ku, _ = _mxfp4_preshuf_geom(k128)
+    nw, kk = n_sub * ku, k128 // n_sub
+    lit = isinstance(row, int) and isinstance(kblk, int)
+    _d = (lambda a, b: a // b) if lit else udiv
+    _m = (lambda a, b: a % b) if lit else umod
+
+    kdw, g = _d(kblk, ng), _m(kblk, ng)
+    kh, rem = _d(kdw, nw), _m(kdw, nw)
+    u, lo = _d(rem, n_sub), _m(rem, n_sub)
+    grp, loc = _d(row, 64), _m(row, 64)
+    if is_b:
+        # grp = 4 * (wi // 2) + (wi % 2) + 2 * r_region
+        blk, off = _d(grp, 4), _m(grp, 4)
+        r_region, wi_lo = _d(off, 2), _m(off, 2)
+        wi = blk * 2 + wi_lo
+    else:
+        wi, r_region = _d(grp, 2), _m(grp, 2)
+    if b_ilv:
+        r, t = _d(loc, b_ilv), _m(loc, b_ilv)
+    else:
+        t, r = _d(loc, 16), _m(loc, 16)
+    last = r_region * n_sub + lo
+    base = ((wi * kk + kh * ku) * 64 + r) * nd
+    return (base + u * (64 * nd) + g * 64 + last) * 4 + t

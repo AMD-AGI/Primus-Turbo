@@ -19,6 +19,10 @@ import torch
 
 # isort: off
 from primus_turbo.flydsl.utils.gemm_helper import (
+    _MXFP4_PRESHUF_FO,
+    _MXFP4_PRESHUF_ND,
+    _MXFP4_PRESHUF_NG,
+    _mxfp4_preshuf_geom,
     compile_with_scratch_out,
     g2s_lds_imm,
     G2SLoader,
@@ -1815,6 +1819,53 @@ class MfmaScaleFp4:
 # ── Compile factory (NT, BLOCK_M=BLOCK_N=BLOCK_K=256) ─────────────────────────
 
 
+# The packed B-scale layout hangs off one switch -- whether the C store folds into the tail
+# MFMA stream -- so the GEMM build and the standalone scale preshuffle both read it from here.
+# A second copy of this rule is a second thing to drift: the two would still agree byte for
+# byte on the scales, and disagree only on how to read them.
+_MXFP4_PACK_ILV = 4  # BLOCK_N // 2 // 32: B's n-fragments per lane, and the packed layout's stride
+
+
+def _mxfp4_cstore_on(*, out_fp16, beta_is_one, ki, half_k, cstore=True, coop=False, taccw=False):
+    """Whether the C store folds. The peel is the only tail phase issuing no g2s, so it is the
+    one place a store cannot be serialised against DMA; the twins and a beta=1 epilogue each
+    take that place away."""
+    return (
+        cstore
+        and (not out_fp16)
+        and not beta_is_one
+        and not coop
+        and not taccw
+        and (ki >= 4)
+        and (ki % 2 == 0 or half_k)
+    )
+
+
+def mxfp4_packed_scale_ilv(K, *, out_fp16=False, accum=False, k_real=None):
+    """`b_ilv` for the layout `gemm_mxfp4_flydsl_kernel(..., scales_prepacked=True)` reads.
+
+    Quoted at ksplit=1, which is the only split a caller can know about. `_mxfp4_split_keeps_ilv`
+    keeps the launch-mode race away from any split that would move it.
+    """
+    kr = K if k_real is None else k_real
+    ki = K // 256
+    half_k = ceildiv(kr, 128) == 2 * (K // 256) - 1
+    return (
+        _MXFP4_PACK_ILV if _mxfp4_cstore_on(out_fp16=out_fp16, beta_is_one=accum, ki=ki, half_k=half_k) else 0
+    )
+
+
+def _mxfp4_split_keeps_ilv(K, ksplit, *, out_fp16=False, accum=False, k_real=None):
+    """Does this split read the packed scales the same way an unsplit launch would?"""
+    kr = K if k_real is None else k_real
+    ki = K // ksplit // 256
+    half_k = ceildiv(kr, 128) == 2 * (K // ksplit // 256) - 1
+    ilv = (
+        _MXFP4_PACK_ILV if _mxfp4_cstore_on(out_fp16=out_fp16, beta_is_one=accum, ki=ki, half_k=half_k) else 0
+    )
+    return ilv == mxfp4_packed_scale_ilv(K, out_fp16=out_fp16, accum=accum, k_real=k_real)
+
+
 def _build_mxfp4_gemm_kernel(
     *,
     K: int,
@@ -1870,15 +1921,14 @@ def _build_mxfp4_gemm_kernel(
     _KR = K if k_real is None else k_real  # operands' true contraction
     # half_k drops the last sub-step rather than feed it a block of zeros.
     _HALF_K = ceildiv(_KR, 128) == 2 * (K // ksplit // 256) - 1
-    # The peel is the only tail phase issuing no g2s, so it is where a store cannot be serialised against DMA.
-    _CSTORE = (
-        cstore
-        and (not out_fp16)
-        and not beta_is_one
-        and not coop
-        and not taccw
-        and (KI >= 4)
-        and (KI % 2 == 0 or _HALF_K)
+    _CSTORE = _mxfp4_cstore_on(
+        cstore=cstore,
+        out_fp16=out_fp16,
+        beta_is_one=beta_is_one,
+        coop=coop,
+        taccw=taccw,
+        ki=KI,
+        half_k=_HALF_K,
     )
     # The C store's cache policy follows its destination's lifetime: a final tile is
     # write-once and dead, so `nt` leaves the A/B band resident, while a split-K partial
@@ -3090,25 +3140,10 @@ def _get_mxfp4_fused_launch(
 # per output dword; decoding the packed index (wi,kk,lane,last) + inverting the A/B group map
 # gives the 4 source rows grp*64 + t*16 + r. Forward map of the deleted C++ preshuffle index.
 
-_MXFP4_PRESHUF_BLK = 256
-_MXFP4_PRESHUF_NG = 4  # g bytes packed by one thread
-_MXFP4_PRESHUF_ND = 4  # (r_region, K sub-block) cells packed by one thread
-_MXFP4_PRESHUF_FO = _MXFP4_PRESHUF_NG * _MXFP4_PRESHUF_ND  # output dwords per thread
 # Adjacent packed cells (same rows, next 256-K block) repacked together: batching KU
 # of them turns KU narrow reads into one wide one, cutting read sectors by KU for the
 # same bytes. The store side is untouched and the grid still covers every CU.
-_MXFP4_PRESHUF_KU = 2
 _MXFP4_SCALE_WS: dict = {}  # (M, N, K, device) -> (a_sp, b_sp) packed int32 workspace
-
-
-def _mxfp4_preshuf_geom(k128):
-    """``(cells per thread, block size)`` for the scale preshuffle. The batched cells are
-    adjacent 256-K blocks of one row set, so K/256 has to divide by KU; a K the host does
-    not know keeps the single-cell form."""
-    ku = _MXFP4_PRESHUF_KU
-    if k128 is None or ku < 2 or (k128 // 2) % ku:
-        return 1, _MXFP4_PRESHUF_BLK
-    return ku, max(_MXFP4_PRESHUF_BLK // ku, 64)
 
 
 def _mxfp4_pack_cell(dws, n_sub, nd, ng):
@@ -3665,6 +3700,11 @@ def gemm_mxfp4_flydsl_kernel(
     ks = (0, 1) if K != Kw else _MXFP4_KSPLIT_CACHE.get((M, N, K, _row_b, out_fp16))
     if ks is None:
         cands = _ksplit_candidates(M, N, K)
+        if scales_prepacked:
+            # The caller packed against an unsplit build's layout; a split that folds its C
+            # store differently would read those same bytes another way. Quoting the layout at
+            # ksplit=1 is what lets the quantiser emit it without knowing the launch mode.
+            cands = [s for s in cands if _mxfp4_split_keeps_ilv(Kw, s, out_fp16=out_fp16, k_real=_k_real)]
         modes = [(0, 1)] + [(1, s) for s in cands[1:]]
         # Only the smallest split gets a tail arm: at equal CU fill it moves the fewest
         # partial bytes, and the uniform arms already cover "more splits, more fill".
@@ -3693,30 +3733,107 @@ def gemm_mxfp4_flydsl_kernel(
     return out2.t().contiguous() if trans_c else out2
 
 
-def pack_mxfp4_scales(
-    a: torch.Tensor,
+_MXFP4_PRESHUF_LAUNCH_CACHE: dict = {}
+
+
+def _get_mxfp4_preshuffle_launch(*, b_ilv, sc_row, src_unit, k128):
+    """The A+B scale preshuffle on its own, with no GEMM behind it."""
+    key = (b_ilv, sc_row, src_unit, k128)
+    launch = _MXFP4_PRESHUF_LAUNCH_CACHE.get(key)
+    if launch is not None:
+        return launch
+
+    pre_ab = _build_mxfp4_preshuffle_kernel_ab(
+        b_ilv=b_ilv, byte_src=sc_row != k128 * 4, src_unit=src_unit, k128=k128
+    )
+    pku, pblk = _mxfp4_preshuf_geom(k128)
+    pgrid = _MXFP4_PRESHUF_FO * pblk * pku
+
+    @flyc.jit
+    def launch_mxfp4_preshuffle(
+        A_raw: fx.Tensor,
+        A_scale: fx.Tensor,
+        B_raw: fx.Tensor,
+        B_scale: fx.Tensor,
+        c_m: fx.Int32,
+        c_n: fx.Int32,
+        stream: fx.Stream,
+    ):
+        qm = ceildiv(c_m, fx.Int32(256)) * fx.Int32(256)
+        qn = ceildiv(c_n, fx.Int32(256)) * fx.Int32(256)
+        grid_a = ceildiv(qm * fx.Int32(k128), pgrid)
+        grid_b = ceildiv(qn * fx.Int32(k128), pgrid)
+        pre_ab(
+            A_raw,
+            A_scale,
+            B_raw,
+            B_scale,
+            qm,
+            qn,
+            c_m,
+            c_n,
+            fx.Int32(k128),
+            grid_a,
+            fx.Int32(sc_row),
+        ).launch(grid=(grid_a + grid_b, 1, 1), block=(pblk, 1, 1), stream=stream)
+
+    _MXFP4_PRESHUF_LAUNCH_CACHE[key] = launch_mxfp4_preshuffle
+    return launch_mxfp4_preshuffle
+
+
+def preshuffle_mxfp4_scales(
     a_scale: torch.Tensor,
-    b: torch.Tensor,
     b_scale: torch.Tensor,
+    M: int,
+    N: int,
+    K: int,
     *,
     out_dtype: torch.dtype = torch.bfloat16,
+    accum: bool = False,
 ) -> "tuple[torch.Tensor, torch.Tensor]":
-    """Pack ``a_scale``/``b_scale`` into the layout ``scales_prepacked=True`` reads back.
+    """Repack canonical E8M0 scales into the layout ``scales_prepacked=True`` reads back.
 
-    Every ordinary call repacks the canonical E8M0 scales before the GEMM can start. A caller
-    whose operands outlive one GEMM -- a weight, or an activation that both the forward and the
-    dgrad consume -- can pay that once here instead, worth a bit over 1% of the GEMM on the
-    Llama training shapes. The returned tensors are private copies: the kernel's own packing
-    workspace is shared per shape, and the next repacking call overwrites it.
+    For a caller that already holds canonical scales -- from the C++ quant, from a checkpoint,
+    from anything that is not this file's quant kernel -- and wants to stop paying the repack
+    on every launch. Worth a bit over 1% of the GEMM on the Llama training shapes.
 
-        a_sp, b_sp = pack_mxfp4_scales(a, a_scale, b, b_scale)
+    There are three supported ways to get the GEMM its scales, and none of them replaces
+    another:
+
+      * canonical throughout -- hand the GEMM ``[dim, K/32]`` and let it repack per launch.
+        The default, and the only option when the shape is not known at quantisation time.
+      * this function -- canonical scales in hand, packed once, reused across launches.
+      * ``mxfp4_quant_kernel``'s ``pack_row`` -- the quant writes the packed layout directly,
+        so nothing repacks at all. Needs the GEMM shape at quantisation time.
+
+        a_sp, b_sp = preshuffle_mxfp4_scales(a_scale, b_scale, M, N, K)
         c = gemm_mxfp4_flydsl_kernel(a, a_sp, b, b_sp, scales_prepacked=True, k=K)
 
-    A packed scale tensor is flat and no longer carries the contraction, hence the explicit k.
+    ``M``/``N``/``K`` are the GEMM's logical extents -- the packed layout is tiled, so it is
+    only meaningful against the shape it was packed for. A packed scale tensor is flat and no
+    longer carries the contraction, hence the explicit ``k`` at the call.
     """
-    K = a_scale.shape[1] * 32
-    # Driving the pack with an ordinary GEMM of the same operands is what keeps the layout in
-    # step with _BILV, which the caller's arguments alone do not determine.
-    gemm_mxfp4_flydsl_kernel(a, a_scale, b, b_scale, out_dtype=out_dtype)
-    a_sp, b_sp = _get_mxfp4_scale_ws(a.shape[0], b.shape[0], (K + 255) // 256 * 256, a.device)
-    return a_sp.clone(), b_sp.clone()
+    assert a_scale.shape[1] * 32 == K and b_scale.shape[1] * 32 == K, (
+        f"scale K mismatch: a {a_scale.shape}, b {b_scale.shape} for K={K}"
+    )
+    Kw = (K + 255) // 256 * 256
+    k_real = None if K == Kw else K
+    out_fp16 = out_dtype == torch.float16
+    ilv = mxfp4_packed_scale_ilv(Kw, out_fp16=out_fp16, accum=accum, k_real=k_real)
+    k128 = Kw // 128
+    sc_row = (Kw if k_real is None else k_real) // 32
+    launch = _get_mxfp4_preshuffle_launch(
+        b_ilv=ilv, sc_row=sc_row, src_unit=2 if sc_row % 2 == 0 else 1, k128=k128
+    )
+    a_sp = torch.empty((M + 255) // 256 * 256 * k128, dtype=torch.int32, device=a_scale.device)
+    b_sp = torch.empty((N + 255) // 256 * 256 * k128, dtype=torch.int32, device=b_scale.device)
+    launch(
+        a_scale.view(torch.int8),
+        a_sp,
+        b_scale.view(torch.int8),
+        b_sp,
+        M,
+        N,
+        torch.cuda.current_stream(),
+    )
+    return a_sp, b_sp
