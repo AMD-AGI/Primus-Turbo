@@ -380,24 +380,20 @@ def _make_dualwave_swp_traits(
     """Build gfx950 DUALWAVE_SWP compile-time layout traits."""
     rows_per_wave = 32
     warp_size = 64
-    if block_m is None:
-        block_m = 256
-    wave_row_groups = block_m // rows_per_wave
-    block_n = 64
-    k_sub_n = 32
-    k_step_qk = 16
-    d_chunk = 32
-    gqa_group_size = num_heads // num_kv_heads
-
     # A left window trims the body to `ceil((W + block_m)/BLOCK_N)` KV tiles, and that band is
     # `W + block_m` columns wide however few rows share it -- so halving `block_m` removes a
     # quarter of the masked-away MFMA work. The narrower body also falls out of the
     # `block_m in (128, 256)` gate that raises `waves_per_eu` to 4, which costs more than it
     # returns on a body this short. Measured +16.9% / +17.5% on GQA head_dim 64, W=128, s=8192.
     # Gated on the window: the dense path has no band and is bit-for-bit unaffected.
-    if int(window_left) >= 0:
-        block_m = 64
-        wave_row_groups = block_m // rows_per_wave
+    if block_m is None:
+        block_m = 64 if int(window_left) >= 0 else 256
+    wave_row_groups = block_m // rows_per_wave
+    block_n = 64
+    k_sub_n = 32
+    k_step_qk = 16
+    d_chunk = 32
+    gqa_group_size = num_heads // num_kv_heads
 
     # Global K/V DMA is 16B per lane; D_128B_SIZE is one 128B row in bf16 elements.
     bf16_bytes = 2

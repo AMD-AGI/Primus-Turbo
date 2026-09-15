@@ -14,8 +14,9 @@
 """Dual-wave, software-pipelined flash-attention kernel for gfx950 (D=64/128, bf16/fp16).
 
 Dispatched when gpu_arch >= gfx950, head_dim in (64, 128) and seq_len >= 384.
-seq_len need not be a multiple of 256/64: partial q-blocks and odd kv-tile counts
-are covered by num_records bounds, an even-rounded tile count and a kv pad mask.
+seq_len need not be a multiple of 256/64: partial q-blocks are covered by num_records
+bounds and a kv pad mask. On the dense causal path, odd KV-tile spans are even-rounded;
+the left-windowed path keeps an odd span and pairs it with a two-tile epilogue drain.
 """
 
 import flydsl.compiler as flyc
