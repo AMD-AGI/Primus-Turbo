@@ -1949,17 +1949,13 @@ def _wgrad_xcd_aff_widths(n_blocks_m, n_blocks_n, tiles_per_group, nxcd=_WGRAD_X
     return tuple((w, rows) for _, w, rows in ranked)
 
 
-def _wgrad_xcd_aff_geom(n_blocks_m, n_blocks_n, tiles_per_group, nxcd=_WGRAD_XCD_HW, wwin=()):
+def _wgrad_xcd_aff_geom(n_blocks_m, n_blocks_n, tiles_per_group, nxcd=_WGRAD_XCD_HW):
     """(h, w) for the XCD-affine wgrad swizzle, or None when the grid is too small. Reorders each
-    XCD's residue class into a contiguous width-w column band (h>1 reuses A-slabs). ``wwin``
-    (see _WGRAD_AFF_W) only narrows that width, re-solving inside it when the grid offers it."""
+    XCD's residue class into a contiguous width-w column band (h>1 reuses A-slabs)."""
     ranked = _wgrad_xcd_aff_widths(n_blocks_m, n_blocks_n, tiles_per_group, nxcd)
     if not ranked:
         return None
     w, rows = ranked[0]
-    if wwin and w > max(wwin):
-        # Inside the window take the narrowest width the grid offers, not the balanced one.
-        w, rows = next(((d, r) for d in sorted(wwin) for rw, r in ranked if rw == d), (w, rows))
     return (2 if w > 1 and rows % 2 == 0 and n_blocks_m % 2 == 0 else 1), w
 
 
@@ -4654,8 +4650,6 @@ _WGRAD_AFF_ROUNDS = 8
 # Reciprocal of the wall fraction a boundary body costs once the launch is that deep: a cheap tile
 # frees its CU early and the WG that refills it runs out of L2 phase with its neighbours (_HALF_N).
 _WGRAD_BND_PHASE_INV = 20
-# N-blocks a band may span before its B stripes stop sharing the XCD's L2 slice.
-_WGRAD_AFF_W = (3, 4)
 _WGRAD_RACE_MARGIN = 0.998
 
 
@@ -4703,11 +4697,7 @@ def _wgrad_4wave_cands(OUT_M, OUT_N, G, ncu, block=256):
     )
     # The affine run leads once the launch is deep: it hands every XCD a compact rectangle of the
     # Balancing can pick a band wider than a class keeps co-resident, so preferred width leads.
-    narrow = (
-        None
-        if aff is None
-        else _wgrad_xcd_aff_geom(n_blocks_m, n_blocks_n, tiles_per_group, xcd_k, _WGRAD_AFF_W)
-    )
+    narrow = None if aff is None else _wgrad_xcd_aff_geom(n_blocks_m, n_blocks_n, tiles_per_group, xcd_k)
     lead_aff = deep and aff is not None and aff != (1, 1)
     if aff is None:
         geom = band
