@@ -45,7 +45,30 @@ _TRACE_FILE = os.environ.get("PRIMUS_TURBO_ASM_BWD_TRACE_FILE", "")
 # Hard off switch, mirroring PRIMUS_TURBO_ATTN_DISABLE_ASM_FWD. Without one, the only way to
 # measure what this path is worth is to make aiter unimportable, which changes the forward
 # at the same time and makes the comparison meaningless.
-_DISABLED = os.environ.get("PRIMUS_TURBO_ATTN_DISABLE_ASM_BWD", "") not in ("", "0")
+# DEFAULT OFF as of 0915. Opt in with PRIMUS_TURBO_ATTN_ENABLE_ASM_BWD=1.
+#
+# The kernel is 1.74x the vendored fused backward at the operator level, measured n=5 with
+# bit-identical SQNR, and that number is real. It is also the wrong number to ship on:
+#
+#   20 training steps, llama-3.1-8B b=4 s=8192, only this switch differs
+#     ASM backward ON    1858 tps   mfu 34.49%
+#     ASM backward OFF   1984 tps   mfu 36.83%     <- 6.78% FASTER, at 30x the noise floor
+#
+# The cause is memory, not the kernel. This backward needs an fp32 dq_acc that the fused one
+# does not (that one has no atomics) plus dk/dv per q head rather than per kv head: 1.07 GB
+# per layer per step, ~34 GB of allocator churn over 32 layers. Operator-level timing never
+# sees it because the caching allocator reuses the same blocks every iteration.
+#
+# Caching the scratch removes the churn and is NOT a fix: it trades churn for peak, and this
+# config has no peak headroom. Memory at step 3 went 380.06 GiB (87.98%) without the cache
+# to 381.44 GiB (88.30%) with it, and the run took SIGBUS -- then leaked its KFD context and
+# 411 GB of VRAM, leaving the card unable to create new contexts until a power cycle.
+#
+# So: correct, fast in isolation, and not shippable by default on this configuration. The
+# measurement entry points stay (--impl asmbwd, the harness switches) so the operator-level
+# result remains reproducible.
+_ENABLED = os.environ.get("PRIMUS_TURBO_ATTN_ENABLE_ASM_BWD", "") not in ("", "0")
+_DISABLED = not _ENABLED
 
 # The gate is on SEQUENCE LENGTH, not parallelism. Measured head-to-head against
 # dense_fused_backward, both arms in one process (ratios are fused/asm, >1 means the ASM
@@ -151,7 +174,8 @@ def asm_backward_eligible(
     this path does not raise, it reads the wrong memory.
     """
     if _DISABLED:
-        return _no("disabled by PRIMUS_TURBO_ATTN_DISABLE_ASM_BWD")
+        return _no("off by default; set PRIMUS_TURBO_ATTN_ENABLE_ASM_BWD=1 to opt in "
+                   "(6.78% e2e regression from its memory footprint -- see module docstring)")
     if not is_gfx1250():
         return _no("not gfx1250")
     if _launcher() is None:
