@@ -118,6 +118,8 @@ MXFP6Prologue prologue_from_mode(const int64_t mode) {
     case 2:
         return MXFP6Prologue::BiasGeluBackward;
     default:
+        // 3 (QK-norm+RoPE backward) and 4 (LnModulate) are deliberately absent: their
+        // operands do not fit this entry point's (aux, bias), so each has its own op.
         PRIMUS_TURBO_CHECK(false,
                            "prologue mode must be 0 (identity), 1 (bias+gelu) or 2 "
                            "(bias+gelu backward), got ",
@@ -317,6 +319,67 @@ run_qk_norm_rope_bwd(const at::Tensor &input, const at::Tensor &dq, const at::Te
     return {row_p, row_s, col_p, col_s, col_sum, dw_q, dw_k};
 }
 
+std::vector<at::Tensor> run_ln_modulate(const at::Tensor &input, const at::Tensor &mean,
+                                        const at::Tensor &rstd, const at::Tensor &scale,
+                                        const at::Tensor &shift, const bool want_col_sum) {
+    check_input(input);
+    const c10::DeviceGuard device_guard(input.device());
+    const int64_t          M = input.size(0);
+    const int64_t          N = input.size(1);
+
+    // The batch comes from the modulation's leading axis rather than an argument: scale is
+    // [B, N] by construction, so deriving B here means a caller cannot pass a B that
+    // disagrees with the tensor it also passed.
+    PRIMUS_TURBO_CHECK(scale.dim() == 2, "scale must be 2D [B, N], got ", scale.dim(), "D");
+    const int64_t B = scale.size(0);
+    PRIMUS_TURBO_CHECK(B > 0 && (B & (B - 1)) == 0,
+                       "LnModulate needs a power-of-two batch so the kernel can take the batch "
+                       "index as the low bits of the row; got B = ", B);
+    PRIMUS_TURBO_CHECK(M % B == 0,
+                       "input's rows must be a whole number of batches: M is ", M, " and B is ",
+                       B);
+
+    const at::ScalarType dt = input.scalar_type();
+    check_operand(mean, input, "mean", {M}, at::kFloat);
+    check_operand(rstd, input, "rstd", {M}, at::kFloat);
+    check_operand(scale, input, "scale", {B, N}, dt);
+    check_operand(shift, input, "shift", {B, N}, dt);
+
+    const auto [row_p_bytes, row_s_bytes] = pack_sizes(M, N); // contract N
+    const auto [col_p_bytes, col_s_bytes] = pack_sizes(N, M); // contract M
+
+    at::Tensor row_p = empty_blob(row_p_bytes, input);
+    at::Tensor row_s = empty_blob(row_s_bytes, input);
+    at::Tensor col_p = empty_blob(col_p_bytes, input);
+    at::Tensor col_s = empty_blob(col_s_bytes, input);
+
+    const int  rows      = mxfp6_col_sum_rows(static_cast<int>(M));
+    const auto fp32_opts = input.options().dtype(at::kFloat);
+    at::Tensor col_sum = at::empty({want_col_sum ? rows : 0, want_col_sum ? N : 0}, fp32_opts);
+
+    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+
+    auto launch = [&]<typename T>() {
+        MXFP6LnModulateArgs<T> args{};
+        args.mean       = mean.data_ptr<float>();
+        args.rstd       = rstd.data_ptr<float>();
+        args.scale      = reinterpret_cast<const T *>(scale.data_ptr());
+        args.shift      = reinterpret_cast<const T *>(shift.data_ptr());
+        args.batch_mask = static_cast<int32_t>(B - 1);
+        quantize_mxfp6_ln_modulate_impl<T>(
+            reinterpret_cast<const T *>(input.data_ptr()), args, row_p.data_ptr<uint8_t>(),
+            row_s.data_ptr<uint8_t>(), col_p.data_ptr<uint8_t>(), col_s.data_ptr<uint8_t>(),
+            want_col_sum ? col_sum.data_ptr<float>() : nullptr, static_cast<int>(M),
+            static_cast<int>(N), stream);
+    };
+    if (dt == at::kBFloat16)
+        launch.template operator()<dtype::bfloat16>();
+    else
+        launch.template operator()<dtype::float16>();
+
+    return {row_p, row_s, col_p, col_s, col_sum};
+}
+
 } // namespace
 
 std::vector<at::Tensor> quantize_mxfp6(const at::Tensor input, const int64_t axis) {
@@ -346,6 +409,16 @@ quantize_mxfp6_qk_norm_rope_bwd(const at::Tensor input, const at::Tensor dq, con
                                 const at::Tensor rstd_k, const bool want_col_sum) {
     return run_qk_norm_rope_bwd(input, dq, dk, dv, cos, sin, wq, wk, rstd_q, rstd_k,
                                 want_col_sum);
+}
+
+// Off the `mode` argument for the same reason: four operands that are not (aux, bias). The
+// input here is the norm's *input*, not its output -- the point of the fusion is that the
+// output never exists.
+std::vector<at::Tensor> quantize_mxfp6_ln_modulate(const at::Tensor input, const at::Tensor mean,
+                                                   const at::Tensor rstd, const at::Tensor scale,
+                                                   const at::Tensor shift,
+                                                   const bool       want_col_sum) {
+    return run_ln_modulate(input, mean, rstd, scale, shift, want_col_sum);
 }
 
 // Meta implementations. Shapes are pure arithmetic on M and N, so torch.compile can trace
@@ -402,6 +475,20 @@ quantize_mxfp6_qk_norm_rope_bwd_meta(const at::Tensor input, const at::Tensor dq
     out.push_back(at::empty({want_col_sum ? rows : 0, want_col_sum ? N : 0}, fp32_opts));
     out.push_back(at::empty({rows, num_heads, head_dim}, fp32_opts));
     out.push_back(at::empty({rows, num_heads, head_dim}, fp32_opts));
+    return out;
+}
+
+// Same five outputs as the fused packer: the prologue does not touch the blob geometry and
+// the modulation's operands are not part of it.
+std::vector<at::Tensor>
+quantize_mxfp6_ln_modulate_meta(const at::Tensor input, const at::Tensor mean,
+                                const at::Tensor rstd, const at::Tensor scale,
+                                const at::Tensor shift, const bool want_col_sum) {
+    const int64_t M    = input.size(0);
+    const int64_t N    = input.size(1);
+    auto          out  = quantize_mxfp6_dual_meta(input);
+    const int64_t rows = want_col_sum ? mxfp6_col_sum_rows(static_cast<int>(M)) : 0;
+    out.push_back(at::empty({rows, want_col_sum ? N : 0}, input.options().dtype(at::kFloat)));
     return out;
 }
 
