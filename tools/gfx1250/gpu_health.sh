@@ -57,7 +57,33 @@ health_state() {
   echo HEALTHY; return 0
 }
 
+# A dmesg grep is necessary and NOT sufficient, and 0915 is the demonstration: after an e2e
+# run hung, three independent jobs failed to complete while every fault pattern above read
+# zero and rocm-smi answered promptly with VRAM free. The card was not wedged and not
+# faulting -- torch.cuda.init() had gone from about 1 s to 45.6 s, so everything downstream
+# blew its timeout. "dmesg is clean" and "the card computes" are different questions.
+#
+# compute_probe STAGES the answer, because the two failure modes need opposite responses:
+#   init completes but slowly -> DEGRADED: widen timeouts and keep working
+#   init never returns        -> WEDGED:   stop dispatching, switch to CPU work
+# A single end-to-end matmul probe cannot tell them apart; it just times out either way.
+compute_probe() {
+  local budget=${1:-600} ctr=${CTR:-fa-repro}
+  timeout $((budget + 30)) docker exec -e HIP_VISIBLE_DEVICES=0 "$ctr" bash -c \
+    "exec timeout -k 10 $budget python3 -u -c '
+import time,sys
+t=time.time()
+import torch
+print(\"import %.1f\"%(time.time()-t),flush=True)
+t=time.time(); torch.cuda.init(); print(\"init %.1f\"%(time.time()-t),flush=True)
+t=time.time(); a=torch.randn(4096,4096,device=\"cuda\",dtype=torch.bfloat16); torch.cuda.synchronize()
+print(\"alloc %.1f\"%(time.time()-t),flush=True)
+t=time.time(); b=a@a; torch.cuda.synchronize(); print(\"matmul %.2f\"%(time.time()-t),flush=True)
+'" 2>/dev/null | grep -E '^(import|init|alloc|matmul) '
+}
+
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  if [ "${1:-}" = "--probe" ]; then compute_probe "${2:-600}"; exit $?; fi
   st=$(health_state "${BASE_DEGRADED:-0}" "${BASE_WEDGED:-0}"); rc=$?
   if [ "${1:-}" = "--json" ]; then
     printf '{"state":"%s","degraded":%s,"wedged":%s,"gpus":%s,"kfd_holders":%s,"sclk_mhz":%s}\n' \

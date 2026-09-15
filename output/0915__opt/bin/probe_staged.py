@@ -1,0 +1,12 @@
+import os, sys, time
+os.environ.setdefault("TORCH_BLAS_PREFER_HIPBLASLT", "0")
+def say(m): print(m, flush=True)
+t=time.time(); say("A import torch")
+import torch; say("B imported %.1fs"%(time.time()-t))
+t=time.time(); torch.cuda.init(); say("C cuda.init %.1fs"%(time.time()-t))
+t=time.time(); say("D device_count=%d %.1fs"%(torch.cuda.device_count(), time.time()-t))
+t=time.time(); a=torch.randn(1024,1024,device="cuda",dtype=torch.bfloat16); torch.cuda.synchronize()
+say("E small alloc %.1fs"%(time.time()-t))
+t=time.time(); b=a@a; torch.cuda.synchronize(); say("F small matmul %.1fs"%(time.time()-t))
+t=time.time(); c=torch.randn(4096,4096,device="cuda",dtype=torch.bfloat16); torch.cuda.synchronize()
+d=c@c; torch.cuda.synchronize(); say("G 4096 matmul %.1fs -> OK"%(time.time()-t))
