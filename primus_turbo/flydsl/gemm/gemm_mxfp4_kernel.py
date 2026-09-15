@@ -3668,10 +3668,7 @@ def gemm_mxfp4_flydsl_kernel(
         modes = [(0, 1)] + [(1, s) for s in cands[1:]]
         # Only the smallest split gets a tail arm: at equal CU fill it moves the fewest
         # partial bytes, and the uniform arms already cover "more splits, more fill".
-        # The tail stubs still take the raw scales, so the packed path stays on the plain one.
-        if scales_prepacked:
-            pass
-        elif len(cands) > 1 and _mxfp4_tail_rows(M, N, cands[1]):
+        if len(cands) > 1 and _mxfp4_tail_rows(M, N, cands[1]):
             modes.append((2, cands[1]))
         elif len(cands) > 1 and _mxfp4_tail_cols(M, N, cands[1]):
             modes.append((3, cands[1]))
