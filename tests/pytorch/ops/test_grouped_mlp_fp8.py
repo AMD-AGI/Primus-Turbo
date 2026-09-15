@@ -48,7 +48,7 @@ SHAPES = [(2048, 1024, 512, 4), (2048, 1024, 320, 4), (1536, 1152, 384, 3)]
 GATES = {"silu": F.silu, "gelu": lambda t: F.gelu(t, approximate="tanh")}
 
 CLAMP_LIMIT = 1.0
-GATE_CASES = [("silu", None), ("gelu", None), ("silu", CLAMP_LIMIT)]
+GATE_CASES = [("silu", None), ("gelu", None), ("silu", CLAMP_LIMIT), ("gelu", CLAMP_LIMIT)]
 
 CLAMP_SNR_THRESHOLD = 12.0
 

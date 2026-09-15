@@ -932,7 +932,7 @@ class MXFP8DualQuantStore:
         """
         if row_limit is None:
             row_limit = fx.Int32(0x7FFFFFFF)
-        assert not self.use_2d_block, "2-D block scaling is not wired up yet; see design.md 5"
+        assert not self.use_2d_block, "2-D block scaling is not wired up yet"
         self._stage(self._prepare(runs, grow0, row_limit, row_gap))
         self._store_colwise(base_col, pad_row0, col_row_limit=col_row_limit, row_gap=row_gap)
         self._store_rowwise(base_col, grow0, row_limit, row_gap=row_gap)
@@ -999,15 +999,9 @@ def _check_activation(activation: str) -> str:
     return activation
 
 
-SUPPORTED_CLAMPABLE_ACTIVATIONS = ("silu",)
-
-
-def _check_clamp_limit(activation: str, clamp_limit):
+def _check_clamp_limit(clamp_limit):
     if clamp_limit is None:
         return None
-    assert activation in SUPPORTED_CLAMPABLE_ACTIVATIONS, (
-        f"clamp_limit is only supported for activation in {SUPPORTED_CLAMPABLE_ACTIVATIONS}, got {activation!r}"
-    )
     clamp_limit = float(clamp_limit)
     assert clamp_limit > 0.0, f"clamp_limit must be positive, got {clamp_limit}"
     return clamp_limit
@@ -1120,7 +1114,7 @@ class StoreCSwiGLU(StoreCPerTensor, _EpilogueAmax):
         self.act_base = _buffer_ops.extract_base_index(ACT)
         self.act_aux = act_aux
         self.activation = _check_activation(activation)
-        self.clamp_limit = _check_clamp_limit(activation, clamp_limit)
+        self.clamp_limit = _check_clamp_limit(clamp_limit)
         self.ilv = ilv
         # With I in whole 64-column bands every band is either fully inside it or
         # fully past it, so the edge is a zero num_records on the band's SRD rather
@@ -1362,7 +1356,7 @@ class StoreCdSwiGLUCShuffle(_EpilogueAmax):
     ):
         self.BAND_COLS = 256
         self.activation = _check_activation(activation)
-        self.clamp_limit = _check_clamp_limit(activation, clamp_limit)
+        self.clamp_limit = _check_clamp_limit(clamp_limit)
         self.row_pad = row_pad
         self.col_safe = col_safe
         self.c_rows = c_rows
@@ -1609,7 +1603,7 @@ class StoreCdSwiGLUQuadCShuffle:
         clamp_limit,
     ):
         self.activation = _check_activation(activation)
-        self.clamp_limit = _check_clamp_limit(activation, clamp_limit)
+        self.clamp_limit = _check_clamp_limit(clamp_limit)
         self.VEC = 8  # 16b elements in a 128b global access
         self.Cc = n_tiles_b * 16  # columns one wave owns in a 16-row sub-tile
         self.BAND_COLS = 2 * self.Cc  # the two wave_n of a wave_m group

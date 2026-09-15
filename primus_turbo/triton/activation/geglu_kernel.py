@@ -23,9 +23,12 @@ def geglu_with_mask_fwd_kernel(
     stride_x_token,
     stride_probs_token,
     stride_out_token,
+    # clamp
+    clamp_limit,
     # metas
     LOAD_WIDTH: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    HAS_CLAMP: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
@@ -49,6 +52,11 @@ def geglu_with_mask_fwd_kernel(
 
         up = tl.load(up_ptr + col_off, mask=mask).to(compute_type)
         down = tl.load(down_ptr + col_off, mask=mask).to(compute_type)
+
+        if HAS_CLAMP:
+            limit = clamp_limit.to(compute_type)
+            up = tl.minimum(up, limit)
+            down = tl.minimum(tl.maximum(down, -limit), limit)
 
         up = gelu_none(up)
         out = up * down
@@ -76,9 +84,12 @@ def geglu_with_mask_bwd_kernel(
     stride_probs_token,
     stride_grad_x_token,
     stride_grad_probs_token,
+    # clamp
+    clamp_limit,
     # metas
     LOAD_WIDTH: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    HAS_CLAMP: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
@@ -104,6 +115,13 @@ def geglu_with_mask_bwd_kernel(
         up = tl.load(up_ptr + col_off, mask=mask).to(compute_type)
         down = tl.load(down_ptr + col_off, mask=mask).to(compute_type)
 
+        if HAS_CLAMP:
+            limit = clamp_limit.to(compute_type)
+            up_kept = up <= limit
+            down_kept = (down >= -limit) & (down <= limit)
+            up = tl.minimum(up, limit)
+            down = tl.minimum(tl.maximum(down, -limit), limit)
+
         gelu = gelu_none(up)
 
         grad_out = tl.load(grad_out_ptr + row_idx * stride_grad_out_token + col_off, mask=mask).to(
@@ -124,6 +142,10 @@ def geglu_with_mask_bwd_kernel(
         grad_out_with_probs = grad_out * probs
         grad_down = grad_out_with_probs * gelu
         grad_up = gelu_bwd_none(up, grad_out_with_probs * down)
+
+        if HAS_CLAMP:
+            grad_up = tl.where(up_kept, grad_up, 0.0)
+            grad_down = tl.where(down_kept, grad_down, 0.0)
 
         tl.store(
             grad_x_ptr + row_idx * stride_grad_x_token + col_off, grad_up.to(grad_x_data_type), mask=mask
@@ -147,8 +169,11 @@ def geglu_fwd_kernel(
     stride_x_token: tl.constexpr,
     stride_probs_token: tl.constexpr,
     stride_out_token: tl.constexpr,
+    # clamp
+    clamp_limit,
     # metas
     LOAD_WIDTH: tl.constexpr,
+    HAS_CLAMP: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
@@ -169,6 +194,11 @@ def geglu_fwd_kernel(
 
     up = tl.load(up_ptr + col_off, mask=mask).to(compute_type)
     down = tl.load(down_ptr + col_off, mask=mask).to(compute_type)
+
+    if HAS_CLAMP:
+        limit = clamp_limit.to(compute_type)
+        up = tl.minimum(up, limit)
+        down = tl.minimum(tl.maximum(down, -limit), limit)
 
     up = gelu_none(up)
     out = up * down
@@ -195,8 +225,11 @@ def geglu_bwd_kernel(
     stride_probs_token: tl.constexpr,
     stride_grad_x_token: tl.constexpr,
     stride_grad_probs_token: tl.constexpr,
+    # clamp
+    clamp_limit,
     # metas
     LOAD_WIDTH: tl.constexpr,
+    HAS_CLAMP: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
@@ -219,6 +252,13 @@ def geglu_bwd_kernel(
     up = tl.load(up_ptr + col_off, mask=mask).to(compute_type)
     down = tl.load(down_ptr + col_off, mask=mask).to(compute_type)
 
+    if HAS_CLAMP:
+        limit = clamp_limit.to(compute_type)
+        up_kept = up <= limit
+        down_kept = (down >= -limit) & (down <= limit)
+        up = tl.minimum(up, limit)
+        down = tl.minimum(tl.maximum(down, -limit), limit)
+
     gelu = gelu_none(up)
 
     grad_out = tl.load(grad_out_ptr + row_idx * stride_grad_out_token + col_off, mask=mask).to(compute_type)
@@ -237,6 +277,10 @@ def geglu_bwd_kernel(
     grad_out_with_probs = grad_out * probs
     grad_down = grad_out_with_probs * gelu
     grad_up = gelu_bwd_none(up, grad_out_with_probs * down)
+
+    if HAS_CLAMP:
+        grad_up = tl.where(up_kept, grad_up, 0.0)
+        grad_down = tl.where(down_kept, grad_down, 0.0)
 
     tl.store(grad_x_ptr + row_idx * stride_grad_x_token + col_off, grad_up.to(grad_x_data_type), mask=mask)
     tl.store(
