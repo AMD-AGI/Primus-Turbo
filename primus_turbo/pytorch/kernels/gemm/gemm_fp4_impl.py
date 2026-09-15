@@ -417,6 +417,9 @@ class GEMMFP4KernelDispatcher(AutoKernelDispatcher):
         **kwargs,
     ):
         m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
+        # An fp4 row is K/2 bytes, so whether it starts on a 128-byte line is the caller's
+        # allocation to decide, and the backends do not pay for the misaligned case equally.
+        # Same logical shape, two allocations, two answers -- so the stride is part of the key.
         # Not every backend carries the beta=1 epilogue, so a choice tuned for the
         # plain GEMM must not be reused for the accumulating one (a cache hit skips
         # can_handle and would call a backend that ignores `out`).
@@ -433,7 +436,61 @@ class GEMMFP4KernelDispatcher(AutoKernelDispatcher):
             granularity,
             preshuffled,
             inplace_add_to_out,
+            a.stride(0),
+            b.stride(0),
         )
+
+
+_FP4_BACKEND_FOR_SHAPE: dict = {}
+
+
+def resolve_fp4_backend(
+    m: int,
+    n: int,
+    k: int,
+    *,
+    out_dtype: torch.dtype,
+    device: torch.device,
+    granularity: ScalingGranularity = ScalingGranularity.MX_BLOCKWISE,
+    default_backend: BackendType = BackendType.HIPBLASLT,
+) -> BackendType:
+    """Which backend will serve this GEMM, asked before there is anything to serve it with.
+
+    The scale layout a quantiser emits decides which backends can read it, so asking after the
+    fact only confirms a choice already made. This asks first, off the shapes alone: the race
+    times each candidate on the layout it would be fed (see ``KernelBackend.tuning_kwargs``),
+    and none of it reads the operands for anything but their timing, so empty ones will do.
+
+    Cached per shape -- the answer cannot change between two calls with the same arguments, and
+    running the race is not cheap.
+    """
+    key = (m, n, k, out_dtype, str(device), granularity, default_backend)
+    hit = _FP4_BACKEND_FOR_SHAPE.get(key)
+    if hit is not None:
+        return hit
+
+    def _fp4(rows):
+        return torch.empty((rows, k // 2), dtype=float4_e2m1fn_x2, device=device)
+
+    def _scale(rows):
+        return torch.empty((rows, k // 32), dtype=torch.uint8, device=device)
+
+    chosen = GEMMFP4KernelDispatcher.resolve(
+        default_backend,
+        GlobalBackendManager.get_gemm_backend(PrecisionType.FP4),
+        a=_fp4(m),
+        b=_fp4(n),
+        a_scale_inv=_scale(m),
+        b_scale_inv=_scale(n),
+        out_dtype=out_dtype,
+        trans_a=False,
+        trans_b=True,
+        trans_c=False,
+        granularity=granularity,
+        preshuffled=False,
+    )
+    _FP4_BACKEND_FOR_SHAPE[key] = chosen
+    return chosen
 
 
 @_torch_custom_op_wrapper("primus_turbo::gemm_fp4_impl", mutates_args=(), device_types="cuda")

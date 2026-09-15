@@ -5,6 +5,7 @@
 ###############################################################################
 
 import os
+import statistics
 import warnings
 from abc import ABC, abstractmethod
 from collections import OrderedDict
@@ -507,8 +508,8 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
     _cache: Optional[TuneCache] = None
     _warmup_iters: int = 10
     _profile_iters: int = 20
-    # Two candidates within this factor are re-timed in the opposite order before one wins.
-    _retime_margin: float = 1.10
+    # Forward-and-back passes over the candidates; each pass times every one of them.
+    _tune_rounds: int = 1
     _subclasses: List[Type["AutoKernelDispatcher"]] = []
 
     @staticmethod
@@ -570,37 +571,49 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
         if cached_backend is not None:
             return cached_backend
 
+        # Resolved once per candidate, not once per timing: a backend that allocates its own
+        # operands here would otherwise get fresh pages on every read, and the variance that
+        # comes with them would land on that backend alone.
+        tune_args: Dict[Type[KernelBackend], dict] = {}
+
         def _time(impl):
             torch.cuda.synchronize()
             try:
-                return cls.profile(impl, **impl.tuning_kwargs(**kwargs))
+                if impl not in tune_args:
+                    tune_args[impl] = impl.tuning_kwargs(**kwargs)
+                return cls.profile(impl, **tune_args[impl])
             except Exception:  # noqa: BLE001 -- a backend that cannot run is not a candidate
                 return float("inf")
             finally:
                 torch.cuda.synchronize()
 
-        timed = [
-            (_time(entry.impl), entry.impl)
+        cands = [
+            entry.impl
             for entry in cls._backends.values()
             if entry.autotune and entry.impl.can_handle(**kwargs)
         ]
+        if not cands:
+            return None
+
+        # Timing each candidate's whole batch before starting the next one puts the card's
+        # drift on whichever ran later, which is worth several percent here -- more than the
+        # margin between backends on most shapes. Interleaving instead, once forward and once
+        # back, gives every candidate every position, and the median drops a one-off excursion.
+        samples = {impl: [] for impl in cands}
+        for _ in range(cls._tune_rounds):
+            for impl in cands:
+                samples[impl].append(_time(impl))
+            for impl in reversed(cands):
+                samples[impl].append(_time(impl))
+
         # A backend that raised is not a winner, however alone it is: dropping it here leaves
         # the caller to fall through to its default rather than dispatch to something that
         # just failed.
-        timed = [t for t in timed if t[0] != float("inf")]
-        if not timed:
+        ranked = [(statistics.median(v), impl) for impl, v in samples.items() if min(v) != float("inf")]
+        if not ranked:
             return None
 
-        # Candidates are profiled back to back on one card, so a drifting clock lands on
-        # whichever ran later. That is worth a few percent -- enough to decide a close call and
-        # not enough to matter otherwise, so pay for a second look only when it is close:
-        # re-time the top two in the opposite order and keep each one's better reading.
-        timed.sort(key=lambda t: t[0])
-        if len(timed) > 1 and timed[1][0] < timed[0][0] * cls._retime_margin:
-            timed[:2] = [(min(t, _time(impl)), impl) for t, impl in reversed(timed[:2])]
-            timed.sort(key=lambda t: t[0])
-
-        best_backend = timed[0][1]
+        best_backend = min(ranked, key=lambda t: t[0])[1]
         cls._cache.put(key, best_backend)
         return best_backend
 
