@@ -254,6 +254,8 @@ class Float4QuantConfig(metaclass=_OpaqueMeta):
     use_gradient_sr: bool = False
     use_preshuffle: bool = False
     # E8M0 scale exponent bias: 0=half ULP, 1=one ULP, 2=three-eighths ULP.
+    # Reference: Jianlin Yu et al., "MXAttention", arXiv:2607.24377.
+    # https://arxiv.org/abs/2607.24377
     scale_rounding_mode: int = 0
 
     def __fx_repr__(self) -> Tuple[str, dict]:
