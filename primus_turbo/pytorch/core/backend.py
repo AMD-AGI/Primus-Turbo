@@ -492,6 +492,8 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
     _cache: Optional[TuneCache] = None
     _warmup_iters: int = 10
     _profile_iters: int = 20
+    # Two candidates within this factor are re-timed in the opposite order before one wins.
+    _retime_margin: float = 1.10
     _subclasses: List[Type["AutoKernelDispatcher"]] = []
 
     @staticmethod
@@ -553,25 +555,38 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
         if cached_backend is not None:
             return cached_backend
 
-        best_backend = None
-        best_time = float("inf")
-        for entry in cls._backends.values():
-            if not entry.autotune:
-                continue
-            if entry.impl.can_handle(**kwargs):
+        def _time(impl):
+            torch.cuda.synchronize()
+            try:
+                return cls.profile(impl, **kwargs)
+            except Exception:  # noqa: BLE001 -- a backend that cannot run is not a candidate
+                return float("inf")
+            finally:
                 torch.cuda.synchronize()
-                try:
-                    cur_time = cls.profile(entry.impl, **kwargs)
-                except Exception:
-                    cur_time = float("inf")
-                finally:
-                    torch.cuda.synchronize()
-                if cur_time < best_time:
-                    best_time = cur_time
-                    best_backend = entry.impl
 
-        if best_backend is not None:
-            cls._cache.put(key, best_backend)
+        timed = [
+            (_time(entry.impl), entry.impl)
+            for entry in cls._backends.values()
+            if entry.autotune and entry.impl.can_handle(**kwargs)
+        ]
+        # A backend that raised is not a winner, however alone it is: dropping it here leaves
+        # the caller to fall through to its default rather than dispatch to something that
+        # just failed.
+        timed = [t for t in timed if t[0] != float("inf")]
+        if not timed:
+            return None
+
+        # Candidates are profiled back to back on one card, so a drifting clock lands on
+        # whichever ran later. That is worth a few percent -- enough to decide a close call and
+        # not enough to matter otherwise, so pay for a second look only when it is close:
+        # re-time the top two in the opposite order and keep each one's better reading.
+        timed.sort(key=lambda t: t[0])
+        if len(timed) > 1 and timed[1][0] < timed[0][0] * cls._retime_margin:
+            timed[:2] = [(min(t, _time(impl)), impl) for t, impl in reversed(timed[:2])]
+            timed.sort(key=lambda t: t[0])
+
+        best_backend = timed[0][1]
+        cls._cache.put(key, best_backend)
         return best_backend
 
     @classmethod

@@ -360,10 +360,13 @@ class GEMMFP4FlyDSLBackend(KernelBackend):
         )
 
 
+# Both race on raw E8M0, where they take the same operands and each converts them its own way.
+# AITER's three shuffle launches are its real cost under that contract; a caller that wants to
+# skip them passes `preshuffled=True`, and is then AITER's alone to serve.
 _GEMM_FP4_BACKENDS = {
-    BackendType.AITER: BackendEntry(GEMMFP4AITERBackend, autotune=False),
+    BackendType.AITER: BackendEntry(GEMMFP4AITERBackend),
     BackendType.HIPBLASLT: BackendEntry(GEMMFP4HipBLASLtBackend),
-    BackendType.FLYDSL: BackendEntry(GEMMFP4FlyDSLBackend, autotune=False),
+    BackendType.FLYDSL: BackendEntry(GEMMFP4FlyDSLBackend),
 }
 
 
