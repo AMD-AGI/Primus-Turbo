@@ -799,7 +799,7 @@ class StoreCSwiGLU(StoreCPerTensor, _EpilogueAmax):
         self.band_drop = band_drop
         self.cst = cst  # l1 already went out inside the mainloop; only act is left here
         self.skip_act = skip_act
-        assert not ilv or ilv == n_tiles_b
+        assert not ilv or (ilv == n_tiles_b and n_tiles_b % 2 == 0), "the run packs in pairs"
         # Interleaved fragments give a lane ``ilv`` adjacent columns, so as long as I is a
         # whole number of those the edge is a lane boundary and one predicate covers a lane's
         # whole store -- which the non-interleaved layout, spread over 64 columns, cannot do.
@@ -881,7 +881,7 @@ class StoreCSwiGLU(StoreCPerTensor, _EpilogueAmax):
         )
         act_rs = make_row_band_resource(self.act_base, base_row, rows, self.glu_i, 2)
         col0 = base_col + self._col(0)
-        dcol = self.ilv if const_expr(bool(self.ilv)) else 16  # columns a tj step advances
+        dcol = 1 if const_expr(bool(self.ilv)) else 16
         NTB = self.n_tiles_b
         masked = const_expr(not (self.col_safe or self.band_drop or self.lane_drop))
         lane_ok = (col0 < fx.Int32(self.glu_i)) if const_expr(self.lane_drop) else None
@@ -914,8 +914,27 @@ class StoreCSwiGLU(StoreCPerTensor, _EpilogueAmax):
                 )
 
             def _emit(rsrc, offs, val_fn, aux, valid=valid, fold=False):
-                """One stream, one row at a time, both column chunks adjacent."""
+                """One stream, one row at a time, both column chunks adjacent.
+
+                Interleaved fragments sit on consecutive columns, so a lane's whole run leaves
+                as one request rather than a short per fragment -- the trade the act stream
+                below already makes, and the plain paired-column store makes. One predicate
+                covers the run, so the wide store carries the first fragment's."""
                 for i in range_constexpr(4):
+                    if const_expr(bool(self.ilv)):
+                        vs = [val_fn(tj, i).to(self.out_ty) for tj in range_constexpr(NTB)]
+                        _buffer_ops.buffer_store(
+                            Vec.from_elements(vs, self.out_ty),
+                            rsrc,
+                            offs[i],
+                            mask=valid[0],
+                            cache_modifier=aux,
+                            offset_is_bytes=True,
+                        )
+                        if const_expr(fold):
+                            for tj in range_constexpr(NTB):
+                                _fold(vs[tj], i, tj)
+                        continue
                     for tj in range_constexpr(NTB):
                         v = val_fn(tj, i).to(self.out_ty)
                         _buffer_ops.buffer_store(
