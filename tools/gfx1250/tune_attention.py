@@ -332,7 +332,7 @@ def main() -> int:
                          "import (see the top of this file), so it must be a process-level "
                          "flag rather than a runtime one. Off-only: eligibility is a "
                          "capability question and forcing 'on' would only move the failure.")
-    ap.add_argument("--impl", default="turbo", choices=["turbo", "aiter", "fused", "asm"],
+    ap.add_argument("--impl", default="turbo", choices=["turbo", "aiter", "fused", "asm", "asmbwd"],
                     help="turbo = Primus-Turbo's in-tree Triton backend (the PR target). "
                          "aiter = AITER's Triton MHA, the alternative seed the plan named. "
                          "Same shape, same fp32 reference, same SQNR gate, same timer -- the "
@@ -497,6 +497,47 @@ def _measure(args) -> int:
 
         result["impl_note"] = "aiter prebuilt gfx1250 ASM forward + vendored fused backward"
         _impl_fwd = lambda: _AsmFwdFusedBwd.apply(q, k, v)  # noqa: E731
+    elif args.impl == "asmbwd":
+        # Both halves from aiter's prebuilt gfx1250 ASM: the forward, and the three-kernel
+        # backward brought up on 0915 (odo -> dqdkdv -> dq_convert), launched by hand
+        # because no Python arch gate in aiter reaches the backward kernels --
+        # can_impl_fmha_v3_bwd starts from get_gfx() == "gfx942" and the only widening is
+        # for gfx950, so gfx1250 can never select them.
+        #
+        # dk/dv are allocated per q head and reduced here. The main kernel's grid is
+        # (kv_tiles, nhead_q, batch), so under GQA `ratio` workgroups own the same dk/dv
+        # tile and race; measured at ratio=4 that costs dk/dv about -0.3 dB while dq stays
+        # correct. The reduction is inside the timed region because it is part of the cost.
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(_REPO_ROOT, "tools", "gfx1250"))
+        import asm_bwd_launcher as _abl
+        from aiter.ops.mha import fmha_fwd_with_sink_asm
+
+        _asm_scale = (q.shape[-1]) ** -0.5
+        _rep = q.shape[2] // k.shape[2]
+
+        class _AsmFwdAsmBwd(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, q_, k_, v_):
+                o_, lse_ = fmha_fwd_with_sink_asm(q_, k_, v_, _asm_scale, causal, True)
+                ctx.save_for_backward(q_, k_, v_, o_, lse_)
+                return o_
+
+            @staticmethod
+            def backward(ctx, do_):
+                q_, k_, v_, o_, lse_ = ctx.saved_tensors
+                dq_, dk_, dv_ = _abl.asm_backward(
+                    q_, k_, v_, o_, do_.contiguous(), lse_, _asm_scale, dkdv_heads="q"
+                )
+                if _rep > 1:
+                    b_, s_, _, d_ = dk_.shape
+                    hk_ = k_.shape[2]
+                    dk_ = dk_.view(b_, s_, hk_, _rep, d_).float().sum(3).to(k_.dtype)
+                    dv_ = dv_.view(b_, s_, hk_, _rep, d_).float().sum(3).to(v_.dtype)
+                return dq_, dk_, dv_
+
+        result["impl_note"] = "aiter prebuilt gfx1250 ASM forward + aiter prebuilt ASM backward"
+        _impl_fwd = lambda: _AsmFwdAsmBwd.apply(q, k, v)  # noqa: E731
     elif args.impl == "aiter":
         from aiter.ops.triton._triton_kernels.attention import mha as _amha
         from aiter.ops.triton.attention.mha import flash_attn_func as _aiter_fa

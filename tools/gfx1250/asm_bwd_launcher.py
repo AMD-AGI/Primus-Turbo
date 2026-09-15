@@ -179,7 +179,8 @@ CO = {
 }
 
 
-def asm_backward(q, k, v, o, do, lse, softmax_scale=None, hip=None, dkdv_heads="kv"):
+def asm_backward(q, k, v, o, do, lse, softmax_scale=None, hip=None, dkdv_heads="kv",
+                 co_variant=""):
     """Run the three-kernel ASM backward. Returns (dq, dk, dv).
 
     q/k/v/o/do are [B, S, H, D] bf16 as Primus-Turbo lays them out; lse is
@@ -242,7 +243,12 @@ def asm_backward(q, k, v, o, do, lse, softmax_scale=None, hip=None, dkdv_heads="
 
     hip = hip or HipModule()
     f_odo = hip.function(ASM_DIR / CO["odo"], SYMBOLS["odo"])
-    f_main = hip.function(ASM_DIR / CO["dqdkdv"], SYMBOLS["dqdkdv"])
+    # co_variant="_perf" selects bwd_hd128_bf16_causal_br_a32_pssk_perf.co. It exports the
+    # SAME mangled symbol as the shipped one, so the ABI is unchanged and only the file
+    # swaps. Neither _perf object is mentioned in any of the campaign documents -- they are
+    # an unexplored free variable, not a known-better build.
+    main_co = CO["dqdkdv"].replace(".co", f"{co_variant}.co") if co_variant else CO["dqdkdv"]
+    f_main = hip.function(ASM_DIR / main_co, SYMBOLS["dqdkdv"])
     f_post = hip.function(ASM_DIR / CO["post"], SYMBOLS["post"])
     stream = torch.cuda.current_stream().cuda_stream
 

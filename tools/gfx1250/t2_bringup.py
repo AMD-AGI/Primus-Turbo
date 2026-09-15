@@ -117,6 +117,8 @@ def main() -> int:
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--co-variant", default="", choices=["", "_perf"],
+                    help="swap in the _perf build of the main kernel; same symbol, same ABI")
     ap.add_argument("--dkdv-heads", default="kv", choices=["kv", "q"],
                     help="'q' allocates dk/dv with nhead_q slices and reduces host-side, "
                          "testing whether the kernel writes per-q-head partials.")
@@ -191,7 +193,8 @@ def main() -> int:
         dk_ref = k32.grad.view(b, hk, rep, s, d).sum(2).transpose(1, 2).contiguous()
         dv_ref = v32.grad.view(b, hk, rep, s, d).sum(2).transpose(1, 2).contiguous()
 
-        dq, dk, dv = L.asm_backward(q, k, v, o, do, lse, dkdv_heads=args.dkdv_heads)
+        dq, dk, dv = L.asm_backward(q, k, v, o, do, lse, dkdv_heads=args.dkdv_heads,
+                                    co_variant=args.co_variant)
         if args.dkdv_heads == "q" and rep > 1:
             dk = dk.view(b, s, hk, rep, d).sum(3).to(k.dtype)
             dv = dv.view(b, s, hk, rep, d).sum(3).to(v.dtype)
@@ -231,7 +234,8 @@ def main() -> int:
         rep = hq // hk
 
         def asm_bwd():
-            dq, dk, dv = L.asm_backward(q, k, v, o_t, do, lse_t, dkdv_heads="q")
+            dq, dk, dv = L.asm_backward(q, k, v, o_t, do, lse_t, dkdv_heads="q",
+                                        co_variant=args.co_variant)
             if rep > 1:
                 dk = dk.view(b, s, hk, rep, d).float().sum(3).to(k.dtype)
                 dv = dv.view(b, s, hk, rep, d).float().sum(3).to(v.dtype)
@@ -267,6 +271,7 @@ def main() -> int:
         rec["asm_ms"] = timed(asm_bwd, args.iters, args.warmup)
         rec["speedup"] = rec["champ_ms"] / rec["asm_ms"]
         rec["peak_mem_gib"] = torch.cuda.max_memory_allocated() / (1 << 30)
+        rec["co_variant"] = args.co_variant or "(shipped)"
         rec["ok"] = min(rec["sqnr_dq_vs_champ_db"], rec["sqnr_dk_vs_champ_db"],
                         rec["sqnr_dv_vs_champ_db"]) >= 40.0
 
