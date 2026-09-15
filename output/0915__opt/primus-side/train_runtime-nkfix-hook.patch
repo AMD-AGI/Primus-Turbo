@@ -1,0 +1,25 @@
+diff --git a/primus/core/runtime/train_runtime.py b/primus/core/runtime/train_runtime.py
+index 15a9cb7b..b1969e9e 100644
+--- a/primus/core/runtime/train_runtime.py
++++ b/primus/core/runtime/train_runtime.py
+@@ -507,6 +507,20 @@ class PrimusRuntime:
+         trainer.runtime_state = self.ctx.runtime_state
+ 
+     def _run_trainer_lifecycle(self) -> None:
++        # EXPERIMENT HOOK (0915, local tree only -- not for upstream). Installs the aten::mm
++        # layout workaround when NKFIX_ENABLE=1. It has to go here rather than in
++        # sitecustomize: sitecustomize runs at interpreter startup, before torch exists, so
++        # `torch.ops.aten.mm.default` cannot be resolved there, and it would fire in every
++        # unrelated python subprocess as well. By this point torch is fully loaded and we are
++        # in the one process that runs the training loop.
++        import os
++        if os.environ.get("NKFIX_ENABLE") == "1":
++            try:
++                import nkfix
++                nkfix.install()
++                log_rank_0(f"[nkfix] installed, min_bytes={nkfix._MIN_BYTES}")
++            except Exception as e:
++                log_rank_0(f"[nkfix] FAILED: {e!r}")
+         assert (
+             self.ctx is not None and self.ctx.trainer is not None
+         ), "Trainer must be created before executing lifecycle."
