@@ -12,6 +12,34 @@ from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
 from tests.pytorch.test_utils import get_tolerances
 
 
+@pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+def test_gemm_flydsl_bf16(layout, out_dtype):
+    """Exercise ragged M/N tiles and the FP32-output LM-head wgrad path."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    if torch.cuda.get_device_capability() != (9, 5):
+        pytest.skip("BF16 FlyDSL GEMM is gfx950-only")
+
+    m, n, k = 384, 320, 256
+    trans_a = layout[0] == "T"
+    trans_b = layout[1] == "T"
+    a_shape = (k, m) if trans_a else (m, k)
+    b_shape = (n, k) if trans_b else (k, n)
+    torch.manual_seed(42)
+    a = torch.randn(a_shape, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(b_shape, dtype=torch.bfloat16, device="cuda")
+    reference = (a.T if trans_a else a).float() @ (b.T if trans_b else b).float()
+
+    GlobalBackendManager.set_gemm_backend(BackendType.FLYDSL)
+    GlobalBackendManager.set_auto_tune(False)
+    actual = turbo.ops.gemm(a, b, trans_a, trans_b, out_dtype)
+
+    assert actual.dtype == out_dtype
+    torch.testing.assert_close(actual.float(), reference, **get_tolerances(torch.bfloat16))
+    GlobalBackendManager.reset()
+
+
 @pytest.mark.parametrize("m", [1, 16, 128, 256, 512, 1024, 2048])
 @pytest.mark.parametrize("n", [1, 16, 129, 512, 1024, 2048, 4096])
 @pytest.mark.parametrize("k", [1, 16, 127, 255, 512, 1024, 2048])
@@ -151,7 +179,7 @@ def test_gemm_deterministic(m, n, k, layout, dtype, backend):
 @pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("main_grad_dtype", [torch.float32, None])
-@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.HIPBLASLT])
+@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.HIPBLASLT, BackendType.FLYDSL])
 def test_gemm_fused_grad_accum(layout, dtype, main_grad_dtype, backend):
     """``fuse_bgrad_accum_pattern`` must leave ``main_grad`` holding previous + wgrad.
 
@@ -163,6 +191,11 @@ def test_gemm_fused_grad_accum(layout, dtype, main_grad_dtype, backend):
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
+    if backend is BackendType.FLYDSL:
+        if torch.cuda.get_device_capability() != (9, 5):
+            pytest.skip("BF16 FlyDSL GEMM is gfx950-only")
+        if dtype != torch.bfloat16:
+            pytest.skip("BF16 FlyDSL GEMM requires BF16 operands")
 
     m, n, k = 256, 512, 256
     accum_dtype = main_grad_dtype if main_grad_dtype is not None else dtype

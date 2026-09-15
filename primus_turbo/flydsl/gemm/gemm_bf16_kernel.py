@@ -368,6 +368,7 @@ def gemm_bf16_nt_tile(
     persistent=False,
     ab_ty=fx.BFloat16,
     out_fp16=False,
+    out_fp32=False,
     nt_vmcnt=3,
     b_group_base=None,
     c_cache_modifier=0,
@@ -424,7 +425,7 @@ def gemm_bf16_nt_tile(
     # decided by the mfma atom, so fp16 rides the bf16 staging untouched.
     a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, fx.BFloat16.ir_type, wave_id)
     b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, fx.BFloat16.ir_type, wave_id)
-    _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
+    _out_ty = fx.Float32 if out_fp32 else (fx.Float16 if out_fp16 else fx.BFloat16)
     store_c = StoreCBf16(C, c_m, c_n, _out_ty, cache_modifier=c_cache_modifier)
 
     def _run(pair_cols, grid, half_n, col_safe=False, b_steps=N_LDS_STEPS_B, pair_tiles=False):
@@ -503,6 +504,7 @@ def _gemm_bf16_nn_tn_tile_impl(
     persistent=False,
     ab_ty=fx.BFloat16,
     out_fp16=False,
+    out_fp32=False,
     nt_vmcnt=3,
     b_group_base=None,
     c_cache_modifier=0,
@@ -566,7 +568,7 @@ def _gemm_bf16_nn_tn_tile_impl(
 
     a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, fx.BFloat16.ir_type, wave_id)
     b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, fx.BFloat16.ir_type, wave_id)
-    _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
+    _out_ty = fx.Float32 if out_fp32 else (fx.Float16 if out_fp16 else fx.BFloat16)
     store_c = StoreCBf16(C, c_m, c_n, _out_ty, cache_modifier=c_cache_modifier)
 
     def _run(grid, quad_conds, half_n, col_safe=False, b_steps=N_LDS_STEPS_B):
@@ -639,6 +641,7 @@ def gemm_bf16_nn_tile(
     persistent=False,
     ab_ty=fx.BFloat16,
     out_fp16=False,
+    out_fp32=False,
     nt_vmcnt=3,
     b_group_base=None,
     c_cache_modifier=0,
@@ -663,6 +666,7 @@ def gemm_bf16_nn_tile(
         persistent=persistent,
         ab_ty=ab_ty,
         out_fp16=out_fp16,
+        out_fp32=out_fp32,
         nt_vmcnt=nt_vmcnt,
         b_group_base=b_group_base,
         c_cache_modifier=c_cache_modifier,
@@ -689,8 +693,10 @@ def gemm_bf16_tn_tile(
     persistent=False,
     ab_ty=fx.BFloat16,
     out_fp16=False,
+    out_fp32=False,
     nt_vmcnt=3,
     b_group_base=None,
+    n_tail=0,
 ):
     _gemm_bf16_nn_tn_tile_impl(
         A,
@@ -711,8 +717,10 @@ def gemm_bf16_tn_tile(
         persistent=persistent,
         ab_ty=ab_ty,
         out_fp16=out_fp16,
+        out_fp32=out_fp32,
         nt_vmcnt=nt_vmcnt,
         b_group_base=b_group_base,
+        n_tail=n_tail,
     )
 
 

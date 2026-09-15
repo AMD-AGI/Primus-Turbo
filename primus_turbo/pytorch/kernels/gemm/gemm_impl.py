@@ -18,6 +18,7 @@ from primus_turbo.pytorch.core.backend import (
     PrecisionType,
     TuneCache,
 )
+from primus_turbo.pytorch.core.utils import is_gfx950
 from primus_turbo.triton.gemm.gemm_kernel import gemm_triton_kernel
 
 _COMMON_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
@@ -99,9 +100,102 @@ class GEMMTritonBackend(KernelBackend):
         return gemm_triton_kernel(a, b, trans_a, trans_b, out_dtype, trans_c, beta=beta, out=out)
 
 
+_FLYDSL_LAYOUTS = {
+    (False, True): "nt",  # forward: X @ W.T
+    (False, False): "nn",  # dgrad: dY @ W
+    (True, False): "tn",  # wgrad: dY.T @ X
+}
+
+
+def _flydsl_call(a, trans_a, b, trans_b, trans_c):
+    """Normalize GEMM flags to one of the physical layouts implemented by FlyDSL."""
+    if trans_c:
+        # (op(a) @ op(b)).T == op(b).T @ op(a).T
+        a, b, trans_a, trans_b = b, a, not trans_b, not trans_a
+    layout = _FLYDSL_LAYOUTS.get((trans_a, trans_b))
+    return None if layout is None else (a, b, layout)
+
+
+def _flydsl_shape(call):
+    a, b, layout = call
+    if layout == "nn":
+        m, k = a.shape
+        kb, n = b.shape
+    elif layout == "nt":
+        m, k = a.shape
+        n, kb = b.shape
+    else:
+        k, m = a.shape
+        kb, n = b.shape
+    return m, n, k, kb
+
+
+def _flydsl_gemm(a, b, layout, out_dtype):
+    # Keep FlyDSL/MLIR imports off the import path for installations which do
+    # not select this backend.
+    from primus_turbo.flydsl.gemm.gemm_bf16_dense_kernel import gemm_bf16_flydsl_kernel
+
+    return gemm_bf16_flydsl_kernel(a, b, layout, out_dtype)
+
+
+class GEMMFlyDSLBackend(KernelBackend):
+    """gfx950 dense MFMA GEMM for the BF16 LM-head forward and backward calls."""
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
+        **kwargs,
+    ) -> bool:
+        if not is_gfx950() or a.ndim != 2 or b.ndim != 2:
+            return False
+        if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
+            return False
+        call = _flydsl_call(a, trans_a, b, trans_b, trans_c)
+        if call is None:
+            return False
+        _, _, k, kb = _flydsl_shape(call)
+        if k != kb or k % 64 != 0:
+            return False
+        result_dtype = out.dtype if inplace_add_to_out and out is not None else out_dtype
+        if result_dtype not in (torch.bfloat16, torch.float32):
+            return False
+        if inplace_add_to_out:
+            m, n, _, _ = _flydsl_shape(call)
+            return out is not None and out.is_contiguous() and tuple(out.shape) == (m, n)
+        return True
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        ka, kb, layout = _flydsl_call(a, trans_a, b, trans_b, trans_c)
+        result_dtype = out.dtype if inplace_add_to_out else out_dtype
+        result = _flydsl_gemm(ka, kb, layout, result_dtype)
+        if inplace_add_to_out:
+            out.add_(result)
+            return out
+        return result
+
+
 _GEMM_BACKENDS = {
     BackendType.HIPBLASLT: BackendEntry(GEMMHipBLASLtBackend),
     BackendType.TRITON: BackendEntry(GEMMTritonBackend),
+    BackendType.FLYDSL: BackendEntry(GEMMFlyDSLBackend),
 }
 
 

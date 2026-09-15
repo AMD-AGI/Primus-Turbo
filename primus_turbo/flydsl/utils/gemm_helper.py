@@ -2246,15 +2246,18 @@ class StoreCBf16:
         self.c_cols = c_cols
         self.lane_id = fx.thread_idx.x % 64
         self.out_ty = out_ty
+        self.out_bytes = 4 if out_ty is fx.Float32 else 2
         self.cache_modifier = cache_modifier
-        c_nbytes = c_rows * c_cols * 2
+        c_nbytes = c_rows * c_cols * self.out_bytes
         # Rebuild a rank-1 view: store indices are linear, so C's host rank must not leak in.
         c_ptr_ty = PointerType.get(elem_ty=out_ty.ir_type, address_space=AddressSpace.Global, alignment=16)
         c_base = ArithValue(arith.index_cast(T.i64, _buffer_ops.extract_base_index(C)), signed=True)
         c_lin = fx.Tensor(fx.make_view(fx.inttoptr(c_ptr_ty, c_base), fx.make_layout(c_rows * c_cols, 1)))
         gC = fx.rocdl.make_buffer_tensor(c_lin, max_size=False, num_records_bytes=c_nbytes)
         self.c_div = fx.logical_divide(gC, fx.make_layout(1, 1))
-        self.out_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), out_ty)
+        self.out_atom_1 = fx.make_copy_atom(
+            fx.rocdl.BufferCopy32b() if out_ty is fx.Float32 else fx.rocdl.BufferCopy16b(), out_ty
+        )
         self.reg_out_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), out_ty)
         self.c_rsrc = (
             create_buffer_resource(c_lin, max_size=False, num_records_bytes=c_nbytes)
@@ -2289,26 +2292,32 @@ class StoreCBf16:
         """Two 16x16 accumulators on neighbouring output columns (the feed interleaved the LDS
         column halves), packed into one dword store per row so a column tile's 16-lane run is 64
         contiguous bytes -- gfx950's write-request granularity.  ``n_tiles_b`` counts column tiles."""
-        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
+        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, self.out_bytes)
         n_tiles_a = len(frag_even) // n_tiles_b
         lane_col = self.lane_id % 16
-        row_bytes = self.c_cols * 2
+        row_bytes = self.c_cols * self.out_bytes
         col_ok = [
             (base_col + (j * 16 + lane_col) * 2 < self.c_cols) if mask_cols else None
             for j in range_constexpr(n_tiles_b)
         ]
-        base_off = ((self.lane_id // 16) * 4) * row_bytes + (base_col + lane_col * 2) * 2
+        base_off = ((self.lane_id // 16) * 4) * row_bytes + (base_col + lane_col * 2) * self.out_bytes
         for ti in range_constexpr(n_tiles_a):
             for r in range_constexpr(4):
                 # One address per row; the column-tile step folds into the store immediate.
                 off = base_off + (ti * 16 + r) * row_bytes
                 for j in range_constexpr(n_tiles_b):
                     t = ti * n_tiles_b + j
-                    packed = _pack_out_pair(Vec(frag_even[t])[r], Vec(frag_odd[t])[r], self.out_ty)
+                    even = Vec(frag_even[t])[r]
+                    odd = Vec(frag_odd[t])[r]
+                    if const_expr(self.out_ty is fx.Float32):
+                        value = Vec.from_elements([even, odd], fx.Float32)
+                    else:
+                        packed = _pack_out_pair(even, odd, self.out_ty)
+                        value = Vec.from_elements([packed], fx.Int32).bitcast(self.out_ty)
                     buffer_store(
-                        Vec.from_elements([packed], fx.Int32).bitcast(self.out_ty),
+                        value,
                         rsrc,
-                        off + j * 64,
+                        off + j * 32 * self.out_bytes,
                         mask=col_ok[j],
                         cache_modifier=self.cache_modifier,
                         offset_is_bytes=True,
@@ -2320,14 +2329,14 @@ class StoreCBf16:
         """Every accumulator quadrant sharing a row run, stored through one row-band SRD rather
         than per-element index arithmetic: bounding the resource lets the hardware drop the ragged
         rows.  The band base is wave-uniform, so the SRD stays in SGPRs and stores do not waterfall."""
-        rsrc = make_row_band_resource(self.c_base, base_row, row_bound, self.c_cols, 2)
+        rsrc = make_row_band_resource(self.c_base, base_row, row_bound, self.c_cols, self.out_bytes)
         lane_col = self.lane_id % 16
         col_ok = [
             (base_col + q * col_step + lane_col < self.c_cols) if mask_n else None
             for q in range(len(c_frags))
         ]
-        row_bytes = self.c_cols * 2
-        base_off = ((self.lane_id // 16) * 4) * row_bytes + (base_col + lane_col) * 2
+        row_bytes = self.c_cols * self.out_bytes
+        base_off = ((self.lane_id // 16) * 4) * row_bytes + (base_col + lane_col) * self.out_bytes
         for ti in range_constexpr(n_tiles_a):
             for r in range_constexpr(4):
                 # One address per row; both column steps fold into the store immediate.
@@ -2338,7 +2347,7 @@ class StoreCBf16:
                         buffer_store(
                             val,
                             rsrc,
-                            off + q * col_step * 2 + j * 32,
+                            off + (q * col_step + j * 16) * self.out_bytes,
                             mask=col_ok[q],
                             cache_modifier=self.cache_modifier,
                             offset_is_bytes=True,
