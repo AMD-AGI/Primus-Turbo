@@ -1,0 +1,411 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# WRITTEN 2026-09-13, OFFLINE. NOTHING IN THIS FILE HAS BEEN MEASURED BY THIS JOB.
+#
+# Every number below is carried from a prior source and is cited to it. Setup owes a
+# paired re-measurement of `op/baseline` and `op/beat` on a rebooted, health-checked card
+# in ONE image and ONE session before round 0 is scored. Two things make that mandatory
+# rather than hygienic:
+#
+#   1. THE CARD IS VR-THROTTLED. op-evolve Phase 1 (E1) measured MAX_CLK 1100 MHz where
+#      the same card held 1699-1703 MHz on 2026-09-04 -- a factor of ~1.65. The measured
+#      bf16 compute roof in that state is 1002.7 TFLOP/s. Every absolute figure in this
+#      file is conditional on the clock state it was taken in.
+#   2. THE TWO CANDIDATE SEEDS WERE NEVER CROSS-CHECKED. aiter's 34.111 ms came from
+#      primus-turbo:gfx1250-20260831-extended-v2; turbo:TRITON's 58.424 ms came from a
+#      different image. The round-0 bake-off exists to settle that, not to confirm it.
+#
+# AND ONE UNRESOLVED CONTRADICTION, which is the highest-value single probe in the job:
+# commit c1325c7e reports 220.6 TFLOP/s for turbo's Triton backend at b=2 s=8192; the
+# in-tree bench measured 131.7 TFLOP/s for the same kernel at b=4, same s/H/D/dtype.
+# Batch alone should not move TFLOP/s. 220.6 / 131.7 = 1.675, which is the throttle ratio
+# to within noise. If that is confirmed, every absolute target here must be rewritten by
+# 1.65x and the throttle becomes the job's most valuable finding rather than its footnote.
+# ─────────────────────────────────────────────────────────────────────────────
+
+job:
+  name: gfx1250-attn-llama31-8b-bwd                    # [user]
+  description: >
+    Llama-3.1-8B's full-causal attention, forward and backward, on gfx1250 (MI455X),
+    written in Triton. Head dim 128, GQA 32/8, bf16, BSHD, causal over the full
+    sequence, no sink, no sliding window, no dropout. One shape: micro-batch 4,
+    sequence 8192.
+
+    The motivation is a JIRA analysis in which MI455X is ~7% slower end-to-end than
+    MI355X on this model despite its GEMM being 1.51x FASTER (655 ms vs 987 ms per
+    step). The entire deficit is the attention software path: 755 ms/step against
+    MI355X's 315 ms. Three things about that framing have been checked and two of
+    them are wrong, and the job should not inherit them:
+
+      - The JIRA says the `turbo_attention` patch is "skipped" on MI455X. It is not.
+        Its condition checks two config flags and nothing about arch, aiter or head
+        dim (Primus attention_patches.py:22-31); it IS applied, and then dies at the
+        first step on `ModuleNotFoundError: No module named 'aiter'`. The "Skipped"
+        log line comes from a later config that sets `use_turbo_attention: false` as
+        a workaround. So the JIRA's request to "enable AITER fmha on gfx1250" is not
+        reachable: aiter's fmha backward lands in CK, which is CDNA-only and rejects
+        the call at runtime AFTER the forward has succeeded.
+      - The JIRA counts 245 ms of elementwise as part of the attention gap. The bench
+        shows flex's entire elementwise cost inside one fwd+bwd is 0.399/31.857 ms =
+        1.25%, which scales to ~12.8 ms/step, not 245 -- a 19x discrepancy. The 245 ms
+        is model-level eager RoPE and layout transposes left unfused because the repro
+        configs set `compile.enable: false`. It will NOT vanish when this kernel lands.
+        Out of scope for this job; it needs its own ticket.
+      - The JIRA's 30k tps target implies 1282.8 TFLOP/s, which is 128% of the MEASURED
+        bf16 compute roof on this card. An attention kernel cannot exceed the dense-GEMM
+        roof of the same silicon at the same clock, so that target is not merely
+        ambitious, it is unreachable by construction at 1100 MHz. Against the inferred
+        un-throttled roof it is still 76-81% of peak, above any FA implementation known
+        to the corpus. `op.target` is set relative to a measured anchor for this reason.
+
+    The structural difficulty is GQA against a key-outer pass. dK/dV is naturally
+    key-outer, so the worker count is divided by G = 4, and the axis that makes the
+    kernel expensive -- query length -- adds none back. The measured consequence is
+    stark: in turbo's Triton backend `_bwd_kernel_dkdv` is 35.922 ms of a 58.424 ms op
+    (61.5%), against `_bwd_kernel_dq` at 11.745 (20.1%) and `attn_fwd` at 9.939 (17.0%).
+    dkdv leads the second-worst kernel by a factor of three. A campaign that spends its
+    first rounds on the forward is spending them on 17% of the problem.
+
+    The backward is 73-76% of the time and this is NOT an artifact of the dense-causal
+    footing -- Phase 1 measured that share holding across a 7x mask-sparsity range, and
+    76% under the real training mask. A query-axis split of the dK/dV pass should
+    therefore be a first-class knob: `sequence_parallel` is currently hardcoded True in
+    attention_triton_impl.py and has never been priced. Note that the longest-first
+    causal dispatch order that pays in a query-outer kernel is exactly backwards here.
+
+    What makes this job worth running at all is that the search space is untouched. In
+    turbo's kernel `FIXED_BLOCK_M = FIXED_BLOCK_N = 64` are module-level constants; the
+    forward's @triton.autotune list holds exactly ONE config (num_stages=1, num_warps=4)
+    and so does the backward's; `_bwd_preprocess_use_o` carries no autotune decorator at
+    all. Those values were inherited verbatim from a CDNA-targeted perf-kernel: wave64,
+    MFMA, 64 KB LDS. gfx1250 is wave32 with WMMA and >=256 KB LDS, so num_warps=4 is 128
+    lanes here rather than 256, and num_stages=1 is no software pipelining at all on a
+    part whose headline feature is an async data mover. @triton.autotune is functioning
+    as a compile cache, not a search. The same is true of the alternative seed: aiter's
+    `gfx1250-MHA-DEFAULT.json` is byte-identical (md5 dd06bae7e50b0634b9f4a5704204ddda)
+    to its gfx950 file.
+
+    The calibrating prior: on aiter's Triton MHA at this exact shape, TWO integers --
+    forward num_stages 1->2 and backward num_warps 4->2 -- took 34.111 ms to 24.347 ms
+    (1.401x), with SQNR identical to four decimal places on all of out/dq/dk/dv and 33%
+    less peak memory. num_stages alone took the forward 6.665 -> 3.234 ms (2.06x).
+
+agent:
+  account:
+    anthropic: ~/claude/.amd_llm_env          # exports ANTHROPIC_* / OPENAI_* / CURSOR_API_KEY
+    openai: ~/claude/.amd_llm_env
+    cursor: ~/claude/.amd_llm_env
+  roles:
+    setup:    {sdk: claude, model: claude-opus-5, effort: xhigh}
+    profiler: {sdk: claude, model: claude-opus-5, effort: xhigh}
+    planner:  {sdk: claude, model: claude-opus-5, effort: max}
+    reviewer: {sdk: cursor, model: claude-opus-5, effort: xhigh}
+
+op:
+  type: attention
+  config:
+    causal: bottom-right          # Sq == Skv == 8192, so identical to top-left here.
+    sliding_window: null          # [user] full causal
+    sparsity: dense               # See `reference.logic` -- the training mask is 99.25%
+                                  # as dense as plain causal over Primus' mock dataset.
+    q_head_dim: 128               # [user]
+    kv_head_dim: 128
+    heads_q_per_kv: 4             # [user] G = 32/8. NOTE: G=4 is why FlyDSL refuses this
+                                  # shape on EVERY arch -- _gqa_group_ok requires a power
+                                  # of two in [8, 256]. Not an arch issue; a shape issue.
+    format: bshd                  # [user] q [4, 8192, 32, 128], k/v [4, 8192, 8, 128]
+    direction: [fwd, bwd]         # [user] both: a training step runs 32 of each and the
+                                  # two must share a backend (LSE convention).
+    sink: null                    # [user] Llama-3.1 has no attention sink.
+    softmax_scale: "1/sqrt(128) = 0.08838834764831845, the default"
+    determinism: >
+      NOT REQUIRED. This job optimises throughput; an atomic dQ is allowed. Note that
+      turbo's atomic dQ path gates on Skv % 256 == 0, which BOTH 8192 and 4096 satisfy,
+      so a bitwise-identical run at either length is not evidence of determinism in
+      general -- do not report it as one.
+    dtype:
+      qkv: bf16                   # [user]
+      out: bf16
+      qk_acc: fp32
+      softmax: fp32
+      pv_acc: fp32
+      lse: fp32
+      delta: fp32                 # rowsum(dO . O), the pre-pass
+      dq_accum: >
+        fp32 today, and this is a live item rather than a setting. dense_backward passes
+        dq/dk/dv=None, so attention_triton_backward_impl allocates all three as fp32
+        (bwd_torch_dtype). PyTorch's autograd then casts them back to bf16 on the way
+        out -- visible in the bench trace as bfloat16_copy_kernel x3, 0.182 ms. So this
+        is NOT a correctness bug, but it is 2x the gradient bytes plus three cast kernels
+        plus the fp32 zero-fills. Whether the fp32 buffer is load-bearing for the atomic
+        accumulation or merely inherited must be MEASURED, not assumed, before changing.
+      dsink_accum: null
+      dsink: null
+
+  reference:
+    impl: null
+    logic: >
+      Standard flash-attention-2, forward and backward, full causal, GQA 32/8, no sink.
+      Inputs, all BSHD: q [B, S, Hq, D], k/v [B, S, Hkv, D], dout [B, S, Hq, D],
+      lse [B, Hq, S] fp32. Outputs: dq [B, S, Hq, D], dk/dv [B, S, Hkv, D].
+      B = 4, S = 8192, Hq = 32, Hkv = 8, D = 128, scale = 1/sqrt(128).
+
+      With g = h // 4 mapping a query head to its kv head, live(i, j) = (j <= i), and P
+      recomputed from the SAVED lse rather than from a fresh row max:
+        p[i, j]   =  exp( s[i, j] - lse[b, h, i] )      for j <= i, else 0
+        delta[i]  =  sum over d of dout[i, d] * o[i, d]
+        dp[i, j]  =  dot( dout[i, :], v[j, :] )
+        ds[i, j]  =  p[i, j] * ( dp[i, j] - delta[i] )  for j <= i, else 0
+        dv[j, :]  =  sum over i >= j of p[i, j] * dout[i, :]
+        dk[j, :]  =  scale * sum over i >= j of ds[i, j] * q[i, :]
+        dq[i, :]  =  scale * sum over j <= i of ds[i, j] * k[j, :]
+      dk and dv accumulate over ALL FOUR query heads in the group. A reference that
+      computes per-query-head gradients and forgets to sum the group produces dk/dv
+      wrong by a factor that a sampled check will not localise.
+
+      MASK FOOTING, and it is settled. TorchTitan builds `block_causal` for this model
+      as and_masks(causal, document_mask(input_batch, eos_id)). Over Primus' MOCK
+      dataset that mask is 99.25% as dense as plain causal (8258/16384 live 128x128
+      blocks against 2080/4096), because the mock documents tokenize to ~24,327 tokens
+      and a 8192-token sequence therefore contains 0.323 EOS on average. Measured:
+      block_causal 31.133 ms vs dense causal 31.012 ms = 1.004x, in the wrong direction.
+      So the two footings agree to 0.4% and the label costs nothing. CARRY THIS CAVEAT:
+      against real C4 the documents are far shorter and block_causal WOULD be genuinely
+      sparse. If this job's baseline ever moves to real data, the whole analysis is void.
+
+      Also note that `bench_attention.py --mask block_causal` is a no-op: _make_block_mask
+      builds the same causal_mod in both branches and only switches the BlockMask batch
+      dim. It has never been worth running.
+
+      No dropout, no bias, no alibi, no sink, no sliding window.
+
+    api: >
+      Primus-Turbo's `primus_turbo.pytorch.ops.attention.flash_attn_func`, registered as
+      a torch autograd Function:
+        out = flash_attn_func(q, k, v, causal=True, window_size=(-1, -1))
+        out.backward(dout)      # -> q.grad, k.grad, v.grad
+
+      The backend MUST be pinned, not dispatched: GlobalBackendManager.set_attn_backend(
+      BackendType.TRITON, PrecisionType.BF16_FP16_FP32). Without the pin a round does not
+      know which kernel it measured. `tools/gfx1250/tune_attention.py` in Primus-Turbo
+      does this and is the intended measurement entry point.
+
+      MEASUREMENT NOTES, all from the corpus and all load-bearing:
+      - Time forward and backward SEPARATELY. The backward is 73-76% of the op; a
+        combined figure hides which half moved, and every candidate in this job moves
+        one half at a time.
+      - turbo's backward is THREE kernels (_bwd_preprocess_use_o, _bwd_kernel_dq,
+        _bwd_kernel_dkdv), so a per-kernel figure and an op-level figure are different
+        numbers. Quote the op column against other backends and the kernel column only
+        when attributing time inside one implementation. Never mix them.
+      - The config that was asked for must be ASSERTED to be the config that ran, before
+        any timing. Triton builds its autotune list at import; aiter's `_get_config` is
+        @lru_cache'd and silently ignores an override that does not call cache_clear().
+        The signature of this failure is a sweep where every candidate returns the same
+        time to within noise -- which reads as "this knob does nothing", not as a broken
+        harness. A prior backward sweep returned 27.45-27.49 ms for EVERY config,
+        including grid-changing ones, and was only caught afterwards.
+
+  # ── SEED, UPDATED 2026-09-13 AFTER A DAY OF MEASUREMENT ──────────────────────────
+  # The spec above was written before hardware access and named aiter's SHIPPED config as
+  # op/baseline. That is now the wrong seed: the campaign has already moved well past it and
+  # the result is in-tree.
+  #
+  #   turbo shipped (the original seed)   59.642 ms   129.0 TFLOP/s
+  #   aiter shipped (the spec's seed)     31.107      247.4
+  #   torch flex (op/beat)                31.337      245.6
+  #   >>> SEED THIS INSTEAD <<<           24.435      315.0
+  #
+  # Use primus_turbo/triton/attention/fused_mha_bwd_kernel.py plus its adapter
+  # primus_turbo/pytorch/kernels/attention/attention_fused_bwd_impl.py. It is self-contained
+  # (no aiter import, no JIT, no runtime config discovery), its default config is the tuned
+  # champion, and it is already wired into the dispatcher behind a work-based gate.
+  #
+  # MEASUREMENT HARNESS -- do not write a new one. tools/gfx1250/tune_attention.py already
+  # provides: a four-tensor SQNR gate against a chunked fp32 reference, one process per
+  # candidate, a bitwise determinism mode, launch-level config verification, and a resumable
+  # JSONL ledger. tools/gfx1250/exclusive.sh takes a GPU window without SIGKILLing anything
+  # mid-kernel.
+  #
+  # REPORT THE BACKWARD ON BOTH FLOP BASES. This kernel issues SEVEN score-matrix GEMM
+  # passes, not FlashAttention-2's five -- it trades a pass for avoiding dq atomics. Charging
+  # it the FA-2 flop count understates real machine utilisation by 1.22x. The 20 ms backward
+  # is 385 TFLOP/s of actually-issued MFMA = 38.4% of the 1002.7 roof, and the structure's
+  # own floor is 7.68 ms, not 5.48.
+  #
+  # ── DO NOT RE-DERIVE: each of these cost real GPU time to refute ─────────────────
+  #  1. Asymmetric tiles for the in-tree UNFUSED dkdv. 64x64 is already optimal there and
+  #     aiter's 32x128 is 59% WORSE. Tile preference is a property of the kernel STRUCTURE,
+  #     not of the shape -- the same N=256 that is catastrophic unfused is the win fused.
+  #  2. sequence_parallel=False. It computes 1/128 of the gradient and leaves the rest at the
+  #     zeros init. A timing-only sweep reports it as a spectacular win.
+  #  3. The standard XCD remap. gridDim0 is already a multiple of 8, so tiles sharing a
+  #     (batch, head) already land on one XCD for free; chunking would scatter them.
+  #  4. Skipping the causal mask on non-diagonal blocks: 9% REGRESSION. The scalar branch
+  #     costs more than the compare-and-select it avoids.
+  #  5. Tightening dkdv's lo bound, and folding log_p_scale: both perf-neutral.
+  #  6. The forward "0.9 ms gap" vs aiter: does NOT reproduce under profiling (4.219 vs
+  #     4.035). Two methodologies disagree, so it is not established.
+  #  7. HipKittens' fixed-zero reference max, applied to the BACKWARD. There is no running
+  #     max in this backward -- m comes from the forward's saved LSE -- so there is nothing
+  #     to delete. Its dual (folding the LSE shift into the GEMM accumulator initialiser via
+  #     tl.dot(acc=...)) IS applicable, but only in the dq pass.
+  #  8. FlyDSL. Upstream v0.3.3 does support gfx1250 (tdm_ops, s_wait_tensorcnt,
+  #     ds_load_tr16_b128 all present) so the toolchain gate DOES clear -- but no gfx1250
+  #     attention backward exists in any tree, and Primus-Turbo's gfx950 FlyDSL backward is
+  #     5,581 lines with 106 MFMA sites whose hand-scheduling does not survive wave64->wave32.
+  #
+  # ── HIGHEST-VALUE UNTESTED KNOB ──────────────────────────────────────────────────
+  # num_warps on the FUSED kernel. It is inherited from aiter at 4 and has never been swept
+  # (the num_warps sweep in this campaign was on the in-tree unfused kernel). At BLOCK_N1=256
+  # and HEAD_DIM=128 on wave32, the dk/dv fp32 accumulators alone are 512 VGPR/lane, plus 256
+  # for the persistent k/v tiles: 768 of 1024 before any q/p/ds tile, at 1 wave/SIMD with
+  # num_stages=1 -- no latency hiding from occupancy OR pipelining. num_warps=8 halves
+  # VGPR/lane. One env var: PRIMUS_TURBO_FUSED_MHA_BWD_TUNE=num_warps=8
+
+  precision_sqnr_db: 50
+  # 50 dB, and the check MUST compute SQNR separately for out, dq, dk AND dv against an
+  # exact fp32 reference computed over the full b=4 tensor. Justification, all measured:
+  #   - bf16 round-trip floor at this shape: 55.81 / 55.60 / 55.61 / 55.62.
+  #   - Every CORRECT backend lands at 53.67 / 52.25 / 52.31 / 52.73 -- aiter, flex and
+  #     sdpa-FLASH agree to within 0.01 dB. So 50 dB leaves ~2 dB on the tightest tensor.
+  #   - The threshold is not what catches the known traps; the COVERAGE is. aiter's
+  #     BLOCK_N1=256-alone config measures 1.31x FASTER with dq at 9.59 dB and dk/dv
+  #     PERFECT, and its fused backward gives dk at -0.22 dB with out perfect. An
+  #     output-only check passes both. A dk/dv-only check passes both.
+  #   - The existing bench's max-abs check returned an identical 8.011e-03 for every
+  #     backend and never looks at gradients at all. It is not a weaker gate; it is no gate.
+  # Sampling is not allowed: dk/dv accumulate across the GQA group, so a sampled check
+  # under-counts group contributions and passes a kernel that drops part of the group.
+
+  shape:
+    mode: single                            # [user]
+    shapes:
+      - {batch: 4, seqlen_q: 8192, seqlen_kv: 8192, heads_q: 32, heads_kv: 8}
+    # Tuning proxy, for fast rounds only: {batch: 4, seqlen: 4096, ...} -- exactly 1/4 the
+    # FLOPs, preserves the causal block structure, the GQA 4:1 group reduction and the
+    # occupancy regime; does not exercise the long K-loop trip count. A config that wins
+    # on the proxy MUST be confirmed on the shape above before it becomes champion.
+    # Note bench_attention_turbo.py cannot express the proxy: it has no shape CLI args and
+    # DenseModelConfigs["Llama-3.1-8B"]["seqlen"] is hardcoded 8192. Use the harness.
+
+  target:
+    beat: "torch flex_attention with TorchTitan's compile options, block_causal BlockMask, MEASURED IN THE SAME RUN -- must be beaten by 50%"   # [user]
+    tflops: null                            # [user] MUST stay null
+    roofline_pct: null                      # [user] MUST stay null
+    # Both null on purpose: loop.py::_margin() returns None -- silently disabling the
+    # relative bar -- if EITHER is set, and it then matches the literal phrase
+    # "beaten by N%" out of the `beat` string. Do not "helpfully" fill these in.
+    #
+    # WHY 50%, AND THE TRAP IN CHOOSING IT. op/beat is flex at ~31.0-31.3 ms, and the
+    # two-knob aiter point already sits at 24.347 ms = 1.286x flex. Seeding at aiter's
+    # SHIPPED config (34.111 ms = 0.92x flex) and setting the margin at 50% means round 0
+    # starts behind the anchor, the two known integers become the job's first real win,
+    # and the bar (1.50x flex = ~20.8 ms) is ~1.17x beyond what is already known. Seeding
+    # at the tuned point instead would hand the job a round 0 that already beats the
+    # anchor by 28.6% and any margin below that is not a bar at all.
+    # For scale: 20.8 ms = 370 TFLOP/s = 37% of the measured 1002.7 TFLOP/s roof.
+    #
+    # THE ANCHOR IS FLAKY AND THE HARNESS MUST HANDLE IT. flex's backward with a B>1
+    # BlockMask memory-faults ~2 runs in 12 (rc=139, clean process kill, 0 of 6 at B=1).
+    # op/beat is re-measured every round, so ~1 in 6 anchor measurements can die. Treat
+    # rc=139 as RETRY, record the retry count, and run every candidate in its own process
+    # so a fault cannot poison the next one.
+
+  backend: [triton]                         # [user]
+  # Triton, and the reasoning is in the JIRA analysis rather than preference. On gfx1250:
+  # aiter reaches CK (CDNA-only, backward rejects at runtime); FlyDSL raises at BUILD time
+  # on any non-gfx950 arch because it emits ds_read_tr16_b64, is not installed at all on a
+  # gfx1250 build (setup.py:529-535), AND refuses this shape on every arch because G=4;
+  # HipKittens and Gluon are hard-gated to gfx950, and Gluon is forward-only. Triton is
+  # not the best of several options here, it is the only one that runs.
+
+evolve:
+  max_rounds: 40                            # [user]
+  max_timeout: 36h                          # [user]
+  schedule:
+    fast_rounds: 12                         # [user] see below
+    fast_per_deep: 5                        # [user] ~34 fast / 6 deep over 40
+  # WHY SO FEW DEEP ROUNDS -- this is a property of the part, not impatience. rocprofv3 on
+  # gfx1250 in this image lists 51 hardware counters (gfx950 has 630) and ZERO derived
+  # metrics. Of 27 requested, 8 return non-zero and 17 read exactly zero including the
+  # entire WMMA family. TCC, TCP, TA, TD, EA, LDS, GDS, GL2C, GL2A, TX and SQG are absent
+  # ENTIRELY -- there is no byte, sector or cache-line counter at any level, so bound
+  # analysis ("is this kernel compute- or memory-bound") is IMPOSSIBLE as written, not
+  # merely degraded. Of the six numbered profiling analyses a deep round runs: 2 work,
+  # 1 should be skipped by reusing E1, 2 degrade sharply, 2 are impossible. A deep round
+  # costs ~2.4h and returns a kernel ranking that is already stable plus a clock that E1
+  # already measured. Meanwhile E2 showed the wins here are two-integer config changes,
+  # which suit A/B over counters, and a fast round is seconds of device time with a
+  # measured 0.26% cross-process spread.
+  # Not all-fast, because an unaccepted fast round forces the next deep anyway -- the
+  # cycle is a floor on evidence, not a cap.
+  #
+  # WORTH ONE PROBE IN ROUND 0: the host's ROCm 7.15 defines 233 gfx1250 counters,
+  # including GL2C_EA_RDREQ_{32,64,128,256}B and GL2C_READ_SECTORS. One --pmc pass with
+  # `GL2C_EA_RDREQ_64B SQ_WAVES` under the newer SDK would tell us whether bound analysis
+  # is recoverable, and if so this schedule should be revisited. Caution: DEFINED is not
+  # RETURNS DATA -- this image already has 13 counters that are defined, accepted, and
+  # read exactly zero.
+
+runtime:
+  runner:
+    type: docker                            # [user]
+    docker:
+      image: docker.io/amdprimus/amdprimus:gfx1250-20260910   # [user] MUST be pinned:
+      container: null                       # aiter's 34.111 and turbo's 58.424 were taken
+      options:                              # on DIFFERENT images and never cross-checked.
+        - --ipc=host
+        - --network=host
+        - --device=/dev/kfd
+        - --device=/dev/dri
+        - --cap-add=SYS_PTRACE
+        - --cap-add=CAP_SYS_ADMIN           # required for rocprofv3 counters
+        - --security-opt=seccomp=unconfined # required for rocprofv3 counters
+        - --group-add=video
+  sudo: true                                # [user] verify `sudo -n true` before starting
+  gpu_arch: gfx1250                         # [user] confirmed: gfx_target_version 120500,
+                                            # wave_front_size 32, lds_size_in_kb 320,
+                                            # simd_count 1024 => 256 CUs / 128 WGPs
+  gpu_id: 1                                 # fenced: 0/2 sweep queues, 3 e2e
+  gpu_pool: []                              # [user] single card on this node
+
+  # ── HAZARDS THIS JOB MUST HANDLE AT THE WRAPPER LEVEL, NOT IN AN AGENT'S JUDGEMENT ──
+  #
+  # 1. FORBID rocprofv3 PC SAMPLING. Three attempts, three GPU faults, zero rows of
+  #    output. Attempt 2 was at a deliberately 32x SMALLER shape and gave a hard GPU Hang
+  #    -- shrinking the workload made it WORSE -- and wedged the driver: MES failing
+  #    INVALIDATE_TLBS / REMOVE_QUEUE / SUSPEND / RESET / RESUME, then `wait for reset ack`
+  #    forever and D-state tasks. All twelve non-PC-sampling runs the same morning were
+  #    clean; that is the control. NOTE the prior knowledge doc
+  #    knowledge/arch/gfx1250/profiling-surface.md says "Stochastic PC sampling -- works"
+  #    and calls it "the one rich source on this part". That is REFUTED and the page needs
+  #    correcting. Also: `GPU core dump skipped because PC Sampling active` means the one
+  #    failing mode is the one that cannot self-diagnose.
+  #
+  # 2. THE HEALTH CHECK MUST NOT SHELL OUT TO rocm-smi. One of the wedged-task stacks is
+  #    amdgpu_info_ioctl -- which is rocm-smi itself. A health check that calls it HANGS
+  #    rather than alerting. Grep dmesg for `MES(` / `GPU Hang` / `wait for reset ack`
+  #    before and after every round instead.
+  #
+  # 3. NEVER USE hipBLASLt AS A ROOF, A REFERENCE, OR A GEMM BASELINE ON THIS IMAGE.
+  #    Measured 91.5 TFLOP/s against Triton's 1002.7 on the same tensors in the same
+  #    process -- a 10.96x gap, flat across every layout, dtype and size tried. At
+  #    1026 MHz that is ~87 flop/SIMD/cycle, which is VALU territory, not matrix-core.
+  #
+  # 4. aiter's CK/HIP JIT extension FAILS TO BUILD on gfx1250 at import and prints ~130
+  #    lines of stderr plus a `CK and HIP ops are disabled. Triton ops remain available.`
+  #    It is harmless -- it confirms the CK path is dead here and only the Triton path is
+  #    live -- but log parsing MUST NOT read it as a failure, and it costs ~7s per process.
+  #
+  # 5. tools/clock_probe.py measure() OVER-COMMITS THE QUEUE ~372x -- its loop enqueues
+  #    with no backpressure, so a 0.5s enqueue window produced 16,359 calls and 185s of
+  #    drain. Wrap or fix it before any round calls it.
+  #
+  # 6. NO GPU LOCK, NO COST ACCOUNTING. A stolen or shared GPU does not raise, it records
+  #    a low number, and that number becomes the champion the next round must beat. Check
+  #    the card is idle before every round. `cost_usd` is read from the SDK and neither
+  #    accumulated nor persisted, so `--rounds` is the only bound on spend at roughly
+  #    $13-20 per optimize round.
+
+review:
+  auto_approve_after: 10m                   # [user]

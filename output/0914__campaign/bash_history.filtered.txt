@@ -1,0 +1,190 @@
+pwd
+tmux ls
+rocm-smi
+amd-smi
+rocm-smi
+source ~/.bashrc
+rocm-smi
+watch rocm-smi
+watch rocm-smi
+docker ps
+docker ps -a
+cat ~/.ssh/id_ed25519.pub 
+ll /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/
+docker images
+docker ps
+pwd
+cd code/
+ll
+pwd
+docker ps
+vim ~/claude/.amd_llm_env 
+tail ~/.bashrc
+docker ps
+cat /home/lihuzhan/claude/.amd_llm_env
+docker ps
+who
+watch docker ps
+who
+rocm-smi
+df -h
+sudo modprobe amdgpu
+rocm-smi
+pwd
+docker images
+curl -fsSL https://claude.ai/install.sh | bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+source ~/.bashrc 
+pwd
+mkdir claude
+vim claude/.amd_llm_env
+apt-get install vim
+cat /etc/os-release 
+yum install vim
+sudo yum install vim
+vim claude/.amd_llm_env
+chmod 600 claude/.amd_llm_env
+vim ~/.bashrc 
+claude
+source ~/.bashrc 
+claude
+pwd
+ll
+mkdir code
+cd code/
+mkdir 2026_0828__primus
+cd 2026_0828__primus
+ssh-keygen -t ed25519
+cat ~/.ssh/id_ed25519.pub 
+git clone git@github.com:AMD-AGI/Primus.git
+ll
+cd Primus/
+git submodule update --init third_party/Megatron-LM/
+cd ../../
+mkdir 2026_0903__kyle_flydsl
+cd 2026_0903__kyle_flydsl
+pwd
+df -h
+ll
+tar xzf 'campaign_example.tar 1.gz'
+ll
+cd campaign_example/
+ll
+git init
+git status
+git add .
+git commit -m "init"
+git status
+pwd
+cd ../../
+ll
+mkdir 2026_0903__turbo
+cd 2026_0903__turbo
+git clone git@github.com:AMD-AGI/Primus-Turbo.git
+ll
+cd ..
+mkdir 2026_0910__op-evolve
+cd 2026_0910__op-evolve
+git clone git@github.com:wenxie-amd/op-evolve.git
+cd ..
+mkdir 2026_0911__kyle_skill
+cd 2026_0911__kyle_skill
+git clone git@github.com:kyle-256/myskill.git
+cd ..
+ll
+ssh lihuzhan@heliosr-1b114-c07-1.mnb.dcgpu
+ll
+cd 2026_0903__turbo/
+ll
+cd Primus-Turbo/
+claude
+tmux
+tmux 
+tmux ls
+tmux kill-session -t 2
+tmux kill-session -t 1
+tmux ls
+tmux a -t 0
+rocm-smi
+watch docker ps
+date
+watch docker ps
+who
+watch docker ps
+date
+watch docker ps
+watch rocm-smi
+rocm-smi
+watch rocm-smi
+pwd
+ll
+claude
+rocm-smi
+who
+watch rocm-smi
+claude
+watch docker ps
+date
+watch docker ps
+rocm-smi
+watch rocm-smi
+tmux ls
+tmux a -t 0
+tmux ls
+tmux a -t 0
+watch rocm-smi
+docker ps
+docker ps -a
+cd code/
+cd 2026_0903__turbo/Primus-Turbo/
+ll
+git status
+pwd
+cd output/
+ll
+ll *
+ll
+du -sh *
+cd ..
+du -sh ../Primus-Turbo/
+tar zcf output.tar.gz output
+pwd
+ll output/0914__campaign/
+pwd
+ll ../../
+cd code/2026_0903__turbo/Primus-Turbo/
+claude
+cd code/
+ll
+du -sh *
+du -sh 2026_0903__turbo/*
+du -sh 2026_0903__turbo/Primus-Turbo/*
+tar czf 2026_0903__turbo.tar.gz 2026_0903__turbo
+du -sh 2026_0903__turbo.tar.gz
+du -sh *
+du -sh 2026_0828__primus/Primus/*
+rm -rf 2026_0828__primus/Primus/gpucore.140870.gpu 
+du -sh *
+du -sh 2026_0910__op-evolve/op-evolve/*
+ll
+pwd
+mv 2026_0903__turbo.tar.gz ../
+ll
+cd ..
+ll
+du -sh code/*
+tar czf code.tar.gz code
+du -sh code.tar.gz 
+pwd
+ll
+du -sh code.tar.gz 
+du -sh 2026_0903__turbo.tar.gz 
+du -sh .claude
+tmux ls
+tmux a -t 0
+du -sh .claude
+tar czf .claude.tar.gz .claude
+ll claude/
+pwd
+who
+rocm-smi

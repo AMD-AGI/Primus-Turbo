@@ -1,0 +1,15 @@
+[runjob] launched key=r3_pc pid=2832722
+W0914 05:05:36.129441   60037 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.000248 sec
+W0914 05:05:36.129571   60037 simple_timer.cpp:55] [rocprofv3] 'python op/benchmark.py --impl /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/003/op --shape b4_s8192_hq32_hkv8_d128 --iters 5 --warmup-s 1.0' ::     0.000000 sec
+W0914 05:05:37.063092   60037 tool.cpp:3082] HSA version 1.21.0 initialized (instance=0)
+W0914 05:05:37.716611   60369 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.000249 sec
+W0914 05:05:37.716729   60369 simple_timer.cpp:55] [rocprofv3] '/bin/sh /sbin/ldconfig -p' ::     0.000000 sec
+Memory access fault by GPU node-3 (Agent handle: 0xdf4aee0) on address 0x7f9cad2f4000. Reason: Page not present or supervisor privilege.
+GPU core dump skipped because PC Sampling active
+W0914 05:05:38.805302   60363 tool.cpp:3811] [PPID=60027][PID=60037][TID=60363][rocprofv3_error_signal_handler] rocprofv3 caught signal 6...
+W0914 05:05:38.805344   60363 tool.cpp:3834] [PPID=60027][PID=60037][TID=60363][rocprofv3_error_signal_handler] rocprofv3 will wait for 0 children to exit
+W0914 05:05:38.805349   60363 tool.cpp:3849] [PPID=60027][PID=60037][TID=60363][rocprofv3_error_signal_handler] rocprofv3 finalizing after signal 6...
+W0914 05:05:43.805531   60363 queue.cpp:1008] Timeout while waiting for queue sync: 1 kernels still active
+W0914 05:05:43.805590   60363 pool.hpp:195] Pool object at index 14 is still in use during pool clear
+/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/003/scratch/pcsample.sh: line 7: 60037 Killed                  rocprofv3 --pc-sampling-beta-enabled --pc-sampling-method stochastic --pc-sampling-unit cycles --pc-sampling-interval 2048 --output-format csv --output-file pc -d /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/003/scratch/pc/out -- python op/benchmark.py --impl /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/003/op --shape b4_s8192_hq32_hkv8_d128 --iters 5 --warmup-s 1.0
+RC=137
