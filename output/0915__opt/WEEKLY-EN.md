@@ -22,14 +22,18 @@ A/B measurements — with it bypassed, between-run variance drops **9.3x to 0.42
 ## Fuller version
 
 **Attention operator (single layer, b=4 s=8192 hq=32 hkv=8 d=128 bf16 causal, A0-c07-1 at
-1100 MHz, operator-level, n=5):**
+1100 MHz, operator-level, medians). Note n and measurement epoch differ per row:**
 
-| Stage | fwd | bwd | total | vs stock |
-|---|--:|--:|--:|--:|
-| Primus-Turbo stock `1cb2e183` | 10.651 | 45.134 | 55.785 ms | 1.00x |
-| forced Triton fwd + fused bwd | 4.166 | 17.835 | 22.001 ms | 2.54x |
-| aiter ASM fwd + fused bwd (now default) | 1.561 | 17.686 | 19.239 ms | 2.90x |
-| aiter ASM fwd + ASM bwd (opt-in) | 1.572 | 10.160 | 11.726 ms | **4.76x** |
+| Stage | fwd | bwd | total | vs stock | n |
+|---|--:|--:|--:|--:|--:|
+| Primus-Turbo stock `1cb2e183` | 10.651 | 45.134 | 55.785 ms | 1.00x | 3, pre-incident |
+| forced Triton fwd + fused bwd | 4.166 | 17.835 | 22.001 ms | 2.54x | 2, pre-incident |
+| aiter ASM fwd + fused bwd (now default) | 1.561 | 17.686 | 19.239 ms | 2.90x | 5, post-AC |
+| aiter ASM fwd + ASM bwd (opt-in) | 1.572 | 10.160 | 11.726 ms | **4.76x** | 5, post-AC |
+
+The two baseline rows predate an AC-cycle that happened mid-campaign; the ASM rows were
+re-measured after it, and the ASM-fwd row reproduced its pre-incident value to 0.03%
+(19.239 vs 19.233), which is the evidence the machine returned to the same state.
 
 SQNR stays above the 50 dB gate throughout. The ASM backward is **opt-in, not default**: at
 n=9 it shows no measurable end-to-end gain, and it carries 1 GiB of resident scratch plus

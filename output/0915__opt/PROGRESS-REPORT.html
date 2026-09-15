@@ -280,7 +280,7 @@
 </div>
 
 <figure>
-  <figcaption><b>attention 算子优化阶梯</b> · A0-c07-1 @1100 MHz · 单层一次 fwd+bwd · AC-cycle 后重测 n=5</figcaption>
+  <figcaption><b>attention 算子优化阶梯</b> · A0-c07-1 @1100 MHz · 单层一次 fwd+bwd · 各档取中位数，<b>n 与测量时段逐行不同</b>（见下表）</figcaption>
   <div class="bars">
     <div class="bar-row"><div class="bar-lab">Primus-Turbo 出厂<br><span class="cond">全 Triton</span></div>
       <div class="bar-track"><div class="bar-plot"><div class="bar-fill mute" style="width:100%"></div></div>
@@ -295,8 +295,27 @@
       <div class="bar-track"><div class="bar-plot"><div class="bar-fill" style="width:21.0%"></div></div>
         <span class="bar-val">11.726 <em>ms · 4.76×</em></span></div></div>
   </div>
-  <p class="foot">各档离散度 0.06–0.93%，SQNR 全程 ≥ 50 dB 门槛。前向从 10.651 → 1.572 ms（<b>6.8×</b>），
-    反向从 45.134 → 10.160 ms（<b>4.4×</b>）。</p>
+  <p class="foot">前向从 10.651 → 1.572 ms（<b>6.8×</b>），反向从 45.134 → 10.160 ms（<b>4.4×</b>），SQNR 全程 ≥ 50 dB 门槛。</p>
+  <div class="tw" style="margin-top:14px">
+  <table>
+    <caption>各档的 <b>n 与测量时段并不相同</b>，不可当作一组同质测量</caption>
+    <thead><tr><th>档位</th><th class="num">total</th><th class="num">离散</th><th class="num">n</th><th>测量时段</th></tr></thead>
+    <tbody>
+      <tr><td>出厂 <code>1cb2e183</code></td><td class="num">55.785 ms</td><td class="num">0.93%</td><td class="num">3</td>
+          <td class="cond">事故前，且来自另一个 worktree（<code>wt-bakeoff</code>）</td></tr>
+      <tr><td>强制 Triton 前向 + 融合反向</td><td class="num">22.001 ms</td><td class="num">0.06%</td><td class="num">2</td>
+          <td class="cond">事故前</td></tr>
+      <tr><td>ASM 前向 + 融合反向</td><td class="num">19.239 ms</td><td class="num">0.53%</td><td class="num">5</td>
+          <td class="cond">AC-cycle 后重测；与事故前的 19.233 只差 0.03%，是机器回到同一状态的证据</td></tr>
+      <tr><td>ASM 前向 + ASM 反向</td><td class="num">11.726 ms</td><td class="num">0.57%</td><td class="num">5</td>
+          <td class="cond">AC-cycle 后重测</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="foot"><b>另需说明</b>：此前文档记录过一个 <code>11.687 ms（n=7）</code> 的值，
+    穷举该时段全部 11 条原始记录的所有 7 元子集后确认<b>无法重构</b> ——
+    只有 4 个子集能同时命中 fwd 1.568 与 bwd 10.118，而它们的 total 全是 11.685，从来不是 11.687。
+    本报告一律采用可追溯到原始记录的 <b>11.726（n=5，AC-cycle 后）</b>。</p>
 </figure>
 
 <h3>为什么最快的那档默认是关闭的</h3>
