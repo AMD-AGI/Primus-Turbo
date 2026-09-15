@@ -237,8 +237,30 @@ def _anchor_v_o(traits, v_o):
 
 
 def _anchor_v_p(traits, v_p, elem_dtype):
-    # Fixed-reference-max forward: P is never rescaled, so there is no ordering left to pin.
-    return v_p
+    if const_expr(traits.DUALWAVE_SWP_FIXED_MAX):
+        # Fixed-reference-max forward: P is never rescaled.
+        return v_p
+    p_lo, p_hi = v_p
+    p_lo_all = _concat_vectors(p_lo[0], p_lo[1])
+    p_hi_all = _concat_vectors(p_hi[0], p_hi[1])
+    p_all = _concat_vectors(p_lo_all, p_hi_all)
+    p_all_ir = as_mlir_value(p_all)
+    p_all_anchored = llvm.inline_asm(
+        p_all_ir.type,
+        [p_all_ir],
+        "",
+        "=v,0",
+        has_side_effects=True,
+    )
+    p_vec = Vec(p_all_anchored, (traits.PV_K_STEPS * 2 * 8,), elem_dtype)
+    anchored_lo = []
+    anchored_hi = []
+    for pks in range_constexpr(traits.PV_K_STEPS):
+        lo_base = pks * 8
+        hi_base = traits.PV_K_STEPS * 8 + pks * 8
+        anchored_lo.append(p_vec.shuffle(p_vec, [lo_base + i for i in range(8)]).ir_value())
+        anchored_hi.append(p_vec.shuffle(p_vec, [hi_base + i for i in range(8)]).ir_value())
+    return anchored_lo, anchored_hi
 
 
 def _score_lists_to_vecs(v_s_lists):
@@ -415,7 +437,10 @@ def _make_dualwave_swp_traits(
     # Softmax is shift-invariant, so the main loop can run on a fixed zero reference max and let
     # the epilogue re-enter the online path.
     if dualwave_swp_fixed_max is None:
-        dualwave_swp_fixed_max = causal
+        # D=128 training needs row-adaptive softmax: a low fixed reference overflows
+        # positive rows, a high one underflows negative rows in BF16. D=64 stays
+        # fixed-max until that path is validated online.
+        dualwave_swp_fixed_max = causal and head_dim != 128
     # With a fixed reference max nothing rebases l_row mid-loop, so the running row sum
     # can live in an MFMA accumulator fed by a ones A operand instead of a VALU fold.
     dualwave_swp_mfma_rowsum = bool(dualwave_swp_fixed_max)
@@ -957,6 +982,15 @@ class DualwaveKernelContext:
         return lo_partial, hi_full
 
     def cast_p_and_sum(self, l_row, v_p):
+        if const_expr(not self.traits.DUALWAVE_SWP_MFMA_ROWSUM):
+            tile_sum = _lane_pair_reduce(
+                _reduce_score_pair(v_p, self.c_zero_f, _fadd, self.fm_fast),
+                _fadd,
+                self.fm_fast,
+            )
+            l_row = _fadd(l_row, tile_sum, self.fm_fast)
+            return self.cast_p(v_p), l_row
+
         """Pack P to bf16 and fold the tile into the row sum; the MFMA path feeds the packs
         themselves to a ones-matrix MFMA so numerator and denominator see the same bf16 values.
         Each 16-kv pack is one 16x16x32 MFMA against the ones A operand, which also folds the
@@ -977,6 +1011,8 @@ class DualwaveKernelContext:
         return v_p, l_row
 
     def finish_row_sum(self, l_row):
+        if const_expr(not self.traits.DUALWAVE_SWP_MFMA_ROWSUM):
+            return l_row
         """Take the row sum out of the MFMA accumulator; D element 0 holds this lane's q."""
         return Vec(l_row)[0]
 
@@ -1046,16 +1082,65 @@ class DualwaveKernelContext:
         return v_s
 
     def shift_scores(self, v_s, row_max):
-        return _score_lists_to_vecs(v_s) if isinstance(v_s[0], list) else v_s
+        if isinstance(v_s[0], list):
+            v_s = _score_lists_to_vecs(v_s)
+        if const_expr(self.traits.DUALWAVE_SWP_FIXED_MAX):
+            return v_s
+        shifted = []
+        for half in v_s:
+            shifted.append(
+                Vec.from_elements(
+                    [
+                        as_mlir_value(_fsub(Vec(half)[r], row_max, self.fm_fast))
+                        for r in range_constexpr(16)
+                    ],
+                    fx.Float32,
+                ).ir_value()
+            )
+        return tuple(shifted)
+
+    def scale_p(self, v_p, rescale):
+        """Rescale packed BF16 probabilities carried between pipeline tiles."""
+        f32x8 = Vec.make_type(8, fx.Float32)
+        elemx8 = Vec.make_type(8, self.elem_dtype)
+        fm_attr = ir.Attribute.parse("#llvm.fastmath<fast>")
+        scale_vec = Vec.from_elements([rescale], fx.Float32).broadcast_to(8)
+        scaled_halves = []
+        for packs in v_p:
+            scaled_packs = []
+            for pack in packs:
+                extended = llvm.FPExtOp(f32x8, as_mlir_value(pack))
+                extended.operation.attributes["fastmathFlags"] = fm_attr
+                scaled = arith.mulf(
+                    as_mlir_value(scale_vec),
+                    as_mlir_value(extended.result),
+                    fastmath=self.fm_fast,
+                )
+                truncated = llvm.FPTruncOp(elemx8, scaled)
+                truncated.operation.attributes["fastmathFlags"] = fm_attr
+                scaled_packs.append(truncated.result)
+            scaled_halves.append(scaled_packs)
+        return tuple(scaled_halves)
 
     def tile_rescale_o(self, v_o, m_row, l_row, v_s, v_p, sched_group):
-        """With a fixed reference max the correction is identically 1, so the row-max reduction,
-        the rescale and the m_row update all drop out."""
-        return v_o, m_row, l_row, v_p
+        """Fixed-max: identity. Online (D=128): rebase O/l; H11 skips scale_p
+        because all four PV steps already ran on the unrescaled v_p."""
+        if const_expr(self.traits.DUALWAVE_SWP_FIXED_MAX):
+            return v_o, m_row, l_row, v_p
+        m_new, rescale = self.tile_row_max(m_row, v_s)
+        self.scale_o(v_o, rescale)
+        l_row = self.scale_l_by(l_row, rescale)
+        return v_o, m_new, l_row, v_p
 
     def tile_row_max(self, m_row, v_s):
-        """Returns None as the O/l correction when the reference max is fixed and nothing rebases."""
-        return m_row, None
+        if const_expr(self.traits.DUALWAVE_SWP_FIXED_MAX):
+            return m_row, None
+        m_tile = self.reduce_max(v_s)
+        if const_expr(self.traits.CAUSAL):
+            m_tile = self.floor_masked_max(m_tile)
+        m_new = _fmax(m_row, m_tile, self.fm_fast)
+        rescale = fx.Float32(rocdl.exp2(T.f32, _fsub(m_row, m_new, self.fm_fast)))
+        return m_new, rescale
 
     def scale_o_by(self, v_o, rescale):
         if rescale is not None:
