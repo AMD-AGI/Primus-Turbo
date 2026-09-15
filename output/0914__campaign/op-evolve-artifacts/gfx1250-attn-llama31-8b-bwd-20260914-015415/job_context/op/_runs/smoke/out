@@ -1,0 +1,8 @@
+vendored primus_turbo at: /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/op/baseline/vendor/primus_turbo/__init__.py
+fused cfg: {'BLOCK_M1': 32, 'BLOCK_N1': 256, 'BLOCK_M2': 256, 'BLOCK_N2': 32, 'BLK_SLICE_FACTOR': 1, 'waves_per_eu': 1, 'matrix_instr_nonkdim': 16, 'num_warps': 4, 'num_ctas': 1, 'num_stages': 1}
+fwd ok (4, 8192, 32, 128) torch.bfloat16 build+run 1.09s
+bwd ok build+run 3.03s
+  dq (4, 8192, 32, 128) torch.bfloat16 finite=True absmax=4.3438
+  dk (4, 8192, 8, 128) torch.bfloat16 finite=True absmax=5.9688
+  dv (4, 8192, 8, 128) torch.bfloat16 finite=True absmax=10.1875
+SMOKE OK

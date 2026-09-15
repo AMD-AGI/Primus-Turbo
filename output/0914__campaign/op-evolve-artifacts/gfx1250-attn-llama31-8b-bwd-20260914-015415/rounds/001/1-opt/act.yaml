@@ -1,0 +1,148 @@
+round: 1
+mode: fast
+candidate: r1.i2.g2
+outcome: delivered
+
+correctness:
+  unit_tests: pass
+  precision: pass
+  checked_with: op/validation.py
+  sqnr_db: 52.04
+  # The MINIMUM over all four tensors and all four gated shapes, which is the
+  # number the 50 dB gate actually tests. Per-tensor on the spec shape:
+  # out 53.67, dq 52.24, dk 52.31, dv 52.71. Identical to the incumbent's to two
+  # decimals on every shape -- neither change touches the arithmetic.
+  # `op/ut/correctness.py` reports the same figures and PASSES 4 gated shapes.
+  # The diagnostic-only shape `sq_gt_skv` fails at dq -15.95 dB; it is a
+  # pre-existing defect of the seed, documented in op/ut/shapes.py and
+  # PROVENANCE.md, is not gated, and reads identically on rounds/000/op.
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/000/op, op/beat]
+  shapes:
+    - name: b4_s8192_hq32_hkv8_d128
+      this_round_tflops: 633.2
+      best_round_tflops: 549.2
+      target_tflops: 706.0
+      champion_round: 0
+      champion_tflops: 549.2
+      champion_rebuilt: true
+      ratio: 0.8968
+      vs_champion: 1.1529
+  score: 0.8968
+
+validation:
+  exit_code: 1
+
+explored:
+  ran:
+    - "rocprofv3 --stats --kernel-trace (FAILED -- recorded zero dispatches; see opt.md s1)"
+    - "torch.profiler kernel breakdown (the replacement; changed the decision by killing every host-side and launch-overhead candidate: bwd_kernel_causal is 99.28% of the backward)"
+    - "static resource census from the Triton cache (.hsaco metadata; changed the decision twice -- it is where the 326-VGPR spill and the LDS-at-20% figure come from, and both route rows 2 and 4 trace to it)"
+    - "op/benchmark.py tile/warp/knob sweeps (raw/sweep1-3.txt; changed the decision by falsifying num_warps=8 and by finding both shipped knobs)"
+  consulted:
+    - INDEX.md
+    - arch/gfx1250/gfx1250.md
+    - arch/gfx1250/isa.md
+    - arch/gfx1250/profiling-surface.md
+    - optimization/techniques/0-register-pressure-and-occupancy.md
+    - optimization/techniques/2-lds-bank-conflicts.md
+    - optimization/techniques/3-pipelining-and-scheduling.md
+    - optimization/routes/1-metrics-to-techniques.md
+    - pitfalls/measurement-traps.md
+    - pitfalls/compiler-and-toolchain.md
+    - backends/README.md
+    - backends/hip/README.md
+    - backends/aiter/attention/recipes/fmha_v3_bwd_hd128_bf16.md
+    - backends/flydsl/attention/recipes/hd128.md
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+    - backends/hipkittens/gemm/recipes/bf16_gfx1250_ladder.md
+    - backends/hipkittens/tiles-and-register-control.md
+  bound: power
+  confidence: medium
+  why: >
+    Inferred, not measured -- this part has no byte counter at any level and its
+    entire WMMA FLOP counter family reads exactly 0, so there is no counter-derived
+    roofline to read. What there is: the kernel spills 326 VGPRs / 1308 B per lane
+    to scratch at 1 wave/SIMD, where the flat 131072/NUM_THREADS budget gives 1024
+    VGPR/lane at num_warps=4 and no second wave exists to cover a reload; and the
+    card is measured pinned at 2497-2502 W of a 2500 W SOCKET_POWER_LIMIT with the
+    GFX clock held at ~1700 of 2400 MHz, 29% below maximum, under sustained bf16
+    GEMM. Under a cap, removing work pays and overlapping it does not -- which is
+    consistent with both of this round's wins being deletions (an LDS round trip per
+    transposing dot; an occupancy constraint the compiler was paying registers for)
+    and with num_warps=8 measuring 2.36x SLOWER rather than merely flat.
+
+arms:
+  - id: r1.i1.g1
+    built: "A alone, from op/current -- waves_per_eu 1 -> 0 in the vendored one-kernel config"
+    tflops: {b4_s8192_hq32_hkv8_d128: 573.5}
+    vs_champion: 1.043
+    shipped: false
+    note: "9.5873 ms, 1.216x beat. Measured twice (9.5873 / 9.5936)."
+  - id: r1.i2.g2
+    built: "B alone, from op/current and NOT on top of A -- TRITON_HIP_USE_IN_THREAD_TRANSPOSE scoped to the launch"
+    tflops: {b4_s8192_hq32_hkv8_d128: 583.4}
+    vs_champion: 1.063
+    shipped: false
+    note: "9.4248 ms, 1.238x beat. Measured four times (9.4128 / 9.4142 / 9.4147 / 9.4248)."
+  - id: r1.i1.g1+r1.i2.g2
+    built: "the merge, built only because neither arm lost"
+    tflops: {b4_s8192_hq32_hkv8_d128: 633.2}
+    vs_champion: 1.1529
+    shipped: true
+    note: >
+      Superadditive: A saves 4.2%, B saves 5.9%, together 13.2% where additive
+      would be 9.9%. This is the arm left in rounds/001/op. `candidate:` above
+      names r1.i2.g2 because the schema takes one id and B is the larger half;
+      the working copy contains BOTH.
+
+expected: >
+  A alone should take the backward from 10.03 ms to about 9.57 ms and B alone to
+  about 9.42 ms; the merge, if the two are as independent as the sweep suggested,
+  to about 8.70 ms, which is 1.34x beat and still short of the 1.50x gate. I do not
+  expect round 1 to pass -- the launch-configuration surface is worth roughly 13%
+  and the gate needs 29% from here.
+
+added_to_pool: [r1.i1.g1, r1.i2.g2]
+route_updated: true
+
+implementation:
+  files_changed:
+    - impl.py
+    - vendor/primus_turbo/triton/attention/fused_mha_bwd_kernel.py
+    - vendor/primus_turbo/pytorch/kernels/attention/attention_triton_impl.py
+  build_failures:
+    - attempt: 1
+      error: "RuntimeError: Type '...Float8QuantConfig' is already registered as an opaque type"
+      root_cause: >
+        torch's opaque-type registry is process-global and keyed by qualname, and
+        validation.py imports two primus_turbo trees (ours vendored, op/baseline's
+        installed) into one process. Fixed by making torch._C._register_opaque_type
+        idempotent rather than by unregistering, which would perturb a registry the
+        dispatcher reads.
+    - attempt: 2
+      error: "RuntimeError: an installed primus_turbo was imported before this module"
+      root_cause: >
+        PRE-EXISTING framework bug, not this round's: op/baseline guards on the name
+        primus_turbo being absent from sys.modules, and any candidate that vendors
+        the package trips it. An UNMODIFIED copy of op/current reproduces it, so
+        before this round validation.py could not judge any directory except
+        op/baseline. Fixed by moving the vendored modules to a private
+        _op_evolve_<n>. prefix instead of deleting them.
+    - attempt: 3
+      error: "ValueError: vector::reserve / MemoryError: std::bad_alloc / SIGSEGV (rc 139), intermittently, always at the first fwd() of the speed phase"
+      root_cause: >
+        Use-after-free in the dispatcher, wearing three faces. The vendored tree and
+        the installed primus_turbo both declare
+        primus_turbo::attention_triton_forward_impl; two torch.library fragments
+        defining one op name share a single OperatorEntry, and when the second
+        fragment is collected the schema is destroyed under the first tree's live
+        OpOverload. validation.py's speed order is cand>beat>baseline>baseline>beat>cand,
+        so baseline registers and dies between the candidate's two turns -- which is
+        why it never touched the correctness phase and why whether it fired at all
+        depended on when the collector ran. Fixed in one line: register under
+        primus_turbo_opevolve::. Cost four validation runs. Two earlier theories
+        (sys.modules deletion dropping the last reference; the opaque-type
+        unregistration) were both wrong and are recorded as wrong in opt.md.

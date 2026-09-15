@@ -1,0 +1,31 @@
+tile=256 DEFAULT                                         bwd_ms=9.9984 min=9.9677
+tile=256 waves_per_eu=0                                  bwd_ms=9.5982 min=9.5498
+tile=256 BLOCK_M1=16,BLOCK_N2=16                         bwd_ms=12.5050 min=12.4766
+tile=256 BLOCK_M1=16,BLOCK_N2=16,waves_per_eu=0          bwd_ms=12.5195 min=12.5037
+tile=128 DEFAULT                                         bwd_ms=13.3191 min=13.2965
+tile=128 waves_per_eu=0                                  bwd_ms=13.4079 min=13.3910
+tile=128 BLOCK_M1=16,BLOCK_N2=16                         bwd_ms=17.6007 min=17.5737
+tile=512 DEFAULT                                         bwd_ms=54.1117 min=53.5857
+tile=512 waves_per_eu=0                                  bwd_ms=53.5972 min=53.3421
+tile=64 BLOCK_M1=16,BLOCK_N2=16                          bwd_ms=32.7703 min=32.7226
+tile=256 waves_per_eu=0,num_stages=2                     bwd_ms=12.5863 min=12.5691
+tile=256 waves_per_eu=0,matrix_instr_nonkdim=32          bwd_ms=9.5750 min=9.5467
+tile=256 waves_per_eu=3                                  bwd_ms=78.6179 min=78.0095
+tile=256 waves_per_eu=4                                  bwd_ms=75.3045 min=74.7540
+tile=256 waves_per_eu=8                                  bwd_ms=96.7539 min=96.0906
+--- sorted ---
+9.5750  tile=256 waves_per_eu=0,matrix_instr_nonkdim=32
+9.5982  tile=256 waves_per_eu=0
+9.9984  tile=256 DEFAULT
+12.5050  tile=256 BLOCK_M1=16,BLOCK_N2=16
+12.5195  tile=256 BLOCK_M1=16,BLOCK_N2=16,waves_per_eu=0
+12.5863  tile=256 waves_per_eu=0,num_stages=2
+13.3191  tile=128 DEFAULT
+13.4079  tile=128 waves_per_eu=0
+17.6007  tile=128 BLOCK_M1=16,BLOCK_N2=16
+32.7703  tile=64 BLOCK_M1=16,BLOCK_N2=16
+53.5972  tile=512 waves_per_eu=0
+54.1117  tile=512 DEFAULT
+75.3045  tile=256 waves_per_eu=4
+78.6179  tile=256 waves_per_eu=3
+96.7539  tile=256 waves_per_eu=8

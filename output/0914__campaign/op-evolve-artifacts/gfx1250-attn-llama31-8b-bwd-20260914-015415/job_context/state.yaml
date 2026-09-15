@@ -1,0 +1,178 @@
+meta:
+  name: gfx1250-attn-llama31-8b-bwd
+  id: 20260914-015415
+  started_at: '2026-09-14T01:54:15'
+  spec_version: v000
+  elapsed_seconds: 28219.5
+setup:
+  job_setup:
+    status: done
+    spec_version: v000
+    at: '2026-09-14T02:05:13'
+    seconds: 658.0
+  op_setup:
+    status: done
+    spec_version: v000
+    at: '2026-09-14T02:35:48'
+    seconds: 1835.3
+lifecycle:
+- at: '2026-09-14T01:54:15'
+  event: setup_started
+- at: '2026-09-14T03:40:35'
+  event: stopped
+  reason: user_interrupt
+- at: '2026-09-14T03:40:35'
+  event: resumed
+  spec_version: v000
+- at: '2026-09-14T09:44:34'
+  event: stopped
+  reason: user_interrupt
+best_round: 1
+champions:
+  b4_s8192_hq32_hkv8_d128: 1
+rounds:
+- round: 0
+  progress: []
+  score: null
+  outcome: delivered
+  passed: true
+  accepted: true
+  note: baseline (measured at setup)
+  tflops:
+    b4_s8192_hq32_hkv8_d128: 548.9
+- round: 1
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  sessions:
+    opt: c6d8ece9-9794-42c6-877b-cd0ea46b6e47
+  seconds:
+    opt: 3844.1
+    reflect: 127.4
+    round: 3971.5
+  bound: power
+  validation_exit_code: 1
+  validation_by: framework
+  validation_failures:
+  - b4_s8192_hq32_hkv8_d128 1.345x 1.50x 1.150x FAIL
+  score: 0.89688
+  outcome: delivered
+  passed: true
+  accepted: true
+  tflops:
+    b4_s8192_hq32_hkv8_d128: 633.2
+  targets:
+    b4_s8192_hq32_hkv8_d128: 706.0
+  beats:
+    b4_s8192_hq32_hkv8_d128: 470.6666666666667
+  incumbents:
+    b4_s8192_hq32_hkv8_d128: 549.2
+  gain: 1.1529
+  changed: 3
+  flops:
+    b4_s8192_hq32_hkv8_d128: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: null
+  changed_disagreement: null
+- round: 2
+  progress:
+  - opt
+  mode: fast
+  sessions:
+    opt: a3c1eb8e-e9d5-4f1b-893d-b5be2d5d1a83
+  seconds:
+    opt: 2322.2
+    reflect: 464.5
+    round: 2786.7
+  bound: compute
+  validation_exit_code: 0
+  validation_by: framework
+  validation_disagreement: act.yaml reported validation exit 1; the framework's run exited 0
+  score: 0.83796
+  outcome: failed
+  passed: false
+  accepted: false
+  tflops:
+    b4_s8192_hq32_hkv8_d128: 591.6
+  targets:
+    b4_s8192_hq32_hkv8_d128: 706.0
+  beats:
+    b4_s8192_hq32_hkv8_d128: 470.6666666666667
+  incumbents:
+    b4_s8192_hq32_hkv8_d128: 633.1
+  gain: 0.9344
+  changed: 1
+  flops:
+    b4_s8192_hq32_hkv8_d128: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: 'FastError: {''id'': ''r2.i3.g10'', ''what'': ''Gate every candidate on vgpr_spill_count read
+    from the compiled .amdgcn BEFORE spending a timing run on it. Four points now span 326/325/307/266
+    spills against 9.983/9.302'
+  changed_disagreement: null
+- round: 3
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  sessions:
+    opt: eea8377f-82f6-4026-8767-d6808fe56470
+  seconds:
+    opt: 5446.5
+    reflect: 220.1
+    round: 5666.6
+  bound: power
+  validation_exit_code: null
+  validation_by: skipped (abandoned)
+  score: null
+  outcome: abandoned
+  passed: null
+  accepted: false
+  tflops: {}
+  targets: {}
+  beats: {}
+  incumbents: {}
+  gain: null
+  changed: 0
+  flops: {}
+  guards: {}
+  guard_failed: null
+  note: 'abandoned: nothing was built, so the figures recorded here would have been op/current''s own
+    code re-measured. They are dropped -- in the throughput column they read as a round that was faster
+    and rejected.'
+  changed_disagreement: null
+- round: 4
+  progress:
+  - opt
+  mode: fast
+  sessions:
+    opt: 4dc51d59-94d4-440a-ab67-74f0966c18f0
+  seconds:
+    opt: 12475.1
+    round: 12475.1
+  bound: latency
+  validation_exit_code: 137
+  validation_by: framework
+  validation_disagreement: act.yaml reported validation exit 1; the framework's run exited 137
+  score: 0.83031
+  outcome: delivered
+  passed: true
+  accepted: false
+  tflops:
+    b4_s8192_hq32_hkv8_d128: 586.2
+  targets:
+    b4_s8192_hq32_hkv8_d128: 706.0
+  beats:
+    b4_s8192_hq32_hkv8_d128: 470.6666666666667
+  incumbents:
+    b4_s8192_hq32_hkv8_d128: 633.6
+  gain: 0.9252
+  changed: 1
+  flops:
+    b4_s8192_hq32_hkv8_d128: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: 'b4_s8192_hq32_hkv8_d128: 586.2 is 92.5% of its best ever 633.6'
+  changed_disagreement: null

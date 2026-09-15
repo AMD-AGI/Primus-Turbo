@@ -1,0 +1,20 @@
+Traceback (most recent call last):
+  File "/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/001/scratch/bisect.py", line 4, in <module>
+    import benchmark, correctness
+  File "/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/op/benchmark.py", line 52, in <module>
+    import statistics
+  File "/usr/lib/python3.12/statistics.py", line 132, in <module>
+    import random
+  File "/usr/lib/python3.12/random.py", line 62, in <module>
+    from bisect import bisect as _bisect
+  File "/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/001/scratch/bisect.py", line 4, in <module>
+    import benchmark, correctness
+  File "/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/op/ut/correctness.py", line 32, in <module>
+    import torch
+  File "/opt/venv/lib/python3.12/site-packages/torch/__init__.py", line 53, in <module>
+    from torch._utils_internal import (
+  File "/opt/venv/lib/python3.12/site-packages/torch/_utils_internal.py", line 6, in <module>
+    import tempfile
+  File "/usr/lib/python3.12/tempfile.py", line 184, in <module>
+    from random import Random as _Random
+ImportError: cannot import name 'Random' from partially initialized module 'random' (most likely due to a circular import) (/usr/lib/python3.12/random.py)

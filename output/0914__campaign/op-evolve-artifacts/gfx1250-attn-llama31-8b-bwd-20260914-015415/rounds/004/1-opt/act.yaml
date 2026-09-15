@@ -1,0 +1,145 @@
+round: 4
+mode: fast
+candidate: r4.i2.g17
+outcome: delivered
+
+correctness:
+  unit_tests: pass
+  precision: pass
+  checked_with: op/validation.py
+  sqnr_db: 52.24
+  note: >
+    op/ut/ holds no pytest tests -- it is the module validation.py imports (ut/correctness.py,
+    ut/shapes.py) and its supported runnable form is `python op/ut/correctness.py <impl_dir>`.
+    `unit_tests` records that run against rounds/004/op: PASSED, 4 gated shapes, all four
+    tensors >= 50 dB. A `pytest op/ut` invocation collects nothing and exits 0; that is not a
+    pass and is not recorded as one. sqnr_db is the worst gated tensor on the spec shape.
+    Every gated number is identical to the incumbent's to the last digit despite a large
+    restructuring of the dk/dv pass. The sq_gt_skv dq reading of -15.95 dB is inherited and
+    validation.py reports it as diagnostic, not gated. Raw in raw/ut_correctness.txt and
+    raw/final_validation_and_bench.txt.
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/001/op]
+  shapes:
+    - name: b4_s8192_hq32_hkv8_d128
+      this_round_tflops: 586.2
+      best_round_tflops: 633.6
+      target_tflops: 706.0
+      champion_round: 1
+      champion_tflops: 633.6
+      champion_rebuilt: true
+      ratio: 0.8303
+      vs_champion: 0.9252
+  score: 0.8303
+  note: >
+    Candidate and incumbent measured back to back in one session on an idle GPU[1]
+    (rocm-smi --showpids empty of live PIDs, --showuse GPU[1] 0% before and after),
+    `op/benchmark.py --shape all --json`, unprofiled, one process per arm, fresh
+    TRITON_CACHE_DIR each. The candidate is SLOWER ON ALL FIVE SHAPES, bwd ms
+    cand/incumbent: 9.3802/8.6782, 0.7286/0.7257, 0.1944/0.1893, 0.3423/0.2690,
+    0.4312/0.3467 -- vs_champion 0.925 / 0.996 / 0.974 / 0.786 / 0.804. Acceptance
+    fails on throughput and on the 95%-of-best-ever condition. Independently, the
+    dedicated sweep r4_sweep4 put g17 at 9.3689 and 9.3816 ms against base copies at
+    8.6873 and 8.6867 (base-to-base spread 0.007%, g17-to-g17 0.14%), and validation.py's
+    own palindromic run put it at 9.3782. Three independent measurements, +7.8% every
+    time. Raw in raw/final_validation_and_bench.txt and raw/ptD_*.log.
+
+validation:
+  exit_code: 1
+
+explored:
+  ran:
+    - "static .amdgcn census on every build before it was given a timing slot (route row 1, the must) -- it killed tl.range(num_stages=2) for 0 GPU-seconds at 2001 spills, and it fired correctly on the shipped arm"
+    - "op/benchmark.py --shape all on rounds/004/op and rounds/001/op back to back, unprofiled"
+    - "r4_sweep4: five timed points, one process each, palindromic base slots, absum checksums per point"
+    - "rocm-smi power/clock trace under load on the physical GPU[1] (route row 1 of the look) -- it overturned round 3's 20-45% instruction discount"
+    - "TTIR/LLIR/amdgcn diff of the tl.assume build -- closed that candidate permanently without a timing slot"
+  consulted:
+    - INDEX.md
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+    - backends/aiter/attention/recipes/fmha_v3_bwd_hd128_bf16.md
+    - optimization/techniques/3-pipelining-and-scheduling.md
+    - profiling/2-power-wall-analysis.md
+  bound: latency
+  confidence: medium
+  why: >
+    Changed from round 3's `power`, on this round's own measurements rather than on an
+    inference from a GEMM card. Two results, both taken here. (1) The clock half of the
+    power-wall regime test does not hold: bwd_kernel_causal runs at 2159-2167 MHz, median
+    2161, against MAX_CLK 2400 -- a 10.0% droop, where the ladder card's sustained bf16
+    GEMM droops 29%. The power half is UNREADABLE: rocm-smi -P omits the GPU[1] socket
+    power row in all 30 load samples while printing it for GPU[0]/[2]/[3], so the regime
+    test cannot be completed and the 20-45% discount cannot be asserted. (2) Trading memory
+    traffic for arithmetic makes this kernel SLOWER, twice, which is not how an
+    energy-limited kernel behaves: disable_licm cut static scratch_load 265 -> 156 (-41%)
+    and scratch 1064 -> 944 B/lane and was +17.5%; g17 cut spills 266 -> 0 and scratch to
+    0 B/lane and was +7.8%, paying for it in 64 extra WMMA and one extra streaming pass
+    over Q/dO/LSE. Both say the time is set by dependent latency the 264-trip loop cannot
+    hide, not by energy under a cap. `medium` and not `high` because the direct instrument
+    that would separate latency from compute -- PC sampling -- is dead on this kernel
+    (round 3, and not re-attempted here), so this is inference from two deletion probes.
+
+arms:
+  - id: r4.i2.g17
+    built: "two-phase dk/dv: _bwd_dkdv_inner gains PHASE constexpr, the hqid loop is wrapped in tl.static_range(2) with ONE accumulator, dv stored inside the phase loop before dk is allocated. From op/current via scratch/mkg17.py"
+    tflops: {b4_s8192_hq32_hkv8_d128: 586.2}
+    vs_champion: 0.9252
+    shipped: true
+    note: >
+      vgpr 1024 -> 973, spills 266 -> 0, private_segment_fixed_size 1064 -> 0 B/lane,
+      scratch_load 265 -> 0. First zero-spill zero-scratch bwd_kernel_causal in four rounds.
+      Its own stated falsifier fired first: s_set_vgpr_msb went UP 1666 -> 1728, so the
+      above-register-255 premise the row was built on is refuted. wmma 448 -> 512 (+14%).
+      9.3689/9.3816 ms against base 8.6873/8.6867. absum bit-identical to base.
+  - id: r4.i1.g16 (flatten)
+    built: "tl.range(num_steps, flatten=True) on the dk/dv loop alone, from op/current via scratch/mkg16.py"
+    tflops: {b4_s8192_hq32_hkv8_d128: 631.1}
+    vs_champion: 0.9977
+    shipped: false
+    note: "8.7072 ms, +0.23%. The .amdgcn is IDENTICAL to base on all seven census fields, so this is inert -- the compiler already flattens this loop."
+  - id: r4.i1.g16 (num_stages=2)
+    built: "tl.range(num_steps, num_stages=2) on the dk/dv loop alone"
+    tflops: {}
+    vs_champion: null
+    shipped: false
+    note: "DISCARDed on the row-1 census and never timed: spills 266 -> 2001, scratch 1064 -> 2468 B/lane, instrs 9547 -> 14694, s_set_vgpr_msb 1666 -> 2338. Per-loop staging is unaffordable at this register pressure."
+  - id: r4.i3.probes
+    built: "disable_licm / tl.assume / loop_unroll_factor=2 on the dk/dv loop -- the look's seven-point sweep, not speed arms"
+    tflops: {}
+    vs_champion: null
+    shipped: false
+    note: "base 8.6860/8.6928; assume 8.6912 (inert, and closed by IR reading: 301 assume ops in TTIR, ZERO llvm.assume in LLIR); dkdv_nolicm 10.2033 (+17.5%); assume_nolicm 10.2108; dkdv_unroll2 25.6807 (+196%, 3678 spills); unroll2_nolicm 29.7783 (+243%, 2913 spills -- FEWER spills, 16% slower)."
+
+expected: >
+  Written before building, from route.md row 2 and opt.md s10. "Halve the resident
+  accumulator set by running the m-loop once for dv and once for dk" -- peak accumulator
+  residency 512 VGPRs -> 256, loop-invariant set 768 -> 512, aimed at the 1666 static
+  s_set_vgpr_msb that are 26% of the dk/dv body, against the corpus's 1.72x for the
+  above-register-255 boundary on the same operator at the same head dim and the same
+  1 wave/SIMD. Priced at "roughly 26%" after this round killed round 3's 20-45%
+  instruction discount. Explicitly falsifiable on a free compile: "if the split does not
+  move s_set_vgpr_msb below 1666, the premise is wrong and it dies for a compile."
+  Outcome: the falsifier fired (1666 -> 1728) and I timed it anyway, because the same
+  census showed the first zero-spill zero-scratch build of this kernel in four rounds and
+  there was no other way to price that. It was +7.8%. The gate was right.
+
+added_to_pool: [r4.i1.g16, r4.i2.g17]
+route_updated: true
+
+implementation:
+  files_changed: [vendor/primus_turbo/triton/attention/fused_mha_bwd_kernel.py]
+  build_failures:
+    - attempt: 1
+      error: "CompilationError: at 277:8: for phase in (0, 1): AttributeError(\"'Tuple' object has no attribute 'func'\")"
+      root_cause: >
+        Triton 3.6.0's AST tracer requires the iterable of a `for` to be a CALL node -- it
+        reaches straight for `.func` to decide whether it is range, tl.range or
+        tl.static_range. Any other expression (tuple, list, zip, a name bound to a sequence)
+        raises this AttributeError rather than a diagnostic. There is no Python-level `for`
+        in a @triton.jit body; compile-time repetition must go through tl.static_range.
+        Fixed by tl.static_range(2) plus replacing the constexpr ternary
+        `acc = acc_dv if phase == 0 else acc_dk` with a plain if/else on the same constexpr.
+        One failure, one root cause, fixed rather than worked around; the hypothesis is
+        unchanged.

@@ -1,0 +1,444 @@
+=== device map ===
+GPU[0]		: PCI Bus: 0001:04:00.0
+GPU[1]		: PCI Bus: 0002:04:00.0
+GPU[2]		: PCI Bus: 0003:04:00.0
+GPU[3]		: PCI Bus: 0004:04:00.0
+torch sees 1 device(s)
+HIP_VISIBLE_DEVICES=1 -> name AMD Radeon Graphics pci_bus_id 4 uuid 35316463-3633-3834-6161-353032306339
+=== IDLE, ALL GPUS (3 samples) ===
+GPU[0]		: sclk clock level: 1 (2354Mhz)
+GPU[1]		: sclk clock level: 1 (2400Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2364Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1145.0
+GPU[1]		: Current Socket Graphics Package Power (W): 1121.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1143.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 0
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+--
+GPU[0]		: sclk clock level: 1 (2354Mhz)
+GPU[1]		: sclk clock level: 1 (2400Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2364Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1145.0
+GPU[1]		: Current Socket Graphics Package Power (W): 1121.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1143.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 0
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+--
+GPU[0]		: sclk clock level: 1 (2354Mhz)
+GPU[1]		: sclk clock level: 1 (2400Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2364Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1145.0
+GPU[1]		: Current Socket Graphics Package Power (W): 1120.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1143.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 0
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+--
+=== UNDER LOAD, ALL GPUS ===
+t=1
+GPU[0]		: sclk clock level: 1 (2354Mhz)
+GPU[1]		: sclk clock level: 1 (2167Mhz)
+GPU[2]		: sclk clock level: 1 (2357Mhz)
+GPU[3]		: sclk clock level: 1 (2364Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1145.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1142.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=2
+GPU[0]		: sclk clock level: 1 (2355Mhz)
+GPU[1]		: sclk clock level: 1 (2163Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2364Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1144.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1128.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1142.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=3
+GPU[0]		: sclk clock level: 1 (2355Mhz)
+GPU[1]		: sclk clock level: 1 (2162Mhz)
+GPU[2]		: sclk clock level: 1 (2357Mhz)
+GPU[3]		: sclk clock level: 1 (2364Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1145.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1143.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=4
+GPU[0]		: sclk clock level: 1 (2355Mhz)
+GPU[1]		: sclk clock level: 1 (2161Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2364Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1144.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1143.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=5
+GPU[0]		: sclk clock level: 1 (2354Mhz)
+GPU[1]		: sclk clock level: 1 (2161Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2365Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1144.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1143.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=6
+GPU[0]		: sclk clock level: 1 (2355Mhz)
+GPU[1]		: sclk clock level: 1 (2161Mhz)
+GPU[2]		: sclk clock level: 1 (2357Mhz)
+GPU[3]		: sclk clock level: 1 (2365Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1144.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1143.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=7
+GPU[0]		: sclk clock level: 1 (2355Mhz)
+GPU[1]		: sclk clock level: 1 (2161Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2364Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1145.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1143.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=8
+GPU[0]		: sclk clock level: 1 (2356Mhz)
+GPU[1]		: sclk clock level: 1 (2161Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2365Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1145.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1143.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=9
+GPU[0]		: sclk clock level: 1 (2355Mhz)
+GPU[1]		: sclk clock level: 1 (2159Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2364Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1145.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1143.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=10
+GPU[0]		: sclk clock level: 1 (2355Mhz)
+GPU[1]		: sclk clock level: 1 (2162Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2365Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1144.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1143.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=11
+GPU[0]		: sclk clock level: 1 (2355Mhz)
+GPU[1]		: sclk clock level: 1 (2160Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2364Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1144.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1142.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=12
+GPU[0]		: sclk clock level: 1 (2355Mhz)
+GPU[1]		: sclk clock level: 1 (2161Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2365Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1144.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1142.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=13
+GPU[0]		: sclk clock level: 1 (2355Mhz)
+GPU[1]		: sclk clock level: 1 (2161Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2365Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1144.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1142.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=14
+GPU[0]		: sclk clock level: 1 (2355Mhz)
+GPU[1]		: sclk clock level: 1 (2160Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2365Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1144.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1142.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=15
+GPU[0]		: sclk clock level: 1 (2355Mhz)
+GPU[1]		: sclk clock level: 1 (2161Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2365Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1144.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1142.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=16
+GPU[0]		: sclk clock level: 1 (2355Mhz)
+GPU[1]		: sclk clock level: 1 (2160Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2365Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1144.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1142.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=17
+GPU[0]		: sclk clock level: 1 (2355Mhz)
+GPU[1]		: sclk clock level: 1 (2160Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2365Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1144.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1142.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=18
+GPU[0]		: sclk clock level: 1 (2355Mhz)
+GPU[1]		: sclk clock level: 1 (2160Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2365Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1144.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1142.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=19
+GPU[0]		: sclk clock level: 1 (2355Mhz)
+GPU[1]		: sclk clock level: 1 (2161Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2365Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1144.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1142.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=20
+GPU[0]		: sclk clock level: 1 (2355Mhz)
+GPU[1]		: sclk clock level: 1 (2160Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2365Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1144.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1142.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=21
+GPU[0]		: sclk clock level: 1 (2355Mhz)
+GPU[1]		: sclk clock level: 1 (2159Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2365Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1144.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1126.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1142.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=22
+GPU[0]		: sclk clock level: 1 (2355Mhz)
+GPU[1]		: sclk clock level: 1 (2159Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2365Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1143.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1142.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=23
+GPU[0]		: sclk clock level: 1 (2355Mhz)
+GPU[1]		: sclk clock level: 1 (2160Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2365Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1143.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1142.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=24
+GPU[0]		: sclk clock level: 1 (2355Mhz)
+GPU[1]		: sclk clock level: 1 (2161Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2365Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1144.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1142.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=25
+GPU[0]		: sclk clock level: 1 (2354Mhz)
+GPU[1]		: sclk clock level: 1 (2161Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2365Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1144.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1142.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=26
+GPU[0]		: sclk clock level: 1 (2354Mhz)
+GPU[1]		: sclk clock level: 1 (2160Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2365Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1144.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1126.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1142.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=27
+GPU[0]		: sclk clock level: 1 (2354Mhz)
+GPU[1]		: sclk clock level: 1 (2160Mhz)
+GPU[2]		: sclk clock level: 1 (2357Mhz)
+GPU[3]		: sclk clock level: 1 (2365Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1144.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1142.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=28
+GPU[0]		: sclk clock level: 1 (2355Mhz)
+GPU[1]		: sclk clock level: 1 (2160Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2364Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1144.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1142.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=29
+GPU[0]		: sclk clock level: 1 (2355Mhz)
+GPU[1]		: sclk clock level: 1 (2161Mhz)
+GPU[2]		: sclk clock level: 1 (2358Mhz)
+GPU[3]		: sclk clock level: 1 (2365Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1144.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1142.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+t=30
+GPU[0]		: sclk clock level: 1 (2354Mhz)
+GPU[1]		: sclk clock level: 1 (2161Mhz)
+GPU[2]		: sclk clock level: 1 (2357Mhz)
+GPU[3]		: sclk clock level: 1 (2365Mhz)
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 1144.0
+GPU[2]		: Current Socket Graphics Package Power (W): 1127.0
+GPU[3]		: Current Socket Graphics Package Power (W): 1142.0
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+=== LOAD OUTPUT ===
+LOADSTART
+LOADDONE iters=10340 mean_ms=8.7205

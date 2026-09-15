@@ -1,0 +1,11 @@
+[gate] forcing BLOCK_N1 = BLOCK_M2 = 128
+--- AQHVKGZSRP4Z5TP5SSTO5YI2WHLXAM452HJS7ZCA7LACCBSN3YYQ
+    vgpr_count=771 vgpr_spill_count=0 sgpr_spill_count=0 scratch_B_per_lane=0 lds=0
+      v_wmma                                       224
+      s_set_vgpr_msb                               833
+      scratch_load                                 0
+      scratch_store                                0
+      \bds_                                        524
+      v_pk_mul_f32                                 256
+      v_add_nc_u32|v_add3_u32|v_dual_add_nc_u32    377
+    VERDICT vs incumbent 266: MEASURE (a falsifiable prediction)

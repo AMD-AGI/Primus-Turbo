@@ -1,0 +1,5 @@
+[bench] impl=baseline shape=min_seqlen
+[bench]   statistic=median iters=10 warmup_s=1.0
+[bench]   fwd_ms=0.3115 fwd_tflops=27.63 fwd_gbps=134.7 fwd_spread_pct=88.26
+[bench]   bwd_ms=1.6177 bwd_tflops=13.30 bwd_gbps=51.9 bwd_spread_pct=542.38
+[bench]   total_ms=1.9291 peak_mem_gib=0.09

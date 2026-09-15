@@ -1,0 +1,51 @@
+ls: cannot access '/workspace/Primus-Turbo/tools/gfx1250/': No such file or directory
+--- gemm benches ---
+ls: cannot access '/workspace/Primus-Turbo/benchmarks/': No such file or directory
+--- fused mha bwd kernel present? ---
+ls: cannot access '/workspace/Primus-Turbo/primus_turbo/triton/attention/fused_mha_bwd_kernel.py': No such file or directory
+ls: cannot access '/workspace/Primus-Turbo/primus_turbo/pytorch/kernels/attention/attention_fused_bwd_impl.py': No such file or directory
+### what IS in the image's Primus-Turbo
+f857e429 feat: add grad accumulation fuse support for tensorwise (Part1) (#454)
+3rdparty
+CONTRIBUTING.md
+LICENSE
+LICENSE-APACHE
+MANIFEST.in
+README.md
+SECURITY.md
+agent
+benchmark
+build
+csrc
+docs
+libprimus_turbo_kernels.so
+primus_turbo
+pyproject.toml
+requirements.txt
+setup.py
+tests
+tools
+--- attention kernels ---
+primus_turbo/pytorch/kernels/attention/:
+__init__.py
+attention_aiter_impl.py
+attention_flydsl_impl.py
+attention_gluon_impl.py
+attention_hipkittens_impl.py
+attention_impl.py
+attention_triton_impl.py
+sparse_mla_impl.py
+
+primus_turbo/triton/attention/:
+__init__.py
+attention_kernel.py
+sparse_mla.py
+
+### the host checkout the SEED block's files must come from
+/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo
+d2f75576 T7: resolve two of the three unknowns offline, and find a blocker that would have wasted GPU time tomorrow
+--- SEED files present on host? ---
+-rw-r--r-- 1 lihuzhan lihuzhan 24302 Sep 14 00:37 primus_turbo/pytorch/kernels/attention/attention_fused_bwd_impl.py
+-rw-r--r-- 1 lihuzhan lihuzhan 72167 Sep 14 00:37 primus_turbo/triton/attention/fused_mha_bwd_kernel.py
+-rwxr-xr-x 1 lihuzhan lihuzhan  1585 Sep 14 00:37 tools/gfx1250/exclusive.sh
+-rw-r--r-- 1 lihuzhan lihuzhan 29873 Sep 14 00:37 tools/gfx1250/tune_attention.py

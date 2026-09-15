@@ -1,0 +1,9 @@
+[ok  ] planner   claude/claude-opus-5 answered in 3.662s $0.0379
+[ok  ] planner   session 440a591d-9649-46f8-9829-e067f4c3b7f5 resumed, context intact
+[ok  ] profiler  claude/claude-opus-5 answered in 2.447s $0.0145
+[ok  ] profiler  session ac58e31c-aceb-4fa3-8e0e-780c1d355d81 resumed, context intact
+[ok  ] reviewer  codex/gpt-5.6-sol answered in 2.219s
+[ok  ] reviewer  session 01a09da2-e758-7500-9cc8-c08a494d78dd resumed, context intact
+[ok  ] setup     claude/claude-opus-5 answered in 2.187s $0.0145
+[ok  ] setup     session d71d5aae-0cef-4ca9-8346-9a0ab28e5b5c resumed, context intact
+EXIT=0

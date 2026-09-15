@@ -1,0 +1,30 @@
+### host
+ctheliosp-1b112-a37-1.mnb.dcgpu
+6.16.1-0_fbk2_brcmrdma5_35_g5ba27bd1d6b9
+2026-09-14T01:58:28+00:00
+### ssh hops: runtime.runner.ssh is null -> zero hops; controller == node == container host
+### sudo -n true
+sudo: AVAILABLE (passwordless)
+### docker
+server 29.7.2
+### pinned image present locally?
+id=sha256:6e656de79e6c8d7f3b3db3690606c3e6cb0536ec871f0521735746015297c9a1 created=2026-09-09T17:02:19.216628442Z arch=amd64
+### digest
+template parsing error: template: :1: unexpected "\\" in operand
+### does the op-evolve container already exist?
+
+error: no such object: op-evolve-gfx1250-attn-llama31-8b-bwd
+### other containers on this node
+fa-e2e	amdprimus/amdprimus:gfx1250-20260910	Up 10 minutes
+fa-repro	amdprimus/amdprimus:gfx1250-20260910	Up About an hour
+### /dev/kfd + render nodes
+/dev/kfd
+/dev/dri/renderD128 /dev/dri/renderD129 /dev/dri/renderD130 /dev/dri/renderD131 /dev/dri/renderD132 /dev/dri/renderD133 /dev/dri/renderD134 /dev/dri/renderD135 /dev/dri/renderD136 /dev/dri/renderD137 /dev/dri/renderD138 /dev/dri/renderD139 /dev/dri/renderD140 /dev/dri/renderD141 /dev/dri/renderD142 /dev/dri/renderD143 /dev/dri/renderD144 /dev/dri/renderD145 /dev/dri/renderD146 /dev/dri/renderD147 /dev/dri/renderD148 /dev/dri/renderD149 /dev/dri/renderD150 /dev/dri/renderD151 /dev/dri/renderD152 /dev/dri/renderD153 /dev/dri/renderD154 /dev/dri/renderD155 /dev/dri/renderD156 /dev/dri/renderD157 /dev/dri/renderD158 /dev/dri/renderD159 
+### amdgpu kernel module
+version:        7.1.1.31300009
+srcversion:     390DDE7DEA1EBD99204E6D5
+### dmesg wedge signatures (hazard 2: grep, do not call rocm-smi)
+0
+amdprimus/amdprimus@sha256:6e656de79e6c8d7f3b3db3690606c3e6cb0536ec871f0521735746015297c9a1
+
+Error response from daemon: pull access denied for amdprimus/amdprimus, repository does not exist or may require 'docker login'

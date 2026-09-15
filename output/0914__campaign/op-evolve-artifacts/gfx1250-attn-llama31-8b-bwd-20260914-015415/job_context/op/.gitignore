@@ -1,0 +1,4 @@
+# runjob.sh state: one directory per run key, holding cmd/pid/out/rc.
+# Transient by design -- a finished run is deleted and re-run, never cached.
+_runs/
+__pycache__/

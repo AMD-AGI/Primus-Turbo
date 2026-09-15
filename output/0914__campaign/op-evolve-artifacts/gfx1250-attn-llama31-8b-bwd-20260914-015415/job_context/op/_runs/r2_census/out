@@ -1,0 +1,3 @@
+_bwd_preprocess              regs=None spills=None lds=512 warps=4 ws=32 stages=2 wpe=0
+attn_fwd                     regs=None spills=None lds=16384 warps=4 ws=32 stages=1 wpe=0
+bwd_kernel_causal            regs=None spills=None lds=65536 warps=4 ws=32 stages=1 wpe=0

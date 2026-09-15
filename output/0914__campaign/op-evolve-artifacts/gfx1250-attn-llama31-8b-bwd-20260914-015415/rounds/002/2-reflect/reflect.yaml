@@ -1,0 +1,74 @@
+round: 2
+mode: fast
+accepted: false
+
+expectation_check:
+  expected: "roughly 2-3% each from r2.i1.g8 and r2.i2.g9, and 4-6% merged if both survived"
+  measured: "-7.5% (g8) and -7.0% (g9) against a 0.03-0.06% measurement floor; no merge, both lost"
+  held: false
+  reading: >
+    Wrong in sign and in size. Each arm deleted exactly the instructions it claimed --
+    the static census confirms g8 removed the precise 32 v_pk_mul_f32 it targeted --
+    and each got slower, because the deletion lengthened live ranges on a kernel
+    already at 1024/1024 VGPRs with one wave per SIMD. g8 went 266 -> 307 spills,
+    g9 266 -> 325. At this occupancy a source-level deletion is a request to the
+    register allocator and the allocator's answer is what gets timed. I modelled the
+    instructions and never the allocator, though round 1's num_warps=8 result (2.36x
+    slower) had already shown me which term dominates.
+    A second expectation failed the same round, for free: step 4's law "time tracks
+    vgpr_spill_count and nothing else" was falsified by my own new instrument.
+    BLOCK_N1=128 compiles to vgpr_spill_count=0, vgpr_count=771, zero scratch, and
+    runs at 11.8-13.3 ms against the incumbent's 8.691. The law holds within a tile
+    and is empty across tiles.
+
+moves:
+  - {id: r2.i3.g10, from: pool, to: facts, round: 2,
+     reason: "built and used (rounds/002/1-opt/census_gate.py); it killed route row 2 for free the same round. Filed with its scope corrected: a screen within one tile, not an objective across tiles."}
+  - {id: r2.i4.g11, from: pool, to: dead_ends, round: 2,
+     reason: "killed at look, no build. HEAD_DIM is the contraction axis of qkT and dpT, so k and v stay resident: 768 -> 512, not 384, for +50% wmma and 2x Q/dO traffic. BLOCK_N1=128 is strictly better at the same trade (768 -> 384, no recompute) and already measured 20-33% slower."}
+  - {id: r2.i1.g8, from: none, to: dead_ends, round: 2,
+     reason: "arm A, created by opt this round, never in the pool. Measured 9.347 vs 8.691 ms, +7.5%: deleted 32 v_pk_mul_f32 and bought 41 spills (266 -> 307)."}
+  - {id: r2.i2.g9, from: none, to: dead_ends, round: 2,
+     reason: "arm B, created by opt this round, never in the pool. Measured 9.302 vs 8.691 ms, +7.0%: hoisted offset tensors became long-lived spilled values, 266 -> 325, and v_add went up not down. This is the shipped working copy that was rejected."}
+
+untouched_by_design: [route.md]
+
+bottleneck:
+  changed: true
+  to: "instruction issue inside the dk/dv loop body, with register pressure as the cause of the instructions -- under round 1's hard power cap"
+  confidence: medium
+  why: >
+    Round 1 said "register spill to scratch". Round 2's static loop map narrows it and
+    round 2's measurements bound it. One unmasked dk/dv iteration is 1400 instructions:
+    128 wmma (9.1%) against 517 (37%) of register-pressure overhead -- 363
+    s_set_vgpr_msb and 77 scratch_load. The dq pass has no scratch traffic at all.
+    Not memory (154 GB/s), not math density (633 TF/s against 2236-2667 for bf16 GEMM).
+    But "spill" alone is the wrong name for it, because a zero-spill build
+    (BLOCK_N1=128, vgpr_count=771, scratch 0) is 20-33% slower: shrinking the tile
+    trades residency for doubled Q/dO re-reads and the traffic wins. So the live
+    direction is lower residency at constant Q/dO traffic, inside one pass over the
+    m-loop, and the traffic-for-residency family is closed.
+    Medium and not high: none of this is counter-derived -- gfx1250 has no byte
+    counter at any level, its WMMA FLOP counters read exactly 0, rocprofv3 records
+    zero dispatches on this benchmark -- so the instrument is a static census that
+    counts instructions and does not time them. And this round is itself evidence
+    that an instruction count read without the allocator's response predicts the
+    wrong sign.
+
+not_added_to_pool:
+  - id: null
+    idea: >
+      Split the dk/dv pass into a dv-only loop then a dk-only loop, so peak residency
+      is 512 rather than 768 for +25% wmma (cheaper than r2.i4.g11's +50%). Noted
+      during step 5 and deliberately not switched to, because it is a different
+      mechanism from the route's HEAD_DIM split. It also pays the 2x Q/dO traffic
+      that this round measured as fatal, so on current evidence it is dominated by
+      BLOCK_N1=128 the same way g11 was -- it belongs in the pool only if someone
+      finds a way to keep both halves under one pass over Q and dO.
+  - id: null
+    idea: >
+      Ask whether the 363 s_set_vgpr_msb bank switches (26% of the loop body) can be
+      reduced by influencing which values land above VGPR 256, rather than by
+      reducing the number of live values. That is a different axis from every
+      candidate in the pool, but I have no evidence it is controllable from Triton
+      source, so it is a question and not a candidate.

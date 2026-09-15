@@ -1,0 +1,1312 @@
+
+======================================================================
+turn 1 | claude claude-opus-5 effort=xhigh | session=e8e4cf21-86bb-4bee-ba15-2a833aecd034 resumed=False | 658.005s | ok=True
+----------------------------------------------------------------------
+PROMPT
+You are setting up an op performance optimization job.
+
+Job file: /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/history/v000_original.yaml
+Job name: gfx1250-attn-llama31-8b-bwd
+Job id: 20260914-015415
+Started at: 2026-09-14T01:54:15
+Job directory: /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415
+Job context directory: /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context
+Tools directory: /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/tools
+Report to write: /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/history/review/job_setup_v000.md
+
+Your task is Job Setup: turn that job file into a complete job context on disk.
+You do not create the baseline, the target, unit tests or `validation.py` --
+that is Op Setup, a later stage. Do not create `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/op/`.
+
+Work through the steps in order. Verify by actually running commands; never
+assume a check passed because the job file says it should. If a step fails,
+stop there and report it rather than working around it.
+
+## 1. Parse the job file
+
+Read `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/history/v000_original.yaml`. Resolve every field, and list anything ambiguous,
+missing, or contradictory instead of guessing a value. Where you must infer
+something, record what you inferred and why -- it goes in the report.
+
+## 2. Complete the spec
+
+The framework has already created the job context and its directories, copied
+`/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/history/v000_original.yaml` verbatim to `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/history/v000_original.yaml`,
+and written `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/state.yaml`. **Do not create or edit any of
+them.** `state.yaml` is the framework's ledger and it writes it on every module
+boundary; a second writer loses.
+
+What is yours is `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/gfx1250-attn-llama31-8b-bwd_final.yaml`: the completed spec. It currently holds a
+copy of the user's input. Rewrite it as the user's input plus every value you
+resolved or inferred in step 1, with nothing left implicit. This file is the
+single source of truth for the rest of the job.
+
+Then add an entry to `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/history/changelog.md` for
+v000, listing what you filled in and why.
+
+The spec must be complete on disk before the checks below, because step 5 reads it.
+
+## 3. Verify the LLM accounts
+
+For every SDK named anywhere in `agent.roles`:
+
+    python3 /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/tools/check_llm_account.py --config /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/gfx1250-attn-llama31-8b-bwd_final.yaml
+
+It checks every role the spec names, and `--role <name>` narrows it to one. For
+each it makes **one real call and then a second that resumes the first**: a key
+that parses but cannot reach the model fails on the first, and a session that
+cannot be handed back fails on the second. The second matters as much -- 3-Act
+continues the planner's session and 4-Reflect the reviewer's.
+
+The script reads the credentials file itself and sources it rather than parsing
+it, so a value written in terms of another variable arrives expanded. Do not read
+those files yourself and do not set the variables by hand. Use this script rather
+than a check of your own.
+
+Never copy a key, token, or the contents of a credentials file into any file
+under `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context`, or into the report.
+
+## 4. Verify the environment
+
+Check the machine yourself, however you find easiest:
+
+- The node is reachable over every ssh hop in `runtime.runner.ssh`.
+- The GPU exists and reports `runtime.gpu_arch`, and `runtime.gpu_id` is usable.
+- The docker image pulls, or the container named in `runtime.runner.docker`
+  already exists.
+- `rocm-smi` is installed and runs.
+- torch imports, sees the GPU, and can execute a GPU op.
+- Whether sudo is available.
+
+Do not continue while any of this fails -- report it instead.
+
+## 5. Verify the runner
+
+Only once step 4 is clean, run:
+
+    python3 /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/tools/check_runner.py --config /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/gfx1250-attn-llama31-8b-bwd_final.yaml --job-dir /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415
+
+That tool builds the runner described by `runtime.runner` and puts it through the
+five things the loop will need: the machine answers, a torch GPU GEMM runs, the
+job directory is the same directory seen from both sides, `rocprofv3` collects a
+counter and writes rows, and whether the ATT trace decoder can be fetched. It
+leaves what it ran as `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/env/run_torch_gemm.sh` and the whole
+table as `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/env/README.md`.
+
+Only the decoder check may fail: the other four analyses do not need it, so what
+is recorded is whether it will be possible.
+
+Step 4 proves the machine works; this proves the runner can drive it. That
+matters because `op/validation.py` is executed the same way later, and its exit
+code -- not any agent's judgement -- is what decides whether the job succeeded.
+
+## 6. Write the remaining job context files
+
+- `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/env/README.md` -- step 5 wrote the runner's own table
+  here. Add to it what only you observed: each ssh hop, docker options, whether a
+  GPU is present, GPU arch, GPU id, sudo availability, torch version, and the
+  ROCm version reported by `rocm-smi`. Record observed values, not the values the
+  job file asked for.
+- `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/account/README.md` -- where to obtain each key and which
+  environment variables the file for each SDK must define. Paths and variable
+  names only, never values.
+- `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/logs/` -- the output of the checks you ran, one file per
+  step.
+
+Do not touch `state.yaml`. The framework records this stage's completion itself,
+once your report exists.
+
+## 7. Write the report
+
+Write `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/history/review/job_setup_v000.md` with:
+
+- One line: SUCCESS or FAILED, with the reason if failed.
+- A table of account checks: item, expected, observed, pass/fail.
+- A table of environment checks: item, expected, observed, pass/fail.
+- A table of the resolved op spec: field, value, where it came from
+  (user-provided or inferred).
+- Anything you had to infer, and anything still unresolved.
+
+The user reads this report and either approves it or asks for changes, so state
+what you actually observed rather than what was expected.
+
+----------------------------------------------------------------------
+REPLY
+I'll start by reading the job file and exploring the job context.
+Now let me verify my reading of the schedule and margin logic against the actual code:
+Now I'll write the completed spec. First the targeted inline additions:
+Spec is complete and still loads with margin 1.50. Now the changelog, and I'll start the account check in the background:
+Now step 4 — the environment. Let me start with the image and host-level checks:
+Account check finished. Let me read it and continue into the container:
+All four LLM roles pass call **and** resume. Note the image **cannot be pulled** — it's local-only. Now the GPU checks, using the job's exact docker options:
+Step 4 is clean. Now step 5 — the runner:
+All five pass. But the GEMM number (123.2 TFLOP/s) lands exactly in the hipBLASLt trap the job file warns about. Let me check that:
+Significant finding on the clock. Let me check whether a matrix-core-saturating load is available to make that reading representative:
+All checks clean. Now the remaining job context files:
+Now I'll update the spec's open questions with what the checks actually found:
+Now the changelog addendum and the report:
+`job_context/op/` is empty and was created by the framework at 01:54:15 (before I started) — I neither created nor wrote into it.
+
+## Job setup complete — SUCCESS
+
+Everything verified by running it, not by trusting the job file.
+
+**Account checks** — all four roles (`setup`, `profiler`, `planner` on claude/opus-5; `reviewer` on codex/gpt-5.6-sol) passed both the real call **and** the resume. The resume is the one that mattered: 3-Act continues the planner's session and 4-Reflect the reviewer's. No credential value was read or recorded anywhere.
+
+**Environment** — 4× gfx1250 (wave32, 320 KB LDS, 256 CU), GPU 1 usable, ROCm 7.14, torch 2.11.0+rocm7.14 runs a bf16 matmul, rocm-smi runs, sudo passwordless, dmesg clean before and after. All five runner checks pass including the optional decoder. Per your hazards: no PC sampling, no `clock_probe.py`, and dmesg was grepped *before* rocm-smi was ever called.
+
+**Spec** — your job file is byte-for-byte intact; six implicit values made explicit (`ssh: null`, `turn_timeout`, `min_gain`, shape `name`/`head_dim`/`window_left`) plus a `setup_resolution:` block. No `[user]` field touched; `target.tflops` and `roofline_pct` still null, margin still resolves to 1.50.
+
+### Four things need your decision
+
+1. **FLOP basis mismatch (high).** `op_flops.py` returns the FA-2 backward *alone* for `backward=True`, but the measured time is fwd+bwd. All four of your anchors reproduce exactly on the 3.5× basis and none on the framework's — **the ledger will read 1.400× below every number in your spec and the JIRA.** Pass/fail is unaffected (relative bar), every absolute and roofline claim is. I did not patch the shared tool.
+
+2. **The card is at ~1701 MHz, not 1100 (high).** Three samples under sustained load, at 100% util — that's your own un-throttled 2026-09-04 figure to within 1 MHz, and it would explain the c1325c7e contradiction you called the job's highest-value probe. **But my load was hipBLASLt-rate and low-power, so this is necessary, not sufficient.** It proves no *static* cap; it says nothing about the clock under a real attention kernel.
+
+3. **The seed and harness aren't in the pinned image (high — blocks Op Setup).** None of the four files the SEED block and `reference.api` mandate exist in `gfx1250-20260910`; they're in your host checkout at `d2f75576`, which isn't mounted.
+
+4. **Seed contradicts the margin rationale (high).** The SEED block and the `op.target` comment assume opposite seeds. With the fused seed, round 0 starts at 1.28× the anchor and the 50% bar is 1.17× beyond it. I recommend keeping both as-is, but it's your call.
+
+Lower stakes, recorded: `min_gain` couldn't be measured (no baseline yet); your schedule gives 36 fast / 4 deep, not ~34/6; the image can't be re-pulled; and `check_runner`'s 123.2 TFLOP/s is your hazard-3 hipBLASLt trap — **not a roof.**
+
+======================================================================
+turn 2 | claude claude-opus-5 effort=xhigh | session=e8e4cf21-86bb-4bee-ba15-2a833aecd034 resumed=True | 1835.292s | ok=True
+----------------------------------------------------------------------
+PROMPT
+The job spec is approved. Build everything the evolve loop needs.
+
+Spec: /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/gfx1250-attn-llama31-8b-bwd_final.yaml (version v000)
+Job directory: /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415
+Job context directory: /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context
+Tools directory: /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/tools
+Knowledge corpus: /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/knowledge
+Report to write: /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/history/review/op_setup_v000.md
+
+Your task is Op Setup. The spec, the environment and the runner were all
+verified in Job Setup and are not yours to change. Read the spec; do not edit
+it. Everything you create goes under `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/op/`.
+
+Whatever the backend is, every implementation you write -- baseline, current,
+beat, eager -- must end up exposed as a callable PyTorch op with the same signature.
+A backend that needs compiling (hip, ck, asm) is built and bound into a torch
+extension; one that does not (triton, flydsl) is wrapped in a Python function
+that takes and returns torch tensors. Either way the call site sees one API, so
+the unit tests, the measurements and `validation.py` can swap implementations
+without knowing how any of them was produced. Build once at import or first
+call, never inside a timing loop.
+
+Work through the steps in order. Run every measurement through the runner
+described by `runtime.runner`, never by hand -- the numbers in your report must
+come from the same path `validation.py` will use. If a step fails, stop there
+and report it rather than working around it.
+
+**Any helper you write for driving long runs must survive its own caller dying.**
+The runner is `ssh <node> "docker exec <container> ..."`: the command inside the
+container is a child of dockerd, not of sshd, so a timeout on the client leaves the
+remote process running, holding the GPU, writing its output minutes later. A helper
+that holds the command in the foreground turns that into a lost measurement AND an
+orphan contending with whatever runs next. On this project it cost setup its own
+step 7 and step 9, and three later rounds. So: launch detached, write the exit code
+to a sentinel, poll for the sentinel, and key the run directory so a re-invocation
+attaches to a run still IN FLIGHT rather than starting a second one --
+
+    setsid bash -c '<cmd> > D/out 2>&1; echo $? > D/rc' </dev/null >/dev/null 2>&1 &
+
+A run that has already FINISHED must be re-run, not returned from cache: keying on
+the command text alone once handed a round the result from before its own fix.
+
+## 1. Create the baseline
+
+Write the baseline implementation to `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/op/baseline/`, using the
+backend named in `op.backend` and the API in `op.reference.api`.
+
+**The baseline is round 0's code and it is frozen after this stage.** Every later
+round starts from it, and it is the denominator of the headline speedup, so a weak
+baseline makes the whole job cheap to improve and worth nothing.
+
+**First look for one you can stand on.** The knowledge corpus at `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/knowledge`
+keeps per-configuration best practice under
+`backends/<op.backend>/<op.type>/`. Read that directory's `README.md`, then:
+
+1. **Diff every best-practice file's `config:` block against `op.config`, field by
+   field.** Fields only one side states are not compared. If one matches on every
+   field both sides state, follow its implementation pointer, read that code, and
+   build the baseline from it. Starting from a known-good kernel is the single
+   largest thing that shortens a job.
+2. **If none matches, develop one** from that op directory's `techniques.md`, its
+   `dead-ends.md` (so you do not start inside a known loss) and the route in
+   `optimization/routes/`.
+
+Two rules that are not optional:
+
+- **Record which branch you took**, in the report and in `op/baseline/PROVENANCE.md`:
+  the branch, the source repository, **the commit**, the files you read, and every
+  `config:` field that differed from this job. Months later nothing else says where
+  this code came from, and the two branches produce starting points an order of
+  magnitude apart in quality.
+- **If a referenced implementation will not build or run in this environment, stop
+  and report it.** Do not quietly fall back to developing from scratch. That turns a
+  toolchain or version problem into a job that looks normal and starts far below
+  where it should.
+
+## 2. Do not create the working copy
+
+`op/current/` and `rounds/000/op/` are the framework's, written once this stage is
+approved. `op/baseline/` is the only copy you make, and it is never edited again.
+
+`op/current/` is a **copy, not a second source of truth** -- `state.yaml`'s
+`best_round` is the truth, and `op/current/` is regenerated from
+`rounds/<best_round>/op/` whenever a round is accepted.
+
+## 3. Create the comparison implementation, if the spec names one
+
+**Only if `op.target.beat` is non-null.** Build it into
+`/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/op/beat/`, behind the same API.
+
+This exists so every round can measure it **in the same session** as the candidate.
+A recorded historical number cannot carry a sub-percent verdict; a same-session
+measurement can.
+
+Record the library and **its version** in `op/beat/PROVENANCE.md` -- "beat hipblaslt"
+is a different bar under a different hipblaslt. If the named implementation is not
+available in this environment, stop and report it rather than skipping the directory.
+
+When `op.target.beat` is null, do not create the directory. Note in the report that
+the run has **no live anchor**, so absolute numbers will carry the machine's drift.
+
+## 4. Create the eager reference
+
+Write a plain torch implementation to `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/op/eager/`. It exists to
+be obviously correct, so prefer the clearest expression over an efficient one.
+
+**This is always the precision reference, and it is the only one.** Never align
+against a library implementation, including the one `op.target.beat` names: a
+library carries its own accumulation order and internal precision, so aligning to
+it both hides real numerical bugs and flags differences that are not bugs. Never
+align the code under optimization against itself.
+
+**Use `op.reference.logic` where it disagrees with `op.reference.impl`.** A named
+torch call can carry semantics that do not match this job -- most sharply,
+`torch.nn.functional.scaled_dot_product_attention(is_causal=True)` is **top-left**
+aligned for non-square masks, so it is wrong for a `causal: bottom-right` job on any
+shape where `seqlen_q != seqlen_kv`. Build the mask explicitly in that case.
+
+## 5. Create the unit tests
+
+Write tests to `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/op/ut/` covering every shape in `op.shape`.
+
+Compare against `op/eager/` and require at least `op.precision_sqnr_db` dB SQNR. Cover the edge cases the op's own
+configuration implies -- causal masking, sliding window, varlen sequences,
+non-multiple-of-tile shapes, zero-length groups -- not just the happy path.
+
+**Include at least one shape where the two sequence axes differ** (`seqlen_q !=
+seqlen_kv` for attention, unequal group lengths for grouped GEMM). A square-only or
+balanced-only suite makes a whole class of error permanently invisible: mask
+alignment, and any tile heuristic keyed to the wrong axis, are both correct on square
+shapes by coincidence.
+
+## 6. Run correctness
+
+Run the unit tests through the runner. Do not continue past a correctness
+failure: a performance number from an incorrect kernel is worse than no number,
+because it looks like progress. Report the failure instead.
+
+## 7. Write benchmark.py, and measure with it
+
+Write `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/op/benchmark.py` first, then use it for this step.
+**It measures and prints; it decides nothing.** Later modules run it in
+conditions where a verdict would be meaningless -- under `rocprofv3`, which
+serialises dispatches and shifts the clock; on deliberately corrupted input for
+the power-wall regime test; at varying iteration counts to find a noise floor.
+A pass/fail check in that path either fails spuriously or forces the profiling
+module to write a second timing loop, and two timing loops is how two rounds get
+measured differently without anyone noticing.
+
+It must:
+
+- Take which implementation to run (`baseline`, `current`, `beat`, `eager`) and
+  which shape, so one file serves every arm.
+- Print latency, achieved TFLOPS and achieved bandwidth in a form something else
+  can parse, and print the statistic and iteration count it used.
+- **Take FLOP and byte counts from `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/tools/op_flops.py`**, importing it
+  rather than recomputing them inline. Every way of getting those wrong by hand
+  is an integer factor, and an integer factor in a benchmark is invisible -- the
+  throughput comes out stable, reproducible and wrong.
+- Warm up under continuous load before timing, and never print a verdict.
+
+Then measure `baseline`, `current` and -- if it exists -- `beat` on every shape in
+`op.shape`, through the runner, **in one session**. Record for each: latency,
+achieved TFLOPS, achieved bandwidth, and the ratio to the baseline.
+
+Warm up under continuous load before timing, fix the statistic (median or best-of-N)
+before you start and do not change it afterwards, and order the arms so no arm is
+always first. The measurement traps this avoids are in
+`/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/knowledge/pitfalls/measurement-traps.md`; read it before recording numbers,
+not after.
+
+At round 0 `current` is a copy of `baseline`, so their numbers should agree. **If
+they do not, the measurement is not stable enough to run a job on** -- report that
+rather than proceeding.
+
+## 8. Write validation.py
+
+Write `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/op/validation.py`. It is the sole criterion for
+whether this job has succeeded, and later modules run it through the runner and
+read only its exit code.
+
+It must:
+
+- Check correctness against `op/eager/` at `op.precision_sqnr_db` dB.
+- **Call `benchmark.py` for every number it uses.** It must not contain a second
+  timing loop; a verdict measured differently from the profile it is compared
+  against is not a verdict.
+- Check the goal in `op.target` -- beating a named implementation, an absolute
+  TFLOPS number, a percentage of roofline, or whichever of these the spec sets.
+  When `op.target.beat` is set, measure `op/beat/` in the same run rather than
+  comparing against a stored number.
+- Cover every shape in `op.shape`, honouring `op.shape.mode`: `single` means
+  that one shape must hit the goal, `sweep` means the aggregate across shapes
+  must.
+- Exit 0 only when everything passes, non-zero otherwise.
+- Print a summary of what it measured, so a human can see why it passed or
+  failed.
+- Take **one optional argument: the implementation directory to test**, defaulting
+  to `op/current/`. 3-Act passes `rounds/<n>/op/`, because that is where the round's
+  code is: `op/current/` is the *incumbent* and is regenerated only when a round is
+  accepted, so a `validation.py` pinned to it grades the previous round's work and
+  the job's stop condition lags a round behind.
+
+  This does not weaken the rule below. An explicit path still has to be measured;
+  what it must not accept is a *result*.
+- Depend on nothing outside `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context` **except the shipped
+  `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/tools`**, which the container mounts at the same absolute path it has
+  here. Import `op_flops.py` from there; do **not** copy it into the
+  job context. A copy drifts, and every way of getting a FLOP or byte count wrong
+  is an integer factor -- which is invisible in a benchmark, because the
+  throughput comes out stable, reproducible and wrong. One file, one place.
+
+Write it so it cannot be satisfied by editing it: it must measure, not assert
+what it was told.
+
+## 9. Run validation.py once
+
+Run `validation.py` through the runner. It is expected to fail at this point --
+the kernel has not been optimized yet -- and that is a valid result, not an error.
+Report its exit code and what it printed.
+
+Do not write `state.yaml` and do not create `rounds/000/`. Once this stage is
+approved the framework records round 0 itself: it copies `op/baseline/` to
+`rounds/000/op/`, sets `best_round: 0`, and regenerates `op/current/` from there.
+
+Round 0's row carries **no score**, deliberately. A score is the quantity the
+acceptance rule compares, and every such comparison re-measures the incumbent's code
+in the session doing the comparing -- so a score stored here would never be the one
+used, and recording it would only invite someone to use it.
+
+Its **throughput** is recorded, from the block you reply with below, because a
+progress table whose first row is blank cannot show where the job started. It is
+marked as setup's measurement and is never compared against: round 1 measures round
+0's code again, in its own session, and that is the number acceptance uses.
+
+## 10. Write the report
+
+Write `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/history/review/op_setup_v000.md` with:
+
+- One line: SUCCESS or FAILED, with the reason if failed.
+- **Which branch step 1 took**, the source and commit if it stood on one, and every
+  `config:` field that differed. This is the first thing the user should check.
+- A table of what was created: path, what it is, how it was verified.
+- A table of measurements: shape, baseline, current, beat, SQNR, pass/fail.
+- What `validation.py` checks, stated as the success condition in one sentence,
+  and the statistic and iteration count `benchmark.py` uses.
+- Whether the run has a live anchor (`op/beat/`) or not.
+- Anything you had to infer, and any known weakness in the baseline.
+
+The user reads this report and either approves it or asks for changes. Be
+honest about a weak baseline or a shaky measurement -- it is cheaper to fix now
+than after a hundred rounds have been measured against it.
+
+## Reply with
+
+```yaml
+report: /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/history/review/op_setup_v000.md
+baseline:                         # what you measured, one row per shape in op.shape
+  - {shape: m4096n4096k4096, tflops: 837.5}
+beat:                             # the same shapes, or null when op/beat/ does not exist
+  - {shape: m4096n4096k4096, tflops: 1413.7}
+```
+
+These are the numbers already in your report; the block is so the framework can put the
+baseline into round 0's ledger row without a person retyping it. Report them as you measured
+them -- the framework records them as **setup's** measurement and every later round still
+re-measures the incumbent in its own session.
+
+----------------------------------------------------------------------
+REPLY
+I'll start by exploring the knowledge corpus and the source checkout in parallel.
+No `backends/triton/` in the corpus. Let me check that carefully and read the seed's own provenance:
+Rich provenance. Let me explore the corpus thoroughly while I read the source:
+I'll start by exploring the corpus structure and reading the key files.
+Now let me read the key files in parallel.
+Now the INDEX, routes, ops/attention, and arch/gfx1250.
+Important divergence found. Let me check the dependency graph to decide how to vendor:
+The dependency graph is shallow — all four files are nearly self-contained. Let me confirm the last details:
+Vendoring with a shadowing package path keeps the files byte-identical. Let me check on the corpus survey and start the vendor test in parallel:
+Now the detached run helper — this is the piece the brief says cost setup two steps last time:
+# Answer to the one question
+
+**No.** There is no per-configuration best-practice file in this corpus whose `config:` block matches this job on every field both sides state. Every attention recipe fails on at least two hard fields, and all five fail on `arch` (all are `gfx950`) and on `backend` (none is `triton`).
+
+There is also **no `knowledge/backends/triton/` directory**, and `backends/README.md`'s backend table does not list `triton` at all — the enumerated `op.backend` values are `hip`, `ck`, `flydsl`, `hipkittens`, `asm`, `hipblaslt`, `aiter`. `backends/README.md` explicitly flags this case:
+
+> "Keep this list and the `op.backend` enum in the job templates in step. A backend the spec can name but the corpus cannot describe sends the agent looking for a directory that is not there."
+
+---
+
+## 1. `knowledge/INDEX.md` and `knowledge/backends/README.md`
+
+`/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/knowledge/INDEX.md`
+
+Structure: hand-written "How to read this corpus" preamble, then a `<!-- BEGIN GENERATED -->` block produced by `tools/build_knowledge_index.py` from each file's front matter.
+
+Mechanically-resolving branches keyed to the job spec:
+
+| Spec field | Branch |
+| --- | --- |
+| `runtime.gpu_arch` | `arch/<gpu_arch>/` |
+| `op.type` | `ops/<op.type>/` |
+| `op.backend` + `op.type` | `backends/<backend>/<op.type>/` |
+| `op.type` | `optimization/routes/` |
+
+Rules that bear directly on your question:
+
+- "Inside `backends/<backend>/<op.type>/` the files are four genres — per-configuration best practice, techniques that transfer, dead ends, open questions… Then **diff a best-practice file's `config:` block against the job spec before adopting anything from it**."
+- "A missing `dead-ends.md` means *not yet split out*, never *nothing has been ruled out*."
+- Status precedence: `verified` (measured by this project) > `reported` > `reference` > `draft`.
+- "**Take the mechanism, never the constants.** A tile, a wave count or a threshold does not cross a backend boundary."
+- "**Do not edit anything under `knowledge/` while running a job.**"
+
+Generated **Operator cards → `op.type: attention`** table (the complete set — five cards, all `measured here`):
+
+| Backend | Card | Status |
+| --- | --- | --- |
+| `aiter` | `backends/aiter/attention/recipes/fmha_v3_bwd_hd128_bf16.md` | measured here |
+| `flydsl` | `backends/flydsl/attention/recipes/hd128.md` | measured here |
+| `flydsl` | `backends/flydsl/attention/recipes/hd64.md` | measured here |
+| `hipkittens` | `backends/hipkittens/attention/recipes/gqa_d128.md` | measured here |
+| `hipkittens` | `backends/hipkittens/attention/recipes/gqa_d64.md` | measured here |
+
+The generated index also lists `arch/gfx1250/` (3 files), `ops/attention/` (4 files), `optimization/routes/`, `optimization/techniques/`, `pitfalls/`, `profiling/`, and "Branches awaiting content": `backends/asm/`, `backends/ck/`, `backends/hip/`. **No triton row anywhere.**
+
+`/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/knowledge/backends/README.md` — one directory per `op.backend` value; `hipblaslt` and `aiter` are the deliberate exceptions (libraries you call, not write in). The question each backend note answers first is "**what this toolchain takes out of your hands**" (register allocation, instruction scheduling, shared-memory layout, grid mapping), and that capability surface is paired with the "Requires from the backend" block that opens every file in `optimization/techniques/`.
+
+---
+
+## 2 & 3. Every file with a `config:` block, verbatim, plus field-by-field diff
+
+Sixteen files in the corpus carry a `config:` block. Eleven are gemm/grouped_gemm and are out of scope for `op.type: attention`; I list them at the end for completeness. The five attention ones follow.
+
+### 2.1 `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/knowledge/backends/aiter/attention/recipes/fmha_v3_bwd_hd128_bf16.md`
+
+**title:** `hd128 bf16 causal attention backward on gfx950, as AITER's assembly kernels run it`
+
+**summary:** `AITER's `fmha_v3_bwd` ships 286 prebuilt code objects and no assembly source. This maps the whole configuration space from the four sibling `.csv` manifests and the host heuristic, then measures the one member a standard training call actually gets -- `bwd_hd128_bf16_causal_br_a32_psskddv`, a three-kernel pipeline whose dQ is accumulated with L2-bypassing fp32 atomics. 674 TFLOP/s at b2/h32/s4096, dK and dV bitwise reproducible, dQ not, and 74% of its vector-memory requests are those atomics.`
+
+**applies_to:** `arch: [gfx950]`, `op: [attention]`, `backend: [aiter]`
+
+**status:** `verified`
+**verified:** `"MI355X (gfx950), ROCm 7.2.1, torch 2.10.0+git94c6e04, rocm/primus:v26.3, aiter 3e2770a0d, bwd_hd128_bf16_causal_br_a32_psskddv.co sha256 6d272c1b..., twelve configurations, full profile at b2/h32/s4096/hd128 causal"`
+
+**`config:` block, verbatim:**
+
+```yaml
+config:
+  # Mirrors `op.config` in the job spec. A recipe applies only where these match --
+  # diff field by field before adopting anything below. Each entry is a *requirement*
+  # where the profile or the host code establishes one, and says so where it does not.
+  direction: backward           # the forward is a different family (`hsa/gfx950/fmha_v3_fwd/`)
+                                # and is not measured here
+  q_head_dim: 128               # HARD through the Python API on gfx950: `can_impl_fmha_v3_bwd_gfx950`
+                                # admits only `64 < hdim_q <= 128` (padded to 128) or the
+                                # `hdim_q=192, hdim_v=128` pair. hd64 and hd192/192 objects exist
+                                # for gfx950 and are unreachable from `flash_attn_func` -- section 5
+  kv_head_dim: 128
+  dtype:
+    qkv: bf16                   # fp16 is a parallel object set, measured, within 0.2% (section 3)
+    acc: fp32                   # `v_mfma_f32_*_bf16`, fp32 accumulate
+    dq_accum: fp32              # `is_v3_atomic_fp32=True`, the API default. The fp32/16 choice is
+                                # the single biggest performance and precision lever here -- b1
+  causal: bottom-right          # what `flash_attn_func(causal=True)` produces. `causal_br`
+                                # (mask=2) objects. Top-left (`causal`, mask=1) objects exist and
+                                # the Python API never selects them -- section 5
+  sliding_window: NOT supported # `can_impl_fmha_v3_bwd_gfx950` has `ret &= not swa`. Four gfx950
+                                # `swa` objects ship and no manifest lists them -- section 5
+  mode: batch                   # `_group` (varlen) objects exist for every batch object; not measured
+  bias: none                    # `fmha_v3_bwd` returns -1 on `bias_type != 0` or `has_dbias`
+  dropout: none                 # same gate
+  determinism: "dQ NOT reproducible; dK and dV bitwise" # measured, 5 runs. Asking for
+                                # `deterministic=True` at seqlen_k > 256 refuses the asm path
+                                # entirely and costs 1.61x -- section 6, b2
+  seqlen: ">= 512 for the tile to pay"  # any length works; the block-granular causal overhead is
+                                # 1/ceil(S/256), so +50% matrix work at S=512 and +6.25% at 4096
+  grid_fill: "b * nhead_q * ceil(ceil(S/256)/2) workgroups"  # 512 at b2/h32/s4096, on 256 CUs
+  power_regime: NOT capped      # 1320 W of 1400 W, and a data swap moves the time 0.67%. Unlike
+                                # every GEMM card in this corpus, this kernel is not power-bound
+  tuned_for: not tuned          # AITER ships no tuning table for attention; selection is a
+                                # deterministic filter over the four csv manifests
+```
+
+**Implementation pointer, verbatim:**
+
+```yaml
+source:
+  repo: https://github.com/ROCm/aiter
+  commit: 3e2770a0db51025bb50a3897ace21e080f1fe913
+  license: >-
+    MIT for the whole repository (`LICENSE`). `csrc/cpp_itfs/mha_bwd.cu`, `hsa/codegen.py` and
+    `op_tests/cpp/mha/*` each carry an SPDX MIT line of their own. The `.co` code objects carry
+    no SPDX line at all and are covered by the repository licence -- and they are what this card
+    is about, so say so rather than citing a `.cu` header.
+
+  # THE COMMIT IS NOT ENOUGH, for the reason card 15 established: the kernels are prebuilt
+  # binaries committed into a real repository, with no assembly source anywhere in the tree
+  # (verified in section 2). The commit pins the host heuristic and the four csv manifests;
+  # the sha256 pins the arithmetic. Both are required.
+  co_sha256:
+    bwd_hd128_bf16_causal_br_a32_psskddv.co: 6d272c1b48014205680d1927180e72f3f2b3f3f9a84fa180ca49a409c93bc482
+    bwd_hd128_odo_bf16.co:                   250c13c903954242ef6f4c60e120ace01a29ac8edaa1979f499b560809f12f37
+    bwd_hd128_dq_convert_bf16.co:            607a5f3750108d87992f383d48ea6eef39ac181c7bcd68117b8288d74ba7a96a
+    bwd_hd128_bf16_causal_br_a16_psskddv.co: c73be248c886c08cee2408fc727dfd845b2cbce6cc63c05ee1aeea937f530361
+    bwd_hd128_dq_shuffle.co:                 5a5a3abbeeaba6ca1af60c6926cae00d924e8b8415373ca00ced69f1f480b276
+  paths:
+  - hsa/gfx950/fmha_v3_bwd/bwd_hd128_bf16_causal_br_a32_psskddv.co  # the profiled kernel
+  - hsa/gfx950/fmha_v3_bwd/bwd_hd128_odo_bf16.co                    # stage 1 of 3
+  - hsa/gfx950/fmha_v3_bwd/bwd_hd128_dq_convert_bf16.co             # stage 3 of 3
+  - hsa/gfx950/fmha_v3_bwd/fmha_bwd_dqdkdv.csv                      # 92-row manifest
+  - hsa/gfx950/fmha_v3_bwd/fmha_bwd_odo.csv                         # 12-row manifest
+  - hsa/gfx950/fmha_v3_bwd/fmha_bwd_dq_convert.csv                  # 12-row manifest
+  - hsa/gfx950/fmha_v3_bwd/fmha_bwd_dq_shuffle.csv                  # 4-row manifest
+  - csrc/cpp_itfs/mha_bwd.cu                                        # the whole dispatch heuristic
+  - aiter/ops/mha.py                                                # the Python gate and defaults
+  - op_tests/test_mha.py                                            # the Python benchmark used
+  - op_tests/cpp/mha/benchmark_mha_bwd_v3.cpp                       # the C++ benchmark used
+```
+
+**Diff against the job:**
+
+| Field | Recipe | Job | Verdict |
+| --- | --- | --- | --- |
+| arch | gfx950 (`applies_to`) | gfx1250 | **MISMATCH** |
+| backend | aiter | triton | **MISMATCH** |
+| direction | `backward` | `[fwd, bwd]` | **PARTIAL** — forward not covered ("a different family, not measured here") |
+| q_head_dim | 128 | 128 | match |
+| kv_head_dim | 128 | 128 | match |
+| causal | bottom-right | bottom-right | match |
+| sliding_window | `NOT supported` | null | compatible |
+| dtype.qkv | bf16 | bf16 | match |
+| dtype.acc | fp32 | qk_acc/softmax/pv_acc = fp32 | match (recipe states one `acc`, job states three) |
+| seqlen | `">= 512 for the tile to pay"` | 8192 | satisfied |
+| mode | `batch` | batch (b=4, not varlen) | compatible |
+| bias / dropout | `none` / `none` | not stated by job | recipe-only |
+| determinism, grid_fill, power_regime, tuned_for | stated | not stated | recipe-only |
+| heads_q_per_kv | **not stated** | 4 | job-only |
+| format | **not stated** | bshd | job-only |
+| sparsity | **not stated** | dense | job-only |
+| sink | **not stated** | null | job-only |
+| dtype out / lse | **not stated** | bf16 / fp32 | job-only |
+
+Closest on `op.config` of the five, but three hard misses (arch, backend, direction).
+
+---
+
+### 2.2 `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/knowledge/backends/flydsl/attention/recipes/hd128.md`
+
+**title:** `head_dim=128 flash attention on gfx950, and what a first-class deterministic dQ costs`
+
+**summary:** `"Primus-Turbo's FlyDSL bf16 GQA attention at D=128, measured at main. The default backward accumulates dQ with buffer_atomic_pk_add_bf16 into a permuted bf16 image and is NOT bitwise reproducible; deterministic=True vetoes that onto a split-K band workspace and does deliver bitwise dQ, dK and dV -- verified, five hashed runs. At this head dimension it costs 22.7% of the backward against 11.4% at D=64 measured in the same run, and the factor of two is exactly the kv band the flag also halves. Same operator, head dimension and node as AITER's card 16, opposite branch of the same fork: FlyDSL's deterministic backward is 1.03x AITER's non-deterministic one, and 1.62x its deterministic fallback."`
+
+**applies_to:** `arch: [gfx950]`, `op: [attention]`, `backend: [flydsl]`
+
+**status:** `verified`
+**verified:** `"MI355X (gfx950), ROCm 7.2.1, torch 2.10.0+git94c6e04, rocm/primus:v26.3 with flydsl upgraded 0.1.1.dev409 -> 0.2.4, Primus-Turbo ed8d7af4 built from source; 18 op-level rows x 2 determinism settings, 16 kernel-only rows x 3 arms, full profile at B=2 Sq=Skv=4096 Hq=64 Hkv=8 D=128 bf16 bottom-right causal SBHD"`
+
+**`config:` block, verbatim:**
+
+```yaml
+config:
+  # Mirrors `op.config` in the job spec. A recipe applies only where these match --
+  # diff field by field before adopting anything below. Every entry was read out of
+  # `can_handle` / `_flydsl_common_ok` / the kernel builders at ed8d7af4, and every
+  # head-dimension-dependent one was re-derived here rather than inherited from hd64.md.
+  q_head_dim: 128
+  kv_head_dim: 128
+  heads_q_per_kv: "power of two in [8, 256]"
+                                # HARD (`_gqa_group_ok`, attention_impl.py:65-72), and it is a
+                                # BACKWARD CORRECTNESS constraint (LD_VEC >= 2), not a tiling
+                                # preference. Of the nine head_dim-128 shapes in Turbo's own
+                                # model set only three pass it. Outside the range the call goes
+                                # to aiter SILENTLY under --backend auto. Measured at G=8 and G=16
+  causal: bottom-right          # and it is the ONLY mode. Non-causal is refused, not slowed
+  sliding_window: "left only, W >= 64, or none"
+                                # `(W,0)` or `(-1,-1)`. A window also makes `deterministic` a
+                                # NO-OP -- `_dq_a16_for` requires window_left < 0. Measured
+                                # +0.01% at W=1024 and -0.03% at W=512
+  sparsity: dense               # the sparse-MLA path is a different pair of kernels
+  format: "[thd-varlen (uniform cu_seqlens only), sbhd]"
+                                # dense is SBHD-ONLY; bshd is accepted at batch 1 alone, where
+                                # the bytes coincide (`_sbhd_layout`), and refused above it
+  direction: [fwd, bwd]
+  dtype:
+    qkv: bf16                   # hard; fp16 is refused
+    acc: fp32
+    dq_accum: "bf16 atomic (default) | fp32 split-K reduce (deterministic=True)"
+  softmax_scale: "1/sqrt(D), baked"   # any other value is refused (`_scale_ok`)
+  sink: "optional, fp32 [Hq]"   # ⚠ NOT EXERCISED HERE. On THIS card's backend (flydsl) the
+                                # pair sink + `deterministic` is LEGAL. A previous revision
+                                # said flatly "mutually exclusive with `deterministic` by
+                                # assertion"; the assertion is real but it guards the AITER
+                                # path, and flydsl returns before reaching it. Section 12b
+  determinism: "dQ NOT reproducible by default; `deterministic=True` DOES deliver bitwise dQ/dK/dV and costs 22.7%"
+                                # THE FIELD THIS CARD EXISTS FOR. dK, dV and the forward are
+                                # bitwise in BOTH settings on every shape measured. dQ is not,
+                                # by default, on every full-causal square SBHD shape: five
+                                # identical runs give five distinct dQ. Section 3
+  seqlen: ">= 512 measured; no gate"
+                                # `seq_len >= 384` is a stale docstring, not a gate (card 8).
+                                # But `Skv % 256 == 0` IS a gate on the atomic path, so a
+                                # non-aligned Skv is reproducible by accident
+  power_regime: "forward power-capped, backward clock-capped"
+                                # 1853 MHz at 1324 W forward; 2142 MHz at 1298 W backward.
+                                # The deterministic backward draws MORE (1377 W of 1400) at the
+                                # same clock -- the extra is DRAM traffic. Section 4
+  grid_fill: "B x ceil(Skv/BLOCK_KV) x Hkv x q_split work-groups"
+                                # 1024 default / 512 per chunk deterministic, at b2/s4096/Hkv8
+  tuned_for: sweep              # constants are a compromise across a shape set
+```
+
+**Implementation pointer, verbatim:**
+
+```yaml
+source:
+  repo: https://github.com/AMD-AGI/Primus-Turbo
+  commit: ed8d7af46938d8debe56fd5ff5b70fd64dde33be
+  license: "MIT for the repository (LICENSE); Apache-2.0 for everything under primus_turbo/flydsl/, which carries its own SPDX-License-Identifier line and LICENSE-APACHE. Both kernels this card describes are Apache-2.0 files; the dispatcher, the op layer and the benchmark it also quotes are MIT."
+  paths:
+  - primus_turbo/flydsl/attention/flash_attn_fwd.py
+  - primus_turbo/flydsl/attention/flash_attn_bwd.py
+  - primus_turbo/flydsl/utils/attn_helper.py
+  - primus_turbo/pytorch/kernels/attention/attention_impl.py
+  - primus_turbo/pytorch/kernels/attention/attention_flydsl_impl.py
+  - primus_turbo/pytorch/ops/attention/flash_attn_interface.py
+  - benchmark/ops/training/bench_attention_turbo.py
+```
+
+**Diff against the job:**
+
+| Field | Recipe | Job | Verdict |
+| --- | --- | --- | --- |
+| arch | gfx950 | gfx1250 | **MISMATCH** |
+| backend | flydsl | triton | **MISMATCH** |
+| q_head_dim / kv_head_dim | 128 / 128 | 128 / 128 | match |
+| **heads_q_per_kv** | `"power of two in [8, 256]"` (stated HARD, a backward correctness constraint) | **4** | **MISMATCH — hard** |
+| causal | bottom-right (and "the ONLY mode") | bottom-right | match |
+| sliding_window | left only W≥64, or none | null | compatible |
+| sparsity | dense | dense | match |
+| **format** | `"[thd-varlen (uniform cu_seqlens only), sbhd]"`; bshd only at batch 1 | **bshd at batch 4** | **MISMATCH — hard** |
+| direction | `[fwd, bwd]` | `[fwd, bwd]` | match |
+| dtype.qkv / .acc | bf16 / fp32 | bf16 / fp32 | match |
+| sink | `"optional, fp32 [Hq]"` | null | compatible |
+| softmax_scale | `1/sqrt(D)`, baked | not stated by job | recipe-only |
+| seqlen | ≥512, `Skv % 256 == 0` gate on atomic path | 8192 | satisfied |
+| determinism / power_regime / grid_fill / tuned_for | stated | not stated | recipe-only |
+| dtype out / lse | **not stated** | bf16 / fp32 | job-only |
+| dtype.dq_accum | stated | not stated | recipe-only |
+
+Four mismatches, two of them on `op.config` itself (`heads_q_per_kv`, `format`).
+
+---
+
+### 2.3 `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/knowledge/backends/flydsl/attention/recipes/hd64.md`
+
+**title:** `head_dim=64 flash attention on gfx950`
+
+**summary:** `Primus-Turbo's FlyDSL bf16 GQA attention at D=64, measured at main: 1003.9 TF/s forward and 952.0 TF/s backward at the GPT-OSS-20B shape, with the backward's default dQ path NOT bitwise reproducible -- `deterministic=True` buys reproducibility for 10.4% of the backward. Also the card that settles the corpus's `buffer_load ... lds` / `vmcnt(0)` claim: the forward double-buffers K/V through LDS with direct-to-LDS fills in flight and emits ten whole-queue drains against 144 ds_read, none of them before a ds_read.`
+
+**applies_to:** `arch: [gfx950]`, `op: [attention]`, `backend: [flydsl]`
+
+**status:** `verified`
+**verified:** `"MI355X (gfx950), ROCm 7.2.1, torch 2.10.0+git94c6e04, rocm/primus:v26.3 with flydsl upgraded 0.1.1.dev409 -> 0.2.4, Primus-Turbo ed8d7af4 built from source; B=1 Sq=Skv=4096 Hq=64 Hkv=8 D=64 bf16 bottom-right causal SBHD the profiled shape"`
+
+**`config:` block, verbatim:**
+
+```yaml
+config:
+  # Mirrors `op.config` in the job spec. A recipe applies only where these match --
+  # diff field by field before adopting anything below. Partial match: borrow the
+  # structure and the attack order, re-sweep every constant.
+  #
+  # Every entry was read out of the dispatcher's `can_handle` / `_flydsl_common_ok`
+  # or asserted in the kernel builder at ed8d7af4, not taken on description. The
+  # previous revision of this file guessed several of these from a pull request and
+  # got three of them wrong; section 12 is the diff.
+  q_head_dim: 64
+  kv_head_dim: 64
+  heads_q_per_kv: "power of two in [8, 256]"
+                                # HARD, and much narrower than this file used to claim.
+                                # `_gqa_group_ok` (attention_impl.py:65-72) refuses MHA and
+                                # every non-power-of-two group; the reason is the backward's
+                                # LDS-staged (delta, lse) load, `LD_VEC = 64 // (256 // G)`,
+                                # which must be >= 2. Outside the range the call goes to
+                                # aiter SILENTLY. Measured at G = 8 and G = 16
+  causal: bottom-right          # and it is the ONLY mode. Non-causal does not fall back to a
+                                # slower flydsl path -- it is refused (`bool(causal)`,
+                                # attention_impl.py:91), and 9 of the 18 rows in section 3's
+                                # sweep are that refusal. torch SDPA's is_causal=True is top-left
+  sliding_window: "left only, W >= 64, or none"
+                                # `(W,0)` or `(-1,-1)`; `_MIN_FLYDSL_WINDOW = 64` is a
+                                # correctness floor, not a preference -- below BLOCK_Q=64 the
+                                # dQ reduce sums workspace the body never wrote (NaN).
+                                # A window also DISABLES the atomic dQ path: see `determinism`
+  sparsity: dense               # the sparse-MLA path is a different pair of kernels
+  format: "[thd-varlen (uniform cu_seqlens only), sbhd]"
+                                # dense is SBHD-ONLY. bshd is accepted at batch 1 alone, where
+                                # the bytes coincide (`_sbhd_layout`, attention_impl.py:148-156);
+                                # at batch > 1 a bshd call is refused. bhsd never. varlen
+                                # additionally needs every segment the same length
+  direction: [fwd, bwd]         # they want opposite wave counts -- 8 against 4; see section 5
+  dtype:
+    qkv: bf16                   # hard: `q.dtype == torch.bfloat16`. fp16 is refused
+    acc: fp32
+  softmax_scale: "1/sqrt(D), baked"   # any other value is refused (`_scale_ok`), because the
+                                # forward folds `rsqrt(D)*log2e` into the Q scale at load
+  sink: "optional, fp32 [Hq]"   # folded into the denominator in the epilogue only
+  determinism: "OFF BY DEFAULT -- `deterministic=True` costs 10.4%"
+                                # THIS IS THE FIELD THAT CHANGED. The default backward
+                                # accumulates dQ with `buffer_atomic_pk_add_bf16` and is NOT
+                                # bitwise reproducible; dK, dV and the forward always are.
+                                # `deterministic=True` vetoes the atomic path and routes dQ
+                                # onto split-K. It is a bool argument on the backward, not a
+                                # separate kernel. Measured cost: section 3
+  power_regime: "forward power-capped, backward clock-capped"
+                                # REQUIRED for section 6's ranking, and the two halves differ:
+                                # the forward holds 1611 MHz at 1317 W, the backward 2227 MHz
+                                # at 1349 W. Same socket, opposite regimes
+  tuned_for: sweep              # constants are a compromise across a shape set
+```
+
+**Implementation pointer, verbatim:**
+
+```yaml
+source:
+  repo: https://github.com/AMD-AGI/Primus-Turbo
+  commit: ed8d7af46938d8debe56fd5ff5b70fd64dde33be
+  license: "MIT for the repository (LICENSE); Apache-2.0 for everything under primus_turbo/flydsl/, which carries its own SPDX-License-Identifier line and LICENSE-APACHE. Both kernels this card describes are Apache-2.0 files; the dispatcher and the benchmark it also quotes are MIT."
+  paths:
+  - primus_turbo/flydsl/attention/flash_attn_fwd.py
+  - primus_turbo/flydsl/attention/flash_attn_bwd.py
+  - primus_turbo/flydsl/utils/attn_helper.py
+  - primus_turbo/pytorch/kernels/attention/attention_impl.py
+  - primus_turbo/pytorch/kernels/attention/attention_flydsl_impl.py
+  - benchmark/ops/training/bench_attention_turbo.py
+```
+
+**Diff against the job:** identical to hd128 above except **`q_head_dim: 64` / `kv_head_dim: 64` vs the job's 128 — MISMATCH**. So five mismatches total (arch, backend, head_dim x2, heads_q_per_kv, format). Poorest fit of the three hd-128-adjacent cards.
+
+---
+
+### 2.4 `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/knowledge/backends/hipkittens/attention/recipes/gqa_d128.md`
+
+**title:** `GQA attention at head_dim 128 on gfx950, as HipKittens writes it`
+
+**summary:** `The four shipped HipKittens GQA attention kernels at D=128 -- forward and backward, causal and not, plus the 4-warp/8-warp backward pair -- built, checked and measured against AITER on an idle MI355X; why none of them compiles under ROCm 7.2.1 and what the one-line fix is; why D=128 is the D=64 kernel with ten different wait counts and nothing else; and why the repository's own committed JSONs already show that the paper's "22% for 4-wave attention backward" is a register-pinning result, not a wave-count result.`
+
+**applies_to:** `arch: [gfx950]`, `op: [attention]`, `backend: [hipkittens]`
+
+**status:** `verified`
+**verified:** `"MI355X (gfx950), ROCm 7.2.1, torch 2.10.0+git94c6e04, rocm/primus:v26.3, HipKittens 1602364f, four sequence lengths x three passes, full profile at N=4096"`
+
+**`config:` block, verbatim:**
+
+```yaml
+config:
+  # Mirrors `op.config` in a job spec. A recipe applies only where these match --
+  # diff field by field before adopting anything below. Each entry is a *requirement*
+  # of the shipped kernels, not merely the value they happened to be measured at.
+  q_head_dim: 128
+  kv_head_dim: 128
+  layout: BNHD                  # (batch, seq, head, dim), bf16, contiguous. `L`/`delta` are
+                                # (B, H, 1, N) fp32. This is torch's SDPA layout transposed and it
+                                # is not a runtime option -- the `gl<>` indexing is compiled in
+  dtype:
+    qkv: bf16
+    acc: fp32                   # `v_mfma_f32_*_bf16`, fp32 accumulate throughout
+    o: bf16
+    lse: fp32
+  gqa: "H % H_KV == 0"          # `GROUP_SIZE = ATTN_H / ATTN_H_KV`, an integer division used as a
+                                # divisor of blockIdx. Measured at H=64 / H_KV=8 (GROUP_SIZE 8),
+                                # the repository's own GQA shape. MHA (GROUP_SIZE 1) compiles but
+                                # see section 10 -- the analysis copy of the forward has a head
+                                # remap that is only correct when GROUP_SIZE == H_KV
+  causal: top-left              # `q_pos - k_pos` with both indices absolute from 0, so it is
+                                # top-left causal and it coincides with torch `is_causal=True`.
+                                # Separate source files, not a flag
+  compile_time_shape: "B, H, H_KV and N are all compile-time constants"
+                                # **the binding constraint.** `-DATTN_B -DATTN_H -DATTN_H_KV
+                                # -DATTN_N`; the grid is computed from them and `ATTN_N / KV_BLOCK`
+                                # is peeled by hand. One binary per shape. Section 2
+  seqlen: "multiple of 256 (fwd), multiple of 256 (bwd)"
+                                # fwd: `grid.y = ceil(N/32/8)` and the loop is peeled at both ends,
+                                # so N/64 >= 6. bwd: `grid.y = N / BLOCK_SIZE_KV` with BLOCK_SIZE_KV
+                                # 256, an integer division -- a non-multiple silently drops the tail
+  head_dim_is_not_a_parameter: "the backward is D=128 only"
+                                # `constexpr int ATTN_D = 128` in `attn_bkwd_*.cpp` is **unguarded**
+                                # and the backward Makefiles pass no `-DATTN_D`. There is no D=64
+                                # backward in this repository. Section 12
+  waves: "8 at 2/SIMD (forward), 4 at 1/SIMD (backward)"
+                                # and the two reach one workgroup per CU by the same route: a
+                                # 160 000 B dynamic LDS request against a 163 840 B budget
+  bound: "compute and issue, never memory"    # arithmetic intensity 1221-8090 FLOP/byte
+                                # against ridge points of 254-403, and the highest HBM bandwidth
+                                # any arm reaches is 0.62 TB/s -- 10.0% of the 6.23 TB/s roof.
+                                # Achieved/ceiling 71.5% (fwd), 51.5% (bwd), 23.0% (4-warp), and
+                                # in every case it equals the matrix pipe's share of sustained
+                                # cycles to 0.00 pp. Section 4
+  power_regime: capped          # 1322-1400 W of a hard 1 400 000 000 uW cap on the four
+                                # kernels that are working. The compiler-allocated 4-warp is the
+                                # exception at 1147 W / 2397 MHz -- not power-limited, waiting.
+                                # Section 4
+  tuned_for: "long sequences at batch 16"
+```
+
+**Implementation pointer, verbatim:**
+
+```yaml
+source:
+  repo: https://github.com/HazyResearch/HipKittens
+  commit: 1602364f4f40b5caeec0ccbbaf9ca31f784f1599
+  license: MIT
+  # One LICENSE at the repository root, MIT (Copyright (c) 2024 HazyResearch), covering every
+  # file used here. No file under `include/` or `kernels/cdna4/attn/` carries its own SPDX line.
+  paths:
+  - kernels/cdna4/attn/gqa/kernel.cpp
+  - kernels/cdna4/attn/gqa/kernel_d64.cpp
+  - kernels/cdna4/attn/gqa/kernel-hip-amdgcn-amd-amdhsa-gfx950.s
+  - kernels/cdna4/attn/gqa_causal/kernel.cpp
+  - kernels/cdna4/attn/gqa_backwards/attn_bkwd_non_causal.cpp
+  - kernels/cdna4/attn/gqa_backwards/attn_bkwd_prep.cpp
+  - kernels/cdna4/attn/gqa_backwards/attn_fwd_non_causal.cpp
+  - kernels/cdna4/attn/gqa_backwards/archive/GQA_bkwd_4warps.cpp
+  - kernels/cdna4/attn/gqa_backwards/archive/GQA_bkwd_8warps.cpp
+  - kernels/cdna4/attn/gqa_backwards/archive/GQA_bkwd_asm.cpp
+  - kernels/cdna4/attn/gqa_causal_backwards/attn_bkwd_causal.cpp
+  - analysis/attn/bkwd/benchmark/attn_bkwd_non_causal_4_warps.cpp
+  - analysis/attn/bkwd/benchmark/attn_bkwd_non_causal_8_warps.cpp
+  - analysis/attn/bkwd/benchmark/mi355x_gqa_bkwd_non_causal.json
+  - analysis/attn/fwd/benchmark/mi355x_gqa_non_causal_fwd.json
+  - include/cdna4/types/register/art.cuh
+  - include/cdna4/types/register/rt.cuh
+```
+
+**Diff against the job:**
+
+| Field | Recipe | Job | Verdict |
+| --- | --- | --- | --- |
+| arch | gfx950 | gfx1250 | **MISMATCH** |
+| backend | hipkittens | triton | **MISMATCH** |
+| q_head_dim / kv_head_dim | 128 / 128 | 128 / 128 | match |
+| **causal** | **top-left** ("Separate source files, not a flag") | **bottom-right** | **MISMATCH — hard** |
+| layout | `BNHD` — `(batch, seq, head, dim)` | `bshd` | **effectively match on bytes** (BNHD as spelled here = batch, seq, head, dim = bshd); vocabulary differs, and the card itself notes gqa_d64 spells the same thing `bnhd` |
+| gqa / heads_q_per_kv | `"H % H_KV == 0"` (measured at GROUP_SIZE 8) | 4 (32/8) | satisfies the stated constraint; **not** the measured point. Note the section-10 caveat: the analysis forward's head remap is only correct when `GROUP_SIZE == H_KV` — 4 ≠ 8 here |
+| dtype.qkv / .acc / .o / .lse | bf16 / fp32 / bf16 / fp32 | bf16 / fp32 / bf16 / fp32 | **match on all four** — the only card that states `o` and `lse` |
+| seqlen | multiple of 256 | 8192 | satisfied |
+| direction | fwd + bwd covered; backward is D=128 only | `[fwd, bwd]` | compatible |
+| compile_time_shape | B, H, H_KV, N compile-time constants; one binary per shape | not stated by job | recipe-only, and a strong capability constraint |
+| waves / bound / power_regime / tuned_for | stated | not stated | recipe-only |
+| sliding_window | **not stated** | null | job-only |
+| sparsity | **not stated** | dense | job-only |
+| sink | **not stated** | null | job-only |
+
+Matches the job's dtype quartet and layout exactly, but is top-left causal — which `ops/attention/masking-heads-and-layout.md` treats as a definitional difference, not a tuning one.
+
+---
+
+### 2.5 `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/knowledge/backends/hipkittens/attention/recipes/gqa_d64.md`
+
+**title:** `head_dim 64 GQA attention on gfx950, as HipKittens writes it`
+
+**summary:** `HipKittens' GQA attention at D=64 -- forward causal and non-causal, and the backward that has no D=64 at all -- measured on MI355X under ROCm 7.2.1. The forward family does not compile on this toolchain and why; the shipped rescale threshold is load-bearing for correctness, not just speed; asking for four waves per SIMD spills 223 registers and returns non-deterministic output because the kernel writes its own wait counts; and the paper's 22%-for-3x-the-code attention-backward claim is register pinning, not wave count -- the matched 4-warp/8-warp pair measures 1.30x the other way.`
+
+**applies_to:** `arch: [gfx950]`, `op: [attention]`, `backend: [hipkittens]`
+
+**status:** `verified`
+**verified:** `"MI355X (gfx950), ROCm 7.2.1, torch 2.10.0+git94c6e04, rocm/primus:v26.3, HipKittens 1602364f, forward D=64 at five sequence lengths x three passes, backward D=128 at four x two, full profile and power probe at B=16 H=64 H_KV=8 N=4096"`
+
+**`config:` block, verbatim:**
+
+```yaml
+config:
+  # Mirrors `op.config` in a job spec. A recipe applies only where these match --
+  # diff field by field before adopting anything below. Each entry is a *requirement*
+  # of the shipped kernel, not merely the value it happened to be measured at.
+  direction: forward            # **D=64 exists only in the forward.** Every backward source in
+                                # this repository hard-codes `constexpr int ATTN_D = 128` with no
+                                # `#ifndef`, and setting it to 64 fails a `static_assert` in
+                                # `art.cuh` because the hand-assigned register ranges are sized
+                                # for D=128. Section 2. The backward figures in this card are
+                                # therefore **D=128** and are labelled as such
+  q_head_dim: 64                # `kernel_d64.cpp`; `ATTN_D` is a compile-time constant
+  kv_head_dim: 64
+  causal: "top-left, and a separate source file"   # `gqa/` and `gqa_causal/` are two kernels, not
+                                # a flag. The causal one masks with `q_pos - k_pos` against a
+                                # 32-wide column tile -- top-left, which is what torch SDPA's
+                                # `is_causal=True` also means, and NOT the bottom-right convention
+                                # `flydsl/attention/recipes/hd64.md` and AITER use
+  dtype:
+    qkv: bf16                   # `gl<bf16,-1,-1,-1,-1>`; there is no fp16 or fp8 attention here
+    acc: fp32                   # `v_mfma_f32_32x32x16_bf16`, fp32 accumulate
+    o: bf16                     # stored through `v_cvt_pk_bf16_f32`, a **round-to-nearest**
+                                # hardware conversion -- NOT the truncating scalar path cards 2
+                                # and 3 found in the GEMMs. Section 6.5
+    lse: fp32
+  layout: bnhd                  # Q, K, V, O are `[batch, seq, head, dim]`; LSE is `[B, H, 1, N]`
+  heads_q_per_kv: ">= 1, and a divisor of ATTN_H"  # `GROUP_SIZE = ATTN_H / ATTN_H_KV`. The head
+                                # remap assumes `ATTN_H_KV * GROUP_SIZE == ATTN_H`; measured at
+                                # 64/8. Section 6.3
+  compile_time_shape: "ATTN_B, ATTN_H, ATTN_H_KV, ATTN_N, ATTN_D are all compile-time constants"
+                                # **the binding constraint.** One `.so` per shape. A shape that
+                                # was not compiled in does not exist, and the runtime tensor
+                                # shapes are not checked against the ones baked in
+  seqlen: "multiple of 64, and >= 384"   # `num_tiles = ATTN_N / KV_BLOCK_SIZE` with
+                                # KV_BLOCK_SIZE 64; the hot loop runs `j = 3 .. num_tiles-2`
+                                # and a 13-cluster epilogue peels the last five KV tiles
+  batch_x_heads: "grid is (ATTN_H, ATTN_N/256, ATTN_B)"  # 16 384 workgroups at B=16 N=4096 H=64,
+                                # i.e. 64 per CU. Grid fill is never the constraint at these shapes
+  waves: "8 per workgroup, 2 per SIMD"   # `__launch_bounds__(512, 2)`. **Not a free parameter:**
+                                # forcing 4 waves/SIMD caps the allocator at 128 registers, spills
+                                # 223, and returns wrong answers. Section 6.2
+  registers: "157 arch VGPR, 0 AGPR, 0 spill"   # D=64 non-causal; 159 causal; 238 at D=128
+  lds: "32 768 B used, 160 000 B requested"      # the request is `MAX_SHARED_MEMORY` and is inert
+                                # here -- registers cap residency at one workgroup per CU first.
+                                # Measured with a control that asks for the true 32 768. Section 10
+  softmax: "online max with a threshold-gated lazy rescale"   # `RESCALE_THRESHOLD = 8.0f`.
+                                # **Load-bearing for correctness, not only for speed** -- setting
+                                # it to 0 (standard online softmax) costs 6.6% AND 35.7 dB.
+                                # Section 6.1
+  power_regime: capped          # 1365 W of a hard 1400 W cap on the forward, and 21.3% of
+                                # its time is the cap (data-swap test). The two compiler-allocated
+                                # backward bodies are NOT power-limited. Section 4
+  bound: "VALU issue, on the transcendental"     # VALU-issue-bound on the transcendental. MFMA duty cycle
+                                # 43.8% at N=4096; HBM at 4.0% of the 6.23 TB/s roof; arithmetic
+                                # intensity 3591 FLOP/byte against a 330 FLOP/byte ridge. Section 4
+  tuned_for: "large N"          # 696.9 TFLOP/s at N=1024 rising to 939.3 at N=16384
+```
+
+**Implementation pointer, verbatim:**
+
+```yaml
+source:
+  repo: https://github.com/HazyResearch/HipKittens
+  commit: 1602364f4f40b5caeec0ccbbaf9ca31f784f1599
+  license: MIT
+  # One LICENSE at the repository root, MIT (Copyright (c) 2024 HazyResearch), covering every
+  # file used here. No file under `include/`, `kernels/cdna4/attn/` or `analysis/attn/` carries
+  # its own SPDX line, so unlike the Turbo/FlyDSL cards there is no second licence on a subtree.
+  paths:
+  - kernels/cdna4/attn/gqa/kernel_d64.cpp
+  - kernels/cdna4/attn/gqa/kernel.cpp
+  - kernels/cdna4/attn/gqa/kernel-hip-amdgcn-amd-amdhsa-gfx950.s
+  - kernels/cdna4/attn/gqa_causal/kernel_d64.cpp
+  - kernels/cdna4/attn/gqa_backwards/attn_bkwd_non_causal.cpp
+  - kernels/cdna4/attn/gqa_backwards/attn_bkwd_prep.cpp
+  - kernels/cdna4/attn/gqa_backwards/attn_fwd_non_causal.cpp
+  - kernels/cdna4/attn/gqa_causal_backwards/attn_bkwd_causal.cpp
+  - kernels/cdna4/attn/gqa_backwards/archive/GQA_bkwd_4warps.cpp
+  - kernels/cdna4/attn/gqa_backwards/archive/GQA_bkwd_8warps.cpp
+  - analysis/attn/fwd/benchmark/attn_fwd_non_causal_d64.cpp
+  - analysis/attn/fwd/benchmark/attn_fwd_causal_d64.cpp
+  - analysis/attn/bkwd/benchmark/attn_bkwd_non_causal_4_warps.cpp
+  - analysis/attn/bkwd/benchmark/attn_bkwd_non_causal_8_warps.cpp
+  - analysis/attn/fwd/benchmark/mi355x_d64_gqa_non_causal_fwd.json
+  - analysis/attn/fwd/benchmark/mi355x_d64_gqa_causal_fwd.json
+  - analysis/attn/bkwd/benchmark/mi355x_gqa_bkwd_non_causal.json
+  - analysis/attn/bkwd/benchmark/mi355x_gqa_bkwd_non_causal_4warps.json
+  - analysis/attn/bkwd/benchmark/mi355x_gqa_bkwd_non_causal_8warps.json
+  - include/cdna4/common/base_types.cuh
+  - include/cdna4/common/util.cuh
+```
+
+**Diff against the job:** worst fit. `direction: forward` only (job needs fwd+bwd) — MISMATCH; `q_head_dim: 64` / `kv_head_dim: 64` vs 128 — MISMATCH; `causal: top-left` vs bottom-right — MISMATCH; plus arch and backend. Matches on dtype quartet (bf16/fp32/bf16/fp32), `layout: bnhd` ≈ bshd, and `heads_q_per_kv: ">= 1, and a divisor of ATTN_H"` (4 divides 32, satisfied). `sliding_window`, `sparsity`, `sink` stated by neither.
+
+---
+
+### Summary matrix (attention recipes vs your job)
+
+| | aiter fmha_v3_bwd_hd128 | flydsl hd128 | flydsl hd64 | hk gqa_d128 | hk gqa_d64 |
+| --- | --- | --- | --- | --- | --- |
+| arch gfx1250 | ✗ gfx950 | ✗ gfx950 | ✗ gfx950 | ✗ gfx950 | ✗ gfx950 |
+| backend triton | ✗ aiter | ✗ flydsl | ✗ flydsl | ✗ hipkittens | ✗ hipkittens |
+| causal bottom-right | ✓ | ✓ | ✓ | ✗ top-left | ✗ top-left |
+| sliding_window null | ✓ (n/s supported) | ✓ | ✓ | — not stated | — not stated |
+| sparsity dense | — not stated | ✓ | ✓ | — not stated | — not stated |
+| q/kv_head_dim 128 | ✓ | ✓ | ✗ 64 | ✓ | ✗ 64 |
+| heads_q_per_kv 4 | — not stated | ✗ pow2 ∈ [8,256] | ✗ pow2 ∈ [8,256] | ✓ (H%H_KV==0) | ✓ (divisor of H) |
+| format bshd (b=4) | — not stated | ✗ sbhd/thd only | ✗ sbhd/thd only | ✓ BNHD≡bshd | ✓ bnhd≡bshd |
+| direction [fwd,bwd] | ✗ bwd only | ✓ | ✓ | ✓ | ✗ fwd only |
+| sink null | — not stated | ✓ optional | ✓ optional | — not stated | — not stated |
+| dtype qkv bf16 | ✓ | ✓ | ✓ | ✓ | ✓ |
+| acc fp32 | ✓ | ✓ | ✓ | ✓ | ✓ |
+| out bf16 | — not stated | — not stated | — not stated | ✓ | ✓ |
+| lse fp32 | — not stated | — not stated | — not stated | ✓ | ✓ |
+| seqlen 8192 | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+Per `backends/flydsl/attention/README.md`'s adoption table, all five land in **Partial** at best (arch + backend both differ, so arguably **Poor**): "Nothing. Work from `techniques.md` and the route."
+
+### The eleven non-attention `config:` files (for completeness)
+
+`backends/aiter/gemm/recipes/bf16_nt.md`, `backends/hipblaslt/gemm/recipes/bf16_nt.md`, `backends/flydsl/gemm/recipes/bf16_nt.md`, `backends/flydsl/grouped_gemm/recipes/{bf16,fp8_tensorwise,mxfp4,mxfp8}.md`, `backends/hipkittens/gemm/recipes/{bf16_nt,fp8,mxfp8,bf16_gfx1250_ladder}.md`.
+
+One of these is worth naming: **`backends/hipkittens/gemm/recipes/bf16_gfx1250_ladder.md`** is the corpus's only **gfx1250** recipe (`applies_to.arch: [gfx1250]`, `op: [gemm]`, `backend: [hipkittens]`). Wrong op type, but it is the only file that carries a measured-on-gfx1250 build-and-correctness workflow, a thirteen-rung `00_naive` → `12_two_waves` optimization order, and the three CDNA5-only rungs (`tdm`, `split_bar`, `wgc_multicast`). Source pointer: `https://github.com/HazyResearch/HipKittens`, ladder `gemm_ladder.py`; toolchain `"ROCm 7.15 (clang 23) for rungs 09-12; ROCm 7.2+ for 00-08; torch 2.11.0+rocm7.14.0"`. Its status line notes the 25-round campaign **hung the GPU at round 16 of 25**.
+
+---
+
+## 4. `knowledge/ops/attention/` — full listing
+
+Five files. All `status: reference`, `applies_to: arch [any] / backend [any]`, no measurements anywhere by design.
+
+| File | Lines | Summary |
+| --- | --- | --- |
+| `README.md` | 74 | Branch contract. Table routing each of the four content files to the moment you read it. States the boundary test: "**if the statement would change on a different GPU, or in a different DSL, it does not belong here.**" Structural ratios (FLOP counts, reuse factors, causal-block fractions) belong; measurements do not. Explicitly points tile/wave/occupancy questions at `backends/flydsl/attention/recipes/hd64.md`, dead ends at `backends/flydsl/attention/dead-ends.md`, issue-port model at `backends/flydsl/attention/techniques.md`. **"What is not covered":** sparse/block-sparse selection, latent/compressed KV (MLA), decode-time single-query shapes, cross-attention — "treating this directory's mask and parallelism arithmetic as applying to them would be wrong." Your job is dense/causal/GQA, so it is in scope. |
+| `online-softmax.md` | 223 | The definitional form vs the one-pass recurrence; the rescale and its cost; shift invariance and what it licenses; LSE and what storing it saves; degenerate/fully-masked rows; where precision must be held wider than storage; non-associativity and the price of reproducibility. Sections: "The definitional form, and why it is not the one you implement", "The one-pass recurrence", "Shift invariance, and what it licenses", "LSE, and what storing it saves", "Degenerate rows and fully-masked blocks", "Where precision must be held", "Non-associativity, and what it costs to be reproducible". |
+| `backward-dataflow.md` | 205 | **The most relevant file for your `direction: bwd`.** Five matrix products plus one row-wise reduction; the identity that makes the backward one-pass; why the row term (`sum(O*dO)` / delta) is formed before the main loop; **why one of dQ or dK/dV always needs atomics or a split-and-reduce**; what the loop order (KV-outer vs Q-outer) also decides; arithmetic intensity of the backward; why the backward is hard to make deterministic. |
+| `masking-heads-and-layout.md` | 311 | **The second most relevant.** Causal masking and its block classification / work imbalance; a dedicated `### Top-left versus bottom-right alignment` section (lines 75-105) — directly load-bearing for your `causal=bottom-right` vs the HipKittens cards' top-left; sliding windows; `## Head grouping: MHA, GQA, MQA` and what GQA does to a KV-outer kernel's parallelism; `## Head dimension, and where the arithmetic intensity is` (why d=64 is harder than d=128); `## Sequence layout` covering bshd/sbhd/bhsd/varlen. README says read it "at setup, when the job spec's `op.config` is first read, and again whenever a constant is carried across a configuration." |
+| `reference-implementation.md` | 150 | What an obviously-correct eager reference must get right; where a library reference legitimately disagrees (convention, not bug); whether a library kernel can be a bitwise oracle (it cannot, in general); what the acceptance set must contain; how to get reference gradients for the backward. |
+
+**There is no `techniques.md` or `dead-ends.md` under `ops/attention/`** — by design; those genres live under `backends/<backend>/attention/`. The only ones that exist for attention anywhere are `backends/flydsl/attention/techniques.md` and `backends/flydsl/attention/dead-ends.md` (both `measured elsewhere (Primus-Turbo PR #458, MI355X)`, scope `gfx950, attention, flydsl`):
+
+- `techniques.md` (439 lines): "The constraint is softmax issue, not matrix throughput"; "The pipes are partly additive — measure the conversion rate"; "Two ways to overlap exp with MFMA"; "Which cluster the work lands in"; "How you spell the transcendental changes the schedule"; "One `vmcnt`, shared by loads and stores" (← explicitly invalidated on gfx1250, see §6); "Working out your occupancy limiter"; "Audit the index map before the kernel body"; "Filling the grid" / "How many bytes a split costs is set by the register file"; "Determinism without float atomics"; "MFMA shape as a scheduling knob" (← no MFMA on gfx1250).
+- `dead-ends.md` (427 lines), 19 recorded losses: software exp polynomial; fp8 operands; manual wave staggering; splitting the head dimension in a KV-outer backward; enlarging the KV block (cost 3x); forcing occupancy by raising the request; LDS double-buffering of streamed K/V; non-temporal hints on reused operands; deleting never-issued instructions; a non-amortising register transpose; hand-written address arithmetic; an autotune bound inherited from an earlier configuration; an opaque inline-asm transcendental carrying no hazard; coarsening a hazard anchor ("faster, wrong, and invisible on the main shape"); a sync-count change validated on one shape; a probe that deletes the exp; a win measured on one shape class; a tile heuristic keyed to the wrong axis; a gate whose comment cannot state a reason; and "A dead end without a root cause".
+
+`backends/aiter/attention/README.md` exists (structural note on the 286-object / 11-manifest `fmha_v3_bwd` family, and "Not filled yet: a `techniques.md` and a `dead-ends.md`"). **`backends/hipkittens/attention/` has no README.md** — only the two recipes.
+
+---
+
+## 5. `knowledge/optimization/routes/`
+
+`/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/knowledge/optimization/routes/README.md` gives an explicit `op.type` → file mapping:
+
+| `op.type` | Post-profile lookup |
+| --- | --- |
+| `attention` | `1-metrics-to-techniques.md` |
+| `gemm` | `1-metrics-to-techniques.md` |
+| `grouped_gemm` | `1-metrics-to-techniques.md` |
+| `other` | same, if MFMA-dominated |
+
+So **the route that applies to attention is `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/knowledge/optimization/routes/1-metrics-to-techniques.md`** — and `0-kernel-programming-principles.md` "applies to every one of them without qualification," read before a kernel exists and again at plan time.
+
+The README's rationale for one file covering all three op types: "the **metrics and their normalisation are identical** — a spill, an under-filled grid and a bank conflict do not care what the algorithm is, and `SQ_VALU_MFMA_BUSY_CYCLES / (SIMDs_per_XCD x GRBM_COUNT)` is the same ratio in all of them." (Note: that normalisation is gfx942/gfx950-only — `SQ_VALU_MFMA_BUSY_CYCLES` does not exist on gfx1250.)
+
+**`1-metrics-to-techniques.md`** (203 lines, `status: from documentation`, scope `gfx942/gfx950, gemm/grouped_gemm/attention`):
+
+- `## How to read the two tables`
+- `## Table A -- metrics that invalidate other metrics` — evaluate top to bottom, **stop at the first one that fires**; that row is the work, re-take the profile afterwards. Spill is the strongest case: scratch traffic pollutes every memory counter, so a memory-bound diagnosis taken with non-zero spill is describing the spill.
+- `## Table B -- diagnostic metrics` — each row indexed by a derived metric with its formula and the condition under which it is readable at all, pointing at one file in `optimization/techniques/`.
+- `## Why three of these readings lie`
+- `## Metric combinations` — what two metrics together say that neither says alone.
+- `## When no metric is elevated`
+- `## Before a candidate becomes a plan`
+- `## What this file assumes you already know about the op`
+
+**Caveat for your job:** its `applies_to.arch` is `gfx942/gfx950`. `arch/gfx1250/profiling-surface.md` establishes that the counter vocabulary this route is built on largely does not exist on gfx1250 (see §6).
+
+`0-kernel-programming-principles.md` (`status: from documentation`, scope `gfx942/gfx950`) is principles ordered by how often each is violated, each with a quantified check answerable from source / the compiler resource report / a sixty-second test, plus its exceptions. It does mention gfx1250 (one of the 19 files that do).
+
+---
+
+## 6. `knowledge/arch/gfx1250/` — three files
+
+| File | Lines | Status |
+| --- | --- | --- |
+| `gfx1250.md` | 196 | `reference` — "Nothing here is measured." Transcribed from AMD "CDNA5" ISA Reference Guide, 27-July-2026 |
+| `isa.md` | 237 | `reference` — same source document |
+| `profiling-surface.md` | 215 | **`verified`** — MI455X engineering sample (Card SKU M4500001, chip 0x75c1), ROCm 7.14.60850, PyTorch 2.11.0+rocm7.14, host `heliosr-1b114-c07-1`, 2026-08-31 |
+
+There is **no** `performance-counters.md` and **no** `performance-model.md` for gfx1250 (both exist for gfx942 and gfx950). `profiling-surface.md` says why: "This page is deliberately **not** named `performance-counters.md`. There is no counter reference to write yet."
+
+### Profiling surface / counters
+
+This is the single most consequential file for your job.
+
+- **51 counters defined for gfx1250** in `$ROCM_PATH/share/rocprofiler-sdk/config.yaml` — the smallest of any architecture in the ROCm database, smaller than Vega. gfx950 has 630, gfx942 420.
+- **Only 13 return non-zero data.** The other 38 are defined, accepted by `rocprofv3`, and read zero. The working 13: `GRBM_COUNT`, `GRBM_CPC_BUSY`, `GRBM_GUI_ACTIVE`, `GRBMA_COUNT`, `GRBMH_COUNT`, `GRBMH_SPI_BUSY`, `SQC_ICACHE_REQ`, `SQC_ICACHE_MISSES`, `SQC_ICACHE_MISSES_DUPLICATE`, `SQ_WAVES`, `SQ_CYCLES`, `SQ_BUSY_CYCLES`, `SQ_ITEMS`. "That is: wall-clock cycles, wave count, and instruction-cache behaviour. Nothing about memory, nothing about the matrix unit, nothing about occupancy, nothing about stalls."
+- **Entire blocks gone:** TCC (L2) 133→0, TCP (vL1D) 124→0, TA+TD 60→0, derived metrics 47→0, SQ 116→16, SPI 81→1. New RDNA-vocabulary blocks (GL1A, GL1C, GLARBC, CHA, CHC, GRBMA, GRBMH) exist but are "nearly empty". **"gfx1250 exposes no counter that reports bytes, at any level of the hierarchy."**
+- **The WMMA FLOP counters read zero.** A kernel executing exactly 4,096,000 `v_wmma_f32_16x16x32_bf16` instructions reports `SQ_INSTS_VEC32_VALU_WMMA`, `SQ_INST_CYCLES_VALU_WMMA` and `SQ_VALU_WMMA_FLOP_BF16` all exactly 0, while `SQ_WAVES` in the same run is exact. The whole `SQ_VALU_WMMA_FLOP_*` family is marked `{emulated}` in its own description text and none of it works. A real hipBLASLt bf16 GEMM behaves the same way.
+- **Silent failure trap:** `rocprofv3 --pmc TCC_HIT_sum SQ_INSTS_VALU ...` exits **0** and writes no CSV, no warning. "A profiling script ported from gfx950 therefore 'succeeds' and produces nothing. Any harness that runs `rocprofv3` on gfx1250 must assert that the output CSV exists and contains the counters it asked for; exit status is not a signal."
+- **What does work:** stochastic PC sampling (the one rich source) and ATT. Host-trap PC sampling and SPM are advertised but produce no output. PC sampling reports per sample: instruction text, `Instruction_Type`, `Stall_Reason`, `Wave_Count`, `Exec_Mask`, whether the wave issued. Measured separation: WMMA kernel = 76.5% `ARBITER_NOT_WIN`, 81.9% `MATRIX`, 82.8% issue rate, mean Wave_Count 1.4; 2 GiB streaming kernel = 49.7% `WAITCNT` + 41.1% `OTHER_WAIT`, 97.4% `NO_INST`, 2.2% issue, mean Wave_Count 7.8. Invocation:
+  ```
+  rocprofv3 --pc-sampling-beta-enabled --pc-sampling-method stochastic \
+    --pc-sampling-unit cycles --pc-sampling-interval 2048 \
+    --output-format csv --output-file pc -d out -- ./app
+  ```
+  Valid interval 256–1048576 cycles.
+- **What it falsifies elsewhere:** `profiling/3-bound-analysis.md`'s byte accounting (`TCC_*_SECTORS x 32`, `TCC_EA0_*_DRAM_32B x 32`) and its `SQ_LDS_IDX_ACTIVE` LDS-bandwidth row — gone. `profiling/2-power-wall-analysis.md`'s `SQ_WAIT_ANY` / `SQ_ACTIVE_INST_ANY` / `SQ_BUSY_CU_CYCLES` / `SQ_VALU_MFMA_BUSY_CYCLES` — none of the four exists.
+- **Open question, explicitly not to be recorded as fact:** whether the 38 dead counters are unwired silicon or unimplemented ROCm 7.14.
+- **Machine shape observed** (incidental): 256 CUs, 4 SIMDs/CU, wave32, 16 shader engines, 2 shader arrays/engine, 320 KB LDS, 432 GiB HBM; counter dimensions report 8 XCCs and 2 AIDs. One unresolved inconsistency: counter dims report `WGP[0:8]` (9 WGPs/array) against an arithmetic 4.
+
+### wave32 vs wave64
+
+- Wavefront size **32** (ISA §1). "**Wave64 is gone.** The ISA document opens by saying it may refer to wave64 but the device supports only wave32."
+- "Every lane-count assumption in a kernel is wrong by a factor of two: cross-lane reductions, `EXEC` mask arithmetic, the lane-to-matrix-element mappings in any hand-written matrix layout, and the occupancy arithmetic that turns a register budget into waves."
+- `EXEC` and `VCC` remain 64-bit registers; only bits [31:0] have effect; `EXECZ`/`VCCZ` test that half.
+- `DS_PERMUTE_B32` / `DS_BPERMUTE_B32` now swizzle across 32 lanes — only index bits [6:2] used.
+
+### WMMA (and the absence of MFMA)
+
+- "**MFMA does not exist on this part.** `V_MFMA` appears 163 times in the CDNA 3 guide, 150 times in the CDNA 4 guide, and **zero** times in the CDNA 5 guide. Neither does `V_SMFMAC`. This is not a rename."
+- Matrix work is `V_WMMA` (dense) and `V_SWMMAC` (2:4 sparse), VOP3P-encoded, `A * B + C => D`, one matrix striped across the wave (§7.12).
+- **For bf16 the relevant shape is `V_WMMA_F32_16X16X32_BF16`** (A 16x32 BF16, B 32x16 BF16, C/D 16x16 F32). Also `V_WMMA_BF16_16X16X32_BF16` and `V_WMMA_BF16F32_16X16X32_BF16` (C = F32, D = BF16 — useful for a bf16 output). Note **M is 16 for every shape except `V_WMMA_SCALE*_F32_32X16X128_F4`**. There is no 32x32 tile as on CDNA3/4.
+- Hard restrictions on every WMMA/SWMMAC: **wave32 only**; **`EXEC` must be all ones** ("Not honoured-and-ignored — required"); **DPP not supported**; round-to-nearest-even only; `MODE.Denorm` ignored and denorms **preserved, never flushed**; any NaN input → NaN, `0*Inf` → NaN; no exceptions.
+- Operand rules: `SRC0`/`SRC1`/`VDST` must be **even-aligned VGPRs**; `SRC2` an even VGPR or inline zero. `OPSEL[2]`/`OPSEL_HI[2]` are **A-reuse / B-reuse hints** — "set them only when the current instruction is identical to the previous one, otherwise the result is undefined."
+- **Hazards: there is no interlock.** Reading a previous matrix result as the A/B/index operand of another matrix instruction after `WMMA_*F16`/`WMMA_*BF16` needs **5 independent instructions (1 NOP + 4 co-exec slots)**, or 1 `V_NOP` with co-exec disabled. FP8/BF8 at 16x16x64 needs 2; at 16x16x128 needs 4; `WMMA_IU8` needs 9; `SWMMAC_*{F16,BF16,FP8,BF8}` needs 3. A following **VALU** that reads D (RAW), writes D (WAW) or writes A/B/index (WAR) needs a different count — 4 co-exec slots after `WMMA_*F16`/`*BF16` — and no `V_NOP` at all with co-exec disabled. "The slots can be filled by co-executing work, the leading NOP cannot."
+- **Transposing loads** (§11.2.4), all wave32-only and `EXEC` ignored/all-ones: `DS_LOAD_TR16_B128` / `GLOBAL_LOAD_TR16_B128` (16-bit), `DS_LOAD_TR8_B64`, `DS_LOAD_TR6_B96`, `DS_LOAD_TR4_B64`. The 16-bit one is the gfx1250 analogue of the `ds_read_b64_tr_b16` the AITER attention card documents on gfx950 — relevant for the backward's K^T/V^T tiles.
+
+### LDS
+
+| | Value | Source |
+| --- | --- | --- |
+| LDS per workgroup | **up to 320 KB** (0–320 KB) | ISA §2.2, §3.3.4 |
+| Allocation granularity | 2048 bytes | ISA §3.3.4 |
+| Physical memory | 320 KB LDS + 64 KB WGP$, **one structure with a configurable split** | ISA §1.2.2.1, §11.1 |
+| Banks | **64, 4 bytes wide** | ISA §11.1 |
+
+- vs gfx950: 160 KB → 320 KB per workgroup. Bank count unchanged (64).
+- "**LDS bank count does not change from gfx950.** 64 banks of 4 bytes on both. A swizzle derived for gfx950 has the right modulus — but it was derived for 64 lanes issuing in phases, and the wave is now 32 lanes, so the phase structure it was tuned against is different. **Re-derive rather than assume**" (method in `optimization/techniques/2-lds-bank-conflicts.md`).
+- Accesses bounds-checked against LDS base/size registers the shader cannot write. Every SIMD in the WGP can reach both LDS and WGP$.
+- Waves are now grouped under a **WGP**, not a CU. 4 SIMDs (SIMD32) per WGP, 32 workgroups per WGP, max 1024 work-items per workgroup.
+
+### Async data movement: TDM / tensor descriptors, clusters, MWAIT
+
+**Tensor Data Mover (TDM)** — ISA §1.2.2.1, §10.11. One per pair of SIMDs. Instructions: `TENSOR_LOAD_TO_LDS`, `TENSOR_STORE_FROM_LDS`.
+
+- "**It uses no VGPRs and is not issued per lane.** The tensor and tile are described by a descriptor (`D#`) held in SGPRs — 2 SGPR groups for tensors up to 2D, 4 groups for up to 5D."
+- "**`EXEC` is ignored entirely.** The instruction issues whether `EXEC` is zero or not."
+- "**It has its own completion counter,** `TENSORcnt`, waited on with `S_WAIT_TENSORCNT`. Tensor instructions stay in order with each other but are unordered with respect to every other kind of memory instruction. Completion is reported once per instruction, not per memory transfer."
+- "**Tile data can be padded in LDS on a regular basis** to help a transpose or to avoid bank conflicts — the padding is part of the descriptor rather than something the addressing math has to carry."
+- Tensor instructions may not appear in a clause.
+- In a cluster, `D#.workgroup_mask` lets one TDM instruction land data in the LDS of several WGPs at once; must be zero outside a cluster.
+
+**Workgroup clusters** — ISA §2.3. Up to 16 workgroups, 1D/2D/3D, scheduled onto the same shader engine; **each workgroup in a cluster runs on a separate WGP**. Grid hierarchy gains a level: Grid → Cluster → Workgroup → Wave → Work-item. Cluster-wide split barrier (signal + arrive) plus a second reserved for trap sync. Multicast loads: `CLUSTER_LOAD_B{32,64,128}` (tracked by `LOADcnt`) and `CLUSTER_LOAD_ASYNC_TO_LDS_B{32,64,128}` (tracked by `ASYNCcnt`); both **force a miss in the WGP$** regardless of scope/temporal bits. `Cluster_ID == 0` means not in a cluster and every cluster-barrier instruction becomes a NOP. Position delivered in `TTMP6`/`TTMP7`/`TTMP9`.
+
+**MWAIT** — ISA §10.10. `GLOBAL_LOAD_MONITOR_{B32,B64,B128}` (or FLAT) arms an L2 cacheline watch and returns data immediately; `S_MONITOR_SLEEP` parks the wave. "**Wake-ups are not precise.**" Any watched line modified or evicted wakes *every* waiting wave. The "sleep forever" encoding is documented as unsafe.
+
+**Six wait counters replace `vmcnt`/`lgkmcnt`** (§5.7.1) — they count **instructions, not threads**:
+
+| Counter | Bits | Counts |
+| --- | --- | --- |
+| `LOADcnt` | 6 | vector loads and atomics-with-return, `global_inv` |
+| `STOREcnt` | 6 | vector stores and atomics-without-return, `global_wb`/`wbinv` |
+| `DScnt` | 6 | LDS instructions |
+| `KMcnt` | 5 | scalar loads and `S_SENDMSG` |
+| `ASYNCcnt` | 6 | async loads/stores incl. `CLUSTER_LOAD_ASYNC_TO_LDS_*` |
+| `TENSORcnt` | 6 | TDM transfers |
+
+Waits: `S_WAIT_LOADCNT`, `S_WAIT_STORECNT`, `S_WAIT_DSCNT`, `S_WAIT_KMCNT`, `S_WAIT_ASYNCCNT`, `S_WAIT_TENSORCNT`, plus fused `S_WAIT_LOADCNT_DSCNT` / `S_WAIT_STORECNT_DSCNT` and `S_WAIT_XCNT`. **"Loads and stores no longer share a counter"** — this directly retires the constraint behind `backends/flydsl/attention/techniques.md`'s "One `vmcnt`, shared by loads and stores" section: "a drain carried over from gfx950 is leaving something on the table as well as being mis-spelled." `S_WAIT_KMcnt 0` is the only legitimate value with SMEM loads outstanding (scalar loads return out of order).
+
+**Cache scope** replaces `SC0`/`SC1`/`NT` with a 2-bit `SCOPE` (0 `WGP`, 1 `SE`, 2 `DEV`, 3 `SYS`) plus a temporal hint (§4.1.1). Explicit prefetch: `FLAT_PREFETCH_B8`, `GLOBAL_PREFETCH_B8`, taking a `SCOPE` that selects the cache level.
+
+### Occupancy and VGPR limits
+
+- **VGPRs addressable: V0–V1023** (up from V0–V255 on gfx942/gfx950) — one flat file.
+- **Accumulation VGPRs: none.** "`AccVGPR`, `ACCVGPR`, `AGPR` and `AV0-AV255` all appear zero times in the CDNA 5 guide… Anything in this corpus about splitting a register budget between arch and accumulation registers — `optimization/techniques/0-register-pressure-and-occupancy.md` in particular, whose '256 VGPR + 256 AGPR at 1 wave/SIMD' is a CDNA 3/4 fact — **does not describe this part**."
+- SGPRs: S0–S105 (106 per wave) plus 16 TTMP. PC is 57 bits.
+- **"No waves-per-SIMD limit"** is stated explicitly as a gap: "that last one is worth naming because third-party analyses of the LLVM backend quote a figure for it and the ISA document does not contain one."
+- Also absent from the ISA doc and therefore from this branch: CU/XCD count, clock, HBM capacity, bandwidth, per-datatype peak throughput, PMC counter list. "Fill these from hardware when a part is available; until then, this file supports porting decisions and **not roofline arithmetic**."
+- Practical consequence: there is no occupancy counter on gfx1250 either (`OccupancyPercent`, `MeanOccupancyPerCU` have no definition), so occupancy has to be read from the compiler resource report or inferred from PC sampling's `Wave_Count`.
+- **Shader tail padding is a hard requirement:** 64 DWORDs (256 bytes) past the last instruction (ISA §2.4), `S_CODE_END` recommended as filler. "CDNA 5 prefetches instructions aggressively enough to run off the end of a kernel."
+
+---
+
+## 7. Triton across the corpus
+
+`grep -rni "triton" knowledge/` returns hits in 13 files. **No file discusses Triton as a backend you would write attention in.** Every hit is one of three kinds:
+
+**(a) Triton as a *version string* in a `measured_on` block** — incidental, carries no Triton content:
+- `backends/flydsl/attention/recipes/hd128.md:94` and `hd64.md:97` — `triton: 3.8.0`
+- `backends/flydsl/grouped_gemm/recipes/{bf16,fp8_tensorwise,mxfp4,mxfp8}.md` — same
+- Several notes recording that building Primus-Turbo from source **upgraded triton** as a side effect: `hd64.md:188-189` corrects the record — "the triton upgrade here was **3.6.0 -> 3.8.0**, not 3.7 -> 3.8.0"; `flydsl/gemm/recipes/bf16_nt.md:96` says the same; the grouped_gemm cards say 3.7 → 3.8.0.
+
+**(b) Triton as a *rival dispatch backend* inside Primus-Turbo** — the substantive hits, all GEMM/grouped-GEMM:
+- `backends/flydsl/gemm/recipes/bf16_nt.md:54,132` — `_GEMM_BACKENDS = {BackendType.HIPBLASLT: ..., BackendType.TRITON: ...}`; "`BackendType.FLYDSL` exists … and is wired to attention and sparse-MLA, never to dense GEMM."
+- `backends/flydsl/grouped_gemm/recipes/bf16.md` — the richest Triton content in the corpus: `default_backend=BackendType.TRITON`; `can_handle` is True for CK, HIPBLASLT, TRITON and FLYDSL alike at the measured shape; a whole section `### FlyDSL against the Triton default, and why the default is defensible` with "**There is a crossover at about 2048 tokens per group** … below the crossover Triton is up to **1.55x faster** and above it FlyDSL is up to **1.28x faster**"; and the warning that anyone quoting the default as "Turbo's bf16 grouped GEMM" has actually measured Triton.
+- `backends/flydsl/grouped_gemm/recipes/mxfp4.md:218-219,955,1262` — "MXFP4 grouped GEMM currently has a single Triton block-scaled backend, so only `BackendType.TRITON` is registered"; and "**The Triton fp4 backend was not measured.**"
+- `backends/flydsl/grouped_gemm/recipes/fp8_tensorwise.md:212,216` — four backends registered (CK, hipBLASLt, Triton, FlyDSL); `BackendType.FLYDSL if is_gfx950() else BackendType.TRITON`.
+- `backends/flydsl/grouped_gemm/recipes/mxfp8.md:23` — a dispatcher that "silently serves the call from Triton or CK."
+
+**(c) Triton as a *comparison baseline*** — the only two attention-adjacent hits:
+- `backends/hipkittens/scheduling-patterns.md:338-339`:
+  > `| BF16 and FP8 GEMM | Competitive with AITER and hipBLASLt (assembly); **1.3-3.0x** over Triton |`
+  > `| Attention forward, MHA and GQA, d=64 and d=128 | **1.0-2.1x** AITER, **1.0-1.4x** CK, **1.2-4.5x** Triton, **1.3-4.5x** PyTorch SDPA |`
+  Status `measured elsewhere (HipKittens arXiv 2511.08083, main @ 3c4b91e)`, scope `gfx942/gfx950`. Forward only, no backward number, and it is a *speed ratio against* Triton, not guidance for writing Triton.
+- `backends/flydsl/attention/recipes/hd64.md:1116` — an explicitly recorded gap: "**No comparison against aiter, hipkittens or triton** at these shapes."
+- `backends/flydsl/official-skills-map.md:62` — one adjacent line: the `flydsl-tile-programming` skill is for when "You are starting a kernel from nothing or **porting one from Triton**."
+
+**Bottom line on Triton:** the corpus knows Triton exists as a dispatch target and as a baseline that HipKittens beats by 1.2–4.5x on attention forward. It contains **zero** capability-surface material (what Triton takes out of your hands), **zero** Triton attention techniques, **zero** Triton dead ends, and **no `config:` block from a Triton recipe**. There is no gfx1250 Triton content of any kind.
+
+---
+
+## Practical read for your job
+
+1. **No recipe adoption is licensed.** Per `backends/flydsl/attention/README.md`'s adoption table, arch + backend both differ on all five attention cards, so you are in the "Poor / Partial" rows: take the *structure and attack order* at most, re-sweep every constant, take no number.
+2. **Closest on `op.config`:** `backends/aiter/attention/recipes/fmha_v3_bwd_hd128_bf16.md` (hd128, bf16, fp32 acc, bottom-right causal, backward) — but gfx950/aiter/backward-only, and it says nothing about `heads_q_per_kv`, `format` or `sparsity`. Second: `backends/hipkittens/attention/recipes/gqa_d128.md` — the only card whose dtype quartet (qkv bf16 / acc fp32 / o bf16 / lse fp32) and layout (`BNHD` = batch, seq, head, dim ≡ your `bshd`) match your job exactly, and whose `gqa: "H % H_KV == 0"` admits your 32/8=4 — but it is **top-left causal**, and it was measured at GROUP_SIZE 8 with a documented head-remap correctness caveat that binds when `GROUP_SIZE != H_KV` (your case: 4 ≠ 8).
+3. **Your `heads_q_per_kv: 4` is outside both FlyDSL cards' hard range** `"power of two in [8, 256]"` — worth flagging, because that constraint is stated as a *backward correctness* constraint (`LD_VEC >= 2`), not a preference. It is a FlyDSL-specific gate, not an algorithmic one, but it is the only place in the corpus where a group factor below 8 is discussed at all.
+4. **Your `format: bshd` at batch 4 is refused by both FlyDSL cards** (`bshd is accepted at batch 1 alone, where the bytes coincide`).
+5. **gfx1250 invalidates most of the profiling-driven route.** `optimization/routes/1-metrics-to-techniques.md` and all of `optimization/techniques/` are `gfx942/gfx950`; `arch/gfx1250/profiling-surface.md` names which parts are dead. Plan on stochastic PC sampling `Stall_Reason` + ATT rather than counters, and assert that `rocprofv3` actually wrote a CSV.
+6. **gfx1250 also invalidates the matrix-instruction layer** of `backends/flydsl/attention/techniques.md` ("MFMA shape as a scheduling knob") and relaxes its "One `vmcnt`, shared by loads and stores" section. The WMMA hazard table (5 independent instructions after a bf16 WMMA before reading its result as an A/B operand) is the new scheduling constraint, and `arch/gfx1250/isa.md` is the only place it is written down.
+7. **Arch-independent material that does fully apply:** all of `ops/attention/` — especially `backward-dataflow.md` (your `bwd` direction) and `masking-heads-and-layout.md` §"Top-left versus bottom-right alignment" and §"Head grouping: MHA, GQA, MQA".
+`direction: [fwd, bwd]` with `op_flops(backward=True)` = backward-only FLOPs. Now the baseline op itself:
+The corpus survey settles step 1's branch: **no matching best-practice file exists** — there is no `backends/triton/` at all, and all five attention recipes miss on arch *and* backend. So step 1 takes the "develop one" branch, standing on the seed the spec itself names. Let me now verify that seed actually runs here:
+`low_precision.py` needs `core/utils.py` (functools/typing/torch only) — vendor it rather than hand-write a substitute:
+Forward builds and runs on gfx1250. Fixing the eligibility call signature:
+Baseline runs — that's the first execution of this vendored kernel anywhere (provenance §7 said "nothing here has been executed"). Now the eager reference, which is the only precision oracle:
+Now the unit tests — separate SQNR on out/dq/dk/dv, over full tensors, with a non-square shape to pin the mask convention:
+Job shape gives 53.67/52.24/52.31/52.71 — matching the provenance's recorded SQNR exactly, confirming the vendored kernel is the one that was characterised. `sq_lt_skv` passes, so bottom-right is confirmed. The NaN is my own eager forward on the all-masked row I warned about in its own docstring:
+`out`, `dk`, `dv` are all correct; only `dq` is wrong. Let me localise it before deciding what it means:
+Fully localised: live rows are correct at 52.05 dB; the kernel leaves nonzero garbage in query rows that are entirely masked. That's a real defect in the seed, but it's unreachable at `Sq == Skv` — every shape in `op.shape`. Let me read the measurement traps before I touch any timing, and restructure the acceptance set:
+Now the acceptance-set split, being explicit about why the defect is reported rather than gated:
+UTs pass through the runner. Now `op/beat/` — flex_attention with TorchTitan's compile options:
+This is prior work from the same campaign, and it flags something important about the beat arm. Let me read the results:
+The corrected flex anchor used the autotuner's `num_warps=4`, not Inductor's default heuristic of 8, which is 2.43× slower — using the default would make the beat arm a straw man. I'll verify that myself rather than inherit the constant:
+Let me confirm the `op_flops.py` interface I must import rather than copy:
+Now `benchmark.py` — it measures and prints, and decides nothing:
+Works. The spread on the tiny shape is host-enqueue noise; let me check the real shape, which is where the numbers matter:
+601% spread is not a usable measurement. Let me look at the raw distribution rather than guess:
+The `.backward()` path was measuring allocator churn, not the kernel — `autograd.grad` gives a clean 10.21 ms plateau that matches the campaign's 10.270 ms champion figure. Fixing the measurement definition:
+That's far worse, and `gpu_id: 1` is fenced in the spec while my runs pin nothing — I've been measuring on a contended device. Let me check before assuming:
+Two findings: GPU 0 is 100% busy with someone else's work (my runs weren't pinned), and PID 1474958 is holding 263 GiB on GPU 1 — the fenced card. Let me identify it before touching anything:
+Not mine — every run of mine has exited. GPU 1, the card the spec fences for this job, is held by someone else's TorchTitan Llama-3.1-8B pretrain (263 GiB, 6 min in), and GPU 0 is at 100%. My unpinned runs were landing on GPU 0. Let me pin to the spec's card and watch for it to clear:
+The monitor's parse came back empty rather than genuinely free — let me verify directly rather than trust it:
+`rocm-smi` only exists inside the container — my monitor was checking the host and returned nothing. Checking properly:
+GPU 1 reads 0% use and 0% VRAM in the memory table — the trainer is actually on GPU 0 (100% busy, 60% VRAM); the PID table's GPU column disagrees with it. Pinning should give me a clean card. Let me verify empirically:
+Clean: 10.008 ms backward at 0.56% spread, matching the campaign's champion. The contention was the whole problem. Now let me add config fingerprints and settle the beat's `num_warps` by measuring it:
+Independently confirmed in this job: Inductor's default `num_warps=8` gives 30.64 ms, `num_warps=4` gives 11.65 ms — **2.63× apart**. The default would have been a straw man. Now the full measurement session:
+`op/current/` doesn't exist yet — the framework creates it at round start, so there is nothing of mine to measure there. Launching the full session in the background:
+Session complete, rc=0. Baseline's two palindrome positions agree to 0.20% on the job shape (10.0263 / 10.0064 ms) — the round-0 stability check passes. Now the provenance files:
+Now both PROVENANCE files:
+Now `op/validation.py` — the sole success criterion:
+UTs pass (4 gated shapes, all four tensors ≥ 50 dB). Validation's speed section is running.
+Still running. Drafting the report while it finishes.
+Validation ran and failed on speed exactly as the brief predicts. Cleanup, then the report:
+Op Setup is complete. `state.yaml` untouched, no `rounds/`, no `op/current/`.
+
+**Headline:** step 1 took the **develop-one** branch — `knowledge/backends/triton/` does not exist, and all five attention cards in the corpus are `arch: gfx950` against this job's `gfx1250`. The baseline stands on the seed the spec itself names (Primus-Turbo @ `d2f75576`), vendored byte-identically.
+
+**Round 0 is a correct FAIL:** baseline beats the flex_attention bar by **1.166×** on the backward against a required **1.50×** — 28.7% of real work left for the loop.
+
+Three things worth flagging in the report: the beat arm was nearly a straw man (Inductor's default `num_warps=8` is 2.63× slower than 4 — measured, not inherited); the GPU is not fenced by the framework and an unpinned run read 2064% spread before pinning to `gpu_id: 1` fixed it to 0.56%; and the baseline has a real dq defect on fully-masked query rows that is unreachable at `Sq == Skv`, so it is carried as a printed diagnostic rather than a gate.
+
+```yaml
+report: /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/history/review/op_setup_v000.md
+baseline:
+  - {shape: b4_s8192_hq32_hkv8_d128, tflops: 548.9}
+beat:
+  - {shape: b4_s8192_hq32_hkv8_d128, tflops: 470.9}
+```

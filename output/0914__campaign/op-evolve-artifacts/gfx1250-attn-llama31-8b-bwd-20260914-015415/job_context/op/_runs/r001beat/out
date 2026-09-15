@@ -1,0 +1,165 @@
++ R=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds
++ for r in beat 001 beat 001
++ case $r in
++ I=beat
++ echo '---- beat'
++ python -u op/benchmark.py --impl beat --shape all --iters 30 --warmup-s 3.0
+---- beat
+[bench] impl=beat shape=b4_s8192_hq32_hkv8_d128
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=3.7012 fwd_tflops=594.22 fwd_gbps=181.3 fwd_spread_pct=7.66
+[bench]   bwd_ms=11.6887 bwd_tflops=470.39 bwd_gbps=114.8 bwd_spread_pct=2.79
+[bench]   fwd_min_ms=3.5671 fwd_max_ms=3.8947 bwd_min_ms=11.4438 bwd_max_ms=12.0983
+[bench]   total_ms=15.3898 peak_mem_gib=1.51
+[bench]   fingerprint={"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}
+[bench] impl=beat shape=sq_lt_skv
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.2000 fwd_tflops=515.67 fwd_gbps=503.4 fwd_spread_pct=0.94
+[bench]   bwd_ms=0.7256 bwd_tflops=355.28 bwd_gbps=277.5 bwd_spread_pct=7.79
+[bench]   fwd_min_ms=0.1989 fwd_max_ms=0.2407 bwd_min_ms=0.6928 bwd_max_ms=0.7542
+[bench]   total_ms=0.9255 peak_mem_gib=1.51
+[bench]   fingerprint={"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}
+[bench] impl=beat shape=min_seqlen
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.0649 fwd_tflops=132.54 fwd_gbps=645.9 fwd_spread_pct=7.09
+[bench]   bwd_ms=0.1435 bwd_tflops=149.99 bwd_gbps=584.8 bwd_spread_pct=3.94
+[bench]   fwd_min_ms=0.0629 fwd_max_ms=0.0702 bwd_min_ms=0.1419 bwd_max_ms=0.1646
+[bench]   total_ms=0.2084 peak_mem_gib=1.51
+[bench]   fingerprint={"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}
+[bench] impl=beat shape=ragged_tail
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.1443 fwd_tflops=227.32 fwd_gbps=567.7 fwd_spread_pct=1.22
+[bench]   bwd_ms=0.6754 bwd_tflops=121.41 bwd_gbps=242.6 bwd_spread_pct=18.42
+[bench]   fwd_min_ms=0.1435 fwd_max_ms=0.1833 bwd_min_ms=0.5427 bwd_max_ms=0.7283
+[bench]   total_ms=0.8197 peak_mem_gib=1.51
+[bench]   fingerprint={"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}
+[bench] impl=beat shape=sq_gt_skv
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.1979 fwd_tflops=173.81 fwd_gbps=763.1 fwd_spread_pct=5.99
+[bench]   bwd_ms=0.5256 bwd_tflops=163.60 bwd_gbps=574.6 bwd_spread_pct=11.50
+[bench]   fwd_min_ms=0.1886 fwd_max_ms=0.2368 bwd_min_ms=0.4725 bwd_max_ms=0.5515
+[bench]   total_ms=0.7234 peak_mem_gib=1.51
+[bench]   fingerprint={"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}
++ for r in beat 001 beat 001
++ case $r in
++ I=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/001/op
++ echo '---- 001'
++ python -u op/benchmark.py --impl /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/001/op --shape all --iters 30 --warmup-s 3.0
+---- 001
+[bench] impl=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/001/op shape=b4_s8192_hq32_hkv8_d128
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=4.9717 fwd_tflops=442.36 fwd_gbps=135.0 fwd_spread_pct=3.66
+[bench]   bwd_ms=8.6857 bwd_tflops=633.02 bwd_gbps=154.5 bwd_spread_pct=0.49
+[bench]   fwd_min_ms=4.8480 fwd_max_ms=5.1374 bwd_min_ms=8.6499 bwd_max_ms=8.9274
+[bench]   total_ms=13.6574 peak_mem_gib=1.27
+[bench]   fingerprint={"in_thread_transpose": "1", "onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 0}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "407fa48b924f2266"}, "tile_for_8192": 256}
+[bench] impl=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/001/op shape=sq_lt_skv
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.3039 fwd_tflops=339.26 fwd_gbps=331.2 fwd_spread_pct=3.57
+[bench]   bwd_ms=0.7235 bwd_tflops=356.28 bwd_gbps=278.3 bwd_spread_pct=0.84
+[bench]   fwd_min_ms=0.2962 fwd_max_ms=0.5591 bwd_min_ms=0.7177 bwd_max_ms=0.8318
+[bench]   total_ms=1.0275 peak_mem_gib=1.27
+[bench]   fingerprint={"in_thread_transpose": "1", "onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 0}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "407fa48b924f2266"}, "tile_for_8192": 256}
+[bench] impl=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/001/op shape=min_seqlen
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.2871 fwd_tflops=29.98 fwd_gbps=146.1 fwd_spread_pct=4.34
+[bench]   bwd_ms=0.1568 bwd_tflops=137.19 bwd_gbps=534.9 bwd_spread_pct=3.07
+[bench]   fwd_min_ms=0.2784 fwd_max_ms=0.3055 bwd_min_ms=0.1532 bwd_max_ms=0.2726
+[bench]   total_ms=0.4439 peak_mem_gib=1.27
+[bench]   fingerprint={"in_thread_transpose": "1", "onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 0}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "407fa48b924f2266"}, "tile_for_8192": 256}
+[bench] impl=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/001/op shape=ragged_tail
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.2626 fwd_tflops=124.91 fwd_gbps=312.0 fwd_spread_pct=4.41
+[bench]   bwd_ms=0.2718 bwd_tflops=301.67 bwd_gbps=602.7 bwd_spread_pct=1.65
+[bench]   fwd_min_ms=0.2565 fwd_max_ms=0.3844 bwd_min_ms=0.2699 bwd_max_ms=0.3776
+[bench]   total_ms=0.5344 peak_mem_gib=1.27
+[bench]   fingerprint={"in_thread_transpose": "1", "onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 0}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "407fa48b924f2266"}, "tile_for_8192": 256}
+[bench] impl=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/001/op shape=sq_gt_skv
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.2632 fwd_tflops=130.70 fwd_gbps=573.8 fwd_spread_pct=9.54
+[bench]   bwd_ms=0.3456 bwd_tflops=248.82 bwd_gbps=873.9 bwd_spread_pct=1.79
+[bench]   fwd_min_ms=0.2432 fwd_max_ms=0.3914 bwd_min_ms=0.3427 bwd_max_ms=0.4367
+[bench]   total_ms=0.6087 peak_mem_gib=1.27
+[bench]   fingerprint={"in_thread_transpose": "1", "onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 0}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "407fa48b924f2266"}, "tile_for_8192": 256}
+---- beat
++ for r in beat 001 beat 001
++ case $r in
++ I=beat
++ echo '---- beat'
++ python -u op/benchmark.py --impl beat --shape all --iters 30 --warmup-s 3.0
+[bench] impl=beat shape=b4_s8192_hq32_hkv8_d128
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=3.7040 fwd_tflops=593.76 fwd_gbps=181.2 fwd_spread_pct=8.71
+[bench]   bwd_ms=11.6720 bwd_tflops=471.06 bwd_gbps=115.0 bwd_spread_pct=2.45
+[bench]   fwd_min_ms=3.5679 fwd_max_ms=3.9400 bwd_min_ms=11.4924 bwd_max_ms=11.8805
+[bench]   total_ms=15.3760 peak_mem_gib=1.51
+[bench]   fingerprint={"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}
+[bench] impl=beat shape=sq_lt_skv
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.1992 fwd_tflops=517.53 fwd_gbps=505.2 fwd_spread_pct=1.21
+[bench]   bwd_ms=0.7215 bwd_tflops=357.28 bwd_gbps=279.0 bwd_spread_pct=7.03
+[bench]   fwd_min_ms=0.1975 fwd_max_ms=0.2410 bwd_min_ms=0.6924 bwd_max_ms=0.7492
+[bench]   total_ms=0.9208 peak_mem_gib=1.51
+[bench]   fingerprint={"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}
+[bench] impl=beat shape=min_seqlen
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.0630 fwd_tflops=136.58 fwd_gbps=665.6 fwd_spread_pct=5.91
+[bench]   bwd_ms=0.1432 bwd_tflops=150.31 bwd_gbps=586.0 bwd_spread_pct=2.41
+[bench]   fwd_min_ms=0.0613 fwd_max_ms=0.0712 bwd_min_ms=0.1416 bwd_max_ms=0.1937
+[bench]   total_ms=0.2062 peak_mem_gib=1.51
+[bench]   fingerprint={"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}
+[bench] impl=beat shape=ragged_tail
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.1442 fwd_tflops=227.47 fwd_gbps=568.1 fwd_spread_pct=1.25
+[bench]   bwd_ms=0.6744 bwd_tflops=121.59 bwd_gbps=242.9 bwd_spread_pct=18.31
+[bench]   fwd_min_ms=0.1434 fwd_max_ms=0.1842 bwd_min_ms=0.5386 bwd_max_ms=0.6963
+[bench]   total_ms=0.8186 peak_mem_gib=1.51
+[bench]   fingerprint={"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}
+[bench] impl=beat shape=sq_gt_skv
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.1988 fwd_tflops=172.99 fwd_gbps=759.5 fwd_spread_pct=6.51
+[bench]   bwd_ms=0.5252 bwd_tflops=163.73 bwd_gbps=575.0 bwd_spread_pct=10.58
+[bench]   fwd_min_ms=0.1880 fwd_max_ms=0.2364 bwd_min_ms=0.4752 bwd_max_ms=0.5570
+[bench]   total_ms=0.7240 peak_mem_gib=1.51
+[bench]   fingerprint={"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}
++ for r in beat 001 beat 001
++ case $r in
++ I=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/001/op
++ echo '---- 001'
++ python -u op/benchmark.py --impl /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/001/op --shape all --iters 30 --warmup-s 3.0
+---- 001
+[bench] impl=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/001/op shape=b4_s8192_hq32_hkv8_d128
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=4.9589 fwd_tflops=443.50 fwd_gbps=135.3 fwd_spread_pct=3.57
+[bench]   bwd_ms=8.6792 bwd_tflops=633.49 bwd_gbps=154.6 bwd_spread_pct=0.30
+[bench]   fwd_min_ms=4.8181 fwd_max_ms=5.1849 bwd_min_ms=8.6553 bwd_max_ms=8.8130
+[bench]   total_ms=13.6381 peak_mem_gib=1.27
+[bench]   fingerprint={"in_thread_transpose": "1", "onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 0}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "407fa48b924f2266"}, "tile_for_8192": 256}
+[bench] impl=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/001/op shape=sq_lt_skv
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.3064 fwd_tflops=336.49 fwd_gbps=328.5 fwd_spread_pct=4.13
+[bench]   bwd_ms=0.7239 bwd_tflops=356.09 bwd_gbps=278.1 bwd_spread_pct=0.92
+[bench]   fwd_min_ms=0.2993 fwd_max_ms=0.5458 bwd_min_ms=0.7215 bwd_max_ms=0.8209
+[bench]   total_ms=1.0304 peak_mem_gib=1.27
+[bench]   fingerprint={"in_thread_transpose": "1", "onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 0}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "407fa48b924f2266"}, "tile_for_8192": 256}
+[bench] impl=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/001/op shape=min_seqlen
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.2574 fwd_tflops=33.43 fwd_gbps=162.9 fwd_spread_pct=3.56
+[bench]   bwd_ms=0.1587 bwd_tflops=135.62 bwd_gbps=528.7 bwd_spread_pct=4.87
+[bench]   fwd_min_ms=0.2544 fwd_max_ms=0.2834 bwd_min_ms=0.1533 bwd_max_ms=0.2625
+[bench]   total_ms=0.4161 peak_mem_gib=1.27
+[bench]   fingerprint={"in_thread_transpose": "1", "onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 0}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "407fa48b924f2266"}, "tile_for_8192": 256}
+[bench] impl=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/001/op shape=ragged_tail
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.2619 fwd_tflops=125.26 fwd_gbps=312.8 fwd_spread_pct=3.38
+[bench]   bwd_ms=0.2691 bwd_tflops=304.75 bwd_gbps=608.9 bwd_spread_pct=1.91
+[bench]   fwd_min_ms=0.2560 fwd_max_ms=0.3674 bwd_min_ms=0.2662 bwd_max_ms=0.3674
+[bench]   total_ms=0.5309 peak_mem_gib=1.27
+[bench]   fingerprint={"in_thread_transpose": "1", "onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 0}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "407fa48b924f2266"}, "tile_for_8192": 256}
+[bench] impl=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/001/op shape=sq_gt_skv
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.2631 fwd_tflops=130.71 fwd_gbps=573.8 fwd_spread_pct=6.18
+[bench]   bwd_ms=0.3446 bwd_tflops=249.53 bwd_gbps=876.4 bwd_spread_pct=1.79
+[bench]   fwd_min_ms=0.2455 fwd_max_ms=0.3766 bwd_min_ms=0.3420 bwd_max_ms=0.4297
+[bench]   total_ms=0.6077 peak_mem_gib=1.27
+[bench]   fingerprint={"in_thread_transpose": "1", "onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 0}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "407fa48b924f2266"}, "tile_for_8192": 256}

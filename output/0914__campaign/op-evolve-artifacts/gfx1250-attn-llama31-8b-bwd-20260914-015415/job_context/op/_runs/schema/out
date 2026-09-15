@@ -1,0 +1,6 @@
+[probe] start: has_kernel=False
+[probe] after candidate load: has_kernel=True
+[probe] after gc: has_kernel=True
+[probe] after eager+gc: has_kernel=True
+[probe] after correctness+gc: has_kernel=True
+[probe] after 5x gc: has_kernel=True

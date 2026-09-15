@@ -1,0 +1,38 @@
+
+
+============================ ROCm System Management Interface ============================
+=================================== % time GPU is busy ===================================
+GPU[0]		: GPU use (%): 100
+GPU[1]		: GPU use (%): 0
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+==========================================================================================
+=================================== Current Memory Use ===================================
+GPU[0]		: GPU Memory Allocated (VRAM%): 60
+GPU[0]		: GPU Memory Read/Write Activity (%): 35
+GPU[0]		: Memory Activity: N/A
+GPU[0]		: Not supported on the given system
+GPU[1]		: GPU Memory Allocated (VRAM%): 0
+GPU[1]		: GPU Memory Read/Write Activity (%): 0
+GPU[1]		: Memory Activity: N/A
+GPU[1]		: Not supported on the given system
+GPU[2]		: GPU Memory Allocated (VRAM%): 0
+GPU[2]		: GPU Memory Read/Write Activity (%): 0
+GPU[2]		: Memory Activity: N/A
+GPU[2]		: Not supported on the given system
+GPU[3]		: GPU Memory Allocated (VRAM%): 0
+GPU[3]		: GPU Memory Read/Write Activity (%): 0
+GPU[3]		: Memory Activity: N/A
+GPU[3]		: Not supported on the given system
+==========================================================================================
+===================================== KFD Processes ======================================
+KFD process information:
+PID    	PROCESS NAME	GPU(s)	VRAM USED   	SDMA USED	CU OCCUPANCY	
+1474958	UNKNOWN     	1     	282213150720	0        	UNKNOWN     	
+1474624	UNKNOWN     	0     	0           	0        	UNKNOWN     	
+1476898	UNKNOWN     	0     	0           	0        	UNKNOWN     	
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+--- dmesg hazard grep ---
+0
+grep found 0

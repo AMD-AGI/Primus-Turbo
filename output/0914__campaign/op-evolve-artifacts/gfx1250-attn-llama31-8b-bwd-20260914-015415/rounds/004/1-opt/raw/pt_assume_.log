@@ -1,0 +1,1 @@
+RESULT {"label": "assume", "ms": 8.691211223602295, "census": {"vgpr": "1024", "spill": "266", "sspill": "67", "sgpr": "107", "scratchB": "1064", "lds": "0", "wmma": 448, "msb": 1666, "sload": 265, "sstore": 128, "ds": 656, "ninstr": 9547}, "absum": [3694818.5, 1474473.625, 1492202.25]}

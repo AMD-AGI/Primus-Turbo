@@ -1,0 +1,1 @@
+RESULT {"label": "dkdv_unroll2", "ms": 25.680684089660645, "census": {"vgpr": "1024", "spill": "3678", "sspill": "150", "sgpr": "107", "scratchB": "4212", "lds": "0", "wmma": 960, "msb": 3297, "sload": 1590, "sstore": 1130, "ds": 1142, "ninstr": 18985}, "absum": [3694818.5, 1474473.625, 1492202.25]}

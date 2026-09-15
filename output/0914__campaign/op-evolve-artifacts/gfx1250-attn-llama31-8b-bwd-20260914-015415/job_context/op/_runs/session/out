@@ -1,0 +1,174 @@
+[bench] impl=baseline shape=b4_s8192_hq32_hkv8_d128
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=4.9478 fwd_tflops=444.49 fwd_gbps=135.6 fwd_spread_pct=4.24
+[bench]   bwd_ms=10.0263 bwd_tflops=548.38 bwd_gbps=133.9 bwd_spread_pct=0.82
+[bench]   fwd_min_ms=4.8338 fwd_max_ms=5.2741 bwd_min_ms=9.9568 bwd_max_ms=10.2693
+[bench]   total_ms=14.9742 peak_mem_gib=1.27
+[bench]   fingerprint={"onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 1}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "35473f68bcccd859"}, "tile_for_8192": 256}
+[json] {"bwd_bytes": 1342177280, "bwd_flop": 5498229227520.0, "bwd_gbps": 133.86550277059928, "bwd_max_ms": 10.269256591796875, "bwd_min_ms": 9.956828117370605, "bwd_ms": 10.026311874389648, "bwd_spread_pct": 0.8246752937931296, "bwd_tflops": 548.3800320997599, "fingerprint": {"onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 1}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "35473f68bcccd859"}, "tile_for_8192": 256}, "fwd_bytes": 671088640, "fwd_flop": 2199291691008.0, "fwd_gbps": 135.63241317424206, "fwd_max_ms": 5.274056911468506, "fwd_min_ms": 4.833837985992432, "fwd_ms": 4.947848558425903, "fwd_spread_pct": 4.240935226946211, "fwd_tflops": 444.49454445462607, "impl": "baseline", "iters": 30, "peak_mem_gib": 1.26568603515625, "shape": "b4_s8192_hq32_hkv8_d128", "statistic": "median", "total_ms": 14.974160432815552, "warmup_calls_bwd": 300, "warmup_calls_fwd": 600, "warmup_s": 3.0}
+[bench] impl=beat shape=b4_s8192_hq32_hkv8_d128
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=3.7575 fwd_tflops=585.31 fwd_gbps=178.6 fwd_spread_pct=8.35
+[bench]   bwd_ms=11.6449 bwd_tflops=472.16 bwd_gbps=115.3 bwd_spread_pct=2.49
+[bench]   fwd_min_ms=3.5637 fwd_max_ms=3.9002 bwd_min_ms=11.4660 bwd_max_ms=11.8922
+[bench]   total_ms=15.4023 peak_mem_gib=1.51
+[bench]   fingerprint={"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}
+[json] {"bwd_bytes": 1342177280, "bwd_flop": 5498229227520.0, "bwd_gbps": 115.2592378810234, "bwd_max_ms": 11.89224624633789, "bwd_min_ms": 11.46596908569336, "bwd_ms": 11.644856452941895, "bwd_spread_pct": 2.4923924187649056, "bwd_tflops": 472.1594679796123, "fingerprint": {"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}, "fwd_bytes": 671088640, "fwd_flop": 2199291691008.0, "fwd_gbps": 178.60138351324989, "fwd_max_ms": 3.900160074234009, "fwd_min_ms": 3.5636959075927734, "fwd_ms": 3.7574660778045654, "fwd_spread_pct": 8.347917237073329, "fwd_tflops": 585.3124540496225, "impl": "beat", "iters": 30, "peak_mem_gib": 1.5078754425048828, "shape": "b4_s8192_hq32_hkv8_d128", "statistic": "median", "total_ms": 15.40232253074646, "warmup_calls_bwd": 260, "warmup_calls_fwd": 808, "warmup_s": 3.0}
+[bench] impl=beat shape=b4_s8192_hq32_hkv8_d128
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=3.6596 fwd_tflops=600.97 fwd_gbps=183.4 fwd_spread_pct=7.83
+[bench]   bwd_ms=11.7075 bwd_tflops=469.63 bwd_gbps=114.6 bwd_spread_pct=2.93
+[bench]   fwd_min_ms=3.5618 fwd_max_ms=3.8740 bwd_min_ms=11.4573 bwd_max_ms=11.9637
+[bench]   total_ms=15.3671 peak_mem_gib=1.51
+[bench]   fingerprint={"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}
+[json] {"bwd_bytes": 1342177280, "bwd_flop": 5498229227520.0, "bwd_gbps": 114.6424201755753, "bwd_max_ms": 11.963672637939453, "bwd_min_ms": 11.457275390625, "bwd_ms": 11.707509994506836, "bwd_spread_pct": 2.9334532617303672, "bwd_tflops": 469.63267424924425, "fingerprint": {"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}, "fwd_bytes": 671088640, "fwd_flop": 2199291691008.0, "fwd_gbps": 183.37864950540921, "fwd_max_ms": 3.8740410804748535, "fwd_min_ms": 3.5617730617523193, "fwd_ms": 3.6595789194107056, "fwd_spread_pct": 7.831198986356881, "fwd_tflops": 600.9685101591272, "impl": "beat", "iters": 30, "peak_mem_gib": 1.5079383850097656, "shape": "b4_s8192_hq32_hkv8_d128", "statistic": "median", "total_ms": 15.367088913917542, "warmup_calls_bwd": 260, "warmup_calls_fwd": 808, "warmup_s": 3.0}
+[bench] impl=baseline shape=b4_s8192_hq32_hkv8_d128
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=4.9917 fwd_tflops=440.59 fwd_gbps=134.4 fwd_spread_pct=2.64
+[bench]   bwd_ms=10.0064 bwd_tflops=549.47 bwd_gbps=134.1 bwd_spread_pct=0.69
+[bench]   fwd_min_ms=4.8191 fwd_max_ms=5.1890 bwd_min_ms=9.9535 bwd_max_ms=10.2741
+[bench]   total_ms=14.9980 peak_mem_gib=1.51
+[bench]   fingerprint={"onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 1}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "35473f68bcccd859"}, "tile_for_8192": 256}
+[json] {"bwd_bytes": 1342177280, "bwd_flop": 5498229227520.0, "bwd_gbps": 134.13238709762174, "bwd_max_ms": 10.274104118347168, "bwd_min_ms": 9.953462600708008, "bwd_ms": 10.006362438201904, "bwd_spread_pct": 0.6929947553148191, "bwd_tflops": 549.4733237454075, "fingerprint": {"onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 1}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "35473f68bcccd859"}, "tile_for_8192": 256}, "fwd_bytes": 671088640, "fwd_flop": 2199291691008.0, "fwd_gbps": 134.44214099379485, "fwd_max_ms": 5.18897008895874, "fwd_min_ms": 4.819056034088135, "fwd_ms": 4.991653919219971, "fwd_spread_pct": 2.636341465441668, "fwd_tflops": 440.59378446486454, "impl": "baseline", "iters": 30, "peak_mem_gib": 1.5079383850097656, "shape": "b4_s8192_hq32_hkv8_d128", "statistic": "median", "total_ms": 14.998016357421875, "warmup_calls_bwd": 300, "warmup_calls_fwd": 600, "warmup_s": 3.0}
+[bench] impl=baseline shape=sq_lt_skv
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.3068 fwd_tflops=336.09 fwd_gbps=328.1 fwd_spread_pct=3.25
+[bench]   bwd_ms=0.8063 bwd_tflops=319.69 bwd_gbps=249.7 bwd_spread_pct=0.87
+[bench]   fwd_min_ms=0.3005 fwd_max_ms=0.5723 bwd_min_ms=0.8027 bwd_max_ms=0.9896
+[bench]   total_ms=1.1131 peak_mem_gib=1.51
+[bench]   fingerprint={"onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 1}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "35473f68bcccd859"}, "tile_for_8192": 256}
+[json] {"bwd_bytes": 201326592, "bwd_flop": 257781923840.0, "bwd_gbps": 249.67736757877887, "bwd_max_ms": 0.9895619750022888, "bwd_min_ms": 0.8026819825172424, "bwd_ms": 0.806346982717514, "bwd_spread_pct": 0.8693506905822869, "bwd_tflops": 319.69106273732814, "fingerprint": {"onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 1}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "35473f68bcccd859"}, "tile_for_8192": 256}, "fwd_bytes": 100663296, "fwd_flop": 103112769536.0, "fwd_gbps": 328.1082982378952, "fwd_max_ms": 0.5723369717597961, "fwd_min_ms": 0.30048999190330505, "fwd_ms": 0.3067989945411682, "fwd_spread_pct": 3.2516402502082187, "fwd_tflops": 336.0922668283506, "impl": "baseline", "iters": 30, "peak_mem_gib": 1.5079383850097656, "shape": "sq_lt_skv", "statistic": "median", "total_ms": 1.1131459772586823, "warmup_calls_bwd": 3572, "warmup_calls_fwd": 8212, "warmup_s": 3.0}
+[bench] impl=beat shape=sq_lt_skv
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.1997 fwd_tflops=516.44 fwd_gbps=504.2 fwd_spread_pct=0.70
+[bench]   bwd_ms=0.7118 bwd_tflops=362.17 bwd_gbps=282.9 bwd_spread_pct=7.51
+[bench]   fwd_min_ms=0.1993 fwd_max_ms=0.2465 bwd_min_ms=0.6923 bwd_max_ms=0.7495
+[bench]   total_ms=0.9114 peak_mem_gib=1.51
+[bench]   fingerprint={"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}
+[json] {"bwd_bytes": 201326592, "bwd_flop": 257781923840.0, "bwd_gbps": 282.8550263843854, "bwd_max_ms": 0.7494819760322571, "bwd_min_ms": 0.692317008972168, "bwd_ms": 0.7117660045623779, "bwd_spread_pct": 7.508090305935995, "bwd_tflops": 362.1722900330068, "fingerprint": {"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}, "fwd_bytes": 100663296, "fwd_flop": 103112769536.0, "fwd_gbps": 504.1760881111668, "fwd_max_ms": 0.2465289980173111, "fwd_min_ms": 0.1992579996585846, "fwd_ms": 0.19965900480747223, "fwd_spread_pct": 0.7016999693034252, "fwd_tflops": 516.4443729218718, "impl": "beat", "iters": 30, "peak_mem_gib": 1.5079383850097656, "shape": "sq_lt_skv", "statistic": "median", "total_ms": 0.9114250093698502, "warmup_calls_bwd": 4092, "warmup_calls_fwd": 14384, "warmup_s": 3.0}
+[bench] impl=beat shape=sq_lt_skv
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.1998 fwd_tflops=515.98 fwd_gbps=503.7 fwd_spread_pct=1.28
+[bench]   bwd_ms=0.7154 bwd_tflops=360.33 bwd_gbps=281.4 bwd_spread_pct=7.28
+[bench]   fwd_min_ms=0.1989 fwd_max_ms=0.2475 bwd_min_ms=0.6930 bwd_max_ms=0.7655
+[bench]   total_ms=0.9152 peak_mem_gib=1.51
+[bench]   fingerprint={"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}
+[json] {"bwd_bytes": 201326592, "bwd_flop": 257781923840.0, "bwd_gbps": 281.4138981691742, "bwd_max_ms": 0.7654659748077393, "bwd_min_ms": 0.6929579973220825, "bwd_ms": 0.715410977602005, "bwd_spread_pct": 7.2794533886374415, "bwd_tflops": 360.32704544744684, "fingerprint": {"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}, "fwd_bytes": 100663296, "fwd_flop": 103112769536.0, "fwd_gbps": 503.7219864409298, "fwd_max_ms": 0.24749000370502472, "fwd_min_ms": 0.19889800250530243, "fwd_ms": 0.19983899593353271, "fwd_spread_pct": 1.2830319183522025, "fwd_tflops": 515.9792214443257, "impl": "beat", "iters": 30, "peak_mem_gib": 1.5079383850097656, "shape": "sq_lt_skv", "statistic": "median", "total_ms": 0.9152499735355377, "warmup_calls_bwd": 4112, "warmup_calls_fwd": 14372, "warmup_s": 3.0}
+[bench] impl=baseline shape=sq_lt_skv
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.3064 fwd_tflops=336.49 fwd_gbps=328.5 fwd_spread_pct=3.48
+[bench]   bwd_ms=0.8076 bwd_tflops=319.19 bwd_gbps=249.3 bwd_spread_pct=0.75
+[bench]   fwd_min_ms=0.3004 fwd_max_ms=0.5687 bwd_min_ms=0.8029 bwd_max_ms=0.9091
+[bench]   total_ms=1.1140 peak_mem_gib=1.51
+[bench]   fingerprint={"onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 1}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "35473f68bcccd859"}, "tile_for_8192": 256}
+[json] {"bwd_bytes": 201326592, "bwd_flop": 257781923840.0, "bwd_gbps": 249.2872095641121, "bwd_max_ms": 0.909080982208252, "bwd_min_ms": 0.8029220104217529, "bwd_ms": 0.8076089918613434, "bwd_spread_pct": 0.753832421222427, "bwd_tflops": 319.1914979127152, "fingerprint": {"onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 1}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "35473f68bcccd859"}, "tile_for_8192": 256}, "fwd_bytes": 100663296, "fwd_flop": 103112769536.0, "fwd_gbps": 328.494295067676, "fwd_max_ms": 0.5686910152435303, "fwd_min_ms": 0.30044999718666077, "fwd_ms": 0.30643849074840546, "fwd_spread_pct": 3.4773696860436694, "fwd_tflops": 336.48765624765605, "impl": "baseline", "iters": 30, "peak_mem_gib": 1.5079383850097656, "shape": "sq_lt_skv", "statistic": "median", "total_ms": 1.1140474826097488, "warmup_calls_bwd": 3576, "warmup_calls_fwd": 8144, "warmup_s": 3.0}
+[bench] impl=baseline shape=min_seqlen
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.2731 fwd_tflops=31.51 fwd_gbps=153.6 fwd_spread_pct=12.26
+[bench]   bwd_ms=0.1806 bwd_tflops=119.12 bwd_gbps=464.4 bwd_spread_pct=2.22
+[bench]   fwd_min_ms=0.2586 fwd_max_ms=0.3076 bwd_min_ms=0.1783 bwd_max_ms=0.2816
+[bench]   total_ms=0.4538 peak_mem_gib=1.51
+[bench]   fingerprint={"onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 1}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "35473f68bcccd859"}, "tile_for_8192": 256}
+[json] {"bwd_bytes": 83886080, "bwd_flop": 21516779520.0, "bwd_gbps": 464.40835255449116, "bwd_max_ms": 0.2815819978713989, "bwd_min_ms": 0.17834700644016266, "bwd_ms": 0.18062999844551086, "bwd_spread_pct": 2.2177923974461375, "bwd_tflops": 119.12074243022698, "fingerprint": {"onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 1}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "35473f68bcccd859"}, "tile_for_8192": 256}, "fwd_bytes": 41943040, "fwd_flop": 8606711808.0, "fwd_gbps": 153.5649447936261, "fwd_max_ms": 0.30757999420166016, "fwd_min_ms": 0.2585879862308502, "fwd_ms": 0.27312900125980377, "fwd_spread_pct": 12.26160605458658, "fwd_tflops": 31.511526671652074, "impl": "baseline", "iters": 30, "peak_mem_gib": 1.5079383850097656, "shape": "min_seqlen", "statistic": "median", "total_ms": 0.45375899970531464, "warmup_calls_bwd": 14924, "warmup_calls_fwd": 11268, "warmup_s": 3.0}
+[bench] impl=beat shape=min_seqlen
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.0683 fwd_tflops=125.97 fwd_gbps=613.9 fwd_spread_pct=23.22
+[bench]   bwd_ms=0.1426 bwd_tflops=150.94 bwd_gbps=588.5 bwd_spread_pct=2.89
+[bench]   fwd_min_ms=0.0632 fwd_max_ms=0.2396 bwd_min_ms=0.1402 bwd_max_ms=0.1660
+[bench]   total_ms=0.2109 peak_mem_gib=1.51
+[bench]   fingerprint={"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}
+[json] {"bwd_bytes": 83886080, "bwd_flop": 21516779520.0, "bwd_gbps": 588.4533140955532, "bwd_max_ms": 0.16600899398326874, "bwd_min_ms": 0.14020900428295135, "bwd_ms": 0.14255350083112717, "bwd_spread_pct": 2.8943501212316365, "bwd_tflops": 150.9382750655094, "fingerprint": {"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}, "fwd_bytes": 41943040, "fwd_flop": 8606711808.0, "fwd_gbps": 613.8978919852726, "fwd_max_ms": 0.23963800072669983, "fwd_min_ms": 0.06321500241756439, "fwd_ms": 0.06832250207662582, "fwd_spread_pct": 23.21782848174571, "fwd_tflops": 125.97184743537792, "impl": "beat", "iters": 30, "peak_mem_gib": 1.5079383850097656, "shape": "min_seqlen", "statistic": "median", "total_ms": 0.210876002907753, "warmup_calls_bwd": 20448, "warmup_calls_fwd": 50816, "warmup_s": 3.0}
+[bench] impl=beat shape=min_seqlen
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.0670 fwd_tflops=128.54 fwd_gbps=626.4 fwd_spread_pct=10.89
+[bench]   bwd_ms=0.1437 bwd_tflops=149.78 bwd_gbps=583.9 bwd_spread_pct=3.15
+[bench]   fwd_min_ms=0.0641 fwd_max_ms=0.0760 bwd_min_ms=0.1416 bwd_max_ms=0.1650
+[bench]   total_ms=0.2106 peak_mem_gib=1.51
+[bench]   fingerprint={"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}
+[json] {"bwd_bytes": 83886080, "bwd_flop": 21516779520.0, "bwd_gbps": 583.9392103841628, "bwd_max_ms": 0.16500699520111084, "bwd_min_ms": 0.1416119933128357, "bwd_ms": 0.14365550130605698, "bwd_spread_pct": 3.1512907837539474, "bwd_tflops": 149.78040746353778, "fingerprint": {"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}, "fwd_bytes": 41943040, "fwd_flop": 8606711808.0, "fwd_gbps": 626.3894909218435, "fwd_max_ms": 0.07603400200605392, "fwd_min_ms": 0.06409599632024765, "fwd_ms": 0.06695999950170517, "fwd_spread_pct": 10.887105343710886, "fwd_tflops": 128.5351235371623, "impl": "beat", "iters": 30, "peak_mem_gib": 1.5079383850097656, "shape": "min_seqlen", "statistic": "median", "total_ms": 0.21061550080776215, "warmup_calls_bwd": 20424, "warmup_calls_fwd": 51776, "warmup_s": 3.0}
+[bench] impl=baseline shape=min_seqlen
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.3157 fwd_tflops=27.26 fwd_gbps=132.9 fwd_spread_pct=10.27
+[bench]   bwd_ms=0.1796 bwd_tflops=119.80 bwd_gbps=467.0 bwd_spread_pct=2.99
+[bench]   fwd_min_ms=0.3074 fwd_max_ms=0.3436 bwd_min_ms=0.1753 bwd_max_ms=0.2678
+[bench]   total_ms=0.4953 peak_mem_gib=1.51
+[bench]   fingerprint={"onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 1}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "35473f68bcccd859"}, "tile_for_8192": 256}
+[json] {"bwd_bytes": 83886080, "bwd_flop": 21516779520.0, "bwd_gbps": 467.0470106531544, "bwd_max_ms": 0.2677600085735321, "bwd_min_ms": 0.17526200413703918, "bwd_ms": 0.1796094998717308, "bwd_spread_pct": 2.988147027025054, "bwd_tflops": 119.79755823253412, "fingerprint": {"onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 1}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "35473f68bcccd859"}, "tile_for_8192": 256}, "fwd_bytes": 41943040, "fwd_flop": 8606711808.0, "fwd_gbps": 132.86042619214174, "fwd_max_ms": 0.3435949981212616, "fwd_min_ms": 0.30737999081611633, "fwd_ms": 0.3156924992799759, "fwd_spread_pct": 10.265685473241112, "fwd_tflops": 27.262959454627488, "impl": "baseline", "iters": 30, "peak_mem_gib": 1.5079383850097656, "shape": "min_seqlen", "statistic": "median", "total_ms": 0.4953019991517067, "warmup_calls_bwd": 14920, "warmup_calls_fwd": 11440, "warmup_s": 3.0}
+[bench] impl=baseline shape=ragged_tail
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.2866 fwd_tflops=114.45 fwd_gbps=285.8 fwd_spread_pct=12.16
+[bench]   bwd_ms=0.3135 bwd_tflops=261.54 bwd_gbps=522.6 bwd_spread_pct=1.04
+[bench]   fwd_min_ms=0.2616 fwd_max_ms=0.3764 bwd_min_ms=0.3114 bwd_max_ms=0.3930
+[bench]   total_ms=0.6001 peak_mem_gib=1.51
+[bench]   fingerprint={"onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 1}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "35473f68bcccd859"}, "tile_for_8192": 256}
+[json] {"bwd_bytes": 163840000, "bwd_flop": 82001919999.99998, "bwd_gbps": 522.5664465206306, "bwd_max_ms": 0.39302900433540344, "bwd_min_ms": 0.31138598918914795, "bwd_ms": 0.31352950632572174, "bwd_spread_pct": 1.035312238348234, "bwd_tflops": 261.5445064835756, "fingerprint": {"onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 1}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "35473f68bcccd859"}, "tile_for_8192": 256}, "fwd_bytes": 81920000, "fwd_flop": 32800767999.999996, "fwd_gbps": 285.8443987636678, "fwd_max_ms": 0.376444011926651, "fwd_min_ms": 0.26155200600624084, "fwd_ms": 0.28658948838710785, "fwd_spread_pct": 12.160947802687039, "fwd_tflops": 114.45209726497258, "impl": "baseline", "iters": 30, "peak_mem_gib": 1.5079383850097656, "shape": "ragged_tail", "statistic": "median", "total_ms": 0.6001189947128296, "warmup_calls_bwd": 9060, "warmup_calls_fwd": 10760, "warmup_s": 3.0}
+[bench] impl=beat shape=ragged_tail
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.1444 fwd_tflops=227.09 fwd_gbps=567.2 fwd_spread_pct=1.00
+[bench]   bwd_ms=0.6707 bwd_tflops=122.27 bwd_gbps=244.3 bwd_spread_pct=18.30
+[bench]   fwd_min_ms=0.1439 fwd_max_ms=0.1872 bwd_min_ms=0.5407 bwd_max_ms=0.7215
+[bench]   total_ms=0.8151 peak_mem_gib=1.51
+[bench]   fingerprint={"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}
+[json] {"bwd_bytes": 163840000, "bwd_flop": 82001919999.99998, "bwd_gbps": 244.29502772469283, "bwd_max_ms": 0.7214810252189636, "bwd_min_ms": 0.5407299995422363, "bwd_ms": 0.6706644892692566, "bwd_spread_pct": 18.301843344798378, "bwd_tflops": 122.26966137620875, "fingerprint": {"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}, "fwd_bytes": 81920000, "fwd_flop": 32800767999.999996, "fwd_gbps": 567.169652074114, "fwd_max_ms": 0.18716099858283997, "fwd_min_ms": 0.1438550055027008, "fwd_ms": 0.14443650096654892, "fwd_spread_pct": 0.998362782426995, "fwd_tflops": 227.09472869047525, "impl": "beat", "iters": 30, "peak_mem_gib": 1.5079383850097656, "shape": "ragged_tail", "statistic": "median", "total_ms": 0.8151009902358055, "warmup_calls_bwd": 4516, "warmup_calls_fwd": 19720, "warmup_s": 3.0}
+[bench] impl=beat shape=ragged_tail
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.1444 fwd_tflops=227.13 fwd_gbps=567.2 fwd_spread_pct=0.97
+[bench]   bwd_ms=0.6725 bwd_tflops=121.93 bwd_gbps=243.6 bwd_spread_pct=20.55
+[bench]   fwd_min_ms=0.1439 fwd_max_ms=0.1848 bwd_min_ms=0.5388 bwd_max_ms=0.7363
+[bench]   total_ms=0.8169 peak_mem_gib=1.51
+[bench]   fingerprint={"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}
+[json] {"bwd_bytes": 163840000, "bwd_flop": 82001919999.99998, "bwd_gbps": 243.62572123662622, "bwd_max_ms": 0.7363420128822327, "bwd_min_ms": 0.5387669801712036, "bwd_ms": 0.6725069880485535, "bwd_spread_pct": 20.545059978489373, "bwd_tflops": 121.93467347893139, "fingerprint": {"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}, "fwd_bytes": 81920000, "fwd_flop": 32800767999.999996, "fwd_gbps": 567.2462273370891, "fwd_max_ms": 0.1848369985818863, "fwd_min_ms": 0.14393499493598938, "fwd_ms": 0.14441700279712677, "fwd_spread_pct": 0.9714949790340377, "fwd_tflops": 227.12538942577044, "impl": "beat", "iters": 30, "peak_mem_gib": 1.5079383850097656, "shape": "ragged_tail", "statistic": "median", "total_ms": 0.8169239908456802, "warmup_calls_bwd": 4532, "warmup_calls_fwd": 19784, "warmup_s": 3.0}
+[bench] impl=baseline shape=ragged_tail
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.2682 fwd_tflops=122.29 fwd_gbps=305.4 fwd_spread_pct=8.63
+[bench]   bwd_ms=0.3150 bwd_tflops=260.36 bwd_gbps=520.2 bwd_spread_pct=0.55
+[bench]   fwd_min_ms=0.2613 fwd_max_ms=0.3903 bwd_min_ms=0.3138 bwd_max_ms=0.4095
+[bench]   total_ms=0.5832 peak_mem_gib=1.51
+[bench]   fingerprint={"onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 1}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "35473f68bcccd859"}, "tile_for_8192": 256}
+[json] {"bwd_bytes": 163840000, "bwd_flop": 82001919999.99998, "bwd_gbps": 520.2062520399369, "bwd_max_ms": 0.4095340073108673, "bwd_min_ms": 0.3137899935245514, "bwd_ms": 0.3149520009756088, "bwd_spread_pct": 0.5467525161133306, "bwd_tflops": 260.3632291459883, "fingerprint": {"onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 1}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "35473f68bcccd859"}, "tile_for_8192": 256}, "fwd_bytes": 81920000, "fwd_flop": 32800767999.999996, "fwd_gbps": 305.4186409944759, "fwd_max_ms": 0.3903450071811676, "fwd_min_ms": 0.26131099462509155, "fwd_ms": 0.26822200417518616, "fwd_spread_pct": 8.63239784458664, "fwd_tflops": 122.28962385418814, "impl": "baseline", "iters": 30, "peak_mem_gib": 1.5079383850097656, "shape": "ragged_tail", "statistic": "median", "total_ms": 0.583174005150795, "warmup_calls_bwd": 8940, "warmup_calls_fwd": 10648, "warmup_s": 3.0}W0914 02:27:12.267000 8260 torch/_dynamo/convert_frame.py:1743] [0/8] torch._dynamo hit config.recompile_limit (8)
+W0914 02:27:12.267000 8260 torch/_dynamo/convert_frame.py:1743] [0/8]    function: 'flex_attention' (/opt/venv/lib/python3.12/site-packages/torch/nn/attention/flex_attention.py:1468)
+W0914 02:27:12.267000 8260 torch/_dynamo/convert_frame.py:1743] [0/8]    last reason: 0/7: tensor 'key' size mismatch at index 2. expected 1000, actual 1024
+W0914 02:27:12.267000 8260 torch/_dynamo/convert_frame.py:1743] [0/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+W0914 02:27:12.267000 8260 torch/_dynamo/convert_frame.py:1743] [0/8] To diagnose recompilation issues, see https://docs.pytorch.org/docs/main/user_guide/torch_compiler/compile/programming_model.recompilation.html
+/opt/venv/lib/python3.12/site-packages/torch/nn/attention/flex_attention.py:1704: UserWarning: flex_attention called without torch.compile() - this will use an unfused implementation that materializes the full scores matrix instead of generating a fused kernel.
+
+SOLUTION: Use torch.compile(flex_attention)(...)
+
+If you want to debug your score_mod/mask_mod, you can set:
+torch.nn.attention.flex_attention._FLEX_ATTENTION_DISABLE_COMPILE_DEBUG = True
+
+This will allow you to use print statements or breakpoints. Note: This doesn't work with the backwards pass and may produce incorrect results.
+  _warn_once(
+
+[bench] impl=baseline shape=sq_gt_skv
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.2600 fwd_tflops=132.28 fwd_gbps=580.7 fwd_spread_pct=11.34
+[bench]   bwd_ms=0.3963 bwd_tflops=216.95 bwd_gbps=762.0 bwd_spread_pct=1.23
+[bench]   fwd_min_ms=0.2446 fwd_max_ms=0.3974 bwd_min_ms=0.3935 bwd_max_ms=0.4922
+[bench]   total_ms=0.6563 peak_mem_gib=1.51
+[bench]   fingerprint={"onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 1}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "35473f68bcccd859"}, "tile_for_8192": 256}
+[json] {"bwd_bytes": 301989888, "bwd_flop": 85983232000.0, "bwd_gbps": 761.9599995280463, "bwd_max_ms": 0.4922170042991638, "bwd_min_ms": 0.3934690058231354, "bwd_ms": 0.3963329941034317, "bwd_spread_pct": 1.2330502122815727, "bwd_tflops": 216.94694431006872, "fingerprint": {"onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 1}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "35473f68bcccd859"}, "tile_for_8192": 256}, "fwd_bytes": 150994944, "fwd_flop": 34393292800.0, "fwd_gbps": 580.7285714849424, "fwd_max_ms": 0.39735499024391174, "fwd_min_ms": 0.24460700154304504, "fwd_ms": 0.2600094974040985, "fwd_spread_pct": 11.339581505858636, "fwd_tflops": 132.27706350490357, "impl": "baseline", "iters": 30, "peak_mem_gib": 1.5079383850097656, "shape": "sq_gt_skv", "statistic": "median", "total_ms": 0.6563424915075302, "warmup_calls_bwd": 7248, "warmup_calls_fwd": 10696, "warmup_s": 3.0}
+[bench] impl=beat shape=sq_gt_skv
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=4.4850 fwd_tflops=7.67 fwd_gbps=33.7 fwd_spread_pct=7.90
+[bench]   bwd_ms=7.6498 bwd_tflops=11.24 bwd_gbps=39.5 bwd_spread_pct=1.34
+[bench]   fwd_min_ms=4.4234 fwd_max_ms=7.0841 bwd_min_ms=7.5672 bwd_max_ms=7.7763
+[bench]   total_ms=12.1347 peak_mem_gib=7.13
+[bench]   fingerprint={"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}
+[json] {"bwd_bytes": 301989888, "bwd_flop": 85983232000.0, "bwd_gbps": 39.47706910639195, "bwd_max_ms": 7.7763237953186035, "bwd_min_ms": 7.567171096801758, "bwd_ms": 7.649754524230957, "bwd_spread_pct": 1.3432216950041695, "bwd_tflops": 11.239998842792154, "fingerprint": {"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}, "fwd_bytes": 150994944, "fwd_flop": 34393292800.0, "fwd_gbps": 33.66683751735726, "fwd_max_ms": 7.084126949310303, "fwd_min_ms": 4.423384189605713, "fwd_ms": 4.484975576400757, "fwd_spread_pct": 7.901271950111398, "fwd_tflops": 7.668557434509155, "impl": "beat", "iters": 30, "peak_mem_gib": 7.1301774978637695, "shape": "sq_gt_skv", "statistic": "median", "total_ms": 12.134730100631714, "warmup_calls_bwd": 392, "warmup_calls_fwd": 568, "warmup_s": 3.0}
+[bench] impl=beat shape=sq_gt_skv
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=4.4840 fwd_tflops=7.67 fwd_gbps=33.7 fwd_spread_pct=1.86
+[bench]   bwd_ms=7.6582 bwd_tflops=11.23 bwd_gbps=39.4 bwd_spread_pct=1.92
+[bench]   fwd_min_ms=4.4321 fwd_max_ms=7.0794 bwd_min_ms=7.5631 bwd_max_ms=7.7612
+[bench]   total_ms=12.1422 peak_mem_gib=7.13
+[bench]   fingerprint={"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}
+[json] {"bwd_bytes": 301989888, "bwd_flop": 85983232000.0, "bwd_gbps": 39.433394871542085, "bwd_max_ms": 7.7612199783325195, "bwd_min_ms": 7.563124179840088, "bwd_ms": 7.65822696685791, "bwd_spread_pct": 1.9150627385282595, "bwd_tflops": 11.227563817591843, "fingerprint": {"bwd_num_warps": 4, "library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0"}, "fwd_bytes": 150994944, "fwd_flop": 34393292800.0, "fwd_gbps": 33.67450816618478, "fwd_max_ms": 7.079440116882324, "fwd_min_ms": 4.4320759773254395, "fwd_ms": 4.483953952789307, "fwd_spread_pct": 1.8645332557454735, "fwd_tflops": 7.670304637853199, "impl": "beat", "iters": 30, "peak_mem_gib": 7.1301774978637695, "shape": "sq_gt_skv", "statistic": "median", "total_ms": 12.142180919647217, "warmup_calls_bwd": 392, "warmup_calls_fwd": 584, "warmup_s": 3.0}
+[bench] impl=baseline shape=sq_gt_skv
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=0.2896 fwd_tflops=118.76 fwd_gbps=521.4 fwd_spread_pct=12.24
+[bench]   bwd_ms=0.3962 bwd_tflops=217.01 bwd_gbps=762.2 bwd_spread_pct=1.70
+[bench]   fwd_min_ms=0.2605 fwd_max_ms=0.3921 bwd_min_ms=0.3931 bwd_max_ms=0.4710
+[bench]   total_ms=0.6858 peak_mem_gib=7.13
+[bench]   fingerprint={"onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 1}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "35473f68bcccd859"}, "tile_for_8192": 256}
+[json] {"bwd_bytes": 301989888, "bwd_flop": 85983232000.0, "bwd_gbps": 762.189795932025, "bwd_max_ms": 0.4710249900817871, "bwd_min_ms": 0.3931080102920532, "bwd_ms": 0.39621350169181824, "bwd_spread_pct": 1.6985842273161245, "bwd_tflops": 217.01237245286822, "fingerprint": {"onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 1}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "35473f68bcccd859"}, "tile_for_8192": 256}, "fwd_bytes": 150994944, "fwd_flop": 34393292800.0, "fwd_gbps": 521.4030787942619, "fwd_max_ms": 0.39206698536872864, "fwd_min_ms": 0.2604700028896332, "fwd_ms": 0.28959350287914276, "fwd_spread_pct": 12.24232980765802, "fwd_tflops": 118.76403461424854, "impl": "baseline", "iters": 30, "peak_mem_gib": 7.1301774978637695, "shape": "sq_gt_skv", "statistic": "median", "total_ms": 0.685807004570961, "warmup_calls_bwd": 7252, "warmup_calls_fwd": 10448, "warmup_s": 3.0}

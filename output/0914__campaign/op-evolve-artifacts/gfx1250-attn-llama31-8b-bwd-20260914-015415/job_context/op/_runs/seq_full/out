@@ -1,0 +1,6 @@
+corr b4_s8192_hq32_hkv8_d128 True
+corr sq_lt_skv True
+corr min_seqlen True
+corr ragged_tail True
+corr sq_gt_skv False
+bench OK bwd_ms=9.5714

@@ -1,0 +1,7 @@
+[ok  ] reach          ctheliosp-1b112-a37-1.mnb.dcgpu (kfd) via docker
+[ok  ] torch gemm     torch   2.11.0+rocm7.14.0a20260625 | gemm    4096^3 bf16  1.116 ms  123.2 TFLOP/s
+[ok  ] shared path    verified both directions at /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415
+[ok  ] counters       GRBM_COUNT, 27 rows
+[ok  ] decoder        reachable; the profiling agent may fetch it
+[ok  ] written            /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/env/README.md
+EXIT=0

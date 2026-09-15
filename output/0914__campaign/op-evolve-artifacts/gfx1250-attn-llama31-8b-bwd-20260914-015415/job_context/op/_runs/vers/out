@@ -1,0 +1,1 @@
+LIBVER {"library": "torch.nn.attention.flex_attention", "torch": "2.11.0+rocm7.14.0a20260625", "triton": "3.6.0", "bwd_num_warps": 4}

@@ -1,0 +1,1 @@
+timeout 30 rocm-smi --showuse --showmemuse --showpids 2>&1 | head -40; echo '--- dmesg hazard grep ---'; dmesg 2>/dev/null | tail -200 | grep -cE 'MES\(|GPU Hang|wait for reset ack' || echo 'grep found 0'

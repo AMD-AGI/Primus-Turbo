@@ -1,0 +1,84 @@
+[runjob] launched key=valAdbg pid=1893989
+[W914 03:04:09.426871346 Module.cpp:204] symbolizing C++ stack trace for exception; if this hangs, rerun with TORCH_DISABLE_ADDR2LINE=1...
+
+==============================================================================
+CORRECTNESS  /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/001/arms/A  vs op/eager/  (gate: all four tensors >= 50 dB)
+------------------------------------------------------------------------------
+shape                           out       dq       dk       dv   verdict
+b4_s8192_hq32_hkv8_d128       53.67    52.24    52.31    52.71   pass
+sq_lt_skv                     53.01    52.50    52.58    52.57   pass
+min_seqlen                    54.09    52.04    52.08    52.77   pass
+ragged_tail                   53.99    52.09    52.15    52.75   pass
+sq_gt_skv                     53.97   -15.95    52.10    52.72   fail  (diagnostic, not gated)
+==============================================================================
+SPEED  statistic=median  iters=5  warmup_s=0.5  order=A>beat>baseline>baseline>beat>A
+Traceback (most recent call last):
+  File "/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/op/validation.py", line 185, in <module>
+    sys.exit(main(sys.argv))
+             ^^^^^^^^^^^^^^
+  File "/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/op/validation.py", line 148, in main
+    speed = measure_speed(impl_dir, iters, warmup_s)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/op/validation.py", line 118, in measure_speed
+    r = benchmark.measure(arm, shape, iters=iters, warmup_s=warmup_s)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/op/benchmark.py", line 170, in measure
+    out = fwd()
+          ^^^^^
+  File "/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/op/benchmark.py", line 168, in <lambda>
+    fwd = lambda: mod.attention(q, k, v, causal=causal)  # noqa: E731
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/001/arms/A/impl.py", line 135, in attention
+    return _Attention.apply(q, k, v, causal, softmax_scale)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/venv/lib/python3.12/site-packages/torch/autograd/function.py", line 596, in apply
+    return super().apply(*args, **kwargs)  # type: ignore[misc]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/001/arms/A/impl.py", line 109, in forward
+    out, lse = dense_forward(q, k, v, softmax_scale, causal)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/001/arms/A/vendor/primus_turbo/pytorch/kernels/attention/attention_triton_impl.py", line 704, in dense_forward
+    out, lse, _ = attention_triton_forward_impl(
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/venv/lib/python3.12/site-packages/torch/_library/custom_ops.py", line 698, in __call__
+    return self._opoverload(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/venv/lib/python3.12/site-packages/torch/_ops.py", line 865, in __call__
+    return self._op(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: schema_.has_value() INTERNAL ASSERT FAILED at "/__w/rocm-npi-dev/rocm-npi-dev/_therock/external-builds/pytorch/pytorch/aten/src/ATen/core/dispatch/OperatorEntry.h":80, please report a bug to PyTorch. Tried to access the schema for . 
+Exception raised from schema at /__w/rocm-npi-dev/rocm-npi-dev/_therock/external-builds/pytorch/pytorch/aten/src/ATen/core/dispatch/OperatorEntry.h:80 (most recent call first):
+C++ CapturedTraceback:
+#4 std::_Function_handler<std::shared_ptr<c10::LazyValue<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > const> (), c10::SetStackTraceFetcher(std::function<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > ()>)::{lambda()#1}>::_M_invoke(std::_Any_data const&) from Logging.cpp:0
+#5 c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) from ??:0
+#6 c10::detail::torchCheckFail(char const*, char const*, unsigned int, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) from ??:0
+#7 c10::detail::torchInternalAssertFail(char const*, char const*, unsigned int, char const*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) from ??:0
+#8 torch::jit::_get_operation_for_overload_or_packet(c10::ArrayRef<std::shared_ptr<torch::jit::Operator> >, c10::Symbol, pybind11::args const&, pybind11::kwargs const&, bool, std::optional<c10::DispatchKey>) from :0
+#9 pybind11::cpp_function::initialize<torch::jit::initJITBindings(_object*)::{lambda(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)#2}::operator()(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) const::{lambda(pybind11::args const&, pybind11::kwargs const&)#1}, pybind11::object, pybind11::args const&, pybind11::kwargs const&>(torch::jit::initJITBindings(_object*)::{lambda(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)#2}::operator()(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) const::{lambda(pybind11::args const&, pybind11::kwargs const&)#1}&&, pybind11::object (*)(pybind11::args const&, pybind11::kwargs const&))::{lambda(pybind11::detail::function_call&)#1}::_FUN(pybind11::detail::function_call&) from init.cpp:0
+#10 pybind11::cpp_function::dispatcher(_object*, _object*, _object*) from :0
+#11 PyCMethod_New from ??:0
+#12 PyObject_Call from ??:0
+#13 _PyEval_EvalFrameDefault from ??:0
+#14 _PyObject_Call_Prepend from ??:0
+#15 PyType_GetModule from ??:0
+#16 PyObject_Call from ??:0
+#17 _PyEval_EvalFrameDefault from ??:0
+#18 _PyObject_Call_Prepend from ??:0
+#19 PyType_GetModule from ??:0
+#20 _PyObject_MakeTpCall from ??:0
+#21 _PyEval_EvalFrameDefault from ??:0
+#22 (anonymous namespace)::THPFunction_apply(_object*, _object*) from python_function.cpp:0
+#23 PyCMethod_New from ??:0
+#24 PyObject_Call from ??:0
+#25 _PyEval_EvalFrameDefault from ??:0
+#26 PyEval_EvalCode from ??:0
+#27 PyRun_StringFlags from ??:0
+#28 _PyRun_SimpleFileObject from ??:0
+#29 _PyRun_SimpleFileObject from ??:0
+#30 _PyRun_AnyFileObject from ??:0
+#31 Py_RunMain from ??:0
+#32 Py_BytesMain from ??:0
+#33 __libc_init_first from ??:0
+#34 __libc_start_main from ??:0
+#35 _start from ??:0
+

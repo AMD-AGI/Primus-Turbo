@@ -1,0 +1,1930 @@
+###############################################################################
+# SPDX-License-Identifier: MIT
+#
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Modification Copyright© 2026 Advanced Micro Devices, Inc. All rights reserved.
+#
+# This file contains the Triton one-kernel fused FlashAttention backward: dQ,
+# dK and dV are produced by separate passes inside a single kernel launch, with
+# no atomics and no dq accumulation buffer.
+#
+# Source code:
+#   Adapted from AITER (https://github.com/ROCm/aiter), commit
+#   ffa945f93115d21d6396e9fb16023e833b660764 (2026-09-13), file
+#   aiter/ops/triton/_triton_kernels/attention/mha_onekernel_bwd.py.
+#   Modified by the Primus-Turbo team.
+#
+#   NOT adapted from aiter's mha_fused_bwd.py, which is a different kernel and
+#   is numerically broken on this arch (dk measured at -0.22 dB SQNR).
+#
+# License:
+#   MIT License, the same license that covers Primus-Turbo (see LICENSE).
+#   Upstream AITER is MIT (Copyright © Advanced Micro Devices, Inc.), so no
+#   additional license file or 3rdparty vendoring is required.
+#
+# Modifications (each one is also marked inline at its site):
+#   - Config loading (aiter's resolve_config_dir / load_config_json /
+#     configs/<arch>/.../DEFAULT.json plus the functools-cached _get_config)
+#     replaced by a hard-coded gfx1250 table carrying the Primus-Turbo tuned
+#     champion, with an env-var override in the house style.
+#   - make_kernel_repr removed (cosmetic compiled-artifact naming only), so the
+#     three `@triton.jit(repr=...)` decorators become plain `@triton.jit`.
+#   - _compute_fp8_scaling_factors inlined from
+#     aiter/ops/triton/utils/_triton/mha_kernel_utils.py so that the fp8
+#     branches of the kernel body stay byte-identical to upstream.
+#   - `import functools` dropped (it was only used by _get_config).
+#
+#   The result has no `aiter` import of any kind. That is load-bearing: any
+#   surviving `from aiter...` re-executes aiter/__init__.py, which
+#   unconditionally pulls in the CK/HIP JIT build machinery (~7 s per process,
+#   and it does not build on gfx1250).
+###############################################################################
+
+import os
+
+import triton  # type: ignore
+import triton.language as tl  # type: ignore
+
+# ---------------------------------------------------------------------------
+# Inlined from aiter/ops/triton/utils/_triton/mha_kernel_utils.py
+# (SPDX-License-Identifier: MIT, Copyright (C) 2024-2025, Advanced Micro
+# Devices, Inc. All rights reserved.), verbatim.
+#
+# CHANGED vs upstream: this lived in a separate aiter module. It is a
+# `@triton.jit` device function called from four `if IS_FP8:` branches of the
+# kernel body below, so it cannot be stubbed out even though Primus-Turbo's
+# production path is bf16 -- copying it keeps those branches unedited.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _compute_fp8_scaling_factors(x, fp8_max: tl.constexpr):
+    # compute fp8 scaling and descaling factor for a block
+    x_amax = tl.max(tl.abs(x))  # NOTE: abs deals with negative values
+    x_amax = tl.where(x_amax <= 1e-9, 1e-9, x_amax)
+    scale_x = fp8_max / x_amax
+    descale_x = x_amax / fp8_max
+    return scale_x, descale_x
+
+
+
+
+# NOTE: triton fails to import tl.constexprs so create them here for the file
+DROPOUT_USE_PYTORCH = False
+DROPOUT_DUMP = False
+
+tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
+tl_DROPOUT_DUMP: tl.constexpr = triton.language.constexpr(DROPOUT_DUMP)
+
+
+# This function computes delta given output Out and gradient DO
+# Here is the I/O shape:
+# Out: (batch, nhead_q, max_seqlens_q, headDim)
+# DO: (batch, nhead_q, max_seqlens_q, headDim)
+# Delta: (batch, nheads_q, max_seqlens_q), same as softmax_lse defined at
+@triton.jit
+def _bwd_preprocess(
+    o_ptr,
+    do_ptr,
+    delta_ptr,
+    stride_o_b,
+    stride_o_h,
+    stride_o_m,
+    stride_o_k,
+    stride_do_b,
+    stride_do_h,
+    stride_do_m,
+    stride_do_k,
+    stride_delta_b,
+    stride_delta_h,
+    stride_delta_m,
+    stride_descale_do_z,
+    cu_seqlens_q,
+    max_seqlen_q,
+    descale_do_ptr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_D_MODEL: tl.constexpr,
+    BLOCK_D_MODEL_POW2: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    IS_FP8: tl.constexpr,
+):
+    pid_m = tl.program_id(0)  # seqlen
+    bid = tl.program_id(1)  # batch
+    hid = tl.program_id(2)  # head
+
+    # Handle varlen
+    q_start = 0
+    seqlen_q = max_seqlen_q
+    if IS_VARLEN:
+        q_start = tl.load(cu_seqlens_q + bid)
+        q_end = tl.load(cu_seqlens_q + bid + 1)
+        seqlen_q = q_end - q_start
+    else:
+        q_start = 0
+        seqlen_q = max_seqlen_q
+
+    # Compute offsets
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, BLOCK_D_MODEL_POW2)
+
+    # O and DO may have different strides (e.g. BSHD vs SBHD memory layout),
+    # so address each with its own strides.
+    offs_o = (
+        bid * stride_o_b
+        + hid * stride_o_h
+        + q_start * stride_o_m
+        + offs_m[:, None] * stride_o_m
+        + offs_k[None, :] * stride_o_k
+    )
+    offs_do = (
+        bid * stride_do_b
+        + hid * stride_do_h
+        + q_start * stride_do_m
+        + offs_m[:, None] * stride_do_m
+        + offs_k[None, :] * stride_do_k
+    )
+
+    # create masks
+    mask_m = offs_m < seqlen_q
+    mask = mask_m[:, None]
+    PADDED_HEAD: tl.constexpr = BLOCK_D_MODEL != BLOCK_D_MODEL_POW2
+    if PADDED_HEAD:
+        mask &= offs_k[None, :] < BLOCK_D_MODEL
+
+    # load [BLOCK_M, BLOCK_D_MODEL_POW2]
+    o = tl.load(o_ptr + offs_o, mask=mask, other=0.0)
+    do = tl.load(do_ptr + offs_do, mask=mask, other=0.0)
+
+    # compute and write-back to delta
+    if IS_FP8:
+        descale_do = tl.load(descale_do_ptr + bid * stride_descale_do_z + hid)
+
+        # NOTE: do is in the fp8 range and o is not in fp8
+        delta = tl.sum(o.to(tl.float32) * (do.to(tl.float32) * descale_do), axis=1)
+    else:
+        delta = tl.sum(o.to(tl.float32) * do.to(tl.float32), axis=1)
+
+    offs_delta = (
+        bid * stride_delta_b
+        + hid * stride_delta_h
+        + q_start * stride_delta_m
+        + offs_m * stride_delta_m
+    )
+    tl.store(delta_ptr + offs_delta, delta, mask=mask_m)
+
+
+# The main inner-loop logic for computing dK and dV.
+@triton.jit
+def _bwd_dkdv_inner(
+    dk,  # output
+    dk_pe,  # optional output, pass None for non-PE case
+    dv,  # output
+    Q,
+    k,
+    k_pe,
+    v,
+    DO,
+    M,
+    D,
+    sm_scale,  # input tensor
+    stride_qm,
+    stride_qk,
+    stride_dom,
+    stride_dok,
+    stride_dropoutm,
+    stride_dropoutn,
+    stride_deltam,
+    BLOCK_M: tl.constexpr,  # 16
+    BLOCK_N: tl.constexpr,  # 128
+    HEAD_DIM: tl.constexpr,
+    ACTUAL_HEAD_DIM: tl.constexpr,
+    PE_HEAD_DIM: tl.constexpr,
+    dropout_p,
+    philox_seed,
+    batch_philox_offset,
+    dropout_offset,
+    alibi_slope,
+    seqlen_q,
+    seqlen_k,  # max sequence length for q and k
+    # Filled in by the wrapper.
+    start_n,
+    start_m,
+    num_steps,  # iteration numbers
+    descale_q,
+    descale_k,
+    descale_v,
+    descale_do,  # fp8 descale factors from user
+    MASK: tl.constexpr,  # causal masking, only apply to tiles on mask diagonal
+    ENABLE_DROPOUT: tl.constexpr,  # activate dropout
+    USE_ALIBI: tl.constexpr,
+    USE_EXP2: tl.constexpr,  # activate exp2
+    IS_FP8: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    DEBUG_TRITON: tl.constexpr,
+    DEBUG_TRITON_DETAIL: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
+):
+    # if HEAD_DIM is padded
+    PADDED_HEAD: tl.constexpr = ACTUAL_HEAD_DIM != HEAD_DIM
+    HAS_PE: tl.constexpr = PE_HEAD_DIM > 0
+    delta_qk = seqlen_q - seqlen_k
+    offs_m = start_m + tl.arange(0, BLOCK_M)  # start_m + (0, 15)
+    offs_n = start_n + tl.arange(0, BLOCK_N)  # start_m + (0, 127)
+    offs_k = tl.arange(0, HEAD_DIM)
+    if HAS_PE:
+        offs_k_pe = HEAD_DIM + tl.arange(0, PE_HEAD_DIM)
+    # mask to make sure not OOB of seqlen_q
+    mask_n = offs_n < seqlen_k
+    # Q and DO are (seqlen_q, head_dim)
+    # qT_ptrs = (1, BLOCK_M) + (HEAD_DIM, 1), transpose of q
+    qT_ptrs = Q + offs_m[None, :] * stride_qm + offs_k[:, None] * stride_qk
+    if HAS_PE:
+        qT_pe_ptrs = Q + offs_m[None, :] * stride_qm + offs_k_pe[:, None] * stride_qk
+    # do_ptrs = (BLOCK_M, 1) + (1, HEAD_DIM), NOT transposed
+    do_ptrs = DO + offs_m[:, None] * stride_dom + offs_k[None, :] * stride_dok
+    # BLOCK_N must be a multiple of BLOCK_M, otherwise the code wouldn't work.
+    tl.static_assert(BLOCK_N % BLOCK_M == 0)
+    curr_m = start_m
+    step_m = BLOCK_M
+    curr_philox_offset = batch_philox_offset
+    curr_dropout_offset = dropout_offset
+    RCP_LN2: tl.constexpr = 1.4426950408889634  # = 1.0 / ln(2)
+
+    for blk_idx in range(num_steps):
+        if DEBUG_TRITON:
+            print(f"iter {blk_idx}: curr_m = {curr_m}")
+        offs_m = curr_m + tl.arange(0, BLOCK_M)
+        # update the mask because offs_m advanced
+        mask_m = offs_m < seqlen_q
+        mask_qT = mask_m[None, :]
+        mask_do = mask_m[:, None]
+        mask_nm = mask_n[:, None] & (offs_m[None, :] < seqlen_q)
+        if PADDED_HEAD:
+            mask_qT &= offs_k[:, None] < ACTUAL_HEAD_DIM
+            mask_do &= offs_k[None, :] < ACTUAL_HEAD_DIM
+        qT = tl.load(qT_ptrs, mask=mask_qT, other=0.0)
+        if HAS_PE:
+            qT_pe = tl.load(qT_pe_ptrs, mask=mask_qT, other=0.0)
+        # generate dropout mask
+        if ENABLE_DROPOUT:
+            # NOTE: dropout is transposed because it is used to mask pT
+            philox_offs = (
+                curr_philox_offset
+                + offs_m[None, :] * stride_dropoutm
+                + offs_n[:, None] * stride_dropoutn
+            )
+            if tl_DROPOUT_USE_PYTORCH:
+                dropout_offs = (
+                    offs_m[None, :] * stride_dropoutm
+                    + offs_n[:, None] * stride_dropoutn
+                )
+                dropout_mask = tl.load(curr_dropout_offset + dropout_offs, mask=mask_nm)
+            else:
+                rand_vals = tl.rand(philox_seed, philox_offs)
+                dropout_mask = rand_vals > dropout_p
+            dropout_scale = 1.0 / (1 - dropout_p)
+        # Load m before computing qk to reduce pipeline stall.
+        m = tl.load(M + offs_m * stride_deltam, mask=mask_m, other=0.0)
+        if IS_FP8:
+            qkT = tl.dot(k, qT) * descale_q * descale_k
+        else:
+            qkT = tl.dot(k, qT)
+            if HAS_PE:
+                qkT = tl.dot(k_pe, qT_pe, acc=qkT)
+        # CHANGED round 2 (r2.i1.g8): sm_scale is folded into the exponent's own
+        # constant instead of being applied as a separate elementwise pass over
+        # the [BLOCK_N, BLOCK_M] fp32 score tile. In the shipped ISA that pass is
+        # 32 v_pk_mul_f32 of a 1400-instruction loop body; the fold turns
+        # `(qkT * sm_scale) * RCP_LN2 - m * RCP_LN2` into a single FMA against a
+        # precomputed scalar. The ALIBI path must still materialise the scaled
+        # tile because the bias is added to it, so it keeps the old form exactly.
+        if USE_ALIBI:
+            qkT_scaled = qkT * sm_scale
+            relative_pos_block = offs_n[:, None] + seqlen_q - seqlen_k - offs_m[None, :]
+            alibi_block = -1 * alibi_slope * tl.abs(relative_pos_block)
+            qkT_scaled += alibi_block
+            exp_arg_scale = 1.0
+        else:
+            qkT_scaled = qkT
+            exp_arg_scale = sm_scale
+
+        if DEBUG_TRITON_DETAIL and start_n == 256:
+            print(f"qT: {qT.shape}\n", qT)
+            print(f"k: {k.shape}\n", k)
+            print(f"qkT scaled: {qkT.shape}\n", qkT_scaled)
+        # TODO: remove the scaling of m later when we removed re-scaling in fwd
+        if USE_EXP2:
+            pT = tl.math.exp2(
+                qkT_scaled * (exp_arg_scale * RCP_LN2) - m[None, :] * RCP_LN2
+            )
+        else:
+            pT = tl.math.exp(qkT_scaled * exp_arg_scale - m[None, :])
+
+        # Autoregressive masking.
+        if MASK:
+            # offset offs_m with delta_qk since the causal mask starts at
+            # bottom right of the (seqlen_q, seqlen_k) matrix
+            causal_mask = (offs_m[None, :] - delta_qk) >= offs_n[:, None]
+            mask = causal_mask & mask_nm
+            if DEBUG_TRITON_DETAIL and start_n == 256:
+                print(f"causal_mask: {causal_mask.shape}\n", causal_mask)
+                print(
+                    f"qkT after causal: {qkT.shape}\n",
+                    tl.where(causal_mask, qkT * sm_scale, 0.0),
+                )
+            pT = tl.where(mask, pT, 0.0)
+        if SLIDING_WINDOW > 0:
+            window_mask = offs_n[:, None] >= (
+                offs_m[None, :] - delta_qk - SLIDING_WINDOW
+            )
+            pT = tl.where(window_mask, pT, 0.0)
+        do = tl.load(do_ptrs, mask=mask_do, other=0.0)
+        # Compute dV.
+        if ENABLE_DROPOUT:
+            pT_dropout = tl.where(dropout_mask, pT, 0.0) * dropout_scale
+            if IS_FP8:
+                scale_p_dropout, descale_p_dropout = _compute_fp8_scaling_factors(
+                    pT_dropout, FP8_MAX
+                )
+                dv += (
+                    tl.dot((pT_dropout * scale_p_dropout).to(do.type.element_ty), do)
+                    * descale_p_dropout
+                    * descale_do
+                )
+            else:
+                dv = tl.dot(pT_dropout.to(do.type.element_ty), do, acc=dv)
+        else:
+            if IS_FP8:
+                scale_pT, descale_pT = _compute_fp8_scaling_factors(pT, FP8_MAX)
+                dv += (
+                    tl.dot((pT * scale_pT).to(do.type.element_ty), do)
+                    * descale_pT
+                    * descale_do
+                )
+            else:
+                dv = tl.dot(pT.to(do.type.element_ty), do, acc=dv)
+
+        if DEBUG_TRITON_DETAIL and start_n == 256:
+            print(f"pT: {pT.shape}\n", pT)
+        # D (= delta) is pre-divided by ds_scale.
+        Di = tl.load(D + offs_m * stride_deltam, mask=mask_m)
+        # Compute dP and dS.
+        if IS_FP8:
+            dpT = tl.dot(v, tl.trans(do)) * descale_v * descale_do
+        else:
+            dpT = tl.dot(v, tl.trans(do))
+        if ENABLE_DROPOUT:
+            dpT = tl.where(dropout_mask, dpT, 0.0) * dropout_scale
+        delta_i = Di[None, :]
+        dsT = pT * (dpT - delta_i)
+        if IS_FP8:
+            scale_dsT, descale_dsT = _compute_fp8_scaling_factors(dsT, FP8_MAX)
+            dk += (
+                tl.dot((dsT * scale_dsT).to(qT.type.element_ty), tl.trans(qT))
+                * descale_dsT
+                * descale_q
+            )
+        else:
+            dk = tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT), acc=dk)
+            if HAS_PE:
+                dk_pe = tl.dot(
+                    dsT.to(qT_pe.type.element_ty), tl.trans(qT_pe), acc=dk_pe
+                )
+        # Increment pointers.
+        curr_m += step_m
+        qT_ptrs += step_m * stride_qm
+        if HAS_PE:
+            qT_pe_ptrs += step_m * stride_qm
+        do_ptrs += step_m * stride_dom
+    return dk, dk_pe, dv
+
+
+# the main inner-loop logic for computing dQ
+@triton.jit
+def _bwd_dq_inner(
+    dq,  # output
+    dq_pe,  # optional output, pass None for non-PE case
+    q,
+    q_pe,
+    K,
+    V,
+    do,
+    m,
+    Di,  # D (= delta) is pre-divided by ds_scale.
+    sm_scale,  # input
+    # shared by Q/K/V.
+    stride_qm,
+    stride_qk,
+    stride_kn,
+    stride_kk,
+    stride_vn,
+    stride_vk,
+    stride_dropoutm,
+    stride_dropoutn,  # stride for dropout
+    seqlen_q,
+    seqlen_k,
+    BLOCK_M2: tl.constexpr,
+    BLOCK_N2: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    ACTUAL_HEAD_DIM: tl.constexpr,
+    PE_HEAD_DIM: tl.constexpr,
+    dropout_p,
+    philox_seed,
+    batch_philox_offset,
+    dropout_offset,
+    alibi_slope,
+    # Filled in by the wrapper.
+    start_m,
+    start_n,
+    end_n,
+    num_steps,
+    descale_q,
+    descale_k,
+    descale_v,
+    descale_do,  # fp8 descale factors from user
+    MASK: tl.constexpr,
+    ENABLE_DROPOUT: tl.constexpr,
+    USE_ALIBI: tl.constexpr,
+    USE_EXP2: tl.constexpr,
+    IS_FP8: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    DEBUG_TRITON: tl.constexpr,
+    DEBUG_TRITON_DETAIL: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
+    ENABLE_SINK: tl.constexpr,
+):
+    # if HEAD_DIM is padded
+    PADDED_HEAD: tl.constexpr = ACTUAL_HEAD_DIM != HEAD_DIM
+    HAS_PE: tl.constexpr = PE_HEAD_DIM > 0
+    delta_qk = seqlen_q - seqlen_k
+    offs_m = start_m + tl.arange(0, BLOCK_M2)
+    offs_n = start_n + tl.arange(0, BLOCK_N2)
+    offs_k = tl.arange(0, HEAD_DIM)
+    if HAS_PE:
+        offs_k_pe = HEAD_DIM + tl.arange(0, PE_HEAD_DIM)
+
+    # mask to make sure not OOB of seqlen_q
+    mask_m = offs_m < seqlen_q
+
+    kT_ptrs = K + offs_n[None, :] * stride_kn + offs_k[:, None] * stride_kk
+    if HAS_PE:
+        kT_pe_ptrs = K + offs_n[None, :] * stride_kn + offs_k_pe[:, None] * stride_kk
+    vT_ptrs = V + offs_n[None, :] * stride_vn + offs_k[:, None] * stride_vk
+    # BLOCK_M2 must be a multiple of BLOCK_N2, otherwise the code wouldn't work.
+    tl.static_assert(BLOCK_M2 % BLOCK_N2 == 0)
+    curr_n = start_n
+    step_n = BLOCK_N2
+    curr_philox_offset = batch_philox_offset
+    curr_dropout_offset = dropout_offset
+    RCP_LN2: tl.constexpr = 1.4426950408889634  # = 1.0 / ln(2)
+    delta_recomp = tl.zeros([BLOCK_M2], dtype=tl.float32)
+    for blk_idx in range(num_steps):
+        if DEBUG_TRITON:
+            print(f"iter {blk_idx}: curr_n = {curr_n}")
+        offs_n = curr_n + tl.arange(0, BLOCK_N2)
+        # end_n is needed because the end of causal True might not be perfectly
+        # aligned with the end of the block
+        mask_n = offs_n < end_n
+        if DEBUG_TRITON_DETAIL:
+            print(
+                f"start_n = {start_n}, end_n = {end_n}, offs_n: {offs_n.shape}\n{offs_n}"
+            )
+        if DEBUG_TRITON_DETAIL:
+            print(f"mask_n: {mask_n.shape}\n{mask_n}")
+        mask_kT = mask_n[None, :]
+        mask_mn = mask_m[:, None] & (offs_n[None, :] < end_n)
+        if PADDED_HEAD:
+            mask_kT &= offs_k[:, None] < ACTUAL_HEAD_DIM
+
+        kT = tl.load(kT_ptrs, mask=mask_kT, other=0.0)
+        if HAS_PE:
+            kT_pe = tl.load(kT_pe_ptrs, mask=mask_kT, other=0.0)
+        vT = tl.load(vT_ptrs, mask=mask_kT, other=0.0)
+
+        if ENABLE_DROPOUT:
+            # NOTE: dropout is transposed because it is used to mask pT
+            philox_offs = (
+                curr_philox_offset
+                + offs_m[:, None] * stride_dropoutm
+                + offs_n[None, :] * stride_dropoutn
+            )
+            if tl_DROPOUT_USE_PYTORCH:
+                dropout_offs = (
+                    offs_m[:, None] * stride_dropoutm
+                    + offs_n[None, :] * stride_dropoutn
+                )
+                dropout_mask = tl.load(curr_dropout_offset + dropout_offs, mask=mask_mn)
+            else:
+                rand_vals = tl.rand(philox_seed, philox_offs)
+                dropout_mask = rand_vals > dropout_p
+            dropout_scale = 1 / (1 - dropout_p)
+
+        if IS_FP8:
+            qk = tl.dot(q, kT) * descale_q * descale_k
+        else:
+            qk = tl.dot(q, kT)
+            if HAS_PE:
+                qk = tl.dot(q_pe, kT_pe, acc=qk)
+        # CHANGED round 2 (r2.i1.g8): same fold as in _bwd_dkdv_inner above.
+        if USE_ALIBI:
+            qk_scaled = qk * sm_scale
+            relative_pos_block = offs_m[:, None] + seqlen_k - seqlen_q - offs_n[None, :]
+            alibi_block = -1 * alibi_slope * tl.abs(relative_pos_block)
+            qk_scaled += alibi_block
+            exp_arg_scale = 1.0
+        else:
+            qk_scaled = qk
+            exp_arg_scale = sm_scale
+
+        if DEBUG_TRITON_DETAIL:
+            print(f"qk scaled: {qk.shape}\n", qk_scaled)
+        if USE_EXP2:
+            p = tl.math.exp2(qk_scaled * (exp_arg_scale * RCP_LN2) - m * RCP_LN2)
+        else:
+            p = tl.math.exp(qk_scaled * exp_arg_scale - m)
+
+        # Autoregressive masking.
+        if MASK:
+            causal_mask = (offs_m[:, None] - delta_qk) >= offs_n[None, :]
+            mask = causal_mask & mask_mn
+            p = tl.where(mask, p, 0.0)
+        if SLIDING_WINDOW > 0:
+            window_mask = offs_n[None, :] >= (
+                offs_m[:, None] - delta_qk - SLIDING_WINDOW
+            )
+            p = tl.where(window_mask, p, 0.0)
+        # Compute dP and dS.
+        if IS_FP8:
+            dp = tl.dot(do, vT) * descale_do * descale_v
+        else:
+            dp = tl.dot(do, vT)
+        if ENABLE_DROPOUT:
+            dp = tl.where(dropout_mask, dp, 0.0) * dropout_scale
+        if ENABLE_SINK:
+            # Equal to do_i . o_i but skips the bf16 round-trip through forward `o`.
+            delta_recomp += tl.sum(p * dp, axis=1)
+        delta_i = Di[:, None]
+        ds = p * (dp - delta_i)
+        # Compute dQ.
+        # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
+        if IS_FP8:
+            scale_ds, descale_ds = _compute_fp8_scaling_factors(ds, FP8_MAX)
+            dq += (
+                tl.dot((ds * scale_ds).to(kT.type.element_ty), tl.trans(kT))
+                * descale_ds
+                * descale_k
+            )
+        else:
+            dq = tl.dot(ds.to(kT.type.element_ty), tl.trans(kT), acc=dq)
+            if HAS_PE:
+                dq_pe = tl.dot(ds.to(kT_pe.type.element_ty), tl.trans(kT_pe), acc=dq_pe)
+        # Increment pointers.
+        curr_n += step_n
+        kT_ptrs += step_n * stride_kn
+        if HAS_PE:
+            kT_pe_ptrs += step_n * stride_kn
+        vT_ptrs += step_n * stride_vn
+    return dq, dq_pe, delta_recomp
+
+
+@triton.jit
+def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nheads_q)
+    Q,
+    K,
+    V,
+    Sink,
+    sm_scale,
+    DO,
+    DQ,
+    DK,
+    DV,
+    DSink,
+    M,
+    Delta,
+    stride_qb_in,
+    stride_qh_in,
+    stride_qm_in,
+    stride_qd_in,
+    stride_kb_in,
+    stride_kh_in,
+    stride_kn_in,
+    stride_kd_in,
+    stride_vb_in,
+    stride_vh_in,
+    stride_vn_in,
+    stride_vd_in,
+    stride_dqb_in,
+    stride_dqh_in,
+    stride_dqm_in,
+    stride_dqd_in,
+    stride_dkb_in,
+    stride_dkh_in,
+    stride_dkn_in,
+    stride_dkd_in,
+    stride_dvb_in,
+    stride_dvh_in,
+    stride_dvn_in,
+    stride_dvd_in,
+    stride_deltab_in,
+    stride_deltah_in,
+    stride_deltam_in,
+    stride_dob_in,
+    stride_doh_in,
+    stride_dom_in,
+    stride_dod_in,
+    stride_dropoutb_in,
+    stride_dropouth_in,
+    stride_dropoutm_in,
+    stride_dropoutn_in,
+    stride_descale_q_z_in,
+    stride_descale_k_z_in,
+    stride_descale_v_z_in,
+    stride_descale_do_z_in,
+    stride_az_in,
+    stride_ah_in,
+    HQ,
+    HK,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    Dropout_mask,
+    dropout_p,
+    philox_seed,
+    philox_offset_base_in,
+    Alibi_slopes,
+    Descale_q,
+    Descale_k,
+    Descale_v,
+    Descale_do,
+    BLOCK_M1: tl.constexpr,
+    BLOCK_N1: tl.constexpr,
+    BLOCK_M2: tl.constexpr,
+    BLOCK_N2: tl.constexpr,
+    BLK_SLICE_FACTOR: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    ACTUAL_HEAD_DIM: tl.constexpr,
+    PE_HEAD_DIM: tl.constexpr,
+    ENABLE_DROPOUT: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    USE_ALIBI: tl.constexpr,
+    USE_EXP2: tl.constexpr,
+    IS_FP8: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    DEBUG_TRITON: tl.constexpr,
+    DEBUG_TRITON_DETAIL: tl.constexpr,
+    USE_INT64_STRIDES: tl.constexpr,
+    ENABLE_SINK: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
+):
+    if USE_INT64_STRIDES:
+        stride_qb = tl.cast(stride_qb_in, tl.int64)
+        stride_qh = tl.cast(stride_qh_in, tl.int64)
+        stride_qm = tl.cast(stride_qm_in, tl.int64)
+        stride_qd = tl.cast(stride_qd_in, tl.int64)
+        stride_kb = tl.cast(stride_kb_in, tl.int64)
+        stride_kh = tl.cast(stride_kh_in, tl.int64)
+        stride_kn = tl.cast(stride_kn_in, tl.int64)
+        stride_kd = tl.cast(stride_kd_in, tl.int64)
+        stride_vb = tl.cast(stride_vb_in, tl.int64)
+        stride_vh = tl.cast(stride_vh_in, tl.int64)
+        stride_vn = tl.cast(stride_vn_in, tl.int64)
+        stride_vd = tl.cast(stride_vd_in, tl.int64)
+        stride_dqb = tl.cast(stride_dqb_in, tl.int64)
+        stride_dqh = tl.cast(stride_dqh_in, tl.int64)
+        stride_dqm = tl.cast(stride_dqm_in, tl.int64)
+        stride_dqd = tl.cast(stride_dqd_in, tl.int64)
+        stride_dkb = tl.cast(stride_dkb_in, tl.int64)
+        stride_dkh = tl.cast(stride_dkh_in, tl.int64)
+        stride_dkn = tl.cast(stride_dkn_in, tl.int64)
+        stride_dkd = tl.cast(stride_dkd_in, tl.int64)
+        stride_dvb = tl.cast(stride_dvb_in, tl.int64)
+        stride_dvh = tl.cast(stride_dvh_in, tl.int64)
+        stride_dvn = tl.cast(stride_dvn_in, tl.int64)
+        stride_dvd = tl.cast(stride_dvd_in, tl.int64)
+        stride_deltab = tl.cast(stride_deltab_in, tl.int64)
+        stride_deltah = tl.cast(stride_deltah_in, tl.int64)
+        stride_deltam = tl.cast(stride_deltam_in, tl.int64)
+        stride_dob = tl.cast(stride_dob_in, tl.int64)
+        stride_doh = tl.cast(stride_doh_in, tl.int64)
+        stride_dom = tl.cast(stride_dom_in, tl.int64)
+        stride_dod = tl.cast(stride_dod_in, tl.int64)
+        philox_offset_base = tl.cast(philox_offset_base_in, tl.int64)
+        stride_dropoutb = tl.cast(stride_dropoutb_in, tl.int64)
+        stride_dropouth = tl.cast(stride_dropouth_in, tl.int64)
+        stride_dropoutm = tl.cast(stride_dropoutm_in, tl.int64)
+        stride_dropoutn = tl.cast(stride_dropoutn_in, tl.int64)
+        if IS_FP8:
+            stride_descale_q_z = tl.cast(stride_descale_q_z_in, tl.int64)
+            stride_descale_k_z = tl.cast(stride_descale_k_z_in, tl.int64)
+            stride_descale_v_z = tl.cast(stride_descale_v_z_in, tl.int64)
+            stride_descale_do_z = tl.cast(stride_descale_do_z_in, tl.int64)
+        stride_az = tl.cast(stride_az_in, tl.int64)
+        stride_ah = tl.cast(stride_ah_in, tl.int64)
+    else:
+        stride_qb = stride_qb_in
+        stride_qh = stride_qh_in
+        stride_qm = stride_qm_in
+        stride_qd = stride_qd_in
+        stride_kb = stride_kb_in
+        stride_kh = stride_kh_in
+        stride_kn = stride_kn_in
+        stride_kd = stride_kd_in
+        stride_vb = stride_vb_in
+        stride_vh = stride_vh_in
+        stride_vn = stride_vn_in
+        stride_vd = stride_vd_in
+        stride_dqb = stride_dqb_in
+        stride_dqh = stride_dqh_in
+        stride_dqm = stride_dqm_in
+        stride_dqd = stride_dqd_in
+        stride_dkb = stride_dkb_in
+        stride_dkh = stride_dkh_in
+        stride_dkn = stride_dkn_in
+        stride_dkd = stride_dkd_in
+        stride_dvb = stride_dvb_in
+        stride_dvh = stride_dvh_in
+        stride_dvn = stride_dvn_in
+        stride_dvd = stride_dvd_in
+        stride_deltab = stride_deltab_in
+        stride_deltah = stride_deltah_in
+        stride_deltam = stride_deltam_in
+        stride_dob = stride_dob_in
+        stride_doh = stride_doh_in
+        stride_dom = stride_dom_in
+        stride_dod = stride_dod_in
+        philox_offset_base = philox_offset_base_in
+        stride_dropoutb = stride_dropoutb_in
+        stride_dropouth = stride_dropouth_in
+        stride_dropoutm = stride_dropoutm_in
+        stride_dropoutn = stride_dropoutn_in
+        stride_descale_q_z = stride_descale_q_z_in
+        stride_descale_k_z = stride_descale_k_z_in
+        stride_descale_v_z = stride_descale_v_z_in
+        stride_descale_do_z = stride_descale_do_z_in
+        stride_az = stride_az_in
+        stride_ah = stride_ah_in
+
+    # program ids
+    hkid = tl.program_id(0)
+    pid = tl.program_id(1)
+    bid = tl.program_id(2)
+    if DEBUG_TRITON:
+        print(f"\npid: {pid}, bid: {bid}, hkid: {hkid}")
+    # figure out varlen start and end
+    q_start = 0
+    k_start = 0
+    seqlen_q = max_seqlen_q
+    seqlen_k = max_seqlen_k
+    if IS_VARLEN:
+        # Compute actual sequence lengths
+        q_start = tl.load(cu_seqlens_q + bid)
+        q_end = tl.load(cu_seqlens_q + bid + 1)
+        k_start = tl.load(cu_seqlens_k + bid)
+        k_end = tl.load(cu_seqlens_k + bid + 1)
+        seqlen_q = q_end - q_start
+        seqlen_k = k_end - k_start
+
+    delta_qk = seqlen_q - seqlen_k
+    if DEBUG_TRITON:
+        print(f"delta_qk = {delta_qk}")
+    PADDED_HEAD: tl.constexpr = ACTUAL_HEAD_DIM != HEAD_DIM
+    HAS_PE: tl.constexpr = PE_HEAD_DIM > 0
+    offs_d = tl.arange(0, HEAD_DIM)
+    if HAS_PE:
+        offs_d_pe = HEAD_DIM + tl.arange(0, PE_HEAD_DIM)
+    GROUP_SIZE: tl.constexpr = HQ // HK
+
+    # align the delta_qk
+    start_n = pid * BLOCK_N1
+    if start_n < seqlen_k:
+        # This section does dk and dv
+        dk = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
+        if HAS_PE:
+            dk_pe = tl.zeros([BLOCK_N1, PE_HEAD_DIM], dtype=tl.float32)
+        else:
+            # Couldn't assign None to dk_pe because _bwd_dkdv_inner can't return None.
+            dk_pe = dk
+        dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
+
+        # q > k: diretcly skip all the way until the start of causal block
+        start_delta_q_gt_k = delta_qk
+        # q < k: some blocks will have no Masked block, other needs to re-calc
+        # starting position
+        # delta_qk is negative so flip it, only multiple of BLOCK_N can skip the
+        # masked op
+        num_blocks_skip = -delta_qk // BLOCK_N1
+        delta_aligned = (num_blocks_skip + 1) * BLOCK_N1 + delta_qk
+        start_delta_q_lt_k = delta_aligned // BLOCK_M1 * BLOCK_M1
+        if delta_qk >= 0:
+            start_delta = delta_qk
+            if DEBUG_TRITON:
+                print(
+                    f"q >= k: start_delta = delta_qk aligned to BLOCK_M = {start_delta_q_gt_k}"
+                )
+        else:
+            start_delta = start_delta_q_lt_k
+            if DEBUG_TRITON:
+                print(
+                    f"q < k: start_delta = residue btw multiple BLOCK_N and delta_qk = {delta_aligned} = aligned to BLOCK_M = {start_delta_q_lt_k}"
+                )
+
+        offs_n = start_n + tl.arange(0, BLOCK_N1)
+        # Mask for loading K and V
+        mask_kv = offs_n[:, None] < seqlen_k
+        if PADDED_HEAD:
+            mask_d = offs_d < ACTUAL_HEAD_DIM
+            mask_kv &= mask_d[None, :]
+
+        # K/V tensors not changed for the group
+        adj_k = (
+            bid * stride_kb
+            + hkid * stride_kh
+            + k_start * stride_kn
+            + offs_n[:, None] * stride_kn
+            + offs_d[None, :] * stride_kd
+        )
+        if HAS_PE:
+            adj_k_pe = (
+                bid * stride_kb
+                + hkid * stride_kh
+                + k_start * stride_kn
+                + offs_n[:, None] * stride_kn
+                + offs_d_pe[None, :] * stride_kd
+            )
+        adj_v = (
+            bid * stride_vb
+            + hkid * stride_vh
+            + k_start * stride_vn
+            + offs_n[:, None] * stride_vn
+            + offs_d[None, :] * stride_vd
+        )
+        # load K and V: they stay in SRAM throughout the inner loop.
+        k = tl.load(K + adj_k, mask=mask_kv, other=0.0)
+        if HAS_PE:
+            k_pe = tl.load(K + adj_k_pe, mask=mask_kv, other=0.0)
+        else:
+            k_pe = None
+        v = tl.load(V + adj_v, mask=mask_kv, other=0.0)
+        # If MQA / GQA, set the K and V head offsets appropriately.
+        # hqid = hkid
+        for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
+            if delta_qk >= 0:
+                start_m = start_n + start_delta
+                len_m = BLOCK_N1
+            else:
+                start_m = max(start_n + delta_qk, 0)
+                start_m = start_m // BLOCK_M1 * BLOCK_M1
+                # because we might shift the masked blocks up, we are deeper into
+                # the masked out region, so we would potentially increase the total
+                # steps with masked operation to get out of it
+                residue_m = max(start_n + delta_qk - start_m, 0)
+                len_m = BLOCK_N1 + residue_m
+                if DEBUG_TRITON:
+                    print(f"residue_m = {residue_m}")
+
+            # offset input and output tensor by batch and Q/K heads
+            adj_q = bid * stride_qb + hqid * stride_qh + q_start * stride_qm
+            Q_ptr = Q + adj_q
+            adj_do = bid * stride_dob + hqid * stride_doh + q_start * stride_dom
+            DO_ptr = DO + adj_do
+            adj_delta = (
+                bid * stride_deltab + hqid * stride_deltah + q_start * stride_deltam
+            )
+            M_ptr = M + adj_delta
+            Delta_ptr = Delta + adj_delta
+
+            if USE_ALIBI:
+                alibi_offset = bid * stride_az + hqid * stride_ah
+                alibi_slope = tl.load(Alibi_slopes + alibi_offset)
+            else:
+                alibi_slope = None
+
+            # batch_philox_offset is the ACTUALLY dropout offset
+            # dropout_offset is for debug purpose and will be removed later
+            batch_philox_offset = 0
+            dropout_offset = 0
+            if ENABLE_DROPOUT:
+                batch_philox_offset = (
+                    philox_offset_base + bid * stride_dropoutb + hqid * stride_dropouth
+                )
+                dropout_offset = (
+                    Dropout_mask + bid * stride_dropoutb + hqid * stride_dropouth
+                )
+
+            if IS_FP8:
+                descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
+                descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
+                descale_v = tl.load(Descale_v + bid * stride_descale_v_z + hkid)
+                descale_do = tl.load(Descale_do + bid * stride_descale_do_z + hqid)
+            else:
+                descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
+
+            MASK_BLOCK_M1: tl.constexpr = BLOCK_M1 // BLK_SLICE_FACTOR
+            # bound the masked operation to q len so it does not have to wast cycles
+            len_m = min(len_m, seqlen_q)
+            num_steps = tl.cdiv(len_m, MASK_BLOCK_M1)
+            # when q < k, we may skip the initial masked op
+            if pid < num_blocks_skip:
+                num_steps = 0
+
+            # if start_m is negative, the current N-tile has no block on the
+            #   diagonal of causal mask, so everything have no causal mask
+            if DEBUG_TRITON:
+                print(
+                    f"Masked: start_n: {start_n}; start_m: {start_m}, num_steps: {num_steps}"
+                )
+            dk, dk_pe, dv = _bwd_dkdv_inner(
+                dk,  # output tensor
+                dk_pe,  # optional output tensor
+                dv,  # output tensor
+                Q_ptr,
+                k,
+                k_pe,
+                v,
+                DO_ptr,
+                M_ptr,
+                Delta_ptr,
+                sm_scale,  # input tensors
+                stride_qm,
+                stride_qd,  # strides for q
+                stride_dom,
+                stride_dod,  # strides for o
+                stride_dropoutm,
+                stride_dropoutn,  # strides for dropout
+                stride_deltam,
+                MASK_BLOCK_M1,
+                BLOCK_N1,  # block dim
+                HEAD_DIM,
+                ACTUAL_HEAD_DIM,  # head dim
+                PE_HEAD_DIM,
+                dropout_p,
+                philox_seed,
+                batch_philox_offset,
+                dropout_offset,
+                alibi_slope,
+                seqlen_q,
+                seqlen_k,  # max sequence length for q and k
+                start_n,
+                start_m,
+                num_steps,  # iteration numbers
+                descale_q,
+                descale_k,
+                descale_v,
+                descale_do,
+                MASK=True,  # causal masking
+                ENABLE_DROPOUT=ENABLE_DROPOUT,  # activate dropout
+                USE_ALIBI=USE_ALIBI,
+                USE_EXP2=USE_EXP2,
+                IS_FP8=IS_FP8,
+                FP8_MAX=FP8_MAX,
+                DEBUG_TRITON=DEBUG_TRITON,
+                DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                SLIDING_WINDOW=SLIDING_WINDOW,
+            )
+            start_m += num_steps * MASK_BLOCK_M1
+            end_m = seqlen_q
+            if SLIDING_WINDOW > 0:
+                end_m = min(start_n + BLOCK_N1 + delta_qk + SLIDING_WINDOW, seqlen_q)
+            num_steps = tl.cdiv(max(end_m - start_m, 0), BLOCK_M1)
+            end_m = start_m + num_steps * BLOCK_M1
+
+            if DEBUG_TRITON:
+                print(f"start_m after Masked step: {start_m}; num_steps: {num_steps}")
+            if DEBUG_TRITON:
+                print(
+                    f"unMasked: start_n: {start_n}, start_m: {start_m}, end_m: {end_m}, num_steps: {num_steps}"
+                )
+            if DEBUG_TRITON:
+                print("unMasked")
+            dk, dk_pe, dv = _bwd_dkdv_inner(
+                dk,  # output tensor
+                dk_pe,  # optional output tensor
+                dv,  # output tensor
+                Q_ptr,
+                k,
+                k_pe,
+                v,
+                DO_ptr,
+                M_ptr,
+                Delta_ptr,
+                sm_scale,  # input tensors
+                stride_qm,
+                stride_qd,  # strides for q
+                stride_dom,
+                stride_dod,  # strides for o
+                stride_dropoutm,
+                stride_dropoutn,  # strides for dropout
+                stride_deltam,
+                BLOCK_M1,
+                BLOCK_N1,  # block dim
+                HEAD_DIM,
+                ACTUAL_HEAD_DIM,  # head dim
+                PE_HEAD_DIM,
+                dropout_p,
+                philox_seed,
+                batch_philox_offset,
+                dropout_offset,
+                alibi_slope,
+                seqlen_q,
+                seqlen_k,  # max sequence length for q and k
+                start_n,
+                start_m,
+                num_steps,  # iteration numbers
+                descale_q,
+                descale_k,
+                descale_v,
+                descale_do,
+                MASK=False,  # causal masking
+                ENABLE_DROPOUT=ENABLE_DROPOUT,  # activate dropout
+                USE_ALIBI=USE_ALIBI,
+                USE_EXP2=USE_EXP2,
+                IS_FP8=IS_FP8,
+                FP8_MAX=FP8_MAX,
+                DEBUG_TRITON=DEBUG_TRITON,
+                DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                SLIDING_WINDOW=SLIDING_WINDOW,
+            )
+        # end of GQA/MQA of dkdv
+        # Write back dV
+        adj_dv = bid * stride_dvb + hkid * stride_dvh + k_start * stride_dvn
+        offs_dv = offs_n[:, None] * stride_dvn + offs_d[None, :] * stride_dvd
+        tl.store(DV + adj_dv + offs_dv, dv, mask=mask_kv)
+        # write back dk
+        adj_dk = bid * stride_dkb + hkid * stride_dkh + k_start * stride_dkn
+        offs_dk = offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkd
+        dk *= sm_scale
+        tl.store(DK + adj_dk + offs_dk, dk, mask=mask_kv)
+        if HAS_PE:
+            offs_dk_pe = offs_n[:, None] * stride_dkn + offs_d_pe[None, :] * stride_dkd
+            dk_pe *= sm_scale
+            tl.store(DK + adj_dk + offs_dk_pe, dk_pe, mask=mask_kv)
+
+    # This part does dq
+    start_m = pid * BLOCK_M2
+    if start_m < seqlen_q:
+        # seqlen_q > seqlen_k, no need to process these tile for dq
+        if DEBUG_TRITON:
+            print(
+                f"end_n = start_m + BLOCK_M = {start_m} + {BLOCK_M2} = {start_m + BLOCK_M2}"
+            )
+        if start_m + BLOCK_M2 < delta_qk:
+            if DEBUG_TRITON:
+                print(
+                    f"start_m + BLOCK_M2 = {start_m} + {BLOCK_M2} = {start_m + BLOCK_M2} < delta_qk of {delta_qk}"
+                )
+            return
+
+        offs_m = start_m + tl.arange(0, BLOCK_M2)
+        # Mask for loading K and V
+        mask_q = offs_m[:, None] < seqlen_q
+        if PADDED_HEAD:
+            mask_d = offs_d < ACTUAL_HEAD_DIM
+            mask_q &= mask_d[None, :]
+        offs_q = offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+        if HAS_PE:
+            offs_q_pe = offs_m[:, None] * stride_qm + offs_d_pe[None, :] * stride_qd
+        offs_do = offs_m[:, None] * stride_dom + offs_d[None, :] * stride_dod
+        # NOTE: don't assume that the strides for k and v are the same!
+        K += bid * stride_kb + hkid * stride_kh + k_start * stride_kn
+        V += bid * stride_vb + hkid * stride_vh + k_start * stride_vn
+
+        # If MQA / GQA, set the K and V head offsets appropriately.
+        for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
+            # seqlen_q < seqlen_k: delta_qk more kv tokens are added at the front
+            #   for every M-tile
+            end_n = start_m + BLOCK_M2 - delta_qk
+            # clamp end_n at [0, seqlen_k]
+            end_n = max(min(end_n, seqlen_k), 0)
+            if DEBUG_TRITON:
+                print(f"delta_qk: {delta_qk}; end_n: {end_n}")
+            # offset input and output tensor by batch and Q/K heads
+            adj_q = bid * stride_qb + hqid * stride_qh + q_start * stride_qm
+            adj_do = bid * stride_dob + hqid * stride_doh + q_start * stride_dom
+            adj_delta = (
+                bid * stride_deltab + hqid * stride_deltah + q_start * stride_deltam
+            )
+            Delta_ptr = Delta + adj_delta
+
+            if USE_ALIBI:
+                alibi_offset = bid * stride_az + hqid * stride_ah
+                alibi_slope = tl.load(Alibi_slopes + alibi_offset)
+            else:
+                alibi_slope = None
+
+            # batch_philox_offset is the ACTUALLY dropout offset
+            # dropout_offset is for debug purpose and will be removed later
+            batch_philox_offset = 0
+            dropout_offset = 0
+            if ENABLE_DROPOUT:
+                batch_philox_offset = (
+                    philox_offset_base + bid * stride_dropoutb + hqid * stride_dropouth
+                )
+                dropout_offset = (
+                    Dropout_mask + bid * stride_dropoutb + hqid * stride_dropouth
+                )
+            q = tl.load(Q + adj_q + offs_q, mask=mask_q, other=0.0)
+            if HAS_PE:
+                q_pe = tl.load(Q + adj_q + offs_q_pe, mask=mask_q, other=0.0)
+            else:
+                q_pe = None
+            do = tl.load(DO + adj_do + offs_do, mask=mask_q, other=0.0)
+            mask_m = offs_m < seqlen_q
+            m = tl.load(M + adj_delta + offs_m * stride_deltam, mask=mask_m, other=0.0)
+            m = m[:, None]
+            delta = tl.load(Delta_ptr + offs_m * stride_deltam, mask=mask_m, other=0.0)
+
+            MASK_BLOCK_N2: tl.constexpr = BLOCK_N2 // BLK_SLICE_FACTOR
+            # start can only be 0 at minimum
+            start_n = max(end_n - BLOCK_M2, 0)
+            num_steps = tl.cdiv(end_n - start_n, MASK_BLOCK_N2)
+
+            if IS_FP8:
+                descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
+                descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
+                descale_v = tl.load(Descale_v + bid * stride_descale_v_z + hkid)
+                descale_do = tl.load(Descale_do + bid * stride_descale_do_z + hqid)
+            else:
+                descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
+
+            dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
+            if HAS_PE:
+                dq_pe = tl.zeros([BLOCK_M2, PE_HEAD_DIM], dtype=tl.float32)
+            else:
+                dq_pe = dq  # Couldn't assign None to dq_pe because _bwd_dq_inner can't return None.
+            dq, dq_pe, delta_recomp_masked = _bwd_dq_inner(
+                dq,  # output tensor
+                dq_pe,  # optional output tensor
+                q,
+                q_pe,
+                K,
+                V,
+                do,
+                m,
+                delta,
+                sm_scale,
+                stride_qm,
+                stride_qd,
+                stride_kn,
+                stride_kd,
+                stride_vn,
+                stride_vd,
+                stride_dropoutm,
+                stride_dropoutn,
+                seqlen_q,
+                seqlen_k,
+                BLOCK_M2,
+                MASK_BLOCK_N2,
+                HEAD_DIM,
+                ACTUAL_HEAD_DIM,
+                PE_HEAD_DIM,
+                dropout_p,
+                philox_seed,
+                batch_philox_offset,
+                dropout_offset,
+                alibi_slope,
+                start_m,
+                start_n,
+                end_n,
+                num_steps,
+                descale_q,
+                descale_k,
+                descale_v,
+                descale_do,
+                MASK=True,
+                ENABLE_DROPOUT=ENABLE_DROPOUT,
+                USE_ALIBI=USE_ALIBI,
+                USE_EXP2=USE_EXP2,
+                IS_FP8=IS_FP8,
+                FP8_MAX=FP8_MAX,
+                DEBUG_TRITON=DEBUG_TRITON,
+                DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                SLIDING_WINDOW=SLIDING_WINDOW,
+                ENABLE_SINK=ENABLE_SINK,
+            )
+            end_n -= num_steps * MASK_BLOCK_N2
+            window_start_n = 0
+            if SLIDING_WINDOW > 0:
+                window_start_n = max(start_m - delta_qk - SLIDING_WINDOW, 0)
+            start_n = window_start_n // BLOCK_N2 * BLOCK_N2
+            num_steps = tl.cdiv(max(end_n - start_n, 0), BLOCK_N2)
+            if DEBUG_TRITON:
+                print(
+                    f"unMasked: start_m: {start_m}, start_n: {start_n}, end_n: {end_n}, num_steps: {num_steps}"
+                )
+            dq, dq_pe, delta_recomp_unmasked = _bwd_dq_inner(
+                dq,  # output tensor
+                dq_pe,  # optional output tensor
+                q,
+                q_pe,
+                K,
+                V,
+                do,
+                m,
+                delta,
+                sm_scale,
+                stride_qm,
+                stride_qd,
+                stride_kn,
+                stride_kd,
+                stride_vn,
+                stride_vd,
+                stride_dropoutm,
+                stride_dropoutn,
+                seqlen_q,
+                seqlen_k,
+                BLOCK_M2,
+                BLOCK_N2,
+                HEAD_DIM,
+                ACTUAL_HEAD_DIM,
+                PE_HEAD_DIM,
+                dropout_p,
+                philox_seed,
+                batch_philox_offset,
+                dropout_offset,
+                alibi_slope,
+                start_m,
+                start_n,
+                end_n,
+                num_steps,
+                descale_q,
+                descale_k,
+                descale_v,
+                descale_do,
+                MASK=False,
+                ENABLE_DROPOUT=ENABLE_DROPOUT,
+                USE_ALIBI=USE_ALIBI,
+                USE_EXP2=USE_EXP2,
+                IS_FP8=IS_FP8,
+                FP8_MAX=FP8_MAX,
+                DEBUG_TRITON=DEBUG_TRITON,
+                DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                SLIDING_WINDOW=SLIDING_WINDOW,
+                ENABLE_SINK=ENABLE_SINK,
+            )
+            if ENABLE_SINK:
+                sink = tl.load(Sink + hqid).to(tl.float32)
+                if USE_EXP2:
+                    RCP_LN2: tl.constexpr = 1.4426950408889634
+                    psink = tl.math.exp2(sink * RCP_LN2 - m * RCP_LN2)
+                else:
+                    psink = tl.math.exp(sink - m)
+                delta_recomp = delta_recomp_masked + delta_recomp_unmasked
+                dsink = tl.sum(-psink * delta_recomp[:, None])
+                tl.atomic_add(DSink + hqid, dsink, sem="relaxed")
+            # Write back dQ.
+            adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
+            offs_dq = offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd
+            dq *= sm_scale
+            tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
+            if HAS_PE:
+                offs_dq_pe = (
+                    offs_m[:, None] * stride_dqm + offs_d_pe[None, :] * stride_dqd
+                )
+                dq_pe *= sm_scale
+                tl.store(DQ + adj_dq + offs_dq_pe, dq_pe, mask=mask_q)
+            # end of GQA/MQA of dq
+
+
+@triton.jit
+def bwd_kernel_noncausal(
+    Q,
+    K,
+    V,
+    Sink,
+    sm_scale,
+    DO,
+    DQ,
+    DK,
+    DV,
+    DSink,
+    M,
+    Delta,
+    stride_qb_in,
+    stride_qh_in,
+    stride_qm_in,
+    stride_qd_in,
+    stride_kb_in,
+    stride_kh_in,
+    stride_kn_in,
+    stride_kd_in,
+    stride_vb_in,
+    stride_vh_in,
+    stride_vn_in,
+    stride_vd_in,
+    stride_dqb_in,
+    stride_dqh_in,
+    stride_dqm_in,
+    stride_dqd_in,
+    stride_dkb_in,
+    stride_dkh_in,
+    stride_dkn_in,
+    stride_dkd_in,
+    stride_dvb_in,
+    stride_dvh_in,
+    stride_dvn_in,
+    stride_dvd_in,
+    stride_deltab_in,
+    stride_deltah_in,
+    stride_deltam_in,
+    stride_dob_in,
+    stride_doh_in,
+    stride_dom_in,
+    stride_dod_in,
+    stride_dropoutb_in,
+    stride_dropouth_in,
+    stride_dropoutm_in,
+    stride_dropoutn_in,
+    stride_descale_q_z_in,
+    stride_descale_k_z_in,
+    stride_descale_v_z_in,
+    stride_descale_do_z_in,
+    stride_az_in,
+    stride_ah_in,
+    HQ,
+    HK,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    Dropout_mask,
+    dropout_p,
+    philox_seed,
+    philox_offset_base_in,
+    Alibi_slopes,
+    Descale_q,
+    Descale_k,
+    Descale_v,
+    Descale_do,
+    BLOCK_M1: tl.constexpr,  # 32
+    BLOCK_N1: tl.constexpr,  # 128
+    BLOCK_M2: tl.constexpr,  # 128
+    BLOCK_N2: tl.constexpr,  # 32
+    BLK_SLICE_FACTOR: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    ACTUAL_HEAD_DIM: tl.constexpr,
+    PE_HEAD_DIM: tl.constexpr,
+    ENABLE_DROPOUT: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    USE_ALIBI: tl.constexpr,
+    USE_EXP2: tl.constexpr,
+    IS_FP8: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    DEBUG_TRITON: tl.constexpr,
+    DEBUG_TRITON_DETAIL: tl.constexpr,
+    USE_INT64_STRIDES: tl.constexpr,
+    ENABLE_SINK: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
+):
+    if USE_INT64_STRIDES:
+        stride_qb = tl.cast(stride_qb_in, tl.int64)
+        stride_qh = tl.cast(stride_qh_in, tl.int64)
+        stride_qm = tl.cast(stride_qm_in, tl.int64)
+        stride_qd = tl.cast(stride_qd_in, tl.int64)
+        stride_kb = tl.cast(stride_kb_in, tl.int64)
+        stride_kh = tl.cast(stride_kh_in, tl.int64)
+        stride_kn = tl.cast(stride_kn_in, tl.int64)
+        stride_kd = tl.cast(stride_kd_in, tl.int64)
+        stride_vb = tl.cast(stride_vb_in, tl.int64)
+        stride_vh = tl.cast(stride_vh_in, tl.int64)
+        stride_vn = tl.cast(stride_vn_in, tl.int64)
+        stride_vd = tl.cast(stride_vd_in, tl.int64)
+        stride_dqb = tl.cast(stride_dqb_in, tl.int64)
+        stride_dqh = tl.cast(stride_dqh_in, tl.int64)
+        stride_dqm = tl.cast(stride_dqm_in, tl.int64)
+        stride_dqd = tl.cast(stride_dqd_in, tl.int64)
+        stride_dkb = tl.cast(stride_dkb_in, tl.int64)
+        stride_dkh = tl.cast(stride_dkh_in, tl.int64)
+        stride_dkn = tl.cast(stride_dkn_in, tl.int64)
+        stride_dkd = tl.cast(stride_dkd_in, tl.int64)
+        stride_dvb = tl.cast(stride_dvb_in, tl.int64)
+        stride_dvh = tl.cast(stride_dvh_in, tl.int64)
+        stride_dvn = tl.cast(stride_dvn_in, tl.int64)
+        stride_dvd = tl.cast(stride_dvd_in, tl.int64)
+        stride_deltab = tl.cast(stride_deltab_in, tl.int64)
+        stride_deltah = tl.cast(stride_deltah_in, tl.int64)
+        stride_deltam = tl.cast(stride_deltam_in, tl.int64)
+        stride_dob = tl.cast(stride_dob_in, tl.int64)
+        stride_doh = tl.cast(stride_doh_in, tl.int64)
+        stride_dom = tl.cast(stride_dom_in, tl.int64)
+        stride_dod = tl.cast(stride_dod_in, tl.int64)
+        philox_offset_base = tl.cast(philox_offset_base_in, tl.int64)
+        stride_dropoutb = tl.cast(stride_dropoutb_in, tl.int64)
+        stride_dropouth = tl.cast(stride_dropouth_in, tl.int64)
+        stride_dropoutm = tl.cast(stride_dropoutm_in, tl.int64)
+        stride_dropoutn = tl.cast(stride_dropoutn_in, tl.int64)
+        if IS_FP8:
+            stride_descale_q_z = tl.cast(stride_descale_q_z_in, tl.int64)
+            stride_descale_k_z = tl.cast(stride_descale_k_z_in, tl.int64)
+            stride_descale_v_z = tl.cast(stride_descale_v_z_in, tl.int64)
+            stride_descale_do_z = tl.cast(stride_descale_do_z_in, tl.int64)
+        stride_az = tl.cast(stride_az_in, tl.int64)
+        stride_ah = tl.cast(stride_ah_in, tl.int64)
+    else:
+        stride_qb = stride_qb_in
+        stride_qh = stride_qh_in
+        stride_qm = stride_qm_in
+        stride_qd = stride_qd_in
+        stride_kb = stride_kb_in
+        stride_kh = stride_kh_in
+        stride_kn = stride_kn_in
+        stride_kd = stride_kd_in
+        stride_vb = stride_vb_in
+        stride_vh = stride_vh_in
+        stride_vn = stride_vn_in
+        stride_vd = stride_vd_in
+        stride_dqb = stride_dqb_in
+        stride_dqh = stride_dqh_in
+        stride_dqm = stride_dqm_in
+        stride_dqd = stride_dqd_in
+        stride_dkb = stride_dkb_in
+        stride_dkh = stride_dkh_in
+        stride_dkn = stride_dkn_in
+        stride_dkd = stride_dkd_in
+        stride_dvb = stride_dvb_in
+        stride_dvh = stride_dvh_in
+        stride_dvn = stride_dvn_in
+        stride_dvd = stride_dvd_in
+        stride_deltab = stride_deltab_in
+        stride_deltah = stride_deltah_in
+        stride_deltam = stride_deltam_in
+        stride_dob = stride_dob_in
+        stride_doh = stride_doh_in
+        stride_dom = stride_dom_in
+        stride_dod = stride_dod_in
+        philox_offset_base = philox_offset_base_in
+        stride_dropoutb = stride_dropoutb_in
+        stride_dropouth = stride_dropouth_in
+        stride_dropoutm = stride_dropoutm_in
+        stride_dropoutn = stride_dropoutn_in
+        stride_descale_q_z = stride_descale_q_z_in
+        stride_descale_k_z = stride_descale_k_z_in
+        stride_descale_v_z = stride_descale_v_z_in
+        stride_descale_do_z = stride_descale_do_z_in
+        stride_az = stride_az_in
+        stride_ah = stride_ah_in
+
+    # program ids
+    hkid = tl.program_id(0)
+    pid = tl.program_id(1)
+    bid = tl.program_id(2)
+    if DEBUG_TRITON:
+        print(f"\npid: {pid}, bid: {bid}, hkid: {hkid}")
+    # figure out varlen start and end
+    q_start = 0
+    k_start = 0
+    seqlen_q = max_seqlen_q
+    seqlen_k = max_seqlen_k
+    if IS_VARLEN:
+        # Compute actual sequence lengths
+        q_start = tl.load(cu_seqlens_q + bid)
+        q_end = tl.load(cu_seqlens_q + bid + 1)
+        k_start = tl.load(cu_seqlens_k + bid)
+        k_end = tl.load(cu_seqlens_k + bid + 1)
+        seqlen_q = q_end - q_start
+        seqlen_k = k_end - k_start
+
+    PADDED_HEAD: tl.constexpr = ACTUAL_HEAD_DIM != HEAD_DIM
+    HAS_PE: tl.constexpr = PE_HEAD_DIM > 0
+    offs_d = tl.arange(0, HEAD_DIM)
+    if HAS_PE:
+        offs_d_pe = HEAD_DIM + tl.arange(0, PE_HEAD_DIM)
+    GROUP_SIZE: tl.constexpr = HQ // HK
+
+    start_n = pid * BLOCK_N1
+    if start_n < seqlen_k:
+        dk = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
+        if HAS_PE:
+            dk_pe = tl.zeros([BLOCK_N1, PE_HEAD_DIM], dtype=tl.float32)
+        else:
+            # Couldn't assign None to dk_pe because _bwd_dkdv_inner can't return None.
+            dk_pe = dk
+        dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
+
+        offs_n = start_n + tl.arange(0, BLOCK_N1)
+        # Mask for loading K and V
+        mask_kv = offs_n[:, None] < seqlen_k
+        if PADDED_HEAD:
+            mask_d = offs_d < ACTUAL_HEAD_DIM
+            mask_kv &= mask_d[None, :]
+        # NOTE: don't assume that the strides for k and v are the same!
+        # K/V tensors not changed for the group
+        adj_k = (
+            bid * stride_kb
+            + hkid * stride_kh
+            + k_start * stride_kn
+            + offs_n[:, None] * stride_kn
+            + offs_d[None, :] * stride_kd
+        )
+        if HAS_PE:
+            adj_k_pe = (
+                bid * stride_kb
+                + hkid * stride_kh
+                + k_start * stride_kn
+                + offs_n[:, None] * stride_kn
+                + offs_d_pe[None, :] * stride_kd
+            )
+        adj_v = (
+            bid * stride_vb
+            + hkid * stride_vh
+            + k_start * stride_vn
+            + offs_n[:, None] * stride_vn
+            + offs_d[None, :] * stride_vd
+        )
+        # load K and V: they stay in SRAM throughout the inner loop.
+        k = tl.load(K + adj_k, mask=mask_kv, other=0.0)
+        if HAS_PE:
+            k_pe = tl.load(K + adj_k_pe, mask=mask_kv, other=0.0)
+        else:
+            k_pe = None
+        v = tl.load(V + adj_v, mask=mask_kv, other=0.0)
+        # If MQA / GQA, set the K and V head offsets appropriately.
+        for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
+            # offset input and output tensor by batch and Q/K heads
+            adj_q = bid * stride_qb + hqid * stride_qh + q_start * stride_qm
+            Q_ptr = Q + adj_q
+            adj_do = bid * stride_dob + hqid * stride_doh + q_start * stride_dom
+            DO_ptr = DO + adj_do
+            adj_delta = (
+                bid * stride_deltab + hqid * stride_deltah + q_start * stride_deltam
+            )
+            M_ptr = M + adj_delta
+            Delta_ptr = Delta + adj_delta
+
+            if USE_ALIBI:
+                alibi_offset = bid * stride_az + hqid * stride_ah
+                alibi_slope = tl.load(Alibi_slopes + alibi_offset)
+            else:
+                alibi_slope = None
+
+            # batch_philox_offset is the ACTUALLY dropout offset
+            # dropout_offset is for debug purpose and will be removed later
+            batch_philox_offset = 0
+            dropout_offset = 0
+            if ENABLE_DROPOUT:
+                batch_philox_offset = (
+                    philox_offset_base + bid * stride_dropoutb + hqid * stride_dropouth
+                )
+                dropout_offset = (
+                    Dropout_mask + bid * stride_dropoutb + hqid * stride_dropouth
+                )
+
+            if IS_FP8:
+                descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
+                descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
+                descale_v = tl.load(Descale_v + bid * stride_descale_v_z + hkid)
+                descale_do = tl.load(Descale_do + bid * stride_descale_do_z + hqid)
+            else:
+                descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
+
+            # because there is no causal, we always start from the beginning
+            start_m = 0
+            num_steps = tl.cdiv(seqlen_q, BLOCK_M1)
+            dk, dk_pe, dv = _bwd_dkdv_inner(
+                dk,  # output tensor
+                dk_pe,  # optional output tensor
+                dv,  # output tensor
+                Q_ptr,
+                k,
+                k_pe,
+                v,
+                DO_ptr,
+                M_ptr,
+                Delta_ptr,
+                sm_scale,  # input tensors
+                stride_qm,
+                stride_qd,  # strides for q
+                stride_dom,
+                stride_dod,  # strides for o
+                stride_dropoutm,
+                stride_dropoutn,  # strides for dropout
+                stride_deltam,
+                BLOCK_M1,
+                BLOCK_N1,  # block dim
+                HEAD_DIM,
+                ACTUAL_HEAD_DIM,  # head dim
+                PE_HEAD_DIM,
+                dropout_p,
+                philox_seed,
+                batch_philox_offset,
+                dropout_offset,
+                alibi_slope,
+                seqlen_q,
+                seqlen_k,  # max sequence length for q and k
+                start_n,
+                start_m,
+                num_steps,  # iteration numbers
+                descale_q,
+                descale_k,
+                descale_v,
+                descale_do,  # fp8 descale factors from user
+                MASK=False,  # causal masking
+                ENABLE_DROPOUT=ENABLE_DROPOUT,  # activate dropout
+                USE_ALIBI=USE_ALIBI,
+                USE_EXP2=USE_EXP2,
+                IS_FP8=IS_FP8,
+                FP8_MAX=FP8_MAX,
+                DEBUG_TRITON=DEBUG_TRITON,
+                DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                SLIDING_WINDOW=SLIDING_WINDOW,
+            )
+
+        # Write back dV
+        adj_dv = bid * stride_dvb + hkid * stride_dvh + k_start * stride_dvn
+        offs_dv = offs_n[:, None] * stride_dvn + offs_d[None, :] * stride_dvd
+        tl.store(DV + adj_dv + offs_dv, dv, mask=mask_kv)
+        # write back dk
+        adj_dk = bid * stride_dkb + hkid * stride_dkh + k_start * stride_dkn
+        offs_dk = offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkd
+        dk *= sm_scale
+        tl.store(DK + adj_dk + offs_dk, dk, mask=mask_kv)
+        if HAS_PE:
+            offs_dk_pe = offs_n[:, None] * stride_dkn + offs_d_pe[None, :] * stride_dkd
+            dk_pe *= sm_scale
+            tl.store(DK + adj_dk + offs_dk_pe, dk_pe, mask=mask_kv)
+
+    # THIS PART DOES DQ
+    start_m = pid * BLOCK_M2
+    if start_m < seqlen_q:
+        offs_m = start_m + tl.arange(0, BLOCK_M2)
+        # Mask for loading K and V
+        mask_q = offs_m[:, None] < seqlen_q
+        if PADDED_HEAD:
+            mask_d = offs_d < ACTUAL_HEAD_DIM
+            mask_q &= mask_d[None, :]
+        offs_q = offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+        if HAS_PE:
+            offs_q_pe = offs_m[:, None] * stride_qm + offs_d_pe[None, :] * stride_qd
+        offs_do = offs_m[:, None] * stride_dom + offs_d[None, :] * stride_dod
+        K += bid * stride_kb + hkid * stride_kh + k_start * stride_kn
+        V += bid * stride_vb + hkid * stride_vh + k_start * stride_vn
+        # If MQA / GQA, set the K and V head offsets appropriately.
+        for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
+            # offset input and output tensor by batch and Q/K heads
+            adj_q = bid * stride_qb + hqid * stride_qh + q_start * stride_qm
+            adj_do = bid * stride_dob + hqid * stride_doh + q_start * stride_dom
+            adj_delta = (
+                bid * stride_deltab + hqid * stride_deltah + q_start * stride_deltam
+            )
+            Delta_ptr = Delta + adj_delta
+
+            if USE_ALIBI:
+                alibi_offset = bid * stride_az + hqid * stride_ah
+                alibi_slope = tl.load(Alibi_slopes + alibi_offset)
+            else:
+                alibi_slope = None
+
+            # batch_philox_offset is the ACTUALLY dropout offset
+            # dropout_offset is for debug purpose and will be removed later
+            batch_philox_offset = 0
+            dropout_offset = 0
+            if ENABLE_DROPOUT:
+                batch_philox_offset = (
+                    philox_offset_base + bid * stride_dropoutb + hqid * stride_dropouth
+                )
+                dropout_offset = (
+                    Dropout_mask + bid * stride_dropoutb + hqid * stride_dropouth
+                )
+
+            q = tl.load(Q + adj_q + offs_q, mask=mask_q, other=0.0)
+            if HAS_PE:
+                q_pe = tl.load(Q + adj_q + offs_q_pe, mask=mask_q, other=0.0)
+            else:
+                q_pe = None
+            do = tl.load(DO + adj_do + offs_do, mask=mask_q, other=0.0)
+            mask_m = offs_m < seqlen_q
+            m = tl.load(M + adj_delta + offs_m * stride_deltam, mask=mask_m, other=0.0)
+            m = m[:, None]
+            delta = tl.load(Delta_ptr + offs_m * stride_deltam, mask=mask_m, other=0.0)
+
+            if IS_FP8:
+                descale_q = tl.load(Descale_q + bid * stride_descale_q_z + hqid)
+                descale_k = tl.load(Descale_k + bid * stride_descale_k_z + hkid)
+                descale_v = tl.load(Descale_v + bid * stride_descale_v_z + hkid)
+                descale_do = tl.load(Descale_do + bid * stride_descale_do_z + hqid)
+            else:
+                descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
+
+            # start can only be 0 at minimum
+            start_n = 0
+            end_n = seqlen_k
+            num_steps = tl.cdiv(seqlen_k, BLOCK_N2)
+
+            dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
+            if HAS_PE:
+                dq_pe = tl.zeros([BLOCK_M2, PE_HEAD_DIM], dtype=tl.float32)
+            else:
+                dq_pe = dq  # Couldn't assign None to dq_pe because _bwd_dq_inner can't return None.
+            dq, dq_pe, delta_recomp = _bwd_dq_inner(
+                dq,  # output tensor
+                dq_pe,  # optional output tensor
+                q,
+                q_pe,
+                K,
+                V,
+                do,
+                m,
+                delta,
+                sm_scale,
+                stride_qm,
+                stride_qd,
+                stride_kn,
+                stride_kd,
+                stride_vn,
+                stride_vd,
+                stride_dropoutm,
+                stride_dropoutn,
+                seqlen_q,
+                seqlen_k,
+                BLOCK_M2,
+                BLOCK_N2,
+                HEAD_DIM,
+                ACTUAL_HEAD_DIM,
+                PE_HEAD_DIM,
+                dropout_p,
+                philox_seed,
+                batch_philox_offset,
+                dropout_offset,
+                alibi_slope,
+                start_m,
+                start_n,
+                end_n,
+                num_steps,
+                descale_q,
+                descale_k,
+                descale_v,
+                descale_do,
+                MASK=False,
+                ENABLE_DROPOUT=ENABLE_DROPOUT,
+                USE_ALIBI=USE_ALIBI,
+                USE_EXP2=USE_EXP2,
+                IS_FP8=IS_FP8,
+                FP8_MAX=FP8_MAX,
+                DEBUG_TRITON=DEBUG_TRITON,
+                DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                SLIDING_WINDOW=SLIDING_WINDOW,
+                ENABLE_SINK=ENABLE_SINK,
+            )
+            if ENABLE_SINK:
+                sink = tl.load(Sink + hqid).to(tl.float32)
+                if USE_EXP2:
+                    RCP_LN2: tl.constexpr = 1.4426950408889634
+                    psink = tl.math.exp2(sink * RCP_LN2 - m * RCP_LN2)
+                else:
+                    psink = tl.math.exp(sink - m)
+                dsink = tl.sum(-psink * delta_recomp[:, None])
+                tl.atomic_add(DSink + hqid, dsink, sem="relaxed")
+            # Write back dQ.
+            adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
+            offs_dq = offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd
+            dq *= sm_scale
+            tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
+            if HAS_PE:
+                offs_dq_pe = (
+                    offs_m[:, None] * stride_dqm + offs_d_pe[None, :] * stride_dqd
+                )
+                dq_pe *= sm_scale
+                tl.store(DQ + adj_dq + offs_dq_pe, dq_pe, mask=mask_q)
+
+
+# ---------------------------------------------------------------------------
+# Tuning surface
+# ---------------------------------------------------------------------------
+# CHANGED vs upstream. AITER ends this file with:
+#
+#     @functools.lru_cache(maxsize=1024)
+#     def _get_config():
+#         cfg_dir = resolve_config_dir("attention", "MHA", backend="triton")
+#         config = load_config_json(f"{cfg_dir}/DEFAULT.json")
+#         return config["bkwd_onekernel"]
+#
+# which discovers a per-arch JSON file at runtime. That is dropped entirely:
+#
+#   * resolve_config_dir() exists to pick a file per GPU arch; it also reaches
+#     arch_info, which probes `triton.runtime.driver.active` at *import* time.
+#     A single-arch vendored kernel has nothing to discover and should not
+#     touch a device on import.
+#   * a vendored .json would not even ship: setup.py's package_data lists only
+#     "primus_turbo/lib/*.so" and MANIFEST.in lists only README/LICENSE files,
+#     so the table has to live in Python to survive a wheel build.
+#
+# The shipped values are NOT upstream's. aiter's gfx1250 DEFAULT.json
+# "bkwd_onekernel" block ships BLOCK_N1=128, BLOCK_M2=128, BLK_SLICE_FACTOR=2.
+# The three deltas below (N1 128->256, M2 128->256, SLICE 2->1) are the
+# Primus-Turbo measured champion on gfx1250 at b=4 s=8192 hq=32 hkv=8 d=128
+# bf16 causal: bwd 18.42 ms against 32.25 ms for the previous in-tree Triton
+# backward. See FUSED_MHA_PROVENANCE.md.
+_FUSED_BWD_TUNE_ENV = "PRIMUS_TURBO_FUSED_MHA_BWD_TUNE"
+
+# delta = rowsum(dO * O) preprocess pass. Unchanged from upstream.
+_DEFAULT_PREPROCESS_CONFIG = {
+    "PRE_BLOCK": 128,
+}
+
+_DEFAULT_ONEKERNEL_CONFIG = {
+    "BLOCK_M1": 32,  # unchanged from upstream
+    "BLOCK_N1": 256,  # CHANGED 128 -> 256 (tuned)
+    "BLOCK_M2": 256,  # CHANGED 128 -> 256 (tuned)
+    "BLOCK_N2": 32,  # unchanged from upstream
+    "BLK_SLICE_FACTOR": 1,  # CHANGED 2 -> 1 (tuned)
+    # CHANGED round 1 (r1.i1.g1): 1 -> 0. waves_per_eu=0 is Triton's "do not
+    # constrain occupancy, let the backend choose"; measured 9.571 ms vs 9.996 ms
+    # for waves_per_eu=1 on b4_s8192_hq32_hkv8_d128.
+    "waves_per_eu": 0,
+    "matrix_instr_nonkdim": 16,
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 1,
+}
+
+# Every value the kernel launch accepts is an integer; anything else is a typo.
+# Zero is a typo for every key except waves_per_eu, where it is Triton's
+# encoding for "do not constrain occupancy, let the backend choose". That is a
+# distinct compilation, not a disabled knob: the attribute reaches LLVM as
+# amdgpu-waves-per-eu and changes scheduling. Rejecting it as non-positive made
+# the setting unreachable from the tuning harness.
+_ZERO_MEANS_UNSET = frozenset({"waves_per_eu"})
+
+_ONEKERNEL_KEYS = frozenset(_DEFAULT_ONEKERNEL_CONFIG)
+_PREPROCESS_KEYS = frozenset(_DEFAULT_PREPROCESS_CONFIG)
+
+
+def _check_block_invariant(onekernel: dict) -> None:
+    """The dk/dv pass and the dq pass must use transposed tiles of one shape.
+
+    ``bwd_kernel_{causal,noncausal}`` walk the same score matrix twice: pass 1
+    tiles it BLOCK_M1 x BLOCK_N1 for dK/dV and pass 2 tiles it
+    BLOCK_M2 x BLOCK_N2 for dQ. The launch grid is sized off BLOCK_N1 only, so
+    a config where the two passes disagree does not error -- it silently
+    computes the wrong thing. The tuning harness enforces the same pair of
+    equalities (tools/gfx1250/tune_attention.py); carry it into the library so
+    a hand-written env override cannot get it wrong either.
+    """
+    if onekernel["BLOCK_N1"] != onekernel["BLOCK_M2"]:
+        raise ValueError(
+            f"{_FUSED_BWD_TUNE_ENV}: BLOCK_N1 must equal BLOCK_M2, got "
+            f"{onekernel['BLOCK_N1']} vs {onekernel['BLOCK_M2']}"
+        )
+    if onekernel["BLOCK_M1"] != onekernel["BLOCK_N2"]:
+        raise ValueError(
+            f"{_FUSED_BWD_TUNE_ENV}: BLOCK_M1 must equal BLOCK_N2, got "
+            f"{onekernel['BLOCK_M1']} vs {onekernel['BLOCK_N2']}"
+        )
+
+
+def _parse_tune_spec(spec: str) -> dict:
+    """Parse ``KEY=INT,KEY=INT`` into overrides, raising on anything unparsable.
+
+    Same contract as attention_kernel.PRIMUS_TURBO_ATTN_TRITON_TUNE: a typo
+    raises rather than silently falling back to the shipped config, because a
+    run that quietly measured the default would read as "this knob does
+    nothing".
+    """
+    overrides = {}
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"{_FUSED_BWD_TUNE_ENV}: expected KEY=VALUE, got {item!r}")
+        key, value = (x.strip() for x in item.split("=", 1))
+        if key not in _ONEKERNEL_KEYS and key not in _PREPROCESS_KEYS:
+            known = ",".join(sorted(_ONEKERNEL_KEYS | _PREPROCESS_KEYS))
+            raise ValueError(f"{_FUSED_BWD_TUNE_ENV}: unknown key {key!r} (known: {known})")
+        try:
+            parsed = int(value)
+        except ValueError as exc:
+            raise ValueError(f"{_FUSED_BWD_TUNE_ENV}: {key} must be an integer, got {value!r}") from exc
+        if parsed < 0 or (parsed == 0 and key not in _ZERO_MEANS_UNSET):
+            raise ValueError(f"{_FUSED_BWD_TUNE_ENV}: {key} must be positive, got {parsed}")
+        overrides[key] = parsed
+    if not overrides:
+        raise ValueError(f"{_FUSED_BWD_TUNE_ENV}: spec is set but empty; unset it or use 'off'")
+    return overrides
+
+
+def get_fused_bwd_config() -> dict:
+    """Return ``{"preprocess_kernel": {...}, "onekernel": {...}}``.
+
+    Replaces aiter's ``_get_config()``. Returns fresh dicts every call: the
+    launch site pops entries out of the onekernel dict, so a shared one would
+    be destroyed on first use.
+
+    ``PRIMUS_TURBO_FUSED_MHA_BWD_TUNE`` overrides individual keys, e.g.
+    ``PRIMUS_TURBO_FUSED_MHA_BWD_TUNE=BLOCK_N1=128,BLOCK_M2=128,BLK_SLICE_FACTOR=2``
+    recovers upstream aiter's shipped gfx1250 config. ``off`` (or unset) means
+    the shipped Primus-Turbo values.
+    """
+    preprocess = dict(_DEFAULT_PREPROCESS_CONFIG)
+    onekernel = dict(_DEFAULT_ONEKERNEL_CONFIG)
+
+    spec = os.environ.get(_FUSED_BWD_TUNE_ENV, "").strip()
+    if spec and spec not in ("0", "off"):
+        for key, value in _parse_tune_spec(spec).items():
+            if key in _PREPROCESS_KEYS:
+                preprocess[key] = value
+            else:
+                onekernel[key] = value
+
+    _check_block_invariant(onekernel)
+    return {"preprocess_kernel": preprocess, "onekernel": onekernel}

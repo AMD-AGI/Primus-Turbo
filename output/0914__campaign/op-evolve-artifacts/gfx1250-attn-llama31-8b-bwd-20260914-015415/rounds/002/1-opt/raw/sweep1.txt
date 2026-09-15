@@ -1,0 +1,42 @@
+[runjob] launched key=r2_sweep1 pid=2248603
+tile=256 DEFAULT                                             bwd_ms=8.6720 min=8.6469 sqnr_vs_default=354.5dB
+tile=256 BLOCK_M1=16                                         bwd_ms=11.2994 min=11.2637 sqnr_vs_default=354.5dB
+tile=256 BLOCK_N2=16                                         bwd_ms=9.4940 min=9.4734 sqnr_vs_default=354.5dB
+tile=256 BLOCK_M1=16,BLOCK_N2=16                             bwd_ms=12.0616 min=12.0476 sqnr_vs_default=354.5dB
+tile=256 BLOCK_M1=64                                         bwd_ms=15.9582 min=15.8699 sqnr_vs_default=354.5dB
+tile=256 BLK_SLICE_FACTOR=2                                  bwd_ms=8.8726 min=8.8565 sqnr_vs_default=354.5dB
+/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/002/op/vendor/primus_turbo/triton/attention/fused_mha_bwd_kernel.py:363:19: error: no matching matrix core intrinsic for wmma version 3 with instruction shape [0, 0, 128] and element types A='bf16', B='bf16', C='f32'. Check whether the mfma version, instruction shape, and data types are supported on the current AMD GPU architecture.
+            dpT = tl.dot(v, tl.trans(do))
+                  ^
+/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/002/op/vendor/primus_turbo/triton/attention/fused_mha_bwd_kernel.py:921:29: note: called from
+            dk, dk_pe, dv = _bwd_dkdv_inner(
+                            ^
+/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/002/op/vendor/primus_turbo/triton/attention/fused_mha_bwd_kernel.py:291:19: error: no matching matrix core intrinsic for wmma version 3 with instruction shape [0, 0, 128] and element types A='bf16', B='bf16', C='f32'. Check whether the mfma version, instruction shape, and data types are supported on the current AMD GPU architecture.
+            qkT = tl.dot(k, qT)
+                  ^
+/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/002/op/vendor/primus_turbo/triton/attention/fused_mha_bwd_kernel.py:921:29: note: called from
+            dk, dk_pe, dv = _bwd_dkdv_inner(
+                            ^
+/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/002/op/vendor/primus_turbo/triton/attention/fused_mha_bwd_kernel.py:363:19: error: no matching matrix core intrinsic for wmma version 3 with instruction shape [0, 0, 128] and element types A='bf16', B='bf16', C='f32'. Check whether the mfma version, instruction shape, and data types are supported on the current AMD GPU architecture.
+            dpT = tl.dot(v, tl.trans(do))
+                  ^
+/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/002/op/vendor/primus_turbo/triton/attention/fused_mha_bwd_kernel.py:921:29: note: called from
+            dk, dk_pe, dv = _bwd_dkdv_inner(
+                            ^
+/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/002/op/vendor/primus_turbo/triton/attention/fused_mha_bwd_kernel.py:291:19: error: no matching matrix core intrinsic for wmma version 3 with instruction shape [0, 0, 128] and element types A='bf16', B='bf16', C='f32'. Check whether the mfma version, instruction shape, and data types are supported on the current AMD GPU architecture.
+            qkT = tl.dot(k, qT)
+                  ^
+/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/002/op/vendor/primus_turbo/triton/attention/fused_mha_bwd_kernel.py:921:29: note: called from
+            dk, dk_pe, dv = _bwd_dkdv_inner(
+                            ^
+tile=256 BLOCK_M1=16,BLK_SLICE_FACTOR=2                      bwd_ms=39.4504 min=39.2694 sqnr_vs_default=81.9dB
+tile=256 DEFAULT                                             bwd_ms=8.6780 min=8.6569 sqnr_vs_default=354.5dB
+--- sorted ---
+8.6720  tile=256 DEFAULT
+8.6780  tile=256 DEFAULT
+8.8726  tile=256 BLK_SLICE_FACTOR=2
+9.4940  tile=256 BLOCK_N2=16
+11.2994  tile=256 BLOCK_M1=16
+12.0616  tile=256 BLOCK_M1=16,BLOCK_N2=16
+15.9582  tile=256 BLOCK_M1=64
+39.4504  tile=256 BLOCK_M1=16,BLK_SLICE_FACTOR=2

@@ -1,0 +1,32 @@
+### torch.matmul (hipBLASLt) roof -- reproduces runtime hazard 3
+torch.matmul (hipBLASLt) 4096^3 bf16: 1.110 ms  123.8 TFLOP/s
+torch.matmul (hipBLASLt) 8192^3 bf16: 9.683 ms  113.5 TFLOP/s
+  flat in size, ~113-124 TFLOP/s. Job file hazard 3 measured 91.5 vs Triton 1002.7.
+
+### stack in the container
+triton 3.6.0
+aiter: NOT INSTALLED (ModuleNotFoundError) -- corroborates the job description's claim
+       that the turbo_attention patch IS applied and then dies at the first step.
+primus_turbo: /workspace/Primus-Turbo/primus_turbo/__init__.py (baked into the image,
+       NOT on the shared mount)
+
+### sclk UNDER SUSTAINED LOAD on GPU 1 -- the throttle question
+(the header says MAX_CLK was 1100 MHz vs 1699-1703 on 2026-09-04; idle now reads 2400)
+GPU[1]		: sclk clock level: 1 (1702Mhz)
+GPU[1]		: GPU use (%): 100
+   --- sample 1 ---
+GPU[1]		: sclk clock level: 1 (1702Mhz)
+GPU[1]		: GPU use (%): 100
+   --- sample 2 ---
+GPU[1]		: sclk clock level: 1 (1701Mhz)
+GPU[1]		: GPU use (%): 100
+   --- sample 3 ---
+### post-load GPU state
+GPU[0]		: GPU use (%): 0
+GPU[1]		: GPU use (%): 0
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+### dmesg wedge signature count AFTER all checks (hazard 1/2)
+0
+### op-evolve container
+running image=docker.io/amdprimus/amdprimus:gfx1250-20260910
