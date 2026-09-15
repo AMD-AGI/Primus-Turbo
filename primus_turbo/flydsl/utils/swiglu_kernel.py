@@ -106,6 +106,7 @@ def _make_swiglu_bwd(
     block_threads: int,
     with_gate: bool,
     with_act_w: bool,
+    clamp: bool = True,
 ):
     two_I = 2 * I
     # Gate reduction folds all I columns per row; block spans multiple warps.
@@ -171,17 +172,27 @@ def _make_swiglu_bwd(
                 sc = buffer_load(scale_rsrc, m, vec_width=1, dtype=fx.T.f32())
                 d = fx.arith.mulf(d, _vector.broadcast(f32v, sc))
 
-            gc = _clampv(gate, lo, hi)
-            uc = _clampv(up, lo, hi)
+            gc = _clampv(gate, lo, hi) if clamp else gate
+            uc = _clampv(up, lo, hi) if clamp else up
             sig = fx.arith.divf(one, fx.arith.addf(one, fmath.exp(fx.arith.mulf(gc, neg1))))
             s = fx.arith.mulf(gc, sig)
             duc = fx.arith.mulf(d, s)
             dsilu = fx.arith.mulf(sig, fx.arith.addf(one, fx.arith.mulf(gc, fx.arith.subf(one, sig))))
             dgc = fx.arith.mulf(fx.arith.mulf(d, uc), dsilu)
-            mg = fx.arith.select(fx.arith.cmpf(fx.arith.CmpFPredicate.OEQ, gate, gc), one, zero)
-            mu = fx.arith.select(fx.arith.cmpf(fx.arith.CmpFPredicate.OEQ, up, uc), one, zero)
-            dgate = fx.arith.trunc_f(bf16v, fx.arith.mulf(dgc, mg))
-            dup = fx.arith.trunc_f(bf16v, fx.arith.mulf(duc, mu))
+            # Ternaries, not `if`: a branch here would be traced, and these names are
+            # read after it.
+            mg = (
+                fx.arith.select(fx.arith.cmpf(fx.arith.CmpFPredicate.OEQ, gate, gc), one, zero)
+                if clamp
+                else None
+            )
+            mu = (
+                fx.arith.select(fx.arith.cmpf(fx.arith.CmpFPredicate.OEQ, up, uc), one, zero)
+                if clamp
+                else None
+            )
+            dgate = fx.arith.trunc_f(bf16v, fx.arith.mulf(dgc, mg) if clamp else dgc)
+            dup = fx.arith.trunc_f(bf16v, fx.arith.mulf(duc, mu) if clamp else duc)
 
             if not guard or in_bounds:
                 # Padding rows write garbage dx here; upstream must zero Xpad to keep dW1 clean.
@@ -288,7 +299,7 @@ def _compiled_swiglu(
         for grid_x, block_threads in itertools.product((2048, 4096), (256, 512))
     ],
     rep=5,
-    key=["I", "with_scale", "BM", "with_gate", "with_act_w"],
+    key=["I", "with_scale", "BM", "with_gate", "with_act_w", "clamp"],
 )
 @flyc.jit
 def _compiled_swiglu_bwd(
@@ -306,6 +317,7 @@ def _compiled_swiglu_bwd(
     with_act_w: fx.Constexpr[int],
     grid_x: fx.Constexpr[int],
     block_threads: fx.Constexpr[int],
+    clamp: fx.Constexpr[int],
     stream: fx.Stream,
 ):
     cols_per_block = _VEC * block_threads
@@ -318,6 +330,7 @@ def _compiled_swiglu_bwd(
         block_threads,
         bool(with_gate),
         bool(with_act_w),
+        clamp=bool(clamp),
     )
     grid_y = 1 if with_gate else n_col_tiles
     # One f32 LDS slot per warp for cross-warp gate reduction.
@@ -337,6 +350,8 @@ def swiglu_backward_flydsl_kernel(
     scale: torch.Tensor | None = None,
     return_gate: bool = False,
     return_act_w: bool = False,
+    clamp: bool = True,
+    BM: int = _POOL_BLOCK_M,
 ):
     M, two_I = x.shape
     assert two_I % 2 == 0, f"x last dim must be even (gate||up), got {two_I}"
@@ -362,9 +377,10 @@ def swiglu_backward_flydsl_kernel(
         ACT_W=act_w,
         I=I,
         with_scale=int(with_scale),
-        BM=_POOL_BLOCK_M,
+        BM=BM,
         with_gate=int(return_gate),
         with_act_w=int(return_act_w),
+        clamp=int(clamp),
         stream=torch.cuda.current_stream(),
     )
     if return_gate and return_act_w:
@@ -374,6 +390,29 @@ def swiglu_backward_flydsl_kernel(
     if return_act_w:
         return dx, act_w
     return dx
+
+
+_DENSE_NTB: dict = {}
+
+
+def _dense_ntb(m: int, device) -> torch.Tensor:
+    """M as the i32 device scalar the grid-stride bound is read from."""
+    key = (int(m), str(device))
+    t = _DENSE_NTB.get(key)
+    if t is None:
+        t = torch.full((1,), int(m), dtype=torch.int32, device=device)
+        _DENSE_NTB[key] = t
+    return t
+
+
+def swiglu_backward_dense_flydsl(dact: torch.Tensor, x: torch.Tensor, clamp: bool = False) -> torch.Tensor:
+    """dSwiGLU for a dense MLP. ``x`` is [M, 2I] gate||up, ``dact`` is [M, I] -> [M, 2I].
+
+    The MoE kernel with the routing weight off and BM=1 so the grid-stride bound is M
+    itself, not a 256-row pool count. ``clamp=False`` is plain SwiGLU (Llama); True is
+    the gpt-oss clamped form, whose gradient has a dead band.
+    """
+    return swiglu_backward_flydsl_kernel(dact, x, _dense_ntb(int(x.shape[0]), x.device), clamp=clamp, BM=1)
 
 
 def swiglu_flydsl_kernel(

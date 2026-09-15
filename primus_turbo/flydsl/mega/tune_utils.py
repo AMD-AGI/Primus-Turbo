@@ -78,9 +78,13 @@ class Autotuner(_BaseAutotuner):
 
     def __call__(self, *args, **kwargs):
         key = self._make_key(args, kwargs)
-        # Cache hit = real run: never suppress, so kernel errors surface.
+        # Cache hit = real run: never suppress, so kernel errors surface. Inlined, not
+        # delegated: there is no _run_config on this class or on the base.
         if key in self.cache:
-            return self._run_config(self.cache[key], args, kwargs)
+            best = self.cache[key]
+            merged = dict(kwargs)
+            merged.update(best.all_kwargs())
+            return self._run_with_hints(best.compiler_opts(), args, merged)
         # First tune for this key: silence flydsl's per-config progress prints.
         with _suppress_stdout_stderr():
             return super().__call__(*args, **kwargs)
