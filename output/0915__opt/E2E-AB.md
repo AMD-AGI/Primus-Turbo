@@ -303,3 +303,33 @@ dq_acc fp32 0.500 GiB + dk/dv bf16 0.250×2 = **进程级常数 1.000 GiB，不�
 
 这是本 campaign 反复踩的"参照臂/测量入口与被测对象分叉"那个坑的又一个变体
 （前两次：参照臂自己变成 ASM 反向；`TORCH_BLAS_PREFER_HIPBLASLT=0` 让 op 级免疫）。
+
+## 事故：关掉 converter 会打死这张卡（0915 晚，第二次 AC-cycle）
+
+为了验证"三模态是否与 turbo attention 有关"，我把 `converters: []` 跑了一次对照臂。
+**卡直接 wedge，需要第二次人工 AC-cycle。** 一步训练都没跑出来。
+
+日志停在 inductor 的 `AUTOTUNE flex_decoding`（正在 benchmark 6 个 `triton_flex_decoding`
+候选），dmesg 是：
+
+```
+MES(6,0) / MES(7,0) failed to respond to msg=REMOVE_QUEUE   反复约 30 秒
+failed to unmap legacy queue
+Suspending ip block ih_v7_0
+wait for reset ack                                          <- 停住
+```
+
+**机制**：`converters: []` 不只是"换掉 attention 实现"。它让模型退回 torchtitan 原生
+Flex Attention，而 `FlexAttentionWrapper` 内部**必须** `torch.compile(flex_attention)` ——
+配置里的 `compile.enable: false` 管不住它，那个开关管的是 TransformerBlock 的编译。
+
+也就是说：**converter 一直在顺带保护这张卡不进 inductor 路径。**
+在这台机器上，关掉 converter 等价于打开 inductor，而配置注释早就记着
+inductor 的 triton autotune 会 `hipErrorLaunchFailure` 并打死 GPU。
+我读过那条注释，但把它理解成"不要开 compile"，没想到还有第二个入口。
+
+处置：`repro_l8b_noconv_8L_fast.yaml` 已删除（留着就是陷阱），
+三个带 converter 的配置在 `converters:` 那一行上方都加了警告。
+
+**这条对"想测无 turbo attention 基线"的人是硬约束**：在这台机器上做不到 ——
+至少不能靠关 converter，那条路必经 flex，而 flex 必经 inductor。

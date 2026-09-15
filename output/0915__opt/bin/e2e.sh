@@ -67,6 +67,7 @@ timeout ${E2E_TIMEOUT:-1800} docker exec \
   -e MASTER_PORT="${MASTER_PORT:-$((20000 + RANDOM % 20000))}" \
   -e PRIMUS_EXP_NAME="$TAG" -e TRITON_CACHE_DIR=/tmp/triton_cache_e2e \
   ${E2E_ENV:-} fa-repro bash -lc "ulimit -c 0; cd $PRIMUS && exec timeout --foreground -k 20 ${E2E_INNER:-1700} \
+      ${E2E_PREFIX:-} \
       bash runner/primus-cli direct --log_file $RUNDIR/launcher.log \
       -- train pretrain --config examples/torchtitan/configs/MI455X/$CFG $*" \
   > "$OUT/logs/e2e.$TAG.log" 2>&1
