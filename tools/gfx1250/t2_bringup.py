@@ -56,6 +56,11 @@ import asm_bwd_launcher as L  # noqa: E402
 SHAPES = {
     # Start small. If the kernarg layout is wrong this is the blast radius.
     "tiny": dict(batch=1, seqlen=256, hq=8, hkv=2, d=128),
+    "s128":  dict(batch=1, seqlen=128,  hq=8, hkv=2, d=128),
+    "s256":  dict(batch=1, seqlen=256,  hq=8, hkv=2, d=128),
+    "s384":  dict(batch=1, seqlen=384,  hq=8, hkv=2, d=128),
+    "s512":  dict(batch=1, seqlen=512,  hq=8, hkv=2, d=128),
+    "s768":  dict(batch=1, seqlen=768,  hq=8, hkv=2, d=128),
     "smoke": dict(batch=1, seqlen=1024, hq=8, hkv=2, d=128),
     # ratio=1. If dk/dv come right here and wrong under GQA, the fault is in how the
     # kernel's `ratio` field is used (or in the reference's grouping), not in the strides.

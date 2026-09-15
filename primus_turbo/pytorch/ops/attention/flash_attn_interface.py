@@ -19,6 +19,10 @@ from primus_turbo.pytorch.core.low_precision import (
     ScalingGranularity,
 )
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
+from primus_turbo.pytorch.kernels.attention.attention_asm_bwd_impl import (
+    asm_backward_eligible,
+    asm_dense_backward,
+)
 from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
     attention_aiter_backward_impl,
     attention_aiter_forward_impl,
@@ -358,6 +362,21 @@ class FlashAttnFunc(torch.autograd.Function):
             # path that was already shipping.
             # getattr, not ctx.use_asm_fwd: a ctx saved by an older forward (or by a path
             # that never set it) still has to work.
+            # aiter's prebuilt ASM backward first: on this shape it is 1.75x the vendored
+            # fused one (17.675 -> 10.098 ms at b=4 s=8192). It declines anything it has not
+            # been validated on, including batch*nhead_q < 32, where it loses 3x.
+            if asm_backward_eligible(
+                q, k, v,
+                causal=ctx.causal,
+                sink=sink,
+                window_size=ctx.window_size,
+            ):
+                dq, dk, dv = asm_dense_backward(
+                    dout, q, k, v, out, lse,
+                    softmax_scale=ctx.softmax_scale,
+                    causal=ctx.causal,
+                )
+                return _flash_attn_grads(dq, dk, dv, None, None)
             if getattr(ctx, "use_asm_fwd", False) or fused_backward_eligible(q, k.shape[1], sink):
                 dq, dk, dv = dense_fused_backward(
                     dout,
