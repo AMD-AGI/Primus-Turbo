@@ -191,7 +191,7 @@ SYM_NONCAUSAL = "_ZN5aiter28fmha_bwd_hd128_bf16_a32_psskE"
 
 
 def asm_backward(q, k, v, o, do, lse, softmax_scale=None, hip=None, dkdv_heads="kv",
-                 co_variant="", causal=True):
+                 co_variant="", causal=True, grid_halve=None):
     """Run the three-kernel ASM backward. Returns (dq, dk, dv).
 
     q/k/v/o/do are [B, S, H, D] bf16 as Primus-Turbo lays them out; lse is
@@ -278,8 +278,15 @@ def asm_backward(q, k, v, o, do, lse, softmax_scale=None, hip=None, dkdv_heads="
                    "ptr_qseq": 0, "ptr_qseq_padded": 0}), stream)
 
     gdx = (seqlen_k + TS_KV - 1) // TS_KV
-    if causal:
-        gdx = (gdx + 1) // 2  # the host halves it for mask types 1 and 2 only
+    # grid_halve=None follows the host: halve for mask types 1 and 2 only. Overridable
+    # because the undocumented _perf build returns dq at 5.84 dB -- partially right rather
+    # than garbage, which is what missing contributions look like -- while returning dk and
+    # dv BIT-identical to the shipped build. If _perf assigns dq where the shipped one
+    # accumulates atomically, a halved grid would drop half of it.
+    if grid_halve is None:
+        grid_halve = causal
+    if grid_halve:
+        gdx = (gdx + 1) // 2
     main_args = {name: 0 for name, _, _ in DQDKDV_FIELDS}
     main_args.update({
         "ptr_dq": dq_acc.data_ptr(), "ptr_dk": dk.data_ptr(), "ptr_dv": dv.data_ptr(),

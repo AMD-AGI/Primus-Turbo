@@ -139,6 +139,8 @@ def main() -> int:
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--grid-halve", default="auto", choices=["auto", "yes", "no"],
+                    help="override the causal x-grid halving; for the _perf dq hypothesis")
     ap.add_argument("--no-causal", action="store_true",
                     help="validate the mask=0 object, which the gate currently declines")
     ap.add_argument("--co-variant", default="", choices=["", "_perf"],
@@ -218,8 +220,10 @@ def main() -> int:
         dk_ref = k32.grad.view(b, hk, rep, s, d).sum(2).transpose(1, 2).contiguous()
         dv_ref = v32.grad.view(b, hk, rep, s, d).sum(2).transpose(1, 2).contiguous()
 
+        gh = {"auto": None, "yes": True, "no": False}[args.grid_halve]
         dq, dk, dv = L.asm_backward(q, k, v, o, do, lse, dkdv_heads=args.dkdv_heads,
-                                    co_variant=args.co_variant, causal=not args.no_causal)
+                                    co_variant=args.co_variant, causal=not args.no_causal,
+                                    grid_halve=gh)
         if args.dkdv_heads == "q" and rep > 1:
             dk = dk.view(b, s, hk, rep, d).sum(3).to(k.dtype)
             dv = dv.view(b, s, hk, rep, d).sum(3).to(v.dtype)
