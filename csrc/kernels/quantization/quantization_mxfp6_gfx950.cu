@@ -509,6 +509,9 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
     // The direct-to-LDS instruction lays each wave's lane payloads contiguously.
     // Use a compact pitch for that arm; the production path retains its aligned
     // padded pitch unchanged.
+    // QkNormRopeBackward opts out deliberately: its head-pair reduction wants a row's
+    // chunks laid out the way the padded pitch leaves them, and staging it this way
+    // measured 33.6 ms/step against 24.7 for the padded pitch on the Flux QKV shapes.
     constexpr bool kAsyncStage = MXFP6_ASYNC_STAGE && !kQkr && TILE_M == 64 &&
                                  (TILE_N == 64 || TILE_N == 128) &&
                                  THREADS_PER_BLOCK == 256;
