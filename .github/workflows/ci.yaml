@@ -235,6 +235,7 @@ jobs:
     runs-on: turbo-jax-ut-v2605 # launch in the container turbo_jax_github_runner_v2605 based on the image rocm/jax-training:maxtext-v26.5
     env:
       PRIMUS_TURBO_WORKDIR: /apps/tas/0_public/primus_turbo_ci/actions-runner-jax
+      XLA_PYTHON_CLIENT_PREALLOCATE: "false"
     steps:
       - run: echo "🎉 Begin Primus-Turbo JAX Framework Unit-Test."
       - name: Change owner
@@ -263,10 +264,32 @@ jobs:
           else
             echo "UT_LOG_PATH=${PRIMUS_TURBO_WORKDIR}/ut_out/others" >> $GITHUB_ENV
           fi
-      - name: Print rocminfo
+      # This job runs in a long-lived privileged container. Cancelled or
+      # timed-out `pytest -n 8` workers keep /dev/kfd open; the image also
+      # sets GPU_MAX_HW_QUEUES=2, so the next rocminfo/HIP init returns
+      # HSA_STATUS_ERROR_OUT_OF_RESOURCES and JAX silently falls back to CPU.
+      - name: Reclaim leftover HSA clients
         run: |
-          echo "=== rocminfo ==="
-          rocminfo || true
+          echo "=== /dev/kfd clients before reclaim ==="
+          lsof /dev/kfd 2>/dev/null | head -50 || true
+          pkill -f '/opt/venv/bin/pytest .*tests/jax' || true
+          pkill -f 'python3 -u -c import sys;exec' || true
+          sleep 2
+          echo "=== /dev/kfd clients after reclaim ==="
+          lsof /dev/kfd 2>/dev/null | head -50 || true
+      - name: Check ROCm GPU
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 3
+          max_attempts: 5
+          retry_wait_seconds: 20
+          command: |
+            set -euo pipefail
+            echo "=== leftover /dev/kfd clients ==="
+            lsof /dev/kfd 2>/dev/null | head -50 || true
+            echo "=== rocminfo ==="
+            rocminfo | tee /tmp/rocminfo.txt
+            grep -E "Name:[[:space:]]+gfx" /tmp/rocminfo.txt
       - name: Install and build
         run: |
           echo "set UT_LOG_PATH as: ${{ env.UT_LOG_PATH }}"
@@ -285,6 +308,25 @@ jobs:
           SITE_PACKAGES=$(python3 -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
           echo "import coverage; coverage.process_startup()" > "${SITE_PACKAGES}/coverage_subprocess.pth"
           rm -f .coverage .coverage.*
+      - name: Check JAX ROCm backend
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 5
+          max_attempts: 5
+          retry_wait_seconds: 20
+          command: |
+            set -euo pipefail
+            python3 - <<'PY'
+            import os
+            os.environ.setdefault("JAX_PLATFORMS", "rocm")
+            import jax
+            print("backend", jax.default_backend())
+            print("devices", jax.devices())
+            if jax.default_backend() == "cpu":
+                raise SystemExit("JAX backend is CPU; ROCm GPU is required")
+            PY
+        env:
+          JAX_PLATFORMS: rocm
       - name: Run single-GPU tests (parallel)
         uses: nick-fields/retry@v3
         with:
@@ -292,6 +334,7 @@ jobs:
           max_attempts: 2
           command: pytest -v tests/jax -n 8 --log-cli-level=INFO --cov=primus_turbo --cov-branch --cov-append
         env:
+          JAX_PLATFORMS: rocm
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"
       # Keep in-process multi-GPU tests and distributed/per-process tests in
       # separate pytest invocations. The JAX DeepEP in-process path keeps GPU
@@ -305,6 +348,7 @@ jobs:
           max_attempts: 2
           command: pytest -v tests/jax --dist-only --ignore=tests/jax/lax/test_mp_dispatch_combine.py --log-cli-level=INFO --cov=primus_turbo --cov-branch --cov-append
         env:
+          JAX_PLATFORMS: rocm
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"
       - name: Run distributed tests
         uses: nick-fields/retry@v3
@@ -313,6 +357,7 @@ jobs:
           max_attempts: 2
           command: pytest -v tests/jax/lax/test_mp_dispatch_combine.py --log-cli-level=INFO --cov=primus_turbo --cov-branch --cov-append
         env:
+          JAX_PLATFORMS: rocm
           XLA_PYTHON_CLIENT_PREALLOCATE: "false"
       - name: Combine and stage coverage data
         if: always()

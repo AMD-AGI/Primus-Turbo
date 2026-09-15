@@ -27,8 +27,9 @@ inline Float8Format current_fp8_format() {
 #if PRIMUS_TURBO_DEVICE_COMPILE
     return Float8Format::FNUZ; // dummy
 #else
-    static Float8Format fmt = [] { return is_gfx942() ? Float8Format::FNUZ : Float8Format::OCP; }();
-    return fmt;
+    // Do not cache on first call: get_current_arch() used to pin UNKNOWN when
+    // HIP was not ready yet, which would permanently pick OCP on gfx942.
+    return is_gfx942() ? Float8Format::FNUZ : Float8Format::OCP;
 #endif
 }
 

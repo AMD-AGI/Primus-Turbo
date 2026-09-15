@@ -20,12 +20,19 @@ import os
 
 import pytest
 
-# Assign each xdist worker to a separate GPU
+# Assign each xdist worker to a separate GPU. Set HIP/ROCR/CUDA together:
+# JAX/XLA on ROCm does not always honor HIP_VISIBLE_DEVICES alone.
 _worker_id = os.environ.get("PYTEST_XDIST_WORKER")
 if _worker_id is not None:
     _num_gpus = 8  # TODO: hardcode.
     _gpu_id = int(_worker_id.replace("gw", "")) % _num_gpus
-    os.environ["HIP_VISIBLE_DEVICES"] = str(_gpu_id)
+    _gpu = str(_gpu_id)
+    os.environ["HIP_VISIBLE_DEVICES"] = _gpu
+    os.environ["ROCR_VISIBLE_DEVICES"] = _gpu
+    os.environ["CUDA_VISIBLE_DEVICES"] = _gpu
+
+# Must be set before any `import jax` (test modules are imported during collection).
+os.environ.setdefault("JAX_PLATFORMS", "rocm")
 
 
 def pytest_addoption(parser):
@@ -60,6 +67,14 @@ def pytest_collection_modifyitems(config, items):
         from primus_turbo.jax.core.utils import is_gfx1250 as is_gfx1250_jax
 
         is_gfx1250 = is_gfx1250_jax()
+        import jax
+
+        if jax.default_backend() == "cpu":
+            raise pytest.UsageError(
+                "JAX default backend is CPU; Primus-Turbo JAX GPU tests require ROCm. "
+                f"devices={jax.devices()!r}. Check rocminfo / HSA (OUT_OF_RESOURCES) "
+                "and HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES."
+            )
 
     if is_gfx1250:
         skip_gfx1250 = pytest.mark.skip(reason="Not yet supported on gfx1250")

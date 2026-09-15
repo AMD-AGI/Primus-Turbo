@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from primus_turbo.jax._C import get_quantize_fp8_rowwise_workspace_size
 from primus_turbo.jax.core.low_precision import (
     ScalingGranularity,
     float8_e4m3,
@@ -16,6 +17,17 @@ from primus_turbo.jax.core.low_precision import (
 from primus_turbo.jax.lax.quantization import dequantize_fp8, quantize_fp8
 from tests.jax.ref.quantization_ref import dequantize_fp8_ref, quantize_fp8_ref
 from tests.jax.test_utils import assert_allclose, get_tolerances
+
+
+def test_quantize_fp8_rowwise_colmajor_workspace_size_does_not_require_gpu():
+    """Host-side size query must not throw if HIP arch detection is unavailable.
+
+    CI hit this with shape float16[1,111,4096] and a non-last axis (col-major).
+    """
+    ws_col = get_quantize_fp8_rowwise_workspace_size([1, 111, 4096], 0)
+    ws_row = get_quantize_fp8_rowwise_workspace_size([1, 111, 4096], -1)
+    assert ws_col > 0
+    assert ws_row > 0
 
 
 @pytest.mark.parametrize("orig_dtype", [jnp.bfloat16, jnp.float16, jnp.float32])
