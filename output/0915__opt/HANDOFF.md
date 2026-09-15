@@ -44,34 +44,39 @@ op 级 SQNR 逐位不变、耗时中性，**端到端效果见 `E2E-AB.md` 的�
 那条墙是给我们那个 7-GEMM Triton 结构算的，现在跑的是 aiter 的另一个结构，
 对它相关的参照是 5-GEMM 下界 5.48 ms，还有约 1.74×。
 
-## 明天可直接做的（按价值排序）
+## 明天可直接做的（按价值排序，已按端到端结果重排）
 
-### 1. 重跑 20 步 e2e A/B —— 今天唯一没拿到的数字
+### 1. GEMM —— 今天唯一被证明有端到端价值的方向
 
-今天两次都失败，原因已查清并修好（`bin/e2e.sh`）：孤儿 `torchrun` 占着 rendezvous 端口 1234。
-现在脚本会先收割残留、等卡安静、并给每次运行随机 `MASTER_PORT`。
+hipBLASLt 修正路径后是 68.7 TF/s，Triton 是 897 TF/s，**还有 13×**。
+而 e2e 是 GEMM-bound（32 层 attention 只占单步的 2.2%），所以这里的每一分收益都直接到账。
 
-```bash
-D=/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/gfx1250
-BLAS_ENV="-e HIPBLASLT_TENSILE_LIBPATH=$D" \
-E2E_ENV="-e PRIMUS_TURBO_ASM_BWD_TRACE=1 -e PRIMUS_TURBO_ASM_BWD_TRACE_FILE=/tmp/t.trace" \
-  bash output/0915__opt/bin/e2e.sh on20 repro_l8b_turbo_conv.yaml
-# 对照臂加  -e PRIMUS_TURBO_ATTN_DISABLE_ASM_BWD=1
-```
+对比今天的实测：BLAS 路径一个环境变量换 **8.3×**（244 → 2027 tps），
+而一整天的 attention 内核工作在端到端是 **−6.78%**。
 
-预期差异约 **1.5%**（attention 占 17 秒步长的 2.2%），需要 20 步取稳态才测得出。
-**两臂之间必须等卡安静** —— 今天正是没等导致的失败。
+**先做**：把 BLAS 路径错位报给镜像维护方（`BLAS-FINDING.md`，一行环境变量，影响所有用户）。
+**再做**：评估把 GEMM 钉到 Triton。需要 `torch.compile`，而配置注释记载 inductor 对
+TransformerBlock 做 autotune 会抛 `hipErrorLaunchFailure` **并打死 GPU** ——
+**用 8 层配置试**（`repro_l8b_turbo_conv_8L.yaml`），不要在 32 层那个 88% 显存的配置上试。
 
-### 2. 把 BLAS 修复推给镜像维护方
+### 2. 搞清楚 ASM 反向的端到端回归，或者放弃它
 
-`TensileLibrary_lazy_gfx1250.dat` 被放在 `library/gfx1250/` 而加载器在 `library/` 找。
-细节和实测在 `BLAS-FINDING.md`。这是**一行环境变量换 8.3×**，影响所有用这个镜像的人。
+算子级 1.741×、端到端 −6.78%。第三轮（8 层，留显存余量）的结果决定方向：
 
-### 3. GEMM 仍有 13×
+- **若 8 层下不再落后** → 是显存压力。那么资格门可以按"显存余量"开启，
+  或者把 `dq_acc` 做成进程级单例（32 层共用一块，而不是每层一块）
+- **若 8 层下仍落后** → 不是显存。真因未知，需要从"每次调用多三次 kernel launch"
+  和"host 侧规约"两个方向查
 
-hipBLASLt 68.7 vs Triton 897 TF/s。钉到 Triton 需要 `torch.compile`，
-而配置注释记载 inductor 对 TransformerBlock 做 autotune 会抛 `hipErrorLaunchFailure`
-**并打死 GPU**。这个矛盾未解，**不要在没有准备的情况下试**。
+无论哪种，**默认关闭不变**，直到有端到端正收益的证据。
+
+### 3. op-evolve 优化我们自己的融合反向
+
+今天的结论把它的价值提高了：融合反向**不需要 `dq_acc`**（没有原子累加），
+也不需要 4 倍大的 dk/dv，所以没有那个内存问题。
+昨天在 B0 上 round 1 就拿到 −13.2%（`waves_per_eu 1→0` 加 `IN_THREAD_TRANSPOSE`）。
+它占整块 GPU 跑一天，适合作为一整天的主线。
+重启命令在 0914 的 `HANDOFF.md:114-118`，spec 陷阱在 `HOWTO-OP-EVOLVE.md:99-108`。
 
 ### 4. 5-GEMM 结构重构（只在 1–3 都推不动时）
 
