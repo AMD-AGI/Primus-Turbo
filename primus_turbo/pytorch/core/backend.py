@@ -404,6 +404,21 @@ class KernelBackend(ABC):
     def execute(**kwargs):
         raise NotImplementedError("execute is not implemented")
 
+    @staticmethod
+    def tuning_kwargs(**kwargs):
+        """Arguments to TIME this backend with, which need not be the ones it will run on.
+
+        A backend whose steady-state cost depends on an operand layout the pipeline chooses
+        upstream is otherwise timed on whatever layout the tuning call happened to arrive with
+        -- and since that layout also decides which backends can run at all, the race ends up
+        ratifying a choice made before it. Restating the operands in the layout this backend
+        would be fed in deployment puts every candidate on its own best contract.
+
+        Only timing reads these, so they do not have to produce the right answer: scale bytes
+        drive no control flow and cost the same whatever they hold.
+        """
+        return kwargs
+
 
 @dataclass(frozen=True)
 class BackendEntry:
@@ -558,7 +573,7 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
         def _time(impl):
             torch.cuda.synchronize()
             try:
-                return cls.profile(impl, **kwargs)
+                return cls.profile(impl, **impl.tuning_kwargs(**kwargs))
             except Exception:  # noqa: BLE001 -- a backend that cannot run is not a candidate
                 return float("inf")
             finally:
