@@ -36,6 +36,8 @@ jobs:
     steps:
       - name: Change owner
         run: sudo chown -R $(id -u):$(id -g) ${GITHUB_WORKSPACE} || true
+      - name: Clean stale submodule checkout
+        run: rm -rf "${GITHUB_WORKSPACE}/3rdparty" "${GITHUB_WORKSPACE}/.git/modules"
       - uses: actions/checkout@v4
         with:
           submodules: recursive
