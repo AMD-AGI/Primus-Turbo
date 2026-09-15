@@ -179,7 +179,7 @@ CO = {
 }
 
 
-def asm_backward(q, k, v, o, do, lse, softmax_scale=None, hip=None):
+def asm_backward(q, k, v, o, do, lse, softmax_scale=None, hip=None, dkdv_heads="kv"):
     """Run the three-kernel ASM backward. Returns (dq, dk, dv).
 
     q/k/v/o/do are [B, S, H, D] bf16 as Primus-Turbo lays them out; lse is
@@ -215,8 +215,18 @@ def asm_backward(q, k, v, o, do, lse, softmax_scale=None, hip=None):
     dq_acc = torch.zeros((batch, nhead_q, seqlen_q, head_dim), device=q.device, dtype=torch.float32)
     delta = torch.empty((batch, nhead_q, seqlen_q), device=q.device, dtype=torch.float32)
     dq = torch.empty_like(q)
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(v)
+    # Under GQA, ratio q heads share one kv head, and the main kernel's grid is
+    # (kv_tiles, nhead_q, batch) -- so `ratio` workgroups would write the same dk/dv tile.
+    # dkdv_heads="q" gives each q head its own slice, which the caller then reduces.
+    # Measured on 0915: with ratio=1 all three tensors come back at ~52 dB, while at ratio=4
+    # dq stays correct and dk/dv collapse to about -0.3 dB, which is what an unsynchronised
+    # 4-way overwrite of the same tile looks like.
+    if dkdv_heads == "q":
+        dk = torch.zeros((batch, seqlen_k, nhead_q, head_dim), device=k.device, dtype=k.dtype)
+        dv = torch.zeros((batch, seqlen_k, nhead_q, head_dim), device=v.device, dtype=v.dtype)
+    else:
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
 
     def bs(t, elem):  # byte strides, in the host's (batch, seq, head) order
         return (t.stride(0) * elem, t.stride(1) * elem, t.stride(2) * elem)
