@@ -106,7 +106,62 @@ s=1024 时落进别的分配里所以只是静默损坏（dk/dv 约 −0.3 dB �
 
 **已接进分发层**：`--impl fused`（不带 `--impl asmbwd`）实测 **11.7156 ms**，说明资格门在产品路径上正常触发。
 
-**尚未做**：非因果路径、varlen、torchtitan e2e。
+**尚未做**：非因果路径、varlen。
+
+## e2e：跑通了，但这个配置测不了 attention
+
+`converters: []` 此前关掉了 primus_turbo 的 model converter，而 converter 才是真正装上
+TurboAttention 的东西 —— 所以**今天之前所有 e2e 数字测的都是原版 attention**。
+关它的理由是 torchtitan 0.2.2 传 `enable_gqa` 而 `TurboAttention.forward` 不接受 → TypeError。
+该参数已接受（刻意不转发：kernel 从 nhead_q/nhead_k 原生分组，形状已带这个信息）。
+
+打开 converter 后三步跑通，`loss 12.05` 紧贴 `ln(128256) ≈ 11.76` 的理论初值。
+
+### 两臂对照（唯一差别是 `PRIMUS_TURBO_ATTN_DISABLE_ASM_BWD`）
+
+| step | A loss | B loss | A grad_norm | B grad_norm | A tps | B tps |
+|--:|--:|--:|--:|--:|--:|--:|
+| 1 | 12.052 | 12.138 | 42.98 | 42.65 | 240 | 240 |
+| 2 | 27.942 | 28.421 | 72.10 | 78.53 | 243 | 243 |
+| 3 | 24.361 | 16.812 | 206.39 | 117.23 | 244 | 244 |
+
+**loss 上涨与 ASM 反向无关** —— 两臂同样 12 → 28 再回落，grad_norm 都在爆，是 mock 随机数据
+加 lr warmup 的行为。但**这个配置也证明不了梯度正确**：第 3 步两臂差 45%，随机数据下轨迹本就混沌。
+它只能排除"明显破坏训练"。
+
+**tps 三个数字逐一相同，显存也相同**（313.72 → 378.00 GiB，说明 ASM 反向那套 4 倍 dk/dv
+在 e2e 峰值里不占位，峰值由激活主导）。
+
+### 为什么测不出来：e2e 是 GEMM-bound，而且 bound 在一条坏掉的路径上
+
+单步 134 秒，而 attention 全部 32 层是 `11.7 ms × 32 ≈ 374 ms` —— **占 0.28%**。
+`output/0914__campaign/bin/gemm_roof.py` 同进程测两个半边：
+
+| | TFLOP/s | 8192³ 耗时 |
+|---|--:|--:|
+| `torch.mm`（rocBLAS） | **27.64** | 39.78 ms |
+| Triton GEMM（最佳配置 BM128/BN256/BK32/w8/s3） | **897.53** | 1.225 ms |
+| **gap** | **32.5×** | |
+
+算术吻合：llama-3.1-8B 每步约 `6 × 8e9 × 32768 = 1.57e15` FLOPs，按 27.6 TF/s 要 57 秒。
+
+**为什么走 rocBLAS**：hipBLASLt 在这个镜像里整个不可用 —— 缺
+`_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/TensileLibrary_lazy_gfx1250.dat`，
+任何 matmul 都抛 `HIPBLAS_STATUS_INVALID_VALUE`，只能用
+`TORCH_BLAS_PREFER_HIPBLASLT=0` 退回 rocBLAS。
+
+**这是 e2e 的真正阻塞点，不是 attention。** 在 BLAS 路径修好之前，
+attention 上的任何改进在 e2e 里都不可见。文档给的方向是把 GEMM 钉到 Triton
+（`TORCHINDUCTOR_MAX_AUTOTUNE_GEMM=1` + `..._BACKENDS=TRITON`），但那需要
+`compile.enable=true`，而配置自己的注释记载 inductor 对 TransformerBlock 做 autotune 时
+会抛 `hipErrorLaunchFailure` **并打死 GPU**。这两者的矛盾是明天要解的。
+
+### 一个反复出现的坑，值得单列
+
+`TORCH_BLAS_PREFER_HIPBLASLT=0` **今天咬了我三次**：T2 bring-up 的 fp32 参考、
+第一次 e2e、以及 `gemm_roof.py`。根因是 `tune_attention.py` 在 import torch 之前自己设了它，
+所以**整个 campaign 的 op 级测量从来没见过这个问题**，而任何不走那个 harness 的新路径都会撞上。
+它必须在进程启动前进入环境（torch 在选后端时读一次），从脚本内部设来不及。
 
 ## 与文档界线的关系
 
