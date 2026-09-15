@@ -101,14 +101,11 @@ class TurboAttention(torch.nn.Module):
         the shapes already carry everything the flag would say. The only thing worth doing
         with it is catching a caller whose flag and shapes disagree.
         """
-        # Compares the whole shape rather than a head axis on purpose: this module leaves
-        # qkv_format at its "bshd" default today, but identical shapes mean no grouping under
-        # any layout, so the check cannot false-fire if that ever changes.
-        if enable_gqa and q.shape == k.shape:
-            raise ValueError(
-                f"enable_gqa=True but q and k have identical shapes {tuple(q.shape)}; "
-                "the caller and the tensors disagree about grouping"
-            )
+        # No validation of the flag. torch SDPA accepts enable_gqa=True on a model whose q
+        # and k head counts are equal -- it is a no-op there, not an error -- so raising on
+        # that combination would break exactly the callers this parameter exists to support.
+        # An earlier version of this guard did raise, which would have broken every non-GQA
+        # model the moment the converter was enabled.
         kwargs = dict(
             dropout_p=self.dropout_p,
             softmax_scale=self.softmax_scale,

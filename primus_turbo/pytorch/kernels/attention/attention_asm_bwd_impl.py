@@ -109,12 +109,42 @@ _LAUNCH = None
 # gradient that has not been accumulated yet.
 _SCRATCH: dict = {}
 
+# One HipModule for the process. asm_backward does `hip = hip or HipModule()`, and
+# asm_dense_backward was not passing one -- so every backward built a fresh instance with an
+# empty module cache and re-ran hipModuleLoad on all three .co files. 3 loads per layer per
+# step, 96 per step across 32 layers, and nothing ever calls hipModuleUnload, so they
+# accumulate for the life of the process.
+#
+# Found by review on 0915, after the scratch-reuse fix failed to recover the 6.78% e2e
+# regression. Allocation churn was the hypothesis; this is a second, independent per-call
+# cost that the hypothesis missed entirely, and the operator-level harness hides it the same
+# way it hides the allocation -- 20 iterations of one call site reload the same three modules
+# 20 times, which is nothing next to a 32-layer training step.
+_HIP = None
 
-def _scratch(key, shape, dtype, device):
+
+def _hip():
+    global _HIP
+    if _HIP is None:
+        m = _launcher()
+        if m is None:
+            return None
+        _HIP = m.HipModule()
+    return _HIP
+
+
+def _scratch(key, shape, dtype, device, zero=False):
     buf = _SCRATCH.get(key)
     if buf is None or buf.shape != shape or buf.dtype != dtype or buf.device != device:
         buf = torch.empty(shape, dtype=dtype, device=device)
         _SCRATCH[key] = buf
+    if zero:
+        # The non-scratch path allocates dk/dv with torch.ZEROS, not empty. Whether the
+        # kernel writes every element of a per-q-head dk/dv slice has not been established,
+        # and a reused buffer carries the previous layer's gradient rather than the fresh
+        # garbage a new allocation would -- which is worse, because it is plausible-looking.
+        # Match the path being replaced until there is evidence full coverage holds.
+        buf.zero_()
     return buf
 
 
@@ -233,11 +263,11 @@ def asm_dense_backward(dout, q, k, v, out, lse, softmax_scale, causal=True):
     scratch = {"dq_acc": _scratch(("dq_acc", b, hq, s, d, dev), (b, hq, s, d),
                                   torch.float32, dev)}
     if rep > 1:
-        scratch["dk"] = _scratch(("dk", b, s, hq, d, dev), (b, s, hq, d), k.dtype, dev)
-        scratch["dv"] = _scratch(("dv", b, s, hq, d, dev), (b, s, hq, d), v.dtype, dev)
+        scratch["dk"] = _scratch(("dk", b, s, hq, d, dev), (b, s, hq, d), k.dtype, dev, zero=True)
+        scratch["dv"] = _scratch(("dv", b, s, hq, d, dev), (b, s, hq, d), v.dtype, dev, zero=True)
     dq, dk, dv = m.asm_backward(
-        q, k, v, out, dout.contiguous(), lse, softmax_scale, dkdv_heads="q", causal=causal,
-        scratch=scratch,
+        q, k, v, out, dout.contiguous(), lse, softmax_scale, hip=_hip(), dkdv_heads="q",
+        causal=causal, scratch=scratch,
     )
     if rep > 1:
         # fp32 accumulate: the partials are bf16 and summing four of them in bf16 costs

@@ -365,11 +365,18 @@ class FlashAttnFunc(torch.autograd.Function):
             # aiter's prebuilt ASM backward first: on this shape it is 1.75x the vendored
             # fused one (17.675 -> 10.098 ms at b=4 s=8192). It declines anything it has not
             # been validated on, including batch*nhead_q < 32, where it loses 3x.
+            # dropout_p / bias / alibi_slopes are passed through even though this path
+            # has none of them today: the gate declines on each, and a decline that can
+            # never fire is a check that silently stops guarding the day a caller starts
+            # setting one.
             if asm_backward_eligible(
                 q, k, v,
                 causal=ctx.causal,
                 sink=sink,
                 window_size=ctx.window_size,
+                dropout_p=getattr(ctx, "dropout_p", 0.0),
+                bias=getattr(ctx, "bias", None),
+                alibi_slopes=getattr(ctx, "alibi_slopes", None),
             ):
                 dq, dk, dv = asm_dense_backward(
                     dout, q, k, v, out, lse,
