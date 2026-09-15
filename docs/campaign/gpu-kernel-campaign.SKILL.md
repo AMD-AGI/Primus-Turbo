@@ -148,7 +148,53 @@ Test **each card separately** — one dead card among four looks like a dead box
 - **An independent confirmation from a different harness in a different process is worth more
   than either result alone.** Two of the day's accepted knobs were found twice this way.
 
-## 9. When the infrastructure becomes the work, stop
+## 9. An operator-level win is not an end-to-end win, and both numbers can be right
+
+Measured 2026-09-15, gfx1250 single card. A prebuilt ASM attention backward beat the
+vendored Triton one by **1.74x** at the operator level: 17.686 -> 10.160 ms, n=5, 0.5%
+spread, SQNR bit-identical. Across 32 layers that is 241 ms off a 17.6 s training step.
+
+Twenty steps of real training, the only difference being an env var that disables it:
+
+```
+ASM backward ON    1858 tps   mfu 34.49%   (n=13, spread 0.4%)
+ASM backward OFF   1984 tps   mfu 36.83%   (n=13, spread 0.2%)
+```
+
+**Turning the faster kernel off made training 6.78% faster**, at thirty times the noise
+floor. The step got about 1.2 s LONGER where it should have got 241 ms shorter -- roughly
+1.4 s per step that operator-level timing cannot see.
+
+Neither measurement is wrong. They measure different things:
+
+- **Operator level** measures the kernel. The same tensors are reused every iteration, so
+  the caching allocator hands back the same blocks and allocation costs nothing.
+- **End to end** measures the kernel *plus what it demands of the allocator and the memory
+  system*. Here: an fp32 dq_acc the alternative does not need (it does not accumulate
+  atomically), and dk/dv allocated per q head rather than per kv head because the kernel's
+  grid races otherwise. 1.07 GB per layer per step, ~34 GB of churn across 32 layers.
+
+### What to take from it
+
+**A kernel that needs scratch the alternative does not need has a hidden cost that only e2e
+shows.** Before claiming an op-level win, ask what the kernel allocates that the thing it
+replaces does not. If the answer is "a large fp32 accumulator" or "a larger output that gets
+reduced afterwards", assume the e2e number will disagree until measured.
+
+**Cache the scratch, never the returned tensors.** Reusing buffers across calls removes the
+churn. But anything handed to autograd must be fresh -- a reused gradient buffer gets
+overwritten by the next layer's backward before it is accumulated. Watch for the path where
+no reduction happens (rep == 1 under GQA) and the scratch would be returned directly.
+
+**The wider lesson is about what the campaign had evidence for.** Every result in this
+campaign's first two days rested on operator-level measurement alone, because e2e could not
+run at all -- a TypeError on an unaccepted `enable_gqa` kwarg had forced `converters: []`,
+and the converter is what installs the attention under test. The first thing running e2e
+revealed was that the headline result was negative in training. If a campaign cannot run
+end-to-end, that is not a scheduling detail to defer; it is the thing blocking every
+conclusion it produces.
+
+## 10. When the infrastructure becomes the work, stop
 
 Several hours went into adding streams, discovering idle ones, fixing the monitor, then
 finding the monitor untrustworthy. If a measurement takes 8–13 minutes, a 6-minute inspection
