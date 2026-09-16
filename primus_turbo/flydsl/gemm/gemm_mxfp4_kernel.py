@@ -1718,12 +1718,12 @@ def _build_mxfp4_gemm_kernel(
     assert not (glu and dglu)
     assert not dglu or (glu_i > 0 and not beta_is_one and ksplit == 1 and not coop and not taccw)
     assert not dglu or (mn is not None and mn[1] == glu_i), "dglu needs mn=(M, I)"
-    assert not glu_act_quant or (
-        glu and _CSTORE and N_TILES_A % 2 == 0 and N_TILES_BH == 4
-    ), "StoreCSwiGLUQuant needs in-loop l1 store, even n_tiles_a, n_tiles_b==4"
-    assert not dglu_act_quant or (
-        dglu and N_TILES_A % 2 == 0 and N_TILES_BH == 4 and glu_i % 32 == 0
-    ), "StoreCdSwiGLUQuadQuant needs dglu, even n_tiles_a, n_tiles_b==4, I%32==0"
+    assert not glu_act_quant or (glu and _CSTORE and N_TILES_A % 2 == 0 and N_TILES_BH == 4), (
+        "StoreCSwiGLUQuant needs in-loop l1 store, even n_tiles_a, n_tiles_b==4"
+    )
+    assert not dglu_act_quant or (dglu and N_TILES_A % 2 == 0 and N_TILES_BH == 4 and glu_i % 32 == 0), (
+        "StoreCdSwiGLUQuadQuant needs dglu, even n_tiles_a, n_tiles_b==4, I%32==0"
+    )
     assert not (epi_row_sr or epi_col_sr) or glu_act_quant or dglu_act_quant
     # B's g2s permutes source columns so a lane's n-fragments land adjacent and pack into dwordx2.
     _BILV = N_TILES_BH if _CSTORE else 0
@@ -2266,9 +2266,7 @@ def _build_mxfp4_gemm_kernel(
                 if const_expr(glu_act_quant):
                     _lds_barrier(vmcnt=0)
                     _lds_barrier(vmcnt=0)
-                    store_c.store_pair_quant(
-                        accL, accR, base_row, base_col_l, base_row, _c_store_rows
-                    )
+                    store_c.store_pair_quant(accL, accR, base_row, base_col_l, base_row, _c_store_rows)
                     return
                 store_c.store_pair(accL, accR, base_row, base_col_l)
                 return
@@ -2852,9 +2850,9 @@ def _compile_mxfp4_fused(
             stream: fx.Stream,
         ):
             grid_x = _preshuf(A_raw, A_scale, B_raw, B_scale, c_m, c_n, stream)
-            gemm_kern(
-                A, B_T, C, A_scale, B_scale, c_m, c_n, ACT, PROBS, value_attrs=gemm_value_attrs
-            ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
+            gemm_kern(A, B_T, C, A_scale, B_scale, c_m, c_n, ACT, PROBS, value_attrs=gemm_value_attrs).launch(
+                grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream
+            )
 
     return launch_mxfp4_fused
 
@@ -3472,7 +3470,6 @@ def gemm_mxfp4_glu_quant_flydsl_kernel(
     assert l1.shape == (M, two_i) and l1.dtype == out_dtype
     assert probs.shape == (M,) and probs.dtype == torch.float32
 
-    I_pad = ceildiv(I, 128) * 128
     M_pad = ceildiv(M, 256) * 256
     stream = torch.cuda.current_stream()
     _capturing = torch.cuda.is_current_stream_capturing()
@@ -3540,7 +3537,6 @@ def gemm_mxfp4_glu_quant_flydsl_kernel(
             compiled = compile_with_scratch_out(raw, fused_args)
             entry[1] = compiled
         compiled(*fused_args)
-    del I_pad
     return l1, row_out, row_sc, col_out, col_sc
 
 
@@ -3674,4 +3670,3 @@ def gemm_mxfp4_dglu_quant_flydsl_kernel(
             entry[1] = compiled
         compiled(*fused_args)
     return row_out, row_sc, col_out, col_sc
-

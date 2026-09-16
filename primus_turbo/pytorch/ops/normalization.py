@@ -159,9 +159,7 @@ class _RMSNormResidualWithRstdFunction(torch.autograd.Function):
         del grad_rstd
         x_plus_r, gamma, rstd = ctx.saved_tensors
         if grad_y is None:
-            grad_y = torch.zeros(
-                ctx.orig_shape, device=x_plus_r.device, dtype=x_plus_r.dtype
-            )
+            grad_y = torch.zeros(ctx.orig_shape, device=x_plus_r.device, dtype=x_plus_r.dtype)
         dx, dg = rmsnorm_bwd_residual_impl(
             grad_y,
             grad_xpr,
@@ -223,9 +221,7 @@ def rmsnorm_residual_mxfp4(
     from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import flydsl_rmsnorm_dual_quant
     from primus_turbo.pytorch.core.low_precision import float4_e2m1fn_x2
 
-    y, x_plus_r, rstd = _RMSNormResidualWithRstdFunction.apply(
-        x, residual, gamma, eps, skip_y_store
-    )
+    y, x_plus_r, rstd = _RMSNormResidualWithRstdFunction.apply(x, residual, gamma, eps, skip_y_store)
     H = gamma.shape[0]
     xpr2 = x_plus_r.reshape(-1, H).contiguous()
     with torch.no_grad():

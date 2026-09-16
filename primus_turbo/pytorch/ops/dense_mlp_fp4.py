@@ -11,7 +11,7 @@ P1: MLP-up GEMM fuses SiLU(gate)*up into the same store slot as the unfused
     ``kernel_gemm_4w``). Router ``probs`` are ones.
 
 P2: same GEMM writes the row/col MXFP4 pair fc2 / wgrad consume
-    (``StoreCSwiGLUQuant``). ``l1`` stays BF16 for TE ``dswiglu``. Gated by
+    (``StoreCSwiGLUQuant``). ``l1`` stays BF16 for the dSwiGLU kernel. Gated by
     ``fuse_act_quant`` / ``PRIMUS_TURBO_DENSE_MLP_FUSE_QUANT``.
 
 P3: fc2 dgrad fuses dSwiGLU + dual-quant of ``grad_l1``
@@ -26,9 +26,9 @@ import os
 from typing import Union
 
 import torch
-from transformer_engine.pytorch.cpp_extensions import dswiglu as te_dswiglu
 
 from primus_turbo.flydsl.gemm.gemm_mxfp4_kernel import dense_glu_epi_quant_supported
+from primus_turbo.flydsl.utils.swiglu_kernel import swiglu_backward_dense_flydsl
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import (
     MXFP4_BLOCK_SIZE,
@@ -61,7 +61,7 @@ _PROBS_ONES: dict = {}
 def _probs_ones(M: int, device) -> torch.Tensor:
     key = (M, str(device))
     t = _PROBS_ONES.get(key)
-    if t is None or t.device != device:
+    if t is None:
         t = torch.ones(M, device=device, dtype=torch.float32)
         _PROBS_ONES[key] = t
     return t
@@ -80,13 +80,12 @@ def _quantize_weight(w, config: Float4QuantConfig):
 
 
 def _dswiglu(dact: torch.Tensor, l1: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
-    """SwiGLU gradient via TE ``dswiglu`` — same kernel as the unfused recipe.
+    """SwiGLU gradient on the FlyDSL kernel the MoE path already uses.
 
-    Dense P1's Python ``silu`` / ``mul`` / ``cat`` path was ~123 ms/step vs TE's
-    35 ms/step (250–260 window). ``probs`` are ones for a dense MLP.
+    ``probs`` are ones for a dense MLP, so the routing-weight form is off.
     """
     del probs
-    return te_dswiglu(dact, l1, None)
+    return swiglu_backward_dense_flydsl(dact, l1, clamp=False)
 
 
 class FP4DenseGluMXFunc(torch.autograd.Function):
@@ -199,7 +198,7 @@ class FP4DenseMlpQuantMXFunc(torch.autograd.Function):
     """P2/P3: MXFP4 dense GEMM + SwiGLU + dual-quant of ``act``, then fc2.
 
     ``act`` never hits BF16 HBM. ``l1`` stays BF16. fc2 and both wgrads stay on
-    plain ``kernel_gemm_4w``. P3 replaces TE ``dswiglu`` + ``dL1`` quant with
+    plain ``kernel_gemm_4w``. P3 replaces the dSwiGLU kernel + ``dL1`` quant with
     ``gemm_fp4_dglu_quant_impl`` when ``fuse_dglu`` is set.
     """
 
@@ -476,7 +475,12 @@ def dense_mlp_fp4(
     if out_dtype is None:
         out_dtype = x.dtype
 
-    if _fuse_act_quant(fuse_act_quant):
+    fused = _fuse_act_quant(fuse_act_quant)
+    assert x_prequant is None or fused, (
+        "x_prequant needs fuse_act_quant=True (or PRIMUS_TURBO_DENSE_MLP_FUSE_QUANT=1): the "
+        "unfused path quantizes x itself and would ignore the pre-quantized pair."
+    )
+    if fused:
         x_row_pre = x_rs_pre = x_col_pre = x_cs_pre = None
         if x_prequant is not None:
             x_row_pre, x_rs_pre, x_col_pre, x_cs_pre = x_prequant

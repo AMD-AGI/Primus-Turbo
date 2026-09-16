@@ -855,6 +855,12 @@ def flydsl_rmsnorm_dual_quant(xpr_bf16, rstd_f32, gamma_f32, fp4_dtype, col_rht=
     ``xpr_bf16`` is ``[R, C]`` bf16 (residual sum). ``rstd_f32`` is ``[R]``.
     ``gamma_f32`` is ``[C]``. Row recipe is no-RHT; col recipe is RHT when
     ``col_rht`` (matches dense MLP / QKV activation ``quantize_fp4_with_trans``).
+
+    This is close to, but NOT the same as, quantizing a materialised BF16 ``y``:
+    ``rstd*gamma`` is applied in f32 registers, so the bf16 rounding of ``y`` never
+    happens. Measured on [8192, 4096] that moves 1.1% of the output bytes (and some
+    scales). It is the more accurate of the two; a test must compare with a tolerance,
+    not with ``torch.equal`` against ``quantize_fp4_with_trans(y)``.
     """
     import torch
 
@@ -864,7 +870,9 @@ def flydsl_rmsnorm_dual_quant(xpr_bf16, rstd_f32, gamma_f32, fp4_dtype, col_rht=
     assert rstd_f32.shape == (R,) and gamma_f32.shape == (C,)
     assert xpr_bf16.dtype == torch.bfloat16
     assert rstd_f32.dtype == torch.float32 and gamma_f32.dtype == torch.float32
-    assert R % 128 == 0 and C % 256 == 0
+    # R % 256, not the kernel's own R % 128: the col outputs below are [C, R/8] unpadded
+    # while the GEMM's activation buffers round M up to 256.
+    assert R % 256 == 0 and C % 256 == 0
     dev = xpr_bf16.device
     x_i32 = xpr_bf16.contiguous().view(torch.int32)
     ro = torch.empty((R, C // 8), dtype=torch.int32, device=dev)

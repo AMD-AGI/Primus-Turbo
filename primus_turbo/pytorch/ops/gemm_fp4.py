@@ -361,6 +361,11 @@ def gemm_fp4(
         trans_b: Whether to transpose matrix b, if True b shape is (N, K)
         out_dtype: Output data type, defaults to None (auto-inferred)
         config: FP4 quantization config
+        a_prequant: Optional ``(row, row_scale, col, col_scale)`` for ``a``, already
+            quantized by the producer (a fused RMSNorm, say) so this GEMM does not
+            re-quantize it. ``a`` itself is still the autograd tensor the backward
+            flows through. Unlike the :class:`QuantizedTensor` forms this is not
+            recipe-checked, so it requires ``use_preshuffle=False``.
         fuse_bgrad_accum_pattern: Enables fusing the weight-gradient accumulation
             into the wgrad GEMM epilogue, so backward writes ``b.main_grad``
             directly instead of returning a gradient the framework then adds.
@@ -410,6 +415,11 @@ def gemm_fp4(
 
     if out_dtype is None:
         out_dtype = torch.promote_types(a_data.dtype, b_data.dtype)
+
+    assert not (a_prequant is not None and config.use_preshuffle), (
+        "a_prequant requires use_preshuffle=False: the tuple carries no ScalingRecipe, so "
+        "there is nothing to check its shuffle_scale/shuffle_out against."
+    )
 
     assert not (fuse_bgrad_accum_pattern is not None and config.use_preshuffle), (
         "fuse_bgrad_accum_pattern requires use_preshuffle=False: the FP4 beta=1 wgrad epilogue "

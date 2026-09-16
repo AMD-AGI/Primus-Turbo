@@ -14,6 +14,7 @@ from primus_turbo.pytorch.core.low_precision import (
     ScaleDtype,
     ScalingGranularity,
     ScalingRecipe,
+    float4_e2m1fn_x2,
 )
 from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensor,
@@ -701,3 +702,113 @@ def test_gemm_fp4_impl_aiter_preshuffle_parity(m, n, k):
         )
     finally:
         GlobalBackendManager.reset()
+
+
+# (M, K, I): the smallest that clear dense_glu_epi_quant_supported (M % 256, I % 64,
+# K // 256 >= 4) and the FlyDSL GEMM's 64-multiple requirement.
+_DENSE_MLP_MKI = (512, 1024, 1024)
+
+
+def _dense_mlp_leaves(dtype, seed=42):
+    m, k, i = _DENSE_MLP_MKI
+    torch.manual_seed(seed)
+    device = "cuda:0"
+    x = torch.randn((m, k), dtype=dtype, device=device, requires_grad=True)
+    w1 = (torch.randn((2 * i, k), dtype=dtype, device=device) * 0.02).requires_grad_(True)
+    w2 = (torch.randn((k, i), dtype=dtype, device=device) * 0.02).requires_grad_(True)
+    grad_out = torch.randn((m, k), dtype=dtype, device=device) * 0.1
+    return x, w1, w2, grad_out
+
+
+def _dense_mlp_run(dtype, fuse_act_quant, fuse_dglu):
+    from primus_turbo.pytorch.ops.dense_mlp_fp4 import dense_mlp_fp4
+
+    x, w1, w2, grad_out = _dense_mlp_leaves(dtype)
+    out = dense_mlp_fp4(x, w1, w2, fuse_act_quant=fuse_act_quant, fuse_dglu=fuse_dglu)
+    out.backward(grad_out)
+    return out.detach(), x.grad, w1.grad, w2.grad
+
+
+def _dense_mlp_reference(dtype):
+    i = _DENSE_MLP_MKI[2]
+    x, w1, w2, grad_out = _dense_mlp_leaves(dtype)
+    l1 = x.float() @ w1.float().t()
+    act = torch.nn.functional.silu(l1[:, :i]) * l1[:, i:]
+    out = act @ w2.float().t()
+    out.backward(grad_out.float())
+    return out.detach(), x.grad, w1.grad, w2.grad
+
+
+_DENSE_MLP_TENSORS = ("out", "dx", "dw1", "dw2")
+
+
+@pytest.mark.parametrize(
+    "fuse_act_quant, fuse_dglu",
+    [(False, False), (True, False), (True, True)],
+    ids=["unfused", "fuse_act_quant", "fuse_dglu"],
+)
+def test_dense_mlp_fp4_mx_blockwise(fuse_act_quant, fuse_dglu):
+    """``dense_mlp_fp4``'s three paths against an eager fp32 reference.
+
+    The floor is low for the same reason the grouped MLP's is: MXFP4 carries ~2 mantissa
+    bits and this stacks four quantizations plus the wgrad operands' RHT, so it catches a
+    wrong answer rather than the quantization.
+    """
+    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
+
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    snr_threshold = 6
+    ref = _dense_mlp_reference(torch.bfloat16)
+    got = _dense_mlp_run(torch.bfloat16, fuse_act_quant, fuse_dglu)
+    for name, r, g in zip(_DENSE_MLP_TENSORS, ref, got):
+        snr = compute_snr(r.float(), g.float())
+        print(f"{name}-SNR: {snr:.2f} dB")
+        assert snr > snr_threshold, f"{name} snr too low"
+
+
+def test_dense_mlp_fp4_fuse_act_quant_matches_unfused():
+    """``fuse_act_quant`` only moves where act is quantized, so the two must agree.
+
+    ``fuse_dglu`` deliberately is not held to this: it re-associates the dSwiGLU in f32
+    registers instead of round-tripping dL1 through bf16, which measures ~29 dB against
+    the other two and the same quality against the reference.
+    """
+    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
+
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    unfused = _dense_mlp_run(torch.bfloat16, False, False)
+    fused = _dense_mlp_run(torch.bfloat16, True, False)
+    for name, a, b in zip(_DENSE_MLP_TENSORS, unfused, fused):
+        snr = compute_snr(a.float(), b.float())
+        print(f"{name}-SNR: {snr:.2f} dB")
+        assert snr > 100, f"{name} must be reproduced, got {snr:.2f} dB"
+
+
+def test_dense_mlp_fp4_x_prequant_requires_the_fused_path():
+    """Only the fused path reads ``x_prequant``, and that path is off by default."""
+    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
+    from primus_turbo.pytorch.ops.dense_mlp_fp4 import dense_mlp_fp4
+    from primus_turbo.pytorch.ops.quantization import quantize_fp4_with_trans
+
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    x, w1, w2, _ = _dense_mlp_leaves(torch.bfloat16)
+    prequant = quantize_fp4_with_trans(
+        x.detach(),
+        float4_e2m1fn_x2,
+        ScalingGranularity.MX_BLOCKWISE,
+        block_size=32,
+        scaling_recipe=ScalingRecipe(),
+        scaling_recipe_for_trans=ScalingRecipe(use_rht=True),
+    )
+    with pytest.raises(AssertionError, match="fuse_act_quant"):
+        dense_mlp_fp4(x, w1, w2, fuse_act_quant=False, x_prequant=prequant)
+    dense_mlp_fp4(x, w1, w2, fuse_act_quant=True, x_prequant=prequant)
