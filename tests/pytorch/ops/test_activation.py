@@ -5,16 +5,22 @@
 ###############################################################################
 
 import random
+from functools import partial
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from primus_turbo.pytorch.ops.activation import geglu_with_probs, swiglu_with_probs
+from primus_turbo.pytorch.ops.activation import (
+    geglu_with_probs,
+    swiglu_with_probs,
+)
 from tests.pytorch.test_utils import get_tolerances
 
 torch.manual_seed(42)
 random.seed(42)
+
+CLAMP_LIMIT = 1.0
 
 
 # NOTE: Align precision with torch.compile
@@ -23,6 +29,17 @@ def swiglu_with_probs_ref(x: torch.Tensor, probs: torch.Tensor):
     dtype = x.dtype
     x = torch.chunk(x, 2, dim=-1)
     res = F.silu(x[0]) * x[1]
+    return (res * probs).to(dtype)
+
+
+# NOTE: Align precision with torch.compile
+@torch.compile
+def clamped_swiglu_with_probs_ref(x: torch.Tensor, probs: torch.Tensor, clamp_limit: float):
+    dtype = x.dtype
+    gate, up = torch.chunk(x, 2, dim=-1)
+    gate = torch.clamp(gate, max=clamp_limit)
+    up = torch.clamp(up, min=-clamp_limit, max=clamp_limit)
+    res = F.silu(gate) * up
     return (res * probs).to(dtype)
 
 
@@ -51,6 +68,17 @@ def geglu_with_probs_ref(x: torch.Tensor, probs: torch.Tensor):
     return (res * probs).to(dtype)
 
 
+# NOTE: Align precision with torch.compile
+@torch.compile
+def clamped_geglu_with_probs_ref(x: torch.Tensor, probs: torch.Tensor, clamp_limit: float):
+    dtype = x.dtype
+    gate, up = torch.chunk(x, 2, dim=-1)
+    gate = torch.clamp(gate, max=clamp_limit)
+    up = torch.clamp(up, min=-clamp_limit, max=clamp_limit)
+    res = F.gelu(gate) * up
+    return (res * probs).to(dtype)
+
+
 @pytest.mark.parametrize(
     "batch_size",
     [1, 8],
@@ -75,7 +103,7 @@ def geglu_with_probs_ref(x: torch.Tensor, probs: torch.Tensor):
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("with_tokens_per_expert", [False, True])
-@pytest.mark.parametrize("act_type", ["swiglu", "geglu"])
+@pytest.mark.parametrize("act_type", ["swiglu", "geglu", "clamped_swiglu", "clamped_geglu"])
 def test_glu_with_probs(batch_size, sequence_length, hidden_size, dtype, with_tokens_per_expert, act_type):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
@@ -86,6 +114,12 @@ def test_glu_with_probs(batch_size, sequence_length, hidden_size, dtype, with_to
     elif act_type == "geglu":
         func = geglu_with_probs
         ref_func = geglu_with_probs_ref
+    elif act_type == "clamped_swiglu":
+        func = partial(swiglu_with_probs, clamp_limit=CLAMP_LIMIT)
+        ref_func = partial(clamped_swiglu_with_probs_ref, clamp_limit=CLAMP_LIMIT)
+    elif act_type == "clamped_geglu":
+        func = partial(geglu_with_probs, clamp_limit=CLAMP_LIMIT)
+        ref_func = partial(clamped_geglu_with_probs_ref, clamp_limit=CLAMP_LIMIT)
 
     device = "cuda"
 

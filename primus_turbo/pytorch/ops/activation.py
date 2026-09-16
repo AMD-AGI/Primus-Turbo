@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-from typing import Union
+from typing import Optional, Union
 
 import torch
 
@@ -23,7 +23,12 @@ __all__ = ["swiglu_with_probs", "geglu_with_probs"]
 class GLUWithProbs(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx, x: torch.Tensor, probs: torch.Tensor, row_mask: Union[torch.Tensor, None], act_type: str
+        ctx,
+        x: torch.Tensor,
+        probs: torch.Tensor,
+        row_mask: Union[torch.Tensor, None],
+        act_type: str,
+        clamp_limit: Optional[float] = None,
     ):
         x_origin_shape = x.size()
         probs_origin_shape = probs.size()
@@ -39,6 +44,10 @@ class GLUWithProbs(torch.autograd.Function):
             f"Unsupported act_type: {act_type}. Supported types: {SUPPORTED_ACT_TYPES}"
         )
 
+        if clamp_limit is not None:
+            clamp_limit = float(clamp_limit)
+            assert clamp_limit > 0.0, f"clamp_limit must be positive, got {clamp_limit}"
+
         if row_mask is not None:
             assert row_mask.is_cuda, "row_mask must be a CUDA tensor"
             assert x.size(0) == row_mask.size(0), "first dimension of x and row_mask must be the same"
@@ -46,12 +55,13 @@ class GLUWithProbs(torch.autograd.Function):
             assert row_mask.dtype == torch.int64, "The dtype of row_mask must be torch.int64."
 
         if act_type == "silu":
-            out = swiglu_fwd_with_probs(x, probs, row_mask)
+            out = swiglu_fwd_with_probs(x, probs, row_mask, clamp_limit)
         elif act_type == "gelu":
-            out = geglu_fwd_with_probs(x, probs, row_mask)
+            out = geglu_fwd_with_probs(x, probs, row_mask, clamp_limit)
 
         ctx.save_for_backward(x, probs, row_mask)
         ctx.act_type = act_type
+        ctx.clamp_limit = clamp_limit
         ctx.x_origin_shape = x_origin_shape
         ctx.probs_origin_shape = probs_origin_shape
 
@@ -64,20 +74,42 @@ class GLUWithProbs(torch.autograd.Function):
         x, probs, row_mask = ctx.saved_tensors
 
         if ctx.act_type == "silu":
-            grad_x, grad_probs = swiglu_bwd_with_probs(grad_output, x, probs, row_mask)
+            grad_x, grad_probs = swiglu_bwd_with_probs(grad_output, x, probs, row_mask, ctx.clamp_limit)
         elif ctx.act_type == "gelu":
-            grad_x, grad_probs = geglu_bwd_with_probs(grad_output, x, probs, row_mask)
+            grad_x, grad_probs = geglu_bwd_with_probs(grad_output, x, probs, row_mask, ctx.clamp_limit)
 
-        return grad_x.view(ctx.x_origin_shape), grad_probs.view(ctx.probs_origin_shape), None, None
+        return grad_x.view(ctx.x_origin_shape), grad_probs.view(ctx.probs_origin_shape), None, None, None
 
 
 def swiglu_with_probs(
-    x: torch.Tensor, probs: torch.Tensor, row_mask: Union[torch.Tensor, None]
+    x: torch.Tensor,
+    probs: torch.Tensor,
+    row_mask: Union[torch.Tensor, None],
+    clamp_limit: Optional[float] = None,
 ) -> torch.Tensor:
-    return GLUWithProbs.apply(x, probs, row_mask, "silu")
+    """``silu(gate) * up * probs``, where ``gate`` / ``up`` are the halves of ``x``'s
+    last dim.
+
+    Args:
+        clamp_limit: with ``L`` given, the activation becomes
+            ``silu(min(gate, L)) * clamp(up, -L, L) * probs``. The clamp backward is
+            straight-through, matching ``torch.clamp``. None for no clamp.
+    """
+    return GLUWithProbs.apply(x, probs, row_mask, "silu", clamp_limit)
 
 
 def geglu_with_probs(
-    x: torch.Tensor, probs: torch.Tensor, row_mask: Union[torch.Tensor, None]
+    x: torch.Tensor,
+    probs: torch.Tensor,
+    row_mask: Union[torch.Tensor, None],
+    clamp_limit: Optional[float] = None,
 ) -> torch.Tensor:
-    return GLUWithProbs.apply(x, probs, row_mask, "gelu")
+    """``gelu(gate) * up * probs``, where ``gate`` / ``up`` are the halves of ``x``'s
+    last dim.
+
+    Args:
+        clamp_limit: with ``L`` given, the activation becomes
+            ``gelu(min(gate, L)) * clamp(up, -L, L) * probs``. The clamp backward is
+            straight-through, matching ``torch.clamp``. None for no clamp.
+    """
+    return GLUWithProbs.apply(x, probs, row_mask, "gelu", clamp_limit)

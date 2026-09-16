@@ -145,7 +145,10 @@ class FP4GemmMXFunction(torch.autograd.Function):
                     axis=-2,
                     block_size=config.block_size,
                     scaling_recipe=a_t_scaling_recipe,
+                    scale_rounding_mode=config.scale_rounding_mode,
                 )
+            else:
+                check_quantized_tensor(a_t, config, axis=-2, scaling_recipe=a_t_scaling_recipe)
             a_col, a_col_scale = a_t.qdata, a_t.scale_inv
         else:
             a_row, a_row_scale, a_col, a_col_scale = quantize_fp4_with_trans(
@@ -155,6 +158,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
                 block_size=config.block_size,
                 scaling_recipe=a_scaling_recipe,
                 scaling_recipe_for_trans=a_t_scaling_recipe,
+                scale_rounding_mode=config.scale_rounding_mode,
             )
 
         b_scaling_recipe = ScalingRecipe(
@@ -182,7 +186,10 @@ class FP4GemmMXFunction(torch.autograd.Function):
                     axis=-2,
                     block_size=config.block_size,
                     scaling_recipe=b_t_scaling_recipe,
+                    scale_rounding_mode=config.scale_rounding_mode,
                 )
+            else:
+                check_quantized_tensor(b_t, config, axis=-2, scaling_recipe=b_t_scaling_recipe)
             b_col, b_col_scale = b_t.qdata, b_t.scale_inv
         else:
             b_row, b_row_scale, b_col, b_col_scale = quantize_fp4_with_trans(
@@ -192,6 +199,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
                 block_size=config.block_size,
                 scaling_recipe=b_scaling_recipe,
                 scaling_recipe_for_trans=b_t_scaling_recipe,
+                scale_rounding_mode=config.scale_rounding_mode,
             )
 
         # NT layout
@@ -254,6 +262,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
             block_size=ctx.config.block_size,
             scaling_recipe=grad_out_scaling_recipe,
             scaling_recipe_for_trans=grad_out_t_scaling_recipe,
+            scale_rounding_mode=ctx.config.scale_rounding_mode,
         )
 
         # NOTE: convert NN layout to NT layout because MXFP4 only supports NT layout on hipblaslt.

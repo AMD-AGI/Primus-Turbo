@@ -47,6 +47,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     StoreCPerTensorQuadN,
     wait_barrier,
     xcd_remap_pid,
+    xcd_window_mn,
     XPOSE_SLOT,
     XPOSE_SLOTS,
 )
@@ -70,8 +71,14 @@ from flydsl.expr.typing import Vector as Vec
 
 # `nt` aux bit: C is write-once, so caching it evicts the A/B band the L2 swizzle keeps.
 _CSTORE_AUX = 2
+_CSTORE_AUX_BURST = 19  # `sc0|sc1|nt`: device scope, for a burst the near cache cannot absorb
+# C bytes in one device-wide beta=1 burst at or above which the wide scope wins: about where the
+# burst stops fitting in L2 beside the operand band. gfx950-only backend, so the slice is fixed.
+_CSTORE_BURST_BYTES = 26 << 20
+_CSTORE_OUT_BYTES = 2  # both output dtypes are 16-bit; C's bytes per element
 
 _PICK_RAMP_ITERS = 200  # throwaway launches before timing: the leading candidate else pays the ramp
+_PICK_PASSES = 3  # reversed round trips over the candidates; one does not resolve the dense bands
 
 
 @functools.lru_cache(maxsize=256)
@@ -1123,6 +1130,8 @@ class _Tn4Geom(NamedTuple):
     bn: int
     pools: tuple
     bstep: int
+    bstep_tr: int = 0  # bstep for the transposed-B variant, whose reads issue best as one burst
+    mstep: int = 2  # srcA rows of one issue-order step, i.e. how long a srcB fragment is held
     # Boundaries taking a wait state, "<before><after>" over m (mfma), d (ds_read), g (g2s).
     pad: tuple = ("mm", "md", "mg", "dm", "dd", "dg", "gm", "gd", "gg")
     wgrid: tuple = (2, 2)  # a square split shares both operands' reads four ways, not one side's
@@ -1141,7 +1150,8 @@ _TN4_SQUARE = _Tn4Geom(
     256,
     256,
     ((0, 128, 2), (0, 128, 2), (1, 128, 3), (1, 128, 3)),
-    0,
+    8,  # both operands read through the transpose reader, whose reads issue best as one burst
+    mstep=4,
 )
 # Finer grid for shapes the square tile cannot round onto whole CU passes, same operand bytes.
 _TN4_RECT = _Tn4Geom(
@@ -1695,8 +1705,23 @@ def _dense_tn_wave4_tile(
     mfma = {p.tiles: Mfma16x16x128(apool[0].tiles, p.tiles) for p in bpool}
     if c_rows is None:
         c_rows = fx.Int32(M) if row_shift is None else fx.Int32(M) + row_shift
+    pool_lds = [getattr(lds, f"p{i}") for i in range(len(pools))]
+    # Both operands arrive transposed, so the epilogue is where this tile sheds issue slots.
+    line = _nt4_line_extents(0, col_safe, tuple(mfma))
+    line_kw = (
+        {
+            "lds_xpose": _nt4_xpose_lds(pools[0], pool_lds[0], wave_id, _tn4_nthr(geom) // 64),
+            "scale": load_per_tensor_scale(A_scale, B_scale),
+        }
+        if line
+        else {}
+    )
     store_c = {
-        nb: (StoreCPerTensorPairN if col_safe and nb % 2 == 0 else StoreCPerTensor)(
+        nb: (
+            StoreCPerTensorLineN
+            if nb in line
+            else (StoreCPerTensorPairN if col_safe and nb % 2 == 0 else StoreCPerTensor)
+        )(
             A_scale,
             B_scale,
             C,
@@ -1709,13 +1734,12 @@ def _dense_tn_wave4_tile(
             col_safe=col_safe,
             store_aux=store_aux,
             c_base=store_base,
+            **(line_kw if nb in line else {}),
         )
         for nb, m in mfma.items()
     }
-
     a_k = arith.index(_TN4_BLOCK_K) * arith.index(M)
     b_k = arith.index(_TN4_BLOCK_K) * arith.index(N)
-    pool_lds = [getattr(lds, f"p{i}") for i in range(len(pools))]
     for b in range(max(p.nbuf for p in pools)):
         for i, p in enumerate(pools):
             if b < p.nbuf:
@@ -1772,6 +1796,9 @@ def _dense_tn_wave4_tile(
 
     row_q = bm_off + wave_m * fx.Int32(apool[0].tiles * 16)
     base_row = row_q if row_shift is None else row_q + row_shift
+    # The staging scratch is borrowed from a buffer the body reads: retire those reads first.
+    if any(s.stages_lds for s in store_c.values()):
+        _lds_barrier()
 
     if handoff:
         _tn4_publish_frag(res, hand_st, wave_id, lane_id, 0, nacc, out_ty, handoff)
@@ -1804,6 +1831,8 @@ def _dense_tn_wave4_tile(
                 frag = _tn4_fold_frag(frag, hand_ld, wave_id, lane_id, q, nacc, out_ty, handoff)
             store_c[pb.tiles].store(frag, base_row + pa.gcol, col_q + pb.gcol)
             q += n
+    for s in store_c.values():
+        s.flush()
 
 
 _TN4_SPLIT_S = (2, 3, 4)  # slice factors; an odd one is fine, the slices stay co-resident
@@ -1842,6 +1871,15 @@ def _dense_num_cus():
     if not _NUM_CUS:
         _NUM_CUS = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
     return _NUM_CUS
+
+
+def _cstore_aux(beta_is_one, tiles_per_wg, n_wg, tile_bytes):
+    """C store cache policy. One tile per workgroup puts every beta=1 read-modify-write in the
+    same instant with no successor tile to hide it behind, so the wider scope pays once that
+    burst outgrows L2. The predicate is the burst's bytes, not the workgroup count."""
+    if beta_is_one and tiles_per_wg == 1 and n_wg * tile_bytes >= _CSTORE_BURST_BYTES:
+        return _CSTORE_AUX_BURST
+    return _CSTORE_AUX
 
 
 def _compile_dense_tn_wave4(
@@ -2003,11 +2041,72 @@ _NT4_SQUARE = _Tn4Geom(
     256,
     256,
     ((0, 128, 2), (0, 128, 2), (1, 128, 3), (1, 128, 3)),
-    0,
+    8,  # a whole accumulator block per issue step, so a srcA fragment feeds every column it reaches
+    mstep=4,
     drain_lgkm=6,  # NT's plain reads leave fewer in flight than the transpose path's
+)
+# Narrower N edge for tile counts between whole CU passes; 128+64 is the widest LDS-legal cut.
+_NT4_RECT = _Tn4Geom(
+    256,
+    192,
+    ((0, 128, 2), (0, 128, 2), (1, 128, 3), (1, 64, 3)),
+    0,
+    bstep_tr=6,  # this tile's phase leaves the diagonal too little to spread a refill over
+    mstep=2,
+    drain_lgkm=6,
+)
+# An M an extent does not divide still issues its dead quadrants' mfma -- the num_records clamp
+# drops only the fetches and stores -- so an exact tile shortens every workgroup's own path.
+_NT4_M192 = _NT4_SQUARE._replace(
+    bm=192,
+    pools=((0, 96, 2), (0, 96, 2), (1, 128, 3), (1, 128, 3)),
+    mstep=3,  # mstep == nt, as above
+)
+# The same on both axes, for a shape neither extent divides. bm+bn is unchanged, so a K block
+# still moves the same operand bytes; the n-fragments no longer divide the fold, hence paired.
+_NT4_W320 = _NT4_SQUARE._replace(
+    bm=320,
+    bn=192,
+    pools=((0, 160, 2), (0, 160, 2), (1, 192, 3)),
+    bstep=6,
+    mstep=5,  # mstep == nt, as above
+    store_split_flat=5,  # one unit per fragment row: a coarser split spills the beta=1 read-back
 )
 _NT4_ASM_CACHE: dict = {}
 _NT4_BAND = 64  # B rows one wave's four n-fragments span in a pool
+_NT4_WIN_ASPECT = 2  # widest per-step window a raster may be out of square
+
+
+def _nt4_resident(M, N, geom, ncu):
+    """Workgroups the whole loop keeps resident for this shape. Every group walks the same
+    number of tiles, so a tile count between two whole CU passes rounds the group count down
+    and the rest of the device never takes a wave. This, not the tile count, is the signal."""
+    tiles = ceildiv(M, geom.bm) * ceildiv(N, geom.bn)
+    return ceildiv(tiles, ceildiv(tiles, min(tiles, ncu)))
+
+
+def _nt4_intensity(geom):
+    """Operand bytes one macro tile pulls per output cell, up to the shared K factor."""
+    return (geom.bm + geom.bn) / (geom.bm * geom.bn)
+
+
+def _nt4_geoms(M, N, beta_is_one, square_bands, rect_bands):
+    """Macro tiles the whole loop races for this shape. The N-narrow tile trades arithmetic
+    intensity for CU coverage, so it joins only where the coverage outweighs the operand bytes;
+    an exact tile joins only where it fits one CU pass and shortens the critical path."""
+    geoms = [(_NT4_SQUARE, square_bands)]
+    ncu = _dense_num_cus()
+    coverage = _nt4_resident(M, N, _NT4_RECT, ncu) / _nt4_resident(M, N, _NT4_SQUARE, ncu)
+    if N % _NT4_RECT.bn == 0 and coverage > _nt4_intensity(_NT4_RECT) / _nt4_intensity(_NT4_SQUARE):
+        geoms.append((_NT4_RECT, rect_bands))
+    square_path = _nt4_wg_path(M, N, _NT4_SQUARE, beta_is_one, ncu)[1]
+    for geom in (_NT4_M192, _NT4_W320):
+        if M % geom.bm or N % geom.bn:
+            continue
+        wg, path = _nt4_wg_path(M, N, geom, beta_is_one, ncu)
+        if wg <= ncu and path < square_path:
+            geoms.append((geom, rect_bands))
+    return geoms
 
 
 def _nt4_pools(geom, fold):
@@ -2021,6 +2120,17 @@ def _nt4_pools(geom, fold):
         p.gq = i % npg
         p.gcol = p.col - p.gq * p.width
     return pools
+
+
+def _nt4_wg_path(M, N, geom, beta_is_one, ncu):
+    """(workgroups, mfma a workgroup issues per K block) of the whole loop over ``geom``. The
+    second is the critical path every workgroup walks, which is what the wall follows: work
+    freed on only some of them returns less, since the idle CUs come back as clock."""
+    n_tile = ceildiv(M, geom.bm) * ceildiv(N, geom.bn)
+    tiles_per_wg = 1 if beta_is_one else ceildiv(n_tile, min(n_tile, ncu))
+    pools = _tn4_pools(geom)
+    nacc = sum(p.tiles for p in pools if p.side == 0) * sum(p.tiles for p in pools if p.side == 1)
+    return ceildiv(n_tile, tiles_per_wg), tiles_per_wg * nacc
 
 
 def _nt4_fold_gl_off(lane_id, wave_id, K, n_rounds, gq, fold):
@@ -2043,10 +2153,11 @@ def _nt4_fold_gl_off(lane_id, wave_id, K, n_rounds, gq, fold):
     return out
 
 
-def _tn4_mfma_order(geom, nt, nb, na, nacc, ap, bp, bcol, qoff, pools):
+def _tn4_mfma_order(geom, nt, nb, na, nacc, ap, bp, bcol, qoff, pools, bstep=0):
     """(accumulator, srcA, srcB) of one phase's mfma, in issue order: the srcA pool is outer
     because this mfma is srcA-movement sensitive, and the diagonal spreads the refills."""
-    bm, bn = 2, geom.bstep or nb // 2
+    bm, bn = geom.mstep, bstep or geom.bstep or nb // 2
+    assert nb % bn == 0 and nt % bm == 0, "a step must divide its fragments, or mfma vanish"
     n_row_steps, n_col_steps = nt // bm, nb // bn
     for d in range(n_row_steps + n_col_steps - 1):
         for iib in range(n_row_steps):
@@ -2085,7 +2196,7 @@ def _dense_nt_wave4_asm(geom, k_iters, cbsz, blgp, fold, tr_b=False, b_kstep=_TN
     n_main = (k_iters // phases) * phases
     tail = k_iters - n_main
     assert n_main >= phases, "the NT whole-loop needs a K of at least one main-loop pass"
-    assert not (carry and tail), "a carried ring needs the trip to end on a whole pass"
+    n_spec = _nt4_spec_phases(k_iters, phases, max(p.nbuf for p in pools) if carry else 1)
     pad = geom.pad
     ds_sep = f"\n{_TN4_ISSUE_PAD}\n" if "d" in pad else "\n"
     g2s_sep = f"\n{_TN4_ISSUE_PAD}\n" if "g" in pad else "\n"
@@ -2121,8 +2232,8 @@ def _dense_nt_wave4_asm(geom, k_iters, cbsz, blgp, fold, tr_b=False, b_kstep=_TN
     i_rsrc_a, i_rsrc_b = take(1)[0], take(1)[0]
     i_rsrc2 = [take(1)[0], take(1)[0]] if carry else []
     i_soff0 = take(npool)
-    cbuf = _nt4_carry_bufs(pools, carry)
-    i_pfsoff = [take(len(b)) for b in cbuf]
+    cbuf = _nt4_carry_bufs(pools, carry, k_iters, phases)
+    i_pfsoff = [dict(zip(b, take(len(b)))) for b in cbuf]
     i_gl = [gl[_tn4_gl_key(p)] for p in pools]
     i_rsrc = [(i_rsrc_a, i_rsrc_b)[p.side] for p in pools]
     i_pfrsrc = [i_rsrc2[p.side] for p in pools] if carry else []
@@ -2150,13 +2261,14 @@ def _dense_nt_wave4_asm(geom, k_iters, cbsz, blgp, fold, tr_b=False, b_kstep=_TN
         return "0" if init else f"${q}"
 
     def carried(p, left):
-        # Past the last phase a fill would fetch a K-block nothing reads; a successor takes it.
-        return carry and pools[p].nbuf > left
+        # Past the last phase a fill would fetch a K-block nothing reads; a successor takes it,
+        # but only from a phase the emitter peeled out of the shared main-loop body.
+        return carry and left <= min(pools[p].nbuf - 1, n_spec)
 
     def emit_g2s(wbuf, left):
         order = [(p, st) for st in range(pools[0].steps) for p in ap]
         order += [(p, st) for p in bp for st in range(pools[p].steps)]
-        assert all(not carried(p, left) or wbuf[p] < len(i_pfsoff[p]) for p, _st in order), (
+        assert all(not carried(p, left) or wbuf[p] in i_pfsoff[p] for p, _st in order), (
             "a carried fill must aim at a buffer the next tile top leaves alone"
         )
         return [
@@ -2170,7 +2282,9 @@ def _dense_nt_wave4_asm(geom, k_iters, cbsz, blgp, fold, tr_b=False, b_kstep=_TN
     def mfma_seq(init):
         return [
             (f"v_mfma_f32_16x16x128_f8f6f4 ${q}, ${at}, ${br}, {src2(q, init)}{mods}", at, br, q)
-            for q, at, br in _tn4_mfma_order(geom, nt, nb, na, nacc, ap, bp, bcol, qoff, pools)
+            for q, at, br in _tn4_mfma_order(
+                geom, nt, nb, na, nacc, ap, bp, bcol, qoff, pools, geom.bstep_tr if tr_b else 0
+            )
         ]
 
     def emit_phase(rbuf, wbuf, init, left):
@@ -2199,7 +2313,9 @@ def _dense_nt_wave4_asm(geom, k_iters, cbsz, blgp, fold, tr_b=False, b_kstep=_TN
     tailp = [i for i, p in enumerate(pools) if p.nbuf > 2]
     assert tailp == list(range(npool - len(tailp), npool)), "deep pools must be issued last"
     assert all(phases % p.nbuf == 0 for p in pools), "a pass must end on every pool's buf 0"
-    n_out = sum(pools[i].steps for i in tailp)
+    # The tile top primes buffer-major, so the prologue may leave outstanding exactly the fills
+    # aimed past buffer 1; everything phase 0 reads has to have landed by then.
+    n_out = sum(p.steps * sum(1 for b in t if b > 1) for p, t in zip(pools, _nt4_top_bufs(pools, cbuf)))
 
     def n_flight(lf):
         """Fills the phase drain may leave outstanding: the trailing run nothing later waits on."""
@@ -2242,12 +2358,20 @@ def _dense_nt_wave4_asm(geom, k_iters, cbsz, blgp, fold, tr_b=False, b_kstep=_TN
     # accumulating, sparing the zero-init; the closing phase is peeled the other way and
     # handed back, its mfma the window an occ=1 epilogue has nowhere else to sink into.
     if tail:
+        # One more pass out of the loop body when the K-tail alone peels fewer closing phases
+        # than the deepest pool has buffers to hand on (_nt4_spec_phases).
+        xtra = phases if n_spec > tail - 1 else 0
         L += pass_block(True, False)
-        if n_main > phases:
-            L += loop_block(n_main - phases)
-        L += ["s_waitcnt vmcnt(0) lgkmcnt(0)", "s_barrier"]
+        if n_main > phases + xtra:
+            L += loop_block(n_main - phases - xtra)
+        if xtra:
+            L += pass_block(False, False, n_spec)
+        # Entry to the closing phases. The pass that just ran already ended on the graded drain
+        # and barrier the main loop's back edge relies on, so grade this rendezvous the same way
+        # the phases do rather than draining the fill pipeline that is feeding the next tile.
+        L += [f"s_waitcnt vmcnt({n_flight(tail - 1 if carry else k_iters)}) lgkmcnt(0)", "s_barrier"]
         for j in range(tail - 1):
-            L += phase_block(j)
+            L += phase_block(j, left=(tail - 1 - j) if carry else None)
     else:
         _tl = phases - 1 if carry else None
         L += pass_block(True, n_main == phases, _tl if n_main == phases else None)
@@ -2279,10 +2403,41 @@ def _dense_nt_wave4_asm(geom, k_iters, cbsz, blgp, fold, tr_b=False, b_kstep=_TN
     return _NT4_ASM_CACHE[key]
 
 
-def _nt4_tile_window(d, M, N, K, NBM, NBN, group_m, group_n, num_xcd, geom, tr_b):
+def _nt4_window_ok(raster, NBM, NBN, n_tile, n_wg, num_xcd, tr_b):
+    """Whether ``xcd_window_mn``'s aligned per-step rectangle tiles this grid."""
+    if raster <= 0 or tr_b or num_xcd <= 1 or n_tile % n_wg or n_wg % num_xcd or NBM % num_xcd:
+        return False
+    slots = n_wg // num_xcd
+    return not (slots % raster or (NBM // num_xcd) % raster or NBN % (slots // raster))
+
+
+def _nt4_raster(NBM, NBN, group_m, n_tile, n_wg, num_xcd, tr_b):
+    """Aligned per-step window for this grid, or 0 to keep the GROUP_M raster. A step straddles
+    two ``group_m*NBN`` super-rows unless one divides the other, pulling two part-width windows
+    into the XCD's L2; where it does divide the emitted mapping is left bit-identical."""
+    if num_xcd <= 1 or n_wg % num_xcd:
+        return 0
+    slots = n_wg // num_xcd
+    super_row = group_m * NBN
+    if super_row % slots == 0 or slots % super_row == 0:
+        return 0
+    # A step reads win_m + slots/win_m operand slabs, so prefer the squarest legal rectangle.
+    ok = [
+        w
+        for w in range(1, slots + 1)
+        if max(w, slots // w) <= _NT4_WIN_ASPECT * min(w, slots // w)
+        and _nt4_window_ok(w, NBM, NBN, n_tile, n_wg, num_xcd, tr_b)
+    ]
+    return min(ok, key=lambda w: (w + slots // w, w), default=0)
+
+
+def _nt4_tile_window(d, M, N, K, NBM, NBN, group_m, group_n, num_xcd, geom, tr_b, raster=0, n_wg=0):
     """One dispatch id's operand windows, num_records bounded so read-ahead past the tile drops."""
-    pid = xcd_remap_pid(d, NBM * NBN, num_xcd)
-    block_m, block_n = block_mn(pid, fx.Int32(NBM), fx.Int32(NBN), group_m, group_n)
+    if raster:
+        block_m, block_n = xcd_window_mn(d, n_wg, NBM, NBN, num_xcd, raster)
+    else:
+        pid = xcd_remap_pid(d, NBM * NBN, num_xcd)
+        block_m, block_n = block_mn(pid, fx.Int32(NBM), fx.Int32(NBN), group_m, group_n)
     bm_off = _readfirstlane_i32(block_m) * fx.Int32(geom.bm)
     bn_off = _readfirstlane_i32(block_n) * fx.Int32(geom.bn)
     a_base = arith.index_cast(T.index, bm_off) * arith.index(K)
@@ -2333,9 +2488,40 @@ def _nt4_prime(pools, pool_lds, g2s, bufs, K, b_kstep, tr_b):
                 )
 
 
-def _nt4_carry_bufs(pools, carry):
-    """Buffers the closing phases hand on: all but the last, whose K-block this trip still reads."""
-    return [list(range(p.nbuf - 1)) if carry else [] for p in pools]
+def _nt4_spec_phases(k_iters, phases, deep=1):
+    """Closing phases the emitter can specialise, counted as ``left`` (phases still to run). The
+    rest sit in the shared loop body, which cannot carry as it is entered once per pass; a K-tail
+    shorter than the deepest pool unrolls one more pass out of the loop whenever K can spare it."""
+    tail = k_iters % phases
+    if not tail:
+        return phases - 1
+    if tail < deep and k_iters - tail >= 2 * phases:
+        return tail - 1 + phases
+    return tail - 1
+
+
+def _nt4_carry_bufs(pools, carry, k_iters, phases):
+    """Buffers the closing phases hand on. A phase whose fill would fetch a K-block past this
+    tile's end writes the successor's buffer instead; which buffer that is follows from the phase
+    index alone, so any K aligns as long as the tile top primes whichever one is left over."""
+    if not carry:
+        return [[] for _ in pools]
+    spec = _nt4_spec_phases(k_iters, phases, max(p.nbuf for p in pools))
+    return [sorted((k_iters - 1 - l) % p.nbuf for l in range(1, min(p.nbuf, spec + 1))) for p in pools]
+
+
+def _nt4_top_bufs(pools, cbuf):
+    """Buffers the tile top primes itself: whatever the closing phases did not hand over."""
+    return [[b for b in range(p.nbuf) if b not in c] for p, c in zip(pools, cbuf)]
+
+
+def _nt4_line_extents(fold, col_safe, gtiles):
+    """The n-extents of ``gtiles`` whose store gathers four n-fragments into one whole-line
+    request: a folded epilogue already leaves wide requests, a masked column edge has no run to
+    bound, and an uneven cut can only widen one half, which is a wash."""
+    if fold or not col_safe or len(set(gtiles)) != 1:
+        return ()
+    return tuple(n for n in dict.fromkeys(gtiles) if n % 4 == 0)
 
 
 def _nt4_xpose_lds(p, lds, wave_id, n_waves):
@@ -2355,11 +2541,15 @@ def _dense_nt_wave4_tile(
     N,
     K,
     K_ITERS,
+    k_tail,
+    lane_id,
     NBM,
     NBN,
     group_m,
     group_n,
     num_xcd,
+    raster,
+    n_wg,
     store_aux,
     lds,
     geom,
@@ -2387,13 +2577,12 @@ def _dense_nt_wave4_tile(
     pools = _nt4_pools(geom, fold)
     apool = [p for p in pools if p.side == 0]
     bpool = [p for p in pools if p.side == 1]
-    assert len({p.tiles for p in pools if p.side == 1}) == 1, "B pools must be equally wide"
     b_kstep = _TN4_BLOCK_K * N if tr_b else _TN4_BLOCK_K
     pool_lds = [getattr(lds, f"p{i}") for i in range(len(pools))]
     n_waves = _tn4_nthr(geom) // 64
     carry = d_next is not None
-    cbuf = _nt4_carry_bufs(pools, carry)
-    wargs = (M, N, K, NBM, NBN, group_m, group_n, num_xcd, geom, tr_b)
+    cbuf = _nt4_carry_bufs(pools, carry, K_ITERS, _tn4_phases(geom))
+    wargs = (M, N, K, NBM, NBN, group_m, group_n, num_xcd, geom, tr_b, raster, n_wg)
     bm_off, bn_off, win = _nt4_tile_window(d, *wargs)
 
     s2r = {}
@@ -2417,43 +2606,55 @@ def _dense_nt_wave4_tile(
     # store behind. A folded unit leaves few whole-line requests; an unfolded one leaves
     # narrow ones that spread better over the peel when the rows are cut finer.
     nsplit = geom.store_split if fold else geom.store_split_flat
-    split = math.gcd(nsplit, apool[0].tiles)
-    nfold = fold or bpool[0].tiles
-    npg = nfold // bpool[0].tiles  # B pools one store spans
-    a_step = apool[0].tiles * bpool[0].tiles // (split * nfold)
-    mfma = Mfma16x16x128(a_step, nfold)
-    line_n = not fold and col_safe and nfold % 4 == 0
-    store_c = (
-        StoreCPerTensorQuadN
-        if fold
-        else (
-            StoreCPerTensorLineN
-            if line_n
-            else (StoreCPerTensorPairN if pair_n and nfold % 2 == 0 else StoreCPerTensor)
+    npg = max(1, fold // bpool[0].tiles)  # B pools one store spans
+    assert npg == 1 or len({p.tiles for p in bpool}) == 1, "a folded store needs equal B pools"
+    split = math.gcd(nsplit, apool[0].tiles // npg)
+    a_step = apool[0].tiles // (split * npg)
+    # One store per n-extent: a two-width B side gives groups of two, and only one can own the pool.
+    groups = [bpool[g : g + npg] for g in range(0, len(bpool), npg)]
+    gtiles = [sum(p.tiles for p in g) for g in groups]
+    line = _nt4_line_extents(fold, col_safe, gtiles)
+
+    def _store(nfold):
+        if fold:
+            # A folded store carries one column mask per lane run, so every group extent
+            # must be an exact number of runs.
+            assert geom.bn % fold == 0 and (nfold * 16) % fold == 0 and (npg * bpool[0].width) % fold == 0
+        cls = (
+            StoreCPerTensorQuadN
+            if fold
+            else (
+                StoreCPerTensorLineN
+                if nfold in line
+                else (StoreCPerTensorPairN if pair_n and nfold % 2 == 0 else StoreCPerTensor)
+            )
         )
-    )(
-        A_scale,
-        B_scale,
-        C,
-        fx.Int32(M),
-        fx.Int32(N),
-        mfma.idx,
-        a_step,
-        nfold,
-        out_ty,
-        col_safe=col_safe,
-        store_aux=store_aux,
-        beta_is_one=beta_is_one,
-        **(
-            {"lds_xpose": _nt4_xpose_lds(pools[0], pool_lds[0], wave_id, n_waves), "scale": scale}
-            if line_n
-            else {}
-        ),
-    )
+        return cls(
+            A_scale,
+            B_scale,
+            C,
+            fx.Int32(M),
+            fx.Int32(N),
+            Mfma16x16x128(a_step, nfold).idx,
+            a_step,
+            nfold,
+            out_ty,
+            col_safe=col_safe,
+            store_aux=store_aux,
+            beta_is_one=beta_is_one,
+            scale=scale,
+            **(
+                {"lds_xpose": _nt4_xpose_lds(pools[0], pool_lds[0], wave_id, n_waves)}
+                if nfold in line
+                else {}
+            ),
+        )
+
+    store_c = {n: _store(n) for n in dict.fromkeys(gtiles)}
 
     g2s = _nt4_g2s(A, B, win, pools, gl_off, wave_id)
     _lds_barrier()
-    top = [[p.nbuf - 1] if carry else list(range(p.nbuf)) for p in pools]
+    top = _nt4_top_bufs(pools, cbuf)
     _nt4_prime(pools, pool_lds, g2s, top, K, b_kstep, tr_b)
     wait_barrier(sum(p.steps * sum(1 for b in t if b) for p, t in zip(pools, top)))
 
@@ -2499,7 +2700,13 @@ def _dense_nt_wave4_tile(
     frag_ty = ir.Type.parse("vector<8xi32>")
     n_frag = sum(p.tiles for p in apool + bpool)
     frg = [Vec(_llvm.extractvalue(frag_ty, r, [nacc + f])) for f in range_constexpr(n_frag)]
-    if store_c.stages_lds:
+    # Both NT operands are K-contiguous, so a partial last K-block over-reads into the next
+    # row instead of past the SRD. Quantized weights cannot contain E4M3 NaN encodings, so
+    # zeroing A's out-of-range K columns is sufficient to drop the tail terms.
+    if k_tail:
+        na = sum(p.tiles for p in apool)
+        frg[:na] = mask_a_tail(frg[:na], lane_id, k_tail)
+    if any(s.stages_lds for s in store_c.values()):
         _lds_barrier()
 
     base_row = bm_off + wave_m * fx.Int32(apool[0].tiles * 16)
@@ -2510,34 +2717,36 @@ def _dense_nt_wave4_tile(
             o += apool[0].tiles * pb.tiles
     unit = []
     for ai, pa in enumerate(apool):
-        for gi in range(len(bpool) // npg):
+        for gi, g in enumerate(groups):
             for h in range(pa.tiles // a_step):
                 unit.append(
                     (
                         [
-                            qoff[(ai, gi * npg + j)] + (h * a_step + ti) * bpool[0].tiles + bt
+                            qoff[(ai, gi * npg + j)] + (h * a_step + ti) * g[j].tiles + bt
                             for ti in range(a_step)
                             for j in range(npg)
-                            for bt in range(bpool[0].tiles)
+                            for bt in range(g[j].tiles)
                         ],
                         pa.col + h * a_step * 16,
-                        bn_off + wave_n * fx.Int32(nfold * 16) + gi * npg * bpool[0].width,
+                        # A fold's wave slice is the whole group; plain pools each keep their own.
+                        bn_off + wave_n * fx.Int32((gtiles[gi] if fold else g[0].tiles) * 16) + g[0].col,
+                        gtiles[gi],
                     )
                 )
     # A unit's mfma all precede the store of the previous unit: that store's reads and
     # converts then issue while this unit's mfma occupy the matrix core. Reordering the
     # phase's mfma by unit is free -- they are independent and their refills already ran.
-    grp = [[m for m in peel if m[0] in set(acc)] for acc, _row, _col in unit]
+    grp = [[m for m in peel if m[0] in set(acc)] for acc, _row, _col, _nb in unit]
 
     def emit_store(i, tap=None):
-        acc, row, col = unit[i]
-        store_c.store([res[q] for q in acc], base_row + row, col, **({"tap": tap} if tap else {}))
+        acc, row, col, nb = unit[i]
+        store_c[nb].store([res[q] for q in acc], base_row + row, col, **({"tap": tap} if tap else {}))
 
     def emit_mfma(m):
         q, at, br = m
         res[q] = asm_mma_do(frg[at], frg[br], res[q], mode="2", cbsz=cbsz, blgp=blgp)
 
-    lead = geom.peel_lead if line_n else 0
+    lead = geom.peel_lead if line else 0
     if lead:
         # One mfma per output row under the store keeps the matrix core busy underneath it.
         for i in range_constexpr(lead):
@@ -2555,6 +2764,8 @@ def _dense_nt_wave4_tile(
             for m in ahead:  # a group wider than the slots the unit offered
                 emit_mfma(m)
     else:
+        # A store reads accumulators the peel's mfma have just written, so it trails by one
+        # group; the barrier keeps the next group's mfma from clobbering them first.
         for i in range_constexpr(len(unit)):
             for m in grp[i]:
                 emit_mfma(m)
@@ -2562,7 +2773,8 @@ def _dense_nt_wave4_tile(
                 rocdl.sched_barrier(0)
                 emit_store(i - 1)
         emit_store(len(unit) - 1)
-    store_c.flush()
+    for s in store_c.values():
+        s.flush()
 
 
 @functools.lru_cache(maxsize=128)
@@ -2573,6 +2785,7 @@ def _compile_dense_wave4(
     group_m: int = 4,
     group_n: int = 0,
     num_xcd: int = 8,
+    raster: int = -1,  # aligned per-step XCD window, win_m block rows; -1 = pick, 0 = GROUP_M
     geom=_NT4_SQUARE,
     cbsz: int = 0,  # srcA fp8 fmt: 0=E4M3, 1=E5M2
     blgp: int = 0,  # srcB fp8 fmt: 0=E4M3, 1=E5M2
@@ -2583,16 +2796,18 @@ def _compile_dense_wave4(
     tr_b: bool = False,  # B is K-major (NN), so its side pays the transpose reader
     ring: bool = False,  # carry the pool fills across the tile boundary
 ):
-    """Whole-loop dense NT (``tr_b=False``) or NN over ``geom``'s macro tile: a resident
-    workgroup per CU walks a column of tiles. K must be whole BLOCK_K blocks -- a partial one
-    would need the read-ahead to mask, and the 8-wave kernel carries the native K-tail."""
+    """Whole-loop dense NT (``tr_b=False``) or NN over ``geom``'s macro tile. NT's
+    operands are K-contiguous, so it supports a partial final K block by masking A's tail.
+    NN keeps its exact-K dispatcher gate because its K-major B has different over-read bounds."""
     BM, BN = geom.bm, geom.bn
     NTHR = _tn4_nthr(geom)
     phases = _tn4_phases(geom)
     # The whole-line epilogue interleaves the n-fragments by permuting B's global row order,
-    # which a K-major B cannot be given; the fold must also divide the wave's n-extent.
+    # which a K-major B cannot be given; the fold must also divide the wave's n-extent. A
+    # ragged column window is fine as long as N is a whole number of runs: the folded store
+    # then masks per run, and the dropped runs' operands were never in range to begin with.
     _bt = sum(p.tiles for p in _tn4_pools(geom) if p.side == geom.gl_side)
-    fold = 0 if tr_b else (geom.fold if col_safe and _bt % geom.fold == 0 else 0)
+    fold = 0 if tr_b else (geom.fold if N % geom.fold == 0 and _bt % geom.fold == 0 else 0)
     _pools = _nt4_pools(geom, fold)
     NBM, NBN = ceildiv(M, BM), ceildiv(N, BN)
     n_tile = NBM * NBN
@@ -2601,10 +2816,19 @@ def _compile_dense_wave4(
     # in twice, so beta=1 gives up residency and takes one tile per group.
     tiles_per_wg = 1 if beta_is_one else ceildiv(n_tile, min(n_tile, _dense_num_cus()))
     n_wg = ceildiv(n_tile, tiles_per_wg)
-    K_ITERS = K // _TN4_BLOCK_K
-    assert K % _TN4_BLOCK_K == 0, "the dense whole loop has no K-tail path"
+    K_ITERS = ceildiv(K, _TN4_BLOCK_K)
+    K_TAIL = K % _TN4_BLOCK_K
     assert K_ITERS >= phases, "the dense whole loop needs a K of at least one main-loop pass"
-    carry = ring and K_ITERS % phases == 0
+    # The ring needs a closing phase outside the shared loop body to redirect, and a successor
+    # to redirect into: a beta=1 tile loop runs once, and K_ITERS%phases==1 peels nothing.
+    carry = ring and tiles_per_wg > 1 and _nt4_spec_phases(K_ITERS, phases, max(p.nbuf for p in _pools)) >= 1
+    # The aligned per-step window needs the tile loop to be a clean grid walk and the rectangle to
+    # tile both axes; anything else keeps the GROUP_M raster. Plain-B only, as the transposed-B
+    # body reads its column block through a different global swizzle.
+    if raster < 0:
+        raster = _nt4_raster(NBM, NBN, group_m, n_tile, n_wg, num_xcd, tr_b)
+    elif not _nt4_window_ok(raster, NBM, NBN, n_tile, n_wg, num_xcd, tr_b):
+        raster = 0
     _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
 
     SharedStorage = fx.struct(
@@ -2648,12 +2872,16 @@ def _compile_dense_wave4(
             N=N,
             K=K,
             K_ITERS=K_ITERS,
+            k_tail=K_TAIL,
+            lane_id=lane_id,
             NBM=NBM,
             NBN=NBN,
             group_m=group_m,
             group_n=group_n,
             num_xcd=num_xcd,
-            store_aux=_CSTORE_AUX,
+            raster=raster,
+            n_wg=n_wg,
+            store_aux=_cstore_aux(beta_is_one, tiles_per_wg, n_wg, BM * BN * _CSTORE_OUT_BYTES),
             lds=lds,
             geom=geom,
             A=A,
@@ -2674,19 +2902,24 @@ def _compile_dense_wave4(
             tr_b=tr_b,
         )
 
+        # Hoisted: inside the tile loop this load's first use pins an s_waitcnt vmcnt(0) into
+        # every epilogue, draining the fills the closing phases issued for the next tile. Plain-B
+        # only, as the transposed-B body cannot keep the value live across the loop.
+        scale = None if tr_b else load_per_tensor_scale(A_scale, B_scale)
+
         if const_expr(carry):
-            w0 = _nt4_tile_window(fx.block_idx.x, M, N, K, NBM, NBN, group_m, group_n, num_xcd, geom, tr_b)
+            w0 = _nt4_tile_window(
+                fx.block_idx.x, M, N, K, NBM, NBN, group_m, group_n, num_xcd, geom, tr_b, raster, n_wg
+            )
             _nt4_prime(
                 _pools,
                 [getattr(lds, f"p{i}") for i in range(len(_pools))],
                 _nt4_g2s(A, B, w0[2], _pools, gl_off, wave_id),
-                _nt4_carry_bufs(_pools, True),
+                _nt4_carry_bufs(_pools, True, K_ITERS, phases),
                 K,
                 _TN4_BLOCK_K * N if tr_b else _TN4_BLOCK_K,
                 tr_b,
             )
-
-        scale = load_per_tensor_scale(A_scale, B_scale) if carry else None
 
         for t in range(fx.Int32(0), fx.Int32(tiles_per_wg), fx.Int32(1)):
             d = fx.block_idx.x + t * n_wg
@@ -2719,7 +2952,7 @@ def _compile_dense_wave4(
     return launch_dense_wave4
 
 
-_compile_dense_nt_wave4 = functools.partial(_compile_dense_wave4, tr_b=False, ring=False)
+_compile_dense_nt_wave4 = functools.partial(_compile_dense_wave4, tr_b=False, ring=True)
 _compile_dense_nn_wave4 = functools.partial(_compile_dense_wave4, tr_b=True, ring=True)
 
 
@@ -2785,6 +3018,16 @@ def _dense_beta1_entry(cache, key, tuned):
     return entry
 
 
+def _dense_tuned(cache, key, beta_is_one):
+    """The config already tuned for this shape, or None on a first call. It spares every later
+    launch the candidate list its dispatch would assemble -- one partial per candidate, plus the
+    geometry gating -- which only the first-call race reads."""
+    tuned = cache.get(key)
+    if tuned is None:
+        return None
+    return _dense_beta1_entry(cache, key, tuned) if beta_is_one else tuned
+
+
 def _dense_race(cache, key, args, layout, builders, beta_is_one):
     """First-call race of ``builders`` -- (cfg, factory) pairs -- with the winner cached by
     ``key``. A candidate that fails to build, or whose output sample is not finite, is dropped
@@ -2811,16 +3054,16 @@ def _dense_race(cache, key, args, layout, builders, beta_is_one):
 
 
 def _pick_dense_candidate(cands, args):
-    """Fastest of ``cands`` = [[launch, cfg, compiled, factory], ...], sampled twice with the second
-    pass reversed and kept at its min, behind a throwaway pass: the leading candidates sit
-    closer than one sample's spread, so otherwise clock drift and warm-up do the ranking."""
+    """Fastest of ``cands`` = [[launch, cfg, compiled, factory], ...], sampled over reversed
+    passes and kept at its min, behind a throwaway pass: the leading candidates sit closer than
+    one sample's spread, so too few passes let clock drift and warm-up do the ranking."""
     for _ in range(_PICK_RAMP_ITERS):
         cands[0][2](*args)
     torch.cuda.synchronize()
     order = list(range(len(cands)))
     ts = [float("inf")] * len(cands)
-    for i in order + order[::-1]:
-        ts[i] = min(ts[i], _robust_time(cands[i][2], args, warmup=2, reps=2, iters=40))
+    for i in (order + order[::-1]) * _PICK_PASSES:
+        ts[i] = min(ts[i], _robust_time(cands[i][2], args, warmup=2, reps=3, iters=40))
     return cands[min(order, key=ts.__getitem__)]
 
 
@@ -2842,13 +3085,13 @@ def _dense_operand(t: torch.Tensor) -> torch.Tensor:
 
 
 def _scalar_scale(scale: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """Tensorwise scalar -> length-1 fp32 buffer (no broadcast): the kernel applies the
-    single value per-tensor, so only an fp32/device cast is needed. A conforming buffer is
-    returned as is, since .to()/.reshape() are no-ops on it but still cost two dispatches."""
-    if scale.dtype is torch.float32 and scale.shape == (1,) and scale.device == device:
-        return scale
+    """Tensorwise scalar -> length-1 fp32 buffer (no broadcast): the kernel applies the single
+    value per-tensor, so only an fp32/device cast is needed. Each step is skipped where it is a
+    no-op, since even a no-op .to()/.reshape() costs a dispatch inside every launch."""
     assert scale.numel() == 1, f"per-tensor expects scalar, got {scale.shape}"
-    return scale.to(dtype=torch.float32, device=device).reshape(1)
+    if scale.dtype is not torch.float32 or scale.device != device:
+        scale = scale.to(dtype=torch.float32, device=device)
+    return scale if scale.shape == (1,) else scale.reshape(1)
 
 
 # (BLOCK_M, GROUP_M, group_n, num_xcd, AGPR), keyed on whether the whole loop is eligible:
@@ -2862,6 +3105,8 @@ _NN_CANDIDATES = {
 # XCD group count is left to spread the rows.
 _NN4_MIN_K_ITERS = 16
 _NN4_BANDS = [(2, 0, 2), (4, 8, 8)]  # (GROUP_M, group_n, num_xcd) the whole loop races
+# Pinned, not raced: unremapped ids are free on a shallow K, costly on a deep one -- unrankable.
+_NN4_RECT_BANDS = [(4, 0, 8)]
 _NN_AUTOTUNE_CACHE: dict = {}
 
 
@@ -2870,6 +3115,10 @@ def _autotune_nn_dispatch(
 ):
     """NN candidates for the shape, raced on first call (see _dense_race). ``i64_traverse``
     re-bases B's SRD per load, lifting the k*n < 2^32 cap."""
+    key = (M, N, K, cbsz, blgp, out_fp16, i64_traverse)
+    hit = _dense_tuned(_NN_AUTOTUNE_CACHE, key, beta_is_one)
+    if hit is not None:
+        return hit
     pair_n, col_safe = N % 2 == 0 and not out_fp16, N % 256 == 0
     w4 = not i64_traverse and K % _TN4_BLOCK_K == 0 and K // _TN4_BLOCK_K >= _NN4_MIN_K_ITERS
     builders = [
@@ -2902,7 +3151,7 @@ def _autotune_nn_dispatch(
     if w4:
         builders += [
             (
-                ("nn4", gm, gn, xcd),
+                ("nn4", geom.bn, gm, gn, xcd),
                 functools.partial(
                     _compile_dense_nn_wave4,
                     M,
@@ -2911,16 +3160,17 @@ def _autotune_nn_dispatch(
                     group_m=gm,
                     group_n=gn,
                     num_xcd=xcd,
+                    geom=geom,
                     cbsz=cbsz,
                     blgp=blgp,
                     out_fp16=out_fp16,
                     pair_n=pair_n,
-                    col_safe=col_safe,
+                    col_safe=N % geom.bn == 0,
                 ),
             )
-            for gm, gn, xcd in _NN4_BANDS
+            for geom, bands in _nt4_geoms(M, N, beta_is_one, _NN4_BANDS, _NN4_RECT_BANDS)
+            for gm, gn, xcd in bands
         ]
-    key = (M, N, K, cbsz, blgp, out_fp16, i64_traverse)
     return _dense_race(_NN_AUTOTUNE_CACHE, key, args, "NN", builders, beta_is_one)
 
 
@@ -2941,14 +3191,20 @@ _NT_CANDIDATES = {
 # writes it a whole line at a time, which pays off even on the short-K shapes.
 _NT4_MIN_K_ITERS = 16
 _NT4_BANDS = [(2, 1), (4, 8)]  # (GROUP_M, num_xcd) the whole loop races
+# One band, not two: the candidates sit inside the race's own spread, so a second only misranks.
+_NT4_RECT_BANDS = [(4, 8)]
 _NT_AUTOTUNE_CACHE: dict = {}
 
 
 def _autotune_nt_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False, beta_is_one=False):
     """NT candidates for the shape, raced on first call (see _dense_race). The 8-wave tiles are
     joined by the 4-wave whole-loop on the long-K shapes whose steady state pays for it."""
+    key = (M, N, K, cbsz, blgp, out_fp16)
+    hit = _dense_tuned(_NT_AUTOTUNE_CACHE, key, beta_is_one)
+    if hit is not None:
+        return hit
     pair_n, col_safe = N % 2 == 0 and not out_fp16, N % 256 == 0
-    w4 = K % _TN4_BLOCK_K == 0 and K // _TN4_BLOCK_K >= _NT4_MIN_K_ITERS
+    w4 = ceildiv(K, _TN4_BLOCK_K) >= _NT4_MIN_K_ITERS
     wide = 4 * 256 * K > _NT_BAND_L2_BYTES  # GROUP_M * BLOCK_M * K of the leading cfg
     builders = [
         (
@@ -2973,7 +3229,7 @@ def _autotune_nt_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False, beta_is
     if w4:
         builders += [
             (
-                ("nt4", gm, xcd),
+                ("nt4", geom.bn, gm, xcd),
                 functools.partial(
                     _compile_dense_nt_wave4,
                     M,
@@ -2981,16 +3237,17 @@ def _autotune_nt_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False, beta_is
                     K,
                     group_m=gm,
                     num_xcd=xcd,
+                    geom=geom,
                     cbsz=cbsz,
                     blgp=blgp,
                     out_fp16=out_fp16,
                     pair_n=pair_n,
-                    col_safe=col_safe,
+                    col_safe=N % geom.bn == 0,
                 ),
             )
-            for gm, xcd in _NT4_BANDS
+            for geom, bands in _nt4_geoms(M, N, beta_is_one, _NT4_BANDS, _NT4_RECT_BANDS)
+            for gm, xcd in bands
         ]
-    key = (M, N, K, cbsz, blgp, out_fp16)
     return _dense_race(_NT_AUTOTUNE_CACHE, key, args, "NT", builders, beta_is_one)
 
 
@@ -2998,7 +3255,6 @@ _TN_WAVE4_CACHE: dict = {}
 _TN4_WS_CACHE: dict = {}
 _TN4_FLAG_CACHE: dict = {}
 _TN4_PLAN_CACHE: dict = {}
-_TN4_MS_MARGIN = 1.05  # makespan spread inside which the model does not order the macro tiles
 _TN4_XCD = 8  # XCDs the dispatcher round-robins over; each fills a private L2 slice
 
 
@@ -3037,17 +3293,11 @@ def _tn4_geom_split(M, N, K, ncu, geom):
     )
 
 
-def _tn4_makespan(M, N, K, ncu, geom):
-    """Device time one geometry needs for this shape, in macro-tile cells: full tiles retire
-    ncu at a time and the split-K window's slices, being 1/s of a tile each, share the rounds
-    they land in. It only orders the candidates; the race is what picks one."""
-    tiles = ceildiv(M, geom.bm) * ceildiv(N, geom.bn)
-    cells = geom.bm * geom.bn
-    split = _tn4_geom_split(M, N, K, ncu, geom)
-    if split is None:
-        return ceildiv(tiles, ncu) * cells
-    lo, n, s = split
-    return (lo // ncu) * cells + _tn4_split_rounds(tiles, n, s, ncu) * cells / s
+def _tn4_rounds(M, N, ncu, geom):
+    """Whole CU passes this geometry's tiles occupy. The split-K window only slices the last
+    pass's remainder across the CUs it leaves idle, so it fills a pass rather than removing
+    one, and the count is the geometry's own."""
+    return ceildiv(ceildiv(M, geom.bm) * ceildiv(N, geom.bn), ncu)
 
 
 def _tn4_grid(M, N, K, ncu, geom):
@@ -3065,18 +3315,17 @@ def _tn4_grid(M, N, K, ncu, geom):
 
 
 def _tn4_plan(M, N, K, ncu):
-    """Whole-loop macro tiles for one TN shape, most promising first, with the scratch bands
-    and flags the widest needs. Ordered by predicted makespan, ties going to the smaller grid.
-    Memoised because the steady-state launch path reads it on every call."""
+    """Whole-loop macro tiles for one TN shape, most promising first, with the scratch bands and
+    flags the widest needs. The CU passes they occupy order them; that only orders the race,
+    which is what picks one. Memoised because every launch reads it."""
     key = (M, N, K, ncu)
     plan = _TN4_PLAN_CACHE.get(key)
     if plan is None:
         scored = []
-        for g in _TN4_GEOMS:
-            grid, bands, flags = _tn4_grid(M, N, K, ncu, g)
-            scored.append((_tn4_makespan(M, N, K, ncu, g), grid, bands, flags, g))
-        lo = min(s[0] for s in scored)
-        scored.sort(key=lambda s: (s[0] > lo * _TN4_MS_MARGIN, s[1]))
+        for rank, g in enumerate(_TN4_GEOMS):
+            _grid, bands, flags = _tn4_grid(M, N, K, ncu, g)
+            scored.append((_tn4_rounds(M, N, ncu, g), rank, bands, flags, g))
+        scored.sort(key=lambda s: s[:2])
         plan = (
             tuple(s[4] for s in scored),
             max(s[2] for s in scored),
@@ -3155,6 +3404,10 @@ def _autotune_tn_dispatch(
     L2-resident shapes pick num_xcd=1. ``i64_traverse`` re-bases A's and B's
     SRDs per load (lifts the k*m / k*n < 2^32 cap; threaded to _compile_dense_tn).
     """
+    key = (M, N, K, cbsz, blgp, out_fp16, i64_traverse)
+    hit = _dense_tuned(_TN_AUTOTUNE_CACHE, key, beta_is_one)
+    if hit is not None:
+        return hit
     bm = 256
     builders = [
         (
@@ -3176,7 +3429,6 @@ def _autotune_tn_dispatch(
         )
         for xcd in (8, 1)
     ]
-    key = (M, N, K, cbsz, blgp, out_fp16, i64_traverse)
     return _dense_race(_TN_AUTOTUNE_CACHE, key, args, "TN", builders, beta_is_one)
 
 

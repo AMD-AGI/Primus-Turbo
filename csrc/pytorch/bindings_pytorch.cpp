@@ -32,7 +32,8 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
 
     // ********* Quantization *********
     m.def("quantize_fp8_tensorwise(Tensor input, ScalarType dest_dtype, Tensor? scale_opt=None, "
-          "int padding_align_size=128, int pad_penultimate_align_size=1) -> Tensor[]");
+          "int padding_align_size=128, int pad_penultimate_align_size=1, "
+          "Tensor? amax_partials=None) -> Tensor[]");
     m.def("quantize_fp8_rowwise(Tensor input, ScalarType dest_dtype, int axis, Tensor? "
           "scale_opt=None) -> Tensor[]");
     m.def("quantize_fp8_blockwise_segment_m_row_col(Tensor input, ScalarType dest_dtype, "
@@ -54,20 +55,23 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "bool rowwise_use_2d_block, bool rowwise_use_sr, bool rowwise_use_rht, "
           "bool colwise_use_2d_block, bool colwise_use_sr, bool colwise_use_rht, "
           "bool shuffle_rowwise_scale=False, bool shuffle_rowwise=False, "
-          "bool shuffle_colwise_scale=False, bool shuffle_colwise=False) -> Tensor[]");
+          "bool shuffle_colwise_scale=False, bool shuffle_colwise=False, "
+          "int scale_rounding_mode=0) -> Tensor[]");
     m.def("quantize_mxfp4(Tensor input, ScalarType dest_dtype, int axis, "
           "int padding_align_size, "
           "bool use_2d_block, bool use_sr, bool use_rht, "
-          "bool shuffle_scale=False, bool shuffle_out=False) -> Tensor[]");
+          "bool shuffle_scale=False, bool shuffle_out=False, "
+          "int scale_rounding_mode=0) -> Tensor[]");
     m.def("dequantize_mxfp4(Tensor input, Tensor scale_inv, int axis, int block_size, "
           "ScalarType dest_dtype) -> Tensor");
     m.def("grouped_quantize_mxfp4_dual(Tensor input, Tensor group_lens, Tensor group_offs, "
           "ScalarType dest_dtype, "
           "bool rowwise_use_2d_block, bool rowwise_use_sr, bool rowwise_use_rht, "
-          "bool colwise_use_2d_block, bool colwise_use_sr, bool colwise_use_rht) -> Tensor[]");
+          "bool colwise_use_2d_block, bool colwise_use_sr, bool colwise_use_rht, "
+          "int scale_rounding_mode=0) -> Tensor[]");
     m.def("grouped_quantize_mxfp4(Tensor input, Tensor group_lens, Tensor group_offs, "
           "ScalarType dest_dtype, int axis, "
-          "bool use_2d_block, bool use_sr, bool use_rht) -> Tensor[]");
+          "bool use_2d_block, bool use_sr, bool use_rht, int scale_rounding_mode=0) -> Tensor[]");
 
     // ********* MXFP8 Quantization *********
     m.def("quantize_mxfp8_dual(Tensor input, ScalarType dest_dtype, "

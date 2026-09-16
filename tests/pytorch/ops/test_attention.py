@@ -19,7 +19,7 @@ from primus_turbo.pytorch.core.backend import (
     GlobalBackendManager,
     PrecisionType,
 )
-from primus_turbo.pytorch.core.utils import is_gfx950
+from primus_turbo.pytorch.core.utils import is_gfx950, is_gfx1250
 from primus_turbo.pytorch.kernels.attention import attention_gluon_impl, attention_impl
 from primus_turbo.pytorch.kernels.attention.attention_impl import (
     resolve_flash_attn_backend,
@@ -1650,3 +1650,102 @@ def test_attention_hipkittens_envelope(case, needle):
 
     ok, why = hipkittens_attn_supported(q, k, v, **kw)
     assert not ok and needle in why, f"expected a refusal mentioning {needle!r}, got {ok} / {why!r}"
+
+
+# ---------------------------------------------------------------------------
+# Dense Triton backend (gfx1250)
+# ---------------------------------------------------------------------------
+
+
+def _triton_gate(monkeypatch, **kwargs):
+    """Run DenseAttnFwdTritonBackend.can_handle as if we were on gfx1250.
+
+    The gating rules are arch-independent, but can_handle short-circuits on is_gfx1250()
+    first, so on any other card every case below would pass for the wrong reason.
+    """
+    monkeypatch.setattr(attention_impl, "is_gfx1250", lambda: True)
+    q = kwargs.pop("q", None)
+    if q is None:
+        q = torch.empty(1, 8, 4, 64, dtype=torch.bfloat16)
+    args = dict(k=torch.empty_like(q), v=torch.empty_like(q), qkv_format="bshd")
+    args.update(kwargs)
+    return attention_impl.DenseAttnFwdTritonBackend.can_handle(q, **args)
+
+
+def test_triton_dense_gate_accepts_a_plain_causal_call(monkeypatch):
+    assert _triton_gate(monkeypatch) is True
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        {"dropout_p": 0.1},
+        {"bias": torch.empty(1)},
+        {"alibi_slopes": torch.empty(4)},
+        {"return_softmax": True},
+        {"k": None},
+        {"v": None},
+    ],
+    ids=["dropout", "bias", "alibi", "return_softmax", "no_k", "no_v"],
+)
+def test_triton_dense_gate_refuses_what_the_kernel_lacks(monkeypatch, unsupported):
+    # Each of these would otherwise be ignored and quietly answer a different problem.
+    assert _triton_gate(monkeypatch, **unsupported) is False
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.int8], ids=["fp32", "int8"])
+def test_triton_dense_gate_refuses_unsupported_dtypes(monkeypatch, dtype):
+    assert _triton_gate(monkeypatch, q=torch.empty(1, 8, 4, 64, dtype=dtype)) is False
+
+
+@pytest.mark.parametrize("sink_dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_triton_dense_gate_takes_a_sink_of_any_float_dtype(monkeypatch, sink_dtype):
+    # The adapter casts the sink to fp32 itself. Requiring fp32 here would push a bf16 sink
+    # -- gpt-oss trains with one -- back to aiter, i.e. to CK on gfx1250.
+    assert _triton_gate(monkeypatch, sink=torch.empty(4, dtype=sink_dtype)) is True
+
+
+@pytest.mark.parametrize("numel", [3, 5], ids=["too_few", "too_many"])
+def test_triton_dense_gate_refuses_a_sink_that_is_not_per_head(monkeypatch, numel):
+    assert _triton_gate(monkeypatch, sink=torch.empty(numel, dtype=torch.float32)) is False
+
+
+def test_triton_dense_gate_is_off_outside_gfx1250(monkeypatch):
+    monkeypatch.setattr(attention_impl, "is_gfx1250", lambda: False)
+    q = torch.empty(1, 8, 4, 64, dtype=torch.bfloat16)
+    assert (
+        attention_impl.DenseAttnFwdTritonBackend.can_handle(
+            q, k=torch.empty_like(q), v=torch.empty_like(q), qkv_format="bshd"
+        )
+        is False
+    )
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx1250()),
+    reason="the dense Triton backend is validated on gfx1250 only",
+)
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_triton_dense_backend_matches_the_reference(causal, dtype):
+    """Pinned TRITON, forward and backward, against the fp32 reference."""
+    b, s, hq, hkv, d = 2, 256, 8, 2, 64
+    dev = "cuda"
+    q, k, v = (torch.randn(b, s, h, d, device=dev, dtype=dtype, requires_grad=True) for h in (hq, hkv, hkv))
+    grad_out = torch.randn(b, s, hq, d, device=dev, dtype=dtype)
+
+    GlobalBackendManager.set_attn_backend(BackendType.TRITON, PrecisionType.BF16_FP16_FP32)
+    try:
+        out = flash_attn_func(q, k, v, causal=causal)
+        out.backward(grad_out)
+    finally:
+        GlobalBackendManager.set_attn_backend(None, PrecisionType.BF16_FP16_FP32)
+
+    qr, kr, vr = (t.detach().float().requires_grad_(True) for t in (q, k, v))
+    out_ref = attention_vanilla_forward_pytorch_ref_impl(qr, kr, vr, d**-0.5, causal, qkv_format="bshd")
+    out_ref.backward(grad_out.float())
+
+    assert compute_snr(out_ref, out.float()) > 40.0
+    assert compute_snr(qr.grad, q.grad.float()) > 40.0
+    assert compute_snr(kr.grad, k.grad.float()) > 40.0
+    assert compute_snr(vr.grad, v.grad.float()) > 40.0

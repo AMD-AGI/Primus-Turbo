@@ -151,6 +151,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
                     block_size=MXFP4_BLOCK_SIZE,
                     scaling_recipe=a_scaling_recipe,
                     scaling_recipe_for_trans=a_t_scaling_recipe,
+                    scale_rounding_mode=config.scale_rounding_mode,
                 )
             )
         else:
@@ -167,10 +168,12 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
                     block_size=config.block_size,
                     scaling_recipe=a_t_scaling_recipe,
                     group_lens=group_lens,
+                    scale_rounding_mode=config.scale_rounding_mode,
                 )
             else:
                 assert isinstance(a_t, QuantizedTensor)
                 quantized_a_t = a_t
+                check_quantized_tensor(quantized_a_t, config, axis=-2, scaling_recipe=a_t_scaling_recipe)
             a_col, a_col_scale = quantized_a_t.qdata, quantized_a_t.scale_inv
 
         # --- B: 3D weight (G, N, K). row-wise (rht=F) is the fwd operand; col-wise
@@ -184,6 +187,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
                 block_size=MXFP4_BLOCK_SIZE,
                 scaling_recipe=b_scaling_recipe,
                 scaling_recipe_for_trans=b_t_scaling_recipe,
+                scale_rounding_mode=config.scale_rounding_mode,
             )
         else:
             quantized_b = b
@@ -197,10 +201,12 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
                     axis=-2,
                     block_size=config.block_size,
                     scaling_recipe=b_t_scaling_recipe,
+                    scale_rounding_mode=config.scale_rounding_mode,
                 )
             else:
                 assert isinstance(b_t, QuantizedTensor)
                 quantized_b_t = b_t
+                check_quantized_tensor(quantized_b_t, config, axis=-2, scaling_recipe=b_t_scaling_recipe)
 
             b_row, b_row_scale = quantized_b.qdata, quantized_b.scale_inv
             b_col, b_col_scale = quantized_b_t.qdata, quantized_b_t.scale_inv
@@ -263,6 +269,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
             block_size=ctx.config.block_size,
             scaling_recipe=grad_out_scaling_recipe,
             scaling_recipe_for_trans=grad_out_t_scaling_recipe,
+            scale_rounding_mode=ctx.config.scale_rounding_mode,
         )
 
         # --- dgrad: grad_a = gradO_row(rht=F) @ B_col(rht=F)^T, contract N -> [total_m, K] ---

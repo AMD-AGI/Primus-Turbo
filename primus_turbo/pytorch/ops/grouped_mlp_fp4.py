@@ -57,7 +57,18 @@ from primus_turbo.pytorch.ops.utils import (
 __all__ = ["grouped_mlp_fp4"]
 
 
-_SUPPORTED_ACTIVATIONS = ("silu",)
+_SUPPORTED_ACTIVATIONS = ("silu", "gelu")
+
+
+def _check_activation(activation: str, clamp_limit: Union[None, float]) -> Union[None, float]:
+    assert activation in _SUPPORTED_ACTIVATIONS, (
+        f"Unsupported activation: {activation!r}, expected one of {_SUPPORTED_ACTIVATIONS}"
+    )
+    if clamp_limit is None:
+        return None
+    clamp_limit = float(clamp_limit)
+    assert clamp_limit > 0.0, f"clamp_limit must be positive, got {clamp_limit}"
+    return clamp_limit
 
 
 def _wgrad_grouped_gemm_fp4_impl_wrapper(
@@ -114,6 +125,7 @@ def _quantize_weight(
             block_size=MXFP4_BLOCK_SIZE,
             scaling_recipe=recipe,
             scaling_recipe_for_trans=recipe,
+            scale_rounding_mode=config.scale_rounding_mode,
         )
 
     assert not w._is_grouped_tensor, "an expert weight must not be a grouped tensor"
@@ -126,9 +138,11 @@ def _quantize_weight(
             axis=-2,
             block_size=config.block_size,
             scaling_recipe=recipe,
+            scale_rounding_mode=config.scale_rounding_mode,
         )
     else:
         assert isinstance(w_t, QuantizedTensor)
+        check_quantized_tensor(w_t, config, axis=-2, scaling_recipe=recipe)
     return w.qdata, w.scale_inv, w_t.qdata, w_t.scale_inv
 
 
@@ -150,14 +164,13 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
         trans_w1: bool,
         trans_w2: bool,
         activation: str,
+        clamp_limit: Union[None, float],
         out_dtype: torch.dtype,
         config: Float4QuantConfig,
         num_cu: int | None,
         fuse_wgrad_accum_pattern: Union[None, str] = None,
     ):
-        assert activation in _SUPPORTED_ACTIVATIONS, (
-            f"Unsupported activation: {activation!r}, expected one of {_SUPPORTED_ACTIVATIONS}"
-        )
+        clamp_limit = _check_activation(activation, clamp_limit)
         # MXFP4 has no non-NT layout, so the weights can only be given as
         # w1 [G, 2I, K] / w2 [G, K_out, I], which is what both flags being set means.
         assert trans_w1 and trans_w2, (
@@ -198,6 +211,7 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
                 block_size=MXFP4_BLOCK_SIZE,
                 scaling_recipe=x_scaling_recipe,
                 scaling_recipe_for_trans=x_t_scaling_recipe,
+                scale_rounding_mode=config.scale_rounding_mode,
             )
         else:
             check_quantized_tensor(x, config, axis=-1, scaling_recipe=x_scaling_recipe)
@@ -212,9 +226,11 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
                     block_size=config.block_size,
                     scaling_recipe=x_t_scaling_recipe,
                     group_lens=group_lens,
+                    scale_rounding_mode=config.scale_rounding_mode,
                 )
             else:
                 assert isinstance(x_t, QuantizedTensor)
+                check_quantized_tensor(x_t, config, axis=-2, scaling_recipe=x_t_scaling_recipe)
             x_col, x_col_scale = x_t.qdata, x_t.scale_inv
 
         w1_row, w1_row_scale, w1_col, w1_col_scale = _quantize_weight(w1, w1_t, config)
@@ -239,6 +255,7 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
             out_row_scaling_recipe=ScalingRecipe(),
             out_col_scaling_recipe=ScalingRecipe(use_rht=True),
             activation=activation,
+            clamp_limit=clamp_limit,
         )
 
         out = grouped_gemm_fp4_impl(
@@ -272,6 +289,7 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
             group_offs,
         )
         ctx.activation = activation
+        ctx.clamp_limit = clamp_limit
         ctx.config = config
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
@@ -320,6 +338,7 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
             block_size=ctx.config.block_size,
             scaling_recipe=ScalingRecipe(use_sr=sr),
             scaling_recipe_for_trans=ScalingRecipe(use_sr=sr, use_rht=True),
+            scale_rounding_mode=ctx.config.scale_rounding_mode,
         )
 
         # grad_w2 = gradO_col(rht=T) @ act_col(rht=T)^T, contracting M.
@@ -358,6 +377,7 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
             out_row_scaling_recipe=ScalingRecipe(use_sr=sr),
             out_col_scaling_recipe=ScalingRecipe(use_sr=sr, use_rht=True),
             activation=ctx.activation,
+            clamp_limit=ctx.clamp_limit,
         )
         gl_offs_row, gl_lens_col, gl_offs_col = group_offs, go_lens_col, go_offs_col
 
@@ -405,6 +425,7 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
             None,  # trans_w1
             None,  # trans_w2
             None,  # activation
+            None,  # clamp_limit
             None,  # out_dtype
             None,  # config
             None,  # num_cu
@@ -434,8 +455,9 @@ def grouped_mlp_fp4(
     num_cu: int | None = None,
     fuse_wgrad_accum_pattern: Union[None, str] = None,
     activation: Union[None, str] = None,
+    clamp_limit: Union[None, float] = None,
 ) -> torch.Tensor:
-    """MoE expert MLP in MXFP4: ``fc2(silu(gate) * up * probs)`` over ``group_lens``.
+    """MoE expert MLP in MXFP4: ``fc2(f(gate) * up * probs)`` over ``group_lens``.
 
     Args:
         x: [total_m, K] activations, grouped along M. May instead be a
@@ -450,6 +472,11 @@ def grouped_mlp_fp4(
             the col-wise dgrad operand and so carries no RHT.
         probs: [total_m] float32 routing probabilities. Required -- the fused
             epilogues always scale by it and reduce its gradient.
+        activation: the gate ``f``, one of ``_SUPPORTED_ACTIVATIONS``. ``"gelu"`` is
+            the tanh approximation, i.e. ``F.gelu(approximate="tanh")``.
+        clamp_limit: DeepSeek-V4's pre-multiplication clamp bound ``L``, or None for no
+            clamp. With it the activation is ``f(min(gate, L)) * clamp(up, -L, L)``,
+            whose backward is straight-through.
 
     Returns:
         [total_m, K_out] in ``out_dtype``.
@@ -457,9 +484,7 @@ def grouped_mlp_fp4(
     if config is None:
         config = Float4QuantConfig()
 
-    assert activation in _SUPPORTED_ACTIVATIONS, (
-        f"Unsupported activation: {activation!r}, expected one of {_SUPPORTED_ACTIVATIONS}"
-    )
+    clamp_limit = _check_activation(activation, clamp_limit)
     assert probs is not None, "probs is required: the fused GLU epilogues always scale by it"
 
     if group_offs is None:
@@ -500,6 +525,7 @@ def grouped_mlp_fp4(
         trans_w1,
         trans_w2,
         activation,
+        clamp_limit,
         out_dtype,
         config,
         num_cu,

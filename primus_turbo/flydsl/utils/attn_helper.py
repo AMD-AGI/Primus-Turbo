@@ -380,8 +380,10 @@ def _make_dualwave_swp_traits(
     """Build gfx950 DUALWAVE_SWP compile-time layout traits."""
     rows_per_wave = 32
     warp_size = 64
+    # Windowed default BLOCK_M=64 (fewer masked KV tiles; also avoids waves_per_eu=4).
+    # Dense default stays 256. Callers can still pass block_m explicitly.
     if block_m is None:
-        block_m = 256
+        block_m = 64 if int(window_left) >= 0 else 256
     wave_row_groups = block_m // rows_per_wave
     block_n = 64
     k_sub_n = 32
@@ -716,20 +718,9 @@ class DualwaveKernelContext:
         else:
             self.lse_rsrc = None
 
-        # Learned attention sink: one fp32 scalar per q-head, folded into the online-softmax
-        # denominator in the epilogue (virtual key with logit=sink_h, value=0). q_head_idx is
-        # wave-uniform, so this is a scalar load shared by all lanes of the wave.
-        if const_expr(traits.HAS_SINK):
-            _sink_rsrc = buffer_ops.create_buffer_resource(
-                self.SINK,
-                max_size=False,
-                num_records_bytes=as_mlir_value(fx.Index(traits.NUM_HEADS_Q) * fx.Index(4)),
-            )
-            self.sink_h = fx.Float32(
-                buffer_ops.buffer_load(_sink_rsrc, self.q_head_idx, vec_width=1, dtype=fx.Float32)
-            )
-        else:
-            self.sink_h = None
+        # Sink is loaded in the epilogue (`load_sink_h`), not here: a prologue load stays
+        # live across the KV loop and spills ~112 B of scratch on the sink+LSE build.
+        self.sink_h = None
 
         self.load_atom_128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
         self.store_atom_128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
@@ -768,27 +759,36 @@ class DualwaveKernelContext:
             self.causal_end_raw_i32 = None
             self.max_num_tiles = self.num_kv_tiles
 
-        self.max_num_tiles = ((self.max_num_tiles + fx.Index(1)) // fx.Index(2)) * fx.Index(2)
-        self.max_num_tiles = fx.Index(
-            ArithValue(self.max_num_tiles < fx.Index(4)).select(fx.Index(4), self.max_num_tiles)
-        )
-
         if const_expr(traits.CAUSAL and traits.WINDOW_LEFT >= 0):
-            # SWA: start at the first KV tile that can intersect the left window; the base
-            # must stay even (buf0 parity) and leave >= 4 tiles for the pipeline.
+            # Keep an odd KV span: two-tile drain admits N in {3,5,7,...}; even-rounding
+            # added a fourth tile that the window mask then threw away.
+            self.max_num_tiles = fx.Index(
+                ArithValue(self.max_num_tiles < fx.Index(3)).select(fx.Index(3), self.max_num_tiles)
+            )
+            # SWA: start at the first KV tile that can intersect the left window, leaving
+            # >= 3 tiles for the pipeline.
             swa_lo_raw = fx.Int32(self.q_start) + self.delta_i32 - fx.Int32(traits.WINDOW_LEFT)
             swa_lo_raw = fx.Int32(ArithValue(swa_lo_raw > fx.Int32(0)).select(swa_lo_raw, fx.Int32(0)))
             swa_lo_tile = fx.Index(swa_lo_raw) // fx.Index(traits.BLOCK_N)
-            swa_lo_tile = (swa_lo_tile // fx.Index(2)) * fx.Index(2)
             max_lo = fx.Index(
-                ArithValue(self.max_num_tiles > fx.Index(4)).select(
-                    self.max_num_tiles - fx.Index(4), fx.Index(0)
+                ArithValue(self.max_num_tiles > fx.Index(3)).select(
+                    self.max_num_tiles - fx.Index(3), fx.Index(0)
                 )
             )
             swa_lo_tile = fx.Index(ArithValue(swa_lo_tile < max_lo).select(swa_lo_tile, max_lo))
-            self.split_t0 = swa_lo_tile
-            self.split_t_end = self.max_num_tiles
+            # If the span is even, grow by one tile. Prefer downward (window-masked);
+            # at tile 0 grow upward (causal-masked).
+            span = self.max_num_tiles - swa_lo_tile
+            span_odd = span - (span // fx.Index(2)) * fx.Index(2)
+            grow = fx.Index(1) - span_odd
+            down = fx.Index(ArithValue(swa_lo_tile > fx.Index(0)).select(grow, fx.Index(0)))
+            self.split_t0 = swa_lo_tile - down
+            self.split_t_end = self.max_num_tiles + (grow - down)
         else:
+            self.max_num_tiles = ((self.max_num_tiles + fx.Index(1)) // fx.Index(2)) * fx.Index(2)
+            self.max_num_tiles = fx.Index(
+                ArithValue(self.max_num_tiles < fx.Index(4)).select(fx.Index(4), self.max_num_tiles)
+            )
             self.split_t0 = 0
             self.split_t_end = self.max_num_tiles
 
@@ -919,6 +919,60 @@ class DualwaveKernelContext:
             v_s_hi = _mfma_acc(k_hi[ks], q_pack, v_s_hi, self.mma_atom, self.mfma_acc_vec_type)
         return (v_s_lo, v_s_hi)
 
+    # Skip a 32-col QK half that is wholly -inf for this wave (window/causal edge).
+    # Predicates are wave-uniform; the mask still writes -inf over skipped accs.
+    def chunk_live(self, tile_idx):
+        traits = self.traits
+        kv0 = fx.Int32(self.tile_start(tile_idx))
+        q_lo = fx.Int32(self.q_start_pos_i32 + self.delta_i32)
+        q_hi = fx.Int32(q_lo + fx.Int32(traits.ROWS_PER_WAVE - 1))
+        live_hi = ArithValue(fx.Int32(kv0 + fx.Int32(32)) <= q_hi)
+        if const_expr(traits.WINDOW_LEFT >= 0):
+            win_lo = fx.Int32(q_lo - fx.Int32(traits.WINDOW_LEFT))
+            live_lo = ArithValue(fx.Int32(kv0 + fx.Int32(31)) >= win_lo)
+        else:
+            # Dense causal: LO half is dead when kv0 already exceeds the wave's last q row.
+            live_lo = ArithValue(kv0 <= q_hi)
+        return live_lo, live_hi
+
+    def qk_live(self, v_k, q_all_scaled_bf16, live_lo, live_hi, v_s=None, ks_range=None):
+        k_lo, k_hi = v_k
+        traits = self.traits
+        ks_lo, ks_hi = (0, traits.K_STEPS_QK) if ks_range is None else ks_range
+        if v_s is None:
+            s_lo_in, s_hi_in = self.c_zero_v16f32, self.c_zero_v16f32
+        else:
+            s_lo_in, s_hi_in = v_s
+
+        def _chain(k_part, acc):
+            for ks in range_constexpr(ks_lo, ks_hi):
+                _q_vec = Vec(q_all_scaled_bf16)
+                _base = ks * traits.MFMA_LANE_K
+                q_pack = _q_vec.shuffle(_q_vec, [_base + i for i in range(traits.MFMA_LANE_K)]).ir_value()
+                acc = _mfma_acc(k_part[ks], q_pack, acc, self.mma_atom, self.mfma_acc_vec_type)
+            return acc
+
+        if live_lo is None:
+            v_s_lo = _chain(k_lo, s_lo_in)
+        else:
+
+            @flyc.jit
+            def _qk_lo(v_s_lo, live_lo):
+                if live_lo:
+                    v_s_lo = _chain(k_lo, v_s_lo)
+                return v_s_lo
+
+            v_s_lo = _qk_lo(s_lo_in, live_lo)
+
+        @flyc.jit
+        def _qk_hi(v_s_hi, live_hi):
+            if live_hi:
+                v_s_hi = _chain(k_hi, v_s_hi)
+            return v_s_hi
+
+        v_s_hi = _qk_hi(s_hi_in, live_hi)
+        return (v_s_lo, v_s_hi)
+
     def pv_step_k(self, step, v_p, v_v, v_o):
         v_p_lo, v_p_hi = v_p
         v_pk = v_v[step]
@@ -1013,6 +1067,16 @@ class DualwaveKernelContext:
         l_inv = rocdl.rcp(T.f32, as_mlir_value(l_row))
         return ArithValue(fx.Float32(l_row) > self.c_zero_f).select(l_inv, self.c_zero_f)
 
+    def load_sink_h(self):
+        """Load the per-q-head attention sink (epilogue, not prologue)."""
+        traits = self.traits
+        _sink_rsrc = buffer_ops.create_buffer_resource(
+            self.SINK,
+            max_size=False,
+            num_records_bytes=as_mlir_value(fx.Index(traits.NUM_HEADS_Q) * fx.Index(4)),
+        )
+        return fx.Float32(buffer_ops.buffer_load(_sink_rsrc, self.q_head_idx, vec_width=1, dtype=fx.Float32))
+
     def finalize_o_scale(self, m_row, l_row):
         """Return (o_scale, m_out, l_out): the normalizing scale applied to the unnormalized O
         and the (max, denom) pair to store as LSE. m_row/l_row are in the log2 domain
@@ -1025,7 +1089,7 @@ class DualwaveKernelContext:
         Without HAS_SINK, af==1 and mf==m_row, so this is byte-identical to the plain 1/l path."""
         if const_expr(self.traits.HAS_SINK):
             fm = self.fm_fast
-            sink_log2 = _fmul(self.sink_h, fx.Float32(LOG2E), fm)
+            sink_log2 = _fmul(self.load_sink_h(), fx.Float32(LOG2E), fm)
             mf = fx.Float32(_fmax(m_row, sink_log2, fm))
             af = fx.Float32(rocdl.exp2(T.f32, _fsub(m_row, mf, fm)))
             st = fx.Float32(rocdl.exp2(T.f32, _fsub(sink_log2, mf, fm)))
@@ -1071,7 +1135,8 @@ class DualwaveKernelContext:
             [Vec(s_hi)[r] for r in range_constexpr(16)],
         )
 
-    def _causal_mask_inplace(self, v_s, tile_idx, q_row_i32=None):
+    def _causal_mask_inplace(self, v_s, tile_idx, q_row_i32=None, *, do_causal=True, do_window=True):
+        # Python bools: each instantiation emits only the requested edge.
         if q_row_i32 is None:
             q_row_i32 = self.q_row_i32
         traits = self.traits
@@ -1085,10 +1150,11 @@ class DualwaveKernelContext:
         neg_inf_i32 = fx.Int32(traits.NEG_INF_F32_BITS)
 
         pair_thresholds = [(0, 1), (2, 3), (8, 9), (10, 11), (16, 17), (18, 19), (24, 25), (26, 27)]
-        _apply_dualwave_mask_pair(s_lo, rel_lo_i32, neg_inf_i32, pair_thresholds, "lt")
-        _apply_dualwave_mask_pair(s_hi, rel_hi_i32, neg_inf_i32, pair_thresholds, "lt")
+        if const_expr(do_causal):
+            _apply_dualwave_mask_pair(s_lo, rel_lo_i32, neg_inf_i32, pair_thresholds, "lt")
+            _apply_dualwave_mask_pair(s_hi, rel_hi_i32, neg_inf_i32, pair_thresholds, "lt")
         # SWA left window: additionally mask columns below the window (phys_kv < q_row + delta - W).
-        if const_expr(traits.WINDOW_LEFT >= 0):
+        if const_expr(traits.WINDOW_LEFT >= 0 and do_window):
             w_i32 = fx.Int32(traits.WINDOW_LEFT)
             rel_win_lo_i32 = fx.Int32(rel_lo_i32 - w_i32)
             rel_win_hi_i32 = fx.Int32(rel_hi_i32 - w_i32)
@@ -1117,14 +1183,28 @@ class DualwaveKernelContext:
             s_lo, s_hi = v_s
             _need = q_start_pos_i32 + self.delta_i32 < fx.Int32(kv_end_pos)
             if const_expr(traits.WINDOW_LEFT >= 0):
+                # Window and causal edges never share a tile; apply each mask only when needed.
                 _win_edge = (
                     q_start_pos_i32 + fx.Int32(traits.BLOCK_M) + self.delta_i32 - fx.Int32(traits.WINDOW_LEFT)
                 )
-                _need = ArithValue(_need) | ArithValue(fx.Int32(kv_start_pos_w) < _win_edge)
-            if _need:
-                lo_list, hi_list = self.v_s_vec_to_lists(v_s)
-                self._causal_mask_inplace((lo_list, hi_list), tile_idx, q_row_i32=q_row_i32)
-                s_lo, s_hi = _score_lists_to_vecs((lo_list, hi_list))
+                _need_win = ArithValue(fx.Int32(kv_start_pos_w) < _win_edge)
+                if _need:
+                    lo_list, hi_list = self.v_s_vec_to_lists((s_lo, s_hi))
+                    self._causal_mask_inplace(
+                        (lo_list, hi_list), tile_idx, q_row_i32=q_row_i32, do_window=False
+                    )
+                    s_lo, s_hi = _score_lists_to_vecs((lo_list, hi_list))
+                if _need_win:
+                    lo_list, hi_list = self.v_s_vec_to_lists((s_lo, s_hi))
+                    self._causal_mask_inplace(
+                        (lo_list, hi_list), tile_idx, q_row_i32=q_row_i32, do_causal=False
+                    )
+                    s_lo, s_hi = _score_lists_to_vecs((lo_list, hi_list))
+            else:
+                if _need:
+                    lo_list, hi_list = self.v_s_vec_to_lists(v_s)
+                    self._causal_mask_inplace((lo_list, hi_list), tile_idx, q_row_i32=q_row_i32)
+                    s_lo, s_hi = _score_lists_to_vecs((lo_list, hi_list))
             return s_lo, s_hi
 
         return _causal_mask_prologue_if_needed(v_s, tile_idx, kv_end_pos, q_start_pos_i32, q_row_i32)
@@ -1319,7 +1399,10 @@ class DualwaveKernelContext:
 
 
 def _scale_sched_pairs(pairs, head_dim):
-    return max(1, (pairs + 1) // 2) if head_dim == 64 else pairs
+    """At head_dim 64, use 1/4 of the sched_group_barrier anchors (softmax work is D-independent)."""
+    if head_dim != 64:
+        return pairs
+    return max(1, (pairs + 3) // 4)
 
 
 def _sched_barrier_pairs(traits, pairs, valu_cnt, group, mask=None):

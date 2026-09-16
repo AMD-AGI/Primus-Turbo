@@ -316,6 +316,7 @@ def quantize_fp4(
     block_size: Optional[int] = None,
     axis: Optional[int] = None,
     scaling_recipe: Optional[ScalingRecipe] = None,
+    scale_rounding_mode: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     FP4 Quantize (single direction).
@@ -344,6 +345,7 @@ def quantize_fp4(
             block_size,
             with_trans=False,
             scaling_recipe=scaling_recipe,
+            scale_rounding_mode=scale_rounding_mode,
         )
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
@@ -359,6 +361,7 @@ def grouped_quantize_fp4(
     block_size: Optional[int] = None,
     axis: Optional[int] = None,
     scaling_recipe: Optional[ScalingRecipe] = None,
+    scale_rounding_mode: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """FP4 Grouped Quantize (single direction).
 
@@ -392,6 +395,7 @@ def grouped_quantize_fp4(
             group_offs,
             False,
             scaling_recipe,
+            scale_rounding_mode=scale_rounding_mode,
         )
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
@@ -407,6 +411,7 @@ def grouped_quantize_fp4_with_trans(
     block_size: Optional[int] = None,
     scaling_recipe: Optional[ScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
+    scale_rounding_mode: int = 0,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -450,6 +455,7 @@ def grouped_quantize_fp4_with_trans(
             True,
             scaling_recipe,
             scaling_recipe_for_trans,
+            scale_rounding_mode,
         )
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
@@ -464,6 +470,7 @@ def quantize_fp4_with_trans(
     axis: Optional[int] = None,
     scaling_recipe: Optional[ScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
+    scale_rounding_mode: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     FP4 Quantize with trans
@@ -490,6 +497,7 @@ def quantize_fp4_with_trans(
             with_trans=True,
             scaling_recipe=scaling_recipe,
             scaling_recipe_for_trans=scaling_recipe_for_trans,
+            scale_rounding_mode=scale_rounding_mode,
         )
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")

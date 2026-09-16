@@ -13,6 +13,13 @@ from torch._library.opaque_object import register_opaque_type
 
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
 
+try:
+    # torch >= 2.11 requires an opaque type to carry this metaclass; older torch has
+    # neither the module nor the requirement, where `type` changes nothing.
+    from torch._opaque_base import OpaqueBaseMeta as _OpaqueMeta
+except ImportError:  # pragma: no cover - depends on the installed torch
+    _OpaqueMeta = type
+
 __all__ = ["float8_e4m3", "float8_e5m2"]
 
 
@@ -143,7 +150,7 @@ class ScalingStrategy(Enum):
     # DELAYED_SCALING = auto() # TODO: undetermined
 
 
-class ScalingRecipe(NamedTuple):
+class _ScalingRecipeFields(NamedTuple):
     """
     Supported MXFP8/MXFP4 scaling recipe.
 
@@ -161,6 +168,14 @@ class ScalingRecipe(NamedTuple):
     # Memory Layout Shuffle
     shuffle_scale: bool = False
     shuffle_out: bool = False
+
+
+class ScalingRecipe(_ScalingRecipeFields, metaclass=_OpaqueMeta):
+    """See :class:`_ScalingRecipeFields` for the fields.
+
+    Split so the metaclass can be attached: ``class X(NamedTuple, metaclass=...)``
+    is a metaclass conflict at class creation.
+    """
 
     def __fx_repr__(self) -> Tuple[str, dict]:
         return _quant_config_fx_repr(self)
@@ -187,7 +202,7 @@ def _quant_config_fx_repr(config) -> Tuple[str, dict]:
 
 
 @dataclass(unsafe_hash=True)  # hashable so it can be an opaque custom-op argument
-class Float8QuantConfig:
+class Float8QuantConfig(metaclass=_OpaqueMeta):
     format: Format = Format.E4M3
     granularity: ScalingGranularity = ScalingGranularity.TENSORWISE
     strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
@@ -230,7 +245,7 @@ class Float8QuantConfig:
 
 
 @dataclass(unsafe_hash=True)  # hashable so it can be an opaque custom-op argument
-class Float4QuantConfig:
+class Float4QuantConfig(metaclass=_OpaqueMeta):
     format: Format = Format.E2M1_X2
     granularity: ScalingGranularity = ScalingGranularity.MX_BLOCKWISE
     strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
@@ -238,6 +253,10 @@ class Float4QuantConfig:
     block_size: int = 32
     use_gradient_sr: bool = False
     use_preshuffle: bool = False
+    # E8M0 scale exponent bias: 0=half ULP, 1=one ULP, 2=three-eighths ULP.
+    # Reference: Jianlin Yu et al., "MXAttention", arXiv:2607.24377.
+    # https://arxiv.org/abs/2607.24377
+    scale_rounding_mode: int = 0
 
     def __fx_repr__(self) -> Tuple[str, dict]:
         return _quant_config_fx_repr(self)
@@ -252,6 +271,7 @@ class Float4QuantConfig:
             f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
         )
         assert self.format == Format.E2M1_X2, "Format must be E2M1_X2 for Float4QuantConfig"
+        assert self.scale_rounding_mode in (0, 1, 2), "scale_rounding_mode must be 0, 1, or 2"
 
         mx_support_scale_dtype = ScaleDtype.E8M0
         assert self.scale_dtype == mx_support_scale_dtype, (
