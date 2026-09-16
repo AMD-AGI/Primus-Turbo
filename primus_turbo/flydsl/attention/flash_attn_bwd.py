@@ -2371,11 +2371,14 @@ def build_flash_attn_bwd_dkdv_module(
         c_zero_v4f32 = Vec.filled(4, 0.0, fx.Float32)
 
         def _vexp_intrin(x):
+            """P is held in [0, 1] against the reference the forward clamped it to; the
+            matched min/max folds into the clamp modifier of the v_exp itself."""
             # Backend-visible 2^x: a compiler-visible read of the MFMA accumulator, so unlike
             # opaque inline asm it carries the MFMA->VALU hazard itself.
-            return fx.Float32(
-                llvm.call_intrinsic(ir.F32Type.get(), "llvm.amdgcn.exp2.f32", [_raw(x)], [], [])
-            )
+            e = fx.Float32(llvm.call_intrinsic(ir.F32Type.get(), "llvm.amdgcn.exp2.f32", [_raw(x)], [], []))
+            fm_clamp = fx.arith.FastMathFlags.fast
+            lo = arith.MaxNumFOp(_raw(e), _raw(c_zero_f), fastmath=fm_clamp).result
+            return fx.Float32(arith.MinNumFOp(lo, _raw(fx.Float32(1.0)), fastmath=fm_clamp).result)
 
         # A-operand read (Q/dO from LDS): A[m=q=lane16][k=D=kg*8+s]. mt selects the
         # 16-q tile (row = mt*16 + lane16), ks the D 32-step (D = ks*32 + kg*8).

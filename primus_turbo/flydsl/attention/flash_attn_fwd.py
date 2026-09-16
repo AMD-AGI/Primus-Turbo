@@ -362,9 +362,9 @@ def build_flash_attn_dualwave_swp_module(
                 # Non-causal tiny seq_len needs tile-0 padding masked before the full-tile no-op gate.
                 v_s_0 = ctx.seq_pad_mask_if_needed(v_s_0, ctx.split_tile(0))
             if const_expr(traits.DUALWAVE_SWP_FIXED_MAX):
-                # Softmax is shift-invariant, so a zero reference max is valid; masked scores
-                # already exp2 to 0, so fully-masked rows need no finite floor.
-                m_row_pro = ctx.zero_row_max()
+                m_row_pro = ctx.prologue_ref_max(v_s_0)
+                ctx.set_fixed_ref(m_row_pro)
+                v_s_0 = ctx.shift_scores_by(v_s_0, m_row_pro)
             else:
                 m_row_pro = ctx.reduce_max(v_s_0)
                 if const_expr(traits.CAUSAL):

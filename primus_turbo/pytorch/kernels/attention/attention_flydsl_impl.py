@@ -87,7 +87,7 @@ def _fwd_module(Hq, Hkv, D, causal, cross_seqlen, emit_lse, window_left, sbhd=Fa
     # halves occupancy. Other head dims keep the build defaults.
     cfg = {}
     if D in (64, 128):
-        cfg = dict(waves_per_eu=2, dualwave_swp_enable_stagger=False, block_m=128)
+        cfg = dict(waves_per_eu=2, dualwave_swp_enable_stagger=False, block_m=64 if D == 64 else 128)
     return build_flash_attn_dualwave_swp_module(
         num_heads=Hq,
         head_dim=D,

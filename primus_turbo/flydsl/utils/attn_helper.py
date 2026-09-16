@@ -31,6 +31,10 @@ from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from primus_turbo.flydsl.utils.prims import LOG2E
 
+# Fixed-max softmax reference, log2 above the prologue tile's row max: the margin a later
+# key may exceed that tile by before P flattens, traded against the tail fp32 still holds.
+REF_MARGIN = 96
+
 
 def dtype_to_elem_type(dtype_str: str):
     if dtype_str == "f32":
@@ -121,6 +125,10 @@ def _fmul(a, b, fm_fast):
 
 def _fmax(a, b, fm_fast):
     return arith.MaxNumFOp(as_mlir_value(a), as_mlir_value(b), fastmath=fm_fast).result
+
+
+def _fmin(a, b, fm_fast):
+    return arith.MinNumFOp(as_mlir_value(a), as_mlir_value(b), fastmath=fm_fast).result
 
 
 def _mfma_acc(a, b, c, _mma_atom, mfma_acc_vec_type):
@@ -568,6 +576,7 @@ class DualwaveKernelContext:
         self.c_neg_floor = fx.Float32(-3.0e38)
         self.c_zero_f = fx.Float32(0.0)
         self.c_zero_v16f32 = Vec.filled(16, 0.0, fx.Float32)
+        self.fixed_ref_neg = None
         head_dim_f32 = fx.Float32(fx.Int32(head_dim_runtime))
         c_log2e_f = fx.Float32(LOG2E)
         self.c_sm_scale_log2e = fx.Float32(
@@ -903,12 +912,20 @@ class DualwaveKernelContext:
         q_all_scaled_bf16 = q_all_scaled_bf16_op.result
         return Vec(q_all_scaled_bf16, (traits.K_STEPS_QK * traits.MFMA_LANE_K,), self.elem_dtype)
 
+    def score_acc_seed(self):
+        """Seed for a QK accumulator. QK accumulates into C, so seeding C with -reference
+        performs the rebase for no arithmetic; built per tile because hoisting the broadcast
+        would pin 16 VGPRs across the loop."""
+        if self.fixed_ref_neg is None:
+            return self.c_zero_v16f32
+        return Vec.from_elements([as_mlir_value(self.fixed_ref_neg)], fx.Float32).broadcast_to(16)
+
     def qk(self, v_k, q_all_scaled_bf16, v_s=None, ks_range=None):
         k_lo, k_hi = v_k
         ks_lo, ks_hi = (0, self.traits.K_STEPS_QK) if ks_range is None else ks_range
         if v_s is None:
-            v_s_lo = self.c_zero_v16f32
-            v_s_hi = self.c_zero_v16f32
+            v_s_lo = self.score_acc_seed()
+            v_s_hi = v_s_lo
         else:
             v_s_lo, v_s_hi = v_s
         for ks in range_constexpr(ks_lo, ks_hi):
@@ -940,7 +957,7 @@ class DualwaveKernelContext:
         traits = self.traits
         ks_lo, ks_hi = (0, traits.K_STEPS_QK) if ks_range is None else ks_range
         if v_s is None:
-            s_lo_in, s_hi_in = self.c_zero_v16f32, self.c_zero_v16f32
+            s_lo_in = s_hi_in = self.score_acc_seed()
         else:
             s_lo_in, s_hi_in = v_s
 
@@ -997,17 +1014,28 @@ class DualwaveKernelContext:
     def floor_masked_max(self, row_max):
         return _fmax(row_max, self.c_neg_floor, self.fm_fast)
 
+    def _exp2_clamped(self, x):
+        """exp2 of a rebased score, with P held in [0, 1] so the row sum cannot leave fp32.
+
+        exp2 is non-negative, so the lower bound is a no-op; the pair is spelled out because
+        the backend folds a matched min/max into the clamp modifier of the v_exp itself."""
+        e = rocdl.exp2(T.f32, as_mlir_value(x))
+        if self.fixed_ref_neg is None:
+            return e
+        lo = _fmax(fx.Float32(e), self.c_zero_f, self.fm_fast)
+        return _fmin(fx.Float32(lo), fx.Float32(1.0), self.fm_fast)
+
     def exp2(self, v_s, start, length):
         if const_expr(start == 0):
             s_lo = [Vec(v_s[0])[r] for r in range_constexpr(16)]
             lo_partial = []
             for r in range_constexpr(16):
-                lo_partial.append(rocdl.exp2(T.f32, as_mlir_value(s_lo[r])))
+                lo_partial.append(self._exp2_clamped(s_lo[r]))
             return Vec.from_elements(lo_partial, fx.Float32).ir_value(), v_s[1]
         lo_partial = [Vec(v_s[0])[r] for r in range_constexpr(16)]
         hi_full = []
         for r in range_constexpr(16):
-            hi_full.append(rocdl.exp2(T.f32, as_mlir_value(Vec(v_s[1])[r])))
+            hi_full.append(self._exp2_clamped(Vec(v_s[1])[r]))
         return lo_partial, hi_full
 
     def cast_p_and_sum(self, l_row, v_p):
@@ -1105,6 +1133,30 @@ class DualwaveKernelContext:
 
     def zero_row_max(self):
         return self.c_zero_f
+
+    def prologue_ref_max(self, v_s):
+        """This row's max over the prologue tile, lifted by REF_MARGIN. A fully masked row
+        reduces to -inf; fall back to zero there, which is what this path used before."""
+        m = self.reduce_max(v_s)
+        m = ArithValue(fx.Float32(m) > self.c_neg_floor).select(m, self.c_zero_f)
+        return _fadd(m, fx.Float32(float(REF_MARGIN)), self.fm_fast)
+
+    def set_fixed_ref(self, m_row):
+        """Pin the loop's reference as one per-row scalar, applied by score_acc_seed()."""
+        self.fixed_ref_neg = _fsub(self.c_zero_f, m_row, self.fm_fast)
+
+    def shift_scores_by(self, v_s, row_max):
+        """Shift the prologue tile, the one tile that leaves the MFMA before the reference
+        exists and so cannot be rebased by the accumulator seed."""
+        if isinstance(v_s[0], list):
+            v_s = _score_lists_to_vecs(v_s)
+        return tuple(
+            Vec.from_elements(
+                [as_mlir_value(_fsub(Vec(half)[r], row_max, self.fm_fast)) for r in range_constexpr(16)],
+                fx.Float32,
+            ).ir_value()
+            for half in v_s
+        )
 
     def scores_for_softmax(self, v_s):
         return v_s
