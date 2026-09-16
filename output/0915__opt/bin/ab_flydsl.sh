@@ -23,7 +23,10 @@ for r in $(seq 1 "$REPS"); do
     tag="fly${r}-${arm}"
     mkdir -p "/home/lihuzhan/_dbg_l8b/$tag"
     extra=""
-    [ "$arm" = "fly" ] && extra="-e NKFIX_FLYDSL_WGRAD=1"
+    # The table is built offline by flydsl_table.py on an idle card. Rule 3 reads it and
+    # never tunes; a shape with no entry falls through to rule 2 (counted as
+    # flydsl_no_config in the stats file, so a silent fallback is visible afterwards).
+    [ "$arm" = "fly" ] && extra="-e NKFIX_FLYDSL_WGRAD=1 -e NKFIX_FLYDSL_TABLE=/home/lihuzhan/_dbg_l8b/flydsl_tn.json"
     echo "=== $(date +%H:%M:%S) $tag ==="
     BLAS_ENV="-e HIPBLASLT_TENSILE_LIBPATH=$D" \
     E2E_ENV="-e PYTHONPATH=$PP -e NKFIX_ENABLE=1 -e PRIMUS_TURBO_ATTN_ENABLE_ASM_BWD=1 $extra \
