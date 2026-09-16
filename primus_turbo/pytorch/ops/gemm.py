@@ -8,11 +8,67 @@ from typing import Optional, Union
 
 import torch
 
-from primus_turbo.pytorch.core.backend import BackendType
-from primus_turbo.pytorch.kernels.gemm.gemm_impl import gemm_accum_impl, gemm_impl
+from primus_turbo.pytorch.core.backend import BackendChoice, BackendType
+from primus_turbo.pytorch.kernels.gemm.gemm_impl import (
+    GEMMKernelDispatcher,
+    gemm_accum_impl,
+    gemm_impl,
+)
 from primus_turbo.pytorch.ops.utils import _get_dummy_wgrad, _setup_fused_grad_accum
 
 __all__ = ["gemm"]
+
+
+def _gemm_impl_wrapper(
+    a: torch.Tensor,
+    trans_a: bool,
+    b: torch.Tensor,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    trans_c: bool,
+    default_backend: int,
+    backend: Optional[BackendType] = None,
+    inplace_add_to_out: bool = False,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Dispatch a GEMM, optionally forcing one backend for this call only."""
+    if backend is None:
+        if inplace_add_to_out:
+            assert out is not None
+            gemm_accum_impl(
+                a,
+                trans_a,
+                b,
+                trans_b,
+                out_dtype,
+                trans_c,
+                out=out,
+                default_backend=default_backend,
+            )
+            return out
+        return gemm_impl(
+            a,
+            trans_a,
+            b,
+            trans_b,
+            out_dtype,
+            trans_c,
+            default_backend=default_backend,
+        )
+
+    choice = BackendChoice(backend=backend)
+    return GEMMKernelDispatcher.dispatch(
+        choice,
+        choice,
+        a=a,
+        trans_a=trans_a,
+        b=b,
+        trans_b=trans_b,
+        out_dtype=out_dtype,
+        trans_c=trans_c,
+        inplace_add_to_out=inplace_add_to_out,
+        out=out,
+    )
 
 
 def _bgrad_gemm_impl_wrapper(
@@ -25,6 +81,7 @@ def _bgrad_gemm_impl_wrapper(
     default_backend: int,
     inplace_add_to_out: bool = False,
     out: Optional[torch.Tensor] = None,
+    backend: Optional[BackendType] = None,
 ) -> torch.Tensor:
     """Run the wgrad GEMM, accumulating into ``out`` when asked to.
 
@@ -38,14 +95,22 @@ def _bgrad_gemm_impl_wrapper(
     inputs = (a, trans_a, b, trans_b, out_dtype, trans_c)
 
     if not inplace_add_to_out:
-        return gemm_impl(*inputs, default_backend=default_backend)
+        return _gemm_impl_wrapper(
+            *inputs, default_backend=default_backend, backend=backend
+        )
 
     assert out is not None, "out should not be None when inplace_add_to_out is True"
     # The wgrad keeps the caller's default backend: hipBLASLt and Triton both carry the
     # beta=1 epilogue. Backends without it report `inplace_add_to_out` as unsupported,
     # which keeps an explicitly pinned backend or auto-tune from silently landing
     # somewhere that ignores `out`.
-    gemm_accum_impl(*inputs, out=out, default_backend=default_backend)
+    _gemm_impl_wrapper(
+        *inputs,
+        out=out,
+        default_backend=default_backend,
+        backend=backend,
+        inplace_add_to_out=True,
+    )
 
     return _get_dummy_wgrad(out.shape, out_dtype)
 
@@ -60,13 +125,23 @@ class GemmFunction(torch.autograd.Function):
         trans_b: bool,
         out_dtype: torch.dtype,
         fuse_bgrad_accum_pattern: Union[None, str] = None,
+        backend: Optional[BackendType] = None,
     ):
         assert a.dim() == 2 and b.dim() == 2, "Only 2D GEMM is supported"
         fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
         # FWD
         # out    = a * b
         # [M, N] = [M, K] * [K, N]
-        out = gemm_impl(a, trans_a, b, trans_b, out_dtype, False, default_backend=BackendType.HIPBLASLT.value)
+        out = _gemm_impl_wrapper(
+            a,
+            trans_a,
+            b,
+            trans_b,
+            out_dtype,
+            False,
+            default_backend=BackendType.HIPBLASLT.value,
+            backend=backend,
+        )
         # Save for bwd
         if a.requires_grad or b.requires_grad:
             ctx.save_for_backward(a, b)
@@ -74,6 +149,7 @@ class GemmFunction(torch.autograd.Function):
             ctx.trans_b = trans_b
             ctx.fuse_bgrad_accum = fuse_bgrad_accum
             ctx.main_grad = main_grad
+            ctx.backend = backend
         return out
 
     @staticmethod
@@ -82,7 +158,7 @@ class GemmFunction(torch.autograd.Function):
 
         # AGrad
         # grad_a = grad_out * b^T
-        grad_a = gemm_impl(
+        grad_a = _gemm_impl_wrapper(
             grad_out,
             False,
             b,
@@ -90,6 +166,7 @@ class GemmFunction(torch.autograd.Function):
             a.dtype,
             ctx.trans_a,
             default_backend=BackendType.HIPBLASLT.value,
+            backend=ctx.backend,
         )
 
         # BGrad
@@ -104,9 +181,10 @@ class GemmFunction(torch.autograd.Function):
             default_backend=BackendType.HIPBLASLT.value,
             inplace_add_to_out=ctx.fuse_bgrad_accum,
             out=ctx.main_grad,
+            backend=ctx.backend,
         )
 
-        return grad_a, grad_b, None, None, None, None
+        return grad_a, grad_b, None, None, None, None, None
 
 
 def gemm(
@@ -116,6 +194,7 @@ def gemm(
     trans_b: bool = False,
     out_dtype: torch.dtype | None = None,
     fuse_bgrad_accum_pattern: Union[None, str] = None,
+    backend: Optional[BackendType] = None,
 ) -> torch.Tensor:
     """General matrix multiplication (GEMM) for BF16/FP16, supporting autograd.
 
@@ -130,6 +209,10 @@ def gemm(
             directly instead of returning a gradient the framework then adds.
             ``"megatron"`` is the only supported pattern; ``b`` must carry
             ``main_grad`` / ``grad_added_to_main_grad``. Defaults to None (no fusion).
+        backend: Force a backend for this GEMM and its autograd-generated dgrad
+            and wgrad calls. This per-call override takes precedence over the
+            global backend environment and is intended for narrowly scoped
+            experiments such as a FlyDSL LM head. Defaults to None.
 
     Returns:
         torch.Tensor: Output matrix with shape (M, N)
@@ -137,4 +220,6 @@ def gemm(
     assert a.ndim == 2 and b.ndim == 2, "Only 2D tensors are supported"
     if out_dtype is None:
         out_dtype = torch.promote_types(a.dtype, b.dtype)
-    return GemmFunction.apply(a, b, trans_a, trans_b, out_dtype, fuse_bgrad_accum_pattern)
+    return GemmFunction.apply(
+        a, b, trans_a, trans_b, out_dtype, fuse_bgrad_accum_pattern, backend
+    )

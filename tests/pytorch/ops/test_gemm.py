@@ -31,9 +31,14 @@ def test_gemm_flydsl_bf16(layout, out_dtype):
     b = torch.randn(b_shape, dtype=torch.bfloat16, device="cuda")
     reference = (a.T if trans_a else a).float() @ (b.T if trans_b else b).float()
 
-    GlobalBackendManager.set_gemm_backend(BackendType.FLYDSL)
+    # A call-site override must win over the global setting so clients can
+    # isolate FlyDSL to one layer (for example, an LM head) while every other
+    # BF16/FP16/FP32 GEMM remains on hipBLASLt.
+    GlobalBackendManager.set_gemm_backend(BackendType.HIPBLASLT)
     GlobalBackendManager.set_auto_tune(False)
-    actual = turbo.ops.gemm(a, b, trans_a, trans_b, out_dtype)
+    actual = turbo.ops.gemm(
+        a, b, trans_a, trans_b, out_dtype, backend=BackendType.FLYDSL
+    )
 
     assert actual.dtype == out_dtype
     torch.testing.assert_close(actual.float(), reference, **get_tolerances(torch.bfloat16))
