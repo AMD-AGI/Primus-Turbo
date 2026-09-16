@@ -62,10 +62,28 @@ _RULE3 = os.environ.get("NKFIX_FLYDSL_WGRAD", "") not in ("", "0")
 # understood, a run using rule 3 should be able to say whether it stayed finite rather than
 # leaving it to the loss column to notice several steps later.
 _RULE3_CHECK = int(os.environ.get("NKFIX_FLYDSL_CHECK", "0"))
+# Same sampling for rules 1 and 2. Scanning every finished run's log found loss=nan in 8 of 39
+# runs that had nkfix installed and 0 of 35 that did not -- and the non-nkfix group had MORE
+# total steps, so it had more exposure, not less (Fisher one-sided p ~ 0.003). That points at
+# nkfix itself rather than at rule 3, which did not exist for six of the eight. So the check
+# cannot stay on rule 3 alone: it has to be able to say WHICH rule's output went non-finite.
+_CHECK = int(os.environ.get("NKFIX_CHECK", "0"))
+
+
+def _finite_check(tag, out, a, b):
+    if not _CHECK or stats["checked"] % _CHECK:
+        stats["checked"] += 1
+        return
+    stats["checked"] += 1
+    if not torch.isfinite(out).all():
+        stats["nonfinite_" + tag] = stats.get("nonfinite_" + tag, 0) + 1
+        print("[nkfix] NON-FINITE from rule %s: A%s%s B%s%s"
+              % (tag, tuple(a.shape), "c" if a.is_contiguous() else "v",
+                 tuple(b.shape), "c" if b.is_contiguous() else "v"), flush=True)
 _MM = torch.ops.aten.mm.default
 stats = {"dgrad": 0, "wgrad": 0, "wgrad_skipped_oom": 0, "miss": 0,
          "wgrad_flydsl": 0, "flydsl_unavailable": 0, "flydsl_declined": 0,
-         "flydsl_no_config": 0, "flydsl_nonfinite": 0}
+         "flydsl_no_config": 0, "flydsl_nonfinite": 0, "checked": 0}
 _seen = {}
 
 
@@ -232,14 +250,18 @@ class NKFix(TorchDispatchMode):
                             return out
                     if _headroom_ok(a):
                         stats["wgrad"] += 1
-                        return func(a.contiguous(), b.t().contiguous().t())
+                        out = func(a.contiguous(), b.t().contiguous().t())
+                        _finite_check("wgrad", out, a, b)
+                        return out
                     # No room for the copy. Fall through to the dgrad rule, which needs no
                     # extra allocation and is still worth 1.16-1.34x on a wgrad call -- far
                     # better than taking the SIGBUS.
                     stats["wgrad_skipped_oom"] += 1
                 if b.is_contiguous() and _big(b):
                     stats["dgrad"] += 1
-                    return func(a, b.t().contiguous().t())
+                    out = func(a, b.t().contiguous().t())
+                    _finite_check("dgrad", out, a, b)
+                    return out
             stats["miss"] += 1
         return func(*args, **kwargs)
 
