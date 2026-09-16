@@ -13,7 +13,7 @@ path runs the production shape (b=4, s=8192, hq=32, hkv=8, d=128, bf16, causal) 
 Separately, profiling the end-to-end training step found that **94% of it is hipBLASLt GEMM,
 and 97% of that was running on a macro-tile-32x16x32 solution** picked because hipBLASLt has
 no plain-bf16-GEMM tuning library for the NN transpose combination; routing around it gives
-**1.894x end-to-end throughput (n=9), MFU 34% -> 65.4%**. The same defect turned out to be
+**1.894x end-to-end throughput (n=9), ~106 -> ~204 TFLOP/s**. The same defect turned out to be
 the source of the ~3.9% trimodal run-to-run noise that had been invalidating the campaign's
 A/B measurements — with it bypassed, between-run variance drops **9.3x to 0.42%**.
 
@@ -41,10 +41,17 @@ three prebuilt `.co` files to maintain.
 
 **End-to-end (llama-3.1-8B, b=4 s=8192, 1 GPU, 8-layer config, seed pinned, n=9 per arm):**
 
-| | tps | MFU | between-run sd |
+| | tps | TFLOP/s | between-run sd |
 |---|--:|--:|--:|
-| baseline | 6,128 | ~34% | 3.91% (trimodal) |
-| + GEMM layout workaround | **11,604** | **65.4%** | **0.42%** |
+| baseline | 6,128 | ~106 | 3.91% (trimodal) |
+| + dgrad layout fix | 11,604 | ~204 | 0.42% |
+| **+ wgrad layout fix** | **38,043** | **640.7** | 1.97% (n=6) |
+
+**Do not quote MFU from these runs.** torchtitan's `get_peak_flops()` falls back to
+"assume A100" (312e12) for any unrecognised `device_name`, and this box reports
+"AMD Radeon Graphics" -- so every MFU figure it printed used an A100 denominator.
+Against this campaign's own measured Triton GEMM roof (1002.7 TF/s at 1100 MHz),
+640.7 TF/s is 63.9%.
 
 **Root cause, with hipBLASLt's own logs.** Same M/N/K, same 76 MB workspace; only the
 transpose combination differs. The NN path resolves through a `GridBased` lookup table whose

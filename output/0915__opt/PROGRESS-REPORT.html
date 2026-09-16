@@ -148,9 +148,9 @@
     <div class="n">6,128 → 11,604 tps<br>n=9 重复验证</div>
   </div>
   <div class="tile">
-    <div class="k">MFU（算力利用率）</div>
-    <div class="v">65.4<span class="u">%</span></div>
-    <div class="n">原 ~34%</div>
+    <div class="k">GEMM 实测算力</div>
+    <div class="v">640.7<span class="u"> TF/s</span></div>
+    <div class="n">原 ~106 → 204 → 640.7<br><b>不要引用日志里的 MFU</b>，见下</div>
   </div>
   <div class="tile">
     <div class="k">测量噪声</div>
@@ -473,12 +473,15 @@ TN 路径:  ProblemMap: Contraction_l_Alik_Bljk...   sol-tag = Prediction  ← �
 <div class="tw">
 <table>
   <caption><b>端到端验证</b> · 8 层配置 · 种子已钉 · <b>每臂 n=9 次独立运行</b></caption>
-  <thead><tr><th>配置</th><th class="num">tps</th><th class="num">MFU</th><th class="num">跨运行标准差</th><th>模态</th></tr></thead>
+  <thead><tr><th>配置</th><th class="num">tps</th><th class="num">实测 TFLOP/s</th><th class="num">跨运行标准差</th><th>备注</th></tr></thead>
   <tbody>
     <tr><td>基线</td><td class="num">6,128</td><td class="num">~34%</td><td class="num">3.91%</td>
         <td class="mono cond">5822×2 | 5936×2 | 6327×5</td></tr>
-    <tr class="hl"><td><b>+ GEMM 布局修法</b></td><td class="num"><b>11,604</b></td><td class="num"><b>65.4%</b></td>
-        <td class="num"><b>0.42%</b></td><td class="mono cond"><b>11604×9（单一）</b></td></tr>
+    <tr><td>+ dgrad 布局修法</td><td class="num">11,604</td><td class="num">~204 TF/s</td>
+        <td class="num">0.42%</td><td class="mono cond">11604×9（单一）</td></tr>
+    <tr class="hl"><td><b>+ wgrad 布局修法（0916）</b></td><td class="num"><b>38,043</b></td>
+        <td class="num"><b>640.7 TF/s</b></td><td class="num">1.97%</td>
+        <td class="mono cond">n=6，对无 patch <b>6.21×</b></td></tr>
   </tbody>
 </table>
 </div>
@@ -488,6 +491,17 @@ TN 路径:  ProblemMap: Contraction_l_Alik_Bljk...   sol-tag = Prediction  ← �
   <p style="margin-bottom:0">两条路径对 fp32 参考的 SQNR <b>逐位相同</b>
   （K=14336/32768/128256 上分别 55.60 / 55.62 / 55.62 dB，门槛 50 dB）。
   两者互相之间的差异只有值域的 0.3–0.4%，属于浮点累加顺序差异，不是系统性偏差。</p>
+</div>
+
+<div class="note crit">
+  <span class="note-h">更正：日志里的 MFU 一律不可用</span>
+  <p style="margin-bottom:0">torchtitan 的 <code>get_peak_flops()</code> 对任何不认识的
+  <code>device_name</code> 兜底为 <b>"assume A100" = 312 TFLOP/s</b>，而本机报的是
+  <code>AMD Radeon Graphics</code>（容器里也没有 <code>lspci</code>）。所以它打印的每一个
+  MFU 用的都是 A100 的分母 —— 这也是为什么 0916 的运行会报出 <b>215.63%</b> 这种不可能的值
+  （672.76 ÷ 312 = 2.156）。<br>
+  <b><code>tflops</code> 列是对的</b>（FLOP÷时间），<b><code>mfu</code> 列一律不要引用</b>。
+  若用本 campaign 实测的 Triton GEMM roof（1002.7 TF/s @1100 MHz）作分母，640.7 是 <b>63.9%</b>。</p>
 </div>
 
 <h3>顺带解掉了测量噪声问题</h3>
