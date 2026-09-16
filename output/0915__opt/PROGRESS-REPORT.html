@@ -138,14 +138,14 @@
 
 <div class="tiles">
   <div class="tile">
-    <div class="k">端到端吞吐 · <b>32 层生产配置</b></div>
-    <div class="v">5.85×</div>
-    <div class="n">1,984 → 11,608 tps<br>20 步跑完，峰值显存 88.32%</div>
+    <div class="k">端到端吞吐（8 层，两项叠加）</div>
+    <div class="v">7.04×</div>
+    <div class="n">6,128 → 43,127 tps<br>单步 5.35 s → 760 ms</div>
   </div>
   <div class="tile">
-    <div class="k">单步时间（32 层）</div>
-    <div class="v">2.82<span class="u"> s</span></div>
-    <div class="n">原 16.5 s<br>8 层配置另测得 6.21×</div>
+    <div class="k">32 层生产配置</div>
+    <div class="v">5.85×</div>
+    <div class="n">1,984 → 11,608 tps<br><b>三次里成功一次</b>，复现率待解决</div>
   </div>
   <div class="tile">
     <div class="k">GEMM 实测算力</div>
@@ -340,7 +340,7 @@
   三个预编译 <code>.co</code> 文件的维护成本。</p>
   <p style="margin-bottom:0"><b>所以默认关闭，用 <code>PRIMUS_TURBO_ATTN_ENABLE_ASM_BWD=1</code> 显式开启。</b>
   按模态配对分析时它有 +1.0~1.5% 的信号（与算子级预测的 +1.36% 吻合），但该分析依赖一个未验证的前提，
-  记为<b>有前景的假设，不是结论</b>。</p>
+  记为<b>有前景的假设，不是结论</b>。</s>（以上为 0915 的记录，已被上方更新取代）</p>
 </div>
 
 <h3>资格门：什么时候用 ASM 反向</h3>

@@ -47,6 +47,14 @@ three prebuilt `.co` files to maintain.
 | + dgrad layout fix | 11,604 | ~204 | 0.42% |
 | **+ wgrad layout fix** | **38,043** | **640.7** | 1.97% (n=6) |
 
+**Stacking the attention work on top** (0916): with the GEMM defect worked around, attention
+rises from 3.3% to 20.8% of the step, and the ASM backward — which measured -0.28% and was
+defaulted OFF on 0915 — now measures **+14.40% at 9.1x the sem of the difference**. Combined:
+**6,128 -> 43,127 tps, 7.04x**, step 5.35 s -> 760 ms. Same kernel, same machine, same
+operator-level 1.74x; only its share of the step changed, and that was changed by an unrelated
+fix. An optimisation's end-to-end value is a property of its relationship to the current
+bottleneck, not of the optimisation.
+
 **And on the 32-layer production configuration** — the one that matches JIRA's shape —
 1,984 -> **11,608 tps, 5.85x**, all 20 steps, peak memory 88.32% against the unpatched
 87.98%. Step time 16.5 s -> 2.82 s. That is the number to quote; the 8-layer figures exist
