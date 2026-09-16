@@ -1,36 +1,51 @@
-"""Route aten::mm's contiguous-(K,N) B through an N-major B on this box's hipBLASLt.
+"""Steer aten::mm away from this image's MT32x16x32 solutions. Two rules, two directions.
 
-WHY. A step-10 torch profile of the 8-layer run puts 94% of GPU time in Tensile GEMM kernels,
-and 97% of THAT in solutions with macro tile MT32x16x32 -- grids of 16-65 million 64-thread
-workgroups, 592-681 ms for a single call. The same shapes, when hipBLASLt picks
-MT256x256x128, run 16-21x faster. What flips the selector is B's physical major order:
+WHY. hipBLASLt on this image has no plain-bf16-GEMM tuning library for some transpose
+combinations, so those fall back on a sparse GridBased table whose nearest entry to our
+shapes is N=1 -- and MT32x16x32 is the tile you would pick for a GEMV. Result: 16-65 million
+workgroups and 500-900 ms for a call the right solution does in single-digit ms.
 
-  torch.mm(a(M,K), b(K,N) contiguous)          55.5 ms    69 TF/s   <- MT32x16x32
-  F.linear(a(M,K), bT(N,K) contiguous)          2.4 ms  1628 TF/s   <- MT256x256x128
-  transpose to produce bT                       0.4 ms
-                                              --------------------- net 20x
+Two distinct bad cases, found by profiling the 8-layer step twice (before and after rule 1):
 
-F.linear is fast because it hands mm a NON-contiguous (K,N) view whose storage is N-major.
-So the fix is to give mm the same thing: b.t().contiguous().t().
+  Rule 1 -- dgrad. B contiguous (K,N).  Hand mm a B whose storage is N-major instead:
+      torch.mm(a, b)                55.5 ms    69 TF/s
+      b.t().contiguous().t()         2.4 ms  1628 TF/s     ~20x incl. copy
 
-Costs no accuracy: both paths score SQNR 55.60 / 55.62 / 55.62 dB against an fp32 reference
-at K = 14336 / 32768 / 128256 -- identical to two decimals. They differ from each other by
-0.3-0.4% of peak, which is accumulation order, not bias.
+  Rule 2 -- wgrad. BOTH operands are transposed views (Alik_Bjlk). Here the fix is on A,
+  not B, and making B contiguous makes it WORSE (54.5 TF/s):
+      torch.mm(a, b)                55.6 ms    69 TF/s
+      a.contiguous()                 3.3 ms  1160 TF/s   + 3.3 ms copy -> 8.4x net
+      lm_head (A = 7.83 GiB):     513.6 -> 23.0 + 22.8   ->  11.2x net
+  The zero-copy rewrite (B^T @ A^T)^T was tried and LOSES (0.83-0.95x) -- it lands on the
+  same bad family. The copy is not avoidable; it is simply worth paying.
 
-A WORKAROUND for a solution-coverage gap in this image's Tensile library, same family as the
-HIPBLASLT_TENSILE_LIBPATH mis-packaging in BLAS-FINDING.md. Re-measure, never assume, on any
-other image -- on a library with proper coverage this would be a pure loss (one extra copy).
+Both rules are bit-exact: the rewritten call and the original produce identical results
+(maxdiff 0 measured at three shapes), because only the operand layout changes.
 
-Implemented as a TorchDispatchMode rather than a library impl override: overriding
-aten::mm.default makes the captured "original" resolve back to the override, so the fallback
-path recurses until the stack blows. A mode gets re-entrancy handling for free.
+COST. Rule 2 allocates a transient copy of A -- 0.25 GiB for qkv wgrad, 0.88 for mlp,
+7.83 for lm_head. Fine on the 8-layer config (32% memory). NOT obviously safe on the
+32-layer production config, which already sits at 88%.
+
+This is a WORKAROUND for a library packaging/coverage defect, in the same family as the
+HIPBLASLT_TENSILE_LIBPATH mis-packaging. On an image with proper coverage both rules are a
+pure loss (one extra copy). Re-measure, never assume, elsewhere.
+
+Implemented as a TorchDispatchMode: overriding aten::mm.default via torch.library makes the
+captured "original" resolve back to the override, so the fallback path recurses until the
+stack dies. A dispatch mode gets re-entrancy handling for free.
 """
 import os, torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 _MIN_BYTES = int(os.environ.get("NKFIX_MIN_BYTES", 4 << 20))
+_RULE2 = os.environ.get("NKFIX_WGRAD", "1") not in ("", "0")
 _MM = torch.ops.aten.mm.default
-stats = {"hit": 0, "miss": 0}
+stats = {"dgrad": 0, "wgrad": 0, "miss": 0}
+_seen = {}
+
+
+def _big(t):
+    return t.numel() * t.element_size() >= _MIN_BYTES
 
 
 class NKFix(TorchDispatchMode):
@@ -38,11 +53,19 @@ class NKFix(TorchDispatchMode):
         kwargs = kwargs or {}
         if func is _MM and len(args) == 2:
             a, b = args
-            if (a.dim() == 2 and b.dim() == 2 and b.is_contiguous()
-                    and a.dtype in (torch.bfloat16, torch.float16) and a.dtype == b.dtype
-                    and b.numel() * b.element_size() >= _MIN_BYTES):
-                stats["hit"] += 1
-                return func(a, b.t().contiguous().t())
+            if (a.dim() == 2 and b.dim() == 2 and a.dtype == b.dtype
+                    and a.dtype in (torch.bfloat16, torch.float16)):
+                if _big(a) or _big(b):
+                    k = (tuple(a.shape), tuple(b.shape),
+                         "Ac" if a.is_contiguous() else "Av",
+                         "Bc" if b.is_contiguous() else "Bv")
+                    _seen[k] = _seen.get(k, 0) + 1
+                if b.is_contiguous() and _big(b):
+                    stats["dgrad"] += 1
+                    return func(a, b.t().contiguous().t())
+                if _RULE2 and not b.is_contiguous() and not a.is_contiguous() and _big(a):
+                    stats["wgrad"] += 1
+                    return func(a.contiguous(), b)
             stats["miss"] += 1
         return func(*args, **kwargs)
 
@@ -50,10 +73,27 @@ class NKFix(TorchDispatchMode):
 _mode = None
 
 
+def _report():
+    # Which rule actually fired in a real run? The microbenchmark says rule 2 is worth 8-11x,
+    # so if the end-to-end number does not move, the first thing to check is whether the
+    # predicate ever matched -- not whether the rewrite works.
+    # A file, not stdout: under the training launcher stdout goes through capture layers that
+    # demonstrably swallow lines -- the same reason the ASM-backward gate writes a trace file.
+    out = os.environ.get("NKFIX_STATS_FILE", "/tmp/nkfix_stats.txt")
+    try:
+        with open(out, "w") as f:
+            f.write("stats: %r\n" % (stats,))
+            for k, v in sorted(_seen.items(), key=lambda kv: -kv[1]):
+                f.write("  %5d x  A%s %s  B%s %s\n" % (v, k[0], k[2], k[1], k[3]))
+    except Exception as e:
+        print("[nkfix] stats write failed: %r" % (e,), flush=True)
+
+
 def install():
-    """Activate globally without a `with` block, so it can be turned on from a converter."""
     global _mode
     if _mode is None:
         _mode = NKFix()
         _mode.__enter__()
+        import atexit
+        atexit.register(_report)
     return stats
