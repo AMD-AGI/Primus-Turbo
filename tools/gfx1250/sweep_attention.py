@@ -137,12 +137,17 @@ def report(path: Path) -> int:
         )
 
     if wrong:
+        # total_ms may be absent: tune_attention returns BEFORE timing when SQNR fails, so a
+        # wrong candidate carries its dB values and no time. Reading it unguarded crashed the
+        # report -- and the same read in the run loop below aborted the sweep -- on exactly
+        # the candidate this tool exists to surface.
         print("\nWRONG -- fast but incorrect, never eligible to win:")
-        for r in sorted(wrong, key=lambda r: r["total_ms"]):
+        for r in sorted(wrong, key=lambda r: r.get("total_ms", float("inf"))):
             db = r.get("sqnr_db", {})
             failed = ",".join(r.get("failed_tensors", []))
+            _ms = f"{r['total_ms']:>8.3f} ms" if "total_ms" in r else "  (untimed)"
             print(
-                f"  {(r['tune'] or '<default>'):<44} {r['total_ms']:>8.3f} ms  "
+                f"  {(r['tune'] or '<default>'):<44} {_ms}  "
                 f"failed={failed}  "
                 + " ".join(f"{t}={db.get(t, float('nan')):.1f}dB" for t in ("out", "dq", "dk", "dv"))
             )
@@ -245,7 +250,7 @@ def main() -> int:
                 "ok" if rec.get("ok") and rec.get("correct", True)
                 else "WRONG" if rec.get("ok") else f"rc={rec.get('returncode')}"
             )
-            if rec.get("ok"):
+            if rec.get("ok") and "total_ms" in rec:
                 print(f"  {status}  {rec['total_ms']:.3f} ms  {rec['total_tflops']:.1f} TFLOP/s")
             else:
                 print(f"  {status}")
