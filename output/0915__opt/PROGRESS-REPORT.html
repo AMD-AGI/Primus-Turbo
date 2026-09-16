@@ -138,14 +138,14 @@
 
 <div class="tiles">
   <div class="tile">
-    <div class="k">端到端训练吞吐（0916）</div>
-    <div class="v">6.21×</div>
-    <div class="n">6,128 → 38,043 tps<br>n=6，8 层配置</div>
+    <div class="k">端到端吞吐 · <b>32 层生产配置</b></div>
+    <div class="v">5.85×</div>
+    <div class="n">1,984 → 11,608 tps<br>20 步跑完，峰值显存 88.32%</div>
   </div>
   <div class="tile">
-    <div class="k">单步时间</div>
-    <div class="v">861<span class="u"> ms</span></div>
-    <div class="n">原 5.35 s</div>
+    <div class="k">单步时间（32 层）</div>
+    <div class="v">2.82<span class="u"> s</span></div>
+    <div class="n">原 16.5 s<br>8 层配置另测得 6.21×</div>
   </div>
   <div class="tile">
     <div class="k">GEMM 实测算力</div>
@@ -483,6 +483,20 @@ TN 路径:  ProblemMap: Contraction_l_Alik_Bljk...   sol-tag = Prediction  ← �
     <tr class="hl"><td><b>+ wgrad 布局修法（0916）</b></td><td class="num"><b>38,043</b></td>
         <td class="num"><b>640.7 TF/s</b></td><td class="num">1.97%</td>
         <td class="mono cond">n=6，对无 patch <b>6.21×</b></td></tr>
+  </tbody>
+</table>
+</div>
+
+<h4>32 层生产配置（真正该看的那一组）</h4>
+<div class="tw">
+<table>
+  <caption>llama-3.1-8B <b>32 层</b>，b=4，s=8192，单卡，20 步 —— 与 JIRA 同形的那个配置</caption>
+  <thead><tr><th>配置</th><th class="num">tps</th><th class="num">单步</th><th class="num">峰值显存</th><th>备注</th></tr></thead>
+  <tbody>
+    <tr><td>无 patch（ASM 反向关）</td><td class="num">1,984</td><td class="num">16.5 s</td><td class="num">87.98%</td><td class="cond">n=1，未播种</td></tr>
+    <tr><td>无 patch（ASM 反向开）</td><td class="num">1,858</td><td class="num">17.6 s</td><td class="num">87.98%</td><td class="cond">n=1，未播种</td></tr>
+    <tr class="hl"><td><b>+ GEMM 布局修法</b></td><td class="num"><b>11,608</b></td><td class="num"><b>2.82 s</b></td>
+        <td class="num">88.32%</td><td class="cond"><b>5.85× / 6.25×</b>，20 步跑完，稳态抖动 &lt;0.4%</td></tr>
   </tbody>
 </table>
 </div>

@@ -47,6 +47,11 @@ three prebuilt `.co` files to maintain.
 | + dgrad layout fix | 11,604 | ~204 | 0.42% |
 | **+ wgrad layout fix** | **38,043** | **640.7** | 1.97% (n=6) |
 
+**And on the 32-layer production configuration** — the one that matches JIRA's shape —
+1,984 -> **11,608 tps, 5.85x**, all 20 steps, peak memory 88.32% against the unpatched
+87.98%. Step time 16.5 s -> 2.82 s. That is the number to quote; the 8-layer figures exist
+to make A/B affordable and are not comparable to a 32-layer result.
+
 **Do not quote MFU from these runs.** torchtitan's `get_peak_flops()` falls back to
 "assume A100" (312e12) for any unrecognised `device_name`, and this box reports
 "AMD Radeon Graphics" -- so every MFU figure it printed used an A100 denominator.
