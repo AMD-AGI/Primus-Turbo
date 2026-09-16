@@ -55,6 +55,13 @@ operator-level 1.74x; only its share of the step changed, and that was changed b
 fix. An optimisation's end-to-end value is a property of its relationship to the current
 bottleneck, not of the optimisation.
 
+**A third fix landed on 0916**: the GEMM workaround bought its speed with 137 ms/step of
+operand copies that nothing could cache. Routing those calls to a colleague's gfx1250 FlyDSL
+WMMA GEMM removes the copies entirely. Over three alternating pairs, **every FlyDSL run beat
+every baseline run, the slowest by 9.6%**; the arm is bimodal between runs at +9.7% and +17.5%,
+which is not yet explained. Stacked: **6,128 -> 46.5k-49.9k tps, 7.6x-8.1x**, step 5.35 s ->
+about 0.7 s. It is off by default until the bimodality is understood.
+
 **And on the 32-layer production configuration** — the one that matches JIRA's shape —
 1,984 -> **11,608 tps, 5.85x**, all 20 steps, peak memory 88.32% against the unpatched
 87.98%. Step time 16.5 s -> 2.82 s. That is the number to quote; the 8-layer figures exist
