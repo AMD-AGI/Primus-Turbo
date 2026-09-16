@@ -380,12 +380,8 @@ def _make_dualwave_swp_traits(
     """Build gfx950 DUALWAVE_SWP compile-time layout traits."""
     rows_per_wave = 32
     warp_size = 64
-    # A left window trims the body to `ceil((W + block_m)/BLOCK_N)` KV tiles, and that band is
-    # `W + block_m` columns wide however few rows share it -- so halving `block_m` removes a
-    # quarter of the masked-away MFMA work. The narrower body also falls out of the
-    # `block_m in (128, 256)` gate that raises `waves_per_eu` to 4, which costs more than it
-    # returns on a body this short. Measured +16.9% / +17.5% on GQA head_dim 64, W=128, s=8192.
-    # Gated on the window: the dense path has no band and is bit-for-bit unaffected.
+    # Windowed default BLOCK_M=64 (fewer masked KV tiles; also avoids waves_per_eu=4).
+    # Dense default stays 256. Callers can still pass block_m explicitly.
     if block_m is None:
         block_m = 64 if int(window_left) >= 0 else 256
     wave_row_groups = block_m // rows_per_wave
@@ -722,20 +718,8 @@ class DualwaveKernelContext:
         else:
             self.lse_rsrc = None
 
-        # Learned attention sink: one fp32 scalar per q-head, folded into the online-softmax
-        # denominator in the epilogue (virtual key with logit=sink_h, value=0). q_head_idx is
-        # wave-uniform, so this is a scalar load shared by all lanes of the wave.
-        #
-        # The attention sink is loaded at its point of use in the epilogue, not here.
-        #
-        # Issued in the prologue, its result is live across the whole KV loop for a single
-        # consumer in `finalize_o_scale`. That one extra long-lived value is what pushes the
-        # sink + EMIT_LSE build over the allocator's limit: it emits 112 B of scratch where
-        # every neighbouring configuration emits 0-24 B, and the sink is the only thing it adds
-        # to the loop body. Deferring the load removes the scratch and is arithmetically
-        # identical -- `SINK`, `NUM_HEADS_Q` and `q_head_idx` are all available in the epilogue,
-        # so it is the same address, the same value and the same order of fp32 operations.
-        # Measured +13.2% on GQA head_dim 64 dense with a sink, s=8192.
+        # Sink is loaded in the epilogue (`load_sink_h`), not here: a prologue load stays
+        # live across the KV loop and spills ~112 B of scratch on the sink+LSE build.
         self.sink_h = None
 
         self.load_atom_128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
@@ -776,14 +760,8 @@ class DualwaveKernelContext:
             self.max_num_tiles = self.num_kv_tiles
 
         if const_expr(traits.CAUSAL and traits.WINDOW_LEFT >= 0):
-            # ODD-LENGTH WINDOWED BODY.
-            # The emitted pipeline is prologue (1 tile) + loop (2 tiles per iteration) +
-            # drain, so the legal trip counts are fixed by the drain length alone: the
-            # three-tile drain admits N in {4, 6, 8, ...}, and the two-tile drain in
-            # flash_attn_fwd.py -- selected by this same WINDOW_LEFT const_expr -- admits
-            # N in {3, 5, 7, ...}. A 128-wide left window over a 64-row q block touches
-            # exactly three KV tiles, so rounding N up to even is what made every windowed
-            # workgroup carry a fourth tile the mask then threw away. Keep N odd instead.
+            # Keep an odd KV span: two-tile drain admits N in {3,5,7,...}; even-rounding
+            # added a fourth tile that the window mask then threw away.
             self.max_num_tiles = fx.Index(
                 ArithValue(self.max_num_tiles < fx.Index(3)).select(fx.Index(3), self.max_num_tiles)
             )
@@ -798,11 +776,8 @@ class DualwaveKernelContext:
                 )
             )
             swa_lo_tile = fx.Index(ArithValue(swa_lo_tile < max_lo).select(swa_lo_tile, max_lo))
-            # Widen by one tile when the span came out even. Downward by preference: the
-            # extra tile then sits below the window and the window edge mask zeroes it.
-            # Only at tile 0, where there is nothing below, does the span grow upward, past
-            # the causal end -- where the causal mask zeroes it, exactly as the old >= 4
-            # floor already relied on for short sequences.
+            # If the span is even, grow by one tile. Prefer downward (window-masked);
+            # at tile 0 grow upward (causal-masked).
             span = self.max_num_tiles - swa_lo_tile
             span_odd = span - (span // fx.Index(2)) * fx.Index(2)
             grow = fx.Index(1) - span_odd
@@ -944,16 +919,8 @@ class DualwaveKernelContext:
             v_s_hi = _mfma_acc(k_hi[ks], q_pack, v_s_hi, self.mma_atom, self.mfma_acc_vec_type)
         return (v_s_lo, v_s_hi)
 
-    # WAVE-LOCAL DEAD 32-COLUMN CHUNK ELISION.
-    # `qk` runs the tile's two 32-column halves as two independent 32x32 MFMA chains
-    # (k_lo / k_hi). A wave owns ROWS_PER_WAVE = 32 q rows, so for a windowed band of
-    # W + BLOCK_M = 192 columns one of the six half-tiles is provably ALL -inf for each
-    # wave: row group 0's last tile HI half is entirely above the causal edge, row
-    # group 1's first tile LO half is entirely below the window edge. Both predicates
-    # are wave-uniform (q_start_pos_i32 comes from readfirstlane), so this is a scalar
-    # branch, not divergence. Skipping the chain leaves the accumulator at zero and the
-    # existing mask then writes -inf over it -- the same bits the live chain would have
-    # produced after masking, so the change is bit-exact by construction.
+    # Skip a 32-col QK half that is wholly -inf for this wave (window/causal edge).
+    # Predicates are wave-uniform; the mask still writes -inf over skipped accs.
     def chunk_live(self, tile_idx):
         traits = self.traits
         kv0 = fx.Int32(self.tile_start(tile_idx))
@@ -964,16 +931,7 @@ class DualwaveKernelContext:
             win_lo = fx.Int32(q_lo - fx.Int32(traits.WINDOW_LEFT))
             live_lo = ArithValue(fx.Int32(kv0 + fx.Int32(31)) >= win_lo)
         else:
-            # CAUSAL LO PREDICATE.
-            # `live_hi` above has always had a causal reading (the HI half starts at kv0+32
-            # and is wholly past the causal edge when that exceeds the wave's last q row),
-            # but `live_lo` was only ever formed for the SWA *window* edge, so on the dense
-            # causal path it returned None and the LO chain always ran. The LO half has its
-            # own causal condition and it is the same shape: the half spanning columns
-            # [kv0, kv0+31] is entirely above the causal edge exactly when its FIRST column
-            # already exceeds the wave's last q row. On the band's last tile (kv0 = 128b+64)
-            # that is true for both low q-row groups, which is the largest single block of
-            # dead work in the kernel -- a whole 32x64 tile per wave, twice per q block.
+            # Dense causal: LO half is dead when kv0 already exceeds the wave's last q row.
             live_lo = ArithValue(kv0 <= q_hi)
         return live_lo, live_hi
 
@@ -1110,7 +1068,7 @@ class DualwaveKernelContext:
         return ArithValue(fx.Float32(l_row) > self.c_zero_f).select(l_inv, self.c_zero_f)
 
     def load_sink_h(self):
-        """The deferred sink load. See the note where the prologue would have issued it."""
+        """Load the per-q-head attention sink (epilogue, not prologue)."""
         traits = self.traits
         _sink_rsrc = buffer_ops.create_buffer_resource(
             self.SINK,
@@ -1178,9 +1136,7 @@ class DualwaveKernelContext:
         )
 
     def _causal_mask_inplace(self, v_s, tile_idx, q_row_i32=None, *, do_causal=True, do_window=True):
-        # `do_causal` / `do_window` are plain Python bools, so each
-        # instantiation emits only the edge it was asked for. Defaults reproduce the
-        # original text exactly, which is what the dense path still takes.
+        # Python bools: each instantiation emits only the requested edge.
         if q_row_i32 is None:
             q_row_i32 = self.q_row_i32
         traits = self.traits
@@ -1227,18 +1183,7 @@ class DualwaveKernelContext:
             s_lo, s_hi = v_s
             _need = q_start_pos_i32 + self.delta_i32 < fx.Int32(kv_end_pos)
             if const_expr(traits.WINDOW_LEFT >= 0):
-                # EDGE-SELECTIVE MASKING.
-                # The windowed body is 4 KV tiles wide and covers a band of W + BLOCK_M = 192
-                # columns. Written out (delta = 0, q_start a multiple of BLOCK_N), the tiles
-                # relative to the q block's base row carry:
-                #   [-128,-65] window edge only     [-64,-1] neither     [0,63] causal edge only
-                #   [64,127]   causal edge only (fully masked)
-                # -- no tile ever needs BOTH edges. The old code ORed the two predicates and then
-                # applied all FOUR `_apply_dualwave_mask_pair` calls whenever either fired, so on
-                # each of the three masked tiles half the mask work (2 pairs = 16 inline-asm
-                # blocks = 64 VALU/SALU ops) was provably a no-op that still issued.
-                # Split into two independently predicated regions instead. This is a predicate at
-                # the call site, not a text deletion, which is what the pool entry asked for.
+                # Window and causal edges never share a tile; apply each mask only when needed.
                 _win_edge = (
                     q_start_pos_i32 + fx.Int32(traits.BLOCK_M) + self.delta_i32 - fx.Int32(traits.WINDOW_LEFT)
                 )
@@ -1454,20 +1399,7 @@ class DualwaveKernelContext:
 
 
 def _scale_sched_pairs(pairs, head_dim):
-    """Quarter the `sched_group_barrier` anchor count at head_dim 64.
-
-    The shipped rule already halves the anchor count here, but the halving is keyed to
-    `head_dim` while the population being interleaved against those anchors is the softmax
-    (`exp2` over a BLOCK_M x 64-kv-column score tile), which does not depend on `head_dim`
-    at all. At head_dim 64 the anchors were halved and the EXP/VALU work they spread was
-    not, leaving the body over-anchored. Measured monotone across the ratio: 5/4 of the
-    shipped count reaches 1206.9 TFLOP/s, 1/1 reaches 1234.0, 1/2 reaches 1256.7 and 1/4
-    reaches 1255.8 on GQA head_dim 64 dense, s=8192 -- a plateau from about 1/2 downward,
-    and roughly 4% above it.
-
-    `sched_group_barrier` is a scheduling hint: it reorders within a region and cannot
-    change dataflow, so every ratio is bit-exact.
-    """
+    """At head_dim 64, use 1/4 of the sched_group_barrier anchors (softmax work is D-independent)."""
     if head_dim != 64:
         return pairs
     return max(1, (pairs + 3) // 4)

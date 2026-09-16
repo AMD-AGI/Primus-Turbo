@@ -169,10 +169,7 @@ def build_flash_attn_dualwave_swp_module(
         fold_mem_barriers = sink_drains and traits.Q_HEADS_PER_WG > 1
         fold_pv_barriers = fold_mem_barriers and late_dma
         vm_drain_sync = 0 if fold_pv_barriers else ctx.VM_DRAIN_KV
-        # Drain length. The pipeline's legal trip counts are set by
-        # the drain: three named tiles means N even, two means N odd. The windowed body
-        # needs exactly three KV tiles, so it takes the two-tile drain and attn_helper.py
-        # keeps its span odd. Every other configuration keeps the three-tile drain.
+        # Two-tile drain admits odd KV spans (windowed); three-tile drain needs even N.
         short_drain = traits.CAUSAL and traits.WINDOW_LEFT >= 0
 
         def _mem_cluster_sync():
@@ -185,25 +182,8 @@ def build_flash_attn_dualwave_swp_module(
             if const_expr(sink_drains):
                 _s_waitcnt(traits.LGKMCNT_0_ONLY)
                 _waitcnt_vm_n(vm_drain_sync)
-            # ⚠ The `const_expr` branch below is NOT dead code, however much it looks like it.
-            #
-            # `sched_region` is False at every call site, so the condition never holds and the
-            # emitted instruction sequence is the same either way -- the `else` arm is always
-            # what runs. Collapsing the branch to a bare `_dualwave_sync_barrier()` nevertheless
-            # costs **5%** at head_dim 64 dense (1261 -> 1199 TFLOP/s, s=8192, measured
-            # palindromically against the branch-ful build in one session, both arms within
-            # 0.2%). Bisected to this function: the same cleanup applied to `attn_helper.py`
-            # alone is neutral, and restoring only this branch recovers the whole 5%.
-            #
-            # The tracer evidently makes a region of the `const_expr` arms, and that region
-            # boundary reaches the scheduler. This kernel is unusually sensitive to exactly
-            # that: it is power-bound with the vector pipe as the secondary constraint, and
-            # sweeping the `sched_group_barrier` anchor count alone moves it 4%. So the branch
-            # is a scheduling fence that happens to be spelled as a condition.
-            #
-            # This is understood only that far. It is kept because removing it is measurably
-            # worse, not because the mechanism is settled -- if you find the real one, replace
-            # this with the fence it deserves and delete the note.
+            # Not dead: `sched_region` is always False, but collapsing this to a bare
+            # `_dualwave_sync_barrier()` costs ~5% at head_dim 64. Keep the `const_expr`.
             if const_expr(sched_region):
                 _sched_barrier(0)
                 _sched_barrier(0)
@@ -238,13 +218,7 @@ def build_flash_attn_dualwave_swp_module(
                 return ctx.lds_load_k(buf_id)
 
             def _qk(v_k, buf_id, tile_idx=None, live=None):
-                """QK for one KV tile, issuing the tail K packs between the two MFMA
-                groups so only the head half is resident across the softmax cluster.
-
-                `tile_idx` is passed only on the two band-edge
-                tiles of the windowed body, where one of the tile's two 32-column MFMA
-                chains is wholly masked for each wave row group. See
-                `attn_helper.chunk_live`."""
+                """QK for one KV tile. `tile_idx`/`live` skip a wave-uniform dead 32-col half."""
                 if const_expr(tile_idx is None and live is None):
                     if const_expr(not split_k_reads):
                         return ctx.qk(v_k, q_all_scaled_bf16)
@@ -252,10 +226,7 @@ def build_flash_attn_dualwave_swp_module(
                     v_s = ctx.qk(v_k, q_all_scaled_bf16, ks_range=(0, K_HEAD))
                     v_k = ctx.lds_load_k(buf_id, ks_range=ks_tail, k_regs=v_k)
                     return ctx.qk(v_k, q_all_scaled_bf16, v_s=v_s, ks_range=ks_tail)
-                # `live` lets a call site supply the pair directly and
-                # pass None for a half it has proved is always live, so no branch is emitted
-                # for it. `chunk_live` alone would hand back a predicate that is always true
-                # there, which costs a scalar compare and an scf.if for nothing.
+                # Pass live=(None, pred) to skip the always-true half (avoids a dead scf.if).
                 if const_expr(live is None):
                     live_lo, live_hi = ctx.chunk_live(tile_idx)
                 else:
@@ -288,23 +259,10 @@ def build_flash_attn_dualwave_swp_module(
                     v_o = _pv_step(step, v_p, v_v, v_o, buf_id)
                 return v_o
 
-            # DEAD HALF-TILE P*V AND V LDS ELISION.
-            # `chunk_live` already skips the QK MFMA chain of the 32-column half-tile that
-            # is provably wholly masked for this wave (see `attn_helper.chunk_live`). Those
-            # scores are then -inf, so P is exactly 0 across that half and its two P*V steps
-            # add exactly 0*V to the accumulator -- the elision is bit-exact for the same
-            # reason g28 was. What g28 did NOT remove, and what these two wrappers do, is
-            # the feeding `ds_read_b64_tr_b16` stream: one V substep is 2 * D_CHUNKS reads,
-            # so skipping two substeps removes 8 LDS instructions per wave at hd64, on top
-            # of 2 * D_CHUNKS = 4 MFMAs. Both wrappers are inside `short_drain`, so no dense
-            # shape sees them. The predicate is wave-uniform (`q_start_pos_i32` comes from
-            # readfirstlane), hence a scalar branch, not divergence.
+            # Skip P*V + V LDS reads on a wave-uniform dead 32-col half (P is 0 after the mask).
 
             def _pv_branch(v_o, live, body):
-                """Run `body` on the accumulator list under a wave-uniform scalar branch.
-                `flyc.jit` cannot carry a Python list across an `scf.if` ("state variable
-                is list, not an MLIR Value"), so the D_CHUNKS accumulators are passed and
-                yielded positionally. D_CHUNKS is 2 at hd64 and 4 at hd128."""
+                """Scalar-branch `body` over D_CHUNKS accs; flyc.jit cannot carry a Python list."""
                 if const_expr(traits.D_CHUNKS == 2):
 
                     @flyc.jit
@@ -330,10 +288,7 @@ def build_flash_attn_dualwave_swp_module(
                 return list(_branch4(v_o[0], v_o[1], v_o[2], v_o[3], live))
 
             def _pv_hi_live(v_p, v_v, v_o, buf_id, live_hi):
-                """P*V for a tile whose HI 32 columns may be wholly masked -- the band's
-                LAST tile, for the low q-row group. Steps 0/1 always run; steps 2/3 and the
-                substep-2/3 V reads sit under the branch, so this site removes 2 * D_CHUNKS
-                MFMAs and 2 * 2 * D_CHUNKS `ds_read_b64_tr_b16` (8 at hd64)."""
+                """P*V with HI 32-col (steps 2/3) under `live_hi`."""
                 v_o = ctx.pv_step_k(0, v_p, v_v, v_o)
                 if const_expr(split_kv_reads):
                     ctx.lds_load_v(buf_id, substeps=(1, 2), packs=v_v)
@@ -348,11 +303,7 @@ def build_flash_attn_dualwave_swp_module(
                 return _pv_branch(v_o, live_hi, _tail)
 
             def _pv_lo_live(v_p, v_v, v_o, buf_id, live_lo):
-                """P*V for a tile whose LO 32 columns may be wholly masked -- the band's
-                FIRST tile, for the high q-row group. Substep 2 is hoisted above the branch
-                because step 2 needs it on both paths, and substep 0 was already read by the
-                preceding memory cluster, so this site removes 2 * D_CHUNKS MFMAs but only
-                2 * D_CHUNKS reads (4 at hd64) rather than 8."""
+                """P*V with LO 32-col (steps 0/1) under `live_lo`. Substep 2 is live on both paths."""
                 if const_expr(split_kv_reads):
                     ctx.lds_load_v(buf_id, substeps=(2, 3), packs=v_v)
 
@@ -369,17 +320,7 @@ def build_flash_attn_dualwave_swp_module(
                 return ctx.pv_step_k(3, v_p, v_v, v_o)
 
             def _pv_both_live(v_p, v_v, v_o, buf_id, live_lo, live_hi):
-                """P*V for the band's LAST tile, where BOTH 32-column
-                halves can be wholly masked for a wave. Composition of `_pv_lo_live` and
-                `_pv_hi_live` with nothing hoisted between them: steps 0/1 and the substep-1
-                read sit under `live_lo`, steps 2/3 and the substep-2/3 reads under
-                `live_hi`. Substep 0 was already read by the preceding memory cluster. For
-                the two low q-row groups both predicates are false and the tile then
-                contributes no MFMA and no `ds_read_b64_tr_b16` at all, which is what
-                `_pv_hi_live` alone could not do -- it runs steps 0/1 unconditionally.
-                Bit-exact for the same reason as the QK and P*V elisions above: the skipped
-                columns are exactly the ones the causal mask writes -inf over, so their P is
-                exactly 0 and their P*V contribution is exactly 0*V."""
+                """P*V with both 32-col halves predicated; skipped accs are overwritten by the mask."""
 
                 def _head(v_o):
                     v_o = ctx.pv_step_k(0, v_p, v_v, v_o)
@@ -439,7 +380,7 @@ def build_flash_attn_dualwave_swp_module(
 
             ctx.load_k_split(2, 0)
 
-            # m_row IS NOT CARRIED. See the note at the unpack below.
+            # m_row is loop-invariant (fixed-max path); do not carry it across the back edge.
             init_args = [l_row_init]
             for _ in range_constexpr(traits.D_CHUNKS):
                 init_args.append(v_o_zero)
@@ -549,21 +490,7 @@ def build_flash_attn_dualwave_swp_module(
                 if const_expr(not late_dma):
                     ctx.load_k_tile(j_idx + 1, 0)
                 v_v = _load_v_head(1)
-                # CLUSTER 6'S MASK IS DEAD ON THE PLAIN DENSE PATH.
-                # Cluster 3 forty lines up already carries this exact predicate; Cluster 6 did
-                # not, and called the mask on `CAUSAL` alone. It can never fire here: dense has
-                # split_t0 = 0 and split_t_end = max_num_tiles = 2b+2 (even, no rounding) for
-                # q_block b, the loop is `range(3, split_t_end - 1, 2)` so j <= split_t_end - 3,
-                # and this call masks tile j-1 with kv_end_tile = j, i.e.
-                # kv_end_pos = 64j <= 64(split_t_end-3) = 128b - 64. The guard inside is
-                # `q_start_pos + delta < kv_end_pos` with q_start_pos >= 128b and delta = 0, so
-                # it is false on every iteration for every wave row group. Masking is only ever
-                # needed on tiles split_t_end-2 and split_t_end-1 -- the 128-row diagonal band is
-                # exactly two 64-column tiles -- and both belong to the three-tile epilogue drain.
-                # What the dead call still emits is a scalar compare, a branch, and an scf.if
-                # whose merge carries 32 f32 of scores, inside a memory cluster that also carries
-                # hand-written _waitcnt_vm_n. Bit-exact: the branch is proven not taken and the
-                # else arm is `scores_for_softmax`, the identity on this configuration.
+                # Dense causal: Cluster 6 is before the diagonal band; mask only on SWA / cross-seqlen.
                 if const_expr(traits.CAUSAL and (traits.CROSS_SEQLEN or traits.WINDOW_LEFT >= 0)):
                     v_s_0 = ctx.causal_mask_prologue_if_needed(
                         v_s_0,
@@ -599,18 +526,7 @@ def build_flash_attn_dualwave_swp_module(
                 yield_args = [l_row] + v_o + [v_p_0[0], v_p_0[1]]
                 loop_results = yield yield_args
 
-            # Epilogue drains the final in-flight tiles without further prefetch-ahead.
-            # m_row IS LOOP-INVARIANT, SO IT DOES NOT CROSS THE BACK EDGE.
-            # In this tree the max-rebase machinery is compiled out unconditionally rather than
-            # under a const_expr: attn_helper.py `tile_rescale_o` returns its (v_o, m_row, l_row,
-            # v_p) verbatim, `tile_row_max` returns (m_row, None), and `shift_scores` IGNORES its
-            # row_max argument. There is exactly one definition of each in the whole _vendor tree.
-            # So inside the loop m_row was read out of the iter args, handed to two identities and
-            # two functions that ignore it, and yielded back bit-identical to the block argument it
-            # arrived as -- one per-lane f32 held live across the entire KV loop for a consumer in
-            # the epilogue (`finalize_o_scale`). That is the same shape as the deferred sink
-            # load, and worth +13.2% here. Substituting m_row_pro is bit-exact by construction: it is the same SSA
-            # value the loop was returning.
+            # Epilogue drains the final in-flight tiles. m_row is the prologue value.
             m_row = m_row_pro
             l_row = loop_results[0]
             v_o = [loop_results[1 + i] for i in range_constexpr(traits.D_CHUNKS)]
@@ -624,13 +540,7 @@ def build_flash_attn_dualwave_swp_module(
                 _dualwave_sync_barrier()
 
             if const_expr(short_drain):
-                # TWO-TILE DRAIN.
-                # The three-tile drain below with its middle stage removed. The last two
-                # tiles are max_m2 and max_m1 and both of their K tiles are already
-                # resident -- buf1 from the loop's C2 (or the prologue's load_k_split(1, 1)
-                # when the loop does not run) and buf0 from the loop's C6 (or the
-                # prologue's load_k_split(2, 0)) -- so this drain issues no K DMA at all.
-                # Legal trip counts are N in {3, 5, 7, ...}.
+                # Two-tile drain: last two K tiles already resident, no K DMA. Odd trip counts only.
 
                 # S0 (memory): prefetch V max_m2 into buf1, read the resident K max_m2.
                 _s_nop(3)
@@ -708,14 +618,7 @@ def build_flash_attn_dualwave_swp_module(
                     kv_end_tile=split_t_end,
                 )
                 _s_waitcnt(traits.LGKMCNT_0_ONLY)
-                # S6 ISSUES NO DMA, so it must not drain any.
-                # In the two-tile drain both K tiles are already resident, so S2
-                # and S6 issue nothing: the only vm traffic S6 can see is S4's V prefetch for
-                # max_m1, exactly NUM_DMA_V * dma_wave_reps deep. The inherited VM_DRAIN_V is
-                # half that, so this wait used to retire half of S4's prefetch a whole compute
-                # cluster (S7 -- the drain's largest, a P*V plus a complete softmax) before S8's
-                # vmcnt(0) would have drained it anyway. S6's own ds_read is of buf1, covered by
-                # S4's wait plus its barrier; S8 still drains its own with vmcnt(0). Bit-exact.
+                # S6 issues no DMA; wait the full S4 V prefetch, not VM_DRAIN_V (half a tile).
                 _waitcnt_vm_n(ctx.NUM_DMA_V * (traits.SMEM_N_RPT // traits.NUM_WAVES))
                 _dualwave_sync_barrier()
 
@@ -742,14 +645,7 @@ def build_flash_attn_dualwave_swp_module(
                 _sched_barrier(0)
 
                 # S8 (memory): read the final V packs (buf0, prefetched at S4).
-                # The drain is BEFORE the read here, unlike every other memory cluster.
-                # A cluster's `_waitcnt_vm_n(VM_DRAIN_KV / VM_DRAIN_V)` is what retires the
-                # PREVIOUS cluster's tile -- the drains are one and a half tiles wide and
-                # each memory cluster issues one tile -- so a read is covered by the wait
-                # two clusters back. This drain removes the stage that would have issued
-                # that DMA, leaving half of the S4 prefetch still in flight, so it has to
-                # drain its own: vmcnt(0), then the barrier, because each wave DMAs the
-                # lines the other waves read.
+                # Drain this stage itself: the missing middle tile left S4's prefetch in flight.
                 _waitcnt_vm_n(0)
                 _dualwave_sync_barrier()
                 v_packs_s8 = _load_v_head(0)
@@ -761,22 +657,8 @@ def build_flash_attn_dualwave_swp_module(
                 _, _live_hi_m1 = ctx.chunk_live(max_m1)
                 v_o = _pv_hi_live(v_p_0, v_packs_s8, v_o, 0, _live_hi_m1)
             else:
-                # WAVE-UNIFORM ELISION ON THE DENSE CAUSAL BAND.
-                # The mechanism (`chunk_live` + `qk_live` + `_pv_branch`) has been in this
-                # kernel since the QK and P*V elisions but sat entirely inside `short_drain`,
-                # i.e. SWA only -- `flash_attn_fwd.py` said so in as many words and no dense
-                # shape ever reached it. The three-tile dense drain has the same structure:
-                # with split_t_end = 2b+2 for q block b, tile max_m3 = 2b-1 starts at
-                # 128b-64 and is wholly live for every wave, while the two band tiles are not.
-                # A wave owns ROWS_PER_WAVE = 32 rows, so q_hi = 128b + wave_off + 31:
-                #   max_m2 (kv0 = 128b):    LO live for all four row groups; HI dead for
-                #                           row group 0            -> 1 x 32x32
-                #   max_m1 (kv0 = 128b+64): LO dead for row groups 0 and 32, HI dead for
-                #                           0, 32 and 64           -> 2 x 32x32 + 3 x 32x32
-                # 6144 of the 8128 dead score elements per q block are reachable this way;
-                # the remaining 1984 are the per-lane triangle and are not wave-uniform.
-                # max_m2's LO predicate is omitted rather than computed: kv0 = 128b <= q_hi
-                # holds for every row group, so it would be an always-taken branch.
+                # Dense causal drain: skip wave-uniform dead halves on the last two KV tiles.
+                # max_m2 LO is always live; pass live=(None, hi) to avoid an always-true branch.
                 _live_hi_m2 = ctx.chunk_live(max_m2)[1]
                 _live_lo_m1, _live_hi_m1 = ctx.chunk_live(max_m1)
 
@@ -939,8 +821,7 @@ def build_flash_attn_dualwave_swp_module(
                 _dualwave_sync_barrier()
 
                 # Epilogue C13 (compute): final P*V -> v_o holds the unnormalized output.
-                # v_p_1 belongs to max_m1, the band's last tile -- both halves are
-                # dead for row groups 0 and 32, so those waves issue no P*V for it at all.
+                # v_p_1 belongs to max_m1; both halves are dead for row groups 0 and 32.
                 v_o = _pv_both_live(v_p_1, v_packs_e13, v_o, 1, _live_lo_m1, _live_hi_m1)
 
             # Normalize O; split-K stores normalized partials for later w_s * l_s reweighting.
@@ -953,15 +834,7 @@ def build_flash_attn_dualwave_swp_module(
 
             _s_barrier()
 
-            # The LSE store goes BEFORE the O store, not after. With HAS_SINK,
-            # finalize_o_scale derives two fresh per-lane fp32 (mf, l_out) that only store_lse
-            # consumes; leaving the O store between them and their use holds both live across
-            # the kernel's register peak (permlane32_swap re-lane + packed dwordx4 stores).
-            # That is the one configuration that pays 112 B of scratch -- sink AND emit_lse,
-            # i.e. exactly the scored dense shapes; the sink-free build pays 20 B because its
-            # m_lse is the fixed zero reference and its l_lse is already live for the
-            # reciprocal. Consuming them first is bit-exact: different output tensors, no
-            # aliasing, both already after the same barrier.
+            # Store LSE before O so sink+LSE temps are not live across the O-store register peak.
             if const_expr(traits.EMIT_LSE):
                 ctx.store_lse(m_lse, l_lse, ctx.q_row)
             ctx.store_final_o(v_o, ctx.q_row)
