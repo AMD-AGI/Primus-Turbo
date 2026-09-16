@@ -80,7 +80,7 @@ BLAS_ENV="-e HIPBLASLT_TENSILE_LIBPATH=$D" \
   bash output/0915__opt/bin/e2e.sh fix2-off repro_l8b_turbo_conv_8L.yaml
 ```
 
-**用 8 层配置**（`repro_l8b_turbo_conv_8L.yaml`，已验证显存只占 26%）。
+**用 8 层配置**（`repro_l8b_turbo_conv_8L.yaml`，已验证峰值显存 141.00 GiB / 32.64%（早期记的 26% 与 step 行不符））。
 32 层那个配置在 88% 显存上跑，今天两次挂卡都和它有关。
 8 层单层形状与生产逐项相同，op 级 1.741× 的参照点不变。
 

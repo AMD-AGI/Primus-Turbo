@@ -22,7 +22,7 @@ Primus 仓库（`/home/lihuzhan/code/2026_0828__primus/Primus`）的 remote 是�
 | 文件 | 用途 |
 |---|---|
 | `repro_l8b_turbo_conv.yaml` | 32 层生产配置，显存 88%，今天两次挂卡都与它有关 |
-| `repro_l8b_turbo_conv_8L.yaml` | 8 层，20 步 —— 今天绝大多数 A/B 用它 |
+| `repro_l8b_turbo_conv_8L.yaml` | 8 层，20 步，峰值显存 141.00 GiB（32.64%）—— 绝大多数 A/B 用它 |
 | `repro_l8b_turbo_conv_8L_fast.yaml` | 8 层，10 步（已验证 step 4–8 中位与 8–20 差 ≤0.22%），每次省 53% |
 | `repro_l8b_turbo_conv_8L_prof.yaml` | 8 层 + torch profiler，抓 step 5 |
 
