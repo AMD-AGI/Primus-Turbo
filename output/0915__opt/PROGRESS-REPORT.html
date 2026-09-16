@@ -125,7 +125,7 @@
     <li><a href="#tldr">一页纸结论</a></li>
     <li><a href="#bg">背景知识（零基础可读）</a></li>
     <li><a href="#line1">主线一：attention 算子优化 4.76×</a></li>
-    <li><a href="#line2">主线二：GEMM 后端缺陷 —— 端到端 1.894×</a></li>
+    <li><a href="#line2">主线二：GEMM 后端缺陷 —— 端到端 6.21×</a></li>
     <li><a href="#changes">改动了哪些代码（是否只有 turbo）</a></li>
     <li><a href="#lessons">测量方法学：今天推翻了自己三次</a></li>
     <li><a href="#problems">遇到的问题与事故</a></li>
@@ -138,14 +138,14 @@
 
 <div class="tiles">
   <div class="tile">
-    <div class="k">attention 算子（单层）</div>
-    <div class="v">4.76×</div>
-    <div class="n">55.785 → 11.726 ms<br>算子级，n=5，SQNR ≥ 50 dB</div>
+    <div class="k">端到端训练吞吐（0916）</div>
+    <div class="v">6.21×</div>
+    <div class="n">6,128 → 38,043 tps<br>n=6，8 层配置</div>
   </div>
   <div class="tile">
-    <div class="k">端到端训练吞吐</div>
-    <div class="v">1.894×</div>
-    <div class="n">6,128 → 11,604 tps<br>n=9 重复验证</div>
+    <div class="k">单步时间</div>
+    <div class="v">861<span class="u"> ms</span></div>
+    <div class="n">原 5.35 s</div>
   </div>
   <div class="tile">
     <div class="k">GEMM 实测算力</div>
@@ -153,9 +153,9 @@
     <div class="n">原 ~106 → 204 → 640.7<br><b>不要引用日志里的 MFU</b>，见下</div>
   </div>
   <div class="tile">
-    <div class="k">测量噪声</div>
-    <div class="v">↓ 9.3×</div>
-    <div class="n">跨运行标准差<br>3.91% → 0.42%</div>
+    <div class="k">attention 算子（单层）</div>
+    <div class="v">4.76×</div>
+    <div class="n">55.785 → 11.726 ms<br>算子级，n=5，SQNR ≥ 50 dB</div>
   </div>
 </div>
 
@@ -165,7 +165,8 @@
   <li><b>attention 算子优化</b>：把 Primus-Turbo 出厂的 attention 实现从 55.785 ms 优化到 11.726 ms（<b>4.76×</b>），
     精度不变。这解决了 JIRA 上提的第一条请求。<b>但它在端到端几乎测不出收益</b> —— 因为 attention 只占单步时间的 3.3%。</li>
   <li><b>GEMM 后端缺陷</b>：profile 发现单步时间的 <b>94% 是矩阵乘（GEMM）</b>，而其中 <b>97% 跑在一个错误的
-    kernel 上</b>。根因是 hipBLASLt 这个数学库在某一种矩阵布局下<b>缺少调优数据</b>。绕开它之后端到端 <b>1.894×</b>。</li>
+    kernel 上</b>。根因是 hipBLASLt 这个数学库在某一种矩阵布局下<b>缺少调优数据</b>。
+    绕开它之后端到端 <b>6.21×</b>（0915 先修好一半得到 1.894×，0916 修好另一半到 6.21×）。</li>
 </ol>
 
 <div class="note good">
@@ -370,7 +371,7 @@ ASM 反向有约 <b>0.85 ms 的固定开销</b>（跨 16 倍工作量耗时几�
   <b>支撑门槛的这 9 个点需要重新测量。</b></p>
 </div>
 
-<h2 id="line2">主线二：GEMM 后端缺陷 —— 端到端 1.894×</h2>
+<h2 id="line2">主线二：GEMM 后端缺陷 —— 端到端 6.21×</h2>
 <p class="lede">这条线是意外发现的，但它才是今天端到端价值最大的成果。</p>
 
 <h3>怎么发现的：一个对不上的数字</h3>
@@ -477,8 +478,8 @@ TN 路径:  ProblemMap: Contraction_l_Alik_Bljk...   sol-tag = Prediction  ← �
   <tbody>
     <tr><td>基线</td><td class="num">6,128</td><td class="num">~34%</td><td class="num">3.91%</td>
         <td class="mono cond">5822×2 | 5936×2 | 6327×5</td></tr>
-    <tr><td>+ dgrad 布局修法</td><td class="num">11,604</td><td class="num">~204 TF/s</td>
-        <td class="num">0.42%</td><td class="mono cond">11604×9（单一）</td></tr>
+    <tr><td>+ dgrad 布局修法（0915）</td><td class="num">11,604</td><td class="num">~204 TF/s</td>
+        <td class="num">0.42%</td><td class="cond">n=9</td></tr>
     <tr class="hl"><td><b>+ wgrad 布局修法（0916）</b></td><td class="num"><b>38,043</b></td>
         <td class="num"><b>640.7 TF/s</b></td><td class="num">1.97%</td>
         <td class="mono cond">n=6，对无 patch <b>6.21×</b></td></tr>
@@ -502,6 +503,42 @@ TN 路径:  ProblemMap: Contraction_l_Alik_Bljk...   sol-tag = Prediction  ← �
   （672.76 ÷ 312 = 2.156）。<br>
   <b><code>tflops</code> 列是对的</b>（FLOP÷时间），<b><code>mfu</code> 列一律不要引用</b>。
   若用本 campaign 实测的 Triton GEMM roof（1002.7 TF/s @1100 MHz）作分母，640.7 是 <b>63.9%</b>。</p>
+</div>
+
+<h3>0916 续：还有一半没修，而且要两个操作数一起改</h3>
+<p>
+修完 dgrad 后重新 profile，发现 <b>GEMM 里还有一半跑在坏 kernel 上</b> ——
+57 次调用、2185 ms、占 GEMM 时间的 89.8%、占整个单步的 <b>77%</b>，全部是
+<b>wgrad</b>（权重梯度）。第一版规则按 <code>b.is_contiguous()</code> 判断，而 wgrad 的 B 恰好也是连续的，
+所以被 dgrad 规则先认领走、留在了慢路径上。
+</p>
+<div class="tw">
+<table>
+  <caption>同一个 wgrad 形状，四种处理方式（<b>关键：任何单独一个都不够</b>）</caption>
+  <thead><tr><th>处理</th><th class="num">mlp wgrad</th><th class="num">lm_head</th><th class="num">qkv wgrad</th></tr></thead>
+  <tbody>
+    <tr><td>不处理</td><td class="num">54.3 TF/s</td><td class="num">49.9</td><td class="num">56.5</td></tr>
+    <tr><td>只把 B 改成 N-major</td><td class="num">69.3</td><td class="num">67.2</td><td class="num">69.2</td></tr>
+    <tr><td>只把 A 变连续</td><td class="num">62.7</td><td class="num">62.6</td><td class="num">66.7</td></tr>
+    <tr class="hl"><td><b>两个都改</b></td><td class="num"><b>1145.8</b></td><td class="num"><b>1485.3</b></td><td class="num"><b>1627.0</b></td></tr>
+    <tr><td class="cond">含拷贝的净收益</td><td class="num cond">9.36×</td><td class="num cond">14.74×</td><td class="num cond">7.76×</td></tr>
+  </tbody>
+</table>
+</div>
+<div class="note good">
+  <span class="note-h">端到端 38,043 tps（n=6）</span>
+  <p style="margin-bottom:0">对无 patch <b>6.21×</b>，对只修 dgrad 的版本 <b>3.28×</b>。单步 5.35 s → <b>861 ms</b>。
+  五次连跑零卡故障、零 KFD 残留；step-1 loss 与之前逐位相同；
+  <b>峰值显存 141.00 GiB 不变</b> —— 尽管 lm_head 那次要拷贝 7.83 GiB 的 A，被缓存分配器吸收了。</p>
+</div>
+<div class="note warn">
+  <span class="note-h">这一步走通靠的是读命中统计，不是推理 —— 我连错了两次</span>
+  <ol style="margin-bottom:0">
+    <li>第一版 wgrad 规则<b>端到端零收益</b>。读统计才发现它<b>命中 0 次</b>：
+      我的微基准把 B 构造成了非连续，而真实的 B 是连续的，判据永远不成立。</li>
+    <li>据此我又推断"dgrad 规则在把 wgrad 推进坑"。实测<b>证伪</b> ——
+      它其实有帮助（54 → 69 TF/s），只是远远不够。</li>
+  </ol>
 </div>
 
 <h3>顺带解掉了测量噪声问题</h3>
