@@ -52,6 +52,7 @@ from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     dense_forward as triton_dense_forward,
 )
 from primus_turbo.pytorch.ops.attention.attention_utils import (
+    _hybrid_bwd_is_aiter,
     _infer_qkv_format,
     _resolve_is_v3_atomic_fp32_from_env,
     block_scaling_node,
@@ -182,15 +183,64 @@ class FlashAttnFunc(torch.autograd.Function):
                 sink=sink,
             )
             B, Sq, Hq = q.shape[0], q.shape[1], q.shape[2]
-            if is_grad_enabled and _any_requires_grad(q, k, v, sink):
-                ctx.save_for_backward(q_s, k_s, v_s, out_s, lse)
-                ctx.softmax_scale = softmax_scale
-                ctx.causal = causal
-                ctx.window_size = window_size
-                ctx.sink = sink
-                ctx.deterministic = deterministic
-                ctx.lse_shape = (B, Sq, Hq)
             out = out_s.permute(1, 0, 2, 3)
+            # PRIMUS_TURBO_ATTN_HYBRID_BWD=AITER: keep this forward and take aiter's backward
+            # for it. Only where aiter's backward has a kernel for every argument -- a sink
+            # goes to its Triton one-kernel backward, which wants a philox rng_state this
+            # forward never produced, and dropout needs the mask the same forward never drew.
+            # Those keep the FlyDSL backward instead of being handed to a path that would
+            # ignore them.
+            hybrid_bwd = (
+                _hybrid_bwd_is_aiter()
+                and sink is None
+                and dropout_p == 0.0
+                and bias is None
+                and alibi_slopes is None
+            )
+            if is_grad_enabled and _any_requires_grad(q, k, v, sink):
+                if hybrid_bwd:
+                    # What the aiter backward reads: the [b,s,h,d]-shaped q/k/v it allocates
+                    # sbhd grads against, that same view of O, and softmax_lse as a *packed*
+                    # [B, Hq, Sq]. aiter's maybe_contiguous covers dout/q/k/v/out and not the
+                    # lse, and CK indexes it by assumed stride, so handing over the permuted
+                    # view the FlyDSL backward wants is a wrong answer with no error.
+                    ctx.save_for_backward(
+                        q,
+                        k,
+                        v,
+                        out,
+                        lse.view(B, Sq, Hq).permute(0, 2, 1).contiguous(),
+                        torch.zeros(2, dtype=torch.int64, device=q.device),
+                    )
+                    # The forward still ran on FlyDSL and ctx.backend still says so; only the
+                    # backward moves, so a dispatch log names what each half actually did.
+                    ctx.bwd_backend = BackendType.AITER
+                    ctx.dropout_p = dropout_p
+                    # FlyDSL bakes softmax_scale = 1/sqrt(D) and takes None to mean it; aiter
+                    # takes a float and its custom op rejects None.
+                    ctx.softmax_scale = (
+                        softmax_scale if softmax_scale is not None else q.shape[-1] ** (-0.5)
+                    )
+                    ctx.causal = causal
+                    ctx.window_size = window_size
+                    ctx.bias = None
+                    ctx.alibi_slopes = None
+                    ctx.deterministic = deterministic
+                    ctx.head_size_q_og = q.size(3)
+                    ctx.head_size_v_og = v.size(3)
+                    ctx.is_v3_atomic_fp32 = _resolve_is_v3_atomic_fp32_from_env()
+                    # Same gfx950 rule the aiter forward below applies, for the same reason.
+                    ctx.how_v3_bf16_cvt = 0 if get_device_compute_capability() >= (9, 5) else 1
+                    ctx.sink = None
+                    ctx.qkv_format = qkv_format
+                else:
+                    ctx.save_for_backward(q_s, k_s, v_s, out_s, lse)
+                    ctx.softmax_scale = softmax_scale
+                    ctx.causal = causal
+                    ctx.window_size = window_size
+                    ctx.sink = sink
+                    ctx.deterministic = deterministic
+                    ctx.lse_shape = (B, Sq, Hq)
             # kernel LSE is [B*Sq, Hq] (batch-major) -> [B, Hq, Sq]
             return (out, lse.view(B, Sq, Hq).permute(0, 2, 1)) if return_lse else out
 
@@ -266,12 +316,17 @@ class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        if ctx.backend == BackendType.GLUON:
+        # The forward's backend names the backward's, unless that forward set a different one
+        # for it -- the FlyDSL-forward / aiter-backward pair. ctx.backend keeps naming the
+        # forward that actually ran, so the aiter tail below is reached without editing it and
+        # a dispatch log still reports each half.
+        backend = getattr(ctx, "bwd_backend", ctx.backend)
+        if backend == BackendType.GLUON:
             raise AssertionError(
                 "internal contract violation: gluon flash-attn is forward-only and must not reach backward"
             )
 
-        if ctx.backend == BackendType.HIPKITTENS:
+        if backend == BackendType.HIPKITTENS:
             q_s, k_s, v_s, out_s, lse = ctx.saved_tensors
             dq, dk, dv = flash_attn_sbhd_hipkittens_backward_impl(
                 dout.permute(1, 0, 2, 3).contiguous(),
@@ -287,7 +342,7 @@ class FlashAttnFunc(torch.autograd.Function):
             dq, dk, dv = (g.permute(1, 0, 2, 3) for g in (dq, dk, dv))
             return _flash_attn_grads(dq, dk, dv, None, None)
 
-        if ctx.backend == BackendType.TRITON:
+        if backend == BackendType.TRITON:
             q, k, v, out, lse, sink = ctx.saved_tensors
             dq, dk, dv, dsink = triton_dense_backward(
                 dout,
@@ -303,7 +358,7 @@ class FlashAttnFunc(torch.autograd.Function):
             )
             return _flash_attn_grads(dq, dk, dv, None, dsink)
 
-        if ctx.backend == BackendType.FLYDSL:
+        if backend == BackendType.FLYDSL:
             q_s, k_s, v_s, out_s, lse = ctx.saved_tensors
             B, Sq, Hq = ctx.lse_shape
             grads = flash_attn_sbhd_flydsl_backward_impl(

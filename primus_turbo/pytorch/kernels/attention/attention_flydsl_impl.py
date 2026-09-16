@@ -13,6 +13,7 @@ Bottom-right causal, GQA, D in {64, 128}, bf16. The forward bakes softmax_scale 
 
 import functools
 import math
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -29,6 +30,38 @@ from primus_turbo.flydsl.attention.flash_attn_fwd import (
 # forbids. cudagraph_unsafe because the kernels keep module-level state a capture would
 # strand in the graph pool; without it max-autotune fails on live pool pointers.
 _custom_op = functools.partial(torch.library.custom_op, tags=(torch._C.Tag.cudagraph_unsafe,))
+
+# Opt-in per-call isfinite(LSE) tripwire. Off by default (one extra reduction).
+# Causal dualwave now defaults to a real running-max softmax; the old fixed-zero
+# reference overflows fp32 exp2 once a row's logit crosses ~88.7 nats.
+ENV_FLYDSL_LSE_GUARD = "PRIMUS_TURBO_FLYDSL_LSE_GUARD"
+
+
+@functools.lru_cache(maxsize=1)
+def _lse_guard_enabled() -> bool:
+    return os.environ.get(ENV_FLYDSL_LSE_GUARD, "0") == "1"
+
+
+# Optional calibrated constant reference max (log2 units) for dualwave_swp_fixed_max=True.
+# Read outside _fwd_module's lru_cache so a mid-process env change is a new cache key.
+# Not the shipped default: wiring it into _fwd_module NaN'd real 8-GPU training ~iter 142.
+ENV_DUALWAVE_REF_MAX = "PRIMUS_TURBO_ATTN_DUALWAVE_REF_MAX"
+_DEFAULT_DUALWAVE_REF_MAX = 64.0
+
+
+@functools.lru_cache(maxsize=1)
+def _dualwave_ref_max() -> float:
+    raw = os.environ.get(ENV_DUALWAVE_REF_MAX, "")
+    return float(raw) if raw else _DEFAULT_DUALWAVE_REF_MAX
+
+
+def _check_lse_finite(lse: torch.Tensor) -> None:
+    if not bool(torch.isfinite(lse).all()):
+        raise RuntimeError(
+            "flydsl flash-attn forward: LSE is non-finite (also catches -inf from a whole "
+            "row underflowing to l_row=0). Default dualwave is running-max online softmax; "
+            f"if this fires, capture shapes/amplitude. Set {ENV_FLYDSL_LSE_GUARD}=0 to disable."
+        )
 
 
 def _check_bwd(q, k, v, softmax_scale, causal, window_size, sink, num_heads_q, head_dim, sbhd=False):
@@ -82,12 +115,28 @@ def _uniform_shape(cu_seqlens: "torch.Tensor", max_seqlen, total):
 
 
 @functools.lru_cache(maxsize=64)
-def _fwd_module(Hq, Hkv, D, causal, cross_seqlen, emit_lse, window_left, sbhd=False, has_sink=False):
+def _fwd_module(
+    Hq,
+    Hkv,
+    D,
+    causal,
+    cross_seqlen,
+    emit_lse,
+    window_left,
+    sbhd=False,
+    has_sink=False,
+    ref_max=0.0,
+):
     # D in (64,128): stagger-off lifts MFMA utilization, and the raw 8-wave build default
     # halves occupancy. Other head dims keep the build defaults.
     cfg = {}
     if D in (64, 128):
         cfg = dict(waves_per_eu=2, dualwave_swp_enable_stagger=False, block_m=128)
+    # Running-max online softmax is the default. Causal fixed-zero-ref overflowed fp32
+    # exp2 in Llama-3.1-8B training. ref_max is a cache key so a mid-process env change
+    # is not served from a stale module; the value is unused while fixed_max stays False.
+    cfg["dualwave_swp_fixed_max"] = False
+    _ = ref_max
     return build_flash_attn_dualwave_swp_module(
         num_heads=Hq,
         head_dim=D,
@@ -124,7 +173,16 @@ def _varlen_forward_op(
     Hkv = k.shape[1]
     sink = sink.contiguous() if sink is not None else None
 
-    mod = _fwd_module(Hq, Hkv, D, True, Sq != Skv, bool(return_lse), window_left, has_sink=sink is not None)
+    mod = _fwd_module(
+        Hq,
+        Hkv,
+        D,
+        True,
+        Sq != Skv,
+        bool(return_lse),
+        window_left,
+        has_sink=sink is not None,
+    )
     out = torch.empty_like(q)
     stream = torch.cuda.current_stream()
     kw = dict(seq_len_kv=Skv, cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_k, sink=sink, stream=stream)
@@ -178,6 +236,8 @@ def flash_attn_varlen_flydsl_forward_impl(
         bool(return_lse),
         sink,
     )
+    if return_lse and _lse_guard_enabled():
+        _check_lse_finite(lse)
     return (out, lse) if return_lse else out
 
 
@@ -385,7 +445,16 @@ def _sbhd_forward_op(
     sink = sink.contiguous() if sink is not None else None
 
     mod = _fwd_module(
-        Hq, Hkv, D, True, Sq != Skv, bool(return_lse), window_left, sbhd=True, has_sink=sink is not None
+        Hq,
+        Hkv,
+        D,
+        True,
+        Sq != Skv,
+        bool(return_lse),
+        window_left,
+        sbhd=True,
+        has_sink=sink is not None,
+        ref_max=_dualwave_ref_max(),
     )
     out = torch.empty_like(q)
     stream = torch.cuda.current_stream()
@@ -429,6 +498,8 @@ def flash_attn_sbhd_flydsl_forward_impl(
     Hq, D = q.shape[2], q.shape[3]
     window_left = _check_fwd(q, k, v, softmax_scale, causal, window_size, sink, Hq, D, sbhd=True)
     out, lse = _sbhd_forward_op(q, k, v, window_left, bool(return_lse), sink)
+    if return_lse and _lse_guard_enabled():
+        _check_lse_finite(lse)
     return (out, lse) if return_lse else out
 
 

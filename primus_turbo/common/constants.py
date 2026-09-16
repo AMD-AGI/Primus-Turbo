@@ -56,6 +56,12 @@ ENV_AUTO_TUNE = "PRIMUS_TURBO_AUTO_TUNE"
 # Default: "1" (enabled)
 ENV_ATTN_V3_ATOMIC_FP32 = "PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32"
 
+# Dense flash-attention backward-only backend override. "AITER" runs the aiter/CK backward
+# under the FlyDSL forward; the forward backend is still whatever the dispatcher resolved,
+# and ENV_ATTN_BACKEND still names it. Unset (the default) keeps forward and backward on the
+# same backend, which is what the saved-tensor and LSE conventions otherwise require.
+ENV_ATTN_HYBRID_BWD = "PRIMUS_TURBO_ATTN_HYBRID_BWD"
+
 # When set to "1", EP dispatch/combine kernels run on the caller's current CUDA stream.
 # Default: "0"
 ENV_EP_FORCE_CURRENT_STREAM = "PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM"
