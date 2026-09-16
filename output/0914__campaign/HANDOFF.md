@@ -166,6 +166,40 @@ PATH=/home/lihuzhan/.venv-op-evolve/bin:$PATH op-evolve status --job gfx1250-att
     推到 1160–1630 TF/s。**"架构上更正确"不等于"更快"**，需要微基准才能定。
   - attention 那个 FMHA 内核是 `D_qk=192/D_v=128`（DeepSeek-V3 MLA），
     **与 Llama-3.1-8B 的 D=128 不匹配**，不能直接用。
+
+  **0916 补充：两条线要分开判，结论相反。**
+
+  *FlyDSL 注意力 → 真正阻塞，而且原因比"没装包"具体得多。* `primus_turbo/flydsl/attention/`
+  下的每一个 builder 都硬断言 gfx950：`flash_attn_fwd.py:71` 直接 raise
+  *"requires gfx950+ (uses ds_read_tr16_b64)"*，`flash_attn_bwd.py` 里 odo / lse-transpose /
+  dq-reduce / slot-reduce / a16-unpermute **五个 kernel 各自 assert 一次**。
+  `ds_read_tr16_b64` 是 CDNA4 的 LDS 转置读，gfx1250 对应的是 `ds_load_tr16_b128`，
+  两者的**寄存器落位不同**——这是逐 kernel 的移植，不是改一个 arch 判断。
+  FlyDSL 编译器本身支持 gfx1250 WMMA（`MmaOpGFX1250_WMMAType` 已验证存在）这一点仍然成立，
+  但**用 FlyDSL 写的这批 FA kernel 是 CDNA4 专用的**。上面那句"不要因为 transpose-load 把
+  gfx1250 关在门外"说的是编译器能力，不是这批现成 kernel 的可移植性，两者不要混。
+
+  同事新推的 `dev/sukylasa/llama8b-flydsl-fa-pair`（09-15）做的正是 **D=128 + GQA G=4**，
+  与我们的形状完全一致——但**目标平台是 gfx950**，且作者自己在 commit 里写
+  *"Isolated pair was 9.23 vs AITER a16 9.29; this is not a training keep"*，
+  即便在它的目标平台上也只与 AITER 打平。
+
+  *顺带发现一个应当反馈给同事的隐患。* 该分支把 `_gqa_group_ok` 从 G≥8 放开到 G≥1，
+  而它基于的旧代码里 arch 门还是 `get_device_compute_capability() >= _GFX950`。
+  **gfx1250 报告的是 (12, 5)，数值上 >= (9, 5)**，所以这个门会放行。
+  在 main 上这两处已经修好了（门改成精确的 `is_gfx950()`，注释里正好记着
+  *"Nothing hit that yet only because _gqa_group_ok happens to refuse Llama-3.1-8B's G=4"*）——
+  也就是说，那个分支同时解除了**互相掩护的两道门**，llama3.1-8b 在 gfx1250 上会一路派发进
+  gfx950 的 JIT 然后 raise。合并前需要把 main 的 arch 门带上。
+
+  *FlyDSL GEMM → 这才是值得投的那条。* 分支上有专门的
+  `primus_turbo/flydsl/gemm/gemm_gfx1250_kernel.py`，NN/TN/NT 齐全，注册为 GEMM 后端，
+  并且有一个提交标题就叫 *"make a real training step reach this backend"*——正是上面记的
+  "backend 注册对训练无效"那个缺口。它还带解析式候选裁剪 + 全量 autotune，
+  作者明写**手挑的默认值曾差到 46%**，所以上面引用的"33% roofline"是**调优前**的数字，
+  不能用来判这条路的上限。107/107 测试通过。
+  唯一缺的是 **bf16 NN 调优后的性能数**——commit 只给了 fp8（NN 2855 TFLOPS）。
+  而 bf16 NN 恰恰是 hipBLASLt 坏掉的那个组合。**已在 `tmp/flydsl-gemm` 上零冲突合好，待实测。**
 - **E4 融合反向 `num_warps`**：8 → 24.13 ms、16 → 23.54（出厂的 4 是 10.29）。
   离线 ISA 筛预测 warps=8 能把 VGPR 从顶满 1024 降到 512、`s_set_vgpr_msb` 少 3.2 倍——
   **实测 spill 代价压倒收益，这个内核的寄存器压力假说被证伪。**

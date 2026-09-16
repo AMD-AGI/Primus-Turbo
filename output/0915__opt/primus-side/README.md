@@ -28,3 +28,14 @@ Primus 仓库（`/home/lihuzhan/code/2026_0828__primus/Primus`）的 remote 是�
 
 三个带 converter 的配置里都加了警告：**不要把 `converters:` 改成 `[]`** ——
 那会退回 Flex FA，其内部强制 `torch.compile`，在本机会打死 GPU（0915 挂过一次）。
+
+## 0916 核对
+
+五个 yaml 与权威副本
+`/home/lihuzhan/code/2026_0828__primus/Primus/examples/torchtitan/configs/MI455X/`
+逐字节一致，`train_runtime-nkfix-hook.patch` 与该仓库工作区的实际 diff 一致。
+**这里是唯一的备份** —— Primus 那个仓库的 remote 是上游 `AMD-AGI/Primus`，这些改动不推上去。
+
+同时删掉了 `output/0915__opt/e2e/` 下的三份同名旧副本。它们是陷阱：缺 `debug.seed`
+（照着跑出来的 A/B 两臂模型初始化不同，0915 第一轮 8L A/B 就是这么作废的），
+也缺 `converters: []` 会打死这张卡的警告块。**要用配置，只看这个目录。**
