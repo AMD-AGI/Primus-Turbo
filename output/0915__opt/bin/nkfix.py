@@ -69,161 +69,33 @@ _RULE3_CHECK = int(os.environ.get("NKFIX_FLYDSL_CHECK", "0"))
 # cannot stay on rule 3 alone: it has to be able to say WHICH rule's output went non-finite.
 _CHECK = int(os.environ.get("NKFIX_CHECK", "0"))
 
+# Detecting a rare corruption needs every call covered, and cannot afford a synchronize on every
+# call. The first version sampled one call in N: with N=7 over 6840 calls it inspected 14% of
+# them, so even a run that did go nan would most likely have missed the offending call. Raising
+# it to every call would add a device sync per mm -- which serialises the pipeline and is exactly
+# the kind of diagnostic that changes whether a race happens at all.
+#
+# So: fold every output into a running accumulator (asynchronous, no sync, and nan/inf is
+# absorbing -- once it is in, it never leaves), and inspect the accumulator only every N calls.
+# 100% of calls covered, one sync per N.
+_acc = {}
 
-def _finite_check(tag, out, a, b):
-    if not _CHECK or stats["checked"] % _CHECK:
-        stats["checked"] += 1
+
+def _finite_check(tag, out):
+    if not _CHECK:
         return
+    a = _acc.get(tag)
+    if a is None:
+        a = _acc[tag] = torch.zeros((), device=out.device, dtype=torch.float32)
+    a += out.sum(dtype=torch.float32)          # async; no synchronize here
     stats["checked"] += 1
-    if not torch.isfinite(out).all():
+    if stats["checked"] % _CHECK:
+        return
+    if not torch.isfinite(a):                  # the only sync, once per N calls
         stats["nonfinite_" + tag] = stats.get("nonfinite_" + tag, 0) + 1
-        print("[nkfix] NON-FINITE from rule %s: A%s%s B%s%s"
-              % (tag, tuple(a.shape), "c" if a.is_contiguous() else "v",
-                 tuple(b.shape), "c" if b.is_contiguous() else "v"), flush=True)
-_MM = torch.ops.aten.mm.default
-stats = {"dgrad": 0, "wgrad": 0, "wgrad_skipped_oom": 0, "miss": 0,
-         "wgrad_flydsl": 0, "flydsl_unavailable": 0, "flydsl_declined": 0,
-         "flydsl_no_config": 0, "flydsl_nonfinite": 0, "checked": 0}
-_seen = {}
-
-
-def _big(t):
-    return t.numel() * t.element_size() >= _MIN_BYTES
-
-
-def _headroom_ok(t):
-    """Is there room to copy t without pushing the allocator over a cliff?
-
-    Asked at call time rather than gated on a fixed size, because the same rule is free on a
-    config at 32% memory and fatal on one at 88%. torch.cuda.mem_get_info reports the DEVICE's
-    free bytes, which is what a fresh allocation actually draws on -- the caching allocator's
-    own reserve is already excluded from it.
-
-    The 2x is not padding for its own sake: contiguous() must hold the source and the
-    destination simultaneously, so the transient requirement is twice the tensor. _HEADROOM
-    then keeps a margin on top; at 0.5 the copy may claim at most half of what is free.
-    """
-    try:
-        free, _total = torch.cuda.mem_get_info()
-    except Exception:
-        return True          # cannot tell -- behave as before rather than silently disabling
-    need = t.numel() * t.element_size() * 2
-    return need < free * _HEADROOM
-
-
-# --- rule 3: FlyDSL TN for wgrad -------------------------------------------------------
-#
-# Why this exists. Rule 2 buys its speed with two copies -- dout^T and the activation -- and
-# measurement (BOTTLENECK-SHIFT.md) put those at 137 ms of a 760 ms step, with NEITHER
-# cacheable: both operands are freshly computed every layer every step. FlyDSL's TN kernel
-# consumes the transposed view directly, so the copies simply do not happen. Measured on the
-# real shapes with rule 2's copies included, as training pays them:
-#
-#     shape                     rule 2 (+copies)   FlyDSL tuned
-#     o_proj  4096x32768x4096       441.7 TF/s       794.2       1.80x
-#     mlp    14336x32768x4096       517.0            715.8       1.38x
-#     mlp2    4096x32768x14336      506.3            726.6       1.44x
-#     qkv     6144x32768x4096       470.6            625.9       1.33x
-#     lm_head 128256x32768x4096     732.1            782.2       1.07x
-#
-# lm_head is the exception and it matters, because it is 29% of the wgrad FLOPs: rule 2 is
-# already good there (732 vs 442-517 elsewhere), so the hybrid's win is 58 ms, not the 77 ms
-# a mean over the other four shapes would have predicted.
-#
-# NOT used for dgrad. There FlyDSL NN measures 820-849 TF/s against rule 1's 1238-1627, and
-# rule 1's only copy is a weight (12.5 ms/step). Rule 1 stays.
-
-_fly = None          # gemm_gfx1250, or False once the import has failed
-_fly_table = None    # {(M, N, K): cfg or False}, loaded from NKFIX_FLYDSL_TABLE
-
-
-def _flydsl():
-    global _fly
-    if _fly is None:
-        try:
-            from primus_turbo.flydsl.gemm.gemm_gfx1250_kernel import gemm_gfx1250
-            _fly = gemm_gfx1250
-        except Exception:
-            _fly = False
-    return _fly
-
-
-def _load_table():
-    """Configs measured OFFLINE, one per exact (M, N, K). Absent shape -> rule 2.
-
-    The first version of this rule called FlyDSL's autotune() lazily from inside the training
-    step, and that run took the card down at step 2 with hipErrorLaunchFailure. Two reasons it
-    must never happen again, independent of which config actually faulted:
-
-      * autotune's measurement loop is `try: ... torch.cuda.synchronize() ... except: continue`.
-        A candidate whose launch faults raises at that synchronize, gets swallowed, and the
-        loop moves on -- but a HIP context that has taken an unspecified launch failure is
-        dead, and catching the Python exception does not revive it. The next real GEMM reports
-        the failure, and by then the cause is 30 configs back. It converts "the context is
-        gone" into "that config was not a candidate".
-      * Its cache key is (kind, layout, N, K), documented as leaving M out because "M is the
-        token count". True for NT and NN. In TN it is inverted -- there M is out_features and
-        K is the token count -- so o_proj's wgrad (M=4096) and kv's (M=1024) share one tuned
-        config, and feasible_configs never constrains M at all, so nothing re-checks it.
-
-    So: measure offline, key on the whole shape, and treat an unknown shape as out of scope
-    rather than as something to go and tune mid-step.
-    """
-    global _fly_table
-    if _fly_table is None:
-        _fly_table = {}
-        path = os.environ.get("NKFIX_FLYDSL_TABLE", "")
-        if path:
-            try:
-                import json
-                with open(path) as f:
-                    for k, v in json.load(f).items():
-                        M, N, K = (int(x) for x in k.split(","))
-                        _fly_table[(M, N, K)] = v and dict(
-                            tile=tuple(v["tile"]), m_warp=v["m_warp"],
-                            n_warp=v["n_warp"], num_buffers=v["num_buffers"])
-            except Exception as e:
-                print("[nkfix] FlyDSL table unreadable (%r); rule 3 disabled" % (e,), flush=True)
-    return _fly_table
-
-
-def _flydsl_wgrad(a, b):
-    """Run a wgrad mm through FlyDSL TN, or return None to fall through to rule 2.
-
-    ``a`` is the (M, K) transposed view; FlyDSL wants its (K, M) base. Returning None rather
-    than raising is deliberate: this sits in a dispatch mode on every mm in the model, so an
-    unsupported shape must degrade to the path that already works.
-    """
-    gemm = _flydsl()
-    if not gemm:
-        stats["flydsl_unavailable"] += 1
-        return None
-    base = a.t()
-    if not base.is_contiguous() or not b.is_contiguous():
-        stats["flydsl_declined"] += 1
-        return None
-    cfg = _load_table().get((a.shape[0], b.shape[1], b.shape[0]))
-    if not cfg:
-        stats["flydsl_no_config"] += 1
-        return None
-    try:
-        out = gemm(base, b, layout="tn", out_dtype=a.dtype, **cfg)
-    except Exception:
-        stats["flydsl_declined"] += 1
-        return None
-    if out is None:
-        stats["flydsl_declined"] += 1
-        return None
-    stats["wgrad_flydsl"] += 1
-    if _RULE3_CHECK and stats["wgrad_flydsl"] % _RULE3_CHECK == 0:
-        # torch.isfinite().all() costs a full read plus a sync, so it is sampled rather than
-        # run on every call. Falling back to rule 2 on a bad output would hide the event; the
-        # point is to record that it happened, with the shape, while the run is still alive.
-        if not torch.isfinite(out).all():
-            stats["flydsl_nonfinite"] += 1
-            print("[nkfix] NON-FINITE FlyDSL wgrad output: M=%d N=%d K=%d (call %d)"
-                  % (a.shape[0], b.shape[1], b.shape[0], stats["wgrad_flydsl"]), flush=True)
-    return out
+        print("[nkfix] NON-FINITE detected in rule %s by call %d (accumulator poisoned)"
+              % (tag, stats["checked"]), flush=True)
+        a.zero_()                              # re-arm, so a second event is still visible
 
 
 class NKFix(TorchDispatchMode):
@@ -251,7 +123,7 @@ class NKFix(TorchDispatchMode):
                     if _headroom_ok(a):
                         stats["wgrad"] += 1
                         out = func(a.contiguous(), b.t().contiguous().t())
-                        _finite_check("wgrad", out, a, b)
+                        _finite_check("wgrad", out)
                         return out
                     # No room for the copy. Fall through to the dgrad rule, which needs no
                     # extra allocation and is still worth 1.16-1.34x on a wgrad call -- far
@@ -260,7 +132,7 @@ class NKFix(TorchDispatchMode):
                 if b.is_contiguous() and _big(b):
                     stats["dgrad"] += 1
                     out = func(a, b.t().contiguous().t())
-                    _finite_check("dgrad", out, a, b)
+                    _finite_check("dgrad", out)
                     return out
             stats["miss"] += 1
         return func(*args, **kwargs)
