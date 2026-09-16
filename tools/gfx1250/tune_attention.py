@@ -332,6 +332,17 @@ def main() -> int:
                          "import (see the top of this file), so it must be a process-level "
                          "flag rather than a runtime one. Off-only: eligibility is a "
                          "capability question and forcing 'on' would only move the failure.")
+    ap.add_argument("--bwd-path", default="auto", choices=["auto", "twokernel"],
+                    help="'twokernel' forces the IN-TREE two-kernel Triton backward "
+                         "(_bwd_kernel_dkdv + _bwd_kernel_dq). It is needed because the "
+                         "shipped dispatcher never reaches that path at a training shape: "
+                         "flash_attn_interface.py:387 prefers dense_fused_backward whenever "
+                         "fused_backward_eligible() says yes, which at b*Hq >= 32 and "
+                         "seqlen_k >= 512 is always. The fused backward does not read "
+                         "PRIMUS_TURBO_ATTN_TRITON_TUNE, so a bwd: sweep left on 'auto' "
+                         "returns the SAME time for every candidate -- the flat result that "
+                         "reads as 'this knob does nothing'. Forcing it also forces the "
+                         "Triton forward, because use_asm_fwd is gated on the same predicate.")
     ap.add_argument("--impl", default="turbo", choices=["turbo", "aiter", "fused", "asm", "asmbwd"],
                     help="turbo = Primus-Turbo's in-tree Triton backend (the PR target). "
                          "aiter = AITER's Triton MHA, the alternative seed the plan named. "
@@ -605,6 +616,20 @@ def _measure(args) -> int:
         _impl_fwd = lambda: _aiter_fa(q, k, v, causal=causal, config=fwd_cfg)  # noqa: E731
     else:
         _impl_fwd = None
+
+    if args.bwd_path == "twokernel":
+        if args.impl != "turbo":
+            raise SystemExit("--bwd-path twokernel only applies to --impl turbo")
+        from primus_turbo.pytorch.ops.attention import flash_attn_interface as _fai
+
+        # Patch the NAME the dispatcher reads (it was imported into this module at import
+        # time), not the definition in attention_fused_bwd_impl -- patching the source
+        # module leaves the binding at flash_attn_interface.py:387 pointing at the original
+        # and the override is silently ignored. Same failure shape as aiter's _get_config.
+        _fai.fused_backward_eligible = lambda *a, **kw: False
+        result["bwd_path"] = "twokernel(forced)"
+    else:
+        result["bwd_path"] = "auto"
 
     # Pin TRITON. Without this the dispatcher picks, and a round would not know which
     # kernel it just measured.
