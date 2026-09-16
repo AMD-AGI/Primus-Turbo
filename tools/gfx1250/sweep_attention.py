@@ -57,6 +57,14 @@ RC_FAULT = (139, -11, 134, -6)
 _KNOB_FLOOR = {"num_stages": 1, "num_warps": 1, "waves_per_eu": 0}
 MAX_RETRIES = 3
 
+# A candidate that hangs is worse than one that crashes: the crash is a retry, the hang
+# pins the card until someone notices, and on this machine recovering a pinned card means
+# an AC cycle. num_warps=16 is a known hang -- it does not fail to compile, it never
+# returns -- and it was found by pinning the card, not by reading the code. So every
+# candidate gets a wall clock, and a candidate that exceeds it is recorded as a timeout
+# rather than being allowed to run.
+CANDIDATE_TIMEOUT_S = int(os.environ.get("SWEEP_TIMEOUT_S", 600))
+
 
 def parse_axis(spec: str) -> tuple[str, str, list[str]]:
     """'bwd:num_warps=1,2,4' -> ('bwd', 'num_warps', ['1','2','4'])."""
@@ -82,6 +90,23 @@ def build_spec(points: list[tuple[str, str, str]]) -> str:
     return ";".join(parts)
 
 
+def _reap(cmd) -> None:
+    """Make sure a timed-out candidate leaves no process holding the GPU.
+
+    subprocess.run's own kill on timeout reaps the direct child, but the child owns a GPU
+    context and a half-torn-down context is exactly what leaves a KFD holder behind --
+    which is indistinguishable, from the outside, from the card being wedged.
+    """
+    import time as _time
+
+    pat = str(HARNESS)
+    subprocess.run(["pkill", "-f", pat], capture_output=True)
+    _time.sleep(2)
+    if subprocess.run(["pgrep", "-f", pat], capture_output=True).returncode == 0:
+        subprocess.run(["pkill", "-9", "-f", pat], capture_output=True)
+        _time.sleep(3)
+
+
 def run_one(shape: str, spec: str, extra: list[str]) -> dict:
     """One candidate, one process. Retries a fault; records how many it took."""
     cmd = [sys.executable, str(HARNESS), "--shape", shape, *extra]
@@ -90,7 +115,28 @@ def run_one(shape: str, spec: str, extra: list[str]) -> dict:
 
     retries = 0
     while True:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=CANDIDATE_TIMEOUT_S
+            )
+        except subprocess.TimeoutExpired as exc:
+            # Killing the parent is not enough: the child holds a GPU context, and a
+            # half-dead context is exactly what leaves KFD holders behind. Kill the
+            # process group and record the timeout as a terminal verdict for this
+            # candidate -- unlike a fault, a hang is reproducible and retrying it just
+            # spends the timeout again.
+            _reap(cmd)
+            return {
+                "shape": shape,
+                "tune": spec,
+                "ok": False,
+                "retries": retries,
+                "returncode": "timeout",
+                "timeout_s": CANDIDATE_TIMEOUT_S,
+                "stderr_tail": (exc.stderr or b"").decode(errors="replace").strip().splitlines()[-25:]
+                if isinstance(exc.stderr, bytes)
+                else (exc.stderr or "").strip().splitlines()[-25:],
+            }
         line = next(
             (ln for ln in reversed(proc.stdout.splitlines()) if ln.startswith("{")), ""
         )

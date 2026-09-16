@@ -1,0 +1,23 @@
+73 candidates, 73 to run on shape llama31-8b-s4096
+
+[1/73] <default>
+  ok  4.230 ms  454.9 TFLOP/s
+[2/73] fwd:num_warps=1,waves_per_eu=0,num_stages=1,PRE_LOAD_V=0
+  ok  4.613 ms  417.1 TFLOP/s
+[3/73] fwd:num_warps=1,waves_per_eu=0,num_stages=1,PRE_LOAD_V=1
+  ok  4.451 ms  432.3 TFLOP/s
+[4/73] fwd:num_warps=1,waves_per_eu=0,num_stages=2,PRE_LOAD_V=0
+  ok  4.745 ms  405.5 TFLOP/s
+[5/73] fwd:num_warps=1,waves_per_eu=0,num_stages=2,PRE_LOAD_V=1
+  ok  4.731 ms  406.7 TFLOP/s
+[6/73] fwd:num_warps=1,waves_per_eu=0,num_stages=3,PRE_LOAD_V=0
+  ok  5.475 ms  351.4 TFLOP/s
+[7/73] fwd:num_warps=1,waves_per_eu=0,num_stages=3,PRE_LOAD_V=1
+  ok  5.548 ms  346.8 TFLOP/s
+[8/73] fwd:num_warps=1,waves_per_eu=1,num_stages=1,PRE_LOAD_V=0
+  ok  4.483 ms  429.2 TFLOP/s
+[9/73] fwd:num_warps=1,waves_per_eu=1,num_stages=1,PRE_LOAD_V=1
+  ok  4.334 ms  444.0 TFLOP/s
+[10/73] fwd:num_warps=1,waves_per_eu=1,num_stages=2,PRE_LOAD_V=0
+  ok  4.723 ms  407.4 TFLOP/s
+[11/73] fwd:num_warps=1,waves_per_eu=1,num_stages=2,PRE_LOAD_V=1
