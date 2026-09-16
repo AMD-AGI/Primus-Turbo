@@ -443,7 +443,7 @@ def grouped_gemm_mxfp8_epi_glu_quant_flydsl_kernel(
 ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
     """Grouped GEMM, then GLU and dual quantization epilogue."""
     _check_activation(activation)
-    _check_clamp_limit(activation, clamp_limit)
+    _check_clamp_limit(clamp_limit)
     assert a.ndim == 2 and b.ndim == 3
     assert N % 2 == 0, f"fc1 width must be even (gate||up), got {N}"
     I = N // 2
@@ -947,7 +947,7 @@ def grouped_gemm_mxfp8_epi_dglu_quant_flydsl_kernel(
 ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
     """Grouped GEMM, then dGLU and dual quantization epilogue."""
     _check_activation(activation)
-    _check_clamp_limit(activation, clamp_limit)
+    _check_clamp_limit(clamp_limit)
     assert a.ndim == 2 and b.ndim == 3 and intermediate.ndim == 2
     I = N
     assert dglu_epi_quant_supported(K, I, out_dtype), (

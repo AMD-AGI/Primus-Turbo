@@ -220,7 +220,7 @@ def grouped_gemm_mxfp4_epi_glu_quant_flydsl_kernel(
             two share does not draw one sequence twice.
     """
     _check_activation(activation)
-    _check_clamp_limit(activation, clamp_limit)
+    _check_clamp_limit(clamp_limit)
     assert a.ndim == 2 and b.ndim == 3
     assert N % 2 == 0, f"fc1 width must be even (gate||up), got {N}"
     I = N // 2
@@ -366,7 +366,7 @@ def grouped_gemm_mxfp4_epi_dglu_quant_flydsl_kernel(
         ``(row_out, row_sc, col_out, col_sc)``.
     """
     _check_activation(activation)
-    _check_clamp_limit(activation, clamp_limit)
+    _check_clamp_limit(clamp_limit)
     assert a.ndim == 2 and b.ndim == 3 and intermediate.ndim == 2
     I = N
     assert dglu_epi_quant_supported(K, I, out_dtype), (

@@ -59,8 +59,6 @@ __all__ = ["grouped_mlp_fp4"]
 
 _SUPPORTED_ACTIVATIONS = ("silu", "gelu")
 
-_SUPPORTED_CLAMPABLE_ACTIVATIONS = ("silu",)
-
 
 def _check_activation(activation: str, clamp_limit: Union[None, float]) -> Union[None, float]:
     assert activation in _SUPPORTED_ACTIVATIONS, (
@@ -68,9 +66,6 @@ def _check_activation(activation: str, clamp_limit: Union[None, float]) -> Union
     )
     if clamp_limit is None:
         return None
-    assert activation in _SUPPORTED_CLAMPABLE_ACTIVATIONS, (
-        f"clamp_limit is only supported for activation in {_SUPPORTED_CLAMPABLE_ACTIVATIONS}, got {activation!r}"
-    )
     clamp_limit = float(clamp_limit)
     assert clamp_limit > 0.0, f"clamp_limit must be positive, got {clamp_limit}"
     return clamp_limit
@@ -480,8 +475,8 @@ def grouped_mlp_fp4(
         activation: the gate ``f``, one of ``_SUPPORTED_ACTIVATIONS``. ``"gelu"`` is
             the tanh approximation, i.e. ``F.gelu(approximate="tanh")``.
         clamp_limit: DeepSeek-V4's pre-multiplication clamp bound ``L``, or None for no
-            clamp. With it the activation is ``silu(min(gate, L)) * clamp(up, -L, L)``,
-            whose backward is straight-through. Supported for ``"silu"`` only.
+            clamp. With it the activation is ``f(min(gate, L)) * clamp(up, -L, L)``,
+            whose backward is straight-through.
 
     Returns:
         [total_m, K_out] in ``out_dtype``.

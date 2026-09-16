@@ -26,10 +26,10 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
     grouped_gemm_fp8_dglu_impl,
     grouped_gemm_fp8_glu_impl,
     grouped_gemm_fp8_impl,
-    grouped_gemm_fp8_mx_dglu_impl,
-    grouped_gemm_fp8_mx_glu_impl,
     grouped_gemm_fp8_variable_k_accum_impl,
     grouped_gemm_fp8_variable_k_impl,
+    grouped_gemm_mxfp8_dglu_impl,
+    grouped_gemm_mxfp8_glu_impl,
 )
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     group_offs_from_lens,
@@ -52,8 +52,6 @@ __all__ = [
 
 _SUPPORTED_ACTIVATIONS = ("silu", "gelu")
 
-_SUPPORTED_CLAMPABLE_ACTIVATIONS = ("silu",)
-
 
 def _check_activation(activation: str, clamp_limit: Union[None, float]) -> Union[None, float]:
     assert activation in _SUPPORTED_ACTIVATIONS, (
@@ -61,9 +59,6 @@ def _check_activation(activation: str, clamp_limit: Union[None, float]) -> Union
     )
     if clamp_limit is None:
         return None
-    assert activation in _SUPPORTED_CLAMPABLE_ACTIVATIONS, (
-        f"clamp_limit is only supported for activation in {_SUPPORTED_CLAMPABLE_ACTIVATIONS}, got {activation!r}"
-    )
     clamp_limit = float(clamp_limit)
     assert clamp_limit > 0.0, f"clamp_limit must be positive, got {clamp_limit}"
     return clamp_limit
@@ -569,7 +564,7 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
 
         # The activation is quantised inside the epilogue: it feeds nothing but the
         # quantiser, so staging it in out_dtype would be an [M, I] round trip through HBM.
-        l1, act_row, act_row_scale, act_col, act_col_scale = grouped_gemm_fp8_mx_glu_impl(
+        l1, act_row, act_row_scale, act_col, act_col_scale = grouped_gemm_mxfp8_glu_impl(
             x_row,
             w1_row,
             x_row_scale,
@@ -693,7 +688,7 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
 
         # dgrad against w2_col, contracting K_out; the epilogue turns it into the
         # pre-activation gradient and quantises that, so neither reaches HBM.
-        grad_probs, gl_row, gl_row_scale, gl_col, gl_col_scale = grouped_gemm_fp8_mx_dglu_impl(
+        grad_probs, gl_row, gl_row_scale, gl_col, gl_col_scale = grouped_gemm_mxfp8_dglu_impl(
             go_row,
             w2_col,
             go_row_scale,
@@ -802,8 +797,8 @@ def grouped_mlp_fp8(
         activation: the GLU gate, one of ``("silu", "gelu")``. "gelu" is the tanh
             approximation, i.e. ``F.gelu(approximate="tanh")``.
         clamp_limit: DeepSeek-V4's pre-multiplication clamp bound ``L``, or None for no
-            clamp. With it the activation is ``silu(min(gate, L)) * clamp(up, -L, L)``,
-            whose backward is straight-through. Supported for "silu" only.
+            clamp. With it the activation is ``f(min(gate, L)) * clamp(up, -L, L)``,
+            whose backward is straight-through.
     """
     if config is None:
         config = Float8QuantConfig()

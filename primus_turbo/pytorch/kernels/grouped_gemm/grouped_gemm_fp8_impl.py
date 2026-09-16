@@ -1255,7 +1255,7 @@ def _check_mx_out_recipes(row: ScalingRecipe, col: ScalingRecipe) -> None:
     ``MXFP8DualQuantStore.store_band`` still asserts against it, and there is no grouped
     reference to be byte-exact against either, since ``compile_grouped_qdual`` has no 2-D
     path. Rejecting it here is what keeps that assert honest; the alternative is an op that
-    accepts the flag and silently emits 1-D scales. See ``design.md`` section 5.
+    accepts the flag and silently emits 1-D scales.
 
     Net effect today: both recipes must be the default. The signature carries them per
     operand because the epilogue does quantise the two on their own terms, and that is
@@ -1269,7 +1269,7 @@ def _check_mx_out_recipes(row: ScalingRecipe, col: ScalingRecipe) -> None:
         )
         assert not recipe.use_2d_block, (
             f"2-D block scaling is the only recipe field this epilogue could express, but it is "
-            f"not wired up yet (see design.md 5); got {name}={recipe}"
+            f"not wired up yet; got {name}={recipe}"
         )
 
 
@@ -1587,8 +1587,8 @@ def grouped_gemm_fp8_dglu_impl_meta(
     return grad_probs, grad_intermediate, grad_scale_inv
 
 
-@_torch_custom_op_wrapper("primus_turbo::grouped_gemm_fp8_mx_glu_impl", mutates_args=(), device_types="cuda")
-def grouped_gemm_fp8_mx_glu_impl(
+@_torch_custom_op_wrapper("primus_turbo::grouped_gemm_mxfp8_glu_impl", mutates_args=(), device_types="cuda")
+def grouped_gemm_mxfp8_glu_impl(
     a: torch.Tensor,
     b: torch.Tensor,
     a_scales: torch.Tensor,
@@ -1622,7 +1622,7 @@ def grouped_gemm_fp8_mx_glu_impl(
     Unlike the MXFP4 twin, ``group_lens`` is *used*: the MXFP8 quantiser pads a group's
     rows to 64 for the row-wise operand, so ``group_offs`` is the padded read table the
     GEMM addresses ``a`` with, and the tight table that ``probs`` and ``intermediate`` are
-    indexed by has to be rebuilt from the lengths. See ``design.md`` section 6.
+    indexed by has to be rebuilt from the lengths.
 
     ``config`` and the recipes ride through as opaque value arguments, so torch.compile
     bakes them into the graph and guards on their equality rather than tracing into them.
@@ -1678,8 +1678,8 @@ def grouped_gemm_fp8_mx_glu_impl(
     return intermediate, row_out, row_sc, col_out, col_sc
 
 
-@grouped_gemm_fp8_mx_glu_impl.register_fake
-def grouped_gemm_fp8_mx_glu_impl_meta(
+@grouped_gemm_mxfp8_glu_impl.register_fake
+def grouped_gemm_mxfp8_glu_impl_meta(
     a: torch.Tensor,
     b: torch.Tensor,
     a_scales: torch.Tensor,
@@ -1719,8 +1719,8 @@ def grouped_gemm_fp8_mx_glu_impl_meta(
     return intermediate, row_out, row_sc, col_out, col_sc
 
 
-@_torch_custom_op_wrapper("primus_turbo::grouped_gemm_fp8_mx_dglu_impl", mutates_args=(), device_types="cuda")
-def grouped_gemm_fp8_mx_dglu_impl(
+@_torch_custom_op_wrapper("primus_turbo::grouped_gemm_mxfp8_dglu_impl", mutates_args=(), device_types="cuda")
+def grouped_gemm_mxfp8_dglu_impl(
     a: torch.Tensor,
     b: torch.Tensor,
     a_scales: torch.Tensor,
@@ -1805,8 +1805,8 @@ def grouped_gemm_fp8_mx_dglu_impl(
     return torch.sum(grad_probs_partial[:, :M], dim=0), row_out, row_sc, col_out, col_sc
 
 
-@grouped_gemm_fp8_mx_dglu_impl.register_fake
-def grouped_gemm_fp8_mx_dglu_impl_meta(
+@grouped_gemm_mxfp8_dglu_impl.register_fake
+def grouped_gemm_mxfp8_dglu_impl_meta(
     a: torch.Tensor,
     b: torch.Tensor,
     a_scales: torch.Tensor,
