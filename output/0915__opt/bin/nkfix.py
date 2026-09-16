@@ -24,9 +24,18 @@ real run because its premise about the operand layout was wrong):
 Bit-exact either way: every variant scores the same SQNR against an fp32 reference
 (55.60-55.62 dB at K = 14336 / 32768 / 128256), because only operand layout changes.
 
-COST. The wgrad rule copies A -- 0.25 GiB for qkv, 0.88 for mlp, 7.83 for lm_head. Fine on
-the 8-layer config (32% memory). NOT established as safe on the 32-layer production config,
-which already sits at 88%.
+COST, and it bit. The wgrad rule copies A -- 0.25 GiB for qkv, 0.88 for mlp, 7.83 for
+lm_head. Free on the 8-layer config (32% memory, peak unchanged at 141.00 GiB because the
+caching allocator reuses the block). On the 32-layer production config, which already sits at
+88%, the lm_head copy SIGBUSed the process before step 1 and took the card with it (the dying
+process keeps its KFD context; dmesg then shows MES failures and a GPU reset that does not
+complete). That is why _headroom_ok exists: the rule now asks whether the copy fits before
+making it, instead of assuming a config has room.
+
+Note what the failure looks like from outside, because it is misleading: the dmesg trail is
+MES INVALIDATE_TLBS failures and "MES might be in unrecoverable state", which reads like the
+ring-buffer wedges. The actual cause is one line in the training log -- Signal 7 (SIGBUS).
+Read the training log before theorising about the driver.
 
 A WORKAROUND for a library coverage defect, same family as the HIPBLASLT_TENSILE_LIBPATH
 mis-packaging. On an image with proper NN coverage every rule here is a pure loss. Re-measure,
@@ -41,13 +50,34 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 _MIN_BYTES = int(os.environ.get("NKFIX_MIN_BYTES", 4 << 20))
 _RULE2 = os.environ.get("NKFIX_WGRAD", "1") not in ("", "0")
+_HEADROOM = float(os.environ.get("NKFIX_HEADROOM", "0.5"))
 _MM = torch.ops.aten.mm.default
-stats = {"dgrad": 0, "wgrad": 0, "miss": 0}
+stats = {"dgrad": 0, "wgrad": 0, "wgrad_skipped_oom": 0, "miss": 0}
 _seen = {}
 
 
 def _big(t):
     return t.numel() * t.element_size() >= _MIN_BYTES
+
+
+def _headroom_ok(t):
+    """Is there room to copy t without pushing the allocator over a cliff?
+
+    Asked at call time rather than gated on a fixed size, because the same rule is free on a
+    config at 32% memory and fatal on one at 88%. torch.cuda.mem_get_info reports the DEVICE's
+    free bytes, which is what a fresh allocation actually draws on -- the caching allocator's
+    own reserve is already excluded from it.
+
+    The 2x is not padding for its own sake: contiguous() must hold the source and the
+    destination simultaneously, so the transient requirement is twice the tensor. _HEADROOM
+    then keeps a margin on top; at 0.5 the copy may claim at most half of what is free.
+    """
+    try:
+        free, _total = torch.cuda.mem_get_info()
+    except Exception:
+        return True          # cannot tell -- behave as before rather than silently disabling
+    need = t.numel() * t.element_size() * 2
+    return need < free * _HEADROOM
 
 
 class NKFix(TorchDispatchMode):
@@ -66,8 +96,13 @@ class NKFix(TorchDispatchMode):
                 # contiguous B, so the dgrad rule would claim it and leave it on the bad tile
                 # -- which is exactly what the previous version did, silently.
                 if _RULE2 and not a.is_contiguous() and b.is_contiguous() and _big(a):
-                    stats["wgrad"] += 1
-                    return func(a.contiguous(), b.t().contiguous().t())
+                    if _headroom_ok(a):
+                        stats["wgrad"] += 1
+                        return func(a.contiguous(), b.t().contiguous().t())
+                    # No room for the copy. Fall through to the dgrad rule, which needs no
+                    # extra allocation and is still worth 1.16-1.34x on a wgrad call -- far
+                    # better than taking the SIGBUS.
+                    stats["wgrad_skipped_oom"] += 1
                 if b.is_contiguous() and _big(b):
                     stats["dgrad"] += 1
                     return func(a, b.t().contiguous().t())

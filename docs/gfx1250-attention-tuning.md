@@ -75,17 +75,26 @@ a known delta. It is not in the default search space for that reason.
 | `PRE_LOAD_V` | forward | no | no |
 | forward `BLOCK_N` | inner k loop | no | no |
 | `_bwd_kernel_dq` `BLOCK_N` | inner k loop | no | no |
-| `_bwd_kernel_dkdv` `BLOCK_M` | inner q loop | no | **NOT FREE — see below** |
+| `_bwd_kernel_dkdv` `BLOCK_M` | inner q loop | **yes, since the per-row LSE index** | no — see below |
 | `_bwd_kernel_dkdv` `BLOCK_N` | **its own grid** | yes, self-consistently | no |
 | `sequence_parallel` | both bwd kernels | **do not touch — see §4** | — |
 
-**`_bwd_kernel_dkdv`'s own `BLOCK_M` is also bound to the LSE ABI** — an earlier version of
-this table wrongly listed it as free. It reads the packed scratch as
-`2 * start_m + tl.arange(0, 2 * BLOCK_M)` and splits the halves with two `tl.gather`s, which
-assumes dkdv's `BLOCK_M` equals `FIXED_BLOCK_M`. Setting it to 128 today returns lse-rows
-0..63 concatenated with delta-rows 0..63: no fault, no shape error, smoothly wrong dk/dv.
-Decoupling it means replacing the gathers with direct loads indexed against a separate
-`FIXED_BLOCK_M_ABI` constant.
+**`_bwd_kernel_dkdv`'s `BLOCK_M` used to be bound to the LSE ABI, and no longer is.**
+This paragraph previously said it was NOT free; that has been stale since the per-row index
+landed. History, because the trap is instructive: the old form read the packed scratch as
+`2 * start_m + tl.arange(0, 2 * BLOCK_M)` and split the halves with two `tl.gather`s, which
+silently required dkdv's `BLOCK_M` to equal `LSE_ABI_BLOCK`. At `BLOCK_M=128` it returned
+lse-rows 0..63 concatenated with delta-rows 0..63 — no fault, no shape error, smoothly wrong
+dk/dv.
+
+It is now indexed per row against `LSE_ABI_BLOCK`
+(`primus_turbo/triton/attention/attention_kernel.py:1621-1625`, with the reasoning at
+`:1611-1620`), which frees `BLOCK_M` and is what permits an asymmetric dk/dv tile. The two
+cross-lane gathers are gone from this kernel.
+
+`tl.gather` still appears at `:1952-1953`, but that is `_attn_bwd_dq`, whose `BLOCK_M` is
+`FIXED_BLOCK_M` and is not swept. Do not read those two lines as evidence that the dkdv tile
+is still constrained.
 
 Note that turbo's backward is **split into separate dq and dkdv kernels with their own
 grids**. That is a real structural advantage over a one-kernel backward: it does not have

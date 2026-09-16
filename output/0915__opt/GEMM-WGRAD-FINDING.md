@@ -32,9 +32,12 @@
 
 ```
 stats: {'dgrad': 1140, 'wgrad': 0, 'miss': 570}
-    160 x  A(14336, 32768) Av   B(32768, 4096) Bc     <- wgrad：A 是 view，B 连续
-    160 x  A(32768, 4096)  Ac   B(4096, 14336) Bv     <- dgrad
+    160 x  A(14336, 32768) Av   B(32768, 4096) Bc    <- wgrad：A 是 view，B【连续】
+    160 x  A(32768, 4096)  Ac   B(4096, 14336) Bv    <- 前向：A 连续，B 是 view
 ```
+
+（表里记的是**传入时**的布局，在判据之前采样。所以 `Bc` 的那些会被 rule 1 认领 ——
+包括本该归 wgrad 的那些；而 `Bv` 的那些两条规则都不碰。）
 
 **rule 2 命中 0 次。** 它的判据 `not b.is_contiguous()` 永远不成立，
 因为 wgrad 的 B 本来就是连续的，而 rule 1（`b.is_contiguous()`）先把它们拦走了。
@@ -96,3 +99,60 @@ else:  # for other GPU types, assume A100
   8 层配置下峰值显存没变，但 32 层已在 88%，不能据此推断。
 - **`MES ring buffer is full` 仍未归因。** 本轮 5 次连跑零故障；
   昨天那次出现在第 4 次连续运行，前天那次在第 4 次。样本仍不足以定性。
+
+---
+
+## 32 层验证：SIGBUS，根因明确，已加自适应保护
+
+**结果：32L + b=4 + wgrad 规则 = SIGBUS，第 1 步之前就死。**
+
+| 配置 | 显存 | 结果 |
+|---|--:|---|
+| 32L, b=2, wgrad 规则 | **56.41%** | ✅ 10,646 tps，跑完 10 步 |
+| 32L, b=4, wgrad 规则 | — | ❌ **SIGBUS**，0 步 |
+| 32L, b=4, 无 patch（历史） | 87.98% | ✅ 跑完 20 步 |
+
+原因不神秘：32L b=4 本来就在 **87.98%**，而 wgrad 规则要为 lm_head 拷贝 **7.83 GiB** 的 A。
+没有那个余量。
+
+### 这次故障的表象具有误导性，值得单独记
+
+dmesg 的表现是：
+
+```
+MES(0, 0) failed to respond to msg=INVALIDATE_TLBS      (反复)
+MES might be in unrecoverable state, issue a GPU reset
+GPU reset begin!. Source: 3                             ← 没有对应的 reset end
+```
+
+读起来像是本周追了三次的那个 MES wedge。**实际根因在训练日志里，一行**：
+
+```
+Signal 7 (SIGBUS) received by PID 1098
+```
+
+进程 SIGBUS 死掉后不释放 KFD 上下文，驱动才去尝试 reset，而 reset 没能完成。
+**MES 报错是次生现象。** 这与 0915 那次 scratch 常驻导致的 SIGBUS 是同一个模式。
+
+**教训：先读训练日志，再对驱动下结论。** 前几次 MES 故障也该按这个顺序重看一遍。
+
+### 修法：问一句能不能装得下，而不是假设配置有余量
+
+```python
+def _headroom_ok(t):
+    free, _total = torch.cuda.mem_get_info()
+    need = t.numel() * t.element_size() * 2   # contiguous() 同时持有源和目标
+    return need < free * _HEADROOM            # 默认 0.5
+```
+
+同一条规则在 32% 占用的配置上免费、在 88% 的配置上致命，所以**判据必须是运行时的可用显存，
+不是固定的尺寸阈值**。
+
+显存不足时**不放弃，而是落回 dgrad 规则** —— 它不需要额外分配，在 wgrad 调用上仍值
+1.16–1.34×，远好于吃一个 SIGBUS。统计里单列 `wgrad_skipped_oom`，这样"规则没生效"
+和"规则生效了但没效果"永远能分辨。
+
+### 预期
+
+按 profile，lm_head wgrad 是 510.7 ms / 1 次，其余 wgrad 合计 1674.9 ms / 56 次 ——
+**跳过最大的那一个仍能拿到 wgrad 收益的 77%**。32L 上的实际数字待测。
