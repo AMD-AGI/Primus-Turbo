@@ -67,6 +67,11 @@ sleep "${E2E_COOLDOWN:-20}"
 # Field names are taken from this rocm-smi, not guessed: the first version of this sampler
 # looked for "Average Graphics Package Power" and "Sensor edge", neither of which this build
 # emits, so it wrote a file of empty columns that looked like data.
+# A marker a watchdog can match on that is unique to this run. `pgrep -f e2e.sh` matches any
+# e2e run, so a monitor armed for one run adopts the next one and can reap it -- that happened
+# today. Watch for E2E_RUN_MARKER=$TAG instead.
+export E2E_RUN_MARKER="$TAG"
+
 CLK="$OUT/logs/clk.$TAG.csv"
 echo "t,sclk_mhz,power_w,tjunction_c" > "$CLK"
 (
