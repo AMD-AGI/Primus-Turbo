@@ -130,9 +130,42 @@ PATH=/home/lihuzhan/.venv-op-evolve/bin:$PATH op-evolve status --job gfx1250-att
   `reductions.cuh` 因 `permlane32_swap` 是 gfx950 独有而完全编不过；
   三个矩阵入口只活了 `mma_ABt`；`swap_layout` 在 wave32 下只覆盖一半寄存器却是必经环节。
   GPU gate 确认 256 元素错 126 个。**7–10 工程周的估算要按这三条重新定价。**
-- **FlyDSL**：BLOCKED（确证）。gfx1250 **根本没有 MFMA**——
-  `mfma.f32.32x32x16.bf16` / `ds.read.tr16.b64` / `permlane32.swap` 在 gfx950 全部选中、
-  gfx1250 全部 `Cannot select`。18–36 工程日估算成立。
+- **FlyDSL**：~~BLOCKED（确证）~~ **这条结论 0916 被推翻，见下。**
+
+  原文记的是：gfx1250 没有 MFMA，`mfma.f32.32x32x16.bf16` / `ds.read.tr16.b64` /
+  `permlane32.swap` 在 gfx950 全部选中、gfx1250 全部 `Cannot select`，18–36 工程日估算成立。
+
+  **那次探测本身没错，但它回答的是另一个问题。** 它测的是「gfx950 那个 wave64 MFMA 内核能否
+  直接 retarget 到 gfx1250」——答案确实是不能。它没有测「FlyDSL 能否用于 gfx1250」。
+  gfx1250 是 RDNA 系，用 **WMMA** 而不是 MFMA，而 FlyDSL 的 MLIR dialect 里就有
+  `MmaOpGFX1250_WMMAType`（0916 在 `fa-repro` 容器里 import 验证通过，flydsl 0.2.4 即可）。
+  探测查的 `ds.read.tr16.b64` 是 CDNA4 的形式；gfx1250 有的是 **`.b128`**——
+  而这一条在探测前一天就已经写在
+  `agent/skills/kernel-optimize/knowledge/backend/flydsl/optimization-directions.md:35`：
+  *"不要因为 transpose-load 把 gfx1250 关在门外"*。
+
+  **同事已经做出了 gfx1250 的 FlyDSL 实现**，两个未合并分支：
+
+  | 分支 | 日期 | 内容 |
+  |---|---|---|
+  | `origin/opt/gemm/gfx1250-fp8-tile-config` | 06-07 | FMHA 前向 7677 行 + 反向 + autograd + 测试，WMMA/wave32 |
+  | `origin/feat/gemm/gfx1250-flydsl-gemm` | **09-08/09** | GEMM 1230 行，注册为真正的 GEMM 后端，NT/**NN**/TN，bf16/f16/fp8/mxfp8 |
+
+  第二个分支的日期在本条 BLOCKED 结论落笔前 **6 天**。
+
+  真正的门也不在 arch 逻辑，而在 `setup.py:548-554`——gfx1250 构建时**根本不安装 flydsl**，
+  所以下游任何 gate 都无所谓。（那条 TODO 还顺带说"Triton 不支持 gfx1250"，
+  这一半也已被树里的 gfx1250 Triton 后端证伪。）
+
+  **今天的实际结论**（0916 评估，未实测性能）：
+  - GEMM 分支 merge 进 `dev/lhz/attn` **零冲突**，容器里的 flydsl 0.2.4 正是它开发针对的版本。
+  - 但它的 **backend 注册对我们的训练无效**——profile 实证训练走 `aten::mm`（342 次）
+    与 `aten::linear`（114 次），**没有任何 `primus_turbo::gemm`**。要用只能像 nkfix 那样
+    在 dispatch mode 里直接调。
+  - 且其 commit message 自称 NN 只到 **33% roofline**，而我们的 nkfix 路径已把同类 GEMM
+    推到 1160–1630 TF/s。**"架构上更正确"不等于"更快"**，需要微基准才能定。
+  - attention 那个 FMHA 内核是 `D_qk=192/D_v=128`（DeepSeek-V3 MLA），
+    **与 Llama-3.1-8B 的 D=128 不匹配**，不能直接用。
 - **E4 融合反向 `num_warps`**：8 → 24.13 ms、16 → 23.54（出厂的 4 是 10.29）。
   离线 ISA 筛预测 warps=8 能把 VGPR 从顶满 1024 降到 512、`s_set_vgpr_msb` 少 3.2 倍——
   **实测 spill 代价压倒收益，这个内核的寄存器压力假说被证伪。**
