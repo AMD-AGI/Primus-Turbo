@@ -66,10 +66,16 @@ It stays off by default: one run in eleven went loss=nan mid-training, a sudden 
 a divergence, while 720 isolated calls to the same kernel were bit-identical to torch.mm. Until
 that is explained the speed is not claimable as usable.
 
-**And on the 32-layer production configuration** — the one that matches JIRA's shape —
-1,984 -> **11,608 tps, 5.85x**, all 20 steps, peak memory 88.32% against the unpatched
-87.98%. Step time 16.5 s -> 2.82 s. That is the number to quote; the 8-layer figures exist
-to make A/B affordable and are not comparable to a 32-layer result.
+**Correction (0916, late)**: the 32-layer figure previously reported here -- 1,984 -> 11,608
+tps, 5.85x, "reproduces one run in three" -- came from a run whose loss was `nan` from step 3
+onward, for 17 of its 20 steps. It was never a measurement. The 32-layer result now rests on a
+clean, same-session pair measured today: **14,050 tps against a 12,340 control, 7.08x over the
+1,984 baseline**, both runs completing 20 steps with zero non-finite steps.
+
+**On the 32-layer production configuration** — the one that matches JIRA's shape —
+1,984 -> **14,050 tps, 7.08x**, all 20 steps, zero non-finite steps, peak memory 88.32%
+against the unpatched 87.98%. Step time 16.5 s -> 2.33 s. That is the number to quote; the
+8-layer figures exist to make A/B affordable and are not comparable to a 32-layer result.
 
 **Do not quote MFU from these runs.** torchtitan's `get_peak_flops()` falls back to
 "assume A100" (312e12) for any unrecognised `device_name`, and this box reports

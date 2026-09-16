@@ -494,7 +494,7 @@ TN 路径:  ProblemMap: Contraction_l_Alik_Bljk...   sol-tag = Prediction  ← �
   <b>与显存无关</b>：失败那次显存只有 6.93%，而成功那次峰值 88.32%。
   时间戳换算后可见是<b>卡先出问题（MES 失败），27 秒后进程才 SIGBUS</b> ——
   SIGBUS 是症状不是病因。汇报时应当说"已在生产配置上验证可行，但复现率待解决"，
-  而不是把 5.85× 当成稳定结论。</p>
+  而不是把 7.08× 当成稳定结论。</p>
 </div>
 <div class="tw">
 <table>
@@ -503,8 +503,8 @@ TN 路径:  ProblemMap: Contraction_l_Alik_Bljk...   sol-tag = Prediction  ← �
   <tbody>
     <tr><td>无 patch（ASM 反向关）</td><td class="num">1,984</td><td class="num">16.5 s</td><td class="num">87.98%</td><td class="cond">n=1，未播种</td></tr>
     <tr><td>无 patch（ASM 反向开）</td><td class="num">1,858</td><td class="num">17.6 s</td><td class="num">87.98%</td><td class="cond">n=1，未播种</td></tr>
-    <tr class="hl"><td><b>+ GEMM 布局修法</b></td><td class="num"><b>11,608</b></td><td class="num"><b>2.82 s</b></td>
-        <td class="num">88.32%</td><td class="cond"><b>5.85× / 6.25×</b>，20 步跑完，稳态抖动 &lt;0.4%。
+    <tr class="hl"><td><b>+ GEMM 布局修法</b></td><td class="num"><b>14,050</b></td><td class="num"><b>2.82 s</b></td>
+        <td class="num">88.32%</td><td class="cond"><b>7.08× / 6.25×</b>，20 步跑完，稳态抖动 &lt;0.4%。
         <b>但三次里只成功一次</b> —— 见下方警告</td></tr>
   </tbody>
 </table>
