@@ -85,8 +85,27 @@ _TRACE_FILE = os.environ.get("PRIMUS_TURBO_ASM_BWD_TRACE_FILE", "")
 #
 # So the default stays OFF because the end-to-end gain is UNMEASURABLE at n=9, while the path
 # costs 1 GiB of resident scratch, an eligibility gate and three .co files to maintain -- not
-# because it regresses. If the per-mode +1.2% can be nailed down (n=18 per arm, or by finding
-# and controlling the physical cause of the modes), this decision is worth revisiting.
+# because it regresses.
+#
+# UPDATE 0916 -- that "unmeasurable" is CONDITIONAL, and the condition changed. It was measured
+# when attention was 3.3% of a 5.2 s step, with the rest dominated by GEMM calls landing on a
+# MT32x16x32 solution (see output/0915__opt/GEMM-NN-FINDING.md). With that GEMM defect worked
+# around, the step falls to 794 ms and attention becomes 20.8% of it. Re-running the identical
+# A/B under that structure:
+#
+#     ASM backward ON    43,127 tps   (44313 / 42548 / 42519)
+#     ASM backward OFF   37,697 tps   (37790 / 37677 / 37623)
+#     +14.40%, 9.1x the sem of the difference
+#
+# Same kernel, same machine, same 1.74x at the operator level. What changed is the share of the
+# step it occupies, and that share was moved by an unrelated optimisation. An optimisation's
+# end-to-end value is not a property of the optimisation; it is a property of its relationship
+# to the current bottleneck.
+#
+# The default stays OFF for now only because the GEMM workaround is a runtime patch
+# (output/0915__opt/bin/nkfix.py), not product code -- so on the shipped default path the 0915
+# premise still holds. WHEN THE GEMM DEFECT IS FIXED IN THE IMAGE, OR THAT WORKAROUND ENTERS
+# THE PRODUCT PATH, THIS DEFAULT SHOULD FLIP TO ON, after re-running that A/B to confirm.
 #
 # THE TWO PER-CALL COSTS, both invisible to operator-level timing. Neither is the kernel.
 #
