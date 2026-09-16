@@ -16,9 +16,14 @@ OUT=output/0915__opt
 D=/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/gfx1250
 PP=/home/lihuzhan/_dbg_l8b/patch:/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo:/home/lihuzhan/code/aiter-src
 REPS=${REPS:-3}
+# Replicate index to start from, so a partly-finished A/B can be topped up without redoing
+# (or overwriting) the pairs that already landed. The startup phase is this box's known
+# failure window -- every run is one more roll of that die -- so adding the two runs you
+# actually need beats re-running six.
+START=${START:-1}
 CFG=${CFG:-repro_l8b_turbo_conv_8L.yaml}
 
-for r in $(seq 1 "$REPS"); do
+for r in $(seq "$START" $((START + REPS - 1))); do
   for arm in fly copy; do
     tag="fly${r}-${arm}"
     mkdir -p "/home/lihuzhan/_dbg_l8b/$tag"
