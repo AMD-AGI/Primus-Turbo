@@ -17,6 +17,7 @@ import torch
 from primus_turbo.common.constants import (
     ENV_ATTN_BACKEND,
     ENV_AUTO_TUNE,
+    ENV_BACKEND_ALLOW_FALLBACK,
     ENV_GEMM_BACKEND,
     ENV_GROUPED_GEMM_BACKEND,
     ENV_MOE_DISPATCH_COMBINE_BACKEND,
@@ -82,6 +83,13 @@ class BackendType(Enum):
 class BackendChoice:
     backend: Optional[BackendType] = None
     auto_tune: bool = False
+    # Treat `backend` as a preference rather than a requirement: if it cannot
+    # handle the inputs, carry on down the normal priority order instead of
+    # raising. Off by default -- pinning a backend and silently getting another
+    # one hides exactly the thing pinning is usually meant to diagnose. It is
+    # what a production run wants, though, where one unsupported shape should
+    # cost throughput rather than kill the job.
+    allow_fallback: bool = False
 
 
 class GlobalBackendManager:
@@ -369,6 +377,11 @@ class GlobalBackendManager:
         return choice
 
     @classmethod
+    def allow_backend_fallback(cls) -> bool:
+        """Whether a pinned backend that cannot handle the inputs falls back."""
+        return os.environ.get(ENV_BACKEND_ALLOW_FALLBACK, "0") == "1"
+
+    @classmethod
     def auto_tune_enabled(cls) -> bool:
         """Check whether the global auto-tune switch is on.
 
@@ -465,6 +478,29 @@ def _format_kwargs(kwargs: Dict[str, Any]) -> str:
         return repr(v)
 
     return ", ".join(f"{k}={_format_value(v)}" for k, v in kwargs.items())
+
+
+def _pinned_may_fall_back(choice: Optional["BackendChoice"]) -> bool:
+    """Whether a pinned backend is a preference rather than a requirement."""
+    if choice is not None and choice.allow_fallback:
+        return True
+    return GlobalBackendManager.allow_backend_fallback()
+
+
+def _warn_pinned_fallback(backend_enum: BackendType, kwargs: dict) -> None:
+    """Say once that the *pinned* backend was skipped.
+
+    Louder than _warn_fallback: the caller asked for this backend by name, so
+    quietly running another one would misreport what was measured.
+    """
+    if torch.compiler.is_compiling():
+        return
+    logger.warning(
+        f"Pinned backend {backend_enum.name} cannot handle {_format_kwargs(kwargs)}; "
+        f"falling back because fallback is enabled. The run is NOT using the backend "
+        f"that was asked for on these inputs.",
+        once=True,
+    )
 
 
 def _warn_fallback(backend_enum: BackendType, kwargs: dict) -> None:
@@ -590,12 +626,14 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
                     f"Available backends: {[b.name for b in cls._backends.keys()]}"
                 )
             entry = cls._backends[user_backend_enum]
-            if not entry.impl.can_handle(**kwargs):
+            if entry.impl.can_handle(**kwargs):
+                return entry.impl.execute(**kwargs)
+            if not _pinned_may_fall_back(user_backend_choice):
                 raise ValueError(
                     f"User specified backend {user_backend_enum.name} cannot handle the given inputs: {_format_kwargs(kwargs)}. "
                     f"Please check input constraints or choose a different backend."
                 )
-            return entry.impl.execute(**kwargs)
+            _warn_pinned_fallback(user_backend_enum, kwargs)
 
         # 2. Auto tune
         # NOTE: Skip autotune during cuda graph capture.
@@ -649,12 +687,14 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
                     f"User specified backend {user_backend_enum.name} is not registered for {cls.__name__}. "
                     f"Available backends: {[b.name for b in cls._backends.keys()]}"
                 )
-            if not cls._backends[user_backend_enum].impl.can_handle(**kwargs):
+            if cls._backends[user_backend_enum].impl.can_handle(**kwargs):
+                return user_backend_enum
+            if not _pinned_may_fall_back(None):
                 raise ValueError(
                     f"User specified backend {user_backend_enum.name} cannot handle the given inputs: {_format_kwargs(kwargs)}. "
                     f"Please check input constraints or choose a different backend."
                 )
-            return user_backend_enum
+            _warn_pinned_fallback(user_backend_enum, kwargs)
 
         # 2. Auto tune
         # NOTE: Skip autotune during cuda graph capture.
