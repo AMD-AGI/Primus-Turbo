@@ -59,6 +59,28 @@ for _ in $(seq 1 60); do
   sleep 10
 done
 sleep "${E2E_COOLDOWN:-20}"
+
+# Sample clock, power and temperature for the whole run. This box is VR-throttled, so the
+# sustained clock is a variable of the experiment, not a constant -- and nothing was recording
+# it, which is why the fly arm's between-run spread has no evidence either way.
+#
+# Field names are taken from this rocm-smi, not guessed: the first version of this sampler
+# looked for "Average Graphics Package Power" and "Sensor edge", neither of which this build
+# emits, so it wrote a file of empty columns that looked like data.
+CLK="$OUT/logs/clk.$TAG.csv"
+echo "t,sclk_mhz,power_w,tjunction_c" > "$CLK"
+(
+  while :; do
+    o=$(rocm-smi --showgpuclocks --showpower --showtemp 2>/dev/null)
+    printf '%s,%s,%s,%s\n' "$(date +%s)" \
+      "$(printf '%s' "$o" | sed -n 's/.*sclk clock level: [0-9]* (\([0-9]*\)Mhz).*/\1/p' | head -1)" \
+      "$(printf '%s' "$o" | sed -n 's/.*Graphics Package Power (W): \([0-9.]*\).*/\1/p' | head -1)" \
+      "$(printf '%s' "$o" | sed -n 's/.*Temperature (Sensor junction) (C): \([0-9.]*\).*/\1/p' | head -1)"
+    sleep 5
+  done
+) >> "$CLK" 2>/dev/null &
+CLKPID=$!
+trap 'kill $CLKPID 2>/dev/null' EXIT
 timeout ${E2E_TIMEOUT:-1800} docker exec \
   -e GPU=0 -e HIP_VISIBLE_DEVICES=0 \
   ${BLAS_ENV:--e TORCH_BLAS_PREFER_HIPBLASLT=0} \
