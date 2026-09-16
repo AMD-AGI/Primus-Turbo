@@ -59,6 +59,33 @@ for _ in $(seq 1 60); do
   sleep 10
 done
 sleep "${E2E_COOLDOWN:-20}"
+
+# Sample clock, power and temperature for the whole run. This box is VR-throttled, so the
+# sustained clock is a variable of the experiment, not a constant -- and nothing was recording
+# it, which is why the fly arm's between-run spread has no evidence either way.
+#
+# Field names are taken from this rocm-smi, not guessed: the first version of this sampler
+# looked for "Average Graphics Package Power" and "Sensor edge", neither of which this build
+# emits, so it wrote a file of empty columns that looked like data.
+# A marker a watchdog can match on that is unique to this run. `pgrep -f e2e.sh` matches any
+# e2e run, so a monitor armed for one run adopts the next one and can reap it -- that happened
+# today. Watch for E2E_RUN_MARKER=$TAG instead.
+export E2E_RUN_MARKER="$TAG"
+
+CLK="$OUT/logs/clk.$TAG.csv"
+echo "t,sclk_mhz,power_w,tjunction_c" > "$CLK"
+(
+  while :; do
+    o=$(rocm-smi --showgpuclocks --showpower --showtemp 2>/dev/null)
+    printf '%s,%s,%s,%s\n' "$(date +%s)" \
+      "$(printf '%s' "$o" | sed -n 's/.*sclk clock level: [0-9]* (\([0-9]*\)Mhz).*/\1/p' | head -1)" \
+      "$(printf '%s' "$o" | sed -n 's/.*Graphics Package Power (W): \([0-9.]*\).*/\1/p' | head -1)" \
+      "$(printf '%s' "$o" | sed -n 's/.*Temperature (Sensor junction) (C): \([0-9.]*\).*/\1/p' | head -1)"
+    sleep 5
+  done
+) >> "$CLK" 2>/dev/null &
+CLKPID=$!
+trap 'kill $CLKPID 2>/dev/null' EXIT
 timeout ${E2E_TIMEOUT:-1800} docker exec \
   -e GPU=0 -e HIP_VISIBLE_DEVICES=0 \
   ${BLAS_ENV:--e TORCH_BLAS_PREFER_HIPBLASLT=0} \
@@ -71,4 +98,15 @@ timeout ${E2E_TIMEOUT:-1800} docker exec \
       bash runner/primus-cli direct --log_file $RUNDIR/launcher.log \
       -- train pretrain --config examples/torchtitan/configs/MI455X/$CFG $*" \
   > "$OUT/logs/e2e.$TAG.log" 2>&1
-echo "rc=$? tag=$TAG log=$OUT/logs/e2e.$TAG.log"
+RC=$?
+
+# A run whose loss went nan is not a slow run or a fast run -- it is not a measurement at all,
+# and its tps is the speed of a computation that had already broken. Today one such run was
+# reported as a result, and two explanations were built on top of it, because eleven e2e runs
+# were scored on tps without anyone looking at the loss column. Check it here so that can never
+# be a matter of remembering.
+NANS=$(sed 's/\x1b\[[0-9;]*m//g' "$OUT/logs/e2e.$TAG.log" 2>/dev/null | grep -ci "loss: *nan")
+echo "rc=$RC tag=$TAG log=$OUT/logs/e2e.$TAG.log nan_steps=$NANS"
+if [ "${NANS:-0}" -gt 0 ]; then
+  echo "!! $TAG: loss went nan on $NANS steps -- DISCARD this run's tps, it is not a measurement"
+fi
