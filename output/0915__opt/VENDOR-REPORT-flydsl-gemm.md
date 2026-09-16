@@ -80,3 +80,49 @@ except Exception:
 TODO 里写的理由是 "Triton 3.7.0 and flydsl 0.2.4 does not support gfx1250"。
 就 flydsl 而言这一半已被这个分支自己证伪；就 Triton 而言也已被树里的 gfx1250 Triton 后端证伪。
 容器里装着的 flydsl 0.2.4 带有 `MmaOpGFX1250_WMMAType`，这个分支在它上面工作正常。
+
+---
+
+## 附：建议的最小修复
+
+两处都很小，且都不改变现有 NT/NN 调用者的行为。
+
+**（1）TN 的调优缓存键补上 M。**
+
+```python
+# autotune()
+key = (cfg.kind, layout, cfg.N, cfg.K)
+```
+
+改为在 TN 下带上 M（NT/NN 维持原样，那里注释是对的）：
+
+```python
+key = ((cfg.kind, layout, cfg.M, cfg.N, cfg.K) if layout == "tn"
+       else (cfg.kind, layout, cfg.N, cfg.K))
+```
+
+并把 `_TUNED` 上方那段注释限定为 NT/NN —— 否则下一个人读到的仍是
+"M 是 token 数"，而在 TN 下它不是。
+
+**（2）`autotune` 区分"编不过"与"发射失败"。**
+
+现在两者共用同一个 `except Exception: continue`。前者 continue 是对的，
+后者之后 HIP context 已经不可恢复，continue 只会让剩下几十个候选对着一个死掉的 context
+跑完，错误最终在**无关的**调用上报出来。最小改法是在 `except` 里判断一次：
+
+```python
+except Exception as exc:
+    if "launch failure" in str(exc) or "unspecified" in str(exc):
+        raise                     # context is gone; continuing cannot help
+    continue                      # genuinely just "this config will not compile"
+```
+
+（字符串匹配不优雅，但比现状好；更干净的做法是调用方在 autotune 外层包一次
+context 存活检查。我们这边的规避是根本不在在线路径上调 `autotune`，
+改为离线建表 —— 但那是绕开，不是修复。）
+
+## 我们这边可直接复用的产物
+
+`output/0915__opt/bin/flydsl_table.py` —— 离线建表脚本：每形状一个子进程（一个形状 fault
+只损失那个形状）、硬超时、逐形状 SQNR ≥ 50 dB 门。它产出的表也就是上面那张"五个共用
+`(N,K)` 的形状调出四个不同最优配置"的证据。
