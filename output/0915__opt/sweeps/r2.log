@@ -21,3 +21,97 @@
 [10/73] fwd:num_warps=1,waves_per_eu=1,num_stages=2,PRE_LOAD_V=0
   ok  4.723 ms  407.4 TFLOP/s
 [11/73] fwd:num_warps=1,waves_per_eu=1,num_stages=2,PRE_LOAD_V=1
+  ok  4.732 ms  406.6 TFLOP/s
+[12/73] fwd:num_warps=1,waves_per_eu=1,num_stages=3,PRE_LOAD_V=0
+  ok  5.523 ms  348.4 TFLOP/s
+[13/73] fwd:num_warps=1,waves_per_eu=1,num_stages=3,PRE_LOAD_V=1
+  ok  5.535 ms  347.6 TFLOP/s
+[14/73] fwd:num_warps=1,waves_per_eu=2,num_stages=1,PRE_LOAD_V=0
+  ok  10.191 ms  188.8 TFLOP/s
+[15/73] fwd:num_warps=1,waves_per_eu=2,num_stages=1,PRE_LOAD_V=1
+  ok  10.522 ms  182.9 TFLOP/s
+[16/73] fwd:num_warps=1,waves_per_eu=2,num_stages=2,PRE_LOAD_V=0
+  ok  9.157 ms  210.1 TFLOP/s
+[17/73] fwd:num_warps=1,waves_per_eu=2,num_stages=2,PRE_LOAD_V=1
+  ok  11.278 ms  170.6 TFLOP/s
+[18/73] fwd:num_warps=1,waves_per_eu=2,num_stages=3,PRE_LOAD_V=0
+  ok  10.565 ms  182.1 TFLOP/s
+[19/73] fwd:num_warps=1,waves_per_eu=2,num_stages=3,PRE_LOAD_V=1
+  ok  10.847 ms  177.4 TFLOP/s
+[20/73] fwd:num_warps=2,waves_per_eu=0,num_stages=1,PRE_LOAD_V=0
+  ok  5.053 ms  380.8 TFLOP/s
+[21/73] fwd:num_warps=2,waves_per_eu=0,num_stages=1,PRE_LOAD_V=1
+  ok  4.913 ms  391.6 TFLOP/s
+[22/73] fwd:num_warps=2,waves_per_eu=0,num_stages=2,PRE_LOAD_V=0
+  ok  4.282 ms  449.4 TFLOP/s
+[23/73] fwd:num_warps=2,waves_per_eu=0,num_stages=2,PRE_LOAD_V=1
+  ok  4.250 ms  452.7 TFLOP/s
+[24/73] fwd:num_warps=2,waves_per_eu=0,num_stages=3,PRE_LOAD_V=0
+  ok  4.458 ms  431.6 TFLOP/s
+[25/73] fwd:num_warps=2,waves_per_eu=0,num_stages=3,PRE_LOAD_V=1
+  ok  4.472 ms  430.3 TFLOP/s
+[26/73] fwd:num_warps=2,waves_per_eu=1,num_stages=1,PRE_LOAD_V=0
+  ok  4.997 ms  385.1 TFLOP/s
+[27/73] fwd:num_warps=2,waves_per_eu=1,num_stages=1,PRE_LOAD_V=1
+  ok  4.803 ms  400.6 TFLOP/s
+[28/73] fwd:num_warps=2,waves_per_eu=1,num_stages=2,PRE_LOAD_V=0
+  ok  4.809 ms  400.1 TFLOP/s
+[29/73] fwd:num_warps=2,waves_per_eu=1,num_stages=2,PRE_LOAD_V=1
+  ok  4.733 ms  406.5 TFLOP/s
+[30/73] fwd:num_warps=2,waves_per_eu=1,num_stages=3,PRE_LOAD_V=0
+  ok  4.854 ms  396.4 TFLOP/s
+[31/73] fwd:num_warps=2,waves_per_eu=1,num_stages=3,PRE_LOAD_V=1
+  ok  4.827 ms  398.6 TFLOP/s
+[32/73] fwd:num_warps=2,waves_per_eu=2,num_stages=1,PRE_LOAD_V=0
+  ok  4.257 ms  452.0 TFLOP/s
+[33/73] fwd:num_warps=2,waves_per_eu=2,num_stages=1,PRE_LOAD_V=1
+  ok  4.227 ms  455.2 TFLOP/s
+[34/73] fwd:num_warps=2,waves_per_eu=2,num_stages=2,PRE_LOAD_V=0
+  ok  4.096 ms  469.8 TFLOP/s
+[35/73] fwd:num_warps=2,waves_per_eu=2,num_stages=2,PRE_LOAD_V=1
+  ok  4.180 ms  460.3 TFLOP/s
+[36/73] fwd:num_warps=2,waves_per_eu=2,num_stages=3,PRE_LOAD_V=0
+  ok  4.325 ms  444.9 TFLOP/s
+[37/73] fwd:num_warps=2,waves_per_eu=2,num_stages=3,PRE_LOAD_V=1
+  ok  4.337 ms  443.7 TFLOP/s
+[38/73] fwd:num_warps=4,waves_per_eu=0,num_stages=1,PRE_LOAD_V=0
+  ok  4.906 ms  392.2 TFLOP/s
+[39/73] fwd:num_warps=4,waves_per_eu=0,num_stages=1,PRE_LOAD_V=1
+  ok  4.317 ms  445.7 TFLOP/s
+[40/73] fwd:num_warps=4,waves_per_eu=0,num_stages=2,PRE_LOAD_V=0
+  ok  3.945 ms  487.7 TFLOP/s
+[41/73] fwd:num_warps=4,waves_per_eu=0,num_stages=2,PRE_LOAD_V=1
+  ok  4.199 ms  458.3 TFLOP/s
+[42/73] fwd:num_warps=4,waves_per_eu=0,num_stages=3,PRE_LOAD_V=0
+  ok  4.174 ms  461.0 TFLOP/s
+[43/73] fwd:num_warps=4,waves_per_eu=0,num_stages=3,PRE_LOAD_V=1
+  ok  4.133 ms  465.5 TFLOP/s
+[44/73] fwd:num_warps=4,waves_per_eu=1,num_stages=1,PRE_LOAD_V=0
+  ok  6.111 ms  314.9 TFLOP/s
+[45/73] fwd:num_warps=4,waves_per_eu=1,num_stages=1,PRE_LOAD_V=1
+  ok  5.651 ms  340.5 TFLOP/s
+[46/73] fwd:num_warps=4,waves_per_eu=1,num_stages=2,PRE_LOAD_V=0
+  ok  5.460 ms  352.4 TFLOP/s
+[47/73] fwd:num_warps=4,waves_per_eu=1,num_stages=2,PRE_LOAD_V=1
+  ok  5.444 ms  353.4 TFLOP/s
+[48/73] fwd:num_warps=4,waves_per_eu=1,num_stages=3,PRE_LOAD_V=0
+  ok  5.487 ms  350.7 TFLOP/s
+[49/73] fwd:num_warps=4,waves_per_eu=1,num_stages=3,PRE_LOAD_V=1
+  ok  5.480 ms  351.1 TFLOP/s
+[50/73] fwd:num_warps=4,waves_per_eu=2,num_stages=1,PRE_LOAD_V=0
+  ok  4.893 ms  393.3 TFLOP/s
+[51/73] fwd:num_warps=4,waves_per_eu=2,num_stages=1,PRE_LOAD_V=1
+  ok  4.642 ms  414.5 TFLOP/s
+[52/73] fwd:num_warps=4,waves_per_eu=2,num_stages=2,PRE_LOAD_V=0
+  ok  4.473 ms  430.2 TFLOP/s
+[53/73] fwd:num_warps=4,waves_per_eu=2,num_stages=2,PRE_LOAD_V=1
+  ok  4.504 ms  427.2 TFLOP/s
+[54/73] fwd:num_warps=4,waves_per_eu=2,num_stages=3,PRE_LOAD_V=0
+  ok  4.471 ms  430.4 TFLOP/s
+[55/73] fwd:num_warps=4,waves_per_eu=2,num_stages=3,PRE_LOAD_V=1
+  ok  4.546 ms  423.3 TFLOP/s
+[56/73] fwd:num_warps=8,waves_per_eu=0,num_stages=1,PRE_LOAD_V=0
+  ok  5.766 ms  333.7 TFLOP/s
+[57/73] fwd:num_warps=8,waves_per_eu=0,num_stages=1,PRE_LOAD_V=1
+  ok  5.815 ms  330.9 TFLOP/s
+[58/73] fwd:num_warps=8,waves_per_eu=0,num_stages=2,PRE_LOAD_V=0
