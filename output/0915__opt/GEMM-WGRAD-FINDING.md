@@ -102,60 +102,55 @@ else:  # for other GPU types, assume A100
 
 ---
 
-## 32 层验证：SIGBUS，根因明确，已加自适应保护
+## 32 层验证：两次失败一次成功，而我对失败的归因错了两次
 
-**结果：32L + b=4 + wgrad 规则 = SIGBUS，第 1 步之前就死。**
+| 运行 | 结果 | 步数 | 峰值显存 |
+|---|---|--:|--:|
+| 32L, b=2, 带 patch | ✅ | 10 | 56.41% |
+| 32L, b=4, 带 patch（第 1 次） | ❌ SIGBUS | 0 | — |
+| 32L, b=4, 带 patch（第 2 次） | ✅ | **20** | 88.32% |
+| 32L, b=4, 带 patch（第 3 次） | ❌ SIGBUS | 0 | **6.93%** |
 
-| 配置 | 显存 | 结果 |
-|---|--:|---|
-| 32L, b=2, wgrad 规则 | **56.41%** | ✅ 10,646 tps，跑完 10 步 |
-| 32L, b=4, wgrad 规则 | — | ❌ **SIGBUS**，0 步 |
-| 32L, b=4, 无 patch（历史） | 87.98% | ✅ 跑完 20 步 |
+### 第一次归因（错）："是显存不够"
 
-原因不神秘：32L b=4 本来就在 **87.98%**，而 wgrad 规则要为 lm_head 拷贝 **7.83 GiB** 的 A。
-没有那个余量。
+看到 SIGBUS + 32L 本来就在 88%，我断定是 wgrad 规则拷贝 lm_head 的 7.83 GiB 撑爆了，
+并据此加了 `_headroom_ok` 保护。
 
-### 这次故障的表象具有误导性，值得单独记
+**被第三次运行证伪：它在显存只有 6.93% 时就 SIGBUS 了。** 那是启动早期，离耗尽差得远。
+而成功那次峰值 88.32% 反而没事。**显存不是原因。**
 
-dmesg 的表现是：
+保护本身也从未起过作用：成功那次的统计是 `wgrad_skipped_oom: 0`，
+`mem_get_info` 报的设备级 free 在 88% 占用时仍有约 51 GiB，
+lm_head 需要 15.66 GiB，对阈值 25.9 从来没触到过。
+**带保护和不带保护在这个配置上走的是同一条路径。**
+
+### 第二次归因（也错）："SIGBUS 的进程不释放 KFD，驱动 reset 才产生 MES"
+
+把时间戳换算到同一时钟后，因果是**反的**：
 
 ```
-MES(0, 0) failed to respond to msg=INVALIDATE_TLBS      (反复)
-MES might be in unrecoverable state, issue a GPU reset
-GPU reset begin!. Source: 3                             ← 没有对应的 reset end
+首条 MES(0,0) failed to respond to msg=INVALIDATE_TLBS   08:01:28
+Signal 7 (SIGBUS) received by PID 2226                   08:01:55   ← 27 秒之后
 ```
 
-读起来像是本周追了三次的那个 MES wedge。**实际根因在训练日志里，一行**：
+**卡先出问题，进程随后访问 GPU 内存才 SIGBUS。** 所以 SIGBUS 是**症状**，
+MES 才更接近病灶 —— 与我上一条写的正好相反。
 
-```
-Signal 7 (SIGBUS) received by PID 1098
-```
+（前一次失败的首条故障在 uptime 281s，同样早于其 SIGBUS。两次一致。）
 
-进程 SIGBUS 死掉后不释放 KFD 上下文，驱动才去尝试 reset，而 reset 没能完成。
-**MES 报错是次生现象。** 这与 0915 那次 scratch 常驻导致的 SIGBUS 是同一个模式。
+### 现在能说什么
 
-**教训：先读训练日志，再对驱动下结论。** 前几次 MES 故障也该按这个顺序重看一遍。
+- **32L 能跑通，5.85× 是实测**（见下一节），但**不稳定**：三次里成一次。
+- **失败与显存无关**，与是否带 headroom 保护也无关。
+- **失败都发生在启动阶段**（0 步），且都是"卡先 MES 失败、进程后 SIGBUS"。
+  这与 0915/0916 早先那几次 MES 故障是同一个形态 —— 全部在启动阶段。
+- `_headroom_ok` **保留**，但要如实标注：它防的是一个**尚未被证实存在**的显存问题，
+  代价是每次 wgrad 调用一次 `mem_get_info`。不是这次成功的原因。
 
-### 修法：问一句能不能装得下，而不是假设配置有余量
+### 教训
 
-```python
-def _headroom_ok(t):
-    free, _total = torch.cuda.mem_get_info()
-    need = t.numel() * t.element_size() * 2   # contiguous() 同时持有源和目标
-    return need < free * _HEADROOM            # 默认 0.5
-```
-
-同一条规则在 32% 占用的配置上免费、在 88% 的配置上致命，所以**判据必须是运行时的可用显存，
-不是固定的尺寸阈值**。
-
-显存不足时**不放弃，而是落回 dgrad 规则** —— 它不需要额外分配，在 wgrad 调用上仍值
-1.16–1.34×，远好于吃一个 SIGBUS。统计里单列 `wgrad_skipped_oom`，这样"规则没生效"
-和"规则生效了但没效果"永远能分辨。
-
-### 预期
-
-按 profile，lm_head wgrad 是 510.7 ms / 1 次，其余 wgrad 合计 1674.9 ms / 56 次 ——
-**跳过最大的那一个仍能拿到 wgrad 收益的 77%**。32L 上的实际数字待测。
+**先读训练日志再看 dmesg** 这条建议本身是对的，但不够 —— 还得**把两边的时间戳换算到同一时钟**。
+只看"训练日志说 SIGBUS"就下结论，正好会得到反向的因果。
 
 ## 32 层生产配置跑通：5.85×，但成功的机制未定
 
