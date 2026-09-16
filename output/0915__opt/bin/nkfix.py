@@ -55,10 +55,17 @@ _HEADROOM = float(os.environ.get("NKFIX_HEADROOM", "0.5"))
 # Off by default -- it needs the feat/gemm/gfx1250-flydsl-gemm branch merged, and a config
 # where that import fails must behave exactly as before rather than erroring at the first mm.
 _RULE3 = os.environ.get("NKFIX_FLYDSL_WGRAD", "") not in ("", "0")
+# Check every Nth rule-3 output for non-finite values (0 = never). One run in eleven went
+# loss=nan at step 10 -- a sudden jump, not a divergence: the seeded control run was at 9.71 on
+# the same step. 720 isolated calls across three processes were bit-identical to torch.mm, so
+# the fault is rare, nondeterministic, and not reproducible in isolation. Until it is
+# understood, a run using rule 3 should be able to say whether it stayed finite rather than
+# leaving it to the loss column to notice several steps later.
+_RULE3_CHECK = int(os.environ.get("NKFIX_FLYDSL_CHECK", "0"))
 _MM = torch.ops.aten.mm.default
 stats = {"dgrad": 0, "wgrad": 0, "wgrad_skipped_oom": 0, "miss": 0,
          "wgrad_flydsl": 0, "flydsl_unavailable": 0, "flydsl_declined": 0,
-         "flydsl_no_config": 0}
+         "flydsl_no_config": 0, "flydsl_nonfinite": 0}
 _seen = {}
 
 
@@ -190,6 +197,14 @@ def _flydsl_wgrad(a, b):
         stats["flydsl_declined"] += 1
         return None
     stats["wgrad_flydsl"] += 1
+    if _RULE3_CHECK and stats["wgrad_flydsl"] % _RULE3_CHECK == 0:
+        # torch.isfinite().all() costs a full read plus a sync, so it is sampled rather than
+        # run on every call. Falling back to rule 2 on a bad output would hide the event; the
+        # point is to record that it happened, with the shape, while the run is still alive.
+        if not torch.isfinite(out).all():
+            stats["flydsl_nonfinite"] += 1
+            print("[nkfix] NON-FINITE FlyDSL wgrad output: M=%d N=%d K=%d (call %d)"
+                  % (a.shape[0], b.shape[1], b.shape[0], stats["wgrad_flydsl"]), flush=True)
     return out
 
 

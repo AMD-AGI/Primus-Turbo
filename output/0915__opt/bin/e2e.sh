@@ -98,4 +98,15 @@ timeout ${E2E_TIMEOUT:-1800} docker exec \
       bash runner/primus-cli direct --log_file $RUNDIR/launcher.log \
       -- train pretrain --config examples/torchtitan/configs/MI455X/$CFG $*" \
   > "$OUT/logs/e2e.$TAG.log" 2>&1
-echo "rc=$? tag=$TAG log=$OUT/logs/e2e.$TAG.log"
+RC=$?
+
+# A run whose loss went nan is not a slow run or a fast run -- it is not a measurement at all,
+# and its tps is the speed of a computation that had already broken. Today one such run was
+# reported as a result, and two explanations were built on top of it, because eleven e2e runs
+# were scored on tps without anyone looking at the loss column. Check it here so that can never
+# be a matter of remembering.
+NANS=$(sed 's/\x1b\[[0-9;]*m//g' "$OUT/logs/e2e.$TAG.log" 2>/dev/null | grep -ci "loss: *nan")
+echo "rc=$RC tag=$TAG log=$OUT/logs/e2e.$TAG.log nan_steps=$NANS"
+if [ "${NANS:-0}" -gt 0 ]; then
+  echo "!! $TAG: loss went nan on $NANS steps -- DISCARD this run's tps, it is not a measurement"
+fi
