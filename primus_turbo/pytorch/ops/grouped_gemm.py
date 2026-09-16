@@ -9,7 +9,7 @@ from typing import Optional, Union
 import torch
 
 from primus_turbo.pytorch.core.backend import BackendType
-from primus_turbo.pytorch.kernels.gemm.gemm_impl import gemm_accum_impl, gemm_impl
+from primus_turbo.pytorch.kernels.gemm.gemm_impl import gemm_impl
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
     grouped_gemm_impl,
     grouped_gemm_variable_k_accum_impl,
@@ -128,30 +128,21 @@ class GroupedGemmFunc(torch.autograd.Function):
                 ctx.trans_a,
                 default_backend=BackendType.HIPBLASLT.value,
             )
-            if ctx.fuse_bgrad_accum:
-                # main_grad matches b's [1, ...] shape; the dense GEMM writes 2D, and
-                # squeeze(0) is a view so the accumulation lands in the real buffer.
-                gemm_accum_impl(
-                    a,
-                    True,
-                    grad_out,
-                    False,
-                    b.dtype,
-                    ctx.trans_b,
-                    out=ctx.main_grad.squeeze(0),
-                    default_backend=BackendType.HIPBLASLT.value,
-                )
-                grad_b = _get_dummy_wgrad(b.shape, b.dtype)
-            else:
-                grad_b = gemm_impl(
-                    a,
-                    True,
-                    grad_out,
-                    False,
-                    b.dtype,
-                    ctx.trans_b,
-                    default_backend=BackendType.HIPBLASLT.value,
-                ).view(b.size())
+            # wgrad reduces over M: a dense GEMM would fold `a`'s uninitialized
+            # worst-case tail rows into grad_b, so stop at group_offs.
+            grad_b = _bgrad_grouped_gemm_impl_wrapper(
+                a,
+                grad_out,
+                group_lens,
+                group_offs,
+                trans_a=not ctx.trans_a,
+                trans_b=False,
+                trans_c=ctx.trans_b,
+                num_cu=ctx.num_cu,
+                default_backend=BackendType.TRITON.value,
+                inplace_add_to_out=ctx.fuse_bgrad_accum,
+                out=ctx.main_grad,
+            ).view(b.size())
         else:
             grad_a = grouped_gemm_impl(
                 grad_out,
