@@ -32,3 +32,6 @@ out/
 output/*/run/
 output/*/sched.pid
 output/*/STOP
+
+# rocprofv3 scratch, written into cwd by the profiling agent
+.rocprofv3/
