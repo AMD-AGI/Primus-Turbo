@@ -15,11 +15,13 @@
 | **0** | 静态可行性（**现在就能做**） | **0** | 1–2 | 无 |
 | **1** | 接通并测量 aiter 的 gfx1250 FlyDSL **前向** | 1–2 | 1 | Stage 0 |
 | **2** | 决策门：继续 / 停止 | 0 | 0.5 | Stage 1 |
-| **3** | gfx1250 FlyDSL **反向** 第一版（odo + dkdv 骨架） | 3–5 | 3–5 | Stage 2 通过 |
-| **4** | 反向补全（dq、LSE、GQA 规约）与正确性门 | 3–5 | 2–4 | Stage 3 |
-| **5** | 调优与 e2e 验证 | 4–6 | 2–3 | Stage 4 |
+| **3** | gfx1250 FlyDSL **反向** 第一版（两 job 骨架） | 2–4 | 2–4 | Stage 2 通过 |
+| **4** | 反向补全（LSE、GQA、varlen）与正确性门 | 2–4 | 2–3 | Stage 3 |
+| **5** | 调优与 e2e 验证 | 3–5 | 2–3 | Stage 4 |
 
-**合计（若全程通过）：11–18 GPU run，9–15 agent session。**
+**合计（若全程通过）：8–15 GPU run，7–12 agent session。**
+（0917 下修：aiter 更新后出现了 `fmha_bwd_gfx942/` —— 一份 **1044 行、高层写法**的完整
+FlyDSL FA 反向，提供了反向的**结构模板**。详见 `SURVEY.md` §10.2。原估 11–18 / 9–15。）
 Stage 3 起是**新写内核**，这个估算的不确定度大，且 §决策门 存在提前终止。
 
 ---
@@ -99,7 +101,17 @@ Stage 3 起是**新写内核**，这个估算的不确定度大，且 §决策�
 ## Stage 3 — gfx1250 FlyDSL 反向：第一版（3–5 GPU run，3–5 session）
 
 **不是移植 CDNA4 那份**（三原语全部 Cannot select，见 SURVEY §2），
-**是以 aiter 的 gfx1250 前向为模板新写**。
+**是把两份模板合成**（0917 更新，见 `SURVEY.md` §10.2）：
+
+| 模板 | 提供 |
+|---|---|
+| `aiter/ops/flydsl/kernels/fmha_gfx1250/`（4147 行，前向） | gfx1250 的**原语与布局**：wave32、`WMMA(16,16,32)`、`ds_load_tr16_b128`、TDM |
+| **`aiter/ops/flydsl/kernels/fmha_bwd_gfx942/`（1044 行，反向）** | 反向的**结构**：两 job 一 grid、**无 atomic 全确定性**、dK/dV 与 dQ 的转置技巧 |
+
+主要的合成工作是把 `fx.rocdl.MFMA(16,16,16,bf16)`（gfx942）换成
+`fx.rocdl.WMMA(16,16,32,bf16,fx.Float32)`（gfx1250），并相应调整 k 循环步长与 LDS staging。
+**gfx942 那份 "no atomics, fully deterministic、每个输出恰好写一次" 的结构应当保留** ——
+它正好避开 aiter gfx1250 ASM 反向那个 GQA 越界写。
 
 可复用的 gfx1250 惯用法（全部来自 `fmha_gfx1250/`，**已实测存在**）：
 `ds_load_tr16_b128`（12 处）、`make_tdm_atom` + `tdm_ops`（TDM 异步拷贝）、

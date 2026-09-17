@@ -262,3 +262,90 @@ attention 需要的是 **LDS→寄存器直接喂进 MMA fragment**。`67beab6f`
 
 全部在 §10 的 Stage 0，见 `PLAN.md`。要点：aiter 那份前向对 flydsl 0.3.x API 的依赖是
 **纯静态可查**的，不需要卡。
+
+---
+
+## 10. aiter 更新到 2026-09-17 后的复核（本节为 pull 之后追加）
+
+`/home/lihuzhan/code/aiter-src` 是 `ROCm/aiter` 的 shallow clone（depth 1，`blob:none`）。
+更新前 HEAD `ffa945f` (2026-09-13)，更新后 **`6963ae9` (2026-09-17)**，工作区干净、无本地改动。
+
+### 10.1 核心结论：不变
+
+| 事实 | 更新前 | 更新后 |
+|---|---|---|
+| `hsa/gfx1250/fmha_v3_bwd/` 的 `.co` 数 | 6 | **6，且六个文件字节数逐一不变** |
+| `fmha_bwd_dqdkdv.csv` 选择表 | 2 行 | **2 行，内容不变** |
+| gfx950 反向 `.co` 数 | 124 | 124 |
+| **gfx1250 的 FlyDSL 反向** | 不存在 | **仍然不存在** |
+
+**我们所有 ASM 反向的测量基准没有被这次更新改动。** 这一点很重要，因为运行时读的就是这个 checkout（见 §10.4）。
+
+### 10.2 新增：gfx942 的 FlyDSL 反向 —— 这是计划里最有价值的新模板
+
+`aiter/ops/flydsl/kernels/fmha_bwd_gfx942/fmha_bwd_core.py`，**1044 行、单文件**，
+入口 `flydsl_flash_attn_varlen_bwd`（`fmha_kernels.py:547`）。
+
+**它不是 gfx1250 的**，docstring 明写目标是 **gfx942**、`d_qk=192 / d_v=128`、**no GQA**，
+所以不能直接用。但它的**结构**正是一个 gfx1250 反向需要的：
+
+> `k_bwd` carries TWO JOB TYPES on one grid. Each output element is written exactly once by
+> exactly one workgroup — **no atomics, fully deterministic** — at the cost of computing the
+> score matrix once per job type.
+> **dK/dV job**：one workgroup per (key block of 128, sequence, head); streams query tiles of 32.
+> **dQ job**：one workgroup per (query block of 128, sequence, head); streams key tiles of 32.
+> Computes the scores TRANSPOSED (S^T = K.Q^T) so the dS^T fragment is, for free, the dS operand
+> that dQ = dS.K needs.
+
+**"no atomics, fully deterministic、每个输出元素恰好被一个 workgroup 写一次"** ——
+这正好绕开了 aiter gfx1250 **ASM** 反向那个 GQA 越界写/竞争的 bug（见 `BACKEND-STRATEGY.md` §Q7.3b）。
+
+**规模对照，这条直接改变工作量估算：**
+
+| 实现 | 行数 | 风格 |
+|---|--:|---|
+| turbo 的 gfx950 FlyDSL 反向（`flash_attn_bwd.py`） | **5581** | 手推 intrinsic，7 个 builder |
+| **aiter 的 gfx942 FlyDSL 反向** | **1044** | **高层 layout-algebra，单文件** |
+
+裸原语统计（**实测** `grep -o`）：gfx942 那份只有 `make_buffer_tensor`、`exp2`、
+以及**一处** `MFMA(` —— MMA 是通过 atom API 表达的：
+
+```python
+mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))     # fmha_bwd_core.py:104
+```
+
+而 gfx1250 的标准写法是（**实测**，全树 4 处）：
+
+```python
+fx.rocdl.WMMA(WMMA_M, WMMA_N, WMMA_K, elem_dtype, fx.Float32)      # 16, 16, 32
+```
+
+**不是一行照抄**（K 从 16 变 32，k 循环步长要改），但也远不是重写 5581 行。
+
+### 10.3 由此修正工作量估算
+
+`PLAN.md` 的 Stage 3–5 原估 **6–16 GPU run / 7–12 agent session**，依据是
+"以 gfx1250 前向为模板新写反向"。现在有了**两份互补模板**：
+
+| 模板 | 提供什么 |
+|---|---|
+| `fmha_gfx1250/`（4147 行，前向） | gfx1250 的**原语与布局**：wave32、WMMA 16x16x32、`ds_load_tr16_b128`、TDM 异步拷贝 |
+| **`fmha_bwd_gfx942/`（1044 行，反向）** | **反向的结构**：两 job 一 grid、无 atomic、dK/dV 与 dQ 的转置技巧、LSE 处理、varlen |
+
+**修正后估算：Stage 3–5 约 5–12 GPU run / 5–9 agent session**（原 6–16 / 7–12）。
+下修的理由是结构模板已存在且规模只有 1044 行；**但不确定度仍然大**，
+因为两份模板的架构不同，合成过程本身没有先例。
+
+### 10.4 运行时 aiter 从哪来（此前未记录，且与上面这条更新直接相关）
+
+| 事实 | 证据 | 标记 |
+|---|---|---|
+| **容器镜像里没有 aiter** | 无 GPU 一次性容器内 `ls site-packages/aiter*` 无输出 | **实测** |
+| e2e 通过 `PYTHONPATH` 用**宿主机的这个 checkout** | `output/0915__opt/bin/e2e.sh:92` `-e PYTHONPATH=...:/home/lihuzhan/code/aiter-src` | **实测** |
+| `.co` 的目录是从 `import aiter` 反推的，不是硬编码 | `_asm_bwd_kernargs.py:18-31` `_asm_dir()`：`Path(aiter.__file__).parent.parent / "hsa" / "gfx1250" / "fmha_v3_bwd"`，失败才退回硬编码路径 | **实测** |
+| 它是**源码方式**被 import 的，没有编译安装 | 0916 一次 `docker exec` 未带 PYTHONPATH 时报 `ModuleNotFoundError: No module named 'aiter'` | **实测** |
+
+**含义（这是一条需要写进纪律的风险）**：更新这个 checkout 会**直接改变下一次 e2e 跑的是什么**——
+Python 源码与 `.co` 二进制都来自它，没有中间的构建或版本固定。
+本次更新经逐项核对**没有改动我们依赖的任何东西**，但**下次 pull 之前应当先做同样的核对**：
+六个 `.co` 的字节数、`fmha_bwd_dqdkdv.csv` 的内容、以及 `_asm_bwd_kernargs.py` 依赖的 aiter 目录结构。
