@@ -2450,9 +2450,52 @@ def _build_mxfp4_gemm_kernel(
 # ── Primus-Turbo host wrapper ────────────────────────────────────────────────
 
 _MXFP4_LAUNCH_CACHE: dict = {}  # (K, gm, xcd, gn, wlv, elgk, coop, ksplit, taccw, out_fp16) -> fused launch
-# (M, N, K, gm, xcd, gn, wlv, elgk, taccw, coop, out_fp16) -> [raw, compiled_or_None]
 _MXFP4_AT_CACHE: dict = {}
-_MXFP4_CFG_CACHE: dict = {}  # (M, N, K, row_bytes, out_fp16) -> (gm, gn, xcd, wlv, elgk, taccw, coop)
+_MXFP4_CFG_CACHE: dict = {}
+
+
+def _mxfp4_cfg_key(device_idx, M, N, K, k_real, row_bytes, out_fp16, beta_is_one):
+    """Device and logical-layout identity for a timed configuration winner."""
+    return (device_idx, M, N, K, k_real, row_bytes, out_fp16, beta_is_one)
+
+
+def _mxfp4_artifact_key(
+    device_idx,
+    M,
+    N,
+    K,
+    k_real,
+    row_bytes,
+    gm,
+    xcd,
+    gn,
+    wlv,
+    elgk,
+    taccw,
+    coop,
+    ksplit,
+    out_fp16,
+    beta_is_one,
+):
+    """Identity of one compiled fused-launch variant."""
+    return (
+        device_idx,
+        M,
+        N,
+        K,
+        k_real,
+        row_bytes,
+        gm,
+        xcd,
+        gn,
+        wlv,
+        elgk,
+        taccw,
+        coop,
+        ksplit,
+        out_fp16,
+        beta_is_one,
+    )
 
 
 def _mxfp4_nt_config(M, N, K):
@@ -2489,22 +2532,35 @@ def _mxfp4_swizzle_candidates(M, N, K):
     return cands[:3]
 
 
-def _autotune_mxfp4_config(M, N, K, args, out_fp16=False, k_real=None, row_bytes=None):
-    """Pick (group_m, group_n, num_xcds) for this (M, N, K, out dtype) by a quick timed
-    sweep over ``_mxfp4_swizzle_candidates`` (<=3) on the real operands; cached per shape
-    and store dtype.
+def _autotune_mxfp4_config(
+    M,
+    N,
+    K,
+    args,
+    out_fp16=False,
+    k_real=None,
+    row_bytes=None,
+    beta_is_one=False,
+    device_idx=None,
+    capturing=False,
+):
+    """Pick (group_m, group_n, num_xcds) for this (M, N, K, out dtype, beta) by a quick timed
+    sweep over ``_mxfp4_swizzle_candidates`` (<=3) on the real operands; cached per shape,
+    store dtype AND beta -- a beta=1 build's epilogue is a different kernel (read-back +
+    accumulate instead of overwrite), so it must be raced and cached independently of the
+    beta=0 build of the same (M, N, K).
 
     The swizzle only remaps which workgroup computes which output tile, so every
     candidate is bit-identical -- we are purely chasing L2 residency / tail balance.
     Skipped (falls back to the static heuristic) during CUDA-graph capture (cannot
     time inside capture). Compiled winners are stashed in _MXFP4_AT_CACHE so the
     subsequent real launch reuses them with no recompile."""
-    key = (M, N, K, row_bytes, out_fp16)
+    key = _mxfp4_cfg_key(device_idx, M, N, K, k_real, row_bytes, out_fp16, beta_is_one)
     cached = _MXFP4_CFG_CACHE.get(key)
     if cached is not None:
         return cached
 
-    if torch.cuda.is_current_stream_capturing():
+    if capturing:
         cfg = (
             *_mxfp4_nt_config(M, N, K),
             10,
@@ -2521,7 +2577,24 @@ def _autotune_mxfp4_config(M, N, K, args, out_fp16=False, k_real=None, row_bytes
     for _wlv, _elgk in _wl_opts:
         for gm, gn, xcd in _mxfp4_swizzle_candidates(M, N, K):
             try:
-                at_key = (M, N, K, k_real, row_bytes, gm, xcd, gn, _wlv, _elgk, False, False, out_fp16, False)
+                at_key = _mxfp4_artifact_key(
+                    device_idx,
+                    M,
+                    N,
+                    K,
+                    k_real,
+                    row_bytes,
+                    gm,
+                    xcd,
+                    gn,
+                    _wlv,
+                    _elgk,
+                    False,
+                    False,
+                    1,
+                    out_fp16,
+                    beta_is_one,
+                )
                 entry = _MXFP4_AT_CACHE.get(at_key)
                 if entry is None:
                     raw = _get_mxfp4_fused_launch(
@@ -2533,10 +2606,11 @@ def _autotune_mxfp4_config(M, N, K, args, out_fp16=False, k_real=None, row_bytes
                         _elgk,
                         coop=False,
                         out_fp16=out_fp16,
+                        beta_is_one=beta_is_one,
                         n_tail=N % 256,
                         k_real=k_real,
                         row_bytes=row_bytes,
-                        mn=_mxfp4_mn_specialise(M, N),
+                        mn=_mxfp4_mn_specialise(M, N, device_idx),
                     )
                     entry = [raw, compile_with_scratch_out(raw, args)]
                     _MXFP4_AT_CACHE[at_key] = entry
@@ -2546,20 +2620,20 @@ def _autotune_mxfp4_config(M, N, K, args, out_fp16=False, k_real=None, row_bytes
     for _ in range(5):
         for _, compiled in compiled_cands:
             compiled(*args)
-    torch.cuda.synchronize()
+    torch.cuda.synchronize(device_idx)
 
     ITERS, REPS = 20, 8
     cand_t = {cfg: float("inf") for cfg, _ in compiled_cands}
     for _ in range(REPS):
         for cfg, compiled in compiled_cands:
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device_idx)
             e0 = torch.cuda.Event(enable_timing=True)
             e1 = torch.cuda.Event(enable_timing=True)
-            e0.record()
+            e0.record(args[-1])
             for _ in range(ITERS):
                 compiled(*args)
-            e1.record()
-            torch.cuda.synchronize()
+            e1.record(args[-1])
+            torch.cuda.synchronize(device_idx)
             cand_t[cfg] = min(cand_t[cfg], e0.elapsed_time(e1))
     _WL_MARGIN = 1.02
     best, best_t = None, float("inf")
@@ -2575,10 +2649,45 @@ def _autotune_mxfp4_config(M, N, K, args, out_fp16=False, k_real=None, row_bytes
     if _try_var:
         gm0, gn0, xcd0, w0, e0 = best[:5]
         try:
-            df_compiled = _MXFP4_AT_CACHE[(M, N, K, gm0, xcd0, gn0, w0, e0, False, False, out_fp16, False)][1]
+            df_key = _mxfp4_artifact_key(
+                device_idx,
+                M,
+                N,
+                K,
+                k_real,
+                row_bytes,
+                gm0,
+                xcd0,
+                gn0,
+                w0,
+                e0,
+                False,
+                False,
+                1,
+                out_fp16,
+                beta_is_one,
+            )
+            df_compiled = _MXFP4_AT_CACHE[df_key][1]
             variants = []  # (taccw, coop, compiled)
             for _cp, _tw in ((False, True), (True, False), (True, True)):
-                vkey = (M, N, K, k_real, row_bytes, gm0, xcd0, gn0, w0, e0, _tw, _cp, out_fp16, False)
+                vkey = _mxfp4_artifact_key(
+                    device_idx,
+                    M,
+                    N,
+                    K,
+                    k_real,
+                    row_bytes,
+                    gm0,
+                    xcd0,
+                    gn0,
+                    w0,
+                    e0,
+                    _tw,
+                    _cp,
+                    1,
+                    out_fp16,
+                    beta_is_one,
+                )
                 ventry = _MXFP4_AT_CACHE.get(vkey)
                 if ventry is None:
                     vraw = _get_mxfp4_fused_launch(
@@ -2591,10 +2700,11 @@ def _autotune_mxfp4_config(M, N, K, args, out_fp16=False, k_real=None, row_bytes
                         taccw=_tw,
                         coop=_cp,
                         out_fp16=out_fp16,
+                        beta_is_one=beta_is_one,
                         n_tail=N % 256,
                         k_real=k_real,
                         row_bytes=row_bytes,
-                        mn=_mxfp4_mn_specialise(M, N),
+                        mn=_mxfp4_mn_specialise(M, N, device_idx),
                     )
                     ventry = [vraw, compile_with_scratch_out(vraw, args)]
                     _MXFP4_AT_CACHE[vkey] = ventry
@@ -2603,17 +2713,17 @@ def _autotune_mxfp4_config(M, N, K, args, out_fp16=False, k_real=None, row_bytes
                 df_compiled(*args)
                 for _, _, _vc in variants:
                     _vc(*args)
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device_idx)
 
             def _time(fn):
                 _q0 = torch.cuda.Event(enable_timing=True)
                 _q1 = torch.cuda.Event(enable_timing=True)
-                torch.cuda.synchronize()
-                _q0.record()
+                torch.cuda.synchronize(device_idx)
+                _q0.record(args[-1])
                 for _ in range(ITERS):
                     fn(*args)
-                _q1.record()
-                torch.cuda.synchronize()
+                _q1.record(args[-1])
+                torch.cuda.synchronize(device_idx)
                 return _q0.elapsed_time(_q1)
 
             df_t = float("inf")
@@ -2640,28 +2750,56 @@ def _autotune_mxfp4_config(M, N, K, args, out_fp16=False, k_real=None, row_bytes
     return best
 
 
-_MXFP4_KSPLIT_CACHE: dict = {}  # (M, N, K, row_bytes, out_fp16) -> ksplit (timed, never regresses)
+_MXFP4_KSPLIT_CACHE: dict = {}
 
 
-_MXFP4_NCU: list = []  # device CU count, read once (a per-launch query costs host time)
+_MXFP4_NCU: dict = {}  # device index -> CU count (a per-launch property query costs host time)
 
 
-def _mxfp4_mn_specialise(M, N):
+def _mxfp4_mn_specialise(M, N, device_idx):
     """Host-known ``(M, N)`` for the compile-time tile decode, or None to keep it runtime.
     Folding the decode deletes per-tile scalar work, so it only pays where a CU runs several
     tiles; at one dispatch round the decode already hides behind the launch ramp."""
-    if not _MXFP4_NCU:
-        _MXFP4_NCU.append(torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count)
-    return (M, N) if ceildiv(M, 256) * ceildiv(N, 256) > _MXFP4_NCU[0] else None
+    ncu = _MXFP4_NCU.get(device_idx)
+    if ncu is None:
+        ncu = torch.cuda.get_device_properties(device_idx).multi_processor_count
+        _MXFP4_NCU[device_idx] = ncu
+    return (M, N) if ceildiv(M, 256) * ceildiv(N, 256) > ncu else None
 
 
-def _ksplit_candidates(M, N, K):
+# (device_idx, M, N, K, Kb_a, out_dtype, beta) -> (Kw, k_real, row_bytes, out_fp16, beta_is_one, mn)
+_MXFP4_SHAPE_CACHE: dict = {}
+
+
+def _mxfp4_shape_derived(device_idx, M, N, K, Kb_a, out_dtype, beta):
+    """Memoize the pure shape/dtype-derived scalars ``gemm_mxfp4_flydsl_kernel`` recomputes
+    every call (padded K, tail-K sentinel, row-stride sentinel, out-dtype flag, beta flag,
+    and the compile-time (M, N) tile specialisation) into one record keyed only on the call's
+    own shape/dtype/beta signature. Never keyed on tensor identity or a data pointer, and
+    caches no tensor data at all (only small ints/bools/None) -- a repeat call with the
+    identical signature (the common case: the ruler calls one shape hundreds of times)
+    collapses ~6 small per-call computations into one dict lookup."""
+    key = (device_idx, M, N, K, Kb_a, out_dtype, beta)
+    rec = _MXFP4_SHAPE_CACHE.get(key)
+    if rec is None:
+        Kw = (K + 255) // 256 * 256  # loop + packed-scale extent
+        k_real = None if K == Kw else K  # None keeps the aligned shapes' launch key unchanged
+        row_bytes = None if Kb_a == K // 2 else Kb_a
+        out_fp16 = out_dtype == torch.float16
+        beta_is_one = beta == 1.0
+        mn = _mxfp4_mn_specialise(M, N, device_idx)
+        rec = (Kw, k_real, row_bytes, out_fp16, beta_is_one, mn)
+        _MXFP4_SHAPE_CACHE[key] = rec
+    return rec
+
+
+def _ksplit_candidates(M, N, K, device_idx):
     """Split-K candidates for the timed ksplit autotune. Only FEW-TILE large-K shapes
     (the one-WG-per-tile grid leaves CUs idle) are worth splitting; the sweep always
     includes ksplit=1 and takes the global min, so a bad split can never regress a shape.
     ksplit must divide K//256 (whole 256-K blocks per split) and K//ksplit % 256 == 0."""
     tiles = ceildiv(M, 256) * ceildiv(N, 256)
-    ncu = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    ncu = torch.cuda.get_device_properties(device_idx).multi_processor_count
     if tiles >= ncu // 2 or K < 2048:
         return [1]  # already enough WGs to fill the CUs (or K too small to split)
     kb = K // 256
@@ -3150,7 +3288,6 @@ def gemm_mxfp4_flydsl_kernel(
     row stride from the fp4 tensors, so a caller may seat its rows on the line with no copy."""
     assert a.dim() == 2 and b.dim() == 2, "a, b must be 2D"
     assert out_dtype in (torch.bfloat16, torch.float16), "mxfp4 FlyDSL store emits bf16/fp16"
-    out_fp16 = out_dtype == torch.float16
     assert not (beta == 1.0 and trans_c), (
         "beta=1.0 cannot be combined with trans_c: the transpose is a post-kernel copy, "
         "so the accumulation would land in a buffer the caller never sees."
@@ -3175,28 +3312,48 @@ def gemm_mxfp4_flydsl_kernel(
     assert M % 64 == 0, f"M must be a multiple of 64, got {M}"
     assert N % 64 == 0, f"N must be a multiple of 64, got {N}"
 
-    stream = torch.cuda.current_stream()
+    device = a.device  # hoisted: reused below instead of separate `a.device` property reads
+    device_idx = device.index
+
+    # One dict lookup replaces ~6 independent per-call scalar derivations (padded K, tail-K
+    # sentinel, row-stride sentinel, out-dtype flag, beta flag, (M,N) tile specialisation) on
+    # every repeat call at this exact shape/dtype/beta signature -- keyed on shapes/dtype/beta
+    # only (never tensor identity), so a real shape change still misses and recomputes fresh.
+    Kw, _k_real, _row_b, out_fp16, beta_is_one, _mn = _mxfp4_shape_derived(
+        device_idx, M, N, K, Kb_a, out_dtype, beta
+    )
+
+    # Pass the int index, not the device object: torch.cuda._utils._get_device_index() special-
+    # cases isinstance(dev, int) first and returns immediately, skipping the torch.device /
+    # jit.is_scripting dispatch chain that current_stream(device) or current_stream() still walk.
+    # Also correctness-neutral-or-better: pins the stream to the device the operands actually
+    # live on instead of whatever the ambient "current device" happens to be.
+    stream = torch.cuda.current_stream(device_idx)
     # Fused (turbo/mxfp8-style) path: a single @flyc.jit stub enqueues the A+B scale preshuffle
     # then the GEMM on this stream -- one host dispatch, no separate launch/sync. The preshuffle
     # repacks canonical E8M0 into the caller-owned packed workspace (a_sp/b_sp); the quant stays
     # generic. Workspace cached per shape (stable across graph replays); the timed autotune
     # includes the fixed preshuffle so the config ranking is preserved.
-    _capturing = torch.cuda.is_current_stream_capturing()
-    Kw = (K + 255) // 256 * 256  # loop + packed-scale extent
-    _k_real = None if K == Kw else K  # None keeps the aligned shapes' launch key unchanged
-    _row_b = None if Kb_a == K // 2 else Kb_a
-    a_sp, b_sp = _get_mxfp4_scale_ws(M, N, Kw, a.device)
-    # E8M0 has no memref element type and a row of K/32 bytes need not be a whole number of dwords, so the bytes go in as u8.
-    a_raw = a_scale.contiguous().view(torch.uint8).reshape(-1)
-    b_raw = b_scale.contiguous().view(torch.uint8).reshape(-1)
-    out = resolve_accum_out(out, beta, (M, N), a.device, out_dtype)
-    beta_is_one = beta == 1.0
+    with torch.cuda.device(device_idx):
+        _capturing = torch.cuda.is_current_stream_capturing()
+    a_sp, b_sp = _get_mxfp4_scale_ws(M, N, Kw, device)
+    # E8M0 has no memref element type and a row of K/32 bytes need not be a whole number of
+    # dwords, so the bytes go in as u8. Kept 2D (no flattening .reshape(-1)): the SRD builder
+    # (create_buffer_resource) reads only the base pointer plus an explicit num_records_bytes,
+    # exactly as it already does for the 2D fp4 operands below -- the extra reshape() bought
+    # nothing but host time. Skip the .contiguous() dispatch too when it would be a no-op: the
+    # production quantizer's canonical E8M0 output is already contiguous on every ruler case.
+    a_raw = (a_scale if a_scale.is_contiguous() else a_scale.contiguous()).view(torch.uint8)
+    b_raw = (b_scale if b_scale.is_contiguous() else b_scale.contiguous()).view(torch.uint8)
+    out = resolve_accum_out(out, beta, (M, N), device, out_dtype)
     # Keep the fp4 operands 2D (do NOT flatten): M*K/2 / N*K/2 exceed 2^31 int8s for
     # large M*K / N*K, which flydsl packs as an int32 dim (host CABI overflow). Both the
     # prologue G2S and the in-loop asm refill address off the rebased flat base
-    # (make_fp8_rebased_tensor_and_srd), so the operand's own shape is irrelevant.
-    a8 = a.contiguous().view(torch.int8)
-    b8 = b.contiguous().view(torch.int8)
+    # (make_fp8_rebased_tensor_and_srd), so the operand's own shape is irrelevant. Same
+    # already-contiguous no-op skip as above -- the quantizer's packed fp4 rows are always
+    # contiguous (that is the exact row-stride contract this kernel is built on).
+    a8 = (a if a.is_contiguous() else a.contiguous()).view(torch.int8)
+    b8 = (b if b.is_contiguous() else b.contiguous()).view(torch.int8)
 
     # Fused stub args: (A, B_T, C, A_raw, B_raw, A_scale_ws, B_scale_ws, c_m, c_n, stream).
     # C stays 2D (StoreCPlain re-bases per row band from C's base + c_n); a 1D M*N view
@@ -3226,9 +3383,23 @@ def gemm_mxfp4_flydsl_kernel(
         # default one-WG-per-tile path (autotuned swizzle / pipe depth / scale-load / wide store).
         target = out if target is None else target
         # The racer keys on the padded extent: keying on the true K would miss on every padded launch.
-        cfg = _MXFP4_CFG_CACHE.get((M, N, Kw, _row_b, out_fp16))
+        # beta (accum) is part of the key: a beta=1 build's epilogue is a different kernel
+        # (read-back + accumulate), so it must not share a cached config with the beta=0 build.
+        cfg_key = _mxfp4_cfg_key(device_idx, M, N, Kw, _k_real, _row_b, out_fp16, accum)
+        cfg = _MXFP4_CFG_CACHE.get(cfg_key)
         if cfg is None:
-            cfg = _autotune_mxfp4_config(M, N, Kw, _tune_args(), out_fp16, k_real=_k_real, row_bytes=_row_b)
+            cfg = _autotune_mxfp4_config(
+                M,
+                N,
+                Kw,
+                _tune_args(),
+                out_fp16,
+                k_real=_k_real,
+                row_bytes=_row_b,
+                beta_is_one=accum,
+                device_idx=device_idx,
+                capturing=_capturing,
+            )
         gm, gn, xcd, _wlv, _elgk, _tw, _coop = cfg
         launch = _get_mxfp4_fused_launch(
             Kw,
@@ -3244,10 +3415,26 @@ def gemm_mxfp4_flydsl_kernel(
             n_tail=N % 256,
             k_real=_k_real,
             row_bytes=_row_b,
-            mn=_mxfp4_mn_specialise(M, N),
+            mn=_mn,
         )
-        # row_bytes must be in the artifact key too: one logical shape, two allocations, two kernels.
-        at_key = (M, N, K, _row_b, gm, xcd, gn, _wlv, _elgk, _tw, _coop, out_fp16, accum)
+        at_key = _mxfp4_artifact_key(
+            device_idx,
+            M,
+            N,
+            Kw,
+            _k_real,
+            _row_b,
+            gm,
+            xcd,
+            gn,
+            _wlv,
+            _elgk,
+            _tw,
+            _coop,
+            1,
+            out_fp16,
+            accum,
+        )
         fused_args = _args_for(target)
         entry = _MXFP4_AT_CACHE.get(at_key)
         if entry is None:
@@ -3269,7 +3456,7 @@ def gemm_mxfp4_flydsl_kernel(
         # row bands (BW-bound reduce, faster than an atomic-fused reduce for these shapes).
         # The fused stub still preshuffles A/B into a_sp/b_sp before the split GEMM.
         gm, gn, xcd = _mxfp4_nt_config(M, N, K)
-        ws = torch.empty((ksplit * M, N), dtype=out_dtype, device=a.device)
+        ws = torch.empty((ksplit * M, N), dtype=out_dtype, device=device)
         cbuf = ws.view(-1)
         sk_args = (a8, b8, cbuf, a_raw, b_raw, a_sp, b_sp, M, N, cbuf, cbuf, stream)
         launch = _get_mxfp4_fused_launch(
@@ -3282,9 +3469,26 @@ def gemm_mxfp4_flydsl_kernel(
             ksplit=ksplit,
             out_fp16=out_fp16,
             n_tail=N % 256,
-            mn=_mxfp4_mn_specialise(M, N),
+            mn=_mn,
         )
-        sk_key = (M, N, K, _row_b, gm, xcd, gn, 10, 9, ksplit, out_fp16)
+        sk_key = _mxfp4_artifact_key(
+            device_idx,
+            M,
+            N,
+            K,
+            None,
+            _row_b,
+            gm,
+            xcd,
+            gn,
+            10,
+            9,
+            False,
+            False,
+            ksplit,
+            out_fp16,
+            False,
+        )
         entry = _MXFP4_AT_CACHE.get(sk_key)
         if entry is None:
             entry = [launch, None]
@@ -3305,28 +3509,29 @@ def gemm_mxfp4_flydsl_kernel(
         return reduced
 
     # ksplit is picked by timing {plain, split+reduce} end to end, so it never regresses a shape.
-    ks = 1 if K != Kw else _MXFP4_KSPLIT_CACHE.get((M, N, K, _row_b, out_fp16))
+    ks_key = (device_idx, M, N, K, _row_b, out_fp16, beta_is_one)
+    ks = 1 if K != Kw else _MXFP4_KSPLIT_CACHE.get(ks_key)
     if ks is None:
-        cands = _ksplit_candidates(M, N, K)
+        cands = _ksplit_candidates(M, N, K, device_idx)
         if _capturing or len(cands) == 1:
             ks = 1  # cannot time inside capture / nothing to try
             if not _capturing:
-                _MXFP4_KSPLIT_CACHE[(M, N, K, _row_b, out_fp16)] = ks
+                _MXFP4_KSPLIT_CACHE[ks_key] = ks
         else:
 
             def _bench(fn):
                 for _ in range(3):
                     fn()
-                torch.cuda.synchronize()
+                torch.cuda.synchronize(device_idx)
                 best = float("inf")
                 for _ in range(5):
                     e0 = torch.cuda.Event(enable_timing=True)
                     e1 = torch.cuda.Event(enable_timing=True)
-                    e0.record()
+                    e0.record(stream)
                     for _ in range(20):
                         fn()
-                    e1.record()
-                    torch.cuda.synchronize()
+                    e1.record(stream)
+                    torch.cuda.synchronize(device_idx)
                     best = min(best, e0.elapsed_time(e1))
                 return best
 
@@ -3334,12 +3539,16 @@ def gemm_mxfp4_flydsl_kernel(
             tgt = _tune_target()
             for s in cands:
                 try:
-                    fn = (lambda: _exec_plain(tgt)) if s == 1 else (lambda s=s: _exec_split(s, tgt))
+                    fn = (
+                        (lambda: _exec_plain(tgt, beta_is_one))
+                        if s == 1
+                        else (lambda s=s: _exec_split(s, tgt, beta_is_one))
+                    )
                     times[s] = _bench(fn)
                 except Exception:  # noqa: BLE001 -- a bad variant must not break the GEMM
                     continue
             ks = min(times, key=times.get) if times else 1
-            _MXFP4_KSPLIT_CACHE[(M, N, K, _row_b, out_fp16)] = ks
+            _MXFP4_KSPLIT_CACHE[ks_key] = ks
 
     out2 = _exec_split(ks, out, beta_is_one) if ks > 1 else _exec_plain(out, beta_is_one)
     return out2.t().contiguous() if trans_c else out2
