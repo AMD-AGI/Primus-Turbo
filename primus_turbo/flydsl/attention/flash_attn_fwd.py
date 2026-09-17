@@ -380,8 +380,11 @@ def build_flash_attn_dualwave_swp_module(
 
             ctx.load_k_split(2, 0)
 
-            # m_row is loop-invariant (fixed-max path); do not carry it across the back edge.
-            init_args = [l_row_init]
+            # A fixed reference never moves, so that path keeps m_row off the back edge.
+            # The online path must carry it: the running maximum is what every rescale is
+            # measured against, and restarting it each iteration silently loses row mass.
+            carry_m = not traits.DUALWAVE_SWP_FIXED_MAX
+            init_args = [m_row_pro, l_row_init] if carry_m else [l_row_init]
             for _ in range_constexpr(traits.D_CHUNKS):
                 init_args.append(v_o_zero)
             init_args.append(v_p_0[0])
@@ -393,10 +396,11 @@ def build_flash_attn_dualwave_swp_module(
                 fx.Index(2),
                 init=init_args,
             ):
-                m_row = m_row_pro
-                l_row = loop_args[0]
-                v_o = [loop_args[1 + i] for i in range_constexpr(traits.D_CHUNKS)]
-                v_p_0 = (loop_args[1 + traits.D_CHUNKS], loop_args[2 + traits.D_CHUNKS])
+                mo = 1 if carry_m else 0
+                m_row = loop_args[0] if carry_m else m_row_pro
+                l_row = loop_args[mo]
+                v_o = [loop_args[1 + mo + i] for i in range_constexpr(traits.D_CHUNKS)]
+                v_p_0 = (loop_args[1 + mo + traits.D_CHUNKS], loop_args[2 + mo + traits.D_CHUNKS])
                 j_idx = j
 
                 # Cluster 0: prefetch V buf1, read resident K for MMA0, and use carried page ids.
@@ -450,9 +454,11 @@ def build_flash_attn_dualwave_swp_module(
                     )
                 else:
                     v_s_1 = ctx.scores_for_softmax(v_s_1)
-                v_o, m_row, l_row, v_p_0 = ctx.tile_rescale_o(v_o, m_row, l_row, v_s_1, v_p_0, 2)
+                m_row, rescale_m2 = ctx.tile_row_max(m_row, v_s_1)
                 for pvs in range_constexpr(1, 4):
                     v_o = _pv_step(pvs, v_p_0, v_v, v_o, 0)
+                ctx.scale_o_by(v_o, rescale_m2)
+                l_row = ctx.scale_l_by(l_row, rescale_m2)
                 v_s_1 = ctx.shift_scores(v_s_1, m_row)
                 v_p_1 = ctx.exp2(v_s_1, 0, 16)
 
@@ -512,9 +518,11 @@ def build_flash_attn_dualwave_swp_module(
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                     _s_setprio(1)
                 v_o = _pv_step(0, v_p_1, v_v, v_o, 1)
-                v_o, m_row, l_row, v_p_1 = ctx.tile_rescale_o(v_o, m_row, l_row, v_s_0, v_p_1, 4)
+                m_row, rescale_m4 = ctx.tile_row_max(m_row, v_s_0)
                 for pvs in range_constexpr(1, 4):
                     v_o = _pv_step(pvs, v_p_1, v_v, v_o, 1)
+                ctx.scale_o_by(v_o, rescale_m4)
+                l_row = ctx.scale_l_by(l_row, rescale_m4)
                 v_s_0 = ctx.shift_scores(v_s_0, m_row)
                 v_p_0 = ctx.exp2(v_s_0, 0, 16)
                 _sched_barrier_pairs(traits, 6, 5, 4)
@@ -523,14 +531,15 @@ def build_flash_attn_dualwave_swp_module(
                     _s_setprio(0)
                 _pv_cluster_sync()
 
-                yield_args = [l_row] + v_o + [v_p_0[0], v_p_0[1]]
+                yield_args = ([m_row, l_row] if carry_m else [l_row]) + v_o + [v_p_0[0], v_p_0[1]]
                 loop_results = yield yield_args
 
-            # Epilogue drains the final in-flight tiles. m_row is the prologue value.
-            m_row = m_row_pro
-            l_row = loop_results[0]
-            v_o = [loop_results[1 + i] for i in range_constexpr(traits.D_CHUNKS)]
-            v_p_0 = (loop_results[1 + traits.D_CHUNKS], loop_results[2 + traits.D_CHUNKS])
+            # Epilogue drains the final in-flight tiles, continuing from the loop's maximum.
+            mo = 1 if carry_m else 0
+            m_row = loop_results[0] if carry_m else m_row_pro
+            l_row = loop_results[mo]
+            v_o = [loop_results[1 + mo + i] for i in range_constexpr(traits.D_CHUNKS)]
+            v_p_0 = (loop_results[1 + mo + traits.D_CHUNKS], loop_results[2 + mo + traits.D_CHUNKS])
 
             max_m3 = split_t_end - 3
             max_m2 = split_t_end - 2
