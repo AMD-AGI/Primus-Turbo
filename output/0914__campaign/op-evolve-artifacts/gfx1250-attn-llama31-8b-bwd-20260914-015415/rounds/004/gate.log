@@ -1,0 +1,8 @@
+$ python validation.py /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/004/op
+(cwd /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/op)
+exit 137
+
+--- stdout ---
+
+--- stderr ---
+

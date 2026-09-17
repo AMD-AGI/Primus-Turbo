@@ -1,0 +1,64 @@
+round: 3
+mode: fast
+accepted: false
+
+expectation_check:
+  expected: >
+    "PC sampling costs no code change and arch/gfx1250/profiling-surface.md supplies the
+    discriminating signature, so it gates rows 2-3 for the price of one profiled run" --
+    written into route.md row 1 before building, expecting a reading of either WMMA-bound
+    (76.5% ARBITER_NOT_WIN, 82.8% issue, mean Wave_Count 1.4) or streaming (49.7% WAITCNT,
+    97.4% NO_INST, 2.2% issue).
+  measured: >
+    Neither. At interval 2048 the GPU page-faults inside the sampled process and rocprofv3
+    aborts and hangs in finalisation; at 1048576, the coarsest legal interval, there is no
+    fault and not one sample -- 13 minutes alive with GPU[1] at 0% and no CSV. Two attempts,
+    device verified healthy after both.
+  held: false
+  reading: >
+    The failure is worth more than the reading would have been, because it generalises: with
+    counters at 13/51 and kernel-trace already recording zero dispatches, gfx1250 has no
+    instruction-level dynamic instrument for this kernel at all. But the round paid for that
+    the expensive way. My mistake was structural, not analytical -- I put an instrument in
+    the `must` slot and wrote the two idea rows to be conditional on its reading, planning
+    for "issue-bound" and "byte-bound" and not for "no reading". When it returned nothing,
+    both idea rows were unreachable by their own conditions and the round had nothing left
+    to build. A gate that can return nothing needs a branch for that case. Separately, the
+    two arms I did build while deciding were wrong by more than 2x, and the lesson there is
+    general enough to keep: slack a pass has when compiled ALONE is not slack it has inside
+    the fused kernel, because it is one function and one interference graph at 1024 of 1024
+    VGPRs. I derived that premise from my own half-kernel probe without noticing the probe
+    deletes exactly the thing that makes it false.
+
+moves:
+  - {id: r3.i3.g14, from: pool, to: dead_ends, reason: "executed as the round's must-row; PC sampling faults at a fine interval and produces no samples at the coarsest one, because the sampling path cannot save wave state for a kernel at 1024/1024 VGPRs with 1064 B/lane scratch on one wave per SIMD -- same family as kernel-trace recording zero dispatches", round: 3}
+
+untouched_by_design: [route.md]
+
+bottleneck:
+  changed: true
+  to: "Unresolved between instruction issue and the memory path in the dk/dv loop -- and vgpr_spill_count is refuted as the proxy that was standing in for the answer"
+  confidence: low
+  why: >
+    The direction survives and the reason does not. Still measured and solid: 99.2% of the
+    backward is one kernel; the dk/dv pass is 5.906 ms and owns 263 of the 266 spills while
+    the dq pass is 3.858 ms with zero spills and zero scratch; the fusion is the causal load
+    balancer, so unfusing starts 12.5% down. What broke is the model on top. Round 2 left
+    vgpr_spill_count standing as the within-tile predictor of time; round 3 broke it AT a
+    fixed tile -- same source, same tile, same launch, AMDGCN_ANALYZE_SMALL_TENSOR_RANGE=1
+    compiles to 187 spills, the lowest this job has produced, and runs 82% SLOWER, with
+    AMDGCN_USE_BUFFER_OPS=0 a second such point at +74%. Both change addressing rather than
+    pressure. And facts.md's "37% of the loop body is register-pressure overhead" is an
+    instruction count, not a time share: it is mostly s_set_vgpr_msb and v_nop, which switch
+    almost nothing, and on a part measured pinned at a 2500 W cap with the clock 29% below
+    MAX_CLK the corpus prices cycles at 20-45% and bytes at full -- so that 37% is more like
+    6-14%, and the 77 scratch_load per iteration are the part worth chasing. Confidence is
+    LOW rather than MEDIUM deliberately: the measurement that would settle which family this
+    is, is PC sampling, and it does not run. This verdict is an inference from a corpus
+    artefact plus two deletion probes, not a reading of this kernel, and a deep round with
+    six analyses behind it should overrule it without hesitation.
+
+not_added_to_pool:
+  - "Retire r3.i4.g15 (widen the dk/dv epilogue) to dead_ends.md. It is refuted -- its own free gate found 96 buffer_store_b128 and ZERO buffer_store_b64 in the shipped .amdgcn, so every global store is already at maximum width and the corpus's +12.09% coalescing mechanism has nothing here to convert. I am allowed one removal and it belonged to the executed candidate, so g15 is still sitting in pool.md as `open`. The next round should retire it unread; evidence in rounds/003/1-opt/opt.md s13."
+  - "facts.md's r1.i2.g2 entry (TRITON_HIP_USE_IN_THREAD_TRANSPOSE=1, shipped round 1) records a knob that is INERT on this part: is_in_thread_transpose_enabled in this Triton returns true only for gfx942. impl.py still forces the variable to 1 around the backward launch, which also means any sweep point setting it to 0 in the process environment silently measures nothing. Not a speed-up either way, so it is not a candidate and I did not touch shipped code for it -- but the entry overstates what g2 does, and a later reflect that owns consolidation should correct it. Recorded in rounds/003/1-opt/opt.md s10."
+  - "The LDS premise repair (shared = 65536, 20% of 327,680, passed dynamically) makes r1.i7.g7's blocker smaller than its pool entry now claims -- the gap is not 'Triton cannot use LDS here' but 'Triton will not let me choose what lives there across the m-loop', which sits closer to layout/num_stages territory than to a rewrite. That is a restatement of an existing pool entry rather than a new idea, and restating it now would be me re-deciding the route after seeing my own round fail, so it stays here."

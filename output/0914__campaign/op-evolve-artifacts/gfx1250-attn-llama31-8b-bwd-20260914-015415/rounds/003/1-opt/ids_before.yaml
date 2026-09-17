@@ -1,0 +1,16 @@
+facts.md:
+- r1.i1.g1
+- r1.i2.g2
+- r2.i3.g10
+pool.md:
+- r1.i3.g3
+- r1.i4.g4
+- r1.i5.g5
+- r1.i6.g6
+- r1.i7.g7
+- r3.i3.g14
+- r3.i4.g15
+dead_ends.md:
+- r2.i1.g8
+- r2.i2.g9
+- r2.i4.g11

@@ -1,0 +1,6 @@
+Sq=2048 Skv=1024  rows [0,1024) are fully masked under bottom-right
+dead rows : ref |dq| max = 0.000000   impl |dq| max = 5.250000
+live rows : SQNR dq = 52.05 dB
+dead rows : SQNR dq = -inf dB
+whole     : SQNR dq = -15.95 dB
+impl dq dead-row sample: [[0.0, -0.279296875, 0.0, 1.1015625], [0.0, 1.2734375, 0.0, -0.042236328125], [0.0, 0.99609375, 0.0, -0.34375]]

@@ -1,0 +1,22 @@
+--- default arg (op/current) ---
+VALIDATION FAILED: no impl.py under /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/op/current
+rc_default=1
+--- explicit: op/baseline ---
+Traceback (most recent call last):
+  File "/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/op/validation.py", line 185, in <module>
+    sys.exit(main(sys.argv))
+             ^^^^^^^^^^^^^^
+  File "/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/op/validation.py", line 136, in main
+==============================================================================
+CORRECTNESS  op/baseline  vs op/eager/  (gate: all four tensors >= 50 dB)
+------------------------------------------------------------------------------
+shape                           out       dq       dk       dv   verdict
+    correct, _ = check_correctness(impl_dir)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/op/validation.py", line 87, in check_correctness
+    ok, s = correctness.check_shape(impl_dir, shape, threshold=SQNR_DB)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/op/ut/correctness.py", line 93, in check_shape
+    import eager_ref
+ModuleNotFoundError: No module named 'eager_ref'
+rc_baseline=1

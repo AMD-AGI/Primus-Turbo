@@ -1,0 +1,12 @@
+[runjob] launched key=r3_tilesweep pid=2692848
+RESULT {"label": "tile256a", "ms": 8.673144340515137, "census": {"vgpr": "1024", "spill": "266", "sspill": "67", "sgpr": "107", "scratchB": "1064", "lds": "0", "wmma": 448, "msb": 1666, "sload": 265, "sstore": 128, "ds": 656, "ninstr": 9547}, "absum": [3694818.5, 1474473.625, 1492202.25]}
+    raise ValueError(f"Shape element {i} must be a power of 2")
+ValueError: Shape element 0 must be a power of 2
+triton.compiler.errors.CompilationError: at 10:11:
+triton.compiler.errors.CompilationError: at 212:13:
+RESULT {"label": "tile512", "ms": 59.09943199157715, "census": {"vgpr": "1024", "spill": "5704", "sspill": "24", "sgpr": "107", "scratchB": "6292", "lds": "0", "wmma": 896, "msb": 4112, "sload": 2208, "sstore": 1767, "ds": 916, "ninstr": 23231}, "absum": [3694818.5, 1474473.5, 1492202.25]}
+    raise ValueError(f"Shape element {i} must be a power of 2")
+ValueError: Shape element 0 must be a power of 2
+triton.compiler.errors.CompilationError: at 10:11:
+triton.compiler.errors.CompilationError: at 212:13:
+RESULT {"label": "tile256b", "ms": 8.677690982818604, "census": {"vgpr": "1024", "spill": "266", "sspill": "67", "sgpr": "107", "scratchB": "1064", "lds": "0", "wmma": 448, "msb": 1666, "sload": 265, "sstore": 128, "ds": 656, "ninstr": 9547}, "absum": [3694818.5, 1474473.625, 1492202.25]}

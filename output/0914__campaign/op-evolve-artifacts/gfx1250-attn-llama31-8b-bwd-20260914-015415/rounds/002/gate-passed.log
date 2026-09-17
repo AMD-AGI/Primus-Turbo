@@ -1,0 +1,29 @@
+$ python validation.py /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/002/op
+(cwd /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/op)
+exit 0
+
+--- stdout ---
+==============================================================================
+CORRECTNESS  /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/002/op  vs op/eager/  (gate: all four tensors >= 50 dB)
+------------------------------------------------------------------------------
+shape                           out       dq       dk       dv   verdict
+b4_s8192_hq32_hkv8_d128       53.67    52.24    52.31    52.71   pass
+sq_lt_skv                     53.01    52.50    52.58    52.57   pass
+min_seqlen                    54.09    52.04    52.08    52.77   pass
+ragged_tail                   53.99    52.09    52.15    52.75   pass
+sq_gt_skv                     53.97   -15.95    52.10    52.72   fail  (diagnostic, not gated)
+==============================================================================
+SPEED  statistic=median  iters=30  warmup_s=3.0  order=op>beat>baseline>baseline>beat>op
+------------------------------------------------------------------------------
+shape                      arm           fwd ms    bwd ms  bwd TF/s  bwd GB/s  spread%
+b4_s8192_hq32_hkv8_d128    candidate     5.1044   10.4283    527.25     128.7    39.59
+b4_s8192_hq32_hkv8_d128    beat          3.8556   17.8366    308.46      75.3    73.00
+b4_s8192_hq32_hkv8_d128    baseline      5.2603   10.9942    500.20     122.1    36.70
+------------------------------------------------------------------------------
+shape                        vs beat  required  vs baseline   verdict
+b4_s8192_hq32_hkv8_d128       1.710x     1.50x       1.054x   pass
+==============================================================================
+VALIDATION PASSED
+
+--- stderr ---
+

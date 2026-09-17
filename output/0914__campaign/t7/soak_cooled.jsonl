@@ -1,0 +1,10 @@
+{"round": 0, "turbo_ms": 2.5914, "asm_ms": 1.4137, "ratio_asm_over_turbo": 0.546}
+{"round": 1, "turbo_ms": 2.5931, "asm_ms": 1.4081, "ratio_asm_over_turbo": 0.543}
+{"round": 2, "turbo_ms": 2.6055, "asm_ms": 1.4089, "ratio_asm_over_turbo": 0.541}
+{"round": 3, "turbo_ms": 2.5985, "asm_ms": 1.4185, "ratio_asm_over_turbo": 0.546}
+{"round": 4, "turbo_ms": 2.6245, "asm_ms": 1.417, "ratio_asm_over_turbo": 0.54}
+{"round": 5, "turbo_ms": 2.622, "asm_ms": 1.4146, "ratio_asm_over_turbo": 0.54}
+{"round": 6, "turbo_ms": 2.6218, "asm_ms": 1.4183, "ratio_asm_over_turbo": 0.541}
+{"round": 7, "turbo_ms": 2.6283, "asm_ms": 1.4199, "ratio_asm_over_turbo": 0.54}
+{"round": 8, "turbo_ms": 2.6335, "asm_ms": 1.4146, "ratio_asm_over_turbo": 0.537}
+{"round": 9, "turbo_ms": 2.6186, "asm_ms": 1.4225, "ratio_asm_over_turbo": 0.543}

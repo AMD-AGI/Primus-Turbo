@@ -1,0 +1,23 @@
+{}                                                               bwd_ms=9.9960 min=9.9589
+{"schedule_hint": "attention"}                                   bwd_ms=9.6328 min=9.5929
+{"schedule_hint": "attention", "waves_per_eu": 0}                bwd_ms=9.5263 min=9.4988
+{"schedule_hint": "memory-bound-attention"}                      bwd_ms=9.5984 min=9.5788
+{"schedule_hint": "attention,memory-bound-attention"}            bwd_ms=10.0323 min=9.9915
+{"waves_per_eu": 0}                                              bwd_ms=9.5709 min=9.5424
+{"kpack": 2}                                                     bwd_ms=10.0158 min=9.9490
+{"kpack": 2, "waves_per_eu": 0}                                  bwd_ms=9.5769 min=9.5296
+{"kpack": 2, "schedule_hint": "attention", "waves_per_eu": 0}    bwd_ms=9.5217 min=9.4864
+{"num_warps": 8, "schedule_hint": "attention"}                   bwd_ms=22.5132 min=22.3539
+{"schedule_hint": "attention", "waves_per_eu": 2}                bwd_ms=50.6140 min=49.8871
+--- sorted ---
+9.5217  {"kpack": 2, "schedule_hint": "attention", "waves_per_eu": 0}
+9.5263  {"schedule_hint": "attention", "waves_per_eu": 0}
+9.5709  {"waves_per_eu": 0}
+9.5769  {"kpack": 2, "waves_per_eu": 0}
+9.5984  {"schedule_hint": "memory-bound-attention"}
+9.6328  {"schedule_hint": "attention"}
+9.9960  {}
+10.0158  {"kpack": 2}
+10.0323  {"schedule_hint": "attention,memory-bound-attention"}
+22.5132  {"num_warps": 8, "schedule_hint": "attention"}
+50.6140  {"schedule_hint": "attention", "waves_per_eu": 2}

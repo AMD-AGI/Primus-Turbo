@@ -1,0 +1,71 @@
+{
+ "iso": "2026-09-15T08:10:51",
+ "state": "HEALTHY",
+ "uptime": "0h47m",
+ "idle_pct": 0.11665547077371217,
+ "sclk": "",
+ "deg_new": 0,
+ "wedge_new": 0,
+ "sigkills": 0,
+ "budgets": {
+  "measure": 90,
+  "measure_cold": 180,
+  "bringup": 300,
+  "sweep": 300,
+  "e2e": 3600,
+  "cpu": 600
+ },
+ "counts": {
+  "ok": 124,
+  "wrong": 4,
+  "fault": 2,
+  "timeout": 1
+ },
+ "best": "bwd 0.732 ms (gen|asm|smoke|1)   must-beat 17.692",
+ "queued": 3,
+ "blocked": 3,
+ "malformed": 0,
+ "next": [
+  "nc-time|llama31-8b|1",
+  "nc-time|gqa2k|1",
+  "nc-time|w8s4096|1"
+ ],
+ "recent": [
+  "07:23:22  final|champ|1              ok       15.0s  bwd  10.1161  sqnr 53.62",
+  "07:23:37  final|champ|2              ok       15.0s  bwd  10.1599  sqnr 53.62",
+  "07:23:52  final|champ|3              ok       15.0s  bwd  10.1755  sqnr 53.62",
+  "07:24:07  final|champ|4              ok       15.0s  bwd  10.1807  sqnr 53.62",
+  "07:24:22  final|champ|5              ok       15.0s  bwd  10.1334  sqnr 53.62",
+  "07:24:37  final|prev|1               ok       15.0s  bwd  17.7662  sqnr 53.62",
+  "07:24:52  final|prev|2               ok       15.0s  bwd  17.6876  sqnr 53.62",
+  "07:25:07  final|prev|3               ok       15.0s  bwd  17.6774  sqnr 53.62",
+  "07:25:22  final|prev|4               ok       15.0s  bwd  17.6766  sqnr 53.62",
+  "07:25:37  final|prev|5               ok       15.0s  bwd  17.6857  sqnr 53.62",
+  "07:25:53  final|oob|1                ok       15.0s  bwd  10.4177  sqnr 53.67",
+  "07:26:08  final|oob|2                ok       15.0s  bwd  10.4817  sqnr 53.67",
+  "07:26:23  final|oob|3                ok       15.0s  bwd   9.0537  sqnr 53.67"
+ ],
+ "learned": [
+  "OK final|champ|1            sqnr_db.out >=50  got 53.6196775297861",
+  "OK final|champ|1            sqnr_db.dk >=50  got 50.60819203012865",
+  "OK final|champ|2            sqnr_db.out >=50  got 53.6196775297861",
+  "OK final|champ|2            sqnr_db.dk >=50  got 50.60819203012865",
+  "OK final|champ|3            sqnr_db.out >=50  got 53.6196775297861",
+  "OK final|champ|3            sqnr_db.dk >=50  got 50.60819203012865",
+  "OK final|champ|4            sqnr_db.out >=50  got 53.6196775297861",
+  "OK final|champ|4            sqnr_db.dk >=50  got 50.60819203012865",
+  "OK final|champ|5            sqnr_db.out >=50  got 53.6196775297861",
+  "OK final|champ|5            sqnr_db.dk >=50  got 50.60819203012865",
+  "OK final|prev|1             sqnr_db.out >=50  got 53.6196775297861",
+  "OK final|prev|2             sqnr_db.out >=50  got 53.6196775297861",
+  "OK final|prev|3             sqnr_db.out >=50  got 53.6196775297861",
+  "OK final|prev|4             sqnr_db.out >=50  got 53.6196775297861",
+  "OK final|prev|5             sqnr_db.out >=50  got 53.6196775297861",
+  "OK final|oob|1              sqnr_db.out >=50  got 53.66972664861177",
+  "OK final|oob|2              sqnr_db.out >=50  got 53.66972664861177",
+  "OK final|oob|3              sqnr_db.out >=50  got 53.66972664861177"
+ ],
+ "action": [],
+ "now_running": null,
+ "idle_reason": "STOP sentinel present"
+}

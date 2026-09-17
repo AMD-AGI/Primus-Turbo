@@ -1,0 +1,1 @@
+RESULT {"label": "assume_nolicm", "ms": 10.21078634262085, "census": {"vgpr": "1024", "spill": "276", "sspill": "6", "sgpr": "107", "scratchB": "944", "lds": "0", "wmma": 448, "msb": 1748, "sload": 156, "sstore": 90, "ds": 656, "ninstr": 9869}, "absum": [3694818.5, 1474473.625, 1492202.25]}

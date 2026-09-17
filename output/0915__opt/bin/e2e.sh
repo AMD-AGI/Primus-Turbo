@@ -1,0 +1,112 @@
+#!/bin/bash
+# One torchtitan run on this single-GPU box. Adapted from output/0914__campaign/bin/e2e.sh,
+# which fenced a 4-GPU box with HIP_VISIBLE_DEVICES=3 at `docker run` time and used a
+# separate fa-e2e container -- neither applies here.
+#
+# compile stays DISABLED. The config's own comment records that inductor's triton autotune
+# over TransformerBlock raises hipErrorLaunchFailure and takes the GPU down with it. Do not
+# turn it on to chase the documented 1.2-1.5x without a plan for losing the card.
+# BLAS_ENV overrides the default. hipBLASLt is usable after all -- the image just has it
+# mis-pathed (see output/0915__opt/BLAS-FINDING.md), and pointing HIPBLASLT_TENSILE_LIBPATH
+# at library/gfx1250/ gives 68.74 TFLOP/s against rocBLAS's 27.64 on an 8192^3 bf16 GEMM.
+#
+# TORCH_BLAS_PREFER_HIPBLASLT=0 is NOT optional as the default. Without it step 1 dies with
+# HIPBLAS_STATUS_INVALID_VALUE out of hipblasLtMatmulAlgoGetHeuristic, because the image is
+# missing TensileLibrary_lazy_gfx1250.dat. tune_attention.py sets the same variable itself
+# before importing torch, which is why the op-level measurements never saw this and the
+# first e2e run did. torch reads it at backend-selection time, so it has to be in the
+# environment before the process starts -- it cannot be set from inside the training script.
+#   e2e.sh <run_tag> <config_basename> [extra primus-cli args...]
+set -u
+TAG=${1:?run tag}; CFG=${2:?config yaml basename}; shift 2
+PRIMUS=/home/lihuzhan/code/2026_0828__primus/Primus
+OUT=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0915__opt
+RUNDIR=/home/lihuzhan/_dbg_l8b/$TAG
+mkdir -p "$RUNDIR" "$OUT/logs"
+
+# Wait for the card to go quiet before starting. Sequential e2e runs without this raced:
+# arm 1 started 65 s after the previous run reported "Training completed", three processes
+# still held the KFD, and it sat at 100% GPU inside its first attention forward until its
+# own timeout killed it 24 minutes later -- no fault in dmesg, the card was HEALTHY
+# throughout, it simply never came out. bin/closing.sh in the 0914 campaign polls for quiet
+# for the same reason; this is that discipline, applied here.
+#
+# Reap first, then wait. `timeout` kills only the process it spawned; torchrun is that
+# process's CHILD and survives as an orphan holding both the card and the rendezvous port.
+# That is what happened: arm 1 hung, its inner timeout fired, torchrun lived on for 27
+# minutes in state Dl with a zombie worker, and arm 2 died instantly on
+# "DistNetworkError: server socket failed to listen ... port: 1234".
+#
+# Note the processes are ROOT-owned, because the container runs as root. A plain kill from
+# this shell gets EPERM, which 2>/dev/null turns into something indistinguishable from
+# "already gone" -- hence sudo -n and the explicit check afterwards.
+if [ "${E2E_REAP:-1}" = "1" ]; then
+  for p in $(ls /sys/class/kfd/kfd/proc/ 2>/dev/null); do
+    args=$(ps -o args= -p "$p" 2>/dev/null)
+    case "$args" in
+      *torchrun*|*pt_elastic*|*primus/cli/main.py*)
+        echo "reaping leftover GPU process $p"; sudo -n kill -9 "$p" 2>/dev/null ;;
+    esac
+  done
+fi
+
+# /sys/class/kfd/kfd/proc is a plain directory read: safe on a card that is misbehaving,
+# unlike rocm-smi or ps, which hang.
+for _ in $(seq 1 60); do
+  n=$(ls /sys/class/kfd/kfd/proc/ 2>/dev/null | wc -l)
+  [ "$n" -le 1 ] && break
+  echo "waiting for the card to quiesce: $n processes still hold the KFD"
+  sleep 10
+done
+sleep "${E2E_COOLDOWN:-20}"
+
+# Sample clock, power and temperature for the whole run. This box is VR-throttled, so the
+# sustained clock is a variable of the experiment, not a constant -- and nothing was recording
+# it, which is why the fly arm's between-run spread has no evidence either way.
+#
+# Field names are taken from this rocm-smi, not guessed: the first version of this sampler
+# looked for "Average Graphics Package Power" and "Sensor edge", neither of which this build
+# emits, so it wrote a file of empty columns that looked like data.
+# A marker a watchdog can match on that is unique to this run. `pgrep -f e2e.sh` matches any
+# e2e run, so a monitor armed for one run adopts the next one and can reap it -- that happened
+# today. Watch for E2E_RUN_MARKER=$TAG instead.
+export E2E_RUN_MARKER="$TAG"
+
+CLK="$OUT/logs/clk.$TAG.csv"
+echo "t,sclk_mhz,power_w,tjunction_c" > "$CLK"
+(
+  while :; do
+    o=$(rocm-smi --showgpuclocks --showpower --showtemp 2>/dev/null)
+    printf '%s,%s,%s,%s\n' "$(date +%s)" \
+      "$(printf '%s' "$o" | sed -n 's/.*sclk clock level: [0-9]* (\([0-9]*\)Mhz).*/\1/p' | head -1)" \
+      "$(printf '%s' "$o" | sed -n 's/.*Graphics Package Power (W): \([0-9.]*\).*/\1/p' | head -1)" \
+      "$(printf '%s' "$o" | sed -n 's/.*Temperature (Sensor junction) (C): \([0-9.]*\).*/\1/p' | head -1)"
+    sleep 5
+  done
+) >> "$CLK" 2>/dev/null &
+CLKPID=$!
+trap 'kill $CLKPID 2>/dev/null' EXIT
+timeout ${E2E_TIMEOUT:-1800} docker exec \
+  -e GPU=0 -e HIP_VISIBLE_DEVICES=0 \
+  ${BLAS_ENV:--e TORCH_BLAS_PREFER_HIPBLASLT=0} \
+  -e PYTHONPATH=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo:/home/lihuzhan/code/aiter-src \
+  -e GPUS_PER_NODE=1 -e NNODES=1 -e NODE_RANK=0 -e PRIMUS_GPU_MODEL=MI455X \
+  -e MASTER_PORT="${MASTER_PORT:-$((20000 + RANDOM % 20000))}" \
+  -e PRIMUS_EXP_NAME="$TAG" -e TRITON_CACHE_DIR=/tmp/triton_cache_e2e \
+  ${E2E_ENV:-} fa-repro bash -lc "ulimit -c 0; cd $PRIMUS && exec timeout --foreground -k 20 ${E2E_INNER:-1700} \
+      ${E2E_PREFIX:-} \
+      bash runner/primus-cli direct --log_file $RUNDIR/launcher.log \
+      -- train pretrain --config examples/torchtitan/configs/MI455X/$CFG $*" \
+  > "$OUT/logs/e2e.$TAG.log" 2>&1
+RC=$?
+
+# A run whose loss went nan is not a slow run or a fast run -- it is not a measurement at all,
+# and its tps is the speed of a computation that had already broken. Today one such run was
+# reported as a result, and two explanations were built on top of it, because eleven e2e runs
+# were scored on tps without anyone looking at the loss column. Check it here so that can never
+# be a matter of remembering.
+NANS=$(sed 's/\x1b\[[0-9;]*m//g' "$OUT/logs/e2e.$TAG.log" 2>/dev/null | grep -ci "loss: *nan")
+echo "rc=$RC tag=$TAG log=$OUT/logs/e2e.$TAG.log nan_steps=$NANS"
+if [ "${NANS:-0}" -gt 0 ]; then
+  echo "!! $TAG: loss went nan on $NANS steps -- DISCARD this run's tps, it is not a measurement"
+fi

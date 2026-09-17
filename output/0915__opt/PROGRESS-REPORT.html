@@ -1,0 +1,1239 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>gfx1250 算子优化进展 — 0915</title>
+<style>
+  :root{
+    color-scheme:light;
+    --surface-0:#f4f4f2; --surface-1:#fcfcfb; --surface-2:#eeeeec; --surface-3:#e6e6e3;
+    --text-primary:#0b0b0b; --text-secondary:#52514e; --text-muted:#77756f;
+    --rule:#dededa; --rule-strong:#c4c3bd;
+    --series-1:#2a78d6; --series-2:#eb6834; --series-3:#1baf7a;
+    --good:#0ca30c; --warning:#fab219; --serious:#ec835a; --critical:#d03b3b;
+    --warn-bg:#fdf6e3; --crit-bg:#fbeceb; --good-bg:#edf7ed; --info-bg:#eef4fc;
+  }
+  @media (prefers-color-scheme:dark){ :root:not([data-theme="light"]){
+    color-scheme:dark;
+    --surface-0:#121211; --surface-1:#1a1a19; --surface-2:#242423; --surface-3:#2e2e2c;
+    --text-primary:#ffffff; --text-secondary:#c3c2b7; --text-muted:#96958c;
+    --rule:#333331; --rule-strong:#4a4a47;
+    --series-1:#3987e5; --series-2:#d95926; --series-3:#199e70;
+    --warn-bg:#2a2416; --crit-bg:#2e1a19; --good-bg:#16261a; --info-bg:#161f2a;
+  }}
+  :root[data-theme="dark"]{
+    color-scheme:dark;
+    --surface-0:#121211; --surface-1:#1a1a19; --surface-2:#242423; --surface-3:#2e2e2c;
+    --text-primary:#ffffff; --text-secondary:#c3c2b7; --text-muted:#96958c;
+    --rule:#333331; --rule-strong:#4a4a47;
+    --series-1:#3987e5; --series-2:#d95926; --series-3:#199e70;
+    --warn-bg:#2a2416; --crit-bg:#2e1a19; --good-bg:#16261a; --info-bg:#161f2a;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%; scroll-behavior:smooth}
+  body{margin:0; background:var(--surface-0); color:var(--text-primary);
+    font:15.5px/1.75 ui-sans-serif,system-ui,-apple-system,"Segoe UI","Noto Sans CJK SC","PingFang SC","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1000px; margin:0 auto; padding:40px 20px 120px}
+  header{border-bottom:1px solid var(--rule-strong); padding-bottom:22px; margin-bottom:10px}
+  h1{font-size:28px; line-height:1.3; margin:0 0 8px; font-weight:650; letter-spacing:-.01em}
+  .sub{color:var(--text-secondary); font-size:14px; margin:0}
+  h2{font-size:21px; margin:52px 0 6px; font-weight:650; letter-spacing:-.005em; padding-top:24px; border-top:1px solid var(--rule)}
+  h2:first-of-type{border-top:none; padding-top:6px}
+  h3{font-size:16.5px; margin:30px 0 10px; font-weight:650}
+  h4{font-size:15px; margin:22px 0 8px; font-weight:650; color:var(--text-secondary)}
+  .lede{color:var(--text-secondary); margin:0 0 20px; font-size:15px}
+  p{margin:0 0 15px}
+  ul,ol{margin:0 0 15px; padding-left:24px}
+  li{margin-bottom:8px}
+  code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:13px}
+  code{background:var(--surface-2); padding:1.5px 5px; border-radius:3px}
+  pre{background:var(--surface-2); border:1px solid var(--rule); border-radius:5px;
+    padding:14px 16px; overflow-x:auto; font-size:12.5px; line-height:1.6; margin:0 0 16px}
+  pre code{background:none; padding:0}
+  .note{background:var(--surface-1); border:1px solid var(--rule); border-left:3px solid var(--series-1);
+    padding:15px 17px; border-radius:4px; margin:0 0 18px; font-size:14.5px}
+  .note.warn{border-left-color:var(--warning); background:var(--warn-bg)}
+  .note.crit{border-left-color:var(--critical); background:var(--crit-bg)}
+  .note.good{border-left-color:var(--good); background:var(--good-bg)}
+  .note.bg{border-left-color:var(--text-muted); background:var(--info-bg)}
+  .note-h{font-weight:650; display:block; margin-bottom:6px}
+  .note p:last-child,.note ul:last-child,.note table:last-child{margin-bottom:0}
+  .tiles{display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:12px; margin:0 0 24px}
+  .tile{background:var(--surface-1); border:1px solid var(--rule); border-radius:5px; padding:16px 17px}
+  .tile .k{font-size:12px; color:var(--text-muted); margin-bottom:8px; line-height:1.45}
+  .tile .v{font-size:29px; font-weight:640; line-height:1.1; letter-spacing:-.015em}
+  .tile .u{font-size:13px; font-weight:450; color:var(--text-secondary); margin-left:3px}
+  .tile .n{font-size:12px; color:var(--text-muted); margin-top:8px; line-height:1.5}
+  .tw{overflow-x:auto; margin:0 0 18px; border:1px solid var(--rule); border-radius:5px; background:var(--surface-1)}
+  table{border-collapse:collapse; width:100%; font-size:13.5px}
+  caption{text-align:left; padding:13px 15px 11px; font-size:13px; color:var(--text-secondary); border-bottom:1px solid var(--rule)}
+  caption b{color:var(--text-primary); font-weight:650}
+  th,td{padding:9px 13px; text-align:left; border-bottom:1px solid var(--rule); vertical-align:top}
+  thead th{font-size:11.5px; font-weight:600; color:var(--text-muted); border-bottom:1px solid var(--rule-strong); white-space:nowrap}
+  tbody tr:last-child td{border-bottom:none}
+  td.num,th.num{text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap}
+  td.mono{font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12.5px}
+  .cond{color:var(--text-muted); font-size:12px; line-height:1.5}
+  tr.hl td{background:var(--surface-2)}
+  figure{margin:0 0 22px; background:var(--surface-1); border:1px solid var(--rule); border-radius:5px; padding:17px 19px 15px}
+  figcaption{font-size:13px; color:var(--text-secondary); margin-bottom:15px}
+  figcaption b{color:var(--text-primary); font-weight:650}
+  .bars{display:grid; gap:10px}
+  .bar-row{display:grid; grid-template-columns:minmax(130px,215px) 1fr; gap:13px; align-items:center}
+  .bar-lab{font-size:12.5px; color:var(--text-secondary); line-height:1.4}
+  .bar-track{display:grid; grid-template-columns:1fr auto; gap:9px; align-items:center}
+  .bar-plot{height:23px; display:flex; align-items:center; min-width:0}
+  .bar-fill{height:15px; border-radius:0 4px 4px 0; background:var(--series-1); min-width:2px}
+  .bar-fill.s2{background:var(--series-2)} .bar-fill.s3{background:var(--series-3)}
+  .bar-fill.mute{background:var(--rule-strong)}
+  .bar-val{font-size:12.5px; font-variant-numeric:tabular-nums; color:var(--text-primary); white-space:nowrap}
+  .bar-val em{font-style:normal; color:var(--text-muted); font-size:11.5px}
+  .foot{margin-top:11px; font-size:12px; color:var(--text-muted); line-height:1.55}
+  .tag{display:inline-block; font-size:10.5px; font-weight:600; padding:1.5px 6px; border-radius:3px;
+    border:1px solid var(--rule-strong); color:var(--text-secondary); white-space:nowrap; line-height:1.5}
+  .tag.m{border-color:var(--good); color:var(--good)}
+  .tag.a{border-color:var(--serious); color:var(--serious)}
+  .tag.x{border-color:var(--critical); color:var(--critical)}
+  .toc{background:var(--surface-1); border:1px solid var(--rule); border-radius:5px; padding:16px 20px; margin:0 0 30px}
+  .toc ol{margin:0; padding-left:20px; font-size:14px}
+  .toc li{margin-bottom:5px}
+  .toc a{color:var(--series-1); text-decoration:none}
+  .toc a:hover{text-decoration:underline}
+  dl{margin:0 0 16px}
+  dt{font-weight:650; margin-top:14px; font-size:14.5px}
+  dd{margin:4px 0 0 0; color:var(--text-secondary); font-size:14px}
+  @media (max-width:620px){
+    .wrap{padding:26px 15px 80px} h1{font-size:23px} h2{font-size:19px}
+    .bar-row{grid-template-columns:1fr; gap:3px} .tile .v{font-size:25px}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>gfx1250 单卡算子优化进展汇报</h1>
+  <p class="sub">
+    2026-09-15 · 本机 <code>A0-heliosr-1b114-c07-1</code>（单卡 gfx1250，VR 限频）·
+    分支 <code>dev/lhz/attn</code> · 代码已全部提交推送至 <code>AMD-AGI/Primus-Turbo</code>
+  </p>
+</header>
+
+<div class="toc">
+  <ol>
+    <li><a href="#tldr">一页纸结论</a></li>
+    <li><a href="#bg">背景知识（零基础可读）</a></li>
+    <li><a href="#line1">主线一：attention 算子优化 4.76×</a></li>
+    <li><a href="#line2">主线二：GEMM 后端缺陷 —— 端到端 6.21×</a></li>
+    <li><a href="#changes">改动了哪些代码（是否只有 turbo）</a></li>
+    <li><a href="#lessons">测量方法学：今天推翻了自己三次</a></li>
+    <li><a href="#problems">遇到的问题与事故</a></li>
+    <li><a href="#next">下一步计划与预期收益</a></li>
+    <li><a href="#qa">补充问答（为周会准备）</a> — 含预想提问与答复</li>
+  </ol>
+</div>
+
+<h2 id="tldr">一页纸结论</h2>
+
+<div class="tiles">
+  <div class="tile">
+    <div class="k">端到端吞吐（8 层，两项叠加）</div>
+    <div class="v">7.57×</div>
+    <div class="n">6,128 → 46,374 tps<br>单步 5.35 s → 707 ms<br><span style="opacity:.75">0916 加入 FlyDSL wgrad（n=3，sd 0.60%）</span></div>
+  </div>
+  <div class="tile">
+    <div class="k">32 层生产配置</div>
+    <div class="v">7.08×</div>
+    <div class="n">1,984 → 14,050 tps<br>同会话对照 12,340（<b>+13.9%</b>）<br><span style="opacity:.75">n=1，复现率仍未验证</span></div>
+  </div>
+  <div class="tile">
+    <div class="k">GEMM 实测算力</div>
+    <div class="v">640.7<span class="u"> TF/s</span></div>
+    <div class="n">原 ~106 → 204 → 640.7<br><b>不要引用日志里的 MFU</b>，见下</div>
+  </div>
+  <div class="tile">
+    <div class="k">attention 算子（单层）</div>
+    <div class="v">4.76×</div>
+    <div class="n">55.785 → 11.726 ms<br>算子级，n=5，SQNR ≥ 50 dB</div>
+  </div>
+</div>
+
+<p>今天有<b>两条独立的主线</b>，第二条是在验证第一条的过程中意外挖出来的，而且它的端到端价值远大于第一条：</p>
+
+<ol>
+  <li><b>attention 算子优化</b>：把 Primus-Turbo 出厂的 attention 实现从 55.785 ms 优化到 11.726 ms（<b>4.76×</b>），
+    精度不变。这解决了 JIRA 上提的第一条请求。<b>但它在端到端几乎测不出收益</b> —— 因为 attention 只占单步时间的 3.3%。</li>
+  <li><b>GEMM 后端缺陷</b>：profile 发现单步时间的 <b>94% 是矩阵乘（GEMM）</b>，而其中 <b>97% 跑在一个错误的
+    kernel 上</b>。根因是 hipBLASLt 这个数学库在某一种矩阵布局下<b>缺少调优数据</b>。
+    绕开它之后端到端 <b>6.21×</b>（0915 先修好一半得到 1.894×，0916 修好另一半到 6.21×）。</li>
+</ol>
+
+<div class="note good">
+  <span class="note-h">额外收获：解掉了困扰一整天的测量噪声问题</span>
+  <p style="margin-bottom:0">同一个缺陷还是"同样的配置反复跑，结果会在三个不同数值之间跳"的根源。
+  修掉之后跨运行标准差从 3.91% 降到 0.42%。这件事的意义在于：<b>在此之前，所有小于 4% 的优化效果在这台机器上都是测不准的。</b></p>
+</div>
+
+<h2 id="bg">背景知识（零基础可读）</h2>
+<p class="lede">这一节是给不做算子优化的同学准备的，已经熟悉的可以直接跳到下一节。</p>
+
+<h3>大模型训练一步在做什么</h3>
+<p>
+训练一个大语言模型，是反复执行"一步"（step）。每一步做三件事：
+</p>
+<ol>
+  <li><b>前向传播（forward）</b>：把一批文本喂进模型，算出预测结果和误差（loss）。</li>
+  <li><b>反向传播（backward）</b>：从误差倒推回去，算出每个参数应该往哪个方向调整（梯度）。
+    <b>反向的计算量大约是前向的两倍</b>，所以它通常是优化重点。</li>
+  <li><b>参数更新（optimizer）</b>：按梯度把参数改一点点。</li>
+</ol>
+<p>
+模型由很多层（layer）堆叠而成，本次测试的 llama-3.1-8B 有 32 层。每一层内部主要是两类计算：
+<b>attention（注意力）</b> 和 <b>MLP（前馈网络）</b>，而这两类的底层几乎都是<b>矩阵乘法</b>。
+</p>
+
+<div class="note bg">
+  <span class="note-h">关键术语</span>
+  <dl>
+    <dt>算子（kernel / operator）</dt>
+    <dd>在 GPU 上执行的一个具体计算单元，比如"一次矩阵乘"或"一次 attention 计算"。
+      算子优化 = 让单个这样的计算跑得更快。</dd>
+
+    <dt>GEMM</dt>
+    <dd>General Matrix Multiply，通用矩阵乘法。大模型训练里绝大部分算力都花在这上面。</dd>
+
+    <dt>TFLOP/s</dt>
+    <dd>每秒万亿次浮点运算，衡量算得多快。数字越大越好。</dd>
+
+    <dt>MFU（Model FLOPs Utilization）</dt>
+    <dd>实际算力 ÷ 硬件理论峰值算力。比如 65% 表示把这块卡的算力发挥出了 65%。
+      这是衡量训练效率最常用的单一指标。业界大模型训练能到 40–60% 就算不错。</dd>
+
+    <dt>tps（tokens per second）</dt>
+    <dd>每秒处理多少个词元，端到端训练速度的直接指标。</dd>
+
+    <dt>SQNR</dt>
+    <dd>信噪比，单位 dB，用来验证"优化后算得还对不对"。
+      我们的门槛是 <b>≥ 50 dB</b>，低于这个值就认为精度受损、优化不能采纳。</dd>
+
+    <dt>bf16</dt>
+    <dd>一种 16 位浮点数格式，训练常用。比 32 位省一半显存和带宽，精度足够。</dd>
+
+    <dt>GQA（分组查询注意力）</dt>
+    <dd>attention 的一种省显存变体。本次形状是 32 个 query 头共享 8 个 key/value 头（比例 4:1）。</dd>
+  </dl>
+</div>
+
+<h3>为什么"算子快了"不等于"训练快了"</h3>
+<p>
+这是今天最重要的一条经验。一个算子快 4.76 倍，如果它只占整步时间的 3%，那整步最多快 2.4%。
+更糟的是，算子级测试和真实训练的环境不同 —— 算子测试里同一块显存反复复用，而真实训练里要和几百 GB 的其它数据抢资源。
+<b>所以算子级的收益必须用端到端实测来验证，不能外推。</b>
+</p>
+
+<div class="note warn">
+  <span class="note-h">今天的实例</span>
+  <p style="margin-bottom:0">我们的 ASM 反向算子在算子级快 1.74×，但第一次端到端测试显示它让训练<b>慢了 6.78%</b>。
+  查下来有两个算子级测不出来的开销：每次调用都重新加载 GPU 代码模块（每步 96 次），以及大量临时显存申请。
+  修掉之后重测，端到端<b>既不快也不慢</b>（n=9 下差异 −0.28%，统计上不显著）。</p>
+</div>
+
+<h3>本次测试的硬件和它的局限</h3>
+<div class="note crit">
+  <span class="note-h">本机被限频，所有绝对数字都不代表正常水平</span>
+  <ul style="margin-bottom:0">
+    <li>本机 <code>A0-c07-1</code> 被 VR（供电模块）限频在 <b>1100 MHz</b>，而实测持续负载下只有 <b>943 MHz</b>。</li>
+    <li>同一块卡 09-04 曾跑到 1699–1703 MHz；另一台 <code>B0-a37-1</code> 负载下稳定在 2133–2244 MHz，
+      驱动上限是 2400 MHz。</li>
+    <li>所以本机的 tps、TFLOP/s <b>只能自己和自己比</b>，不能和其它机器或 JIRA 上的数字横向对比。
+      本报告全程<b>不做任何跨机器的时钟换算</b>。</li>
+    <li>另外本机是<b>单卡</b>，且今天大部分实验用的是 <b>8 层</b>模型（生产是 32 层）——
+      8 层每 token 的计算量约为 32 层的四分之一，所以它的 tps 天然虚高 3–4 倍，
+      <b>不能和 32 层的数字放在一起比较</b>。用 8 层是为了让 A/B 实验跑得起来，
+      并避开 32 层配置 88% 显存占用的悬崖。</li>
+  </ul>
+</div>
+
+<h2 id="line1">主线一：attention 算子优化 4.76×</h2>
+<p class="lede">
+形状：<code>b=4, s=8192, hq=32, hkv=8, d=128, bf16, causal</code>（即 batch 4、序列长度 8192、32 个 query 头、
+8 个 kv 头、每头维度 128），与生产配置逐项一致。算子级测量，单层一次前向+反向。
+</p>
+
+<h3>优化基于什么后端</h3>
+<p>共涉及三种实现，逐步替换：</p>
+<div class="tw">
+<table>
+  <thead><tr><th>后端</th><th>是什么</th><th>本次角色</th></tr></thead>
+  <tbody>
+    <tr><td><b>Primus-Turbo 自研 Triton</b></td>
+      <td class="cond">Triton 是用 Python 写 GPU 算子的语言。这是 Primus-Turbo 原本自带的 attention 实现。</td>
+      <td class="cond"><b>出厂基线。其反向已被否决</b> —— 对照实验里我们调优过的版本反而输给了
+        aiter 未经改动的出厂版（36.405 vs 34.565 ms）。前向仍有参考价值</td></tr>
+    <tr><td><b>aiter Triton 融合反向</b><br><span class="cond">= 文中的"融合反向"</span></td>
+      <td class="cond">AMD aiter 库里的<b>单 kernel</b>反向（相对我们原来的两个 kernel）。
+        <b>不是我们写的，也不是 Primus-Turbo 出厂的</b> —— 是本次移植进来的</td>
+      <td class="cond"><b>已采纳，当前默认反向路径</b></td></tr>
+    <tr><td><b>aiter 预编译 ASM</b></td>
+      <td class="cond">AMD 为 gfx1250 <b>手写汇编</b>并预编译成 <code>.co</code> 的 attention 内核，针对特定形状做到极致</td>
+      <td class="cond">前向已采纳为默认；反向可选开启（默认关）</td></tr>
+    <tr><td><b>Flex Attention</b></td>
+      <td class="cond">PyTorch 原生的 attention，依赖 <code>torch.compile</code> 即时编译。</td>
+      <td class="cond">JIRA 上 MI455X 退回的就是这条路径，<b>在本机会打死 GPU</b>（见"问题"一节）</td></tr>
+  </tbody>
+</table>
+</div>
+
+<figure>
+  <figcaption><b>attention 算子优化阶梯</b> · A0-c07-1 @1100 MHz · 单层一次 fwd+bwd · 各档取中位数，<b>n 与测量时段逐行不同</b>（见下表）</figcaption>
+  <div class="bars">
+    <div class="bar-row"><div class="bar-lab">Primus-Turbo 出厂<br><span class="cond">全 Triton</span></div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill mute" style="width:100%"></div></div>
+        <span class="bar-val">55.785 <em>ms · 基线</em></span></div></div>
+    <div class="bar-row"><div class="bar-lab">强制 Triton 前向 + 融合反向</div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill s2" style="width:39.4%"></div></div>
+        <span class="bar-val">22.001 <em>ms · 2.54×</em></span></div></div>
+    <div class="bar-row"><div class="bar-lab">ASM 前向 + 融合反向<br><span class="cond">← 当前默认路径</span></div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill s3" style="width:34.5%"></div></div>
+        <span class="bar-val">19.239 <em>ms · 2.90×</em></span></div></div>
+    <div class="bar-row"><div class="bar-lab">ASM 前向 + ASM 反向<br><span class="cond">可选，默认关闭</span></div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill" style="width:21.0%"></div></div>
+        <span class="bar-val">11.726 <em>ms · 4.76×</em></span></div></div>
+  </div>
+  <p class="foot">前向从 10.651 → 1.572 ms（<b>6.8×</b>），反向从 45.134 → 10.160 ms（<b>4.4×</b>），SQNR 全程 ≥ 50 dB 门槛。</p>
+  <div class="tw" style="margin-top:14px">
+  <table>
+    <caption>各档的 <b>n 与测量时段并不相同</b>，不可当作一组同质测量</caption>
+    <thead><tr><th>档位</th><th class="num">total</th><th class="num">离散</th><th class="num">n</th><th>测量时段</th></tr></thead>
+    <tbody>
+      <tr><td>出厂 <code>1cb2e183</code></td><td class="num">55.785 ms</td><td class="num">0.93%</td><td class="num">3</td>
+          <td class="cond">事故前，且来自另一个 worktree（<code>wt-bakeoff</code>）</td></tr>
+      <tr><td>强制 Triton 前向 + 融合反向</td><td class="num">22.001 ms</td><td class="num">0.06%</td><td class="num">2</td>
+          <td class="cond">事故前</td></tr>
+      <tr><td>ASM 前向 + 融合反向</td><td class="num">19.239 ms</td><td class="num">0.53%</td><td class="num">5</td>
+          <td class="cond">AC-cycle 后重测；与事故前的 19.233 只差 0.03%，是机器回到同一状态的证据</td></tr>
+      <tr><td>ASM 前向 + ASM 反向</td><td class="num">11.726 ms</td><td class="num">0.57%</td><td class="num">5</td>
+          <td class="cond">AC-cycle 后重测</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="foot"><b>另需说明</b>：此前文档记录过一个 <code>11.687 ms（n=7）</code> 的值，
+    穷举该时段全部 11 条原始记录的所有 7 元子集后确认<b>无法重构</b> ——
+    只有 4 个子集能同时命中 fwd 1.568 与 bwd 10.118，而它们的 total 全是 11.685，从来不是 11.687。
+    本报告一律采用可追溯到原始记录的 <b>11.726（n=5，AC-cycle 后）</b>。</p>
+</figure>
+
+<div class="note bg">
+  <span class="note-h">这三档里，哪些代码是我们写的？</span>
+  <p style="margin-bottom:0"><b>三个计算内核都不是我们写的</b> —— 全部是 AMD / aiter 的代码。
+  "融合反向"是从 aiter 移植进来的（内核主体与上游逐字节相同），
+  "ASM 前向 / 反向"是 aiter 预编译的汇编对象。
+  我们写的是围绕它们的<b>移植、分发、资格判定、参数打包和正确性验证机制</b>，约 2300 行。
+  详见下方 <a href="#q2">Q2</a> —— 这个区别在汇报时必须说准。</p>
+</div>
+
+<h3>为什么最快的那档默认是关闭的</h3>
+<div class="note warn">
+  <p>ASM 反向在算子级确实是最快的，但<b>端到端测不出收益</b>：n=9 重复实验下它与融合反向的差异是 −0.28%
+  （分离度 0.15 倍标准误，统计上完全不显著）。而它要付出：常驻 1 GiB 临时显存、一套资格门逻辑、
+  三个预编译 <code>.co</code> 文件的维护成本。</p>
+  <p style="margin-bottom:0"><b>所以默认关闭，用 <code>PRIMUS_TURBO_ATTN_ENABLE_ASM_BWD=1</code> 显式开启。</b>
+  按模态配对分析时它有 +1.0~1.5% 的信号（与算子级预测的 +1.36% 吻合），但该分析依赖一个未验证的前提，
+  记为<b>有前景的假设，不是结论</b>。</s>（以上为 0915 的记录，已被上方更新取代）</p>
+</div>
+
+<h3>资格门：什么时候用 ASM 反向</h3>
+<p>
+ASM 反向有约 <b>0.85 ms 的固定开销</b>（跨 16 倍工作量耗时几乎不变：0.88 / 0.91 / 1.00 / 1.34 ms），
+所以工作量太小时它反而更慢。用 9 个测量点定出门槛 <code>seqlen &gt;= 2048</code>：
+</p>
+<div class="tw">
+<table>
+  <caption>比值 = 融合反向耗时 ÷ ASM 反向耗时，<b>&gt;1 表示 ASM 更快</b> · 每格 n=2 取均值</caption>
+  <thead><tr><th>seqlen</th><th class="num">b·hq=8</th><th class="num">12</th><th class="num">16</th><th class="num">24</th><th class="num">32</th><th class="num">128</th></tr></thead>
+  <tbody>
+    <tr><td>1024</td><td class="num">0.660×</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">0.632×</td><td class="num">0.537×</td></tr>
+    <tr><td>1536</td><td class="num">0.869×</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td></tr>
+    <tr class="hl"><td>2048 <span class="cond">← 门槛</span></td><td class="num"><b>1.748×</b></td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">1.549×</td><td class="num">—</td></tr>
+    <tr><td>4096</td><td class="num">2.812×</td><td class="num">2.025×</td><td class="num">2.571×</td><td class="num">2.235×</td><td class="num">2.110×</td><td class="num">—</td></tr>
+    <tr><td>8192</td><td class="num">3.954×</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">2.002×</td></tr>
+  </tbody>
+</table>
+</div>
+<div class="note warn">
+  <span class="note-h">这个门槛很可能定高了，需要重测</span>
+  <p style="margin-bottom:0">收尾时发现：四个算子级测量入口
+  （<code>tune_attention.py:529</code>、<code>t2_bringup.py:224/266</code>、<code>perfdq_diag.py:18</code>）
+  调用时<b>都没有传入修复后的参数</b>，测的仍是<b>未修复</b>的路径 —— 只有产品代码路径传了。
+  而那 0.85 ms 固定地板里<b>有一部分正是每次调用重新加载 GPU 模块的开销</b>，修复后应当下降。
+  重测修复后的路径得到 8.13–8.68 ms（而非记录在案的 10.16），即算子级比值实际上是 <b>约 2.18×</b> 而非 1.74×。
+  <b>支撑门槛的这 9 个点需要重新测量。</b></p>
+</div>
+
+<h2 id="line2">主线二：GEMM 后端缺陷 —— 端到端 6.21×</h2>
+<p class="lede">这条线是意外发现的，但它才是今天端到端价值最大的成果。</p>
+
+<h3>怎么发现的：一个对不上的数字</h3>
+<p>
+端到端日志报告整体算力是 117 TFLOP/s，而我测的 GEMM 微基准只有 68.74 TFLOP/s。
+<b>如果训练是 GEMM 主导的，整体速率不可能超过 GEMM 本身</b> —— 这说明微基准测错了东西。
+于是抓了一次 torch profiler，把单步时间拆开：
+</p>
+
+<div class="tw">
+<table>
+  <caption><b>单步 5.2 秒的去向</b>（8 层配置，step 10 的 profile）</caption>
+  <thead><tr><th>模块</th><th class="num">耗时</th><th class="num">占比</th></tr></thead>
+  <tbody>
+    <tr class="hl"><td><b>hipBLASLt GEMM（矩阵乘）</b></td><td class="num"><b>4877 ms</b></td><td class="num"><b>94%</b></td></tr>
+    <tr><td>attention（前向 + 反向）</td><td class="num">171 ms</td><td class="num">3.3%</td></tr>
+    <tr><td>其余全部（逐元素运算、optimizer、归约、softmax…）</td><td class="num">~140 ms</td><td class="num">2.7%</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>
+再往里拆，那 4877 ms 的 GEMM 里，<b>4727 ms（97%）跑在一个叫 <code>MT32x16x32</code> 的 kernel 上</b>。
+</p>
+
+<div class="note bg">
+  <span class="note-h">什么是 macro tile（MT）</span>
+  <p style="margin-bottom:0">GPU 算矩阵乘时，会把大矩阵切成小块分给成千上万个线程组并行算。
+  <code>MT32x16x32</code> 表示每个线程组只负责输出矩阵里 32×16 的一小块。
+  块切得越小，需要的线程组就越多、重复读取的数据也越多。
+  这里的 grid 达到 <b>6567 万个线程组</b>，单次调用耗时 592–681 毫秒；
+  而选对 <code>MT256x256x128</code>（块大 128 倍）的同类调用只要 <b>0.796 毫秒</b>。</p>
+</div>
+
+<div class="tw">
+<table>
+  <caption><b>同一个矩阵形状，选中不同 kernel 的耗时对比</b></caption>
+  <thead><tr><th>矩阵形状</th><th class="num">选中 MT32x16x32</th><th class="num">选中 MT256x256x128</th><th class="num">倍数</th></tr></thead>
+  <tbody>
+    <tr><td class="mono">[32768,4096]×[4096,14336]</td><td class="num">51.0 ms/次</td><td class="num">3.1 ms/次</td><td class="num">16.5×</td></tr>
+    <tr><td class="mono">[32768,14336]×[14336,4096]</td><td class="num">51.6 ms/次</td><td class="num">2.4 ms/次</td><td class="num">21.5×</td></tr>
+    <tr><td class="mono">[32768,4096]×[4096,4096]</td><td class="num">14.6 ms/次</td><td class="num">0.82 ms/次</td><td class="num">17.8×</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>根因：NN 布局缺少纯 GEMM 调优库</h3>
+
+<div class="note bg">
+  <span class="note-h">什么是 NN / NT / TN 布局</span>
+  <p style="margin-bottom:0">矩阵乘 <code>C = A × B</code> 中，A 和 B 各自可以是"正常存放"（N）或"转置存放"（T）。
+  组合起来就有 NN、NT、TN 三种常见情况。<b>它们在数学上等价，但在 GPU 上访存模式完全不同</b>，
+  所以数学库要为每种组合分别做调优。PyTorch 的 <code>Linear</code> 层前向走 NT，而<b>反向的梯度计算走 NN</b>。</p>
+</div>
+
+<p>打开 hipBLASLt 自己的日志（<code>HIPBLASLT_LOG_LEVEL=4</code> + <code>TENSILE_DB=0x6</code>），
+同样的矩阵尺寸、同样 76 MB 工作空间，<b>唯一差别是布局</b>：</p>
+
+<pre><code>NN 路径:  ProblemMap: Contraction_l_Ailk_Bljk...   sol-tag = GridBased   ← 稀疏查找表
+          目标问题 key: M=4096, N=32768, K=14336
+          查找表里最近的点 →  M=1024, N=1, B=1, K=512     ← N 差了三万倍！
+          Considered 11 (31.43%) of entries        → 选中 sol-idx 104, MT32x16x32
+
+TN 路径:  ProblemMap: Contraction_l_Alik_Bljk...   sol-tag = Prediction  ← 训练好的预测模型
+                                                   → 选中 sol-idx 237, MT256x256x128</code></pre>
+
+<p>
+<b>NN 路径没有预测模型，只有一张稀疏的查找表，而表里离目标最近的点是 N=1</b>。
+<code>MT32x16x32</code> 正是为 N=1 这种"细长条"矩阵设计的切法，被错误地套用到了 N=32768 上。
+</p>
+
+<p><b>物证在库文件目录里</b>。hipBLASLt 的调优数据按布局组合分文件存放：</p>
+<pre><code>NN (Ailk_Bljk) 的 bf16 库：        TN (Alik_Bljk) 的 bf16 库：
+  BB_BB_Bias_UA_Type_BB_HPA          BB_BB_Bias_UA_Type_BB_HPA
+  BB_BB_HA_Bias_Grad_UA_...          BB_BB_HA_Bias_Grad_UA_...
+  BB_BB_HA_Bias_SAV_UA_...           BB_BB_HA_Bias_SAV_UA_...
+  BB_BB_HA_Grad_UA_...               BB_BB_HA_Grad_UA_...
+                                     BB_BB_UA_Type_BB_HPA        ← 纯 GEMM 调优库
+                                     BB_BB_UA_Type_BB_HPA_CU96   ← 按 CU 数的变体
+                                     BB_BB_UA_Type_BB_HPA_CU192  ← 按 CU 数的变体</code></pre>
+<p>
+<b><code>BB_BB_UA_Type_BB_HPA</code>（不带 Bias/Grad 后缀的纯 bf16 GEMM 调优库）TN 有三份，NN 一份都没有。</b>
+文件总数也不对等：TN 68 个，NN 40 个。所以纯矩阵乘一旦走 NN，只能退到带 Bias 的库上，而那些库的查找表覆盖不到大 N 区域。
+</p>
+
+<div class="note good">
+  <span class="note-h">这不是硬件问题，是镜像打包/覆盖缺陷</span>
+  <p style="margin-bottom:0">同一块卡、同一时钟下，<b>NT 路径实测 1502 TFLOP/s</b> ——
+  比我们一直当作天花板的手写 Triton GEMM（897 TFLOP/s）还快 <b>1.67×</b>。硬件完全没问题。
+  这与之前发现的 <code>HIPBLASLT_TENSILE_LIBPATH</code> 路径错位是<b>同一家族</b>的镜像问题。</p>
+</div>
+
+<h3>变通修法与端到端验证</h3>
+<p>
+修法很简单：当 <code>aten::mm</code> 收到一个"正常存放"的 B 矩阵时，把它换成物理上转置存放的等价形式
+（<code>b.t().contiguous().t()</code> —— 逻辑上同一个矩阵，物理主序不同）。
+实现为 PyTorch 的 <code>TorchDispatchMode</code>，见 <code>bin/nkfix.py</code>。
+</p>
+
+<div class="tw">
+<table>
+  <caption><b>端到端验证</b> · 8 层配置 · 种子已钉 · <b>每臂 n=9 次独立运行</b></caption>
+  <thead><tr><th>配置</th><th class="num">tps</th><th class="num">实测 TFLOP/s</th><th class="num">跨运行标准差</th><th>备注</th></tr></thead>
+  <tbody>
+    <tr><td>基线</td><td class="num">6,128</td><td class="num">~34%</td><td class="num">3.91%</td>
+        <td class="mono cond">5822×2 | 5936×2 | 6327×5</td></tr>
+    <tr><td>+ dgrad 布局修法（0915）</td><td class="num">11,604</td><td class="num">~204 TF/s</td>
+        <td class="num">0.42%</td><td class="cond">n=9</td></tr>
+    <tr class="hl"><td><b>+ wgrad 布局修法（0916）</b></td><td class="num"><b>38,043</b></td>
+        <td class="num"><b>640.7 TF/s</b></td><td class="num">1.97%</td>
+        <td class="mono cond">n=6，对无 patch <b>6.21×</b></td></tr>
+  </tbody>
+</table>
+</div>
+
+<h4>32 层生产配置（真正该看的那一组）</h4>
+<div class="note crit">
+  <span class="note-h">这个数字是实测的，但它不稳定 —— 三次里成功一次</span>
+  <p style="margin-bottom:0">两次失败都在<b>启动阶段</b>（0 步）以 SIGBUS 告终。
+  <b>与显存无关</b>：失败那次显存只有 6.93%，而成功那次峰值 88.32%。
+  时间戳换算后可见是<b>卡先出问题（MES 失败），27 秒后进程才 SIGBUS</b> ——
+  SIGBUS 是症状不是病因。汇报时应当说"已在生产配置上验证可行，但复现率待解决"，
+  而不是把 7.08× 当成稳定结论。</p>
+</div>
+<div class="tw">
+<table>
+  <caption>llama-3.1-8B <b>32 层</b>，b=4，s=8192，单卡，20 步 —— 与 JIRA 同形的那个配置</caption>
+  <thead><tr><th>配置</th><th class="num">tps</th><th class="num">单步</th><th class="num">峰值显存</th><th>备注</th></tr></thead>
+  <tbody>
+    <tr><td>无 patch（ASM 反向关）</td><td class="num">1,984</td><td class="num">16.5 s</td><td class="num">87.98%</td><td class="cond">n=1，未播种</td></tr>
+    <tr><td>无 patch（ASM 反向开）</td><td class="num">1,858</td><td class="num">17.6 s</td><td class="num">87.98%</td><td class="cond">n=1，未播种</td></tr>
+    <tr class="hl"><td><b>+ GEMM 布局修法</b></td><td class="num"><b>14,050</b></td><td class="num"><b>2.82 s</b></td>
+        <td class="num">88.32%</td><td class="cond"><b>7.08× / 6.25×</b>，20 步跑完，稳态抖动 &lt;0.4%。
+        <b>但三次里只成功一次</b> —— 见下方警告</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note good">
+  <span class="note-h">精度零代价</span>
+  <p style="margin-bottom:0">两条路径对 fp32 参考的 SQNR <b>逐位相同</b>
+  （K=14336/32768/128256 上分别 55.60 / 55.62 / 55.62 dB，门槛 50 dB）。
+  两者互相之间的差异只有值域的 0.3–0.4%，属于浮点累加顺序差异，不是系统性偏差。</p>
+</div>
+
+<div class="note crit">
+  <span class="note-h">更正：日志里的 MFU 一律不可用</span>
+  <p style="margin-bottom:0">torchtitan 的 <code>get_peak_flops()</code> 对任何不认识的
+  <code>device_name</code> 兜底为 <b>"assume A100" = 312 TFLOP/s</b>，而本机报的是
+  <code>AMD Radeon Graphics</code>（容器里也没有 <code>lspci</code>）。所以它打印的每一个
+  MFU 用的都是 A100 的分母 —— 这也是为什么 0916 的运行会报出 <b>215.63%</b> 这种不可能的值
+  （672.76 ÷ 312 = 2.156）。<br>
+  <b><code>tflops</code> 列是对的</b>（FLOP÷时间），<b><code>mfu</code> 列一律不要引用</b>。
+  若用本 campaign 实测的 Triton GEMM roof（1002.7 TF/s @1100 MHz）作分母，640.7 是 <b>63.9%</b>。</p>
+</div>
+
+<h3>0916 续：还有一半没修，而且要两个操作数一起改</h3>
+<p>
+修完 dgrad 后重新 profile，发现 <b>GEMM 里还有一半跑在坏 kernel 上</b> ——
+57 次调用、2185 ms、占 GEMM 时间的 89.8%、占整个单步的 <b>77%</b>，全部是
+<b>wgrad</b>（权重梯度）。第一版规则按 <code>b.is_contiguous()</code> 判断，而 wgrad 的 B 恰好也是连续的，
+所以被 dgrad 规则先认领走、留在了慢路径上。
+</p>
+<div class="tw">
+<table>
+  <caption>同一个 wgrad 形状，四种处理方式（<b>关键：任何单独一个都不够</b>）</caption>
+  <thead><tr><th>处理</th><th class="num">mlp wgrad</th><th class="num">lm_head</th><th class="num">qkv wgrad</th></tr></thead>
+  <tbody>
+    <tr><td>不处理</td><td class="num">54.3 TF/s</td><td class="num">49.9</td><td class="num">56.5</td></tr>
+    <tr><td>只把 B 改成 N-major</td><td class="num">69.3</td><td class="num">67.2</td><td class="num">69.2</td></tr>
+    <tr><td>只把 A 变连续</td><td class="num">62.7</td><td class="num">62.6</td><td class="num">66.7</td></tr>
+    <tr class="hl"><td><b>两个都改</b></td><td class="num"><b>1145.8</b></td><td class="num"><b>1485.3</b></td><td class="num"><b>1627.0</b></td></tr>
+    <tr><td class="cond">含拷贝的净收益</td><td class="num cond">9.36×</td><td class="num cond">14.74×</td><td class="num cond">7.76×</td></tr>
+  </tbody>
+</table>
+</div>
+<div class="note good">
+  <span class="note-h">端到端 38,043 tps（n=6）</span>
+  <p style="margin-bottom:0">对无 patch <b>6.21×</b>，对只修 dgrad 的版本 <b>3.28×</b>。单步 5.35 s → <b>861 ms</b>。
+  五次连跑零卡故障、零 KFD 残留；step-1 loss 与之前逐位相同；
+  <b>峰值显存 141.00 GiB 不变</b> —— 尽管 lm_head 那次要拷贝 7.83 GiB 的 A，被缓存分配器吸收了。</p>
+</div>
+<div class="note warn">
+  <span class="note-h">这一步走通靠的是读命中统计，不是推理 —— 我连错了两次</span>
+  <ol style="margin-bottom:0">
+    <li>第一版 wgrad 规则<b>端到端零收益</b>。读统计才发现它<b>命中 0 次</b>：
+      我的微基准把 B 构造成了非连续，而真实的 B 是连续的，判据永远不成立。</li>
+    <li>据此我又推断"dgrad 规则在把 wgrad 推进坑"。实测<b>证伪</b> ——
+      它其实有帮助（54 → 69 TF/s），只是远远不够。</li>
+  </ol>
+</div>
+
+<h3>顺带解掉了测量噪声问题</h3>
+<p>
+今天花了大半天刻画出"本机端到端跨运行噪声约 3.9%、且呈三个离散模态"这个现象，并据此推翻了此前所有 n=1 的结论。
+现在因果清楚了：<b>三模态的源头就是 NN 路径上查找表的最近邻匹配</b> ——
+表覆盖不到这片区域，不同进程可能落到不同的 solution 上。绕开它，散布从 3.91% 降到 0.42%，模态消失。
+</p>
+<p>
+这也解释了一个之前没想通的现象：为什么 A/B 两个臂的方差几乎一模一样（3.88% vs 3.91%）——
+<b>因为它们共用同一条 GEMM 路径，模态从来就不在 attention 里。</b>
+</p>
+
+<h2 id="changes">改动了哪些代码（是否只有 turbo）</h2>
+<p class="lede"><b>不只有 Primus-Turbo。</b>共涉及三处，性质和归属各不相同：</p>
+
+<div class="tw">
+<table>
+  <thead><tr><th>位置</th><th>内容</th><th>状态</th></tr></thead>
+  <tbody>
+    <tr><td><b>Primus-Turbo</b><br><span class="cond">产品代码</span></td>
+      <td class="cond">
+        attention ASM 反向的接入与两个修复（进程级 <code>HipModule</code> 单例、scratch 复用）；
+        资格门逻辑与默认值（默认关闭）；<code>enable_gqa</code> 的 TypeError 修复（这是 converter
+        一直被跳过的原因，也就是 JIRA Request 1 的根因）；全部测量脚本与文档。
+      </td>
+      <td class="cond"><span class="tag m">已提交推送</span><br><code>dev/lhz/attn</code></td></tr>
+
+    <tr><td><b>Primus</b><br><span class="cond">本地实验树</span></td>
+      <td class="cond">
+        <code>train_runtime.py</code> 加了 14 行实验 hook（按环境变量安装 GEMM 修法）；
+        四个 MI455X 训练配置（这些在 Primus 树里本来就是 untracked）。
+      </td>
+      <td class="cond"><span class="tag a">未推送</span><br>该仓库 remote 是上游
+        <code>AMD-AGI/Primus</code>，<b>不应推送</b>；已备份到
+        <code>output/0915__opt/primus-side/</code></td></tr>
+
+    <tr><td><b>GEMM 修法</b><br><span class="cond">运行时 patch</span></td>
+      <td class="cond">
+        <code>bin/nkfix.py</code>，一个 <code>TorchDispatchMode</code>。
+        <b>不改动任何产品代码</b>，通过环境变量 <code>NKFIX_ENABLE=1</code> 开关。
+      </td>
+      <td class="cond"><span class="tag m">已提交</span><br>定位为<b>临时变通</b>，
+        真正的修复应该在镜像侧</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note">
+  <span class="note-h">一个实现上的坑，值得记录</span>
+  <p style="margin-bottom:0">GEMM 修法<b>不能</b>用 <code>torch.library</code> 覆盖 <code>aten::mm.default</code> ——
+  这样做的话，代码里捕获的"原始函数"会解析回覆盖本身，fallback 路径无限递归直到爆栈。
+  必须用 <code>TorchDispatchMode</code>，它自带重入保护。同理也不能放在 <code>sitecustomize.py</code> 里：
+  那个文件在解释器启动时就执行，那时 torch 还没加载。</p>
+</div>
+
+<h2 id="lessons">测量方法学：今天推翻了自己三次</h2>
+<p class="lede">这一节可能比上面的性能数字更值得同步给团队 —— 它关系到<b>此前所有结论的可信度</b>。</p>
+
+<div class="tw">
+<table>
+  <thead><tr><th>曾经的结论</th><th class="num">当时 n</th><th>后来发现</th></tr></thead>
+  <tbody>
+    <tr><td>ASM 反向"让训练慢 6.78%，是噪声的 30 倍"</td><td class="num">1</td>
+      <td class="cond">那个"噪声"是<b>单次运行内部的步间抖动</b>，不是跨运行方差。6.78% 完全落在模态间距之内</td></tr>
+    <tr><td>带修复后"快 3.42%，翻盘了"</td><td class="num">1</td>
+      <td class="cond">没有播种（两臂的模型初始权重就不一样）+ 一臂冷启动一臂热启动</td></tr>
+    <tr><td>"ON 臂不可重复 sd 4.53%，OFF 臂稳定 0.06%"</td><td class="num">3</td>
+      <td class="cond">那三次 OFF 碰巧落在同一模态。n=9 下 OFF 的 sd 是 <b>3.91%</b>，两臂其实一样</td></tr>
+    <tr><td>"GEMM 层已排除为模态源"</td><td class="num">9</td>
+      <td class="cond">用了<b>错误的布局</b>（NT + 方阵）测的，那不是 e2e 实际走的路径。
+        换成真实 NN 形状重测，跨进程变异 14–23%</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>两个已修复的基础设施问题</h3>
+<ol>
+  <li><b>没有设随机种子。</b>torchtitan 的 <code>set_determinism</code> 在单卡且
+    <code>debug.seed is None</code> 时<b>直接 return 而不播种</b>，导致每次运行的模型初始权重都不同
+    （五次运行给出五个不同的 step-1 loss）。现已在配置里钉死 <code>debug.seed: 1234</code>。
+    注意<b>只钉种子，不开 <code>deterministic</code></b> —— 后者会启用确定性算法并降速，反而污染被测对象。</li>
+  <li><b>把组内抖动当成了跨运行方差。</b>这是所有错误的共同根源。
+    已提供 <code>bin/ab_replicate.sh</code>（带种子、交替顺序）和 <code>bin/ab_summary.py</code>
+    （报告<b>跨运行</b>方差），以及 <code>bin/watch_e2e.sh</code>（静默看门狗，只在异常时告警）。</li>
+</ol>
+
+<div class="note good">
+  <span class="note-h">附带优化：每次 e2e 实验省 53% 时间</span>
+  <p style="margin-bottom:0">时间分解显示初始化只占 9 秒，步数才是全部成本。
+  对 18 次运行逐一比对不同窗口后确认：取 <code>step 4–8</code> 的中位数与取 <code>step 8–20</code>
+  最大只差 <b>0.22%</b>，远低于噪声地板。所以步数可以从 20 砍到 10，单次从 110 秒降到约 52 秒。</p>
+</div>
+
+<h2 id="problems">遇到的问题与事故</h2>
+
+<h3>两次挂卡，均需人工 AC-cycle</h3>
+<div class="tw">
+<table>
+  <thead><tr><th>事故</th><th>机制</th><th>状态</th></tr></thead>
+  <tbody>
+    <tr><td><b>关闭 converter 打死 GPU</b></td>
+      <td class="cond">为做对照实验把 <code>converters: []</code> 关掉，模型退回 torchtitan 原生 Flex Attention，
+        而它内部<b>强制调用 <code>torch.compile</code></b> —— 配置里的 <code>compile.enable: false</code> 管不住它。
+        进程停在 inductor 的 <code>AUTOTUNE flex_decoding</code>，卡随即 wedge。
+        <b>也就是说 converter 一直在顺带保护这张卡不进 inductor 路径。</b></td>
+      <td class="cond"><span class="tag m">已定位</span><br>危险配置已删除，
+        其余配置加了醒目警告</td></tr>
+    <tr><td><b><code>MES ring buffer is full</code></b></td>
+      <td class="cond">GEMM 修法重复验证的第 4 次，卡命令队列满、进程成僵尸、
+        <code>torch.cuda.init()</code> 挂住。</td>
+      <td class="cond"><span class="tag x">未归因</span><br>AC-cycle 后以更长冷却时间
+        连跑 6 次<b>未能复现</b>（6/6 成功）。既不能说修法有问题，也不能说它安全</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>镜像层面的两个缺陷（建议上报）</h3>
+<ol>
+  <li><b>hipBLASLt 的 NN 组合缺少纯 GEMM 调优库</b>（<code>BB_BB_UA_Type_BB_HPA</code> 及其 CU 变体）。
+    影响面很大：在 PyTorch 训练里，NN 就是<b>每一个 Linear 层的梯度计算</b>，也就是每个模型每一步的大头。</li>
+  <li><b><code>hipblaslt-bench</code> 在这个镜像里不可用</b>：它要找 <code>TensileLibrary_lazy_*.dat</code>，
+    而镜像提供的是"非 lazy"布局（每个问题类型一个独立文件、没有总索引）。
+    这挡住了用户自行做 tuning 或验证 solution 的路。</li>
+</ol>
+<p>
+另外此前已发现的 <code>HIPBLASLT_TENSILE_LIBPATH</code> 路径错位（加载器在 <code>library/</code> 下找索引，
+而 402 个文件全在 <code>library/gfx1250/</code> 子目录里）—— 一行环境变量即可修正，
+端到端影响 <b>8.3×</b>（244 → 2,027 tps，32 层配置）。<b>这三条都建议一并上报镜像维护方。</b>
+</p>
+
+<h3>一条需要更正的旧结论</h3>
+<div class="note warn">
+  <p style="margin-bottom:0">此前文档记载"hipBLASLt 68.7 vs Triton 897 TFLOP/s，还有 13× 空间"。
+  那是在 <b>NN 布局的 8192³ 方阵</b>上测的，恰好落在本次发现的缺陷区域内。
+  所以 <b>13× 在 NN 上是真的，但它的含义不是"hipBLASLt 慢"，而是"NN 没有调优库"</b>。
+  同一块卡同一时钟下，NT 布局上 hipBLASLt 是 <b>1502 TFLOP/s</b>，比那个 Triton 数字还快 1.67×。</p>
+</div>
+
+<h2 id="next">下一步计划与预期收益</h2>
+
+<div class="tw">
+<table>
+  <thead><tr><th class="num">优先级</th><th>动作</th><th>预期收益</th><th>风险 / 前置条件</th></tr></thead>
+  <tbody>
+    <tr class="hl"><td class="num">1</td>
+      <td><b>把三条 hipBLASLt 缺陷上报镜像维护方</b></td>
+      <td class="cond">最大的一条是 NN 调优库缺失。若镜像侧补齐，<b>所有用户、所有模型</b>都直接受益，
+        且无需任何运行时 patch。本机实测量级 <b>1.89×</b></td>
+      <td class="cond">纯上报动作，无技术风险。<b>建议本周就做</b></td></tr>
+
+    <tr><td class="num">2</td>
+      <td><b>在 32 层生产配置上验证 GEMM 修法</b></td>
+      <td class="cond">若 8 层的 1.894× 能保持，这是最大的一笔端到端收益</td>
+      <td class="cond"><span class="tag x">有风险</span>32 层配置显存已占 <b>88%</b>，
+        而修法的转置会增加瞬时分配。应先上 <code>bin/nkfix_cached.py</code>
+        （缓存转置结果，权重一步内不变）——<b>该变体尚未验证</b></td></tr>
+
+    <tr><td class="num">3</td>
+      <td><b>把 <code>MES ring buffer is full</code> 定性</b></td>
+      <td class="cond">不直接产生性能收益，但它挡着长任务 —— 不搞清楚就不能放心用修法跑长训练</td>
+      <td class="cond">需要补足样本。两种解释（冷却时间不足 / 随机事件）目前都站得住</td></tr>
+
+    <tr><td class="num">4</td>
+      <td><b>修好四个算子级测量入口并重测资格门</b></td>
+      <td class="cond">算子级比值从记录的 1.74× 修正到约 <b>2.18×</b>；
+        门槛 <code>seqlen&gt;=2048</code> 很可能可以下调，从而让更多形状受益</td>
+      <td class="cond">工作量小。但要注意重测会改变已发布的基线数字，需同步更新文档</td></tr>
+
+    <tr><td class="num">5</td>
+      <td><b>op-evolve 自动调优融合反向</b></td>
+      <td class="cond">B0 机器上 round 1 曾拿到 <b>−13.2%</b>。
+        融合反向不需要 ASM 反向那套额外显存，没有它的包袱</td>
+      <td class="cond">需要独占一整块 GPU 跑一天</td></tr>
+
+    <tr><td class="num">6</td>
+      <td><b>争取解除本机 VR 限频，或换满频机器复测</b></td>
+      <td class="cond">时钟是所有对外数字不可比的根本原因；本机 943 MHz 实测 vs 满频 2133–2244 MHz</td>
+      <td class="cond">需要运维介入</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>对预期收益的两点说明</h3>
+<div class="note warn">
+  <ul style="margin-bottom:0">
+    <li><b>不要把 1.894× 外推到 32 层或其它模型。</b>它是 8 层配置、单卡、限频机器上的测量值。
+      GEMM 形状随模型和并行策略变化，缺陷命中程度也会变。</li>
+    <li><b>attention 那 4.76× 的端到端价值目前接近于零</b>，因为 attention 只占单步的 3.3%。
+      它的真正价值要等 GEMM 问题解决后才会显现 —— GEMM 修好后 attention 占比会自动上升，
+      届时值得重新评估 ASM 反向的默认值。</li>
+  </ul>
+</div>
+
+<h2 id="qa">补充问答（为周会准备）</h2>
+<p class="lede">以下六组问答是为汇报补充的。所有数字都回查过原始记录；凡是<b>查不出来</b>的，直接写"查不出来"，不做推测。</p>
+
+<h3 id="q1">Q1　我们的出厂 55.785 ms，和 JIRA 里 MI455X 的 attention 差多少？fwd / bwd 分别差多少？</h3>
+
+<div class="note crit">
+  <span class="note-h">先说结论：fwd / bwd 分别差多少 —— <b>给不出来</b></span>
+  <p style="margin-bottom:0"><b>JIRA 的两张截图里没有任何 attention 的前向/反向分解。</b>
+  它给的是 <code>FA path = flex 501 + elem 245 + softmax 9 = 755 ms</code>，
+  这是<b>按 kernel 类别</b>分的桶，不是按前向/反向分的。从类别桶无法用算术还原出 fwd/bwd ——
+  那需要 JIRA 那个 trace 链接背后的原始数据，而它不在我们仓库里。
+  <b>所以这一栏我们不能填，填了就是编的。</b>我们自己这边是有分解的（fwd 10.651 / bwd 45.134），但对面没有可对的东西。</p>
+</div>
+
+<h4>那总量能比吗？能算，但不建议拿去汇报</h4>
+<p>唯一能写下来的算术是：</p>
+<pre><code>32 层 × 55.785 ms = 1785.13 ms    vs    JIRA FA path 755 ms    →  2.36×   【推导值，非实测】</code></pre>
+<p>这个比值依赖六条假设，其中<b>至少三条不成立、一条完全未知</b>：</p>
+<div class="tw">
+<table>
+  <thead><tr><th>假设</th><th>状态</th></tr></thead>
+  <tbody>
+    <tr><td>32 层且每层形状相同</td>
+      <td class="cond">形状相同<b>成立</b>（scratch 的 key 不含层索引，所有层塌缩成一个 buffer 可证）。
+        但 <b>"32 层"这个数不在 JIRA 截图里</b> —— 截图只写 "Llama 3.1 8B"。是常识推断，汇报时不能说"JIRA 写的"</td></tr>
+    <tr><td>层与层之间无相互影响</td>
+      <td class="cond"><b>我们自己的文档主张它不成立</b>。不过要诚实：我没能定位到直接证明这一点的那个实验，
+        所以这是"我方立场"，不是"已证实的结果"</td></tr>
+    <tr><td>形状一致</td><td class="cond"><b>成立</b>。b=4 / s=8192 / Llama-3.1-8B 两边一致</td></tr>
+    <tr><td>测量口径一致</td>
+      <td class="cond"><b>不成立。</b>我们是算子微基准（CUDA-event 中位、20 iters / 5 warmup、SQNR 门槛）；
+        JIRA 是整步 trace 聚合，且其中 <b>245 ms 的 ElementWise 是 dtype cast（×492）</b>，
+        在我们的微基准里根本没有对应物</td></tr>
+    <tr><td>时钟已知或一致</td>
+      <td class="cond"><b>未知。</b>JIRA 机器的时钟在截图和我们仓库里都没有记载。我们这边是 1100 MHz 标称 / 943 实测</td></tr>
+    <tr><td>跑的是同一个实现</td>
+      <td class="cond"><b>不成立，而且这是最关键的一条</b> —— 见下</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note warn">
+  <span class="note-h">最关键的：两边跑的根本不是同一份代码</span>
+  <div class="tw" style="margin:10px 0 0">
+  <table>
+    <thead><tr><th></th><th>JIRA 的 MI455X</th><th>我们的 55.785</th></tr></thead>
+    <tbody>
+      <tr><td>实现</td><td>Triton <b>Flex Attention</b></td><td>Primus-Turbo <b>自己的 Triton</b> attention</td></tr>
+      <tr><td><code>turbo_attention</code></td><td><b>Skipped</b>（JIRA 自己的 Root Cause 第 1 条）</td><td>就是 turbo 这条路径</td></tr>
+      <tr><td>测量入口</td><td>整个模型一步的 trace</td><td>直接调 <code>flash_attn_func</code>，喂合成的 q/k/v</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p style="margin:12px 0 0">所以 <code>1785 vs 755</code> 是"flex 加上 dtype-cast 开销"对"turbo 的 Triton"，
+  在两台不同的机器上 —— 既不是退步，也不是进步，<b>它不是一个同类比较</b>。</p>
+</div>
+
+<div class="note">
+  <span class="note-h">顺带更正本报告前文一处措辞</span>
+  <p style="margin-bottom:0">55.785 这个数<b>不是"converter 打开"的端到端配置下测的</b>。
+  算子级 harness 直接调用 <code>flash_attn_func</code> 并喂合成张量，<b>模型根本没有被构建</b>。
+  converter 是 torchtitan 侧把模型里的 attention 替换掉的机制，
+  <code>enable_gqa</code> 的 TypeError 修复是让 turbo kernel 在<b>端到端</b>里能被用上的前提，
+  与这个算子级数字无关。两者别混。</p>
+</div>
+
+<div class="note good">
+  <span class="note-h">建议的汇报口径</span>
+  <p style="margin-bottom:0">不要给比值。改说：<b>「JIRA 记录的是 MI455X 在 turbo 被跳过、退回 Flex 时的表现；
+  我们已经把 turbo 这条路打通并优化到 11.726 ms/层。两边口径、实现、机器、时钟都不同，无法直接相减，
+  但 JIRA 提的第一条请求（让 turbo_attention 在 gfx1250 上生效）已经完成。」</b></p>
+</div>
+
+<h3 id="q2">Q2　"融合反向""ASM 前向""ASM 反向"到底是什么？是我们新写的代码吗？</h3>
+<p class="lede"><b>三个都不是我们写的 kernel。</b>三个计算内核全部是 AMD / aiter 的代码。
+我们做的是<b>把它们接进来、并围绕它们建起分发、资格判定、正确性验证和启动机制</b>。这个区别很重要，汇报时必须说准。</p>
+
+<div class="tw">
+<table>
+  <thead><tr><th>名称</th><th>它是什么</th><th>计算内核是谁的</th><th>我们写了什么</th></tr></thead>
+  <tbody>
+    <tr><td><b>融合反向</b><br><span class="cond">fused backward</span></td>
+      <td class="cond">把反向的多个步骤合成<b>一个</b> Triton kernel（相对的是我们原来的两个 kernel）</td>
+      <td class="cond"><b>ROCm/aiter 的 <code>mha_onekernel_bwd</code></b>，整体移植进来（vendored），
+        锁定在 commit <code>ffa945f</code>，MIT 许可（与 Primus-Turbo 相同，无需额外许可文件）</td>
+      <td class="cond"><b>1919 行里 kernel 主体与上游逐字节相同</b>（用 difflib 机械比对验证过，
+        差异只有一个首行和一个尾行空行）。我们改的是 4 处工程性问题
+        （去掉会拖进 aiter JIT 构建机制的 import、去掉每次调用都构造 f-string 的 logger 等）
+        <b>+ 3 处调优</b>（block size 与 <code>waves_per_eu</code>）</td></tr>
+
+    <tr><td><b>ASM 前向</b></td>
+      <td class="cond">aiter 预编译的<b>手写汇编</b>前向</td>
+      <td class="cond"><b>aiter 预编译的 <code>.co</code> 二进制</b>（4 个对象 + 1 个 CSV 调度表）</td>
+      <td class="cond">host 侧的调用机制：资格门（12 个拒绝条件）、参数打包、与我们 LSE 布局的适配</td></tr>
+
+    <tr><td><b>ASM 反向</b></td>
+      <td class="cond">aiter 预编译的手写汇编反向，三个 kernel 串起来</td>
+      <td class="cond"><b>aiter 预编译的 <code>.co</code> 二进制</b>（6 个对象 + 3 个 CSV，其中 2 个 <code>_perf</code> 变体经查不可用、已排除）</td>
+      <td class="cond"><b>这块我们写得最多</b>：kernarg 二进制打包（<code>DQDKDV</code> 44 个字段 / 704 字节、
+        <code>ODO</code> 16 字段、<code>POST</code> 10 字段）、grid 计算、模块加载与缓存、
+        <code>dq_acc</code>/<code>dk</code>/<code>dv</code> 的 scratch 管理与 GQA 规约、
+        资格门、以及把它接进分发层</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note bg">
+  <span class="note-h">一个值得强调的点：aiter 自己在 gfx1250 上够不到这条路</span>
+  <p style="margin-bottom:0">aiter 的 <code>can_impl_fmha_v3_bwd()</code> 里写死了
+  <code>ret = get_gfx() == "gfx942"</code>，后来只放宽到 gfx950。
+  <b>也就是说走 aiter 自己的公开接口，gfx1250 上根本调不到这个 ASM 反向</b> ——
+  能用上它，是我们自己把预编译对象的调用链接出来的结果。这部分工作是实打实的，
+  只是它的性质是"打通并验证"，不是"写了一个新 kernel"。</p>
+</div>
+
+<h4>代码量的实际构成</h4>
+<div class="tw">
+<table>
+  <thead><tr><th>文件</th><th class="num">行数</th><th>归属</th></tr></thead>
+  <tbody>
+    <tr><td><code>triton/attention/fused_mha_bwd_kernel.py</code></td><td class="num">1919</td>
+        <td class="cond"><b>移植自 aiter</b>（主体逐字节相同）</td></tr>
+    <tr><td><code>kernels/attention/attention_fused_bwd_impl.py</code></td><td class="num">675</td>
+        <td class="cond">移植 + 我们加的 <code>dense_fused_backward</code> 适配入口</td></tr>
+    <tr><td><code>kernels/attention/_asm_bwd_kernargs.py</code></td><td class="num">335</td><td class="cond"><b>我们写的</b></td></tr>
+    <tr><td><code>kernels/attention/attention_asm_bwd_impl.py</code></td><td class="num">334</td><td class="cond"><b>我们写的</b></td></tr>
+    <tr><td><code>triton/attention/FUSED_MHA_PROVENANCE.md</code></td><td class="num">281</td>
+        <td class="cond"><b>我们写的</b> —— 移植来源、许可、逐项改动说明</td></tr>
+    <tr><td><code>kernels/attention/attention_asm_fwd_impl.py</code></td><td class="num">199</td><td class="cond"><b>我们写的</b></td></tr>
+    <tr><td><code>ops/attention/flash_attn_interface.py</code></td><td class="num">+114</td><td class="cond"><b>我们写的</b> —— 分发逻辑</td></tr>
+    <tr class="hl"><td>合计</td><td class="num">约 4200</td>
+        <td class="cond">其中 <b>约 1900 行是移植</b>，<b>约 2300 行是我们写的集成 / 分发 / 资格门 / 正确性机制</b></td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note">
+  <span class="note-h">建议的汇报措辞</span>
+  <p style="margin-bottom:0">"我们没有写新的 attention kernel。我们做的是：<b>评测各个现成实现、选出最好的、把它移植/接通到 gfx1250 上、
+  并建立起一套能判断它什么时候该用、用了对不对的机制。</b>
+  其中 ASM 这条路 aiter 自己的接口在 gfx1250 上是够不到的，是我们接出来的。"
+  —— 这个说法既不夸大，也不埋没工作量。</p>
+</div>
+
+<h3 id="q3">Q3　这些改动只对当前这组配置有效吗？换 mbs 或换硬件呢？会影响 MI355X 吗？</h3>
+
+<h4>先回答最要紧的：会不会影响 MI355X？</h4>
+<div class="note good">
+  <span class="note-h">不会影响 MI355X 的 attention 性能</span>
+  <p style="margin-bottom:0">两个 ASM 资格门的<b>第二个条件</b>就是 <code>is_gfx1250()</code>。
+  在 MI355X（gfx950）上，两个门都在第二行直接返回 False，<b>这两条快速路径在那里根本不存在</b>，
+  走的仍然是原来的代码。另外 <code>git diff</code> 显示我们碰的 13 个文件里，
+  <b>没有一个在 GEMM / grouped-GEMM / 量化目录下</b>。</p>
+</div>
+
+<div class="note warn">
+  <span class="note-h">但有一处我们的改动确实影响 gfx1250 之外，必须说明</span>
+  <p><b>FlyDSL 后端的门被收窄了</b>，而且它的 import 改成了可选：</p>
+  <ul>
+    <li>原来：缺 flydsl 包会让<b>整个 attention 栈无法 import</b> —— 连只有它能用的 Triton 路径也一起挂掉。
+      现在改成"FlyDSL 声明自己不可用"，这是个<b>修复</b>。</li>
+    <li>门从 <code>&gt;= gfx950</code> 收窄为 <code>is_gfx950() and FLYDSL_AVAILABLE</code>。
+      在 gfx950 且装了 flydsl 时<b>行为不变</b>；在比 gfx950 更新的架构上，
+      现在会 decline，而原来会 dispatch 进一个 gfx950 专用的 JIT（那本来就会失败）。</li>
+  </ul>
+  <p style="margin-bottom:0">两条都是把"会炸"变成"优雅拒绝"，但它<b>确实是 gfx1250 之外的行为变化</b>，不应隐瞒。</p>
+</div>
+
+<h4>换配置还有效吗：逐条看资格门</h4>
+<div class="tw">
+<table>
+  <caption>改动这些参数会把工作负载<b>踢出</b>快速路径</caption>
+  <thead><tr><th>参数</th><th>ASM 反向要求</th><th>改了会怎样</th></tr></thead>
+  <tbody>
+    <tr><td>架构</td><td>gfx1250</td><td class="cond">换卡即失效（按设计）</td></tr>
+    <tr><td>dtype</td><td>bf16</td><td class="cond">fp16 / fp8 立刻失效 —— 预编译对象只有 bf16</td></tr>
+    <tr class="hl"><td><b>head_dim</b></td><td><b>必须 = 128</b></td>
+      <td class="cond"><b>换模型最容易踩的一条。</b>预编译 <code>.co</code> 在这个架构上只覆盖 128。
+        前向稍宽，支持 64 或 128</td></tr>
+    <tr><td><b>seqlen</b></td><td><b>&gt;= 2048</b></td>
+      <td class="cond">短序列会 decline（那里 ASM 反而更慢，见资格门表）。<b>注意这个门槛可能定高了</b>，见前文</td></tr>
+    <tr><td><b>batch (mbs)</b></td><td>不在门里</td>
+      <td class="cond"><b>改 mbs 不会失效</b>，快速路径照常启用。但收益大小会变 —— ASM 反向有约 0.85 ms 固定开销，
+        工作量越小越难摊平</td></tr>
+    <tr><td>头数 / GQA 比例</td><td>hq 必须是 hkv 的整数倍</td><td class="cond">常见模型都满足</td></tr>
+    <tr><td>其它</td><td>无 sink / 滑窗 / bias / alibi / dropout；q/k/v 连续；自注意力</td>
+      <td class="cond">任一不满足即 decline。<b>这是有意设计成保守的</b> —— 这条路径上一个参数传错不会报错，
+        它会去读错误的内存</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h4>哪些是换配置也能复用的</h4>
+<div class="tw">
+<table>
+  <thead><tr><th>成果</th><th>是否与形状/硬件相关</th></tr></thead>
+  <tbody>
+    <tr><td><code>HipModule</code> 进程级单例（消除每次调用重新加载模块）</td><td class="cond"><b>完全可复用</b>，与形状无关</td></tr>
+    <tr><td>scratch 复用（消除分配 churn）</td><td class="cond"><b>完全可复用</b></td></tr>
+    <tr><td><code>enable_gqa</code> TypeError 修复</td><td class="cond"><b>完全可复用</b>，且它是 converter 能被启用的前提</td></tr>
+    <tr><td>FlyDSL import 可选化</td><td class="cond"><b>完全可复用</b>，修的是"缺包就整体挂掉"</td></tr>
+    <tr><td>播种、重复 A/B、跨运行方差统计、静默看门狗</td><td class="cond"><b>完全可复用</b>，而且是今天最该推广的东西</td></tr>
+    <tr><td>GEMM 布局修法（nkfix）</td>
+      <td class="cond"><b>形状无关，但镜像相关。</b>它绕的是<b>这个镜像</b>的库覆盖缺陷。
+        在一个 NN 覆盖正常的镜像上，它是<b>纯粹的损失</b>（白白多一次转置）。
+        而且它<b>不在产品代码里</b>，是运行时可开关的 patch</td></tr>
+    <tr><td>ASM 前向/反向的接入</td><td class="cond"><b>与形状和架构强相关</b>，见上表</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3 id="q4">Q4　优化优先级是怎么定的？评估过哪些后端？</h3>
+<p class="lede">优先级不是拍脑袋定的，是被一次对照实验<b>逼出来</b>的 —— 而且那次实验同时暴露了我们自己之前的方法论错误。</p>
+
+<h4>决定方向的那次 bake-off</h4>
+<p>把所有候选实现放在<b>同一个会话、同一个镜像、同一个进程池、同一个 fp32 参考、同一套 SQNR 门槛</b>下跑（A0，1100 MHz）：</p>
+<div class="tw">
+<table>
+  <thead><tr><th>实现</th><th class="num">fwd</th><th class="num">bwd</th><th class="num">total</th><th class="num">TFLOP/s</th></tr></thead>
+  <tbody>
+    <tr><td>aiter Triton + 2 个旋钮</td><td class="num">3.260</td><td class="num">27.947</td><td class="num">31.207</td><td class="num">246.6</td></tr>
+    <tr><td>torch flex（锚点）</td><td class="num">7.506</td><td class="num"><b>23.831</b></td><td class="num">31.337</td><td class="num">245.6</td></tr>
+    <tr><td>aiter Triton <b>出厂未动</b></td><td class="num">6.676</td><td class="num">27.888</td><td class="num">34.565</td><td class="num">222.7</td></tr>
+    <tr class="hl"><td><b>我们自己的 Triton，已调优</b></td><td class="num">4.152</td><td class="num">32.252</td><td class="num"><b>36.405</b></td><td class="num">211.4</td></tr>
+    <tr><td>我们自己的 Triton，出厂</td><td class="num">10.673</td><td class="num">48.969</td><td class="num">59.642</td><td class="num">129.0</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note crit">
+  <span class="note-h">这张表里最该讲的一行</span>
+  <p><b>我们自己精心调优过的实现（36.405 ms），输给了 aiter 完全没动过的出厂版本（34.565 ms）。</b>
+  而且差距全部在反向 —— 我们的前向其实是好的（比 flex 快 1.81×）。</p>
+  <p style="margin-bottom:0">更值得说的是：这次 bake-off <b>本该是第一步，但当时没有先跑</b>。
+  在它之前，好几天时间花在调我们自己那个实现的调度参数上，而<b>每一个都落在中性或更差</b>。
+  由此定下的规则是：<b>「在确认某个实现是值得优化的那个之前，不要去优化它。」</b>
+  当前的优先级 —— 停止改进自研 kernel、改为采纳 aiter 的 —— 就是这条规则的直接结果。</p>
+</div>
+
+<h4>完整的后端评估清单</h4>
+<div class="tw">
+<table>
+  <thead><tr><th>后端</th><th>测过？</th><th>结论</th><th>依据</th></tr></thead>
+  <tbody>
+    <tr><td>Primus-Turbo 自研 Triton（两个 kernel）</td><td class="cond">是</td>
+      <td class="cond"><b>反向被否决</b>，前向保留参考价值</td>
+      <td class="cond">结构上就没融合；其 64×64 tile 已是自身最优，profiler 显示它是 2 个 kernel（18.96 + 11.26 ms）对 aiter 的 1 个融合 kernel</td></tr>
+    <tr class="hl"><td><b>aiter Triton 单 kernel 融合反向</b></td><td class="cond">是</td>
+      <td class="cond"><b>采纳并移植</b> —— 当前默认反向</td>
+      <td class="cond">A0 上 17.686 ms；B0 上 8.700 ms</td></tr>
+    <tr class="hl"><td><b>aiter 预编译 ASM 前向</b></td><td class="cond">是</td><td class="cond"><b>采纳，已设为默认</b></td>
+      <td class="cond">A0 1.572 ms（对自研 Triton 前向 2.7×）</td></tr>
+    <tr><td><b>aiter 预编译 ASM 反向</b></td><td class="cond">是</td>
+      <td class="cond"><b>采纳但默认关闭</b>（算子级最快，端到端测不出收益）</td>
+      <td class="cond">A0 10.160 ms；e2e n=9 差异 −0.28%，不显著</td></tr>
+    <tr><td>torch Flex Attention</td><td class="cond">是</td>
+      <td class="cond"><b>不可用</b> —— 在本机会打死 GPU（强制走 inductor 编译）</td>
+      <td class="cond">0915 挂卡一次，需人工 AC-cycle</td></tr>
+    <tr><td><b>HipKittens (udna1)</b></td><td class="cond">是，做到 GPU 验证</td>
+      <td class="cond"><b>否决（RED）</b></td>
+      <td class="cond">三条编译期硬墙：<code>reductions.cuh</code> 依赖 gfx950 独有的 <code>permlane32_swap</code> 完全编不过；
+        三个矩阵入口只活了一个；<code>swap_layout</code> 在 wave32 下只覆盖一半寄存器却是必经环节。
+        GPU 验证确认 256 个元素错了 126 个</td></tr>
+    <tr><td><b>FlyDSL</b></td><td class="cond">是，做到指令选择验证</td>
+      <td class="cond"><b>阻塞（确证）</b></td>
+      <td class="cond"><b>gfx1250 根本没有 MFMA 指令</b> —— <code>mfma.f32.32x32x16.bf16</code>、
+        <code>ds.read.tr16.b64</code>、<code>permlane32.swap</code> 在 gfx950 上全部选中，
+        在 gfx1250 上全部 <code>Cannot select</code></td></tr>
+    <tr><td>aiter <code>_perf</code> 变体 <code>.co</code></td><td class="cond">是</td>
+      <td class="cond"><b>排除</b></td>
+      <td class="cond">aiter 自己不 dispatch 它们；实测 dq 只有 5.84 dB，位置 0–127 对、128 之后全错
+        （128 正是它的 KV tile 尺寸 —— 它对 dq 是赋值而非原子累加）</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note bg">
+  <span class="note-h">"gfx1250 没有 MFMA" 这一条值得单独讲</span>
+  <p style="margin-bottom:0">MFMA 是 CDNA 架构上做矩阵乘的专用指令。
+  <b>gfx1250 上没有它</b>，这意味着很多在 gfx950（MI355X）上成熟的 attention 方案
+  <b>不是"移植工作量大"，而是"指令层面就不存在"</b>。
+  这解释了为什么 HipKittens 和 FlyDSL 两条路都断在编译期，
+  也解释了为什么我们最终落在"用 AMD 已经为 gfx1250 预编译好的汇编对象"这条路上。</p>
+</div>
+
+<h3 id="q5">Q5　当前后端还有多少空间？其它后端最好能到多少？下一步用哪个？</h3>
+
+<h4>理论下界（都是本机限频态下算的，换机器要重算）</h4>
+<div class="tw">
+<table>
+  <thead><tr><th>参照</th><th class="num">下界</th><th>适用于哪个结构</th></tr></thead>
+  <tbody>
+    <tr><td>5-GEMM MFMA 下界</td><td class="num">5.48 ms</td><td class="cond">理想的 5 次矩阵乘结构 —— ASM 反向更接近这个参照</td></tr>
+    <tr><td>7-GEMM MFMA 下界</td><td class="num">7.68 ms</td><td class="cond">我们原来那个 7 次矩阵乘的 Triton 结构</td></tr>
+    <tr><td>"真实墙"（含调度开销）</td><td class="num">9.2–9.9 ms</td><td class="cond">同上，是对 Triton 结构给的可达估计</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="tw">
+<table>
+  <caption>据此推算的<b>剩余空间</b></caption>
+  <thead><tr><th>当前</th><th class="num">实测</th><th class="num">参照下界</th><th class="num">剩余</th></tr></thead>
+  <tbody>
+    <tr><td>ASM 反向</td><td class="num">10.160 ms</td><td class="num">5.48 ms</td><td class="num"><b>约 1.85×</b></td></tr>
+    <tr><td>融合反向（当前默认）</td><td class="num">17.686 ms</td><td class="num">9.2–9.9 ms</td><td class="num"><b>约 1.8–1.9×</b></td></tr>
+    <tr><td>ASM 前向</td><td class="num">1.572 ms</td><td class="cond">—</td>
+      <td class="cond"><b>仓库里没有前向的下界分析</b>。前向已占总时间不到 14%，
+        继续压它的端到端价值很小</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note warn">
+  <p style="margin-bottom:0"><b>这些"剩余空间"要谨慎使用。</b>它们是把实测值和一个理论下界相除得到的，
+  而下界是按理想矩阵乘算的，不含任何调度、访存、同步的现实开销。
+  历史上我们自己的两个 Triton kernel 分别落在下界的 2.0× 和 2.2–2.4×，
+  而某份计划文档预测"调度良好的 Triton 应落在 1.3–1.5×" —— <b>那个预测已被我们自己的实测证伪</b>。
+  所以把 1.85× 理解成"理论上限的距离"，不要理解成"能拿到的收益"。</p>
+</div>
+
+<h4>下一步建议用哪个后端</h4>
+<div class="tw">
+<table>
+  <thead><tr><th class="num">顺序</th><th>方向</th><th>预期</th><th>为什么是它</th></tr></thead>
+  <tbody>
+    <tr class="hl"><td class="num">1</td><td><b>先不碰 attention 后端，去修 GEMM</b></td>
+      <td class="cond">已实测 <b>1.894×</b> 端到端</td>
+      <td class="cond">attention 现在只占单步 <b>3.3%</b>，而 GEMM 占 94%。
+        即使 attention 再快一倍，端到端也只有 1.7% 的空间。<b>这是本报告最重要的一条优先级判断</b></td></tr>
+    <tr><td class="num">2</td><td><b>op-evolve 自动调优融合反向</b></td>
+      <td class="cond">B0 上第一轮曾拿到 <b>−13.2%</b></td>
+      <td class="cond">融合反向是<b>当前默认路径</b>，改进它不需要改默认值、没有 ASM 反向那套显存包袱。
+        且它离自己的参照墙还有 1.8–1.9×。占一整块 GPU 跑一天</td></tr>
+    <tr><td class="num">3</td><td>修好四个测量入口，重测资格门</td>
+      <td class="cond">算子级比值从 1.74× 修正到约 <b>2.18×</b>；门槛可能下调</td>
+      <td class="cond">工作量小，且现在的门槛建立在含每次调用开销的地板上</td></tr>
+    <tr><td class="num">4</td><td>5-GEMM 结构重构</td>
+      <td class="cond">理论上另外 1.85×</td>
+      <td class="cond"><b>只在 1–3 都推不动时才做。</b>交付物应当是一个投资决策，不是一个 kernel</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note crit">
+  <span class="note-h">不建议的方向</span>
+  <p style="margin-bottom:0"><b>HipKittens 和 FlyDSL 短期内都不要再投入</b> ——
+  它们断在 gfx1250 没有 MFMA 这个硬件事实上，不是工程量问题。
+  <b>Flex Attention 不要在本机碰</b>，它会打死卡。</p>
+</div>
+
+<h3 id="q6">Q6　预想周会上可能被问到的问题</h3>
+<p class="lede">按提问者完全不了解算子优化来准备。每条都给可以直接说出口的答复。</p>
+
+<div class="tw">
+<table>
+  <thead><tr><th style="width:30%">可能的问题</th><th>建议答复</th></tr></thead>
+  <tbody>
+    <tr><td><b>算子快了 4.76 倍，为什么训练只快 1.89 倍？</b></td>
+      <td class="cond">这两个数说的不是同一件事。4.76× 是 attention 这个算子本身，而 attention 只占单步时间的
+        <b>3.3%</b> —— 就算把它优化到零，整步也只快 3.3%。<br>
+        而 1.89× <b>根本不是 attention 带来的</b>，是修了一个矩阵乘库的问题。两件事要分开讲。</td></tr>
+
+    <tr><td><b>那 attention 这一天的工作到底有没有价值？</b></td>
+      <td class="cond">有三重价值，但要诚实分级：<br>
+        ① <b>JIRA 的第一条请求完成了</b> —— turbo attention 在 gfx1250 上被跳过的根因找到并修掉；<br>
+        ② 算子本身 4.76×，这是<b>能力储备</b> —— 一旦 GEMM 问题解决，attention 占比会自动上升，届时它就值钱了；<br>
+        ③ 正是在验证 attention 的过程中，才发现了 GEMM 那个大问题。<br>
+        <b>但要直说：以今天的占比，attention 优化的端到端收益接近于零。</b></td></tr>
+
+    <tr><td><b>为什么最快的那个反而默认关掉？</b></td>
+      <td class="cond">因为端到端测不出它的好处。n=9 的重复实验下，开和关的差异是 −0.28%，
+        统计上完全不显著；而它要付出 1 GiB 常驻显存和三个预编译文件的维护成本。
+        <b>没有可测收益的复杂度不应该进默认路径。</b>需要时一个环境变量就能打开。</td></tr>
+
+    <tr><td><b>你们是不是就是调了几个参数？</b></td>
+      <td class="cond">不是调参，但也<b>不是写了新 kernel</b>，要说准：三个计算内核都是 AMD/aiter 的。
+        我们做的是评测选型、把 aiter 的实现移植/接通到 gfx1250、
+        并写了约 2300 行的分发、资格判定、参数打包和正确性验证机制。<br>
+        其中 <b>ASM 这条路 aiter 自己的接口在 gfx1250 上够不到</b>（它的代码里写死了只认 gfx942/gfx950），是我们接出来的。</td></tr>
+
+    <tr><td><b>GEMM 那个问题是我们的 bug 还是 AMD 的？</b></td>
+      <td class="cond">是镜像/库侧的<b>覆盖缺陷</b>，不是我们的代码问题，也不是硬件能力问题。
+        hipBLASLt 对 NN 这种矩阵布局<b>缺少纯 GEMM 的调优数据</b>（TN 有三份，NN 一份没有），
+        于是它退回到一张覆盖不到的查找表，选中了为 N=1 细长矩阵设计的切法。<br>
+        证据是同一块卡同一时钟下，NT 布局能跑到 <b>1502 TFLOP/s</b>。</td></tr>
+
+    <tr><td><b>为什么这个问题现在才发现？</b></td>
+      <td class="cond">因为之前的 GEMM 微基准<b>用错了矩阵布局</b>。我们一直测的是 NN 方阵，
+        而训练里 Linear 层前向走 NT、反向走 NN。<br>
+        真正戳破它的是一个对不上的数：端到端报告整体 117 TFLOP/s，而 GEMM 微基准只有 68.74 ——
+        <b>如果训练是 GEMM 主导，整体不可能超过 GEMM 本身</b>。顺着这个矛盾做 profile 才挖出来。</td></tr>
+
+    <tr><td><b>1.89× 能在生产的 32 层配置上拿到吗？</b></td>
+      <td class="cond"><b>还不知道，这是下一步第一件事。</b>目前所有端到端数字都是 8 层配置。
+        32 层配置显存已占 88%，而这个修法的转置会增加瞬时分配，有 OOM 风险。
+        已经准备了一个缓存转置的变体来降低这个风险，<b>但还没验证</b>。</td></tr>
+
+    <tr><td><b>换个模型还有效吗？</b></td>
+      <td class="cond">分两块：<br>
+        <b>GEMM 修法</b>与模型无关，只要走 NN 布局的大矩阵乘就有效 —— 也就是<b>所有模型的每个 Linear 层反向</b>；<br>
+        <b>attention 的 ASM 路径</b>限制较严：必须 head_dim=128、bf16、seqlen≥2048。
+        换 mbs <b>不影响</b>资格，但换 head_dim 会立刻失效。</td></tr>
+
+    <tr><td><b>会不会影响 MI355X？</b></td>
+      <td class="cond">attention 不会 —— 两个快速路径的门第二条就是"必须是 gfx1250"，
+        在 MI355X 上直接拒绝，走原来的代码。我们也没有碰任何 GEMM / 量化目录。<br>
+        <b>有一处要如实说</b>：FlyDSL 后端的门收窄了、import 改成可选。
+        这修的是"缺包会让整个 attention 栈无法 import"，在 gfx950 装了 flydsl 时行为不变。</td></tr>
+
+    <tr><td><b>数据可靠吗？听说你们今天推翻了自己好几次</b></td>
+      <td class="cond">应该反过来看：<b>推翻得越多，现在留下的越可靠。</b><br>
+        今天做的最重要的一件事，是量出了这台机器的测量噪声 —— 跨运行 <b>3.9% 且三模态</b>。
+        在此之前所有端到端结论都是<b>单次测量</b>，其中一条还把方向搞反了 10 个百分点。<br>
+        现在的做法是：钉随机种子、交替顺序、每臂跑 9 次、报<b>跨运行</b>方差。
+        而且所有对外数字都回查过原始记录 —— 查出四处与文档不符，包括一个<b>在任何原始记录里都不存在</b>的数。</td></tr>
+
+    <tr><td><b>机器挂了两次，是我们代码的问题吗？</b></td>
+      <td class="cond">一次是，一次不确定，要分开说：<br>
+        <b>第一次确定是我操作导致的</b> —— 为做对照实验关掉了 converter，模型退回 Flex Attention，
+        而它内部强制走 inductor 编译，那条路径在本机会打死 GPU。原因清楚，危险配置已删除，其余配置加了警告。<br>
+        <b>第二次未能归因</b> —— AC-cycle 后用更长冷却时间连跑 6 次没能复现。
+        既不能说修法有问题，也不能说它安全，需要补样本。</td></tr>
+
+    <tr><td><b>我们和 JIRA 上的目标差多少？</b></td>
+      <td class="cond">这个比较<b>做不了</b>，原因要讲清楚：本机被限频到 1100 MHz（实测负载下 943），
+        而 JIRA 机器的时钟<b>在截图和我们仓库里都没有记载</b>。<br>
+        能说的是：JIRA 提的第一条请求（turbo attention 被跳过）<b>已经完成</b>；
+        第二条（对齐 compile + primus_turbo）受阻于本机 inductor 会打死卡。</td></tr>
+
+    <tr><td><b>为什么不直接用 torch.compile？</b></td>
+      <td class="cond">在本机不能用 —— inductor 的 Triton 自动调优会触发
+        <code>hipErrorLaunchFailure</code> 并<b>打死 GPU</b>，今天验证过一次。<br>
+        这也正是 JIRA 那边 MI455X 配置里 <code>compile.enable=False</code> 的原因。这个矛盾目前无解。</td></tr>
+
+    <tr><td><b>SQNR 50 dB 是什么？够吗？</b></td>
+      <td class="cond">是衡量"优化后算得还对不对"的信噪比指标，越高越准。
+        50 dB 是这个项目定的门槛，低于它就认为精度受损、优化不采纳。<br>
+        我们所有采纳的改动都在门槛之上。特别地，GEMM 那个修法<b>精度零代价</b> ——
+        两条路径对 fp32 参考的 SQNR <b>逐位相同</b>。</td></tr>
+
+    <tr><td><b>nkfix 这个 patch 能进产品吗？</b></td>
+      <td class="cond"><b>不建议直接进。</b>它是绕过库缺陷的临时手段，在一个 NN 覆盖正常的镜像上
+        它是<b>纯粹的损失</b>（白白多一次转置）。<br>
+        正确做法是<b>推动镜像侧补齐调优库</b>；在那之前可以作为一个环境变量开关的临时方案，
+        但必须写清适用条件。</td></tr>
+
+    <tr><td><b>报给 AMD 之后多久能修？在那之前怎么办？</b></td>
+      <td class="cond">时间不由我们控制。在那之前有两个可用手段：
+        <code>HIPBLASLT_TENSILE_LIBPATH</code> 指向正确目录（一行环境变量，端到端 8.3×，<b>零风险</b>），
+        以及 nkfix 这个运行时 patch（1.89×，但需先在 32 层配置上验证显存）。</td></tr>
+
+    <tr><td><b>限频什么时候能解决？</b></td>
+      <td class="cond">需要运维介入，不在我们控制范围。<br>
+        要说明的是：<b>限频不影响我们优化决策的正确性</b>（所有对比都在同一台机器同一时钟下做），
+        但它<b>确实让所有绝对数字无法对外比较</b>。建议后续关键结论在满频机器上复测一遍。</td></tr>
+
+    <tr><td><b>下一步要多久？</b></td>
+      <td class="cond">上报 hipBLASLt 缺陷是<b>本周就能做</b>的事，且收益最大。
+        32 层验证大约<b>半天</b>（含显存风险处理）。op-evolve 需要<b>独占一块 GPU 跑一天</b>。<br>
+        注意本机已交还给同事，需要先协调机器。</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>附：数据来源与可复现性</h2>
+<p class="foot">
+所有数字来自 <code>output/0915__opt/</code> 下的日志与 ledger：
+<code>HANDOFF.md</code>、<code>E2E-AB.md</code>、<code>BLAS-FINDING.md</code>、
+<code>GEMM-NN-FINDING.md</code>、<code>RESULTS.md</code>、<code>logs/*.log</code>、<code>ledger.jsonl</code>。
+JIRA 对照见 <code>JIRA-BASELINE.html</code>。英文周报段落见 <code>WEEKLY-EN.md</code>。
+关键测量脚本：<code>bin/ab_replicate.sh</code>（重复 A/B）、<code>bin/ab_summary.py</code>（跨运行方差）、
+<code>bin/watch_e2e.sh</code>（静默看门狗）、<code>bin/nkfix.py</code>（GEMM 修法）。
+本报告中的每一处对比都在同一台机器、同一时钟下进行；<b>没有任何跨机器的时钟换算</b>。
+标注 <span class="tag m">实测</span> 的直接来自日志，<span class="tag a">证据不足</span> 表示样本量或口径不足以支撑，
+<span class="tag x">未归因</span> 表示现象确认但原因未定。
+</p>
+
+</div>
+</body>
+</html>

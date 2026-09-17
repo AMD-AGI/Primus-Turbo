@@ -1,0 +1,439 @@
+<title>MI455X 注意力优化进展</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap">
+<style>
+:root{
+  --paper:#F4F6F7; --surface:#FFFFFF; --surface-2:#EDF1F2;
+  --ink:#15191D; --ink-2:#3B454E; --muted:#66727C; --line:#DCE2E5;
+  --accent:#0C6A6C; --accent-2:#0A8B8E; --accent-wash:#DCECEC;
+  --critical:#A4301A; --critical-wash:#F6E2DE;
+  --warn:#7F5A00; --warn-wash:#F7ECD4;
+  --good:#1B6639; --good-wash:#DFEEE4;
+  --shadow:0 1px 2px rgba(21,25,29,.06),0 6px 18px rgba(21,25,29,.05);
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --paper:#0F1316; --surface:#171C20; --surface-2:#1E252A;
+    --ink:#E5E9EB; --ink-2:#BCC6CC; --muted:#8B979F; --line:#2A3238;
+    --accent:#4FB2B4; --accent-2:#6FC9CB; --accent-wash:#12312F;
+    --critical:#E08573; --critical-wash:#3A211B;
+    --warn:#D6A94A; --warn-wash:#33280F;
+    --good:#66B888; --good-wash:#15301F;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 6px 18px rgba(0,0,0,.3);
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#0F1316; --surface:#171C20; --surface-2:#1E252A;
+  --ink:#E5E9EB; --ink-2:#BCC6CC; --muted:#8B979F; --line:#2A3238;
+  --accent:#4FB2B4; --accent-2:#6FC9CB; --accent-wash:#12312F;
+  --critical:#E08573; --critical-wash:#3A211B;
+  --warn:#D6A94A; --warn-wash:#33280F;
+  --good:#66B888; --good-wash:#15301F;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 6px 18px rgba(0,0,0,.3);
+}
+*{box-sizing:border-box}
+body{
+  background:var(--paper); color:var(--ink);
+  font-family:"IBM Plex Sans","Noto Sans SC",system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+  font-size:16px; line-height:1.75; margin:0;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:940px; margin:0 auto; padding-inline:20px; padding-block:0 96px}
+code,.mono,.num{font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace}
+.num{font-variant-numeric:tabular-nums}
+
+/* ---- masthead ---- */
+header.mast{border-bottom:1px solid var(--line); padding-block:56px 32px; margin-bottom:48px}
+.eyebrow{font-family:"IBM Plex Mono",monospace; font-size:11.5px; letter-spacing:.16em;
+  text-transform:uppercase; color:var(--accent); margin:0 0 18px}
+h1{font-size:clamp(30px,5.2vw,46px); line-height:1.14; font-weight:700; margin:0 0 20px;
+  letter-spacing:-.02em; text-wrap:balance}
+.standfirst{font-size:19px; line-height:1.65; color:var(--ink-2); max-width:64ch; margin:0}
+.mast-meta{display:flex; flex-wrap:wrap; gap:10px 28px; margin-top:28px;
+  font-size:13px; color:var(--muted); font-family:"IBM Plex Mono",monospace}
+.mast-meta b{color:var(--ink-2); font-weight:500}
+
+/* ---- sections ---- */
+section{margin-bottom:64px; scroll-margin-top:20px}
+.sec-head{display:flex; align-items:baseline; gap:14px; margin-bottom:8px;
+  padding-bottom:12px; border-bottom:2px solid var(--ink)}
+.sec-n{font-family:"IBM Plex Mono",monospace; font-size:13px; font-weight:600;
+  color:var(--accent); letter-spacing:.04em}
+h2{font-size:26px; font-weight:600; margin:0; letter-spacing:-.012em; text-wrap:balance}
+h3{font-size:18px; font-weight:600; margin:36px 0 12px; letter-spacing:-.008em}
+p{margin:0 0 16px; max-width:68ch}
+ul,ol{max-width:68ch; padding-left:22px; margin:0 0 16px}
+li{margin-bottom:9px}
+strong{font-weight:600}
+a{color:var(--accent); text-decoration-thickness:1px; text-underline-offset:2px}
+
+/* ---- evidence tags: the doc's core structural device ---- */
+.ev{display:inline-flex; align-items:center; gap:5px; font-family:"IBM Plex Mono",monospace;
+  font-size:10.5px; font-weight:500; letter-spacing:.06em; padding:2px 7px;
+  border-radius:3px; vertical-align:2px; white-space:nowrap}
+.ev-m{background:var(--good-wash); color:var(--good)}
+.ev-d{background:var(--warn-wash); color:var(--warn)}
+.ev-q{background:var(--critical-wash); color:var(--critical)}
+.ev-legend{display:flex; flex-wrap:wrap; gap:18px; padding:16px 18px; background:var(--surface-2);
+  border-radius:6px; font-size:13.5px; color:var(--ink-2); margin-bottom:40px}
+
+/* ---- callouts ---- */
+.callout{border-left:3px solid var(--accent); background:var(--surface);
+  padding:18px 22px; border-radius:0 6px 6px 0; margin:0 0 22px; box-shadow:var(--shadow)}
+.callout.bad{border-left-color:var(--critical)}
+.callout.warnc{border-left-color:var(--warn)}
+.callout h4{margin:0 0 8px; font-size:15.5px; font-weight:600}
+.callout p:last-child{margin-bottom:0}
+
+/* ---- tables ---- */
+.tscroll{overflow-x:auto; margin:0 0 22px; border:1px solid var(--line); border-radius:6px;
+  background:var(--surface)}
+table{border-collapse:collapse; width:100%; font-size:14px; min-width:520px}
+th,td{padding:11px 14px; text-align:left; border-bottom:1px solid var(--line); vertical-align:top}
+thead th{background:var(--surface-2); font-weight:600; font-size:12px; letter-spacing:.05em;
+  text-transform:uppercase; color:var(--muted); white-space:nowrap}
+tbody tr:last-child td{border-bottom:none}
+td.n,th.n{text-align:right; font-family:"IBM Plex Mono",monospace; font-variant-numeric:tabular-nums;
+  white-space:nowrap}
+tr.hl td{background:var(--accent-wash)}
+tr.dim td{color:var(--muted)}
+
+/* ---- pills ---- */
+.pill{display:inline-block; font-size:11.5px; font-weight:600; padding:2px 9px;
+  border-radius:99px; white-space:nowrap; font-family:"IBM Plex Sans","Noto Sans SC",sans-serif}
+.p-good{background:var(--good-wash); color:var(--good)}
+.p-warn{background:var(--warn-wash); color:var(--warn)}
+.p-bad{background:var(--critical-wash); color:var(--critical)}
+
+/* ---- bar chart (single series, magnitude) ---- */
+.bars{margin:0 0 8px; display:flex; flex-direction:column; gap:10px}
+.bar-row{display:grid; grid-template-columns:minmax(130px,180px) 1fr auto; gap:14px; align-items:center}
+.bar-lab{font-family:"IBM Plex Mono",monospace; font-size:12.5px; color:var(--ink-2);
+  overflow-wrap:anywhere}
+.bar-track{background:var(--surface-2); border-radius:4px; height:22px; position:relative}
+.bar-fill{background:var(--accent); height:100%; border-radius:0 4px 4px 0; min-width:3px}
+.bar-fill.muted{background:var(--muted)}
+.bar-fill.crit{background:var(--critical)}
+.bar-val{font-family:"IBM Plex Mono",monospace; font-size:12.5px; font-variant-numeric:tabular-nums;
+  color:var(--ink); white-space:nowrap}
+figure{margin:0 0 24px}
+figcaption{font-size:13px; color:var(--muted); margin-top:12px; max-width:68ch}
+
+/* ---- phase blocks ---- */
+.phase{background:var(--surface); border:1px solid var(--line); border-radius:8px;
+  padding:22px 24px; margin-bottom:18px; box-shadow:var(--shadow)}
+.phase-top{display:flex; flex-wrap:wrap; align-items:center; gap:12px; margin-bottom:6px}
+.phase-id{font-family:"IBM Plex Mono",monospace; font-size:12px; font-weight:600;
+  background:var(--ink); color:var(--paper); padding:3px 9px; border-radius:4px}
+.phase h3{margin:0; font-size:18px}
+.phase .gate{font-size:12px; color:var(--muted); font-family:"IBM Plex Mono",monospace}
+.phase ul{margin-top:12px; margin-bottom:0}
+
+/* ---- kv grid ---- */
+.kv{display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:1px;
+  background:var(--line); border:1px solid var(--line); border-radius:6px; overflow:hidden; margin-bottom:22px}
+.kv > div{background:var(--surface); padding:14px 16px}
+.kv dt{font-size:11.5px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted);
+  margin:0 0 5px; font-weight:500}
+.kv dd{margin:0; font-family:"IBM Plex Mono",monospace; font-size:15px; font-weight:500;
+  font-variant-numeric:tabular-nums}
+
+footer{border-top:1px solid var(--line); padding-top:24px; font-size:13px; color:var(--muted)}
+@media (max-width:560px){
+  .bar-row{grid-template-columns:1fr auto; }
+  .bar-track{grid-column:1 / -1; order:3}
+}
+</style>
+<div class="wrap">
+
+<header class="mast">
+  <p class="eyebrow">Primus-Turbo · gfx1250 · 优化进展</p>
+  <h1>把注意力从 129 做到 316 TFLOP/s</h1>
+  <p class="standfirst">
+    这份文档记录 MI455X 上 Llama-3.1-8B BF16 注意力内核的优化实况：做到哪一步了、
+    每一步的依据是什么、哪些假设被实测推翻了、现在在跑什么、接下来做什么。
+    配套的背景和计划在 <a href="index.html">index.html</a>。
+  </p>
+  <div class="mast-meta">
+    <span><b>形状</b> b=4 s=8192 hq=32 hkv=8 d=128 bf16 causal</span>
+    <span><b>卡</b> gfx1250，VR 限频 1100 MHz</span>
+    <span><b>算力上限</b> 实测 1002.7 TFLOP/s</span>
+  </div>
+</header>
+
+<div class="ev-legend">
+  <span><span class="ev ev-m">实测</span> 有数据文件可查</span>
+  <span><span class="ev ev-d">推导</span> 由实测算出</span>
+  <span><span class="ev ev-q">存疑</span> 尚未定论</span>
+</div>
+
+<section>
+  <div class="sec-head"><span class="sec-n">01</span><h2>结果</h2></div>
+
+  <div class="kv">
+    <div><dt>起点（出厂配置）</dt><dd>59.642 ms</dd></div>
+    <div><dt>现在（树内）</dt><dd>24.349 ms</dd></div>
+    <div><dt>提升</dt><dd>2.45×</dd></div>
+    <div><dt>等效算力</dt><dd>316.1 TFLOP/s</dd></div>
+  </div>
+
+  <figure>
+    <div class="bars">
+      <div class="bar-row"><span class="bar-lab">纯 aiter 冠军（参考上界）</span>
+        <span class="bar-track"><span class="bar-fill" style="width:36.3%"></span></span>
+        <span class="bar-val">21.67 ms · 355 TF</span></div>
+      <div class="bar-row"><span class="bar-lab">树内 vendored（已提交）</span>
+        <span class="bar-track"><span class="bar-fill" style="width:40.8%"></span></span>
+        <span class="bar-val">24.35 ms · 316 TF</span></div>
+      <div class="bar-row"><span class="bar-lab">torch flex（对照锚点）</span>
+        <span class="bar-track"><span class="bar-fill muted" style="width:52.5%"></span></span>
+        <span class="bar-val">31.34 ms · 246 TF</span></div>
+      <div class="bar-row"><span class="bar-lab">turbo 仅配置调优</span>
+        <span class="bar-track"><span class="bar-fill muted" style="width:61.0%"></span></span>
+        <span class="bar-val">36.41 ms · 211 TF</span></div>
+      <div class="bar-row"><span class="bar-lab">turbo 出厂（起点）</span>
+        <span class="bar-track"><span class="bar-fill crit" style="width:100%"></span></span>
+        <span class="bar-val">59.64 ms · 129 TF</span></div>
+    </div>
+    <figcaption>
+      一次前向+反向，越短越好。<span class="ev ev-m">实测</span>
+      所有条目都通过了四张量 SQNR 门（out/dq/dk/dv 对 fp32 参考，阈值 50 dB）。
+      <strong>对 flex 快 1.29×</strong>，对起点快 <strong>2.45×</strong>。
+    </figcaption>
+  </figure>
+
+  <div class="callout">
+    <h4>关于 316.1 这个数字</h4>
+    <p>
+      这正是最初问到的那个历史数值。需要说明的是：那个历史数在当前 aiter 上<strong>复现不出来</strong>
+      （上游改过反向配置，实测只有 247）。现在这个 316.1 是<strong>重新做出来的</strong>——
+      在 Primus-Turbo 自己的前向驱动下、树内、同会话对实测锚点比较、可复现（5 次重复离散度 0.87%）。
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-n">02</span><h2>优化历程：三次假设被推翻</h2></div>
+  <p>
+    这条路上真正有价值的不是找到的配置，而是<strong>被实测推翻的假设</strong>——
+    每一次推翻都把方向修正了一次。
+  </p>
+
+  <h3>第一步：配置调优（59.6 → 36.4，1.66×）</h3>
+  <p>
+    内核的 <code>@triton.autotune</code> 列表里<strong>只有一个配置</strong>，而且是从 CDNA
+    （wave64 / MFMA / 64KB LDS）原样继承的——gfx1250 是 wave32 / WMMA / 320KB LDS。
+    <code>num_warps=4</code> 在这里是 128 条通道不是 256，<code>num_stages=1</code> 意味着
+    <strong>完全没有软件流水</strong>，而这块芯片的招牌特性就是异步数据搬运。
+  </p>
+  <p>
+    两个整数：前向 <code>num_stages</code> 1→2（单项 <strong>2.4–2.6×</strong>）、
+    反向 <code>num_warps</code> 4→2（<strong>1.54×</strong>）。数值精度逐位不变。
+  </p>
+
+  <h3>第二步：假设「非对称 tile」—— 被推翻</h3>
+  <p>
+    aiter 的反向用非对称 tile（32×128），turbo 用对称的 64×64，而且 turbo 的
+    <code>BLOCK_M</code> 被一个跨内核的 ABI 绑死了。于是做了解耦，让 tile 可自由设置。
+    结果：
+  </p>
+  <div class="tscroll">
+  <table>
+    <thead><tr><th>tile</th><th class="n">反向 ms</th><th class="n">对比 64×64</th></tr></thead>
+    <tbody>
+      <tr class="hl"><td><b>64×64</b></td><td class="n"><b>32.447</b></td><td class="n">基准</td></tr>
+      <tr><td>32×64</td><td class="n">35.545</td><td class="n">+10%</td></tr>
+      <tr><td>128×64</td><td class="n">43.719</td><td class="n">+35%</td></tr>
+      <tr class="dim"><td>32×128（aiter 的）</td><td class="n">51.563</td><td class="n">+59%</td></tr>
+      <tr class="dim"><td>32×256</td><td class="n">125.998</td><td class="n">+288%</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>
+    <strong>64×64 本来就是最优，而 aiter 自己的 tile 在 turbo 内核里慢 59%。</strong>
+    假设被彻底推翻。
+  </p>
+
+  <h3>第三步：profiler 定位真因 —— 内核融合</h3>
+  <div class="tscroll">
+  <table>
+    <thead><tr><th>实现</th><th>结构</th><th class="n">反向</th></tr></thead>
+    <tbody>
+      <tr><td>turbo</td><td><b>两个内核</b>：dkdv 18.96 + dq 11.26</td><td class="n">30.6 ms</td></tr>
+      <tr class="hl"><td>aiter</td><td><b>一个融合内核</b></td><td class="n">27.7 ms</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="callout">
+    <h4>核心洞察：tile 偏好是内核结构的属性，不是形状的属性</h4>
+    <p>
+      同一个方向（把 K 轴 tile 放大到 256），在 turbo 的<strong>非融合</strong>内核里是灾难
+      （126 ms），在 aiter 的<strong>融合</strong>内核里是<strong>胜负手</strong>（反向 1.26×）。
+      两个方向都被实测证明了。
+    </p>
+    <p>
+      所以结论不是「换个参数」，而是<strong>必须换结构</strong>——这也是最终决定 vendor
+      融合内核的依据，是 1.75× 的实测差距，不是论证。
+    </p>
+  </div>
+
+  <h3>第四步：找到真正的杠杆（和预期的不一样）</h3>
+  <p>
+    原本预期杠杆是 <code>BLOCK_M1</code>（因为 flex 和 aiter 的配置只差这一项）。
+    <strong>M1 几乎无关</strong>。真正的两个杠杆是：
+  </p>
+  <div class="tscroll">
+  <table>
+    <thead><tr><th>杠杆</th><th>改动</th><th class="n">反向收益</th></tr></thead>
+    <tbody>
+      <tr><td><code>BLOCK_N1</code> / <code>BLOCK_M2</code>（K 轴 tile）</td><td>128 → 256</td><td class="n"><b>1.26×</b></td></tr>
+      <tr><td><code>BLK_SLICE_FACTOR</code></td><td>2 → 1</td><td class="n"><b>1.20×</b></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>合起来反向 27.85 → 18.42 ms，<strong>1.51×</strong>。</p>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-n">03</span><h2>方法论：抓到的两次「静默失效」</h2></div>
+  <p>
+    这一节是整个过程里最该被记住的部分——两次差点把错误结论写进报告。
+  </p>
+
+  <div class="callout bad">
+    <h4>一、又快又错的配置</h4>
+    <p>
+      某个配置返回 <code>out 53.67 dB ✓、dq 52.24 dB ✓、dk −inf ✗、dv −inf ✗</code>——
+      <strong>输出和 dq 完全正常，dk/dv 被毁掉</strong>。只看输出的检查会直接放过它。
+    </p>
+    <p>
+      同类陷阱还有：反向的启动 grid 由 <code>BLOCK_N1</code> 决定，而<strong>同一个 grid</strong>
+      也喂给按 <code>BLOCK_M2</code> 切分的 dq 那一半。破坏配对会让 dq 只覆盖部分 query 行——
+      <strong>测出来更快</strong>。现在这个配对在调度前就被断言拦下。
+    </p>
+    <p><strong>规则：正确性门必须分别覆盖四个张量。关键不是阈值，是覆盖面。</strong></p>
+  </div>
+
+  <div class="callout bad">
+    <h4>二、覆盖没生效，而我自己的断言放过了它</h4>
+    <p>
+      一轮 sweep 的六个配置结果只差 <strong>0.6%</strong>——这正是「覆盖没生效」的特征。
+      原因：配置函数在一个模块里，但调用方在导入时做了
+      <code>from … import _get_config</code>，<strong>把名字绑进了自己的模块</strong>。
+      patch 源模块后，<code>_get_config()</code> 老老实实返回新值，<strong>launch 用的还是旧值</strong>。
+    </p>
+    <p>
+      我的断言验证的是「配置源返回了我要的值」，<strong>而不是「内核确实用这个值跑了」</strong>。
+      两者在任何持有独立引用的地方就会分叉。
+    </p>
+    <p>
+      定案靠的是<strong>内核名字</strong>——aiter 把 tile 尺寸编进了 kernel name：
+      <code>bwd_kernel_causal_BLOCK_M1_32_BLOCK_N1_256_…</code>。
+      <strong>规则：在 launch 处验证，不在源头验证。</strong>
+      那一轮的十二次测量作废重跑，重跑后才出现了真正的突破。
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-n">04</span><h2>正在跑的</h2></div>
+  <p>
+    一个可跑数小时、断点续跑的无人值守队列，外加每 30 分钟的守护任务——
+    <strong>GPU 空闲被当作故障状态处理</strong>，自动投下一批。
+  </p>
+  <div class="tscroll">
+  <table>
+    <thead><tr><th>批次</th><th>在测什么</th><th>为什么</th></tr></thead>
+    <tbody>
+      <tr><td>shape gate 网格</td><td>vendored 版本 × N1∈{32,64,128,256} × 4 种形状</td><td>接 dispatcher 必须的门控表</td></tr>
+      <tr><td>N1 × BLK_SLICE 交互</td><td>两个杠杆是否独立</td><td>决定配置表要几维</td></tr>
+      <tr><td>400 次确定性复验</td><td>vendored 路径逐位一致性</td><td>ship 前的硬门槛</td></tr>
+      <tr><td>前向深挖</td><td>num_stages × num_warps 网格</td><td>turbo 4.15 vs aiter 3.26 的差距</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>已经出来的关键数据：shape gate 的交叉点</h3>
+  <div class="tscroll">
+  <table>
+    <thead><tr><th>形状</th><th class="n">N1=64</th><th class="n">N1=128</th><th class="n">N1=256</th><th>最优</th></tr></thead>
+    <tbody>
+      <tr><td>b1 s1024（小）</td><td class="n"><b>0.759</b></td><td class="n">0.911</td><td class="n">1.437</td><td><span class="pill p-warn">N1=64</span></td></tr>
+      <tr><td>b4 s4096</td><td class="n">12.644</td><td class="n">8.386</td><td class="n"><b>6.818</b></td><td><span class="pill p-good">N1=256</span></td></tr>
+      <tr><td>b4 s8192（生产）</td><td class="n">48.801</td><td class="n">30.455</td><td class="n"><b>21.691</b></td><td><span class="pill p-good">N1=256</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>
+    <span class="ev ev-m">实测</span> 交叉点很干净且单调：<strong>短序列要小 tile，长序列要大 tile</strong>。
+    这直接给出了门控规则——<strong>冠军配置不能无条件设为默认</strong>，
+    在 b=1 s=1024 上它是 0.69×（N1=256 时只剩 4 个 K block，大 tile 全是浪费）。
+  </p>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-n">05</span><h2>下一步规划</h2></div>
+  <ol>
+    <li><strong>接 dispatcher（带 shape gate）</strong>。用上表的交叉点做门控，补 gfx1250 测试。
+      这是让成果真正生效的一步——目前还要靠环境变量。</li>
+    <li><strong>再跑一次 bake-off</strong>。vendor 之后必须重测，不能假设移植保持了性能。
+      <span class="ev ev-m">已做</span> 树内 316.1 已验证。</li>
+    <li><strong>补前向的 0.9 ms</strong>。turbo 4.15 vs aiter 3.26，两个都是 Triton 前向。
+      配置已扫遍（num_stages 2/3/4、num_warps 1/2/4/8、PRE_LOAD_V 都不动），
+      说明是<strong>结构差异</strong>，可能也要 vendor 前向。</li>
+    <li><strong>查 vendored 与纯 aiter 的 1.8 ms 差</strong>（反向 20.2 vs 18.4）。
+      怀疑是 packed LSE 的 gather 开销——Primus-Turbo 的前向写的是
+      <code>[B,Hq,2*Sq]</code> 交错布局，融合内核要的是稠密 <code>[B,Hq,Sq]</code>。</li>
+    <li><strong>HipKittens udna1 路线</strong>。仓库里<strong>已经有完整的 gfx1250 移植</strong>
+      （<code>3rdparty/hipkittens/include/udna1/</code>，72 个头文件，WMMA 16×16×32、TDM 描述符、
+      split wait counter 都接好了），只差 attention 内核。这是 Triton 撞到天花板后的现成地基。</li>
+  </ol>
+
+  <div class="callout warnc">
+    <h4>两个不是代码能解决的阻塞项</h4>
+    <p>
+      <strong>① VR 限频</strong>，值约 <strong>1.65×</strong>。重启没有解除，
+      <code>MAX_CLK</code> 仍是 1100 MHz（这张卡 9/04 还能跑 1699 MHz）。
+      本页所有绝对数字都在限频态下。
+    </p>
+    <p>
+      <strong>② 缺失的 gfx1250 BLAS</strong>，值约 <strong>37×</strong>。
+      稠密 GEMM 只有 27.4 TFLOP/s，而<strong>同一张卡同一次会话</strong>里注意力内核跑到 316——
+      <strong>稠密 GEMM 比 flash-attention 慢 8 倍，方向是反的</strong>。
+      hipBLASLt 的 gfx1250 库在镜像里根本不存在。这导致<strong>端到端测不出 attention</strong>
+      （attention 只占一个 step 的 1%），两个后端的 tps 差 0.4%。
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head"><span class="sec-n">06</span><h2>已提交</h2></div>
+  <div class="tscroll">
+  <table>
+    <thead><tr><th>commit</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr class="hl"><td><code>1cb2e183</code></td><td>vendor 融合反向内核 —— <b>316 TFLOP/s</b></td></tr>
+      <tr><td><code>5eba2cf4</code></td><td>dk/dv tile 与 LSE ABI 解耦（逐位验证中性）</td></tr>
+      <tr><td><code>49257416</code></td><td>逐位确定性模式（0.47 s/次，比原设计快 64×）</td></tr>
+      <tr><td><code>df20f1d6</code></td><td>修反向 autotune key list</td></tr>
+      <tr><td><code>f8c45dee</code></td><td>dispatch 修复 + 调优开关；36 个测试在 gfx1250 上能跑了</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>
+    完整决策记录在 <code>output/0913__opt_plan__claude/phase2/DECISIONS.md</code>，
+    每条都写了依据和「什么情况下会推翻它」。
+  </p>
+</section>
+
+<footer>
+  <p>
+    形状 b=4 s=8192 hq=32 hkv=8 d=128 bf16 causal，每次调用 7.697 TFLOP，一个训练 step 32 次。
+    所有性能数字在 VR 限频态（1100 MHz）下测得；限频解除后预计整体按 ~1.65× 缩放。
+    正确性一律对 fp32 参考按 (batch, q-head) 分块全量计算，四张量分别门控。
+  </p>
+</footer>
+
+</div>

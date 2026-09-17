@@ -1,0 +1,15 @@
+[runjob] launched key=survey2 pid=1625534
+W0914 02:37:03.218564   11757 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.000269 sec
+W0914 02:37:03.218709   11757 simple_timer.cpp:55] [rocprofv3] 'python op/benchmark.py --impl /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/001/op --shape b4_s8192_hq32_hkv8_d128 --iters 10 --warmup-s 1.0' ::     0.000000 sec
+W0914 02:37:04.115203   11757 tool.cpp:3082] HSA version 1.21.0 initialized (instance=0)
+W0914 02:37:04.747788   12092 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.000226 sec
+W0914 02:37:04.747916   12092 simple_timer.cpp:55] [rocprofv3] '/bin/sh /sbin/ldconfig -p' ::     0.000000 sec
+[bench] impl=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/001/op shape=b4_s8192_hq32_hkv8_d128
+[bench]   statistic=median iters=10 warmup_s=1.0
+[bench]   fwd_ms=5.0332 fwd_tflops=436.95 fwd_gbps=133.3 fwd_spread_pct=8.21
+[bench]   bwd_ms=10.0124 bwd_tflops=549.14 bwd_gbps=134.1 bwd_spread_pct=2.23
+[bench]   fwd_min_ms=4.8392 fwd_max_ms=5.2523 bwd_min_ms=9.9785 bwd_max_ms=10.2023
+[bench]   total_ms=15.0456 peak_mem_gib=1.27
+[bench]   fingerprint={"onekernel": {"BLK_SLICE_FACTOR": 1, "BLOCK_M1": 32, "BLOCK_M2": 256, "BLOCK_N1": 256, "BLOCK_N2": 32, "matrix_instr_nonkdim": 16, "num_ctas": 1, "num_stages": 1, "num_warps": 4, "waves_per_eu": 1}, "sha256": {"attention_kernel.py": "98225ba81917185f", "fused_mha_bwd_kernel.py": "35473f68bcccd859"}, "tile_for_8192": 256}
+W0914 02:37:07.921804   11757 simple_timer.cpp:55] [rocprofv3] output generation ::     0.006319 sec
+W0914 02:37:07.923235   11757 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.007791 sec

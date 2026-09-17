@@ -1,0 +1,6 @@
+TIME base   bwd_ms=8.6924 fwd_ms=4.9802 tf=632.5 spread=0.44%
+TIME A      bwd_ms=9.3504 fwd_ms=4.9717 tf=588.0 spread=0.46%
+TIME B      bwd_ms=9.2883 fwd_ms=4.9708 tf=592.0 spread=0.82%
+TIME B      bwd_ms=9.3159 fwd_ms=4.9635 tf=590.2 spread=0.62%
+TIME A      bwd_ms=9.3427 fwd_ms=4.9791 tf=588.5 spread=0.98%
+TIME base   bwd_ms=8.6899 fwd_ms=4.9574 tf=632.7 spread=0.36%

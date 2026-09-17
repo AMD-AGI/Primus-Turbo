@@ -1,0 +1,21 @@
+--- rounds/002/scratch/tc_arms/2GRAAMQAW7Z3XZP3TRB5TVD6SUMLR2E2M7IZMPZKCZ4TVPKBP7JQ/bwd_kernel_causal.amdgcn
+		.amdhsa_private_segment_fixed_size 1288
+.private_segment_fixed_size: 1288
+.sgpr_spill_count: 68
+.vgpr_count:     1024
+.vgpr_spill_count: 325
+  pk_mul=448 add_nc=124 setmsb=1669 scratch_ld=269 wmma=448
+--- rounds/002/scratch/tc_arms/QOYAJUEMQB4CGDHMOXD7FTE7LPK3I6OYZFWR4UIRHP4VP4FMZT4Q/bwd_kernel_causal.amdgcn
+		.amdhsa_private_segment_fixed_size 1228
+.private_segment_fixed_size: 1228
+.sgpr_spill_count: 64
+.vgpr_count:     1024
+.vgpr_spill_count: 307
+  pk_mul=416 add_nc=126 setmsb=1702 scratch_ld=273 wmma=448
+--- rounds/002/scratch/tc_arms/VXZPKKKHYFMKNWKNDZTCP6KYV2FSO3CB37HGD3UUN7REPYQI7PSQ/bwd_kernel_causal.amdgcn
+		.amdhsa_private_segment_fixed_size 1064
+.private_segment_fixed_size: 1064
+.sgpr_spill_count: 67
+.vgpr_count:     1024
+.vgpr_spill_count: 266
+  pk_mul=448 add_nc=115 setmsb=1666 scratch_ld=265 wmma=448

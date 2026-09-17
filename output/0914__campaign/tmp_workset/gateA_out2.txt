@@ -1,0 +1,7 @@
+STAGE 1: build module (traits + kernel decl)
+STAGE 1 OK -> <function build_flash_attn_dualwave_swp_module.<locals>._launch at 0x7fb676353f60>
+STAGE 2: flyc.compile (MLIR lowering -> ISA)
+ExpandIntegerOperand Op #2: t531: ch = llvm.amdgcn.raw.ptr.buffer.load.lds<(dereferenceable load (s128) from %ir.79, align 1, addrspace 8), (dereferenceable store (s4096) into %ir.118, align 1, addrspace 3)> # D:1 t0, TargetConstant:i64<3418>, t977, t488, TargetConstant:i32<16>, t858, Constant:i32<0>, TargetConstant:i32<0>, TargetConstant:i32<0>
+
+LLVM ERROR: Do not know how to expand this operator's operand!
+timeout: the monitored command dumped core

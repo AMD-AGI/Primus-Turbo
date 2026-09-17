@@ -1,0 +1,34 @@
+:3:rocdevice.cpp            :435 : 320620533270 us:  Initalizing runtime stack, Enumerated GPU agents = 1
+:3:rocdevice.cpp            :182 : 320620533493 us:  Numa selects cpu agent[0]=0x8ceadc0(fine=0x879bba0,coarse=0x87970b0) for gpu agent=0x8dd6900 CPU<->GPU XGMI=1
+:3:comgrctx.cpp             :89  : 320620533511 us:  Loaded COMGR library version 3.3.
+:3:rocdevice.cpp            :1662: 320620533576 us:  addressableNumVGPRs=1024, totalNumVGPRs=1024, vGPRAllocGranule=16, availableRegistersPerCU_=131072
+:3:rocdevice.cpp            :1673: 320620533582 us:  imageSupport=0
+:3:rocdevice.cpp            :1720: 320620533584 us:  Gfx Major/Minor/Stepping: 12/5/0, Device ID: 0x75c1
+:3:rocdevice.cpp            :1721: 320620533585 us:  Using dev kernel arg wa = 1
+:3:rocdevice.cpp            :1723: 320620533585 us:  HMM support: 1, XNACK: 0, Direct host access: 1
+:3:rocdevice.cpp            :1725: 320620533586 us:  Max SDMA Read Mask: 0xffff, Max SDMA Write Mask: 0xffff
+:3:runtime.cpp              :70  : 320620533875 us:  ROCclr version: feb9c98
+:3:hip_context.cpp          :42  : 320620533878 us:  HIP Version: 7.14.60850, Direct Dispatch: 1
+:3:os_posix.cpp             :1024: 320620533882 us:  Runtime Library Path: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_core/lib/libamdhip64.so.7
+:3:hip_device_runtime.cpp   :710 : 320620541067 us:  [32m hipGetDeviceCount ( 0x7ffef58a1b60 ) [0m
+:3:hip_device_runtime.cpp   :712 : 320620541070 us:  hipGetDeviceCount: Returned hipSuccess : 
+:3:hip_device.cpp           :705 : 320620541079 us:  [32m hipGetDevicePropertiesR0600 ( 0x987b8f0, 0 ) [0m
+:3:hip_device.cpp           :707 : 320620541080 us:  hipGetDevicePropertiesR0600: Returned hipSuccess : 
+:3:hip_device_runtime.cpp   :710 : 320620541085 us:  [32m hipGetDeviceCount ( 0x7ffef58a19fc ) [0m
+:3:hip_device_runtime.cpp   :712 : 320620541086 us:  hipGetDeviceCount: Returned hipSuccess : 
+:3:hip_device_runtime.cpp   :710 : 320620541123 us:  [32m hipGetDeviceCount ( 0x7ffef58a1b7c ) [0m
+:3:hip_device_runtime.cpp   :712 : 320620541124 us:  hipGetDeviceCount: Returned hipSuccess : 
+:3:hip_device_runtime.cpp   :694 : 320620541136 us:  [32m hipGetDevice ( 0x7ffef58a17ac ) [0m
+:3:hip_device_runtime.cpp   :706 : 320620541137 us:  hipGetDevice: Returned hipSuccess : 0
+:3:hip_context.cpp          :336 : 320620541369 us:  [32m hipDevicePrimaryCtxGetState ( 0, 0x7ffef58a17c4, 0x7ffef58a17c8 ) [0m
+:3:hip_context.cpp          :350 : 320620541372 us:  hipDevicePrimaryCtxGetState: Returned hipSuccess : 
+:3:hip_device_runtime.cpp   :694 : 320620541373 us:  [32m hipGetDevice ( 0x7ffef58a17ac ) [0m
+:3:hip_device_runtime.cpp   :706 : 320620541374 us:  hipGetDevice: Returned hipSuccess : 0
+:3:hip_context.cpp          :336 : 320620541375 us:  [32m hipDevicePrimaryCtxGetState ( 0, 0x7ffef58a17c4, 0x7ffef58a17c8 ) [0m
+:3:hip_context.cpp          :350 : 320620541376 us:  hipDevicePrimaryCtxGetState: Returned hipSuccess : 
+:3:hip_device_runtime.cpp   :694 : 320620541380 us:  [32m hipGetDevice ( 0x7ffef58a198c ) [0m
+:3:hip_device_runtime.cpp   :706 : 320620541381 us:  hipGetDevice: Returned hipSuccess : 0
+:3:hip_context.cpp          :336 : 320620541382 us:  [32m hipDevicePrimaryCtxGetState ( 0, 0x7ffef58a19a4, 0x7ffef58a19a8 ) [0m
+:3:hip_context.cpp          :350 : 320620541382 us:  hipDevicePrimaryCtxGetState: Returned hipSuccess : 
+HIPINIT 80.4
+:3:runtime.cpp              :114 : 320620674888 us:  Begin runtime teardown

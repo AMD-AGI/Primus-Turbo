@@ -1,0 +1,196 @@
+round: 2
+mode: fast
+candidate: r2.i2.g9
+outcome: delivered
+
+correctness:
+  unit_tests: pass
+  precision: pass
+  checked_with: op/validation.py
+  sqnr_db: 52.04
+  # The MINIMUM over all four tensors and all four gated shapes -- the number the
+  # 50 dB gate actually tests. Per-tensor on the spec shape: out 53.67, dq 52.24,
+  # dk 52.31, dv 52.71. Identical to the incumbent's on every shape to two
+  # decimals: r2.i2.g9 rewrites addressing, not arithmetic. The diagnostic-only
+  # shape sq_gt_skv fails at dq -15.95 dB; pre-existing seed defect, documented
+  # in op/ut/shapes.py and PROVENANCE.md, reads identically on rounds/001/op.
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/001/op]
+  # One process per arm (three vendored primus_turbo trees in one process
+  # segfault -- see implementation.build_failures), four processes back to back
+  # in a single docker exec, palindromic cand>inc>inc>cand, GPU[1] verified to
+  # hold exactly one process throughout. The incumbent re-measured 633.1 TF/s
+  # here against the 633.2 round 1 reported -- 0.02% apart.
+  shapes:
+    - name: b4_s8192_hq32_hkv8_d128
+      this_round_tflops: 591.6
+      best_round_tflops: 633.1
+      target_tflops: 706.0
+      champion_round: 1
+      champion_tflops: 633.1
+      champion_rebuilt: true
+      ratio: 0.8380
+      vs_champion: 0.9345
+  score: 0.8380
+
+validation:
+  exit_code: 1
+  # My own run against rounds/002/op: correctness passes all four gated shapes,
+  # backward 9.3013 ms = 1.254x op/beat/ against the required 1.50x. My separate
+  # session read the same build at 9.3021 ms -- 0.01% apart, nothing to reconcile.
+
+explored:
+  ran:
+    - "static .amdgcn census of the shipped build from the Triton cache (changed the decision: it is where vgpr_spill_count 266 / 1064 B-per-lane comes from, and the calibration against round 0's 326 / 1308)"
+    - "ISA loop-region map by backward-branch analysis, with a per-region instruction census (changed the decision decisively: ALL 265 scratch loads are in the dk/dv pass and the dq pass has ZERO, which is the first statement in this job about which half of the kernel to attack; it also answers r1.i6.g6, which round 1 left open after rocprofv3 recorded zero dispatches)"
+    - "instruction histogram of one unmasked dk/dv iteration (changed the decision: 363 s_set_vgpr_msb vs 128 wmma -- 37% of the loop body is register-pressure overhead, 9.1% is matrix work -- which is what selected both arms)"
+    - "TTGIR scf.for iter_args inspection (changed the decision twice: killed the dk_pe/dq_pe dead-alias candidate for free before it was proposed, and identified the loop-carried pointer tensors that became arm B)"
+    - "in-process config sweep, BLK_SLICE_FACTOR and BLOCK_M1/BLOCK_N2 decoupled (changed the decision: killed pool item r1.i5.g5 at +2.3% and closed a newly-available degree of freedom -- _check_block_invariant's BLOCK_M1==BLOCK_N2 rule is over-strict, and every point in the freed direction loses)"
+    - "op/benchmark.py palindromic multi-arm session, one process per arm (the round's measurement; also established the 0.03-0.08% session floor)"
+    - "null-arm control: a byte-identical copy of the incumbent directory, measured in the same session shape (changed the decision: it read 8.686 vs 8.691, proving both arms' ~7% losses were the edits and not the harness -- two independent edits losing by the same amount demanded that check)"
+    - "census_gate.py on BLOCK_N1=128 (route row 1; changed the decision decisively -- zero spills and 20-33% slower FALSIFIED this round's own spill-count law across tiles and killed route row 2 before it was built)"
+    - "rocprofv3 --stats: NOT re-run. Round 1 established it records zero dispatches on this part and the counter surface is 13/51 non-zero with no byte counter at any level. The .amdgcn replaced it and cost nothing."
+  consulted: []
+  # Empty, and honestly so. route.md named both of this round's rows by id, and the
+  # two arms came from instruments taken on this job's own binary rather than from a
+  # recipe. Flagging it as the risk the schema says it is: round 3 should open the
+  # corpus, because the live direction this round leaves behind -- lower residency at
+  # CONSTANT Q/dO traffic -- is exactly the kind of thing the cross-backend attention
+  # recipes may already answer, and nothing in this job's pool does.
+  bound: compute
+  confidence: medium
+  why: >
+    Refined this round, and the refinement is measured rather than argued. At the
+    shipped tile the kernel is instruction-issue bound: one unmasked dk/dv iteration is
+    1400 instructions of which 128 (9.1%) are v_wmma and 517 (37%) are register-pressure
+    overhead -- 363 s_set_vgpr_msb, 84 v_nop, 77 scratch_load -- which is consistent
+    with 633 TF/s against a 2236-2667 TF/s bf16 GEMM and with 154 GB/s, nowhere near
+    bandwidth. Round 1's `power` is still true underneath (2497-2502 W of a 2500 W cap,
+    GFX clock 29% below max) and is why deleting instructions is the only thing that can
+    pay; it is not the proximate binding constraint on this configuration. The one place
+    memory binds is the TILE CHOICE, not the tile: BLOCK_N1=128 removes the spill
+    entirely (vgpr_spill_count 0, vgpr_count 771) and is still 20-33% slower, because
+    halving the K/V tile doubles Q/dO traffic in the dk/dv pass. Confidence is medium
+    and not high because this part has no byte counter at any level and its entire WMMA
+    FLOP counter family reads exactly 0, so none of this is counter-derived -- it is
+    read off the ISA and off end-to-end times.
+
+arms:
+  - id: r2.i1.g8
+    built: "A alone, from op/current -- fold sm_scale into the exp2 argument's own constant in _bwd_dkdv_inner and _bwd_dq_inner, deleting a full elementwise pass over the fp32 score tile"
+    tflops: {b4_s8192_hq32_hkv8_d128: 587.9}
+    vs_champion: 0.9294
+    shipped: false
+    note: >
+      LOST, 9.3466 ms vs the incumbent's 8.6912 in the same session (+7.5%, against a
+      0.03-0.06% floor). It did exactly what it was designed to do -- v_pk_mul_f32 fell
+      448 -> 416, precisely the 32 targeted -- and paid 41 more spilled VGPRs
+      (266 -> 307) for them, because folding a short-lived value into a longer
+      expression extends the live range of what it was consuming, and at 1024 of 1024
+      VGPRs there is no slack to absorb that.
+  - id: r2.i2.g9
+    built: "B alone, from op/current -- NOT on top of A -- loop-invariant offset tensors plus a scalar row cursor added at the load, replacing the loop-carried tensor<128x32xi32> pointer iter_args"
+    tflops: {b4_s8192_hq32_hkv8_d128: 591.6}
+    vs_champion: 0.9345
+    shipped: true
+    note: >
+      LOST, 9.3021 ms (+7.0%), and it did NOT even get the instruction it was after:
+      v_add went UP, 115 -> 124. Triton's pointer-tensor increment is one add on a
+      value the allocator keeps coalesced; ptr + scalar*stride re-materialises the full
+      address tensor at each load instead. 59 more spills (266 -> 325). Shipped as the
+      best arm, as the rule requires when every arm loses, and left in the working copy.
+  - id: r2.i1.g8+r2.i2.g9
+    built: "NOT BUILT"
+    shipped: false
+    note: >
+      No merge. The rule builds one only when neither arm lost; both lost, and a merge
+      is measured rather than inferred, so building it would have spent the round's GPU
+      budget confirming that two edits costing 41 and 59 spills cost both together.
+  - id: r2.i3.g10
+    built: "route row 1 (must) -- the spill gate, delivered as rounds/002/1-opt/census_gate.py"
+    shipped: false
+    note: >
+      Not an arm with a time; an instrument, and the round's most useful output. It
+      falsified its own premise on the first candidate it was pointed at: BLOCK_N1=128
+      censuses at vgpr_spill_count 0, scratch 0 B/lane, vgpr_count 771, and round 1
+      TIMED it at 11.8-13.3 ms. So the spill law holds only at a FIXED tile -- the four
+      monotone points were all at BLOCK_N1=256 -- and across tiles Q/dO traffic
+      dominates register pressure. Cost: one compile, no timing run.
+  - id: r2.i4.g11
+    built: "route row 2 -- NOT BUILT, gated out by row 1"
+    shipped: false
+    note: >
+      See abandoned.mechanism. Row 1's stated job was to gate rows 2-3 and it did.
+
+expected: >
+  Each arm is worth roughly 2-3% on the backward; neither reaches the 11.5% still
+  needed for the 1.50x gate; the merge, if both survive, might reach 4-6%. Nothing
+  found this round has gate-sized headroom, because BLOCK_N1 cannot shrink (Q/dO
+  traffic doubles) and num_warps cannot rise (2.36x slower), so the 26%
+  s_set_vgpr_msb overhead and the 266-VGPR spill are structurally locked in at this
+  tile.
+  # Written before the arms were measured. Wrong in sign and right in size: both arms
+  # moved ~7%, not 2-3%, and both moved the wrong way. The clause that held up exactly
+  # is the last one -- and row 1 then showed the reason it gave for BLOCK_N1 is the
+  # reason the whole traffic-for-residency family is closed.
+
+added_to_pool: [r2.i3.g10, r2.i4.g11]
+route_updated: true
+
+implementation:
+  files_changed:
+    - op/vendor/primus_turbo/triton/attention/fused_mha_bwd_kernel.py
+  build_failures:
+    - attempt: 1
+      error: "rc 139, SIGSEGV, no traceback, at the first attention() call with all three arms' impl dirs loaded"
+      root_cause: >
+        Three vendored primus_turbo trees in ONE process. impl.py makes the opaque-type
+        registration idempotent and round 1 moved the forward to primus_turbo_opevolve::,
+        but that namespace is shared by every copy, so the third torch.library fragment
+        on the same OperatorEntry takes the process down. validation.py never hits it
+        because only one of its three arms carries a vendored tree (beat is
+        flex_attention). Fix: one arm per process; arms share a SESSION, back to back
+        and palindromic, inside one docker exec. The base slots then came back 0.03-0.06%
+        apart, tighter than round 1 achieved in-process.
+    - attempt: 2
+      error: "no matching matrix core intrinsic for wmma version 3 with instruction shape [0, 0, 128] and element types A='bf16', B='bf16', C='f32', at tl.dot(k, qT) and tl.dot(v, tl.trans(do))"
+      root_cause: >
+        BLOCK_M1=16 with BLK_SLICE_FACTOR=2 gives MASK_BLOCK_M1=8, and the wmma is
+        16x16x32 with no fragment below it. BLOCK_M < 16 is illegal on this arch. It
+        still COMPILES and RUNS, at 39.45 ms and 81.9 dB -- so the diagnostic must not
+        be read as "correct but slow". Sweep point discarded.
+    - attempt: 3
+      error: "TypeError: unsupported operand type(s) for +: 'int' and 'tuple' in triton.cdiv"
+      root_cause: >
+        census_gate.py's tile override returned a 2-tuple; fused_backward_tile returns a
+        SCALAR BLOCK_N1 which dense_fused_backward assigns to both BLOCK_N1 and BLOCK_M2.
+        One-line fix, in the instrument rather than in the kernel.
+
+abandoned:
+  # Present for route row 2 only. The ROUND's outcome is `delivered` -- r2.i2.g9 was
+  # built, measured and left in the working copy. This records the row that was not
+  # built, because its mechanism is the largest thing the round produced.
+  mechanism: >
+    In the dk/dv pass, do not buy register residency with Q/dO traffic -- the exchange
+    rate is already measured and it is bad. Halving BLOCK_N1 to 128 halves every
+    resident tile and removes the spill ENTIRELY (vgpr_spill_count 0, scratch 0 B/lane,
+    vgpr_count 771 so not even an s_set_vgpr_msb tax), and it is still 20-33% SLOWER
+    than the 266-spill incumbent, because every Q and dO block is then read by twice as
+    many K/V blocks. Route row 2 (split HEAD_DIM so dk/dv halve) pays exactly that
+    traffic and buys LESS: HEAD_DIM is the free axis of dk and dv but the CONTRACTION
+    axis of qkT = dot(k, qT) and dpT = dot(v, trans(do)), so k and v stay fully resident
+    and the real accounting is 768 -> 512, not the 768 -> 384 the route claimed -- plus
+    +50% wmma from recomputing qkT and dpT in each half-pass. BLOCK_N1=128 is a strictly
+    better version of the same bet and it loses, so row 2 is dominated by an
+    already-measured point. This also kills r1.i7.g7 in its "re-read K/V from LDS" form
+    and the whole "recompute instead of keeping a tile live" family that r1.i4.g4 kept
+    generating. The remaining live direction is anything that lowers residency at
+    CONSTANT Q/dO traffic -- inside one pass over the m-loop, not by running it twice.
+  evidence:
+    - "rounds/002/1-opt/raw/gate_tile128.txt: BLOCK_N1=BLOCK_M2=128 -> vgpr_count=771 vgpr_spill_count=0 sgpr_spill_count=0 scratch_B_per_lane=0 scratch_load=0"
+    - "rounds/001/1-opt/opt.md: the same tile-128 configuration measures 11.8-13.3 ms against the incumbent's 8.69 ms"
+    - "rounds/002/1-opt/raw/census_arms.txt: base 266 spills / 8.691 ms, armA 307 / 9.347, armB 325 / 9.302 -- all at BLOCK_N1=256, which is why the law looked monotone"
+    - "fused_mha_bwd_kernel.py:_bwd_dkdv_inner -- qkT = tl.dot(k, qT) and dpT = tl.dot(v, tl.trans(do)) both contract over HEAD_DIM, so a half-pass holding only k[:, :64] cannot form qkT at all"
+  stage: look

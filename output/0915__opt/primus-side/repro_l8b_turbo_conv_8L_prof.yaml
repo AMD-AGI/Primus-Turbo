@@ -1,0 +1,106 @@
+work_group: ${PRIMUS_TEAM:amd}
+user_name: ${PRIMUS_USER:root}
+exp_name: ${PRIMUS_EXP_NAME:l8b_8L_prof}
+workspace: /home/lihuzhan/_dbg_l8b/output
+
+modules:
+  pre_trainer:
+    framework: torchtitan
+    config: pre_trainer.yaml
+
+    # model to run
+    model: llama3.1_8B.yaml
+    overrides:
+      sink_level: null
+      file_sink_level: DEBUG
+      stderr_sink_level: INFO
+
+      model:
+        # 截图里 MI455X 的 FA path 是 Triton flex。
+        # 8B_flex 与 8B 参数逐项相同，只多了 attn_type=flex / attn_mask_type=block_causal。
+        # 不能用默认的 8B：其 attn_type=sdpa，而 ScaledDotProductAttentionWrapper 的后端顺序是
+        # CUDNN -> FLASH -> MATH，前两者在 gfx1250 上不可用，回退 MATH 会物化
+        # [4,32,8192,8192] 的注意力矩阵，显存冲到 442GB 后触发 SIGBUS。
+        flavor: 8B_flex_8L
+        # 本地 tokenizer 资产，避开 gated repo 需要 HF_TOKEN
+        hf_assets_path: /home/lihuzhan/_hfassets/llama31_8B
+        # converter 打开。它才是真正把 attention 换成 TurboAttention 的东西；
+        # use_turbo_attention: true 只替换类，converter 不注册的话那个类永远不会被装上，
+        # 也就是说 converters: [] 时测的根本不是 turbo attention。
+        #
+        # 之前关掉它的理由是 torchtitan 0.2.2 会传 enable_gqa 而 TurboAttention.forward
+        # 不接受该参数 -> TypeError。该参数已在 Primus-Turbo 侧接受（并刻意不转发：
+        # 我们的 kernel 从 nhead_q/nhead_k 原生处理分组，形状已经带了这个信息）。
+        # 不要为了做对照实验把这里改成 []。converters: [] 会让模型退回 torchtitan 原生
+        # Flex Attention，而 FlexAttentionWrapper 内部必须 torch.compile(flex_attention) ——
+        # 下面的 compile.enable: false 管不住它。0915 晚试过一次，进程停在 inductor 的
+        # AUTOTUNE flex_decoding（6 个 triton_flex_decoding 候选）上，卡直接 wedge:
+        # MES(6,0)/(7,0) failed to respond to msg=REMOVE_QUEUE 反复 30 秒，然后
+        # wait for reset ack 停住,需要人工 AC-cycle。一步训练都没跑出来。
+        #
+        # 也就是说 converter 一直在顺带保护这张卡不进 inductor 路径。它不只是一个
+        # "attention 实现开关"；在这台机器上，关掉它等于打开 inductor。
+        # 要测"没有 turbo attention 的基线"，得另找不经过 flex 的办法。
+        converters: ["primus_turbo"]
+
+      # 播种。torchtitan 的 set_determinism 在 world_size==1 且 debug.seed 为 None 时
+      # 直接 return 而不播种，于是每次运行的模型初始化都是新的随机权重 —— 0915 第一轮
+      # 8 层 A/B 的两臂 step-1 loss 是 12.12861 vs 12.31076，五次运行给出五个不同的值。
+      # A/B 的两臂因此至少差三个变量而不是一个。这里只钉种子，不开 deterministic:
+      # 后者会启用确定性算法并降速，那会污染被测量的东西本身。
+      debug:
+        seed: 1234
+
+      # torch profiler。抓 step 5 一步，其余步照常出 tps，所以还能从同一次运行判断
+      # 它落在哪个吞吐模态上 —— profiler 本身有开销，被抓的那一步不能用来读 tps。
+      profiling:
+        enable_profiling: true
+        save_traces_folder: profile_traces
+        profile_freq: 5
+        profiler_active: 1
+
+      metrics:
+        log_freq: 1
+        enable_wandb: false
+
+      lr_scheduler:
+        warmup_steps: 10
+
+      training:
+        # 复现目标：MBS = GBS = 4, seq = 8192, 1 GPU
+        local_batch_size: 4
+        global_batch_size: 4
+        seq_len: 8192
+        mock_data: true
+        steps: 10
+        gc_freq: 100
+        dataloader:
+          num_workers: 1
+          prefetch_factor: 4
+          persistent_workers: true
+          pin_memory: true
+
+      # tp1 / pp1 / cp1，单卡不做 FSDP 分片
+      parallelism:
+        tensor_parallel_degree: 1
+        pipeline_parallel_degree: 1
+        context_parallel_degree: 1
+        data_parallel_shard_degree: 1
+        data_parallel_replicate_degree: 1
+
+      # 截图 MI455X 一栏即 compile.enable=False；
+      # 且本机 inductor 对 TransformerBlock 做 compile 时的 triton autotune
+      # 会触发 hipErrorLaunchFailure 并打死 GPU
+      compile:
+        enable: false
+
+      # AC = none
+      activation_checkpoint:
+        mode: "none"
+        selective_ac_option: "op"
+
+      # converter 的注册只看 enable_primus_turbo，不看 use_turbo_attention
+      primus_turbo:
+        enable_primus_turbo: true
+        enable_attention_float8: false
+        use_turbo_attention: true

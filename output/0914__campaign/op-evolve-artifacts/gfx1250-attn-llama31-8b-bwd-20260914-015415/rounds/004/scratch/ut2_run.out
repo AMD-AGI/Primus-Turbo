@@ -1,0 +1,13 @@
+[runjob] launched key=r4_ut2 pid=4154574
+reference: /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context/op/eager/impl.py (fp32)
+under test: /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/004/op/impl.py
+gate: every tensor >= 50.0 dB
+
+shape                         out       dq       dk       dv  result
+b4_s8192_hq32_hkv8_d128     53.67    52.24    52.31    52.71  PASS
+sq_lt_skv                   53.01    52.50    52.58    52.57  PASS
+min_seqlen                  54.09    52.04    52.08    52.77  PASS
+ragged_tail                 53.99    52.09    52.15    52.75  PASS
+sq_gt_skv                   53.97   -15.95    52.10    52.72  FAIL  (diagnostic, not gated)
+
+PASSED: 4 gated shapes, all four tensors >= 50 dB (1 diagnostic shape(s) reported above, not gated)

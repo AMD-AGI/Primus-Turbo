@@ -1,0 +1,1 @@
+RESULT {"label": "g16stages", "ms": null, "census": {"vgpr": "1024", "spill": "2001", "sspill": "65", "sgpr": "107", "scratchB": "2468", "lds": "0", "wmma": 704, "msb": 2338, "sload": 698, "sstore": 581, "ds": 760, "ninstr": 14694}, "absum": [3694818.5, 1474473.625, 1492202.25]}

@@ -1,0 +1,3 @@
+{"date":"2026-09-14","gpu":0,"host":"this 4-GPU gfx1250 host","sclk_mhz":2356,"impl":"torch-flex","config":"inductor default (bwd num_warps=8)","fwd_ms":6.894,"bwd_ms":30.228,"total_ms":37.122,"total_tflops":207.3,"note":"supersedes: default heuristic, not autotuned"}
+{"date":"2026-09-14","gpu":0,"impl":"torch-flex","config":"max-autotune-no-cudagraphs","fwd_ms":3.704,"bwd_ms":11.566,"total_ms":15.271,"total_tflops":504.0}
+{"date":"2026-09-14","gpu":0,"impl":"torch-flex","config":"kernel_options num_warps=4 (=autotune winner)","fwd_ms":3.727,"bwd_ms":11.535,"total_ms":15.262,"total_tflops":504.3,"sqnr_db":{"out":53.67,"dq":52.23,"dk":52.29,"dv":52.71},"best":true}

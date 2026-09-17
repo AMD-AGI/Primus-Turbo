@@ -1,0 +1,171 @@
+round: 3
+mode: fast
+candidate: r3.i3.g14
+outcome: abandoned
+
+correctness:
+  unit_tests: pass
+  precision: pass
+  checked_with: op/validation.py
+  sqnr_db: 52.24
+  note: >
+    No code was written this round, so this is the incumbent's own correctness, re-measured
+    in this session. op/ut/ holds no pytest tests -- it is the module (ut/correctness.py,
+    ut/shapes.py) that validation.py imports -- so `unit_tests` records validation.py's run
+    of ut/correctness.check_shape across all five shapes. Gated shapes pass: spec shape
+    out/dq/dk/dv = 53.67 / 52.24 / 52.31 / 52.71 dB, and sq_lt_skv, min_seqlen, ragged_tail
+    all pass. sqnr_db is the worst gated tensor on the spec shape. The sq_gt_skv row reads
+    dq -15.95 dB; validation.py reports it as diagnostic and not gated, and it is inherited,
+    not introduced here.
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/001/op]
+  shapes:
+    - name: b4_s8192_hq32_hkv8_d128
+      this_round_tflops: 633.6
+      best_round_tflops: 633.2
+      target_tflops: 706.0
+      champion_round: 1
+      champion_tflops: 633.2
+      champion_rebuilt: true
+      ratio: 0.8975
+      vs_champion: 1.0007
+  score: 0.8975
+  note: >
+    rounds/003/op is BYTE-IDENTICAL to rounds/001/op and to op/current -- nothing was built,
+    so there is no change to leave in the working copy and none was reverted. vs_champion
+    1.0007 is therefore 1.0 by construction, measured rather than assumed: four processes
+    back to back in one session on an idle GPU[1], palindromic (003, 001, 001, 003), spec
+    shape bwd 8.6742 / 8.6869 / 8.6788 / 8.6800 ms. The 0.07% spread between the arms is
+    this harness's floor and is the round's own measurement of it. Raw in raw/final_bench.txt.
+
+validation:
+  exit_code: 1
+
+explored:
+  ran:
+    - "rocprofv3 --pc-sampling-beta-enabled --pc-sampling-method stochastic (route row 1, FAILED TWICE -- see abandoned.mechanism)"
+    - "grep of global/buffer store widths in the shipped bwd_kernel_causal.amdgcn (route row 3 gate -- killed row 3 for one grep)"
+    - "read Triton metadata bwd_kernel_causal.json (unplanned; it falsified a premise round 2 had written into pool.md -- see opt.md s13)"
+  consulted:
+    - INDEX.md
+    - arch/README.md
+    - arch/gfx1250/gfx1250.md
+    - arch/gfx1250/isa.md
+    - arch/gfx1250/profiling-surface.md
+    - optimization/routes/0-kernel-programming-principles.md
+    - optimization/routes/1-metrics-to-techniques.md
+    - optimization/techniques/0-register-pressure-and-occupancy.md
+    - optimization/techniques/2-lds-bank-conflicts.md
+    - optimization/techniques/3-pipelining-and-scheduling.md
+    - optimization/techniques/4-epilogue-and-data-movement.md
+    - ops/attention/backward-dataflow.md
+    - profiling/2-power-wall-analysis.md
+    - pitfalls/compiler-and-toolchain.md
+    - backends/flydsl/attention/README.md
+    - backends/flydsl/attention/dead-ends.md
+    - backends/flydsl/attention/techniques.md
+    - backends/flydsl/attention/recipes/hd128.md
+    - backends/flydsl/attention/recipes/hd64.md
+    - backends/flydsl/writing-and-debugging.md
+    - backends/aiter/attention/README.md
+    - backends/aiter/attention/recipes/fmha_v3_bwd_hd128_bf16.md
+    - backends/hipkittens/README.md
+    - backends/hipkittens/tiles-and-register-control.md
+    - backends/hipkittens/scheduling-patterns.md
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+    - backends/hipkittens/attention/recipes/gqa_d64.md
+    - backends/hipkittens/gemm/recipes/bf16_gfx1250_ladder.md
+  bound: power
+  confidence: medium
+  why: >
+    Not measured on this part this round -- PC sampling was the measurement and it would not
+    run -- so this is an inference from a gfx1250 artefact plus this round's own deletion
+    probe, and `medium` is the honest confidence. The ladder card measures THIS part pinned
+    at 2497-2502 W of a 2500 W cap with the GFX clock held at 1699-1703 MHz against MAX_CLK
+    2400, i.e. 29% below maximum. Under a cap bytes price at full value and cycles at 20-45%,
+    which reprices facts.md's "37% of the dk/dv body is register-pressure overhead": that
+    figure is dominated by 363 s_set_vgpr_msb and 84 v_nop per iteration, both of which
+    switch almost nothing, so it is 6-14% of time rather than 37%. Two independent results
+    this round point the same way and neither is explained by an instruction or spill model:
+    AMDGCN_ANALYZE_SMALL_TENSOR_RANGE=1 compiles the same source at the same tile to 187
+    spills -- the lowest this job has produced, 30% under the incumbent -- and runs 82%
+    SLOWER, and AMDGCN_USE_BUFFER_OPS=0 does the same at 250 spills and +74%. Both change
+    addressing and cost ~12% more instructions for 75-82% more time. `compute` is not
+    excluded and would be distinguished by exactly the measurement that failed.
+
+arms:
+  - id: r3.i1.g12
+    built: "BLOCK_N2 upward (dq loop step), throwaway from op/current, BLOCK_M1==BLOCK_N2 invariant removed"
+    tflops: {b4_s8192_hq32_hkv8_d128: 307.9}
+    vs_champion: 0.486
+    shipped: false
+    note: "BLOCK_N2=64 -> 17.865 ms / 554 spills; =128 -> 24.345 ms / 2822 spills. Premise was that the dq pass has register slack, measured alone; it does not have it inside the fused kernel."
+  - id: r3.i2.g13
+    built: "BLOCK_N1 = BLOCK_M2 above 256, throwaway from op/current via fused_backward_tile()"
+    tflops: {b4_s8192_hq32_hkv8_d128: 93.1}
+    vs_champion: 0.147
+    shipped: false
+    note: "tile 512 -> 59.099 ms / 5704 spills. Tiles 192 and 384 do not compile: Triton block shapes must be powers of two, so there is no point between 256 and 512."
+  - id: r3.i0
+    built: "SKIP_DKDV / SKIP_DQ constexpr deletion probe, throwaway -- free instrument, not a speed arm"
+    tflops: {}
+    vs_champion: null
+    shipped: false
+    note: "dk/dv alone 5.906 ms at 263 spills; dq alone 3.858 ms at vgpr_count 971 with ZERO spills; fused 8.678. Halves sum to 9.764, +12.5% over fused."
+
+expected: >
+  Written before building, from opt.md s6 and s8. For r3.i1.g12: "BLOCK_N2 is the dq pass's
+  loop STEP, the dq pass has register slack that the dk/dv pass does not, so raising it
+  halves the dq loop trips and its per-iteration overhead without growing the dq
+  accumulator, which is sized by BLOCK_M2" -- expecting a few percent, and noting that only
+  one side of this lever had ever been measured. For r3.i2.g13: "tile 128 is 11.8-13.3 ms
+  with ZERO spills and tile 256 is 8.68 ms with 266 spills, so bigger-and-spillier has been
+  winning and nobody has gone up" -- expecting the trend to continue to 384. Both were
+  wrong, and wrong by more than 2x rather than marginally.
+
+added_to_pool: [r3.i3.g14, r3.i4.g15]
+route_updated: true
+
+implementation:
+  files_changed: []
+  build_failures:
+    - attempt: 1
+      error: "ValueError: Shape element 0 must be a power of 2 -- raised from tl.zeros([BLOCK_N1, HEAD_DIM]), reaching tl.dot"
+      root_cause: "BLOCK_N1 = 384. Triton block shapes must be powers of two, so the tile axis is not continuous and there is no point between 256 and 512."
+    - attempt: 2
+      error: "ValueError: Shape element 0 must be a power of 2"
+      root_cause: "BLOCK_N1 = 192, same cause as attempt 1. Two points, same root cause, and the axis was abandoned rather than probed further."
+
+abandoned:
+  mechanism: >
+    Route row 1 was stochastic PC sampling, the corpus's stated replacement for the 38 dead
+    gfx1250 counters and the round's gate on rows 2-3. It does not run on this kernel, and it
+    fails in two different ways depending on the sampling interval, which is what identifies
+    the mechanism rather than a flake. At interval 2048 cycles the GPU takes a page fault
+    inside the sampled process -- "Memory access fault by GPU node-3 ... Reason: Page not
+    present or supervisor privilege", followed by "GPU core dump skipped because PC Sampling
+    active" and SIGABRT in rocprofv3's own signal handler; the tool then hangs in finalisation
+    with "Timeout while waiting for queue sync: 1 kernels still active". At interval 1048576,
+    the coarsest the part accepts, there is no fault at all and instead the process wedges
+    before emitting a single sample: alive for 13 minutes with GPU[1] at 0% utilisation, no
+    CSV written, no output past tool initialisation. So the failure is not the sampling rate
+    and not this kernel's arithmetic -- it is that the PC-sampling interrupt path cannot be
+    unwound for a kernel that is resident at 1024 of 1024 VGPRs with 1064 B/lane of scratch
+    on a single wave per SIMD: sample and it faults on the save area, do not sample and the
+    queue never drains. This is the same family as the already-recorded finding that
+    rocprofv3 --stats --kernel-trace exits 0 with zero dispatches on this benchmark, and it
+    closes the last instrument the corpus offered for this part. Consequence for the route:
+    row 2 (r1.i7.g7) was explicitly gated on this reading byte-bound and must not be opened
+    on an inference, and row 3 (r3.i4.g15) had already died on its own free gate -- the
+    shipped .amdgcn emits 96 buffer_store_b128 and ZERO buffer_store_b64, so the dk/dv
+    epilogue is already at maximum store width and the corpus's +12.09% LDS-staged-epilogue
+    mechanism has nothing here to widen. Both arms the table could reach were therefore
+    unreachable for reasons the table itself specified, and no code was written.
+  evidence:
+    - "raw/pcsample_attempt1.txt -- interval 2048: 'Memory access fault by GPU node-3 (Agent handle: 0xdf4aee0) on address 0x7f9cad2f4000. Reason: Page not present or supervisor privilege.' / 'GPU core dump skipped because PC Sampling active' / 'rocprofv3 caught signal 6' / 'Timeout while waiting for queue sync: 1 kernels still active'"
+    - "raw/pcsample_attempt2.txt -- interval 1048576: no fault, no samples, no CSV; process alive 13 min with GPU[1] at 0% use, output file unmodified since tool initialisation; killed"
+    - "device verified healthy after both attempts: rocm-smi GPU[1] 0% use, no KFD PIDs, and a 4096^3 bf16 matmul returns correctly"
+    - "route row 3 gate, one grep of the shipped bwd_kernel_causal.amdgcn: 96 buffer_store_b128, 0 buffer_store_b64, 160 ds_store_b128, 46 scratch_store_b128, 82 scratch_store_b32"
+  stage: look

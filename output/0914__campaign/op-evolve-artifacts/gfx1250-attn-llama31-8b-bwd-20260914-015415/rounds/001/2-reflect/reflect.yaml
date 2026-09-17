@@ -1,0 +1,42 @@
+round: 1
+mode: fast
+accepted: true
+
+expectation_check:
+  expected: "the merge, if the two are as independent as the sweep suggested, to about 8.70 ms, which is 1.34x beat and still short of the 1.50x gate"
+  measured: "8.683 ms, 633.2 TF/s, 1.340x beat, 1.1529x the incumbent; gate FAILED"
+  held: true
+  reading: >
+    Held on the number and on the verdict -- I predicted the round would not pass and it
+    did not. It did NOT hold on the reason, and that is the part worth carrying: the
+    prediction assumed the two knobs were independent and would compose additively
+    (9.9%), and they composed superadditively (13.2%). The speed stands; the model
+    behind it does not. My story -- both reduce register pressure, so removing one
+    constraint makes the other's saving reachable -- has no measurement behind it, and
+    with rocprofv3 recording zero dispatches this round had no way to get one.
+
+moves:
+  - {id: r1.i2.g2, from: pool, to: facts, reason: "executed round 1 as arm B, shipped in the merge: 9.4248 ms alone (4 runs), 8.683 ms merged", round: 1}
+  - {id: r1.i1.g1, from: pool, to: facts, reason: "executed round 1 as arm A, shipped in the same merge: 9.5873 ms alone (2 runs). Moved because it is now in op/current -- leaving a shipped change in the pool would offer the next round its own code as a candidate", round: 1}
+
+untouched_by_design: [route.md]
+
+bottleneck:
+  changed: true
+  to: "register spill to scratch at 1 wave/SIMD, on a hard power-capped part -- 326 VGPRs / 1308 B per lane spilled while LDS sits at 65,536 of 327,680 B (20%)"
+  confidence: medium
+  why: >
+    There was no prior bottleneck line -- findings/facts.md did not exist before this
+    round. The verdict is an inference from a static resource census plus the corpus,
+    NOT a reading: gfx1250 has no byte counter at any level, its entire WMMA FLOP
+    counter family reads exactly 0, and rocprofv3 --stats recorded zero dispatches on
+    this job's benchmark, so nothing this round measured says where inside the kernel
+    the time goes. What the measurement does support is the shape of a register-pressure
+    limit -- both wins were deletions of work and both paid, and num_warps=8, which
+    halves the per-lane budget to 512 against a kernel already spilling, measured 2.36x
+    slower rather than flat. A deep round should re-derive this rather than inherit it.
+
+not_added_to_pool:
+  - "Run r1.i6.g6 (PC sampling / ATT) BEFORE r1.i7.g7 rather than after -- the LDS work needs to know which live range to move, and route.md currently orders them the other way. An ordering opinion formed after the round, not a new idea."
+  - "The superadditivity of g1 and g2 is unexplained and a compile-time resource report on each of the three arms would probably explain it for free. Not a candidate, an instrument."
+  - "AITER pairs causal K-tile j with n-1-j to balance the two halves of the mask. Ruled out in round 1 as already balanced here, but that was a code reading, not a measurement, and the corpus does not price the technique."

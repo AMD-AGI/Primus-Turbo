@@ -1,0 +1,22 @@
+facts.md:
+- r1.i1.g1
+- r1.i2.g2
+pool.md:
+- r1.i3.g3
+- r1.i4.g4
+- r1.i5.g5
+- r1.i6.g6
+- r1.i7.g7
+- r2.i3.g10
+- r2.i4.g11
+- '{''id'': ''r2.i3.g10'', ''what'': ''Gate every candidate on vgpr_spill_count read
+  from the compiled .amdgcn BEFORE spending a timing run on it. Four points now span
+  326/325/307/266 spills against 9.983/9.302/9.347/8.691 ms, monotone; loop-body instruction
+  count predicts nothing. The number needs a compile, not a GPU: >=266 spills means
+  discard unmeasured, <266 means measure.\n''}'
+- '{''id'': ''r2.i4.g11'', ''what'': ''Split HEAD_DIM in the dk/dv pass into two halves
+  of 64 so dk/dv/k/v fall from 768 to 384 loop-invariant VGPRs, paying one recomputed
+  dot. The only lever left that can move the spill count: BLOCK_N1 cannot shrink (traffic
+  doubles), num_warps cannot rise (2.36x slower), BLOCK_M1 is the step not the residency
+  (every decoupled point loses).\n''}'
+dead_ends.md: []

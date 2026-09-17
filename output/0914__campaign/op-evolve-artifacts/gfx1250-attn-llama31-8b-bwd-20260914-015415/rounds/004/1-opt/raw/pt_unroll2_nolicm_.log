@@ -1,0 +1,1 @@
+RESULT {"label": "unroll2_nolicm", "ms": 29.778319358825684, "census": {"vgpr": "1024", "spill": "2913", "sspill": "121", "sgpr": "107", "scratchB": "4048", "lds": "0", "wmma": 960, "msb": 3435, "sload": 1506, "sstore": 917, "ds": 1142, "ninstr": 18861}, "absum": [3694818.5, 1474473.625, 1492202.25]}

@@ -1,0 +1,26 @@
+[runjob] launched key=r3_breakdown pid=2627368
+WALL bwd median 8.6387 ms  min 8.5594
+/opt/venv/lib/python3.12/site-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+[W914 04:37:12.450498622 collection.cpp:1148] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+GPU total over 20 iters: 519.960 ms  -> 25.9980 ms/iter
+     8.6551 ms/iter   33.29%  autograd::engine::evaluate_function: _AttentionBackward
+     8.6551 ms/iter   33.29%  _AttentionBackward
+     8.5832 ms/iter   33.01%  bwd_kernel_causal
+     0.0445 ms/iter    0.17%  _bwd_preprocess
+     0.0079 ms/iter    0.03%  aten::index
+     0.0079 ms/iter    0.03%  void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native::index_ker
+     0.0054 ms/iter    0.02%  aten::floor_divide
+     0.0054 ms/iter    0.02%  void at::native::vectorized_elementwise_kernel<4, at::native::BUnaryFunctor<long, long, long, at::na
+     0.0047 ms/iter    0.02%  aten::remainder
+     0.0047 ms/iter    0.02%  void at::native::vectorized_elementwise_kernel<4, at::native::BUnaryFunctor<long, long, long, at::na
+     0.0034 ms/iter    0.01%  aten::arange
+     0.0031 ms/iter    0.01%  aten::add
+     0.0031 ms/iter    0.01%  void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<long>, std::array<char
+     0.0026 ms/iter    0.01%  aten::mul
+     0.0026 ms/iter    0.01%  void at::native::vectorized_elementwise_kernel<4, at::native::AUnaryFunctor<long, long, long, at::na
+     0.0019 ms/iter    0.01%  aten::zeros_like
+     0.0019 ms/iter    0.01%  aten::zero_
+     0.0019 ms/iter    0.01%  aten::fill_
+     0.0019 ms/iter    0.01%  void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<float>, std::array<char*, 
+     0.0017 ms/iter    0.01%  void (anonymous namespace)::elementwise_kernel_with_index_grid_stride<int, at::native::arange_cuda_o

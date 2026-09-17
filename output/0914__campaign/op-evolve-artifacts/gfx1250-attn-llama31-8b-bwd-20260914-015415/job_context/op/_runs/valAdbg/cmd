@@ -1,0 +1,1 @@
+TORCH_SHOW_CPP_STACKTRACES=1 VALIDATION_ITERS=5 VALIDATION_WARMUP_S=0.5 python op/validation.py /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/001/arms/A

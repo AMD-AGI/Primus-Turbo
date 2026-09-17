@@ -1,0 +1,6 @@
+[bench] impl=baseline shape=b4_s8192_hq32_hkv8_d128
+[bench]   statistic=median iters=30 warmup_s=3.0
+[bench]   fwd_ms=6.9990 fwd_tflops=314.23 fwd_gbps=95.9 fwd_spread_pct=2064.21
+[bench]   bwd_ms=17.7743 bwd_tflops=309.34 bwd_gbps=75.5 bwd_spread_pct=582.83
+[bench]   fwd_min_ms=5.6509 fwd_max_ms=340.3384 bwd_min_ms=11.2081 bwd_max_ms=173.1413
+[bench]   total_ms=24.7734 peak_mem_gib=1.27

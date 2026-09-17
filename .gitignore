@@ -16,3 +16,19 @@ logs/
 primus_turbo/_build_info.py
 primus_turbo/_version.py
 .coverage*
+# GPU core dumps (ROCm writes these into cwd on an HSA abort; ~8 GB each)
+gpucore.*.gpu
+# ...and the plain ones the kernel writes next to them. `gpucore.*.gpu` does NOT
+# match these: a 3.97 GB root-owned `core` sat untracked and unignored in this
+# directory on 0915, one `git add -A` away from an unpushable commit.
+/core
+/core.*
+
+# Local measurement ledgers from tools/gfx1250/
+out/
+# 0915 scheduler runtime state: PID files and per-job container PIDs, meaningless outside
+# the session that produced them. The ledger, events and queue ARE tracked -- they are the
+# evidence every conclusion in output/0915__opt/ rests on.
+output/*/run/
+output/*/sched.pid
+output/*/STOP

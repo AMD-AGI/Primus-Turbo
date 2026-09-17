@@ -1,0 +1,3 @@
+{"t":1789371986,"iso":"2026-09-14T07:47:30+00:00","dmesg_faults":0,"hard_faults":0,"degraded":0,"wedge":0,
+ "streams":[{"gpu":3,"stream":"fwd","state":"parked","ledger_age_s":48,"gpu_use":"0"},{"gpu":2,"stream":"shapes2","state":"parked","ledger_age_s":188,"gpu_use":"0"},{"gpu":0,"stream":"sweep2","state":"parked","ledger_age_s":161,"gpu_use":"100"}],
+ "op_evolve":{"ref":"gfx1250-attn-llama31-8b-bwd-20260914-015415","state_age_s":6116}}

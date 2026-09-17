@@ -1,0 +1,11 @@
+		.amdhsa_group_segment_fixed_size 0
+		.amdhsa_private_segment_fixed_size 1064
+		.amdhsa_user_sgpr_count 2
+.group_segment_fixed_size: 0
+.name:           bwd_kernel_causal
+.private_segment_fixed_size: 1064
+.sgpr_count:     107
+.sgpr_spill_count: 67
+.vgpr_count:     1024
+.vgpr_spill_count: 266
+static totals: scratch_load=265 scratch_store=128 wmma=448 s_set_vgpr_msb=1666 ds=0

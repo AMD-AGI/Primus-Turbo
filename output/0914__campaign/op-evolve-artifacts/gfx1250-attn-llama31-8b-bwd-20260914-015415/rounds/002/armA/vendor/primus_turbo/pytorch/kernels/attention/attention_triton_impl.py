@@ -1,0 +1,813 @@
+###############################################################################
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
+import math
+
+import torch
+import triton
+import triton.language as tl
+
+_torch_custom_op_wrapper = torch.library.custom_op
+from typing import Optional, Tuple
+
+from torch._library import wrap_triton
+
+from primus_turbo.pytorch.core.low_precision import float8_e4m3, float8_e5m2
+from primus_turbo.triton.attention.attention_kernel import (
+    FIXED_BLOCK_M,
+    FIXED_BLOCK_N,
+    get_dkdv_blocks,
+    USE_FP8E5M2_BWD,
+    _bwd_kernel_dkdv,
+    _bwd_kernel_dq,
+    _bwd_preprocess_use_o,
+    attn_fwd,
+    get_padded_head_dim,
+    get_shape_from_layout,
+    get_strides_from_layout,
+    get_tl_f8_bwd_dtype,
+    philox_offset,
+    philox_seed,
+)
+
+fwd_torch_dtype: tl.constexpr = torch.bfloat16
+bwd_torch_dtype: tl.constexpr = torch.float32
+
+
+def get_f8_fwd_dtype():
+    return float8_e4m3
+
+
+def get_f8_bwd_dtype():
+    return float8_e5m2 if USE_FP8E5M2_BWD else float8_e4m3
+
+
+F8_FWD_MAX: tl.constexpr = torch.finfo(get_f8_fwd_dtype()).max
+F8_BWD_MAX: tl.constexpr = torch.finfo(get_f8_bwd_dtype()).max
+
+
+# CHANGED round 1 (harness fix, no effect on the kernel). The op is registered
+# under a PRIVATE namespace so it cannot collide with the installed
+# `primus_turbo` that `op/baseline` imports later in the same `validation.py`
+# process. Both trees declare `primus_turbo::attention_triton_forward_impl`; the
+# second `torch.library` fragment to define that name owns the schema on the
+# shared `OperatorEntry`, and when it is collected the schema is destroyed under
+# the first tree's still-live `OpOverload`. Calling through that stale handle
+# faults -- observed as `schema_.has_value() INTERNAL ASSERT FAILED`,
+# `std::bad_alloc` and SIGSEGV, intermittently, always at the first `fwd()` of
+# the speed phase. Only the registry key changes; the op is reached through the
+# Python symbol, which is unchanged.
+@_torch_custom_op_wrapper("primus_turbo_opevolve::attention_triton_forward_impl", mutates_args=(), device_types="cuda")
+def attention_triton_forward_impl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    p_scale: float,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    bias: Optional[torch.Tensor],
+    alibi_slopes: Optional[torch.Tensor],
+    return_softmax: bool,
+    use_fp8: bool,
+    sink: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+    assert q.is_contiguous()
+    assert k.is_contiguous()
+    assert v.is_contiguous()
+    assert q_descale.is_contiguous()
+    assert k_descale.is_contiguous()
+
+    layout = "bshd"
+    cu_seqlens_q = 0
+    cu_seqlens_k = 0
+    max_seqlens_q = q.shape[1]
+    max_seqlens_k = k.shape[1]
+    return_scores = return_softmax
+    use_exp2 = True
+
+    o_shape = list(q.shape)
+    o_shape[-1] = v.shape[-1]  # output shape should match v's head dim
+    o = torch.empty(
+        o_shape,
+        device=q.device,
+        dtype=fwd_torch_dtype if use_fp8 else q.dtype,
+        requires_grad=True,
+    )
+
+    # check if varlen
+    is_varlen = layout == "thd"
+
+    # NOTE: a large bias tensor leads to overflow during pointer arithmetic
+    if bias is not None:
+        assert bias.numel() < 2**31
+
+    batch, nheads_q, nheads_k, head_size_qk, head_size_v, seqlen_q, seqlen_k = get_shape_from_layout(
+        q, k, v, layout, cu_seqlens_q, cu_seqlens_k, max_seqlens_q, max_seqlens_k
+    )
+    q_strides = get_strides_from_layout(q, layout)
+    k_strides = get_strides_from_layout(k, layout)
+    v_strides = get_strides_from_layout(v, layout)
+    o_strides = get_strides_from_layout(o, layout)
+
+    # Get closest power of 2 over or equal to 32.
+    padded_d_model_qk = get_padded_head_dim(head_size_qk)
+    padded_d_model_v = get_padded_head_dim(head_size_v)
+
+    grid = (triton.cdiv(max_seqlens_q, FIXED_BLOCK_M), nheads_q, batch)
+
+    if return_scores:
+        scores = torch.zeros(
+            (batch, nheads_q, max_seqlens_q, max_seqlens_k), device=q.device, dtype=torch.float32
+        )
+        scores_scaled_shifted = torch.zeros(
+            (batch, nheads_q, max_seqlens_q, max_seqlens_k), device=q.device, dtype=torch.float32
+        )
+        scores_strides = (scores.stride(0), scores.stride(1), scores.stride(2), scores.stride(3))
+    else:
+        scores = torch.empty([], device=q.device, dtype=torch.float32)
+        scores_scaled_shifted = None
+        scores_strides = (0, 0, 0, 0)
+
+    # exp_scores is used to validate dropout behavior vs the PyTorch SDPA math backend reference.  We zero this out
+    # to give a consistent starting point and then populate it with the output of softmax with the sign bit set according
+    # to the dropout mask. The resulting return allows this mask to be fed into the reference implementation for testing
+    # only.  This return holds no useful output aside from debugging.
+    if return_scores:
+        exp_scores = torch.zeros(
+            (batch, nheads_q, max_seqlens_q, max_seqlens_k), device=q.device, dtype=torch.float32
+        )
+    else:
+        exp_scores = torch.empty([], device=q.device, dtype=torch.float32)
+
+    # stores LSE the log of the normalization constant / sum of expoential score(unnormalzied probablities)
+    if is_varlen:
+        softmax_lse = torch.empty((q.shape[0] * 2, nheads_q), device=q.device, dtype=torch.float32)
+        stride_lse_m, stride_lse_h = softmax_lse.stride()
+        stride_lse_z = 0
+    else:
+        softmax_lse = torch.empty((batch, nheads_q, max_seqlens_q * 2), device=q.device, dtype=torch.float32)
+        stride_lse_z, stride_lse_h, stride_lse_m = softmax_lse.stride()
+
+    if bias is not None:
+        bias_strides = (bias.stride(0), bias.stride(1), bias.stride(2), bias.stride(3))
+    else:
+        bias_strides = (0, 0, 0, 0)
+
+    if alibi_slopes is not None:
+        alibi_strides = (alibi_slopes.stride(0), alibi_slopes.stride(1))
+    else:
+        alibi_strides = (0, 0)
+
+    if use_fp8:
+        stride_qdescale_z, stride_qdescale_h, stride_qdescale_m = (
+            q_descale.stride(0),
+            q_descale.stride(1),
+            q_descale.stride(2),
+        )
+        stride_kdescale_z, stride_kdescale_h, stride_kdescale_m = (
+            k_descale.stride(0),
+            k_descale.stride(1),
+            k_descale.stride(2),
+        )
+        stride_vdescale_z, stride_vdescale_h, stride_vdescale_m = (
+            v_descale.stride(0),
+            v_descale.stride(1),
+            v_descale.stride(2),
+        )
+        padded_kscale_block_num = 1 << (stride_kdescale_h - 1).bit_length()
+        padded_vscale_block_num = 1 << (stride_vdescale_h - 1).bit_length()
+    else:
+        stride_qdescale_z, stride_qdescale_h, stride_qdescale_m = None, None, None
+        stride_kdescale_z, stride_kdescale_h, stride_kdescale_m = None, None, None
+        stride_vdescale_z, stride_vdescale_h, stride_vdescale_m = None, None, None
+        padded_kscale_block_num = None
+        padded_vscale_block_num = None
+
+    wrap_triton(attn_fwd)[grid](
+        q,
+        k,
+        v,
+        bias,
+        p_scale,
+        q_descale,
+        k_descale,
+        v_descale,
+        use_fp8,
+        softmax_scale,
+        softmax_lse,
+        o,
+        *q_strides,
+        *k_strides,
+        *v_strides,
+        *o_strides,
+        *bias_strides,
+        *alibi_strides,
+        *scores_strides,
+        stride_lse_z,
+        stride_lse_h,
+        stride_lse_m,
+        stride_qdescale_z,
+        stride_qdescale_h,
+        stride_qdescale_m,
+        stride_kdescale_z,
+        stride_kdescale_h,
+        stride_kdescale_m,
+        stride_vdescale_z,
+        stride_vdescale_h,
+        stride_vdescale_m,
+        padded_kscale_block_num,
+        padded_vscale_block_num,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        dropout_p=dropout_p,
+        philox_seed=philox_seed,
+        philox_offset_base=philox_offset,
+        scores=scores,
+        scores_scaled_shifted=scores_scaled_shifted,
+        exp_scores=exp_scores,
+        alibi_slopes=alibi_slopes,
+        sink=sink,
+        stride_sink_h=0 if sink is None else sink.stride(0),
+        HQ=nheads_q,
+        HK=nheads_k,
+        ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
+        ACTUAL_BLOCK_DMODEL_V=head_size_v,
+        MAX_SEQLENS_Q=max_seqlens_q,
+        MAX_SEQLENS_K=max_seqlens_k,
+        IS_CAUSAL=causal,
+        WINDOW_LEFT=window_size_left,
+        WINDOW_RIGHT=window_size_right,
+        VARLEN=is_varlen,
+        BLOCK_DMODEL_QK=padded_d_model_qk,
+        BLOCK_DMODEL_V=padded_d_model_v,
+        USE_BIAS=False if bias is None else True,
+        USE_ALIBI=False if alibi_slopes is None else True,
+        USE_SINK=False if sink is None else True,
+        ENABLE_DROPOUT=dropout_p > 0.0,
+        USE_EXP2=use_exp2,
+        RETURN_SCORES=return_scores,
+        BLOCK_M=FIXED_BLOCK_M,
+        BLOCK_N=FIXED_BLOCK_N,
+    )
+
+    return o, softmax_lse, exp_scores
+
+
+@attention_triton_forward_impl.register_fake
+def _attention_triton_forward_impl_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    p_scale: float,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    bias: Optional[torch.Tensor],
+    alibi_slopes: Optional[torch.Tensor],
+    return_softmax: bool,
+    use_fp8: bool,
+    sink: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    o_shape = list(q.shape)
+    o_shape[-1] = v.shape[-1]  # output shape should match v's head dim
+    o = torch.empty(
+        o_shape,
+        device=q.device,
+        dtype=torch.bfloat16 if use_fp8 else q.dtype,
+        requires_grad=True,
+    )
+
+    batch_q, max_seqlen_q, nheads_q, head_size_q = q.shape
+    batch_k, max_seqlen_k, nheads_k, head_size_k = k.shape
+
+    if return_softmax:
+        exp_scores = torch.zeros(
+            (batch_q, nheads_q, max_seqlen_q, max_seqlen_k), device=q.device, dtype=torch.float32
+        )
+    else:
+        exp_scores = torch.empty([], device=q.device, dtype=torch.float32)
+
+    softmax_lse = torch.empty((batch_q, nheads_q, max_seqlen_q * 2), device=q.device, dtype=torch.float32)
+
+    return o, softmax_lse, exp_scores
+
+
+@_torch_custom_op_wrapper(
+    "primus_turbo_opevolve::attention_triton_backward_impl", mutates_args=("dq", "dk", "dv"), device_types="cuda"
+)
+def attention_triton_backward_impl(
+    do: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    p_scale: float,
+    softmax_lse_delta: torch.Tensor,
+    dq: Optional[torch.Tensor],
+    dk: Optional[torch.Tensor],
+    dv: Optional[torch.Tensor],
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    alibi_slopes: Optional[torch.Tensor],
+    use_fp8: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+    use_exp2 = True
+    layout = "bshd"
+    sequence_parallel = True
+    do = do.contiguous()
+
+    # get strides and shape
+    batch, nheads_q, nheads_k, head_size_qk, head_size_v, max_seqlen_q, max_seqlen_k = get_shape_from_layout(
+        q, k, v, layout, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
+    )
+    q_strides = get_strides_from_layout(q, layout)
+    k_strides = get_strides_from_layout(k, layout)
+    v_strides = get_strides_from_layout(v, layout)
+    o_strides = get_strides_from_layout(o, layout)
+    do_strides = get_strides_from_layout(do, layout)
+    stride_qz, stride_qh, stride_qm, stride_qk = q_strides
+    stride_kz, stride_kh, stride_kn, stride_kk = k_strides
+    stride_vz, stride_vh, stride_vn, stride_vk = v_strides
+    stride_oz, stride_oh, stride_om, stride_ok = o_strides
+    stride_doz, stride_doh, stride_dom, stride_dok = do_strides
+    batch_headsize_q = batch * nheads_q
+    batch_headsize_k = batch * nheads_k
+    is_varlen = layout == "thd"
+
+    assert head_size_qk >= 32 and head_size_v >= 32
+    assert head_size_qk % 2 == 0 and head_size_v % 2 == 0
+    padded_d_model_qk = get_padded_head_dim(head_size_qk)
+    padded_d_model_v = get_padded_head_dim(head_size_v)
+
+    # NOTE: we might need to copy the output tensor if they are not continuous or have other issues
+    copy_back = {"dq": False, "dk": False, "dv": False}
+
+    # deal with dq
+    if dq is None:
+        dq = torch.zeros_like(q, dtype=bwd_torch_dtype)
+    else:
+        dq_og = dq
+        if not dq.is_contiguous():
+            dq = dq.contiguous()
+            copy_back["dq"] = True
+
+        dq.zero_()
+    stride_dq_all = dq.stride()[0]
+
+    # deal with dk, dv
+    if (dk is None) or (dv is None):
+        dk = torch.zeros_like(k, dtype=bwd_torch_dtype)
+        dv = torch.zeros_like(v, dtype=bwd_torch_dtype)
+    else:
+        if not dk.is_contiguous():
+            dk_og = dk
+            dk = dk.contiguous()
+            copy_back["dk"] = True
+
+        if not dv.is_contiguous():
+            dv_og = dv
+            dv = dv.contiguous()
+            copy_back["dv"] = True
+
+    # assert contigious
+    assert do.is_contiguous()
+    assert q.is_contiguous()
+    assert k.is_contiguous()
+    assert v.is_contiguous()
+    assert o.is_contiguous()
+    assert softmax_lse_delta.is_contiguous()
+    assert q_descale.is_contiguous()
+    assert k_descale.is_contiguous()
+
+    # # init delta
+    # delta = torch.empty_like(softmax_lse)
+    if is_varlen:
+        stride_lse_delta_m, stride_lse_delta_h = softmax_lse_delta.stride()
+        stride_lse_delta_z = 0
+    else:
+        stride_lse_delta_z, stride_lse_delta_h, stride_lse_delta_m = softmax_lse_delta.stride()
+
+    if use_fp8:
+        do_fp8 = torch.empty_like(do, dtype=get_f8_bwd_dtype())
+        _shape = (batch, nheads_q, triton.cdiv(max_seqlen_q, FIXED_BLOCK_M))
+        do_descale = torch.empty(_shape, dtype=torch.float32, device=q.device)
+        stride_descalez, stride_descaleh, stride_descalem = do_descale.stride()
+        stride_qscalez, stride_qscaleh, stride_qscalem = q_descale.stride()
+        stride_kscalez, stride_kscaleh, stride_kscalem = k_descale.stride()
+        stride_vscalez, stride_vscaleh, stride_vscalem = v_descale.stride()
+
+        padded_doscale_block_num = 1 << (stride_descaleh - 1).bit_length()
+        padded_qscale_block_num = 1 << (stride_qscaleh - 1).bit_length()
+        padded_kscale_block_num = 1 << (stride_kscaleh - 1).bit_length()
+        padded_vscale_block_num = 1 << (stride_vscaleh - 1).bit_length()
+    else:
+        do_fp8 = None
+        do_descale = None
+        stride_descalez, stride_descaleh, stride_descalem = None, None, None
+        stride_qscalez, stride_qscaleh, stride_qscalem = None, None, None
+        stride_kscalez, stride_kscaleh, stride_kscalem = None, None, None
+        stride_vscalez, stride_vscaleh, stride_vscalem = None, None, None
+        (
+            padded_doscale_block_num,
+            padded_qscale_block_num,
+            padded_kscale_block_num,
+            padded_vscale_block_num,
+        ) = (None, None, None, None)
+
+    grid_prebwd = (triton.cdiv(max_seqlen_q, FIXED_BLOCK_M), batch_headsize_q)
+    wrap_triton(_bwd_preprocess_use_o)[grid_prebwd](
+        o,
+        do,
+        do_fp8,
+        do_descale,
+        softmax_lse_delta,
+        use_fp8,
+        stride_oz,
+        stride_oh,
+        stride_om,
+        stride_ok,
+        stride_doz,
+        stride_doh,
+        stride_dom,
+        stride_dok,
+        stride_lse_delta_z,
+        stride_lse_delta_h,
+        stride_lse_delta_m,
+        stride_descalez,
+        stride_descaleh,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        BLOCK_DMODEL_V=padded_d_model_v,
+        ACTUAL_BLOCK_DMODEL_V=head_size_v,
+        BLOCK_M=FIXED_BLOCK_M,
+        N_CTX_Q=max_seqlen_q,
+        Z=batch,
+        HQ=nheads_q,
+        IS_VARLEN=is_varlen,
+        F8_BWD_DTYPE=get_tl_f8_bwd_dtype(),
+        F8_BWD_MAX=F8_BWD_MAX,
+    )
+
+    log_p_scale = math.log(p_scale)
+    num_block_m = triton.cdiv(max_seqlen_q, FIXED_BLOCK_M)
+    grid_bwd = (
+        batch_headsize_q,
+        triton.cdiv(max_seqlen_q, FIXED_BLOCK_M) if sequence_parallel else 1,
+    )
+    wrap_triton(_bwd_kernel_dq)[grid_bwd](
+        q,
+        k,
+        v,
+        softmax_scale,
+        q_descale,
+        k_descale,
+        v_descale,
+        p_scale,
+        do_descale,
+        o,
+        do_fp8 if use_fp8 else do,
+        dq,
+        dk,
+        dv,
+        softmax_lse_delta,
+        stride_dq_all,
+        stride_qz,
+        stride_qh,
+        stride_qm,
+        stride_qk,
+        stride_kz,
+        stride_kh,
+        stride_kn,
+        stride_kk,
+        stride_vz,
+        stride_vh,
+        stride_vn,
+        stride_vk,
+        stride_doz,
+        stride_doh,
+        stride_dom,
+        stride_dok,
+        stride_lse_delta_z,
+        stride_lse_delta_h,
+        stride_lse_delta_m,
+        stride_descalez,
+        stride_descaleh,
+        stride_descalem,
+        stride_qscalez,
+        stride_qscaleh,
+        stride_qscalem,
+        stride_kscalez,
+        stride_kscaleh,
+        stride_kscalem,
+        stride_vscalez,
+        stride_vscaleh,
+        stride_vscalem,
+        padded_doscale_block_num,
+        padded_qscale_block_num,
+        padded_kscale_block_num,
+        padded_vscale_block_num,
+        batch,
+        nheads_q,
+        nheads_k,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        num_block_m=num_block_m,
+        BLOCK_M=FIXED_BLOCK_M,
+        BLOCK_N=FIXED_BLOCK_N,
+        BLOCK_DMODEL_QK=padded_d_model_qk,
+        BLOCK_DMODEL_V=padded_d_model_v,
+        ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
+        ACTUAL_BLOCK_DMODEL_V=head_size_v,
+        SEQUENCE_PARALLEL=sequence_parallel,
+        CAUSAL=causal,
+        WINDOW_LEFT=window_size_left,
+        WINDOW_RIGHT=window_size_right,
+        USE_EXP2=use_exp2,
+        IS_VARLEN=is_varlen,
+        USE_FP8=use_fp8,
+        log_p_scale=log_p_scale,
+        F8_FWD_MAX=F8_FWD_MAX,
+    )
+
+    # One source of truth for the dk/dv tile: BLOCK_N sets the grid AND the tile, so they
+    # cannot be allowed to disagree. BLOCK_M is independent of the lse/delta ABI now that
+    # the kernel indexes that scratch per row (LSE_ABI_BLOCK below).
+    dkdv_block_m, dkdv_block_n = get_dkdv_blocks()
+    dkdv_num_block_m = triton.cdiv(max_seqlen_q, dkdv_block_m)
+    grid_bwd_dkdv = (
+        batch_headsize_k,
+        triton.cdiv(max_seqlen_k, dkdv_block_n) if sequence_parallel else 1,
+    )
+    wrap_triton(_bwd_kernel_dkdv)[grid_bwd_dkdv](
+        q,
+        k,
+        v,
+        softmax_scale,
+        q_descale,
+        k_descale,
+        v_descale,
+        p_scale,
+        do_descale,
+        o,
+        do_fp8 if use_fp8 else do,
+        dq,
+        dk,
+        dv,
+        softmax_lse_delta,
+        stride_dq_all,
+        stride_qz,
+        stride_qh,
+        stride_qm,
+        stride_qk,
+        stride_kz,
+        stride_kh,
+        stride_kn,
+        stride_kk,
+        stride_vz,
+        stride_vh,
+        stride_vn,
+        stride_vk,
+        stride_doz,
+        stride_doh,
+        stride_dom,
+        stride_dok,
+        stride_lse_delta_z,
+        stride_lse_delta_h,
+        stride_lse_delta_m,
+        stride_descalez,
+        stride_descaleh,
+        stride_descalem,
+        stride_qscalez,
+        stride_qscaleh,
+        stride_qscalem,
+        stride_kscalez,
+        stride_kscaleh,
+        stride_kscalem,
+        stride_vscalez,
+        stride_vscaleh,
+        stride_vscalem,
+        batch,
+        nheads_q,
+        nheads_k,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        # Loop bound for the query axis, in units of THIS kernel's BLOCK_M. The dq launch
+        # keeps the FIXED_BLOCK_M-based count; conflating them would make the dk/dv loop
+        # stop short of the sequence and leave the tail of dk/dv at its zeros init.
+        num_block_m=dkdv_num_block_m,
+        # attn_fwd's BLOCK_M, i.e. the row interleave of the shared lse/delta scratch. It is
+        # deliberately NOT this kernel's BLOCK_M -- they were the same value before the
+        # dk/dv tile was decoupled, and conflating them again silently mis-reads delta.
+        LSE_ABI_BLOCK=FIXED_BLOCK_M,
+        BLOCK_M=dkdv_block_m,
+        BLOCK_N=dkdv_block_n,
+        BLOCK_DMODEL_QK=padded_d_model_qk,
+        BLOCK_DMODEL_V=padded_d_model_v,
+        ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
+        ACTUAL_BLOCK_DMODEL_V=head_size_v,
+        SEQUENCE_PARALLEL=sequence_parallel,
+        CAUSAL=causal,
+        WINDOW_LEFT=window_size_left,
+        WINDOW_RIGHT=window_size_right,
+        USE_EXP2=use_exp2,
+        IS_VARLEN=is_varlen,
+        USE_FP8=use_fp8,
+        log_p_scale=log_p_scale,
+        F8_FWD_MAX=F8_FWD_MAX,
+    )
+
+    if copy_back["dq"]:
+        dq_og.copy_(dq)
+        dq = dq_og
+    if copy_back["dk"]:
+        dk_og.copy_(dk)
+        dk = dk_og
+    if copy_back["dv"]:
+        dv_og.copy_(dv)
+        dv = dv_og
+
+    return dq, dk, dv
+
+
+@attention_triton_backward_impl.register_fake
+def _attention_triton_backward_impl_fake(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    p_scale: float,
+    softmax_lse: torch.Tensor,
+    dq: Optional[torch.Tensor],
+    dk: Optional[torch.Tensor],
+    dv: Optional[torch.Tensor],
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    alibi_slopes: Optional[torch.Tensor],
+    use_fp8: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dq_out, dk_out, dv_out = (
+        torch.empty_like(q, dtype=bwd_torch_dtype),
+        torch.empty_like(k, dtype=bwd_torch_dtype),
+        torch.empty_like(v, dtype=bwd_torch_dtype),
+    )
+    return dq_out, dk_out, dv_out
+
+
+# bf16/fp16 adapters. The impls above take fp8 plumbing (descales, p_scale) that is identity
+# for a non-fp8 call; dq/dk/dv must be None, as passing preallocated returns of the custom op
+# trips torch's aliasing check.
+
+
+def dense_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: Optional[float],
+    causal: bool,
+    sink: Optional[torch.Tensor] = None,
+    window_size: Tuple[int, int] = (-1, -1),
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dense bshd forward. Returns (out, softmax_lse)."""
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+    one = torch.ones(1, device=q.device, dtype=torch.float32)
+    out, lse, _ = attention_triton_forward_impl(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        1.0,
+        one,
+        one,
+        one,
+        0.0,
+        softmax_scale,
+        causal,
+        window_size[0],
+        window_size[1],
+        None,
+        None,
+        False,
+        False,
+        None if sink is None else sink.contiguous().float(),
+    )
+    return out, lse
+
+
+def _lse_delta_views(lse_delta: torch.Tensor, seqlen_q: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Split the [B, Hq, seqlen_q * 2] scratch into per-row (lse, delta).
+
+    The forward writes LSE at block offset ``m * BLOCK_M * 2`` and the backward preprocess
+    writes delta at ``+ BLOCK_M`` of the same block, so the two interleave per BLOCK_M rather
+    than per row. BLOCK_M is the module-level FIXED_BLOCK_M, not an autotuned value, so the
+    layout is knowable here. Both views are trimmed back to seqlen_q.
+    """
+    row = torch.arange(seqlen_q, device=lse_delta.device)
+    # Index rather than reshape: the scratch is allocated as seqlen_q * 2, which need not be
+    # a whole number of 2 * BLOCK_M blocks, so a view would be wrong on a ragged tail.
+    lse_idx = (row // FIXED_BLOCK_M) * (2 * FIXED_BLOCK_M) + (row % FIXED_BLOCK_M)
+    return lse_delta[:, :, lse_idx], lse_delta[:, :, lse_idx + FIXED_BLOCK_M]
+
+
+def dense_sink_grad(lse_delta: torch.Tensor, sink: torch.Tensor, seqlen_q: int) -> torch.Tensor:
+    """Gradient of the loss w.r.t. the per-head sink logits.
+
+    The sink is one extra softmax term with no value vector, so ``p_sink = exp(sink - lse)``
+    and its score gradient is ``p_sink * (0 - delta)`` with the same ``delta = o . do`` the
+    backward already computes -- which is also why dq/dk/dv need no kernel change: they read
+    p back from an LSE that already includes the sink.
+
+    Call this only after the backward kernel has filled in delta.
+    """
+    lse, delta = _lse_delta_views(lse_delta, seqlen_q)
+    p_sink = torch.exp(sink.float().view(1, -1, 1) - lse)
+    return -(p_sink * delta).sum(dim=(0, 2)).to(sink.dtype)
+
+
+def dense_backward(
+    do: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    softmax_scale: Optional[float],
+    causal: bool,
+    sink: Optional[torch.Tensor] = None,
+    window_size: Tuple[int, int] = (-1, -1),
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Dense bshd backward. Returns (dq, dk, dv, dsink)."""
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+    one = torch.ones(1, device=q.device, dtype=torch.float32)
+    seqlen_q, seqlen_k = q.shape[1], k.shape[1]
+    # The kernel asserts all of these are contiguous, and q/k/v arrive as the caller saved
+    # them -- which is sbhd-ordered bytes whenever qkv_format said so.
+    dq, dk, dv = attention_triton_backward_impl(
+        do.contiguous(),
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        o.contiguous(),
+        one,
+        one,
+        one,
+        1.0,
+        softmax_lse,
+        None,
+        None,
+        None,
+        None,
+        None,
+        seqlen_q,
+        seqlen_k,
+        softmax_scale,
+        causal,
+        window_size[0],
+        window_size[1],
+        None,
+        False,
+    )
+    # dsink needs delta, which the call above writes into softmax_lse in place.
+    dsink = None if sink is None else dense_sink_grad(softmax_lse, sink, seqlen_q)
+    return dq, dk, dv, dsink

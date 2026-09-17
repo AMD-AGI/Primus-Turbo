@@ -1,0 +1,108 @@
+33 candidates, 33 to run on shape llama31-8b-s4096
+
+[1/33] <default>
+  ok  10.604 ms  181.4 TFLOP/s
+[2/33] bwd:num_warps=1,waves_per_eu=0,num_stages=1
+  ok  16.699 ms  115.2 TFLOP/s
+[3/33] bwd:num_warps=1,waves_per_eu=0,num_stages=2
+  ok  13.002 ms  148.0 TFLOP/s
+[4/33] bwd:num_warps=1,waves_per_eu=1,num_stages=1
+  ok  17.353 ms  110.9 TFLOP/s
+[5/33] bwd:num_warps=1,waves_per_eu=1,num_stages=2
+  ok  18.611 ms  103.4 TFLOP/s
+[6/33] bwd:num_warps=1,waves_per_eu=2,num_stages=1
+  ok  33.004 ms  58.3 TFLOP/s
+[7/33] bwd:num_warps=1,waves_per_eu=2,num_stages=2
+  ok  36.821 ms  52.3 TFLOP/s
+[8/33] bwd:num_warps=1,waves_per_eu=4,num_stages=1
+  ok  65.228 ms  29.5 TFLOP/s
+[9/33] bwd:num_warps=1,waves_per_eu=4,num_stages=2
+  ok  72.599 ms  26.5 TFLOP/s
+[10/33] bwd:num_warps=2,waves_per_eu=0,num_stages=1
+  ok  8.987 ms  214.1 TFLOP/s
+[11/33] bwd:num_warps=2,waves_per_eu=0,num_stages=2
+  ok  12.155 ms  158.3 TFLOP/s
+[12/33] bwd:num_warps=2,waves_per_eu=1,num_stages=1
+  ok  8.950 ms  215.0 TFLOP/s
+[13/33] bwd:num_warps=2,waves_per_eu=1,num_stages=2
+  ok  12.592 ms  152.8 TFLOP/s
+[14/33] bwd:num_warps=2,waves_per_eu=2,num_stages=1
+  ok  16.325 ms  117.9 TFLOP/s
+[15/33] bwd:num_warps=2,waves_per_eu=2,num_stages=2
+  ok  26.186 ms  73.5 TFLOP/s
+[16/33] bwd:num_warps=2,waves_per_eu=4,num_stages=1
+  ok  34.886 ms  55.2 TFLOP/s
+[17/33] bwd:num_warps=2,waves_per_eu=4,num_stages=2
+  ok  41.830 ms  46.0 TFLOP/s
+[18/33] bwd:num_warps=4,waves_per_eu=0,num_stages=1
+  ok  10.640 ms  180.8 TFLOP/s
+[19/33] bwd:num_warps=4,waves_per_eu=0,num_stages=2
+  ok  14.647 ms  131.4 TFLOP/s
+[20/33] bwd:num_warps=4,waves_per_eu=1,num_stages=1
+  ok  12.573 ms  153.0 TFLOP/s
+[21/33] bwd:num_warps=4,waves_per_eu=1,num_stages=2
+  ok  15.606 ms  123.3 TFLOP/s
+[22/33] bwd:num_warps=4,waves_per_eu=2,num_stages=1
+  ok  11.385 ms  169.0 TFLOP/s
+[23/33] bwd:num_warps=4,waves_per_eu=2,num_stages=2
+  ok  18.455 ms  104.3 TFLOP/s
+[24/33] bwd:num_warps=4,waves_per_eu=4,num_stages=1
+  ok  20.793 ms  92.5 TFLOP/s
+[25/33] bwd:num_warps=4,waves_per_eu=4,num_stages=2
+  ok  41.370 ms  46.5 TFLOP/s
+[26/33] bwd:num_warps=8,waves_per_eu=0,num_stages=1
+  ok  14.149 ms  136.0 TFLOP/s
+[27/33] bwd:num_warps=8,waves_per_eu=0,num_stages=2
+  ok  25.381 ms  75.8 TFLOP/s
+[28/33] bwd:num_warps=8,waves_per_eu=1,num_stages=1
+  ok  14.041 ms  137.0 TFLOP/s
+[29/33] bwd:num_warps=8,waves_per_eu=1,num_stages=2
+  ok  25.336 ms  75.9 TFLOP/s
+[30/33] bwd:num_warps=8,waves_per_eu=2,num_stages=1
+  ok  14.042 ms  137.0 TFLOP/s
+[31/33] bwd:num_warps=8,waves_per_eu=2,num_stages=2
+  ok  22.130 ms  86.9 TFLOP/s
+[32/33] bwd:num_warps=8,waves_per_eu=4,num_stages=1
+  ok  16.718 ms  115.1 TFLOP/s
+[33/33] bwd:num_warps=8,waves_per_eu=4,num_stages=2
+  ok  41.079 ms  46.8 TFLOP/s
+33 candidates: 33 ok, 0 WRONG, 0 failed
+
+config                                           fwd ms   bwd ms    total  TFLOP/s  step ms rtry
+------------------------------------------------------------------------------------------------
+bwd:num_warps=2,waves_per_eu=1,num_stages=1       1.443    7.507    8.950    215.0    286.4    0
+bwd:num_warps=2,waves_per_eu=0,num_stages=1       1.454    7.533    8.987    214.1    287.6    0
+<default>                                         1.446    9.158   10.604    181.4    339.3    0
+bwd:num_warps=4,waves_per_eu=0,num_stages=1       1.459    9.181   10.640    180.8    340.5    0
+bwd:num_warps=4,waves_per_eu=2,num_stages=1       1.453    9.932   11.385    169.0    364.3    0
+bwd:num_warps=2,waves_per_eu=0,num_stages=2       1.441   10.714   12.155    158.3    389.0    0
+bwd:num_warps=4,waves_per_eu=1,num_stages=1       1.455   11.118   12.573    153.0    402.3    0
+bwd:num_warps=2,waves_per_eu=1,num_stages=2       1.444   11.148   12.592    152.8    402.9    0
+bwd:num_warps=1,waves_per_eu=0,num_stages=2       1.448   11.555   13.002    148.0    416.1    0
+bwd:num_warps=8,waves_per_eu=1,num_stages=1       1.444   12.597   14.041    137.0    449.3    0
+bwd:num_warps=8,waves_per_eu=2,num_stages=1       1.439   12.602   14.042    137.0    449.3    0
+bwd:num_warps=8,waves_per_eu=0,num_stages=1       1.467   12.681   14.149    136.0    452.8    0
+bwd:num_warps=4,waves_per_eu=0,num_stages=2       1.446   13.201   14.647    131.4    468.7    0
+bwd:num_warps=4,waves_per_eu=1,num_stages=2       1.445   14.161   15.606    123.3    499.4    0
+bwd:num_warps=2,waves_per_eu=2,num_stages=1       1.444   14.881   16.325    117.9    522.4    0
+bwd:num_warps=1,waves_per_eu=0,num_stages=1       1.445   15.254   16.699    115.2    534.4    0
+bwd:num_warps=8,waves_per_eu=4,num_stages=1       1.438   15.280   16.718    115.1    535.0    0
+bwd:num_warps=1,waves_per_eu=1,num_stages=1       1.456   15.897   17.353    110.9    555.3    0
+bwd:num_warps=4,waves_per_eu=2,num_stages=2       1.446   17.009   18.455    104.3    590.6    0
+bwd:num_warps=1,waves_per_eu=1,num_stages=2       1.449   17.161   18.611    103.4    595.5    0
+bwd:num_warps=4,waves_per_eu=4,num_stages=1       1.445   19.348   20.793     92.5    665.4    0
+bwd:num_warps=8,waves_per_eu=2,num_stages=2       1.441   20.689   22.130     86.9    708.2    0
+bwd:num_warps=8,waves_per_eu=1,num_stages=2       1.443   23.893   25.336     75.9    810.7    0
+bwd:num_warps=8,waves_per_eu=0,num_stages=2       1.448   23.933   25.381     75.8    812.2    0
+bwd:num_warps=2,waves_per_eu=2,num_stages=2       1.441   24.745   26.186     73.5    838.0    0
+bwd:num_warps=1,waves_per_eu=2,num_stages=1       1.439   31.564   33.004     58.3   1056.1    0
+bwd:num_warps=2,waves_per_eu=4,num_stages=1       1.446   33.441   34.886     55.2   1116.4    0
+bwd:num_warps=1,waves_per_eu=2,num_stages=2       1.449   35.373   36.821     52.3   1178.3    0
+bwd:num_warps=8,waves_per_eu=4,num_stages=2       1.453   39.626   41.079     46.8   1314.5    0
+bwd:num_warps=4,waves_per_eu=4,num_stages=2       1.456   39.914   41.370     46.5   1323.8    0
+bwd:num_warps=2,waves_per_eu=4,num_stages=2       1.462   40.368   41.830     46.0   1338.6    0
+bwd:num_warps=1,waves_per_eu=4,num_stages=1       1.447   63.781   65.228     29.5   2087.3    0
+bwd:num_warps=1,waves_per_eu=4,num_stages=2       1.441   71.158   72.599     26.5   2323.2    0
+
+best: bwd:num_warps=2,waves_per_eu=1,num_stages=1  8.950 ms  (215.0 TFLOP/s, 286.4 ms/step)
+  converged: num_stages=1 is this knob's hard minimum.

@@ -1,0 +1,1 @@
+cd /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/job_context && BEAT_BWD_NUM_WARPS=4 python op/_warps.py

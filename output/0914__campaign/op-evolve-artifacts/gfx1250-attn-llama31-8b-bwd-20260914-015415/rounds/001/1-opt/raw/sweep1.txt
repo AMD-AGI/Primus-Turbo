@@ -1,0 +1,33 @@
+DEFAULT                                                      bwd_ms=10.0068 spread=0.66% min=9.9684
+num_warps=8                                                  bwd_ms=23.5782 spread=1.13% min=23.4343
+num_warps=8,waves_per_eu=0                                   bwd_ms=23.5885 spread=1.55% min=23.4188
+num_warps=2                                                  bwd_ms=46.8351 spread=1.35% min=46.4596
+BLOCK_N1=128,BLOCK_M2=128                                    bwd_ms=10.0068 spread=0.82% min=9.9564
+BLOCK_N1=128,BLOCK_M2=128,num_warps=8                        bwd_ms=23.6447 spread=1.07% min=23.4972
+BLOCK_N1=512,BLOCK_M2=512,num_warps=8                        bwd_ms=23.6157 spread=0.79% min=23.5352
+BLOCK_M1=64,BLOCK_N2=64                                      bwd_ms=23.4778 spread=0.63% min=23.3994
+BLOCK_M1=64,BLOCK_N2=64,num_warps=8                          bwd_ms=32.9826 spread=0.71% min=32.8328
+waves_per_eu=0                                               bwd_ms=9.5690 spread=0.69% min=9.5334
+waves_per_eu=2                                               bwd_ms=50.2447 spread=0.86% min=49.8898
+num_stages=2                                                 bwd_ms=12.2040 spread=0.75% min=12.1693
+BLK_SLICE_FACTOR=2                                           bwd_ms=10.7143 spread=0.70% min=10.6510
+matrix_instr_nonkdim=32                                      bwd_ms=10.0382 spread=0.53% min=10.0019
+num_warps=8,BLK_SLICE_FACTOR=2                               bwd_ms=24.9854 spread=1.11% min=24.8804
+num_warps=16                                                 bwd_ms=23.9273 spread=0.64% min=23.8158
+--- sorted ---
+9.5690  waves_per_eu=0
+10.0068  DEFAULT
+10.0068  BLOCK_N1=128,BLOCK_M2=128
+10.0382  matrix_instr_nonkdim=32
+10.7143  BLK_SLICE_FACTOR=2
+12.2040  num_stages=2
+23.4778  BLOCK_M1=64,BLOCK_N2=64
+23.5782  num_warps=8
+23.5885  num_warps=8,waves_per_eu=0
+23.6157  BLOCK_N1=512,BLOCK_M2=512,num_warps=8
+23.6447  BLOCK_N1=128,BLOCK_M2=128,num_warps=8
+23.9273  num_warps=16
+24.9854  num_warps=8,BLK_SLICE_FACTOR=2
+32.9826  BLOCK_M1=64,BLOCK_N2=64,num_warps=8
+46.8351  num_warps=2
+50.2447  waves_per_eu=2

@@ -1,0 +1,31 @@
+facts.md:
+- r1.i1.g1
+- r1.i2.g2
+- r2.i3.g10
+pool.md:
+- r1.i3.g3
+- r1.i4.g4
+- r1.i5.g5
+- r1.i6.g6
+- r1.i7.g7
+- r3.i4.g15
+- r4.i1.g16
+- r4.i2.g17
+- '{''id'': ''r4.i1.g16'', ''what'': ''tl.range(num_stages=N) and flatten=True on
+  the dk/dv loop ALONE. Not the closed launch surface: config num_stages is whole-kernel,
+  which is why round 3 read it at 12.2-12.9 ms -- it also pipelines the dq loop, which
+  has zero scratch traffic and no slack. Per-loop staging has never been expressible
+  before.\n''}'
+- '{''id'': ''r4.i2.g17'', ''what'': ''Split the dk/dv pass into two sequential m-loops,
+  one accumulating dv and one accumulating dk. Halves peak accumulator residency 512
+  -> 256 VGPRs and the loop-invariant set 768 -> 512, at the cost of a second pass
+  over Q/dO/LSE and a recompute of p. Tile, BLOCK_N1, fusion and launch config untouched,
+  so it is none of the closed surface. Falsifiable on a free compile: if s_set_vgpr_msb
+  does not drop below 1666, the premise is wrong.\n''}'
+dead_ends.md:
+- r2.i1.g8
+- r2.i2.g9
+- r2.i4.g11
+- r3.i1.g12
+- r3.i2.g13
+- r3.i3.g14

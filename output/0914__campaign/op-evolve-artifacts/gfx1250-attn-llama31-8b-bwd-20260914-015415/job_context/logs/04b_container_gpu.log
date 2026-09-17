@@ -1,0 +1,110 @@
+### throwaway container with runtime.runner.docker.options verbatim
+3360e9ace9def821af51269b3c3b5d9ff9c93f7b73ad64fed9d2974f3ed21a2b
+container created OK (options accepted)
+
+### rocm-smi present?
+/opt/venv/bin/rocm-smi
+ROCM-SMI version: 4.0.0+feb9c98
+ROCM-SMI-LIB version: 7.8.0
+### rocm-smi --showproductname (timeout-guarded; dmesg wedge count was 0 beforehand)
+
+
+============================ ROCm System Management Interface ============================
+====================================== Product Info ======================================
+GPU[0]		: Card Series: 		AMD Radeon Graphics
+GPU[0]		: Card Model: 		0x75c1
+GPU[0]		: Card Vendor: 		0x1002
+GPU[0]		: Card SKU: 		M4500001
+GPU[0]		: Subsystem ID: 	0x75c1
+GPU[0]		: Device Rev: 		0x00
+GPU[0]		: Node ID: 		2
+GPU[0]		: GUID: 		34992
+GPU[0]		: GFX Version: 		gfx1250
+GPU[1]		: Card Series: 		AMD Radeon Graphics
+GPU[1]		: Card Model: 		0x75c1
+GPU[1]		: Card Vendor: 		0x1002
+GPU[1]		: Card SKU: 		M4500001
+GPU[1]		: Subsystem ID: 	0x75c1
+GPU[1]		: Device Rev: 		0x00
+GPU[1]		: Node ID: 		3
+GPU[1]		: GUID: 		30548
+GPU[1]		: GFX Version: 		gfx1250
+GPU[2]		: Card Series: 		AMD Radeon Graphics
+GPU[2]		: Card Model: 		0x75c1
+GPU[2]		: Card Vendor: 		0x1002
+GPU[2]		: Card SKU: 		M4500001
+GPU[2]		: Subsystem ID: 	0x75c1
+GPU[2]		: Device Rev: 		0x00
+GPU[2]		: Node ID: 		4
+GPU[2]		: GUID: 		57865
+GPU[2]		: GFX Version: 		gfx1250
+GPU[3]		: Card Series: 		AMD Radeon Graphics
+GPU[3]		: Card Model: 		0x75c1
+GPU[3]		: Card Vendor: 		0x1002
+GPU[3]		: Card SKU: 		M4500001
+GPU[3]		: Subsystem ID: 	0x75c1
+GPU[3]		: Device Rev: 		0x00
+GPU[3]		: Node ID: 		5
+GPU[3]		: GUID: 		51359
+GPU[3]		: GFX Version: 		gfx1250
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+rc=0
+
+### GPU count / arch from sysfs (does not touch the amdgpu ioctl)
+6
+/sys/class/kfd/kfd/topology/nodes/2/properties gfx=120500 simd=1024
+/sys/class/kfd/kfd/topology/nodes/3/properties gfx=120500 simd=1024
+/sys/class/kfd/kfd/topology/nodes/4/properties gfx=120500 simd=1024
+/sys/class/kfd/kfd/topology/nodes/5/properties gfx=120500 simd=1024
+### ROCm version
+---
+============================== Version of System Component ===============================
+Driver version: 7.1.1.31300009
+
+### node 3 (= GPU[1], runtime.gpu_id 1) properties
+simd_count 1024
+lds_size_in_kb 320
+wave_front_size 32
+array_count 32
+simd_per_cu 4
+gfx_target_version 120500
+max_engine_clk_fcompute 2400
+
+### is any card busy right now? (use/clock) -- hazard 6, no GPU lock exists
+GPU[0]		: sclk clock level: 1 (2358Mhz)
+GPU[1]		: sclk clock level: 1 (2400Mhz)
+GPU[2]		: sclk clock level: 1 (2359Mhz)
+GPU[3]		: sclk clock level: 1 (2365Mhz)
+GPU[0]		: GPU use (%): 0
+GPU[1]		: GPU use (%): 0
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+### ROCm version in image
+ls: cannot access '/opt/rocm*/': No such file or directory
+7.14.60850-0000000
+             version: 1.3.2
+        git_revision: feb9c98f8779fbdd6fa26cd07ca4f5454ac382db
+        library_arch: x86_64-unknown-linux-gnu
+         system_name: Linux
+    system_processor: x86_64
+
+### torch import + GPU op on runtime.gpu_id=1
+torch       2.11.0+rocm7.14.0a20260625
+hip         7.14.60850
+available   True
+device_cnt  1
+name        AMD Radeon Graphics
+arch        gfx1250
+warp_size   32
+CUs         256
+mem GiB     432.0
+gpu op      OK bf16 matmul, sum= -109072.6875
+### where is ROCm? (_provision() globs /opt/rocm*/libexec/rocprofiler-compute/requirements.txt)
+ls: cannot access '/opt/rocm*': No such file or directory
+--- hipconfig path ---
+/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel
+--- rocprof-compute requirements anywhere? ---
+ls: cannot access '/opt/rocm*/libexec/rocprofiler-compute/requirements.txt': No such file or directory
+--- rocprof-compute binary ---
+/opt/venv/bin/rocprofv3

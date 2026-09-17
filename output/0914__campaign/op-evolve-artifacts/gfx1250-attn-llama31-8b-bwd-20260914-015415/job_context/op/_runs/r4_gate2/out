@@ -1,0 +1,1 @@
+RESULT {"label": "g17", "ms": null, "census": {"vgpr": "973", "spill": "0", "sspill": "63", "sgpr": "107", "scratchB": "0", "lds": "0", "wmma": 512, "msb": 1728, "sload": 0, "sstore": 0, "ds": 696, "ninstr": 9889}, "absum": [3694818.5, 1474473.625, 1492202.25]}

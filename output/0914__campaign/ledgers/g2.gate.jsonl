@@ -1,0 +1,145 @@
+{"tag":"gate|gate-s1024|fused","gpu":2,"t":1789352476,"r":{"shape": "gate-s1024", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789352471.987165, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "gpu": "2", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 2, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 1024, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.98593957446458, "dq": 52.13884166837584, "dk": 52.211941291629856, "dv": 52.74646900744986}, "correct": true, "fwd_ms": 0.3268510103225708, "bwd_ms": 0.41546300053596497, "fwd_tflops": 105.12354951600183, "bwd_tflops": 206.75570582503423, "total_ms": 0.7423140108585358, "total_tflops": 162.0056775553951, "bwd_share": 0.5596863247339953, "per_step_ms": 23.754048347473145, "peak_mem_gib": 0.8750033378601074, "dmesg_faults_after": 0, "wall_s": 4.282568454742432}}
+{"tag":"gate|gate-s1024|turbo","gpu":2,"t":1789352479,"r":{"shape": "gate-s1024", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789352477.3687854, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "gpu": "2", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 2, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 1024, "hq": 32, "hkv": 8, "head_dim": 128, "sqnr_db": {"out": 53.98593957446458, "dq": 52.13884166837584, "dk": 52.211941291629856, "dv": 52.74646900744986}, "correct": true, "fwd_ms": 0.3233650028705597, "bwd_ms": 0.42996498942375183, "fwd_tflops": 106.2568245264127, "bwd_tflops": 199.78218699881614, "total_ms": 0.7533299922943115, "total_tflops": 159.63666058448538, "bwd_share": 0.5707525172524563, "per_step_ms": 24.10655975341797, "peak_mem_gib": 0.8750033378601074, "dmesg_faults_after": 0, "wall_s": 1.802150011062622}}
+{"tag":"gate|gate-s2048|fused","gpu":2,"t":1789352483,"r":{"shape": "gate-s2048", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789352480.265524, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "gpu": "2", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 2, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 2048, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.865503590401616, "dq": 52.14381446593494, "dk": 52.220359119760474, "dv": 52.73122015000708}, "correct": true, "fwd_ms": 0.4436259865760803, "bwd_ms": 1.0393589735031128, "fwd_tflops": 309.8081664078299, "bwd_tflops": 330.5858634403477, "total_ms": 1.4829849600791931, "total_tflops": 324.3703409684695, "bwd_share": 0.7008560447218627, "per_step_ms": 47.45551872253418, "peak_mem_gib": 1.6250052452087402, "dmesg_faults_after": 0, "wall_s": 2.9386959075927734}}
+{"tag":"gate|gate-s2048|turbo","gpu":2,"t":1789352486,"r":{"shape": "gate-s2048", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789352484.283149, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "gpu": "2", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 2, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 2048, "hq": 32, "hkv": 8, "head_dim": 128, "sqnr_db": {"out": 53.865503590401616, "dq": 52.14381446593494, "dk": 52.220359119760474, "dv": 52.73122015000708}, "correct": true, "fwd_ms": 0.4507170021533966, "bwd_ms": 1.042525053024292, "fwd_tflops": 304.93403358505685, "bwd_tflops": 329.5818960736225, "total_ms": 1.4932420551776886, "total_tflops": 322.14223774641744, "bwd_share": 0.6981621294480864, "per_step_ms": 47.783745765686035, "peak_mem_gib": 1.6250052452087402, "dmesg_faults_after": 0, "wall_s": 1.8260397911071777}}
+{"tag":"gate|llama31-8b-s4096|fused","gpu":2,"t":1789352490,"r":{"shape": "llama31-8b-s4096", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789352487.1892757, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "gpu": "2", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 2, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 4096, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.73858945795214, "dq": 52.206226373597595, "dk": 52.29353782842695, "dv": 52.69993866924786}, "correct": true, "fwd_ms": 0.8474709987640381, "bwd_ms": 3.11407208442688, "fwd_tflops": 648.7016248222895, "bwd_tflops": 441.34801554311014, "total_ms": 3.961543083190918, "total_tflops": 485.7060262129351, "bwd_share": 0.7860755314362446, "per_step_ms": 126.76937866210938, "peak_mem_gib": 3.125009059906006, "dmesg_faults_after": 0, "wall_s": 3.06546688079834}}
+{"tag":"gate|llama31-8b-s4096|turbo","gpu":2,"t":1789352493,"r":{"shape": "llama31-8b-s4096", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789352491.347116, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "gpu": "2", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 2, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 4096, "hq": 32, "hkv": 8, "head_dim": 128, "sqnr_db": {"out": 53.73858945795214, "dq": 52.206226373597595, "dk": 52.29353782842695, "dv": 52.69993866924786}, "correct": true, "fwd_ms": 0.8458290100097656, "bwd_ms": 3.1067419052124023, "fwd_tflops": 649.9609346357755, "bwd_tflops": 442.38935085469717, "total_ms": 3.952570915222168, "total_tflops": 486.8085582469168, "bwd_share": 0.7860053549571234, "per_step_ms": 126.48226928710938, "peak_mem_gib": 3.125009059906006, "dmesg_faults_after": 0, "wall_s": 1.9077820777893066}}
+{"tag":"gate|gate-b1|fused","gpu":2,"t":1789352496,"r":{"shape": "gate-b1", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789352494.3279035, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "gpu": "2", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 2, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 1, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.68196186416223, "dq": 52.206502921398304, "dk": 52.262635145301, "dv": 52.67622076071972}, "correct": true, "fwd_ms": 0.8417029976844788, "bwd_ms": 3.2562060356140137, "fwd_tflops": 653.1470309602981, "bwd_tflops": 422.08309906926246, "total_ms": 4.097909033298492, "total_tflops": 469.54320678495276, "bwd_share": 0.7946018345343858, "per_step_ms": 131.13308906555176, "peak_mem_gib": 1.832061767578125, "dmesg_faults_after": 0, "wall_s": 1.8804035186767578}}
+{"tag":"gate|gate-b1|turbo","gpu":2,"t":1789352499,"r":{"shape": "gate-b1", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789352497.2835827, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "gpu": "2", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 2, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 1, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "sqnr_db": {"out": 53.68196186416223, "dq": 52.206502921398304, "dk": 52.262635145301, "dv": 52.67622076071972}, "correct": true, "fwd_ms": 0.8344119787216187, "bwd_ms": 3.284247875213623, "fwd_tflops": 658.8541726477451, "bwd_tflops": 418.47923388870373, "total_ms": 4.118659853935242, "total_tflops": 467.1775327038826, "bwd_share": 0.7974069215926229, "per_step_ms": 131.79711532592773, "peak_mem_gib": 1.832061767578125, "dmesg_faults_after": 0, "wall_s": 1.8892390727996826}}
+{"tag":"gate|llama31-8b-b2|fused","gpu":2,"t":1789352502,"r":{"shape": "llama31-8b-b2", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789352500.2468483, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "gpu": "2", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 2, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 2, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.63365366604665, "dq": 52.23344946677845, "dk": 52.29969352468498, "dv": 52.692387139554604}, "correct": true, "fwd_ms": 1.3782680034637451, "bwd_ms": 5.058350086212158, "fwd_tflops": 797.7487868925358, "bwd_tflops": 543.4141612563568, "total_ms": 6.436618089675903, "total_tflops": 597.8746359658211, "bwd_share": 0.7858707811677632, "per_step_ms": 205.9717788696289, "peak_mem_gib": 3.125009059906006, "dmesg_faults_after": 0, "wall_s": 1.9985480308532715}}
+{"tag":"gate|llama31-8b-b2|turbo","gpu":2,"t":1789352505,"r":{"shape": "llama31-8b-b2", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789352503.3086016, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "gpu": "2", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 2, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 2, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "sqnr_db": {"out": 53.63365366604665, "dq": 52.23344946677845, "dk": 52.29969352468498, "dv": 52.692387139554604}, "correct": true, "fwd_ms": 1.377066969871521, "bwd_ms": 5.039641857147217, "fwd_tflops": 798.4445577680099, "bwd_tflops": 545.4314309144177, "total_ms": 6.416708827018738, "total_tflops": 599.7296746600159, "bwd_share": 0.7853935705991324, "per_step_ms": 205.3346824645996, "peak_mem_gib": 3.125009059906006, "dmesg_faults_after": 0, "wall_s": 1.9967947006225586}}
+{"tag":"gate|llama31-8b|fused","gpu":2,"t":1789352509,"r":{"shape": "llama31-8b", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789352506.3838968, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "gpu": "2", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 2, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.66972664416035, "dq": 52.2407931159983, "dk": 52.30895023622992, "dv": 52.71029671803958}, "correct": true, "fwd_ms": 2.581512928009033, "bwd_ms": 9.870530128479004, "fwd_tflops": 851.8350738022356, "bwd_tflops": 556.9668566248674, "total_ms": 12.452043056488037, "total_tflops": 618.0978783575405, "bwd_share": 0.7926835848303659, "per_step_ms": 398.4653778076172, "peak_mem_gib": 6.125009059906006, "dmesg_faults_after": 0, "wall_s": 2.276182174682617}}
+{"tag":"gate|llama31-8b|turbo","gpu":2,"t":1789352512,"r":{"shape": "llama31-8b", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789352509.7490218, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "gpu": "2", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 2, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 4, "seqlen": 8192, "hq": 32, "hkv": 8, "head_dim": 128, "sqnr_db": {"out": 53.66972664416035, "dq": 52.2407931159983, "dk": 52.30895023622992, "dv": 52.71029671803958}, "correct": true, "fwd_ms": 2.5858399868011475, "bwd_ms": 9.859474182128906, "fwd_tflops": 850.4096412679946, "bwd_tflops": 557.5914128204492, "total_ms": 12.445314168930054, "total_tflops": 618.4320692881062, "bwd_share": 0.7922238079568339, "per_step_ms": 398.2500534057617, "peak_mem_gib": 6.125009059906006, "dmesg_faults_after": 0, "wall_s": 2.270429849624634}}
+{"tag":"gate|gate-b8|fused","gpu":2,"t":1789352515,"r":{"shape": "gate-b8", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789352513.1016939, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "gpu": "2", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 2, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 8, "seqlen": 4096, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.755352996147295, "dq": 52.20199172441675, "dk": 52.25968902144534, "dv": 52.726126370436425}, "correct": true, "fwd_ms": 1.4637969732284546, "bwd_ms": 5.627042770385742, "fwd_tflops": 751.1366998874093, "bwd_tflops": 488.49443332942127, "total_ms": 7.090839743614197, "total_tflops": 542.7129700232837, "bwd_share": 0.7935650746377807, "per_step_ms": 226.9068717956543, "peak_mem_gib": 6.125009059906006, "dmesg_faults_after": 0, "wall_s": 2.1015491485595703}}
+{"tag":"gate|gate-b8|turbo","gpu":2,"t":1789352518,"r":{"shape": "gate-b8", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789352516.3013017, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "gpu": "2", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 2, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 8, "seqlen": 4096, "hq": 32, "hkv": 8, "head_dim": 128, "sqnr_db": {"out": 53.755352996147295, "dq": 52.20199172441675, "dk": 52.25968902144534, "dv": 52.726126370436425}, "correct": true, "fwd_ms": 1.467041015625, "bwd_ms": 5.6254401206970215, "fwd_tflops": 749.4757243086198, "bwd_tflops": 488.63360207617177, "total_ms": 7.0924811363220215, "total_tflops": 542.5873715064437, "bwd_share": 0.7931554575292434, "per_step_ms": 226.9593963623047, "peak_mem_gib": 6.125009059906006, "dmesg_faults_after": 0, "wall_s": 2.1048080921173096}}
+{"tag":"gate|gate-s16384|fused","gpu":2,"t":1789352523,"r":{"shape": "gate-s16384", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789352519.4820848, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "gpu": "2", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 2, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 1, "seqlen": 16384, "hq": 32, "hkv": 8, "head_dim": 128, "impl_note": "turbo forward + vendored fused backward", "sqnr_db": {"out": 53.56300666989452, "dq": 52.24805770189455, "dk": 52.35296608302461, "dv": 52.66572639439842}, "correct": true, "fwd_ms": 2.559640884399414, "bwd_ms": 9.65793228149414, "fwd_tflops": 859.1139753059429, "bwd_tflops": 569.2272402255335, "total_ms": 12.217573165893555, "total_tflops": 629.9599183836028, "bwd_share": 0.7904951458326536, "per_step_ms": 390.96234130859375, "peak_mem_gib": 5.66412353515625, "dmesg_faults_after": 0, "wall_s": 3.41296648979187}}
+{"tag":"gate|gate-s16384|turbo","gpu":2,"t":1789352526,"r":{"shape": "gate-s16384", "tune": "fwd:num_stages=2", "dtype": "bf16", "causal": true, "ok": true, "wall_start": 1789352523.9978487, "dmesg_faults_before": 0, "turbo_path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/primus_turbo/__init__.py", "gpu": "2", "arch": "gfx1250", "is_gfx1250": true, "configs": {"fwd": [{"PRE_LOAD_V": false, "num_warps": 2, "num_stages": 2}], "bwd": [{"num_warps": 4, "num_stages": 1}]}, "batch": 1, "seqlen": 16384, "hq": 32, "hkv": 8, "head_dim": 128, "sqnr_db": {"out": 53.56300666989452, "dq": 52.24805770189455, "dk": 52.35296608302461, "dv": 52.66572639439842}, "correct": true, "fwd_ms": 2.5637669563293457, "bwd_ms": 9.603250503540039, "fwd_tflops": 857.731335573665, "bwd_tflops": 572.4684716756519, "total_ms": 12.167017459869385, "total_tflops": 632.5774923737657, "bwd_share": 0.7892855036342762, "per_step_ms": 389.3445587158203, "peak_mem_gib": 5.66412353515625, "dmesg_faults_after": 0, "wall_s": 2.245159864425659}}
+{"round_complete":1,"phase":"gate","t":1789352526}
+{"round_complete":2,"phase":"gate","t":1789352531}
+{"round_complete":3,"phase":"gate","t":1789352651}
+{"round_complete":4,"phase":"gate","t":1789352771}
+{"round_complete":5,"phase":"gate","t":1789352891}
+{"round_complete":6,"phase":"gate","t":1789353011}
+{"round_complete":7,"phase":"gate","t":1789353131}
+{"round_complete":8,"phase":"gate","t":1789353251}
+{"round_complete":9,"phase":"gate","t":1789353371}
+{"round_complete":10,"phase":"gate","t":1789353491}
+{"round_complete":11,"phase":"gate","t":1789353611}
+{"round_complete":12,"phase":"gate","t":1789353731}
+{"round_complete":13,"phase":"gate","t":1789353851}
+{"round_complete":14,"phase":"gate","t":1789353971}
+{"round_complete":15,"phase":"gate","t":1789354091}
+{"round_complete":16,"phase":"gate","t":1789354211}
+{"round_complete":17,"phase":"gate","t":1789354331}
+{"round_complete":18,"phase":"gate","t":1789354451}
+{"round_complete":19,"phase":"gate","t":1789354571}
+{"round_complete":20,"phase":"gate","t":1789354691}
+{"round_complete":21,"phase":"gate","t":1789354811}
+{"round_complete":22,"phase":"gate","t":1789354931}
+{"round_complete":23,"phase":"gate","t":1789355051}
+{"round_complete":24,"phase":"gate","t":1789355171}
+{"round_complete":25,"phase":"gate","t":1789355291}
+{"round_complete":26,"phase":"gate","t":1789355411}
+{"round_complete":27,"phase":"gate","t":1789355531}
+{"round_complete":28,"phase":"gate","t":1789355651}
+{"round_complete":29,"phase":"gate","t":1789355771}
+{"round_complete":30,"phase":"gate","t":1789355891}
+{"round_complete":31,"phase":"gate","t":1789356011}
+{"round_complete":32,"phase":"gate","t":1789356131}
+{"round_complete":33,"phase":"gate","t":1789356251}
+{"round_complete":34,"phase":"gate","t":1789356371}
+{"round_complete":35,"phase":"gate","t":1789356492}
+{"round_complete":36,"phase":"gate","t":1789356612}
+{"round_complete":37,"phase":"gate","t":1789356732}
+{"round_complete":38,"phase":"gate","t":1789356852}
+{"round_complete":39,"phase":"gate","t":1789356972}
+{"round_complete":40,"phase":"gate","t":1789357092}
+{"round_complete":41,"phase":"gate","t":1789357212}
+{"round_complete":42,"phase":"gate","t":1789357332}
+{"round_complete":43,"phase":"gate","t":1789357452}
+{"round_complete":44,"phase":"gate","t":1789357572}
+{"round_complete":45,"phase":"gate","t":1789357692}
+{"round_complete":46,"phase":"gate","t":1789357812}
+{"round_complete":47,"phase":"gate","t":1789357932}
+{"round_complete":48,"phase":"gate","t":1789358052}
+{"round_complete":49,"phase":"gate","t":1789358172}
+{"round_complete":50,"phase":"gate","t":1789358962}
+{"round_complete":51,"phase":"gate","t":1789359082}
+{"round_complete":52,"phase":"gate","t":1789359202}
+{"round_complete":53,"phase":"gate","t":1789359322}
+{"round_complete":54,"phase":"gate","t":1789359442}
+{"round_complete":55,"phase":"gate","t":1789359562}
+{"round_complete":56,"phase":"gate","t":1789359682}
+{"round_complete":57,"phase":"gate","t":1789359802}
+{"round_complete":58,"phase":"gate","t":1789359922}
+{"round_complete":59,"phase":"gate","t":1789360042}
+{"round_complete":60,"phase":"gate","t":1789360162}
+{"round_complete":61,"phase":"gate","t":1789360282}
+{"round_complete":62,"phase":"gate","t":1789360402}
+{"round_complete":63,"phase":"gate","t":1789360522}
+{"round_complete":64,"phase":"gate","t":1789360642}
+{"round_complete":65,"phase":"gate","t":1789360762}
+{"round_complete":66,"phase":"gate","t":1789360882}
+{"round_complete":67,"phase":"gate","t":1789361002}
+{"round_complete":68,"phase":"gate","t":1789361122}
+{"round_complete":69,"phase":"gate","t":1789361242}
+{"round_complete":70,"phase":"gate","t":1789361362}
+{"round_complete":71,"phase":"gate","t":1789361482}
+{"round_complete":72,"phase":"gate","t":1789361602}
+{"round_complete":73,"phase":"gate","t":1789361722}
+{"round_complete":74,"phase":"gate","t":1789361842}
+{"round_complete":75,"phase":"gate","t":1789361962}
+{"round_complete":76,"phase":"gate","t":1789362082}
+{"round_complete":77,"phase":"gate","t":1789362202}
+{"round_complete":78,"phase":"gate","t":1789362322}
+{"round_complete":79,"phase":"gate","t":1789362442}
+{"round_complete":80,"phase":"gate","t":1789362562}
+{"round_complete":81,"phase":"gate","t":1789362682}
+{"round_complete":82,"phase":"gate","t":1789362802}
+{"round_complete":83,"phase":"gate","t":1789362922}
+{"round_complete":84,"phase":"gate","t":1789363042}
+{"round_complete":85,"phase":"gate","t":1789363162}
+{"round_complete":86,"phase":"gate","t":1789363282}
+{"round_complete":87,"phase":"gate","t":1789363402}
+{"round_complete":88,"phase":"gate","t":1789363522}
+{"round_complete":89,"phase":"gate","t":1789363642}
+{"round_complete":90,"phase":"gate","t":1789363762}
+{"round_complete":91,"phase":"gate","t":1789363882}
+{"round_complete":92,"phase":"gate","t":1789364002}
+{"round_complete":93,"phase":"gate","t":1789364122}
+{"round_complete":94,"phase":"gate","t":1789364242}
+{"round_complete":95,"phase":"gate","t":1789364362}
+{"round_complete":96,"phase":"gate","t":1789364482}
+{"round_complete":97,"phase":"gate","t":1789364602}
+{"round_complete":98,"phase":"gate","t":1789364722}
+{"round_complete":99,"phase":"gate","t":1789364842}
+{"round_complete":100,"phase":"gate","t":1789364964}
+{"round_complete":101,"phase":"gate","t":1789365084}
+{"round_complete":102,"phase":"gate","t":1789365204}
+{"round_complete":103,"phase":"gate","t":1789365324}
+{"round_complete":104,"phase":"gate","t":1789365444}
+{"round_complete":105,"phase":"gate","t":1789365564}
+{"round_complete":106,"phase":"gate","t":1789365684}
+{"round_complete":107,"phase":"gate","t":1789365804}
+{"round_complete":108,"phase":"gate","t":1789365924}
+{"round_complete":109,"phase":"gate","t":1789366044}
+{"round_complete":110,"phase":"gate","t":1789366165}
+{"round_complete":111,"phase":"gate","t":1789366285}
+{"round_complete":112,"phase":"gate","t":1789366405}
+{"round_complete":113,"phase":"gate","t":1789366525}
+{"round_complete":114,"phase":"gate","t":1789366645}
+{"round_complete":115,"phase":"gate","t":1789368185}
+{"round_complete":116,"phase":"gate","t":1789368305}
+{"round_complete":117,"phase":"gate","t":1789368425}
+{"round_complete":118,"phase":"gate","t":1789368545}
+{"round_complete":119,"phase":"gate","t":1789368665}
+{"round_complete":120,"phase":"gate","t":1789368785}
+{"round_complete":121,"phase":"gate","t":1789368905}
+{"round_complete":122,"phase":"gate","t":1789369025}
+{"round_complete":123,"phase":"gate","t":1789369145}
+{"round_complete":124,"phase":"gate","t":1789369265}
+{"round_complete":125,"phase":"gate","t":1789369385}
+{"round_complete":126,"phase":"gate","t":1789369505}
+{"round_complete":127,"phase":"gate","t":1789369625}
+{"round_complete":128,"phase":"gate","t":1789369745}
+{"round_complete":129,"phase":"gate","t":1789369865}

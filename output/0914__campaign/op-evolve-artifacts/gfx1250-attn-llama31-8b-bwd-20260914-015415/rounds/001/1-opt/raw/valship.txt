@@ -1,0 +1,23 @@
+[runjob] launched key=valship pid=2089960
+==============================================================================
+CORRECTNESS  /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-attn-llama31-8b-bwd-20260914-015415/rounds/001/op  vs op/eager/  (gate: all four tensors >= 50 dB)
+------------------------------------------------------------------------------
+shape                           out       dq       dk       dv   verdict
+b4_s8192_hq32_hkv8_d128       53.67    52.24    52.31    52.71   pass
+sq_lt_skv                     53.01    52.50    52.58    52.57   pass
+min_seqlen                    54.09    52.04    52.08    52.77   pass
+ragged_tail                   53.99    52.09    52.15    52.75   pass
+sq_gt_skv                     53.97   -15.95    52.10    52.72   fail  (diagnostic, not gated)
+==============================================================================
+SPEED  statistic=median  iters=30  warmup_s=3.0  order=op>beat>baseline>baseline>beat>op
+------------------------------------------------------------------------------
+shape                      arm           fwd ms    bwd ms  bwd TF/s  bwd GB/s  spread%
+b4_s8192_hq32_hkv8_d128    candidate     4.9746    8.6997    632.00     154.3     0.42
+b4_s8192_hq32_hkv8_d128    beat          3.7576   11.6543    471.78     115.2     2.07
+b4_s8192_hq32_hkv8_d128    baseline      4.9660   10.0108    549.23     134.1     0.74
+------------------------------------------------------------------------------
+shape                        vs beat  required  vs baseline   verdict
+b4_s8192_hq32_hkv8_d128       1.340x     1.50x       1.151x   FAIL
+==============================================================================
+VALIDATION FAILED: speed
+  b4_s8192_hq32_hkv8_d128: backward is 1.340x op/beat/, needs 1.50x -- short by 10.7% of the target
