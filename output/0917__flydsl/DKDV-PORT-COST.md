@@ -85,6 +85,36 @@ lane 内：`e = 0..7` 要 `kv = half*8 + 0..7`，正好是 tile `j` 的八个值
 `P^T` 的 `q` 落在累加器的 N 轴（`l%16`）而操作数要它在 M 轴；dq 沿 kv 收缩，
 两边的 `q` 都在 `l%16` 上。**不能从一个推另一个** —— 这也是为什么两个都要单独验。
 
+## dkdv 的转置怎么做：机制存在，而且两半都是现成惯用法
+
+不用另发明。前向里已经有这条路的两半（`fmha_b16_buffer_managers.py` 的类清单）：
+
+| 需要的动作 | 前向里的现成实现 |
+|---|---|
+| WMMA 累加器 → LDS | `OManager16bV1`："WMMA accumulator -> swizzled LDS -> coalesced buffer_store" |
+| 按转置布局从 LDS 读回 | `VManager16bV1/V2`：`rocdl.ds_load_tr16_b128(v8_ty, ptr)`，返回 v8 bf16 |
+
+所以 dkdv 里 `P^T` / `dS^T` 每个 tile、每次 k 迭代要多付的是：
+
+1. 累加器 fp32 → bf16，**lane 内**（前向的 epilogue 就这么做）；
+2. 按 O 风格的 XOR swizzle 存进 LDS；
+3. 一次 barrier；
+4. 两次 `ds_load_tr16_b128` 拼成一个 v16 操作数。
+
+**swizzle 是 bank 冲突优化，不是正确性要求。** 前向的注释写明：V block 按 32(kv)×d 子块堆放，
+每块切成 32×32 tile、再切成 4(kv)×16(d) 子 tile，子 tile 列号按行号 `& 1` 做 XOR
+——"to make the transpose load (`ds_load_tr16_b128`) bank-conflict-free"。
+先不 swizzle 也能对，只是慢。
+
+**还有一条硬要求**（前向注释里用 55% NaN 的代价换来的）：LDS 读**必须**用
+plain intrinsic，**绝不能用不透明的 inline asm** —— 否则 LLVM 看不见它与异步
+global→LDS 写之间的 RAW 依赖，在 `DEP_MODE=2` 下会错序，表现为
+**16384 causal 下 55% 的静默 NaN**。写 dkdv 时照抄这一条，不要自己发明内存 op 封装。
+
+**尚未实测的部分**：`ds_load_tr16_b128` 的确切转置语义（它转置哪个 16×16 子块、
+lane→地址怎么映射）在读过的代码里没有文档化。这是下一个探针，也是写 dkdv 之前
+最后一个未知量。
+
 ## 与已有证据合起来看
 
 到今天为止，FlyDSL gfx1250 反向这件事的账目是：
