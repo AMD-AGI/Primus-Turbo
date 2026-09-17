@@ -28,6 +28,15 @@ if _worker_id is not None:
     os.environ["HIP_VISIBLE_DEVICES"] = str(_gpu_id)
 
 
+# Suites that run on gfx1250 (MI455X). Everything else is skipped there -- see
+# pytest_collection_modifyitems. Paths are matched as suffixes of the test file path.
+_GFX1250_ENABLED_TESTS = (
+    # bf16 grouped GEMM through the backend registry: Triton, plus the FlyDSL
+    # WMMA/TDM kernels in grouped_gemm_bf16_kernel_gfx1250.py.
+    "tests/pytorch/ops/test_grouped_gemm.py",
+)
+
+
 def pytest_addoption(parser):
     parser.addoption(
         "--dist-only",
@@ -62,10 +71,19 @@ def pytest_collection_modifyitems(config, items):
         is_gfx1250 = is_gfx1250_jax()
 
     if is_gfx1250:
+        # The default on gfx1250 is still "skip": most ops have no port yet, and a
+        # blanket skip is honest about that. _GFX1250_ENABLED_TESTS is the opt-in list
+        # of suites that have been brought up and measured on the part, so a
+        # regression in one of those shows up as a failure instead of disappearing
+        # behind the skip. Match on a path suffix, not the bare file name -- there is
+        # a second test_grouped_gemm.py under tests/jax/.
         skip_gfx1250 = pytest.mark.skip(reason="Not yet supported on gfx1250")
         for item in items:
-            item.add_marker(skip_gfx1250)
-        return
+            path = str(getattr(item, "path", item.fspath)).replace(os.sep, "/")
+            if not any(path.endswith(enabled) for enabled in _GFX1250_ENABLED_TESTS):
+                item.add_marker(skip_gfx1250)
+        # Fall through: the enabled items still need the --dist-only / --deterministic
+        # filtering below.
 
     dist_only = config.getoption("--dist-only", False)
     deterministic_only = config.getoption("--deterministic-only", False)

@@ -526,11 +526,18 @@ if __name__ == "__main__":
         "scipy",
     ]
 
-    # TODO(ruibin): Triton 3.7.0 and flydsl 0.2.4 does not support gfx1250, so we skip their installation when building for gfx1250.
     offload_arch_list, _ = get_offload_archs()
+
+    # flydsl 0.2.4 does support gfx1250: the four symbols the gfx1250 kernels need
+    # (rocdl.WMMA, rocdl.make_tdm_atom, flydsl.expr.tdm_ops, rocdl.ds_load_tr16_b128)
+    # are all present in it, and the gfx1250 bf16 grouped-GEMM entry points compile
+    # and give correct results under it. Installed on every arch.
+    install_requires.append("flydsl==0.2.4")
+
+    # TODO(ruibin): Triton 3.7.0 does not support gfx1250, so we skip its
+    # installation when building for gfx1250.
     if "--offload-arch=gfx1250" not in offload_arch_list:
         install_requires.append("triton>=3.7.0")
-        install_requires.append("flydsl==0.2.4")
     else:
         print("[Primus-Turbo Setup] Building for gfx1250; skipping triton dependency.")
 
