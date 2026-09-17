@@ -1,0 +1,21 @@
+{
+  "flydsl": {
+    "sqnr_out_db": 51.63,
+    "isfinite": "134217728/134217728",
+    "full_coverage": true,
+    "median_ms": 2.3732,
+    "best_ms": 2.3282,
+    "sd_pct": 2.68,
+    "n": 20
+  },
+  "asm": {
+    "sqnr_out_db": 53.62,
+    "isfinite": "134217728/134217728",
+    "full_coverage": true,
+    "median_ms": 1.5691,
+    "best_ms": 1.5552,
+    "sd_pct": 1.09,
+    "n": 20
+  },
+  "ratio_asm_over_flydsl": 0.6612
+}

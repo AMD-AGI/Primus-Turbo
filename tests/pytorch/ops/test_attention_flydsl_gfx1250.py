@@ -11,6 +11,20 @@ backward is exercised through `tools/gfx1250/tune_attention.py --impl flydsl`,
 which pairs this forward with the vendored fused backward and gates all four
 tensors.
 
+REQUIRES flydsl 0.3.2. Measured 2026-09-17: on 0.2.4 this kernel does not build -- the
+0.2.4 `ast_rewriter` rejects a list as the state variable of a stateful dynamic `if`, which
+`_maybe_rescale` relies on, and no symbol shim fixes that. Note that 0.3.2 in turn deletes
+`flydsl.expr.buffer_ops`, which `primus_turbo/flydsl/attention/flash_attn_bwd.py` imports
+unconditionally, so `import primus_turbo.pytorch` fails under it. These tests therefore
+import aiter, torch and the torch-only reference, never primus_turbo.
+
+That is not yet enough to run them under pytest: `tests/conftest.py` imports
+`primus_turbo.pytorch.core.utils` during collection, so the whole session fails to collect
+under 0.3.2. Until `primus_turbo/flydsl/` is made import-safe, run these directly
+(`python3 -m pytest` still collects via conftest -- use the standalone scripts in
+`output/0917__flydsl/bin/` instead) or with 0.2.4 present, where collection works and every
+test here fails to build. Making that import lazy is the unblocking change.
+
 Two things these tests exist to catch, neither of which raises on its own:
 
   1. `flydsl_flash_attn_batch_func` RETURNS None when it will not serve a
@@ -131,13 +145,12 @@ def test_lse_shape_and_dtype(shape):
     assert got_lse.dtype is torch.float32, f"expected fp32 lse, got {got_lse.dtype}"
 
 
-@pytest.mark.xfail(
-    reason="UNVERIFIED: whether this kernel's LSE is natural log (what dense_fused_backward "
-    "expects, and what the ASM forward emits) or log2 -- the kernel carries a LOG2E "
-    "constant. Remove the xfail once measured; do not delete the test.",
-    strict=False,
-)
 def test_lse_is_natural_log():
+    """MEASURED 2026-09-17: this kernel emits natural-log LSE, ratio 1.0000 against a
+    natural-log reference at 81.85 dB. That is what dense_fused_backward expects, so the
+    pairing in `tune_attention.py --impl flydsl` needs no conversion. This test exists to
+    notice if that ever changes -- it would change gradients without raising.
+    """
     b, s, hq, hkv, d = 1, 256, 2, 1, 128
     q, k, v = _qkv(b, s, hq, hkv, d)
     scale = d**-0.5
@@ -150,8 +163,8 @@ def test_lse_is_natural_log():
     db = snr_db(ref_lse.float(), got_lse.float())
     assert db >= MIN_SNR_DB, (
         f"lse SQNR {db:.2f} dB against a NATURAL-LOG reference. If the ratio against the "
-        "reference is ~1.4427 the kernel is emitting log2 and the fused-backward pairing "
-        "needs a conversion."
+        "reference is ~1.4427 the kernel has switched to log2 and the fused-backward "
+        "pairing needs a conversion."
     )
 
 
