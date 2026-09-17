@@ -16,7 +16,6 @@ from primus_turbo.flydsl.gemm.gemm_mxfp4_kernel import (
     dense_glu_epi_quant_supported,
     gemm_mxfp4_dglu_quant_flydsl_kernel,
     gemm_mxfp4_flydsl_kernel,
-    gemm_mxfp4_glu_flydsl_kernel,
     gemm_mxfp4_glu_quant_flydsl_kernel,
 )
 from primus_turbo.pytorch.core.backend import (
@@ -518,56 +517,6 @@ def gemm_fp4_accum_impl_meta(
     return None
 
 
-@_torch_custom_op_wrapper("primus_turbo::gemm_fp4_glu_bf16_impl", mutates_args=(), device_types="cuda")
-def gemm_fp4_glu_bf16_impl(
-    a: torch.Tensor,
-    a_scale_inv: torch.Tensor,
-    b: torch.Tensor,
-    b_scale_inv: torch.Tensor,
-    probs: torch.Tensor,
-    out_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dense MXFP4 GEMM + SwiGLU: ``kernel_gemm_4w`` with ``StoreCSwiGLU``.
-
-    Writes BF16 ``l1[M, 2I]`` (gate||up) and ``act[M, I]``. Even-K shapes
-    (Llama hidden 4096) that fail the grouped glu-quant gate still run here.
-    The caller quantises ``act`` with the standalone dense quantiser.
-    """
-    M, two_i = int(a.shape[0]), int(b.shape[0])
-    assert two_i % 2 == 0, f"B rows must be 2I (gate||up), got {two_i}"
-    I = two_i // 2
-    l1 = torch.empty((M, two_i), device=a.device, dtype=out_dtype)
-    act = torch.empty((M, I), device=a.device, dtype=out_dtype)
-    gemm_mxfp4_glu_flydsl_kernel(
-        a,
-        a_scale_inv,
-        b,
-        b_scale_inv,
-        l1,
-        act,
-        probs,
-        out_dtype=out_dtype,
-    )
-    return l1, act
-
-
-@gemm_fp4_glu_bf16_impl.register_fake
-def gemm_fp4_glu_bf16_impl_meta(
-    a: torch.Tensor,
-    a_scale_inv: torch.Tensor,
-    b: torch.Tensor,
-    b_scale_inv: torch.Tensor,
-    probs: torch.Tensor,
-    out_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    M, two_i = a.shape[0], b.shape[0]
-    I = two_i // 2
-    return (
-        torch.empty((M, two_i), device=a.device, dtype=out_dtype),
-        torch.empty((M, I), device=a.device, dtype=out_dtype),
-    )
-
-
 def _alloc_dense_act_buffers(M: int, I: int, device):
     """Row/col MXFP4 pair matching :func:`quantize_fp4_with_trans` on ``[M, I]``."""
     e8 = getattr(torch, "float8_e8m0fnu", torch.uint8)
@@ -598,6 +547,9 @@ def gemm_fp4_glu_quant_impl(
     out_dtype: torch.dtype,
     row_use_sr: bool,
     col_use_sr: bool,
+    scale_rounding_mode: int,
+    activation: str,
+    clamp_limit: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dense MXFP4 GEMM + SwiGLU + dual-quant of ``act``. ``l1`` stays BF16."""
     M, two_i = int(a.shape[0]), int(b.shape[0])
@@ -621,6 +573,9 @@ def gemm_fp4_glu_quant_impl(
         out_dtype=out_dtype,
         row_use_sr=row_use_sr,
         col_use_sr=col_use_sr,
+        scale_rounding_mode=scale_rounding_mode,
+        activation=activation,
+        clamp_limit=clamp_limit,
     )
     return l1, row_out, row_sc, col_out, col_sc
 
@@ -635,8 +590,11 @@ def gemm_fp4_glu_quant_impl_meta(
     out_dtype: torch.dtype,
     row_use_sr: bool,
     col_use_sr: bool,
+    scale_rounding_mode: int,
+    activation: str,
+    clamp_limit: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    del a_scale_inv, b_scale_inv, probs, row_use_sr, col_use_sr
+    del a_scale_inv, b_scale_inv, probs, row_use_sr, col_use_sr, scale_rounding_mode, activation, clamp_limit
     M, two_i = a.shape[0], b.shape[0]
     I = two_i // 2
     row_out, row_sc, col_out, col_sc = _alloc_dense_act_buffers(M, I, a.device)
@@ -660,6 +618,9 @@ def gemm_fp4_dglu_quant_impl(
     out_dtype: torch.dtype,
     row_use_sr: bool,
     col_use_sr: bool,
+    scale_rounding_mode: int,
+    activation: str,
+    clamp_limit: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dense MXFP4 fc2 dgrad + dSwiGLU + dual-quant of ``grad_l1``."""
     M, I = int(a.shape[0]), int(b.shape[0])
@@ -683,6 +644,9 @@ def gemm_fp4_dglu_quant_impl(
         out_dtype=out_dtype,
         row_use_sr=row_use_sr,
         col_use_sr=col_use_sr,
+        scale_rounding_mode=scale_rounding_mode,
+        activation=activation,
+        clamp_limit=clamp_limit,
     )
     return row_out, row_sc, col_out, col_sc
 
@@ -698,7 +662,21 @@ def gemm_fp4_dglu_quant_impl_meta(
     out_dtype: torch.dtype,
     row_use_sr: bool,
     col_use_sr: bool,
+    scale_rounding_mode: int,
+    activation: str,
+    clamp_limit: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    del a_scale_inv, b_scale_inv, l1, probs, out_dtype, row_use_sr, col_use_sr
+    del (
+        a_scale_inv,
+        b_scale_inv,
+        l1,
+        probs,
+        out_dtype,
+        row_use_sr,
+        col_use_sr,
+        scale_rounding_mode,
+        activation,
+        clamp_limit,
+    )
     M, I = a.shape[0], b.shape[0]
     return _alloc_dense_act_buffers(M, 2 * I, a.device)

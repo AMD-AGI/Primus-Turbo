@@ -1656,6 +1656,8 @@ def _build_mxfp4_gemm_kernel(
     dglu_act_quant: bool = False,  # StoreCdSwiGLUQuadQuant; dglu, no _CSTORE
     epi_row_sr: bool = False,
     epi_col_sr: bool = False,
+    epi_activation: str = "silu",
+    epi_clamp_limit=None,
 ):
     BLOCK_M = 256
     BLOCK_N = 256
@@ -1784,6 +1786,7 @@ def _build_mxfp4_gemm_kernel(
         AQ_TSC,
         aq_col_rows,
         sr_seed,
+        srb,
     ):
         F8_IR_t = fx.Float8E4M3FN.ir_type
         lds = fx.SharedAllocator().allocate(SharedStorageFp4_4w).peek()
@@ -1878,6 +1881,8 @@ def _build_mxfp4_gemm_kernel(
                 band_drop=(not _col_safe) and (glu_i % 64 == 0),
                 cst=_CSTORE,
                 act_aux=2,
+                activation=epi_activation,
+                clamp_limit=epi_clamp_limit,
             )
             _glu_args = (
                 None,
@@ -1905,6 +1910,7 @@ def _build_mxfp4_gemm_kernel(
                     fx.recast_iter(fx.Int32, BL_buf[0].ptr),
                     wave_id,
                     lane_id,
+                    srb,
                     row_sr=epi_row_sr,
                     col_sr=epi_col_sr,
                     sr_seed=sr_seed,
@@ -1949,6 +1955,8 @@ def _build_mxfp4_gemm_kernel(
                 row_pad=_dglu_pad,
                 col_safe=(glu_i % BLOCK_N == 0),
                 store_aux=2,
+                activation=epi_activation,
+                clamp_limit=epi_clamp_limit,
             )
             if const_expr(dglu_act_quant):
                 _q = MXFP4DualQuantStoreDglu(
@@ -1965,6 +1973,7 @@ def _build_mxfp4_gemm_kernel(
                     _row_stride,
                     lane_id,
                     wave_n,
+                    srb,
                     row_sr=epi_row_sr,
                     col_sr=epi_col_sr,
                     sr_seed=sr_seed,
@@ -2331,6 +2340,7 @@ def _build_mxfp4_gemm_kernel(
             AQ_TSC: fx.Tensor,
             aq_col_rows: fx.Int32,
             sr_seed: fx.Int32,
+            scale_rounding_bias: fx.Int32,
         ):
             _kernel_body(
                 A,
@@ -2349,6 +2359,7 @@ def _build_mxfp4_gemm_kernel(
                 AQ_TSC,
                 aq_col_rows,
                 sr_seed,
+                scale_rounding_bias,
             )
 
     elif dglu_act_quant:
@@ -2370,6 +2381,7 @@ def _build_mxfp4_gemm_kernel(
             AQ_TSC: fx.Tensor,
             aq_col_rows: fx.Int32,
             sr_seed: fx.Int32,
+            scale_rounding_bias: fx.Int32,
         ):
             _kernel_body(
                 A,
@@ -2388,6 +2400,7 @@ def _build_mxfp4_gemm_kernel(
                 AQ_TSC,
                 aq_col_rows,
                 sr_seed,
+                scale_rounding_bias,
             )
 
     else:
@@ -2414,6 +2427,7 @@ def _build_mxfp4_gemm_kernel(
                 c_n,
                 ACT,
                 PROBS,
+                None,
                 None,
                 None,
                 None,
@@ -2680,6 +2694,8 @@ def _compile_mxfp4_fused(
     dglu_act_quant=False,
     epi_row_sr=False,
     epi_col_sr=False,
+    epi_activation="silu",
+    epi_clamp_limit=None,
 ):
     """Turbo/mxfp8-style fused @flyc.jit stub: ONE host dispatch enqueues the A scale
     preshuffle, the B scale preshuffle, then the NT GEMM on the same stream (no separate
@@ -2714,6 +2730,8 @@ def _compile_mxfp4_fused(
         dglu_act_quant=dglu_act_quant,
         epi_row_sr=epi_row_sr,
         epi_col_sr=epi_col_sr,
+        epi_activation=epi_activation,
+        epi_clamp_limit=epi_clamp_limit,
     )
     pre_ab = _build_mxfp4_preshuffle_kernel_ab(
         b_ilv=_bilv, byte_src=_sc_row != K128 * 4, src_unit=_su, glu_i=glu_i if glu else 0
@@ -2768,6 +2786,7 @@ def _compile_mxfp4_fused(
             AQ_TSC: fx.Tensor,
             aq_col_rows: fx.Int32,
             sr_seed: fx.Int32,
+            scale_rounding_bias: fx.Int32,
             stream: fx.Stream,
         ):
             grid_x = _preshuf(A_raw, A_scale, B_raw, B_scale, c_m, c_n, stream)
@@ -2786,6 +2805,7 @@ def _compile_mxfp4_fused(
                 AQ_TSC,
                 aq_col_rows,
                 sr_seed,
+                scale_rounding_bias,
                 value_attrs=gemm_value_attrs,
             ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
@@ -2810,6 +2830,7 @@ def _compile_mxfp4_fused(
             AQ_TSC: fx.Tensor,
             aq_col_rows: fx.Int32,
             sr_seed: fx.Int32,
+            scale_rounding_bias: fx.Int32,
             stream: fx.Stream,
         ):
             grid_x = _preshuf(A_raw, A_scale, B_raw, B_scale, c_m, c_n, stream)
@@ -2829,6 +2850,7 @@ def _compile_mxfp4_fused(
                 AQ_TSC,
                 aq_col_rows,
                 sr_seed,
+                scale_rounding_bias,
                 value_attrs=gemm_value_attrs,
             ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
@@ -2880,6 +2902,8 @@ def _get_mxfp4_fused_launch(
     dglu_act_quant=False,
     epi_row_sr=False,
     epi_col_sr=False,
+    epi_activation="silu",
+    epi_clamp_limit=None,
 ):
     lk = (
         K,
@@ -2904,6 +2928,8 @@ def _get_mxfp4_fused_launch(
         dglu_act_quant,
         epi_row_sr,
         epi_col_sr,
+        epi_activation,
+        epi_clamp_limit,
     )
     launch = _MXFP4_LAUNCH_CACHE.get(lk)
     if launch is None:
@@ -2930,6 +2956,8 @@ def _get_mxfp4_fused_launch(
             dglu_act_quant=dglu_act_quant,
             epi_row_sr=epi_row_sr,
             epi_col_sr=epi_col_sr,
+            epi_activation=epi_activation,
+            epi_clamp_limit=epi_clamp_limit,
         )
         _MXFP4_LAUNCH_CACHE[lk] = launch
     return launch
@@ -3317,95 +3345,6 @@ def gemm_mxfp4_flydsl_kernel(
     return out2.t().contiguous() if trans_c else out2
 
 
-_MXFP4_GLU_AT_CACHE: dict = {}
-
-
-def gemm_mxfp4_glu_flydsl_kernel(
-    a: torch.Tensor,
-    a_scale: torch.Tensor,
-    b: torch.Tensor,
-    b_scale: torch.Tensor,
-    l1: torch.Tensor,
-    act: torch.Tensor,
-    probs: torch.Tensor,
-    *,
-    trans_a: bool = False,
-    trans_b: bool = True,
-    out_dtype: torch.dtype = torch.bfloat16,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dense MXFP4 NT GEMM + StoreCSwiGLU: A [M, K] @ B[2I, K]^T -> l1[M, 2I], act[M, I].
-
-    Same ``kernel_gemm_4w`` as :func:`gemm_mxfp4_flydsl_kernel`, with the R B-pool
-    pointed at the up band (row offset ``I``) so gate and up for one column land
-    in the same lane. ``probs`` scales ``act`` only (pass ones for a dense MLP).
-    """
-    assert a.dim() == 2 and b.dim() == 2, "a, b must be 2D"
-    assert out_dtype in (torch.bfloat16, torch.float16)
-    assert (not trans_a) and trans_b, "mxfp4 glu FlyDSL GEMM is NT only"
-    out_fp16 = out_dtype == torch.float16
-
-    M, Kb_a = a.shape
-    two_i, Kb_b = b.shape
-    assert two_i % 2 == 0, f"B rows must be 2I (gate||up), got {two_i}"
-    I = two_i // 2
-    K = a_scale.shape[1] * 32
-    assert b_scale.shape[1] * 32 == K, f"scale K mismatch: {a_scale.shape} vs {b_scale.shape}"
-    assert a_scale.shape[0] == M and b_scale.shape[0] == two_i
-    assert Kb_a == Kb_b
-    assert K // 2 <= Kb_a <= (K + 255) // 256 * 128
-    assert K % 64 == 0 and M % 64 == 0 and I % 64 == 0
-    assert l1.shape == (M, two_i) and l1.dtype == out_dtype
-    assert act.shape == (M, I) and act.dtype == out_dtype
-    assert probs.shape == (M,) and probs.dtype == torch.float32
-
-    stream = torch.cuda.current_stream()
-    _capturing = torch.cuda.is_current_stream_capturing()
-    Kw = (K + 255) // 256 * 256
-    _k_real = None if K == Kw else K
-    _row_b = None if Kb_a == K // 2 else Kb_a
-    # B-scale workspace covers gate||up (2I), not the gate width the GEMM's c_n uses.
-    a_sp, b_sp = _get_mxfp4_scale_ws(M, two_i, Kw, a.device)
-    a_raw = a_scale.contiguous().view(torch.uint8).reshape(-1)
-    b_raw = b_scale.contiguous().view(torch.uint8).reshape(-1)
-    a8 = a.contiguous().view(torch.int8)
-    b8 = b.contiguous().view(torch.int8)
-
-    gm, gn, xcd = _mxfp4_nt_config(M, I, Kw)
-    launch = _get_mxfp4_fused_launch(
-        Kw,
-        gm,
-        xcd,
-        gn,
-        10,
-        9,
-        taccw=False,
-        coop=False,
-        out_fp16=out_fp16,
-        beta_is_one=False,
-        n_tail=0,
-        k_real=_k_real,
-        row_bytes=_row_b,
-        mn=(M, I),
-        glu=True,
-        glu_i=I,
-    )
-    fused_args = (a8, b8, l1, a_raw, b_raw, a_sp, b_sp, M, I, act, probs, stream)
-    at_key = (M, I, K, _row_b, gm, xcd, gn, 10, 9, out_fp16, True)
-    entry = _MXFP4_GLU_AT_CACHE.get(at_key)
-    if entry is None:
-        entry = [launch, None]
-        _MXFP4_GLU_AT_CACHE[at_key] = entry
-    raw, compiled = entry
-    if _capturing:
-        raw(*fused_args)
-    else:
-        if compiled is None:
-            compiled = compile_with_scratch_out(raw, fused_args)
-            entry[1] = compiled
-        compiled(*fused_args)
-    return l1, act
-
-
 def dense_glu_epi_quant_supported(K: int, I: int, M: int = 0, out_dtype=torch.bfloat16) -> bool:
     """Whether :func:`gemm_mxfp4_glu_quant_flydsl_kernel` covers this shape.
 
@@ -3445,12 +3384,18 @@ def gemm_mxfp4_glu_quant_flydsl_kernel(
     out_dtype: torch.dtype = torch.bfloat16,
     row_use_sr: bool = False,
     col_use_sr: bool = False,
+    scale_rounding_mode: int = 0,
+    activation: str = "silu",
+    clamp_limit=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dense MXFP4 NT GEMM + StoreCSwiGLUQuant: act never hits BF16 HBM.
 
     Writes ``l1[M, 2I]`` BF16 and the row/col MXFP4 pair fc2 / wgrad consume.
     """
-    from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import _next_sr_seed
+    from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import (
+        _mxfp4_scale_rounding_bias,
+        _next_sr_seed,
+    )
 
     assert a.dim() == 2 and b.dim() == 2, "a, b must be 2D"
     assert out_dtype == torch.bfloat16, "fused act quant is bf16-accumulator only"
@@ -3503,8 +3448,11 @@ def gemm_mxfp4_glu_quant_flydsl_kernel(
         glu_act_quant=True,
         epi_row_sr=row_use_sr,
         epi_col_sr=col_use_sr,
+        epi_activation=activation,
+        epi_clamp_limit=clamp_limit,
     )
     sr_seed = _next_sr_seed() if (row_use_sr or col_use_sr) else 0
+    scale_rounding_bias = _mxfp4_scale_rounding_bias(scale_rounding_mode)
     fused_args = (
         a8,
         b8,
@@ -3522,9 +3470,10 @@ def gemm_mxfp4_glu_quant_flydsl_kernel(
         col_sc.view(torch.uint8),
         M_pad,
         sr_seed,
+        scale_rounding_bias,
         stream,
     )
-    at_key = (M, I, K, _row_b, gm, xcd, gn, 10, 9, row_use_sr, col_use_sr)
+    at_key = (M, I, K, _row_b, gm, xcd, gn, 10, 9, row_use_sr, col_use_sr, activation, clamp_limit)
     entry = _MXFP4_GLU_QUANT_AT_CACHE.get(at_key)
     if entry is None:
         entry = [launch, None]
@@ -3574,13 +3523,19 @@ def gemm_mxfp4_dglu_quant_flydsl_kernel(
     out_dtype: torch.dtype = torch.bfloat16,
     row_use_sr: bool = False,
     col_use_sr: bool = False,
+    scale_rounding_mode: int = 0,
+    activation: str = "silu",
+    clamp_limit=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dense MXFP4 NT dgrad + dSwiGLU + dual-quant of ``grad_l1``.
 
     ``a`` is fc2 ``dY`` row-quant, ``b`` is ``w2`` col-quant. Accumulator is
     ``dact[M, I]``; ``grad_l1[M, 2I]`` never hits BF16 HBM.
     """
-    from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import _next_sr_seed
+    from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import (
+        _mxfp4_scale_rounding_bias,
+        _next_sr_seed,
+    )
 
     assert a.dim() == 2 and b.dim() == 2, "a, b must be 2D"
     assert out_dtype == torch.bfloat16
@@ -3634,8 +3589,11 @@ def gemm_mxfp4_dglu_quant_flydsl_kernel(
         dglu_act_quant=True,
         epi_row_sr=row_use_sr,
         epi_col_sr=col_use_sr,
+        epi_activation=activation,
+        epi_clamp_limit=clamp_limit,
     )
     sr_seed = _next_sr_seed() if (row_use_sr or col_use_sr) else 0
+    scale_rounding_bias = _mxfp4_scale_rounding_bias(scale_rounding_mode)
     fused_args = (
         a8,
         b8,
@@ -3654,9 +3612,10 @@ def gemm_mxfp4_dglu_quant_flydsl_kernel(
         col_sc.view(torch.uint8),
         M_pad,
         sr_seed,
+        scale_rounding_bias,
         stream,
     )
-    at_key = (M, I, K, _row_b, gm, xcd, gn, 10, 9, row_use_sr, col_use_sr, "dglu")
+    at_key = (M, I, K, _row_b, gm, xcd, gn, 10, 9, row_use_sr, col_use_sr, activation, clamp_limit, "dglu")
     entry = _MXFP4_DGLU_QUANT_AT_CACHE.get(at_key)
     if entry is None:
         entry = [launch, None]

@@ -899,6 +899,7 @@ def _build_rmsnorm_dual_kernel(row_rht, col_rht, col_locality=False):
         R: fx.Int32,
         C: fx.Int32,
         SR_SEED: fx.Int32,
+        SCALE_ROUNDING_BIAS: fx.Int32,
     ):
         lds = fx.SharedAllocator().allocate(_DualSS).peek()
         tid = fx.thread_idx.x
@@ -917,6 +918,7 @@ def _build_rmsnorm_dual_kernel(row_rht, col_rht, col_locality=False):
             R,
             C,
             fx.block_idx.x,
+            SCALE_ROUNDING_BIAS,
             col_locality=col_locality,
             sr_seed=SR_SEED,
             sr_gbid=fx.block_idx.x,
@@ -945,17 +947,18 @@ def _build_rmsnorm_dual_launch(row_rht, col_rht, col_locality=False):
         R: fx.Int32,
         C: fx.Int32,
         SR_SEED: fx.Int32,
+        SCALE_ROUNDING_BIAS: fx.Int32,
         grid_x: fx.Int32,
         stream: fx.Stream,
     ):
-        kern(X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, RSTD, GAMMA, R, C, SR_SEED).launch(
+        kern(X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, RSTD, GAMMA, R, C, SR_SEED, SCALE_ROUNDING_BIAS).launch(
             grid=(grid_x, 1, 1), block=(BLK, 1, 1), stream=stream
         )
 
     return _rmsnorm_dual_launch
 
 
-def flydsl_rmsnorm_dual_quant(xpr_bf16, rstd_f32, gamma_f32, fp4_dtype, col_rht=True):
+def flydsl_rmsnorm_dual_quant(xpr_bf16, rstd_f32, gamma_f32, fp4_dtype, col_rht=True, scale_rounding_mode=0):
     """MXFP4 dual of ``y = xpr * rstd[:,None] * gamma`` without a BF16 ``y`` load.
 
     ``xpr_bf16`` is ``[R, C]`` bf16 (residual sum). ``rstd_f32`` is ``[R]``.
@@ -997,6 +1000,7 @@ def flydsl_rmsnorm_dual_quant(xpr_bf16, rstd_f32, gamma_f32, fp4_dtype, col_rht=
         R,
         C,
         0,
+        _mxfp4_scale_rounding_bias(scale_rounding_mode),
         grid_x,
         torch.cuda.current_stream(),
     )
@@ -1028,7 +1032,7 @@ def get_rmsnorm_dual_cast(R, C, row_rht, col_rht):
         gamma = torch.zeros((C,), dtype=torch.float32, device="cuda")
         grid_x = (R // _RMS_TR) * (C // _RMS_TC)
         stream = torch.cuda.current_stream()
-        fn = flyc.compile(raw, x, ro, rs, co, cs, rstd, gamma, R, C, 0, grid_x, stream)
+        fn = flyc.compile(raw, x, ro, rs, co, cs, rstd, gamma, R, C, 0, 1 << 21, grid_x, stream)
         ent = (fn, grid_x)
         _RMSNORM_DUAL_COMPILED[key] = ent
     return ent
