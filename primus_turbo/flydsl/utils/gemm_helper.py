@@ -278,8 +278,25 @@ def shear_mbias(m_row, ksm):
     return (m_row * fx.Int32(ksm)) % fx.Int32(128)
 
 
+def g2s_lds_imm(step, lds_step):
+    """Part of a wave-major g2s step's LDS offset that fits the buffer instruction's 12-bit
+    immediate; the rest (a multiple of 4096) still has to go through M0.  ``lds_step`` 0 marks
+    the legacy step-major fill, where every step needs its own M0 write."""
+    return (step % (4096 // lds_step)) * lds_step if lds_step else 0
+
+
 class G2SLoader:
-    def __init__(self, gl_src, gl_offsets, n_load_steps, lds_dtype, wave_id, chunk_stride=1024, rebase=None):
+    def __init__(
+        self,
+        gl_src,
+        gl_offsets,
+        n_load_steps,
+        lds_dtype,
+        wave_id,
+        chunk_stride=1024,
+        rebase=None,
+        lds_step=0,
+    ):
         self.g2lds_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
         self.LdsPtr_t = fx.PointerType.get(lds_dtype, 2, 512)
         self.gl_src = gl_src
@@ -293,6 +310,10 @@ class G2SLoader:
         # span at < 2^32 fp8). A (arg_i8, fp8_ir_t, base_elems, num_records_bytes) tuple re-bases
         # the SRD per load instead (k_offset folds into the i64 base), lifting the cap.
         self.rebase = rebase
+        # Wave-major fill: this wave's chunks sit ``lds_step`` apart instead of one whole-WG
+        # step apart. ``gl_offsets`` arrives with that immediate already taken out; this path
+        # emits no immediate, so it puts it back on the soffset.
+        self.lds_step = lds_step
 
     def _src_div(self, k_offset):
         """(divided source tensor, soffset) for one load. int32 path returns the
@@ -312,7 +333,10 @@ class G2SLoader:
 
     def _lds_dst_at(self, lds_dst, step, base_off=None):
         cs = self.chunk_stride
-        step_off = self.wave_id * cs + step * (self.n_waves * cs)
+        if self.lds_step:
+            step_off = self.wave_id * (self.n_load_steps * cs) + step * cs
+        else:
+            step_off = self.wave_id * cs + step * (self.n_waves * cs)
         base_i32 = fx.Int32(fx.ptrtoint(lds_dst.ptr))
         if base_off is not None:  # runtime LDS-stage byte offset (double-buffer parity)
             base_i32 = base_i32 + base_off
@@ -325,7 +349,9 @@ class G2SLoader:
         for step in range_constexpr(self.n_load_steps):
             src = fx.slice(src_div, (None, fx.Int32(self.gl_offsets[step])))
             dst = self._lds_dst_at(lds_dst, step, base_off)
-            fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(soff))
+            imm = g2s_lds_imm(step, self.lds_step)
+            so = fx.Int32(soff) + fx.Int32(imm) if imm else fx.Int32(soff)
+            fx.copy(self.g2lds_atom, src, dst, soffset=so)
 
 
 def pack_i32x4_i32x8(lo, hi):
@@ -2551,3 +2577,61 @@ def xcd_band_remap_pid(pid, total_pids, num_xcd, band):
     rnd = local // band
     mapped = (rnd * num_xcd + xcd) * band + (local - rnd * band)
     return arith.select(pid < (total_pids // span) * span, mapped, pid)
+
+
+_MXFP4_PRESHUF_BLK = 256
+_MXFP4_PRESHUF_NG = 4  # g bytes packed by one thread
+_MXFP4_PRESHUF_ND = 4  # (r_region, K sub-block) cells packed by one thread
+_MXFP4_PRESHUF_KU = 2
+_MXFP4_PRESHUF_FO = _MXFP4_PRESHUF_NG * _MXFP4_PRESHUF_ND  # output dwords per thread
+
+
+def _mxfp4_preshuf_geom(k128):
+    """``(cells per thread, block size)`` for the scale preshuffle. The batched cells are
+    adjacent 256-K blocks of one row set, so K/256 has to divide by KU; a K the host does
+    not know keeps the single-cell form."""
+    ku = _MXFP4_PRESHUF_KU
+    if k128 is None or ku < 2 or (k128 // 2) % ku:
+        return 1, _MXFP4_PRESHUF_BLK
+    return ku, max(_MXFP4_PRESHUF_BLK // ku, 64)
+
+
+def mxfp4_packed_scale_byte(row, kblk, *, k128, b_ilv, is_b, kk=None):
+    """Byte offset of a canonical E8M0 scale (``row``, ``kblk`` = k // 32) in the packed layout.
+
+    The scatter counterpart of the gather in ``_build_mxfp4_preshuffle_kernel_ab``. That pass
+    is a pure byte permutation -- ``_mxfp4_pack_cell`` only transposes bytes, it never
+    arithmetics them -- so a producer already holding one scale byte can store it straight into
+    its packed slot and skip the repacking pass altogether. Accepts Python ints or traced
+    values; the divisors are all compile-time.
+    """
+    n_sub, nd, ng = 2, _MXFP4_PRESHUF_ND, _MXFP4_PRESHUF_NG
+    ku, _ = _mxfp4_preshuf_geom(k128)
+    # `kk` may be handed in as a traced value: it is the only term that varies with the
+    # shape's contraction, and keeping it out of the emitted constants lets one compiled
+    # kernel serve every shape rather than one per K.
+    nw = n_sub * ku
+    if kk is None:
+        kk = k128 // n_sub
+    lit = isinstance(row, int) and isinstance(kblk, int)
+    _d = (lambda a, b: a // b) if lit else udiv
+    _m = (lambda a, b: a % b) if lit else umod
+
+    kdw, g = _d(kblk, ng), _m(kblk, ng)
+    kh, rem = _d(kdw, nw), _m(kdw, nw)
+    u, lo = _d(rem, n_sub), _m(rem, n_sub)
+    grp, loc = _d(row, 64), _m(row, 64)
+    if is_b:
+        # grp = 4 * (wi // 2) + (wi % 2) + 2 * r_region
+        blk, off = _d(grp, 4), _m(grp, 4)
+        r_region, wi_lo = _d(off, 2), _m(off, 2)
+        wi = blk * 2 + wi_lo
+    else:
+        wi, r_region = _d(grp, 2), _m(grp, 2)
+    if b_ilv:
+        r, t = _d(loc, b_ilv), _m(loc, b_ilv)
+    else:
+        t, r = _d(loc, 16), _m(loc, 16)
+    last = r_region * n_sub + lo
+    base = ((wi * kk + kh * ku) * 64 + r) * nd
+    return (base + u * (64 * nd) + g * 64 + last) * 4 + t
