@@ -468,3 +468,27 @@ So before planning a day's queue, ask what the failure is attached to. If it is 
 work into runs. If it is thermal or time-dependent, do the opposite. Either way, say what the
 per-unit rate is -- "about 5 runs to catch this fault once, at 21% wedge risk per startup, so
 roughly one power cycle" is a cost a human can decide about; "it might take a few tries" is not.
+
+## 21. Language: English in the repository, the user's language in what people read
+
+Two different audiences, so two different defaults. Getting this backwards is a recurring slip
+worth a rule.
+
+**English, always, for anything that lives in the repository as engineering artefact:** commit
+messages, code, comments, docstrings, identifiers, log and error strings, config keys, test
+names, and the prose inside source files. These are read by everyone who touches the codebase
+and by tooling that assumes ASCII; a commit subject in another language is unsearchable for
+half the team and looks like an accident in `git log`.
+
+**The user's language for documents written to be read by people:** progress reports, HTML
+write-ups, analysis documents, weekly summaries, and the explanations in chat. If the user
+writes to you in Chinese, these default to Chinese.
+
+The line is not "source file versus markdown" — it is *who the reader is*. A findings document
+under `output/` that a colleague will read follows the user's language. A README that ships with
+the library is documentation for whoever clones it, so English.
+
+**Watch for mixed strings specifically.** The failure mode is not writing a whole message in the
+wrong language; it is dropping one word in. A Chinese word inside an otherwise English commit
+subject reads as a typo and survives review because the sentence still parses. Before committing,
+it is cheap to check: `git log -1 --format=%B | grep -P "[^\x00-\x7F]"` should return nothing.
