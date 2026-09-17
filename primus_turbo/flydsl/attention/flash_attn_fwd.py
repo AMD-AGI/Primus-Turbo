@@ -370,7 +370,9 @@ def build_flash_attn_dualwave_swp_module(
                 if const_expr(traits.CAUSAL):
                     # Floor fully-masked rows (-inf) to finite so exp2 yields 0, not NaN.
                     m_row_pro = ctx.floor_masked_max(m_row_pro)
+                m_row_pro = ctx.lift_ref(m_row_pro)
             v_s_0 = ctx.shift_scores(v_s_0, m_row_pro)
+            ctx.set_ref(m_row_pro)
             v_p_0 = ctx.exp2(v_s_0, 0, 16)
             _dualwave_sync_barrier()
 
@@ -398,6 +400,8 @@ def build_flash_attn_dualwave_swp_module(
             ):
                 mo = 1 if carry_m else 0
                 m_row = loop_args[0] if carry_m else m_row_pro
+                if const_expr(carry_m):
+                    ctx.set_ref(m_row)
                 l_row = loop_args[mo]
                 v_o = [loop_args[1 + mo + i] for i in range_constexpr(traits.D_CHUNKS)]
                 v_p_0 = (loop_args[1 + mo + traits.D_CHUNKS], loop_args[2 + mo + traits.D_CHUNKS])
@@ -454,12 +458,9 @@ def build_flash_attn_dualwave_swp_module(
                     )
                 else:
                     v_s_1 = ctx.scores_for_softmax(v_s_1)
-                m_row, rescale_m2 = ctx.tile_row_max(m_row, v_s_1)
                 for pvs in range_constexpr(1, 4):
                     v_o = _pv_step(pvs, v_p_0, v_v, v_o, 0)
-                ctx.scale_o_by(v_o, rescale_m2)
-                l_row = ctx.scale_l_by(l_row, rescale_m2)
-                v_s_1 = ctx.shift_scores(v_s_1, m_row)
+                m_row, l_row, v_s_1 = ctx.rebase_if_needed(m_row, v_o, l_row, v_s_1)
                 v_p_1 = ctx.exp2(v_s_1, 0, 16)
 
                 _sched_barrier_pairs(traits, 6, 6, 2)
@@ -518,12 +519,9 @@ def build_flash_attn_dualwave_swp_module(
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                     _s_setprio(1)
                 v_o = _pv_step(0, v_p_1, v_v, v_o, 1)
-                m_row, rescale_m4 = ctx.tile_row_max(m_row, v_s_0)
                 for pvs in range_constexpr(1, 4):
                     v_o = _pv_step(pvs, v_p_1, v_v, v_o, 1)
-                ctx.scale_o_by(v_o, rescale_m4)
-                l_row = ctx.scale_l_by(l_row, rescale_m4)
-                v_s_0 = ctx.shift_scores(v_s_0, m_row)
+                m_row, l_row, v_s_0 = ctx.rebase_if_needed(m_row, v_o, l_row, v_s_0)
                 v_p_0 = ctx.exp2(v_s_0, 0, 16)
                 _sched_barrier_pairs(traits, 6, 5, 4)
                 _sched_barrier_pairs(traits, 6, 3, 4, traits.SCHED_EXP_MASK)
@@ -537,6 +535,9 @@ def build_flash_attn_dualwave_swp_module(
             # Epilogue drains the final in-flight tiles, continuing from the loop's maximum.
             mo = 1 if carry_m else 0
             m_row = loop_results[0] if carry_m else m_row_pro
+            # the epilogue seeds against the loop's result, not the last body value
+            if const_expr(carry_m):
+                ctx.set_ref(m_row)
             l_row = loop_results[mo]
             v_o = [loop_results[1 + mo + i] for i in range_constexpr(traits.D_CHUNKS)]
             v_p_0 = (loop_results[1 + mo + traits.D_CHUNKS], loop_results[2 + mo + traits.D_CHUNKS])
@@ -588,13 +589,11 @@ def build_flash_attn_dualwave_swp_module(
                 # v_p_0 here belongs to tile max_m3, the band's first tile.
                 _live_lo_m3, _ = ctx.chunk_live(max_m3)
                 v_o = _pv_lo_live(v_p_0, v_packs_s2, v_o, 0, _live_lo_m3)
-                m_row, rescale_s3 = ctx.tile_row_max(m_row, v_s_1)
-                v_s_1 = ctx.shift_scores(v_s_1, m_row)
+                m_row, l_row, v_s_1 = ctx.rebase_if_needed(m_row, v_o, l_row, v_s_1)
                 v_p_1 = ctx.exp2(v_s_1, 0, 16)
                 _sched_barrier_pairs(traits, 10, 5, 6)
                 _sched_barrier_pairs(traits, 6, 3, 6, traits.SCHED_EXP_MASK)
                 _sched_barrier(0)
-                ctx.scale_o_by(v_o, rescale_s3)
                 v_o = _anchor_v_o(traits, v_o)
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                     _s_setprio(0)
@@ -610,7 +609,6 @@ def build_flash_attn_dualwave_swp_module(
                 _dualwave_sync_barrier()
 
                 # S5 (compute): fold rescale, finish P of max_m2, MMA0 -> scores of max_m1.
-                l_row = ctx.scale_l_by(l_row, rescale_s3)
                 v_p_1 = ctx.exp2(v_p_1, 16, 16)
                 v_p_1, l_row = ctx.cast_p_and_sum(l_row, v_p_1)
                 v_p_1 = _anchor_v_p(traits, v_p_1, elem_dtype=elem_dtype)
@@ -635,18 +633,15 @@ def build_flash_attn_dualwave_swp_module(
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                     _s_setprio(1)
                 v_o = _pv(v_p_1, v_packs_s6, v_o, 1)
-                m_row, rescale_s7 = ctx.tile_row_max(m_row, v_s_0)
-                v_s_0 = ctx.shift_scores(v_s_0, m_row)
+                m_row, l_row, v_s_0 = ctx.rebase_if_needed(m_row, v_o, l_row, v_s_0)
                 v_p_0 = ctx.exp2(v_s_0, 0, 16)
                 _sched_barrier_pairs(traits, 9, 6, 8)
                 _sched_barrier_pairs(traits, 7, 3, 8, traits.SCHED_EXP_MASK)
                 _sched_barrier(0)
                 v_p_0 = ctx.exp2(v_p_0, 16, 16)
-                l_row = ctx.scale_l_by(l_row, rescale_s7)
                 v_p_0, l_row = ctx.cast_p_and_sum(l_row, v_p_0)
                 v_p_0 = _anchor_v_p(traits, v_p_0, elem_dtype=elem_dtype)
                 _sched_barrier(0)
-                ctx.scale_o_by(v_o, rescale_s7)
                 v_o = _anchor_v_o(traits, v_o)
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                     _s_setprio(0)
@@ -710,13 +705,11 @@ def build_flash_attn_dualwave_swp_module(
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                     _s_setprio(1)
                 v_o = _pv(v_p_0, v_packs_e3, v_o, 0)
-                m_row, rescale_e3 = ctx.tile_row_max(m_row, v_s_1)
-                v_s_1 = ctx.shift_scores(v_s_1, m_row)
+                m_row, l_row, v_s_1 = ctx.rebase_if_needed(m_row, v_o, l_row, v_s_1)
                 v_p_1 = ctx.exp2(v_s_1, 0, 16)
                 _sched_barrier_pairs(traits, 10, 5, 6)
                 _sched_barrier_pairs(traits, 6, 3, 6, traits.SCHED_EXP_MASK)
                 _sched_barrier(0)
-                ctx.scale_o_by(v_o, rescale_e3)
                 v_o = _anchor_v_o(traits, v_o)
 
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
@@ -732,8 +725,7 @@ def build_flash_attn_dualwave_swp_module(
                 _waitcnt_vm_n(ctx.VM_DRAIN_KV)
                 _dualwave_sync_barrier()
 
-                # Epilogue C5 folds rescale_e3 into l_row, finishes v_p_1 softmax, then computes MMA0.
-                l_row = ctx.scale_l_by(l_row, rescale_e3)
+                # Epilogue C5 finishes the v_p_1 softmax, then computes MMA0.
                 v_p_1 = ctx.exp2(v_p_1, 16, 16)
                 v_p_1, l_row = ctx.cast_p_and_sum(l_row, v_p_1)
                 v_p_1 = _anchor_v_p(traits, v_p_1, elem_dtype=elem_dtype)
@@ -760,13 +752,11 @@ def build_flash_attn_dualwave_swp_module(
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                     _s_setprio(1)
                 v_o = _pv(v_p_1, v_packs_e7, v_o, 1)
-                m_row, rescale_e7 = ctx.tile_row_max(m_row, v_s_0)
-                v_s_0 = ctx.shift_scores(v_s_0, m_row)
+                m_row, l_row, v_s_0 = ctx.rebase_if_needed(m_row, v_o, l_row, v_s_0)
                 v_p_0 = ctx.exp2(v_s_0, 0, 16)
                 _sched_barrier_pairs(traits, 10, 5, 8)
                 _sched_barrier_pairs(traits, 6, 3, 8, traits.SCHED_EXP_MASK)
                 _sched_barrier(0)
-                ctx.scale_o_by(v_o, rescale_e7)
                 v_o = _anchor_v_o(traits, v_o)
                 if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                     _s_setprio(0)
@@ -781,8 +771,7 @@ def build_flash_attn_dualwave_swp_module(
                 _waitcnt_vm_n(ctx.VM_DRAIN_V)
                 _dualwave_sync_barrier()
 
-                # Epilogue C9 folds rescale_e7 into l_row, finishes v_p_0, then computes last-tile MMA0.
-                l_row = ctx.scale_l_by(l_row, rescale_e7)
+                # Epilogue C9 finishes v_p_0, then computes the last-tile MMA0.
                 v_p_0 = ctx.exp2(v_p_0, 16, 16)
                 v_p_0, l_row = ctx.cast_p_and_sum(l_row, v_p_0)
                 v_p_0 = _anchor_v_p(traits, v_p_0, elem_dtype=elem_dtype)
@@ -808,18 +797,15 @@ def build_flash_attn_dualwave_swp_module(
                 # Epilogue C11: final rescale and complete the last tile's softmax in-place.
                 # v_p_0 belongs to max_m2, whose HI half is dead for row group 0.
                 v_o = _pv_hi_live(v_p_0, v_packs_e11, v_o, 0, _live_hi_m2)
-                m_row, rescale_e11 = ctx.tile_row_max(m_row, v_s_1)
-                v_s_1 = ctx.shift_scores(v_s_1, m_row)
+                m_row, l_row, v_s_1 = ctx.rebase_if_needed(m_row, v_o, l_row, v_s_1)
                 v_p_1 = ctx.exp2(v_s_1, 0, 16)
                 _sched_barrier_pairs(traits, 9, 6, 10)
                 _sched_barrier_pairs(traits, 7, 3, 10, traits.SCHED_EXP_MASK)
                 _sched_barrier(0)
                 v_p_1 = ctx.exp2(v_p_1, 16, 16)
-                l_row = ctx.scale_l_by(l_row, rescale_e11)
                 v_p_1, l_row = ctx.cast_p_and_sum(l_row, v_p_1)
                 v_p_1 = _anchor_v_p(traits, v_p_1, elem_dtype=elem_dtype)
                 _sched_barrier(0)
-                ctx.scale_o_by(v_o, rescale_e11)
                 v_o = _anchor_v_o(traits, v_o)
                 _s_barrier()
                 _sched_barrier(0)

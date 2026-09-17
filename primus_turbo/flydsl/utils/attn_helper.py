@@ -31,9 +31,27 @@ from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from primus_turbo.flydsl.utils.prims import LOG2E
 
-# Fixed-max softmax reference, log2 above the prologue tile's row max: the margin a later
-# key may exceed that tile by before P flattens, traded against the tail fp32 still holds.
-REF_MARGIN = 96
+# Room a later key has above a tile's row max before it forces another rebase.
+REF_MARGIN = 96.0
+
+
+def _wave_any(cond):
+    mask = rocdl.ballot(fx.Int64.ir_type, as_mlir_value(cond))
+    return ArithValue(fx.Int64(mask) != fx.Int64(0))
+
+
+def _if_wave(cond, vals, then_fn):
+    from flydsl._mlir.dialects import scf
+
+    _v = [as_mlir_value(v) for v in vals]
+    op = scf.IfOp(as_mlir_value(cond), [x.type for x in _v], has_else=True)
+    with ir.InsertionPoint(op.regions[0].blocks[0]):
+        scf.YieldOp([as_mlir_value(x) for x in then_fn()])
+    if not op.regions[1].blocks:
+        op.regions[1].blocks.append()
+    with ir.InsertionPoint(op.regions[1].blocks[0]):
+        scf.YieldOp(_v)
+    return list(op.results)
 
 
 def dtype_to_elem_type(dtype_str: str):
@@ -287,6 +305,20 @@ def _reduce_score_pair(v_s, initial, reducer, fm_fast):
     for r in range_constexpr(16):
         acc = reducer(acc, s_hi[r], fm_fast)
     return acc
+
+
+def _reduce_score_tree(v_s, reducer, fm_fast):
+    cur = [half[r] for half in v_s for r in range_constexpr(16)]
+    while len(cur) > 1:
+        nxt = []
+        for i in range_constexpr(0, len(cur), 3):
+            grp = cur[i : i + 3]
+            acc = grp[0]
+            for x in grp[1:]:
+                acc = reducer(acc, x, fm_fast)
+            nxt.append(acc)
+        cur = nxt
+    return cur[0]
 
 
 def _lane_pair_reduce(v, reducer, fm_fast):
@@ -604,7 +636,7 @@ class DualwaveKernelContext:
         self.c_neg_floor = fx.Float32(-3.0e38)
         self.c_zero_f = fx.Float32(0.0)
         self.c_zero_v16f32 = Vec.filled(16, 0.0, fx.Float32)
-        self.fixed_ref_neg = None
+        self.ref_neg = None
         head_dim_f32 = fx.Float32(fx.Int32(head_dim_runtime))
         c_log2e_f = fx.Float32(LOG2E)
         self.c_sm_scale_log2e = fx.Float32(
@@ -941,12 +973,16 @@ class DualwaveKernelContext:
         return Vec(q_all_scaled_bf16, (traits.K_STEPS_QK * traits.MFMA_LANE_K,), self.elem_dtype)
 
     def score_acc_seed(self):
-        """Seed for a QK accumulator. QK accumulates into C, so seeding C with -reference
-        performs the rebase for no arithmetic; built per tile because hoisting the broadcast
-        would pin 16 VGPRs across the loop."""
-        if self.fixed_ref_neg is None:
+        """QK accumulates into C, so seeding C with -reference shifts the scores for free."""
+        if self.ref_neg is None:
             return self.c_zero_v16f32
-        return Vec.from_elements([as_mlir_value(self.fixed_ref_neg)], fx.Float32).broadcast_to(16)
+        return Vec.from_elements([as_mlir_value(self.ref_neg)], fx.Float32).broadcast_to(16)
+
+    def lift_ref(self, m_row):
+        return _fadd(m_row, fx.Float32(REF_MARGIN), self.fm_fast)
+
+    def set_ref(self, ref):
+        self.ref_neg = _fsub(self.c_zero_f, ref, self.fm_fast)
 
     def qk(self, v_k, q_all_scaled_bf16, v_s=None, ks_range=None):
         k_lo, k_hi = v_k
@@ -1043,12 +1079,9 @@ class DualwaveKernelContext:
         return _fmax(row_max, self.c_neg_floor, self.fm_fast)
 
     def _exp2_clamped(self, x):
-        """exp2 of a rebased score, with P held in [0, 1] so the row sum cannot leave fp32.
-
-        exp2 is non-negative, so the lower bound is a no-op; the pair is spelled out because
-        the backend folds a matched min/max into the clamp modifier of the v_exp itself."""
+        """exp2 with P held at 1, which the hardware applies as an output modifier."""
         e = rocdl.exp2(T.f32, as_mlir_value(x))
-        if self.fixed_ref_neg is None:
+        if self.ref_neg is None:
             return e
         lo = _fmax(fx.Float32(e), self.c_zero_f, self.fm_fast)
         return _fmin(fx.Float32(lo), fx.Float32(1.0), self.fm_fast)
@@ -1182,7 +1215,7 @@ class DualwaveKernelContext:
 
     def set_fixed_ref(self, m_row):
         """Pin the loop's reference as one per-row scalar, applied by score_acc_seed()."""
-        self.fixed_ref_neg = _fsub(self.c_zero_f, m_row, self.fm_fast)
+        self.ref_neg = _fsub(self.c_zero_f, m_row, self.fm_fast)
 
     def shift_scores_by(self, v_s, row_max):
         """Shift the prologue tile, the one tile that leaves the MFMA before the reference
@@ -1214,6 +1247,50 @@ class DualwaveKernelContext:
                 ).ir_value()
             )
         return tuple(shifted)
+
+    def rebase_if_needed(self, ref, v_o, l_row, v_s):
+        """Raise the reference only for a tile that has outrun it, which is rare."""
+        if const_expr(self.traits.DUALWAVE_SWP_FIXED_MAX):
+            return ref, l_row, v_s
+        if isinstance(v_s[0], list):
+            v_s = _score_lists_to_vecs(v_s)
+        m_lane = _reduce_score_tree(v_s, _fmax, self.fm_fast)
+        fired = _wave_any(ArithValue(fx.Float32(m_lane) > self.c_zero_f))
+
+        def _then():
+            m_tile = _lane_pair_reduce(m_lane, _fmax, self.fm_fast)
+            if const_expr(self.traits.CAUSAL):
+                m_tile = self.floor_masked_max(m_tile)
+            delta = _fmax(_fadd(m_tile, fx.Float32(REF_MARGIN), self.fm_fast), self.c_zero_f, self.fm_fast)
+            r = fx.Float32(rocdl.exp2(T.f32, _fsub(self.c_zero_f, delta, self.fm_fast)))
+            out = [_fadd(ref, delta, self.fm_fast)]
+            out += [
+                _fmul(
+                    Vec(v_o[dc]),
+                    Vec.from_elements([as_mlir_value(r)], fx.Float32).broadcast_to(16),
+                    self.fm_fast,
+                )
+                for dc in range_constexpr(self.traits.D_CHUNKS)
+            ]
+            out.append(self.scale_l_by(l_row, r))
+            for half in v_s:
+                out.append(
+                    Vec.from_elements(
+                        [
+                            as_mlir_value(_fsub(Vec(half)[i], delta, self.fm_fast))
+                            for i in range_constexpr(16)
+                        ],
+                        fx.Float32,
+                    ).ir_value()
+                )
+            return out
+
+        res = _if_wave(fired, [ref] + list(v_o) + [l_row] + list(v_s), _then)
+        nd = self.traits.D_CHUNKS
+        for dc in range_constexpr(nd):
+            v_o[dc] = res[1 + dc]
+        self.set_ref(res[0])
+        return res[0], res[1 + nd], (res[2 + nd], res[3 + nd])
 
     def tile_row_max(self, m_row, v_s):
         """Returns None as the O/l correction when the reference max is fixed and nothing rebases."""
