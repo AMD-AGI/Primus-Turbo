@@ -1,5 +1,21 @@
 # gfx1250 FlyDSL kernels we wrote
 
+**All three backward kernels PLAN.md Stage 3 lists now exist and pass**, in the order that
+plan gives (odo, then dkdv, then dq -- ordered by what can be validated independently, not
+by dataflow):
+
+| kernel | SQNR |
+|---|--:|
+| `odo`  (delta = rowsum(dO*O)) | 159.24 / 156.49 dB |
+| `dkdv` (dV, dK)               | 150.73 / 145.41 dB |
+| `dq`                          | 144.90 dB |
+
+Every one passed on its first run against torch, with NaN-prefilled outputs and full
+isfinite coverage checked before SQNR. What exists is the complete backward **data path** at
+single-tile, single-wave scope; what does not exist is everything that makes it a production
+kernel -- causal masking, the kv/query loops, GQA, multi-wave scheduling, tail handling, the
+bank-conflict swizzle, varlen, and the launcher.
+
 Bring-up sources, not yet integrated. **Placement is an open question, not an oversight:**
 these are written against flydsl **0.3.2**, and `primus_turbo/flydsl/` is a 0.2.4 tree that
 0.3.2 cannot import (`flydsl.expr.buffer_ops` was removed). Dropping them in beside it would
@@ -16,6 +32,7 @@ produce a tree that no single flydsl version can load. See `../STAGE1-FWD.md` se
 | `tr16_operand_e2e.py` | **works.** LDS + two tr16 loads build a WMMA A-operand (148.00 dB) |
 | `dv_gfx1250.py` | **works.** `dV = P^T . dO` -- the first complete slice of dkdv (150.75 dB) |
 | `dkdv_gfx1250.py` | **works.** `dV` AND `dK` in one kernel -- the expensive half of the backward (150.73 / 145.41 dB) |
+| `dq_gfx1250.py` | **works.** `dQ = dS . K`, operand free from the accumulators, no LDS round trip for it (144.90 dB) |
 
 ## odo_gfx1250.py
 
@@ -153,3 +170,23 @@ bank-conflict swizzle, and no kv/query loops. What is done is the whole data pat
 layout question in it; what is left is the production wrapping around it.
 
 Not yet written: `dq = dS . K`, whose operand the `dq_operand_probe` showed comes free.
+
+
+## dq_gfx1250.py -- the half where the operand is free
+
+dkdv stages P^T / dS^T through LDS because it contracts over the query axis. dq contracts
+over kv, and `dq_operand_probe.py` showed what follows: two consecutive kv-tile dS^T
+accumulators **concatenate in lane** into one v16 A-operand -- no LDS round trip, no barrier
+for that operand.
+
+```
+dQ[q,d] = sum_kv dS[q,kv] K[kv,d]     A = dS  free from two accumulators
+                                      B = K   tr16 over K staged [kv][d]
+```
+
+| | isfinite | SQNR | max abs err |
+|---|---|--:|--:|
+| dQ | 2048/2048 | **144.90 dB** | 1.19e-07 |
+
+The only LDS traffic is staging K, and the only barrier is for that. Scope: one wave, 16
+queries, KV=32 (exactly one WMMA contraction), D=128, non-causal.
