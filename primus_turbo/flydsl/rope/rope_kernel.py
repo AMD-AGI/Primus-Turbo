@@ -14,12 +14,11 @@
 """Standalone FlyDSL RoPE forward kernel: split packed QKV into three contiguous
 Q/K/V tensors, applying rotate-half RoPE to Q and K (V is a pure pass-through).
 
-Matches transformer_engine's ``apply_fused_qkv_rotary_pos_emb`` I/O contract
-exactly (see ``primus_turbo/flydsl/rope/rope_ops.py`` for the shim that swaps
-this kernel in for TE's, and the autograd wrapper that keeps the backward on
-TE's existing ``fused_qkv_rope_backward`` -- this file only replaces forward).
+Matches the fused QKV rotary-embedding I/O contract Megatron calls with;
+``primus_turbo.pytorch.ops.rope`` wraps this file's forward and backward in
+autograd.
 
-Layout (see campaign probes ``r2_p4_layout.py`` for the derivation):
+Layout:
   - PACKED_QKV: [S, B, NG, (NPG+2)*D] bf16 contiguous. Per group, the last dim is
     NPG Q head-slots of D columns, then 1 K head-slot, then 1 V head-slot -- i.e.
     6 contiguous D-wide "head slots" per group when NPG=4.
@@ -30,15 +29,14 @@ Layout (see campaign probes ``r2_p4_layout.py`` for the derivation):
   - Row index (flattened over S,B) is identical across every tensor above:
     row = s*B + b. Position for the frequency table is s = row // B.
 
-Rotation (non-interleaved rotate-half, matches TE's ``_rotate_half`` + f32
-cos/sin applied before the final bf16 store -- see ``rope_ops.py`` docstring
-for the exact TE source this mirrors):
+Rotation (non-interleaved rotate-half, with cos/sin taken in f32 and the
+result rounded once on the way to bf16):
     lo, hi = x[:D//2], x[D//2:]
     out_lo = lo * cos(freq) - hi * sin(freq)
     out_hi = hi * cos(freq) + lo * sin(freq)
 
-Kernel shape (measured on the production shape S=8192,B=4,NG=8,NPG=4,D=128;
-see campaign round-3 ROUND_REPORT for the full sweep): block_threads=64 is
+Kernel shape (measured on the production shape S=8192,B=4,NG=8,NPG=4,D=128):
+block_threads=64 is
 split into 4 "row lanes" (_NROW) x 16 "p lanes" (_NPLANE), each p lane issuing
 a vec_width=4 (128-bit) buffer_load/store. This is the widest vector the f32
 frequency load supports (vec_width=8 f32 would need a 256-bit buffer op, which
@@ -47,8 +45,6 @@ by having each row-lane process a different row of the same (group, head)
 column slice concurrently -- measured ~30% faster than one-row-per-block with
 vec_width=1 or 2 (both of which leave lanes idle or under-vectorized).
 """
-
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -61,6 +57,15 @@ _HALF = _D // 2  # 64: rotate-half split point
 _VEC = 4  # vector width per lane; capped at 4xf32 = 128 bits (the freq load)
 _NPLANE = _HALF // _VEC  # 16 lanes cover the 64-wide half with vec4
 _NROW = 64 // _NPLANE  # 4 rows processed concurrently per block (fills the wave)
+# Row lanes a block advances together. A caller must keep S*B a multiple of this:
+# the kernels carry no per-row predicate and their descriptors span the whole address space.
+ROPE_ROW_GROUP = _NROW
+
+# Issue the rotate and the K+V kernels from one Python call instead of two. Same two
+# kernels and the same grids either way, so the outputs are bit-identical; what it
+# saves is one host-side autotune-key and JIT-cache-key resolution per call. That is
+# the whole call at shapes whose device time sits under the host floor.
+_MERGED_DISPATCH = True
 _BLOCK_THREADS = _NROW * _NPLANE  # 64 = one full wave
 
 assert _HALF % _VEC == 0
@@ -88,9 +93,8 @@ def _make_rope_kernel(
     8B's GQA ratio, NG=8 KV groups x NPG=4 Q heads/group = 32 Q heads) but is
     a real parameter, not hardcoded into the row-stride math: an earlier
     version of this function hardcoded ``pack_stride = NG * 6 * _D`` (i.e.
-    baked in NPG+2=6), which silently produced garbage (SNR around 0 dB, not
-    just reduced precision) for any NPG != 4 -- caught by a round-3
-    generalization test (t19_multiseed_multishape.py) that was not required
+    baked in NPG+2=6), which silently produced garbage for any NPG != 4 --
+    caught only by a multi-shape test, which is why the pack width is derived
     for the production shape but is cheap insurance against a future GQA
     ratio change. Fixed by deriving the packed row width from ``npg`` itself.
 
@@ -195,20 +199,20 @@ def _make_kv_merged_kernel(NG: int, B: int, total_rows: int, npg: int, grid_x: i
     """Build ONE kernel that does both K (rotate) and V (pass-through-copy) in a
     single launch, picking its branch from a block-uniform runtime predicate.
 
-    Why K+V and not Q+K (measured, round-3 ROUND_REPORT t17/t18): the two
+    Why K+V and not Q+K: the two
     rotate kernels want very different total block counts for the same
     grid_x -- Q has grid_y=NG*NPG=32 and its optimum sits at a SMALL grid_x
     (~224; more blocks than that just adds grid-stride-loop overhead for no
     gain), while K has grid_y=NG=8 and needs a LARGE grid_x (~4096) to reach
     the same total block count. Sharing one grid_x between Q and K would force
     one of them off its optimum. V, however, is measured FLAT across the
-    entire grid_x range the rotate kernels care about (0.0439-0.0444 ms from
-    192 to 8192, t10_sweep_production.py) -- so V pays ~nothing for adopting
+    entire grid_x range the rotate kernels care about (flat, from
+    192 to 8192) -- so V pays ~nothing for adopting
     K's grid_x, and the merge only removes a kernel launch + a redundant
     buffer-resource setup, never forces a compromise. Measured: 15.9% faster
     than two separate launches at the production shape, bit-exact vs the
-    separate K/V kernels (t17_kv_merge_probe.py), own grid_x optimum re-swept
-    and confirmed flat 1024-4096 (t18_kv_merge_sweep.py, best 3072).
+    separate K/V kernels, with its own grid_x optimum re-swept and flat over
+    the range this uses.
 
     block_idx.y in [0, NG*2): g = y//2, is_v = (y%2==1). is_v is block-uniform
     (every lane in a block sees the same y), so the ``if is_v`` below is a
@@ -295,8 +299,8 @@ def _make_kv_merged_kernel(NG: int, B: int, total_rows: int, npg: int, grid_x: i
     return rope_kv_kernel
 
 
-# grid_x candidates: measured sweep (round-3 ROUND_REPORT t10_sweep_production.py,
-# wide sweep 64..16384) found the true optimum tracks grid_y = NG*n_hk, NOT
+# grid_x candidates. A wide sweep (64..16384) found the true optimum tracks
+# grid_y = NG*n_hk, NOT
 # do_rotate: Q (n_hk=NPG=4, grid_y=32) wants a SMALL grid_x (~160-256, total
 # blocks ~5-8K; degrades past 1024 as each block's work shrinks below the
 # grid-stride loop's fixed overhead), while K (n_hk=1, grid_y=8, but still a
@@ -306,10 +310,10 @@ def _make_kv_merged_kernel(NG: int, B: int, total_rows: int, npg: int, grid_x: i
 # An earlier version of this file conflated "rotate vs copy" with "small vs
 # large grid_x" and gave the rotate list only Q's narrow range: K (which is
 # also do_rotate=True) then silently tuned inside a range 3-6x away from its
-# optimum (0.062ms measured best-in-range vs 0.051ms true optimum @ 4096) --
+# optimum -- the in-range best is close enough to the true one that
 # a ~20% regression that cost nothing to detect once measured directly, and
 # nothing to fix by simply widening the shared candidate list. V (grid_y=8,
-# do_rotate=False) is nearly flat from 192 to 8192 (0.0427-0.044ms), so one
+# do_rotate=False) is nearly flat from 192 to 8192, so one
 # wide list safely covers Q+K+V; the one-time autotune search cost (cached to
 # disk per shape key) is negligible against millions of training-step calls.
 _ROTATE_GRID_X_CANDIDATES = (128, 160, 192, 224, 256, 320, 512, 768, 1024, 1536, 2048, 3072, 4096)
@@ -336,9 +340,7 @@ def _compiled_rope_rotate(
 ):
     grid_y = NG * n_hk
     kernel = _make_rope_kernel(NG, B, total_rows, hk_base, n_hk, True, grid_x, npg)
-    kernel(PACKED, FREQS, OUT).launch(
-        grid=(grid_x, grid_y, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream
-    )
+    kernel(PACKED, FREQS, OUT).launch(grid=(grid_x, grid_y, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
 
 @autotune(
@@ -363,9 +365,9 @@ def _compiled_rope_copy(
     kernel(PACKED, OUT).launch(grid=(grid_x, grid_y, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
 
-# Merged K+V launch (round-3 H7-lite, see _make_kv_merged_kernel docstring for
+# Merged K+V launch (see _make_kv_merged_kernel docstring for
 # the measured rationale). Reuses the ROTATE candidate list: the merged
-# kernel's own re-swept optimum (t18_kv_merge_sweep.py) is flat 1024-4096,
+# kernel's own re-swept optimum is flat over the range this uses,
 # best 3072 -- already inside _ROTATE_GRID_X_CANDIDATES, and K (the harder of
 # the two to tune) needs the same large-grid_x region the rotate list covers.
 @autotune(
@@ -391,22 +393,20 @@ def _compiled_rope_kv(
     )
 
 
-
-# --- Merged-dispatch launcher (campaign 20260914_113401, OPTIMIZE r7, H3) ---
+# --- Merged-dispatch launcher ---
 #
-# Motivation: ANALYZE r1's cProfile put ~64% of the 0.127 ms/call FlyDSL host
+# Motivation: a cProfile of the FlyDSL host
 # dispatch cost inside two per-call key-resolution steps that run on EVERY
 # Python-level call regardless of cache warmth -- flydsl's own
 # ``Autotuner._make_key`` (~25%, string-serializes shape/dtype/stride/env
 # every call) and ``JitFunction._resolve_and_make_cache_key`` (~39%, wraps
 # every tensor arg into a fresh ``JitArgument`` and hashes it, *before* the
 # JIT's own "reuse compiled CallState" fast path can even be consulted --
-# read from ``jit_function.py`` this round: the fast-path check is the LAST
+# read from ``jit_function.py``: the fast-path check is the LAST
 # line of that resolution, not a bypass of it). r4 wired the standalone FlyDSL
 # RoPE kernel in and measured the device-side family drop (21.770 -> 16.521
 # ms/step) land as a smaller step drop (786.0 -> ~784.2-784.6) than the device
 # number alone predicts -- exactly the gap this dispatch cost explains, and
-# exactly the trigger goal.md's H3 names ("only when H1 drops RoPE family but
 # step doesn't drop as much").
 #
 # Reaching into ``JitFunction``/``Autotuner`` internals to memoize by
@@ -420,7 +420,7 @@ def _compiled_rope_kv(
 # the key-hashing cost layered on top, for uncertain payoff against a real
 # risk of silently serving a stale ``call_state`` if any invalidating axis
 # (env fingerprint, globals snapshot) is missed. Rejected as the H3 mechanism
-# this round in favor of the lever below, which needs no private-API access.
+# in favor of the lever below, which needs no private-API access.
 #
 # Mechanism actually used: cut the NUMBER of Python-level JIT dispatches per
 # ``flydsl_qkv_rope_forward`` call from 2 to 1 by launching Q's rotate kernel
@@ -437,7 +437,7 @@ def _compiled_rope_kv(
 # one of Q/K off its own optimal grid as analyzed in that function's
 # docstring, and would need new correctness-sensitive branch code).
 #
-# r7 correction (measured, see ROUND_REPORT): an earlier version of this
+# Correction (measured): an earlier version of this
 # function hardcoded grid_x_kv=3072 from _make_kv_merged_kernel's docstring
 # ("own grid_x optimum re-swept ... best 3072"). Re-autotuning THIS kernel on
 # THIS box today, side by side, shows the standalone _compiled_rope_kv
@@ -478,7 +478,7 @@ def _compiled_rope_qkv_merged(
 ):
     """One Python-level JIT dispatch, two kernel launches on ``stream``: Q's
     rotate kernel and the K+V merged kernel, EACH WITH ITS OWN AUTOTUNED
-    grid_x (both axes searched together this round after the hardcoded-KV
+    grid_x (both axes searched together, after the hardcoded-KV
     version regressed -- see module comment above). Each launched kernel is
     byte-identical in its trace to what the two-dispatch path builds -- only
     the number of times ``Autotuner.__call__``/``JitFunction.__call__`` run
@@ -496,8 +496,8 @@ def _compiled_rope_qkv_merged(
 
 
 def flydsl_qkv_rope_forward(qkv, q_freqs, k_freqs, qkv_split_arg_list):
-    """Raw (non-autograd) FlyDSL RoPE forward. See ``rope_ops.py`` for the
-    autograd-wrapped, TE-signature-matching entry point used by the shim.
+    """Raw (non-autograd) FlyDSL RoPE forward; ``primus_turbo.pytorch.ops.rope``
+    carries the autograd-wrapped entry point.
 
     Args:
         qkv: [S, B, NG, (NPG+2)*D] bf16, contiguous.
@@ -505,9 +505,8 @@ def flydsl_qkv_rope_forward(qkv, q_freqs, k_freqs, qkv_split_arg_list):
         qkv_split_arg_list: [q_size, k_size, v_size] with k_size == v_size == D.
 
     Returns:
-        (q_out, k_out, v_out): bf16 contiguous tensors matching TE's
-        ``fused_qkv_rope_forward`` shapes exactly --
-        q_out [S,B,NG*NPG,D], k_out/v_out [S,B,NG,D].
+        (q_out, k_out, v_out): bf16 contiguous, q_out [S,B,NG*NPG,D] and
+        k_out/v_out [S,B,NG,D].
 
     Launches 2 kernels: Q (rotate) on its own, K+V merged into one launch
     (``_compiled_rope_kv`` -- measured 15.9% faster than separate K and V
@@ -517,16 +516,8 @@ def flydsl_qkv_rope_forward(qkv, q_freqs, k_freqs, qkv_split_arg_list):
     force one off its optimum, whereas V's grid_x-flatness makes the K+V
     kernel merge free.
 
-    Python-level dispatch COUNT is a separate axis from kernel-shape choice
-    (campaign 20260914_113401, OPTIMIZE r7, H3): by default this still issues
-    2 separate JIT calls (``_compiled_rope_rotate`` + ``_compiled_rope_kv``),
-    each independently autotuned exactly as before. Setting
-    ``PRIMUS_TURBO_FLYDSL_ROPE_MERGED_DISPATCH=1`` switches to
-    ``_compiled_rope_qkv_merged``, which launches the SAME two kernels (same
-    grid_x choices) but from a single Python-level call, halving the
-    per-call autotune-key + JIT-cache-key host resolution tax. Gated
-    separately from ``PRIMUS_TURBO_FLYDSL_ROPE`` so it can be A/B'd without
-    touching the shim install path.
+    How many Python-level dispatches carry those kernels is a separate axis from
+    the kernel shapes; ``_MERGED_DISPATCH`` selects it.
     """
     import torch
 
@@ -546,18 +537,42 @@ def flydsl_qkv_rope_forward(qkv, q_freqs, k_freqs, qkv_split_arg_list):
     v_out = torch.empty((S, B, NG, _D), dtype=torch.bfloat16, device=qkv.device)
     stream = torch.cuda.current_stream()
 
-    if os.environ.get("PRIMUS_TURBO_FLYDSL_ROPE_MERGED_DISPATCH", "0") == "1":
+    if _MERGED_DISPATCH:
         _compiled_rope_qkv_merged(
-            PACKED=qkv, Q_FREQS=q_freqs, K_FREQS=k_freqs, Q_OUT=q_out, K_OUT=k_out, V_OUT=v_out,
-            NG=NG, B=B, total_rows=total_rows, npg=npg, stream=stream,
+            PACKED=qkv,
+            Q_FREQS=q_freqs,
+            K_FREQS=k_freqs,
+            Q_OUT=q_out,
+            K_OUT=k_out,
+            V_OUT=v_out,
+            NG=NG,
+            B=B,
+            total_rows=total_rows,
+            npg=npg,
+            stream=stream,
         )
     else:
         _compiled_rope_rotate(
-            PACKED=qkv, FREQS=q_freqs, OUT=q_out, NG=NG, B=B, total_rows=total_rows, hk_base=0, n_hk=npg, npg=npg,
+            PACKED=qkv,
+            FREQS=q_freqs,
+            OUT=q_out,
+            NG=NG,
+            B=B,
+            total_rows=total_rows,
+            hk_base=0,
+            n_hk=npg,
+            npg=npg,
             stream=stream,
         )
         _compiled_rope_kv(
-            PACKED=qkv, K_FREQS=k_freqs, K_OUT=k_out, V_OUT=v_out, NG=NG, B=B, total_rows=total_rows, npg=npg,
+            PACKED=qkv,
+            K_FREQS=k_freqs,
+            K_OUT=k_out,
+            V_OUT=v_out,
+            NG=NG,
+            B=B,
+            total_rows=total_rows,
+            npg=npg,
             stream=stream,
         )
 
@@ -565,38 +580,28 @@ def flydsl_qkv_rope_forward(qkv, q_freqs, k_freqs, qkv_split_arg_list):
 
 
 # ==========================================================================
-# Backward (inverse RoPE) kernel + launchers (campaign 20260914_113401,
-# OPTIMIZE r9, L1 -- see rope_ops.py::_te_rope_backward for the call site and
-# the env-gated A/B switch this port is measured through).
-#
+# Backward (inverse RoPE) kernel + launchers. Same rotation as the forward with
+# sin negated, so the packed dQKV comes back in one pass.
 # Mirrors _make_rope_kernel/_make_kv_merged_kernel with source and destination
-# roles swapped: reads the CONTIGUOUS per-tensor gradient (dq/dk/dv -- already
-# contiguous in production; ANALYZE/REPLAN r8 forensics traced rope_bwd's
-# predecessor as ck_fused_attn::dk_dv_reduce with no copy kernel in between,
-# 352/352 launches) and writes the STRIDED packed dQKV gradient that TE's own
-# ``fused_qkv_rope_backward`` produces.
+# roles swapped: reads the contiguous per-tensor gradients and writes the
+# strided packed dQKV gradient.
 #
 # Rotation is the forward 2x2 rotate-half matrix transposed (sin negated):
 #     d_lo = d_lo' * cos + d_hi' * sin
 #     d_hi = d_hi' * cos - d_lo' * sin
 # where (d_lo', d_hi') is the incoming (contiguous, per-tensor) gradient
-# half-pair and (d_lo, d_hi) is the outgoing (packed) gradient half-pair. V
-# has no rotation (pure copy), matching forward's V and TE's own bwd
-# contract for the value gradient.
+# half-pair and (d_lo, d_hi) is the outgoing (packed) one. V has no rotation,
+# matching the forward.
 #
-# Correctness (this round's prototype, r8_replan_probe2.py::task_bwd,
-# production shape [8192,4,8,768], seed 1234, reproduced on two independent
-# GPUs): dQ SNR 100.72 dB, dK SNR 99.24 dB (both maxabs 1.5625e-02 = 1 bf16
-# ULP, not bit-exact -- fp32-accumulate order differs from TE's kernel), dV
-# bit-exact (pure copy, no float math). Overall SNR 101.17 dB vs the gate's
-# >=45 dB, 56 dB of margin.
+# Correctness is covered by tests/pytorch/ops/test_rope.py against a plain
+# PyTorch reference.
 #
 # Launch count: 3 (Q rotate, K rotate, V copy) -- the same shape as this
 # round's prototype, deliberately NOT merging K+V the way forward's
 # _compiled_rope_kv does. That merge is a separate, already-measured-risky
-# lever for this backward kernel (OPTIMIZE r7's H3 found merging two kernels
+# Merging the two launches is a host-side lever only; see _MERGED_DISPATCH.
 # into one JIT dispatch cut host time ~32% but cost DEVICE time +5-6%, net
-# negative in isolation for the forward K+V pair) and is not this round's
+# negative in isolation for the forward K+V pair) and is not this file's
 # single hypothesis -- one change per round (iteration_rules.mdc Rule 1).
 # ==========================================================================
 
@@ -718,8 +723,8 @@ def _make_rope_bwd_kernel(
 # re-searches this range for ITS OWN function (each @autotune call below gets
 # its own Autotuner instance / own on-disk cache per tune_utils.py, keyed by
 # this function's identity plus the listed key fields) instead of trusting
-# the forward optimum's value without measuring (pitfalls.md: "never trust a
-# historical constant, autotune both axes" -- OPTIMIZE r7's hardcoded-3072
+# Autotune both axes rather than carrying the forward optimum over: the two
+# kernels do not share an optimum.
 # regression is exactly this mistake for a sibling kernel).
 @autotune(
     configs=[Config(grid_x=gx) for gx in _ROTATE_GRID_X_CANDIDATES],
@@ -769,13 +774,9 @@ def _compiled_rope_bwd_copy(
 
 
 def flydsl_qkv_rope_backward(dq, dk, dv, q_freqs, k_freqs, qkv_split_arg_list):
-    """Inverse-RoPE backward: produces the packed ``dQKV`` gradient that TE's
-    own ``fused_qkv_rope_backward`` produces, from the per-tensor Q/K/V
-    gradients. See ``rope_ops.py::_te_rope_backward`` for the call site and
-    the env-gated A/B switch (``PRIMUS_TURBO_FLYDSL_ROPE_BWD``); this function
-    itself is a raw (non-autograd) kernel entry point, matching
-    ``flydsl_qkv_rope_forward``'s split between raw kernel and autograd
-    wrapper.
+    """Inverse-RoPE backward: the packed ``dQKV`` gradient, from the per-tensor
+    Q/K/V gradients. Raw (non-autograd) entry point, like the forward;
+    ``primus_turbo.pytorch.ops.rope`` wraps both.
 
     Args:
         dq: [S, B, NG*NPG, D] bf16, contiguous (gradient w.r.t. q_out).
@@ -818,16 +819,39 @@ def flydsl_qkv_rope_backward(dq, dk, dv, q_freqs, k_freqs, qkv_split_arg_list):
     stream = torch.cuda.current_stream()
 
     _compiled_rope_bwd_rotate(
-        DSPLIT=dq, FREQS=q_freqs, DPACKED=grad_qkv, NG=NG, B=B, total_rows=total_rows,
-        hk_base=0, n_hk=npg, npg=npg, stream=stream,
+        DSPLIT=dq,
+        FREQS=q_freqs,
+        DPACKED=grad_qkv,
+        NG=NG,
+        B=B,
+        total_rows=total_rows,
+        hk_base=0,
+        n_hk=npg,
+        npg=npg,
+        stream=stream,
     )
     _compiled_rope_bwd_rotate(
-        DSPLIT=dk, FREQS=k_freqs, DPACKED=grad_qkv, NG=NG, B=B, total_rows=total_rows,
-        hk_base=npg, n_hk=1, npg=npg, stream=stream,
+        DSPLIT=dk,
+        FREQS=k_freqs,
+        DPACKED=grad_qkv,
+        NG=NG,
+        B=B,
+        total_rows=total_rows,
+        hk_base=npg,
+        n_hk=1,
+        npg=npg,
+        stream=stream,
     )
     _compiled_rope_bwd_copy(
-        DSPLIT=dv, DPACKED=grad_qkv, NG=NG, B=B, total_rows=total_rows,
-        hk_base=npg + 1, n_hk=1, npg=npg, stream=stream,
+        DSPLIT=dv,
+        DPACKED=grad_qkv,
+        NG=NG,
+        B=B,
+        total_rows=total_rows,
+        hk_base=npg + 1,
+        n_hk=1,
+        npg=npg,
+        stream=stream,
     )
 
     return grad_qkv
