@@ -1,0 +1,17 @@
+
+rocblaslt error: Cannot read "/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/TensileLibrary_lazy_gfx1250.dat" (or .zlib variant): No such file or directory
+
+rocblaslt error: Could not load "/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/TensileLibrary_lazy_gfx1250.dat"
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250.hsaco
+ error: file not found
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250-xnack-.hsaco
+ error: file not found
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250-xnack+.hsaco
+ error: file not found
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm baseline -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/baseline
+# arm current -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/.runs/current_probe/current
+# statistic median  iters 101  warmup 3.0s continuous  order palindromic  device gfx1250
+RESULT shape=fast arm=baseline stat=median iters=101 latency_ms=1.7738569974899292 min_ms=1.7645230293273926 max_ms=2.6427578926086426 tflops=3.029529442116435 bw_gbs=5.91127696022719 flop=5373952000.0 bytes_min=10485760 sclk_start=1100 sclk_end=1100 causal=True
+RESULT shape=fast arm=current stat=median iters=101 latency_ms=1.7740570306777954 min_ms=1.7658849954605103 max_ms=2.077631950378418 tflops=3.029187848570364 bw_gbs=5.910610436234857 flop=5373952000.0 bytes_min=10485760 sclk_start=1100 sclk_end=1100 causal=True

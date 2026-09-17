@@ -1,0 +1,5 @@
+# arm cand -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/001/op
+# arm beat -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/beat
+# statistic median  iters 5  warmup 0.5s continuous  order palindromic  device gfx1250
+RESULT shape=proxy arm=cand stat=median iters=5 latency_ms=9.486446380615234 min_ms=9.391463279724121 max_ms=9.646245002746582 tflops=36.228663081075766 bw_gbs=17.685459156004768 flop=343681269760.0 bytes_min=167772160 sclk_start=1057 sclk_end=1100 causal=True
+RESULT shape=proxy arm=beat stat=median iters=5 latency_ms=0.6007400155067444 min_ms=0.5916860103607178 max_ms=0.6152409911155701 tflops=572.0965157782827 bw_gbs=279.2758192718002 flop=343681269760.0 bytes_min=167772160 sclk_start=1057 sclk_end=1100 causal=True

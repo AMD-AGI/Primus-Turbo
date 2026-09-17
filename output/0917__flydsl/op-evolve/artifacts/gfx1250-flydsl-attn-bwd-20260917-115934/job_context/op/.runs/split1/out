@@ -1,0 +1,5 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+SPLIT shape=fast delta=0.0599ms(3.2%) dkdv=1.5595ms(83.0%) dq=0.2604ms(13.9%) total=1.8799ms
+SPLIT shape=proxy delta=0.0666ms(0.7%) dkdv=7.0526ms(73.7%) dq=2.4515ms(25.6%) total=9.5707ms
+SPLIT shape=prod delta=0.1179ms(0.1%) dkdv=64.3936ms(67.1%) dq=31.3932ms(32.7%) total=95.9047ms

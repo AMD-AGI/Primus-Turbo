@@ -1,0 +1,44 @@
+meta:
+  name: gfx1250-flydsl-attn-bwd
+  id: 20260917-115934
+  started_at: '2026-09-17T11:59:34'
+  spec_version: v000
+  elapsed_seconds: 4686.5
+setup:
+  job_setup:
+    status: done
+    spec_version: v000
+    at: '2026-09-17T12:09:53'
+    seconds: 618.3
+  op_setup:
+    status: done
+    spec_version: v000
+    at: '2026-09-17T12:57:23'
+    seconds: 2850.0
+lifecycle:
+- at: '2026-09-17T11:59:34'
+  event: setup_started
+best_round: 0
+champions: {}
+rounds:
+- round: 0
+  progress: []
+  score: null
+  outcome: delivered
+  passed: true
+  accepted: true
+  note: baseline (measured at setup)
+  tflops:
+    fast: 3.042
+    proxy: 36.442
+    prod: 57.241
+- round: 1
+  progress: []
+  mode: fast
+  running:
+    module: opt
+    step: null
+    since: '2026-09-17T12:57:23'
+  seconds:
+    opt: 1218.2
+    round: 1218.2

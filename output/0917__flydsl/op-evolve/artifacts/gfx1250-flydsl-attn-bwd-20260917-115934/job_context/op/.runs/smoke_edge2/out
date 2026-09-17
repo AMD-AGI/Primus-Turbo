@@ -1,0 +1,28 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+
+rocblaslt error: Cannot read "/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/TensileLibrary_lazy_gfx1250.dat" (or .zlib variant): No such file or directory
+
+rocblaslt error: Could not load "/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/TensileLibrary_lazy_gfx1250.dat"
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250.hsaco
+ error: file not found
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250-xnack-.hsaco
+ error: file not found
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250-xnack+.hsaco
+ error: file not found
+impl /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/baseline
+arch gfx1250   gate 50.0 dB
+  toy                causal     163.3 ms  dq 16384/16384   52.49 dB  dk 8192/8192   52.36 dB  dv 8192/8192   52.84 dB   PASS
+  toy                full         0.7 ms  dq 16384/16384   52.65 dB  dk 8192/8192   52.76 dB  dv 8192/8192   52.85 dB   PASS
+  gqa4_small         causal       0.7 ms  dq 262144/262144   52.64 dB  dk 65536/65536   52.67 dB  dv 65536/65536   52.85 dB   PASS
+  gqa4_small         full         0.7 ms  dq 262144/262144   52.51 dB  dk 65536/65536   52.62 dB  dv 65536/65536   52.70 dB   PASS
+  mha                causal       0.6 ms  dq 131072/131072   52.34 dB  dk 131072/131072   52.46 dB  dv 131072/131072   52.73 dB   PASS
+  mha                full         0.6 ms  dq 131072/131072   52.60 dB  dk 131072/131072   52.67 dB  dv 131072/131072   52.66 dB   PASS
+  unequal_seqlen     causal       1.4 ms  dq 524288/524288   52.57 dB  dk 262144/262144   52.62 dB  dv 262144/262144   52.51 dB   PASS
+  unequal_seqlen     full         1.4 ms  dq 524288/524288   52.54 dB  dk 262144/262144   52.58 dB  dv 262144/262144   52.45 dB   PASS
+  unequal_seqlen_2   causal       2.2 ms  dq 1048576/1048576   52.56 dB  dk 524288/524288   52.60 dB  dv 524288/524288   52.57 dB   PASS
+  unequal_seqlen_2   full         2.2 ms  dq 1048576/1048576   52.55 dB  dk 524288/524288   52.61 dB  dv 524288/524288   52.56 dB   PASS
+  sq_gt_skv          full         2.1 ms  dq 1048576/1048576   52.54 dB  dk 131072/131072   52.61 dB  dv 131072/131072   52.63 dB   PASS
+  fast               causal       2.1 ms  dq 1048576/1048576   52.52 dB  dk 262144/262144   52.60 dB  dv 262144/262144   52.71 dB   PASS
+  fast               full         2.1 ms  dq 1048576/1048576   52.56 dB  dk 262144/262144   52.62 dB  dv 262144/262144   52.54 dB   PASS
+RESULT: PASS

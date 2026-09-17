@@ -1,0 +1,29 @@
+W0917 13:00:50.490063   28707 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.000313 sec
+W0917 13:00:50.490216   28707 simple_timer.cpp:55] [rocprofv3] 'python3 /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/benchmark.py --arm-path cand=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/001/op --arms beat --shapes proxy --iters 5 --warmup-seconds 0.5' ::     0.000000 sec
+W0917 13:00:51.379710   28707 tool.cpp:3082] HSA version 1.21.0 initialized (instance=0)
+
+rocblaslt error: Cannot read "/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/TensileLibrary_lazy_gfx1250.dat" (or .zlib variant): No such file or directory
+
+rocblaslt error: Could not load "/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/TensileLibrary_lazy_gfx1250.dat"
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250.hsaco
+ error: file not found
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250-xnack-.hsaco
+ error: file not found
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250-xnack+.hsaco
+ error: file not found
+Queue error: HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION: The agent attempted to access memory beyond the largest legal address.
+Failed to create GPU coredump: File exists
+GPU core dump failed
+VGPU=0x2a5fbeb0 SWq=0x79c08ceeb000, HWq=0x79bfe3200000, id=1
+	Ext Dispatch Header =0xb00 (type=0, barrier=1, acquire=1, release=1), amd_format=3, setup=3
+	cluster_count=[1, 16, 1], cluster_size=[1, 1, 1], workgroup=[256, 1, 1]
+	private_seg_size=0, group_seg_size=6144
+	kernel_obj=0x79bfe8b71c40, kernarg_address=0x0x79bfe2c70200
+	dep_signal=0x0, completion_signal=0x0
+	rptr=1115, wptr=3157
+:0:rocdevice.cpp            :4213: 18759121599 us:  Callback: Queue 0x79bfe3200000 aborting with error : HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION: The agent attempted to access memory beyond the largest legal address. code: 0x29 [host: heliosr-1b114-c07-1, GPU index: 0, kernel: Cijk_Ailk_Bljk_SB_MT128x64x8_SN_AMAS0_BL0_BS1_GLVWA1_GLVWB1_GRVW1_GSU1_GSUASB_K1_LRVW1_NLCA1_NLCB1_PGR0_PLR0_SIA1_SU32_SUS256_SVW4_TT8_4_USFGRO0_VAW1_VS1_VW1_VWB1_WG16_16_1_WGM8]
+W0917 13:00:54.282568   29032 tool.cpp:3811] [PPID=28705][PID=28707][TID=29032][rocprofv3_error_signal_handler] rocprofv3 caught signal 6...
+W0917 13:00:54.282612   29032 tool.cpp:3834] [PPID=28705][PID=28707][TID=29032][rocprofv3_error_signal_handler] rocprofv3 will wait for 0 children to exit
+W0917 13:00:54.282616   29032 tool.cpp:3849] [PPID=28705][PID=28707][TID=29032][rocprofv3_error_signal_handler] rocprofv3 finalizing after signal 6...
+Memory access fault by GPU node-2 (Agent handle: 0x29f2cf90) on address 0xb89c2000. Reason: Page not present or supervisor privilege.
+bash: line 1: 28707 Aborted                 (core dumped) rocprofv3 --stats --kernel-trace -d /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/001/_scratch/prof -o s1 -- python3 /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/benchmark.py --arm-path cand=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/001/op --arms beat --shapes proxy --iters 5 --warmup-seconds 0.5

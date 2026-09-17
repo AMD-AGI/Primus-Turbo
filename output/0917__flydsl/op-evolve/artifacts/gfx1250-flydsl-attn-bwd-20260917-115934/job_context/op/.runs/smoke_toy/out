@@ -1,0 +1,17 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+
+rocblaslt error: Cannot read "/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/TensileLibrary_lazy_gfx1250.dat" (or .zlib variant): No such file or directory
+
+rocblaslt error: Could not load "/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/TensileLibrary_lazy_gfx1250.dat"
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250.hsaco
+ error: file not found
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250-xnack-.hsaco
+ error: file not found
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250-xnack+.hsaco
+ error: file not found
+impl /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/baseline
+arch gfx1250   gate 50.0 dB
+  toy                causal    1297.8 ms  dq 16384/16384   52.40 dB  dk 8192/8192   52.79 dB  dv 8192/8192   53.27 dB   PASS
+  toy                full         0.7 ms  dq 16384/16384   52.40 dB  dk 8192/8192   52.59 dB  dv 8192/8192   52.71 dB   PASS
+RESULT: PASS

@@ -1,0 +1,23 @@
+
+rocblaslt error: Cannot read "/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/TensileLibrary_lazy_gfx1250.dat" (or .zlib variant): No such file or directory
+
+rocblaslt error: Could not load "/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/TensileLibrary_lazy_gfx1250.dat"
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250.hsaco
+ error: file not found
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250-xnack-.hsaco
+ error: file not found
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250-xnack+.hsaco
+ error: file not found
+impl /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/beat
+arch gfx1250   gate 50.0 dB
+  toy                causal       1.6 ms  dq 16384/16384   52.44 dB  dk 8192/8192   50.21 dB  dv 8192/8192   50.69 dB   PASS
+  toy                full         0.8 ms  dq 16384/16384   52.56 dB  dk 8192/8192   50.48 dB  dv 8192/8192   50.45 dB   PASS
+  gqa4_small         causal       0.3 ms  dq 262144/262144   52.66 dB  dk 65536/65536   50.91 dB  dv 65536/65536   50.98 dB   PASS
+  gqa4_small         full         0.2 ms  dq 262144/262144   52.52 dB  dk 65536/65536   50.86 dB  dv 65536/65536   50.70 dB   PASS
+  mha                causal       0.2 ms  dq 131072/131072   52.52 dB  dk 131072/131072   52.56 dB  dv 131072/131072   52.98 dB   PASS
+  mha                full         0.2 ms  dq 131072/131072   52.56 dB  dk 131072/131072   52.50 dB  dv 131072/131072   52.50 dB   PASS
+  fast               causal       0.2 ms  dq 1048576/1048576   52.45 dB  dk 262144/262144   50.66 dB  dv 262144/262144   50.84 dB   PASS
+  fast               full         0.2 ms  dq 1048576/1048576   52.54 dB  dk 262144/262144   50.79 dB  dv 262144/262144   50.76 dB   PASS
+  unequal_seqlen     causal       0.2 ms  dq 524288/524288   52.56 dB  dk 262144/262144   50.81 dB  dv 262144/262144   50.85 dB   PASS
+  unequal_seqlen     full         0.2 ms  dq 524288/524288   52.54 dB  dk 262144/262144   50.80 dB  dv 262144/262144   50.81 dB   PASS
+RESULT: PASS

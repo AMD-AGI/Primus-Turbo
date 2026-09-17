@@ -1,0 +1,286 @@
+# ==============================================================================
+# COMPLETED SPEC -- v000, written by Job Setup on 2026-09-17.
+#
+# This is the user's job file (jobs/gfx1250-flydsl-attn-bwd.yaml, preserved verbatim at
+# history/v000_original.yaml) plus every value Job Setup resolved or observed. Lines
+# marked [user] are the user's own; lines marked [resolved] were implicit in the input
+# and are now written out; [observed] was measured on this machine on 2026-09-17.
+# Nothing here is left implicit. The rest of the job reads THIS file.
+#
+# READ jobs/gfx1250-flydsl-attn-bwd.HINTS.md FIRST. It carries the arch facts, the
+# traps this box has actually sprung, and the two findings the PREVIOUS op-evolve job
+# on this hardware discovered and then lost to a bookkeeping rule.
+# [resolved] absolute path:
+#   /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/jobs/gfx1250-flydsl-attn-bwd.HINTS.md
+#
+# WHAT IS DIFFERENT ABOUT THIS JOB
+#
+# Every other FlyDSL job in this directory optimises a heavily tuned production kernel
+# against itself and hunts for 20%. This one is the opposite: `op/baseline/` is a
+# CORRECT but deliberately unoptimised kernel written on 2026-09-17, and the gap to
+# `op/beat/` is about **93x**. The search space is untouched.
+#
+# That matters because the previous job on this box (gfx1250-attn-llama31-8b-bwd,
+# 2026-09-14) stalled after one accepted round for the opposite reason: its round 1
+# mined the launch-config axis dry, and rounds 2-4 re-searched the same space. Do not
+# expect that here, and do not confine the editable surface to launch configuration.
+#
+# ------------------------------------------------------------------- PROVENANCE --
+#
+# The baseline is NOT vendored from Primus-Turbo main. It is new code, written and
+# validated against torch this week, living at
+#
+#     Primus-Turbo/output/0917__flydsl/kernels/
+#         odo_gfx1250.py        delta = rowsum(dO*O)          159.24 / 156.49 dB
+#         dkdv_loop_gfx1250.py  dV, dK, runtime q loop, causal  141.9 / 141.0 dB
+#         dq_gfx1250.py         dQ = dS . K                    144.90 dB
+#
+# [resolved] "Primus-Turbo" is /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo -- it is
+# NOT inside the op-evolve checkout. All three files verified present on 2026-09-17; see
+# op.baseline.sources below for the absolute paths.
+#
+# Setup copies those three into `op/baseline/` and wires them behind one callable with
+# the signature in `op.reference.api`. Every one passed on its first run, each with
+# NaN-prefilled outputs and full isfinite coverage checked before SQNR.
+# [resolved] "Setup" here means OP SETUP, the next stage. Job Setup did not create
+# `op/`, and was instructed not to.
+#
+# ⚠ THE BASELINE IMPORTS AITER AND TORCH ONLY -- NEVER primus_turbo.
+# flydsl 0.3.2 is required (0.2.4 cannot build aiter's gfx1250 kernels) and 0.3.2
+# removes `flydsl.expr.buffer_ops`, which primus_turbo's own FlyDSL tree imports
+# unconditionally. Importing primus_turbo under 0.3.2 raises. Install 0.3.2 with
+# `pip install --target /home/lihuzhan/.local/flydsl032` and prepend to sys.path; do NOT touch the
+# image's site-packages, whose 0.2.4 other things depend on. Setup must print
+# `flydsl.__file__` and assert it resolves to the 0.3.2 copy.
+# [observed] ALREADY INSTALLED, no pip step needed: /home/lihuzhan/.local/flydsl032 holds
+# flydsl 0.3.2 and the image's /opt/venv/.../site-packages holds 0.2.4. With the two
+# sys.path entries in runtime.python_path below, `flydsl.__version__` is 0.3.2,
+# `flydsl.__file__` is /home/lihuzhan/.local/flydsl032/flydsl/__init__.py,
+# `flydsl.expr.buffer_ops` is absent, and `import aiter` succeeds. Verified in-container.
+#
+# ⚠ ONE GPU. `gpu_pool` is empty, so deep rounds cannot parallelise their analyses and
+# will be slow. The schedule below is weighted toward fast rounds for that reason.
+# While this job holds the card, nothing else may use it.
+# ==============================================================================
+
+job:
+  name: gfx1250-flydsl-attn-bwd        # [user]
+  id: '20260917-115934'                # [resolved] from the framework
+  started_at: '2026-09-17T11:59:34'    # [resolved] from the framework
+  description: >
+    A first-party FlyDSL flash-attention BACKWARD for gfx1250, written 2026-09-17,
+    correct and unoptimised. Three kernels: odo (delta), dkdv (dV and dK in one pass),
+    and dq. bf16, head dim 128, causal bottom-right, BSHD. The anchor is aiter's
+    prebuilt gfx1250 ASM backward, which does the production shape in 10.160 ms
+    (~540 TFLOP/s useful at this card's 1100 MHz VR-throttled clock) against the
+    baseline's ~5.8 TFLOP/s.
+
+    The motivation is NOT that FlyDSL is expected to be faster. A like-for-like forward
+    comparison on this card measured aiter's FlyDSL forward 1.51x SLOWER than its own
+    prebuilt ASM forward, with both sides mature -- that is the best available estimate
+    of what these gfx1250 FlyDSL idioms are worth, and parity is the realistic ceiling
+    for the backward too. What a source-level backward buys instead is: gfx1250 has NO
+    varlen ASM backward at all (an existence gap, not a speed one); the ASM backward
+    carries a GQA out-of-bounds write worked around with 1.254 GiB of peak scratch and
+    a host reduction costing 5.2% of the backward; and gfx1250 ships 6 backward .co
+    against gfx950's 124.
+
+    So the job's real question is whether an optimised FlyDSL backward can REACH the
+    ASM backward, not beat it by a margin. A well-measured refutation is a result, and
+    the operator would rather have it in ten rounds than forty.
+
+agent:
+  account:
+    # [user] paths; [resolved] expanded from ~ and confirmed to exist. Job Setup never
+    # read or copied their contents; tools/check_llm_account.py sources them itself.
+    anthropic: /home/lihuzhan/.op_evolve_anthropic
+    openai: /home/lihuzhan/.op_evolve_openai       # [user] symlink to the anthropic file: it
+                                      # already defines OPENAI_BASE_URL and OPENAI_API_KEY.
+                                      # Set reviewer: null instead if single-SDK is wanted.
+                                      # [observed] it IS a symlink -> .op_evolve_anthropic,
+                                      # and one file satisfies both SDKs. Keeping the
+                                      # two-SDK setup: the reviewer stays `codex`.
+                                      # [resolved] sdk `codex` reads agent.account.openai;
+                                      # sdk `claude` reads agent.account.anthropic.
+  roles:
+    setup:    {sdk: claude, model: claude-opus-5, effort: xhigh}   # [user]
+    profiler: {sdk: claude, model: claude-opus-5, effort: xhigh}   # [user]
+    planner:  {sdk: claude, model: claude-opus-5, effort: max}     # [user]
+    reviewer: {sdk: codex,  model: gpt-5.6-sol,   effort: xhigh}   # [user]
+
+op:
+  type: attention                  # [user]
+  config:
+    causal: bottom-right           # [user]
+    sliding_window: -1             # [user] -- none, on every shape
+    sparsity: dense                # [user]
+    q_head_dim: 128                # [user]
+    kv_head_dim: 128               # [user]
+    heads_q_per_kv: 4              # Llama-3.1-8B. NOTE the ASM anchor's GQA bug is here.
+                                   # [resolved] consistent with all three shapes:
+                                   # 8/2, 32/8 and 32/8 all give 4.
+    format: bshd                   # [user] q/k/v/o/do are [b, s, h, d] in memory
+    direction: [bwd]               # [user] -- backward only. The forward is run to
+                                   # produce o and lse and is NOT part of the measured
+                                   # region. [resolved]
+    sink: none                     # [user]
+    softmax_scale: head_dim ** -0.5
+    softmax_scale_value: 0.08838834764831845   # [resolved] 128 ** -0.5, written out so
+                                   # no stage re-derives it. `softmax_scale=None` in the
+                                   # api means this value.
+    determinism: >
+      The baseline is atomic-free by construction: every output element is written
+      exactly once. Keep that -- it is one of the reasons to have a source-level
+      backward at all, and 200-run bitwise determinism is a cheap gate on it.
+    determinism_gate: >
+      [resolved] Operationally: no atomics on any output, and dq/dk/dv bitwise identical
+      across 200 consecutive runs at the fast-iteration shape. A round that introduces a
+      split-k or atomic reduction fails this gate even if it is faster.
+    dtype: {qkv: bf16, out: bf16, qk_acc: fp32, softmax: fp32, pv_acc: fp32, lse: fp32}
+  reference:
+    impl: >
+      Plain torch, written by setup, not copied: s = q@k.T*scale; causal mask; lse;
+      p = exp(s-lse); o = p@v; delta = rowsum(do*o); ds = p*(do@v.T - delta)*scale;
+      dq = ds@k; dk = ds.T@q; dv = p.T@do. Chunk over (batch, head) and query blocks --
+      a dense [4,32,8192,8192] fp32 score tensor is 34 GB.
+    impl_dtype: fp32               # [resolved] the reference computes in fp32 and the
+                                   # bf16 candidate is scored against it. Implied by
+                                   # "a dense fp32 score tensor" above.
+    logic: >
+      Grouped-query flash attention backward, causal bottom-right, bf16, no sink, no
+      sliding window, no dropout. Consumes o and lse from the forward and returns
+      dq, dk, dv.
+    api: >
+      flydsl_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True)
+      -> (dq, dk, dv).  q/k/v/o/do are [b, s, h, d]; lse is [b, hq, sq] fp32 NATURAL
+      log (measured: aiter's gfx1250 forward emits natural log, ratio 1.0000, 81.85 dB).
+  baseline:
+    # [resolved] Op Setup copies these three into op/baseline/ and wires them behind
+    # op.reference.api. All three verified present and readable on 2026-09-17.
+    root: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0917__flydsl/kernels
+    sources:
+      - {file: odo_gfx1250.py,       role: "delta = rowsum(dO*O)",           validated_db: "159.24 / 156.49"}
+      - {file: dkdv_loop_gfx1250.py, role: "dV, dK, runtime q loop, causal", validated_db: "141.9 / 141.0"}
+      - {file: dq_gfx1250.py,        role: "dQ = dS . K",                    validated_db: "144.90"}
+    imports: [torch, aiter]        # NEVER primus_turbo -- see the header
+    reported_tflops: 5.8           # [user, from job.description] at the production shape
+  precision_sqnr_db: 50            # [user]
+  precision_gate: >
+    [resolved] from the HINTS file, which is stricter than a single number: dq, dk and
+    dv are checked SEPARATELY, each >= 50 dB against the fp32 reference, with the output
+    buffers NaN-prefilled and full `isfinite` coverage asserted BEFORE SQNR is computed.
+    A run that reports one tensor only, or computes SQNR over a partly-uncovered buffer,
+    does not satisfy this gate. (2026-09-16 precedent: out 53.67 / dq 52.24 / dk -inf /
+    dv -inf would have passed a one-tensor check.)
+  shape:
+    mode: sweep                    # [user] -- all three shapes scored, none is a guard
+    shapes:
+      # [user] shapes verbatim. flop/bytes_min are [resolved], computed with
+      # tools/op_flops.py attention --backward --causal bottom-right --dtype bf16,
+      # so no stage re-derives a FLOP count by hand.
+      - {batch: 1, seqlen_q: 1024, seqlen_kv: 1024, heads_q: 8,  heads_kv: 2, head_dim: 128, note: fast-iteration,
+         flop: 5.37395e+09, bytes_min: 1.04858e+07}
+      - {batch: 1, seqlen_q: 4096, seqlen_kv: 4096, heads_q: 32, heads_kv: 8, head_dim: 128, note: quarter-FLOP proxy,
+         flop: 3.43681e+11, bytes_min: 1.67772e+08}
+      - {batch: 4, seqlen_q: 8192, seqlen_kv: 8192, heads_q: 32, heads_kv: 8, head_dim: 128, note: production,
+         flop: 5.49823e+12, bytes_min: 1.34218e+09}
+  guards: []                       # [resolved] none. Every shape above is scored.
+  target:
+    beat: "aiter prebuilt gfx1250 ASM backward via tools/gfx1250/asm_bwd_launcher.py, dkdv_heads=q plus the host reduction -- must be beaten by 0%"  # [user]
+    beat_launcher: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/tools/gfx1250/asm_bwd_launcher.py  # [resolved] verified present 2026-09-17
+    beat_margin_pct: 0             # [resolved] "by 0%" -- parity with the anchor is the
+                                   # bar, which matches job.description ("REACH the ASM
+                                   # backward, not beat it by a margin").
+    beat_measured_same_run: true   # [resolved] the anchor is re-measured in the same run
+                                   # as the candidate, never read from a stored figure:
+                                   # this card is VR-throttled and DRIFTS (1100 -> 967 MHz
+                                   # observed inside one timing window), so a stored
+                                   # anchor turns clock drift into apparent progress.
+    beat_reference_figure: >
+      [user, from job.description] 10.160 ms at the production shape ~= 541.2 TFLOP/s on
+      5.49823e12 FLOP (recomputed by Job Setup; the job file's "~540" checks out). This is
+      a SANITY figure only -- it is not the gate. The gate is the same-run measurement.
+    tflops: null            # MUST stay null, or _margin() returns None and the
+    roofline_pct: null      # relative gate is silently disabled.
+                            # [resolved] confirmed still null; do not fill these in.
+  backend: [flydsl]         # [user] pinned
+
+evolve:
+  max_rounds: 40            # [user] failed rounds count against this
+  max_timeout: 48h          # [user]  [resolved] = 172800 s
+  min_gain: 0.0             # [resolved] explicit default: anything above 1.0 counts as
+                            # an improvement. Justified here rather than copied -- the
+                            # gap to the anchor is ~93x, so round gains are expected to
+                            # be integer factors, far above this machine's run-to-run
+                            # spread. Raise it only if measured spread says to.
+  turn_timeout: null        # [resolved] unset: each module keeps its own default (3 h).
+  schedule:
+    fast_rounds: 12         # single card: deep rounds cannot parallelise, so front-load
+    fast_per_deep: 5        # [user]
+
+runtime:
+  runner:
+    type: docker            # [user] -- LOCAL docker. [resolved] there is no
+                            # `runtime.runner.ssh` block: the controller, the node and
+                            # the container are all on heliosr-1b114-c07-1, so there are
+                            # ZERO ssh hops to verify.
+    ssh: null               # [resolved] no hops
+    docker:
+      image: null                   # [user] unused: `container` is set, so the runner
+                                    # attaches and never creates. [observed] the running
+                                    # container's image is `fa-tune:deps`, recorded for
+                                    # provenance only -- do NOT move it into this field,
+                                    # which would make the runner own the container.
+      container: fa-repro           # EXISTING container; the runner attaches, never
+                                    # recreates. flydsl 0.3.2 is at /home/lihuzhan/.local/flydsl032.
+                                    # [observed] Up, image fa-tune:deps, mounts
+                                    # /home/lihuzhan:/home/lihuzhan, /dev/kfd + /dev/dri,
+                                    # ipc=host, net=host, shm 16 GiB, seccomp=unconfined,
+                                    # groups video,993.
+      options: []                   # [user] -- and none are applied: `options` is only
+                                    # read when the runner CREATES a container, which it
+                                    # will not do here. [resolved]
+      owned: false                  # [resolved] user-owned container. The runner must not
+                                    # create, recreate, restart or pip-install into it.
+  sudo: false               # [user] -- do not use sudo. [observed] `sudo -n true`
+                            # SUCCEEDS on this host, so sudo is AVAILABLE; this field is
+                            # a policy, not a capability, and it stays false.
+  gpu_arch: gfx1250         # [observed] confirmed: rocm-smi GFX Version gfx1250,
+                            # rocminfo amdgcn-amd-amdhsa--gfx1250,
+                            # torch gcnArchName gfx1250. AMD Eng Sample 100-000001046-04.
+  gpu_id: 0                 # [observed] usable: the only GPU on the node (device count 1)
+  gpu_pool: []              # one card on this host. Not a placeholder.
+  # [resolved] Everything below was observed by Job Setup on 2026-09-17 and is written
+  # here because every later stage needs it and none of it was in the job file.
+  host: heliosr-1b114-c07-1
+  python_path:              # prepend IN THIS ORDER before `import flydsl` / `import aiter`
+    - /home/lihuzhan/.local/flydsl032     # flydsl 0.3.2, ahead of the image's 0.2.4
+    - /home/lihuzhan/code/aiter-src       # aiter is NOT installed in the container
+  env:
+    TORCH_BLAS_PREFER_HIPBLASLT: '0'      # hipBLASLt is broken for bf16 on this image
+                                          # (its gfx1250 Tensile library files are
+                                          # missing; torch falls back to rocBLAS with a
+                                          # noisy but harmless error on the first GEMM).
+                                          # The baseline kernels already set this.
+  observed:
+    torch: 2.11.0+rocm7.14.0a20260625
+    torch_hip: 7.14.60850
+    rocm_smi: /opt/venv/bin/rocm-smi      # the container has no /opt/rocm; ROCm arrives
+                                          # through the _rocm_sdk_libraries_gfx1250 wheel
+    rocprofv3: 1.3.2
+    flydsl_in_image: 0.2.4                # /opt/venv/lib/python3.12/site-packages/flydsl
+    flydsl_selected: 0.3.2                # /home/lihuzhan/.local/flydsl032/flydsl
+    gpu_count: 1
+  # ⚠ [resolved from knowledge already on this machine] SAFETY RULES for this card:
+  #   - rocprofv3 PC SAMPLING is reboot-level dangerous here (wedged MES on 2026-09-11).
+  #     Plain ATT and PMC counter sweeps are the clean controls. Never enable PC sampling.
+  #   - Never call an autotuner on a training path: its `except: continue` cannot recover
+  #     a HIP context that has taken a launch failure (wedged the card 2026-09-16).
+  #   - Launch any newly compiled kernel at a toy shape first, in its own process, with
+  #     AMD_SERIALIZE_KERNEL=3. A bad TDM descriptor or wave-size mismatch HANGS silently.
+  #   - The card is VR-throttled to 1100 MHz and drifts. Interleave arms ABAB and record a
+  #     clock witness with every figure.
+
+review:
+  auto_approve_after: 10m   # single operator, often away; nothing may block on them
+                            # [resolved] = 600 s

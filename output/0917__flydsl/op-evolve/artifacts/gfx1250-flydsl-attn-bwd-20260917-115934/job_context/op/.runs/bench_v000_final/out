@@ -1,0 +1,25 @@
+
+rocblaslt error: Cannot read "/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/TensileLibrary_lazy_gfx1250.dat" (or .zlib variant): No such file or directory
+
+rocblaslt error: Could not load "/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/TensileLibrary_lazy_gfx1250.dat"
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250.hsaco
+ error: file not found
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250-xnack-.hsaco
+ error: file not found
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250-xnack+.hsaco
+ error: file not found
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm baseline -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/baseline
+# arm current -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/.runs/current_probe/current
+# arm beat -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/beat
+# statistic median  iters 51  warmup 3.0s continuous  order palindromic  device gfx1250
+RESULT shape=fast arm=baseline stat=median iters=51 latency_ms=1.7665259838104248 min_ms=1.7550289630889893 max_ms=2.3341360092163086 tflops=3.042101870705745 bw_gbs=5.935808528206333 flop=5373952000.0 bytes_min=10485760 sclk_start=1100 sclk_end=1100 causal=True
+RESULT shape=fast arm=current stat=median iters=51 latency_ms=1.7758599519729614 min_ms=1.7550679445266724 max_ms=1.924921989440918 tflops=3.026112500611096 bw_gbs=5.904609757289944 flop=5373952000.0 bytes_min=10485760 sclk_start=1100 sclk_end=1100 causal=True
+RESULT shape=fast arm=beat stat=median iters=51 latency_ms=0.1054380014538765 min_ms=0.10023000091314316 max_ms=0.18671900033950806 tflops=50.967885637995685 bw_gbs=99.4495329521867 flop=5373952000.0 bytes_min=10485760 sclk_start=1100 sclk_end=1100 causal=True
+RESULT shape=proxy arm=baseline stat=median iters=51 latency_ms=9.430963516235352 min_ms=9.3528470993042 max_ms=10.338123321533203 tflops=36.44179824981345 bw_gbs=17.78950366112446 flop=343681269760.0 bytes_min=167772160 sclk_start=1054 sclk_end=1100 causal=True
+RESULT shape=proxy arm=current stat=median iters=51 latency_ms=9.442140579223633 min_ms=9.334739685058594 max_ms=9.56921100616455 tflops=36.39866054485907 bw_gbs=17.768445469787196 flop=343681269760.0 bytes_min=167772160 sclk_start=1054 sclk_end=1100 causal=True
+RESULT shape=proxy arm=beat stat=median iters=51 latency_ms=0.594730019569397 min_ms=0.5813509821891785 max_ms=0.6761729717254639 tflops=577.8777906802752 bw_gbs=282.0980183940812 flop=343681269760.0 bytes_min=167772160 sclk_start=1054 sclk_end=1100 causal=True
+RESULT shape=prod arm=baseline stat=median iters=51 latency_ms=96.0533447265625 min_ms=95.20599365234375 max_ms=97.74535369873047 tflops=57.241413541318614 bw_gbs=13.973248759018338 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1051 sclk_end=1100 causal=True
+RESULT shape=prod arm=current stat=median iters=51 latency_ms=96.1060562133789 min_ms=95.55147552490234 max_ms=97.21379852294922 tflops=57.210018225205175 bw_gbs=13.965584822459459 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1051 sclk_end=1100 causal=True
+RESULT shape=prod arm=beat stat=median iters=51 latency_ms=7.613361835479736 min_ms=7.519782066345215 max_ms=7.718921184539795 tflops=722.1815206387788 bw_gbs=176.29232775266175 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1051 sclk_end=1100 causal=True

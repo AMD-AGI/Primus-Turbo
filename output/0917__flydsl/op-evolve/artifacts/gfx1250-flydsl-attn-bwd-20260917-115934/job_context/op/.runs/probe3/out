@@ -1,0 +1,7 @@
+AAA
+heliosr-1b114-c07-1
+/opt/venv/bin/rocprofv3
+NORPC
+ls: cannot access '/tmp/op-evolve-gfx1250-flydsl-attn-bwd-20260917-115934-r001': No such file or directory
+NOSCRATCH
+overlay         3.5T  1.9T  1.5T  56% /
