@@ -226,12 +226,13 @@ def _rht16_pair(v, post_scale=True):
     return [r[i][0] for i in range_constexpr(16)] + [r[i][1] for i in range_constexpr(16)]
 
 
-def _microblock_vf(vbits, use_rht, fold_scale=False):
+def _microblock_vf(vbits, use_rht, fold_scale=False, scales=None):
     """32 f32-bit i32 values -> list of 32 f32 Values (post-RHT if enabled).
-    ``fold_scale`` drops the RHT's trailing ``*0.25``; see ``_rht16``. It returns
-    ``vf_exp_up(use_rht, fold_scale)`` extra binary exponents that the caller must
-    hand to ``_compute_scale_native``."""
+    ``fold_scale`` drops the RHT's trailing ``*0.25``; see ``_rht16``. ``scales``
+    is applied before RHT so RMSNorm can fold rstd*gamma in without a bf16 trip."""
     vf = [Vec.from_elements([b], fx.Int32).bitcast(fx.Float32)[0] for b in vbits]
+    if scales is not None:
+        vf = [vf[i] * scales[i] for i in range_constexpr(32)]
     if use_rht:
         if fold_scale:  # packed path: both H16 in <2 x float>, no trailing *0.25
             vf = _rht16_pair(vf, post_scale=False)
@@ -271,11 +272,11 @@ def _microblock_amax_f(vf):
     return Vec.from_elements([cur], fx.Float32).bitcast(fx.Int32)[0]
 
 
-def _finish_microblock(vbits, use_rht, scale_rounding_bias, seed=None):
+def _finish_microblock(vbits, use_rht, scale_rounding_bias, seed=None, scales=None):
     """32 f32-bit i32 values -> (4 fp4 i32 words, scale_e8m0 i8-ready i32).
     ``seed`` (i32 Value) enables stochastic rounding in the final cvt (amax/scale
-    stay deterministic)."""
-    vf = _microblock_vf(vbits, use_rht, fold_scale=True)
+    stay deterministic); ``scales`` folds a per-element factor in before RHT."""
+    vf = _microblock_vf(vbits, use_rht, fold_scale=True, scales=scales)
     amax = _microblock_amax_f(vf)
     native_bits, biased = _compute_scale_native(amax, scale_rounding_bias, exp_up=vf_exp_up(use_rht))
     words = _cvt_microblock_to_fp4(vf, arith.bitcast(T.f32, native_bits), seed)
@@ -296,6 +297,10 @@ _NLOAD = (_NW + BLK * 4 - 1) // (BLK * 4)  # vec4 loads per thread
 _RROWTASK = (_TR * (_TC // 32)) // BLK  # row tasks per thread
 _RMBC = _TC // 32  # row micro-blocks along C (== 8)
 _NSCR = _TR * _RMBC  # LDS amax scratch elems (64x8 = 512 i32 = 2KB)
+# Scaled dual: half-height tile so buf+gamma+rstd LDS stays under 32 KB (5 WG/CU).
+_RMS_TR = 32
+_RMS_TC = _TC
+_RMS_NW = _RMS_TR * (_RMS_TC // 2)  # 4096 i32 = 16 KB
 
 
 _TILE_DEFAULT = (_TR, _TC)
@@ -390,6 +395,11 @@ def _emit_dual_body(
     col_sr=False,
     sr_seed=None,
     sr_gbid=None,
+    rmsnorm_scale=False,
+    RSTD=None,
+    GAMMA=None,
+    tile_tr=None,
+    tile_tc=None,
 ):
     """Emit one fused-dual tile (rowwise + colwise-transpose mxfp4 cast) for block
     ``bid``. ``row_2d``/``col_2d`` pick the C++ ``USE_2D_BLOCK`` amax geometry; the
@@ -397,32 +407,43 @@ def _emit_dual_body(
     ``gmul=G`` to widen the SRDs over the whole 3D tensor (R,C stay per-expert).
     ``padded`` (non-256 K / non-128 N): X is the real [R,C] but outputs use K_pad=CP /
     N_pad=RP cols (caller zero-inits so pad stays 0, matching HIP); loads past real C
-    mask to 0 and writes past K_pad / real-C rows go to _OOB so the store drops them."""
+    mask to 0 and writes past K_pad / real-C rows go to _OOB so the store drops them.
+    ``rmsnorm_scale``: X is residual-sum ``xpr``; multiply by ``RSTD[row]*GAMMA[col]``
+    (f32) after unpack and before RHT so this dual matches ``quantize(y)``.
+    ``tile_tr``/``tile_tc`` override the module tile (rmsnorm dual uses a shorter
+    row tile so gamma/rstd LDS does not drop CU occupancy)."""
+    tile_r = _TR if tile_tr is None else int(tile_tr)
+    tile_c = _TC if tile_tc is None else int(tile_tc)
+    tile_cw = tile_c // 2
+    tile_rmb = tile_r // 32
+    tile_nload = (tile_r * tile_cw + BLK * 4 - 1) // (BLK * 4)
+    tile_rrowtask = (tile_r * (tile_c // 32)) // BLK
+    tile_rmbc = tile_c // 32
     if ncblk is None:
-        ncblk = C // _TC
+        ncblk = C // tile_c
     cpad = CP if padded else C  # row-out column extent (K_pad)
     rpad = RP if padded else R  # col-out column extent (N_pad)
     # Block order = which output's partial stores L2 can combine. col_locality (C>R):
     # row-tile-fastest so blocks writing the same col-out rows run back-to-back and L2
     # merges the scattered transpose stores; else col-tile-fastest keeps row-out coalesced.
     if col_locality:
-        nrblk = R // _TR
+        nrblk = R // tile_r
         cblk = bid // nrblk
         rblk = bid % nrblk
     else:
         rblk = bid // ncblk
         cblk = bid % ncblk
-    r0 = rblk * _TR
-    c0w = cblk * _TCW  # i32-word base along C
+    r0 = rblk * tile_r
+    c0w = cblk * tile_cw  # i32-word base along C
 
     # Re-base each SRD in int64 with per-tile/per-expert num_records: a whole-tensor SRD's
     # num_records (full bytes) overflows the 32-bit field past 4GB (high rows/experts OOB) and
-    # the per-row voffset overflows int32. 2D folds this tile's row (r0)/col (cblk*_TC) base;
+    # the per-row voffset overflows int32. 2D folds this tile's row (r0)/col (cblk*tile_c) base;
     # batched-3D folds the per-expert base (small experts keep r0/c0 in the offsets). _row0/
     # _col0 drop the folded base from the additive offsets below.
     _fold = not batched
     _row0 = fx.Int32(0) if _fold else r0
-    _col0 = fx.Int32(0) if _fold else cblk * _TC
+    _col0 = fx.Int32(0) if _fold else cblk * tile_c
 
     def _srd(t, elem_off, elem_bytes, nrec_bytes):
         base = arith.index_cast(T.i64, buffer_ops.extract_base_index(t))
@@ -430,6 +451,8 @@ def _emit_dual_body(
         raw = arith._to_raw(base + boff)
         r = rocdl.readfirstlane(res=raw.type, src=raw)  # pin the SRD base to an SGPR
         base_v = r.result if hasattr(r, "result") else r
+        if isinstance(nrec_bytes, int):
+            nrec_bytes = arith.index(nrec_bytes)
         nr = arith.minui(arith.index_cast(T.index, nrec_bytes), arith.index(0x7FFFFFFF))
         return buffer_ops.create_buffer_resource_from_addr(base_v, num_records_bytes=nr)
 
@@ -442,18 +465,52 @@ def _emit_dual_body(
         gx = gro = grsc = gco = gcsc = 0  # expert bases folded into the SRDs above
     else:
         r0i = arith.index_cast(T.index, r0)
-        c0i = arith.index_cast(T.index, cblk * _TC)
-        rsrc = _srd(X, r0i * arith.index_cast(T.index, C >> 1), 4, _TR * (C >> 1) * 4)
-        orsrc = _srd(ROW_OUT, r0i * arith.index_cast(T.index, cpad >> 3), 4, _TR * (cpad >> 3) * 4)
-        rscrsrc = _srd(ROW_SC, r0i * arith.index_cast(T.index, cpad >> 5), 1, _TR * (cpad >> 5))
-        corsrc = _srd(COL_OUT, c0i * arith.index_cast(T.index, rpad >> 3), 4, _TC * (rpad >> 3) * 4)
-        cscrsrc = _srd(COL_SC, c0i * arith.index_cast(T.index, rpad >> 5), 1, _TC * (rpad >> 5))
+        c0i = arith.index_cast(T.index, cblk * tile_c)
+        rsrc = _srd(X, r0i * arith.index_cast(T.index, C >> 1), 4, tile_r * (C >> 1) * 4)
+        orsrc = _srd(ROW_OUT, r0i * arith.index_cast(T.index, cpad >> 3), 4, tile_r * (cpad >> 3) * 4)
+        rscrsrc = _srd(ROW_SC, r0i * arith.index_cast(T.index, cpad >> 5), 1, tile_r * (cpad >> 5))
+        corsrc = _srd(COL_OUT, c0i * arith.index_cast(T.index, rpad >> 3), 4, tile_c * (rpad >> 3) * 4)
+        cscrsrc = _srd(COL_SC, c0i * arith.index_cast(T.index, rpad >> 5), 1, tile_c * (rpad >> 5))
+
+    rstd_rsrc = None
+    gamma_rsrc = None
+    _rmsnorm_scales_row = None
+    _rmsnorm_scales_col = None
+    if rmsnorm_scale:
+        # X is xpr; y = xpr * rstd * gamma is applied in-register before amax/RHT.
+        r0i = arith.index_cast(T.index, r0)
+        c0i = arith.index_cast(T.index, cblk * tile_c)
+        rstd_rsrc = _srd(RSTD, r0i, 4, arith.index(tile_r * 4))
+        gamma_rsrc = _srd(GAMMA, c0i, 4, arith.index(tile_c * 4))
+
+        def _f32_from_i32bits(bits):
+            return Vec.from_elements([bits], fx.Int32).bitcast(fx.Float32)[0]
+
+        def _rmsnorm_scales_row(r_row, cmb):
+            rstd_v = _f32_from_i32bits(_lds_load1(lds.rbits.ptr, r_row))
+            scales = []
+            base = cmb * 32
+            for q in range_constexpr(8):
+                v4 = _lds_load_vec4(lds.gbits.ptr, base + q * 4)
+                for j in range_constexpr(4):
+                    scales.append(rstd_v * _f32_from_i32bits(v4[j]))
+            return scales
+
+        def _rmsnorm_scales_col(mmb, c_col):
+            gv = _f32_from_i32bits(_lds_load1(lds.gbits.ptr, c_col))
+            scales = []
+            row0 = mmb * 32
+            for q in range_constexpr(8):
+                v4 = _lds_load_vec4(lds.rbits.ptr, row0 + q * 4)
+                for j in range_constexpr(4):
+                    scales.append(_f32_from_i32bits(v4[j]) * gv)
+            return scales
 
     # ---- coalesced tile load -> LDS ----
-    for chunk in range_constexpr(_NLOAD):
+    for chunk in range_constexpr(tile_nload):
         tw = chunk * (BLK * 4) + tid * 4
-        tr = tw // _TCW
-        wc = tw % _TCW
+        tr = tw // tile_cw
+        wc = tw % tile_cw
         goff = (_row0 + tr) * (C >> 1) + c0w + wc + gx
         if padded:
             # mask cols past real C -> OOB load returns 0 (rows always valid: R%64==0,
@@ -461,6 +518,15 @@ def _emit_dual_body(
             goff = arith.select((c0w + wc) < (C >> 1), goff, fx.Int32(_OOB))
         vec = buffer_ops.buffer_load(rsrc, goff, vec_width=4, dtype=T.i32)
         _lds_store_vec4(lds.buf.ptr, tw, vec)
+    if rmsnorm_scale:
+        # One cooperative fill of the 256-col gamma tile and 64-row rstd tile.
+        # Replaces 32 scalar global loads per microblock (same values reused
+        # across rows / cols of this tile).
+        gv = fx.Float32(buffer_ops.buffer_load(gamma_rsrc, _col0 + tid, vec_width=1, dtype=T.f32))
+        _lds_store1(lds.gbits.ptr, tid, Vec.from_elements([gv], fx.Float32).bitcast(fx.Int32)[0])
+        roff = arith.select(tid < tile_r, _row0 + tid, fx.Int32(_OOB))
+        rv = fx.Float32(buffer_ops.buffer_load(rstd_rsrc, roff, vec_width=1, dtype=T.f32))
+        _lds_store1(lds.rbits.ptr, tid, Vec.from_elements([rv], fx.Float32).bitcast(fx.Int32)[0])
     # DS writes must retire before any thread reads the tile (a bare s_barrier
     # does NOT wait for LDS); fx.barrier() emits the waitcnt + barrier.
     fx.barrier()
@@ -473,12 +539,12 @@ def _emit_dual_body(
     def _row_seed(k):
         if not row_sr:
             return None
-        return _sr_hash(sr_seed ^ (_gbid * (BLK * _RROWTASK) + (k * BLK + tid)))
+        return _sr_hash(sr_seed ^ (_gbid * (BLK * tile_rrowtask) + (k * BLK + tid)))
 
     def _col_seed(mmb):
         if not col_sr:
             return None
-        return _sr_hash((sr_seed ^ _SR_COL_SALT) ^ (_gbid * (BLK * _RMB) + (mmb * BLK + tid)))
+        return _sr_hash((sr_seed ^ _SR_COL_SALT) ^ (_gbid * (BLK * tile_rmb) + (mmb * BLK + tid)))
 
     # ---- ROW phase: 32-elem microblocks along C, contiguous LDS (vec4 reads) ----
     if row_2d:
@@ -489,11 +555,11 @@ def _emit_dual_body(
         # 32 amax of its tile, then quantizes its held vals with the tile scale.
         vf_hold = []
         meta = []
-        for k in range_constexpr(_RROWTASK):
+        for k in range_constexpr(tile_rrowtask):
             task = k * BLK + tid
-            r_row = task // _RMBC
-            cmb = task % _RMBC
-            base_w = r_row * _TCW + cmb * 16
+            r_row = task // tile_rmbc
+            cmb = task % tile_rmbc
+            base_w = r_row * tile_cw + cmb * 16
             rbits = []
             for q in range_constexpr(4):
                 v4 = _lds_load_vec4(lds.buf.ptr, base_w + q * 4)
@@ -502,23 +568,23 @@ def _emit_dual_body(
                     rbits.append(word << 16)
                     rbits.append(word & 0xFFFF0000)
             vf = _microblock_vf(rbits, row_rht, fold_scale=True)
-            _lds_store1(lds.scr.ptr, r_row * _RMBC + cmb, _microblock_amax_f(vf))
+            _lds_store1(lds.scr.ptr, r_row * tile_rmbc + cmb, _microblock_amax_f(vf))
             vf_hold.append(vf)
             meta.append((r_row, cmb))
         fx.barrier()
-        for k in range_constexpr(_RROWTASK):
+        for k in range_constexpr(tile_rrowtask):
             r_row, cmb = meta[k]
             vf = vf_hold[k]
             row_base = (r_row // 32) * 32  # tile's first row within the LDS tile
             tile_amax = fx.Int32(0)
             for i in range_constexpr(32):
-                tile_amax = _imax(tile_amax, _lds_load1(lds.scr.ptr, (row_base + i) * _RMBC + cmb))
+                tile_amax = _imax(tile_amax, _lds_load1(lds.scr.ptr, (row_base + i) * tile_rmbc + cmb))
             native_bits, rbiased = _compute_scale_native(
                 tile_amax, scale_rounding_bias, exp_up=vf_exp_up(row_rht)
             )
             rwords = _cvt_microblock_to_fp4(vf, arith.bitcast(T.f32, native_bits), _row_seed(k))
             grow = _row0 + r_row
-            gcmb = cblk * _RMBC + cmb
+            gcmb = cblk * tile_rmbc + cmb
             ob = grow * (cpad >> 3) + gcmb * 4 + gro
             sc = grow * (cpad >> 5) + gcmb + grsc
             if padded:
@@ -528,11 +594,11 @@ def _emit_dual_body(
             _store_words_vec4(orsrc, ob, rwords)
             buffer_ops.buffer_store(arith.trunci(T.i8, rbiased & 0xFF), rscrsrc, sc)
     else:
-        for k in range_constexpr(_RROWTASK):
+        for k in range_constexpr(tile_rrowtask):
             task = k * BLK + tid
-            r_row = task // (_TC // 32)
-            cmb = task % (_TC // 32)
-            base_w = r_row * _TCW + cmb * 16
+            r_row = task // (tile_c // 32)
+            cmb = task % (tile_c // 32)
+            base_w = r_row * tile_cw + cmb * 16
             rbits = []
             for q in range_constexpr(4):
                 v4 = _lds_load_vec4(lds.buf.ptr, base_w + q * 4)
@@ -540,9 +606,15 @@ def _emit_dual_body(
                     word = v4[j]
                     rbits.append(word << 16)
                     rbits.append(word & 0xFFFF0000)
-            rwords, rbiased = _finish_microblock(rbits, row_rht, scale_rounding_bias, _row_seed(k))
+            rwords, rbiased = _finish_microblock(
+                rbits,
+                row_rht,
+                scale_rounding_bias,
+                seed=_row_seed(k),
+                scales=_rmsnorm_scales_row(r_row, cmb) if rmsnorm_scale else None,
+            )
             grow = _row0 + r_row
-            gcmb = cblk * (_TC // 32) + cmb
+            gcmb = cblk * (tile_c // 32) + cmb
             ob = grow * (cpad >> 3) + gcmb * 4 + gro
             sc = grow * (cpad >> 5) + gcmb + grsc
             if padded:
@@ -562,11 +634,11 @@ def _emit_dual_body(
         # after the row phase); a barrier before pass 1 protects the WAR on scr.
         fx.barrier()
         cvf_hold = []
-        for mmb in range_constexpr(_RMB):
+        for mmb in range_constexpr(tile_rmb):
             row0 = mmb * 32
             cbits = []
             for row in range_constexpr(32):
-                word = _lds_load1(lds.buf.ptr, (row0 + row) * _TCW + cw)
+                word = _lds_load1(lds.buf.ptr, (row0 + row) * tile_cw + cw)
                 fb = arith.select(half != 0, word & fx.Int32(-65536), word << 16)
                 cbits.append(fb)
             vf = _microblock_vf(cbits, col_rht, fold_scale=True)
@@ -574,7 +646,7 @@ def _emit_dual_body(
             cvf_hold.append(vf)
         fx.barrier()
         col_base = (c_col // 32) * 32  # tile's first column within the LDS tile
-        for mmb in range_constexpr(_RMB):
+        for mmb in range_constexpr(tile_rmb):
             vf = cvf_hold[mmb]
             tile_amax = fx.Int32(0)
             for i in range_constexpr(32):
@@ -584,7 +656,7 @@ def _emit_dual_body(
             )
             cwords = _cvt_microblock_to_fp4(vf, arith.bitcast(T.f32, native_bits), _col_seed(mmb))
             gcol = _col0 + c_col
-            gmmb = rblk * _RMB + mmb
+            gmmb = rblk * tile_rmb + mmb
             cob = gcol * (rpad >> 3) + gmmb * 4 + gco
             csoff = gcol * (rpad >> 5) + gmmb + gcsc
             if padded:
@@ -594,16 +666,22 @@ def _emit_dual_body(
             _store_words_vec4(corsrc, cob, cwords)
             buffer_ops.buffer_store(arith.trunci(T.i8, cbiased & 0xFF), cscrsrc, csoff)
     else:
-        for mmb in range_constexpr(_RMB):
+        for mmb in range_constexpr(tile_rmb):
             row0 = mmb * 32
             cbits = []
             for row in range_constexpr(32):
-                word = _lds_load1(lds.buf.ptr, (row0 + row) * _TCW + cw)
+                word = _lds_load1(lds.buf.ptr, (row0 + row) * tile_cw + cw)
                 fb = arith.select(half != 0, word & fx.Int32(-65536), word << 16)
                 cbits.append(fb)
-            cwords, cbiased = _finish_microblock(cbits, col_rht, scale_rounding_bias, _col_seed(mmb))
+            cwords, cbiased = _finish_microblock(
+                cbits,
+                col_rht,
+                scale_rounding_bias,
+                seed=_col_seed(mmb),
+                scales=_rmsnorm_scales_col(mmb, c_col) if rmsnorm_scale else None,
+            )
             gcol = _col0 + c_col
-            gmmb = rblk * _RMB + mmb
+            gmmb = rblk * tile_rmb + mmb
             cob = gcol * (rpad >> 3) + gmmb * 4 + gco
             csoff = gcol * (rpad >> 5) + gmmb + gcsc
             if padded:
@@ -791,6 +869,172 @@ def get_dual_cast(R, C, row_rht, col_rht, row_2d=False, col_2d=False, row_sr=Fal
         fn = flyc.compile(raw, x, ro, rs, co, cs, R, C, 0, 1 << 21, grid_x, stream)
         ent = (fn, grid_x)
         _DUAL_COMPILED[key] = ent
+    return ent
+
+
+_RMSNORM_DUAL_LAUNCH = {}
+_RMSNORM_DUAL_COMPILED = {}
+
+
+def _build_rmsnorm_dual_kernel(row_rht, col_rht, col_locality=False):
+    """Dual of residual-sum ``xpr`` with in-register ``rstd*gamma`` (activation recipe)."""
+
+    @fx.struct
+    class _RmsDualSS:
+        buf: fx.Array[fx.Int32, _RMS_NW, 16]
+        gbits: fx.Array[fx.Int32, _RMS_TC, 16]
+        rbits: fx.Array[fx.Int32, BLK, 16]
+
+    _DualSS = _RmsDualSS
+
+    @flyc.kernel(known_block_size=[BLK, 1, 1])
+    def _rmsnorm_dual_kernel(
+        X: fx.Tensor,
+        ROW_OUT: fx.Tensor,
+        ROW_SC: fx.Tensor,
+        COL_OUT: fx.Tensor,
+        COL_SC: fx.Tensor,
+        RSTD: fx.Tensor,
+        GAMMA: fx.Tensor,
+        R: fx.Int32,
+        C: fx.Int32,
+        SR_SEED: fx.Int32,
+        SCALE_ROUNDING_BIAS: fx.Int32,
+    ):
+        lds = fx.SharedAllocator().allocate(_DualSS).peek()
+        tid = fx.thread_idx.x
+        _emit_dual_body(
+            row_rht,
+            col_rht,
+            False,
+            False,
+            lds,
+            tid,
+            X,
+            ROW_OUT,
+            ROW_SC,
+            COL_OUT,
+            COL_SC,
+            R,
+            C,
+            fx.block_idx.x,
+            SCALE_ROUNDING_BIAS,
+            col_locality=col_locality,
+            sr_seed=SR_SEED,
+            sr_gbid=fx.block_idx.x,
+            rmsnorm_scale=True,
+            RSTD=RSTD,
+            GAMMA=GAMMA,
+            tile_tr=_RMS_TR,
+            tile_tc=_RMS_TC,
+        )
+
+    return _rmsnorm_dual_kernel
+
+
+def _build_rmsnorm_dual_launch(row_rht, col_rht, col_locality=False):
+    kern = _build_rmsnorm_dual_kernel(row_rht, col_rht, col_locality)
+
+    @flyc.jit
+    def _rmsnorm_dual_launch(
+        X: fx.Tensor,
+        ROW_OUT: fx.Tensor,
+        ROW_SC: fx.Tensor,
+        COL_OUT: fx.Tensor,
+        COL_SC: fx.Tensor,
+        RSTD: fx.Tensor,
+        GAMMA: fx.Tensor,
+        R: fx.Int32,
+        C: fx.Int32,
+        SR_SEED: fx.Int32,
+        SCALE_ROUNDING_BIAS: fx.Int32,
+        grid_x: fx.Int32,
+        stream: fx.Stream,
+    ):
+        kern(X, ROW_OUT, ROW_SC, COL_OUT, COL_SC, RSTD, GAMMA, R, C, SR_SEED, SCALE_ROUNDING_BIAS).launch(
+            grid=(grid_x, 1, 1), block=(BLK, 1, 1), stream=stream
+        )
+
+    return _rmsnorm_dual_launch
+
+
+def flydsl_rmsnorm_dual_quant(xpr_bf16, rstd_f32, gamma_f32, fp4_dtype, col_rht=True, scale_rounding_mode=0):
+    """MXFP4 dual of ``y = xpr * rstd[:,None] * gamma`` without a BF16 ``y`` load.
+
+    ``xpr_bf16`` is ``[R, C]`` bf16 (residual sum). ``rstd_f32`` is ``[R]``.
+    ``gamma_f32`` is ``[C]``. Row recipe is no-RHT; col recipe is RHT when
+    ``col_rht`` (matches dense MLP / QKV activation ``quantize_fp4_with_trans``).
+
+    This is close to, but NOT the same as, quantizing a materialised BF16 ``y``:
+    ``rstd*gamma`` is applied in f32 registers, so the bf16 rounding of ``y`` never
+    happens. Measured on [8192, 4096] that moves 1.1% of the output bytes (and some
+    scales). It is the more accurate of the two; a test must compare with a tolerance,
+    not with ``torch.equal`` against ``quantize_fp4_with_trans(y)``.
+    """
+    import torch
+
+    R, C = xpr_bf16.shape
+    rstd_f32 = rstd_f32.reshape(-1).contiguous()
+    gamma_f32 = gamma_f32.reshape(-1).contiguous()
+    assert rstd_f32.shape == (R,) and gamma_f32.shape == (C,)
+    assert xpr_bf16.dtype == torch.bfloat16
+    assert rstd_f32.dtype == torch.float32 and gamma_f32.dtype == torch.float32
+    # R % 256, not the kernel's own R % 128: the col outputs below are [C, R/8] unpadded
+    # while the GEMM's activation buffers round M up to 256.
+    assert R % 256 == 0 and C % 256 == 0
+    dev = xpr_bf16.device
+    x_i32 = xpr_bf16.contiguous().view(torch.int32)
+    ro = torch.empty((R, C // 8), dtype=torch.int32, device=dev)
+    rs = torch.empty((R, C // 32), dtype=torch.uint8, device=dev)
+    co = torch.empty((C, R // 8), dtype=torch.int32, device=dev)
+    cs = torch.empty((C, R // 32), dtype=torch.uint8, device=dev)
+    fn, grid_x = get_rmsnorm_dual_cast(R, C, False, bool(col_rht))
+    fn(
+        x_i32,
+        ro,
+        rs,
+        co,
+        cs,
+        rstd_f32.contiguous(),
+        gamma_f32.contiguous(),
+        R,
+        C,
+        0,
+        _mxfp4_scale_rounding_bias(scale_rounding_mode),
+        grid_x,
+        torch.cuda.current_stream(),
+    )
+    row_data = ro.view(torch.uint8).view(fp4_dtype)
+    col_data = co.view(torch.uint8).view(fp4_dtype)
+    row_scale = rs.view(torch.float8_e8m0fnu)
+    col_scale = cs.view(torch.float8_e8m0fnu)
+    return row_data, row_scale, col_data, col_scale
+
+
+def get_rmsnorm_dual_cast(R, C, row_rht, col_rht):
+    col_locality = int(C) > int(R)
+    lk = (bool(row_rht), bool(col_rht), col_locality)
+    raw = _RMSNORM_DUAL_LAUNCH.get(lk)
+    if raw is None:
+        raw = _build_rmsnorm_dual_launch(bool(row_rht), bool(col_rht), col_locality)
+        _RMSNORM_DUAL_LAUNCH[lk] = raw
+    key = (int(R), int(C), bool(row_rht), bool(col_rht))
+    ent = _RMSNORM_DUAL_COMPILED.get(key)
+    if ent is None:
+        import torch
+
+        x = torch.zeros((R, C // 2), dtype=torch.int32, device="cuda")
+        ro = torch.zeros((R, C // 8), dtype=torch.int32, device="cuda")
+        rs = torch.zeros((R, C // 32), dtype=torch.uint8, device="cuda")
+        co = torch.zeros((C, R // 8), dtype=torch.int32, device="cuda")
+        cs = torch.zeros((C, R // 32), dtype=torch.uint8, device="cuda")
+        rstd = torch.zeros((R,), dtype=torch.float32, device="cuda")
+        gamma = torch.zeros((C,), dtype=torch.float32, device="cuda")
+        grid_x = (R // _RMS_TR) * (C // _RMS_TC)
+        stream = torch.cuda.current_stream()
+        fn = flyc.compile(raw, x, ro, rs, co, cs, rstd, gamma, R, C, 0, 1 << 21, grid_x, stream)
+        ent = (fn, grid_x)
+        _RMSNORM_DUAL_COMPILED[key] = ent
     return ent
 
 

@@ -4071,16 +4071,15 @@ def _assert_fusable(Hq, D):
     """Every shape that reaches this backward emits dQ from the KV-outer body.
 
     The dQ reduce tiles a work-group's chunk out of 2*Hq*D elements, which needs Hq*D to be
-    a multiple of 128 -- D128 always is, D64 needs an even Hq. That is not a case to branch
-    on: the backend admits FlyDSL only when the GQA group Hq/Hkv is a power of two in
-    [8, 256] (see _gqa_group_ok), so Hq is a multiple of 8 and the condition holds for both
-    head dims. Asserted rather than assumed because it is the whole reason the Q-outer dq
-    kernel could be deleted -- if the backend ever admits a smaller group, this fires here
-    instead of silently reducing a partial dQ.
+    a multiple of 128 -- D128 always is, D64 needs Hq >= 2. That is not a case to branch on:
+    _gqa_group_ok screens it out, so every shape that reaches here satisfies it. Asserted
+    rather than assumed because it is the whole reason the Q-outer dq kernel could be
+    deleted -- if the backend ever admits a shape that fails it, this fires here instead of
+    silently reducing a partial dQ.
     """
     assert (Hq * D) % 128 == 0, (
-        f"the fused dQ reduce needs Hq*D % 128 == 0, got Hq={Hq} D={D}; the FlyDSL backend "
-        "is supposed to admit only GQA groups that make Hq a multiple of 8"
+        f"the fused dQ reduce needs Hq*D % 128 == 0, got Hq={Hq} D={D}; _gqa_group_ok is "
+        "supposed to refuse these shapes before the backend is chosen"
     )
 
 

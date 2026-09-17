@@ -239,13 +239,20 @@ def rmsnorm_bwd_impl(
 
 
 def rmsnorm_fwd_residual_impl(
-    x: torch.Tensor, residual: torch.Tensor, gamma: torch.Tensor, eps: float
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    gamma: torch.Tensor,
+    eps: float,
+    skip_y_store: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int, int]:
     """Fused (x + residual) -> rmsnorm forward.
 
     Returns ``(y, x_plus_r, rstd, BLOCK_H, ROWS, num_warps, num_stages)``. Both
     ``y`` and ``x_plus_r`` are returned in [B, H] layout (caller is expected to
     reshape back to the original logical shape if needed).
+
+    ``skip_y_store``: R3 path. Do not write BF16 ``y`` (GEMM consumes MXFP4).
+    ``y`` is still allocated so the autograd Function can return a tensor.
     """
     H = gamma.shape[0]
     x2 = _reshape_batch_hidden(x, H)
@@ -274,6 +281,7 @@ def rmsnorm_fwd_residual_impl(
             H=H,
             eps=eps,
             BLOCK_H=BLOCK_H,
+            SKIP_Y_STORE=skip_y_store,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -299,6 +307,7 @@ def rmsnorm_fwd_residual_impl(
             eps=eps,
             BLOCK_H=BLOCK_H,
             ROWS_PER_BLOCK=ROWS,
+            SKIP_Y_STORE=skip_y_store,
             num_warps=num_warps,
             num_stages=num_stages,
         )

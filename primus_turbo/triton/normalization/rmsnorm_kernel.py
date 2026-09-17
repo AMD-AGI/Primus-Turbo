@@ -145,6 +145,7 @@ def rmsnorm_fwd_residual_kernel(
     H: tl.constexpr,
     eps,
     BLOCK_H: tl.constexpr,
+    SKIP_Y_STORE: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_H)
@@ -162,9 +163,14 @@ def rmsnorm_fwd_residual_kernel(
 
     var = tl.sum(xpr * xpr, axis=0) / H
     rstd = tl.rsqrt(var + eps)
-    g = tl.load(g_ptrs, mask=mask, other=0.0).to(tl.float32)
-    y = (xpr * rstd * g).to(Y_ptr.dtype.element_ty)
-    tl.store(y_ptrs, y, mask=mask)
+    # R3 skip-quant: GEMM consumes MXFP4 of y, not BF16 y. Dual applies
+    # rstd*gamma in-register. Skipping the y store (and gamma load) is the
+    # residual-fwd HBM tax that round 2's mark_non_differentiable could not
+    # remove.
+    if not SKIP_Y_STORE:
+        g = tl.load(g_ptrs, mask=mask, other=0.0).to(tl.float32)
+        y = (xpr * rstd * g).to(Y_ptr.dtype.element_ty)
+        tl.store(y_ptrs, y, mask=mask)
     tl.store(RSTD_ptr + row, rstd)
 
 
@@ -192,6 +198,7 @@ def rmsnorm_fwd_residual_kernel_multi_row(
     eps,
     BLOCK_H: tl.constexpr,
     ROWS_PER_BLOCK: tl.constexpr,
+    SKIP_Y_STORE: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     row_start = pid * ROWS_PER_BLOCK
@@ -210,15 +217,16 @@ def rmsnorm_fwd_residual_kernel_multi_row(
     full_mask = row_mask[:, None] & h_mask[None, :]
     x = tl.load(x_ptrs, mask=full_mask, other=0.0).to(tl.float32)
     r = tl.load(r_ptrs, mask=full_mask, other=0.0).to(tl.float32)
-    g = tl.load(g_ptrs, mask=h_mask, other=0.0).to(tl.float32)
 
     xpr = x + r
     tl.store(xpr_ptrs, xpr.to(XPR_ptr.dtype.element_ty), mask=full_mask)
 
     var = tl.sum(xpr * xpr, axis=1) / H
     rstd = tl.rsqrt(var + eps)
-    y = (xpr * rstd[:, None] * g[None, :]).to(Y_ptr.dtype.element_ty)
-    tl.store(y_ptrs, y, mask=full_mask)
+    if not SKIP_Y_STORE:
+        g = tl.load(g_ptrs, mask=h_mask, other=0.0).to(tl.float32)
+        y = (xpr * rstd[:, None] * g[None, :]).to(Y_ptr.dtype.element_ty)
+        tl.store(y_ptrs, y, mask=full_mask)
     tl.store(RSTD_ptr + row_offs, rstd, mask=row_mask)
 
 

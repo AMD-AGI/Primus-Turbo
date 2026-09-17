@@ -6,6 +6,7 @@
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
 from primus_turbo.pytorch.core.low_precision import (
@@ -14,6 +15,7 @@ from primus_turbo.pytorch.core.low_precision import (
     ScaleDtype,
     ScalingGranularity,
     ScalingRecipe,
+    float4_e2m1fn_x2,
 )
 from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensor,
@@ -736,3 +738,179 @@ def test_gemm_fp4_impl_aiter_preshuffle_parity(m, n, k):
         )
     finally:
         GlobalBackendManager.reset()
+
+
+# (M, K, I): the smallest that clear dense_glu_epi_quant_supported (M % 256, I % 64,
+# K // 256 >= 4) and the FlyDSL GEMM's 64-multiple requirement.
+_MLP_MKI = (512, 1024, 1024)
+# Llama-3.1-8B's own MLP, one case: it is far more work than the small one.
+_MLP_MKI_LLAMA = (8192, 4096, 14336)
+
+_MLP_GATES = {"silu": F.silu, "gelu": lambda t: F.gelu(t, approximate="tanh")}
+# Sized against these leaves rather than borrowed: a limit small enough to saturate
+# most of l1 leaves dx with no signal, and the test then measures nothing.
+_MLP_CLAMP_LIMIT = 1.0
+_MLP_SNR_THRESHOLD = 6.0
+# The clamp's dead band costs the gradients a little.
+_MLP_CLAMP_SNR_THRESHOLD = 7.0
+
+
+def _mlp_fp4_leaves(dtype, seed=42, mki=None):
+    m, k, i = mki or _MLP_MKI
+    torch.manual_seed(seed)
+    device = "cuda:0"
+    x = torch.randn((m, k), dtype=dtype, device=device, requires_grad=True)
+    w1 = (torch.randn((2 * i, k), dtype=dtype, device=device) * 0.02).requires_grad_(True)
+    w2 = (torch.randn((k, i), dtype=dtype, device=device) * 0.02).requires_grad_(True)
+    grad_out = torch.randn((m, k), dtype=dtype, device=device) * 0.1
+    return x, w1, w2, grad_out
+
+
+def _mlp_fp4_run(dtype, prequantize_x=False, activation="silu", clamp_limit=None, mki=None):
+    from primus_turbo.pytorch.core.quantized_tensor import (
+        QuantizedTensor,
+        QuantizedTensorPair,
+    )
+    from primus_turbo.pytorch.ops import mlp_fp4
+
+    x, w1, w2, grad_out = _mlp_fp4_leaves(dtype, mki=mki)
+    x_in = x
+    if prequantize_x:
+        # data is the row-wise operand, data_t the col-wise (RHT) wgrad one.
+        from primus_turbo.pytorch.ops.quantization import quantize_fp4_with_trans
+
+        row_recipe, col_recipe = ScalingRecipe(), ScalingRecipe(use_rht=True)
+        row, row_scale, col, col_scale = quantize_fp4_with_trans(
+            x.detach(),
+            float4_e2m1fn_x2,
+            ScalingGranularity.MX_BLOCKWISE,
+            block_size=32,
+            scaling_recipe=row_recipe,
+            scaling_recipe_for_trans=col_recipe,
+        )
+
+        def _wrap(data, scale_inv, shape, recipe, axis):
+            return QuantizedTensor(
+                data,
+                scale_inv,
+                shape=shape,
+                orig_dtype=x.dtype,
+                dest_dtype=float4_e2m1fn_x2,
+                granularity=ScalingGranularity.MX_BLOCKWISE,
+                block_size=32,
+                scaling_recipe=recipe,
+                quantized_axis=axis,
+            )
+
+        m, k, _ = mki or _MLP_MKI
+        x_in = QuantizedTensorPair(
+            _wrap(row, row_scale, torch.Size((m, k)), row_recipe, -1),
+            _wrap(col, col_scale, torch.Size((k, m)), col_recipe, -2),
+        )
+    out = mlp_fp4(x_in, w1, w2, activation=activation, clamp_limit=clamp_limit)
+    out.backward(grad_out)
+    return out.detach(), (None if prequantize_x else x.grad), w1.grad, w2.grad
+
+
+def _mlp_fp4_reference(dtype, activation="silu", clamp_limit=None, mki=None):
+    i = (mki or _MLP_MKI)[2]
+    x, w1, w2, grad_out = _mlp_fp4_leaves(dtype, mki=mki)
+    l1 = x.float() @ w1.float().t()
+    gate, up = l1[:, :i], l1[:, i:]
+    if clamp_limit is not None:
+        # The gate saturates from above only; the linear half from both sides.
+        gate = gate.clamp(max=clamp_limit)
+        up = up.clamp(min=-clamp_limit, max=clamp_limit)
+    act = _MLP_GATES[activation](gate) * up
+    out = act @ w2.float().t()
+    out.backward(grad_out.float())
+    return out.detach(), x.grad, w1.grad, w2.grad
+
+
+_MLP_FP4_TENSORS = ("out", "dx", "dw1", "dw2")
+
+
+@pytest.mark.parametrize(
+    "mki, activation, clamp_limit",
+    [
+        (_MLP_MKI, "silu", None),
+        (_MLP_MKI, "gelu", None),
+        (_MLP_MKI, "silu", _MLP_CLAMP_LIMIT),
+        (_MLP_MKI, "gelu", _MLP_CLAMP_LIMIT),
+        pytest.param(_MLP_MKI_LLAMA, "silu", None, id="llama3.1-8b"),
+    ],
+)
+def test_mlp_fp4_mx_blockwise(mki, activation, clamp_limit):
+    """``mlp_fp4`` end to end against an eager fp32 reference.
+
+    The floor is low for the same reason the grouped MLP's is: MXFP4 carries ~2 mantissa
+    bits and this stacks four quantizations plus the wgrad operands' RHT, so it catches a
+    wrong answer rather than the quantization.
+    """
+    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
+
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    floor = _MLP_SNR_THRESHOLD if clamp_limit is None else _MLP_CLAMP_SNR_THRESHOLD
+    ref = _mlp_fp4_reference(torch.bfloat16, activation, clamp_limit, mki)
+    got = _mlp_fp4_run(torch.bfloat16, activation=activation, clamp_limit=clamp_limit, mki=mki)
+    for name, r, g in zip(_MLP_FP4_TENSORS, ref, got):
+        snr = compute_snr(r.float(), g.float())
+        print(f"{name}-SNR: {snr:.2f} dB")
+        assert snr > floor, f"{name} snr too low"
+
+
+def test_mlp_fp4_accepts_a_prequantized_x():
+    """A caller that already has x quantized must get the same numbers.
+
+    This is the only way to hand the op a pre-quantized activation, so it is also
+    what the fused RMSNorm entry point feeds it.
+    """
+    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
+
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    plain = _mlp_fp4_run(torch.bfloat16)
+    pre = _mlp_fp4_run(torch.bfloat16, prequantize_x=True)
+    for name, a, b in zip(_MLP_FP4_TENSORS, plain, pre):
+        if a is None or b is None:  # dx: a QuantizedTensor x is not a leaf
+            continue
+        snr = compute_snr(a.float(), b.float())
+        print(f"{name}-SNR: {snr:.2f} dB")
+        assert snr > 100, f"{name} must be reproduced, got {snr:.2f} dB"
+
+
+def test_rmsnorm_residual_fp4_feeds_mlp_fp4():
+    """The fused norm's pair feeds the MLP directly and still carries the gradient."""
+    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
+    from primus_turbo.pytorch.ops import mlp_fp4
+    from primus_turbo.pytorch.ops.normalization import rmsnorm_residual_fp4
+
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    m, k, i = _MLP_MKI
+    torch.manual_seed(42)
+    device = "cuda:0"
+    x = torch.randn((m, k), dtype=torch.bfloat16, device=device, requires_grad=True)
+    residual = torch.randn((m, k), dtype=torch.bfloat16, device=device, requires_grad=True)
+    gamma = torch.randn((k,), dtype=torch.bfloat16, device=device, requires_grad=True)
+    w1 = (torch.randn((2 * i, k), dtype=torch.bfloat16, device=device) * 0.02).requires_grad_(True)
+    w2 = (torch.randn((k, i), dtype=torch.bfloat16, device=device) * 0.02).requires_grad_(True)
+
+    y, x_plus_r, y_fp4 = rmsnorm_residual_fp4(x, residual, gamma)
+    out = mlp_fp4(y_fp4, w1, w2)
+    out.backward(torch.randn_like(out) * 0.1)
+
+    assert out.shape == (m, k)
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(y).all() and torch.isfinite(x_plus_r).all()
+    # The pair is a straight-through estimator for y, so the dgrad has to land here.
+    for name, t in (("x", x), ("residual", residual), ("gamma", gamma)):
+        assert t.grad is not None, f"{name} got no gradient through the quantized pair"
+        assert torch.isfinite(t.grad).all(), f"{name} gradient is not finite"
