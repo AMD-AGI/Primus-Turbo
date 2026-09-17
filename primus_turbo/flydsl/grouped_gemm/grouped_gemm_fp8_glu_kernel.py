@@ -183,7 +183,7 @@ def grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
         ``(act_out, intermediate_out)``.
     """
     _check_activation(activation)
-    _check_clamp_limit(activation, clamp_limit)
+    _check_clamp_limit(clamp_limit)
     assert trans_b, "FlyDSL fused GLU is NT only: pass b as [G, 2I, K]"
     assert a.ndim == 2 and b.ndim == 3
     M_total, K = a.shape
@@ -411,7 +411,7 @@ def grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
         ``out``, for call-site convenience.
     """
     _check_activation(activation)
-    _check_clamp_limit(activation, clamp_limit)
+    _check_clamp_limit(clamp_limit)
     assert not trans_b, "FlyDSL fused dGLU is NN only: pass b as [G, K, I]"
     assert a.ndim == 2 and b.ndim == 3 and intermediate.ndim == 2
     M_total, K = a.shape

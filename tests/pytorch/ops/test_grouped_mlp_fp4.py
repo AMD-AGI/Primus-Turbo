@@ -41,7 +41,7 @@ SHAPES = [(2048, 896, 512, 4), (2048, 1408, 320, 4), (1536, 1152, 384, 3)]
 GATES = {"silu": F.silu, "gelu": lambda t: F.gelu(t, approximate="tanh")}
 
 CLAMP_LIMIT = 0.10
-GATE_CASES = [("silu", None), ("gelu", None), ("silu", CLAMP_LIMIT)]
+GATE_CASES = [("silu", None), ("gelu", None), ("silu", CLAMP_LIMIT), ("gelu", CLAMP_LIMIT)]
 CASES = [
     (shape, activation, clamp_limit, 0) for shape in SHAPES for activation, clamp_limit in GATE_CASES
 ] + [pytest.param(SHAPES[0], "silu", None, 2, id="uos-mode2")]
