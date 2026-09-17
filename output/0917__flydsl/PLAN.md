@@ -183,3 +183,63 @@ Stage 3 起是**新写内核**，这个估算的不确定度大，且 §决策�
 | 4 | 本计划 Stage 3–5 | 仅在 Stage 2 通过后 |
 
 **Stage 0 现在就可以开始，不需要等机器。**
+
+---
+
+# 0917 晚间修订：执行之后，这份计划哪里错了
+
+上面的内容保留原样，作为当时判断的记录。这一节记下**执行一天之后被推翻或需要改写的部分**，
+依据都在同目录的文档里。下一个会话请先读这一节，不要照着上面的原文行动。
+
+## 被推翻的四条
+
+| 原文说 | 实际 | 依据 |
+|---|---|---|
+| Stage 1 决策门只看前向速度 | 前向 **2.373 ms vs ASM 1.569 ms，慢 1.51×**，落在中间档。而且这**证伪了 SURVEY §8 三条理由里的"前向模板有竞争力"那条** | `STAGE1-FWD.md` |
+| Stage 0「aiter 那份前向能否在 flydsl 0.2.4 下工作」→ 结论"能，4 个 shim" | **不能。** 差的不是第五个符号，是编译器前端语义（0.2.4 的 `ast_rewriter` 不接受 list 作为 stateful-if 状态变量）。**0.3.2 零 shim 跑通** | `API-DELTA.md` 顶部 RETRACTION |
+| （未提及） | **0.3.2 删除了 `flydsl.expr.buffer_ops`**，turbo 的 FlyDSL 树无条件 import 它 → **两个版本一个进程装不下**。Stage 4 的派发接线要重新设计 | `STAGE1-FWD.md` §4 |
+| Stage 3「把 MFMA 换成 WMMA，并相应调整 k 循环步长与 LDS staging」 | 不完整。模板「`Pᵀ`/`dSᵀ` 从累加器免费得到」的技巧 **dq 成立、dkdv 不成立**，dkdv 每个 tile 每次迭代要多一次 LDS 转置往返 | `DKDV-PORT-COST.md` |
+
+## Stage 3 实际完成到哪
+
+**三个反向内核的数据通路全部写出来并验证通过**（`kernels/`，全部一次通过，先查 isfinite 覆盖再看 SQNR）：
+
+| | SQNR | 状态 |
+|---|--:|---|
+| `odo`（`delta = rowsum(dO*O)`） | 159.24 / 156.49 dB | 单 tile |
+| `dkdv`（dV + dK） | 150.73 / 145.41 dB | 单 tile |
+| `dkdv_loop`（运行时 query 循环 + causal） | 141.9 / 141.0 dB | **真内核** |
+| `dq` | 144.90 dB | 单 tile |
+
+**但性能是 5.8 TFLOP/s，对 ASM 反向的约 540 TFLOP/s —— 慢约 93×**（`DKDV-FIRST-TIMING.md`）。
+差距全部在未做的外围：单 wave / 16 宽收缩填充到 32 / 不跳过 causal tile / 无 TDM 流水 /
+无 swizzle。**这不是打磨，是主要工作量。**
+
+## Stage 4/5 之前需要人来做的一个取舍
+
+按今天的全部证据：
+
+- 前向那个 **1.51×** 是在两边都优化过的前提下比出来的，是这套 gfx1250 FlyDSL 惯用法竞争力的最好估计；
+- 如果反向优化到位后落在同一量级，**替换 ASM 反向不会带来性能收益**；
+- 剩下的立项理由只有三条结构性的，其中**只有 varlen 是"有没有"的问题**
+  （gfx1250 完全没有 varlen ASM 反向），另外两条是 GQA 越界写（已量化：峰值 1.254 GiB + 反向 5.2%）
+  和 ASM 资产 1/25。
+
+**建议**：在投入多 wave 调度与 TDM 流水（数个 agent session）之前，把这个取舍摆给决策人。
+如果继续，优先级是 **多 wave（占用率）→ causal tile 跳过 → 更宽收缩 → TDM 流水 → swizzle**，
+每步单独计时 —— 上表里只有前两项的量级是已知的。
+
+## 一个独立于本项目、值得先做的小改动
+
+turbo 在 gfx1250 上 `import primus_turbo.pytorch` 依赖 flydsl 版本，这已经修了 attention 和
+sparse_mla 两处（见 `fix(attention): make the optional flydsl dependency optional`），
+但 MoE / GEMM / quantization 下还有 **10 个文件**在 module scope 无条件 import
+`primus_turbo.flydsl.*`。把它们也变成 import-safe，就能把"turbo 能不能在 gfx1250 上 import"
+和"装的是哪个 flydsl"彻底解耦。范围明确，与本项目无关，独立有价值。
+
+## 挂卡账目
+
+全天**一次故障、零次 AC-cycle**。那次是我给已知越界写的 `dkdv_heads="kv"` 计时触发的
+`GCVM_L2_PROTECTION_FAULT`，驱动按进程重置队列，卡事后 matmul 5.08 ms（故障前 5.09）。
+全部内核 bring-up 零故障 —— 玩具形状先行 + `AMD_SERIALIZE_KERNEL=3` + 构建期失败
+把风险挡在了发射之前。
