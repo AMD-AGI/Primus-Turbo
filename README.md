@@ -3,7 +3,7 @@
 [![Primus-Turbo-CI](https://github.com/AMD-AGI/Primus-Turbo/actions/workflows/ci.yaml/badge.svg)](https://github.com/AMD-AGI/Primus-Turbo/actions/workflows/ci.yaml)
 [![Primus-Turbo-Benchmark](https://github.com/AMD-AGI/Primus-Turbo/actions/workflows/benchmark.yaml/badge.svg)](https://github.com/AMD-AGI/Primus-Turbo/actions/workflows/benchmark.yaml)
 
-[What's Primus-Turbo?](#-whats-primus-turbo) | [What's New](#-whats-new) | [Primus Ecosystem](#-primus-ecosystem) | [Quick Start](#-quick-start) | [Example](#-example) | [Performance](#-performance) | [Roadmap](#-roadmap) | [Acknowledgements](#-acknowledgements) | [License](#-license)
+[What's Primus-Turbo?](#-whats-primus-turbo) | [What's New](#-whats-new) | [Quick Start](#-quick-start) | [Example](#-example) | [Performance](#-performance) | [Roadmap](#-roadmap) | [Primus Ecosystem](#-primus-ecosystem) | [Acknowledgements](#-acknowledgements) | [License](#-license)
 
 ## 🔍 What's Primus-Turbo?
 **Primus-Turbo** is a high-performance acceleration library dedicated to large-scale model training on AMD GPUs. Built and optimized for the AMD ROCm platform, it covers the full training stack — including core compute operators (GEMM, Attention, GroupedGEMM), communication primitives, low-precision computation (FP8), and compute–communication overlap kernels.
