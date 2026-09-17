@@ -10,12 +10,18 @@ One FlyDSL kernel owns a 32-row panel across the full 2880 hidden extent:
 
     phase A  streaming residual add -> ``x_plus_r`` (bf16) and the fp32
              sum-of-squares, 8 threads/row, cross-lane reduce via
-             ``ds_bpermute``; the leading ``_KWCH`` 256-wide hidden chunks stay
-             resident in registers so phase B does not re-read them from HBM.
+             ``ds_bpermute``. The packed-bf16 word already computed for the
+             ``x_plus_r`` store (one i32 per element, not a two-register fp32
+             pair) is also kept resident in registers for every hidden
+             element covered by the leading ``_KWCH`` 256-wide chunks, so
+             phase B does not re-read ``x_plus_r`` from HBM. At ``_KWCH=12``
+             (``_KWCH * _VPC = 48 >= _NVEC = 45``) this covers the whole row.
     phase B  11 full 256-wide chunks + one masked 64-wide tail (2880 = 11*256 +
-             64). Each chunk stages ``y = x_plus_r * rstd * gamma`` into LDS and
-             emits both the rowwise (no RHT) and the colwise-transpose (RHT-16)
-             MXFP4 microblocks with the shipped quantizer primitives.
+             64). Each chunk unpacks the resident (or, below full residency,
+             freshly re-read) bf16 word, stages ``y = x_plus_r * rstd * gamma``
+             into LDS and emits both the rowwise (no RHT) and the
+             colwise-transpose (RHT-16) MXFP4 microblocks with the shipped
+             quantizer primitives.
 
 ``skip_y_store=True`` never writes the bf16 ``y`` bytes; the autograd edge is
 kept by a real backward over the saved ``x_plus_r`` / ``rstd``.
@@ -77,10 +83,32 @@ _GAMW = ((_HW + _BLK - 1) // _BLK) * _BLK  # 1536 gamma LDS slots
 _GITER = _GAMW // _BLK
 _OOB = 0x7FFFFFFF
 
-# Hidden chunks held live in registers across the sum-of-squares reduction.
-# 6 of 11.25 chunks = 53.3% residency: the measured interior optimum between
-# re-read traffic and the occupancy cliff.
-_KWCH = 6
+# Hidden chunks held live in registers across the sum-of-squares reduction, as
+# the packed-bf16 word already computed for the x_plus_r store (one i32 per
+# element) rather than the unrounded fp32 (lo, hi) pair (two f32 registers).
+# Packed-bf16 residency costs roughly half the registers per held element, so
+# the whole row now fits: _KWCH=12 gives kwvec = 12*4 = 48 >= _NVEC = 45,
+# covering every phase-A iteration and deleting the phase-B x_plus_r re-read
+# entirely (the HBM-re-read branch below is dead Python code once
+# kwvec >= _NVEC, since _emit_fused_body traces with concrete Python ints).
+# Measured combined VGPR+AGPR at this design is LOWER than the earlier
+# 53.3%-resident fp32-hold design (240) despite covering 100% of the row --
+# see the H2 sweep in campaigns/20260917_021009/scratch/. A literal-only
+# `_KWCH=12` on the *fp32* (lo, hi) representation was measured this round to
+# cost 400 combined VGPR+AGPR (128 VGPR + 272 AGPR), fall off the occupancy
+# cliff described in the H2 goal section (1 wave/SIMD), and run slower in
+# isolation (~238 us) than the champion's ~205-207 us -- the bf16-pack
+# conversion is not optional, it is what makes full residency affordable.
+#
+# Numerics: holding the bf16-rounded word instead of the unrounded fp32 sum
+# adds one rounding step to the y = x_plus_r * rstd * gamma product for every
+# element (previously only the ~46.7% HBM-re-read fraction paid it). This is
+# numerically IDENTICAL to re-reading x_plus_r from HBM (both round through
+# bf16 before the y multiply) -- measured impact vs the fp32-hybrid champion:
+# row/col/gemm SNR 36.3/34.4/36.2 -> ~33.0/31.1/33.0 dB, still 11-13 dB clear
+# of the 20 dB gate (see scratch/kwch0_snr_probe.py, which forces the same
+# numerics via 0% residency).
+_KWCH = 12
 
 _SCALE_ROUNDING_MODE = 2
 _GRANULARITY = ScalingGranularity.MX_BLOCKWISE
@@ -160,9 +188,13 @@ def _emit_fused_body(
             lo = _f32(xw << 16) + _f32(rw << 16)
             hi = _f32(xw & 0xFFFF0000) + _f32(rw & 0xFFFF0000)
             acc[q] = acc[q] + lo * lo + hi * hi
-            outw.append(_pack_bf16(lo, hi))
+            packed = _pack_bf16(lo, hi)
+            outw.append(packed)
             if i < kwvec:
-                hold[(i, q)] = (lo, hi)
+                # Reuse the word already packed for the x_plus_r store instead
+                # of holding the wider (lo, hi) fp32 pair: one i32 register
+                # per held element instead of two.
+                hold[(i, q)] = packed
         buffer_ops.buffer_store(Vec.from_elements(outw, fx.Int32), xps, goff)
 
     ssq = (acc[0] + acc[1]) + (acc[2] + acc[3])
@@ -195,19 +227,21 @@ def _emit_fused_body(
             lw = rr * I32(_TCW) + (woff - I32(c * _TCW))
             g4 = _lds_load_vec4(lds.gam.ptr, woff)
             if i < kwvec:
-                vals = [hold[(i, q)] for q in range_constexpr(4)]
+                pwords = [hold[(i, q)] for q in range_constexpr(4)]
             else:
                 xv = buffer_ops.buffer_load(xps, rowbase + woff, vec_width=4, dtype=T.i32)
-                vals = []
-                for q in range_constexpr(4):
-                    xw = fx.Int32(xv[q])
-                    vals.append((_f32(xw << 16), _f32(xw & 0xFFFF0000)))
+                pwords = [fx.Int32(xv[q]) for q in range_constexpr(4)]
+            # Both branches now yield a packed-bf16 i32 word per lane; unpack
+            # uniformly regardless of whether it came from a register or HBM.
             yw = []
             for q in range_constexpr(4):
                 gw = fx.Int32(g4[q])
-                lo, hi = vals[q]
+                pw = pwords[q]
                 yw.append(
-                    _pack_bf16(lo * rstd * _f32(gw << 16), hi * rstd * _f32(gw & 0xFFFF0000))
+                    _pack_bf16(
+                        _f32(pw << 16) * rstd * _f32(gw << 16),
+                        _f32(pw & 0xFFFF0000) * rstd * _f32(gw & 0xFFFF0000),
+                    )
                 )
             _lds_store_vec4(lds.buf.ptr, lw, Vec.from_elements(yw, fx.Int32))
         if tail:
