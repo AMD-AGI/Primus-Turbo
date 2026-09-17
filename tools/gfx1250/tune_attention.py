@@ -343,9 +343,13 @@ def main() -> int:
                          "returns the SAME time for every candidate -- the flat result that "
                          "reads as 'this knob does nothing'. Forcing it also forces the "
                          "Triton forward, because use_asm_fwd is gated on the same predicate.")
-    ap.add_argument("--impl", default="turbo", choices=["turbo", "aiter", "fused", "asm", "asmbwd"],
+    ap.add_argument("--impl", default="turbo",
+                    choices=["turbo", "aiter", "fused", "asm", "asmbwd", "flydsl"],
                     help="turbo = Primus-Turbo's in-tree Triton backend (the PR target). "
                          "aiter = AITER's Triton MHA, the alternative seed the plan named. "
+                         "flydsl = AITER's FlyDSL gfx1250 forward (its default path on this "
+                         "arch) paired with the vendored fused backward, so the number that "
+                         "moves is the forward. There is no FlyDSL backward on gfx1250. "
                          "Same shape, same fp32 reference, same SQNR gate, same timer -- the "
                          "only way the two numbers are comparable is if everything but the "
                          "kernel is identical code.")
@@ -549,6 +553,72 @@ def _measure(args) -> int:
 
         result["impl_note"] = "aiter prebuilt gfx1250 ASM forward + aiter prebuilt ASM backward"
         _impl_fwd = lambda: _AsmFwdAsmBwd.apply(q, k, v)  # noqa: E731
+    elif args.impl == "flydsl":
+        # AITER's FlyDSL gfx1250 forward -- the DEFAULT path on this arch -- paired with the
+        # vendored fused backward, the same backward `--impl asm` uses. Pairing it that way
+        # is the point: `asm` and `flydsl` then differ in the forward and nothing else, so
+        # the delta between them is attributable.
+        #
+        # Entry point is flydsl_flash_attn_batch_func, NOT flydsl_flash_attn_func. The latter
+        # is the gfx1201 RDNA4 kernel and returns no LSE, so it cannot be paired with any
+        # backward. The batch entry is BSHD [B,S,H,D] -- the layout this harness already
+        # holds -- gates on get_gfx() == "gfx1250", and returns LSE as [B, nheads_q, S_q]
+        # fp32, which is the form dense_fused_backward documents as accepted.
+        #
+        # Its GQA condition is `nheads_q % nheads_kv == 0`, so Llama-3.1-8B's G=4 is in
+        # scope here. Turbo's own _gqa_group_ok requires a power of two in [8, 256] and is
+        # what keeps this shape off turbo's FlyDSL path -- a different gate, not this one.
+        #
+        # IT RETURNS None WHEN IT CANNOT SERVE THE CONFIGURATION rather than raising. Left
+        # unchecked, an unsupported shape would fall through to whatever the caller does
+        # next and the run would report a number for a kernel that never executed. Raise.
+        from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_func
+        from primus_turbo.pytorch.kernels.attention.attention_fused_bwd_impl import (
+            dense_fused_backward,
+        )
+
+        _fdsl_scale = (q.shape[-1]) ** -0.5
+
+        _probe = flydsl_flash_attn_batch_func(
+            q.detach(), k.detach(), v.detach(),
+            softmax_scale=_fdsl_scale, causal=causal, return_lse=True,
+        )
+        if _probe is None:
+            raise SystemExit(
+                "flydsl_flash_attn_batch_func returned None for this configuration: "
+                f"b={b} s={sq} hq={hq} hkv={hkv} d={d} dtype={dtype} causal={causal}, "
+                f"arch={result.get('arch')}. It declines rather than raising, so this is a "
+                "refusal to serve the shape, not a failure. Do not fall back silently."
+            )
+        _probe_out, _probe_lse = _probe
+        result["flydsl_lse_shape"] = list(_probe_lse.shape)
+        result["flydsl_lse_dtype"] = str(_probe_lse.dtype)
+        del _probe, _probe_out, _probe_lse
+
+        class _FlydslFwdFusedBwd(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, q_, k_, v_):
+                o_, lse_ = flydsl_flash_attn_batch_func(
+                    q_, k_, v_, softmax_scale=_fdsl_scale, causal=causal, return_lse=True,
+                )
+                ctx.save_for_backward(q_, k_, v_, o_, lse_)
+                return o_
+
+            @staticmethod
+            def backward(ctx, do_):
+                q_, k_, v_, o_, lse_ = ctx.saved_tensors
+                dq_, dk_, dv_ = dense_fused_backward(
+                    do_.contiguous(), q_, k_, v_, o_, lse_, _fdsl_scale, causal, (-1, -1)
+                )
+                return dq_, dk_, dv_
+
+        # NOT YET VERIFIED: whether this kernel's LSE is natural log (what
+        # dense_fused_backward expects, and what the ASM forward emits) or log2 -- the
+        # kernel carries a LOG2E constant. A mismatch does not raise; it produces smoothly
+        # wrong gradients. The four-tensor SQNR gate is what catches it, which is the reason
+        # dq/dk/dv are gated here and not just `out`.
+        result["impl_note"] = "aiter FlyDSL gfx1250 forward + vendored fused backward"
+        _impl_fwd = lambda: _FlydslFwdFusedBwd.apply(q, k, v)  # noqa: E731
     elif args.impl == "aiter":
         from aiter.ops.triton._triton_kernels.attention import mha as _amha
         from aiter.ops.triton.attention.mha import flash_attn_func as _aiter_fa
