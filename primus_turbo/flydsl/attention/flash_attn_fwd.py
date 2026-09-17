@@ -50,7 +50,6 @@ def build_flash_attn_dualwave_swp_module(
     num_kv_heads=None,
     waves_per_eu=2,
     daz=True,
-    dualwave_swp_fixed_max=None,
     dualwave_swp_setprio=True,
     dualwave_swp_enable_stagger=True,
     varlen=False,
@@ -90,7 +89,6 @@ def build_flash_attn_dualwave_swp_module(
         dtype_str=dtype_str,
         waves_per_eu=waves_per_eu,
         daz=daz,
-        dualwave_swp_fixed_max=dualwave_swp_fixed_max,
         dualwave_swp_setprio=dualwave_swp_setprio,
         dualwave_swp_enable_stagger=dualwave_swp_enable_stagger,
         varlen=varlen,
@@ -361,16 +359,11 @@ def build_flash_attn_dualwave_swp_module(
             else:
                 # Non-causal tiny seq_len needs tile-0 padding masked before the full-tile no-op gate.
                 v_s_0 = ctx.seq_pad_mask_if_needed(v_s_0, ctx.split_tile(0))
-            if const_expr(traits.DUALWAVE_SWP_FIXED_MAX):
-                m_row_pro = ctx.prologue_ref_max(v_s_0)
-                ctx.set_fixed_ref(m_row_pro)
-                v_s_0 = ctx.shift_scores_by(v_s_0, m_row_pro)
-            else:
-                m_row_pro = ctx.reduce_max(v_s_0)
-                if const_expr(traits.CAUSAL):
-                    # Floor fully-masked rows (-inf) to finite so exp2 yields 0, not NaN.
-                    m_row_pro = ctx.floor_masked_max(m_row_pro)
-                m_row_pro = ctx.lift_ref(m_row_pro)
+            m_row_pro = ctx.reduce_max(v_s_0)
+            if const_expr(traits.CAUSAL):
+                # Floor fully-masked rows (-inf) to finite so exp2 yields 0, not NaN.
+                m_row_pro = ctx.floor_masked_max(m_row_pro)
+            m_row_pro = ctx.lift_ref(m_row_pro)
             v_s_0 = ctx.shift_scores(v_s_0, m_row_pro)
             ctx.set_ref(m_row_pro)
             v_p_0 = ctx.exp2(v_s_0, 0, 16)
@@ -382,11 +375,9 @@ def build_flash_attn_dualwave_swp_module(
 
             ctx.load_k_split(2, 0)
 
-            # A fixed reference never moves, so that path keeps m_row off the back edge.
-            # The online path must carry it: the running maximum is what every rescale is
-            # measured against, and restarting it each iteration silently loses row mass.
-            carry_m = not traits.DUALWAVE_SWP_FIXED_MAX
-            init_args = [m_row_pro, l_row_init] if carry_m else [l_row_init]
+            # The running maximum is what every rescale is measured against, so it rides the
+            # back edge; restarting it each iteration silently loses row mass.
+            init_args = [m_row_pro, l_row_init]
             for _ in range_constexpr(traits.D_CHUNKS):
                 init_args.append(v_o_zero)
             init_args.append(v_p_0[0])
@@ -398,13 +389,11 @@ def build_flash_attn_dualwave_swp_module(
                 fx.Index(2),
                 init=init_args,
             ):
-                mo = 1 if carry_m else 0
-                m_row = loop_args[0] if carry_m else m_row_pro
-                if const_expr(carry_m):
-                    ctx.set_ref(m_row)
-                l_row = loop_args[mo]
-                v_o = [loop_args[1 + mo + i] for i in range_constexpr(traits.D_CHUNKS)]
-                v_p_0 = (loop_args[1 + mo + traits.D_CHUNKS], loop_args[2 + mo + traits.D_CHUNKS])
+                m_row = loop_args[0]
+                ctx.set_ref(m_row)
+                l_row = loop_args[1]
+                v_o = [loop_args[2 + i] for i in range_constexpr(traits.D_CHUNKS)]
+                v_p_0 = (loop_args[2 + traits.D_CHUNKS], loop_args[3 + traits.D_CHUNKS])
                 j_idx = j
 
                 # Cluster 0: prefetch V buf1, read resident K for MMA0, and use carried page ids.
@@ -529,18 +518,16 @@ def build_flash_attn_dualwave_swp_module(
                     _s_setprio(0)
                 _pv_cluster_sync()
 
-                yield_args = ([m_row, l_row] if carry_m else [l_row]) + v_o + [v_p_0[0], v_p_0[1]]
+                yield_args = [m_row, l_row] + v_o + [v_p_0[0], v_p_0[1]]
                 loop_results = yield yield_args
 
             # Epilogue drains the final in-flight tiles, continuing from the loop's maximum.
-            mo = 1 if carry_m else 0
-            m_row = loop_results[0] if carry_m else m_row_pro
+            m_row = loop_results[0]
             # the epilogue seeds against the loop's result, not the last body value
-            if const_expr(carry_m):
-                ctx.set_ref(m_row)
-            l_row = loop_results[mo]
-            v_o = [loop_results[1 + mo + i] for i in range_constexpr(traits.D_CHUNKS)]
-            v_p_0 = (loop_results[1 + mo + traits.D_CHUNKS], loop_results[2 + mo + traits.D_CHUNKS])
+            ctx.set_ref(m_row)
+            l_row = loop_results[1]
+            v_o = [loop_results[2 + i] for i in range_constexpr(traits.D_CHUNKS)]
+            v_p_0 = (loop_results[2 + traits.D_CHUNKS], loop_results[3 + traits.D_CHUNKS])
 
             max_m3 = split_t_end - 3
             max_m2 = split_t_end - 2

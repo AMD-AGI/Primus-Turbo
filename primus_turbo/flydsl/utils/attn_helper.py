@@ -263,9 +263,6 @@ def _anchor_v_o(traits, v_o):
 
 
 def _anchor_v_p(traits, v_p, elem_dtype):
-    if const_expr(traits.DUALWAVE_SWP_FIXED_MAX):
-        # Fixed-reference-max forward: P is never rescaled.
-        return v_p
     p_lo, p_hi = v_p
     p_lo_all = _concat_vectors(p_lo[0], p_lo[1])
     p_hi_all = _concat_vectors(p_hi[0], p_hi[1])
@@ -406,7 +403,6 @@ class DualwaveSwpTraits:
             self.DTYPE_STR,
             self.WAVES_PER_EU,
             self.DAZ,
-            self.DUALWAVE_SWP_FIXED_MAX,
             self.DUALWAVE_SWP_MFMA_ROWSUM,
             self.DUALWAVE_SWP_SETPRIO,
             self.DUALWAVE_SWP_ENABLE_STAGGER,
@@ -427,7 +423,6 @@ def _make_dualwave_swp_traits(
     dtype_str="bf16",
     waves_per_eu=2,
     daz=True,
-    dualwave_swp_fixed_max=None,
     dualwave_swp_setprio=True,
     dualwave_swp_enable_stagger=True,
     varlen=False,
@@ -476,15 +471,8 @@ def _make_dualwave_swp_traits(
     dualwave_swp_kv_per_buffer = smem_k_tile_elems + smem_v_tile_elems
     varlen = bool(varlen)
     cross_seqlen = bool(cross_seqlen)
-    # Softmax is shift-invariant, so the main loop can run on a fixed zero reference max and let
-    # the epilogue re-enter the online path.
-    if dualwave_swp_fixed_max is None:
-        # D128 training needs row-adaptive softmax: low fixed references overflow
-        # positive rows, while high references underflow negative rows in BF16.
-        # Preserve the independently tuned D64 path until it is validated online.
-        dualwave_swp_fixed_max = causal and head_dim != 128
-    # With a fixed reference max nothing rebases l_row mid-loop, so the running row sum
-    # can live in an MFMA accumulator fed by a ones A operand instead of a VALU fold.
+    # The running row sum lives in an MFMA accumulator fed by a ones A operand instead of a
+    # VALU fold.
     # The ones-operand MFMA row sum folds the half-wave partner too, so it replaces a
     # permlane pair reduce per tile. Online needs its running sum corrected when the row
     # maximum moves, which is a multiply on the accumulator -- no reason to give it up.
@@ -523,7 +511,6 @@ def _make_dualwave_swp_traits(
         DTYPE_STR=dtype_str,
         WAVES_PER_EU=waves_per_eu,
         DAZ=bool(daz),
-        DUALWAVE_SWP_FIXED_MAX=bool(dualwave_swp_fixed_max),
         DUALWAVE_SWP_MFMA_ROWSUM=dualwave_swp_mfma_rowsum,
         DUALWAVE_SWP_SETPRIO=bool(dualwave_swp_setprio),
         DUALWAVE_SWP_ENABLE_STAGGER=bool(dualwave_swp_enable_stagger),
@@ -1203,41 +1190,12 @@ class DualwaveKernelContext:
         for dc in range_constexpr(self.traits.D_CHUNKS):
             v_o[dc] = _fmul(Vec(v_o[dc]), scale_vec, self.fm_fast)
 
-    def zero_row_max(self):
-        return self.c_zero_f
-
-    def prologue_ref_max(self, v_s):
-        """This row's max over the prologue tile, lifted by REF_MARGIN. A fully masked row
-        reduces to -inf; fall back to zero there, which is what this path used before."""
-        m = self.reduce_max(v_s)
-        m = ArithValue(fx.Float32(m) > self.c_neg_floor).select(m, self.c_zero_f)
-        return _fadd(m, fx.Float32(float(REF_MARGIN)), self.fm_fast)
-
-    def set_fixed_ref(self, m_row):
-        """Pin the loop's reference as one per-row scalar, applied by score_acc_seed()."""
-        self.ref_neg = _fsub(self.c_zero_f, m_row, self.fm_fast)
-
-    def shift_scores_by(self, v_s, row_max):
-        """Shift the prologue tile, the one tile that leaves the MFMA before the reference
-        exists and so cannot be rebased by the accumulator seed."""
-        if isinstance(v_s[0], list):
-            v_s = _score_lists_to_vecs(v_s)
-        return tuple(
-            Vec.from_elements(
-                [as_mlir_value(_fsub(Vec(half)[r], row_max, self.fm_fast)) for r in range_constexpr(16)],
-                fx.Float32,
-            ).ir_value()
-            for half in v_s
-        )
-
     def scores_for_softmax(self, v_s):
         return v_s
 
     def shift_scores(self, v_s, row_max):
         if isinstance(v_s[0], list):
             v_s = _score_lists_to_vecs(v_s)
-        if const_expr(self.traits.DUALWAVE_SWP_FIXED_MAX):
-            return v_s
         shifted = []
         for half in v_s:
             shifted.append(
@@ -1250,8 +1208,6 @@ class DualwaveKernelContext:
 
     def rebase_if_needed(self, ref, v_o, l_row, v_s):
         """Raise the reference only for a tile that has outrun it, which is rare."""
-        if const_expr(self.traits.DUALWAVE_SWP_FIXED_MAX):
-            return ref, l_row, v_s
         if isinstance(v_s[0], list):
             v_s = _score_lists_to_vecs(v_s)
         m_lane = _reduce_score_tree(v_s, _fmax, self.fm_fast)
@@ -1291,21 +1247,6 @@ class DualwaveKernelContext:
             v_o[dc] = res[1 + dc]
         self.set_ref(res[0])
         return res[0], res[1 + nd], (res[2 + nd], res[3 + nd])
-
-    def tile_row_max(self, m_row, v_s):
-        """Returns None as the O/l correction when the reference max is fixed and nothing rebases."""
-        if const_expr(self.traits.DUALWAVE_SWP_FIXED_MAX):
-            return m_row, None
-        m_tile = self.reduce_max(v_s)
-        if const_expr(self.traits.CAUSAL):
-            m_tile = self.floor_masked_max(m_tile)
-        m_new = _fmax(m_row, m_tile, self.fm_fast)
-        rescale = fx.Float32(rocdl.exp2(T.f32, _fsub(m_row, m_new, self.fm_fast)))
-        return m_new, rescale
-
-    def scale_o_by(self, v_o, rescale):
-        if rescale is not None:
-            self.scale_o(v_o, rescale)
 
     def scale_l_by(self, l_row, rescale):
         """Apply a row-max correction to the running row sum, in whichever form it is held.
