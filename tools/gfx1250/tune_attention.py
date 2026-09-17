@@ -456,6 +456,33 @@ def _measure(args) -> int:
     v = torch.randn(b, sq, hkv, d, device="cuda", dtype=dtype, requires_grad=True)
     do = torch.randn(b, sq, hq, d, device="cuda", dtype=dtype)
 
+    # These four impls need attention backends that live on dev/lhz/attn (the aiter ASM
+    # forward, the ASM backward launcher, and the vendored fused backward) and are NOT on
+    # this branch, which was cut from main to keep the FlyDSL line separate. Say so, rather
+    # than letting a bare ModuleNotFoundError surface a hundred lines into a measurement.
+    if args.impl in ("fused", "asm", "asmbwd", "flydsl"):
+        import importlib.util as _ilu
+
+        _needed = {
+            "fused": ["attention_fused_bwd_impl"],
+            "asm": ["attention_asm_fwd_impl", "attention_fused_bwd_impl"],
+            "asmbwd": ["attention_asm_fwd_impl", "attention_asm_bwd_impl"],
+            "flydsl": ["attention_fused_bwd_impl"],
+        }[args.impl]
+        _missing = [
+            m
+            for m in _needed
+            if _ilu.find_spec(f"primus_turbo.pytorch.kernels.attention.{m}") is None
+        ]
+        if _missing:
+            raise SystemExit(
+                f"--impl {args.impl} needs {', '.join(_missing)}, which this branch does not "
+                "carry (they are part of the ASM/fused line on dev/lhz/attn). For a "
+                "FlyDSL-vs-ASM forward comparison that needs neither, use "
+                "output/0917__flydsl/bin/stage1_fwd_ab.py -- both of its arms come from "
+                "aiter, which also sidesteps the flydsl 0.2.4/0.3.2 conflict."
+            )
+
     if args.impl == "fused":
         # What would actually ship: Primus-Turbo's own forward, with the vendored fused
         # backward swapped in for the in-tree two-kernel one. Patched at the op layer rather

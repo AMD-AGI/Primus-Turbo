@@ -17,12 +17,40 @@ from typing import Optional, Tuple
 
 import torch
 
-from primus_turbo.flydsl.attention.flash_attn_bwd import (
-    flydsl_varlen_backward,
-)
-from primus_turbo.flydsl.attention.flash_attn_fwd import (
-    build_flash_attn_dualwave_swp_module,
-)
+# The flydsl package is an optional dependency: setup.py skips installing it for a
+# gfx1250 build, where these kernels cannot run anyway (they emit ds_read_tr16_b64, a
+# CDNA4 LDS transpose load, and every builder raises on a non-gfx950 arch). Importing it
+# unconditionally here makes the whole attention stack unimportable on such a build --
+# attention_impl and flash_attn_interface both import this module at module scope, so a
+# missing or incompatible flydsl takes down flash_attn_func itself, including the Triton
+# path that is the only one that works there. Degrade to "FlyDSL declines" instead.
+#
+# "Incompatible", not just "missing", is a case that actually occurs: flydsl 0.3.2 removed
+# `flydsl.expr.buffer_ops`, which flash_attn_bwd.py imports, so an environment carrying
+# 0.3.2 for some other consumer (aiter's gfx1250 kernels pin it) raises ImportError here.
+try:
+    from primus_turbo.flydsl.attention.flash_attn_bwd import (
+        flydsl_varlen_backward,
+    )
+    from primus_turbo.flydsl.attention.flash_attn_fwd import (
+        build_flash_attn_dualwave_swp_module,
+    )
+
+    FLYDSL_AVAILABLE = True
+    _FLYDSL_IMPORT_ERROR: Optional[BaseException] = None
+except ImportError as exc:  # pragma: no cover - depends on how the wheel was built
+    FLYDSL_AVAILABLE = False
+    _FLYDSL_IMPORT_ERROR = exc
+
+    def _flydsl_unavailable(*args, **kwargs):
+        raise ImportError(
+            "This operator needs the optional 'flydsl' package, and it is missing or "
+            "incompatible. The FlyDSL attention backend should have declined before "
+            "reaching here -- reaching this call means a backend gate is wrong."
+        ) from _FLYDSL_IMPORT_ERROR
+
+    flydsl_varlen_backward = _flydsl_unavailable
+    build_flash_attn_dualwave_swp_module = _flydsl_unavailable
 
 # Custom ops so a compiled caller sees opaque nodes instead of tracing into FlyDSL's JIT
 # build (which shells out and takes locks) -- a graph break there is what fullgraph=True

@@ -29,12 +29,13 @@ from primus_turbo.pytorch.core.backend import (
     KernelBackend,
     TuneCache,
 )
-from primus_turbo.pytorch.core.utils import get_device_compute_capability, is_gfx1250
+from primus_turbo.pytorch.core.utils import is_gfx950, is_gfx1250
 from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
     attention_aiter_forward_impl,
     attention_aiter_varlen_forward_impl,
 )
 from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
+    FLYDSL_AVAILABLE,
     flash_attn_sbhd_flydsl_forward_impl,
     flash_attn_varlen_flydsl_forward_impl,
 )
@@ -46,7 +47,6 @@ from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     dense_forward as _triton_dense_forward,
 )
 
-_GFX950 = (9, 5)
 # Narrowest left window the FlyDSL backward is correct on. The kv band comes from the window
 # rounded down to a power of two, and the dQ reduce takes the low edge of a whole q BLOCK's
 # band range. Below BLOCK_Q=64 a band is narrower than the block, so odd bands start mid-block
@@ -101,7 +101,16 @@ def _flydsl_common_ok(
     """
     head_dim = q.shape[-1]
     return (
-        get_device_compute_capability() >= _GFX950
+        # gfx950 exactly, not ">= gfx950". Every FlyDSL FA builder hard-raises on anything
+        # else -- flash_attn_fwd.py checks gpu_arch.startswith("gfx950") because it emits
+        # ds_read_tr16_b64, a CDNA4 LDS transpose load, and the backward builders assert
+        # the same. A compute-capability compare lets gfx1250 through: it reports (12, 5),
+        # which is >= (9, 5). Nothing has hit that yet only because _gqa_group_ok happens
+        # to refuse Llama-3.1-8B's G=4; any model with G in {8, 16, ...} would dispatch
+        # here and raise inside a gfx950 JIT.
+        is_gfx950()
+        # Optional dependency; a build that skipped it has no FlyDSL kernels to reach.
+        and FLYDSL_AVAILABLE
         and bool(causal)
         and q.dtype == torch.bfloat16
         and head_dim in (64, 128)

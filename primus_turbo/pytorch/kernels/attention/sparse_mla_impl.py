@@ -22,8 +22,30 @@ from typing import Optional, Tuple
 
 import torch
 
-from primus_turbo.flydsl.attention.sparse_mla_bwd import sparse_mla_bwd_flydsl
-from primus_turbo.flydsl.attention.sparse_mla_fwd import sparse_mla_fwd_flydsl
+# Optional dependency, same as attention_flydsl_impl. These two modules are worse than
+# the rest of the tree in one respect: they carry NO arch gate, so on a non-gfx950 card
+# they are a compiler error rather than a clean refusal -- all the more reason the import
+# itself must not take the module down. flydsl 0.3.2 removed `flydsl.expr.buffer_ops`,
+# which they import, so an environment carrying 0.3.2 for another consumer raises here.
+try:
+    from primus_turbo.flydsl.attention.sparse_mla_bwd import sparse_mla_bwd_flydsl
+    from primus_turbo.flydsl.attention.sparse_mla_fwd import sparse_mla_fwd_flydsl
+
+    SPARSE_MLA_FLYDSL_AVAILABLE = True
+    _SPARSE_MLA_IMPORT_ERROR: Optional[BaseException] = None
+except ImportError as exc:  # pragma: no cover - depends on how the wheel was built
+    SPARSE_MLA_FLYDSL_AVAILABLE = False
+    _SPARSE_MLA_IMPORT_ERROR = exc
+
+    def _sparse_mla_flydsl_unavailable(*args, **kwargs):
+        raise ImportError(
+            "Sparse MLA's FlyDSL path needs the optional 'flydsl' package, and it is "
+            "missing or incompatible. The backend gate should have chosen TRITON before "
+            "reaching here."
+        ) from _SPARSE_MLA_IMPORT_ERROR
+
+    sparse_mla_bwd_flydsl = _sparse_mla_flydsl_unavailable
+    sparse_mla_fwd_flydsl = _sparse_mla_flydsl_unavailable
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
     BackendChoice,
@@ -54,6 +76,8 @@ class SparseMlaFwdFlydslBackend(KernelBackend):
         _, num_heads, d_qk = q.shape
         return (
             is_gfx950()
+            # Optional dependency; without it there is no FlyDSL kernel to reach.
+            and SPARSE_MLA_FLYDSL_AVAILABLE
             and q.dtype == torch.bfloat16
             and d_qk == _DSV4_QK_DIM
             and num_heads % 32 == 0
@@ -96,6 +120,8 @@ class SparseMlaBwdFlydslBackend(KernelBackend):
         _, num_heads, d_qk = q.shape
         return (
             is_gfx950()
+            # Optional dependency; without it there is no FlyDSL kernel to reach.
+            and SPARSE_MLA_FLYDSL_AVAILABLE
             and q.dtype == torch.bfloat16
             and d_qk == _DSV4_QK_DIM
             and num_heads % 32 == 0
