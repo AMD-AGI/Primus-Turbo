@@ -15,6 +15,7 @@ produce a tree that no single flydsl version can load. See `../STAGE1-FWD.md` se
 | `tr16_semantics_probe.py` | **decoded.** `ds_load_tr16_b128` -> lane l, elem e gets `src[(l//16)*8+e, l%16]` |
 | `tr16_operand_e2e.py` | **works.** LDS + two tr16 loads build a WMMA A-operand (148.00 dB) |
 | `dv_gfx1250.py` | **works.** `dV = P^T . dO` -- the first complete slice of dkdv (150.75 dB) |
+| `dkdv_gfx1250.py` | **works.** `dV` AND `dK` in one kernel -- the expensive half of the backward (150.73 / 145.41 dB) |
 
 ## odo_gfx1250.py
 
@@ -121,3 +122,34 @@ handling. Everything structural is exercised; everything that makes it a product
 
 Next: `dK = dS^T . Q`, which needs `dP = dO . V^T` and the `delta` that `odo_gfx1250.py`
 already produces.
+
+
+## dkdv_gfx1250.py -- dV and dK in one kernel
+
+dK is structurally dV with substitutions, which is why they belong in one pass:
+
+```
+S^T[kv,q] = K @ Q^T * scale        dP^T[kv,q] = V @ dO^T          <- same GEMM shape
+P^T       = exp(S^T - lse[q])      dS^T = P^T*(dP^T - delta[q])*scale
+dV[kv,d]  = sum_q P^T  dO[q,d]     dK[kv,d] = sum_q dS^T Q[q,d]   <- same GEMM shape
+```
+
+| | isfinite | SQNR | max abs err |
+|---|---|--:|--:|
+| dV | 2048/2048 | **150.73 dB** | 1.19e-07 |
+| dK | 2048/2048 | **145.41 dB** | 2.38e-07 |
+
+Four operands, all through the same `ds_load_tr16_b128`-over-row-major-LDS path: P and dS
+staged `[q][kv]`, dO and Q staged `[q][d]`. The P and dS stores are one `b128` each per
+q-tile. `delta` comes from `odo_gfx1250.py`.
+
+**A FlyDSL gotcha worth keeping:** a statement-level `for si in range(8)` that appends to a
+list is rewritten into an `scf.for` with carried variables and fails with
+`carried variable 'p_list' does not match the region entry`. Use a list comprehension, or
+`range_constexpr`, for compile-time unrolling.
+
+Scope: one wave, one 16-row kv tile, NQ=32, D=128, non-causal, no GQA, no tail handling, no
+bank-conflict swizzle, and no kv/query loops. What is done is the whole data path and every
+layout question in it; what is left is the production wrapping around it.
+
+Not yet written: `dq = dS . K`, whose operand the `dq_operand_probe` showed comes free.
