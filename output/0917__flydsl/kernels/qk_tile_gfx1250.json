@@ -1,0 +1,30 @@
+[
+  {
+    "D": 32,
+    "ndt": 1,
+    "isfinite": "256/256",
+    "sqnr_db": 150.34,
+    "pass": true
+  },
+  {
+    "D": 64,
+    "ndt": 2,
+    "isfinite": "256/256",
+    "sqnr_db": 146.38,
+    "pass": true
+  },
+  {
+    "D": 128,
+    "ndt": 4,
+    "isfinite": "256/256",
+    "sqnr_db": 143.07,
+    "pass": true
+  },
+  {
+    "D": 256,
+    "ndt": 8,
+    "isfinite": "256/256",
+    "sqnr_db": 138.68,
+    "pass": true
+  }
+]
