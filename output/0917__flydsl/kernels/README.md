@@ -9,6 +9,12 @@ produce a tree that no single flydsl version can load. See `../STAGE1-FWD.md` se
 |---|---|
 | `odo_gfx1250.py` | **works.** `delta = rowsum(dO*O)`, BSHD in, `[B,H,S]` fp32 out |
 | `wmma_layout_probe.py` | **works.** One 16x32 @ 32x16 WMMA tile against torch. Pins the fragment layout everything else will be built on |
+| `qk_tile_gfx1250.py` | **works.** S^T = K @ Q^T over d, the accumulation chain (d=128: 143.07 dB) |
+| `accumulator_operand_probe.py` | **negative result.** The accumulator is NOT operand-shaped on gfx1250 (-4.28 dB), so dkdv needs a transpose |
+| `dq_operand_probe.py` | **works.** dq's operand IS free -- two kv-tile accumulators concatenate in-lane (151.32 dB) |
+| `tr16_semantics_probe.py` | **decoded.** `ds_load_tr16_b128` -> lane l, elem e gets `src[(l//16)*8+e, l%16]` |
+| `tr16_operand_e2e.py` | **works.** LDS + two tr16 loads build a WMMA A-operand (148.00 dB) |
+| `dv_gfx1250.py` | **works.** `dV = P^T . dO` -- the first complete slice of dkdv (150.75 dB) |
 
 ## odo_gfx1250.py
 
@@ -80,3 +86,38 @@ in aiter's `load_q_to_vgpr_part2`.
 Sources for the layout: `fmha_b16_buffer_managers.py:1124-1143` (fragment construction),
 `fmha_fwd_prefill_a16w16_m32x8.py:251-276` (the `_wmma` wrapper and the accumulator comment,
 which says "GPU-verified" -- this file is our own independent check of that claim).
+
+
+## dv_gfx1250.py -- the first real slice of dkdv
+
+Chains everything above into one kernel that is checkable end to end:
+
+```
+S^T[kv,q] = K @ Q^T * scale          the d-tile accumulation chain
+P^T[kv,q] = exp(S^T - lse[q])        fp32, in the accumulator
+dV[kv,d]  = sum_q P^T[kv,q] dO[q,d]  contracts over q -- BOTH operands transposed
+```
+
+| | |
+|---|--:|
+| isfinite | 2048/2048 |
+| SQNR vs torch (P truncated to bf16 the same way) | **150.75 dB** |
+| max abs error | 1.19e-07 |
+
+The part worth reusing: **both operands of the second GEMM come from the same trick.**
+`ds_load_tr16_b128` over row-major LDS gives lane `l` a column, so
+
+```
+A = P^T  (M=kv, K=q)  <- P  staged [q][kv];  tr16 -> P[q=(l//16)*8+e, kv=l%16]
+B = dO   (N=d,  K=q)  <- dO staged [q][d];   tr16 -> dO[q=(l//16)*8+e, d=l%16]
+```
+
+and the P store is **one b128 per q-tile**, because the S^T accumulator hands a lane eight
+values consecutive in kv for a fixed q, which is exactly one row-major `[q][kv]` run.
+
+Scope: one wave, one 16-row kv tile, NQ=32 queries, D=128, non-causal, no GQA, no tail
+handling. Everything structural is exercised; everything that makes it a production kernel
+(causal masking, the kv/query loops, GQA, multi-wave, the LDS swizzle, dK) is not.
+
+Next: `dK = dS^T . Q`, which needs `dP = dO . V^T` and the `delta` that `odo_gfx1250.py`
+already produces.
