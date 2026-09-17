@@ -137,7 +137,7 @@ gfx1250 的资产集只有 gfx950 的 1/4，这不是我们能靠调用补上的
 
 **阻塞是硬的**：`primus_turbo/flydsl/attention/` 下每个 builder 都硬断言 gfx950 ——
 `flash_attn_fwd.py:71` 直接 raise *"requires gfx950+ (uses `ds_read_tr16_b64`)"*，
-反向的 odo / lse-transpose / dq-reduce / slot-reduce / a16-unpermute **五个 kernel 各断言一次**。
+反向的 odo(:296) / lse-transpose(:492) / dq-reduce(:683) / slot-reduce(:1079) / a16-unpermute(:1161) / **dkdv(:1343)** **六个 kernel 各断言一次**（0917 更正：先前写的"五个"漏掉了 dkdv，而它是 2777 行、最贵的那个）。
 `ds_read_tr16_b64` 是 CDNA4 的 LDS 转置读，gfx1250 对应的是 `ds_load_tr16_b128`，
 **寄存器落位不同** —— 这是逐 kernel 移植，不是改一个 arch 判断。
 
