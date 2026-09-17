@@ -18,7 +18,15 @@ That is a plausible-sounding argument of the kind that is worth not trusting, so
 """
 import os, sys, json
 os.environ.setdefault("TORCH_BLAS_PREFER_HIPBLASLT", "0")
-sys.path.insert(0, "/tmp/flydsl032"); sys.path.insert(0, "/home/lihuzhan/code/aiter-src")
+# flydsl 0.3.2 is required (0.2.4 cannot build aiter's gfx1250 kernels) and is installed
+# side by side rather than over the image's 0.2.4, which other things in this container
+# still need. Durable path first: /tmp does not survive a container restart, and the
+# unattended op-evolve job runs for up to 48h with a supervisor that restarts things.
+for _p in ("/home/lihuzhan/.local/flydsl032", "/tmp/flydsl032"):
+    if os.path.isdir(_p):
+        sys.path.insert(0, _p)
+        break
+sys.path.insert(0, "/home/lihuzhan/code/aiter-src")
 import torch, flydsl
 import flydsl.compiler as flyc
 import flydsl.expr as fx

@@ -33,7 +33,7 @@
 # flydsl 0.3.2 is required (0.2.4 cannot build aiter's gfx1250 kernels) and 0.3.2
 # removes `flydsl.expr.buffer_ops`, which primus_turbo's own FlyDSL tree imports
 # unconditionally. Importing primus_turbo under 0.3.2 raises. Install 0.3.2 with
-# `pip install --target /tmp/flydsl032` and prepend to sys.path; do NOT touch the
+# `pip install --target /home/lihuzhan/.local/flydsl032` and prepend to sys.path; do NOT touch the
 # image's site-packages, whose 0.2.4 other things depend on. Setup must print
 # `flydsl.__file__` and assert it resolves to the 0.3.2 copy.
 #
@@ -136,7 +136,7 @@ runtime:
     docker:
       image: null
       container: fa-repro           # EXISTING container; the runner attaches, never
-                                    # recreates. flydsl 0.3.2 is at /tmp/flydsl032.
+                                    # recreates. flydsl 0.3.2 is at /home/lihuzhan/.local/flydsl032.
       options: []
   sudo: false
   gpu_arch: gfx1250
