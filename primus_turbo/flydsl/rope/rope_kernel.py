@@ -59,6 +59,7 @@ _NPLANE = _HALF // _VEC  # 16 lanes cover the 64-wide half with vec4
 _NROW = 64 // _NPLANE  # 4 rows processed concurrently per block (fills the wave)
 # Row lanes a block advances together. A caller must keep S*B a multiple of this:
 # the kernels carry no per-row predicate and their descriptors span the whole address space.
+ROPE_HEAD_DIM = _D  # the head width these kernels are built for
 ROPE_ROW_GROUP = _NROW
 
 # Issue the rotate and the K+V kernels from one Python call instead of two. Same two

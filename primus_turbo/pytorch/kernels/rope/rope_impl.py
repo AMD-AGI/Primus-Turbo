@@ -13,12 +13,11 @@ from typing import Sequence, Tuple
 import torch
 
 from primus_turbo.flydsl.rope.rope_kernel import (
+    ROPE_HEAD_DIM,
     ROPE_ROW_GROUP,
     flydsl_qkv_rope_backward,
     flydsl_qkv_rope_forward,
 )
-
-_ROPE_HEAD_DIM = 128
 
 
 def rope_shape_error(qkv, q_freqs, k_freqs, qkv_split_arg_list) -> str | None:
@@ -36,12 +35,12 @@ def rope_shape_error(qkv, q_freqs, k_freqs, qkv_split_arg_list) -> str | None:
     if len(qkv_split_arg_list) != 3:
         return f"qkv_split_arg_list must be [q, k, v], got {list(qkv_split_arg_list)}"
     q_size, k_size, v_size = qkv_split_arg_list
-    if k_size != _ROPE_HEAD_DIM or v_size != _ROPE_HEAD_DIM or q_size % _ROPE_HEAD_DIM:
-        return f"k and v must be {_ROPE_HEAD_DIM} and q a multiple of it, got {list(qkv_split_arg_list)}"
+    if k_size != ROPE_HEAD_DIM or v_size != ROPE_HEAD_DIM or q_size % ROPE_HEAD_DIM:
+        return f"k and v must be {ROPE_HEAD_DIM} and q a multiple of it, got {list(qkv_split_arg_list)}"
     if qkv.shape[-1] != q_size + k_size + v_size:
         return f"qkv last dim {qkv.shape[-1]} != q+k+v {q_size + k_size + v_size}"
-    if q_freqs.shape[-1] != _ROPE_HEAD_DIM or k_freqs.shape[-1] != _ROPE_HEAD_DIM:
-        return f"freqs last dim must be {_ROPE_HEAD_DIM}"
+    if q_freqs.shape[-1] != ROPE_HEAD_DIM or k_freqs.shape[-1] != ROPE_HEAD_DIM:
+        return f"freqs last dim must be {ROPE_HEAD_DIM}"
     # No per-row predicate, and the descriptors span all of memory: a partial last
     # row group would read and write out of bounds rather than be clamped.
     rows = qkv.shape[0] * qkv.shape[1]

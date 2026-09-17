@@ -7,10 +7,9 @@
 import pytest
 import torch
 
+from primus_turbo.flydsl.rope.rope_kernel import ROPE_HEAD_DIM as _D
 from primus_turbo.pytorch.ops.rope import fused_qkv_rope, fused_qkv_rope_supported
 from tests.pytorch.test_utils import get_tolerances
-
-_D = 128  # the head width the kernels are built for
 
 
 def _rope_ref(x: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
