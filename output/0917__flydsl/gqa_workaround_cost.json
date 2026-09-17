@@ -1,0 +1,23 @@
+{
+  "q(no reduce)": {
+    "median_ms": 9.1951,
+    "best_ms": 9.1014,
+    "sd_pct": 28.96,
+    "n": 15
+  },
+  "q+reduce(shipped)": {
+    "median_ms": 9.6774,
+    "best_ms": 9.5837,
+    "sd_pct": 0.75,
+    "n": 15
+  },
+  "deltas_ms": {
+    "reduce": 0.4823
+  },
+  "scratch": {
+    "needed_gib": 0.125,
+    "held_gib": 0.5,
+    "excess_gib": 0.375,
+    "peak_delta_gib": 1.2539
+  }
+}
