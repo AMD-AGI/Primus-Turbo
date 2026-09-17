@@ -1,0 +1,23 @@
+[
+  {
+    "label": "toy b1 s256 h2",
+    "build_s": 0.275,
+    "isfinite": "512/512",
+    "full_coverage": true,
+    "sqnr_db": 159.24
+  },
+  {
+    "label": "prod b4 s8192 h32",
+    "build_s": 0.001,
+    "isfinite": "1048576/1048576",
+    "full_coverage": true,
+    "sqnr_db": 156.49
+  },
+  {
+    "label": "prod (cached)",
+    "build_s": 0.0,
+    "isfinite": "1048576/1048576",
+    "full_coverage": true,
+    "sqnr_db": 156.49
+  }
+]
