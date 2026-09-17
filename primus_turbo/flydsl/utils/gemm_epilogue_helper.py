@@ -2206,3 +2206,110 @@ class StoreCSwiGLUQuantMX(StoreCSwiGLU):
             col_row_limit=col_row_limit,
             row_gap=row_gap,
         )
+
+###############################################################################
+# FlyDSL RoPE shim retry hook (te-exit harvest 20260914_113401, r4/r9).
+# Opt-in: PRIMUS_TURBO_FLYDSL_ROPE=1. Default off. Not StoreC / H2-PERM / vec8.
+###############################################################################
+import os
+import sys
+
+_ROPE_SHIM_ENV = "PRIMUS_TURBO_FLYDSL_ROPE"
+_ROPE_SHIM_TARGET_MODULE = "primus_turbo.flydsl.gemm.gemm_mxfp4_kernel"
+
+
+def _rope_shim_patch_classes(mod):
+    """Arm maybe_install_rope_shim() on every GEMM, including warm FlyDSL cache.
+
+    Trigger A wraps gemm_mxfp4_flydsl_kernel (always fires). Trigger B wraps
+    StoreCPlain.__init__ (cold-cache only). Production torchrun hits a warm
+    cache, so A is the load-bearing path.
+    """
+    if getattr(mod, "_rope_shim_hook_patched", False):
+        return
+
+    from primus_turbo.flydsl.rope.rope_ops import maybe_install_rope_shim
+
+    orig_gemm = getattr(mod, "gemm_mxfp4_flydsl_kernel", None)
+    if orig_gemm is not None:
+
+        def _gemm_with_shim_retry(*args, **kwargs):
+            maybe_install_rope_shim()
+            return orig_gemm(*args, **kwargs)
+
+        _gemm_with_shim_retry._primus_turbo_orig = orig_gemm
+        mod.gemm_mxfp4_flydsl_kernel = _gemm_with_shim_retry
+
+    store_c_plain = getattr(mod, "StoreCPlain", None)
+    if store_c_plain is not None:
+        orig_init = store_c_plain.__init__
+
+        def _init(self, *args, **kwargs):
+            orig_init(self, *args, **kwargs)
+            maybe_install_rope_shim()
+
+        store_c_plain.__init__ = _init
+
+    if orig_gemm is not None or store_c_plain is not None:
+        mod._rope_shim_hook_patched = True
+
+
+def install_rope_shim_retry_hook():
+    """sys.monitoring PY_RETURN on gemm_mxfp4_kernel import. Never raises."""
+    try:
+        monitoring = getattr(sys, "monitoring", None)
+        if monitoring is None:
+            return
+
+        frame = sys._getframe(1)
+        target = None
+        for _ in range(64):
+            if frame is None:
+                break
+            if frame.f_globals.get("__name__") == _ROPE_SHIM_TARGET_MODULE:
+                target = frame
+                break
+            frame = frame.f_back
+        if target is None:
+            return
+        target_code = target.f_code
+        target_module_name = _ROPE_SHIM_TARGET_MODULE
+
+        tool_id = None
+        for cand in (4, 5, 3, 0, 1, 2):
+            try:
+                monitoring.use_tool_id(cand, "primus-turbo-rope-shim-retry")
+                tool_id = cand
+                break
+            except ValueError:
+                continue
+        if tool_id is None:
+            return
+
+        def _cleanup():
+            try:
+                monitoring.set_local_events(tool_id, target_code, 0)
+                monitoring.register_callback(tool_id, monitoring.events.PY_RETURN, None)
+                monitoring.free_tool_id(tool_id)
+            except Exception:
+                pass
+
+        def _on_return(code, instr_offset, retval):
+            if code is target_code:
+                _cleanup()
+                try:
+                    mod = sys.modules.get(target_module_name)
+                    if mod is not None:
+                        _rope_shim_patch_classes(mod)
+                except Exception:
+                    pass
+            return monitoring.DISABLE
+
+        monitoring.register_callback(tool_id, monitoring.events.PY_RETURN, _on_return)
+        monitoring.set_local_events(tool_id, target_code, monitoring.events.PY_RETURN)
+    except Exception:
+        pass
+
+
+if os.environ.get(_ROPE_SHIM_ENV, "0") == "1":
+    install_rope_shim_retry_hook()
