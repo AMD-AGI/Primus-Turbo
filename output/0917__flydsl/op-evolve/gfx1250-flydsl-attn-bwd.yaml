@@ -1,0 +1,147 @@
+# ==============================================================================
+# READ jobs/gfx1250-flydsl-attn-bwd.HINTS.md FIRST. It carries the arch facts, the
+# traps this box has actually sprung, and the two findings the PREVIOUS op-evolve job
+# on this hardware discovered and then lost to a bookkeeping rule.
+#
+# WHAT IS DIFFERENT ABOUT THIS JOB
+#
+# Every other FlyDSL job in this directory optimises a heavily tuned production kernel
+# against itself and hunts for 20%. This one is the opposite: `op/baseline/` is a
+# CORRECT but deliberately unoptimised kernel written on 2026-09-17, and the gap to
+# `op/beat/` is about **93x**. The search space is untouched.
+#
+# That matters because the previous job on this box (gfx1250-attn-llama31-8b-bwd,
+# 2026-09-14) stalled after one accepted round for the opposite reason: its round 1
+# mined the launch-config axis dry, and rounds 2-4 re-searched the same space. Do not
+# expect that here, and do not confine the editable surface to launch configuration.
+#
+# ------------------------------------------------------------------- PROVENANCE --
+#
+# The baseline is NOT vendored from Primus-Turbo main. It is new code, written and
+# validated against torch this week, living at
+#
+#     Primus-Turbo/output/0917__flydsl/kernels/
+#         odo_gfx1250.py        delta = rowsum(dO*O)          159.24 / 156.49 dB
+#         dkdv_loop_gfx1250.py  dV, dK, runtime q loop, causal  141.9 / 141.0 dB
+#         dq_gfx1250.py         dQ = dS . K                    144.90 dB
+#
+# Setup copies those three into `op/baseline/` and wires them behind one callable with
+# the signature in `op.reference.api`. Every one passed on its first run, each with
+# NaN-prefilled outputs and full isfinite coverage checked before SQNR.
+#
+# ⚠ THE BASELINE IMPORTS AITER AND TORCH ONLY -- NEVER primus_turbo.
+# flydsl 0.3.2 is required (0.2.4 cannot build aiter's gfx1250 kernels) and 0.3.2
+# removes `flydsl.expr.buffer_ops`, which primus_turbo's own FlyDSL tree imports
+# unconditionally. Importing primus_turbo under 0.3.2 raises. Install 0.3.2 with
+# `pip install --target /tmp/flydsl032` and prepend to sys.path; do NOT touch the
+# image's site-packages, whose 0.2.4 other things depend on. Setup must print
+# `flydsl.__file__` and assert it resolves to the 0.3.2 copy.
+#
+# ⚠ ONE GPU. `gpu_pool` is empty, so deep rounds cannot parallelise their analyses and
+# will be slow. The schedule below is weighted toward fast rounds for that reason.
+# While this job holds the card, nothing else may use it.
+# ==============================================================================
+
+job:
+  name: gfx1250-flydsl-attn-bwd
+  description: >
+    A first-party FlyDSL flash-attention BACKWARD for gfx1250, written 2026-09-17,
+    correct and unoptimised. Three kernels: odo (delta), dkdv (dV and dK in one pass),
+    and dq. bf16, head dim 128, causal bottom-right, BSHD. The anchor is aiter's
+    prebuilt gfx1250 ASM backward, which does the production shape in 10.160 ms
+    (~540 TFLOP/s useful at this card's 1100 MHz VR-throttled clock) against the
+    baseline's ~5.8 TFLOP/s.
+
+    The motivation is NOT that FlyDSL is expected to be faster. A like-for-like forward
+    comparison on this card measured aiter's FlyDSL forward 1.51x SLOWER than its own
+    prebuilt ASM forward, with both sides mature -- that is the best available estimate
+    of what these gfx1250 FlyDSL idioms are worth, and parity is the realistic ceiling
+    for the backward too. What a source-level backward buys instead is: gfx1250 has NO
+    varlen ASM backward at all (an existence gap, not a speed one); the ASM backward
+    carries a GQA out-of-bounds write worked around with 1.254 GiB of peak scratch and
+    a host reduction costing 5.2% of the backward; and gfx1250 ships 6 backward .co
+    against gfx950's 124.
+
+    So the job's real question is whether an optimised FlyDSL backward can REACH the
+    ASM backward, not beat it by a margin. A well-measured refutation is a result, and
+    the operator would rather have it in ten rounds than forty.
+
+agent:
+  account:
+    anthropic: ~/.op_evolve_anthropic
+    openai: ~/.op_evolve_openai       # [user] symlink to the anthropic file: it already
+                                      # defines OPENAI_BASE_URL and OPENAI_API_KEY.
+                                      # Set reviewer: null instead if single-SDK is wanted.
+  roles:
+    setup:    {sdk: claude, model: claude-opus-5, effort: xhigh}
+    profiler: {sdk: claude, model: claude-opus-5, effort: xhigh}
+    planner:  {sdk: claude, model: claude-opus-5, effort: max}
+    reviewer: {sdk: codex,  model: gpt-5.6-sol,   effort: xhigh}
+
+op:
+  type: attention
+  config:
+    causal: bottom-right
+    sliding_window: -1
+    sparsity: dense
+    q_head_dim: 128
+    kv_head_dim: 128
+    heads_q_per_kv: 4              # Llama-3.1-8B. NOTE the ASM anchor's GQA bug is here.
+    format: bshd
+    direction: [bwd]
+    sink: none
+    softmax_scale: head_dim ** -0.5
+    determinism: >
+      The baseline is atomic-free by construction: every output element is written
+      exactly once. Keep that -- it is one of the reasons to have a source-level
+      backward at all, and 200-run bitwise determinism is a cheap gate on it.
+    dtype: {qkv: bf16, out: bf16, qk_acc: fp32, softmax: fp32, pv_acc: fp32, lse: fp32}
+  reference:
+    impl: >
+      Plain torch, written by setup, not copied: s = q@k.T*scale; causal mask; lse;
+      p = exp(s-lse); o = p@v; delta = rowsum(do*o); ds = p*(do@v.T - delta)*scale;
+      dq = ds@k; dk = ds.T@q; dv = p.T@do. Chunk over (batch, head) and query blocks --
+      a dense [4,32,8192,8192] fp32 score tensor is 34 GB.
+    logic: >
+      Grouped-query flash attention backward, causal bottom-right, bf16, no sink, no
+      sliding window, no dropout. Consumes o and lse from the forward and returns
+      dq, dk, dv.
+    api: >
+      flydsl_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True)
+      -> (dq, dk, dv).  q/k/v/o/do are [b, s, h, d]; lse is [b, hq, sq] fp32 NATURAL
+      log (measured: aiter's gfx1250 forward emits natural log, ratio 1.0000, 81.85 dB).
+  precision_sqnr_db: 50
+  shape:
+    mode: sweep
+    shapes:
+      - {batch: 1, seqlen_q: 1024, seqlen_kv: 1024, heads_q: 8,  heads_kv: 2, head_dim: 128, note: fast-iteration}
+      - {batch: 1, seqlen_q: 4096, seqlen_kv: 4096, heads_q: 32, heads_kv: 8, head_dim: 128, note: quarter-FLOP proxy}
+      - {batch: 4, seqlen_q: 8192, seqlen_kv: 8192, heads_q: 32, heads_kv: 8, head_dim: 128, note: production}
+  target:
+    beat: "aiter prebuilt gfx1250 ASM backward via tools/gfx1250/asm_bwd_launcher.py, dkdv_heads=q plus the host reduction -- must be beaten by 0%"
+    tflops: null            # MUST stay null, or _margin() returns None and the
+    roofline_pct: null      # relative gate is silently disabled.
+  backend: [flydsl]
+
+evolve:
+  max_rounds: 40            # [user] failed rounds count against this
+  max_timeout: 48h
+  schedule:
+    fast_rounds: 12         # single card: deep rounds cannot parallelise, so front-load
+    fast_per_deep: 5
+
+runtime:
+  runner:
+    type: docker
+    docker:
+      image: null
+      container: fa-repro           # EXISTING container; the runner attaches, never
+                                    # recreates. flydsl 0.3.2 is at /tmp/flydsl032.
+      options: []
+  sudo: false
+  gpu_arch: gfx1250
+  gpu_id: 0
+  gpu_pool: []                      # one card on this host. Not a placeholder.
+
+review:
+  auto_approve_after: 10m           # single operator, often away; nothing may block on them
