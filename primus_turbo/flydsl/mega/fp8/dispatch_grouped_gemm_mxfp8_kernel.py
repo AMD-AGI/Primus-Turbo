@@ -60,8 +60,8 @@ from primus_turbo.flydsl.mega.fp8.prims import (
 )
 from primus_turbo.flydsl.mega.fp8.quant import quantize_rowwise_mxfp8_flydsl
 from primus_turbo.flydsl.mega.fp8.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
+from primus_turbo.flydsl.mega.fp8.lds_repack import _emit_lds_repack
 from primus_turbo.flydsl.utils.gemm_helper import (
-    _emit_lds_repack,
     emit_for,
     emit_if_then,
     make_value_attrs,
