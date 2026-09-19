@@ -795,7 +795,15 @@ class StoreCBf16Accum(StoreCBf16):
     before the bf16 cast so the accumulate rounds exactly once (cf. ``StoreCPerTensor._accum``)."""
 
     def store_band16(
-        self, c_frags, base_row, base_col, col_step, n_tiles_a, n_tiles_b, row_bound, mask_n=False,
+        self,
+        c_frags,
+        base_row,
+        base_col,
+        col_step,
+        n_tiles_a,
+        n_tiles_b,
+        row_bound,
+        mask_n=False,
         col_tile=16,
     ):
         rsrc = make_row_band_resource(self.c_base, base_row, row_bound, self.c_cols, 2)
@@ -1069,7 +1077,9 @@ def dense_bf16_chunked_tile(
             # this unconditional would blow the VGPR budget for no live use.
             if not need:
                 return []
-            return [fx.make_rmem_tensor(fx.make_layout(mfma.acc_len, 1), fx.Float32) for _ in range(n_a16 * n_b16)]
+            return [
+                fx.make_rmem_tensor(fx.make_layout(mfma.acc_len, 1), fx.Float32) for _ in range(n_a16 * n_b16)
+            ]
 
         acc = [_acc_group(True), _acc_group(not half_n), _acc_group(True), _acc_group(not half_n)]
         for quad in acc:
@@ -1121,9 +1131,7 @@ def dense_bf16_chunked_tile(
         )
         emit_if_then(
             (block_n + 1) * BLOCK_N > c_n,
-            lambda: _run(
-                2, 2, wave_id // 2, wave_id % 2, True, ceildiv(n_tail, 64), n_tail % 32 != 0, 2
-            ),
+            lambda: _run(2, 2, wave_id // 2, wave_id % 2, True, ceildiv(n_tail, 64), n_tail % 32 != 0, 2),
         )
 
 
@@ -1139,17 +1147,13 @@ def _dense_a_operand(A, block_m, a_trans, a_tile_elems, a_chunk_bytes, a_total_b
         def _a_src(chunk_idx):
             off = _i64(chunk_idx) * fx.Int64(a_chunk_bytes)
             return fx.logical_divide(
-                make_bf16_buffer_tensor_rebased(
-                    A, fx.BFloat16.ir_type, off, fx.Int64(a_total_bytes) - off
-                ),
+                make_bf16_buffer_tensor_rebased(A, fx.BFloat16.ir_type, off, fx.Int64(a_total_bytes) - off),
                 fx.make_layout(1, 1),
             )
 
         return A, _a_src
     a_base = fx.Int64(_ptrtoint(_get_iter(A)))
-    tile = make_bf16_fp16_tile_tensor(
-        a_base, _i64(block_m) * fx.Int64(a_tile_elems * 2), a_tile_elems
-    )
+    tile = make_bf16_fp16_tile_tensor(a_base, _i64(block_m) * fx.Int64(a_tile_elems * 2), a_tile_elems)
     return tile, None
 
 
@@ -1191,9 +1195,7 @@ def _compile_dense_bf16_nn_tn(
             block_m, block_n = group_m_tile_decode(tile, N_BLOCKS_M, N_BLOCKS_N, GROUP_M)
             # Module-level so the layout fork stays a Python branch: a nested def inside the
             # kernel is AST-rewritten, and a value defined in an scf.if does not escape it.
-            a_arg, a_src = _dense_a_operand(
-                A, block_m, A_TRANS, A_TILE_ELEMS, A_CHUNK_BYTES, A_TOTAL_BYTES
-            )
+            a_arg, a_src = _dense_a_operand(A, block_m, A_TRANS, A_TILE_ELEMS, A_CHUNK_BYTES, A_TOTAL_BYTES)
             dense_bf16_chunked_tile(
                 a_arg,
                 B,
@@ -1263,12 +1265,8 @@ def _compile_dense_bf16_nt(
             c_base = fx.Int64(_ptrtoint(_get_iter(C)))
             # C is up to 8.4 GB here; a single SRD only reaches 4 GB, so the row band is
             # rebased in int64 per tile and the tile then addresses it with block_m = 0.
-            a_tile = make_bf16_fp16_tile_tensor(
-                a_base, _i64(block_m) * fx.Int64(A_TILE_BYTES), BLOCK_M * K
-            )
-            c_tile = make_bf16_fp16_tile_tensor(
-                c_base, _i64(block_m) * fx.Int64(C_TILE_BYTES), BLOCK_M * N
-            )
+            a_tile = make_bf16_fp16_tile_tensor(a_base, _i64(block_m) * fx.Int64(A_TILE_BYTES), BLOCK_M * K)
+            c_tile = make_bf16_fp16_tile_tensor(c_base, _i64(block_m) * fx.Int64(C_TILE_BYTES), BLOCK_M * N)
             gemm_bf16_nt_tile(
                 a_tile,
                 B,
@@ -1318,8 +1316,14 @@ _DENSE_BF16_CFG = {
     # the single-region B buffers already use (320/8)*chunk_stride*2 bytes each (measured
     # group_segment_fixed_size below), and 1152 overflows the 163840 B LDS budget here.
     "tn": dict(
-        BLOCK_M=256, BLOCK_N=320, GROUP_M=1, num_xcd=4, waves_per_eu=2, agpr_alloc=0,
-        lds_chunk_stride=1024, single_n=True,
+        BLOCK_M=256,
+        BLOCK_N=320,
+        GROUP_M=1,
+        num_xcd=4,
+        waves_per_eu=2,
+        agpr_alloc=0,
+        lds_chunk_stride=1024,
+        single_n=True,
     ),
 }
 

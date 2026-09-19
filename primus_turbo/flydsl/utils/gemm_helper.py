@@ -2505,7 +2505,15 @@ class StoreCBf16:
                     )
 
     def store_band16(
-        self, c_frags, base_row, base_col, col_step, n_tiles_a, n_tiles_b, row_bound, mask_n=False,
+        self,
+        c_frags,
+        base_row,
+        base_col,
+        col_step,
+        n_tiles_a,
+        n_tiles_b,
+        row_bound,
+        mask_n=False,
         col_tile=16,
     ):
         """Every accumulator quadrant sharing a row run, stored through one row-band SRD rather
