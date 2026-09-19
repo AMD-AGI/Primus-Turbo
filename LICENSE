@@ -86,9 +86,9 @@ Primus-Turbo uses or references the following third-party projects:
    - Repository: https://github.com/NVIDIA/Megatron-LM.git
    - Note: the following files carry NVIDIA attribution and remain licensed under
      the 3-clause BSD license rather than the MIT license above:
-       primus_turbo/pytorch/ops/moe/permutation.py
+       primus_turbo/pytorch/kernels/moe/moe_permute_impl.py
          <- megatron/core/transformer/moe/moe_utils.py
-       primus_turbo/pytorch/ops/moe/indices_converter.py
+       primus_turbo/pytorch/kernels/moe/fused_moe_indices_converter_impl.py
          <- megatron/core/fusions/fused_indices_converter.py
        primus_turbo/triton/moe/multihot_to_indices.py
          <- megatron/core/fusions/fused_indices_converter.py

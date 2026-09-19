@@ -51,7 +51,10 @@ def _row_id_map_pass_1_kernel(
         mask=offset < num_tokens,
     )
     n_tokens_per_block = tl.sum(expert_token_mask)
-    tl.store(workspace_ptr + pid_m * tl.cdiv(num_tokens, BLOCK_SIZE) + pid_n, n_tokens_per_block)
+    tl.store(
+        workspace_ptr + pid_m * tl.cdiv(num_tokens, BLOCK_SIZE) + pid_n,
+        n_tokens_per_block,
+    )
 
 
 @triton.jit
@@ -465,7 +468,11 @@ def _unpermute_kernel(
             unpermuted_prob_off = (
                 pid_t * stride_unpermuted_probs_token + stride_unpermuted_probs_expert * map_load_off
             )
-            tl.store(unpermuted_probs_ptr + unpermuted_prob_off, 0.0, mask=map_load_off < num_experts)
+            tl.store(
+                unpermuted_probs_ptr + unpermuted_prob_off,
+                0.0,
+                mask=map_load_off < num_experts,
+            )
     accumulator = tl.zeros((BLOCK_SIZE,), dtype=compute_type)
     n_routed = tl.load(
         row_id_map_ptr + pid_t * stride_row_id_map_token + num_experts * 2 * stride_row_id_map_expert
@@ -624,7 +631,11 @@ def _unpermute_bwd_with_merging_probs_kernel(
     token_probs_grad_off = (
         pid * stride_merging_probs_grad_token + stride_merging_probs_grad_expert * map_load_off
     )
-    tl.store(merging_probs_grad_ptr + token_probs_grad_off, 0.0, mask=map_load_off < num_experts)
+    tl.store(
+        merging_probs_grad_ptr + token_probs_grad_off,
+        0.0,
+        mask=map_load_off < num_experts,
+    )
     n_routed = tl.load(
         row_id_map_ptr + pid * stride_row_id_map_token + num_experts * 2 * stride_row_id_map_expert
     )
@@ -753,7 +764,9 @@ def _make_chunk_sort_map_kernel(
 
     # get chunk idx of the current token in the input tensor
     input_split_sizes = tl.load(
-        split_sizes_ptr + load_split_offset, mask=load_split_offset < num_splits, other=0
+        split_sizes_ptr + load_split_offset,
+        mask=load_split_offset < num_splits,
+        other=0,
     ).to(tl.int32)
     input_split_sizes_cumsum = tl.cumsum(input_split_sizes)
     input_split_sizes_mask = tl.where(input_split_sizes_cumsum <= pid, 1, 0)
