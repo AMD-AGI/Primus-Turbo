@@ -2181,15 +2181,30 @@ class S2RLoaderTr16x32Bf16Wide(_S2RLoaderBf16):
 
     _SUB = (0, 2)
 
-    def __init__(self, wave_idx, n_tiles, chunk_stride=1024):
+    def __init__(self, wave_idx, n_tiles, chunk_stride=1024, n_waves=None):
         super().__init__(wave_idx, n_tiles)
-        assert n_tiles in (1, 2, 4), "a load must not straddle a 4-tile chunk group"
+        # Contiguous map (n_waves=None): this wave owns tiles [w*n_tiles, w*n_tiles+n_tiles).
+        # A tile's LDS offset then depends on w through the 4-tile chunk-group boundary, and
+        # ds_read_b64_tr_b16's offset: field must be a compile-time immediate, so only
+        # n_tiles in (1,2,4) keeps the run inside one group.
+        # Interleaved map (n_waves=W, W in {2,4}): this wave owns tiles w, w+W, w+2W, ...
+        # The per-tile delta grp(w+i*W) - grp(w) is then w-independent and constexpr for any
+        # n_tiles, which is what admits a BLOCK that is not a power of two.
+        assert n_waves is not None or n_tiles in (1, 2, 4), "a load must not straddle a 4-tile chunk group"
+        assert n_waves is None or n_waves in (2, 4), "interleaved map needs grp() to cancel w"
         self.chunk_stride = chunk_stride
+        self.n_waves = n_waves
+
+    def _grp(self, tile):
+        """LDS byte offset of one 16-wide tile: four tiles share a chunk group of eight
+        ``chunk_stride`` chunks, so crossing a group is a chunk-group jump, not 4*256."""
+        return (tile // 4) * 8 * self.chunk_stride + (tile % 4) * 256
 
     def load(self, lds_src):
         octet, mm = self.lane_id // 16, self.lane_id % 16
         s_in_pair, kb = octet // 2, octet % 2
-        base_tile = self.wave_idx * self.n_tiles
+        stride = self.n_waves or 1
+        base_tile = self.wave_idx * (1 if self.n_waves else self.n_tiles)
         sub0 = (base_tile // 4) * 8 + 2 * s_in_pair + kb
         row0 = (base_tile % 4) * 128 + mm * 4  # fold the quarter-chunk offset into the row
         step = 2 * (self._SUB[1] - self._SUB[0]) * self.chunk_stride
@@ -2197,7 +2212,8 @@ class S2RLoaderTr16x32Bf16Wide(_S2RLoaderBf16):
         ptr = _lds_ptr_from_i32(base_i32 + sub0 * self.chunk_stride + row0 * 2)
         offs = []
         for i in range_constexpr(self.n_tiles):
-            offs += [i * 256, i * 256 + 128, i * 256 + step, i * 256 + step + 128]
+            t = self._grp(i * stride) if self.n_waves else i * 256
+            offs += [t, t + 128, t + step, t + step + 128]
         r = _packed_ds_read_tr16(ptr, offs)
         return [
             [
@@ -2315,7 +2331,8 @@ class StoreCBf16:
                     )
 
     def store_band16(
-        self, c_frags, base_row, base_col, col_step, n_tiles_a, n_tiles_b, row_bound, mask_n=False
+        self, c_frags, base_row, base_col, col_step, n_tiles_a, n_tiles_b, row_bound, mask_n=False,
+        col_tile=16,
     ):
         """Every accumulator quadrant sharing a row run, stored through one row-band SRD rather
         than per-element index arithmetic: bounding the resource lets the hardware drop the ragged
@@ -2338,7 +2355,7 @@ class StoreCBf16:
                         buffer_store(
                             val,
                             rsrc,
-                            off + q * col_step * 2 + j * 32,
+                            off + q * col_step * 2 + j * col_tile * 2,
                             mask=col_ok[q],
                             cache_modifier=self.cache_modifier,
                             offset_is_bytes=True,
