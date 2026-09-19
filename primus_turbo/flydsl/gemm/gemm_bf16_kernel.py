@@ -1337,7 +1337,8 @@ def gemm_bf16_flydsl_kernel(
 ):
     """Dense bf16 GEMM ``op(a) @ op(b)`` for the GPT-OSS LM head (NT / NN / TN).
 
-    ``beta=1`` accumulates into ``out`` in place (bf16, one rounding); ``beta=0`` allocates."""
+    ``beta=1`` accumulates into ``out`` in place (bf16, one rounding), NN/TN only; ``beta=0``
+    allocates (or overwrites ``out`` when given) on any layout."""
     assert a.dtype == torch.bfloat16 and b.dtype == torch.bfloat16
     assert not trans_c, "trans_c is not part of the scored LM-head contract"
     assert beta in (0.0, 1.0), f"beta={beta} unsupported (0 or 1)"
@@ -1354,6 +1355,14 @@ def gemm_bf16_flydsl_kernel(
     else:
         raise ValueError("tt layout is not part of the LM-head contract")
     assert Kb == K, f"K mismatch: {K} vs {Kb}"
+    # `_compile_dense_bf16_nt` (gemm_bf16_nt_tile) has no accumulate store path -- only NN/TN
+    # route through `StoreCBf16Accum` (dense_bf16_chunked_tile's `beta_is_one` branch). Without
+    # this guard, beta=1.0 on the NT layout would silently overwrite `out` instead of
+    # accumulating, the same silent-wrong-result class of bug `resolve_accum_out` already
+    # guards against for `out=None`.
+    assert not (layout == "nt" and beta == 1.0), (
+        "beta=1.0 accumulation is not implemented for the NT launcher; only NN/TN support it"
+    )
 
     conf = dict(_DENSE_BF16_CFG[layout])
     conf.update(cfg)
