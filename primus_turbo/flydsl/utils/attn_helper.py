@@ -34,13 +34,21 @@ from primus_turbo.flydsl.utils.prims import LOG2E
 # Room a later key has above a tile's row max before it forces another rebase.
 REF_MARGIN = 96.0
 
+# Slack on the Cauchy-Schwarz logit bound: the fp32 norm reductions on both sides, plus the
+SCORE_BOUND_SLACK = 1.0 + 2.0**-6
+SCORE_BOUND_KV_CHUNKS = 8
+# Head dims the bound gate is armed for. Above it the kernel keeps the exact per-tile trigger
+SCORE_BOUND_HEAD_DIM_MAX = 64
+
 
 def _wave_any(cond):
+    """Wave-uniform "some lane satisfies cond", as one ballot and one compare."""
     mask = rocdl.ballot(fx.Int64.ir_type, as_mlir_value(cond))
     return ArithValue(fx.Int64(mask) != fx.Int64(0))
 
 
 def _if_wave(cond, vals, then_fn):
+    """Wave-uniform branch yielding ``vals``; the else arm passes them through."""
     from flydsl._mlir.dialects import scf
 
     _v = [as_mlir_value(v) for v in vals]
@@ -100,9 +108,7 @@ def _s_setprio(val):
 
 
 def _dualwave_sync_barrier():
-    rocdl.sched_barrier(0)
     rocdl.s_barrier()
-    rocdl.sched_barrier(0)
 
 
 def _s_nop(x):
@@ -249,41 +255,11 @@ def _packed_o_128_vec(traits, v_o, dc, g, lane_div_32, elem_dtype):
 
 def _anchor_v_o(traits, v_o):
     """Pin v_o accumulators at the current source position."""
-    acc_irs = [as_mlir_value(v_o[dc]) for dc in range_constexpr(traits.D_CHUNKS)]
-    ret_ty = ir.Type.parse(f"!llvm.struct<({', '.join(['vector<16xf32>'] * traits.D_CHUNKS)})>")
-    constraints = ",".join(["=v"] * traits.D_CHUNKS + [str(i) for i in range(traits.D_CHUNKS)])
-    ret = llvm.inline_asm(
-        ret_ty,
-        acc_irs,
-        "",
-        constraints,
-        has_side_effects=True,
-    )
-    return [llvm.extractvalue(acc_irs[dc].type, ret, [dc]) for dc in range_constexpr(traits.D_CHUNKS)]
-
-
-def _anchor_v_p(traits, v_p, elem_dtype):
-    p_lo, p_hi = v_p
-    p_lo_all = _concat_vectors(p_lo[0], p_lo[1])
-    p_hi_all = _concat_vectors(p_hi[0], p_hi[1])
-    p_all = _concat_vectors(p_lo_all, p_hi_all)
-    p_all_ir = as_mlir_value(p_all)
-    p_all_anchored = llvm.inline_asm(
-        p_all_ir.type,
-        [p_all_ir],
-        "",
-        "=v,0",
-        has_side_effects=True,
-    )
-    p_vec = Vec(p_all_anchored, (traits.PV_K_STEPS * 2 * 8,), elem_dtype)
-    anchored_lo = []
-    anchored_hi = []
-    for pks in range_constexpr(traits.PV_K_STEPS):
-        lo_base = pks * 8
-        hi_base = traits.PV_K_STEPS * 8 + pks * 8
-        anchored_lo.append(p_vec.shuffle(p_vec, [lo_base + i for i in range(8)]).ir_value())
-        anchored_hi.append(p_vec.shuffle(p_vec, [hi_base + i for i in range(8)]).ir_value())
-    return anchored_lo, anchored_hi
+    irs = [as_mlir_value(v_o[dc]) for dc in range_constexpr(traits.D_CHUNKS)]
+    ret_ty = ir.Type.parse(f"!llvm.struct<({', '.join(['vector<16xf32>'] * len(irs))})>")
+    constraints = ",".join(["=v"] * len(irs) + [str(i) for i in range(len(irs))])
+    ret = llvm.inline_asm(ret_ty, irs, "", constraints, has_side_effects=True)
+    return [llvm.extractvalue(irs[i].type, ret, [i]) for i in range(len(irs))]
 
 
 def _score_lists_to_vecs(v_s_lists):
@@ -302,6 +278,18 @@ def _reduce_score_pair(v_s, initial, reducer, fm_fast):
     for r in range_constexpr(16):
         acc = reducer(acc, s_hi[r], fm_fast)
     return acc
+
+
+def _reduce_vec_tree(vec, width, reducer, fm_fast):
+    """Fold a power-of-two vector down to one lane-local scalar, halving the width each step so the reduction is log-depth and every step is one packed op."""
+    cur = Vec(vec)
+    while width > 1:
+        half = width // 2
+        lo = Vec(cur.shuffle(cur, [i for i in range(half)]).ir_value())
+        hi = Vec(cur.shuffle(cur, [half + i for i in range(half)]).ir_value())
+        cur = Vec(reducer(lo, hi, fm_fast))
+        width = half
+    return cur[0]
 
 
 def _reduce_score_tree(v_s, reducer, fm_fast):
@@ -580,9 +568,14 @@ class DualwaveKernelContext:
         head_dim_runtime=None,
         block_table_stride=None,
         SINK=None,
+        ScoreBound=None,
     ):
         self.traits = traits
         self.SINK = SINK
+        self.ScoreBound = ScoreBound
+        self.use_score_bound = ScoreBound is not None and traits.HEAD_DIM <= SCORE_BOUND_HEAD_DIM_MAX
+        self.bound_over_ref = None
+        self.q_norm_sq = None
         self.Q = Q
         self.K = K
         self.V = V
@@ -624,6 +617,7 @@ class DualwaveKernelContext:
         self.c_zero_f = fx.Float32(0.0)
         self.c_zero_v16f32 = Vec.filled(16, 0.0, fx.Float32)
         self.ref_neg = None
+        self.ref_seed_vec = None
         head_dim_f32 = fx.Float32(fx.Int32(head_dim_runtime))
         c_log2e_f = fx.Float32(LOG2E)
         self.c_sm_scale_log2e = fx.Float32(
@@ -954,22 +948,64 @@ class DualwaveKernelContext:
             as_mlir_value(q_all_f32),
             fastmath=self.fm_fast,
         )
+        if const_expr(self.use_score_bound):
+            n_half = traits.K_STEPS_QK * traits.MFMA_LANE_K
+            sq = _fmul(Vec(q_all_scaled_f32), Vec(q_all_scaled_f32), self.fm_fast)
+            acc = _reduce_vec_tree(sq, n_half, _fadd, self.fm_fast)
+            self.q_norm_sq = _lane_pair_reduce(acc, _fadd, self.fm_fast)
         q_all_scaled_bf16_op = llvm.FPTruncOp(v64bf16_type, q_all_scaled_f32)
         q_all_scaled_bf16_op.operation.attributes["fastmathFlags"] = fm_fast_attr
         q_all_scaled_bf16 = q_all_scaled_bf16_op.result
         return Vec(q_all_scaled_bf16, (traits.K_STEPS_QK * traits.MFMA_LANE_K,), self.elem_dtype)
 
+    def score_bound(self):
+        """Cauchy-Schwarz upper bound on every logit this lane's q row can ever produce."""
+        traits = self.traits
+        grp = self.kv_head_idx
+        if const_expr(traits.SBHD):
+            # SBHD K is [S, B, Hkv, D]: a row carries B*Hkv groups, batch-major.
+            grp = self.batch_idx * fx.Index(traits.NUM_HEADS_KV) + grp
+        n_chunks = SCORE_BOUND_KV_CHUNKS
+        rsrc = buffer_ops.create_buffer_resource(
+            self.ScoreBound,
+            max_size=False,
+            num_records_bytes=as_mlir_value((grp + fx.Index(1)) * fx.Index(n_chunks * 4)),
+        )
+        base = grp * fx.Index(n_chunks)
+        kn_sq_vec = None
+        for c in range_constexpr(0, n_chunks, 4):
+            part = buffer_ops.buffer_load(rsrc, fx.Int32(base + fx.Index(c)), vec_width=4, dtype=fx.Float32)
+            kn_sq_vec = part if kn_sq_vec is None else _fmax(Vec(kn_sq_vec), Vec(part), self.fm_fast)
+        kn_sq = _reduce_vec_tree(kn_sq_vec, 4, _fmax, self.fm_fast)
+        bound = fmath.sqrt(fx.Float32(_fmul(self.q_norm_sq, kn_sq, self.fm_fast)), fastmath=self.fm_fast)
+        return _fmul(fx.Float32(bound), fx.Float32(SCORE_BOUND_SLACK), self.fm_fast)
+
+    def floor_at_score_bound(self, row_max, bound):
+        """Floor the prologue maximum at -bound, which is a valid row maximum by the same inequality."""
+        return _fmax(row_max, _fsub(self.c_zero_f, bound, self.fm_fast), self.fm_fast)
+
+    def arm_score_bound(self, bound, ref):
+        """Latch, once, whether any row in this wave can outrun its reference."""
+        self.bound_over_ref = _wave_any(ArithValue(fx.Float32(bound) > fx.Float32(ref)))
+
     def score_acc_seed(self):
         """QK accumulates into C, so seeding C with -reference shifts the scores for free."""
         if self.ref_neg is None:
             return self.c_zero_v16f32
-        return Vec.from_elements([as_mlir_value(self.ref_neg)], fx.Float32).broadcast_to(16)
+        if self.ref_seed_vec is None:
+            self.ref_seed_vec = Vec.from_elements([as_mlir_value(self.ref_neg)], fx.Float32).broadcast_to(16)
+        return self.ref_seed_vec
+
+    def set_seed_vec(self, value):
+        """Adopt a loop-carried seed so the broadcast is not rebuilt every iteration."""
+        self.ref_seed_vec = Vec(as_mlir_value(value))
 
     def lift_ref(self, m_row):
         return _fadd(m_row, fx.Float32(REF_MARGIN), self.fm_fast)
 
     def set_ref(self, ref):
         self.ref_neg = _fsub(self.c_zero_f, ref, self.fm_fast)
+        self.ref_seed_vec = None
 
     def qk(self, v_k, q_all_scaled_bf16, v_s=None, ks_range=None):
         k_lo, k_hi = v_k
@@ -1206,29 +1242,44 @@ class DualwaveKernelContext:
             )
         return tuple(shifted)
 
-    def rebase_if_needed(self, ref, v_o, l_row, v_s):
-        """Raise the reference only for a tile that has outrun it, which is rare."""
+    def rebase_if_needed(self, ref, l_row, v_s, v_o, pending=None):
+        """Raise the reference only for a tile that has outrun it, which is rare.
+
+        With the Cauchy-Schwarz bound armed the trigger is loop-invariant, so the 32-score
+        max tree moves inside the guard and only runs for a row whose bound clears the
+        reference. Without it the tile's own maximum is the trigger and has to be reduced
+        on every tile to find out.
+
+        The accumulator correction this site owes is applied to whatever ``v_o`` holds when
+        the branch runs, so the caller decides how much of the P*V it covers. A trigger that
+        only resolves after the P*V has to place the branch there and correct its own site.
+        A loop-invariant trigger can instead run the branch before the P*V and hand the
+        correction to ``pending`` for the next site to pay, once its P*V has landed: that
+        keeps the P*V MFMAs and the exp2 chain they hide in one scheduling region and still
+        costs one branch per site, which only works because both sites test the same
+        wave-uniform value."""
         if isinstance(v_s[0], list):
             v_s = _score_lists_to_vecs(v_s)
-        m_lane = _reduce_score_tree(v_s, _fmax, self.fm_fast)
-        fired = _wave_any(ArithValue(fx.Float32(m_lane) > self.c_zero_f))
+        gated = self.bound_over_ref is not None
+        if const_expr(not gated):
+            m_lane_always = _reduce_score_tree(v_s, _fmax, self.fm_fast)
+            assert pending is None, "an exact trigger cannot pay another site's debt"
+            fired = _wave_any(ArithValue(fx.Float32(m_lane_always) > self.c_zero_f))
+        else:
+            fired = self.bound_over_ref
+        seed_in = self.score_acc_seed()
 
         def _then():
+            if const_expr(gated):
+                m_lane = _reduce_score_tree(v_s, _fmax, self.fm_fast)
+            else:
+                m_lane = m_lane_always
             m_tile = _lane_pair_reduce(m_lane, _fmax, self.fm_fast)
             if const_expr(self.traits.CAUSAL):
                 m_tile = self.floor_masked_max(m_tile)
             delta = _fmax(_fadd(m_tile, fx.Float32(REF_MARGIN), self.fm_fast), self.c_zero_f, self.fm_fast)
             r = fx.Float32(rocdl.exp2(T.f32, _fsub(self.c_zero_f, delta, self.fm_fast)))
-            out = [_fadd(ref, delta, self.fm_fast)]
-            out += [
-                _fmul(
-                    Vec(v_o[dc]),
-                    Vec.from_elements([as_mlir_value(r)], fx.Float32).broadcast_to(16),
-                    self.fm_fast,
-                )
-                for dc in range_constexpr(self.traits.D_CHUNKS)
-            ]
-            out.append(self.scale_l_by(l_row, r))
+            out = [_fadd(ref, delta, self.fm_fast), self.scale_l_by(l_row, r)]
             for half in v_s:
                 out.append(
                     Vec.from_elements(
@@ -1239,14 +1290,38 @@ class DualwaveKernelContext:
                         fx.Float32,
                     ).ir_value()
                 )
+            out.append(
+                Vec.from_elements(
+                    [as_mlir_value(_fsub(self.c_zero_f, out[0], self.fm_fast))], fx.Float32
+                ).broadcast_to(16)
+            )
+            out += self._scale_acc(v_o, r if pending is None else pending[1])
+            if const_expr(pending is not None):
+                out.append(r)
             return out
 
-        res = _if_wave(fired, [ref] + list(v_o) + [l_row] + list(v_s), _then)
-        nd = self.traits.D_CHUNKS
-        for dc in range_constexpr(nd):
-            v_o[dc] = res[1 + dc]
+        tail = list(v_o) + ([] if pending is None else [self.no_rescale()])
+        res = _if_wave(fired, [ref, l_row] + list(v_s) + [seed_in] + tail, _then)
         self.set_ref(res[0])
-        return res[0], res[1 + nd], (res[2 + nd], res[3 + nd])
+        self.set_seed_vec(res[4])
+        nd = self.traits.D_CHUNKS
+        v_o_out = list(res[5 : 5 + nd])
+        if const_expr(pending is None):
+            return res[0], res[1], (res[2], res[3]), v_o_out
+        return res[0], res[1], (res[2], res[3]), v_o_out, (fired, res[5 + nd])
+
+    def no_rescale(self):
+        """The neutral accumulator rescale a site hands on when the reference did not move."""
+        return as_mlir_value(fx.Float32(1.0))
+
+    def _scale_acc(self, v_o, rescale):
+        r_vec = Vec.from_elements([as_mlir_value(rescale)], fx.Float32).broadcast_to(16)
+        return [_fmul(Vec(v_o[dc]), r_vec, self.fm_fast) for dc in range_constexpr(self.traits.D_CHUNKS)]
+
+    def rebase_acc(self, v_o, pending):
+        """Apply a reference rise to the output accumulator, once the P*V measured against the old reference has been added to it."""
+        fired, rescale = pending
+        return list(_if_wave(fired, list(v_o), lambda: self._scale_acc(v_o, rescale)))
 
     def scale_l_by(self, l_row, rescale):
         """Apply a row-max correction to the running row sum, in whichever form it is held.
