@@ -45,6 +45,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     make_fp16_bf16_buffer_tensor,
     make_row_band_resource,
     make_value_attrs,
+    resolve_accum_out,
     wait_barrier,
     xcd_remap_pid,
 )
@@ -1356,10 +1357,11 @@ def gemm_bf16_flydsl_kernel(
 
     conf = dict(_DENSE_BF16_CFG[layout])
     conf.update(cfg)
-    if out is None:
-        out = torch.empty((M, N), device=a.device, dtype=out_dtype)
-    else:
-        assert out.shape == (M, N) and out.dtype == out_dtype and out.is_contiguous()
+    # beta=1.0 with out=None would otherwise accumulate the GEMM result into torch.empty's
+    # uninitialized memory (silently, no error) instead of failing loudly like every other
+    # accumulate path in this file; resolve_accum_out is the shared beta=1 guard (see its
+    # docstring) and asserts beta==0.0 before allocating.
+    out = resolve_accum_out(out, beta, (M, N), a.device, out_dtype)
     args = (
         _ptr_only_view(a),
         flyc.from_torch_tensor(b.reshape(-1)),
