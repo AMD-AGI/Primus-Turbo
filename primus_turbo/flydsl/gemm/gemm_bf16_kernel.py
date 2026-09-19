@@ -1001,6 +1001,7 @@ def dense_bf16_chunked_tile(
     nt_vmcnt=3,
     lds_chunk_stride=1024,
     single_n=False,
+    c_cache_modifier=0,
 ):
     """One NN/TN output tile over a runtime K loop.  Geometry, swizzles, LDS layout and store
     are the fixed-K ``_gemm_bf16_nn_tn_tile_impl``'s; only the K loop differs.
@@ -1055,7 +1056,7 @@ def dense_bf16_chunked_tile(
         b_div, gl_off_b, N_LDS_STEPS_B, fx.BFloat16.ir_type, wave_id, chunk_stride=lds_chunk_stride
     )
     store_cls = StoreCBf16Accum if beta_is_one else StoreCBf16
-    store_c = store_cls(C, c_m, c_n, fx.BFloat16)
+    store_c = store_cls(C, c_m, c_n, fx.BFloat16, cache_modifier=c_cache_modifier)
 
     def _run(n_a16, n_b16, w_m, w_n, half_n, b_steps, mask_n, n_w_n=4):
         b_g2s.n_load_steps = b_steps
@@ -1174,6 +1175,7 @@ def _compile_dense_bf16_nn_tn(
     nt_vmcnt=3,
     lds_chunk_stride=1024,
     single_n=False,
+    c_cache_modifier=0,
 ):
     A_TRANS = layout == "tn"
     assert M % BLOCK_M == 0, "the NN/TN store has no ragged-M path"
@@ -1216,6 +1218,7 @@ def _compile_dense_bf16_nn_tn(
                 nt_vmcnt=nt_vmcnt,
                 lds_chunk_stride=lds_chunk_stride,
                 single_n=single_n,
+                c_cache_modifier=c_cache_modifier,
             )
 
         _do_tile(fx.block_idx.x)
@@ -1244,6 +1247,7 @@ def _compile_dense_bf16_nt(
     waves_per_eu=2,
     agpr_alloc=0,
     nt_vmcnt=3,
+    c_cache_modifier=0,
 ):
     assert M % BLOCK_M == 0, "A/C are rebased per M block; a ragged M needs the masked path"
     N_BLOCKS_M = M // BLOCK_M
@@ -1285,6 +1289,7 @@ def _compile_dense_bf16_nt(
                 nt_vmcnt=nt_vmcnt,
                 pair_n=N % 2 == 0,
                 n_tail=N % BLOCK_N,
+                c_cache_modifier=c_cache_modifier,
             )
 
         _do_tile(fx.block_idx.x)
@@ -1308,7 +1313,13 @@ _DENSE_BF16_CACHE: dict = {}
 # see the campaign notes for the sweep behind every value.
 _DENSE_BF16_CFG = {
     #        BLOCK_M BLOCK_N GROUP_M num_xcd waves_per_eu agpr_alloc
-    "nt": dict(BLOCK_M=256, BLOCK_N=256, GROUP_M=8, num_xcd=8, waves_per_eu=2, agpr_alloc=64),
+    # c_cache_modifier=2 is the streaming/SLC store hint (matches hipBLASLt's own NTC4 bit on
+    # this store instruction) -- measured a consistent small win on NT's C store across
+    # multiple independent sessions; NN's C store is a different width/pattern (2 B/lane vs
+    # NT's 4 B/lane) and measured net-negative here, so it stays off on NN.
+    "nt": dict(
+        BLOCK_M=256, BLOCK_N=256, GROUP_M=8, num_xcd=8, waves_per_eu=2, agpr_alloc=64, c_cache_modifier=2
+    ),
     "nn": dict(BLOCK_M=256, BLOCK_N=256, GROUP_M=1, num_xcd=8, waves_per_eu=2, agpr_alloc=64),
     # single_n=True: one N accumulator region spanning the whole (real) BLOCK_N=320 instead of
     # two 128-wide regions -- 2880 = 9*320 exactly (vs 2880 = 11*256 + 64 ragged), so this grid
