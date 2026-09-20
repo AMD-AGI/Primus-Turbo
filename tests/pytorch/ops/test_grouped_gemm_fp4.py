@@ -7,7 +7,7 @@
 import pytest
 import torch
 
-from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
+from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager, PrecisionType
 from primus_turbo.pytorch.core.low_precision import (
     MXFP4_BLOCK_SIZE,
     Float4QuantConfig,
@@ -429,7 +429,7 @@ def test_grouped_gemm_fp4_zero_group_lens(dtype, group_lens_values, N, K):
 # ----------------------------------------------------------------------------
 @pytest.mark.parametrize("dtype", DTYPE_VALUES)
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-def test_grouped_gemm_fp4_fused_grad_accum(dtype, balance):
+def test_grouped_gemm_fp4_fused_grad_accum(dtype, balance, request):
     """``fuse_bgrad_accum_pattern`` must leave ``main_grad`` holding previous + wgrad.
 
     FlyDSL is the only FP4 variable-K backend with the accumulate epilogue and its store
@@ -442,6 +442,15 @@ def test_grouped_gemm_fp4_fused_grad_accum(dtype, balance):
     seed = 42
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+    per_op_autotune = dtype == torch.bfloat16 and not balance
+    if per_op_autotune:
+        GlobalBackendManager.reset()
+        request.addfinalizer(GlobalBackendManager.reset)
+        GlobalBackendManager.set_grouped_gemm_backend(
+            precision=PrecisionType.FP4,
+            auto_tune=True,
+        )
 
     device = "cuda:0"
     B, M, N, K = 4, 256, 512, 256
@@ -489,6 +498,25 @@ def test_grouped_gemm_fp4_fused_grad_accum(dtype, balance):
     print(f"AGrad-SNR={a_grad_snr:.2f} dB  BGrad-SNR={b_grad_snr:.2f} dB")
     assert a_grad_snr > SNR_THRESHOLD, f"a_grad_snr={a_grad_snr:.2f} too low"
     assert b_grad_snr > SNR_THRESHOLD, f"b_grad_snr={b_grad_snr:.2f} too low"
+
+    if per_op_autotune:
+        # Re-run the accumulation key to cover the cache-hit path as well.
+        before_cache_hit = b_fused.main_grad.clone()
+        a_fused.grad = None
+        b_fused.grad = None
+        out_fused = grouped_gemm_fp4(
+            a_fused,
+            b_fused,
+            group_lens,
+            trans_b=True,
+            config=config,
+            fuse_bgrad_accum_pattern="megatron",
+        )
+        out_fused.backward(grad_out)
+        torch.cuda.synchronize()
+        cache_hit_delta = b_fused.main_grad.float() - before_cache_hit.float()
+        cache_hit_snr = compute_snr(b.grad.float(), cache_hit_delta)
+        assert cache_hit_snr > SNR_THRESHOLD, f"cache_hit_snr={cache_hit_snr:.2f} too low"
 
 
 # CUDA-graph capturability (forward). The forward uses no D2H sync, so it is

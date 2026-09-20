@@ -579,6 +579,8 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
         cls,
         default_backend_choice: BackendChoice,
         user_backend_choice: Optional[BackendChoice] = None,
+        *,
+        tuning_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> Any:
         # 1. User specified backend (env or code) - highest priority
@@ -604,7 +606,8 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
             or default_backend_choice.auto_tune
             or GlobalBackendManager.auto_tune_enabled()
         ) and not cls._is_graph_capturing():
-            backend_cls = cls.tune(**kwargs)
+            # Mutating ops can profile with scratch tensors while executing with ``kwargs``.
+            backend_cls = cls.tune(**(tuning_kwargs if tuning_kwargs is not None else kwargs))
             if backend_cls is not None:
                 return backend_cls.execute(**kwargs)
 

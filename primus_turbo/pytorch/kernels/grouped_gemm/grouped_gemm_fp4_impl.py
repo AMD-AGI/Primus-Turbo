@@ -586,16 +586,26 @@ def grouped_gemm_fp4_variable_k_accum_impl(
         out=out,
     )
 
-    # The tuner benchmarks a backend by launching it repeatedly, so letting it tune on
-    # the caller's buffer would accumulate the wgrad once per warmup and timing
-    # iteration.
-    if (
-        GlobalBackendManager.auto_tune_enabled()
-        and not GroupedGEMMFP4VariableKKernelDispatcher._is_graph_capturing()
-    ):
-        GroupedGEMMFP4VariableKKernelDispatcher.tune(**{**kwargs, "out": torch.zeros_like(out)})
+    # The tuner launches each candidate repeatedly. On the first accumulation-key
+    # lookup, tune against scratch so those profiling writes do not mutate ``out``.
+    user_selected_backend = user_backend_choice is not None and user_backend_choice.backend is not None
+    should_autotune = not user_selected_backend and (
+        (user_backend_choice is not None and user_backend_choice.auto_tune)
+        or default_backend_choice.auto_tune
+        or GlobalBackendManager.auto_tune_enabled()
+    )
+    tuning_kwargs = None
+    if should_autotune and not GroupedGEMMFP4VariableKKernelDispatcher._is_graph_capturing():
+        key = GroupedGEMMFP4VariableKKernelDispatcher.make_key(**kwargs)
+        if key not in GroupedGEMMFP4VariableKKernelDispatcher._cache:
+            tuning_kwargs = {**kwargs, "out": torch.zeros_like(out)}
 
-    GroupedGEMMFP4VariableKKernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
+    GroupedGEMMFP4VariableKKernelDispatcher.dispatch(
+        default_backend_choice,
+        user_backend_choice,
+        tuning_kwargs=tuning_kwargs,
+        **kwargs,
+    )
 
 
 @grouped_gemm_fp4_variable_k_accum_impl.register_fake
