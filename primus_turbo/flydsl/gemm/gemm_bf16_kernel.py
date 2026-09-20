@@ -1179,6 +1179,15 @@ def _compile_dense_bf16_nn_tn(
 ):
     A_TRANS = layout == "tn"
     assert M % BLOCK_M == 0, "the NN/TN store has no ragged-M path"
+    # single_n's store path always runs unmasked (dense_bf16_chunked_tile forces n_tail=0), so an
+    # actual ragged N here would store a masked-off wave's would-be-tail columns straight through
+    # -- past `c_cols` inside a still-valid row, i.e. into the next row's data, not a bounds error.
+    # This is a no-op assert for every currently shipped config (production tn: N=2880,
+    # BLOCK_N=320, 2880 % 320 == 0), so it changes no scored behavior; it only stops a future
+    # BLOCK_N/N combination from silently corrupting `C` instead of failing loudly.
+    assert not single_n or N % BLOCK_N == 0, (
+        f"single_n=True has no ragged-N tail path; N={N} must be a multiple of BLOCK_N={BLOCK_N}"
+    )
     N_BLOCKS_M = M // BLOCK_M
     N_BLOCKS_N = ceildiv(N, BLOCK_N)
     TOTAL = N_BLOCKS_M * N_BLOCKS_N
