@@ -852,19 +852,19 @@ def dense_mma_chunked_bf16(
     CHUNK,
     n_steps_a,
     n_steps_b,
-    wave_m,
+    wave_hi,
     nt_vmcnt,
     half_n=False,
     a_chunk_src=None,
 ):
     """Runtime-K twin of ``dense_mma_pipeline_bf16``'s main loop: same 4-buffer, 4-quadrant,
-    8-barrier body, but ``CHUNK`` k-iterations per ``emit_for`` trip instead of one fully
+    7-barrier body, but ``CHUNK`` k-iterations per ``emit_for`` trip instead of one fully
     unrolled ``range_constexpr``.  Accumulators live in rmem, not SSA, so nothing has to phi
     through the ``scf.for``.  ``a_chunk_src`` re-bases A's SRD once per chunk for an operand
     whose K span exceeds the 4 GB a single buffer descriptor reaches (wgrad's 8.4 GB A).
 
     The body's barrier COUNT is load-bearing, not just its placement: the prologue's
-    ``wave_m == 1`` barrier leaves the low wave half permanently one rendezvous ahead, so a
+    ``wave_hi == 1`` barrier leaves the low wave half permanently one rendezvous ahead, so a
     barrier added or dropped on one path re-pairs every later rendezvous between the halves.
     Keep this identical to ``dense_mma_pipeline_bf16``'s loop -- an extra barrier on the
     ``half_n`` path let A1's k+1 refill land while the other half was still reading it,
@@ -891,7 +891,7 @@ def dense_mma_chunked_bf16(
         b_g2s.load(lds.B_lds_cur_1, b1_off + 0 * b_k_step)
     a_g2s.load(lds.A_lds_cur_1, a1_off + 0 * a_k_step)
     # One tile per WG, so only the high half has to stop here; cf. dense_mma_pipeline_bf16.
-    if wave_m == 1:
+    if wave_hi == 1:
         rocdl.s_barrier()
     wait_barrier(n_steps_a + B1_STEPS)
 
