@@ -19,6 +19,12 @@ from primus_turbo.pytorch.core.low_precision import (
     float4_e2m1fn_x2,
 )
 from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
+from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp4_impl import (
+    GroupedGEMMFP4VariableKFlyDSLBackend,
+    GroupedGEMMFP4VariableKKernelDispatcher,
+    GroupedGEMMFP4VariableKTritonBackend,
+    grouped_gemm_fp4_variable_k_impl_meta,
+)
 from primus_turbo.pytorch.ops.grouped_gemm_fp4 import grouped_gemm_fp4
 from primus_turbo.pytorch.ops.quantization import grouped_quantize_fp4_with_trans
 from tests.pytorch.ref.gemm_ref import (
@@ -72,6 +78,89 @@ def _make_config():
         block_size=32,
         scale_dtype=ScaleDtype.E8M0,
     )
+
+
+def test_grouped_gemm_fp4_variable_k_dispatch_keys():
+    a = torch.empty((512, 2048), device="meta", dtype=float4_e2m1fn_x2)
+    group_lens = torch.empty((8,), device="meta", dtype=torch.int64)
+    common = dict(
+        a=a,
+        a_scales=None,
+        b_scales=None,
+        group_lens=group_lens,
+        group_offs=None,
+        trans_a=False,
+        trans_b=True,
+        trans_c=False,
+        out_dtype=torch.bfloat16,
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        num_cu=None,
+    )
+
+    key_n3072 = GroupedGEMMFP4VariableKKernelDispatcher.make_key(
+        b=torch.empty((3072, 2048), device="meta", dtype=float4_e2m1fn_x2), **common
+    )
+    key_n4096 = GroupedGEMMFP4VariableKKernelDispatcher.make_key(
+        b=torch.empty((4096, 2048), device="meta", dtype=float4_e2m1fn_x2), **common
+    )
+    accumulation_key = GroupedGEMMFP4VariableKKernelDispatcher.make_key(
+        b=torch.empty((3072, 2048), device="meta", dtype=float4_e2m1fn_x2),
+        inplace_add_to_out=True,
+        **common,
+    )
+
+    assert key_n3072[1:4] == (512, 3072, 2048)
+    assert key_n4096[1:4] == (512, 4096, 2048)
+    assert key_n3072 != key_n4096
+    assert key_n3072 != accumulation_key
+
+
+def test_grouped_gemm_fp4_variable_k_dispatch_contract(monkeypatch):
+    monkeypatch.setattr(
+        "primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp4_impl.is_gfx942", lambda: False
+    )
+    monkeypatch.setattr(
+        "primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp4_impl.is_gfx950", lambda: True
+    )
+
+    a = torch.empty((128, 256), device="meta", dtype=float4_e2m1fn_x2)
+    b = torch.empty((64, 256), device="meta", dtype=float4_e2m1fn_x2)
+    kwargs = dict(
+        a=a,
+        b=b,
+        a_scales=torch.empty((128, 16), device="meta", dtype=torch.uint8),
+        b_scales=torch.empty((64, 16), device="meta", dtype=torch.uint8),
+        group_lens=torch.empty((4,), device="meta", dtype=torch.int64),
+        group_offs=torch.empty((5,), device="meta", dtype=torch.int64),
+        trans_a=False,
+        trans_b=True,
+        trans_c=False,
+        out_dtype=torch.bfloat16,
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        num_cu=None,
+    )
+
+    for backend in (GroupedGEMMFP4VariableKTritonBackend, GroupedGEMMFP4VariableKFlyDSLBackend):
+        assert backend.can_handle(**kwargs)
+        assert not backend.can_handle(**{**kwargs, "trans_b": False})
+
+    out = grouped_gemm_fp4_variable_k_impl_meta(
+        **{
+            **kwargs,
+            "granularity": ScalingGranularity.MX_BLOCKWISE.value,
+            "default_backend": BackendType.FLYDSL.value,
+        }
+    )
+    assert out.shape == (4, 128, 64)
+    with pytest.raises(AssertionError, match="NT only"):
+        grouped_gemm_fp4_variable_k_impl_meta(
+            **{
+                **kwargs,
+                "trans_b": False,
+                "granularity": ScalingGranularity.MX_BLOCKWISE.value,
+                "default_backend": BackendType.FLYDSL.value,
+            }
+        )
 
 
 def _run(B, M, N, K, dtype, balance):
