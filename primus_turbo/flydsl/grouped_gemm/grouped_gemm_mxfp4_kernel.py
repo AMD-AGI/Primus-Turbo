@@ -95,8 +95,20 @@ _GMXFP4_SCHED_HINTS = {
 }
 
 
-_GMXFP4_SKEW_CUS = 256  # one skew rank per CU
-_GMXFP4_SKEW_STEP = 2  # s_sleep units (~64 clocks) per skew rank
+_GMXFP4_SKEW_CUS = 128  # skew ranks: ranks >= this get zero delay, not a capped one (round 7
+# round-robin sweep of {0,64,128,192,256}, 6 rounds x 5 configs interleaved in round-robin
+# order within one measurement pass (needed: a same-config check found ~2% drift between two
+# separate, non-interleaved probe.py sessions, i.e. session-level DVFS/thermal drift is large
+# enough to flip the ranking of nearby CUS values if each is measured in its own session) --
+# per-round-paired vs that round's own CUS=256 sample, n=6: CUS=128 has the best worst-case
+# (NT total improves in all 6/6 rounds, worst round -0.17%) and is statistically tied for best
+# mean NT total (-0.88%, vs 64's -0.89%, 0's -0.84%, 192's only -0.24%); uniquely among the
+# sweep it also improves dgrad_gate_up in 6/6 rounds (mean -1.12%, never positive) AND improves
+# dgrad_down on average (mean -0.22%, vs +0.34%/+0.45% regression at CUS=0/64) -- see r7/
+# goal.md P4 sub-lever 3 for the full per-round table and the drift bug this sweep replaced.
+_GMXFP4_SKEW_STEP = 2  # s_sleep units (~64 clocks) per skew rank; round 7 swept {0,1,2,4} at
+# CUS=256 and found STEP alone does not reproduce the CUS win (it softens the same ramp for all
+# 256 ranks rather than dropping the long high-rank tail), so STEP is left at its prior value.
 
 
 def _emit_launch_skew(bid):
@@ -917,8 +929,22 @@ _GMXFP4_NT_CFG = (4, 8, 0, 16, False)
 _GMXFP4_NT_CFG_THIN = (4, 8, 0, 16, True)
 _GMXFP4_WGRAD_CFG = (2, 1, 4, False, 1)
 _GMXFP4_WGRAD_CFG_SHORT = (4, 1, 6, True, 2)  # short per-group contraction: see selector
-# When a group's tiles outnumber the CUs the band shape alone decides residency: narrower M.
-_GMXFP4_WGRAD_CFG_SHORT_SPAN = (2, 1, 8, True, 2)
+# When a group's tiles outnumber the CUs (wgrad_gate_up: N_BLOCKS_M=23 x N_BLOCKS_N=12=276 >
+# _N_CU), a 2D group_n band walks all group_m row-blocks across ONE N-band before advancing to
+# the next N-band -- reusing the B column-panel across many tiles but only touching each A
+# row-panel once per band, far apart in launch order. group_n=0 (plain group_m=2 row-major
+# clustering, same as the NT path's own already-proven _GMXFP4_NT_CFG) instead sweeps the FULL
+# N range for each row-pair immediately, reusing the just-loaded A row-panel 12x in a row. Round
+# 11 screened group_m in {1,2,4,8} x group_n in {0,4,6,8,12} (the plan's full grid) for this cell
+# only: every banded group_n>0 point measured worse than group_n=0, confirmed over 6 round-robin
+# rounds (isolated wgrad_gate_up mean -3.693%, 0/6 regressions; group_n=12, which takes the
+# identical "banding disabled" code path since N_BLOCKS_N(12) is not > 12, round-robins to a
+# statistically indistinguishable -3.757%, the built-in control that rules out session drift).
+# TCC_HIT_sum+TCC_MISS_sum request count and SQ_INSTS_MFMA are IDENTICAL between the two tuples
+# (107.8M and 69.337M respectively) but L2 hit rate rises 57.9%->62.7% and HBM read bytes fall
+# 12.8% (2.861->2.494 GB) -- the win is L2 locality/latency, not less issued work. wgrad_down's
+# own _GMXFP4_WGRAD_CFG_SHORT tuple is untouched and was confirmed byte-identical throughout.
+_GMXFP4_WGRAD_CFG_SHORT_SPAN = (2, 1, 0, True, 2)
 _GMXFP4_WGRAD_SHORT_MG = 8192  # per-group contraction at/below which the short-M blocking applies
 _GMXFP4_CACHE_CAP = 32  # drop caches past this; real MoE uses few shapes, a test sweep many
 _N_CU = 256  # gfx950 compute units, i.e. the width of one dispatch generation
@@ -1373,10 +1399,14 @@ def grouped_gemm_mxfp4_flydsl_kernel(
     K = K256
     K128 = K // 128
 
-    a_raw = asu.contiguous().view(torch.int32).reshape(-1)
-    b_raw = bsu.contiguous().view(torch.int32).reshape(-1)
-    a8 = au.contiguous().view(torch.int8)  # keep multi-dim: 1D view of >2^31-elem MoE tensor overflows CABI
-    b8 = bu.contiguous().view(torch.int8)
+    # au/asu/bu/bsu are already contiguous from the .contiguous() calls just above (a
+    # dtype-only .view() of a contiguous tensor stays contiguous), so a second
+    # .contiguous() here is a provable no-op (Tensor.contiguous() returns self when
+    # is_contiguous() already holds) that still pays a Python/dispatcher call per launch.
+    a_raw = asu.view(torch.int32).reshape(-1)
+    b_raw = bsu.view(torch.int32).reshape(-1)
+    a8 = au.view(torch.int8)  # keep multi-dim: 1D view of >2^31-elem MoE tensor overflows CABI
+    b8 = bu.view(torch.int8)
     out = torch.empty((total_M, N), dtype=out_dtype, device=dev)
 
     go = (group_offs if group_offs.dtype == torch.int64 else group_offs.to(torch.int64)).view(torch.int32)
@@ -1386,7 +1416,10 @@ def grouped_gemm_mxfp4_flydsl_kernel(
     grid_upper = (ceildiv(total_M, 256) + G) * n_blocks
     a_pre_grid = ceildiv(slab_rows * K128, _PRESHUF_FO * _PRESHUF_BLK)
 
-    stream = torch.cuda.current_stream()
+    # current_stream(dev) (gemm_helper.py) is the same live per-call stream lookup WGRAD
+    # already uses at :1849 -- it returns the raw stream pointer FlyDSL's launch/args tuple
+    # accepts, skipping the ~2us Python torch.cuda.Stream wrapper that current_stream() builds.
+    stream = current_stream(dev)
     wlv, elgk = 10, 9
     args = (
         a8,
