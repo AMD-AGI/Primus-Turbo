@@ -210,16 +210,20 @@ class GEMMFlyDSLBackend(KernelBackend):
         from primus_turbo.flydsl.gemm.gemm_bf16_kernel import gemm_bf16_flydsl_kernel
 
         a, trans_a, b, trans_b = _canonicalize_transposed_output(a, trans_a, b, trans_b, trans_c)
-        return gemm_bf16_flydsl_kernel(
-            a,
-            b,
-            trans_a=trans_a,
-            trans_b=trans_b,
-            out_dtype=out_dtype,
-            trans_c=False,
-            beta=1.0 if inplace_add_to_out else 0.0,
-            out=out,
-        )
+        layout = ("t" if trans_a else "n") + ("t" if trans_b else "n")
+        role = {"nt": "forward", "nn": "dgrad", "tn": "wgrad"}[layout]
+        marker = f"primus_turbo::gptoss_bf16_lm_head_{role}_flydsl"
+        with torch.autograd.profiler.record_function(marker):
+            return gemm_bf16_flydsl_kernel(
+                a,
+                b,
+                trans_a=trans_a,
+                trans_b=trans_b,
+                out_dtype=out_dtype,
+                trans_c=False,
+                beta=1.0 if inplace_add_to_out else 0.0,
+                out=out,
+            )
 
 
 _GEMM_BACKENDS = {
