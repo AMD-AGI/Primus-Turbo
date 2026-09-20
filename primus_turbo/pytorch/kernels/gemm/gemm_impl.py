@@ -18,6 +18,7 @@ from primus_turbo.pytorch.core.backend import (
     PrecisionType,
     TuneCache,
 )
+from primus_turbo.pytorch.core.utils import is_gfx950
 from primus_turbo.triton.gemm.gemm_kernel import gemm_triton_kernel
 
 _COMMON_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
@@ -99,9 +100,132 @@ class GEMMTritonBackend(KernelBackend):
         return gemm_triton_kernel(a, b, trans_a, trans_b, out_dtype, trans_c, beta=beta, out=out)
 
 
+_GPTOSS_BF16_LM_HEAD_CASES = {
+    ("nt", 32768, 128256, 2880),
+    ("nn", 32768, 2880, 128256),
+    ("tn", 128256, 2880, 32768),
+}
+
+
+def _canonicalize_transposed_output(a, trans_a, b, trans_b, trans_c):
+    """Express ``(op(a) @ op(b)).T`` as ``op(b).T @ op(a).T``.
+
+    Primus' dense autograd wrapper asks hipBLASLt to transpose the wgrad output
+    so it matches the stored ``[vocab, hidden]`` weight. The tuned FlyDSL kernel
+    emits that same physical shape directly as a TN GEMM and has no separate
+    transposed-store path.
+    """
+    if trans_c:
+        return b, not trans_b, a, not trans_a
+    return a, trans_a, b, trans_b
+
+
+def _is_gptoss_bf16_lm_head_flydsl_case(
+    a: torch.Tensor,
+    trans_a: bool,
+    b: torch.Tensor,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    trans_c: bool,
+    inplace_add_to_out: bool = False,
+    out: torch.Tensor | None = None,
+) -> bool:
+    """Whether this call is one of the three trace-locked GPT-OSS LM-head roles."""
+    if not is_gfx950():
+        return False
+    if a.ndim != 2 or b.ndim != 2:
+        return False
+    if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16 or out_dtype != torch.bfloat16:
+        return False
+    if not a.is_contiguous() or not b.is_contiguous():
+        return False
+
+    a, trans_a, b, trans_b = _canonicalize_transposed_output(a, trans_a, b, trans_b, trans_c)
+    layout = ("t" if trans_a else "n") + ("t" if trans_b else "n")
+    if layout == "nt":
+        m, k = a.shape
+        n, kb = b.shape
+    elif layout == "nn":
+        m, k = a.shape
+        kb, n = b.shape
+    elif layout == "tn":
+        k, m = a.shape
+        kb, n = b.shape
+    else:
+        return False
+
+    if k != kb or (layout, m, n, k) not in _GPTOSS_BF16_LM_HEAD_CASES:
+        return False
+    if inplace_add_to_out:
+        return layout == "tn" and out is not None and out.dtype == torch.bfloat16 and out.is_contiguous()
+    return True
+
+
+class GEMMFlyDSLBackend(KernelBackend):
+    """Selective dense backend for the GPT-OSS BF16 LM head.
+
+    ``BF16_FP16_FP32`` is one backend-selection bucket, so choosing FLYDSL for
+    BF16 also reaches unrelated dense calls. Keep those calls on hipBLASLt and
+    route only the three profiled LM-head contracts to the tuned kernel.
+    """
+
+    @staticmethod
+    def can_handle(**kwargs) -> bool:
+        return GEMMHipBLASLtBackend.can_handle(**kwargs)
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if not _is_gptoss_bf16_lm_head_flydsl_case(
+            a,
+            trans_a,
+            b,
+            trans_b,
+            out_dtype,
+            trans_c,
+            inplace_add_to_out,
+            out,
+        ):
+            return GEMMHipBLASLtBackend.execute(
+                a=a,
+                trans_a=trans_a,
+                b=b,
+                trans_b=trans_b,
+                out_dtype=out_dtype,
+                trans_c=trans_c,
+                inplace_add_to_out=inplace_add_to_out,
+                out=out,
+                **kwargs,
+            )
+
+        from primus_turbo.flydsl.gemm.gemm_bf16_kernel import gemm_bf16_flydsl_kernel
+
+        a, trans_a, b, trans_b = _canonicalize_transposed_output(a, trans_a, b, trans_b, trans_c)
+        return gemm_bf16_flydsl_kernel(
+            a,
+            b,
+            trans_a=trans_a,
+            trans_b=trans_b,
+            out_dtype=out_dtype,
+            trans_c=False,
+            beta=1.0 if inplace_add_to_out else 0.0,
+            out=out,
+        )
+
+
 _GEMM_BACKENDS = {
     BackendType.HIPBLASLT: BackendEntry(GEMMHipBLASLtBackend),
     BackendType.TRITON: BackendEntry(GEMMTritonBackend),
+    BackendType.FLYDSL: BackendEntry(GEMMFlyDSLBackend, autotune=False),
 }
 
 
