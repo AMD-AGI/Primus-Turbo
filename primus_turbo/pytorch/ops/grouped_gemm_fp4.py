@@ -299,7 +299,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
             group_lens_padded_colwise,
             group_offs_padded_colwise,
             trans_a=False,
-            trans_b=False,
+            trans_b=True,
             trans_c=False,
             out_dtype=ctx.out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
