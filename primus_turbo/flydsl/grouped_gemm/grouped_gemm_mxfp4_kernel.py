@@ -1512,7 +1512,13 @@ def _build_grouped_mxfp4_wgrad_kernel(
         k128m = m_total // I32(128)
         m2_idx = arith.index_cast(T.index, m2)
 
-        mfma = MfmaScaleFp4(N_TILES_A, N_TILES_BH, packed=True, wlv=wlv, elgk=elgk)
+        # H1a: transposed accumulator (acc = C^T) whenever the standalone (non-fused)
+        # epilogue runs -- the beta=1 scored contract always takes this path, since
+        # _CSTORE is unconditionally False once beta_is_one=True. tacc lets the store
+        # below use store_tacc_wide's dwordx4 permlane16_swap path instead of 128
+        # scalar 2-byte read-back+store pairs per accumulator half (see StoreCPlain in
+        # gemm_mxfp4_kernel.py). Mirrors the sibling dense MXFP4 kernel's taccw axis.
+        mfma = MfmaScaleFp4(N_TILES_A, N_TILES_BH, packed=True, wlv=wlv, elgk=elgk, tacc=not _CSTORE)
         gl_off_a = fp4_g2s_offsets(lane_id, wave_id, m_total, N_LDS_STEPS_A, BPR, swizzle=swizzle)
         gl_off_b = fp4_g2s_offsets(lane_id, wave_id, m_total, N_LDS_STEPS_BH, BPR, swizzle=swizzle, ilv=_BILV)
         a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, LDS_ROW_STRIDE, swizzle=swizzle)
@@ -1700,8 +1706,9 @@ def _build_grouped_mxfp4_wgrad_kernel(
                 cst_nt=cst_nt,
             )
             if const_expr(not _CSTORE):
-                store_c.store(accL, base_row, base_col_l, n_valid=_NV)
-                store_c.store(accR, base_row, base_col_r, n_valid=_NV)
+                # H1a: wide transposed-accumulator store (paired with tacc=True above).
+                store_c.store_tacc_wide(accL, base_row, base_col_l, n_valid=_NV)
+                store_c.store_tacc_wide(accR, base_row, base_col_r, n_valid=_NV)
 
     _pt = {"passthrough": [["amdgpu-agpr-alloc", "256"]]}
     attrs = {"rocdl.flat_work_group_size": "256,256", "rocdl.waves_per_eu": OCC, **_pt}
