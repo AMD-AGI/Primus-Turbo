@@ -39,8 +39,10 @@ import argparse
 import itertools
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -90,21 +92,71 @@ def build_spec(points: list[tuple[str, str, str]]) -> str:
     return ";".join(parts)
 
 
-def _reap(cmd) -> None:
+def _reap(proc: "subprocess.Popen") -> str:
     """Make sure a timed-out candidate leaves no process holding the GPU.
 
-    subprocess.run's own kill on timeout reaps the direct child, but the child owns a GPU
-    context and a half-torn-down context is exactly what leaves a KFD holder behind --
-    which is indistinguishable, from the outside, from the card being wedged.
-    """
-    import time as _time
+    subprocess's own kill reaps the direct child, but the child owns a GPU context and a
+    half-torn-down context is exactly what leaves a KFD holder behind -- which is
+    indistinguishable, from the outside, from the card being wedged. So the candidate is
+    launched with start_new_session=True and the whole process group is signalled here.
 
-    pat = str(HARNESS)
-    subprocess.run(["pkill", "-f", pat], capture_output=True)
-    _time.sleep(2)
-    if subprocess.run(["pgrep", "-f", pat], capture_output=True).returncode == 0:
-        subprocess.run(["pkill", "-9", "-f", pat], capture_output=True)
-        _time.sleep(3)
+    THIS USED TO BE `pkill -f <harness>` FOLLOWED BY `pkill -9 -f <harness>`, and the
+    docstring already claimed it killed the process group. It did not, and both halves of
+    what it actually did are on this box's do-not-do list:
+
+      * `pkill -9` against a process with work in flight on the GPU. Every such kill
+        leaves one more unkillable D-state process behind, pushing a recoverable state
+        toward one that needs a human to power-cycle the machine.
+      * `pgrep`, to decide whether to escalate. pgrep walks /proc, and on a wedged card
+        it blocks on the processes stuck in the driver -- it has hung here before, the
+        same way ps and rocm-smi do. The liveness check would then hang inside the
+        cleanup path that exists to prevent hangs.
+
+    A pattern match is also the wrong instrument: `-f <harness path>` matches every
+    concurrent run of the same harness, so reaping one candidate could take out a
+    sibling sweep, and a pattern can match the killer's own command line.
+
+    SIGTERM to the group, wait, then SIGKILL to the group only if it is still there.
+    Escalating to KILL is still a last resort, but it is now aimed at one process group
+    we started rather than at every process whose command line looks similar.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return "already-gone"
+
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return "already-gone"
+
+    # Reap our own child FIRST. communicate() raised TimeoutExpired, so it has not been
+    # waited on, and a dead-but-unreaped child is a zombie -- which still belongs to the
+    # process group. os.killpg(pgid, 0) therefore keeps succeeding on a group whose every
+    # member has already exited, and without this wait the loop below spends its full
+    # budget and escalates to SIGKILL every single time. That would quietly undo the
+    # reason for preferring SIGTERM. Measured: 13 s and an unnecessary KILL, every call.
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:  # noqa: BLE001 - never let cleanup raise into the sweep
+        pass
+
+    # Bounded, and never via pgrep: os.killpg with signal 0 is a single check against one
+    # process group and cannot block on the driver.
+    for _ in range(20):
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return "term"
+        time.sleep(0.5)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+        time.sleep(3)
+    except ProcessLookupError:
+        return "term"
+    return "kill"
 
 
 def run_one(shape: str, spec: str, extra: list[str]) -> dict:
@@ -115,17 +167,22 @@ def run_one(shape: str, spec: str, extra: list[str]) -> dict:
 
     retries = 0
     while True:
+        # start_new_session puts the candidate in its own process group, which is what
+        # makes _reap able to signal the group instead of pattern-matching command lines.
+        popen = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
+        )
         try:
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=CANDIDATE_TIMEOUT_S
-            )
+            out, err = popen.communicate(timeout=CANDIDATE_TIMEOUT_S)
+            proc = subprocess.CompletedProcess(cmd, popen.returncode, out, err)
         except subprocess.TimeoutExpired as exc:
             # Killing the parent is not enough: the child holds a GPU context, and a
             # half-dead context is exactly what leaves KFD holders behind. Kill the
             # process group and record the timeout as a terminal verdict for this
             # candidate -- unlike a fault, a hang is reproducible and retrying it just
             # spends the timeout again.
-            _reap(cmd)
+            reaped = _reap(popen)
             return {
                 "shape": shape,
                 "tune": spec,
@@ -133,6 +190,7 @@ def run_one(shape: str, spec: str, extra: list[str]) -> dict:
                 "retries": retries,
                 "returncode": "timeout",
                 "timeout_s": CANDIDATE_TIMEOUT_S,
+                "reaped": reaped,
                 "stderr_tail": (exc.stderr or b"").decode(errors="replace").strip().splitlines()[-25:]
                 if isinstance(exc.stderr, bytes)
                 else (exc.stderr or "").strip().splitlines()[-25:],
