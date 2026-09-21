@@ -33,6 +33,37 @@ mkdir -p "$(dirname "$MARK")"
 rc=0
 alert(){ echo "[$(date -Is)] $*"; rc=1; }
 
+# --- the wedge latch --------------------------------------------------------------------
+# A wedge is a STATE, not an event, and this file used to report it as an event. The dmesg
+# check below is deliberately differential -- it baselines the count each pass and reacts
+# only to what is new -- because a buffer still holding an old, recovered fault would
+# otherwise make every pass shout. But that means the wedge alarm fires exactly ONCE: the
+# next pass has already folded those lines into its baseline, sees no new ones, and
+# returns 0.
+#
+# Observed on 2026-09-21. Two unrecoverable signatures appeared, the pass reported WEDGED
+# and exit 2, and the very next pass came back clean -- on a card that was still wedged
+# and still needed a human. A monitor whose alarm cancels itself is worse than no monitor:
+# the second reading looks like recovery.
+#
+# It already wrote this flag. It just never read it back. Now it latches: once set, every
+# pass keeps reporting until a person clears it, and the only thing that clears it is the
+# power cycle it was asking for.
+if [ -f "$MARK.wedged" ]; then
+  BOOT=$(date -d "$(uptime -s)" +%s 2>/dev/null || echo 0)
+  SET=$(stat -c %Y "$MARK.wedged" 2>/dev/null || echo 0)
+  if [ "$SET" -gt "$BOOT" ]; then
+    echo "[$(date -Is)] STILL WEDGED (latched $(date -Is -d @"$SET"))."
+    echo "  Nothing has power-cycled this machine since the wedge was recorded."
+    echo "  Every GPU loop must stay stopped. Clear with: rm $MARK.wedged"
+    exit 2
+  fi
+  # The box booted after the flag was written, so the cycle happened. Clear it and carry
+  # on -- re-arming the dmesg baseline below against the fresh buffer.
+  rm -f "$MARK.wedged" "$MARK.hard"
+  echo "[$(date -Is)] wedge cleared: the machine booted at $(uptime -s), after the flag was set."
+fi
+
 # --- unrecoverable card state, measured against a baseline taken when this armed --------
 # Only NEW lines matter. A dmesg buffer already containing an old, recovered fault would
 # otherwise make every single pass shout.

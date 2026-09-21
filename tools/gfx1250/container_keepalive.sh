@@ -20,6 +20,19 @@ mkdir -p "$(dirname "$LEDGER")"
 
 note(){ printf '{"t":"%s","container":"%s","event":%s}\n' "$(date -Is)" "$C" "$1" >> "$LEDGER"; }
 
+# A PID file, because `pgrep -f container_keepalive.sh` matches the command line of
+# whoever is asking -- measured: a liveness check run from an interactive shell reported
+# "already running" against its own 0-second-old invocation, on a machine that had been
+# power-cycled minutes earlier and could not have had a survivor. Same family as the
+# `pkill -f <pattern>` trap: a pattern that names the target also names the asker.
+# Check liveness with `kill -0 "$(cat <pidfile>)"`, never by pattern.
+PID_FILE=${KEEPALIVE_PID_FILE:-/tmp/gfx1250-container-keepalive.pid}
+if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
+  echo "already running as pid $(cat "$PID_FILE")"; exit 0
+fi
+echo $$ > "$PID_FILE"
+trap 'rm -f "$PID_FILE"' EXIT INT TERM
+
 while true; do
   state=$(timeout 30 docker inspect -f '{{.State.Running}}|{{.State.ExitCode}}' "$C" 2>/dev/null)
   case "$state" in

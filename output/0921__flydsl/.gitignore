@@ -2,3 +2,7 @@
 # bin/compile_only_driver.py. The JSON summaries beside them are the durable record.
 a0dump/
 isa/*/
+
+# patrol.sh keeps its baselines here; they are per-machine state, not source.
+.patrol*
+keepalive.jsonl
