@@ -2202,22 +2202,43 @@ def make_fp16_bf16_buffer_tensor(arg):
     return fx.rocdl.make_buffer_tensor(arg, max_size=False)
 
 
-def compute_global_swizzle_bf16(lane_id, wave_id, K, n_rounds, row_step=1, pair_span=0):
+def compute_global_swizzle_bf16(
+    lane_id, wave_id, K, n_rounds, row_step=1, pair_span=0, quad_phase_step=0
+):
     """Per-lane global element offsets feeding one LDS chunk of a [rows, K] operand.
     ``row_step`` strides the global row and ``pair_span`` permutes it within a group, both so a
-    reader holds even and odd output columns; neither changes the rows a chunk fetches."""
+    reader holds even and odd output columns; neither changes the rows a chunk fetches.
+
+    ``quad_phase_step`` (charter mechanism 3, NT four-way B feed) generalizes that two-way
+    interleave to four output columns spread over a *pair* of physical regions: it requires
+    ``pair_span`` to cover this call's WHOLE local-row range (a single period). The low half of
+    local rows then walks phase 0 densely at stride ``quad_phase_step`` (e.g. 4), the high half
+    walks phase ``quad_phase_step // 2`` (e.g. 2) at the same stride -- so this region (called
+    with k_offset ``B0``) supplies real columns {0, 2} mod ``quad_phase_step`` and a sibling
+    region offset by ``+K`` (the same trick ``row_step=2``'s ``B1`` already uses for the
+    two-way case) supplies {1, 3}. ``row_step`` is ignored here; the stride lives in
+    ``quad_phase_step`` instead, since the two phases per region need different effective
+    strides (``quad_phase_step`` and half of it) that a single external multiplier cannot
+    express. See ``S2RLoader16x16Bf16Quad`` for the matching LDS->register read and
+    ``StoreCBf16.store_band_quad4`` for the four-way recombination at the store."""
     offsets = []
     n_waves = fx.block_dim.x // 64
     for r in range_constexpr(n_rounds):
         row = lane_id // 8 + wave_id * 8 + r * (n_waves * 8)
         col_byte = (lane_id % 8) * 16
         _, c = swizzle_128(row, col_byte)
-        g_row = row
-        if const_expr(pair_span):
+        if const_expr(quad_phase_step):
             half = pair_span // 2
             t = row % pair_span
-            g_row = (row - t) + (t % half) * 2 + t // half
-        offsets.append(g_row * (row_step * K) + c // 2)
+            g_row = (t % half) * quad_phase_step + (t // half) * (quad_phase_step // 2)
+            offsets.append(g_row * K + c // 2)
+        else:
+            g_row = row
+            if const_expr(pair_span):
+                half = pair_span // 2
+                t = row % pair_span
+                g_row = (row - t) + (t % half) * 2 + t // half
+            offsets.append(g_row * (row_step * K) + c // 2)
     return offsets
 
 
@@ -2265,6 +2286,38 @@ def _packed_ds_read_tr16(base_ptr, byte_offsets):
         has_side_effects=True,
     )
     return [Vec(_llvm.extractvalue(v2i32, op.result, [k])).bitcast(fx.BFloat16) for k in range(n)]
+
+
+def _packed_ds_read_b128(base_ptr, byte_offsets):
+    """One inline-asm block of ``ds_read_b128`` at compile-time byte offsets from a single
+    runtime base pointer -- the untransposed-read twin of ``_packed_ds_read_tr16``. Batches
+    n independent per-tile 128-bit LDS reads into one opaque asm block so the scheduler can
+    move the whole group as a unit instead of tracking n separate register dependencies
+    (p1-nn-a-operand-read-ahead step 1a).
+
+    Outputs use the ``"a"`` (AccVGPR) constraint, not ``"v"``: gfx950's ``ds_read_b128``
+    requires its 4-register destination aligned to a multiple of 4 (confirmed two ways --
+    the champion's compiler-generated reads always land on v[4k:4k+3], and a bare ``"=&v"``
+    inline-asm output measurably does not, which silently read the wrong bytes: non-
+    deterministic output, ~70 dB SNR instead of ~390). AccVGPR-128 tuples on CDNA are
+    alignment-constrained by the MFMA accumulator ABI, and that constraint carries through
+    inline-asm register-class selection where the generic arch-VGPR class does not (verified
+    with a standalone .ll repro: ``"=&a"`` outputs land on a[0:3]/a[4:7]/... every time,
+    ``"=&v"`` does not). gfx950 unifies the arch/acc file (round-1 finding), so this costs no
+    extra registers by itself; downstream consumers get whatever copy the allocator needs."""
+    n = len(byte_offsets)
+    v4i32 = ir.VectorType.get([4], ir.IntegerType.get_signless(32))
+    struct_t = _llvm.StructType.get_literal([v4i32] * n)
+    asm = "\n".join(f"ds_read_b128 ${k}, ${n} offset:{byte_offsets[k]}" for k in range(n))
+    constraints = ",".join(["=&a"] * n + ["v"] + ["~{memory}"])
+    op = _llvm.InlineAsmOp(
+        res=struct_t,
+        operands_=[_raw(base_ptr)],
+        asm_string=asm,
+        constraints=constraints,
+        has_side_effects=True,
+    )
+    return [Vec(_llvm.extractvalue(v4i32, op.result, [k])).bitcast(fx.BFloat16) for k in range(n)]
 
 
 def _lds_xpose_tr16(wr_ptr, rd_ptr, val, byte_offset=0):
@@ -2408,13 +2461,136 @@ def _load8_bf16(lds_src, byte_off):
 class S2RLoader16x16Bf16(_S2RLoaderBf16):
     """mfma_f32_16x16x32 operand, swizzled and non-transposed.  The atom spreads 64 lanes
     over 16 rows x 4 k-chunks, so a sub is one ds_read_b128 and halving the tile while
-    doubling ``n_tiles`` keeps the read count and the bytes unchanged."""
+    doubling ``n_tiles`` keeps the read count and the bytes unchanged.
+
+    ``PACKED_READ`` (p1-nn-a-operand-read-ahead step 1a, measured OFF -- see below) issues
+    one packed ``ds_read_b128`` asm block per k-sub instead of ``n_tiles`` independent
+    per-tile reads, mirroring ``S2RLoaderTr16x32Bf16Wide.load``. This is legal because
+    ``swizzle_128``'s XOR key is a function of ``row % 16`` only, and
+    ``row = wave_idx*(n_tiles*16) + i*16 + m`` means ``row % 16 == m`` for every tile index
+    ``i`` -- the swizzled column offset ``cs`` does not depend on ``i``, so tile ``i``'s byte
+    address is exactly ``tile0_addr + i*2048``, a compile-time immediate that fits
+    ``ds_read_b128``'s offset field for ``n_tiles <= 8``. Packing turns n_tiles independent
+    per-tile register dependencies (a fine-grained ``s_waitcnt lgkmcnt`` staircase) into one
+    opaque asm block the scheduler can move as a unit. Set ``PACKED_READ = False`` (the
+    current default) to revert to the original per-tile ``_tile()`` path byte-for-byte.
+
+    Combined with ``gemm_bf16_kernel.py``'s ``hoist_a1`` (p1-nn-a-operand-read-ahead step 1b)
+    this DOES reach the ISA signature it was designed to reach -- dgrad's `.LBB0_6` main loop
+    goes from 56 `s_waitcnt`/{2:40,6:8,16:8} MFMA runs to 16 `s_waitcnt`/{16:16} (16
+    uninterrupted 16-MFMA blocks, matching wgrad TN's zero-stall pattern) -- and is still
+    +11.3% slower than the champion (19.20 ms vs ~17.25 ms, 15-rep paired probe, dgrad_nn),
+    worse than either half alone (+5.45% packing-only, +2.85% hoist-only). This is the
+    decisive falsification: achieving the target instruction-schedule *shape* does not
+    reproduce the target's *speed*, because raw `s_waitcnt` count is not the right proxy for
+    stall cost -- wgrad's few waits are cheap (each already-satisfied by the time it is
+    checked, since the automatic pass computes the minimal sufficient count from genuine
+    surrounding work); this mechanism's few waits are expensive (each a forced full
+    `lgkmcnt(0)` drain with ~0 elapsed time since the read, so it blocks for the real LDS
+    round trip, on top of +40 total registers, 208->248, leaving 8 of headroom). See
+    ``_load_packed`` and ``_packed_ds_read_b128`` below for the two packing-only failures
+    that precede this."""
 
     _K_BASE = (0, 32)
+    # p1-nn-a-operand-read-ahead step 1a: measured OFF. Kept as documented dead code (the
+    # revertible-candidate pattern established rounds 4-6) -- see _load_packed/
+    # _packed_ds_read_b128 docstrings for the four distinct measured failures:
+    #   (1) "=&v" 4x32b output for a 128-bit read -> misaligned dest (v[166:169], not
+    #       4-aligned) -> silent data corruption, SNR ~70 dB, non-deterministic.
+    #   (2) "=&a" (AccVGPR) output -> correctly 4-aligned (a[8:11] etc, confirmed by ISA and
+    #       an independent .ll repro) but the automatic SIInsertWaitcnts pass emits ZERO
+    #       `s_waitcnt lgkmcnt` anywhere near these reads (confirmed by ISA: only unrelated
+    #       `vmcnt` waits present) -- MFMA consumes the AGPR destination before the LDS read
+    #       completes. SNR ~77 dB, non-deterministic: a second, distinct race, not the same
+    #       alignment bug.
+    #   (3) "=&a" + one manual trailing `wait_lgkmcnt(0, memory=True)` (mirroring
+    #       S2RLoaderTr.load's own "issue all async reads then one trailing lgkmcnt(0)"
+    #       pattern) -> fully correct, SNR 390.829 dB, deterministic -- but +5.45% slower
+    #       than the per-tile baseline in a same-time paired probe (18.131 ms vs 17.195 ms,
+    #       11 reps each), 10x past the charter's 0.5% packing-only abort gate. ISA: vgpr 216/
+    #       agpr 32 (+8 total, no spill), 18 explicit `lgkmcnt(0)` drains emitted verbatim.
+    #       `lgkmcnt(0)` is a FULL drain of one undifferentiated per-wave counter shared with
+    #       the G2S prefetch-to-LDS writes (`buffer_load_dwordx4 ... offen lds` increments the
+    #       same counter) -- the same "blanket wait is worse than a precise staircase" pattern
+    #       the KB documents for `vmcnt` (round 3) now reproduces for `lgkmcnt`: the manual
+    #       drain also waits out unrelated in-flight G2S traffic that the MFMA doesn't need
+    #       yet, which the automatic per-tile staircase's smaller partial counts did not.
+    #   (4) "=&v" split into 2x `ds_read_b64` halves (avoids the alignment requirement
+    #       entirely, no "a" needed) -> correct, SNR 390.829 dB -- but +19.6% slower (doubled
+    #       DS instruction count, vgpr 208->248, only 2 registers of headroom left).
+    # All four are correct-or-refuted by direct measurement; none clears the gate. Set True
+    # only to reproduce failure (3), the best of the four.
+    PACKED_READ = False
 
     def _tile(self, lds_src, i):
         m, kblk = self.lane_id % 16, self.lane_id // 16
         row = self.wave_idx * (self.n_tiles * 16) + i * 16 + m
+        subs = []
+        for c in range_constexpr(len(self._K_BASE)):
+            col_byte = (self._K_BASE[c] + kblk * 8) * 2
+            _, cs = swizzle_128(row, col_byte)
+            subs.append(_load8_bf16(lds_src, row * 128 + cs))
+        return subs
+
+    def _load_packed(self, lds_src):
+        """Two packed ds_read_b128 blocks (one per k-sub in _K_BASE), n_tiles reads each,
+        at compile-time offsets i*2048 from a single runtime base pointer (tile 0's address).
+        Both blocks are issued before the one trailing ``wait_lgkmcnt(0)`` drain -- mirroring
+        ``S2RLoaderTr.load``'s "issue every tile's async reads then one trailing lgkmcnt(0)
+        before the consuming mfma" -- because ``ds_read_b128`` writing to AccVGPR (required
+        for 4-alignment, see ``_packed_ds_read_b128``) is not tracked by the automatic
+        waitcnt-insertion pass: an ISA dump with no manual drain showed zero ``s_waitcnt
+        lgkmcnt`` anywhere near these reads (only unrelated ``vmcnt`` waits from the G2S
+        path), and the MFMAs consumed the AccVGPR destinations before the LDS read
+        completed -- non-deterministic output at ~77 dB SNR, a silent hardware/compiler-pass
+        race distinct from the alignment hazard. The manual drain is a real hardware
+        ``s_waitcnt`` on the lgkmcnt counter (incremented by ds_read_b128 regardless of
+        destination register class), so it is correct independent of that pass's gap.
+        Returns the same [tile][k-sub] structure as the per-tile _tile() loop."""
+        m, kblk = self.lane_id % 16, self.lane_id // 16
+        row0 = self.wave_idx * (self.n_tiles * 16) + m  # tile i's row is row0 + i*16
+        base_i32 = fx.Int32(fx.ptrtoint(lds_src.ptr))
+        offs = [i * 2048 for i in range_constexpr(self.n_tiles)]
+        reads_by_sub = []
+        for c in range_constexpr(len(self._K_BASE)):
+            col_byte = (self._K_BASE[c] + kblk * 8) * 2
+            _, cs = swizzle_128(row0, col_byte)
+            ptr = _lds_ptr_from_i32(base_i32 + row0 * 128 + cs)
+            reads_by_sub.append(_packed_ds_read_b128(ptr, offs))
+        wait_lgkmcnt(0, memory=True)
+        tiles = [[] for _ in range_constexpr(self.n_tiles)]
+        for c in range_constexpr(len(self._K_BASE)):
+            for i in range_constexpr(self.n_tiles):
+                tiles[i].append(reads_by_sub[c][i])
+        return tiles
+
+    def load(self, lds_src):
+        if const_expr(self.PACKED_READ):
+            return self._load_packed(lds_src)
+        return [self._tile(lds_src, i) for i in range_constexpr(self.n_tiles)]
+
+
+class S2RLoader16x16Bf16Quad(S2RLoader16x16Bf16):
+    """``S2RLoader16x16Bf16`` twin for ``compute_global_swizzle_bf16``'s ``quad_phase_step``
+    write pattern (charter mechanism 3, NT four-way B feed): tile 0 reads local rows
+    ``[0, half_rows)`` (the region's low phase), tile 1 reads ``[half_rows, 2*half_rows)`` (the
+    high phase) -- both at this wave's own 16-row offset -- instead of the base class's single
+    contiguous ``[wave_idx*n_tiles*16, ...)`` run. This is needed because ``quad_phase_step``
+    stacks two real-column phases in a region's local-row HALVES rather than laying one phase
+    across the whole row range, so tile index no longer strides by ``16`` within one contiguous
+    block; it jumps a half-region instead. ``n_tiles`` is fixed at 2 (one read per stacked
+    phase); ``half_rows`` is the region's row count per phase (``LDS_BLOCK_N // 2`` for the
+    champion NT geometry). LDS bank addressing (``swizzle_128`` on ``row``) is untouched --
+    only which local row a given (wave, tile) pair reads changes, mirroring the write side
+    exactly (see ``compute_global_swizzle_bf16``'s docstring)."""
+
+    def __init__(self, wave_idx, half_rows):
+        super().__init__(wave_idx, 2)
+        self.half_rows = half_rows
+
+    def _tile(self, lds_src, i):
+        m, kblk = self.lane_id % 16, self.lane_id // 16
+        row = i * self.half_rows + self.wave_idx * 16 + m
         subs = []
         for c in range_constexpr(len(self._K_BASE)):
             col_byte = (self._K_BASE[c] + kblk * 8) * 2
@@ -2428,6 +2604,15 @@ def _pack_out_pair(x0, x1, out_ty):
     if const_expr(out_ty is fx.Float16):
         return Vec.from_elements([x0.to(fx.Float16), x1.to(fx.Float16)], fx.Float16).bitcast(fx.Int32)[0]
     return rocdl.cvt_pk_bf16_f32(x0, x1)
+
+
+def _pack_out_quad(x0, x1, x2, x3, out_ty):
+    """Four f32 accumulator values -> one dwordx2 (8 B) holding them side by side in ``out_ty``,
+    via two ``_pack_out_pair`` calls concatenated -- the four-way twin of ``_pack_out_pair``
+    used by ``StoreCBf16.store_band_quad4`` (charter mechanism 3)."""
+    d0 = _pack_out_pair(x0, x1, out_ty)
+    d1 = _pack_out_pair(x2, x3, out_ty)
+    return Vec.from_elements([d0, d1], fx.Int32).bitcast(out_ty)
 
 
 class StoreCBf16:
@@ -2503,6 +2688,34 @@ class StoreCBf16:
                         cache_modifier=self.cache_modifier,
                         offset_is_bytes=True,
                     )
+
+    def store_band_quad4(self, frag0, frag1, frag2, frag3, base_row, base_col, mask_cols=True):
+        """Charter mechanism 3 (NT four-way B feed): four phase accumulators -- one flat
+        per-A-tile list each, e.g. ``frag_even[0::2]``/``frag_odd[0::2]``/``frag_even[1::2]``/
+        ``frag_odd[1::2]`` from ``dense_mma_pipeline_bf16``'s two region quadrants (see
+        ``compute_global_swizzle_bf16``'s ``quad_phase_step`` docstring and
+        ``S2RLoader16x16Bf16Quad``) -- land on four CONSECUTIVE real output columns for a fixed
+        (a-tile, row, lane), so they pack into one dwordx2 store instead of
+        ``store_band_pair16``'s two dword stores over the same 64-lane run: half the store
+        instructions for the identical bytes moved. Always one quad group per wave (the NT
+        four-way feed only fires where ``N_TILES_B == 1``, i.e. ``store_band_pair16``'s
+        ``n_tiles_b`` would itself be 1)."""
+        rsrc = make_row_band_resource(self.c_base, base_row, self.c_rows, self.c_cols, 2)
+        n_tiles_a = len(frag0)
+        lane_col = self.lane_id % 16
+        row_bytes = self.c_cols * 2
+        col_ok = (base_col + lane_col * 4 < self.c_cols) if mask_cols else None
+        base_off = ((self.lane_id // 16) * 4) * row_bytes + (base_col + lane_col * 4) * 2
+        for ti in range_constexpr(n_tiles_a):
+            for r in range_constexpr(4):
+                # One address per row; all four phases of this wave's 64-col window land here.
+                off = base_off + (ti * 16 + r) * row_bytes
+                packed = _pack_out_quad(
+                    Vec(frag0[ti])[r], Vec(frag1[ti])[r], Vec(frag2[ti])[r], Vec(frag3[ti])[r], self.out_ty
+                )
+                buffer_store(
+                    packed, rsrc, off, mask=col_ok, cache_modifier=self.cache_modifier, offset_is_bytes=True
+                )
 
     def store_band16(
         self,

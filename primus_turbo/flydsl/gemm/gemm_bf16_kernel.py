@@ -32,6 +32,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     G2SLoader,
     Mfma16x16x32,
     S2RLoader16x16Bf16,
+    S2RLoader16x16Bf16Quad,
     S2RLoaderTr16x32Bf16Wide,
     StoreCBf16,
     compile_with_scratch_out,
@@ -134,6 +135,7 @@ def dense_mma_pipeline_bf16(
     nt_vmcnt,
     pair_cols=False,
     pair_tiles=False,
+    quad_cols=False,
     quad_conds=None,
     half_n=False,
     n_tiles_a=None,
@@ -354,6 +356,18 @@ def dense_mma_pipeline_bf16(
         halves = (frag_even, frag_odd)
         if const_expr(half_n):
             halves = (frag_even,)
+        if const_expr(quad_cols):
+            # frag_even/frag_odd are region 0/1's *doubled* fragment lists (charter mechanism
+            # 3): compute_global_swizzle_bf16's quad_phase_step stacks two real-column phases
+            # in each region's local-row halves, so a fixed (a-tile, j) pair already alternates
+            # phase-low/phase-high the same way pair_tiles' even/odd columns alternate above --
+            # slice it the same way. frag_even[0::2]=phase0, frag_odd[0::2]=phase1,
+            # frag_even[1::2]=phase2, frag_odd[1::2]=phase3; for a fixed lane these four land on
+            # four CONSECUTIVE real columns, so store_band_quad4 packs them into one dwordx2.
+            store_c.store_band_quad4(
+                frag_even[0::2], frag_odd[0::2], frag_even[1::2], frag_odd[1::2],
+                row, pair_col, mask_cols=not col_safe,
+            )
         if const_expr(pair_cols):
             store_c.store_band_pair16(frag_even, frag_odd, row, pair_col, N_TILES_B, mask_cols=not col_safe)
         if const_expr(pair_tiles):
@@ -361,7 +375,7 @@ def dense_mma_pipeline_bf16(
             store_c.store_band_pair16(
                 frag_even[0::2], frag_even[1::2], row, base_col, 1, mask_cols=not col_safe
             )
-        if const_expr(not pair_cols and not pair_tiles):
+        if const_expr(not pair_cols and not pair_tiles and not quad_cols):
             store_c.store_band16(
                 halves,
                 row,
@@ -417,6 +431,7 @@ def gemm_bf16_nt_tile(
     c_cache_modifier=0,
     pair_n=False,
     n_tail=None,
+    quad_cols=False,
 ):
     assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
     assert K % BLOCK_K == 0, f"bf16 NT needs K % {BLOCK_K} == 0 (got K={K})"
@@ -453,6 +468,9 @@ def gemm_bf16_nt_tile(
     B0_gl_offset = (block_n * BLOCK_N) * K
     # Column-interleaved feed: LDS half 0/1 hold the block's even and odd output columns, paired at store.
     PAIR_COLS = pair_n and N_TILES_B == 1
+    # Charter mechanism 3 (NT four-way B feed, default off): genuine four-way interleave, only
+    # meaningful wherever PAIR_COLS itself would apply (N_TILES_B == 1 -- one B column-group).
+    QUAD_COLS = quad_cols and PAIR_COLS
     if b_group_base is not None:
         B0_gl_offset = B0_gl_offset + b_group_base
 
@@ -471,10 +489,19 @@ def gemm_bf16_nt_tile(
     _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
     store_c = StoreCBf16(C, c_m, c_n, _out_ty, cache_modifier=c_cache_modifier)
 
-    def _run(pair_cols, grid, half_n, col_safe=False, b_steps=N_LDS_STEPS_B, pair_tiles=False):
+    def _run(pair_cols, grid, half_n, col_safe=False, b_steps=N_LDS_STEPS_B, pair_tiles=False, quad_cols=False):
         # The bodies differ only in B's column layout, so the loader is re-pointed, not duplicated.
         n_a, n_b, w_m, w_n = grid
-        if pair_cols:
+        if quad_cols:
+            # Four-way interleave (charter mechanism 3): region 0/1 each stack TWO real-column
+            # phases in their own local-row halves (pair_span = this call's whole row range),
+            # spaced quad_phase_step=4 apart; region 1's "+K" base (below) supplies the other
+            # two phases at the same row->phase mapping. See compute_global_swizzle_bf16's
+            # docstring and S2RLoader16x16Bf16Quad for the matching LDS->register read.
+            b_g2s.gl_offsets = compute_global_swizzle_bf16(
+                lane_id, wave_id, K, N_LDS_ROUNDS, pair_span=LDS_BLOCK_N, quad_phase_step=4
+            )
+        elif pair_cols:
             b_g2s.gl_offsets = compute_global_swizzle_bf16(lane_id, wave_id, K, N_LDS_ROUNDS, row_step=2)
         elif pair_tiles:
             assert n_b == 1, "pair_tiles pairs a wave's two 16-column tiles"
@@ -483,18 +510,21 @@ def gemm_bf16_nt_tile(
             b_g2s.gl_offsets = gl_off_b
         b_g2s.n_load_steps = b_steps
         n_a16, n_b16 = 2 * n_a, 2 * n_b
+        b_s2r = (
+            S2RLoader16x16Bf16Quad(w_n, LDS_BLOCK_N // 2) if quad_cols else S2RLoader16x16Bf16(w_n, n_b16)
+        )
         dense_mma_pipeline_bf16(
             lds,
             a_g2s,
             b_g2s,
             S2RLoader16x16Bf16(w_m, n_a16),
-            S2RLoader16x16Bf16(w_n, n_b16),
+            b_s2r,
             Mfma16x16x32(n_a16, n_b16, ab_ty),
             store_c,
             A0_gl_offset,
             A1_gl_offset,
             B0_gl_offset,
-            B0_gl_offset + (K if pair_cols else LDS_BLOCK_N * K),
+            B0_gl_offset + (K if (pair_cols or quad_cols) else LDS_BLOCK_N * K),
             BLOCK_K,
             BLOCK_K,
             block_m,
@@ -507,6 +537,7 @@ def gemm_bf16_nt_tile(
             nt_vmcnt,
             pair_cols=pair_cols,
             pair_tiles=pair_tiles,
+            quad_cols=quad_cols,
             half_n=half_n,
             n_tiles_a=n_a16,
             n_tiles_b=n_b16,
@@ -517,10 +548,13 @@ def gemm_bf16_nt_tile(
 
     TAIL_QUADS = 0 if n_tail is None else ceildiv(n_tail, 32)
     if TAIL_QUADS not in (2, 4):
-        _run(PAIR_COLS, MAIN_GRID, False, n_tail == 0)
+        _run(PAIR_COLS and not QUAD_COLS, MAIN_GRID, False, n_tail == 0, quad_cols=QUAD_COLS)
     else:
         tail_grid = TAIL_GRID if TAIL_QUADS == 2 else MAIN_GRID
-        emit_if_then((block_n + 1) * BLOCK_N <= c_n, lambda: _run(PAIR_COLS, MAIN_GRID, False, True))
+        emit_if_then(
+            (block_n + 1) * BLOCK_N <= c_n,
+            lambda: _run(PAIR_COLS and not QUAD_COLS, MAIN_GRID, False, True, quad_cols=QUAD_COLS),
+        )
         emit_if_then(
             (block_n + 1) * BLOCK_N > c_n,
             lambda: _run(False, tail_grid, True, n_tail % 32 == 0, ceildiv(n_tail, 64), pair_tiles=pair_n),
@@ -901,6 +935,54 @@ def dense_mma_chunked_bf16(
         b_g2s.load(lds.B_lds_next_1, b1_off + 1 * b_k_step)
     wait_barrier(n_steps_a + n_steps_b + B1_STEPS)
 
+    # p1-nn-a-operand-read-ahead step 1b: hoist A1's S2R read one barrier phase earlier --
+    # measured OFF, kept as documented dead code (rounds 5/6's revertible-candidate
+    # pattern). Gate is NN/dgrad-only (a_chunk_src is None exactly when a_transpose is
+    # False -- wgrad/TN always passes a callable and must stay byte-identical) and
+    # `not half_n` (under half_n/tail-fork the MMA01 span this hoist jumps in front of is
+    # dead code, so hoisted and original positions coincide there; forced False avoids a
+    # no-op duplicate branch). The edit moves A1's S2R read from right before the barrier
+    # gating MMA10 (its first consumer) to right after B1's read / B0's G2S write-back --
+    # in front of MMA01's 16-MFMA block instead of after it, meant to give ~256 matrix
+    # cycles of read-to-use cover per round 7's ISA-measured deficit (dgrad's `s_waitcnt
+    # lgkmcnt` staircase vs wgrad's zero-wait, 40-MFMA-covered A read).
+    #
+    # Three distinct measured results (dgrad_nn, paired 15-rep probes against a same-time
+    # control; drop the `False and` below to reproduce):
+    #  (1) Hoist alone (per-tile `_tile()` reads unchanged, gemm_helper.py's PACKED_READ
+    #      stays False): +2.85% (17.74 ms vs ~17.2-17.37 ms control, reproduced twice).
+    #      ISA (`loops3.py`/`seq2.py` on `.LBB0_6`): `s_waitcnt`=56, MFMA runs
+    #      {2:40,6:8,16:8} -- BYTE-IDENTICAL to the un-hoisted baseline's histogram and
+    #      compact op-stream. The compiler's post-RA scheduler places every per-tile
+    #      `ds_read_b128` wherever it independently decides is optimal, regardless of this
+    #      Python-source-level call position -- generalizing round 4's "source-level
+    #      'define closer to use' does not reliably move a value" finding from pure
+    #      address arithmetic to a full dependency-free memory read (a_cur1's data is
+    #      barrier-guaranteed ready from the start of the iteration, so it has no
+    #      in-loop dependency forcing any particular placement). The ONLY measured effect
+    #      is +32 registers (208->240, still no spill) from the register allocator's
+    #      pre-scheduling liveness analysis seeing a longer apparent live range -- a pure,
+    #      unrecovered cost.
+    #  (2) Hoist + gemm_helper.py's PACKED_READ=True (the full mechanism as specified,
+    #      1a+1b together): +11.3% (19.20 ms), worse than either half alone. This one DOES
+    #      reach the intended ISA shape -- `.LBB0_6` goes to `s_waitcnt`=16, MFMA runs
+    #      {16:16} (16 uninterrupted 16-MFMA blocks, matching wgrad's zero-stall pattern)
+    #      -- and is still the slowest variant measured. Decisive: raw `s_waitcnt` count
+    #      is not the right proxy for stall cost. wgrad's few waits are cheap (already
+    #      satisfied by the time checked, since ~40 MFMAs' worth of genuine surrounding
+    #      work elapses first); this mechanism's few waits are expensive (each a forced
+    #      full `lgkmcnt(0)` drain issued with ~0 elapsed time since the read, so it blocks
+    #      for the real LDS round trip) -- on top of +40 registers (208->248, 8 of
+    #      headroom left). Reproducing wgrad's *schedule shape* does not reproduce its
+    #      *speed*, because the two paths reach that shape by different means (natural
+    #      cover vs. a forced drain).
+    #  (3) Per round 7's own falsification criterion ("if s_waitcnt per MFMA falls to the
+    #      TN level and dgrad time does not move, the mechanism is refuted"): (2) is a
+    #      stronger result than that bar -- waits fell to the TN level AND time got worse,
+    #      not merely "did not move". All three variants are correct and deterministic
+    #      (SNR 390.829 dB) throughout; this is purely a performance failure.
+    hoist_a1 = False and a_chunk_src is None and not half_n
+
     # Nested so the Python-level buffer rotation stays out of the runtime chunk loop.
     def _chunk(chunk_iv):
         chunk_idx = ArithValue(chunk_iv)
@@ -939,6 +1021,8 @@ def dense_mma_chunked_bf16(
             if const_expr(not half_n):
                 b1 = b_s2r.load(b_cur1)
             b_g2s.load(b_cur0, b0_off + (kb + 2) * b_k_step)
+            if const_expr(hoist_a1):
+                a1 = a_s2r.load(a_cur1)
             if const_expr(not half_n):
                 rocdl.s_barrier()
                 rocdl.sched_barrier(0)
@@ -946,7 +1030,8 @@ def dense_mma_chunked_bf16(
                 rocdl.sched_barrier(0)
                 rocdl.s_barrier()
 
-            a1 = a_s2r.load(a_cur1)
+            if const_expr(not hoist_a1):
+                a1 = a_s2r.load(a_cur1)
             a_g2s.load(a_cur0, a0_off + (ka + 2) * a_k_step)
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
@@ -1296,6 +1381,7 @@ def _compile_dense_bf16_nt(
     agpr_alloc=0,
     nt_vmcnt=3,
     c_cache_modifier=0,
+    quad_cols=False,
 ):
     assert M % BLOCK_M == 0, "A/C are rebased per M block; a ragged M needs the masked path"
     N_BLOCKS_M = M // BLOCK_M
@@ -1338,6 +1424,7 @@ def _compile_dense_bf16_nt(
                 pair_n=N % 2 == 0,
                 n_tail=N % BLOCK_N,
                 c_cache_modifier=c_cache_modifier,
+                quad_cols=quad_cols,
             )
 
         _do_tile(fx.block_idx.x)
@@ -1365,8 +1452,30 @@ _DENSE_BF16_CFG = {
     # this store instruction) -- measured a consistent small win on NT's C store across
     # multiple independent sessions; NN's C store is a different width/pattern (2 B/lane vs
     # NT's 4 B/lane) and measured net-negative here, so it stays off on NN.
+    # quad_cols=True (charter mechanism 3, round 9): genuine four-way NT B feed -- see
+    # compute_global_swizzle_bf16's quad_phase_step, S2RLoader16x16Bf16Quad and
+    # StoreCBf16.store_band_quad4. Measured register-neutral (.vgpr_count 255/255, no spill,
+    # byte-identical accum_offset/agpr_count to the two-way champion) and instruction-count-
+    # neutral everywhere except the epilogue store, which halves as designed (64
+    # buffer_store_dword -> 32 buffer_store_dwordx2, same 256 B moved); MFMA/ds_read_b128/
+    # buffer_load_dwordx4/s_barrier counts are all exactly unchanged (2880/1080/360/361). Output
+    # is byte-identical to the two-way champion on every tested shape and every column residue
+    # class mod 4 (production forward shape plus three smaller aligned shapes), SNR 390.829 dB,
+    # fully deterministic. Four balanced AB/BA cfg_probe pairs (15 reps each, alternating which
+    # variant runs first) all show a forward speedup: champion median 16.536 ms vs quad median
+    # 16.216 ms, -1.93%, range -1.72% to -2.25% across the four pairs -- comfortably inside the
+    # round's abort gate (forward must not be >+1% worse; it is ~2% better).  NN/TN are
+    # untouched by this change (dense_mma_chunked_bf16, the shared NN/TN pipeline, has no
+    # quad_cols parameter at all), so dgrad/wgrad are byte-identical to the pre-round champion.
     "nt": dict(
-        BLOCK_M=256, BLOCK_N=256, GROUP_M=8, num_xcd=8, waves_per_eu=2, agpr_alloc=64, c_cache_modifier=2
+        BLOCK_M=256,
+        BLOCK_N=256,
+        GROUP_M=8,
+        num_xcd=8,
+        waves_per_eu=2,
+        agpr_alloc=64,
+        c_cache_modifier=2,
+        quad_cols=True,
     ),
     # block_threads=256 (4 waves, 1 wave/SIMD -- see dense_bf16_chunked_tile) was measured and
     # REJECTED at this same (256,256)+tail tile: with waves_per_eu left at 2 the compiler still
