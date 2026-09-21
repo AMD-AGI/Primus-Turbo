@@ -106,3 +106,47 @@ done
 **`--user "$(id -u):$(id -g)"` 是必须的。** 不加它容器以 root 身份写出产物目录，
 宿主这边之后就写不进去了——op-evolve 为同一个原因在每条命令前加 `PYTHONDONTWRITEBYTECODE=1`。
 命令里**没有** `--device /dev/kfd`、**没有** `--device /dev/dri`，这是有意的。
+
+---
+
+# B4：候选网格的机制（`--set`），以及第一次试用
+
+`compile_only_driver.py` 加了 `--set NAME=VALUE`。它**拷贝整个实现目录再改源码里的常量**，
+不是 import 之后 `setattr`。
+
+理由：可调常量是模块级的，而**有意思的那些旁边都跟着 import 期算好的派生常量**——
+`DELTA_THREADS` 喂 `LANES_PER_ROW` / `ROWS_PER_PASS` / `PASSES_PER_WG`，`D` 喂 `NDT` / `NDO`，
+`KV_STEP` 喂 `NKT`。import 之后再改父常量，派生值全部停在旧值上，**而内核照样编译成功**。
+产出的会是一个「不是你要的那个候选」，且一声不吭。
+
+这也正是作业自己造臂的方式：`rounds/001/_scratch` 下的 armA/armB/armAB 都是**整目录拷贝**。
+身份规则也一致：**目录就是候选**。
+
+打错的旋钮是**硬失败**，不是静默 no-op：
+
+```
+knob 'NO_SUCH_KNOB' is not a module-level constant in .../kernels.py.
+Screening would have silently compiled the unmodified kernel.
+```
+
+一个拼错的旋钮安静地筛了未修改的内核，正是那种「看起来像真结果」的结果。
+
+## 第一次试用：`KV_STEP` 32 → 64
+
+| variant | kernel | wmma | tr16 | instr | vgpr | LDS | spill |
+|---|---|--:|--:|--:|--:|--:|--:|
+| baseline | `k_dq` | 24 | 16 | 830 | 269 | 8192 | 0 |
+| `KV_STEP=64` | `k_dq` | 24 | 16 | **990** | 264 | **16384** | 0 |
+| baseline | `k_dkdv` | 24 | 18 | 898 | 255 | 9216 | 0 |
+| `KV_STEP=64` | `k_dkdv` | 24 | 18 | 898 | 255 | 9216 | 0 |
+
+`k_dkdv` **一个字节都没动**——正确，`KV_STEP` 只进 `k_dq`。这本身就是这次试用要验的东西：
+改一个旋钮不应该扰动不相干的内核，而它确实没有。派生的 `NKT` 跟着 `KV_STEP` 重算了。
+
+`k_dq` 的 LDS 翻倍到 16384（staging 64 个 key 而不是 32），指令 +19%，vgpr 略降。
+
+**但不要从这张表得出「KV_STEP=64 更好或更差」的结论。**
+`KV_STEP` 决定 `Skv / KV_STEP` 跑多少次循环——**它是一个改 trip count 的旋钮**，
+而上面已经确立：**静态筛对 trip count 是瞎的**（armA 就是同一条教训）。
+这张表能说的只有两件事：它**过了 spill 硬门**（可以安全发射），以及它**把 LDS 翻倍了**
+（那正是 armB 只拿到 1.13× 而不是 1.5× 的那条嫌疑机理）。**排序必须靠实测。**

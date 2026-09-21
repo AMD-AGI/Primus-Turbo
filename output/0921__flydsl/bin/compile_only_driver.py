@@ -94,6 +94,49 @@ def preload_aiter_shims():
     return used
 
 
+def materialise(impl_dir, overrides, workdir):
+    """Copy an implementation and rewrite module-level constants in its kernels.py.
+
+    WHY A COPY AND NOT setattr AFTER IMPORT. The tunable constants are module-level and
+    most of the interesting ones have DERIVED constants computed beside them at import
+    time -- DELTA_THREADS feeds LANES_PER_ROW, ROWS_PER_PASS and PASSES_PER_WG; D feeds
+    NDT and NDO. Rebinding the parent after import leaves every derived value at its old
+    setting, and the kernel still compiles. It would produce a candidate that is not the
+    candidate you asked for and reports no error at all.
+
+    Rewriting the source and re-importing is also how the job's own arms are built:
+    armA/armB/armAB under rounds/001/_scratch are whole directory copies, not patched
+    imports. Same identity rule as load_kernels -- the directory IS the candidate.
+
+    Only `NAME = <number>` at column zero is rewritten, so a same-named local inside a
+    function is untouched. A name that is not found is an error rather than a silent
+    no-op: a typo'd knob that quietly screens the unmodified kernel is exactly the shape
+    of result that looks real.
+    """
+    import re as _re
+    import shutil
+
+    dst = os.path.join(workdir, os.path.basename(impl_dir.rstrip("/")))
+    if os.path.isdir(dst):
+        shutil.rmtree(dst)
+    shutil.copytree(impl_dir, dst)
+    path = os.path.join(dst, "kernels.py")
+    src = open(path).read()
+    applied = {}
+    for name, value in overrides.items():
+        pat = _re.compile(rf"^({_re.escape(name)}\s*=\s*)([-\w.]+)", _re.M)
+        hit = pat.search(src)
+        if not hit:
+            raise SystemExit(
+                f"knob {name!r} is not a module-level constant in {path}. "
+                f"Screening would have silently compiled the unmodified kernel."
+            )
+        applied[name] = {"from": hit.group(2), "to": value}
+        src = pat.sub(rf"\g<1>{value}", src, count=1)
+    open(path, "w").write(src)
+    return dst, applied
+
+
 def load_kernels(impl_dir):
     """Import kernels.py from impl_dir under a name unique to that directory.
 
@@ -262,6 +305,11 @@ def main():
     ap.add_argument("--skv", type=int, default=8192)
     ap.add_argument("--hq", type=int, default=32)
     ap.add_argument("--hkv", type=int, default=8)
+    ap.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
+                    help="override a module-level constant in kernels.py (repeatable)")
+    ap.add_argument("--workdir", default="/tmp/flyscreen",
+                    help="where --set materialises the patched copy")
+    ap.add_argument("--tag", default=None, help="label carried into the JSON record")
     a = ap.parse_args()
 
     os.environ["FLYDSL_DUMP_IR"] = "1"
@@ -275,12 +323,19 @@ def main():
     witness = assert_arch()
     witness["aiter_shims"] = preload_aiter_shims()
     shape = {"b": a.b, "sq": a.sq, "skv": a.skv, "hq": a.hq, "hkv": a.hkv}
-    k = load_kernels(a.impl)
+    impl = a.impl
+    applied = {}
+    if a.set:
+        overrides = dict(kv.split("=", 1) for kv in a.set)
+        os.makedirs(a.workdir, exist_ok=True)
+        impl, applied = materialise(a.impl, overrides, a.workdir)
+    k = load_kernels(impl)
     built = build_all(k, shape)
     isa = scan_isa(a.dump_dir)
 
-    report = {"witness": witness, "impl": os.path.abspath(a.impl),
-              "shape": shape, "built": built, "isa": isa}
+    report = {"witness": witness, "impl": os.path.abspath(impl),
+              "source_impl": os.path.abspath(a.impl), "tag": a.tag,
+              "overrides": applied, "shape": shape, "built": built, "isa": isa}
     text = json.dumps(report, indent=1)
     if a.json:
         open(a.json, "w").write(text)
