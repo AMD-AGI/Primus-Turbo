@@ -1,0 +1,4 @@
+# Compiler dumps: 21 MLIR stages per kernel per candidate, regenerated in seconds by
+# bin/compile_only_driver.py. The JSON summaries beside them are the durable record.
+a0dump/
+isa/*/
