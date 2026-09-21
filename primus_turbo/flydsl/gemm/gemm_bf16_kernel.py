@@ -365,8 +365,13 @@ def dense_mma_pipeline_bf16(
             # frag_even[1::2]=phase2, frag_odd[1::2]=phase3; for a fixed lane these four land on
             # four CONSECUTIVE real columns, so store_band_quad4 packs them into one dwordx2.
             store_c.store_band_quad4(
-                frag_even[0::2], frag_odd[0::2], frag_even[1::2], frag_odd[1::2],
-                row, pair_col, mask_cols=not col_safe,
+                frag_even[0::2],
+                frag_odd[0::2],
+                frag_even[1::2],
+                frag_odd[1::2],
+                row,
+                pair_col,
+                mask_cols=not col_safe,
             )
         if const_expr(pair_cols):
             store_c.store_band_pair16(frag_even, frag_odd, row, pair_col, N_TILES_B, mask_cols=not col_safe)
@@ -489,7 +494,9 @@ def gemm_bf16_nt_tile(
     _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
     store_c = StoreCBf16(C, c_m, c_n, _out_ty, cache_modifier=c_cache_modifier)
 
-    def _run(pair_cols, grid, half_n, col_safe=False, b_steps=N_LDS_STEPS_B, pair_tiles=False, quad_cols=False):
+    def _run(
+        pair_cols, grid, half_n, col_safe=False, b_steps=N_LDS_STEPS_B, pair_tiles=False, quad_cols=False
+    ):
         # The bodies differ only in B's column layout, so the loader is re-pointed, not duplicated.
         n_a, n_b, w_m, w_n = grid
         if quad_cols:
@@ -510,9 +517,7 @@ def gemm_bf16_nt_tile(
             b_g2s.gl_offsets = gl_off_b
         b_g2s.n_load_steps = b_steps
         n_a16, n_b16 = 2 * n_a, 2 * n_b
-        b_s2r = (
-            S2RLoader16x16Bf16Quad(w_n, LDS_BLOCK_N // 2) if quad_cols else S2RLoader16x16Bf16(w_n, n_b16)
-        )
+        b_s2r = S2RLoader16x16Bf16Quad(w_n, LDS_BLOCK_N // 2) if quad_cols else S2RLoader16x16Bf16(w_n, n_b16)
         dense_mma_pipeline_bf16(
             lds,
             a_g2s,
@@ -1252,9 +1257,7 @@ def dense_bf16_chunked_tile(
         )
         emit_if_then(
             (block_n + 1) * BLOCK_N > c_n,
-            lambda: _run(
-                TAIL_N_A16, 2, wave_id // 2, wave_id % 2, True, TAIL_B_STEPS, n_tail % 32 != 0, 2
-            ),
+            lambda: _run(TAIL_N_A16, 2, wave_id // 2, wave_id % 2, True, TAIL_B_STEPS, n_tail % 32 != 0, 2),
         )
 
 

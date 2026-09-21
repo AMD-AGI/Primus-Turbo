@@ -2202,9 +2202,7 @@ def make_fp16_bf16_buffer_tensor(arg):
     return fx.rocdl.make_buffer_tensor(arg, max_size=False)
 
 
-def compute_global_swizzle_bf16(
-    lane_id, wave_id, K, n_rounds, row_step=1, pair_span=0, quad_phase_step=0
-):
+def compute_global_swizzle_bf16(lane_id, wave_id, K, n_rounds, row_step=1, pair_span=0, quad_phase_step=0):
     """Per-lane global element offsets feeding one LDS chunk of a [rows, K] operand.
     ``row_step`` strides the global row and ``pair_span`` permutes it within a group, both so a
     reader holds even and odd output columns; neither changes the rows a chunk fetches.
