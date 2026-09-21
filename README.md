@@ -20,9 +20,9 @@ Note: JAX support is under active development. Optim support is planned but not 
 ## 🚀 What's New
 
 - **[2026/09/16]** 🔥 **Release v0.5.0** — Mega MoE / GroupedMLP MXFP8 maturity, FlyDSL grouped GEMM BF16, and operator auto-tune on MI355X ([changes since v0.4.0](https://github.com/AMD-AGI/Primus-Turbo/compare/v0.4.0...main)).
-- **[2026/08/18]** 🔥 **Mega MoE (MXFP8)** — fused forward and backward on the BF16 megakernel: dispatch+FC1 and FC2+combine with intra-node EP (#456).
+- **[2026/08/25–09/14]** 🔥 **Fused GroupedMLP (FP8 / MXFP8)** — expert MLP with SwiGLU folded into grouped GEMM; pad-aware paths for GPT-OSS-20B-style MoE (#476, #488, #503).
+- **[2026/08/18]** 🔥 **Mega MoE (MXFP8)** — fused forward and backward in the MXFP8 Mega MoE path: dispatch+FC1 and FC2+combine with intra-node EP (#456).
 - **[2026/07/15]** 🔥 **Mega MoE (BF16)** — FlyDSL fused MoE layer with comm–compute overlap inside the grouped GEMMs ([overview](./docs/README_Mega_MoE.md)) (#412).
-- **[2026/08]** 🔥 **Fused GroupedMLP (FP8 / MXFP8)** — expert MLP with SiGLU folded into grouped GEMM; pad-aware paths for GPT-OSS-20B-style MoE (#476, #488, #503).
 - **[2026/07]** 🔥 **MXFP4 GEMM & grouped GEMM** — FlyDSL and hipBLASLt stacks for dense and expert GEMMs in low-precision training (#424, #483).
 - **[2026/07/30]** 🔥 **Release v0.4.0** — grouped GEMM autotune, MXFP4 correctness, and Mega MoE stability fixes on gfx950.
 - **[2026/06/10]** 🔥 **DeepEP** — JAX intranode/internode token dispatch; PyTorch `DeepEPTokenDispatcher` and rocSHMEM integration for MoE all-to-all (#344, #409, [guide](./primus_turbo/pytorch/deep_ep/README.md)).
