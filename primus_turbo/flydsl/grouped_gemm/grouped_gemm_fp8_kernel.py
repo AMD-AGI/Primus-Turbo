@@ -681,7 +681,10 @@ def _compile_grouped_nn(
                 a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K)
                 if const_expr(_ld_b1):
                     b_g2s.load(b_next1, _b1_off + arith.index(1 * BLOCK_K) * cn_i)
-                wait_barrier(_w2)
+                # K_ITERS == 2 skips the main loop, so the tail reads a_next0 before its own
+                # wait_barrier(0). _w2 already lands b_next0; drain fully because the body
+                # variants (_full / _mfull / _ld_b1) each issue a different load count.
+                wait_barrier(0 if K_ITERS == 2 else _w2)
 
                 for k in range_constexpr(K_ITERS - 2):
                     # b0's reads stay in flight: a0 is read after them and lgkm retires in order,
@@ -1579,7 +1582,9 @@ def _compile_grouped_nt(
             b_g2s.load(b_next0, B0_gl_offset + 1 * BLOCK_K)
             a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K)
             b_g2s.load(b_next1, B1_gl_offset + 1 * BLOCK_K)
-            wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
+            # K_ITERS == 2 skips the main loop, so nothing drains k=1's b_next0/a_next0 before
+            # the tails read them. (The distance-2 body above stages and drains all four.)
+            wait_barrier(0 if K_ITERS == 2 else N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
 
             for k in range_constexpr(K_ITERS - 2):
                 b0_frag = b_s2r.load(b_cur0)

@@ -182,7 +182,9 @@ def dense_mma_pipeline_bf16(
     if const_expr(not half_n):
         b_g2s.load(b_next1, B1_gl_offset + 1 * b_k_step)
 
-    wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B + B1_STEPS)
+    # K_ITERS == 2 skips the main loop, leaving the tail's b_next0 read with no vmcnt wait.
+    # B1_STEPS lands it either way: full-N leaves b_next1 behind it, half-N issues nothing after.
+    wait_barrier(B1_STEPS if K_ITERS == 2 else N_LDS_STEPS_A + N_LDS_STEPS_B + B1_STEPS)
 
     for k in range_constexpr(K_ITERS - 2):
         b0_frag = b_s2r.load(b_cur0)

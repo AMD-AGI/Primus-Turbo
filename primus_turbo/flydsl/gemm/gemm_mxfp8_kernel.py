@@ -221,7 +221,10 @@ def _build_mxfp8_nt_kernel(
         a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K)
         b_g2s.load(b_next1, B1_gl_offset + 1 * BLOCK_K)
 
-        wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
+        # Same zero-iteration hazard as the dense fp8 NT kernel, with no incidental cover:
+        # K_ITERS == 2 skips the main loop and the non-transpose S2RLoader emits no s_waitcnt
+        # of its own, so k=1's b_next0/a_next0 have to land here.
+        wait_barrier(N_LDS_STEPS_B if K_ITERS == 2 else N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
 
         # 1-deep broadcast scale prefetch (preload k=0, prefetch k+1 in-loop).
         sa0 = sa_s2r.load(sa_base0, 0)
