@@ -81,7 +81,8 @@ def _make_config():
 
 
 def test_grouped_gemm_fp4_variable_k_dispatch_keys():
-    a = torch.empty((512, 2048), device="meta", dtype=float4_e2m1fn_x2)
+    fp4_dtype = float4_e2m1fn_x2 if float4_e2m1fn_x2 is not None else torch.uint8
+    a = torch.empty((512, 2048), device="meta", dtype=fp4_dtype)
     group_lens = torch.empty((8,), device="meta", dtype=torch.int64)
     common = dict(
         a=a,
@@ -98,13 +99,13 @@ def test_grouped_gemm_fp4_variable_k_dispatch_keys():
     )
 
     key_n3072 = GroupedGEMMFP4VariableKKernelDispatcher.make_key(
-        b=torch.empty((3072, 2048), device="meta", dtype=float4_e2m1fn_x2), **common
+        b=torch.empty((3072, 2048), device="meta", dtype=fp4_dtype), **common
     )
     key_n4096 = GroupedGEMMFP4VariableKKernelDispatcher.make_key(
-        b=torch.empty((4096, 2048), device="meta", dtype=float4_e2m1fn_x2), **common
+        b=torch.empty((4096, 2048), device="meta", dtype=fp4_dtype), **common
     )
     accumulation_key = GroupedGEMMFP4VariableKKernelDispatcher.make_key(
-        b=torch.empty((3072, 2048), device="meta", dtype=float4_e2m1fn_x2),
+        b=torch.empty((3072, 2048), device="meta", dtype=fp4_dtype),
         inplace_add_to_out=True,
         **common,
     )
@@ -116,6 +117,11 @@ def test_grouped_gemm_fp4_variable_k_dispatch_keys():
 
 
 def test_grouped_gemm_fp4_variable_k_dispatch_contract(monkeypatch):
+    fp4_dtype = float4_e2m1fn_x2 if float4_e2m1fn_x2 is not None else torch.uint8
+    monkeypatch.setattr(
+        "primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp4_impl.float4_e2m1fn_x2",
+        fp4_dtype,
+    )
     monkeypatch.setattr(
         "primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp4_impl.is_gfx942", lambda: False
     )
@@ -123,8 +129,8 @@ def test_grouped_gemm_fp4_variable_k_dispatch_contract(monkeypatch):
         "primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp4_impl.is_gfx950", lambda: True
     )
 
-    a = torch.empty((128, 256), device="meta", dtype=float4_e2m1fn_x2)
-    b = torch.empty((64, 256), device="meta", dtype=float4_e2m1fn_x2)
+    a = torch.empty((128, 256), device="meta", dtype=fp4_dtype)
+    b = torch.empty((64, 256), device="meta", dtype=fp4_dtype)
     kwargs = dict(
         a=a,
         b=b,
