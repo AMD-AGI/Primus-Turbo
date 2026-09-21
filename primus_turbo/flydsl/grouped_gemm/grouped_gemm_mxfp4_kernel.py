@@ -104,8 +104,8 @@ _GMXFP4_SKEW_CUS = 128  # skew ranks: ranks >= this get zero delay, not a capped
 # (NT total improves in all 6/6 rounds, worst round -0.17%) and is statistically tied for best
 # mean NT total (-0.88%, vs 64's -0.89%, 0's -0.84%, 192's only -0.24%); uniquely among the
 # sweep it also improves dgrad_gate_up in 6/6 rounds (mean -1.12%, never positive) AND improves
-# dgrad_down on average (mean -0.22%, vs +0.34%/+0.45% regression at CUS=0/64) -- see r7/
-# goal.md P4 sub-lever 3 for the full per-round table and the drift bug this sweep replaced.
+# dgrad_down on average (mean -0.22%, vs +0.34%/+0.45% regression at CUS=0/64). These paired
+# measurements replace the earlier non-interleaved sweep that was confounded by session drift.
 _GMXFP4_SKEW_STEP = 2  # s_sleep units (~64 clocks) per skew rank; round 7 swept {0,1,2,4} at
 # CUS=256 and found STEP alone does not reproduce the CUS win (it softens the same ramp for all
 # 256 ranks rather than dropping the long high-rank tail), so STEP is left at its prior value.
@@ -1416,9 +1416,9 @@ def grouped_gemm_mxfp4_flydsl_kernel(
     grid_upper = (ceildiv(total_M, 256) + G) * n_blocks
     a_pre_grid = ceildiv(slab_rows * K128, _PRESHUF_FO * _PRESHUF_BLK)
 
-    # current_stream(dev) (gemm_helper.py) is the same live per-call stream lookup WGRAD
-    # already uses at :1849 -- it returns the raw stream pointer FlyDSL's launch/args tuple
-    # accepts, skipping the ~2us Python torch.cuda.Stream wrapper that current_stream() builds.
+    # current_stream(dev) (gemm_helper.py) is the same live per-call stream lookup used by the
+    # WGRAD path below. It returns the raw stream pointer FlyDSL's launch/args tuple accepts,
+    # skipping the ~2us Python torch.cuda.Stream wrapper that torch.cuda.current_stream() builds.
     stream = current_stream(dev)
     wlv, elgk = 10, 9
     args = (
