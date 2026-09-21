@@ -6,6 +6,8 @@
 ###############################################################################
 #
 # Run gfx950-only PyTorch tests on an MI350X / MI355X host.
+# Lives under tests/ next to conftest; a gfx1250 (MI455X) sibling can be added
+# later as tests/run_gfx1250_tests.sh.
 #
 # CI currently covers gfx942 (MI300X) only. Cases that require gfx950 are
 # marked with @pytest.mark.gfx950 (or auto-promoted from matching skipif
