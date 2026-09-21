@@ -25,7 +25,7 @@ from primus_turbo.pytorch.core.quantized_tensor import (
 )
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.ops import gemm_fp8
-from tests.pytorch.test_utils import compute_snr
+from tests.pytorch.test_utils import compute_snr, gfx950_param
 
 torch.manual_seed(42)
 
@@ -221,7 +221,7 @@ def _run_gemm_fp8_deterministic_test(
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
-    "backend", [None, BackendType.TRITON, BackendType.CK, BackendType.HIPBLASLT, BackendType.FLYDSL]
+    "backend", [None, BackendType.TRITON, BackendType.CK, BackendType.HIPBLASLT, gfx950_param(BackendType.FLYDSL, id="FLYDSL")]
 )
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype, backend, auto_tune):
@@ -296,8 +296,9 @@ def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, block_size, backend,
 @pytest.mark.parametrize("layout", ["NT"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT, BackendType.TURBO, BackendType.FLYDSL])
+@pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT, BackendType.TURBO, gfx950_param(BackendType.FLYDSL, id="FLYDSL")])
 @pytest.mark.parametrize("auto_tune", [False, True])
+@pytest.mark.gfx950
 def test_gemm_fp8_mx_blockwise(m, n, k, layout, format, dtype, backend, auto_tune):
     # NOTE: m, n and k must be multiples of 16 for MX_BLOCKWISE.
     assert m % 16 == 0 and n % 16 == 0 and k % 16 == 0, "m, n and k must be multiples of 16"
@@ -477,7 +478,7 @@ def _run_gemm_fp8_quantized_tensor_test(
 @pytest.mark.parametrize("layout", ["NT", "NN"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.FLYDSL])
+@pytest.mark.parametrize("backend", [None, BackendType.CK, BackendType.HIPBLASLT, gfx950_param(BackendType.FLYDSL, id="FLYDSL")])
 def test_gemm_fp8_tensorwise_quantized_tensor(m, n, k, layout, format, dtype, backend):
     """TENSORWISE gemm with pre-quantized QuantizedTensor inputs."""
     _run_gemm_fp8_quantized_tensor_test(
@@ -519,6 +520,7 @@ def test_gemm_fp8_rowwise_quantized_tensor(m, n, k, layout, format, dtype, backe
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT, BackendType.TURBO])
+@pytest.mark.gfx950
 def test_gemm_fp8_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, backend):
     # NOTE: m, n and k must be multiples of 16 for MX_BLOCKWISE.
     assert m % 16 == 0 and n % 16 == 0 and k % 16 == 0, "m, n and k must be multiples of 16"
@@ -578,7 +580,7 @@ def test_gemm_fp8_blockwise_quantized_tensor(m, n, k, layout, format, dtype, bac
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
-    "backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, BackendType.FLYDSL]
+    "backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, gfx950_param(BackendType.FLYDSL, id="FLYDSL")]
 )
 @pytest.mark.deterministic
 def test_gemm_fp8_tensorwise_deterministic(m, n, k, layout, format, dtype, backend):
@@ -766,7 +768,7 @@ def _run_gemm_fp8_fused_grad_accum_test(
 @pytest.mark.parametrize("layout", ["NT", "NN", "TN"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.HYBRID])
-@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.HIPBLASLT, BackendType.FLYDSL])
+@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.HIPBLASLT, gfx950_param(BackendType.FLYDSL, id="FLYDSL")])
 def test_gemm_fp8_tensorwise_fused_grad_accum(layout, dtype, format, backend):
     if backend == BackendType.FLYDSL and get_device_compute_capability() < (9, 5):
         pytest.skip("FlyDSL fp8 GEMM is gfx950-only")
@@ -786,7 +788,8 @@ def test_gemm_fp8_tensorwise_fused_grad_accum(layout, dtype, format, backend):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.HYBRID])
-@pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT, BackendType.FLYDSL])
+@pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT, gfx950_param(BackendType.FLYDSL, id="FLYDSL")])
+@pytest.mark.gfx950
 def test_gemm_fp8_mx_fused_grad_accum(dtype, format, backend):
     """MXFP8 is NT-only, so the layout sweep collapses to a single entry."""
     if get_device_compute_capability() < (9, 5):

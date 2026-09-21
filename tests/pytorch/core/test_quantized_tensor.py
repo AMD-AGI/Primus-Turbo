@@ -28,6 +28,9 @@ from tests.pytorch.test_utils import get_tolerances
 MXFP8_SUPPORT, _ = check_mxfp8_support()
 MXFP4_SUPPORT, _ = check_mxfp4_support()
 
+# MXFP* needs gfx950+. Keep these as plain skipif MarkDecorators so they work
+# both as ``@SKIP_MXFP8`` and as ``marks=SKIP_MXFP8``; conftest auto-promotes
+# matching skipif reasons into the ``gfx950`` marker for ``-m gfx950``.
 SKIP_MXFP8 = pytest.mark.skipif(not MXFP8_SUPPORT, reason="MXFP8 not supported on this device")
 SKIP_MXFP4 = pytest.mark.skipif(not MXFP4_SUPPORT, reason="MXFP4 not supported on this device")
 

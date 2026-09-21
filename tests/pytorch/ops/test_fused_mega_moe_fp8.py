@@ -80,6 +80,9 @@ _COSINE_FLOOR = 0.995
 # Same as the bf16 suite: match the small tensor-level grad norm seen under real loss scaling.
 _GRAD_OUT_NORM = 1e-3
 
+# Whole suite is gfx950 / MXFP8-only.
+pytestmark = pytest.mark.gfx950
+
 skip_unless_mxfp8 = unittest.skipUnless(
     torch.cuda.is_available() and check_mxfp8_support()[0], "mxfp8 mega MoE requires gfx950"
 )

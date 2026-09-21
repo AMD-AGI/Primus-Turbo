@@ -490,6 +490,7 @@ print("optimized Gluon direct apply rejected before launch")
     ),
     _GLUON_CORRECTNESS_CASES,
 )
+@pytest.mark.gfx950
 def test_gluon_correctness_gfx950(
     dtype,
     qkv_format,
@@ -557,6 +558,7 @@ def test_gluon_correctness_gfx950(
         pytest.param(torch.bfloat16, "bhsd", 512, id="bf16-bhsd-s512"),
     ],
 )
+@pytest.mark.gfx950
 def test_gluon_short_causal_compile_boundaries_gfx950(dtype, qkv_format, seqlen):
     """The aligned D128 causal specialization compiles at S384/S512."""
     device = _gfx950_device_for_test()
@@ -596,6 +598,7 @@ def test_gluon_short_causal_compile_boundaries_gfx950(dtype, qkv_format, seqlen)
     ],
 )
 @pytest.mark.filterwarnings("error:Dynamo detected a call to a .*lru_cache.*attention_impl\\.py")
+@pytest.mark.gfx950
 def test_gluon_compile_fullgraph_values_and_exact_strides_gfx950(
     qkv_format,
     expected_output_stride,
@@ -655,6 +658,7 @@ def test_gluon_compile_fullgraph_values_and_exact_strides_gfx950(
     torch.testing.assert_close(compiled_lse, eager_lse, rtol=0, atol=0)
 
 
+@pytest.mark.gfx950
 def test_gluon_non_default_stream_uses_q_device_gfx950():
     device_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
     target_device = _gfx950_device_for_test(prefer_nonzero=device_count >= 2)
@@ -720,6 +724,7 @@ def test_gluon_non_default_stream_uses_q_device_gfx950():
 
 
 @pytest.mark.deterministic
+@pytest.mark.gfx950
 def test_gluon_repeatability_is_bitwise_after_warmup_gfx950():
     device = _gfx950_device_for_test()
     generator = torch.Generator(device=device).manual_seed(20260818)

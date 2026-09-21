@@ -27,6 +27,9 @@ from tests.pytorch.ref.gemm_ref import (
 )
 from tests.pytorch.test_utils import compute_snr
 
+# MXFP4 grouped GEMM is gfx950-only (check_mxfp4_support).
+pytestmark = pytest.mark.gfx950
+
 torch.manual_seed(42)
 
 # Sweep parameters. MXFP4 is NT-only (trans_b=True), single E2M1 format, Triton

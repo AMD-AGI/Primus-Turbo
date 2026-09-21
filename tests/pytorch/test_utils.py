@@ -19,6 +19,19 @@ def is_ROCM():
     return torch.cuda.is_available() and torch.version.hip
 
 
+def gfx950_param(value, **kwargs):
+    """``pytest.param`` that also carries the ``gfx950`` marker.
+
+    Use for backends / recipes that only run on MI350X/MI355X (e.g. FlyDSL
+    MXFP*, Mega MoE) so ``pytest -m gfx950`` / ``tools/run_gfx950_tests.sh``
+    can select them without re-running the whole hybrid file.
+    """
+    marks = kwargs.pop("marks", ())
+    if not isinstance(marks, (list, tuple)):
+        marks = (marks,) if marks else ()
+    return pytest.param(value, marks=(pytest.mark.gfx950, *marks), **kwargs)
+
+
 # TODO: Need to check again whether these values are reasonable.
 def get_tolerances(dtype):
     if dtype == torch.float32:

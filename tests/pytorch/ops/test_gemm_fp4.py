@@ -24,6 +24,9 @@ from primus_turbo.pytorch.core.quantized_tensor import (
 from primus_turbo.pytorch.ops.gemm_fp4 import FP4GemmMXFunction, gemm_fp4
 from tests.pytorch.test_utils import compute_snr
 
+# MXFP4 dense GEMM is gfx950-only (check_mxfp4_support / FlyDSL path).
+pytestmark = pytest.mark.gfx950
+
 torch.manual_seed(42)
 
 

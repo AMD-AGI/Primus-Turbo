@@ -17,7 +17,7 @@ from tests.pytorch.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
     grouped_gemm_ref,
 )
-from tests.pytorch.test_utils import compute_snr, get_tolerances
+from tests.pytorch.test_utils import compute_snr, get_tolerances, gfx950_param
 
 
 @pytest.mark.parametrize("B", [1, 2, 3, 8, 16, 32])
@@ -30,7 +30,14 @@ from tests.pytorch.test_utils import compute_snr, get_tolerances
 @pytest.mark.parametrize("trans_b", [True, False])
 @pytest.mark.parametrize("reduce_num_cu", [0, 16, 32])
 @pytest.mark.parametrize(
-    "backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, BackendType.FLYDSL]
+    "backend",
+    [
+        None,
+        BackendType.CK,
+        BackendType.HIPBLASLT,
+        BackendType.TRITON,
+        gfx950_param(BackendType.FLYDSL, id="FLYDSL"),
+    ],
 )
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu, backend, auto_tune):
@@ -363,7 +370,7 @@ def test_grouped_gemm_with_zero_length_groups(B, M, N_K, dtype, trans_b, backend
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("balance", [True, False])
 @pytest.mark.parametrize("trans_b", [True, False])
-@pytest.mark.parametrize("backend", [BackendType.TRITON, BackendType.CK])
+@pytest.mark.parametrize("backend", [BackendType.TRITON, gfx950_param(BackendType.CK, id="CK")])
 def test_grouped_gemm_schedule_work_steal(B, M, N_K, dtype, balance, trans_b, backend):
     """``schedule="work_steal"`` on each WS-capable backend matches the static
     path bit-for-bit for forward and backward (per-tile accumulator order is
@@ -410,7 +417,7 @@ def test_grouped_gemm_schedule_work_steal(B, M, N_K, dtype, balance, trans_b, ba
     GlobalBackendManager.reset()
 
 
-@pytest.mark.parametrize("backend", [BackendType.TRITON, BackendType.CK])
+@pytest.mark.parametrize("backend", [BackendType.TRITON, gfx950_param(BackendType.CK, id="CK")])
 def test_grouped_gemm_schedule_work_steal_single_group(backend):
     """Single-group degenerate case (G=1): the dispatcher special-cases this
     to call non-grouped gemm; ``schedule`` must be accepted (and ignored)
@@ -643,7 +650,9 @@ def test_grouped_gemm_padded_tail_zeroed(dtype, trans_b, backend):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("balance", [True, False])
 @pytest.mark.parametrize("trans_c", [False, True])
-@pytest.mark.parametrize("backend", [BackendType.TRITON, BackendType.FLYDSL], ids=["TRITON", "FLYDSL"])
+@pytest.mark.parametrize(
+    "backend", [BackendType.TRITON, gfx950_param(BackendType.FLYDSL, id="FLYDSL")]
+)
 def test_grouped_gemm_variable_k_backend(B, M, N_K, dtype, balance, trans_c, backend):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")

@@ -26,6 +26,7 @@ import os
 import unittest
 
 import numpy as np
+import pytest
 import torch
 import torch.distributed as dist
 from torch.testing._internal.common_distributed import (
@@ -67,6 +68,9 @@ def _dequant_mxfp8(q, s_raw, block=_MXFP8_BLOCK):
 skip_unless_mxfp8 = unittest.skipUnless(
     torch.cuda.is_available() and check_mxfp8_support()[0], "mxfp8 mega MoE requires gfx950"
 )
+
+# Whole suite is gfx950 / MXFP8-only (selected by tools/run_gfx950_tests.sh).
+pytestmark = pytest.mark.gfx950
 
 
 @instantiate_parametrized_tests

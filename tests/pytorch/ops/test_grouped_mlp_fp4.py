@@ -24,6 +24,9 @@ from primus_turbo.pytorch.core.low_precision import (
 from primus_turbo.pytorch.ops.grouped_mlp_fp4 import grouped_mlp_fp4
 from tests.pytorch.test_utils import compute_snr
 
+# MXFP4 grouped MLP is gfx950-only (see check_mxfp4_support).
+pytestmark = pytest.mark.gfx950
+
 # The op measures 10.15-10.88 dB across these shapes and tensors, the same band a
 # single MXFP4 grouped GEMM sits in; grad_probs on the last shape is the tightest.
 # The threshold sits just under that rather than at the fp4 GEMM suite's 8 dB, so a

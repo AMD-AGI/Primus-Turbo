@@ -35,6 +35,9 @@ from primus_turbo.pytorch.core.utils import is_gfx942, is_gfx950
 from primus_turbo.pytorch.ops.grouped_mlp_fp8 import grouped_mlp_fp8
 from tests.pytorch.test_utils import compute_snr
 
+# Currently unsupported on gfx942; MX_BLOCKWISE / fused MXFP8 epilogues need gfx950.
+pytestmark = pytest.mark.gfx950
+
 # fp8 puts a floor of ~55 dB on a single GEMM; stacking two of them and their
 # quantisations costs roughly half of that, and the whole op measures ~23.7 dB
 # across these shapes, forward and backward alike. MXFP8 lands in the same band.

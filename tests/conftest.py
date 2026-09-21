@@ -55,6 +55,36 @@ def pytest_addoption(parser):
 def pytest_configure(config):
     config.addinivalue_line("markers", "multigpu: mark test as requiring multiple GPUs")
     config.addinivalue_line("markers", "deterministic: mark test as deterministic-only suite")
+    config.addinivalue_line(
+        "markers",
+        "gfx950: requires gfx950 (MI350X/MI355X); not exercised on CI gfx942 hosts — "
+        "run via tools/run_gfx950_tests.sh on an MI355X box",
+    )
+
+
+def _skipif_reason(mark) -> str:
+    """Best-effort extract of a skipif reason string."""
+    if mark.kwargs.get("reason"):
+        return str(mark.kwargs["reason"])
+    if len(mark.args) >= 2 and isinstance(mark.args[1], str):
+        return mark.args[1]
+    return ""
+
+
+def _looks_like_gfx950_skip(reason: str) -> bool:
+    text = reason.lower()
+    return any(
+        needle in text
+        for needle in (
+            "gfx950",
+            "mi355",
+            "mi350",
+            "mxfp8",
+            "mxfp4",
+            "fused_mega_moe",
+            "mega moe",
+        )
+    )
 
 
 def pytest_collection_modifyitems(config, items):
@@ -92,6 +122,16 @@ def pytest_collection_modifyitems(config, items):
         raise pytest.UsageError("--dist-only and --deterministic-only cannot be enabled together")
 
     for item in items:
+        # Promote decorator-level skipif reasons that name gfx950/MXFP* into the
+        # gfx950 marker so `pytest -m gfx950` / tools/run_gfx950_tests.sh can
+        # select them. Prefer explicit @pytest.mark.gfx950 / module pytestmark
+        # for new tests; this only backfills existing skipifs.
+        if item.get_closest_marker("gfx950") is None:
+            for mark in item.iter_markers("skipif"):
+                if _looks_like_gfx950_skip(_skipif_reason(mark)):
+                    item.add_marker(pytest.mark.gfx950)
+                    break
+
         is_dist = _is_distributed_test(item)
         is_deterministic = item.get_closest_marker("deterministic") is not None
         if _worker_id and is_dist:

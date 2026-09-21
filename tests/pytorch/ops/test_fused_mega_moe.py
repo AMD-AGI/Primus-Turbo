@@ -48,6 +48,8 @@ _COSINE_THRESHOLD = 0.99
 # Match the small tensor-level grad norm seen under real training loss scaling.
 _GRAD_OUT_NORM = 1e-3
 
+# Whole suite is gfx950-only (see skip_unless_gfx950 below).
+pytestmark = pytest.mark.gfx950
 
 # Fused kernel only supports gfx950; skip everywhere else.
 skip_unless_gfx950 = unittest.skipUnless(

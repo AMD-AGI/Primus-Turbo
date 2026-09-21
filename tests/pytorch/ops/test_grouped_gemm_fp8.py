@@ -26,7 +26,7 @@ from tests.pytorch.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
     grouped_gemm_ref,
 )
-from tests.pytorch.test_utils import compute_snr
+from tests.pytorch.test_utils import compute_snr, gfx950_param
 
 torch.manual_seed(42)
 
@@ -308,7 +308,7 @@ _DET_NK_VALUES = [(2048, 1536), (4096, 7168)]
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
 @pytest.mark.parametrize(
-    "backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, BackendType.FLYDSL]
+    "backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, gfx950_param(BackendType.FLYDSL, id="FLYDSL")]
 )
 @pytest.mark.deterministic
 def test_grouped_gemm_fp8_tensorwise_deterministic(B, M, NK, ori_dtype, format, trans_b, balance, backend):
@@ -399,8 +399,9 @@ def test_grouped_gemm_fp8_blockwise_deterministic(
 @pytest.mark.parametrize("format", FORMAT_VALUES)
 @pytest.mark.parametrize("trans_b", [True])
 @pytest.mark.parametrize("balance", [True, False])
-@pytest.mark.parametrize("backend", [BackendType.TRITON, BackendType.FLYDSL], ids=["TRITON", "FLYDSL"])
+@pytest.mark.parametrize("backend", [BackendType.TRITON, gfx950_param(BackendType.FLYDSL, id="FLYDSL")])
 @pytest.mark.deterministic
+@pytest.mark.gfx950
 def test_grouped_gemm_fp8_mx_blockwise_deterministic(B, M, NK, ori_dtype, format, trans_b, balance, backend):
     mxfp8_supported, reason = check_mxfp8_support()
     if not mxfp8_supported:
@@ -430,7 +431,7 @@ def test_grouped_gemm_fp8_mx_blockwise_deterministic(B, M, NK, ori_dtype, format
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
 @pytest.mark.parametrize(
-    "backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, BackendType.FLYDSL]
+    "backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, gfx950_param(BackendType.FLYDSL, id="FLYDSL")]
 )
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_grouped_gemm_fp8_tensorwise(B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune):
@@ -533,7 +534,8 @@ def test_grouped_gemm_fp8_blockwise(
 @pytest.mark.parametrize("format", FORMAT_VALUES + [Format.HYBRID])
 @pytest.mark.parametrize("trans_b", [True])
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-@pytest.mark.parametrize("backend", [BackendType.TRITON, BackendType.FLYDSL], ids=["TRITON", "FLYDSL"])
+@pytest.mark.parametrize("backend", [BackendType.TRITON, gfx950_param(BackendType.FLYDSL, id="FLYDSL")])
+@pytest.mark.gfx950
 def test_grouped_gemm_fp8_mx_blockwise(B, M, NK, ori_dtype, format, trans_b, balance, backend):
     """MXFP8 grouped GEMM fwd + dgrad + wgrad."""
     N, K = NK
@@ -695,7 +697,7 @@ def _run_grouped_gemm_fp8_quantized_tensor_test(
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
 @pytest.mark.parametrize(
-    "backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, BackendType.FLYDSL]
+    "backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, gfx950_param(BackendType.FLYDSL, id="FLYDSL")]
 )
 @pytest.mark.parametrize("auto_tune", [False, True])
 def test_grouped_gemm_fp8_tensorwise_quantized_tensor(
@@ -772,8 +774,9 @@ def test_grouped_gemm_fp8_rowwise_quantized_tensor(
     ],
 )
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.FLYDSL])
+@pytest.mark.parametrize("backend", [None, BackendType.TRITON, gfx950_param(BackendType.FLYDSL, id="FLYDSL")])
 @pytest.mark.parametrize("auto_tune", [False, True])
+@pytest.mark.gfx950
 def test_grouped_gemm_fp8_mx_blockwise_quantized_tensor(
     B, M, NK, ori_dtype, format, trans_b, balance, backend, auto_tune
 ):
@@ -1178,7 +1181,7 @@ def _poison_alloc_pool(shape, dtype, device, sentinel, n=24):
 @pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
 @pytest.mark.parametrize("trans_b", TRANS_B_VALUES)
 @pytest.mark.parametrize(
-    "backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, BackendType.FLYDSL]
+    "backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, gfx950_param(BackendType.FLYDSL, id="FLYDSL")]
 )
 def test_grouped_gemm_fp8_padded_tail_zeroed(ori_dtype, trans_b, backend):
     """Over-allocated output tail [sum(group_lens):M_total] must be zeroed, not left as
@@ -1339,7 +1342,7 @@ def _run_grouped_gemm_fp8_fused_grad_accum_test(
 
 @pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
 @pytest.mark.parametrize("trans_b", [True, False])
-@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.HIPBLASLT, BackendType.FLYDSL])
+@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.HIPBLASLT, gfx950_param(BackendType.FLYDSL, id="FLYDSL")])
 def test_grouped_gemm_fp8_tensorwise_fused_grad_accum(ori_dtype, trans_b, backend):
     if backend == BackendType.FLYDSL and get_device_compute_capability() < (9, 5):
         pytest.skip("FlyDSL fp8 grouped GEMM is gfx950-only")
@@ -1358,7 +1361,8 @@ def test_grouped_gemm_fp8_tensorwise_fused_grad_accum(ori_dtype, trans_b, backen
 
 
 @pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
-@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.FLYDSL])
+@pytest.mark.parametrize("backend", [None, BackendType.TRITON, gfx950_param(BackendType.FLYDSL, id="FLYDSL")])
+@pytest.mark.gfx950
 def test_grouped_gemm_fp8_mx_fused_grad_accum(ori_dtype, backend):
     """MXFP8 grouped GEMM is NT-only, so trans_b is fixed rather than swept."""
     if backend == BackendType.FLYDSL and get_device_compute_capability() < (9, 5):
