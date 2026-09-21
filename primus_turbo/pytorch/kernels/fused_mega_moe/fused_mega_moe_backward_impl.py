@@ -11,7 +11,7 @@ from typing import List, Tuple
 import torch
 from torch.distributed.distributed_c10d import _resolve_process_group
 
-from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
+from primus_turbo.flydsl.mega.bf16.grouped_gemm_bf16_kernel import (
     grouped_gemm_bf16_variable_k_flydsl_kernel,
 )
 from primus_turbo.flydsl.mega import (

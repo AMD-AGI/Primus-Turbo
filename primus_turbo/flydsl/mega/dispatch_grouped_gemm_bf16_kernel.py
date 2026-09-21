@@ -27,11 +27,13 @@ from flydsl.expr.buffer_ops import (
 )
 from flydsl.expr.typing import AddressSpace, PointerType
 
-from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (
+# Private f6d5ab68 snapshot — do not import the shared flydsl BF16 tiles;
+# ed8d7af4 (#486) rebuilt those and broke MegaMoE numericals.
+from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
     _make_shared_storage,
     gemm_bf16_tile,
 )
-from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
+from primus_turbo.flydsl.mega.bf16.grouped_gemm_bf16_kernel import (
     grouped_gemm_bf16_variable_k_tile,
 )
 from primus_turbo.flydsl.mega.dispatch_prologue_kernel import (
@@ -48,7 +50,7 @@ from primus_turbo.flydsl.mega.tune_utils import (
     Config,
     autotune,
 )
-from primus_turbo.flydsl.utils.gemm_helper import (
+from primus_turbo.flydsl.mega.bf16.gemm_helper import (
     make_bf16_fp16_tile_tensor,
     make_value_attrs,
     xcd_remap_pid,
