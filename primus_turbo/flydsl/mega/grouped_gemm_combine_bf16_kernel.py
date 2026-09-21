@@ -49,6 +49,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
 from primus_turbo.flydsl.utils.prims import (
     atomic_add,
     cast,
+    l2_invalidate,
     ld,
     read_clock,
     spin_timed_out,
@@ -212,6 +213,13 @@ def _make_grouped_gemm_combine(
                                 )
                             tile_cursor = tile_cursor + fx.Int32(1)
                     fx.rocdl.s_waitcnt(0)
+                    fx.gpu.barrier()
+                    # ACQUIRE for the GEMM output tiles the gate above waited on. Same reason as
+                    # the dispatch gate: the flag being visible says nothing about the payload
+                    # lines, and combine_bf16_tile reads them straight into the reduction.
+                    if thread_index == fx.Int32(0):
+                        l2_invalidate()
+                        fx.rocdl.s_waitcnt(fx.Int32(0))
                     fx.gpu.barrier()
                     combine_bf16_tile(
                         sym_buffer,
