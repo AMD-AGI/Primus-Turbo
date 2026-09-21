@@ -161,7 +161,7 @@ pytest tests/jax/ --dist-only
 CI currently runs on gfx942 (MI300X) only. Cases that need gfx950 (Mega MoE, MXFP8/MXFP4, FlyDSL, Gluon, HipKittens, …) are marked `@pytest.mark.gfx950`. On an MI355X box, PR owners should run:
 
 ```bash
-./tools/run_gfx950_tests.sh          # single + deterministic + dist (same shape as CI)
+./tests/run_gfx950_tests.sh          # single + deterministic + dist (same shape as CI)
 # or: pytest tests/pytorch -n 8 -m gfx950 --timeout=600
 ```
 

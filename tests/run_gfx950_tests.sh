@@ -13,11 +13,11 @@
 # FlyDSL / Gluon / HipKittens should run this script before merge.
 #
 # Usage:
-#   ./tools/run_gfx950_tests.sh              # all three CI-equivalent suites
-#   ./tools/run_gfx950_tests.sh single       # single-GPU parallel only
-#   ./tools/run_gfx950_tests.sh deterministic
-#   ./tools/run_gfx950_tests.sh dist
-#   EXTRA_PYTEST_ARGS="-k mega_moe" ./tools/run_gfx950_tests.sh
+#   ./tests/run_gfx950_tests.sh              # all three CI-equivalent suites
+#   ./tests/run_gfx950_tests.sh single       # single-GPU parallel only
+#   ./tests/run_gfx950_tests.sh deterministic
+#   ./tests/run_gfx950_tests.sh dist
+#   EXTRA_PYTEST_ARGS="-k mega_moe" ./tests/run_gfx950_tests.sh
 #
 set -euo pipefail
 

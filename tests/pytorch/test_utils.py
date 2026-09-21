@@ -23,7 +23,7 @@ def gfx950_param(value, **kwargs):
     """``pytest.param`` that also carries the ``gfx950`` marker.
 
     Use for backends / recipes that only run on MI350X/MI355X (e.g. FlyDSL
-    MXFP*, Mega MoE) so ``pytest -m gfx950`` / ``tools/run_gfx950_tests.sh``
+    MXFP*, Mega MoE) so ``pytest -m gfx950`` / ``tests/run_gfx950_tests.sh``
     can select them without re-running the whole hybrid file.
     """
     marks = kwargs.pop("marks", ())

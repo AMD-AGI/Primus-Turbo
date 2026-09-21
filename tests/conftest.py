@@ -58,7 +58,7 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "gfx950: requires gfx950 (MI350X/MI355X); not exercised on CI gfx942 hosts — "
-        "run via tools/run_gfx950_tests.sh on an MI355X box",
+        "run via tests/run_gfx950_tests.sh on an MI355X box",
     )
 
 
@@ -123,7 +123,7 @@ def pytest_collection_modifyitems(config, items):
 
     for item in items:
         # Promote decorator-level skipif reasons that name gfx950/MXFP* into the
-        # gfx950 marker so `pytest -m gfx950` / tools/run_gfx950_tests.sh can
+        # gfx950 marker so `pytest -m gfx950` / tests/run_gfx950_tests.sh can
         # select them. Prefer explicit @pytest.mark.gfx950 / module pytestmark
         # for new tests; this only backfills existing skipifs.
         if item.get_closest_marker("gfx950") is None:

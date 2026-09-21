@@ -28,4 +28,4 @@ Please list the changes introduced in this PR:
 - [ ] My changes generate no new warnings
 - [ ] I have added tests that prove my fix is effective or that my feature works
 - [ ] New and existing unit tests pass locally with my changes
-- [ ] Ran `./tools/run_gfx950_tests.sh` on MI355X (if this PR touches gfx950 kernels / MXFP* / Mega MoE / FlyDSL / Gluon / HipKittens)
+- [ ] Ran `./tests/run_gfx950_tests.sh` on MI355X (if this PR touches gfx950 kernels / MXFP* / Mega MoE / FlyDSL / Gluon / HipKittens)
