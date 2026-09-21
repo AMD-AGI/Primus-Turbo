@@ -1002,6 +1002,7 @@ def dense_bf16_chunked_tile(
     lds_chunk_stride=1024,
     single_n=False,
     c_cache_modifier=0,
+    block_threads=512,
 ):
     """One NN/TN output tile over a runtime K loop.  Geometry, swizzles, LDS layout and store
     are the fixed-K ``_gemm_bf16_nn_tn_tile_impl``'s; only the K loop differs.
@@ -1010,26 +1011,52 @@ def dense_bf16_chunked_tile(
     tile's whole (real) ``BLOCK_N``, permanently running the ``half_n`` feed/store path instead
     of forking it only for a ragged tail.  This frees ``BLOCK_N`` to be any multiple of 64 (not
     just 128), at the cost of the second N region's accumulator throughput -- see
-    ``_make_shared_storage``'s docstring for the matching LDS layout."""
+    ``_make_shared_storage``'s docstring for the matching LDS layout.
+
+    ``block_threads`` (default 512 = 8 waves) is the caller's workgroup size; every wave/tile
+    formula below is re-derived from it, and every formula reduces to today's shipped constant
+    at the default, so 512 is byte-identical to before this parameter existed."""
     assert BLOCK_M % 128 == 0
     if single_n:
         assert BLOCK_N % 64 == 0, "single_n needs BLOCK_N a multiple of 64 (one wave's tile atom)"
     else:
         assert BLOCK_N % 128 == 0
     assert K % (BLOCK_K * CHUNK) == 0 and CHUNK % 2 == 0
+    assert block_threads % 64 == 0, f"block_threads={block_threads} must be a whole number of waves"
     LDS_BLOCK_M = BLOCK_M // 2
     LDS_BLOCK_N = BLOCK_N if single_n else BLOCK_N // 2
-    N_LDS_STEPS_A = LDS_BLOCK_M // 64
-    N_LDS_STEPS_B = LDS_BLOCK_N // 64
+    # Wave/tile map. WAVE_N_FANOUT is the fixed 4-way interleaved B-column split (matches
+    # S2RLoaderTr16x32Bf16Wide's n_waves=4 contract on the B side and never changes with
+    # block_threads). Whatever is left of the workgroup's wave count after that fixed split
+    # goes to the M-direction split (WAVE_HI_FANOUT); at block_threads=256 (N_WAVES ==
+    # WAVE_N_FANOUT) it collapses to 1, i.e. no M-split at all -- every wave covers the tile's
+    # whole M extent -- which also makes dense_mma_chunked_bf16's ``if wave_hi == 1`` prologue
+    # barrier permanently dead code (wave_hi is uniformly 0 for every thread), so the two
+    # wave-halves' barrier counts can no longer desync (see that function's docstring).
+    N_WAVES = block_threads // 64
+    WAVE_N_FANOUT = 4
+    assert N_WAVES % WAVE_N_FANOUT == 0, (
+        f"N_WAVES={N_WAVES} (block_threads={block_threads}) must be a multiple of the fixed "
+        f"B-side fanout {WAVE_N_FANOUT}"
+    )
+    WAVE_HI_FANOUT = N_WAVES // WAVE_N_FANOUT
+    # G2S cooperative load: n_load_steps * n_waves (n_waves is re-derived from block_dim.x at
+    # runtime inside G2SLoader / compute_global_swizzle_*) must keep covering the same fixed
+    # LDS_BLOCK_{M,N} // 8 span regardless of block_threads, so halving N_WAVES doubles steps.
+    N_LDS_STEPS_A = LDS_BLOCK_M // (N_WAVES * 8)
+    N_LDS_STEPS_B = LDS_BLOCK_N // (N_WAVES * 8)
     N_LDS_ROUNDS = max(N_LDS_STEPS_A, N_LDS_STEPS_B)
-    NTA16 = LDS_BLOCK_M // 32
-    NTB16 = LDS_BLOCK_N // 64
+    # S2R per-wave operand tile counts: A's count follows WAVE_HI_FANOUT (the M-split), B's
+    # follows the fixed WAVE_N_FANOUT -- NTB16's formula and value are unchanged at any
+    # block_threads; NTA16's formula reduces to today's shipped value at the 512 default.
+    NTA16 = LDS_BLOCK_M // (WAVE_HI_FANOUT * 16)
+    NTB16 = LDS_BLOCK_N // (WAVE_N_FANOUT * 16)
     N_CHUNKS = (K // BLOCK_K) // CHUNK
 
     lane_id = fx.thread_idx.x % 64
     wave_id = fx.thread_idx.x // 64
-    wave_hi = wave_id // 4
-    wave_n = wave_id % 4
+    wave_hi = wave_id // WAVE_N_FANOUT
+    wave_n = wave_id % WAVE_N_FANOUT
 
     if a_transpose:  # A is [K, M]
         a0_off = block_m * BLOCK_M
@@ -1126,13 +1153,23 @@ def dense_bf16_chunked_tile(
         _run(NTA16, NTB16, wave_hi, wave_n, False, N_LDS_STEPS_B, False)
     else:
         assert ceildiv(n_tail, 32) == 2, f"n_tail={n_tail}: only the 2-tile tail grid is wired"
+        # The tail fork's N width (<= 64) is too narrow for the main path's WAVE_N_FANOUT-way
+        # split, so it always uses a fixed 2-way split on both M and N regardless of N_WAVES;
+        # only the M-partition's row count (TAIL_N_A16) and the B-side step count scale with
+        # N_WAVES, the same way NTA16 / N_LDS_STEPS_B do for the main path above. Both reduce to
+        # today's shipped values (2, ceildiv(n_tail, 64)) at the block_threads=512 default.
+        TAIL_M_FANOUT = N_WAVES // 2
+        TAIL_N_A16 = LDS_BLOCK_M // (TAIL_M_FANOUT * 16)
+        TAIL_B_STEPS = ceildiv(n_tail, N_WAVES * 8)
         emit_if_then(
             (block_n + 1) * BLOCK_N <= c_n,
             lambda: _run(NTA16, NTB16, wave_hi, wave_n, False, N_LDS_STEPS_B, False),
         )
         emit_if_then(
             (block_n + 1) * BLOCK_N > c_n,
-            lambda: _run(2, 2, wave_id // 2, wave_id % 2, True, ceildiv(n_tail, 64), n_tail % 32 != 0, 2),
+            lambda: _run(
+                TAIL_N_A16, 2, wave_id // 2, wave_id % 2, True, TAIL_B_STEPS, n_tail % 32 != 0, 2
+            ),
         )
 
 
@@ -1176,6 +1213,7 @@ def _compile_dense_bf16_nn_tn(
     lds_chunk_stride=1024,
     single_n=False,
     c_cache_modifier=0,
+    block_threads=512,
 ):
     A_TRANS = layout == "tn"
     assert M % BLOCK_M == 0, "the NN/TN store has no ragged-M path"
@@ -1196,7 +1234,7 @@ def _compile_dense_bf16_nn_tn(
     A_CHUNK_BYTES = CHUNK * BLOCK_K * M * 2  # TN only: A is [K, M], re-based per chunk
     A_TOTAL_BYTES = K * M * 2
 
-    @flyc.kernel(known_block_size=[512, 1, 1])
+    @flyc.kernel(known_block_size=[block_threads, 1, 1])
     def kernel_dense_nn_tn(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor):
         _ = str(fx.thread_idx.x)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -1228,6 +1266,7 @@ def _compile_dense_bf16_nn_tn(
                 lds_chunk_stride=lds_chunk_stride,
                 single_n=single_n,
                 c_cache_modifier=c_cache_modifier,
+                block_threads=block_threads,
             )
 
         _do_tile(fx.block_idx.x)
@@ -1238,8 +1277,8 @@ def _compile_dense_bf16_nn_tn(
             A,
             B,
             C,
-            value_attrs=make_value_attrs(waves_per_eu, agpr_alloc, "512,512"),
-        ).launch(grid=(TOTAL, 1, 1), block=(512, 1, 1), stream=stream)
+            value_attrs=make_value_attrs(waves_per_eu, agpr_alloc, f"{block_threads},{block_threads}"),
+        ).launch(grid=(TOTAL, 1, 1), block=(block_threads, 1, 1), stream=stream)
 
     return launch_dense_nn_tn
 
@@ -1329,6 +1368,17 @@ _DENSE_BF16_CFG = {
     "nt": dict(
         BLOCK_M=256, BLOCK_N=256, GROUP_M=8, num_xcd=8, waves_per_eu=2, agpr_alloc=64, c_cache_modifier=2
     ),
+    # block_threads=256 (4 waves, 1 wave/SIMD -- see dense_bf16_chunked_tile) was measured and
+    # REJECTED at this same (256,256)+tail tile: with waves_per_eu left at 2 the compiler still
+    # targets a 256-register budget it cannot hold at the doubled per-wave accumulator/fragment
+    # demand and spills (vgpr 320 + agpr 64, 488 B private, 5.7x slower); with waves_per_eu=1 and
+    # agpr_alloc in {0, -256} the spill clears (vgpr ~502, agpr ~246, 0 B private, confirming the
+    # 512-register-per-wave floor is real) but the kernel is still ~29-32% slower than this
+    # 512-thread champion (~22.4-22.8 ms vs ~17.3 ms median) -- halving 8 waves/CU to 4 waves/CU
+    # (1 wave/SIMD) costs more in lost VMEM-latency hiding than the freed registers buy back, and
+    # an nt_vmcnt sweep {0,1,6,12} at the best register config stayed flat at 23.3-23.9 ms, so the
+    # loss is occupancy-driven, not a mistunable wait count. Do not retry 256 here without a new
+    # mechanism (e.g. a tile shape whose accumulator footprint does not double at 1 wave/SIMD).
     "nn": dict(BLOCK_M=256, BLOCK_N=256, GROUP_M=1, num_xcd=8, waves_per_eu=2, agpr_alloc=64),
     # single_n=True: one N accumulator region spanning the whole (real) BLOCK_N=320 instead of
     # two 128-wide regions -- 2880 = 9*320 exactly (vs 2880 = 11*256 + 64 ragged), so this grid
