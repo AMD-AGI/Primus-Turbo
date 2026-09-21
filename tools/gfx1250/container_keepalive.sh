@@ -31,7 +31,12 @@ if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; t
   echo "already running as pid $(cat "$PID_FILE")"; exit 0
 fi
 echo $$ > "$PID_FILE"
-trap 'rm -f "$PID_FILE"' EXIT INT TERM
+# The handler must EXIT. A trap on TERM whose body does not exit makes bash run the body
+# and then CARRY ON with the loop -- the signal is swallowed and the process becomes
+# un-stoppable by the ordinary means. Measured: this script ignored two SIGTERMs and kept
+# restarting a container it was supposed to have stopped guarding.
+trap 'rm -f "$PID_FILE"' EXIT
+trap 'rm -f "$PID_FILE"; exit 0' INT TERM
 
 while true; do
   state=$(timeout 30 docker inspect -f '{{.State.Running}}|{{.State.ExitCode}}' "$C" 2>/dev/null)
