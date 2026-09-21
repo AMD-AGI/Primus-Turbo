@@ -12,7 +12,6 @@
 ###############################################################################
 
 import functools
-import os
 from typing import Optional, Tuple
 
 import flydsl.compiler as flyc
@@ -55,13 +54,7 @@ from primus_turbo.flydsl.mega.bf16.gemm_helper import (
     make_value_attrs,
     xcd_remap_pid,
 )
-from primus_turbo.flydsl.utils.prims import (
-    cast,
-    l2_invalidate,
-    ld,
-    read_clock,
-    spin_timed_out,
-)
+from primus_turbo.flydsl.utils.prims import cast, ld, read_clock, spin_timed_out
 
 
 @functools.lru_cache(maxsize=1)
@@ -226,15 +219,6 @@ def _make_kernel(
                         fx.rocdl.s_waitcnt(0)
                         sig = ld(dispatch_flag_base, ge_blk, scope="sys", dtype=fx.T.i64())
                 fx.gpu.barrier()
-                # ACQUIRE for the peer-pushed pool rows. The gate above only establishes that the
-                # flag is visible; s_waitcnt drains this wave's own accesses and is not an acquire,
-                # so without the invalidate the K-loop below can still read pool lines this L2
-                # cached before the peer's write landed. One lane covers every wave because both
-                # the vector L1 and the XCD's L2 are workgroup-shared; the barrier releases the rest.
-                if thread_index == fx.Int32(0):
-                    l2_invalidate()
-                    fx.rocdl.s_waitcnt(fx.Int32(0))
-                fx.gpu.barrier()
                 pool_ptr_ty = PointerType.get(
                     elem_ty=fx.BFloat16.ir_type, address_space=AddressSpace.Global, alignment=16
                 )
@@ -297,13 +281,6 @@ def _make_kernel(
                         fx.rocdl.s_waitcnt(0)
                         signal = ld(dispatch_flag_base, blk, scope="sys", dtype=fx.T.i64())
                 fx.gpu.barrier()
-                # ACQUIRE for the peer-pushed pool rows -- see the tn gate above for why the gate
-                # alone is not enough. This is the A operand of the GEMM below, so a stale line
-                # here lands directly in the output.
-                if thread_index == fx.Int32(0):
-                    l2_invalidate()
-                    fx.rocdl.s_waitcnt(fx.Int32(0))
-                fx.gpu.barrier()
 
                 # A base = dispatch_token_pool (int64 symm addr); B/C base = WEIGHTS/OUTPUT tensors.
                 out_base = fx.arith.ArithValue(
@@ -357,20 +334,9 @@ def _make_epoch_bump(addend):
     return epoch_bump_kernel
 
 
-_DISPATCH_CU_CANDIDATES = (16, 32, 64)
-# MEGA_BF16_DISPATCH_CU pins the comm-role CU count instead of letting the autotuner time the
-# candidates. The autotuner picks by measured latency and caches the winner per container
-# (~/.flydsl/autotune), so which candidate runs is a property of the machine; pinning turns that
-# hidden variable into one an experiment can drive.
-_dispatch_cu_pin = os.environ.get("MEGA_BF16_DISPATCH_CU")
-_dispatch_cu_configs = [
-    Config(num_dispatch_cu=cu, nt_vmcnt=3)
-    for cu in ((int(_dispatch_cu_pin),) if _dispatch_cu_pin else _DISPATCH_CU_CANDIDATES)
-]
-
 
 @autotune(
-    configs=_dispatch_cu_configs,
+    configs=[Config(num_dispatch_cu=cu, nt_vmcnt=3) for cu in (16, 32, 64)],
     key=[
         "out_features",
         "hidden_size",
