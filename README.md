@@ -25,7 +25,7 @@ Note: JAX support is under active development. Optim support is planned but not 
 - **[2026/07/15]** 🔥 **Mega MoE (BF16)** — FlyDSL fused MoE layer with comm–compute overlap inside the grouped GEMMs ([overview](./docs/README_Mega_MoE.md)) (#412).
 - **[2026/07]** 🔥 **MXFP4 GEMM & grouped GEMM** — FlyDSL and hipBLASLt stacks for dense and expert GEMMs in low-precision training (#424, #483).
 - **[2026/07/30]** 🔥 **Release v0.4.0** — grouped GEMM autotune, MXFP4 correctness, and Mega MoE stability fixes on gfx950.
-- **[2026/06/10]** 🔥 **DeepEP** — JAX intranode/internode token dispatch; PyTorch `DeepEPTokenDispatcher` and rocSHMEM integration for MoE all-to-all (#344, #409, [guide](./primus_turbo/pytorch/deep_ep/README.md)).
+- **[2026/06/10]** 🔥 **DeepEP** — JAX intranode/internode token dispatch (#344); PyTorch `DeepEPTokenDispatcher` (introduced in #114). The separate rocSHMEM backend integration is tracked in #409 ([guide](./primus_turbo/pytorch/deep_ep/README.md)).
 - **[2025/12/16]** 🔥 [MoE training best practices on AMD GPUs](https://rocm.blogs.amd.com/software-tools-optimization/primus-moe-package/README.html) — DeepEP, grouped GEMM, and Primus recipes end to end.
 
 ## 📦 Quick Start
