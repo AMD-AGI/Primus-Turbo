@@ -11,9 +11,13 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-from .dispatch_grouped_gemm_bf16_kernel import dispatch_grouped_gemm_bf16_flydsl_kernel
-from .dispatch_prologue_kernel import dispatch_prologue_flydsl_kernel
-from .grouped_gemm_combine_bf16_kernel import grouped_gemm_combine_bf16_flydsl_kernel
+from .bf16.dispatch_grouped_gemm_bf16_kernel import (
+    dispatch_grouped_gemm_bf16_flydsl_kernel,
+)
+from .bf16.dispatch_prologue_kernel import dispatch_prologue_flydsl_kernel
+from .bf16.grouped_gemm_combine_bf16_kernel import (
+    grouped_gemm_combine_bf16_flydsl_kernel,
+)
 
 __all__ = [
     "dispatch_grouped_gemm_bf16_flydsl_kernel",

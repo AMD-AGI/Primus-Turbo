@@ -45,13 +45,21 @@ from flydsl.expr.buffer_ops import (
 from flydsl.expr.typing import AddressSpace, PointerType
 from torch.distributed import ProcessGroup
 
-from primus_turbo.flydsl.mega.ep_intranode import _BLOCK_THREADS, _WARP
 from primus_turbo.flydsl.mega.fp8.dispatch_prologue import dispatch_prologue
+from primus_turbo.flydsl.mega.fp8.gemm_helper import (
+    emit_for,
+    emit_if_then,
+    make_value_attrs,
+    run_compiled,
+)
 from primus_turbo.flydsl.mega.fp8.gemm_mxfp8_tile import (
     BLOCK_K,
     gemm_mxfp8_nt_tile,
 )
+from primus_turbo.flydsl.mega.fp8.lds_repack import _emit_lds_repack
 from primus_turbo.flydsl.mega.fp8.prims import (
+    _BLOCK_THREADS,
+    _WARP,
     atomic_add,
     l2_invalidate,
     l2_writeback,
@@ -60,13 +68,6 @@ from primus_turbo.flydsl.mega.fp8.prims import (
 )
 from primus_turbo.flydsl.mega.fp8.quant import quantize_rowwise_mxfp8_flydsl
 from primus_turbo.flydsl.mega.fp8.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
-from primus_turbo.flydsl.utils.gemm_helper import (
-    _emit_lds_repack,
-    emit_for,
-    emit_if_then,
-    make_value_attrs,
-    run_compiled,
-)
 from primus_turbo.flydsl.utils.prims import (
     cast,
     ceildiv,

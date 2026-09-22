@@ -23,7 +23,7 @@ from flydsl.expr.buffer_ops import (
     create_buffer_resource_from_addr,
 )
 
-from primus_turbo.flydsl.mega.symm_buffer import SymBuffer, Workspace
+from primus_turbo.flydsl.mega.bf16.symm_buffer import SymBuffer, Workspace
 from primus_turbo.flydsl.utils.prims import (
     atomic_add,
     copy_warp,

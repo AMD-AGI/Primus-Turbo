@@ -18,9 +18,10 @@ different symmetric-memory design (``SymBuffer`` + ``Workspace`` + flag/parity e
 fp8 kernels were written against the ``SymLayout`` + scoreboard + two-heap design. To avoid
 touching the bf16 stack, that whole foundation is VENDORED here under this package
 (``prims`` / ``barrier`` / ``symm_buffer`` / ``dispatch_prologue`` /
-``gemm_helper``), and all fp8 modules import from ``primus_turbo.flydsl.mega.fp8.*`` only. It
-shares nothing with the bf16 files except ``primus_turbo.pytorch.core`` (SymmetricMemory,
-low_precision) and the external ``flydsl`` package.
+``gemm_helper``), and all fp8 modules import from ``primus_turbo.flydsl.mega.fp8.*`` only —
+including a private ``gemm_helper`` snapshot so shared ``flydsl/utils`` edits cannot reach
+this path. It shares nothing with the bf16 files except ``primus_turbo.pytorch.core``
+(SymmetricMemory, low_precision) and the external ``flydsl`` package.
 """
 
 # --- fused mxfp8 dispatch PUSH + preshuffle + grouped mxfp8 NT GEMM ---

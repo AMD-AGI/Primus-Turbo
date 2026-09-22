@@ -11,12 +11,12 @@ from typing import List, Tuple
 import torch
 from torch.distributed.distributed_c10d import _resolve_process_group
 
-from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
-    grouped_gemm_bf16_variable_k_flydsl_kernel,
-)
 from primus_turbo.flydsl.mega import (
     dispatch_grouped_gemm_bf16_flydsl_kernel,
     grouped_gemm_combine_bf16_flydsl_kernel,
+)
+from primus_turbo.flydsl.mega.bf16.grouped_gemm_bf16_kernel import (
+    grouped_gemm_bf16_variable_k_flydsl_kernel,
 )
 from primus_turbo.flydsl.utils.swiglu_kernel import swiglu_backward_flydsl_kernel
 from primus_turbo.pytorch.core.backend import (
