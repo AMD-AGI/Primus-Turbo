@@ -668,7 +668,9 @@ def _build_grouped_mxfp8_nt_kernel(
             b_g2s.load(b_next0, B0_gl_offset + 1 * BLOCK_K)
             a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K)
             b_g2s.load(b_next1, B1_gl_offset + 1 * BLOCK_K)
-            wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
+            # K_ITERS == 2 skips the main loop, so nothing drains k=1's b_next0/a_next0 before
+            # the tails read them.
+            wait_barrier(N_LDS_STEPS_B if K_ITERS == 2 else N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
 
             sa0 = sa_s2r.load(sa_base0, 0)
             sa1 = sa_s2r.load(sa_base1, 0)

@@ -254,7 +254,10 @@ def _compile_dense_nt(
         a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K)
         b_g2s.load(b_next1, B1_gl_offset + 1 * BLOCK_K)
 
-        wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
+        # K_ITERS == 2 skips the main loop, so nothing drains k=1's b_next0/a_next0 before
+        # epilog 1/2 read them (s_barrier orders waves, it does not drain G2S). Only b_next1
+        # may stay in flight: epilog 2 reads it after its own wait_barrier(0).
+        wait_barrier(N_LDS_STEPS_B if K_ITERS == 2 else N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
 
         # Main K-loop. Each iter: s2r {a0,b0,b1,a1} → 4 mma (c00→c01→c10→c11)
         # interleaved with k+1 (a_next1) and k+2 (a_cur0, b_cur0, b_cur1) prefetches.
@@ -599,7 +602,10 @@ def _compile_dense_nn(
         a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K)
         b_g2s.load(b_next1, B1_gl_offset + arith.index(1 * BLOCK_K) * cn_i)
 
-        wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
+        # Same zero-iteration hazard as NT: at K_ITERS == 2 nothing drains k=1's b_next0/
+        # a_next0 before the epilogs read them. The transpose loader's own s_waitcnt happens
+        # to reach far enough, but it is per-wave and these reads cross wave chunks.
+        wait_barrier(N_LDS_STEPS_B if K_ITERS == 2 else N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
 
         # Main loop. Emits 7 barriers per K-iter (before/after each MFMA);
         # all are load-bearing — dropping any risks a compiler-reorder race.
@@ -973,7 +979,10 @@ def _compile_dense_tn(
         a_g2s.load(a_next0, A0_gl_offset + arith.index(1 * BLOCK_K) * cm_i)
         b_g2s.load(b_next1, B1_gl_offset + arith.index(1 * BLOCK_K) * cn_i)
 
-        wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
+        # Same zero-iteration hazard as NT, and here the loaders' s_waitcnt vmcnt(3) really
+        # does not cover it: six G2S are outstanding entering epilog 1, so draining to three
+        # lands b_next0 but leaves a_next0's last step in flight.
+        wait_barrier(N_LDS_STEPS_B if K_ITERS == 2 else N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
 
         # Steady loop: per-iter A-half-0/A-half-1 × {b0,b1} MMA interleaved
         # with the next-tile G2S prefetch and one s_barrier per MMA quadrant.
