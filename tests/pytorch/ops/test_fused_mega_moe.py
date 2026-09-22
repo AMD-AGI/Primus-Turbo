@@ -61,10 +61,17 @@ def _weighted_swiglu(fc1_out, weights):
     return F.silu(gate) * up * weights
 
 
-def generate_inputs(rank, world, *, num_tokens, hidden, inter, num_experts, num_topk, device="cuda"):
-    """One rank's local MoE inputs: x, this rank's L1/L2 expert shard, random top-k routing."""
+def generate_inputs(
+    rank, world, *, num_tokens, hidden, inter, num_experts, num_topk, device="cuda", seed=1234
+):
+    """One rank's local MoE inputs: x, this rank's L1/L2 expert shard, random top-k routing.
+
+    The generator is seeded here and does NOT read the ambient RNG, so two calls with the same
+    ``seed`` return identical tensors however the caller seeded torch in between. Callers that want
+    genuinely different data -- a second micro-batch, a second layer -- must pass a different
+    ``seed``; ``torch.manual_seed`` in front of the call does nothing."""
     epr = num_experts // world
-    g = torch.Generator(device=device).manual_seed(1234 + rank)
+    g = torch.Generator(device=device).manual_seed(seed + rank)
     x = torch.randn((num_tokens, hidden), generator=g, device=device, dtype=torch.float32).bfloat16()
     l1_weight = torch.randn((epr, 2 * inter, hidden), generator=g, device=device, dtype=torch.bfloat16)
     l1_weight *= 2.0 / math.sqrt(hidden)

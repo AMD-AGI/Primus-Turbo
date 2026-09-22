@@ -299,11 +299,19 @@ def combine_copy_fp8_tile(
                 vals.append(buffer_load(l2y_fp8_res, row_base + col, vec_width=4, dtype=fx.T.i32()))
             for c in range(num_full):
                 col = fx.Int32(c * cols_per_step) + lane * fx.Int32(4)
-                buffer_store(vals[c], peer, slot_base + col)
+                # sc0|sc1|nt: publish to a REMOTE agent, paired with the system-scope read in
+                # the reduce. Plain stores here (and plain loads there) let the peer's reduce see
+                # the release flag below while still reading the PREVIOUS combine's payload out of
+                # this slot -- the forward L2's y, ~1e6 larger than the backward dx it corrupts.
+                # The uncached signal heap alone does not close this; bf16 carries the bits.
+                buffer_store(vals[c], peer, slot_base + col, cache_modifier=19)
 
             def _emit_scale():
                 sv = buffer_load(l2y_scale_res, row * fx.Int32(SC) + lane, vec_width=1, dtype=fx.T.i32())
-                buffer_store(sv, peer, fx.Int32(payload_i32_total) + slot * fx.Int32(SC) + lane)
+                buffer_store(
+                    sv, peer, fx.Int32(payload_i32_total) + slot * fx.Int32(SC) + lane,
+                    cache_modifier=19,  # sc0|sc1|nt, as above
+                )
 
             emit_if_then(lane < fx.Int32(SC), _emit_scale)
             if with_gate:
@@ -312,7 +320,10 @@ def combine_copy_fp8_tile(
                 gate_value = buffer_load(grad_gate_res, row, vec_width=1, dtype=fx.T.f32())
                 gate_addr = gate_base + buffer_load(main_delta_res, origin, vec_width=1, dtype=fx.T.i64())
                 gate_peer = create_buffer_resource_from_addr(gate_addr, num_records_bytes=gate_records)
-                buffer_store(gate_value, gate_peer, slot)
+                # sc0|sc1|nt: combine_gate is the one cross-rank payload still on the CACHED main
+                # heap (the fp8 comb payload sits in the uncached signal pad), so this store has to
+                # carry system scope itself or it lands in a line the origin rank never re-reads.
+                buffer_store(gate_value, gate_peer, slot, cache_modifier=19)
             # epoch flag: write the cumulative reduce target into the peer's reduce_flag bank
             # (never reset; the reduce spins on == expected_reduce). reduce_bank uses OUR parity,
             # which equals the peer's by lockstep, so it lands in the peer's current bank.
@@ -413,11 +424,13 @@ def _make_topk_reduce_fp8(hidden, topk, combine_slots, apply_weights, with_gate)
                 acc = [fx.arith.constant_vector(0.0, f32_v4) for _ in range_constexpr(VW)]
                 for jj in fx.range_constexpr(topk):
                     slot = token * fx.Int32(topk) + fx.Int32(jj)
+                    # sc0|sc1|nt: system-visible non-temporal read -- a PEER wrote this.
                     pv = buffer_load(
                         comb_res,
                         slot * fx.Int32(H4) + w,
                         vec_width=VW,
                         dtype=fx.T.i32(),
+                        cache_modifier=19,
                     )
                     words = [Vec(pv)[v].ir_value() for v in range_constexpr(VW)] if VW > 1 else [pv]
                     sw = buffer_load(
@@ -425,6 +438,7 @@ def _make_topk_reduce_fp8(hidden, topk, combine_slots, apply_weights, with_gate)
                         fx.Int32(payload_i32_total) + slot * fx.Int32(SC) + sword_idx,
                         vec_width=1,
                         dtype=fx.T.i32(),
+                        cache_modifier=19,  # sc0|sc1|nt, as above
                     )
                     e8 = (fx.arith.ArithValue(sw) >> shift) & fx.Int32(0xFF)
                     sf = (fx.arith.ArithValue(e8) << fx.Int32(23)).bitcast(fx.T.f32())
@@ -454,7 +468,14 @@ def _make_topk_reduce_fp8(hidden, topk, combine_slots, apply_weights, with_gate)
                     slot = token * fx.Int32(topk) + fx.Int32(jj)
                     topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i64())
                     if lane == fx.Int32(0):
-                        gate_v = buffer_load(gate_local_res, slot, vec_width=1, dtype=fx.T.f32())
+                        # sc0|sc1|nt: system-visible non-temporal read. Written by a PEER into
+                        # this rank's CACHED combine_gate, and the reduce's flag spin is only
+                        # agent-scope, so a plain load is served from an L2 line still holding the
+                        # PREVIOUS combine's gate -- the earlier layers of a multi-layer backward
+                        # then read the later layers' gate gradient. Mirrors the bf16 reduce.
+                        gate_v = buffer_load(
+                            gate_local_res, slot, vec_width=1, dtype=fx.T.f32(), cache_modifier=19
+                        )
                         zero_f = fx.Float32(0.0)
                         v1 = fx.arith.select(topk_index < fx.Int64(num_experts), gate_v, zero_f)
                         d_val = fx.arith.select(topk_index >= fx.Int64(0), v1, zero_f)
