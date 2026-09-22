@@ -403,41 +403,9 @@ def _grouped_bf16_persistent_gemm_kernel_ws(
     # (Inlining the per-tile body twice -- once per phase -- produced phase-2
     # NaN on the Triton-AMD backend even with no register spilling reported.
     # Folding both phases into one while loop sidesteps the issue.)
-    local_idx = tl.atomic_add(local_counter, 1, sem="relaxed", scope="gpu")
-    in_phase2 = local_idx >= per_xcd
-    if in_phase2:
-        g_idx = tl.atomic_add(global_counter_ptr, 1, sem="relaxed", scope="gpu")
-        tile_id = phase1_total + g_idx
-    else:
-        tile_id = xcd_id * per_xcd + local_idx
-
-    while tile_id < total_tiles:
-        _process_grouped_gemm_tile(
-            tile_id,
-            A,
-            B,
-            C,
-            group_offs_ptr,
-            G,
-            N,
-            K,
-            stride_am,
-            stride_bg,
-            stride_bn,
-            stride_cm,
-            stride_cn,
-            num_pid_n,
-            stride_ak=stride_ak,
-            stride_bk=stride_bk,
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            BLOCK_SIZE_K=BLOCK_SIZE_K,
-            GROUP_SIZE_M=GROUP_SIZE_M,
-            EVEN_K=EVEN_K,
-            CACHE_MODIFIER_A=CACHE_MODIFIER_A,
-            CACHE_MODIFIER_B=CACHE_MODIFIER_B,
-            ALLOW_TF32=ALLOW_TF32,
-        )
+    in_phase2 = False
+    done = False
+    while not done:
         if in_phase2:
             g_idx = tl.atomic_add(global_counter_ptr, 1, sem="relaxed", scope="gpu")
             tile_id = phase1_total + g_idx
@@ -449,6 +417,36 @@ def _grouped_bf16_persistent_gemm_kernel_ws(
                 tile_id = phase1_total + g_idx
             else:
                 tile_id = xcd_id * per_xcd + local_idx
+
+        if tile_id >= total_tiles:
+            done = True
+        else:
+            _process_grouped_gemm_tile(
+                tile_id,
+                A,
+                B,
+                C,
+                group_offs_ptr,
+                G,
+                N,
+                K,
+                stride_am,
+                stride_bg,
+                stride_bn,
+                stride_cm,
+                stride_cn,
+                num_pid_n,
+                stride_ak=stride_ak,
+                stride_bk=stride_bk,
+                BLOCK_SIZE_M=BLOCK_SIZE_M,
+                BLOCK_SIZE_N=BLOCK_SIZE_N,
+                BLOCK_SIZE_K=BLOCK_SIZE_K,
+                GROUP_SIZE_M=GROUP_SIZE_M,
+                EVEN_K=EVEN_K,
+                CACHE_MODIFIER_A=CACHE_MODIFIER_A,
+                CACHE_MODIFIER_B=CACHE_MODIFIER_B,
+                ALLOW_TF32=ALLOW_TF32,
+            )
 
 
 @scoped_amd_knobs
@@ -935,44 +933,9 @@ def _grouped_variable_k_gemm_kernel_ws(
     per_xcd = local_per_xcd.to(tl.int32)
     phase1_total = (per_xcd * ACTIVE_XCDS).to(tl.int32)
 
-    local_idx = tl.atomic_add(local_counter, 1, sem="relaxed", scope="gpu")
-    in_phase2 = local_idx >= per_xcd
-    if in_phase2:
-        g_idx = tl.atomic_add(global_counter_ptr, 1, sem="relaxed", scope="gpu")
-        tile_id = phase1_total + g_idx
-    else:
-        tile_id = xcd_id * per_xcd + local_idx
-
-    while tile_id < total_tiles:
-        _process_variable_k_tile(
-            tile_id,
-            LHS,
-            RHS,
-            C,
-            scale,
-            group_offs_ptr,
-            OUT_M,
-            OUT_N,
-            stride_lhs_m,
-            stride_rhs_m,
-            stride_cg,
-            stride_cm,
-            stride_cn,
-            tiles_m,
-            tiles_n,
-            tiles_per_group,
-            stride_lhs_n=stride_lhs_n,
-            stride_rhs_n=stride_rhs_n,
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            BLOCK_SIZE_K=BLOCK_SIZE_K,
-            GROUP_SIZE_M=GROUP_SIZE_M,
-            IS_FP8=IS_FP8,
-            CACHE_MODIFIER_A=CACHE_MODIFIER_A,
-            CACHE_MODIFIER_B=CACHE_MODIFIER_B,
-            ALLOW_TF32=ALLOW_TF32,
-            BETA_IS_ONE=BETA_IS_ONE,
-        )
+    in_phase2 = False
+    done = False
+    while not done:
         if in_phase2:
             g_idx = tl.atomic_add(global_counter_ptr, 1, sem="relaxed", scope="gpu")
             tile_id = phase1_total + g_idx
@@ -984,6 +947,39 @@ def _grouped_variable_k_gemm_kernel_ws(
                 tile_id = phase1_total + g_idx
             else:
                 tile_id = xcd_id * per_xcd + local_idx
+
+        if tile_id >= total_tiles:
+            done = True
+        else:
+            _process_variable_k_tile(
+                tile_id,
+                LHS,
+                RHS,
+                C,
+                scale,
+                group_offs_ptr,
+                OUT_M,
+                OUT_N,
+                stride_lhs_m,
+                stride_rhs_m,
+                stride_cg,
+                stride_cm,
+                stride_cn,
+                tiles_m,
+                tiles_n,
+                tiles_per_group,
+                stride_lhs_n=stride_lhs_n,
+                stride_rhs_n=stride_rhs_n,
+                BLOCK_SIZE_M=BLOCK_SIZE_M,
+                BLOCK_SIZE_N=BLOCK_SIZE_N,
+                BLOCK_SIZE_K=BLOCK_SIZE_K,
+                GROUP_SIZE_M=GROUP_SIZE_M,
+                IS_FP8=IS_FP8,
+                CACHE_MODIFIER_A=CACHE_MODIFIER_A,
+                CACHE_MODIFIER_B=CACHE_MODIFIER_B,
+                ALLOW_TF32=ALLOW_TF32,
+                BETA_IS_ONE=BETA_IS_ONE,
+            )
 
 
 # -- Public API -- Variable-K BF16 grouped GEMM (backward) --
