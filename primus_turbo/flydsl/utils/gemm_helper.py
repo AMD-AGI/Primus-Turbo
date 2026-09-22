@@ -2332,6 +2332,9 @@ def _packed_ds_read_tr16(base_ptr, byte_offsets):
     v2i32 = ir.VectorType.get([2], ir.IntegerType.get_signless(32))
     struct_t = _llvm.StructType.get_literal([v2i32] * n)
     asm = "\n".join(f"ds_read_b64_tr_b16 ${k}, ${n} offset:{byte_offsets[k]}" for k in range(n))
+    # The block must drain its own reads: the backend cannot see that opaque asm started LDS
+    # traffic, so it never waits on the destination registers before a consumer reads them.
+    asm += "\ns_waitcnt lgkmcnt(0)"
     constraints = ",".join(["=&v"] * n + ["v"] + ["~{memory}"])
     op = _llvm.InlineAsmOp(
         res=struct_t,
