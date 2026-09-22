@@ -228,8 +228,8 @@ class GroupedGEMMFP4VariableKTritonBackend(KernelBackend):
     """Triton persistent-kernel backend for MXFP4 variable-K grouped GEMM (wgrad).
 
     MX_BLOCKWISE only. Both operands are FP4-packed 2D ``(OUT_*, M_total/2)`` and
-    the kernel reduces over the (padded) per-group M, so it expects the
-    non-transposed layout (``not trans_a and not trans_b``).
+    the kernel reduces over the (padded) per-group M. The feature-major operands
+    therefore implement ``lhs @ rhs.T`` and use the NT tag (``not trans_a and trans_b``).
     """
 
     SUPPORTED_GRANULARITIES = {ScalingGranularity.MX_BLOCKWISE}
@@ -259,7 +259,7 @@ class GroupedGEMMFP4VariableKTritonBackend(KernelBackend):
         supported &= granularity in GroupedGEMMFP4VariableKTritonBackend.SUPPORTED_GRANULARITIES
         supported &= a.dtype == float4_e2m1fn_x2 and b.dtype == float4_e2m1fn_x2
         supported &= out_dtype in (torch.float16, torch.bfloat16)
-        supported &= not trans_a and not trans_b
+        supported &= not trans_a and trans_b
         return supported
 
     @staticmethod
@@ -306,9 +306,9 @@ class GroupedGEMMFP4VariableKTritonBackend(KernelBackend):
 class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
     """FlyDSL MXFP4 variable-K grouped GEMM backend (wgrad, gfx950).
 
-    MX_BLOCKWISE, non-transposed FP4-packed 2D operands ``(OUT_*, M_total/2)``,
-    contraction over the (128-padded) per-group M. Reuses the dense whole-loop
-    with a runtime nval; the host repacks the contraction to 512-aligned per group.
+    MX_BLOCKWISE, NT-tagged FP4-packed 2D operands ``(OUT_*, M_total/2)`` implementing
+    ``lhs @ rhs.T``, with contraction over the 256-aligned per-group M produced by
+    dual quant. The dense whole-loop consumes that layout directly at a runtime nval.
     """
 
     SUPPORTED_GRANULARITIES = {ScalingGranularity.MX_BLOCKWISE}
@@ -337,10 +337,10 @@ class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= granularity in GroupedGEMMFP4VariableKFlyDSLBackend.SUPPORTED_GRANULARITIES
         supported &= a.dtype == float4_e2m1fn_x2 and b.dtype == float4_e2m1fn_x2
-        # bf16 and fp16: this kernel consumes the FlyDSL dual-quant's 512-aligned colwise
+        # bf16 and fp16: this kernel consumes the FlyDSL dual-quant's 256-aligned colwise
         # layout, which the grouped quant now produces for both dtypes.
         supported &= out_dtype in (torch.bfloat16, torch.float16)
-        supported &= not trans_a and not trans_b
+        supported &= not trans_a and trans_b
         # OUT_M/OUT_N (=a.shape[0]/b.shape[0], swapped by trans_c) must be 64-multiples for
         # the packed-scale preshuffle; non-64 (tiny test shapes) falls back to Triton.
         supported &= a.shape[0] % 64 == 0 and b.shape[0] % 64 == 0
@@ -418,6 +418,7 @@ class GroupedGEMMFP4VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDisp
         out_dtype,
         granularity,
         num_cu,
+        inplace_add_to_out=False,
         **kwargs,
     ):
         bs = group_lens.shape[0]
@@ -426,7 +427,22 @@ class GroupedGEMMFP4VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDisp
         k = a.shape[0] if trans_a else a.shape[1]
         if trans_c:
             m, n = n, m
-        return (bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, granularity)
+        # Triton cannot accumulate while FlyDSL can. A cache hit skips can_handle,
+        # so overwrite and beta=1 calls must never share a backend choice.
+        return (
+            bs,
+            m,
+            n,
+            k,
+            a.dtype,
+            b.dtype,
+            out_dtype,
+            trans_a,
+            trans_b,
+            trans_c,
+            granularity,
+            inplace_add_to_out,
+        )
 
 
 _torch_custom_op_wrapper = torch.library.custom_op
@@ -570,16 +586,26 @@ def grouped_gemm_fp4_variable_k_accum_impl(
         out=out,
     )
 
-    # The tuner benchmarks a backend by launching it repeatedly, so letting it tune on
-    # the caller's buffer would accumulate the wgrad once per warmup and timing
-    # iteration.
-    if (
-        GlobalBackendManager.auto_tune_enabled()
-        and not GroupedGEMMFP4VariableKKernelDispatcher._is_graph_capturing()
-    ):
-        GroupedGEMMFP4VariableKKernelDispatcher.tune(**{**kwargs, "out": torch.zeros_like(out)})
+    # The tuner launches each candidate repeatedly. On the first accumulation-key
+    # lookup, tune against scratch so those profiling writes do not mutate ``out``.
+    user_selected_backend = user_backend_choice is not None and user_backend_choice.backend is not None
+    should_autotune = not user_selected_backend and (
+        (user_backend_choice is not None and user_backend_choice.auto_tune)
+        or default_backend_choice.auto_tune
+        or GlobalBackendManager.auto_tune_enabled()
+    )
+    tuning_kwargs = None
+    if should_autotune and not GroupedGEMMFP4VariableKKernelDispatcher._is_graph_capturing():
+        key = GroupedGEMMFP4VariableKKernelDispatcher.make_key(**kwargs)
+        if key not in GroupedGEMMFP4VariableKKernelDispatcher._cache:
+            tuning_kwargs = {**kwargs, "out": torch.zeros_like(out)}
 
-    GroupedGEMMFP4VariableKKernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
+    GroupedGEMMFP4VariableKKernelDispatcher.dispatch(
+        default_backend_choice,
+        user_backend_choice,
+        tuning_kwargs=tuning_kwargs,
+        **kwargs,
+    )
 
 
 @grouped_gemm_fp4_variable_k_accum_impl.register_fake
@@ -603,6 +629,10 @@ def grouped_gemm_fp4_variable_k_accum_impl_meta(
     assert a.dim() == 2, f"a must be 2D, got {a.shape}"
     assert b.dim() == 2, f"b must be 2D, got {b.shape}"
     assert out.dim() == 3, f"out must be 3D, got {out.shape}"
+    assert not trans_a and trans_b, "MXFP4 variable-K grouped GEMM is NT only"
+    assert a.shape[1] == b.shape[1], (
+        f"packed contraction dimensions must match, got {a.shape[1]} and {b.shape[1]}"
+    )
     return None
 
 
@@ -948,6 +978,10 @@ def grouped_gemm_fp4_variable_k_impl_meta(
         torch.float16,
         torch.bfloat16,
     ), f"out_dtype must be float16 or bfloat16, got {out_dtype}"
+    assert not trans_a and trans_b, "MXFP4 variable-K grouped GEMM is NT only"
+    assert a.shape[1] == b.shape[1], (
+        f"packed contraction dimensions must match, got {a.shape[1]} and {b.shape[1]}"
+    )
 
     # wgrad: C[g] (OUT_M, OUT_N) = lhs[:,g] @ rhs[:,g]^T, lhs/rhs swapped by
     # trans_c (matches the eager path). Output (G, OUT_M, OUT_N).

@@ -7,7 +7,7 @@
 import pytest
 import torch
 
-from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
+from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager, PrecisionType
 from primus_turbo.pytorch.core.low_precision import (
     MXFP4_BLOCK_SIZE,
     Float4QuantConfig,
@@ -19,6 +19,12 @@ from primus_turbo.pytorch.core.low_precision import (
     float4_e2m1fn_x2,
 )
 from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
+from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp4_impl import (
+    GroupedGEMMFP4VariableKFlyDSLBackend,
+    GroupedGEMMFP4VariableKKernelDispatcher,
+    GroupedGEMMFP4VariableKTritonBackend,
+    grouped_gemm_fp4_variable_k_impl_meta,
+)
 from primus_turbo.pytorch.ops.grouped_gemm_fp4 import grouped_gemm_fp4
 from primus_turbo.pytorch.ops.quantization import grouped_quantize_fp4_with_trans
 from tests.pytorch.ref.gemm_ref import (
@@ -72,6 +78,95 @@ def _make_config():
         block_size=32,
         scale_dtype=ScaleDtype.E8M0,
     )
+
+
+def test_grouped_gemm_fp4_variable_k_dispatch_keys():
+    fp4_dtype = float4_e2m1fn_x2 if float4_e2m1fn_x2 is not None else torch.uint8
+    a = torch.empty((512, 2048), device="meta", dtype=fp4_dtype)
+    group_lens = torch.empty((8,), device="meta", dtype=torch.int64)
+    common = dict(
+        a=a,
+        a_scales=None,
+        b_scales=None,
+        group_lens=group_lens,
+        group_offs=None,
+        trans_a=False,
+        trans_b=True,
+        trans_c=False,
+        out_dtype=torch.bfloat16,
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        num_cu=None,
+    )
+
+    key_n3072 = GroupedGEMMFP4VariableKKernelDispatcher.make_key(
+        b=torch.empty((3072, 2048), device="meta", dtype=fp4_dtype), **common
+    )
+    key_n4096 = GroupedGEMMFP4VariableKKernelDispatcher.make_key(
+        b=torch.empty((4096, 2048), device="meta", dtype=fp4_dtype), **common
+    )
+    accumulation_key = GroupedGEMMFP4VariableKKernelDispatcher.make_key(
+        b=torch.empty((3072, 2048), device="meta", dtype=fp4_dtype),
+        inplace_add_to_out=True,
+        **common,
+    )
+
+    assert key_n3072[1:4] == (512, 3072, 2048)
+    assert key_n4096[1:4] == (512, 4096, 2048)
+    assert key_n3072 != key_n4096
+    assert key_n3072 != accumulation_key
+
+
+def test_grouped_gemm_fp4_variable_k_dispatch_contract(monkeypatch):
+    fp4_dtype = float4_e2m1fn_x2 if float4_e2m1fn_x2 is not None else torch.uint8
+    monkeypatch.setattr(
+        "primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp4_impl.float4_e2m1fn_x2",
+        fp4_dtype,
+    )
+    monkeypatch.setattr(
+        "primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp4_impl.is_gfx942", lambda: False
+    )
+    monkeypatch.setattr(
+        "primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp4_impl.is_gfx950", lambda: True
+    )
+
+    a = torch.empty((128, 256), device="meta", dtype=fp4_dtype)
+    b = torch.empty((64, 256), device="meta", dtype=fp4_dtype)
+    kwargs = dict(
+        a=a,
+        b=b,
+        a_scales=torch.empty((128, 16), device="meta", dtype=torch.uint8),
+        b_scales=torch.empty((64, 16), device="meta", dtype=torch.uint8),
+        group_lens=torch.empty((4,), device="meta", dtype=torch.int64),
+        group_offs=torch.empty((5,), device="meta", dtype=torch.int64),
+        trans_a=False,
+        trans_b=True,
+        trans_c=False,
+        out_dtype=torch.bfloat16,
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        num_cu=None,
+    )
+
+    for backend in (GroupedGEMMFP4VariableKTritonBackend, GroupedGEMMFP4VariableKFlyDSLBackend):
+        assert backend.can_handle(**kwargs)
+        assert not backend.can_handle(**{**kwargs, "trans_b": False})
+
+    out = grouped_gemm_fp4_variable_k_impl_meta(
+        **{
+            **kwargs,
+            "granularity": ScalingGranularity.MX_BLOCKWISE.value,
+            "default_backend": BackendType.FLYDSL.value,
+        }
+    )
+    assert out.shape == (4, 128, 64)
+    with pytest.raises(AssertionError, match="NT only"):
+        grouped_gemm_fp4_variable_k_impl_meta(
+            **{
+                **kwargs,
+                "trans_b": False,
+                "granularity": ScalingGranularity.MX_BLOCKWISE.value,
+                "default_backend": BackendType.FLYDSL.value,
+            }
+        )
 
 
 def _run(B, M, N, K, dtype, balance):
@@ -340,7 +435,7 @@ def test_grouped_gemm_fp4_zero_group_lens(dtype, group_lens_values, N, K):
 # ----------------------------------------------------------------------------
 @pytest.mark.parametrize("dtype", DTYPE_VALUES)
 @pytest.mark.parametrize("balance", BALANCE_VALUES)
-def test_grouped_gemm_fp4_fused_grad_accum(dtype, balance):
+def test_grouped_gemm_fp4_fused_grad_accum(dtype, balance, request):
     """``fuse_bgrad_accum_pattern`` must leave ``main_grad`` holding previous + wgrad.
 
     FlyDSL is the only FP4 variable-K backend with the accumulate epilogue and its store
@@ -353,6 +448,15 @@ def test_grouped_gemm_fp4_fused_grad_accum(dtype, balance):
     seed = 42
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+    per_op_autotune = dtype == torch.bfloat16 and not balance
+    if per_op_autotune:
+        GlobalBackendManager.reset()
+        request.addfinalizer(GlobalBackendManager.reset)
+        GlobalBackendManager.set_grouped_gemm_backend(
+            precision=PrecisionType.FP4,
+            auto_tune=True,
+        )
 
     device = "cuda:0"
     B, M, N, K = 4, 256, 512, 256
@@ -400,6 +504,25 @@ def test_grouped_gemm_fp4_fused_grad_accum(dtype, balance):
     print(f"AGrad-SNR={a_grad_snr:.2f} dB  BGrad-SNR={b_grad_snr:.2f} dB")
     assert a_grad_snr > SNR_THRESHOLD, f"a_grad_snr={a_grad_snr:.2f} too low"
     assert b_grad_snr > SNR_THRESHOLD, f"b_grad_snr={b_grad_snr:.2f} too low"
+
+    if per_op_autotune:
+        # Re-run the accumulation key to cover the cache-hit path as well.
+        before_cache_hit = b_fused.main_grad.clone()
+        a_fused.grad = None
+        b_fused.grad = None
+        out_fused = grouped_gemm_fp4(
+            a_fused,
+            b_fused,
+            group_lens,
+            trans_b=True,
+            config=config,
+            fuse_bgrad_accum_pattern="megatron",
+        )
+        out_fused.backward(grad_out)
+        torch.cuda.synchronize()
+        cache_hit_delta = b_fused.main_grad.float() - before_cache_hit.float()
+        cache_hit_snr = compute_snr(b.grad.float(), cache_hit_delta)
+        assert cache_hit_snr > SNR_THRESHOLD, f"cache_hit_snr={cache_hit_snr:.2f} too low"
 
 
 # CUDA-graph capturability (forward). The forward uses no D2H sync, so it is

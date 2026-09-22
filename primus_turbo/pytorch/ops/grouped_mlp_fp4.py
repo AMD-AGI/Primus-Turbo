@@ -91,7 +91,7 @@ def _wgrad_grouped_gemm_fp4_impl_wrapper(
     inputs = (a, b, a_scales, b_scales, group_lens, group_offs)
     options = dict(
         trans_a=False,
-        trans_b=False,
+        trans_b=True,
         trans_c=False,
         out_dtype=out_dtype,
         granularity=ScalingGranularity.MX_BLOCKWISE.value,
