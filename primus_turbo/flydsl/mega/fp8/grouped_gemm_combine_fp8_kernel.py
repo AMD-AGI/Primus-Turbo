@@ -57,7 +57,6 @@ from flydsl.expr.buffer_ops import (
 from flydsl.expr.rocdl import cvt_pk_f32_fp8
 from flydsl.expr.typing import Vector as Vec
 
-from primus_turbo.flydsl.mega.ep_intranode import _BLOCK_THREADS, _NUM_WARPS, _WARP
 from primus_turbo.flydsl.mega.fp8.dispatch_grouped_gemm_mxfp8_kernel import (
     _H_NUM_TILE_BLOCKS,
     _H_ORIGIN_RANK,
@@ -70,6 +69,9 @@ from primus_turbo.flydsl.mega.fp8.gemm_mxfp8_tile import (
     emit_gemm_mxfp8_nt_tile,
 )
 from primus_turbo.flydsl.mega.fp8.prims import (
+    _BLOCK_THREADS,
+    _NUM_WARPS,
+    _WARP,
     _wait_mem,
     l2_invalidate,
     ld,

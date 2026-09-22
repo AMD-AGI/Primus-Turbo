@@ -21,6 +21,14 @@ from primus_turbo.flydsl.utils.prims import (  # shared with the bf16 path; only
     elem_ptr,
 )
 
+# Block geometry every fp8 kernel in this package is written against: `known_block_size`,
+# the warp-strided row loops and the `_WARP * VW` payload steps all assume these exact values.
+# They used to be borrowed from the bf16 `ep_intranode`, which is the one import that kept this
+# package from being self-contained; the values are pinned here instead.
+_WARP = 64
+_BLOCK_THREADS = 512
+_NUM_WARPS = _BLOCK_THREADS // _WARP
+
 
 def _wait_mem():
     llvm.inline_asm(fx.T.i32(), [], "s_waitcnt lgkmcnt(0) vmcnt(0)", "=r,~{memory}", has_side_effects=True)

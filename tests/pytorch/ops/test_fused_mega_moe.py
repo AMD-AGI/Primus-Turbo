@@ -33,7 +33,7 @@ from primus_turbo.pytorch.core.utils import is_gfx950, is_gfx1250  # noqa: E402
 if is_gfx1250():
     pytest.skip("mega_moe_fused is not supported on gfx1250", allow_module_level=True)
 
-from primus_turbo.flydsl.mega.symm_buffer import (  # noqa: E402
+from primus_turbo.flydsl.mega.bf16.symm_buffer import (  # noqa: E402
     get_symm_buffer_for_mega_moe,
 )
 from primus_turbo.pytorch.ops import grouped_gemm as _turbo_gg  # noqa: E402

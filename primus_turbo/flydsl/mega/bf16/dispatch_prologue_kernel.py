@@ -30,8 +30,8 @@ from flydsl.expr.buffer_ops import (
 from flydsl.expr.primitive import get_dyn_shared
 from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
-from primus_turbo.flydsl.mega.barrier import grid_sync, xgmi_barrier
-from primus_turbo.flydsl.mega.symm_buffer import TOKEN_DTYPE, SymBuffer, Workspace
+from primus_turbo.flydsl.mega.bf16.barrier import grid_sync, xgmi_barrier
+from primus_turbo.flydsl.mega.bf16.symm_buffer import TOKEN_DTYPE, SymBuffer, Workspace
 from primus_turbo.flydsl.mega.tune_utils import (
     Config,
     autotune,

@@ -35,11 +35,11 @@ from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
 from primus_turbo.flydsl.mega.bf16.grouped_gemm_bf16_kernel import (
     grouped_gemm_bf16_variable_k_tile,
 )
-from primus_turbo.flydsl.mega.dispatch_prologue_kernel import (
+from primus_turbo.flydsl.mega.bf16.dispatch_prologue_kernel import (
     dispatch_prologue_flydsl_kernel,
 )
-from primus_turbo.flydsl.mega.ep_intranode import _BLOCK_THREADS, dispatch_bf16_tile
-from primus_turbo.flydsl.mega.symm_buffer import (
+from primus_turbo.flydsl.mega.bf16.ep_intranode import _BLOCK_THREADS, dispatch_bf16_tile
+from primus_turbo.flydsl.mega.bf16.symm_buffer import (
     TOKEN_DTYPE,
     SymBuffer,
     Workspace,

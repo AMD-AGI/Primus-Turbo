@@ -29,11 +29,11 @@ from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
     _make_shared_storage,
     gemm_bf16_tile,
 )
-from primus_turbo.flydsl.mega.ep_intranode import (
+from primus_turbo.flydsl.mega.bf16.ep_intranode import (
     combine_bf16_tile,
     topk_reduce_bf16_tile,
 )
-from primus_turbo.flydsl.mega.symm_buffer import (
+from primus_turbo.flydsl.mega.bf16.symm_buffer import (
     TOKEN_DTYPE,
     SymBuffer,
     Workspace,

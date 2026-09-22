@@ -45,13 +45,14 @@ from flydsl.expr.buffer_ops import (
 from flydsl.expr.typing import AddressSpace, PointerType
 from torch.distributed import ProcessGroup
 
-from primus_turbo.flydsl.mega.ep_intranode import _BLOCK_THREADS, _WARP
 from primus_turbo.flydsl.mega.fp8.dispatch_prologue import dispatch_prologue
 from primus_turbo.flydsl.mega.fp8.gemm_mxfp8_tile import (
     BLOCK_K,
     gemm_mxfp8_nt_tile,
 )
 from primus_turbo.flydsl.mega.fp8.prims import (
+    _BLOCK_THREADS,
+    _WARP,
     atomic_add,
     l2_invalidate,
     l2_writeback,

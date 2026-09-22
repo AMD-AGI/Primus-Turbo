@@ -68,7 +68,7 @@ from primus_turbo.flydsl.mega import (  # noqa: E402  # noqa: E402
     dispatch_prologue_flydsl_kernel,
     grouped_gemm_combine_bf16_flydsl_kernel,
 )
-from primus_turbo.flydsl.mega.ep_intranode import (  # noqa: E402
+from primus_turbo.flydsl.mega.bf16.ep_intranode import (  # noqa: E402
     _BLOCK_THREADS,
     _NUM_WARPS,
     _PVEC,
@@ -76,10 +76,10 @@ from primus_turbo.flydsl.mega.ep_intranode import (  # noqa: E402
     dispatch_bf16_tile,
     topk_reduce_bf16_tile,
 )
-from primus_turbo.flydsl.mega.symm_buffer import (  # noqa: E402
+from primus_turbo.flydsl.mega.bf16.symm_buffer import (  # noqa: E402
     BLOCK_M as _POOL_BLOCK_M,
 )
-from primus_turbo.flydsl.mega.symm_buffer import (  # noqa: E402
+from primus_turbo.flydsl.mega.bf16.symm_buffer import (  # noqa: E402
     TOKEN_DTYPE,
     SymBuffer,
     Workspace,
