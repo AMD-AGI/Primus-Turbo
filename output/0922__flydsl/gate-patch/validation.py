@@ -134,11 +134,13 @@ def check_correctness(impl_dir: Path, shapes):
             # Move the reference to the device one tensor at a time rather than all five at
             # once: at prod dq alone is 537 MB in fp32, and the candidate's own outputs plus
             # the poisoned allocator are already resident.
-            o = blob["o"].to(q.device, non_blocking=False)
-            lse = blob["lse"].to(q.device, non_blocking=False)
-            rq = blob["dq"].to(q.device, non_blocking=False)
-            rk = blob["dk"].to(q.device, non_blocking=False)
-            rv = blob["dv"].to(q.device, non_blocking=False)
+            # o and lse are INPUTS to the candidate, so they must be resident. dq/dk/dv
+            # are only compared, so they stay on the host until each is needed -- at prod
+            # that keeps the reference peak at 512 MiB (dq alone) instead of 768 MiB, and
+            # dk+dv never coexist with dq.
+            o = blob["o"].to(q.device)
+            lse = blob["lse"].to(q.device)
+            rq, rk, rv = blob["dq"], blob["dk"], blob["dv"]
             del blob
         poison_allocator()
         gq, gk, gv = impl(do, q, k, v, o, lse, causal=True)
@@ -150,7 +152,15 @@ def check_correctness(impl_dir: Path, shapes):
                 row.append(f"{tag} UNCOVERED {fin}/{got.numel()}")
                 ok = False
                 continue
-            db = sqnr_db(ref, got)
+            # ref may be a host tensor when it came from the cache: move just this one,
+            # compare, and drop it before the next. sqnr_db is elementwise plus a reduction,
+            # so keeping the comparison on the device adds no dispatch the gate did not
+            # already make -- and it avoids a blocking D2H synchronised on the candidate's
+            # own launches, which would make an async fault in the CANDIDATE surface inside
+            # a hipMemcpy instead of at a named event.
+            ref_dev = ref.to(got.device) if ref.device != got.device else ref
+            db = sqnr_db(ref_dev, got)
+            del ref_dev
             row.append(f"{tag} {db:6.2f} dB")
             if not (db >= GATE_DB):
                 ok = False
@@ -170,9 +180,11 @@ def check_determinism(impl_dir: Path, shape="fast"):
     import torch
     from common import forward_reference, load_impl, make_inputs
 
+    from refcache_util import cached_forward
+
     impl = load_impl(impl_dir)
     q, k, v, do = make_inputs(shape, seed=0)
-    o, lse = forward_reference(q, k, v, causal=True)
+    o, lse = cached_forward(shape, q, k, v, causal=True)
     ref = [t.clone() for t in impl(do, q, k, v, o, lse, causal=True)]
     for i in range(1, DETERMINISM_RUNS):
         got = impl(do, q, k, v, o, lse, causal=True)
