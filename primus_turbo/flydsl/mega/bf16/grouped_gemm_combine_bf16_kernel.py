@@ -24,14 +24,19 @@ from flydsl.expr.buffer_ops import (
     extract_base_index,
 )
 
+from primus_turbo.flydsl.mega.bf16.ep_intranode import (
+    combine_bf16_tile,
+    topk_reduce_bf16_tile,
+)
+
 # Private f6d5ab68 snapshot — see mega/bf16/__init__.py.
 from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
     _make_shared_storage,
     gemm_bf16_tile,
 )
-from primus_turbo.flydsl.mega.bf16.ep_intranode import (
-    combine_bf16_tile,
-    topk_reduce_bf16_tile,
+from primus_turbo.flydsl.mega.bf16.gemm_helper import (
+    make_bf16_fp16_tile_tensor,
+    make_value_attrs,
 )
 from primus_turbo.flydsl.mega.bf16.symm_buffer import (
     TOKEN_DTYPE,
@@ -42,10 +47,6 @@ from primus_turbo.flydsl.mega.bf16.symm_buffer import (
 from primus_turbo.flydsl.mega.tune_utils import (
     Config,
     autotune,
-)
-from primus_turbo.flydsl.mega.bf16.gemm_helper import (
-    make_bf16_fp16_tile_tensor,
-    make_value_attrs,
 )
 from primus_turbo.flydsl.utils.prims import (
     atomic_add,

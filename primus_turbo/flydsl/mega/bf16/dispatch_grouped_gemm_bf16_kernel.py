@@ -26,19 +26,25 @@ from flydsl.expr.buffer_ops import (
 )
 from flydsl.expr.typing import AddressSpace, PointerType
 
+from primus_turbo.flydsl.mega.bf16.dispatch_prologue_kernel import (
+    dispatch_prologue_flydsl_kernel,
+)
+from primus_turbo.flydsl.mega.bf16.ep_intranode import _BLOCK_THREADS, dispatch_bf16_tile
+
 # Private f6d5ab68 snapshot — do not import the shared flydsl BF16 tiles;
 # ed8d7af4 (#486) rebuilt those and broke MegaMoE numericals.
 from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
     _make_shared_storage,
     gemm_bf16_tile,
 )
+from primus_turbo.flydsl.mega.bf16.gemm_helper import (
+    make_bf16_fp16_tile_tensor,
+    make_value_attrs,
+    xcd_remap_pid,
+)
 from primus_turbo.flydsl.mega.bf16.grouped_gemm_bf16_kernel import (
     grouped_gemm_bf16_variable_k_tile,
 )
-from primus_turbo.flydsl.mega.bf16.dispatch_prologue_kernel import (
-    dispatch_prologue_flydsl_kernel,
-)
-from primus_turbo.flydsl.mega.bf16.ep_intranode import _BLOCK_THREADS, dispatch_bf16_tile
 from primus_turbo.flydsl.mega.bf16.symm_buffer import (
     TOKEN_DTYPE,
     SymBuffer,
@@ -48,11 +54,6 @@ from primus_turbo.flydsl.mega.bf16.symm_buffer import (
 from primus_turbo.flydsl.mega.tune_utils import (
     Config,
     autotune,
-)
-from primus_turbo.flydsl.mega.bf16.gemm_helper import (
-    make_bf16_fp16_tile_tensor,
-    make_value_attrs,
-    xcd_remap_pid,
 )
 from primus_turbo.flydsl.utils.prims import cast, ld, read_clock, spin_timed_out
 
@@ -332,7 +333,6 @@ def _make_epoch_bump(addend):
             buffer_store(new_exp, expected_res, idx)
 
     return epoch_bump_kernel
-
 
 
 @autotune(

@@ -62,6 +62,7 @@ from primus_turbo.flydsl.mega.fp8.dispatch_grouped_gemm_mxfp8_kernel import (
     _H_ORIGIN_RANK,
     _H_ORIGIN_SLOT,
 )
+from primus_turbo.flydsl.mega.fp8.gemm_helper import emit_if_then, run_compiled
 from primus_turbo.flydsl.mega.fp8.gemm_mxfp8_tile import (
     BLOCK_K as _MXFP8_BLOCK_K,
 )
@@ -78,7 +79,6 @@ from primus_turbo.flydsl.mega.fp8.prims import (
     st,
 )
 from primus_turbo.flydsl.mega.fp8.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
-from primus_turbo.flydsl.mega.fp8.gemm_helper import emit_if_then, run_compiled
 from primus_turbo.flydsl.utils.prims import cast, read_clock, spin_timed_out
 
 # s_waitcnt vmcnt bound for the GEMM main loop; changes the emitted kernel, so it is in the flyc

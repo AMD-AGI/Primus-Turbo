@@ -52,9 +52,9 @@ from flydsl.expr.primitive import get_dyn_shared
 from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
 from primus_turbo.flydsl.mega.fp8.barrier import grid_sync, xgmi_barrier
+from primus_turbo.flydsl.mega.fp8.gemm_helper import run_compiled
 from primus_turbo.flydsl.mega.fp8.prims import atomic_add, ld, st
 from primus_turbo.flydsl.mega.fp8.symm_buffer import SymLayout, sym_map
-from primus_turbo.flydsl.mega.fp8.gemm_helper import run_compiled
 
 # grid_blocks (== num_cu) is a caller arg (default 64). Fewer blocks => cheaper
 # self-resetting grid_sync; 48-64 is the measured sweet spot. Must stay <= num_CU so
