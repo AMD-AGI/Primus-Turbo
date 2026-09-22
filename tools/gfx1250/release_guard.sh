@@ -18,16 +18,40 @@
 # process with work in flight on the GPU leaves an unkillable D-state process behind each
 # time, which pushes a recoverable card toward one that needs a power cycle -- the exact
 # outcome we are trying to spare whoever gets this node next.
+#
+# WHY IT SLEPT THROUGH 2026-09-21. Committed in dd1aec29 with no launcher anywhere: no
+# cron, no systemd unit, no call from patrol.sh. It never ran, and since it wrote no pid
+# file, no log and no sentinel, nothing on disk could show that it had not. patrol.sh now
+# starts it (opt-in, PATROL_ARM_GUARD=1) and it now writes $PIDFILE. Separately, its four
+# original checks would not have caught that wedge anyway: the box did not reboot, dmesg
+# carried no reset signature at all, fa-repro stayed up, and the supervisor stayed alive --
+# parked forever in gpu_ok()'s 900 s backoff. Check 5 exists for exactly that state.
+#
+# TESTABILITY. NOTE/TOKEN/MARK are overridable. They used to be hardcoded to production
+# paths, so smoke-testing this script performed a real node release -- which is how a test
+# on 2026-09-22 deleted the live card token and wrote a bogus RELEASED.md. To exercise it:
+#   GUARD_NOTE=/tmp/t.md GUARD_TOKEN=/tmp/t.owner GUARD_MARK=/tmp/t GUARD_PID_FILE=/tmp/t.pid \
+#     bash release_guard.sh <job> 5
 set -u
 JOB=${1:?usage: release_guard.sh <job-ref> [interval_s]}
 INTERVAL=${2:-60}
 
 OE=${OE_ROOT:-/home/lihuzhan/code/2026_0910__op-evolve/op-evolve}
-REPO=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo
-NOTE="$REPO/output/0921__flydsl/RELEASED.md"
-TOKEN=/home/lihuzhan/gfx1250.owner
-MARK="$REPO/output/0921__flydsl/.patrol"
+REPO=${REPO:-/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo}
+NOTE=${GUARD_NOTE:-$REPO/output/0921__flydsl/RELEASED.md}
+TOKEN=${GUARD_TOKEN:-/home/lihuzhan/gfx1250.owner}
+MARK=${GUARD_MARK:-$REPO/output/0921__flydsl/.patrol}
+PIDFILE=${GUARD_PID_FILE:-/tmp/gfx1250-release-guard.pid}
+STATE="$OE/artifacts/$JOB/job_context/state.yaml"
+SUPLOG="$OE/artifacts/supervisor.log"
 BOOT_AT=$(date -d "$(uptime -s)" +%s)
+
+# A guard that RELEASES a node on a false positive is expensive -- it stops the job and
+# hands the machine away. So its staleness trigger is deliberately looser than patrol.sh's
+# alert threshold: opt rounds on this job have run 66 and 70 minutes, so 90 would fire
+# inside a healthy deep round.
+STALE_MIN=${GUARD_STALE_MIN:-180}
+PARKED_STREAK=0
 
 log(){ echo "[$(date -Is)] $*"; }
 
@@ -53,8 +77,8 @@ release(){
   rm -f "$TOKEN"
 
   local rounds best
-  rounds=$(grep -c '^- round:' "$OE/artifacts/$JOB/job_context/state.yaml" 2>/dev/null || echo '?')
-  best=$(grep -m1 'best_round' "$OE/artifacts/$JOB/job_context/state.yaml" 2>/dev/null | tr -d ' ')
+  rounds=$(grep -c '^- round:' "$STATE" 2>/dev/null || echo '?')
+  best=$(grep -m1 'best_round' "$STATE" 2>/dev/null | tr -d ' ')
 
   cat > "$NOTE" <<EOF
 # 节点已释放 -- $(date -Is)
@@ -99,15 +123,35 @@ EOF
   exit 0
 }
 
-# Capture the supervisor once, by job ref, using awk so the pattern is a variable rather
-# than a literal in this process's command line.
-SUP_PID=$(ps -eo pid,args | awk -v j="supervise_job.sh --job $JOB" 'index($0,j)>0 && $2 ~ /bash|sh$/ {print $1; exit}')
+# Capture the supervisor by job ref, using awk so the pattern is a variable rather than a
+# literal in this process's command line.
+find_sup(){ ps -eo pid,args | awk -v j="supervise_job.sh --job $JOB" 'index($0,j)>0 && $2 ~ /bash|sh$/ {print $1; exit}'; }
+
+# Bounded retry rather than a silent `exit 1`. Launched the way this repo launches
+# background work (>/dev/null 2>&1 &), an immediate refusal to arm is indistinguishable
+# from a healthy guard. A guard that declines to arm must leave a sentinel on disk, not a
+# line on a discarded stdout.
+SUP_PID=""
+for _try in $(seq 1 10); do
+  SUP_PID=$(find_sup)
+  [ -n "${SUP_PID:-}" ] && break
+  log "no supervisor for $JOB yet (try $_try/10); retrying in ${INTERVAL}s"
+  sleep "$INTERVAL"
+done
 if [ -z "${SUP_PID:-}" ]; then
-  log "no supervisor running for $JOB -- refusing to arm, since there is nothing to guard"
+  touch "$MARK.guard-unarmed"
+  log "GAVE UP ARMING: no supervisor for $JOB after 10 tries; wrote $MARK.guard-unarmed"
   exit 1
 fi
+rm -f "$MARK.guard-unarmed"
 
 log "release guard armed for $JOB (supervisor pid $SUP_PID; checks every ${INTERVAL}s; releases on first anomaly, never restarts)"
+
+# Liveness observable from disk. Without this, "is the guard running?" had no answer, which
+# is why its absence went unnoticed for fourteen hours.
+echo $$ > "$PIDFILE"
+trap 'rm -f "$PIDFILE"; exit 0' INT TERM
+trap 'rm -f "$PIDFILE"' EXIT
 
 while true; do
   # 1. The machine rebooted under us.
@@ -134,11 +178,43 @@ while true; do
   #    NOT `ps -eo args | grep -q "supervise_job.sh --job $JOB"`. The grep process's own
   #    command line contains that exact string, so depending on whether ps snapshots it
   #    the test can be permanently true -- a guard that never fires on the one condition
-  #    it was armed for. This box has already produced two self-match bugs today from the
-  #    same family. A PID captured once and checked with kill -0 cannot self-match, and
-  #    kill -0 is a single signal check that cannot block on the driver the way pgrep can.
+  #    it was armed for. A PID captured once and checked with kill -0 cannot self-match,
+  #    and kill -0 cannot block on the driver the way pgrep can.
   if ! kill -0 "$SUP_PID" 2>/dev/null; then
     release "supervisor 自己没了" "pid $SUP_PID (captured at arm time) is gone"
+  fi
+
+  # 5. The supervisor is ALIVE but parked forever in gpu_ok()'s 900 s backoff. This is the
+  #    state the 2026-09-21 16:01:54 wedge actually produced, and the reason checks 1-4 all
+  #    stayed false while the card was unusable for fourteen hours. patrol.sh's own header
+  #    calls this terminal state #3. Two consecutive observations, since one could be
+  #    transient, and only the last few lines, so a recovered old backoff cannot re-fire.
+  if tail -3 "$SUPLOG" 2>/dev/null \
+     | grep -qE 'GPU not visible to rocminfo|NOT restarting into a dead device|MAX_RESTARTS|giving up'; then
+    PARKED_STREAK=$((PARKED_STREAK+1))
+  else
+    PARKED_STREAK=0
+  fi
+  if [ "$PARKED_STREAK" -ge 2 ]; then
+    touch "$MARK.wedged"
+    release "supervisor 停在 gpu_ok() 无限 backoff（卡对 rocminfo 不可见）" "$(tail -4 "$SUPLOG" 2>/dev/null)"
+  fi
+
+  # 6. patrol.sh latched a wedge. Honour another watcher's verdict instead of re-deriving
+  #    it -- but only if the latch postdates this boot, since patrol clears it by boot time.
+  if [ -f "$MARK.wedged" ] && [ "$(stat -c %Y "$MARK.wedged" 2>/dev/null || echo 0)" -gt "$BOOT_AT" ]; then
+    release "patrol 已置位 wedge latch" "$MARK.wedged @ $(date -Is -d @"$(stat -c %Y "$MARK.wedged")")"
+  fi
+
+  # 7. A candidate hung: the loop is alive and looks healthy, state.yaml is frozen. This is
+  #    the failure mode this project produces most, and supervise_job.sh only supervises the
+  #    loop DYING, so nothing else catches it.
+  if [ -f "$STATE" ]; then
+    age_min=$(( ( $(date +%s) - $(stat -c %Y "$STATE") ) / 60 ))
+    if [ "$age_min" -ge "$STALE_MIN" ]; then
+      release "state.yaml 冻结 ${age_min} 分钟（>= ${STALE_MIN}），候选疑似挂起" \
+              "$STATE last modified $(date -Is -d @"$(stat -c %Y "$STATE")")"
+    fi
   fi
 
   sleep "$INTERVAL"

@@ -33,6 +33,29 @@ mkdir -p "$(dirname "$MARK")"
 rc=0
 alert(){ echo "[$(date -Is)] $*"; rc=1; }
 
+# --- the release guard's launcher -------------------------------------------------------
+# release_guard.sh was committed on 2026-09-21 with NO launcher anywhere: no cron, no
+# systemd unit, and no call from here. It therefore never ran, and because it wrote no pid
+# file, no log and no sentinel, nothing on disk could show that it had not. That is why the
+# node was never handed over when the card wedged at 16:01:54.
+#
+# Deliberately OPT-IN. Releasing the node is outward-facing and irreversible -- it stops the
+# job and drops the card token -- so it must not arm itself during ordinary daytime patrols.
+# Set PATROL_ARM_GUARD=1 in the handover invocation, and only there.
+GUARD_PID_FILE=${GUARD_PID_FILE:-/tmp/gfx1250-release-guard.pid}
+REPO=${REPO:-/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo}
+ensure_guard(){
+  [ "${PATROL_ARM_GUARD:-0}" = "1" ] || return 0
+  if [ -f "$GUARD_PID_FILE" ] && kill -0 "$(cat "$GUARD_PID_FILE" 2>/dev/null)" 2>/dev/null; then
+    return 0
+  fi
+  setsid nohup bash "$REPO/tools/gfx1250/release_guard.sh" "$JOB" 60 \
+    >> "$ART/release_guard.log" 2>&1 < /dev/null &
+  alert "release guard was not running; started it (log: $ART/release_guard.log)"
+}
+ensure_guard
+[ -f "$MARK.guard-unarmed" ] && alert "release guard REFUSED TO ARM (see $MARK.guard-unarmed); the node will NOT be handed over automatically"
+
 # --- the wedge latch --------------------------------------------------------------------
 # A wedge is a STATE, not an event, and this file used to report it as an event. The dmesg
 # check below is deliberately differential -- it baselines the count each pass and reacts
