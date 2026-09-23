@@ -4,6 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import os
 from typing import Tuple
 
 import torch
@@ -391,6 +392,109 @@ class GEMMFP4KernelDispatcher(AutoKernelDispatcher):
         )
 
 
+_GEMM_FP4_BACKEND_WARM: dict = {}
+
+
+def _flux_fp4_host_dispatch() -> bool:
+    """True when FLUX Linear asked for the eager gemm_fp4_impl host path."""
+    dispatch = os.getenv("FLUX_FP4_DISPATCH", "").strip().lower()
+    return dispatch == "host_dispatch" or os.getenv("FLUX_FP4_HOST_DISPATCH", "0") == "1"
+
+
+def _gemm_fp4_impl_eager(
+    a: torch.Tensor,
+    a_scale_inv: torch.Tensor,
+    trans_a: bool,
+    b: torch.Tensor,
+    b_scale_inv: torch.Tensor,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    trans_c: bool,
+    granularity: int,
+    default_backend: int,
+    preshuffled: bool = False,
+) -> torch.Tensor:
+    """Plain-Python gemm_fp4_impl: skip the torch.library custom-op dispatcher.
+
+    FLUX MXFP4Linear imports this name for ``FLUX_FP4_DISPATCH=mxfp4_mm``, and
+    the module-level ``gemm_fp4_impl`` is rebound to it for
+    ``FLUX_FP4_DISPATCH=host_dispatch``. Fusion-only Linear keeps the registered
+    custom op.
+    """
+    user_backend_choice = GlobalBackendManager.get_gemm_backend(PrecisionType.FP4)
+
+    _warm_key = None
+    if (
+        user_backend_choice is not None
+        and user_backend_choice.backend is not None
+        and not user_backend_choice.auto_tune
+    ):
+        _warm_key = (
+            a.shape[0],
+            a.shape[1],
+            a.ndim,
+            b.shape[0],
+            b.shape[1],
+            b.ndim,
+            a.dtype,
+            b.dtype,
+            out_dtype,
+            trans_a,
+            trans_b,
+            trans_c,
+            granularity,
+            preshuffled,
+            a_scale_inv.shape[0],
+            a_scale_inv.shape[1],
+            a_scale_inv.element_size(),
+            b_scale_inv.shape[0],
+            b_scale_inv.shape[1],
+            b_scale_inv.element_size(),
+            a.device.index,
+            user_backend_choice.backend,
+        )
+        _warm_entry = _GEMM_FP4_BACKEND_WARM.get(_warm_key)
+        if _warm_entry is not None:
+            _impl, _granularity_enum = _warm_entry
+            return _impl.execute(
+                a=a,
+                b=b,
+                a_scale_inv=a_scale_inv,
+                b_scale_inv=b_scale_inv,
+                out_dtype=out_dtype,
+                trans_a=trans_a,
+                trans_b=trans_b,
+                trans_c=trans_c,
+                granularity=_granularity_enum,
+                preshuffled=preshuffled,
+            )
+
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    granularity_enum = ScalingGranularity(granularity)
+
+    kwargs = dict(
+        a=a,
+        b=b,
+        a_scale_inv=a_scale_inv,
+        b_scale_inv=b_scale_inv,
+        out_dtype=out_dtype,
+        trans_a=trans_a,
+        trans_b=trans_b,
+        trans_c=trans_c,
+        granularity=granularity_enum,
+        preshuffled=preshuffled,
+    )
+
+    result = GEMMFP4KernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
+
+    if _warm_key is not None:
+        _entry = GEMMFP4KernelDispatcher._backends.get(user_backend_choice.backend)
+        if _entry is not None:
+            _GEMM_FP4_BACKEND_WARM[_warm_key] = (_entry.impl, granularity_enum)
+
+    return result
+
+
 @_torch_custom_op_wrapper("primus_turbo::gemm_fp4_impl", mutates_args=(), device_types="cuda")
 def gemm_fp4_impl(
     a: torch.Tensor,
@@ -443,6 +547,52 @@ def gemm_fp4_impl_meta(
     if trans_c:
         m, n = n, m
     return torch.empty(m, n, dtype=out_dtype, device=a.device)
+
+
+_gemm_fp4_impl_custom_op = gemm_fp4_impl
+
+if _flux_fp4_host_dispatch():
+
+    def gemm_fp4_impl(
+        a: torch.Tensor,
+        a_scale_inv: torch.Tensor,
+        trans_a: bool,
+        b: torch.Tensor,
+        b_scale_inv: torch.Tensor,
+        trans_b: bool,
+        out_dtype: torch.dtype,
+        trans_c: bool,
+        granularity: int,
+        default_backend: int,
+        preshuffled: bool = False,
+    ) -> torch.Tensor:
+        if torch.compiler.is_compiling():
+            return _gemm_fp4_impl_custom_op(
+                a,
+                a_scale_inv,
+                trans_a,
+                b,
+                b_scale_inv,
+                trans_b,
+                out_dtype,
+                trans_c,
+                granularity,
+                default_backend,
+                preshuffled,
+            )
+        return _gemm_fp4_impl_eager(
+            a,
+            a_scale_inv,
+            trans_a,
+            b,
+            b_scale_inv,
+            trans_b,
+            out_dtype,
+            trans_c,
+            granularity,
+            default_backend,
+            preshuffled,
+        )
 
 
 @_torch_custom_op_wrapper("primus_turbo::gemm_fp4_accum_impl", mutates_args={"out"}, device_types="cuda")
