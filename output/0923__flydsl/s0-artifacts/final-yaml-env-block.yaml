@@ -1,0 +1,28 @@
+  env:
+    TORCH_BLAS_PREFER_HIPBLASLT: '1'      # [stage2 S0-b, 2026-09-23] was '0'. The v000
+                                          # diagnosis ("the image has no gfx1250 Tensile
+                                          # library") was wrong. THREE library dirs exist
+                                          # in this container and only one is complete:
+                                          #  * /opt/rocm/lib/hipblaslt/library -- empty,
+                                          #    and a decoy: ROCm is not at /opt/rocm here.
+                                          #  * _rocm_sdk_libraries_gfx1250/lib/hipblaslt/
+                                          #    library -- hipBLASLt's DEFAULT search path,
+                                          #    and it lacks the gfx1250 payload. This, not
+                                          #    a missing library, is what made
+                                          #    HIPBLASLT_TENSILE_LIBPATH unset raise
+                                          #    HIPBLAS_STATUS_INVALID_VALUE.
+                                          #  * _rocm_sdk_devel/lib/hipblaslt/library/
+                                          #    gfx1250 -- 326 files but INCOMPLETE (no
+                                          #    Kernels.so-000, no extop, .dat unzipped).
+                                          #    Pointing LIBPATH here SIGSEGVs (exit 139).
+                                          # The complete set is the host's 328-file ROCm
+                                          # 10.1.0 library, copied under $HOME (the only
+                                          # bind mount) and named below. Measured clean on
+                                          # 2026-09-23: bf16 and fp32 GEMM at 512/2048/
+                                          # 4096, and the fp32 QK^T [2,16,4096,128] shape
+                                          # that the precision gate used to fault on.
+                                          # Zero rocblaslt errors, zero dmesg faults.
+                                          # NOT re-run under the old '0' config: that
+                                          # would be deliberately reproducing a wedge.
+    HIPBLASLT_TENSILE_LIBPATH: /home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250
+  observed:
