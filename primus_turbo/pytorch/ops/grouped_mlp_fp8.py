@@ -154,8 +154,8 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
         # Each weight carries its own accumulation buffer, so the two wgrads
         # cannot share one: resolve them separately while the parameter objects
         # are still in hand.
-        fuse_w1_accum, w1_main_grad = _setup_fused_grad_accum(w1, fuse_wgrad_accum_pattern)
-        fuse_w2_accum, w2_main_grad = _setup_fused_grad_accum(w2, fuse_wgrad_accum_pattern)
+        fuse_w1_accum, w1_main_grad, _ = _setup_fused_grad_accum(w1, fuse_wgrad_accum_pattern)
+        fuse_w2_accum, w2_main_grad, _ = _setup_fused_grad_accum(w2, fuse_wgrad_accum_pattern)
 
         assert config.granularity == ScalingGranularity.TENSORWISE
 
@@ -527,8 +527,8 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
             )
 
         # Each weight has its own accumulation buffer, so these cannot be shared.
-        fuse_w1_accum, w1_main_grad = _setup_fused_grad_accum(w1, fuse_wgrad_accum_pattern)
-        fuse_w2_accum, w2_main_grad = _setup_fused_grad_accum(w2, fuse_wgrad_accum_pattern)
+        fuse_w1_accum, w1_main_grad, _ = _setup_fused_grad_accum(w1, fuse_wgrad_accum_pattern)
+        fuse_w2_accum, w2_main_grad, _ = _setup_fused_grad_accum(w2, fuse_wgrad_accum_pattern)
 
         M = int(probs.shape[0])
         x_dtype = _get_fp8_dtype(config.format, True)
