@@ -1,0 +1,27 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+
+rocblaslt error: Cannot read "/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/TensileLibrary_lazy_gfx1250.dat" (or .zlib variant): No such file or directory
+
+rocblaslt error: Could not load "/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/TensileLibrary_lazy_gfx1250.dat"
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250.hsaco
+ error: file not found
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250-xnack-.hsaco
+ error: file not found
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250-xnack+.hsaco
+ error: file not found
+validation.py  impl=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/008/_scratch/armAB
+  gate 50.0 dB vs op/eager/ | bitwise x200 | geomean speedup vs beat >= 1.00 | shapes ['fast', 'proxy', 'prod']
+
+  correctness fast     dq  52.61 dB  dk  52.65 dB  dv  52.83 dB
+Queue error: HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION: The agent attempted to access memory beyond the largest legal address.
+Failed to create GPU coredump: File exists
+GPU core dump failed
+VGPU=0x13e9d4f0 SWq=0x7b2cdace6000, HWq=0x7b1c93000000, id=1
+	Ext Dispatch Header =0xb00 (type=0, barrier=1, acquire=1, release=1), amd_format=3, setup=3
+	cluster_count=[1, 16, 1], cluster_size=[1, 1, 1], workgroup=[256, 1, 1]
+	private_seg_size=0, group_seg_size=6144
+	kernel_obj=0x7b1ca18e1c40, kernarg_address=0x0x7b1c84800000
+	dep_signal=0x0, completion_signal=0x0
+	rptr=5174, wptr=5176
+:0:rocdevice.cpp            :4213: 0501137245 us:  Callback: Queue 0x7b1c93000000 aborting with error : HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION: The agent attempted to access memory beyond the largest legal address. code: 0x29 [host: heliosr-1b114-c07-1, GPU index: 0, kernel: Cijk_Ailk_Bljk_SB_MT128x64x8_SN_AMAS0_BL0_BS1_GLVWA1_GLVWB1_GRVW1_GSU1_GSUASB_K1_LRVW1_NLCA1_NLCB1_PGR0_PLR0_SIA1_SU32_SUS256_SVW4_TT8_4_USFGRO0_VAW1_VS1_VW1_VWB1_WG16_16_1_WGM8]

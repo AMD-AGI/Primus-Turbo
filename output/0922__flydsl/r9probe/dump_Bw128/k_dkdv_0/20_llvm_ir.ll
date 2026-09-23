@@ -1,0 +1,4062 @@
+; ModuleID = 'LLVMDialectModule'
+source_filename = "LLVMDialectModule"
+target datalayout = "e-p:64:64-p1:64:64-p2:32:32-p3:32:32-p4:64:64-p5:32:32-p6:32:32-p7:160:256:256:32-p8:128:128:128:48-p9:192:256:256:32-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:256-v256:256-v512:512-v1024:1024-v2048:2048-n32:64-S32-A5-G1-ni:7:8:9"
+
+@__shared_alloc_0 = external dso_local addrspace(3) global [22528 x i8], align 16
+
+define amdgpu_kernel void @k_dkdv_0(ptr addrspace(1) %0, <{ <{ i32, i32, i32, i32 }>, <{ i64, i64, i64 }> }> %1, ptr addrspace(1) %2, <{ <{ i32, i32, i32, i32 }>, <{ i64, i64, i64 }> }> %3, ptr addrspace(1) %4, <{ <{ i32, i32, i32, i32 }>, <{ i64, i64, i64 }> }> %5, ptr addrspace(1) %6, <{ <{ i32, i32, i32, i32 }>, <{ i64, i64, i64 }> }> %7, ptr addrspace(1) %8, <{ <{ i32, i32, i32 }>, <{ i64, i64 }> }> %9, ptr addrspace(1) %10, <{ <{ i32, i32, i32 }>, <{ i64, i64 }> }> %11, ptr addrspace(1) %12, <{ <{ i32, i32, i32, i32 }>, <{ i64, i64, i64 }> }> %13, ptr addrspace(1) %14, <{ <{ i32, i32, i32, i32 }>, <{ i64, i64, i64 }> }> %15, float %16, i32 %17, i32 %18, i32 %19, i32 %20, i32 %21, i32 %22, i32 %23, i32 %24, i32 %25) #0 !reqd_work_group_size !1 {
+  %27 = call range(i32 0, 128) i32 @llvm.amdgcn.workitem.id.x()
+  %28 = sext i32 %27 to i64
+  %29 = trunc i64 %28 to i32
+  %30 = call i32 @llvm.amdgcn.workgroup.id.x()
+  %31 = sext i32 %30 to i64
+  %32 = trunc i64 %31 to i32
+  %33 = call i32 @llvm.amdgcn.workgroup.id.y()
+  %34 = sext i32 %33 to i64
+  %35 = trunc i64 %34 to i32
+  %36 = call i32 @llvm.amdgcn.workgroup.id.z()
+  %37 = sext i32 %36 to i64
+  %38 = trunc i64 %37 to i32
+  %39 = srem i32 %29, 16
+  %40 = sdiv i32 %29, 16
+  %41 = mul i32 %40, 16
+  %42 = icmp ne i32 %29, %41
+  %43 = icmp slt i32 %29, 0
+  %44 = icmp ne i1 %43, false
+  %45 = and i1 %42, %44
+  %46 = add i32 %40, -1
+  %47 = select i1 %45, i32 %46, i32 %40
+  %48 = mul i32 %35, 32
+  %49 = mul i32 %25, %17
+  %50 = mul i32 %49, %19
+  %51 = mul i32 %50, 256
+  %52 = mul i32 %25, %18
+  %53 = mul i32 %52, %20
+  %54 = mul i32 %53, 256
+  %55 = mul i32 %25, %19
+  %56 = mul i32 %55, %17
+  %57 = mul i32 %56, 4
+  %58 = sext i32 %51 to i64
+  %59 = call ptr addrspace(8) @llvm.amdgcn.make.buffer.rsrc.p8.p1(ptr addrspace(1) %0, i16 0, i64 %58, i32 159744)
+  %60 = sext i32 %54 to i64
+  %61 = call ptr addrspace(8) @llvm.amdgcn.make.buffer.rsrc.p8.p1(ptr addrspace(1) %2, i16 0, i64 %60, i32 159744)
+  %62 = call ptr addrspace(8) @llvm.amdgcn.make.buffer.rsrc.p8.p1(ptr addrspace(1) %4, i16 0, i64 %60, i32 159744)
+  %63 = call ptr addrspace(8) @llvm.amdgcn.make.buffer.rsrc.p8.p1(ptr addrspace(1) %6, i16 0, i64 %58, i32 159744)
+  %64 = sext i32 %57 to i64
+  %65 = call ptr addrspace(8) @llvm.amdgcn.make.buffer.rsrc.p8.p1(ptr addrspace(1) %8, i16 0, i64 %64, i32 159744)
+  %66 = call ptr addrspace(8) @llvm.amdgcn.make.buffer.rsrc.p8.p1(ptr addrspace(1) %10, i16 0, i64 %64, i32 159744)
+  %67 = call ptr addrspace(8) @llvm.amdgcn.make.buffer.rsrc.p8.p1(ptr addrspace(1) %12, i16 0, i64 %60, i32 159744)
+  %68 = call ptr addrspace(8) @llvm.amdgcn.make.buffer.rsrc.p8.p1(ptr addrspace(1) %14, i16 0, i64 %60, i32 159744)
+  %69 = mul i32 %19, 16
+  %70 = mul i32 %20, 16
+  %71 = mul i32 %38, %18
+  %72 = mul i32 %71, %70
+  %73 = mul i32 %32, 16
+  %74 = add i32 %72, %73
+  %75 = add i32 %48, %39
+  %76 = mul i32 %75, %70
+  %77 = add i32 %74, %76
+  %78 = add i32 %77, %47
+  %79 = mul i32 %78, 16
+  %80 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %61, i32 %79, i32 0, i32 0)
+  %81 = bitcast i128 %80 to <8 x bfloat>
+  %82 = add i32 %78, 2
+  %83 = mul i32 %82, 16
+  %84 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %61, i32 %83, i32 0, i32 0)
+  %85 = bitcast i128 %84 to <8 x bfloat>
+  %86 = shufflevector <8 x bfloat> %81, <8 x bfloat> %85, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %87 = add i32 %78, 4
+  %88 = mul i32 %87, 16
+  %89 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %61, i32 %88, i32 0, i32 0)
+  %90 = bitcast i128 %89 to <8 x bfloat>
+  %91 = add i32 %78, 6
+  %92 = mul i32 %91, 16
+  %93 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %61, i32 %92, i32 0, i32 0)
+  %94 = bitcast i128 %93 to <8 x bfloat>
+  %95 = shufflevector <8 x bfloat> %90, <8 x bfloat> %94, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %96 = add i32 %78, 8
+  %97 = mul i32 %96, 16
+  %98 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %61, i32 %97, i32 0, i32 0)
+  %99 = bitcast i128 %98 to <8 x bfloat>
+  %100 = add i32 %78, 10
+  %101 = mul i32 %100, 16
+  %102 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %61, i32 %101, i32 0, i32 0)
+  %103 = bitcast i128 %102 to <8 x bfloat>
+  %104 = shufflevector <8 x bfloat> %99, <8 x bfloat> %103, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %105 = add i32 %78, 12
+  %106 = mul i32 %105, 16
+  %107 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %61, i32 %106, i32 0, i32 0)
+  %108 = bitcast i128 %107 to <8 x bfloat>
+  %109 = add i32 %78, 14
+  %110 = mul i32 %109, 16
+  %111 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %61, i32 %110, i32 0, i32 0)
+  %112 = bitcast i128 %111 to <8 x bfloat>
+  %113 = shufflevector <8 x bfloat> %108, <8 x bfloat> %112, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %114 = add i32 %48, 16
+  %115 = add i32 %114, %39
+  %116 = mul i32 %115, %70
+  %117 = add i32 %74, %116
+  %118 = add i32 %117, %47
+  %119 = mul i32 %118, 16
+  %120 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %61, i32 %119, i32 0, i32 0)
+  %121 = bitcast i128 %120 to <8 x bfloat>
+  %122 = add i32 %118, 2
+  %123 = mul i32 %122, 16
+  %124 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %61, i32 %123, i32 0, i32 0)
+  %125 = bitcast i128 %124 to <8 x bfloat>
+  %126 = shufflevector <8 x bfloat> %121, <8 x bfloat> %125, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %127 = add i32 %118, 4
+  %128 = mul i32 %127, 16
+  %129 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %61, i32 %128, i32 0, i32 0)
+  %130 = bitcast i128 %129 to <8 x bfloat>
+  %131 = add i32 %118, 6
+  %132 = mul i32 %131, 16
+  %133 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %61, i32 %132, i32 0, i32 0)
+  %134 = bitcast i128 %133 to <8 x bfloat>
+  %135 = shufflevector <8 x bfloat> %130, <8 x bfloat> %134, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %136 = add i32 %118, 8
+  %137 = mul i32 %136, 16
+  %138 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %61, i32 %137, i32 0, i32 0)
+  %139 = bitcast i128 %138 to <8 x bfloat>
+  %140 = add i32 %118, 10
+  %141 = mul i32 %140, 16
+  %142 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %61, i32 %141, i32 0, i32 0)
+  %143 = bitcast i128 %142 to <8 x bfloat>
+  %144 = shufflevector <8 x bfloat> %139, <8 x bfloat> %143, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %145 = add i32 %118, 12
+  %146 = mul i32 %145, 16
+  %147 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %61, i32 %146, i32 0, i32 0)
+  %148 = bitcast i128 %147 to <8 x bfloat>
+  %149 = add i32 %118, 14
+  %150 = mul i32 %149, 16
+  %151 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %61, i32 %150, i32 0, i32 0)
+  %152 = bitcast i128 %151 to <8 x bfloat>
+  %153 = shufflevector <8 x bfloat> %148, <8 x bfloat> %152, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %154 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %62, i32 %79, i32 0, i32 0)
+  %155 = bitcast i128 %154 to <8 x bfloat>
+  %156 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %62, i32 %83, i32 0, i32 0)
+  %157 = bitcast i128 %156 to <8 x bfloat>
+  %158 = shufflevector <8 x bfloat> %155, <8 x bfloat> %157, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %159 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %62, i32 %88, i32 0, i32 0)
+  %160 = bitcast i128 %159 to <8 x bfloat>
+  %161 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %62, i32 %92, i32 0, i32 0)
+  %162 = bitcast i128 %161 to <8 x bfloat>
+  %163 = shufflevector <8 x bfloat> %160, <8 x bfloat> %162, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %164 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %62, i32 %97, i32 0, i32 0)
+  %165 = bitcast i128 %164 to <8 x bfloat>
+  %166 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %62, i32 %101, i32 0, i32 0)
+  %167 = bitcast i128 %166 to <8 x bfloat>
+  %168 = shufflevector <8 x bfloat> %165, <8 x bfloat> %167, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %169 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %62, i32 %106, i32 0, i32 0)
+  %170 = bitcast i128 %169 to <8 x bfloat>
+  %171 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %62, i32 %110, i32 0, i32 0)
+  %172 = bitcast i128 %171 to <8 x bfloat>
+  %173 = shufflevector <8 x bfloat> %170, <8 x bfloat> %172, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %174 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %62, i32 %119, i32 0, i32 0)
+  %175 = bitcast i128 %174 to <8 x bfloat>
+  %176 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %62, i32 %123, i32 0, i32 0)
+  %177 = bitcast i128 %176 to <8 x bfloat>
+  %178 = shufflevector <8 x bfloat> %175, <8 x bfloat> %177, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %179 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %62, i32 %128, i32 0, i32 0)
+  %180 = bitcast i128 %179 to <8 x bfloat>
+  %181 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %62, i32 %132, i32 0, i32 0)
+  %182 = bitcast i128 %181 to <8 x bfloat>
+  %183 = shufflevector <8 x bfloat> %180, <8 x bfloat> %182, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %184 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %62, i32 %137, i32 0, i32 0)
+  %185 = bitcast i128 %184 to <8 x bfloat>
+  %186 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %62, i32 %141, i32 0, i32 0)
+  %187 = bitcast i128 %186 to <8 x bfloat>
+  %188 = shufflevector <8 x bfloat> %185, <8 x bfloat> %187, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %189 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %62, i32 %146, i32 0, i32 0)
+  %190 = bitcast i128 %189 to <8 x bfloat>
+  %191 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %62, i32 %150, i32 0, i32 0)
+  %192 = bitcast i128 %191 to <8 x bfloat>
+  %193 = shufflevector <8 x bfloat> %190, <8 x bfloat> %192, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %194 = mul i32 %47, 8
+  %195 = srem i32 %29, 8
+  %196 = add i32 %194, %195
+  %197 = sdiv i32 %29, 8
+  %198 = mul i32 %197, 8
+  %199 = icmp ne i32 %29, %198
+  %200 = icmp slt i32 %29, 0
+  %201 = icmp ne i1 %200, false
+  %202 = and i1 %199, %201
+  %203 = add i32 %197, -1
+  %204 = select i1 %202, i32 %203, i32 %197
+  %205 = srem i32 %204, 2
+  %206 = mul i32 %205, 8
+  %207 = sdiv i32 %22, 2
+  %208 = mul i32 %207, 2
+  %209 = icmp ne i32 %22, %208
+  %210 = icmp slt i32 %22, 0
+  %211 = icmp ne i1 %210, false
+  %212 = and i1 %209, %211
+  %213 = add i32 %207, -1
+  %214 = select i1 %212, i32 %213, i32 %207
+  %215 = sub i32 %48, %23
+  %216 = call i32 @llvm.smax.i32(i32 %215, i32 0)
+  %217 = sdiv i32 %216, 32
+  %218 = mul i32 %217, 32
+  %219 = icmp ne i32 %216, %218
+  %220 = icmp slt i32 %216, 0
+  %221 = icmp ne i1 %220, false
+  %222 = and i1 %219, %221
+  %223 = add i32 %217, -1
+  %224 = select i1 %222, i32 %223, i32 %217
+  %225 = icmp ne i32 %24, 0
+  %226 = select i1 %225, i32 %224, i32 0
+  %227 = sub i32 %214, %226
+  %228 = add i32 %48, 31
+  %229 = sub i32 %228, %23
+  %230 = icmp slt i32 %229, 0
+  %231 = add i32 %229, 31
+  %232 = sdiv i32 %231, 32
+  %233 = mul i32 %232, 32
+  %234 = icmp ne i32 %231, %233
+  %235 = icmp slt i32 %231, 0
+  %236 = icmp ne i1 %235, false
+  %237 = and i1 %234, %236
+  %238 = add i32 %232, -1
+  %239 = select i1 %237, i32 %238, i32 %232
+  %240 = select i1 %230, i32 0, i32 %239
+  %241 = call i32 @llvm.smin.i32(i32 %240, i32 %214)
+  %242 = sub i32 %241, %226
+  %243 = call i32 @llvm.smax.i32(i32 %242, i32 0)
+  %244 = call i32 @llvm.smin.i32(i32 %243, i32 %227)
+  %245 = select i1 %225, i32 %244, i32 0
+  %246 = mul i32 %32, %21
+  %247 = mul i32 %38, %17
+  %248 = mul i32 %247, %69
+  %249 = mul i32 %246, 16
+  %250 = add i32 %248, %249
+  %251 = mul i32 %226, 32
+  %252 = add i32 %251, %39
+  %253 = mul i32 %252, %69
+  %254 = add i32 %250, %253
+  %255 = add i32 %254, %47
+  %256 = mul i32 %255, 16
+  %257 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %256, i32 0, i32 0)
+  %258 = bitcast i128 %257 to <8 x bfloat>
+  %259 = add i32 %255, 2
+  %260 = mul i32 %259, 16
+  %261 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %260, i32 0, i32 0)
+  %262 = bitcast i128 %261 to <8 x bfloat>
+  %263 = add i32 %255, 4
+  %264 = mul i32 %263, 16
+  %265 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %264, i32 0, i32 0)
+  %266 = bitcast i128 %265 to <8 x bfloat>
+  %267 = add i32 %255, 6
+  %268 = mul i32 %267, 16
+  %269 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %268, i32 0, i32 0)
+  %270 = bitcast i128 %269 to <8 x bfloat>
+  %271 = add i32 %255, 8
+  %272 = mul i32 %271, 16
+  %273 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %272, i32 0, i32 0)
+  %274 = bitcast i128 %273 to <8 x bfloat>
+  %275 = add i32 %255, 10
+  %276 = mul i32 %275, 16
+  %277 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %276, i32 0, i32 0)
+  %278 = bitcast i128 %277 to <8 x bfloat>
+  %279 = add i32 %255, 12
+  %280 = mul i32 %279, 16
+  %281 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %280, i32 0, i32 0)
+  %282 = bitcast i128 %281 to <8 x bfloat>
+  %283 = add i32 %255, 14
+  %284 = mul i32 %283, 16
+  %285 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %284, i32 0, i32 0)
+  %286 = bitcast i128 %285 to <8 x bfloat>
+  %287 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %256, i32 0, i32 0)
+  %288 = bitcast i128 %287 to <8 x bfloat>
+  %289 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %260, i32 0, i32 0)
+  %290 = bitcast i128 %289 to <8 x bfloat>
+  %291 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %264, i32 0, i32 0)
+  %292 = bitcast i128 %291 to <8 x bfloat>
+  %293 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %268, i32 0, i32 0)
+  %294 = bitcast i128 %293 to <8 x bfloat>
+  %295 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %272, i32 0, i32 0)
+  %296 = bitcast i128 %295 to <8 x bfloat>
+  %297 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %276, i32 0, i32 0)
+  %298 = bitcast i128 %297 to <8 x bfloat>
+  %299 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %280, i32 0, i32 0)
+  %300 = bitcast i128 %299 to <8 x bfloat>
+  %301 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %284, i32 0, i32 0)
+  %302 = bitcast i128 %301 to <8 x bfloat>
+  %303 = add i32 %251, 16
+  %304 = add i32 %303, %39
+  %305 = mul i32 %304, %69
+  %306 = add i32 %250, %305
+  %307 = add i32 %306, %47
+  %308 = mul i32 %307, 16
+  %309 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %308, i32 0, i32 0)
+  %310 = bitcast i128 %309 to <8 x bfloat>
+  %311 = add i32 %307, 2
+  %312 = mul i32 %311, 16
+  %313 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %312, i32 0, i32 0)
+  %314 = bitcast i128 %313 to <8 x bfloat>
+  %315 = add i32 %307, 4
+  %316 = mul i32 %315, 16
+  %317 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %316, i32 0, i32 0)
+  %318 = bitcast i128 %317 to <8 x bfloat>
+  %319 = add i32 %307, 6
+  %320 = mul i32 %319, 16
+  %321 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %320, i32 0, i32 0)
+  %322 = bitcast i128 %321 to <8 x bfloat>
+  %323 = add i32 %307, 8
+  %324 = mul i32 %323, 16
+  %325 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %324, i32 0, i32 0)
+  %326 = bitcast i128 %325 to <8 x bfloat>
+  %327 = add i32 %307, 10
+  %328 = mul i32 %327, 16
+  %329 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %328, i32 0, i32 0)
+  %330 = bitcast i128 %329 to <8 x bfloat>
+  %331 = add i32 %307, 12
+  %332 = mul i32 %331, 16
+  %333 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %332, i32 0, i32 0)
+  %334 = bitcast i128 %333 to <8 x bfloat>
+  %335 = add i32 %307, 14
+  %336 = mul i32 %335, 16
+  %337 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %336, i32 0, i32 0)
+  %338 = bitcast i128 %337 to <8 x bfloat>
+  %339 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %308, i32 0, i32 0)
+  %340 = bitcast i128 %339 to <8 x bfloat>
+  %341 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %312, i32 0, i32 0)
+  %342 = bitcast i128 %341 to <8 x bfloat>
+  %343 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %316, i32 0, i32 0)
+  %344 = bitcast i128 %343 to <8 x bfloat>
+  %345 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %320, i32 0, i32 0)
+  %346 = bitcast i128 %345 to <8 x bfloat>
+  %347 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %324, i32 0, i32 0)
+  %348 = bitcast i128 %347 to <8 x bfloat>
+  %349 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %328, i32 0, i32 0)
+  %350 = bitcast i128 %349 to <8 x bfloat>
+  %351 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %332, i32 0, i32 0)
+  %352 = bitcast i128 %351 to <8 x bfloat>
+  %353 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %336, i32 0, i32 0)
+  %354 = bitcast i128 %353 to <8 x bfloat>
+  %355 = mul i32 %21, %245
+  %356 = sext i32 %355 to i64
+  br label %357
+
+357:                                              ; preds = %424, %26
+  %358 = phi i64 [ %1458, %424 ], [ 0, %26 ]
+  %359 = phi <8 x float> [ %1411, %424 ], [ zeroinitializer, %26 ]
+  %360 = phi <8 x float> [ %1413, %424 ], [ zeroinitializer, %26 ]
+  %361 = phi <8 x float> [ %1415, %424 ], [ zeroinitializer, %26 ]
+  %362 = phi <8 x float> [ %1417, %424 ], [ zeroinitializer, %26 ]
+  %363 = phi <8 x float> [ %1419, %424 ], [ zeroinitializer, %26 ]
+  %364 = phi <8 x float> [ %1421, %424 ], [ zeroinitializer, %26 ]
+  %365 = phi <8 x float> [ %1423, %424 ], [ zeroinitializer, %26 ]
+  %366 = phi <8 x float> [ %1425, %424 ], [ zeroinitializer, %26 ]
+  %367 = phi <8 x float> [ %1442, %424 ], [ zeroinitializer, %26 ]
+  %368 = phi <8 x float> [ %1444, %424 ], [ zeroinitializer, %26 ]
+  %369 = phi <8 x float> [ %1446, %424 ], [ zeroinitializer, %26 ]
+  %370 = phi <8 x float> [ %1448, %424 ], [ zeroinitializer, %26 ]
+  %371 = phi <8 x float> [ %1450, %424 ], [ zeroinitializer, %26 ]
+  %372 = phi <8 x float> [ %1452, %424 ], [ zeroinitializer, %26 ]
+  %373 = phi <8 x float> [ %1454, %424 ], [ zeroinitializer, %26 ]
+  %374 = phi <8 x float> [ %1456, %424 ], [ zeroinitializer, %26 ]
+  %375 = phi <8 x float> [ %1412, %424 ], [ zeroinitializer, %26 ]
+  %376 = phi <8 x float> [ %1414, %424 ], [ zeroinitializer, %26 ]
+  %377 = phi <8 x float> [ %1416, %424 ], [ zeroinitializer, %26 ]
+  %378 = phi <8 x float> [ %1418, %424 ], [ zeroinitializer, %26 ]
+  %379 = phi <8 x float> [ %1420, %424 ], [ zeroinitializer, %26 ]
+  %380 = phi <8 x float> [ %1422, %424 ], [ zeroinitializer, %26 ]
+  %381 = phi <8 x float> [ %1424, %424 ], [ zeroinitializer, %26 ]
+  %382 = phi <8 x float> [ %1426, %424 ], [ zeroinitializer, %26 ]
+  %383 = phi <8 x float> [ %1443, %424 ], [ zeroinitializer, %26 ]
+  %384 = phi <8 x float> [ %1445, %424 ], [ zeroinitializer, %26 ]
+  %385 = phi <8 x float> [ %1447, %424 ], [ zeroinitializer, %26 ]
+  %386 = phi <8 x float> [ %1449, %424 ], [ zeroinitializer, %26 ]
+  %387 = phi <8 x float> [ %1451, %424 ], [ zeroinitializer, %26 ]
+  %388 = phi <8 x float> [ %1453, %424 ], [ zeroinitializer, %26 ]
+  %389 = phi <8 x float> [ %1455, %424 ], [ zeroinitializer, %26 ]
+  %390 = phi <8 x float> [ %1457, %424 ], [ zeroinitializer, %26 ]
+  %391 = phi <8 x bfloat> [ %466, %424 ], [ %258, %26 ]
+  %392 = phi <8 x bfloat> [ %470, %424 ], [ %262, %26 ]
+  %393 = phi <8 x bfloat> [ %474, %424 ], [ %266, %26 ]
+  %394 = phi <8 x bfloat> [ %478, %424 ], [ %270, %26 ]
+  %395 = phi <8 x bfloat> [ %482, %424 ], [ %274, %26 ]
+  %396 = phi <8 x bfloat> [ %486, %424 ], [ %278, %26 ]
+  %397 = phi <8 x bfloat> [ %490, %424 ], [ %282, %26 ]
+  %398 = phi <8 x bfloat> [ %494, %424 ], [ %286, %26 ]
+  %399 = phi <8 x bfloat> [ %496, %424 ], [ %288, %26 ]
+  %400 = phi <8 x bfloat> [ %498, %424 ], [ %290, %26 ]
+  %401 = phi <8 x bfloat> [ %500, %424 ], [ %292, %26 ]
+  %402 = phi <8 x bfloat> [ %502, %424 ], [ %294, %26 ]
+  %403 = phi <8 x bfloat> [ %504, %424 ], [ %296, %26 ]
+  %404 = phi <8 x bfloat> [ %506, %424 ], [ %298, %26 ]
+  %405 = phi <8 x bfloat> [ %508, %424 ], [ %300, %26 ]
+  %406 = phi <8 x bfloat> [ %510, %424 ], [ %302, %26 ]
+  %407 = phi <8 x bfloat> [ %518, %424 ], [ %310, %26 ]
+  %408 = phi <8 x bfloat> [ %522, %424 ], [ %314, %26 ]
+  %409 = phi <8 x bfloat> [ %526, %424 ], [ %318, %26 ]
+  %410 = phi <8 x bfloat> [ %530, %424 ], [ %322, %26 ]
+  %411 = phi <8 x bfloat> [ %534, %424 ], [ %326, %26 ]
+  %412 = phi <8 x bfloat> [ %538, %424 ], [ %330, %26 ]
+  %413 = phi <8 x bfloat> [ %542, %424 ], [ %334, %26 ]
+  %414 = phi <8 x bfloat> [ %546, %424 ], [ %338, %26 ]
+  %415 = phi <8 x bfloat> [ %548, %424 ], [ %340, %26 ]
+  %416 = phi <8 x bfloat> [ %550, %424 ], [ %342, %26 ]
+  %417 = phi <8 x bfloat> [ %552, %424 ], [ %344, %26 ]
+  %418 = phi <8 x bfloat> [ %554, %424 ], [ %346, %26 ]
+  %419 = phi <8 x bfloat> [ %556, %424 ], [ %348, %26 ]
+  %420 = phi <8 x bfloat> [ %558, %424 ], [ %350, %26 ]
+  %421 = phi <8 x bfloat> [ %560, %424 ], [ %352, %26 ]
+  %422 = phi <8 x bfloat> [ %562, %424 ], [ %354, %26 ]
+  %423 = icmp slt i64 %358, %356
+  br i1 %423, label %424, label %1459
+
+424:                                              ; preds = %357
+  %425 = trunc i64 %358 to i32
+  %426 = sdiv i32 %425, %21
+  %427 = mul i32 %426, %21
+  %428 = icmp ne i32 %425, %427
+  %429 = icmp slt i32 %425, 0
+  %430 = icmp slt i32 %21, 0
+  %431 = icmp ne i1 %429, %430
+  %432 = and i1 %428, %431
+  %433 = add i32 %426, -1
+  %434 = select i1 %432, i32 %433, i32 %426
+  %435 = add i32 %425, 1
+  %436 = sdiv i32 %435, %21
+  %437 = mul i32 %436, %21
+  %438 = icmp ne i32 %435, %437
+  %439 = icmp slt i32 %435, 0
+  %440 = icmp slt i32 %21, 0
+  %441 = icmp ne i1 %439, %440
+  %442 = and i1 %438, %441
+  %443 = add i32 %436, -1
+  %444 = select i1 %442, i32 %443, i32 %436
+  %445 = add i32 %226, %434
+  %446 = mul i32 %434, %21
+  %447 = sub i32 %425, %446
+  %448 = add i32 %226, %444
+  %449 = mul i32 %444, %21
+  %450 = sub i32 %435, %449
+  %451 = add i32 %246, %447
+  %452 = mul i32 %38, %19
+  %453 = add i32 %452, %451
+  %454 = mul i32 %453, %17
+  %455 = mul i32 %445, 32
+  %456 = add i32 %246, %450
+  %457 = mul i32 %456, 16
+  %458 = add i32 %248, %457
+  %459 = mul i32 %448, 32
+  %460 = add i32 %459, %39
+  %461 = mul i32 %460, %69
+  %462 = add i32 %458, %461
+  %463 = add i32 %462, %47
+  %464 = mul i32 %463, 16
+  %465 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %464, i32 0, i32 0)
+  %466 = bitcast i128 %465 to <8 x bfloat>
+  %467 = add i32 %463, 2
+  %468 = mul i32 %467, 16
+  %469 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %468, i32 0, i32 0)
+  %470 = bitcast i128 %469 to <8 x bfloat>
+  %471 = add i32 %463, 4
+  %472 = mul i32 %471, 16
+  %473 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %472, i32 0, i32 0)
+  %474 = bitcast i128 %473 to <8 x bfloat>
+  %475 = add i32 %463, 6
+  %476 = mul i32 %475, 16
+  %477 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %476, i32 0, i32 0)
+  %478 = bitcast i128 %477 to <8 x bfloat>
+  %479 = add i32 %463, 8
+  %480 = mul i32 %479, 16
+  %481 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %480, i32 0, i32 0)
+  %482 = bitcast i128 %481 to <8 x bfloat>
+  %483 = add i32 %463, 10
+  %484 = mul i32 %483, 16
+  %485 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %484, i32 0, i32 0)
+  %486 = bitcast i128 %485 to <8 x bfloat>
+  %487 = add i32 %463, 12
+  %488 = mul i32 %487, 16
+  %489 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %488, i32 0, i32 0)
+  %490 = bitcast i128 %489 to <8 x bfloat>
+  %491 = add i32 %463, 14
+  %492 = mul i32 %491, 16
+  %493 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %492, i32 0, i32 0)
+  %494 = bitcast i128 %493 to <8 x bfloat>
+  %495 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %464, i32 0, i32 0)
+  %496 = bitcast i128 %495 to <8 x bfloat>
+  %497 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %468, i32 0, i32 0)
+  %498 = bitcast i128 %497 to <8 x bfloat>
+  %499 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %472, i32 0, i32 0)
+  %500 = bitcast i128 %499 to <8 x bfloat>
+  %501 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %476, i32 0, i32 0)
+  %502 = bitcast i128 %501 to <8 x bfloat>
+  %503 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %480, i32 0, i32 0)
+  %504 = bitcast i128 %503 to <8 x bfloat>
+  %505 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %484, i32 0, i32 0)
+  %506 = bitcast i128 %505 to <8 x bfloat>
+  %507 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %488, i32 0, i32 0)
+  %508 = bitcast i128 %507 to <8 x bfloat>
+  %509 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %492, i32 0, i32 0)
+  %510 = bitcast i128 %509 to <8 x bfloat>
+  %511 = add i32 %459, 16
+  %512 = add i32 %511, %39
+  %513 = mul i32 %512, %69
+  %514 = add i32 %458, %513
+  %515 = add i32 %514, %47
+  %516 = mul i32 %515, 16
+  %517 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %516, i32 0, i32 0)
+  %518 = bitcast i128 %517 to <8 x bfloat>
+  %519 = add i32 %515, 2
+  %520 = mul i32 %519, 16
+  %521 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %520, i32 0, i32 0)
+  %522 = bitcast i128 %521 to <8 x bfloat>
+  %523 = add i32 %515, 4
+  %524 = mul i32 %523, 16
+  %525 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %524, i32 0, i32 0)
+  %526 = bitcast i128 %525 to <8 x bfloat>
+  %527 = add i32 %515, 6
+  %528 = mul i32 %527, 16
+  %529 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %528, i32 0, i32 0)
+  %530 = bitcast i128 %529 to <8 x bfloat>
+  %531 = add i32 %515, 8
+  %532 = mul i32 %531, 16
+  %533 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %532, i32 0, i32 0)
+  %534 = bitcast i128 %533 to <8 x bfloat>
+  %535 = add i32 %515, 10
+  %536 = mul i32 %535, 16
+  %537 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %536, i32 0, i32 0)
+  %538 = bitcast i128 %537 to <8 x bfloat>
+  %539 = add i32 %515, 12
+  %540 = mul i32 %539, 16
+  %541 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %540, i32 0, i32 0)
+  %542 = bitcast i128 %541 to <8 x bfloat>
+  %543 = add i32 %515, 14
+  %544 = mul i32 %543, 16
+  %545 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %544, i32 0, i32 0)
+  %546 = bitcast i128 %545 to <8 x bfloat>
+  %547 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %516, i32 0, i32 0)
+  %548 = bitcast i128 %547 to <8 x bfloat>
+  %549 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %520, i32 0, i32 0)
+  %550 = bitcast i128 %549 to <8 x bfloat>
+  %551 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %524, i32 0, i32 0)
+  %552 = bitcast i128 %551 to <8 x bfloat>
+  %553 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %528, i32 0, i32 0)
+  %554 = bitcast i128 %553 to <8 x bfloat>
+  %555 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %532, i32 0, i32 0)
+  %556 = bitcast i128 %555 to <8 x bfloat>
+  %557 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %536, i32 0, i32 0)
+  %558 = bitcast i128 %557 to <8 x bfloat>
+  %559 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %540, i32 0, i32 0)
+  %560 = bitcast i128 %559 to <8 x bfloat>
+  %561 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %544, i32 0, i32 0)
+  %562 = bitcast i128 %561 to <8 x bfloat>
+  %563 = mul i32 %39, 272
+  %564 = mul i32 %47, 16
+  %565 = add i32 %563, %564
+  %566 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %565
+  %567 = inttoptr i32 %566 to ptr addrspace(3)
+  store <8 x bfloat> %399, ptr addrspace(3) %567, align 16
+  %568 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %565
+  %569 = inttoptr i32 %568 to ptr addrspace(3)
+  store <8 x bfloat> %391, ptr addrspace(3) %569, align 16
+  %570 = add i32 %565, 32
+  %571 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %570
+  %572 = inttoptr i32 %571 to ptr addrspace(3)
+  store <8 x bfloat> %400, ptr addrspace(3) %572, align 16
+  %573 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %570
+  %574 = inttoptr i32 %573 to ptr addrspace(3)
+  store <8 x bfloat> %392, ptr addrspace(3) %574, align 16
+  %575 = add i32 %565, 64
+  %576 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %575
+  %577 = inttoptr i32 %576 to ptr addrspace(3)
+  store <8 x bfloat> %401, ptr addrspace(3) %577, align 16
+  %578 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %575
+  %579 = inttoptr i32 %578 to ptr addrspace(3)
+  store <8 x bfloat> %393, ptr addrspace(3) %579, align 16
+  %580 = add i32 %565, 96
+  %581 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %580
+  %582 = inttoptr i32 %581 to ptr addrspace(3)
+  store <8 x bfloat> %402, ptr addrspace(3) %582, align 16
+  %583 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %580
+  %584 = inttoptr i32 %583 to ptr addrspace(3)
+  store <8 x bfloat> %394, ptr addrspace(3) %584, align 16
+  %585 = add i32 %565, 128
+  %586 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %585
+  %587 = inttoptr i32 %586 to ptr addrspace(3)
+  store <8 x bfloat> %403, ptr addrspace(3) %587, align 16
+  %588 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %585
+  %589 = inttoptr i32 %588 to ptr addrspace(3)
+  store <8 x bfloat> %395, ptr addrspace(3) %589, align 16
+  %590 = add i32 %565, 160
+  %591 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %590
+  %592 = inttoptr i32 %591 to ptr addrspace(3)
+  store <8 x bfloat> %404, ptr addrspace(3) %592, align 16
+  %593 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %590
+  %594 = inttoptr i32 %593 to ptr addrspace(3)
+  store <8 x bfloat> %396, ptr addrspace(3) %594, align 16
+  %595 = add i32 %565, 192
+  %596 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %595
+  %597 = inttoptr i32 %596 to ptr addrspace(3)
+  store <8 x bfloat> %405, ptr addrspace(3) %597, align 16
+  %598 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %595
+  %599 = inttoptr i32 %598 to ptr addrspace(3)
+  store <8 x bfloat> %397, ptr addrspace(3) %599, align 16
+  %600 = add i32 %565, 224
+  %601 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %600
+  %602 = inttoptr i32 %601 to ptr addrspace(3)
+  store <8 x bfloat> %406, ptr addrspace(3) %602, align 16
+  %603 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %600
+  %604 = inttoptr i32 %603 to ptr addrspace(3)
+  store <8 x bfloat> %398, ptr addrspace(3) %604, align 16
+  %605 = shufflevector <8 x bfloat> %391, <8 x bfloat> %392, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %606 = shufflevector <8 x bfloat> %393, <8 x bfloat> %394, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %607 = shufflevector <8 x bfloat> %395, <8 x bfloat> %396, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %608 = shufflevector <8 x bfloat> %397, <8 x bfloat> %398, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %609 = shufflevector <8 x bfloat> %399, <8 x bfloat> %400, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %610 = shufflevector <8 x bfloat> %401, <8 x bfloat> %402, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %611 = shufflevector <8 x bfloat> %403, <8 x bfloat> %404, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %612 = shufflevector <8 x bfloat> %405, <8 x bfloat> %406, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %613 = add i32 %455, %39
+  %614 = add i32 %454, %613
+  %615 = mul i32 %614, 4
+  %616 = call i32 @llvm.amdgcn.raw.ptr.buffer.load.i32(ptr addrspace(8) %65, i32 %615, i32 0, i32 0)
+  %617 = bitcast i32 %616 to float
+  %618 = call i32 @llvm.amdgcn.raw.ptr.buffer.load.i32(ptr addrspace(8) %66, i32 %615, i32 0, i32 0)
+  %619 = bitcast i32 %618 to float
+  %620 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %86, <16 x bfloat> %605, i16 0, <8 x float> zeroinitializer, i1 false, i1 false)
+  %621 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %158, <16 x bfloat> %609, i16 0, <8 x float> zeroinitializer, i1 false, i1 false)
+  %622 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %95, <16 x bfloat> %606, i16 0, <8 x float> %620, i1 false, i1 false)
+  %623 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %163, <16 x bfloat> %610, i16 0, <8 x float> %621, i1 false, i1 false)
+  %624 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %104, <16 x bfloat> %607, i16 0, <8 x float> %622, i1 false, i1 false)
+  %625 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %168, <16 x bfloat> %611, i16 0, <8 x float> %623, i1 false, i1 false)
+  %626 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %113, <16 x bfloat> %608, i16 0, <8 x float> %624, i1 false, i1 false)
+  %627 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %173, <16 x bfloat> %612, i16 0, <8 x float> %625, i1 false, i1 false)
+  %628 = add i32 %48, %194
+  %629 = add i32 %613, %23
+  %630 = icmp sgt i32 %628, %629
+  %631 = and i1 %630, %225
+  %632 = extractelement <8 x float> %626, i64 0
+  %633 = fmul float %632, %16
+  %634 = select i1 %631, float -3.000000e+38, float %633
+  %635 = add i32 %628, 1
+  %636 = icmp sgt i32 %635, %629
+  %637 = and i1 %636, %225
+  %638 = extractelement <8 x float> %626, i64 1
+  %639 = fmul float %638, %16
+  %640 = select i1 %637, float -3.000000e+38, float %639
+  %641 = add i32 %628, 2
+  %642 = icmp sgt i32 %641, %629
+  %643 = and i1 %642, %225
+  %644 = extractelement <8 x float> %626, i64 2
+  %645 = fmul float %644, %16
+  %646 = select i1 %643, float -3.000000e+38, float %645
+  %647 = add i32 %628, 3
+  %648 = icmp sgt i32 %647, %629
+  %649 = and i1 %648, %225
+  %650 = extractelement <8 x float> %626, i64 3
+  %651 = fmul float %650, %16
+  %652 = select i1 %649, float -3.000000e+38, float %651
+  %653 = add i32 %628, 4
+  %654 = icmp sgt i32 %653, %629
+  %655 = and i1 %654, %225
+  %656 = extractelement <8 x float> %626, i64 4
+  %657 = fmul float %656, %16
+  %658 = select i1 %655, float -3.000000e+38, float %657
+  %659 = add i32 %628, 5
+  %660 = icmp sgt i32 %659, %629
+  %661 = and i1 %660, %225
+  %662 = extractelement <8 x float> %626, i64 5
+  %663 = fmul float %662, %16
+  %664 = select i1 %661, float -3.000000e+38, float %663
+  %665 = add i32 %628, 6
+  %666 = icmp sgt i32 %665, %629
+  %667 = and i1 %666, %225
+  %668 = extractelement <8 x float> %626, i64 6
+  %669 = fmul float %668, %16
+  %670 = select i1 %667, float -3.000000e+38, float %669
+  %671 = add i32 %628, 7
+  %672 = icmp sgt i32 %671, %629
+  %673 = and i1 %672, %225
+  %674 = extractelement <8 x float> %626, i64 7
+  %675 = fmul float %674, %16
+  %676 = select i1 %673, float -3.000000e+38, float %675
+  %677 = fsub float %634, %617
+  %678 = fmul float %677, f0x3FB8AA3B
+  %679 = call float @llvm.amdgcn.exp2.f32(float %678)
+  %680 = fsub float %640, %617
+  %681 = fmul float %680, f0x3FB8AA3B
+  %682 = call float @llvm.amdgcn.exp2.f32(float %681)
+  %683 = fsub float %646, %617
+  %684 = fmul float %683, f0x3FB8AA3B
+  %685 = call float @llvm.amdgcn.exp2.f32(float %684)
+  %686 = fsub float %652, %617
+  %687 = fmul float %686, f0x3FB8AA3B
+  %688 = call float @llvm.amdgcn.exp2.f32(float %687)
+  %689 = fsub float %658, %617
+  %690 = fmul float %689, f0x3FB8AA3B
+  %691 = call float @llvm.amdgcn.exp2.f32(float %690)
+  %692 = fsub float %664, %617
+  %693 = fmul float %692, f0x3FB8AA3B
+  %694 = call float @llvm.amdgcn.exp2.f32(float %693)
+  %695 = fsub float %670, %617
+  %696 = fmul float %695, f0x3FB8AA3B
+  %697 = call float @llvm.amdgcn.exp2.f32(float %696)
+  %698 = fsub float %676, %617
+  %699 = fmul float %698, f0x3FB8AA3B
+  %700 = call float @llvm.amdgcn.exp2.f32(float %699)
+  %701 = fptrunc float %679 to bfloat
+  %702 = fptrunc float %682 to bfloat
+  %703 = fptrunc float %685 to bfloat
+  %704 = fptrunc float %688 to bfloat
+  %705 = fptrunc float %691 to bfloat
+  %706 = fptrunc float %694 to bfloat
+  %707 = fptrunc float %697 to bfloat
+  %708 = fptrunc float %700 to bfloat
+  %709 = extractelement <8 x float> %627, i64 0
+  %710 = fsub float %709, %619
+  %711 = fmul float %679, %710
+  %712 = fmul float %711, %16
+  %713 = fptrunc float %712 to bfloat
+  %714 = extractelement <8 x float> %627, i64 1
+  %715 = fsub float %714, %619
+  %716 = fmul float %682, %715
+  %717 = fmul float %716, %16
+  %718 = fptrunc float %717 to bfloat
+  %719 = extractelement <8 x float> %627, i64 2
+  %720 = fsub float %719, %619
+  %721 = fmul float %685, %720
+  %722 = fmul float %721, %16
+  %723 = fptrunc float %722 to bfloat
+  %724 = extractelement <8 x float> %627, i64 3
+  %725 = fsub float %724, %619
+  %726 = fmul float %688, %725
+  %727 = fmul float %726, %16
+  %728 = fptrunc float %727 to bfloat
+  %729 = extractelement <8 x float> %627, i64 4
+  %730 = fsub float %729, %619
+  %731 = fmul float %691, %730
+  %732 = fmul float %731, %16
+  %733 = fptrunc float %732 to bfloat
+  %734 = extractelement <8 x float> %627, i64 5
+  %735 = fsub float %734, %619
+  %736 = fmul float %694, %735
+  %737 = fmul float %736, %16
+  %738 = fptrunc float %737 to bfloat
+  %739 = extractelement <8 x float> %627, i64 6
+  %740 = fsub float %739, %619
+  %741 = fmul float %697, %740
+  %742 = fmul float %741, %16
+  %743 = fptrunc float %742 to bfloat
+  %744 = extractelement <8 x float> %627, i64 7
+  %745 = fsub float %744, %619
+  %746 = fmul float %700, %745
+  %747 = fmul float %746, %16
+  %748 = fptrunc float %747 to bfloat
+  %749 = mul i32 %39, 80
+  %750 = add i32 %749, %564
+  %751 = insertelement <8 x bfloat> poison, bfloat %701, i64 0
+  %752 = insertelement <8 x bfloat> %751, bfloat %702, i64 1
+  %753 = insertelement <8 x bfloat> %752, bfloat %703, i64 2
+  %754 = insertelement <8 x bfloat> %753, bfloat %704, i64 3
+  %755 = insertelement <8 x bfloat> %754, bfloat %705, i64 4
+  %756 = insertelement <8 x bfloat> %755, bfloat %706, i64 5
+  %757 = insertelement <8 x bfloat> %756, bfloat %707, i64 6
+  %758 = insertelement <8 x bfloat> %757, bfloat %708, i64 7
+  %759 = add i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), %750
+  %760 = inttoptr i32 %759 to ptr addrspace(3)
+  store <8 x bfloat> %758, ptr addrspace(3) %760, align 16
+  %761 = insertelement <8 x bfloat> poison, bfloat %713, i64 0
+  %762 = insertelement <8 x bfloat> %761, bfloat %718, i64 1
+  %763 = insertelement <8 x bfloat> %762, bfloat %723, i64 2
+  %764 = insertelement <8 x bfloat> %763, bfloat %728, i64 3
+  %765 = insertelement <8 x bfloat> %764, bfloat %733, i64 4
+  %766 = insertelement <8 x bfloat> %765, bfloat %738, i64 5
+  %767 = insertelement <8 x bfloat> %766, bfloat %743, i64 6
+  %768 = insertelement <8 x bfloat> %767, bfloat %748, i64 7
+  %769 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 2560), %750
+  %770 = inttoptr i32 %769 to ptr addrspace(3)
+  store <8 x bfloat> %768, ptr addrspace(3) %770, align 16
+  %771 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %126, <16 x bfloat> %605, i16 0, <8 x float> zeroinitializer, i1 false, i1 false)
+  %772 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %178, <16 x bfloat> %609, i16 0, <8 x float> zeroinitializer, i1 false, i1 false)
+  %773 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %135, <16 x bfloat> %606, i16 0, <8 x float> %771, i1 false, i1 false)
+  %774 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %183, <16 x bfloat> %610, i16 0, <8 x float> %772, i1 false, i1 false)
+  %775 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %144, <16 x bfloat> %607, i16 0, <8 x float> %773, i1 false, i1 false)
+  %776 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %188, <16 x bfloat> %611, i16 0, <8 x float> %774, i1 false, i1 false)
+  %777 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %153, <16 x bfloat> %608, i16 0, <8 x float> %775, i1 false, i1 false)
+  %778 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %193, <16 x bfloat> %612, i16 0, <8 x float> %776, i1 false, i1 false)
+  %779 = add i32 %114, %194
+  %780 = icmp sgt i32 %779, %629
+  %781 = and i1 %780, %225
+  %782 = extractelement <8 x float> %777, i64 0
+  %783 = fmul float %782, %16
+  %784 = select i1 %781, float -3.000000e+38, float %783
+  %785 = add i32 %779, 1
+  %786 = icmp sgt i32 %785, %629
+  %787 = and i1 %786, %225
+  %788 = extractelement <8 x float> %777, i64 1
+  %789 = fmul float %788, %16
+  %790 = select i1 %787, float -3.000000e+38, float %789
+  %791 = add i32 %779, 2
+  %792 = icmp sgt i32 %791, %629
+  %793 = and i1 %792, %225
+  %794 = extractelement <8 x float> %777, i64 2
+  %795 = fmul float %794, %16
+  %796 = select i1 %793, float -3.000000e+38, float %795
+  %797 = add i32 %779, 3
+  %798 = icmp sgt i32 %797, %629
+  %799 = and i1 %798, %225
+  %800 = extractelement <8 x float> %777, i64 3
+  %801 = fmul float %800, %16
+  %802 = select i1 %799, float -3.000000e+38, float %801
+  %803 = add i32 %779, 4
+  %804 = icmp sgt i32 %803, %629
+  %805 = and i1 %804, %225
+  %806 = extractelement <8 x float> %777, i64 4
+  %807 = fmul float %806, %16
+  %808 = select i1 %805, float -3.000000e+38, float %807
+  %809 = add i32 %779, 5
+  %810 = icmp sgt i32 %809, %629
+  %811 = and i1 %810, %225
+  %812 = extractelement <8 x float> %777, i64 5
+  %813 = fmul float %812, %16
+  %814 = select i1 %811, float -3.000000e+38, float %813
+  %815 = add i32 %779, 6
+  %816 = icmp sgt i32 %815, %629
+  %817 = and i1 %816, %225
+  %818 = extractelement <8 x float> %777, i64 6
+  %819 = fmul float %818, %16
+  %820 = select i1 %817, float -3.000000e+38, float %819
+  %821 = add i32 %779, 7
+  %822 = icmp sgt i32 %821, %629
+  %823 = and i1 %822, %225
+  %824 = extractelement <8 x float> %777, i64 7
+  %825 = fmul float %824, %16
+  %826 = select i1 %823, float -3.000000e+38, float %825
+  %827 = fsub float %784, %617
+  %828 = fmul float %827, f0x3FB8AA3B
+  %829 = call float @llvm.amdgcn.exp2.f32(float %828)
+  %830 = fsub float %790, %617
+  %831 = fmul float %830, f0x3FB8AA3B
+  %832 = call float @llvm.amdgcn.exp2.f32(float %831)
+  %833 = fsub float %796, %617
+  %834 = fmul float %833, f0x3FB8AA3B
+  %835 = call float @llvm.amdgcn.exp2.f32(float %834)
+  %836 = fsub float %802, %617
+  %837 = fmul float %836, f0x3FB8AA3B
+  %838 = call float @llvm.amdgcn.exp2.f32(float %837)
+  %839 = fsub float %808, %617
+  %840 = fmul float %839, f0x3FB8AA3B
+  %841 = call float @llvm.amdgcn.exp2.f32(float %840)
+  %842 = fsub float %814, %617
+  %843 = fmul float %842, f0x3FB8AA3B
+  %844 = call float @llvm.amdgcn.exp2.f32(float %843)
+  %845 = fsub float %820, %617
+  %846 = fmul float %845, f0x3FB8AA3B
+  %847 = call float @llvm.amdgcn.exp2.f32(float %846)
+  %848 = fsub float %826, %617
+  %849 = fmul float %848, f0x3FB8AA3B
+  %850 = call float @llvm.amdgcn.exp2.f32(float %849)
+  %851 = fptrunc float %829 to bfloat
+  %852 = fptrunc float %832 to bfloat
+  %853 = fptrunc float %835 to bfloat
+  %854 = fptrunc float %838 to bfloat
+  %855 = fptrunc float %841 to bfloat
+  %856 = fptrunc float %844 to bfloat
+  %857 = fptrunc float %847 to bfloat
+  %858 = fptrunc float %850 to bfloat
+  %859 = extractelement <8 x float> %778, i64 0
+  %860 = fsub float %859, %619
+  %861 = fmul float %829, %860
+  %862 = fmul float %861, %16
+  %863 = fptrunc float %862 to bfloat
+  %864 = extractelement <8 x float> %778, i64 1
+  %865 = fsub float %864, %619
+  %866 = fmul float %832, %865
+  %867 = fmul float %866, %16
+  %868 = fptrunc float %867 to bfloat
+  %869 = extractelement <8 x float> %778, i64 2
+  %870 = fsub float %869, %619
+  %871 = fmul float %835, %870
+  %872 = fmul float %871, %16
+  %873 = fptrunc float %872 to bfloat
+  %874 = extractelement <8 x float> %778, i64 3
+  %875 = fsub float %874, %619
+  %876 = fmul float %838, %875
+  %877 = fmul float %876, %16
+  %878 = fptrunc float %877 to bfloat
+  %879 = extractelement <8 x float> %778, i64 4
+  %880 = fsub float %879, %619
+  %881 = fmul float %841, %880
+  %882 = fmul float %881, %16
+  %883 = fptrunc float %882 to bfloat
+  %884 = extractelement <8 x float> %778, i64 5
+  %885 = fsub float %884, %619
+  %886 = fmul float %844, %885
+  %887 = fmul float %886, %16
+  %888 = fptrunc float %887 to bfloat
+  %889 = extractelement <8 x float> %778, i64 6
+  %890 = fsub float %889, %619
+  %891 = fmul float %847, %890
+  %892 = fmul float %891, %16
+  %893 = fptrunc float %892 to bfloat
+  %894 = extractelement <8 x float> %778, i64 7
+  %895 = fsub float %894, %619
+  %896 = fmul float %850, %895
+  %897 = fmul float %896, %16
+  %898 = fptrunc float %897 to bfloat
+  %899 = add i32 %749, 32
+  %900 = add i32 %899, %564
+  %901 = insertelement <8 x bfloat> poison, bfloat %851, i64 0
+  %902 = insertelement <8 x bfloat> %901, bfloat %852, i64 1
+  %903 = insertelement <8 x bfloat> %902, bfloat %853, i64 2
+  %904 = insertelement <8 x bfloat> %903, bfloat %854, i64 3
+  %905 = insertelement <8 x bfloat> %904, bfloat %855, i64 4
+  %906 = insertelement <8 x bfloat> %905, bfloat %856, i64 5
+  %907 = insertelement <8 x bfloat> %906, bfloat %857, i64 6
+  %908 = insertelement <8 x bfloat> %907, bfloat %858, i64 7
+  %909 = add i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), %900
+  %910 = inttoptr i32 %909 to ptr addrspace(3)
+  store <8 x bfloat> %908, ptr addrspace(3) %910, align 16
+  %911 = insertelement <8 x bfloat> poison, bfloat %863, i64 0
+  %912 = insertelement <8 x bfloat> %911, bfloat %868, i64 1
+  %913 = insertelement <8 x bfloat> %912, bfloat %873, i64 2
+  %914 = insertelement <8 x bfloat> %913, bfloat %878, i64 3
+  %915 = insertelement <8 x bfloat> %914, bfloat %883, i64 4
+  %916 = insertelement <8 x bfloat> %915, bfloat %888, i64 5
+  %917 = insertelement <8 x bfloat> %916, bfloat %893, i64 6
+  %918 = insertelement <8 x bfloat> %917, bfloat %898, i64 7
+  %919 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 2560), %900
+  %920 = inttoptr i32 %919 to ptr addrspace(3)
+  store <8 x bfloat> %918, ptr addrspace(3) %920, align 16
+  %921 = add i32 %455, 16
+  %922 = add i32 %39, 16
+  %923 = mul i32 %922, 272
+  %924 = add i32 %923, %564
+  %925 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %924
+  %926 = inttoptr i32 %925 to ptr addrspace(3)
+  store <8 x bfloat> %415, ptr addrspace(3) %926, align 16
+  %927 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %924
+  %928 = inttoptr i32 %927 to ptr addrspace(3)
+  store <8 x bfloat> %407, ptr addrspace(3) %928, align 16
+  %929 = add i32 %924, 32
+  %930 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %929
+  %931 = inttoptr i32 %930 to ptr addrspace(3)
+  store <8 x bfloat> %416, ptr addrspace(3) %931, align 16
+  %932 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %929
+  %933 = inttoptr i32 %932 to ptr addrspace(3)
+  store <8 x bfloat> %408, ptr addrspace(3) %933, align 16
+  %934 = add i32 %924, 64
+  %935 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %934
+  %936 = inttoptr i32 %935 to ptr addrspace(3)
+  store <8 x bfloat> %417, ptr addrspace(3) %936, align 16
+  %937 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %934
+  %938 = inttoptr i32 %937 to ptr addrspace(3)
+  store <8 x bfloat> %409, ptr addrspace(3) %938, align 16
+  %939 = add i32 %924, 96
+  %940 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %939
+  %941 = inttoptr i32 %940 to ptr addrspace(3)
+  store <8 x bfloat> %418, ptr addrspace(3) %941, align 16
+  %942 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %939
+  %943 = inttoptr i32 %942 to ptr addrspace(3)
+  store <8 x bfloat> %410, ptr addrspace(3) %943, align 16
+  %944 = add i32 %924, 128
+  %945 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %944
+  %946 = inttoptr i32 %945 to ptr addrspace(3)
+  store <8 x bfloat> %419, ptr addrspace(3) %946, align 16
+  %947 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %944
+  %948 = inttoptr i32 %947 to ptr addrspace(3)
+  store <8 x bfloat> %411, ptr addrspace(3) %948, align 16
+  %949 = add i32 %924, 160
+  %950 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %949
+  %951 = inttoptr i32 %950 to ptr addrspace(3)
+  store <8 x bfloat> %420, ptr addrspace(3) %951, align 16
+  %952 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %949
+  %953 = inttoptr i32 %952 to ptr addrspace(3)
+  store <8 x bfloat> %412, ptr addrspace(3) %953, align 16
+  %954 = add i32 %924, 192
+  %955 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %954
+  %956 = inttoptr i32 %955 to ptr addrspace(3)
+  store <8 x bfloat> %421, ptr addrspace(3) %956, align 16
+  %957 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %954
+  %958 = inttoptr i32 %957 to ptr addrspace(3)
+  store <8 x bfloat> %413, ptr addrspace(3) %958, align 16
+  %959 = add i32 %924, 224
+  %960 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %959
+  %961 = inttoptr i32 %960 to ptr addrspace(3)
+  store <8 x bfloat> %422, ptr addrspace(3) %961, align 16
+  %962 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %959
+  %963 = inttoptr i32 %962 to ptr addrspace(3)
+  store <8 x bfloat> %414, ptr addrspace(3) %963, align 16
+  %964 = shufflevector <8 x bfloat> %407, <8 x bfloat> %408, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %965 = shufflevector <8 x bfloat> %409, <8 x bfloat> %410, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %966 = shufflevector <8 x bfloat> %411, <8 x bfloat> %412, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %967 = shufflevector <8 x bfloat> %413, <8 x bfloat> %414, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %968 = shufflevector <8 x bfloat> %415, <8 x bfloat> %416, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %969 = shufflevector <8 x bfloat> %417, <8 x bfloat> %418, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %970 = shufflevector <8 x bfloat> %419, <8 x bfloat> %420, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %971 = shufflevector <8 x bfloat> %421, <8 x bfloat> %422, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %972 = add i32 %921, %39
+  %973 = add i32 %454, %972
+  %974 = mul i32 %973, 4
+  %975 = call i32 @llvm.amdgcn.raw.ptr.buffer.load.i32(ptr addrspace(8) %65, i32 %974, i32 0, i32 0)
+  %976 = bitcast i32 %975 to float
+  %977 = call i32 @llvm.amdgcn.raw.ptr.buffer.load.i32(ptr addrspace(8) %66, i32 %974, i32 0, i32 0)
+  %978 = bitcast i32 %977 to float
+  %979 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %86, <16 x bfloat> %964, i16 0, <8 x float> zeroinitializer, i1 false, i1 false)
+  %980 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %158, <16 x bfloat> %968, i16 0, <8 x float> zeroinitializer, i1 false, i1 false)
+  %981 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %95, <16 x bfloat> %965, i16 0, <8 x float> %979, i1 false, i1 false)
+  %982 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %163, <16 x bfloat> %969, i16 0, <8 x float> %980, i1 false, i1 false)
+  %983 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %104, <16 x bfloat> %966, i16 0, <8 x float> %981, i1 false, i1 false)
+  %984 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %168, <16 x bfloat> %970, i16 0, <8 x float> %982, i1 false, i1 false)
+  %985 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %113, <16 x bfloat> %967, i16 0, <8 x float> %983, i1 false, i1 false)
+  %986 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %173, <16 x bfloat> %971, i16 0, <8 x float> %984, i1 false, i1 false)
+  %987 = add i32 %972, %23
+  %988 = icmp sgt i32 %628, %987
+  %989 = and i1 %988, %225
+  %990 = extractelement <8 x float> %985, i64 0
+  %991 = fmul float %990, %16
+  %992 = select i1 %989, float -3.000000e+38, float %991
+  %993 = icmp sgt i32 %635, %987
+  %994 = and i1 %993, %225
+  %995 = extractelement <8 x float> %985, i64 1
+  %996 = fmul float %995, %16
+  %997 = select i1 %994, float -3.000000e+38, float %996
+  %998 = icmp sgt i32 %641, %987
+  %999 = and i1 %998, %225
+  %1000 = extractelement <8 x float> %985, i64 2
+  %1001 = fmul float %1000, %16
+  %1002 = select i1 %999, float -3.000000e+38, float %1001
+  %1003 = icmp sgt i32 %647, %987
+  %1004 = and i1 %1003, %225
+  %1005 = extractelement <8 x float> %985, i64 3
+  %1006 = fmul float %1005, %16
+  %1007 = select i1 %1004, float -3.000000e+38, float %1006
+  %1008 = icmp sgt i32 %653, %987
+  %1009 = and i1 %1008, %225
+  %1010 = extractelement <8 x float> %985, i64 4
+  %1011 = fmul float %1010, %16
+  %1012 = select i1 %1009, float -3.000000e+38, float %1011
+  %1013 = icmp sgt i32 %659, %987
+  %1014 = and i1 %1013, %225
+  %1015 = extractelement <8 x float> %985, i64 5
+  %1016 = fmul float %1015, %16
+  %1017 = select i1 %1014, float -3.000000e+38, float %1016
+  %1018 = icmp sgt i32 %665, %987
+  %1019 = and i1 %1018, %225
+  %1020 = extractelement <8 x float> %985, i64 6
+  %1021 = fmul float %1020, %16
+  %1022 = select i1 %1019, float -3.000000e+38, float %1021
+  %1023 = icmp sgt i32 %671, %987
+  %1024 = and i1 %1023, %225
+  %1025 = extractelement <8 x float> %985, i64 7
+  %1026 = fmul float %1025, %16
+  %1027 = select i1 %1024, float -3.000000e+38, float %1026
+  %1028 = fsub float %992, %976
+  %1029 = fmul float %1028, f0x3FB8AA3B
+  %1030 = call float @llvm.amdgcn.exp2.f32(float %1029)
+  %1031 = fsub float %997, %976
+  %1032 = fmul float %1031, f0x3FB8AA3B
+  %1033 = call float @llvm.amdgcn.exp2.f32(float %1032)
+  %1034 = fsub float %1002, %976
+  %1035 = fmul float %1034, f0x3FB8AA3B
+  %1036 = call float @llvm.amdgcn.exp2.f32(float %1035)
+  %1037 = fsub float %1007, %976
+  %1038 = fmul float %1037, f0x3FB8AA3B
+  %1039 = call float @llvm.amdgcn.exp2.f32(float %1038)
+  %1040 = fsub float %1012, %976
+  %1041 = fmul float %1040, f0x3FB8AA3B
+  %1042 = call float @llvm.amdgcn.exp2.f32(float %1041)
+  %1043 = fsub float %1017, %976
+  %1044 = fmul float %1043, f0x3FB8AA3B
+  %1045 = call float @llvm.amdgcn.exp2.f32(float %1044)
+  %1046 = fsub float %1022, %976
+  %1047 = fmul float %1046, f0x3FB8AA3B
+  %1048 = call float @llvm.amdgcn.exp2.f32(float %1047)
+  %1049 = fsub float %1027, %976
+  %1050 = fmul float %1049, f0x3FB8AA3B
+  %1051 = call float @llvm.amdgcn.exp2.f32(float %1050)
+  %1052 = fptrunc float %1030 to bfloat
+  %1053 = fptrunc float %1033 to bfloat
+  %1054 = fptrunc float %1036 to bfloat
+  %1055 = fptrunc float %1039 to bfloat
+  %1056 = fptrunc float %1042 to bfloat
+  %1057 = fptrunc float %1045 to bfloat
+  %1058 = fptrunc float %1048 to bfloat
+  %1059 = fptrunc float %1051 to bfloat
+  %1060 = extractelement <8 x float> %986, i64 0
+  %1061 = fsub float %1060, %978
+  %1062 = fmul float %1030, %1061
+  %1063 = fmul float %1062, %16
+  %1064 = fptrunc float %1063 to bfloat
+  %1065 = extractelement <8 x float> %986, i64 1
+  %1066 = fsub float %1065, %978
+  %1067 = fmul float %1033, %1066
+  %1068 = fmul float %1067, %16
+  %1069 = fptrunc float %1068 to bfloat
+  %1070 = extractelement <8 x float> %986, i64 2
+  %1071 = fsub float %1070, %978
+  %1072 = fmul float %1036, %1071
+  %1073 = fmul float %1072, %16
+  %1074 = fptrunc float %1073 to bfloat
+  %1075 = extractelement <8 x float> %986, i64 3
+  %1076 = fsub float %1075, %978
+  %1077 = fmul float %1039, %1076
+  %1078 = fmul float %1077, %16
+  %1079 = fptrunc float %1078 to bfloat
+  %1080 = extractelement <8 x float> %986, i64 4
+  %1081 = fsub float %1080, %978
+  %1082 = fmul float %1042, %1081
+  %1083 = fmul float %1082, %16
+  %1084 = fptrunc float %1083 to bfloat
+  %1085 = extractelement <8 x float> %986, i64 5
+  %1086 = fsub float %1085, %978
+  %1087 = fmul float %1045, %1086
+  %1088 = fmul float %1087, %16
+  %1089 = fptrunc float %1088 to bfloat
+  %1090 = extractelement <8 x float> %986, i64 6
+  %1091 = fsub float %1090, %978
+  %1092 = fmul float %1048, %1091
+  %1093 = fmul float %1092, %16
+  %1094 = fptrunc float %1093 to bfloat
+  %1095 = extractelement <8 x float> %986, i64 7
+  %1096 = fsub float %1095, %978
+  %1097 = fmul float %1051, %1096
+  %1098 = fmul float %1097, %16
+  %1099 = fptrunc float %1098 to bfloat
+  %1100 = mul i32 %922, 80
+  %1101 = add i32 %1100, %564
+  %1102 = insertelement <8 x bfloat> poison, bfloat %1052, i64 0
+  %1103 = insertelement <8 x bfloat> %1102, bfloat %1053, i64 1
+  %1104 = insertelement <8 x bfloat> %1103, bfloat %1054, i64 2
+  %1105 = insertelement <8 x bfloat> %1104, bfloat %1055, i64 3
+  %1106 = insertelement <8 x bfloat> %1105, bfloat %1056, i64 4
+  %1107 = insertelement <8 x bfloat> %1106, bfloat %1057, i64 5
+  %1108 = insertelement <8 x bfloat> %1107, bfloat %1058, i64 6
+  %1109 = insertelement <8 x bfloat> %1108, bfloat %1059, i64 7
+  %1110 = add i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), %1101
+  %1111 = inttoptr i32 %1110 to ptr addrspace(3)
+  store <8 x bfloat> %1109, ptr addrspace(3) %1111, align 16
+  %1112 = insertelement <8 x bfloat> poison, bfloat %1064, i64 0
+  %1113 = insertelement <8 x bfloat> %1112, bfloat %1069, i64 1
+  %1114 = insertelement <8 x bfloat> %1113, bfloat %1074, i64 2
+  %1115 = insertelement <8 x bfloat> %1114, bfloat %1079, i64 3
+  %1116 = insertelement <8 x bfloat> %1115, bfloat %1084, i64 4
+  %1117 = insertelement <8 x bfloat> %1116, bfloat %1089, i64 5
+  %1118 = insertelement <8 x bfloat> %1117, bfloat %1094, i64 6
+  %1119 = insertelement <8 x bfloat> %1118, bfloat %1099, i64 7
+  %1120 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 2560), %1101
+  %1121 = inttoptr i32 %1120 to ptr addrspace(3)
+  store <8 x bfloat> %1119, ptr addrspace(3) %1121, align 16
+  %1122 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %126, <16 x bfloat> %964, i16 0, <8 x float> zeroinitializer, i1 false, i1 false)
+  %1123 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %178, <16 x bfloat> %968, i16 0, <8 x float> zeroinitializer, i1 false, i1 false)
+  %1124 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %135, <16 x bfloat> %965, i16 0, <8 x float> %1122, i1 false, i1 false)
+  %1125 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %183, <16 x bfloat> %969, i16 0, <8 x float> %1123, i1 false, i1 false)
+  %1126 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %144, <16 x bfloat> %966, i16 0, <8 x float> %1124, i1 false, i1 false)
+  %1127 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %188, <16 x bfloat> %970, i16 0, <8 x float> %1125, i1 false, i1 false)
+  %1128 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %153, <16 x bfloat> %967, i16 0, <8 x float> %1126, i1 false, i1 false)
+  %1129 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %193, <16 x bfloat> %971, i16 0, <8 x float> %1127, i1 false, i1 false)
+  %1130 = icmp sgt i32 %779, %987
+  %1131 = and i1 %1130, %225
+  %1132 = extractelement <8 x float> %1128, i64 0
+  %1133 = fmul float %1132, %16
+  %1134 = select i1 %1131, float -3.000000e+38, float %1133
+  %1135 = icmp sgt i32 %785, %987
+  %1136 = and i1 %1135, %225
+  %1137 = extractelement <8 x float> %1128, i64 1
+  %1138 = fmul float %1137, %16
+  %1139 = select i1 %1136, float -3.000000e+38, float %1138
+  %1140 = icmp sgt i32 %791, %987
+  %1141 = and i1 %1140, %225
+  %1142 = extractelement <8 x float> %1128, i64 2
+  %1143 = fmul float %1142, %16
+  %1144 = select i1 %1141, float -3.000000e+38, float %1143
+  %1145 = icmp sgt i32 %797, %987
+  %1146 = and i1 %1145, %225
+  %1147 = extractelement <8 x float> %1128, i64 3
+  %1148 = fmul float %1147, %16
+  %1149 = select i1 %1146, float -3.000000e+38, float %1148
+  %1150 = icmp sgt i32 %803, %987
+  %1151 = and i1 %1150, %225
+  %1152 = extractelement <8 x float> %1128, i64 4
+  %1153 = fmul float %1152, %16
+  %1154 = select i1 %1151, float -3.000000e+38, float %1153
+  %1155 = icmp sgt i32 %809, %987
+  %1156 = and i1 %1155, %225
+  %1157 = extractelement <8 x float> %1128, i64 5
+  %1158 = fmul float %1157, %16
+  %1159 = select i1 %1156, float -3.000000e+38, float %1158
+  %1160 = icmp sgt i32 %815, %987
+  %1161 = and i1 %1160, %225
+  %1162 = extractelement <8 x float> %1128, i64 6
+  %1163 = fmul float %1162, %16
+  %1164 = select i1 %1161, float -3.000000e+38, float %1163
+  %1165 = icmp sgt i32 %821, %987
+  %1166 = and i1 %1165, %225
+  %1167 = extractelement <8 x float> %1128, i64 7
+  %1168 = fmul float %1167, %16
+  %1169 = select i1 %1166, float -3.000000e+38, float %1168
+  %1170 = fsub float %1134, %976
+  %1171 = fmul float %1170, f0x3FB8AA3B
+  %1172 = call float @llvm.amdgcn.exp2.f32(float %1171)
+  %1173 = fsub float %1139, %976
+  %1174 = fmul float %1173, f0x3FB8AA3B
+  %1175 = call float @llvm.amdgcn.exp2.f32(float %1174)
+  %1176 = fsub float %1144, %976
+  %1177 = fmul float %1176, f0x3FB8AA3B
+  %1178 = call float @llvm.amdgcn.exp2.f32(float %1177)
+  %1179 = fsub float %1149, %976
+  %1180 = fmul float %1179, f0x3FB8AA3B
+  %1181 = call float @llvm.amdgcn.exp2.f32(float %1180)
+  %1182 = fsub float %1154, %976
+  %1183 = fmul float %1182, f0x3FB8AA3B
+  %1184 = call float @llvm.amdgcn.exp2.f32(float %1183)
+  %1185 = fsub float %1159, %976
+  %1186 = fmul float %1185, f0x3FB8AA3B
+  %1187 = call float @llvm.amdgcn.exp2.f32(float %1186)
+  %1188 = fsub float %1164, %976
+  %1189 = fmul float %1188, f0x3FB8AA3B
+  %1190 = call float @llvm.amdgcn.exp2.f32(float %1189)
+  %1191 = fsub float %1169, %976
+  %1192 = fmul float %1191, f0x3FB8AA3B
+  %1193 = call float @llvm.amdgcn.exp2.f32(float %1192)
+  %1194 = fptrunc float %1172 to bfloat
+  %1195 = fptrunc float %1175 to bfloat
+  %1196 = fptrunc float %1178 to bfloat
+  %1197 = fptrunc float %1181 to bfloat
+  %1198 = fptrunc float %1184 to bfloat
+  %1199 = fptrunc float %1187 to bfloat
+  %1200 = fptrunc float %1190 to bfloat
+  %1201 = fptrunc float %1193 to bfloat
+  %1202 = extractelement <8 x float> %1129, i64 0
+  %1203 = fsub float %1202, %978
+  %1204 = fmul float %1172, %1203
+  %1205 = fmul float %1204, %16
+  %1206 = fptrunc float %1205 to bfloat
+  %1207 = extractelement <8 x float> %1129, i64 1
+  %1208 = fsub float %1207, %978
+  %1209 = fmul float %1175, %1208
+  %1210 = fmul float %1209, %16
+  %1211 = fptrunc float %1210 to bfloat
+  %1212 = extractelement <8 x float> %1129, i64 2
+  %1213 = fsub float %1212, %978
+  %1214 = fmul float %1178, %1213
+  %1215 = fmul float %1214, %16
+  %1216 = fptrunc float %1215 to bfloat
+  %1217 = extractelement <8 x float> %1129, i64 3
+  %1218 = fsub float %1217, %978
+  %1219 = fmul float %1181, %1218
+  %1220 = fmul float %1219, %16
+  %1221 = fptrunc float %1220 to bfloat
+  %1222 = extractelement <8 x float> %1129, i64 4
+  %1223 = fsub float %1222, %978
+  %1224 = fmul float %1184, %1223
+  %1225 = fmul float %1224, %16
+  %1226 = fptrunc float %1225 to bfloat
+  %1227 = extractelement <8 x float> %1129, i64 5
+  %1228 = fsub float %1227, %978
+  %1229 = fmul float %1187, %1228
+  %1230 = fmul float %1229, %16
+  %1231 = fptrunc float %1230 to bfloat
+  %1232 = extractelement <8 x float> %1129, i64 6
+  %1233 = fsub float %1232, %978
+  %1234 = fmul float %1190, %1233
+  %1235 = fmul float %1234, %16
+  %1236 = fptrunc float %1235 to bfloat
+  %1237 = extractelement <8 x float> %1129, i64 7
+  %1238 = fsub float %1237, %978
+  %1239 = fmul float %1193, %1238
+  %1240 = fmul float %1239, %16
+  %1241 = fptrunc float %1240 to bfloat
+  %1242 = add i32 %1100, 32
+  %1243 = add i32 %1242, %564
+  %1244 = insertelement <8 x bfloat> poison, bfloat %1194, i64 0
+  %1245 = insertelement <8 x bfloat> %1244, bfloat %1195, i64 1
+  %1246 = insertelement <8 x bfloat> %1245, bfloat %1196, i64 2
+  %1247 = insertelement <8 x bfloat> %1246, bfloat %1197, i64 3
+  %1248 = insertelement <8 x bfloat> %1247, bfloat %1198, i64 4
+  %1249 = insertelement <8 x bfloat> %1248, bfloat %1199, i64 5
+  %1250 = insertelement <8 x bfloat> %1249, bfloat %1200, i64 6
+  %1251 = insertelement <8 x bfloat> %1250, bfloat %1201, i64 7
+  %1252 = add i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), %1243
+  %1253 = inttoptr i32 %1252 to ptr addrspace(3)
+  store <8 x bfloat> %1251, ptr addrspace(3) %1253, align 16
+  %1254 = insertelement <8 x bfloat> poison, bfloat %1206, i64 0
+  %1255 = insertelement <8 x bfloat> %1254, bfloat %1211, i64 1
+  %1256 = insertelement <8 x bfloat> %1255, bfloat %1216, i64 2
+  %1257 = insertelement <8 x bfloat> %1256, bfloat %1221, i64 3
+  %1258 = insertelement <8 x bfloat> %1257, bfloat %1226, i64 4
+  %1259 = insertelement <8 x bfloat> %1258, bfloat %1231, i64 5
+  %1260 = insertelement <8 x bfloat> %1259, bfloat %1236, i64 6
+  %1261 = insertelement <8 x bfloat> %1260, bfloat %1241, i64 7
+  %1262 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 2560), %1243
+  %1263 = inttoptr i32 %1262 to ptr addrspace(3)
+  store <8 x bfloat> %1261, ptr addrspace(3) %1263, align 16
+  fence syncscope("workgroup") release
+  call void @llvm.amdgcn.s.barrier.signal(i32 -1)
+  call void @llvm.amdgcn.s.barrier.wait(i16 -1)
+  fence syncscope("workgroup") acquire
+  %1264 = mul i32 %205, 16
+  %1265 = mul i32 %196, 272
+  %1266 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %1265
+  %1267 = add i32 %1266, %1264
+  %1268 = inttoptr i32 %1267 to ptr addrspace(3)
+  %1269 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1268)
+  %1270 = add i32 %1267, 4352
+  %1271 = inttoptr i32 %1270 to ptr addrspace(3)
+  %1272 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1271)
+  %1273 = shufflevector <8 x bfloat> %1269, <8 x bfloat> %1272, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1274 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %1265
+  %1275 = add i32 %1274, %1264
+  %1276 = inttoptr i32 %1275 to ptr addrspace(3)
+  %1277 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1276)
+  %1278 = add i32 %1275, 4352
+  %1279 = inttoptr i32 %1278 to ptr addrspace(3)
+  %1280 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1279)
+  %1281 = shufflevector <8 x bfloat> %1277, <8 x bfloat> %1280, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1282 = add i32 %206, 16
+  %1283 = mul i32 %1282, 2
+  %1284 = add i32 %1266, %1283
+  %1285 = inttoptr i32 %1284 to ptr addrspace(3)
+  %1286 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1285)
+  %1287 = add i32 %1284, 4352
+  %1288 = inttoptr i32 %1287 to ptr addrspace(3)
+  %1289 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1288)
+  %1290 = shufflevector <8 x bfloat> %1286, <8 x bfloat> %1289, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1291 = add i32 %1274, %1283
+  %1292 = inttoptr i32 %1291 to ptr addrspace(3)
+  %1293 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1292)
+  %1294 = add i32 %1291, 4352
+  %1295 = inttoptr i32 %1294 to ptr addrspace(3)
+  %1296 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1295)
+  %1297 = shufflevector <8 x bfloat> %1293, <8 x bfloat> %1296, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1298 = add i32 %206, 32
+  %1299 = mul i32 %1298, 2
+  %1300 = add i32 %1266, %1299
+  %1301 = inttoptr i32 %1300 to ptr addrspace(3)
+  %1302 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1301)
+  %1303 = add i32 %1300, 4352
+  %1304 = inttoptr i32 %1303 to ptr addrspace(3)
+  %1305 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1304)
+  %1306 = shufflevector <8 x bfloat> %1302, <8 x bfloat> %1305, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1307 = add i32 %1274, %1299
+  %1308 = inttoptr i32 %1307 to ptr addrspace(3)
+  %1309 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1308)
+  %1310 = add i32 %1307, 4352
+  %1311 = inttoptr i32 %1310 to ptr addrspace(3)
+  %1312 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1311)
+  %1313 = shufflevector <8 x bfloat> %1309, <8 x bfloat> %1312, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1314 = add i32 %206, 48
+  %1315 = mul i32 %1314, 2
+  %1316 = add i32 %1266, %1315
+  %1317 = inttoptr i32 %1316 to ptr addrspace(3)
+  %1318 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1317)
+  %1319 = add i32 %1316, 4352
+  %1320 = inttoptr i32 %1319 to ptr addrspace(3)
+  %1321 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1320)
+  %1322 = shufflevector <8 x bfloat> %1318, <8 x bfloat> %1321, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1323 = add i32 %1274, %1315
+  %1324 = inttoptr i32 %1323 to ptr addrspace(3)
+  %1325 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1324)
+  %1326 = add i32 %1323, 4352
+  %1327 = inttoptr i32 %1326 to ptr addrspace(3)
+  %1328 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1327)
+  %1329 = shufflevector <8 x bfloat> %1325, <8 x bfloat> %1328, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1330 = add i32 %206, 64
+  %1331 = mul i32 %1330, 2
+  %1332 = add i32 %1266, %1331
+  %1333 = inttoptr i32 %1332 to ptr addrspace(3)
+  %1334 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1333)
+  %1335 = add i32 %1332, 4352
+  %1336 = inttoptr i32 %1335 to ptr addrspace(3)
+  %1337 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1336)
+  %1338 = shufflevector <8 x bfloat> %1334, <8 x bfloat> %1337, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1339 = add i32 %1274, %1331
+  %1340 = inttoptr i32 %1339 to ptr addrspace(3)
+  %1341 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1340)
+  %1342 = add i32 %1339, 4352
+  %1343 = inttoptr i32 %1342 to ptr addrspace(3)
+  %1344 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1343)
+  %1345 = shufflevector <8 x bfloat> %1341, <8 x bfloat> %1344, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1346 = add i32 %206, 80
+  %1347 = mul i32 %1346, 2
+  %1348 = add i32 %1266, %1347
+  %1349 = inttoptr i32 %1348 to ptr addrspace(3)
+  %1350 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1349)
+  %1351 = add i32 %1348, 4352
+  %1352 = inttoptr i32 %1351 to ptr addrspace(3)
+  %1353 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1352)
+  %1354 = shufflevector <8 x bfloat> %1350, <8 x bfloat> %1353, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1355 = add i32 %1274, %1347
+  %1356 = inttoptr i32 %1355 to ptr addrspace(3)
+  %1357 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1356)
+  %1358 = add i32 %1355, 4352
+  %1359 = inttoptr i32 %1358 to ptr addrspace(3)
+  %1360 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1359)
+  %1361 = shufflevector <8 x bfloat> %1357, <8 x bfloat> %1360, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1362 = add i32 %206, 96
+  %1363 = mul i32 %1362, 2
+  %1364 = add i32 %1266, %1363
+  %1365 = inttoptr i32 %1364 to ptr addrspace(3)
+  %1366 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1365)
+  %1367 = add i32 %1364, 4352
+  %1368 = inttoptr i32 %1367 to ptr addrspace(3)
+  %1369 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1368)
+  %1370 = shufflevector <8 x bfloat> %1366, <8 x bfloat> %1369, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1371 = add i32 %1274, %1363
+  %1372 = inttoptr i32 %1371 to ptr addrspace(3)
+  %1373 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1372)
+  %1374 = add i32 %1371, 4352
+  %1375 = inttoptr i32 %1374 to ptr addrspace(3)
+  %1376 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1375)
+  %1377 = shufflevector <8 x bfloat> %1373, <8 x bfloat> %1376, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1378 = add i32 %206, 112
+  %1379 = mul i32 %1378, 2
+  %1380 = add i32 %1266, %1379
+  %1381 = inttoptr i32 %1380 to ptr addrspace(3)
+  %1382 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1381)
+  %1383 = add i32 %1380, 4352
+  %1384 = inttoptr i32 %1383 to ptr addrspace(3)
+  %1385 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1384)
+  %1386 = shufflevector <8 x bfloat> %1382, <8 x bfloat> %1385, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1387 = add i32 %1274, %1379
+  %1388 = inttoptr i32 %1387 to ptr addrspace(3)
+  %1389 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1388)
+  %1390 = add i32 %1387, 4352
+  %1391 = inttoptr i32 %1390 to ptr addrspace(3)
+  %1392 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1391)
+  %1393 = shufflevector <8 x bfloat> %1389, <8 x bfloat> %1392, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1394 = mul i32 %196, 80
+  %1395 = add i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), %1394
+  %1396 = add i32 %1395, %1264
+  %1397 = inttoptr i32 %1396 to ptr addrspace(3)
+  %1398 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1397)
+  %1399 = add i32 %1396, 1280
+  %1400 = inttoptr i32 %1399 to ptr addrspace(3)
+  %1401 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1400)
+  %1402 = shufflevector <8 x bfloat> %1398, <8 x bfloat> %1401, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1403 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 2560), %1394
+  %1404 = add i32 %1403, %1264
+  %1405 = inttoptr i32 %1404 to ptr addrspace(3)
+  %1406 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1405)
+  %1407 = add i32 %1404, 1280
+  %1408 = inttoptr i32 %1407 to ptr addrspace(3)
+  %1409 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1408)
+  %1410 = shufflevector <8 x bfloat> %1406, <8 x bfloat> %1409, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1411 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1402, <16 x bfloat> %1273, i16 0, <8 x float> %359, i1 false, i1 false)
+  %1412 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1410, <16 x bfloat> %1281, i16 0, <8 x float> %375, i1 false, i1 false)
+  %1413 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1402, <16 x bfloat> %1290, i16 0, <8 x float> %360, i1 false, i1 false)
+  %1414 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1410, <16 x bfloat> %1297, i16 0, <8 x float> %376, i1 false, i1 false)
+  %1415 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1402, <16 x bfloat> %1306, i16 0, <8 x float> %361, i1 false, i1 false)
+  %1416 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1410, <16 x bfloat> %1313, i16 0, <8 x float> %377, i1 false, i1 false)
+  %1417 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1402, <16 x bfloat> %1322, i16 0, <8 x float> %362, i1 false, i1 false)
+  %1418 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1410, <16 x bfloat> %1329, i16 0, <8 x float> %378, i1 false, i1 false)
+  %1419 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1402, <16 x bfloat> %1338, i16 0, <8 x float> %363, i1 false, i1 false)
+  %1420 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1410, <16 x bfloat> %1345, i16 0, <8 x float> %379, i1 false, i1 false)
+  %1421 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1402, <16 x bfloat> %1354, i16 0, <8 x float> %364, i1 false, i1 false)
+  %1422 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1410, <16 x bfloat> %1361, i16 0, <8 x float> %380, i1 false, i1 false)
+  %1423 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1402, <16 x bfloat> %1370, i16 0, <8 x float> %365, i1 false, i1 false)
+  %1424 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1410, <16 x bfloat> %1377, i16 0, <8 x float> %381, i1 false, i1 false)
+  %1425 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1402, <16 x bfloat> %1386, i16 0, <8 x float> %366, i1 false, i1 false)
+  %1426 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1410, <16 x bfloat> %1393, i16 0, <8 x float> %382, i1 false, i1 false)
+  %1427 = add i32 %1264, 32
+  %1428 = add i32 %1395, %1427
+  %1429 = inttoptr i32 %1428 to ptr addrspace(3)
+  %1430 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1429)
+  %1431 = add i32 %1428, 1280
+  %1432 = inttoptr i32 %1431 to ptr addrspace(3)
+  %1433 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1432)
+  %1434 = shufflevector <8 x bfloat> %1430, <8 x bfloat> %1433, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1435 = add i32 %1403, %1427
+  %1436 = inttoptr i32 %1435 to ptr addrspace(3)
+  %1437 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1436)
+  %1438 = add i32 %1435, 1280
+  %1439 = inttoptr i32 %1438 to ptr addrspace(3)
+  %1440 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %1439)
+  %1441 = shufflevector <8 x bfloat> %1437, <8 x bfloat> %1440, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1442 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1434, <16 x bfloat> %1273, i16 0, <8 x float> %367, i1 false, i1 false)
+  %1443 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1441, <16 x bfloat> %1281, i16 0, <8 x float> %383, i1 false, i1 false)
+  %1444 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1434, <16 x bfloat> %1290, i16 0, <8 x float> %368, i1 false, i1 false)
+  %1445 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1441, <16 x bfloat> %1297, i16 0, <8 x float> %384, i1 false, i1 false)
+  %1446 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1434, <16 x bfloat> %1306, i16 0, <8 x float> %369, i1 false, i1 false)
+  %1447 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1441, <16 x bfloat> %1313, i16 0, <8 x float> %385, i1 false, i1 false)
+  %1448 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1434, <16 x bfloat> %1322, i16 0, <8 x float> %370, i1 false, i1 false)
+  %1449 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1441, <16 x bfloat> %1329, i16 0, <8 x float> %386, i1 false, i1 false)
+  %1450 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1434, <16 x bfloat> %1338, i16 0, <8 x float> %371, i1 false, i1 false)
+  %1451 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1441, <16 x bfloat> %1345, i16 0, <8 x float> %387, i1 false, i1 false)
+  %1452 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1434, <16 x bfloat> %1354, i16 0, <8 x float> %372, i1 false, i1 false)
+  %1453 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1441, <16 x bfloat> %1361, i16 0, <8 x float> %388, i1 false, i1 false)
+  %1454 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1434, <16 x bfloat> %1370, i16 0, <8 x float> %373, i1 false, i1 false)
+  %1455 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1441, <16 x bfloat> %1377, i16 0, <8 x float> %389, i1 false, i1 false)
+  %1456 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1434, <16 x bfloat> %1386, i16 0, <8 x float> %374, i1 false, i1 false)
+  %1457 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %1441, <16 x bfloat> %1393, i16 0, <8 x float> %390, i1 false, i1 false)
+  fence syncscope("workgroup") release
+  call void @llvm.amdgcn.s.barrier.signal(i32 -1)
+  call void @llvm.amdgcn.s.barrier.wait(i16 -1)
+  fence syncscope("workgroup") acquire
+  %1458 = add i64 %358, 1
+  br label %357
+
+1459:                                             ; preds = %357
+  %1460 = sub i32 %227, %245
+  %1461 = mul i32 %21, %1460
+  %1462 = add i32 %226, %245
+  %1463 = sext i32 %1461 to i64
+  br label %1464
+
+1464:                                             ; preds = %1531, %1459
+  %1465 = phi i64 [ %2451, %1531 ], [ 0, %1459 ]
+  %1466 = phi <8 x float> [ %2404, %1531 ], [ %359, %1459 ]
+  %1467 = phi <8 x float> [ %2406, %1531 ], [ %360, %1459 ]
+  %1468 = phi <8 x float> [ %2408, %1531 ], [ %361, %1459 ]
+  %1469 = phi <8 x float> [ %2410, %1531 ], [ %362, %1459 ]
+  %1470 = phi <8 x float> [ %2412, %1531 ], [ %363, %1459 ]
+  %1471 = phi <8 x float> [ %2414, %1531 ], [ %364, %1459 ]
+  %1472 = phi <8 x float> [ %2416, %1531 ], [ %365, %1459 ]
+  %1473 = phi <8 x float> [ %2418, %1531 ], [ %366, %1459 ]
+  %1474 = phi <8 x float> [ %2435, %1531 ], [ %367, %1459 ]
+  %1475 = phi <8 x float> [ %2437, %1531 ], [ %368, %1459 ]
+  %1476 = phi <8 x float> [ %2439, %1531 ], [ %369, %1459 ]
+  %1477 = phi <8 x float> [ %2441, %1531 ], [ %370, %1459 ]
+  %1478 = phi <8 x float> [ %2443, %1531 ], [ %371, %1459 ]
+  %1479 = phi <8 x float> [ %2445, %1531 ], [ %372, %1459 ]
+  %1480 = phi <8 x float> [ %2447, %1531 ], [ %373, %1459 ]
+  %1481 = phi <8 x float> [ %2449, %1531 ], [ %374, %1459 ]
+  %1482 = phi <8 x float> [ %2405, %1531 ], [ %375, %1459 ]
+  %1483 = phi <8 x float> [ %2407, %1531 ], [ %376, %1459 ]
+  %1484 = phi <8 x float> [ %2409, %1531 ], [ %377, %1459 ]
+  %1485 = phi <8 x float> [ %2411, %1531 ], [ %378, %1459 ]
+  %1486 = phi <8 x float> [ %2413, %1531 ], [ %379, %1459 ]
+  %1487 = phi <8 x float> [ %2415, %1531 ], [ %380, %1459 ]
+  %1488 = phi <8 x float> [ %2417, %1531 ], [ %381, %1459 ]
+  %1489 = phi <8 x float> [ %2419, %1531 ], [ %382, %1459 ]
+  %1490 = phi <8 x float> [ %2436, %1531 ], [ %383, %1459 ]
+  %1491 = phi <8 x float> [ %2438, %1531 ], [ %384, %1459 ]
+  %1492 = phi <8 x float> [ %2440, %1531 ], [ %385, %1459 ]
+  %1493 = phi <8 x float> [ %2442, %1531 ], [ %386, %1459 ]
+  %1494 = phi <8 x float> [ %2444, %1531 ], [ %387, %1459 ]
+  %1495 = phi <8 x float> [ %2446, %1531 ], [ %388, %1459 ]
+  %1496 = phi <8 x float> [ %2448, %1531 ], [ %389, %1459 ]
+  %1497 = phi <8 x float> [ %2450, %1531 ], [ %390, %1459 ]
+  %1498 = phi <8 x bfloat> [ %1573, %1531 ], [ %391, %1459 ]
+  %1499 = phi <8 x bfloat> [ %1577, %1531 ], [ %392, %1459 ]
+  %1500 = phi <8 x bfloat> [ %1581, %1531 ], [ %393, %1459 ]
+  %1501 = phi <8 x bfloat> [ %1585, %1531 ], [ %394, %1459 ]
+  %1502 = phi <8 x bfloat> [ %1589, %1531 ], [ %395, %1459 ]
+  %1503 = phi <8 x bfloat> [ %1593, %1531 ], [ %396, %1459 ]
+  %1504 = phi <8 x bfloat> [ %1597, %1531 ], [ %397, %1459 ]
+  %1505 = phi <8 x bfloat> [ %1601, %1531 ], [ %398, %1459 ]
+  %1506 = phi <8 x bfloat> [ %1603, %1531 ], [ %399, %1459 ]
+  %1507 = phi <8 x bfloat> [ %1605, %1531 ], [ %400, %1459 ]
+  %1508 = phi <8 x bfloat> [ %1607, %1531 ], [ %401, %1459 ]
+  %1509 = phi <8 x bfloat> [ %1609, %1531 ], [ %402, %1459 ]
+  %1510 = phi <8 x bfloat> [ %1611, %1531 ], [ %403, %1459 ]
+  %1511 = phi <8 x bfloat> [ %1613, %1531 ], [ %404, %1459 ]
+  %1512 = phi <8 x bfloat> [ %1615, %1531 ], [ %405, %1459 ]
+  %1513 = phi <8 x bfloat> [ %1617, %1531 ], [ %406, %1459 ]
+  %1514 = phi <8 x bfloat> [ %1625, %1531 ], [ %407, %1459 ]
+  %1515 = phi <8 x bfloat> [ %1629, %1531 ], [ %408, %1459 ]
+  %1516 = phi <8 x bfloat> [ %1633, %1531 ], [ %409, %1459 ]
+  %1517 = phi <8 x bfloat> [ %1637, %1531 ], [ %410, %1459 ]
+  %1518 = phi <8 x bfloat> [ %1641, %1531 ], [ %411, %1459 ]
+  %1519 = phi <8 x bfloat> [ %1645, %1531 ], [ %412, %1459 ]
+  %1520 = phi <8 x bfloat> [ %1649, %1531 ], [ %413, %1459 ]
+  %1521 = phi <8 x bfloat> [ %1653, %1531 ], [ %414, %1459 ]
+  %1522 = phi <8 x bfloat> [ %1655, %1531 ], [ %415, %1459 ]
+  %1523 = phi <8 x bfloat> [ %1657, %1531 ], [ %416, %1459 ]
+  %1524 = phi <8 x bfloat> [ %1659, %1531 ], [ %417, %1459 ]
+  %1525 = phi <8 x bfloat> [ %1661, %1531 ], [ %418, %1459 ]
+  %1526 = phi <8 x bfloat> [ %1663, %1531 ], [ %419, %1459 ]
+  %1527 = phi <8 x bfloat> [ %1665, %1531 ], [ %420, %1459 ]
+  %1528 = phi <8 x bfloat> [ %1667, %1531 ], [ %421, %1459 ]
+  %1529 = phi <8 x bfloat> [ %1669, %1531 ], [ %422, %1459 ]
+  %1530 = icmp slt i64 %1465, %1463
+  br i1 %1530, label %1531, label %2452
+
+1531:                                             ; preds = %1464
+  %1532 = trunc i64 %1465 to i32
+  %1533 = sdiv i32 %1532, %21
+  %1534 = mul i32 %1533, %21
+  %1535 = icmp ne i32 %1532, %1534
+  %1536 = icmp slt i32 %1532, 0
+  %1537 = icmp slt i32 %21, 0
+  %1538 = icmp ne i1 %1536, %1537
+  %1539 = and i1 %1535, %1538
+  %1540 = add i32 %1533, -1
+  %1541 = select i1 %1539, i32 %1540, i32 %1533
+  %1542 = add i32 %1532, 1
+  %1543 = sdiv i32 %1542, %21
+  %1544 = mul i32 %1543, %21
+  %1545 = icmp ne i32 %1542, %1544
+  %1546 = icmp slt i32 %1542, 0
+  %1547 = icmp slt i32 %21, 0
+  %1548 = icmp ne i1 %1546, %1547
+  %1549 = and i1 %1545, %1548
+  %1550 = add i32 %1543, -1
+  %1551 = select i1 %1549, i32 %1550, i32 %1543
+  %1552 = add i32 %1462, %1541
+  %1553 = mul i32 %1541, %21
+  %1554 = sub i32 %1532, %1553
+  %1555 = add i32 %1462, %1551
+  %1556 = mul i32 %1551, %21
+  %1557 = sub i32 %1542, %1556
+  %1558 = add i32 %246, %1554
+  %1559 = mul i32 %38, %19
+  %1560 = add i32 %1559, %1558
+  %1561 = mul i32 %1560, %17
+  %1562 = mul i32 %1552, 32
+  %1563 = add i32 %246, %1557
+  %1564 = mul i32 %1563, 16
+  %1565 = add i32 %248, %1564
+  %1566 = mul i32 %1555, 32
+  %1567 = add i32 %1566, %39
+  %1568 = mul i32 %1567, %69
+  %1569 = add i32 %1565, %1568
+  %1570 = add i32 %1569, %47
+  %1571 = mul i32 %1570, 16
+  %1572 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %1571, i32 0, i32 0)
+  %1573 = bitcast i128 %1572 to <8 x bfloat>
+  %1574 = add i32 %1570, 2
+  %1575 = mul i32 %1574, 16
+  %1576 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %1575, i32 0, i32 0)
+  %1577 = bitcast i128 %1576 to <8 x bfloat>
+  %1578 = add i32 %1570, 4
+  %1579 = mul i32 %1578, 16
+  %1580 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %1579, i32 0, i32 0)
+  %1581 = bitcast i128 %1580 to <8 x bfloat>
+  %1582 = add i32 %1570, 6
+  %1583 = mul i32 %1582, 16
+  %1584 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %1583, i32 0, i32 0)
+  %1585 = bitcast i128 %1584 to <8 x bfloat>
+  %1586 = add i32 %1570, 8
+  %1587 = mul i32 %1586, 16
+  %1588 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %1587, i32 0, i32 0)
+  %1589 = bitcast i128 %1588 to <8 x bfloat>
+  %1590 = add i32 %1570, 10
+  %1591 = mul i32 %1590, 16
+  %1592 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %1591, i32 0, i32 0)
+  %1593 = bitcast i128 %1592 to <8 x bfloat>
+  %1594 = add i32 %1570, 12
+  %1595 = mul i32 %1594, 16
+  %1596 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %1595, i32 0, i32 0)
+  %1597 = bitcast i128 %1596 to <8 x bfloat>
+  %1598 = add i32 %1570, 14
+  %1599 = mul i32 %1598, 16
+  %1600 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %1599, i32 0, i32 0)
+  %1601 = bitcast i128 %1600 to <8 x bfloat>
+  %1602 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %1571, i32 0, i32 0)
+  %1603 = bitcast i128 %1602 to <8 x bfloat>
+  %1604 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %1575, i32 0, i32 0)
+  %1605 = bitcast i128 %1604 to <8 x bfloat>
+  %1606 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %1579, i32 0, i32 0)
+  %1607 = bitcast i128 %1606 to <8 x bfloat>
+  %1608 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %1583, i32 0, i32 0)
+  %1609 = bitcast i128 %1608 to <8 x bfloat>
+  %1610 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %1587, i32 0, i32 0)
+  %1611 = bitcast i128 %1610 to <8 x bfloat>
+  %1612 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %1591, i32 0, i32 0)
+  %1613 = bitcast i128 %1612 to <8 x bfloat>
+  %1614 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %1595, i32 0, i32 0)
+  %1615 = bitcast i128 %1614 to <8 x bfloat>
+  %1616 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %1599, i32 0, i32 0)
+  %1617 = bitcast i128 %1616 to <8 x bfloat>
+  %1618 = add i32 %1566, 16
+  %1619 = add i32 %1618, %39
+  %1620 = mul i32 %1619, %69
+  %1621 = add i32 %1565, %1620
+  %1622 = add i32 %1621, %47
+  %1623 = mul i32 %1622, 16
+  %1624 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %1623, i32 0, i32 0)
+  %1625 = bitcast i128 %1624 to <8 x bfloat>
+  %1626 = add i32 %1622, 2
+  %1627 = mul i32 %1626, 16
+  %1628 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %1627, i32 0, i32 0)
+  %1629 = bitcast i128 %1628 to <8 x bfloat>
+  %1630 = add i32 %1622, 4
+  %1631 = mul i32 %1630, 16
+  %1632 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %1631, i32 0, i32 0)
+  %1633 = bitcast i128 %1632 to <8 x bfloat>
+  %1634 = add i32 %1622, 6
+  %1635 = mul i32 %1634, 16
+  %1636 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %1635, i32 0, i32 0)
+  %1637 = bitcast i128 %1636 to <8 x bfloat>
+  %1638 = add i32 %1622, 8
+  %1639 = mul i32 %1638, 16
+  %1640 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %1639, i32 0, i32 0)
+  %1641 = bitcast i128 %1640 to <8 x bfloat>
+  %1642 = add i32 %1622, 10
+  %1643 = mul i32 %1642, 16
+  %1644 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %1643, i32 0, i32 0)
+  %1645 = bitcast i128 %1644 to <8 x bfloat>
+  %1646 = add i32 %1622, 12
+  %1647 = mul i32 %1646, 16
+  %1648 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %1647, i32 0, i32 0)
+  %1649 = bitcast i128 %1648 to <8 x bfloat>
+  %1650 = add i32 %1622, 14
+  %1651 = mul i32 %1650, 16
+  %1652 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %59, i32 %1651, i32 0, i32 0)
+  %1653 = bitcast i128 %1652 to <8 x bfloat>
+  %1654 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %1623, i32 0, i32 0)
+  %1655 = bitcast i128 %1654 to <8 x bfloat>
+  %1656 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %1627, i32 0, i32 0)
+  %1657 = bitcast i128 %1656 to <8 x bfloat>
+  %1658 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %1631, i32 0, i32 0)
+  %1659 = bitcast i128 %1658 to <8 x bfloat>
+  %1660 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %1635, i32 0, i32 0)
+  %1661 = bitcast i128 %1660 to <8 x bfloat>
+  %1662 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %1639, i32 0, i32 0)
+  %1663 = bitcast i128 %1662 to <8 x bfloat>
+  %1664 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %1643, i32 0, i32 0)
+  %1665 = bitcast i128 %1664 to <8 x bfloat>
+  %1666 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %1647, i32 0, i32 0)
+  %1667 = bitcast i128 %1666 to <8 x bfloat>
+  %1668 = call i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) %63, i32 %1651, i32 0, i32 0)
+  %1669 = bitcast i128 %1668 to <8 x bfloat>
+  %1670 = mul i32 %39, 272
+  %1671 = mul i32 %47, 16
+  %1672 = add i32 %1670, %1671
+  %1673 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %1672
+  %1674 = inttoptr i32 %1673 to ptr addrspace(3)
+  store <8 x bfloat> %1506, ptr addrspace(3) %1674, align 16
+  %1675 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %1672
+  %1676 = inttoptr i32 %1675 to ptr addrspace(3)
+  store <8 x bfloat> %1498, ptr addrspace(3) %1676, align 16
+  %1677 = add i32 %1672, 32
+  %1678 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %1677
+  %1679 = inttoptr i32 %1678 to ptr addrspace(3)
+  store <8 x bfloat> %1507, ptr addrspace(3) %1679, align 16
+  %1680 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %1677
+  %1681 = inttoptr i32 %1680 to ptr addrspace(3)
+  store <8 x bfloat> %1499, ptr addrspace(3) %1681, align 16
+  %1682 = add i32 %1672, 64
+  %1683 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %1682
+  %1684 = inttoptr i32 %1683 to ptr addrspace(3)
+  store <8 x bfloat> %1508, ptr addrspace(3) %1684, align 16
+  %1685 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %1682
+  %1686 = inttoptr i32 %1685 to ptr addrspace(3)
+  store <8 x bfloat> %1500, ptr addrspace(3) %1686, align 16
+  %1687 = add i32 %1672, 96
+  %1688 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %1687
+  %1689 = inttoptr i32 %1688 to ptr addrspace(3)
+  store <8 x bfloat> %1509, ptr addrspace(3) %1689, align 16
+  %1690 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %1687
+  %1691 = inttoptr i32 %1690 to ptr addrspace(3)
+  store <8 x bfloat> %1501, ptr addrspace(3) %1691, align 16
+  %1692 = add i32 %1672, 128
+  %1693 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %1692
+  %1694 = inttoptr i32 %1693 to ptr addrspace(3)
+  store <8 x bfloat> %1510, ptr addrspace(3) %1694, align 16
+  %1695 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %1692
+  %1696 = inttoptr i32 %1695 to ptr addrspace(3)
+  store <8 x bfloat> %1502, ptr addrspace(3) %1696, align 16
+  %1697 = add i32 %1672, 160
+  %1698 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %1697
+  %1699 = inttoptr i32 %1698 to ptr addrspace(3)
+  store <8 x bfloat> %1511, ptr addrspace(3) %1699, align 16
+  %1700 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %1697
+  %1701 = inttoptr i32 %1700 to ptr addrspace(3)
+  store <8 x bfloat> %1503, ptr addrspace(3) %1701, align 16
+  %1702 = add i32 %1672, 192
+  %1703 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %1702
+  %1704 = inttoptr i32 %1703 to ptr addrspace(3)
+  store <8 x bfloat> %1512, ptr addrspace(3) %1704, align 16
+  %1705 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %1702
+  %1706 = inttoptr i32 %1705 to ptr addrspace(3)
+  store <8 x bfloat> %1504, ptr addrspace(3) %1706, align 16
+  %1707 = add i32 %1672, 224
+  %1708 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %1707
+  %1709 = inttoptr i32 %1708 to ptr addrspace(3)
+  store <8 x bfloat> %1513, ptr addrspace(3) %1709, align 16
+  %1710 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %1707
+  %1711 = inttoptr i32 %1710 to ptr addrspace(3)
+  store <8 x bfloat> %1505, ptr addrspace(3) %1711, align 16
+  %1712 = shufflevector <8 x bfloat> %1498, <8 x bfloat> %1499, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1713 = shufflevector <8 x bfloat> %1500, <8 x bfloat> %1501, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1714 = shufflevector <8 x bfloat> %1502, <8 x bfloat> %1503, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1715 = shufflevector <8 x bfloat> %1504, <8 x bfloat> %1505, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1716 = shufflevector <8 x bfloat> %1506, <8 x bfloat> %1507, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1717 = shufflevector <8 x bfloat> %1508, <8 x bfloat> %1509, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1718 = shufflevector <8 x bfloat> %1510, <8 x bfloat> %1511, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1719 = shufflevector <8 x bfloat> %1512, <8 x bfloat> %1513, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %1720 = add i32 %1562, %39
+  %1721 = add i32 %1561, %1720
+  %1722 = mul i32 %1721, 4
+  %1723 = call i32 @llvm.amdgcn.raw.ptr.buffer.load.i32(ptr addrspace(8) %65, i32 %1722, i32 0, i32 0)
+  %1724 = bitcast i32 %1723 to float
+  %1725 = call i32 @llvm.amdgcn.raw.ptr.buffer.load.i32(ptr addrspace(8) %66, i32 %1722, i32 0, i32 0)
+  %1726 = bitcast i32 %1725 to float
+  %1727 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %86, <16 x bfloat> %1712, i16 0, <8 x float> zeroinitializer, i1 false, i1 false)
+  %1728 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %158, <16 x bfloat> %1716, i16 0, <8 x float> zeroinitializer, i1 false, i1 false)
+  %1729 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %95, <16 x bfloat> %1713, i16 0, <8 x float> %1727, i1 false, i1 false)
+  %1730 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %163, <16 x bfloat> %1717, i16 0, <8 x float> %1728, i1 false, i1 false)
+  %1731 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %104, <16 x bfloat> %1714, i16 0, <8 x float> %1729, i1 false, i1 false)
+  %1732 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %168, <16 x bfloat> %1718, i16 0, <8 x float> %1730, i1 false, i1 false)
+  %1733 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %113, <16 x bfloat> %1715, i16 0, <8 x float> %1731, i1 false, i1 false)
+  %1734 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %173, <16 x bfloat> %1719, i16 0, <8 x float> %1732, i1 false, i1 false)
+  %1735 = extractelement <8 x float> %1733, i64 0
+  %1736 = fmul float %1735, %16
+  %1737 = extractelement <8 x float> %1733, i64 1
+  %1738 = fmul float %1737, %16
+  %1739 = extractelement <8 x float> %1733, i64 2
+  %1740 = fmul float %1739, %16
+  %1741 = extractelement <8 x float> %1733, i64 3
+  %1742 = fmul float %1741, %16
+  %1743 = extractelement <8 x float> %1733, i64 4
+  %1744 = fmul float %1743, %16
+  %1745 = extractelement <8 x float> %1733, i64 5
+  %1746 = fmul float %1745, %16
+  %1747 = extractelement <8 x float> %1733, i64 6
+  %1748 = fmul float %1747, %16
+  %1749 = extractelement <8 x float> %1733, i64 7
+  %1750 = fmul float %1749, %16
+  %1751 = fsub float %1736, %1724
+  %1752 = fmul float %1751, f0x3FB8AA3B
+  %1753 = call float @llvm.amdgcn.exp2.f32(float %1752)
+  %1754 = fsub float %1738, %1724
+  %1755 = fmul float %1754, f0x3FB8AA3B
+  %1756 = call float @llvm.amdgcn.exp2.f32(float %1755)
+  %1757 = fsub float %1740, %1724
+  %1758 = fmul float %1757, f0x3FB8AA3B
+  %1759 = call float @llvm.amdgcn.exp2.f32(float %1758)
+  %1760 = fsub float %1742, %1724
+  %1761 = fmul float %1760, f0x3FB8AA3B
+  %1762 = call float @llvm.amdgcn.exp2.f32(float %1761)
+  %1763 = fsub float %1744, %1724
+  %1764 = fmul float %1763, f0x3FB8AA3B
+  %1765 = call float @llvm.amdgcn.exp2.f32(float %1764)
+  %1766 = fsub float %1746, %1724
+  %1767 = fmul float %1766, f0x3FB8AA3B
+  %1768 = call float @llvm.amdgcn.exp2.f32(float %1767)
+  %1769 = fsub float %1748, %1724
+  %1770 = fmul float %1769, f0x3FB8AA3B
+  %1771 = call float @llvm.amdgcn.exp2.f32(float %1770)
+  %1772 = fsub float %1750, %1724
+  %1773 = fmul float %1772, f0x3FB8AA3B
+  %1774 = call float @llvm.amdgcn.exp2.f32(float %1773)
+  %1775 = fptrunc float %1753 to bfloat
+  %1776 = fptrunc float %1756 to bfloat
+  %1777 = fptrunc float %1759 to bfloat
+  %1778 = fptrunc float %1762 to bfloat
+  %1779 = fptrunc float %1765 to bfloat
+  %1780 = fptrunc float %1768 to bfloat
+  %1781 = fptrunc float %1771 to bfloat
+  %1782 = fptrunc float %1774 to bfloat
+  %1783 = extractelement <8 x float> %1734, i64 0
+  %1784 = fsub float %1783, %1726
+  %1785 = fmul float %1753, %1784
+  %1786 = fmul float %1785, %16
+  %1787 = fptrunc float %1786 to bfloat
+  %1788 = extractelement <8 x float> %1734, i64 1
+  %1789 = fsub float %1788, %1726
+  %1790 = fmul float %1756, %1789
+  %1791 = fmul float %1790, %16
+  %1792 = fptrunc float %1791 to bfloat
+  %1793 = extractelement <8 x float> %1734, i64 2
+  %1794 = fsub float %1793, %1726
+  %1795 = fmul float %1759, %1794
+  %1796 = fmul float %1795, %16
+  %1797 = fptrunc float %1796 to bfloat
+  %1798 = extractelement <8 x float> %1734, i64 3
+  %1799 = fsub float %1798, %1726
+  %1800 = fmul float %1762, %1799
+  %1801 = fmul float %1800, %16
+  %1802 = fptrunc float %1801 to bfloat
+  %1803 = extractelement <8 x float> %1734, i64 4
+  %1804 = fsub float %1803, %1726
+  %1805 = fmul float %1765, %1804
+  %1806 = fmul float %1805, %16
+  %1807 = fptrunc float %1806 to bfloat
+  %1808 = extractelement <8 x float> %1734, i64 5
+  %1809 = fsub float %1808, %1726
+  %1810 = fmul float %1768, %1809
+  %1811 = fmul float %1810, %16
+  %1812 = fptrunc float %1811 to bfloat
+  %1813 = extractelement <8 x float> %1734, i64 6
+  %1814 = fsub float %1813, %1726
+  %1815 = fmul float %1771, %1814
+  %1816 = fmul float %1815, %16
+  %1817 = fptrunc float %1816 to bfloat
+  %1818 = extractelement <8 x float> %1734, i64 7
+  %1819 = fsub float %1818, %1726
+  %1820 = fmul float %1774, %1819
+  %1821 = fmul float %1820, %16
+  %1822 = fptrunc float %1821 to bfloat
+  %1823 = mul i32 %39, 80
+  %1824 = add i32 %1823, %1671
+  %1825 = insertelement <8 x bfloat> poison, bfloat %1775, i64 0
+  %1826 = insertelement <8 x bfloat> %1825, bfloat %1776, i64 1
+  %1827 = insertelement <8 x bfloat> %1826, bfloat %1777, i64 2
+  %1828 = insertelement <8 x bfloat> %1827, bfloat %1778, i64 3
+  %1829 = insertelement <8 x bfloat> %1828, bfloat %1779, i64 4
+  %1830 = insertelement <8 x bfloat> %1829, bfloat %1780, i64 5
+  %1831 = insertelement <8 x bfloat> %1830, bfloat %1781, i64 6
+  %1832 = insertelement <8 x bfloat> %1831, bfloat %1782, i64 7
+  %1833 = add i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), %1824
+  %1834 = inttoptr i32 %1833 to ptr addrspace(3)
+  store <8 x bfloat> %1832, ptr addrspace(3) %1834, align 16
+  %1835 = insertelement <8 x bfloat> poison, bfloat %1787, i64 0
+  %1836 = insertelement <8 x bfloat> %1835, bfloat %1792, i64 1
+  %1837 = insertelement <8 x bfloat> %1836, bfloat %1797, i64 2
+  %1838 = insertelement <8 x bfloat> %1837, bfloat %1802, i64 3
+  %1839 = insertelement <8 x bfloat> %1838, bfloat %1807, i64 4
+  %1840 = insertelement <8 x bfloat> %1839, bfloat %1812, i64 5
+  %1841 = insertelement <8 x bfloat> %1840, bfloat %1817, i64 6
+  %1842 = insertelement <8 x bfloat> %1841, bfloat %1822, i64 7
+  %1843 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 2560), %1824
+  %1844 = inttoptr i32 %1843 to ptr addrspace(3)
+  store <8 x bfloat> %1842, ptr addrspace(3) %1844, align 16
+  %1845 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %126, <16 x bfloat> %1712, i16 0, <8 x float> zeroinitializer, i1 false, i1 false)
+  %1846 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %178, <16 x bfloat> %1716, i16 0, <8 x float> zeroinitializer, i1 false, i1 false)
+  %1847 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %135, <16 x bfloat> %1713, i16 0, <8 x float> %1845, i1 false, i1 false)
+  %1848 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %183, <16 x bfloat> %1717, i16 0, <8 x float> %1846, i1 false, i1 false)
+  %1849 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %144, <16 x bfloat> %1714, i16 0, <8 x float> %1847, i1 false, i1 false)
+  %1850 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %188, <16 x bfloat> %1718, i16 0, <8 x float> %1848, i1 false, i1 false)
+  %1851 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %153, <16 x bfloat> %1715, i16 0, <8 x float> %1849, i1 false, i1 false)
+  %1852 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %193, <16 x bfloat> %1719, i16 0, <8 x float> %1850, i1 false, i1 false)
+  %1853 = extractelement <8 x float> %1851, i64 0
+  %1854 = fmul float %1853, %16
+  %1855 = extractelement <8 x float> %1851, i64 1
+  %1856 = fmul float %1855, %16
+  %1857 = extractelement <8 x float> %1851, i64 2
+  %1858 = fmul float %1857, %16
+  %1859 = extractelement <8 x float> %1851, i64 3
+  %1860 = fmul float %1859, %16
+  %1861 = extractelement <8 x float> %1851, i64 4
+  %1862 = fmul float %1861, %16
+  %1863 = extractelement <8 x float> %1851, i64 5
+  %1864 = fmul float %1863, %16
+  %1865 = extractelement <8 x float> %1851, i64 6
+  %1866 = fmul float %1865, %16
+  %1867 = extractelement <8 x float> %1851, i64 7
+  %1868 = fmul float %1867, %16
+  %1869 = fsub float %1854, %1724
+  %1870 = fmul float %1869, f0x3FB8AA3B
+  %1871 = call float @llvm.amdgcn.exp2.f32(float %1870)
+  %1872 = fsub float %1856, %1724
+  %1873 = fmul float %1872, f0x3FB8AA3B
+  %1874 = call float @llvm.amdgcn.exp2.f32(float %1873)
+  %1875 = fsub float %1858, %1724
+  %1876 = fmul float %1875, f0x3FB8AA3B
+  %1877 = call float @llvm.amdgcn.exp2.f32(float %1876)
+  %1878 = fsub float %1860, %1724
+  %1879 = fmul float %1878, f0x3FB8AA3B
+  %1880 = call float @llvm.amdgcn.exp2.f32(float %1879)
+  %1881 = fsub float %1862, %1724
+  %1882 = fmul float %1881, f0x3FB8AA3B
+  %1883 = call float @llvm.amdgcn.exp2.f32(float %1882)
+  %1884 = fsub float %1864, %1724
+  %1885 = fmul float %1884, f0x3FB8AA3B
+  %1886 = call float @llvm.amdgcn.exp2.f32(float %1885)
+  %1887 = fsub float %1866, %1724
+  %1888 = fmul float %1887, f0x3FB8AA3B
+  %1889 = call float @llvm.amdgcn.exp2.f32(float %1888)
+  %1890 = fsub float %1868, %1724
+  %1891 = fmul float %1890, f0x3FB8AA3B
+  %1892 = call float @llvm.amdgcn.exp2.f32(float %1891)
+  %1893 = fptrunc float %1871 to bfloat
+  %1894 = fptrunc float %1874 to bfloat
+  %1895 = fptrunc float %1877 to bfloat
+  %1896 = fptrunc float %1880 to bfloat
+  %1897 = fptrunc float %1883 to bfloat
+  %1898 = fptrunc float %1886 to bfloat
+  %1899 = fptrunc float %1889 to bfloat
+  %1900 = fptrunc float %1892 to bfloat
+  %1901 = extractelement <8 x float> %1852, i64 0
+  %1902 = fsub float %1901, %1726
+  %1903 = fmul float %1871, %1902
+  %1904 = fmul float %1903, %16
+  %1905 = fptrunc float %1904 to bfloat
+  %1906 = extractelement <8 x float> %1852, i64 1
+  %1907 = fsub float %1906, %1726
+  %1908 = fmul float %1874, %1907
+  %1909 = fmul float %1908, %16
+  %1910 = fptrunc float %1909 to bfloat
+  %1911 = extractelement <8 x float> %1852, i64 2
+  %1912 = fsub float %1911, %1726
+  %1913 = fmul float %1877, %1912
+  %1914 = fmul float %1913, %16
+  %1915 = fptrunc float %1914 to bfloat
+  %1916 = extractelement <8 x float> %1852, i64 3
+  %1917 = fsub float %1916, %1726
+  %1918 = fmul float %1880, %1917
+  %1919 = fmul float %1918, %16
+  %1920 = fptrunc float %1919 to bfloat
+  %1921 = extractelement <8 x float> %1852, i64 4
+  %1922 = fsub float %1921, %1726
+  %1923 = fmul float %1883, %1922
+  %1924 = fmul float %1923, %16
+  %1925 = fptrunc float %1924 to bfloat
+  %1926 = extractelement <8 x float> %1852, i64 5
+  %1927 = fsub float %1926, %1726
+  %1928 = fmul float %1886, %1927
+  %1929 = fmul float %1928, %16
+  %1930 = fptrunc float %1929 to bfloat
+  %1931 = extractelement <8 x float> %1852, i64 6
+  %1932 = fsub float %1931, %1726
+  %1933 = fmul float %1889, %1932
+  %1934 = fmul float %1933, %16
+  %1935 = fptrunc float %1934 to bfloat
+  %1936 = extractelement <8 x float> %1852, i64 7
+  %1937 = fsub float %1936, %1726
+  %1938 = fmul float %1892, %1937
+  %1939 = fmul float %1938, %16
+  %1940 = fptrunc float %1939 to bfloat
+  %1941 = add i32 %1823, 32
+  %1942 = add i32 %1941, %1671
+  %1943 = insertelement <8 x bfloat> poison, bfloat %1893, i64 0
+  %1944 = insertelement <8 x bfloat> %1943, bfloat %1894, i64 1
+  %1945 = insertelement <8 x bfloat> %1944, bfloat %1895, i64 2
+  %1946 = insertelement <8 x bfloat> %1945, bfloat %1896, i64 3
+  %1947 = insertelement <8 x bfloat> %1946, bfloat %1897, i64 4
+  %1948 = insertelement <8 x bfloat> %1947, bfloat %1898, i64 5
+  %1949 = insertelement <8 x bfloat> %1948, bfloat %1899, i64 6
+  %1950 = insertelement <8 x bfloat> %1949, bfloat %1900, i64 7
+  %1951 = add i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), %1942
+  %1952 = inttoptr i32 %1951 to ptr addrspace(3)
+  store <8 x bfloat> %1950, ptr addrspace(3) %1952, align 16
+  %1953 = insertelement <8 x bfloat> poison, bfloat %1905, i64 0
+  %1954 = insertelement <8 x bfloat> %1953, bfloat %1910, i64 1
+  %1955 = insertelement <8 x bfloat> %1954, bfloat %1915, i64 2
+  %1956 = insertelement <8 x bfloat> %1955, bfloat %1920, i64 3
+  %1957 = insertelement <8 x bfloat> %1956, bfloat %1925, i64 4
+  %1958 = insertelement <8 x bfloat> %1957, bfloat %1930, i64 5
+  %1959 = insertelement <8 x bfloat> %1958, bfloat %1935, i64 6
+  %1960 = insertelement <8 x bfloat> %1959, bfloat %1940, i64 7
+  %1961 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 2560), %1942
+  %1962 = inttoptr i32 %1961 to ptr addrspace(3)
+  store <8 x bfloat> %1960, ptr addrspace(3) %1962, align 16
+  %1963 = add i32 %1562, 16
+  %1964 = add i32 %39, 16
+  %1965 = mul i32 %1964, 272
+  %1966 = add i32 %1965, %1671
+  %1967 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %1966
+  %1968 = inttoptr i32 %1967 to ptr addrspace(3)
+  store <8 x bfloat> %1522, ptr addrspace(3) %1968, align 16
+  %1969 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %1966
+  %1970 = inttoptr i32 %1969 to ptr addrspace(3)
+  store <8 x bfloat> %1514, ptr addrspace(3) %1970, align 16
+  %1971 = add i32 %1966, 32
+  %1972 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %1971
+  %1973 = inttoptr i32 %1972 to ptr addrspace(3)
+  store <8 x bfloat> %1523, ptr addrspace(3) %1973, align 16
+  %1974 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %1971
+  %1975 = inttoptr i32 %1974 to ptr addrspace(3)
+  store <8 x bfloat> %1515, ptr addrspace(3) %1975, align 16
+  %1976 = add i32 %1966, 64
+  %1977 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %1976
+  %1978 = inttoptr i32 %1977 to ptr addrspace(3)
+  store <8 x bfloat> %1524, ptr addrspace(3) %1978, align 16
+  %1979 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %1976
+  %1980 = inttoptr i32 %1979 to ptr addrspace(3)
+  store <8 x bfloat> %1516, ptr addrspace(3) %1980, align 16
+  %1981 = add i32 %1966, 96
+  %1982 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %1981
+  %1983 = inttoptr i32 %1982 to ptr addrspace(3)
+  store <8 x bfloat> %1525, ptr addrspace(3) %1983, align 16
+  %1984 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %1981
+  %1985 = inttoptr i32 %1984 to ptr addrspace(3)
+  store <8 x bfloat> %1517, ptr addrspace(3) %1985, align 16
+  %1986 = add i32 %1966, 128
+  %1987 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %1986
+  %1988 = inttoptr i32 %1987 to ptr addrspace(3)
+  store <8 x bfloat> %1526, ptr addrspace(3) %1988, align 16
+  %1989 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %1986
+  %1990 = inttoptr i32 %1989 to ptr addrspace(3)
+  store <8 x bfloat> %1518, ptr addrspace(3) %1990, align 16
+  %1991 = add i32 %1966, 160
+  %1992 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %1991
+  %1993 = inttoptr i32 %1992 to ptr addrspace(3)
+  store <8 x bfloat> %1527, ptr addrspace(3) %1993, align 16
+  %1994 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %1991
+  %1995 = inttoptr i32 %1994 to ptr addrspace(3)
+  store <8 x bfloat> %1519, ptr addrspace(3) %1995, align 16
+  %1996 = add i32 %1966, 192
+  %1997 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %1996
+  %1998 = inttoptr i32 %1997 to ptr addrspace(3)
+  store <8 x bfloat> %1528, ptr addrspace(3) %1998, align 16
+  %1999 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %1996
+  %2000 = inttoptr i32 %1999 to ptr addrspace(3)
+  store <8 x bfloat> %1520, ptr addrspace(3) %2000, align 16
+  %2001 = add i32 %1966, 224
+  %2002 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %2001
+  %2003 = inttoptr i32 %2002 to ptr addrspace(3)
+  store <8 x bfloat> %1529, ptr addrspace(3) %2003, align 16
+  %2004 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %2001
+  %2005 = inttoptr i32 %2004 to ptr addrspace(3)
+  store <8 x bfloat> %1521, ptr addrspace(3) %2005, align 16
+  %2006 = shufflevector <8 x bfloat> %1514, <8 x bfloat> %1515, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2007 = shufflevector <8 x bfloat> %1516, <8 x bfloat> %1517, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2008 = shufflevector <8 x bfloat> %1518, <8 x bfloat> %1519, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2009 = shufflevector <8 x bfloat> %1520, <8 x bfloat> %1521, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2010 = shufflevector <8 x bfloat> %1522, <8 x bfloat> %1523, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2011 = shufflevector <8 x bfloat> %1524, <8 x bfloat> %1525, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2012 = shufflevector <8 x bfloat> %1526, <8 x bfloat> %1527, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2013 = shufflevector <8 x bfloat> %1528, <8 x bfloat> %1529, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2014 = add i32 %1963, %39
+  %2015 = add i32 %1561, %2014
+  %2016 = mul i32 %2015, 4
+  %2017 = call i32 @llvm.amdgcn.raw.ptr.buffer.load.i32(ptr addrspace(8) %65, i32 %2016, i32 0, i32 0)
+  %2018 = bitcast i32 %2017 to float
+  %2019 = call i32 @llvm.amdgcn.raw.ptr.buffer.load.i32(ptr addrspace(8) %66, i32 %2016, i32 0, i32 0)
+  %2020 = bitcast i32 %2019 to float
+  %2021 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %86, <16 x bfloat> %2006, i16 0, <8 x float> zeroinitializer, i1 false, i1 false)
+  %2022 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %158, <16 x bfloat> %2010, i16 0, <8 x float> zeroinitializer, i1 false, i1 false)
+  %2023 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %95, <16 x bfloat> %2007, i16 0, <8 x float> %2021, i1 false, i1 false)
+  %2024 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %163, <16 x bfloat> %2011, i16 0, <8 x float> %2022, i1 false, i1 false)
+  %2025 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %104, <16 x bfloat> %2008, i16 0, <8 x float> %2023, i1 false, i1 false)
+  %2026 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %168, <16 x bfloat> %2012, i16 0, <8 x float> %2024, i1 false, i1 false)
+  %2027 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %113, <16 x bfloat> %2009, i16 0, <8 x float> %2025, i1 false, i1 false)
+  %2028 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %173, <16 x bfloat> %2013, i16 0, <8 x float> %2026, i1 false, i1 false)
+  %2029 = extractelement <8 x float> %2027, i64 0
+  %2030 = fmul float %2029, %16
+  %2031 = extractelement <8 x float> %2027, i64 1
+  %2032 = fmul float %2031, %16
+  %2033 = extractelement <8 x float> %2027, i64 2
+  %2034 = fmul float %2033, %16
+  %2035 = extractelement <8 x float> %2027, i64 3
+  %2036 = fmul float %2035, %16
+  %2037 = extractelement <8 x float> %2027, i64 4
+  %2038 = fmul float %2037, %16
+  %2039 = extractelement <8 x float> %2027, i64 5
+  %2040 = fmul float %2039, %16
+  %2041 = extractelement <8 x float> %2027, i64 6
+  %2042 = fmul float %2041, %16
+  %2043 = extractelement <8 x float> %2027, i64 7
+  %2044 = fmul float %2043, %16
+  %2045 = fsub float %2030, %2018
+  %2046 = fmul float %2045, f0x3FB8AA3B
+  %2047 = call float @llvm.amdgcn.exp2.f32(float %2046)
+  %2048 = fsub float %2032, %2018
+  %2049 = fmul float %2048, f0x3FB8AA3B
+  %2050 = call float @llvm.amdgcn.exp2.f32(float %2049)
+  %2051 = fsub float %2034, %2018
+  %2052 = fmul float %2051, f0x3FB8AA3B
+  %2053 = call float @llvm.amdgcn.exp2.f32(float %2052)
+  %2054 = fsub float %2036, %2018
+  %2055 = fmul float %2054, f0x3FB8AA3B
+  %2056 = call float @llvm.amdgcn.exp2.f32(float %2055)
+  %2057 = fsub float %2038, %2018
+  %2058 = fmul float %2057, f0x3FB8AA3B
+  %2059 = call float @llvm.amdgcn.exp2.f32(float %2058)
+  %2060 = fsub float %2040, %2018
+  %2061 = fmul float %2060, f0x3FB8AA3B
+  %2062 = call float @llvm.amdgcn.exp2.f32(float %2061)
+  %2063 = fsub float %2042, %2018
+  %2064 = fmul float %2063, f0x3FB8AA3B
+  %2065 = call float @llvm.amdgcn.exp2.f32(float %2064)
+  %2066 = fsub float %2044, %2018
+  %2067 = fmul float %2066, f0x3FB8AA3B
+  %2068 = call float @llvm.amdgcn.exp2.f32(float %2067)
+  %2069 = fptrunc float %2047 to bfloat
+  %2070 = fptrunc float %2050 to bfloat
+  %2071 = fptrunc float %2053 to bfloat
+  %2072 = fptrunc float %2056 to bfloat
+  %2073 = fptrunc float %2059 to bfloat
+  %2074 = fptrunc float %2062 to bfloat
+  %2075 = fptrunc float %2065 to bfloat
+  %2076 = fptrunc float %2068 to bfloat
+  %2077 = extractelement <8 x float> %2028, i64 0
+  %2078 = fsub float %2077, %2020
+  %2079 = fmul float %2047, %2078
+  %2080 = fmul float %2079, %16
+  %2081 = fptrunc float %2080 to bfloat
+  %2082 = extractelement <8 x float> %2028, i64 1
+  %2083 = fsub float %2082, %2020
+  %2084 = fmul float %2050, %2083
+  %2085 = fmul float %2084, %16
+  %2086 = fptrunc float %2085 to bfloat
+  %2087 = extractelement <8 x float> %2028, i64 2
+  %2088 = fsub float %2087, %2020
+  %2089 = fmul float %2053, %2088
+  %2090 = fmul float %2089, %16
+  %2091 = fptrunc float %2090 to bfloat
+  %2092 = extractelement <8 x float> %2028, i64 3
+  %2093 = fsub float %2092, %2020
+  %2094 = fmul float %2056, %2093
+  %2095 = fmul float %2094, %16
+  %2096 = fptrunc float %2095 to bfloat
+  %2097 = extractelement <8 x float> %2028, i64 4
+  %2098 = fsub float %2097, %2020
+  %2099 = fmul float %2059, %2098
+  %2100 = fmul float %2099, %16
+  %2101 = fptrunc float %2100 to bfloat
+  %2102 = extractelement <8 x float> %2028, i64 5
+  %2103 = fsub float %2102, %2020
+  %2104 = fmul float %2062, %2103
+  %2105 = fmul float %2104, %16
+  %2106 = fptrunc float %2105 to bfloat
+  %2107 = extractelement <8 x float> %2028, i64 6
+  %2108 = fsub float %2107, %2020
+  %2109 = fmul float %2065, %2108
+  %2110 = fmul float %2109, %16
+  %2111 = fptrunc float %2110 to bfloat
+  %2112 = extractelement <8 x float> %2028, i64 7
+  %2113 = fsub float %2112, %2020
+  %2114 = fmul float %2068, %2113
+  %2115 = fmul float %2114, %16
+  %2116 = fptrunc float %2115 to bfloat
+  %2117 = mul i32 %1964, 80
+  %2118 = add i32 %2117, %1671
+  %2119 = insertelement <8 x bfloat> poison, bfloat %2069, i64 0
+  %2120 = insertelement <8 x bfloat> %2119, bfloat %2070, i64 1
+  %2121 = insertelement <8 x bfloat> %2120, bfloat %2071, i64 2
+  %2122 = insertelement <8 x bfloat> %2121, bfloat %2072, i64 3
+  %2123 = insertelement <8 x bfloat> %2122, bfloat %2073, i64 4
+  %2124 = insertelement <8 x bfloat> %2123, bfloat %2074, i64 5
+  %2125 = insertelement <8 x bfloat> %2124, bfloat %2075, i64 6
+  %2126 = insertelement <8 x bfloat> %2125, bfloat %2076, i64 7
+  %2127 = add i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), %2118
+  %2128 = inttoptr i32 %2127 to ptr addrspace(3)
+  store <8 x bfloat> %2126, ptr addrspace(3) %2128, align 16
+  %2129 = insertelement <8 x bfloat> poison, bfloat %2081, i64 0
+  %2130 = insertelement <8 x bfloat> %2129, bfloat %2086, i64 1
+  %2131 = insertelement <8 x bfloat> %2130, bfloat %2091, i64 2
+  %2132 = insertelement <8 x bfloat> %2131, bfloat %2096, i64 3
+  %2133 = insertelement <8 x bfloat> %2132, bfloat %2101, i64 4
+  %2134 = insertelement <8 x bfloat> %2133, bfloat %2106, i64 5
+  %2135 = insertelement <8 x bfloat> %2134, bfloat %2111, i64 6
+  %2136 = insertelement <8 x bfloat> %2135, bfloat %2116, i64 7
+  %2137 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 2560), %2118
+  %2138 = inttoptr i32 %2137 to ptr addrspace(3)
+  store <8 x bfloat> %2136, ptr addrspace(3) %2138, align 16
+  %2139 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %126, <16 x bfloat> %2006, i16 0, <8 x float> zeroinitializer, i1 false, i1 false)
+  %2140 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %178, <16 x bfloat> %2010, i16 0, <8 x float> zeroinitializer, i1 false, i1 false)
+  %2141 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %135, <16 x bfloat> %2007, i16 0, <8 x float> %2139, i1 false, i1 false)
+  %2142 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %183, <16 x bfloat> %2011, i16 0, <8 x float> %2140, i1 false, i1 false)
+  %2143 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %144, <16 x bfloat> %2008, i16 0, <8 x float> %2141, i1 false, i1 false)
+  %2144 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %188, <16 x bfloat> %2012, i16 0, <8 x float> %2142, i1 false, i1 false)
+  %2145 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %153, <16 x bfloat> %2009, i16 0, <8 x float> %2143, i1 false, i1 false)
+  %2146 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %193, <16 x bfloat> %2013, i16 0, <8 x float> %2144, i1 false, i1 false)
+  %2147 = extractelement <8 x float> %2145, i64 0
+  %2148 = fmul float %2147, %16
+  %2149 = extractelement <8 x float> %2145, i64 1
+  %2150 = fmul float %2149, %16
+  %2151 = extractelement <8 x float> %2145, i64 2
+  %2152 = fmul float %2151, %16
+  %2153 = extractelement <8 x float> %2145, i64 3
+  %2154 = fmul float %2153, %16
+  %2155 = extractelement <8 x float> %2145, i64 4
+  %2156 = fmul float %2155, %16
+  %2157 = extractelement <8 x float> %2145, i64 5
+  %2158 = fmul float %2157, %16
+  %2159 = extractelement <8 x float> %2145, i64 6
+  %2160 = fmul float %2159, %16
+  %2161 = extractelement <8 x float> %2145, i64 7
+  %2162 = fmul float %2161, %16
+  %2163 = fsub float %2148, %2018
+  %2164 = fmul float %2163, f0x3FB8AA3B
+  %2165 = call float @llvm.amdgcn.exp2.f32(float %2164)
+  %2166 = fsub float %2150, %2018
+  %2167 = fmul float %2166, f0x3FB8AA3B
+  %2168 = call float @llvm.amdgcn.exp2.f32(float %2167)
+  %2169 = fsub float %2152, %2018
+  %2170 = fmul float %2169, f0x3FB8AA3B
+  %2171 = call float @llvm.amdgcn.exp2.f32(float %2170)
+  %2172 = fsub float %2154, %2018
+  %2173 = fmul float %2172, f0x3FB8AA3B
+  %2174 = call float @llvm.amdgcn.exp2.f32(float %2173)
+  %2175 = fsub float %2156, %2018
+  %2176 = fmul float %2175, f0x3FB8AA3B
+  %2177 = call float @llvm.amdgcn.exp2.f32(float %2176)
+  %2178 = fsub float %2158, %2018
+  %2179 = fmul float %2178, f0x3FB8AA3B
+  %2180 = call float @llvm.amdgcn.exp2.f32(float %2179)
+  %2181 = fsub float %2160, %2018
+  %2182 = fmul float %2181, f0x3FB8AA3B
+  %2183 = call float @llvm.amdgcn.exp2.f32(float %2182)
+  %2184 = fsub float %2162, %2018
+  %2185 = fmul float %2184, f0x3FB8AA3B
+  %2186 = call float @llvm.amdgcn.exp2.f32(float %2185)
+  %2187 = fptrunc float %2165 to bfloat
+  %2188 = fptrunc float %2168 to bfloat
+  %2189 = fptrunc float %2171 to bfloat
+  %2190 = fptrunc float %2174 to bfloat
+  %2191 = fptrunc float %2177 to bfloat
+  %2192 = fptrunc float %2180 to bfloat
+  %2193 = fptrunc float %2183 to bfloat
+  %2194 = fptrunc float %2186 to bfloat
+  %2195 = extractelement <8 x float> %2146, i64 0
+  %2196 = fsub float %2195, %2020
+  %2197 = fmul float %2165, %2196
+  %2198 = fmul float %2197, %16
+  %2199 = fptrunc float %2198 to bfloat
+  %2200 = extractelement <8 x float> %2146, i64 1
+  %2201 = fsub float %2200, %2020
+  %2202 = fmul float %2168, %2201
+  %2203 = fmul float %2202, %16
+  %2204 = fptrunc float %2203 to bfloat
+  %2205 = extractelement <8 x float> %2146, i64 2
+  %2206 = fsub float %2205, %2020
+  %2207 = fmul float %2171, %2206
+  %2208 = fmul float %2207, %16
+  %2209 = fptrunc float %2208 to bfloat
+  %2210 = extractelement <8 x float> %2146, i64 3
+  %2211 = fsub float %2210, %2020
+  %2212 = fmul float %2174, %2211
+  %2213 = fmul float %2212, %16
+  %2214 = fptrunc float %2213 to bfloat
+  %2215 = extractelement <8 x float> %2146, i64 4
+  %2216 = fsub float %2215, %2020
+  %2217 = fmul float %2177, %2216
+  %2218 = fmul float %2217, %16
+  %2219 = fptrunc float %2218 to bfloat
+  %2220 = extractelement <8 x float> %2146, i64 5
+  %2221 = fsub float %2220, %2020
+  %2222 = fmul float %2180, %2221
+  %2223 = fmul float %2222, %16
+  %2224 = fptrunc float %2223 to bfloat
+  %2225 = extractelement <8 x float> %2146, i64 6
+  %2226 = fsub float %2225, %2020
+  %2227 = fmul float %2183, %2226
+  %2228 = fmul float %2227, %16
+  %2229 = fptrunc float %2228 to bfloat
+  %2230 = extractelement <8 x float> %2146, i64 7
+  %2231 = fsub float %2230, %2020
+  %2232 = fmul float %2186, %2231
+  %2233 = fmul float %2232, %16
+  %2234 = fptrunc float %2233 to bfloat
+  %2235 = add i32 %2117, 32
+  %2236 = add i32 %2235, %1671
+  %2237 = insertelement <8 x bfloat> poison, bfloat %2187, i64 0
+  %2238 = insertelement <8 x bfloat> %2237, bfloat %2188, i64 1
+  %2239 = insertelement <8 x bfloat> %2238, bfloat %2189, i64 2
+  %2240 = insertelement <8 x bfloat> %2239, bfloat %2190, i64 3
+  %2241 = insertelement <8 x bfloat> %2240, bfloat %2191, i64 4
+  %2242 = insertelement <8 x bfloat> %2241, bfloat %2192, i64 5
+  %2243 = insertelement <8 x bfloat> %2242, bfloat %2193, i64 6
+  %2244 = insertelement <8 x bfloat> %2243, bfloat %2194, i64 7
+  %2245 = add i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), %2236
+  %2246 = inttoptr i32 %2245 to ptr addrspace(3)
+  store <8 x bfloat> %2244, ptr addrspace(3) %2246, align 16
+  %2247 = insertelement <8 x bfloat> poison, bfloat %2199, i64 0
+  %2248 = insertelement <8 x bfloat> %2247, bfloat %2204, i64 1
+  %2249 = insertelement <8 x bfloat> %2248, bfloat %2209, i64 2
+  %2250 = insertelement <8 x bfloat> %2249, bfloat %2214, i64 3
+  %2251 = insertelement <8 x bfloat> %2250, bfloat %2219, i64 4
+  %2252 = insertelement <8 x bfloat> %2251, bfloat %2224, i64 5
+  %2253 = insertelement <8 x bfloat> %2252, bfloat %2229, i64 6
+  %2254 = insertelement <8 x bfloat> %2253, bfloat %2234, i64 7
+  %2255 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 2560), %2236
+  %2256 = inttoptr i32 %2255 to ptr addrspace(3)
+  store <8 x bfloat> %2254, ptr addrspace(3) %2256, align 16
+  fence syncscope("workgroup") release
+  call void @llvm.amdgcn.s.barrier.signal(i32 -1)
+  call void @llvm.amdgcn.s.barrier.wait(i16 -1)
+  fence syncscope("workgroup") acquire
+  %2257 = mul i32 %205, 16
+  %2258 = mul i32 %196, 272
+  %2259 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 5120), %2258
+  %2260 = add i32 %2259, %2257
+  %2261 = inttoptr i32 %2260 to ptr addrspace(3)
+  %2262 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2261)
+  %2263 = add i32 %2260, 4352
+  %2264 = inttoptr i32 %2263 to ptr addrspace(3)
+  %2265 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2264)
+  %2266 = shufflevector <8 x bfloat> %2262, <8 x bfloat> %2265, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2267 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 13824), %2258
+  %2268 = add i32 %2267, %2257
+  %2269 = inttoptr i32 %2268 to ptr addrspace(3)
+  %2270 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2269)
+  %2271 = add i32 %2268, 4352
+  %2272 = inttoptr i32 %2271 to ptr addrspace(3)
+  %2273 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2272)
+  %2274 = shufflevector <8 x bfloat> %2270, <8 x bfloat> %2273, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2275 = add i32 %206, 16
+  %2276 = mul i32 %2275, 2
+  %2277 = add i32 %2259, %2276
+  %2278 = inttoptr i32 %2277 to ptr addrspace(3)
+  %2279 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2278)
+  %2280 = add i32 %2277, 4352
+  %2281 = inttoptr i32 %2280 to ptr addrspace(3)
+  %2282 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2281)
+  %2283 = shufflevector <8 x bfloat> %2279, <8 x bfloat> %2282, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2284 = add i32 %2267, %2276
+  %2285 = inttoptr i32 %2284 to ptr addrspace(3)
+  %2286 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2285)
+  %2287 = add i32 %2284, 4352
+  %2288 = inttoptr i32 %2287 to ptr addrspace(3)
+  %2289 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2288)
+  %2290 = shufflevector <8 x bfloat> %2286, <8 x bfloat> %2289, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2291 = add i32 %206, 32
+  %2292 = mul i32 %2291, 2
+  %2293 = add i32 %2259, %2292
+  %2294 = inttoptr i32 %2293 to ptr addrspace(3)
+  %2295 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2294)
+  %2296 = add i32 %2293, 4352
+  %2297 = inttoptr i32 %2296 to ptr addrspace(3)
+  %2298 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2297)
+  %2299 = shufflevector <8 x bfloat> %2295, <8 x bfloat> %2298, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2300 = add i32 %2267, %2292
+  %2301 = inttoptr i32 %2300 to ptr addrspace(3)
+  %2302 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2301)
+  %2303 = add i32 %2300, 4352
+  %2304 = inttoptr i32 %2303 to ptr addrspace(3)
+  %2305 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2304)
+  %2306 = shufflevector <8 x bfloat> %2302, <8 x bfloat> %2305, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2307 = add i32 %206, 48
+  %2308 = mul i32 %2307, 2
+  %2309 = add i32 %2259, %2308
+  %2310 = inttoptr i32 %2309 to ptr addrspace(3)
+  %2311 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2310)
+  %2312 = add i32 %2309, 4352
+  %2313 = inttoptr i32 %2312 to ptr addrspace(3)
+  %2314 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2313)
+  %2315 = shufflevector <8 x bfloat> %2311, <8 x bfloat> %2314, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2316 = add i32 %2267, %2308
+  %2317 = inttoptr i32 %2316 to ptr addrspace(3)
+  %2318 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2317)
+  %2319 = add i32 %2316, 4352
+  %2320 = inttoptr i32 %2319 to ptr addrspace(3)
+  %2321 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2320)
+  %2322 = shufflevector <8 x bfloat> %2318, <8 x bfloat> %2321, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2323 = add i32 %206, 64
+  %2324 = mul i32 %2323, 2
+  %2325 = add i32 %2259, %2324
+  %2326 = inttoptr i32 %2325 to ptr addrspace(3)
+  %2327 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2326)
+  %2328 = add i32 %2325, 4352
+  %2329 = inttoptr i32 %2328 to ptr addrspace(3)
+  %2330 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2329)
+  %2331 = shufflevector <8 x bfloat> %2327, <8 x bfloat> %2330, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2332 = add i32 %2267, %2324
+  %2333 = inttoptr i32 %2332 to ptr addrspace(3)
+  %2334 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2333)
+  %2335 = add i32 %2332, 4352
+  %2336 = inttoptr i32 %2335 to ptr addrspace(3)
+  %2337 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2336)
+  %2338 = shufflevector <8 x bfloat> %2334, <8 x bfloat> %2337, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2339 = add i32 %206, 80
+  %2340 = mul i32 %2339, 2
+  %2341 = add i32 %2259, %2340
+  %2342 = inttoptr i32 %2341 to ptr addrspace(3)
+  %2343 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2342)
+  %2344 = add i32 %2341, 4352
+  %2345 = inttoptr i32 %2344 to ptr addrspace(3)
+  %2346 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2345)
+  %2347 = shufflevector <8 x bfloat> %2343, <8 x bfloat> %2346, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2348 = add i32 %2267, %2340
+  %2349 = inttoptr i32 %2348 to ptr addrspace(3)
+  %2350 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2349)
+  %2351 = add i32 %2348, 4352
+  %2352 = inttoptr i32 %2351 to ptr addrspace(3)
+  %2353 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2352)
+  %2354 = shufflevector <8 x bfloat> %2350, <8 x bfloat> %2353, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2355 = add i32 %206, 96
+  %2356 = mul i32 %2355, 2
+  %2357 = add i32 %2259, %2356
+  %2358 = inttoptr i32 %2357 to ptr addrspace(3)
+  %2359 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2358)
+  %2360 = add i32 %2357, 4352
+  %2361 = inttoptr i32 %2360 to ptr addrspace(3)
+  %2362 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2361)
+  %2363 = shufflevector <8 x bfloat> %2359, <8 x bfloat> %2362, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2364 = add i32 %2267, %2356
+  %2365 = inttoptr i32 %2364 to ptr addrspace(3)
+  %2366 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2365)
+  %2367 = add i32 %2364, 4352
+  %2368 = inttoptr i32 %2367 to ptr addrspace(3)
+  %2369 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2368)
+  %2370 = shufflevector <8 x bfloat> %2366, <8 x bfloat> %2369, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2371 = add i32 %206, 112
+  %2372 = mul i32 %2371, 2
+  %2373 = add i32 %2259, %2372
+  %2374 = inttoptr i32 %2373 to ptr addrspace(3)
+  %2375 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2374)
+  %2376 = add i32 %2373, 4352
+  %2377 = inttoptr i32 %2376 to ptr addrspace(3)
+  %2378 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2377)
+  %2379 = shufflevector <8 x bfloat> %2375, <8 x bfloat> %2378, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2380 = add i32 %2267, %2372
+  %2381 = inttoptr i32 %2380 to ptr addrspace(3)
+  %2382 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2381)
+  %2383 = add i32 %2380, 4352
+  %2384 = inttoptr i32 %2383 to ptr addrspace(3)
+  %2385 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2384)
+  %2386 = shufflevector <8 x bfloat> %2382, <8 x bfloat> %2385, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2387 = mul i32 %196, 80
+  %2388 = add i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), %2387
+  %2389 = add i32 %2388, %2257
+  %2390 = inttoptr i32 %2389 to ptr addrspace(3)
+  %2391 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2390)
+  %2392 = add i32 %2389, 1280
+  %2393 = inttoptr i32 %2392 to ptr addrspace(3)
+  %2394 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2393)
+  %2395 = shufflevector <8 x bfloat> %2391, <8 x bfloat> %2394, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2396 = add i32 add (i32 ptrtoint (ptr addrspace(3) @__shared_alloc_0 to i32), i32 2560), %2387
+  %2397 = add i32 %2396, %2257
+  %2398 = inttoptr i32 %2397 to ptr addrspace(3)
+  %2399 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2398)
+  %2400 = add i32 %2397, 1280
+  %2401 = inttoptr i32 %2400 to ptr addrspace(3)
+  %2402 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2401)
+  %2403 = shufflevector <8 x bfloat> %2399, <8 x bfloat> %2402, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2404 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2395, <16 x bfloat> %2266, i16 0, <8 x float> %1466, i1 false, i1 false)
+  %2405 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2403, <16 x bfloat> %2274, i16 0, <8 x float> %1482, i1 false, i1 false)
+  %2406 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2395, <16 x bfloat> %2283, i16 0, <8 x float> %1467, i1 false, i1 false)
+  %2407 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2403, <16 x bfloat> %2290, i16 0, <8 x float> %1483, i1 false, i1 false)
+  %2408 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2395, <16 x bfloat> %2299, i16 0, <8 x float> %1468, i1 false, i1 false)
+  %2409 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2403, <16 x bfloat> %2306, i16 0, <8 x float> %1484, i1 false, i1 false)
+  %2410 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2395, <16 x bfloat> %2315, i16 0, <8 x float> %1469, i1 false, i1 false)
+  %2411 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2403, <16 x bfloat> %2322, i16 0, <8 x float> %1485, i1 false, i1 false)
+  %2412 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2395, <16 x bfloat> %2331, i16 0, <8 x float> %1470, i1 false, i1 false)
+  %2413 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2403, <16 x bfloat> %2338, i16 0, <8 x float> %1486, i1 false, i1 false)
+  %2414 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2395, <16 x bfloat> %2347, i16 0, <8 x float> %1471, i1 false, i1 false)
+  %2415 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2403, <16 x bfloat> %2354, i16 0, <8 x float> %1487, i1 false, i1 false)
+  %2416 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2395, <16 x bfloat> %2363, i16 0, <8 x float> %1472, i1 false, i1 false)
+  %2417 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2403, <16 x bfloat> %2370, i16 0, <8 x float> %1488, i1 false, i1 false)
+  %2418 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2395, <16 x bfloat> %2379, i16 0, <8 x float> %1473, i1 false, i1 false)
+  %2419 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2403, <16 x bfloat> %2386, i16 0, <8 x float> %1489, i1 false, i1 false)
+  %2420 = add i32 %2257, 32
+  %2421 = add i32 %2388, %2420
+  %2422 = inttoptr i32 %2421 to ptr addrspace(3)
+  %2423 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2422)
+  %2424 = add i32 %2421, 1280
+  %2425 = inttoptr i32 %2424 to ptr addrspace(3)
+  %2426 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2425)
+  %2427 = shufflevector <8 x bfloat> %2423, <8 x bfloat> %2426, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2428 = add i32 %2396, %2420
+  %2429 = inttoptr i32 %2428 to ptr addrspace(3)
+  %2430 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2429)
+  %2431 = add i32 %2428, 1280
+  %2432 = inttoptr i32 %2431 to ptr addrspace(3)
+  %2433 = call <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) %2432)
+  %2434 = shufflevector <8 x bfloat> %2430, <8 x bfloat> %2433, <16 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15>
+  %2435 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2427, <16 x bfloat> %2266, i16 0, <8 x float> %1474, i1 false, i1 false)
+  %2436 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2434, <16 x bfloat> %2274, i16 0, <8 x float> %1490, i1 false, i1 false)
+  %2437 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2427, <16 x bfloat> %2283, i16 0, <8 x float> %1475, i1 false, i1 false)
+  %2438 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2434, <16 x bfloat> %2290, i16 0, <8 x float> %1491, i1 false, i1 false)
+  %2439 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2427, <16 x bfloat> %2299, i16 0, <8 x float> %1476, i1 false, i1 false)
+  %2440 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2434, <16 x bfloat> %2306, i16 0, <8 x float> %1492, i1 false, i1 false)
+  %2441 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2427, <16 x bfloat> %2315, i16 0, <8 x float> %1477, i1 false, i1 false)
+  %2442 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2434, <16 x bfloat> %2322, i16 0, <8 x float> %1493, i1 false, i1 false)
+  %2443 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2427, <16 x bfloat> %2331, i16 0, <8 x float> %1478, i1 false, i1 false)
+  %2444 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2434, <16 x bfloat> %2338, i16 0, <8 x float> %1494, i1 false, i1 false)
+  %2445 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2427, <16 x bfloat> %2347, i16 0, <8 x float> %1479, i1 false, i1 false)
+  %2446 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2434, <16 x bfloat> %2354, i16 0, <8 x float> %1495, i1 false, i1 false)
+  %2447 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2427, <16 x bfloat> %2363, i16 0, <8 x float> %1480, i1 false, i1 false)
+  %2448 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2434, <16 x bfloat> %2370, i16 0, <8 x float> %1496, i1 false, i1 false)
+  %2449 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2427, <16 x bfloat> %2379, i16 0, <8 x float> %1481, i1 false, i1 false)
+  %2450 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat> %2434, <16 x bfloat> %2386, i16 0, <8 x float> %1497, i1 false, i1 false)
+  fence syncscope("workgroup") release
+  call void @llvm.amdgcn.s.barrier.signal(i32 -1)
+  call void @llvm.amdgcn.s.barrier.wait(i16 -1)
+  fence syncscope("workgroup") acquire
+  %2451 = add i64 %1465, 1
+  br label %1464
+
+2452:                                             ; preds = %1464
+  %2453 = mul i32 %71, %20
+  %2454 = mul i32 %2453, 128
+  %2455 = mul i32 %32, 128
+  %2456 = add i32 %2454, %2455
+  %2457 = add i32 %48, %194
+  %2458 = mul i32 %2457, %20
+  %2459 = mul i32 %2458, 128
+  %2460 = add i32 %2456, %2459
+  %2461 = add i32 %2460, %39
+  %2462 = extractelement <8 x float> %1466, i64 0
+  %2463 = fptrunc float %2462 to bfloat
+  %2464 = mul i32 %2461, 4
+  %2465 = bitcast bfloat %2463 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2465, ptr addrspace(8) %67, i32 %2464, i32 0, i32 0)
+  %2466 = extractelement <8 x float> %1482, i64 0
+  %2467 = fptrunc float %2466 to bfloat
+  %2468 = bitcast bfloat %2467 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2468, ptr addrspace(8) %68, i32 %2464, i32 0, i32 0)
+  %2469 = add i32 %2457, 1
+  %2470 = mul i32 %2469, %20
+  %2471 = mul i32 %2470, 128
+  %2472 = add i32 %2456, %2471
+  %2473 = add i32 %2472, %39
+  %2474 = extractelement <8 x float> %1466, i64 1
+  %2475 = fptrunc float %2474 to bfloat
+  %2476 = mul i32 %2473, 4
+  %2477 = bitcast bfloat %2475 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2477, ptr addrspace(8) %67, i32 %2476, i32 0, i32 0)
+  %2478 = extractelement <8 x float> %1482, i64 1
+  %2479 = fptrunc float %2478 to bfloat
+  %2480 = bitcast bfloat %2479 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2480, ptr addrspace(8) %68, i32 %2476, i32 0, i32 0)
+  %2481 = add i32 %2457, 2
+  %2482 = mul i32 %2481, %20
+  %2483 = mul i32 %2482, 128
+  %2484 = add i32 %2456, %2483
+  %2485 = add i32 %2484, %39
+  %2486 = extractelement <8 x float> %1466, i64 2
+  %2487 = fptrunc float %2486 to bfloat
+  %2488 = mul i32 %2485, 4
+  %2489 = bitcast bfloat %2487 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2489, ptr addrspace(8) %67, i32 %2488, i32 0, i32 0)
+  %2490 = extractelement <8 x float> %1482, i64 2
+  %2491 = fptrunc float %2490 to bfloat
+  %2492 = bitcast bfloat %2491 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2492, ptr addrspace(8) %68, i32 %2488, i32 0, i32 0)
+  %2493 = add i32 %2457, 3
+  %2494 = mul i32 %2493, %20
+  %2495 = mul i32 %2494, 128
+  %2496 = add i32 %2456, %2495
+  %2497 = add i32 %2496, %39
+  %2498 = extractelement <8 x float> %1466, i64 3
+  %2499 = fptrunc float %2498 to bfloat
+  %2500 = mul i32 %2497, 4
+  %2501 = bitcast bfloat %2499 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2501, ptr addrspace(8) %67, i32 %2500, i32 0, i32 0)
+  %2502 = extractelement <8 x float> %1482, i64 3
+  %2503 = fptrunc float %2502 to bfloat
+  %2504 = bitcast bfloat %2503 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2504, ptr addrspace(8) %68, i32 %2500, i32 0, i32 0)
+  %2505 = add i32 %2457, 4
+  %2506 = mul i32 %2505, %20
+  %2507 = mul i32 %2506, 128
+  %2508 = add i32 %2456, %2507
+  %2509 = add i32 %2508, %39
+  %2510 = extractelement <8 x float> %1466, i64 4
+  %2511 = fptrunc float %2510 to bfloat
+  %2512 = mul i32 %2509, 4
+  %2513 = bitcast bfloat %2511 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2513, ptr addrspace(8) %67, i32 %2512, i32 0, i32 0)
+  %2514 = extractelement <8 x float> %1482, i64 4
+  %2515 = fptrunc float %2514 to bfloat
+  %2516 = bitcast bfloat %2515 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2516, ptr addrspace(8) %68, i32 %2512, i32 0, i32 0)
+  %2517 = add i32 %2457, 5
+  %2518 = mul i32 %2517, %20
+  %2519 = mul i32 %2518, 128
+  %2520 = add i32 %2456, %2519
+  %2521 = add i32 %2520, %39
+  %2522 = extractelement <8 x float> %1466, i64 5
+  %2523 = fptrunc float %2522 to bfloat
+  %2524 = mul i32 %2521, 4
+  %2525 = bitcast bfloat %2523 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2525, ptr addrspace(8) %67, i32 %2524, i32 0, i32 0)
+  %2526 = extractelement <8 x float> %1482, i64 5
+  %2527 = fptrunc float %2526 to bfloat
+  %2528 = bitcast bfloat %2527 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2528, ptr addrspace(8) %68, i32 %2524, i32 0, i32 0)
+  %2529 = add i32 %2457, 6
+  %2530 = mul i32 %2529, %20
+  %2531 = mul i32 %2530, 128
+  %2532 = add i32 %2456, %2531
+  %2533 = add i32 %2532, %39
+  %2534 = extractelement <8 x float> %1466, i64 6
+  %2535 = fptrunc float %2534 to bfloat
+  %2536 = mul i32 %2533, 4
+  %2537 = bitcast bfloat %2535 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2537, ptr addrspace(8) %67, i32 %2536, i32 0, i32 0)
+  %2538 = extractelement <8 x float> %1482, i64 6
+  %2539 = fptrunc float %2538 to bfloat
+  %2540 = bitcast bfloat %2539 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2540, ptr addrspace(8) %68, i32 %2536, i32 0, i32 0)
+  %2541 = add i32 %2457, 7
+  %2542 = mul i32 %2541, %20
+  %2543 = mul i32 %2542, 128
+  %2544 = add i32 %2456, %2543
+  %2545 = add i32 %2544, %39
+  %2546 = extractelement <8 x float> %1466, i64 7
+  %2547 = fptrunc float %2546 to bfloat
+  %2548 = mul i32 %2545, 4
+  %2549 = bitcast bfloat %2547 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2549, ptr addrspace(8) %67, i32 %2548, i32 0, i32 0)
+  %2550 = extractelement <8 x float> %1482, i64 7
+  %2551 = fptrunc float %2550 to bfloat
+  %2552 = bitcast bfloat %2551 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2552, ptr addrspace(8) %68, i32 %2548, i32 0, i32 0)
+  %2553 = add i32 %2460, 16
+  %2554 = add i32 %2553, %39
+  %2555 = extractelement <8 x float> %1467, i64 0
+  %2556 = fptrunc float %2555 to bfloat
+  %2557 = mul i32 %2554, 4
+  %2558 = bitcast bfloat %2556 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2558, ptr addrspace(8) %67, i32 %2557, i32 0, i32 0)
+  %2559 = extractelement <8 x float> %1483, i64 0
+  %2560 = fptrunc float %2559 to bfloat
+  %2561 = bitcast bfloat %2560 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2561, ptr addrspace(8) %68, i32 %2557, i32 0, i32 0)
+  %2562 = add i32 %2472, 16
+  %2563 = add i32 %2562, %39
+  %2564 = extractelement <8 x float> %1467, i64 1
+  %2565 = fptrunc float %2564 to bfloat
+  %2566 = mul i32 %2563, 4
+  %2567 = bitcast bfloat %2565 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2567, ptr addrspace(8) %67, i32 %2566, i32 0, i32 0)
+  %2568 = extractelement <8 x float> %1483, i64 1
+  %2569 = fptrunc float %2568 to bfloat
+  %2570 = bitcast bfloat %2569 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2570, ptr addrspace(8) %68, i32 %2566, i32 0, i32 0)
+  %2571 = add i32 %2484, 16
+  %2572 = add i32 %2571, %39
+  %2573 = extractelement <8 x float> %1467, i64 2
+  %2574 = fptrunc float %2573 to bfloat
+  %2575 = mul i32 %2572, 4
+  %2576 = bitcast bfloat %2574 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2576, ptr addrspace(8) %67, i32 %2575, i32 0, i32 0)
+  %2577 = extractelement <8 x float> %1483, i64 2
+  %2578 = fptrunc float %2577 to bfloat
+  %2579 = bitcast bfloat %2578 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2579, ptr addrspace(8) %68, i32 %2575, i32 0, i32 0)
+  %2580 = add i32 %2496, 16
+  %2581 = add i32 %2580, %39
+  %2582 = extractelement <8 x float> %1467, i64 3
+  %2583 = fptrunc float %2582 to bfloat
+  %2584 = mul i32 %2581, 4
+  %2585 = bitcast bfloat %2583 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2585, ptr addrspace(8) %67, i32 %2584, i32 0, i32 0)
+  %2586 = extractelement <8 x float> %1483, i64 3
+  %2587 = fptrunc float %2586 to bfloat
+  %2588 = bitcast bfloat %2587 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2588, ptr addrspace(8) %68, i32 %2584, i32 0, i32 0)
+  %2589 = add i32 %2508, 16
+  %2590 = add i32 %2589, %39
+  %2591 = extractelement <8 x float> %1467, i64 4
+  %2592 = fptrunc float %2591 to bfloat
+  %2593 = mul i32 %2590, 4
+  %2594 = bitcast bfloat %2592 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2594, ptr addrspace(8) %67, i32 %2593, i32 0, i32 0)
+  %2595 = extractelement <8 x float> %1483, i64 4
+  %2596 = fptrunc float %2595 to bfloat
+  %2597 = bitcast bfloat %2596 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2597, ptr addrspace(8) %68, i32 %2593, i32 0, i32 0)
+  %2598 = add i32 %2520, 16
+  %2599 = add i32 %2598, %39
+  %2600 = extractelement <8 x float> %1467, i64 5
+  %2601 = fptrunc float %2600 to bfloat
+  %2602 = mul i32 %2599, 4
+  %2603 = bitcast bfloat %2601 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2603, ptr addrspace(8) %67, i32 %2602, i32 0, i32 0)
+  %2604 = extractelement <8 x float> %1483, i64 5
+  %2605 = fptrunc float %2604 to bfloat
+  %2606 = bitcast bfloat %2605 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2606, ptr addrspace(8) %68, i32 %2602, i32 0, i32 0)
+  %2607 = add i32 %2532, 16
+  %2608 = add i32 %2607, %39
+  %2609 = extractelement <8 x float> %1467, i64 6
+  %2610 = fptrunc float %2609 to bfloat
+  %2611 = mul i32 %2608, 4
+  %2612 = bitcast bfloat %2610 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2612, ptr addrspace(8) %67, i32 %2611, i32 0, i32 0)
+  %2613 = extractelement <8 x float> %1483, i64 6
+  %2614 = fptrunc float %2613 to bfloat
+  %2615 = bitcast bfloat %2614 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2615, ptr addrspace(8) %68, i32 %2611, i32 0, i32 0)
+  %2616 = add i32 %2544, 16
+  %2617 = add i32 %2616, %39
+  %2618 = extractelement <8 x float> %1467, i64 7
+  %2619 = fptrunc float %2618 to bfloat
+  %2620 = mul i32 %2617, 4
+  %2621 = bitcast bfloat %2619 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2621, ptr addrspace(8) %67, i32 %2620, i32 0, i32 0)
+  %2622 = extractelement <8 x float> %1483, i64 7
+  %2623 = fptrunc float %2622 to bfloat
+  %2624 = bitcast bfloat %2623 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2624, ptr addrspace(8) %68, i32 %2620, i32 0, i32 0)
+  %2625 = add i32 %2460, 32
+  %2626 = add i32 %2625, %39
+  %2627 = extractelement <8 x float> %1468, i64 0
+  %2628 = fptrunc float %2627 to bfloat
+  %2629 = mul i32 %2626, 4
+  %2630 = bitcast bfloat %2628 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2630, ptr addrspace(8) %67, i32 %2629, i32 0, i32 0)
+  %2631 = extractelement <8 x float> %1484, i64 0
+  %2632 = fptrunc float %2631 to bfloat
+  %2633 = bitcast bfloat %2632 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2633, ptr addrspace(8) %68, i32 %2629, i32 0, i32 0)
+  %2634 = add i32 %2472, 32
+  %2635 = add i32 %2634, %39
+  %2636 = extractelement <8 x float> %1468, i64 1
+  %2637 = fptrunc float %2636 to bfloat
+  %2638 = mul i32 %2635, 4
+  %2639 = bitcast bfloat %2637 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2639, ptr addrspace(8) %67, i32 %2638, i32 0, i32 0)
+  %2640 = extractelement <8 x float> %1484, i64 1
+  %2641 = fptrunc float %2640 to bfloat
+  %2642 = bitcast bfloat %2641 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2642, ptr addrspace(8) %68, i32 %2638, i32 0, i32 0)
+  %2643 = add i32 %2484, 32
+  %2644 = add i32 %2643, %39
+  %2645 = extractelement <8 x float> %1468, i64 2
+  %2646 = fptrunc float %2645 to bfloat
+  %2647 = mul i32 %2644, 4
+  %2648 = bitcast bfloat %2646 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2648, ptr addrspace(8) %67, i32 %2647, i32 0, i32 0)
+  %2649 = extractelement <8 x float> %1484, i64 2
+  %2650 = fptrunc float %2649 to bfloat
+  %2651 = bitcast bfloat %2650 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2651, ptr addrspace(8) %68, i32 %2647, i32 0, i32 0)
+  %2652 = add i32 %2496, 32
+  %2653 = add i32 %2652, %39
+  %2654 = extractelement <8 x float> %1468, i64 3
+  %2655 = fptrunc float %2654 to bfloat
+  %2656 = mul i32 %2653, 4
+  %2657 = bitcast bfloat %2655 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2657, ptr addrspace(8) %67, i32 %2656, i32 0, i32 0)
+  %2658 = extractelement <8 x float> %1484, i64 3
+  %2659 = fptrunc float %2658 to bfloat
+  %2660 = bitcast bfloat %2659 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2660, ptr addrspace(8) %68, i32 %2656, i32 0, i32 0)
+  %2661 = add i32 %2508, 32
+  %2662 = add i32 %2661, %39
+  %2663 = extractelement <8 x float> %1468, i64 4
+  %2664 = fptrunc float %2663 to bfloat
+  %2665 = mul i32 %2662, 4
+  %2666 = bitcast bfloat %2664 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2666, ptr addrspace(8) %67, i32 %2665, i32 0, i32 0)
+  %2667 = extractelement <8 x float> %1484, i64 4
+  %2668 = fptrunc float %2667 to bfloat
+  %2669 = bitcast bfloat %2668 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2669, ptr addrspace(8) %68, i32 %2665, i32 0, i32 0)
+  %2670 = add i32 %2520, 32
+  %2671 = add i32 %2670, %39
+  %2672 = extractelement <8 x float> %1468, i64 5
+  %2673 = fptrunc float %2672 to bfloat
+  %2674 = mul i32 %2671, 4
+  %2675 = bitcast bfloat %2673 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2675, ptr addrspace(8) %67, i32 %2674, i32 0, i32 0)
+  %2676 = extractelement <8 x float> %1484, i64 5
+  %2677 = fptrunc float %2676 to bfloat
+  %2678 = bitcast bfloat %2677 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2678, ptr addrspace(8) %68, i32 %2674, i32 0, i32 0)
+  %2679 = add i32 %2532, 32
+  %2680 = add i32 %2679, %39
+  %2681 = extractelement <8 x float> %1468, i64 6
+  %2682 = fptrunc float %2681 to bfloat
+  %2683 = mul i32 %2680, 4
+  %2684 = bitcast bfloat %2682 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2684, ptr addrspace(8) %67, i32 %2683, i32 0, i32 0)
+  %2685 = extractelement <8 x float> %1484, i64 6
+  %2686 = fptrunc float %2685 to bfloat
+  %2687 = bitcast bfloat %2686 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2687, ptr addrspace(8) %68, i32 %2683, i32 0, i32 0)
+  %2688 = add i32 %2544, 32
+  %2689 = add i32 %2688, %39
+  %2690 = extractelement <8 x float> %1468, i64 7
+  %2691 = fptrunc float %2690 to bfloat
+  %2692 = mul i32 %2689, 4
+  %2693 = bitcast bfloat %2691 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2693, ptr addrspace(8) %67, i32 %2692, i32 0, i32 0)
+  %2694 = extractelement <8 x float> %1484, i64 7
+  %2695 = fptrunc float %2694 to bfloat
+  %2696 = bitcast bfloat %2695 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2696, ptr addrspace(8) %68, i32 %2692, i32 0, i32 0)
+  %2697 = add i32 %2460, 48
+  %2698 = add i32 %2697, %39
+  %2699 = extractelement <8 x float> %1469, i64 0
+  %2700 = fptrunc float %2699 to bfloat
+  %2701 = mul i32 %2698, 4
+  %2702 = bitcast bfloat %2700 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2702, ptr addrspace(8) %67, i32 %2701, i32 0, i32 0)
+  %2703 = extractelement <8 x float> %1485, i64 0
+  %2704 = fptrunc float %2703 to bfloat
+  %2705 = bitcast bfloat %2704 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2705, ptr addrspace(8) %68, i32 %2701, i32 0, i32 0)
+  %2706 = add i32 %2472, 48
+  %2707 = add i32 %2706, %39
+  %2708 = extractelement <8 x float> %1469, i64 1
+  %2709 = fptrunc float %2708 to bfloat
+  %2710 = mul i32 %2707, 4
+  %2711 = bitcast bfloat %2709 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2711, ptr addrspace(8) %67, i32 %2710, i32 0, i32 0)
+  %2712 = extractelement <8 x float> %1485, i64 1
+  %2713 = fptrunc float %2712 to bfloat
+  %2714 = bitcast bfloat %2713 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2714, ptr addrspace(8) %68, i32 %2710, i32 0, i32 0)
+  %2715 = add i32 %2484, 48
+  %2716 = add i32 %2715, %39
+  %2717 = extractelement <8 x float> %1469, i64 2
+  %2718 = fptrunc float %2717 to bfloat
+  %2719 = mul i32 %2716, 4
+  %2720 = bitcast bfloat %2718 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2720, ptr addrspace(8) %67, i32 %2719, i32 0, i32 0)
+  %2721 = extractelement <8 x float> %1485, i64 2
+  %2722 = fptrunc float %2721 to bfloat
+  %2723 = bitcast bfloat %2722 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2723, ptr addrspace(8) %68, i32 %2719, i32 0, i32 0)
+  %2724 = add i32 %2496, 48
+  %2725 = add i32 %2724, %39
+  %2726 = extractelement <8 x float> %1469, i64 3
+  %2727 = fptrunc float %2726 to bfloat
+  %2728 = mul i32 %2725, 4
+  %2729 = bitcast bfloat %2727 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2729, ptr addrspace(8) %67, i32 %2728, i32 0, i32 0)
+  %2730 = extractelement <8 x float> %1485, i64 3
+  %2731 = fptrunc float %2730 to bfloat
+  %2732 = bitcast bfloat %2731 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2732, ptr addrspace(8) %68, i32 %2728, i32 0, i32 0)
+  %2733 = add i32 %2508, 48
+  %2734 = add i32 %2733, %39
+  %2735 = extractelement <8 x float> %1469, i64 4
+  %2736 = fptrunc float %2735 to bfloat
+  %2737 = mul i32 %2734, 4
+  %2738 = bitcast bfloat %2736 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2738, ptr addrspace(8) %67, i32 %2737, i32 0, i32 0)
+  %2739 = extractelement <8 x float> %1485, i64 4
+  %2740 = fptrunc float %2739 to bfloat
+  %2741 = bitcast bfloat %2740 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2741, ptr addrspace(8) %68, i32 %2737, i32 0, i32 0)
+  %2742 = add i32 %2520, 48
+  %2743 = add i32 %2742, %39
+  %2744 = extractelement <8 x float> %1469, i64 5
+  %2745 = fptrunc float %2744 to bfloat
+  %2746 = mul i32 %2743, 4
+  %2747 = bitcast bfloat %2745 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2747, ptr addrspace(8) %67, i32 %2746, i32 0, i32 0)
+  %2748 = extractelement <8 x float> %1485, i64 5
+  %2749 = fptrunc float %2748 to bfloat
+  %2750 = bitcast bfloat %2749 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2750, ptr addrspace(8) %68, i32 %2746, i32 0, i32 0)
+  %2751 = add i32 %2532, 48
+  %2752 = add i32 %2751, %39
+  %2753 = extractelement <8 x float> %1469, i64 6
+  %2754 = fptrunc float %2753 to bfloat
+  %2755 = mul i32 %2752, 4
+  %2756 = bitcast bfloat %2754 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2756, ptr addrspace(8) %67, i32 %2755, i32 0, i32 0)
+  %2757 = extractelement <8 x float> %1485, i64 6
+  %2758 = fptrunc float %2757 to bfloat
+  %2759 = bitcast bfloat %2758 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2759, ptr addrspace(8) %68, i32 %2755, i32 0, i32 0)
+  %2760 = add i32 %2544, 48
+  %2761 = add i32 %2760, %39
+  %2762 = extractelement <8 x float> %1469, i64 7
+  %2763 = fptrunc float %2762 to bfloat
+  %2764 = mul i32 %2761, 4
+  %2765 = bitcast bfloat %2763 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2765, ptr addrspace(8) %67, i32 %2764, i32 0, i32 0)
+  %2766 = extractelement <8 x float> %1485, i64 7
+  %2767 = fptrunc float %2766 to bfloat
+  %2768 = bitcast bfloat %2767 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2768, ptr addrspace(8) %68, i32 %2764, i32 0, i32 0)
+  %2769 = add i32 %2460, 64
+  %2770 = add i32 %2769, %39
+  %2771 = extractelement <8 x float> %1470, i64 0
+  %2772 = fptrunc float %2771 to bfloat
+  %2773 = mul i32 %2770, 4
+  %2774 = bitcast bfloat %2772 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2774, ptr addrspace(8) %67, i32 %2773, i32 0, i32 0)
+  %2775 = extractelement <8 x float> %1486, i64 0
+  %2776 = fptrunc float %2775 to bfloat
+  %2777 = bitcast bfloat %2776 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2777, ptr addrspace(8) %68, i32 %2773, i32 0, i32 0)
+  %2778 = add i32 %2472, 64
+  %2779 = add i32 %2778, %39
+  %2780 = extractelement <8 x float> %1470, i64 1
+  %2781 = fptrunc float %2780 to bfloat
+  %2782 = mul i32 %2779, 4
+  %2783 = bitcast bfloat %2781 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2783, ptr addrspace(8) %67, i32 %2782, i32 0, i32 0)
+  %2784 = extractelement <8 x float> %1486, i64 1
+  %2785 = fptrunc float %2784 to bfloat
+  %2786 = bitcast bfloat %2785 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2786, ptr addrspace(8) %68, i32 %2782, i32 0, i32 0)
+  %2787 = add i32 %2484, 64
+  %2788 = add i32 %2787, %39
+  %2789 = extractelement <8 x float> %1470, i64 2
+  %2790 = fptrunc float %2789 to bfloat
+  %2791 = mul i32 %2788, 4
+  %2792 = bitcast bfloat %2790 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2792, ptr addrspace(8) %67, i32 %2791, i32 0, i32 0)
+  %2793 = extractelement <8 x float> %1486, i64 2
+  %2794 = fptrunc float %2793 to bfloat
+  %2795 = bitcast bfloat %2794 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2795, ptr addrspace(8) %68, i32 %2791, i32 0, i32 0)
+  %2796 = add i32 %2496, 64
+  %2797 = add i32 %2796, %39
+  %2798 = extractelement <8 x float> %1470, i64 3
+  %2799 = fptrunc float %2798 to bfloat
+  %2800 = mul i32 %2797, 4
+  %2801 = bitcast bfloat %2799 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2801, ptr addrspace(8) %67, i32 %2800, i32 0, i32 0)
+  %2802 = extractelement <8 x float> %1486, i64 3
+  %2803 = fptrunc float %2802 to bfloat
+  %2804 = bitcast bfloat %2803 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2804, ptr addrspace(8) %68, i32 %2800, i32 0, i32 0)
+  %2805 = add i32 %2508, 64
+  %2806 = add i32 %2805, %39
+  %2807 = extractelement <8 x float> %1470, i64 4
+  %2808 = fptrunc float %2807 to bfloat
+  %2809 = mul i32 %2806, 4
+  %2810 = bitcast bfloat %2808 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2810, ptr addrspace(8) %67, i32 %2809, i32 0, i32 0)
+  %2811 = extractelement <8 x float> %1486, i64 4
+  %2812 = fptrunc float %2811 to bfloat
+  %2813 = bitcast bfloat %2812 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2813, ptr addrspace(8) %68, i32 %2809, i32 0, i32 0)
+  %2814 = add i32 %2520, 64
+  %2815 = add i32 %2814, %39
+  %2816 = extractelement <8 x float> %1470, i64 5
+  %2817 = fptrunc float %2816 to bfloat
+  %2818 = mul i32 %2815, 4
+  %2819 = bitcast bfloat %2817 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2819, ptr addrspace(8) %67, i32 %2818, i32 0, i32 0)
+  %2820 = extractelement <8 x float> %1486, i64 5
+  %2821 = fptrunc float %2820 to bfloat
+  %2822 = bitcast bfloat %2821 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2822, ptr addrspace(8) %68, i32 %2818, i32 0, i32 0)
+  %2823 = add i32 %2532, 64
+  %2824 = add i32 %2823, %39
+  %2825 = extractelement <8 x float> %1470, i64 6
+  %2826 = fptrunc float %2825 to bfloat
+  %2827 = mul i32 %2824, 4
+  %2828 = bitcast bfloat %2826 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2828, ptr addrspace(8) %67, i32 %2827, i32 0, i32 0)
+  %2829 = extractelement <8 x float> %1486, i64 6
+  %2830 = fptrunc float %2829 to bfloat
+  %2831 = bitcast bfloat %2830 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2831, ptr addrspace(8) %68, i32 %2827, i32 0, i32 0)
+  %2832 = add i32 %2544, 64
+  %2833 = add i32 %2832, %39
+  %2834 = extractelement <8 x float> %1470, i64 7
+  %2835 = fptrunc float %2834 to bfloat
+  %2836 = mul i32 %2833, 4
+  %2837 = bitcast bfloat %2835 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2837, ptr addrspace(8) %67, i32 %2836, i32 0, i32 0)
+  %2838 = extractelement <8 x float> %1486, i64 7
+  %2839 = fptrunc float %2838 to bfloat
+  %2840 = bitcast bfloat %2839 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2840, ptr addrspace(8) %68, i32 %2836, i32 0, i32 0)
+  %2841 = add i32 %2460, 80
+  %2842 = add i32 %2841, %39
+  %2843 = extractelement <8 x float> %1471, i64 0
+  %2844 = fptrunc float %2843 to bfloat
+  %2845 = mul i32 %2842, 4
+  %2846 = bitcast bfloat %2844 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2846, ptr addrspace(8) %67, i32 %2845, i32 0, i32 0)
+  %2847 = extractelement <8 x float> %1487, i64 0
+  %2848 = fptrunc float %2847 to bfloat
+  %2849 = bitcast bfloat %2848 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2849, ptr addrspace(8) %68, i32 %2845, i32 0, i32 0)
+  %2850 = add i32 %2472, 80
+  %2851 = add i32 %2850, %39
+  %2852 = extractelement <8 x float> %1471, i64 1
+  %2853 = fptrunc float %2852 to bfloat
+  %2854 = mul i32 %2851, 4
+  %2855 = bitcast bfloat %2853 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2855, ptr addrspace(8) %67, i32 %2854, i32 0, i32 0)
+  %2856 = extractelement <8 x float> %1487, i64 1
+  %2857 = fptrunc float %2856 to bfloat
+  %2858 = bitcast bfloat %2857 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2858, ptr addrspace(8) %68, i32 %2854, i32 0, i32 0)
+  %2859 = add i32 %2484, 80
+  %2860 = add i32 %2859, %39
+  %2861 = extractelement <8 x float> %1471, i64 2
+  %2862 = fptrunc float %2861 to bfloat
+  %2863 = mul i32 %2860, 4
+  %2864 = bitcast bfloat %2862 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2864, ptr addrspace(8) %67, i32 %2863, i32 0, i32 0)
+  %2865 = extractelement <8 x float> %1487, i64 2
+  %2866 = fptrunc float %2865 to bfloat
+  %2867 = bitcast bfloat %2866 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2867, ptr addrspace(8) %68, i32 %2863, i32 0, i32 0)
+  %2868 = add i32 %2496, 80
+  %2869 = add i32 %2868, %39
+  %2870 = extractelement <8 x float> %1471, i64 3
+  %2871 = fptrunc float %2870 to bfloat
+  %2872 = mul i32 %2869, 4
+  %2873 = bitcast bfloat %2871 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2873, ptr addrspace(8) %67, i32 %2872, i32 0, i32 0)
+  %2874 = extractelement <8 x float> %1487, i64 3
+  %2875 = fptrunc float %2874 to bfloat
+  %2876 = bitcast bfloat %2875 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2876, ptr addrspace(8) %68, i32 %2872, i32 0, i32 0)
+  %2877 = add i32 %2508, 80
+  %2878 = add i32 %2877, %39
+  %2879 = extractelement <8 x float> %1471, i64 4
+  %2880 = fptrunc float %2879 to bfloat
+  %2881 = mul i32 %2878, 4
+  %2882 = bitcast bfloat %2880 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2882, ptr addrspace(8) %67, i32 %2881, i32 0, i32 0)
+  %2883 = extractelement <8 x float> %1487, i64 4
+  %2884 = fptrunc float %2883 to bfloat
+  %2885 = bitcast bfloat %2884 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2885, ptr addrspace(8) %68, i32 %2881, i32 0, i32 0)
+  %2886 = add i32 %2520, 80
+  %2887 = add i32 %2886, %39
+  %2888 = extractelement <8 x float> %1471, i64 5
+  %2889 = fptrunc float %2888 to bfloat
+  %2890 = mul i32 %2887, 4
+  %2891 = bitcast bfloat %2889 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2891, ptr addrspace(8) %67, i32 %2890, i32 0, i32 0)
+  %2892 = extractelement <8 x float> %1487, i64 5
+  %2893 = fptrunc float %2892 to bfloat
+  %2894 = bitcast bfloat %2893 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2894, ptr addrspace(8) %68, i32 %2890, i32 0, i32 0)
+  %2895 = add i32 %2532, 80
+  %2896 = add i32 %2895, %39
+  %2897 = extractelement <8 x float> %1471, i64 6
+  %2898 = fptrunc float %2897 to bfloat
+  %2899 = mul i32 %2896, 4
+  %2900 = bitcast bfloat %2898 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2900, ptr addrspace(8) %67, i32 %2899, i32 0, i32 0)
+  %2901 = extractelement <8 x float> %1487, i64 6
+  %2902 = fptrunc float %2901 to bfloat
+  %2903 = bitcast bfloat %2902 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2903, ptr addrspace(8) %68, i32 %2899, i32 0, i32 0)
+  %2904 = add i32 %2544, 80
+  %2905 = add i32 %2904, %39
+  %2906 = extractelement <8 x float> %1471, i64 7
+  %2907 = fptrunc float %2906 to bfloat
+  %2908 = mul i32 %2905, 4
+  %2909 = bitcast bfloat %2907 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2909, ptr addrspace(8) %67, i32 %2908, i32 0, i32 0)
+  %2910 = extractelement <8 x float> %1487, i64 7
+  %2911 = fptrunc float %2910 to bfloat
+  %2912 = bitcast bfloat %2911 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2912, ptr addrspace(8) %68, i32 %2908, i32 0, i32 0)
+  %2913 = add i32 %2460, 96
+  %2914 = add i32 %2913, %39
+  %2915 = extractelement <8 x float> %1472, i64 0
+  %2916 = fptrunc float %2915 to bfloat
+  %2917 = mul i32 %2914, 4
+  %2918 = bitcast bfloat %2916 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2918, ptr addrspace(8) %67, i32 %2917, i32 0, i32 0)
+  %2919 = extractelement <8 x float> %1488, i64 0
+  %2920 = fptrunc float %2919 to bfloat
+  %2921 = bitcast bfloat %2920 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2921, ptr addrspace(8) %68, i32 %2917, i32 0, i32 0)
+  %2922 = add i32 %2472, 96
+  %2923 = add i32 %2922, %39
+  %2924 = extractelement <8 x float> %1472, i64 1
+  %2925 = fptrunc float %2924 to bfloat
+  %2926 = mul i32 %2923, 4
+  %2927 = bitcast bfloat %2925 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2927, ptr addrspace(8) %67, i32 %2926, i32 0, i32 0)
+  %2928 = extractelement <8 x float> %1488, i64 1
+  %2929 = fptrunc float %2928 to bfloat
+  %2930 = bitcast bfloat %2929 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2930, ptr addrspace(8) %68, i32 %2926, i32 0, i32 0)
+  %2931 = add i32 %2484, 96
+  %2932 = add i32 %2931, %39
+  %2933 = extractelement <8 x float> %1472, i64 2
+  %2934 = fptrunc float %2933 to bfloat
+  %2935 = mul i32 %2932, 4
+  %2936 = bitcast bfloat %2934 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2936, ptr addrspace(8) %67, i32 %2935, i32 0, i32 0)
+  %2937 = extractelement <8 x float> %1488, i64 2
+  %2938 = fptrunc float %2937 to bfloat
+  %2939 = bitcast bfloat %2938 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2939, ptr addrspace(8) %68, i32 %2935, i32 0, i32 0)
+  %2940 = add i32 %2496, 96
+  %2941 = add i32 %2940, %39
+  %2942 = extractelement <8 x float> %1472, i64 3
+  %2943 = fptrunc float %2942 to bfloat
+  %2944 = mul i32 %2941, 4
+  %2945 = bitcast bfloat %2943 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2945, ptr addrspace(8) %67, i32 %2944, i32 0, i32 0)
+  %2946 = extractelement <8 x float> %1488, i64 3
+  %2947 = fptrunc float %2946 to bfloat
+  %2948 = bitcast bfloat %2947 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2948, ptr addrspace(8) %68, i32 %2944, i32 0, i32 0)
+  %2949 = add i32 %2508, 96
+  %2950 = add i32 %2949, %39
+  %2951 = extractelement <8 x float> %1472, i64 4
+  %2952 = fptrunc float %2951 to bfloat
+  %2953 = mul i32 %2950, 4
+  %2954 = bitcast bfloat %2952 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2954, ptr addrspace(8) %67, i32 %2953, i32 0, i32 0)
+  %2955 = extractelement <8 x float> %1488, i64 4
+  %2956 = fptrunc float %2955 to bfloat
+  %2957 = bitcast bfloat %2956 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2957, ptr addrspace(8) %68, i32 %2953, i32 0, i32 0)
+  %2958 = add i32 %2520, 96
+  %2959 = add i32 %2958, %39
+  %2960 = extractelement <8 x float> %1472, i64 5
+  %2961 = fptrunc float %2960 to bfloat
+  %2962 = mul i32 %2959, 4
+  %2963 = bitcast bfloat %2961 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2963, ptr addrspace(8) %67, i32 %2962, i32 0, i32 0)
+  %2964 = extractelement <8 x float> %1488, i64 5
+  %2965 = fptrunc float %2964 to bfloat
+  %2966 = bitcast bfloat %2965 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2966, ptr addrspace(8) %68, i32 %2962, i32 0, i32 0)
+  %2967 = add i32 %2532, 96
+  %2968 = add i32 %2967, %39
+  %2969 = extractelement <8 x float> %1472, i64 6
+  %2970 = fptrunc float %2969 to bfloat
+  %2971 = mul i32 %2968, 4
+  %2972 = bitcast bfloat %2970 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2972, ptr addrspace(8) %67, i32 %2971, i32 0, i32 0)
+  %2973 = extractelement <8 x float> %1488, i64 6
+  %2974 = fptrunc float %2973 to bfloat
+  %2975 = bitcast bfloat %2974 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2975, ptr addrspace(8) %68, i32 %2971, i32 0, i32 0)
+  %2976 = add i32 %2544, 96
+  %2977 = add i32 %2976, %39
+  %2978 = extractelement <8 x float> %1472, i64 7
+  %2979 = fptrunc float %2978 to bfloat
+  %2980 = mul i32 %2977, 4
+  %2981 = bitcast bfloat %2979 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2981, ptr addrspace(8) %67, i32 %2980, i32 0, i32 0)
+  %2982 = extractelement <8 x float> %1488, i64 7
+  %2983 = fptrunc float %2982 to bfloat
+  %2984 = bitcast bfloat %2983 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2984, ptr addrspace(8) %68, i32 %2980, i32 0, i32 0)
+  %2985 = add i32 %2460, 112
+  %2986 = add i32 %2985, %39
+  %2987 = extractelement <8 x float> %1473, i64 0
+  %2988 = fptrunc float %2987 to bfloat
+  %2989 = mul i32 %2986, 4
+  %2990 = bitcast bfloat %2988 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2990, ptr addrspace(8) %67, i32 %2989, i32 0, i32 0)
+  %2991 = extractelement <8 x float> %1489, i64 0
+  %2992 = fptrunc float %2991 to bfloat
+  %2993 = bitcast bfloat %2992 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2993, ptr addrspace(8) %68, i32 %2989, i32 0, i32 0)
+  %2994 = add i32 %2472, 112
+  %2995 = add i32 %2994, %39
+  %2996 = extractelement <8 x float> %1473, i64 1
+  %2997 = fptrunc float %2996 to bfloat
+  %2998 = mul i32 %2995, 4
+  %2999 = bitcast bfloat %2997 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %2999, ptr addrspace(8) %67, i32 %2998, i32 0, i32 0)
+  %3000 = extractelement <8 x float> %1489, i64 1
+  %3001 = fptrunc float %3000 to bfloat
+  %3002 = bitcast bfloat %3001 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3002, ptr addrspace(8) %68, i32 %2998, i32 0, i32 0)
+  %3003 = add i32 %2484, 112
+  %3004 = add i32 %3003, %39
+  %3005 = extractelement <8 x float> %1473, i64 2
+  %3006 = fptrunc float %3005 to bfloat
+  %3007 = mul i32 %3004, 4
+  %3008 = bitcast bfloat %3006 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3008, ptr addrspace(8) %67, i32 %3007, i32 0, i32 0)
+  %3009 = extractelement <8 x float> %1489, i64 2
+  %3010 = fptrunc float %3009 to bfloat
+  %3011 = bitcast bfloat %3010 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3011, ptr addrspace(8) %68, i32 %3007, i32 0, i32 0)
+  %3012 = add i32 %2496, 112
+  %3013 = add i32 %3012, %39
+  %3014 = extractelement <8 x float> %1473, i64 3
+  %3015 = fptrunc float %3014 to bfloat
+  %3016 = mul i32 %3013, 4
+  %3017 = bitcast bfloat %3015 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3017, ptr addrspace(8) %67, i32 %3016, i32 0, i32 0)
+  %3018 = extractelement <8 x float> %1489, i64 3
+  %3019 = fptrunc float %3018 to bfloat
+  %3020 = bitcast bfloat %3019 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3020, ptr addrspace(8) %68, i32 %3016, i32 0, i32 0)
+  %3021 = add i32 %2508, 112
+  %3022 = add i32 %3021, %39
+  %3023 = extractelement <8 x float> %1473, i64 4
+  %3024 = fptrunc float %3023 to bfloat
+  %3025 = mul i32 %3022, 4
+  %3026 = bitcast bfloat %3024 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3026, ptr addrspace(8) %67, i32 %3025, i32 0, i32 0)
+  %3027 = extractelement <8 x float> %1489, i64 4
+  %3028 = fptrunc float %3027 to bfloat
+  %3029 = bitcast bfloat %3028 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3029, ptr addrspace(8) %68, i32 %3025, i32 0, i32 0)
+  %3030 = add i32 %2520, 112
+  %3031 = add i32 %3030, %39
+  %3032 = extractelement <8 x float> %1473, i64 5
+  %3033 = fptrunc float %3032 to bfloat
+  %3034 = mul i32 %3031, 4
+  %3035 = bitcast bfloat %3033 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3035, ptr addrspace(8) %67, i32 %3034, i32 0, i32 0)
+  %3036 = extractelement <8 x float> %1489, i64 5
+  %3037 = fptrunc float %3036 to bfloat
+  %3038 = bitcast bfloat %3037 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3038, ptr addrspace(8) %68, i32 %3034, i32 0, i32 0)
+  %3039 = add i32 %2532, 112
+  %3040 = add i32 %3039, %39
+  %3041 = extractelement <8 x float> %1473, i64 6
+  %3042 = fptrunc float %3041 to bfloat
+  %3043 = mul i32 %3040, 4
+  %3044 = bitcast bfloat %3042 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3044, ptr addrspace(8) %67, i32 %3043, i32 0, i32 0)
+  %3045 = extractelement <8 x float> %1489, i64 6
+  %3046 = fptrunc float %3045 to bfloat
+  %3047 = bitcast bfloat %3046 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3047, ptr addrspace(8) %68, i32 %3043, i32 0, i32 0)
+  %3048 = add i32 %2544, 112
+  %3049 = add i32 %3048, %39
+  %3050 = extractelement <8 x float> %1473, i64 7
+  %3051 = fptrunc float %3050 to bfloat
+  %3052 = mul i32 %3049, 4
+  %3053 = bitcast bfloat %3051 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3053, ptr addrspace(8) %67, i32 %3052, i32 0, i32 0)
+  %3054 = extractelement <8 x float> %1489, i64 7
+  %3055 = fptrunc float %3054 to bfloat
+  %3056 = bitcast bfloat %3055 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3056, ptr addrspace(8) %68, i32 %3052, i32 0, i32 0)
+  %3057 = add i32 %114, %194
+  %3058 = mul i32 %3057, %20
+  %3059 = mul i32 %3058, 128
+  %3060 = add i32 %2456, %3059
+  %3061 = add i32 %3060, %39
+  %3062 = extractelement <8 x float> %1474, i64 0
+  %3063 = fptrunc float %3062 to bfloat
+  %3064 = mul i32 %3061, 4
+  %3065 = bitcast bfloat %3063 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3065, ptr addrspace(8) %67, i32 %3064, i32 0, i32 0)
+  %3066 = extractelement <8 x float> %1490, i64 0
+  %3067 = fptrunc float %3066 to bfloat
+  %3068 = bitcast bfloat %3067 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3068, ptr addrspace(8) %68, i32 %3064, i32 0, i32 0)
+  %3069 = add i32 %3057, 1
+  %3070 = mul i32 %3069, %20
+  %3071 = mul i32 %3070, 128
+  %3072 = add i32 %2456, %3071
+  %3073 = add i32 %3072, %39
+  %3074 = extractelement <8 x float> %1474, i64 1
+  %3075 = fptrunc float %3074 to bfloat
+  %3076 = mul i32 %3073, 4
+  %3077 = bitcast bfloat %3075 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3077, ptr addrspace(8) %67, i32 %3076, i32 0, i32 0)
+  %3078 = extractelement <8 x float> %1490, i64 1
+  %3079 = fptrunc float %3078 to bfloat
+  %3080 = bitcast bfloat %3079 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3080, ptr addrspace(8) %68, i32 %3076, i32 0, i32 0)
+  %3081 = add i32 %3057, 2
+  %3082 = mul i32 %3081, %20
+  %3083 = mul i32 %3082, 128
+  %3084 = add i32 %2456, %3083
+  %3085 = add i32 %3084, %39
+  %3086 = extractelement <8 x float> %1474, i64 2
+  %3087 = fptrunc float %3086 to bfloat
+  %3088 = mul i32 %3085, 4
+  %3089 = bitcast bfloat %3087 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3089, ptr addrspace(8) %67, i32 %3088, i32 0, i32 0)
+  %3090 = extractelement <8 x float> %1490, i64 2
+  %3091 = fptrunc float %3090 to bfloat
+  %3092 = bitcast bfloat %3091 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3092, ptr addrspace(8) %68, i32 %3088, i32 0, i32 0)
+  %3093 = add i32 %3057, 3
+  %3094 = mul i32 %3093, %20
+  %3095 = mul i32 %3094, 128
+  %3096 = add i32 %2456, %3095
+  %3097 = add i32 %3096, %39
+  %3098 = extractelement <8 x float> %1474, i64 3
+  %3099 = fptrunc float %3098 to bfloat
+  %3100 = mul i32 %3097, 4
+  %3101 = bitcast bfloat %3099 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3101, ptr addrspace(8) %67, i32 %3100, i32 0, i32 0)
+  %3102 = extractelement <8 x float> %1490, i64 3
+  %3103 = fptrunc float %3102 to bfloat
+  %3104 = bitcast bfloat %3103 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3104, ptr addrspace(8) %68, i32 %3100, i32 0, i32 0)
+  %3105 = add i32 %3057, 4
+  %3106 = mul i32 %3105, %20
+  %3107 = mul i32 %3106, 128
+  %3108 = add i32 %2456, %3107
+  %3109 = add i32 %3108, %39
+  %3110 = extractelement <8 x float> %1474, i64 4
+  %3111 = fptrunc float %3110 to bfloat
+  %3112 = mul i32 %3109, 4
+  %3113 = bitcast bfloat %3111 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3113, ptr addrspace(8) %67, i32 %3112, i32 0, i32 0)
+  %3114 = extractelement <8 x float> %1490, i64 4
+  %3115 = fptrunc float %3114 to bfloat
+  %3116 = bitcast bfloat %3115 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3116, ptr addrspace(8) %68, i32 %3112, i32 0, i32 0)
+  %3117 = add i32 %3057, 5
+  %3118 = mul i32 %3117, %20
+  %3119 = mul i32 %3118, 128
+  %3120 = add i32 %2456, %3119
+  %3121 = add i32 %3120, %39
+  %3122 = extractelement <8 x float> %1474, i64 5
+  %3123 = fptrunc float %3122 to bfloat
+  %3124 = mul i32 %3121, 4
+  %3125 = bitcast bfloat %3123 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3125, ptr addrspace(8) %67, i32 %3124, i32 0, i32 0)
+  %3126 = extractelement <8 x float> %1490, i64 5
+  %3127 = fptrunc float %3126 to bfloat
+  %3128 = bitcast bfloat %3127 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3128, ptr addrspace(8) %68, i32 %3124, i32 0, i32 0)
+  %3129 = add i32 %3057, 6
+  %3130 = mul i32 %3129, %20
+  %3131 = mul i32 %3130, 128
+  %3132 = add i32 %2456, %3131
+  %3133 = add i32 %3132, %39
+  %3134 = extractelement <8 x float> %1474, i64 6
+  %3135 = fptrunc float %3134 to bfloat
+  %3136 = mul i32 %3133, 4
+  %3137 = bitcast bfloat %3135 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3137, ptr addrspace(8) %67, i32 %3136, i32 0, i32 0)
+  %3138 = extractelement <8 x float> %1490, i64 6
+  %3139 = fptrunc float %3138 to bfloat
+  %3140 = bitcast bfloat %3139 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3140, ptr addrspace(8) %68, i32 %3136, i32 0, i32 0)
+  %3141 = add i32 %3057, 7
+  %3142 = mul i32 %3141, %20
+  %3143 = mul i32 %3142, 128
+  %3144 = add i32 %2456, %3143
+  %3145 = add i32 %3144, %39
+  %3146 = extractelement <8 x float> %1474, i64 7
+  %3147 = fptrunc float %3146 to bfloat
+  %3148 = mul i32 %3145, 4
+  %3149 = bitcast bfloat %3147 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3149, ptr addrspace(8) %67, i32 %3148, i32 0, i32 0)
+  %3150 = extractelement <8 x float> %1490, i64 7
+  %3151 = fptrunc float %3150 to bfloat
+  %3152 = bitcast bfloat %3151 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3152, ptr addrspace(8) %68, i32 %3148, i32 0, i32 0)
+  %3153 = add i32 %3060, 16
+  %3154 = add i32 %3153, %39
+  %3155 = extractelement <8 x float> %1475, i64 0
+  %3156 = fptrunc float %3155 to bfloat
+  %3157 = mul i32 %3154, 4
+  %3158 = bitcast bfloat %3156 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3158, ptr addrspace(8) %67, i32 %3157, i32 0, i32 0)
+  %3159 = extractelement <8 x float> %1491, i64 0
+  %3160 = fptrunc float %3159 to bfloat
+  %3161 = bitcast bfloat %3160 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3161, ptr addrspace(8) %68, i32 %3157, i32 0, i32 0)
+  %3162 = add i32 %3072, 16
+  %3163 = add i32 %3162, %39
+  %3164 = extractelement <8 x float> %1475, i64 1
+  %3165 = fptrunc float %3164 to bfloat
+  %3166 = mul i32 %3163, 4
+  %3167 = bitcast bfloat %3165 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3167, ptr addrspace(8) %67, i32 %3166, i32 0, i32 0)
+  %3168 = extractelement <8 x float> %1491, i64 1
+  %3169 = fptrunc float %3168 to bfloat
+  %3170 = bitcast bfloat %3169 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3170, ptr addrspace(8) %68, i32 %3166, i32 0, i32 0)
+  %3171 = add i32 %3084, 16
+  %3172 = add i32 %3171, %39
+  %3173 = extractelement <8 x float> %1475, i64 2
+  %3174 = fptrunc float %3173 to bfloat
+  %3175 = mul i32 %3172, 4
+  %3176 = bitcast bfloat %3174 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3176, ptr addrspace(8) %67, i32 %3175, i32 0, i32 0)
+  %3177 = extractelement <8 x float> %1491, i64 2
+  %3178 = fptrunc float %3177 to bfloat
+  %3179 = bitcast bfloat %3178 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3179, ptr addrspace(8) %68, i32 %3175, i32 0, i32 0)
+  %3180 = add i32 %3096, 16
+  %3181 = add i32 %3180, %39
+  %3182 = extractelement <8 x float> %1475, i64 3
+  %3183 = fptrunc float %3182 to bfloat
+  %3184 = mul i32 %3181, 4
+  %3185 = bitcast bfloat %3183 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3185, ptr addrspace(8) %67, i32 %3184, i32 0, i32 0)
+  %3186 = extractelement <8 x float> %1491, i64 3
+  %3187 = fptrunc float %3186 to bfloat
+  %3188 = bitcast bfloat %3187 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3188, ptr addrspace(8) %68, i32 %3184, i32 0, i32 0)
+  %3189 = add i32 %3108, 16
+  %3190 = add i32 %3189, %39
+  %3191 = extractelement <8 x float> %1475, i64 4
+  %3192 = fptrunc float %3191 to bfloat
+  %3193 = mul i32 %3190, 4
+  %3194 = bitcast bfloat %3192 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3194, ptr addrspace(8) %67, i32 %3193, i32 0, i32 0)
+  %3195 = extractelement <8 x float> %1491, i64 4
+  %3196 = fptrunc float %3195 to bfloat
+  %3197 = bitcast bfloat %3196 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3197, ptr addrspace(8) %68, i32 %3193, i32 0, i32 0)
+  %3198 = add i32 %3120, 16
+  %3199 = add i32 %3198, %39
+  %3200 = extractelement <8 x float> %1475, i64 5
+  %3201 = fptrunc float %3200 to bfloat
+  %3202 = mul i32 %3199, 4
+  %3203 = bitcast bfloat %3201 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3203, ptr addrspace(8) %67, i32 %3202, i32 0, i32 0)
+  %3204 = extractelement <8 x float> %1491, i64 5
+  %3205 = fptrunc float %3204 to bfloat
+  %3206 = bitcast bfloat %3205 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3206, ptr addrspace(8) %68, i32 %3202, i32 0, i32 0)
+  %3207 = add i32 %3132, 16
+  %3208 = add i32 %3207, %39
+  %3209 = extractelement <8 x float> %1475, i64 6
+  %3210 = fptrunc float %3209 to bfloat
+  %3211 = mul i32 %3208, 4
+  %3212 = bitcast bfloat %3210 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3212, ptr addrspace(8) %67, i32 %3211, i32 0, i32 0)
+  %3213 = extractelement <8 x float> %1491, i64 6
+  %3214 = fptrunc float %3213 to bfloat
+  %3215 = bitcast bfloat %3214 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3215, ptr addrspace(8) %68, i32 %3211, i32 0, i32 0)
+  %3216 = add i32 %3144, 16
+  %3217 = add i32 %3216, %39
+  %3218 = extractelement <8 x float> %1475, i64 7
+  %3219 = fptrunc float %3218 to bfloat
+  %3220 = mul i32 %3217, 4
+  %3221 = bitcast bfloat %3219 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3221, ptr addrspace(8) %67, i32 %3220, i32 0, i32 0)
+  %3222 = extractelement <8 x float> %1491, i64 7
+  %3223 = fptrunc float %3222 to bfloat
+  %3224 = bitcast bfloat %3223 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3224, ptr addrspace(8) %68, i32 %3220, i32 0, i32 0)
+  %3225 = add i32 %3060, 32
+  %3226 = add i32 %3225, %39
+  %3227 = extractelement <8 x float> %1476, i64 0
+  %3228 = fptrunc float %3227 to bfloat
+  %3229 = mul i32 %3226, 4
+  %3230 = bitcast bfloat %3228 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3230, ptr addrspace(8) %67, i32 %3229, i32 0, i32 0)
+  %3231 = extractelement <8 x float> %1492, i64 0
+  %3232 = fptrunc float %3231 to bfloat
+  %3233 = bitcast bfloat %3232 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3233, ptr addrspace(8) %68, i32 %3229, i32 0, i32 0)
+  %3234 = add i32 %3072, 32
+  %3235 = add i32 %3234, %39
+  %3236 = extractelement <8 x float> %1476, i64 1
+  %3237 = fptrunc float %3236 to bfloat
+  %3238 = mul i32 %3235, 4
+  %3239 = bitcast bfloat %3237 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3239, ptr addrspace(8) %67, i32 %3238, i32 0, i32 0)
+  %3240 = extractelement <8 x float> %1492, i64 1
+  %3241 = fptrunc float %3240 to bfloat
+  %3242 = bitcast bfloat %3241 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3242, ptr addrspace(8) %68, i32 %3238, i32 0, i32 0)
+  %3243 = add i32 %3084, 32
+  %3244 = add i32 %3243, %39
+  %3245 = extractelement <8 x float> %1476, i64 2
+  %3246 = fptrunc float %3245 to bfloat
+  %3247 = mul i32 %3244, 4
+  %3248 = bitcast bfloat %3246 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3248, ptr addrspace(8) %67, i32 %3247, i32 0, i32 0)
+  %3249 = extractelement <8 x float> %1492, i64 2
+  %3250 = fptrunc float %3249 to bfloat
+  %3251 = bitcast bfloat %3250 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3251, ptr addrspace(8) %68, i32 %3247, i32 0, i32 0)
+  %3252 = add i32 %3096, 32
+  %3253 = add i32 %3252, %39
+  %3254 = extractelement <8 x float> %1476, i64 3
+  %3255 = fptrunc float %3254 to bfloat
+  %3256 = mul i32 %3253, 4
+  %3257 = bitcast bfloat %3255 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3257, ptr addrspace(8) %67, i32 %3256, i32 0, i32 0)
+  %3258 = extractelement <8 x float> %1492, i64 3
+  %3259 = fptrunc float %3258 to bfloat
+  %3260 = bitcast bfloat %3259 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3260, ptr addrspace(8) %68, i32 %3256, i32 0, i32 0)
+  %3261 = add i32 %3108, 32
+  %3262 = add i32 %3261, %39
+  %3263 = extractelement <8 x float> %1476, i64 4
+  %3264 = fptrunc float %3263 to bfloat
+  %3265 = mul i32 %3262, 4
+  %3266 = bitcast bfloat %3264 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3266, ptr addrspace(8) %67, i32 %3265, i32 0, i32 0)
+  %3267 = extractelement <8 x float> %1492, i64 4
+  %3268 = fptrunc float %3267 to bfloat
+  %3269 = bitcast bfloat %3268 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3269, ptr addrspace(8) %68, i32 %3265, i32 0, i32 0)
+  %3270 = add i32 %3120, 32
+  %3271 = add i32 %3270, %39
+  %3272 = extractelement <8 x float> %1476, i64 5
+  %3273 = fptrunc float %3272 to bfloat
+  %3274 = mul i32 %3271, 4
+  %3275 = bitcast bfloat %3273 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3275, ptr addrspace(8) %67, i32 %3274, i32 0, i32 0)
+  %3276 = extractelement <8 x float> %1492, i64 5
+  %3277 = fptrunc float %3276 to bfloat
+  %3278 = bitcast bfloat %3277 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3278, ptr addrspace(8) %68, i32 %3274, i32 0, i32 0)
+  %3279 = add i32 %3132, 32
+  %3280 = add i32 %3279, %39
+  %3281 = extractelement <8 x float> %1476, i64 6
+  %3282 = fptrunc float %3281 to bfloat
+  %3283 = mul i32 %3280, 4
+  %3284 = bitcast bfloat %3282 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3284, ptr addrspace(8) %67, i32 %3283, i32 0, i32 0)
+  %3285 = extractelement <8 x float> %1492, i64 6
+  %3286 = fptrunc float %3285 to bfloat
+  %3287 = bitcast bfloat %3286 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3287, ptr addrspace(8) %68, i32 %3283, i32 0, i32 0)
+  %3288 = add i32 %3144, 32
+  %3289 = add i32 %3288, %39
+  %3290 = extractelement <8 x float> %1476, i64 7
+  %3291 = fptrunc float %3290 to bfloat
+  %3292 = mul i32 %3289, 4
+  %3293 = bitcast bfloat %3291 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3293, ptr addrspace(8) %67, i32 %3292, i32 0, i32 0)
+  %3294 = extractelement <8 x float> %1492, i64 7
+  %3295 = fptrunc float %3294 to bfloat
+  %3296 = bitcast bfloat %3295 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3296, ptr addrspace(8) %68, i32 %3292, i32 0, i32 0)
+  %3297 = add i32 %3060, 48
+  %3298 = add i32 %3297, %39
+  %3299 = extractelement <8 x float> %1477, i64 0
+  %3300 = fptrunc float %3299 to bfloat
+  %3301 = mul i32 %3298, 4
+  %3302 = bitcast bfloat %3300 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3302, ptr addrspace(8) %67, i32 %3301, i32 0, i32 0)
+  %3303 = extractelement <8 x float> %1493, i64 0
+  %3304 = fptrunc float %3303 to bfloat
+  %3305 = bitcast bfloat %3304 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3305, ptr addrspace(8) %68, i32 %3301, i32 0, i32 0)
+  %3306 = add i32 %3072, 48
+  %3307 = add i32 %3306, %39
+  %3308 = extractelement <8 x float> %1477, i64 1
+  %3309 = fptrunc float %3308 to bfloat
+  %3310 = mul i32 %3307, 4
+  %3311 = bitcast bfloat %3309 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3311, ptr addrspace(8) %67, i32 %3310, i32 0, i32 0)
+  %3312 = extractelement <8 x float> %1493, i64 1
+  %3313 = fptrunc float %3312 to bfloat
+  %3314 = bitcast bfloat %3313 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3314, ptr addrspace(8) %68, i32 %3310, i32 0, i32 0)
+  %3315 = add i32 %3084, 48
+  %3316 = add i32 %3315, %39
+  %3317 = extractelement <8 x float> %1477, i64 2
+  %3318 = fptrunc float %3317 to bfloat
+  %3319 = mul i32 %3316, 4
+  %3320 = bitcast bfloat %3318 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3320, ptr addrspace(8) %67, i32 %3319, i32 0, i32 0)
+  %3321 = extractelement <8 x float> %1493, i64 2
+  %3322 = fptrunc float %3321 to bfloat
+  %3323 = bitcast bfloat %3322 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3323, ptr addrspace(8) %68, i32 %3319, i32 0, i32 0)
+  %3324 = add i32 %3096, 48
+  %3325 = add i32 %3324, %39
+  %3326 = extractelement <8 x float> %1477, i64 3
+  %3327 = fptrunc float %3326 to bfloat
+  %3328 = mul i32 %3325, 4
+  %3329 = bitcast bfloat %3327 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3329, ptr addrspace(8) %67, i32 %3328, i32 0, i32 0)
+  %3330 = extractelement <8 x float> %1493, i64 3
+  %3331 = fptrunc float %3330 to bfloat
+  %3332 = bitcast bfloat %3331 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3332, ptr addrspace(8) %68, i32 %3328, i32 0, i32 0)
+  %3333 = add i32 %3108, 48
+  %3334 = add i32 %3333, %39
+  %3335 = extractelement <8 x float> %1477, i64 4
+  %3336 = fptrunc float %3335 to bfloat
+  %3337 = mul i32 %3334, 4
+  %3338 = bitcast bfloat %3336 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3338, ptr addrspace(8) %67, i32 %3337, i32 0, i32 0)
+  %3339 = extractelement <8 x float> %1493, i64 4
+  %3340 = fptrunc float %3339 to bfloat
+  %3341 = bitcast bfloat %3340 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3341, ptr addrspace(8) %68, i32 %3337, i32 0, i32 0)
+  %3342 = add i32 %3120, 48
+  %3343 = add i32 %3342, %39
+  %3344 = extractelement <8 x float> %1477, i64 5
+  %3345 = fptrunc float %3344 to bfloat
+  %3346 = mul i32 %3343, 4
+  %3347 = bitcast bfloat %3345 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3347, ptr addrspace(8) %67, i32 %3346, i32 0, i32 0)
+  %3348 = extractelement <8 x float> %1493, i64 5
+  %3349 = fptrunc float %3348 to bfloat
+  %3350 = bitcast bfloat %3349 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3350, ptr addrspace(8) %68, i32 %3346, i32 0, i32 0)
+  %3351 = add i32 %3132, 48
+  %3352 = add i32 %3351, %39
+  %3353 = extractelement <8 x float> %1477, i64 6
+  %3354 = fptrunc float %3353 to bfloat
+  %3355 = mul i32 %3352, 4
+  %3356 = bitcast bfloat %3354 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3356, ptr addrspace(8) %67, i32 %3355, i32 0, i32 0)
+  %3357 = extractelement <8 x float> %1493, i64 6
+  %3358 = fptrunc float %3357 to bfloat
+  %3359 = bitcast bfloat %3358 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3359, ptr addrspace(8) %68, i32 %3355, i32 0, i32 0)
+  %3360 = add i32 %3144, 48
+  %3361 = add i32 %3360, %39
+  %3362 = extractelement <8 x float> %1477, i64 7
+  %3363 = fptrunc float %3362 to bfloat
+  %3364 = mul i32 %3361, 4
+  %3365 = bitcast bfloat %3363 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3365, ptr addrspace(8) %67, i32 %3364, i32 0, i32 0)
+  %3366 = extractelement <8 x float> %1493, i64 7
+  %3367 = fptrunc float %3366 to bfloat
+  %3368 = bitcast bfloat %3367 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3368, ptr addrspace(8) %68, i32 %3364, i32 0, i32 0)
+  %3369 = add i32 %3060, 64
+  %3370 = add i32 %3369, %39
+  %3371 = extractelement <8 x float> %1478, i64 0
+  %3372 = fptrunc float %3371 to bfloat
+  %3373 = mul i32 %3370, 4
+  %3374 = bitcast bfloat %3372 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3374, ptr addrspace(8) %67, i32 %3373, i32 0, i32 0)
+  %3375 = extractelement <8 x float> %1494, i64 0
+  %3376 = fptrunc float %3375 to bfloat
+  %3377 = bitcast bfloat %3376 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3377, ptr addrspace(8) %68, i32 %3373, i32 0, i32 0)
+  %3378 = add i32 %3072, 64
+  %3379 = add i32 %3378, %39
+  %3380 = extractelement <8 x float> %1478, i64 1
+  %3381 = fptrunc float %3380 to bfloat
+  %3382 = mul i32 %3379, 4
+  %3383 = bitcast bfloat %3381 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3383, ptr addrspace(8) %67, i32 %3382, i32 0, i32 0)
+  %3384 = extractelement <8 x float> %1494, i64 1
+  %3385 = fptrunc float %3384 to bfloat
+  %3386 = bitcast bfloat %3385 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3386, ptr addrspace(8) %68, i32 %3382, i32 0, i32 0)
+  %3387 = add i32 %3084, 64
+  %3388 = add i32 %3387, %39
+  %3389 = extractelement <8 x float> %1478, i64 2
+  %3390 = fptrunc float %3389 to bfloat
+  %3391 = mul i32 %3388, 4
+  %3392 = bitcast bfloat %3390 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3392, ptr addrspace(8) %67, i32 %3391, i32 0, i32 0)
+  %3393 = extractelement <8 x float> %1494, i64 2
+  %3394 = fptrunc float %3393 to bfloat
+  %3395 = bitcast bfloat %3394 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3395, ptr addrspace(8) %68, i32 %3391, i32 0, i32 0)
+  %3396 = add i32 %3096, 64
+  %3397 = add i32 %3396, %39
+  %3398 = extractelement <8 x float> %1478, i64 3
+  %3399 = fptrunc float %3398 to bfloat
+  %3400 = mul i32 %3397, 4
+  %3401 = bitcast bfloat %3399 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3401, ptr addrspace(8) %67, i32 %3400, i32 0, i32 0)
+  %3402 = extractelement <8 x float> %1494, i64 3
+  %3403 = fptrunc float %3402 to bfloat
+  %3404 = bitcast bfloat %3403 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3404, ptr addrspace(8) %68, i32 %3400, i32 0, i32 0)
+  %3405 = add i32 %3108, 64
+  %3406 = add i32 %3405, %39
+  %3407 = extractelement <8 x float> %1478, i64 4
+  %3408 = fptrunc float %3407 to bfloat
+  %3409 = mul i32 %3406, 4
+  %3410 = bitcast bfloat %3408 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3410, ptr addrspace(8) %67, i32 %3409, i32 0, i32 0)
+  %3411 = extractelement <8 x float> %1494, i64 4
+  %3412 = fptrunc float %3411 to bfloat
+  %3413 = bitcast bfloat %3412 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3413, ptr addrspace(8) %68, i32 %3409, i32 0, i32 0)
+  %3414 = add i32 %3120, 64
+  %3415 = add i32 %3414, %39
+  %3416 = extractelement <8 x float> %1478, i64 5
+  %3417 = fptrunc float %3416 to bfloat
+  %3418 = mul i32 %3415, 4
+  %3419 = bitcast bfloat %3417 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3419, ptr addrspace(8) %67, i32 %3418, i32 0, i32 0)
+  %3420 = extractelement <8 x float> %1494, i64 5
+  %3421 = fptrunc float %3420 to bfloat
+  %3422 = bitcast bfloat %3421 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3422, ptr addrspace(8) %68, i32 %3418, i32 0, i32 0)
+  %3423 = add i32 %3132, 64
+  %3424 = add i32 %3423, %39
+  %3425 = extractelement <8 x float> %1478, i64 6
+  %3426 = fptrunc float %3425 to bfloat
+  %3427 = mul i32 %3424, 4
+  %3428 = bitcast bfloat %3426 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3428, ptr addrspace(8) %67, i32 %3427, i32 0, i32 0)
+  %3429 = extractelement <8 x float> %1494, i64 6
+  %3430 = fptrunc float %3429 to bfloat
+  %3431 = bitcast bfloat %3430 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3431, ptr addrspace(8) %68, i32 %3427, i32 0, i32 0)
+  %3432 = add i32 %3144, 64
+  %3433 = add i32 %3432, %39
+  %3434 = extractelement <8 x float> %1478, i64 7
+  %3435 = fptrunc float %3434 to bfloat
+  %3436 = mul i32 %3433, 4
+  %3437 = bitcast bfloat %3435 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3437, ptr addrspace(8) %67, i32 %3436, i32 0, i32 0)
+  %3438 = extractelement <8 x float> %1494, i64 7
+  %3439 = fptrunc float %3438 to bfloat
+  %3440 = bitcast bfloat %3439 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3440, ptr addrspace(8) %68, i32 %3436, i32 0, i32 0)
+  %3441 = add i32 %3060, 80
+  %3442 = add i32 %3441, %39
+  %3443 = extractelement <8 x float> %1479, i64 0
+  %3444 = fptrunc float %3443 to bfloat
+  %3445 = mul i32 %3442, 4
+  %3446 = bitcast bfloat %3444 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3446, ptr addrspace(8) %67, i32 %3445, i32 0, i32 0)
+  %3447 = extractelement <8 x float> %1495, i64 0
+  %3448 = fptrunc float %3447 to bfloat
+  %3449 = bitcast bfloat %3448 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3449, ptr addrspace(8) %68, i32 %3445, i32 0, i32 0)
+  %3450 = add i32 %3072, 80
+  %3451 = add i32 %3450, %39
+  %3452 = extractelement <8 x float> %1479, i64 1
+  %3453 = fptrunc float %3452 to bfloat
+  %3454 = mul i32 %3451, 4
+  %3455 = bitcast bfloat %3453 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3455, ptr addrspace(8) %67, i32 %3454, i32 0, i32 0)
+  %3456 = extractelement <8 x float> %1495, i64 1
+  %3457 = fptrunc float %3456 to bfloat
+  %3458 = bitcast bfloat %3457 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3458, ptr addrspace(8) %68, i32 %3454, i32 0, i32 0)
+  %3459 = add i32 %3084, 80
+  %3460 = add i32 %3459, %39
+  %3461 = extractelement <8 x float> %1479, i64 2
+  %3462 = fptrunc float %3461 to bfloat
+  %3463 = mul i32 %3460, 4
+  %3464 = bitcast bfloat %3462 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3464, ptr addrspace(8) %67, i32 %3463, i32 0, i32 0)
+  %3465 = extractelement <8 x float> %1495, i64 2
+  %3466 = fptrunc float %3465 to bfloat
+  %3467 = bitcast bfloat %3466 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3467, ptr addrspace(8) %68, i32 %3463, i32 0, i32 0)
+  %3468 = add i32 %3096, 80
+  %3469 = add i32 %3468, %39
+  %3470 = extractelement <8 x float> %1479, i64 3
+  %3471 = fptrunc float %3470 to bfloat
+  %3472 = mul i32 %3469, 4
+  %3473 = bitcast bfloat %3471 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3473, ptr addrspace(8) %67, i32 %3472, i32 0, i32 0)
+  %3474 = extractelement <8 x float> %1495, i64 3
+  %3475 = fptrunc float %3474 to bfloat
+  %3476 = bitcast bfloat %3475 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3476, ptr addrspace(8) %68, i32 %3472, i32 0, i32 0)
+  %3477 = add i32 %3108, 80
+  %3478 = add i32 %3477, %39
+  %3479 = extractelement <8 x float> %1479, i64 4
+  %3480 = fptrunc float %3479 to bfloat
+  %3481 = mul i32 %3478, 4
+  %3482 = bitcast bfloat %3480 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3482, ptr addrspace(8) %67, i32 %3481, i32 0, i32 0)
+  %3483 = extractelement <8 x float> %1495, i64 4
+  %3484 = fptrunc float %3483 to bfloat
+  %3485 = bitcast bfloat %3484 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3485, ptr addrspace(8) %68, i32 %3481, i32 0, i32 0)
+  %3486 = add i32 %3120, 80
+  %3487 = add i32 %3486, %39
+  %3488 = extractelement <8 x float> %1479, i64 5
+  %3489 = fptrunc float %3488 to bfloat
+  %3490 = mul i32 %3487, 4
+  %3491 = bitcast bfloat %3489 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3491, ptr addrspace(8) %67, i32 %3490, i32 0, i32 0)
+  %3492 = extractelement <8 x float> %1495, i64 5
+  %3493 = fptrunc float %3492 to bfloat
+  %3494 = bitcast bfloat %3493 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3494, ptr addrspace(8) %68, i32 %3490, i32 0, i32 0)
+  %3495 = add i32 %3132, 80
+  %3496 = add i32 %3495, %39
+  %3497 = extractelement <8 x float> %1479, i64 6
+  %3498 = fptrunc float %3497 to bfloat
+  %3499 = mul i32 %3496, 4
+  %3500 = bitcast bfloat %3498 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3500, ptr addrspace(8) %67, i32 %3499, i32 0, i32 0)
+  %3501 = extractelement <8 x float> %1495, i64 6
+  %3502 = fptrunc float %3501 to bfloat
+  %3503 = bitcast bfloat %3502 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3503, ptr addrspace(8) %68, i32 %3499, i32 0, i32 0)
+  %3504 = add i32 %3144, 80
+  %3505 = add i32 %3504, %39
+  %3506 = extractelement <8 x float> %1479, i64 7
+  %3507 = fptrunc float %3506 to bfloat
+  %3508 = mul i32 %3505, 4
+  %3509 = bitcast bfloat %3507 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3509, ptr addrspace(8) %67, i32 %3508, i32 0, i32 0)
+  %3510 = extractelement <8 x float> %1495, i64 7
+  %3511 = fptrunc float %3510 to bfloat
+  %3512 = bitcast bfloat %3511 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3512, ptr addrspace(8) %68, i32 %3508, i32 0, i32 0)
+  %3513 = add i32 %3060, 96
+  %3514 = add i32 %3513, %39
+  %3515 = extractelement <8 x float> %1480, i64 0
+  %3516 = fptrunc float %3515 to bfloat
+  %3517 = mul i32 %3514, 4
+  %3518 = bitcast bfloat %3516 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3518, ptr addrspace(8) %67, i32 %3517, i32 0, i32 0)
+  %3519 = extractelement <8 x float> %1496, i64 0
+  %3520 = fptrunc float %3519 to bfloat
+  %3521 = bitcast bfloat %3520 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3521, ptr addrspace(8) %68, i32 %3517, i32 0, i32 0)
+  %3522 = add i32 %3072, 96
+  %3523 = add i32 %3522, %39
+  %3524 = extractelement <8 x float> %1480, i64 1
+  %3525 = fptrunc float %3524 to bfloat
+  %3526 = mul i32 %3523, 4
+  %3527 = bitcast bfloat %3525 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3527, ptr addrspace(8) %67, i32 %3526, i32 0, i32 0)
+  %3528 = extractelement <8 x float> %1496, i64 1
+  %3529 = fptrunc float %3528 to bfloat
+  %3530 = bitcast bfloat %3529 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3530, ptr addrspace(8) %68, i32 %3526, i32 0, i32 0)
+  %3531 = add i32 %3084, 96
+  %3532 = add i32 %3531, %39
+  %3533 = extractelement <8 x float> %1480, i64 2
+  %3534 = fptrunc float %3533 to bfloat
+  %3535 = mul i32 %3532, 4
+  %3536 = bitcast bfloat %3534 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3536, ptr addrspace(8) %67, i32 %3535, i32 0, i32 0)
+  %3537 = extractelement <8 x float> %1496, i64 2
+  %3538 = fptrunc float %3537 to bfloat
+  %3539 = bitcast bfloat %3538 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3539, ptr addrspace(8) %68, i32 %3535, i32 0, i32 0)
+  %3540 = add i32 %3096, 96
+  %3541 = add i32 %3540, %39
+  %3542 = extractelement <8 x float> %1480, i64 3
+  %3543 = fptrunc float %3542 to bfloat
+  %3544 = mul i32 %3541, 4
+  %3545 = bitcast bfloat %3543 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3545, ptr addrspace(8) %67, i32 %3544, i32 0, i32 0)
+  %3546 = extractelement <8 x float> %1496, i64 3
+  %3547 = fptrunc float %3546 to bfloat
+  %3548 = bitcast bfloat %3547 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3548, ptr addrspace(8) %68, i32 %3544, i32 0, i32 0)
+  %3549 = add i32 %3108, 96
+  %3550 = add i32 %3549, %39
+  %3551 = extractelement <8 x float> %1480, i64 4
+  %3552 = fptrunc float %3551 to bfloat
+  %3553 = mul i32 %3550, 4
+  %3554 = bitcast bfloat %3552 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3554, ptr addrspace(8) %67, i32 %3553, i32 0, i32 0)
+  %3555 = extractelement <8 x float> %1496, i64 4
+  %3556 = fptrunc float %3555 to bfloat
+  %3557 = bitcast bfloat %3556 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3557, ptr addrspace(8) %68, i32 %3553, i32 0, i32 0)
+  %3558 = add i32 %3120, 96
+  %3559 = add i32 %3558, %39
+  %3560 = extractelement <8 x float> %1480, i64 5
+  %3561 = fptrunc float %3560 to bfloat
+  %3562 = mul i32 %3559, 4
+  %3563 = bitcast bfloat %3561 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3563, ptr addrspace(8) %67, i32 %3562, i32 0, i32 0)
+  %3564 = extractelement <8 x float> %1496, i64 5
+  %3565 = fptrunc float %3564 to bfloat
+  %3566 = bitcast bfloat %3565 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3566, ptr addrspace(8) %68, i32 %3562, i32 0, i32 0)
+  %3567 = add i32 %3132, 96
+  %3568 = add i32 %3567, %39
+  %3569 = extractelement <8 x float> %1480, i64 6
+  %3570 = fptrunc float %3569 to bfloat
+  %3571 = mul i32 %3568, 4
+  %3572 = bitcast bfloat %3570 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3572, ptr addrspace(8) %67, i32 %3571, i32 0, i32 0)
+  %3573 = extractelement <8 x float> %1496, i64 6
+  %3574 = fptrunc float %3573 to bfloat
+  %3575 = bitcast bfloat %3574 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3575, ptr addrspace(8) %68, i32 %3571, i32 0, i32 0)
+  %3576 = add i32 %3144, 96
+  %3577 = add i32 %3576, %39
+  %3578 = extractelement <8 x float> %1480, i64 7
+  %3579 = fptrunc float %3578 to bfloat
+  %3580 = mul i32 %3577, 4
+  %3581 = bitcast bfloat %3579 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3581, ptr addrspace(8) %67, i32 %3580, i32 0, i32 0)
+  %3582 = extractelement <8 x float> %1496, i64 7
+  %3583 = fptrunc float %3582 to bfloat
+  %3584 = bitcast bfloat %3583 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3584, ptr addrspace(8) %68, i32 %3580, i32 0, i32 0)
+  %3585 = add i32 %3060, 112
+  %3586 = add i32 %3585, %39
+  %3587 = extractelement <8 x float> %1481, i64 0
+  %3588 = fptrunc float %3587 to bfloat
+  %3589 = mul i32 %3586, 4
+  %3590 = bitcast bfloat %3588 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3590, ptr addrspace(8) %67, i32 %3589, i32 0, i32 0)
+  %3591 = extractelement <8 x float> %1497, i64 0
+  %3592 = fptrunc float %3591 to bfloat
+  %3593 = bitcast bfloat %3592 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3593, ptr addrspace(8) %68, i32 %3589, i32 0, i32 0)
+  %3594 = add i32 %3072, 112
+  %3595 = add i32 %3594, %39
+  %3596 = extractelement <8 x float> %1481, i64 1
+  %3597 = fptrunc float %3596 to bfloat
+  %3598 = mul i32 %3595, 4
+  %3599 = bitcast bfloat %3597 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3599, ptr addrspace(8) %67, i32 %3598, i32 0, i32 0)
+  %3600 = extractelement <8 x float> %1497, i64 1
+  %3601 = fptrunc float %3600 to bfloat
+  %3602 = bitcast bfloat %3601 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3602, ptr addrspace(8) %68, i32 %3598, i32 0, i32 0)
+  %3603 = add i32 %3084, 112
+  %3604 = add i32 %3603, %39
+  %3605 = extractelement <8 x float> %1481, i64 2
+  %3606 = fptrunc float %3605 to bfloat
+  %3607 = mul i32 %3604, 4
+  %3608 = bitcast bfloat %3606 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3608, ptr addrspace(8) %67, i32 %3607, i32 0, i32 0)
+  %3609 = extractelement <8 x float> %1497, i64 2
+  %3610 = fptrunc float %3609 to bfloat
+  %3611 = bitcast bfloat %3610 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3611, ptr addrspace(8) %68, i32 %3607, i32 0, i32 0)
+  %3612 = add i32 %3096, 112
+  %3613 = add i32 %3612, %39
+  %3614 = extractelement <8 x float> %1481, i64 3
+  %3615 = fptrunc float %3614 to bfloat
+  %3616 = mul i32 %3613, 4
+  %3617 = bitcast bfloat %3615 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3617, ptr addrspace(8) %67, i32 %3616, i32 0, i32 0)
+  %3618 = extractelement <8 x float> %1497, i64 3
+  %3619 = fptrunc float %3618 to bfloat
+  %3620 = bitcast bfloat %3619 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3620, ptr addrspace(8) %68, i32 %3616, i32 0, i32 0)
+  %3621 = add i32 %3108, 112
+  %3622 = add i32 %3621, %39
+  %3623 = extractelement <8 x float> %1481, i64 4
+  %3624 = fptrunc float %3623 to bfloat
+  %3625 = mul i32 %3622, 4
+  %3626 = bitcast bfloat %3624 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3626, ptr addrspace(8) %67, i32 %3625, i32 0, i32 0)
+  %3627 = extractelement <8 x float> %1497, i64 4
+  %3628 = fptrunc float %3627 to bfloat
+  %3629 = bitcast bfloat %3628 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3629, ptr addrspace(8) %68, i32 %3625, i32 0, i32 0)
+  %3630 = add i32 %3120, 112
+  %3631 = add i32 %3630, %39
+  %3632 = extractelement <8 x float> %1481, i64 5
+  %3633 = fptrunc float %3632 to bfloat
+  %3634 = mul i32 %3631, 4
+  %3635 = bitcast bfloat %3633 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3635, ptr addrspace(8) %67, i32 %3634, i32 0, i32 0)
+  %3636 = extractelement <8 x float> %1497, i64 5
+  %3637 = fptrunc float %3636 to bfloat
+  %3638 = bitcast bfloat %3637 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3638, ptr addrspace(8) %68, i32 %3634, i32 0, i32 0)
+  %3639 = add i32 %3132, 112
+  %3640 = add i32 %3639, %39
+  %3641 = extractelement <8 x float> %1481, i64 6
+  %3642 = fptrunc float %3641 to bfloat
+  %3643 = mul i32 %3640, 4
+  %3644 = bitcast bfloat %3642 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3644, ptr addrspace(8) %67, i32 %3643, i32 0, i32 0)
+  %3645 = extractelement <8 x float> %1497, i64 6
+  %3646 = fptrunc float %3645 to bfloat
+  %3647 = bitcast bfloat %3646 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3647, ptr addrspace(8) %68, i32 %3643, i32 0, i32 0)
+  %3648 = add i32 %3144, 112
+  %3649 = add i32 %3648, %39
+  %3650 = extractelement <8 x float> %1481, i64 7
+  %3651 = fptrunc float %3650 to bfloat
+  %3652 = mul i32 %3649, 4
+  %3653 = bitcast bfloat %3651 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3653, ptr addrspace(8) %67, i32 %3652, i32 0, i32 0)
+  %3654 = extractelement <8 x float> %1497, i64 7
+  %3655 = fptrunc float %3654 to bfloat
+  %3656 = bitcast bfloat %3655 to i16
+  call void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16 %3656, ptr addrspace(8) %68, i32 %3652, i32 0, i32 0)
+  ret void
+}
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 1024) i32 @llvm.amdgcn.workitem.id.x() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef i32 @llvm.amdgcn.workgroup.id.x() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef i32 @llvm.amdgcn.workgroup.id.y() #1
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef i32 @llvm.amdgcn.workgroup.id.z() #1
+
+; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare ptr addrspace(8) @llvm.amdgcn.make.buffer.rsrc.p8.p1(ptr addrspace(1) readnone, i16, i64, i32) #2
+
+; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: read)
+declare i128 @llvm.amdgcn.raw.ptr.buffer.load.i128(ptr addrspace(8) readonly captures(none), i32, i32, i32 immarg) #3
+
+; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare i32 @llvm.smax.i32(i32, i32) #2
+
+; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare i32 @llvm.smin.i32(i32, i32) #2
+
+; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: write)
+declare void @llvm.amdgcn.raw.ptr.buffer.store.i16(i16, ptr addrspace(8) writeonly captures(none), i32, i32, i32 immarg) #4
+
+; Function Attrs: nocallback nofree nosync nounwind willreturn memory(argmem: read)
+declare i32 @llvm.amdgcn.raw.ptr.buffer.load.i32(ptr addrspace(8) readonly captures(none), i32, i32, i32 immarg) #3
+
+; Function Attrs: convergent nocallback nocreateundeforpoison nofree nounwind willreturn memory(none)
+declare <8 x float> @llvm.amdgcn.wmma.f32.16x16x32.bf16.v8f32.v16bf16(<16 x bfloat>, <16 x bfloat>, i16 immarg, <8 x float>, i1 immarg, i1 immarg) #5
+
+; Function Attrs: nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare float @llvm.amdgcn.exp2.f32(float) #2
+
+; Function Attrs: convergent nocallback nofree nounwind willreturn
+declare void @llvm.amdgcn.s.barrier.signal(i32 immarg) #6
+
+; Function Attrs: convergent nocallback nofree nounwind willreturn
+declare void @llvm.amdgcn.s.barrier.wait(i16 immarg) #6
+
+; Function Attrs: convergent nocallback nofree nounwind willreturn memory(argmem: read)
+declare <8 x bfloat> @llvm.amdgcn.ds.load.tr16.b128.v8bf16(ptr addrspace(3) captures(none)) #7
+
+attributes #0 = { "amdgpu-flat-work-group-size"="128,128" "uniform-work-group-size" }
+attributes #1 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #2 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #3 = { nocallback nofree nosync nounwind willreturn memory(argmem: read) }
+attributes #4 = { nocallback nofree nosync nounwind willreturn memory(argmem: write) }
+attributes #5 = { convergent nocallback nocreateundeforpoison nofree nounwind willreturn memory(none) }
+attributes #6 = { convergent nocallback nofree nounwind willreturn }
+attributes #7 = { convergent nocallback nofree nounwind willreturn memory(argmem: read) }
+
+!llvm.module.flags = !{!0}
+
+!0 = !{i32 2, !"Debug Info Version", i32 3}
+!1 = !{i32 128, i32 1, i32 1}

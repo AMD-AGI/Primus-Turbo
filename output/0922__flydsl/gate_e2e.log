@@ -1,0 +1,33 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+validation.py  impl=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/current
+  gate 50.0 dB vs op/eager/ | bitwise x200 | geomean speedup vs beat >= 1.00 | shapes ['fast', 'proxy', 'prod']
+
+  correctness fast     dq  52.61 dB  dk  52.65 dB  dv  52.83 dB
+  correctness proxy    dq  52.52 dB  dk  52.57 dB  dv  52.67 dB
+  correctness prod     dq  52.56 dB  dk  52.60 dB  dv  52.71 dB
+  determinism fast: dq/dk/dv bitwise identical across 200 runs
+
+$ /opt/venv/bin/python3 /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/benchmark.py --arm-path candidate=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/current --arms beat --shapes fast,proxy,prod --json /tmp/validation-lsiea_0l/bench.json
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm candidate -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/current
+# arm beat -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/beat
+# statistic median  iters 51  warmup 3.0s continuous  order palindromic  device gfx1250
+RESULT shape=fast arm=candidate stat=median iters=51 latency_ms=0.3726769983768463 min_ms=0.3520070016384125 max_ms=0.539205014705658 tflops=14.419864986048662 bw_gbs=28.136321923997386 flop=5373952000.0 bytes_min=10485760 sclk_start=1100 sclk_end=1100 causal=True
+RESULT shape=fast arm=beat stat=median iters=51 latency_ms=0.24797099828720093 min_ms=0.23755499720573425 max_ms=0.4473089873790741 tflops=21.67169563021184 bw_gbs=42.2862353760231 flop=5373952000.0 bytes_min=10485760 sclk_start=1100 sclk_end=1100 causal=True
+RESULT shape=proxy arm=candidate stat=median iters=51 latency_ms=1.4695179462432861 min_ms=1.386273980140686 max_ms=1.5492359399795532 tflops=233.8734757466527 bw_gbs=114.16815999348434 flop=343681269760.0 bytes_min=167772160 sclk_start=1065 sclk_end=1100 causal=True
+RESULT shape=proxy arm=beat stat=median iters=51 latency_ms=0.7453950047492981 min_ms=0.7278090119361877 max_ms=0.8334869742393494 tflops=461.0726763262812 bw_gbs=225.07819200697156 flop=343681269760.0 bytes_min=167772160 sclk_start=1065 sclk_end=1100 causal=True
+RESULT shape=prod arm=candidate stat=median iters=51 latency_ms=12.772064208984375 min_ms=12.626846313476562 max_ms=12.954174995422363 tflops=430.48869294380216 bw_gbs=105.08695055383917 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1056 sclk_end=1059 causal=True
+RESULT shape=prod arm=beat stat=median iters=51 latency_ms=7.850182056427002 min_ms=7.766455173492432 max_ms=7.939435005187988 tflops=700.3951230683317 bw_gbs=170.9740322393096 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1056 sclk_end=1059 causal=True
+
+  shape     candidate ms     TF/s    beat ms     TF/s   x beat
+  fast            0.3727     14.4     0.2480     21.7    0.665
+  proxy           1.4695    233.9     0.7454    461.1    0.507
+  prod           12.7721    430.5     7.8502    700.4    0.615
+  geomean over 3 shapes (op.shape.mode=sweep): 0.592x beat
+
+  correctness  pass
+  determinism  pass
+  speed        FAIL
+RESULT: FAILED

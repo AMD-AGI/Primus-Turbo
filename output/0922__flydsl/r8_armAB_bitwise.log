@@ -1,0 +1,21 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+
+rocblaslt error: Cannot read "/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/TensileLibrary_lazy_gfx1250.dat" (or .zlib variant): No such file or directory
+
+rocblaslt error: Could not load "/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/TensileLibrary_lazy_gfx1250.dat"
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250.hsaco
+ error: file not found
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250-xnack-.hsaco
+ error: file not found
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250-xnack+.hsaco
+ error: file not found
+  fast   dq: bitwise_identical=True  differing=0/1048576  finite 1048576/1048576  dtype=torch.bfloat16
+  fast   dk: bitwise_identical=True  differing=0/262144  finite 262144/262144  dtype=torch.bfloat16
+  fast   dv: bitwise_identical=True  differing=0/262144  finite 262144/262144  dtype=torch.bfloat16
+  proxy  dq: bitwise_identical=True  differing=0/16777216  finite 16777216/16777216  dtype=torch.bfloat16
+  proxy  dk: bitwise_identical=True  differing=0/4194304  finite 4194304/4194304  dtype=torch.bfloat16
+  proxy  dv: bitwise_identical=True  differing=0/4194304  finite 4194304/4194304  dtype=torch.bfloat16
+  prod   dq: bitwise_identical=True  differing=0/134217728  finite 134217728/134217728  dtype=torch.bfloat16
+  prod   dk: bitwise_identical=True  differing=0/33554432  finite 33554432/33554432  dtype=torch.bfloat16
+  prod   dv: bitwise_identical=True  differing=0/33554432  finite 33554432/33554432  dtype=torch.bfloat16

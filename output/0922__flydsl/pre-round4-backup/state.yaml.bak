@@ -1,0 +1,148 @@
+meta:
+  name: gfx1250-flydsl-attn-bwd
+  id: 20260917-115934
+  started_at: '2026-09-17T11:59:34'
+  spec_version: v000
+  elapsed_seconds: 7922.0
+setup:
+  job_setup:
+    status: done
+    spec_version: v000
+    at: '2026-09-17T12:09:53'
+    seconds: 618.3
+  op_setup:
+    status: done
+    spec_version: v000
+    at: '2026-09-17T12:57:23'
+    seconds: 2850.0
+lifecycle:
+- at: '2026-09-17T11:59:34'
+  event: setup_started
+- at: '2026-09-21T11:53:46'
+  event: resumed
+  spec_version: v000
+- at: '2026-09-21T15:08:24'
+  event: resumed
+  spec_version: v000
+best_round: 2
+champions:
+  fast: 2
+  proxy: 2
+  prod: 2
+rounds:
+- round: 0
+  progress: []
+  score: null
+  outcome: delivered
+  passed: true
+  accepted: true
+  note: baseline (measured at setup)
+  tflops:
+    fast: 3.042
+    proxy: 36.442
+    prod: 57.241
+- round: 1
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  seconds:
+    opt: 3990.2
+    reflect: 123.1
+    round: 4113.3
+  sessions:
+    opt: c98b60e0-7803-41c6-880f-eab8c0db3a86
+  bound: latency
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - speed FAIL
+  score: 0.09096
+  outcome: delivered
+  passed: true
+  accepted: true
+  tflops:
+    fast: 3.572
+    proxy: 41.407
+    prod: 92.62
+  targets:
+    fast: 49.244
+    proxy: 579.357
+    prod: 718.707
+  beats:
+    fast: 49.244
+    proxy: 579.357
+    prod: 718.707
+  incumbents:
+    fast: 3.007
+    proxy: 35.649
+    prod: 55.244
+  gain: 1.342
+  changed: 1
+  flops:
+    fast: 5373952000.0
+    proxy: 343681269760.0
+    prod: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: null
+  changed_disagreement: null
+- round: 2
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  sessions:
+    opt: f5a7e471-23ec-41d5-981c-016c0d998ed6
+  seconds:
+    opt: 4205.6
+    reflect: 240.4
+    round: 4446.0
+  bound: latency
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - speed FAIL
+  score: 0.16928
+  outcome: delivered
+  passed: true
+  accepted: true
+  tflops:
+    fast: 7.259
+    proxy: 90.6107
+    prod: 143.232
+  targets:
+    fast: 47.611
+    proxy: 580.3094
+    prod: 718.9083
+  beats:
+    fast: 47.611
+    proxy: 580.3094
+    prod: 718.9083
+  incumbents:
+    fast: 3.592
+    proxy: 41.2768
+    prod: 92.6309
+  gain: 1.9208
+  changed: 2
+  flops:
+    fast: 5373952000.0
+    proxy: 343681269760.0
+    prod: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: null
+  changed_disagreement: act.yaml reported 3 changed files; the working copy differs from op/current in
+    2
+- round: 3
+  progress: []
+  mode: fast
+  running:
+    module: opt
+    step: null
+    since: '2026-09-21T15:08:24'
+  sessions:
+    opt: 9272c016-f9d6-43c4-b02b-dbd0944c31e9
+  seconds:
+    opt: 3235.5
+    round: 3235.5

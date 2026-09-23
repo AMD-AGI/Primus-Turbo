@@ -1,0 +1,33 @@
+
+rocblaslt error: Cannot read "/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/TensileLibrary_lazy_gfx1250.dat" (or .zlib variant): No such file or directory
+
+rocblaslt error: Could not load "/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/TensileLibrary_lazy_gfx1250.dat"
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250.hsaco
+ error: file not found
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250-xnack-.hsaco
+ error: file not found
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250-xnack+.hsaco
+ error: file not found
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm cur -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/008/op
+# arm armA -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/008/_scratch/armA
+# arm armB -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/008/_scratch/armB
+# arm armAB -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/008/_scratch/armAB
+# arm beat -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/beat
+# statistic median  iters 101  warmup 3.0s continuous  order palindromic  device gfx1250
+RESULT shape=fast arm=cur stat=median iters=101 latency_ms=0.35389000177383423 min_ms=0.34800100326538086 max_ms=0.5249850153923035 tflops=15.185373910151924 bw_gbs=29.62999787346717 flop=5373952000.0 bytes_min=10485760 sclk_start=1100 sclk_end=1100 causal=True
+RESULT shape=fast arm=armA stat=median iters=101 latency_ms=0.3541710078716278 min_ms=0.34848201274871826 max_ms=0.3988780081272125 tflops=15.173325542072131 bw_gbs=29.60648886257977 flop=5373952000.0 bytes_min=10485760 sclk_start=1100 sclk_end=1100 causal=True
+RESULT shape=fast arm=armB stat=median iters=101 latency_ms=0.35465100407600403 min_ms=0.34852200746536255 max_ms=0.380730003118515 tflops=15.152789469752431 bw_gbs=29.56641847756572 flop=5373952000.0 bytes_min=10485760 sclk_start=1100 sclk_end=1100 causal=True
+RESULT shape=fast arm=armAB stat=median iters=101 latency_ms=0.3582560122013092 min_ms=0.35084500908851624 max_ms=0.37223801016807556 tflops=15.000312114735145 bw_gbs=29.268901687288086 flop=5373952000.0 bytes_min=10485760 sclk_start=1100 sclk_end=1100 causal=True
+RESULT shape=fast arm=beat stat=median iters=101 latency_ms=0.24612900614738464 min_ms=0.23495200276374817 max_ms=0.33886799216270447 tflops=21.833883312322893 bw_gbs=42.602699145995885 flop=5373952000.0 bytes_min=10485760 sclk_start=1100 sclk_end=1100 causal=True
+RESULT shape=proxy arm=cur stat=median iters=101 latency_ms=1.5137050151824951 min_ms=1.4564189910888672 max_ms=1.8931909799575806 tflops=227.04639696167297 bw_gbs=110.83543908307199 flop=343681269760.0 bytes_min=167772160 sclk_start=1061 sclk_end=1100 causal=True
+RESULT shape=proxy arm=armA stat=median iters=101 latency_ms=1.483219027519226 min_ms=1.4201250076293945 max_ms=1.5815659761428833 tflops=231.71309387449526 bw_gbs=113.11354350719807 flop=343681269760.0 bytes_min=167772160 sclk_start=1061 sclk_end=1100 causal=True
+RESULT shape=proxy arm=armB stat=median iters=101 latency_ms=1.5012860298156738 min_ms=1.4629889726638794 max_ms=1.6146960258483887 tflops=228.9245772853803 bw_gbs=111.75229547736407 flop=343681269760.0 bytes_min=167772160 sclk_start=1061 sclk_end=1100 causal=True
+RESULT shape=proxy arm=armAB stat=median iters=101 latency_ms=1.4574609994888306 min_ms=1.3852729797363281 max_ms=1.5574100017547607 tflops=235.80821022349 bw_gbs=115.11262398022457 flop=343681269760.0 bytes_min=167772160 sclk_start=1061 sclk_end=1100 causal=True
+RESULT shape=proxy arm=beat stat=median iters=101 latency_ms=0.7445939779281616 min_ms=0.7358610033988953 max_ms=0.9650840163230896 tflops=461.5686937413807 bw_gbs=225.32032889498691 flop=343681269760.0 bytes_min=167772160 sclk_start=1061 sclk_end=1100 causal=True
+RESULT shape=prod arm=cur stat=median iters=101 latency_ms=13.60740852355957 min_ms=13.500329971313477 max_ms=13.986377716064453 tflops=404.0614506428969 bw_gbs=98.63577459853458 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1053 sclk_end=1068 causal=True
+RESULT shape=prod arm=armA stat=median iters=101 latency_ms=13.004471778869629 min_ms=12.863214492797852 max_ms=13.19367504119873 tflops=422.79527542624385 bw_gbs=103.20890404644058 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1053 sclk_end=1068 causal=True
+RESULT shape=prod arm=armB stat=median iters=101 latency_ms=13.407630920410156 min_ms=13.275956153869629 max_ms=13.729635238647461 tflops=410.08208386391067 bw_gbs=100.10547634905669 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1053 sclk_end=1068 causal=True
+RESULT shape=prod arm=armAB stat=median iters=101 latency_ms=12.804288864135742 min_ms=12.630069732666016 max_ms=13.016570091247559 tflops=429.40527864224475 bw_gbs=104.82247739344433 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1053 sclk_end=1068 causal=True
+RESULT shape=prod arm=beat stat=median iters=101 latency_ms=7.803257942199707 min_ms=7.728744983673096 max_ms=7.890911102294922 tflops=704.6068793632717 bw_gbs=172.0021675487054 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1053 sclk_end=1068 causal=True
