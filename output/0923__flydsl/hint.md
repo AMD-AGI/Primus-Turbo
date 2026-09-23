@@ -1555,17 +1555,36 @@ process died.
 **The single discriminant is `IH ring buffer overflow`.** Everything else is present on
 both sides:
 
-- **`MORE_FAULTS: 0x1` does NOT predict a wedge.** Half the survivable burst had it.
-  What differs is the *proportion* — every record in the wedge, half of them here — which
-  is a symptom of arrival rate, not a cause.
+- **`MORE_FAULTS: 0x1` does NOT predict a wedge**, in any form. The first survivable
+  burst had it on 3 of 6 records; a second survivable burst forty minutes later had it on
+  **8 of 8**, the same 100% as the wedge. Proportion is not a discriminant either.
 - **Faults on several dies do not predict a wedge either.** The survivable burst hit five.
 - **`PERMISSION_FAULTS: 0x5` with `RW: 0x1`** — the signature recorded as the
   memory-aperture class — is the one that **survived**. That signature names the class of
   bug, not the severity.
 
-The mechanism this fits: faults have to arrive fast enough to overflow the interrupt ring.
-Once records are lost there, MES cannot drain its queues, and the driver's own GPU reset
-cannot complete either — which is why only an AC cycle recovers it.
+### The root cause is the fault ARRIVAL RATE, and it is measurable
+
+Timestamping the faults inside each burst makes the mechanism quantitative:
+
+| | median interval between faults |
+|---|--:|
+| **wedged** (11 faults) | **0.016 ms** |
+| **survived** (14 faults, two bursts) | **96.8 ms** |
+
+**Six thousand times faster.** The driver drains a fault every ~100 ms without noticing;
+at one every 16 µs it cannot keep up, the interrupt ring overflows, fault records are
+lost, MES can no longer drain its queues, and the driver's own GPU reset cannot complete
+either — which is why only an AC cycle recovers it.
+
+So `IH ring buffer overflow` is the *observable consequence*; arrival rate is the cause.
+
+This also says what kind of bug is dangerous. A ~97 ms cadence is one fault per launch —
+a single bad address, raised once, process killed. A 16 µs cadence is **many waves
+faulting concurrently inside a hot loop**. So an out-of-bounds address computed
+**per-iteration or per-wave** is the one that takes the card down; an out-of-bounds
+computed once in a prologue or epilogue usually just kills the process.
+**Weight the review of a candidate's address arithmetic accordingly.**
 
 **So the alarm condition is:** `IH ring buffer overflow`, or any
 `MES(...) failed to respond` / `failed to suspend all gangs` / `unrecoverable`, or
