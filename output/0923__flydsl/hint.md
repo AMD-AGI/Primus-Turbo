@@ -1146,3 +1146,72 @@ pair, `a_p`/`a_ds`. The pool entry conflated them. Three further discounts: the 
 gfx950; the incumbent already uses the **hardware** transposing load `DS_LOAD_TR16_B128`
 (one instruction, not a naive round trip); and `DS_BPERMUTE` still goes through LDS hardware
 across only 32 lanes.
+
+---
+
+## h19 — the first hardware counters, and what they kill (2026-09-23, before round 13)
+
+rocprofv3 `--pmc` works on this machine and does **not** wedge the card. Six runs, all
+rc=0, KFD clean, zero fault signatures. The ban came from one rc=134 whose fault callback
+names an *eager Tensile GEMM*, not the profiler. `--kernel-trace` is separately broken
+here (zero dispatches recorded), so use `--pmc`; it costs about 2 minutes per counter set.
+Profile every round.
+
+Measured on the round-12 shipment, prod shape:
+
+| kernel | VGPR | LDS/WG | SQ_BUSY/SQ_CYCLES | ICACHE miss |
+|---|--:|--:|--:|--:|
+| `k_dkdv_0` | 376 | 70656 | 0.9977 | 0.0002% |
+| `k_dq_0`   | 480 |  8704 | 0.9976 | 0.00003% |
+
+**Three things this settles. Do not re-litigate them; they are measured.**
+
+1. **The icache hypothesis is dead.** 171 misses in 86.5M requests. Round 10's
+   instruction-count inversion needs a different explanation, and instruction *count* is
+   no longer a reason on its own to prefer or reject a candidate.
+
+2. **`SQ_BUSY/SQ_CYCLES = 0.998` proves nothing, and I nearly wrote that it did.**
+   The first draft of this hint read it as "waves are resident, so the deficit is stall,
+   not starvation." That is wrong. `SQ_BUSY_CYCLES` counts cycles in which the SQ has
+   *any* wave at all. `k_dkdv` runs at **1 wave/SIMD** (see 3), so a single wave stalling
+   on memory for the entire kernel would still read 0.998. The counter is trivially
+   saturated at this occupancy and discriminates nothing.
+   To actually separate stall from starvation, collect an *issue* counter
+   (`SQ_INSTS_VALU` / `SQ_INSTS` against `SQ_BUSY_CYCLES`) or a wait counter
+   (`SQ_WAIT_ANY`, `SQ_WAIT_INST_LDS`). Until then, **neither hypothesis is excluded**,
+   and a candidate must not cite this number in either direction.
+
+3. **The two hot kernels are capped by different resources, and neither cap has ever been
+   priced in twelve rounds.**
+   - `k_dkdv` is **LDS-bound, and runs at 1 wave/SIMD**: 70656 B/WG against a measured
+     327680 B/CU gives 4 WG/CU; the workgroup is 32 threads = 1 wave, so that is 4
+     waves/CU spread over 4 SIMDs. Its 376 VGPRs would allow 2 waves/SIMD. **There is
+     currently no intra-SIMD latency hiding in the dominant kernel at all.**
+     And the 70656 is almost entirely a hole: `kernels.py:219-225` allocates
+     `LDS_SEG + 2*32*S_ROW_B` = 65536 + 5120, but the live data is
+     `2*32*X_ROW_B` (Q and dO, 17408 B) plus `2*32*S_ROW_B` (P and dS, 5120 B)
+     = **22528 B used out of 70656 allocated. 48128 B is padding**, placed there by
+     r12.i1.g39 to push P/dS into a different 64 KB LDS segment from Q/dO.
+     Thresholds are sharp: ≤65536 B buys 5 WG/CU, ≤40960 B buys 8 (= the VGPR max).
+     Whether g39's segment separation is worth 2x occupancy has never been measured --
+     it shipped inside round 12, whose accepted gain was attributed to dispatch order.
+   - `k_dq` is **VGPR-bound**: 8704 B of LDS would allow 37 WG/CU, but 480 VGPRs cap it
+     at 2 waves/SIMD. ≤341 VGPRs buys 3.
+
+   These are step functions, not gradients. A change that cuts `k_dkdv` LDS from 70656 to
+   66000 buys **nothing**; the same change to 65536 buys 25%. Compute which side of the
+   threshold a candidate lands on *before* spending a round on it.
+
+4. **5.8% of per-step GPU-active time is torch elementwise kernels** doing no attention
+   math (`at::native::` at grid 524288 and a vectorized elementwise at grid 16777216).
+   That is free money next to a 1.464x gap, and it is not kernel work at all — it is
+   whatever the Python impl does around the three kernels.
+
+**And a methodological one.** Each of these three overturned a belief that had been
+written into this file and used to steer rounds. The pattern in every case was the same:
+a real observation, generalised one step too far, then quoted as if it were the
+observation. `TORCH_BLAS_PREFER_HIPBLASLT=0` was set on the strength of one error message
+and survived twelve rounds because `sitecustomize.py:18` pinned the same value anyway, so
+nothing ever contradicted it. **Before building on a fact in this file, check whether
+anything since could have falsified it — and prefer facts that carry their own
+measurement.**
