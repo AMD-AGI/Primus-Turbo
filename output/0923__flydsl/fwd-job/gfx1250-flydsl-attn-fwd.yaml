@@ -1,0 +1,735 @@
+# ==============================================================================
+# JOB SPEC -- gfx1250-flydsl-attn-fwd, written 2026-09-23, NOT YET CREATED.
+#
+# This file is a PROPOSED job file. No job exists for it yet: nothing was run,
+# `op-evolve run` was NOT executed, and there is no artifacts/ directory. Read
+# NOTES.md (next to this file) before creating the job.
+#
+# It is derived, field by field, from the BACKWARD job's completed spec:
+#   /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/
+#     gfx1250-flydsl-attn-bwd-20260917-115934/job_context/
+#     gfx1250-flydsl-attn-bwd_final.yaml            (307 lines as of 2026-09-23)
+# Every line below that says "[bwd-spec:N]" cites that file. Its prose is kept
+# where it still applies and REWRITTEN where the forward inverts it; the places
+# it was rewritten are called out in NOTES.md so a reader can disagree with each
+# one individually.
+#
+# ⚠⚠⚠ ONE GPU, AND THIS JOB CANNOT RUN AT THE SAME TIME AS THE BACKWARD JOB. ⚠⚠⚠
+#
+#   `runtime.gpu_pool` is empty and `runtime.observed.gpu_count` is 1. There is
+#   exactly ONE gfx1250 card on heliosr-1b114-c07-1 [bwd-spec:251-252,294].
+#   gfx1250-flydsl-attn-bwd-20260917-115934 is LIVE on that card right now
+#   (round 13, a backward round). Creating this job while that one holds the
+#   card gives two processes interleaving kernels on one device: every timing
+#   in both jobs becomes meaningless, and this card is VR-throttled and drifts
+#   (1100 -> 967 MHz inside one timing window [bwd-spec:302-303]), so the
+#   contamination looks exactly like clock drift rather than like an error.
+#   The backward job must be `op-evolve stop`ped, or finished, FIRST.
+#   The backward spec states the same rule from its own side: "While this job
+#   holds the card, nothing else may use it." [bwd-spec:61-63]
+#
+# ------------------------------------------------- WHAT IS DIFFERENT HERE --
+#
+# The backward job's premise was a ~93x gap to its anchor against a deliberately
+# unoptimised first-draft baseline that WE wrote [bwd-spec:19-21,30-40]. Every
+# clause of that premise is false here, and three fields below are set
+# differently BECAUSE of it (`evolve.min_gain`, `evolve.max_rounds`,
+# `evolve.schedule.fast_rounds`):
+#
+#   1. The baseline is a MATURE VENDOR KERNEL -- aiter's own gfx1250 FlyDSL
+#      forward prefill, 2233 lines, shipped and tuned
+#      (/home/lihuzhan/code/aiter-src/aiter/ops/flydsl/kernels/fmha_gfx1250/
+#       fmha_fwd_prefill_a16w16_m32x8.py). Assume a constant you want to change
+#      was chosen on purpose and find out why before changing it.
+#
+#   2. The gap is 1.51x, not 93x. Measured on this card today, same session,
+#      interleaved arms, 101 reps: FlyDSL 2.356 ms vs ASM 1.557 ms at the
+#      production shape (STAGE2-FWD-SWEEP.md, "O_VARIANT 确认" table).
+#      Round gains will be single-digit percentages, not integer factors.
+#
+#   3. The search space is NOT untouched. Three directions were measured and
+#      closed in-session on 2026-09-23 before this spec was written, and the
+#      planner should not re-mine them:
+#        * n_block 64 -> 128 -> 256 alone: 3.2x and 9.9x SLOWER (VGPR spill,
+#          not LDS). STAGE2-FWD-SWEEP.md, first table.
+#        * (BLOCK_M, n_block) jointly, five points: the shipped
+#          (256, 64) is a LOCAL OPTIMUM of that family.
+#          STAGE2-FWD-SWEEP.md, second table.
+#        * 4-wave arms: BLOCKED, not slower. The V1 loader no longer compiles
+#          under flydsl 0.3.2 (`fly.ptr.load` rejects addrspace(3)) and the
+#          V2/V3 managers hard-raise on num_waves != 8. Record it as a
+#          roadblock, never as "4 waves is slower".
+#          STAGE2-FWD-SWEEP.md, third table.
+#      One free win was found and confirmed and is NOT yet in the baseline:
+#      `O_VARIANT` v1 beats the shipped v3 by 1.90% over 101 reps, confirmed
+#      against two distinct kernel descriptors (VGPR 232 vs 224).
+#      The two structural levers never tried on the forward are deep unroll /
+#      software pipelining of the KV loop, and dispatch order (the backward
+#      took 14% from dispatch order alone in its round 12).
+#
+# ⚠ THE BASELINE IS SOMEBODY ELSE'S CODE. This is the single biggest difference
+#   from the backward job, where op/baseline/ was ours. See op.baseline below.
+#
+# ⚠ THE BASELINE IMPORTS AITER, FLYDSL AND TORCH ONLY -- NEVER primus_turbo.
+#   Carried over verbatim from [bwd-spec:48-59] and still true: flydsl 0.3.2 is
+#   required and removes `flydsl.expr.buffer_ops`, which primus_turbo's own
+#   FlyDSL tree imports unconditionally. Already installed at
+#   /home/lihuzhan/.local/flydsl032; the image's site-packages holds 0.2.4 and must
+#   not be touched. Setup must print `flydsl.__file__` and assert it resolves to
+#   the 0.3.2 copy.
+#   Separately: Primus-Turbo's own FlyDSL forward is NOT a candidate here at
+#   all -- it refuses gfx1250 outright
+#   (Primus-Turbo/primus_turbo/flydsl/attention/flash_attn_fwd.py:72-75) and is
+#   structurally wave64. That is a rewrite, not a gate relaxation.
+# ==============================================================================
+
+job:
+  name: gfx1250-flydsl-attn-fwd   # was `gfx1250-flydsl-attn-bwd` [bwd-spec:67].
+                                  # This name determines the artifacts directory and the
+                                  # `<name>_final.yaml` filename (job.py:76-77,
+                                  # job.py:199), so it must differ from the
+                                  # backward job's or the two collide on disk.
+  # id / started_at are NOT set here: the framework resolves them at
+  # `op-evolve run`. The backward spec carries them [bwd-spec:68-69] because it
+  # is a COMPLETED spec; this one is an input.
+  description: >
+    aiter's gfx1250 FlyDSL flash-attention FORWARD prefill kernel
+    (fmha_fwd_prefill_a16w16_m32x8, 2233 lines), optimised against aiter's OWN
+    prebuilt gfx1250 ASM forward. bf16, head dim 128, causal bottom-right, BSHD,
+    GQA 4:1, no sink, no sliding window.
+
+    Measured on this card on 2026-09-23, same session, ABAB-interleaved, 101
+    reps, 8 s warmup, at the production shape b=4 sq=skv=8192 hq=32 hkv=8 d=128:
+    the FlyDSL forward runs 2.356 ms median (933.5 TFLOP/s on 2.19929e12 FLOP)
+    and the ASM forward runs 1.557 ms median (1412.5 TFLOP/s). The gap is
+    1.513x. Per-arm run-to-run sd was 1.17-1.21%.
+
+    The job's question is whether a SOURCE-LEVEL FlyDSL forward can reach the
+    prebuilt ASM forward. The backward job's framing applies unchanged here:
+    a well-measured refutation is a result, and the operator would rather have
+    it in a dozen rounds than forty [bwd-spec:88-90]. What is already known
+    about where the gap is NOT: it is not the tile aspect ratio (a five-point
+    (BLOCK_M, n_block) sweep pinned the shipped point as a local optimum) and
+    it is not the mathematics (blocked causal costs only 0.78% extra). The one
+    structural difference left standing is that the ASM bar runs 4 waves at
+    1024 VGPR each -- 1024/1024 VGPR per SIMD -- against the FlyDSL kernel's
+    8 waves at 224 VGPR -- 448/1024 per SIMD. The bar holds 2.3x more state in
+    registers. Both use the full 327680 B of CU LDS and neither spills
+    (scratch=0). See output/0923__flydsl/STAGE2-FWD-SWEEP.md.
+
+agent:
+  # Unchanged from [bwd-spec:92-109]. The accounts exist and one file satisfies
+  # both SDKs (`~/.op_evolve_openai` is a symlink to `~/.op_evolve_anthropic`).
+  account:
+    anthropic: /home/lihuzhan/.op_evolve_anthropic
+    openai: /home/lihuzhan/.op_evolve_openai
+  roles:
+    setup:    {sdk: claude, model: claude-opus-5, effort: xhigh}
+    profiler: {sdk: claude, model: claude-opus-5, effort: xhigh}
+    planner:  {sdk: claude, model: claude-opus-5, effort: max}
+    reviewer: {sdk: codex,  model: gpt-5.6-sol,   effort: xhigh}
+
+op:
+  type: attention
+  config:
+    causal: bottom-right           # matches the kernel: `causal_off = kv_len - q_len`
+                                   # at fmha_fwd_prefill_a16w16_m32x8.py:762.
+    sliding_window: -1             # none, on every shape
+    sparsity: dense
+    q_head_dim: 128                # fmha_fwd_prefill_a16w16_m32x8.py:109
+                                   # SUPPORTED_QK_HDIM = (128, 192, 256)
+    kv_head_dim: 128               # fmha_fwd_prefill_a16w16_m32x8.py:2100
+                                   # asserts v.shape[-1] == 128
+    heads_q_per_kv: 4              # 8/2, 32/8 and 32/8 all give 4
+    format: bshd                   # q/k/v/o are [b, s, h, d] in memory; the host
+                                   # entry is batched BSHD
+                                   # (fmha_fwd_prefill_a16w16_m32x8.py:2073-2074)
+    direction: [fwd]               # ⚠ REWRITTEN. The backward spec's comment here
+                                   # read "the forward is run to produce o and lse
+                                   # and is NOT part of the measured region"
+                                   # [bwd-spec:123-125]. That is now exactly
+                                   # backwards: THE FORWARD IS THE MEASURED REGION.
+                                   # Nothing else is timed -- there is no backward
+                                   # pass in this job, no delta kernel, no dq/dk/dv,
+                                   # and no host reduction. The measured region is
+                                   # one kernel launch producing o and lse.
+                                   # Corollary that WILL bite if missed: the FLOP
+                                   # counter must be called with backward=False.
+                                   # The backward job's benchmark.py hardcodes
+                                   # `backward=True` (that job's op/benchmark.py:72-76);
+                                   # left as-is here it would report forward
+                                   # throughput ~2.5x too high, consistently, and
+                                   # nothing would look wrong.
+    sink: none                     # sink=None on every shape. The ASM entry takes
+                                   # an optional `sink` (aiter/ops/mha.py:596) and
+                                   # both arms pass None.
+    softmax_scale: head_dim ** -0.5
+    softmax_scale_value: 0.08838834764831845   # 128 ** -0.5, written out so no
+                                   # stage re-derives it. `softmax_scale=None` in
+                                   # the api means this value.
+    determinism: >
+      The baseline is atomic-free by construction: every output element of o and
+      lse is written exactly once. Keep that. A 200-run bitwise gate costs
+      nothing on a kernel with no atomic and no split-k, and it is the cheapest
+      possible tripwire on a round that tries to buy speed with a reduction.
+    determinism_gate: >
+      ⚠ REWRITTEN from dq/dk/dv to o/lse. Operationally: no atomics on any
+      output, and `o` AND `lse` bitwise identical across 200 consecutive runs at
+      the fast-iteration shape. A round that introduces a split-k or atomic
+      reduction fails this gate even if it is faster.
+
+      The 200-run count is KEPT, not reduced, and the claim that it costs
+      nothing was verified rather than assumed: grepping the whole vendored
+      kernel tree for atomics and split-k reductions returns ZERO matches --
+      `grep -rn "atomic\|split_k\|splitk\|split-k" --include=*.py` over
+      /home/lihuzhan/code/aiter-src/aiter/ops/flydsl/kernels/fmha_gfx1250/
+      (fmha_fwd_prefill_a16w16_m32x8.py 2233 L + fmha_b16_buffer_managers.py
+      1914 L) produced no output at all, run 2026-09-23.
+
+      ⚠ STILL UNVERIFIED: 200 runs have never actually been executed bitwise on
+      this machine. The source-level argument is strong but it is a source-level
+      argument. Setup must run the gate once and report the result rather than
+      inheriting this sentence as a pass.
+    dtype: {qkv: bf16, out: bf16, qk_acc: fp32, softmax: fp32, pv_acc: fp32, lse: fp32}
+
+  reference:
+    impl: >
+      ⚠ REWRITTEN for the forward. Plain torch, fp32: s = q@k.T*scale;
+      bottom-right causal mask; lse = logsumexp(s, dim=-1); p = exp(s - lse);
+      o = p@v. Chunk over (batch, head) and query blocks -- a dense
+      [4,32,8192,8192] fp32 score tensor is 34 GB.
+
+      This reference ALREADY EXISTS VERBATIM and does not need writing: it is
+      `forward_reference` at
+      /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/
+        gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/ut/common.py:53-82
+      (q_chunk=1024, `shift = skv - sq` for bottom-right, natural-log lse,
+      o cast to bf16, returns `(o, lse)` at :82). It was written for the backward
+      job because that job's reference needed an o and an lse of its own; here it
+      IS the reference. Copy that function; do not re-derive it. Nothing else
+      from that op/ directory should be copied wholesale -- see the note on
+      `core` / `core.gpu` in NOTES.md.
+    impl_dtype: fp32               # the reference computes in fp32 and the bf16
+                                   # candidate is scored against it.
+    logic: >
+      Grouped-query flash attention FORWARD, causal bottom-right, bf16, no sink,
+      no sliding window, no dropout. Consumes q, k, v and returns o and lse.
+    api: >
+      ⚠ REWRITTEN for the forward, and the ATTRIBUTE NAME CHANGES WITH IT.
+
+        attn_fwd(q, k, v, softmax_scale=None, causal=True) -> (o, lse)
+
+      q/k/v/o are [b, s, h, d]; lse is [b, hq, sq] fp32 NATURAL log (measured on
+      the backward job: aiter's gfx1250 forward emits natural log, ratio 1.0000,
+      81.85 dB) [bwd-spec:153-156].
+
+      *** EVERY IMPL MUST EXPOSE THE SAME ATTRIBUTE NAME, AND THAT NAME IS NOW
+      `attn_fwd`. *** The loader does a hardcoded
+      `fn = getattr(mod, "attn_bwd", None)` at op/ut/common.py:104 and raises
+      "defines no `attn_bwd`" at :106. That line, and the matching alias at the
+      bottom of every impl.py, must become `attn_fwd` -- in ALL of them:
+      op/baseline/impl.py, op/beat/impl.py, op/eager/impl.py and any round's
+      op/current/impl.py, plus op/benchmark.py and op/validation.py wherever they
+      name it. In the backward job those aliases were
+      `attn_bwd = flydsl_attn_bwd` (baseline/impl.py:91),
+      `attn_bwd = asm_attn_bwd` (beat/impl.py:92) and
+      `attn_bwd = eager_attn_bwd` (eager/impl.py:73).
+
+      This is called out in the spec, loudly, precisely because it is a rename
+      that fails LATE and LOUDLY in one place and SILENTLY in another: the
+      loader raises AttributeError if a name is missing, but a job that renames
+      only three of the four leaves one arm unloadable at the first round that
+      touches it, hours in. Setup must rename them together and say so.
+
+  baseline:
+    # ⚠⚠ THIS BASELINE IS SOMEBODY ELSE'S CODE. In the backward job op/baseline/
+    #    was three kernels WE wrote on 2026-09-17 and could edit with no external
+    #    obligation [bwd-spec:30-40,157-164]. Here it is aiter's shipped vendor
+    #    kernel, vendored into op/baseline/. Three consequences:
+    #      * An improvement found here is a PATCH PROPOSAL against aiter, not a
+    #        change to our own file. Round reports should read that way.
+    #      * The installed/importable aiter tree at /home/lihuzhan/code/aiter-src is
+    #        NOT this job's writable surface. ⚠ NEVER EDIT IT. It is what the
+    #        rest of the machine imports, and on a job whose beat arm also lives
+    #        in aiter, an edit there would move BOTH arms together and the job
+    #        would report a tidy "no change" while having destroyed its own
+    #        baseline. `op/current/` is the only writable copy of anything.
+    #        (This is the backward-direction wording of the turbo forward job's
+    #        site-packages warning, jobs/turbo-flydsl-attn-fwd.yaml:76-80.)
+    #      * The copy must be WHAT ACTUALLY GETS IMPORTED, and setup must PROVE
+    #        it rather than assert it -- see baseline.import_proof below.
+    root: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0923__flydsl/fwd-job/op_baseline
+    root_note: >
+      The vendored tree EXISTS at the `root` path above. It holds five files
+      copied from /home/lihuzhan/code/aiter-src/aiter/ops/flydsl/kernels/, with
+      every import rewritten so nothing reaches the installed aiter package.
+      Setup copies that tree into `op/baseline/` and wires it behind
+      `op.reference.api`.
+      ⚠ It was built on 2026-09-23 while this spec was being written, so an
+      earlier draft of this note said it did not exist yet. It does. As checked:
+      the five vendored aiter files
+      are under `op_baseline/flydsl_fwd/` (fmha_fwd_prefill_a16w16_m32x8.py
+      93778 B, fmha_b16_buffer_managers.py 90803 B, kernels_common.py,
+      tensor_shim.py, buffer_ops.py) plus `__init__.py`, and alongside them
+      `impl.py`, `_env.py`, `__init__.py` and `PROVENANCE.md`. The wrapper
+      already exposes the right name: `flydsl_attn_fwd(q, k, v,
+      softmax_scale=None, causal=True)` at impl.py:81 with
+      `attn_fwd = flydsl_attn_fwd` at impl.py:124 -- matching op.reference.api
+      above. The `sources` paths below are therefore relative to
+      `op_baseline/flydsl_fwd/`.
+      Setup must STILL check the directory is present and non-empty before
+      anything else, and stop if it is not, rather than silently falling back
+      to importing the installed aiter.
+    sources:
+      # Five files, from the dependency chain of the forward prefill kernel.
+      # Sizes/roles read from /home/lihuzhan/code/aiter-src on 2026-09-23.
+      - {file: flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py, lines: 2264,
+         role: "the forward prefill kernel itself; host entry flash_attn_batch_m32x8"}
+      - {file: flydsl_fwd/fmha_b16_buffer_managers.py, lines: 1914,
+         role: "Q/K/V loaders and O writers; the V2/V3 managers and the TDM load views"}
+      - {file: flydsl_fwd/kernels_common.py, role: "LOG2E, create_llvm_ptr, get_warp_size"}
+      - {file: flydsl_fwd/tensor_shim.py,    role: "_run_compiled, _to_raw"}
+      - {file: flydsl_fwd/buffer_ops.py,     role: "buffer_load/store helpers"}
+      # NOT vendored: aiter/ops/flydsl/fmha_kernels.py, the dispatcher. It pulls
+      # in fmha_bwd_gfx942, flash_attn_func_gfx1201 and fmha_gfx950 -- three trees
+      # this job never measures. Call flash_attn_batch_m32x8 directly.
+      # NOT vendored: flydsl itself. It is an external pip dependency (0.3.2 at
+      # /home/lihuzhan/.local/flydsl032), not aiter's code and not this job's subject.
+    import_rewrites: >
+      Eight absolute `aiter.` imports must be rewritten to point at the copy, or
+      the copy will import the installed tree's modules and only LOOK vendored:
+      fmha_fwd_prefill_a16w16_m32x8.py:51,52,54,55,61 (five),
+      fmha_b16_buffer_managers.py:39,41,42 (three),
+      tensor_shim.py:21 (one, `from aiter.ops.flydsl.kernels.kernels_common
+      import get_warp_size`). kernels_common.py and buffer_ops.py import only
+      flydsl and the standard library and need no rewrite.
+      One genuine reach back into the aiter package remains and is ALLOWED:
+      `get_lds_capacity_bytes` from aiter.jit.utils.chip_info
+      (fmha_fwd_prefill_a16w16_m32x8.py:51). aiter-src is already on
+      runtime.python_path and `aiter` is already in baseline.imports, so leaving
+      it absolute is legal; copying the one function in is also fine. Say which
+      was done.
+    import_proof: >
+      ⚠ MANDATORY, carried over from jobs/turbo-flydsl-attn-fwd.yaml:82-86:
+      "The copy must be what actually gets imported. Setup proves it with a
+      deliberate edit: change a constant in `op/baseline/`, show the measured
+      number moves, revert."
+
+      Concretely, and with a constant already known to move the number: set
+      `O_VARIANT` (fmha_fwd_prefill_a16w16_m32x8.py:150, shipped value "v3") to
+      "v1" IN THE COPY, re-measure at the fast shape, show the median moves
+      (v1 measured 1.90% faster than v3 over 101 reps at the production shape on
+      2026-09-23), then revert to "v3" and show it moves back. An arm that
+      silently ran the installed aiter is this job's headline failure mode and
+      it looks EXACTLY like "no change measured".
+
+      ⚠ And a tripwire on the tripwire, learned the hard way on 2026-09-23:
+      a build that takes 0.0-0.1 s is NOT proof the edit was ignored, and two
+      "different" arms with identical timings usually means the parameter never
+      reached the kernel. `n_block` is a keyword DEFAULT bound at def time
+      (`n_block: int = DEFAULT_N_BLOCK`, fmha_fwd_prefill_a16w16_m32x8.py:1422)
+      and the builder is `@functools.cache`d, so mutating the module constant
+      after import is a no-op and the cache returns the same kernel object.
+      Setup must (a) track the object returned by `build()`, not the `_launch`
+      closure, which is fresh on every call and so can never be equal, and
+      (b) confirm a claimed difference against the kernel DESCRIPTOR via
+      rocprofv3 --pmc (VGPR/SGPR/LDS/scratch), which is how the O_VARIANT result
+      above was confirmed: v3 VGPR=224 vs v1 VGPR=232, same LDS 327680,
+      scratch=0 both. See STAGE2-FWD-SWEEP.md.
+      Rule: an "indifferent" result should be suspected of being an ineffective
+      experiment BEFORE it is believed to be an ineffective mechanism.
+    imports: [torch, aiter, flydsl]   # NEVER primus_turbo -- see the header
+    reported_tflops: 933.5
+    reported_tflops_note: >
+      ⚠ REPLACES the backward's 5.8 [bwd-spec:166], which was a backward figure
+      for a different kernel and does not carry in any form.
+
+      MEASURED ON THIS CARD ON 2026-09-23, not quoted from a document: the
+      shipped FlyDSL forward (O_VARIANT=v3, n_block=64, BLOCK_M=256) runs
+      2.356 ms MEDIAN at the production shape over 101 interleaved reps with an
+      8 s warmup, per-arm sd 1.21%.
+      Source: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/
+              0923__flydsl/STAGE2-FWD-SWEEP.md, section
+              "`O_VARIANT` 确认: v1 比出货的 v3 快 1.90%".
+
+      TF/s computed here from the FORWARD FLOP in op.shape.shapes below, NOT
+      copied from that document:
+        2.19929e12 FLOP / 2.356e-3 s = 9.3350e14 = 933.5 TFLOP/s
+      verified with `python3 tools/op_flops.py attention --batch 4 --seqlen 8192
+      --heads 32 --kv-heads 8 --head-dim 128 --causal bottom-right --dtype bf16
+      --seconds 0.002356` -> "TFLOPS 933.5".
+      ⚠ STAGE2-FWD-SWEEP.md prints 947.8 TF/s for the same 2.356 ms because its
+      harness uses a slightly larger FLOP count (~2.233e12). This spec uses the
+      canonical tool's number throughout so that every figure in the job is
+      commensurable. The TIME is the measurement; the TF/s is a derived unit.
+
+  precision_sqnr_db: 50
+  precision_gate: >
+    ⚠ REWRITTEN for the forward. `o` and `lse` are checked SEPARATELY, each
+    >= 50 dB against the fp32 reference (op.reference.impl), with the output
+    buffers NaN-prefilled and full `isfinite` coverage asserted BEFORE SQNR is
+    computed. A run that reports one tensor only, or computes SQNR over a
+    partly-uncovered buffer, does not satisfy this gate.
+
+    The backward spec justified the two-tensor rule with a 2026-09-16 precedent
+    (out 53.67 / dq 52.24 / dk -inf / dv -inf would have passed a one-tensor
+    check) [bwd-spec:168-174]. ⚠ THAT PRECEDENT IS DROPPED: it is about dk/dv,
+    which do not exist in this job, and quoting it here would be borrowing
+    someone else's evidence. The RULE is kept on its own merits -- an
+    uncovered-buffer -inf is a class of bug, not a backward-specific one, and
+    the NaN-prefill machinery already exists (`poison_allocator`, op/ut/common.py
+    just after :104).
+
+    For calibration, not as the gate: the in-session A/B on 2026-09-23 measured
+    the FlyDSL forward's `o` at 51.63-51.69 dB and the ASM forward's at 53.62 dB
+    against the same fp32 reference (STAGE2-FWD-SWEEP.md, first and second
+    tables). 50 dB therefore has roughly 1.6 dB of headroom on the baseline
+    arm -- it is a real gate, not a formality, and a round that costs 2 dB
+    fails it.
+    ⚠ OPEN: the 50 dB threshold was chosen for a bf16 tensor. `lse` is fp32 and
+    a natural log; SQNR on it is numerically well-defined but is not the same
+    quantity as SQNR on bf16 `o`, and whether 50 dB is the right bar for it is
+    UNVERIFIED. Setup must report the measured baseline lse SQNR alongside the
+    o SQNR at round 0 so the operator can retune the threshold once with a
+    number in hand.
+
+  shape:
+    mode: sweep                    # all three shapes scored, none is a guard
+    shapes:
+      # ⚠ ALL SIX NUMBERS RECOMPUTED. The backward spec's flop/bytes_min
+      # [bwd-spec:181-186] were generated with `--backward` and are 2.5x and 2x
+      # the forward values respectively; reused as-is they would inflate every
+      # TFLOP/s in this job by 2.5x, uniformly and invisibly.
+      #
+      # Regenerated 2026-09-23 with, for each shape:
+      #   python3 /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/tools/op_flops.py \
+      #       attention --batch B --seqlen S --heads HQ --kv-heads HKV \
+      #       --head-dim 128 --causal bottom-right --dtype bf16
+      # (no --backward). The tool does not touch the GPU. Real output pasted:
+      #
+      #   === --batch 1 --seqlen 1024 --heads 8 --kv-heads 2
+      #   op               attention_fwd
+      #   shape            b=1 h=8 kvh=2 sq=1024 skv=1024 d=128 causal=bottom-right window=none live=0.5005 bf16
+      #   flop             2.14958e+09  (2.150 GFLOP)
+      #   bytes_min        5.24288e+06  (5.243 MB)
+      #   intensity_max    410.00 FLOP/byte  -- the op's ceiling, a kernel sits at or below it
+      #
+      #   === --batch 1 --seqlen 4096 --heads 32 --kv-heads 8
+      #   op               attention_fwd
+      #   shape            b=1 h=32 kvh=8 sq=4096 skv=4096 d=128 causal=bottom-right window=none live=0.5001 bf16
+      #   flop             1.37473e+11  (137.473 GFLOP)
+      #   bytes_min        8.38861e+07  (83.886 MB)
+      #   intensity_max    1638.80 FLOP/byte  -- the op's ceiling, a kernel sits at or below it
+      #
+      #   === --batch 4 --seqlen 8192 --heads 32 --kv-heads 8
+      #   op               attention_fwd
+      #   shape            b=4 h=32 kvh=8 sq=8192 skv=8192 d=128 causal=bottom-right window=none live=0.5001 bf16
+      #   flop             2.19929e+12  (2199.292 GFLOP)
+      #   bytes_min        6.71089e+08  (671.089 MB)
+      #   intensity_max    3277.20 FLOP/byte  -- the op's ceiling, a kernel sits at or below it
+      #
+      # Cross-check on the ratios to the backward values, as a guard against a
+      # transcription error: 5.37395e9/2.14958e9 = 2.500, 3.43681e11/1.37473e11
+      # = 2.500, 5.49823e12/2.19929e12 = 2.500 (FLOP), and 2.000 exactly on all
+      # three bytes_min. Both ratios are the textbook ones.
+      - {batch: 1, seqlen_q: 1024, seqlen_kv: 1024, heads_q: 8,  heads_kv: 2, head_dim: 128, note: fast-iteration,
+         flop: 2.14958e+09, bytes_min: 5.24288e+06}
+      - {batch: 1, seqlen_q: 4096, seqlen_kv: 4096, heads_q: 32, heads_kv: 8, head_dim: 128, note: quarter-FLOP proxy,
+         flop: 1.37473e+11, bytes_min: 8.38861e+07}
+      - {batch: 4, seqlen_q: 8192, seqlen_kv: 8192, heads_q: 32, heads_kv: 8, head_dim: 128, note: production,
+         flop: 2.19929e+12, bytes_min: 6.71089e+08}
+  guards: []                       # none. Every shape above is scored.
+
+  target:
+    # *** DO NOT REWORD THE `beat:` LINE WITHOUT KEEPING THE SUBSTRING
+    # *** "beaten by N%" IN IT. op_evolve/core/tune.py:32 parses it with
+    # ***   MARGIN = re.compile(r"(beaten by\s+)(\d+(?:\.\d+)?)(\s*%)")
+    # *** and `op-evolve tune --beat-margin` rewrites exactly that capture.
+    # *** validation reads the same line. A reword that keeps the prose and
+    # *** loses the number is a silently wrong gate, which is the defect that
+    # *** command exists to prevent (tune.py:9-15).
+    beat: "aiter prebuilt gfx1250 ASM forward, aiter.ops.mha.fmha_fwd_with_sink_asm (aiter/ops/mha.py:589), sink=None -- must be beaten by 0%"
+    beat_note: >
+      ⚠ NO HAND-WRITTEN LAUNCHER IS NEEDED, unlike the backward.
+      `op.target.beat_launcher` in the backward spec pointed at
+      Primus-Turbo/tools/gfx1250/asm_bwd_launcher.py [bwd-spec:190]; that field
+      is DELETED here and has no forward equivalent. The backward needed one
+      because aiter's Python arch gate does not reach the gfx1250 backward
+      kernels. The forward has a public Python entry point already:
+        def fmha_fwd_with_sink_asm(q, k, v, softmax_scale, is_causal,
+                                   return_lse, sink=None, out=None)
+            -> tuple[Tensor, Tensor]          # aiter/ops/mha.py:589-598
+      and the gfx1250 code object is already on disk:
+        /home/lihuzhan/code/aiter-src/hsa/gfx1250/fmha_fwd_bf16/
+            fmha_bf16_pertokenBf16_hd128_128x256_mask.co
+      (verified present 2026-09-23, alongside the non-mask variant and the hd64
+      pair; the varlen tree carries its own _varlen.co).
+      The mask variant is the one this job's causal shapes select.
+      A working two-arm harness that already wires FlyDSL-forward against
+      ASM-forward with ABAB interleaving, a clock witness and NaN coverage
+      exists and should be the blueprint for op/beat/ and op/baseline/:
+      Primus-Turbo/output/0917__flydsl/bin/stage1_fwd_ab.py:20-21.
+    beat_margin_pct: 0             # "by 0%" -- parity with the ASM forward is
+                                   # the bar, matching job.description. Note this
+                                   # is a HARDER 0% than the backward's: the
+                                   # forward starts 1.513x behind, so parity means
+                                   # finding 51%. It is deliberately not softened
+                                   # to a number the job could reach by accident;
+                                   # `op-evolve tune --beat-margin` can move it
+                                   # later without a spec bump.
+    beat_measured_same_run: true   # KEPT, and for the same reason
+                                   # [bwd-spec:194-198]: the anchor is re-measured
+                                   # in the same run as the candidate, never read
+                                   # from a stored figure. This card is
+                                   # VR-throttled and DRIFTS (1100 -> 967 MHz
+                                   # inside one timing window), so a stored anchor
+                                   # turns clock drift into apparent progress.
+                                   # Independently confirmed for the forward:
+                                   # the SAME code drifted about 1.5% across
+                                   # sessions on 2026-09-23.
+    beat_reference_figure: >
+      ⚠ REPLACED. The backward's figure (10.160 ms ~= 541.2 TFLOP/s on
+      5.49823e12 FLOP) [bwd-spec:199-202] is a backward number and does not
+      carry.
+
+      FORWARD, measured on this card on 2026-09-23: aiter's prebuilt gfx1250 ASM
+      forward runs 1.557 ms MEDIAN at the production shape over 101 interleaved
+      reps, per-arm sd 1.39%, `o` at 53.62 dB.
+      2.19929e12 FLOP / 1.557e-3 s = 1.41253e15 = 1412.5 TFLOP/s (from
+      tools/op_flops.py --seconds 0.001557, "TFLOPS 1412.5"). Against the
+      baseline's 2.356 ms that is a ratio of 1.513x.
+      Source: output/0923__flydsl/STAGE2-FWD-SWEEP.md.
+
+      This is a SANITY figure only -- it is NOT the gate. The gate is the
+      same-run measurement (beat_measured_same_run above).
+    tflops: null            # MUST stay null, or _margin() returns None and the
+    roofline_pct: null      # relative gate is silently disabled.
+                            # ⚠ And on this machine roofline_pct has a second
+                            # reason to stay null: the card's true bf16 peak has
+                            # never been measured. Every "distance to the roof"
+                            # statement in this campaign rests on one Triton bf16
+                            # GEMM result (1002.7 TF/s) that the ASM forward
+                            # already exceeds by 1.398x. Until a real peak is
+                            # pinned, quote no absolute ceiling.
+                            # (output/0923__flydsl/STAGE2-S0-PROBE.md, "仍然未钉死")
+  backend: [flydsl]         # PINNED. The candidate is a FlyDSL program.
+
+evolve:
+  max_rounds: 12
+  # ⚠ REDUCED from the backward's 40 [bwd-spec:209]. That 40 was justified by an
+  # UNMINED search space against a first-draft baseline at a ~93x gap
+  # [bwd-spec:19-21,211-215]. Neither clause holds here: the baseline is aiter's
+  # shipped kernel, and three directions in it were already measured and closed
+  # on 2026-09-23 before this job existed (the n_block sweep, the joint
+  # (BLOCK_M, n_block) sweep, and the 4-wave roadblock -- see the header).
+  # What is left is ONE confirmed free win (O_VARIANT v1, +1.90%) and TWO
+  # untried structural levers (deep unroll / software pipelining of the KV loop;
+  # dispatch order, which the backward's round 12 turned into 14%). Twelve
+  # rounds is enough to land the free win, attempt both levers with a deep round
+  # on each, and produce a measured refutation if they do not pay. Spending 40
+  # rounds of single-card time re-searching a family already pinned as a local
+  # optimum is exactly the failure the backward spec warned about
+  # [bwd-spec:23-26].
+  max_timeout: 48h          # = 172800 s. Unchanged [bwd-spec:210]; 12 rounds
+                            # will not reach it, and it is a backstop, not a plan.
+  min_gain: 0.005
+  # [stage2, 2026-09-23] LOWERED from an earlier draft's 0.015. That value was set
+  # from the ~1.5% drift the same code showed ACROSS sessions, but cross-session drift is
+  # not the noise this gate sees: `beat_measured_same_run: true` measures every arm in one
+  # process, and acceptance compares medians of 101 reps taken interleaved, where drift is
+  # common-mode and cancels. The relevant spread is the standard error of a
+  # median-of-101 against a per-rep sd of 1.17-1.39%, which is a few tenths of a percent.
+  # 0.005 sits several times above that and still well under the one forward win confirmed
+  # so far (O_VARIANT v3->v1, +1.90% over 101 reps in two independent sessions).
+  # At 0.015 a real 1% improvement would have been rejected as noise, and on a 1.51x gap
+  # that is the wrong error to prefer: the forward's gains will be single-digit percents,
+  # not the integer factors the backward saw. Measurements:
+  # output/0923__flydsl/STAGE2-FWD-SWEEP.md.
+  # NOTE min_gain is NOT tunable with `op-evolve tune` -- changing it later needs
+  # `resume --config`, which bumps spec_version and rebuilds op/. Get it right now.
+  # ⚠ RAISED from the backward's 0.0 [bwd-spec:211-215]. That 0.0 was justified
+  # by "the gap to the anchor is ~93x, so round gains are expected to be integer
+  # factors, far above this machine's run-to-run spread". The gap here is 1.513x
+  # and gains are single-digit percentages, so 0.0 would let noise walk the
+  # champion upward and force every later round to beat the noise too -- the
+  # exact failure core/spec.py:79-86 records from turbo-flydsl-attn-bwd-dense.
+  #
+  # WHICH MEASUREMENT THIS NUMBER COMES FROM, explicitly: it is set from the
+  # SAME-CODE CROSS-SESSION DRIFT of about 1.5% observed on 2026-09-23 -- the
+  # identical FlyDSL forward, unchanged, measured in two independent sessions --
+  # NOT from the per-rep spread. The per-rep spread is the smaller of the two
+  # numbers and would have given a lower floor: per-arm sd over 101 reps was
+  # 1.17% (O_VARIANT=v1), 1.21% (v3) and 1.39% (ASM). Both are recorded in
+  # output/0923__flydsl/STAGE2-FWD-SWEEP.md. 0.015 sits just above the larger.
+  #
+  # ⚠ A READER MAY REASONABLY DISAGREE, and NOTES.md argues both sides. The
+  # short version: the median of 101 reps is far tighter than one rep's sd, and
+  # `beat_measured_same_run: true` means both arms move together, so a
+  # within-round RATIO cancels most of the session drift -- on that reading a
+  # floor near 0.005 would be defensible and 0.015 rejects the known-real
+  # O_VARIANT win of 1.90% by only 0.4 points of margin. It is set at 0.015
+  # anyway because the drift is the only spread that has actually been observed
+  # to move this kernel's number with no code change, and a champion walked
+  # upward by drift is unrecoverable without re-running every round, whereas a
+  # real win rejected at round N is simply re-proposed at round N+1.
+  # ⚠ NOT tunable with `op-evolve tune`: that command exposes only
+  # --fast-rounds/--fast-per-deep/--max-rounds/--max-timeout/--beat-margin/
+  # --target-tflops (cli.py:76-86). Changing min_gain means a hand edit of the
+  # resolved yaml.
+  turn_timeout: null        # unset: each module keeps its own default (3 h).
+  schedule:
+    fast_rounds: 6
+    # ⚠ REDUCED from the backward's 40 [bwd-spec:217-218], whose comment was
+    # "single card: deep rounds cannot parallelise, so front-load". The single
+    # card is still true, but the OTHER half of that argument has expired: on
+    # 2026-09-17 the profiling modules were under a blanket ban on this card and
+    # a deep round was mostly wasted. On 2026-09-23 that ban was lifted -- six
+    # rocprofv3 runs, all rc=0, clean KFD, zero page faults -- with the single
+    # caveat that only `--pmc` produces data (`--kernel-trace` records zero
+    # dispatches) and it costs about 2 minutes per counter group
+    # (STAGE2-S0-PROBE.md, S0-c). A deep round is now worth its cost, and the
+    # two remaining levers (deep unroll, dispatch order) are precisely the kind
+    # that need counters rather than guesses. So: 6 fast rounds to land the free
+    # win and re-establish the arms, then deep rounds enter the cycle.
+    fast_per_deep: 3        # then fast, fast, fast, deep, repeating -- tighter
+                            # than the backward's 5 [bwd-spec:219], same reason.
+  # ⚠ ALL THREE of max_rounds, fast_rounds and fast_per_deep are TUNABLE LATER,
+  # in place, with `op-evolve tune --job <name>-<id> --max-rounds N
+  # --fast-rounds N --fast-per-deep N`. That command writes the final yaml ONLY,
+  # never state.yaml, so it does NOT bump spec_version and does NOT trigger a
+  # setup re-run (tune.py:19-22). A bump would make both setup stages look
+  # incomplete and the setup agent would rewrite op/baseline, op/eager, op/ut,
+  # op/benchmark.py and op/validation.py over any hand patches. So these initial
+  # values do not have to be right the first time -- they only have to be small
+  # enough that being wrong is cheap. Precedent: this was done on the backward
+  # job itself on 2026-09-23 (`--max-rounds 40 --fast-rounds 40`, spec_version
+  # stayed v000, refcache and hand patches intact -- STAGE2-S0-PROBE.md, S0-a).
+
+runtime:
+  # ⚠ CARRIED OVER UNCHANGED from [bwd-spec:221-303] except where marked. Same
+  # host, same container, same card, same interpreter. Nothing about the
+  # direction of the pass changes any of it.
+  runner:
+    type: docker            # LOCAL docker. There is no `runtime.runner.ssh`
+                            # block: the controller, the node and the container
+                            # are all on heliosr-1b114-c07-1, so ZERO ssh hops.
+    ssh: null
+    docker:
+      image: null                   # unused: `container` is set, so the runner
+                                    # attaches and never creates. The running
+                                    # container's image is `fa-tune:deps`,
+                                    # recorded for provenance only -- do NOT move
+                                    # it into this field, which would make the
+                                    # runner own the container.
+      container: fa-repro           # EXISTING container; the runner attaches,
+                                    # never recreates. flydsl 0.3.2 is at
+                                    # /home/lihuzhan/.local/flydsl032. Mounts
+                                    # /home/lihuzhan:/home/lihuzhan, /dev/kfd + /dev/dri,
+                                    # ipc=host, net=host, shm 16 GiB,
+                                    # seccomp=unconfined, groups video,993.
+                                    # ⚠ THE SAME container the backward job is
+                                    # attached to. See the ONE GPU banner.
+      options: []                   # none are applied: `options` is only read
+                                    # when the runner CREATES a container.
+      owned: false                  # user-owned container. The runner must not
+                                    # create, recreate, restart or pip-install
+                                    # into it.
+  sudo: false               # policy, not capability: `sudo -n true` SUCCEEDS on
+                            # this host, and it stays false anyway.
+  gpu_arch: gfx1250         # rocm-smi GFX Version gfx1250,
+                            # rocminfo amdgcn-amd-amdhsa--gfx1250,
+                            # torch gcnArchName gfx1250.
+                            # AMD Eng Sample 100-000001046-04.
+  gpu_id: 0                 # the only GPU on the node (device count 1)
+  gpu_pool: []              # ⚠ ONE card on this host. Not a placeholder. Deep
+                            # rounds cannot parallelise their analyses. AND this
+                            # job cannot coexist with
+                            # gfx1250-flydsl-attn-bwd-20260917-115934 -- see the
+                            # banner at the top of this file.
+  host: heliosr-1b114-c07-1
+  python_path:              # prepend IN THIS ORDER before `import flydsl` / `import aiter`
+    - /home/lihuzhan/.local/flydsl032     # flydsl 0.3.2, ahead of the image's 0.2.4
+    - /home/lihuzhan/code/aiter-src       # aiter is NOT installed in the container
+  env:
+    TORCH_BLAS_PREFER_HIPBLASLT: '1'
+    HIPBLASLT_TENSILE_LIBPATH: /home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250
+    # ⚠ CARRIED OVER AT '1', WHICH IS WHAT KEEPS ALL ARMS IDENTICAL. Both values
+    # are "identical across arms" in the trivial sense -- the runner exports one
+    # value to every process -- so the choice is which value is SAFE, and on
+    # 2026-09-23 that became '1'.
+    #
+    # WHAT WAS ESTABLISHED ON 2026-09-23 (output/0923__flydsl/STAGE2-S0-PROBE.md,
+    # section S0-b): THE IMAGE'S hipBLASLt IS NOT BROKEN. The v000 diagnosis --
+    # "this image has no gfx1250 Tensile library" -- was WRONG. What is actually
+    # true is that hipBLASLt's DEFAULT SEARCH PATH merely lacks the gfx1250
+    # payload. There are THREE hipBLASLt library directories in this container
+    # and only one usable set:
+    #   * /opt/rocm/lib/hipblaslt/library -- empty, and a decoy: this container's
+    #     ROCm is not at /opt/rocm at all.
+    #   * _rocm_sdk_libraries_gfx1250/lib/hipblaslt/library -- hipBLASLt's
+    #     DEFAULT search path, and it lacks the gfx1250 payload. THIS, not a
+    #     missing library, is what made HIPBLASLT_TENSILE_LIBPATH-unset raise
+    #     HIPBLAS_STATUS_INVALID_VALUE.
+    #   * _rocm_sdk_devel/lib/hipblaslt/library/gfx1250 -- 326 files but
+    #     INCOMPLETE (no Kernels.so-000, no extop/transform, .dat not unzipped).
+    #     Pointing LIBPATH here SIGSEGVs (exit 139).
+    # Setting HIPBLASLT_TENSILE_LIBPATH=/home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250
+    # -- the host's complete 328-file ROCm 10.1.0 library, copied under $HOME,
+    # the only bind mount -- MAKES IT WORK. Measured clean on 2026-09-23: bf16
+    # and fp32 GEMM at 512/2048/4096, and the fp32 QK^T [2,16,4096,128] shape the
+    # precision gate used to fault on. Zero rocblaslt errors, zero dmesg faults.
+    # It was NOT re-run under the old '0' configuration: that would be
+    # deliberately reproducing a wedge.
+    #
+    # ⚠ AND IT WILL NOT STICK UNLESS IT IS SET EXPLICITLY.
+    # /usr/lib/python3.12/sitecustomize.py:18 does
+    # `setdefault("TORCH_BLAS_PREFER_HIPBLASLT","0")` at EVERY interpreter
+    # startup, before any project code. The backward job's `op/*/_env.py` also
+    # used `setdefault`, so for twelve rounds it was a no-op and nobody noticed.
+    # `docker exec` runs `bash -c` and does not read profile, so
+    # /etc/profile.d/zz-gfx1250.sh never participated either. Setup must ASSIGN
+    # these two variables, not setdefault them, and must PRINT the effective
+    # values from inside the measuring process. An escape hatch
+    # OPEVOLVE_KEEP_BLAS_ENV=1 exists for deliberately restoring the old
+    # behaviour; this job does not use it.
+  observed:
+    torch: 2.11.0+rocm7.14.0a20260625
+    torch_hip: 7.14.60850
+    rocm_smi: /opt/venv/bin/rocm-smi      # the container has no /opt/rocm; ROCm
+                                          # arrives through the
+                                          # _rocm_sdk_libraries_gfx1250 wheel
+    rocprofv3: 1.3.2
+    flydsl_in_image: 0.2.4                # /opt/venv/lib/python3.12/site-packages/flydsl
+    flydsl_selected: 0.3.2                # /home/lihuzhan/.local/flydsl032/flydsl
+    gpu_count: 1
+  # ⚠ SAFETY RULES for this card. Carried over from [bwd-spec:295-303] with ONE
+  # rule amended by measurement on 2026-09-23:
+  #   - rocprofv3 PC SAMPLING is reboot-level dangerous here (wedged MES on
+  #     2026-09-11). NEVER enable PC sampling. This rule stands.
+  #   - ⚠ AMENDED: the blanket "no profiling" posture is LIFTED. Six rocprofv3
+  #     runs on 2026-09-23 were all rc=0 with a clean KFD and zero aperture /
+  #     page-fault / INVALIDATE_TLBS signatures; the rc=134 that originally
+  #     motivated the ban named eager's Tensile GEMM in its fault callback, not
+  #     the profiler. USE `--pmc` ONLY: `--kernel-trace` and `--runtime-trace`
+  #     produce a .db with ZERO dispatch rows on this box (kernel SYMBOLS are
+  #     registered, 458 of them, but rocpd_kernel_dispatch has 0 rows), so a
+  #     deep round that relies on a kernel trace will silently analyse nothing.
+  #     Budget ~2 minutes per counter group. (STAGE2-S0-PROBE.md, S0-c.)
+  #   - ⚠ rocprofv3's VGPR column is HALF the ISA count on this box, and six of
+  #     its counters lie. Read descriptors, not derived percentages.
+  #   - Never call an autotuner on a training path: its `except: continue`
+  #     cannot recover a HIP context that has taken a launch failure (wedged the
+  #     card 2026-09-16).
+  #   - Launch any newly compiled kernel at a toy shape first, in its own
+  #     process, with AMD_SERIALIZE_KERNEL=3. A bad TDM descriptor or wave-size
+  #     mismatch HANGS silently.
+  #   - The card is VR-throttled to 1100 MHz and drifts. Interleave arms ABAB and
+  #     record a clock witness with every figure. For this job specifically,
+  #     101 reps with an 8 s warmup is the protocol every figure in this spec was
+  #     taken under, and a round that reports 20 reps is not comparable to them.
+  #   - ⚠ A wedge costs a human power-cycle on this card. There is one card and
+  #     one operator, who is often away.
+
+review:
+  auto_approve_after: 10m   # = 600 s. Single operator, often away; nothing may
+                            # block on them. Unchanged [bwd-spec:306-307].
