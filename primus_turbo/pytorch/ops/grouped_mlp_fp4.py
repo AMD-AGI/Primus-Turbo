@@ -229,12 +229,8 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
             )
 
         # Each weight has its own accumulation buffer, so these cannot be shared.
-        fuse_w1_accum, w1_main_grad, w1_first_write = _setup_fused_grad_accum(
-            w1, fuse_wgrad_accum_pattern
-        )
-        fuse_w2_accum, w2_main_grad, w2_first_write = _setup_fused_grad_accum(
-            w2, fuse_wgrad_accum_pattern
-        )
+        fuse_w1_accum, w1_main_grad, w1_first_write = _setup_fused_grad_accum(w1, fuse_wgrad_accum_pattern)
+        fuse_w2_accum, w2_main_grad, w2_first_write = _setup_fused_grad_accum(w2, fuse_wgrad_accum_pattern)
 
         # x's col-wise half is a wgrad operand, so it is the one that carries the RHT.
         x_scaling_recipe = ScalingRecipe()
