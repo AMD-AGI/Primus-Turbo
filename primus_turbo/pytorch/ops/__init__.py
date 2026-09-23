@@ -28,3 +28,4 @@ from .mlp_fp4 import mlp_fp4
 from .moe import *
 from .normalization import *
 from .quantization import *
+from .rope import *
