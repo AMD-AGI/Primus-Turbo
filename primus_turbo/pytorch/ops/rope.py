@@ -8,7 +8,6 @@
 
 Public API:
     - ``fused_qkv_rope(qkv, q_freqs, k_freqs, qkv_split_arg_list) -> (q, k, v)``
-    - ``fused_qkv_rope_supported(qkv, q_freqs, k_freqs, qkv_split_arg_list) -> bool``
 """
 
 from __future__ import annotations
@@ -23,7 +22,7 @@ from primus_turbo.pytorch.kernels.rope.rope_impl import (
     rope_shape_error,
 )
 
-__all__ = ["fused_qkv_rope", "fused_qkv_rope_supported"]
+__all__ = ["fused_qkv_rope"]
 
 
 class _FusedQKVRoPEFunction(torch.autograd.Function):
@@ -54,7 +53,7 @@ def fused_qkv_rope(
 
     Args:
         qkv: ``[S, B, H, q + k + v]`` bfloat16, contiguous. ``S * B`` must be a
-            multiple of the kernels' row group (see ``fused_qkv_rope_supported``).
+            multiple of the kernels' row group.
         q_freqs: ``[S, 1, 1, D]`` rotation angles for the q heads.
         k_freqs: ``[S, 1, 1, D]`` rotation angles for the k heads.
         qkv_split_arg_list: ``[q, k, v]`` widths of the last dim; k and v are one
@@ -62,15 +61,11 @@ def fused_qkv_rope(
 
     Returns:
         ``(q, k, v)``, q and k rotated and v a plain copy.
+
+    Raises:
+        ValueError: if the tensors are not a shape the kernels accept.
     """
+    why = rope_shape_error(qkv, q_freqs, k_freqs, qkv_split_arg_list)
+    if why is not None:
+        raise ValueError(f"fused_qkv_rope: unsupported input ({why})")
     return _FusedQKVRoPEFunction.apply(qkv, q_freqs, k_freqs, qkv_split_arg_list)
-
-
-def fused_qkv_rope_supported(
-    qkv: torch.Tensor,
-    q_freqs: torch.Tensor,
-    k_freqs: torch.Tensor,
-    qkv_split_arg_list: Sequence[int],
-) -> bool:
-    """Whether :func:`fused_qkv_rope` accepts these inputs, for callers that route."""
-    return rope_shape_error(qkv, q_freqs, k_freqs, qkv_split_arg_list) is None

@@ -21,11 +21,7 @@ from primus_turbo.flydsl.rope.rope_kernel import (
 
 
 def rope_shape_error(qkv, q_freqs, k_freqs, qkv_split_arg_list) -> str | None:
-    """The reason this shape is unsupported, or None when the kernels accept it.
-
-    Returned rather than raised so a caller that wants to route elsewhere can ask
-    without catching.
-    """
+    """The reason this shape is unsupported, or None when the kernels accept it."""
     if qkv.ndim != 4:
         return f"qkv must be 4-D [S, B, H, q+k+v], got {tuple(qkv.shape)}"
     if qkv.dtype != torch.bfloat16:

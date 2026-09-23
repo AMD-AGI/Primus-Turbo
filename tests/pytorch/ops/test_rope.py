@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from primus_turbo.flydsl.rope.rope_kernel import ROPE_HEAD_DIM as _D
-from primus_turbo.pytorch.ops.rope import fused_qkv_rope, fused_qkv_rope_supported
+from primus_turbo.pytorch.ops.rope import fused_qkv_rope
 from tests.pytorch.test_utils import get_tolerances
 
 
@@ -87,19 +87,21 @@ def test_fused_qkv_rope_backward(S, B, n_q_heads):
 
 
 @pytest.mark.parametrize(
-    "mutate,reason",
+    "mutate",
     [
         # S*B must miss the row group, which needs B itself to miss it -- with B=4
         # every S lands on a multiple.
-        (lambda a: (a[0][:3], a[1][:3], a[2][:3], a[3]), "S*B not a multiple of the row group"),
-        (lambda a: (a[0].float(), *a[1:]), "dtype is not bfloat16"),
-        (lambda a: (a[0], a[1], a[2], [a[3][0], 64, 64]), "k/v are not one 128-wide head"),
-        (lambda a: (a[0][:, :, :, :-1], *a[1:]), "last dim does not match the split"),
+        pytest.param(
+            lambda a: (a[0][:3], a[1][:3], a[2][:3], a[3]),
+            id="S*B not a multiple of the row group",
+        ),
+        pytest.param(lambda a: (a[0].float(), *a[1:]), id="dtype is not bfloat16"),
+        pytest.param(lambda a: (a[0], a[1], a[2], [a[3][0], 64, 64]), id="k/v are not one 128-wide head"),
+        pytest.param(lambda a: (a[0][:, :, :, :-1], *a[1:]), id="last dim does not match the split"),
     ],
 )
-def test_unsupported_inputs_are_rejected(mutate, reason):
+def test_unsupported_inputs_are_rejected(mutate):
     """Shapes the kernels were not built for must raise, not read out of bounds."""
     args = mutate(_inputs(8, 1, 4))
-    assert not fused_qkv_rope_supported(*args), reason
     with pytest.raises(ValueError, match="unsupported input"):
         fused_qkv_rope(*args)
