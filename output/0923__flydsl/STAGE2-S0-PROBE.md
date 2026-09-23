@@ -86,10 +86,17 @@ TORCH_BLAS_PREFER_HIPBLASLT=1
 - `k_dq`：LDS 仅 8704 B（允许 37 WG/CU），**VGPR 480** 才是限制，⌊1024/480⌋ = 2 wave/SIMD。
   → 降到 ≤341 得 3 wave/SIMD（+50%）。
 
-**④ 5.8% 的时间花在 torch 的 elementwise kernel 上。**
-按 `GRBM_GUI_ACTIVE` 分解每步时间：`k_dkdv` 62.9%、`k_dq` 30.7%、
-torch `at::native` 两个 kernel 合计 **5.8%**、`k_delta` 0.6%。
-那 5.8% 不做任何注意力数学。
+**④ 没有 elementwise 开销——这一条我先写错了，订正在此。**
+初稿说「5.8% 的时间花在 torch elementwise 上」。错了。把 CSV 里的**完整** kernel 名读出来
+（而不是截断到 20 字符）就清楚了：那是 `normal_and_transform`（6 次 = profdrv 的六个
+`torch.randn`）、`bfloat16_copy_kernel`（5 次 = 它的五个 `.to(bfloat16)`）、
+外加一个 `AbsFunctor` 和一个 `add`（= 它的 `lse.abs()+8.0`）。
+**全是 profiling driver 自己造输入的一次性开销**，按 `Start_Timestamp` 排序全都落在测量循环之前，
+而 `impl.py` 里根本没有任何 elementwise op。
+
+真实的每步构成按 `GRBM_GUI_ACTIVE`：**`k_dkdv` 66.7% / `k_dq` 32.6% / `k_delta` 0.7%**，没有别的。
+
+> 读计数器转储的规矩：按**完整** kernel 名聚合，并先看启动顺序，再把开销算到被测对象头上。
 
 ---
 

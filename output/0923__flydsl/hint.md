@@ -1202,10 +1202,18 @@ Measured on the round-12 shipment, prod shape:
    66000 buys **nothing**; the same change to 65536 buys 25%. Compute which side of the
    threshold a candidate lands on *before* spending a round on it.
 
-4. **5.8% of per-step GPU-active time is torch elementwise kernels** doing no attention
-   math (`at::native::` at grid 524288 and a vectorized elementwise at grid 16777216).
-   That is free money next to a 1.464x gap, and it is not kernel work at all — it is
-   whatever the Python impl does around the three kernels.
+4. **There is no elementwise overhead. I misread my own profile and nearly shipped it.**
+   The first draft of this hint claimed 5.8% of per-step time ran in torch elementwise
+   kernels around the three attention kernels. Wrong: reading the *full* kernel names out
+   of the counter CSV instead of a 20-character truncation shows they are
+   `normal_and_transform` (6x, = profdrv.py's six `torch.randn`), `bfloat16_copy_kernel`
+   (5x, = its five `.to(torch.bfloat16)`), and one `AbsFunctor` + one `add` (= its
+   `lse.abs() + 8.0`). They are the **profiling driver's one-time input construction**,
+   every one of them launches before the measured loop, and `impl.py` contains no
+   elementwise op at all. The real per-step split by `GRBM_GUI_ACTIVE` is
+   **`k_dkdv` 66.7% / `k_dq` 32.6% / `k_delta` 0.7%**, and nothing else.
+   *Lesson for reading counter dumps: aggregate by the FULL kernel name, and check launch
+   order, before attributing a cost to the thing under test.*
 
 **And a methodological one.** Each of these three overturned a belief that had been
 written into this file and used to steer rounds. The pattern in every case was the same:
