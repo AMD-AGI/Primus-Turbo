@@ -33,7 +33,15 @@ from aiter.ops.flydsl.kernels.fmha_gfx1250 import fmha_fwd_prefill_a16w16_m32x8 
 B, S, HQ, HKV, D = 4, 8192, 32, 8, 128
 DT, CAUSAL, SCALE = torch.bfloat16, True, D ** -0.5
 ITERS, WARMUP_S = 20, 3.0
-NBLOCKS = [int(x) for x in (sys.argv[1].split(",") if len(sys.argv) > 1 else ["64", "128", "256"])]
+# Arms are (WMMA_ROW_PER_WAVE, n_block) pairs: "R:N,R:N,...".
+# n_block alone is a measured dead end -- 128 is 3.2x slower and 256 is 9.9x, because the
+# KV width drives the K/V burst and the S accumulator while the Q tile keeps its own
+# registers, and 2 waves/SIMD x ~584 VGPRs overruns the 1024-VGPR file into scratch.
+# The bar's tile is 128 Q x 256 KV against our 256 x 64, so it buys KV width by halving
+# Q rows. R=1 halves BLOCK_M to 128 and with it the O and S accumulators, which is the
+# only way the wider KV block has room to land.
+ARGV = sys.argv[1] if len(sys.argv) > 1 else "2:64,1:64,1:128,1:256"
+CONFIGS = [tuple(int(y) for y in x.split(":")) for x in ARGV.split(",")]
 
 def sclk():
     try:
@@ -46,7 +54,8 @@ def sclk():
 print(f"flydsl {flydsl.__version__} @ {flydsl.__file__}")
 print(f"arch   {torch.cuda.get_device_properties(0).gcnArchName}")
 print(f"shape  b={B} s={S} hq={HQ} hkv={HKV} d={D} {DT} causal={CAUSAL}")
-print(f"DEFAULT_N_BLOCK ships as {M.DEFAULT_N_BLOCK}; sweeping {NBLOCKS}")
+print(f"ships as WMMA_ROW_PER_WAVE={M.WMMA_ROW_PER_WAVE} BLOCK_M={M.BLOCK_M} "
+      f"n_block={M.DEFAULT_N_BLOCK}; sweeping (R,n) = {CONFIGS}")
 print(f"sclk before: {sclk()}")
 
 torch.manual_seed(0)
@@ -70,38 +79,41 @@ def _call_flydsl():
 # The build-time assert below is the tripwire: a real rebuild is seconds, a cache hit 0.0s.
 _BUILD = M.build_fmha_fwd_prefill_a16w16_m32x8
 assert "n_block" in (_BUILD.__wrapped__.__kwdefaults__ or {}), "n_block is not a kwarg default"
-_orig = _BUILD.__wrapped__.__kwdefaults__["n_block"]
-print(f"  builder kwdefault n_block = {_orig}")
+_orig_n = _BUILD.__wrapped__.__kwdefaults__["n_block"]
+_orig_R, _orig_BM = M.WMMA_ROW_PER_WAVE, M.BLOCK_M
 variants, build_err = {}, {}
-for n in NBLOCKS:
+for R, n in CONFIGS:
     M._launch_fns.clear()
     _BUILD.cache_clear()
     _BUILD.__wrapped__.__kwdefaults__["n_block"] = n
+    M.WMMA_ROW_PER_WAVE = R
+    M.BLOCK_M = M.WMMA_M * R * M.NUM_WAVES        # BLOCK_M is a derived module global
     try:
         t0 = time.time()
         _call_flydsl(); torch.cuda.synchronize()
         dt = time.time() - t0
-        variants[n] = dict(M._launch_fns)          # steal every entry this build created
-        print(f"  n_block={n:3d}: built {len(variants[n])} launch fn(s) in {dt:5.1f}s"
-              + ("   <-- SUSPICIOUS: too fast to be a real build" if dt < 0.5 else ""))
+        variants[(R, n)] = dict(M._launch_fns)     # steal every entry this build created
+        print(f"  R={R} n_block={n:3d} (BLOCK_M={M.BLOCK_M:3d}): built {len(variants[(R,n)])} "
+              f"launch fn(s) in {dt:5.1f}s")
     except Exception as e:
-        build_err[n] = f"{type(e).__name__}: {e}"
-        print(f"  n_block={n:3d}: BUILD/LAUNCH FAILED -- {build_err[n]}")
-_BUILD.__wrapped__.__kwdefaults__["n_block"] = _orig
+        build_err[f"{R}:{n}"] = f"{type(e).__name__}: {e}"
+        print(f"  R={R} n_block={n:3d}: BUILD/LAUNCH FAILED -- {build_err[f'{R}:{n}']}")
+_BUILD.__wrapped__.__kwdefaults__["n_block"] = _orig_n
+M.WMMA_ROW_PER_WAVE, M.BLOCK_M = _orig_R, _orig_BM
 if len(variants) > 1 and len({id(list(v.values())[0]) for v in variants.values()}) == 1:
-    print("\nEVERY VARIANT IS THE SAME OBJECT -- the sweep did not reach n_block. Aborting.")
+    print("\nEVERY VARIANT IS THE SAME OBJECT -- the sweep reached nothing. Aborting.")
     sys.exit(3)
 
-def flydsl_arm(n):
+def flydsl_arm(key):
     def go():
-        M._launch_fns.clear(); M._launch_fns.update(variants[n])
+        M._launch_fns.clear(); M._launch_fns.update(variants[key])
         return _call_flydsl()
     return go
 
 ARMS = {"asm": (lambda: ASM(q, k, v, SCALE, CAUSAL, True)[0])}
-for n in NBLOCKS:
-    if n in variants:
-        ARMS[f"flydsl_n{n}"] = flydsl_arm(n)
+for key in CONFIGS:
+    if key in variants:
+        ARMS[f"fly_R{key[0]}n{key[1]}"] = flydsl_arm(key)
 if len(ARMS) < 2:
     print("\nnothing to compare against the bar."); sys.exit(2)
 
@@ -184,11 +196,13 @@ for name in ARMS:
     if name == "asm": continue
     print(f"  asm / {name:12s} = {a/res[name]['median_ms']:.4f}"
           f"   ({'candidate faster' if res[name]['median_ms'] < a else 'ASM faster'})")
-base = res.get("flydsl_n64", {}).get("median_ms")
+SHIP = f"fly_R{_orig_R}n{_orig_n}"
+base = res.get(SHIP, {}).get("median_ms")
 if base:
+    print()
     for name in ARMS:
-        if name.startswith("flydsl_n") and name != "flydsl_n64":
-            print(f"  {name} vs flydsl_n64 = {base/res[name]['median_ms']:.4f}x")
+        if name.startswith("fly_") and name != SHIP:
+            print(f"  {name} vs {SHIP} (shipping) = {base/res[name]['median_ms']:.4f}x")
 res["build_err"] = build_err
 json.dump(res, open("/tmp/fwd_nblock.json", "w"), indent=2)
 print("\nwritten /tmp/fwd_nblock.json")
