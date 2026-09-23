@@ -1602,3 +1602,47 @@ computed once in a prologue or epilogue usually just kills the process.
 `timeout 20 docker exec <container> true` failing to answer. **Not** the word "fault", and
 **not** `MORE_FAULTS` — a monitor keyed on either will cry wolf on every candidate that
 runs past the end of a buffer, and this campaign produces those regularly.
+
+
+### h22 addendum 3 — the survivable faults are NOT a candidate's bug. I attributed them wrongly.
+
+h22 said "a candidate kernel read out of bounds" and told future rounds to review candidate
+address arithmetic. **Round 14's own per-arm isolation refutes that** for the survivable
+class, and its evidence is far stronger than the inference I made from "faults appeared
+while a round was building candidates":
+
+| arm, in its own process | faulted? |
+|---|---|
+| `armA` alone | **yes**, at `0x78f2372e3000` |
+| `armB` alone | **yes**, at `0x732ffd5b3000` |
+| **`armAB` — the merge of both** | **no** |
+| `armA32` | no |
+| `cur` — the unmodified champion | no |
+
+A bug in armA's addressing cannot vanish when armA is merged with armB. And three separate
+faults landed at **three different addresses**, every one of them **at the fast→proxy shape
+transition**, with `GCVM_L2_PROTECTION_FAULT_STATUS_LO32: 0x00D040A1` each time and no ring
+timeout and no GPU reset. A sweep containing only `beat` plus two copies of `cur` faulted
+too, while the same set's next sweep was clean.
+
+**So the signal is the shape transition, not the kernel under test.** Something at the
+boundary where one shape's tensors are freed and the next shape's are allocated — a
+lifetime or descriptor-reuse problem in the harness, not in a candidate.
+
+Round 14 also ruled out two tempting explanations:
+- **Not the reference forward.** All three refcache entries hit; `forward_reference`'s fp32
+  Tensile dispatch never ran.
+- **Not a static out-of-bounds.** `r1.i7.g07` gave every descriptor a real byte extent, so
+  an out-of-range access returns zero **without faulting** — and if it hit live data the
+  SQNR gate would fail first.
+
+**What this changes:** stop sending rounds to audit candidate address arithmetic on the
+strength of a survivable fault. Look at the shape-transition boundary in `benchmark.py`
+instead. h22's "an out-of-bounds computed per-iteration is what takes the card down"
+remains a reasonable *rule of thumb about severity*, but it is no longer supported by any
+observed case here.
+
+**Still unattributed: the 13:35 wedge.** Its signature differs from these
+(`PERMISSION_FAULTS: 0x3` and `RW: 0x0`, a read, against `0x5`/`RW: 0x1`, a write, here),
+it was the only event with an interrupt-ring overflow, and no isolation run exists for it.
+Do not assume round 14's finding explains it.
