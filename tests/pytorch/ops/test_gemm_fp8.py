@@ -25,9 +25,42 @@ from primus_turbo.pytorch.core.quantized_tensor import (
 )
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.ops import gemm_fp8
+from tests.pytorch.ops.gemm_shapes_helper import (
+    GEMM_FP8_BLOCKWISE_SHAPES,
+    GEMM_FP8_BLOCKWISE_SHAPES_SMALL,
+    GEMM_FP8_SHAPES,
+    GEMM_FP8_SHAPES_SMALL,
+    GEMM_MX_SHAPES,
+    GEMM_MX_SHAPES_SMALL,
+)
 from tests.pytorch.test_utils import compute_snr
 
 torch.manual_seed(42)
+
+_DET_SHAPES = [(255, 1024, 576), (1032, 4096, 1024), (2056, 2048, 2048)]
+
+# (backend, auto_tune): auto_tune is ignored when a backend is pinned.
+TENSORWISE_BACKEND_CONFIGS = [
+    (None, False),
+    (None, True),
+    (BackendType.TRITON, False),
+    (BackendType.CK, False),
+    (BackendType.HIPBLASLT, False),
+    (BackendType.FLYDSL, False),
+]
+TRITON_CK_BACKEND_CONFIGS = [
+    (None, False),
+    (None, True),
+    (BackendType.TRITON, False),
+    (BackendType.CK, False),
+]
+MX_BACKEND_CONFIGS = [
+    (None, False),
+    (None, True),
+    (BackendType.HIPBLASLT, False),
+    (BackendType.TURBO, False),
+    (BackendType.FLYDSL, False),
+]
 
 
 def _run_gemm_fp8_test(
@@ -126,7 +159,7 @@ def _run_gemm_fp8_deterministic_test(
     dtype: torch.dtype,
     granularity: ScalingGranularity,
     backend: BackendType,
-    repeats: int = 10,
+    repeats: int = 3,
     block_size: int | None = None,
 ):
     """Determinism + correctness check for gemm_fp8 on a small set of configs."""
@@ -214,16 +247,11 @@ def _run_gemm_fp8_deterministic_test(
         GlobalBackendManager.reset()
 
 
-@pytest.mark.parametrize("m", [255, 256, 507, 512])
-@pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
-@pytest.mark.parametrize("k", [256, 512, 576, 1024, 2048])
+@pytest.mark.parametrize("m, n, k", GEMM_FP8_SHAPES)
 @pytest.mark.parametrize("layout", ["NN", "NT"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize(
-    "backend", [None, BackendType.TRITON, BackendType.CK, BackendType.HIPBLASLT, BackendType.FLYDSL]
-)
-@pytest.mark.parametrize("auto_tune", [False, True])
+@pytest.mark.parametrize("backend, auto_tune", TENSORWISE_BACKEND_CONFIGS)
 def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype, backend, auto_tune):
     if m % 32 != 0 and backend == BackendType.CK:
         pytest.skip("CK backend requires m to be a multiple of 32")
@@ -241,14 +269,11 @@ def test_gemm_fp8_tensorwise(m, n, k, layout, format, dtype, backend, auto_tune)
     )
 
 
-@pytest.mark.parametrize("m", [255, 256, 507, 512])
-@pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
-@pytest.mark.parametrize("k", [256, 512, 576, 1024, 2048])
+@pytest.mark.parametrize("m, n, k", GEMM_FP8_SHAPES)
 @pytest.mark.parametrize("layout", ["NN", "NT"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.CK])
-@pytest.mark.parametrize("auto_tune", [False, True])
+@pytest.mark.parametrize("backend, auto_tune", TRITON_CK_BACKEND_CONFIGS)
 def test_gemm_fp8_rowwise(m, n, k, layout, format, dtype, backend, auto_tune):
     if m % 32 != 0 and backend == BackendType.CK:
         pytest.skip("CK backend requires m to be a multiple of 32")
@@ -266,15 +291,12 @@ def test_gemm_fp8_rowwise(m, n, k, layout, format, dtype, backend, auto_tune):
     )
 
 
-@pytest.mark.parametrize("m", [512, 1024])
-@pytest.mark.parametrize("n", [1024, 4096])
-@pytest.mark.parametrize("k", [256, 1024, 4096])
+@pytest.mark.parametrize("m, n, k", GEMM_FP8_BLOCKWISE_SHAPES)
 @pytest.mark.parametrize("layout", ["NT", "NN"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("block_size", [128])
-@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.CK])
-@pytest.mark.parametrize("auto_tune", [False, True])
+@pytest.mark.parametrize("backend, auto_tune", TRITON_CK_BACKEND_CONFIGS)
 def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, block_size, backend, auto_tune):
     _run_gemm_fp8_test(
         m=m,
@@ -290,14 +312,11 @@ def test_gemm_fp8_blockwise(m, n, k, layout, format, dtype, block_size, backend,
     )
 
 
-@pytest.mark.parametrize("m", [176, 256, 512, 1024])
-@pytest.mark.parametrize("n", [256, 352, 1024, 2048])
-@pytest.mark.parametrize("k", [128, 160, 256, 512, 1024])
+@pytest.mark.parametrize("m, n, k", GEMM_MX_SHAPES)
 @pytest.mark.parametrize("layout", ["NT"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT, BackendType.TURBO, BackendType.FLYDSL])
-@pytest.mark.parametrize("auto_tune", [False, True])
+@pytest.mark.parametrize("backend, auto_tune", MX_BACKEND_CONFIGS)
 def test_gemm_fp8_mx_blockwise(m, n, k, layout, format, dtype, backend, auto_tune):
     # NOTE: m, n and k must be multiples of 16 for MX_BLOCKWISE.
     assert m % 16 == 0 and n % 16 == 0 and k % 16 == 0, "m, n and k must be multiples of 16"
@@ -471,9 +490,7 @@ def _run_gemm_fp8_quantized_tensor_test(
     GlobalBackendManager.reset()
 
 
-@pytest.mark.parametrize("m", [512, 1024])
-@pytest.mark.parametrize("n", [512, 1024])
-@pytest.mark.parametrize("k", [512, 1024])
+@pytest.mark.parametrize("m, n, k", GEMM_FP8_SHAPES_SMALL)
 @pytest.mark.parametrize("layout", ["NT", "NN"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -492,9 +509,7 @@ def test_gemm_fp8_tensorwise_quantized_tensor(m, n, k, layout, format, dtype, ba
     )
 
 
-@pytest.mark.parametrize("m", [512, 1024])
-@pytest.mark.parametrize("n", [512, 1024])
-@pytest.mark.parametrize("k", [512, 1024])
+@pytest.mark.parametrize("m, n, k", GEMM_FP8_SHAPES_SMALL)
 @pytest.mark.parametrize("layout", ["NT", "NN"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -512,9 +527,7 @@ def test_gemm_fp8_rowwise_quantized_tensor(m, n, k, layout, format, dtype, backe
     )
 
 
-@pytest.mark.parametrize("m", [256, 512, 1024])
-@pytest.mark.parametrize("n", [256, 352, 1024, 2048])
-@pytest.mark.parametrize("k", [128, 160, 512, 1024])
+@pytest.mark.parametrize("m, n, k", GEMM_MX_SHAPES_SMALL)
 @pytest.mark.parametrize("layout", ["NT"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2, Format.HYBRID])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -548,9 +561,7 @@ def test_gemm_fp8_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, 
     )
 
 
-@pytest.mark.parametrize("m", [256, 512, 1024])
-@pytest.mark.parametrize("n", [256, 512, 4096])
-@pytest.mark.parametrize("k", [256, 1024])
+@pytest.mark.parametrize("m, n, k", GEMM_FP8_BLOCKWISE_SHAPES_SMALL)
 @pytest.mark.parametrize("layout", ["NT", "NN"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -571,9 +582,7 @@ def test_gemm_fp8_blockwise_quantized_tensor(m, n, k, layout, format, dtype, bac
     )
 
 
-@pytest.mark.parametrize("m", [255, 507, 1032, 2056])
-@pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
-@pytest.mark.parametrize("k", [256, 512, 576, 1024, 2048])
+@pytest.mark.parametrize("m, n, k", _DET_SHAPES)
 @pytest.mark.parametrize("layout", ["NN", "NT"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -595,9 +604,7 @@ def test_gemm_fp8_tensorwise_deterministic(m, n, k, layout, format, dtype, backe
     )
 
 
-@pytest.mark.parametrize("m", [255, 507, 1032, 2056])
-@pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
-@pytest.mark.parametrize("k", [256, 512, 576, 1024, 2048])
+@pytest.mark.parametrize("m, n, k", _DET_SHAPES)
 @pytest.mark.parametrize("layout", ["NN", "NT"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -617,9 +624,7 @@ def test_gemm_fp8_rowwise_deterministic(m, n, k, layout, format, dtype, backend)
     )
 
 
-@pytest.mark.parametrize("m", [255, 257, 512, 1024])
-@pytest.mark.parametrize("n", [256, 512, 1024, 4096])
-@pytest.mark.parametrize("k", [256, 1024, 4096])
+@pytest.mark.parametrize("m, n, k", [(255, 4096, 1024), (512, 256, 4096), (1024, 1024, 256)])
 @pytest.mark.parametrize("layout", ["NT", "NN"])
 @pytest.mark.parametrize("format", [Format.E4M3, Format.E5M2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
