@@ -117,7 +117,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
         num_cu: int | None,
         fuse_bgrad_accum_pattern: Union[None, str] = None,
     ):
-        fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
+        fuse_bgrad_accum, main_grad, _ = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
 
         assert config.granularity == ScalingGranularity.MX_BLOCKWISE
         assert a.ndim == 2 and b.ndim == 3

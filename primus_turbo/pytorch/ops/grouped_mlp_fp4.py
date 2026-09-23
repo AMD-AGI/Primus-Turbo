@@ -16,10 +16,14 @@ wgrad operands only, and every GEMM is NT.
          wgrad              : the col-wise (rht=T) operands, contract M
 """
 
+import atexit
+import os
+from collections import Counter
 from typing import Optional, Union
 
 import torch
 
+from primus_turbo.pytorch.core import grad_ownership
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import (
     MXFP4_BLOCK_SIZE,
@@ -59,6 +63,26 @@ __all__ = ["grouped_mlp_fp4"]
 
 _SUPPORTED_ACTIVATIONS = ("silu", "gelu")
 
+_WGRAD_ACCUM_STATS = os.environ.get("PRIMUS_TURBO_WGRAD_ACCUM_STATS", "0") == "1"
+_wgrad_accum_counts: Counter = Counter()
+
+
+def _count_wgrad_accum(epilogue: str, out: torch.Tensor) -> None:
+    """Tally beta=0 vs beta=1 wgrad writes per output shape, for accounting runs.
+
+    One write per expert weight per microbatch is the invariant; a shape that
+    drifts from ``layers x microbatches x steps`` means a dropped or doubled
+    accumulation.
+    """
+    if _WGRAD_ACCUM_STATS:
+        _wgrad_accum_counts[(epilogue, tuple(out.shape))] += 1
+
+
+@atexit.register
+def _report_wgrad_accum() -> None:
+    for (epilogue, shape), calls in sorted(_wgrad_accum_counts.items()):
+        print(f"WGRAD_ACCUM_STATS {epilogue} out={list(shape)} calls={calls}", flush=True)
+
 
 def _check_activation(activation: str, clamp_limit: Union[None, float]) -> Union[None, float]:
     assert activation in _SUPPORTED_ACTIVATIONS, (
@@ -82,11 +106,16 @@ def _wgrad_grouped_gemm_fp4_impl_wrapper(
     num_cu: int | None,
     inplace_add_to_out: bool,
     out: Optional[torch.Tensor],
+    overwrite_out: bool = False,
 ) -> torch.Tensor:
     """Variable-K wgrad, accumulating into ``out`` when asked to.
 
     Returns a dummy buffer in that case: the framework's own accumulation stands
     down, but Megatron needs a tensor rather than None for its backward hooks.
+
+    ``overwrite_out`` runs the epilogue at beta=0 instead of beta=1. The GEMM
+    covers every element of ``out``, so on the step's first write there is
+    nothing to accumulate and re-reading ``out`` only costs bandwidth.
     """
     inputs = (a, b, a_scales, b_scales, group_lens, group_offs)
     options = dict(
@@ -102,7 +131,12 @@ def _wgrad_grouped_gemm_fp4_impl_wrapper(
         return grouped_gemm_fp4_variable_k_impl(*inputs, **options)
 
     assert out is not None, "out should not be None when inplace_add_to_out is True"
-    grouped_gemm_fp4_variable_k_accum_impl(*inputs, out=out, **options)
+    grouped_gemm_fp4_variable_k_accum_impl(*inputs, out=out, overwrite_out=overwrite_out, **options)
+    if overwrite_out:
+        grad_ownership.record_overwrite(out)
+        _count_wgrad_accum("beta0", out)
+    else:
+        _count_wgrad_accum("beta1", out)
     return _get_dummy_wgrad(out.shape, out_dtype)
 
 
@@ -195,8 +229,12 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
             )
 
         # Each weight has its own accumulation buffer, so these cannot be shared.
-        fuse_w1_accum, w1_main_grad = _setup_fused_grad_accum(w1, fuse_wgrad_accum_pattern)
-        fuse_w2_accum, w2_main_grad = _setup_fused_grad_accum(w2, fuse_wgrad_accum_pattern)
+        fuse_w1_accum, w1_main_grad, w1_first_write = _setup_fused_grad_accum(
+            w1, fuse_wgrad_accum_pattern
+        )
+        fuse_w2_accum, w2_main_grad, w2_first_write = _setup_fused_grad_accum(
+            w2, fuse_wgrad_accum_pattern
+        )
 
         # x's col-wise half is a wgrad operand, so it is the one that carries the RHT.
         x_scaling_recipe = ScalingRecipe()
@@ -295,6 +333,12 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
         ctx.num_cu = num_cu
         ctx.fuse_w1_accum = fuse_w1_accum
         ctx.fuse_w2_accum = fuse_w2_accum
+        # Bound here rather than read in backward: under a schedule that runs
+        # several forwards before the matching backward, a later microbatch has
+        # already claimed the weight by then and the flag no longer describes
+        # this call.
+        ctx.w1_overwrite = w1_first_write
+        ctx.w2_overwrite = w2_first_write
         # Off save_for_backward: the wgrad writes these in place, which would bump
         # the version counter saved tensors are checked against.
         ctx.w1_main_grad = w1_main_grad
@@ -353,6 +397,7 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
             ctx.num_cu,
             ctx.fuse_w2_accum,
             ctx.w2_main_grad,
+            ctx.w2_overwrite,
         )
 
         # dgrad against w2_col, contracting K_out; the epilogue turns it into the
@@ -410,6 +455,7 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
             ctx.num_cu,
             ctx.fuse_w1_accum,
             ctx.w1_main_grad,
+            ctx.w1_overwrite,
         )
 
         return (

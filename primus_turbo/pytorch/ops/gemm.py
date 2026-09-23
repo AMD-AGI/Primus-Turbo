@@ -62,7 +62,7 @@ class GemmFunction(torch.autograd.Function):
         fuse_bgrad_accum_pattern: Union[None, str] = None,
     ):
         assert a.dim() == 2 and b.dim() == 2, "Only 2D GEMM is supported"
-        fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
+        fuse_bgrad_accum, main_grad, _ = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
         # FWD
         # out    = a * b
         # [M, N] = [M, K] * [K, N]

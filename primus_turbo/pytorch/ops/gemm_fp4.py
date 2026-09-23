@@ -101,7 +101,7 @@ class FP4GemmMXFunction(torch.autograd.Function):
         supported_mxfp4_backend, reason = check_mxfp4_support()
         assert supported_mxfp4_backend, reason
 
-        fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
+        fuse_bgrad_accum, main_grad, _ = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
 
         dest_dtype = FP4GemmMXFunction.get_fp4_dtype(
             config.format,
