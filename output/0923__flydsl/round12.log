@@ -560,3 +560,7 @@ round 12 (fast):
     gate: act.yaml reported validation exit 0; the framework's run exited 2
     accepted: 1.0907x its best ever (score 0.55068 over 0.50514); op/current/ is round 12
   1-opt: done
+    2-reflect: candidate ids in more than one findings file: ['r10.i3.g30', 'r12.i0.g38']; dead_ends.md has more than one entry heading for the same id: ['r10.i4.g31'] -- one candidate keeps one id. Make the second an annotation heading that does not lead with the id, or give it its own.; asking for a fix
+    2-reflect: invariant holds after the fix
+  2-reflect: done
+job gfx1250-flydsl-attn-bwd-20260917-115934 max_rounds
