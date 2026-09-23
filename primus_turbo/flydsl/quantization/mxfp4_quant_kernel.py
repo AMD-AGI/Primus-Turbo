@@ -1358,3 +1358,140 @@ def flydsl_dual_quant_batched(
         co.view(torch.uint8).view(fp4_dtype),
         cs.view(torch.float8_e8m0fnu),
     )
+
+
+# ---- Row-only H16 + mxfp4 cast ------------------------------------------------
+# MXFP4Linear consumes only the row pack. The fused dual also writes the
+# colwise-transpose pack (half the output bytes, all of the strided stores).
+# Dropping that axis makes the cast a flat stream: microblock mb owns X words
+# [16mb, 16mb+16), ROW_OUT words [4mb, 4mb+4) and ROW_SC byte mb -- exact for
+# every C % 32 == 0. No LDS, no barrier, no integer division; every access is
+# wave-contiguous (4 KB load / 1 KB + 64 B store per wave).
+#
+# Bit-identical to ``flydsl_dual_quant(x, fp4_dtype, True, False)[:2]``.
+def _srd_at(t, elem_off, elem_bytes, nrec_bytes):
+    base = arith.index_cast(T.i64, buffer_ops.extract_base_index(t))
+    boff = arith.index_cast(T.i64, arith.index_cast(T.index, elem_off) * arith.index(elem_bytes))
+    raw = arith._to_raw(base + boff)
+    r = rocdl.readfirstlane(res=raw.type, src=raw)
+    base_v = r.result if hasattr(r, "result") else r
+    nr = arith.minui(arith.index_cast(T.index, nrec_bytes), arith.index(0x7FFFFFFF))
+    return buffer_ops.create_buffer_resource_from_addr(base_v, num_records_bytes=nr)
+
+
+_RQ_BLK = 128  # row-only flat kernel block size (independent of the dual's BLK)
+
+
+def _build_rowq_kernel(row_rht):
+    @flyc.kernel(known_block_size=[_RQ_BLK, 1, 1])
+    def _rowq_kernel(
+        X: fx.Tensor,  # int32 view [R, C/2]
+        ROW_OUT: fx.Tensor,  # int32 view [R, C/8]
+        ROW_SC: fx.Tensor,  # uint8 [R, C/32]
+        SCALE_ROUNDING_BIAS: fx.Int32,
+    ):
+        tid = fx.thread_idx.x
+        mb0 = arith.index_cast(T.index, fx.block_idx.x * _RQ_BLK)
+        xsrc = _srd_at(X, mb0 * arith.index(16), 4, fx.Int32(_RQ_BLK * 16 * 4))
+        osrc = _srd_at(ROW_OUT, mb0 * arith.index(4), 4, fx.Int32(_RQ_BLK * 4 * 4))
+        ssrc = _srd_at(ROW_SC, mb0, 1, fx.Int32(_RQ_BLK))
+        rbits = []
+        for q in range_constexpr(4):
+            v4 = buffer_ops.buffer_load(xsrc, tid * 16 + q * 4, vec_width=4, dtype=T.i32)
+            for j in range_constexpr(4):
+                word = v4[j]
+                rbits.append(word << 16)
+                rbits.append(word & 0xFFFF0000)
+        words, biased = _finish_microblock(rbits, row_rht, SCALE_ROUNDING_BIAS)
+        buffer_ops.buffer_store(
+            Vec.from_elements(list(words), fx.Int32), osrc, tid * 4, cache_modifier=2
+        )
+        buffer_ops.buffer_store(arith.trunci(T.i8, biased & 0xFF), ssrc, tid)
+
+    return _rowq_kernel
+
+
+def _build_rowq_launch(row_rht):
+    kern = _build_rowq_kernel(row_rht)
+
+    @flyc.jit
+    def _rowq_launch(X, ROW_OUT, ROW_SC, BIAS: fx.Int32, grid_x: fx.Int32, stream: fx.Stream):
+        kern(X, ROW_OUT, ROW_SC, BIAS).launch(grid=(grid_x, 1, 1), block=(_RQ_BLK, 1, 1), stream=stream)
+
+    return _rowq_launch
+
+
+_ROWQ_LAUNCH = {}
+_ROWQ_COMPILED = {}
+_ROWQ_PLAN = {}
+
+
+def rowq_eligible(R, C):
+    return (int(C) % 32 == 0) and ((int(R) * int(C) // 32) % _RQ_BLK == 0)
+
+
+def get_rowq_cast(R, C, row_rht):
+    raw = _ROWQ_LAUNCH.get(bool(row_rht))
+    if raw is None:
+        raw = _build_rowq_launch(bool(row_rht))
+        _ROWQ_LAUNCH[bool(row_rht)] = raw
+    key = (int(R), int(C), bool(row_rht))
+    ent = _ROWQ_COMPILED.get(key)
+    if ent is None:
+        import torch
+
+        x = torch.zeros((R, C // 2), dtype=torch.int32, device="cuda")
+        ro = torch.zeros((R, C // 8), dtype=torch.int32, device="cuda")
+        rs = torch.zeros((R, C // 32), dtype=torch.uint8, device="cuda")
+        grid_x = (R * C // 32) // _RQ_BLK
+        fn = flyc.compile(raw, x, ro, rs, 1 << 21, grid_x, torch.cuda.current_stream())
+        ent = (fn, grid_x)
+        _ROWQ_COMPILED[key] = ent
+    return ent
+
+
+def _make_rowq_plan(R, C, row_rht, fp4_dtype, scale_rounding_mode=0):
+    """Hoist compiled fn, grid, and stream lookup out of the per-call path.
+
+    ``ro``/``rs`` are allocated in the caller-facing dtypes (``fp4_dtype``,
+    ``float8_e8m0fnu``) and ``x_bf16`` is passed un-viewed. FlyDSL's per-call
+    kernarg fill only reads ``t.data_ptr()``; dtype is fixed at ``flyc.compile``
+    from ``get_rowq_cast``'s int32/uint8 warmup tensors. The kernel addresses
+    memory through ``_srd_at``'s ``R``/``C``-derived byte offsets, so a
+    differently-dtyped but same-byte-count tensor is address-identical.
+    """
+    import torch
+
+    fn, grid_x = get_rowq_cast(R, C, row_rht)
+    ro_shape = (R, C // 2)  # fp4_dtype elements (1 B) == C//8 i32 words (4 B)
+    rs_shape = (R, C // 32)
+    bias = _mxfp4_scale_rounding_bias(scale_rounding_mode)
+    e8m0 = torch.float8_e8m0fnu
+    raw_stream = torch._C._cuda_getCurrentRawStream
+
+    def _plan(x_bf16):
+        ro = x_bf16.new_empty(ro_shape, dtype=fp4_dtype)
+        rs = x_bf16.new_empty(rs_shape, dtype=e8m0)
+        fn(x_bf16, ro, rs, bias, grid_x, raw_stream(x_bf16.device.index))
+        return ro, rs
+
+    return _plan
+
+
+def flydsl_quant_mxfp4_h16(x_bf16, fp4_dtype, scale_rounding_mode=0):
+    """Rowwise mxfp4 cast with in-kernel deterministic H16 (``_rht16``).
+
+    Bit-identical to ``flydsl_dual_quant(x, fp4_dtype, True, False)[:2]`` without
+    computing or storing the discarded colwise pack. Shapes that fail
+    ``rowq_eligible`` fall back to that dual and slice the row outputs.
+    """
+    R, C = x_bf16.shape
+    if not rowq_eligible(R, C):
+        row, scale, _, _ = flydsl_dual_quant(x_bf16, fp4_dtype, True, False)
+        return row, scale
+    key = (int(R), int(C), True, fp4_dtype, int(scale_rounding_mode))
+    plan = _ROWQ_PLAN.get(key)
+    if plan is None:
+        plan = _make_rowq_plan(R, C, True, fp4_dtype, scale_rounding_mode)
+        _ROWQ_PLAN[key] = plan
+    return plan(x_bf16)
