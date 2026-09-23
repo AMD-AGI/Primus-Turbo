@@ -22,6 +22,7 @@ the head of a round, so direction can be changed here **without stopping the job
 | h14 | must note | Round 9 is the carried-state merge: ~200 VGPR are an allocation failure, not a cost | open |
 | h15 | must standing | Rules for every script a round writes: cached_forward, line buffering, dmesg between blocks | open |
 | h16 | must note | The bound is the ISSUE ROOF, not bandwidth. g15 and g18 close; g04 demoted; round 10 is g27 | open |
+| h17 | must standing | Read the corpus before you build. h16 named a documented dead end and it cost a round | open |
 
 ---
 
@@ -916,3 +917,90 @@ into an act.yaml speed table. `split2.py` loads kernels.py by path and drives it
 
 **The probe ships nothing. Its `qmask=3` output is numerically WRONG by construction.** It is
 a one-shot instrument and must never appear in a speed table.
+
+## h17 -- Read the corpus before you build
+
+### What happened
+
+h16 named `r10.i1.g27` as round 10's candidate, reasoning from the ISA: four LSE/delta
+`buffer_load_b32` in k_dkdv's hot body that `g21` had never prefetched, followed by
+`s_wait_loadcnt 0x22` and four `v_nop` the scheduler could not fill. It looked like free
+latency.
+
+It was already a documented dead end, in two places:
+* `techniques.md:214-216` -- the same family, measured at **-5.3%**
+* `dead_ends.md:154-194` -- again, at **-4.3%**
+
+Round 10 built it anyway and measured **-14.57%**, then found both entries itself and wrote
+"two build-before-read in one round, the thing most worth remembering from it". That is the
+correct lesson and this hint makes it standing.
+
+**The operator wrote h16 without checking either file. The cost was a whole round.** A hint
+carries more weight than a round's own idea, which makes an unchecked hint more expensive
+than an unchecked idea, not less.
+
+**Rule: before any candidate is built -- whether it came from a hint, the pool, or the
+round's own reading of the ISA -- grep `dead_ends.md`, `techniques.md` and `facts.md` for
+its mechanism, not just its id.** g27 had no id in the corpus; it had a *mechanism* written
+down twice. Searching for "g27" would have found nothing.
+
+### The mechanism, which is worth more than the candidate was
+
+Folding those four loads into the carried set does not shorten the wait. It **lengthens**
+it: `s_wait_loadcnt 0x22` waits on a COUNT, and adding loads to the carried tuple moves the
+consumer past a full-landing count instead of a partial one. A partial wait becomes a full
+drain. That inverts the g21/g26 lesson -- those two added prefetch and won, this one added
+prefetch and lost -- and the distinction is whether the consumer's wait count still permits
+partial completion.
+
+Round 10's three arms make the shape of it unmistakable, and the anti-correlation is the
+finding:
+
+| arm | issue slots cut | prod |
+|---|--:|--:|
+| `g28` | -17% | **-7.77%** |
+| `g27` | -6.6% | **-14.57%** |
+| `g32` (throwaway probe, finest-grained waits) | — | **-61.5%** |
+
+**Instruction count is not the independent variable and `s_wait` count is a deceptive proxy.
+Load-to-use distance is, and the in-place implementation is already at a local optimum on
+it.** Instruction-level scheduling of k_dkdv's hot body is a CLOSED DOOR. Do not spend
+another round on it, and do not take h16's qmask probe either -- round 10 declined it for
+exactly this reason and was right to.
+
+### What h16 keeps
+
+Its eta decomposition stands and is not in question: of the 1.464x to aiter, **1.408x is
+doing 40% more matrix work (seven GEMMs against five, confirmed from our own ISA) and only
+1.040x is scheduling**. What round 10 refuted is the actionable reading -- that saving
+instructions collects that 1.040x. The 1.040x is real but it is not reachable by cutting
+slots.
+
+### Round 11: `r10.i3.g30`, the register bank tax
+
+Round 10's own route names the one door it found open. `s_set_vgpr_msb` exists solely
+because the kernel uses more than 256 VGPRs, so every access above the window costs a bank
+switch. The static count at 740 VGPR:
+
+```
+k_dkdv hot body   110 of 693 instructions = 15.9%
+k_dkdv whole      449
+```
+
+This is a different mechanism from what round 10 closed. It is not load-to-use distance and
+not issue-slot count -- it is the cost of *addressing* registers, and it scales with how
+badly the register allocation is grouped rather than with how many registers there are.
+
+Two things to establish before building, in that order:
+1. **Is the tax reducible at constant VGPR?** 110 switches for 693 instructions suggests
+   poor bank locality, not an irreducible floor. Grouping accesses so consecutive
+   instructions stay within one window would cut switches without touching the allocation.
+   Read the ISA and count how many of the 110 are *redundant* -- a switch to a window that
+   the previous switch already selected.
+2. **What is the floor?** The dK+dV accumulators alone are 256 dwords per lane
+   (`2 * NKV * NDO` = 32 v8f32), so VGPR can never drop below 256 and the tax can never go
+   to zero. Establish the arithmetic floor before estimating any payoff.
+
+And apply the rule at the top of this hint first: **grep the corpus for
+`s_set_vgpr_msb`, "bank", "vgpr window" before building anything.** If it is already priced
+there, that number outranks any estimate made here.
