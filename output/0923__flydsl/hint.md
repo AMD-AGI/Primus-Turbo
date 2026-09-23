@@ -1392,3 +1392,66 @@ Two consequences:
 **Rule: never hand-edit `op/current/` while a round is starting or running. If an
 environment change must reach a measured arm, put it in the spec and let the round pick it
 up, and check every arm has it.**
+
+---
+
+## h21 — round 13 won on the wrong shape, and said why the right one is still open
+
+Round 13 is accepted, `gain 1.3704`, score **0.551 → 0.704**. Good round. But read the
+shapes before quoting the number:
+
+| shape | this round | same-session champion | vs champion | vs the bar |
+|---|--:|--:|--:|--:|
+| fast | 34.38 | 19.72 | **+73.1%** | 0.669 |
+| proxy | 417.15 | 318.99 | **+31.0%** | 0.734 |
+| **prod** | **497.39** | 495.26 | **+0.38%** | **0.699** |
+
+**The entire gain is fast and proxy. prod did not move, by design** -- the host picks
+`nsp=1` at prod, so prod runs the completely unmodified path and is bitwise identical.
+The framework accepts on the arithmetic mean over three shapes, so a large small-shape win
+carries a round on its own. That is not cheating and g42 is a real result, but it is worth
+being blunt about the consequence: **prod has gone 0.693 → 0.699 of the bar across two
+rounds.** The job exists to close that gap.
+
+**So: name prod in the hypothesis.** If a candidate is expected to be a no-op at prod, say
+so in `expected` *and say what the round is for* -- closing a family, building an
+instrument, winning a shape that matters for its own sake. All three are legitimate. What
+is not legitimate is letting the mean hide it.
+
+*(And when comparing, use `champion_tflops` -- the same-session rebuild -- not
+`best_round_tflops`, which is archived from another session. Reading round 13's prod
+against the archived 499.1459 makes it look like a 0.4% regression when the same-session
+comparison says +0.38%. This campaign has already lost a conclusion to exactly that
+substitution.)*
+
+### Round 13's most valuable output is not g42. It is the census.
+
+The grid census (zero card time, zero code change, `1-opt/raw/census.txt`) established
+that **prod's dispatch efficiency is already 100% for both hot kernels** -- g03 and g40
+closed that door in earlier rounds. Round 13's own words:
+
+> prod 剩下的不是空转的 CU，是在跑的 wave 在等
+
+**prod is latency-bound, not parallelism-bound.** That matters because the counters on
+this card cannot answer the stall-versus-starvation question at all (h20), and the census
+answers it from the other side, by model rather than by counter.
+
+**This makes TDM more motivated than it was this morning, not less.** TDM replaces 36
+synchronous `buffer_load` per iteration with an asynchronous global→LDS engine drained by
+a single `s_wait_tensorcnt`. That is a latency-exposure mechanism, and latency exposure is
+now what prod is measured to be limited by. It is still the one structural difference from
+the bar that has never been tested, and the record closing it still does not bind
+(gfx950, a different instruction, causes that cannot occur here -- see h20).
+
+### Two more results worth keeping
+
+- **`num_xcc = 8`, read from `/sys/class/kfd/kfd/topology/nodes/*/properties`.** The corpus
+  calls the XCD count undocumented for gfx1250. It is not; KFD prints it. Also
+  `simd_count 1024`, `gfx_target_version 120500`.
+- **The per-XCD L2 locality family is closed.** g43 cut `k_dq`'s per-XCD K/V footprint to a
+  quarter and measured NULL (six readings 0.9928-1.0065, inside the session's own 1.8%
+  floor), against a corpus entry promising +7%. Either the XCD mapping is not round-robin
+  or the LLC is not per-XCD private; one zero-card-time check next round decides which.
+- **h8 takes another hit.** g43 removed bytes and gained nothing; g42 *added* an fp32
+  workspace round trip and gained 30%. **Byte counts still do not predict time on this op.**
+  Stop using them to price candidates.
