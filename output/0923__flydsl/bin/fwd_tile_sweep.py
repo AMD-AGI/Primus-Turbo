@@ -32,7 +32,8 @@ from aiter.ops.flydsl.kernels.fmha_gfx1250 import fmha_fwd_prefill_a16w16_m32x8 
 
 B, S, HQ, HKV, D = 4, 8192, 32, 8, 128
 DT, CAUSAL, SCALE = torch.bfloat16, True, D ** -0.5
-ITERS, WARMUP_S = 20, 3.0
+ITERS = int(os.environ.get("SWEEP_ITERS", "20"))
+WARMUP_S = float(os.environ.get("SWEEP_WARMUP", "3.0"))
 # Arms are (WMMA_ROW_PER_WAVE, n_block) pairs: "R:N,R:N,...".
 # n_block alone is a measured dead end -- 128 is 3.2x slower and 256 is 9.9x, because the
 # KV width drives the K/V burst and the S accumulator while the Q tile keeps its own
@@ -103,7 +104,16 @@ assert "n_block" in (_BUILD.__wrapped__.__kwdefaults__ or {}), "n_block is not a
 _orig_n = _BUILD.__wrapped__.__kwdefaults__["n_block"]
 _orig = (M.NUM_WAVES, M.WMMA_ROW_PER_WAVE, M.BLOCK_M, M.BLOCK_SIZE,
          M.USE_TDM_LOADER, M.O_VARIANT)
-variants, build_err = {}, {}
+variants, build_err, built_kernels = {}, {}, {}
+_real_build = _BUILD.__wrapped__
+def _spy(*a, **kw):
+    r = _real_build(*a, **kw)
+    _spy.last = r
+    return r
+_BUILD.__wrapped__.__kwdefaults__  # touched above; keep the reference alive
+M.build_fmha_fwd_prefill_a16w16_m32x8 = __import__("functools").cache(_spy)
+_BUILD = M.build_fmha_fwd_prefill_a16w16_m32x8
+_BUILD.__wrapped__.__kwdefaults__ = _real_build.__kwdefaults__
 for cfg in CONFIGS:
     W, R, n, tdm, ovar = cfg
     M._launch_fns.clear()
@@ -119,6 +129,7 @@ for cfg in CONFIGS:
         _call_flydsl(); torch.cuda.synchronize()
         dt = time.time() - t0
         variants[cfg] = dict(M._launch_fns)
+        built_kernels[cfg] = id(getattr(_spy, "last", None))
         print(f"  {tag:16s} BLOCK_M={M.BLOCK_M:3d}: built in {dt:5.1f}s"
               + ("   <-- SUSPICIOUS: too fast to be a real build" if dt < 0.5 else ""))
     except Exception as e:
@@ -127,9 +138,12 @@ for cfg in CONFIGS:
 (M.NUM_WAVES, M.WMMA_ROW_PER_WAVE, M.BLOCK_M, M.BLOCK_SIZE,
  M.USE_TDM_LOADER, M.O_VARIANT) = _orig
 _BUILD.__wrapped__.__kwdefaults__["n_block"] = _orig_n
-if len(variants) > 1 and len({id(list(v.values())[0]) for v in variants.values()}) == 1:
-    print("\nEVERY VARIANT IS THE SAME OBJECT -- the sweep reached nothing. Aborting.")
+# Compare the objects build() RETURNED, not the launch closures: _ensure_*_kernel defines
+# a fresh closure every call, so comparing those could never detect a cache hit.
+if len(built_kernels) > 1 and len(set(built_kernels.values())) == 1:
+    print("\nEVERY ARM GOT THE SAME BUILT KERNEL -- the sweep reached nothing. Aborting.")
     sys.exit(3)
+print(f"  distinct built kernels: {len(set(built_kernels.values()))}/{len(built_kernels)}")
 
 def flydsl_arm(key):
     def go():
