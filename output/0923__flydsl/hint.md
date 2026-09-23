@@ -1368,3 +1368,27 @@ read the descriptors.
 One more nail in the icache coffin: the ASM bar's own miss rate is
 50137 / 339246799 = **0.0148%**, two orders of magnitude *worse* than our `k_dkdv`'s
 0.0002%, and it is still 1.4x faster.
+
+### h20 addendum 2 — `op/current/` is restored from the champion at every round start
+
+Patching `op/current/` by hand does not survive. Starting round 13 restored
+`op/current/_env.py` from the round-12 archive, mtime and all, silently discarding both an
+edit made an hour earlier **and its `.bak` beside it**, and `rounds/013/op/` was seeded
+from the restored copy.
+
+Two consequences:
+
+1. **A hand-patch to `op/current/` is transient.** It lives until the next round starts.
+   Anything that must persist belongs in the job spec's `runtime.env`, in
+   `op/baseline/`, or in a file the round-start restore does not touch -- and it should be
+   verified *after* the round starts, not before.
+2. **It can silently desynchronise the arms.** `op/baseline/` is *not* restored, so a patch
+   applied to both `current` and `baseline` ends up applied to only one, and the candidate
+   and baseline arms then run in different environments. That is a confound manufactured
+   by a housekeeping edit. When this happened on 2026-09-23 the fix was to revert
+   `baseline` too, so all three arms shared one environment for the measurement, rather
+   than to re-patch `current` mid-flight.
+
+**Rule: never hand-edit `op/current/` while a round is starting or running. If an
+environment change must reach a measured arm, put it in the spec and let the round pick it
+up, and check every arm has it.**
