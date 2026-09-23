@@ -57,6 +57,11 @@ from flydsl.expr.buffer_ops import (
 from flydsl.expr.rocdl import cvt_pk_f32_fp8
 from flydsl.expr.typing import Vector as Vec
 
+from primus_turbo.flydsl.mega.fp8.combine_autotune import (
+    autotune_enabled,
+    choose_combine_cu,
+    observe_combine_cu,
+)
 from primus_turbo.flydsl.mega.fp8.dispatch_grouped_gemm_mxfp8_kernel import (
     _H_NUM_TILE_BLOCKS,
     _H_ORIGIN_RANK,
@@ -309,7 +314,9 @@ def combine_copy_fp8_tile(
             def _emit_scale():
                 sv = buffer_load(l2y_scale_res, row * fx.Int32(SC) + lane, vec_width=1, dtype=fx.T.i32())
                 buffer_store(
-                    sv, peer, fx.Int32(payload_i32_total) + slot * fx.Int32(SC) + lane,
+                    sv,
+                    peer,
+                    fx.Int32(payload_i32_total) + slot * fx.Int32(SC) + lane,
                     cache_modifier=19,  # sc0|sc1|nt, as above
                 )
 
@@ -1009,6 +1016,54 @@ def _combine_launch(
     return output
 
 
+# ─────────────────────────── combine CU split: shape-keyed autotune ───────────────────────────
+# Historical pins, kept as the fallback for when autotuning is switched off. Both were measured on
+# DeepSeek-V3 (H=7168, I=2048) and neither transfers: see ``combine_autotune`` for why the optimum
+# moves with the shape and why this path cannot use ``flydsl.autotune``.
+_L2_COMBINE_CU_FALLBACK = 32
+_L1_COMBINE_CU_FALLBACK = 28
+
+
+def _tune_key(c, BM, BN, apply_weights, with_gate):
+    """Everything the CU optimum depends on. Mirrors the bf16 combine's autotune key, with the
+    direction flags standing in for its ``layout_code`` -- the two directions contract over
+    different K and have their own optima, so they must not share an entry."""
+    return (
+        c.out_features,
+        c.K,
+        c.M,
+        BM,
+        BN,
+        c.combine_slots,
+        c.topk,
+        c.num_experts,
+        c.num_ranks,
+        apply_weights,
+        with_gate,
+    )
+
+
+def _launch_maybe_tuned(key, num_combine_cu, fallback, group, launch):
+    """Run ``launch(cu)`` once, timing it for the tuner while a key is still being tuned.
+
+    ``num_combine_cu`` not None is an explicit pin: it is honoured as given and nothing is measured,
+    so a caller that knows its shape keeps full control. Otherwise the tuner names the candidate and
+    gets the event pair back. The events are read on a later call, never here -- this is on the
+    training critical path and must not sync."""
+    if num_combine_cu is not None:
+        return launch(int(num_combine_cu))
+    cu = choose_combine_cu(key, group=group, default=fallback)
+    if not autotune_enabled():
+        return launch(int(cu))
+    ev_start = torch.cuda.Event(enable_timing=True)
+    ev_end = torch.cuda.Event(enable_timing=True)
+    ev_start.record()
+    out = launch(int(cu))
+    ev_end.record()
+    observe_combine_cu(key, int(cu), ev_start, ev_end)
+    return out
+
+
 def combine_l2_fwd_mxfp8_flydsl_kernel(
     weights_fp8,
     handle,
@@ -1018,9 +1073,10 @@ def combine_l2_fwd_mxfp8_flydsl_kernel(
     x_fp8,
     BM=256,
     BN=256,
-    num_combine_cu=32,
+    num_combine_cu=None,
     num_reduce_cu=256,
     num_gemm_cu=None,
+    group=None,
 ):
     """Forward L2: ``act @ w2`` (K=I) + fp8 combine PUSH + WEIGHTED top-k reduce -> ``y`` [T, H] bf16.
 
@@ -1035,20 +1091,28 @@ def combine_l2_fwd_mxfp8_flydsl_kernel(
     ``num_combine_cu`` / ``num_reduce_cu`` / ``num_gemm_cu`` size the three roles; 0 drops one's work,
     which is how the benches isolate a stage. See ``_compile`` for what each means."""
     c = _combine_ctx(handle, x_fp8)
-    return _combine_launch(
-        c,
-        weights_fp8,
-        topk_indices=topk_indices,
-        topk_weights_arg=topk_weights.contiguous().view(-1),
-        grad_gate_arg=c.dummy_f32,
-        d_topk_w=c.dummy_f32,
-        apply_weights=True,
-        with_gate=False,
-        BM=BM,
-        BN=BN,
-        combine_cu=num_combine_cu,
-        num_reduce_cu=num_reduce_cu,
-        num_gemm_cu=num_gemm_cu,
+    key = _tune_key(c, BM, BN, apply_weights=True, with_gate=False)
+    topk_weights_arg = topk_weights.contiguous().view(-1)
+    return _launch_maybe_tuned(
+        key,
+        num_combine_cu,
+        _L2_COMBINE_CU_FALLBACK,
+        group,
+        lambda cu: _combine_launch(
+            c,
+            weights_fp8,
+            topk_indices=topk_indices,
+            topk_weights_arg=topk_weights_arg,
+            grad_gate_arg=c.dummy_f32,
+            d_topk_w=c.dummy_f32,
+            apply_weights=True,
+            with_gate=False,
+            BM=BM,
+            BN=BN,
+            combine_cu=cu,
+            num_reduce_cu=num_reduce_cu,
+            num_gemm_cu=num_gemm_cu,
+        ),
     )
 
 
@@ -1061,9 +1125,10 @@ def combine_l1_dgrad_mxfp8_flydsl_kernel(
     x_fp8_rowwise,
     BM=256,
     BN=256,
-    num_combine_cu=24,
+    num_combine_cu=None,
     num_reduce_cu=256,
     num_gemm_cu=None,
+    group=None,
 ):
     """Backward L1 dgrad: ``grad_l1 @ w1^T`` (K=2I) + fp8 combine PUSH + gate scatter + UNWEIGHTED
     top-k reduce -> ``(dx [T, H] bf16, d_topk_w [combine_slots] f32)``.
@@ -1081,19 +1146,27 @@ def combine_l1_dgrad_mxfp8_flydsl_kernel(
     which is how the benches isolate a stage. See ``_compile`` for what each means."""
     c = _combine_ctx(handle, x_fp8_rowwise)
     d_topk_w = torch.empty(c.combine_slots, dtype=torch.float32, device=c.dev)
-    dx = _combine_launch(
-        c,
-        weights_fp8,
-        topk_indices=topk_indices,
-        topk_weights_arg=c.dummy_f32,
-        grad_gate_arg=grad_gate.contiguous().view(-1),
-        d_topk_w=d_topk_w,
-        apply_weights=False,
-        with_gate=True,
-        BM=BM,
-        BN=BN,
-        combine_cu=num_combine_cu,
-        num_reduce_cu=num_reduce_cu,
-        num_gemm_cu=num_gemm_cu,
+    key = _tune_key(c, BM, BN, apply_weights=False, with_gate=True)
+    grad_gate_arg = grad_gate.contiguous().view(-1)
+    dx = _launch_maybe_tuned(
+        key,
+        num_combine_cu,
+        _L1_COMBINE_CU_FALLBACK,
+        group,
+        lambda cu: _combine_launch(
+            c,
+            weights_fp8,
+            topk_indices=topk_indices,
+            topk_weights_arg=c.dummy_f32,
+            grad_gate_arg=grad_gate_arg,
+            d_topk_w=d_topk_w,
+            apply_weights=False,
+            with_gate=True,
+            BM=BM,
+            BN=BN,
+            combine_cu=cu,
+            num_reduce_cu=num_reduce_cu,
+            num_gemm_cu=num_gemm_cu,
+        ),
     )
     return dx, d_topk_w

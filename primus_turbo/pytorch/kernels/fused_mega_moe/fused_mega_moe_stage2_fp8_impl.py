@@ -11,6 +11,7 @@ dual-quant, and the dW2 wgrad. The dual-quant emits grad_l1 only as quantized op
 backward returns them for the op layer to hand to stage1 out of band.
 """
 
+import os
 from typing import Tuple
 
 import torch
@@ -41,7 +42,14 @@ _H_NUM_TILE_BLOCKS = 11  # fp8 dispatch handle index of num_tile_blocks (device 
 
 # The L1 comm/preshuffle split is left to the dispatch kernel's signature default, whose measured
 # pair is that direction's. L2 combine 32 beats 48 by ~5% on EP8 T=8192 DSv3.
-_L2_NUM_COMBINE_CU = 32
+#
+# This optimum is shape-dependent and 32 was measured on DSv3 (H=7168, I=2048) only, so the combine
+# now tunes it per shape online (``flydsl/mega/fp8/combine_autotune.py``). ``None`` hands it that
+# choice; setting the env pins a value instead and skips tuning entirely, which is what the sweeps
+# and any shape with a known-good split use.
+_L2_NUM_COMBINE_CU = (
+    int(os.environ["PT_MEGA_FP8_L2_COMBINE_CU"]) if "PT_MEGA_FP8_L2_COMBINE_CU" in os.environ else None
+)
 
 __all__ = [
     "fused_mega_moe_stage2_forward_fp8_impl",
@@ -112,6 +120,7 @@ def fused_mega_moe_stage2_forward_fp8_impl(
         topk_weights=topk_weights if topk_weights.dtype == torch.float32 else topk_weights.to(torch.float32),
         x_fp8=(act_fp8, act_a_sp),
         num_combine_cu=_L2_NUM_COMBINE_CU,
+        group=group,
     )
     return y
 
