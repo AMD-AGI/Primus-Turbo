@@ -1181,26 +1181,43 @@ Measured on the round-12 shipment, prod shape:
    (`SQ_WAIT_ANY`, `SQ_WAIT_INST_LDS`). Until then, **neither hypothesis is excluded**,
    and a candidate must not cite this number in either direction.
 
-3. **The two hot kernels are capped by different resources, and neither cap has ever been
-   priced in twelve rounds.**
-   - `k_dkdv` is **LDS-bound, and runs at 1 wave/SIMD**: 70656 B/WG against a measured
-     327680 B/CU gives 4 WG/CU; the workgroup is 32 threads = 1 wave, so that is 4
-     waves/CU spread over 4 SIMDs. Its 376 VGPRs would allow 2 waves/SIMD. **There is
-     currently no intra-SIMD latency hiding in the dominant kernel at all.**
-     And the 70656 is almost entirely a hole: `kernels.py:219-225` allocates
-     `LDS_SEG + 2*32*S_ROW_B` = 65536 + 5120, but the live data is
-     `2*32*X_ROW_B` (Q and dO, 17408 B) plus `2*32*S_ROW_B` (P and dS, 5120 B)
-     = **22528 B used out of 70656 allocated. 48128 B is padding**, placed there by
-     r12.i1.g39 to push P/dS into a different 64 KB LDS segment from Q/dO.
-     Thresholds are sharp: ≤65536 B buys 5 WG/CU, ≤40960 B buys 8 (= the VGPR max).
-     Whether g39's segment separation is worth 2x occupancy has never been measured --
-     it shipped inside round 12, whose accepted gain was attributed to dispatch order.
-   - `k_dq` is **VGPR-bound**: 8704 B of LDS would allow 37 WG/CU, but 480 VGPRs cap it
-     at 2 waves/SIMD. ≤341 VGPRs buys 3.
+3. **WRONG AS FIRST WRITTEN. `rocprofv3`'s VGPR column on this card is HALF the ISA
+   allocation, and correcting it inverts the conclusion.**
+   The first draft read `k_dkdv` VGPR 376 / `k_dq` 480 off the counter CSV and concluded
+   that LDS was throwing away half of `k_dkdv`'s occupancy and that `k_dq` had headroom
+   to 3 waves/SIMD. Both are void.
 
-   These are step functions, not gradients. A change that cuts `k_dkdv` LDS from 70656 to
-   66000 buys **nothing**; the same change to 65536 buys 25%. Compute which side of the
-   threshold a candidate lands on *before* spending a round on it.
+   **The units rule, verified independently and decisively:** aiter's ASM forward code
+   object declares `.vgpr_count: 1024` in its own metadata, and `rocprofv3` reports
+   **512** for that same kernel in the same run. The column is
+   `roundup(next_free_vgpr / 2, 8)`. It fits every kernel measured with no free
+   parameter: 740→376, 960→480, 40→24, 1024→512.
+   **Never read an occupancy step off that column. Multiply by 2 first.**
+
+   Corrected, and this agrees with `findings/facts.md:1306`, which the campaign already
+   measured in round 12 and which the first draft of this hint contradicted:
+
+   | | ISA VGPR | waves/SIMD | VGPR/SIMD used |
+   |---|--:|--:|--:|
+   | `k_dkdv` | **740** | 1 | 740 / 1024 |
+   | `k_dq`   | **960** | 1 | 960 / 1024 |
+   | aiter ASM forward (the bar) | 1024 | 1 | 1024 / 1024 |
+
+   So: **both our kernels are already in the bar's configuration** -- one wave per SIMD on
+   a nearly-full register file. `k_dkdv` is VGPR-capped at 4 WG/CU *regardless of LDS*,
+   which means the 48128 B LDS hole costs **zero occupancy** and the "LDS is holding back
+   half our occupancy" reading is dead. There is no register slack to spend: `k_dkdv` has
+   272 VGPRs free, `k_dq` has 64.
+
+   Two consequences that close families rather than open them:
+   - **`BLOCK_KV` 32→64 is LESS reachable now than when round 3 measured it 2.76x slower.**
+     It costs +256 accumulator and +128 kf/vf VGPRs on top of g21's 128-VGPR prefetch
+     that did not exist then, landing near 1110-1124 against a 1024 ceiling. It would
+     spill, and a spilling build hangs this card.
+   - **`k_dq`'s register axis is arithmetically closed.** 3 waves/SIMD needs ≤341, a 64%
+     cut; even 2 waves needs ≤512, and the dQ accumulators (256, proven by the
+     256-instruction bf16 store epilogue) plus the hoisted Q/dO fragments (256) are
+     already 512 before one K or V byte is loaded.
 
 4. **There is no elementwise overhead. I misread my own profile and nearly shipped it.**
    The first draft of this hint claimed 5.8% of per-step time ran in torch elementwise
@@ -1223,3 +1240,131 @@ and survived twelve rounds because `sitecustomize.py:18` pinned the same value a
 nothing ever contradicted it. **Before building on a fact in this file, check whether
 anything since could have falsified it — and prefer facts that carry their own
 measurement.**
+
+
+---
+
+## h20 — corrections to h19, and the counters that actually exist (2026-09-23)
+
+h19 was written the same day and three of its four points needed correcting within hours.
+They are corrected in place above; what follows is the part that would otherwise be
+rediscovered the expensive way.
+
+**The counters h19 told you to collect do not exist on gfx1250.**
+`SQ_WAIT_INST_LDS` and `SQ_WAIT_BARRIER` are not defined for this chip, and neither are
+`SQ_WAIT_CNT_ANY`, `SQ_ACTIVE_INST_ANY`, `SQ_BUSY_CU_CYCLES`, `SQ_LDS_BANK_CONFLICT` or
+`SQ_INSTS_VMEM`. **Naming any one of them fails the entire pass**, so a round that trusts
+h19's list gets nothing back and may read the empty result as "the probe does not work".
+
+The authority is `/opt/rocm/share/rocprofiler-sdk/config.yaml` -- **not** the legacy
+`basic_counters.xml`, which has no gfx1250 section at all. It defines 224 basic counters
+for gfx1250, 187 of them gfx1250-only, so it is chip evidence rather than gfx11
+substitution.
+
+What exists and answers the open question:
+
+| counter | what it buys |
+|---|---|
+| `SQ_WAIT_ANY` | wave-cycles blocked on anything, `s_waitcnt` included |
+| `SQ_WAIT_INST_ANY` | wave-cycles blocked waiting for an **issue slot** |
+| `SQ_WAVE_CYCLES` | the denominator both of those belong over |
+| `SQ_VALU_WMMA_FLOP_BF16` | **issued** bf16 FLOP, directly -- no more inferring it from source |
+| `SQ_INSTS_VEC32_VALU_WMMA`, `SQ_INSTS_ALL` | instruction mix |
+
+The discriminator is the **gap between the two wait counters**. At 1 wave/SIMD there is
+nobody to contend with for an issue slot, so `SQ_WAIT_INST_ANY` should come back near
+zero; a large `SQ_WAIT_ANY` beside it proves the wave is resident and blocked on data,
+which is the thing `SQ_BUSY_CYCLES` could never show.
+
+**Per-pass budget is per hardware block, not global**: SQ 8 (SQC shares that budget),
+TCP 8, GRBM 2. Pack to exactly 8 SQ counters per pass.
+
+**Normalisation.** `SQ_WAVES` is already a whole-GPU total and needs no divisor --
+`k_dkdv` read 8192, exactly grid 262144 / 32. But the cycle-type SQ counters divide by
+**256, not 1024**: /256 gives 1.00 GHz against this card's 1050-1100 MHz, while /1024
+would imply an impossible 251 MHz. h19's hand-division by 1024 SIMDs was wrong.
+**Prefer ratios of two SQ counters, which survive the divisor being wrong.**
+
+**And `.co` files DO disassemble here.** `/opt/rocm/llvm/bin/llvm-objdump -d` returns
+8253 lines for the backward bar and 11,846 for the forward. `planner.log:989` and h18's
+caveat both say otherwise and are both wrong. Twelve rounds reverse-engineered a box that
+was never locked.
+
+### What this leaves for round 13
+
+Four candidates were priced against the corrected numbers. Three closed:
+
+- **the LDS hole** -- costs no occupancy, and g39 *was* measured in isolation: prod
+  +0.59% / +0.21% against a self-reported 0.86% floor, i.e. **NULL**. Round 12's entire
+  +4.91% came from g40, the `k_dq` dispatch-order change. Also: the "64 KB segment served
+  by two 256 B/cycle read ports" story behind g39 is **UNVERIFIED as hardware** -- the
+  project's own gfx1250 ISA readout has a full LDS section (320 KB, 2048 B granularity,
+  64 banks x 4 B) that never mentions a segment or a read port, and the corpus's own
+  portability table already marks it "Unknown ... Do not assume".
+- **a fatter wave** -- `BLOCK_KV` 64 spills (above); 2x query-loop unroll measured -7.8%
+  (g28), deeper prefetch -14.6% (g27), the half-prefetch probe -61.5% (g32), and K/V
+  resident in registers has shipped since round 1.
+- **`k_dq` registers** -- arithmetically closed (above).
+
+One is open, and it is the one difference from the bar that has never been tested:
+**the bar moves every global→LDS byte by TDM and issues zero `buffer_load`.**
+Our `k_dkdv` hot body is exactly 36 `buffer_load` (32 b128 + 4 b32), counted in the
+shipped round-12 object. The record that closed TDM does not bind: its number is a
+**gfx950** A/B of `buffer_load ... lds` -- a different instruction -- attributed to
++16 `s_barrier` and -32 AGPRs, and **neither can happen here**: gfx1250 has no AGPRs, and
+our workgroup is a single wave whose `s_barrier` count is already 0, so there are no
+barriers to add. flydsl 0.3.2's TDM 2D surface is complete, and its padding mode
+reproduces our g16-tuned `X_ROW_B = 272 B` exactly (`pad_interval=128, pad_amount=8`).
+
+**Expected sign: genuinely UNKNOWN.** Say so in the act, and make it the round's
+falsification target rather than a prediction. The precedent cuts both ways -- deleting
+traffic on `k_dkdv` paid +11.0% once (g09) while the identical deletion on `k_dq` paid
+nothing (g12).
+
+### h20 addendum — the counter whitelist for this machine (validated, 2026-09-23)
+
+Everything above about which counters "exist" was still one layer too optimistic, and the
+failure mode is the worst kind: **`--list-avail` lists the counter, `rocprofv3` accepts it,
+the pass exits 0, and it silently returns zero.**
+
+This was caught only because the control was aiter's ASM forward, a kernel that provably
+issues millions of WMMA. `SQ_VALU_WMMA_FLOP_BF16` came back **0** for it, in the same pass
+where `SQ_WAVES` read a correct 16384. Without that control the conclusion would have been
+"the bar issues no bf16 matrix work" -- absurd, and yet it would have looked exactly like
+data.
+
+**Use only these nine. They were validated against a known-nonzero control:**
+
+```
+SQ_WAVES   SQ_CYCLES   SQ_BUSY_CYCLES   SQ_ITEMS
+SQC_ICACHE_REQ   SQC_ICACHE_HITS   SQC_ICACHE_MISSES   SQC_ICACHE_MISSES_DUPLICATE
+GRBM_GUI_ACTIVE
+```
+
+**Accepted but silently zero -- do NOT use, and do not read a zero from them as a finding:**
+`SQ_WAVE_CYCLES`, `SQ_INST_CYCLES_VALU_WMMA`, `SQ_INSTS_VEC32_VALU_WMMA`,
+`SQ_VALU_WMMA_FLOP_BF16`, `SQ_VALU_WMMA_FLOP_FP16`, `SQ_INSTS_SENDMSG`.
+
+**Rejected outright** (naming one fails the whole pass): every wait and stall counter --
+`SQ_WAIT_ANY`, `SQ_WAIT_INST_ANY`, `SQ_WAIT_INST_LDS`, `SQ_WAIT_BARRIER`,
+`SQ_BUSY_CU_CYCLES`, `SQ_LDS_BANK_CONFLICT`, `SQ_INSTS_VMEM`, `SQ_INSTS_ALL`.
+Note this also kills the `SQ_WAIT_ANY` / `SQ_WAIT_INST_ANY` pair that the round-13 pricing
+recommended: that recommendation was read out of
+`/opt/rocm/share/rocprofiler-sdk/config.yaml`, which is **not** the table the container's
+`rocprofv3` consults. Ask the tool, not the config file.
+
+**Therefore: "is the wave stalling or starving" cannot be answered by counters on this
+machine.** Stop proposing it. Drop it as a decision input rather than leaving it open as
+something a future round might resolve.
+
+**What per-round profiling is still worth**, and it is not nothing: every `--pmc` pass
+returns the kernel descriptors for free -- `VGPR_Count`, `SGPR_Count`, `LDS_Block_Size`,
+`Scratch_Size`, `Workgroup_Size`, `Grid_Size`. That is how the O_VARIANT result was
+confirmed to be two genuinely different kernels rather than one cached build, and it is
+the cheapest spill check available (`Scratch_Size` != 0 means the build spilled, and a
+spilling build hangs this card). Run one pass per round with the nine counters above and
+read the descriptors.
+
+One more nail in the icache coffin: the ASM bar's own miss rate is
+50137 / 339246799 = **0.0148%**, two orders of magnitude *worse* than our `k_dkdv`'s
+0.0002%, and it is still 1.4x faster.

@@ -1,0 +1,624 @@
+GPU     :	0
+Name    :	gfx1250
+configs :
+   Method              :	host_trap
+   Unit                :	time
+   Min_Interval        :	512
+   Max_Interval        :	18446744073709551615
+   Flags               :	none
+
+
+   Method              :	stochastic
+   Unit                :	cycle
+   Min_Interval        :	256
+   Max_Interval        :	1048576
+   Flags               :	interval pow2
+
+
+
+
+GPU     :	0
+Name    :	gfx1250
+configs :
+   Type                :	SAMPLE_INTERVAL_SCLK_CYCLES
+   Minimum_Interval    :	32
+   Maximum_Interval    :	65504
+
+
+
+
+GPU:0
+Name:gfx1250
+Counter_Name        :	processor_id_low
+Description         :	Constant value processor_id_low from agent properties
+
+
+Counter_Name        :	capability
+Description         :	Constant value capability from agent properties
+
+
+Counter_Name        :	local_mem_size
+Description         :	Constant value local_mem_size from agent properties
+
+
+Counter_Name        :	size
+Description         :	Constant value size from agent properties
+
+
+Counter_Name        :	unique_id
+Description         :	Constant value unique_id from agent properties
+
+
+Counter_Name        :	min_latency
+Description         :	Constant value min_latency from agent properties
+
+
+Counter_Name        :	weight
+Description         :	Constant value weight from agent properties
+
+
+Counter_Name        :	node_from
+Description         :	Constant value node_from from agent properties
+
+
+Counter_Name        :	version_major
+Description         :	Constant value version_major from agent properties
+
+
+Counter_Name        :	version_minor
+Description         :	Constant value version_minor from agent properties
+
+
+Counter_Name        :	mem_clk_max
+Description         :	Constant value mem_clk_max from agent properties
+
+
+Counter_Name        :	num_xcc
+Description         :	Constant value num_xcc from agent properties
+
+
+Counter_Name        :	width
+Description         :	Constant value width from agent properties
+
+
+Counter_Name        :	flags
+Description         :	Constant value flags from agent properties
+
+
+Counter_Name        :	size_in_bytes
+Description         :	Constant value size_in_bytes from agent properties
+
+
+Counter_Name        :	array_count
+Description         :	Constant value array_count from agent properties
+
+
+Counter_Name        :	num_gws
+Description         :	Constant value num_gws from agent properties
+
+
+Counter_Name        :	simd_id_base
+Description         :	Constant value simd_id_base from agent properties
+
+
+Counter_Name        :	max_waves_per_simd
+Description         :	Constant value max_waves_per_simd from agent properties
+
+
+Counter_Name        :	sdma_fw_version
+Description         :	Constant value sdma_fw_version from agent properties
+
+
+Counter_Name        :	gfx_target_version
+Description         :	Constant value gfx_target_version from agent properties
+
+
+Counter_Name        :	max_bandwidth
+Description         :	Constant value max_bandwidth from agent properties
+
+
+Counter_Name        :	cpu_core_id_base
+Description         :	Constant value cpu_core_id_base from agent properties
+
+
+Counter_Name        :	cache_line_size
+Description         :	Constant value cache_line_size from agent properties
+
+
+Counter_Name        :	level
+Description         :	Constant value level from agent properties
+
+
+Counter_Name        :	min_bandwidth
+Description         :	Constant value min_bandwidth from agent properties
+
+
+Counter_Name        :	location_id
+Description         :	Constant value location_id from agent properties
+
+
+Counter_Name        :	wave_front_size
+Description         :	Constant value wave_front_size from agent properties
+
+
+Counter_Name        :	lds_size_in_kb
+Description         :	Constant value lds_size_in_kb from agent properties
+
+
+Counter_Name        :	simd_count
+Description         :	Constant value simd_count from agent properties
+
+
+Counter_Name        :	fw_version
+Description         :	Constant value fw_version from agent properties
+
+
+Counter_Name        :	recommended_transfer_size
+Description         :	Constant value recommended_transfer_size from agent properties
+
+
+Counter_Name        :	simd_per_cu
+Description         :	Constant value simd_per_cu from agent properties
+
+
+Counter_Name        :	association
+Description         :	Constant value association from agent properties
+
+
+Counter_Name        :	mem_banks_count
+Description         :	Constant value mem_banks_count from agent properties
+
+
+Counter_Name        :	latency
+Description         :	Constant value latency from agent properties
+
+
+Counter_Name        :	max_latency
+Description         :	Constant value max_latency from agent properties
+
+
+Counter_Name        :	cpu_cores_count
+Description         :	Constant value cpu_cores_count from agent properties
+
+
+Counter_Name        :	io_links_count
+Description         :	Constant value io_links_count from agent properties
+
+
+Counter_Name        :	domain
+Description         :	Constant value domain from agent properties
+
+
+Counter_Name        :	max_engine_clk_fcompute
+Description         :	Constant value max_engine_clk_fcompute from agent properties
+
+
+Counter_Name        :	caches_count
+Description         :	Constant value caches_count from agent properties
+
+
+Counter_Name        :	simd_arrays_per_engine
+Description         :	Constant value simd_arrays_per_engine from agent properties
+
+
+Counter_Name        :	cache_lines_per_tag
+Description         :	Constant value cache_lines_per_tag from agent properties
+
+
+Counter_Name        :	gds_size_in_kb
+Description         :	Constant value gds_size_in_kb from agent properties
+
+
+Counter_Name        :	cu_per_simd_array
+Description         :	Constant value cu_per_simd_array from agent properties
+
+
+Counter_Name        :	type
+Description         :	Constant value type from agent properties
+
+
+Counter_Name        :	max_slots_scratch_cu
+Description         :	Constant value max_slots_scratch_cu from agent properties
+
+
+Counter_Name        :	vendor_id
+Description         :	Constant value vendor_id from agent properties
+
+
+Counter_Name        :	device_id
+Description         :	Constant value device_id from agent properties
+
+
+Counter_Name        :	heap_type
+Description         :	Constant value heap_type from agent properties
+
+
+Counter_Name        :	drm_render_minor
+Description         :	Constant value drm_render_minor from agent properties
+
+
+Counter_Name        :	num_sdma_engines
+Description         :	Constant value num_sdma_engines from agent properties
+
+
+Counter_Name        :	node_to
+Description         :	Constant value node_to from agent properties
+
+
+Counter_Name        :	num_sdma_xgmi_engines
+Description         :	Constant value num_sdma_xgmi_engines from agent properties
+
+
+Counter_Name        :	num_sdma_queues_per_engine
+Description         :	Constant value num_sdma_queues_per_engine from agent properties
+
+
+Counter_Name        :	hive_id
+Description         :	Constant value hive_id from agent properties
+
+
+Counter_Name        :	num_cp_queues
+Description         :	Constant value num_cp_queues from agent properties
+
+
+Counter_Name        :	max_engine_clk_ccompute
+Description         :	Constant value max_engine_clk_ccompute from agent properties
+
+
+Counter_Name        :	CHA_BUSY
+Description         :	Count busy cycles. Not windowable.
+Block               :	CHA
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	CHA_CYCLE
+Description         :	Number of cycles. Not windowable.
+Block               :	CHA
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	CHC_REQ_READ
+Description         :	Sum of REQ_READ_32B, REQ_READ_64B, REQ_READ_128B, REQ_READ_256B
+Block               :	CHC
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	CHC_REQ_READ_32B
+Description         :	Number of read requests with logical size 32B
+Block               :	CHC
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	CHC_REQ_READ_64B
+Description         :	Number of read requests with logical size 64B
+Block               :	CHC
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	CHC_REQ_READ_128B
+Description         :	Number of read requests with logical size 128B
+Block               :	CHC
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	CHC_REQ_READ_256B
+Description         :	Number of read requests with logical size 256B
+Block               :	CHC
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	CPC_CPC_STAT_BUSY
+Description         :	CPC Busy.
+Block               :	CPC
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	CPC_CPC_STAT_IDLE
+Description         :	CPC Idle.
+Block               :	CPC
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	CPC_CPC_STAT_STALL
+Description         :	CPC Stalled.
+Block               :	CPC
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	CPC_CPC_TCIU_BUSY
+Description         :	CPC TCIU interface Busy.
+Block               :	CPC
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	CPC_CPC_TCIU_IDLE
+Description         :	CPC TCIU interface Idle.
+Block               :	CPC
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	CPC_CPC_UTCL2IU_BUSY
+Description         :	CPC UTCL2 interface Busy.
+Block               :	CPC
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	CPC_CPC_UTCL2IU_IDLE
+Description         :	CPC UTCL2 interface Idle.
+Block               :	CPC
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	CPC_ME1_BUSY_FOR_PACKET_DECODE
+Description         :	Me1 busy for packet decode.
+Block               :	CPC
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	CPC_ME1_DC0_SPI_BUSY
+Description         :	CPC Me1 Processor Busy.
+Block               :	CPC
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	CPF_CPF_STAT_BUSY
+Description         :	CPF Busy.
+Block               :	CPF
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	GLARBC_CYCLE
+Description         :	Number of cycles. Not windowable.
+Block               :	GLARBC
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:23] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	GLARBC_BUSY
+Description         :	Number of cycles with a request pending. Not Windowed.
+Block               :	GLARBC
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:23] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	GL1A_BUSY
+Description         :	Number of cycles. Not windowable.
+Block               :	GL1A
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	GL1A_CYCLE
+Description         :	Number of cycles. Not windowable.
+Block               :	GL1A
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	GL1C_GL2_REQ_READ_LEVEL
+Description         :	Number of cycles in-flight for reads, atomics with return, NOP_RTN0. Average GL2 read latency = GL1C_PERF_SEL_GL2_REQ_READ_LEVEL/SUM_OF_REQ_COUNTERS
+Block               :	GL1C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:11] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	GL1C_GL2_REQ_WRITE_LEVEL
+Description         :	Number of cycles in-flight for writes, atomics without return, NOP_ACK. Average GL2 read latency = GL1C_PERF_SEL_GL2_REQ_WRITE_LEVEL/SUM_OF_REQ_COUNTERS
+Block               :	GL1C
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:11] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	GRBM_COUNT
+Description         :	Tie High - Count Number of Clocks
+Block               :	GRBM
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	GRBM_CPC_BUSY
+Description         :	The Command Processor Compute (CPC) is busy.
+Block               :	GRBM
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	GRBM_GUI_ACTIVE
+Description         :	The GUI is Active
+Block               :	GRBM
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	GRBMA_COUNT
+Description         :	Tie High - Count Number of Clocks
+Block               :	GRBMA
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0] DIMENSION_AID[0:1]
+
+
+Counter_Name        :	GRBMA_SPI_BUSY
+Description         :	Any of the Shader Pipe Interpolators (SPI OR SQG) are busy.
+Block               :	GRBMA
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0] DIMENSION_AID[0:1]
+
+
+Counter_Name        :	GRBMH_COUNT
+Description         :	Tie High - Count Number of Clocks
+Block               :	GRBMH
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	GRBMH_SPI_BUSY
+Description         :	Any of the Shader Pipe Interpolators (SPI OR SQG) are busy.
+Block               :	GRBMH
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	SPI_RA_REQ_NO_ALLOC
+Description         :	Arb cycles with requests but no allocation. Source is RA0
+Block               :	SPI
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_INSTANCE[0:0] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	SQC_ICACHE_HITS
+Description         :	Number of cache hits. (per-SQ, per-Bank, nondeterministic)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:8] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	SQC_ICACHE_MISSES
+Description         :	Number of cache misses, includes uncached requests. (per-SQ, per-Bank, nondeterministic)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:8] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	SQC_ICACHE_MISSES_DUPLICATE
+Description         :	Number of misses that were duplicates (access to a non-resident, miss pending CL). (per-SQ, per-Bank, nondeterministic)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:8] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	SQC_ICACHE_REQ
+Description         :	Number of requests. (per-SQ, per-Bank)
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:8] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	SQ_BUSY_CYCLES
+Description         :	Number of clock cycles there are active waves in a shader engine (as reported by the distributed sequencer). This value does not denote the number of active waves, only the clock cycle in which any wave is present in a SE. This value is returned on a per-shader engine basis in clock cycles.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:8] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	SQ_CYCLES
+Description         :	Clock cycles. Value is returned per-SIMD.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:8] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	SQ_INSTS_SENDMSG
+Description         :	Total number of Sendmsg (typically an interrupt to the CPU host) instructions issued. This value is returned per-SE (aggregate of values in SIMDs in the SE). See AMD ISAs for more information on Sendmsg instructions.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:8] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	SQ_ITEMS
+Description         :	Number of valid items per wave. This value is returned on a per-SE (aggregate of values in SIMDs in the SE) basis.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:8] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	SQ_WAVES
+Description         :	Count number of waves sent to distributed sequencers (SQs). This value represents the number of waves that are sent to each SQ. This only counts new waves sent since the start of collection (for dispatch profiling this is the timeframe of kernel execution, for agent profiling it is the timeframe between start_context and read counter data). A sum of all SQ_WAVES values will give the total number of waves started by the application during the collection timeframe. Returns one value per-SE (aggregates of SIMD values).
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:8] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	SQ_WAVE_CYCLES
+Description         :	The cycles spent executing waves in the CUs. This value is reported per-SE (aggregates of SIMD values) and is nondeterministic. Units are in quad-cycles (4 cycles). Useful for determining how much time is spent executing wave code vs overhead/waiting. Low cycle count relative to actual number of cycles processed by the CU can indicate that the CU is stalling or is overloaded.
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:8] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	SQ_INST_CYCLES_VALU_WMMA
+Description         :	Number of cycles of work sent for wmma. {emulated}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:8] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	SQ_INSTS_VEC32_VALU_WMMA
+Description         :	Number of valu WMMA instructions issued per vec32. {emulated}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:8] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	SQ_VALU_WMMA_FLOP_FP32
+Description         :	SGEMM flop, only report 1 per issue cycle, it stands for 128 Ops per SIMD32. {emulated, windowed, deterministic}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:8] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	SQ_VALU_WMMA_FLOP_FP16
+Description         :	HPGEMM flop, only report 1 per issue cycle, it stands for 2048 Ops per SIMD32, sparse will report 2 per issue cycle.. {emulated, windowed, deterministic}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:8] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	SQ_VALU_WMMA_FLOP_FP8
+Description         :	FP8 GEMM flop, only report 1 per issue cycle, it stands for 4096 Ops per SIMD32, sparse will report 2 per issue cycle. Count as FP8 is the largest input data type (other input is FP4, FP6 or FP8).. {emulated, windowed, deterministic}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:8] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	SQ_VALU_WMMA_FLOP_FP6
+Description         :	FP6 GEMM flop, only report 1 per issue cycle, it stands for 8192 Ops per SIMD32, sparse will report 2 per issue cycle (but there is no sparse currently). Count as FP6 is the largest input data type (other input is FP4 or FP6).. {emulated, windowed, deterministic}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:8] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	SQ_VALU_WMMA_FLOP_FP4
+Description         :	FP4 GEMM flop, only report 1 per issue cycle, it stands for 8192 Ops per SIMD32, sparse will report 2 per issue cycle (but there is no sparse currently). Count as FP4 if both sources are FP4.. {emulated, windowed, deterministic}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:8] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	SQ_VALU_WMMA_FLOP_F6F4
+Description         :	F6 or F4 GEMM flop, only report 1 per issue cycle, it stands for 4096 Ops per SIMD32, sparse will report 2 per issue cycle. Mixed precision WMMA counts as FLOP_F6F4 if input operands are only F6 and F4 (not F8). If any are F8, it counts as FLOP_F8. {emulated, windowed, deterministic}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:8] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	SQ_VALU_WMMA_FLOP_BF16
+Description         :	BF16GEMM flop, only report 1 per issue cycle, it stands for 2048 Ops per SIMD32, sparse will report 2 per issue cycle.. {emulated, windowed, deterministic}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:8] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
+Counter_Name        :	SQ_VALU_WMMA_FLOP_I8
+Description         :	I8GEMM flop, only report 1 per issue cycle, it stands for 4096 Ops per SIMD32, sparse will report 2 per issue cycle.. {emulated, windowed, deterministic}
+Block               :	SQ
+SPM                 :	Not Supported
+Dimensions          :	DIMENSION_WGP[0:8] DIMENSION_SHADER_ARRAY[0:1] DIMENSION_SHADER_ENGINE[0:1] DIMENSION_XCC[0:7]
+
+
