@@ -1579,6 +1579,17 @@ either — which is why only an AC cycle recovers it.
 
 So `IH ring buffer overflow` is the *observable consequence*; arrival rate is the cause.
 
+**One caveat, stated rather than papered over.** Four separate survivable bursts on
+2026-09-23 measured 93.23, 96.79, 96.99 and 96.89 ms — **too regular to be a kernel's own
+fault rate.** That cadence is almost certainly a driver-side reporting throttle, so the
+~97 ms figure measures the throttle, not how fast the kernel actually faults. The wedge's
+0.016 ms is then better read as *faults arriving faster than the throttle can be applied*
+— which is consistent with the overflow but means the 6000x is a ratio between two
+different things, not a clean rate comparison.
+**What is safe to rely on: the overflow itself, and the observation that the survivable
+bursts all sat at the throttle while the wedge did not.** Do not quote the 6000x as a
+measured fault-generation ratio.
+
 This also says what kind of bug is dangerous. A ~97 ms cadence is one fault per launch —
 a single bad address, raised once, process killed. A 16 µs cadence is **many waves
 faulting concurrently inside a hot loop**. So an out-of-bounds address computed
