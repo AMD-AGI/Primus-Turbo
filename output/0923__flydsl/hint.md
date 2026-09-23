@@ -23,6 +23,7 @@ the head of a round, so direction can be changed here **without stopping the job
 | h15 | must standing | Rules for every script a round writes: cached_forward, line buffering, dmesg between blocks | open |
 | h16 | must note | The bound is the ISSUE ROOF, not bandwidth. g15 and g18 close; g04 demoted; round 10 is g27 | open |
 | h17 | must standing | Read the corpus before you build. h16 named a documented dead end and it cost a round | open |
+| h18 | must note | The bar cannot pass our own gate. Round 12 buys an instrument, not a candidate | open |
 
 ---
 
@@ -305,7 +306,8 @@ should try to falsify.**
 
 Three independent sources agree on this configuration, which is why it outranks everything
 else in the pool:
-1. aiter's own gfx1250 kernel, from disassembly: `block=128` (4 x wave32), ts=128, 80 WMMA
+1. aiter's gfx1250 kernel -- NOT from disassembly, see the correction in h18:
+   `block=128` (4 x wave32), ts=128, 80 WMMA
    per wave x 4 = 320 = 5 GEMM x 64, LDS 327680 B, zero `global_load` (all TDM).
 2. The colleague's gfx950 branch converged on `flat_wg=256` (NUM_WAVES=4) with
    `_fuse_blockkv_for` returning 128 at D=128.
@@ -1004,3 +1006,143 @@ Two things to establish before building, in that order:
 And apply the rule at the top of this hint first: **grep the corpus for
 `s_set_vgpr_msb`, "bank", "vgpr window" before building anything.** If it is already priced
 there, that number outranks any estimate made here.
+
+## h18 -- The bar cannot pass our own gate
+
+### The finding
+
+**aiter's gfx1250 backward accumulates dq with fp32 atomics.** Three independent sources,
+all hard:
+
+* `aiter-src/csrc/cpp_itfs/mha_bwd.cu:617-618` -- "ASM kernel **atomically accumulates**
+  into dq_accum; require zero-init"
+* `:472` -- `need_post_processing` is **unconditionally true** for gfx1250
+* our own launcher, `tools/gfx1250/asm_bwd_abi.py:27` -- the pipeline is
+  `bwd_hd128_odo_bf16`, `bwd_hd128_bf16_causal_br_a32_pssk`, `bwd_hd128_dq_convert_bf16`,
+  where **`a32` is `v3_atomic_fp32`**
+
+So the bar would fail `DETERMINISM_RUNS = 200` if we ran it through our own gate. **The
+entire 1.408x of matrix work that separates us grows out of that gate.** This is not "we
+are worse than aiter"; it is "we are playing a different game", and every kernel-level
+lever left to us lives inside the remaining 1.040x.
+
+### A correction to h16, of the same kind h17 exists to prevent
+
+h16 said aiter's five-GEMM fusion was "confirmed by disassembly". **It was not.**
+`job_context/logs/planner.log:989` records that gfx1250 `.co` files do not disassemble --
+`llvm-objdump` returns an empty `.text` for `e_flags 0x549`. The five-GEMM claim is
+*inferred* from gfx950 disassembly plus the manifest plus `mha_bwd.cu`. Our own seven is
+measured from our own ISA; their five is not. The atomics claim above, by contrast, IS
+hard evidence, and it is the stronger of the two.
+
+### What the gate actually is, and where it came from
+
+The requirement is the operator's own words, unannotated, in
+`job_context/history/v000_original.yaml:94-97`:
+
+> The baseline is atomic-free by construction: every output element is written exactly
+> once. Keep that -- it is one of the reasons to have a source-level backward at all, and
+> **200-run bitwise determinism is a cheap gate on it.**
+
+The real requirement is *every output element written exactly once*. The 200-run check is
+named, by the person who set it, as **a cheap observation of that property, not the
+property**. `validation.py:174-177` says the same: "Bitwise identity is the OBSERVABLE form
+of 'no atomics on any output'." A constraint given with its reason is one the same person
+can re-weigh against the same reason.
+
+Three strengths, strictest first:
+
+| | | us | aiter |
+|---|---|---|---|
+| A | bitwise against the fp32 reference | ✗ (nobody) | ✗ |
+| B | **this kernel bitwise run-to-run** (the current gate) | ✓ 11 rounds | **✗** |
+| C | fixed reduction order, "training reproducible" | ✓ | ✗ |
+
+**The gate enforces B, and B is strictly stronger than C.** PyTorch's
+`use_deterministic_algorithms` asks for C. aiter ships a `deterministic=True` path that is
+C, priced in the corpus at **-22.7%** -- but that figure is gfx950 hd128, not measured here.
+
+### If it were relaxed
+
+Estimated, from our measured 481.0 TF/s at prod and the ISA-measured 7/5 ratio:
+
+| | prod ms | TF/s | of bar | gap closed |
+|---|--:|--:|--:|--:|
+| today, 7 GEMM, eta 0.682 (**measured**) | 11.430 | 481.0 | 0.668x | -- |
+| 5 GEMM, eta unchanged (est.) | 8.164 | 673.4 | 0.935x | **80%** |
+| + the atomic form's own overhead (est.) | 8.470 | 649.1 | 0.902x | 70% |
+| 5 GEMM at aiter's eta 0.725 (est.) | 7.680 | 715.9 | 0.994x | 98% |
+
+The atomic form's overhead is arithmetic: a 536.9 MB fp32 `dq_accum` zero-init plus
+`dq_convert` reading 536.9 MB and writing 268.4 MB = 1.342 GB at the measured 4.39 TB/s =
+**0.306 ms**. Note this does NOT pay h16's -4.6 ms: that figure was for the *deterministic*
+split-K alternative, whose 17.2 GB read-back disappears entirely under atomics. The
+credible range is **[649, 720] TF/s**, and the top of it is a number actually measured on
+this card -- by the bar.
+
+**But the path is not a switch.** It is g04 (4-wave, BLOCK_KV 32->128) plus re-adding the
+three barriers h13 requires, plus g15 (fuse dQ, delete k_dq), plus atomic dq, plus the
+convert kernel -- the largest structural rewrite in the job. And per-kernel eta says
+`k_dq` is already **0.79, above aiter's 0.725**, while `k_dkdv` is 0.63: the gap is 100% in
+k_dkdv, and fusing would delete the better kernel into the worse one.
+
+`evolve.max_rounds: 12` is the operator's own setting and rounds 0-11 are spent. **One
+round remains.** Relaxing the gate today could not be cashed in it.
+
+### What the gate has caught, stated fairly
+
+**In eleven rounds it has never fired once** -- every `validation.py` record reads
+`correctness pass / determinism x200 pass / speed FAIL`. That is evidence it has not
+caught a defect here.
+
+But the corpus has a case where it caught what nothing else would
+(`planner.log:901`): dQ silently miscomputed at 8-14 dB on particular
+`(q_split, BLOCK_KV)` combinations while throughput read fine, and **the determinism check
+failed before the SNR check did**. And round 6 proved SQNR is blind to this class: `armM`
+(bitwise-identical by construction) and `armN` (deliberately reordered fp32 accumulation)
+both read **52.61 / 52.65 / 52.83 dB, to two decimals**.
+
+Against that, h13 already recorded a hole the gate cannot cover: a race that drops or
+reorders staged rows can clear 50 dB *and* be bitwise-stable across 200 runs if it resolves
+the same way under a fixed schedule.
+
+**A cheap middle:** drop from B to C (fixed reduction order) while widening the check from
+one shape to cross-shape x cross-launch-config. The corpus precedent that actually caught
+something relied on the `q_split x BLOCK_KV` sweep, not on the number 200 -- so this keeps
+the half that works and unlocks the 1.408x. **Operator's call, not the round's.**
+
+### Round 12 buys an instrument, not a candidate
+
+Two rejections in a row, +6.4% of headroom, and both obvious doors shut from mechanism:
+
+* **instruction-level scheduling** (round 10) -- instruction count and time anti-correlate;
+  load-to-use distance is the variable and the code is at a local optimum.
+* **the bank tax** (round 11) -- `s_set_vgpr_msb` is a pure encoding prefix for the next
+  instruction's VGPR index bits. `g32` still showed 110 of them at 632 VGPR, so it is
+  driven by which register numbers the WMMA operand slots reference, not by how many
+  registers exist. FlyDSL has no register pinning and 32 accumulators are a 256-VGPR floor.
+  **The source cannot reach this variable.**
+
+And one lever found and killed for free by h17's rule: FlyDSL 0.3.2 exposes `waves_per_eu`
+and `maxnreg` compile hints and this job has never set one. The corpus, same backend, same
+op, a backward body: `waves_per_eu=3` -> **-32%**, `=4` -> **-5x**, "on a latency-bound
+kernel a forced step is negative in every instance measured here". Spill is a cliff (35
+dwords = -19%) and we would spill ~228. Elsewhere the same mechanism produced **wrong
+answers**. Cost to establish: zero GPU.
+
+So the last round should **price the one remaining window rather than guess at it**: an
+ablation probe over the ~125-instruction zero-matrix stretch in `k_dkdv`'s hot body, where
+all of the residual 1.040x lives. An ablation gives an upper bound, never a candidate --
+the corpus is explicit about that -- and an upper bound is exactly what is needed to decide
+whether to keep going.
+
+**If the window prices under ~5% at prod: stop optimising and consolidate.** Eleven rounds,
+57.2 -> 481.0 TF/s (8.4x), six consecutive losing arms, and a 7-GEMM ceiling of 511.6.
+
+Also: do NOT spend the slot on pool item `g35` as written. It names `lds_q`/`lds_do` for
+deletion, but those are the **2-consumer** transposes (16 `tr()` each feeding 2 WMMA) --
+the side the precedent measured at **-77%**. The winning side there was the 4-`tr()`-feeding-8
+pair, `a_p`/`a_ds`. The pool entry conflated them. Three further discounts: the precedent is
+gfx950; the incumbent already uses the **hardware** transposing load `DS_LOAD_TR16_B128`
+(one instruction, not a naive round trip); and `DS_BPERMUTE` still goes through LDS hardware
+across only 32 lanes.

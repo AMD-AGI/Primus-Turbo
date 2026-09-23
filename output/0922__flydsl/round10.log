@@ -530,3 +530,5 @@ round 10 (fast):
     not accepted: prod: 430.6 is 93.0% of its best ever 463.0
     not accepted: throughput 0.9586x its best ever does not improve on it (score 0.47167, incumbent 0.49477)
   1-opt: done
+  2-reflect: done
+round 11 (fast):
