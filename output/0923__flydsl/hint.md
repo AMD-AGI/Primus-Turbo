@@ -1529,37 +1529,46 @@ not complete, which is why only an AC cycle recovered it.
 stops responding before anything else the operator can see. It needs no root, no dmesg,
 and no GPU call. It is now in the round monitor.
 
-### h22 addendum — a fault is not a wedge. A fault STORM is. (measured 2026-09-23)
+### h22 addendum — a fault is not a wedge. Only the interrupt-ring overflow is.
+
+*(This paragraph was written once with the wrong discriminant and corrected within ten
+minutes, by the monitor built from it falsifying it on its next tick. The first version
+named `MORE_FAULTS` and multi-die faults. Both appear in the survivable case too. What
+follows is the version that survived a direct comparison of the two events.)*
 
 Forty minutes after the 13:35 wedge, round 14 faulted again on a fresh boot and **the card
-survived**: `docker exec` answered, GPU stayed at 100%, the loop kept running, and the only
-MES lines in `dmesg` were boot-time initialisation. The faulting candidate's process died;
-nothing else did.
+survived**: `docker exec` answered, the GPU stayed at 100%, the loop kept running, and
+every MES line in `dmesg` was boot-time initialisation. Only the faulting candidate's
+process died.
 
-Putting the two side by side gives the discriminant that actually predicts an AC cycle:
-
-| | 13:35 — WEDGED | 14:0x — SURVIVED |
-|---|---|---|
-| `MORE_FAULTS` | **0x1** | **0x0** |
-| IH ring buffer | **overflow** | — |
-| dies faulting | XCD0, XCD1, XCD2 | one per burst |
+| | 13:35 — **WEDGED** | 14:0x — **SURVIVED** |
+|---|--:|--:|
+| `no-retry page fault` records | 11 | 6 |
+| `MORE_FAULTS: 0x1` | **11 of 11** | 3 of 6 |
+| **`IH ring buffer overflow`** | **6** | **0** |
+| dies faulting | XCD0, XCD1, XCD2 | five, across AID0 and AID1 |
 | `PERMISSION_FAULTS` | 0x3 | 0x5 |
 | `RW` | 0x0 (read) | 0x1 (write) |
 | MES | `failed to respond` → unrecoverable | boot-time lines only |
 | cost | **power cycle** | one dead process |
 
-**`MORE_FAULTS` and the IH ring overflow are the predictors, not the fault itself, and not
-`PERMISSION_FAULTS`.** A single out-of-bounds access raises one fault, kills its process,
-and leaves the card usable. A storm overflows the interrupt ring, and once that happens MES
-cannot drain its queues and even the driver's own GPU reset cannot complete.
+**The single discriminant is `IH ring buffer overflow`.** Everything else is present on
+both sides:
 
-Two practical consequences:
+- **`MORE_FAULTS: 0x1` does NOT predict a wedge.** Half the survivable burst had it.
+  What differs is the *proportion* — every record in the wedge, half of them here — which
+  is a symptom of arrival rate, not a cause.
+- **Faults on several dies do not predict a wedge either.** The survivable burst hit five.
+- **`PERMISSION_FAULTS: 0x5` with `RW: 0x1`** — the signature recorded as the
+  memory-aperture class — is the one that **survived**. That signature names the class of
+  bug, not the severity.
 
-1. **Do not treat "a fault appeared in `dmesg`" as "the card is wedged".** That reflex
-   costs a round for nothing. Grep for the storm markers — `MORE_FAULTS: 0x1`,
-   `IH ring buffer overflow`, `MES(...) failed to respond`, `failed to suspend all gangs`,
-   `unrecoverable` — and check `docker exec` answers. A monitor that alarms on the word
-   "fault" will cry wolf on every candidate that reads past a buffer.
-2. **`PERMISSION_FAULTS: 0x5` with `RW: 0x1` is the recorded memory-aperture signature**,
-   and here it was survivable. So that signature identifies the *class of bug*, not the
-   severity. Severity is `MORE_FAULTS`.
+The mechanism this fits: faults have to arrive fast enough to overflow the interrupt ring.
+Once records are lost there, MES cannot drain its queues, and the driver's own GPU reset
+cannot complete either — which is why only an AC cycle recovers it.
+
+**So the alarm condition is:** `IH ring buffer overflow`, or any
+`MES(...) failed to respond` / `failed to suspend all gangs` / `unrecoverable`, or
+`timeout 20 docker exec <container> true` failing to answer. **Not** the word "fault", and
+**not** `MORE_FAULTS` — a monitor keyed on either will cry wolf on every candidate that
+runs past the end of a buffer, and this campaign produces those regularly.
