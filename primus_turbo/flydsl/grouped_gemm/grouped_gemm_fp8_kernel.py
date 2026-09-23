@@ -1936,7 +1936,7 @@ def _grouped_block_mn(
 
 
 _WGRAD_XCD_HW = 8  # gfx950 dispatcher: workgroup bid runs on XCD bid % _WGRAD_XCD_HW
-_WGRAD_XCD_RCP_SHIFT = 16  # fixed-point reciprocal of the compile-time swizzle divisors
+_WGRAD_XCD_RCP_SHIFT = 16  # base fixed-point shift for the compile-time swizzle divisors' reciprocals
 
 
 def _wgrad_xcd_aff_widths(n_blocks_m, n_blocks_n, tiles_per_group, nxcd=_WGRAD_XCD_HW):
@@ -1974,10 +1974,15 @@ def _wgrad_band_is_xcd_aff(n_blocks_m, n_blocks_n, group_m, group_n, nxcd=_WGRAD
 def _wgrad_xcd_div(x, d, xmax):
     """``x // d`` for a compile-time d, as one multiply plus one shift by a fixed-point reciprocal
     exact over [0, xmax]. Same trick as _wgrad_split_div, same reason: a real divide in
-    the per-tile prologue is a latency-exposed serial chain at occ=1."""
-    m = -(-(1 << _WGRAD_XCD_RCP_SHIFT) // d)
-    assert all((v * m) >> _WGRAD_XCD_RCP_SHIFT == v // d for v in range(xmax + 1)), (d, xmax)
-    return fx.Int32(fx.Int32(x * fx.Int32(m)) >> _WGRAD_XCD_RCP_SHIFT)
+    the per-tile prologue is a latency-exposed serial chain at occ=1. The shift is the smallest one
+    from the base that is exact and keeps the i32 product from wrapping."""
+    for s in range(_WGRAD_XCD_RCP_SHIFT, 31):
+        m = -(-(1 << s) // d)
+        if xmax * m < 1 << 31 and all((v * m) >> s == v // d for v in range(xmax + 1)):
+            break
+    else:
+        raise AssertionError((d, xmax))
+    return fx.Int32(fx.Int32(x * fx.Int32(m)) >> s)
 
 
 def _wgrad_xcd_rot_ok(TILES_PER_GROUP, gp=1, nxcd=_WGRAD_XCD_HW):
