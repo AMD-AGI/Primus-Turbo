@@ -17,6 +17,7 @@ Bitwise deterministic except the a16 dQ path (see _dq_a16_for), which accumulate
 """
 
 import math as host_math
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -4511,6 +4512,9 @@ _DQ_FOLD_SLICES = 16
 _DQ_FOLD_SLICE_BYTES = 1 << 27
 _SIDE_STREAM: dict = {}
 _PIPE_EVENTS: dict = {}
+# Serializing the D=64 atomic path can avoid stream interference with
+# application-level communication pipelines. Preserve overlap by default.
+_ATTN_SINGLE_STREAM = os.getenv("PRIMUS_TURBO_ATTN_SINGLE_STREAM", "0") == "1"
 
 
 def _dq_pipe_fills(block_kv):
@@ -5460,19 +5464,25 @@ def flydsl_varlen_backward(
             if _side is None:
                 _side = torch.cuda.Stream(device=dq.device)
                 _SIDE_STREAM[dq.device] = _side
-            _ev = _A16_EVENTS.get(_nbc)
-            if _ev is None:
-                _ev = torch.cuda.Event()
-                _A16_EVENTS[_nbc] = _ev
-            _odos[0](o16, dof16, df, _per, Sq, st, img=img)
-            _side.wait_stream(st)
-            for j in range(1, _nbc):
-                _odos[j](o16, dof16, df, _per, Sq, _side, img=img)
-            _ev.record(_side)
-            for j, _body in enumerate(_bodies):
-                if j == 1:
-                    st.wait_event(_ev)  # chunks 1.. read the delta the side just made
-                _body(*_bufs, _per, Sq, Skv, 0, st)
+            if _ATTN_SINGLE_STREAM:
+                for j in range(_nbc):
+                    _odos[j](o16, dof16, df, _per, Sq, st, img=img)
+                for _body in _bodies:
+                    _body(*_bufs, _per, Sq, Skv, 0, st)
+            else:
+                _ev = _A16_EVENTS.get(_nbc)
+                if _ev is None:
+                    _ev = torch.cuda.Event()
+                    _A16_EVENTS[_nbc] = _ev
+                _odos[0](o16, dof16, df, _per, Sq, st, img=img)
+                _side.wait_stream(st)
+                for j in range(1, _nbc):
+                    _odos[j](o16, dof16, df, _per, Sq, _side, img=img)
+                _ev.record(_side)
+                for j, _body in enumerate(_bodies):
+                    if j == 1:
+                        st.wait_event(_ev)  # chunks 1.. read the delta the side just made
+                    _body(*_bufs, _per, Sq, Skv, 0, st)
     elif band_span:
         _fused_bandgroups(
             dkdv_l,
