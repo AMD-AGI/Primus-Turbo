@@ -1,0 +1,301 @@
+2026-09-23T09:21:22.768432+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=INVALIDATE_TLBS
+2026-09-23T09:21:25.240403+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:21:27.717760+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=SUSPEND
+2026-09-23T09:21:27.717764+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to suspend all gangs
+2026-09-23T09:21:30.197970+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=RESET
+2026-09-23T09:21:30.197975+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Failed to detect hung queues
+2026-09-23T09:21:32.679244+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=RESUME
+2026-09-23T09:21:32.679254+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to resume all gangs
+2026-09-23T09:21:32.688840+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to remove queue from MES, doorbell=0x2a2c
+2026-09-23T09:21:32.700216+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES might be in unrecoverable state, issue a GPU reset
+2026-09-23T09:21:32.706386+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Failed to evict queue 2
+2026-09-23T09:21:32.706389+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GPU reset begin!. Source:  3
+2026-09-23T09:21:32.706389+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Failed to evict process queues
+2026-09-23T09:21:35.178405+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=INVALIDATE_TLBS
+2026-09-23T09:21:35.178409+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Failed to evict queue 2
+2026-09-23T09:21:35.184401+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Failed to restore queue 2
+2026-09-23T09:21:35.197432+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Failed to restore process queues
+2026-09-23T09:21:35.197434+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Failed to evict queue 2
+2026-09-23T09:21:35.210612+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Failed to evict queue 2
+2026-09-23T09:21:35.221009+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: remove_all_kfd_queues_mes: Failed to remove queue 2 for dev 56179
+2026-09-23T09:21:35.222580+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Suspending ip block mes_v12_1
+2026-09-23T09:21:35.222587+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Suspending ip block gfx_v12_1
+2026-09-23T09:21:37.700995+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:21:37.701004+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:21:40.178356+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:21:40.178361+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:21:42.659408+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:21:42.659418+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:21:45.137625+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:21:45.137636+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:21:47.617614+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:21:47.617618+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:21:50.095365+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:21:50.095401+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:21:52.573657+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:21:52.573661+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:21:55.051521+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:21:55.051525+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:21:57.533632+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:21:57.533635+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:00.010834+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:00.010838+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:02.487209+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:02.487220+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:04.963357+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:04.963364+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:07.440100+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:07.440104+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:09.917102+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:09.917107+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:12.394127+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:12.394139+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:14.871021+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:14.871032+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:17.348099+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(2, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:17.348110+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:19.826361+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(2, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:19.826367+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:22.303989+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(2, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:22.303998+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:24.780993+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(2, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:24.780998+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:27.258997+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(2, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:27.259001+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:29.737014+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(2, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:29.737026+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:32.214603+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(2, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:32.214611+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:34.691619+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(2, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:34.691624+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:37.169159+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(3, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:37.169163+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:39.648604+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(3, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:39.648616+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:42.126220+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(3, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:42.126232+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:44.603569+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(3, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:44.603577+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:47.080614+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(3, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:47.080619+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:49.559302+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(3, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:49.559314+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:52.036845+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(3, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:52.036850+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:54.514364+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(3, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:54.514370+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:56.992860+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(4, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:56.992865+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T09:22:59.469965+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(4, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T09:22:59.469972+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:35:09.910032+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:3 pasid:874)
+2026-09-23T13:35:09.910033+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 138402 thread python3 pid 138402
+2026-09-23T13:35:09.910034+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x000073d10e019000 from IH client 27 (GC_UTCL2)
+2026-09-23T13:35:09.910034+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+2026-09-23T13:35:09.910035+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00C04061
+2026-09-23T13:35:09.910035+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 Faulty UTCL2 client ID: TCP (0x8)
+2026-09-23T13:35:09.910035+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 MORE_FAULTS: 0x1
+2026-09-23T13:35:09.910036+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 WALKER_ERROR: 0x0
+2026-09-23T13:35:09.910036+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 PERMISSION_FAULTS: 0x3
+2026-09-23T13:35:09.910036+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 MAPPING_ERROR: 0x0
+2026-09-23T13:35:09.910037+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 RW: 0x0
+2026-09-23T13:35:09.910038+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+2026-09-23T13:35:09.910038+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 FED: 0x0
+2026-09-23T13:35:09.910039+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: IH ring buffer overflow (0x000B04E0, 0x00028C60, 0x00030500)
+2026-09-23T13:35:42.460742+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:4 pasid:876)
+2026-09-23T13:35:42.460762+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 138956 thread python3 pid 138956
+2026-09-23T13:35:42.460763+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x000076ac0e03c000 from IH client 27 (GC_UTCL2)
+2026-09-23T13:35:42.460764+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 4 fault from die AID0.XCD2
+2026-09-23T13:35:42.460764+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00C04061
+2026-09-23T13:35:42.460765+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 Faulty UTCL2 client ID: TCP (0x8)
+2026-09-23T13:35:42.460766+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 MORE_FAULTS: 0x1
+2026-09-23T13:35:42.460767+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 WALKER_ERROR: 0x0
+2026-09-23T13:35:42.460767+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 PERMISSION_FAULTS: 0x3
+2026-09-23T13:35:42.460768+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 MAPPING_ERROR: 0x0
+2026-09-23T13:35:42.460768+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 RW: 0x0
+2026-09-23T13:35:42.460769+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+2026-09-23T13:35:42.460769+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 FED: 0x0
+2026-09-23T13:35:42.460770+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:4 pasid:876)
+2026-09-23T13:35:42.460771+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 138956 thread python3 pid 138956
+2026-09-23T13:35:42.460771+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x000076ac0e7eb000 from IH client 27 (GC_UTCL2)
+2026-09-23T13:35:42.460772+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+2026-09-23T13:35:42.460773+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00C04061
+2026-09-23T13:35:42.460773+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 Faulty UTCL2 client ID: TCP (0x8)
+2026-09-23T13:35:42.460774+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 MORE_FAULTS: 0x1
+2026-09-23T13:35:42.460774+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 WALKER_ERROR: 0x0
+2026-09-23T13:35:42.460783+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 PERMISSION_FAULTS: 0x3
+2026-09-23T13:35:42.460784+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 MAPPING_ERROR: 0x0
+2026-09-23T13:35:42.460784+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 RW: 0x0
+2026-09-23T13:35:42.460785+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+2026-09-23T13:35:42.460785+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 FED: 0x0
+2026-09-23T13:35:42.460786+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:4 pasid:876)
+2026-09-23T13:35:42.460786+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 138956 thread python3 pid 138956
+2026-09-23T13:35:42.460789+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x000076ac067e3000 from IH client 27 (GC_UTCL2)
+2026-09-23T13:35:42.460789+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+2026-09-23T13:35:42.460789+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00C04061
+2026-09-23T13:35:42.460804+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 Faulty UTCL2 client ID: TCP (0x8)
+2026-09-23T13:35:42.460805+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 MORE_FAULTS: 0x1
+2026-09-23T13:35:42.460805+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 WALKER_ERROR: 0x0
+2026-09-23T13:35:42.460808+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 PERMISSION_FAULTS: 0x3
+2026-09-23T13:35:42.460809+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 MAPPING_ERROR: 0x0
+2026-09-23T13:35:42.460810+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 RW: 0x0
+2026-09-23T13:35:42.460810+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+2026-09-23T13:35:42.460811+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 FED: 0x0
+2026-09-23T13:35:42.460812+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:4 pasid:876)
+2026-09-23T13:35:42.460813+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 138956 thread python3 pid 138956
+2026-09-23T13:35:42.460815+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x000076ac0e7e3000 from IH client 27 (GC_UTCL2)
+2026-09-23T13:35:42.460815+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+2026-09-23T13:35:42.460816+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00C04061
+2026-09-23T13:35:42.460817+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 Faulty UTCL2 client ID: TCP (0x8)
+2026-09-23T13:35:42.460818+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 MORE_FAULTS: 0x1
+2026-09-23T13:35:42.460818+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 WALKER_ERROR: 0x0
+2026-09-23T13:35:42.460820+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 PERMISSION_FAULTS: 0x3
+2026-09-23T13:35:42.460821+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 MAPPING_ERROR: 0x0
+2026-09-23T13:35:42.460821+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 RW: 0x0
+2026-09-23T13:35:42.460822+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+2026-09-23T13:35:42.460823+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 FED: 0x0
+2026-09-23T13:35:42.460824+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:4 pasid:876)
+2026-09-23T13:35:42.460825+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 138956 thread python3 pid 138956
+2026-09-23T13:35:42.460826+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x000076ac067c4000 from IH client 27 (GC_UTCL2)
+2026-09-23T13:35:42.460827+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 4 fault from die AID0.XCD2
+2026-09-23T13:35:42.460828+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00C04061
+2026-09-23T13:35:42.460828+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 Faulty UTCL2 client ID: TCP (0x8)
+2026-09-23T13:35:42.460829+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 MORE_FAULTS: 0x1
+2026-09-23T13:35:42.460830+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 WALKER_ERROR: 0x0
+2026-09-23T13:35:42.460831+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 PERMISSION_FAULTS: 0x3
+2026-09-23T13:35:42.460832+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 MAPPING_ERROR: 0x0
+2026-09-23T13:35:42.460833+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 RW: 0x0
+2026-09-23T13:35:42.460834+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+2026-09-23T13:35:42.460834+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 FED: 0x0
+2026-09-23T13:35:42.460835+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:4 pasid:876)
+2026-09-23T13:35:42.460836+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 138956 thread python3 pid 138956
+2026-09-23T13:35:42.460837+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x000076ac067ba000 from IH client 27 (GC_UTCL2)
+2026-09-23T13:35:42.460838+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 2 fault from die AID0.XCD0
+2026-09-23T13:35:42.460838+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00C04061
+2026-09-23T13:35:42.460839+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 Faulty UTCL2 client ID: TCP (0x8)
+2026-09-23T13:35:42.460839+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 MORE_FAULTS: 0x1
+2026-09-23T13:35:42.460840+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 WALKER_ERROR: 0x0
+2026-09-23T13:35:42.460843+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 PERMISSION_FAULTS: 0x3
+2026-09-23T13:35:42.460843+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 MAPPING_ERROR: 0x0
+2026-09-23T13:35:42.460844+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 RW: 0x0
+2026-09-23T13:35:42.460844+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+2026-09-23T13:35:42.460845+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 FED: 0x0
+2026-09-23T13:35:42.460845+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: IH ring buffer overflow (0x0009B320, 0x000312E0, 0x0001B340)
+2026-09-23T13:35:42.460847+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:4 pasid:876)
+2026-09-23T13:35:42.460847+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 138956 thread python3 pid 138956
+2026-09-23T13:35:42.460848+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x000076ac06774000 from IH client 27 (GC_UTCL2)
+2026-09-23T13:35:42.460848+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 4 fault from die AID0.XCD2
+2026-09-23T13:35:42.460849+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00C04061
+2026-09-23T13:35:42.460849+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 Faulty UTCL2 client ID: TCP (0x8)
+2026-09-23T13:35:42.460851+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 MORE_FAULTS: 0x1
+2026-09-23T13:35:42.460851+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 WALKER_ERROR: 0x0
+2026-09-23T13:35:42.460851+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 PERMISSION_FAULTS: 0x3
+2026-09-23T13:35:42.460852+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 MAPPING_ERROR: 0x0
+2026-09-23T13:35:42.460853+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 RW: 0x0
+2026-09-23T13:35:42.460853+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+2026-09-23T13:35:42.460854+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 FED: 0x0
+2026-09-23T13:35:42.460855+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:4 pasid:876)
+2026-09-23T13:35:42.460855+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 138956 thread python3 pid 138956
+2026-09-23T13:35:42.460856+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x000076ac067c0000 from IH client 27 (GC_UTCL2)
+2026-09-23T13:35:42.460856+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 12 fault from die AID1.XCD2
+2026-09-23T13:35:42.460857+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00C04061
+2026-09-23T13:35:42.460857+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 Faulty UTCL2 client ID: TCP (0x8)
+2026-09-23T13:35:42.460859+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 MORE_FAULTS: 0x1
+2026-09-23T13:35:42.460860+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 WALKER_ERROR: 0x0
+2026-09-23T13:35:42.460860+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 PERMISSION_FAULTS: 0x3
+2026-09-23T13:35:42.460860+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 MAPPING_ERROR: 0x0
+2026-09-23T13:35:42.460861+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 RW: 0x0
+2026-09-23T13:35:42.460861+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+2026-09-23T13:35:42.460862+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 FED: 0x0
+2026-09-23T13:35:42.460878+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:4 pasid:876)
+2026-09-23T13:35:42.460891+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 138956 thread python3 pid 138956
+2026-09-23T13:35:42.460891+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x000076ac0677a000 from IH client 27 (GC_UTCL2)
+2026-09-23T13:35:42.460892+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 13 fault from die AID1.XCD3
+2026-09-23T13:35:42.460893+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00C04061
+2026-09-23T13:35:42.460894+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 Faulty UTCL2 client ID: TCP (0x8)
+2026-09-23T13:35:42.460895+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 MORE_FAULTS: 0x1
+2026-09-23T13:35:42.460895+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 WALKER_ERROR: 0x0
+2026-09-23T13:35:42.460896+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 PERMISSION_FAULTS: 0x3
+2026-09-23T13:35:42.460897+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 MAPPING_ERROR: 0x0
+2026-09-23T13:35:42.460898+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 RW: 0x0
+2026-09-23T13:35:42.460899+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+2026-09-23T13:35:42.460899+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 FED: 0x0
+2026-09-23T13:35:42.460900+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:4 pasid:876)
+2026-09-23T13:35:42.460901+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 138956 thread python3 pid 138956
+2026-09-23T13:35:42.460902+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x000076ac06562000 from IH client 27 (GC_UTCL2)
+2026-09-23T13:35:42.460903+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 2 fault from die AID0.XCD0
+2026-09-23T13:35:42.460904+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00C04061
+2026-09-23T13:35:42.460904+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 Faulty UTCL2 client ID: TCP (0x8)
+2026-09-23T13:35:42.460905+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 MORE_FAULTS: 0x1
+2026-09-23T13:35:42.460906+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 WALKER_ERROR: 0x0
+2026-09-23T13:35:42.460907+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 PERMISSION_FAULTS: 0x3
+2026-09-23T13:35:42.460908+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 MAPPING_ERROR: 0x0
+2026-09-23T13:35:42.460908+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 RW: 0x0
+2026-09-23T13:35:42.460909+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+2026-09-23T13:35:42.460910+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: 	 FED: 0x0
+2026-09-23T13:35:43.598547+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:35:45.617141+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=SUSPEND
+2026-09-23T13:35:45.617149+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to suspend all gangs
+2026-09-23T13:35:47.629533+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: queue id 0x1 at pasid 138402 is reset
+2026-09-23T13:35:49.640549+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: queue id 0x0 at pasid 138402 is reset
+2026-09-23T13:35:52.118495+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=RESET
+2026-09-23T13:35:52.118508+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to reset legacy queue
+2026-09-23T13:35:54.594067+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=RESUME
+2026-09-23T13:35:54.594080+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to resume all gangs
+2026-09-23T13:35:55.657032+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to remove queue from MES, doorbell=0x1802
+2026-09-23T13:35:55.657043+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES might be in unrecoverable state, issue a GPU reset
+2026-09-23T13:35:55.663165+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Failed to evict queue 1
+2026-09-23T13:35:55.663169+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GPU reset begin!. Source:  3
+2026-09-23T13:35:55.674538+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: remove_all_kfd_queues_mes: Failed to remove queue 0 for dev 56179
+2026-09-23T13:35:55.674546+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Suspending ip block mes_v12_1
+2026-09-23T13:35:55.674547+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Suspending ip block gfx_v12_1
+2026-09-23T13:35:58.154241+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:35:58.154244+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:36:00.629736+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:36:00.629739+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:36:03.105787+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:36:03.105799+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:36:05.583242+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:36:05.583256+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:36:08.058514+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:36:08.058543+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:36:10.534114+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:36:10.534119+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:36:13.009486+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:36:13.009491+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:36:15.485746+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:36:15.485751+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:36:17.962104+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 1) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:36:17.962108+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:36:20.437492+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:36:20.437498+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:36:22.913489+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:36:22.913494+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:36:25.390240+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:36:25.390246+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:36:27.867115+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:36:27.867121+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:36:30.342610+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:36:30.342615+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:36:32.818745+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:36:32.818751+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:36:35.294742+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:36:35.294747+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:36:37.770752+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:36:37.770756+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:36:40.246076+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 1) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:36:40.246080+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:36:42.722110+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(2, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:36:42.722115+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:36:45.199493+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(2, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:36:45.199499+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:36:47.674838+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(2, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:36:47.674844+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:36:50.151743+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(2, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:36:50.151748+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:36:52.626978+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(2, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:36:52.626982+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:36:55.103496+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(2, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:36:55.103501+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+2026-09-23T13:36:57.579102+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(2, 0) failed to respond to msg=REMOVE_QUEUE
+2026-09-23T13:36:57.579107+00:00 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue

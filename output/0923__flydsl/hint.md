@@ -1455,3 +1455,76 @@ the bar that has never been tested, and the record closing it still does not bin
 - **h8 takes another hit.** g43 removed bytes and gained nothing; g42 *added* an fp32
   workspace round trip and gained 30%. **Byte counts still do not predict time on this op.**
   Stop using them to price candidates.
+
+---
+
+## h22 — the first properly-classified wedge, and it is a THIRD class (2026-09-23 13:35)
+
+Two things had to be fixed before this could be written at all.
+
+**`dmesg` was unreadable all day.** `/proc/sys/kernel/dmesg_restrict` was `1`, so `dmesg`
+returned a single line. **Every "zero fault signatures" check in this campaign's logs
+today was grepping empty output** — not evidence of health, evidence of nothing. If a
+check for wedge signatures ever comes back clean, first confirm the source is readable:
+`dmesg | wc -l` should be in the thousands. The fix needs root:
+`sudo sysctl -w kernel.dmesg_restrict=0`.
+
+**And the ring buffer does not survive a power cycle.** The evidence was recovered from
+`/var/log/kern.log`, which persists (5.4 GB here, so `tail -n 400000` it, never grep the
+whole file). `journalctl -k -b -1` did NOT have it.
+
+### The signature
+
+```
+13:35:09  first fault, pid 138402 vmid 3 pasid 874, then: IH ring buffer overflow
+13:35:42  fault storm, pid 138956 vmid 4 pasid 876, on AID0.XCD0, XCD1 AND XCD2
+            in page starting at address 0x000076ac0e03c000 from IH client 27 (GC_UTCL2)
+            Faulty UTCL2 client ID: TCP (0x8)
+            MORE_FAULTS: 0x1   WALKER_ERROR: 0x0   PERMISSION_FAULTS: 0x3
+            MAPPING_ERROR: 0x0   RW: 0x0   FED: 0x0
+13:35:43  MES(0,0) failed to respond to msg=REMOVE_QUEUE
+13:35:45  MES(0,0) failed to respond to msg=SUSPEND  /  failed to suspend all gangs
+13:35:55  MES might be in unrecoverable state, issue a GPU reset
+```
+
+**This is neither recorded class.** Against class A (memory aperture) all three
+discriminants fail: the address is high, not a sub-4 GB truncation; `RW: 0x0` is a
+**read**, not the recorded write; and `copy_context_work_handler` never appears. Against
+class B (TLB/queue) it fails too: class B's whole point is that `INVALIDATE_TLBS` times
+out with **no preceding memory fault**, and here a fault storm precedes MES by one second.
+*(This morning's 09:21 wedge — the one the operator power-cycled for — WAS class B: pure
+`INVALIDATE_TLBS` → `failed to suspend all gangs` → unrecoverable, no fault before it.)*
+
+### What it means, read field by field
+
+- **`Faulty UTCL2 client ID: TCP`** is the vector-memory pipe. So this is a **kernel's own
+  load**, not a copy engine and not a host transfer.
+- **`RW: 0x0`** — a read.
+- **`WALKER_ERROR: 0x0` and `MAPPING_ERROR: 0x0`** — the page-table walk *succeeded*. The
+  page is mapped. The access was simply not permitted.
+- **`MORE_FAULTS: 0x1`, faults on three XCDs, and an `IH ring buffer overflow`** — not one
+  stray lane, a storm across the device.
+
+**Diagnosis: a candidate kernel read out of bounds into a mapped-but-unreadable page, and
+the resulting fault storm left MES unable to drain its queues.** The GPU reset then could
+not complete, which is why only an AC cycle recovered it.
+
+### Two consequences
+
+1. **This is the failure mode a candidate build produces, so it will recur.** The round-14
+   attempt that caused it had five variants under `_scratch` (`armA`, `armB16`, `armB32`,
+   `armAB`, `red`); one of them read past the end of a buffer. **Screen offline
+   (`COMPILE_ONLY=1`) before any dispatch, and bounds-check every new index expression** —
+   especially any candidate that changes a block size, a split count, or a grid mapping,
+   because those all rewrite address arithmetic.
+2. **`poison_allocator` did not catch it, and we already knew it could not.** It was
+   recorded as ineffective at prod (largest poison block 64 MiB against a 256 MiB
+   request). That was filed as a prerequisite for a later work item. It has now cost a
+   power cycle. **Fix it before the next round that changes address arithmetic**, not
+   after.
+
+### The check that actually works, and costs nothing
+
+`timeout 20 docker exec <container> true` — when the card wedges this way, `docker exec`
+stops responding before anything else the operator can see. It needs no root, no dmesg,
+and no GPU call. It is now in the round monitor.
