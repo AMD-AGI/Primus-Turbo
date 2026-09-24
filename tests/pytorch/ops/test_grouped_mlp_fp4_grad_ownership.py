@@ -27,7 +27,9 @@ grad_ownership`` build their skip-zeroing decision on:
   its slice of ``main_grad`` must come out exactly zero and finite;
 * a second microbatch against the same real ``Parameter`` accumulates
   (beta=1) on top of the first microbatch's beta=0 write exactly once, rather
-  than overwriting or dropping it.
+  than overwriting or dropping it. The beta=0 writer is selected when backward
+  executes; CPU regression coverage for recompute and reversed backward order
+  lives in ``test_fused_grad_overwrite_claim.py``.
 """
 
 import pytest

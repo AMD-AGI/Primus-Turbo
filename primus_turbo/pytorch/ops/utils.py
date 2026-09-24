@@ -16,6 +16,38 @@ from primus_turbo.pytorch.core.low_precision import (
     float8_e5m2,
 )
 
+_FUSED_GRAD_WRITE_STATE = "_primus_turbo_fused_grad_write_state"
+
+
+class _FusedGradWriteState:
+    """Shared state for every forward that may write one Parameter this step."""
+
+    def __init__(self):
+        self.claimed = False
+        self.overwrite_eligible = True
+
+
+class _FusedGradOverwriteClaim:
+    """Select the beta=0 writer when its backward actually executes."""
+
+    def __init__(self, parameter: torch.nn.Parameter):
+        self.parameter = parameter
+
+    def claim(self) -> bool:
+        parameter = self.parameter
+        state = getattr(parameter, _FUSED_GRAD_WRITE_STATE, None)
+
+        # A retained graph may be run again after Megatron starts a new step
+        # without executing another forward. It has no complete registration
+        # of the new epoch's possible producers, so conservatively accumulate.
+        if not bool(parameter.grad_added_to_main_grad) or not isinstance(state, _FusedGradWriteState):
+            return False
+
+        if not state.overwrite_eligible or state.claimed:
+            return False
+        state.claimed = True
+        return True
+
 
 def _get_fp8_dtype(format: Format, is_fwd_stage: bool):
     if format == Format.E4M3:
@@ -34,30 +66,36 @@ def _ensure_contiguous_grad_out(grad_out: torch.Tensor) -> torch.Tensor:
     return grad_out if grad_out.is_contiguous() else grad_out.contiguous()
 
 
-def _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern: Optional[str]):
+def _setup_fused_grad_accum(
+    b,
+    fuse_bgrad_accum_pattern: Optional[str],
+    *,
+    supports_overwrite: bool = False,
+):
     """Resolve the weight's gradient-accumulation buffer for the fused wgrad path.
 
-    Returns ``(enabled, main_grad, first_write)``. When enabled, the wgrad GEMM
+    Returns ``(enabled, main_grad, overwrite_claim)``. When enabled, the wgrad GEMM
     writes straight into ``main_grad`` and the Function must return no gradient
     for ``b``.
 
-    ``first_write`` is True when this call is the step's first claim on the
-    weight's ``main_grad``, which lets the wgrad epilogue overwrite (beta=0)
-    instead of accumulating (beta=1) and skip re-reading the buffer. Megatron's
-    ``zero_grad_buffer()`` clears ``grad_added_to_main_grad`` once per step right
-    after zeroing the buffer, so reading the flag just before setting it is
-    exactly a first-write oracle.
+    An overwrite-capable caller receives a claim object and must call
+    ``claim()`` immediately before its backward write. The first backward that
+    actually executes for the Parameter receives True and may overwrite with
+    beta=0; later writes receive False and accumulate with beta=1. Deciding at
+    the write, rather than in forward, keeps checkpoint recomputation, staged
+    forwards, tied weights, and reverse backward order correct.
 
     The claim is restricted to a real ``nn.Parameter``. On the multi-microbatch
     path the caller hands us a per-microbatch quantized alias carrying a *copy*
     of the flag, and the real parameter's flag is only set later; an alias read
     would hand out beta=0 twice and silently drop a microbatch.
 
-    Call this at the top of ``forward``: the flag has to be set while the weight
-    object is still in hand, because the backward pass only sees the saved tensors.
+    Calls from fused paths that cannot overwrite register the epoch as
+    ineligible, so a tied Parameter shared with a beta=1-only producer can never
+    have one contribution erased by a later beta=0 write.
     """
     if fuse_bgrad_accum_pattern is None:
-        return False, None, False
+        return False, None, None
 
     assert fuse_bgrad_accum_pattern in ["megatron"], (
         "Only megatron support gradient accumulation fusion currently"
@@ -71,12 +109,20 @@ def _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern: Optional[str]):
         "b.main_grad must be a tensor with the same shape as b"
     )
 
-    first_write = isinstance(b, torch.nn.Parameter) and not bool(b.grad_added_to_main_grad)
+    overwrite_claim = None
+    if isinstance(b, torch.nn.Parameter):
+        state = getattr(b, _FUSED_GRAD_WRITE_STATE, None)
+        if not bool(b.grad_added_to_main_grad) or not isinstance(state, _FusedGradWriteState):
+            state = _FusedGradWriteState()
+            setattr(b, _FUSED_GRAD_WRITE_STATE, state)
+        if not supports_overwrite:
+            state.overwrite_eligible = False
+        else:
+            overwrite_claim = _FusedGradOverwriteClaim(b)
 
-    # Set in forward, not backward: autograd hands backward the saved tensors, not
-    # the parameter object that carries this attribute.
+    # Preserve Megatron's existing fused-accumulation signal during forward.
     b.grad_added_to_main_grad = True
-    return True, b.main_grad, first_write
+    return True, b.main_grad, overwrite_claim
 
 
 _dummy_wgrads = {}

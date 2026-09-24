@@ -229,8 +229,12 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
             )
 
         # Each weight has its own accumulation buffer, so these cannot be shared.
-        fuse_w1_accum, w1_main_grad, w1_first_write = _setup_fused_grad_accum(w1, fuse_wgrad_accum_pattern)
-        fuse_w2_accum, w2_main_grad, w2_first_write = _setup_fused_grad_accum(w2, fuse_wgrad_accum_pattern)
+        fuse_w1_accum, w1_main_grad, w1_overwrite_claim = _setup_fused_grad_accum(
+            w1, fuse_wgrad_accum_pattern, supports_overwrite=True
+        )
+        fuse_w2_accum, w2_main_grad, w2_overwrite_claim = _setup_fused_grad_accum(
+            w2, fuse_wgrad_accum_pattern, supports_overwrite=True
+        )
 
         # x's col-wise half is a wgrad operand, so it is the one that carries the RHT.
         x_scaling_recipe = ScalingRecipe()
@@ -329,12 +333,8 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
         ctx.num_cu = num_cu
         ctx.fuse_w1_accum = fuse_w1_accum
         ctx.fuse_w2_accum = fuse_w2_accum
-        # Bound here rather than read in backward: under a schedule that runs
-        # several forwards before the matching backward, a later microbatch has
-        # already claimed the weight by then and the flag no longer describes
-        # this call.
-        ctx.w1_overwrite = w1_first_write
-        ctx.w2_overwrite = w2_first_write
+        ctx.w1_overwrite_claim = w1_overwrite_claim
+        ctx.w2_overwrite_claim = w2_overwrite_claim
         # Off save_for_backward: the wgrad writes these in place, which would bump
         # the version counter saved tensors are checked against.
         ctx.w1_main_grad = w1_main_grad
@@ -382,6 +382,7 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
         )
 
         # grad_w2 = gradO_col(rht=T) @ act_col(rht=T)^T, contracting M.
+        w2_overwrite = ctx.w2_overwrite_claim is not None and ctx.w2_overwrite_claim.claim()
         grad_w2 = _wgrad_grouped_gemm_fp4_impl_wrapper(
             go_col,
             act_col,
@@ -393,7 +394,7 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
             ctx.num_cu,
             ctx.fuse_w2_accum,
             ctx.w2_main_grad,
-            ctx.w2_overwrite,
+            w2_overwrite,
         )
 
         # dgrad against w2_col, contracting K_out; the epilogue turns it into the
@@ -440,6 +441,7 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
         )
 
         # grad_w1 = grad_l1_col(rht=T) @ x_col(rht=T)^T, contracting M.
+        w1_overwrite = ctx.w1_overwrite_claim is not None and ctx.w1_overwrite_claim.claim()
         grad_w1 = _wgrad_grouped_gemm_fp4_impl_wrapper(
             gl_col,
             x_col,
@@ -451,7 +453,7 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
             ctx.num_cu,
             ctx.fuse_w1_accum,
             ctx.w1_main_grad,
-            ctx.w1_overwrite,
+            w1_overwrite,
         )
 
         return (

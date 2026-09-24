@@ -13,11 +13,10 @@ find those slices: the producer calls :func:`record_overwrite` from the branch
 that actually issues the beta=0 write, and the consumer calls
 :func:`begin_step` once per iteration to rotate the log.
 
-Recording happens at the write, never at the forward. Under activation
-recompute the checkpointed forward runs twice and the second pass sees the
-first-write flag already set, so the wgrad falls back to beta=1; a mark placed
-at the forward would then claim a slice nobody overwrote and the framework
-would skip zeroing storage that beta=1 goes on to accumulate into.
+Recording happens at the write, never at the forward. The beta=0 producer is
+also selected in actual backward order, so activation recomputation and a
+schedule that stages several forwards before backward cannot assign ownership
+to a discarded or later-executing forward.
 
 A slice skipped for iteration N is justified by iteration N-1 having
 overwritten it, so :func:`begin_step` re-checks that prediction against what
