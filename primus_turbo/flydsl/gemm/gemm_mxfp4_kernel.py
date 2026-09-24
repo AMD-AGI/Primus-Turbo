@@ -28,7 +28,7 @@ from primus_turbo.flydsl.utils.gemm_epilogue_helper import (
     StoreCSwiGLUQuant,
 )
 from primus_turbo.flydsl.utils.gemm_helper import (
-    _MXFP4_PRESHUF_BLK,
+    _MXFP4_PRESHUF_BLK,  # noqa: F401 -- grouped GEMM imports this compatibility alias
     _MXFP4_PRESHUF_FO,
     _MXFP4_PRESHUF_ND,
     _MXFP4_PRESHUF_NG,
@@ -1977,7 +1977,9 @@ def _build_mxfp4_gemm_kernel(
     cstore: bool = True,
     n_tail: int = 0,  # N % BLOCK_N: bounds the store to c_n, and gates the half-N variant
     k_real: int = None,  # operands' true contraction; K is the 256-rounded loop/scale extent
-    row_bytes: int = None,  # operands' ALLOCATED row stride; defaults to the true K's width
+    # Operands' allocated row strides. An int means both strides match; a tuple carries
+    # (A, B) when independently padded allocations have different pitches.
+    row_bytes: "int | tuple[int, int] | None" = None,
     mn: tuple = None,  # host-known (M, N): folds the tile decode's divides and the tile bounds
     glu: bool = False,  # fused StoreCSwiGLU; N == glu_i, B is gate||up [2I, K]
     glu_i: int = 0,
@@ -2044,8 +2046,14 @@ def _build_mxfp4_gemm_kernel(
     # it; _CSTORE is what keeps the next tile's fill from racing the ring.
     _TPW = _mxfp4_tiles_per_wg(n_pids, K, persist and _CSTORE)
     n_partial = n_tail != 0
-    # A row of K/2 bytes off the 128-byte line costs its G2S two requests; the caller's allocation decides that.
-    K2 = (_KR // 2) if row_bytes is None else row_bytes
+    # A row of K/2 bytes off the 128-byte line costs its G2S two requests; each
+    # operand's allocation decides that independently.
+    if row_bytes is None:
+        K2A = K2B = _KR // 2
+    elif isinstance(row_bytes, tuple):
+        K2A, K2B = row_bytes
+    else:
+        K2A = K2B = row_bytes
     _AB_SPLIT_STEP = K_loop // 2
     _SC_SPLIT_STEP = KI * (64 * (2 * N_SUB) * 4)
 
@@ -2081,7 +2089,7 @@ def _build_mxfp4_gemm_kernel(
     _ROWS_PER_STEP = 64 // (BPR // 16) * (256 // 64)  # n_waves = 256//64 = 4
     N_LDS_STEPS_A = BLOCK_M // _ROWS_PER_STEP
     N_LDS_STEPS_BH = LDS_BN_HALF // _ROWS_PER_STEP
-    _ROWSPLIT = _MXFP4_ROWSPLIT and (K2 % 128 == 64) and not coop
+    _ROWSPLIT = _MXFP4_ROWSPLIT and K2A == K2B and (K2A % 128 == 64) and not coop
     _SK = 64 if _ROWSPLIT else 0
     _NOBUF = 3 if _ROWSPLIT else 2
     _A_SLOT = (BLOCK_M // 2) * LDS_ROW_STRIDE
@@ -2093,11 +2101,12 @@ def _build_mxfp4_gemm_kernel(
     # the step's lowest source row must already be that far into the operand. B's ilv
     # permutation makes that a real bound: check every stream and step, else fall back.
     _GWSTEP = (64 // (BPR // 16)) * BPR  # LDS bytes one wave writes per g2s step
-    _GSTREAM = ((N_LDS_STEPS_A, 0), (N_LDS_STEPS_BH, _BILV))
+    _GSTREAM = ((N_LDS_STEPS_A, 0, K2A), (N_LDS_STEPS_BH, _BILV, K2B))
     _GIMM = _GWSTEP if ((_MXFP4_G2S_IMM & 2) and not _ROWSPLIT and 4096 % _GWSTEP == 0) else 0
     if _GIMM and not all(
-        fp4_g2s_min_row(_ns, 64 // (BPR // 16), 4, _r, _il, True) * K2 >= g2s_lds_imm(_r, _GIMM)
-        for _ns, _il in _GSTREAM
+        fp4_g2s_min_row(_ns, 64 // (BPR // 16), 4, _r, _il, True) * _k2
+        >= g2s_lds_imm(_r, _GIMM)
+        for _ns, _il, _k2 in _GSTREAM
         for _r in range(_ns)
     ):
         _GIMM = 0
@@ -2173,38 +2182,38 @@ def _build_mxfp4_gemm_kernel(
 
         # Both offset builders stride by their K//2 argument, so they get the ALLOCATED width, one stream per parity.
         if const_expr(_ROWSPLIT):
-            gl_a_e = fp4_g2s_offsets_split(lane_id, wave_id, K2 * 2, NSA_H, 0, 0)
-            gl_a_o = fp4_g2s_offsets_split(lane_id, wave_id, K2 * 2, NSA_H, 1, _SK)
-            gl_a_o0 = fp4_g2s_offsets_split(lane_id, wave_id, K2 * 2, NSA_H, 1, -_SK)
-            gl_b_e = fp4_g2s_offsets_split(lane_id, wave_id, K2 * 2, NSB_H, 0, 0, ilv=_BILV)
-            gl_b_o = fp4_g2s_offsets_split(lane_id, wave_id, K2 * 2, NSB_H, 1, _SK, ilv=_BILV)
-            gl_b_o0 = fp4_g2s_offsets_split(lane_id, wave_id, K2 * 2, NSB_H, 1, -_SK, ilv=_BILV)
+            gl_a_e = fp4_g2s_offsets_split(lane_id, wave_id, K2A * 2, NSA_H, 0, 0)
+            gl_a_o = fp4_g2s_offsets_split(lane_id, wave_id, K2A * 2, NSA_H, 1, _SK)
+            gl_a_o0 = fp4_g2s_offsets_split(lane_id, wave_id, K2A * 2, NSA_H, 1, -_SK)
+            gl_b_e = fp4_g2s_offsets_split(lane_id, wave_id, K2B * 2, NSB_H, 0, 0, ilv=_BILV)
+            gl_b_o = fp4_g2s_offsets_split(lane_id, wave_id, K2B * 2, NSB_H, 1, _SK, ilv=_BILV)
+            gl_b_o0 = fp4_g2s_offsets_split(lane_id, wave_id, K2B * 2, NSB_H, 1, -_SK, ilv=_BILV)
             gl_off_a, gl_off_b = gl_a_e + gl_a_o, gl_b_e + gl_b_o
         else:
             gl_off_a = fp4_g2s_offsets(
-                lane_id, wave_id, K2 * 2, N_LDS_STEPS_A, BPR, swizzle=swizzle, lds_step=_GIMM
+                lane_id, wave_id, K2A * 2, N_LDS_STEPS_A, BPR, swizzle=swizzle, lds_step=_GIMM
             )
             gl_off_b = fp4_g2s_offsets(
-                lane_id, wave_id, K2 * 2, N_LDS_STEPS_BH, BPR, swizzle=swizzle, ilv=_BILV, lds_step=_GIMM
+                lane_id, wave_id, K2B * 2, N_LDS_STEPS_BH, BPR, swizzle=swizzle, ilv=_BILV, lds_step=_GIMM
             )
         # Operand SRDs/loaders are rebased per-tile (_bind): the tile's row/col base exceeds int32 for large M*K/N*K.
         _ld: dict = {}
 
         def _bind(bm, bn):
-            a_base_e = arith.index_cast(T.index, bm * fx.Int32(BLOCK_M)) * arith.index(K2)
+            a_base_e = arith.index_cast(T.index, bm * fx.Int32(BLOCK_M)) * arith.index(K2A)
             if const_expr(glu):
                 # B is gate||up [2I, K]. Rebase to this tile's 128 gate columns so
                 # BL is offset 0 and BR is a residual I rows (the matching up band).
-                b_base_e = arith.index_cast(T.index, bn * fx.Int32(_NCB)) * arith.index(K2)
-                b_nrec = arith.index_cast(T.index, fx.Int32(2) * _cn) * arith.index(K2) - b_base_e
+                b_base_e = arith.index_cast(T.index, bn * fx.Int32(_NCB)) * arith.index(K2B)
+                b_nrec = arith.index_cast(T.index, fx.Int32(2) * _cn) * arith.index(K2B) - b_base_e
             else:
-                b_base_e = arith.index_cast(T.index, bn * fx.Int32(BLOCK_N)) * arith.index(K2)
+                b_base_e = arith.index_cast(T.index, bn * fx.Int32(BLOCK_N)) * arith.index(K2B)
                 b_nrec = (
                     arith.index_cast(T.index, _cn) - arith.index_cast(T.index, bn * fx.Int32(BLOCK_N))
-                ) * arith.index(K2)
+                ) * arith.index(K2B)
             a_nrec = (
                 arith.index_cast(T.index, _cm) - arith.index_cast(T.index, bm * fx.Int32(BLOCK_M))
-            ) * arith.index(K2)
+            ) * arith.index(K2A)
             gA, _ld["rsrc_a"] = make_fp8_rebased_tensor_and_srd(A, F8_IR_t, a_base_e, a_nrec)
             gB, _ld["rsrc_b"] = make_fp8_rebased_tensor_and_srd(B_T, F8_IR_t, b_base_e, b_nrec)
             a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
@@ -2505,7 +2514,7 @@ def _build_mxfp4_gemm_kernel(
             a_off = fx.Int32(0)  # tile A row / B col bases folded into the SRDs; only br's
             bl_off = fx.Int32(0)  # LDS-half column shift survives as an int32-safe residual.
             # glu: R pool is the up band at +I, not the next 128 output columns.
-            br_off = fx.Int32(_RSHIFT * K2)
+            br_off = fx.Int32(_RSHIFT * K2B)
             sa_b = fx.Int32(bm * BLOCK_M + wave_m_off)
             # Packed-scale coordinates stay in the 256-wide layout; the glu
             # preshuffle lays each up band where the R pool already looks.
@@ -3975,9 +3984,14 @@ def gemm_mxfp4_flydsl_kernel(
     else:
         K = a_scale.shape[1] * 32
         assert b_scale.shape[1] * 32 == K, f"scale K mismatch: {a_scale.shape} vs {b_scale.shape}"
-    assert Kb_a == Kb_b, f"row stride mismatch: a {a.shape}, b {b.shape}"
-    assert K // 2 <= Kb_a <= (K + 255) // 256 * 128, (
-        f"fp4 row stride {Kb_a} B is not between K/2 = {K // 2} and ceil256(K)/2 for K={K}"
+    max_row_bytes = (K + 255) // 256 * 128
+    assert K // 2 <= Kb_a <= max_row_bytes, (
+        f"fp4 A row stride {Kb_a} bytes is not between K/2 = {K // 2} and "
+        f"ceil256(K)/2 = {max_row_bytes} for K={K}"
+    )
+    assert K // 2 <= Kb_b <= max_row_bytes, (
+        f"fp4 B row stride {Kb_b} bytes is not between K/2 = {K // 2} and "
+        f"ceil256(K)/2 = {max_row_bytes} for K={K}"
     )
     assert K % 64 == 0, f"K must be a multiple of 64, got {K}"
     # A mid-tile M is already bounded by num_records and the store band; a mid-tile N needs n_tail's column drop.
@@ -3993,7 +4007,12 @@ def gemm_mxfp4_flydsl_kernel(
     _capturing = torch.cuda.is_current_stream_capturing()
     Kw = (K + 255) // 256 * 256  # loop + packed-scale extent
     _k_real = None if K == Kw else K  # None keeps the aligned shapes' launch key unchanged
-    _row_b = None if Kb_a == K // 2 else Kb_a
+    if Kb_a == K // 2 and Kb_b == K // 2:
+        _row_b = None
+    elif Kb_a == Kb_b:
+        _row_b = Kb_a
+    else:
+        _row_b = (Kb_a, Kb_b)
     if scales_prepacked:
         # The caller already holds the packed layout, so there is nothing to repack and no
         # workspace to own: the scale tensors go straight in as the GEMM's packed operands.
