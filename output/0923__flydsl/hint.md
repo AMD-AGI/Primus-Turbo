@@ -1992,3 +1992,38 @@ stall 777 → 1481). It cost nothing and it was right — `g48` is the family of
 Note the consistency with (1): the gate is a **fact about the build** (did this wait stay
 partial?), not a **prediction of time**. That is exactly the line where static analysis
 still pays.
+
+### h25 addendum — PC sampling faults at prod. The stall question is CLOSED, not open.
+
+Round 17's own profiling step ran stochastic PC sampling at the production shape, because
+an earlier revision of `02_counters.md` recommended it as "the only rich source of *why* on
+this card". **That recommendation was written from documentation, not measurement, and the
+measurement went the other way.** It has been removed and replaced with a prohibition.
+
+```
+Memory access fault by GPU node-2 on address 0x7ed0642e4000.
+GPU core dump skipped because PC Sampling active
+... rocprofv3 caught signal 6 ...
+Timeout while waiting for queue sync: 4 kernels still active
+```
+
+plus a **131-line** `no-retry page fault` burst (`PERMISSION_FAULTS: 0x5`, `RW: 0x1`,
+`MORE_FAULTS: 0x1`, client TCP). The card survived. On **2026-09-11** it did not: PC
+sampling is the **only profiler-attributable wedge** this campaign has, and it cost a
+physical power cycle.
+
+Two details make it worse than the raw fault:
+- **`GPU core dump skipped because PC Sampling active`** — the failure destroys its own
+  post-mortem.
+- **`Timeout while waiting for queue sync: 4 kernels still active`** — that is the queue
+  path that becomes `failed to suspend all gangs` and then `unrecoverable`.
+
+**Therefore the stall-versus-issue question is CLOSED on this card, not open.**
+Counters cannot answer it (every wait and stall counter is rejected by this chip, h20).
+PC sampling must not be attempted. Record it as a stated limitation and move on. Do **not**
+substitute a static instruction count — h26 measured static metrics improving on an arm
+that lost by 16.25%.
+
+*And note how this one entered:* a tool was recommended in a prompt on the strength of what
+it is documented to do. Nothing in the chain was dishonest; it simply had not been run.
+**A capability claim that has not been exercised on this machine is a hypothesis.**

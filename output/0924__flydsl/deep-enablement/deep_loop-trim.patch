@@ -125,10 +125,10 @@ index 8811562..c5cdea7 100644
  ### Which shapes
  
 diff --git a/op_evolve/modules/deep_loop/profiling/prompts/02_counters.md b/op_evolve/modules/deep_loop/profiling/prompts/02_counters.md
-index 8acff80..c3cd18f 100644
+index 8acff80..9f9d081 100644
 --- a/op_evolve/modules/deep_loop/profiling/prompts/02_counters.md
 +++ b/op_evolve/modules/deep_loop/profiling/prompts/02_counters.md
-@@ -9,25 +9,79 @@ Collect per-kernel counters with `rocprofv3` for each kernel in `{{out_dir}}/ker
+@@ -9,25 +9,101 @@ Collect per-kernel counters with `rocprofv3` for each kernel in `{{out_dir}}/ker
  one `-k`-equivalent filter at a time. Results go to
  `{{out_dir}}/2-kernel-profiling/kernel-<slug>/`.
  
@@ -188,18 +188,40 @@ index 8acff80..c3cd18f 100644
 +counters -- which looks identical to "the counter does not exist". Collect in several passes
 +rather than diagnosing this each time.
 +
-+**The stall question is not answered by counters here; it is answered by PC sampling.**
-+Stochastic PC sampling works on this part and reports `Stall_Reason`, `Instruction_Type`,
-+`Wave_Count` and issue rate per sample:
++⚠ **DO NOT RUN PC SAMPLING. MEASURED 2026-09-24, round 17.**
 +
-+```bash
-+rocprofv3 --pc-sampling-beta-enabled --pc-sampling-method stochastic \
-+  --pc-sampling-unit cycles --pc-sampling-interval 2048 \
-+  --output-format csv --output-file pc -d $SCRATCH -- <benchmark>
++An earlier revision of this file recommended stochastic PC sampling here as "the only rich
++source of *why* on this card". **That recommendation is withdrawn — it was written from the
++docs, not from a measurement, and the measurement went the other way.**
++
++Round 17's own profiling step ran it at the production shape and it faulted:
++
++```
++Memory access fault by GPU node-2 on address 0x7ed0642e4000.
++    Reason: Page not present or supervisor privilege.
++GPU core dump skipped because PC Sampling active
++... rocprofv3 caught signal 6 ...
++Timeout while waiting for queue sync: 4 kernels still active
 +```
 +
-+Valid interval range on this part is 256 to 1048576 cycles. Run it once per selected kernel
-+alongside the counter passes; it is the only rich source of *why* on this card.
++with a 131-line `no-retry page fault` burst in `dmesg`
++(`PERMISSION_FAULTS: 0x5`, `RW: 0x1`, `MORE_FAULTS: 0x1`, client TCP). The card survived
++that time. It did not on **2026-09-11**, where PC sampling put MES into an unrecoverable
++state and cost a physical power cycle — the only profiler-attributable wedge this campaign
++has.
++
++Note the two aggravating details, both visible above:
++- **`GPU core dump skipped because PC Sampling active`** — the failure destroys its own
++  post-mortem. You cannot diagnose what it broke.
++- **`Timeout while waiting for queue sync: 4 kernels still active`** — that is the queue
++  path that becomes `failed to suspend all gangs` and then `unrecoverable`. It came close.
++
++**So: the stall question CANNOT be answered on this card.** Counters cannot (every wait and
++stall counter is rejected by this chip), and PC sampling must not be attempted. Say so in
++`analysis.md` as a stated limitation and move on. Do not substitute a static instruction
++count for it — this job has twice measured static metrics improving on an arm that lost
++(h26).
++
  
 -Write `analysis.md` with the counters, their normalised values, and what each says. No
 -verdict yet -- the regime comes in step 4 and the bound in step 5.
@@ -214,7 +236,7 @@ index 8acff80..c3cd18f 100644
  passes: 3
 +counters_absent: []        # names asked for that produced no column, if any
  highlights: [{metric: ..., value: ..., note: ...}]   # at most 6 lines
-+pc_sampling: {status: ok|failed, top_stall_reason: ..., issue_rate_pct: ...}
++pc_sampling: {status: not_attempted, reason: forbidden_faults_this_card}   # see above
  status: ok
  ```
 diff --git a/op_evolve/modules/deep_loop/profiling/prompts/03_metrics.md b/op_evolve/modules/deep_loop/profiling/prompts/03_metrics.md
