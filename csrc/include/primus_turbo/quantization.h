@@ -124,6 +124,37 @@ constexpr int E8M0_EXPONENT_BIAS = 127;
 } // namespace detail
 
 // ---------------------------------------------------------------------------
+// MXFP4 (E2M1) quantize + pack into AITER's A6W4 weight-operand blob layout.
+//
+// Shares the MXFP6 blob geometry -- 256-row tiles, 128-K tiles, two guard K tiles, the
+// same E8M0 scale plane and block indexing -- and differs only in the code plane (16
+// compact bytes per group against MXFP6's 24 split over C0/C1) and in deriving the scale
+// as ceil_pow2(amax / 6) against E2M1's max_pos rather than E2M3's.
+//
+// This is the A6W4 *weight* operand only. The activation side of A6W4 is unchanged: it
+// consumes the blob quantize_mxfp6_impl already produces. wgrad has no MXFP4 operand at
+// all, since it contracts M and never reads the weight.
+// ---------------------------------------------------------------------------
+
+// Same value and same reason as MXFP6_GUARD_K_TILES; kept separate so the two layouts can
+// be reasoned about independently if one ever moves.
+constexpr int MXFP4_GUARD_K_TILES = 2;
+
+enum class MXFP4Direction {
+    Row,  // contract along the last axis  -- the forward's weight operand
+    Col,  // contract along the first axis -- dgrad's weight operand
+    Dual, // both, from a single read of the input
+};
+
+// Writes (row_packed, row_scale) and/or (col_packed, col_scale) for a [M, N] input,
+// according to `direction`. Pointers for a direction that is not requested are unused and
+// may be null. Sizes must come from mxfp4_pack_sizes on the Python side.
+template <typename DType>
+void quantize_mxfp4_impl(const DType *input, uint8_t *row_packed, uint8_t *row_scale,
+                         uint8_t *col_packed, uint8_t *col_scale, const int32_t M,
+                         const int32_t N, const MXFP4Direction direction, hipStream_t stream);
+
+// ---------------------------------------------------------------------------
 // MXFP6 (E2M3) quantize + pack into AITER's mxfp6_c0c1_256_padk2 blob layout.
 //
 // Unlike the other formats there is no strided output tensor here: the A6W6 assembly

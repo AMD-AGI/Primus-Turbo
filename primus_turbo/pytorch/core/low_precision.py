@@ -124,6 +124,14 @@ MXFP6_GUARD_K_TILES = 2
 MXFP6_PACKED_TILE_BYTES = 24576
 MXFP6_SCALE_TILE_BYTES = 1024
 
+# Geometry of the A6W4 weight-operand blob. It shares every dimension above -- 256-row
+# tiles, 128-K tiles, the two guard tiles and the scale plane -- and differs only in the
+# code plane, because E2M1 spends 4 bits per value in one compact region where E2M3
+# spends 6 across C0 and C1. Named `_GEMM_` to keep them clear of the plain MXFP4 path,
+# which writes strided tensors and a scale_inv rather than a re-tiled blob.
+MXFP4_GEMM_PACKED_TILE_BYTES = 16384
+MXFP4_GEMM_SCALE_TILE_BYTES = MXFP6_SCALE_TILE_BYTES
+
 # Elementwise epilogues the MXFP6 packer can fold into its staging read, so the tensor the
 # epilogue produces never reaches HBM. Must match enum MXFP6Prologue in
 # csrc/include/primus_turbo/quantization.h.

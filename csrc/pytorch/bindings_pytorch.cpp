@@ -165,6 +165,14 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("hk_attn_block_sizes(int head_dim) -> int[]");
 #endif // BUILD_HIPKITTENS_BACKEND
 
+    // ********* MXFP4 GEMM-blob Quantization (A6W4 weights) *********
+    // gfx950-only for the same reason as MXFP6 below: hardware FP4 conversion. Distinct
+    // from the `quantize_mxfp4` family registered above, which writes strided tensors.
+#ifdef BUILD_MXFP4_BACKEND
+    m.def("quantize_mxfp4_gemm(Tensor input, int axis) -> Tensor[]");
+    m.def("quantize_mxfp4_gemm_dual(Tensor input) -> Tensor[]");
+#endif // BUILD_MXFP4_BACKEND
+
     // ********* MXFP6 Quantization *********
     // gfx950-only: the packer uses the hardware FP6 conversion, so like the hipkittens
     // ops these are absent rather than failing at launch on other archs.
@@ -200,6 +208,10 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     // ********* MXFP4 Quantization *********
     m.impl("quantize_mxfp4_dual", quantize_mxfp4_dual);
     m.impl("quantize_mxfp4", quantize_mxfp4);
+#ifdef BUILD_MXFP4_BACKEND
+    m.impl("quantize_mxfp4_gemm", quantize_mxfp4_gemm);
+    m.impl("quantize_mxfp4_gemm_dual", quantize_mxfp4_gemm_dual);
+#endif // BUILD_MXFP4_BACKEND
 #ifdef BUILD_MXFP6_BACKEND
     m.impl("quantize_mxfp6", quantize_mxfp6);
     m.impl("quantize_mxfp6_dual", quantize_mxfp6_dual);
@@ -268,6 +280,10 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     // ********* MXFP4 Quantization *********
     m.impl("quantize_mxfp4_dual", quantize_mxfp4_dual_meta);
     m.impl("quantize_mxfp4", quantize_mxfp4_meta);
+#ifdef BUILD_MXFP4_BACKEND
+    m.impl("quantize_mxfp4_gemm", quantize_mxfp4_gemm_meta);
+    m.impl("quantize_mxfp4_gemm_dual", quantize_mxfp4_gemm_dual_meta);
+#endif // BUILD_MXFP4_BACKEND
 #ifdef BUILD_MXFP6_BACKEND
     m.impl("quantize_mxfp6", quantize_mxfp6_meta);
     m.impl("quantize_mxfp6_dual", quantize_mxfp6_dual_meta);

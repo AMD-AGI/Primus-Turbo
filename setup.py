@@ -364,6 +364,10 @@ def get_common_flags():
         # from non-gfx950 builds, so its torch entry points have to go with it.
         cxx_flags.append("-DBUILD_MXFP6_BACKEND")
         nvcc_flags.append("-DBUILD_MXFP6_BACKEND")
+        # And for the MXFP4 weight packer behind A6W4, which uses the hardware FP4
+        # conversion and so is gfx950-only on exactly the same terms.
+        cxx_flags.append("-DBUILD_MXFP4_BACKEND")
+        nvcc_flags.append("-DBUILD_MXFP4_BACKEND")
 
     # Max Jobs
     max_jobs = int(os.getenv("MAX_JOBS", "64"))

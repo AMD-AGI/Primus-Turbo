@@ -84,6 +84,22 @@ std::vector<at::Tensor> quantize_mxfp4_dual(
     const bool shuffle_rowwise_scale = false, const bool shuffle_rowwise = false,
     const bool shuffle_colwise_scale = false, const bool shuffle_colwise = false);
 
+#ifdef BUILD_MXFP4_BACKEND
+// MXFP4 (E2M1) quantize + pack into AITER's A6W4 weight-operand blob layout. Same return
+// convention as the MXFP6 pair below, and the same blob geometry apart from a 16-byte
+// compact code plane per group. This packs weights for A6W4's forward (row) and dgrad
+// (col) GEMMs; wgrad contracts M and has no MXFP4 operand.
+//
+// The `_gemm` suffix separates these from the plain `quantize_mxfp4` family above, which
+// is a different thing entirely: that one writes strided tensors plus a scale_inv for the
+// general MXFP4 path, while these write AITER's opaque re-tiled GEMM blob. The naming
+// follows AITER's own `quant_mxfp4` / `quant_mxfp4_gemm` split for the same reason.
+std::vector<at::Tensor> quantize_mxfp4_gemm(const at::Tensor input, const int64_t axis);
+std::vector<at::Tensor> quantize_mxfp4_gemm_dual(const at::Tensor input);
+std::vector<at::Tensor> quantize_mxfp4_gemm_meta(const at::Tensor input, const int64_t axis);
+std::vector<at::Tensor> quantize_mxfp4_gemm_dual_meta(const at::Tensor input);
+#endif // BUILD_MXFP4_BACKEND
+
 #ifdef BUILD_MXFP6_BACKEND
 // MXFP6 (E2M3) quantize + pack into AITER's mxfp6_c0c1_256_padk2 blob layout. Returns
 // (packed, scale) 1-D uint8 blobs, or all four for the dual form; the logical shape is
