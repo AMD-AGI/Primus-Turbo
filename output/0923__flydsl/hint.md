@@ -2161,3 +2161,43 @@ per-iteration transient rather than a carried accumulator, LDS needs zero new by
 single-wave shape, and FlyDSL has atomics, multi-wave workgroups and barriers); and the
 gate permits a deterministic form. **The open question is geometry and its byte cost, not
 permission.**
+
+### h28 addendum — the 8× disagreement is settled from source. The slot count is `nsp`.
+
+Two investigations disagreed by ~8× on the fused form's reduction cost. **Settled against
+the source, not by preferring an author.**
+
+`kernels.py:163` states it outright: *"`PARTIAL=True` splits the unmasked q-pair range
+`nsp` ways, each split writing its own fp32 workspace."* `:215` gives the workspace shape
+`[nsp, B, Skv, Hkv, D]` fp32, and `:530`'s `_ch = (_fn + nsp - 1) // nsp` shows each split
+owns a **contiguous** range, so it accumulates its own chunk serially in registers.
+
+**Slots = `nsp`, a free parameter — not the number of q-tiles.** The DO-NOT verdict priced
+64 slots (8192/128), which is the naive form nobody would build and which **this codebase
+already does not build**. Same error class as g49 vs g51 (h26): a mechanism judged by one
+placement of it.
+
+Recomputed independently from `B=4, Skv=8192, Hkv=8, D=128` and the measured 4.39 TB/s:
+
+| | workspace | reduction | prod time | TF/s | vs bar |
+|---|--:|--:|--:|--:|--:|
+| **now** (7 GEMMs) | — | — | 11.12 ms | 494.4 | **0.696×** |
+| 5 GEMMs, same issue efficiency | — | — | 7.90 ms | — | *(saves 3.22 ms)* |
+| fused, **nsp=2** | 2×256 MiB | 1.00 GiB → 0.245 ms | **8.15 ms** | **674.6** | **0.951×** |
+| fused, nsp=4 | 4×256 MiB | 2.00 GiB → 0.489 ms | 8.39 ms | 655.4 | 0.923× |
+| fused, nsp=8 | 8×256 MiB | 4.00 GiB → 0.978 ms | 8.88 ms | 619.3 | 0.872× |
+| *(the DO-NOT pricing)* | *64×256 MiB* | *32 GiB → 7.83 ms* | *net negative* | | |
+
+**Three assumptions, stated so this is not quoted as a measurement:**
+
+1. **Issue efficiency is assumed unchanged after fusing.** The fused kernel has a larger
+   live set; efficiency could fall. **Not measured.**
+2. **`nsp=2` reduces workgroup count at prod**, and `impl.py:165` records that prod already
+   runs 8 dispatch waves at 100% balance, where "splitting is pure cost". In the fused form
+   the split serves a different purpose (avoiding atomics for dK/dV), but the occupancy
+   effect is **not computed**.
+3. Bandwidth uses the measured 4.39 TB/s; a streaming reduction may do better.
+
+**So this is an upper bound, not a promise.** But even at 70% of it, it dwarfs everything
+prod has gained in five rounds (0.693 → 0.698). **This is the first quantified path to
+closing the backward's production gap**, and it is the thing to spend rounds on.
