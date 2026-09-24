@@ -2589,3 +2589,142 @@ fast. The job never aligns `beat`'s output against anything, so nothing would ca
 Cannot be settled without the card. **30-second micro-check for the next GPU window: fill the
 scratch with NaN between calls and see whether dk/dv still come back at ~52 dB.** It decides
 whether the bar needs raising by ~0.1 ms, and it is a correctness question, not a timing one.
+
+## h33 — k_dq is CLEAN by full enumeration. Three real defects exist elsewhere, all fixable at zero card time, and one "obvious fix" would silently destroy 75% of dQ at prod.
+
+Zero card time. Full cross-product enumeration of every k_dq / k_dq_sp byte offset
+(grid x 32 lanes x qh_[4] x dtile[8] x si[8] — 8.4M tuples at fast, 16.8M at proxy, 134.2M at
+prod, **no sampling**), across all nine shapes in `ut/common.py:13-25`, causal and non-causal.
+
+### Result: no out-of-bounds access in k_dq or k_dq_sp
+
+The two write sites (`kernels.py:949` split fp32 -> dqp, `:953` non-split bf16 -> dq_o) form a
+**bijection onto the real tensor** — every element written exactly once, slack **0 bytes**.
+Reads (Q/dO `:700-703`, K/V `:705-710`, LSE/DEL `:721-722`) also slack 0; the hand clamps at
+`:876-877` (`jj = min(ii+1, n-1)`) and `:928` (`_pf`) both hold.
+
+`fast` takes **k_dq_sp** (nsp_q=8), proxy and prod take k_dq (nsp_q=1) — `impl.py:98,208-211`.
+
+**So the k_dq descriptor debt is technical debt, not a wedge defence.** Deprioritise it as a
+safety measure; see below for why it is still dangerous to "fix" naively.
+
+### NEW ISA FACT — gfx1250's V# num_records is in units of 128 BYTES
+
+This resolves a 128x discrepancy three earlier reports filed as unexplainable. It is not a
+presentation artefact:
+
+```
+k_dq_0/21_final_isa.s:165   s_mov_b32 s6, 0x800000    ; = (1<<30) >> 7   (V# word2)
+k_dq_0/21_final_isa.s:34    s_mov_b32 s14, 0x200000   ; = (1<<28) >> 7
+k_dq_sp_0/21_final_isa.s    s_lshl_b32 s2,s4,9 -> s_ashr_i32 s3,s2,31 -> s_lshr_b64 s[2:3],s[2:3],7
+```
+
+The runtime path performs an explicit `>> 7`; the constant path is folded to the same thing.
+**Effective hardware limit = the byte count written in the source.** A consequence nobody had
+recorded: **a byte count that is not a multiple of 128 is truncated DOWN, and the tail really
+is clamped away.** `_dkdv_impl`'s `nl_b = B*Hq*Sq*4` (`:202`) is safe only because
+`impl.py:123`'s unrelated `n_rows % ROWS_DELTA(32) == 0` assertion happens to guarantee it.
+
+### The seven fake descriptors: all too LARGE, none too small
+
+`:675` Q, `:676` K, `:677` V, `:678` dO (each `1<<30`), `:679` LSE, `:680` DEL (each `1<<28`),
+`:687` dQ (`1<<30`). Ratios fake/real run 4x–8192x depending on shape. **Every one is
+oversized, so none discards a valid write** — there is no live silent-corruption bug here.
+The unprotected window past dQ is 805,306,368 B at prod. Enumeration proves nothing reaches it.
+`:685` (dqp) is the only descriptor carrying a true extent (1.000x).
+
+### DO NOT "fix" the descriptors the obvious way — quantified
+
+`k_dq` hardcodes `B_` and `nsp` to `fx.Int32(1)` at `kernels.py:963-964` and its signature
+(`:959-962`) **has no `B_` at all**. Substituting `_dkdv_impl`'s formula `B_*Sq*Hq*(D*2)` gives
+**67,108,864** against a real 268,435,456 at prod:
+
+> **3 of prod's 4 batches are clamped away entirely — 75% of dQ left as uninitialised
+> `torch.empty` garbage** — and `proxy` cannot catch it because b=1 there.
+
+A correct fix requires all four of: thread `b` through `k_dq`'s signature, `launch_dq`
+(`:978-986`) and `impl.py:214-217`; keep every byte count a multiple of 128; compute `:685` in
+Int64; and re-baseline, because `:943-948` states the address algebra's ORDER moves nine
+instructions and breaks the byte-identical-prod gate. **That is its own round, not a side edit.**
+
+### Three real defects, all fixable at zero card time
+
+**(a) floor/ceil mismatch — the only path whose shape matches an ISSUED out-of-bounds write.**
+`impl.py:217,:223` pass `nblk = sq // BLOCK_Q` (floor); `kernels.py:667-668` computes
+`bid = ceil(Sq/BLOCK_Q) - 1 - blockIdx.y` (ceil). `impl.py:115` asserts only `sq % 32 == 0`,
+**not `% BLOCK_Q`**. Verified independently:
+
+| sq | launcher nblk | kernel ceil | |
+|--:|--:|--:|---|
+| 8192 / 4096 / 1024 | 128 / 64 / 16 | same | ok |
+| **8224 / 4128 / 1056** | 128 / 64 / 16 | **129 / 65 / 17** | **mismatch** |
+
+Every mismatch is exactly `sq % 64 == 32`; a sweep of 258,048 legal combinations found no
+other out-of-bounds case anywhere in k_dq's index space. At those shapes the kernel **issues**
+262,144 B of out-of-bounds writes *through the fake `1<<30` descriptor* (issued, not clamped)
+and query tile 0 is never dispatched, leaving dQ's first 64 rows as `torch.empty` garbage.
+All nine scored shapes happen to have `sq % 64 == 0`, so it is unreachable today.
+
+**FIX: `impl.py:115` -> `assert sq % _k.BLOCK_Q == 0`.** One line, zero card time,
+**ISA byte-identical, no re-baseline**. Highest value per unit of risk in the whole table.
+
+**(b) int32 overflow at `kernels.py:685`.** `nsp * B_ * Sq * Hq * fx.Int32(D*4)` is int32
+throughout. Verified at prod dims:
+
+| nsp | true | int32 |
+|--:|--:|---|
+| 1, 2 | 5.37e8, 1.07e9 | ok |
+| 4 | 2,147,483,648 | **-2,147,483,648** |
+| **8, 16** | 4.29e9, 8.59e9 | **exactly 0 -> num_records = 0 -> every dQ write silently discarded** |
+
+Unreachable today only because prod takes nsp_q=1 — but `_NSP_Q_CAP` is 8 and round 18 was
+sweeping nsp=16 (`rounds/018/_scratch/screen_cur.out:32`). One constant away from silently
+producing an all-garbage dQ that the SQNR gate would catch only by luck.
+**FIX: compute in Int64.**
+
+**(c) A LIVE out-of-bounds READ — in k_dkdv, not k_dq.** The unconditional prologue prefetch
+`_ldqd(_qt0, fx.Int32(0))` at `kernels.py:538` (split) and `:545` (non-split) lets the query-pair
+index exceed `nqt2`: **982,272 B past the end of Q/dO at fast, 261,376 B at proxy and prod**.
+A second unclamped prefetch is the carried `jj = ii + 1` at `:499-504`.
+
+It does not fault today **only because `_dkdv_impl` gives these buffers REAL extents at
+`kernels.py:200-206`**, so the hardware clamps it.
+
+**Therefore: never convert k_dkdv's descriptors to the fake style.** The asymmetry that looks
+like an inconsistency is the one thing holding a live out-of-bounds read.
+**FIX: clamp with `min(_qt0, nqt2-1)`, the same idiom already used at `:876-877` / `:928`.**
+It only lowers the address of a DEAD value, so it cannot change any live result — numerically
+identical by construction.
+
+### Round 18 had TWO distinct faults. Do not merge them.
+
+| | recorded by round 18 | the wedge |
+|---|---|---|
+| timestamp | `[5796.84]` | `[53032.75]` |
+| pid | 130034 | 576508 |
+| address | `0x7e13681c3000` | `0x71d29e09b000` |
+| PERMISSION_FAULTS | 0x3 | **0x5** |
+| **RW** | **0x0 (read)** | **0x1 (write)** |
+| outcome | card survived; `opt.md:504` "卡未 wedge，未需断电" | MES dead 31 s later, cost a power cycle |
+
+The read fault is the old `screen.py` teardown path and did NOT wedge the card; round 18
+recorded it correctly and correctly refused to blame an arm. The write fault is the wedge.
+An analysis that cites the RW=0x0 record as "round 18's fault signature" has the wrong event.
+**The wedge's RW=0x1 remains unexplained by this audit** — k_dq's writes are proven clean, and
+k_dkdv's out-of-bounds access is a READ that the real descriptors clamp.
+
+### What was enumerated vs what was argued
+
+Enumerated: the full integer index algebra at the FlyDSL source level (only K/V's `kv0` uses an
+"affine and monotone therefore extremes bound the interior" argument for its interior).
+NOT covered: scratch / register-spill writes (also TCP traffic — the 32-register prefetch tuple
+at `:741-748` makes spill plausible and it is invisible without compiling), host-side allocator
+page mapping, and the actual runtime arguments of the round-18 process.
+
+### Suggested order for round 20, all zero card time, one commit
+
+1. `impl.py:115` -> `% _k.BLOCK_Q` (ISA byte-identical, no re-baseline)
+2. clamp `kernels.py:538`, `:545`, `:499-504`
+3. `kernels.py:685` in Int64
+
+Leave the seven k_dq descriptors alone until they get their own round.
