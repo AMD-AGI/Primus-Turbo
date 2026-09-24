@@ -209,7 +209,7 @@ def _cached_launch(cache, jit_fn, hints, args, kwargs):
             return jit_fn(*args, **kwargs)
         with CompilationContext.compile_hints(hints):
             return jit_fn(*args, **kwargs)
-    key = tuple(a for a in args[:-1] if not isinstance(a, torch.Tensor))
+    key = tuple(type(a) for a in args[:-1] if not isinstance(a, torch.Tensor))
     fn = cache.get(key)
     if fn is None:
         if len(cache) >= 64:
@@ -5239,6 +5239,11 @@ def _get_bwd(
     band_span=0,
     a16=False,
 ):
+    # batch_size is baked only into the SBHD seq-step stride (RD_STRIDE_*); THD takes it as a
+    # runtime kernel argument. Keeping it in the key there rebuilds the module -- and so
+    # recompiles -- for every num_seq an e2e run happens to hit.
+    if not sbhd:
+        batch_size = None
     key = (
         Hq,
         Hkv,
