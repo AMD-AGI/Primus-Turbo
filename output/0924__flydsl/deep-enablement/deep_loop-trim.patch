@@ -1,0 +1,642 @@
+diff --git a/op_evolve/modules/deep_loop/profiling/prompts/00_preflight.md b/op_evolve/modules/deep_loop/profiling/prompts/00_preflight.md
+index b393bb9..cd06d2c 100644
+--- a/op_evolve/modules/deep_loop/profiling/prompts/00_preflight.md
++++ b/op_evolve/modules/deep_loop/profiling/prompts/00_preflight.md
+@@ -77,16 +77,29 @@ already passed, so a failure here means the *environment* broke, not the code.
+ 
+ You may attempt repair, from this list only:
+ 
+-- restart the container
+-- reinstall a missing Python dependency
+-- install the ATT trace decoder
+ - clear a compiler cache
+-
+-You may **not** change the image, the ROCm or framework version, the GPU, the job spec, or
+-any code under `rounds/`. A repair outside that list silently invalidates every measurement
+-taken before it, with nothing in the output to say so. Record every repair in
+-`provenance.yaml`, re-run the idle check afterwards, and note that restarting the container
+-empties `{{scratch_dir}}`, so anything in flight restarts from the beginning.
++- re-run the failing command once, after confirming no orphan from it is still alive
++
++**This container is not yours (`owned: false` in the job spec), and you are running under
++bypassPermissions -- so the prohibitions below are the only thing standing between a broken
++import and a broken shared machine.** You may **not**:
++
++- `pip install` anything into the container's site-packages (`/opt/venv/...`). Not plotly,
++  not kaleido, not matplotlib, not a missing dependency of a tool.
++- restart, recreate or reconfigure the container. Other work shares it.
++- download or install the ATT trace decoder. **It is already on disk** at
++  `/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib` -- step 4 pins that path.
++- install `rocprof-compute`. Step 3 is permanently unavailable here and says why.
++- change the image, the ROCm or framework version, the GPU, the job spec, or any code under
++  `rounds/`.
++
++If a step needs something that is not installed, **that step fails** -- `status: failed` in
++its `provenance.yaml` with the missing thing named, and the round continues. A missing tool
++is a recorded gap; an installed one is an unrecorded change to a machine other people are
++using. A repair outside the list above also silently invalidates every measurement taken
++before it, with nothing in the output to say so.
++
++Record every repair in `provenance.yaml` and re-run the idle check afterwards.
+ 
+ After 3 failed repair attempts, stop and report to the user.
+ 
+diff --git a/op_evolve/modules/deep_loop/profiling/prompts/01_select.md b/op_evolve/modules/deep_loop/profiling/prompts/01_select.md
+index 8811562..c5cdea7 100644
+--- a/op_evolve/modules/deep_loop/profiling/prompts/01_select.md
++++ b/op_evolve/modules/deep_loop/profiling/prompts/01_select.md
+@@ -4,7 +4,7 @@
+ 
+ Every later step refers to what you write here and rediscovers nothing. Fill in
+ `{{out_dir}}/kernel.yaml`, following `{{schemas_dir}}/kernel.yaml`. The discovery run's own
+-output -- the commands, the `--stats` table you read -- goes in
++output -- the commands and the counter CSV you read -- goes in
+ `{{out_dir}}/1-kernel-selection/raw/`, with a `provenance.yaml` beside it.
+ 
+ Read [`{{knowledge_dir}}/profiling/0-kernel-profiling.md`](../../../../knowledge/profiling/0-kernel-profiling.md),
+@@ -12,12 +12,56 @@ the section "Attributing a measurement to the right kernel". Nothing else from t
+ 
+ ### Which kernels
+ 
+-Discover what actually ran:
++Discover what actually ran.
++
++**`--kernel-trace` MUST NOT be used on this stack, and `--stats` goes with it.** On this
++card (gfx1250, rocprofv3 1.3.2) a `--kernel-trace` pass records **zero dispatches**: it
++exits 0 and writes a stats table with nothing in it, which reads exactly like "the op never
++ran". You cannot rank from it, and believing its emptiness is worse than not running it.
++
++Rank from a `--pmc` pass instead. Counter collection works on this card, and every `--pmc`
++row carries the dispatch's descriptors and timestamps for free -- which is all the ranking
++needs. One pass, five counters, one hardware pass:
+ 
+ ```bash
+-rocprofv3 --stats --kernel-trace --output-format csv -o discover -d $SCRATCH -- <benchmark>
++rocprofv3 --pmc SQ_WAVES,SQ_CYCLES,SQ_BUSY_CYCLES,SQ_ITEMS,GRBM_GUI_ACTIVE \
++  --output-format csv --output-file discover -d $SCRATCH -- <benchmark>
++```
++
++The four `SQC_ICACHE_*` counters are validated here too, but say nothing about time; leave
++them to step 2 rather than risking a second hardware pass in the step everything depends on.
++
++**Then assert the CSV exists and contains the counters you asked for. Exit status is not a
++signal on this part**: a `--pmc` list naming one counter gfx1250 does not define writes no
++CSV at all and still exits 0, which looks identical to a clean run. Glob for the file --
++`<dir>/discover_counter_collection.csv` in some builds,
++`<dir>/pass_1/discover_counter_collection.csv` in others.
++
++It is long-format, one row per counter per dispatch, with columns
++
++```text
++"Correlation_Id","Dispatch_Id","Agent_Id","Queue_Id","Process_Id","Thread_Id","Grid_Size",
++"Kernel_Id","Kernel_Name","Workgroup_Size","LDS_Block_Size","Scratch_Size","VGPR_Count",
++"Accum_VGPR_Count","SGPR_Count","Counter_Name","Counter_Value","Start_Timestamp","End_Timestamp"
+ ```
+ 
++Compute, per `Kernel_Name`, filtering to the rows of **one** `Counter_Name` first so each
++dispatch is counted once:
++
++- **duration** = sum of `End_Timestamp - Start_Timestamp` over its dispatches, in ns.
++- **share of time** = that sum over the same sum across every kernel in the profile. This is
++  what `pct_of_time` means below.
++- **a second, independent ranking** from the per-dispatch `GRBM_GUI_ACTIVE` sums. If the two
++  orderings disagree, rank by the timestamps and say in `kernel.yaml` that they disagreed.
++- **dispatch count**, and the descriptors every `--pmc` row carries anyway: `Grid_Size`,
++  `Workgroup_Size`, `VGPR_Count`, `SGPR_Count`, `LDS_Block_Size`, `Scratch_Size`. Record them
++  in `kernel.yaml`. A non-zero `Scratch_Size` is a register spill and is a finding in its own
++  right, not bookkeeping.
++
++These durations are taken under the profiler, where dispatches are serialised and the clock
++differs. **They rank kernels; they are never the round's score.** That stays
++`benchmark-results.md`.
++
+ Select **the kernels implementing the op**, not every dispatch in the process. A PyTorch
+ driver also launches `distribution_elementwise_grid_stride_kernel` for `randn` and
+ `__amd_rocclr_fillBufferAligned` for allocation -- together under 8% of the time and never
+@@ -52,8 +96,8 @@ profile id. Directories are named by the kernel's slug, never by index -- otherw
+ `kernel-0` and round 7's silently compare two different kernels.
+ 
+ **A kernel from a runtime-loaded code object may have no name in a thread trace.** If a later
+-step needs a name the trace does not carry, it comes from the `--kernel-trace --stats` pass
+-you just ran. Set `name_available_in_trace` accordingly.
++step needs a name the trace does not carry, it comes from the `Kernel_Name` column of the
++`--pmc` pass you just ran. Set `name_available_in_trace` accordingly.
+ 
+ ### Which shapes
+ 
+diff --git a/op_evolve/modules/deep_loop/profiling/prompts/02_counters.md b/op_evolve/modules/deep_loop/profiling/prompts/02_counters.md
+index 8acff80..c3cd18f 100644
+--- a/op_evolve/modules/deep_loop/profiling/prompts/02_counters.md
++++ b/op_evolve/modules/deep_loop/profiling/prompts/02_counters.md
+@@ -9,25 +9,79 @@ Collect per-kernel counters with `rocprofv3` for each kernel in `{{out_dir}}/ker
+ one `-k`-equivalent filter at a time. Results go to
+ `{{out_dir}}/2-kernel-profiling/kernel-<slug>/`.
+ 
+-What that document settles and you should not re-derive: which block each counter comes from,
+-how many instances it sums over (`GRBM_*` per XCD, `SQ_*_CU_CYCLES` per CU,
+-`SQ_VALU_MFMA_BUSY_CYCLES` per SIMD), and whether a counter reports bytes or requests. Apply
+-the normalisation it gives; an un-normalised counter is off by the instance count and looks
+-plausible.
++What that document settles and you should not re-derive: which block a counter comes from,
++how many instances it sums over (`GRBM_*` per XCD, `SQ_*_CU_CYCLES` per CU), and whether a
++counter reports bytes or requests. Apply the normalisation it gives; an un-normalised counter
++is off by the instance count and looks plausible.
++
++**Its counter NAMES are gfx942/gfx950 and mostly do not exist here. Do not copy a list out of
++it.** The surface that was swept on this card is
++[`{{knowledge_dir}}/arch/gfx1250/profiling-surface.md`](../../../../knowledge/arch/gfx1250/profiling-surface.md);
++this step's list comes from there and from nowhere else.
++
++**Validated on this card** -- non-zero against a kernel provably doing the work:
++
++```
++SQ_WAVES   SQ_CYCLES   SQ_BUSY_CYCLES   SQ_ITEMS   GRBM_GUI_ACTIVE
++SQC_ICACHE_REQ   SQC_ICACHE_MISSES   SQC_ICACHE_MISSES_DUPLICATE
++```
++
++That is wall-clock cycles, wave count and instruction-cache behaviour. Nothing about memory,
++the matrix unit, occupancy or stalls.
++
++⚠ **`SQC_ICACHE_HITS` is accepted and returns zero** in the same run where `REQ` and `MISSES`
++are both sensible (`profiling-surface.md:105`). If you collect it, a zero from it is **not a
++measurement** and must be labelled as such wherever it appears.
++
++**Rejected names fail the WHOLE pass, silently.** A `--pmc` list naming one counter gfx1250
++does not define writes **no** `*_counter_collection.csv` and still exits 0 -- indistinguishable
++from a clean run. Every wait/stall counter is rejected, and so is anything naming MFMA:
++**gfx1250 has WMMA, not MFMA, so `SQ_VALU_MFMA_BUSY_CYCLES` does not exist here** and neither
++do `SQ_WAIT_ANY`, `SQ_ACTIVE_INST_ANY` or `SQ_BUSY_CU_CYCLES`.
++
++**Accepted-but-silently-zero -- do not put these in a list.** The whole
++`SQ_VALU_WMMA_FLOP_*` family, `SQ_INSTS_VEC32_VALU_WMMA`, `SQ_INST_CYCLES_VALU_WMMA`, and
++every memory counter (`CHC_*`, `GL1C_*`, `CHA_*`, `GLARBC_*`). Measured: a kernel executing
++exactly 4,096,000 `v_wmma_f32_16x16x32_bf16` instructions reports all three WMMA counters as
++exactly 0 while `SQ_WAVES` reports 4096, which is exact. If one of these reaches a CSV anyway,
++write beside every zero that **a zero from this counter is not a measurement**.
++
++**There is no byte-reporting counter at any level on this part.** No traffic figure, no
++measured arithmetic intensity, no cache hit rate comes from counters here. Say so rather than
++substituting something that looks like one.
++
++**Assert the output.** After every pass, check the CSV exists and that `Counter_Name` contains
++each counter you asked for. Exit status is not a signal.
+ 
+ **Split the counter list.** A `--pmc` list needing more than one hardware pass aborts with
+ `signal 6` or leaves dangling correlation ids, and writes an `agent_info.csv` with no
+-counters -- which looks identical to "the counter does not exist". Two derived counters are
+-enough to trigger it. Collect in several passes rather than diagnosing this each time.
++counters -- which looks identical to "the counter does not exist". Collect in several passes
++rather than diagnosing this each time.
++
++**The stall question is not answered by counters here; it is answered by PC sampling.**
++Stochastic PC sampling works on this part and reports `Stall_Reason`, `Instruction_Type`,
++`Wave_Count` and issue rate per sample:
++
++```bash
++rocprofv3 --pc-sampling-beta-enabled --pc-sampling-method stochastic \
++  --pc-sampling-unit cycles --pc-sampling-interval 2048 \
++  --output-format csv --output-file pc -d $SCRATCH -- <benchmark>
++```
++
++Valid interval range on this part is 256 to 1048576 cycles. Run it once per selected kernel
++alongside the counter passes; it is the only rich source of *why* on this card.
+ 
+-Write `analysis.md` with the counters, their normalised values, and what each says. No
+-verdict yet -- the regime comes in step 4 and the bound in step 5.
++Write `analysis.md` with the counters, their normalised values, and what each says -- and,
++for anything you collected from the silently-zero set, the explicit note that its zero is not
++a measurement. No verdict yet -- the regime comes in step 5 and the bound in step 6.
+ 
+ ## Reply with
+ 
+ ```yaml
+ kernels_done: [<slug>, ...]
+ passes: 3
++counters_absent: []        # names asked for that produced no column, if any
+ highlights: [{metric: ..., value: ..., note: ...}]   # at most 6 lines
++pc_sampling: {status: ok|failed, top_stall_reason: ..., issue_rate_pct: ...}
+ status: ok
+ ```
+diff --git a/op_evolve/modules/deep_loop/profiling/prompts/03_metrics.md b/op_evolve/modules/deep_loop/profiling/prompts/03_metrics.md
+index 1ab8840..536b2d1 100644
+--- a/op_evolve/modules/deep_loop/profiling/prompts/03_metrics.md
++++ b/op_evolve/modules/deep_loop/profiling/prompts/03_metrics.md
+@@ -1,46 +1,47 @@
+ {{preamble}}
+ 
+-## Step 3: panel metrics
+-
+-Read [`{{knowledge_dir}}/profiling/1-kernel-metrics.md`](../../../../knowledge/profiling/1-kernel-metrics.md).
+-That file only.
+-
+-Run `rocprof-compute` once per selected kernel and write to
+-`{{out_dir}}/3-kernel-metrics/kernel-<slug>/`.
+-
+-**Isolate the kernel.** Every panel defaults to an aggregate over every dispatch in the
+-profile, and that aggregate is a plain per-dispatch mean -- with the GEMM at 92% of *time*
+-but 3 of 6 dispatches, the aggregate reported exactly half the per-kernel throughput. Use the
+-kernel index from `kernel.yaml`, and remember it belongs to this profile only.
+-
+-Produce, per kernel:
+-
+-- panel 2, System Speed-of-Light, plus `sol_chart.png` via `tools/sol_chart.py`
+-- panel 3, the memory chart, plus `mem_chart.png` via `tools/mem_chart.py`
+-- the panels from groups 15 to 18 that your counters in step 2 pointed at
+-
+-**Known environment failure.** `rocprof-compute` pins `kaleido==0.2.1` while a current image
+-ships plotly 7, which needs `kaleido>=1`. The symptom is misleading: `profile` exits 1 after
+-writing a malformed `roofline.csv`, and `analyze` then dies with `EmptyDataError` naming
+-neither. Fix with `pip install "plotly<6" "kaleido==0.2.1"` and record it as a repair.
+-
+-**Do not quote the tool's empirical peaks for packed dtypes.** They were measured correct for
+-full-rate fp32/fp64 and wrong by a power of two for the packed paths; the theoretical `Peak`
+-column agrees with our own arithmetic. That document has the table.
+-
+-**Pass `--no-roof` to `rocprof-compute profile`.** Without it the tool runs its own
+-microbenchmark suite to build an empirical roofline before it profiles anything -- measured
+-here at 133 s against 63 s with the flag, more than half the step's machine time. That
+-roofline is data this corpus tells you not to use: its microbenchmark is wrong by a power of
+-two for every packed dtype, bf16 coming back at 0.24x, and the ceiling you plot is computed
+-instead. Everything the panels need -- `pmc_perf.csv`, `sysinfo.csv`, `perfmon` -- is still
+-collected; only `roofline.csv` is skipped.
++## Step 3: panel metrics -- UNAVAILABLE ON THIS MACHINE
++
++**Do not run anything in this step. Do not install anything.** Write
++`{{out_dir}}/3-kernel-metrics/provenance.yaml` with `status: skipped` and the reason below,
++reply, and stop. This step is not part of the module's spine: the round continues past it,
++and every later step must treat panel metrics as absent rather than pending.
++
++`rocprof-compute` is **not installed here and will not be installed**, and that is a decision
++already taken, not a gap to close:
++
++- On gfx1250 its panels collect almost nothing. The LDS panel asks for 152 counters and 1 is
++  available on this part; the L2, EA, UTCL1 and TXD panels get 0. There are no derived metrics
++  on this architecture at all -- `FETCH_SIZE`, `WRITE_SIZE`, `MfmaFlops`, `VALUBusy`,
++  `OccupancyPercent`, `LdsBankConflict`, `MemUnitStalled` have no gfx1250 definition -- so the
++  Speed-of-Light panel has nothing to fill.
++- It overrides the runtime counter table through `ROCPROFILER_METRICS_PATH`, so it would
++  request counters the driver accepts and returns zero for. On a part where unknown counters
++  fail silently, that amplifies the one hazard this module exists to avoid, and it does it
++  where you cannot see it.
++- Installing it would mean writing into `/opt/venv` in a **shared** container, which the job
++  spec forbids (`owned: false`).
++
++The evidence for the panels' emptiness is in
++[`{{knowledge_dir}}/arch/gfx1250/profiling-surface.md`](../../../../knowledge/arch/gfx1250/profiling-surface.md).
++
++`tools/sol_chart.py` and `tools/mem_chart.py` are also unusable here for a second, independent
++reason: they import `matplotlib`. As of 2026-09-24 it IS available, but ONLY under
++`PYTHONPATH=/home/lihuzhan/.local/pyviz`; it is deliberately NOT in the container's own site-packages and must not be
++installed into it.
++
++**What replaces this step.** Nothing does, completely. The questions it would have answered
++are answered partially by step 2 (counters, plus stochastic PC sampling for stall reasons) and
++step 4 (the instruction trace). Cache hit rates, byte traffic and matrix-unit utilisation are
++simply **not measurable on this card** -- say that in the summary's `non_findings` rather than
++leaving a gap that reads like an oversight.
+ 
+ ## Reply with
+ 
+ ```yaml
+-kernels_done: [<slug>, ...]
+-sol: [{kernel: <slug>, mfma_pct_of_peak: ..., valu_util: ..., l2_hit_rate: ...}]
+-charts: [sol_chart.png, mem_chart.png]
+-status: ok
++status: skipped
++reason: rocprof-compute not installed and not installable here; gfx1250 panels collect ~nothing
++kernels_done: []
++charts: []
++installed_anything: false
+ ```
+diff --git a/op_evolve/modules/deep_loop/profiling/prompts/04_thread_trace.md b/op_evolve/modules/deep_loop/profiling/prompts/04_thread_trace.md
+index a3b9fdb..a8020a2 100644
+--- a/op_evolve/modules/deep_loop/profiling/prompts/04_thread_trace.md
++++ b/op_evolve/modules/deep_loop/profiling/prompts/04_thread_trace.md
+@@ -9,6 +9,46 @@ A thread trace answers a different question from everything above: not *which* u
+ but *what each instruction did on each cycle*, for one compute unit. It costs minutes and
+ hundreds of megabytes per dispatch.
+ 
++**ATT serialises dispatches. Its timings must NEVER be used for ranking**, for a share of
++time, or for any comparison against `benchmark-results.md`. It answers *what the instructions
++did*, not *how long the kernel takes*. The ranking is step 1's and stays step 1's.
++
++**The decoder library is already on disk. Pin it and install nothing.**
++
++```
++att_library_path: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib
++```
++
++That directory holds `librocprof-trace-decoder.so` -> `.so.0.2`. **You may not pip install,
++download, or otherwise add anything to this container** -- it is shared and the job spec sets
++`owned: false`. If the pinned path does not resolve, this step fails: write
++`status: failed` with the path you tried and stop.
++
++**Smallest safe capture, and no larger.** One kernel, one iteration, one CU:
++
++```yaml
++jobs:
++  - kernel_include_regex: "<the exact kernel name from kernel.yaml>"
++    kernel_iteration_range: "[3]"        # one dispatch, past warm-up
++    advanced_thread_trace: true
++    att_library_path: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib
++    att_target_cu: 1
++    att_shader_engine_mask: "0x1"
++    att_simd_select: "0xf"
++    att_buffer_size: "0x2000000"         # 32 MB. Raise ONLY if the trace truncates,
++                                         # one doubling at a time.
++    output_directory: <scratch>
++    output_file: att
++```
++
++Start at that buffer size rather than the corpus's 384 MB: this card has one GPU and a
++capture that overruns is paid for by the whole job. A truncated trace is a re-run; a wedged
++card is a human power-cycle.
++
++**PMC and ATT cannot share a job.** Never add `--pmc` to this run, and do not use
++`--att-perfcounters` / `--att-perfcounter-ctrl` / `--att-activity`: all three are accepted on
++this stack and emit no counter file, silently.
++
+ **Narrow the capture from the start**, with an input file using `kernel_include_regex` and
+ `kernel_iteration_range`. Unfiltered, one HIP program produced 374 MB and two directories,
+ one of them the runtime's memset; filtered, the same GEMM produced one directory of 21 MB.
+@@ -18,9 +58,16 @@ name is the application's dispatch id -- not an index into your kernels. Gaps ar
+ Use the name from `kernel.yaml`; if the kernel came from a runtime-loaded code object it has
+ no name in the trace, and `tools/att_views.py --kernel-name` is how you supply it.
+ 
+-Generate all views with `tools/att_views.py`, including the overlap view. Two limits state
++`tools/att_views.py` imports `matplotlib`. As of 2026-09-24 it IS available under
++`PYTHONPATH=/home/lihuzhan/.local/pyviz` (measured: Agg renders a valid PNG). It is **not in the container's own site-packages and
++must not be installed into it**. Render under that PYTHONPATH if you want charts; otherwise parse the
++`stats_*.csv` the decoder writes and report the numbers in `analysis.md` instead; record
++`charts: []` rather than a path to a chart that was never drawn. Three limits to state
+ explicitly in `analysis.md`:
+ 
++- **These timings are serialised by the tracer** and are not comparable to anything in
++  `benchmark-results.md`, nor usable to rank kernels.
++
+ - **This is one compute unit**, selected by `--att-target-cu`, out of hundreds. Every
+   per-wave view describes that one.
+ - **The overlap view is per-wave.** Latency is also hidden between waves, which it does not
+@@ -30,10 +77,16 @@ explicitly in `analysis.md`:
+ The trace's `ui_output_*` stays in `{{scratch_dir}}` and is discarded. Keep the charts, the
+ `stats_*.csv` you parsed, and `analysis.md`.
+ 
+-**If the decoder library is missing**, install it -- it is a separate release, not part of
+-the ROCm image, and `--att-library-path` takes any directory. If the node cannot reach
+-GitHub, this step fails; record that and stop. "The library is not in this image" is not the
+-same finding as "ATT is unavailable here".
++**If the decoder library is missing, do NOT install it.** The library present on this
++machine is
++`/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/librocprof-trace-decoder.so`
++(0.2.x); a second copy sits under `_rocm_sdk_core/lib`. Pointing `--att-library-path` at that
++directory is the only sanctioned way to satisfy the decoder. Downloading a release, unpacking
++one, or writing anything into `/opt/venv` is forbidden: the container is shared and the job
++spec sets `owned: false`. If the pinned path does not resolve, or the decoder reports
++`INVALID_SHADER_DATA` (version skew against rocprofv3 1.3.2), record `status: failed` with the
++message and stop. "The library is not where I expected" is not the same finding as "ATT is
++unavailable here", and neither is a licence to install.
+ 
+ ## Reply with
+ 
+@@ -41,6 +94,45 @@ same finding as "ATT is unavailable here".
+ kernels_done: [<slug>, ...]
+ dispatch_dirs: [{kernel: <slug>, dir: ui_output_..._dispatch_6, size_mb: 21}]
+ findings: [{observation: ..., view: overlap|wave_states|hotspot|...}]
+-charts: [att_combined_view.png, ...]
++charts: []                     # set only if you actually rendered one under the PYTHONPATH above
++decoder_path: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib
++installed_anything: false
+ status: ok|failed
+ ```
++
++---
++
++## MEASURED ON THIS MACHINE, 2026-09-24 -- read this before spending a step here
++
++ATT was probed directly on this card while it was otherwise idle. Four runs, and the card
++was **completely unharmed every time**: zero `MES ... failed to respond`, zero
++`suspend all gangs`, zero `unrecoverable`, **zero page faults**, `docker exec` responsive
++throughout. **ATT does not wedge this card.** The standing ban was inherited from PC
++sampling, which is a different mechanism -- a per-wave interrupt that writes wave state to
++a save area -- and it does not apply here.
++
++But ATT is **not usable on this job's kernels**, and that is the operative fact:
++
++| workload | result |
++|---|---|
++| a trivial `torch` elementwise kernel | **34 files, 11 MB, a real `.att` trace plus `ui_output_*_dispatch_*/`** |
++| this op's FlyDSL kernels (`profdrv.py`), with `--kernel-include-regex` | 9 files, **every one a `*_code_object_id_*.out` ELF dump**, no trace |
++| the same, **without** any regex filter | identical -- 9 files, no trace |
++
++So the filter is not the problem; **ATT captures nothing for FlyDSL JIT-compiled kernels
++on this stack**, while capturing a torch kernel in the same container minutes apart. This
++also explains the 2026-09-11 records, whose output was likewise ELF-dumps-only: those runs
++were not "unarmed", they hit this same limitation.
++
++**Therefore:** attempting ATT on this op costs a step and returns nothing. Record
++`status: skipped`, `reason: att_captures_no_flydsl_kernels`, and cite this block. If a
++future round changes how kernels are loaded (away from runtime `hipModuleLoad` of a JIT'd
++module), re-probe with the torch control alongside it.
++
++Two traps found while probing, worth keeping:
++- **`--att-buffer-size` is in BYTES, not MB.** `--att-buffer-size 64` aborts with
++  `F core.cpp:108] Invalid buffer size: 64`, and rocprofv3 then sits in its own SIGABRT
++  handler until killed -- which reads exactly like a hung GPU and is not one. Use
++  `67108864` for 64 MiB.
++- Always verify a capture **armed** before quoting it as a pass: a directory containing
++  only `*_code_object_id_*.out` is a NULL result, not a clean one.
+diff --git a/op_evolve/modules/deep_loop/profiling/prompts/05_power_wall.md b/op_evolve/modules/deep_loop/profiling/prompts/05_power_wall.md
+index 491e339..6994ec4 100644
+--- a/op_evolve/modules/deep_loop/profiling/prompts/05_power_wall.md
++++ b/op_evolve/modules/deep_loop/profiling/prompts/05_power_wall.md
+@@ -14,9 +14,31 @@ This step answers one question: **are cycles still a proxy for time?** On a powe
+ part they are not, and every stall metric collected above changes meaning -- removing stall
+ that is uncorrelated with the power draw returns nothing.
+ 
+-Run the data-swap test with `tools/clock_probe.py`: the byte-identical binary on real data,
+-on one operand zeroed, and on both. Measured previously: **-24.3%** and **-22.3%**. Record
+-sustained clock and socket power alongside.
++Run the data-swap test on **the op's own kernels**: the byte-identical binary on real data,
++on one operand zeroed, and on both. Measured previously on another part: **-24.3%** and
++**-22.3%**. Record sustained clock and socket power alongside.
++
++**Do not run `tools/clock_probe.py` from the command line.** Its CLI default is an 8192-cubed
++bf16 GEMM dispatched through hipBLASLt/Tensile (`tools/clock_probe.py:21-28`), and that is the
++path that has faulted this card. A fault here costs a human power-cycle, and the probe's
++numbers never become the round's score -- so the GEMM buys nothing and risks the machine.
++
++Import the harness instead, which is what the tool documents at `tools/clock_probe.py:13-18`:
++
++```python
++from clock_probe import measure
++r = measure(lambda: op(q, k, v, ...), flop=<from tools/op_flops.py>, secs=9.0)
++```
++
++Build three operand sets for the op's selected shape -- real, one input zeroed, both zeroed --
++allocate them once outside the loop, and call the same compiled kernel on each. The harness is
++the part that is easy to get wrong (reading power right after a `synchronize()` once reported
++382 W on a run drawing 1394 W); the workload is the part you are replacing.
++
++If the op cannot be driven this way in the time available, **skip the step** -- write
++`status: skipped, reason: no_safe_sustained_load` into `provenance.yaml` and let the bound
++analysis say it used the boost clock. Skipping is cheap. A GEMM that wedges the one card in
++this job is not.
+ 
+ Two things that document settles:
+ 
+diff --git a/op_evolve/modules/deep_loop/profiling/prompts/06_bound.md b/op_evolve/modules/deep_loop/profiling/prompts/06_bound.md
+index 720f231..e083184 100644
+--- a/op_evolve/modules/deep_loop/profiling/prompts/06_bound.md
++++ b/op_evolve/modules/deep_loop/profiling/prompts/06_bound.md
+@@ -3,17 +3,33 @@
+ ## Step 6: which bound
+ 
+ Read [`{{knowledge_dir}}/profiling/3-bound-analysis.md`](../../../../knowledge/profiling/3-bound-analysis.md).
+-That file only. Output to `{{out_dir}}/6-bound-analysis/`, including `roofline_model.png`.
++That file only. Output to `{{out_dir}}/6-bound-analysis/`. A roofline PNG is OPTIONAL -- see below.
+ 
+ This is where the round's verdict is formed: **memory, compute, latency, or power/clock**.
+ State it per selected shape -- one verdict covering both shapes is a verdict about neither.
+ 
++⚠ **gfx1250, this card: there is NO byte-reporting counter at any memory level.** Step 2
++states this. A *measured* arithmetic intensity therefore CANNOT be computed here, so the
++classical roofline cannot be built from counters. Do not fabricate one, and do not infer
++bytes from the source and present the result as measured -- this job has already recorded
++(h8, twice) that byte counts do not predict time on this op.
++
++INSTEAD, give the verdict from what IS measured: per-kernel time share and descriptors from
++step 1's `--pmc` pass (Grid, Workgroup, VGPR, LDS, Scratch), the counter ratios from step 2,
++and the sustained clock from step 5 -- and state the uncertainty plainly. `charts: []` is a
++valid and expected answer here.
++
++`tools/roofline.py` needs `matplotlib`, which IS available but only under
++`PYTHONPATH=/home/lihuzhan/.local/pyviz`. Build a roofline only if you have a defensible intensity from a source
++other than counters.
++
++--- the original instruction follows, and applies only where those inputs exist ---
+ Build the roofline with `tools/roofline.py` from the counters in step 2 and the ceilings that
+ document gives. Three things it settles, each of which moves a point or a ceiling far enough
+ to change the answer:
+ 
+-- **The compute ceiling is a band.** Use the sustained clock from step 4, not the boost table.
+-  If step 4 was skipped, say in `analysis.md` that the ceiling is the boost figure and the
++- **The compute ceiling is a band.** Use the sustained clock from step 5, not the boost table.
++  If step 5 was skipped, say in `analysis.md` that the ceiling is the boost figure and the
+   utilisation is therefore understated.
+ - **Intensity is per memory level**, so one kernel is several points. A kernel comfortably
+   above the HBM ridge can still be pinned by its L2 traffic.
+@@ -36,6 +52,6 @@ verdicts:
+   - {shape: ..., bound: memory|compute|latency|power, confidence: high|medium|low,
+      basis: ["...", "..."]}
+ ceiling_source: sustained|boost
+-charts: [roofline_model.png]
++charts: []                     # see above: no byte counter on gfx1250, so no measured intensity
+ status: ok
+ ```
+diff --git a/op_evolve/modules/deep_loop/profiling/prompts/07_summary.md b/op_evolve/modules/deep_loop/profiling/prompts/07_summary.md
+index e6ad017..ea51c8e 100644
+--- a/op_evolve/modules/deep_loop/profiling/prompts/07_summary.md
++++ b/op_evolve/modules/deep_loop/profiling/prompts/07_summary.md
+@@ -22,7 +22,7 @@ silently.
+ 
+ An analysis with nothing to read gets `reports: []` rather than being left out -- a plan
+ built on four analyses believing it had five is worse than one that knows what is missing.
+-If step 4 was skipped, the bound verdict carries the caveat that its compute ceiling is the
++If step 5 was skipped, the bound verdict carries the caveat that its compute ceiling is the
+ boost clock.
+ 
+ **Rates come only from `benchmark.py`**, and `performance.profiled` is `false`. Counters give
+diff --git a/op_evolve/modules/deep_loop/profiling/schemas/kernel.yaml b/op_evolve/modules/deep_loop/profiling/schemas/kernel.yaml
+index 118604d..48f6d2b 100644
+--- a/op_evolve/modules/deep_loop/profiling/schemas/kernel.yaml
++++ b/op_evolve/modules/deep_loop/profiling/schemas/kernel.yaml
+@@ -57,7 +57,9 @@ kernels:
+       # false for a kernel from a runtime-loaded code object. hipBLASLt's GEMMs are the case:
+       # an ATT capture's code.json opens straight into `s_nop 0` with no symbol comment and
+       # the result database's dispatch table is empty, so the name has to come from a separate
+-      # `--kernel-trace --stats` pass. When false, that pass is what filled `name` above.
++      # pass that does carry names. On gfx1250 that is the `--pmc` discovery pass from step 1
++      # (its `Kernel_Name` column), NOT `--kernel-trace --stats`, which records zero dispatches
++      # on this stack. When false, the `--pmc` pass is what filled `name` above.
+ 
+ excluded:
+   # Recorded rather than dropped: "why is this kernel not in the analysis" is a question the
+diff --git a/op_evolve/modules/deep_loop/profiling/schemas/profiling.yaml b/op_evolve/modules/deep_loop/profiling/schemas/profiling.yaml
+index 11dc5da..519c8ef 100644
+--- a/op_evolve/modules/deep_loop/profiling/schemas/profiling.yaml
++++ b/op_evolve/modules/deep_loop/profiling/schemas/profiling.yaml
+@@ -99,7 +99,7 @@ coverage:                         # REQUIRED. What has data, what does not, and
+     charts: [3-bound-analysis/roofline_model.png]
+   - analysis: 4-thread-trace
+     status: failed
+-    reason: "trace decoder absent and the node could not reach GitHub"
++    reason: "trace decoder not found at the pinned in-image path; installing one is forbidden"
+     reports: []
+     charts: []
+ 
+diff --git a/op_evolve/modules/deep_loop/profiling/schemas/provenance.yaml b/op_evolve/modules/deep_loop/profiling/schemas/provenance.yaml
+index b16330e..e6a5d57 100644
+--- a/op_evolve/modules/deep_loop/profiling/schemas/provenance.yaml
++++ b/op_evolve/modules/deep_loop/profiling/schemas/provenance.yaml
+@@ -13,7 +13,7 @@ profiled: op/current
+ 
+ status: ok                        # REQUIRED. ok | failed | skipped
+ failure:                          # present only when status is failed
+-  stage: rocprof-compute profile
++  stage: rocprofv3 --pmc counter pass
+   message: "signal 6 -- counter list needs more than one hardware pass"
+   # Each analysis may fail on its own. These tools fail for reasons that have nothing to do
+   # with the kernel, and one of them misbehaving must not stop a loop that has four other
+@@ -29,9 +29,9 @@ timeout_s: 1800                   # every command has one: rocprof-compute has b
+ 
+ versions:                         # REQUIRED. Measurements do not transfer across releases
+   rocm: 7.2.1
+-  rocprofv3: 1.1.0
++  rocprofv3: 1.3.2                 # measured in this container 2026-09-24
+   rocprof_compute: 3.4.0
+-  trace_decoder: 0.1.6            # null when not installed
++  trace_decoder: 0.2.0            # from the copy already in the image; never installed by us
+   torch: 2.10.0+git94c6e04
+   image: rocm/primus:v26.3
+   node: smci355-ccs-aus-n01-21
+@@ -56,23 +56,26 @@ hashes:
+ commands:
+   # Verbatim, in order, with what each returned. This is what makes a step reproducible by
+   # hand, which is how every failure in this module has actually been diagnosed.
+-  - cmd: "rocprof-compute profile -n sol -p $DIR -- python3 tools/gemm.py 8192 3"
++  # ⚠ THE OLD EXAMPLE HERE DEMONSTRATED THE TWO THINGS THIS MODULE NOW FORBIDS:
++  #   rocprof-compute (step 3 declares it unavailable on this machine) and an 8192^3
++  #   hipBLASLt GEMM (step 5 forbids it -- that path has faulted this card).
++  #   A schema's worked example teaches by showing. Keep this one honest.
++  - cmd: "rocprofv3 -f csv --pmc SQ_WAVES SQ_CYCLES SQ_BUSY_CYCLES SQ_ITEMS GRBM_GUI_ACTIVE -d $DIR -o p -- <driver>"
+     exit: 0
+-    seconds: 402
+-  - cmd: "rocprof-compute analyze -p $DIR -k 0 -b 2 > sol.txt"
+-    exit: 0
+-    seconds: 11
++    seconds: 130
+ 
+ repairs:
+-  # Only from the fixed list: restart the container, reinstall a missing Python dependency,
+-  # install the ATT decoder, clear a compiler cache. Never the image, the ROCm or framework
+-  # version, the GPU, the job spec, or any code under rounds/ -- a repair outside that list
+-  # invalidates every measurement taken before it with nothing in the output to say so.
+-  - {at: '2026-08-29T09:29:40Z', action: install_dependency,
+-     detail: "pip install 'plotly<6' 'kaleido==0.2.1'",
+-     reason: "rocprof-compute exits 1 after writing a malformed roofline.csv"}
+-  # The idle check is re-run after any repair. Restarting the container empties /tmp, so an
+-  # analysis in flight restarts from the beginning.
++  # Only from the fixed list in 00_preflight.md: clear a compiler cache, or re-run a failing
++  # command once. On a container the job does not own (owned: false) NOTHING may be installed,
++  # restarted or downloaded -- not a Python dependency, not the ATT decoder, not
++  # rocprof-compute. A step that needs a missing tool FAILS and is recorded as failed.
++  # Never the image, the ROCm or framework version, the GPU, the job spec, or any code under
++  # rounds/ -- a repair outside that list invalidates every measurement taken before it with
++  # nothing in the output to say so.
++  - {at: '2026-08-29T09:29:40Z', action: clear_cache,
++     detail: "removed the DSL backend's compiled-kernel cache",
++     reason: "an edit appeared to do nothing; profiling would have measured the old binary"}
++  # The idle check is re-run after any repair.
+ 
+ scratch_dir: /tmp/rpc-20260829-093012
+   # Machine-generated bulk lives here and is NOT kept: a thread trace's ui_output_* runs to

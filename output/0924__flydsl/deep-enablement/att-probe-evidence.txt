@@ -1,0 +1,8 @@
+/tmp/att4/stats_ui_output_agent_5704_dispatch_2.csv
+/tmp/att4/p4_gfx1250_code_object_id_4.out
+/tmp/att4/p4_5704_shader_engine_0_2.att
+/tmp/att4/ui_output_agent_5704_dispatch_1/wstates1.json
+/tmp/att4/ui_output_agent_5704_dispatch_1/realtime.json
+/tmp/att4/ui_output_agent_5704_dispatch_1/se0_sm3_sl0_wv0.json
+att4 总数 34
+att6 总数 9 全为 code_object: 9

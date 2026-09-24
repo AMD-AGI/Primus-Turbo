@@ -1846,3 +1846,94 @@ Round 15 was recorded as **failed** because it dropped `g46` and `g47` without w
 either into `facts.md` or `dead_ends.md` and without declaring a merge. **Every id that is
 built or priced must be closed somewhere**, including — especially — the ones killed
 statically. That is what makes the next round cheap.
+
+---
+
+## h25 — deep rounds enabled, ATT measured, and three assumptions inverted (2026-09-24)
+
+Round 17 is the campaign's first DEEP round. Getting there required measuring four things,
+and **three of them came back opposite to the assumption they were built on.**
+
+### ATT does not wedge this card. It also cannot see our kernels.
+
+Probed directly, card otherwise idle, four runs. **Zero `MES ... failed to respond`, zero
+`suspend all gangs`, zero `unrecoverable`, ZERO page faults, `docker exec` responsive
+throughout.** The ban was inherited from **PC sampling**, which is a different mechanism —
+a per-wave interrupt that writes wave state to a save area — and does not transfer.
+
+But the operative fact is the second one:
+
+| workload | result |
+|---|---|
+| a trivial `torch` elementwise kernel | **34 files, 11 MB, a real `.att` trace + `ui_output_*_dispatch_*/`** |
+| this op's FlyDSL kernels, `--kernel-include-regex k_dkdv` | 9 files, **all 9 are `*_code_object_id_*.out`**, no trace |
+| the same, **no** regex filter | identical: 9 files, all code-object dumps |
+
+The filter is not the problem. **ATT captures nothing for FlyDSL JIT-compiled kernels on
+this stack**, minutes after capturing a torch kernel in the same container. This also
+closes the 2026-09-11 mystery: those runs produced ELF-dumps-only too. They were not
+"unarmed" — they hit this same limitation.
+
+**So: do not spend a deep step on ATT for this op.** `status: skipped`,
+`reason: att_captures_no_flydsl_kernels`.
+
+Two traps found while probing, both of which impersonate a GPU failure:
+- **`--att-buffer-size` is in BYTES, not MB.** `64` aborts with
+  `F core.cpp:108] Invalid buffer size: 64`, and rocprofv3 then sits in its own SIGABRT
+  handler until killed. It reads **exactly** like a hung card and is not one. Use `67108864`.
+- **Verify a capture ARMED before calling it a pass.** A directory holding only
+  `*_code_object_id_*.out` is a NULL result, not a clean one.
+
+### rocprof-compute: installable, and deliberately not installed
+
+`/opt/rocm` points at a build with **no gfx1250 support at all**; `/opt/rocm-10.1.0a20260811`
+beside it has full support. **Both report VERSION 3.8.0** — so a version check is not a
+capability check. Profile mode is stdlib-only, so the hipBLASLt-style copy-to-`$HOME` would
+work with zero installs.
+
+It is still **not being used**, for a reason that matters more than availability: this
+card's rocprofv3 defines **51 counters** for gfx1250, and mapping the gfx1250 panels onto
+them gives **SoL 96→13** (two of which are the known silent-zero WMMA FLOPs), **LDS 152→1**
+(only `GRBM_GUI_ACTIVE`), and **L2 / EA / UTCL1 / TXD → 0**. For an LDS-bound `k_dkdv` the
+panels we would actually read are empty. Worse, `soc_base.py:660-720` **overrides the
+runtime counter table** via `ROCPROFILER_METRICS_PATH` with its own 1811-entry table — so
+it bypasses the 51-counter guard and requests counters the driver accepts and returns zero
+for. That amplifies the silent-zero hazard **with no control**.
+
+One positive by-product: those 51 definitions **independently confirm h20's whitelist** —
+the 9 working and 6 silently-zero counters are all present, and every counter rejected
+outright is absent from the table.
+
+### The stock deep round would have aborted at step 2
+
+`01_select` is a SPINE step and mandated `rocprofv3 --stats --kernel-trace`, which records
+**zero dispatches** on this stack. A stock deep round therefore burns its setup and dies
+having measured nothing. It now ranks kernels from a `--pmc` pass instead (timestamps and
+`GRBM_GUI_ACTIVE`, two independent orderings, disagreement reported).
+
+Also fixed, all in `deep_loop/profiling/`: the only counter name in the tree was
+`SQ_VALU_MFMA_BUSY_CYCLES` — **gfx1250 has WMMA, not MFMA**, and one rejected name fails
+the whole pass; three passages told the agent to `pip install` into the shared container,
+restart it, or download a decoder, against the spec's `owned: false` and under
+`bypassPermissions`; `05_power_wall` drove an 8192³ hipBLASLt GEMM, the path that has
+faulted this card; and **`06_bound` — the step that forms the round's verdict — demanded a
+roofline built from byte counters that do not exist at any level on this part.** It would
+have failed or fabricated.
+
+*The diff is not in this repo.* op-evolve belongs to someone else; the changes live in its
+working tree and are saved as
+`output/0924__flydsl/deep-enablement/deep_loop-trim.patch` so a `git checkout` there cannot
+silently erase them.
+
+### And a warning about the fix that nearly poisoned everything
+
+Making matplotlib available (`pip install --target`) pulled **numpy 2.5.3**, which shadowed
+the container's **2.4.1 that torch 2.11 was built against**. With that directory on
+`PYTHONPATH`, every subsequent measurement would have run against a different numpy. It was
+caught by an explicit adversarial check, pruned, and re-verified: `import numpy` resolves to
+`/opt/venv`'s 2.4.1 and torch imports. **Any `--target` install must be audited for packages
+the container already provides.**
+
+Also: **`runtime.env` does not exist in op-evolve.** The docker runner wraps commands with
+no `-e`, and `load_spec` silently drops unknown keys. Adding `runtime.env:` to a job spec is
+a silent no-op — the exact failure class this campaign keeps losing days to.
