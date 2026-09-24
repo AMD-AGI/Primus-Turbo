@@ -46,6 +46,10 @@ from primus_turbo.pytorch.core.low_precision import (
     ScalingGranularity,
 )
 from primus_turbo.pytorch.core.utils import is_gfx950_device
+from primus_turbo.pytorch.kernels.quantization.mxfp4_pack import (
+    aiter_has_a6w4_bias_epilogue,
+    mxfp4_gemm_pack_sizes,
+)
 from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import (
     aiter_has_bias_epilogue,
     mxfp6_pack_sizes,
@@ -119,8 +123,59 @@ class GEMMFP6AITERBackend(KernelBackend):
         return aiter.gemm_a6w6(a, b, a_scale, b_scale, m, n, k, bias=bias)
 
 
+class GEMMA6W4AITERBackend(GEMMFP6AITERBackend):
+    """A6W4: the same GEMM with the B operand in MXFP4 instead of MXFP6.
+
+    Everything `can_handle` tests is identical -- gfx950, bf16 out, MX_BLOCKWISE, uint8
+    blobs, M/N on 256 and K on 128 -- because A6W4 shares A6W6's tile geometry exactly.
+    What differs is which blob `b` is (sized by `mxfp4_gemm_pack_sizes`, checked in
+    `_validate_blobs`) and that there is no bias epilogue to fold into.
+
+    Only the forward and dgrad GEMMs can reach this. wgrad contracts M, so neither of its
+    operands is the weight and there is no MXFP4 blob to hand it.
+    """
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        a_scale: torch.Tensor,
+        b: torch.Tensor,
+        b_scale: torch.Tensor,
+        m: int,
+        n: int,
+        k: int,
+        out_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del out_dtype, granularity  # already gated by can_handle
+        aiter = get_aiter()
+        if bias is None:
+            return aiter.gemm_a6w4(a, b, a_scale, b_scale, m, n, k)
+        if aiter_has_a6w4_bias_epilogue():
+            return aiter.gemm_a6w4(a, b, a_scale, b_scale, m, n, k, bias=bias)
+        out = aiter.gemm_a6w4(a, b, a_scale, b_scale, m, n, k)
+        # Unlike A6W6, the upstream A6W4 asm has no bias epilogue, so the add is a
+        # separate pass here. That is a real cost on the forward -- the epilogue is worth
+        # a measurable cost on A6W6 -- and the reason porting BIAS into the A6W4
+        # generator is tracked as the next step rather than skipped. Correctness is
+        # unaffected: adding in bf16 after the GEMM rounds twice where the epilogue rounds
+        # once, so the two differ by at most a last-bit step.
+        #
+        # Deliberately NOT `out.add_(bias)`, which looks strictly cheaper -- one allocation
+        # and one write of the whole [M, N] output saved -- and measures slower end to
+        # end. The in-place op is a fusion barrier: the functional add gets folded
+        # into the Inductor region that consumes this output, and the in-place one cannot
+        # be. The allocation is cheaper than the fusion it costs.
+        return out + bias
+
+
 _GEMM_FP6_BACKENDS = {
     BackendType.AITER: BackendEntry(GEMMFP6AITERBackend, autotune=False),
+}
+
+_GEMM_A6W4_BACKENDS = {
+    BackendType.AITER: BackendEntry(GEMMA6W4AITERBackend, autotune=False),
 }
 
 
@@ -147,6 +202,7 @@ def _validate_blobs(
     m: int,
     n: int,
     k: int,
+    weight_is_fp4: bool = False,
 ) -> None:
     """Reject malformed packed operands before they reach AITER.
 
@@ -174,13 +230,20 @@ def _validate_blobs(
 
     # a is the [M, K] operand and b the [N, K] one, in every direction: the backward
     # GEMMs permute which logical tensor plays which role but not this relationship.
+    #
+    # Under A6W4 only b changes format, so only b's expected size does. Getting this
+    # wrong is exactly the failure the whole function exists to catch -- an MXFP6-sized
+    # blob handed to gemm_a6w4 is 1.5x too long and would be read at the wrong stride
+    # with no error anywhere -- so the two formats are sized by their own helpers.
+    b_pack_sizes = mxfp4_gemm_pack_sizes if weight_is_fp4 else mxfp6_pack_sizes
+    fmt = "A6W4" if weight_is_fp4 else "MXFP6"
     for name, (operand, scale), (want_operand, want_scale) in (
         ("a", (a, a_scale), mxfp6_pack_sizes(m, k)),
-        ("b", (b, b_scale), mxfp6_pack_sizes(n, k)),
+        ("b", (b, b_scale), b_pack_sizes(n, k)),
     ):
         if operand.numel() != want_operand or scale.numel() != want_scale:
             raise ValueError(
-                f"MXFP6 GEMM operand {name} does not match M={m} N={n} K={k}: expected "
+                f"{fmt} GEMM operand {name} does not match M={m} N={n} K={k}: expected "
                 f"{want_operand} operand and {want_scale} scale bytes, got "
                 f"{operand.numel()} and {scale.numel()}."
             )
@@ -198,13 +261,17 @@ def gemm_fp6_impl(
     out_dtype: torch.dtype,
     granularity: int,
     bias: torch.Tensor | None = None,
+    weight_is_fp4: bool = False,
 ) -> torch.Tensor:
     granularity_enum = ScalingGranularity(granularity)
-    _validate_blobs(a, a_scale, b, b_scale, m, n, k)
+    _validate_blobs(a, a_scale, b, b_scale, m, n, k, weight_is_fp4)
     if bias is not None and (bias.dim() != 1 or bias.numel() != n):
         raise ValueError(f"MXFP6 GEMM bias must be a 1D tensor of length N={n}, got {tuple(bias.shape)}.")
     backend = _resolve_backend()
-    impl = _GEMM_FP6_BACKENDS[backend].impl
+    # One flag rather than a second op: the two differ only in which aiter entry point
+    # runs and how b is sized, and sharing the op keeps every caller's autograd, fake
+    # kernel and Dynamo behaviour identical between the formats.
+    impl = (_GEMM_A6W4_BACKENDS if weight_is_fp4 else _GEMM_FP6_BACKENDS)[backend].impl
 
     kwargs = dict(
         a=a,
@@ -241,9 +308,11 @@ def gemm_fp6_impl_meta(
     out_dtype: torch.dtype,
     granularity: int,
     bias: torch.Tensor | None = None,
+    weight_is_fp4: bool = False,
 ) -> torch.Tensor:
     # Pure arithmetic on purpose: this must not reach into AITER, whose kernel
-    # selection does lru_cached pandas lookups that SymInts would break.
+    # selection does lru_cached pandas lookups that SymInts would break. The output
+    # geometry does not depend on the weight format, so weight_is_fp4 is unused here.
     return torch.empty(m, n, dtype=out_dtype, device=a.device)
 
 
