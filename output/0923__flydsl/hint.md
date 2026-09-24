@@ -2728,3 +2728,33 @@ page mapping, and the actual runtime arguments of the round-18 process.
 3. `kernels.py:685` in Int64
 
 Leave the seven k_dq descriptors alone until they get their own round.
+
+## h34 — CLOSED: the bar does NOT read stale gradients. h32's open correctness question is resolved, negatively.
+
+h32 flagged that `beat/impl.py:66-69` allocates the dk/dv scratch with `torch.empty` and never
+zeroes it, while `_asm_bwd_kernargs.py:249-250` uses `torch.zeros` for the same layout, and
+that if `pssk` did not fully write every q-head slice the bar would be reading the previous
+call's gradients — a correctness defect nothing in the job would catch.
+
+**Measured, ~40 s of card time.** Fill the entire scratch (dk, dv, dq_acc) with NaN, call
+`beat.attn_bwd` once, count survivors:
+
+| shape | dk NaN | dv NaN | dq NaN | bitwise == un-poisoned call |
+|---|--:|--:|--:|---|
+| fast | 0 / 262,144 | 0 | 0 | dk yes, dv yes |
+| prod | 0 / 33,554,432 | 0 | 0 | dk yes, dv yes |
+
+**`pssk` writes every slice. The scratch never needs zeroing and the bar needs no adjustment.**
+716 TF/s / 7.67 ms stands as measured.
+
+`dq` is NOT bitwise identical between the two calls, and that is correct rather than alarming:
+it comes from 514 `buffer_atomic_add_f32` into `dq_acc`, whose accumulation order is not
+reproducible. This is precisely why aiter cannot pass a bitwise gate and why this job's
+determinism gate applies to our kernel only. It also independently confirms that
+`dq_acc.zero_()` (the `FillFunctor` dispatch in `profiling/beat/kernel.yaml`) really does run
+every call — the NaN we wrote into `dq_acc` never reaches the output.
+
+**Caveat, stated because the two earlier anchor measurements did have it:** this run's
+`rocm-smi --showpids` guard captured no PIDs at all, so unlike the fwd/bwd anchors I have no
+positive evidence the card was exclusively mine during it. The verdict does not depend on it
+(a NaN count is self-evidencing), but the exclusivity claim is not backed here. dmesg clean.
