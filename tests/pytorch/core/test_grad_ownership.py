@@ -40,7 +40,7 @@ def _clean_grad_ownership_state():
 
 
 def _slice_of(tensor: torch.Tensor):
-    return (tensor.data_ptr(), tensor.numel())
+    return (tensor.data_ptr(), tensor.numel(), tensor.dtype)
 
 
 class TestBeginStepRotation:
@@ -81,7 +81,7 @@ class TestBeginStepRotation:
 
         assert owned == frozenset({_slice_of(t2)})
 
-    def test_record_overwrite_keys_by_address_and_numel_not_object_identity(self):
+    def test_record_overwrite_keys_by_address_numel_dtype_not_object_identity(self):
         """Two different Python tensor objects describing the same underlying
         memory region and element count must count as the same slice -- this is
         what lets the consumer re-derive its own claim purely from buffer
@@ -96,6 +96,17 @@ class TestBeginStepRotation:
 
         assert _slice_of(rederived_view) in owned
 
+    def test_dtype_prevents_same_address_and_numel_from_colliding(self):
+        tensor = torch.empty(8, dtype=torch.float32)
+        typed_alias = tensor.view(torch.int32)
+        assert tensor.data_ptr() == typed_alias.data_ptr()
+        assert tensor.numel() == typed_alias.numel()
+
+        grad_ownership.record_overwrite(tensor)
+        owned = grad_ownership.begin_step()
+
+        assert _slice_of(typed_alias) not in owned
+
 
 class TestBeginStepSafetyNet:
     def test_raises_when_a_skipped_slice_was_never_rewritten(self):
@@ -103,7 +114,7 @@ class TestBeginStepSafetyNet:
         skipped zeroing) must actually receive one. If not, the reduced
         gradient for that slice is stale -- this is the mechanical detector
         for a wgrad producer that stopped running or fell back to beta=1."""
-        phantom_slice = (0x1000, 16)
+        phantom_slice = (0x1000, 16, torch.float32)
         grad_ownership.note_skipped([phantom_slice])
 
         with pytest.raises(RuntimeError, match="left unzeroed"):

@@ -6,6 +6,7 @@
 
 """CPU regression tests for beta=0 selection in actual backward order."""
 
+import pytest
 import torch
 
 from primus_turbo.pytorch.ops.utils import _setup_fused_grad_accum
@@ -48,14 +49,27 @@ def test_checkpoint_recompute_can_claim_after_original_forward_is_discarded():
     assert recomputed_forward.claim() is True
 
 
-def test_retained_graph_falls_back_to_beta1_after_framework_reset():
+def test_retained_graph_is_rejected_after_framework_reset():
     parameter = _parameter()
     retained_claim = _claim(parameter)
     assert retained_claim.claim() is True
 
     parameter.grad_added_to_main_grad = False
 
-    assert retained_claim.claim() is False
+    with pytest.raises(RuntimeError, match="stale write epoch"):
+        retained_claim.claim()
+
+
+def test_old_claim_is_rejected_after_new_epoch_forward():
+    parameter = _parameter()
+    old_claim = _claim(parameter)
+
+    parameter.grad_added_to_main_grad = False
+    new_claim = _claim(parameter)
+
+    with pytest.raises(RuntimeError, match="stale write epoch"):
+        old_claim.claim()
+    assert new_claim.claim() is True
 
 
 def test_beta1_only_tied_weight_producer_disables_overwrite_for_epoch():

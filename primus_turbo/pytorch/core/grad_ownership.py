@@ -22,7 +22,7 @@ A slice skipped for iteration N is justified by iteration N-1 having
 overwritten it, so :func:`begin_step` re-checks that prediction against what
 iteration N actually wrote and raises if a skipped slice went unwritten.
 
-Entries are ``(data_ptr, numel)`` rather than tensor or parameter references:
+Entries are ``(data_ptr, numel, dtype)`` rather than tensor or parameter references:
 the consumer re-derives the same pair from its own buffer offsets and only
 honours an exact match, so a stale or aliased entry cannot widen a claim, and
 nothing here keeps a tensor alive.
@@ -34,7 +34,7 @@ import torch
 
 __all__ = ["record_overwrite", "note_skipped", "begin_step", "was_enabled"]
 
-Slice = Tuple[int, int]
+Slice = Tuple[int, int, torch.dtype]
 
 _written: Set[Slice] = set()
 _skipped: Set[Slice] = set()
@@ -46,7 +46,7 @@ def record_overwrite(main_grad: torch.Tensor) -> None:
     """Log that ``main_grad`` was fully overwritten by a beta=0 wgrad epilogue."""
     global _ever_recorded
     _ever_recorded = True
-    _written.add((main_grad.data_ptr(), main_grad.numel()))
+    _written.add((main_grad.data_ptr(), main_grad.numel(), main_grad.dtype))
 
 
 def note_skipped(slices: Iterable[Slice]) -> None:

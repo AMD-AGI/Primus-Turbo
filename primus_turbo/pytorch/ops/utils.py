@@ -30,18 +30,22 @@ class _FusedGradWriteState:
 class _FusedGradOverwriteClaim:
     """Select the beta=0 writer when its backward actually executes."""
 
-    def __init__(self, parameter: torch.nn.Parameter):
+    def __init__(self, parameter: torch.nn.Parameter, state: _FusedGradWriteState):
         self.parameter = parameter
+        self.state = state
 
     def claim(self) -> bool:
         parameter = self.parameter
         state = getattr(parameter, _FUSED_GRAD_WRITE_STATE, None)
 
-        # A retained graph may be run again after Megatron starts a new step
-        # without executing another forward. It has no complete registration
-        # of the new epoch's possible producers, so conservatively accumulate.
-        if not bool(parameter.grad_added_to_main_grad) or not isinstance(state, _FusedGradWriteState):
-            return False
+        # A retained graph may be run again after Megatron starts a new step.
+        # Falling back to beta=1 is not safe when the framework skipped this
+        # slice's clear based on the previous epoch, so reject before writing.
+        if not bool(parameter.grad_added_to_main_grad) or state is not self.state:
+            raise RuntimeError(
+                "fused gradient overwrite claim belongs to a stale write epoch; "
+                "retained-graph backward across gradient-buffer resets is unsupported"
+            )
 
         if not state.overwrite_eligible or state.claimed:
             return False
@@ -118,7 +122,7 @@ def _setup_fused_grad_accum(
         if not supports_overwrite:
             state.overwrite_eligible = False
         else:
-            overwrite_claim = _FusedGradOverwriteClaim(b)
+            overwrite_claim = _FusedGradOverwriteClaim(b, state)
 
     # Preserve Megatron's existing fused-accumulation signal during forward.
     b.grad_added_to_main_grad = True
