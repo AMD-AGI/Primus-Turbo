@@ -2758,3 +2758,29 @@ every call — the NaN we wrote into `dq_acc` never reaches the output.
 `rocm-smi --showpids` guard captured no PIDs at all, so unlike the fwd/bwd anchors I have no
 positive evidence the card was exclusively mine during it. The verdict does not depend on it
 (a NaN count is self-evidencing), but the exclusivity claim is not backed here. dmesg clean.
+
+## h35 — Keep the shape names stable. Renaming them silently forks the champion ledger.
+
+Round 20 renamed the scored shapes in its `act.yaml` from `prod` / `proxy` / `fast` to
+`prod_b4_s8192_hq32_hkv8_d128` and friends. The framework keys `champions` by that string, so
+it created a NEW entry and left the old one in place:
+
+```
+champions:
+  fast: 17
+  proxy: 17
+  prod: 19                                  <- stale, still points at round 19
+  prod_b4_s8192_hq32_hkv8_d128: 20          <- the live one
+```
+
+Round 20's own verdict was unaffected, because it computed `vs_champion` against the champion
+**rebuilt in the same sweep** (501.41 TF/s) rather than against the ledger — which is the
+correct method and is why the +2.00% stands. But the ledger is now split: anything that reads
+`champions['prod']` gets round 19's figure, and anything that reads the long key gets round
+20's. That divergence compounds silently with every further rename.
+
+**Rule: use exactly `fast`, `proxy`, `prod` in `act.yaml`.** The descriptive form belongs in a
+comment. The cosmetic gain is not worth forking the ledger.
+
+This is framework behaviour (`wenxie-amd/op-evolve`), not ours, so it is not being patched
+here — it is a constraint on what rounds write.
