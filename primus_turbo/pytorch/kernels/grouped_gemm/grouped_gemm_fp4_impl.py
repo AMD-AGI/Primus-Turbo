@@ -339,7 +339,7 @@ class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
     ) -> bool:
         supported = True
         if inplace_add_to_out:
-            supported &= out is not None and out.dtype == out_dtype
+            supported &= out is not None and out.dtype == out_dtype and out.is_contiguous()
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= granularity in GroupedGEMMFP4VariableKFlyDSLBackend.SUPPORTED_GRANULARITIES
         supported &= a.dtype == float4_e2m1fn_x2 and b.dtype == float4_e2m1fn_x2
@@ -453,6 +453,7 @@ class GroupedGEMMFP4VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDisp
             inplace_add_to_out,
             overwrite_out,
             out.dtype if out is not None else None,
+            out.is_contiguous() if out is not None else None,
         )
 
 
