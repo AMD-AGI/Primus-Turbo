@@ -162,6 +162,31 @@ class TestBeginStepSafetyNet:
             grad_ownership.begin_step()
 
 
+class TestPreCollectiveValidation:
+    def test_raises_before_collective_for_relevant_unwritten_slice(self):
+        stale = (0x1000, 16, torch.float32)
+        unrelated = (0x2000, 8, torch.bfloat16)
+        grad_ownership.note_skipped([stale, unrelated])
+
+        with pytest.raises(RuntimeError, match="left unzeroed"):
+            grad_ownership.validate_overwritten([stale])
+
+    def test_ignores_unwritten_slice_from_a_different_bucket_group(self):
+        current = torch.empty(8)
+        later = (0x2000, 8, torch.float32)
+        grad_ownership.note_skipped([_slice_of(current), later])
+        grad_ownership.record_overwrite(current)
+
+        grad_ownership.validate_overwritten([_slice_of(current)])
+
+    def test_accepts_relevant_slice_after_current_iteration_overwrite(self):
+        current = torch.empty(8)
+        grad_ownership.note_skipped([_slice_of(current)])
+        grad_ownership.record_overwrite(current)
+
+        grad_ownership.validate_overwritten([_slice_of(current)])
+
+
 class TestWasEnabled:
     def test_false_until_the_first_overwrite_ever_recorded(self):
         assert grad_ownership.was_enabled() is False

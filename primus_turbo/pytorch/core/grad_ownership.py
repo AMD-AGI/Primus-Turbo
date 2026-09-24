@@ -32,7 +32,13 @@ from typing import FrozenSet, Iterable, Set, Tuple
 
 import torch
 
-__all__ = ["record_overwrite", "note_skipped", "begin_step", "was_enabled"]
+__all__ = [
+    "record_overwrite",
+    "note_skipped",
+    "validate_overwritten",
+    "begin_step",
+    "was_enabled",
+]
 
 Slice = Tuple[int, int, torch.dtype]
 
@@ -54,6 +60,24 @@ def note_skipped(slices: Iterable[Slice]) -> None:
     _skipped.update(slices)
 
 
+def _raise_if_unwritten(unwritten: Set[Slice]) -> None:
+    if not unwritten:
+        return
+    preview = sorted(unwritten, key=lambda entry: (entry[0], entry[1], str(entry[2])))[:4]
+    raise RuntimeError(
+        f"{len(unwritten)} gradient-buffer slice(s) were left unzeroed on the "
+        "prediction that a beta=0 wgrad would overwrite them, but no overwrite "
+        f"arrived: {preview}. The reduced gradient for those slices is stale. "
+        "This means a wgrad producer stopped running or fell back to beta=1 mid-run."
+    )
+
+
+def validate_overwritten(slices: Iterable[Slice]) -> None:
+    """Fail before communication if any relevant skipped slice is still stale."""
+    relevant = _skipped.intersection(slices)
+    _raise_if_unwritten(relevant - _written)
+
+
 def begin_step() -> FrozenSet[Slice]:
     """Rotate the log at the top of an iteration and return the previous one.
 
@@ -64,16 +88,7 @@ def begin_step() -> FrozenSet[Slice]:
     neither takes any beta=0 write.
     """
     global _written, _skipped, _previous
-    unwritten = _skipped - _written
-    if unwritten:
-        preview = sorted(unwritten, key=lambda entry: (entry[0], entry[1], str(entry[2])))[:4]
-        raise RuntimeError(
-            f"{len(unwritten)} gradient-buffer slice(s) were left unzeroed on the "
-            "prediction that a beta=0 wgrad would overwrite them, but no overwrite "
-            f"arrived: {preview}. The reduced gradient for those "
-            "slices is stale. This means a wgrad producer stopped running or fell "
-            "back to beta=1 mid-run."
-        )
+    _raise_if_unwritten(_skipped - _written)
     _previous = frozenset(_written)
     _written = set()
     _skipped = set()
