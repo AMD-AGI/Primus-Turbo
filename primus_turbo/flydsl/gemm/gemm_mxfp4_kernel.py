@@ -38,6 +38,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     make_fp8_rebased_tensor_and_srd,
     make_row_band_resource,
     resolve_accum_out,
+    run_compiled,
     umax,
     umin,
     xcd_remap_pid_u,
@@ -512,6 +513,18 @@ _MXFP4_MID_SYNC = 0
 
 # Phase traversal as (A rows, N columns) per block; a fragment refills at its last consumer.
 _MXFP4_MBLK = (4, 8)
+
+# Parity-split LDS staging for a fp4 row pitch of 64 (mod 128), where every odd row starts
+# mid-line: the skewed rows get their own g2s stream and a deeper ring (see `_ROWSPLIT`).
+# OFF -- the skewed stream races. It lands a wrong 128-wide k-slab in row groups the width of
+# one g2s instruction, always at odd rows and a different set on every call, which shows up as a
+# large SNR drop against fp32 on the dequantised operands. It needs a grid of thousands of tiles
+# to show, and the first call after compile is clean, which is the one an SNR sample sees.
+# Not a missing drain: full vmcnt(0)+lgkmcnt(0) at every phase barrier, a vm drain at tile
+# exit, a 2-slot ring and one tile per workgroup all still corrupt. The aligned-pitch path
+# this falls back to is bit-exact with padding the pitch to 1536 B, which is where a correct
+# fast path for these shapes should come from.
+_MXFP4_ROWSPLIT = False
 
 
 class MfmaScaleFp4:
@@ -2067,7 +2080,7 @@ def _build_mxfp4_gemm_kernel(
     _ROWS_PER_STEP = 64 // (BPR // 16) * (256 // 64)  # n_waves = 256//64 = 4
     N_LDS_STEPS_A = BLOCK_M // _ROWS_PER_STEP
     N_LDS_STEPS_BH = LDS_BN_HALF // _ROWS_PER_STEP
-    _ROWSPLIT = (K2 % 128 == 64) and not coop
+    _ROWSPLIT = _MXFP4_ROWSPLIT and (K2 % 128 == 64) and not coop
     _SK = 64 if _ROWSPLIT else 0
     _NOBUF = 3 if _ROWSPLIT else 2
     _A_SLOT = (BLOCK_M // 2) * LDS_ROW_STRIDE
@@ -2839,23 +2852,48 @@ def _mxfp4_nt_config(M, N, K):
     return group_m, group_n, num_xcds
 
 
+_MXFP4_L2_PER_XCD = 4 << 20  # bytes of L2 one XCD sees
+
+
+def _mxfp4_l2_band(N, K):
+    """Widest power-of-two N band whose fp4 B slice still fits one XCD's L2, so the band stays
+    resident while its workgroups sweep M. Returns 0 (no banding) once a single N tile already
+    fills L2, because a band that cannot hold two tiles buys no residency."""
+    per_tile = 256 * ((K + 1) // 2)  # fp4 B bytes behind one N tile
+    band = min(_MXFP4_L2_PER_XCD // max(per_tile, 1), max(N // 256, 1))
+    return (1 << (band.bit_length() - 1)) if band >= 2 else 0
+
+
 def _mxfp4_swizzle_candidates(M, N, K):
-    """<=3 L2-swizzle configs for the timed autotune: the production heuristic pick plus up
-    to two group_n neighbors (group_n is the dominant L2-residency axis). Keeping the
-    heuristic pick in the set means autotune never regresses below it; the swizzle is a pure
-    WG->tile bijection (correctness-invariant), so trimming the sweep only trades coverage."""
+    """L2-swizzle configs for the timed autotune, heuristic pick first (so autotune never
+    regresses below it) and the speculative ones last; the caller charges the tail a margin.
+    The swizzle is a pure WG->tile bijection (correctness-invariant), so widening the sweep
+    only costs compile time.
+
+    Free tail (historical set): two group_n neighbors, the dominant L2-residency axis.
+    Charged tail: the L2-sized band, which the heuristic only reaches for wide-N or big-K
+    shapes, and -- where the heuristic left the physical XCD count -- a narrower interleave.
+    """
     gm, gn, xcd = _mxfp4_nt_config(M, N, K)
+    nb = max(N // 256, 1)
     cands = [(gm, gn, xcd)]
+    charged = []
+
+    def _add(dst, c):
+        if c not in cands and c not in charged and 0 <= c[1] <= nb:
+            dst.append(c)
+
     for gn2 in (0, gn * 2 if gn else 4):
-        c = (gm, gn2, xcd)
-        if c not in cands:
-            cands.append(c)
-    return cands[:3]
+        _add(cands, (gm, gn2, xcd))
+    _add(charged, (gm, _mxfp4_l2_band(N, K), xcd))
+    if xcd != 8:
+        _add(charged, (gm, gn, 2))
+    return cands + charged, len(cands)
 
 
 def _autotune_mxfp4_config(M, N, K, args, out_fp16=False, k_real=None, row_bytes=None, prepacked=False):
     """Pick (group_m, group_n, num_xcds) for this (M, N, K, out dtype) by a quick timed
-    sweep over ``_mxfp4_swizzle_candidates`` (<=3) on the real operands; cached per shape
+    sweep over ``_mxfp4_swizzle_candidates`` on the real operands; cached per shape
     and store dtype.
 
     The swizzle only remaps which workgroup computes which output tile, so every
@@ -2881,9 +2919,11 @@ def _autotune_mxfp4_config(M, N, K, args, out_fp16=False, k_real=None, row_bytes
 
     _try_deepwl = K >= 8192
     _wl_opts = ((10, 9), (16, 15)) if _try_deepwl else ((10, 9),)
+    _swz, _n_free = _mxfp4_swizzle_candidates(M, N, K)
+    _free_swz = set(_swz[:_n_free])
     compiled_cands = []
     for _wlv, _elgk in _wl_opts:
-        for gm, gn, xcd in _mxfp4_swizzle_candidates(M, N, K):
+        for gm, gn, xcd in _swz:
             try:
                 at_key = (
                     M,
@@ -2943,9 +2983,15 @@ def _autotune_mxfp4_config(M, N, K, args, out_fp16=False, k_real=None, row_bytes
             torch.cuda.synchronize()
             cand_t[cfg] = min(cand_t[cfg], e0.elapsed_time(e1))
     _WL_MARGIN = 1.02
+    # Smaller than the whole-loop margin on purpose: the candidate *ordering* is stable well
+    # inside this band even while the absolute times drift, so it is what the timing can
+    # actually resolve between two swizzles.
+    _SWZ_MARGIN = 1.005
     best, best_t = None, float("inf")
     for cfg, t in cand_t.items():
         _teff = t * _WL_MARGIN if cfg[3:5] != (10, 9) else t
+        if cfg[:3] not in _free_swz:  # speculative swizzle: must win by more than the noise
+            _teff *= _SWZ_MARGIN
         if _teff < best_t:
             best_t, best = _teff, cfg
     if best is None:
@@ -3675,11 +3721,42 @@ def _get_mxfp4_fused_launch(
 _MXFP4_SCALE_WS: dict = {}  # (M, N, K, device) -> (a_sp, b_sp) packed int32 workspace
 
 
+# Byte-gather selectors for the 4x4 transpose below. v_perm_b32's pool is
+# {src0 bytes -> selectors 4..7, src1 bytes -> selectors 0..3} and selector byte i
+# names the source of result byte i, so each constant is read low byte first.
+_PERM_ZIP_LO = 0x05010400  # (hi, lo) -> {hi.b1, lo.b1, hi.b0, lo.b0}
+_PERM_ZIP_HI = 0x07030602  # (hi, lo) -> {hi.b3, lo.b3, hi.b2, lo.b2}
+_PERM_MRG_LO = 0x05040100  # (hi, lo) -> {hi.b1, hi.b0, lo.b1, lo.b0}
+_PERM_MRG_HI = 0x07060302  # (hi, lo) -> {hi.b3, hi.b2, lo.b3, lo.b2}
+
+
 def _mxfp4_pack_cell(dws, n_sub, nd, ng):
     """Byte-transpose one preshuffle cell so each output dword gathers byte g across
     source rows. Returns ng lists of nd dwords, each contiguous in the packed layout
-    so it stores as one vector."""
+    so it stores as one vector.
+
+    For the deployed 4x4 cell the transpose is pure byte movement, so it rides
+    ``v_perm_b32``: two rounds of byte-interleave turn 4 source dwords into all 4
+    outputs in 8 instructions, where the shift/mask/or form needs ~40. Same bytes
+    in the same output positions, so the packed cell is bit-identical."""
     I32 = fx.Int32
+    if nd == 4 and ng == 4:  # trace-time Python branch on the launch geometry
+
+        def _perm(hi, lo, sel):
+            return I32(rocdl.perm_b32(hi, lo, I32(sel)))
+
+        out = [[None] * nd for _g in range_constexpr(ng)]
+        for last in range_constexpr(nd):
+            s = [dws[(last // n_sub) * nd + t][last % n_sub] for t in range_constexpr(nd)]
+            z0 = _perm(s[1], s[0], _PERM_ZIP_LO)
+            z1 = _perm(s[1], s[0], _PERM_ZIP_HI)
+            z2 = _perm(s[3], s[2], _PERM_ZIP_LO)
+            z3 = _perm(s[3], s[2], _PERM_ZIP_HI)
+            out[0][last] = _perm(z2, z0, _PERM_MRG_LO)
+            out[1][last] = _perm(z2, z0, _PERM_MRG_HI)
+            out[2][last] = _perm(z3, z1, _PERM_MRG_LO)
+            out[3][last] = _perm(z3, z1, _PERM_MRG_HI)
+        return out
     out = []
     for g in range_constexpr(ng):
         sh = I32(g * 8)
@@ -4276,6 +4353,7 @@ def gemm_mxfp4_flydsl_kernel(
 
 
 _MXFP4_PRESHUF_LAUNCH_CACHE: dict = {}
+_MXFP4_PRESHUF_COMPILED: dict = {}
 
 
 def _get_mxfp4_preshuffle_launch(*, b_ilv, sc_row, src_unit, k128):
@@ -4369,7 +4447,14 @@ def preshuffle_mxfp4_scales(
     )
     a_sp = torch.empty((M + 255) // 256 * 256 * k128, dtype=torch.int32, device=a_scale.device)
     b_sp = torch.empty((N + 255) // 256 * 256 * k128, dtype=torch.int32, device=b_scale.device)
-    launch(
+    # This kernel repacks a few MB of scale bytes, so calling the launch directly makes the call
+    # all dispatch -- its host time swamps the work, and the GEMM it feeds. Go through the
+    # compiled object (see ``run_compiled``). The launch derives its grid and its qm/qn from
+    # c_m/c_n, so those two are baked into the artifact and join the launch cache's own key.
+    run_compiled(
+        _MXFP4_PRESHUF_COMPILED,
+        (ilv, sc_row, k128, M, N),
+        launch,
         a_scale.view(torch.int8),
         a_sp,
         b_scale.view(torch.int8),
