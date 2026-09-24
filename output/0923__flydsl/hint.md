@@ -2070,3 +2070,94 @@ rounds, so nothing looked broken. The failure was in a channel nobody had checke
 surfaced only because a stage produced a number that contradicted something already
 measured. **When enabling a new code path, verify that the accumulated context reaches it —
 not just that it runs.**
+
+---
+
+## h28 — the 7/5 gap IS the recompute. Measured three ways. And the gate already allows the fix.
+
+Round 17's regime change (prod is **compute**-bound, the gap is **1.408× work / 1.020×
+scheduling**) sent four independent read-only investigations at the structure. Result:
+
+### The seven, counted from our own source
+
+| kernel | WMMA per loop body | GEMMs |
+|---|--:|---|
+| `k_dkdv` | **64** | S=K·Qᵀ (`:401`), dP=V·dOᵀ (`:404`), dV+=Pᵀ·dO (`:464`), dK+=dSᵀ·Q (`:467`) |
+| `k_dq` | **96** | S=K·Qᵀ (`:767`), dP=V·dOᵀ (`:770`), dQ+=dS·K (`:812`) |
+| `k_delta` | **0** | — |
+
+**The two extra GEMMs are `k_dq`'s S and dP** — straight recomputes of `k_dkdv`'s. They
+exist because dS = P∘(dP−δ)·scale is an O(Sq×Skv) intermediate and the only things that
+cross between the kernels are `lse` and `delta`, both O(Sq).
+
+**Refuted along the way:** "P is recomputed" — P is elementwise `exp2` (`:419`, `:784`),
+**zero matrix work**. What gets recomputed is **dP**. And "zero tile-padding waste" needs
+qualifying: the shape divides evenly, but **diagonal half-masked blocks are computed whole**,
+which is the 0.55%.
+
+### 5 GEMMs is now MEASURED, not inferred
+
+The bar's `.co` disassembles (h18 retracted this claim as unverifiable; **h18 was wrong**):
+**80 WMMA per unrolled stage = exactly 5 GEMMs** at 32q×32kv×D128, against **112** in our
+source over the same footprint. **112/80 = 1.400.**
+
+So the structural gap has now been derived **three independent ways** — from our source
+(1.40764 = 1.400 × 1.00546), from round 17's counters (1.408), and from the bar's ISA
+(1.400). They agree. **The gap is the recompute and essentially nothing else.**
+
+*(Correction to our own bookkeeping: `issued` is **7.7395e12**, not 7.745e12, and the ratio
+is **1.40764**, not 1.4087. Earlier text calling 1.4080 "exactly 7/5" is self-contradictory
+— 7/5 is 1.400, and the remainder is the diagonal-block granularity.)*
+
+### How the bar does it, from the ISA
+
+One dispatch, three kernels, **only one containing matrix work**, and its kernargs carry
+`ptr_dq`, `ptr_dk` **and** `ptr_dv` together — **dK/dV and dQ are fused**. That is the whole
+answer.
+
+It does **not** reconcile the two loop orders. **It abolishes the dQ loop**: dQ is flushed
+every q-iteration as 32 `buffer_atomic_add_f32` per lane into an fp32 global accumulator
+(514 total), converted to bf16 by a separate kernel. Workgroups own a 128-row KV block and
+sweep all Q, so dK/dV never collide while **every** dQ row is touched by every workgroup —
+that is the mechanism that forces atomics.
+
+Its matrix density is **not** better than ours (320/2753 = 11.6% against our `k_dq`'s
+96/782 = 12.3%). **It wins purely on doing 1.400× less.**
+
+### ⚠ The determinism gate does not forbid this — and the spec contradicts the shipped code
+
+- `history/v000_original.yaml:94-97` (the operator's own words) asks only that **every
+  output element is written exactly once**, and calls the 200-run comparison a *cheap
+  observation of that property*.
+- `_final.yaml:135-138` added "a round that introduces split-k or atomic reduction fails
+  even if it is faster."
+- **`validation.py:179-204` implements only the first.** And at the `fast` shape where the
+  gate runs, `impl.py:147-149` derives **`nsp=16`** — so **the 200-run check has been
+  passing the `k_dkdv_sp` split-K + `k_redsp` fixed-order reduction every single round.**
+
+**The prose forbids what the code has been doing and passing all along.** The gate forbids
+**non-determinism**, not atomics or split-K as categories; a fixed-order reduction is
+bitwise reproducible. `k_redsp`'s machinery already exists and already clears the gate.
+
+Also: what caught the real defect (dQ silently at 8–14 dB) was **the sweep over
+(q_split, BLOCK_KV)**, not the number 200 — `route.md:1038-1040` says so.
+
+### What is NOT settled, and must be before a round is spent
+
+Two of the four investigations **disagree by ~8× on the load-bearing number**:
+
+- one priced the q-outer fused form at **≥64 reduction slots → 34.3 GB → 7.8 ms → net −4.6 ms**,
+  concluding DO-NOT;
+- the other found the slot count **collapses to `nsp`, not tile count**, with the reduction
+  target falling 536.9 MB → **268.4 MB** under GQA (hkv=8 vs hq=32), giving
+  **0.245–0.978 ms at nsp=2..8**.
+
+**Settle that before building.** And note `h9` and `h16` already differ by ~2× on the byte
+count for the same deterministic split-K — the same unresolved arithmetic, twice.
+
+**Direction, stated plainly:** the backward's remaining prod gap is the recompute; closing
+it means fusing; fusing is feasible (registers close near 868 VGPR because dQ is a
+per-iteration transient rather than a carried accumulator, LDS needs zero new bytes in the
+single-wave shape, and FlyDSL has atomics, multi-wave workgroups and barriers); and the
+gate permits a deterministic form. **The open question is geometry and its byte cost, not
+permission.**
