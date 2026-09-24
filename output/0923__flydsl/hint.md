@@ -2784,3 +2784,42 @@ comment. The cosmetic gain is not worth forking the ledger.
 
 This is framework behaviour (`wenxie-amd/op-evolve`), not ours, so it is not being patched
 here — it is a constraint on what rounds write.
+
+## h36 — Before building g63: k_dq's VGPR baseline is already 960 of 1024. The same prefetch edit that worked on k_dkdv cannot fit.
+
+Round 20's handoff proposes `r21.i1.g63` — apply g62's prefetch deepening (depth 1 -> 2) to
+`k_dq`, which is ~37% of prod time — and notes "a 960-VGPR spill gate that may well kill it".
+**That gate is not a risk, it is arithmetic, and the number is already measured** (h30, four
+COMPILE_ONLY builds, `21_final_isa.s`):
+
+| kernel | `.vgpr_count` | `.vgpr_spill_count` |
+|---|--:|--:|
+| `k_dq` **(shipped, before any edit)** | **960** | 0 |
+| `k_dkdv` before g62 | 724 | 0 |
+| `k_dkdv` after g62 | 912 | 0 |
+
+g62 cost **+188 VGPR** on `k_dkdv` (724 -> 912) and fit because `k_dkdv` had 300 to spare.
+`k_dq` has **64**. `960 + 188 = 1148 > 1024`.
+
+**So do not spend an arm slot discovering this on the card.** The probe is free and the harness
+already exists:
+
+```
+rounds/002/_scratch/screen.py --impl <dir> --dump-dir <d> --workdir <w> --json <j>
+# under COMPILE_ONLY=1 ARCH=gfx1250 FLYDSL_GPU_ARCH=gfx1250, ~4 min per build on CPU
+```
+
+Build g63 COMPILE_ONLY first and read `.vgpr_spill_count` out of `k_dq_0/21_final_isa.s`.
+If it spills — which the arithmetic says it will unless the allocator finds ~124 VGPR of
+savings elsewhere — g63 is dead before it costs card time, and the arm slot goes to
+`r21.i2.g64` or to a variant that pays for the prefetch by shortening something else first.
+
+**A cheaper variant that the arithmetic does permit:** deepen the prefetch for only PART of
+the tuple. g62's +188 is the full Q/dO pair; half of it is +94, which still exceeds 64 but by
+much less, and `k_dq`'s body has ZERO modelled stall (round 18's attribution) and 54.3% matrix
+busy — so the mechanism g62 exploits may not even be present in `k_dq`. **Check whether k_dq
+has a load-to-use problem at all before paying 188 registers to cover one.**
+
+Related, from h30: `k_dq` at BLOCK_Q=128 spills 1068 B and at 256 spills 4903 B. Its register
+budget is the tightest constraint in this kernel pair and every proposal touching `k_dq`
+should state its VGPR delta before it is built.
