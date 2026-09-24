@@ -1937,3 +1937,58 @@ the container already provides.**
 Also: **`runtime.env` does not exist in op-evolve.** The docker runner wraps commands with
 no `-e`, and `load_spec` silently drops unknown keys. Adding `runtime.env:` to a job spec is
 a silent no-op — the exact failure class this campaign keeps losing days to.
+
+---
+
+## h26 — static ISA metrics have now anti-correlated TWICE. Stop ranking with them. (round 16)
+
+Round 16 measured three arms of the same family. The transferable result is not the one
+that shipped:
+
+| arm | what it did | prod | note |
+|---|---|--:|---|
+| `g48` | — | never built | killed at a **zero-card-time ISA gate** written into route.md *before* the build |
+| `g49` | one global fence (`mask=0`) | **−16.25%** | **every static metric improved** |
+| `g51` | the same fence, **only where needed** | **+0.66%** | shipped |
+
+**Two things to carry forward.**
+
+### 1. A static win measured as a loss, for the second time in this job
+
+`g49`'s issue slots went 678 → 640 and its `s_wait_loadcnt 0x0` full drains went 2 → 1.
+Both are the metrics this campaign has been using to pre-rank candidates. It then lost
+**16.25% at prod, 18.4% at proxy, 6.1% at fast** — same sign on all three shapes, far
+outside any noise floor.
+
+Round 15 had already produced the same inversion. **That is twice.** Combined with h16's
+record that the static models on this job run ~1.7x off, the honest position is:
+
+> **Static ISA readings on this kernel do not order candidates.** They are useful as
+> *gates* — "this build spills", "this wait became a full drain", "this VGPR count crosses
+> an occupancy rung" — because those are facts about the build. They are NOT useful as a
+> *predictor of time*. Never reject a candidate because its static numbers look worse, and
+> never ship one because they look better. **Pricing must go on card.**
+
+### 2. The same instruction in two positions is worth 17 points
+
+`g49` and `g51` place the *same* fence. `g49` puts it globally with `mask=0`, which pins
+the 32 prefetch loads above it and **forbids the scheduler from interleaving them with the
+body at all**. `g51` puts it only at the one site that needs the ordering. Same mechanism,
+opposite sign, a 17-point spread.
+
+So when a scheduling primitive loses, **the mechanism is not necessarily refuted — its
+placement may be.** Before writing a family into `dead_ends.md`, ask whether the arm
+tested the mechanism or tested one placement of it. `g49` alone would have closed a family
+that `g51` then won in.
+
+### 3. The zero-card-time gate worked, and it should be the default
+
+`g48` was never built. A gate was written into `route.md` and `pool.md` **before** the
+build, in terms of the ISA: the wait consuming the b32 must stay a PARTIAL wait, and the
+attributed body stall must drop. The build failed both (`0x22` → `0x0`, a full drain;
+stall 777 → 1481). It cost nothing and it was right — `g48` is the family of the already-dead
+`r10.i1.g27` (−14.6%).
+
+Note the consistency with (1): the gate is a **fact about the build** (did this wait stay
+partial?), not a **prediction of time**. That is exactly the line where static analysis
+still pays.
