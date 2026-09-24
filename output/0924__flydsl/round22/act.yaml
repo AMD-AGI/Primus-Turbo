@@ -1,0 +1,185 @@
+round: 22
+mode: fast
+candidate: r22.i2.g68
+outcome: delivered
+
+correctness:
+  unit_tests: pass
+  precision: pass
+  checked_with: op/validation.py
+  sqnr_db: 52.30
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/020/op, rounds/019/op, rounds/017/op]
+  shapes:
+    - name: prod
+      this_round_tflops: 361.73
+      best_round_tflops: 516.87
+      beat_tflops: 719.14
+      target_tflops: 719.14
+      champion_round: 20
+      champion_tflops: 516.87
+      champion_rebuilt: true
+      ratio: 0.5030
+      vs_champion: 0.6998
+    - name: proxy
+      this_round_tflops: 327.77
+      best_round_tflops: 443.73
+      beat_tflops: 584.05
+      target_tflops: 584.05
+      champion_round: 19
+      champion_tflops: 443.73
+      champion_rebuilt: true
+      ratio: 0.5612
+      vs_champion: 0.7387
+    - name: fast
+      this_round_tflops: 51.22
+      best_round_tflops: 55.32
+      beat_tflops: 52.04
+      target_tflops: 52.04
+      champion_round: 19
+      champion_tflops: 55.32
+      champion_rebuilt: true
+      ratio: 0.9842
+      vs_champion: 0.9259
+  score: 0.6828
+
+validation:
+  exit_code: 2
+
+explored:
+  ran:
+    - "rocprofv3 --stats on op/benchmark.py -- the default survey. Reproduced the standing dispatch picture (k_dkdv and k_dq carry the op, nothing else material). It changed no decision this round and is reported as such."
+    - "offline static screen (COMPILE_ONLY=1 ARCH=gfx1250 FLYDSL_GPU_ARCH=gfx1250, 21_final_isa.s) on cur_a / A68 / B67 / P70"
+    - "r22.i0.a -- per-kernel ISA census: k_dkdv 160 buffer_load_b128 / 80 ds_store_b128 / 80 ds_load_tr16 / 128 wmma / 52 v_nop; k_dq 160 / 32 / 32 / 192 / 41. This is what established that k_dq carries a real K/V staging round trip and k_dkdv's Q/dO do not -- the whole basis of r23.i1.g69."
+    - "r22.i0.b -- 1 Hz power/clock/temp trace across the scored block, then a dedicated 0.5 Hz 60-point trace across one cur_a prod benchmark. NEW to this job. Negative result, and it changed a decision: it removed 'the card was throttling' as an explanation and retired the power-bound hypothesis as untestable here."
+    - "r22.i0.c -- census of the installed FlyDSL rocdl surface (tdm_ops.py, cluster.py). It changed a decision: it killed the register-destination cluster-load idea outright before any code was written, and it is what turned r23.i1.g69 from a build into a one-file reading task."
+    - "on-card A/B with two physically-rebuilt incumbent slots for the same-session noise floor, palindromic order, 51-iteration median, one process per shape, sclk witness, rocm-smi idle witness before and after"
+    - "same-session champion re-measure of rounds/{017,019,020}/op beside rounds/022/op, after rm -rf /root/.flydsl and a full __pycache__ purge"
+  consulted:
+    - INDEX.md
+    - optimization/routes/1-metrics-to-techniques.md
+    - optimization/techniques/3-pipelining-and-scheduling.md
+    - optimization/techniques/4-tdm-and-cluster-multicast.md
+    - optimization/techniques/5-wmma-fragment-shapes.md
+    - pitfalls/wmma-raw-hazards-and-vnop.md
+    - pitfalls/sched-barrier-mask-semantics.md
+    - pitfalls/gfx1250-split-wait-counters.md
+    - pitfalls/power-and-clock-limits.md
+    - backends/flydsl/attention/facts.md
+    - backends/flydsl/attention/dead-ends.md
+    - backends/flydsl/attention/recipes/bwd_gqa_d128_bf16.md
+    - backends/aiter/attention/recipes/fmha_v3_bwd_hd128_bf16.md
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+    - backends/hipkittens/gemm/recipes/bf16_ladder.md
+  bound: latency
+  confidence: medium
+  why: >
+    Three independent reorder-only results this round, all negative, none of which can
+    happen on a bandwidth-bound body. r22.i2.g68 changed ONLY the issue position of 32
+    buffer_load_b128 in k_dkdv -- identical byte traffic, WMMA count 64, LDS op count 40+40,
+    VGPR and spill 0 all unchanged -- and cost 30.0% of prod. The throwaway probe P70 deleted
+    k_dq's prefetch entirely, which changes no HBM byte at all and only removes latency
+    hiding, and cost 10.86%. And r22.i1.g67's fence made the clump wider rather than
+    narrower, growing the body by 74 instructions with five new mid-body partial waits.
+    The unifying quantity is worst-case load-to-use cover distance to the next full
+    s_wait_loadcnt 0x0: k_dkdv incumbent ~603 instructions, g68 ~41. That model predicted
+    g68's sign and rough magnitude BEFORE the card and was confirmed.
+    This round also eliminated power as the bound rather than assuming it away: a 60-point
+    trace across a full prod run moves the package-power reading by under 0.5% (855.0 W idle
+    vs 853 W median under load -- the sensor is static and the question is untestable on this
+    box), and sclk is flat at 1100 MHz for 60/60 samples under sustained load, so there is no
+    clock droop to blame.
+    Confidence stays medium rather than high because gfx1250 exposes no byte-reporting and no
+    stall-reason counter at any level, so every positive statement here is inferred from
+    controlled A/B deltas and disassembly rather than read off an instrument; and because the
+    one mechanism that ever moved this operator in a positive direction (g62, +1.65%) has now
+    been repriced onto the measured null-control floor of 1.57%.
+
+arms:
+  - id: r22.i2.g68
+    built: "A alone, from op/current -- sched_group_barrier(VMEM,1)/(MFMA,2) x32 in k_dkdv._body, spreading the 32 prefetch loads across the body without deepening"
+    tflops: {prod: 361.73, proxy: 327.77, fast: 51.22}
+    vs_champion: 0.6998
+    shipped: true
+    note: >
+      The round's load-bearing result, and a falsification rather than a loss. Round 21
+      recorded that k_dkdv and k_dq have OPPOSITE SIGNS on the prefetch-spread lever, with
+      body shape as the discriminant. g68 is that model's own prediction applied to the
+      kernel it says should gain, and it lost 30.0%. Spreading the load clump loses on BOTH
+      kernels; there is no sign flip. Every offline gate passed (verdict pass, spill 0,
+      VGPR unchanged, 52+ dB) and it still lost by 75x the same-session floor.
+      The cover model written down before the card called it: last prefetch load moves from
+      idx 188 to idx 789 while the full drain sits at idx 25 of the next iteration, cutting
+      cover from ~603 instructions to ~41.
+  - id: r22.i1.g67
+    built: "B alone -- form 1 (rocdl.sched_barrier(0) fence pair around k_dq's _ldkv group) built and offline-screened only, killed before any card time; form 2 measured on card as the throwaway probe P70"
+    tflops: {prod: 461.05, proxy: 383.56, fast: 50.66}
+    vs_champion: 0.8918
+    shipped: false
+    note: >
+      Both halves died, one free and one cheap. Form 1's declared gate required the
+      buffer_load_b128 idx span to come out NARROWER than the incumbent's 51-100. Measured:
+      29-92, i.e. 63 wide against 49 -- WIDER -- with the body growing 742 to 816, five new
+      mid-body partial s_wait_loadcnt at 11-27% depth, and v_nop 28 to 49. That is g66's
+      failure signature exactly, so it was not taken to the card.
+      The general finding outlives the arm: sched_barrier(0) is a scheduling BOUNDARY, not a
+      clamp. Fencing around a group hands the scheduler two smaller regions and it fills them
+      by pulling loads earlier. Asking this backend to tighten a clump with barriers reliably
+      loosens it.
+      Form 2 is the subtractive probe pool.md demanded be run first: deleting k_dq's prefetch
+      entirely (depth 1 -> 0) costs 10.86% prod / 12.59% proxy. The best any SHORTENING could
+      achieve is removal, and removal is negative, so the direction has no headroom. The
+      tflops figures on this entry are P70's, measured in the scored session.
+  - id: "merge r22.i1.g67 + r22.i2.g68"
+    built: "NOT BUILT -- the merge rule requires that neither arm lost, and both lost"
+    tflops: {}
+    vs_champion: null
+    shipped: false
+
+expected: >
+  Written before building, for r22.i2.g68: I expect A68 to LOSE, and to lose large.
+  Round 21's model says k_dkdv should have the opposite sign to k_dq on this lever and
+  therefore gain, but reading the two disassemblies together gives a different and simpler
+  variable: worst-case load-to-use cover distance to the next full s_wait_loadcnt 0x0.
+  The incumbent k_dkdv issues its last prefetch load at idx 188 and drains at idx 13 of the
+  next iteration, about 603 instructions of cover. A68 pushes the last load to idx 789
+  against a drain at idx 25, about 41 instructions -- a 15x collapse. If cover is the binding
+  quantity rather than body shape, A68 loses on the order of 20-30% of prod and round 21's
+  signed fact is false. Building it is worth it either way: it is the only clean test of that
+  fact, and the cheapest one available.
+  For r22.i1.g67, written before building: form 2 (the subtractive probe) must run before
+  form 1, because it bounds the whole direction from above. g21's prefetch mechanism is worth
+  roughly +21% overall, so I expect deleting k_dq's prefetch to be negative; what matters is
+  the MAGNITUDE. If the ceiling is negative and small, k_dq's prefetch was barely working and
+  the whole axis leaves for free.
+
+added_to_pool: [r23.i1.g69, r23.i2.g70]
+route_updated: true
+
+implementation:
+  files_changed: [rounds/022/op/kernels.py]
+  build_failures:
+    - attempt: 1
+      error: "ls rounds/022/_scratch/scr/dump_$t/*k_dq*.s -- no such file (rc=2, no artefact parsed)"
+      root_cause: >
+        The offline screen writes one directory per kernel (dump_X/k_dq_0/21_final_isa.s), not
+        flat per-kernel .s files at the top level. The glob matched nothing and would have made
+        an empty ISA census look like a kernel with zero loads. Fixed by copying */21_final_isa.s
+        out by directory name. Zero card time -- it failed in the shell, before any build.
+    - attempt: 2
+      error: "dmesg Monitor emitted the entire boot log as a single event"
+      root_cause: >
+        The HOST kernel cmdline carries modprobe.blacklist=amdgpu, so host dmesg contains no
+        amdgpu events at all and a host-side monitor can only ever replay the boot log. GPU
+        health has to be read from INSIDE the container. Fixed by dropping the host monitor and
+        relying on the bounded in-container `dmesg | tail -3` that val.sh/meas.sh already run
+        between GPU blocks per h15. Recorded because it will mislead any future round that arms
+        a host-side dmesg watch on this box.
+  note: >
+    No compile failures. All four builds (cur_a, cur_b rebuilt incumbents, A68, B67, P70)
+    screened clean with verdict pass and spill 0; h3 never fired. The compile cache
+    (/root/.flydsl) and every __pycache__ under rounds/ were purged before the shipped copy
+    was rebuilt and re-validated, so no measurement in this round can be serving a previous
+    round's binary.

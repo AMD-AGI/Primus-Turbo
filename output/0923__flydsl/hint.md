@@ -2896,3 +2896,54 @@ Round 21 satisfied route row 10's zero-card-time precondition before building an
 (per-basic-block ISA census plus a positional map of every `s_wait_*`, `scr/blocks.py`,
 `scr/pos.py`), and killed a third candidate (`g65`) offline with no card time at all. The
 isolation arm `g66` cost one arm slot and bought the only mechanistic fact of the round.
+
+## h38 — The cover model, and a caveat on which noise floor applies to which comparison.
+
+Round 22 replaced round 21's "signed per-kernel" story with **one variable**: worst-case
+load-to-use cover distance to the next full `s_wait_loadcnt 0x0`. It pre-registered the
+prediction ("A68 loses 20-30% of prod") **before the card** and measured -30.0%. The model
+retro-explains every reorder result on this operator with one quantity:
+
+| arm | what it did to cover | prod |
+|---|---|--:|
+| `g62` k_dkdv depth 1 -> 2 | +~1 iteration | **+1.65%** |
+| `g28` | reduced | -7.8% |
+| `g66` spread k_dq's 32 loads | collapsed | -19.33% |
+| **`g68` spread k_dkdv's 32 loads** | **~603 -> ~41 instructions** | **-30.32%** |
+| `P70` delete k_dq's prefetch | to zero | -10.86% |
+
+Nothing here changes a byte of traffic, a WMMA count or an LDS op count, and `g68` holds VGPR
+and spill flat as well. **A pure reordering cannot cost 30% of a bandwidth-bound body**, so
+this is also the strongest remaining evidence against any bandwidth reading.
+
+Two general findings worth more than the arms:
+
+- **`sched_barrier(0)` is a scheduling BOUNDARY, not a clamp.** Fencing around a group hands
+  the scheduler two smaller regions and it fills them by pulling loads *earlier*. Asking this
+  backend to tighten a clump with barriers reliably loosens it — `g67` form 1 reproduced
+  `g66`'s exact failure signature offline and was never taken to the card.
+- **The "tighten k_dq" axis has no headroom, bounded from above.** The most any shortening can
+  achieve is deletion, and deletion (`P70`) is -10.86%.
+
+Also retired by measurement, not assumption: **power and clock**. A 60-point 0.5 Hz trace
+across a full prod run moves package power by under 0.5% (855.0 W idle vs 853 W under load —
+the sensor is static, so the question is untestable on this box) and sclk is flat at 1100 MHz
+for 60/60 samples. "The card was throttling" is no longer available as an explanation.
+
+### CAVEAT — which floor applies
+
+Round 22 concludes "this operator has not moved outside the noise since round 17", resting
+`g62`'s +1.65% against the corpus **cross-session** null-control floor of 1.57% (n=5).
+
+**That floor is the wrong one for that comparison.** Round 22's own same-session control is
+three physical rebuilds of identical source — `cur_a` 517.21, `cur_b` 515.17, `r020` 516.87 —
+spreading **0.40%**. And `r020` beats `r017` by **+2.18%** (516.87 vs 505.85) *inside one
+sweep, one process, palindromic order, sclk 1051 throughout*, which is 5.5x that floor. Using
+a cross-session floor on a same-session interleaved comparison is exactly what
+`beat_measured_same_run: true` exists to avoid.
+
+So round 20's promotion stands. **But round 22's prescription is right and should be adopted
+anyway:** three rounds of accepted work separate 505.85 / 507.13 / 516.87, which is a thin
+return, and the bar for the next round is **"beat the champion by more than the same-session
+floor"**, not "be positive". `min_gain: 0.0` in the job spec is what let round 20 promote on
+gain 1.0016; that is a real gap between the spec and what is worth banking.
