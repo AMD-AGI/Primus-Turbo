@@ -1,0 +1,87 @@
+=== PRE
+
+
+============================ ROCm System Management Interface ============================
+===================================== KFD Processes ======================================
+No KFD PIDs currently running
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+
+
+============================ ROCm System Management Interface ============================
+=================================== % time GPU is busy ===================================
+GPU[0]		: GPU use (%): 0
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+===== SHAPE prod
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm cur_a -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/018/_scratch/arms3/cur_a
+# arm g56_a -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/018/_scratch/arms3/g56_a
+# arm g56_b -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/018/_scratch/arms3/g56_b
+# arm cur_b -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/018/_scratch/arms3/cur_b
+# arm cur_c -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/018/_scratch/arms3/cur_c
+# arm g56_c -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/018/_scratch/arms3/g56_c
+# arm beat -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/beat
+# statistic median  iters 51  warmup 3.0s continuous  order palindromic  device gfx1250
+RESULT shape=prod arm=cur_a stat=median iters=51 latency_ms=10.90243911743164 min_ms=10.831293106079102 max_ms=11.209258079528809 tflops=504.31184877969343 bw_gbs=123.10798212613047 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1051 sclk_end=1055 causal=True
+RESULT shape=prod arm=g56_a stat=median iters=51 latency_ms=11.709325790405273 min_ms=11.563668251037598 max_ms=11.968113899230957 tflops=469.55984707721586 bw_gbs=114.62464227443326 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1051 sclk_end=1055 causal=True
+RESULT shape=prod arm=g56_b stat=median iters=51 latency_ms=11.67179012298584 min_ms=11.553853988647461 max_ms=11.774023056030273 tflops=471.0699189743022 bw_gbs=114.9932671730263 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1051 sclk_end=1055 causal=True
+RESULT shape=prod arm=cur_b stat=median iters=51 latency_ms=10.908608436584473 min_ms=10.836620330810547 max_ms=11.0237398147583 tflops=504.02663726387425 bw_gbs=123.03835890732924 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1051 sclk_end=1055 causal=True
+RESULT shape=prod arm=cur_c stat=median iters=51 latency_ms=10.941536903381348 min_ms=10.832293510437012 max_ms=11.020655632019043 tflops=502.5097731764575 bw_gbs=122.66807596154217 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1051 sclk_end=1055 causal=True
+RESULT shape=prod arm=g56_c stat=median iters=51 latency_ms=11.72723388671875 min_ms=11.52761459350586 max_ms=11.867963790893555 tflops=468.84280475951095 bw_gbs=114.44960448175539 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1051 sclk_end=1055 causal=True
+RESULT shape=prod arm=beat stat=median iters=51 latency_ms=7.641839027404785 min_ms=7.534317970275879 max_ms=7.7798848152160645 tflops=719.4903226569576 bw_gbs=175.6353771895417 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1051 sclk_end=1055 causal=True
+RC_prod 0
+===== SHAPE proxy
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm cur_a -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/018/_scratch/arms3/cur_a
+# arm g56_a -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/018/_scratch/arms3/g56_a
+# arm g56_b -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/018/_scratch/arms3/g56_b
+# arm cur_b -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/018/_scratch/arms3/cur_b
+# arm cur_c -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/018/_scratch/arms3/cur_c
+# arm g56_c -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/018/_scratch/arms3/g56_c
+# arm beat -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/beat
+# statistic median  iters 51  warmup 3.0s continuous  order palindromic  device gfx1250
+RESULT shape=proxy arm=cur_a stat=median iters=51 latency_ms=0.7776029706001282 min_ms=0.7701929807662964 max_ms=1.0230909585952759 tflops=441.9752531227577 bw_gbs=215.75555436795594 flop=343681269760.0 bytes_min=167772160 sclk_start=1055 sclk_end=1062 causal=True
+RESULT shape=proxy arm=g56_a stat=median iters=51 latency_ms=0.8551989793777466 min_ms=0.8313239812850952 max_ms=0.887287974357605 tflops=401.8728717497614 bw_gbs=196.17909287271732 flop=343681269760.0 bytes_min=167772160 sclk_start=1055 sclk_end=1062 causal=True
+RESULT shape=proxy arm=g56_b stat=median iters=51 latency_ms=0.8386549949645996 min_ms=0.831043004989624 max_ms=0.8521559834480286 tflops=409.80053994015395 bw_gbs=200.04907978528385 flop=343681269760.0 bytes_min=167772160 sclk_start=1055 sclk_end=1062 causal=True
+RESULT shape=proxy arm=cur_b stat=median iters=51 latency_ms=0.7771629691123962 min_ms=0.770313024520874 max_ms=0.7907829880714417 tflops=442.22548348195363 bw_gbs=215.8777073380296 flop=343681269760.0 bytes_min=167772160 sclk_start=1055 sclk_end=1062 causal=True
+RESULT shape=proxy arm=cur_c stat=median iters=51 latency_ms=0.7779240012168884 min_ms=0.7712739706039429 max_ms=0.7920659780502319 tflops=441.7928605138643 bw_gbs=215.666517214481 flop=343681269760.0 bytes_min=167772160 sclk_start=1055 sclk_end=1062 causal=True
+RESULT shape=proxy arm=g56_c stat=median iters=51 latency_ms=0.8489099740982056 min_ms=0.8303629755973816 max_ms=0.9007480144500732 tflops=404.85007862593625 bw_gbs=197.63245234363498 flop=343681269760.0 bytes_min=167772160 sclk_start=1055 sclk_end=1062 causal=True
+RESULT shape=proxy arm=beat stat=median iters=51 latency_ms=0.5915650129318237 min_ms=0.5751010179519653 max_ms=0.8369719982147217 tflops=580.9695675826054 bw_gbs=283.60730660610466 flop=343681269760.0 bytes_min=167772160 sclk_start=1055 sclk_end=1062 causal=True
+RC_proxy 0
+===== SHAPE fast
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm cur_a -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/018/_scratch/arms3/cur_a
+# arm g56_a -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/018/_scratch/arms3/g56_a
+# arm g56_b -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/018/_scratch/arms3/g56_b
+# arm cur_b -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/018/_scratch/arms3/cur_b
+# arm cur_c -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/018/_scratch/arms3/cur_c
+# arm g56_c -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/018/_scratch/arms3/g56_c
+# arm beat -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/beat
+# statistic median  iters 51  warmup 3.0s continuous  order palindromic  device gfx1250
+RESULT shape=fast arm=cur_a stat=median iters=51 latency_ms=0.09650500118732452 min_ms=0.09233800321817398 max_ms=0.347680002450943 tflops=55.68573580522211 bw_gbs=108.65509425409194 flop=5373952000.0 bytes_min=10485760 sclk_start=1100 sclk_end=1100 causal=True
+RESULT shape=fast arm=g56_a stat=median iters=51 latency_ms=0.11332999914884567 min_ms=0.09738600254058838 max_ms=0.12791100144386292 tflops=47.418618550785865 bw_gbs=92.52413375763096 flop=5373952000.0 bytes_min=10485760 sclk_start=1100 sclk_end=1100 causal=True
+RESULT shape=fast arm=g56_b stat=median iters=51 latency_ms=0.09942899644374847 min_ms=0.09734500199556351 max_ms=0.11256799846887589 tflops=54.0481367831193 bw_gbs=105.45977908901328 flop=5373952000.0 bytes_min=10485760 sclk_start=1100 sclk_end=1100 causal=True
+RESULT shape=fast arm=cur_b stat=median iters=51 latency_ms=0.0975859984755516 min_ms=0.09490100294351578 max_ms=0.1018730029463768 tflops=55.06888369181718 bw_gbs=107.45148037427742 flop=5373952000.0 bytes_min=10485760 sclk_start=1100 sclk_end=1100 causal=True
+RESULT shape=fast arm=cur_c stat=median iters=51 latency_ms=0.09722600132226944 min_ms=0.09534300118684769 max_ms=0.10231299698352814 tflops=55.272786362850304 bw_gbs=107.84933924458596 flop=5373952000.0 bytes_min=10485760 sclk_start=1100 sclk_end=1100 causal=True
+RESULT shape=fast arm=g56_c stat=median iters=51 latency_ms=0.102913998067379 min_ms=0.09702499955892563 max_ms=0.11236800253391266 tflops=52.21789164659224 bw_gbs=101.88856906652146 flop=5373952000.0 bytes_min=10485760 sclk_start=1100 sclk_end=1100 causal=True
+RESULT shape=fast arm=beat stat=median iters=51 latency_ms=0.10459599643945694 min_ms=0.09898799657821655 max_ms=0.23855699598789215 tflops=51.37818064681464 bw_gbs=100.25010857915053 flop=5373952000.0 bytes_min=10485760 sclk_start=1100 sclk_end=1100 causal=True
+RC_fast 0
+=== POST
+
+
+============================ ROCm System Management Interface ============================
+===================================== KFD Processes ======================================
+No KFD PIDs currently running
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+
+
+============================ ROCm System Management Interface ============================
+=================================== % time GPU is busy ===================================
+GPU[0]		: GPU use (%): 0
+==========================================================================================
+================================== End of ROCm SMI Log ===================================

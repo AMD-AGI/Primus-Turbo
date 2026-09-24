@@ -1,0 +1,187 @@
+round: 18
+mode: fast
+candidate: r18.i3.g56
+outcome: delivered
+
+correctness:
+  unit_tests: pass
+  precision: pass
+  checked_with: op/validation.py
+  sqnr_db: 52.56          # worst of dq/dk/dv at prod: dq 52.56 / dk 52.60 / dv 52.71.
+                          # Worst over all three shapes is fast dq 52.61 -> prod dq 52.56 is
+                          # the minimum of the nine. Gate is 50.0 dB. determinism x200 bitwise.
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/017/op]
+  # rounds/017/op is the incumbent AND the champion at all three shapes; op/current is a byte
+  # -identical copy of it (verified with diff). Rebuilt into three separate arm slots this
+  # session and interleaved palindromically with the three candidate slots in ONE benchmark
+  # process per shape, 51 iters, median. Device idle before and after (rocm-smi --showpids:
+  # "No KFD PIDs currently running"), sclk 1051-1100 MHz.
+  shapes:
+    - name: prod
+      this_round_tflops: 469.56
+      best_round_tflops: 504.03
+      beat_tflops: 719.49
+      target_tflops: 719.49       # margin 1.00 x beat, measured in this same sweep
+      champion_round: 17
+      champion_tflops: 504.03
+      champion_rebuilt: true
+      ratio: 0.6526
+      vs_champion: 0.9316
+    - name: proxy
+      this_round_tflops: 404.85
+      best_round_tflops: 441.98
+      beat_tflops: 580.97
+      target_tflops: 580.97
+      champion_round: 17
+      champion_tflops: 441.98
+      champion_rebuilt: true
+      ratio: 0.6969
+      vs_champion: 0.9160
+    - name: fast
+      this_round_tflops: 52.22
+      best_round_tflops: 55.27
+      beat_tflops: 51.38
+      target_tflops: 51.38
+      champion_round: 17
+      champion_tflops: 55.27
+      champion_rebuilt: true
+      ratio: 1.0000               # min(52.22/51.38, 1.0) -- uncapped it is 1.0163
+      vs_champion: 0.9447
+      note: >
+        The candidate's three fast slots spread 13.98% (47.42 / 54.05 / 52.22) against the
+        incumbent's 1.12%. Reported as measured (median), but fast is a sentinel and does not
+        rank a candidate (h7), and h6 records that a single-arm fast read is unusable here.
+  score: 0.7832                   # mean of the three ratios; incumbent same-sweep is 0.8204
+
+validation:
+  exit_code: 2
+  # correctness pass, determinism pass, speed FAIL. The speed leg is the job's standing gate
+  # (geomean >= 1.00x beat) and no round in eighteen has met it; exit 2 here is not a regression.
+
+explored:
+  ran: []
+  # No rocprofv3 this round, and that is a decision, not an omission: h4 is a standing
+  # constraint that rocprofv3 is a dead end on this op (three faults, one power-cycle), and
+  # round 17's kernel.yaml already fixes the dispatch set per shape. What replaced it was
+  # rounds/018/_scratch/scr/attrib_ss.py (steady-state stall attribution, ncopy=4, zero card
+  # time). It changed two decisions: it re-confirmed the 2048 FLOP/SIMD-cycle WMMA rate by an
+  # independent route (30.4% matrix busy vs the 29.5% back-solved from throughput), which
+  # voided round 17's `bound: compute`; and it put 470 of .LBB0_8's 562 stall cycles on ONE
+  # site, which is what selected this round's candidate.
+  consulted:
+    - backends/flydsl/attention/dead-ends.md
+    - optimization/techniques/6-gfx1250-cdna5-mechanisms.md
+    - backends/hipkittens/gemm/recipes/bf16_gfx1250_ladder.md
+  bound: latency
+  confidence: medium
+  # latency, not compute and not memory. Compute is out: the 2048 rate is now confirmed twice
+  # and matrix busy in the hot body is 30.4%. Memory is out: this round moved 16 bytes per
+  # iteration off one queue and lost 6.84%, while the 512 bytes of b128 in the same body were
+  # untouched -- the eighth piece of counter-evidence against h8's byte-count story.
+  # confidence medium rather than high because the round's own candidate falsified the
+  # sharpest prediction the latency model made: removing the site that owned 83.6% of the
+  # body's stall made the kernel SLOWER. The model locates the stall correctly and prices it
+  # wrongly, and the instrument that would settle it (an ASYNCcnt queue in the attribution
+  # tool) does not exist yet -- it is row 5 of the route table.
+  why: >
+    k_dkdv .LBB0_8 at WMMA_cost=8 is 1685 cycles = 512 WMMA (30.4%) + 611 other issue (36.3%)
+    + 562 stall (33.4%), and 470 of the 562 are one site (@228 loadcnt N=35) popping a
+    buffer_load_b32 stuck behind the 32-deep b128 prefetch in the in-order LOADcnt FIFO.
+    k_dq's hot body has ZERO stall and 54.3% matrix busy. Per S-element non-WMMA issue is
+    0.315 for k_dq against 0.597 for k_dkdv (1.9x); parity would put prod at ~754 TF/s,
+    above the bar, without touching the 7/5 structural factor.
+
+arms:
+  - id: r18.i3.g56
+    built: "alone, from op/current"
+    tflops: {prod: 469.56, proxy: 404.85, fast: 52.22}
+    vs_champion: 0.9316
+    shipped: true
+    note: >
+      Correct (dk/dv 52.60/52.71 dB at prod, determinism x200 pass) and every gate the route
+      table set for it passed: no new s_wait_loadcnt 0x0 in .LBB0_8 (2, same as incumbent),
+      s_wait_asynccnt 0x2 / 0x0 as designed, spill 0. Statically better on every count
+      available: buffer_load_b32 4 -> 0 (the source instruction of the 470-cycle site is gone
+      entirely), s_wait_loadcnt 7 -> 3, body 678 -> 667 instructions, VGPR 724 -> 718. It
+      still lost 6.84% at prod, 8.40% at proxy, 5.53% at fast -- same sign on all three,
+      far outside this session's 0.36% same-code floor.
+  - id: r18.i1.g54
+    built: "not built -- priced on paper and killed at zero card time"
+    shipped: false
+    note: >
+      Fusing dQ into k_dkdv. 16 B per S-element x 4.295e9 causal S-elements = 68.7 GB written
+      + 68.7 GB read = 137 GB = 62.6 ms at 4.39 TB/s, against 10.82 ms of total kernel time
+      and a 3.1 ms saving from 7 -> 5 products. ~20x loss. In dead_ends.md.
+  - id: r18.i2.g55
+    built: "not built -- priced on paper and killed at zero card time"
+    shipped: false
+    note: >
+      Raising occupancy. .LBB0_8 carries 395 live-in VGPR of 724; 384 of them are the 256-VGPR
+      dK/dV accumulators plus the 128-VGPR g21 prefetch tuple. Reaching <=512 needs >=212
+      removed, necessarily including that tuple, and even then 596 > 512, so BLOCK_KV would
+      have to halve and undo g06's 1.677x. In dead_ends.md.
+  - id: r18.i5.g58
+    built: "not built -- third in the route table, no arm slot reached it"
+    shipped: false
+    note: >
+      Q/dO on the same async-to-LDS path. Left OPEN in pool.md, but this round reclassified it:
+      the mechanism is now known to lower correctly and to cost 6.84% at 16 bytes per
+      iteration. It must not be built until the attribution tool has an ASYNCcnt queue.
+
+expected: >
+  I did not write a TFLOP/s prediction before measuring, and I am not going to invent one now.
+  What opt.md section 9 does carry, under the heading "One thing the ISA shows that I do not
+  like, recorded before measuring", is this, verbatim:
+
+  ".LBB0_8 now opens with the 2 async loads at slots 49-51 and then an s_wait_loadcnt 0x0 at
+  slot 54, before the body's first buffer_load_b128 (slot ~93). The allocator gave the async
+  ops' address registers v4/v5, and the b128 batch later writes v[2:5] -- so this is a WAR
+  drain of the previous iteration's b128, newly introduced by register reuse. It is a full
+  LOADcnt drain at the top of the hot body. It may cost more than the 470 cycles removed. If
+  the card says g56 loses, that is the first thing to look at, and it is fixable by keeping
+  the async address out of the b128 batch's register range rather than by abandoning the
+  mechanism."
+
+  That was a falsifiable statement and the round falsified it. Build #3 has the two async
+  loads at .LBB0_8 slots 48/49 and the first s_wait_loadcnt 0x0 at slot 52 -- and the body
+  carries 2 of them, exactly as the incumbent does. No drain was added. The candidate still
+  lost 6.84%. So the WAR was not the cost, and the thing I flagged as the first place to look
+  has been looked at and cleared.
+  # The absence of a number here is itself the finding to carry: this round had a stall
+  # attribution precise enough to name one site and price it at 470 of 562 cycles, and it
+  # still could not be turned into a throughput prediction. Round 19 should write one down.
+
+added_to_pool: [r18.i3.g56, r18.i5.g58]
+route_updated: true
+
+implementation:
+  files_changed: [rounds/018/op/kernels.py]
+  build_failures:
+    - attempt: 1
+      error: "6 global_load_async_to_lds_b32 emitted, 0 s_wait_asynccnt"
+      root_cause: >
+        The backend does not derive the async wait from the memory dependence: the LDS
+        destination is an inttoptr address and is opaque to it. The ds_load consumer could
+        race the async write. All four offline screens returned verdict pass, spill 0 on it.
+        Fixed by writing rocdl.s_wait_asynccnt(2 if carry else 0) explicitly, with the count
+        chosen so the full body does NOT drain its just-issued pair (that is r10.i1.g27's
+        failure) and the masked body does.
+    - attempt: 2
+      error: "op/validation.py FAIL: dk -56.23/-67.22/-73.14 dB, dv -54.60/-66.03/-72.07 dB (dq 52.6 dB, untouched)"
+      root_cause: >
+        The LDS destination operand of global_load_async_to_lds_b32 is PER LANE -- lane l
+        writes its own dword at the address its own VGPR holds, with NO implicit lane stride.
+        _ldslot(qt, gh) is built only from lds_ld, qt, gh and G, so all 32 lanes passed the
+        same address, collided on the same 4 bytes, and 31 of 32 values were dropped; the
+        consumer's _sl + row*4 then read LDS that was never written for every row >= 1. This
+        is the old gfx90a/gfx940 global_load_lds contract (uniform LDS base via m0, hardware
+        strides by lane) applied to the gfx1250 async op, which does not have it -- that is
+        the price of not needing m0 and not requiring uniformity. Fixed with
+        _sl = _ldslot(qt, gh) + lane * fx.Int32(4).
+  note: >
+    The compile cache was cleared before the first build of this round
+    (rm -rf /root/.flydsl/* ~/.cache/comgr/*, 253 MB + 77 MB, plus the working copy's
+    __pycache__), so no measurement here can be a stale binary from round 17.
