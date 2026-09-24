@@ -2464,3 +2464,128 @@ attribution. Check for a fresh `core.gpu` after any future fault BEFORE power-cy
 Enumerate on CPU every `(blockIdx, lane, qh_, dtile, si)` byte offset that `k_dq` / `k_dq_sp`
 store and load at all three spec shapes, and assert each lands inside the real tensor. Nobody
 has done it. It costs no card time and it is the only thing that can name the access.
+
+## h32 — The bar is 7.67 ms / 716 TF/s, measured 177 times. The 10.160 ms figure is a 2026-09-15 measurement shim that was retracted the same day, and the retraction never propagated.
+
+### The census
+
+Every `RESULT shape=prod arm=beat` line under `rounds/**` and `job_context/**`:
+
+| | |
+|---|---|
+| n | **177** |
+| median | **7.6721 ms / 716 TF/s** |
+| min / max | 7.6077 / 7.7556 (spread **1.019x**) |
+| sd | 0.0363 ms (**0.47%**) |
+| sclk | 1045–1100 |
+| **records >= 8.0 ms** | **ZERO** |
+
+Today's two independent measurements land at z = +1.5 (`benchmark.py`, 7.7306) and z = +2.4
+(anchor script, 7.7636). The bar is one of the best-established numbers in this campaign.
+
+### Where 10.160 came from, and that it was already withdrawn
+
+`output/0915__opt/status.json:34-38`, 2026-09-15 07:23, n=5, median 10.1599, published at
+`RESULTS.md:15`. What it timed is `tune_attention.py:560-578`'s `_AsmFwdAsmBwd` — an autograd
+shim written for that measurement — driven through `out.backward()`, with `:571-573` passing
+**neither `hip=` nor `scratch=`**.
+
+**Retracted the same day.** 2026-09-15 09:33, same card, same session, side by side: the shim
+10.062 ms against the corrected path **8.13 ms**. The withdrawal never reached the operator's
+notes, and 10.160 kept propagating.
+
+`gfx1250-flydsl-attn-bwd_final.yaml:199-202` carries 10.160 only as a copied sanity value and
+says so in place: *"This is a SANITY figure only -- it is not the gate. The gate is the
+same-run measurement"*, with `beat_measured_same_run: true`.
+
+### What actually costs the 2.4 ms — and what does NOT
+
+**MEASURED by controlled isolation:**
+
+| item | ms | how |
+|---|--:|---|
+| per-call `HipModule()` + 3x `hipModuleLoad` | **+1.15** | forced `_HIP=None`: 9.2834 vs 8.1334 |
+| autograd plumbing (`out.backward()`, AccumulateGrad into q/k/v.grad) | **+1.42** | paired: standalone 8.68 vs harness 10.098, reload in both |
+| **per-call allocation of ~1 GiB of scratch** | **+0.01** | forced `_SCRATCH={}`: 8.1419 vs 8.1334 — *"Ruled out as a cost of any size"* |
+
+**RETRACTION — mine, from earlier today.** I attributed the gap to per-call scratch allocation
+at ~1.52 ms. **It is +0.01 ms.** I took `GQA-WORKAROUND-COST.md:37`'s prose ("每次调用新分配
+dk/dv") as a mechanism when that same batch of work had already isolated it to zero. The real
+jitter source in that script is that it does not pass `hip=` either
+(`bin/gqa_workaround_cost.py:50,52,64`) — loader, not allocator. `:37` and the isolation
+result cannot both be cited; the isolation wins.
+
+**The GQA host reduction is NOT the cause, and the direction is opposite.** It costs
++0.4823 ms (`gqa_workaround_cost.json`), and it is **inside both timed regions**:
+`beat/impl.py:87-88` sits in `asm_attn_bwd()`'s body and `benchmark.py` wraps the whole call
+in `ev0/ev1`. Independently confirmed by dispatch arithmetic rather than by docstring —
+`profiling/beat/kernel.yaml:46-49` counts `odo(1)+pssk(1)+dq_convert(1)+FillFunctor(1)+
+reduce_kernel(2) = 6` per call, giving prod `8x6+13 = 61` and fast `23x6+13 = 151`, matching
+the measured dispatch counts exactly. `reduce_kernel` IS the host reduction (0.2225 ms/call)
+and `FillFunctor` IS `dq_acc.zero_()` (0.094 ms/call). **Removing the workaround would move
+the bar DOWN to about 7.45, not up.**
+
+**Honest gap:** 1.15 + 1.42 = 2.57 exceeds the measured 10.062 - 8.13 = **1.93** by ~0.6 ms.
+The two totals are measured; the per-item split is inferred and does not close. The likely
+cause is that the 8.13 arm used `torch.autograd.grad` (no AccumulateGrad) while 10.098 used
+`out.backward()`. **Cite the totals, never the decomposition.**
+
+Three independent paths all land in 7.5–7.8: `8.68 - 1.15 = 7.53`; `8.13 - 0.26(fp32 reduce)
+- ~0.1 = ~7.8`; per-kernel profile sum **7.7166** and un-profiled median **7.7381**.
+
+### Correction to my own framing
+
+I argued "the forward agrees to 0.03%, so the machine and discipline are fine and the delta
+must be methodological". The premise was sloppy: 1.5724 came from a **separate forward-only
+probe** (sclk 1011->989), while the same-window anchor that produced 7.7636 read fwd
+**1.6061** (sclk 1004->996). Forward agreement is 0–2.1%, not 0.03%. The conclusion survives
+(2% << 31%), and in fact forward agreement is a **prediction** of this explanation rather than
+evidence against it: every cost above — `do.contiguous()`, five saved tensors,
+`dq_acc.zero_()`, the host reduction, 384 MB of gradient accumulation, three `.co` reloads —
+is backward-only. The forward path touches none of them.
+
+### The campaign's position
+
+| bar | provenance | ratio vs cur 11.017 ms / 499.06 TF/s |
+|---|---|--:|
+| 7.6721 ms | measured, n=177 | **0.696** |
+| 7.7636 ms | measured, today's anchor | **0.705** |
+| 10.160 ms | 2026-09-15 shim | 0.922 — **artefact** |
+
+**Report 0.70.** And prefer the pair from a single run: round 18's own
+`rounds/018/1-opt/raw/meas_g56.txt` gives `cur 10.8373 ms / 507.34 TF/s` against
+`beat 7.6261 ms / 720.98 TF/s` at the same sclk 1050->1056 — **0.704**. That is the only
+ratio taken in one process, one timing window, one clock state. No cross-session pairing
+beats it.
+
+0.922 is not a measured ratio under any convention: it divides the candidate's kernel-region
+number by the bar's shim number. Putting the candidate under the same shim would add the same
+constant to both arms and make the ratio worse, not better.
+
+### Downstream numbers that inherit the 2.4 ms inflation — all still uncorrected
+
+- `RESULTS.md:15` labels the 10.160 row "产品路径". **Mislabelled** — it is the shim.
+  `grep -rn "asm_backward" --include=*.py primus_turbo/` finds the definition and **zero**
+  callers on this branch. This mislabel is how 10.160 escaped as a "product number".
+- 11.726 ms/layer; `ASM-ATTENTION.md:113`'s 4.76x; the op-level 1.74x (really ~2.18x, already
+  noted at `E2E-AB.md:297-299`).
+- **The `seqlen >= 2048` qualification gate.** It was derived from an "ASM backward has a
+  ~0.85 ms fixed floor" claim (`RESULTS.md:119-121`) — and part of that floor WAS the per-call
+  `hipModuleLoad`. `E2E-AB.md:301-302` booked a re-measurement of the 9 supporting points and
+  **it has never been done**. The threshold is probably set too high.
+- History worth remembering: `b281b46b`'s e2e A/B used 10.160 to predict 241 ms/step saved
+  over 32 layers, and the measurement came back **6.78% FASTER with the ASM backward turned
+  off**. Same root cause as this: the missing `scratch=` / `hip=`.
+
+### OPEN — a possible correctness hole in the bar itself
+
+`beat/impl.py:66-69` allocates the dk/dv scratch with `torch.empty` and **never zeroes it**,
+while the no-scratch path at `_asm_bwd_kernargs.py:249-250` uses `torch.zeros` (and that same
+function's `else` branch uses `empty_like` — an asymmetry implying the author believed the q
+layout needs zeroing). If `pssk` does not fully write every q-head slice under causal +
+grid_halve, the bar is **reading the previous call's stale gradients** — not merely ~0.09 ms
+fast. The job never aligns `beat`'s output against anything, so nothing would catch it.
+
+Cannot be settled without the card. **30-second micro-check for the next GPU window: fill the
+scratch with NaN between calls and see whether dk/dv still come back at ~52 dB.** It decides
+whether the bar needs raising by ~0.1 ms, and it is a correctness question, not a timing one.
