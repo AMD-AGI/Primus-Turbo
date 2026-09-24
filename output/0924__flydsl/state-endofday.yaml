@@ -1,0 +1,1196 @@
+meta:
+  name: gfx1250-flydsl-attn-bwd
+  id: 20260917-115934
+  started_at: '2026-09-17T11:59:34'
+  spec_version: v000
+  elapsed_seconds: 55779.1
+setup:
+  job_setup:
+    status: done
+    spec_version: v000
+    at: '2026-09-17T12:09:53'
+    seconds: 618.3
+  op_setup:
+    status: done
+    spec_version: v000
+    at: '2026-09-17T12:57:23'
+    seconds: 2850.0
+lifecycle:
+- at: '2026-09-17T11:59:34'
+  event: setup_started
+- at: '2026-09-21T11:53:46'
+  event: resumed
+  spec_version: v000
+- at: '2026-09-21T15:08:24'
+  event: resumed
+  spec_version: v000
+- at: '2026-09-22T09:51:26'
+  event: resumed
+  spec_version: v000
+- at: '2026-09-22T10:49:05'
+  event: stopped
+  reason: user_interrupt
+- at: '2026-09-22T10:53:22'
+  event: resumed
+  spec_version: v000
+- at: '2026-09-22T11:34:48'
+  event: stopped
+  reason: user_interrupt
+- at: '2026-09-22T12:08:11'
+  event: resumed
+  spec_version: v000
+- at: '2026-09-22T13:23:47'
+  event: stopped
+  reason: user_interrupt
+- at: '2026-09-22T13:25:24'
+  event: resumed
+  spec_version: v000
+- at: '2026-09-22T14:00:26'
+  event: stopped
+  reason: user_interrupt
+- at: '2026-09-22T14:12:36'
+  event: resumed
+  spec_version: v000
+- at: '2026-09-22T15:34:37'
+  event: resumed
+  spec_version: v000
+- at: '2026-09-23T08:03:27'
+  event: resumed
+  spec_version: v000
+- at: '2026-09-23T08:46:07'
+  event: resumed
+  spec_version: v000
+- at: '2026-09-23T09:59:23'
+  event: resumed
+  spec_version: v000
+- at: '2026-09-23T10:51:33'
+  event: finished
+  reason: max_rounds
+- at: '2026-09-23T12:27:04'
+  event: resumed
+  spec_version: v000
+- at: '2026-09-23T14:03:34'
+  event: resumed
+  spec_version: v000
+- at: '2026-09-24T01:58:05'
+  event: resumed
+  spec_version: v000
+- at: '2026-09-24T03:25:47'
+  event: resumed
+  spec_version: v000
+- at: '2026-09-24T04:13:12'
+  event: stopped
+  reason: user_interrupt
+- at: '2026-09-24T04:52:51'
+  event: resumed
+  spec_version: v000
+- at: '2026-09-24T08:37:23'
+  event: resumed
+  spec_version: v000
+- at: '2026-09-24T10:01:41'
+  event: resumed
+  spec_version: v000
+best_round: 20
+champions:
+  fast: 17
+  proxy: 17
+  prod: 19
+  prod_b4_s8192_hq32_hkv8_d128: 20
+rounds:
+- round: 0
+  progress: []
+  score: null
+  outcome: delivered
+  passed: true
+  accepted: true
+  note: baseline (measured at setup)
+  tflops:
+    fast: 3.042
+    proxy: 36.442
+    prod: 57.241
+- round: 1
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  seconds:
+    opt: 3990.2
+    reflect: 123.1
+    round: 4113.3
+  sessions:
+    opt: c98b60e0-7803-41c6-880f-eab8c0db3a86
+  bound: latency
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - speed FAIL
+  score: 0.09096
+  outcome: delivered
+  passed: true
+  accepted: true
+  tflops:
+    fast: 3.572
+    proxy: 41.407
+    prod: 92.62
+  targets:
+    fast: 49.244
+    proxy: 579.357
+    prod: 718.707
+  beats:
+    fast: 49.244
+    proxy: 579.357
+    prod: 718.707
+  incumbents:
+    fast: 3.007
+    proxy: 35.649
+    prod: 55.244
+  gain: 1.342
+  changed: 1
+  flops:
+    fast: 5373952000.0
+    proxy: 343681269760.0
+    prod: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: null
+  changed_disagreement: null
+- round: 2
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  sessions:
+    opt: f5a7e471-23ec-41d5-981c-016c0d998ed6
+  seconds:
+    opt: 4205.6
+    reflect: 240.4
+    round: 4446.0
+  bound: latency
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - speed FAIL
+  score: 0.16928
+  outcome: delivered
+  passed: true
+  accepted: true
+  tflops:
+    fast: 7.259
+    proxy: 90.6107
+    prod: 143.232
+  targets:
+    fast: 47.611
+    proxy: 580.3094
+    prod: 718.9083
+  beats:
+    fast: 47.611
+    proxy: 580.3094
+    prod: 718.9083
+  incumbents:
+    fast: 3.592
+    proxy: 41.2768
+    prod: 92.6309
+  gain: 1.9208
+  changed: 2
+  flops:
+    fast: 5373952000.0
+    proxy: 343681269760.0
+    prod: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: null
+  changed_disagreement: act.yaml reported 3 changed files; the working copy differs from op/current in
+    2
+- round: 3
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  sessions:
+    opt: 9272c016-f9d6-43c4-b02b-dbd0944c31e9
+  seconds:
+    opt: 3235.5
+    round: 3235.5
+  bound: latency
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - speed FAIL
+  score: 0.28101
+  outcome: delivered
+  passed: true
+  accepted: true
+  tflops:
+    fast: 6.4544
+    proxy: 109.5272
+    prod: 207.4736
+  targets:
+    fast: 20.8401
+    proxy: 458.4844
+    prod: 704.6908
+  beats:
+    fast: 20.8401
+    proxy: 458.4844
+    prod: 704.6908
+  incumbents:
+    fast: 5.6372
+    proxy: 85.0584
+    prod: 142.2278
+  gain: 1.2971
+  changed: 2
+  flops:
+    fast: 5373952000.0
+    proxy: 343681269760.0
+    prod: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: 'CLOSED BY HAND 2026-09-22, not by the act module. The opt step shipped and validated this candidate
+    on 2026-09-21 but was killed by a card wedge at 16:01:54 before writing act.yaml; the acceptance benchmark
+    it had detached at 15:42:21 never returned. Every figure here is measured -- see rounds/003/1-opt/raw/bench_accept.json,
+    a four-arm one-session sweep at 101 iterations taken after the 06:47:43 AC-cycle, and validation.py
+    run against rounds/003/op on both 2026-09-21 and 2026-09-22. 2-reflect is marked done but was NOT
+    re-run: its ledger writes had already landed before the wedge (pool.md 15:52, dead_ends.md 15:52,
+    route.md 15:57).'
+  changed_disagreement: null
+- round: 4
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  sessions:
+    opt: c54a9d3e-3c22-4e96-b7e3-6f04224ad76a
+  seconds:
+    opt: 3084.9
+    reflect: 258.8
+    round: 3343.7
+  bound: latency
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - speed FAIL
+  validation_disagreement: act.yaml reported validation exit 1; the framework's run exited 2
+  score: 0.33884
+  outcome: delivered
+  passed: true
+  accepted: true
+  tflops:
+    fast: 11.45
+    proxy: 184.87
+    prod: 330.98
+  targets:
+    fast: 49.72
+    proxy: 571.18
+    prod: 715.53
+  beats:
+    fast: 49.72
+    proxy: 571.18
+    prod: 715.53
+  incumbents:
+    fast: 8.28
+    proxy: 117.21
+    prod: 209.99
+  gain: 1.5121
+  changed: 1
+  flops:
+    fast: 5373952000.0
+    proxy: 343681269760.0
+    prod: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: null
+  changed_disagreement: act.yaml reported 2 changed files; the working copy differs from op/current in
+    1
+- round: 5
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  sessions:
+    opt: 2f3d72ad-e796-44e1-8f3c-699fbdac3e5d
+  seconds:
+    opt: 2308.9
+    reflect: 62.2
+    round: 2371.1
+  bound: latency
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - speed FAIL
+  validation_disagreement: act.yaml reported validation exit 1; the framework's run exited 2
+  score: 0.37198
+  outcome: delivered
+  passed: true
+  accepted: true
+  tflops:
+    fast: 15.41
+    proxy: 199.79
+    prod: 335.42
+  targets:
+    fast: 51.5
+    proxy: 573.36
+    prod: 716.32
+  beats:
+    fast: 51.5
+    proxy: 573.36
+    prod: 716.32
+  incumbents:
+    fast: 11.31
+    proxy: 183.94
+    prod: 331.07
+  gain: 1.1539
+  changed: 2
+  flops:
+    fast: 5373952000.0
+    proxy: 343681269760.0
+    prod: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: null
+  changed_disagreement: act.yaml reported 3 changed files; the working copy differs from op/current in
+    2
+- round: 6
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  sessions:
+    opt: ca292846-2711-490e-ad73-98e3ba205178
+  seconds:
+    opt: 4338.3
+    reflect: 84.3
+    round: 4422.6
+  bound: latency
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - speed FAIL
+  score: 0.392
+  outcome: delivered
+  passed: true
+  accepted: true
+  tflops:
+    fast: 15.606
+    proxy: 208.734
+    prod: 354.293
+  targets:
+    fast: 50.205
+    proxy: 563.454
+    prod: 716.193
+  beats:
+    fast: 50.205
+    proxy: 563.454
+    prod: 716.193
+  incumbents:
+    fast: 15.329
+    proxy: 194.257
+    prod: 336.093
+  gain: 1.0489
+  changed: 1
+  flops:
+    fast: 5373952000.0
+    proxy: 343681269760.0
+    prod: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: null
+  changed_disagreement: null
+- round: 7
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  sessions:
+    opt: 2ac856d5-8959-4c9d-bc4b-b0690d523b62
+  seconds:
+    opt: 1881.3
+    reflect: 108.7
+    round: 1990.0
+  bound: latency
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - speed FAIL
+  score: 0.42321
+  outcome: delivered
+  passed: true
+  accepted: true
+  tflops:
+    fast: 17.922
+    proxy: 218.996
+    prod: 382.728
+  targets:
+    fast: 50.66
+    proxy: 573.32
+    prod: 716.897
+  beats:
+    fast: 50.66
+    proxy: 573.32
+    prod: 716.897
+  incumbents:
+    fast: 15.62
+    proxy: 208.856
+    prod: 353.527
+  gain: 1.0928
+  changed: 1
+  flops:
+    fast: 5373952000.0
+    proxy: 343681269760.0
+    prod: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: null
+  changed_disagreement: null
+- round: 8
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  seconds:
+    opt: 4212.0
+    round: 4212.0
+  bound: latency
+  validation_exit_code: 2
+  validation_by: hand
+  validation_failures:
+  - speed FAIL
+  score: 0.60244
+  outcome: delivered
+  passed: true
+  accepted: true
+  tflops:
+    fast: 15.0003
+    proxy: 235.8082
+    prod: 429.4053
+  targets:
+    fast: 21.8339
+    proxy: 461.5687
+    prod: 704.6069
+  beats:
+    fast: 21.8339
+    proxy: 461.5687
+    prod: 704.6069
+  incumbents:
+    fast: 15.1854
+    proxy: 227.0464
+    prod: 404.0615
+  gain: 1.0297
+  changed: 1
+  flops:
+    fast: 5373952000.0
+    proxy: 343681269760.0
+    prod: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: 'CLOSED BY HAND 2026-09-22 after the card wedged mid-round. The opt step built armA / armB / armAB
+    and passed the full gate on armA and armB, then the GPU entered an unrecoverable MES state (GPU reset
+    begin, unbounded REMOVE_QUEUE cascade across MES 0-7) and the one-session sweep never ran. The machine
+    was AC-cycled at 14:40:38 and every figure here was re-measured after it. TWO CAVEATS. (1) ABSOLUTE
+    FIGURES DO NOT COMPARE WITH ROUNDS 0-7: the identical round-7 kernel measures 404.06 at prod here
+    against the 382.73 recorded in round 7''s own session, +5.6% on unchanged code (md5 3ad59da722a4),
+    while beat at prod moved only -1.7%. (2) THE SCORE JUMP IS NOT PROGRESS: beat measured anomalously
+    low at the small shapes this session -- fast 21.83 against 50.70, proxy 461.57 against 573.31, prod
+    normal -- so score rises from 0.42321 to 0.60244 with no matching improvement. Rank on gain and on
+    prod (h7); do not plot score across this boundary. champions.fast stays at 7 because fast regressed
+    0.988x same-session. armAB''s correctness is bitwise identity to the incumbent (0 of 134,217,728 elements
+    differing at prod), not a fresh SQNR: validation.py aborted at proxy with HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION
+    inside op/eager/''s hipBLASLt GEMM (workgroup=[256,1,1], group_seg_size=6144), the same flake that
+    aborted round 3. Determinism was run standalone and passed 200 runs. 2-reflect did not run.'
+  changed_disagreement: null
+- round: 9
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  sessions:
+    opt: 171e09a2-c721-4e71-b0c1-3059fd5d6808
+  seconds:
+    opt: 1620.0
+    round: 1620.0
+  bound: latency
+  validation_exit_code: 2
+  validation_by: hand
+  validation_failures:
+  - speed FAIL
+  score: 0.52536
+  outcome: delivered
+  passed: true
+  accepted: true
+  tflops:
+    fast: 20.0877
+    proxy: 284.649
+    prod: 480.9598
+  targets:
+    fast: 48.9048
+    proxy: 572.0118
+    prod: 720.319
+  beats:
+    fast: 48.9048
+    proxy: 572.0118
+    prod: 720.319
+  incumbents:
+    fast: 18.14
+    proxy: 250.6146
+    prod: 432.2123
+  gain: 1.1187
+  changed: 1
+  flops:
+    fast: 5373952000.0
+    proxy: 343681269760.0
+    prod: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: 'CLOSED BY HAND 2026-09-23 after the 2026-09-22 16:01 card wedge. Unlike rounds 3 and 8 this needed
+    NO further GPU work: _scratch/d_s2/out (rc=0) is a complete five-arm one-session 101-iteration palindromic
+    sweep carrying cur AND beat at all three shapes, so the same-session champion reference that gain
+    and score require was already on disk. The opt agent survived the wedge on the CPU side and had already
+    written act.yaml, opt.md and the pool/route ledger entries; only this state entry and act.yaml''s
+    canonical measurements.shapes block were missing. Shipped armAB = r9.i1.g25 + r9.i2.g26 (kernels.py
+    md5 51a5d35f5b91). All three arms passed correctness (52.52-52.83 dB) and the 200-run determinism
+    gate, and all three are BITWISE IDENTICAL to the incumbent in all nine shape x tensor cells, so unit_tests
+    is pass by inheritance rather than by a fresh run -- act.yaml''s own note that pytest collected zero
+    cases stands unsoftened. Zero hipBLASLt/Tensile firings this round: the 2026-09-22 refcache gate fix
+    held. SCORE NOTE, opposite in sign to round 8''s: round 8''s 0.60244 was inflated by an anomalously
+    low beat at the small shapes (fast 21.83 against round 7''s 50.70). Here beat is back on the round
+    0-7 scale (48.90 / 572.01 / 720.32), so 0.52536 being numerically below 0.60244 is a return to normal,
+    not a regression. Rank on gain and prod per h7: 1.1187 is the largest single-round gain since round
+    4. champions.fast finally advances off 7 -- round 9 fast is 1.1074x round 8 same-session and round
+    8 was 0.9878x round 7, i.e. about 1.0939x round 7 transitively. 2-reflect did not re-run; its ledger
+    writes had already landed (pool.md 16:05, route.md 16:09).'
+  changed_disagreement: null
+- round: 10
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  sessions:
+    opt: 7d510011-c552-40d3-be34-58be58017233
+  seconds:
+    opt: 2245.9
+    reflect: 236.4
+    round: 2482.3
+  bound: latency
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - speed FAIL
+  score: 0.47167
+  outcome: delivered
+  passed: true
+  accepted: false
+  tflops:
+    fast: 19.324
+    proxy: 250.385
+    prod: 430.606
+  targets:
+    fast: 50.305
+    proxy: 579.077
+    prod: 719.482
+  beats:
+    fast: 50.305
+    proxy: 579.077
+    prod: 719.482
+  incumbents:
+    fast: 19.419
+    proxy: 263.351
+    prod: 462.986
+  gain: 0.9586
+  changed: 1
+  flops:
+    fast: 5373952000.0
+    proxy: 343681269760.0
+    prod: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: 'prod: 430.6 is 93.0% of its best ever 463.0'
+  changed_disagreement: null
+- round: 11
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  sessions:
+    opt: a46e42c8-7855-4751-b1f1-9f9f80547b36
+  seconds:
+    opt: 1844.2
+    round: 1844.2
+  bound: latency
+  validation_exit_code: 2
+  validation_by: hand
+  validation_failures:
+  - speed FAIL
+  score: 0.4552
+  outcome: delivered
+  passed: true
+  accepted: false
+  tflops:
+    fast: 18.073
+    proxy: 248.232
+    prod: 420.232
+  targets:
+    fast: 51.26
+    proxy: 578.344
+    prod: 719.716
+  beats:
+    fast: 51.26
+    proxy: 578.344
+    prod: 719.716
+  incumbents:
+    fast: 19.409
+    proxy: 261.982
+    prod: 462.439
+  gain: 0.9291
+  changed: 1
+  flops:
+    fast: 5373952000.0
+    proxy: 343681269760.0
+    prod: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: 'CLOSED BY HAND 2026-09-23 after the fourth card wedge, which hit as validation.py began on the
+    shipped tree (_scratch/d_s4/out has no rc). REJECTED, and correctly: gain 0.9291 with every shape
+    below its same-session champion. Nothing promoted; best_round stays 9 and op/current is still round
+    9''s ship. Every figure is the round''s own acceptance measurement from act.yaml, taken against rounds/009/op
+    and beat in one session. A LATER session in the same round (raw/bench_final.json) disagrees in SIGN
+    at the two small shapes -- candidate 20.02 vs incumbent 19.52 at fast and 269.22 vs 262.52 at proxy
+    -- while agreeing at prod, 457.58 vs 461.43. Both sessions have prod at or below 1.0, and prod is
+    what ranks (h7), so the verdict is the same either way; but the fast/proxy sign flip is another instance
+    of the cross-session instability this ledger has recorded since round 8 and is not evidence for the
+    candidate. Second consecutive rejection. Round 10 closed instruction-level scheduling of k_dkdv''s
+    hot body; round 11''s arms RAISED the bank-switch count they were meant to cut (cur 323 at 740 VGPR,
+    armA 339 at 772, armB 355 at 780), which the static screen showed before either reached the card.
+    One thing did improve: UT_EXIT=0 with every shape PASS. The unit-test gate had been vacuous -- "no
+    tests ran in 0.72s" -- until the 2026-09-23 fix to ut/test_correctness.py made it both reproducible
+    (seed=0 instead of a PYTHONHASHSEED-salted hash) and cache-served. This round is the first whose UT
+    gate actually checked anything.'
+  changed_disagreement: null
+- round: 12
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  sessions:
+    opt: d1c2ce9e-832b-4dea-b75d-6e85785ae990
+  seconds:
+    opt: 2862.2
+    reflect: 184.4
+    round: 3046.6
+  bound: latency
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - speed FAIL
+  validation_disagreement: act.yaml reported validation exit 0; the framework's run exited 2
+  score: 0.55068
+  outcome: delivered
+  passed: true
+  accepted: true
+  tflops:
+    fast: 19.8533
+    proxy: 324.5521
+    prod: 499.1459
+  targets:
+    fast: 51.221
+    proxy: 574.3596
+    prod: 713.7059
+  beats:
+    fast: 51.221
+    proxy: 574.3596
+    prod: 713.7059
+  incumbents:
+    fast: 19.4277
+    proxy: 271.0651
+    prod: 474.0365
+  gain: 1.0907
+  changed: 1
+  flops:
+    fast: 5373952000.0
+    proxy: 343681269760.0
+    prod: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: null
+  changed_disagreement: null
+- round: 13
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  sessions:
+    opt: 05cd00a3-d782-474b-b29b-881754aa0da1
+  seconds:
+    opt: 3232.1
+    reflect: 150.5
+    round: 3382.6
+  bound: latency
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - speed FAIL
+  validation_disagreement: act.yaml reported validation exit 0; the framework's run exited 2
+  score: 0.70413
+  outcome: delivered
+  passed: true
+  accepted: true
+  tflops:
+    fast: 34.3792
+    proxy: 417.1522
+    prod: 497.3859
+  targets:
+    fast: 50.2991
+    proxy: 572.1337
+    prod: 710.7809
+  beats:
+    fast: 50.2991
+    proxy: 572.1337
+    prod: 710.7809
+  incumbents:
+    fast: 19.391
+    proxy: 312.6399
+    prod: 495.4253
+  gain: 1.3704
+  changed: 2
+  flops:
+    fast: 5373952000.0
+    proxy: 343681269760.0
+    prod: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: null
+  changed_disagreement: null
+- round: 14
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  sessions:
+    opt: 514a355e-2802-4e68-8b7f-1bde2a2b7652
+  seconds:
+    opt: 4236.9
+    reflect: 135.1
+    round: 4372.0
+  bound: latency
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - speed FAIL
+  validation_disagreement: act.yaml reported validation exit 1; the framework's run exited 2
+  score: 0.77065
+  outcome: delivered
+  passed: true
+  accepted: true
+  tflops:
+    fast: 43.151
+    proxy: 440.812
+    prod: 499.139
+  targets:
+    fast: 50.301
+    proxy: 580.765
+    prod: 718.122
+  beats:
+    fast: 50.301
+    proxy: 580.765
+    prod: 718.122
+  incumbents:
+    fast: 33.496
+    proxy: 422.688
+    prod: 498.168
+  gain: 1.111
+  changed: 2
+  flops:
+    fast: 5373952000.0
+    proxy: 343681269760.0
+    prod: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: null
+  changed_disagreement: null
+- round: 15
+  progress:
+  - opt
+  mode: fast
+  sessions:
+    opt: 3504f98b-3724-4f07-b494-8feb6b9b5a62
+  seconds:
+    opt: 3751.5
+    reflect: 242.8
+    round: 3994.3
+  bound: latency
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - speed FAIL
+  score: 0.73266
+  outcome: failed
+  passed: false
+  accepted: false
+  tflops:
+    fast: 41.857
+    proxy: 415.892
+    prod: 475.141
+  targets:
+    fast: 51.329
+    proxy: 579.699
+    prod: 714.419
+  beats:
+    fast: 51.329
+    proxy: 579.699
+    prod: 714.419
+  incumbents:
+    fast: 39.488
+    proxy: 423.686
+    prod: 490.432
+  gain: 1.0035
+  changed: 1
+  flops:
+    fast: 5373952000.0
+    proxy: 343681269760.0
+    prod: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: "FastError: {'id': 'r15.i1.g46', 'what': '\u628A k_dkdv \u5FAA\u73AF\u4F53\u91CC\u7684\u4E24\u5768\
+    \u5168 drain\uFF08pops 74 / pops 22\uFF09\u6362\u6210\u624B\u5199\u7684\u5206\u7EA7\u7B49\u5F85 s_wait_loadcnt(N>0)\
+    \ / s_wait_dscnt(N>0)'} was dropped without being written into facts.md or dead_ends.md, and without"
+  changed_disagreement: null
+- round: 16
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  sessions:
+    opt: 93fa812b-2228-4b90-aa83-5f041ed61872
+  seconds:
+    opt: 2758.4
+    reflect: 119.7
+    round: 2878.1
+  bound: latency
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - speed FAIL
+  score: 0.75458
+  outcome: delivered
+  passed: true
+  accepted: true
+  tflops:
+    fast: 41.598
+    proxy: 434.598
+    prod: 502.028
+  targets:
+    fast: 50.915
+    proxy: 580.508
+    prod: 719.14
+  beats:
+    fast: 50.915
+    proxy: 580.508
+    prod: 719.14
+  incumbents:
+    fast: 41.68
+    proxy: 430.183
+    prod: 498.744
+  gain: 1.005
+  changed: 1
+  flops:
+    fast: 5373952000.0
+    proxy: 343681269760.0
+    prod: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: null
+  changed_disagreement: null
+- round: 17
+  progress:
+  - profiling
+  - plan
+  - act
+  - reflect
+  mode: deep
+  profiled_in: 17
+  profiled_sha: 63b7e1a3b3c04be9
+  profiled_on: docker||(pre-existing container)|fa-repro
+  seconds:
+    profiling: 6916.2
+    plan: 2486.9
+    act: 2668.6
+    reflect: 598.6
+    round: 12670.3
+  bound: compute
+  sessions:
+    planner: aaa8419a-ab72-446a-b6f0-49d5365f7bcd
+    reviewer: 01a0d22d-bd0f-75c2-a852-71e865e1982a
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - speed FAIL
+  score: 0.86264
+  outcome: delivered
+  passed: true
+  accepted: true
+  tflops:
+    fast: 56.451
+    proxy: 448.774
+    prod: 507.79
+  targets:
+    fast: 50.915
+    proxy: 580.508
+    prod: 719.14
+  beats:
+    fast: 50.915
+    proxy: 580.508
+    prod: 719.14
+  incumbents:
+    fast: 38.896
+    proxy: 440.23
+    prod: 504.704
+  gain: 1.159
+  changed: 2
+  flops:
+    fast: 5373952000.0
+    proxy: 343681269760.0
+    prod: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: null
+  changed_disagreement: null
+- round: 18
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  seconds:
+    opt: 3914.6
+    reflect: 124.9
+    round: 4039.5
+  sessions:
+    opt: 65bfb8a3-1ba4-4a67-bdaa-9ed64db187ed
+  bound: latency
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - speed FAIL
+  score: 0.78861
+  outcome: delivered
+  passed: true
+  accepted: false
+  tflops:
+    prod: 469.56
+    proxy: 404.85
+    fast: 52.22
+  targets:
+    prod: 719.49
+    proxy: 580.97
+    fast: 51.38
+  beats:
+    prod: 719.49
+    proxy: 580.97
+    fast: 51.38
+  incumbents:
+    prod: 504.03
+    proxy: 441.98
+    fast: 55.27
+  gain: 0.9308
+  changed: 1
+  flops:
+    prod: 5373952000.0
+    proxy: 343681269760.0
+    fast: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: 'prod: 469.6 is 93.2% of its best ever 504.0'
+  changed_disagreement: null
+- round: 19
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  sessions:
+    opt: 0c26f3c1-9a0e-493e-a17e-fb0a7790a92a
+  seconds:
+    opt: 2190.3
+    reflect: 124.8
+    round: 2315.1
+  bound: latency
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - speed FAIL
+  score: 0.82478
+  outcome: delivered
+  passed: true
+  accepted: false
+  tflops:
+    prod: 505.29
+    proxy: 439.83
+    fast: 53.11
+  targets:
+    prod: 719.5
+    proxy: 584.97
+    fast: 52.06
+  beats:
+    prod: 719.5
+    proxy: 584.97
+    fast: 52.06
+  incumbents:
+    prod: 504.9
+    proxy: 440.29
+    fast: 54.08
+  gain: 0.9939
+  changed: 1
+  flops:
+    prod: 5373952000.0
+    proxy: 343681269760.0
+    fast: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: throughput 0.9939x its best ever does not improve on it (score 0.82478, incumbent 0.83107)
+  changed_disagreement: null
+- round: 20
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  sessions:
+    opt: 89200d61-ed62-44e8-9dab-a30f248828bd
+  seconds:
+    opt: 3727.7
+    reflect: 122.3
+    round: 3850.0
+  bound: latency
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - speed FAIL
+  score: 0.85104
+  outcome: delivered
+  passed: true
+  accepted: true
+  tflops:
+    prod_b4_s8192_hq32_hkv8_d128: 511.42
+    proxy_b1_s4096_hq32_hkv8_d128: 435.93
+    fast_b1_s1024_hq8_hkv2_d128: 55.07
+  targets:
+    prod_b4_s8192_hq32_hkv8_d128: 715.94
+    proxy_b1_s4096_hq32_hkv8_d128: 575.17
+    fast_b1_s1024_hq8_hkv2_d128: 50.95
+  beats:
+    prod_b4_s8192_hq32_hkv8_d128: 715.94
+    proxy_b1_s4096_hq32_hkv8_d128: 575.17
+    fast_b1_s1024_hq8_hkv2_d128: 50.95
+  incumbents:
+    prod_b4_s8192_hq32_hkv8_d128: 501.41
+    proxy_b1_s4096_hq32_hkv8_d128: 442.54
+    fast_b1_s1024_hq8_hkv2_d128: 55.09
+  gain: 1.0016
+  changed: 1
+  flops:
+    prod_b4_s8192_hq32_hkv8_d128: 5373952000.0
+    proxy_b1_s4096_hq32_hkv8_d128: 343681269760.0
+    fast_b1_s1024_hq8_hkv2_d128: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: null
+  changed_disagreement: null
+- round: 21
+  progress:
+  - opt
+  mode: fast
+  sessions:
+    opt: 738c4c24-3268-4f7a-9d2c-b1a42cf765cd
+  seconds:
+    opt: 2760.5
+    reflect: 316.0
+    round: 3076.5
+  bound: latency
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - speed FAIL
+  score: 0.75656
+  outcome: failed
+  passed: false
+  accepted: false
+  tflops:
+    prod: 412.1
+    proxy: 365.71
+    fast: 53.3
+  targets:
+    prod: 713.09
+    proxy: 576.05
+    fast: 50.43
+  beats:
+    prod: 713.09
+    proxy: 576.05
+    fast: 50.43
+  incumbents:
+    prod: 509.15
+    proxy: 438.99
+    fast: 54.73
+  gain: 0.8721
+  changed: 1
+  flops:
+    prod: 5373952000.0
+    proxy: 343681269760.0
+    fast: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: 'FastError: {''id'': ''r21.i3.g65'', ''status'': ''CLOSED'', ''where'': ''offline screen, zero
+    card time'', ''evidence'': ''k_dq ISA instruction-identical to incumbent after register renaming;
+    k_dkdv and k_delta_bshd byte-ident'
+  changed_disagreement: null
+- round: 22
+  progress:
+  - opt
+  mode: fast
+  sessions:
+    opt: c9ccd7b0-a13c-45cc-86dc-0f974e2f9c66
+  seconds:
+    opt: 2058.1
+    reflect: 192.2
+    round: 2250.3
+  bound: latency
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - speed FAIL
+  score: 0.68282
+  outcome: failed
+  passed: false
+  accepted: false
+  tflops:
+    prod: 361.73
+    proxy: 327.77
+    fast: 51.22
+  targets:
+    prod: 719.14
+    proxy: 584.05
+    fast: 52.04
+  beats:
+    prod: 719.14
+    proxy: 584.05
+    fast: 52.04
+  incumbents:
+    prod: 516.87
+    proxy: 443.73
+    fast: 55.32
+  gain: 0.7881
+  changed: 1
+  flops:
+    prod: 5373952000.0
+    proxy: 343681269760.0
+    fast: 5498229227520.0
+  guards: {}
+  guard_failed: null
+  note: "FastError: {'id': 'r23.i1.g69', 'what': 'TDM / cluster \u591A\u64AD\u63A5\u7BA1 k_dq \u7684 K/V\
+    \ staging\uFF08\u8BED\u6599\u5B9E\u6D4B +40.68%, n=5\uFF09', 'gate': '\u96F6\u5361\u65F6\u95F4\u2014\
+    \u2014\u8BFB _ldkv \u7684\u6D88\u8D39\u8005\uFF0C\u5224\u5B9A K/V \u662F\u5426 dual-use\uFF1B\u662F\
+    \u5219\u968F r5.i2.g18 \u514D\u8D39\u51FA\u5C40'} was dropped without being written into fact"
+  changed_disagreement: null
+- round: 23
+  progress: []
+  mode: fast
+  running:
+    module: opt
+    step: null
+    since: '2026-09-24T14:29:35'
+  seconds:
+    opt: 75.0
+    round: 75.0
