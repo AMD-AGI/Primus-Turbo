@@ -81,7 +81,11 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
             operation_desc, scaleB_inv_ptr_desc, &scaleB_inv, sizeof(scaleB_inv)));
     }
 
-    const int                                     request_solutions = 1;
+    // gfx950 rejects the top-ranked algorithm for some shapes with HIPBLAS_STATUS_INTERNAL_ERROR --
+    // DeepSeek-V3's MLA kv_down_proj (bf16, transA=OP_T, K=7168, N in {544,576}) hits it every time.
+    // The heuristic still returns usable alternatives, so ask for several and take the first that
+    // actually runs instead of failing the step.
+    const int                                     request_solutions = 8;
     std::vector<hipblasLtMatmulHeuristicResult_t> algos(request_solutions);
     int                                           returnedAlgoCount = 0;
 
@@ -97,20 +101,27 @@ void hipblaslt_gemm_impl(const void *A, const hipDataType A_type, const int64_t 
                        "hipBLASLt: no valid algorithm found for current matmul config");
 
     const float alpha = 1.0;
-    // clang-format off
-    PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatmul(
-        handle,
-        operation_desc,
-        &alpha,
-        A, A_desc,
-        B, B_desc,
-        &beta,
-        D, D_desc,
-        D, D_desc,
-        &algos[0].algo,
-        workspace, workspace_size,
-        stream));
-    // clang-format on
+    hipblasStatus_t matmul_status = HIPBLAS_STATUS_INTERNAL_ERROR;
+    for (int i = 0; i < returnedAlgoCount; ++i) {
+        // clang-format off
+        matmul_status = hipblasLtMatmul(
+            handle,
+            operation_desc,
+            &alpha,
+            A, A_desc,
+            B, B_desc,
+            &beta,
+            D, D_desc,
+            D, D_desc,
+            &algos[i].algo,
+            workspace, workspace_size,
+            stream);
+        // clang-format on
+        if (matmul_status == HIPBLAS_STATUS_SUCCESS) {
+            break;
+        }
+    }
+    PRIMUS_TURBO_CHECK_HIPBLAS(matmul_status);
 
     PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutDestroy(D_desc));
     PRIMUS_TURBO_CHECK_HIPBLAS(hipblasLtMatrixLayoutDestroy(B_desc));
