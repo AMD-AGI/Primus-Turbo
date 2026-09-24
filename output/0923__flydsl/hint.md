@@ -2027,3 +2027,46 @@ that lost by 16.25%.
 *And note how this one entered:* a tool was recommended in a prompt on the strength of what
 it is documented to do. Nothing in the chain was dishonest; it simply had not been run.
 **A capability claim that has not been exercised on this machine is a hypothesis.**
+
+---
+
+## h27 — deep rounds do not receive this file. Three of their four stages fly blind.
+
+Found while watching round 17, the campaign's first deep round.
+
+```
+fast_loop/run.py          imports hints   ✓
+deep_loop/reflect/run.py  imports hints   ✓
+deep_loop/profiling/run.py                ✗   never
+deep_loop/plan/run.py                     ✗   never
+deep_loop/act/run.py                      ✗   never
+```
+
+**So in a deep round, the three stages that diagnose the kernel, choose the candidate and
+build it cannot see a single one of these hints.** Only `reflect` — which runs after
+everything is decided and measured — gets them. A fast round is strictly better informed
+than a deep one on everything this campaign has learned.
+
+It showed immediately. Round 17's `06_bound`, the step that forms the round's verdict,
+read `VGPR 480` for `k_dq` straight off the `rocprofv3` column and concluded **2 waves/SIMD**.
+The column is half the ISA count (h19, h25, measured three days earlier): `k_dq` is **960**,
+so **1 wave/SIMD**. It also attributed `k_dkdv`'s 1 wave/SIMD to **LDS**, when h25 measured
+that its **740 VGPRs force it independently** and the 48,128 B LDS hole costs zero
+occupancy. A plan built on that attribution would go shrink LDS for nothing.
+
+**Mitigation applied**, because a code change to `run.py` would not have reached the
+already-running process: the six decision-changing corrections are now inlined into
+`deep_loop/{profiling,plan,act}/prompts/_preamble.md`. Prompts are read from disk per step,
+so the edit landed before round 17's `plan` began. The block names itself as a stand-in and
+says why it exists.
+
+**The real fix is still owed**: wire `hints` into those three modules the way `fast_loop`
+does. Until then, **every new hint must be copied into that preamble block by hand, or deep
+rounds will not have it.** That is a maintenance burden and it will be forgotten — treat
+the preamble block as a cache that goes stale, not as the source of truth.
+
+*And the general shape of it, again:* the hint file was doing its job perfectly for fast
+rounds, so nothing looked broken. The failure was in a channel nobody had checked, and it
+surfaced only because a stage produced a number that contradicted something already
+measured. **When enabling a new code path, verify that the accumulated context reaches it —
+not just that it runs.**
