@@ -1,0 +1,192 @@
+##############################################################################
+## /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/018/_scratch/dump_cur/k_dkdv_0/21_final_isa.s
+
+  ---- body .LBB0_4   issue_slots=625  WMMA=64  slots/WMMA=9.77
+       s_wait_loadcnt  @slot  170  pops  6  critical op buffer_load_b128   issued @  71  DISTANCE=  99
+       s_wait_loadcnt  @slot  173  pops  5  critical op buffer_load_b128   issued @  89  DISTANCE=  84
+       s_wait_loadcnt  @slot  175  pops  1  critical op buffer_load_b128   issued @  91  DISTANCE=  84
+       s_wait_loadcnt  @slot  180  pops  5  critical op buffer_load_b128   issued @ 104  DISTANCE=  76
+       s_wait_loadcnt  @slot  182  pops  1  critical op buffer_load_b128   issued @ 105  DISTANCE=  77
+       s_wait_loadcnt  @slot  191  pops 11  critical op buffer_load_b128   issued @ 130  DISTANCE=  61
+       s_wait_loadcnt  @slot  193  pops  1  critical op buffer_load_b128   issued @ 131  DISTANCE=  62
+       s_wait_loadcnt  @slot  197  pops  3  critical op buffer_load_b128   issued @ 134  DISTANCE=  63
+       s_wait_loadcnt  @slot  199  pops  1  critical op buffer_load_b128   issued @ 135  DISTANCE=  64
+       s_wait_loadcnt  @slot  417  pops  2  critical op buffer_load_b128   issued @ 137  DISTANCE= 280
+       s_wait_dscnt    @slot  546  pops 58  critical op ds_load_tr16_b128  issued @ 543  DISTANCE=   3
+       s_wait_dscnt    @slot  576  pops  4  critical op ds_load_tr16_b128  issued @ 549  DISTANCE=  27
+       s_wait_dscnt    @slot  578  pops  2  critical op ds_load_tr16_b128  issued @ 551  DISTANCE=  27
+       s_wait_dscnt    @slot  580  pops  2  critical op ds_load_tr16_b128  issued @ 553  DISTANCE=  27
+       s_wait_dscnt    @slot  583  pops  2  critical op ds_load_tr16_b128  issued @ 555  DISTANCE=  28
+       s_wait_dscnt    @slot  585  pops  2  critical op ds_load_tr16_b128  issued @ 557  DISTANCE=  28
+       s_wait_dscnt    @slot  588  pops  2  critical op ds_load_tr16_b128  issued @ 560  DISTANCE=  28
+       s_wait_dscnt    @slot  590  pops  2  critical op ds_load_tr16_b128  issued @ 562  DISTANCE=  28
+       s_wait_dscnt    @slot  593  pops  2  critical op ds_load_tr16_b128  issued @ 575  DISTANCE=  18
+       s_wait_dscnt    @slot  599  pops  2  critical op ds_load_tr16_b128  issued @ 597  DISTANCE=   2
+       s_wait_dscnt    @slot  605  pops  2  critical op ds_load_tr16_b128  issued @ 603  DISTANCE=   2
+       loadcnt distances: n=10 min=61 median=77 max=280 sum=950  mean=95.0
+       dscnt   distances: n=11 min=2 median=27 max=28 sum=218  mean=19.8
+
+  ---- body .LBB0_8   issue_slots=675  WMMA=64  slots/WMMA=10.55
+       s_wait_loadcnt  @slot  228  pops  1  critical op buffer_load_b32    issued @  38  DISTANCE= 190
+       s_wait_loadcnt  @slot  312  pops  1  critical op buffer_load_b32    issued @  39  DISTANCE= 273
+       s_wait_dscnt    @slot  480  pops 74  critical op ds_load_tr16_b128  issued @ 472  DISTANCE=   8
+       s_wait_loadcnt  @slot  483  pops  2  critical op buffer_load_b32    issued @  42  DISTANCE= 441
+       s_wait_dscnt    @slot  486  pops  4  critical op ds_load_tr16_b128  issued @ 476  DISTANCE=  10
+       s_wait_dscnt    @slot  488  pops  2  critical op ds_load_tr16_b128  issued @ 478  DISTANCE=  10
+       s_wait_loadcnt  @slot  501  pops 25  critical op buffer_load_b128   issued @ 108  DISTANCE= 393
+       s_wait_loadcnt  @slot  508  pops  1  critical op buffer_load_b128   issued @ 109  DISTANCE= 399
+       s_wait_loadcnt  @slot  530  pops  2  critical op buffer_load_b128   issued @ 111  DISTANCE= 419
+       s_wait_loadcnt  @slot  612  pops  4  critical op buffer_load_b128   issued @ 115  DISTANCE= 497
+       loadcnt distances: n=7 min=190 median=399 max=497 sum=2612  mean=373.1
+       dscnt   distances: n=3 min=8 median=10 max=10 sum=28  mean=9.3
+##############################################################################
+## /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/018/1-opt/raw/isa_g56_build3_k_dkdv.s
+
+  ---- body .LBB0_4   issue_slots=668  WMMA=64  slots/WMMA=10.44
+       s_wait_loadcnt  @slot  173  pops  4  critical op buffer_load_b128   issued @  77  DISTANCE=  96
+       s_wait_loadcnt  @slot  177  pops  1  critical op buffer_load_b128   issued @  83  DISTANCE=  94
+       s_wait_loadcnt  @slot  179  pops  1  critical op buffer_load_b128   issued @  84  DISTANCE=  95
+       s_wait_loadcnt  @slot  184  pops  3  critical op buffer_load_b128   issued @  98  DISTANCE=  86
+       s_wait_loadcnt  @slot  186  pops  1  critical op buffer_load_b128   issued @  99  DISTANCE=  87
+       s_wait_loadcnt  @slot  193  pops  7  critical op buffer_load_b128   issued @ 115  DISTANCE=  78
+       s_wait_loadcnt  @slot  195  pops  1  critical op buffer_load_b128   issued @ 116  DISTANCE=  79
+       s_wait_loadcnt  @slot  199  pops  7  critical op buffer_load_b128   issued @ 139  DISTANCE=  60
+       s_wait_loadcnt  @slot  201  pops  1  critical op buffer_load_b128   issued @ 141  DISTANCE=  60
+       s_wait_dscnt    @slot  210  pops 17  critical op ds_load_2addr_b32  issued @ 209  DISTANCE=   1
+       s_wait_loadcnt  @slot  259  pops  2  critical op buffer_load_b128   issued @ 146  DISTANCE= 113
+       s_wait_loadcnt  @slot  320  pops  4  critical op buffer_load_b128   issued @ 159  DISTANCE= 161
+       s_wait_loadcnt  @slot  441  pops  1  critical op buffer_load_b128   issued @ 162  DISTANCE= 279
+       s_wait_loadcnt  @slot  443  pops  1  critical op buffer_load_b128   issued @ 164  DISTANCE= 279
+       s_wait_dscnt    @slot  472  pops 21  critical op ds_load_2addr_b32  issued @ 450  DISTANCE=  22
+       s_wait_dscnt    @slot  588  pops 22  critical op ds_load_tr16_b128  issued @ 585  DISTANCE=   3
+       s_wait_dscnt    @slot  619  pops  4  critical op ds_load_tr16_b128  issued @ 591  DISTANCE=  28
+       s_wait_dscnt    @slot  621  pops  2  critical op ds_load_tr16_b128  issued @ 593  DISTANCE=  28
+       s_wait_dscnt    @slot  623  pops  2  critical op ds_load_tr16_b128  issued @ 595  DISTANCE=  28
+       s_wait_dscnt    @slot  626  pops  2  critical op ds_load_tr16_b128  issued @ 597  DISTANCE=  29
+       s_wait_dscnt    @slot  628  pops  2  critical op ds_load_tr16_b128  issued @ 599  DISTANCE=  29
+       s_wait_dscnt    @slot  631  pops  2  critical op ds_load_tr16_b128  issued @ 602  DISTANCE=  29
+       s_wait_dscnt    @slot  633  pops  2  critical op ds_load_tr16_b128  issued @ 604  DISTANCE=  29
+       s_wait_dscnt    @slot  636  pops  2  critical op ds_load_tr16_b128  issued @ 618  DISTANCE=  18
+       s_wait_dscnt    @slot  642  pops  2  critical op ds_load_tr16_b128  issued @ 640  DISTANCE=   2
+       s_wait_dscnt    @slot  648  pops  2  critical op ds_load_tr16_b128  issued @ 646  DISTANCE=   2
+       loadcnt distances: n=13 min=60 median=94 max=279 sum=1567  mean=120.5
+       dscnt   distances: n=13 min=1 median=28 max=29 sum=248  mean=19.1
+
+  ---- body .LBB0_8   issue_slots=667  WMMA=64  slots/WMMA=10.42
+       s_wait_loadcnt  @slot   50  pops  2  critical op global_load_async_to_lds_b32 issued @  47  DISTANCE=   3
+       s_wait_dscnt    @slot  171  pops 17  critical op ds_load_2addr_b32  issued @ 154  DISTANCE=  17
+       s_wait_dscnt    @slot  325  pops 21  critical op ds_load_2addr_b32  issued @ 306  DISTANCE=  19
+       s_wait_dscnt    @slot  482  pops 38  critical op ds_load_tr16_b128  issued @ 474  DISTANCE=   8
+       s_wait_dscnt    @slot  485  pops  4  critical op ds_load_tr16_b128  issued @ 478  DISTANCE=   7
+       s_wait_dscnt    @slot  487  pops  2  critical op ds_load_tr16_b128  issued @ 480  DISTANCE=   7
+       s_wait_loadcnt  @slot  502  pops 30  critical op buffer_load_b128   issued @ 121  DISTANCE= 381
+       s_wait_loadcnt  @slot  635  pops  2  critical op buffer_load_b128   issued @ 123  DISTANCE= 512
+       loadcnt distances: n=3 min=3 median=381 max=512 sum=896  mean=298.7
+       dscnt   distances: n=5 min=7 median=8 max=19 sum=58  mean=11.6
+
+### k_dkdv_0 .LBB0_4 slots=625 async_ops=0 WMMA_cost=8  STEADY cycles=2124 stall=1051 (49.5%)
+      queue loadcnt        725 cyc
+      queue dscnt          326 cyc
+      stall      725 cyc ( 69.0%) on buffer_load_b128
+      stall      326 cyc ( 31.0%) on ds_load_tr16_b128
+        site@ 170 loadcnt   N=30   popped buffer_load_b128                 issued@  71 0 iter(s) earlier JUMP=    701
+        site@ 173 loadcnt   N=25   popped buffer_load_b128                 issued@  89 0 iter(s) earlier JUMP=      8
+        site@ 180 loadcnt   N=19   popped buffer_load_b128                 issued@ 104 0 iter(s) earlier JUMP=      8
+        site@ 191 loadcnt   N=7    popped buffer_load_b128                 issued@ 130 0 iter(s) earlier JUMP=      8
+        site@ 546 dscnt     N=2    popped ds_load_tr16_b128                issued@ 543 0 iter(s) earlier JUMP=     97
+        site@ 576 dscnt     N=14   popped ds_load_tr16_b128                issued@ 549 0 iter(s) earlier JUMP=     24
+        site@ 593 dscnt     N=0    popped ds_load_tr16_b128                issued@ 575 0 iter(s) earlier JUMP=      9
+        site@ 599 dscnt     N=0    popped ds_load_tr16_b128                issued@ 597 0 iter(s) earlier JUMP=     98
+        site@ 605 dscnt     N=0    popped ds_load_tr16_b128                issued@ 603 0 iter(s) earlier JUMP=     98
+
+### k_dkdv_0 .LBB0_8 slots=675 async_ops=0 WMMA_cost=8  STEADY cycles=1685 stall=562 (33.4%)
+      queue loadcnt        470 cyc
+      queue dscnt           92 cyc
+      stall      470 cyc ( 83.6%) on buffer_load_b32
+      stall       92 cyc ( 16.4%) on ds_load_tr16_b128
+        site@ 228 loadcnt   N=35   popped buffer_load_b32                  issued@  38 0 iter(s) earlier JUMP=    470
+        site@ 480 dscnt     N=6    popped ds_load_tr16_b128                issued@ 472 0 iter(s) earlier JUMP=     92
+
+### raw .LBB0_4 slots=668 async_ops=2 WMMA_cost=8 L_ASYNC=400  STEADY cycles=2324 stall=1208 (52.0%)
+      queue dscnt          482 cyc
+      queue loadcnt        441 cyc
+      queue asynccnt       285 cyc
+      stall      441 cyc ( 36.5%) on buffer_load_b128
+      stall      326 cyc ( 27.0%) on ds_load_tr16_b128
+      stall      285 cyc ( 23.6%) on global_load_async_to_lds_b32
+      stall      156 cyc ( 12.9%) on ds_load_2addr_b32
+        site@ 167 asynccnt  N=0    popped global_load_async_to_lds_b32     issued@  52 0 iter(s) earlier JUMP=    285
+        site@ 173 loadcnt   N=30   popped buffer_load_b128                 issued@  77 0 iter(s) earlier JUMP=    419
+        site@ 184 loadcnt   N=25   popped buffer_load_b128                 issued@  98 0 iter(s) earlier JUMP=      3
+        site@ 193 loadcnt   N=17   popped buffer_load_b128                 issued@ 115 0 iter(s) earlier JUMP=      1
+        site@ 199 loadcnt   N=9    popped buffer_load_b128                 issued@ 139 0 iter(s) earlier JUMP=     18
+        site@ 210 dscnt     N=0    popped ds_load_2addr_b32                issued@ 209 0 iter(s) earlier JUMP=     99
+        site@ 472 dscnt     N=0    popped ds_load_2addr_b32                issued@ 450 0 iter(s) earlier JUMP=     57
+        site@ 588 dscnt     N=2    popped ds_load_tr16_b128                issued@ 585 0 iter(s) earlier JUMP=     97
+        site@ 619 dscnt     N=14   popped ds_load_tr16_b128                issued@ 591 0 iter(s) earlier JUMP=     23
+        site@ 636 dscnt     N=0    popped ds_load_tr16_b128                issued@ 618 0 iter(s) earlier JUMP=     10
+        site@ 642 dscnt     N=0    popped ds_load_tr16_b128                issued@ 640 0 iter(s) earlier JUMP=     98
+        site@ 648 dscnt     N=0    popped ds_load_tr16_b128                issued@ 646 0 iter(s) earlier JUMP=     98
+
+### raw .LBB0_4 slots=668 async_ops=2 WMMA_cost=8 L_ASYNC=800  STEADY cycles=2324 stall=1208 (52.0%)
+      queue asynccnt       685 cyc
+      queue dscnt          482 cyc
+      queue loadcnt         41 cyc
+      stall      685 cyc ( 56.7%) on global_load_async_to_lds_b32
+      stall      326 cyc ( 27.0%) on ds_load_tr16_b128
+      stall      156 cyc ( 12.9%) on ds_load_2addr_b32
+      stall       41 cyc (  3.4%) on buffer_load_b128
+        site@ 167 asynccnt  N=0    popped global_load_async_to_lds_b32     issued@  52 0 iter(s) earlier JUMP=    685
+        site@ 173 loadcnt   N=30   popped buffer_load_b128                 issued@  77 0 iter(s) earlier JUMP=     19
+        site@ 184 loadcnt   N=25   popped buffer_load_b128                 issued@  98 0 iter(s) earlier JUMP=      3
+        site@ 193 loadcnt   N=17   popped buffer_load_b128                 issued@ 115 0 iter(s) earlier JUMP=      1
+        site@ 199 loadcnt   N=9    popped buffer_load_b128                 issued@ 139 0 iter(s) earlier JUMP=     18
+        site@ 210 dscnt     N=0    popped ds_load_2addr_b32                issued@ 209 0 iter(s) earlier JUMP=     99
+        site@ 472 dscnt     N=0    popped ds_load_2addr_b32                issued@ 450 0 iter(s) earlier JUMP=     57
+        site@ 588 dscnt     N=2    popped ds_load_tr16_b128                issued@ 585 0 iter(s) earlier JUMP=     97
+        site@ 619 dscnt     N=14   popped ds_load_tr16_b128                issued@ 591 0 iter(s) earlier JUMP=     23
+        site@ 636 dscnt     N=0    popped ds_load_tr16_b128                issued@ 618 0 iter(s) earlier JUMP=     10
+        site@ 642 dscnt     N=0    popped ds_load_tr16_b128                issued@ 640 0 iter(s) earlier JUMP=     98
+        site@ 648 dscnt     N=0    popped ds_load_tr16_b128                issued@ 646 0 iter(s) earlier JUMP=     98
+
+### raw .LBB0_4 slots=668 async_ops=2 WMMA_cost=8 L_ASYNC=1600  STEADY cycles=3083 stall=1967 (63.8%)
+      queue asynccnt      1485 cyc
+      queue dscnt          482 cyc
+      stall     1485 cyc ( 75.5%) on global_load_async_to_lds_b32
+      stall      326 cyc ( 16.6%) on ds_load_tr16_b128
+      stall      156 cyc (  7.9%) on ds_load_2addr_b32
+        site@ 167 asynccnt  N=0    popped global_load_async_to_lds_b32     issued@  52 0 iter(s) earlier JUMP=   1485
+        site@ 210 dscnt     N=0    popped ds_load_2addr_b32                issued@ 209 0 iter(s) earlier JUMP=     99
+        site@ 472 dscnt     N=0    popped ds_load_2addr_b32                issued@ 450 0 iter(s) earlier JUMP=     57
+        site@ 588 dscnt     N=2    popped ds_load_tr16_b128                issued@ 585 0 iter(s) earlier JUMP=     97
+        site@ 619 dscnt     N=14   popped ds_load_tr16_b128                issued@ 591 0 iter(s) earlier JUMP=     23
+        site@ 636 dscnt     N=0    popped ds_load_tr16_b128                issued@ 618 0 iter(s) earlier JUMP=     10
+        site@ 642 dscnt     N=0    popped ds_load_tr16_b128                issued@ 640 0 iter(s) earlier JUMP=     98
+        site@ 648 dscnt     N=0    popped ds_load_tr16_b128                issued@ 646 0 iter(s) earlier JUMP=     98
+
+### raw .LBB0_8 slots=667 async_ops=2 WMMA_cost=8 L_ASYNC=400  STEADY cycles=1343 stall=228 (17.0%)
+      queue dscnt          228 cyc
+      stall      136 cyc ( 59.6%) on ds_load_2addr_b32
+      stall       92 cyc ( 40.4%) on ds_load_tr16_b128
+        site@ 171 dscnt     N=0    popped ds_load_2addr_b32                issued@ 154 0 iter(s) earlier JUMP=     69
+        site@ 325 dscnt     N=0    popped ds_load_2addr_b32                issued@ 306 0 iter(s) earlier JUMP=     67
+        site@ 482 dscnt     N=6    popped ds_load_tr16_b128                issued@ 474 0 iter(s) earlier JUMP=     92
+
+### raw .LBB0_8 slots=667 async_ops=2 WMMA_cost=8 L_ASYNC=800  STEADY cycles=1343 stall=228 (17.0%)
+      queue dscnt          228 cyc
+      stall      136 cyc ( 59.6%) on ds_load_2addr_b32
+      stall       92 cyc ( 40.4%) on ds_load_tr16_b128
+        site@ 171 dscnt     N=0    popped ds_load_2addr_b32                issued@ 154 0 iter(s) earlier JUMP=     69
+        site@ 325 dscnt     N=0    popped ds_load_2addr_b32                issued@ 306 0 iter(s) earlier JUMP=     67
+        site@ 482 dscnt     N=6    popped ds_load_tr16_b128                issued@ 474 0 iter(s) earlier JUMP=     92
+
+### raw .LBB0_8 slots=667 async_ops=2 WMMA_cost=8 L_ASYNC=1600  STEADY cycles=1491 stall=376 (25.2%)
+      queue dscnt          228 cyc
+      queue asynccnt       148 cyc
+      stall      148 cyc ( 39.4%) on global_load_async_to_lds_b32
+      stall      136 cyc ( 36.2%) on ds_load_2addr_b32
+      stall       92 cyc ( 24.5%) on ds_load_tr16_b128
+        site@ 128 asynccnt  N=2    popped global_load_async_to_lds_b32     issued@  47 1 iter(s) earlier JUMP=    148
+        site@ 171 dscnt     N=0    popped ds_load_2addr_b32                issued@ 154 0 iter(s) earlier JUMP=     69
+        site@ 325 dscnt     N=0    popped ds_load_2addr_b32                issued@ 306 0 iter(s) earlier JUMP=     67
+        site@ 482 dscnt     N=6    popped ds_load_tr16_b128                issued@ 474 0 iter(s) earlier JUMP=     92

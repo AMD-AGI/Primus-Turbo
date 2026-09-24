@@ -1,0 +1,45 @@
+##############################################################################
+## /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/018/_scratch/dump_cur/k_dkdv_0/21_final_isa.s
+
+  ---- body .LBB0_4   issue_slots=625  WMMA=64  slots/WMMA=9.77
+       s_wait_loadcnt  @slot  170  pops  6  critical op buffer_load_b128   issued @  71  DISTANCE=  99
+       s_wait_loadcnt  @slot  173  pops  5  critical op buffer_load_b128   issued @  89  DISTANCE=  84
+       s_wait_loadcnt  @slot  175  pops  1  critical op buffer_load_b128   issued @  91  DISTANCE=  84
+       s_wait_loadcnt  @slot  180  pops  5  critical op buffer_load_b128   issued @ 104  DISTANCE=  76
+       s_wait_loadcnt  @slot  182  pops  1  critical op buffer_load_b128   issued @ 105  DISTANCE=  77
+       s_wait_loadcnt  @slot  191  pops 11  critical op buffer_load_b128   issued @ 130  DISTANCE=  61
+       s_wait_loadcnt  @slot  193  pops  1  critical op buffer_load_b128   issued @ 131  DISTANCE=  62
+       s_wait_loadcnt  @slot  197  pops  3  critical op buffer_load_b128   issued @ 134  DISTANCE=  63
+       s_wait_loadcnt  @slot  199  pops  1  critical op buffer_load_b128   issued @ 135  DISTANCE=  64
+       s_wait_loadcnt  @slot  417  pops  2  critical op buffer_load_b128   issued @ 137  DISTANCE= 280
+       s_wait_dscnt    @slot  546  pops 58  critical op ds_load_tr16_b128  issued @ 543  DISTANCE=   3
+       s_wait_dscnt    @slot  576  pops  4  critical op ds_load_tr16_b128  issued @ 549  DISTANCE=  27
+       s_wait_dscnt    @slot  578  pops  2  critical op ds_load_tr16_b128  issued @ 551  DISTANCE=  27
+       s_wait_dscnt    @slot  580  pops  2  critical op ds_load_tr16_b128  issued @ 553  DISTANCE=  27
+       s_wait_dscnt    @slot  583  pops  2  critical op ds_load_tr16_b128  issued @ 555  DISTANCE=  28
+       s_wait_dscnt    @slot  585  pops  2  critical op ds_load_tr16_b128  issued @ 557  DISTANCE=  28
+       s_wait_dscnt    @slot  588  pops  2  critical op ds_load_tr16_b128  issued @ 560  DISTANCE=  28
+       s_wait_dscnt    @slot  590  pops  2  critical op ds_load_tr16_b128  issued @ 562  DISTANCE=  28
+       s_wait_dscnt    @slot  593  pops  2  critical op ds_load_tr16_b128  issued @ 575  DISTANCE=  18
+       s_wait_dscnt    @slot  599  pops  2  critical op ds_load_tr16_b128  issued @ 597  DISTANCE=   2
+       s_wait_dscnt    @slot  605  pops  2  critical op ds_load_tr16_b128  issued @ 603  DISTANCE=   2
+       loadcnt distances: n=10 min=61 median=77 max=280 sum=950  mean=95.0
+       dscnt   distances: n=11 min=2 median=27 max=28 sum=218  mean=19.8
+
+  ---- body .LBB0_8   issue_slots=675  WMMA=64  slots/WMMA=10.55
+       s_wait_loadcnt  @slot  228  pops  1  critical op buffer_load_b32    issued @  38  DISTANCE= 190
+       s_wait_loadcnt  @slot  312  pops  1  critical op buffer_load_b32    issued @  39  DISTANCE= 273
+       s_wait_dscnt    @slot  480  pops 74  critical op ds_load_tr16_b128  issued @ 472  DISTANCE=   8
+       s_wait_loadcnt  @slot  483  pops  2  critical op buffer_load_b32    issued @  42  DISTANCE= 441
+       s_wait_dscnt    @slot  486  pops  4  critical op ds_load_tr16_b128  issued @ 476  DISTANCE=  10
+       s_wait_dscnt    @slot  488  pops  2  critical op ds_load_tr16_b128  issued @ 478  DISTANCE=  10
+       s_wait_loadcnt  @slot  501  pops 25  critical op buffer_load_b128   issued @ 108  DISTANCE= 393
+       s_wait_loadcnt  @slot  508  pops  1  critical op buffer_load_b128   issued @ 109  DISTANCE= 399
+       s_wait_loadcnt  @slot  530  pops  2  critical op buffer_load_b128   issued @ 111  DISTANCE= 419
+       s_wait_loadcnt  @slot  612  pops  4  critical op buffer_load_b128   issued @ 115  DISTANCE= 497
+       loadcnt distances: n=7 min=190 median=399 max=497 sum=2612  mean=373.1
+       dscnt   distances: n=3 min=8 median=10 max=10 sum=28  mean=9.3
+
+### k_dkdv_0 .LBB0_4 slots=625
+   VALU_cvt/pk      128  (20.5%)
+   SALU/ctrl         81  (13.0%)

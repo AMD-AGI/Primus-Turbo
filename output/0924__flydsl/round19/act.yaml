@@ -1,0 +1,205 @@
+round: 19
+mode: fast
+candidate: r19.i1.g59
+outcome: delivered
+
+correctness:
+  unit_tests: pass
+  precision: pass
+  checked_with: op/validation.py
+  sqnr_db: 52.52          # worst of the nine (dq/dk/dv x prod/proxy/fast) on the SHIPPED arm
+                          # r19.i1.g59. Gate is 50.0 dB. determinism x200 bitwise at fast: pass.
+                          # r19.i2.g60 measured 52.55-52.83 dB on the same gate, also pass.
+                          # Both arms were validated BEFORE any benchmark was run (h1).
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/017/op]
+  # rounds/017/op is the incumbent AND the champion at all three shapes; op/current is a
+  # byte-identical copy of it (verified with diff -r this session; op/current was not touched).
+  # It was rebuilt into TWO separate arm slots (cur_a, cur_b) this session and interleaved
+  # palindromically with the candidate slots (armA, armA_b) and armB inside ONE benchmark
+  # process per shape, 51 iters, median, L2 flush between iters. `op/beat/` was re-measured in
+  # the same sweep. Device idle before and after every session (rocm-smi --showpids:
+  # "No KFD PIDs currently running"; --showuse 0%), dmesg clean, sclk 1051-1062 MHz at
+  # prod/proxy and 1100 MHz at fast.
+  #
+  # Every figure below for a rebuilt arm is the mean of its two slots; the spread between two
+  # slots of IDENTICAL code is this session's noise floor and is quoted with it.
+  shapes:
+    - name: prod
+      this_round_tflops: 505.29     # armA 504.59 / armA_b 505.98
+      best_round_tflops: 504.90     # incumbent this session: cur_a 506.42 / cur_b 503.37
+      beat_tflops: 719.50           # re-measured in this same sweep, NOT carried forward
+      target_tflops: 719.50         # margin 1.00 x beat
+      champion_round: 17
+      champion_tflops: 504.90
+      champion_rebuilt: true
+      ratio: 0.7023
+      vs_champion: 1.0008
+      note: >
+        +0.08% against a same-code slot-to-slot floor of 0.61%. This is a NULL, not a win:
+        the shipped arm carries no speed and the round says so.
+    - name: proxy
+      this_round_tflops: 439.83     # armA 437.80 / armA_b 441.86
+      best_round_tflops: 440.29     # cur_a 443.39 / cur_b 437.18
+      beat_tflops: 584.97
+      target_tflops: 584.97
+      champion_round: 17
+      champion_tflops: 440.29
+      champion_rebuilt: true
+      ratio: 0.7519
+      vs_champion: 0.9990
+      note: "-0.10% against a same-code floor of 1.42%. Null."
+    - name: fast
+      this_round_tflops: 53.11      # armA 51.28 / armA_b 54.93
+      best_round_tflops: 54.08      # cur_a 55.59 / cur_b 52.57
+      beat_tflops: 52.06
+      target_tflops: 52.06
+      champion_round: 17
+      champion_tflops: 54.08
+      champion_rebuilt: true
+      ratio: 1.0000                 # min(53.11/52.06, 1.0) -- uncapped 1.0202
+      vs_champion: 0.9821
+      note: >
+        fast is a sentinel and does not rank a candidate (h7): the incumbent's own two slots
+        spread 5.74% (55.59 / 52.57) and the candidate's spread 7.1%, both an order of
+        magnitude above the difference being read. Reported as measured.
+  score: 0.8181                     # mean(0.7023, 0.7519, 1.0000); incumbent same-sweep 0.8180
+
+validation:
+  exit_code: 2
+  # correctness pass (>= 50 dB on all nine), determinism pass (x200 bitwise at fast),
+  # speed FAIL (geomean 0.811x of the re-measured bar against a gate of 1.00x). No round in
+  # nineteen has met the speed leg; exit 2 here is the standing state, not a regression.
+
+explored:
+  ran: []
+  # No rocprofv3, and that is a decision: h4 is a standing constraint that rocprofv3 is a dead
+  # end on this op (three faults, one power-cycle on this box). What replaced it was zero-card
+  # -time instrumentation, all of it in 1-opt/raw/, and it changed three decisions:
+  #   * attrib_ss5.py -- round 18's stall model upgraded with the missing FIFTH queue
+  #     (ASYNCcnt). It prices r18.i3.g56's body at 1343 cycles against the incumbent's 1685,
+  #     i.e. ~20% FASTER; g56 measured 6.84% SLOWER. The upgrade that was supposed to fix the
+  #     previous misprediction made it worse. -> r18.i5.g58 CLOSED without being built, and
+  #     the whole attrib*.py family demoted to a build gate (scratch/VGPR/spill) for good.
+  #   * census.py -- instruction-class census of k_dkdv .LBB0_8. 40 ds_store_b128 + 40
+  #     ds_load_tr16_b128 = 1.25 LDS ops per WMMA against k_dq's 0.33, and 64 of the 80 are
+  #     the Q/dO round trip. -> the LDS-port hypothesis, and r16.i3.g50 as the route's only idea.
+  #   * model calibration against the measured wall clock: prod k_dkdv 62.93% of 10.909 ms
+  #     over 4,177,920 loop iterations / 1024 SIMDs = ~1809 REAL cycles per iteration against
+  #     the static model's 1685, and an issue-only floor of 1123. -> ~38% of the body is
+  #     genuinely not issuing, which is the number the latency verdict rests on.
+  consulted:
+    - arch/gfx1250/isa.md
+    - arch/gfx1250/profiling-surface.md
+    - optimization/routes/1-metrics-to-techniques.md
+    - optimization/techniques/6-gfx1250-cdna5-mechanisms.md
+    - backends/flydsl/attention/techniques.md
+    - backends/flydsl/attention/dead-ends.md
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+    - backends/hipkittens/gemm/recipes/bf16_gfx1250_ladder.md
+    - ops/attention/backward.md
+  bound: latency
+  confidence: medium
+  # Raised from LOW to MEDIUM, and for the first time on a MEASUREMENT rather than a model.
+  # Compute is out (2048 FLOP/SIMD-cycle confirmed twice; matrix busy 30.4% in the hot body).
+  # Memory is out, ninth time: h8's own 107 GB / 4.39 TB/s = 24.4 ms against a measured 10.9 ms
+  # total -- HBM cannot physically be supplying that traffic, so the byte model is not measuring
+  # HBM at all. Issue roof is now out too, and that is this round's headline: r19.i2.g60 deleted
+  # 82 issue slots of hazard/window overhead (s_set_vgpr_msb 334->277, v_nop 82->24) plus 88
+  # VGPR, spill 0 -- and ran 17.27% SLOWER. A kernel that gets slower when you delete
+  # instructions is not issue-bound. What is left is latency, and the remaining mechanistic
+  # story is LDS port pressure, not bandwidth.
+  why: >
+    k_dkdv is 62.93% of prod and its .LBB0_8 measures ~1809 cycles per iteration against an
+    issue-only floor of 1123: ~686 cycles (38%) are not issuing. The census puts 80 LDS ops in
+    that body -- 1.25 per WMMA against k_dq's 0.33, 3.8x -- and 64 of the 80 are the Q/dO
+    store/transpose-load round trip, 40,960 B per wave-iteration, ~91 B/cycle/CU. k_dq, whose
+    body has ZERO modelled stall and 54.3% matrix busy, is the control. g60 independently shows
+    the latency cover is what is holding the body together: removing r7.i1.g21's 128-VGPR
+    prefetch tuple costs 17.3%, which re-prices g21 at ~+21% on today's body (it was +8.3% in
+    round 7) and makes it the largest surviving mechanism in the kernel.
+
+arms:
+  - id: r19.i1.g59
+    built: "A alone, from op/current -- WMMA A-operand reuse hint (OPSEL[2]) in k_dkdv's dK/dV loop"
+    tflops: {prod: 505.29, proxy: 439.83, fast: 53.11}
+    vs_champion: 1.0008
+    shipped: true
+    note: >
+      CORRECT, NULL, SHIPPED as the best of the two arms. The hint reached the hardware: the
+      k_dkdv ISA goes from 0 to 56 `matrix_a_reuse` of 128 v_wmma (raw/isa_dkdv_armA.s against
+      raw/isa_dkdv_cur.s), spill 0, VGPR 724 unchanged, arithmetic bit-identical, 52.52 dB.
+      It bought +0.08% prod / -0.10% proxy, both inside a same-code floor of 0.61% / 1.42%.
+      This is the corpus's FIRST measurement of gfx1250 WMMA operand reuse and the measurement
+      is zero -- which is itself worth more than the arm: the hint is free to set, it is
+      encoded, and it does not move a latency-bound body. A later round may revert it at zero
+      cost; it is left in place because it is what was measured.
+  - id: r19.i2.g60
+    built: "B alone, from op/current -- NOT on top of A. Deletes r7.i1.g21's prefetch tuple"
+    tflops: {prod: 417.73, proxy: 373.66, fast: 53.27}
+    vs_champion: 0.8273
+    shipped: false
+    note: >
+      DEAD, -17.27% prod / -15.13% proxy, and the most informative arm of the round. It removed
+      88 VGPR (724 -> 636), 57 s_set_vgpr_msb (334 -> 277) and 58 v_nop (82 -> 24, -71%) with
+      spill 0 and scratch 0 -- every static indicator improved, the time got 17% worse. Three
+      consequences, all now in pool.md and route.md: (1) the register-window tax is NOT on the
+      critical path and the gfx950 v_accvgpr 1.72x analogue does not transfer to gfx1250's flat
+      file; (2) the occupancy axis closed by r18.i2.g55 is closed from the other end too, and
+      with it h12's BLOCK_KV axis -- there is no longer even a motive to trade BLOCK_KV for
+      registers; (3) r7.i1.g21 is re-priced from +8.3% to ~+21% on today's body.
+  - id: r18.i5.g58
+    built: "not built -- CLOSED at zero card time by this round's own instrument"
+    shipped: false
+    note: >
+      Q/dO on the global_load_async_to_lds path. Round 18 left it OPEN pending an ASYNCcnt queue
+      in the attribution tool. This round built that queue (attrib_ss5.py) and it predicted g56
+      -- the same mechanism at 16 bytes per iteration -- would be 20% FASTER when it had already
+      measured 6.84% slower. The instrument that was supposed to price this family cannot price
+      it, so the family is closed rather than built blind.
+  - id: r19.i0.attrib_ss5 / r19.i0.census
+    built: "instruments, zero card time, no g allocated (round 14-18 precedent)"
+    shipped: false
+    note: >
+      raw/attrib_ss5.py (5-queue steady-state stall attribution) and raw/census.py
+      (instruction-class census). Their output is raw/attrib_async_cur_vs_g56.txt and
+      raw/census_cur_dkdv.txt. Between them they closed g58, retired the static model, and
+      selected the route's only idea row.
+
+expected: >
+  No TFLOP/s figure was written down before measuring, and I am not going to invent one after
+  the fact -- round 18's act.yaml asked round 19 to write one and round 19 did not. What opt.md
+  sections 3.1 and 3.2 DO carry, written before either arm was built, are two falsifiable
+  statements, quoted verbatim:
+
+  3.1, on g59: "The hint is only legal when the *preceding* matrix instruction used an
+  identical operand -- and the incumbent's emission order interleaves (a_p, b_do[d]) with
+  (a_ds, b_q[d]), so A alternates every instruction and the hint could never have been used
+  even if someone had thought to set it." -- CONFIRMED by the ISA: 0 matrix_a_reuse before,
+  56 after. The reasoning about legality was right; the assumption that legality implied
+  throughput was never stated and turns out to be false.
+
+  3.2, on g60: "the corpus's closest analogue (the gfx950 v_accvgpr_read/write window tax,
+  gqa_d128.md section 6.1) cost 1.72x. ... If the window tax now outweighs the prefetch, the
+  whole s_set_vgpr_msb block becomes addressable." and "It is a *measurement*, not a proposal
+  -- a loss here is the answer." -- FALSIFIED, by 17.3% in the wrong direction. The analogue
+  does not transfer. The arm was built to be falsifiable and it was falsified, which is the
+  one thing this round is confident about.
+
+added_to_pool: [r19.i1.g59, r19.i2.g60]
+route_updated: true
+
+implementation:
+  files_changed: [rounds/019/op/kernels.py]
+  build_failures: []
+  # No build failed this round. Both arms compiled and validated on the first build.
+  note: >
+    The compile cache was cleared before the first build of this round
+    (rm -rf /root/.flydsl/* ~/.cache/comgr/* inside the container, plus every __pycache__ in
+    the arm trees), so no figure here can be a stale binary from round 18. Every build and every
+    measurement went through the runner (docker exec fa-repro), detached with a sentinel rc file
+    and polled -- never on the controller.
+    rounds/019/op differs from op/current in exactly one file, kernels.py, by the 18-line g59
+    diff; op/current itself was verified untouched by diff -r at the end of the session.
