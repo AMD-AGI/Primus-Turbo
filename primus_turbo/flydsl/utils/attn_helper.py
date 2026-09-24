@@ -237,8 +237,38 @@ def _anchor_v_o(traits, v_o):
 
 
 def _anchor_v_p(traits, v_p, elem_dtype):
-    # Fixed-reference-max forward: P is never rescaled, so there is no ordering left to pin.
+    # No-op for both traits today: the fixed-reference-max build never rescales P, and the
+    # running-max build's rescale (see _rescale_v_p/tile_rescale_o) has shown no need for an
+    # explicit ordering pin so far -- revisit if scheduling ever misplaces the rescale.
     return v_p
+
+
+def _rescale_pack8(pack, corr_vec8, elem_dtype, fm_fast):
+    """Rescale one 8-wide packed elem_dtype (bf16/f16) probability vector by a per-lane
+    broadcast f32 correction: unpack -> f32, multiply, truncate back (the same widen/narrow
+    idiom as scale_all's Q rescale, which is also dtype-agnostic via a plain FPExt/FPTrunc
+    pair). Used by _rescale_v_p to keep an already-cast-and-packed P tile consistent with a
+    running max that moved after this tile's P was computed; see
+    DualwaveKernelContext.tile_rescale_o."""
+    fm_fast_attr = ir.Attribute.parse("#llvm.fastmath<fast>")
+    ext_op = llvm.FPExtOp(Vec.make_type(8, fx.Float32), as_mlir_value(pack))
+    ext_op.operation.attributes["fastmathFlags"] = fm_fast_attr
+    scaled = arith.mulf(as_mlir_value(ext_op.result), as_mlir_value(corr_vec8), fastmath=fm_fast)
+    trunc_op = llvm.FPTruncOp(Vec.make_type(8, elem_dtype), as_mlir_value(scaled))
+    trunc_op.operation.attributes["fastmathFlags"] = fm_fast_attr
+    return trunc_op.result
+
+
+def _rescale_v_p(v_p, corr, elem_dtype, fm_fast):
+    """Rescale every k-substep pack of a cast_p()-produced v_p (p_lo_packs, p_hi_packs) by
+    the same per-row corr used on O/l. Running-max path only; see
+    DualwaveKernelContext.tile_rescale_o for why this is needed in addition to scale_o_by
+    and scale_l_by."""
+    corr_vec8 = Vec.from_elements([corr], fx.Float32).broadcast_to(8)
+    p_lo_packs, p_hi_packs = v_p
+    new_lo = [_rescale_pack8(p, corr_vec8, elem_dtype, fm_fast) for p in p_lo_packs]
+    new_hi = [_rescale_pack8(p, corr_vec8, elem_dtype, fm_fast) for p in p_hi_packs]
+    return new_lo, new_hi
 
 
 def _score_lists_to_vecs(v_s_lists):
@@ -345,6 +375,7 @@ class DualwaveSwpTraits:
             self.WAVES_PER_EU,
             self.DAZ,
             self.DUALWAVE_SWP_FIXED_MAX,
+            self.DUALWAVE_SWP_REF_MAX,
             self.DUALWAVE_SWP_MFMA_ROWSUM,
             self.DUALWAVE_SWP_SETPRIO,
             self.DUALWAVE_SWP_ENABLE_STAGGER,
@@ -365,7 +396,8 @@ def _make_dualwave_swp_traits(
     dtype_str="bf16",
     waves_per_eu=2,
     daz=True,
-    dualwave_swp_fixed_max=None,
+    dualwave_swp_fixed_max=False,
+    dualwave_swp_ref_max=0.0,
     dualwave_swp_setprio=True,
     dualwave_swp_enable_stagger=True,
     varlen=False,
@@ -414,13 +446,21 @@ def _make_dualwave_swp_traits(
     dualwave_swp_kv_per_buffer = smem_k_tile_elems + smem_v_tile_elems
     varlen = bool(varlen)
     cross_seqlen = bool(cross_seqlen)
-    # Softmax is shift-invariant, so the main loop can run on a fixed zero reference max and let
-    # the epilogue re-enter the online path.
-    if dualwave_swp_fixed_max is None:
-        dualwave_swp_fixed_max = causal
-    # With a fixed reference max nothing rebases l_row mid-loop, so the running row sum
-    # can live in an MFMA accumulator fed by a ones A operand instead of a VALU fold.
-    dualwave_swp_mfma_rowsum = bool(dualwave_swp_fixed_max)
+    # Running-max online softmax is the default. The old `fixed_max = causal` path uses a
+    # zero reference max and overflows fp32 exp2 (~88.7 nats) in Llama-3.1-8B training.
+    # Callers can still pass dualwave_swp_fixed_max=True. A non-zero ref_max is only sound
+    # with fixed_max=True: under a running max it cancels from O/l_row but silently offsets
+    # store_lse by -ref_max*ln2 nats.
+    #
+    # MFMA row-sum stays on for both paths: cast_p_and_sum has no VALU-fold fallback, and
+    # scale_l_by broadcasts corr across the 4-wide accumulator (only lane 0 is read back).
+    if dualwave_swp_ref_max != 0.0 and not dualwave_swp_fixed_max:
+        raise ValueError(
+            "dualwave_swp_ref_max is only meaningful together with dualwave_swp_fixed_max=True "
+            f"(got dualwave_swp_ref_max={dualwave_swp_ref_max!r} with "
+            f"dualwave_swp_fixed_max={dualwave_swp_fixed_max!r})."
+        )
+    dualwave_swp_mfma_rowsum = True
     # Splitting the K/V LDS reads across the memory/compute cluster boundary keeps the main
     # loop inside the 4-waves-per-SIMD register budget, so ask for that budget instead of the
     # caller's floor. Stagger spends the same scheduling slack, so it keeps it.
@@ -456,6 +496,7 @@ def _make_dualwave_swp_traits(
         WAVES_PER_EU=waves_per_eu,
         DAZ=bool(daz),
         DUALWAVE_SWP_FIXED_MAX=bool(dualwave_swp_fixed_max),
+        DUALWAVE_SWP_REF_MAX=float(dualwave_swp_ref_max),
         DUALWAVE_SWP_MFMA_ROWSUM=dualwave_swp_mfma_rowsum,
         DUALWAVE_SWP_SETPRIO=bool(dualwave_swp_setprio),
         DUALWAVE_SWP_ENABLE_STAGGER=bool(dualwave_swp_enable_stagger),
@@ -568,6 +609,19 @@ class DualwaveKernelContext:
         self.c_neg_floor = fx.Float32(-3.0e38)
         self.c_zero_f = fx.Float32(0.0)
         self.c_zero_v16f32 = Vec.filled(16, 0.0, fx.Float32)
+        # Calibrated reference max (log2 units, m_row's domain): the QK MFMA accumulator
+        # already starts every tile's score from a compile-time constant (see qk() below), so
+        # starting it at -REF_MAX instead of 0 pre-shifts every raw score by the same constant
+        # with ZERO extra instructions -- no per-tile row-max reduce, no scale_o/scale_l, no
+        # _rescale_v_p. zero_row_max() hands the identical constant to the LSE epilogue
+        # (finalize_o_scale/store_lse), so the stored LSE stays exactly the absolute value it
+        # would be without the shift: LSE = ln2*(REF_MAX + log2(l_row)) and
+        # l_row = sum_j 2^(s_j*log2e - REF_MAX), so the two REF_MAX terms cancel exactly.
+        # REF_MAX=0.0 (the default) reproduces the old zero-reference fixed-max path exactly,
+        # byte-for-byte -- this is purely additive to that path, not a replacement for it.
+        _ref_max = float(traits.DUALWAVE_SWP_REF_MAX)
+        self.c_ref_max_f = fx.Float32(_ref_max)
+        self.c_qk_acc_init = self.c_zero_v16f32 if _ref_max == 0.0 else Vec.filled(16, -_ref_max, fx.Float32)
         head_dim_f32 = fx.Float32(fx.Int32(head_dim_runtime))
         c_log2e_f = fx.Float32(LOG2E)
         self.c_sm_scale_log2e = fx.Float32(
@@ -907,8 +961,8 @@ class DualwaveKernelContext:
         k_lo, k_hi = v_k
         ks_lo, ks_hi = (0, self.traits.K_STEPS_QK) if ks_range is None else ks_range
         if v_s is None:
-            v_s_lo = self.c_zero_v16f32
-            v_s_hi = self.c_zero_v16f32
+            v_s_lo = self.c_qk_acc_init
+            v_s_hi = self.c_qk_acc_init
         else:
             v_s_lo, v_s_hi = v_s
         for ks in range_constexpr(ks_lo, ks_hi):
@@ -1104,29 +1158,69 @@ class DualwaveKernelContext:
             v_o[dc] = _fmul(Vec(v_o[dc]), scale_vec, self.fm_fast)
 
     def zero_row_max(self):
-        return self.c_zero_f
+        return self.c_ref_max_f
 
     def scores_for_softmax(self, v_s):
         return v_s
 
     def shift_scores(self, v_s, row_max):
-        return _score_lists_to_vecs(v_s) if isinstance(v_s[0], list) else v_s
+        """Fixed reference max (unchanged contract): scores are already relative to 0, so
+        this stays a passthrough other than normalizing list-form input to vecs. Running
+        max: actually rebase v_s onto row_max (broadcast to all 16 lanes of each half)
+        before exp2 sees it, so exp2's argument never grows past the tile's own row max."""
+        s_lo, s_hi = _score_lists_to_vecs(v_s) if isinstance(v_s[0], list) else v_s
+        if const_expr(self.traits.DUALWAVE_SWP_FIXED_MAX):
+            return s_lo, s_hi
+        row_max_vec16 = Vec.from_elements([row_max], fx.Float32).broadcast_to(16)
+        new_lo = arith.subf(as_mlir_value(s_lo), as_mlir_value(row_max_vec16), fastmath=self.fm_fast)
+        new_hi = arith.subf(as_mlir_value(s_hi), as_mlir_value(row_max_vec16), fastmath=self.fm_fast)
+        return new_lo, new_hi
 
     def tile_rescale_o(self, v_o, m_row, l_row, v_s, v_p, sched_group):
         """With a fixed reference max the correction is identically 1, so the row-max reduction,
-        the rescale and the m_row update all drop out."""
-        return v_o, m_row, l_row, v_p
+        the rescale and the m_row update all drop out (unchanged contract). With a running
+        max: this call site sits between pv_step(0) (already consumed v_p's OLD frame) and
+        pv_step(1..3) (still to come), while l_row already carries this tile's FULL sum
+        (cast_p_and_sum ran before pv_step(0)). So corr must rescale all three -- v_o and
+        l_row for what already landed, and the not-yet-consumed v_p k-substeps, so
+        pv_step(1..3) add into the same frame pv_step(0) used."""
+        m_new, corr = self.tile_row_max(m_row, v_s)
+        if const_expr(self.traits.DUALWAVE_SWP_FIXED_MAX):
+            return v_o, m_new, l_row, v_p
+        self.scale_o_by(v_o, corr)
+        l_row = self.scale_l_by(l_row, corr)
+        v_p = _rescale_v_p(v_p, corr, self.elem_dtype, self.fm_fast)
+        return v_o, m_new, l_row, v_p
 
     def tile_row_max(self, m_row, v_s):
-        """Returns None as the O/l correction when the reference max is fixed and nothing rebases."""
-        return m_row, None
+        """Fixed reference max (unchanged contract): nothing rebases, so the O/l correction
+        is None. Running max: fold this tile's row max into m_row and return
+        corr = 2^(m_old - m_new) for the caller to rescale O/l/P into the new frame.
+        reduce_max already gives a genuine per-row max here (the QK MFMA's operand order
+        puts the query row on lane_mod_32, so the cross-lane permlane32_swap reduction in
+        reduce_max never mixes two different rows), and floor_masked_max keeps a
+        fully-masked tile's -inf row max from ever reaching the subtraction below (this
+        kernel compiles with no-nans-fp-math=true, so an actual NaN would be undefined
+        behavior, not just a wrong value). m_new >= m_old always, so corr is in (0, 1]."""
+        if const_expr(self.traits.DUALWAVE_SWP_FIXED_MAX):
+            return m_row, None
+        row_max = self.floor_masked_max(self.reduce_max(v_s))
+        m_new = fx.Float32(_fmax(m_row, row_max, self.fm_fast))
+        corr = fx.Float32(rocdl.exp2(T.f32, _fsub(m_row, m_new, self.fm_fast)))
+        return m_new, corr
 
     def scale_o_by(self, v_o, rescale):
         if rescale is not None:
             self.scale_o(v_o, rescale)
 
     def scale_l_by(self, l_row, rescale):
-        return l_row if rescale is None else _fmul(l_row, rescale, self.fm_fast)
+        if rescale is None:
+            return l_row
+        # l_row is the 4-wide MFMA row-sum accumulator (DUALWAVE_SWP_MFMA_ROWSUM is
+        # unconditionally True; see _make_dualwave_swp_traits), so the correction must be
+        # broadcast across all 4 lanes -- a bare scalar _fmul here would be a shape mismatch.
+        rescale_vec4 = Vec.from_elements([rescale], fx.Float32).broadcast_to(4)
+        return _fmul(l_row, rescale_vec4, self.fm_fast)
 
     def v_s_vec_to_lists(self, v_s):
         s_lo, s_hi = v_s
