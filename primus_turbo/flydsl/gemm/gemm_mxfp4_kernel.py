@@ -28,6 +28,7 @@ from primus_turbo.flydsl.utils.gemm_epilogue_helper import (
     StoreCSwiGLUQuant,
 )
 from primus_turbo.flydsl.utils.gemm_helper import (
+    _MXFP4_PRESHUF_BLK,
     _MXFP4_PRESHUF_FO,
     _MXFP4_PRESHUF_ND,
     _MXFP4_PRESHUF_NG,
