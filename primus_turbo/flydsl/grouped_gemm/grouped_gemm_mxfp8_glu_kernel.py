@@ -125,7 +125,7 @@ def _compile_grouped_glu_qdual(
         ldsc = sm.ldsc
         t = fx.thread_idx.x
         pid = fx.block_idx.x
-        br, bkc = _decode_pid(pid, I32(NBK), None, False)
+        br, bkc = _decode_pid(pid, I32(NBK))
         base_m = br * I32(BMv)
 
         go_t = rocdl.make_buffer_tensor(GO, max_size=False, num_records_bytes=(G + 1) * 8)
@@ -560,7 +560,7 @@ def _compile_grouped_dglu_qdual(
         ldsc = sm.ldsc
         t = fx.thread_idx.x
         pid = fx.block_idx.x
-        br, bkc = _decode_pid(pid, I32(NBK), None, False)
+        br, bkc = _decode_pid(pid, I32(NBK))
         base_m = br * I32(BMv)
 
         go_t = rocdl.make_buffer_tensor(GO, max_size=False, num_records_bytes=(G + 1) * 8)

@@ -467,7 +467,8 @@ def spin_flag_eq(rsrc, off, want):
                 "2:",
             ]
         ),
-        "=&v,=&s,s,v,s,~{memory}",
+        # s_cmp rewrites SCC; without the clobber LLVM may keep a branch condition in SCC across the loop.
+        "=&v,=&s,s,v,s,~{scc},~{memory}",
         has_side_effects=True,
     )
 
@@ -1550,15 +1551,39 @@ def make_value_attrs(waves_per_eu, agpr_alloc, fwg):
 def asm_mma_do(a, b, c, mode="2", cbsz=0, blgp=0):
     """fp8 16x16x128 MFMA via inline asm, to pin the dst register class. mode "2" (=a,v,v,0):
     accumulator in AGPR, freeing the VGPR file; mode "3" (=v,v,v,0): VGPR in-place (D=C, no
-    accvgpr shuffle); mode "1" (=&v,v,v,0): VGPR early-clobber."""
+    accvgpr shuffle); mode "1" (=&v,v,v,0): VGPR early-clobber.
+
+    A zero ``c`` is emitted as src2=0: tying it would zero the register with a VALU op, and the
+    hazard recognizer cannot see this MFMA to pad the 2 wait states it needs before reading it
+    (CDNA4 ISA, sec. 7.6 "Dependency Resolution: Required Independent Instructions", Table 38:
+    "Non-DLops VALU Write VGPR" -> "V_MFMA* read VGPR" requires 2 waits)."""
+
+    def _is_zero_fill(v):
+        """True when ``v`` is ``Vec.filled(n, 0.0, ...)``: a vector.broadcast of arith.constant 0.0."""
+        bcast = v.owner
+        if not isinstance(bcast, ir.OpView) or bcast.operation.name != "vector.broadcast":
+            return False
+        cst = bcast.operands[0].owner
+        return (
+            isinstance(cst, ir.OpView)
+            and cst.operation.name == "arith.constant"
+            and ir.FloatAttr(cst.attributes["value"]).value == 0.0
+        )
+
     v4f32 = ir.VectorType.get([4], ir.F32Type.get())
-    cons = {"2": "=a,v,v,0", "3": "=v,v,v,0"}.get(str(mode), "=&v,v,v,0")
     # cbsz/blgp select srcA/srcB fp8 format (0=E4M3, 1=E5M2).
     mods = f" cbsz:{cbsz} blgp:{blgp}" if (cbsz or blgp) else ""
+    if _is_zero_fill(_raw(c)):
+        # Untied, so a VGPR dst must be early-clobber to stay off srcA/srcB.
+        cons = "=a,v,v" if str(mode) == "2" else "=&v,v,v"
+        operands, src2 = [_raw(a), _raw(b)], "0"
+    else:
+        cons = {"2": "=a,v,v,0", "3": "=v,v,v,0"}.get(str(mode), "=&v,v,v,0")
+        operands, src2 = [_raw(a), _raw(b), _raw(c)], "$0"
     op = _llvm.InlineAsmOp(
         res=v4f32,
-        operands_=[_raw(a), _raw(b), _raw(c)],
-        asm_string=f"v_mfma_f32_16x16x128_f8f6f4 $0, $1, $2, $0{mods}",
+        operands_=operands,
+        asm_string=f"v_mfma_f32_16x16x128_f8f6f4 $0, $1, $2, {src2}{mods}",
         constraints=cons,
         has_side_effects=False,
     )
