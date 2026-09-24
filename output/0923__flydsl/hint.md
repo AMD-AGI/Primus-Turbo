@@ -2823,3 +2823,35 @@ has a load-to-use problem at all before paying 188 registers to cover one.**
 Related, from h30: `k_dq` at BLOCK_Q=128 spills 1068 B and at 256 spills 4903 B. Its register
 budget is the tightest constraint in this kernel pair and every proposal touching `k_dq`
 should state its VGPR delta before it is built.
+
+## h36-CORRECTION — h36's spill prediction was WRONG. g63 costs +32 VGPR on k_dq, not +188, and it fits.
+
+Round 21 built it COMPILE_ONLY before I could be proven right or wrong on the card, and the
+ISA says:
+
+| build | `k_dq` `.vgpr_count` | spill | `k_dkdv` |
+|---|--:|--:|--:|
+| `cur_a` (round 20 champion) | 960 | 0 | 904 |
+| **`A63` (g63)** | **992** | **0** | 904 |
+| `B65`, `B66` | 960 | 0 | 904 |
+
+**+32 VGPR, spill 0, 32 to spare.** h36 predicted 960 + 188 = 1148 and "almost certainly
+spills". That is wrong and the hint above must not be cited.
+
+**The error, named:** I took g62's measured +188 VGPR on `k_dkdv` and assumed the same edit
+costs the same on `k_dq`. It does not. `k_dkdv` carries the 256-VGPR dK/dV accumulator pair and
+its prefetch covers a body that streams every q tile of every q head; `k_dq`'s prefetch sits on
+the kv loop with a different tuple shape. **Register cost is a property of the body, not of the
+edit.** This is the same "assume the mechanism transfers" failure that killed the corpus's
+"+8.7% chain split" claim in round 20 (g61, null) and the gfx950 `v_accvgpr` analogue in round
+19 (g60, -17.3%) — I made it one message after criticising round 20 for it.
+
+**What survives from h36, and it is the useful half:** build any `k_dq` proposal COMPILE_ONLY
+through `rounds/002/_scratch/screen.py` and read `.vgpr_spill_count` before spending an arm
+slot. Round 21 did exactly that. The measured headroom is real — `k_dq` ships at 960/1024 and
+h30's sweep shows BLOCK_Q=128 spilling 1068 B — so the *check* is right even though my
+*extrapolation* was not. State a VGPR delta as measured, never as inherited.
+
+**Still open and NOT answered by the compile:** whether `k_dq` has a load-to-use problem for
+the prefetch to cover at all. Round 18's attribution put ZERO modelled stall in `k_dq`'s body
+at 54.3% matrix busy. Fitting is not the same as helping; the card decides that.
