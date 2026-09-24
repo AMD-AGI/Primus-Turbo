@@ -1,0 +1,50 @@
+--- /tmp/validation.py.bak	2026-09-24 09:54:20.757218429 +0000
++++ /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/validation.py	2026-09-24 09:54:20.783097447 +0000
+@@ -58,18 +58,35 @@
+     no chance of staging a symlink, whose .resolve() would walk back out of op/ and kill
+     every import.
+     """
+-    out = Path(tempfile.mkdtemp(prefix="validation-")) / "bench.json"
+-    cmd = [sys.executable, str(HERE / "benchmark.py"),
+-           "--arm-path", f"candidate={impl_dir}",
+-           "--arms", "beat",
+-           "--shapes", ",".join(shapes),
+-           "--json", str(out)]
+-    print("$ " + " ".join(cmd), flush=True)
+-    proc = subprocess.run(cmd, cwd=str(HERE))
+-    if proc.returncode != 0:
+-        print(f"benchmark.py exited {proc.returncode}")
+-        return None
+-    rows = json.loads(out.read_text())
++    # h31 -- ONE SHAPE PER PROCESS. Crossing a shape boundary inside a single benchmark
++    # process is the only condition under which this job has ever faulted the card, and it
++    # is isolated by a controlled pair, not inferred: rounds/016/_scratch/meas2/out:23
++    # (one process, --shapes fast,proxy,prod) faults; rounds/016/_scratch/meas3/out:16,33,50
++    # (same binary, same six arms including beat, same cold JIT cache, split per shape) is
++    # rc=0 three times. facts.md:241 ratified "one benchmark process per shape" rounds ago,
++    # but it only ever reached the hand-written meas scripts -- this line still said
++    # ",".join(shapes), which is the direct source of the round 17 and round 18 wedges.
++    #
++    # This removes no out-of-bounds access. It removes the isolated trigger, and it stops
++    # feeding further shapes to an already-sick card (rounds/003/_scratch/gpu2/out:9-18 is
++    # how one fault becomes a wedge). Every ratio the gate computes is within one shape, so
++    # no comparison changes.
++    tmp = Path(tempfile.mkdtemp(prefix="validation-"))
++    rows = []
++    for s in shapes:
++        out = tmp / f"bench_{s}.json"
++        cmd = [sys.executable, str(HERE / "benchmark.py"),
++               "--arm-path", f"candidate={impl_dir}",
++               "--arms", "beat",
++               "--shapes", s,
++               "--json", str(out)]
++        print("$ " + " ".join(cmd), flush=True)
++        proc = subprocess.run(cmd, cwd=str(HERE))
++        if proc.returncode != 0:
++            print(f"benchmark.py exited {proc.returncode} on shape {s}; "
++                  f"aborting remaining shapes", flush=True)
++            return None
++        rows += json.loads(out.read_text())
+     return {(r["shape"], r["arm"]): r for r in rows}
+ 
+ 

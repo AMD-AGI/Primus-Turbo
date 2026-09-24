@@ -2359,3 +2359,108 @@ zero-cost under the current single-wave launch, and only then the block-size cha
 
 The BLOCK_Q sweep cost four CPU compiles and settled a question that two rounds of arithmetic
 could not. When a question is "does it fit", ask the compiler, not the spreadsheet.
+
+## h31 — The card-wedging fault is bound to ONE SHAPE PER PROCESS, not to any arm, not to module reload. Three of my own prior conclusions are retracted.
+
+`facts.md:241` ratified "one benchmark process per shape" rounds ago. **It never reached
+`validation.py`.** That file's `measure()` kept building `--shapes fast,proxy,prod` as a single
+subprocess, and that single line is the direct source of the round 17 AND round 18 wedges.
+The ratified mitigation was executed only by hand-written `meas` scripts; **the gate never
+executed it.** Fixed now — `validation.py` runs one benchmark process per shape and aborts the
+remaining shapes on the first non-zero return code.
+
+### The controlled pair that isolates the trigger
+
+This is an experiment in the tree, not an inference:
+
+| run | structure | outcome |
+|---|---|---|
+| `rounds/016/_scratch/meas2/out:23` | ONE process, `--shapes fast,proxy,prod` | **fault** |
+| `rounds/016/_scratch/meas3/out:16,33,50` | one process PER shape | rc=0, rc=0, rc=0 |
+
+Same binary, same six arms **including `beat`**, same freshly-cleared JIT cache
+(`meas2/out:3-8` and `meas3/out:3-8` arm lines are byte-identical). The only variable is the
+process structure.
+
+### RETRACTED — three things I concluded and stated, all wrong
+
+1. **The round-16 `load_impl` hoist is NOT the fix. Retire the diagnosis, keep the code.**
+   `benchmark.py:168-180` blames `sys.modules` replacement -> cyclic GC -> `hipModuleUnload`
+   mid-launch. Refuted twice over: (a) `rounds/014/_scratch/out/s2.out:29-37` is a
+   **single-arm** process — one `load_impl`, no per-shape reload, no `sys.modules`
+   replacement, no collectable flydsl cycle — and it faulted anyway; (b) the hoist has been
+   in the tree for all three subsequent faults (`rounds/016/_scratch/meas2/out` 03:58,
+   `rounds/017/_scratch/val2/out` 07:58, `rounds/018/_scratch/val2/out` 08:58).
+   **And my evidence was worthless**: at the measured ~44%/process fault rate,
+   P(0 faults in 6 sweeps) = 0.49 — six clean sweeps was the *most likely* outcome under the
+   null. I reported it as verification. **A clean run count is not evidence unless the base
+   rate says it should have failed.**
+2. **`empty_cache` is not the delta, and my comment cites the wrong line.**
+   `benchmark.py:179` says "empty_cache at :169"; it is at `validation.py:175` (`:169` is
+   `del ref_dev`). More importantly the real delta is **exposure, by four to five orders of
+   magnitude**: `validation.py:152` issues ONE `impl()` call per shape, while
+   `benchmark.py:108-112` issues 3.0 s of continuous calls plus 51 timed ones
+   (`:117-125`) per arm per shape. Treating `empty_cache` as the fix would repeat the
+   round-16 error exactly.
+3. **"`validation.py` never faults" is false.** It faulted at least four times, always after
+   `correctness proxy` (`rounds/002/1-opt/raw/r2_gpu2.out:25-26`, `r2_gpu5.out:19-21`,
+   `rounds/001/1-opt/raw/val3_armA_armB_armAB.log:75-77`, `rounds/003/_scratch/main/out:21-22`).
+   That was a different, Tensile-path fault now bypassed by refcache
+   (`refcache_util.py:8`). It looks clean today because the path was deleted, not because it
+   is correct. **I used this false premise in a live status report.**
+
+Also corrected: `route.md:1255-1259`'s "only reproduces on a cold cache" is too narrow —
+round 18's val2 faulted on a **hot** cache (`rounds/018/_scratch/meas1/out` 08:52 had already
+compiled the non-split `k_dq` at prod, and `rounds/018/op/kernels.py` is byte-identical to
+`job_context/op/current/kernels.py`). Cold-vs-hot is not the variable.
+
+### The cause is still NOT established, and the fix does not claim to remove it
+
+The fix removes the **isolated trigger** and stops feeding further shapes to a sick card. It
+removes no out-of-bounds access. If a stray access exists it will still be issued.
+
+`beat` is **exonerated by existence proof**, not statistics:
+`rounds/014/_scratch/out/s2.out:29-37` faulted in a process whose command line
+(`:29`) loads only `--arm-path armA=...` — aiter's ASM was never in the address space.
+
+`k_dq` is named in only two of the faults (`rounds/014/_scratch/out/s2.out:124`,
+`rounds/016/_scratch/meas2/out:23`) and it is the **last** kernel of every backward
+(`impl.py:136/172/179/194/214`) with 10521 packets in flight at the time
+(`meas2/out:22`, `rptr=770834 wptr=781355`). That name pins which arm was airborne, not which
+instruction went out of bounds. Rounds 17 and 18 have **no** kernel attribution at all.
+
+### DO NOT "fix" k_dq's descriptors as part of an optimisation round
+
+`kernels.py:675-680` uses five `1 << 30` and two `1 << 28` as `num_records`, and `:687`'s
+non-split `g_dq = _bv(DQ, 1 << 30, ...)`, where `_dkdv_impl` uses real extents at `:200-206`.
+This is a real defect and a genuine **amplifier** (it turns a clamped access into a walk into
+the next page) — but it is a **constant that is byte-identical in every faulting run and every
+clean run**, so it has zero discriminating power and is not the cause.
+
+Copying the dkdv formula would be a self-inflicted wound: `kernels.py:964` calls
+`_dq_impl(False, ..., fx.Int32(1), fx.Int32(1))` and k_dq's signature (`:959-962`) **has no
+`B_`**, so `nq_b = B_*Sq*Hq*(D*2)` would cut the descriptor to 1/4 of its true size at prod
+(B=4), silently discarding every `bat >= 1` store — and the resulting SQNR collapse would read
+exactly like "the clamp caught a real bug". `route.md:25` already forbids this
+("Do not 'fix' the descriptor as part of an optimisation round") and `route.md:20-23` records
+the descriptor semantics as an OPEN question. If it is ever done: a dedicated infrastructure
+round, `B_` kernarg first, clamp second, full prod re-baseline third.
+
+### Round 18's core gives no attribution, and the reason is now removed
+
+`job_context/op/core` (1.2 GB, 08:59) parses as `NT_PRPSINFO` =
+`/opt/venv/bin/python3 validation.py ...`, 321 threads, `cursig = 6 SIGABRT`. That is **val3**,
+the run that met the ALREADY-wedged card and printed `HW Exception ... GPU Hang` — the
+consequence, not the cause. The originating fault (val2's benchmark.py subprocess) left no GPU
+core at all: `Failed to create GPU coredump: File exists`, because a stale `core.gpu` from
+2026-09-21 held the name.
+
+**Both are now renamed out of the way** (`core.gpu.stale-20260921`,
+`core.host.val3-20260924`), so the next fault can write a real GPU coredump with dispatch
+attribution. Check for a fresh `core.gpu` after any future fault BEFORE power-cycling.
+
+### The one zero-card-time action that would convert hypothesis into conclusion
+
+Enumerate on CPU every `(blockIdx, lane, qh_, dtile, si)` byte offset that `k_dq` / `k_dq_sp`
+store and load at all three spec shapes, and assert each lands inside the real tensor. Nobody
+has done it. It costs no card time and it is the only thing that can name the access.
