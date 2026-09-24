@@ -6,6 +6,9 @@
 
 """CPU regression tests for beta=0 selection in actual backward order."""
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 import torch
 
@@ -39,6 +42,23 @@ def test_staged_forwards_assign_beta0_in_reverse_backward_order():
     # first. The first actual write, not the first forward, must overwrite.
     assert second_forward.claim() is True
     assert first_forward.claim() is False
+
+
+def test_concurrent_backward_contexts_have_exactly_one_beta0_winner(monkeypatch):
+    parameter = _parameter()
+    claims = [_claim(parameter) for _ in range(16)]
+    start = threading.Barrier(len(claims))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    def race(claim):
+        start.wait()
+        return claim.claim()
+
+    with ThreadPoolExecutor(max_workers=len(claims)) as executor:
+        results = list(executor.map(race, claims))
+
+    assert results.count(True) == 1
+    assert results.count(False) == len(claims) - 1
 
 
 def test_checkpoint_recompute_can_claim_after_original_forward_is_discarded():

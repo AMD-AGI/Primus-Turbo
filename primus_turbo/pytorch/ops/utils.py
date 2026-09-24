@@ -6,6 +6,7 @@
 
 """Helpers shared across the GEMM / grouped-GEMM op implementations."""
 
+import threading
 from typing import Optional
 
 import torch
@@ -36,6 +37,7 @@ class _FusedGradWriteState:
     """Shared state for every forward that may write one Parameter this step."""
 
     def __init__(self):
+        self.lock = threading.Lock()
         self.claimed = False
         self.overwrite_eligible = True
         self.has_overwrite_producer = False
@@ -51,27 +53,30 @@ class _FusedGradOverwriteClaim:
 
     def claim(self) -> bool:
         parameter = self.parameter
-        state = getattr(parameter, _FUSED_GRAD_WRITE_STATE, None)
+        state = self.state
+        with state.lock:
+            current_state = getattr(parameter, _FUSED_GRAD_WRITE_STATE, None)
 
-        # A retained graph may be run again after Megatron starts a new step.
-        # Falling back to beta=1 is not safe when the framework skipped this
-        # slice's clear based on the previous epoch, so reject before writing.
-        if not bool(parameter.grad_added_to_main_grad) or state is not self.state:
-            raise RuntimeError(
-                "fused gradient overwrite claim belongs to a stale write epoch; "
-                "retained-graph backward across gradient-buffer resets is unsupported"
-            )
+            # A retained graph may be run again after Megatron starts a new
+            # step. Falling back to beta=1 is not safe when the framework
+            # skipped this slice's clear based on the previous epoch, so reject
+            # before writing.
+            if not bool(parameter.grad_added_to_main_grad) or current_state is not state:
+                raise RuntimeError(
+                    "fused gradient overwrite claim belongs to a stale write epoch; "
+                    "retained-graph backward across gradient-buffer resets is unsupported"
+                )
 
-        # Python bookkeeping is not replayed by CUDA graphs. Capture beta=1
-        # into the graph and permanently disable overwrite for this epoch.
-        if _is_cuda_graph_capturing():
-            state.overwrite_eligible = False
-            return False
+            # Python bookkeeping is not replayed by CUDA graphs. Capture beta=1
+            # into the graph and permanently disable overwrite for this epoch.
+            if _is_cuda_graph_capturing():
+                state.overwrite_eligible = False
+                return False
 
-        if not state.overwrite_eligible or state.claimed:
-            return False
-        state.claimed = True
-        return True
+            if not state.overwrite_eligible or state.claimed:
+                return False
+            state.claimed = True
+            return True
 
 
 def _get_fp8_dtype(format: Format, is_fwd_stage: bool):
