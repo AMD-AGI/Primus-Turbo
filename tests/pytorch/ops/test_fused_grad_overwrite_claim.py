@@ -84,13 +84,44 @@ def test_cuda_graph_capture_disables_overwrite_for_epoch(monkeypatch):
     assert later_claim.claim() is False
 
 
-def test_beta1_only_tied_weight_producer_disables_overwrite_for_epoch(monkeypatch):
+@pytest.mark.parametrize("exception", [RuntimeError, AssertionError, AttributeError])
+def test_cuda_graph_capture_probe_tolerates_unavailable_runtime(monkeypatch, exception):
     parameter = _parameter()
-    overwrite_capable = _claim(parameter)
-    assert _claim(parameter, supports_overwrite=False) is None
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    capture_claim = _claim(parameter)
 
-    assert overwrite_capable.claim() is False
+    def unavailable():
+        raise exception("CUDA unavailable")
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", unavailable)
+
+    assert capture_claim.claim() is True
+
+
+def test_beta1_only_tied_weight_producer_rejects_mixed_epoch():
+    parameter = _parameter()
+    _claim(parameter)
+
+    with pytest.raises(RuntimeError, match="mixing beta=0-capable and beta=1-only"):
+        _claim(parameter, supports_overwrite=False)
+
+
+def test_overwrite_producer_rejects_epoch_registered_by_beta1_only_producer():
+    parameter = _parameter()
+    assert _claim(parameter, supports_overwrite=False) is None
+
+    with pytest.raises(RuntimeError, match="mixing beta=0-capable and beta=1-only"):
+        _claim(parameter)
+
+
+def test_beta1_only_producer_rejects_slice_skipped_from_previous_epoch():
+    parameter = _parameter()
+    previous_claim = _claim(parameter)
+    assert previous_claim.claim() is True
+
+    parameter.grad_added_to_main_grad = False
+
+    with pytest.raises(RuntimeError, match="may have skipped its clear"):
+        _claim(parameter, supports_overwrite=False)
 
 
 def test_tensor_alias_never_receives_an_overwrite_claim():

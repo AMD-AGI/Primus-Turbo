@@ -22,11 +22,13 @@ _FUSED_GRAD_WRITE_STATE = "_primus_turbo_fused_grad_write_state"
 def _is_cuda_graph_capturing() -> bool:
     fn = getattr(torch.cuda, "is_current_stream_capturing", None)
     if fn is None:
-        return False
+        graphs = getattr(torch.cuda, "graphs", None)
+        fn = getattr(graphs, "is_current_stream_capturing", None) if graphs is not None else None
     try:
-        return bool(fn())
-    except RuntimeError:
-        # CPU-only test environments may expose the API without a driver.
+        return bool(fn()) if fn is not None else False
+    except Exception:
+        # CPU-only builds and uninitialized drivers may expose the API but
+        # raise RuntimeError, AssertionError, or AttributeError when called.
         return False
 
 
@@ -36,6 +38,8 @@ class _FusedGradWriteState:
     def __init__(self):
         self.claimed = False
         self.overwrite_eligible = True
+        self.has_overwrite_producer = False
+        self.has_beta1_only_producer = False
 
 
 class _FusedGradOverwriteClaim:
@@ -112,8 +116,9 @@ def _setup_fused_grad_accum(
     would hand out beta=0 twice and silently drop a microbatch.
 
     Calls from fused paths that cannot overwrite register the epoch as
-    ineligible, so a tied Parameter shared with a beta=1-only producer can never
-    have one contribution erased by a later beta=0 write.
+    ineligible. Mixing one of those producers with an overwrite-capable
+    producer, or switching to one immediately after an owned beta=0 epoch, is
+    rejected because the framework may already have skipped the buffer clear.
     """
     if fuse_bgrad_accum_pattern is None:
         return False, None, None
@@ -133,12 +138,34 @@ def _setup_fused_grad_accum(
     overwrite_claim = None
     if isinstance(b, torch.nn.Parameter):
         state = getattr(b, _FUSED_GRAD_WRITE_STATE, None)
+        previous_state = None
         if not bool(b.grad_added_to_main_grad) or not isinstance(state, _FusedGradWriteState):
+            previous_state = state
             state = _FusedGradWriteState()
             setattr(b, _FUSED_GRAD_WRITE_STATE, state)
         if not supports_overwrite:
+            # If the previous epoch actually used beta=0, Primus may already
+            # have skipped clearing this slice before the current forward. A
+            # beta=1-only producer cannot safely consume that stale value.
+            if isinstance(previous_state, _FusedGradWriteState) and previous_state.claimed:
+                raise RuntimeError(
+                    "fused gradient producer changed from beta=0 overwrite to beta=1-only; "
+                    "the gradient buffer may have skipped its clear"
+                )
+            if state.has_overwrite_producer:
+                raise RuntimeError(
+                    "mixing beta=0-capable and beta=1-only fused gradient producers "
+                    "for one Parameter in the same write epoch is unsupported"
+                )
+            state.has_beta1_only_producer = True
             state.overwrite_eligible = False
         else:
+            if state.has_beta1_only_producer:
+                raise RuntimeError(
+                    "mixing beta=0-capable and beta=1-only fused gradient producers "
+                    "for one Parameter in the same write epoch is unsupported"
+                )
+            state.has_overwrite_producer = True
             overwrite_claim = _FusedGradOverwriteClaim(b, state)
 
     # Preserve Megatron's existing fused-accumulation signal during forward.
