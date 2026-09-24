@@ -66,10 +66,11 @@ def begin_step() -> FrozenSet[Slice]:
     global _written, _skipped, _previous
     unwritten = _skipped - _written
     if unwritten:
+        preview = sorted(unwritten, key=lambda entry: (entry[0], entry[1], str(entry[2])))[:4]
         raise RuntimeError(
             f"{len(unwritten)} gradient-buffer slice(s) were left unzeroed on the "
             "prediction that a beta=0 wgrad would overwrite them, but no overwrite "
-            f"arrived: {sorted(unwritten)[:4]}. The reduced gradient for those "
+            f"arrived: {preview}. The reduced gradient for those "
             "slices is stale. This means a wgrad producer stopped running or fell "
             "back to beta=1 mid-run."
         )

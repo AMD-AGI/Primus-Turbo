@@ -120,6 +120,16 @@ class TestBeginStepSafetyNet:
         with pytest.raises(RuntimeError, match="left unzeroed"):
             grad_ownership.begin_step()
 
+    def test_dtype_aliases_preserve_fail_closed_runtime_error(self):
+        tensor = torch.empty(8, dtype=torch.float32)
+        typed_alias = tensor.view(torch.int32)
+        assert tensor.data_ptr() == typed_alias.data_ptr()
+        assert tensor.numel() == typed_alias.numel()
+        grad_ownership.note_skipped([_slice_of(tensor), _slice_of(typed_alias)])
+
+        with pytest.raises(RuntimeError, match="2 gradient-buffer slice"):
+            grad_ownership.begin_step()
+
     def test_does_not_raise_when_the_skipped_slice_was_rewritten(self):
         t = torch.empty(8)
         grad_ownership.note_skipped([_slice_of(t)])
