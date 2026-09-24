@@ -1780,3 +1780,69 @@ waiting". But `k_dq`'s two largest matrix-free windows have **`vmem=0` and `lds=
 97% VALU** (`windows.txt`). In those windows there is nothing to wait *for*. That is
 **issue serialisation, not latency exposure** — a different bottleneck from `k_dkdv`'s, and
 another reason TDM could not have helped prod.
+
+---
+
+## h24 — HARD RULE: a candidate that loses at prod does not ship (2026-09-24)
+
+### What happened in round 15
+
+`r15.i2.g47` was measured at **prod `vs_champion` = 0.9688**, a **3.1% regression** on the
+production shape, and it was **shipped and promoted to champion anyway**. The operator had
+to revert `best_round` by hand.
+
+It was not a mistake by the round. It followed the rules exactly:
+
+```
+gain = mean(1.0600, 0.9816, 0.9688) = 1.0035  >  1.0 + min_gain(0.0)   -> accept
+lowest shape 0.9688  >  NOISE_BAND 0.95                                -> no veto
+```
+
+**`fast`'s +6.0% paid for `prod`'s −3.1%, because acceptance is an arithmetic mean over
+three shapes and `min_gain` is 0.0.**
+
+`min_gain: 0.0` was justified in the spec by "the gap to the anchor is ~93x, so round gains
+are expected as integer factors". **That justification died several rounds ago.** Gains are
+now single-digit percentages and this machine's same-code spread is about 1.5%. The floor
+has not been raised because raising it needs `resume --config`, which bumps `spec_version`,
+re-runs `op_setup`, and would overwrite the hand-written `refcache`, `poison_util` and
+`benchmark.py` fixes. So the floor stays, **and this rule stands in its place.**
+
+### The rule
+
+> **No candidate may be declared `shipped: true` if its `prod` `vs_champion` is below
+> 1.0 − (the round's own self-reported noise floor).**
+>
+> Not below 0.95. Not "acceptable because the mean clears". **Below the floor at prod
+> means it does not ship**, whatever `fast` and `proxy` did.
+
+If an arm wins big on `fast` or `proxy` and loses at `prod`, that is a **real and reportable
+result** — record it in `facts.md`, keep the instruments, and say which shape it belongs to.
+It is not a shipment.
+
+### Why this matters more than one round
+
+`op/current` is what every later round is measured against. A champion that is 3.1% worse
+at prod **lowers the bar permanently**: every subsequent round's `vs_champion` is inflated
+by that much, and the regression never appears again in any table. It is the one kind of
+error this ledger cannot self-correct, because the evidence of it is destroyed by the act
+of committing it.
+
+### Two things round 15 did right, and they should be kept
+
+1. **It killed `g46` by reading the ISA instead of building it.** Its premise was that
+   `.LBB0_8`'s waits were a coarse all-drain; the ISA shows they are already a descending
+   staircase (`0x22 → 0x21 → 0x20 → 0xa → 0x2 → 0x0`). The round wrote *"I had misread my
+   own instrument"*. That is exactly the right move and it cost no card time.
+2. **It found the real blocker for the whole family.** `g47rev` showed the
+   `ds_store x40 → ds_load x40 → WMMA x32` tail of `k_dkdv`'s hot body is locked by a
+   **true LDS RAW dependence**. The scheduler hook works, is free, and genuinely moves the
+   schedule — but there is nothing it can legally move *there*. Any future candidate aimed
+   at that tail must break the dependence, not reschedule around it.
+
+### And the bookkeeping failure that ended the round
+
+Round 15 was recorded as **failed** because it dropped `g46` and `g47` without writing
+either into `facts.md` or `dead_ends.md` and without declaring a merge. **Every id that is
+built or priced must be closed somewhere**, including — especially — the ones killed
+statically. That is what makes the next round cheap.
