@@ -2947,3 +2947,41 @@ anyway:** three rounds of accepted work separate 505.85 / 507.13 / 516.87, which
 return, and the bar for the next round is **"beat the champion by more than the same-session
 floor"**, not "be positive". `min_gain: 0.0` in the job spec is what let round 20 promote on
 gain 1.0016; that is a real gap between the spec and what is worth banking.
+
+## h38-CORRECTION — my reason was wrong; the conclusion is right for a better reason. The 1.57% floor was measured on a DIFFERENT KERNEL.
+
+h38 objected that 1.57% is a "cross-session" floor being misapplied to a same-session
+comparison. **That reason is wrong** — `bench_onesession.json` is exactly what the name says.
+I asserted it without opening the source.
+
+The source is `optimization/techniques/6-gfx1250-cdna5-mechanisms.md:25`, and it is decisive:
+
+> "Deltas are paired within rotated rounds, n=5, null-control resolution floor 1.57%,
+> **measured on HipKittens' bf16 GEMM ladder at 8192^3**"
+
+**The 1.57% floor is a GEMM's floor, not this operator's.** It is a machine-level corpus
+constant, established on a completely different kernel with a different harness.
+
+This job has measured its OWN same-session, same-code prod floor repeatedly and directly:
+
+| round | prod same-code floor |
+|---|--:|
+| 19 | 0.61% |
+| 20 | 0.66% |
+| 22 | **0.40%** (three physical rebuilds: cur_a 517.21, cur_b 515.17, r020 516.87) |
+
+Against 0.40–0.66%, `r020`'s **+2.18%** over `r017` — same sweep, one process, palindromic
+order, sclk 1051 throughout — clears by **3.3x to 5.5x**. Round 20's promotion stands.
+
+**Using a GEMM ladder's null-control floor to judge an attention backward's delta is the same
+"the measurement transfers" error this campaign has now documented four times** (g61's chain
+split, g60's gfx950 `v_accvgpr` analogue, g63's cross-kernel prefetch, my own h36 VGPR
+extrapolation). The floor is a property of the kernel and harness that produced it.
+
+**Keep quoting 1.57% for what it is** — round 3 was right that "below the floor a delta is
+unresolved, not zero" — but quote this operator's own 0.40–0.66% when grading this operator.
+
+**Round 22's prescription still stands unchanged and should be adopted:** the bar is "beat the
+champion by more than the same-session floor", not "be positive". `min_gain: 0.0` is what let
+round 20 promote on gain 1.0016, and that gap between the spec and what is worth banking is
+real regardless of which floor you use.
