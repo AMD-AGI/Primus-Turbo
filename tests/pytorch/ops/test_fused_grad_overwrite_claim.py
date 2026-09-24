@@ -72,10 +72,23 @@ def test_old_claim_is_rejected_after_new_epoch_forward():
     assert new_claim.claim() is True
 
 
-def test_beta1_only_tied_weight_producer_disables_overwrite_for_epoch():
+def test_cuda_graph_capture_disables_overwrite_for_epoch(monkeypatch):
+    parameter = _parameter()
+    capture_claim = _claim(parameter)
+    later_claim = _claim(parameter)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    assert capture_claim.claim() is False
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    assert later_claim.claim() is False
+
+
+def test_beta1_only_tied_weight_producer_disables_overwrite_for_epoch(monkeypatch):
     parameter = _parameter()
     overwrite_capable = _claim(parameter)
     assert _claim(parameter, supports_overwrite=False) is None
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
     assert overwrite_capable.claim() is False
 

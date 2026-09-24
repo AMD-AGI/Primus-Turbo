@@ -19,6 +19,17 @@ from primus_turbo.pytorch.core.low_precision import (
 _FUSED_GRAD_WRITE_STATE = "_primus_turbo_fused_grad_write_state"
 
 
+def _is_cuda_graph_capturing() -> bool:
+    fn = getattr(torch.cuda, "is_current_stream_capturing", None)
+    if fn is None:
+        return False
+    try:
+        return bool(fn())
+    except RuntimeError:
+        # CPU-only test environments may expose the API without a driver.
+        return False
+
+
 class _FusedGradWriteState:
     """Shared state for every forward that may write one Parameter this step."""
 
@@ -46,6 +57,12 @@ class _FusedGradOverwriteClaim:
                 "fused gradient overwrite claim belongs to a stale write epoch; "
                 "retained-graph backward across gradient-buffer resets is unsupported"
             )
+
+        # Python bookkeeping is not replayed by CUDA graphs. Capture beta=1
+        # into the graph and permanently disable overwrite for this epoch.
+        if _is_cuda_graph_capturing():
+            state.overwrite_eligible = False
+            return False
 
         if not state.overwrite_eligible or state.claimed:
             return False
