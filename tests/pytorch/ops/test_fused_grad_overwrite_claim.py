@@ -33,6 +33,10 @@ def _claim(parameter, *, supports_overwrite=True):
     return claim
 
 
+def _execute(claim):
+    return claim.execute(lambda overwrite: overwrite)
+
+
 def test_staged_forwards_assign_beta0_in_reverse_backward_order():
     parameter = _parameter()
     first_forward = _claim(parameter)
@@ -40,25 +44,46 @@ def test_staged_forwards_assign_beta0_in_reverse_backward_order():
 
     # Pipeline schedules may stage both forwards and run the second backward
     # first. The first actual write, not the first forward, must overwrite.
-    assert second_forward.claim() is True
-    assert first_forward.claim() is False
+    assert _execute(second_forward) is True
+    assert _execute(first_forward) is False
 
 
-def test_concurrent_backward_contexts_have_exactly_one_beta0_winner(monkeypatch):
+def test_concurrent_backward_contexts_serialize_selection_through_launch(monkeypatch):
     parameter = _parameter()
-    claims = [_claim(parameter) for _ in range(16)]
-    start = threading.Barrier(len(claims))
+    winner_claim = _claim(parameter)
+    loser_claim = _claim(parameter)
+    winner_launched = threading.Event()
+    loser_attempting = threading.Event()
+    loser_launched = threading.Event()
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
-    def race(claim):
-        start.wait()
-        return claim.claim()
+    def launch_winner(overwrite):
+        assert overwrite is True
+        winner_launched.set()
+        assert loser_attempting.wait(timeout=2)
+        assert not loser_launched.is_set()
+        return overwrite
 
-    with ThreadPoolExecutor(max_workers=len(claims)) as executor:
-        results = list(executor.map(race, claims))
+    def run_winner():
+        return winner_claim.execute(launch_winner)
 
-    assert results.count(True) == 1
-    assert results.count(False) == len(claims) - 1
+    def run_loser():
+        assert winner_launched.wait(timeout=2)
+        loser_attempting.set()
+
+        def launch(overwrite):
+            loser_launched.set()
+            return overwrite
+
+        return loser_claim.execute(launch)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        winner = executor.submit(run_winner)
+        loser = executor.submit(run_loser)
+
+    assert winner.result() is True
+    assert loser.result() is False
+    assert loser_launched.is_set()
 
 
 def test_checkpoint_recompute_can_claim_after_original_forward_is_discarded():
@@ -66,18 +91,18 @@ def test_checkpoint_recompute_can_claim_after_original_forward_is_discarded():
     _discarded_forward = _claim(parameter)
     recomputed_forward = _claim(parameter)
 
-    assert recomputed_forward.claim() is True
+    assert _execute(recomputed_forward) is True
 
 
 def test_retained_graph_is_rejected_after_framework_reset():
     parameter = _parameter()
     retained_claim = _claim(parameter)
-    assert retained_claim.claim() is True
+    assert _execute(retained_claim) is True
 
     parameter.grad_added_to_main_grad = False
 
     with pytest.raises(RuntimeError, match="stale write epoch"):
-        retained_claim.claim()
+        _execute(retained_claim)
 
 
 def test_old_claim_is_rejected_after_new_epoch_forward():
@@ -88,8 +113,8 @@ def test_old_claim_is_rejected_after_new_epoch_forward():
     new_claim = _claim(parameter)
 
     with pytest.raises(RuntimeError, match="stale write epoch"):
-        old_claim.claim()
-    assert new_claim.claim() is True
+        _execute(old_claim)
+    assert _execute(new_claim) is True
 
 
 def test_cuda_graph_capture_disables_overwrite_for_epoch(monkeypatch):
@@ -98,10 +123,10 @@ def test_cuda_graph_capture_disables_overwrite_for_epoch(monkeypatch):
     later_claim = _claim(parameter)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
 
-    assert capture_claim.claim() is False
+    assert _execute(capture_claim) is False
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    assert later_claim.claim() is False
+    assert _execute(later_claim) is False
 
 
 @pytest.mark.parametrize("exception", [RuntimeError, AssertionError, AttributeError])
@@ -114,7 +139,7 @@ def test_cuda_graph_capture_probe_tolerates_unavailable_runtime(monkeypatch, exc
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", unavailable)
 
-    assert capture_claim.claim() is True
+    assert _execute(capture_claim) is True
 
 
 def test_beta1_only_tied_weight_producer_rejects_mixed_epoch():
@@ -136,7 +161,7 @@ def test_overwrite_producer_rejects_epoch_registered_by_beta1_only_producer():
 def test_beta1_only_producer_rejects_slice_skipped_from_previous_epoch():
     parameter = _parameter()
     previous_claim = _claim(parameter)
-    assert previous_claim.claim() is True
+    assert _execute(previous_claim) is True
 
     parameter.grad_added_to_main_grad = False
 

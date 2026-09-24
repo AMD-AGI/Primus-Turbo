@@ -7,7 +7,7 @@
 """Helpers shared across the GEMM / grouped-GEMM op implementations."""
 
 import threading
-from typing import Optional
+from typing import Callable, Optional, TypeVar
 
 import torch
 
@@ -18,6 +18,7 @@ from primus_turbo.pytorch.core.low_precision import (
 )
 
 _FUSED_GRAD_WRITE_STATE = "_primus_turbo_fused_grad_write_state"
+_T = TypeVar("_T")
 
 
 def _is_cuda_graph_capturing() -> bool:
@@ -42,6 +43,7 @@ class _FusedGradWriteState:
         self.overwrite_eligible = True
         self.has_overwrite_producer = False
         self.has_beta1_only_producer = False
+        self.last_write_stream = None
 
 
 class _FusedGradOverwriteClaim:
@@ -51,7 +53,14 @@ class _FusedGradOverwriteClaim:
         self.parameter = parameter
         self.state = state
 
-    def claim(self) -> bool:
+    def execute(self, launch: Callable[[bool], _T]) -> _T:
+        """Choose beta and enqueue the write as one serialized operation.
+
+        The lock stays held through kernel launch, so a beta=1 writer cannot be
+        enqueued before the beta=0 winner. If autograd invokes tied-Parameter
+        backwards on different CUDA streams, ``wait_stream`` extends that
+        ordering to device execution before the next write is launched.
+        """
         parameter = self.parameter
         state = self.state
         with state.lock:
@@ -71,12 +80,24 @@ class _FusedGradOverwriteClaim:
             # into the graph and permanently disable overwrite for this epoch.
             if _is_cuda_graph_capturing():
                 state.overwrite_eligible = False
-                return False
+                overwrite = False
+            elif not state.overwrite_eligible or state.claimed:
+                overwrite = False
+            else:
+                state.claimed = True
+                overwrite = True
 
-            if not state.overwrite_eligible or state.claimed:
-                return False
-            state.claimed = True
-            return True
+            main_grad = parameter.main_grad
+            current_stream = None
+            if main_grad.is_cuda:
+                current_stream = torch.cuda.current_stream(main_grad.device)
+                if state.last_write_stream is not None and state.last_write_stream != current_stream:
+                    current_stream.wait_stream(state.last_write_stream)
+
+            result = launch(overwrite)
+            if current_stream is not None:
+                state.last_write_stream = current_stream
+            return result
 
 
 def _get_fp8_dtype(format: Format, is_fwd_stage: bool):
@@ -109,9 +130,10 @@ def _setup_fused_grad_accum(
     for ``b``.
 
     An overwrite-capable caller receives a claim object and must call
-    ``claim()`` immediately before its backward write. The first backward that
-    actually executes for the Parameter receives True and may overwrite with
-    beta=0; later writes receive False and accumulate with beta=1. Deciding at
+    ``execute()`` around its backward write. The first backward that actually
+    executes for the Parameter receives True and may overwrite with beta=0;
+    later writes receive False and accumulate with beta=1. Selection and launch
+    are serialized so the overwrite is also the first device write. Deciding at
     the write, rather than in forward, keeps checkpoint recomputation, staged
     forwards, tied weights, and reverse backward order correct.
 

@@ -382,19 +382,25 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
         )
 
         # grad_w2 = gradO_col(rht=T) @ act_col(rht=T)^T, contracting M.
-        w2_overwrite = ctx.w2_overwrite_claim is not None and ctx.w2_overwrite_claim.claim()
-        grad_w2 = _wgrad_grouped_gemm_fp4_impl_wrapper(
-            go_col,
-            act_col,
-            go_col_scale,
-            act_col_scale,
-            go_lens_col,
-            go_offs_col,
-            ctx.out_dtype,
-            ctx.num_cu,
-            ctx.fuse_w2_accum,
-            ctx.w2_main_grad,
-            w2_overwrite,
+        def launch_w2_wgrad(overwrite):
+            return _wgrad_grouped_gemm_fp4_impl_wrapper(
+                go_col,
+                act_col,
+                go_col_scale,
+                act_col_scale,
+                go_lens_col,
+                go_offs_col,
+                ctx.out_dtype,
+                ctx.num_cu,
+                ctx.fuse_w2_accum,
+                ctx.w2_main_grad,
+                overwrite,
+            )
+
+        grad_w2 = (
+            ctx.w2_overwrite_claim.execute(launch_w2_wgrad)
+            if ctx.w2_overwrite_claim is not None
+            else launch_w2_wgrad(False)
         )
 
         # dgrad against w2_col, contracting K_out; the epilogue turns it into the
@@ -441,19 +447,25 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
         )
 
         # grad_w1 = grad_l1_col(rht=T) @ x_col(rht=T)^T, contracting M.
-        w1_overwrite = ctx.w1_overwrite_claim is not None and ctx.w1_overwrite_claim.claim()
-        grad_w1 = _wgrad_grouped_gemm_fp4_impl_wrapper(
-            gl_col,
-            x_col,
-            gl_col_scale,
-            x_col_scale,
-            gl_lens_col,
-            gl_offs_col,
-            ctx.out_dtype,
-            ctx.num_cu,
-            ctx.fuse_w1_accum,
-            ctx.w1_main_grad,
-            w1_overwrite,
+        def launch_w1_wgrad(overwrite):
+            return _wgrad_grouped_gemm_fp4_impl_wrapper(
+                gl_col,
+                x_col,
+                gl_col_scale,
+                x_col_scale,
+                gl_lens_col,
+                gl_offs_col,
+                ctx.out_dtype,
+                ctx.num_cu,
+                ctx.fuse_w1_accum,
+                ctx.w1_main_grad,
+                overwrite,
+            )
+
+        grad_w1 = (
+            ctx.w1_overwrite_claim.execute(launch_w1_wgrad)
+            if ctx.w1_overwrite_claim is not None
+            else launch_w1_wgrad(False)
         )
 
         return (

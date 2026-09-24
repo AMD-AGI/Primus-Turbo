@@ -427,6 +427,7 @@ class GroupedGEMMFP4VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDisp
         num_cu,
         inplace_add_to_out=False,
         overwrite_out=False,
+        out=None,
         **kwargs,
     ):
         bs = group_lens.shape[0]
@@ -451,6 +452,7 @@ class GroupedGEMMFP4VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDisp
             granularity,
             inplace_add_to_out,
             overwrite_out,
+            out.dtype if out is not None else None,
         )
 
 

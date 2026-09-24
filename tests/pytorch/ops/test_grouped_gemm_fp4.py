@@ -106,6 +106,13 @@ def test_grouped_gemm_fp4_variable_k_dispatch_keys():
     accumulation_key = GroupedGEMMFP4VariableKKernelDispatcher.make_key(
         b=torch.empty((3072, 2048), device="meta", dtype=fp4_dtype),
         inplace_add_to_out=True,
+        out=torch.empty((8, 512, 3072), device="meta", dtype=torch.bfloat16),
+        **common,
+    )
+    incompatible_destination_key = GroupedGEMMFP4VariableKKernelDispatcher.make_key(
+        b=torch.empty((3072, 2048), device="meta", dtype=fp4_dtype),
+        inplace_add_to_out=True,
+        out=torch.empty((8, 512, 3072), device="meta", dtype=torch.float32),
         **common,
     )
 
@@ -113,6 +120,15 @@ def test_grouped_gemm_fp4_variable_k_dispatch_keys():
     assert key_n4096[1:4] == (512, 4096, 2048)
     assert key_n3072 != key_n4096
     assert key_n3072 != accumulation_key
+    assert accumulation_key != incompatible_destination_key
+
+    cache = GroupedGEMMFP4VariableKKernelDispatcher._cache
+    cache.clear()
+    try:
+        cache.put(accumulation_key, GroupedGEMMFP4VariableKFlyDSLBackend)
+        assert cache.get(incompatible_destination_key) is None
+    finally:
+        cache.clear()
 
 
 def test_grouped_gemm_fp4_variable_k_dispatch_contract(monkeypatch):
