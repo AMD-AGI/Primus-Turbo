@@ -1,0 +1,73 @@
+=== PRE
+
+
+============================ ROCm System Management Interface ============================
+===================================== KFD Processes ======================================
+No KFD PIDs currently running
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+
+
+============================ ROCm System Management Interface ============================
+=================================== % time GPU is busy ===================================
+GPU[0]		: GPU use (%): 0
+==========================================================================================
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm cur_a -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/021/_scratch/arms/cur_a
+# arm A63 -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/021/_scratch/arms/A63
+# arm B66 -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/021/_scratch/arms/B66
+# arm cur_b -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/021/_scratch/arms/cur_b
+# arm beat -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/beat
+# statistic median  iters 51  warmup 3.0s continuous  order palindromic  device gfx1250
+RESULT shape=prod arm=cur_a stat=median iters=51 latency_ms=10.776580810546875 min_ms=10.72574520111084 max_ms=11.057400703430176 tflops=510.20164226291206 bw_gbs=124.54574448014453 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1053 sclk_end=1052 causal=True
+RESULT shape=prod arm=A63 stat=median iters=51 latency_ms=13.370906829833984 min_ms=13.31181812286377 max_ms=13.47714614868164 tflops=411.2084017556696 bw_gbs=100.38042274030748 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1053 sclk_end=1052 causal=True
+RESULT shape=prod arm=B66 stat=median iters=51 latency_ms=13.81677532196045 min_ms=13.76714038848877 max_ms=13.871255874633789 tflops=397.93867233124126 bw_gbs=97.14113812553187 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1053 sclk_end=1052 causal=True
+RESULT shape=prod arm=cur_b stat=median iters=51 latency_ms=10.797411918640137 min_ms=10.723501205444336 max_ms=10.847126007080078 tflops=509.21732623982973 bw_gbs=124.30546228239467 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1053 sclk_end=1052 causal=True
+RESULT shape=prod arm=beat stat=median iters=51 latency_ms=7.706343173980713 min_ms=7.593813896179199 max_ms=7.8177490234375 tflops=713.4679968683369 bw_gbs=174.16526226494247 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1053 sclk_end=1052 causal=True
+RC_prod 0
+GPU[0]		: sclk clock level: 1: (1100Mhz)
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm cur_a -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/021/_scratch/arms/cur_a
+# arm A63 -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/021/_scratch/arms/A63
+# arm B66 -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/021/_scratch/arms/B66
+# arm cur_b -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/021/_scratch/arms/cur_b
+# arm beat -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/beat
+# statistic median  iters 51  warmup 3.0s continuous  order palindromic  device gfx1250
+RESULT shape=proxy arm=cur_a stat=median iters=51 latency_ms=0.792186975479126 min_ms=0.7786870002746582 max_ms=1.037714958190918 tflops=433.8385764953238 bw_gbs=211.78353746415613 flop=343681269760.0 bytes_min=167772160 sclk_start=1055 sclk_end=1061 causal=True
+RESULT shape=proxy arm=A63 stat=median iters=51 latency_ms=0.9467380046844482 min_ms=0.9249060153961182 max_ms=0.9847149848937988 tflops=363.01623898002316 bw_gbs=177.21075859410456 flop=343681269760.0 bytes_min=167772160 sclk_start=1055 sclk_end=1061 causal=True
+RESULT shape=proxy arm=B66 stat=median iters=51 latency_ms=0.9885209798812866 min_ms=0.9791470170021057 max_ms=1.001099944114685 tflops=347.67220600747726 bw_gbs=169.720383699037 flop=343681269760.0 bytes_min=167772160 sclk_start=1055 sclk_end=1061 causal=True
+RESULT shape=proxy arm=cur_b stat=median iters=51 latency_ms=0.7994379997253418 min_ms=0.7844560146331787 max_ms=0.8176640272140503 tflops=429.9035946228183 bw_gbs=209.8626285686201 flop=343681269760.0 bytes_min=167772160 sclk_start=1055 sclk_end=1061 causal=True
+RESULT shape=proxy arm=beat stat=median iters=51 latency_ms=0.5938900113105774 min_ms=0.5807099938392639 max_ms=0.7118269801139832 tflops=578.695150978504 bw_gbs=282.49702268904264 flop=343681269760.0 bytes_min=167772160 sclk_start=1055 sclk_end=1061 causal=True
+RC_proxy 0
+GPU[0]		: sclk clock level: 1: (1100Mhz)
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm cur_a -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/021/_scratch/arms/cur_a
+# arm A63 -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/021/_scratch/arms/A63
+# arm B66 -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/021/_scratch/arms/B66
+# arm cur_b -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/021/_scratch/arms/cur_b
+# arm beat -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/beat
+# statistic median  iters 51  warmup 3.0s continuous  order palindromic  device gfx1250
+RESULT shape=fast arm=cur_a stat=median iters=51 latency_ms=0.09666500240564346 min_ms=0.09145700186491013 max_ms=0.20815199613571167 tflops=55.59356402277666 bw_gbs=108.47524687371057 flop=5373952000.0 bytes_min=10485760 sclk_start=1100 sclk_end=1100 causal=True
+RESULT shape=fast arm=A63 stat=median iters=51 latency_ms=0.1064400002360344 min_ms=0.09930899739265442 max_ms=0.12346500158309937 tflops=50.48808707330961 bw_gbs=98.51334063084802 flop=5373952000.0 bytes_min=10485760 sclk_start=1100 sclk_end=1100 causal=True
+RESULT shape=fast arm=B66 stat=median iters=51 latency_ms=0.1077210009098053 min_ms=0.10555800050497055 max_ms=0.11381100118160248 tflops=49.88769092945586 bw_gbs=97.34183595991388 flop=5373952000.0 bytes_min=10485760 sclk_start=1100 sclk_end=1100 causal=True
+RESULT shape=fast arm=cur_b stat=median iters=51 latency_ms=0.10579799860715866 min_ms=0.09578400105237961 max_ms=0.12570899724960327 tflops=50.79445803085711 bw_gbs=99.11113762118461 flop=5373952000.0 bytes_min=10485760 sclk_start=1100 sclk_end=1100 causal=True
+RESULT shape=fast arm=beat stat=median iters=51 latency_ms=0.10479699820280075 min_ms=0.09862799942493439 max_ms=0.16144199669361115 tflops=51.27963674685081 bw_gbs=100.05782779873329 flop=5373952000.0 bytes_min=10485760 sclk_start=1100 sclk_end=1100 causal=True
+RC_fast 0
+GPU[0]		: sclk clock level: 1: (1100Mhz)
+=== POST
+
+
+============================ ROCm System Management Interface ============================
+===================================== KFD Processes ======================================
+No KFD PIDs currently running
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+
+
+============================ ROCm System Management Interface ============================
+=================================== % time GPU is busy ===================================
+GPU[0]		: GPU use (%): 0
+==========================================================================================

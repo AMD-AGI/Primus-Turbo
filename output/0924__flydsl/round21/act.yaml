@@ -1,0 +1,141 @@
+round: 21
+mode: fast
+candidate: r21.i1.g63
+outcome: delivered
+
+correctness:
+  unit_tests: pass
+  precision: pass
+  checked_with: op/validation.py
+  sqnr_db: 52.52
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/020/op, rounds/019/op, rounds/017/op]
+  shapes:
+    - name: prod
+      this_round_tflops: 412.10
+      best_round_tflops: 509.15
+      beat_tflops: 713.09
+      target_tflops: 713.09
+      champion_round: 20
+      champion_tflops: 509.15
+      champion_rebuilt: true
+      ratio: 0.5779
+      vs_champion: 0.8094
+    - name: proxy
+      this_round_tflops: 365.71
+      best_round_tflops: 438.99
+      beat_tflops: 576.05
+      target_tflops: 576.05
+      champion_round: 19
+      champion_tflops: 438.99
+      champion_rebuilt: true
+      ratio: 0.6349
+      vs_champion: 0.8331
+    - name: fast
+      this_round_tflops: 53.30
+      best_round_tflops: 54.73
+      beat_tflops: 50.43
+      target_tflops: 50.43
+      champion_round: 19
+      champion_tflops: 54.73
+      champion_rebuilt: true
+      ratio: 1.0000
+      vs_champion: 0.9738
+  score: 0.7376
+
+validation:
+  exit_code: 2
+
+explored:
+  ran:
+    - "offline static screen (COMPILE_ONLY=1 ARCH=gfx1250 FLYDSL_GPU_ARCH=gfx1250 ISA dump) on cur_a / A63 / B65 / B66"
+    - "per-basic-block ISA census + in-body positional map of every s_wait_* (scr/blocks.py, scr/pos.py)"
+    - "on-card A/B with two physically-rebuilt incumbent slots for the same-session noise floor, sclk witness, rocm-smi idle witness"
+  # NOT rocprofv3 --stats: h4 records that rocprofv3 faults this op with
+  # HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION and that PC sampling is categorically banned
+  # (three faults, one reboot). The static screen is the substitute the job standardised on.
+  # What the survey changed: it satisfied route row 10's hard zero-card-time precondition
+  # (k_dq's .LBB0_2 carries four s_wait_loadcnt, three of them late, NOT ~0), which is what
+  # allowed g63 to be built at all; and it killed r21.i3.g65 outright before any card time.
+  consulted:
+    - INDEX.md
+    - optimization/routes/1-metrics-to-techniques.md
+    - optimization/techniques/3-pipelining-and-scheduling.md
+    - backends/flydsl/attention/dead-ends.md
+    - backends/aiter/attention/recipes/fmha_v3_bwd_hd128_bf16.md
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+  bound: latency
+  confidence: medium
+  why: >
+    r21.i4.g66 changed nothing but the ISSUE POSITION of 32 buffer_load_b128 -- identical
+    byte traffic, identical WMMA count, identical LDS op count, VGPR 960 -> 960, spill 0 --
+    and cost 21.93% of prod. A pure re-ordering cannot cost a fifth of a bandwidth-bound
+    body. Confidence stays medium rather than high because the positive side of the case is
+    still a single mechanism (g21's cross-iteration prefetch) and gfx1250 exposes no
+    byte-reporting or stall-reason counter at any level to corroborate it.
+
+arms:
+  - id: r21.i1.g63
+    built: "A alone, from op/current -- k_dq prefetch depth 1 -> 2, the r20.i2.g62 edit on the other kernel"
+    tflops: {prod: 412.10, proxy: 365.71, fast: 53.30}
+    vs_champion: 0.8094
+    shipped: true
+    note: >
+      Every gate passed and it still lost by 100x the noise floor. The intended ISA delta
+      landed exactly (s_wait_loadcnt 4 -> 2, the 93% full drain gone); VGPR 960 -> 992 with
+      spill 0 and scratch 0, 32 under the one-wave/SIMD cap of 1024.
+  - id: r21.i4.g66
+    built: "B alone, from op/current -- NOT on top of A. sched_group_barrier(VMEM,1)/(MFMA,3) x32 in k_dq._body"
+    tflops: {prod: 397.94, proxy: 347.67, fast: 49.89}
+    vs_champion: 0.7816
+    shipped: false
+    note: >
+      The round's load-bearing result. Built to isolate WHY g63 lost: it buys the same load
+      spread at VGPR 960 -> 960 (unchanged) and body +2.7%, and loses MORE (-21.93% vs
+      -19.33%). So the loss is not spill, not register pressure, not code size -- it is the
+      spread itself. k_dq's tight 50-instruction prefetch clump is load-bearing.
+  - id: r21.i3.g65
+    built: "built and offline-screened only; killed before any card time"
+    tflops: {}
+    vs_champion: null
+    shipped: false
+    note: >
+      Hoisting k_dq's 16 ds_store_b128 out of the kt/dt loop. After register-renaming
+      normalisation the k_dq hot body is instruction-for-instruction identical to the
+      incumbent (k_dkdv and k_delta_bshd byte-identical): the backend already clusters the
+      stores at idx 4-108 and the tr16 reads at 110-249, whose consumers sit at 77-92% of
+      the body. Source order is not issue order (second time, after r16.i1.g48).
+  - id: "merge r21.i1.g63 + r21.i4.g66"
+    built: "NOT BUILT -- the merge rule requires that neither arm lost, and both lost"
+    tflops: {}
+    vs_champion: null
+    shipped: false
+
+expected: >
+  k_dq is ~37% of prod time and round 20 measured the second prefetch stage worth
+  +1.5-1.7% on k_dkdv. This is the same edit on the other kernel -- the single mechanism
+  that has ever moved this operator, applied to the half of prod time round 20 did not
+  touch. The ISA precondition is satisfied (k_dq's .LBB0_2 carries four s_wait_loadcnt,
+  three of them late: 0xd @77%, 0x8 @78%, a full 0x0 drain @93%), so the depth-1 prefetch
+  demonstrably never reaches the next iteration. spill 0 is the gate and the likely failure
+  mode. Expect prod 509.7 -> roughly 515-520 if it transfers, and a fast, unambiguous loss
+  if register pressure serialises the body instead.
+  For r21.i4.g66, written before building: I expect B66 to LOSE, because the hint spread the
+  waits into the body along with the loads (s_wait_loadcnt 4 -> 10, four new 0x0 full drains
+  mid-body). It is built anyway because it is the only way to separate "spread" from "depth",
+  and it is cheap.
+
+added_to_pool: [r21.i3.g65, r21.i4.g66]
+route_updated: true
+
+implementation:
+  files_changed: [rounds/021/op/kernels.py]
+  build_failures:
+    - attempt: 1
+      error: "screen.py: error: argument --tag: expected one argument (rc=0, no artefact produced)"
+      root_cause: "launch.sh passes only the script path into setsid, never argv; the tag was silently dropped. Fixed with a one-line wrapper script per tag."
+    - attempt: 2
+      error: "benchmark.py: error: arm 'cur_a': no impl.py under job_context/op/cur_a"
+      root_cause: "--arms takes only arms resolvable under op/; an arm registered via --arm-path is already an arm and must NOT be repeated in --arms. Failed in argparse, so zero card time was spent."

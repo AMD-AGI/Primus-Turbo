@@ -2855,3 +2855,44 @@ h30's sweep shows BLOCK_Q=128 spilling 1068 B — so the *check* is right even t
 **Still open and NOT answered by the compile:** whether `k_dq` has a load-to-use problem for
 the prefetch to cover at all. Round 18's attribution put ZERO modelled stall in `k_dq`'s body
 at 54.3% matrix busy. Fitting is not the same as helping; the card decides that.
+
+## h37 — k_dq's prefetch clump is LOAD-BEARING. Spreading its loads costs ~20%, and this is isolated, not inferred.
+
+Round 21 applied g62's winning edit (prefetch depth 1 -> 2) to `k_dq` as `g63` and lost
+**19.33% at prod**. It then built `g66` specifically to find out why, and that second arm is
+the result worth keeping:
+
+> `g66` changes **only the issue position** of 32 `buffer_load_b128` in `k_dq._body`
+> (`sched_group_barrier(VMEM,1)/(MFMA,3) x32`). Identical byte traffic, identical WMMA count,
+> identical LDS op count, **VGPR 960 -> 960**, spill 0, body +2.7% instructions.
+> It cost **21.93%** — *more* than g63.
+
+**So the loss is not spill, not register pressure, not code size. It is the spread itself.**
+`k_dq`'s tight ~50-instruction prefetch clump is load-bearing, and a pure re-ordering cannot
+cost a fifth of a bandwidth-bound body — which is also further evidence against any remaining
+bandwidth reading of this kernel.
+
+### The rule this refines
+
+Round 20 handed over "add independent work, lengthen load-to-use distance, do not remove
+anything". `g63` *added* work, fit in registers (960 -> 992, spill 0), landed its intended ISA
+delta exactly (`s_wait_loadcnt` 4 -> 2, the 93% full drain gone) — and lost by 100x the noise
+floor. The rule is too coarse. Corrected:
+
+> **Latency cover pays only where there is latency to cover, and only in the form the body
+> already uses.** `k_dkdv` has ~38% non-issuing cycles and takes prefetch depth (+1.65%).
+> `k_dq` has four `s_wait_loadcnt` in `.LBB0_2`, three of them late — so it is NOT stall-free,
+> which corrects my own overstatement — but its cure is clumping, not spreading, and applying
+> `k_dkdv`'s cure to it costs 20%.
+
+This is the third measured instance of "the mechanism does not transfer between these two
+kernels" (after g61's chain split and h36's VGPR extrapolation). **Treat `k_dq` and `k_dkdv` as
+different machines. Any proposal that says "the edit that worked on X, applied to Y" must state
+what makes Y's body the same, and be screened COMPILE_ONLY first.**
+
+### Method credit
+
+Round 21 satisfied route row 10's zero-card-time precondition before building anything
+(per-basic-block ISA census plus a positional map of every `s_wait_*`, `scr/blocks.py`,
+`scr/pos.py`), and killed a third candidate (`g65`) offline with no card time at all. The
+isolation arm `g66` cost one arm slot and bought the only mechanistic fact of the round.
