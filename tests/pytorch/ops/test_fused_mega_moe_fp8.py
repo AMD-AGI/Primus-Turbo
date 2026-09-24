@@ -56,6 +56,9 @@ if is_gfx1250():
 from primus_turbo.flydsl.mega.fp8.symm_buffer import (  # noqa: E402
     get_symm_buffer_for_mega_moe,
 )
+from primus_turbo.pytorch.kernels.fused_mega_moe import (  # noqa: E402
+    advance_weight_generation,
+)
 from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import (  # noqa: E402
     fused_mega_moe_fp8_stage1,
     fused_mega_moe_fp8_stage2,
@@ -112,6 +115,19 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
         "hidden, inter, num_experts, num_topk, num_tokens",
         [
             (7168, 2048, 256, 8, 8192),
+            # deepseek_v2's expert shape. Its MegaMoE mxfp8 arm trains to loss 11.81 at iteration
+            # 20 where its bf16 arm reaches 10.39, with iteration-1 loss matching -- forward fine,
+            # backward not. inter=1536 is the only structural difference from the shape above.
+            (5120, 1536, 160, 6, 8192),
+            # Same, with hidden held at the known-good 7168, so a failure here pins it on inter
+            # alone rather than on the hidden/inter pair.
+            (7168, 1536, 256, 8, 8192),
+            # The shape above with topk 6 instead of 8. In training this is the configuration that
+            # blows up: a topk-sweep on deepseek_v3 measured iteration-1 grad norm 0.81 at topk 4
+            # and 1.43 at topk 8, against 2245 / 1529 / 1290 at topk 5 / 6 / 7 -- only powers of
+            # two survive, and only with mxfp8 experts (bf16 experts report 1.09 at topk 6). The
+            # layer's dx is correct there, so it is the weight gradients that are inflated.
+            (7168, 2048, 256, 6, 8192),
         ],
     )
     def test_staged_forward_backward(self, hidden, inter, num_experts, num_topk, num_tokens):
@@ -192,6 +208,149 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
         for tag, snr, cos in measured:
             self.assertGreaterEqual(snr, _SNR_FLOOR_DB, f"[{tag}] SNR {snr:.2f} dB < {_SNR_FLOOR_DB}")
             self.assertGreaterEqual(cos, _COSINE_FLOOR, f"[{tag}] cosine {cos:.5f} < {_COSINE_FLOOR}")
+
+
+    @skip_unless_mxfp8
+    @skip_if_lt_x_gpu(8)
+    @parametrize("num_topk", [8, 6])
+    def test_multi_layer_grad_accumulation(self, num_topk):
+        """Several layers per pass and several accumulated passes -- the shape of a training step.
+
+        The single-pass test above reuses the symmetric workspace once; a training step reuses it
+        ``num_layers * micro_batches * 2`` times, and two cross-rank handoffs in the fp8 combine
+        were only correct on a cold workspace:
+
+          * ``combine_gate`` (the gate gradient a peer scatters into this rank's CACHED main heap)
+            was pushed and read without the system-scope cache bits, so every layer but the last
+            read the gate gradient the NEXT layer's backward had left in L2 -- dtw fell from 23 dB
+            to 6 dB on layers 0..L-2 while the last layer, whose backward runs with nothing in
+            between, stayed correct.
+          * the ``comb`` payload was pushed and read the same way, so a handful of slots per call
+            were reduced from the FORWARD's y still sitting in the buffer. dx is ~1e-6 and y is
+            ~1e0, so a few stale slots inflated dx by ~1e6 -- iteration-1 grad norm 1300 instead
+            of 1.4, clip_grad turning every update into a 1000x smaller learning rate.
+
+        Both need the workspace to be warm, which is why they are invisible to a single pass, and
+        both are silent: no NaN, no hang, forward and loss unchanged.
+
+        What this test needs that the earlier one did not: DISTINCT data per pass. ``generate_inputs``
+        seeds its own generator, so passes built without a ``seed`` are the same micro-batch twice,
+        and a buffer left holding the previous pass's values is indistinguishable from a correct one.
+
+        dx and dtw are checked, not just the weight gradients: dx is where the 1e6 inflation shows,
+        and dtw is where the gate staleness does. topk 8 runs alongside 6 as the control -- the
+        training sweep found only powers of two surviving, and the timing of the comb race follows
+        the tile count, so the two values exercise different schedules of the same code.
+        """
+        torch.cuda.set_device(self.device)
+        # The prepared-fp8-weight cache keys on (data_ptr, shape) plus the generation, so a tensor
+        # allocated at an address a previous test just freed, at the same shape, is served that
+        # test's quantized weights. Advancing the generation is what an optimizer step does and is
+        # the cache's documented contract; without it this test reads the previous parametrization's
+        # w1/w2 and reports cos ~ 0 at unchanged magnitude.
+        advance_weight_generation()
+        group = dist.group.WORLD
+        # Same shape as the single-pass test above, deliberately: this class runs every test in
+        # one process, and compiling the combine for a second token count there trips a FlyDSL
+        # trace error in whichever test recompiles next.
+        hidden, inter, num_experts, num_tokens = 7168, 2048, 256, 8192
+        num_layers, num_passes = 2, 2
+
+        symm = get_symm_buffer_for_mega_moe(
+            group,
+            num_experts=num_experts,
+            num_max_tokens_per_rank=num_tokens,
+            num_topk=num_topk,
+            hidden=hidden,
+            intermediate_hidden=inter,
+            use_mxfp8=True,
+        )
+        try:
+            shape = dict(
+                num_tokens=num_tokens,
+                hidden=hidden,
+                inter=inter,
+                num_experts=num_experts,
+                num_topk=num_topk,
+                device=self.device,
+            )
+            # One weight pair per layer, one (x, routing, grad_y) per pass, all distinct.
+            weights = [
+                generate_inputs(self.rank, self.world_size, seed=7700 + 13 * lyr, **shape)[1:3]
+                for lyr in range(num_layers)
+            ]
+            passes = []
+            for p in range(num_passes):
+                x, _, _, topk_idx, topk_weight = generate_inputs(
+                    self.rank, self.world_size, seed=4200 + 91 * p, **shape
+                )
+                _g = torch.randn(x.shape, device=self.device, dtype=torch.float32)
+                passes.append((x, topk_idx, topk_weight, (_g / (_g.norm() + 1e-12) * _GRAD_OUT_NORM).bfloat16()))
+
+            def accumulate(run_one):
+                """All layers per pass, then one backward -- so each layer's backward runs with
+                other layers' calls between it and its own forward, as in a real step."""
+                ws = [
+                    (l1.detach().clone().requires_grad_(True), l2.detach().clone().requires_grad_(True))
+                    for l1, l2 in weights
+                ]
+                dx_acc = [torch.zeros(num_tokens, hidden, device=self.device) for _ in range(num_layers)]
+                dtw_acc = [torch.zeros(num_tokens, num_topk, device=self.device) for _ in range(num_layers)]
+                for x, topk_idx, topk_weight, grad_y in passes:
+                    xs, tws, ys = [], [], []
+                    for l1, l2 in ws:
+                        xs.append(x.detach().requires_grad_(True))
+                        tws.append(topk_weight.detach().requires_grad_(True))
+                        ys.append(run_one(xs[-1], topk_idx, tws[-1], l1, l2))
+                    # NO synchronize()/barrier() between the calls: a rendezvous there is not
+                    # something a training step does, and it hides what this test is for.
+                    sum(ys).backward(grad_y)
+                    for lyr in range(num_layers):
+                        dx_acc[lyr] += xs[lyr].grad.float()
+                        dtw_acc[lyr] += tws[lyr].grad.float()
+                return [
+                    (l1.grad, l2.grad, dx_acc[lyr], dtw_acc[lyr]) for lyr, (l1, l2) in enumerate(ws)
+                ]
+
+            def mega(x, topk_idx, tw, l1, l2):
+                l1_out, dwib, handle, state = fused_mega_moe_fp8_stage1(x, topk_idx, tw, l1, group)
+                return fused_mega_moe_fp8_stage2(l1_out, dwib, handle, state, topk_idx, tw, l2, group)
+
+            def reference(x, topk_idx, tw, l1, l2):
+                return baseline_reference(
+                    group, x, topk_idx, tw, l1, l2, num_experts=num_experts, num_topk=num_topk
+                )
+
+            got = accumulate(mega)
+            torch.cuda.synchronize()
+            group.barrier()
+            want = accumulate(reference)
+        finally:
+            symm.destroy()
+
+        tags = ("dl1_weight", "dl2_weight", "dx", "dtw")
+        measured = [
+            (f"layer{lyr} {tag}", got[lyr][i], want[lyr][i])
+            for lyr in range(num_layers)
+            for i, tag in enumerate(tags)
+        ]
+        results = [(name, *self._metrics(a, r)) for name, a, r in measured]
+        if self.rank == 0:
+            print(
+                f"\n[{num_layers}-layer x {num_passes}-pass accumulated fp8 mega MoE]  "
+                f"EP{self.world_size} topk={num_topk}"
+            )
+            for (name, snr, cos), (_, a, r) in zip(results, measured):
+                # Scale is the symptom: the training failure is a ~1e6 inflation, not noise.
+                ratio = float(a.float().norm() / r.float().norm())
+                print(
+                    f"  {name:<20}: min SNR = {snr:7.2f} dB  min cos = {cos:.5f}  "
+                    f"||mega||/||ref|| = {ratio:.3f}",
+                    flush=True,
+                )
+        for name, snr, cos in results:
+            self.assertGreaterEqual(snr, _SNR_FLOOR_DB, f"[{name}] SNR {snr:.2f} dB < {_SNR_FLOOR_DB}")
+            self.assertGreaterEqual(cos, _COSINE_FLOOR, f"[{name}] cosine {cos:.5f} < {_COSINE_FLOOR}")
 
 
 if __name__ == "__main__":

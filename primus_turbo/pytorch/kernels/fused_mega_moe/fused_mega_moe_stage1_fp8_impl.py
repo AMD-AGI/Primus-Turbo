@@ -10,6 +10,7 @@ Stage1 owns the forward dispatch + fc1 and the fc1-input pool requant for dW1; o
 L1 dgrad and the dW1 wgrad. Every call below is a helper the fused path already uses.
 """
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -81,6 +82,14 @@ def _mxfp8_variable_k_wgrad_dw1(
     )
 
 
+# L1 dgrad combine CU split: 28 was unified w/ fwd L2 (task-based push; T=8192) on DSv3. Like
+# ``_L2_NUM_COMBINE_CU`` this optimum moves with the expert shape, so ``None`` lets the combine's
+# online autotune pick it; the env pins a value and skips tuning.
+_L1_NUM_COMBINE_CU = (
+    int(os.environ["PT_MEGA_FP8_L1_COMBINE_CU"]) if "PT_MEGA_FP8_L1_COMBINE_CU" in os.environ else None
+)
+
+
 def _l1_dgrad_combine_mxfp8_flydsl_kernel(
     w1,
     group,
@@ -102,7 +111,8 @@ def _l1_dgrad_combine_mxfp8_flydsl_kernel(
         topk_indices=topk_idx.contiguous().view(-1),
         grad_gate=grad_gate,
         x_fp8_rowwise=grad_l1_rowwise_fp8,
-        num_combine_cu=28,  # unified w/ fwd L2 (task-based push; T=8192)
+        num_combine_cu=_L1_NUM_COMBINE_CU,
+        group=group,
     )
     grad_topk_weights = d_topk_w_flat[: num_tokens * num_topk].view(num_tokens, num_topk)
     return dx, grad_topk_weights
