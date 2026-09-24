@@ -48,6 +48,7 @@ from primus_turbo.flydsl.utils.prims import (
 )
 from primus_turbo.flydsl.utils.gemm_epilogue_helper import (
     DGLU_BAND_ROWS,
+    DGLU_CO_BANDS,
     LDS_WORDS_PER_WAVE,
     MXFP4DualQuantStore,
     MXFP4DualQuantStoreDglu,
@@ -387,11 +388,31 @@ def _build_grouped_mxfp4_nt_kernel(
     _B_SLOT = (LDS_BN_HALF // 2) * LDS_ROW_STRIDE
     _SK = 64 * _K128  # skewed region's byte offset from its 128B-aligned line
     _NOBUF = 3 if _K128 else 2  # a skewed in-place refill needs 2 live + 1 landing slot
+    # The dglu quant epilogue's staging runs from the A pool through BL; on K with an
+    # even count of 128-blocks those pools lose a slot each and come up short. The
+    # shortfall is given to BL_o -- the last pool the band may cover -- rather than
+    # taken from BR by overrunning it. It costs nothing: the struct is already past
+    # half the 160 KB a CU has, so occupancy is 1 either way, and the mainloop never
+    # sees the tail because it addresses BL_o by slot and there are still _NOBUF.
+    _EPI_BYTES = 0
+    if dglu_act_quant:
+        _pools = (NABUF + _NOBUF) * _A_SLOT + (NBB + _NOBUF) * _B_SLOT
+        _need = (
+            2
+            * (
+                DGLU_BAND_ROWS * (2 * N_TILES_BH * 16 + _DGLU_BAND_PAD)
+                + MXFP4DualQuantStoreDglu.col_words_per_group()
+                + MXFP4DualQuantStoreDglu.co_words_per_group(DGLU_CO_BANDS)
+            )
+            * 4
+        )
+        _EPI_BYTES = max(0, ceildiv(_need - _pools, 16) * 16)
     _anns = {"A_e": fx.Array[fx.Float8E4M3FN, NABUF * _A_SLOT, 16]}
     _anns["A_o"] = fx.Array[fx.Float8E4M3FN, _NOBUF * _A_SLOT, 16]
     for _h in ("BL", "BR"):
         _anns[f"{_h}_e"] = fx.Array[fx.Float8E4M3FN, NBB * _B_SLOT, 16]
-        _anns[f"{_h}_o"] = fx.Array[fx.Float8E4M3FN, _NOBUF * _B_SLOT, 16]
+        _tail = _EPI_BYTES if _h == "BL" else 0
+        _anns[f"{_h}_o"] = fx.Array[fx.Float8E4M3FN, _NOBUF * _B_SLOT + _tail, 16]
     SS = fx.struct(type("SSFp4Grp", (), {"__annotations__": _anns}))
 
     def _body(
@@ -673,13 +694,10 @@ def _build_grouped_mxfp4_nt_kernel(
                 N_TILES_A,
                 N_TILES_BH,
                 _out_ty,
-                lds.BL_e,  # dead once the mainloop drains; see the class docstring
+                lds.A_e,  # dead once the mainloop drains; see the class docstring
                 wave_id,
             )
-            # The quant band is a whole 32-row micro-block, which only fits the two
-            # dead BL pools unpadded; the pad is worth its bank-disjoint staging
-            # writes only where there is room for it (see the assert below).
-            _dglu_pad = 0 if dglu_act_quant else _DGLU_BAND_PAD
+            _dglu_pad = _DGLU_BAND_PAD
             _dglu_kw = dict(
                 row_pad=_dglu_pad,
                 col_safe=_COL_SAFE,
@@ -698,8 +716,11 @@ def _build_grouped_mxfp4_nt_kernel(
                     glu_i,
                     ceildiv(2 * glu_i, 128) * 128,  # the quantiser's row-wise pad
                     aq_col_rows,
-                    I32(fx.ptrtoint(lds.BL_e.ptr)),
+                    I32(fx.ptrtoint(lds.A_e.ptr)),
                     I32(wave_m) * I32(DGLU_BAND_ROWS * _row_stride),
+                    # The transpose sits past both wave_m groups' dact bands.
+                    I32(2 * DGLU_BAND_ROWS * _row_stride)
+                    + I32(wave_m) * I32(MXFP4DualQuantStoreDglu.col_words_per_group()),
                     _row_stride,
                     lane_id,
                     wave_n,
@@ -707,16 +728,20 @@ def _build_grouped_mxfp4_nt_kernel(
                     row_sr=epi_row_sr,
                     col_sr=epi_col_sr,
                     sr_seed=SR_SEED,
+                    # The col-out staging sits past both groups' transposes.
+                    co_words=I32(2 * DGLU_BAND_ROWS * _row_stride)
+                    + I32(2 * MXFP4DualQuantStoreDglu.col_words_per_group())
+                    + I32(wave_m) * I32(MXFP4DualQuantStoreDglu.co_words_per_group(DGLU_CO_BANDS)),
+                    co_bands=DGLU_CO_BANDS,
                 )
                 store_c = StoreCdSwiGLUQuadQuant(*_dglu_args, quant_store=_q, **_dglu_kw)
                 pad_row_base = _lane_tbl_get(_pad0, group_idx) + bm * I32(BLOCK_M) + I32(wave_m_off)
             else:
                 store_c = StoreCdSwiGLUQuadCShuffle(*_dglu_args, **_dglu_kw)
-            # The band is wider than BL_e alone, so it runs on into BL_o; both are
-            # dead by then and the struct lays them out adjacent. BR is not covered
-            # by this bound and is not free whatever the drains above say -- a band
-            # overrunning into it reads back what the mainloop left there.
-            assert store_c.lds_bytes() <= (NBB + _NOBUF) * _B_SLOT
+            # The band starts at the A pool and runs through BL and its declared tail
+            # (A_e/A_o/BL_e/BL_o are all dead once the mainloop drains). BR is not free
+            # whatever the drains say -- reaching into it corrupts the col-wise operand.
+            assert store_c.lds_bytes() <= (NABUF + _NOBUF) * _A_SLOT + (NBB + _NOBUF) * _B_SLOT + _EPI_BYTES
         else:
             store_c = StoreCPlain(C, m_end, c_n, mfma.idx, N_TILES_A, N_TILES_BH, _out_ty, ilv=_BILV)
         if const_expr(not _CSTORE):
@@ -777,8 +802,9 @@ def _build_grouped_mxfp4_nt_kernel(
             # accL is gate, accR the up column it pairs with: the R pool read the up band.
             store_c.store_pair(accL, accR, base_row, base_col_l)
         elif dglu:
-            # The band borrows the BL pool, so the mainloop's in-flight ds_reads and
-            # g2s prefetch must retire before the first staging write. Both fences
+            # The band borrows the operand pools, so the mainloop's in-flight
+            # ds_reads and g2s prefetch must retire before the first staging
+            # write. Both fences
             # have to drain vmcnt, and both are needed: one leaves a g2s the
             # scheduler placed after the first drain free to overwrite the band.
             _lds_barrier(vmcnt=0)

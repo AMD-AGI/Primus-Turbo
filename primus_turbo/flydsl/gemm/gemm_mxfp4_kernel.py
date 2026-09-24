@@ -588,6 +588,37 @@ class MfmaScaleFp4:
             _scextra = nsct  # VGPR-direct 2nd scale set (ping-pong)
             set_sz = ntmp + nsct + _scextra
             ntmp2 = NSET * set_sz
+            # Accumulators and fragment temporaries trade register files.  An accumulator the
+            # fused store touches is read out of the AGPRs twice -- once to pack the l1 store,
+            # once for the epilogue -- and one that already sits in an arch VGPR is read no
+            # times; the fragments do not care which file they are in, because MFMA takes
+            # srcA/srcB from either and ``ds_read_b128`` writes either.  The scale temporaries
+            # are the exception and stay arch VGPRs.  Both windows are ``4 * ntmp`` wide, so the
+            # swap moves nothing else and ``_CDV`` still lands where ``emit_sc_vgpr`` expects.
+            # Only the quads at the top move, keeping ``cst_wide``'s ``ntb`` groups uniform.
+            _FRAGV0 = _PINBASE + 2 * nsct  # first fragment VGPR (scales hold the slots below)
+            _NAV = min((ntmp // ntb) * ntb, NT) if (_CST and _ZACC and 4 * NT <= 256) else 0
+            assert NSET == 1 or not _NAV, "the swap assumes one operand set"
+            _AV0 = NT - _NAV  # first accumulator quad that moved to an arch VGPR
+            _AFR0 = 4 * _AV0  # first AGPR the fragments take over
+            _ACCV0 = _FRAGV0 + 4 * (ntmp - _NAV)  # arch VGPRs left over for those accumulators
+
+            def acc_reg(q, e=0):
+                """Register holding dword ``e`` of accumulator quad ``q`` after the swap."""
+                if q < _AV0:
+                    return f"a{4 * q + e}"
+                return f"v{_ACCV0 + 4 * (q - _AV0) + e}"
+
+            def acc_cons(q):
+                """Output constraint pinning quad ``q``.  An output pulled out of the AGPRs needs
+                the ``&``: without it the allocator may overlap it with a ``v``-class input and
+                some shapes come out wrong.  ``&`` rules out a tied operand, hence the ``_ZACC``
+                dependence above -- the accumulators have to start from an MFMA src2 immediate."""
+                if q < _AV0:
+                    return f"={{a[{4 * q}:{4 * q + 3}]}}"
+                v0 = _ACCV0 + 4 * (q - _AV0)
+                return f"=&{{v[{v0}:{v0 + 3}]}}"
+
             _nvx = 19 if _ROT else 0  # split: 12 rotating ds_read bases + 2x3 ring offsets + scratch
             _nbase = NT + ntmp2
             o_nb = [[[_nbase + t * 4 + b * 2 + s for s in range(2)] for b in range(2)] for t in range(3)]
@@ -838,7 +869,7 @@ class MfmaScaleFp4:
                 imm = (cst_gap if sl else 0) + ji * 32
                 rs = i_cr if sl else i_cl
                 return [
-                    f"buffer_store_short_d16_hi a{4 * q + e}, ${o_crw[p][e]}, ${rs}, 0 offen"
+                    f"buffer_store_short_d16_hi {acc_reg(q, e)}, ${o_crw[p][e]}, ${rs}, 0 offen"
                     + (f" offset:{imm}" if imm else "")
                     + _CNT
                     for e in range(4)
@@ -846,22 +877,30 @@ class MfmaScaleFp4:
 
             def cst_wide(ii, sl, p, u):
                 # Interleaved: each C row packs to a dwordx2 via v_accvgpr_read + v_cvt_pk_bf16_f32.
+                # A quad the swap left in an arch VGPR is already where the pack wants its source,
+                # so the read in front of it is gone -- which is what the swap is for.
                 q0 = sl * nq + ii * ntb
                 imm = cst_gap if sl else 0
                 rs = i_cr if sl else i_cl
                 b = _CDV + (u & 1) * 8
                 s0, s1 = _CDV + 16, _CDV + 17
                 ls = []
+
+                def pack(q_lo, q_hi, e, dst, tmp):
+                    """``v_cvt_pk_bf16_f32`` of two quads' dword ``e``, staging whatever is an AGPR."""
+                    out = []
+                    srcs = []
+                    for q, into in ((q_lo, dst), (q_hi, tmp)):
+                        r = acc_reg(q, e)
+                        if r[0] == "a":
+                            out.append(f"v_accvgpr_read_b32 v{into}, {r}")
+                            r = f"v{into}"
+                        srcs.append(r)
+                    return out + [f"v_cvt_pk_bf16_f32 v{dst}, {srcs[0]}, {srcs[1]}"]
+
                 for e in range(4):
                     d = b + 2 * e
-                    ls += [
-                        f"v_accvgpr_read_b32 v{d}, a{4 * q0 + e}",
-                        f"v_accvgpr_read_b32 v{s0}, a{4 * (q0 + 1) + e}",
-                        f"v_cvt_pk_bf16_f32 v{d}, v{d}, v{s0}",
-                        f"v_accvgpr_read_b32 v{d + 1}, a{4 * (q0 + 2) + e}",
-                        f"v_accvgpr_read_b32 v{s1}, a{4 * (q0 + 3) + e}",
-                        f"v_cvt_pk_bf16_f32 v{d + 1}, v{d + 1}, v{s1}",
-                    ]
+                    ls += pack(q0, q0 + 1, e, d, s0) + pack(q0 + 2, q0 + 3, e, d + 1, s1)
                 for e in range(4):
                     d = b + 2 * e
                     ls.append(
@@ -1159,9 +1198,14 @@ class MfmaScaleFp4:
                 def emit_acc_clear(lo, hi):
                     # Explicit clear for accumulators no src2-immediate MFMA reaches (see emit_head).
                     return [
-                        f"v_accvgpr_write_b32 a{4 * q + e}, 0"
+                        (
+                            f"v_accvgpr_write_b32 {r}, 0"
+                            if r[0] == "a"
+                            else f"v_mov_b32 {r}, 0"  # the swapped quads clear in the arch file
+                        )
                         for q in range_constexpr(lo, hi)
                         for e in range_constexpr(4)
+                        for r in (acc_reg(q, e),)
                     ]
 
                 def emit_head(half, l_head=7):
@@ -1523,12 +1567,16 @@ class MfmaScaleFp4:
                 for j in range(_nsc2):
                     _vtmp[s * set_sz + ntmp + j] = f"=&{{v{bv}}}"
                     bv += 1
-                for j in order:  # frags: vector<4xi32> = 4 VGPR
-                    _vtmp[s * set_sz + j] = f"=&{{v[{bv}:{bv + 3}]}}"
-                    bv += 4
+                for i, j in enumerate(order):  # frags: vector<4xi32> = 4 VGPR
+                    if i < _NAV:  # swapped into the AGPRs the top accumulator quads vacated
+                        av = _AFR0 + 4 * i
+                        _vtmp[s * set_sz + j] = f"=&{{a[{av}:{av + 3}]}}"
+                    else:
+                        _vtmp[s * set_sz + j] = f"=&{{v[{bv}:{bv + 3}]}}"
+                        bv += 4
             _vtmp += ["=&v"] * _nvx  # split: rotating ds_read bases + ring offsets
             cons = ",".join(
-                ([f"={{a[{4 * q}:{4 * q + 3}]}}" for q in o_acc] if _CST else ["=a"] * NT)
+                ([acc_cons(q) for q in o_acc] if _CST else ["=a"] * NT)
                 + _vtmp
                 + ["=&s"] * (12 + (10 if _ROT else 0))  # cnt+3soff+3tmp+4scsoff+1sctmp(+ring)
                 + ((["=&s"] + ["=&v"] * 8) if _CST else [])  # fused store scratch
