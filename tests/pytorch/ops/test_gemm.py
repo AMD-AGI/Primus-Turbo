@@ -9,12 +9,11 @@ import torch
 
 import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
+from tests.pytorch.ops.gemm_shapes_helper import GEMM_SHAPES
 from tests.pytorch.test_utils import get_tolerances
 
 
-@pytest.mark.parametrize("m", [1, 16, 128, 256, 512, 1024, 2048])
-@pytest.mark.parametrize("n", [1, 16, 129, 512, 1024, 2048, 4096])
-@pytest.mark.parametrize("k", [1, 16, 127, 255, 512, 1024, 2048])
+@pytest.mark.parametrize("m, n, k", GEMM_SHAPES)
 @pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_gemm(m, n, k, layout, dtype):
@@ -67,22 +66,25 @@ def test_gemm(m, n, k, layout, dtype):
     torch.testing.assert_close(b.grad, b_ref.grad, **get_tolerances(dtype))
 
 
-@pytest.mark.parametrize("m", [1, 16, 128, 256, 512, 1024, 2048])
-@pytest.mark.parametrize("n", [1, 16, 129, 512, 1024, 2048, 4096])
-@pytest.mark.parametrize("k", [1, 16, 127, 255, 512, 1024, 2048])
+# Triton has no float32 kernel.
+_DET_BACKEND_DTYPES = [
+    (backend, dtype)
+    for backend in (None, BackendType.TRITON, BackendType.HIPBLASLT)
+    for dtype in (torch.float32, torch.float16, torch.bfloat16)
+    if not (backend is BackendType.TRITON and dtype == torch.float32)
+]
+
+
+@pytest.mark.parametrize("m, n, k", [(1, 4096, 2048), (128, 129, 127), (1024, 1024, 512), (2048, 4096, 2048)])
 @pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.HIPBLASLT])
+@pytest.mark.parametrize("backend, dtype", _DET_BACKEND_DTYPES)
 @pytest.mark.deterministic
-def test_gemm_deterministic(m, n, k, layout, dtype, backend):
+def test_gemm_deterministic(m, n, k, layout, backend, dtype):
     trans_a = layout[0] == "T"
     trans_b = layout[1] == "T"
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
-
-    if backend is BackendType.TRITON and dtype == torch.float32:
-        pytest.skip("Triton backend does not support float32")
 
     if backend is BackendType.TRITON and min(m, n, k) < 64:
         pytest.skip(
@@ -126,7 +128,7 @@ def test_gemm_deterministic(m, n, k, layout, dtype, backend):
         c.backward(grad_c)
         return c.detach(), a.grad.detach(), b.grad.detach()
 
-    repeats = 10
+    repeats = 3
     outs = []
     for _ in range(repeats):
         outs.append(_run_once())

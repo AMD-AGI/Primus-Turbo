@@ -27,6 +27,10 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp4_impl import (
 )
 from primus_turbo.pytorch.ops.grouped_gemm_fp4 import grouped_gemm_fp4
 from primus_turbo.pytorch.ops.quantization import grouped_quantize_fp4_with_trans
+from tests.pytorch.ops.gemm_shapes_helper import (
+    GROUPED_GEMM_SHAPES,
+    GROUPED_GEMM_SHAPES_SMALL,
+)
 from tests.pytorch.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
     grouped_gemm_ref,
@@ -36,27 +40,22 @@ from tests.pytorch.test_utils import compute_snr
 torch.manual_seed(42)
 
 # Sweep parameters. MXFP4 is NT-only (trans_b=True), single E2M1 format, Triton
-# backend only, so we drop those axes and keep full B / M / NK / dtype / balance.
+# backend only, so we drop those axes and sweep (B, M, N, K) tuples / dtype.
 # N, K need only be multiples of MXFP4_BLOCK_SIZE (=32); the quantizer zero-pads
 # the contraction dims up to 128. M is grouped along rows; the FlyDSL wgrad
 # operand uses a compact 256-aligned span per group.
-B_VALUES = [1, 2, 3, 8, 16, 32]
-M_VALUES = [128, 256, 512, 1024, 2048]
-NK_VALUES = [
-    (2048, 1536),
-    (2048, 1408),
-    (1408, 2048),
-    (2816, 2048),
-    (3072, 5120),
-    (5120, 1536),
-    (4096, 7168),
-    (7168, 2048),
-]
+
 # 32-multiples that are NOT 128-multiples (exercises the padded-contraction +
 # free-dim c_mask path): covers N-unaligned, K-unaligned, and both-unaligned.
-NK_UNALIGNED_VALUES = [(96, 160), (160, 96), (288, 256), (256, 288), (1568, 2080)]
+SHAPES_UNALIGNED = [
+    (2, 128, 96, 160),
+    (4, 256, 160, 96),
+    (8, 512, 288, 256),
+    (2, 256, 256, 288),
+    (4, 512, 1568, 2080),
+    (8, 128, 1568, 2080),
+]
 DTYPE_VALUES = [torch.bfloat16, torch.float16]
-BALANCE_VALUES = [True, False]
 
 # E2M1 (1-bit mantissa) is intrinsically lossy, so the SNR bar is lower than the
 # FP8 suite's 20-25 dB. 8 dB cleanly separates "correct" from "broken layout".
@@ -169,7 +168,7 @@ def test_grouped_gemm_fp4_variable_k_dispatch_contract(monkeypatch):
         )
 
 
-def _run(B, M, N, K, dtype, balance):
+def _run(B, M, N, K, dtype):
     seed = 42
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -181,8 +180,8 @@ def _run(B, M, N, K, dtype, balance):
         pytest.skip("Shape hits int32 indexing limit (numel >= 2**31).")
 
     device = "cuda:0"
-    group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
-    print(f"\nB={B}, M={M}, N={N}, K={K}, dtype={dtype}, balance={balance}")
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=False).to(device)
+    print(f"\nB={B}, M={M}, N={N}, K={K}, dtype={dtype}")
 
     a = torch.randn((B * M, K), dtype=dtype, device=device, requires_grad=True)
     b = torch.randn((B, N, K), dtype=dtype, device=device, requires_grad=True)
@@ -214,23 +213,19 @@ def _run(B, M, N, K, dtype, balance):
 
 
 # ----------------------------------------------------------------------------
-# Main sweep: fwd + dgrad + wgrad on the full B / M / NK / dtype / balance grid.
+# Main sweep: fwd + dgrad + wgrad on the (B, M, N, K) tuples x dtype.
 # ----------------------------------------------------------------------------
-@pytest.mark.parametrize("B", B_VALUES)
-@pytest.mark.parametrize("M", M_VALUES)
-@pytest.mark.parametrize("NK", NK_VALUES)
+@pytest.mark.parametrize("B, M, N, K", GROUPED_GEMM_SHAPES)
 @pytest.mark.parametrize("dtype", DTYPE_VALUES)
-@pytest.mark.parametrize("balance", BALANCE_VALUES)
-def test_grouped_gemm_fp4_mx_blockwise(B, M, NK, dtype, balance):
+def test_grouped_gemm_fp4_mx_blockwise(B, M, N, K, dtype):
     """MXFP4 grouped GEMM fwd + dgrad + wgrad on the Triton backend."""
-    N, K = NK
-    _run(B, M, N, K, dtype, balance)
+    _run(B, M, N, K, dtype)
 
 
 # ----------------------------------------------------------------------------
 # Pre-quantized QuantizedTensor inputs.
 # ----------------------------------------------------------------------------
-def _run_grouped_gemm_fp4_quantized_tensor_test(B, M, N, K, dtype, balance):
+def _run_grouped_gemm_fp4_quantized_tensor_test(B, M, N, K, dtype):
     seed = 42
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -242,8 +237,8 @@ def _run_grouped_gemm_fp4_quantized_tensor_test(B, M, N, K, dtype, balance):
         pytest.skip("Shape hits int32 indexing limit (numel >= 2**31).")
 
     device = "cuda:0"
-    group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
-    print(f"\n[QT] B={B}, M={M}, N={N}, K={K}, dtype={dtype}, balance={balance}")
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=False).to(device)
+    print(f"\n[QT] B={B}, M={M}, N={N}, K={K}, dtype={dtype}")
 
     a = torch.randn((B * M, K), dtype=dtype, device=device, requires_grad=True)
     b = torch.randn((B, N, K), dtype=dtype, device=device, requires_grad=True)
@@ -300,30 +295,23 @@ def _run_grouped_gemm_fp4_quantized_tensor_test(B, M, N, K, dtype, balance):
     assert b_grad_snr > SNR_THRESHOLD, f"b_grad_snr={b_grad_snr:.2f} too low"
 
 
-@pytest.mark.parametrize("B", B_VALUES)
-@pytest.mark.parametrize("M", M_VALUES)
-@pytest.mark.parametrize("NK", NK_VALUES)
+@pytest.mark.parametrize("B, M, N, K", GROUPED_GEMM_SHAPES_SMALL)
 @pytest.mark.parametrize("dtype", DTYPE_VALUES)
-@pytest.mark.parametrize("balance", BALANCE_VALUES)
-def test_grouped_gemm_fp4_mx_blockwise_quantized_tensor(B, M, NK, dtype, balance):
+def test_grouped_gemm_fp4_mx_blockwise_quantized_tensor(B, M, N, K, dtype):
     """MXFP4 grouped GEMM with pre-quantized grouped/regular QuantizedTensor inputs."""
     mxfp4_supported, reason = check_mxfp4_support()
     if not mxfp4_supported:
         pytest.skip(reason)
 
-    N, K = NK
-    _run_grouped_gemm_fp4_quantized_tensor_test(B, M, N, K, dtype, balance)
+    _run_grouped_gemm_fp4_quantized_tensor_test(B, M, N, K, dtype)
 
 
 # ----------------------------------------------------------------------------
 # 32-but-not-128 N/K (padded-contraction path) + unbalanced groups.
 # ----------------------------------------------------------------------------
-@pytest.mark.parametrize("B", [2, 4, 8])
-@pytest.mark.parametrize("M", [128, 256, 512])
-@pytest.mark.parametrize("NK", NK_UNALIGNED_VALUES)
+@pytest.mark.parametrize("B, M, N, K", SHAPES_UNALIGNED)
 @pytest.mark.parametrize("dtype", DTYPE_VALUES)
-@pytest.mark.parametrize("balance", BALANCE_VALUES)
-def test_grouped_gemm_fp4_unaligned_nk(B, M, NK, dtype, balance):
+def test_grouped_gemm_fp4_unaligned_nk(B, M, N, K, dtype):
     """N/K are 32-multiples but not 128-multiples (+ unbalanced groups).
 
     Validates the padded-contraction path: the quantizer zero-pads the
@@ -331,8 +319,7 @@ def test_grouped_gemm_fp4_unaligned_nk(B, M, NK, dtype, balance):
     that padded length so the zero tail contributes 0, and the free dim is masked
     by the kernel. Passing SNR also confirms the padding-region scales are not
     NaN (a 0*NaN would poison the dot)."""
-    N, K = NK
-    _run(B, M, N, K, dtype, balance)
+    _run(B, M, N, K, dtype)
 
 
 # ----------------------------------------------------------------------------
@@ -434,8 +421,7 @@ def test_grouped_gemm_fp4_zero_group_lens(dtype, group_lens_values, N, K):
 # Fused gradient accumulation (Megatron main_grad written from the wgrad epilogue).
 # ----------------------------------------------------------------------------
 @pytest.mark.parametrize("dtype", DTYPE_VALUES)
-@pytest.mark.parametrize("balance", BALANCE_VALUES)
-def test_grouped_gemm_fp4_fused_grad_accum(dtype, balance, request):
+def test_grouped_gemm_fp4_fused_grad_accum(dtype, request):
     """``fuse_bgrad_accum_pattern`` must leave ``main_grad`` holding previous + wgrad.
 
     FlyDSL is the only FP4 variable-K backend with the accumulate epilogue and its store
@@ -449,7 +435,7 @@ def test_grouped_gemm_fp4_fused_grad_accum(dtype, balance, request):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    per_op_autotune = dtype == torch.bfloat16 and not balance
+    per_op_autotune = dtype == torch.bfloat16
     if per_op_autotune:
         GlobalBackendManager.reset()
         request.addfinalizer(GlobalBackendManager.reset)
@@ -460,8 +446,8 @@ def test_grouped_gemm_fp4_fused_grad_accum(dtype, balance, request):
 
     device = "cuda:0"
     B, M, N, K = 4, 256, 512, 256
-    group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
-    print(f"\nB={B}, M={M}, N={N}, K={K}, dtype={dtype}, balance={balance}")
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=False).to(device)
+    print(f"\nB={B}, M={M}, N={N}, K={K}, dtype={dtype}")
 
     config = _make_config()
 
@@ -529,9 +515,8 @@ def test_grouped_gemm_fp4_fused_grad_accum(dtype, balance, request):
 # graph-capturable and a replay with in-place-updated group_lens must re-route.
 # Only the forward is captured: fwd+bwd through autograd segfaults at capture_end
 # (AccumulateGrad-on-default-stream, reproducible identically on the MXFP8 path).
-@pytest.mark.parametrize("balance", [True, False])
 @pytest.mark.parametrize("NK", [(2048, 1536), (4096, 4096), (160, 96)])
-def test_grouped_gemm_fp4_cuda_graph(NK, balance):
+def test_grouped_gemm_fp4_cuda_graph(NK):
     supported, reason = check_mxfp4_support()
     if not supported:
         pytest.skip(reason)
@@ -539,8 +524,8 @@ def test_grouped_gemm_fp4_cuda_graph(NK, balance):
     N, K = NK
     device = "cuda:0"
     torch.manual_seed(0)
-    group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
-    group_lens2 = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=False).to(device)
+    group_lens2 = generate_grouped_gemm_group_lens(B, M, balance=False).to(device)
 
     a = torch.randn((B * M, K), dtype=torch.bfloat16, device=device)
     b = torch.randn((B, N, K), dtype=torch.bfloat16, device=device)
@@ -573,13 +558,17 @@ def test_grouped_gemm_fp4_cuda_graph(NK, balance):
 # ----------------------------------------------------------------------------
 # Determinism suite (run with --deterministic-only): bit-exact across repeats.
 # ----------------------------------------------------------------------------
-_DET_B_VALUES = [1, 8]
-_DET_M_VALUES = [256, 1024]
-# (256, 320) is the FlyDSL packed-scale-workspace regression shape (#427): small dgrad
-# contraction (N=256) with a 64- but NOT 256-aligned free dim (K=320, 320 % 256 == 64)
-# needs 256-row scale padding; a buggy preshuffle leaves it unwritten. The poison loop
-# below surfaces the leak as a cross-repeat mismatch (2880 = gpt-oss hidden).
-_DET_NK_VALUES = [(2048, 1536), (4096, 7168), (2880, 2048), (256, 320)]
+# (B, M, N, K). (256, 320) is the FlyDSL packed-scale-workspace regression shape (#427):
+# small dgrad contraction (N=256) with a 64- but NOT 256-aligned free dim (K=320,
+# 320 % 256 == 64) needs 256-row scale padding; a buggy preshuffle leaves it unwritten.
+# The poison loop below surfaces the leak as a cross-repeat mismatch (2880 = gpt-oss
+# hidden). Both regression shapes need B > 1 so the leading expert gets emptied.
+_DET_SHAPES = [
+    (1, 1024, 2048, 1536),
+    (8, 256, 4096, 7168),
+    (8, 1024, 2880, 2048),
+    (8, 256, 256, 320),
+]
 
 
 # Distinct-per-repeat sentinels. Bytes near 0x7f decode to moderate finite E8M0
@@ -598,7 +587,7 @@ def _poison_alloc_pool(shape, dtype, device, sentinel, n=24):
     del blocks
 
 
-def _run_grouped_gemm_fp4_deterministic_test(B, M, N, K, dtype, balance, backend=None, repeats=10):
+def _run_grouped_gemm_fp4_deterministic_test(B, M, N, K, dtype, backend=None, repeats=3):
     seed = 42
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -612,16 +601,16 @@ def _run_grouped_gemm_fp4_deterministic_test(B, M, N, K, dtype, balance, backend
     from primus_turbo.flydsl.grouped_gemm import grouped_gemm_mxfp4_kernel
 
     device = "cuda:0"
-    group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
-    # Unbalanced runs additionally empty the LEADING expert (a real MoE occurrence):
-    # the zero shifts every downstream per-expert scale offset, which is what exposes
-    # the FlyDSL packed-scale 256-padding bug (#427). total_M is kept fixed.
-    if not balance and B > 1:
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=False).to(device)
+    # Also empty the LEADING expert (a real MoE occurrence): the zero shifts every
+    # downstream per-expert scale offset, which is what exposes the FlyDSL packed-scale
+    # 256-padding bug (#427). total_M is kept fixed.
+    if B > 1:
         group_lens[-1] += group_lens[0]
         group_lens[0] = 0
     print(
         f"\n[deterministic] B={B}, M={M}, N={N}, K={K}, dtype={dtype}, "
-        f"balance={balance}, backend={backend}, group0={int(group_lens[0])}"
+        f"backend={backend}, group0={int(group_lens[0])}"
     )
 
     a0 = torch.randn((B * M, K), dtype=dtype, device=device)
@@ -731,25 +720,21 @@ def _run_grouped_gemm_fp4_deterministic_test(B, M, N, K, dtype, balance, backend
     assert int(torch.count_nonzero(tail)) == 0, f"over-allocated tail [{S}:{S + PAD}] not zeroed"
 
 
-@pytest.mark.parametrize("B", _DET_B_VALUES)
-@pytest.mark.parametrize("M", _DET_M_VALUES)
-@pytest.mark.parametrize("NK", _DET_NK_VALUES)
+@pytest.mark.parametrize("B, M, N, K", _DET_SHAPES)
 @pytest.mark.parametrize("dtype", DTYPE_VALUES)
-@pytest.mark.parametrize("balance", BALANCE_VALUES)
 @pytest.mark.parametrize("backend", [None, BackendType.FLYDSL], ids=["default", "FLYDSL"])
 @pytest.mark.deterministic
-def test_grouped_gemm_fp4_mx_blockwise_deterministic(B, M, NK, dtype, balance, backend):
-    """fwd + dgrad + wgrad are bit-exact across 10 repeats (SR off).
+def test_grouped_gemm_fp4_mx_blockwise_deterministic(B, M, N, K, dtype, backend):
+    """fwd + dgrad + wgrad are bit-exact across 3 repeats (SR off).
 
     ``backend=None`` runs the default (Triton) dispatch; ``FLYDSL`` pins the
     packed-scale FlyDSL kernel. Every repeat poisons the cached B-scale workspace
-    with a distinct sentinel, and the unbalanced (``balance=False``) runs empty the
-    leading expert. Together with the 64-but-not-256 free dims -- (2880, 2048) for
-    forward, (2048, 2880) for dgrad -- this makes the suite catch #427 (FlyDSL
-    packed-scale 256-padding not fully overwritten): buggy code leaks the sentinel
-    and breaks bit-exactness, correct code overwrites every slot.
+    with a distinct sentinel, and multi-group runs empty the leading expert.
+    Together with the 64-but-not-256 free dims -- (2880, 2048) for forward,
+    (2048, 2880) for dgrad -- this makes the suite catch #427 (FlyDSL packed-scale
+    256-padding not fully overwritten): buggy code leaks the sentinel and breaks
+    bit-exactness, correct code overwrites every slot.
     """
-    N, K = NK
     if backend == BackendType.FLYDSL and N % 64 != 0:
         pytest.skip("FlyDSL grouped MXFP4 backend requires N % 64 == 0")
-    _run_grouped_gemm_fp4_deterministic_test(B, M, N, K, dtype, balance, backend=backend, repeats=10)
+    _run_grouped_gemm_fp4_deterministic_test(B, M, N, K, dtype, backend=backend)

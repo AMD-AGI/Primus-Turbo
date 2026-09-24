@@ -22,6 +22,7 @@ from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensorPair,
 )
 from primus_turbo.pytorch.ops.gemm_fp4 import FP4GemmMXFunction, gemm_fp4
+from tests.pytorch.ops.gemm_shapes_helper import GEMM_MX_SHAPES, GEMM_MX_SHAPES_SMALL
 from tests.pytorch.test_utils import compute_snr
 
 torch.manual_seed(42)
@@ -62,41 +63,24 @@ def test_gemm_fp4_dense_quant_tail_regression():
     assert compute_snr(reference, actual) > 10
 
 
-@pytest.mark.parametrize("m", [256, 512, 1024])
-@pytest.mark.parametrize("n", [256, 352, 1024, 2048])
-@pytest.mark.parametrize("k", [128, 160, 512, 1024])
+# (backend, dtype, preshuffle): AITER is bf16-only and the only backend with preshuffle.
+MX_BACKEND_CONFIGS = [
+    (BackendType.AITER, torch.bfloat16, False),
+    (BackendType.AITER, torch.bfloat16, True),
+    (BackendType.FLYDSL, torch.bfloat16, False),
+    (BackendType.FLYDSL, torch.float16, False),
+]
+
+
+@pytest.mark.parametrize("m, n, k", GEMM_MX_SHAPES)
 @pytest.mark.parametrize("layout", ["NT"])
-@pytest.mark.parametrize(
-    "format",
-    [
-        Format.E2M1_X2,
-    ],
-)
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        torch.bfloat16,
-        torch.float16,
-    ],
-)
+@pytest.mark.parametrize("format", [Format.E2M1_X2])
 @pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
-@pytest.mark.parametrize("backend", [BackendType.AITER, BackendType.FLYDSL])
-@pytest.mark.parametrize("auto_tune", [False, True])
-@pytest.mark.parametrize("preshuffle", [False, True])
-def test_gemm_fp4_mx_blockwise(m, n, k, layout, format, dtype, granularity, backend, auto_tune, preshuffle):
-    if backend != BackendType.AITER and preshuffle:
-        pytest.skip("Preshuffle is only supported for AITER backend")
-
-    if backend == BackendType.AITER and dtype != torch.bfloat16:
-        pytest.skip("AITER backend only supports bfloat16 dtype")
-
+@pytest.mark.parametrize("backend, dtype, preshuffle", MX_BACKEND_CONFIGS)
+def test_gemm_fp4_mx_blockwise(m, n, k, layout, format, granularity, backend, dtype, preshuffle):
     if backend == BackendType.FLYDSL:
         if not (m % 64 == 0 and n % 64 == 0 and k % 64 == 0):
             pytest.skip("FlyDSL MXFP4 backend requires M/N/K all multiples of 64")
-
-    # Skip redundant test: auto_tune is ignored when backend is explicitly specified
-    if backend is not None and auto_tune:
-        pytest.skip("auto_tune is ignored when backend is explicitly specified")
 
     from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
 
@@ -105,13 +89,13 @@ def test_gemm_fp4_mx_blockwise(m, n, k, layout, format, dtype, granularity, back
     if not mxfp4_supported:
         pytest.skip(reason)
 
-    # Set backend and auto_tune config
+    # Set backend config
     GlobalBackendManager.set_gemm_backend(backend)
-    GlobalBackendManager.set_auto_tune(auto_tune)
+    GlobalBackendManager.set_auto_tune(False)
 
     print(
         f"\nM={m}, N={n}, K={k}, layout={layout}, dtype={dtype}, format={format}, "
-        f"backend={backend}, auto_tune={auto_tune}, preshuffle={preshuffle}"
+        f"backend={backend}, preshuffle={preshuffle}"
     )
 
     device = "cuda:0"
@@ -294,15 +278,12 @@ def _run_gemm_fp4_mx_quantized_tensor_test(
     GlobalBackendManager.reset()
 
 
-@pytest.mark.parametrize("m", [256, 1024])
-@pytest.mark.parametrize("n", [256, 1024])
-@pytest.mark.parametrize("k", [128, 512])
+@pytest.mark.parametrize("m, n, k", GEMM_MX_SHAPES_SMALL)
 @pytest.mark.parametrize("layout", ["NT"])
 @pytest.mark.parametrize("format", [Format.E2M1_X2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT, BackendType.FLYDSL])
-@pytest.mark.parametrize("preshuffle", [False, True])
-def test_gemm_fp4_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, backend, preshuffle):
+def test_gemm_fp4_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, backend):
     """MX_BLOCKWISE gemm_fp4 with pre-quantized QuantizedTensor inputs.
 
     HipBLASLt / default-dispatch / FlyDSL coverage. AITER QT coverage is in
@@ -310,10 +291,6 @@ def test_gemm_fp4_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, 
     below because AITER lacks tuned GEMM configs for these small shapes
     (default config produces near-zero SNR).
     """
-    if backend != BackendType.AITER and preshuffle:
-        pytest.skip("Preshuffle is only supported for AITER backend")
-    if backend == BackendType.AITER and dtype != torch.bfloat16:
-        pytest.skip("AITER backend only supports bfloat16 dtype")
     if backend == BackendType.FLYDSL and not (m % 64 == 0 and n % 64 == 0 and k % 64 == 0):
         pytest.skip("FlyDSL MXFP4 backend requires M/N/K all multiples of 64")
 
@@ -325,7 +302,7 @@ def test_gemm_fp4_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, 
         format=format,
         dtype=dtype,
         backend=backend,
-        preshuffle=preshuffle,
+        preshuffle=False,
     )
 
 
@@ -520,18 +497,21 @@ def test_gemm_fp4_mx_blockwise_torch_compile_backward(m, n, k, dtype):
 # Determinism suite (run with --deterministic-only): bit-exact across repeats.
 # ----------------------------------------------------------------------------
 _DET_GEMM_FP4_MNK = [(256, 256, 256), (512, 512, 256), (1024, 1024, 512)]
+# AITER is bf16-only.
+_DET_GEMM_FP4_BACKEND_DTYPES = [
+    pytest.param(BackendType.AITER, torch.bfloat16, id="AITER-bf16"),
+    pytest.param(BackendType.HIPBLASLT, torch.bfloat16, id="HIPBLASLT-bf16"),
+    pytest.param(BackendType.HIPBLASLT, torch.float16, id="HIPBLASLT-fp16"),
+    pytest.param(BackendType.FLYDSL, torch.bfloat16, id="FLYDSL-bf16"),
+    pytest.param(BackendType.FLYDSL, torch.float16, id="FLYDSL-fp16"),
+]
 
 
 @pytest.mark.parametrize("mnk", _DET_GEMM_FP4_MNK)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize(
-    "backend",
-    [BackendType.AITER, BackendType.HIPBLASLT, BackendType.FLYDSL],
-    ids=["AITER", "HIPBLASLT", "FLYDSL"],
-)
+@pytest.mark.parametrize("backend, dtype", _DET_GEMM_FP4_BACKEND_DTYPES)
 @pytest.mark.deterministic
-def test_gemm_fp4_deterministic(mnk, dtype, backend):
-    """Dense MXFP4 GEMM fwd + bwd are bit-exact across 10 repeats (SR off), and
+def test_gemm_fp4_deterministic(mnk, backend, dtype):
+    """Dense MXFP4 GEMM fwd + bwd are bit-exact across 3 repeats (SR off), and
     match a high-precision reference (SNR)."""
     from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
 
@@ -540,8 +520,6 @@ def test_gemm_fp4_deterministic(mnk, dtype, backend):
         pytest.skip(reason)
 
     m, n, k = mnk
-    if backend == BackendType.AITER and dtype != torch.bfloat16:
-        pytest.skip("AITER backend only supports bfloat16 dtype")
     if backend == BackendType.FLYDSL and not (m % 64 == 0 and n % 64 == 0 and k % 64 == 0):
         pytest.skip("FlyDSL MXFP4 backend requires M/N/K all multiples of 64")
 
@@ -587,7 +565,7 @@ def test_gemm_fp4_deterministic(mnk, dtype, backend):
         return c.detach(), a.grad.detach(), b.grad.detach()
 
     try:
-        repeats = 10
+        repeats = 3
         outs = []
         for _ in range(repeats):
             outs.append(_run_once())

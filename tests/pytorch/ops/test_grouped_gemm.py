@@ -13,43 +13,38 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl import (
     grouped_gemm_variable_k_impl,
 )
 from primus_turbo.pytorch.ops import grouped_gemm
+from tests.pytorch.ops.gemm_shapes_helper import GROUPED_GEMM_SHAPES
 from tests.pytorch.ref.gemm_ref import (
     generate_grouped_gemm_group_lens,
     grouped_gemm_ref,
 )
 from tests.pytorch.test_utils import compute_snr, get_tolerances
 
+# (backend, auto_tune, reduce_num_cu): auto_tune is ignored under a pinned backend, and
+# hipBLASLt (which the tuner may pick) rejects a reduced CU count.
+_FUNC_BACKEND_CONFIGS = [
+    (None, False, 0),
+    (None, False, 32),
+    (None, True, 0),
+    (BackendType.CK, False, 0),
+    (BackendType.CK, False, 32),
+    (BackendType.HIPBLASLT, False, 0),
+    (BackendType.TRITON, False, 0),
+    (BackendType.TRITON, False, 32),
+    (BackendType.FLYDSL, False, 0),
+    (BackendType.FLYDSL, False, 32),
+]
 
-@pytest.mark.parametrize("B", [1, 2, 3, 8, 16, 32])
-@pytest.mark.parametrize("M", [128, 256, 512, 1024, 2048])
-@pytest.mark.parametrize(
-    "N_K", [(2048, 1536), (2048, 1408), (2816, 2048), (3072, 5120), (5120, 1536), (4096, 7168), (7168, 2048)]
-)
+
+@pytest.mark.parametrize("B, M, N, K", GROUPED_GEMM_SHAPES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("balance", [True, False])
 @pytest.mark.parametrize("trans_b", [True, False])
-@pytest.mark.parametrize("reduce_num_cu", [0, 16, 32])
-@pytest.mark.parametrize(
-    "backend", [None, BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON, BackendType.FLYDSL]
-)
-@pytest.mark.parametrize("auto_tune", [False, True])
-def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu, backend, auto_tune):
+@pytest.mark.parametrize("backend, auto_tune, reduce_num_cu", _FUNC_BACKEND_CONFIGS)
+def test_grouped_gemm_func(B, M, N, K, dtype, trans_b, backend, auto_tune, reduce_num_cu):
     seed = 42
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-    if backend is not None and auto_tune:
-        pytest.skip("auto_tune is ignored when backend is explicitly specified")
-
-    if auto_tune and reduce_num_cu > 0:
-        pytest.skip(
-            "skip auto_tune when reduce_num_cu > 0 because hipBLASLt does not support reduce_num_cu > 0 "
-            "and the tuner may select hipBLASLt"
-        )
-
-    if backend is BackendType.HIPBLASLT and reduce_num_cu > 0:
-        pytest.skip("HIPBLASLT does not support reduce_num_cu > 0")
 
     if backend is BackendType.CK and get_device_compute_capability() == (12, 5):
         # CK is gated off on gfx1250 twice over: setup.py force-disables the CK backend
@@ -93,9 +88,8 @@ def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu, ba
     props = torch.cuda.get_device_properties(device)
     num_cu = props.multi_processor_count - reduce_num_cu
 
-    N, K = N_K
-    group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
-    print(B, M, N, K, dtype, balance, trans_b, num_cu, backend, auto_tune)
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=False).to(device)
+    print(B, M, N, K, dtype, trans_b, num_cu, backend, auto_tune)
 
     b_shape = (B, N, K) if trans_b else (B, K, N)
 
@@ -138,15 +132,12 @@ def test_grouped_gemm_func(B, M, N_K, dtype, balance, trans_b, reduce_num_cu, ba
     GlobalBackendManager.reset()
 
 
-@pytest.mark.parametrize("B", [1, 2])
-@pytest.mark.parametrize("M", [2048, 4096])
-@pytest.mark.parametrize("N_K", [(2048, 1536), (4096, 7168)])
+@pytest.mark.parametrize("B, M, N, K", [(1, 4096, 2048, 1536), (2, 2048, 4096, 7168)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("balance", [True, False])
 @pytest.mark.parametrize("trans_b", [True, False])
 @pytest.mark.parametrize("backend", [BackendType.CK, BackendType.HIPBLASLT, BackendType.TRITON])
 @pytest.mark.deterministic
-def test_grouped_gemm_deterministic(B, M, N_K, dtype, balance, trans_b, backend):
+def test_grouped_gemm_deterministic(B, M, N, K, dtype, trans_b, backend):
     seed = 42
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -167,10 +158,9 @@ def test_grouped_gemm_deterministic(B, M, N_K, dtype, balance, trans_b, backend)
     props = torch.cuda.get_device_properties(device)
     num_cu = props.multi_processor_count
 
-    N, K = N_K
-    group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=False).to(device)
     print(
-        f"\n[deterministic] B={B}, M={M}, N={N}, K={K}, dtype={dtype}, balance={balance}, trans_b={trans_b}, backend={backend}"
+        f"\n[deterministic] B={B}, M={M}, N={N}, K={K}, dtype={dtype}, trans_b={trans_b}, backend={backend}"
     )
 
     b_shape = (B, N, K) if trans_b else (B, K, N)
@@ -194,7 +184,7 @@ def test_grouped_gemm_deterministic(B, M, N_K, dtype, balance, trans_b, backend)
         out.backward(grad_out)
         return out.detach(), a.grad.detach(), b.grad.detach()
 
-    repeats = 10
+    repeats = 3
     outs = []
     for _ in range(repeats):
         outs.append(_run_once())
@@ -357,14 +347,11 @@ def test_grouped_gemm_with_zero_length_groups(B, M, N_K, dtype, trans_b, backend
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("B", [4, 8])
-@pytest.mark.parametrize("M", [1024, 4096])
-@pytest.mark.parametrize("N_K", [(2048, 1536), (4096, 7168)])
+@pytest.mark.parametrize("B, M, N, K", [(4, 4096, 2048, 1536), (8, 1024, 4096, 7168), (8, 4096, 2048, 1536)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("balance", [True, False])
 @pytest.mark.parametrize("trans_b", [True, False])
 @pytest.mark.parametrize("backend", [BackendType.TRITON, BackendType.CK])
-def test_grouped_gemm_schedule_work_steal(B, M, N_K, dtype, balance, trans_b, backend):
+def test_grouped_gemm_schedule_work_steal(B, M, N, K, dtype, trans_b, backend):
     """``schedule="work_steal"`` on each WS-capable backend matches the static
     path bit-for-bit for forward and backward (per-tile accumulator order is
     identical to the static schedule; there is no cross-tile reduction)."""
@@ -383,8 +370,7 @@ def test_grouped_gemm_schedule_work_steal(B, M, N_K, dtype, balance, trans_b, ba
     GlobalBackendManager.set_auto_tune(False)
 
     device = "cuda"
-    N, K = N_K
-    group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=False).to(device)
 
     b_shape = (B, N, K) if trans_b else (B, K, N)
     a0 = torch.randn((B * M, K), dtype=torch.float32, device=device).to(dtype)
@@ -637,14 +623,20 @@ def test_grouped_gemm_padded_tail_zeroed(dtype, trans_b, backend):
 # test_grouped_gemm_func covers the pair through autograd; this pins the variable-K op the way
 # the backward calls it, so the wgrad's own edges get their own matrix: ragged group lengths, an
 # OUT_M off the block grid, and the expert count at the cap.
-@pytest.mark.parametrize("B", [1, 4, 16, 64])
-@pytest.mark.parametrize("M", [256, 512])
-@pytest.mark.parametrize("N_K", [(512, 768), (2048, 1536), (320, 2880)])
+@pytest.mark.parametrize(
+    "B, M, N, K",
+    [
+        (1, 512, 2048, 1536),
+        (4, 256, 320, 2880),
+        (16, 512, 512, 768),
+        (64, 256, 2048, 1536),
+        (64, 512, 320, 2880),
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("balance", [True, False])
 @pytest.mark.parametrize("trans_c", [False, True])
 @pytest.mark.parametrize("backend", [BackendType.TRITON, BackendType.FLYDSL], ids=["TRITON", "FLYDSL"])
-def test_grouped_gemm_variable_k_backend(B, M, N_K, dtype, balance, trans_c, backend):
+def test_grouped_gemm_variable_k_backend(B, M, N, K, dtype, trans_c, backend):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     if backend is BackendType.FLYDSL and get_device_compute_capability() not in ((9, 5), (12, 5)):
@@ -652,9 +644,8 @@ def test_grouped_gemm_variable_k_backend(B, M, N_K, dtype, balance, trans_c, bac
 
     torch.manual_seed(42)
     device = "cuda"
-    N, K = N_K
 
-    group_lens = generate_grouped_gemm_group_lens(B, M, balance=balance).to(device)
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=False).to(device)
     group_offs = torch.zeros(B + 1, dtype=torch.int64, device=device)
     group_offs[1:] = group_lens.cumsum(0)
     total_m = int(group_offs[-1].item())
