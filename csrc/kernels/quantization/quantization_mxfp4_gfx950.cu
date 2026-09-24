@@ -108,6 +108,8 @@ constexpr int kDefaultTileN     = MXFP4_TILE_N;
 constexpr int THREADS_PER_BLOCK = MXFP4_THREADS_PER_BLOCK;
 
 using uint4_t = uint32_t __attribute__((ext_vector_type(4)));
+// Two bf16 in one VGPR, which is the form the FP4 conversion actually wants.
+using bf16x2_t = __bf16 __attribute__((ext_vector_type(2)));
 
 // 16-byte staging vector: the widest load that keeps one thread on one contiguous run of
 // a row. s_tile rows are TILE_N * 2 bytes, a multiple of 16, so the shared-memory store is
@@ -230,19 +232,39 @@ __device__ __forceinline__ void mxfp4_emit_group(float (&values)[kGroupSize],
     // the conversion full fp32. E2M1 has so few levels that the extra rounding costs
     // nothing, but it moves values sitting near a code boundary, so omitting it shifts
     // roughly 1% of codes and a fifth of a percent of the block scales.
-#if !MXFP4_ABLATE_BF16
+    // Round to bf16 and keep the group in that form for the rest of the emit -- sixteen
+    // VGPRs of bf16x2 rather than thirty-two of f32.
+    //
+    // This is a register-pressure change, not a rounding change: AITER rounds here too,
+    // and takes its amax from the rounded values, so the codes are identical either way.
+    // What it buys is occupancy. The FP4 conversion consumes two values per call and
+    // feeds its own accumulator, so a whole group is a chain of sixteen calls and every
+    // value stays live across it -- where MXFP6 consumes all 32 in one
+    // cvt_scalef32_2xpk16_fp6_f32 and frees them immediately. Holding the group as f32
+    // cost 81 VGPRs and 5 waves/SIMD against the MXFP6 packer's 68 and 7, which on a
+    // memory-bound kernel is the missing latency hiding. Forcing it with __launch_bounds__
+    // only trades the registers for spills: 7 waves spills 8-19 VGPRs and measures 1.67x.
+    bf16x2_t pairs[kGroupSize / 2];
 #pragma unroll
-    for (int i = 0; i < kGroupSize; ++i)
-        values[i] = static_cast<float>(static_cast<bfloat16>(values[i]));
+    for (int i = 0; i < kGroupSize / 2; ++i) {
+#if MXFP4_ABLATE_BF16
+        pairs[i][0] = static_cast<__bf16>(0.0f);
+        pairs[i][1] = static_cast<__bf16>(0.0f);
+#else
+        pairs[i][0] = static_cast<__bf16>(values[2 * i]);
+        pairs[i][1] = static_cast<__bf16>(values[2 * i + 1]);
 #endif
+    }
 
     // Seeded at 1e-10 rather than 0, matching AITER's group_amax under RoundUp: it floors
     // the scale for an all-zero group so RCEIL cannot emit byte 0 there. Above that floor
     // it has no effect, so it never perturbs a real weight.
     float amax = 1.0e-10f;
 #pragma unroll
-    for (int i = 0; i < kGroupSize; ++i)
-        amax = fmaxf(amax, fabsf(values[i]));
+    for (int i = 0; i < kGroupSize / 2; ++i) {
+        amax = fmaxf(amax, fabsf(static_cast<float>(pairs[i][0])));
+        amax = fmaxf(amax, fabsf(static_cast<float>(pairs[i][1])));
+    }
 
     // RCEIL: ceil_pow2(amax / 6). Bump the exponent whenever any mantissa bit survives
     // the divide, which is what makes it a ceiling rather than a truncation.
@@ -271,16 +293,16 @@ __device__ __forceinline__ void mxfp4_emit_group(float (&values)[kGroupSize],
     if (amax != 0.0f) {
 #pragma unroll
         for (int w = 0; w < 4; ++w) {
-            const int b   = 8 * w;
+            const int p    = 4 * w;
             uint32_t  word = 0;
-            word = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(word, values[b + 0], values[b + 1],
-                                                            conversion_scale, 0);
-            word = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(word, values[b + 2], values[b + 3],
-                                                            conversion_scale, 1);
-            word = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(word, values[b + 4], values[b + 5],
-                                                            conversion_scale, 2);
-            word = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(word, values[b + 6], values[b + 7],
-                                                            conversion_scale, 3);
+            word = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(word, pairs[p + 0],
+                                                             conversion_scale, 0);
+            word = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(word, pairs[p + 1],
+                                                             conversion_scale, 1);
+            word = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(word, pairs[p + 2],
+                                                             conversion_scale, 2);
+            word = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(word, pairs[p + 3],
+                                                             conversion_scale, 3);
             words[w] = word;
         }
     }
