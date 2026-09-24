@@ -1,0 +1,4 @@
+cur_a  file=21_final_isa.s vgpr=724 spill=0 | WHOLE wmma=128 ds_store=80 ds_tr=80 bufld128=128 | LBB0_8 lines=677 wmma=64 ds_store=40 ds_tr=40 bufld128=32 setmsb=125 vnop=67
+P1     file=21_final_isa.s vgpr=706 spill=0 | WHOLE wmma=128 ds_store=16 ds_tr=16 bufld128=128 | LBB0_8 lines=560 wmma=64 ds_store=8 ds_tr=8 bufld128=32 setmsb=103 vnop=35
+P2     file=21_final_isa.s vgpr=834 spill=0 | WHOLE wmma=128 ds_store=16 ds_tr=16 bufld128=160 | LBB0_8 lines=667 wmma=64 ds_store=8 ds_tr=8 bufld128=64 setmsb=132 vnop=30
+P3     file=21_final_isa.s vgpr=688 spill=0 | WHOLE wmma=128 ds_store=0 ds_tr=0 bufld128=128 | LBB0_8 lines=594 wmma=64 ds_store=0 ds_tr=0 bufld128=32 setmsb=122 vnop=50

@@ -1,0 +1,153 @@
+round: 20
+mode: fast
+candidate: r20.i2.g62
+outcome: delivered
+
+# ---------------------------------------------------------------- correctness
+correctness:
+  unit_tests: pass                # op/ut/test_correctness.py: 15 shape x mask-mode, RESULT: PASS
+  precision: pass
+  checked_with: op/validation.py
+  sqnr_db: 52.52                  # worst of dq/dk/dv over fast/proxy/prod (range 52.52-52.84)
+
+# ---------------------------------------------------------------- measurements
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/017/op, rounds/019/op]
+  shapes:
+    - name: prod_b4_s8192_hq32_hkv8_d128
+      this_round_tflops: 511.42
+      best_round_tflops: 501.41
+      beat_tflops: 715.94
+      target_tflops: 715.94
+      champion_round: 17
+      champion_tflops: 501.41
+      champion_rebuilt: true
+      ratio: 0.7144
+      vs_champion: 1.0200
+    - name: proxy_b1_s4096_hq32_hkv8_d128
+      this_round_tflops: 435.93
+      best_round_tflops: 442.54
+      beat_tflops: 575.17
+      target_tflops: 575.17
+      champion_round: 17
+      champion_tflops: 442.54
+      champion_rebuilt: true
+      ratio: 0.7579
+      vs_champion: 0.9851
+    - name: fast_b1_s1024_hq8_hkv2_d128
+      this_round_tflops: 55.07
+      best_round_tflops: 55.09
+      beat_tflops: 50.95
+      target_tflops: 50.95
+      champion_round: 17
+      champion_tflops: 55.09
+      champion_rebuilt: true
+      ratio: 1.0000
+      vs_champion: 0.9996
+  score: 0.8241
+
+validation:
+  exit_code: 2                    # correctness pass, determinism pass, speed FAIL (bar is 1.40x away)
+
+# ---------------------------------------------------------------- fast-round only
+explored:
+  ran:
+    - "rocprofv3 --stats"
+    - "COMPILE_ONLY offline screen + ISA instruction-class census on k_dkdv .LBB0_8 (5 builds) -- decided the round: it is what verified each throwaway probe actually landed before any card time, and what showed g62's s_wait_loadcnt 9->2 and v_nop 67->40 before the card confirmed it"
+    - "three structural throwaway probes on card (r20.i0.P1/P2/P3) -- killed r16.i3.g50 and the LDS-port hypothesis with it"
+  consulted:
+    - optimization/routes/1-metrics-to-techniques.md
+    - optimization/techniques/3-pipelining-and-scheduling.md
+    - optimization/techniques/2-lds-bank-conflicts.md
+    - optimization/techniques/0-register-pressure-and-occupancy.md
+    - backends/flydsl/attention/techniques.md
+    - backends/flydsl/attention/dead-ends.md
+    - backends/hipkittens/scheduling-patterns.md
+    - backends/aiter/attention/recipes/fmha_v3_bwd_hd128_bf16.md
+    - pitfalls/measurement-traps.md
+    - arch/gfx1250/isa.md
+    - arch/gfx1250/profiling-surface.md
+  bound: latency
+  confidence: medium
+  why: >
+    First POSITIVE evidence, not just the sixth negative one. Deepening the only live
+    latency-cover mechanism (g21's cross-iteration prefetch, depth 1 -> 2) is worth
+    +1.65% / +1.53% / +2.00% prod across three independent sessions, with s_wait_loadcnt
+    9 -> 2 and v_nop 67 -> 40 in the ISA. Against it, six separate deletions have each made
+    this kernel slower: g47, g49, g56 (-6.84%), g60 (-17.27%), and this round's P1 (-6.98%,
+    Q/dO LDS round trip removed) and P3 (-8.19%, all 80 LDS ops removed, WMMA count
+    unchanged). The LDS-port hypothesis -- facts.md's one surviving mechanistic story --
+    is therefore falsified on card, as is h8's HBM premise (107 GB / 4.39 TB/s = 24.4 ms
+    against a measured 10.75-11.04 ms total). Confidence stays medium rather than high
+    because gfx1250 exposes no counter that attributes stall cycles by reason, so the bound
+    is inferred from A/B alone.
+
+arms:
+  - id: r20.i1.g61
+    built: "A alone, from op/current -- split each 4-deep S/P WMMA accumulator chain into 2x2, interleaved, summed in fp32"
+    tflops: {prod: 502.77, proxy: 438.23, fast: 48.34}
+    vs_champion: 1.0027
+    shipped: false
+    note: >
+      NULL, and that is the point. +0.27% prod inside a 0.29% same-code floor, -0.45% proxy
+      inside a 1.04% floor. ISA confirmed the change landed: v_pk_add_f32 32 -> 64, v_wmma
+      unchanged at 64, chain heads doubled. The corpus claim it was built on
+      (backends/flydsl/attention/techniques.md, "cutting one chain into four is a direct win
+      ... +8.7% on a dK/dV body") did NOT transfer. It is the cleanest negative control this
+      job has produced: 4-way matrix ILP and 64 extra independent fp32 ops bought nothing,
+      so the matrix pipe is not what this body waits on.
+  - id: r20.i2.g62
+    built: "B alone, from op/current -- NOT on top of A. g21's Q/dO prefetch deepened from 1 iteration to 2 (carry pre0+pre1, issue for i+2, two prologue issues)"
+    tflops: {prod: 509.66, proxy: 438.16, fast: 54.64}
+    vs_champion: 1.0165
+    shipped: false
+    note: >
+      The round's win and the only thing that moved. prod +1.65%, reproduced at +1.53% in a
+      second independent session. VGPR 724 -> 912, spill 0, scratch 0; s_wait_loadcnt 9 -> 2,
+      v_nop 67 -> 40. Shipped as half of the merge rather than alone.
+  - id: r20.i1.g61+r20.i2.g62
+    built: "the merge, built only because neither arm lost"
+    tflops: {prod: 511.42, proxy: 435.93, fast: 55.07}
+    vs_champion: 1.0200
+    shipped: true
+    note: >
+      904 VGPR -- LOWER than g62 alone at 912, because g61's chain split gave the allocator
+      shorter live ranges. prod +2.00% over the re-measured champion against a 0.66% floor.
+      The ~0.6 points the merge adds over g62 alone is only 1.6x the floor and is NOT claimed
+      as evidence that g61 works.
+  - id: r20.i0.P1/P2/P3
+    built: "three throwaway probes, not shipped, no g allocated -- P1 deletes the Q/dO LDS round trip outright, P3 deletes all 80 LDS ops, P2 carries g50's traffic structure as in-body global loads"
+    tflops: {prod_P1: 470.99, prod_P2: 413.29, prod_P3: 464.85}
+    vs_champion: 0.9302
+    shipped: false
+    note: >
+      -6.98% / -18.37% / -8.19%. This is what killed r16.i3.g50 and the LDS-port hypothesis.
+      Route row 10's literal probe (32 redundant buffer_load_b128 behind a runtime-false
+      select) was replaced with these because a load whose destination nothing reads is
+      exactly what DCE removes (pitfalls/measurement-traps.md, "The probe was deleted") and
+      because it priced only g50's cost, never its benefit. Each probe was verified in the
+      emitted ISA before any card time.
+
+expected: >
+  g62: deepening the prefetch should move prod from ~501 to ~510-515 TF/s if latency cover is
+  really the binding constraint -- g60 measured the removal of the depth-1 stage at -17.27%,
+  so the second stage should still return something, though less. g61: the corpus says +8.7%
+  on a dK/dV body; I expect less than that here and would call anything above the same-code
+  floor a win. If BOTH come back inside the floor, the "latency cover" reading is wrong and
+  the round's real product is the g50 autopsy.
+
+added_to_pool: [r21.i1.g63, r21.i2.g64]
+route_updated: true
+
+# ---------------------------------------------------------------- what got built
+implementation:
+  files_changed: [op/kernels.py]
+  build_failures: []
+  # No build failure with a root cause worth recording. Every one of the 6 builds this round
+  # (P1, P2, P3, A61, B62, M6162) passed the offline screen first try at scratch 0 / spill 0.
+  # Two non-build defects in my own harness, recorded for the next round's scratch setup:
+  #   1. The prescribed /tmp scratch dir is NOT visible inside fa-repro -- only
+  #      /home/lihuzhan is bind-mounted. Relocated scratch under rounds/020/_scratch.
+  #   2. rounds/002/_scratch/screen.py --impl takes a DIRECTORY; passing impl.py fails with
+  #      "no kernels.py in .../impl.py".

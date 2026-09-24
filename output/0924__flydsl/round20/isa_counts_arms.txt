@@ -1,0 +1,17 @@
+           arm |           vgpr |          spill |        scratch |     body_lines |           wmma |      v_add_f32 |  ds_store_b128 |   ds_load_tr16 | buffer_load_b128 | buffer_load_b32 |      v_mov_b32 | s_set_vgpr_msb |       valu_tot |       salu_tot |      s_waitcnt |        s_delay
+         cur_a |            724 |              0 |              0 |            675 |             64 |              0 |             40 |             40 |             32 |              4 |              2 |            125 |            381 |            178 |              0 |              0
+           A61 |            752 |              0 |              0 |            698 |             64 |              0 |             40 |             40 |             32 |              4 |              2 |            118 |            414 |            168 |              0 |              0
+           B62 |            912 |              0 |              0 |            734 |             64 |              0 |             40 |             40 |             32 |              4 |              2 |            153 |            419 |            199 |              0 |              0
+s_set_vgpr_msb                 125 ->   118  (-7)
+s_wait_loadcnt                   9 ->     6  (-3)
+v_nop                           67 ->    68  (+1)
+v_pk_add_f32                    32 ->    64  (+32)
+s_set_vgpr_msb                 125 ->   153  (+28)
+s_wait_loadcnt                   9 ->     2  (-7)
+v_dual_mov_b32                   1 ->     4  (+3)
+v_mov_b64_e32                   64 ->   128  (+64)
+v_nop                           67 ->    40  (-27)
+v_or_b32_e32                    17 ->    15  (-2)
+           arm |           vgpr |          spill |        scratch |     body_lines |           wmma |      v_add_f32 |  ds_store_b128 |   ds_load_tr16 | buffer_load_b128 | buffer_load_b32 |      v_mov_b32 | s_set_vgpr_msb |       valu_tot |       salu_tot |      s_waitcnt |        s_delay
+         cur_a |            724 |              0 |              0 |            675 |             64 |              0 |             40 |             40 |             32 |              4 |              2 |            125 |            381 |            178 |              0 |              0
+         M6162 |            904 |              0 |              0 |            778 |             64 |              0 |             40 |             40 |             32 |              4 |              0 |            161 |            455 |            207 |              0 |              0
