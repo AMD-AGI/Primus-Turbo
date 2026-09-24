@@ -1698,3 +1698,85 @@ standard library's `bisect`**, which torch imports transitively, and every run f
 like a GPU or environment problem and is neither. Renaming the file did not fix it; the
 stale copy had to be deleted from the container. **Never name a probe script after a stdlib
 module** (`bisect`, `random`, `types`, `queue`, `select`, `signal`, `copy`, `token`…).
+
+---
+
+## h23 — RETRACTION: TDM has no target. And what round 15 should actually do. (2026-09-24)
+
+### I pushed TDM for two days and it was wrong
+
+h20 called TDM "the one difference from the bar that has never been tested" and h21 said
+round 13's census made it "more motivated, not less". **Both are withdrawn.**
+
+My reasoning had one half right and skipped the other half entirely. I checked the corpus
+entry that *closed* TDM and correctly found it misfiled — it is a **gfx950** A/B of
+`buffer_load ... lds`, a different instruction, attributed to +16 `s_barrier` and −32 AGPRs,
+neither of which can happen on gfx1250. **But I never checked whether the target still
+existed in our kernel.** `facts.md:669` says "no target left", and I dismissed that half as
+"a statement about our BLOCK_KV=32 shape, not a judgement on the mechanism". That dismissal
+was the error.
+
+What the ISA actually shows:
+
+- **All 32 `buffer_load_b128` in `k_dkdv`'s hot body are global→REGISTER loads, and those
+  registers are dual-use**: stored to LDS *and* shuffled straight into the WMMA A-operands
+  (`kernels.py:270-281`, `:360-366`). That is exactly what **g09 built**. There is no
+  global→LDS staging burst left to replace.
+- The remaining **4 `buffer_load_b32` are scalar LSE/delta** feeding VALU (`kernels.py:372`),
+  not stageable tiles.
+- **K/V are hoisted outside the loop entirely** — not in the hot body at all.
+- Adopting TDM therefore means **undoing g09** and abandoning **g21**, whose measured
+  load-to-use distance is already **223–419 instructions** (`isa_lat_ship.txt`). That is
+  TDM's entire mechanism — issue early, drain late — already delivered synchronously, and
+  measured at +8.3%. TDM cannot buy distance that already exists.
+- **aiter's call shape does not transfer.** Their TDM→LDS hop exists to broadcast one tile
+  to **8 waves** (`fmha_b16_buffer_managers.py:976`). `k_dkdv` is a **single wave32
+  workgroup** with nobody to broadcast to. The one aiter site using `num_warps=1` is a wave
+  copying its own private tile through LDS — precisely the redundant round trip g09 deleted.
+
+**Do not spend an arm slot on TDM.** If a round wants a verdict, record the static finding
+and move the entry to `dead_ends.md`. It costs nothing.
+
+*Generalisable lesson: refuting the reason something was closed does NOT reopen it. Check
+that the target still exists before rebuilding a case on a bad closure.*
+
+### The shape-switch fault is FIXED, and it was the harness
+
+`benchmark.py` reloaded the impl module **once per shape** inside `measure()`. `load_impl`
+replaces `sys.modules` (`ut/common.py:99-103`), so each boundary dropped the previous
+shape's flydsl chain → `GpuJitModule.__del__` → `hipModuleUnload`
+(`jit_executor.py:102,107`) — and because Python modules are reference **cycles**, that
+unload landed at the next generational GC, possibly mid-launch of the next shape.
+Intermittent, boundary-only, different address each run. Exactly the signature.
+
+The control was already in the tree: `validation.py:117` loads the impl **once**, loops all
+three shapes with *more* allocator churn (`:169` `empty_cache`), and never faults.
+
+Fixed by hoisting `load_impl` out of the shape loop. Verified: the same
+`beat + two copies of cur` sweep over `fast,proxy,prod` that used to fault now runs with
+**zero new faults**.
+
+**Round 14 nearly convicted two innocent arms over this.** When a fault appears, check
+whether the harness changed something at that moment before suspecting the candidate.
+
+### Round 15
+
+**`g46`, `k_dq` only.** `k_dq` is **32.6% of prod time and has never had a candidate of its
+own in 14 rounds**. Its hot body spends **128 `v_pk_mul_f32` per iteration** = 4 fp32
+multiplies per element, **two of which are multiplications by loop-invariant scalars that
+fold out by exact algebraic identity** (convert to base-2: `scale` and `lse` become a
+per-row bias, and the trailing `* scale` on `ds` disappears).
+
+⚠ **This fold is legal in `k_dq` but NOT in `k_dkdv`**, because there `pf` is dual-use and
+also feeds dV (`kernels.py:397`). `g47` is the partial version for `k_dkdv` that keeps the
+trailing `* scale`.
+
+The asymmetry is already measured: **round 6 found that deleting the same share of a loop
+body was worth +8.2% in `k_dq` and +1.1% in `k_dkdv`** (`facts.md:945`). That predicts g46
+pays and g47 mostly does not — which is also the round's falsification target.
+
+And note what this says about the diagnosis: round 13's census concluded prod is "waves
+waiting". But `k_dq`'s two largest matrix-free windows have **`vmem=0` and `lds=0`, 91% and
+97% VALU** (`windows.txt`). In those windows there is nothing to wait *for*. That is
+**issue serialisation, not latency exposure** — a different bottleneck from `k_dkdv`'s, and
+another reason TDM could not have helped prod.
