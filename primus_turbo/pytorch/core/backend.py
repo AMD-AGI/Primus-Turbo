@@ -5,6 +5,7 @@
 ###############################################################################
 
 import os
+import statistics
 import warnings
 from abc import ABC, abstractmethod
 from collections import OrderedDict
@@ -404,6 +405,21 @@ class KernelBackend(ABC):
     def execute(**kwargs):
         raise NotImplementedError("execute is not implemented")
 
+    @staticmethod
+    def tuning_kwargs(**kwargs):
+        """Arguments to TIME this backend with, which need not be the ones it will run on.
+
+        A backend whose steady-state cost depends on an operand layout the pipeline chooses
+        upstream is otherwise timed on whatever layout the tuning call happened to arrive with
+        -- and since that layout also decides which backends can run at all, the race ends up
+        ratifying a choice made before it. Restating the operands in the layout this backend
+        would be fed in deployment puts every candidate on its own best contract.
+
+        Only timing reads these, so they do not have to produce the right answer: scale bytes
+        drive no control flow and cost the same whatever they hold.
+        """
+        return kwargs
+
 
 @dataclass(frozen=True)
 class BackendEntry:
@@ -492,6 +508,8 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
     _cache: Optional[TuneCache] = None
     _warmup_iters: int = 10
     _profile_iters: int = 20
+    # Forward-and-back passes over the candidates; each pass times every one of them.
+    _tune_rounds: int = 1
     _subclasses: List[Type["AutoKernelDispatcher"]] = []
 
     @staticmethod
@@ -553,25 +571,50 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
         if cached_backend is not None:
             return cached_backend
 
-        best_backend = None
-        best_time = float("inf")
-        for entry in cls._backends.values():
-            if not entry.autotune:
-                continue
-            if entry.impl.can_handle(**kwargs):
-                torch.cuda.synchronize()
-                try:
-                    cur_time = cls.profile(entry.impl, **kwargs)
-                except Exception:
-                    cur_time = float("inf")
-                finally:
-                    torch.cuda.synchronize()
-                if cur_time < best_time:
-                    best_time = cur_time
-                    best_backend = entry.impl
+        # Resolved once per candidate, not once per timing: a backend that allocates its own
+        # operands here would otherwise get fresh pages on every read, and the variance that
+        # comes with them would land on that backend alone.
+        tune_args: Dict[Type[KernelBackend], dict] = {}
 
-        if best_backend is not None:
-            cls._cache.put(key, best_backend)
+        def _time(impl):
+            torch.cuda.synchronize()
+            try:
+                if impl not in tune_args:
+                    tune_args[impl] = impl.tuning_kwargs(**kwargs)
+                return cls.profile(impl, **tune_args[impl])
+            except Exception:  # noqa: BLE001 -- a backend that cannot run is not a candidate
+                return float("inf")
+            finally:
+                torch.cuda.synchronize()
+
+        cands = [
+            entry.impl
+            for entry in cls._backends.values()
+            if entry.autotune and entry.impl.can_handle(**kwargs)
+        ]
+        if not cands:
+            return None
+
+        # Timing each candidate's whole batch before starting the next one puts the card's
+        # drift on whichever ran later, which is worth several percent here -- more than the
+        # margin between backends on most shapes. Interleaving instead, once forward and once
+        # back, gives every candidate every position, and the median drops a one-off excursion.
+        samples = {impl: [] for impl in cands}
+        for _ in range(cls._tune_rounds):
+            for impl in cands:
+                samples[impl].append(_time(impl))
+            for impl in reversed(cands):
+                samples[impl].append(_time(impl))
+
+        # A backend that raised is not a winner, however alone it is: dropping it here leaves
+        # the caller to fall through to its default rather than dispatch to something that
+        # just failed.
+        ranked = [(statistics.median(v), impl) for impl, v in samples.items() if min(v) != float("inf")]
+        if not ranked:
+            return None
+
+        best_backend = min(ranked, key=lambda t: t[0])[1]
+        cls._cache.put(key, best_backend)
         return best_backend
 
     @classmethod
