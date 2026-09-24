@@ -2201,3 +2201,93 @@ Recomputed independently from `B=4, Skv=8192, Hkv=8, D=128` and the measured 4.3
 **So this is an upper bound, not a promise.** But even at 70% of it, it dwarfs everything
 prod has gained in five rounds (0.693 → 0.698). **This is the first quantified path to
 closing the backward's production gap**, and it is the thing to spend rounds on.
+
+## h29 — RETRACTION: h28's addendum was wrong. Fusion is DO-NOT in BOTH orientations, and the reason is in our own source header.
+
+**I published a number that was wrong, and wrong at exactly the point I had flagged as
+unverified and then did not pursue.** h28's addendum claimed the fused kernel's slot count
+collapses to `nsp`, giving prod 0.696x -> 0.951x. **Retract it.** Do not cite h28's
+addendum, its 0.951x, or its 0.245-0.978 ms again.
+
+### The category error
+
+`slots = nsp` is a TRUE reading of `k_dkdv_sp` / `k_dq_sp` (`kernels.py:163, :215, :685`;
+`impl.py:177`, `:219` -- a deterministic split-K dQ path already ships and has passed the
+bitwise gate every round). **It does not transfer to a fused kernel**, because in the split-K
+kernels the parallel axis and the split axis are DIFFERENT axes, so `nsp` is a free
+parameter; **in a fused kernel the reduced axis IS the parallel axis**, so the slot count is
+forced by the grid, not chosen. At prod's 2048-workgroup / single-wave target
+(`impl.py:144-145`, `:167`) that forces **slots = 64**, not 2.
+
+My 0.245-0.978 ms at nsp=2..8 corresponds to **64-256 workgroups, i.e. 75-93.75% of the
+machine idle**. My own stated assumption 2 said the occupancy cost was not computed. It was
+load-bearing.
+
+### Why Q-outer does NOT get the GQA discount (this is the decisive part, and it is source-backed)
+
+The tempting rescue is: Q-outer reduces dK+dV, which is only 268.4 MB/slot vs dQ's 536.9 MB,
+so Q-outer is 2x cheaper and break-even relaxes from ~25 slots to ~52. **That is backwards.**
+
+`kernels.py:15-16` and `:170-171`, our own file header, state the mechanism:
+
+> "GQA is reduced INSIDE k_dkdv: one workgroup owns a kv tile of one kv head and streams
+> every query tile of all `G = Hq/Hkv` q heads that share it, accumulating into the same
+> registers." ... "grid = (Skv/16, Hkv, B). The accumulators persist across the G q heads
+> that share this kv head, so the GQA reduction happens in registers -- atomic-free,
+> written once."
+
+That register reduction is available **only when the workgroup owns a kv head** -- i.e. only
+in the KV-outer orientation. `impl.py:199` gives k_dq's grid as `ceil(Sq/BLOCK_Q)*Hq*B`:
+**Hq, one q head per workgroup**. So under Q-outer fusion, G=4 workgroups share one kv head
+and collide on its dK/dV. They must either expand dK/dV to Hq or multiply the slot count by
+G. Both cost `4 x 268.4 = 1073.7 MB` per band = **2x dQ**.
+
+**Q-outer does not buy a GQA discount; it throws away a GQA discount we already hold for
+free.** Independently confirmed on the bar: its `grid.x` is `nhead_q` and its dK/dV pointers
+are offset by `Hs_dk * wgid_x`, so it DOES expand to Hq in a 1.074 GB workspace and reduces
+on the host -- ~0.52 ms, 6.9% of its 7.561 ms. **We already beat the bar on this one axis.**
+A Q-outer fusion would hand that advantage back.
+
+Arithmetic identity behind it, verified: `dK_fp32 x G = 134.2 MB x 4 = 536.9 MB = dQ_fp32`
+exactly, because `B*Skv*Hkv*D*G == B*Sq*Hq*D` at `Sq == Skv`.
+
+### The corrected h9/h16 reconciliation
+
+The 2x disagreement was **four errors in two cancelling pairs** (h9: 268.4 MB unit, halved
+bands, write+read; h16: 536.9 MB unit, unhalved bands, write-only). The corrected naive-band
+figure is **51.81 GB / 11.80 ms**, i.e. WORSE than either published number. Neither h9's
+17.2 GB nor h16's 34.4 GB should be cited unqualified again.
+
+### 4.39 TB/s is the optimistic end of the range, not the number
+
+Every fusion estimate in this corpus divides by 4.39 TB/s. **The only measurement of the
+actual reduce kernel on this machine is 1.19 TB/s** (`kernels.py:1004-1007`, k_redsp). Any
+estimate that turns positive only at 4.39 TB/s is not positive.
+
+### What survives: the lever is waves per workgroup, not nsp
+
+Slot count is `Sq/BLOCK_Q` (or `Skv/BLOCK_KV`), and BLOCK is set by waves-per-workgroup. That
+is the only quantity that moves the account:
+
+| geometry | slots | reduce traffic | vs 3.22 ms GEMM saving |
+|---|--:|--:|--:|
+| today, 1 wave, BLOCK=64 | 128 | 15.65 ms | **-12.4 ms** |
+| 4 waves, BLOCK=256 | 32 | 3.91 ms | **-0.7 ms** |
+| 8 waves, BLOCK=512 | 16 | 1.96 ms | **+1.26 ms** |
+
+(at the optimistic 4.39 TB/s; at the measured 1.19 TB/s every row is deeply negative.)
+
+**So fusion is not reachable from any geometry we can build today, and is only arguably
+reachable at 8 waves IF the reduce also hits near-peak bandwidth -- which it has never done.**
+
+### The one action that is decisive and costs zero card time
+
+Before any further arithmetic: **compile k_dq at 4-wave / BLOCK_Q=256 and read
+`vgpr_count` + `vgpr_spill_count` out of `21_final_isa.s`.** The register account
+(~704 non-accumulator + 256 dQ + dK transients) approaches the 1024 hard ceiling. If
+`spill > 0`, the whole multi-wave direction closes and goes to `dead_ends` -- which also
+closes fusion permanently, since fusion needs >= 8 waves. If `spill == 0`, multi-wave is
+worth a round **on its own merits** (dispatch, tail, LDS) independent of fusion.
+
+**Rule this round taught me:** when an estimate rests on an assumption I labelled
+"not computed", the assumption is the result. Compute it or do not publish the number.
