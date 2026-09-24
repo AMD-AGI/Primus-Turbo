@@ -1,0 +1,949 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>gfx1250 attention 优化进展 — ASM 与 FlyDSL 两条线（0913–0922）</title>
+<style>
+  :root{
+    color-scheme:light;
+    --surface-0:#f4f4f2; --surface-1:#fcfcfb; --surface-2:#eeeeec; --surface-3:#e6e6e3;
+    --text-primary:#0b0b0b; --text-secondary:#52514e; --text-muted:#77756f;
+    --rule:#dededa; --rule-strong:#c4c3bd;
+    --series-1:#2a78d6; --series-2:#eb6834; --series-3:#1baf7a;
+    --good:#0ca30c; --warning:#fab219; --serious:#ec835a; --critical:#d03b3b;
+    --warn-bg:#fdf6e3; --crit-bg:#fbeceb; --good-bg:#edf7ed; --info-bg:#eef4fc;
+  }
+  @media (prefers-color-scheme:dark){ :root:not([data-theme="light"]){
+    color-scheme:dark;
+    --surface-0:#121211; --surface-1:#1a1a19; --surface-2:#242423; --surface-3:#2e2e2c;
+    --text-primary:#ffffff; --text-secondary:#c3c2b7; --text-muted:#96958c;
+    --rule:#333331; --rule-strong:#4a4a47;
+    --series-1:#3987e5; --series-2:#d95926; --series-3:#199e70;
+    --warn-bg:#2a2416; --crit-bg:#2e1a19; --good-bg:#16261a; --info-bg:#161f2a;
+  }}
+  :root[data-theme="dark"]{
+    color-scheme:dark;
+    --surface-0:#121211; --surface-1:#1a1a19; --surface-2:#242423; --surface-3:#2e2e2c;
+    --text-primary:#ffffff; --text-secondary:#c3c2b7; --text-muted:#96958c;
+    --rule:#333331; --rule-strong:#4a4a47;
+    --series-1:#3987e5; --series-2:#d95926; --series-3:#199e70;
+    --warn-bg:#2a2416; --crit-bg:#2e1a19; --good-bg:#16261a; --info-bg:#161f2a;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%; scroll-behavior:smooth}
+  body{margin:0; background:var(--surface-0); color:var(--text-primary);
+    font:15.5px/1.75 ui-sans-serif,system-ui,-apple-system,"Segoe UI","Noto Sans CJK SC","PingFang SC","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1000px; margin:0 auto; padding:40px 20px 120px}
+  header{border-bottom:1px solid var(--rule-strong); padding-bottom:22px; margin-bottom:10px}
+  h1{font-size:28px; line-height:1.3; margin:0 0 8px; font-weight:650; letter-spacing:-.01em}
+  .sub{color:var(--text-secondary); font-size:14px; margin:0}
+  h2{font-size:21px; margin:52px 0 6px; font-weight:650; letter-spacing:-.005em; padding-top:24px; border-top:1px solid var(--rule)}
+  h2:first-of-type{border-top:none; padding-top:6px}
+  h3{font-size:16.5px; margin:30px 0 10px; font-weight:650}
+  h4{font-size:15px; margin:22px 0 8px; font-weight:650; color:var(--text-secondary)}
+  .lede{color:var(--text-secondary); margin:0 0 20px; font-size:15px}
+  p{margin:0 0 15px}
+  ul,ol{margin:0 0 15px; padding-left:24px}
+  li{margin-bottom:8px}
+  code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:13px}
+  code{background:var(--surface-2); padding:1.5px 5px; border-radius:3px}
+  pre{background:var(--surface-2); border:1px solid var(--rule); border-radius:5px;
+    padding:14px 16px; overflow-x:auto; font-size:12.5px; line-height:1.6; margin:0 0 16px}
+  pre code{background:none; padding:0}
+  .note{background:var(--surface-1); border:1px solid var(--rule); border-left:3px solid var(--series-1);
+    padding:15px 17px; border-radius:4px; margin:0 0 18px; font-size:14.5px}
+  .note.warn{border-left-color:var(--warning); background:var(--warn-bg)}
+  .note.crit{border-left-color:var(--critical); background:var(--crit-bg)}
+  .note.good{border-left-color:var(--good); background:var(--good-bg)}
+  .note.bg{border-left-color:var(--text-muted); background:var(--info-bg)}
+  .note-h{font-weight:650; display:block; margin-bottom:6px}
+  .note p:last-child,.note ul:last-child,.note table:last-child{margin-bottom:0}
+  .tiles{display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:12px; margin:0 0 24px}
+  .tile{background:var(--surface-1); border:1px solid var(--rule); border-radius:5px; padding:16px 17px}
+  .tile .k{font-size:12px; color:var(--text-muted); margin-bottom:8px; line-height:1.45}
+  .tile .v{font-size:29px; font-weight:640; line-height:1.1; letter-spacing:-.015em}
+  .tile .u{font-size:13px; font-weight:450; color:var(--text-secondary); margin-left:3px}
+  .tile .n{font-size:12px; color:var(--text-muted); margin-top:8px; line-height:1.5}
+  .tw{overflow-x:auto; margin:0 0 18px; border:1px solid var(--rule); border-radius:5px; background:var(--surface-1)}
+  table{border-collapse:collapse; width:100%; font-size:13.5px}
+  caption{text-align:left; padding:13px 15px 11px; font-size:13px; color:var(--text-secondary); border-bottom:1px solid var(--rule)}
+  caption b{color:var(--text-primary); font-weight:650}
+  th,td{padding:9px 13px; text-align:left; border-bottom:1px solid var(--rule); vertical-align:top}
+  thead th{font-size:11.5px; font-weight:600; color:var(--text-muted); border-bottom:1px solid var(--rule-strong); white-space:nowrap}
+  tbody tr:last-child td{border-bottom:none}
+  td.num,th.num{text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap}
+  td.mono{font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12.5px}
+  .cond{color:var(--text-muted); font-size:12px; line-height:1.5}
+  tr.hl td{background:var(--surface-2)}
+  figure{margin:0 0 22px; background:var(--surface-1); border:1px solid var(--rule); border-radius:5px; padding:17px 19px 15px}
+  figcaption{font-size:13px; color:var(--text-secondary); margin-bottom:15px}
+  figcaption b{color:var(--text-primary); font-weight:650}
+  .bars{display:grid; gap:10px}
+  .bar-row{display:grid; grid-template-columns:minmax(130px,215px) 1fr; gap:13px; align-items:center}
+  .bar-lab{font-size:12.5px; color:var(--text-secondary); line-height:1.4}
+  .bar-track{display:grid; grid-template-columns:1fr auto; gap:9px; align-items:center}
+  .bar-plot{height:23px; display:flex; align-items:center; min-width:0}
+  .bar-fill{height:15px; border-radius:0 4px 4px 0; background:var(--series-1); min-width:2px}
+  .bar-fill.s2{background:var(--series-2)} .bar-fill.s3{background:var(--series-3)}
+  .bar-fill.mute{background:var(--rule-strong)}
+  .bar-val{font-size:12.5px; font-variant-numeric:tabular-nums; color:var(--text-primary); white-space:nowrap}
+  .bar-val em{font-style:normal; color:var(--text-muted); font-size:11.5px}
+  .foot{margin-top:11px; font-size:12px; color:var(--text-muted); line-height:1.55}
+  .tag{display:inline-block; font-size:10.5px; font-weight:600; padding:1.5px 6px; border-radius:3px;
+    border:1px solid var(--rule-strong); color:var(--text-secondary); white-space:nowrap; line-height:1.5}
+  .tag.m{border-color:var(--good); color:var(--good)}
+  .tag.a{border-color:var(--serious); color:var(--serious)}
+  .tag.x{border-color:var(--critical); color:var(--critical)}
+  .toc{background:var(--surface-1); border:1px solid var(--rule); border-radius:5px; padding:16px 20px; margin:0 0 30px}
+  .toc ol{margin:0; padding-left:20px; font-size:14px}
+  .toc li{margin-bottom:5px}
+  .toc a{color:var(--series-1); text-decoration:none}
+  .toc a:hover{text-decoration:underline}
+  dl{margin:0 0 16px}
+  dt{font-weight:650; margin-top:14px; font-size:14.5px}
+  dd{margin:4px 0 0 0; color:var(--text-secondary); font-size:14px}
+  @media (max-width:620px){
+    .wrap{padding:26px 15px 80px} h1{font-size:23px} h2{font-size:19px}
+    .bar-row{grid-template-columns:1fr; gap:3px} .tile .v{font-size:25px}
+  }
+</style>
+<style>
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:16px; margin:0 0 18px}
+  @media (max-width:760px){ .grid2{grid-template-columns:1fr} }
+  .qa{background:var(--surface-1); border:1px solid var(--rule); border-radius:5px; padding:0; margin:0 0 20px; overflow:hidden}
+  .qa > .q{background:var(--surface-2); padding:13px 18px; font-weight:650; font-size:15px; border-bottom:1px solid var(--rule)}
+  .qa > .a{padding:16px 18px 4px}
+  .verdict{display:inline-block; font-size:11px; font-weight:700; padding:2px 8px; border-radius:3px; margin-right:8px; vertical-align:2px}
+  .verdict.ok{background:var(--good-bg); color:var(--good); border:1px solid var(--good)}
+  .verdict.no{background:var(--crit-bg); color:var(--critical); border:1px solid var(--critical)}
+  .verdict.mid{background:var(--warn-bg); color:#9a6c00; border:1px solid var(--warning)}
+  .files li{font-size:14px}
+  .strike{text-decoration:line-through; color:var(--text-muted)}
+  h2 .hint{font-size:13px; font-weight:400; color:var(--text-muted); margin-left:10px}
+</style>
+</head>
+
+<body>
+<div class="wrap">
+
+<header>
+  <h1>gfx1250 attention 优化进展 —— ASM 与 FlyDSL 两条线</h1>
+  <p class="sub">
+    2026-09-13 至 09-22 · 主力机 <code>A0-heliosr-1b114-c07-1</code>（单卡 gfx1250 / MI455X，VR 限频 1100 MHz）·
+    分支 <code>dev/lhz/attn</code>（ASM）与 <code>dev/lhz/flydsl-attn</code>（FlyDSL）
+  </p>
+  <p class="sub" style="margin-top:8px">
+    本文汇总 <code>output/0922_summary/</code> 下的两份 md、xlsx 的 <code>attention</code> 页签，
+    以及为组会准备的问答。<b>端到端数字已按 0917 的 nan 筛查更正</b>（见
+    <a href="#corr">更正记录</a>）；算子级数字不受影响。<br>
+    <b>FlyDSL 作业已于 09-22 16:10 停止、节点已交还</b>，最终 <code>best_round 8</code>
+    —— 本文已含 round 6/7/8 与未记账的 round 9。
+  </p>
+</header>
+
+<div class="toc">
+  <ol>
+    <li><a href="#tldr">一页纸结论</a></li>
+    <li><a href="#env">口径与环境</a> — 服务器 / 镜像 / 代码 / 模型 / shape / FLOP 约定</li>
+    <li><a href="#asm">主线一：ASM 路线</a> — 做了哪些适配，拿到什么</li>
+    <li><a href="#fly">主线二：FlyDSL 路线</a> — 前向判定、三内核、round 0→8、挂卡与天花板</li>
+    <li><a href="#why">组会问答：有了 aiter，为什么还要做 FlyDSL</a></li>
+    <li><a href="#qa2">会上可能被追问的其它问题</a></li>
+    <li><a href="#corr">更正记录与口径注意</a></li>
+    <li><a href="#files">文件清单</a></li>
+  </ol>
+</div>
+
+<!-- ============================================================ TLDR -->
+<h2 id="tldr">一页纸结论</h2>
+
+<div class="tiles">
+  <div class="tile">
+    <div class="k">ASM 路线 · 单层算子（fwd+bwd）</div>
+    <div class="v">4.76×</div>
+    <div class="n">55.785 → 11.726 ms<br>138.0 → 656.4 TF/s<br><span style="opacity:.75">n=5，cv 0.57%</span></div>
+  </div>
+  <div class="tile">
+    <div class="k">ASM 路线 · 端到端（8 层，全链三项叠加）</div>
+    <div class="v">7.57×</div>
+    <div class="n">6,128 → 46,374 tps<br>单步 5.35 s → 707 ms<br><span style="opacity:.75">其中 ASM 反向单项 +12.72%</span></div>
+  </div>
+  <div class="tile">
+    <div class="k">FlyDSL 路线 · 反向（prod 形状）</div>
+    <div class="v">7.50×</div>
+    <div class="n">96.05 → 12.80 ms<br>57.2 → 429.4 TF/s<br><span style="opacity:.75">op-evolve round 0 → 8（最终）</span></div>
+  </div>
+  <div class="tile">
+    <div class="k">FlyDSL 与 ASM 反向的差距</div>
+    <div class="v">1.64×</div>
+    <div class="n">从 12.6× 收窄而来<br>目标是<b>追平</b>，不是超越<br><span style="opacity:.75">最终 0.609× beat</span></div>
+  </div>
+</div>
+
+<div class="note good">
+  <span class="note-h">三行版总表 —— 组会上讲这一张就够</span>
+  <div class="tw" style="margin:10px 0 0">
+  <table>
+    <thead><tr>
+      <th>#</th><th>fwd impl</th><th>bwd impl</th>
+      <th class="num">fwd ms</th><th class="num">fwd TF/s</th>
+      <th class="num">bwd ms</th><th class="num">bwd TF/s</th>
+      <th class="num">total ms</th><th class="num">total TF/s</th><th class="num">vs stock</th>
+    </tr></thead>
+    <tbody>
+      <tr><td>1</td><td>Triton (turbo stock <code>1cb2e183</code>)</td><td>Triton fused (stock)</td>
+        <td class="num">10.651</td><td class="num">206.5</td><td class="num">45.134</td><td class="num">121.8</td>
+        <td class="num">55.785</td><td class="num">138.0</td><td class="num">1.00x</td></tr>
+      <tr class="hl"><td>2</td><td><b>aiter ASM</b></td><td><b>aiter ASM</b></td>
+        <td class="num">1.572</td><td class="num">1398.9</td><td class="num">10.160</td><td class="num">541.1</td>
+        <td class="num"><b>11.726</b></td><td class="num"><b>656.4</b></td><td class="num"><b>4.76x</b></td></tr>
+      <tr><td>3</td><td>aiter FlyDSL <span class="cond">(not optimised by us)</span></td><td><b>FlyDSL, ours, round 8</b></td>
+        <td class="num">2.373</td><td class="num">926.6</td><td class="num">12.804</td><td class="num">429.4</td>
+        <td class="num">15.177</td><td class="num">507.1</td><td class="num">3.68x</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="foot">A0 @1100 MHz · <code>b=4 s=8192 hq=32 hkv=8 d=128 bf16 causal</code>（Llama-3.1-8B）·
+  causal FLOP 约定：fwd = 2·b·hq·s²·d，bwd = 5·，合计 7·。
+  <b>两点口径</b>：第 3 行的 fwd 是 aiter 自己的 FlyDSL 前向、我们未优化；第 3 行的 bwd 是
+  op-evolve 的纯 kernel 区间，第 1/2 行是产品路径（含 autograd 管路），故第 3 行的 total 是<b>指示性合成值</b>。</p>
+</div>
+
+<div class="note">
+  <span class="note-h">两条线的分工，一句话</span>
+  <p style="margin-bottom:0"><b>不是"用 FlyDSL 替代 ASM"，而是"ASM 吃掉当前这一个形状，FlyDSL 补它结构上补不了的部分"</b>
+  —— varlen（gfx1250 的 ASM 根本没有）、GQA 越界写的根治、确定性、以及形状/特性变化时不必等 AMD 发新资产。
+  详见 <a href="#why">§组会问答</a>。</p>
+</div>
+
+<!-- ============================================================ ENV -->
+<h2 id="env">口径与环境</h2>
+
+<div class="tw">
+<table>
+  <caption><b>两条线各自跑在什么上面</b> —— 服务器 / 镜像 / 代码 / 模型 / shape</caption>
+  <thead><tr><th>项</th><th>ASM 路线</th><th>FlyDSL 路线</th></tr></thead>
+  <tbody>
+    <tr><td><b>服务器</b></td>
+      <td>A0 <code>heliosr-1b114-c07-1</code>，单卡 gfx1250，VR 限频（rocm-smi 报 1100 MHz，持续负载下 sysfs 采到 943–967 MHz）<br>
+          B0 <code>ctheliosp-1b112-a37-1</code>，4× gfx1250 @2133–2244 MHz，<span class="cond">仅用于调参扫描</span></td>
+      <td>A0 同上，<b>单卡且 <code>gpu_pool</code> 为空</b> → deep round 无法并行，全部走 fast round</td></tr>
+    <tr><td><b>镜像 / 容器</b></td>
+      <td><code>amdprimus/amdprimus:gfx1250-20260910</code><br>容器 <code>fa-repro</code> / <code>fa-e2e</code></td>
+      <td><code>fa-tune:deps</code> = 同一镜像 <b>+1 层</b>（本地派生，建于 09-13）<br>容器 <code>fa-repro</code>，优化器只 attach、从不重建</td></tr>
+    <tr><td><b>runtime</b></td>
+      <td colspan="2">torch <code>2.11.0+rocm7.14.0a20260625</code> · torch_hip <code>7.14.60850</code> · rocprofv3 <code>1.3.2</code> ·
+          <code>TORCH_BLAS_PREFER_HIPBLASLT=0</code>（镜像缺 gfx1250 的 hipBLASLt Tensile 库）</td></tr>
+    <tr><td><b>我方代码</b></td>
+      <td>分支 <code>dev/lhz/attn</code>（off main <code>c1325c7e</code>）<br>
+          <code>pytorch/kernels/attention</code> 下 +1,743 行，另有 674 行 launcher/ABI</td>
+      <td>分支 <code>dev/lhz/flydsl-attn</code>（off main <code>c1325c7e</code>）<br>
+          三个反向 kernel 在 <code>output/0917__flydsl/kernels/</code>；优化由 op-evolve 作业
+          <code>gfx1250-flydsl-attn-bwd-20260917-115934</code> 驱动</td></tr>
+    <tr><td><b>vendor 代码</b></td>
+      <td>aiter @ <code>6963ae9d</code> —— 预编译 ASM 在 <code>hsa/gfx1250/fmha_v3_bwd/</code>：
+          <b>反向 6 个 <code>.co</code></b>（gfx950 有 124），且<b>没有 varlen 反向</b></td>
+      <td><b>flydsl 0.3.2</b>，侧装在 <code>~/.local/flydsl032</code> 并 prepend <code>sys.path</code>。
+          镜像自带 0.2.4。<b>0.3.2 删掉了 <code>flydsl.expr.buffer_ops</code></b>，而 primus_turbo 无条件 import 它
+          —— <b>两者在一个进程里装不下</b></td></tr>
+    <tr><td><b>模型</b></td>
+      <td colspan="2">Llama-3.1-8B —— head_dim 128、GQA ratio 4（hq/hkv = 32/8）、causal bottom-right、BSHD、bf16、无 sink、无 sliding window、无 dropout</td></tr>
+    <tr><td><b>shape</b></td>
+      <td>生产形状，单层：<code>b=4 s=8192 hq=32 hkv=8 d=128</code></td>
+      <td>三个形状全部计分：<br><code>fast  b1 s1024 hq8  hkv2 d128</code><br><code>proxy b1 s4096 hq32 hkv8 d128</code><br><code>prod  b4 s8192 hq32 hkv8 d128</code>（= ASM 那个形状）</td></tr>
+    <tr><td><b>方向</b></td>
+      <td>前向 <b>和</b> 反向都替换</td>
+      <td><b>只做反向</b>。前向测过一次（<a href="#fly-fwd">§FlyDSL 前向判定</a>）后<b>刻意不做优化</b>：前向已由 ASM 拿下</td></tr>
+    <tr><td><b>FLOP 约定</b></td>
+      <td colspan="2">causal：fwd = <code>2·b·hq·s²·d</code>，bwd = <code>5·b·hq·s²·d</code>，合计 <code>7·b·hq·s²·d</code>。
+          生产形状下分别是 <b>2.199e12 / 5.498e12 / 7.697e12 FLOP</b>。<br>
+          <span class="cond">这就是为什么本文里前向的 TF/s 看起来偏高：causal 前向只算 2 份 GEMM。</span></td></tr>
+  </tbody>
+</table>
+</div>
+
+<!-- ============================================================ ASM -->
+<h2 id="asm">主线一：ASM 路线 <span class="hint">0913 – 0916</span></h2>
+
+<p class="lede">我们把 AMD 已经发布、但<b>在 Python 侧完全够不着、且在 GQA 下算错</b>的 gfx1250 预编译 ASM
+attention 内核，做成了 Primus-Turbo 里可派发、可 A/B、正确的一条生产路径。
+<b>我们一行汇编都没有改过</b> —— 价值全部在<b>适配、纠错与工程化</b>上。</p>
+
+<h3>1.1 做了哪些适配</h3>
+
+<div class="qa">
+  <div class="q">① 发射器从零写 —— aiter 根本没有给 gfx1250 任何可调用的入口 <span class="cond">（674 行）</span></div>
+  <div class="a">
+    <p>aiter 的 C++ host 有五处 gfx1250 特判，但 <b>Python wrapper 没有</b>：
+    <code>can_impl_fmha_v3_bwd</code> 从 <code>get_gfx() == "gfx942"</code> 起判、只放宽到 gfx950，
+    <b>gfx1250 永远选不中这些内核</b>。我们离线从 ELF metadata + 反汇编反推 kernarg 布局，自己写了发射器。</p>
+    <div class="tw"><table>
+      <thead><tr><th>文件</th><th class="num">行数</th><th>作用</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">tools/gfx1250/asm_bwd_abi.py</td><td class="num">136</td><td>从 ELF 推出的 kernarg 字段表 + 无 GPU / 无 torch 自检</td></tr>
+        <tr><td class="mono">tools/gfx1250/asm_bwd_launcher.py</td><td class="num">185</td><td>手工发射器（bring-up / ABI 自检入口）</td></tr>
+        <tr><td class="mono">…/attention/_asm_bwd_kernargs.py</td><td class="num">335</td><td>产品侧 kernarg 打包 + <code>HipModule</code></td></tr>
+        <tr><td class="mono">…/attention/attention_asm_bwd_impl.py</td><td class="num">353</td><td>反向资格门 + adapter</td></tr>
+        <tr><td class="mono">…/attention/attention_asm_fwd_impl.py</td><td class="num">199</td><td>前向资格门 + adapter</td></tr>
+      </tbody></table></div>
+    <p><b>反向不是一次发射而是三次</b>：<code>bwd_hd128_odo_bf16</code>（delta=rowsum(dO·O)）→
+    <code>bwd_hd128_bf16_causal_br_a32_pssk</code>（主体，514 条 <code>buffer_atomic_add_f32</code> 累加进 fp32 dq_acc）→
+    <code>bwd_hd128_dq_convert_bf16</code>（fp32→bf16）。</p>
+    <p style="margin-bottom:14px"><b>主要的坑</b>：两种 packing 约定并存 —— <code>dqdkdv</code> 每字段 16 B 对齐、<code>odo</code> 紧凑打包。
+    那个<b>无 torch、无 GPU 的 ABI 自检</b>当场抓到一张手抄字段表悄悄丢了最后七个字段（含 <code>mask_x</code>/<code>mask_y</code>）。</p>
+  </div>
+</div>
+
+<div class="qa">
+  <div class="q">② 找到并绕过 aiter 这批资产里的一个正确性 bug <span class="cond">—— 最实质的一项</span></div>
+  <div class="a">
+    <div class="note crit" style="margin-bottom:16px">
+      <p style="margin-bottom:0">主体内核的 grid 是 <code>(kv_tiles, nhead_q, batch)</code>，却<b>按 q head 去索引 kv 尺寸的 dk/dv 缓冲区 —— 越界写</b>。
+      GQA ratio=4 下，4 个 workgroup 无同步地争同一块 dk/dv tile。</p>
+    </div>
+    <p>两副面孔，取决于越界落在哪：</p>
+    <div class="tw"><table>
+      <thead><tr><th class="num">seqlen</th><th>表现</th></tr></thead>
+      <tbody>
+        <tr><td class="num">1024</td><td><b>静默损坏</b>：dk/dv 掉到约 −0.3 dB，而 dq 仍然正确 52.24 dB</td></tr>
+        <tr><td class="num">256</td><td>跨页 → 进程 fault（<b>dmesg 零记录，不伤卡</b>）</td></tr>
+      </tbody></table></div>
+    <p>三个实验钉死它，并排除了"累加 vs 赋值"假设（预置零没有任何改变）：</p>
+    <div class="tw"><table>
+      <thead><tr><th>配置</th><th class="num">dq</th><th class="num">dk</th><th class="num">dv</th><th></th></tr></thead>
+      <tbody>
+        <tr><td>ratio = 1（无 GQA）</td><td class="num">52.26</td><td class="num">52.27</td><td class="num">52.76</td><td>全对</td></tr>
+        <tr><td>ratio = 4，dk/dv 按 kv head</td><td class="num">52.24</td><td class="num"><b>−0.94</b></td><td class="num"><b>−0.65</b></td><td>损坏</td></tr>
+        <tr class="hl"><td>ratio = 4，dk/dv 按 q head + host 规约</td><td class="num">52.24</td><td class="num">50.55</td><td class="num">51.09</td><td>全对 ← 我们的绕法</td></tr>
+      </tbody></table></div>
+    <p><b>代价（0917 首次单独计量）</b>：dk/dv 张量 0.125 → 0.500 GiB（4.0× = GQA ratio），
+    <b>反向发射峰值增量 1.254 GiB</b>；host 规约 <b>+0.482 ms = 反向的 +5.2%</b>（相当于总时间 −4.1% 的空间）。</p>
+    <p style="margin-bottom:14px"><b>不做这一步，这个内核对 Llama-3.1-8B 这类 GQA 模型直接不可用。</b>
+    已连同完整复现与三实验定位写成 vendor report 提交 aiter。</p>
+  </div>
+</div>
+
+<div class="qa">
+  <div class="q">③ 接进派发层，而不是做成一个脚本</div>
+  <div class="a">
+    <ul>
+      <li><b>前向</b>：可用时替换为 aiter 预编译 ASM 前向，并留 <code>PRIMUS_TURBO_ATTN_DISABLE_ASM_FWD</code> 硬开关
+        —— 没有开关就只能靠"让 aiter 不可 import"来做 A/B，那会同时改掉反向，对比作废。</li>
+      <li><b>反向</b>：<code>PRIMUS_TURBO_ATTN_ENABLE_ASM_BWD</code>（0915 起默认 OFF，理由见 §1.3）。</li>
+      <li>补了 <b>non-causal</b> 发射（换 <code>mask=0</code> 的 <code>.co</code>；只有 causal 才半 x-grid）。</li>
+      <li>修了 <code>enable_gqa</code> 不被接受 —— <b>这才是 e2e 里 turbo attention 根本没被调用的原因</b>。</li>
+      <li><b>资格门 seqlen ≥ 2048</b>：内核自身时间几乎不随工作量变化（<code>0.88 / 0.91 / 1.00 / 1.34 ms</code>，
+        seqlen 1024→8192，即 16× 工作量只换 1.5× 耗时），约 0.85 ms 固定开销，低于 2048 摊不平。
+        <span class="cond">这条我们错过两次：先从单样本外推成 <code>b*hq ≥ 32</code>，后又差点整个拿掉，而那组数据是被污染的。</span></li>
+    </ul>
+  </div>
+</div>
+
+<div class="qa">
+  <div class="q">④ 两个每调用开销 &nbsp;·&nbsp; ⑤ 测量纪律</div>
+  <div class="a">
+    <ul>
+      <li><b>每次反向都重新 <code>hipModuleLoad</code> 三个 <code>.co</code></b> —— 32 层就是每步 96 次加载。改成进程级加载一次。</li>
+      <li><b>scratch 按形状缓存</b>，进程级共 1.000 GiB，<b>不随层数增长</b>（此前一个 45× 的外推错误已纠正）。</li>
+      <li><b>同会话、回文交错、带时钟见证的 A/B</b>：这张卡会漂（一个计时窗口内 1100 → 967 MHz）。
+        另外把 e2e 噪声底刻画清楚了：<b>~3.9% 且三峰</b>，而且 seed 根本没被设上
+        （torchtitan 在 <code>world_size==1</code> 且 <code>debug.seed is None</code> 时直接跳过播种）。两项都已修，A/B 现在播种、交替、n≥9。</li>
+    </ul>
+  </div>
+</div>
+
+<h3 id="asm-ladder">1.2 算子级结果</h3>
+
+<div class="tw">
+<table>
+  <caption><b>ASM 阶梯</b> —— 单层，一次 fwd + 一次 bwd，causal。前向与反向<b>分别</b>计时计分。</caption>
+  <thead><tr>
+    <th>#</th><th>机器</th><th>fwd impl</th><th>bwd impl</th>
+    <th class="num">fwd ms</th><th class="num">fwd TF/s</th>
+    <th class="num">bwd ms</th><th class="num">bwd TF/s</th>
+    <th class="num">total ms</th><th class="num">total TF/s</th>
+    <th class="num">vs stock</th><th class="num">n</th><th>SQNR out/dq/dk/dv</th>
+  </tr></thead>
+  <tbody>
+    <tr><td>1</td><td>A0</td><td>Triton（turbo 出厂 <code>1cb2e183</code>）</td><td>Triton fused（出厂）</td>
+      <td class="num">10.651</td><td class="num">206.5</td><td class="num">45.134</td><td class="num">121.8</td>
+      <td class="num">55.785</td><td class="num">138.0</td><td class="num">1.00×</td><td class="num">3</td><td class="mono">53.67/52.24/52.31/52.71</td></tr>
+    <tr><td>2</td><td>A0</td><td>Triton（强制）</td><td>Triton fused（我们 vendored）</td>
+      <td class="num">4.166</td><td class="num">527.9</td><td class="num">17.835</td><td class="num">308.2</td>
+      <td class="num">22.001</td><td class="num">349.8</td><td class="num">2.54×</td><td class="num">2</td><td class="cond">—</td></tr>
+    <tr><td>3</td><td>A0</td><td><b>aiter ASM</b></td><td>Triton fused</td>
+      <td class="num">1.561</td><td class="num">1408.7</td><td class="num">17.686</td><td class="num">310.8</td>
+      <td class="num">19.239</td><td class="num">400.1</td><td class="num">2.90×</td><td class="num">5</td><td class="mono">53.62/52.24/52.31/52.71</td></tr>
+    <tr class="hl"><td>4</td><td>A0</td><td><b>aiter ASM</b></td><td><b>aiter ASM</b></td>
+      <td class="num">1.572</td><td class="num">1398.9</td><td class="num">10.160</td><td class="num">541.1</td>
+      <td class="num"><b>11.726</b></td><td class="num"><b>656.4</b></td><td class="num"><b>4.76×</b></td><td class="num">5</td><td class="mono">53.62/52.24/<b>50.61/50.83</b></td></tr>
+    <tr><td>5</td><td>B0</td><td>Triton（turbo）</td><td>Triton fused（出厂）</td>
+      <td class="num">2.716</td><td class="num">809.7</td><td class="num">10.292</td><td class="num">534.2</td>
+      <td class="num">13.000</td><td class="num">592.0</td><td class="num">—</td><td class="num">3</td><td class="mono">53.67/52.24/52.31/52.71</td></tr>
+    <tr><td>6</td><td>B0</td><td>Triton, <code>num_warps=2</code></td><td>Triton fused, <code>waves_per_eu</code> 不设</td>
+      <td class="num">2.579</td><td class="num">852.7</td><td class="num">9.872</td><td class="num">556.9</td>
+      <td class="num">12.454</td><td class="num">618.0</td><td class="num">+4.28%</td><td class="num">3</td><td class="mono">53.67/52.24/52.31/52.71</td></tr>
+    <tr><td>7</td><td>B0</td><td>aiter ASM</td><td>Triton fused</td>
+      <td class="num">1.410</td><td class="num">1559.6</td><td class="num">9.770</td><td class="num">562.7</td>
+      <td class="num">11.147</td><td class="num">690.5</td><td class="num">—</td><td class="num">3</td><td class="mono">53.62/52.24/52.31/52.71</td></tr>
+  </tbody>
+</table>
+</div>
+
+<figure>
+  <figcaption><b>总耗时的 TF/s（A0，单层 fwd+bwd）</b> —— 第 3 行的收益<b>全部来自前向</b>，第 4 行才把反向也换掉</figcaption>
+  <div class="bars">
+    <div class="bar-row"><div class="bar-lab">出厂 Triton + fused</div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill mute" style="width:21.0%"></div></div><div class="bar-val">138.0 <em>TF/s · 55.785 ms</em></div></div></div>
+    <div class="bar-row"><div class="bar-lab">Triton 强制 + vendored fused</div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill s3" style="width:53.3%"></div></div><div class="bar-val">349.8 <em>TF/s · 22.001 ms</em></div></div></div>
+    <div class="bar-row"><div class="bar-lab">ASM 前向 + fused 反向<br><span class="cond">当前默认</span></div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill s2" style="width:61.0%"></div></div><div class="bar-val">400.1 <em>TF/s · 19.239 ms</em></div></div></div>
+    <div class="bar-row"><div class="bar-lab">ASM 前向 + ASM 反向<br><span class="cond">冠军，opt-in</span></div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill" style="width:100%"></div></div><div class="bar-val">656.4 <em>TF/s · 11.726 ms</em></div></div></div>
+  </div>
+  <p class="foot">对出厂的<b>分方向</b>增益：fwd <b>10.651 → 1.572 ms（6.78×）</b>，bwd <b>45.134 → 10.160 ms（4.44×）</b>。
+  第 4 行的 dk/dv SQNR 指纹（50.61 / 50.83，而 fused 路径是 52.31 / 52.71）<b>正是"ASM 反向确实跑了"的证据</b>
+  —— ledger 里的 impl 字符串不是证据，它在任何东西跑起来之前就被赋值了。</p>
+</figure>
+
+<h3 id="asm-e2e">1.3 端到端：同一个内核，从 −0.28% 变成 +12.72%</h3>
+
+<div class="tw">
+<table>
+  <caption>llama-3.1-8B，b=4 s=8192，1 GPU，seed 固定</caption>
+  <thead><tr><th>时点</th><th class="num">ASM 反向的 e2e 效应</th><th>原因 / 说明</th></tr></thead>
+  <tbody>
+    <tr><td>0915</td><td class="num"><b>−0.28%</b></td>
+      <td>0.15× sem，完全不显著 → <b>默认 OFF</b>。当时 94% 的 step 是 hipBLASLt GEMM，attention 只占 3.3%。</td></tr>
+    <tr><td>0916（GEMM 缺陷绕开后）</td><td class="num"><span class="strike">+14.40%</span></td>
+      <td>attention 占比升到 20.8%。同一个内核、同一台机器、同样的算子级 1.74×。</td></tr>
+    <tr class="hl"><td><b>0917 更正</b></td><td class="num"><b>+12.72%</b></td>
+      <td>全量 74 次运行的正确性筛查发现<b>两臂各有一次 <code>loss: nan</code></b>
+        （<code>asm1-on</code> nan×6，且是 ON 臂最快的一次；<code>asm3-off</code> nan×1），各自剔除后重算：
+        <b>ON 42,534 / OFF 37,734</b>。<b>效应依然真实且显著，只是小了 1.7 个百分点。</b></td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note">
+  <span class="note-h">这条已经写进 skill</span>
+  <p style="margin-bottom:0">一个优化的端到端价值，是它<b>与当前瓶颈关系</b>的函数，不是它自己的属性。
+  同一个内核、同一台机器、算子级一模一样的 1.74×，端到端从 −0.28% 变成 +12.72%，
+  变的只是它在单步里的占比 —— 而那个占比是被一个<b>与它无关</b>的 GEMM 修法挪动的。</p>
+</div>
+
+<p>叠加三项修法后的全链（8 层，<b>仅干净运行</b>）：<b>6,128 → 46,374 tps（7.57×）</b>，单步 5.35 s → 707 ms。
+<b>32 层生产配置 1,984 → 14,050 tps（7.08×）</b>，同会话对照 12,340，20 步零 non-finite。</p>
+
+<div class="note warn">
+  <span class="note-h">但 ASM 反向默认仍然关闭 —— 理由变了</span>
+  <p style="margin-bottom:0">不再是"测不出收益"（那个前提已被推翻），而是：它的收益依赖的 GEMM 绕路
+  <code>nkfix.py</code> 是<b>运行时补丁而非产品代码</b>，且该绕路自身有 <b>21% 的 nan 率</b>待解决。
+  等 GEMM 走上正路（FlyDSL wgrad 是候选），值得重新评估这个默认值。</p>
+</div>
+
+<h3>1.4 这条路还剩什么</h3>
+
+<div class="tw"><table>
+  <thead><tr><th class="num">顺位</th><th>动作</th><th>依据 / 预期</th></tr></thead>
+  <tbody>
+    <tr><td class="num">1</td><td><b>向 aiter 报 GQA 越界写，并申请 gfx1250 的 <code>psskddv</code> / a16 / varlen 变体</b></td>
+      <td><b>成本近零</b>（复现与三实验定位已完备），<b>杠杆最高</b>。gfx1250 反向只有 6 个 <code>.co</code>，gfx950 有 124。</td></tr>
+    <tr><td class="num">2</td><td>测 <code>_perf</code> 变体并修它的 dq pass</td>
+      <td>已测：dk/dv 与 shipped 版<b>逐位相同</b>，但 dq 只有 5.84 dB —— 不是垃圾，是"部分正确"，大概率 dq pass 需要不同的 grid 或 split。两个 <code>_perf.co</code> 不在 aiter 的选择表里，ELF 元数据与非 perf 完全相同，只差 2296 B 代码体积。</td></tr>
+    <tr><td class="num">3</td><td>去掉 GQA 绕法</td><td>直接省 0.482 ms = 总时间 −4.1%。依赖第 1 项。</td></tr>
+    <tr><td class="num"><b>不建议</b></td><td><b>自己改汇编</b></td>
+      <td>内核 VGPR 已用满 <b>1024</b>、LDS <b>320 KiB</b>、workgroup 1024、wave32 —— <b>资源已饱和，调优面关死</b>。技能门槛最高、杠杆最低，且与第 1 项重复。</td></tr>
+  </tbody>
+</table></div>
+
+<div class="note crit">
+  <span class="note-h">存在性缺口（无任何绕法）</span>
+  <p style="margin-bottom:0"><b>gfx1250 没有 varlen ASM 反向。</b>dispatch 表只有 <code>mode=0</code>，
+  host 对每个 <code>seqstart</code> 指针都传 <code>nullptr</code>。这是 FlyDSL 反向立项的最强理由。</p>
+</div>
+
+<!-- ============================================================ FLYDSL -->
+<h2 id="fly">主线二：FlyDSL 路线 <span class="hint">0917 – 0922，作业已结束，best_round 8</span></h2>
+
+<h3 id="fly-fwd">2.1 前向：先做了一次"值不值得做"的判定</h3>
+
+<p>拿 aiter 自己的 gfx1250 FlyDSL 前向 vs 它自己的预编译 ASM 前向。<b>两边都成熟</b>，
+ABAB 交替、每次 256 MiB L2 flush、n=20、带时钟见证：</p>
+
+<div class="tw"><table>
+  <thead><tr><th>臂</th><th class="num">median</th><th class="num">median TF/s</th><th class="num">best</th><th class="num">best TF/s</th><th class="num">sd</th><th class="num">SQNR out</th></tr></thead>
+  <tbody>
+    <tr><td>aiter <b>FlyDSL</b> 前向（flydsl 0.3.2）</td><td class="num"><b>2.3732 ms</b></td><td class="num"><b>926.6</b></td><td class="num">2.3282</td><td class="num">944.5</td><td class="num">2.68%</td><td class="num">51.63 dB</td></tr>
+    <tr class="hl"><td>aiter 预编译 <b>ASM</b> 前向</td><td class="num"><b>1.5691 ms</b></td><td class="num"><b>1401.5</b></td><td class="num">1.5552</td><td class="num">1414.0</td><td class="num">1.09%</td><td class="num">53.62 dB</td></tr>
+  </tbody>
+</table></div>
+
+<div class="note crit">
+  <span class="note-h">ASM / FlyDSL = 0.661 —— ASM 前向快 1.51×</span>
+  <p>测量链交叉验证：ASM 这次读到 1.5691，与 0915 冠军的 1.572 相差 <b>0.2%</b>，说明两组数据出自同一套测量链、可以并列。
+  顺带确认 LSE 是<b>自然对数</b>（ratio 1.0000，81.85 dB），与 fused backward 配对不需要转换。</p>
+  <p style="margin-bottom:0"><b>决策</b>：FlyDSL <b>前向不做优化</b> —— 前向已由 ASM 拿下，且两边都已成熟，这是最好的估计。
+  FlyDSL <b>反向</b>按结构性理由立项，不按性能立项。</p>
+</div>
+
+<h3>2.2 反向：三个内核从零写出来（0917，一天）</h3>
+
+<p><b>gfx1250 没有 MFMA</b>，gfx950 的 FlyDSL 反向模板<b>不可移植</b>：
+<code>llvm.amdgcn.mfma.f32.32x32x16.bf16</code>、<code>ds.read.tr16.b64</code>、<code>permlane32.swap</code>
+在 gfx1250 上全部 cannot-select；LDS 转置要换成 <code>ds_load_tr16_b128</code>，<b>寄存器落位不同</b>。
+Primus-Turbo 自己的 FlyDSL attention 树里有 <b>6 个 kernel 各自硬断言 gfx950</b>。
+所以是<b>逐 kernel 重写</b>，不是改一个 arch 判断。</p>
+
+<div class="tw"><table>
+  <thead><tr><th>内核</th><th>作用</th><th class="num">首次验证 SQNR</th></tr></thead>
+  <tbody>
+    <tr><td class="mono">odo_gfx1250.py</td><td><code>delta = rowsum(dO*O)</code></td><td class="num">159.24 / 156.49 dB</td></tr>
+    <tr><td class="mono">dkdv_loop_gfx1250.py</td><td>dV + dK，运行时 q 循环 + causal <span class="cond">（真内核）</span></td><td class="num">141.9 / 141.0 dB</td></tr>
+    <tr><td class="mono">dq_gfx1250.py</td><td><code>dQ = dS·K</code></td><td class="num">144.90 dB</td></tr>
+  </tbody>
+</table></div>
+
+<p><b>三个都是一次通过</b>，每个都带 NaN 预填 + 全 <code>isfinite</code> 覆盖检查再算 SQNR。
+写之前先用探针把三件事钉死：WMMA fragment 布局（对 torch 验证）、跨 d-tile 的累加链、<code>ds_load_tr16_b128</code> 的语义。
+并顺手发现 gfx942 模板的"免费操作数"技巧<b>在 dq 上成立（151.32 dB 实测）、在 dkdv 上不成立</b> —— 方向不同结论不同。</p>
+
+<div class="note good">
+  <span class="note-h">顺带修掉 main 上两个真实缺陷</span>
+  <ul style="margin-bottom:0">
+    <li>flydsl 名义可选却被<b>无条件 import</b> —— 缺了它 <code>import primus_turbo.pytorch</code> 整个失败，
+      连 gfx1250 上唯一能用的 Triton 路径也一起拖下水。已修 attention 与 sparse_mla 两处
+      <span class="cond">（MoE / GEMM / quantization 下还有 10 个文件同样问题，范围明确、独立有价值）</span>。</li>
+    <li><code>_flydsl_common_ok</code> 用 <code>&gt;= _GFX950</code> 判断，而 gfx1250 报 <code>(12,5)</code> —— <b>它能通过</b>。
+      只是碰巧被 GQA 门挡住才没出事。已改为 <code>is_gfx950()</code>。</li>
+  </ul>
+</div>
+
+<h3 id="fly-rounds">2.3 op-evolve 自动优化：round 0 → 6</h3>
+
+<p>作业 <code>gfx1250-flydsl-attn-bwd-20260917-115934</code>，<code>max_rounds: 12</code>，<b>单卡、全 fast round</b>。
+判据：同一 session 内回文交错重测，<b>吞吐提升即接受</b>；精度 dq/dk/dv <b>各自</b> ≥ 50 dB；
+<b>无 atomic、200 次逐位确定性</b>。对标 <code>beat</code> = aiter 预编译 ASM 反向（<code>dkdv_heads="q"</code> + host 规约），
+<b>每轮同 session 重测</b> —— 这张卡会漂，存一个固定锚点会把时钟漂移变成假进步。</p>
+
+<figure>
+  <figcaption><b>prod 形状的反向吞吐</b>（bwd only，5.498e12 FLOP）—— 条长按 ASM 锚点 = 100% 归一</figcaption>
+  <div class="bars">
+    <div class="bar-row"><div class="bar-lab">round 0 <span class="cond">基线</span></div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill mute" style="width:8.1%"></div></div><div class="bar-val">57.2 <em>TF/s · 96.05 ms</em></div></div></div>
+    <div class="bar-row"><div class="bar-lab">round 1</div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill s3" style="width:13.1%"></div></div><div class="bar-val">92.6 <em>TF/s · 59.36 ms</em></div></div></div>
+    <div class="bar-row"><div class="bar-lab">round 2</div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill s3" style="width:20.3%"></div></div><div class="bar-val">143.2 <em>TF/s · 38.39 ms</em></div></div></div>
+    <div class="bar-row"><div class="bar-lab">round 3</div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill s3" style="width:29.5%"></div></div><div class="bar-val">207.5 <em>TF/s · 26.50 ms</em></div></div></div>
+    <div class="bar-row"><div class="bar-lab">round 4 <span class="cond">结构性大轮</span></div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill s3" style="width:47.0%"></div></div><div class="bar-val">331.0 <em>TF/s · 16.61 ms</em></div></div></div>
+    <div class="bar-row"><div class="bar-lab">round 5</div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill s3" style="width:47.6%"></div></div><div class="bar-val">335.4 <em>TF/s · 16.39 ms</em></div></div></div>
+    <div class="bar-row"><div class="bar-lab">round 6 <span class="cond">mask 特化</span></div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill s3" style="width:50.3%"></div></div><div class="bar-val">354.3 <em>TF/s · 15.52 ms</em></div></div></div>
+    <div class="bar-row"><div class="bar-lab">round 7 <span class="cond">预取提头</span></div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill s3" style="width:54.3%"></div></div><div class="bar-val">382.7 <em>TF/s · 14.37 ms</em></div></div></div>
+    <div class="bar-row"><div class="bar-lab">round 8 <span class="cond">最终冠军，删 barrier</span></div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill s2" style="width:60.9%"></div></div><div class="bar-val">429.4 <em>TF/s · 12.80 ms</em></div></div></div>
+    <div class="bar-row"><div class="bar-lab"><b>ASM 锚点</b> <span class="cond">beat</span></div>
+      <div class="bar-track"><div class="bar-plot"><div class="bar-fill" style="width:100%"></div></div><div class="bar-val">704.6 <em>TF/s · 7.80 ms</em></div></div></div>
+  </div>
+  <p class="foot"><b>与 ASM 反向的差距：12.6× → 1.64×。</b>
+  锚点在这里读 7.68 ms 而在 <a href="#asm-ladder">§1.2</a> 读 10.160 ms，是因为 op-evolve 只计三次 kernel 发射区间，
+  产品路径还含 autograd 管路（ctx 存取、<code>do.contiguous()</code>，约 1.4 ms）与 GQA host 规约。<b>两者不是同一口径。</b><br>
+  ⚠ <b>round 7 与 round 8 之间有一条 session 边界</b>：同一份 round-7 代码在两个 session 分别测 382.73 与 404.06（<b>+5.6% 而代码没动</b>），
+  所以 round 8 的诚实增益是<b>同 session 的 1.063×</b>，不是 429.4/382.7。</p>
+</figure>
+
+<div class="tw">
+<table>
+  <caption><b>每一轮做了什么</b> —— prod 形状，backward only</caption>
+  <thead><tr><th class="num">round</th><th>候选</th><th>改的 kernel</th>
+    <th class="num">prod ms</th><th class="num">TF/s</th><th class="num">对基线</th><th class="num">对 ASM</th><th class="num">同会话增益</th><th>改动</th></tr></thead>
+  <tbody>
+    <tr><td class="num">0</td><td>基线（三个手写 kernel）</td><td>odo + dkdv + dq</td>
+      <td class="num">96.05</td><td class="num">57.2</td><td class="num">—</td><td class="num">0.081</td><td class="num">—</td>
+      <td>正确、<b>刻意不优化</b>、按构造 atomic-free。</td></tr>
+    <tr><td class="num">1</td><td class="mono">g01</td><td>k_dkdv + k_dq</td>
+      <td class="num">59.36</td><td class="num">92.6</td><td class="num">1.62×</td><td class="num">0.131</td><td class="num">1.342×</td>
+      <td><b>causal tile 跳过</b>：按 causal 结构在运行时算 KV 循环次数，不再遍历全部 tile。
+        <b>位级恒等</b>，用逐位比对验证 —— 确定性闸门抓不到对角线上的 off-by-one，因为"被跳过的 tile"和"正确的接近零"长得一样。</td></tr>
+    <tr><td class="num">2</td><td class="mono">g07 + g06</td><td>k_dkdv</td>
+      <td class="num">38.39</td><td class="num">143.2</td><td class="num">2.50×</td><td class="num">0.203</td><td class="num">1.921×</td>
+      <td>两条正交且强超加性：(a) <b>32 深收缩</b> —— 一次 staging 32 个 query 行，WMMA 不再乘 padding 零；
+        (b) <b><code>BLOCK_KV</code> 16→32</b> —— Q/dO staging 与转置载入被两组累加器共享。
+        同时把所有 global buffer descriptor 的 <code>num_records</code> 从平坦的 1 GiB 改成<b>真实字节范围</b>，
+        修掉一个会走到未映射页的越界读。静态筛：对 4× 旧 workgroup，WMMA −33%、指令 −47%、转置载入 −44%、global b128 载入 −50%，零 spill。</td></tr>
+    <tr><td class="num">3</td><td class="mono">g13</td><td>k_dq</td>
+      <td class="num">26.50</td><td class="num">207.5</td><td class="num">3.63×</td><td class="num">0.294</td><td class="num">1.297×</td>
+      <td><code>k_dq</code> 的 <b><code>BLOCK_Q</code> 32→64</b>：一个 wave 从 32 个 query 行变 64，
+        把 K/V 全局载入和 K 的 LDS <code>ds_load_tr16_b128</code> 转置摊到两倍 query 上。VGPR 457→826，零 spill，LDS 不变。
+        <span class="cond">本轮在 ship 后 13 秒被挂卡打断，由人工收口，所有数字在 AC-cycle 后重测补齐。</span></td></tr>
+    <tr class="hl"><td class="num">4</td><td class="mono">g09 + g16</td><td>k_dkdv</td>
+      <td class="num">16.61</td><td class="num">331.0</td><td class="num">5.78×</td><td class="num">0.470</td><td class="num">1.512×</td>
+      <td>两条都由 per-kernel 拆分瞄准（<code>k_dkdv</code> 占 prod 的 <b>75.2%</b>）：
+        (a) <b>删掉 Q/dO staging 循环</b>，直接写 LDS tile；(b) <b>LDS padding</b>
+        （<code>X_ROW_B</code> 256→272 B、<code>S_ROW_B</code> 64→80 B）消 bank conflict。
+        与 incumbent <b>逐位相同</b>（0 / 21 M bit 差异）—— 精确替换本就该如此。<b>单轮最大</b>。</td></tr>
+    <tr><td class="num">5</td><td class="mono">g12 + g17</td><td>k_dq + 发射路径</td>
+      <td class="num">16.39</td><td class="num">335.4</td><td class="num">5.86×</td><td class="num">0.476</td><td class="num">1.154×</td>
+      <td>(a) 删掉 <code>k_dq</code> 的 K staging 循环；(b) 三次发射改走 <code>flyc.compile()</code>。
+        <b>诚实读数见下方</b>。</td></tr>
+    <tr><td class="num">6</td><td class="mono">armMNS</td><td>k_dkdv</td>
+      <td class="num">15.52</td><td class="num">354.3</td><td class="num">6.19×</td><td class="num">0.495</td><td class="num">1.049×</td>
+      <td><b>causal mask 特化 + grid 轴交换</b>：KV 循环拆成 full 段（不带 mask）与 mask 段，循环次数在 kernel 内算。
+        静态筛显示 full 段循环体指令 <code>k_dq</code> −26.6%、<code>k_dkdv</code> −19.8%。<b>prod +5.4%</b>。</td></tr>
+    <tr><td class="num">7</td><td class="mono">g21</td><td>k_dkdv</td>
+      <td class="num">14.37</td><td class="num">382.7</td><td class="num">6.69×</td><td class="num">0.534</td><td class="num">1.093×</td>
+      <td><b>把下一迭代的 Q/dO 预取提到本迭代体顶部</b>。<b>prod +8.3%</b> —— round 4 之后最大的单旋钮轮次。</td></tr>
+    <tr class="hl"><td class="num"><b>8</b></td><td class="mono">g23 + g24</td><td>k_dkdv + k_dq</td>
+      <td class="num"><b>12.80</b></td><td class="num"><b>429.4</b></td><td class="num"><b>7.50×</b></td><td class="num"><b>0.609</b></td><td class="num">1.030×</td>
+      <td><b>最终冠军 —— 删掉两个 kernel 里的 <code>fx.barrier()</code></b>。
+        机制：<code>block=(32,1,1)</code> 是单 wave，<code>s_barrier</code> 语义上是空操作、LLVM 本就会删；
+        但后端在删它之前会插一条保守的全计数器等待 <code>s_wait_loadcnt_dscnt 0x0</code>，
+        其 <code>loadcnt</code> 那一半在这里<b>没有任何依赖</b> —— 正是它把 <code>g21</code> 的预取覆盖截断到 299 条指令。
+        同会话五臂 sweep 证实了机制边界：延迟受限的 <code>k_dkdv</code> 值 <b>1.046×</b>，
+        计算受限的 <code>k_dq</code> 只值 <b>1.015×</b>，合并 <b>1.063×</b>。</td></tr>
+    <tr><td class="num">9</td><td class="cond">未记账</td><td>仅静态筛</td>
+      <td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td>
+      <td><b>无 GPU 的多 wave 静态筛</b>：<code>DKDV_THREADS</code> 32 → 64 → 128，三棵基线树共 9 个 build。
+        全部 built、<b>零 spill</b>、LDS 不变 22,528 B，而<b>每 wave VGPR 基本不变</b>
+        （32 线程 988/956/632 对 128 线程 984/952/634），多 wave 需要的 <code>s_barrier</code> 如期回来。
+        <b>读数：抬线程数并不重新分配寄存器 —— <code>g04</code> 是一次重构，不是一个旋钮。</b>
+        节点在能测之前就交还了。</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note warn">
+  <span class="note-h">round 5 的一个诚实注记 —— 会上主动说，不要等人问</span>
+  <p>记账上的 1.15× <b>是被 fast 形状抬起来的</b>：接受判据取三形状增益的<b>算术平均</b>，
+  而 fast 只有 0.35 ms、被发射开销主导，却与 26 ms 的 prod <b>同权重</b>。</p>
+  <p style="margin-bottom:0">单臂 prod 实测（基线 331.07）：<code>g12</code> 335.94、<code>g17</code> 333.45、合并 336.32
+  —— <b>round 5 在 prod 上的真实收益约 +1.6%</b>，主要来自 <code>g12</code>。
+  继续跑之前建议先 <code>op-evolve tune</code> 调形状权重，否则后续轮次可以靠 fast 形状持续"赢"而 prod 停滞。</p>
+</div>
+
+<div class="note bg">
+  <span class="note-h">一条值得沉淀的工具链发现（round 6 的 build failure）</span>
+  <p style="margin-bottom:0">FlyDSL 0.3.2 的 <code>ast_rewriter</code> 会把 kernel 体里的 <code>if</code> 整体改写成
+  <code>scf.if</code>：两个分支被提成独立函数，<b>在 if 之前不存在的新变量带不出来</b> → <code>NameError</code>，
+  而且报的是"明明两个分支都赋了值"的那一行。
+  <b>在 FlyDSL kernel 体内做任何编译期分支，条件必须裹 <code>const_expr(...)</code></b>
+  （由 rewriter 自己注入 globals，无需 import）。</p>
+</div>
+
+<h3>2.4 三个形状</h3>
+
+<div class="tw"><table>
+  <thead><tr><th>shape</th><th class="num">round 0 ms</th><th class="num">round 0 TF/s</th>
+    <th class="num">round 8 ms</th><th class="num">round 8 TF/s</th>
+    <th class="num">ASM 锚点 ms</th><th class="num">锚点 TF/s</th><th class="num">对 round 0</th><th class="num">对锚点</th></tr></thead>
+  <tbody>
+    <tr><td class="mono">fast &nbsp;b1 s1024 hq8 hkv2 d128</td><td class="num">1.7667</td><td class="num">3.04</td>
+      <td class="num">0.3583</td><td class="num">15.00</td><td class="num">0.2518</td><td class="num">21.83</td><td class="num">4.93×</td><td class="num">0.687</td></tr>
+    <tr><td class="mono">proxy b1 s4096 hq32 hkv8 d128</td><td class="num">9.4306</td><td class="num">36.44</td>
+      <td class="num">1.4574</td><td class="num">235.81</td><td class="num">0.7446</td><td class="num">461.57</td><td class="num">6.47×</td><td class="num">0.511</td></tr>
+    <tr class="hl"><td class="mono"><b>prod</b> &nbsp;b4 s8192 hq32 hkv8 d128</td><td class="num">96.0521</td><td class="num">57.24</td>
+      <td class="num">12.8041</td><td class="num">429.41</td><td class="num">7.8031</td><td class="num">704.61</td><td class="num"><b>7.50×</b></td><td class="num"><b>0.609</b></td></tr>
+  </tbody>
+</table></div>
+
+<p class="cond"><b>prod 是唯一用来排名候选的形状</b>；fast 与 proxy 是哨兵。一个平的 fast 读数不构成否决某个候选的证据。
+round 8 在 fast 上同会话退了 0.988×，所以 <code>champions.fast</code> 仍停在 round 7（17.92 TF/s）。
+<b>本表三行都取自 round 8 自己的 session</b>，而该 session 的锚点在小形状上读得异常低
+（fast 21.83 对历史 50.70，proxy 461.57 对 573.31，prod 正常），<b>所以 fast/proxy 两行的"对锚点"列不要引用</b>。</p>
+
+<h3 id="fly-wedge">2.5 挂卡、AC-cycle 与一条重要发现</h3>
+
+<p>round 8（当时在试 <code>g04</code> 的 4-wave 重构）运行中，卡于 <b>14:26 挂死</b>：
+<code>MES(0,0) failed to respond</code> 从 <code>INVALIDATE_TLBS</code> 一路升级到 <code>RESET</code>/<code>RESUME</code>，
+随后 <code>GPU reset begin!</code> + <b>MES 0–7 的 <code>REMOVE_QUEUE</code> 无界级联</b> —— 属不可恢复档。</p>
+
+<p><b>没有做任何恢复尝试</b>：不 <code>modprobe -r</code>（上次让整机掉 SSH 两小时）、不 <code>kill -9</code>
+（每次都会多留一个不可杀的 D-state 进程，把可恢复推向不可恢复）、不做进一步探测
+（挂卡时 <code>rocm-smi</code> / <code>pgrep</code> / <code>docker stop</code> 会自己挂住）。
+<b>14:40:38 完成 AC-cycle</b>，重启后全检通过（<code>amdgpu</code> 已加载、KFD 空、零故障签名、
+<code>git fsck</code> 通过、4096³ bf16 matmul 5.071 ms 有限结果），round 8 随后手工收口。</p>
+
+<div class="note crit">
+  <span class="note-h">闸门本身才是挂卡源 —— 这条值得单独讲</span>
+  <p>补验 round 8 时 <code>validation.py</code> 在 proxy 阶段以
+  <code>HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION</code> 中止，dispatch 签名
+  <code>workgroup=[256,1,1] group_seg_size=6144</code> —— 那是 <code>op/eager/</code> 里的
+  hipBLASLt/Tensile GEMM，<b>不是我们任何一个 kernel</b>
+  （k_dkdv 32 线程 / 22,528 B、k_dq 32 / 8,704、k_delta 256 / 0），
+  且<b>与 round 3 中止时的签名完全相同</b>。</p>
+  <p style="margin-bottom:0"><b>含义：每轮的固定挂卡风险，有很大一部分来自闸门里的 fp32 参考实现，而不是被测的 kernel。</b>
+  本轮的绕法是：armAB 对 incumbent <b>逐位相同</b>（prod 上 134,217,728 个元素零差异），
+  正确性<b>由继承得到，比重测 SQNR 更硬</b>（闸门有 2.5 dB 余量，逐位没有余量）；
+  determinism 单独跑（它不需要 eager 参考），200 次通过。</p>
+</div>
+
+<h3>2.6 天花板与剩余方向</h3>
+
+<div class="note warn">
+  <span class="note-h">一个被证伪的模型，记下来免得再被引用</span>
+  <p style="margin-bottom:0">hint <code>h8</code> 断言"我们钉在 HBM 屋顶上"（107 GB / 6.46 TB/s = 16.56 ms ≈ 当时实测 16.39 ms）。
+  <b>强形式错了</b> —— round 6 的 prod 已是 15.52 ms、round 7 是 14.36 ms，<b>都低于那个下界</b>。
+  107 GB 是 load 指令<b>请求</b>字节的正确计数，但实际到 HBM 的流量低于它（cache 吸收一部分），
+  所以并未贴顶，还有延迟/访存并行度余量 —— round 6/7/8 吃的就是这块。
+  <b>方向仍成立</b>：冗余流量是最大杠杆（<b>aiter 的字节数是我们的 1/5.6</b>），但不要再引用"101% of roof"。</p>
+</div>
+
+<ul>
+  <li><code>k_dkdv</code> 仍把 <b>16 宽的收缩 padding 到 WMMA 的 32</b>，浪费一半 GEMM。</li>
+  <li><b>唯一还能指望数量级改善的 <code>g04</code>（多 wave workgroup，<code>BLOCK_KV</code> 32→128）
+    现在被两条独立的阻塞堵住</b>（hint <code>h13</code>）：
+    <ol>
+      <li><b>寄存器 —— 缺 462 个。</b><code>k_dkdv</code> 因 <code>g21</code> 的预取已到 <b>956–988 / 1024</b>。
+        历史规律是 VGPR ≤ 951 的 21 个变体零 spill、= 1024 的 14 个全 spill，<b>中间没有过渡态</b>；
+        而 gfx1250 上 spill 的 build <b>第一次发射就挂起，代价是一次断电</b>。</li>
+      <li><b>同步。</b>round 8 删掉的正是 4-wave 需要的那两个 barrier。若直接把 block 改成 128，
+        kernel 会<b>静默竞态</b> —— 而竞态可能通过 SQNR 闸门（causal 跳过区真值本就接近零）、
+        也可能在固定调度下 200 次逐位稳定，<b>两道现有闸门都不保证能抓到</b>。</li>
+    </ol>
+    两者都是由<b>各自正确</b>的轮次造成的（<code>g21</code> +8.3%、<code>g23+g24</code> +6.3%）。合起来，
+    它们把 kernel 爬进了一个<b>局部最优</b>：流量分析认为唯一必要的结构性改动，现在装不下了。
+    <b>要走 <code>g04</code>，可能得先吐回 <code>g21</code> 和/或 <code>g23+g24</code>；这笔账该由下一轮显式定价</b>，
+    并把交付标准写成"证伪 <code>g04</code> 也算合格"。</li>
+  <li><b>精度余量按设计就薄</b>：返回 bf16 梯度把 SQNR 封在 52–53 dB，对 50 dB 闸门只有约 <b>2.5 dB</b> 余量。</li>
+  <li><b>SQNR 在这个 op 上基本看不出东西</b> —— 能干活的是<b>逐位比对</b>。
+    这也是 round 8 在闸门挂掉时仍能交付的原因。</li>
+</ul>
+
+<!-- ============================================================ WHY -->
+<h2 id="why">组会问答：有了 aiter，为什么还要做 FlyDSL</h2>
+
+<p class="lede">这是最可能被问到的一题。下面把两个常见回答先做真伪判定，再给四个更站得住的角度。</p>
+
+<div class="qa">
+  <div class="q"><span class="verdict ok">成立</span>角度一：aiter ASM 面对 shape 变化不够灵活</div>
+  <div class="a">
+    <p><b>成立，而且要升级说法</b> —— "灵活性不够"听起来像偏好问题，实际是<b>有没有</b>的问题：</p>
+    <ul>
+      <li><b>gfx1250 根本没有 varlen ASM 反向。</b>dispatch 表只有 <code>mode=0</code>，
+        host 对每个 <code>seqstart</code> 指针传 <code>nullptr</code>。<b>这条没有任何绕法。</b></li>
+      <li><b>资产极度稀薄</b>：gfx1250 反向 <b>6</b> 个 <code>.co</code>，gfx950 有 <b>124</b>；
+        只有 a32、只有 pssk，<b>没有 <code>psskddv</code>、没有 a16</b>。
+        MI355 在 trace 里实际跑的 <code>bwd_hd128_bf16_causal_br_a16_psskddv</code>，在 gfx1250 上不存在。</li>
+      <li><b>连入口都没有</b>：<code>can_impl_fmha_v3_bwd</code> 从 gfx942 起判、只放宽到 gfx950
+        —— 走 aiter 公开接口在 gfx1250 上<b>根本调不到</b>，我们是自己反推 kernarg 手写发射器才用上的。</li>
+      <li><b>小 shape 直接掉出去</b>：seqlen &lt; 2048 时 ASM 反向打不过融合 Triton 反向（比值 0.54–0.87），
+        我们不得不设资格门。</li>
+    </ul>
+    <p style="margin-bottom:14px"><b>一句话版本</b>：
+    "ASM 只覆盖我们当前这一个形状族；形状一变、要 varlen、要新特性，就得等 AMD 发新的 <code>.co</code>，
+    <b>而我们连编译它的能力都没有</b>。"</p>
+  </div>
+</div>
+
+<div class="qa">
+  <div class="q"><span class="verdict no">不成立</span>角度二：FlyDSL 预估性能可以超过 ASM</div>
+  <div class="a">
+    <div class="note crit">
+      <p style="margin-bottom:0"><b>会上这么说会被我们自己的测量打脸。</b>同一张卡上，
+      <b>aiter 的 FlyDSL 前向比它自己的 ASM 前向慢 1.51×</b>（2.373 vs 1.569 ms），<b>两边都成熟</b>，
+      这是现有最好的估计。立项文档里我们自己写的是"<b>持平是现实上限</b>"。
+      目前 FlyDSL 反向是 ASM 的 <b>0.609×</b>，还差 1.64×。</p>
+    </div>
+    <p>如果有人追问，反而有一条<b>对你有利但方向不同</b>的数据 —— 同事在 <b>gfx950</b> 上测 FlyDSL vs AITER
+    （<code>dev/kyle/flydsl-attn-gqa4</code>，B=2，D=128，bf16 causal，min of 20）：</p>
+    <div class="tw"><table>
+      <thead><tr><th>形状</th><th class="num">G</th><th class="num">fwd fly / aiter</th><th class="num">bwd fly / aiter</th><th class="num">fwd+bwd</th></tr></thead>
+      <tbody>
+        <tr><td>Llama-2-7B 32/32</td><td class="num">1</td><td class="num">0.304 / 0.566</td><td class="num">1.439 / 1.153</td><td class="num">+1.4%</td></tr>
+        <tr class="hl"><td><b>Llama-3.1-8B 32/8</b></td><td class="num">4</td><td class="num"><b>0.985 / 2.066</b> <span class="cond">（快 2.10×）</span></td><td class="num"><b>3.408 / 3.866</b> <span class="cond">（快 1.13×）</span></td><td class="num">−25.9%</td></tr>
+        <tr><td>Llama-3.1-70B 64/8</td><td class="num">8</td><td class="num">1.915 / 4.096</td><td class="num">6.573 / 7.546</td><td class="num">−22.0%</td></tr>
+      </tbody>
+    </table></div>
+    <p>所以正确的表述是：</p>
+    <div class="note">
+      <p style="margin-bottom:0"><b>"FlyDSL 能不能赢是架构和成熟度的函数，不是定律。gfx950 上它赢，主要赢在前向；
+      gfx1250 上前向 ASM 赢。我们这个作业要回答的是『反向能不能追平』，而不是押注它更快 —— 追平就够了，因为价值在别处。"</b></p>
+    </div>
+    <p style="margin-bottom:14px">补一句量化进展，显得不是空谈：<b>基线 57.2 → 429.4 TF/s（7.50×），
+    与 ASM 的差距从 12.6× 收到 1.64×，八轮做到这里，路线图还有明确的下一步</b>。</p>
+  </div>
+</div>
+
+<div class="qa">
+  <div class="q"><span class="verdict ok">更强</span>角度三：正确性我们拿不回来 —— 最实质的一条</div>
+  <div class="a">
+    <p>aiter 这个 gfx1250 ASM 反向在 GQA 下<b>越界写</b>：s=1024 静默把 dk/dv 打到 −0.3 dB 而 dq 仍正确，
+    s=256 直接 fault。<b>llama3.1-8B 正好是 GQA=4。</b></p>
+    <p style="margin-bottom:14px">没有源码，我们只能在外面绕：per-q-head 分配 + host 规约，
+    代价<b>峰值 +1.254 GiB、反向 +5.2%</b>（总时间 4.1%）。
+    <b>源码版反向把这 1 GiB 和这次规约整个删掉</b> —— 这既是性能，也是把一颗静默损坏梯度的雷拆掉。
+    <b>没有源码就只能一直绕。</b></p>
+  </div>
+</div>
+
+<div class="qa">
+  <div class="q"><span class="verdict ok">成立</span>角度四：确定性 / atomic-free</div>
+  <div class="a">
+    <p style="margin-bottom:14px">ASM 反向用 <b>514 条 <code>buffer_atomic_add_f32</code></b> 往 fp32 dq_acc 里累加，
+    累加顺序不可复现。我们的 FlyDSL 反向<b>按构造无 atomic、每个输出元素只写一次</b>，
+    并有 <b>200 次逐位一致</b>的闸门。训练收敛出问题时能逐位复现，是实打实的产品属性
+    —— 对比：gfx950 的配方里 <code>deterministic=True</code> 要付 <b>22.7%</b>。</p>
+  </div>
+</div>
+
+<div class="qa">
+  <div class="q"><span class="verdict ok">成立</span>角度五：ASM 这条路的调优面已经关死 &nbsp;·&nbsp; 角度六：能力沉淀会外溢</div>
+  <div class="a">
+    <ul>
+      <li><b>调优面关死</b>：内核 VGPR 用满 <b>1024</b>、LDS <b>320 KiB</b>、workgroup 1024、wave32 —— 资源饱和。
+        我们一行汇编都改不了也不该改。<b>ASM 侧后续所有收益都依赖 AMD 发新资产；FlyDSL 是我们能改的那条。</b></li>
+      <li><b>能力外溢</b>：gfx1250 的 FlyDSL 打法（WMMA fragment 布局、<code>ds_load_tr16_b128</code> 转置、
+        <code>const_expr</code> 编译期分支陷阱、wave32）是可复用资产。<b>同一套东西在 GEMM 上已经兑现</b>：
+        FlyDSL wgrad 8 层 <b>+9.26%</b>、32 层生产配置 <b>+13.9%</b>。attention 这边投入的不只是一个算子。</li>
+    </ul>
+  </div>
+</div>
+
+<div class="note good">
+  <span class="note-h">建议的收口说法</span>
+  <p><b>不是"用 FlyDSL 替代 ASM"，是"ASM 吃掉当前这一个形状，FlyDSL 补它结构上补不了的部分"</b>：
+  varlen（ASM 根本没有）、GQA 越界写的根治、确定性、以及形状/特性变化时不必等 AMD。
+  性能上我们的目标是<b>追平</b>，不是超越；目前 <b>7.50× 基线、差距 1.64×</b>，还在收敛。</p>
+  <p style="margin-bottom:0"><b>同时要诚实地说出成本和最高杠杆项</b>：这条线已花掉单卡八轮、两次需 AC-cycle 的挂卡；
+  而成本近零、杠杆最高的动作是<b>把 GQA bug 报给 aiter 并申请 gfx1250 的 <code>psskddv</code> / a16 / varlen 变体</b>。
+  <b>FlyDSL 是他们不发这些资产时的对冲</b> —— 这么讲，两件事就不是竞争关系了。</p>
+</div>
+
+<!-- ============================================================ QA2 -->
+<h2 id="qa2">会上可能被追问的其它问题</h2>
+
+<div class="qa">
+  <div class="q">"你们的卡限频，这些数字是不是都不可比？"</div>
+  <div class="a">
+    <p><b>方向对，幅度错 —— 限频只值约 13%，不是 2×。</b>
+    B0 的时钟是 A0 的 <b>2.13–2.24×</b>，而同代码、同形状、同一个 ASM 反向实现只快
+    <b>1.118× / 1.150× / 1.146×</b>（fwd / bwd / total）。</p>
+    <p style="margin-bottom:14px">结论：<b>gfx1250 上的 attention 几乎不受核心时钟限制</b>，
+    它受限于访存带宽或固定延迟，而 VR 限的是 sclk 不是 HBM。
+    换算过去：A0 的 <b>11.726 ms 在健康卡上约 10.2 ms</b>。</p>
+  </div>
+</div>
+
+<div class="qa">
+  <div class="q">"和 MI355 比怎么样？"</div>
+  <div class="a">
+    <p><b>前向我们是全表最快</b>：比 MI455 的 Flex 快 <b>2.10×</b>、比 MI355 的 AITER 快 <b>2.42×</b>
+    （用满频的 B0 则是 2.35× / 2.70×）。</p>
+    <p style="margin-bottom:14px"><b>反向是唯一的战场</b>：即便在满频的 B0 上，我们的 8.835 仍比 MI355 的 AITER 5.381 慢 <b>1.64×</b>。
+    bwd/fwd 比值：MI355 是 1.42，我们是 <b>6.28</b> —— <b>前向优化得太好，反而让反向的落后无处可躲。</b>
+    另一个参照：理想的 5 次矩阵乘结构下界是 5.48 ms，ASM 反向的 10.160 ms 约是它的 <b>1.85×</b>。</p>
+  </div>
+</div>
+
+<div class="qa">
+  <div class="q">"最快的那档为什么默认是关的？"</div>
+  <div class="a">
+    <p style="margin-bottom:14px">理由被修正过两次，<b>现在的理由不是"测不出收益"</b>（那个前提已被推翻，见
+    <a href="#asm-e2e">§1.3</a>），而是：它的收益依赖的 GEMM 绕路 <code>nkfix.py</code> 是
+    <b>运行时补丁而非产品代码</b>，且该绕路自身有 <b>21% 的 nan 率</b>待解决。
+    等 GEMM 走上正路，值得重新评估这个默认值。</p>
+  </div>
+</div>
+
+<div class="qa">
+  <div class="q">"Triton 那条线为什么不继续投？"</div>
+  <div class="a">
+    <p>三条 Triton 路径全部扫过：vendored 融合反向<b>九个轴全测，<code>256/32/32/4-warps</code> 严格局部最优</b>，
+    邻居更慢（有的 2×）；两 kernel 反向扫出真实 18%，<b>但仍比 ASM 慢 2.7×</b>；前向 −3.73%，只值 e2e 的 0.15%。</p>
+    <p style="margin-bottom:14px"><b>更关键的是结构上界</b>：调度良好的 Triton 在 AMD 上落在 issue-slot wall 的 1.3–1.5×，
+    即总时间 16.7–18.2 ms。<b>我们现在是 11.726 ms</b> —— Triton 不是"提升空间较小"，
+    而是<b>结构上就到不了我们已经在的位置</b>。要拿到剩下的空间得<b>重写 kernel</b>，不是调参。</p>
+  </div>
+</div>
+
+<!-- ============================================================ CORR -->
+<h2 id="corr">更正记录与口径注意</h2>
+
+<div class="note crit">
+  <span class="note-h">0917 正确性筛查 —— 三个已发布数字被下修</span>
+  <p>覆盖全部 <b>74 次</b>端到端运行（此前只按 tps 打分，从没看过 loss）：
+  <b>8 次运行的 loss 是 <code>nan</code></b>，而且<b>每一个 nan 运行都是它那一组里最快的那次</b>
+  —— 崩坏的计算通常更快。</p>
+  <div class="tw" style="margin:12px 0 0"><table>
+    <thead><tr><th>原报数字</th><th>更正为</th><th>原因</th></tr></thead>
+    <tbody>
+      <tr><td class="strike">ASM 反向 e2e +14.40%</td><td><b>+12.72%</b></td>
+        <td>ON 臂 <code>asm1-on</code>（nan×6，也是该臂最快）与 OFF 臂 <code>asm3-off</code>（nan×1）各剔除后重算：ON 42,534 / OFF 37,734。<b>效应依然真实且显著。</b></td></tr>
+      <tr><td class="strike">GEMM wgrad 38,043 tps / 6.21×（n=6）</td><td><b>37,746 tps / 6.16×</b>（n=5）</td>
+        <td>n=6 里含一次 20 步中 4 步 nan 的运行，且是六次里最高的一次。</td></tr>
+      <tr><td class="strike">32 层 11,608 tps / 5.85×，"三次成功一次"</td><td><b>整条作废</b></td>
+        <td>该运行 20 步中 <b>17 步 nan</b>，从 step 3 开始；它同时是"三次成功一次"里唯一那次"成功"，
+          所以 32 层的复现率<b>从未被真正测量过</b>。现在的 32 层结论另起于一对干净的同会话运行：14,050 vs 12,340。</td></tr>
+    </tbody>
+  </table></div>
+  <p class="foot"><b>算子级数字不受影响</b> —— 它们没有 loss 可筛。本文与 xlsx 均已采用更正值。</p>
+</div>
+
+<ol>
+  <li><b>跨机不可比。</b>A0 与 B0 的时钟差约 2×，本文<b>不做任何时钟折算</b>；
+    但幅度要说准，见 <a href="#qa2">"限频只值 13%"</a>。A0 限频，其 Hardware MFU 列不是效率的度量。</li>
+  <li><b>FLOP 约定。</b>causal：fwd = 2·b·hq·s²·d，bwd = 5·，合计 7·。
+    §1 三者都报；§2.3 / §2.4 是<b>纯反向</b>；§2.1 是<b>纯前向</b>。三者的 TF/s 不能互相比较。</li>
+  <li><b>锚点两个口径。</b>同一批 kernel 在 §2.3 读 7.68 ms、在 §1.2 读 10.160 ms：
+    op-evolve 只计三次 kernel 发射，产品路径还含 autograd 管路（约 1.4 ms）与 GQA host 规约。</li>
+  <li><b>FlyDSL 精度余量按设计就薄</b>：bf16 梯度把 SQNR 封在 52–53 dB，对 50 dB 闸门只剩约 2.5 dB。
+    且 <b>SQNR 在这个 op 上几乎什么都分辨不出</b> —— 能干活的是逐位比对。</li>
+  <li><b>每一轮的接受都基于同会话回文重测</b>，不是把吞吐列从上往下读：同一份代码跨会话漂约 1%。
+    每轮另有 200 次逐位确定性闸门。</li>
+  <li><b>不要引用本机 torchtitan 日志里的 MFU</b>：<code>get_peak_flops()</code> 对无法识别的
+    <code>device_name</code> 回退到"当作 A100"（312 TF/s），而本机报的是 "AMD Radeon Graphics"。</li>
+  <li><b>round 7 与 round 8 之间有一条 session 边界，绝对值不可跨它引用。</b>
+    同一份 round-7 代码（md5 <code>3ad59da722a4</code>）在两个 session 分别测 <b>382.73</b> 与 <b>404.06</b>
+    —— <b>+5.6% 而代码没动</b>，同期锚点只动了 −1.7%。round 8 的诚实增益是同 session 的 <b>1.063×</b>。
+    同理 <code>score</code> 从 0.42321 跳到 0.60244 <b>不是进步</b>（该 session 的锚点在 fast 上读低 57%、proxy 读低 19.5%）
+    —— <b>排名看 <code>gain</code> 和 prod，不要把 score 跨这条边界作图</b>。</li>
+  <li><b>卡的账目</b>：全程 <b>2 次需 AC-cycle 的挂卡</b>（09-21 16:01、09-22 14:26，后者在 round 8 运行中）。
+    恢复只用 AC-cycle：不 <code>modprobe -r</code>、不 <code>kill -9</code>、不做进一步探测 —— 那些都会把可恢复推向不可恢复。</li>
+  <li><b>作业已结束</b>：<code>best_round 8</code>，<code>op/current</code> 是 round 8 的码；
+    round 9 只跑了静态筛、<b>未记账</b>；节点于 09-22 16:10 交还（<code>.stop</code> 哨兵已写、持卡令牌已删），
+    当晚完成 AC-cycle，现由他人使用。<code>max_rounds</code> 为 12，<b>还剩 3 轮预算</b>。</li>
+  <li><b>一处记录瑕疵，如实记下</b>：<code>ROUND3-CLOSEOUT.md</code> 被截断在 16,384 B（末尾是填充空白），
+    <code>HANDOVER.md</code> 引用的"round 9 段"<b>实际不在文件里</b> —— 写入过程被挂卡打断。
+    本文的 round 9 内容是从 <code>r9probe/</code> 的 9 份 screen JSON 与 <code>round9.log</code> 重建的。</li>
+</ol>
+
+<!-- ============================================================ FILES -->
+<h2 id="files">文件清单</h2>
+
+<ul class="files">
+  <li><code>output/0922_summary/REPORT-0922.html</code> —— <b>本文</b>（汇总件）</li>
+  <li><code>output/0922_summary/ASM-ATTENTION.md</code> —— ASM 路线总结</li>
+  <li><code>output/0922_summary/FLYDSL-ATTENTION.md</code> —— FlyDSL 路线总结</li>
+  <li><code>output/0922_summary/mi455x-gfx1250-kernel-optimization.xlsx</code> ——
+    <code>attention</code> 页签已填（英文），结构：
+    <span class="cond">[0] 环境与来源 · [1] ASM 算子阶梯（fwd/bwd 分列）· [2] ASM 适配清单 ·
+    [3] ASM 端到端 · [4] FlyDSL 逐轮 · [5] 三形状 · [6] FlyDSL 前向 A/B · NOTES</span></li>
+</ul>
+
+<div class="note warn">
+  <span class="note-h">关于 xlsx 的一个提醒</span>
+  <p style="margin-bottom:0">该文件经 openpyxl 往返保存。其余 8 个页签的单元格内容<b>逐个核对无变化</b>，
+  但源文件里 openpyxl 不支持的<b>条件格式扩展可能被剥掉</b>（加载时有 warning）。
+  如果那些页签的条件格式必须保留，建议只把 <code>attention</code> 页签的内容拷进原始文件。</p>
+</div>
+
+<p class="foot" style="margin-top:40px">
+  生成于 2026-09-22 · 依据：<code>output/0922__flydsl/ROUND3-CLOSEOUT.md</code>、
+  op-evolve 作业 <code>gfx1250-flydsl-attn-bwd-20260917-115934</code> 的 <code>state.yaml</code> /
+  <code>act.yaml</code> / <code>opt.md</code>、<code>output/0917__flydsl/</code>、
+  <code>output/0915__opt/WEEKLY-EN.md</code> 与 <code>BACKEND-STRATEGY.md</code>、
+  <code>output/PROGRESS-REPORT-0917.html</code>（更正来源）、
+  <code>output/0922__flydsl/HANDOVER.md</code> 与 <code>r9probe/</code>。
+  本次汇总<b>未占用 GPU、未提交 commit</b>。
+</p>
+
+</div>
+</body>
+</html>

@@ -1646,3 +1646,55 @@ observed case here.
 (`PERMISSION_FAULTS: 0x3` and `RW: 0x0`, a read, against `0x5`/`RW: 0x1`, a write, here),
 it was the only event with an interrupt-ring overflow, and no isolation run exists for it.
 Do not assume round 14's finding explains it.
+
+### h22 addendum 4 — I do not have a wedge predictor, and I should stop inventing one
+
+This section has now named four discriminants and measurement has falsified every one.
+
+| named as the discriminant | falsified by |
+|---|---|
+| `PERMISSION_FAULTS: 0x5` + `RW: 0x1` (aperture class) | that exact signature survived, repeatedly |
+| `MORE_FAULTS: 0x1` | present in survivable bursts, including 8 of 8 |
+| faults across several XCDs | a survivable burst hit five |
+| **`IH ring buffer overflow`** | **8 overflows on 2026-09-24, card fine, 0 MES failures** |
+
+**So: there is no known predictor.** The only reliable signal is the MES failure sequence
+itself — `MES(...) failed to respond`, `failed to suspend all gangs`,
+`might be in unrecoverable state` — and that is the wedge happening, not a warning of it.
+
+**Operational rule, which does not need a predictor:** alarm on the MES lines and on
+`timeout 20 docker exec <container> true` failing to answer. Treat page faults, overflows
+and `MORE_FAULTS` as information, not as alerts. Do not stop a round for them.
+
+### Non-fatal page faults are normal here, and they do not corrupt results
+
+Measured 2026-09-24 while probing the fp32 reference at the production shape:
+
+- Three consecutive runs completed **3/3**, and the five output hashes were **identical**
+  across repeats in one process and across separate processes
+  (`o=7b0249a1cd82 lse=6fa4e0af2ed0 dq=bc919da8bcdb dk=2aee8288433b dv=d3f40069856d`).
+- **Ten GPU page faults were logged during those same runs.** Exit code 0, correct results.
+- The fault addresses are tiny and sub-4 GB: `0x47000`, `0x53000`, `0x55000`, `0x74000`,
+  `0x83000`, `0x87000` — the *aperture* pattern, not a kernel's own high user VA.
+- Occasionally one of these IS fatal: a run died with
+  `Memory access fault ... on address 0x87000`, exit 134, at an address seen non-fatally
+  in other runs.
+
+**Consequences for how to read a run:**
+1. **A page fault in `dmesg` is not evidence that the run was wrong.** Check the exit code
+   and the output. Results were bitwise correct through ten of them.
+2. **Conversely, a clean exit is not evidence of no faults.** They were invisible from
+   inside the process.
+3. This is the same small-address family the campaign filed as the memory-aperture class,
+   and it appears in the *reference* path with no candidate kernel involved. It is
+   plausibly the same defect as the sweep's fast→proxy transition faults. Do not attribute
+   it to a candidate without an isolation run.
+
+### A harness lesson that cost four commands
+
+A probe script was named `/tmp/bisect.py`. With `/tmp` as `sys.path[0]`, it **shadowed the
+standard library's `bisect`**, which torch imports transitively, and every run failed with
+`partially initialized module 'torch' has no attribute 'Generator'` — an error that reads
+like a GPU or environment problem and is neither. Renaming the file did not fix it; the
+stale copy had to be deleted from the container. **Never name a probe script after a stdlib
+module** (`bisect`, `random`, `types`, `queue`, `select`, `signal`, `copy`, `token`…).
