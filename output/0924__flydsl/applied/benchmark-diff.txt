@@ -1,0 +1,8 @@
+5c5
+< def measure(shape, arms, iters, warmup_seconds, causal=True):
+---
+> def measure(shape, arms, fns, iters, warmup_seconds, causal=True):
+15d14
+<     fns = {label: load_impl(path) for label, path in arms}
+21a21
+>         call(label)

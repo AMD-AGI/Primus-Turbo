@@ -235,22 +235,6 @@ op:
       `attn_bwd = asm_attn_bwd` (beat/impl.py:92) and
       `attn_bwd = eager_attn_bwd` (eager/impl.py:73).
 
-      ⚠ THE HAZARD IS COPY-PASTE, NOT AN EXISTING FILE. Job creation leaves
-      job_context/op/ EMPTY (op_evolve/core/job.py:204-213), so every file that will
-      name this attribute is a file YOU write. But op.reference.impl above tells you
-      to lift `forward_reference` out of the BACKWARD job's op/ut/common.py, and that
-      same file carries `getattr(mod, "attn_bwd", None)` at :104 and the error string
-      "defines no `attn_bwd`" at :106. **COPY THE FUNCTION, NEVER THE FILE.**
-      Sites that must read `attn_fwd`: op/ut/common.py's load_impl getattr and its
-      error string; the alias at the bottom of op/baseline/impl.py, op/beat/impl.py
-      and op/eager/impl.py; each of those directories' __init__.py; and every mention
-      in op/benchmark.py and op/validation.py.
-      op/baseline/impl.py ALREADY has `attn_fwd = flydsl_attn_fwd` at its line 124 --
-      match it, do not rename it.
-
-      GATE, before your step 6: `grep -rn 'attn_bwd' {{job_context_dir}}/op/` must
-      return ZERO lines. Paste that command and its empty output in your report.
-
       This is called out in the spec, loudly, precisely because it is a rename
       that fails LATE and LOUDLY in one place and SILENTLY in another: the
       loader raises AttributeError if a name is missing, but a job that renames
@@ -274,24 +258,6 @@ op:
     #        site-packages warning, jobs/turbo-flydsl-attn-fwd.yaml:76-80.)
     #      * The copy must be WHAT ACTUALLY GETS IMPORTED, and setup must PROVE
     #        it rather than assert it -- see baseline.import_proof below.
-    setup_branch: >
-      ⚠ SETUP: DO NOT WRITE A BASELINE.
-      Your prompt's step 1 offers exactly two branches -- adopt a matching corpus
-      recipe, or develop one from techniques.md. NEITHER APPLIES HERE. The baseline
-      already exists, complete and import-rewritten, at `root` below.
-      Your step 1 is literally:
-          cp -a <root>/. {{job_context_dir}}/op/baseline/
-      then confirm op/baseline/impl.py, op/baseline/_env.py and
-      op/baseline/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py all exist, and that
-      `python3 -m py_compile` passes on every .py under op/baseline/.
-      If the copy fails, or `root` is missing or empty, STOP AND REPORT. Do not fall
-      back to either prompt branch and do not write a kernel of your own.
-      For the record: the only flydsl attention recipe in the corpus,
-      knowledge/backends/flydsl/attention/recipes/hd64.md, declares arch gfx950 and
-      head dim 64 against this job's gfx1250 / q_head_dim 128 -- a POOR match, which
-      the corpus README says entitles you to take nothing from it.
-      Record the branch in op/baseline/PROVENANCE.md as: "neither corpus nor
-      from-scratch: baseline supplied by op.baseline.root, copied verbatim".
     root: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0923__flydsl/fwd-job/op_baseline
     root_note: >
       The vendored tree EXISTS at the `root` path above. It holds five files
@@ -398,35 +364,7 @@ op:
       commensurable. The TIME is the measurement; the TF/s is a derived unit.
 
   precision_sqnr_db: 50
-  precision_gate:
-  refcache: >
-    op/refcache/<shape>.pt holds `o` and `lse` ONLY -- no dq/dk/dv; this is a forward job.
-    WHERE THE REFERENCE IS STILL NEEDED: exactly ONE validation call site,
-    check_correctness, at all three shapes, plus op/ut/test_correctness.py.
-    It is NOT needed by the determinism gate (a forward's inputs are q,k,v, and the
-    200-run gate compares the candidate's own o/lse against itself) and NOT needed by
-    benchmark.py at all -- the backward needed it there only because o and lse were the
-    backward's INPUTS. So the fp32 reference leaves every round's timing subprocess.
-    ⚠ WHY IT IS WORTH BUILDING, stated from measurement rather than from the backward
-    job's history. The backward spec justified refcache by saying the prod-shape fp32
-    reference faults this card, and on 2026-09-22 it did cost a power cycle. THAT
-    JUSTIFICATION NO LONGER HOLDS AS WRITTEN: on 2026-09-24, with
-    HIPBLASLT_TENSILE_LIBPATH set (see runtime.env), the same call at prod ran clean in
-    0.88 s, three consecutive times, bitwise identical across separate processes
-    (o=7b0249a1cd82 lse=6fa4e0af2ed0). The original fault was the Tensile library
-    load-failure path, not the arithmetic.
-    What DOES remain, also measured that day: this machine emits intermittent non-fatal
-    GPU page faults at small sub-4GB addresses during otherwise-correct runs, and
-    occasionally one of them IS fatal to its process. A cached reference removes that
-    one remaining exposure from the gate for about 1 second per round of saved compute,
-    so build it -- but do NOT repeat the claim that the reference itself faults.
-    HOW: adapt Primus-Turbo/tools/gfx1250/build_refcache.py -- drop its
-    load_impl(OP/"eager") and the dq/dk/dv tensors, keep forward_reference and the
-    provenance block (shape, dims, seed, sha256 of eager/impl.py and ut/common.py).
-    ⚠ And keep any helper the cache needs OUTSIDE those two hashed files: the backward
-    job learned this the hard way (op/refcache_util.py:3-12), and it is why a later
-    poison_allocator fix could be shipped as op/poison_util.py without invalidating a
-    single cache entry. >
+  precision_gate: >
     ⚠ REWRITTEN for the forward. `o` and `lse` are checked SEPARATELY, each
     >= 50 dB against the fp32 reference (op.reference.impl), with the output
     buffers NaN-prefilled and full `isfinite` coverage asserted BEFORE SQNR is
@@ -531,18 +469,6 @@ op:
       ASM-forward with ABAB interleaving, a clock witness and NaN coverage
       exists and should be the blueprint for op/beat/ and op/baseline/:
       Primus-Turbo/output/0917__flydsl/bin/stage1_fwd_ab.py:20-21.
-      ⚠ op/beat/ NEEDS ITS OWN _env.py, AND IT IS NOT THE BASELINE'S.
-      runtime.python_path is documentation: nothing in the framework applies it
-      (grep -rn python_path over op_evolve/ and tools/ returns nothing). Each arm
-      sets its own sys.path. op/baseline/_env.py deliberately OMITS
-      /home/lihuzhan/code/aiter-src, so the vendored tree cannot silently reach the
-      installed package. op/beat/ is the opposite case -- it IS the installed
-      package -- so op/beat/_env.py MUST insert /home/lihuzhan/code/aiter-src on
-      sys.path before `from aiter.ops.mha import fmha_fwd_with_sink_asm`.
-      Note aiter/ops/mha.py:571-575 decorates that entry with
-      @compile_ops(..., ffi_type="ctypes"): the FIRST call JIT-builds a C++ module.
-      Build it at import or at first call, OUTSIDE every timing region, and report
-      the build time.
     beat_margin_pct: 0             # "by 0%" -- parity with the ASM forward is
                                    # the bar, matching job.description. Note this
                                    # is a HARDER 0% than the backward's: the
