@@ -2291,3 +2291,71 @@ worth a round **on its own merits** (dispatch, tail, LDS) independent of fusion.
 
 **Rule this round taught me:** when an estimate rests on an assumption I labelled
 "not computed", the assumption is the result. Compute it or do not publish the number.
+
+## h30 — MEASURED: the h29 compile probe closes single-wave fusion outright. Registers and bandwidth pull in opposite directions on BLOCK_Q and no value satisfies both.
+
+Zero card time. `rounds/002/_scratch/screen.py --impl op/current --set BLOCK_Q=<n>` under
+`COMPILE_ONLY=1 ARCH=gfx1250`, four compiles, all rc=0. Read from
+`21_final_isa.s` (`.vgpr_count`, `.vgpr_spill_count`, `.private_segment_fixed_size`):
+
+| BLOCK_Q | `.vgpr_count` | `.vgpr_spill_count` | scratch | verdict |
+|--:|--:|--:|--:|---|
+| 32 | 598 | 0 | 0 | pass |
+| **64 (shipped)** | **960** | **0** | **0** | pass |
+| 128 | 1023 | 1068 | 3604 | **KILL-spill** |
+| 256 | 1024 | 4903 | 9052 | **KILL-spill** |
+
+`k_dkdv_0` is spill-free at every one of the four (it does not depend on BLOCK_Q); only
+`k_dq_0` moves. Slope between the two clean points is **362 VGPR per +32 queries**
+(11.31 VGPR/query); extrapolating 960 + 362 = 1322 > 1024 predicts the BLOCK_Q=128 failure,
+and the compiler's observed 1023 + 1068 B of spill confirms it. **The model is calibrated,
+not assumed.**
+
+### The shipped kernel sits 64 VGPRs from the wall
+
+1024 - 960 = **64 VGPRs of headroom** at BLOCK_Q=64, i.e. 93.75% of the per-lane file in use
+at 1 wave/SIMD occupancy. `k_dq` was already at the cliff and nobody had measured it.
+
+### What a fused dK/dV accumulator costs, against that headroom
+
+k_dq's kv tile is `KV_STEP = 32` (`kernels.py:606`), D = 128, wave32:
+
+    dK accumulator = 32 keys x 128 cols x fp32 / 32 lanes = 128 VGPR
+    dK + dV                                               = 256 VGPR
+    available at BLOCK_Q=64                               =  64 VGPR
+    shortfall                                             = 192 VGPR (4.0x)
+
+### The contradiction, stated exactly
+
+- **Bandwidth** (h29) needs slots <= ~25 to break even, i.e. `Sq/BLOCK_Q <= 25`,
+  i.e. **BLOCK_Q >= 256**.
+- **Registers** (measured above) cap single-wave BLOCK_Q at **64**.
+
+Going the other way makes registers fit and bandwidth explode: at BLOCK_Q=32 the headroom is
+1024 - 598 = 426 VGPR, which *does* hold dK+dV's 256 — but the slot count becomes
+8192/32 = **256**, twice h29's already-fatal 128-slot row.
+
+**There is no single-wave BLOCK_Q that satisfies both accounts.** Single-wave fusion is closed
+by measurement, not by estimate. Add it to `dead_ends`.
+
+### What the probe does NOT close, and the honest caveat
+
+`--set BLOCK_Q=n` with `block=(32,1,1)` makes **one wave own more queries**. It does **not**
+test the multi-wave geometry where BLOCK_Q=256 is split across 4 waves at 64 queries each --
+there per-wave VGPR would stay at the measured 960/spill-0, because per-wave work is unchanged.
+So the multi-wave direction is **untested, not refuted**. Do not cite this probe against it.
+
+But multi-wave does not by itself solve fusion either: at 64 queries/wave the headroom is still
+64 VGPR against dK+dV's 256. **The only form in which fusion can fit is multi-wave with the
+dK/dV accumulators resident in LDS rather than registers.** That is affordable on paper --
+`k_dq` uses `.group_segment_fixed_size: 8704` of the 327680 B/CU available, and a
+`32 x 128 x fp32 x 2` accumulator tile is 32768 B -- but it requires the cross-wave barriers
+that round 8 deleted (`kernels.py:816, :838`, both commented "block=(32,1,1): the workgroup is
+ONE wave"), and h13's precondition therefore applies in full: **barriers back first, with
+explicit `rocdl.s_waitcnt(WAIT_LGKM)` ahead of each, verified bitwise-identical and
+zero-cost under the current single-wave launch, and only then the block-size change.**
+
+### Method note
+
+The BLOCK_Q sweep cost four CPU compiles and settled a question that two rounds of arithmetic
+could not. When a question is "does it fit", ask the compiler, not the spreadsheet.

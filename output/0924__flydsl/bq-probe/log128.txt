@@ -1,0 +1,203 @@
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/tmp/bq_probe/d128/k_delta_bshd_0
+[flydsl.compile] dump 00_origin -> /tmp/bq_probe/d128/k_delta_bshd_0/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /tmp/bq_probe/d128/k_delta_bshd_0/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /tmp/bq_probe/d128/k_delta_bshd_0/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_layout_lowering -> /tmp/bq_probe/d128/k_delta_bshd_0/03_fly_layout_lowering.mlir
+[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /tmp/bq_probe/d128/k_delta_bshd_0/04_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 05_canonicalize -> /tmp/bq_probe/d128/k_delta_bshd_0/05_canonicalize.mlir
+[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /tmp/bq_probe/d128/k_delta_bshd_0/06_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /tmp/bq_probe/d128/k_delta_bshd_0/07_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 08_convert_fly_to_rocdl -> /tmp/bq_probe/d128/k_delta_bshd_0/08_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 09_canonicalize -> /tmp/bq_probe/d128/k_delta_bshd_0/09_canonicalize.mlir
+[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl -> /tmp/bq_probe/d128/k_delta_bshd_0/10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 11_rocdl_attach_target -> /tmp/bq_probe/d128/k_delta_bshd_0/11_rocdl_attach_target.mlir
+[flydsl.compile] dump 12_convert_scf_to_cf -> /tmp/bq_probe/d128/k_delta_bshd_0/12_convert_scf_to_cf.mlir
+[flydsl.compile] dump 13_convert_cf_to_llvm -> /tmp/bq_probe/d128/k_delta_bshd_0/13_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 14_gpu_to_llvm -> /tmp/bq_probe/d128/k_delta_bshd_0/14_gpu_to_llvm.mlir
+[flydsl.compile] dump 15_convert_vector_to_llvm -> /tmp/bq_probe/d128/k_delta_bshd_0/15_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 16_convert_arith_to_llvm -> /tmp/bq_probe/d128/k_delta_bshd_0/16_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 17_convert_func_to_llvm -> /tmp/bq_probe/d128/k_delta_bshd_0/17_convert_func_to_llvm.mlir
+[flydsl.compile] dump 18_reconcile_unrealized_casts -> /tmp/bq_probe/d128/k_delta_bshd_0/18_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 19_gpu_module_to_binary -> /tmp/bq_probe/d128/k_delta_bshd_0/19_gpu_module_to_binary.mlir
+[flydsl.compile] dump 20_llvm_ir -> /tmp/bq_probe/d128/k_delta_bshd_0/20_llvm_ir.ll
+[flydsl.compile] dump 21_final_isa -> /tmp/bq_probe/d128/k_delta_bshd_0/21_final_isa.s
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/tmp/bq_probe/d128/k_dkdv_0
+[flydsl.compile] dump 00_origin -> /tmp/bq_probe/d128/k_dkdv_0/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /tmp/bq_probe/d128/k_dkdv_0/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /tmp/bq_probe/d128/k_dkdv_0/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_layout_lowering -> /tmp/bq_probe/d128/k_dkdv_0/03_fly_layout_lowering.mlir
+[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /tmp/bq_probe/d128/k_dkdv_0/04_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 05_canonicalize -> /tmp/bq_probe/d128/k_dkdv_0/05_canonicalize.mlir
+[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /tmp/bq_probe/d128/k_dkdv_0/06_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /tmp/bq_probe/d128/k_dkdv_0/07_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 08_convert_fly_to_rocdl -> /tmp/bq_probe/d128/k_dkdv_0/08_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 09_canonicalize -> /tmp/bq_probe/d128/k_dkdv_0/09_canonicalize.mlir
+[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl -> /tmp/bq_probe/d128/k_dkdv_0/10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 11_rocdl_attach_target -> /tmp/bq_probe/d128/k_dkdv_0/11_rocdl_attach_target.mlir
+[flydsl.compile] dump 12_convert_scf_to_cf -> /tmp/bq_probe/d128/k_dkdv_0/12_convert_scf_to_cf.mlir
+[flydsl.compile] dump 13_convert_cf_to_llvm -> /tmp/bq_probe/d128/k_dkdv_0/13_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 14_gpu_to_llvm -> /tmp/bq_probe/d128/k_dkdv_0/14_gpu_to_llvm.mlir
+[flydsl.compile] dump 15_convert_vector_to_llvm -> /tmp/bq_probe/d128/k_dkdv_0/15_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 16_convert_arith_to_llvm -> /tmp/bq_probe/d128/k_dkdv_0/16_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 17_convert_func_to_llvm -> /tmp/bq_probe/d128/k_dkdv_0/17_convert_func_to_llvm.mlir
+[flydsl.compile] dump 18_reconcile_unrealized_casts -> /tmp/bq_probe/d128/k_dkdv_0/18_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 19_gpu_module_to_binary -> /tmp/bq_probe/d128/k_dkdv_0/19_gpu_module_to_binary.mlir
+[flydsl.compile] dump 20_llvm_ir -> /tmp/bq_probe/d128/k_dkdv_0/20_llvm_ir.ll
+[flydsl.compile] dump 21_final_isa -> /tmp/bq_probe/d128/k_dkdv_0/21_final_isa.s
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/tmp/bq_probe/d128/k_dq_0
+[flydsl.compile] dump 00_origin -> /tmp/bq_probe/d128/k_dq_0/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /tmp/bq_probe/d128/k_dq_0/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /tmp/bq_probe/d128/k_dq_0/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_layout_lowering -> /tmp/bq_probe/d128/k_dq_0/03_fly_layout_lowering.mlir
+[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /tmp/bq_probe/d128/k_dq_0/04_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 05_canonicalize -> /tmp/bq_probe/d128/k_dq_0/05_canonicalize.mlir
+[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /tmp/bq_probe/d128/k_dq_0/06_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /tmp/bq_probe/d128/k_dq_0/07_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 08_convert_fly_to_rocdl -> /tmp/bq_probe/d128/k_dq_0/08_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 09_canonicalize -> /tmp/bq_probe/d128/k_dq_0/09_canonicalize.mlir
+[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl -> /tmp/bq_probe/d128/k_dq_0/10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 11_rocdl_attach_target -> /tmp/bq_probe/d128/k_dq_0/11_rocdl_attach_target.mlir
+[flydsl.compile] dump 12_convert_scf_to_cf -> /tmp/bq_probe/d128/k_dq_0/12_convert_scf_to_cf.mlir
+[flydsl.compile] dump 13_convert_cf_to_llvm -> /tmp/bq_probe/d128/k_dq_0/13_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 14_gpu_to_llvm -> /tmp/bq_probe/d128/k_dq_0/14_gpu_to_llvm.mlir
+[flydsl.compile] dump 15_convert_vector_to_llvm -> /tmp/bq_probe/d128/k_dq_0/15_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 16_convert_arith_to_llvm -> /tmp/bq_probe/d128/k_dq_0/16_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 17_convert_func_to_llvm -> /tmp/bq_probe/d128/k_dq_0/17_convert_func_to_llvm.mlir
+[flydsl.compile] dump 18_reconcile_unrealized_casts -> /tmp/bq_probe/d128/k_dq_0/18_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 19_gpu_module_to_binary -> /tmp/bq_probe/d128/k_dq_0/19_gpu_module_to_binary.mlir
+[flydsl.compile] dump 20_llvm_ir -> /tmp/bq_probe/d128/k_dq_0/20_llvm_ir.ll
+[flydsl.compile] dump 21_final_isa -> /tmp/bq_probe/d128/k_dq_0/21_final_isa.s
+{
+ "witness": {
+  "arch": "gfx1250",
+  "warp_size": 32,
+  "flydsl_version": "0.3.2",
+  "flydsl_file": "/home/lihuzhan/.local/flydsl032/flydsl/__init__.py",
+  "compile_only": "1",
+  "env_ARCH": "gfx1250",
+  "env_FLYDSL_GPU_ARCH": "gfx1250",
+  "aiter_shims": {
+   "aiter.ops.flydsl.kernels.kernels_common": "/home/lihuzhan/code/aiter-src/aiter/ops/flydsl/kernels/kernels_common.py",
+   "aiter.ops.flydsl.kernels.tensor_shim": "/home/lihuzhan/code/aiter-src/aiter/ops/flydsl/kernels/tensor_shim.py"
+  }
+ },
+ "impl": "/tmp/bq_probe/w128/current",
+ "source_impl": "/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/current",
+ "tag": "bq128",
+ "overrides": {
+  "BLOCK_Q": {
+   "from": "64",
+   "to": "128"
+  }
+ },
+ "shape": {
+  "b": 4,
+  "sq": 8192,
+  "skv": 8192,
+  "hq": 32,
+  "hkv": 8
+ },
+ "built": {
+  "delta": {
+   "ok": true
+  },
+  "dkdv": {
+   "ok": true
+  },
+  "dq": {
+   "ok": true
+  }
+ },
+ "isa": {
+  "k_delta_bshd_0": {
+   "path": "/tmp/bq_probe/d128/k_delta_bshd_0/21_final_isa.s",
+   "bytes": 14646,
+   "target": "amdgcn-amd-amdhsa-unknown-gfx1250",
+   "target_ok": true,
+   "wave32": true,
+   "next_free_vgpr": 40,
+   "next_free_sgpr": 19,
+   "private_segment_fixed_size": 0,
+   "group_segment_fixed_size": 0,
+   "total_instr": 256,
+   "ops": {
+    "v_wmma_f32_16x16x32_bf16": 0,
+    "ds_load_tr16_b128": 0,
+    "ds_read_b128": 0,
+    "ds_write_b128": 0,
+    "s_barrier": 0,
+    "buffer_load_dwordx4": 0,
+    "buffer_store_dwordx4": 0,
+    "v_exp_f32": 0,
+    "s_set_vgpr_msb": 0,
+    "scratch_": 0,
+    "global_load_lds": 0,
+    "s_wait_dscnt": 0,
+    "s_wait_asynccnt": 0,
+    "sched_barrier": 0
+   },
+   "spill": 0,
+   "verdict": "pass"
+  },
+  "k_dkdv_0": {
+   "path": "/tmp/bq_probe/d128/k_dkdv_0/21_final_isa.s",
+   "bytes": 148574,
+   "target": "amdgcn-amd-amdhsa-unknown-gfx1250",
+   "target_ok": true,
+   "wave32": true,
+   "next_free_vgpr": 724,
+   "next_free_sgpr": 78,
+   "private_segment_fixed_size": 0,
+   "group_segment_fixed_size": 70656,
+   "total_instr": 2940,
+   "ops": {
+    "v_wmma_f32_16x16x32_bf16": 128,
+    "ds_load_tr16_b128": 80,
+    "ds_read_b128": 0,
+    "ds_write_b128": 0,
+    "s_barrier": 0,
+    "buffer_load_dwordx4": 0,
+    "buffer_store_dwordx4": 0,
+    "v_exp_f32": 64,
+    "s_set_vgpr_msb": 334,
+    "scratch_": 0,
+    "global_load_lds": 0,
+    "s_wait_dscnt": 14,
+    "s_wait_asynccnt": 0,
+    "sched_barrier": 0
+   },
+   "spill": 0,
+   "verdict": "pass"
+  },
+  "k_dq_0": {
+   "path": "/tmp/bq_probe/d128/k_dq_0/21_final_isa.s",
+   "bytes": 436105,
+   "target": "amdgcn-amd-amdhsa-unknown-gfx1250",
+   "target_ok": true,
+   "wave32": true,
+   "next_free_vgpr": 1023,
+   "next_free_sgpr": 45,
+   "private_segment_fixed_size": 3604,
+   "group_segment_fixed_size": 8704,
+   "total_instr": 8910,
+   "ops": {
+    "v_wmma_f32_16x16x32_bf16": 384,
+    "ds_load_tr16_b128": 32,
+    "ds_read_b128": 0,
+    "ds_write_b128": 0,
+    "s_barrier": 0,
+    "buffer_load_dwordx4": 0,
+    "buffer_store_dwordx4": 0,
+    "v_exp_f32": 256,
+    "s_set_vgpr_msb": 2038,
+    "scratch_": 772,
+    "global_load_lds": 0,
+    "s_wait_dscnt": 10,
+    "s_wait_asynccnt": 0,
+    "sched_barrier": 0
+   },
+   "spill": 4376,
+   "verdict": "KILL-spill"
+  }
+ }
+}
