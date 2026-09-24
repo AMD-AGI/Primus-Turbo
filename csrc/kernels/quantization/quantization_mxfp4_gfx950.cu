@@ -88,11 +88,77 @@ constexpr float kHadamard32Norm = 0.1767578125f;
 // csrc/include/mx_quant_utils.h, which is its default round mode.
 constexpr float kFp4InvMaxPos = 1.0f / 6.0f;
 
-constexpr int TILE_M            = 64;
-constexpr int kDefaultTileN     = 64;
-constexpr int THREADS_PER_BLOCK = 128;
+// Blocking. Overridable so the shape can be swept without editing, exactly as the MXFP6
+// packer parametrises MXFP6_TILE_M / MXFP6_TILE_N / MXFP6_THREADS_PER_BLOCK. The defaults
+// below are the measured winners; see RESULTS_mxfp4_packer.md for the sweep.
+//
+// TILE_M and TILE_N are multiples of kGroupSize so a staged patch holds whole 32-value
+// groups both ways, and divide 256 so a 256-aligned operand tiles exactly.
+#ifndef MXFP4_TILE_M
+#define MXFP4_TILE_M 64
+#endif
+#ifndef MXFP4_TILE_N
+#define MXFP4_TILE_N 128
+#endif
+#ifndef MXFP4_THREADS_PER_BLOCK
+#define MXFP4_THREADS_PER_BLOCK 256
+#endif
+constexpr int TILE_M            = MXFP4_TILE_M;
+constexpr int kDefaultTileN     = MXFP4_TILE_N;
+constexpr int THREADS_PER_BLOCK = MXFP4_THREADS_PER_BLOCK;
 
 using uint4_t = uint32_t __attribute__((ext_vector_type(4)));
+
+// 16-byte staging vector: the widest load that keeps one thread on one contiguous run of
+// a row. s_tile rows are TILE_N * 2 bytes, a multiple of 16, so the shared-memory store is
+// aligned whenever local_n is a multiple of kStageVec.
+constexpr int kStageVec = 8;
+using stage_vec_t = uint16_t __attribute__((ext_vector_type(kStageVec)));
+
+// Pad each LDS row so the column gather does not serialise on one bank. A compact
+// TILE_N=64 row of uint16 is 128 bytes, which is exactly the width of the 32 4-byte banks,
+// so `s_tile[i][n]` for consecutive `i` lands in the *same* bank every time -- a 32-way
+// conflict on the direction that exists to avoid materialising a transpose. Eight uint16
+// of padding shifts consecutive rows 4 banks apart and keeps every row 16-byte aligned for
+// the vector staging store. The MXFP6 packer pads for the same reason (LDS_PAD there).
+constexpr int LDS_PAD = 8;
+
+// Direct-to-LDS staging. `buffer_load_lds` writes HBM straight into LDS without the data
+// passing through VGPRs, which is what lets the MXFP6 packer sit at HBM bandwidth. Without
+// it this kernel reached only about two thirds of MXFP6's bandwidth on the same read and a smaller
+// write -- the gap was never the arithmetic (ablating the whole FP4 conversion and the
+// bf16 rounding moved the total by 0.7%) and never LDS bank conflicts.
+//
+// The instruction lays each wave's lane payloads out contiguously, so it needs the compact
+// pitch; the padded pitch is kept for the fallback, where the column gather would otherwise
+// serialise on one bank.
+#ifndef MXFP4_ASYNC_STAGE
+#define MXFP4_ASYNC_STAGE 1
+#endif
+constexpr bool kAsyncStage = MXFP4_ASYNC_STAGE && TILE_M == 64 &&
+                             (kDefaultTileN == 64 || kDefaultTileN == 128) &&
+                             THREADS_PER_BLOCK == 256;
+constexpr int LDS_PITCH = kAsyncStage ? MXFP4_TILE_N : (MXFP4_TILE_N + LDS_PAD);
+
+using as3_uint32_ptr = uint32_t __attribute__((address_space(3))) *;
+using int32x4_t      = int32_t __attribute__((ext_vector_type(4)));
+
+// Clang's raw_ptr builtin only accepts 1/2/4-byte widths, while the LLVM intrinsic and the
+// gfx950 ISA accept a 16-byte lane payload. Declared the same way the MXFP6 packer does.
+extern "C" __device__ void llvm_amdgcn_raw_buffer_load_lds(
+    int32x4_t resource, as3_uint32_ptr lds_base, int size, int voffset, int soffset, int offset,
+    int aux) __asm("llvm.amdgcn.raw.buffer.load.lds");
+
+__device__ __forceinline__ int32x4_t make_buffer_resource_vec(const void *ptr, uint32_t bytes) {
+    const uint64_t address = reinterpret_cast<uint64_t>(ptr);
+    return int32x4_t{static_cast<int32_t>(address), static_cast<int32_t>(address >> 32),
+                     static_cast<int32_t>(bytes), 0x00020000};
+}
+
+__device__ __forceinline__ void async_load_lds_16(int32x4_t resource, as3_uint32_ptr lds_base,
+                                                  int32_t byte_offset) {
+    llvm_amdgcn_raw_buffer_load_lds(resource, lds_base, 16, byte_offset, 0, 0, 0);
+}
 
 constexpr int ceil_div(const int x, const int m) {
     return (x + m - 1) / m;
@@ -152,13 +218,23 @@ __device__ __forceinline__ void mxfp4_emit_group(float (&values)[kGroupSize],
         }
     }
 
+    // Ablation hooks. Diagnostics only -- each one makes the blob wrong, and they exist to
+    // attribute the packer's time rather than to be shipped. See RESULTS_mxfp4_packer.md.
+#ifndef MXFP4_ABLATE_BF16
+#define MXFP4_ABLATE_BF16 0
+#endif
+#ifndef MXFP4_ABLATE_CVT
+#define MXFP4_ABLATE_CVT 0
+#endif
     // Round the rotated values through bf16. Also MXFP4-specific: the MXFP6 packer feeds
     // the conversion full fp32. E2M1 has so few levels that the extra rounding costs
     // nothing, but it moves values sitting near a code boundary, so omitting it shifts
     // roughly 1% of codes and a fifth of a percent of the block scales.
+#if !MXFP4_ABLATE_BF16
 #pragma unroll
     for (int i = 0; i < kGroupSize; ++i)
         values[i] = static_cast<float>(static_cast<bfloat16>(values[i]));
+#endif
 
     // Seeded at 1e-10 rather than 0, matching AITER's group_amax under RoundUp: it floors
     // the scale for an all-zero group so RCEIL cannot emit byte 0 there. Above that floor
@@ -191,7 +267,7 @@ __device__ __forceinline__ void mxfp4_emit_group(float (&values)[kGroupSize],
     // checked in the frontend before unrolling. Hence the explicit four, matching the
     // reference packer's `static_for` over the same range.
     uint4_t words = {0u, 0u, 0u, 0u};
-#if defined(__gfx950__)
+#if defined(__gfx950__) && !MXFP4_ABLATE_CVT
     if (amax != 0.0f) {
 #pragma unroll
         for (int w = 0; w < 4; ++w) {
@@ -245,23 +321,76 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp4_kernel(
     const int32_t row_nk_pad, const int32_t col_nk_pad) {
     static_assert(TILE_N % kGroupSize == 0, "a staged patch must hold whole groups both ways");
 
-    __shared__ uint16_t s_tile[TILE_M][TILE_N];
+    __shared__ uint16_t s_tile[TILE_M][LDS_PITCH];
 
     const int32_t tile_m = blockIdx.y * TILE_M;
     const int32_t tile_n = blockIdx.x * TILE_N;
 
-    for (int idx = threadIdx.x; idx < TILE_M * TILE_N; idx += THREADS_PER_BLOCK) {
-        const int      local_m  = idx / TILE_N;
-        const int      local_n  = idx % TILE_N;
-        const int32_t  global_m = tile_m + local_m;
-        const int32_t  global_n = tile_n + local_n;
-        const bool     inside   = global_m < M && global_n < N;
-        s_tile[local_m][local_n] =
-            inside ? reinterpret_cast<const uint16_t *>(input)[static_cast<int64_t>(global_m) * N +
-                                                               global_n]
-                   : uint16_t{0};
+    // Stage in 16-byte chunks. A scalar 2-byte load per element leaves this kernel about
+    // 3x off HBM bandwidth -- measured 74 us against the MXFP6 packer's 26.6 us on
+    // 12288x3072, for *less* traffic -- because the packer is memory bound and eight
+    // half-width loads cost eight issues where one costs one. TILE_N and every Flux weight
+    // dimension are multiples of kStageVec, so the vector path takes every full tile and
+    // the scalar tail only runs on a ragged edge.
+    const uint16_t *in16 = reinterpret_cast<const uint16_t *>(input);
+    constexpr int   kChunksPerRow = TILE_N / kStageVec;
+
+    // A block whose tile lies wholly inside the operand can take the direct-to-LDS path.
+    // A ragged edge one cannot: `buffer_load_lds` has no per-lane predication here, and the
+    // out-of-range rows have to read as zero rather than as whatever follows the tensor.
+    const bool async_full_tile = tile_m + TILE_M <= M && tile_n + TILE_N <= N;
+    if constexpr (kAsyncStage) {
+        if (async_full_tile) {
+            // Each pass stages THREADS_PER_BLOCK * kStageVec elements, i.e. that many
+            // halves laid out as whole rows of TILE_N.
+            constexpr int kAsyncStageRows = THREADS_PER_BLOCK * kStageVec / TILE_N;
+            constexpr int kAsyncStages    = TILE_M / kAsyncStageRows;
+            constexpr int kWaveRows       = 64 * kStageVec / TILE_N;
+            constexpr int kVecsPerRow     = TILE_N / kStageVec;
+            static_assert(TILE_M % kAsyncStageRows == 0, "TILE_M must divide into whole stages");
+
+            const auto input_resource_vec = make_buffer_resource_vec(
+                input, static_cast<uint32_t>(int64_t(M) * N * sizeof(DType)));
+            const int wave = threadIdx.x >> 6;
+#pragma unroll
+            for (int stage = 0; stage < kAsyncStages; ++stage) {
+                const int local_m  = threadIdx.x / kVecsPerRow;
+                const int local_n  = (threadIdx.x % kVecsPerRow) * kStageVec;
+                const int global_m = tile_m + stage * kAsyncStageRows + local_m;
+                const int byte_offset =
+                    static_cast<int>((int64_t(global_m) * N + tile_n + local_n) * sizeof(DType));
+                const uintptr_t tile_lds_base = reinterpret_cast<uintptr_t>(
+                    &s_tile[stage * kAsyncStageRows + wave * kWaveRows][0]);
+                async_load_lds_16(input_resource_vec,
+                                  reinterpret_cast<as3_uint32_ptr>(tile_lds_base), byte_offset);
+            }
+            __syncthreads();
+            goto staged;
+        }
+    }
+
+    for (int idx = threadIdx.x; idx < TILE_M * kChunksPerRow; idx += THREADS_PER_BLOCK) {
+        const int     local_m  = idx / kChunksPerRow;
+        const int     local_n  = (idx % kChunksPerRow) * kStageVec;
+        const int32_t global_m = tile_m + local_m;
+        const int32_t global_n = tile_n + local_n;
+
+        stage_vec_t staged;
+        if (global_m < M && global_n + kStageVec <= N) {
+            staged = *reinterpret_cast<const stage_vec_t *>(
+                &in16[static_cast<int64_t>(global_m) * N + global_n]);
+        } else {
+#pragma unroll
+            for (int i = 0; i < kStageVec; ++i)
+                staged[i] = (global_m < M && global_n + i < N)
+                                ? in16[static_cast<int64_t>(global_m) * N + global_n + i]
+                                : uint16_t{0};
+        }
+        *reinterpret_cast<stage_vec_t *>(&s_tile[local_m][local_n]) = staged;
     }
     __syncthreads();
+
+staged:;
 
     const int slot = threadIdx.x;
 

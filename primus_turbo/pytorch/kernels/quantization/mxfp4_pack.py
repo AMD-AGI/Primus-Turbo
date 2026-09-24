@@ -28,9 +28,13 @@ the same E8M0 scale plane -- so the constants below mirror it. The one that diff
 value in one compact plane where E2M3 spends 6 across a C0 and a C1 plane.
 """
 
+import functools
+import inspect
 from typing import Optional, Tuple
 
 import torch
+
+from primus_turbo.common.aiter_utils import get_aiter
 
 from primus_turbo.pytorch.core.low_precision import (
     MXFP4_BLOCK_SIZE,
@@ -43,12 +47,24 @@ from primus_turbo.pytorch.core.low_precision import (
 from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import check_mxfp6_support
 
 __all__ = [
+    "aiter_has_a6w4_bias_epilogue",
+    "check_a6w4_support",
     "mxfp4_data_region",
     "mxfp4_gemm_pack_sizes",
     "quantize_mxfp4_gemm_col",
     "quantize_mxfp4_gemm_dual",
     "quantize_mxfp4_gemm_row",
 ]
+
+# What an aiter must expose for A6W4 to be usable. `gemm_a6w4` and its packer both
+# landed in ROCm/aiter#5587; an aiter predating it runs MXFP6 perfectly well and simply
+# cannot do A6W4, which is a configuration error rather than a crash.
+_A6W4_REQUIRED_ATTRS = ("gemm_a6w4", "quant_mxfp4_gemm")
+
+_MISSING_A6W4_HINT = (
+    "A6W4 (MXFP6 activations x MXFP4 weights) needs an aiter carrying the A6W4 asm GEMM "
+    "from ROCm/aiter#5587. Set mxfp6_weight_format='mxfp6' to stay on A6W6"
+)
 
 
 def _ceil(x: int, m: int) -> int:
@@ -64,6 +80,52 @@ def _require_supported(device: Optional[torch.device] = None) -> None:
     supported, reason = check_mxfp6_support(device)
     if not supported:
         raise RuntimeError(reason)
+
+
+@functools.lru_cache(maxsize=1)
+def check_a6w4_support(device: Optional[torch.device] = None) -> Tuple[bool, str]:
+    """Whether A6W4 is usable here: everything MXFP6 needs, plus the A6W4 entry points.
+
+    Probed rather than version-checked, like ``check_mxfp6_support``: no version string
+    can express "contains commit X". A6W4 is a strict superset of A6W6's requirements,
+    because its activation operand comes from the MXFP6 packer, so the MXFP6 gate runs
+    first and its message is returned unchanged when it is the one that fails.
+    """
+    supported, reason = check_mxfp6_support(device)
+    if not supported:
+        return False, reason
+    try:
+        aiter = get_aiter()
+    except ImportError as exc:
+        return False, f"{_MISSING_A6W4_HINT} ({exc})"
+    missing = [a for a in _A6W4_REQUIRED_ATTRS if not hasattr(aiter, a)]
+    if missing:
+        return False, f"{_MISSING_A6W4_HINT} (missing: {', '.join(missing)})"
+    return True, ""
+
+
+@functools.lru_cache(maxsize=1)
+def aiter_has_a6w4_bias_epilogue() -> bool:
+    """Whether ``aiter.gemm_a6w4`` can fold a bias into its store epilogue.
+
+    Probed by parameter rather than by symbol, and for the same reason as
+    ``aiter_has_bias_epilogue``: the entry point is the same one either way and only its
+    signature changed, so ``hasattr`` cannot tell the two apart. Upstream's A6W4 has no
+    epilogue; ours does, and an aiter without it gets the separate elementwise pass.
+    """
+    try:
+        aiter = get_aiter()
+    except ImportError:
+        return False
+    fn = getattr(aiter, "gemm_a6w4", None)
+    if fn is None:
+        return False
+    try:
+        return "bias" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        # No introspectable signature. Answering "no" costs one pass over the output;
+        # answering "yes" wrongly is a TypeError at the first GEMM.
+        return False
 
 
 def mxfp4_gemm_pack_sizes(rows: int, k: int) -> Tuple[int, int]:

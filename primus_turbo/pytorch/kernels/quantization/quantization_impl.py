@@ -1228,3 +1228,76 @@ def quantize_mxfp6_qk_norm_rope_bwd_impl_meta(
         empty((partial_rows, num_heads, head_dim)),
         empty((partial_rows, num_heads, head_dim)),
     )
+
+
+# ---------------------------------------------------------------------------
+# MXFP4 GEMM-blob packing, for A6W4's weight operand.
+#
+# Mirrors the MXFP6 pair above one for one. Separate ops rather than a format flag on
+# those, because the blob sizes differ and the fake kernels have to say so -- a flag
+# would make the output shapes data-dependent, which is exactly what a fake cannot be.
+# ---------------------------------------------------------------------------
+@torch.library.custom_op("primus_turbo::quantize_mxfp4_gemm_impl", mutates_args=(), device_types="cuda")
+def quantize_mxfp4_gemm_impl(
+    x: torch.Tensor,
+    axis: int = -1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pack ``x`` along one axis into the A6W4 weight blob, ``(operand, scale)``."""
+    from primus_turbo.pytorch.kernels.quantization.mxfp4_pack import (
+        quantize_mxfp4_gemm_col,
+        quantize_mxfp4_gemm_row,
+    )
+
+    return (
+        quantize_mxfp4_gemm_col(x) if axis in (0, -2) else quantize_mxfp4_gemm_row(x)
+    )
+
+
+@quantize_mxfp4_gemm_impl.register_fake
+def quantize_mxfp4_gemm_impl_meta(
+    x: torch.Tensor,
+    axis: int = -1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    from primus_turbo.pytorch.kernels.quantization.mxfp4_pack import mxfp4_gemm_pack_sizes
+
+    if x.dim() != 2:
+        raise ValueError(f"MXFP4 GEMM packing expects a 2D tensor, got {x.dim()}D")
+    rows, cols = x.shape
+    if axis in (0, -2):
+        rows, cols = cols, rows
+    operand_bytes, scale_bytes = mxfp4_gemm_pack_sizes(rows, cols)
+    return (
+        torch.empty(operand_bytes, dtype=torch.uint8, device=x.device),
+        torch.empty(scale_bytes, dtype=torch.uint8, device=x.device),
+    )
+
+
+@torch.library.custom_op(
+    "primus_turbo::quantize_mxfp4_gemm_dual_impl", mutates_args=(), device_types="cuda"
+)
+def quantize_mxfp4_gemm_dual_impl(
+    x: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pack ``x`` along both axes, returning ``(row, row_scale, col, col_scale)``.
+
+    A6W4 needs the weight in both: row for the forward, column for dgrad. wgrad contracts
+    the token dimension and never reads the weight, so there is no third direction.
+    """
+    from primus_turbo.pytorch.kernels.quantization.mxfp4_pack import quantize_mxfp4_gemm_dual
+
+    return quantize_mxfp4_gemm_dual(x)
+
+
+@quantize_mxfp4_gemm_dual_impl.register_fake
+def quantize_mxfp4_gemm_dual_impl_meta(
+    x: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from primus_turbo.pytorch.kernels.quantization.mxfp4_pack import mxfp4_gemm_pack_sizes
+
+    if x.dim() != 2:
+        raise ValueError(f"MXFP4 GEMM packing expects a 2D tensor, got {x.dim()}D")
+    rows, cols = x.shape
+    row_operand, row_scale = mxfp4_gemm_pack_sizes(rows, cols)
+    col_operand, col_scale = mxfp4_gemm_pack_sizes(cols, rows)
+    empty = lambda n: torch.empty(n, dtype=torch.uint8, device=x.device)  # noqa: E731
+    return empty(row_operand), empty(row_scale), empty(col_operand), empty(col_scale)

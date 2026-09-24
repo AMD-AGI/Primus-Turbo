@@ -39,6 +39,7 @@ the better oracle anyway -- it does not route through the code under test.
 """
 
 import functools
+import os
 import inspect
 from typing import Optional, Tuple
 
@@ -116,6 +117,11 @@ def aiter_has_bias_epilogue() -> bool:
     once per GEMM: ``inspect.signature`` costs more than it looks, and a Flux 12B step
     makes a few hundred of these calls. Tests that fake an aiter must ``cache_clear()``.
     """
+    # Diagnostic override. A6W4 has no bias epilogue, so knowing what A6W6's is worth
+    # end to end is what decides whether porting one into the A6W4 generator is justified.
+    # Forcing the fallback here measures exactly that, on an otherwise identical arm.
+    if os.environ.get("PRIMUS_TURBO_DISABLE_A6W6_BIAS_EPILOGUE", "") not in ("", "0"):
+        return False
     try:
         aiter = get_aiter()
     except ImportError:
