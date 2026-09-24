@@ -65,7 +65,10 @@ def measure(impl_dir: Path, shapes):
     # (same binary, same six arms including beat, same cold JIT cache, split per shape) is
     # rc=0 three times. facts.md:241 ratified "one benchmark process per shape" rounds ago,
     # but it only ever reached the hand-written meas scripts -- this line still said
-    # ",".join(shapes), which is the direct source of the round 17 and round 18 wedges.
+    # ",".join(shapes), which is the direct source of the round 17 fault and the round 18 wedge.
+    # (Verified end of day: ONE wedge and ONE AC cycle today -- single boot boundary at
+    # 09:14:30. Round 17's 07:58:04 fault carried the same RW=0x1 / PERMISSION_FAULTS 0x5
+    # signature and did NOT wedge the card.)
     #
     # This removes no out-of-bounds access. It removes the isolated trigger, and it stops
     # feeding further shapes to an already-sick card (rounds/003/_scratch/gpu2/out:9-18 is

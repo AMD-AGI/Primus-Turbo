@@ -9,7 +9,7 @@ baseline, no KFD PIDs, dmesg zero amdgpu events, container `fa-repro` stopped.
 |---|---|
 | champion | **round 20** (`best_round: 20`, `op/current` byte-identical to `rounds/020/op`) |
 | prod | **511.42 TF/s** in round 20's own sweep; **516.87** re-measured in round 22's |
-| bar | **7.67 ms / 716 TF/s** (median of n=177 in-tree measurements, sd 0.47%) |
+| bar | **7.68 ms / 716 TF/s** (median 7.6766 over n=224 raw / 7.6769 over n=146 deduped; sd 0.47-0.50%; min 7.6077, max 7.7556, **zero records >= 7.8 ms**) |
 | ratio | **0.72x** (was 0.696x at start of day) |
 | rounds | 22/40 settled; round 23 stopped mid-`opt`, leaves a partial `1-opt` that the next
 `resume` will move aside automatically |
@@ -32,13 +32,17 @@ traffic, a WMMA count or an LDS op count:
 |---|---|--:|
 | `g62` k_dkdv prefetch depth 1→2 | +~1 iteration | **+1.65%** |
 | `g28` | reduced | −7.8% |
-| `g66` spread k_dq's 32 loads | collapsed | −19.33% |
-| `g68` spread k_dkdv's 32 loads | ~603 → ~41 instr | **−30.32%** |
+| `g63` k_dq prefetch depth 1→2 | — | −19.33% |
+| `g66` spread k_dq's 32 loads (pure reorder, VGPR flat) | collapsed | **−21.93%** |
+| `g68` spread k_dkdv's 32 loads (pure reorder, VGPR flat) | ~603 → ~41 instr | **−30.0%** |
 | `P70` delete k_dq's prefetch | to zero | −10.86% |
 
-Round 22 wrote "A68 loses 20–30% of prod" **before** the card and measured −30.0%.
-A pure reordering costing 30% is also the strongest remaining evidence against any
-bandwidth reading of this kernel.
+Round 22 wrote "A68 loses 20–30% of prod" and measured −30.0%. **Caveat: that is
+self-reported pre-registration** — `act.yaml`'s mtime postdates the measurement, so only the
+model's inputs are provably prior. Only `g66` and `g68` are equal-register pure reorders;
+`g62` is a prefetch deepening, `g28` an unroll, `P70` a deletion. The argument needs only
+those two and they carry it: a pure reordering costing 30% is the strongest remaining
+evidence against any bandwidth reading of this kernel.
 
 ## Hypotheses closed by measurement today
 
@@ -47,18 +51,27 @@ pressure** · power/clock throttling · fusion (both orientations) · static ISA
 ranking signal · the "tighten k_dq" axis
 
 Notable kills: `P3` deleted **all 80 LDS ops** with WMMA count unchanged and ran 8.19%
-slower. `g60` deleted 82 issue slots and ran 17.27% slower. A 60-point power trace showed
-the package sensor is static (855.0 W idle vs 853 W under load) and sclk flat at 1100 MHz
-for 60/60 samples, retiring "the card was throttling".
+slower. `g60` deleted **115** issue slots (`s_set_vgpr_msb` −57, `v_nop` −58) and ran 17.27%
+slower.
+
+> ⚠ **RETRACTED at end of day: power/clock was NOT closed.** The 60-sample trace behind that
+> claim was taken with **nothing running** — `pw.sh:12`'s `--arms cur_a` made `benchmark.py`
+> exit 2 into `/dev/null` while the script's `wait` reported rc=0. The real 264-sample trace
+> across the scored block has 1100 MHz on 67 samples and **<= 1030 MHz on 185**: 1100 is the
+> *idle* clock and the prod window runs 998–1029 MHz, ~9% droop. Package power was never
+> sampled under load at all. Same-session palindromic A/B still exposes every arm to the same
+> droop, so A/B **deltas** stand; the absolute clock claim does not.
 
 ## The bar was wrong all day and is now right
 
 The recorded **10.160 ms** anchor traces to `output/0915__opt/status.json:34-38` — an
 autograd measurement shim (`tune_attention.py:560-578`) driven through `out.backward()`
-passing neither `hip=` nor `scratch=`. **It was retracted the same day** (09-15 09:33: shim
-10.062 vs corrected path 8.13) and the retraction never propagated. Measured causes, by
-controlled isolation: per-call `HipModule()` + 3× `hipModuleLoad` **+1.15 ms**, autograd
-plumbing **+1.42 ms**, per-call scratch allocation **+0.01 ms**. The GQA host reduction is
+passing neither `hip=` nor `scratch=`. **It was superseded the same day** by an upper-layer fix — though the specific
+"10.062 vs 8.13 A/B" is **prose-only with no primary record**; the real text is
+`output/0915__opt/E2E-AB.md:296-299`, which retracts **10.118** and gives a range 8.13–8.68
+that `:294` states was never hardware-verified. The supersession never propagated. Attributed causes — **prose-only, no primary record survives in the repository, and the
+card is gone**: per-call `HipModule()` + 3× `hipModuleLoad` ~+1.15 ms, autograd plumbing
+~+1.42 ms, per-call scratch allocation ~+0.01 ms. The GQA host reduction is
 +0.48 ms and sits inside *both* timed regions, so it cancels.
 
 Consequence: the campaign is at **0.70–0.72x**, not the 0.92x that 10.160 implied.
@@ -69,8 +82,13 @@ zero NaN survived at fast and prod.
 ## The wedge
 
 One wedge, 08:58:53, `RW=0x1 / PERMISSION_FAULTS 0x5`, MES dead 31 s later, cost one AC
-cycle. A **separate** fault recorded by round 18 (`RW=0x0 / PERMISSION_FAULTS 0x3`) did not
-wedge the card — do not merge the two.
+cycle. A **separate** fault (`RW=0x0 / PERMISSION_FAULTS 0x3`) at wall-clock **10:51:06 — after
+the AC cycle, on the next boot** — did not wedge the card. Do not merge the two, and note the
+order: the wedge came first. **One wedge, one AC cycle today** (single boot boundary 09:14:30).
+Two discriminants are now falsified: the wedge had **no** IH ring-buffer overflow while the
+*survivor* did, and round 17's 07:58:04 fault carried the identical `RW=0x1 / PERMISSION_FAULTS
+0x5` signature without wedging. Evidence archived at
+`wedge-rootcause/kernlog_prevboot_wedge.txt` — it existed only in the kernel log.
 
 The trigger is isolated by a controlled pair in the tree, not inferred:
 `rounds/016/_scratch/meas2/out` (one process, three shapes) faults;
@@ -85,13 +103,16 @@ sampling), and `k_dkdv`'s only overrun is a *read* that its real descriptors cla
 
 ## Defects found, fixable at zero card time (not yet applied)
 
+*(line numbers below are re-resolved against `op/current` = round 20 code; earlier notes
+carried round 17's numbering)*
+
 1. `impl.py:115` asserts `sq % 32 == 0` but `kernels.py:667-668` uses ceil while the
    launcher passes floor. At `sq % 64 == 32` the kernel **issues** 262,144 B of
    out-of-bounds writes through a fake `1<<30` descriptor and never dispatches query tile 0.
    All nine scored shapes happen to be safe. **One-line fix, ISA byte-identical.**
-2. `kernels.py:685` computes `nsp * B_ * Sq * Hq * (D*4)` in int32; at prod dims nsp=8/16
+2. `kernels.py:724` computes `nsp * B_ * Sq * Hq * (D*4)` in int32; at prod dims nsp=8/16
    wrap to **exactly 0**, i.e. `num_records = 0` and every dQ write silently discarded.
-3. `kernels.py:538/:545` and `:499-504` — k_dkdv's unclamped prefetch reads up to 982,272 B
+3. `kernels.py:573-574/:583-584` and the carried `jj = ii + 1` — k_dkdv's unclamped prefetch reads up to 982,272 B
    past Q/dO, held back only by its real extents. **Never convert k_dkdv's descriptors to
    the fake style.**
 
@@ -120,7 +141,12 @@ cost and a byte count are properties of the kernel and harness that produced the
 
 ## For whoever picks this up
 
-- The bar is **7.67 ms / 716 TF/s**. Do not cite 10.160 or 541 TF/s.
+- The bar is **~7.68 ms / 716 TF/s**. Do not cite 10.160 or 541 TF/s. Always publish the
+  dedup convention with any `n` — this corpus has produced 158, 177 and 224 for the same
+  census.
+- **An instrument script must assert that its subject actually ran.** `pw.sh` sent the
+  benchmark to `/dev/null` and reported `wait`'s exit code; it produced 60 rows of a run that
+  never happened. Two probes today reported success without running.
 - Grade against **this operator's own same-session floor** (0.4–0.7% at prod), not the
   corpus's 1.57%. Round 22's prescription: the bar is "beat the champion by more than the
   floor", not "be positive". `min_gain: 0.0` is what let round 20 promote on gain 1.0016.

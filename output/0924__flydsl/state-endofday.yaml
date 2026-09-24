@@ -1194,3 +1194,13 @@ rounds:
   seconds:
     opt: 75.0
     round: 75.0
+  closed_by_hand: true
+  closed_at: '2026-09-24T14:45:00'
+  closed_reason: >
+    Machine handed to another user at end of day. The job was stopped by explicit SIGTERM/
+    SIGKILL on its own PID about two minutes into 1-opt, with the GPU idle and no work in
+    flight. rounds/023/ holds only op/, ids_before.yaml and timing.yaml -- no act.yaml, no
+    raw/, no measurement was taken and no card time was spent. The next `resume` will move
+    the partial 1-opt aside as stale; nothing needs reverting and op/current is untouched
+    (byte-identical to rounds/020/op).
+

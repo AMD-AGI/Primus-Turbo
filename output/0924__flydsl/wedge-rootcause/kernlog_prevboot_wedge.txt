@@ -1,0 +1,1402 @@
+Sep 23 18:15:11.225928 heliosr-1b114-c07-1 kernel: Command line: BOOT_IMAGE=/boot/vmlinuz-6.14.0-37-generic root=UUID=a8c7367a-9025-4849-baa8-853bab204e11 ro modprobe.blacklist=amdgpu pci=realloc=off iommu=pt modprobe.blacklist=amdgpu,device_dax,dax_hmem iommu=pt console=tty0 console=ttyS1,115200n8 preempt=full rcu_nocbs=all
+Sep 23 18:15:11.226968 heliosr-1b114-c07-1 kernel: Kernel command line: BOOT_IMAGE=/boot/vmlinuz-6.14.0-37-generic root=UUID=a8c7367a-9025-4849-baa8-853bab204e11 ro modprobe.blacklist=amdgpu pci=realloc=off iommu=pt modprobe.blacklist=amdgpu,device_dax,dax_hmem iommu=pt console=tty0 console=ttyS1,115200n8 preempt=full rcu_nocbs=all
+Sep 23 19:19:10.123099 heliosr-1b114-c07-1 kernel: [drm] amdgpu version: 7.1.1.31300009
+Sep 23 19:19:10.123190 heliosr-1b114-c07-1 kernel: amdgpu: Virtual CRAT table created for CPU
+Sep 23 19:19:10.123204 heliosr-1b114-c07-1 kernel: amdgpu: Topology: Add CPU node
+Sep 23 19:19:10.123217 heliosr-1b114-c07-1 kernel: amdgpu: PeerDirect support was initialized successfully
+Sep 23 19:19:10.123231 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: initializing kernel modesetting (IP DISCOVERY 0x1002:0x75C1 0x1002:0x75C1 0x00).
+Sep 23 19:19:10.123477 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: register mmio base: 0xB4200000
+Sep 23 19:19:10.123686 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: register mmio size: 2097152
+Sep 23 19:19:10.123865 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MEM_RESERVED_INFO: list_num=4
+Sep 23 19:19:10.124003 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   [0] id=4 (VM_PAGE_FAULT) size=0x1000 start=0x16bf5fff000
+Sep 23 19:19:10.124228 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   [1] id=2 (MASTER_DIE_UMF) size=0xa000000 start=0x16bf6000000
+Sep 23 19:19:10.124378 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   [2] id=9 (SPECIFIC_PURPOSE) size=0x6c00000000 start=0x10000000000
+Sep 23 19:19:10.124499 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   [3] id=10 (UNKNOWN) size=0x2000 start=0x16bfda9e000
+Sep 23 19:19:10.124617 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: detected ip block number 0 <common_v1_0_0> (soc_v1_0_common)
+Sep 23 19:19:10.124737 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: detected ip block number 1 <gmc_v12_0_0> (gmc_v12_0)
+Sep 23 19:19:10.124839 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: detected ip block number 2 <ih_v7_0_0> (ih_v7_0)
+Sep 23 19:19:10.124930 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: detected ip block number 3 <psp_v15_0_8> (psp)
+Sep 23 19:19:10.125023 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: detected ip block number 4 <smu_v15_0_0> (smu)
+Sep 23 19:19:10.125144 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: detected ip block number 5 <gfx_v12_1_0> (gfx_v12_1)
+Sep 23 19:19:10.125236 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: detected ip block number 6 <sdma_v7_1_0> (sdma_v7_1)
+Sep 23 19:19:10.125345 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: detected ip block number 7 <ras_v1_0_0> (ras_v1_0)
+Sep 23 19:19:10.125442 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: detected ip block number 8 <vcn_v5_0_2> (vcn_v5_0_2)
+Sep 23 19:19:10.125558 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: detected ip block number 9 <jpeg_v5_0_2> (jpeg_v5_0_2)
+Sep 23 19:19:10.125677 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: detected ip block number 10 <mes_v12_1_0> (mes_v12_1)
+Sep 23 19:19:10.125790 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: detected ip block number 11 <ualink_v1_0_0> (ualink)
+Sep 23 19:19:10.125902 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ROM [??? 0x00000000 flags 0x20000000]: can't assign; bogus alignment
+Sep 23 19:19:10.126023 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Fetched VBIOS from ROM
+Sep 23 19:19:10.126147 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [drm] ATOM BIOS: 113-M4500001-630A, build: 00195379, ver: 025.040.000.009.000001, 2026/07/25
+Sep 23 19:19:10.129074 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Trusted Memory Zone (TMZ) feature not supported
+Sep 23 19:19:10.129216 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GPU posting now...
+Sep 23 19:19:10.129312 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: RAS INFO: ras initialized successfully, hardware ability[fbdf9] ras_mask[fbdf9]
+Sep 23 19:19:10.129404 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: vm size is 134217728 GB, 5 levels, block size is 9-bit, fragment size is 9-bit
+Sep 23 19:19:10.129495 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: VRAM: 442368M 0x0000000000000000 - 0x0000006BFFFFFFFF (442368M used)
+Sep 23 19:19:10.129588 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GART: 512M 0x0000006C00000000 - 0x0000006C1FFFFFFF
+Sep 23 19:19:10.129675 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [drm] Detected VRAM RAM=442368M, BAR=442368M
+Sep 23 19:19:10.129765 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [drm] RAM width 24576bits HBM4
+Sep 23 19:19:10.129855 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  442368M of VRAM memory ready
+Sep 23 19:19:10.129947 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  128711M of GTT memory ready.
+Sep 23 19:19:10.130037 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [drm] GART: num cpu pages 131072, num gpu pages 131072
+Sep 23 19:19:10.130134 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [drm] PCIE GART of 512M enabled (table at 0x0000006BF5EFF000).
+Sep 23 19:19:10.130223 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [VCN instance 0] Found VCN firmware Version ENC: 1.13 DEC: 9 VEP: 0 Revision: 8
+Sep 23 19:19:10.130315 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [VCN instance 1] Found VCN firmware Version ENC: 1.13 DEC: 9 VEP: 0 Revision: 8
+Sep 23 19:19:10.130404 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [VCN instance 2] Found VCN firmware Version ENC: 1.13 DEC: 9 VEP: 0 Revision: 8
+Sep 23 19:19:10.130495 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [VCN instance 3] Found VCN firmware Version ENC: 1.13 DEC: 9 VEP: 0 Revision: 8
+Sep 23 19:19:10.131066 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES: vmid_mask_mmhub 0x0000ff00, vmid_mask_gfxhub 0x0000fff8
+Sep 23 19:19:10.131167 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES: gfx_hqd_mask 0x00000000, compute_hqd_mask 0x000000fc, sdma_hqd_mask 0x000000fc
+Sep 23 19:19:10.133066 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: psp interrupt enabled
+Sep 23 19:19:11.370089 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: RAP: optional rap ta ucode is not available
+Sep 23 19:19:11.370280 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: smu driver if version = 0x007d0000, smu fw if version = 0x007d0000, smu fw program = 2, smu fw version = 0x027d0701 (125.7.1)
+Sep 23 19:19:11.726088 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: WARN: GPU is throttled, expect performance decrease. VR.
+Sep 23 19:19:11.789083 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: SMU is initialized successfully!
+Sep 23 19:19:11.791082 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Requesting 0 partitions through PSP
+Sep 23 19:19:11.820090 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Found UALink interface version 0x1
+Sep 23 19:19:11.828454 heliosr-1b114-c07-1 kernel: amdgpu: Virtual CRAT table created for GPU
+Sep 23 19:19:11.828468 heliosr-1b114-c07-1 kernel: amdgpu: Topology: Add GPU node [0x1002:0x75c1]
+Sep 23 19:19:11.828549 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: SE 2, SH per SE 2, CU per SH 9, active_cu_number 256
+Sep 23 19:19:11.828669 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_0.1.0.0 uses VM inv eng 0 on hub 0
+Sep 23 19:19:11.828769 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_0.1.1.0 uses VM inv eng 1 on hub 0
+Sep 23 19:19:11.828864 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_0.1.2.0 uses VM inv eng 4 on hub 0
+Sep 23 19:19:11.828955 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_0.1.3.0 uses VM inv eng 7 on hub 0
+Sep 23 19:19:11.829043 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_0.1.0.1 uses VM inv eng 8 on hub 0
+Sep 23 19:19:11.829161 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_0.1.1.1 uses VM inv eng 9 on hub 0
+Sep 23 19:19:11.829249 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_0.1.2.1 uses VM inv eng 10 on hub 0
+Sep 23 19:19:11.829341 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_0.1.3.1 uses VM inv eng 11 on hub 0
+Sep 23 19:19:11.829429 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_1.1.0.0 uses VM inv eng 0 on hub 1
+Sep 23 19:19:11.829520 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_1.1.1.0 uses VM inv eng 1 on hub 1
+Sep 23 19:19:11.829608 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_1.1.2.0 uses VM inv eng 4 on hub 1
+Sep 23 19:19:11.829701 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_1.1.3.0 uses VM inv eng 7 on hub 1
+Sep 23 19:19:11.829787 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_1.1.0.1 uses VM inv eng 8 on hub 1
+Sep 23 19:19:11.829873 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_1.1.1.1 uses VM inv eng 9 on hub 1
+Sep 23 19:19:11.829960 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_1.1.2.1 uses VM inv eng 10 on hub 1
+Sep 23 19:19:11.830048 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_1.1.3.1 uses VM inv eng 11 on hub 1
+Sep 23 19:19:11.830140 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_2.1.0.0 uses VM inv eng 0 on hub 2
+Sep 23 19:19:11.830230 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_2.1.1.0 uses VM inv eng 1 on hub 2
+Sep 23 19:19:11.830316 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_2.1.2.0 uses VM inv eng 4 on hub 2
+Sep 23 19:19:11.830405 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_2.1.3.0 uses VM inv eng 7 on hub 2
+Sep 23 19:19:11.830492 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_2.1.0.1 uses VM inv eng 8 on hub 2
+Sep 23 19:19:11.830576 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_2.1.1.1 uses VM inv eng 9 on hub 2
+Sep 23 19:19:11.830663 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_2.1.2.1 uses VM inv eng 10 on hub 2
+Sep 23 19:19:11.830752 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_2.1.3.1 uses VM inv eng 11 on hub 2
+Sep 23 19:19:11.830840 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_3.1.0.0 uses VM inv eng 0 on hub 3
+Sep 23 19:19:11.830927 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_3.1.1.0 uses VM inv eng 1 on hub 3
+Sep 23 19:19:11.831013 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_3.1.2.0 uses VM inv eng 4 on hub 3
+Sep 23 19:19:11.831111 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_3.1.3.0 uses VM inv eng 7 on hub 3
+Sep 23 19:19:11.831200 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_3.1.0.1 uses VM inv eng 8 on hub 3
+Sep 23 19:19:11.831287 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_3.1.1.1 uses VM inv eng 9 on hub 3
+Sep 23 19:19:11.831373 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_3.1.2.1 uses VM inv eng 10 on hub 3
+Sep 23 19:19:11.831463 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_3.1.3.1 uses VM inv eng 11 on hub 3
+Sep 23 19:19:11.831548 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_4.1.0.0 uses VM inv eng 0 on hub 4
+Sep 23 19:19:11.831635 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_4.1.1.0 uses VM inv eng 1 on hub 4
+Sep 23 19:19:11.831722 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_4.1.2.0 uses VM inv eng 4 on hub 4
+Sep 23 19:19:11.831809 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_4.1.3.0 uses VM inv eng 7 on hub 4
+Sep 23 19:19:11.831895 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_4.1.0.1 uses VM inv eng 8 on hub 4
+Sep 23 19:19:11.831983 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_4.1.1.1 uses VM inv eng 9 on hub 4
+Sep 23 19:19:11.832076 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_4.1.2.1 uses VM inv eng 10 on hub 4
+Sep 23 19:19:11.832165 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_4.1.3.1 uses VM inv eng 11 on hub 4
+Sep 23 19:19:11.832252 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_5.1.0.0 uses VM inv eng 0 on hub 5
+Sep 23 19:19:11.832340 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_5.1.1.0 uses VM inv eng 1 on hub 5
+Sep 23 19:19:11.832428 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_5.1.2.0 uses VM inv eng 4 on hub 5
+Sep 23 19:19:11.832513 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_5.1.3.0 uses VM inv eng 7 on hub 5
+Sep 23 19:19:11.832600 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_5.1.0.1 uses VM inv eng 8 on hub 5
+Sep 23 19:19:11.832686 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_5.1.1.1 uses VM inv eng 9 on hub 5
+Sep 23 19:19:11.832772 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_5.1.2.1 uses VM inv eng 10 on hub 5
+Sep 23 19:19:11.832857 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_5.1.3.1 uses VM inv eng 11 on hub 5
+Sep 23 19:19:11.832943 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_6.1.0.0 uses VM inv eng 0 on hub 6
+Sep 23 19:19:11.833028 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_6.1.1.0 uses VM inv eng 1 on hub 6
+Sep 23 19:19:11.833118 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_6.1.2.0 uses VM inv eng 4 on hub 6
+Sep 23 19:19:11.833206 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_6.1.3.0 uses VM inv eng 7 on hub 6
+Sep 23 19:19:11.833292 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_6.1.0.1 uses VM inv eng 8 on hub 6
+Sep 23 19:19:11.833379 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_6.1.1.1 uses VM inv eng 9 on hub 6
+Sep 23 19:19:11.833465 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_6.1.2.1 uses VM inv eng 10 on hub 6
+Sep 23 19:19:11.833552 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_6.1.3.1 uses VM inv eng 11 on hub 6
+Sep 23 19:19:11.833636 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_7.1.0.0 uses VM inv eng 0 on hub 7
+Sep 23 19:19:11.833721 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_7.1.1.0 uses VM inv eng 1 on hub 7
+Sep 23 19:19:11.833805 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_7.1.2.0 uses VM inv eng 4 on hub 7
+Sep 23 19:19:11.833891 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_7.1.3.0 uses VM inv eng 7 on hub 7
+Sep 23 19:19:11.833977 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_7.1.0.1 uses VM inv eng 8 on hub 7
+Sep 23 19:19:11.834067 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_7.1.1.1 uses VM inv eng 9 on hub 7
+Sep 23 19:19:11.834156 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_7.1.2.1 uses VM inv eng 10 on hub 7
+Sep 23 19:19:11.834240 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring comp_7.1.3.1 uses VM inv eng 11 on hub 7
+Sep 23 19:19:11.834327 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring sdma0.0 uses VM inv eng 12 on hub 0
+Sep 23 19:19:11.834412 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring sdma0.1 uses VM inv eng 13 on hub 0
+Sep 23 19:19:11.834498 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring sdma1.0 uses VM inv eng 12 on hub 1
+Sep 23 19:19:11.834584 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring sdma1.1 uses VM inv eng 13 on hub 1
+Sep 23 19:19:11.834668 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring sdma2.0 uses VM inv eng 12 on hub 2
+Sep 23 19:19:11.834757 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring sdma2.1 uses VM inv eng 13 on hub 2
+Sep 23 19:19:11.834846 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring sdma3.0 uses VM inv eng 12 on hub 3
+Sep 23 19:19:11.834934 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring sdma3.1 uses VM inv eng 13 on hub 3
+Sep 23 19:19:11.835020 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring sdma4.0 uses VM inv eng 12 on hub 4
+Sep 23 19:19:11.835110 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring sdma4.1 uses VM inv eng 13 on hub 4
+Sep 23 19:19:11.835199 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring sdma5.0 uses VM inv eng 12 on hub 5
+Sep 23 19:19:11.835287 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring sdma5.1 uses VM inv eng 13 on hub 5
+Sep 23 19:19:11.835373 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring sdma6.0 uses VM inv eng 12 on hub 6
+Sep 23 19:19:11.835460 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring sdma6.1 uses VM inv eng 13 on hub 6
+Sep 23 19:19:11.835548 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring sdma7.0 uses VM inv eng 12 on hub 7
+Sep 23 19:19:11.835680 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring sdma7.1 uses VM inv eng 13 on hub 7
+Sep 23 19:19:11.835770 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring vcn_unified_0 uses VM inv eng 0 on hub 8
+Sep 23 19:19:11.835857 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring vcn_unified_1 uses VM inv eng 1 on hub 8
+Sep 23 19:19:11.835944 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring vcn_unified_2 uses VM inv eng 0 on hub 9
+Sep 23 19:19:11.836028 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring vcn_unified_3 uses VM inv eng 1 on hub 9
+Sep 23 19:19:11.836120 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring jpeg_dec_0.0 uses VM inv eng 4 on hub 8
+Sep 23 19:19:11.836206 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring jpeg_dec_1.0 uses VM inv eng 7 on hub 8
+Sep 23 19:19:11.836294 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring jpeg_dec_2.0 uses VM inv eng 4 on hub 9
+Sep 23 19:19:11.836383 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring jpeg_dec_3.0 uses VM inv eng 7 on hub 9
+Sep 23 19:19:11.836473 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring mes_1.3.0.0 uses VM inv eng 14 on hub 1
+Sep 23 19:19:11.836561 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring mes_1.3.1.0 uses VM inv eng 15 on hub 1
+Sep 23 19:19:11.836649 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring mes_2.3.0.0 uses VM inv eng 14 on hub 2
+Sep 23 19:19:11.836738 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring mes_2.3.1.0 uses VM inv eng 15 on hub 2
+Sep 23 19:19:11.836826 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring mes_3.3.0.0 uses VM inv eng 14 on hub 3
+Sep 23 19:19:11.836910 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring mes_3.3.1.0 uses VM inv eng 15 on hub 3
+Sep 23 19:19:11.836997 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring mes_4.3.0.0 uses VM inv eng 14 on hub 4
+Sep 23 19:19:11.837090 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring mes_4.3.1.0 uses VM inv eng 15 on hub 4
+Sep 23 19:19:11.837176 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring mes_5.3.0.0 uses VM inv eng 14 on hub 5
+Sep 23 19:19:11.837261 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring mes_5.3.1.0 uses VM inv eng 15 on hub 5
+Sep 23 19:19:11.837347 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring mes_6.3.0.0 uses VM inv eng 14 on hub 6
+Sep 23 19:19:11.837433 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring mes_6.3.1.0 uses VM inv eng 15 on hub 6
+Sep 23 19:19:11.837519 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring mes_7.3.0.0 uses VM inv eng 14 on hub 7
+Sep 23 19:19:11.837604 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: ring mes_7.3.1.0 uses VM inv eng 15 on hub 7
+Sep 23 19:19:12.383099 heliosr-1b114-c07-1 kernel: amdgpu: HMM registered 442368MB device memory
+Sep 23 19:19:12.384090 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Runtime PM not available
+Sep 23 19:19:12.384373 heliosr-1b114-c07-1 kernel: [drm] Initialized amdgpu 3.64.0 for 0001:01:00.0 on minor 1
+Sep 23 19:19:12.384389 heliosr-1b114-c07-1 kernel: [drm] Initialized amdgpu 3.64.0 for amdgpu_xcp_0 on minor 2
+Sep 23 19:19:12.384403 heliosr-1b114-c07-1 kernel: [drm] Initialized amdgpu 3.64.0 for amdgpu_xcp_1 on minor 3
+Sep 23 19:19:12.384414 heliosr-1b114-c07-1 kernel: [drm] Initialized amdgpu 3.64.0 for amdgpu_xcp_2 on minor 4
+Sep 23 19:19:12.384426 heliosr-1b114-c07-1 kernel: [drm] Initialized amdgpu 3.64.0 for amdgpu_xcp_3 on minor 5
+Sep 23 19:19:12.384436 heliosr-1b114-c07-1 kernel: [drm] Initialized amdgpu 3.64.0 for amdgpu_xcp_4 on minor 6
+Sep 23 19:19:12.384446 heliosr-1b114-c07-1 kernel: [drm] Initialized amdgpu 3.64.0 for amdgpu_xcp_5 on minor 7
+Sep 23 19:19:12.385064 heliosr-1b114-c07-1 kernel: [drm] Initialized amdgpu 3.64.0 for amdgpu_xcp_6 on minor 8
+Sep 23 19:20:19.089087 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:4)
+Sep 23 19:20:19.089530 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 14575 thread python pid 14575
+Sep 23 19:20:19.089681 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00006ff8d8a2d000 from IH client 27 (GC_UTCL2)
+Sep 23 19:20:19.089787 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 4 fault from die AID0.XCD2
+Sep 23 19:20:19.089896 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:20:19.089998 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:20:19.090141 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:20:19.090250 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:20:19.090356 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:20:19.090455 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:20:19.090548 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:20:19.090656 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:20:19.090752 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:20:19.090850 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: IH ring buffer overflow (0x0008C380, 0x0001E460, 0x0000C3A0)
+Sep 23 19:20:19.090959 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:4)
+Sep 23 19:20:19.091052 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 14575 thread python pid 14575
+Sep 23 19:20:19.091165 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00006ff8d8df8000 from IH client 27 (GC_UTCL2)
+Sep 23 19:20:19.091259 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 13 fault from die AID1.XCD3
+Sep 23 19:20:19.091366 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:20:19.091460 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:20:19.091549 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:20:19.091654 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:20:19.091746 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:20:19.091839 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:20:19.091944 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:20:19.092038 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:20:19.092160 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:20:19.092247 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:4)
+Sep 23 19:20:19.092349 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 14575 thread python pid 14575
+Sep 23 19:20:19.092441 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00006ff8d8dfd000 from IH client 27 (GC_UTCL2)
+Sep 23 19:20:19.092532 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 10 fault from die AID1.XCD0
+Sep 23 19:20:19.092633 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:20:19.092725 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:20:19.092815 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:20:19.092918 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:20:19.093009 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:20:19.093115 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:20:19.093206 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:20:19.093293 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:20:19.093394 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:20:19.093483 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:4)
+Sep 23 19:20:19.093571 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 14575 thread python pid 14575
+Sep 23 19:20:19.093674 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00006ff8d8dfe000 from IH client 27 (GC_UTCL2)
+Sep 23 19:20:19.093769 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 11 fault from die AID1.XCD1
+Sep 23 19:20:19.093872 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:20:19.093963 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:20:19.094051 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:20:19.094166 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:20:19.094256 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:20:19.094355 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:20:19.094446 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:20:19.094534 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:20:19.094631 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:20:19.094719 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:4)
+Sep 23 19:20:19.094808 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 14575 thread python pid 14575
+Sep 23 19:20:19.094909 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00006ff8d8dff000 from IH client 27 (GC_UTCL2)
+Sep 23 19:20:19.095003 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+Sep 23 19:20:19.095109 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:20:19.095203 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:20:19.095291 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:20:19.095393 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:20:19.095484 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:20:19.095571 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:20:19.095676 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:20:19.095768 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:20:19.095874 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:20:19.095966 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:4)
+Sep 23 19:20:19.096061 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 14575 thread python pid 14575
+Sep 23 19:20:19.096162 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00006ff8d8dff000 from IH client 27 (GC_UTCL2)
+Sep 23 19:20:19.096254 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+Sep 23 19:20:19.096356 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:20:19.096446 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:20:19.096536 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:20:19.096642 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:20:19.096732 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:20:19.096822 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:20:19.096925 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:20:19.097015 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:20:19.097122 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:20:19.097211 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:4)
+Sep 23 19:20:19.097298 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 14575 thread python pid 14575
+Sep 23 19:20:19.097400 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00006ff8d8dff000 from IH client 27 (GC_UTCL2)
+Sep 23 19:20:19.097488 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 10 fault from die AID1.XCD0
+Sep 23 19:20:19.097577 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:20:19.097677 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:20:19.097765 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Fence fallback timer expired on ring sdma0.0
+Sep 23 19:20:19.097860 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:20:19.097948 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:20:19.098036 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:20:19.098140 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:20:19.421431 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:20:19.421576 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:20:19.421688 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:20:19.421777 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:4)
+Sep 23 19:20:19.421866 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 14575 thread python pid 14575
+Sep 23 19:20:19.421959 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00006ff8d8e00000 from IH client 27 (GC_UTCL2)
+Sep 23 19:20:19.422049 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 10 fault from die AID1.XCD0
+Sep 23 19:20:19.422158 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:20:19.422251 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:20:19.422337 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:20:19.422424 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:20:19.422510 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:20:19.422597 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:20:19.422683 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:20:19.422770 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:20:19.422857 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:20:19.422945 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:4)
+Sep 23 19:20:19.423033 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 14575 thread python pid 14575
+Sep 23 19:20:19.423146 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00006ff8d8df8000 from IH client 27 (GC_UTCL2)
+Sep 23 19:20:19.423236 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 13 fault from die AID1.XCD3
+Sep 23 19:20:19.423330 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:20:19.423432 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:20:19.423523 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:20:19.423627 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:20:19.423717 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:20:19.423803 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:20:19.423913 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:20:19.424003 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:20:19.424112 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:20:19.424203 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:4)
+Sep 23 19:20:19.424292 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 14575 thread python pid 14575
+Sep 23 19:20:19.424388 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00006ff8d8dff000 from IH client 27 (GC_UTCL2)
+Sep 23 19:20:19.424503 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+Sep 23 19:20:19.424597 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:20:19.424688 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:20:19.424775 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:20:19.424874 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:20:19.424966 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:20:19.425053 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:20:19.425159 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:20:19.425246 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:20:19.425343 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:20:59.750145 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:9)
+Sep 23 19:20:59.750476 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 16727 thread python pid 16727
+Sep 23 19:20:59.750601 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x0000794c88a15000 from IH client 27 (GC_UTCL2)
+Sep 23 19:20:59.750704 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 4 fault from die AID0.XCD2
+Sep 23 19:20:59.750799 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:20:59.750893 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:20:59.750985 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:20:59.751110 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:20:59.751204 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:20:59.751302 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:20:59.751393 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:20:59.751482 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:20:59.751571 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:20:59.751660 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: IH ring buffer overflow (0x00085F60, 0x00016240, 0x00005F80)
+Sep 23 19:24:02.426579 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:13)
+Sep 23 19:24:02.426957 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 18718 thread python pid 18718
+Sep 23 19:24:02.427110 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007ed934a16000 from IH client 27 (GC_UTCL2)
+Sep 23 19:24:02.427217 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 12 fault from die AID1.XCD2
+Sep 23 19:24:02.427313 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:24:02.427419 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:24:02.427516 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:24:02.427614 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:24:02.427708 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:24:02.427801 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:24:02.427894 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:24:02.427986 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:24:02.428084 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:24:02.428174 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: IH ring buffer overflow (0x00095900, 0x00027B60, 0x00015920)
+Sep 23 19:27:31.280107 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:33)
+Sep 23 19:27:31.280491 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 28884 thread python pid 28884
+Sep 23 19:27:31.280623 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007200eca22000 from IH client 27 (GC_UTCL2)
+Sep 23 19:27:31.280728 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 12 fault from die AID1.XCD2
+Sep 23 19:27:31.280826 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:27:31.280918 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:27:31.281014 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:27:31.281134 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:27:31.281226 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:27:31.281318 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:27:31.281408 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:27:31.281500 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:27:31.281590 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:27:31.281680 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: IH ring buffer overflow (0x000A0660, 0x000333E0, 0x00020680)
+Sep 23 19:27:31.281772 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:33)
+Sep 23 19:27:31.281860 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 28884 thread python pid 28884
+Sep 23 19:27:31.281952 heliosr-1b114-c07-1 kernel: workqueue: send_exception_work_handler [amdgpu] hogged CPU for >10000us 4 times, consider switching to WQ_UNBOUND
+Sep 23 19:27:31.655734 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007200ece00000 from IH client 27 (GC_UTCL2)
+Sep 23 19:27:31.655981 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 10 fault from die AID1.XCD0
+Sep 23 19:27:31.656108 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:27:31.656215 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:27:31.656309 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:27:31.656400 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:27:31.656494 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:27:31.656585 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:27:31.656674 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:27:31.656766 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:27:31.656860 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:27:31.656958 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:33)
+Sep 23 19:27:31.657050 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 28884 thread python pid 28884
+Sep 23 19:27:31.657146 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007200ecdff000 from IH client 27 (GC_UTCL2)
+Sep 23 19:27:31.657239 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 2 fault from die AID0.XCD0
+Sep 23 19:27:31.657332 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:27:31.657419 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:27:31.657508 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:27:31.657594 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:27:31.657683 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:27:31.657770 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:27:31.657859 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:27:31.657948 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:27:31.658036 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:27:31.658188 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:33)
+Sep 23 19:27:31.658285 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 28884 thread python pid 28884
+Sep 23 19:27:31.658375 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007200ecdfe000 from IH client 27 (GC_UTCL2)
+Sep 23 19:27:31.658467 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 2 fault from die AID0.XCD0
+Sep 23 19:27:31.658554 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:27:31.658645 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:27:31.658733 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:27:31.658818 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:27:31.658902 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:27:31.658990 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:27:31.659090 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:27:31.659177 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:27:31.659264 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:27:31.659352 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:33)
+Sep 23 19:27:31.659438 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 28884 thread python pid 28884
+Sep 23 19:27:31.659525 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007200ecdff000 from IH client 27 (GC_UTCL2)
+Sep 23 19:27:31.659611 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 10 fault from die AID1.XCD0
+Sep 23 19:27:31.659700 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:27:31.659784 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:27:31.659871 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:27:31.659958 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:27:31.660045 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:27:31.660140 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:27:31.660227 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:27:31.660315 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:27:31.660402 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:30:57.160118 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:38)
+Sep 23 19:30:57.160432 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 31403 thread python pid 31403
+Sep 23 19:30:57.160564 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007a91f8a01000 from IH client 27 (GC_UTCL2)
+Sep 23 19:30:57.160668 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 4 fault from die AID0.XCD2
+Sep 23 19:30:57.160761 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:30:57.160858 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:30:57.160950 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:30:57.161042 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:30:57.161158 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:30:57.161249 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:30:57.161338 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:30:57.161423 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:30:57.161513 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:30:57.161602 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: IH ring buffer overflow (0x0009E920, 0x00007480, 0x0001E940)
+Sep 23 19:30:57.161697 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:38)
+Sep 23 19:30:57.161784 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 31403 thread python pid 31403
+Sep 23 19:30:57.161873 heliosr-1b114-c07-1 kernel: workqueue: send_exception_work_handler [amdgpu] hogged CPU for >10000us 5 times, consider switching to WQ_UNBOUND
+Sep 23 19:30:58.018639 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007a91f8a5c000 from IH client 27 (GC_UTCL2)
+Sep 23 19:30:58.018815 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 10 fault from die AID1.XCD0
+Sep 23 19:30:58.018929 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:30:58.019023 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:30:58.019134 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:30:58.019225 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:30:58.019315 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:30:58.019404 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:30:58.019493 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:30:58.019584 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:30:58.019674 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:30:58.019761 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:38)
+Sep 23 19:30:58.019847 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 31403 thread python pid 31403
+Sep 23 19:30:58.019936 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007a91f8bbc000 from IH client 27 (GC_UTCL2)
+Sep 23 19:30:58.020024 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 12 fault from die AID1.XCD2
+Sep 23 19:30:58.020122 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:30:58.020212 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:30:58.020300 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:30:58.020387 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:30:58.020475 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:30:58.020565 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:30:58.020651 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:30:58.020739 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:30:58.020825 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:30:58.020912 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:38)
+Sep 23 19:30:58.021002 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 31403 thread python pid 31403
+Sep 23 19:30:58.021094 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007a91f8b95000 from IH client 27 (GC_UTCL2)
+Sep 23 19:30:58.021183 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+Sep 23 19:30:58.021274 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:30:58.021359 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:30:58.021447 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:30:58.021534 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:30:58.021623 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:30:58.021708 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:30:58.021797 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:30:58.021883 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:30:58.021968 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:30:58.022059 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:38)
+Sep 23 19:30:58.022147 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 31403 thread python pid 31403
+Sep 23 19:30:58.022234 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007a91f8b29000 from IH client 27 (GC_UTCL2)
+Sep 23 19:30:58.022324 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 4 fault from die AID0.XCD2
+Sep 23 19:30:58.022411 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:30:58.022498 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:30:58.022584 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:30:58.022670 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:30:58.022757 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:30:58.022843 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:30:58.022929 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:30:58.023015 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:30:58.023109 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:30:58.023196 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:38)
+Sep 23 19:30:58.023280 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 31403 thread python pid 31403
+Sep 23 19:30:58.023366 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007a91f8a4c000 from IH client 27 (GC_UTCL2)
+Sep 23 19:30:58.023454 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 10 fault from die AID1.XCD0
+Sep 23 19:30:58.023540 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:30:58.023627 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:30:58.023713 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:30:58.023802 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:30:58.023889 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:30:58.023975 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:30:58.024066 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:30:58.024152 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:30:58.024238 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:30:58.024323 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:38)
+Sep 23 19:30:58.024409 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 31403 thread python pid 31403
+Sep 23 19:30:58.024499 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007a91f8b88000 from IH client 27 (GC_UTCL2)
+Sep 23 19:30:58.024587 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 11 fault from die AID1.XCD1
+Sep 23 19:30:58.024674 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:30:58.024759 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:30:58.024845 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:30:58.024931 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:30:58.025016 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:30:58.025107 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:30:58.025194 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:30:58.025277 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:30:58.025363 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:30:58.025449 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:38)
+Sep 23 19:30:58.025534 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 31403 thread python pid 31403
+Sep 23 19:30:58.025621 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007a91f8bf8000 from IH client 27 (GC_UTCL2)
+Sep 23 19:30:58.025709 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 12 fault from die AID1.XCD2
+Sep 23 19:30:58.025795 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:30:58.025884 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:30:58.025971 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:30:58.026063 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:30:58.026149 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:30:58.026235 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:30:58.026323 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:30:58.026407 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:30:58.026491 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:30:58.026577 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:38)
+Sep 23 19:30:58.026664 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 31403 thread python pid 31403
+Sep 23 19:30:58.026749 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007a91f8b44000 from IH client 27 (GC_UTCL2)
+Sep 23 19:30:58.026837 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 13 fault from die AID1.XCD3
+Sep 23 19:30:58.026924 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:30:58.027010 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:30:58.027099 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:30:58.027185 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:30:58.027270 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:30:58.027359 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:30:58.027443 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:30:58.027528 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:30:58.027614 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:30:58.027702 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:38)
+Sep 23 19:30:58.027786 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 31403 thread python pid 31403
+Sep 23 19:30:58.027873 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007a91f8a55000 from IH client 27 (GC_UTCL2)
+Sep 23 19:30:58.027960 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 2 fault from die AID0.XCD0
+Sep 23 19:30:58.028047 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:30:58.028138 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:30:58.028223 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:30:58.028308 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:30:58.028394 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:30:58.028480 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:30:58.028565 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:30:58.028650 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:30:58.028734 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:32:58.995007 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:43)
+Sep 23 19:32:58.995284 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 33317 thread python pid 33317
+Sep 23 19:32:58.995471 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007a74f4a1f000 from IH client 27 (GC_UTCL2)
+Sep 23 19:32:58.995574 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 4 fault from die AID0.XCD2
+Sep 23 19:32:58.995669 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:32:58.995761 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:32:58.995853 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:32:58.995952 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:32:58.996050 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:32:58.996146 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:32:58.996238 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:32:58.996327 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:32:58.996418 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:32:58.996507 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: IH ring buffer overflow (0x000B7400, 0x00007C00, 0x00037420)
+Sep 23 19:34:59.706794 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:47)
+Sep 23 19:34:59.707188 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 35229 thread python pid 35229
+Sep 23 19:34:59.707315 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x000072285ca03000 from IH client 27 (GC_UTCL2)
+Sep 23 19:34:59.707419 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 4 fault from die AID0.XCD2
+Sep 23 19:34:59.707515 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:34:59.707610 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:34:59.707703 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:34:59.707795 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:34:59.707883 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:34:59.707974 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:34:59.708074 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:34:59.708166 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:34:59.708266 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:34:59.708358 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: IH ring buffer overflow (0x00087060, 0x00018000, 0x00007080)
+Sep 23 19:34:59.717082 heliosr-1b114-c07-1 kernel: workqueue: send_exception_work_handler [amdgpu] hogged CPU for >10000us 7 times, consider switching to WQ_UNBOUND
+Sep 23 19:37:00.404423 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:51)
+Sep 23 19:37:00.404763 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python pid 37138 thread python pid 37138
+Sep 23 19:37:00.404893 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007abbdca0f000 from IH client 27 (GC_UTCL2)
+Sep 23 19:37:00.404994 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 4 fault from die AID0.XCD2
+Sep 23 19:37:00.405114 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 23 19:37:00.405210 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 23 19:37:00.405303 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 23 19:37:00.405395 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 23 19:37:00.405486 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 23 19:37:00.405572 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 23 19:37:00.405660 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 23 19:37:00.405750 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 23 19:37:00.405840 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 23 19:37:00.405928 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: IH ring buffer overflow (0x0009FDC0, 0x00028860, 0x0001FDE0)
+Sep 24 01:32:39.563255 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:3 pasid:130)
+Sep 24 01:32:39.563548 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 122492 thread python3 pid 122492
+Sep 24 01:32:39.563673 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x0000000000053000 from IH client 27 (GC_UTCL2)
+Sep 24 01:32:39.563775 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 13 fault from die AID1.XCD3
+Sep 24 01:32:39.563877 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 01:32:39.563980 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 01:32:39.564109 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 01:32:39.564208 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 01:32:39.564301 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 01:32:39.564392 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 01:32:39.564483 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 01:32:39.564574 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 01:32:39.564667 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 01:32:39.564756 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:3 pasid:130)
+Sep 24 01:32:39.564849 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 122492 thread python3 pid 122492
+Sep 24 01:32:39.564943 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x0000000000055000 from IH client 27 (GC_UTCL2)
+Sep 24 01:32:39.565036 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+Sep 24 01:32:39.565139 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 01:32:39.565231 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 01:32:39.565321 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 01:32:39.565413 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 01:32:39.565505 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 01:32:39.565595 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 01:32:39.565684 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 01:32:39.565773 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 01:32:39.565866 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 01:32:39.565954 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:3 pasid:130)
+Sep 24 01:32:39.566045 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 122492 thread python3 pid 122492
+Sep 24 01:32:39.566185 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x0000000000047000 from IH client 27 (GC_UTCL2)
+Sep 24 01:32:39.566275 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 13 fault from die AID1.XCD3
+Sep 24 01:32:39.566365 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 01:32:39.566453 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 01:32:39.566542 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 01:32:39.566629 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 01:32:39.566718 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 01:32:39.566807 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 01:32:39.566896 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 01:32:39.566985 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 01:32:39.567075 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 01:32:39.567163 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:3 pasid:130)
+Sep 24 01:32:39.567250 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 122492 thread python3 pid 122492
+Sep 24 01:32:39.567342 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x000000000011d000 from IH client 27 (GC_UTCL2)
+Sep 24 01:32:39.567434 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+Sep 24 01:32:39.567523 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 01:32:39.567612 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 01:32:39.567699 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 01:32:39.567786 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 01:32:39.567876 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 01:32:39.567966 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 01:32:39.568059 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 01:32:39.568148 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 01:32:39.568235 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 01:32:39.568325 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:3 pasid:130)
+Sep 24 01:32:39.568413 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 122492 thread python3 pid 122492
+Sep 24 01:32:39.568502 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x0000000000057000 from IH client 27 (GC_UTCL2)
+Sep 24 01:32:39.568592 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 13 fault from die AID1.XCD3
+Sep 24 01:32:39.568680 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 01:32:39.568767 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 01:32:39.568856 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 01:32:39.568944 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 01:32:39.569029 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 01:32:39.569123 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 01:32:39.569211 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 01:32:39.569300 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 01:32:39.569388 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 01:32:39.569476 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:3 pasid:130)
+Sep 24 01:32:39.569561 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 122492 thread python3 pid 122492
+Sep 24 01:32:39.569650 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x0000000000050000 from IH client 27 (GC_UTCL2)
+Sep 24 01:32:39.569738 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 4 fault from die AID0.XCD2
+Sep 24 01:32:39.569826 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 01:32:39.569913 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 01:32:39.570000 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 01:32:39.570092 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 01:32:39.570180 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 01:32:39.570267 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 01:32:39.570354 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 01:32:39.570443 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 01:32:39.570530 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 01:32:39.570622 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:3 pasid:130)
+Sep 24 01:32:39.570709 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 122492 thread python3 pid 122492
+Sep 24 01:32:39.570799 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x0000000000055000 from IH client 27 (GC_UTCL2)
+Sep 24 01:32:39.570886 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+Sep 24 01:32:39.570973 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 01:32:39.571062 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 01:32:39.571150 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 01:32:39.571238 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 01:32:39.571326 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 01:32:39.571412 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 01:32:39.571500 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 01:32:39.571585 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Fence fallback timer expired on ring sdma0.0
+Sep 24 01:32:39.571675 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 01:32:39.571762 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 01:32:39.571848 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:3 pasid:130)
+Sep 24 01:32:39.867557 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 122492 thread python3 pid 122492
+Sep 24 01:32:39.867735 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x0000000000053000 from IH client 27 (GC_UTCL2)
+Sep 24 01:32:39.867848 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 12 fault from die AID1.XCD2
+Sep 24 01:32:39.867953 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 01:32:39.868076 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 01:32:39.868176 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 01:32:39.868277 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 01:32:39.868370 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 01:32:39.868467 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 01:32:39.868563 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 01:32:39.868660 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 01:32:39.868754 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 01:32:39.868848 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:3 pasid:130)
+Sep 24 01:32:39.868941 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 122492 thread python3 pid 122492
+Sep 24 01:32:39.869033 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x0000000000027000 from IH client 27 (GC_UTCL2)
+Sep 24 01:32:39.869136 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 13 fault from die AID1.XCD3
+Sep 24 01:32:39.869228 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 01:32:39.869322 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 01:32:39.869419 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 01:32:39.869514 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 01:32:39.869609 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 01:32:39.869706 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 01:32:39.869800 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 01:32:39.869893 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 01:32:39.869985 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 01:32:39.870084 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:3 pasid:130)
+Sep 24 01:32:39.870178 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 122492 thread python3 pid 122492
+Sep 24 01:32:39.870270 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00000000003d4000 from IH client 27 (GC_UTCL2)
+Sep 24 01:32:39.870363 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 4 fault from die AID0.XCD2
+Sep 24 01:32:39.870456 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 01:32:39.870552 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 01:32:39.870646 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 01:32:39.870740 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 01:32:39.870835 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 01:32:39.870931 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 01:32:39.871024 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 01:32:39.871124 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 01:32:39.871222 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 01:33:12.605983 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:3 pasid:138)
+Sep 24 01:33:12.606294 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 124358 thread python3 pid 124358
+Sep 24 01:33:12.606421 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x000000000005d000 from IH client 27 (GC_UTCL2)
+Sep 24 01:33:12.606523 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 2 fault from die AID0.XCD0
+Sep 24 01:33:12.606633 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 01:33:12.606725 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 01:33:12.606815 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 01:33:12.606910 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 01:33:12.607000 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 01:33:12.607097 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 01:33:12.607186 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 01:33:12.607275 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 01:33:12.607364 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 01:33:12.607452 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:3 pasid:138)
+Sep 24 01:33:12.607541 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 124358 thread python3 pid 124358
+Sep 24 01:33:12.607628 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x0000000000321000 from IH client 27 (GC_UTCL2)
+Sep 24 01:33:12.607717 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 2 fault from die AID0.XCD0
+Sep 24 01:33:12.607806 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 01:33:12.607894 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 01:33:12.607982 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 01:33:12.608081 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 01:33:12.608169 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 01:33:12.608258 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 01:33:12.608345 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 01:33:12.608432 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 01:33:12.608519 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 01:35:41.391080 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:3 pasid:144)
+Sep 24 01:35:41.391502 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 127557 thread python3 pid 127557
+Sep 24 01:35:41.391634 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x0000000000087000 from IH client 27 (GC_UTCL2)
+Sep 24 01:35:41.391742 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 10 fault from die AID1.XCD0
+Sep 24 01:35:41.391860 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 01:35:41.391952 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 01:35:41.392049 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 01:35:41.392166 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 01:35:41.392258 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 01:35:41.392347 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 01:35:41.392437 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 01:35:41.392524 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 01:35:41.392612 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 01:35:41.392699 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:3 pasid:144)
+Sep 24 01:35:41.392788 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 127557 thread python3 pid 127557
+Sep 24 01:35:41.392877 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x0000000000400000 from IH client 27 (GC_UTCL2)
+Sep 24 01:35:41.392971 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 13 fault from die AID1.XCD3
+Sep 24 01:35:41.393067 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 01:35:41.393156 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 01:35:41.393244 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 01:35:41.393333 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 01:35:41.393420 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 01:35:41.393508 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 01:35:41.393595 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 01:35:41.393684 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 01:35:41.393774 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 01:35:41.393862 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:3 pasid:144)
+Sep 24 01:35:41.393947 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 127557 thread python3 pid 127557
+Sep 24 01:35:41.394035 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x0000000000033000 from IH client 27 (GC_UTCL2)
+Sep 24 01:35:41.394133 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 10 fault from die AID1.XCD0
+Sep 24 01:35:41.394220 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 01:35:41.394307 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 01:35:41.394392 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 01:35:41.394482 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 01:35:41.394569 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 01:35:41.394656 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 01:35:41.394745 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 01:35:41.394831 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 01:35:41.394918 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 01:35:41.395004 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:3 pasid:144)
+Sep 24 01:35:41.395101 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 127557 thread python3 pid 127557
+Sep 24 01:35:41.395187 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x000000000007c000 from IH client 27 (GC_UTCL2)
+Sep 24 01:35:41.395275 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 13 fault from die AID1.XCD3
+Sep 24 01:35:41.395365 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 01:35:41.395452 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 01:35:41.395540 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 01:35:41.395628 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 01:35:41.395715 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 01:35:41.395803 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 01:35:41.395888 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 01:35:41.395978 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 01:35:41.396071 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 01:35:41.396160 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:3 pasid:144)
+Sep 24 01:35:41.396244 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 127557 thread python3 pid 127557
+Sep 24 01:35:41.396331 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x0000000000087000 from IH client 27 (GC_UTCL2)
+Sep 24 01:35:41.396419 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 10 fault from die AID1.XCD0
+Sep 24 01:35:41.396506 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 01:35:41.396592 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 01:35:41.396681 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 01:35:41.396766 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 01:35:41.396854 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 01:35:41.396944 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 01:35:41.397030 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 01:35:41.397122 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 01:35:41.397209 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 01:35:41.397294 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:3 pasid:144)
+Sep 24 01:35:41.397382 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 127557 thread python3 pid 127557
+Sep 24 01:35:41.397470 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x0000000000078000 from IH client 27 (GC_UTCL2)
+Sep 24 01:35:41.397557 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 13 fault from die AID1.XCD3
+Sep 24 01:35:41.397644 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 01:35:41.397733 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 01:35:41.397818 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 01:35:41.397904 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 01:35:41.397991 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 01:35:41.398082 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 01:35:41.398171 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 01:35:41.398259 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 01:35:41.398345 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 01:35:41.398430 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:3 pasid:144)
+Sep 24 01:35:41.398518 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 127557 thread python3 pid 127557
+Sep 24 01:35:41.398601 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x0000000000033000 from IH client 27 (GC_UTCL2)
+Sep 24 01:35:41.398688 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 10 fault from die AID1.XCD0
+Sep 24 01:35:41.398776 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 01:35:41.398864 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 01:35:41.398951 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 01:35:41.399038 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 01:35:41.399127 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 01:35:41.399215 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 01:35:41.399301 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 01:35:41.399386 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 01:35:41.399476 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Fence fallback timer expired on ring sdma0.0
+Sep 24 01:35:41.399571 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 01:35:41.399656 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:3 pasid:144)
+Sep 24 01:35:41.687031 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 127557 thread python3 pid 127557
+Sep 24 01:35:41.687207 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x0000000000074000 from IH client 27 (GC_UTCL2)
+Sep 24 01:35:41.687319 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 13 fault from die AID1.XCD3
+Sep 24 01:35:41.687412 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 01:35:41.687505 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 01:35:41.687594 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 01:35:41.687681 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 01:35:41.687770 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 01:35:41.687865 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 01:35:41.687954 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 01:35:41.688040 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 01:35:41.688135 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 01:35:41.688225 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:3 pasid:144)
+Sep 24 01:35:41.688316 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 127557 thread python3 pid 127557
+Sep 24 01:35:41.688403 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x0000000000083000 from IH client 27 (GC_UTCL2)
+Sep 24 01:35:41.688496 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 10 fault from die AID1.XCD0
+Sep 24 01:35:41.688585 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 01:35:41.688672 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 01:35:41.688759 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 01:35:41.688847 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 01:35:41.688934 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 01:35:41.689021 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 01:35:41.689112 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 01:35:41.689201 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 01:35:41.689290 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 01:35:41.689379 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:24 vmid:3 pasid:144)
+Sep 24 01:35:41.689466 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 127557 thread python3 pid 127557
+Sep 24 01:35:41.689553 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x0000000000087000 from IH client 27 (GC_UTCL2)
+Sep 24 01:35:41.689640 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 10 fault from die AID1.XCD0
+Sep 24 01:35:41.689728 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 01:35:41.689816 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 01:35:41.689903 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 01:35:41.689989 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 01:35:41.690083 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 01:35:41.690171 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 01:35:41.690258 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 01:35:41.690347 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 01:35:41.690434 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 03:58:26.692670 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:340)
+Sep 24 03:58:26.693431 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 268991 thread python3 pid 268991
+Sep 24 03:58:26.693714 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007da92f213000 from IH client 27 (GC_UTCL2)
+Sep 24 03:58:26.693836 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+Sep 24 03:58:26.693938 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 03:58:26.694032 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 03:58:26.694149 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 03:58:26.694246 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 03:58:26.694337 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 03:58:26.694427 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 03:58:26.694518 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 03:58:26.694608 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 03:58:26.694696 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 03:58:26.694785 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:340)
+Sep 24 03:58:26.694874 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 268991 thread python3 pid 268991
+Sep 24 03:58:26.694962 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007da928405000 from IH client 27 (GC_UTCL2)
+Sep 24 03:58:26.695059 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 13 fault from die AID1.XCD3
+Sep 24 03:58:26.695153 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 03:58:26.695240 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 03:58:26.695328 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 03:58:26.695417 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 03:58:26.695503 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 03:58:26.695590 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 03:58:26.695678 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 03:58:26.695765 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 03:58:26.695853 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 03:58:26.695941 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:340)
+Sep 24 03:58:26.696029 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 268991 thread python3 pid 268991
+Sep 24 03:58:26.696124 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007da928407000 from IH client 27 (GC_UTCL2)
+Sep 24 03:58:26.696214 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 13 fault from die AID1.XCD3
+Sep 24 03:58:26.696302 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 03:58:26.696389 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 03:58:26.696479 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 03:58:26.696566 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 03:58:26.696655 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 03:58:26.696742 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 03:58:26.696830 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 03:58:26.696916 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 03:58:26.697002 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 03:58:26.697094 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:340)
+Sep 24 03:58:26.697182 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 268991 thread python3 pid 268991
+Sep 24 03:58:26.697269 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007da92f433000 from IH client 27 (GC_UTCL2)
+Sep 24 03:58:26.697356 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+Sep 24 03:58:26.697441 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 03:58:26.697528 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 03:58:26.697615 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 03:58:26.697701 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 03:58:26.697789 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 03:58:26.697874 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 03:58:26.697965 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 03:58:26.698052 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 03:58:26.698149 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 03:58:26.698236 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:340)
+Sep 24 03:58:26.698323 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 268991 thread python3 pid 268991
+Sep 24 03:58:26.698409 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007da928409000 from IH client 27 (GC_UTCL2)
+Sep 24 03:58:26.698498 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 13 fault from die AID1.XCD3
+Sep 24 03:58:26.698585 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 03:58:26.698671 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 03:58:26.698756 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 03:58:26.698842 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 03:58:26.698929 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 03:58:26.699015 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 03:58:26.699106 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 03:58:26.699193 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 03:58:26.699278 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 03:58:26.699368 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:340)
+Sep 24 03:58:26.699457 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 268991 thread python3 pid 268991
+Sep 24 03:58:26.699545 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007da92840b000 from IH client 27 (GC_UTCL2)
+Sep 24 03:58:26.699634 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 13 fault from die AID1.XCD3
+Sep 24 03:58:26.699722 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 03:58:26.699805 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 03:58:26.699891 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 03:58:26.699978 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 03:58:26.700067 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 03:58:26.700153 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 03:58:26.700236 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 03:58:26.700324 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 03:58:26.700420 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 03:58:26.700507 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:340)
+Sep 24 03:58:26.700593 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 268991 thread python3 pid 268991
+Sep 24 03:58:26.700679 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007da92fb3c000 from IH client 27 (GC_UTCL2)
+Sep 24 03:58:26.700771 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 10 fault from die AID1.XCD0
+Sep 24 03:58:26.700859 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 03:58:26.700945 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 03:58:26.701030 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 03:58:26.701122 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 03:58:26.701209 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 03:58:26.701296 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 03:58:26.701381 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 03:58:26.701469 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 03:58:26.701556 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 03:58:26.701640 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:340)
+Sep 24 03:58:26.701728 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 268991 thread python3 pid 268991
+Sep 24 03:58:26.701813 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007da92840d000 from IH client 27 (GC_UTCL2)
+Sep 24 03:58:26.701900 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 13 fault from die AID1.XCD3
+Sep 24 03:58:26.701987 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 03:58:26.702080 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 03:58:26.702171 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 03:58:26.702256 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 03:58:26.702342 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 03:58:26.702427 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 03:58:26.702515 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 03:58:26.702600 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 03:58:26.702686 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 03:58:26.702772 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:340)
+Sep 24 03:58:26.702859 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 268991 thread python3 pid 268991
+Sep 24 03:58:26.702946 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007da92840f000 from IH client 27 (GC_UTCL2)
+Sep 24 03:58:26.703037 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 13 fault from die AID1.XCD3
+Sep 24 03:58:26.703131 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 03:58:26.703218 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 03:58:26.703304 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 03:58:26.703391 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 03:58:26.703477 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 03:58:26.703562 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 03:58:26.703651 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 03:58:26.703738 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 03:58:26.703824 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 03:58:26.703910 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:340)
+Sep 24 03:58:26.703996 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 268991 thread python3 pid 268991
+Sep 24 03:58:26.704088 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007da91821f000 from IH client 27 (GC_UTCL2)
+Sep 24 03:58:26.704177 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 10 fault from die AID1.XCD0
+Sep 24 03:58:26.704262 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 03:58:26.704347 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 03:58:26.704434 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 03:58:26.704518 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 03:58:26.704608 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 03:58:26.704694 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 03:58:26.704777 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 03:58:26.704871 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 03:58:26.704958 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 03:58:26.734091 heliosr-1b114-c07-1 kernel: workqueue: copy_context_work_handler [amdgpu] hogged CPU for >10000us 4 times, consider switching to WQ_UNBOUND
+Sep 24 05:10:18.002999 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:1065)
+Sep 24 05:10:18.003264 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 322912 thread python3 pid 322912
+Sep 24 05:10:18.003383 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007ed0642e4000 from IH client 27 (GC_UTCL2)
+Sep 24 05:10:18.003482 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+Sep 24 05:10:18.003587 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 05:10:18.003687 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 05:10:18.003781 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 05:10:18.003874 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 05:10:18.003966 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 05:10:18.004064 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 05:10:18.004157 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 05:10:18.004246 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 05:10:18.004334 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 05:10:18.004421 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:1065)
+Sep 24 05:10:18.004511 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 322912 thread python3 pid 322912
+Sep 24 05:10:18.004601 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007ed0642e6000 from IH client 27 (GC_UTCL2)
+Sep 24 05:10:18.004688 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+Sep 24 05:10:18.004774 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 05:10:18.004860 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 05:10:18.004948 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 05:10:18.005040 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 05:10:18.005171 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 05:10:18.005260 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 05:10:18.005348 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 05:10:18.005432 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 05:10:18.005517 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 05:10:18.005603 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:1065)
+Sep 24 05:10:18.005693 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 322912 thread python3 pid 322912
+Sep 24 05:10:18.005781 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007ed0642e8000 from IH client 27 (GC_UTCL2)
+Sep 24 05:10:18.005870 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+Sep 24 05:10:18.005956 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 05:10:18.006045 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 05:10:18.006139 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 05:10:18.006226 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 05:10:18.006312 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 05:10:18.006397 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 05:10:18.006483 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 05:10:18.006571 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 05:10:18.006658 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 05:10:18.006745 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:1065)
+Sep 24 05:10:18.006832 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 322912 thread python3 pid 322912
+Sep 24 05:10:18.006921 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007ed0642ea000 from IH client 27 (GC_UTCL2)
+Sep 24 05:10:18.007009 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+Sep 24 05:10:18.007102 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 05:10:18.007188 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 05:10:18.007274 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 05:10:18.007363 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 05:10:18.007450 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 05:10:18.007538 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 05:10:18.007623 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 05:10:18.007709 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 05:10:18.007797 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 05:10:18.007882 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:1065)
+Sep 24 05:10:18.007967 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 322912 thread python3 pid 322912
+Sep 24 05:10:18.008058 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007ed0642ec000 from IH client 27 (GC_UTCL2)
+Sep 24 05:10:18.008146 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+Sep 24 05:10:18.008232 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 05:10:18.008318 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 05:10:18.008404 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 05:10:18.008490 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 05:10:18.008577 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 05:10:18.008662 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 05:10:18.008749 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 05:10:18.008837 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 05:10:18.008922 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 05:10:18.009007 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:1065)
+Sep 24 05:10:18.009098 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 322912 thread python3 pid 322912
+Sep 24 05:10:18.009183 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007ed0642ee000 from IH client 27 (GC_UTCL2)
+Sep 24 05:10:18.009272 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+Sep 24 05:10:18.009361 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 05:10:18.009446 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 05:10:18.009533 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 05:10:18.009618 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 05:10:18.009703 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 05:10:18.009788 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 05:10:18.009873 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 05:10:18.009959 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 05:10:18.010044 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 05:10:18.010135 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:1065)
+Sep 24 05:10:18.010219 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 322912 thread python3 pid 322912
+Sep 24 05:10:18.010304 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007ed0642e4000 from IH client 27 (GC_UTCL2)
+Sep 24 05:10:18.010390 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+Sep 24 05:10:18.010476 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 05:10:18.010562 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 05:10:18.010648 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 05:10:18.010747 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 05:10:18.010837 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 05:10:18.010925 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 05:10:18.011011 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 05:10:18.011101 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 05:10:18.011187 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 05:10:18.011272 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:1065)
+Sep 24 05:10:18.011357 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 322912 thread python3 pid 322912
+Sep 24 05:10:18.011442 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007ed0642e6000 from IH client 27 (GC_UTCL2)
+Sep 24 05:10:18.011530 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+Sep 24 05:10:18.011616 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 05:10:18.011701 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 05:10:18.011788 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 05:10:18.011876 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 05:10:18.011960 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 05:10:18.012046 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 05:10:18.012139 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 05:10:18.012225 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 05:10:18.012314 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 05:10:18.012400 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:1065)
+Sep 24 05:10:18.012486 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 322912 thread python3 pid 322912
+Sep 24 05:10:18.012573 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007ed0642e8000 from IH client 27 (GC_UTCL2)
+Sep 24 05:10:18.012657 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+Sep 24 05:10:18.012747 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 05:10:18.012832 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 05:10:18.012918 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 05:10:18.013005 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 05:10:18.013097 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 05:10:18.013186 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 05:10:18.013271 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 05:10:18.013357 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 05:10:18.013442 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 05:10:18.013527 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:3 pasid:1065)
+Sep 24 05:10:18.013618 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 322912 thread python3 pid 322912
+Sep 24 05:10:18.013705 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007ed0642ea000 from IH client 27 (GC_UTCL2)
+Sep 24 05:10:18.013791 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+Sep 24 05:10:18.013877 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 05:10:18.013963 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 05:10:18.014048 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 05:10:18.014143 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 05:10:18.014230 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 05:10:18.014317 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 05:10:18.014402 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 05:10:18.014489 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 05:10:18.014574 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 07:58:04.607098 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:4 pasid:1261)
+Sep 24 07:58:04.607494 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 468533 thread python3 pid 468533
+Sep 24 07:58:04.607627 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007e1f980ec000 from IH client 27 (GC_UTCL2)
+Sep 24 07:58:04.607732 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+Sep 24 07:58:04.607832 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 07:58:04.607927 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 07:58:04.608020 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 07:58:04.608150 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 07:58:04.608243 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 07:58:04.608331 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 07:58:04.608421 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 07:58:04.608510 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 07:58:04.608736 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 07:58:04.609029 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:4 pasid:1261)
+Sep 24 07:58:04.609170 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 468533 thread python3 pid 468533
+Sep 24 07:58:04.609272 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007e1f97d33000 from IH client 27 (GC_UTCL2)
+Sep 24 07:58:04.609369 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 4 fault from die AID0.XCD2
+Sep 24 07:58:04.609466 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 07:58:04.609554 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 07:58:04.609653 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 07:58:04.609743 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 07:58:04.609832 heliosr-1b114-c07-1 kernel: workqueue: copy_context_work_handler [amdgpu] hogged CPU for >10000us 5 times, consider switching to WQ_UNBOUND
+Sep 24 07:58:04.740083 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 07:58:04.740273 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 07:58:04.740379 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 07:58:04.740475 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 07:58:04.740565 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 07:58:04.740653 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:4 pasid:1261)
+Sep 24 07:58:04.740750 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 468533 thread python3 pid 468533
+Sep 24 07:58:04.740841 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x00007e1f99123000 from IH client 27 (GC_UTCL2)
+Sep 24 07:58:04.740934 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 4 fault from die AID0.XCD2
+Sep 24 07:58:04.741022 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 07:58:04.741129 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 07:58:04.741219 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 07:58:04.741307 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 07:58:04.741393 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 07:58:04.741481 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 07:58:04.741566 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 07:58:04.741653 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 07:58:04.741741 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 08:58:52.592882 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:4 pasid:1575)
+Sep 24 08:58:52.593308 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 576508 thread python3 pid 576508
+Sep 24 08:58:52.593444 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x000071d29e42b000 from IH client 27 (GC_UTCL2)
+Sep 24 08:58:52.593550 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+Sep 24 08:58:52.593653 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 08:58:52.593749 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 08:58:52.593841 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 08:58:52.593935 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 08:58:52.594030 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 08:58:52.594128 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 08:58:52.594219 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 08:58:52.594313 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 08:58:52.594404 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 08:58:52.594493 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:4 pasid:1575)
+Sep 24 08:58:52.594582 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 576508 thread python3 pid 576508
+Sep 24 08:58:52.594683 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x000071d29e9e3000 from IH client 27 (GC_UTCL2)
+Sep 24 08:58:52.594776 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 11 fault from die AID1.XCD1
+Sep 24 08:58:52.594868 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 08:58:52.594956 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 08:58:52.595043 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 08:58:52.595138 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 08:58:52.595225 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 08:58:52.595313 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 08:58:52.595400 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 08:58:52.595491 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 08:58:52.595579 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 08:58:52.595708 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:4 pasid:1575)
+Sep 24 08:58:52.595795 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 576508 thread python3 pid 576508
+Sep 24 08:58:52.595885 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x000071d296a6e000 from IH client 27 (GC_UTCL2)
+Sep 24 08:58:52.595975 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 3 fault from die AID0.XCD1
+Sep 24 08:58:52.596097 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 08:58:52.596191 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 08:58:52.596279 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 08:58:52.596365 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 08:58:52.596453 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 08:58:52.596541 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 08:58:52.596627 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 08:58:52.596713 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 08:58:52.596802 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 08:58:52.596888 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:4 pasid:1575)
+Sep 24 08:58:52.596975 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 576508 thread python3 pid 576508
+Sep 24 08:58:52.597070 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x000071d29e1b3000 from IH client 27 (GC_UTCL2)
+Sep 24 08:58:52.597161 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 13 fault from die AID1.XCD3
+Sep 24 08:58:52.597254 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 08:58:52.597347 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 08:58:52.597433 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 08:58:52.597520 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 08:58:52.597607 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 08:58:52.597697 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 08:58:52.597783 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 08:58:52.597871 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 08:58:52.597956 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 08:58:52.598040 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:4 pasid:1575)
+Sep 24 08:58:52.598133 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 576508 thread python3 pid 576508
+Sep 24 08:58:52.598219 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x000071d29c98b000 from IH client 27 (GC_UTCL2)
+Sep 24 08:58:52.598312 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 12 fault from die AID1.XCD2
+Sep 24 08:58:52.598407 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 08:58:52.598493 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 08:58:52.598577 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 08:58:52.598664 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 08:58:52.598752 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 08:58:52.598837 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 08:58:52.598923 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 08:58:52.599011 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 08:58:52.599106 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 08:58:52.599194 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:40 vmid:4 pasid:1575)
+Sep 24 08:58:52.599281 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:  Process python3 pid 576508 thread python3 pid 576508
+Sep 24 08:58:52.599366 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   in page starting at address 0x000071d29e09b000 from IH client 27 (GC_UTCL2)
+Sep 24 08:58:52.599453 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:   cookie node_id 4 fault from die AID0.XCD2
+Sep 24 08:58:52.599542 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00D040A1
+Sep 24 08:58:52.599628 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          Faulty UTCL2 client ID: TCP (0x8)
+Sep 24 08:58:52.599718 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MORE_FAULTS: 0x1
+Sep 24 08:58:52.599805 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          WALKER_ERROR: 0x0
+Sep 24 08:58:52.599889 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          PERMISSION_FAULTS: 0x5
+Sep 24 08:58:52.599976 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          MAPPING_ERROR: 0x0
+Sep 24 08:58:52.600066 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          RW: 0x1
+Sep 24 08:58:52.600151 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+Sep 24 08:58:52.600240 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0:          FED: 0x0
+Sep 24 08:59:24.047090 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=INVALIDATE_TLBS
+Sep 24 08:59:26.521093 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=INVALIDATE_TLBS
+Sep 24 08:59:28.990085 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=INVALIDATE_TLBS
+Sep 24 08:59:31.462089 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=INVALIDATE_TLBS
+Sep 24 08:59:34.119085 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 08:59:36.594704 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=SUSPEND
+Sep 24 08:59:36.594959 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to suspend all gangs
+Sep 24 08:59:39.071289 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=RESET
+Sep 24 08:59:39.071550 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Failed to detect hung queues
+Sep 24 08:59:41.547095 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=RESUME
+Sep 24 08:59:41.547302 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to resume all gangs
+Sep 24 08:59:41.556265 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to remove queue from MES, doorbell=0x1202
+Sep 24 08:59:41.565993 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES might be in unrecoverable state, issue a GPU reset
+Sep 24 08:59:41.572954 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Failed to evict queue 2
+Sep 24 08:59:41.573133 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: GPU reset begin!. Source:  3
+Sep 24 08:59:41.573244 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Failed to evict process queues
+Sep 24 08:59:44.056693 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=ADD_QUEUE
+Sep 24 08:59:44.057016 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to add hardware queue to MES, doorbell=0x1202
+Sep 24 08:59:44.067904 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES might be in unrecoverable state, issue a GPU reset
+Sep 24 08:59:44.076311 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Failed to restore queue 2
+Sep 24 08:59:44.085398 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Failed to restore process queues
+Sep 24 08:59:44.085561 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: remove_all_kfd_queues_mes: Failed to remove queue 2 for dev 56179
+Sep 24 08:59:44.097203 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Suspending ip block mes_v12_1
+Sep 24 08:59:44.097442 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Suspending ip block gfx_v12_1
+Sep 24 08:59:46.578362 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 08:59:46.578552 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 08:59:49.058193 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 08:59:49.058476 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 08:59:51.535285 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 08:59:51.535550 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 08:59:54.011679 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 08:59:54.011861 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 08:59:56.491305 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 08:59:56.491477 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 08:59:58.968037 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 08:59:58.968320 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:00:01.802806 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) ring buffer is full.
+Sep 24 09:00:04.637369 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(0, 0) ring buffer is full.
+Sep 24 09:00:07.116650 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:00:07.116928 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:00:09.591448 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:00:09.591719 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:00:12.069289 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:00:12.069478 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:00:14.546029 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:00:14.546270 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:00:17.024556 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:00:17.024804 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:00:19.501367 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:00:19.501672 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:00:21.979306 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:00:21.979550 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:00:24.457034 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(1, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:00:24.457256 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:00:26.934030 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(2, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:00:26.934274 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:00:29.413584 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(2, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:00:29.413833 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:00:31.891036 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(2, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:00:31.891320 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:00:34.369022 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(2, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:00:34.369237 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:00:36.845282 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(2, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:00:36.845470 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:00:39.323842 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(2, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:00:39.324081 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:00:41.794090 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(2, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:00:41.794336 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:00:44.268614 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(2, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:00:44.268794 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:00:46.744604 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(3, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:00:46.744792 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:00:49.219707 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(3, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:00:49.219897 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:00:51.696033 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(3, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:00:51.696380 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:00:54.172524 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(3, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:00:54.172772 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:00:56.648289 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(3, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:00:56.648495 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:00:59.125908 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(3, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:00:59.126173 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:01:01.602039 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(3, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:01:01.602339 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:01:04.078641 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(3, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:01:04.078861 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:01:06.555288 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(4, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:01:06.555480 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:01:09.031779 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(4, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:01:09.031953 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:01:11.508295 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(4, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:01:11.508538 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:01:13.985029 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(4, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:01:13.985268 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:01:16.462034 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(4, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:01:16.462249 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:01:18.938535 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(4, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:01:18.938812 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:01:21.414635 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(4, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:01:21.414865 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:01:23.890779 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(4, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:01:23.891014 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:01:26.368033 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(5, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:01:26.368298 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:01:28.844289 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(5, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:01:28.844557 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:01:31.322039 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(5, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:01:31.322375 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:01:33.798764 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(5, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:01:33.798944 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:01:36.274633 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(5, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:01:36.274822 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:01:38.750660 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(5, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:01:38.750843 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:01:41.227291 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(5, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:01:41.227464 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:01:43.704696 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(5, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:01:43.704876 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:01:46.181733 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(6, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:01:46.182009 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:01:48.658285 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(6, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:01:48.658479 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:01:50.038163 heliosr-1b114-c07-1 kernel: Workqueue: events_freezable svm_range_restore_work [amdgpu]
+Sep 24 09:01:50.038312 heliosr-1b114-c07-1 kernel:  svm_range_list_lock_and_flush_work+0x3c/0xf0 [amdgpu]
+Sep 24 09:01:50.038324 heliosr-1b114-c07-1 kernel:  svm_range_restore_work+0x75/0x360 [amdgpu]
+Sep 24 09:01:50.065694 heliosr-1b114-c07-1 kernel:  svm_migrate_copy_done.part.0.isra.0+0x1e/0x90 [amdgpu]
+Sep 24 09:01:50.066164 heliosr-1b114-c07-1 kernel:  svm_migrate_vram_to_ram+0x74d/0xc10 [amdgpu]
+Sep 24 09:01:50.067066 heliosr-1b114-c07-1 kernel:  svm_migrate_to_ram+0x157/0x310 [amdgpu]
+Sep 24 09:01:51.135590 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(6, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:01:51.135841 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:01:53.613288 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(6, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:01:53.613478 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:01:56.091223 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(6, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:01:56.091502 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:01:58.568031 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(6, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:01:58.568360 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:02:01.043507 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(6, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:02:01.043733 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:02:03.523562 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(6, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:02:03.523737 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:02:06.001033 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(7, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:02:06.001248 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:02:08.478052 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(7, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:02:08.478386 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:02:10.955291 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(7, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:02:10.955502 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:02:13.432045 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(7, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:02:13.432398 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:02:15.907779 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(7, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:02:15.907962 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:02:18.384830 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(7, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:02:18.385039 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:02:20.860777 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(7, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:02:20.860951 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:02:23.337295 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: MES(7, 0) failed to respond to msg=REMOVE_QUEUE
+Sep 24 09:02:23.337508 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: failed to unmap legacy queue
+Sep 24 09:02:23.338085 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: Suspending ip block ih_v7_0
+Sep 24 09:02:23.546088 heliosr-1b114-c07-1 kernel: amdgpu 0001:01:00.0: wait for reset ack
+Sep 24 09:03:52.917465 heliosr-1b114-c07-1 kernel: Workqueue: events_freezable svm_range_restore_work [amdgpu]
+Sep 24 09:03:52.918399 heliosr-1b114-c07-1 kernel:  svm_range_list_lock_and_flush_work+0x3c/0xf0 [amdgpu]
+Sep 24 09:03:52.918429 heliosr-1b114-c07-1 kernel:  svm_range_restore_work+0x75/0x360 [amdgpu]
+Sep 24 09:03:52.945262 heliosr-1b114-c07-1 kernel:  svm_migrate_copy_done.part.0.isra.0+0x1e/0x90 [amdgpu]
+Sep 24 09:03:52.946101 heliosr-1b114-c07-1 kernel:  svm_migrate_vram_to_ram+0x74d/0xc10 [amdgpu]
+Sep 24 09:03:52.946119 heliosr-1b114-c07-1 kernel:  svm_migrate_to_ram+0x157/0x310 [amdgpu]

@@ -2908,7 +2908,8 @@ retro-explains every reorder result on this operator with one quantity:
 |---|---|--:|
 | `g62` k_dkdv depth 1 -> 2 | +~1 iteration | **+1.65%** |
 | `g28` | reduced | -7.8% |
-| `g66` spread k_dq's 32 loads | collapsed | -19.33% |
+| `g63` k_dq prefetch depth 1->2 | — | -19.33% |
+| `g66` spread k_dq's 32 loads | collapsed | **-21.93%** |
 | **`g68` spread k_dkdv's 32 loads** | **~603 -> ~41 instructions** | **-30.32%** |
 | `P70` delete k_dq's prefetch | to zero | -10.86% |
 
@@ -2985,3 +2986,136 @@ unresolved, not zero" — but quote this operator's own 0.40–0.66% when gradin
 champion by more than the same-session floor", not "be positive". `min_gain: 0.0` is what let
 round 20 promote on gain 1.0016, and that gap between the spec and what is worth banking is
 real regardless of which floor you use.
+
+## h39 — END-OF-DAY VERIFICATION. Twelve of eighteen summary claims needed correcting, and three had already hardened into `findings/`. Read this before citing anything written on 2026-09-24.
+
+A CPU-only audit re-derived every load-bearing number from the artifacts. Results below. The
+mechanism narrative survives; the arithmetic and the attributions did not.
+
+### 1. THE IDLE-CLOCK TRAP — the worst one, and it is the null-experiment trap again
+
+`rounds/022/_scratch/scr/pw.sh:12` passes `--arms cur_a`. `benchmark.py:84-85` resolves that
+to `job_context/op/cur_a`, which does not exist, and `:160-162` calls `ap.error` ->
+`SystemExit(2)`. stdout and stderr go to `/dev/null`; the script ends in `wait`, so **it
+returned rc=0 and produced 60 plausible-looking rows of a benchmark that never ran.**
+
+The real 264-sample 1 Hz trace across the scored block
+(`rounds/022/_scratch/run/meas/power_trace.txt`) says the opposite of what was recorded:
+
+| sclk | samples |
+|---|--:|
+| 1100 MHz | **67** (three ~21 s inter-process gaps only) |
+| 1040–1055 | 12 |
+| **<= 1030** | **185** |
+
+**1100 MHz is the IDLE clock. The prod window runs 998–1029 MHz — about 9% droop.**
+`benchmark.py:11-12`'s own comment already said the VR limits to 1100 and drifts to 967
+inside a timing window.
+
+- **RETRACT: "power and clock were retired by measurement", "sclk flat at 1100 for 60/60",
+  "the card was throttling is no longer available".** All three were false.
+- Package power was **never measured under load**: 851/853/855 W are all idle samples from
+  the same dead file, and `meas.sh:10` greps `Average Graphics Package Power` while this box
+  prints `Current Socket Graphics Package Power`, so the loaded trace captured no power column.
+- **What survives:** same-session palindromic A/B exposes every arm to the same droop, so A/B
+  *deltas* remain valid. Only the absolute clock claim dies.
+- Source retractions inserted at `findings/facts.md` and `findings/dead_ends.md` today.
+
+**RULE, and this is the second time today one probe reported success without running:** an
+instrument script must assert that its subject actually executed. `meas.sh`, `champ.sh` and
+`val.sh` all echo `RC_$S` per shape; `pw.sh` alone did not. Never send a measured process to
+`/dev/null`, and never take the exit code of `wait` as the subject's exit code.
+
+### 2. Arm attribution
+
+**`g66` is −21.93%. `g63` is −19.33%.** My h38 table had them merged under `g66`; fixed in
+place. `findings/facts.md:26,66-69` was correct all along — the hint was the wrong copy.
+Corrected reorder list:
+
+| arm | what it is | prod |
+|---|---|--:|
+| `g62` | k_dkdv prefetch depth 1->2 (VGPR 724->912, **not** a pure reorder) | +1.65% |
+| `g28` | unroll (**not** a reorder) | −7.8% |
+| `g63` | k_dq prefetch depth 1->2 | **−19.33%** |
+| `g66` | spread k_dq's 32 loads — pure reorder, VGPR flat | **−21.93%** |
+| `g68` | spread k_dkdv's 32 loads — pure reorder, VGPR flat | −30.0% (champion sweep) / −30.32% (scored A/B) |
+| `P70` | delete k_dq's prefetch (**not** a reorder) | −10.86% |
+
+Only `g66` and `g68` are equal-register pure reorders. The "five reorder results" framing
+overclaimed; the argument needs only those two, and they carry it.
+
+**`g60` deleted 115 issue slots, not 82** (`s_set_vgpr_msb` 334->277 = 57, `v_nop` 82->24 =
+58). "82" was the *count* of the incumbent's `v_nop`, read as a delta.
+
+### 3. The bar census — the conclusion holds, the two numbers do not
+
+`n=177` and `median 7.6721` are both wrong. Recomputed: **224 raw lines, 146 after
+deduplication** (the 177 was a 10:49 snapshot of 158 plus 19 lines from `.runs/`, which is
+byte-identical to `rounds/002` raw — double counting). Median is **7.6766** (n=224) or
+**7.6769** (n=146).
+
+**Every number that matters is unchanged under every inclusion rule I tried:** min 7.6077,
+max 7.7556, sd 0.47–0.50%, **zero records >= 7.8 ms**, median throughput 716 TF/s.
+**Always state the dedup convention with an `n`** — this corpus has now produced 158, 177 and
+224 for the same quantity.
+
+### 4. Two claims that are UNSUPPORTED, not merely wrong
+
+- **"10.160 was retracted the same day by a 10.062-vs-8.13 A/B."** The figures 10.062 and
+  8.13 appear only in prose written today (`hint.md` and its copies); there is **no primary
+  record**. The real retraction is `output/0915__opt/E2E-AB.md:296-299`, it retracts
+  **10.118**, it gives a **range 8.13–8.68**, and `:294` states plainly that none of it was
+  hardware-verified. 8.13 is probably today's 8.1334 back-filled onto 09-15.
+  **Restate as: 10.160 was superseded by an upper-layer fix; the accompanying A/B is
+  prose-only.** The main conclusion — 10.160 is a shim artefact and the bar is ~7.68 ms —
+  rests on the 224-line census and is untouched.
+- **h32's cost decomposition** (+1.15 loader / +1.42 autograd / +0.01 scratch, from
+  9.2834 / 8.1334 / 8.1419) has **no primary source anywhere in the repository**. Mark
+  prose-only. The card is gone; it cannot be re-measured.
+- **"The 20–30% prediction was written before the card."** The text is real
+  (`022/1-opt/act.yaml:141-151`) but has **no independent timestamp** — `act.yaml` mtime
+  14:23:51 postdates the scored measurement at 14:06:47. Only the model's *inputs* (ISA dump
+  13:55:29) are provably prior. Say "self-reported pre-registration". **To make
+  pre-registration a claimable property, the `expected` block must be written to its own file
+  and committed before the run starts.**
+
+### 5. h33's line numbers are round 17's; `op/current` is round 20
+
+The findings are all correct on re-derivation (bijection with slack 0; `4*8192*32*512 = 2^29`
+so nsp=4 wraps negative and **nsp=8/16 wrap to exactly 0**; the `sq%64==32` floor/ceil gap;
+the unclamped prefetch). **The addresses are stale:**
+
+| claim | written | actual in `op/current` |
+|---|---|---|
+| dqp `num_records` | `:685` | **`:724`** (`:685` is an XCD-mapping comment) |
+| `_ldqd` prefetches | `:538` / `:545` | **`:573-574` / `:583-584`** |
+| `impl.py` assert | `:115` | `:115` (still correct) |
+
+### 6. Wedge facts corrected
+
+- **`[5796.84]` is AFTER the AC cycle.** This boot began 09:14:30, so that stamp is wall-clock
+  **10:51:06** — 1 h 52 m *after* the 08:58:52 wedge, on a different boot. My side-by-side
+  table earlier in this file compares across boots; read it as "the wedge first, the survivor
+  two hours later".
+- **h22's IH-ring-buffer-overflow discriminant is falsified, in reverse.** The 08:58:52 wedge
+  has **no** IH overflow; the 10:51:04 fault that the card **survived** has one. Strike the
+  claim at `hint.md:1556`.
+- `RW=0x1 / PERMISSION_FAULTS 0x5` is not a discriminant either — round 17's 07:58:04 fault
+  carried the same signature with zero MES lines and no wedge.
+- **Count: ONE wedge, ONE AC cycle** (single boot boundary today at 09:14:30). Text saying
+  "the round 17 and round 18 wedges" is wrong and has reached shipped code comments in
+  `validation.py`; it should read "the round 17 fault and the round 18 wedge".
+- Evidence archived at `output/0924__flydsl/wedge-rootcause/kernlog_prevboot_wedge.txt`
+  (1402 lines from `journalctl -k -b -1`). It existed **only** in the kernel log — nothing in
+  `artifacts/` recorded it, and the ring buffer died with the power cycle.
+
+### 7. Round 20's promotion, stated honestly
+
+`gain` was **1.0016 (0.16%)**. The prod pair behind it is r17 501.41 vs r20 511.42 (+2.00%)
+in round 20's own sweep, against a same-code floor of 0.66%; round 22's sweep gives r17
+505.85 / r19 507.13 / r20 516.87. Round 20's own `act.yaml:116-118` already declined to claim
+the merge's extra ~0.6 points as evidence. **Quote the floor whenever quoting the champion.**
+
+Also: `state.yaml:94-98` holds **four** champion keys. Round 20 owns only
+`prod_b4_s8192_hq32_hkv8_d128`; `champions.prod` is still 19 and `fast`/`proxy` are 17. See
+h35 — the rename forked the ledger and it is still forked.
