@@ -32,7 +32,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
-from primus_turbo.flydsl.utils.gemm_helper import xcd_remap_pid
+from primus_turbo.flydsl.utils.gemm_helper import mxfp4_packed_scale_byte, xcd_remap_pid
 
 _OOB = 0x7FFFFFFF  # word offset past any SRD -> buffer_load returns 0 / buffer_store dropped
 
@@ -400,6 +400,8 @@ def _emit_dual_body(
     GAMMA=None,
     tile_tr=None,
     tile_tc=None,
+    pack_row=None,
+    pack_col=None,
 ):
     """Emit one fused-dual tile (rowwise + colwise-transpose mxfp4 cast) for block
     ``bid``. ``row_2d``/``col_2d`` pick the C++ ``USE_2D_BLOCK`` amax geometry; the
@@ -447,7 +449,10 @@ def _emit_dual_body(
 
     def _srd(t, elem_off, elem_bytes, nrec_bytes):
         base = arith.index_cast(T.i64, buffer_ops.extract_base_index(t))
-        boff = arith.index_cast(T.i64, arith.index_cast(T.index, elem_off) * arith.index(elem_bytes))
+        # A whole-slab SRD gives both of these as host literals, which have no traced value
+        # for index_cast to unwrap.
+        _ix = lambda v: arith.index(v) if isinstance(v, int) else arith.index_cast(T.index, v)
+        boff = arith.index_cast(T.i64, _ix(elem_off) * arith.index(elem_bytes))
         raw = arith._to_raw(base + boff)
         r = rocdl.readfirstlane(res=raw.type, src=raw)  # pin the SRD base to an SGPR
         base_v = r.result if hasattr(r, "result") else r
@@ -468,9 +473,21 @@ def _emit_dual_body(
         c0i = arith.index_cast(T.index, cblk * tile_c)
         rsrc = _srd(X, r0i * arith.index_cast(T.index, C >> 1), 4, tile_r * (C >> 1) * 4)
         orsrc = _srd(ROW_OUT, r0i * arith.index_cast(T.index, cpad >> 3), 4, tile_r * (cpad >> 3) * 4)
-        rscrsrc = _srd(ROW_SC, r0i * arith.index_cast(T.index, cpad >> 5), 1, tile_r * (cpad >> 5))
+        if pack_row is None:
+            rscrsrc = _srd(ROW_SC, r0i * arith.index_cast(T.index, cpad >> 5), 1, tile_r * (cpad >> 5))
+        else:
+            # The packed layout scatters a tile's rows over the whole slab, so this SRD cannot
+            # be re-based per tile the way the canonical one is. Every term of num_records has
+            # to come off a traced extent: a host literal is folded in without keying the
+            # compile cache, and the next shape inherits this one's bound.
+            _qm = ((R + 255) >> 8) << 8
+            rscrsrc = _srd(ROW_SC, grsc, 1, _qm * ((C >> 7) * 4))
         corsrc = _srd(COL_OUT, c0i * arith.index_cast(T.index, rpad >> 3), 4, tile_c * (rpad >> 3) * 4)
-        cscrsrc = _srd(COL_SC, c0i * arith.index_cast(T.index, rpad >> 5), 1, tile_c * (rpad >> 5))
+        if pack_col is None:
+            cscrsrc = _srd(COL_SC, c0i * arith.index_cast(T.index, rpad >> 5), 1, tile_c * (rpad >> 5))
+        else:
+            _qn = ((C + 255) >> 8) << 8
+            cscrsrc = _srd(COL_SC, gcsc, 1, _qn * ((R >> 7) * 4))
 
     rstd_rsrc = None
     gamma_rsrc = None
@@ -586,7 +603,20 @@ def _emit_dual_body(
             grow = _row0 + r_row
             gcmb = cblk * tile_rmbc + cmb
             ob = grow * (cpad >> 3) + gcmb * 4 + gro
-            sc = grow * (cpad >> 5) + gcmb + grsc
+            sc = (
+                grow * (cpad >> 5) + gcmb + grsc
+                if pack_row is None
+                # The canonical store is tile-relative (its SRD is re-based per tile); the
+                # packed slab is addressed whole, so this one needs the global row.
+                else mxfp4_packed_scale_byte(
+                    r0 + r_row,
+                    gcmb,
+                    k128=pack_row["k128"],
+                    kk=C >> 8,  # (C // 128) // 2, traced
+                    b_ilv=pack_row["b_ilv"],
+                    is_b=pack_row["is_b"],
+                )
+            )
             if padded:
                 wok = gcmb < (cpad >> 5)  # rows always valid (R%64==0)
                 ob = arith.select(wok, ob, fx.Int32(_OOB))
@@ -616,7 +646,20 @@ def _emit_dual_body(
             grow = _row0 + r_row
             gcmb = cblk * (tile_c // 32) + cmb
             ob = grow * (cpad >> 3) + gcmb * 4 + gro
-            sc = grow * (cpad >> 5) + gcmb + grsc
+            sc = (
+                grow * (cpad >> 5) + gcmb + grsc
+                if pack_row is None
+                # The canonical store is tile-relative (its SRD is re-based per tile); the
+                # packed slab is addressed whole, so this one needs the global row.
+                else mxfp4_packed_scale_byte(
+                    r0 + r_row,
+                    gcmb,
+                    k128=pack_row["k128"],
+                    kk=C >> 8,  # (C // 128) // 2, traced
+                    b_ilv=pack_row["b_ilv"],
+                    is_b=pack_row["is_b"],
+                )
+            )
             if padded:
                 wok = gcmb < (cpad >> 5)  # rows always valid (R%64==0)
                 ob = arith.select(wok, ob, fx.Int32(_OOB))
@@ -658,7 +701,18 @@ def _emit_dual_body(
             gcol = _col0 + c_col
             gmmb = rblk * tile_rmb + mmb
             cob = gcol * (rpad >> 3) + gmmb * 4 + gco
-            csoff = gcol * (rpad >> 5) + gmmb + gcsc
+            csoff = (
+                gcol * (rpad >> 5) + gmmb + gcsc
+                if pack_col is None
+                else mxfp4_packed_scale_byte(
+                    cblk * _TC + c_col,
+                    gmmb,
+                    k128=pack_col["k128"],
+                    kk=R >> 8,  # (R // 128) // 2, traced
+                    b_ilv=pack_col["b_ilv"],
+                    is_b=pack_col["is_b"],
+                )
+            )
             if padded:
                 cok = gcol < C  # col-out has real-C rows; drop pad-K rows
                 cob = arith.select(cok, cob, fx.Int32(_OOB))
@@ -683,7 +737,18 @@ def _emit_dual_body(
             gcol = _col0 + c_col
             gmmb = rblk * tile_rmb + mmb
             cob = gcol * (rpad >> 3) + gmmb * 4 + gco
-            csoff = gcol * (rpad >> 5) + gmmb + gcsc
+            csoff = (
+                gcol * (rpad >> 5) + gmmb + gcsc
+                if pack_col is None
+                else mxfp4_packed_scale_byte(
+                    cblk * _TC + c_col,
+                    gmmb,
+                    k128=pack_col["k128"],
+                    kk=R >> 8,  # (R // 128) // 2, traced
+                    b_ilv=pack_col["b_ilv"],
+                    is_b=pack_col["is_b"],
+                )
+            )
             if padded:
                 cok = gcol < C  # col-out has real-C rows; drop pad-K rows
                 cob = arith.select(cok, cob, fx.Int32(_OOB))
@@ -693,7 +758,15 @@ def _emit_dual_body(
 
 
 def _build_dual_kernel(
-    row_rht, col_rht, row_2d=False, col_2d=False, col_locality=False, row_sr=False, col_sr=False
+    row_rht,
+    col_rht,
+    row_2d=False,
+    col_2d=False,
+    col_locality=False,
+    row_sr=False,
+    col_sr=False,
+    pack_row=None,
+    pack_col=None,
 ):
     """Single-recipe fused LDS dual (one coalesced 32x256 tile load feeds both the
     rowwise and colwise-transpose casts). Thin wrapper over ``_emit_dual_body``.
@@ -736,6 +809,8 @@ def _build_dual_kernel(
             row_sr=row_sr,
             col_sr=col_sr,
             sr_seed=SR_SEED,
+            pack_row=pack_row,
+            pack_col=pack_col,
             sr_gbid=fx.block_idx.x,
         )
 
@@ -743,9 +818,19 @@ def _build_dual_kernel(
 
 
 def _build_dual_launch(
-    row_rht, col_rht, row_2d=False, col_2d=False, col_locality=False, row_sr=False, col_sr=False
+    row_rht,
+    col_rht,
+    row_2d=False,
+    col_2d=False,
+    col_locality=False,
+    row_sr=False,
+    col_sr=False,
+    pack_row=None,
+    pack_col=None,
 ):
-    kern = _build_dual_kernel(row_rht, col_rht, row_2d, col_2d, col_locality, row_sr, col_sr)
+    kern = _build_dual_kernel(
+        row_rht, col_rht, row_2d, col_2d, col_locality, row_sr, col_sr, pack_row, pack_col
+    )
 
     @flyc.jit
     def _dual_launch(
@@ -798,6 +883,8 @@ def flydsl_dual_quant(
     row_sr=False,
     col_sr=False,
     scale_rounding_mode=0,
+    pack_row=None,
+    pack_col=None,
 ):
     """Fused rowwise + colwise-transpose mxfp4 cast (one bf16 read). Returns
     (row_data, row_scale, col_data, col_scale) in C++-compatible dtypes/shapes.
@@ -808,10 +895,17 @@ def flydsl_dual_quant(
     dev = x_bf16.device
     x_i32 = x_bf16.view(torch.int32)  # [R, C/2]
     ro = torch.empty((R, C // 8), dtype=torch.int32, device=dev)
-    rs = torch.empty((R, C // 32), dtype=torch.uint8, device=dev)
     co = torch.empty((C, R // 8), dtype=torch.int32, device=dev)
-    cs = torch.empty((C, R // 32), dtype=torch.uint8, device=dev)
-    fn, grid_x = get_dual_cast(R, C, row_rht, col_rht, row_2d, col_2d, row_sr, col_sr)
+
+    def _scale_out(pack, dim, k128):
+        # A packed slab is byte-addressed and flat; the canonical one keeps its [dim, K/32].
+        if pack is None:
+            return torch.empty((dim, k128 * 4), dtype=torch.uint8, device=dev)
+        return torch.empty((dim + 255) // 256 * 256 * k128 * 4, dtype=torch.uint8, device=dev)
+
+    rs = _scale_out(pack_row, R, C // 128)
+    cs = _scale_out(pack_col, C, R // 128)
+    fn, grid_x = get_dual_cast(R, C, row_rht, col_rht, row_2d, col_2d, row_sr, col_sr, pack_row, pack_col)
     sr_seed = _next_sr_seed() if (row_sr or col_sr) else 0
     fn(
         x_i32,
@@ -828,21 +922,55 @@ def flydsl_dual_quant(
     )
     row_data = ro.view(torch.uint8).view(fp4_dtype)  # [R, C/2] fp4
     col_data = co.view(torch.uint8).view(fp4_dtype)  # [C, R/2] fp4
-    row_scale = rs.view(torch.float8_e8m0fnu)
-    col_scale = cs.view(torch.float8_e8m0fnu)
+    # A packed slab is the GEMM's own i32 layout, so it goes back as i32 -- that is what the
+    # backend looks at to recognise it. The canonical one stays e8m0.
+    row_scale = rs.view(torch.int32) if pack_row else rs.view(torch.float8_e8m0fnu)
+    col_scale = cs.view(torch.int32) if pack_col else cs.view(torch.float8_e8m0fnu)
     return row_data, row_scale, col_data, col_scale
 
 
-def get_dual_cast(R, C, row_rht, col_rht, row_2d=False, col_2d=False, row_sr=False, col_sr=False):
+def get_dual_cast(
+    R,
+    C,
+    row_rht,
+    col_rht,
+    row_2d=False,
+    col_2d=False,
+    row_sr=False,
+    col_sr=False,
+    pack_row=None,
+    pack_col=None,
+):
     """Return (compiled_fn, grid_x) for the fused dual at
     (R, C, row_rht, col_rht, row_2d, col_2d, row_sr, col_sr).
     Requires R % 128 == 0 and C % 256 == 0 (no scale/output padding)."""
     col_locality = int(C) > int(R)  # C>R (down-proj): combine transpose stores
-    lk = (bool(row_rht), bool(col_rht), bool(row_2d), bool(col_2d), col_locality, bool(row_sr), bool(col_sr))
+    # pack_row changes the emitted store, so it keys both caches.
+    pk = None if pack_row is None else tuple(sorted(pack_row.items()))
+    pc = None if pack_col is None else tuple(sorted(pack_col.items()))
+    lk = (
+        bool(row_rht),
+        bool(col_rht),
+        bool(row_2d),
+        bool(col_2d),
+        col_locality,
+        bool(row_sr),
+        bool(col_sr),
+        pk,
+        pc,
+    )
     raw = _DUAL_LAUNCH.get(lk)
     if raw is None:
         raw = _build_dual_launch(
-            bool(row_rht), bool(col_rht), bool(row_2d), bool(col_2d), col_locality, bool(row_sr), bool(col_sr)
+            bool(row_rht),
+            bool(col_rht),
+            bool(row_2d),
+            bool(col_2d),
+            col_locality,
+            bool(row_sr),
+            bool(col_sr),
+            pack_row,
+            pack_col,
         )
         _DUAL_LAUNCH[lk] = raw
     key = (
@@ -854,6 +982,8 @@ def get_dual_cast(R, C, row_rht, col_rht, row_2d=False, col_2d=False, row_sr=Fal
         bool(col_2d),
         bool(row_sr),
         bool(col_sr),
+        pk,
+        pc,
     )
     ent = _DUAL_COMPILED.get(key)
     if ent is None:
@@ -861,9 +991,19 @@ def get_dual_cast(R, C, row_rht, col_rht, row_2d=False, col_2d=False, row_sr=Fal
 
         x = torch.zeros((R, C // 2), dtype=torch.int32, device="cuda")
         ro = torch.zeros((R, C // 8), dtype=torch.int32, device="cuda")
-        rs = torch.zeros((R, C // 32), dtype=torch.uint8, device="cuda")
+        rs = (
+            torch.zeros((R, C // 32), dtype=torch.uint8, device="cuda")
+            if pack_row is None
+            # byte-addressed like the canonical slab: the packed store is still one i8 per
+            # thread, it just lands somewhere else.
+            else torch.zeros(pack_row["qm"] * pack_row["k128"] * 4, dtype=torch.uint8, device="cuda")
+        )
         co = torch.zeros((C, R // 8), dtype=torch.int32, device="cuda")
-        cs = torch.zeros((C, R // 32), dtype=torch.uint8, device="cuda")
+        cs = (
+            torch.zeros((C, R // 32), dtype=torch.uint8, device="cuda")
+            if pack_col is None
+            else torch.zeros(pack_col["qn"] * pack_col["k128"] * 4, dtype=torch.uint8, device="cuda")
+        )
         grid_x = (R // _TR) * (C // _TC)
         stream = torch.cuda.current_stream()
         fn = flyc.compile(raw, x, ro, rs, co, cs, R, C, 0, 1 << 21, grid_x, stream)
