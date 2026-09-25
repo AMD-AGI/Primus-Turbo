@@ -118,16 +118,28 @@ def test_grouped_gemm_fp4_variable_k_dispatch_keys():
 
 
 @pytest.mark.parametrize(
-    ("inplace_add_to_out", "overwrite_out", "graph_capturing", "expected_beta"),
+    (
+        "inplace_add_to_out",
+        "overwrite_out",
+        "graph_capturing",
+        "record_ownership",
+        "expected_beta",
+    ),
     [
-        (False, False, False, 0.0),
-        (True, False, False, 1.0),
-        (True, True, False, 0.0),
-        (True, True, True, 1.0),
+        (False, False, False, True, 0.0),
+        (True, False, False, True, 1.0),
+        (True, True, False, True, 0.0),
+        (True, True, False, False, 0.0),
+        (True, True, True, True, 1.0),
     ],
 )
 def test_grouped_gemm_fp4_variable_k_flydsl_beta(
-    monkeypatch, inplace_add_to_out, overwrite_out, graph_capturing, expected_beta
+    monkeypatch,
+    inplace_add_to_out,
+    overwrite_out,
+    graph_capturing,
+    record_ownership,
+    expected_beta,
 ):
     from primus_turbo.pytorch.core import grad_ownership
 
@@ -169,12 +181,14 @@ def test_grouped_gemm_fp4_variable_k_flydsl_beta(
         num_cu=None,
         inplace_add_to_out=inplace_add_to_out,
         out=out,
+        record_ownership=record_ownership,
     )
 
     assert captured["beta"] == expected_beta
     assert captured["out"] is out
     assert result is out
-    assert recorded == ([out] if inplace_add_to_out and overwrite_out and not graph_capturing else [])
+    should_record = inplace_add_to_out and overwrite_out and not graph_capturing and record_ownership
+    assert recorded == ([out] if should_record else [])
 
 
 def test_grouped_gemm_fp4_variable_k_dispatch_contract(monkeypatch):

@@ -11,9 +11,11 @@ after it has launched a full replacement of ``main_grad``.  Primus consumes
 that exact ``(data_ptr, numel, dtype)`` identity on the following step to skip
 the otherwise redundant clear of the same slice.
 
-The consumer calls :func:`begin_step` once per iteration.  Any slice it skips
-is then checked by :func:`validate_overwritten` before gradient communication,
-so a missing producer fails instead of silently reducing stale gradients.
+The consumer calls :func:`begin_step` once per iteration. Any slice it skips is
+checked by :func:`validate_overwritten` before gradient communication, so a
+missing producer fails instead of silently reducing stale gradients. A reset
+that is abandoned without communication (for example, synthetic-warmup
+cleanup) is safely discarded by the next :func:`begin_step`.
 """
 
 from typing import FrozenSet, Iterable, Set, Tuple
@@ -69,7 +71,6 @@ def validate_overwritten(slices: Iterable[Slice]) -> None:
 def begin_step() -> FrozenSet[Slice]:
     """Rotate the producer log and return slices overwritten in the prior step."""
     global _written, _skipped, _previous
-    _raise_if_unwritten(_skipped - _written)
     _previous = frozenset(_written)
     _written = set()
     _skipped = set()

@@ -365,6 +365,7 @@ class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
         num_cu: int | None,
         inplace_add_to_out: bool = False,
         out: torch.Tensor | None = None,
+        record_ownership: bool = True,
         **kwargs,
     ):
         from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp4_kernel import (
@@ -401,7 +402,7 @@ class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
             beta=0.0 if overwrite_out or not inplace_add_to_out else 1.0,
             out=out if inplace_add_to_out else None,
         )
-        if overwrite_out:
+        if overwrite_out and record_ownership:
             # Record at the beta=0 producer, rather than at forward time, so
             # Primus may safely skip clearing only slices actually replaced.
             from primus_turbo.pytorch.core import grad_ownership
@@ -616,7 +617,11 @@ def grouped_gemm_fp4_variable_k_accum_impl(
     if should_autotune and not GroupedGEMMFP4VariableKKernelDispatcher._is_graph_capturing():
         key = GroupedGEMMFP4VariableKKernelDispatcher.make_key(**kwargs)
         if key not in GroupedGEMMFP4VariableKKernelDispatcher._cache:
-            tuning_kwargs = {**kwargs, "out": torch.zeros_like(out)}
+            tuning_kwargs = {
+                **kwargs,
+                "out": torch.zeros_like(out),
+                "record_ownership": False,
+            }
 
     GroupedGEMMFP4VariableKKernelDispatcher.dispatch(
         default_backend_choice,
