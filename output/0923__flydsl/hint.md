@@ -3946,3 +3946,60 @@ of that 153 TF/s, and the experiment is worth running until the gap stops helpin
 hands the scheduler two smaller regions and it pulls loads earlier. The mechanism here is
 different (placing work *into* an existing gap rather than reordering a clump), but that record
 says to screen it on the ISA first and expect the scheduler to fight back.
+
+## h52 — THE SPLIT BARRIER IS DIRECTLY CONTROLLABLE. `rocdl.s_barrier_signal` / `s_barrier_wait` are callable, and putting the prefetch in the gap widens it from 1 to 233 instructions.
+
+### The API
+
+`fx.barrier()` emits `s_barrier_signal -1` + `s_barrier_wait -1` back to back, which is why
+our gaps were 0-1 instructions. **Both halves are separately callable** from the MLIR rocdl
+dialect — `flydsl/expr/rocdl/cluster.py:35,42` already does it for cluster sync:
+
+```python
+from flydsl._mlir.dialects import rocdl as _mrocdl
+_mrocdl.s_barrier_signal(-1)
+<independent work>
+_mrocdl.s_barrier_wait(-1)
+```
+
+They are **not** in FlyDSL's `expr/rocdl/__init__.py` export list (which carries only
+`sched_barrier` and `sched_group_barrier`), so `fx.rocdl.s_barrier_signal` does not resolve —
+import the MLIR dialect directly, as `cluster.py` does.
+
+### S2: the prefetch becomes the cover
+
+S1's move — issuing `_ldqd` after barrier-2 — was a **null** on the card (h50). But it proved
+the thing that matters: **`_ldqd` is free to move**, depending only on `(qt_n, gh_n)` and loop
+invariants. Putting those same 36 loads **between** barrier-2's signal and wait turns a useless
+reordering into the rendezvous cover.
+
+Measured on the ISA, `k_dkdv`:
+
+| barrier | 4-wave baseline | **S2** |
+|---|--:|--:|
+| masked body, site 1 | 1 | 1 |
+| masked body, site 2 | 1 | 1 |
+| **full body, site 1** | **0** | **14** |
+| **full body, site 2** | **1** | **233** |
+
+aiter's median is 18. The full body's two sites are now **14 and 233**. Site 1 widened on its
+own — splitting site 2 gave the scheduler freedom it did not have before.
+
+Invariants hold exactly: `buffer_load_b128` 160, `buffer_load_b32` 16, `v_wmma` 128,
+`ds_store_b128` 80, `ds_load_tr16_b128` 80, `s_barrier` 8, spill 0, LDS 82944. VGPR 882 -> 832.
+**Correctness PASS, prod causal 52.56 / 52.60 / 52.71 — identical to the champion.**
+
+### Why this chain is worth recording even if the card says no
+
+Four steps, each one using what the previous one refuted:
+
+1. **S1** moved the prefetch past barrier-2 -> cover +36%, **time unchanged**. That
+   *falsified* the cover model in this configuration (h50) — but proved `_ldqd` is mobile.
+2. **The barrier-free probe** measured the rendezvous at **1.449x** (342.10 -> 495.56), which
+   is the entire 4-wave loss, after three failed diagnoses.
+3. **The aiter comparison** showed the cost is not intrinsic: 26 pairs at 719 TF/s with a
+   median gap of 18 against our 0-1.
+4. **S2** puts step 1's mobile loads into step 3's gap.
+
+The same 36 instructions that did nothing at one position may do everything at another. The
+difference is purely which side of `s_barrier_signal` they land on.

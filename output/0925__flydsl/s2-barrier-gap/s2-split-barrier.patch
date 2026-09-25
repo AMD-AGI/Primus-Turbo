@@ -1,0 +1,35 @@
+--- /home/lihuzhan/g3work/kernels.py	2026-09-25 08:09:05.343648867 +0000
++++ /home/lihuzhan/g5work/kernels.py	2026-09-25 08:29:13.738707439 +0000
+@@ -38,6 +38,7 @@
+ import flydsl.expr as fx
+ from flydsl._mlir.dialects import llvm as llvm_dialect
+ from flydsl.expr import range_constexpr, rocdl
++from flydsl._mlir.dialects import rocdl as _mrocdl
+ 
+ from aiter.ops.flydsl.kernels.kernels_common import create_llvm_ptr
+ from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _ir
+@@ -523,14 +524,19 @@
+         # Bare fx.barrier(): rocdl.s_waitcnt raises ValueError on gfx1250
+         # (flydsl/expr/rocdl/universal.py:47-55) -- SPLIT counters, and the backend
+         # derives the dscnt wait from the LDS memory dependence itself.
+-        fx.barrier()
++        # r24.S2 -- SPLIT BARRIER WITH THE PREFETCH IN THE GAP. Measured: removing both
++        # barriers is worth 1.449x at prod (342.10 -> 495.56), so the rendezvous is the
++        # entire 4-wave cost -- but it is not intrinsic. aiter runs 26 barrier pairs at
++        # 719 TF/s with a MEDIAN of 18 instructions between s_barrier_signal and
++        # s_barrier_wait, where ours had 0/1/1/1. A split barrier exists so a wave can
++        # keep issuing independent work between announcing arrival and blocking.
++        # S1 proved _ldqd is free to move, so its 36 loads are exactly what this gap wants.
+         if const_expr(carry):
+-            # r24.S1 -- issue the next iteration's prefetch HERE, after barrier-2, so the
+-            # loads cross the back-edge instead of being drained by barrier-1's fence.
+-            # _ldqd depends only on (qt_n, gh_n) and loop invariants, so it is free to
+-            # move; the carry=False path is untouched.
++            _mrocdl.s_barrier_signal(-1)
+             nxt = _ldqd(qt_n, gh_n)
++            _mrocdl.s_barrier_wait(-1)
+             return new + [_ir(v) for v in nxt]
++        fx.barrier()
+         return new
+ 
+     @flyc.jit
