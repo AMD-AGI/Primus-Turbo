@@ -1,0 +1,106 @@
+round: 3
+mode: fast
+candidate: r3.i1.g07
+outcome: delivered            # built, correct, measured; did not win (neutral, inside the floor)
+
+correctness:
+  unit_tests: pass          # ut: spec shapes + determinism PASS; the same 7 edge cases 49.82-49.99 dB sit under ut's hard-coded 50 (spec is 49) -- dB lines and determinism hash identical to the incumbent: output bitwise = op/current
+  precision: pass           # validation.py at spec precision 49 dB: all 16 cases PASS
+  checked_with: op/validation.py
+  sqnr_db: 49.82            # worst o SQNR (short_q full); spec shapes 51.23 / 50.89 / 50.83
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/002/op]
+  shapes:                   # mean of 3 sessions with the palindrome order rotated (raw/bench{1,2,3}_*.txt, raw/bench_agg.txt)
+    - name: fast
+      this_round_tflops: 36.33
+      best_round_tflops: 37.08
+      beat_tflops: 66.07
+      target_tflops: 66.07
+      champion_round: 2
+      champion_tflops: 37.08
+      champion_rebuilt: true
+      ratio: 0.5499
+      vs_champion: 0.980
+    - name: proxy
+      this_round_tflops: 778.18
+      best_round_tflops: 761.56
+      beat_tflops: 1033.77
+      target_tflops: 1033.77
+      champion_round: 2
+      champion_tflops: 761.56
+      champion_rebuilt: true
+      ratio: 0.7528
+      vs_champion: 1.022
+    - name: prod
+      this_round_tflops: 1013.60
+      best_round_tflops: 1017.23
+      beat_tflops: 1397.60
+      target_tflops: 1397.60
+      champion_round: 2
+      champion_tflops: 1017.23
+      champion_rebuilt: true
+      ratio: 0.7252
+      vs_champion: 0.996
+  score: 0.6760             # incumbent in the same sessions: 0.6752 (+0.0008, below min_gain, inside the floor)
+  note: >
+    fast/proxy swing +-8% with palindrome slot (A proxy 858 / 759 / 718 by slot alone); only the
+    rotated mean is usable. prod same-session floor ~0.4%. Validation order (2-arm, fast, alternating
+    processes): A 0.0591 / 0.0604 ms vs incumbent 0.0601 / 0.0584 ms -- identical.
+
+validation:
+  exit_code: 2              # correctness + determinism PASS; speed geomean vs beat 0.6515 < 1.0 (fast 0.5215, proxy 0.7289, prod 0.7274)
+
+explored:
+  ran:
+    - "COMPILE_ONLY descriptors for A/B/floor (raw/descriptors.txt) -- spill gate; found INST_PREF_SIZE=216 in the compiled kernel descriptor (whole 27.6 KB already hardware-prefetched at launch), which explains g07's null result"
+    - "g03 post-beat probe on inc/A/B (raw/g03_probe_r3.txt) -- the route's gate for g07: proxy penalty 29 us inc vs 39 us A, did not shrink"
+    - "benchmark.py x3 sessions with rotated arm order, inc/A/B/beat, one process per shape (raw/bench*_*.txt) -- de-confounded slot bias that made A +15% at proxy in session 1"
+    - "validation-order 2-arm fast, inc vs A alternating (raw/validation_order_fast.txt) -- showed the fast validation improvement since round 2 is drift, not g07"
+    - "VALU floor probe at prod (raw/valu_floor_prod.txt) -- exp2 removal = -13.4% wall: softmax exp is on the critical path; prices route rows 5-6"
+    - "ut + own validation.py (raw/ut_*.txt, raw/validation.txt)"
+  consulted:
+    - optimization/routes/1-metrics-to-techniques.md
+    - backends/flydsl/attention/README.md
+    - backends/flydsl/attention/techniques.md
+    - arch/gfx1250/profiling-surface.md
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+    - backends/flydsl/attention/recipes/hd128.md
+  bound: compute
+  confidence: medium
+  why: "floor probe: removing softmax exp2 cuts prod wall 13.4% with WMMA unchanged -- VALU and WMMA serialise per wave; not memory (310 GB/s at prod); clocks VR-throttled at ~1030-1100 MHz"
+
+arms:
+  - id: r3.i1.g07
+    built: "A alone, from op/current -- 8x s_prefetch_inst_pc_rel 0x0..0x7000 size 31 at bshd kernel entry"
+    tflops: {fast: 36.33, proxy: 778.18, prod: 1013.60}
+    vs_champion: 0.9993       # mean of per-shape ratios 0.980 / 1.022 / 0.996
+    shipped: true
+    note: "g03 penalty did not shrink; kernel descriptor already prefetches all code (INST_PREF_SIZE 216)"
+  - id: r3.i2.g08
+    built: "B alone, from op/current -- NOT on top of A; s_setprio 2 over LO's QK, 0 before softmax"
+    tflops: {fast: 34.97, proxy: 741.18, prod: 1016.91}
+    vs_champion: 0.972        # 0.943 / 0.973 / 1.000
+    shipped: false
+    note: "prod neutral; fast/proxy loss largely palindrome slot (S1 post-beat slot 29.81 at fast). No stagger gain"
+  - id: r3.i2.g08-rider-valu-floor
+    built: "throwaway from op/current, exp2 -> fma only (wrong output), prod only, 2-arm session vs inc"
+    tflops: {prod: 1201.6}
+    vs_champion: 1.155        # 2.1134 / 1.8303 ms, same session
+    shipped: false
+    note: "not a candidate; prices softmax exp at 13.4% of prod wall"
+
+expected: >
+  fast in validation order 0.0748 -> ~0.050-0.055 ms (+35-50%); proxy +5-15% in
+  validation order; prod +0.5-1%; in benchmark.py's 5-arm palindrome fast +3-6%, proxy/prod
+  small. Could be ~0 if the size field covers less than assumed or if the misses are not
+  latency-serialised -- the g03 probe (beat -> cur, flush + sleep) is the direct test, run it
+  on the arm before any benchmark.
+
+added_to_pool: [r3.i1.g07, r3.i2.g08]
+route_updated: true
+
+implementation:
+  files_changed: [op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py]
+  build_failures: []

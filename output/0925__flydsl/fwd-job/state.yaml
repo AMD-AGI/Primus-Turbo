@@ -26,7 +26,7 @@ lifecycle:
   spec_version: v000
 best_round: 2
 champions:
-  proxy: 2
+  proxy: 3
   prod: 2
 rounds:
 - round: 0
@@ -100,14 +100,12 @@ rounds:
 - round: 2
   progress:
   - opt
+  - reflect
   mode: fast
-  running:
-    module: reflect
-    step: null
-    since: '2026-09-25T12:54:10'
   seconds:
     opt: 907.4
-    round: 907.4
+    reflect: 52.5
+    round: 959.9
   sessions:
     opt: a9b15b5d-03d4-4184-ba17-0277096631bd
   bound: compute
@@ -145,3 +143,57 @@ rounds:
   guard_failed: null
   note: null
   changed_disagreement: null
+- round: 3
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  sessions:
+    opt: 54a80342-1aab-496a-a589-f2b6a54332ad
+  seconds:
+    opt: 3684.4
+    reflect: 55.0
+    round: 3739.4
+  bound: compute
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - 'speed: geomean candidate/beat 0.6541 < bar 1.0000 (fast 0.5257, proxy 0.7315, prod 0.7277)'
+  score: 0.67596
+  outcome: delivered
+  passed: true
+  accepted: false
+  tflops:
+    fast: 36.33
+    proxy: 778.18
+    prod: 1013.6
+  targets:
+    fast: 66.07
+    proxy: 1033.77
+    prod: 1397.6
+  beats:
+    fast: 66.07
+    proxy: 1033.77
+    prod: 1397.6
+  incumbents:
+    fast: 37.08
+    proxy: 761.56
+    prod: 1017.23
+  gain: 0.9993
+  changed: 1
+  flops:
+    fast: 2149580800.0
+    proxy: 137472507904.0
+    prod: 2199291691008.0
+  guards: {}
+  guard_failed: null
+  note: throughput 0.9993x its best ever does not improve on it by more than the 0.70% it must clear (score
+    0.67596, incumbent 0.67525)
+  changed_disagreement: null
+- round: 4
+  progress: []
+  mode: fast
+  running:
+    module: opt
+    step: null
+    since: '2026-09-25T13:59:21'
