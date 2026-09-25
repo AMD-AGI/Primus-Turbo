@@ -4056,3 +4056,97 @@ is correct. And it established that the one geometry able to carry the 5-GEMM st
 45% for reasons nobody can name. **That is a harder blocker than any of the ones cleared.**
 
 The champion remains `op/current` = round 20 and was never touched by any of this work.
+
+## h54 — READ THIS FIRST. The gap decomposition, the closed axes, and the four traps, in one page.
+
+`hint.md` is now 4000+ lines. This entry is the index; everything below it is detail.
+
+### 1. WHERE THE GAP IS — settled by enumeration on both sides (h40)
+
+```
+gap = 1.386 (structure)  x  1.00-1.01 (everything else)
+```
+
+| | issued matrix FLOP / wall time |
+|---|--:|
+| ours @ champion | 719.9 TF/s |
+| ours @ round-22 re-measure | 727.6 TF/s |
+| **aiter** | **727.1 TF/s** |
+
+**Our scheduling efficiency already equals hand-written ASM.** The residual is +1.0%/-0.1%
+against this operator's own 0.40-0.66% same-session floor.
+
+The 1.386 is that we issue **7 GEMM-equivalents where aiter issues 5** — 3,690,496 WMMA per
+(b,hq) against 2,662,400, both counted from the respective binaries. The extra two are S and
+dP **recomputed in k_dq**, which exists as a separate kernel because dQ cannot be accumulated
+in one pass without atomics.
+
+**CONSEQUENCE, and it should govern candidate selection:** any arm that targets efficiency has
+a ceiling of **~1%**. Rounds 13-22 spent sixteen on-card arms and not one targeted the 1.386.
+
+### 2. WHAT IS CLOSED — do not build these again
+
+| axis | evidence |
+|---|---|
+| compute / matrix ILP | g61 null (+0.27% inside a 0.29% floor) |
+| issue roof | g60 deleted 115 issue slots, **-17.27%** |
+| LDS port pressure | P3 deleted **all 80** LDS ops, WMMA unchanged, **-8.19%** |
+| Q/dO LDS round trip | P1 **-6.98%** |
+| occupancy, single-wave | g55 census; g14 at 982 VGPR spill 0 ran 2.76x slower |
+| prefetch depth and position | g62 +1.65%, g63 -19.33%, g66 -21.93%, g68 -30.0%, P70 -10.86% |
+| `sched_barrier` / `sched_group_barrier` | 0 wins, 5 losses; `sched_barrier(0)` is a BOUNDARY, not a clamp |
+| WMMA operand reuse | g59 encoded 56/128 `matrix_a_reuse`, bought +0.08% |
+| XCD locality | g43 null — this part has one device-wide L2 |
+| source reordering | g22, g65 ISA-identical |
+| static ISA metrics as a ranking signal | wrong four times (g47, g49, g56, the 5-queue model) |
+| deterministic fusion, every geometry | h40 table — bandwidth and registers pull opposite ways |
+| single-wave fusion | h30 — BLOCK_KV=128 needs 1024 accumulator VGPR |
+| **4-wave BLOCK_KV=128** | **h53 — costs 45% for reasons four refuted mechanisms could not name; and its barrier-free ceiling is 0.950x of the champion anyway** |
+| TDM as a fill for this op | h49 — staging is dual-use, so it removes no `buffer_load` |
+
+### 3. THE FOUR TRAPS — each cost at least one round
+
+1. **An instruction count is not a cost.** Six deletions lost on this kernel; the ones that
+   "improved every static metric" lost hardest. Price against the bottleneck, never against
+   the count.
+2. **A number measured in one context is not a property of the mechanism.** It has misled five
+   times: g61's corpus "+8.7%", g60's gfx950 analogue, g63's cross-kernel prefetch, h36's VGPR
+   extrapolation, and a GEMM ladder's 1.57% noise floor applied to this operator (whose own
+   same-session floor is 0.40-0.66%).
+3. **A probe that reports success may not have run.** `pw.sh` sent its subject to `/dev/null`
+   and returned `wait`'s exit code, producing 60 rows of a benchmark that never executed and a
+   false "throttling is ruled out" that reached `findings/`. Every instrument must assert its
+   subject ran.
+4. **A clean run count is not evidence unless the base rate says it should have failed.** Six
+   clean sweeps at a 44%/process fault rate is P=0.49 — the most likely outcome under the null.
+
+### 4. THE API FACTS THAT COST BUILDS
+
+- `rocdl.s_waitcnt` **raises on gfx1250** (split counters). Use a bare `fx.barrier()`; the
+  backend derives the dscnt wait from the LDS dependence.
+- fp32 atomics: `fx.UniversalAtomicAdd(fx.Float32, rocdl.SyncScope.Agent)` on a **plain global
+  pointer** gives `global_atomic_add_f32 ... scope:SCOPE_DEV`. `BufferAtomicAdd` compiles but
+  emits **SCOPE_CU**, which on this 8-XCD part is a silent lost update.
+- `s_barrier_signal` / `s_barrier_wait` are separately callable from
+  `flydsl._mlir.dialects.rocdl` — not in FlyDSL's export list.
+- TDM needs **aiter's** `tdm_ops_gfx1250` shim; FlyDSL's own `tdm_ops` cannot take a Fly shared
+  view. Pass `pad_interval` / `pad_amount` explicitly or you get an unpadded 256 B row stride,
+  which is a silent 64-way bank conflict.
+- `rounds/002/_scratch/screen.py` hardcodes `block=(32,1,1)` for its dkdv launches.
+
+### 5. THE GATE, as of 2026-09-25
+
+**Split.** `dk`/`dv` keep 200-run bitwise; `dq` may use fp32 atomics and is judged by a
+**70 dB run-to-run SQNR floor**, calibrated from aiter itself (its dk/dv are bitwise, its dq
+measures 113.0 dB at fast and 98.0 at prod). Fixed-order split-k was always legal and has
+shipped since round 13.
+
+### 6. WHAT IS ACTUALLY LEFT
+
+With the 1.386 unreachable in every form tried, the honest remaining moves are:
+- **The forward.** Its gap is 1.53x, **100% efficiency with no structural component**, and the
+  determinism gate does not bind it (every O element is written once). Worth 0.83 ms/step
+  against the backward residual's ~0.05.
+- **Explaining the 4-wave 45%.** It is the only thing standing between this operator and the
+  5-GEMM structure, and nobody knows what it is. An ISA census found what three armchair
+  diagnoses could not; a fourth census is likelier to work than a fifth guess.
