@@ -36,6 +36,7 @@
 #include <hip/hip_runtime.h>
 
 #include "primus_turbo/common.h"
+#include "primus_turbo/mxfp4_emit.hpp"
 #include "primus_turbo/quantization.h"
 
 namespace primus_turbo {
@@ -494,8 +495,14 @@ __device__ __forceinline__ void mxfp6_emit_group(float (&values)[kGroupSize], co
  * fall out of the LDS zero-fill produces it for free -- otherwise the host would have to
  * memset the whole blob, which costs more than the packing.
  */
+// COL_FP4 emits the column direction as MXFP4 instead of MXFP6, from the same staged
+// tile. That is what makes wgrad eligible for a mixed-format GEMM: wgrad contracts the
+// token dimension, so its operands are a gradient and an activation rather than the
+// weight, and narrowing one of them needs a tensor packed fp6 one way and fp4 the other.
+// Nothing else changes -- the two blobs share tile geometry, block indexing and the scale
+// plane, and differ only in the code plane, so the switch is local to the emit.
 template <typename DType, bool DO_ROW, bool DO_COL, MXFP6Prologue PROLOGUE, bool DO_COL_SUM,
-          int TILE_N = kDefaultTileN>
+          int TILE_N = kDefaultTileN, bool COL_FP4 = false>
 __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
     const DType *__restrict__ input, const DType *__restrict__ aux, const DType *__restrict__ bias,
     uint8_t *__restrict__ row_packed, uint8_t *__restrict__ row_scale,
@@ -724,9 +731,15 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                         for (int i = 0; i < kGroupSize; ++i)
                             values[i] = to_dot_operand<DType>(
                                 s_tile[stage * kStageRows + i][col_slot]);
-                        mxfp6_emit_group(values, tile_n + col_slot,
-                                         tile_m / kGroupSize + stage, col_nk_pad, col_packed,
-                                         col_scale);
+                        if constexpr (COL_FP4) {
+                            mxfp4_emit::mxfp4_emit_group(values, tile_n + col_slot,
+                                                         tile_m / kGroupSize + stage,
+                                                         col_nk_pad, col_packed, col_scale);
+                        } else {
+                            mxfp6_emit_group(values, tile_n + col_slot,
+                                             tile_m / kGroupSize + stage, col_nk_pad,
+                                             col_packed, col_scale);
+                        }
                     }
                 }
             }
@@ -1139,8 +1152,14 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
             for (int i = 0; i < kGroupSize; ++i)
                 values[i] = to_dot_operand<DType>(s_tile[m_offset + i][local_n]);
 
-            mxfp6_emit_group(values, tile_n + local_n, tile_m / kGroupSize + k_block, col_nk_pad,
-                             col_packed, col_scale);
+            if constexpr (COL_FP4) {
+                mxfp4_emit::mxfp4_emit_group(values, tile_n + local_n,
+                                             tile_m / kGroupSize + k_block, col_nk_pad,
+                                             col_packed, col_scale);
+            } else {
+                mxfp6_emit_group(values, tile_n + local_n, tile_m / kGroupSize + k_block,
+                                 col_nk_pad, col_packed, col_scale);
+            }
         }
     }
 }
@@ -1231,6 +1250,36 @@ void quantize_mxfp6_impl(const DType *input, uint8_t *row_packed, uint8_t *row_s
     }
     PRIMUS_TURBO_CHECK_HIP(hipGetLastError());
 }
+
+// Hybrid: MXFP6 row, MXFP4 column, from one pass over the input.
+//
+// wgrad is `grad_w = g_col @ x_col`, contracting the token dimension, so neither operand
+// is the weight and A6W4 cannot reach it -- a third of GEMM time. Narrowing one of the two
+// makes it eligible, and whichever tensor is narrowed needs exactly this: fp6 in the
+// direction the forward or dgrad consumes, fp4 in the direction wgrad consumes.
+//
+// The column blob must be sized with MXFP4's 16384-byte tile, not MXFP6's 24576; that is
+// the caller's job and mxfp4_gemm_pack_sizes is the helper.
+template <typename DType>
+void quantize_mxfp6_row_mxfp4_col_impl(const DType *input, uint8_t *row_packed,
+                                       uint8_t *row_scale, uint8_t *col_packed,
+                                       uint8_t *col_scale, const int M, const int N,
+                                       hipStream_t stream) {
+    constexpr int kIdentityTileN = 128;
+    const auto [row_nk_pad, col_nk_pad, grid, block] = geometry_for<kIdentityTileN>(M, N);
+    quantize_mxfp6_dual_kernel<DType, true, true, MXFP6Prologue::Identity, false,
+                               kIdentityTileN, true>
+        <<<grid, block, 0, stream>>>(input, nullptr, nullptr, row_packed, row_scale, col_packed,
+                                     col_scale, nullptr, M, N, row_nk_pad, col_nk_pad, {});
+    PRIMUS_TURBO_CHECK_HIP(hipGetLastError());
+}
+
+template void quantize_mxfp6_row_mxfp4_col_impl<bfloat16>(const bfloat16 *, uint8_t *, uint8_t *,
+                                                          uint8_t *, uint8_t *, const int,
+                                                          const int, hipStream_t);
+template void quantize_mxfp6_row_mxfp4_col_impl<float16>(const float16 *, uint8_t *, uint8_t *,
+                                                         uint8_t *, uint8_t *, const int,
+                                                         const int, hipStream_t);
 
 template <typename DType>
 void quantize_mxfp6_fused_impl(const DType *input, const DType *aux, const DType *bias,
