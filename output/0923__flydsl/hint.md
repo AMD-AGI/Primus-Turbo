@@ -4003,3 +4003,56 @@ Four steps, each one using what the previous one refuted:
 
 The same 36 instructions that did nothing at one position may do everything at another. The
 difference is purely which side of `s_barrier_signal` they land on.
+
+## h53 — S2 IS ALSO A NULL. The gap went 1 -> 233 and bought nothing. Four mechanisms proposed for the barrier cost, four refuted. The 45% is real, measured, and UNEXPLAINED.
+
+| shape | S2 (gap 233) | 4-wave baseline (gap 1) | champion |
+|---|--:|--:|--:|
+| prod | 332.74 | 337.56 | 513.78 |
+| proxy | 289.99 | 291.59 | 430.00 |
+| fast | 37.65 | 34.24 | 49.96 |
+
+prod ratio **0.986** — inside the floor, if anything slightly worse. Correctness verified
+first and bit-identical; every instruction count identical; only the position of
+`s_barrier_wait` differed.
+
+### The ledger of refuted mechanisms
+
+The 4-wave build loses 33.6% and the barrier-free probe prices the rendezvous at **1.449x**,
+so the barriers are the whole of it. Four explanations, all mine, all refuted:
+
+| # | mechanism | killed by |
+|---|---|---|
+| 1 | replicated staging quadruples each barrier's drain | ISA census — per-body counts identical to the champion |
+| 2 | occupancy fell to 1 WG/CU, nothing covers the rendezvous | waves/CU is 4 on both sides |
+| 3 | the `s_wait_loadcnt_dscnt` fence truncates prefetch cover | S1: cover +36%, time unchanged |
+| 4 | **the rendezvous latency is exposed at a 0-1 instruction gap** | **S2: gap 1 -> 233, time unchanged** |
+
+**Four for four.** The aiter comparison that motivated #4 remains true — 26 pairs at 719 TF/s
+with a median gap of 18 — but the gap is evidently not what makes their barriers affordable.
+
+### What I am NOT going to do
+
+Propose a fifth mechanism from an armchair. The pattern in this corpus is unambiguous: every
+time I have reasoned from counts to a cause, I have been wrong, and every correction has come
+from either an ISA census nobody had run or a pre-registered experiment. A fifth guess would
+be the same error a fifth time.
+
+**What is established and should be carried forward:**
+- The 4-wave BLOCK_KV=128 skeleton is **built, correct, and 15/15** — the patch is in
+  `output/0925__flydsl/g1b-4wave/`.
+- Its ceiling without barriers is **0.950x of the champion** (495.56 vs 521.86), so even
+  perfectly free barriers would not beat today's kernel.
+- **With barriers it is 0.656x**, and the 45% has no known mechanism.
+- **The fused 5-GEMM design requires barriers** (dS must cross waves). Until the 45% is
+  explained, fusion inherits an unexplained 45% penalty, and no amount of structural saving
+  (1.386x) survives that.
+
+### The honest read on the parity goal
+
+Today established, all by measurement: the contract can be relaxed and was; fp32
+device-scope atomics exist and lower; TDM lowers and retires on TENSORcnt; the 4-wave skeleton
+is correct. And it established that the one geometry able to carry the 5-GEMM structure costs
+45% for reasons nobody can name. **That is a harder blocker than any of the ones cleared.**
+
+The champion remains `op/current` = round 20 and was never touched by any of this work.
