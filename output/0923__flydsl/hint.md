@@ -4150,3 +4150,55 @@ With the 1.386 unreachable in every form tried, the honest remaining moves are:
 - **Explaining the 4-wave 45%.** It is the only thing standing between this operator and the
   5-GEMM structure, and nobody knows what it is. An ISA census found what three armchair
   diagnoses could not; a fourth census is likelier to work than a fifth guess.
+
+## h55 — The forward job is preflight-valid and ready to launch. Its premise differs from this job's in one way that matters.
+
+Checked 2026-09-25, zero card time. Spec at
+`output/0923__flydsl/fwd-job/gfx1250-flydsl-attn-fwd.yaml` (52 KB, with a `.bak.d2` showing it
+survived a preflight pass). Every absolute path it references still resolves.
+
+### The gap, measured same-session 2026-09-24
+
+| | ms | TF/s |
+|---|--:|--:|
+| aiter FlyDSL forward (the baseline) | 2.4005 | 916.16 |
+| aiter ASM forward (the bar) | **1.5724** | **1398.67** |
+
+**Gap 1.5266x, and it is 100% efficiency** — block-causal does only 0.78% extra work, so there
+is no structural term of the kind that blocks the backward. The determinism gate does not bind
+it either: every element of `o` and `lse` is written exactly once, so no reduction is needed to
+satisfy it.
+
+### THE ONE THING THAT DIFFERS, and it should lower expectations
+
+> **"THE BASELINE IS SOMEBODY ELSE'S CODE. This is the single biggest difference from the
+> backward job, where `op/baseline/` was ours."** — the spec's own header.
+
+This job's 8.72x came from starting at our own first draft. The forward starts at **a mature
+vendor kernel written by the FlyDSL authors**. The free wins that carried rounds 0-12 here will
+not be there. Budget accordingly: the forward is a 1.53x efficiency problem against a tuned
+starting point, not a 93x problem against a naive one.
+
+### What is already known about it, from the stage-2 sweep
+
+- **One confirmed free win not yet in the baseline:** `O_VARIANT` v1 beats the shipped v3 by
+  **1.90%** over 101 reps, confirmed against two distinct kernel descriptors (VGPR 232 vs 224).
+- **Two structural levers never tried on the forward:** deep unroll / software pipelining of
+  the KV loop, and **dispatch order** — which is worth knowing because the backward took **14%
+  from dispatch order alone** in its round 12.
+- **`num_waves != 8` hard-raises** in the V2/V3 buffer managers. The spec says to record that
+  as a roadblock and **never as "4 waves is slower"** — which is exactly the misattribution
+  this job made today in the opposite direction.
+
+### One carried defect
+
+The forward spec's `determinism_gate` contains the same sentence this job superseded today:
+*"A round that introduces a split-k or atomic reduction fails this gate even if it is faster."*
+It is harmless there — the forward needs no reduction — but it is equally **unenforceable**:
+a forward `validation.py` would have no atomic or split-k detector either, only a bitwise
+comparison. If the forward job is ever tempted toward a reduction, fix the text first rather
+than discovering the gate cannot see it.
+
+### Launch cost
+
+~58 minutes of card time for setup, and **it cannot run concurrently with the backward job**.
