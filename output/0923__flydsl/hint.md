@@ -3216,3 +3216,71 @@ measured same-session 2026-09-24), it is **100% efficiency with no structural co
 (block-causal does only 0.78% extra work), and **the determinism gate does not bind it** —
 every O element is written exactly once. Closing it is worth 0.83 ms/step against a backward
 residual worth ~0.05 ms/step.
+
+## h41 — CONTRACT RELAXED, AND THE BLOCKER DOES NOT EXIST. FlyDSL lowers fp32 buffer atomics to the exact instruction aiter uses.
+
+### 1. The split gate is live, and it is the bar's own contract
+
+Operator decision 2026-09-25. `dk`/`dv` keep 200-run bitwise; `dq` may use fp32 atomics and
+is judged by a **70 dB run-to-run SQNR floor**.
+
+**The threshold is measured, not invented.** `beat` — aiter's shipping ASM backward — was run
+6 times at fast and prod (`output/0925__flydsl/gate-change/atomic_spread.py`):
+
+| | bitwise | run-to-run SQNR | max rel. deviation |
+|---|---|--:|--:|
+| **dk, dv** | **YES, both shapes** | inf | 0.0 |
+| dq (fast) | no | 113.0 dB | 8.05e-5 |
+| dq (prod) | no | **98.0 dB** | 2.33e-4 |
+
+So **aiter itself satisfies bitwise dk/dv** — it only uses atomics for dQ. Keeping that half
+costs nothing the bar does not already pay, and relaxing it would have given away a property
+the bar has. The 70 dB floor sits 28 dB below the weakest observed reordering and 20 dB above
+the 50 dB correctness gate: atomic reordering passes with margin, a real defect fails.
+
+**Verified as required:** the champion passes the relaxed gate unchanged — correctness
+52.5–52.8 dB on all nine, determinism pass, and `dq` still reports *bitwise* because the
+shipped kernel is still fixed-order. The relaxation is **latent** until something uses it.
+Edited in place; `spec_version` stays `v000`, so refcache and every hand patch survive.
+
+### 2. `buffer_atomic_add_f32` is available in FlyDSL 0.3.2 — compiled, not assumed
+
+The corpus recorded that FlyDSL exposes "an integer `AtomicOp.Add`" and treated that as a
+blocker. **That reading was wrong**: `AtomicOp` is the *operation* enum, and the value type is
+a separate parameter — `primitive.py:218`,
+`UniversalAtomicAdd = lambda val_type, syncscope: UniversalAtomic(AtomicOp.Add, val_type, syncscope)`.
+
+`flydsl/expr/rocdl/` exports `BufferAtomicAdd`, `BufferAtomicPkAdd`,
+`raw_ptr_buffer_atomic_fadd`, `raw_buffer_atomic_fadd`, `RawPtrBufferAtomicFaddOp` and more.
+
+**And it lowers.** COMPILE_ONLY probe, zero card time
+(`output/0925__flydsl/gate-change/atomic_probe2.py`):
+
+```
+fx.copy_atom_call(fx.make_copy_atom(fx.rocdl.BufferAtomicAdd(fx.Float32), fx.Float32), f, dst)
+  -> BUILD ok
+  -> 21_final_isa.s:  buffer_atomic_add_f32 v1, v0, s[0:3], null offen
+```
+
+**That is byte-for-byte the instruction aiter's backward issues 514 times.** The fused-dQ
+route has no missing primitive.
+
+**API note that cost one failed build:** `raw_ptr_buffer_atomic_fadd` wants an LLVM pointer in
+**address space 8**, and rejects the `fly.ptr<f32, #fly_rocdl.buffer_desc>` that
+`fx.get_iter(make_buffer_tensor(...))` yields. Use the **copy-atom path**
+(`fx.rocdl.BufferAtomicAdd(val_type)` + `fx.copy_atom_call`), which is the same shape as the
+`BufferCopy` atom this kernel already uses for its stores (`kernels.py`'s `_atom` / `_stv`).
+
+### 3. What is now derisked, and what is not
+
+| | status |
+|---|---|
+| contract allows atomic dQ | **done**, and calibrated from the bar |
+| champion still passes | **verified** |
+| fp32 atomic exists in FlyDSL | **compiled to the right ISA** |
+| fp32 atomic *throughput* on this card | **UNMEASURED — nothing in the tree records it.** This is now the largest unpriced risk on the critical path |
+| fused body absorbing +25% WMMA in <= +3.0% | **UNMEASURED** — h28 assumption 1 has said "not measured" since it was written |
+| 4-wave barriers not destroying load-to-use cover | **UNMEASURED on our code**; aiter is an existence proof (26 barriers AND large cover) but it has zero `buffer_load` — its fill is 40 TDM ops retiring on a different counter |
+
+**Do not build the fused kernel before the two UNMEASURED performance items have numbers.**
+Both are cheap. That is the same rule that rounds 13-22 violated sixteen times.
