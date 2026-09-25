@@ -565,10 +565,12 @@ def grouped_gemm_fp4_variable_k_accum_impl(
     out: torch.Tensor,
     maybe_pre_sync: bool = False,
 ) -> None:
-    """Variable-K grouped MXFP4 GEMM that accumulates into ``out`` instead of returning.
+    """Variable-K grouped MXFP4 GEMM that writes into ``out`` instead of returning.
 
-    Computes ``out += lhs[:,g] @ rhs[:,g]^T`` per group, folding the accumulation into
-    the GEMM epilogue (beta=1)
+    By default, computes ``out += lhs[:,g] @ rhs[:,g]^T`` per group with a beta=1
+    epilogue. When ``PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT=1``, the epilogue uses
+    beta=0 and replaces ``out``. Enable overwrite mode only when each optimizer step
+    has a single contribution to ``out``; otherwise later contributions are lost.
     """
     default_backend_choice = BackendChoice(backend=BackendType(default_backend))
     user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP4)

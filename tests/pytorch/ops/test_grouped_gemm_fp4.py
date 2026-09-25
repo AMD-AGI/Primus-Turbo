@@ -4,6 +4,8 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import sys
+
 import pytest
 import torch
 
@@ -113,6 +115,51 @@ def test_grouped_gemm_fp4_variable_k_dispatch_keys():
     assert key_n4096[1:4] == (512, 4096, 2048)
     assert key_n3072 != key_n4096
     assert key_n3072 != accumulation_key
+
+
+@pytest.mark.parametrize(
+    ("inplace_add_to_out", "overwrite_out", "expected_beta"),
+    [(False, False, 0.0), (True, False, 1.0), (True, True, 0.0)],
+)
+def test_grouped_gemm_fp4_variable_k_flydsl_beta(
+    monkeypatch, inplace_add_to_out, overwrite_out, expected_beta
+):
+    kernel_module_name = "primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp4_kernel"
+    kernel_module = type(sys)(kernel_module_name)
+    captured = {}
+
+    def fake_kernel(*args, **kwargs):
+        captured.update(kwargs)
+        return kwargs["out"]
+
+    kernel_module.grouped_gemm_mxfp4_variable_k_flydsl_kernel = fake_kernel
+    monkeypatch.setitem(sys.modules, kernel_module_name, kernel_module)
+    if overwrite_out:
+        monkeypatch.setenv("PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT", "1")
+    else:
+        monkeypatch.delenv("PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT", raising=False)
+
+    out = torch.empty((4, 128, 64), device="meta", dtype=torch.bfloat16) if inplace_add_to_out else None
+    result = GroupedGEMMFP4VariableKFlyDSLBackend.execute(
+        a=torch.empty((128, 256), device="meta", dtype=torch.uint8),
+        b=torch.empty((64, 256), device="meta", dtype=torch.uint8),
+        a_scales=torch.empty((128, 16), device="meta", dtype=torch.uint8),
+        b_scales=torch.empty((64, 16), device="meta", dtype=torch.uint8),
+        group_lens=torch.empty((4,), device="meta", dtype=torch.int64),
+        group_offs=torch.empty((5,), device="meta", dtype=torch.int64),
+        trans_a=False,
+        trans_b=True,
+        trans_c=False,
+        out_dtype=torch.bfloat16,
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        num_cu=None,
+        inplace_add_to_out=inplace_add_to_out,
+        out=out,
+    )
+
+    assert captured["beta"] == expected_beta
+    assert captured["out"] is out
+    assert result is out
 
 
 def test_grouped_gemm_fp4_variable_k_dispatch_contract(monkeypatch):
