@@ -100,3 +100,10 @@ Hints live in `job_context/hint.md` as `hN` (converted from `fwd-hint/hint.md`'s
 - **Deep preambles** had bwd-specific hints hard-coded; replaced with an instruction to read the job's own hint.md.
 - **Opus 5.5 agents** need `claude-agent-sdk>=0.2.159` in the op-evolve `.venv` (0.2.152 bundles a CLI too old for `claude-opus-5-5`).
 - **Stopping the loop**: find the pid with `ps -eo pid,cmd | grep "[o]p-evolve resume"` -- `pgrep -f` matches your own shell and `kill -TERM -<pgid>` then kills it.
+
+### Paused 2026-09-25 ~14:00 UTC (machine handed over)
+Round 4 (fast) was interrupted mid-opt: loop process group TERM'd, container `fa-repro` stopped (that also killed the round's in-container rocprofv3 survey, which host-side kill could not reach -- it runs as root inside the container). Champion = round 2 (prod 1018 TF/s). To resume:
+1. `docker start fa-repro`; inside: `/opt/venv/bin/pip uninstall -y primus_turbo` (if it came back); host: `sudo sysctl -w kernel.dmesg_restrict=0`; `rocm-smi --showpids` must be empty.
+2. `cd ~/code/2026_0910__op-evolve/op-evolve && setsid nohup env PATH="$PWD/.venv/bin:$PATH" op-evolve resume --job gfx1250-flydsl-attn-fwd-20260925-114644 >> LOG.fwd 2>&1 < /dev/null &` (never `--config`; the resolved yaml carries the hand edits: 49 dB, shape_band fast 0.90).
+3. Re-arm monitoring: `output/0925__flydsl/mon/watch.sh <job>` (Monitor) + a 15-min patrol cron.
+Round 5 will be the first deep round.
