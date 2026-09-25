@@ -1,0 +1,50 @@
+[
+  {
+    "shape": "proxy",
+    "arm": "w4",
+    "stat": "median",
+    "iters": 51,
+    "latency_ms": 1.1705909967422485,
+    "min_ms": 1.1514029502868652,
+    "max_ms": 1.3811019659042358,
+    "tflops": 293.5963720176082,
+    "bw_gbs": 143.32261265199327,
+    "flop": 343681269760.0,
+    "bytes_min": 167772160,
+    "sclk_start": 1060,
+    "sclk_end": 1067,
+    "causal": true
+  },
+  {
+    "shape": "proxy",
+    "arm": "cur",
+    "stat": "median",
+    "iters": 51,
+    "latency_ms": 0.8233749866485596,
+    "min_ms": 0.8155390024185181,
+    "max_ms": 0.8351680040359497,
+    "tflops": 417.40552644052224,
+    "bw_gbs": 203.76154573615926,
+    "flop": 343681269760.0,
+    "bytes_min": 167772160,
+    "sclk_start": 1060,
+    "sclk_end": 1067,
+    "causal": true
+  },
+  {
+    "shape": "proxy",
+    "arm": "beat",
+    "stat": "median",
+    "iters": 51,
+    "latency_ms": 0.6109359860420227,
+    "min_ms": 0.5901219844818115,
+    "max_ms": 0.7188149690628052,
+    "tflops": 562.548740968027,
+    "bw_gbs": 274.61495775837295,
+    "flop": 343681269760.0,
+    "bytes_min": 167772160,
+    "sclk_start": 1060,
+    "sclk_end": 1067,
+    "causal": true
+  }
+]

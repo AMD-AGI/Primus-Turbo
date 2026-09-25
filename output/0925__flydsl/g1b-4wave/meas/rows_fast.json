@@ -1,0 +1,50 @@
+[
+  {
+    "shape": "fast",
+    "arm": "w4",
+    "stat": "median",
+    "iters": 51,
+    "latency_ms": 0.1385820060968399,
+    "min_ms": 0.13420900702476501,
+    "max_ms": 0.4422909915447235,
+    "tflops": 38.77813686897222,
+    "bw_gbs": 75.66465730531165,
+    "flop": 5373952000.0,
+    "bytes_min": 10485760,
+    "sclk_start": 1100,
+    "sclk_end": 1100,
+    "causal": true
+  },
+  {
+    "shape": "fast",
+    "arm": "cur",
+    "stat": "median",
+    "iters": 51,
+    "latency_ms": 0.11413399875164032,
+    "min_ms": 0.10128799825906754,
+    "max_ms": 0.15511900186538696,
+    "tflops": 47.08458530129933,
+    "bw_gbs": 91.87236156351088,
+    "flop": 5373952000.0,
+    "bytes_min": 10485760,
+    "sclk_start": 1100,
+    "sclk_end": 1100,
+    "causal": true
+  },
+  {
+    "shape": "fast",
+    "arm": "beat",
+    "stat": "median",
+    "iters": 51,
+    "latency_ms": 0.10792399942874908,
+    "min_ms": 0.10152000188827515,
+    "max_ms": 0.3438909947872162,
+    "tflops": 49.793855198517335,
+    "bw_gbs": 97.15874185076554,
+    "flop": 5373952000.0,
+    "bytes_min": 10485760,
+    "sclk_start": 1100,
+    "sclk_end": 1100,
+    "causal": true
+  }
+]

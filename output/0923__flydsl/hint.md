@@ -3455,3 +3455,74 @@ up 1.17% from coarser causal granularity, `nmaskp` goes 1 -> 4 so the masked bod
 times as often, and the four waves are now barrier-coupled inside one workgroup where they
 used to be four independent single-wave workgroups with no rendezvous. What G2 buys is a
 **price for the barrier coupling**, which G1a explicitly could not bound.
+
+## h45 — G2 MEASURED: the 4-wave skeleton loses 33.6% at prod. The cause is barrier rendezvous amplified 4x by replicated staging, and it is diagnosed, not guessed.
+
+Same-session, one process per shape, 51 iters, palindromic, sclk witnessed, dmesg clean:
+
+| shape | 4-wave | champion | ratio | bar |
+|---|--:|--:|--:|--:|
+| prod | 337.02 | 507.34 | **0.664** | 713.99 |
+| proxy | 293.60 | 417.41 | 0.703 | 562.55 |
+| fast | 38.78 | 47.08 | 0.824 | 49.79 |
+
+Far worse than the predicted "neutral to slightly negative". The +1.17% WMMA and the
+`nmaskp` 1 -> 4 change cannot produce −33.6%.
+
+### The diagnosis, from the ISA
+
+Wait *counts* barely moved: `s_wait_loadcnt 0x0` stayed at **2**, `s_wait_loadcnt` 14 -> 15,
+`s_wait_dscnt 0x0` 4 -> 5, and the feared conservative all-counter drain appeared exactly
+**once** (`s_wait_loadcnt_dscnt` 0 -> 1). **So this is not the g23/g24 "conservative waitcnt"
+failure.** The hot loop looks like this:
+
+```
+ds_store_b128 ... offset:8704
+ds_store_b128 ... offset:8736
+s_wait_dscnt 0x0          <- drain EVERY outstanding LDS op
+s_barrier_signal -1
+s_barrier_wait -1
+ds_load_tr16_b128 ...
+```
+
+Four barrier pairs per body, each preceded by a full `s_wait_dscnt 0x0`. Two things multiply:
+
+1. **Replicated staging quadruples what each drain must wait for.** Every wave writes the
+   whole `[32 q][D]` image — 80 `ds_store_b128` per iteration, unchanged from the champion's
+   count but now issued by four waves into the same barrier. Each rendezvous drains 4x the
+   LDS traffic one wave would produce.
+2. **Occupancy is now 1 workgroup/CU, so nothing covers the rendezvous.** The champion runs
+   four *independent* single-wave workgroups per CU with no meeting point: when one stalls on
+   a wait the other three keep issuing. The 4-wave build is one barrier-coupled workgroup and
+   there is no second workgroup resident to switch to. This is exactly the R4 risk that G1a
+   explicitly could not bound, and it is the dominant term.
+
+### What this supersedes
+
+The plan gated the next step on R2 — "is the replicated global load actually coalesced into
+~1 L2 request by the TCP?" **That question is now less important than it was.** Even if the
+replicated loads were perfectly coalesced and cost zero extra global traffic, this build still
+loses 33.6%. The loss is not in global traffic at all.
+
+### The consequence for the direction
+
+**Splitting the Q/dO staging is not an optimisation on top of this step — it is a
+precondition for the step to be even neutral.** It fixes both terms at once: each wave would
+issue ~20 `ds_store_b128` instead of 80, so every barrier drains a quarter of the traffic, and
+`buffer_load_b128` would fall 160 -> ~40.
+
+It is a **redesign, not a gate**: the Q/dO global loads live in the carried prefetch tuple
+(`_NP = 4 + 32`, `_ldqd` at `kernels.py:284`), so splitting them changes the tuple width and
+the `scf.for` carry structure, not just a store address. Doing it carelessly is a silent wrong
+answer. **It needs its own edit plan before it is written.**
+
+### What is banked regardless
+
+The skeleton is **built and proven correct** — 15/15 UT, prod causal SQNR identical to the
+champion (h44). Every structural edit (4 waves, BLOCK_KV=128, lane/wave split, per-wave causal
+predicate, new LDS layout at 82944 B, restored barriers, `nsp` threshold) is verified and in a
+patch. The fused version needs all of it. **What G2 bought is the price of barrier coupling on
+this kernel — 33.6% — which nothing before could bound, and which explains why aiter's zero
+`buffer_load` / 40-TDM fill path is not a stylistic choice but a requirement.**
+
+`op/current` is untouched; this was built and measured entirely in a work copy.
