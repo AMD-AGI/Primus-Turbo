@@ -17,6 +17,8 @@ The forward op over-allocates the output to the (padded) input rows and the
 caller slices ``[:total_m]``; ``group_offs_out`` packs each group tight.
 """
 
+import os
+
 import torch
 
 from primus_turbo.pytorch.core.backend import (
@@ -363,6 +365,8 @@ class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
         num_cu: int | None,
         inplace_add_to_out: bool = False,
         out: torch.Tensor | None = None,
+        record_ownership: bool = True,
+        allow_overwrite: bool = False,
         **kwargs,
     ):
         from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp4_kernel import (
@@ -380,7 +384,13 @@ class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
         OUT_M = lhs.shape[0]
         OUT_N = rhs.shape[0]
         G = group_lens.shape[0]
-        return grouped_gemm_mxfp4_variable_k_flydsl_kernel(
+        overwrite_out = (
+            inplace_add_to_out
+            and allow_overwrite
+            and os.environ.get("PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT", "0") == "1"
+            and not GroupedGEMMFP4VariableKKernelDispatcher._is_graph_capturing()
+        )
+        result = grouped_gemm_mxfp4_variable_k_flydsl_kernel(
             lhs,
             lhs_scales,
             rhs,
@@ -391,9 +401,16 @@ class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
             G,
             out_dtype=out_dtype,
             num_cu=num_cu if num_cu is not None else -1,
-            beta=1.0 if inplace_add_to_out else 0.0,
+            beta=0.0 if overwrite_out or not inplace_add_to_out else 1.0,
             out=out if inplace_add_to_out else None,
         )
+        if overwrite_out and record_ownership:
+            # Record at the beta=0 producer, rather than at forward time, so
+            # Primus may safely skip clearing only slices actually replaced.
+            from primus_turbo.pytorch.core import grad_ownership
+
+            grad_ownership.record_overwrite(out)
+        return result
 
 
 class GroupedGEMMFP4VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDispatcher):
@@ -558,11 +575,17 @@ def grouped_gemm_fp4_variable_k_accum_impl(
     default_backend: int,
     out: torch.Tensor,
     maybe_pre_sync: bool = False,
+    allow_overwrite: bool = False,
 ) -> None:
-    """Variable-K grouped MXFP4 GEMM that accumulates into ``out`` instead of returning.
+    """Variable-K grouped MXFP4 GEMM that writes into ``out`` instead of returning.
 
-    Computes ``out += lhs[:,g] @ rhs[:,g]^T`` per group, folding the accumulation into
-    the GEMM epilogue (beta=1)
+    By default, computes ``out += lhs[:,g] @ rhs[:,g]^T`` per group with a beta=1
+    epilogue. When the expert-wgrad caller opts in and
+    ``PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT=1``, the epilogue uses beta=0 and
+    replaces ``out``. That write is also recorded for Primus's selective
+    gradient-buffer clear. CUDA graph capture retains beta=1 because Python ownership
+    recording is not replayed. Enable overwrite mode only when each optimizer step has
+    a single contribution to ``out``; otherwise later contributions are lost.
     """
     default_backend_choice = BackendChoice(backend=BackendType(default_backend))
     user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP4)
@@ -584,6 +607,7 @@ def grouped_gemm_fp4_variable_k_accum_impl(
         maybe_pre_sync=maybe_pre_sync,
         inplace_add_to_out=True,
         out=out,
+        allow_overwrite=allow_overwrite,
     )
 
     # The tuner launches each candidate repeatedly. On the first accumulation-key
@@ -598,7 +622,11 @@ def grouped_gemm_fp4_variable_k_accum_impl(
     if should_autotune and not GroupedGEMMFP4VariableKKernelDispatcher._is_graph_capturing():
         key = GroupedGEMMFP4VariableKKernelDispatcher.make_key(**kwargs)
         if key not in GroupedGEMMFP4VariableKKernelDispatcher._cache:
-            tuning_kwargs = {**kwargs, "out": torch.zeros_like(out)}
+            tuning_kwargs = {
+                **kwargs,
+                "out": torch.zeros_like(out),
+                "record_ownership": False,
+            }
 
     GroupedGEMMFP4VariableKKernelDispatcher.dispatch(
         default_backend_choice,
@@ -625,6 +653,7 @@ def grouped_gemm_fp4_variable_k_accum_impl_meta(
     default_backend: int,
     out: torch.Tensor,
     maybe_pre_sync: bool = False,
+    allow_overwrite: bool = False,
 ) -> None:
     assert a.dim() == 2, f"a must be 2D, got {a.shape}"
     assert b.dim() == 2, f"b must be 2D, got {b.shape}"
