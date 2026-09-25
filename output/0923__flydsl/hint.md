@@ -3284,3 +3284,61 @@ route has no missing primitive.
 
 **Do not build the fused kernel before the two UNMEASURED performance items have numbers.**
 Both are cheap. That is the same rule that rounds 13-22 violated sixteen times.
+
+## h42 — CORRECTION to h41, and G0 PASSES. The atomic I verified was the WRONG SCOPE; the right one exists.
+
+### RETRACT h41's central claim
+
+h41 said the probe emitted "byte-for-byte the instruction aiter's backward issues". **It did
+not.** Same mnemonic, different scope, and the difference is correctness-critical:
+
+```
+my probe : buffer_atomic_add_f32 v1,   v0,  s[0:3],   null offen
+aiter    : buffer_atomic_add_f32 v204, v20, s[52:55], null offen   scope:SCOPE_DEV
+```
+
+**No modifier ≡ `scope:SCOPE_CU`** (encoding byte[6]: CU 0x80, SE 0x84, DEV 0x88, SYS 0x8c,
+established with `llvm-mc -mcpu=gfx1250 -show-encoding`). This card reports **`num_xcc 8`**
+(`kernels.py:681-683`, from `/sys/class/kfd/kfd/topology/nodes/2/properties`), and dQ's same
+address is accumulated by workgroups on different XCDs. **A CU-scope atomic does not
+guarantee cross-XCD visibility — the failure mode is silently lost updates, not slowness.**
+There is precedent in the corpus for exactly this class: `hd128.md:888-890` records a cache
+-scope bit on a sibling atomic as "a silent wrong answer, not a slowdown".
+
+I verified that an instruction could be emitted and did not verify it was the RIGHT
+instruction. That is the same error shape as five earlier ones: checking the thing that is
+easy to check instead of the thing that decides the outcome.
+
+### G0 RESULT — the route survives, via a different primitive
+
+Three variants, each in its own process because the failures are hard MLIR assertions that
+abort the interpreter:
+
+| variant | result |
+|---|---|
+| `UniversalAtomicAdd(Float32, SyncScope.Agent)` on a **plain global-pointer tensor** | **BUILD ok → `global_atomic_add_f32 v0, v1, s[0:1] scale_offset scope:SCOPE_DEV`** — no `TH_ATOMIC_RETURN`, no `cmpswap`. **PASS** |
+| same, but destination built through `make_buffer_tensor` | MLIR assert, process abort |
+| same with `SyncScope.System`, buffer destination | MLIR assert, process abort |
+| `BufferAtomicAdd(Float32)` copy-atom (h41's probe) | builds, but **`buffer_atomic_add_f32` with NO scope = SCOPE_CU — unusable** |
+
+**So the usable primitive is `global_atomic_add_f32`, not `buffer_atomic_add_f32`.**
+
+Consequences to design around, none fatal:
+- **64-bit address per lane** instead of a 32-bit offset into a descriptor — more VGPR in a
+  kernel whose register budget is the binding constraint. Price it in the first COMPILE_ONLY.
+- **No descriptor OOB clamp.** That is arguably safer here: `kernels.py:911-913` deliberately
+  gives k_dq a flat 1 GiB `num_records` because "the loaded value is dead", which is fine for
+  a read and **catastrophic for an atomic add** — an out-of-range address would be clamped
+  onto a live element and permanently accumulate into it, deterministically, so neither the
+  70 dB run-to-run floor nor a bitwise check would ever see it. With `global_atomic_*` there
+  is no clamp to hide behind: **every atomic must be predicated in the kernel.**
+- `fx.UniversalAtomicAdd` takes the syncscope as its second argument
+  (`primitive.py:208-218`); `fx.rocdl.BufferAtomic` has **no scope parameter at all**
+  (`universal.py:139-146`), which is why the buffer path cannot reach SCOPE_DEV.
+
+### Still unverified about this
+
+Whether a CU-scope atomic *actually* loses updates on this part is ARGUED, not enumerated —
+I did not read the gfx1250 ISA manual. It does not matter operationally: there is exactly one
+safe choice, which is to match aiter and emit SCOPE_DEV, and that is now known to be
+reachable.
