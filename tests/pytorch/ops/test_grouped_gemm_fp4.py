@@ -124,6 +124,8 @@ def test_grouped_gemm_fp4_variable_k_dispatch_keys():
 def test_grouped_gemm_fp4_variable_k_flydsl_beta(
     monkeypatch, inplace_add_to_out, overwrite_out, expected_beta
 ):
+    from primus_turbo.pytorch.core import grad_ownership
+
     kernel_module_name = "primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp4_kernel"
     kernel_module = type(sys)(kernel_module_name)
     captured = {}
@@ -134,6 +136,8 @@ def test_grouped_gemm_fp4_variable_k_flydsl_beta(
 
     kernel_module.grouped_gemm_mxfp4_variable_k_flydsl_kernel = fake_kernel
     monkeypatch.setitem(sys.modules, kernel_module_name, kernel_module)
+    recorded = []
+    monkeypatch.setattr(grad_ownership, "record_overwrite", recorded.append)
     if overwrite_out:
         monkeypatch.setenv("PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT", "1")
     else:
@@ -160,6 +164,7 @@ def test_grouped_gemm_fp4_variable_k_flydsl_beta(
     assert captured["beta"] == expected_beta
     assert captured["out"] is out
     assert result is out
+    assert recorded == ([out] if inplace_add_to_out and overwrite_out else [])
 
 
 def test_grouped_gemm_fp4_variable_k_dispatch_contract(monkeypatch):

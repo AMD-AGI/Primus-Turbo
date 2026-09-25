@@ -382,7 +382,10 @@ class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
         OUT_M = lhs.shape[0]
         OUT_N = rhs.shape[0]
         G = group_lens.shape[0]
-        return grouped_gemm_mxfp4_variable_k_flydsl_kernel(
+        overwrite_out = (
+            inplace_add_to_out and os.environ.get("PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT", "0") == "1"
+        )
+        result = grouped_gemm_mxfp4_variable_k_flydsl_kernel(
             lhs,
             lhs_scales,
             rhs,
@@ -393,13 +396,16 @@ class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
             G,
             out_dtype=out_dtype,
             num_cu=num_cu if num_cu is not None else -1,
-            beta=(
-                1.0
-                if inplace_add_to_out and os.environ.get("PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT", "0") != "1"
-                else 0.0
-            ),
+            beta=0.0 if overwrite_out or not inplace_add_to_out else 1.0,
             out=out if inplace_add_to_out else None,
         )
+        if overwrite_out:
+            # Record at the beta=0 producer, rather than at forward time, so
+            # Primus may safely skip clearing only slices actually replaced.
+            from primus_turbo.pytorch.core import grad_ownership
+
+            grad_ownership.record_overwrite(out)
+        return result
 
 
 class GroupedGEMMFP4VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDispatcher):
@@ -569,8 +575,9 @@ def grouped_gemm_fp4_variable_k_accum_impl(
 
     By default, computes ``out += lhs[:,g] @ rhs[:,g]^T`` per group with a beta=1
     epilogue. When ``PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT=1``, the epilogue uses
-    beta=0 and replaces ``out``. Enable overwrite mode only when each optimizer step
-    has a single contribution to ``out``; otherwise later contributions are lost.
+    beta=0 and replaces ``out``. That write is also recorded for Primus's selective
+    gradient-buffer clear. Enable overwrite mode only when each optimizer step has a
+    single contribution to ``out``; otherwise later contributions are lost.
     """
     default_backend_choice = BackendChoice(backend=BackendType(default_backend))
     user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP4)
