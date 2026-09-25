@@ -1,0 +1,11 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm s1 -> /home/lihuzhan/g3work
+# arm w4 -> /home/lihuzhan/g2work
+# arm cur -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/current
+# arm beat -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/beat
+# statistic median  iters 51  warmup 3.0s continuous  order palindromic  device gfx1250
+RESULT shape=prod arm=s1 stat=median iters=51 latency_ms=16.365863800048828 min_ms=16.274879455566406 max_ms=16.69983673095703 tflops=335.9571663735584 bw_gbs=82.01078148994468 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1055 sclk_end=1066 causal=True
+RESULT shape=prod arm=w4 stat=median iters=51 latency_ms=16.286577224731445 min_ms=16.16349983215332 max_ms=16.421667098999023 tflops=337.5926784156247 bw_gbs=82.41002768598186 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1055 sclk_end=1066 causal=True
+RESULT shape=prod arm=cur stat=median iters=51 latency_ms=10.748522758483887 min_ms=10.60935115814209 max_ms=10.90455436706543 tflops=511.53347776839456 bw_gbs=124.8708599459037 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1055 sclk_end=1066 causal=True
+RESULT shape=prod arm=beat stat=median iters=51 latency_ms=7.642336845397949 min_ms=7.55112886428833 max_ms=7.814805030822754 tflops=719.443455417817 bw_gbs=175.623936389068 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1055 sclk_end=1066 causal=True

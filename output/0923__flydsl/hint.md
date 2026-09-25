@@ -3825,3 +3825,59 @@ The 4-wave build's ceiling is still the champion (identical per-body work, h46).
 507. **Its value is that the fused version needs the BLOCK_KV=128 four-wave skeleton, and that
 skeleton currently carries a 33.6% entry fee.** If S1 removes the fee, a fused build starts
 from parity instead of from -33.6%.
+
+## h50 — S1 IS A NULL. Cover rose 36% and the time did not move. The cover model does not explain the 4-wave loss, and that is the THIRD refuted diagnosis.
+
+Same session, one process per shape, 51 iters, palindromic, sclk witnessed, dmesg clean:
+
+| shape | S1 | 4-wave baseline | ratio | champion |
+|---|--:|--:|--:|--:|
+| prod | 335.96 | 337.59 | **0.995** | 511.53 |
+| proxy | 291.79 | 293.87 | 0.993 | 430.07 |
+| fast | 38.26 | 34.49 | 1.109 | 50.45 |
+
+**Cover went 389 -> 529 (+36%) and prod moved by -0.5%, inside the floor.** Correctness was
+verified first and is bit-identical (prod causal 52.56 / 52.60 / 52.71, same as the champion
+and the baseline), so this is a clean controlled comparison: only the issue position differed.
+
+### This falsifies the cover model as the explanation here
+
+The cover model is the campaign's one unifying variable. It retro-explained `g62` (+1.65%),
+`g28` (-7.8%), `g63` (-19.33%), `g66` (-21.93%), `g68` (-30.0%) and `P70` (-10.86%), and round
+22 pre-registered a prediction with it and hit. **In this configuration it predicts a gain and
+delivers nothing.** Either cover is not the binding quantity in a four-wave body, or the 33.6%
+has a different cause. The model is not dead — five results still fit it — but it is now known
+to have a boundary, and the boundary is here.
+
+### Three diagnoses, three refutations
+
+| # | diagnosis | how it died |
+|---|---|---|
+| 1 | replicated staging quadruples each barrier's drain (h45) | ISA census: per-body counts identical to the champion |
+| 2 | occupancy fell to 1 WG/CU so nothing covers the rendezvous (h45) | waves/CU is 4 on both sides |
+| 3 | **the loadcnt fence truncates prefetch cover (h49)** | **measured: cover +36%, time unchanged** |
+
+I wrote all three. The first two were corrected by a workflow's ISA census; the third by its
+own pre-registered experiment. **Three for three.**
+
+### What is left
+
+The only remaining structural difference is `s_barrier`: **8 in the 4-wave build, 0 in the
+champion.** Not through any wait-counter mechanism — every waitcnt hypothesis is now refuted —
+but the raw rendezvous: four waves meeting eight times per body, with the workgroup advancing
+at the slowest of the four, where the champion's four waves **never wait on each other at
+all**.
+
+A barrier-free timing probe is building: the same kernel with both `fx.barrier()` deleted.
+Results are **wrong by construction** (the cross-wave RAW on the shared Q/dO image is
+unguarded) but the timing is valid. ISA confirms it: `s_barrier` 0, `v_wmma` 128,
+`buffer_load_b128` 160, spill 0 — identical work, zero rendezvous. If it recovers toward 507,
+the barriers are the entire cost.
+
+### Why that would matter more than this arm
+
+**The fused version needs barriers** — dS has to cross waves, because dQ's contraction axis is
+the full 128 kv while one wave owns 32. If the raw rendezvous costs ~33% on this body, the
+fused design does not survive it either, and the 5-GEMM structure is unreachable in any
+four-wave form on this kernel. That is the question the probe answers, and it is worth more
+than the 4-wave arm ever was.
