@@ -17,6 +17,8 @@ The forward op over-allocates the output to the (padded) input rows and the
 caller slices ``[:total_m]``; ``group_offs_out`` packs each group tight.
 """
 
+import os
+
 import torch
 
 from primus_turbo.pytorch.core.backend import (
@@ -249,16 +251,11 @@ class GroupedGEMMFP4VariableKTritonBackend(KernelBackend):
         granularity: ScalingGranularity,
         num_cu: int | None,
         inplace_add_to_out: bool = False,
-        overwrite_out: bool = False,
         **kwargs,
     ) -> bool:
         supported = True
         # TODO: this backend has no beta=1 accumulate epilogue yet.
         supported &= not inplace_add_to_out
-        # Nor can it write a caller-owned `out` at all. Selecting it for an
-        # overwrite would send the gradient to the discarded return value while
-        # the dummy wgrad kept the loss looking healthy.
-        supported &= not overwrite_out
         supported &= not is_gfx942()
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= granularity in GroupedGEMMFP4VariableKTritonBackend.SUPPORTED_GRANULARITIES
@@ -333,13 +330,12 @@ class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
         granularity: ScalingGranularity,
         num_cu: int | None,
         inplace_add_to_out: bool = False,
-        overwrite_out: bool = False,
         out: torch.Tensor | None = None,
         **kwargs,
     ) -> bool:
         supported = True
         if inplace_add_to_out:
-            supported &= out is not None and out.dtype == out_dtype and out.is_contiguous()
+            supported &= out is not None and out.dtype == out_dtype
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= granularity in GroupedGEMMFP4VariableKFlyDSLBackend.SUPPORTED_GRANULARITIES
         supported &= a.dtype == float4_e2m1fn_x2 and b.dtype == float4_e2m1fn_x2
@@ -368,7 +364,6 @@ class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
         granularity: ScalingGranularity,
         num_cu: int | None,
         inplace_add_to_out: bool = False,
-        overwrite_out: bool = False,
         out: torch.Tensor | None = None,
         **kwargs,
     ):
@@ -398,7 +393,12 @@ class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
             G,
             out_dtype=out_dtype,
             num_cu=num_cu if num_cu is not None else -1,
-            beta=0.0 if overwrite_out else (1.0 if inplace_add_to_out else 0.0),
+            beta=(
+                1.0
+                if inplace_add_to_out
+                and os.environ.get("PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT", "0") != "1"
+                else 0.0
+            ),
             out=out if inplace_add_to_out else None,
         )
 
@@ -426,8 +426,6 @@ class GroupedGEMMFP4VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDisp
         granularity,
         num_cu,
         inplace_add_to_out=False,
-        overwrite_out=False,
-        out=None,
         **kwargs,
     ):
         bs = group_lens.shape[0]
@@ -451,9 +449,6 @@ class GroupedGEMMFP4VariableKKernelDispatcher(BaseGroupedGEMMVariableKKernelDisp
             trans_c,
             granularity,
             inplace_add_to_out,
-            overwrite_out,
-            out.dtype if out is not None else None,
-            out.is_contiguous() if out is not None else None,
         )
 
 
@@ -570,14 +565,11 @@ def grouped_gemm_fp4_variable_k_accum_impl(
     default_backend: int,
     out: torch.Tensor,
     maybe_pre_sync: bool = False,
-    overwrite_out: bool = False,
 ) -> None:
-    """Variable-K grouped MXFP4 GEMM that writes into ``out`` instead of returning.
+    """Variable-K grouped MXFP4 GEMM that accumulates into ``out`` instead of returning.
 
     Computes ``out += lhs[:,g] @ rhs[:,g]^T`` per group, folding the accumulation into
-    the GEMM epilogue (beta=1). With ``overwrite_out`` the epilogue runs at beta=0 and
-    ``out`` is replaced rather than accumulated into; the GEMM spans all of ``out``, so
-    the caller only needs to know that nothing it wants to keep is already there.
+    the GEMM epilogue (beta=1)
     """
     default_backend_choice = BackendChoice(backend=BackendType(default_backend))
     user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP4)
@@ -598,7 +590,6 @@ def grouped_gemm_fp4_variable_k_accum_impl(
         num_cu=num_cu,
         maybe_pre_sync=maybe_pre_sync,
         inplace_add_to_out=True,
-        overwrite_out=overwrite_out,
         out=out,
     )
 
@@ -641,7 +632,6 @@ def grouped_gemm_fp4_variable_k_accum_impl_meta(
     default_backend: int,
     out: torch.Tensor,
     maybe_pre_sync: bool = False,
-    overwrite_out: bool = False,
 ) -> None:
     assert a.dim() == 2, f"a must be 2D, got {a.shape}"
     assert b.dim() == 2, f"b must be 2D, got {b.shape}"

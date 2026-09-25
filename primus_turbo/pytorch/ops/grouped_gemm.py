@@ -81,7 +81,7 @@ class GroupedGemmFunc(torch.autograd.Function):
         schedule: str = "static",
         fuse_bgrad_accum_pattern: Union[None, str] = None,
     ):
-        fuse_bgrad_accum, main_grad, _ = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
+        fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
         if len(group_lens) == 1:
             assert b.size(0) == 1, f"Expected first dimension to be 1, got {b.size(0)}"
             b_2d = b.squeeze(0)

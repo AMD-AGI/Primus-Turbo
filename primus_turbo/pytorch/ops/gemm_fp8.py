@@ -108,7 +108,7 @@ class FP8GemmTensorFunction(torch.autograd.Function):
         fuse_bgrad_accum_pattern: Union[None, str] = None,
     ):
         use_nt_layout_gemm_in_bwd = _deter_use_nt_layout_gemm_in_bwd(trans_a, trans_b)
-        fuse_bgrad_accum, main_grad, _ = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
+        fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
 
         if isinstance(a, QuantizedTensor):
             quantized_a = a
@@ -572,7 +572,7 @@ class FP8GemmMXFunction(torch.autograd.Function):
 
         assert trans_a == False and trans_b == True, "trans_a has to be False and trans_b has to be True"
 
-        fuse_bgrad_accum, main_grad, _ = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
+        fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
 
         # Scale preshuffle is NOT done here: the quant emits raw E8M0 [dim, K//32]
         # scales and each GEMM backend implicitly preshuffles right before its own

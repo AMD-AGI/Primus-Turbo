@@ -111,7 +111,7 @@ class FP8GroupedGemmBlockFunc(torch.autograd.Function):
         num_cu: int | None,
         fuse_bgrad_accum_pattern: Union[None, str] = None,
     ):
-        fuse_bgrad_accum, main_grad, _ = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
+        fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
 
         assert config.granularity == ScalingGranularity.BLOCKWISE
         assert config.block_size in [128], "Only block_size 128 is supported currently."
@@ -269,7 +269,7 @@ class FP8GroupedGemmRowFunc(torch.autograd.Function):
         num_cu: int | None,
         fuse_bgrad_accum_pattern: Union[None, str] = None,
     ):
-        fuse_bgrad_accum, main_grad, _ = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
+        fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
 
         assert config.granularity == ScalingGranularity.ROWWISE
 
@@ -459,7 +459,7 @@ class FP8GroupedGemmTensorFunc(torch.autograd.Function):
         num_cu: int | None,
         fuse_bgrad_accum_pattern: Union[None, str] = None,
     ):
-        fuse_bgrad_accum, main_grad, _ = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
+        fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
 
         assert config.granularity == ScalingGranularity.TENSORWISE
 
@@ -648,7 +648,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
         num_cu: int | None,
         fuse_bgrad_accum_pattern: Union[None, str] = None,
     ):
-        fuse_bgrad_accum, main_grad, _ = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
+        fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
 
         supported_mxfp8_backend, reason = check_mxfp8_support()
         assert supported_mxfp8_backend, reason

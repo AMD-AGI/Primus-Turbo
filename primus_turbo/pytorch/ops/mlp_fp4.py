@@ -137,8 +137,8 @@ class FP4MLPMXFunc(torch.autograd.Function):
         assert supported, reason
 
         # Each weight has its own accumulation buffer, so these cannot be shared.
-        fuse_w1_accum, w1_main_grad, _ = _setup_fused_grad_accum(w1, fuse_wgrad_accum_pattern)
-        fuse_w2_accum, w2_main_grad, _ = _setup_fused_grad_accum(w2, fuse_wgrad_accum_pattern)
+        fuse_w1_accum, w1_main_grad = _setup_fused_grad_accum(w1, fuse_wgrad_accum_pattern)
+        fuse_w2_accum, w2_main_grad = _setup_fused_grad_accum(w2, fuse_wgrad_accum_pattern)
         ctx.w1_grad_shape = tuple(w1.shape)
         ctx.w2_grad_shape = tuple(w2.shape)
         ctx.w1_grad_dtype = w1.dtype

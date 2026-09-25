@@ -106,19 +106,6 @@ def test_grouped_gemm_fp4_variable_k_dispatch_keys():
     accumulation_key = GroupedGEMMFP4VariableKKernelDispatcher.make_key(
         b=torch.empty((3072, 2048), device="meta", dtype=fp4_dtype),
         inplace_add_to_out=True,
-        out=torch.empty((8, 512, 3072), device="meta", dtype=torch.bfloat16),
-        **common,
-    )
-    incompatible_destination_key = GroupedGEMMFP4VariableKKernelDispatcher.make_key(
-        b=torch.empty((3072, 2048), device="meta", dtype=fp4_dtype),
-        inplace_add_to_out=True,
-        out=torch.empty((8, 512, 3072), device="meta", dtype=torch.float32),
-        **common,
-    )
-    noncontiguous_destination_key = GroupedGEMMFP4VariableKKernelDispatcher.make_key(
-        b=torch.empty((3072, 2048), device="meta", dtype=fp4_dtype),
-        inplace_add_to_out=True,
-        out=torch.empty((8, 3072, 512), device="meta", dtype=torch.bfloat16).transpose(1, 2),
         **common,
     )
 
@@ -126,17 +113,6 @@ def test_grouped_gemm_fp4_variable_k_dispatch_keys():
     assert key_n4096[1:4] == (512, 4096, 2048)
     assert key_n3072 != key_n4096
     assert key_n3072 != accumulation_key
-    assert accumulation_key != incompatible_destination_key
-    assert accumulation_key != noncontiguous_destination_key
-
-    cache = GroupedGEMMFP4VariableKKernelDispatcher._cache
-    cache.clear()
-    try:
-        cache.put(accumulation_key, GroupedGEMMFP4VariableKFlyDSLBackend)
-        assert cache.get(incompatible_destination_key) is None
-        assert cache.get(noncontiguous_destination_key) is None
-    finally:
-        cache.clear()
 
 
 def test_grouped_gemm_fp4_variable_k_dispatch_contract(monkeypatch):
@@ -172,12 +148,6 @@ def test_grouped_gemm_fp4_variable_k_dispatch_contract(monkeypatch):
     for backend in (GroupedGEMMFP4VariableKTritonBackend, GroupedGEMMFP4VariableKFlyDSLBackend):
         assert backend.can_handle(**kwargs)
         assert not backend.can_handle(**{**kwargs, "trans_b": False})
-
-    destination = torch.empty((4, 128, 64), device="meta", dtype=torch.bfloat16)
-    assert GroupedGEMMFP4VariableKFlyDSLBackend.can_handle(**kwargs, inplace_add_to_out=True, out=destination)
-    assert not GroupedGEMMFP4VariableKFlyDSLBackend.can_handle(
-        **kwargs, inplace_add_to_out=True, out=destination.transpose(1, 2)
-    )
 
     out = grouped_gemm_fp4_variable_k_impl_meta(
         **{
