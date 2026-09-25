@@ -81,3 +81,20 @@ L5 -- each its own arm; L1 `O_VARIANT` v1 if it compiles on 0.3.4.1 (V1 `ptr_loa
 body (L6 pipelining) only after grid arms are measured. Every KYLE/BWD row is a prior, not a result.
 Correctness gates (f16): adversarial large-logit test for any max-tracking change; lse natural log; o/lse
 bitwise deterministic (no atomics, no split-k); log agree_dB vs ASM (49.93).
+
+## 4. Progress log (fwd job `gfx1250-flydsl-attn-fwd-20260925-114644`)
+
+Hints live in `job_context/hint.md` as `hN` (converted from `fwd-hint/hint.md`'s `fN`; h18 = decision index, h20 = re-land r1.i1.g01).
+
+| round | mode | outcome | fast / proxy / prod TF/s | vs champion (prod) | note |
+|---|---|---|---|---|---|
+| 0 | setup | baseline | 47.3 / 549.8 / 935.0 | -- | setup took ~15 min, not 58 |
+| 1 | fast | rejected | 44.2 / 813.4 / 1015.4 | 1.086 | r1.i1.g01 longest-first dispatch: proxy 1.48x, prod +8.6%. Rejected only by operator-side gate bugs (below). O_VARIANT v1 did NOT reproduce (proxy -3/-4%). |
+
+### Operator fixes applied during the fwd job (each cost a round -- check them on any new job)
+- **op-evolve route parser** (`core/route.py`): row type was matched on the whole row, so "must be predicated" / "== idea r1..." in free-text cells flipped must/idea and crashed round 1 (`RouteError`). Fixed to read the type cell only (op-evolve branch `lhz/gfx1250`).
+- **Precision floor 50 dB was unpassable**: the unmodified baseline reads o 49.82-49.99 dB on 7 edge cases. Set `op.precision_sqnr_db: 49` in the resolved yaml (hand edit, no spec bump).
+- **Fast shape vetoed a prod win**: band = max(0.95, 1-min_gain) = 0.993 per shape; fast (s=1024) is launch-bound and its median moves with arm position after ASM. Added `evolve.shape_band: {fast: 0.90}` (new op-evolve feature, `core/acceptance.py`).
+- **Deep preambles** had bwd-specific hints hard-coded; replaced with an instruction to read the job's own hint.md.
+- **Opus 5.5 agents** need `claude-agent-sdk>=0.2.159` in the op-evolve `.venv` (0.2.152 bundles a CLI too old for `claude-opus-5-5`).
+- **Stopping the loop**: find the pid with `ps -eo pid,cmd | grep "[o]p-evolve resume"` -- `pgrep -f` matches your own shell and `kill -TERM -<pgid>` then kills it.

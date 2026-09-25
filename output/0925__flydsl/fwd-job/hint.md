@@ -38,6 +38,7 @@ Source abbreviations used below:
 | h17 | must standing note | FlyDSL version and API policy | open |
 | h18 | standing note | Decision index -- check it before choosing a lever | open |
 | h19 | standing note | Report format (every round) | open |
+| h20 | must note | Re-land r1.i1.g01 (longest-first dispatch) -- round 1 lost it to two operator-side gate bugs, now fixed | open |
 
 ---
 
@@ -271,3 +272,16 @@ Status: ❌ measured-dead · ⚠ conditional · 🔬 predicted-only (ISA reading
 
 ---
 
+
+### h20 -- Re-land r1.i1.g01 (longest-first dispatch) -- round 1 lost it to two operator-side gate bugs, now fixed
+
+Round 1's shipped code (`rounds/001/op/`, r1.i1.g01 alone) measured prod 1015.37 TF/s vs champion
+935.04 (1.086x) and proxy 1.479x in the same session, and was rejected ONLY because (a) the
+precision floor was 50 dB while the unmodified baseline itself reads o 49.82-49.99 dB on 7 edge
+cases, and (b) the fast shape's median (launch-bound, moves with arm position after ASM) read 0.934
+against a 0.993 band. The operator has fixed both in the resolved spec: `op.precision_sqnr_db: 49`,
+`evolve.shape_band: {fast: 0.90}`. Do not rebuild it from scratch: start from `rounds/001/op/`
+(diff it against `op/current/`), re-measure, and ship it -- then use the remaining time of the round
+for the next lever (h5 grid levers: in-WG t/N-1-t pairing L3, XCD remap L4, causal origin L5).
+O_VARIANT v1 (r1.i2.g02) did NOT reproduce under this harness (proxy -3/-4%) -- do not merge it.
+Discharge this hint once r1.i1.g01 is accepted.
