@@ -121,22 +121,25 @@ def test_grouped_gemm_fp4_variable_k_dispatch_keys():
     (
         "inplace_add_to_out",
         "overwrite_out",
+        "allow_overwrite",
         "graph_capturing",
         "record_ownership",
         "expected_beta",
     ),
     [
-        (False, False, False, True, 0.0),
-        (True, False, False, True, 1.0),
-        (True, True, False, True, 0.0),
-        (True, True, False, False, 0.0),
-        (True, True, True, True, 1.0),
+        (False, False, False, False, True, 0.0),
+        (True, False, True, False, True, 1.0),
+        (True, True, False, False, True, 1.0),
+        (True, True, True, False, True, 0.0),
+        (True, True, True, False, False, 0.0),
+        (True, True, True, True, True, 1.0),
     ],
 )
 def test_grouped_gemm_fp4_variable_k_flydsl_beta(
     monkeypatch,
     inplace_add_to_out,
     overwrite_out,
+    allow_overwrite,
     graph_capturing,
     record_ownership,
     expected_beta,
@@ -182,12 +185,15 @@ def test_grouped_gemm_fp4_variable_k_flydsl_beta(
         inplace_add_to_out=inplace_add_to_out,
         out=out,
         record_ownership=record_ownership,
+        allow_overwrite=allow_overwrite,
     )
 
     assert captured["beta"] == expected_beta
     assert captured["out"] is out
     assert result is out
-    should_record = inplace_add_to_out and overwrite_out and not graph_capturing and record_ownership
+    should_record = (
+        inplace_add_to_out and overwrite_out and allow_overwrite and not graph_capturing and record_ownership
+    )
     assert recorded == ([out] if should_record else [])
 
 
