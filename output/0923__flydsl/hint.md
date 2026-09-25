@@ -4202,3 +4202,43 @@ than discovering the gate cannot see it.
 ### Launch cost
 
 ~58 minutes of card time for setup, and **it cannot run concurrently with the backward job**.
+
+## h56 — A round must not leave a scoring session running. Round 23 did, and it contended with the framework's own validation for ~2 minutes.
+
+`rounds/023/1-opt/act.yaml` records, honestly, that a second scoring session was launched, has
+**no result**, and *"is left running rather than killed"*.
+
+Caught live at 09:22 — **three processes on the card at once**:
+
+| pid | elapsed | what |
+|---|--:|---|
+| 43073 + 43975 | 1:14 / 0:10 | the framework's own `validation.py` and its `benchmark.py` child — **legitimate, and it decides the round** |
+| **42585** | **1:23** | **the abandoned `meas2` benchmark** |
+
+`rocm-smi --showpids` showed all three, GPU at 100%. **Two measurement streams were
+contaminating each other, and one of them was the leg that determines the verdict.**
+
+Killed by explicit PID (never `pkill` — that self-match has killed my own shell twice in this
+campaign). Verified harmless first: `_scratch/run/meas2/` is **empty**, so it never wrote, and
+`act.yaml` mentions `meas2` **zero** times, so nothing depends on it.
+
+**RULE: a round owns the card for its duration and must leave it idle.** If a scoring session
+is abandoned, kill it in the same step that abandons it. Leaving it running does not preserve
+an option — it has no result and cannot acquire one — it only guarantees that whatever measures
+next is wrong. The honest note in `act.yaml` is good practice; the decision it records is not.
+
+**Check before trusting any measurement:** `rocm-smi --showpids` must show exactly the
+processes you expect. It is one call and it would have caught this.
+
+### Round 23's actual result, which is a good one despite losing
+
+`r23.i1.g71` removes the second prefetch depth level from `k_dkdv` — undoing `r20.i2.g62`.
+Identical HBM bytes, identical WMMA count, **80 fewer instructions, 64 fewer `v_mov_b64`, and
+a tighter load clump (span 129 -> 77)** — and it **costs 1.74% of prod against a 0.24%
+same-session floor, seven times the floor.**
+
+**That re-prices `g62` upward.** `pool.md` rule 2 and the same sentence in `facts.md` both say
+its +1.65% sits on the noise floor and must not be counted as a banked mechanism. A subtractive
+test at 7x the floor says otherwise: **g62 is a real mechanism and the corpus should stop
+discounting it.** It is also the thirteenth counter-example to the HBM-traffic reading, and the
+first subtractive one — a bandwidth-bound body cannot lose 1.74% to an edit that moves no bytes.
