@@ -3881,3 +3881,68 @@ the full 128 kv while one wave owns 32. If the raw rendezvous costs ~33% on this
 fused design does not survive it either, and the 5-GEMM structure is unreachable in any
 four-wave form on this kernel. That is the question the probe answers, and it is worth more
 than the 4-wave arm ever was.
+
+## h51 — THE BARRIERS ARE THE ENTIRE COST, AND THE COST IS NOT INTRINSIC. aiter puts a median of 18 instructions between signal and wait; we put 0-1.
+
+### The measurement
+
+Barrier-free timing probe: the 4-wave build with both `fx.barrier()` deleted. **Results are
+wrong by construction** (the cross-wave RAW is unguarded) but the work is identical — ISA
+confirms `s_barrier` 0, `v_wmma` 128, `buffer_load_b128` 160, `ds_store_b128` 80, spill 0.
+
+| shape | barrier-free | with barriers | champion |
+|---|--:|--:|--:|
+| prod | **495.56** | 342.10 | 521.86 |
+| proxy | **412.77** | 298.12 | 452.54 |
+
+**Removing two barrier sites is worth 1.449x at prod.** The four-wave build goes from 0.656x
+of the champion to **0.950x**. The barriers are the whole 33.6%, and the residual ~5% is the
++1.17% WMMA from coarser causal granularity plus the 4x masked body.
+
+**That closes the question three diagnoses failed to answer** (h45 twice, h49/S1 once). It is
+not the staging, not the occupancy, not the fence, and not any wait counter. It is the
+rendezvous.
+
+### But the rendezvous is NOT intrinsically expensive — we are using it wrong
+
+aiter runs **26 barrier pairs at 719 TF/s**. The difference is in how far apart the halves of
+a split barrier sit:
+
+| | `s_barrier_signal` -> `s_barrier_wait` gap |
+|---|---|
+| **ours** (4 pairs) | **0, 1, 1, 1 instructions** |
+| **aiter** (26 pairs) | **min 0, median 18, max 37** |
+
+A split barrier exists so a wave can keep issuing **independent work** between announcing its
+arrival and blocking on the others. At a gap of 0-1 the rendezvous latency is **fully
+exposed**: the wave signals and immediately stalls. At a median of 18 it is hidden behind real
+work. That is how aiter affords 26 of them and we cannot afford 4.
+
+The compiler already proves the slot is usable — it placed one `v_wmma` in two of our four
+gaps on its own. It simply had nothing else independent to hoist there.
+
+### What this reopens
+
+**The fused 5-GEMM design is not dead.** It needs barriers because dS must cross waves (dQ
+contracts over the full 128 kv while one wave owns 32), and the naive reading of this
+measurement — "barriers cost 45%, so fusion is unreachable" — **is wrong**. What costs 45% is
+an *unhidden* rendezvous. aiter is the existence proof that a hidden one is affordable on this
+exact part.
+
+### The next experiment, and it is cheap
+
+**Widen the signal-to-wait gap.** Find independent work at each of the four sites and schedule
+it between the halves — `rocdl.sched_group_barrier` can place it, and `kernels.py:311` already
+uses `rocdl.sched_barrier(0)` elsewhere in this file. Candidates at each site: WMMA on operands
+already in registers, the dK/dV accumulator updates, address arithmetic for the next kv step.
+
+**Gate, zero card time:** rebuild and measure the four gaps in the ISA. Anything below ~8
+instructions is not worth taking to the card. The full-barrier build at 342.10 and the
+barrier-free build at 495.56 bracket the answer: every instruction of gap should buy back part
+of that 153 TF/s, and the experiment is worth running until the gap stops helping.
+
+**Caveat carried from today:** `sched_group_barrier` has lost 5 for 5 on this kernel
+(`dead_ends.md`), and `sched_barrier(0)` is a *boundary* rather than a clamp — fencing a group
+hands the scheduler two smaller regions and it pulls loads earlier. The mechanism here is
+different (placing work *into* an existing gap rather than reordering a clump), but that record
+says to screen it on the ISA first and expect the scheduler to fight back.
