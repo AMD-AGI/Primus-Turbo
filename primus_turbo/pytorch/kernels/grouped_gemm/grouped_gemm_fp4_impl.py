@@ -395,8 +395,7 @@ class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
             num_cu=num_cu if num_cu is not None else -1,
             beta=(
                 1.0
-                if inplace_add_to_out
-                and os.environ.get("PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT", "0") != "1"
+                if inplace_add_to_out and os.environ.get("PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT", "0") != "1"
                 else 0.0
             ),
             out=out if inplace_add_to_out else None,
