@@ -3342,3 +3342,53 @@ Whether a CU-scope atomic *actually* loses updates on this part is ARGUED, not e
 I did not read the gfx1250 ISA manual. It does not matter operationally: there is exactly one
 safe choice, which is to match aiter and emit SCOPE_DEV, and that is now known to be
 reachable.
+
+## h43 — G1a PASSES: restoring both barriers is essentially free at one wave. And h13's waitcnt precondition does not exist on gfx1250.
+
+### h13's precondition is inapplicable, not merely optional
+
+h13 required "each barrier preceded by an explicit `rocdl.s_waitcnt(WAIT_LGKM)`". On this arch
+that call **raises**:
+
+```
+ValueError: s_waitcnt is not supported on target arch 'gfx1250';
+            supported: gfx942 (CDNA3), gfx950 (CDNA4), gfx11xx, gfx120x
+```
+(`flydsl/expr/rocdl/universal.py:39-55`)
+
+gfx1250 uses **split** wait counters (`s_wait_loadcnt` / `s_wait_dscnt` / `s_wait_asynccnt`)
+and FlyDSL exposes no wrapper for them — only `s_waitcnt` (which rejects this arch) and
+`wait_asyncmark`. **The backend derives the dscnt wait from the LDS memory dependence itself**,
+which is exactly what the deletion comment at `kernels.py:453` already said. Use a bare
+`fx.barrier()`. h13's precondition was carried over from a gfx942-era note.
+
+### G1a measurement — both barriers restored, launch left at block=(32,1,1)
+
+| | vgpr | spill | LDS | `s_barrier` | `s_wait_loadcnt` | `s_wait_dscnt` |
+|---|--:|--:|--:|--:|--:|--:|
+| champion | 904 | 0 | 70656 | 0 | 14 | 14 |
+| **+2 barriers** | **904** | **0** | **70656** | **0** | 15 | 14 |
+
+Full ISA diff, k_dkdv:
+
+```
+.LBB0_4:  +1   (one  s_wait_dscnt 0x0, in the PROLOGUE block)
+.LBB0_8:  -6   (the hot body the stall model named -- it got SHORTER)
+total:    -5
+```
+
+Everything else in the diff is register renumbering (`v154` -> `v162` and friends). The
+995-instruction `.LBB0_9` is identical line for line. **Zero `s_wait_loadcnt_dscnt 0x0` in
+either build** — the feared conservative all-counter drain does not appear at all.
+
+**So the "barriers destroy the prefetch cover" risk does not materialise at one wave.**
+
+### The limit of this measurement, stated plainly
+
+At `block=(32,1,1)` LLVM still deletes the barrier (`s_barrier` stays 0), so G1a prices only
+the **conservative-waitcnt half** of the risk. At four waves the barrier becomes semantically
+real and will survive into the ISA; its actual cross-wave synchronisation cost is **not**
+bounded by this result. That is what G1b measures.
+
+**Net for G1b: the barrier restoration can be carried into the 4-wave build at no measured
+cost, so it need not be budgeted separately.**

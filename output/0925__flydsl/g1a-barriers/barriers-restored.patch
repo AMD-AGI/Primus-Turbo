@@ -1,0 +1,24 @@
+--- /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/current/kernels.py	2026-09-24 12:23:36.407024462 +0000
++++ /home/lihuzhan/g1work/kernels.py	2026-09-25 05:14:18.279657418 +0000
+@@ -450,6 +450,12 @@
+                 llvm_dialect.store(
+                     fx.as_ir_value(fx.Vector.from_elements(ds_l, dtype=fx.BFloat16)),
+                     create_llvm_ptr(lds_ds + off, address_space=3))
++        # G1a (2026-09-25) -- barrier RESTORED. h13's "explicit s_waitcnt(WAIT_LGKM) ahead
++        # of each barrier" precondition does NOT apply on gfx1250: rocdl.s_waitcnt rejects
++        # this arch outright (universal.py:39-55 -- gfx1250 uses SPLIT counters and FlyDSL
++        # exposes no s_wait_dscnt wrapper). The backend derives the dscnt wait from the LDS
++        # memory dependence itself, which is what the deletion comment below already said.
++        fx.barrier()
+         # r8.i1.g23+g24 -- fx.barrier() DELETED. block=(32,1,1): the workgroup is ONE
+         # 32-lane wave, so s_barrier is semantically a no-op and LLVM already removes
+         # it (0 `s_barrier` in the shipped ISA). What survives is the conservative
+@@ -489,6 +495,8 @@
+                 new[(NKV + kh) * NDO + dtile] = rocdl.wmma_f32_16x16x32_bf16(
+                     v8f, _ir(a_ds), _ir(b_q[dtile]), acc[(NKV + kh) * NDO + dtile],
+                     reuseA=False, reuseB=False).result
++        # G1a (2026-09-25) -- barrier RESTORED (WAR on the next iteration's LDS overwrite).
++        fx.barrier()
+         # r8.i1.g23+g24 -- fx.barrier() DELETED. block=(32,1,1): the workgroup is ONE
+         # 32-lane wave, so s_barrier is semantically a no-op and LLVM already removes
+         # it (0 `s_barrier` in the shipped ISA). What survives is the conservative
