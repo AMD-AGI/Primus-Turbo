@@ -1,0 +1,30 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+
+rocblaslt error: Cannot read "/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/TensileLibrary_lazy_gfx1250.dat" (or .zlib variant): No such file or directory
+
+rocblaslt error: Could not load "/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/TensileLibrary_lazy_gfx1250.dat"
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250.hsaco
+ error: file not found
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250-xnack-.hsaco
+ error: file not found
+hipModuleLoad failed: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/Kernels.so-000-gfx1250-xnack+.hsaco
+ error: file not found
+impl /home/lihuzhan/g2op/current
+arch gfx1250   gate 50.0 dB
+  toy                causal    5166.8 ms  dq 32768/32768   52.60 dB  dk 16384/16384   52.43 dB  dv 16384/16384   52.45 dB   PASS
+  toy                full         0.2 ms  dq 32768/32768   52.64 dB  dk 16384/16384   52.78 dB  dv 16384/16384   52.57 dB   PASS
+  gqa4_small         causal       0.2 ms  dq 262144/262144   52.56 dB  dk 65536/65536   52.54 dB  dv 65536/65536   52.98 dB   PASS
+  gqa4_small         full         0.1 ms  dq 262144/262144   52.58 dB  dk 65536/65536   52.58 dB  dv 65536/65536   52.73 dB   PASS
+  mha                causal       0.1 ms  dq 131072/131072   52.46 dB  dk 131072/131072   52.58 dB  dv 131072/131072   52.75 dB   PASS
+  mha                full         0.1 ms  dq 131072/131072   52.59 dB  dk 131072/131072   52.58 dB  dv 131072/131072   52.61 dB   PASS
+  unequal_seqlen     causal       0.2 ms  dq 524288/524288   52.54 dB  dk 262144/262144   52.62 dB  dv 262144/262144   52.71 dB   PASS
+  unequal_seqlen     full         0.1 ms  dq 524288/524288   52.54 dB  dk 262144/262144   52.62 dB  dv 262144/262144   52.65 dB   PASS
+  unequal_seqlen_2   causal       0.3 ms  dq 1048576/1048576   52.54 dB  dk 524288/524288   52.62 dB  dv 524288/524288   52.60 dB   PASS
+  unequal_seqlen_2   full         0.2 ms  dq 1048576/1048576   52.53 dB  dk 524288/524288   52.61 dB  dv 524288/524288   52.59 dB   PASS
+  sq_gt_skv          full         0.2 ms  dq 1048576/1048576   52.53 dB  dk 131072/131072   52.59 dB  dv 131072/131072   52.57 dB   PASS
+  fast               causal       0.2 ms  dq 1048576/1048576   52.61 dB  dk 262144/262144   52.64 dB  dv 262144/262144   52.84 dB   PASS
+  fast               full         0.2 ms  dq 1048576/1048576   52.56 dB  dk 262144/262144   52.62 dB  dv 262144/262144   52.52 dB   PASS
+  proxy              causal    2563.4 ms  dq 16777216/16777216   52.52 dB  dk 4194304/4194304   52.57 dB  dv 4194304/4194304   52.67 dB   PASS
+  prod               causal    2407.7 ms  dq 134217728/134217728   52.56 dB  dk 33554432/33554432   52.60 dB  dv 33554432/33554432   52.71 dB   PASS
+RESULT: PASS

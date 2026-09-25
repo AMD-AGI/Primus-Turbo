@@ -3392,3 +3392,66 @@ bounded by this result. That is what G1b measures.
 
 **Net for G1b: the barrier restoration can be carried into the 4-wave build at no measured
 cost, so it need not be budgeted separately.**
+
+## h44 — THE 4-WAVE BLOCK_KV=128 SKELETON IS BUILT AND CORRECT. G1b passes; UT 15/15 with SQNR identical to the champion.
+
+26 edits applied in descending line order against `op/current`. Patch archived at
+`output/0925__flydsl/g1b-4wave/4wave.patch`.
+
+### G1b compile gate
+
+| check | champion | 4-wave | |
+|---|--:|--:|---|
+| `s_barrier` | 0 | **8** | real 4 waves — the barrier survived into the ISA |
+| `.max_flat_workgroup_size` | 32 | **128** | |
+| `.reqd_workgroup_size` | 32,1,1 | **128,1,1** | `known_block_size` really changed |
+| `.group_segment_fixed_size` | 70656 | **82944** | exactly the predicted 65536 + 2*32*272 |
+| `.vgpr_count` | 904 | **882** | −22, and **spill 0** |
+| `v_wmma` | 128 | 128 | accumulator structure untouched |
+| `v_cmp_gt_i32` | 28 | 28 | mask shape untouched |
+| `buffer_load_b128` / `ds_store_b128` / `ds_load_tr16_b128` | 160/80/80 | **160/80/80** | replicated staging, as designed |
+| k_dq / k_delta workgroup size | 32 / 256 | **32 / 256** | no over-replacement |
+
+### Correctness: 15/15, and the SQNR is the tell
+
+`ut/test_correctness.py` PASS on every shape and both mask modes. At prod causal:
+**dq 52.56 / dk 52.60 / dv 52.71 dB — identical to the champion's numbers.**
+
+That is the designed check for the highest-risk edit: if any of the six `kv0` sites that must
+become `kvw` had been missed, causal SQNR would drop while non-causal stayed clean. It did not
+move at all, so the per-wave kv base and the per-wave causal predicate are both right.
+
+### Two harness facts that cost builds
+
+- **`rocdl.s_waitcnt` does not exist on gfx1250** (h43). Bare `fx.barrier()`.
+- **`rounds/002/_scratch/screen.py` hardcodes `block=(32,1,1)`** for its dkdv launches, so it
+  refuses a kernel declaring `known_block_size=[128,1,1]` with
+  *"launch block x=32 differs from known_block_size x=128 ... undefined behavior"*. That error
+  is itself proof the declaration took effect. A patched copy that reads
+  `getattr(k, "DKDV_THREADS", 32)` is archived as `screen4w.py`.
+
+### C6 was a false alarm, and the reason is worth keeping
+
+The plan expected `v_lshrrev_b32 v?, 5, v0` for `wave = thread_idx.x // 32` and warned that
+its absence means `wave` was never built. **It is absent, and `wave` is fine.** The IR settles
+it: `20_llvm_ir.ll:12` carries
+`%31 = call range(i32 0, 128) i32 @llvm.amdgcn.workitem.id.x()` — the **range metadata is
+0..128**, propagated from `known_block_size`, against the champion's `range(i32 0, 32)`.
+`fx.lane_id()` lowers to `mbcnt.lo`/`mbcnt.hi` and the backend folds that to
+`v_and_b32 v141, 31, v0` on wave32, which is what the C5 check actually saw.
+**An ISA-shape expectation is not a correctness check.** The correctness check is the SQNR.
+
+### What this build does NOT yet do
+
+**Q/dO staging is REPLICATED, deliberately.** All four waves run `_ldqd` on wave-uniform
+`(qt, gh)` and each writes the whole `[32 q][D]` image with identical bytes.
+`buffer_load_b128` is therefore unchanged at 160 and **there is no global-traffic win in this
+step.** The +13.6% ceiling needs the follow-up that splits the staging store across waves
+(gate it on the L2 read count first — if replicated loads are not coalesced by the TCP into
+~1 L2 request, the whole premise of the step is void).
+
+So the honest expectation for the G2 measurement is **neutral to slightly negative**: WMMA is
+up 1.17% from coarser causal granularity, `nmaskp` goes 1 -> 4 so the masked body runs four
+times as often, and the four waves are now barrier-coupled inside one workgroup where they
+used to be four independent single-wave workgroups with no rendezvous. What G2 buys is a
+**price for the barrier coupling**, which G1a explicitly could not bound.

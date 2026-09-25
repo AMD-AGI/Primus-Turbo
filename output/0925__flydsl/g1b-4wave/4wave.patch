@@ -1,0 +1,238 @@
+--- /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/current/kernels.py	2026-09-24 12:23:36.407024462 +0000
++++ /home/lihuzhan/g2work/kernels.py	2026-09-25 05:45:59.835483666 +0000
+@@ -17,7 +17,8 @@
+ So every output element is written exactly once, with no atomics and no host reduction --
+ the determinism gate in op.config.determinism holds by construction.
+ 
+-Divisibility is asserted, not handled: Sq % 16 == 0, Skv % 32 == 0. The bring-up files
++Divisibility is asserted, not handled: Sq % 16 == 0, Skv % 128 == 0 (r23: k_dkdv's
++workgroup is four wave32 covering BLOCK_KV = 128 kv rows). The bring-up files
+ assert the same way and every shape in op.shape divides.
+ """
+ import importlib.util as _ilu
+@@ -50,9 +51,14 @@
+ WAVE = 32                    # gfx1250 dispatches wave32; gfx942's odo says 64 here
+ LOG2E = 1.4426950408889634
+ NEG = -3.0e38
+-BLOCK_KV = 32               # r1.i6.g06: kv rows one workgroup owns (was 16)
+-S_ROW_B = BLOCK_KV * 2 + 16  # r4.i1.g16: 64 -> 80 B. 16 dwords is a 4-way bank
+-                             # collision at 64 banks; 20 dwords walks all 64.
++BLOCK_KV = 128              # r23: kv rows one WORKGROUP owns; 4 wave32 x 32 (was 32)
++KV_PER_WAVE = 32            # kv rows ONE WAVE owns -- unchanged; this is what keeps
++                            # NKV = 2 and the 256-VGPR accumulator set per wave
++WAVES_DKDV = BLOCK_KV // KV_PER_WAVE   # 4
++DKDV_THREADS = WAVES_DKDV * WAVE       # 128 -- k_dkdv / k_dkdv_sp block size
++S_ROW_B = BLOCK_KV * 2 + 16  # r4.i1.g16 -> r23: 80 -> 272 B. Unpadded would be 256 B =
++                             # 64 dwords, the EXACT full-collision stride; 272 B = 68
++                             # dwords gives row*4 mod 64 -- 16 distinct start banks.
+ X_ROW_B = D * 2 + 16         # r4.i1.g16: 256 -> 272 B. 256 B = 64 dwords is EXACTLY
+                              # the full 64-way collision stride on gfx1250's 64x4B
+                              # LDS: every staged row starts on bank 0, so the 16
+@@ -170,7 +176,8 @@
+     grid = (Skv/16, Hkv, B). The accumulators persist across the G q heads that share this
+     kv head, so the GQA reduction happens in registers -- atomic-free, written once.
+     """
+-    lane = fx.Int32(fx.thread_idx.x)
++    lane = fx.lane_id()                                  # 0..31 WITHIN this wave
++    wave = fx.Int32(fx.thread_idx.x) // fx.Int32(WAVE)   # 0..3, which 32-kv slice
+     # h8 PROBE (throwaway, never shipped): x and y are swapped so that adjacent
+     # workgroup ids walk kv HEADS instead of kv TILES.  Same work, same output,
+     # only the dispatch order changes -- if the ~107 GB of requested Q/dO bytes
+@@ -189,6 +196,11 @@
+     row = lane % fx.Int32(16)
+     half = lane // fx.Int32(16)
+     kv0 = bid * fx.Int32(BLOCK_KV)
++    # kv0 stays the WORKGROUP base (128-aligned) and MUST remain wave-uniform: the
++    # causal bounds below derive both scf.for trip counts from it and _body now contains
++    # two fx.barrier(). Per-wave trip counts would hang the dispatch.
++    kvw = kv0 + wave * fx.Int32(KV_PER_WAVE)      # this WAVE's 32 kv rows
++    wcol = wave * fx.Int32(KV_PER_WAVE * 2)       # its A-ring byte band: 0/64/128/192
+ 
+     # r1.i7.g07 -- ADDRESS CLAMP, not an algorithm change. Every descriptor here used to
+     # carry a flat 1 GiB num_records, so a load one element past a tensor was ISSUED and
+@@ -223,23 +235,25 @@
+     rs_kv = Hkv * fx.Int32(DV8)
+     base_kv = bat * Skv * rs_kv + hkv * fx.Int32(DV8)
+ 
+-    # r1.i6.g06. The workgroup owns BLOCK_KV key rows as NKV 16-row WMMA accumulator
+-    # sets. Q/dO staging is untouched -- still 16 query rows -- so the whole LDS increment
+-    # is the [q][kv] P and dS tiles going 16 -> 32 columns: 9216 -> 10240 B, which is
+-    # still 5 x 2048 B of granularity and still the 32-workgroup residency rung.
+-    # r12.i1.g39 -- LDS SEGMENT SEPARATION. gfx1250's LDS is organised in 64 KB
+-    # segments served by TWO 256 B/cycle read ports; two reads that fall in different
+-    # segments can be served in the same cycle, two in the same segment cannot
+-    # (`optimization/techniques/6-gfx1250-cdna5-mechanisms.md:252-268`). The output
+-    # GEMM's A ring (P, dS) and B ring (dO, Q) were adjacent inside one 22528 B block,
+-    # so all 40 transposing reads of a body contended for one port. Put the B ring at
+-    # offset 0 and the A ring one whole segment up: adding exactly 65536 flips bit 16
+-    # of the address, so the two rings land in ADJACENT segments whatever the
+-    # workgroup's physical LDS base is -- no alignment assumption.
+-    # Occupancy is unchanged: 70656 B gives floor(327680/70656) = 4 workgroups per CU,
+-    # and VGPR already caps it at 4 (740 VGPR, 32768 registers/SIMD -> 1 wave/SIMD,
+-    # r12.i0.g38). The SMALL ring is the one placed high, which is what keeps the
+-    # total under the 4-workgroup rung.
++    # r23 -- FOUR WAVE32 PER WORKGROUP. The workgroup owns BLOCK_KV = 128 key rows,
++    # split KV_PER_WAVE = 32 per wave; each wave still carries NKV = 2 16-row WMMA
++    # accumulator sets, so the per-wave register working set is bit-for-bit what it was.
++    # Q/dO staging stays 32 query rows and is now shared (replicated) by the four waves.
++    #   B ring (dO, Q): [32 q][D] bf16,        X_ROW_B = D*2+16       = 272 B -> 17408 B
++    #   A ring (P, dS): [32 q][BLOCK_KV] bf16, S_ROW_B = BLOCK_KV*2+16 = 272 B -> 17408 B
++    # The A ring is COLUMN-PARTITIONED: wave w owns kv columns [32w, 32w+32), i.e. byte
++    # band [64w, 64w+64) of every row (`wcol`). The B ring is NOT partitioned.
++    # S_ROW_B == X_ROW_B == 272 is a COINCIDENCE at D == BLOCK_KV == 128 -- head-dim
++    # columns versus kv columns. Keep the two symbols separate.
++    # r12.i1.g39 -- LDS SEGMENT SEPARATION survives verbatim: B ring at [0, 17408), A
++    # ring one whole 64 KB segment up at [65536, 82944). 17408 < 65536, so adding
++    # exactly 65536 still flips bit 16 and the two rings land in ADJACENT segments
++    # whatever the physical base is -- no alignment assumption.
++    # OCCUPANCY INVERTS. Total 65536 + 2*32*272 = 82944 B of the 327680 B gfx1250 allows
++    # (flydsl/utils/smem_allocator.py:249). LDS would permit 3 workgroups/CU, but at 904
++    # VGPR the measured rung is 1 wave/SIMD (r12.i0.g38), so 4 SIMDs hold exactly ONE
++    # four-wave workgroup. VGPR is the sole binding constraint and per-CU LDS pressure
++    # DROPS from 4*70656 = 282624 B to 82944 B. Waves per CU is unchanged at 4.
+     LDS_SEG = 65536
+     smem = fx.SharedAllocator().allocate(LDS_SEG + 2 * 32 * S_ROW_B)
+     _lds0 = fx.Int32(fx.ptrtoint(smem.peek().ptr))
+@@ -304,9 +318,9 @@
+                     out.append(b)
+         return out
+ 
+-    kf = [[gfrag(g_k, base_kv, rs_kv, kv0 + fx.Int32(kh * 16), dt) for dt in range(NDT)]
++    kf = [[gfrag(g_k, base_kv, rs_kv, kvw + fx.Int32(kh * 16), dt) for dt in range(NDT)]
+           for kh in range(NKV)]
+-    vf = [[gfrag(g_v, base_kv, rs_kv, kv0 + fx.Int32(kh * 16), dt) for dt in range(NDT)]
++    vf = [[gfrag(g_v, base_kv, rs_kv, kvw + fx.Int32(kh * 16), dt) for dt in range(NDT)]
+           for kh in range(NKV)]
+     lane_r = (lane // fx.Int32(16)) * fx.Int32(8) + lane % fx.Int32(8)
+     lane_c = ((lane // fx.Int32(8)) % fx.Int32(2)) * fx.Int32(8)
+@@ -428,7 +442,7 @@
+                 sv = [_s0[si_] + _s1[si_] for si_ in range_constexpr(8)]
+                 pv_ = [_p0[si_] + _p1[si_] for si_ in range_constexpr(8)]
+                 # causal, BOTTOM-RIGHT: query q attends kv <= q + (Skv - Sq).
+-                kvb = kv0 + fx.Int32(kh * 16) + half * fx.Int32(8)
++                kvb = kvw + fx.Int32(kh * 16) + half * fx.Int32(8)
+                 if const_expr(do_mask):
+                     masked = [
+                         ((kvb + fx.Int32(si) > q_glob + cshift)
+@@ -443,21 +457,20 @@
+                 ds_l = [(pf[si] * (pv_[si] - del_q) * scale).to(fx.BFloat16)
+                         for si in range(8)]
+                 off = ((fx.Int32(hh * 16) + row) * fx.Int32(S_ROW_B)
+-                       + fx.Int32(kh * 32) + half * fx.Int32(16))
++                       + wcol + fx.Int32(kh * 32) + half * fx.Int32(16))
+                 llvm_dialect.store(
+                     fx.as_ir_value(fx.Vector.from_elements(p_l, dtype=fx.BFloat16)),
+                     create_llvm_ptr(lds_p + off, address_space=3))
+                 llvm_dialect.store(
+                     fx.as_ir_value(fx.Vector.from_elements(ds_l, dtype=fx.BFloat16)),
+                     create_llvm_ptr(lds_ds + off, address_space=3))
+-        # r8.i1.g23+g24 -- fx.barrier() DELETED. block=(32,1,1): the workgroup is ONE
+-        # 32-lane wave, so s_barrier is semantically a no-op and LLVM already removes
+-        # it (0 `s_barrier` in the shipped ISA). What survives is the conservative
+-        # ALL-COUNTER waitcnt the backend inserts FOR the barrier before removing it --
+-        # `s_wait_loadcnt_dscnt 0x0`. Its dscnt half is the real LDS RAW and the backend
+-        # re-derives it from the memory dependence; its loadcnt half has no dependence
+-        # at all here and is exactly what truncates r7.i1.g21's prefetch cover to 299
+-        # instructions instead of a full iteration.
++        # r23 -- BARRIER RESTORED. In THIS build the Q/dO staging is REPLICATED: all
++        # four waves run _ldqd on wave-uniform (qt, gh) and each writes the entire
++        # [32 q][D] image with identical bytes, then reads back only bytes it wrote, so
++        # today this is a same-value redundancy rather than a live dependence. It is
++        # restored because G1a measured it free at one wave and because it becomes
++        # mandatory the moment the staging store is split across waves.
++        fx.barrier()
+ 
+         # 32 queries staged, so the contraction is FULL: rows [lane_r] and
+         # [lane_r+16] concatenate in lane into a v16 operand, no padding zeros.
+@@ -479,7 +492,7 @@
+             b_q.append(tr(lds_q + lane_r * fx.Int32(X_ROW_B) + c, X_ROW_B))
+         new = [None] * (2 * NKV * NDO)
+         for kh in range_constexpr(NKV):
+-            col = lane_c * fx.Int32(2) + fx.Int32(kh * 32)
++            col = lane_c * fx.Int32(2) + wcol + fx.Int32(kh * 32)
+             a_p = tr(lds_p + lane_r * fx.Int32(S_ROW_B) + col, S_ROW_B)
+             a_ds = tr(lds_ds + lane_r * fx.Int32(S_ROW_B) + col, S_ROW_B)
+             for dtile in range_constexpr(NDO):
+@@ -489,14 +502,14 @@
+                 new[(NKV + kh) * NDO + dtile] = rocdl.wmma_f32_16x16x32_bf16(
+                     v8f, _ir(a_ds), _ir(b_q[dtile]), acc[(NKV + kh) * NDO + dtile],
+                     reuseA=False, reuseB=False).result
+-        # r8.i1.g23+g24 -- fx.barrier() DELETED. block=(32,1,1): the workgroup is ONE
+-        # 32-lane wave, so s_barrier is semantically a no-op and LLVM already removes
+-        # it (0 `s_barrier` in the shipped ISA). What survives is the conservative
+-        # ALL-COUNTER waitcnt the backend inserts FOR the barrier before removing it --
+-        # `s_wait_loadcnt_dscnt 0x0`. Its dscnt half is the real LDS RAW and the backend
+-        # re-derives it from the memory dependence; its loadcnt half has no dependence
+-        # at all here and is exactly what truncates r7.i1.g21's prefetch cover to 299
+-        # instructions instead of a full iteration.
++        # r23 -- BARRIER RESTORED, and THIS one is load-bearing at 4 waves. WAR on the
++        # shared Q/dO image: wave w may still be issuing its ds_load_tr16_b128 of query
++        # pair qt while another wave has passed the back-edge and is storing pair qt+1
++        # into the same lds_do/lds_q bytes. Different pair, different values.
++        # Bare fx.barrier(): rocdl.s_waitcnt raises ValueError on gfx1250
++        # (flydsl/expr/rocdl/universal.py:47-55) -- SPLIT counters, and the backend
++        # derives the dscnt wait from the LDS memory dependence itself.
++        fx.barrier()
+         if const_expr(carry):
+             return new + [_ir(v) for v in nxt]
+         return new
+@@ -589,7 +602,7 @@
+             ov = fx.Vector(out[kh * NDO + dtile])
+             ok_ = fx.Vector(out[(NKV + kh) * NDO + dtile])
+             for si in range_constexpr(8):
+-                kv = kv0 + fx.Int32(kh * 16) + half * fx.Int32(8) + fx.Int32(si)
++                kv = kvw + fx.Int32(kh * 16) + half * fx.Int32(8) + fx.Int32(si)
+                 idx = base_o + kv * Hkv * fx.Int32(D) + fx.Int32(dtile * 16) + row
+                 if PARTIAL:
+                     _st1(ov[si], g_dv, idx, fx.Float32)
+@@ -599,7 +612,7 @@
+                     _st1(ok_[si].to(fx.BFloat16), g_dk, idx, fx.BFloat16)
+ 
+ 
+-@flyc.kernel(known_block_size=[32, 1, 1])
++@flyc.kernel(known_block_size=[DKDV_THREADS, 1, 1])
+ def k_dkdv(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, DO: fx.Tensor,
+            LSE: fx.Tensor, DEL: fx.Tensor, DV_: fx.Tensor, DK: fx.Tensor,
+            scale: fx.Float32, Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32,
+@@ -608,7 +621,7 @@
+                G, nqt, cshift, causal, B_, fx.Int32(1))
+ 
+ 
+-@flyc.kernel(known_block_size=[32, 1, 1])
++@flyc.kernel(known_block_size=[DKDV_THREADS, 1, 1])
+ def k_dkdv_sp(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, DO: fx.Tensor,
+               LSE: fx.Tensor, DEL: fx.Tensor, DV_: fx.Tensor, DK: fx.Tensor,
+               scale: fx.Float32, Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32,
+@@ -625,7 +638,7 @@
+                 nblk: fx.Int32, nhkv: fx.Int32, nb: fx.Int32, stream: fx.Stream):
+     k_dkdv(Q, K, V, DO, LSE, DEL, DV_, DK, scale, Sq, Skv, Hq, Hkv, G,
+            nqt, cshift, causal, nb).launch(
+-        grid=(nhkv, nblk, nb), block=(32, 1, 1), stream=stream)
++        grid=(nhkv, nblk, nb), block=(DKDV_THREADS, 1, 1), stream=stream)
+ 
+ 
+ @flyc.jit
+@@ -638,7 +651,7 @@
+     # digits so the kv tile stays on grid.y and longest-first dispatch (g03) survives.
+     k_dkdv_sp(Q, K, V, DO, LSE, DEL, DV_, DK, scale, Sq, Skv, Hq, Hkv, G,
+               nqt, cshift, causal, nb, nsp).launch(
+-        grid=(nxs, nblk, nb), block=(32, 1, 1), stream=stream)
++        grid=(nxs, nblk, nb), block=(DKDV_THREADS, 1, 1), stream=stream)
+ 
+ 
+ # ===================================================================== dq =========
+--- /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/current/impl.py	2026-09-24 07:57:12.487607477 +0000
++++ /home/lihuzhan/g2work/impl.py	2026-09-25 05:45:59.835621438 +0000
+@@ -164,7 +164,11 @@
+     # 128:1 causal skew (proxy nsp=2: 264 units, 97.7%). The 16 cap is where the census's
+     # own return vanishes and matches aiter's split_K = max(2, min(num_cu/tg, 16, ...)).
+     nsp = 1
+-    while _wgs * nsp < 2048 and nsp < 16:
++    # r23 -- 2048 encoded TWO dispatch waves of SINGLE-wave workgroups (residency
++    # 1024). k_dkdv's workgroup is now FOUR waves, so residency is 256 and the
++    # target divides by 4. Verified to reproduce today's nsp at all three scored
++    # shapes: fast 16, proxy 2, prod 1. impl.py's k_dq rule below is NOT touched.
++    while _wgs * nsp < 512 and nsp < 16:
+         nsp *= 2
+     if nsp == 1:
+         dk_o = torch.empty((b, skv, hkv, d), device=k.device, dtype=k.dtype)
