@@ -3119,3 +3119,100 @@ the merge's extra ~0.6 points as evidence. **Quote the floor whenever quoting th
 Also: `state.yaml:94-98` holds **four** champion keys. Round 20 owns only
 `prod_b4_s8192_hq32_hkv8_d128`; `champions.prod` is still 19 and `fast`/`proxy` are 17. See
 h35 — the rename forked the ledger and it is still forked.
+
+## h40 — THE GAP IS THE STRUCTURE, AND THE STRUCTURE IS LOCKED BY THE DETERMINISM GATE. Parity is not reachable on this contract. Stop attacking efficiency.
+
+### The measurement that reframes the campaign
+
+Normalise BOTH sides by **issued matrix FLOP / wall time** — our work actually emitted, not the
+algorithmic minimum:
+
+| | issued matrix rate |
+|---|--:|
+| ours @ champion 511.42 | **719.9 TF/s** |
+| ours @ round 22 re-measure 516.87 | **727.6 TF/s** |
+| **aiter @ 716** | **727.1 TF/s** |
+
+**Residual: +1.0% against the champion, −0.1% against the round 22 re-measure.** This
+operator's own same-session floor is 0.40–0.66%, so the residual is 1.9x the floor at worst
+and zero at best. **Our scheduling efficiency already equals hand-written ASM.**
+
+The structural factor, enumerated independently on both sides:
+
+| | issued / algorithmic |
+|---|--:|
+| ours (from our own ISA: 32,896 x 64 + 16,512 x 96 = 3,690,496 WMMA per (b,hq)) | 1.407641 |
+| aiter (from its `.co` disassembly: 8,320 x 320 = 2,662,400) | 1.015501 |
+| **ratio** | **1.38617** |
+
+Measured gap: 1.40002 (champion) / 1.38526 (round 22). **Gap = structure x 1.00–1.01.**
+`route.md:816-817`'s "1.408 x 1.040 = 1.464" is superseded: that 1.040 was computed against
+round 17's 494 TF/s and rounds 18–22 spent exactly that much.
+
+### RETRACTED: `facts.md`'s 754 TF/s target
+
+"If k_dkdv reached k_dq's per-element efficiency, prod would be ~754 TF/s without touching
+fusion" implies an issued rate of **1061 TF/s — 46% faster than hand-written ASM on this
+chip.** It was an artefact of comparing our *issued* work against aiter's *algorithmic* work.
+Five rounds chased it. Retraction inserted at source.
+
+### No deterministic fusion geometry exists — enumerated twice, independently
+
+The two constraints pull in opposite directions: **bandwidth wants few partial slots, so a
+large BLOCK; registers want a small BLOCK so the per-wave accumulators fit.** Reduction
+priced at 3.02 TB/s, the only real streaming-reduce measurement on this card
+(`profiling/beat/kernel.yaml:119-128`), against a 2.93 ms GEMM saving:
+
+| geometry | slots | traffic | time | accumulators | verdict |
+|---|--:|--:|--:|--:|---|
+| KV-outer BLOCK_KV=128, 4 waves | 64 | 64.0 GiB | 22.75 ms | 256 | bandwidth |
+| KV-outer BLOCK_KV=512, 4 waves | 16 | 16.0 GiB | 5.69 ms | 1024 | both |
+| Q-outer BLOCK_Q=256, 4 waves (GQA expanded) | 128 | 64.0 GiB | 22.75 ms | 512 | bandwidth |
+| Q-outer BLOCK_Q=512, 4 waves, one kv head per WG | 16 | **8.0 GiB** | **2.84 ms** | 768 | **registers** |
+
+That last row is the only one that breaks even on bandwidth, and it fails on registers once
+the **non-accumulator** live set is counted: k_dkdv ships at 904 VGPR of which 256 are
+accumulators, so ~648 are not. 768 + 648 = **1416 > 1024**. Dropping to BLOCK_Q=128 gives
+384 + 648 = **1032 — over by 8** — and its bandwidth is back to 11.38 ms anyway.
+
+**CAVEAT on reading such tables: an accumulator count is not a VGPR count.** I made exactly
+that error in h36 (+188 predicted, +32 measured). Always add the ~648 non-accumulator live set.
+
+### What this means, stated plainly
+
+- **Under a bitwise-determinism contract, the 7-GEMM structure is forced** — determinism is
+  what requires dQ to live in a second kernel, and that second kernel must recompute S and dP.
+  aiter reaches 5 by accumulating dQ with 514 `buffer_atomic_add_f32`, which cannot pass a
+  bitwise gate.
+- **Ceiling on this contract ≈ 517 TF/s = 0.72x of the bar**, i.e. today's champion plus the
+  ~1% residual.
+- The operator was asked and **chose: the gate forbids non-determinism.** Fixed-order split-k
+  stays legal (it has shipped since round 13 and passes); fp32 atomics do not.
+
+### STOP LIST — do not spend rounds on these
+
+Every efficiency axis is closed and the residual they compete for is **1%**:
+compute/matrix ILP (g61 null) · issue roof (g60 −17.27%) · LDS port (P3 −8.19%) · Q/dO LDS
+round trip (P1 −6.98%) · occupancy & BLOCK_KV single-wave (g55, g14) · prefetch depth and
+position, both kernels both directions (g62 +1.65%, g63 −19.33%, g66 −21.93%, g68 −30.0%,
+P70 −10.86%) · `sched_barrier`/`sched_group_barrier` (0 wins, 5 losses; it is a boundary, not
+a clamp) · WMMA operand reuse (g59 +0.08%) · XCD locality (g43 null) · source reordering (g22,
+g65 ISA-identical) · static ISA metrics as a ranking signal (wrong four times) · power/clock
+(real, but same-run measurement applies it to both arms, so it is not a gap term).
+
+**Also dead, priced this round:** any deterministic dQ/dK partial workspace (table above);
+materialising dS in bf16 to avoid the recompute (4.2955e9 elements x 2 B x 2 = 17.18 GB =
+5.7 ms against a 3.07 ms saving — and this is the general result for **any** cross-kernel
+materialisation of an O(Sq x Skv) intermediate); 8-wave workgroups (2 waves/SIMD caps VGPR at
+512 and we are at 904/960); **h30's "dK/dV accumulators resident in LDS" is a false path** —
+`rocdl.wmma_f32_16x16x32_bf16`'s C/D operands are VGPRs, so LDS residency means a round trip
+per output WMMA, and at 4 waves each wave still owns 32 kv so the accumulators are 256 VGPR
+either way.
+
+### Where the remaining value is
+
+**The forward.** Its gap is 1.53x (aiter FlyDSL 2.4005 ms / 916 TF/s vs ASM 1.5724 / 1398.67,
+measured same-session 2026-09-24), it is **100% efficiency with no structural component**
+(block-causal does only 0.78% extra work), and **the determinism gate does not bind it** —
+every O element is written exactly once. Closing it is worth 0.83 ms/step against a backward
+residual worth ~0.05 ms/step.
