@@ -1,0 +1,103 @@
+round: 2
+mode: fast
+candidate: r1.i1.g01
+outcome: delivered
+
+correctness:
+  unit_tests: pass          # ut: spec shapes + determinism PASS; 7 edge cases 49.82-49.99 dB are below ut's hard-coded 50 but above the spec's 49
+  precision: pass           # validation.py at spec precision 49 dB: all 16 cases PASS
+  checked_with: op/validation.py
+  sqnr_db: 49.82            # worst o SQNR (short_q full); spec shapes 51.23 / 50.89 / 50.83
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/000/op]
+  shapes:                   # session 1 (raw/bench1_*.txt): ctrl, A, B, AB, beat in one process per shape
+    - name: fast
+      this_round_tflops: 44.53
+      best_round_tflops: 47.28
+      beat_tflops: 69.78
+      target_tflops: 69.78
+      champion_round: 0
+      champion_tflops: 47.28
+      champion_rebuilt: true
+      ratio: 0.6382
+      vs_champion: 0.942
+    - name: proxy
+      this_round_tflops: 778.51
+      best_round_tflops: 551.45
+      beat_tflops: 1026.83
+      target_tflops: 1026.83
+      champion_round: 0
+      champion_tflops: 551.45
+      champion_rebuilt: true
+      ratio: 0.7582
+      vs_champion: 1.412
+    - name: prod
+      this_round_tflops: 1017.97
+      best_round_tflops: 934.50
+      beat_tflops: 1395.10
+      target_tflops: 1395.10
+      champion_round: 0
+      champion_tflops: 934.50
+      champion_rebuilt: true
+      ratio: 0.7297
+      vs_champion: 1.089
+  score: 0.7087
+  note: >
+    Fast's benchmark median carries the post-ASM I$ penalty (g03) by arm position; fast 0.942 of ctrl is
+    above the operator's 0.90 band. Round 1's controlled probe measured g01 neutral at fast (0.999).
+
+validation:
+  exit_code: 2              # correctness + determinism PASS; speed geomean vs beat 0.6133 < 1.0 (fast 0.4258, proxy 0.7416, prod 0.7308)
+
+explored:
+  ran:
+    - "COMPILE descriptors via FLYDSL_DUMP_IR for ctrl/A/B (raw/descriptors.txt) -- spill gate and arm-distinct check (B drops 3 of 4 vccz branches)"
+    - "ut with determinism 200 on A and B (raw/ut_*.txt) -- found B lifts every edge case over 50 dB"
+    - "benchmark.py session: ctrl, A, B, AB, beat per shape (raw/bench1_*.txt)"
+    - "own validation.py (raw/validation.txt)"
+    - "g03 post-ASM penalty discrimination probe (raw/g03_probe.txt) -- per-CU I$ eviction confirmed by a positive test; points the next fast-shape lever at s_prefetch_inst"
+    - "no rocprofv3 --stats: round 1 recorded that --kernel-trace writes no files in fa-repro"
+  consulted:
+    - optimization/routes/1-metrics-to-techniques.md
+    - backends/flydsl/attention/README.md
+    - arch/gfx1250/gfx1250.md
+  bound: compute
+  confidence: low
+  why: >
+    g01 removed the dispatch-tail term; the remaining 0.73-0.76 of beat at proxy/prod is per-tile body
+    efficiency (h2/h4). B's loss (adding one VALU rescale per tile cost 6-10%) is consistent with the body
+    being VALU/issue-limited in the softmax phase, but no counters were taken on the body. Clock
+    VR-throttled at ~1020-1100 MHz throughout.
+
+arms:
+  - id: r1.i1.g01
+    built: "A alone: round 1's kernel file copied byte-identical onto op/current (h20 re-land)"
+    tflops: {fast: 44.53, proxy: 778.51, prod: 1017.97}
+    vs_champion: {fast: 0.942, proxy: 1.412, prod: 1.089}
+    shipped: true
+    note: "VGPR 445 SGPR 97 scratch 0; precision identical to incumbent"
+  - id: r2.i1.g05
+    built: "B alone, from op/current -- ENABLE_DEFER_RESCALE=False"
+    tflops: {fast: 43.73, proxy: 497.56, prod: 878.47}
+    vs_champion: {fast: 0.925, proxy: 0.902, prod: 0.940}
+    shipped: false
+    note: "VGPR 443 scratch 0; lost far outside the floor; precision +0.2-0.4 dB, all 16 cases >= 50.21 dB"
+  - id: r1.i1.g01+r2.i1.g05
+    built: "the merge, built before B's number existed and measured in the same process; disqualified because B lost"
+    tflops: {fast: 43.88, proxy: 721.09, prod: 962.03}
+    vs_champion: {fast: 0.928, proxy: 1.308, prod: 1.029}
+    shipped: false
+    note: "0.926x / 0.945x of A at proxy / prod"
+
+expected: >
+  A = h20 / r1.i1.g01 re-land: prod +8-10%, proxy +45-60%, fast ~0 (benchmark median possibly 0.92-0.95,
+  inside the 0.90 band). B = r2.i1.g05 branch-free rescale: -2..+3%, unpriced. Merge only if neither lost.
+
+added_to_pool: [r2.i1.g05, r2.i2.g06]
+route_updated: true
+
+implementation:
+  files_changed: [op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py]
+  build_failures: []

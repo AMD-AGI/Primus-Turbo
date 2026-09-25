@@ -1,0 +1,147 @@
+meta:
+  name: gfx1250-flydsl-attn-fwd
+  id: 20260925-114644
+  started_at: '2026-09-25T11:46:44'
+  spec_version: v000
+  elapsed_seconds: 2933.2
+setup:
+  job_setup:
+    status: done
+    spec_version: v000
+    at: '2026-09-25T11:51:00'
+    seconds: 256.5
+  op_setup:
+    status: done
+    spec_version: v000
+    at: '2026-09-25T12:01:13'
+    seconds: 612.3
+lifecycle:
+- at: '2026-09-25T11:46:44'
+  event: setup_started
+- at: '2026-09-25T12:16:10'
+  event: resumed
+  spec_version: v000
+- at: '2026-09-25T12:38:23'
+  event: resumed
+  spec_version: v000
+best_round: 2
+champions:
+  proxy: 2
+  prod: 2
+rounds:
+- round: 0
+  progress: []
+  score: null
+  outcome: delivered
+  passed: true
+  accepted: true
+  note: baseline (measured at setup)
+  tflops: {}
+- round: 1
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  sessions:
+    opt: cff49154-2930-41d6-b712-e78a36835a1b
+  seconds:
+    opt: 1823.2
+    reflect: 41.6
+    round: 1864.8
+  bound: compute
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - 'correctness short_q causal=True: o 49.93 dB (65536/65536 finite), lse 86.44 dB (512/512 finite)'
+  - 'correctness short_q causal=False: o 49.82 dB (65536/65536 finite), lse 86.73 dB (512/512 finite)'
+  - 'correctness mha causal=False: o 49.98 dB (131072/131072 finite), lse 85.15 dB (1024/1024 finite)'
+  - 'correctness unequal_seqlen causal=True: o 49.98 dB (524288/524288 finite), lse 87.38 dB (4096/4096
+    finite)'
+  - 'correctness unequal_seqlen causal=False: o 49.98 dB (524288/524288 finite), lse 87.87 dB (4096/4096
+    finite)'
+  - 'correctness unequal_seqlen2 causal=True: o 49.97 dB (1048576/1048576 finite), lse 88.36 dB (8192/8192
+    finite)'
+  score: 0.72501
+  outcome: delivered
+  passed: false
+  accepted: false
+  tflops:
+    fast: 44.2
+    proxy: 813.38
+    prod: 1015.37
+  targets:
+    fast: 66.99
+    proxy: 1031.46
+    prod: 1397.3
+  beats:
+    fast: 66.99
+    proxy: 1031.46
+    prod: 1397.3
+  incumbents:
+    fast: 47.32
+    proxy: 549.77
+    prod: 935.04
+  gain: 1.1665
+  changed: 1
+  flops:
+    fast: 2149580800.0
+    proxy: 137472507904.0
+    prod: 2199291691008.0
+  guards: {}
+  guard_failed: null
+  note: 'delivered: correctness short_q causal=True: o 49.93 dB (65536/65536 finite), lse 86.44 dB (512/512
+    finite); correctness short_q causal=False: o 49.82 dB (65536/65536 finite), lse 86.73 dB (512/512
+    finite); correctness mha causal=False: o 49.98 dB (131072/131072 finite), lse 85.15 dB (1024/1024
+    finite); correctness unequal_seqlen causal=True: o 49.98 dB (524288/524288 finite), lse 87.38 dB (4096/4096
+    finite); correctness unequal_seqlen causal=False: o 49.98 dB (524288/524288 finite), lse 87.87 dB
+    (4096/4096 finite); correctness unequal_seqlen2 causal=True: o 49.97 dB (1048576/1048576 finite),
+    lse 88.36 dB (8192/8192 finite)'
+  changed_disagreement: null
+- round: 2
+  progress:
+  - opt
+  mode: fast
+  running:
+    module: reflect
+    step: null
+    since: '2026-09-25T12:54:10'
+  seconds:
+    opt: 907.4
+    round: 907.4
+  sessions:
+    opt: a9b15b5d-03d4-4184-ba17-0277096631bd
+  bound: compute
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - 'speed: geomean candidate/beat 0.6443 < bar 1.0000 (fast 0.5077, proxy 0.7196, prod 0.7320)'
+  score: 0.70866
+  outcome: delivered
+  passed: true
+  accepted: true
+  tflops:
+    fast: 44.53
+    proxy: 778.51
+    prod: 1017.97
+  targets:
+    fast: 69.78
+    proxy: 1026.83
+    prod: 1395.1
+  beats:
+    fast: 69.78
+    proxy: 1026.83
+    prod: 1395.1
+  incumbents:
+    fast: 47.28
+    proxy: 551.45
+    prod: 934.5
+  gain: 1.1476
+  changed: 1
+  flops:
+    fast: 2149580800.0
+    proxy: 137472507904.0
+    prod: 2199291691008.0
+  guards: {}
+  guard_failed: null
+  note: null
+  changed_disagreement: null

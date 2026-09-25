@@ -1,0 +1,114 @@
+round: 1
+mode: fast
+candidate: r1.i1.g01
+outcome: delivered
+
+correctness:
+  unit_tests: fail          # ut/test_correctness: spec shapes + determinism PASS; 7 edge cases miss 50 dB
+  precision: fail           # identical to the incumbent to 0.01 dB (op_setup_v000.md records the same 7 misses); pre-existing, not caused by this change
+  checked_with: op/validation.py
+  sqnr_db: 49.82            # worst o SQNR (short_q non-causal); spec shapes 51.23 / 50.89 / 50.83
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/000/op]
+  shapes:                   # session 2 (raw/bench2.txt): ctrl, A, B, AB, beat in one process per shape
+    - name: fast
+      this_round_tflops: 44.20
+      best_round_tflops: 47.32
+      beat_tflops: 66.99
+      target_tflops: 66.99
+      champion_round: 0
+      champion_tflops: 47.32
+      champion_rebuilt: true
+      ratio: 0.6598
+      vs_champion: 0.934
+    - name: proxy
+      this_round_tflops: 813.38
+      best_round_tflops: 549.77
+      beat_tflops: 1031.46
+      target_tflops: 1031.46
+      champion_round: 0
+      champion_tflops: 549.77
+      champion_rebuilt: true
+      ratio: 0.7886
+      vs_champion: 1.479
+    - name: prod
+      this_round_tflops: 1015.37
+      best_round_tflops: 935.04
+      beat_tflops: 1397.30
+      target_tflops: 1397.30
+      champion_round: 0
+      champion_tflops: 935.04
+      champion_rebuilt: true
+      ratio: 0.7267
+      vs_champion: 1.086
+  score: 0.7250
+  note: >
+    Fast's benchmark median is dominated by the ~22-29 us post-ASM penalty (pool r1.i3.g03): the ctrl
+    itself read 38.58 in session 1 and 47.32 in session 2 (22% apart). A controlled probe
+    (raw/fast_ab_probe.txt, flush + sleep, arms alternated, 151 reps) gives A/ctrl time 0.9989 alone
+    and 0.9972 after beat at fast -- g01 is neutral there; the 0.934 is a harness position effect.
+
+validation:
+  exit_code: 2              # 7 pre-existing precision misses + speed geomean 0.6613 < 1.0 (fast 0.5286, proxy 0.7580, prod 0.7219)
+
+explored:
+  ran:
+    - "benchmark survey current vs beat (session 1 of this round) -- rocprofv3 --kernel-trace writes no files in fa-repro; CUDA events used instead"
+    - "post-ASM interference probes (session 1) -> pool r1.i3.g03"
+    - "greedy dispatch simulator (raw/dispatch_sim.txt) -> chose g01 and predicted its size"
+    - "offline bijection check of the remap on all 10 ut grids (raw/g01_bijection.txt) -- gate for g01"
+    - "COMPILE_ONLY ISA descriptors for ctrl/A/B/AB (raw/descriptors.txt) -- spill gate, arm-distinct check"
+    - "controlled fast/proxy A-vs-ctrl probe (raw/fast_ab_probe.txt) -> showed fast deficit is harness, not kernel"
+  consulted:
+    - backends/flydsl/attention/README.md
+    - backends/flydsl/attention/techniques.md
+    - backends/flydsl/attention/dead-ends.md
+    - arch/gfx1250/gfx1250.md
+    - arch/gfx1250/profiling-surface.md
+    - optimization/techniques/1-grid-and-cache-locality.md
+    - backends/flydsl/attention/recipes/hd64.md
+    - backends/flydsl/attention/recipes/hd128.md
+    - backends/hipkittens/attention/recipes/gqa_d64.md
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+    - backends/aiter/attention/recipes/fmha_v3_bwd.md
+  bound: compute
+  confidence: low
+  why: >
+    Round removed a dispatch-tail term (1 WG/CU, light->heavy causal order): proxy 1.48-1.60x, prod
+    1.09-1.11x. What remains (0.72-0.79 of beat at proxy/prod) is per-tile matrix-pipe efficiency
+    per h2/h4 (overlap, barriers, softmax/WMMA fencing); no counters taken on the body this round,
+    hence low confidence. Clock is VR-throttled at 1100 MHz throughout.
+
+arms:
+  - id: r1.i1.g01
+    built: "A alone, from op/current"
+    tflops: {fast: 44.20, proxy: 813.38, prod: 1015.37}
+    vs_champion: {fast: 0.934, proxy: 1.479, prod: 1.086}
+    shipped: true
+    note: "session 1: fast 0.918, proxy 1.604, prod 1.107 vs ctrl. VGPR 445 SGPR 99 scratch 0"
+  - id: r1.i2.g02
+    built: "B alone, from op/current -- NOT on top of A (O_VARIANT v1)"
+    tflops: {fast: 44.75, proxy: 525.76, prod: 943.52}
+    vs_champion: {fast: 0.946, proxy: 0.956, prod: 1.009}
+    shipped: false
+    note: "session 1: fast 1.008, proxy 0.969, prod 1.016. Loses at proxy in both sessions; VGPR 449 scratch 0"
+  - id: r1.i1.g01+r1.i2.g02
+    built: "the merge, built because B's net (geomean ~0.997 in session 1) was not resolved as a loss"
+    tflops: {fast: 43.63, proxy: 749.43, prod: 1018.89}
+    vs_champion: {fast: 0.922, proxy: 1.363, prod: 1.090}
+    shipped: false
+    note: "worse than A alone at proxy (-7.9%); prod +0.35% vs A is noise"
+
+expected: >
+  g01 alone -> proxy +20-40% (model upper bound 1.6x; real dispatcher not strict FIFO), prod +3-6%,
+  fast ~0; g02 alone -> prod +1-2%, proxy/fast in noise. Merge only if neither lost beyond the
+  session floor.
+
+added_to_pool: [r1.i3.g03, r1.i4.g04]
+route_updated: true
+
+implementation:
+  files_changed: [op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py]
+  build_failures: []
