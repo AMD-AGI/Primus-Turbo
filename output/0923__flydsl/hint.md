@@ -3710,3 +3710,45 @@ The 4-wave geometry was shelved in h46 as "a pure cost with no offsetting term".
 stands **for a `buffer_load` fill**. With a TDM fill the offsetting term exists: the barriers
 stop draining the tile traffic. The direction is not resurrected yet — it needs the runtime
 check above first — but the reason it died has a known antidote that is now proven to compile.
+
+## h48 — TDM CAN write the padded LDS row stride. The bank-conflict argument survives the port verbatim.
+
+The largest "this might be the wrong move" risk against a TDM fill was that TDM might only
+write contiguous rows. The champion's `X_ROW_B = D*2 + 16 = 272 B` exists precisely because
+**256 B is a 64-way full bank collision** on gfx1250's 64 x 4 B LDS. If TDM could not
+reproduce the 16 B pad, the port would trade a fence for a 64-way conflict.
+
+**It can.** `flydsl/expr/rocdl/tdm_ops.py:85-115` `compute_padding_encoding` follows Triton's
+`TDMUtility.cpp` convention:
+
+```
+interval_dw = pad_interval_elems * elem_bits / 32     (must be a power of 2)
+amount_dw   = pad_amount_elems   * elem_bits / 32
+encoded_interval = log2(interval_dw) - 1
+encoded_amount   = amount_dw - 1
+```
+
+For our B ring, `pad_interval=128` elements (= D) and `pad_amount=8` elements (= 16 B) at
+`elem_bits=16`:
+
+```
+interval_dw = 64   <- power of 2, assertion passes
+amount_dw   = 4
+encoding    = (5, 3)
+row stride  = 256 + 16 = 272 B   == X_ROW_B, byte for byte
+```
+
+Bank check, unchanged from `kernels.py:56-60`'s argument:
+
+| stride | dwords | gcd(·,64) | distinct bank groups over 16 rows | |
+|---|--:|--:|--:|---|
+| 256 B (unpadded) | 64 | 64 | 1 | **64-way collision** |
+| **272 B (padded)** | 68 | 4 | **16** | **conflict-free** |
+
+The A ring also satisfies the power-of-2 constraint at both block sizes:
+`BLOCK_KV=32` gives `interval_dw=16`, `BLOCK_KV=128` gives `64`. Both legal.
+
+**So the padded stride is not a blocker, and `pad_interval` / `pad_amount` must be passed
+explicitly** — the default is `pad_interval=0, pad_amount=0`, which returns `(0, 0)` and
+produces an UNPADDED 256 B stride. Omitting them is a silent 64-way bank conflict, not an
+error.
