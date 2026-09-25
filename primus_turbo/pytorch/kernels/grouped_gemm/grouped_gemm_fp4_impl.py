@@ -383,7 +383,9 @@ class GroupedGEMMFP4VariableKFlyDSLBackend(KernelBackend):
         OUT_N = rhs.shape[0]
         G = group_lens.shape[0]
         overwrite_out = (
-            inplace_add_to_out and os.environ.get("PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT", "0") == "1"
+            inplace_add_to_out
+            and os.environ.get("PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT", "0") == "1"
+            and not GroupedGEMMFP4VariableKKernelDispatcher._is_graph_capturing()
         )
         result = grouped_gemm_mxfp4_variable_k_flydsl_kernel(
             lhs,
@@ -576,8 +578,9 @@ def grouped_gemm_fp4_variable_k_accum_impl(
     By default, computes ``out += lhs[:,g] @ rhs[:,g]^T`` per group with a beta=1
     epilogue. When ``PRIMUS_TURBO_WGRAD_ACCUM_OVERWRITE_OUT=1``, the epilogue uses
     beta=0 and replaces ``out``. That write is also recorded for Primus's selective
-    gradient-buffer clear. Enable overwrite mode only when each optimizer step has a
-    single contribution to ``out``; otherwise later contributions are lost.
+    gradient-buffer clear. CUDA graph capture retains beta=1 because Python ownership
+    recording is not replayed. Enable overwrite mode only when each optimizer step has
+    a single contribution to ``out``; otherwise later contributions are lost.
     """
     default_backend_choice = BackendChoice(backend=BackendType(default_backend))
     user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP4)
