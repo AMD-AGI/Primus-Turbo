@@ -3526,3 +3526,106 @@ this kernel — 33.6% — which nothing before could bound, and which explains w
 `buffer_load` / 40-TDM fill path is not a stylistic choice but a requirement.**
 
 `op/current` is untouched; this was built and measured entirely in a work copy.
+
+## h46 — SHELVE THE 4-WAVE DIRECTION. My G2 diagnosis was wrong on both counts, and the real mechanism is the one I dismissed.
+
+An ISA census that nobody had done — the champion's hot loop against the 4-wave build's,
+counted line by line — settles it:
+
+| `.LBB0_8` per body | champion | 4-wave |
+|---|--:|--:|
+| `ds_store_b128` | **40** | **40** |
+| `ds_load_tr16_b128` | 40 | 40 |
+| `buffer_load_b128` / `_b32` | 32 / 4 | 32 / 4 |
+| `v_wmma` | 64 | 64 |
+| VGPR / spill | 904 / 0 | 882 / 0 |
+| **waves per CU** | **4** (4 WG x 1 wave) | **4** (1 WG x 4 waves) |
+| `s_barrier_signal` | 0 | 2 |
+| `s_wait_loadcnt_dscnt 0x0` | 0 | **1** |
+| **prefetch cover** | **~604 instr** | **389 instr** |
+
+Per-wave work is identical. Waves per CU are identical. Per-CU LDS write bytes are identical
+(4 x 32 x 32 x 16 = 65536 B on both sides). Per-CU global b128 is identical (128).
+**The entire difference is two barrier rendezvous plus the one all-counter fence they drag in.**
+
+### RETRACT both halves of h45's diagnosis
+
+1. **"Replicated staging quadruples what each barrier drains" — there is no such disease.**
+   The champion's staging nest is byte-identical and pays the same 65536 B/CU/body across its
+   four workgroups. I was comparing this build against an idealised "non-replicated" state
+   that has never existed.
+2. **"Occupancy dropped to 1 workgroup/CU so nothing covers the rendezvous" — misattributed.**
+   My own comment at `kernels.py:256` says *"Waves per CU is unchanged at 4."* The champion has
+   no second wave to switch to either. Its advantage is not coverage; it is that **its waves
+   never wait on other waves**.
+
+### The real mechanism — the instruction I read and waved past
+
+`isa_4wave_k_dkdv.s:2091`, the single `s_wait_loadcnt_dscnt 0x0` before barrier-1. It cuts
+prefetch cover **604 -> 389 instructions (-36%)**.
+
+I wrote *"`s_wait_loadcnt 0x0` stayed at 2, so this is not a waitcnt regression."* **Those two
+are dead instructions** — loadcnt is already 0 at the back-edge (verified: zero VMEM ops in
+`2093-2314`). The one I noted in passing — "the conservative all-counter drain appeared
+exactly once" — **was the regression.** I counted the instructions that were easy to count and
+concluded from them, which is the same failure this corpus has now recorded six times.
+
+The control is in the same file: the masked body `.LBB0_4` is `carry=False` with no live VMEM
+crossing its barriers, and its barriers use a **pure `s_wait_dscnt 0x0`**. The loadcnt half
+appears precisely when a **carried prefetch crosses a barrier** — which is the quantity
+`r19.i2.g60` (-17.27% removing the prefetch) and `r20.i2.g62` (+2.00% deepening it, the only
+positive mechanism in the campaign) both point at.
+
+### Why the split must NOT be built
+
+- **It refunds an overhead the champion also pays**, so its ceiling is the champion — 507, not
+  above it. Predicted 337 -> ~342 (+1.5%), still -30% against the champion.
+- **`(wave == dt).select(real, dump)` reduces the drain by exactly zero.** `s_wait_dscnt`
+  drains by **issued LDS op count, not address range** — all 32 stores still issue. It would
+  also put 32 lanes x 16 B into one 32 B scratch: a guaranteed 32-way bank conflict.
+- **`buffer_load_b128` 160 -> 40 is structurally unreachable.** `kernels.py:402-405` shuffles
+  all four `dt` into `qfr`/`dfr` and `:435`/`:438` feed every one into the S/P WMMA — each wave
+  must complete the K=128 contraction in **its own registers**. Those 32 loads are GEMM
+  operands, not staging loads. **Splitting the global load is the easiest silent wrong answer
+  available here**: it would build, launch, and compute K=32.
+- My counts in h45 were whole-function statics. Per body it is **40 stores / 32 loads / 2
+  barrier pairs**, not 80 / 160 / 4.
+
+### Why the whole 4-wave geometry goes back on the shelf
+
+Its premise was that BLOCK_KV=128 buys 4x the Q/dO arithmetic intensity. **It does not** — the
+four waves replicate `_ldqd` on wave-uniform `(qt, gh)`, so per-CU global traffic is identical.
+Same waves, same registers, same global traffic, same LDS traffic, same instruction mix, plus
+two barriers and a fence that costs 36% of the prefetch cover. **It is a pure cost with no
+offsetting term.** The geometry only earns its barriers if each wave reads only its own
+quarter of global — and that requires the S/P GEMM to take its B operand from LDS, which is a
+different kernel.
+
+**2 workgroups/CU is structurally unreachable** and needs no further pricing: the per-wave
+register floor is ~644 VGPR (256 accumulators + ~260 for the carried tuple + 128 kf/vf) against
+the 512 that 2 waves/SIMD allows, and closing it means deleting the prefetch — measured at
+-17.27%.
+
+### What is banked, and what is next
+
+The champion is untouched and in production; the 4-wave tree stays at `/home/lihuzhan/g2work`
+as an experiment, **not merged**. Every structural edit in it is verified correct (15/15 UT,
+SQNR identical) and a fused version would need all of it.
+
+**Next: the TDM screen, zero card time.** aiter reaches 716 TF/s with 26 barriers and ZERO
+`buffer_load` because its fill is 40 `tensor_load_to_lds` retiring on TENSORcnt — so its
+barriers' dscnt drain never waits on tile traffic. That is the only mechanism that addresses
+the fence directly. FlyDSL 0.3.2 has the full API (`flydsl/expr/rocdl/tdm_ops.py`:
+`make_tensor_descriptor_2d` :211, `tensor_load_2d` :1118, `tensor_wait` :1176) **and aiter's
+own FlyDSL kernels on this box already use it** (`gemm_a8w8_256x256_gfx1250.py`,
+`splitk_fused_epilogue_gfx1250.py`) — a working reference for the idiom.
+
+My first probe failed on the LDS memref type: the allocator yields
+`!fly.memref<i8, shared, ...>` while the descriptor wants a typed ranked memref. The reference
+builds it as `fx.Tensor(fx.make_view(fx.add_offset(base_ptr, offset), fx.make_layout(shape, stride)))`.
+**Compile one of aiter's TDM kernels first** — it answers "does TDM lower on gfx1250" and hands
+over the correct construction in one step.
+
+**CARD SAFETY, unchanged:** a TDM descriptor with a wrong extent waits on a counter that never
+retires and hangs the card, costing a human power cycle. Screen COMPILE_ONLY and read the ISA
+before anything is launched, and follow the `gfx1250-card-safety` protocol on first launch.
