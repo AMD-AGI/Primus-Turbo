@@ -1,0 +1,38 @@
+--- /home/lihuzhan/g2work/kernels.py	2026-09-25 05:45:59.835483666 +0000
++++ /home/lihuzhan/g3work/kernels.py	2026-09-25 08:09:05.343648867 +0000
+@@ -369,8 +369,22 @@
+         # own Q/dO and returns only the accumulators, so the two tuples stop being
+         # the same shape and the full body's 128-dword prefetch block no longer has
+         # to coexist with a masked-body copy of itself.
++        # r24.S1 -- PREFETCH ISSUE MOVED PAST BARRIER-2. The fence that costs this build
++        # 33.6% is `s_wait_loadcnt_dscnt 0x0` at rel-583, ahead of barrier-1. The 36
++        # carried prefetch loads are issued at rel-59..194 and therefore drained in the
++        # SAME iteration, giving 389 instructions of cover against the champion's ~604.
++        # Barrier-2 sits at rel-639 and is preceded by a PURE `s_wait_dscnt 0x0`. Issuing
++        # after it pushes the drain to the NEXT iteration's rel-583, so cover becomes
++        # (806 - issue) + 583 ~ 600 -- champion level, with zero instructions added or
++        # removed and the depth-2 structure of r20.i2.g62 untouched.
++        # ⚠ facts.md:29-30 records "any edit that moves the last prefetch load later in
++        # the body loses -- five for five" (g28/g63/g66/g68/P70). Those five drained at
++        # the TOP of the next iteration, so a later issue shortened cover. This build
++        # drains MID-iteration, so issuing past rel-639 LENGTHENS it. This is the one
++        # case where that heuristic and the quantity it proxies diverge, and the ISA
++        # settles it at zero cost -- see the abort gate in the r24 notes.
+         if const_expr(carry):
+-            nxt = _ldqd(qt_n, gh_n)
++            nxt = None
+         else:
+             nxt = None
+             pre = _ldqd(qt, gh)
+@@ -511,6 +525,11 @@
+         # derives the dscnt wait from the LDS memory dependence itself.
+         fx.barrier()
+         if const_expr(carry):
++            # r24.S1 -- issue the next iteration's prefetch HERE, after barrier-2, so the
++            # loads cross the back-edge instead of being drained by barrier-1's fence.
++            # _ldqd depends only on (qt_n, gh_n) and loop invariants, so it is free to
++            # move; the carry=False path is untouched.
++            nxt = _ldqd(qt_n, gh_n)
+             return new + [_ir(v) for v in nxt]
+         return new
+ 

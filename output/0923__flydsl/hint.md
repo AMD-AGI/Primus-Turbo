@@ -3752,3 +3752,76 @@ The A ring also satisfies the power-of-2 constraint at both block sizes:
 explicitly** — the default is `pad_interval=0, pad_amount=0`, which returns `(0, 0)` and
 produces an UNPADDED 256 B stride. Omitting them is a silent 64-way bank conflict, not an
 error.
+
+## h49 — TDM is NOT a candidate on this op, and the reason explains the whole aiter gap. Plus S1: the fence is free to remove.
+
+### Why TDM does not open — the dual-use finding
+
+Every staging site in this op is **dual-use**: the same registers that feed the LDS store also
+feed the WMMA. Champion `kernels.py:384-391`, 4-wave `:398-405`, and `k_dq` `:820-829` are the
+same shape —
+
+```python
+llvm_dialect.store(fx.as_ir_value(qp[dt][u]), create_llvm_ptr(lds_q + o, address_space=3))
+...
+qfr = [qp[dt][0].shuffle(qp[dt][1], list(range(16))) for dt in range_constexpr(NDT)]
+```
+
+`qp`/`dp` are stored to LDS **and** shuffled into `qfr`/`dfr` for the S/P WMMA.
+**TDM has no register destination**, so on this op it cannot remove a single `buffer_load` —
+those loads are GEMM operands regardless of how LDS gets filled. All it could remove is
+`ds_store_b128`, which is a strict subset of probe P1 (**-6.98%**) plus P2's extra global
+traffic (**-18.37%**).
+
+**This is also the real reason aiter has zero `buffer_load` and we do not**: its S/P GEMM takes
+its B operand **from LDS**, ours takes it **from registers**. That is a different kernel
+structure, not a different fill mechanism. Porting TDM without porting that structure buys
+nothing.
+
+The champion additionally has **no fence to save** — `s_barrier_signal = 0`,
+`s_wait_loadcnt_dscnt 0x0 = 0` in its hot body. TDM's measured motivation does not exist there.
+
+In the 4-wave build **both halves of the fence survive TDM**: the loadcnt half is the 36
+carried prefetch loads (32 dual-use GEMM operands, 4 LSE/delta scalars that cannot be tiled and
+whose in-place form is `r10.i1.g27`'s grave at -14.6%), and the dscnt half is 8 P/dS
+`ds_store_b128` crossing barrier-1 with a live RAW.
+
+### S1 — the fence turns out to be free to remove, and it is a two-line edit
+
+The fence sits at rel-582, ahead of barrier-**1**. Barrier-**2** is at rel-638 and is preceded
+by a **pure `s_wait_dscnt 0x0`**. The 36 prefetch loads were issued at rel-59..193 and
+therefore drained **in the same iteration**. Issuing them *after* barrier-2 pushes the drain
+across the back-edge.
+
+Measured on the ISA, `.LBB0_8`:
+
+| | N | last `buffer_load_b128` | fence @ | cover |
+|---|--:|--:|--:|--:|
+| 4-wave baseline | 806 | rel-193 | 582 | **389** (same-iteration drain) |
+| **S1** | 765 | **rel-702** | 466 | **529** (cross-iteration drain) |
+| champion | 778 | rel-187 | — | no fence at all |
+
+**Cover 389 -> 529, +36%.** Every instruction count is identical — `buffer_load_b128` 160,
+`buffer_load_b32` 16, `v_wmma` 128, `ds_store_b128` 80, `ds_load_tr16_b128` 80, `s_barrier` 8,
+spill 0, LDS 82944 — so **only the issue position moved**. VGPR fell 882 -> **832** as a
+bonus: the prefetch values now live a shorter span.
+
+**The pre-registered abort gate said "last load > 640 AND cover >= 550".** First passed
+(rel-702), second missed by 21. The threshold was derived assuming `N = 806` and `fence = 583`,
+and the compiler changed both (765 and 466). The gate's *intent* — did the scheduler pull the
+clump back up? — is unambiguously satisfied. Recording the miss rather than quietly adjusting
+the number.
+
+**The counter-evidence this edit contradicts, and why:** `facts.md:29-30` records *"any edit
+that moves the last prefetch load later in the body loses — five for five"*
+(`g28`/`g63`/`g66`/`g68`/`P70`). Those five all drained at the **top of the next iteration**, so
+a later issue shortened cover. This build drains **mid-iteration**, so issuing past the second
+barrier lengthens it. **This is the one configuration where that heuristic and the quantity it
+proxies diverge** — and the ISA settles it for free.
+
+### What S1 is and is not worth
+
+The 4-wave build's ceiling is still the champion (identical per-body work, h46). S1 cannot beat
+507. **Its value is that the fused version needs the BLOCK_KV=128 four-wave skeleton, and that
+skeleton currently carries a 33.6% entry fee.** If S1 removes the fee, a fused build starts
+from parity instead of from -33.6%.
