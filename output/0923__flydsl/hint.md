@@ -3629,3 +3629,84 @@ over the correct construction in one step.
 **CARD SAFETY, unchanged:** a TDM descriptor with a wrong extent waits on a counter that never
 retires and hangs the card, costing a human power cycle. Screen COMPILE_ONLY and read the ISA
 before anything is launched, and follow the `gfx1250-card-safety` protocol on first launch.
+
+## h47 — TDM SCREEN PASSES. `tensor_load_to_lds` lowers on gfx1250, retires on TENSORcnt, and emits zero `buffer_load` and zero `ds_store`. This is the mechanism that killed the 4-wave build, inverted.
+
+COMPILE_ONLY, never launched, zero card time
+(`output/0925__flydsl/tdm-screen/tdm_screen.py`). A `[32][128]` bf16 tile — the exact Q/dO
+staging shape — filled by TDM:
+
+```
+BUILD ok
+ISA:  tensor_load_to_lds s[8:11], s[0:7]
+      s_wait_tensorcnt 0x0
+      buffer_load = 0      ds_store = 0
+```
+
+**All three properties hold at once**: the fill is `tensor_load_to_lds`, it retires on
+**`s_wait_tensorcnt`** — a counter neither `s_wait_loadcnt` nor `s_wait_dscnt` touches — and it
+produces **neither a `buffer_load` nor a `ds_store`**.
+
+### Why this matters exactly
+
+h46 established that the 4-wave build lost 33.6% to one instruction: the
+`s_wait_loadcnt_dscnt 0x0` fence before barrier-1, which cut prefetch cover 604 -> 389.
+That fence exists **because a carried prefetch living on LOADcnt crosses a barrier**. Under a
+TDM fill the tile traffic is not on LOADcnt or DSCNT at all, so **the fence has nothing to
+drain**. This is the same reason aiter runs 26 barriers at 716 TF/s with zero `buffer_load`:
+not a stylistic choice, a structural requirement — now reproduced in our own toolchain.
+
+### The API trap, and it is a real FlyDSL gap rather than my misuse
+
+**FlyDSL 0.3.2's own `flydsl/expr/rocdl/tdm_ops.py` CANNOT take a Fly shared view.** Four
+attempts failed at `memref.extract_aligned_pointer_as_index`, which demands a builtin MLIR
+memref and rejects `!fly.memref<bf16, shared, (32,128):(128,1)>`.
+
+**aiter ships the fix**, and says so in one line:
+`/home/lihuzhan/code/aiter-src/aiter/ops/flydsl/kernels/tdm_ops_gfx1250.py` (120 lines) —
+`_FlyAwareMemrefDialect` proxies the memref dialect so that
+`extract_aligned_pointer_as_index` also accepts Fly values (`:47-60`), and
+`_fly_aware_lds_extraction()` installs it around the call (`:64-66`). Its docstring:
+*"Let `tdm_ops` take a Fly shared view where it expects a memref."*
+Every aiter FlyDSL kernel on this box imports it as
+`from . import tdm_ops_gfx1250 as tdm_ops` (e.g. `gemm_a8w8_256x256_gfx1250.py:17`).
+
+**Use aiter's wrapper, never FlyDSL's directly.** The corpus previously recorded TDM as
+available from `flydsl/expr/rocdl/tdm_ops.py`; that is true of the symbols and false of the
+usability.
+
+Working idiom, all three pieces needed:
+```python
+@fx.struct
+class TdmStore:
+    tile: fx.Array[fx.BFloat16, ROWS*COLS, 16]
+
+lds  = fx.SharedAllocator().allocate(TdmStore).peek()
+desc = tdm_ops.make_tensor_descriptor_2d(          # aiter's, not FlyDSL's
+    global_ptr=SRC,
+    lds_memref=fx.Tensor(fx.make_view(lds.tile.ptr, fx.make_layout((ROWS,COLS),(COLS,1)))),
+    global_offset=(0,0), tensor_shape=(ROWS,COLS), strides=(COLS,1),
+    tile_shape=(ROWS,COLS), elem_bytes=2, num_warps=1)
+tdm_ops.tensor_load_2d(desc)
+tdm_ops.tensor_wait(0)
+```
+
+### What this screen does NOT establish
+
+- **It was never launched.** Lowering is proven; runtime behaviour is not.
+- **Nothing about performance.** `tensor_wait` may be expensive; unmeasured.
+- **Nothing about integrating it into `k_dkdv`**, where the fill feeds a carried prefetch
+  tuple whose whole design assumes LOADcnt ordering (`r16.i1.g48`'s head-of-FIFO placement,
+  and `r10.i1.g27` which died at −14.6% from breaking that ordering).
+
+**CARD SAFETY, unchanged and now the binding constraint:** a descriptor whose extent exceeds
+the tensor waits on a TENSORcnt that never retires — a hung card and a human power cycle, not
+a wrong answer. First launch follows the `gfx1250-card-safety` protocol: deliberately
+UNDER-sized extent first, single launch, never inside a sweep, never unattended.
+
+### What this reopens
+
+The 4-wave geometry was shelved in h46 as "a pure cost with no offsetting term". That verdict
+stands **for a `buffer_load` fill**. With a TDM fill the offsetting term exists: the barriers
+stop draining the tile traffic. The direction is not resurrected yet — it needs the runtime
+check above first — but the reason it died has a known antidote that is now proven to compile.
