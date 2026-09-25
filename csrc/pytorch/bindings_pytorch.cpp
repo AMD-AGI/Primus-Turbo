@@ -171,6 +171,7 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
 #ifdef BUILD_MXFP4_BACKEND
     m.def("quantize_mxfp4_gemm(Tensor input, int axis) -> Tensor[]");
     m.def("quantize_mxfp4_gemm_dual(Tensor input) -> Tensor[]");
+    m.def("quantize_mxfp6_row_mxfp4_col_dual(Tensor input) -> Tensor[]");
 #endif // BUILD_MXFP4_BACKEND
 
     // ********* MXFP6 Quantization *********
@@ -211,6 +212,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
 #ifdef BUILD_MXFP4_BACKEND
     m.impl("quantize_mxfp4_gemm", quantize_mxfp4_gemm);
     m.impl("quantize_mxfp4_gemm_dual", quantize_mxfp4_gemm_dual);
+    m.impl("quantize_mxfp6_row_mxfp4_col_dual", quantize_mxfp6_row_mxfp4_col_dual);
 #endif // BUILD_MXFP4_BACKEND
 #ifdef BUILD_MXFP6_BACKEND
     m.impl("quantize_mxfp6", quantize_mxfp6);
@@ -283,6 +285,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
 #ifdef BUILD_MXFP4_BACKEND
     m.impl("quantize_mxfp4_gemm", quantize_mxfp4_gemm_meta);
     m.impl("quantize_mxfp4_gemm_dual", quantize_mxfp4_gemm_dual_meta);
+    m.impl("quantize_mxfp6_row_mxfp4_col_dual", quantize_mxfp6_row_mxfp4_col_dual_meta);
 #endif // BUILD_MXFP4_BACKEND
 #ifdef BUILD_MXFP6_BACKEND
     m.impl("quantize_mxfp6", quantize_mxfp6_meta);

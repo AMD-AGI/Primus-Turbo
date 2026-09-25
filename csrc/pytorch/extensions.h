@@ -98,6 +98,9 @@ std::vector<at::Tensor> quantize_mxfp4_gemm(const at::Tensor input, const int64_
 std::vector<at::Tensor> quantize_mxfp4_gemm_dual(const at::Tensor input);
 std::vector<at::Tensor> quantize_mxfp4_gemm_meta(const at::Tensor input, const int64_t axis);
 std::vector<at::Tensor> quantize_mxfp4_gemm_dual_meta(const at::Tensor input);
+// MXFP6 row + MXFP4 column from one pass; the pack wgrad needs to run a mixed-format GEMM.
+std::vector<at::Tensor> quantize_mxfp6_row_mxfp4_col_dual(const at::Tensor input);
+std::vector<at::Tensor> quantize_mxfp6_row_mxfp4_col_dual_meta(const at::Tensor input);
 #endif // BUILD_MXFP4_BACKEND
 
 #ifdef BUILD_MXFP6_BACKEND

@@ -1301,3 +1301,33 @@ def quantize_mxfp4_gemm_dual_impl_meta(
     col_operand, col_scale = mxfp4_gemm_pack_sizes(cols, rows)
     empty = lambda n: torch.empty(n, dtype=torch.uint8, device=x.device)  # noqa: E731
     return empty(row_operand), empty(row_scale), empty(col_operand), empty(col_scale)
+
+
+@torch.library.custom_op(
+    "primus_turbo::quantize_mxfp6_row_mxfp4_col_dual_impl", mutates_args=(), device_types="cuda"
+)
+def quantize_mxfp6_row_mxfp4_col_dual_impl(
+    x: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """MXFP6 row, MXFP4 column, one pass. See mxfp4_pack for why wgrad wants this."""
+    from primus_turbo.pytorch.kernels.quantization.mxfp4_pack import (
+        quantize_mxfp6_row_mxfp4_col_dual,
+    )
+
+    return quantize_mxfp6_row_mxfp4_col_dual(x)
+
+
+@quantize_mxfp6_row_mxfp4_col_dual_impl.register_fake
+def quantize_mxfp6_row_mxfp4_col_dual_impl_meta(
+    x: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from primus_turbo.pytorch.kernels.quantization.mxfp4_pack import mxfp4_gemm_pack_sizes
+    from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import mxfp6_pack_sizes
+
+    if x.dim() != 2:
+        raise ValueError(f"hybrid MXFP6/MXFP4 packing expects a 2D tensor, got {x.dim()}D")
+    rows, cols = x.shape
+    row_operand, row_scale = mxfp6_pack_sizes(rows, cols)
+    col_operand, col_scale = mxfp4_gemm_pack_sizes(cols, rows)
+    empty = lambda n: torch.empty(n, dtype=torch.uint8, device=x.device)  # noqa: E731
+    return empty(row_operand), empty(row_scale), empty(col_operand), empty(col_scale)

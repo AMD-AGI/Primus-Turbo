@@ -124,6 +124,54 @@ std::vector<at::Tensor> quantize_mxfp4_gemm_dual(const at::Tensor input) {
     return run(input, MXFP4Direction::Dual);
 }
 
+// MXFP6 row + MXFP4 column from one pass. The row blob is sized by MXFP6's 24576-byte
+// tile and the column blob by MXFP4's 16384, which is the only thing that differs from
+// quantize_mxfp6_dual on the host side.
+std::vector<at::Tensor> quantize_mxfp6_row_mxfp4_col_dual(const at::Tensor input) {
+    check_input(input);
+    const c10::DeviceGuard device_guard(input.device());
+    const int64_t M = input.size(0);
+    const int64_t N = input.size(1);
+
+    const int64_t row_tiles = cdiv(M, kTileRows);
+    const int64_t row_ktiles = cdiv(N, kKTile) + MXFP4_GUARD_K_TILES;
+    const int64_t col_tiles = cdiv(N, kTileRows);
+    const int64_t col_ktiles = cdiv(M, kKTile) + MXFP4_GUARD_K_TILES;
+    constexpr int64_t kMxfp6PackedTileBytes = 24576;
+
+    at::Tensor row_p = empty_blob(row_tiles * row_ktiles * kMxfp6PackedTileBytes, input);
+    at::Tensor row_s = empty_blob(row_tiles * row_ktiles * kScaleTileBytes, input);
+    at::Tensor col_p = empty_blob(col_tiles * col_ktiles * kPackedTileBytes, input);
+    at::Tensor col_s = empty_blob(col_tiles * col_ktiles * kScaleTileBytes, input);
+
+    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+    if (input.scalar_type() == at::kBFloat16) {
+        quantize_mxfp6_row_mxfp4_col_impl<dtype::bfloat16>(
+            reinterpret_cast<const dtype::bfloat16 *>(input.data_ptr()), row_p.data_ptr<uint8_t>(),
+            row_s.data_ptr<uint8_t>(), col_p.data_ptr<uint8_t>(), col_s.data_ptr<uint8_t>(),
+            static_cast<int>(M), static_cast<int>(N), stream);
+    } else {
+        quantize_mxfp6_row_mxfp4_col_impl<dtype::float16>(
+            reinterpret_cast<const dtype::float16 *>(input.data_ptr()), row_p.data_ptr<uint8_t>(),
+            row_s.data_ptr<uint8_t>(), col_p.data_ptr<uint8_t>(), col_s.data_ptr<uint8_t>(),
+            static_cast<int>(M), static_cast<int>(N), stream);
+    }
+    return {row_p, row_s, col_p, col_s};
+}
+
+std::vector<at::Tensor> quantize_mxfp6_row_mxfp4_col_dual_meta(const at::Tensor input) {
+    const int64_t M = input.size(0);
+    const int64_t N = input.size(1);
+    constexpr int64_t kMxfp6PackedTileBytes = 24576;
+    const int64_t rt = cdiv(M, kTileRows), rk = cdiv(N, kKTile) + MXFP4_GUARD_K_TILES;
+    const int64_t ct = cdiv(N, kTileRows), ck = cdiv(M, kKTile) + MXFP4_GUARD_K_TILES;
+    auto opts = input.options().dtype(at::kByte);
+    return {at::empty({rt * rk * kMxfp6PackedTileBytes}, opts),
+            at::empty({rt * rk * kScaleTileBytes}, opts),
+            at::empty({ct * ck * kPackedTileBytes}, opts),
+            at::empty({ct * ck * kScaleTileBytes}, opts)};
+}
+
 // Meta implementations. Shapes are pure arithmetic on M and N, so torch.compile can trace
 // through the packer without a graph break.
 std::vector<at::Tensor> quantize_mxfp4_gemm_meta(const at::Tensor input, const int64_t axis) {

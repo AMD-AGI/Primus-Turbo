@@ -48,6 +48,7 @@ from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import check_mxfp6_sup
 
 __all__ = [
     "aiter_has_a6w4_bias_epilogue",
+    "quantize_mxfp6_row_mxfp4_col_dual",
     "check_a6w4_support",
     "mxfp4_data_region",
     "mxfp4_gemm_pack_sizes",
@@ -210,3 +211,28 @@ def quantize_mxfp4_gemm_dual(
     _require_supported(x.device)
     _check_input(x)
     return tuple(torch.ops.primus_turbo_cpp_extension.quantize_mxfp4_gemm_dual(x.contiguous()))
+
+
+def quantize_mxfp6_row_mxfp4_col_dual(
+    x: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pack ``x`` as MXFP6 along the last axis and MXFP4 along the first, in one pass.
+
+    Returns ``(row_operand, row_scale, col_operand, col_scale)``. The row blob is what a
+    forward or dgrad GEMM consumes as its MXFP6 operand; the column blob is what wgrad
+    consumes as its MXFP4 one.
+
+    This is what makes wgrad eligible for a mixed-format GEMM. ``grad_w = g_col @ x_col``
+    contracts the token dimension, so neither operand is the weight and A6W4 cannot reach
+    it -- a third of GEMM time. Narrowing one of the two fixes that, and whichever tensor
+    is narrowed needs exactly this shape of pack: fp6 in the direction the forward or dgrad
+    reads, fp4 in the direction wgrad reads.
+
+    It costs nothing extra. The column half writes two thirds of MXFP6's bytes, and both
+    halves still come from a single staged read of ``x``.
+    """
+    _require_supported(x.device)
+    _check_input(x)
+    return tuple(
+        torch.ops.primus_turbo_cpp_extension.quantize_mxfp6_row_mxfp4_col_dual(x.contiguous())
+    )

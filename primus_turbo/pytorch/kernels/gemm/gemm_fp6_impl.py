@@ -174,8 +174,44 @@ _GEMM_FP6_BACKENDS = {
     BackendType.AITER: BackendEntry(GEMMFP6AITERBackend, autotune=False),
 }
 
+class GEMMA4W6AITERBackend(GEMMFP6AITERBackend):
+    """A4W6: the A operand in MXFP4, the B operand in MXFP6 -- the mirror of A6W4.
+
+    This exists for wgrad. `grad_w = g_col @ a_col` contracts the token dimension, so
+    neither operand is the weight and A6W4 cannot reach it; narrowing A instead puts the
+    fp4 on the *gradient* and leaves the activation at fp6, where A6W4 on the same GEMM
+    would put it on the activation. Measured on the Flux wgrad shapes, A6W4 is the faster
+    of the two (1.0982x against 1.0767x) and A4W6 the more accurate (weight-gradient
+    cosine 0.99326 against 0.99279), so which to run is a numerics call and both are wired.
+
+    No bias: wgrad produces a weight gradient and has none.
+    """
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        a_scale: torch.Tensor,
+        b: torch.Tensor,
+        b_scale: torch.Tensor,
+        m: int,
+        n: int,
+        k: int,
+        out_dtype: torch.dtype,
+        granularity: ScalingGranularity,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del out_dtype, granularity
+        if bias is not None:
+            raise ValueError("A4W6 is the wgrad path and takes no bias")
+        return get_aiter().gemm_a4w6(a, b, a_scale, b_scale, m, n, k)
+
+
 _GEMM_A6W4_BACKENDS = {
     BackendType.AITER: BackendEntry(GEMMA6W4AITERBackend, autotune=False),
+}
+
+_GEMM_A4W6_BACKENDS = {
+    BackendType.AITER: BackendEntry(GEMMA4W6AITERBackend, autotune=False),
 }
 
 
@@ -203,6 +239,7 @@ def _validate_blobs(
     n: int,
     k: int,
     weight_is_fp4: bool = False,
+    a_is_fp4: bool = False,
 ) -> None:
     """Reject malformed packed operands before they reach AITER.
 
@@ -235,10 +272,11 @@ def _validate_blobs(
     # wrong is exactly the failure the whole function exists to catch -- an MXFP6-sized
     # blob handed to gemm_a6w4 is 1.5x too long and would be read at the wrong stride
     # with no error anywhere -- so the two formats are sized by their own helpers.
+    a_pack_sizes = mxfp4_gemm_pack_sizes if a_is_fp4 else mxfp6_pack_sizes
     b_pack_sizes = mxfp4_gemm_pack_sizes if weight_is_fp4 else mxfp6_pack_sizes
-    fmt = "A6W4" if weight_is_fp4 else "MXFP6"
+    fmt = "A6W4" if weight_is_fp4 else "A4W6" if a_is_fp4 else "MXFP6"
     for name, (operand, scale), (want_operand, want_scale) in (
-        ("a", (a, a_scale), mxfp6_pack_sizes(m, k)),
+        ("a", (a, a_scale), a_pack_sizes(m, k)),
         ("b", (b, b_scale), b_pack_sizes(n, k)),
     ):
         if operand.numel() != want_operand or scale.numel() != want_scale:
@@ -262,16 +300,26 @@ def gemm_fp6_impl(
     granularity: int,
     bias: torch.Tensor | None = None,
     weight_is_fp4: bool = False,
+    a_is_fp4: bool = False,
 ) -> torch.Tensor:
     granularity_enum = ScalingGranularity(granularity)
-    _validate_blobs(a, a_scale, b, b_scale, m, n, k, weight_is_fp4)
+    if weight_is_fp4 and a_is_fp4:
+        raise ValueError(
+            "weight_is_fp4 selects A6W4 and a_is_fp4 selects A4W6; they are mutually "
+            "exclusive and there is no all-fp4 entry point here."
+        )
+    _validate_blobs(a, a_scale, b, b_scale, m, n, k, weight_is_fp4, a_is_fp4)
     if bias is not None and (bias.dim() != 1 or bias.numel() != n):
         raise ValueError(f"MXFP6 GEMM bias must be a 1D tensor of length N={n}, got {tuple(bias.shape)}.")
     backend = _resolve_backend()
     # One flag rather than a second op: the two differ only in which aiter entry point
     # runs and how b is sized, and sharing the op keeps every caller's autograd, fake
     # kernel and Dynamo behaviour identical between the formats.
-    impl = (_GEMM_A6W4_BACKENDS if weight_is_fp4 else _GEMM_FP6_BACKENDS)[backend].impl
+    impl = (
+        _GEMM_A6W4_BACKENDS
+        if weight_is_fp4
+        else _GEMM_A4W6_BACKENDS if a_is_fp4 else _GEMM_FP6_BACKENDS
+    )[backend].impl
 
     kwargs = dict(
         a=a,
@@ -309,6 +357,7 @@ def gemm_fp6_impl_meta(
     granularity: int,
     bias: torch.Tensor | None = None,
     weight_is_fp4: bool = False,
+    a_is_fp4: bool = False,
 ) -> torch.Tensor:
     # Pure arithmetic on purpose: this must not reach into AITER, whose kernel
     # selection does lru_cached pandas lookups that SymInts would break. The output
@@ -334,6 +383,7 @@ def gemm_fp6_out_impl(
     n: int,
     k: int,
     granularity: int,
+    weight_is_fp4: bool = False,
 ) -> None:
     """``out[M, N] = A[M, K] @ B[N, K].T``, writing into a caller-owned buffer.
 
@@ -350,7 +400,7 @@ def gemm_fp6_out_impl(
       padding-waste guard.
     """
     granularity_enum = ScalingGranularity(granularity)
-    _validate_blobs(a, a_scale, b, b_scale, m, n, k)
+    _validate_blobs(a, a_scale, b, b_scale, m, n, k, weight_is_fp4)
 
     if granularity_enum not in GEMMFP6AITERBackend.SUPPORTED_GRANULARITIES:
         raise ValueError(f"MXFP6 out-GEMM needs MX_BLOCKWISE scaling, got {granularity_enum}.")
@@ -371,6 +421,12 @@ def gemm_fp6_out_impl(
         raise RuntimeError("MXFP6 out-GEMM requires gfx950.")
 
     aiter = get_aiter()
+    if weight_is_fp4:
+        # wgrad with the B operand narrowed. gemm_a6w4_asm takes the same physical buffers
+        # and picks its own kernel, and like A6W6 it stores with beta=0 -- so the same
+        # one-microbatch-per-step contract applies unchanged.
+        aiter.gemm_a6w4_asm(a, b, a_scale, b_scale, out, _pad_k(k))
+        return
     config = aiter.get_GEMM_A6W6_config(m, n, k)
     kernel_name = str(config["kernelName"]) if config is not None else None
     aiter.gemm_a6w6_asm(a, b, a_scale, b_scale, out, _pad_k(k), kernel_name)
@@ -387,5 +443,6 @@ def gemm_fp6_out_impl_meta(
     n: int,
     k: int,
     granularity: int,
+    weight_is_fp4: bool = False,
 ) -> None:
     return None

@@ -180,6 +180,17 @@ void quantize_mxfp6_impl(const DType *input, uint8_t *row_packed, uint8_t *row_s
                          uint8_t *col_packed, uint8_t *col_scale, const int M, const int N,
                          const MXFP6Direction direction, hipStream_t stream);
 
+// Hybrid pack: MXFP6 row direction, MXFP4 column direction, from one pass. Exists so
+// wgrad can run a mixed-format GEMM -- it contracts the token dimension, so its operands
+// are a gradient and an activation rather than the weight, and narrowing one of them needs
+// that tensor packed fp6 one way and fp4 the other. Size the column blob with MXFP4's
+// 16384-byte tile.
+template <typename DType>
+void quantize_mxfp6_row_mxfp4_col_impl(const DType *input, uint8_t *row_packed,
+                                       uint8_t *row_scale, uint8_t *col_packed,
+                                       uint8_t *col_scale, const int M, const int N,
+                                       hipStream_t stream);
+
 // Elementwise epilogue folded into the packer's LDS staging read, so the tensor it
 // applies to never reaches HBM. The result is rounded back to DType before staging, which
 // makes the packed blob bit-identical to packing the epilogue's materialised output.
