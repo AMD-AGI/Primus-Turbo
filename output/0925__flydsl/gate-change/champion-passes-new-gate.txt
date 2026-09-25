@@ -1,0 +1,13 @@
+rc=2
+  gate 50.0 dB vs op/eager/ | bitwise x200 | geomean speedup vs beat >= 1.00 | shapes ['fast', 'proxy', 'prod']
+  correctness fast     dq  52.61 dB  dk  52.64 dB  dv  52.84 dB
+  correctness proxy    dq  52.52 dB  dk  52.57 dB  dv  52.67 dB
+  correctness prod     dq  52.56 dB  dk  52.60 dB  dv  52.71 dB
+  determinism fast: dk/dv bitwise identical across 200 runs; dq bitwise (floor 70 dB)
+  geomean over 3 shapes (op.shape.mode=sweep): 0.810x beat
+  correctness  pass
+  determinism  pass
+  speed        FAIL
+RESULT: FAILED
+
+[exited with code 0]

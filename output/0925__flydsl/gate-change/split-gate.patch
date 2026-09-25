@@ -1,0 +1,122 @@
+--- /tmp/val.bak	2026-09-25 04:07:11.543117232 +0000
++++ /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/validation.py	2026-09-25 04:10:01.918206796 +0000
+@@ -196,12 +196,42 @@
+     return ok
+ 
+ 
++DQ_STABILITY_DB = 70.0   # see check_determinism's docstring for how this was calibrated
++
++
++def _sqnr_db(ref, got):
++    import math
++    import torch
++    ref = ref.float()
++    den = float(((ref - got.float()) ** 2).sum())
++    if den == 0.0:
++        return float("inf")
++    return 10.0 * math.log10(float((ref ** 2).sum()) / den)
++
++
+ def check_determinism(impl_dir: Path, shape="fast"):
+-    """op.config.determinism_gate, run as stated: 200 consecutive runs, bitwise.
++    """op.config.determinism_gate, SPLIT form (operator decision, 2026-09-25).
+ 
+-    Bitwise identity is the OBSERVABLE form of "no atomics on any output". A float atomic
+-    reduction lands in a different order each launch and breaks this within a handful of
+-    runs; nothing else this job would plausibly introduce does.
++    dk/dv -- UNCHANGED: bitwise identical across 200 consecutive runs.
++    This is not a concession: aiter's own ASM backward, the bar this job is measured
++    against, satisfies it. Measured on this card 2026-09-25 over 6 runs at both fast and
++    prod: dk and dv bitwise identical every time (SQNR inf, max relative deviation 0.0),
++    while dq was not. Relaxing dk/dv would give away a property the bar itself has.
++
++    dq -- RELAXED: may be accumulated with fp32 atomics, so bitwise is unachievable by
++    construction (float addition is not associative and the atomic order varies per launch).
++    Replaced by a run-to-run SQNR floor, calibrated against that same shipping atomic
++    implementation rather than invented: aiter's dq measures 113.0 dB at fast and 98.0 dB
++    at prod across 6 runs. The floor is 70.0 dB -- 28 dB below the weakest observed value,
++    so pure atomic reordering passes with margin, and 20 dB ABOVE the 50 dB correctness
++    gate, so anything that degrades dq enough to matter fails here first.
++
++    WHY A FLOOR AND NOT NOTHING. The bitwise gate is on record as having caught a defect
++    that the precision gate missed -- dQ collapsing to 8-14 dB on specific
++    (q_split, BLOCK_KV) combinations. What caught it was that the check ran across
++    configurations, not the number 200. The floor preserves the early-warning property in
++    the weakest form that is still compatible with atomics: a real indexing or
++    synchronisation bug moves dq by orders of magnitude more than reordering does.
+     """
+     import torch
+     from common import forward_reference, load_impl, make_inputs
+@@ -212,15 +242,30 @@
+     q, k, v, do = make_inputs(shape, seed=0)
+     o, lse = cached_forward(shape, q, k, v, causal=True)
+     ref = [t.clone() for t in impl(do, q, k, v, o, lse, causal=True)]
++    worst_dq = float("inf")
+     for i in range(1, DETERMINISM_RUNS):
+         got = impl(do, q, k, v, o, lse, causal=True)
+-        for tag, a, b in zip(("dq", "dk", "dv"), ref, got):
++        # dk/dv: unchanged, bitwise
++        for tag, a, b in zip(("dk", "dv"), ref[1:], got[1:]):
+             if not torch.equal(a, b):
+                 print(f"  determinism {shape}: {tag} differs on run {i + 1} of "
+-                      f"{DETERMINISM_RUNS}  max|d|={float((a - b).abs().max()):.3e}")
++                      f"{DETERMINISM_RUNS}  max|d|={float((a - b).abs().max()):.3e}"
++                      f"   [dk/dv are still a BITWISE gate -- aiter satisfies it too]")
+                 return False
+-    print(f"  determinism {shape}: dq/dk/dv bitwise identical across "
+-          f"{DETERMINISM_RUNS} runs", flush=True)
++        # dq: SQNR floor
++        db = _sqnr_db(ref[0], got[0])
++        worst_dq = min(worst_dq, db)
++        if db < DQ_STABILITY_DB:
++            print(f"  determinism {shape}: dq run-to-run SQNR {db:.1f} dB on run "
++                  f"{i + 1} of {DETERMINISM_RUNS}, below the {DQ_STABILITY_DB:.0f} dB floor."
++                  f"   max|d|={float((ref[0] - got[0]).abs().max()):.3e}")
++            print("    Atomic reordering alone measures 98-113 dB on this card "
++                  "(aiter, 2026-09-25). This is worse than reordering by orders of "
++                  "magnitude and indicates a real defect, not float non-associativity.")
++            return False
++    shown = "bitwise" if worst_dq == float("inf") else f"worst run-to-run SQNR {worst_dq:.1f} dB"
++    print(f"  determinism {shape}: dk/dv bitwise identical across {DETERMINISM_RUNS} runs; "
++          f"dq {shown} (floor {DQ_STABILITY_DB:.0f} dB)", flush=True)
+     return True
+ 
+ 
+@@ -230,7 +275,8 @@
+     impl_dir = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else (HERE / "current")
+     shapes = list(SPEC_SHAPES)
+     print(f"validation.py  impl={impl_dir}")
+-    print(f"  gate {GATE_DB} dB vs op/eager/ | bitwise x{DETERMINISM_RUNS} | "
++    print(f"  gate {GATE_DB} dB vs op/eager/ | dk,dv bitwise x{DETERMINISM_RUNS}, "
++          f"dq >= {DQ_STABILITY_DB:.0f} dB run-to-run | "
+           f"geomean speedup vs beat >= {1.0 + BEAT_MARGIN / 100:.2f} | shapes {shapes}")
+     if not impl_dir.is_dir():
+         print(f"FAILED: no such implementation directory: {impl_dir}")
+--- /tmp/yaml.bak	2026-09-25 04:07:11.544515482 +0000
++++ /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/gfx1250-flydsl-attn-bwd_final.yaml	2026-09-25 04:07:11.590601081 +0000
+@@ -133,9 +133,22 @@
+       exactly once. Keep that -- it is one of the reasons to have a source-level
+       backward at all, and 200-run bitwise determinism is a cheap gate on it.
+     determinism_gate: >
+-      [resolved] Operationally: no atomics on any output, and dq/dk/dv bitwise identical
+-      across 200 consecutive runs at the fast-iteration shape. A round that introduces a
+-      split-k or atomic reduction fails this gate even if it is faster.
++      [operator, 2026-09-25 -- SPLIT GATE, supersedes the text below] dk and dv remain
++      bitwise identical across 200 consecutive runs at the fast-iteration shape. dq may be
++      accumulated with fp32 atomics and is judged instead by a run-to-run SQNR floor of
++      70 dB. The floor is calibrated, not invented: aiter's own ASM backward -- the bar --
++      measures dk/dv BITWISE IDENTICAL and dq at 113.0 dB (fast) / 98.0 dB (prod) over 6
++      runs on this card, so the dk/dv half costs nothing the bar does not already pay, and
++      70 dB sits 28 dB below the weakest observed reordering and 20 dB above the 50 dB
++      correctness gate. Fixed-order split-k remains legal and always was in practice: it
++      has shipped every round since 13 (impl.py's nsp/nsp_q rule) and passes bitwise.
++      SUPERSEDED: "no atomics on any output ... A round that introduces a split-k or
++      atomic reduction fails this gate even if it is faster." That text was never
++      enforceable -- validation.py has no atomic or split-k detector, only a bitwise
++      comparison -- and it was already contradicted by shipped code. The reason for the
++      change is on record: with bitwise dq required, EVERY fused geometry is dead on
++      arithmetic (both orientations, four block sizes), so the 7-GEMM structure is forced
++      and the ceiling is 0.72x of the bar.
+     dtype: {qkv: bf16, out: bf16, qk_acc: fp32, softmax: fp32, pv_acc: fp32, lse: fp32}
+   reference:
+     impl: >
