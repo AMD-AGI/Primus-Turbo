@@ -291,11 +291,15 @@ def shear_mbias(m_row, ksm):
     return (m_row * fx.Int32(ksm)) % fx.Int32(128)
 
 
-def g2s_lds_imm(step, lds_step):
+def g2s_lds_imm(step, lds_step, n_grp=0):
     """Part of a wave-major g2s step's LDS offset that fits the buffer instruction's 12-bit
-    immediate; the rest (a multiple of 4096) still has to go through M0.  ``lds_step`` 0 marks
-    the legacy step-major fill, where every step needs its own M0 write."""
-    return (step % (4096 // lds_step)) * lds_step if lds_step else 0
+    immediate; the rest still has to go through M0.  ``n_grp`` is how many steps share one M0
+    write, defaulting to the whole 4096-byte immediate window -- a stream whose source rows
+    cannot pay for that window takes a narrower one.  ``lds_step`` 0 marks the legacy
+    step-major fill, where every step needs its own M0 write."""
+    if not lds_step:
+        return 0
+    return (step % (n_grp or (4096 // lds_step))) * lds_step
 
 
 class G2SLoader:
@@ -309,6 +313,7 @@ class G2SLoader:
         chunk_stride=1024,
         rebase=None,
         lds_step=0,
+        lds_grp=0,
     ):
         self.g2lds_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
         self.LdsPtr_t = fx.PointerType.get(lds_dtype, 2, 512)
@@ -325,8 +330,10 @@ class G2SLoader:
         self.rebase = rebase
         # Wave-major fill: this wave's chunks sit ``lds_step`` apart instead of one whole-WG
         # step apart. ``gl_offsets`` arrives with that immediate already taken out; this path
-        # emits no immediate, so it puts it back on the soffset.
+        # emits no immediate, so it puts it back on the soffset. ``lds_grp`` is the stream's
+        # M0 window in steps and must match the one ``gl_offsets`` was built with.
         self.lds_step = lds_step
+        self.lds_grp = lds_grp
 
     def _src_div(self, k_offset):
         """(divided source tensor, soffset) for one load. int32 path returns the
@@ -362,7 +369,7 @@ class G2SLoader:
         for step in range_constexpr(self.n_load_steps):
             src = fx.slice(src_div, (None, fx.Int32(self.gl_offsets[step])))
             dst = self._lds_dst_at(lds_dst, step, base_off)
-            imm = g2s_lds_imm(step, self.lds_step)
+            imm = g2s_lds_imm(step, self.lds_step, self.lds_grp)
             so = fx.Int32(soff) + fx.Int32(imm) if imm else fx.Int32(soff)
             fx.copy(self.g2lds_atom, src, dst, soffset=so)
 
@@ -2693,14 +2700,17 @@ _MXFP4_PRESHUF_FO = _MXFP4_PRESHUF_NG * _MXFP4_PRESHUF_ND  # output dwords per t
 def _mxfp4_preshuf_geom(k128):
     """``(cells per thread, block size)`` for the scale preshuffle. The batched cells are
     adjacent 256-K blocks of one row set, so K/256 has to divide by KU; a K the host does
-    not know keeps the single-cell form."""
+    not know keeps the single-cell form.
+
+    KU only moves work between threads: the packed byte map is invariant under it, because
+    ``kh * KU + u`` collapses to ``kdw // n_sub`` for either value."""
     ku = _MXFP4_PRESHUF_KU
     if k128 is None or ku < 2 or (k128 // 2) % ku:
         return 1, _MXFP4_PRESHUF_BLK
     return ku, max(_MXFP4_PRESHUF_BLK // ku, 64)
 
 
-def mxfp4_packed_scale_byte(row, kblk, *, k128, b_ilv, is_b, kk=None):
+def mxfp4_packed_scale_byte(row, kblk, *, k128, b_ilv, is_b, kk=None, b_nt=4, a_nt=4):
     """Byte offset of a canonical E8M0 scale (``row``, ``kblk`` = k // 32) in the packed layout.
 
     The scatter counterpart of the gather in ``_build_mxfp4_preshuffle_kernel_ab``. That pass
@@ -2708,6 +2718,11 @@ def mxfp4_packed_scale_byte(row, kblk, *, k128, b_ilv, is_b, kk=None):
     arithmetics them -- so a producer already holding one scale byte can store it straight into
     its packed slot and skip the repacking pass altogether. Accepts Python ints or traced
     values; the divisors are all compile-time.
+
+    ``b_nt`` is how many 16-column n-fragments B's tile packs into one dword (BLOCK_N // 64),
+    ``a_nt`` the same for A's 16-row m-fragments (BLOCK_M // 64). A narrower tile groups fewer
+    rows/columns and leaves the dword's high bytes unused; the dword index itself is unchanged,
+    so the slab keeps its extent.
     """
     n_sub, nd, ng = 2, _MXFP4_PRESHUF_ND, _MXFP4_PRESHUF_NG
     ku, _ = _mxfp4_preshuf_geom(k128)
@@ -2724,7 +2739,8 @@ def mxfp4_packed_scale_byte(row, kblk, *, k128, b_ilv, is_b, kk=None):
     kdw, g = _d(kblk, ng), _m(kblk, ng)
     kh, rem = _d(kdw, nw), _m(kdw, nw)
     u, lo = _d(rem, n_sub), _m(rem, n_sub)
-    grp, loc = _d(row, 64), _m(row, 64)
+    gspan = 16 * (b_nt if is_b else a_nt)  # rows one packed dword's bytes cover
+    grp, loc = _d(row, gspan), _m(row, gspan)
     if is_b:
         # grp = 4 * (wi // 2) + (wi % 2) + 2 * r_region
         blk, off = _d(grp, 4), _m(grp, 4)
