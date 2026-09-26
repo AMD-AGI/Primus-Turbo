@@ -23,12 +23,60 @@ from primus_turbo.flydsl.attention.flash_attn_bwd import (
 from primus_turbo.flydsl.attention.flash_attn_fwd import (
     build_flash_attn_dualwave_swp_module,
 )
+from primus_turbo.flydsl.utils.attn_helper import (
+    SCORE_BOUND_HEAD_DIM_MAX,
+    SCORE_BOUND_KV_CHUNKS,
+)
+from primus_turbo.triton.attention.score_bound import k_sq_norm_max
+
+
+def _score_bound(k, head_dim):
+    """Key half of the Cauchy-Schwarz reference bound, or None where the kernel keeps the exact per-tile maximum and the streaming read of K would be pure overhead."""
+    if head_dim > SCORE_BOUND_HEAD_DIM_MAX:
+        return None
+    return k_sq_norm_max(k, SCORE_BOUND_KV_CHUNKS)
+
 
 # Custom ops so a compiled caller sees opaque nodes instead of tracing into FlyDSL's JIT
 # build (which shells out and takes locks) -- a graph break there is what fullgraph=True
 # forbids. cudagraph_unsafe because the kernels keep module-level state a capture would
 # strand in the graph pool; without it max-autotune fails on live pool pointers.
 _custom_op = functools.partial(torch.library.custom_op, tags=(torch._C.Tag.cudagraph_unsafe,))
+
+
+def _eager_custom_op(name):
+    """Register the kernel as a custom op, and call it directly when nothing is tracing."""
+
+    def register(fn):
+        op = _custom_op(name, mutates_args=(), device_types="cuda")(fn)
+
+        @functools.wraps(fn)
+        def call(*args):
+            if torch.compiler.is_compiling():
+                return op(*args)
+            if args[0].get_device() != torch.cuda.current_device():
+                with torch.cuda.device(args[0].device):
+                    return fn(*args)
+            return fn(*args)
+
+        call.register_fake = op.register_fake
+        return call
+
+    return register
+
+
+_CURRENT_STREAMS = {}
+
+
+def _current_stream():
+    """``torch.cuda.current_stream()``, without rebuilding the wrapper every launch."""
+    device = torch.cuda.current_device()
+    key = (device, torch._C._cuda_getCurrentRawStream(device))
+    stream = _CURRENT_STREAMS.get(key)
+    if stream is None:
+        stream = torch.cuda.current_stream(device)
+        _CURRENT_STREAMS[key] = stream
+    return stream
 
 
 def _check_bwd(q, k, v, softmax_scale, causal, window_size, sink, num_heads_q, head_dim, sbhd=False):
@@ -87,7 +135,7 @@ def _fwd_module(Hq, Hkv, D, causal, cross_seqlen, emit_lse, window_left, sbhd=Fa
     # halves occupancy. Other head dims keep the build defaults.
     cfg = {}
     if D in (64, 128):
-        cfg = dict(waves_per_eu=2, dualwave_swp_enable_stagger=False, block_m=128)
+        cfg = dict(waves_per_eu=2, dualwave_swp_enable_stagger=False, block_m=64 if D == 64 else 128)
     return build_flash_attn_dualwave_swp_module(
         num_heads=Hq,
         head_dim=D,
@@ -104,7 +152,7 @@ def _fwd_module(Hq, Hkv, D, causal, cross_seqlen, emit_lse, window_left, sbhd=Fa
     )
 
 
-@_custom_op("primus_turbo::flash_attn_varlen_flydsl_forward", mutates_args=(), device_types="cuda")
+@_eager_custom_op("primus_turbo::flash_attn_varlen_flydsl_forward")
 def _varlen_forward_op(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -126,8 +174,15 @@ def _varlen_forward_op(
 
     mod = _fwd_module(Hq, Hkv, D, True, Sq != Skv, bool(return_lse), window_left, has_sink=sink is not None)
     out = torch.empty_like(q)
-    stream = torch.cuda.current_stream()
-    kw = dict(seq_len_kv=Skv, cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_k, sink=sink, stream=stream)
+    stream = _current_stream()
+    kw = dict(
+        seq_len_kv=Skv,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_kv=cu_seqlens_k,
+        sink=sink,
+        score_bound=_score_bound(k, D),
+        stream=stream,
+    )
     # LSE flows through the DebugCounts slot, [total_q, Hq] fp32. The op returns a fixed
     # number of tensors, so an unwanted LSE comes back empty rather than absent.
     lse = torch.zeros((total_q, Hq) if return_lse else (0,), device=q.device, dtype=torch.float32)
@@ -186,7 +241,7 @@ def _pad_dsink(grads, like):
     return grads[0], grads[1], grads[2], (grads[3] if len(grads) > 3 else like.new_empty((0,)))
 
 
-@_custom_op("primus_turbo::flash_attn_varlen_flydsl_backward", mutates_args=(), device_types="cuda")
+@_eager_custom_op("primus_turbo::flash_attn_varlen_flydsl_backward")
 def _varlen_backward_op(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -371,7 +426,7 @@ def flash_attn_varlen_flydsl_backward_impl(
     return (dq, dk, dv, dsink) if dsink.numel() else (dq, dk, dv)
 
 
-@_custom_op("primus_turbo::flash_attn_sbhd_flydsl_forward", mutates_args=(), device_types="cuda")
+@_eager_custom_op("primus_turbo::flash_attn_sbhd_flydsl_forward")
 def _sbhd_forward_op(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -388,7 +443,7 @@ def _sbhd_forward_op(
         Hq, Hkv, D, True, Sq != Skv, bool(return_lse), window_left, sbhd=True, has_sink=sink is not None
     )
     out = torch.empty_like(q)
-    stream = torch.cuda.current_stream()
+    stream = _current_stream()
     # SBHD seq-step strides live in the runtime stride args; the SBHD trait fixes the
     # per-batch base to H*D.
     kw = dict(
@@ -396,10 +451,10 @@ def _sbhd_forward_op(
         stride_q_n=B * Hq * D,
         stride_kv_n=B * Hkv * D,
         sink=sink,
+        score_bound=_score_bound(k, D),
         stream=stream,
     )
-    # LSE is batch-major [B*Sq, Hq] fp32, independent of the SBHD q/k/v layout.
-    lse = torch.zeros((B * Sq, Hq) if return_lse else (0,), device=q.device, dtype=torch.float32)
+    lse = torch.empty((B * Sq, Hq) if return_lse else (0,), device=q.device, dtype=torch.float32)
     if return_lse:
         kw["debug_counts"] = lse
     mod(q, k, v, out, B, Sq, **kw)
@@ -432,7 +487,7 @@ def flash_attn_sbhd_flydsl_forward_impl(
     return (out, lse) if return_lse else out
 
 
-@_custom_op("primus_turbo::flash_attn_sbhd_flydsl_backward", mutates_args=(), device_types="cuda")
+@_eager_custom_op("primus_turbo::flash_attn_sbhd_flydsl_backward")
 def _sbhd_backward_op(
     dout: torch.Tensor,
     q: torch.Tensor,
