@@ -106,7 +106,7 @@ class GroupedGEMMFP4TritonBackend(KernelBackend):
         N = b.shape[-2]
         K = b.shape[-1] * 2
         group_offs_out = kwargs.get("group_offs_out", None)
-        return grouped_gemm_mxfp4_triton_kernel(
+        out = grouped_gemm_mxfp4_triton_kernel(
             a,
             a_scales,
             b,
@@ -117,6 +117,12 @@ class GroupedGEMMFP4TritonBackend(KernelBackend):
             group_offs_out=group_offs_out,
             out_dtype=out_dtype,
             num_cu=num_cu,
+        )
+        # Zero the unwritten tail past the tight write bound, so the caller's [:total_m]
+        # slice never exposes uninitialized rows. The FlyDSL backend below folds the same
+        # clear into its preshuffle launch instead of paying a dispatch for it.
+        return grouped_gemm_output_tail_kernel(
+            out, group_offs_out if group_offs_out is not None else group_offs
         )
 
 
@@ -486,12 +492,10 @@ def grouped_gemm_fp4_impl(
         group_offs_out=group_offs_out,
     )
 
-    out = GroupedGEMMFP4KernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
-    # Over-allocated output: zero the unwritten tail past the tight write bound
-    # (group_offs_out for MX; group_offs otherwise) so the caller's [:total_m]
-    # slice never exposes uninitialized rows.
-    out = grouped_gemm_output_tail_kernel(out, group_offs_out if group_offs_out is not None else group_offs)
-    return out
+    # The over-allocated output's unwritten tail is zeroed by whichever backend ran: the
+    # Triton one calls the post-pass, the FlyDSL one folds the clear into its preshuffle
+    # launch. Doing it here instead would cost the FlyDSL path a dispatch of its own.
+    return GroupedGEMMFP4KernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
 
 
 @_torch_custom_op_wrapper(

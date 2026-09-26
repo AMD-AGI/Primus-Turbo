@@ -77,40 +77,114 @@ def _swz_fwd(c, d=0):
     return ph * 8 + (c % 8 + ph + d) % 8
 
 
-def fp4_g2s_offsets(lane_id, wave_id, K, n_steps, bytes_per_row, swizzle=False, ilv=0):
+# Wave-major G2S.  With the LDS blocks of one wave laid out contiguously, consecutive
+# steps of a stream are one 1024B block apart, so the step fits the MUBUF 12-bit
+# immediate and only one ``s_add_u32 m0`` per 4KB window is needed instead of one per
+# load.  On gfx950 that immediate lands on the LDS address AND on the memory address,
+# so the gmem voffset is pre-subtracted by it -- and must stay non-negative, which is
+# what ``fp4_g2s_wm_win`` bounds.
+G2S_CHUNK = 1024  # bytes one g2s step writes per wave (64 lanes x 16B)
+
+
+def fp4_g2s_wm_win(min_rows, row_bytes, n_steps, min_extra=0, chunk=G2S_CHUNK):
+    """Largest M0 window (in g2s steps) whose 12-bit immediates never exceed the step's
+    smallest source byte offset -- the buffer voffset is pre-subtracted by that immediate
+    and must stay non-negative. ``min_rows[r]`` is the lowest source row any lane/wave
+    reaches at step ``r``, ``row_bytes`` a lower bound on the source row stride, and
+    ``min_extra`` the smallest constant the caller adds on top (a skew may be negative)."""
+    for w in (4, 2, 1):
+        if n_steps % w or (w - 1) * chunk > 4095:
+            continue
+        # A step with a zero immediate keeps the offset it already had, so it constrains nothing.
+        if all(min_rows[r] * row_bytes + min_extra >= (r % w) * chunk for r in range(n_steps) if r % w):
+            return w
+    return 1
+
+
+def _fp4_wm_min_rows(n_steps, rows_per_step, ilv, n_waves=4):
+    """Per-step lowest source row of the wave-major plain (non parity-split) layout."""
+    out = []
+    for r in range(n_steps):
+        rows = []
+        for w in range(n_waves):
+            for ph in range(rows_per_step):
+                row = ph + (w * n_steps + r) * rows_per_step
+                if ilv:
+                    q = row % 64
+                    row = (row // 64) * 64 + ilv * (q % 16) + q // 16
+                rows.append(row)
+        out.append(min(rows))
+    return out
+
+
+def _fp4_wm_min_rows_split(n_steps, ilv, n_waves=4):
+    """Per-step lowest source region row of the wave-major parity-split layout."""
+    out = []
+    for r in range(n_steps):
+        rows = []
+        for w in range(n_waves):
+            blk = w * n_steps + r
+            for ph in range(8):
+                u = (blk // 4) * 32 + (ph + (blk % 2) * 8) * 2 + (blk % 4) // 2 if ilv else ph + blk * 8
+                rows.append(u)
+        out.append(min(rows))
+    return out
+
+
+def fp4_g2s_offsets(lane_id, wave_id, K, n_steps, bytes_per_row, swizzle=False, ilv=0, wm=0):
     """Per-lane gmem byte offsets for fp4 G2S into identity LDS slots (S2R reads back
     at the same address). ``swizzle`` pre-applies the inverse bank-swizzle; ``ilv``
-    column-interleaves source rows so a lane owns adjacent columns, LDS image intact."""
+    column-interleaves source rows so a lane owns adjacent columns, LDS image intact.
+    ``wm`` (steps per M0 window) selects the wave-major layout and pre-subtracts the
+    immediate the asm then puts on the load."""
     n_waves = udiv(fx.block_dim.x, 64)
     lpr = bytes_per_row // 16  # lanes per row
     rows_per_step = 64 // lpr
     assert not ilv or (bytes_per_row == 128 and ilv == 4)
+    # row % rows_per_step must stay == ph under either layout, or the swizzle moves.
+    assert not wm or (lpr == rows_per_step and n_steps % wm == 0)
     offs = []
     for r in range_constexpr(n_steps):
         ph = udiv(lane_id, lpr)  # physical row slot in this lane's LDS block
-        row = ph + wave_id * rows_per_step + r * (n_waves * rows_per_step)
+        if wm:
+            row = ph + (wave_id * n_steps + r) * rows_per_step
+        else:
+            row = ph + wave_id * rows_per_step + r * (n_waves * rows_per_step)
         chunk = umod(umod(lane_id, lpr) + lpr - umod(row, lpr), lpr) if swizzle else umod(lane_id, lpr)
         src = row
         if ilv:
             q = umod(row, 64)
             src = udiv(row, 64) * 64 + ilv * umod(q, 16) + udiv(q, 16)
-        offs.append(src * (K // 2) + chunk * 16)
+        off = src * (K // 2) + chunk * 16
+        offs.append(off - (r % wm) * G2S_CHUNK if wm else off)
     return offs
 
 
-def fp4_g2s_offsets_split(lane_id, wave_id, K, n_steps, row_par, shift, ilv=0):
+def fp4_g2s_offsets_split(lane_id, wave_id, K, n_steps, row_par, shift, ilv=0, wm=0):
     """Per-lane gmem byte offsets for ONE parity region of the split fp4 G2S: a region
     holds alternate operand rows so a whole request stays inside one cache line. ``ilv``
-    column-interleaves across both regions so a lane owns adjacent output columns."""
+    column-interleaves across both regions so a lane owns adjacent output columns.
+    ``wm`` (steps per M0 window) selects the wave-major layout and pre-subtracts the
+    immediate the asm then puts on the load."""
     n_waves = udiv(fx.block_dim.x, 64)
+    assert not wm or n_steps % wm == 0
     offs = []
     for r in range_constexpr(n_steps):
         ph = udiv(lane_id, 8)  # physical row slot in this lane's 1024B block
-        u = ph + wave_id * 8 + r * (n_waves * 8)  # region row
-        if ilv:
+        if wm:
+            blk = wave_id * n_steps + r  # LDS 1024B block this step fills
+            u = (
+                udiv(blk, 4) * 32 + (ph + umod(blk, 2) * 8) * 2 + udiv(umod(blk, 4), 2)
+                if ilv
+                else ph + blk * 8
+            )
+        elif ilv:
             u = r * (n_waves * 8) + (ph + umod(wave_id, 2) * 8) * 2 + udiv(wave_id, 2)
+        else:
+            u = ph + wave_id * 8 + r * (n_waves * 8)  # region row
         k = umod(umod(lane_id, 8) + 8 - ph, 8)  # physical 16B slot -> logical chunk
-        offs.append((u * 2 + row_par) * (K // 2) + k * 16 + shift)
+        off = (u * 2 + row_par) * (K // 2) + k * 16 + shift
+        offs.append(off - (r % wm) * G2S_CHUNK if wm else off)
     return offs
 
 
@@ -491,6 +565,7 @@ class MfmaScaleFp4:
         ki=None,
         sc_buf_stride=0,
         half_n=None,
+        quarter_n=False,
         half_g2s=True,
         half_k=False,
         split=None,
@@ -499,6 +574,8 @@ class MfmaScaleFp4:
         cst_ilv=0,
         cst_nt=False,
         b_base_even=None,
+        g2s_wm=None,
+        kstep_c=0,
         _cache={},  # noqa: B006 -- deliberate cross-call asm compile cache
     ):
         """WHOLE-LOOP bare-asm K-loop: one inline-asm hw-loop, unroll-2 ping-pong with
@@ -508,6 +585,16 @@ class MfmaScaleFp4:
         nta, ntb = self.n_tiles_a, self.n_tiles_b
         nq = nta * ntb
         NT = 2 * nq
+        # quarter_n: a boundary block narrower than ONE wave's column band leaves the
+        # second N-wave with nothing but padding, so the caller re-tiles the four waves
+        # 4x1 over M for that block -- each wave takes half the M sub-tiles of its own
+        # column band.  Only the half-N body changes, and only in how many A rows it
+        # walks; the g2s streams keep every issue slot.  Its phase is half as long,
+        # though, which is why that body gets its own phase-boundary drain (_WLVQ).
+        _QN = bool(quarter_n)
+        assert not _QN or (half_n is not None and nta % 2 == 0)
+        nta_h = nta // 2 if _QN else nta  # A sub-tiles the boundary body walks
+        nq_h = nta_h * ntb  # accumulator quads it writes (all in the L half)
         na, nb = nta * n_sub, ntb * n_sub
         # Merging the peeled pair keeps both k-blocks' B live, which only the A window's spare slots can hold.
         _FOLD2 = (
@@ -525,6 +612,11 @@ class MfmaScaleFp4:
         _COOP = self.coop
         _TACC = self.tacc  # transposed accumulator: swap MMA operands -> acc = C^T
         _PINBASE = 8
+        # Wave-major g2s: steps per M0 window for A / B (0 = step-major, one M0 per load).
+        # The caller owns both halves -- the LDS bases and the pre-subtracted voffsets have
+        # to agree with what is emitted here, so it also picks the windows.
+        _WMA, _WMB = g2s_wm if g2s_wm is not None else (0, 0)
+        assert kstep_c > 0  # the loop tail folds the pair's advance into a literal
         key = (
             nta,
             ntb,
@@ -543,6 +635,7 @@ class MfmaScaleFp4:
             _TACC,
             ki,
             half_n is not None,
+            _QN,
             half_g2s,
             half_k,
             split is not None and len(split[0]),
@@ -550,6 +643,9 @@ class MfmaScaleFp4:
             cst_gap,
             cst_ilv,
             cst_nt,
+            _WMA,
+            _WMB,
+            kstep_c,
         )
         _SPLIT = split is not None
         _CST = cst is not None
@@ -571,6 +667,9 @@ class MfmaScaleFp4:
         _OPEEL = _CST and half_k and not _COOP and (ki is not None) and (ki >= 5) and bool(ki & 1)
         _has_loop = (ki is None) or (ki >= 2)
         _has_tail = (ki is not None) and bool(ki & 1) and not _OPEEL
+        # The odd-KI trailing phase below is shared by both N variants, so it would run
+        # the rows the quarter-N body hands to another wave.
+        assert not (_QN and _has_tail), "quarter-N needs the tail phase inside the variant"
         # Accumulator init folded into the first MFMA's src2 immediate 0: the head phase is peeled
         # so every quad's opening MFMA writes instead of accumulating, which drops the 256-dword
         # AGPR pre-clear (one VALU per accumulator dword) from every tile's prologue.  Needs the
@@ -747,17 +846,40 @@ class MfmaScaleFp4:
                             r.append(f"ds_read_b128 ${tb + ji * n_sub + s + off}, ${bb} offset:{bo}")
                 return r
 
+            def _g2s_wm(dst, voffs, rs, so, w):
+                """One stream's g2s under the wave-major LDS layout: a single M0 write per
+                ``w``-step window, the step carried by the MUBUF 12-bit immediate. That
+                immediate also lands on the memory address, which is why ``voffs`` arrives
+                pre-subtracted by it (fp4_g2s_offsets*)."""
+                assert (w - 1) * G2S_CHUNK <= 4095  # llvm-mc silently truncates a wider offset
+                out = []
+                for st, gl in enumerate(voffs):
+                    imm = (st % w) * G2S_CHUNK
+                    ln = f"buffer_load_dwordx4 ${gl}, ${rs}, ${so} offen"
+                    out.append(
+                        (f"s_add_u32 m0, ${dst}, {(st // w) * w * G2S_CHUNK}\n" if st % w == 0 else "")
+                        + ln
+                        + (f" offset:{imm}" if imm else "")
+                        + " lds"
+                    )
+                return out
+
             def emit_g2s(buf, sa_op, sbl_op, sbr_op, half=False, only_rg=None, b_only=False):
                 if _SPLIT:
                     # Two streams/operand: aligned rows into slot buf, skewed rows into the 3-slot ring head.
                     ne, nbe = nsa // 2, nsb // 2
                     od = o_pod if _ROT else i_od
                     r = []
-                    for de, do, gl, rs, so, n in (
-                        (i_g_ab[buf], od[0][buf], i_gla, i_rsa, sa_op, 0 if b_only else ne),
-                        (i_g_blb[buf], od[1][buf], i_glb, i_rsb, sbl_op, nbe),
-                        (i_g_brb[buf], od[2][buf], i_glb, i_rsb, sbl_op if half else sbr_op, nbe),
+                    for de, do, gl, rs, so, n, w in (
+                        (i_g_ab[buf], od[0][buf], i_gla, i_rsa, sa_op, 0 if b_only else ne, _WMA),
+                        (i_g_blb[buf], od[1][buf], i_glb, i_rsb, sbl_op, nbe, _WMB),
+                        (i_g_brb[buf], od[2][buf], i_glb, i_rsb, sbl_op if half else sbr_op, nbe, _WMB),
                     ):
+                        if w:  # a region's steps share one M0 window, so they issue together
+                            for rg, dst in enumerate((de, do)):
+                                if only_rg is None or rg == only_rg:
+                                    r += _g2s_wm(dst, [gl[rg * n + st] for st in range(n)], rs, so, w)
+                            continue
                         for st in range(n):
                             for rg, dst in enumerate((de, do)):
                                 if only_rg is not None and rg != only_rg:
@@ -768,21 +890,19 @@ class MfmaScaleFp4:
                                 )
                     return r
                 r = []
-                for st in range(0 if b_only else nsa):
-                    r.append(
-                        f"s_add_u32 m0, ${i_g_ab[buf]}, {st * _NWc * 1024}\n"
-                        f"buffer_load_dwordx4 ${i_gla[st]}, ${i_rsa}, ${sa_op} offen lds"
-                    )
-                for st in range(nsb):
-                    r.append(
-                        f"s_add_u32 m0, ${i_g_blb[buf]}, {st * _NWc * 1024}\n"
-                        f"buffer_load_dwordx4 ${i_glb[st]}, ${i_rsb}, ${sbl_op} offen lds"
-                    )
-                for st in range(nsb):
-                    r.append(
-                        f"s_add_u32 m0, ${i_g_brb[buf]}, {st * _NWc * 1024}\n"
-                        f"buffer_load_dwordx4 ${i_glb[st]}, ${i_rsb}, ${sbl_op if half else sbr_op} offen lds"
-                    )
+                for dst, gl, rs, so, n, w in (
+                    (i_g_ab[buf], i_gla, i_rsa, sa_op, 0 if b_only else nsa, _WMA),
+                    (i_g_blb[buf], i_glb, i_rsb, sbl_op, nsb, _WMB),
+                    (i_g_brb[buf], i_glb, i_rsb, sbl_op if half else sbr_op, nsb, _WMB),
+                ):
+                    if w:
+                        r += _g2s_wm(dst, [gl[st] for st in range(n)], rs, so, w)
+                        continue
+                    for st in range(n):
+                        r.append(
+                            f"s_add_u32 m0, ${dst}, {st * _NWc * 1024}\n"
+                            f"buffer_load_dwordx4 ${gl[st]}, ${rs}, ${so} offen lds"
+                        )
                 return r
 
             def emit_rot():
@@ -879,6 +999,13 @@ class MfmaScaleFp4:
                 # Interleaved: each C row packs to a dwordx2 via v_accvgpr_read + v_cvt_pk_bf16_f32.
                 # A quad the swap left in an arch VGPR is already where the pack wants its source,
                 # so the read in front of it is gone -- which is what the swap is for.
+                # The reads the swap cannot reach are irreducible on gfx950: no VALU op takes an
+                # AGPR source (v_cvt_pk_bf16_f32 with a{} in src0 or src1 does not assemble) and
+                # there is no bulk AGPR->VGPR move (v_pk_mov_b32, v_mov_b64 and v_accvgpr_read_b64
+                # all reject AGPR operands), so it stays one v_accvgpr_read_b32 per dword. MUBUF
+                # is the exception -- buffer_store_dwordx2/x4 a[..] does assemble -- which is why
+                # the non-interleaved cst_group can store straight out of the accumulators; only
+                # the bf16 pack forces the round trip through the arch file.
                 q0 = sl * nq + ii * ntb
                 imm = cst_gap if sl else 0
                 rs = i_cr if sl else i_cl
@@ -972,6 +1099,8 @@ class MfmaScaleFp4:
                                     col = cb * bn + dj
                                     if half and col // ntb:
                                         continue  # R half: padding columns
+                                    if half and ii >= nta_h:
+                                        continue  # quarter-N: M sub-tiles another wave took
                                     quads.append((ii, col // ntb, col % ntb))
                 nsub_e = n_sub - 1 if drop_s else n_sub
                 cells = []
@@ -1052,6 +1181,8 @@ class MfmaScaleFp4:
                     for tt in range(t_a, NT + set_sz):  # end drain: refill still-pending temps
                         if half and t_br <= tt < t_sc:
                             continue  # R half: the variant never reads these fragments
+                        if half and t_a + nta_h * n_sub <= tt < t_bl:
+                            continue  # quarter-N: A fragments of another wave's M sub-tiles
                         if tt not in refilled:
                             out.append(ds_line(nxt_buf, tt))
                 if cstq is not None:
@@ -1060,6 +1191,18 @@ class MfmaScaleFp4:
 
             # Keeps the first post-barrier issue off the cycle every wave leaves the barrier on.
             _ipend = f"s_waitcnt vmcnt({_WLV}) lgkmcnt({_ELGK})\ns_barrier\ns_nop 0"
+
+            # The quarter-N body's phase is half as long, so _WLV's timing-based slack no
+            # longer covers the g2s: measured racy at vmcnt(_WLV) even with lgkmcnt(0),
+            # clean once the drain reaches every stream the body READS.  The B right half
+            # is the only stream it does not read (half_g2s aims those loads at the left
+            # half anyway) and it issues last, so its loads are the only ones left in
+            # flight -- the drain is a count, not a delay (pitfalls/04).
+            _WLVQ = min(_WLV, nsb)
+            _ipend_q = f"s_waitcnt vmcnt({_WLVQ}) lgkmcnt({_ELGK})\ns_barrier\ns_nop 0"
+
+            def _ip(half):
+                return _ipend_q if (half and _QN) else _ipend
 
             # VGPR-direct scale prefetch: emit_sc_vgpr loads scale dwords to the pinned set (no LDS/ds_read).
             _pbsc = _PINBASE  # scale VGPRs pinned first (PINSC), at PINBASE
@@ -1217,12 +1360,12 @@ class MfmaScaleFp4:
                     if half and _has_tail:
                         # The R half sits out this body but the shared tail still accumulates into it.
                         B += emit_acc_clear(nq, NT)
-                    return B + [_ipend] + emit_bsoff() + [f"s_branch {l_head}f"]
+                    return B + [_ip(half)] + emit_bsoff() + [f"s_branch {l_head}f"]
 
                 def emit_loop(lbl, half, l_head=7):
                     B = [f"{lbl}:"]
                     B += emit_phase_a(half)
-                    B.append(_ipend)
+                    B.append(_ip(half))
                     B += emit_bsoff()
                     if _ZACC:
                         B.append(f"{l_head}:")  # loop entry for the peeled head phase A
@@ -1237,10 +1380,11 @@ class MfmaScaleFp4:
                         _gB = mix_g2s(_gB, emit_bases(1))
                     B += _scB + emit_inplace(0, _gB, half)
                     B += _scv_adv()
-                    B.append(_ipend)
+                    B.append(_ip(half))
                     for _so in (o_sa, o_sbl, o_sbr):
-                        B.append(f"s_add_u32 ${_so}, ${_so}, ${i_kstep}")
-                        B.append(f"s_add_u32 ${_so}, ${_so}, ${i_kstep}")
+                        # one literal advance for the pair: kstep is a build constant that
+                        # only reaches the kernel as an SGPR (see kstep_c).
+                        B.append(f"s_add_u32 ${_so}, ${_so}, {2 * kstep_c}")
                     B.append(f"s_add_u32 ${o_cnt}, ${o_cnt}, 2")
                     _loop_bound = o_npv if _RTPEEL else (o_sct if _RUNTIME else i_nval)
                     B.append(f"s_cmp_lt_u32 ${o_cnt}, ${_loop_bound}")
@@ -1262,6 +1406,7 @@ class MfmaScaleFp4:
                     accumulator is final after n_st MFMAs and its stores ride all the later ones.
                     Per-accumulator MFMA order is unchanged, so C is bit-identical."""
                     nsl = 1 if half else 2
+                    nta_e = nta_h if half else nta
                     n_tail = 1 if half_k else n_sub  # sub-steps taken from the block after sw
                     n_st = n_sub + n_tail  # MFMA sub-steps this peel consumes per accumulator
                     cq = CstSched()
@@ -1315,7 +1460,7 @@ class MfmaScaleFp4:
                     for s in range(n_st):
                         B.append(rd_a(0, s))
                     mi = 0
-                    for ii in range(nta):
+                    for ii in range(nta_e):
                         B.append("s_waitcnt lgkmcnt(0)")
                         if ii == 0:
                             B.append("s_waitcnt vmcnt(0)")  # trailing scale; no store in flight
@@ -1330,7 +1475,7 @@ class MfmaScaleFp4:
                                     B += cq.emit(mi)
                                     mi += 1
                                     j += 1
-                                    if j == _ARD and ii + 1 < nta:
+                                    if j == _ARD and ii + 1 < nta_e:
                                         for ss in range(n_st):
                                             B.append(rd_a(ii + 1, ss))
                     B += _CST_HAZ + cq.flush()
@@ -1361,7 +1506,7 @@ class MfmaScaleFp4:
                         # kept out of line so the loop-taken path never fetches through it
                         B += (
                             [f"s_branch {l_end}f", f"{l_clr}:"]
-                            + emit_acc_clear(0, nq if half else NT)
+                            + emit_acc_clear(0, nq_h if half else NT)
                             + [f"s_branch {lbl}b", f"{l_end}:"]
                         )
                     return B
@@ -1376,10 +1521,10 @@ class MfmaScaleFp4:
                     B = ["s_waitcnt vmcnt(0) lgkmcnt(0)"]
                     if not _CST:
                         return B
-                    B += emit_acc_clear(0, nq if half else NT)
+                    B += emit_acc_clear(0, nq_h if half else NT)
                     cq = CstSched()
                     mi = 0
-                    for ii in range(nta):
+                    for ii in range(nta_h if half else nta):
                         for sl in range(1 if half else 2):
                             for ji in range(ntb):
                                 cq.done(mi, ii, sl, ji)
@@ -1404,7 +1549,7 @@ class MfmaScaleFp4:
                     _scb[0] = 0
                     B = ["s_waitcnt vmcnt(0) lgkmcnt(0)"]
                     if no_loop and _ZACC:
-                        B += emit_acc_clear(0, nq if half else NT)
+                        B += emit_acc_clear(0, nq_h if half else NT)
                     # The g2s that staged this block is per-wave: s_waitcnt retires only the
                     # issuing wave's loads, while the ds_reads below consume LDS the whole
                     # workgroup filled.
@@ -2306,6 +2451,7 @@ def _build_mxfp4_gemm_kernel(
                 cst_nt=True,  # the folded store's rows are whole lines, so nt costs no merge
                 split=(a_od6, bl_od6, br_od6, qu_a6, qu_b6) if const_expr(_ROWSPLIT) else None,
                 b_base_even=b_even6,
+                kstep_c=KSTEP,
             )
 
         def _cbase(o, _split=None):
