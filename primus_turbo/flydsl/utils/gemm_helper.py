@@ -292,7 +292,9 @@ def shear_mbias(m_row, ksm):
 
 
 class G2SLoader:
-    def __init__(self, gl_src, gl_offsets, n_load_steps, lds_dtype, wave_id, chunk_stride=1024, rebase=None):
+    def __init__(
+        self, gl_src, gl_offsets, n_load_steps, lds_dtype, wave_id, chunk_stride=1024, rebase=None, wm_win=0
+    ):
         self.g2lds_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
         self.LdsPtr_t = fx.PointerType.get(lds_dtype, 2, 512)
         self.gl_src = gl_src
@@ -302,6 +304,10 @@ class G2SLoader:
         self.n_waves = fx.block_dim.x // 64
         # Padding the per-wave chunk stride moves a transposed read's four lane groups off one bank half; reader and LDS pool must agree.
         self.chunk_stride = chunk_stride
+        # Wave-major mode (steps per M0 window, 0 = step-major). The wave's chunks are
+        # contiguous and ``gl_offsets`` carries the asm's 12-bit immediate pre-subtracted,
+        # which this copy has no field for and so adds back.
+        self.wm_win = wm_win
         # i64-traversal mode. None -> the K-offset rides the 32-bit soffset (caps the operand
         # span at < 2^32 fp8). A (arg_i8, fp8_ir_t, base_elems, num_records_bytes) tuple re-bases
         # the SRD per load instead (k_offset folds into the i64 base), lifting the cap.
@@ -325,7 +331,10 @@ class G2SLoader:
 
     def _lds_dst_at(self, lds_dst, step, base_off=None):
         cs = self.chunk_stride
-        step_off = self.wave_id * cs + step * (self.n_waves * cs)
+        if self.wm_win:
+            step_off = self.wave_id * (self.n_load_steps * cs) + step * cs
+        else:
+            step_off = self.wave_id * cs + step * (self.n_waves * cs)
         base_i32 = fx.Int32(fx.ptrtoint(lds_dst.ptr))
         if base_off is not None:  # runtime LDS-stage byte offset (double-buffer parity)
             base_i32 = base_i32 + base_off
@@ -336,7 +345,10 @@ class G2SLoader:
     def load(self, lds_dst, k_offset, base_off=None):
         src_div, soff = self._src_div(k_offset)
         for step in range_constexpr(self.n_load_steps):
-            src = fx.slice(src_div, (None, fx.Int32(self.gl_offsets[step])))
+            off = fx.Int32(self.gl_offsets[step])
+            if self.wm_win:
+                off = off + (step % self.wm_win) * self.chunk_stride
+            src = fx.slice(src_div, (None, off))
             dst = self._lds_dst_at(lds_dst, step, base_off)
             fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(soff))
 
