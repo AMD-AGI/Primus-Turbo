@@ -1,0 +1,125 @@
+round: 9
+mode: fast
+candidate: r9.i2.g25
+outcome: delivered
+
+correctness:
+  unit_tests: fail
+  precision: pass
+  checked_with: op/validation.py
+  sqnr_db: 49.82
+  note: >-
+    op/validation.py passes correctness on every shape (its gate is below 50 dB) and determinism: 200/200 bitwise,
+    hash o=26a89a2db0cd, the champion's own hash. The ut fails only on its 50.0 dB gate, on 7 unscored shapes
+    (short_q, mha full, unequal_seqlen x2, unequal_seqlen2 causal, sq_gt_skv): 49.82-49.99 dB. Because the output
+    is bitwise identical to the champion, the champion should fail the same way. That was NOT re-verified this
+    round: ut on op/current was never run.
+    SCHED_MODE2 scale gate: 0 non-finite at s=512..16384, causal and non-causal, for merged and lock.
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/004/op]
+  protocol: >-
+    h28: no beat in the candidate process. One process per shape; arms inc, nodelay, lock and merged, with the arm
+    order rotated across sessions. 3 sessions per shape; the figures are the mean of the per-session medians.
+    beat was measured alone in its own process per shape. All rc=0 (raw/meas); the device was idle before and
+    after (No KFD PIDs, 0% use).
+  shapes:
+    - name: fast
+      this_round_tflops: 40.97
+      best_round_tflops: 40.58
+      beat_tflops: 66.08
+      target_tflops: 66.08
+      champion_round: 4
+      champion_tflops: 40.58
+      champion_rebuilt: true
+      ratio: 0.6200
+      vs_champion: 1.0096
+    - name: proxy
+      this_round_tflops: 816.36
+      best_round_tflops: 859.42
+      beat_tflops: 1006.65
+      target_tflops: 1006.65
+      champion_round: 4
+      champion_tflops: 859.42
+      champion_rebuilt: true
+      ratio: 0.8110
+      vs_champion: 0.9499
+    - name: prod
+      this_round_tflops: 1061.58
+      best_round_tflops: 1089.71
+      beat_tflops: 1411.89
+      target_tflops: 1411.89
+      champion_round: 4
+      champion_tflops: 1089.71
+      champion_rebuilt: true
+      ratio: 0.7519
+      vs_champion: 0.9742
+  score: 0.7276
+
+validation:
+  exit_code: 2
+  note: "merged and lock arms both exit 2, on the speed bar only (geomean candidate/beat 0.6519 merged, 0.6384 lock, vs 1.0000). Correctness and determinism PASS for both."
+
+explored:
+  ran:
+    - "foreign-predecessor probe (raw/foreign): showed that beat is not special and that an intermediate current call does not re-warm"
+    - "power probe (raw/power): ruled out power, which led to h28-consistent routing"
+    - "evict + PMC probe (raw/evict): the cold state is spatial and binary in I-cache misses"
+    - "beat-cold probe (raw/beatcold): the cold start is specific to current"
+    - "seqlen sweep (raw/seqsweep): the cold start is fixed at +25-42 us, not in the loop; this retired the g16 premise and put g26 at low priority"
+    - "compile census amdgpu-loop-prefetch (raw/cc/lpf): inert, closed"
+    - "compile census lock/merged (raw/cc/isa_lock, isa_merged): +1 prologue setreg, loop unchanged"
+    - "rocprofv3 --stats not re-run (writes no files on this stack; the image is unchanged since r5)"
+  consulted:
+    - optimization/routes/1-metrics-to-techniques.md
+    - optimization/techniques/6-gfx1250-cdna5-mechanisms.md
+    - backends/flydsl/attention/techniques.md
+    - backends/flydsl/attention/dead-ends.md
+    - backends/flydsl/attention/recipes/hd128.md
+    - pitfalls/measurement-traps.md
+    - arch/gfx1250/profiling-surface.md
+  bound: compute
+  confidence: medium
+  why: >-
+    Issue-bound body (softmax VALU/trans between WMMA phases, h4). Removing 14 delay_alu per tile (nodelay) wins
+    about +1% at prod. Removing the post-WMMA arbitration yield (lock_simd) loses 3.5%, so the co-resident wave's
+    ability to take the SIMD after a WMMA matters to throughput.
+
+arms:
+  - id: h29
+    built: "rounds/008/op byte copy (nodelay), from op/current"
+    tflops: {fast: 40.93, proxy: 834.77, prod: 1100.13}
+    vs_champion: {fast: 1.0086, proxy: 0.9713, prod: 1.0096}
+    shipped: false
+    note: >-
+      prod won again, 3/3 sessions (1.0110, 1.0084, 1.0092). proxy is noisy: 1.041, 1.015 and 0.866 across sessions, with
+      the incumbent itself spanning 801-893.
+  - id: r9.i2.g25
+    built: "op/current + one s_setreg WAVE_SCHED_MODE bit 2 at bshd kernel entry"
+    tflops: {fast: 41.00, proxy: 813.80, prod: 1051.78}
+    vs_champion: {fast: 1.0103, proxy: 0.9469, prod: 0.9652}
+    shipped: false
+    note: "Lost at prod, 3/3 sessions (0.9666, 0.9630, 0.9660)."
+  - id: h29+r9.i2.g25
+    built: "the merge; built in parallel, not gated on the arms. It is the working copy rounds/009/op"
+    tflops: {fast: 40.97, proxy: 816.36, prod: 1061.58}
+    vs_champion: {fast: 1.0096, proxy: 0.9499, prod: 0.9742}
+    shipped: true
+    note: >-
+      Left in the working copy as measured, per the step rules. It loses: lock_simd's -3.5% outweighs nodelay's
+      +1%.
+
+expected: >
+  The selected change is row 2, g25 (row 1 is a re-measure). My estimate: prod +0.5% vs op/current, range -1% to
+  +1.5%. Fast/proxy about +0.3%. At fast the kernel is one dispatch wave, and cold-start and launch cost dilute any
+  body change. Geomean about +0.4% alone. Stacked on h29's nodelay (prod +0.7%, fast/proxy about 0 without beat),
+  the merged tree would read about +0.6-0.7% geomean, prod about +1.2%. That is at the 0.70% bar, not safely over
+  it. Falsified if prod is within the 0.47% floor or negative in 3 rotated sessions.
+
+added_to_pool: [r9.i2.g25, r9.i3.g26]
+route_updated: true
+
+implementation:
+  files_changed: [rounds/009/op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py]
+  build_failures: []

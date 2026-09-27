@@ -28,7 +28,7 @@ Source abbreviations used below:
 | h7 | standing note | Barriers (L8) | open |
 | h8 | standing note | Retiling is closed (L10-L12) | open |
 | h9 | advise note | Prefetch depth and unroll (L13, L14, L26) | open |
-| h10 | advise note | Softmax arithmetic (L15-L19) | open |
+| h10 | advise note | Softmax arithmetic (L15-L19) | done r4-r6 (packed exp/rowsum landed r4; permlane rowsum -1.8% r6) |
 | h11 | advise note | Rescale and max (L20, L21) | open |
 | h12 | advise note | Wait/barrier hygiene and compiler flags (L22-L25) | open |
 | h13 | standing note | Closed, do not rebuild (L27, L28, L30) | open |
@@ -586,4 +586,8 @@ Round 8's shipped working copy (`rounds/008/op/`, compile hint amdgpu-enable-del
 output) measured prod +0.62..+0.7% in 3/3 rotated sessions and fast 1.002 / proxy 1.004 in 4/4 sessions WITHOUT
 beat; it was rejected only by the post-beat artifact of h28. Start from `rounds/008/op/` (diff vs op/current),
 re-measure per h28 and ship it; then spend the rest of the round on the next lever. Discharge when accepted.
+UPDATE after round 9: nodelay won prod AGAIN (3/3, +0.9..+1.1%, total now 6/6 sessions) but round 9 shipped a MERGE
+(nodelay + lock_simd) and lock_simd lost 3.5%, so the round was rejected. RULE: the shipped working copy is
+nodelay ALONE unless another arm has independently beaten the champion; a merge is shipped only if every
+component won on its own. A deep round may use its one candidate on nodelay-alone -- it is the only measured win.
 
