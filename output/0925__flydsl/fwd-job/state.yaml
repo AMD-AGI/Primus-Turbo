@@ -197,14 +197,12 @@ rounds:
 - round: 4
   progress:
   - opt
+  - reflect
   mode: fast
-  running:
-    module: reflect
-    step: null
-    since: '2026-09-27T09:19:22'
   seconds:
     opt: 3140.7
-    round: 3140.7
+    reflect: 78.8
+    round: 3219.5
   sessions:
     opt: f2aa93bc-1d9f-4830-8bf7-6bcee81e8c16
   bound: compute
@@ -242,3 +240,65 @@ rounds:
   guard_failed: null
   note: null
   changed_disagreement: null
+- round: 5
+  progress:
+  - profiling
+  - plan
+  - act
+  - reflect
+  mode: deep
+  profiled_in: 5
+  profiled_sha: cca24c5cb19263d4
+  profiled_on: docker||(pre-existing container)|fa-repro
+  seconds:
+    profiling: 2332.8
+    plan: 1123.9
+    act: 1722.4
+    reflect: 291.6
+    round: 5470.7
+  bound: latency
+  sessions:
+    planner: a5fce209-6da7-4eea-a7f4-b45dd7e128f0
+    reviewer: 01a0e24e-410f-7710-aae7-9c04f22ebc2e
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - 'speed: geomean candidate/beat 0.5954 < bar 1.0000 (fast 0.4908, proxy 0.6572, prod 0.6545)'
+  score: 0.59507
+  outcome: delivered
+  passed: false
+  accepted: false
+  tflops:
+    fast: 30.2
+    proxy: 674.46
+    prod: 912.99
+  targets:
+    fast: 65.68
+    proxy: 1004.0
+    prod: 1396.77
+  beats:
+    fast: 65.68
+    proxy: 1004.0
+    prod: 1396.77
+  incumbents:
+    fast: 34.2
+    proxy: 871.42
+    prod: 1075.98
+  gain: 0.8352
+  changed: 1
+  flops:
+    fast: 2149580800.0
+    proxy: 137472507904.0
+    prod: 2199291691008.0
+  guards: {}
+  guard_failed: null
+  note: 'delivered: speed: geomean candidate/beat 0.5954 < bar 1.0000 (fast 0.4908, proxy 0.6572, prod
+    0.6545)'
+  changed_disagreement: null
+- round: 6
+  progress: []
+  mode: fast
+  running:
+    module: opt
+    step: null
+    since: '2026-09-27T10:53:59'

@@ -93,6 +93,7 @@ Hints live in `job_context/hint.md` as `hN` (converted from `fwd-hint/hint.md`'s
 | 2 | fast | **accepted** | 44.5 / 778.5 / 1018.0 | 1.089 | r1.i1.g01 re-landed (h20). Champion copy: `output/0925__flydsl/fwd-job/champion/`. prod = 0.73x ASM. |
 | 3 | fast | rejected | 36.3 / 778.2 / 1013.6 | 0.996 | s_prefetch_inst (dead: INST_PREF_SIZE already prefetches all code) and LO-wave s_setprio (null). Finding: removing softmax exp2 cuts prod 13.4% => softmax VALU is on the critical path. Palindrome-slot bias faked +15% at proxy in one session -- rotate arm order. |
 | 4 | fast | **accepted** | 47.3 / 862.8 / 1082.1 | 1.063 | packed exp argument (v_pk_fma_f32, r4.i1.g09) + packed row-sum tree (v_pk_add_f32, r4.i2.g10). prod 2.033 ms = 77.4% of ASM; +15.7% vs baseline. coexec sched strategy compile-probed only. |
+| 5 | deep | rejected | 30.2 / 674.5 / 913.0 | 0.849 | r5.i1.g13 = QK/softmax software pipeline (h21 family): 512 VGPR, 0 spill, 103/330 v_exp within 8 instr of a WMMA -- and -15.2% prod, +20.3% cycles/call. Static ISA again failed to price time. g14 (row-sum, h22) not built: act runs one candidate only. |
 
 ### Operator fixes applied during the fwd job (each cost a round -- check them on any new job)
 - **op-evolve route parser** (`core/route.py`): row type was matched on the whole row, so "must be predicated" / "== idea r1..." in free-text cells flipped must/idea and crashed round 1 (`RouteError`). Fixed to read the type cell only (op-evolve branch `lhz/gfx1250`).

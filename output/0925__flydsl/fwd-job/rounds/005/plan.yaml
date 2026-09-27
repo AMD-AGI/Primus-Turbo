@@ -1,0 +1,114 @@
+round: 5
+selected: r5.i1.g13
+
+prediction:                       # copied from candidates.yaml r5.i1.g13
+  metric: prod_Mcycles_per_call_randn     # tools/clock_probe measure(), protocol of rounds/005/1-profiling/5-power-wall-analysis
+  from: 1.964
+  to: "<=1.905 (-3% or more)"
+  also_expect:
+    prod_vs_champion_benchmark: ">=1.03 over 3 slot-rotated sessions (planner); reviewer predicts >=1.05"
+    prod_tflops: ">=1115.8 (champion 1083.33, rounds/005/1-profiling/benchmark-results.md)"
+    prod_sclk: "within +-2% of control, reported beside every cycles number"
+    fast_vs_champion: "0.98-1.02"
+    isa_gate: "VGPR 512, SGPR 97, spill 0/0, scratch 0, 103/330 v_exp within 8 instr of a WMMA (compiled in plan, md5 d530dda8)"
+    output: "bitwise equal to champion (o=26a89a2db0cd lse=d6ac8da1e101)"
+  falsified_if: >
+    planner prediction false if prod vs_champion < 1.03; reviewer's false if < 1.05. L6 at n_block 64 is closed
+    only if prod vs_champion < the session's own floor (~0.4-0.5%) at 0 spill.
+
+why_this_one: >
+  The largest predicted prod gain of the round, and the only candidate that tests the premise under all three:
+  that the prod gap is the softmax chain running serially with WMMA inside each wave, and that it can be hidden
+  in-wave. Its disqualifier, VGPR, was measured in plan: 512, 0 spill, 0 scratch (synthesis_notes.md S1).
+  Both agents agreed the order [g13, g14, g15] at 02_review and 04_close.
+
+route_constraint_and_attribution: >
+  h22 is a `must` operator item, so it is row 1 of the Route, above g13. r5.i2.g14 discharges it. Act builds
+  g14 and g13 as two SEPARATE arms from op/current and measures each against the same control in the same
+  3 slot-rotated prod sessions (plus fast and proxy). This is not a bundle: each arm is one change against the
+  control, so each number is attributable. NO MERGE this round. g13 sits at exactly 512 VGPR, so a g13+g14
+  build is a new compile with a new gate and would be a later round's candidate.
+  Ship rule (correction 4): ship the arm with the higher prod vs_champion if it is >= the session floor. Ship
+  neither if both are below it. If g14 ships and g13 does not, the selected prediction is recorded as
+  falsified. g14's own prediction is judged separately (candidates.yaml).
+
+ship_gate:
+  - "prod vs_champion >= the session's measured floor (~0.4%); fast/proxy gains never pay for a prod loss"
+  - "spill 0/0, scratch 0; h16 correctness set; h21 bitwise/determinism set for g13; >=49 dB for g14"
+  - "clock_probe Mcycles/call and sclk at prod, randn, for control and each arm"
+
+added_to_pool: [r5.i1.g13, r5.i2.g14, r5.i3.g15]
+
+instrument_taken_this_round:
+  what: "fast warm vs flushed vs isolated timing, current and beat, one process (the g04 settlement line both agents agreed)"
+  where: rounds/005/2-plan/raw/warm_flush/summary.md
+  result: >
+    Warm back-to-back ratio current/beat: 1.240 and 1.193 in two runs. That is between the agreed thresholds
+    (<=1.15 stale, >=1.3 stays), so the agreed line settles neither. L2 temperature is irrelevant
+    (qwarm 74.71 vs qflush 75.47 us current; 34.49 vs 34.77 beat). Host launch is equal (16.43 vs 16.60 us).
+    About 36 of the ~41 us scored fast gap is a per-dispatch penalty only current pays, and it grows with the
+    preceding idle time (38 us back to back, 71 us after a 1.8-ms sleep). That is r1.i3.g03's penalty, now shown
+    to be not L2 and not host-side.
+
+unresolved_disagreements:
+  - candidate: r5.i1.g13
+    planner:
+      position: "prod gain >=3% (Mcycles/call <=1.905, vs_champion >=1.03); +5% is not supported by any on-card number"
+      grounds:
+        - {claim: "the only card number bounding exp-hiding is clock-inflated", value: "exp removed -13.4% prod (r3); data swap alone moves prod sclk 988 -> 1053 MHz, time -7.2% at -1.2% cycles", from: "job_context/findings/facts.md; rounds/005/1-profiling/5-power-wall-analysis/analysis.md"}
+        - {claim: "the reviewer's +5% rests on a static overlap count plus another kernel's trace, which price no time either", value: "proto 59/66; port 103/330", from: "job_context/findings/route.md (h21); rounds/005/2-plan/synthesis_notes.md#S1"}
+    reviewer:
+      position: >
+        I retain the >=5% prod prediction: current is only 0.768 of beat
+        (rounds/005/1-profiling/benchmark-results.md), while beat places 54.6k
+        v_exp operations in WMMA gaps and attributes 38.0% of stalls to v_cvt/v_pk
+        dependencies versus 0.5% to LDS reads
+        (job_context/profiling/beat/4-thread-trace/analysis.md); neither agent has
+        an on-card price for the overlap, so the competing 3% and 5% predictions
+        should remain distinct.
+      grounds:
+        - {claim: "current/beat at prod", value: 0.768, from: rounds/005/1-profiling/benchmark-results.md}
+        - {claim: "beat: v_exp in WMMA gaps; v_cvt/v_pk 38.0% of stall vs LDS-read 0.5%", value: "54.6k; 38.0%; 0.5%", from: job_context/profiling/beat/4-thread-trace/analysis.md}
+    settled_by: >
+      Measure g13 versus champion in three slot-rotated prod sessions plus
+      clock_probe Mcycles/call and sclk: gain >=5% supports the reviewer;
+      3% to <5% supports only the planner; noise-floor to <3% falsifies both
+      magnitude predictions but remains shippable; below the measured prod
+      noise floor closes L6 at n_block 64.
+
+  - candidate: r5.i2.g14
+    planner:
+      position: "prod gain 1-2% (Mcycles/call 1.925-1.945, vs_champion 1.01-1.02)"
+      grounds:
+        - {claim: "the only card price for a cross-lane/sum-tree cut on this body", value: "r4.i2.g10 x1.013 prod alone", from: job_context/findings/facts.md}
+    reviewer:
+      position: >
+        I retain the >=2% prod prediction: production is core-clock-scaled with
+        cycles changing only -1.2% under the data swap
+        (rounds/005/1-profiling/5-power-wall-analysis/analysis.md), and softmax
+        packing dependencies account for 38.0% of beat's traced stalls
+        (job_context/profiling/beat/4-thread-trace/analysis.md); the planner's
+        1-2% range remains a separate prediction.
+      grounds:
+        - {claim: "cycles change -1.2% under the data swap; prod is core-clock-scaled", from: rounds/005/1-profiling/5-power-wall-analysis/analysis.md}
+        - {claim: "v_cvt/v_pk dependencies 38.0% of beat's traced stall", from: job_context/profiling/beat/4-thread-trace/analysis.md}
+    settled_by: >
+      Measure g14 as a separate arm from op/current in the same sessions:
+      gain >=2% supports the reviewer; 1% to <2% supports only the planner;
+      noise-floor to <1% falsifies both magnitude predictions but remains
+      shippable; below the measured prod noise floor closes the per-tile
+      cross-lane-reduction mechanism.
+
+confirmed_in_dialogue:
+  - {candidate: r5.i3.g15, what: "null prediction (Mcycles >=1.954); closes L13 only with wait 0x2, 0 spill, sclk within 2%"}
+  - {candidate: r1.i4.g04, what: "still_valid true, deferred; settlement line agreed. Measured in plan this round: inconclusive (1.19-1.24), see instrument_taken_this_round"}
+
+dialogue:
+  turns: 3
+  ended_by: unresolved
+  # ran_to_close. The two agents still hold different magnitudes for g13 (3% vs 5%) and g14 (1-2% vs >=2%).
+  # This is a disagreement between the agents, not only against the data; the band edges above settle it.
+  transcript: rounds/005/2-plan/dialogue.md
+
+review_stage: full
+route_updated: true

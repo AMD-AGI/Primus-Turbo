@@ -1,0 +1,142 @@
+constraint:
+  bound: latency
+  shape: prod
+  agrees_with_profiling: true
+  grounds:
+    - {claim: "not HBM: cycles/call flat while sclk moved 988->1053", value: "1.964 -> 1.941 Mcyc (-1.2%), time -7.2%", from: rounds/005/1-profiling/5-power-wall-analysis/analysis.md}
+    - {claim: "clock explains at most +11%; beat does 1.30x the work in the same card state", value: "1100/988; 1410.87 vs 1083.33 TF/s", from: rounds/005/1-profiling/6-bound-analysis/analysis.md}
+    - {claim: "machine is filled at prod", value: "SQ_BUSY/SQ_CYCLES 0.981, 4096 WGs", from: rounds/005/1-profiling/2-kernel-profiling/kernel-kn_fmha_fwd_prefill_a16w16_m32x8_bshd/analysis.md}
+    - {claim: "the cycles beat saves are in-wave WMMA cadence with softmax VALU landing in WMMA gaps", value: "WMMA issue interval 8 cyc 66.7%; v_cvt/v_pk stalls 38% of stall", from: job_context/profiling/beat/4-thread-trace/analysis.md}
+    - {claim: "softmax VALU is serial with WMMA in current, and only cross-tile moves can overlap it", value: "exp removed -13.4% prod (r3); VALU packing +6.3% (r4); intra-tile sink g11 -2.3%", from: job_context/findings/facts.md}
+    - {claim: "the exp-removal price is inflated by clock: prod sclk is data/activity dependent", value: "randn 988 MHz / zeros 1053 MHz", from: rounds/005/1-profiling/5-power-wall-analysis/analysis.md}
+  reading: >
+    Agree on "latency, low", and the label matters less than where the cycles go. Beat's trace plus facts.md say it:
+    the WMMA chain waits on the softmax dependency chain within each wave. Current has 2 waves/SIMD, but the per-tile
+    WG barrier holds them in phase (h4: 4 barriers per 256 KV), and r3.i2.g08's s_setprio stagger bought nothing
+    (prod 1.000). So the overlap has to be built inside the wave, as beat does (QK(j) interleaved with exp(j-1)).
+    fast is a separate regime (32 WGs). Beat has the same underfill there, so underfill is not the differentiator
+    (beat profile_summary: flushed/warm 1.25x beat vs 1.57-1.83x current). Per correction 4 it is not this round's target.
+
+candidates:
+  - id: r5.i1.g13
+    title: "Port h21 L6 QK(i+1)/softmax(i) cross-tile software pipeline onto the round-4 champion"
+    proposed_by: planner
+    round_proposed: 5
+    hypothesis: >
+      The prod per-cycle gap to beat is softmax VALU/TRANS serial with WMMA inside each wave. Round-4 packing
+      shortened that chain but did not overlap it. Double-buffering S so softmax(i) issues under QK(i+1)'s 32 WMMAs
+      hides most of the remaining chain. This is the mechanism beat uses, and the only relocation that has not
+      already been measured to lose (g11 intra-tile -2.3%).
+    prediction:
+      metric: prod_Mcycles_per_call_randn   # tools/clock_probe, same protocol as 5-power-wall
+      from: 1.964
+      to: "<=1.89 (-4% or more)"
+      also_expect:
+        prod_vs_champion_benchmark: ">=1.03 (3 slot-rotated sessions)"
+        prod_sclk: "within -1.5% of control (the extra v_mov/msb adds switching; cycles must fall more than clock)"
+        fast_vs_champion: "0.98-1.02"
+        isa_gate: "VGPR <= 512, spill 0/0, scratch 0; _PIPE gate intact, non-gated configs byte-identical to champion"
+        output: "bitwise equal to champion (hash o=26a89a2db0cd lse=d6ac8da1e101)"
+      falsified_if: "compiles clean at 0 spill and prod cycles/call falls < 1.5% -> in-wave cross-tile overlap is not the lever at 2 waves/SIMD; close L6"
+    evidence:
+      - {claim: "exp on the critical path (upper bound, clock-inflated)", value: "-13.4% prod", from: job_context/findings/facts.md}
+      - {claim: "intra-tile relocation cannot make overlap", value: "g11 -2.3% prod", from: rounds/004/2-reflect/reflect.md}
+      - {claim: "beat fills WMMA gaps with v_exp/v_pk_* from the adjacent tile, 1 wave/SIMD", value: "v_exp 54.6k in WMMA gaps; EXEC 68%", from: job_context/profiling/beat/4-thread-trace/analysis.md}
+      - {claim: "prototype compiled on round-2 base: 508 VGPR, 0 spill; v_exp within 8 instr of QK WMMA 59/66", value: 508, from: job_context/findings/route.md (h21)}
+      - {claim: "round 4 raised champion VGPR 445 -> 456", value: 456, from: job_context/findings/facts.md}
+    justified_by_round: 5
+    source: {kind: internal, repo: null, commit: null, verified: true}
+    scope:
+      files: [op/current/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py]
+      backend_feasible: unknown
+    risk: >
+      VGPR is the wall. Base went 445 -> 456, so a naive port lands near 519 > 512. It must be ported as a diff
+      (h27, never copy files; the conflict is with round 4's packed softmax lines). Read the allocation back from the
+      ISA. If it is over 512 or spills, act stops, records "roadblock: VGPR", and does not run it on card (h14, a
+      spill can wedge the card). One lever that can recover the budget: carry P as bf16 (the packed form PV needs)
+      instead of f32 S across the tile boundary. It is not proposed here unless the compile needs it. Masked loops
+      get no overlap, and the last tile is peeled.
+
+  - id: r5.i2.g14
+    title: "h22 remainder: per-lane partial row-sum carried across tiles (L17), defer rescale kept"
+    proposed_by: planner
+    round_proposed: 5
+    hypothesis: >
+      After round 4 the row-sum is a packed in-lane tree, but a cross-lane permlane reduce still runs every tile on
+      the serial softmax chain. The sum is only needed at the epilogue, so carrying per-lane partials removes that
+      reduce and its dependency wait from every tile. Round 4 found dependency stalls priced higher than slot
+      count (super-additive merge, v_nop 168 -> 62), so a chain-shortening cut should pay more than its instruction count.
+    prediction:
+      metric: prod_Mcycles_per_call_randn
+      from: 1.964
+      to: "1.925-1.945 (-1% to -2%)"
+      also_expect:
+        prod_vs_champion_benchmark: "1.01-1.025"
+        isa: "permlanex16 whole-kernel 16 -> <=10 (proto figure); VGPR <= 470; spill 0/0"
+        precision: "not bitwise (sum re-association); o/lse >= 49 dB on all 16 ut cases, lse vs fp32 reference"
+      falsified_if: "prod < +0.5% (floor) with permlane count down as predicted -> the per-tile cross-lane sum is off the critical path; per-instruction pricing of softmax cuts is then dead too"
+    evidence:
+      - {claim: "prototype: LANE alone shortens QK->PV serial span", value: "551/337 base -> 527/240 LANE only; PK+LANE+defer 506/218", from: job_context/findings/route.md (h22)}
+      - {claim: "h22 is a 'must' route item; L15 and packed sum already landed, so L17 is what remains", value: "must", from: job_context/findings/route.md}
+      - {claim: "dependency-shortening cuts were super-additive", value: "+3.0 and +1.3 -> +6.3%", from: job_context/findings/facts.md}
+    justified_by_round: 5
+    source: {kind: internal, repo: null, commit: null, verified: true}
+    scope:
+      files: [op/current/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py]
+      backend_feasible: yes
+    risk: >
+      The precision headroom is 0.8 dB (worst 49.82). The row-max path is not touched, so h16's large-logit gate is not
+      triggered, but running it anyway is cheap. The lines conflict with g13's softmax region, so it is built as a
+      separate arm from op/current and merged only if both win. BF (L20) is excluded: dead r2 (prod 0.940), and h26
+      says BF adds +31 VALU/iter with no span gain. PK-only (C3) already shipped as g09. So h22's C1/C3 arms have no
+      question left, and this arm (C2 on the current base) discharges h22.
+
+  - id: r5.i3.g15
+    title: "h23 U1PP3: TDM prefetch depth 3, top-of-tile wait drains only tile t (s_wait_tensorcnt 0x2)"
+    proposed_by: planner
+    round_proposed: 5
+    hypothesis: >
+      Current waits for all TDM traffic (tensorcnt 0x0) before every tile, and that wait sits in front of the
+      per-tile WG barrier, so a slow K/V arrival on any wave stalls all 8. Beat keeps 4 in flight (0x4), and TDM
+      wait is still 5.6% of beat's exposed stall. Issuing tile t+2 at tile t removes the full drain.
+    prediction:
+      metric: prod_Mcycles_per_call_randn
+      from: 1.964
+      to: "<=1.93 if the drain is exposed; >=1.97 if one tile of compute already covers TDM latency"
+      also_expect:
+        prod_vs_champion_benchmark: ">=1.02 or <=0.99 -- a result inside +-0.5% is itself the answer (TDM latency hidden)"
+        isa: "VGPR unchanged 456, SGPR ~+7, spill 0/0, LDS 327680, wait 0x2 in the clean loop"
+        output: bitwise equal to champion
+    evidence:
+      - {claim: "champion waits tensorcnt 0x0 every iteration; ASM 0x4", value: "0x0 vs 0x4", from: job_context/findings/route.md (h4)}
+      - {claim: "TDM wait is a residual stall even for beat", value: "s_wait_tensorcnt 5.6% of stall cycles", from: job_context/profiling/beat/4-thread-trace/analysis.md}
+      - {claim: "prototype compiles: U1PP3 VGPR 445 SGPR 104, 0 spill", value: "573 instr/tile", from: job_context/findings/route.md (h23)}
+    justified_by_round: 5
+    source: {kind: internal, repo: null, commit: null, verified: true}
+    scope:
+      files: [op/current/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py]
+      backend_feasible: yes
+    risk: >
+      BWD prior: every depth > 2 lost 10-30%, though that staging was dual-use. This arm also conflicts with g13's LDS
+      ring re-phase ([K(i+1)|V(i)]), so the two cannot merge this round. Run it only if g13 is a roadblock, or as the
+      third arm if budget allows. The CPU schedule proof covers only sq==skv, so the gate adds sq!=skv and
+      kv_len % 64 != 0.
+
+execution_order: >
+  g13 compile-only first (the VGPR read-back decides everything). If it is <= 512 with 0 spill: arms = g13 and g14,
+  each from op/current, 3 slot-rotated sessions, prod/proxy/fast, and prod cycles/call via clock_probe with sclk.
+  If g13 is a VGPR roadblock: arms = g14 and g15. Ship nothing whose prod vs_champion is under the floor
+  (correction 4).
+
+from_pool:
+  - {id: r1.i2.g02, still_valid: false, why: "O_VARIANT v1 lost proxy -3/-4% in round 1 (route row 11 says retire); the +1.9% was flydsl 0.3.2 pre-job"}
+  - {id: r1.i3.g03, still_valid: true, why: "post-beat penalty is still unexplained (r3.i1.g07 excluded I$ fetch); fast-only instrument, not a prod lever -- keep as a rider, not this round"}
+  - {id: r1.i4.g04, still_valid: false, why: "justified by fast underfill, but beat has the same 32-WG underfill and is 1.8x faster; the beat profile's flushed/warm 1.25x vs 1.57-1.83x points to per-call/cold-cache cost, not underfill -- stale justification"}
+  - {id: r2.i2.g06, still_valid: false, why: "round-2 analysis: under g01's order, (b,kv_head) already maps to a fixed XCD, and scored shapes have sq==skv, so L4/L5 have nothing to do at scored shapes"}
+  - {id: r3.i2.g08, still_valid: false, why: "measured round 3: prod 1.000 / proxy 0.973 / fast 0.943; reflect closed it -> dead_ends"}
+  - {id: r4.i2.g10, still_valid: false, why: "shipped inside the round-4 merge (op/current); stale entry, retire to facts"}
+
+knowledge_gaps:
+  - {question: "on gfx1250 (1024-VGPR file) what ceiling does waves_per_eu=2 impose, and does exceeding it spill or drop occupancy", expected_in: knowledge/arch/gfx1250/gfx1250.md or knowledge/backends/flydsl/README.md, did_instead: "assumed 512 from route.md h21/h26 compile results; g13 gated on ISA read-back"}
+  - {question: "gfx1250 bf16 WMMA peak FLOP per SIMD-cycle", expected_in: knowledge/arch/gfx1250/gfx1250.md, did_instead: "used beat's 1410.9 TF/s as a lower bound on the ceiling"}
+  - {question: "how much of a VALU cut is paid as clock vs cycles when sclk is activity-dependent", expected_in: knowledge/backends/flydsl/attention/techniques.md, did_instead: "predictions stated in Mcycles/call from clock_probe with sclk reported beside"}

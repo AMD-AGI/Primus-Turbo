@@ -1,0 +1,163 @@
+candidates:
+  - id: r5.i1.g13
+    alias: r5.i2.g14 (reviewer step 0, same hypothesis -- see synthesis_notes.md S2)
+    title: "Port h21 L6 QK(i+1)/softmax(i) cross-tile software pipeline onto the round-4 champion"
+    proposed_by: planner          # independently proposed by reviewer too
+    round_proposed: 5
+    hypothesis: >
+      The prod per-cycle gap to beat is softmax VALU/TRANS serial with WMMA inside each wave. Double-buffering S so
+      softmax(i) issues under QK(i+1)'s WMMAs hides part of that chain, which is beat's mechanism. Intra-tile
+      relocation already lost (g11 -2.3%), so this is the remaining form of overlap.
+    prediction:
+      metric: prod_Mcycles_per_call_randn     # tools/clock_probe, 5-power-wall protocol
+      from: 1.964
+      to: "<=1.905 (-3% or more)"
+      also_expect:
+        prod_vs_champion_benchmark: ">=1.03 (3 slot-rotated sessions); reviewer predicts >=1.05 -- see disagreements"
+        prod_tflops: ">=1115.8 (1083.33 x 1.03)"
+        prod_sclk: "within +-2% of control, reported beside every time"
+        fast_vs_champion: "0.98-1.02"
+        isa_gate: "MEASURED in plan: VGPR 512, SGPR 97, spill 0/0, scratch 0; 103/330 v_exp within 8 instr of a WMMA (champion 0/264). Act must reproduce md5 d530dda8 or explain the difference"
+        output: "bitwise equal to champion (o=26a89a2db0cd lse=d6ac8da1e101)"
+      falsified_if: "prod cycles/call falls < 1.5% at 0 spill -> in-wave cross-tile overlap does not pay at this nop/msb cost; close L6 at n_block 64"
+    evidence:
+      - {claim: "port compiles at exactly 512 VGPR, 0 spill, 0 scratch; overlap present", value: "512/0/0; 103 v_exp near WMMA", from: rounds/005/2-plan/synthesis_notes.md#S1}
+      - {claim: "exp on the critical path (upper bound; clock-inflated per corpus dead-end 'A probe that deletes the exp')", value: "-13.4% prod", from: job_context/findings/facts.md}
+      - {claim: "intra-tile relocation cannot make overlap", value: "g11 -2.3% prod", from: rounds/004/2-reflect/reflect.md}
+      - {claim: "beat fills WMMA gaps with softmax VALU of the adjacent tile, at 1 wave/SIMD", value: "v_exp 54.6k in WMMA gaps; WMMA 8-cyc interval 66.7%", from: job_context/profiling/beat/4-thread-trace/analysis.md}
+      - {claim: "2 co-resident waves do not supply the overlap: explicit stagger measured null", value: "r3.i2.g08 prod 1.000", from: job_context/findings/pool.md}
+    justified_by_round: 5
+    source: {kind: internal, repo: null, commit: null, verified: true}
+    scope:
+      files: [op/current/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py]
+      backend_feasible: yes      # compiled in plan
+    risk: >
+      Zero VGPR headroom. Nothing stacks on it without a recompile, so a g13+g14 merge is presumed not to fit.
+      Nops go 62 -> 217 and s_set_vgpr_msb 240 -> 757, the opposite of round 4's winning direction. The _PIPE gate
+      must stay as shipped (non-gated configs spilled before the review, h21). The gate also needs the
+      bitwise/determinism set from h21: n_iter=1/2, kv_len%64!=0, sq!=skv, 80x repeat, 200-run determinism.
+
+  - id: r5.i2.g14
+    alias: r5.i1.g13 (reviewer step 0, same hypothesis)
+    title: "h22 remainder: per-lane partial row-sum carried across KV tiles (L17), one cross-lane reduce in the epilogue; defer rescale kept"
+    proposed_by: planner          # independently proposed by reviewer too
+    round_proposed: 5
+    hypothesis: >
+      The per-tile cross-lane row-sum reduce lengthens the serial softmax chain although the sum is needed only at
+      the epilogue. Carrying per-lane partials removes it from every tile. Chain-shortening cuts were priced above
+      their slot count in round 4.
+    prediction:
+      metric: prod_Mcycles_per_call_randn
+      from: 1.964
+      to: "1.925-1.945 (-1% to -2%)"
+      also_expect:
+        prod_tflops: ">=1105.0 (reviewer's threshold, adopted)"
+        prod_vs_champion_benchmark: ">=1.02 (reviewer) / 1.01-1.025 (planner) -- same band, lower edge is the reviewer's"
+        prod_sclk: "within +-2%"
+        isa: "whole-kernel permlanex16 16 -> <=10; VGPR <= 470; spill 0/0; scratch 0"
+        precision: "not bitwise; o/lse >= 49 dB on all 16 ut cases, lse checked against the fp32 reference"
+      falsified_if: "permlane count falls as predicted but prod < +0.5% -> the per-tile cross-lane sum is off the critical path"
+    evidence:
+      - {claim: "LANE shortens the proto's QK->PV serial span", value: "337 -> 240 (LANE only); 218 PK+LANE+defer", from: job_context/findings/route.md (h22)}
+      - {claim: "h22 is a 'must' route item; PK and packed sum already shipped", value: must, from: job_context/findings/route.md}
+      - {claim: "softmax VALU cuts moved prod super-additively", value: "+3.0 and +1.3 -> +6.3%", from: job_context/findings/facts.md}
+      - {claim: "proto diff conflicts with round 4 at the packed region, so this is a hand port", value: "hunk 4 FAILED at :603", from: rounds/005/2-plan/synthesis_notes.md#S1}
+    justified_by_round: 5
+    source: {kind: internal, repo: null, commit: null, verified: true}
+    scope:
+      files: [op/current/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py]
+      backend_feasible: yes
+    risk: >
+      0.8 dB precision headroom (worst 49.82). BF (L20) is excluded: dead in r2 (prod 0.940), and h26 says it adds
+      +31 VALU/iter with no span gain. This arm discharges h22's remaining question.
+
+  - id: r5.i3.g15
+    title: "h23 U1PP3: TDM prefetch depth 3, top-of-tile wait drains only tile t (s_wait_tensorcnt 0x2)"
+    proposed_by: planner
+    round_proposed: 5
+    hypothesis: >
+      The champion drains all TDM traffic (tensorcnt 0x0) before each tile's WG barrier, so the slowest wave's K/V
+      arrival gates all 8 waves. Beat keeps 4 in flight. Depth 3 removes the full drain.
+    prediction:
+      metric: prod_Mcycles_per_call_randn
+      from: 1.964
+      to: "<=1.93 if the drain is exposed; >=1.97 if one tile of compute already covers TDM latency"
+      also_expect:
+        prod_vs_champion_benchmark: "a result inside +-0.5% is itself the answer (TDM latency hidden) and closes L13"
+        isa: "VGPR 456, SGPR ~+4..7, spill 0/0, wait 0x2 in the clean loop"
+        output: bitwise equal to champion
+    evidence:
+      - {claim: "champion waits tensorcnt 0x0 every iteration; ASM 0x4", value: "0x0 vs 0x4", from: job_context/findings/route.md (h4)}
+      - {claim: "TDM wait remains a stall class even for beat", value: "s_wait_tensorcnt 5.6% of stall", from: job_context/profiling/beat/4-thread-trace/analysis.md}
+    justified_by_round: 5
+    source: {kind: internal, repo: null, commit: null, verified: true}
+    scope:
+      files: [op/current/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py]
+      backend_feasible: yes
+    risk: >
+      Conflicts with g13's LDS ring re-phase, so it cannot merge with it. The BWD prior is negative (depth > 2 lost
+      10-30%). Third arm only if the session budget allows; it is not a fallback any more, since g13 compiles.
+
+adopted_from_reviewer: []
+# No new hypothesis came from the reviewer: its two candidates are the same two mechanisms as planner g13/g14,
+# proposed blind, which is agreement, recorded once. Adopted from its text into the merged entries: the
+# prod_tflops thresholds (>=1105.0 for g14) and the +-2% sclk band. Its r1.i3.g03 reasoning ("diagnostic rider
+# only; the I-cache mechanism itself is false") is also adopted; it is sharper than mine.
+
+agreed:
+  - "bound: latency (low), prod, HBM excluded by the data swap -- both, same citations"
+  - "g13 and g14 are the two mechanisms of this round"
+  - "pool: g02, g06, g08, g10 not valid; g03 a rider only"
+
+disagreements:
+  - candidate: r5.i1.g13
+    planner:
+      position: "Expected prod gain is >=+3% (cycles/call <=1.905), not >=+5%. The port pays for its overlap with the instruction overhead round 4 identified as expensive."
+      grounds:
+        - {claim: "port at 512 VGPR: nops 62 -> 217, s_set_vgpr_msb 240 -> 757, v_mov_b64 240 -> 496", from: rounds/005/2-plan/synthesis_notes.md#S1}
+        - {claim: "round 4's super-additive +6.3% came with v_nop 168 -> 62; nop/dependency count tracked time better than slot count", from: job_context/findings/facts.md}
+        - {claim: "the 13.4% exp-removal ceiling is clock-inflated: prod sclk moves 988 -> 1053 on switching activity alone", from: rounds/005/1-profiling/5-power-wall-analysis/analysis.md}
+    reviewer:
+      position: "Overlapping softmax with the next tile's QK removes most of the exposed per-wave chain, so prod gains >=+5% (>=1137.5 TF/s, <=1.934 ms)."
+      grounds:
+        - {claim: "prod is full-grid and core-clock-scaled; the gap is per-wave execution efficiency", from: rounds/005/1-profiling/6-bound-analysis/analysis.md}
+        - {claim: "beat's WMMA gaps hold softmax work, not LDS-feed stalls (LDS-read stall 0.5%)", from: job_context/profiling/beat/4-thread-trace/analysis.md}
+        - {claim: "proto places 59/66 clean-LO v_exp within 8 instructions of a QK WMMA", from: job_context/findings/route.md (h21)}
+    settled_by: "g13 vs control, 3 slot-rotated sessions at prod, plus clock_probe cycles/call with sclk: >=1.05 -> reviewer; 1.03-1.05 -> planner; <1.015 -> both wrong and L6 closed at n_block 64"
+
+  - candidate: ordering (r5.i1.g13 vs r5.i2.g14)
+    planner:
+      position: "Build and price g13 first. g14 runs in the same session as a separate arm, but g13's result decides whether g14 is shippable at all."
+      grounds:
+        - {claim: "g13 fits at exactly 512 VGPR, so g13+g14 cannot be presumed to merge; shipping g14 first could close g13 on VGPR (LANE proto +1 VGPR over its base)", from: rounds/005/2-plan/synthesis_notes.md#S1}
+        - {claim: "g13 tests the premise under both: that the softmax chain is exposed and hideable in-wave. If it wins, g14's chain-shortening is worth less, because the chain is then under QK", from: job_context/findings/facts.md}
+        - {claim: "g13's compile risk, the only reason to put it second, is discharged: it built clean", from: rounds/005/2-plan/synthesis_notes.md#S1}
+    reviewer:
+      position: "g14 (LANE) first: smaller, self-contained, lower risk; g13 second, because it had only 4 VGPRs of headroom and spilled on non-gated paths before its review."
+      grounds:
+        - {claim: "PK+LANE+defer proto: serial span 218, 0 spill", from: job_context/findings/route.md (h22)}
+        - {claim: "pipeline proto 508/512, spilled on non-causal and gqa1 before the gate", from: job_context/findings/route.md (h21)}
+    settled_by: "both arms measured in one session. If g13 >= g14 + floor at prod, ship g13 and re-queue g14 only after a recompile shows g13+g14 <= 512 at 0 spill. If g14 >= g13, ship g14 and re-open g13 only if a recompile on top of g14 fits"
+
+  - candidate: r1.i4.g04
+    planner:
+      position: "still_valid false: the justification (fast grid underfill) is stale. Beat runs the same 32-WG grid and is 1.8x faster, so underfill is not what separates the two arms."
+      grounds:
+        - {claim: "beat underfill identical; flushed/warm ratio 1.25x beat vs 1.57-1.83x current", from: job_context/profiling/beat/profiling_summary.md}
+        - {claim: "current warm 35.3 us vs flushed 56.16 us; beat flushed 30.73 us", from: rounds/005/1-profiling/5-power-wall-analysis/analysis.md}
+    reviewer:
+      position: "still_valid true but deferred: fast still launches 32 WGs on 256 CUs and sits at 0.547 of beat; it is fast-only and needs a deterministic combine."
+      grounds:
+        - {claim: "32 WGs on 256 CUs; fast 0.547", from: rounds/005/1-profiling/kernel.yaml}
+    settled_by: "the profiling's cheapest next measurement: beat warm vs flushed at fast, in the same session as current. If current's warm time is within ~15% of beat's warm time, the fast gap is per-call/cold-cache and split-KV has no target (g04 -> dead_ends stale); if current is still >=1.3x slower warm, per-CU work at underfill matters and g04 stays"
+
+ordering:
+  proposed: [r5.i1.g13, r5.i2.g14, r5.i3.g15]
+  why: >
+    g13 first. It is the one lever that tests the premise under all three candidates (the softmax chain is exposed
+    and can be hidden in-wave). It has the largest expected gain. Its only disqualifier, VGPR, was measured in
+    plan: 512, 0 spill. Its fit leaves zero headroom, so the order matters: landing g14 first can close g13, but
+    not the reverse. g14 runs as a separate arm from op/current in the same sessions. It discharges the 'must' h22
+    and is the answer if g13 falls under its falsification line. g15 is third: it cannot merge with g13 (LDS ring),
+    its prior is negative, and its value is mainly to close L13 if a session has room. Nothing ships with prod
+    vs_champion under the floor (correction 4). Every arm reports prod sclk and clock_probe cycles/call.

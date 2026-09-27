@@ -1,0 +1,69 @@
+round: 5
+candidate: r5.i1.g13
+outcome: delivered
+
+correctness:
+  unit_tests: fail
+  # op/ut/test_correctness.py hard-codes 50 dB. The same 7 edge cases (49.82-49.99 dB) fail with
+  # every dB line identical to the round-4 champion. Output is bitwise identical to op/current
+  # (determinism 200/200, o=26a89a2db0cd lse=d6ac8da1e101), so this is pre-existing, not introduced here.
+  precision: pass            # validation.py: 16/16 at the spec's 49.0 dB, determinism PASS
+  checked_with: op/validation.py
+  sqnr_db: 49.82             # worst o: short_q causal=False (identical to the champion)
+
+measurements:
+  same_session_references: [rounds/004/op, job_context/op/beat]   # r4 = incumbent = champion of fast/proxy/prod
+  benchmark: op/benchmark.py
+  # one process per shape, arms r5/r4/beat palindromic, median of 101; raw/measure/ (+provenance.yaml)
+  shapes:
+    - {name: fast,  this_round_tflops: 30.20,  best_round_tflops: 34.20,   target_tflops: 65.68,
+       champion_round: 4, champion_tflops: 34.20,   champion_rebuilt: true, ratio: 0.4598, vs_champion: 0.883}
+    - {name: proxy, this_round_tflops: 674.46, best_round_tflops: 871.42,  target_tflops: 1004.00,
+       champion_round: 4, champion_tflops: 871.42,  champion_rebuilt: true, ratio: 0.6718, vs_champion: 0.774}
+    - {name: prod,  this_round_tflops: 912.99, best_round_tflops: 1075.98, target_tflops: 1396.77,
+       champion_round: 4, champion_tflops: 1075.98, champion_rebuilt: true, ratio: 0.6536, vs_champion: 0.8485}
+  score: 0.59507             # incumbent in the same runs: 0.71966
+  regressions:
+    - {shape: fast,  vs_champion: 0.883,  within_band: false}
+    - {shape: proxy, vs_champion: 0.774,  within_band: false}
+    - {shape: prod,  vs_champion: 0.8485, within_band: false}
+
+prediction_check:
+  metric: prod_Mcycles_per_call_randn
+  predicted: {from: 1.964, to: "<=1.905"}
+  measured: 2.3585           # r4 control same session 1.9601; +20.3%; sclk r5 990 vs r4 974 MHz; 1739 vs 1851 W
+  held: false
+  measurement: measurements/clock_probe/
+  reading: >
+    Cycles/call rose 20.3%. The clock was 1.7% higher and power 110 W lower, so this is not a clock
+    or power-wall effect: the kernel spends more cycles idle, not doing more work. The static ISA
+    was used only as a gate. WMMA 256->352 and ds_load 288->384 are mostly the peeled last tile's
+    code copy. s_wait_dscnt 60->112 and s_barrier 12->14 come from the re-phased LDS ring
+    [K(i+1)|V(i)]. The likely cause is that softmax(i) VALU was not placed into the gaps of the
+    QK(i+1) WMMAs; it was serialised behind the new LDS waits, with no room left at the
+    512-VGPR cap. This is NOT confirmed: stall/issue attribution is closed on this chip
+    (correction 5), and no trace was taken. Per plan's falsified_if (0 spill, prod vs_champion
+    below the floor), L6 at n_block 64 in this implementation shape is closed. It belongs in
+    dead_ends, not facts. It does not prove that in-wave overlap cannot pay by another route.
+
+implementation:
+  files_changed: [op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py]
+  deviation_from_plan: >
+    None in the kernel: pipe1.diff only, byte-identical to plan's compiled probe (md5 3f87cb48;
+    gqa4 ISA d530dda8 = plan). Plan compiled gqa4 only; act also compiled gqa2 (512 VGPR, 0 spill).
+    Plan's route_constraint asked act to also build r5.i2.g14 as a separate arm. The act rule
+    "one candidate" forbids it, so g14 was NOT built or measured. Route row 1 (h22, must) is
+    still outstanding. Plan's "3 slot-rotated prod sessions" were replaced by one benchmark.py
+    process per shape (palindromic, 101 iters) plus a 3+3-slot alternated clock_probe; the
+    slots agree to <0.05%.
+  build_failures:
+    - {attempt: 1, error: "no ISA dumped; client grep hit 600 s timeout",
+       root_cause: "tooling slip: FLYDSL_DUMP_IR=1 missing, grep then read stdin; compile itself rc=0"}
+    - {attempt: 2, error: null, root_cause: null}
+
+validation:
+  exit_code: 2
+  # raw/val_final/ (10:44:20Z-10:46:27Z, idle before/after, dmesg clean), against rounds/005/op.
+  # Correctness 16/16 PASS at 49 dB and determinism PASS; the ONLY failure is
+  # speed: geomean candidate/beat 0.5761 < bar 1.0000 (fast 0.4477, proxy 0.6525, prod 0.6546).
+  # rc 2 is validation.py's own code for a failed check. Recorded as measured, not mapped to 0|1.

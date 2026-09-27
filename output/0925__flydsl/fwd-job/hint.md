@@ -39,12 +39,13 @@ Source abbreviations used below:
 | h18 | standing note | Decision index -- check it before choosing a lever | open |
 | h19 | standing note | Report format (every round) | open |
 | h20 | must note | Re-land r1.i1.g01 (longest-first dispatch) -- round 1 lost it to two operator-side gate bugs, now fixed | done r2 (accepted, prod 1018) |
-| h21 | advise note | L6 QK(i+1)/softmax(i) software pipeline -- compiled, gated, 508 VGPR / 0 spill (proto `pipeline`) | open |
+| h21 | advise note | L6 QK(i+1)/softmax(i) software pipeline -- compiled, gated, 508 VGPR / 0 spill (proto `pipeline`) | done (r5) |
 | h22 | must note | L15+L17+L20 softmax arithmetic -- QK->PV serial span -34%, 0 spill (proto `softmax`) | open |
 | h23 | advise note | L13+L14 TDM prefetch depth 3 and clean-loop unroll x2 -- 4 compiled arms (proto `unroll`) | open |
 | h24 | advise note | L8 barrier per 2 KV tiles + split signal/wait -- p22s, 439 VGPR (proto `barriers`) | open |
 | h25 | advise note | L3+L29 in-WG q-tile pairing -- O-store overlap only, dispatch gain is zero (proto `pairing`) | open |
 | h26 | standing note | Closed levers from the 2026-09-27 compile-only prototypes | open |
+| h27 | must standing note | Prototypes h21-h25 are based on ROUND 2 -- port their diff, never copy their files over the round-4+ champion | open |
 
 ---
 
@@ -550,3 +551,13 @@ do not spend a round rebuilding them:
   good.
 - **L15 with `fastmath=fast` on the exp-argument fma:** it licenses LLVM to delete the causal -inf mask.
   Closed as a correctness hazard.
+
+### h27 -- Prototypes h21-h25 are based on ROUND 2 -- port their diff, never copy their files over the round-4+ champion
+
+The compile-only prototypes under `Primus-Turbo/output/0927__flydsl/proto/<name>/` were built from
+round 2's `op/current`. Round 4 then changed the softmax (packed exp argument v_pk_fma_f32 + packed
+row-sum v_pk_add_f32). Copying a prototype's `flydsl_fwd/*.py` onto the working copy would silently
+REVERT round 4 (-6.3% prod). Always: `diff -ru proto/<name>/base proto/<name>/op` and apply that diff
+to the current working copy (resolve conflicts by hand -- h22 overlaps round 4's packed changes most),
+then re-check ISA (VGPR <= 512, 0 spill) before measuring.
+

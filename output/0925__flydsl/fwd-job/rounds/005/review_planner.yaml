@@ -1,0 +1,82 @@
+turn: 1
+by: planner
+
+verdicts:
+  - candidate: r5.i1.g13
+    stance: partial
+    grounds:
+      - claim: "Accepted: nop/msb/v_mov counts are gates, not prices (correction 3). They are withdrawn as grounds for the magnitude."
+        value: "nops 62->217, msb 240->757 -- kept only in `risk`"
+        from: rounds/005/2-plan/synthesis_notes.md#S1
+      - claim: "Accepted: 'prediction false' and 'mechanism dead' are separate lines. L6 closes only below the prod floor."
+        value: "prod floor ~0.4-0.5%"
+        from: job_context/findings/facts.md
+      - claim: "Still held, on a measured (not static) ground: the only card number that bounds exp-hiding is inflated by clock, so +5% is not supported by it."
+        value: "exp removed -13.4% prod (r3); prod sclk 988 -> 1053 MHz from switching activity alone, -7.2% time at -1.2% cycles"
+        from: "job_context/findings/facts.md; rounds/005/1-profiling/5-power-wall-analysis/analysis.md"
+      - claim: "The reviewer's +5% rests on the same kind of evidence it rules out for me: a static overlap count (proto 59/66 v_exp near WMMA) plus another kernel's trace. Neither prices time either."
+        value: "59/66 (proto, round-2 base); 103/330 whole-kernel on the port"
+        from: "job_context/findings/route.md (h21); rounds/005/2-plan/synthesis_notes.md#S1"
+    change: >
+      Prediction stays at prod_Mcycles_per_call_randn <= 1.905 (-3%) and prod_vs_champion >= 1.03. The reviewer's
+      <= 1.866 / >= 1.05 is recorded beside it as a competing prediction, not averaged in. falsified_if is
+      rewritten: "planner prediction false if prod < 1.03; reviewer prediction false if < 1.05; L6 at n_block 64
+      closed only if prod vs_champion < the session's floor (~0.5%) at 0 spill". Nop/msb figures move from
+      grounds to risk.
+
+  - candidate: r5.i2.g14
+    stance: partial
+    grounds:
+      - claim: "Accepted: my prediction was internally inconsistent. 1.925-1.945 Mcycles is 1-2%, but the >=1105 TF/s I had adopted requires ~2%."
+        value: "1105.0 / 1083.33 = 1.020"
+        from: rounds/005/1-profiling/benchmark-results.md
+      - claim: "Not accepted: the 2% edge as my own prediction. The only card number for a cross-lane/sum-tree cut on this body is ~1.3% alone, and LANE removes a comparable, smaller piece of the chain."
+        value: "r4.i2.g10 packed row-sum alone x1.013 prod"
+        from: job_context/findings/facts.md
+    change: >
+      One consistent planner prediction: prod_Mcycles_per_call_randn 1.925-1.945 (-1% to -2%), prod_vs_champion
+      1.01-1.02, prod_tflops >= 1094 (the 1.01 edge). The reviewer's >= 1.02 / <= 1.925 is recorded as its own
+      prediction. Closure only below the prod floor (~0.5%), as the reviewer proposes -- accepted. Precision,
+      spill and permlanex16 checks unchanged.
+
+  - candidate: r5.i3.g15
+    stance: accept
+    grounds:
+      - claim: "The reviewer's number undercuts my evidence: most of beat's TDM stall is its per-WG first load, not the steady-state drain g15 targets."
+        value: "prologue s_wait_tensorcnt ~1.17k cyc/wave x 16 waves = 18.7k of 423,781 stall cycles = 4.4%; steady-state TDM wait <= 1.2% of beat's stall"
+        from: job_context/profiling/beat/4-thread-trace/analysis.md
+      - claim: "The conditional prediction was two predictions; accepted."
+        value: "'<=1.93 if exposed; >=1.97 if hidden'"
+        from: rounds/005/2-plan/step1_planner.yaml
+    change: >
+      Adopt the reviewer's prediction: prod_Mcycles_per_call_randn >= 1.954 (< 0.5% gain), i.e. a null. It is
+      falsified by <= 1.925. The candidate is now a closure arm for L13. A null counts only if the ISA shows
+      s_wait_tensorcnt 0x2 in the clean loop, spill 0/0, and sclk within 2% of control. Run it only if the session
+      budget remains after g13 and g14.
+
+  - candidate: r1.i4.g04
+    stance: accept
+    grounds:
+      - claim: "Beat's identical grid shows underfill is not what separates the arms. It does not show more WGs cannot speed up current: splitting KV cuts per-WG serial work whatever beat does. My 'stale' claim was too strong."
+        value: "32 WGs on 256 CUs, <=12.5% CUs with work; fast 0.547"
+        from: rounds/005/1-profiling/6-bound-analysis/analysis.md
+    change: "still_valid: true, deferred, conditional. Retire to dead_ends as stale only if current's warm time at fast is within ~15% of beat's warm time, measured in the same session."
+
+adopted_from_missing: []   # reviewer listed none
+
+unresolved:
+  - candidate: r5.i1.g13
+    settled_by: "g13 vs champion, 3 slot-rotated sessions at prod, plus clock_probe Mcycles/call with sclk. >= 1.05 -> reviewer's prediction held; 1.03-1.05 -> planner's held, reviewer's false; floor-1.03 -> both false, ship if above floor; < floor -> L6 at n_block 64 closed"
+  - candidate: r5.i2.g14
+    settled_by: "same sessions, g14 as a separate arm from op/current. >= 1.02 -> reviewer; 1.01-1.02 -> planner; < floor -> per-tile cross-lane sum is off the critical path"
+  - candidate: r1.i4.g04
+    settled_by: "beat and current, warm (back-to-back, no flush) vs flushed at fast, one session. Current warm within ~15% of beat warm -> g04 stale; >= 1.3x -> g04 stays open. Both agents accept this line; it is unresolved only because the measurement has not been taken"
+
+control:
+  turn: 1
+  stances: {accept: 2, partial: 2, reject: 0}
+  candidate_ids: [r5.i1.g13, r5.i2.g14, r5.i3.g15, r1.i4.g04]
+  unresolved: [r5.i1.g13, r5.i2.g14, r1.i4.g04]
+  resolved: [r5.i3.g15]
+  ordering: [r5.i1.g13, r5.i2.g14, r5.i3.g15]   # agreed by both
+  missing: 0
