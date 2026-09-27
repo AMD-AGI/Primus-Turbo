@@ -118,3 +118,10 @@ Round 4 (fast) was interrupted mid-opt: loop process group TERM'd, container `fa
 2. `cd ~/code/2026_0910__op-evolve/op-evolve && setsid nohup env PATH="$PWD/.venv/bin:$PATH" op-evolve resume --job gfx1250-flydsl-attn-fwd-20260925-114644 >> LOG.fwd 2>&1 < /dev/null &` (never `--config`; the resolved yaml carries the hand edits: 49 dB, shape_band fast 0.90).
 3. Re-arm monitoring: `output/0925__flydsl/mon/watch.sh <job>` (Monitor) + a 15-min patrol cron.
 Round 5 will be the first deep round.
+
+### Paused 2026-09-27 ~15:30 UTC (machine handed over)
+Round 13 (fast) interrupted mid-opt; champion = round 11 (prod 1111 TF/s, 78.9% of ASM). The CPU study
+`gfx1250-fwd-asm-structure` (4-wave / Q128xKV256 ASM-structure prototype, planned as hint h30) was stopped
+mid-run; its partial output is under `output/0927__flydsl/asm-structure/` -- re-run it before relying on it.
+Resume recipe: same as the 2026-09-25 pause above (docker start, pip uninstall primus_turbo, dmesg_restrict,
+`op-evolve resume`, re-arm watch + 15-min cron with the per-round Chinese table).

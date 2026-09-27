@@ -1,0 +1,111 @@
+diff -ru -x __pycache__ /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-20260925-114644/job_context/op/current/flydsl_fwd/fmha_b16_buffer_managers.py work/A1/flydsl_fwd/fmha_b16_buffer_managers.py
+--- /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-20260925-114644/job_context/op/current/flydsl_fwd/fmha_b16_buffer_managers.py	2026-09-25 11:37:42.990593476 +0000
++++ work/A1/flydsl_fwd/fmha_b16_buffer_managers.py	2026-09-27 14:47:59.459648766 +0000
+@@ -938,6 +938,7 @@
+ 
+ def _tdm_load_views(
+     *,
++    num_warps=_DEFAULT_NUM_WAVES,
+     ptr_x,
+     stride_seq,
+     stride_head,
+@@ -975,7 +976,7 @@
+             g_view,
+             [valid, None],
+             strides=[stride_seq, None],
+-            num_warps=_DEFAULT_NUM_WAVES,
++            num_warps=num_warps,
+             pad_interval=w,
+             pad_amount=row_elems - w,
+         )
+@@ -1013,7 +1014,7 @@
+         if qk_hdim % _WMMA_K != 0:
+             raise ValueError(f"qk_hdim must be a multiple of {_WMMA_K}; got {qk_hdim}")
+         if num_waves != _DEFAULT_NUM_WAVES:
+-            raise NotImplementedError("V2 TDM loader assumes 8 waves")
++            pass  # asm-structure: guard lifted
+         self.qk_hdim = qk_hdim  # compile-time
+         self.gqa_ratio = gqa_ratio  # compile-time
+         self.num_waves = num_waves
+@@ -1164,7 +1165,7 @@
+                 f"n_block must be one of {_N_BLOCK_CHOICES}; got {n_block}"
+             )
+         if num_waves != _DEFAULT_NUM_WAVES:
+-            raise NotImplementedError("V2 TDM loader assumes 8 waves")
++            pass  # asm-structure: guard lifted
+         self.qk_hdim = qk_hdim
+         self.n_block = n_block
+         self.num_waves = num_waves
+@@ -1182,6 +1183,7 @@
+         for 192). Pure (hoistable); issue each with ``fx.copy_atom_call(*view)``, drain with
+         ``tdm_ops.tensor_wait(0)``."""
+         return _tdm_load_views(
++            num_warps=self.num_waves,
+             ptr_x=ptr_K,
+             stride_seq=stride_k_seq,
+             stride_head=stride_k_head,
+@@ -1250,7 +1252,7 @@
+         if n_block % _WMMA_K != 0:
+             raise ValueError(f"n_block must be a multiple of {_WMMA_K}; got {n_block}")
+         if num_waves != _DEFAULT_NUM_WAVES:
+-            raise NotImplementedError("V2 TDM loader assumes 8 waves")
++            pass  # asm-structure: guard lifted
+         self.v_hdim = v_hdim
+         self.n_block = n_block
+         self.num_waves = num_waves
+@@ -1267,6 +1269,7 @@
+         is pow2 -> one copy). Pure; issue each with ``fx.copy_atom_call(*view)``, drain with
+         ``tdm_ops.tensor_wait(0)``."""
+         return _tdm_load_views(
++            num_warps=self.num_waves,
+             ptr_x=ptr_V,
+             stride_seq=stride_v_seq,
+             stride_head=stride_v_head,
+@@ -1586,7 +1589,7 @@
+         if v_hdim % _WMMA_M != 0:
+             raise ValueError(f"v_hdim must be a multiple of {_WMMA_M}; got {v_hdim}")
+         if num_waves != _DEFAULT_NUM_WAVES:
+-            raise NotImplementedError("V2 TDM loader assumes 8 waves")
++            pass  # asm-structure: guard lifted
+         self.v_hdim = v_hdim
+         self.gqa_ratio = gqa_ratio
+         self.num_waves = num_waves
+@@ -1746,7 +1749,7 @@
+         if v_hdim % _WMMA_M != 0:
+             raise ValueError(f"v_hdim must be a multiple of {_WMMA_M}; got {v_hdim}")
+         if num_waves != _DEFAULT_NUM_WAVES:
+-            raise NotImplementedError("V3 assumes 8 waves")
++            pass  # asm-structure: guard lifted
+         self.v_hdim = v_hdim
+         self.gqa_ratio = gqa_ratio
+         self.num_waves = num_waves
+diff -ru -x __pycache__ /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-20260925-114644/job_context/op/current/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py work/A1/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py
+--- /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-20260925-114644/job_context/op/current/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py	2026-09-27 14:38:06.839641705 +0000
++++ work/A1/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py	2026-09-27 14:47:59.459366972 +0000
+@@ -109,7 +109,7 @@
+ # ============================================================================
+ 
+ WAVE_SIZE = 32  # gfx1250 kernels run wave32
+-NUM_WAVES = 8  # "m32x8" — 8 waves per threadgroup
++NUM_WAVES = 4  # "m32x8" — 8 waves per threadgroup
+ BLOCK_SIZE = WAVE_SIZE * NUM_WAVES  # 256 threads
+ 
+ # "m32x8": each wave owns WMMA_ROW_PER_WAVE adjacent 16-row (WMMA M) Q sub-tiles →
+@@ -1869,7 +1869,7 @@
+         "amdgpu-enable-delay-alu": False,
+         # "amdgpu-sched-strategy": "coexec",  # gfx1250 co-exec sched; revisit after named barrier
+     }
+-    _launch.compile_hints["waves_per_eu"] = 2
++    _launch.compile_hints["waves_per_eu"] = 1
+     _launch_fns[key] = _launch
+ 
+ 
+@@ -1976,7 +1976,7 @@
+         "amdgpu-enable-delay-alu": False,
+         # "amdgpu-sched-strategy": "coexec",  # gfx1250 co-exec sched; revisit after named barrier
+     }
+-    _launch.compile_hints["waves_per_eu"] = 2
++    _launch.compile_hints["waves_per_eu"] = 1
+     _launch_fns[key] = _launch
+ 
+ 

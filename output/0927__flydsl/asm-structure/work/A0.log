@@ -1,0 +1,50 @@
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+kernel module: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/work/A0/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/dump/A0/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0
+[flydsl.compile] dump 00_origin -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/dump/A0/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/dump/A0/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/dump/A0/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_rocdl_expand_ops -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/dump/A0/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/03_fly_rocdl_expand_ops.mlir
+[flydsl.compile] dump 04_fly_layout_lowering -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/dump/A0/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/04_fly_layout_lowering.mlir
+[flydsl.compile] dump 05_fly_int_swizzle_simplify -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/dump/A0/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/05_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 06_canonicalize -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/dump/A0/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/06_canonicalize.mlir
+[flydsl.compile] dump 07_fly_convert_atom_call_to_ssa_form -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/dump/A0/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/07_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 08_fly_promote_regmem_to_vectorssa -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/dump/A0/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/08_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 09_convert_fly_to_rocdl -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/dump/A0/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/09_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 10_canonicalize -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/dump/A0/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/10_canonicalize.mlir
+[flydsl.compile] dump 11_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/dump/A0/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/11_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 12_rocdl_attach_target -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/dump/A0/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/12_rocdl_attach_target.mlir
+[flydsl.compile] dump 13_convert_scf_to_cf -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/dump/A0/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/13_convert_scf_to_cf.mlir
+[flydsl.compile] dump 14_convert_cf_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/dump/A0/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/14_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 15_gpu_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/dump/A0/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/15_gpu_to_llvm.mlir
+[flydsl.compile] dump 16_convert_vector_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/dump/A0/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/16_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 17_convert_arith_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/dump/A0/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/17_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 18_convert_func_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/dump/A0/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/18_convert_func_to_llvm.mlir
+[flydsl.compile] dump 19_reconcile_unrealized_casts -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/dump/A0/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/19_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 20_gpu_module_to_binary -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/dump/A0/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/20_gpu_module_to_binary.mlir
+[flydsl.compile] dump 21_llvm_ir -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/dump/A0/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/21_llvm_ir.ll
+[flydsl.compile] dump 22_final_isa -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__flydsl/asm-structure/dump/A0/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/22_final_isa.s
+COMPILE_OK

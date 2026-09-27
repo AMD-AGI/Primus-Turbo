@@ -1,0 +1,4 @@
+A1_thd rc=0
+A1_win_sink rc=0
+A2_thd rc=0
+A2_win_sink rc=0
