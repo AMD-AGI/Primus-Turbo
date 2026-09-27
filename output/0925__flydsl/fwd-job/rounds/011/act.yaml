@@ -1,0 +1,104 @@
+round: 11
+mode: fast
+candidate: r11.i1.g30
+outcome: delivered
+
+correctness:
+  unit_tests: pass            # ut/test_correctness.py --impl arms/M --determinism 200: 16/16, 200/200 bitwise
+  precision: pass             # validation.py correctness block on rounds/011/op: 16/16 at 49 dB
+  checked_with: op/validation.py
+  sqnr_db: 49.82              # minimum over all cases (short_q full, o); spec shapes o 51.23 / 50.89 / 50.83
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/004/op]
+  # b2 (raw/b2): 3 rotated sessions, one implementation image per process, INC re-run back to back.
+  # beat measured in its own process in b1 (raw/b1), same device, same sitting.
+  shapes:
+    - name: fast
+      this_round_tflops: 65.43
+      best_round_tflops: 55.17
+      beat_tflops: 64.5
+      target_tflops: 64.5
+      champion_round: 4
+      champion_tflops: 55.17
+      champion_rebuilt: true
+      ratio: 1.0
+      vs_champion: 1.186
+    - name: proxy
+      this_round_tflops: 932.86
+      best_round_tflops: 929.41
+      beat_tflops: 1021.94
+      target_tflops: 1021.94
+      champion_round: 4
+      champion_tflops: 929.41
+      champion_rebuilt: true
+      ratio: 0.9128
+      vs_champion: 1.0037
+    - name: prod
+      this_round_tflops: 1111.15
+      best_round_tflops: 1102.01
+      beat_tflops: 1407.8
+      target_tflops: 1407.8
+      champion_round: 4
+      champion_tflops: 1102.01
+      champion_rebuilt: true
+      ratio: 0.7893
+      vs_champion: 1.0083
+  score: 0.9007
+  note: >
+    Geomean vs champion 1.0627. fast reaches beat only when each implementation has its own
+    process. With beat in the same process (validation's method), fast is M 41.5-44.7 us vs beat
+    30.7-31.4 us (ratio 0.758), and INC is 63.5-65.0 us there.
+
+validation:
+  exit_code: 2                # speed only: geomean vs beat 0.7735 < 1.0 (fast 0.7583, proxy 0.7829, prod 0.7795)
+
+explored:
+  ran:
+    - "static ISA loop census current vs nodelay (reused rounds/008 loops_census.py) -- showed per-tile levers are exhausted at msb 40/tile, pushed the choice toward the untouched fast shape"
+    - "p1 probe WMMA_ROW_PER_WAVE=1 at fast, compile-only then correctness then 2 one-image timings -- made g30 the lead arm"
+  consulted:
+    - optimization/routes/1-metrics-to-techniques.md
+    - arch/gfx1250/isa.md
+    - backends/flydsl/attention/README.md
+    - backends/flydsl/attention/recipes/hd128.md
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+    - optimization/techniques/6-gfx1250-cdna5-mechanisms.md
+  bound: latency
+  confidence: medium
+  why: "fast grid is 32 WGs on 256 CUs, so time = heaviest WG; halving its per-tile work bought 18.6% with no other change"
+
+arms:
+  - id: r11.i1.g30-without-h29
+    built: "A alone, from op/current: m16x8 copy (R=1) + grid-fill gate in impl.py"
+    tflops: {fast: 64.40, proxy: 929.82, prod: 1102.56}
+    vs_champion: 1.058
+    shipped: false
+    note: "b2 means; b1 alone gave fast 1.204x. proxy/prod kernel byte-identical to INC"
+  - id: h29
+    built: "B alone = rounds/010/op (nodelay, r8.i1.g20), NOT on top of A"
+    tflops: {fast: 54.77, proxy: 927.57, prod: 1111.1}
+    vs_champion: 1.0033
+    shipped: false
+    note: "b1 means vs INC 54.47 / 929.75 / 1102.95: fast 1.005, proxy 0.998, prod 1.0074"
+  - id: r11.i1.g30
+    built: "the merge (g30 + h29), built because neither arm lost; A + delay-alu off in both llvm_options dicts of both kernel files"
+    tflops: {fast: 65.43, proxy: 932.86, prod: 1111.15}
+    vs_champion: 1.0627
+    shipped: true
+    note: "the working copy = candidate; carries h29 (nodelay) inside it"
+
+expected: >
+  A alone fast +7-19% (call it +10%), proxy/prod bit-identical (gated off) -> geomean ~+3%.
+  B alone ~+0.3% geomean. Merge ~+3.3%, clearing the 1.007 bar.
+
+added_to_pool: [r11.i1.g30]
+route_updated: true
+
+implementation:
+  files_changed:
+    - rounds/011/op/impl.py
+    - rounds/011/op/flydsl_fwd/fmha_fwd_prefill_a16w16_m16x8.py
+    - rounds/011/op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py
+  build_failures: []

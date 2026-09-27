@@ -67,6 +67,9 @@ _fwd = _sibling_pkg("flydsl_fwd")
 # The kernel module, under the package's unique name, so a second arm in the same
 # process compiles its own kernels instead of reusing this one's.
 _kern = _il.import_module(f"{_fwd.__name__}.fmha_fwd_prefill_a16w16_m32x8")
+# r11.i1.g30: BLOCK_M=128 variant, used only when the BLOCK_M=256 grid leaves CUs idle.
+_kern_m16 = _il.import_module(f"{_fwd.__name__}.fmha_fwd_prefill_a16w16_m16x8")
+_NUM_CU = None
 
 _ENV_CHECKED = False
 
@@ -110,7 +113,14 @@ def flydsl_attn_fwd(q, k, v, softmax_scale=None, causal=True):
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(d)
 
-    out, lse = _kern.flash_attn_batch_m32x8(
+    # r11.i1.g30: an under-filled grid is bound by its heaviest WG's latency; halving the
+    # rows per wave halves that WG's per-tile work (round 11 p1: fast 1.075-1.194x).
+    global _NUM_CU
+    if _NUM_CU is None:
+        _NUM_CU = torch.cuda.get_device_properties(q.device).multi_processor_count
+    grid_m32 = -(-sq * (hq // hkv) // _kern.BLOCK_M) * hkv * b
+    kern = _kern_m16 if (d == 128 and grid_m32 < _NUM_CU) else _kern
+    out, lse = kern.flash_attn_batch_m32x8(
         q,
         k,
         v,

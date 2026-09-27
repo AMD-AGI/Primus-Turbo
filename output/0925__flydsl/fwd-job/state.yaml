@@ -30,11 +30,11 @@ lifecycle:
 - at: '2026-09-27T14:07:34'
   event: resumed
   spec_version: v000
-best_round: 4
+best_round: 11
 champions:
-  proxy: 4
-  prod: 4
-  fast: 4
+  proxy: 11
+  prod: 11
+  fast: 11
 rounds:
 - round: 0
   progress: []
@@ -539,12 +539,50 @@ rounds:
     0.7836)'
   changed_disagreement: null
 - round: 11
-  progress: []
+  progress:
+  - opt
   mode: fast
   running:
-    module: opt
+    module: reflect
     step: null
-    since: '2026-09-27T14:07:34'
+    since: '2026-09-27T14:43:16'
   seconds:
-    opt: 94.6
-    round: 94.6
+    opt: 2122.3
+    round: 2122.3
+  sessions:
+    opt: e30bc6fd-e3b6-43e1-9b41-3281a307ecbb
+  bound: latency
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - 'speed: geomean candidate/beat 0.7406 < bar 1.0000 (fast 0.7202, proxy 0.7272, prod 0.7754)'
+  score: 0.90551
+  outcome: delivered
+  passed: true
+  accepted: true
+  tflops:
+    fast: 65.43
+    proxy: 932.86
+    prod: 1111.15
+  targets:
+    fast: 64.5
+    proxy: 1021.94
+    prod: 1407.8
+  beats:
+    fast: 64.5
+    proxy: 1021.94
+    prod: 1407.8
+  incumbents:
+    fast: 55.17
+    proxy: 929.41
+    prod: 1102.01
+  gain: 1.0074
+  changed: 3
+  flops:
+    fast: 2149580800.0
+    proxy: 137472507904.0
+    prod: 2199291691008.0
+  guards: {}
+  guard_failed: null
+  note: null
+  changed_disagreement: null

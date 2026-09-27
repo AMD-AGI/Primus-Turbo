@@ -1,3 +1,5 @@
+# r11.i1.g30: copy of fmha_fwd_prefill_a16w16_m32x8.py with WMMA_ROW_PER_WAVE=1 (BLOCK_M=128).
+# A separate source file on purpose: FlyDSL keys its compile cache on source text.
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -118,8 +120,8 @@ BLOCK_SIZE = WAVE_SIZE * NUM_WAVES  # 256 threads
 WMMA_M = 16  # query rows per WMMA tile (the "m16" in m32x8)
 WMMA_N = 16  # kv rows per WMMA tile (the S^T=K@Q^T output's n_block-direction axis)
 WMMA_K = 32  # WMMA contraction depth (bf16 v_wmma_f32_16x16x32); d-tile width
-WMMA_ROW_PER_WAVE = 2  # Q WMMA tiles per wave (the "x2" step from m16x8 to m32x8)
-BLOCK_M = WMMA_M * WMMA_ROW_PER_WAVE * NUM_WAVES  # 256
+WMMA_ROW_PER_WAVE = 1  # r11.i1.g30: m16x8 variant (BLOCK_M=128) for grids that do not fill the device
+BLOCK_M = WMMA_M * WMMA_ROW_PER_WAVE * NUM_WAVES  # 128 here
 
 
 class WarpType(IntEnum):
@@ -1468,7 +1470,7 @@ def _zero_fill_attention(
         lse_rsrc = buffer_ops.create_buffer_resource(
             ptr_LSE, num_records_bytes=lse_num_records_bytes
         )
-        prow = row0 + tid  # one LSE per packed row (BLOCK_SIZE threads == BLOCK_M)
+        prow = row0 + tid  # one LSE per packed row; here BLOCK_M < BLOCK_SIZE
         seq = prow // g
         head = kv_head * g + prow % g
         if has_sink:
@@ -1477,7 +1479,10 @@ def _zero_fill_attention(
         else:
             lse_val = fx.Float32(float("-inf"))
         off = (q_start + seq) * stride_lse_seq + head * stride_lse_head
-        off_masked = (seq < q_len).select(off * fx.Int32(4), fx.Int32(0x7FFFFFFF))
+        # r11.i1.g30: threads tid >= BLOCK_M would write the NEXT WG's rows -> drop them.
+        off_masked = ((seq < q_len) & (tid < fx.Int32(BLOCK_M))).select(
+            off * fx.Int32(4), fx.Int32(0x7FFFFFFF)
+        )
         buffer_ops.buffer_store(
             lse_val, lse_rsrc, off_masked, mask=None, offset_is_bytes=True
         )
