@@ -183,9 +183,12 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     // ops these are absent rather than failing at launch on other archs.
 #ifdef BUILD_MXFP6_BACKEND
     m.def("quantize_mxfp6(Tensor input, int axis) -> Tensor[]");
+    m.def("quantize_mxfp6_out(Tensor input, int axis, Tensor(a!) packed, Tensor(b!) scale) -> ()");
     m.def("quantize_mxfp6_dual(Tensor input) -> Tensor[]");
+    m.def("quantize_mxfp6_dual_out(Tensor input, Tensor(a!) row_packed, Tensor(b!) row_scale, Tensor(c!) col_packed, Tensor(d!) col_scale) -> ()");
     m.def("quantize_mxfp6_fused_dual(Tensor input, Tensor? aux, Tensor? bias, int mode, "
           "bool want_col_sum) -> Tensor[]");
+    m.def("quantize_mxfp6_fused_dual_out(Tensor input, Tensor? aux, Tensor? bias, int mode, Tensor(a!) row_packed, Tensor(b!) row_scale, Tensor(c!) col_packed, Tensor(d!) col_scale) -> ()");
     m.def("quantize_mxfp6_qk_norm_rope_bwd(Tensor input, Tensor dq, Tensor dk, Tensor dv, "
           "Tensor cos, Tensor sin, Tensor wq, Tensor wk, Tensor rstd_q, Tensor rstd_k, "
           "bool want_col_sum) -> Tensor[]");
@@ -220,8 +223,11 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
 #endif // BUILD_MXFP4_BACKEND
 #ifdef BUILD_MXFP6_BACKEND
     m.impl("quantize_mxfp6", quantize_mxfp6);
+    m.impl("quantize_mxfp6_out", quantize_mxfp6_out);
     m.impl("quantize_mxfp6_dual", quantize_mxfp6_dual);
+    m.impl("quantize_mxfp6_dual_out", quantize_mxfp6_dual_out);
     m.impl("quantize_mxfp6_fused_dual", quantize_mxfp6_fused_dual);
+    m.impl("quantize_mxfp6_fused_dual_out", quantize_mxfp6_fused_dual_out);
     m.impl("quantize_mxfp6_qk_norm_rope_bwd", quantize_mxfp6_qk_norm_rope_bwd);
     m.impl("quantize_mxfp6_ln_modulate", quantize_mxfp6_ln_modulate);
 #endif // BUILD_MXFP6_BACKEND
@@ -293,8 +299,11 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
 #endif // BUILD_MXFP4_BACKEND
 #ifdef BUILD_MXFP6_BACKEND
     m.impl("quantize_mxfp6", quantize_mxfp6_meta);
+    m.impl("quantize_mxfp6_out", quantize_mxfp6_out_meta);
     m.impl("quantize_mxfp6_dual", quantize_mxfp6_dual_meta);
+    m.impl("quantize_mxfp6_dual_out", quantize_mxfp6_dual_out_meta);
     m.impl("quantize_mxfp6_fused_dual", quantize_mxfp6_fused_dual_meta);
+    m.impl("quantize_mxfp6_fused_dual_out", quantize_mxfp6_fused_dual_out_meta);
     m.impl("quantize_mxfp6_qk_norm_rope_bwd", quantize_mxfp6_qk_norm_rope_bwd_meta);
     m.impl("quantize_mxfp6_ln_modulate", quantize_mxfp6_ln_modulate_meta);
 #endif // BUILD_MXFP6_BACKEND

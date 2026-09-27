@@ -112,7 +112,11 @@ std::vector<at::Tensor> quantize_mxfp6_row_mxfp4_col_dual_meta(const at::Tensor 
 // (packed, scale) 1-D uint8 blobs, or all four for the dual form; the logical shape is
 // not recoverable from a blob and stays the caller's to carry.
 std::vector<at::Tensor> quantize_mxfp6(const at::Tensor input, const int64_t axis);
+void quantize_mxfp6_out(const at::Tensor input, const int64_t axis, at::Tensor packed, at::Tensor scale);
+void quantize_mxfp6_out_meta(const at::Tensor input, const int64_t axis, at::Tensor packed, at::Tensor scale);
 std::vector<at::Tensor> quantize_mxfp6_dual(const at::Tensor input);
+void quantize_mxfp6_dual_out(const at::Tensor input, at::Tensor row_packed, at::Tensor row_scale, at::Tensor col_packed, at::Tensor col_scale);
+void quantize_mxfp6_dual_out_meta(const at::Tensor input, at::Tensor row_packed, at::Tensor row_scale, at::Tensor col_packed, at::Tensor col_scale);
 std::vector<at::Tensor> quantize_mxfp6_meta(const at::Tensor input, const int64_t axis);
 std::vector<at::Tensor> quantize_mxfp6_dual_meta(const at::Tensor input);
 
@@ -124,6 +128,8 @@ std::vector<at::Tensor> quantize_mxfp6_fused_dual(const at::Tensor              
                                                   const c10::optional<at::Tensor> aux,
                                                   const c10::optional<at::Tensor> bias,
                                                   const int64_t mode, const bool want_col_sum);
+void quantize_mxfp6_fused_dual_out(const at::Tensor input, const c10::optional<at::Tensor> aux, const c10::optional<at::Tensor> bias, const int64_t mode, at::Tensor row_packed, at::Tensor row_scale, at::Tensor col_packed, at::Tensor col_scale);
+void quantize_mxfp6_fused_dual_out_meta(const at::Tensor input, const c10::optional<at::Tensor> aux, const c10::optional<at::Tensor> bias, const int64_t mode, at::Tensor row_packed, at::Tensor row_scale, at::Tensor col_packed, at::Tensor col_scale);
 std::vector<at::Tensor> quantize_mxfp6_fused_dual_meta(const at::Tensor                input,
                                                        const c10::optional<at::Tensor> aux,
                                                        const c10::optional<at::Tensor> bias,

@@ -386,9 +386,104 @@ std::vector<at::Tensor> quantize_mxfp6(const at::Tensor input, const int64_t axi
     return run(input, direction_from_axis(axis));
 }
 
+// Out-variant: pack into caller-provided buffers instead of allocating.
+//
+// A grouped A6W6 GEMM runs G GEMMs in one launch, so its packed operands must form one
+// contiguous buffer with each group written into its own slice. The allocating variant
+// cannot target a slice, and both workarounds measure NEGATIVE against the grouped
+// kernel's gain: aiter's caller-buffer packer is ~36% slower than this kernel, and
+// pack-then-copy is worse still. Either is enough to turn the grouped GEMM's gain into a
+// net loss. The kernel is unchanged; only its destination moves.
+void quantize_mxfp6_out(const at::Tensor input,
+                        const int64_t    axis,
+                        at::Tensor       packed,
+                        at::Tensor       scale) {
+    check_input(input);
+    const c10::DeviceGuard device_guard(input.device());
+    const int64_t          M = input.size(0);
+    const int64_t          N = input.size(1);
+
+    const MXFP6Direction direction = direction_from_axis(axis);
+    TORCH_CHECK(direction != MXFP6Direction::Dual,
+                "quantize_mxfp6_out: dual packing yields four blobs; use the allocating variant");
+    const bool is_row             = direction == MXFP6Direction::Row;
+    const auto [p_bytes, s_bytes] = is_row ? pack_sizes(M, N) : pack_sizes(N, M);
+    TORCH_CHECK(packed.numel() == p_bytes && scale.numel() == s_bytes,
+                "quantize_mxfp6_out: output buffers do not match the packed layout size");
+    TORCH_CHECK(packed.is_contiguous() && scale.is_contiguous(),
+                "quantize_mxfp6_out: output buffers must be contiguous");
+    TORCH_CHECK(packed.scalar_type() == at::kByte && scale.scalar_type() == at::kByte,
+                "quantize_mxfp6_out: output buffers must be uint8");
+
+    at::Tensor unused = empty_blob(0, input);
+    uint8_t   *rp = is_row ? packed.data_ptr<uint8_t>() : unused.data_ptr<uint8_t>();
+    uint8_t   *rs = is_row ? scale.data_ptr<uint8_t>() : unused.data_ptr<uint8_t>();
+    uint8_t   *cp = is_row ? unused.data_ptr<uint8_t>() : packed.data_ptr<uint8_t>();
+    uint8_t   *cs = is_row ? unused.data_ptr<uint8_t>() : scale.data_ptr<uint8_t>();
+
+    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+    if(input.scalar_type() == at::kBFloat16)
+        quantize_mxfp6_impl<dtype::bfloat16>(
+            reinterpret_cast<const dtype::bfloat16 *>(input.data_ptr()), rp, rs, cp, cs,
+            static_cast<int>(M), static_cast<int>(N), direction, stream);
+    else
+        quantize_mxfp6_impl<dtype::float16>(
+            reinterpret_cast<const dtype::float16 *>(input.data_ptr()), rp, rs, cp, cs,
+            static_cast<int>(M), static_cast<int>(N), direction, stream);
+}
+
+void quantize_mxfp6_out_meta(const at::Tensor, const int64_t, at::Tensor, at::Tensor) {}
+
 std::vector<at::Tensor> quantize_mxfp6_dual(const at::Tensor input) {
     return run(input, MXFP6Direction::Dual);
 }
+
+// Dual out-variant: row AND column blobs into caller-provided buffers, one kernel.
+//
+// A grouped GEMM needs the ROW blob of both groups in one contiguous buffer, while the
+// COLUMN blob (which contracts along M) must stay per-stream for wgrad. Splitting the
+// fused dual pack into a row call plus a column call to achieve that costs +19.7 us per
+// pair at [8192,3072], which is a large fraction of what the grouping wins. This keeps it
+// a single kernel and hands each direction its own destination, so the split costs
+// nothing.
+void quantize_mxfp6_dual_out(const at::Tensor input,
+                             at::Tensor       row_packed,
+                             at::Tensor       row_scale,
+                             at::Tensor       col_packed,
+                             at::Tensor       col_scale) {
+    check_input(input);
+    const c10::DeviceGuard device_guard(input.device());
+    const int64_t          M = input.size(0);
+    const int64_t          N = input.size(1);
+
+    const auto [rp_bytes, rs_bytes] = pack_sizes(M, N);
+    const auto [cp_bytes, cs_bytes] = pack_sizes(N, M);
+    TORCH_CHECK(row_packed.numel() == rp_bytes && row_scale.numel() == rs_bytes &&
+                    col_packed.numel() == cp_bytes && col_scale.numel() == cs_bytes,
+                "quantize_mxfp6_dual_out: output buffers do not match the packed layout size");
+    TORCH_CHECK(row_packed.is_contiguous() && row_scale.is_contiguous() &&
+                    col_packed.is_contiguous() && col_scale.is_contiguous(),
+                "quantize_mxfp6_dual_out: output buffers must be contiguous");
+    TORCH_CHECK(row_packed.scalar_type() == at::kByte && row_scale.scalar_type() == at::kByte &&
+                    col_packed.scalar_type() == at::kByte && col_scale.scalar_type() == at::kByte,
+                "quantize_mxfp6_dual_out: output buffers must be uint8");
+
+    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+    if(input.scalar_type() == at::kBFloat16)
+        quantize_mxfp6_impl<dtype::bfloat16>(
+            reinterpret_cast<const dtype::bfloat16 *>(input.data_ptr()),
+            row_packed.data_ptr<uint8_t>(), row_scale.data_ptr<uint8_t>(),
+            col_packed.data_ptr<uint8_t>(), col_scale.data_ptr<uint8_t>(),
+            static_cast<int>(M), static_cast<int>(N), MXFP6Direction::Dual, stream);
+    else
+        quantize_mxfp6_impl<dtype::float16>(
+            reinterpret_cast<const dtype::float16 *>(input.data_ptr()),
+            row_packed.data_ptr<uint8_t>(), row_scale.data_ptr<uint8_t>(),
+            col_packed.data_ptr<uint8_t>(), col_scale.data_ptr<uint8_t>(),
+            static_cast<int>(M), static_cast<int>(N), MXFP6Direction::Dual, stream);
+}
+
+void quantize_mxfp6_dual_out_meta(const at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor) {}
 
 std::vector<at::Tensor> quantize_mxfp6_fused_dual(const at::Tensor                input,
                                                   const c10::optional<at::Tensor> aux,
@@ -396,6 +491,61 @@ std::vector<at::Tensor> quantize_mxfp6_fused_dual(const at::Tensor              
                                                   const int64_t mode, const bool want_col_sum) {
     return run_fused(input, aux, bias, prologue_from_mode(mode), want_col_sum);
 }
+
+// Out-variant of the fused prologue+pack, for grouped GEMMs.
+//
+// The MLP's fc2 wants the ROW blob of both streams contiguous (one grouped GEMM), while the
+// COLUMN blob contracts along M and must stay per-stream -- the two streams have different
+// w2, so a stacked column pack would sum contributions that belong to different weights.
+// One kernel, two destinations. col_sum is not exposed: the grouped path does not use it.
+void quantize_mxfp6_fused_dual_out(const at::Tensor                input,
+                                   const c10::optional<at::Tensor> aux,
+                                   const c10::optional<at::Tensor> bias,
+                                   const int64_t                   mode,
+                                   at::Tensor                      row_packed,
+                                   at::Tensor                      row_scale,
+                                   at::Tensor                      col_packed,
+                                   at::Tensor                      col_scale) {
+    const c10::DeviceGuard device_guard(input.device());
+    const int64_t          M = input.size(0);
+    const int64_t          N = input.size(1);
+
+    const auto [rp_bytes, rs_bytes] = pack_sizes(M, N);
+    const auto [cp_bytes, cs_bytes] = pack_sizes(N, M);
+    TORCH_CHECK(row_packed.numel() == rp_bytes && row_scale.numel() == rs_bytes &&
+                    col_packed.numel() == cp_bytes && col_scale.numel() == cs_bytes,
+                "quantize_mxfp6_fused_dual_out: buffers do not match the packed layout size");
+    TORCH_CHECK(row_packed.is_contiguous() && row_scale.is_contiguous() &&
+                    col_packed.is_contiguous() && col_scale.is_contiguous(),
+                "quantize_mxfp6_fused_dual_out: buffers must be contiguous");
+
+    const MXFP6Prologue prologue = prologue_from_mode(mode);
+    auto                stream   = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+
+    if(input.scalar_type() == at::kBFloat16) {
+        using T = dtype::bfloat16;
+        quantize_mxfp6_fused_impl<T>(
+            reinterpret_cast<const T *>(input.data_ptr()),
+            aux.has_value() ? reinterpret_cast<const T *>(aux->data_ptr()) : nullptr,
+            bias.has_value() ? reinterpret_cast<const T *>(bias->data_ptr()) : nullptr,
+            row_packed.data_ptr<uint8_t>(), row_scale.data_ptr<uint8_t>(),
+            col_packed.data_ptr<uint8_t>(), col_scale.data_ptr<uint8_t>(), nullptr,
+            static_cast<int>(M), static_cast<int>(N), prologue, stream);
+    } else {
+        using T = dtype::float16;
+        quantize_mxfp6_fused_impl<T>(
+            reinterpret_cast<const T *>(input.data_ptr()),
+            aux.has_value() ? reinterpret_cast<const T *>(aux->data_ptr()) : nullptr,
+            bias.has_value() ? reinterpret_cast<const T *>(bias->data_ptr()) : nullptr,
+            row_packed.data_ptr<uint8_t>(), row_scale.data_ptr<uint8_t>(),
+            col_packed.data_ptr<uint8_t>(), col_scale.data_ptr<uint8_t>(), nullptr,
+            static_cast<int>(M), static_cast<int>(N), prologue, stream);
+    }
+}
+
+void quantize_mxfp6_fused_dual_out_meta(const at::Tensor, const c10::optional<at::Tensor>,
+                                        const c10::optional<at::Tensor>, const int64_t,
+                                        at::Tensor, at::Tensor, at::Tensor, at::Tensor) {}
 
 // Kept off quantize_mxfp6_fused_dual's `mode` argument on purpose. This prologue's operands do
 // not fit the (aux, bias) shape, and it runs at a different tile width, so routing it through
