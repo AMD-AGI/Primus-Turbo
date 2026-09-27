@@ -1,0 +1,95 @@
+round: 6
+mode: fast
+candidate: r5.i2.g14
+outcome: delivered
+
+correctness:
+  unit_tests: fail          # rc 2 only from ut's hard-coded 50 dB: the same 7 lines at the same dB as the round-4 champion
+  precision: pass           # validation.py: 16/16 PASS at the spec's 49 dB, determinism 200/200 PASS
+  checked_with: op/validation.py
+  sqnr_db: 49.82            # worst o (short_q full); identical to champion at 2 decimals on all 16 cases
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/004/op]
+  shapes:
+    - name: fast
+      this_round_tflops: 38.60
+      best_round_tflops: 37.66
+      beat_tflops: 65.20
+      target_tflops: 65.20
+      champion_round: 4
+      champion_tflops: 37.66
+      champion_rebuilt: true
+      ratio: 0.5920
+      vs_champion: 1.025
+    - name: proxy
+      this_round_tflops: 794.55
+      best_round_tflops: 803.11
+      beat_tflops: 1023.77
+      target_tflops: 1023.77
+      champion_round: 4
+      champion_tflops: 803.11
+      champion_rebuilt: true
+      ratio: 0.7761
+      vs_champion: 0.989
+    - name: prod
+      this_round_tflops: 1065.79
+      best_round_tflops: 1086.52
+      beat_tflops: 1400.40
+      target_tflops: 1400.40
+      champion_round: 4
+      champion_tflops: 1086.52
+      champion_rebuilt: true
+      ratio: 0.7611
+      vs_champion: 0.981
+  score: 0.7097
+  # Extra prod sessions with rotated arm order: s2 (r4,r6,beat) 1063.29 vs 1079.71 = 0.985;
+  # s3 (beat,r4,r6) 1070.11 vs 1089.89 = 0.982. raw/measure/prod_s{2,3}.json
+
+validation:
+  exit_code: 2              # speed bar only (geomean 0.6191 < 1.0); correctness and determinism PASS
+
+explored:
+  ran:
+    - "rocprofv3 --kernel-trace/--stats: wrote no output on this stack (3 tries); --pmc timestamps used instead"
+    - "rocprofv3 --pmc SQC_ICACHE_MISSES/REQ, SQ_BUSY_CYCLES: current-only 0 misses vs beat-preceded 808 -- changed the route (g03 answered, g16 filed)"
+    - "idle3/5/6/7/8 sleep-backlog probes: the fast penalty is triggered by running beat in the process, not idle -- made g04 stale (1.13 < 1.15)"
+    - "g16 discriminator (r4/r5/r6 builds x alone/beat-run): penalty does not scale with code size -- closed g16 without an arm"
+  consulted:
+    - INDEX.md
+    - backends/flydsl/attention/README.md
+    - backends/flydsl/attention/recipes/hd128.md
+    - backends/flydsl/attention/techniques.md
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+    - optimization/routes/1-metrics-to-techniques.md
+    - optimization/techniques/6-gfx1250-cdna5-mechanisms.md
+    - arch/gfx1250/profiling-surface.md
+    - pitfalls/measurement-traps.md
+  bound: latency
+  confidence: medium
+  why: >
+    prod is on-chip per-wave latency bound (round 5: sclk scaling, HBM excluded, SQ busy 0.981). fast and proxy
+    carry a beat-preceded in-kernel penalty correlated with I-cache refetch (misses 0 -> 808) that does not scale
+    with code size. Removing 6 cross-lane permlanes from the softmax chain made prod 1.5-1.9% slower, so that
+    part of the chain is not what bounds it.
+
+arms:
+  - id: r5.i2.g14
+    built: "h22 L17 per-lane partial row sum, hand-ported onto op/current (round-4 champion)"
+    tflops: {fast: 38.60, proxy: 794.55, prod: 1065.79}
+    vs_champion: 0.981
+    shipped: true           # left in the working copy; acceptance will not promote it
+    note: "prod 0.981/0.985/0.982 in 3 slot-rotated sessions; permlanex16 16->10, VGPR 455, 0 spill; s_set_vgpr_msb 240->322"
+
+expected: >
+  g14: prod +1% (planner +1-2%, reviewer >=2%). Fast and proxy unresolvable, because both sit on the bimodal
+  penalty; judge by prod only. g16: if its instrument confirms that the penalty scales with code lines fetched,
+  a 30-40% smaller hot image should cut about 10-15 us at proxy (+5-8% proxy) and about 10 us at fast.
+
+added_to_pool: [r6.i1.g16]
+route_updated: true
+
+implementation:
+  files_changed: [op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py]
+  build_failures: []
