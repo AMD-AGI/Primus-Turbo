@@ -103,3 +103,9 @@ whose containers may be stopped): `references/env-and-pitfalls.md` §11.
 Related user skills: `gfx1250-card-safety` (read before any GPU run), `flydsl-gfx1250` (idioms; stale on 0.3.4.1,
 cache env, s_waitcnt), `gpu-kernel-campaign` (generic discipline; its 10.160 ms example is the shim).
 The latter two carry dated 2026-09-25 correction notes pointing back here.
+
+## 汇报规范（用户要求，2026-09-27）
+- **所有对用户的汇报、报告、巡检回复一律用中文**（代码、commit message、hint.md 仍用英文）。
+- **每个 round 结束后发一张汇总表**，列至少包括：round、模式（fast/deep）、时间（起止，UTC）、是否接受、prod TF/s 与 ms、相对 baseline 提升、相对上一 champion 提升、占 ASM 比例、proxy/fast TF/s、一句话结论。
+  round 多了以后只保留 baseline、最近两轮和最优轮，中间省略（注明"…省略 N 轮"）。
+- 数据来源：`rounds/NNN/1-opt/act.yaml`（每 shape 的 this_round / champion / beat TF/s）、`rounds/NNN/timing.yaml`（起止时间）；prod FLOP = 2.199292e12，ms = FLOP / (TF/s·1e9)。
