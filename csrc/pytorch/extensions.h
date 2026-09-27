@@ -124,8 +124,8 @@ std::vector<at::Tensor> quantize_mxfp6_fused_dual(const at::Tensor              
                                                   const c10::optional<at::Tensor> aux,
                                                   const c10::optional<at::Tensor> bias,
                                                   const int64_t mode, const bool want_col_sum);
-void quantize_mxfp6_fused_dual_out(const at::Tensor input, const c10::optional<at::Tensor> aux, const c10::optional<at::Tensor> bias, const int64_t mode, at::Tensor row_packed, at::Tensor row_scale, at::Tensor col_packed, at::Tensor col_scale);
-void quantize_mxfp6_fused_dual_out_meta(const at::Tensor input, const c10::optional<at::Tensor> aux, const c10::optional<at::Tensor> bias, const int64_t mode, at::Tensor row_packed, at::Tensor row_scale, at::Tensor col_packed, at::Tensor col_scale);
+void quantize_mxfp6_fused_dual_out(const at::Tensor input, const c10::optional<at::Tensor> aux, const c10::optional<at::Tensor> bias, const int64_t mode, at::Tensor row_packed, at::Tensor row_scale, at::Tensor col_packed, at::Tensor col_scale, c10::optional<at::Tensor> col_sum);
+void quantize_mxfp6_fused_dual_out_meta(const at::Tensor input, const c10::optional<at::Tensor> aux, const c10::optional<at::Tensor> bias, const int64_t mode, at::Tensor row_packed, at::Tensor row_scale, at::Tensor col_packed, at::Tensor col_scale, c10::optional<at::Tensor> col_sum);
 std::vector<at::Tensor> quantize_mxfp6_fused_dual_meta(const at::Tensor                input,
                                                        const c10::optional<at::Tensor> aux,
                                                        const c10::optional<at::Tensor> bias,

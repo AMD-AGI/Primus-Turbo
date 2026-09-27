@@ -497,7 +497,14 @@ std::vector<at::Tensor> quantize_mxfp6_fused_dual(const at::Tensor              
 // The MLP's fc2 wants the ROW blob of both streams contiguous (one grouped GEMM), while the
 // COLUMN blob contracts along M and must stay per-stream -- the two streams have different
 // w2, so a stacked column pack would sum contributions that belong to different weights.
-// One kernel, two destinations. col_sum is not exposed: the grouped path does not use it.
+// One kernel, two destinations.
+//
+// col_sum is an optional third destination. The backward prologue
+// (MXFP6_PROLOGUE_BIAS_GELU_BACKWARD) reduces the tensor it is packing, because the bias
+// gradient is a sum over a tensor the fusion deliberately never materialises. Without it
+// here, fc1's dgrad could not use this out-variant at all and so could not be grouped --
+// and copying the row blob out of the allocating form costs about as much as grouping
+// saves. Pass None when the prologue has no reduction, which is the forward case.
 void quantize_mxfp6_fused_dual_out(const at::Tensor                input,
                                    const c10::optional<at::Tensor> aux,
                                    const c10::optional<at::Tensor> bias,
@@ -505,7 +512,8 @@ void quantize_mxfp6_fused_dual_out(const at::Tensor                input,
                                    at::Tensor                      row_packed,
                                    at::Tensor                      row_scale,
                                    at::Tensor                      col_packed,
-                                   at::Tensor                      col_scale) {
+                                   at::Tensor                      col_scale,
+                                   c10::optional<at::Tensor>       col_sum) {
     const c10::DeviceGuard device_guard(input.device());
     const int64_t          M = input.size(0);
     const int64_t          N = input.size(1);
@@ -518,6 +526,13 @@ void quantize_mxfp6_fused_dual_out(const at::Tensor                input,
     TORCH_CHECK(row_packed.is_contiguous() && row_scale.is_contiguous() &&
                     col_packed.is_contiguous() && col_scale.is_contiguous(),
                 "quantize_mxfp6_fused_dual_out: buffers must be contiguous");
+    if(col_sum.has_value()) {
+        TORCH_CHECK(col_sum->is_contiguous() && col_sum->scalar_type() == at::kFloat,
+                    "quantize_mxfp6_fused_dual_out: col_sum must be contiguous float32");
+        TORCH_CHECK(col_sum->numel() == mxfp6_col_sum_rows(static_cast<int>(M)) * N,
+                    "quantize_mxfp6_fused_dual_out: col_sum does not match the reduction shape");
+    }
+    float *col_sum_ptr = col_sum.has_value() ? col_sum->data_ptr<float>() : nullptr;
 
     const MXFP6Prologue prologue = prologue_from_mode(mode);
     auto                stream   = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
@@ -529,7 +544,7 @@ void quantize_mxfp6_fused_dual_out(const at::Tensor                input,
             aux.has_value() ? reinterpret_cast<const T *>(aux->data_ptr()) : nullptr,
             bias.has_value() ? reinterpret_cast<const T *>(bias->data_ptr()) : nullptr,
             row_packed.data_ptr<uint8_t>(), row_scale.data_ptr<uint8_t>(),
-            col_packed.data_ptr<uint8_t>(), col_scale.data_ptr<uint8_t>(), nullptr,
+            col_packed.data_ptr<uint8_t>(), col_scale.data_ptr<uint8_t>(), col_sum_ptr,
             static_cast<int>(M), static_cast<int>(N), prologue, stream);
     } else {
         using T = dtype::float16;
@@ -538,14 +553,15 @@ void quantize_mxfp6_fused_dual_out(const at::Tensor                input,
             aux.has_value() ? reinterpret_cast<const T *>(aux->data_ptr()) : nullptr,
             bias.has_value() ? reinterpret_cast<const T *>(bias->data_ptr()) : nullptr,
             row_packed.data_ptr<uint8_t>(), row_scale.data_ptr<uint8_t>(),
-            col_packed.data_ptr<uint8_t>(), col_scale.data_ptr<uint8_t>(), nullptr,
+            col_packed.data_ptr<uint8_t>(), col_scale.data_ptr<uint8_t>(), col_sum_ptr,
             static_cast<int>(M), static_cast<int>(N), prologue, stream);
     }
 }
 
 void quantize_mxfp6_fused_dual_out_meta(const at::Tensor, const c10::optional<at::Tensor>,
                                         const c10::optional<at::Tensor>, const int64_t,
-                                        at::Tensor, at::Tensor, at::Tensor, at::Tensor) {}
+                                        at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+                                        c10::optional<at::Tensor>) {}
 
 // Kept off quantize_mxfp6_fused_dual's `mode` argument on purpose. This prologue's operands do
 // not fit the (aux, bias) shape, and it runs at a different tile width, so routing it through
