@@ -40,12 +40,14 @@ Source abbreviations used below:
 | h19 | standing note | Report format (every round) | open |
 | h20 | must note | Re-land r1.i1.g01 (longest-first dispatch) -- round 1 lost it to two operator-side gate bugs, now fixed | done r2 (accepted, prod 1018) |
 | h21 | advise note | L6 QK(i+1)/softmax(i) software pipeline -- compiled, gated, 508 VGPR / 0 spill (proto `pipeline`) | done (r5) |
-| h22 | must note | L15+L17+L20 softmax arithmetic -- QK->PV serial span -34%, 0 spill (proto `softmax`) | open |
+| h22 | must note | L15+L17+L20 softmax arithmetic -- QK->PV serial span -34%, 0 spill (proto `softmax`) | closed r6-r7 (row-sum -1.8%, branch-free rescale -8.3%; packed part landed r4) |
 | h23 | advise note | L13+L14 TDM prefetch depth 3 and clean-loop unroll x2 -- 4 compiled arms (proto `unroll`) | open |
 | h24 | advise note | L8 barrier per 2 KV tiles + split signal/wait -- p22s, 439 VGPR (proto `barriers`) | open |
 | h25 | advise note | L3+L29 in-WG q-tile pairing -- O-store overlap only, dispatch gain is zero (proto `pairing`) | open |
 | h26 | standing note | Closed levers from the 2026-09-27 compile-only prototypes | open |
 | h27 | must standing note | Prototypes h21-h25 are based on ROUND 2 -- port their diff, never copy their files over the round-4+ champion | open |
+| h28 | must standing note | Candidate vs champion is measured WITHOUT beat in the process; beat only in its own process | open |
+| h29 | must note | Re-land r8 nodelay (amdgpu-enable-delay-alu=False): +0.7% prod 3/3, fast/proxy neutral without beat | open |
 
 ---
 
@@ -560,4 +562,28 @@ row-sum v_pk_add_f32). Copying a prototype's `flydsl_fwd/*.py` onto the working 
 REVERT round 4 (-6.3% prod). Always: `diff -ru proto/<name>/base proto/<name>/op` and apply that diff
 to the current working copy (resolve conflicts by hand -- h22 overlaps round 4's packed changes most),
 then re-check ISA (VGPR <= 512, 0 spill) before measuring.
+
+
+### h28 -- Candidate vs champion is measured WITHOUT beat in the process; beat only in its own process
+
+Rounds 3, 6 and 8 all found the same harness artifact: our kernel pays a 20-40 us / I-cache-miss penalty
+whenever the aiter ASM beat ran earlier in the same process (I$ misses 0 -> 808; proxy up to -9%, prod ~-1.7%),
+and benchmark.py's palindromic order `A B C | C B A` puts the arm listed next to beat directly after it every
+time -- so the penalty lands on one arm and flips candidate-vs-champion verdicts (round 8: nodelay +0.6% prod but
+rejected on proxy 0.956, while without beat proxy was 1.004 in 4/4 sessions). The ASM kernel never precedes this
+kernel in training, so the penalty is not part of what we optimise.
+RULE for every round from now on:
+- The numbers written to act.yaml `this_round_tflops` and `champion_tflops` come from benchmark.py runs with
+  `--arms current --arm-path candidate=<round op>` and NO beat arm (one process per shape, rotate arm order
+  across >=3 sessions as before).
+- `beat_tflops` comes from a SEPARATE process per shape (`--arms beat`, or beat+current if you want the ratio).
+- State both in opt.md. validation.py (framework gate) still runs candidate+beat together; that only decides
+  "target met", not acceptance.
+
+### h29 -- Re-land r8 nodelay (amdgpu-enable-delay-alu=False): +0.7% prod 3/3, fast/proxy neutral without beat
+
+Round 8's shipped working copy (`rounds/008/op/`, compile hint amdgpu-enable-delay-alu=False, bitwise-identical
+output) measured prod +0.62..+0.7% in 3/3 rotated sessions and fast 1.002 / proxy 1.004 in 4/4 sessions WITHOUT
+beat; it was rejected only by the post-beat artifact of h28. Start from `rounds/008/op/` (diff vs op/current),
+re-measure per h28 and ship it; then spend the rest of the round on the next lever. Discharge when accepted.
 

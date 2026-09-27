@@ -1,0 +1,118 @@
+round: 8
+mode: fast
+candidate: r8.i1.g20
+outcome: delivered
+
+correctness:
+  unit_tests: fail          # rc 2 only from ut's hard-coded 50 dB: the same 7 lines at the same dB as the round-4 champion (rounds/007/1-opt/raw/ab/ut_inc.out); no new failure
+  precision: pass           # validation.py 16/16 PASS at 49 dB; determinism 200/200, hash o=26a89a2db0cd identical to the champion (bitwise identical output)
+  checked_with: op/validation.py
+  sqnr_db: 49.82            # worst o (short_q full)
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/004/op]
+  shapes:                   # mean of a1-a4 (all shapes, beat in the process, slot-rotated), raw/final/summary.txt
+    - name: fast
+      this_round_tflops: 35.84
+      best_round_tflops: 37.28
+      beat_tflops: 69.90
+      target_tflops: 69.90
+      champion_round: 4
+      champion_tflops: 37.28
+      champion_rebuilt: true
+      ratio: 0.5128
+      vs_champion: 0.961
+    - name: proxy
+      this_round_tflops: 766.90
+      best_round_tflops: 802.06
+      beat_tflops: 1029.62
+      target_tflops: 1029.62
+      champion_round: 4
+      champion_tflops: 802.06
+      champion_rebuilt: true
+      ratio: 0.7448
+      vs_champion: 0.956
+    - name: prod
+      this_round_tflops: 1093.10
+      best_round_tflops: 1086.36
+      beat_tflops: 1405.76
+      target_tflops: 1405.76
+      champion_round: 4
+      champion_tflops: 1086.36
+      champion_rebuilt: true
+      ratio: 0.7776
+      vs_champion: 1.0062
+  score: 0.6784
+  # fast/proxy loss appears only when beat has run earlier in the same process (r8/inc proxy 0.913/0.911 after beat,
+  # 1.006/0.993 before it). Without beat in the process (raw/final/n1-n4) r8/inc is fast 1.002, proxy 1.004 in 4/4.
+  # Prod-only screen (raw/screen, no beat): 1.0074/1.0069/1.0072.
+
+validation:
+  exit_code: 2              # speed bar only (geomean vs beat 0.6273 < 1.0); correctness and determinism PASS
+
+explored:
+  ran:
+    - "clean-loop census of 9 builds with prod numbers (r8.i3.g22): every loser lengthened the loop; g14 was +23 instr/tile, not fewer -- motivated picking loop-shortening arms"
+    - "LLVM flag compile census (r8.i4.g23): nodelay -14 instr/tile, noexpert -3, mmc +5; postra/relaxed-occupancy byte-identical -- chose the three card arms, closed two without a card run"
+    - "proto census (r8.i5.g24): p12s +0.6%, u2pp2 +2.2%, u1pp3 +3.3% instr/tile -- chose p12s over G=2/unroll carriers, priced g15 as an expected loss"
+    - "no-beat fast/proxy sessions n1-n4: showed the shipped arm's fast/proxy loss exists only after beat in the same process"
+  consulted:
+    - INDEX.md
+    - optimization/routes/1-metrics-to-techniques.md
+    - backends/flydsl/attention/README.md
+    - backends/flydsl/attention/techniques.md
+    - backends/flydsl/attention/recipes/hd128.md
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+  bound: latency
+  confidence: medium
+  why: >
+    prod is per-wave issue-latency bound. Removing 14 of 513 s_delay_alu instructions per 64-KV tile bought
+    +0.7% with output unchanged bit for bit. Every build that lengthened the serial per-tile stream has lost.
+    noexpert (-3 instructions, -2.3%) shows the order the scheduler picks also matters, not only the count.
+
+arms:
+  - id: r8.i1.g20
+    built: "nodelay: amdgpu-enable-delay-alu=False in both llvm_options dicts, from op/current"
+    tflops: {fast: 35.84, proxy: 766.90, prod: 1093.10}
+    vs_champion: 1.0062
+    shipped: true
+    note: "prod screen 1.0074/1.0069/1.0072 (3 sessions, no beat); all-shape mean with beat above; bitwise identical output"
+  - id: r8.i1.g20.noexpert
+    built: "ENABLE_SCHED_MODE2=False, from op/current"
+    tflops: {prod: 1059.69}
+    vs_champion: 0.977
+    shipped: false
+    note: "prod 0.970/0.984/0.978 in 3 sessions; clean loop 510 instr (-3) yet slower"
+  - id: r8.i1.g20.mmc
+    built: "amdgpu-sched-strategy=max-memory-clause, from op/current (h12 L24)"
+    tflops: {prod: 1071.75}
+    vs_champion: 0.988
+    shipped: false
+    note: "prod 0.981/0.995/0.989; closes h12 L24 as lost"
+  - id: r8.i2.g21.p12s
+    built: "h24 proto G=1 NG=2 split signal/wait, constants hard-coded, from op/current -- NOT on top of nodelay"
+    tflops: {prod: 1046.51}
+    vs_champion: 0.965
+    shipped: false
+    note: "prod 0.965/0.972/0.958; VGPR 450, 0 spill, loop about +0.6% instr; split lost about 1.7 pt to no-split"
+  - id: r8.i2.g21.p12n
+    built: "h24 proto G=1 NG=2 no split, from op/current"
+    tflops: {prod: 1065.32}
+    vs_champion: 0.982
+    shipped: false
+    note: "prod 0.982/0.991/0.974; the proto ring's own cost at G=1. No merge built: g21 lost"
+
+expected: >
+  g20: nodelay +1% at prod (range -2 to +2.5; sign uncertain), noexpert null (within 0.5%), mmc null to -0.5%.
+  About a 40% chance that any g20 arm clears the 0.47% floor.
+  g21: p12s +1.5% at prod (range 0 to +3), p12n -0.5 to 0. The p12s-minus-p12n split gap should be about +1-2 points.
+  If both win, the merge should be sub-additive: about +2%.
+
+added_to_pool: [r8.i1.g20, r8.i2.g21]
+route_updated: true
+
+implementation:
+  files_changed: [op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py]
+  build_failures:
+    - {attempt: 1, error: "RuntimeError: Unknown LLVM option: amdgpu-insert-delay-alu", root_cause: "wrong cl::opt name; the option is amdgpu-enable-delay-alu"}
