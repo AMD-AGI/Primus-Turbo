@@ -1,0 +1,92 @@
+round: 12
+mode: fast
+candidate: r12.i1.g31
+outcome: delivered
+
+correctness:
+  unit_tests: pass            # ut/test_correctness.py 16/16 + determinism 200/200 bitwise (raw/b3)
+  precision: pass             # validation.py correctness block on rounds/012/op: 16/16 >= 49 dB (raw/m1/val.out)
+  checked_with: op/validation.py
+  sqnr_db: 49.97              # minimum over all cases (unequal_seqlen2 causal, o); spec shapes 51.32 / 50.89 / 50.83
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/011/op]
+  # raw/m1: 3 rotated sessions, one implementation per process, INC re-run back to back.
+  # beat measured in its own process right after (raw/m2), same device, same sitting.
+  shapes:
+    - name: fast
+      this_round_tflops: 65.04
+      best_round_tflops: 65.89
+      beat_tflops: 64.26
+      target_tflops: 64.26
+      champion_round: 11
+      champion_tflops: 65.89
+      champion_rebuilt: true
+      ratio: 1.0
+      vs_champion: 0.9871
+    - name: proxy
+      this_round_tflops: 932.52
+      best_round_tflops: 932.52
+      beat_tflops: 1032.39
+      target_tflops: 1032.39
+      champion_round: 11
+      champion_tflops: 932.52
+      champion_rebuilt: true
+      ratio: 0.9033
+      vs_champion: 1.0
+    - name: prod
+      this_round_tflops: 1111.36
+      best_round_tflops: 1111.03
+      beat_tflops: 1406.75
+      target_tflops: 1406.75
+      champion_round: 11
+      champion_tflops: 1111.03
+      champion_rebuilt: true
+      ratio: 0.79
+      vs_champion: 1.0003
+  score: 0.8978
+  note: >
+    Geomean vs champion 0.996 -- lost. proxy/prod run the untouched m32x8 kernel (identical to INC).
+    With beat in the same process (validation's method) fast is 43.43 us vs beat 32.13 us (0.7398).
+
+validation:
+  exit_code: 2                # speed only: geomean vs beat 0.7650 < 1.0 (fast 0.7398, proxy 0.7834, prod 0.7726)
+
+explored:
+  ran:
+    - "torch.profiler per-kernel at fast, C vs INC (raw/d1) -- split attn 21.21 + combine 4.44 us vs 26.93 us; located the miss in the split kernel's per-tile time, not the combine"
+    - "C seqlen sweep 256-4096 (raw/d1/sw_C.out) -- split loses below sq~2048, wins at 2048; slope 0.98 vs priced 0.72 us/tile"
+  consulted:
+    - INDEX.md
+    - optimization/routes/1-metrics-to-techniques.md
+    - backends/flydsl/attention/techniques.md
+    - arch/gfx1250/profiling-surface.md
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+  bound: latency
+  confidence: medium
+  why: "fast is 32 R=1 WGs on 256 CUs; splitting KV halved the heaviest WG's tiles but per-tile time rose ~1.4x and the combine + second dispatch cost ~6 us"
+
+arms:
+  - id: r12.i1.g31
+    built: "A alone, from op/current: 2-way split-KV on the R=1 path + FlyDSL fixed-order combine"
+    tflops: {fast: 65.04, proxy: 932.52, prod: 1111.36}
+    vs_champion: 0.9958
+    shipped: true
+    note: "lost; left in the working copy as instructed. r10.i3.g28 (arm B) not built this round"
+
+expected: >
+  Expectation: g31 alone fast 1.20-1.30x (25-27 us one-image), proxy/prod byte-identical;
+  geomean +6-9%. I would be wrong about g31 if the partial-O write + combine read cost more than
+  5 us (fp32 partials are 2x M4's 4 MB), or if two WGs on one q tile contend for more than L2 gives.
+
+added_to_pool: [r12.i1.g31, r12.i2.g32]
+route_updated: true
+
+implementation:
+  files_changed:
+    - rounds/012/op/impl.py
+    - rounds/012/op/flydsl_fwd/fmha_fwd_prefill_a16w16_m16x8.py
+  build_failures:
+    - {attempt: 1, error: "NameError: name 'batch' is not defined", root_cause: "FlyDSL AST rewriter makes a kernel-body Python if an scf.if region; names do not escape"}
+    - {attempt: 2, error: "TypeError: for-body: carried variable 'outs' does not match the region entry", root_cause: "range() loop traced as scf.for; a Python list cannot be carried"}

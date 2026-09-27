@@ -33,7 +33,7 @@ lifecycle:
 best_round: 11
 champions:
   proxy: 11
-  prod: 11
+  prod: 12
   fast: 11
 rounds:
 - round: 0
@@ -541,14 +541,12 @@ rounds:
 - round: 11
   progress:
   - opt
+  - reflect
   mode: fast
-  running:
-    module: reflect
-    step: null
-    since: '2026-09-27T14:43:16'
   seconds:
     opt: 2122.3
-    round: 2122.3
+    reflect: 66.2
+    round: 2188.5
   sessions:
     opt: e30bc6fd-e3b6-43e1-9b41-3281a307ecbb
   bound: latency
@@ -586,3 +584,57 @@ rounds:
   guard_failed: null
   note: null
   changed_disagreement: null
+- round: 12
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  sessions:
+    opt: 5a3b311a-732c-4847-9e2a-9c0c7a15ae6c
+  seconds:
+    opt: 1935.5
+    reflect: 52.9
+    round: 1988.4
+  bound: latency
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - 'speed: geomean candidate/beat 0.7283 < bar 1.0000 (fast 0.6560, proxy 0.7545, prod 0.7804)'
+  score: 0.90181
+  outcome: delivered
+  passed: true
+  accepted: false
+  tflops:
+    fast: 65.04
+    proxy: 932.52
+    prod: 1111.36
+  targets:
+    fast: 64.26
+    proxy: 1032.39
+    prod: 1406.75
+  beats:
+    fast: 64.26
+    proxy: 1032.39
+    prod: 1406.75
+  incumbents:
+    fast: 65.89
+    proxy: 932.52
+    prod: 1111.03
+  gain: 1.0002
+  changed: 2
+  flops:
+    fast: 2149580800.0
+    proxy: 137472507904.0
+    prod: 2199291691008.0
+  guards: {}
+  guard_failed: null
+  note: throughput 1.0002x its best ever does not improve on it by more than the 0.70% it must clear (score
+    0.90181, incumbent 0.90614)
+  changed_disagreement: null
+- round: 13
+  progress: []
+  mode: fast
+  running:
+    module: opt
+    step: null
+    since: '2026-09-27T15:19:25'
