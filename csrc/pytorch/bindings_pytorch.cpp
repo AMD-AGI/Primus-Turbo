@@ -188,7 +188,7 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("quantize_mxfp6_dual_out(Tensor input, Tensor(a!) row_packed, Tensor(b!) row_scale, Tensor(c!) col_packed, Tensor(d!) col_scale) -> ()");
     m.def("quantize_mxfp6_fused_dual(Tensor input, Tensor? aux, Tensor? bias, int mode, "
           "bool want_col_sum) -> Tensor[]");
-    m.def("quantize_mxfp6_fused_dual_out(Tensor input, Tensor? aux, Tensor? bias, int mode, Tensor(a!) row_packed, Tensor(b!) row_scale, Tensor(c!) col_packed, Tensor(d!) col_scale) -> ()");
+    m.def("quantize_mxfp6_fused_dual_out(Tensor input, Tensor? aux, Tensor? bias, int mode, Tensor(a!) row_packed, Tensor(b!) row_scale, Tensor(c!) col_packed, Tensor(d!) col_scale, Tensor(e!)? col_sum=None) -> ()");
     m.def("quantize_mxfp6_qk_norm_rope_bwd(Tensor input, Tensor dq, Tensor dk, Tensor dv, "
           "Tensor cos, Tensor sin, Tensor wq, Tensor wk, Tensor rstd_q, Tensor rstd_k, "
           "bool want_col_sum) -> Tensor[]");
