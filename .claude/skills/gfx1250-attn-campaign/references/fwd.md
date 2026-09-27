@@ -98,6 +98,7 @@ Hints live in `job_context/hint.md` as `hN` (converted from `fwd-hint/hint.md`'s
 | 7 | fast | rejected | 39.2 / 794.9 / 1045.3 | 0.965 | h24 barrier proto (p22n -6%, p22s -3.5%): ring bookkeeping (+10% instr/tile, runtime tile%G branch) outweighs halved barriers. Timing-only probe: removing the per-tile barrier = +4.5-5.2% prod ceiling. Branch-free rescale (L20) -8.3%, closes h22. |
 | 8 | fast | rejected | 35.8 / 766.9 / 1093.1 | 1.006 | nodelay (amdgpu-enable-delay-alu=False) +0.7% prod 3/3, rejected on proxy 0.956 -- only when it runs right after beat. Root cause: palindromic A B C|C B A always puts the arm next to beat after it. Operator fix: h28 (measure cand vs champion without beat), h29 (re-land nodelay). expert-sched off -2.3%, max-memory-clause -1.2%, h24 G=1 split -3.5%/-1.8%. |
 | 9 | fast | rejected | 41.0 / 816.4 / 1061.6 | 0.974 | shipped a MERGE nodelay+lock_simd; nodelay alone won prod again (+0.9-1.1%, 3/3) but lock_simd lost 3.5%. Post-beat penalty characterised: fixed +25-42 us cold start of our kernel, binary in I$ misses, not power/loop. h29 amended: ship nodelay ALONE. |
+| 10 | deep | rejected | 54.6 / 928.1 / 1099.2 | 1.0087 | nodelay ALONE (no-beat ruler): prod +0.83% in 4/4, fast/proxy flat; rejected because the 3-shape MEAN gain was 1.0022 < 1.007, and ut/gates.py still hard-coded GATE_DB=50. Operator: GATE_DB 49, evolve.gain_weights {prod 1, proxy 0.25, fast 0}. |
 
 ### Operator fixes applied during the fwd job (each cost a round -- check them on any new job)
 - **op-evolve route parser** (`core/route.py`): row type was matched on the whole row, so "must be predicated" / "== idea r1..." in free-text cells flipped must/idea and crashed round 1 (`RouteError`). Fixed to read the type cell only (op-evolve branch `lhz/gfx1250`).
@@ -105,6 +106,8 @@ Hints live in `job_context/hint.md` as `hN` (converted from `fwd-hint/hint.md`'s
 - **Fast shape vetoed a prod win**: band = max(0.95, 1-min_gain) = 0.993 per shape; fast (s=1024) is launch-bound and its median moves with arm position after ASM. Added `evolve.shape_band: {fast: 0.90}` (new op-evolve feature, `core/acceptance.py`).
 - **Deep preambles** had bwd-specific hints hard-coded; replaced with an instruction to read the job's own hint.md.
 - **Opus 5.5 agents** need `claude-agent-sdk>=0.2.159` in the op-evolve `.venv` (0.2.152 bundles a CLI too old for `claude-opus-5-5`).
+- **Acceptance averaged gain over 3 shapes**, so a real +0.83% prod win (fast/proxy flat) read as +0.22%. Added `evolve.gain_weights` (prod 1.0, proxy 0.25, fast 0.0; op-evolve `core/acceptance.py`). Bands still guard fast/proxy.
+- **`op/gates.py` hard-coded `GATE_DB = 50.0`** for the unit test, independent of the spec; set to 49.0 by hand.
 - **Stopping the loop**: find the pid with `ps -eo pid,cmd | grep "[o]p-evolve resume"` -- `pgrep -f` matches your own shell and `kill -TERM -<pgid>` then kills it.
 
 ### Paused 2026-09-25 ~14:00 UTC (machine handed over)

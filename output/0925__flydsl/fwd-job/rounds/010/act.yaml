@@ -1,0 +1,67 @@
+# act.yaml -- round 10, schema op_evolve/modules/deep_loop/act/schemas/act.yaml
+round: 10
+candidate: r8.i1.g20
+outcome: delivered
+
+correctness:
+  unit_tests: fail
+  # op/ut/test_correctness.py hard-codes GATE_DB = 50.0 (job_context/op/gates.py:21); the spec lowered the
+  # gate to 49 dB because the unmodified baseline reads 49.82-49.99 dB on these edge cases. 8 edge cases fail
+  # at 49.82-49.99 dB (raw/s1/ut.out, rc 2). Output is bitwise identical to the round-4 champion
+  # (determinism hash o=26a89a2db0cd lse=d6ac8da1e101 == champion), and the champion fails ut identically
+  # (r5 act.yaml, r9 ut_lock.out/ut_merged.out). Pre-existing harness discrepancy; not weakened, not "fixed".
+  precision: pass            # validation.py at spec 49.0 dB: 16/16 PASS, determinism 200/200 PASS (raw/s1, raw/s4_validation)
+  checked_with: op/validation.py
+  sqnr_db: 49.82             # worst o: short_q full (identical to champion); prod o 50.83, lse min 81.18
+
+measurements:
+  same_session_references: [rounds/004/op, op/beat]   # round 4 = incumbent and champion of every shape
+  benchmark: op/benchmark.py
+  protocol: >
+    raw/s2: 4 sessions; per session one process per shape with exactly two FlyDSL arms
+    (champion_r4, candidate; order alternated per session), beat in its own process right after; shape order
+    rotated. Values below are medians over the 4 sessions of benchmark.py medians.
+  shapes:
+    - {name: fast,  this_round_tflops: 54.61,   best_round_tflops: 54.87,   target_tflops: 64.93,
+       champion_round: 4, champion_tflops: 54.87,   champion_rebuilt: true, ratio: 0.8411, vs_champion: 0.9943}
+    - {name: proxy, this_round_tflops: 928.11,  best_round_tflops: 925.73,  target_tflops: 1021.86,
+       champion_round: 4, champion_tflops: 925.73,  champion_rebuilt: true, ratio: 0.9083, vs_champion: 1.0026}
+    - {name: prod,  this_round_tflops: 1099.24, best_round_tflops: 1089.76, target_tflops: 1416.18,
+       champion_round: 4, champion_tflops: 1089.76, champion_rebuilt: true, ratio: 0.7762, vs_champion: 1.0083}
+  score: 0.84186             # champion under the same protocol: 0.84017
+  regressions:
+    - {shape: fast, vs_champion: 0.9943, within_band: true}
+    # per session 1.0041/0.9899/0.9872/0.9959; champion fast itself spans 53.55-55.04 TF (2.7%) across sessions
+  noise_floor:
+    prod: "champion 1089.13-1090.02 TF across 4 sessions (0.08%); candidate gain +0.83%, every session +0.69..+0.93%"
+
+prediction_check:
+  metric: prod_vs_champion
+  predicted: {from: 1.000, to: ">=1.007 mean over >=3 rotated sessions, every session >1.003"}
+  measured: "1.0083 mean over 4 sessions (1.0086/1.0093/1.0069/1.0084)"
+  held: true
+  measurement: measurements/pmc_icache_cycles_prod/   # mechanism; the ratio itself is raw/s2/summary.txt
+  mechanism_evidence:
+    SQC_ICACHE_REQ: 0.9657        # 122.24M -> 118.05M, bit-stable across reps: dynamic instruction stream shrank
+    SQC_ICACHE_MISSES: "0 / 0"    # gain is not icache relief
+    SQ_BUSY_CYCLES: 0.9911        # clock-independent, agrees with benchmark +0.83%
+    GRBM_GUI_ACTIVE: 0.9912
+    static_loop: "513 -> 499 insts/tile, s_delay_alu 14 -> 0, VGPR 456, 0 spill (raw/s1/isa_census.txt)"
+  reading: >
+    Held. Removing the 14 s_delay_alu per tile shortens the executed instruction stream (icache requests -3.4%)
+    and cuts ~0.9% of cycles at prod, i.e. about 1/3 of the 2.73% instruction-count cut converts (plan said
+    ~1/4). Issue-slot vs fetch-bandwidth attribution is not separable on this chip (no stall counters; closed).
+  cell: faster_held
+
+implementation:
+  files_changed: [flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py]
+  change: '"amdgpu-enable-delay-alu": False added to both _launch.compile_hints["llvm_options"] dicts (2 lines)'
+  deviation_from_plan: null
+  build_failures:
+    - {attempt: 1, error: null, root_cause: null}   # built cleanly first time after compile-cache clear
+
+validation:
+  exit_code: 2
+  # own run, raw/s4_validation/val.out: correctness 16/16 PASS, determinism PASS; the only failure is
+  # "speed: geomean candidate/beat 0.6958 < bar 1.0000 (fast 0.5639, proxy 0.7631, prod 0.7827)".
+  # validation.py exits 2 (not 1) on failure.

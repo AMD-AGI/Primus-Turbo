@@ -3,7 +3,7 @@ meta:
   id: 20260925-114644
   started_at: '2026-09-25T11:46:44'
   spec_version: v000
-  elapsed_seconds: 8094.1
+  elapsed_seconds: 28337.7
 setup:
   job_setup:
     status: done
@@ -25,6 +25,9 @@ lifecycle:
   event: resumed
   spec_version: v000
 - at: '2026-09-27T08:30:04'
+  event: resumed
+  spec_version: v000
+- at: '2026-09-27T14:07:34'
   event: resumed
   spec_version: v000
 best_round: 4
@@ -486,12 +489,62 @@ rounds:
 - round: 10
   progress:
   - profiling
+  - plan
+  - act
+  - reflect
   mode: deep
-  running:
-    module: plan
-    step: 00_analyse(planner, reviewer in parallel)
-    since: '2026-09-27T13:12:40'
   seconds:
     profiling: 0.0
-    round: 0.0
+    plan: 1332.3
+    act: 1302.0
+    reflect: 439.3
+    round: 3073.6
   bound: latency
+  sessions:
+    planner: 266204f9-da03-48c2-b23a-9669e82e79d5
+    reviewer: 01a0e2ff-0c5e-7031-9114-5279028d1f32
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - 'speed: geomean candidate/beat 0.6832 < bar 1.0000 (fast 0.5520, proxy 0.7373, prod 0.7836)'
+  score: 0.84184
+  outcome: delivered
+  passed: false
+  accepted: false
+  tflops:
+    fast: 54.61
+    proxy: 928.11
+    prod: 1099.24
+  targets:
+    fast: 64.93
+    proxy: 1021.86
+    prod: 1416.18
+  beats:
+    fast: 64.93
+    proxy: 1021.86
+    prod: 1416.18
+  incumbents:
+    fast: 54.87
+    proxy: 925.73
+    prod: 1089.76
+  gain: 1.0022
+  changed: 1
+  flops:
+    fast: 2149580800.0
+    proxy: 137472507904.0
+    prod: 2199291691008.0
+  guards: {}
+  guard_failed: null
+  note: 'delivered: speed: geomean candidate/beat 0.6832 < bar 1.0000 (fast 0.5520, proxy 0.7373, prod
+    0.7836)'
+  changed_disagreement: null
+- round: 11
+  progress: []
+  mode: fast
+  running:
+    module: opt
+    step: null
+    since: '2026-09-27T14:07:34'
+  seconds:
+    opt: 94.6
+    round: 94.6

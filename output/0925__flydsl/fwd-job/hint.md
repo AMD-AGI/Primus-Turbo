@@ -47,7 +47,7 @@ Source abbreviations used below:
 | h26 | standing note | Closed levers from the 2026-09-27 compile-only prototypes | open |
 | h27 | must standing note | Prototypes h21-h25 are based on ROUND 2 -- port their diff, never copy their files over the round-4+ champion | open |
 | h28 | must standing note | Candidate vs champion is measured WITHOUT beat in the process; beat only in its own process | open |
-| h29 | must note | Re-land r8 nodelay (amdgpu-enable-delay-alu=False): +0.7% prod 3/3, fast/proxy neutral without beat | open |
+| h29 | must note | Re-land r8 nodelay (amdgpu-enable-delay-alu=False): +0.7% prod 3/3, fast/proxy neutral without beat | done (r10) |
 
 ---
 
