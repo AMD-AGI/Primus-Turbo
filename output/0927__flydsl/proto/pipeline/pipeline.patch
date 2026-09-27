@@ -1,0 +1,357 @@
+diff -ru -x __pycache__ base/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py
+--- base/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py	2026-09-27 08:31:53.333361479 +0000
++++ op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py	2026-09-27 08:48:30.225696065 +0000
+@@ -180,6 +180,26 @@
+ # global_store_async_from_lds_b128.
+ O_VARIANT = "v3"
+ 
++# L6 software pipelining (prototype 2026-09-27, compile-only). When True (TDM loader only), the
++# KV loop is skewed by one tile: iteration i runs QK(i+1) and softmax(i)+PV(i) in ONE basic block
++# with no sched_barrier fence between them, so the scheduler can hide softmax(i)'s VALU/TRANS
++# under QK(i+1)'s WMMAs. S is double-buffered in registers: S(i) arrives as loop-carried state,
++# S(i+1) is produced in the body. The LDS ring is re-phased so V lags K by one tile: a slot holds
++# [K(i+1) | V(i)], so iteration i reads ONE slot and prefetches [K(i+2) | V(i+1)] into the other
++# (still 2 slots, still one WG barrier per tile). Prologue: K(start) -> slot 0, QK(start);
++# [K(start+1) | V(start)] -> slot 1. The last tile's softmax+PV is peeled after the loop.
++# False = the round-2 champion body, byte-identical.
++PIPELINE_QK_SOFTMAX = True
++# gqa ratios whose pipelined kernel compiled spill-free (causal, qk_hdim=128, bf16).
++PIPE_GQA_OK = (2, 4)
++# Optional explicit interleave hint for the pipelined body: after the body's IR, emit
++# PIPE_SGB_ROUNDS x [1 WMMA, PIPE_SGB_VALU VALU, PIPE_SGB_TRANS TRANS] sched_group_barriers
++# (masks 0x008 / 0x002 / 0x400). 0 rounds = leave the scheduler free (no fences at all).
++PIPE_SGB_ROUNDS = 0
++PIPE_SGB_VALU = 4
++PIPE_SGB_TRANS = 2
++PIPE_SGB_DSRD = 0  # V ds_load_tr16 per round pulled into the QK/softmax stream (0 = none)
++
+ # NOTE: the remaining tiling constants (chunk sizes, K/V write-tile + V swizzle
+ # granularity) live inside fmha_b16_buffer_managers.py — they are intrinsic to the
+ # managers' LDS layouts, so the kernel no longer declares them here.
+@@ -729,6 +749,20 @@
+     """
+     lane_idx = _lane_id()
+     kv_head, q_head_idx, seq_idx = _packed_tile_indices(gqa_ratio, warp_idx, lane_idx)
++    # L6 gate (review 2026-09-27): the pipelined body is enabled ONLY for the kernel configs
++    # whose compile-only ISA was verified spill-free. At qk_hdim=128/bf16 it compiles to
++    # 508 VGPR / 0 spill for causal gqa=2 and gqa=4, but spills for NON-CAUSAL (92 VGPR,
++    # 372 B scratch, every gqa) and for causal gqa=1 (85 VGPR, 344 B) -- and a spill can
++    # wedge the card. Every other config falls back to the champion body (byte-identical).
++    _PIPE = (
++        PIPELINE_QK_SOFTMAX
++        and USE_TDM_LOADER
++        and mask_right
++        and not mask_left
++        and gqa_ratio in PIPE_GQA_OK
++        and qk_hdim == 128
++        and v_hdim == 128
++    )
+ 
+     # K/V staging: N_KV_PP ping-pong slots ([K.pp0|V.pp0][K.pp1|V.pp1]), blocks floored
+     # at 64KB. O reuses a non-current slot; Q time-shares slot 1, so the slot must also
+@@ -887,13 +921,60 @@
+             kv_valid=_kv_valid(start_row0),
+         )
+         q_frags = q_mgr.load_q_to_vgpr_part2(scale=softmax_scale)
+-        for _v in k_views:
+-            fx.copy_atom_call(*_v)
+-        for _v in v_views:
+-            fx.copy_atom_call(*_v)
+-        tdm_ops.tensor_wait(0)
+-        gpu.barrier()
++        if _PIPE:
++            # Pipelined prologue: K(start) -> slot 0 only (V(start) goes to slot 1 below).
++            for _v in k_views:
++                fx.copy_atom_call(*_v)
++            tdm_ops.tensor_wait(0)
++            # Q's ds_loads read slot 1 (per-wave regions, but slot-1 TDM below is split over
++            # all 8 waves): retire them before the barrier that licenses the slot-1 overwrite.
++            rocdl.s_wait_dscnt(0)
++            gpu.barrier()
++            # [K(start+1) | V(start)] -> slot 1; consumed by the first pipelined step (drained
++            # at its top barrier). Branch-free (an scf.if here re-splits the prologue and tipped
++            # RA into 82 spills): when tile start+1 does not exist (n_iter == 1) the K copy is
++            # re-pointed at tile start itself -- an in-bounds duplicate into slot 1's K region,
++            # which nothing reads (the peel reads only V from slot 1; O then uses slot 0).
++            k1_row0 = (start_tile + fx.Int32(1) < fx.Int32(n_tiles)).select(
++                start_row0 + fx.Int32(n_block), start_row0
++            )
++            for _v in k_mgr.load_views(
++                ptr_lds=_k_lds_buf(1),
++                ptr_K=ptr_K,
++                stride_k_seq=stride_k_seq,
++                stride_k_head=stride_k_head,
++                kv_head=kv_head,
++                kv_row0=kv_start + k1_row0,
++                kv_valid=_kv_valid(k1_row0),
++            ):
++                fx.copy_atom_call(*_v)
++            for _v in v_mgr.load_views(
++                ptr_lds=_v_lds_buf(1),
++                ptr_V=ptr_V,
++                stride_v_seq=stride_v_seq,
++                stride_v_head=stride_v_head,
++                kv_head=kv_head,
++                kv_row0=kv_start + start_row0,
++                kv_valid=_kv_valid(start_row0),
++            ):
++                fx.copy_atom_call(*_v)
++            # QK(start) from slot 0 overlaps the slot-1 TDM.
++            s_first = _qk_gemm(
++                k_values=k_mgr.load_k_to_reg(
++                    k_mgr.ds_load_ptrs(ptr_lds=_k_lds_buf(0), lane_idx=lane_idx)
++                ),
++                q_frags_list=q_frags,
++                n_block=n_block,
++            )
++        else:
++            for _v in k_views:
++                fx.copy_atom_call(*_v)
++            for _v in v_views:
++                fx.copy_atom_call(*_v)
++            tdm_ops.tensor_wait(0)
++            gpu.barrier()
+     else:
++        assert not _PIPE, "_PIPE needs USE_TDM_LOADER"
+         k_gptrs, k_lds_ptrs, k_imm_offs = k_mgr.global_load_ptrs(
+             ptr_lds=_k_lds_buf(start_pp),
+             ptr_K=ptr_K,
+@@ -968,12 +1049,19 @@
+     # swapped curr<->next each iteration (buffer selected by pointer). Base count per mgr
+     # is manager-defined (V1: 2, V2: 1) — carried generically. Same machinery for V1/V2;
+     # only the global->LDS ISSUE (_addr_phase/_prefetch/_drain) differs. ----
+-    k_lds_ld_curr = k_mgr.ds_load_ptrs(ptr_lds=_k_lds_buf(0), lane_idx=lane_idx)
+-    v_lds_ld_curr = v_mgr.ds_load_ptrs(ptr_lds=_v_lds_buf(0), lane_idx=lane_idx)
+-    k_lds_ld_next = k_mgr.ds_load_ptrs(ptr_lds=_k_lds_buf(1), lane_idx=lane_idx)
+-    v_lds_ld_next = v_mgr.ds_load_ptrs(ptr_lds=_v_lds_buf(1), lane_idx=lane_idx)
++    # Pipelined: the first step reads slot 1 ([K(start+1) | V(start)]), prefetches into slot 0.
++    _cur0, _nxt0 = (1, 0) if _PIPE else (0, 1)
++    k_lds_ld_curr = k_mgr.ds_load_ptrs(ptr_lds=_k_lds_buf(_cur0), lane_idx=lane_idx)
++    v_lds_ld_curr = v_mgr.ds_load_ptrs(ptr_lds=_v_lds_buf(_cur0), lane_idx=lane_idx)
++    k_lds_ld_next = k_mgr.ds_load_ptrs(ptr_lds=_k_lds_buf(_nxt0), lane_idx=lane_idx)
++    v_lds_ld_next = v_mgr.ds_load_ptrs(ptr_lds=_v_lds_buf(_nxt0), lane_idx=lane_idx)
+     _NKB = len(k_lds_ld_curr)  # ds bases per K buffer (V1: 2, V2: 1)
+     _NVB = len(v_lds_ld_curr)
++    _NKV = n_block // WMMA_N
++    _S_BASE = len(_init)  # pipelined only: R x NKV v8-f32 S(i) (the tile softmax runs on next)
++    if _PIPE:
++        for qt in range(R):
++            _init += [_raw(v) for v in s_first[qt]]
+     _PTR_BASE = len(_init)
+     _init = _init + k_lds_ld_curr + k_lds_ld_next + v_lds_ld_curr + v_lds_ld_next
+ 
+@@ -1214,6 +1302,160 @@
+         out += k_next + k_curr + v_next + v_curr
+         return out
+ 
++    # ========================================================================
++    # L6 pipelined step (PIPELINE_QK_SOFTMAX). Tile i's softmax + PV, fused with tile i+1's
++    # QK in one basic block. Resident at the top barrier: slot cur = [K(i+1) | V(i)] (prefetched
++    # by step i-1, or by the prologue for i == start_tile). Prefetch [K(i+2) | V(i+1)] into the
++    # other slot, whose last readers (step i-1: K(i), V(i-1)) are behind the same barrier.
++    # ``last`` = the peeled final tile: no QK, no prefetch, no pointer yield.
++    # ========================================================================
++    def pipe_step(i, state, *, mask_left, mask_right, kv_len, last=False):
++        nxt_pp = (i - start_tile) % fx.Int32(2)  # prefetch destination slot (local parity)
++        m_prev = [fx.Float32(state[qt * _QS + 0]) for qt in range(R)]
++        d_prev = [fx.Float32(state[qt * _QS + 1]) for qt in range(R)]
++        o_acc = [
++            [fx.Vector(state[qt * _QS + 2 + dt]) for dt in range(d_tiles)]
++            for qt in range(R)
++        ]
++        s_prev = [
++            [state[_S_BASE + qt * _NKV + kv] for kv in range(_NKV)] for qt in range(R)
++        ]
++        k_curr = list(state[_PTR_BASE + 0 * _NKB : _PTR_BASE + 1 * _NKB])
++        k_next = list(state[_PTR_BASE + 1 * _NKB : _PTR_BASE + 2 * _NKB])
++        _VB0 = _PTR_BASE + 2 * _NKB
++        v_curr = list(state[_VB0 + 0 * _NVB : _VB0 + 1 * _NVB])
++        v_next = list(state[_VB0 + 1 * _NVB : _VB0 + 2 * _NVB])
++
++        def _drain_barrier():
++            tdm_ops.tensor_wait(0)
++            rocdl.sched_barrier(0)
++            gpu.barrier()
++            rocdl.sched_barrier(0)
++
++        s_next = None
++        if last:
++            _drain_barrier()
++        else:
++            k2_row0 = (i + fx.Int32(2)) * fx.Int32(n_block)
++            v1_row0 = (i + fx.Int32(1)) * fx.Int32(n_block)
++            k_views = k_mgr.load_views(
++                ptr_lds=_k_lds_buf(nxt_pp),
++                ptr_K=ptr_K,
++                stride_k_seq=stride_k_seq,
++                stride_k_head=stride_k_head,
++                kv_head=kv_head,
++                kv_row0=kv_start + k2_row0,
++                kv_valid=_kv_valid(k2_row0),
++            )
++            v_views = v_mgr.load_views(
++                ptr_lds=_v_lds_buf(nxt_pp),
++                ptr_V=ptr_V,
++                stride_v_seq=stride_v_seq,
++                stride_v_head=stride_v_head,
++                kv_head=kv_head,
++                kv_row0=kv_start + v1_row0,
++                kv_valid=_kv_valid(v1_row0),
++            )
++
++            def _prefetch():
++                # V(i+1) always exists inside the loop (i <= n_tiles-2). K(i+2) is skipped on
++                # the second-to-last tile, like the champion's dead-prefetch skip.
++                for _v in v_views:
++                    fx.copy_atom_call(*_v)
++
++                @flyc.jit
++                def _issue_k():
++                    if i + fx.Int32(2) < fx.Int32(n_tiles):
++                        for _v in k_views:
++                            fx.copy_atom_call(*_v)
++
++                _issue_k()
++
++            if warp_type == WarpType.LO_WARP:
++                _drain_barrier()
++                k_values = k_mgr.load_k_to_reg(k_curr)
++                _prefetch()
++                _named_barrier_pair(warp_idx)
++            else:
++                _drain_barrier()
++                _prefetch()
++                _named_barrier_pair(warp_idx)
++                k_values = k_mgr.load_k_to_reg(k_curr)
++            # Keep the K ds_load burst out of the WMMA stream (same fence as the champion).
++            rocdl.sched_barrier(0)
++            # QK(i+1): independent of softmax(i) below -- NO fence between them.
++            s_next = _qk_gemm(k_values=k_values, q_frags_list=q_frags, n_block=n_block)
++
++        # V(i) transpose burst (slot cur, resident since the top barrier).
++        v_values = v_mgr.load_v_to_reg(v_curr)
++
++        kv_tile_start = i * fx.Int32(n_block)
++        q_max_list = [
++            seq_idx[qt] + causal_off + window_right if mask_right else None
++            for qt in range(R)
++        ]
++        q_min_list = [
++            seq_idx[qt] + causal_off - window_left if mask_left else None
++            for qt in range(R)
++        ]
++        p_list, m_new_list, d_new_list, corr_list, do_rescale_list = _softmax(
++            s_list=s_prev,
++            m_prev_list=m_prev,
++            d_prev_list=d_prev,
++            lane_idx=lane_idx,
++            n_block=n_block,
++            kv_pos_base=kv_tile_start,
++            q_max_list=q_max_list,
++            q_min_list=q_min_list,
++            kv_len=kv_len,
++            elem_dtype=elem_dtype,
++        )
++        if not last and PIPE_SGB_ROUNDS > 0:
++            for _ in range(PIPE_SGB_ROUNDS):
++                rocdl.sched_group_barrier(0x008, 1, 0)
++                rocdl.sched_group_barrier(0x002, PIPE_SGB_VALU, 0)
++                rocdl.sched_group_barrier(0x400, PIPE_SGB_TRANS, 0)
++                if PIPE_SGB_DSRD:
++                    rocdl.sched_group_barrier(0x100, PIPE_SGB_DSRD, 0)
++
++        @flyc.jit
++        def _maybe_rescale(o_vecs, corr_vec, do_rescale):
++            result = o_vecs
++            if do_rescale:
++                result = [ov * corr_vec for ov in o_vecs]
++            return result
++
++        o_resc_list = []
++        for qt in range(R):
++            corr_vec = fx.Vector.from_elements(
++                [corr_list[qt]], fx.Float32
++            ).broadcast_to(8)
++            o_vecs = [fx.Vector(_ir(o_acc[qt][dt])) for dt in range(d_tiles)]
++            if do_rescale_list[qt] is None:
++                o_resc = [ov * corr_vec for ov in o_vecs]
++            else:
++                o_resc = list(_maybe_rescale(o_vecs, corr_vec, do_rescale_list[qt]))
++            o_resc_list.append(o_resc)
++
++        o_new_list = _pv_gemm(
++            v_values=v_values,
++            p_list=p_list,
++            v_hdim=v_hdim,
++            n_block=n_block,
++            o_acc_list=o_resc_list,
++        )
++        out = []
++        for qt in range(R):
++            out += [_raw(m_new_list[qt]), _raw(d_new_list[qt])] + [
++                _raw(o) for o in o_new_list[qt]
++            ]
++        if last:
++            return out
++        for qt in range(R):
++            out += [_raw(v) for v in s_next[qt]]
++        out += k_next + k_curr + v_next + v_curr
++        return out
++
+     # ---- Stream tiles [start_tile, n_tiles) through 3 sub-loops split by the attention
+     # band so interior tiles fully inside the band skip masking. clean_lo/clean_hi are
+     # runtime split points, but the mask on/off per sub-loop is COMPILE-TIME (each loop
+@@ -1251,11 +1493,13 @@
+         clean_lo = start_tile
+     clean_lo = fx.min(fx.max(clean_lo, start_tile), clean_hi)
+ 
++    _step = pipe_step if _PIPE else main_loop
++
+     @flyc.jit
+     def _run_tiles(state, lo_i32, hi_i32, *, mask_left, mask_right, kv_len):
+         final_state = state
+         for tile, carried in range(fx.Index(lo_i32), fx.Index(hi_i32), 1, init=state):
+-            next_state = main_loop(
++            next_state = _step(
+                 fx.Int32(tile),
+                 list(carried),
+                 mask_left=mask_left,
+@@ -1278,14 +1522,26 @@
+     state = _run_tiles(
+         state, clean_lo, clean_hi, mask_left=None, mask_right=None, kv_len=None
+     )
++    # Pipelined: the loops cover softmax tiles [start_tile, n_last); tile n_last is peeled (its
++    # step has no QK(n_last+1)). Split points are unchanged (clean_hi <= n_last already), and
++    # each loop's mask flags apply to the tile its body runs softmax on (i), not to i+1.
+     state = _run_tiles(
+         state,
+         clean_hi,
+-        fx.Int32(n_tiles),
++        n_last if _PIPE else fx.Int32(n_tiles),
+         mask_left=mask_left,
+         mask_right=mask_right,
+         kv_len=kv_len,
+     )
++    if _PIPE:
++        state = pipe_step(
++            n_last,
++            list(state),
++            mask_left=mask_left,
++            mask_right=mask_right,
++            kv_len=kv_len,
++            last=True,
++        )
+     final = state
+ 
+     # ========================================================================
+@@ -1317,7 +1573,9 @@
+     assert (
+         o_mgr.get_lds_size_in_byte() <= slot_bytes
+     ), f"O ring budget {o_mgr.get_lds_size_in_byte()}B exceeds K|V slot {slot_bytes}B"
+-    non_cur_pp = n_iter % fx.Int32(N_KV_PP)
++    # Pipelined: the peeled last step read slot n_iter%2; the free slot is (n_iter+1)%2, last
++    # read by step n_iter-2 (or by the prologue QK when n_iter == 1), behind the peel's barrier.
++    non_cur_pp = (n_iter + fx.Int32(int(_PIPE))) % fx.Int32(N_KV_PP)
+     if not USE_TDM_LOADER:
+         rocdl.s_wait_asynccnt(
+             0

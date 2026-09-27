@@ -1,0 +1,294 @@
+--- base/kernels.py	2026-09-27 08:34:10.320402501 +0000
++++ op/kernels.py	2026-09-27 08:35:50.711833731 +0000
+@@ -50,6 +50,15 @@
+ WAVE = 32                    # gfx1250 dispatches wave32; gfx942's odo says 64 here
+ LOG2E = 1.4426950408889634
+ NEG = -3.0e38
++import os as _os
++# FUSED5 (2026-09-27, compile-only prototype): k_dkdv also computes dQ partials = dS @ K
++# and atomically adds them (fp32, SCOPE_DEV) into dq_acc; k_dq is dropped.
++#   F5_KT  = "lds"  K^T B-fragments re-read from an LDS copy of K every iteration
++#            "res"  K^T B-fragments read once in the prologue and held in VGPRs (+64)
++#   F5_ATOM = "1"   real atomics;  "0" = the PARITY section-5 dQ-GEMM cost probe
++#            (same 16 WMMA, results folded into a dummy that is stored once).
++F5_KT = _os.environ.get("F5_KT", "lds")
++F5_ATOM = _os.environ.get("F5_ATOM", "1") == "1"
+ BLOCK_KV = 32               # r1.i6.g06: kv rows one workgroup owns (was 16)
+ S_ROW_B = BLOCK_KV * 2 + 16  # r4.i1.g16: 64 -> 80 B. 16 dwords is a 4-way bank
+                              # collision at 64 banks; 20 dwords walks all 64.
+@@ -164,7 +173,8 @@
+ # slice, reduced on the host. PARTIAL=False is the shipped path, byte-for-byte, and is what
+ # prod uses (8 dispatch waves, already 100% balanced -- splitting there is pure cost).
+ def _dkdv_impl(PARTIAL, Q, K, V, DO, LSE, DEL, DV_, DK,
+-               scale, Sq, Skv, Hq, Hkv, G, nqt, cshift, causal, B_, nsp):
++               scale, Sq, Skv, Hq, Hkv, G, nqt, cshift, causal, B_, nsp,
++               FUSE=False, DQA=None):
+     """One wave owns a 16-row kv tile of one kv head and streams every (q head, q tile).
+ 
+     grid = (Skv/16, Hkv, B). The accumulators persist across the G q heads that share this
+@@ -247,6 +257,9 @@
+     lds_q = lds_do + fx.Int32(32 * X_ROW_B)
+     lds_p = _lds0 + fx.Int32(LDS_SEG)
+     lds_ds = lds_p + fx.Int32(32 * S_ROW_B)
++    # FUSED5: [32 kv][D] K image, 272 B rows, at [17408, 26112) -- inside segment 0,
++    # so the allocation (70656 B, 4 WG/CU rung) does not change.
++    lds_k = lds_q + fx.Int32(32 * X_ROW_B)
+     v8b = fx.Vector.make_type(8, fx.BFloat16)
+     v8f = fx.Vector.make_type(8, fx.Float32)
+ 
+@@ -262,6 +275,23 @@
+         return (_ldv(buf, t, fx.BFloat16, 8),
+                 _ldv(buf, t + fx.Int32(2), fx.BFloat16, 8))
+ 
++    def trl(base, rowb):
++        return fx.Vector(rocdl.ds_load_tr16_b128(
++            v8b, create_llvm_ptr(base, address_space=3))).shuffle(
++            fx.Vector(rocdl.ds_load_tr16_b128(
++                v8b, create_llvm_ptr(base + fx.Int32(16 * rowb),
++                                     address_space=3))), list(range(16)))
++
++    if FUSE:
++        # dq_acc fp32 [B, Sq, Hq, D], zeroed by the host. Plain global pointer (NOT a
++        # buffer tensor: make_buffer_tensor + UniversalAtomicAdd aborts, h42) so the
++        # atomic lowers to global_atomic_add_f32 ... scope:SCOPE_DEV.
++        g_dqa = fx.Tensor(fx.make_view(fx.get_iter(DQA),
++                                       fx.make_layout((1 << 30, 1), (1, 1))))
++        _dq_atom = fx.make_copy_atom(
++            fx.UniversalAtomicAdd(fx.Float32, rocdl.SyncScope.Agent), fx.Float32)
++        rs_dq = Hq * fx.Int32(D)                # fp32 elements between q rows
++
+     # K and V fragments for this kv tile are invariant over every query and every q head.
+     # r7.i1.g21 -- PREFETCH. The 32 Q/dO buffer_load_b128 an iteration consumes are
+     # issued one iteration EARLY and carried in the scf.for state, so the first wait
+@@ -311,6 +341,53 @@
+     lane_r = (lane // fx.Int32(16)) * fx.Int32(8) + lane % fx.Int32(8)
+     lane_c = ((lane // fx.Int32(8)) % fx.Int32(2)) * fx.Int32(8)
+ 
++    kt_res = None
++    if FUSE:
++        # Write K's 32 rows into lds_k from the registers kf already holds (k_dq's
++        # r3.i3.g12 idiom: gfrag halves tile the [32][D] image exactly). One wave:
++        # LDS is in-order per wave, no barrier needed before the tr16 reads.
++        for kh in range_constexpr(NKV):
++            ko = (fx.Int32(kh * 16) + row) * fx.Int32(X_ROW_B) + half * fx.Int32(16)
++            for dt in range_constexpr(NDT):
++                kv16 = fx.Vector(kf[kh][dt])
++                for u in range_constexpr(2):
++                    kh8 = kv16.shuffle(kv16, list(range(u * 8, u * 8 + 8)))
++                    llvm_dialect.store(
++                        fx.as_ir_value(kh8),
++                        create_llvm_ptr(lds_k + ko + fx.Int32(dt * 64 + u * 32),
++                                        address_space=3))
++        if F5_KT == "res":
++            kt_res = [trl(lds_k + lane_r * fx.Int32(X_ROW_B)
++                          + (lane_c + fx.Int32(dtile * 16)) * fx.Int32(2), X_ROW_B)
++                      for dtile in range_constexpr(NDO)]
++
++    def _dq_fused(a_dq, qh0, qh):
++        """dQ[16 q, 128 d] partial of one 16-query half = dS[16q,32kv] @ K[32kv,128d];
++        8 independent WMMA (one per 16-wide d tile), then 64 fp32 atomics per lane.
++        D layout: lane%16 = d column, half*8+si = q row, so one atomic instruction
++        covers 2 q rows x 16 contiguous d = 2 x 64 B."""
++        outs = []
++        for dtile in range_constexpr(NDO):
++            if kt_res is not None:
++                b_kt = kt_res[dtile]
++            else:
++                b_kt = trl(lds_k + lane_r * fx.Int32(X_ROW_B)
++                           + (lane_c + fx.Int32(dtile * 16)) * fx.Int32(2), X_ROW_B)
++            outs.append(rocdl.wmma_f32_16x16x32_bf16(
++                v8f, _ir(a_dq), _ir(b_kt), _ir(fx.Vector.filled(8, 0.0, fx.Float32)),
++                reuseA=False, reuseB=False).result)
++        if not F5_ATOM:
++            return outs
++        base_q = (bat * Sq + qh0 + half * fx.Int32(8)) * rs_dq + qh * fx.Int32(D) + row
++        for dtile in range_constexpr(NDO):
++            ov = fx.Vector(outs[dtile])
++            for si in range_constexpr(8):
++                idx = base_q + fx.Int32(si) * rs_dq + fx.Int32(dtile * 16)
++                f = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
++                fx.memref_store_vec(fx.Vector.from_elements([ov[si]], dtype=fx.Float32), f)
++                fx.copy_atom_call(_dq_atom, f, fx.slice(g_dqa, (idx, None)))
++        return None
++
+     # CAUSAL TILE SKIP. Under bottom-right causal, kv row j is attended only by queries
+     # q >= j - cshift, so this workgroup's kv tile [kv0, kv0+16) is untouched by every
+     # query tile below qt_start = max(0, (kv0 - cshift) // 16). Tiles below it contributed
+@@ -346,6 +423,7 @@
+     def _body(acc, pre, qt, gh, do_mask, qt_n, gh_n, carry=True):
+         # r16.i1.g48 moved qh/base_l into _ldqd with the LSE/delta loads.
+         q0 = qt * fx.Int32(32)
++        dq_sink = []
+ 
+         # r9.i1.g25 -- the masked body does NOT carry g21's prefetch. h14: the two
+         # scf.for bodies had identically-shaped carried tuples and the allocator put
+@@ -394,6 +472,7 @@
+             q_glob = q0 + fx.Int32(hh * 16) + row
+             lse_q = pre[hh * 2][0]
+             del_q = pre[hh * 2 + 1][0]
++            ds_kh = []
+             for kh in range_constexpr(NKV):
+                 # r20.i1.g61 -- CHAIN SPLIT on the S/P GEMM. The K=128 contraction was
+                 # ONE 4-deep dependent WMMA chain per (hh, kh, {s,p}): every
+@@ -442,6 +521,7 @@
+                 p_l = [x.to(fx.BFloat16) for x in pf]
+                 ds_l = [(pf[si] * (pv_[si] - del_q) * scale).to(fx.BFloat16)
+                         for si in range(8)]
++                ds_kh.append(ds_l)
+                 off = ((fx.Int32(hh * 16) + row) * fx.Int32(S_ROW_B)
+                        + fx.Int32(kh * 32) + half * fx.Int32(16))
+                 llvm_dialect.store(
+@@ -450,6 +530,14 @@
+                 llvm_dialect.store(
+                     fx.as_ir_value(fx.Vector.from_elements(ds_l, dtype=fx.BFloat16)),
+                     create_llvm_ptr(lds_ds + off, address_space=3))
++            if FUSE:
++                # FREE A operand (k_dq's idiom): kh=0 holds kv half*8+si, kh=1 holds
++                # 16+half*8+si, which is exactly the 16x32 A-fragment column order.
++                _r = _dq_fused(
++                    fx.Vector.from_elements(ds_kh[0] + ds_kh[1], dtype=fx.BFloat16),
++                    q0 + fx.Int32(hh * 16), hkv * G + gh)
++                if _r is not None:
++                    dq_sink.extend(_r)
+         # r8.i1.g23+g24 -- fx.barrier() DELETED. block=(32,1,1): the workgroup is ONE
+         # 32-lane wave, so s_barrier is semantically a no-op and LLVM already removes
+         # it (0 `s_barrier` in the shipped ISA). What survives is the conservative
+@@ -497,6 +585,15 @@
+         # re-derives it from the memory dependence; its loadcnt half has no dependence
+         # at all here and is exactly what truncates r7.i1.g21's prefetch cover to 299
+         # instructions instead of a full iteration.
++        if FUSE and not F5_ATOM:
++            # PROBE ONLY (wrong dV by construction): keep the 16 WMMA alive by folding
++            # them into accumulator 0 -- the PARITY sec.5 dQ-GEMM cost probe.
++            _a = fx.Vector(new[0])
++            for _v in dq_sink:
++                _vv = fx.Vector(_v)
++                _a = fx.Vector.from_elements([_a[i] + _vv[i] for i in range(8)],
++                                             dtype=fx.Float32)
++            new[0] = _ir(_a)
+         if const_expr(carry):
+             return new + [_ir(v) for v in nxt]
+         return new
+@@ -641,6 +738,49 @@
+         grid=(nxs, nblk, nb), block=(32, 1, 1), stream=stream)
+ 
+ 
++@flyc.kernel(known_block_size=[32, 1, 1])
++def k_dkdv_f5(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, DO: fx.Tensor,
++              LSE: fx.Tensor, DEL: fx.Tensor, DV_: fx.Tensor, DK: fx.Tensor,
++              DQA: fx.Tensor,
++              scale: fx.Float32, Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32,
++              Hkv: fx.Int32, G: fx.Int32, nqt: fx.Int32, cshift: fx.Int32,
++              causal: fx.Int32, B_: fx.Int32):
++    _dkdv_impl(False, Q, K, V, DO, LSE, DEL, DV_, DK, scale, Sq, Skv, Hq, Hkv,
++               G, nqt, cshift, causal, B_, fx.Int32(1), FUSE=True, DQA=DQA)
++
++
++@flyc.kernel(known_block_size=[32, 1, 1])
++def k_dkdv_sp_f5(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, DO: fx.Tensor,
++                 LSE: fx.Tensor, DEL: fx.Tensor, DV_: fx.Tensor, DK: fx.Tensor,
++                 DQA: fx.Tensor,
++                 scale: fx.Float32, Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32,
++                 Hkv: fx.Int32, G: fx.Int32, nqt: fx.Int32, cshift: fx.Int32,
++                 causal: fx.Int32, B_: fx.Int32, nsp: fx.Int32):
++    _dkdv_impl(True, Q, K, V, DO, LSE, DEL, DV_, DK, scale, Sq, Skv, Hq, Hkv,
++               G, nqt, cshift, causal, B_, nsp, FUSE=True, DQA=DQA)
++
++
++@flyc.jit
++def launch_dkdv_f5(Q, K, V, DO, LSE, DEL, DV_, DK, DQA, scale: fx.Float32,
++                   Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32,
++                   G: fx.Int32, nqt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
++                   nblk: fx.Int32, nhkv: fx.Int32, nb: fx.Int32, stream: fx.Stream):
++    k_dkdv_f5(Q, K, V, DO, LSE, DEL, DV_, DK, DQA, scale, Sq, Skv, Hq, Hkv, G,
++              nqt, cshift, causal, nb).launch(
++        grid=(nhkv, nblk, nb), block=(32, 1, 1), stream=stream)
++
++
++@flyc.jit
++def launch_dkdv_sp_f5(Q, K, V, DO, LSE, DEL, DV_, DK, DQA, scale: fx.Float32,
++                      Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32,
++                      G: fx.Int32, nqt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
++                      nblk: fx.Int32, nhkv: fx.Int32, nb: fx.Int32, nsp: fx.Int32,
++                      nxs: fx.Int32, stream: fx.Stream):
++    k_dkdv_sp_f5(Q, K, V, DO, LSE, DEL, DV_, DK, DQA, scale, Sq, Skv, Hq, Hkv, G,
++                 nqt, cshift, causal, nb, nsp).launch(
++        grid=(nxs, nblk, nb), block=(32, 1, 1), stream=stream)
++
++
+ # ===================================================================== dq =========
+ KV_STEP = 32                 # two 16-kv tiles: exactly one WMMA contraction of dS
+ NKT = KV_STEP // 16
+--- base/impl.py	2026-09-27 08:34:10.320481092 +0000
++++ op/impl.py	2026-09-27 08:43:21.948249301 +0000
+@@ -166,18 +166,22 @@
+     nsp = 1
+     while _wgs * nsp < 2048 and nsp < 16:
+         nsp *= 2
++    # FUSED5 (compile-only prototype, never run): dQ = sum_kv dS@K is accumulated by
++    # k_dkdv itself with fp32 SCOPE_DEV atomics into dq_acc [B,Sq,Hq,D]; k_dq is gone.
++    # dk/dv arithmetic is untouched (bitwise gate); dq is run-to-run >= 70 dB.
++    dq_acc = torch.zeros((b, sq, hq, d), device=q.device, dtype=torch.float32)
+     if nsp == 1:
+         dk_o = torch.empty((b, skv, hkv, d), device=k.device, dtype=k.dtype)
+         dv_o = torch.empty_like(dk_o)
+-        _launch("dkdv", _k.launch_dkdv,
+-                (q, k, v, do, lse, delta, dv_o, dk_o, float(softmax_scale),
++        _launch("dkdv_f5", _k.launch_dkdv_f5,
++                (q, k, v, do, lse, delta, dv_o, dk_o, dq_acc, float(softmax_scale),
+                  sq, skv, hq, hkv, g, sq // 16, skv - sq, int(bool(causal)),
+                  skv // _k.BLOCK_KV, hkv, b, stream))
+     else:
+         dkp = torch.empty((nsp, b, skv, hkv, d), device=k.device, dtype=torch.float32)
+         dvp = torch.empty_like(dkp)
+-        _launch("dkdv_sp", _k.launch_dkdv_sp,
+-                (q, k, v, do, lse, delta, dvp, dkp, float(softmax_scale),
++        _launch("dkdv_sp_f5", _k.launch_dkdv_sp_f5,
++                (q, k, v, do, lse, delta, dvp, dkp, dq_acc, float(softmax_scale),
+                  sq, skv, hq, hkv, g, sq // 16, skv - sq, int(bool(causal)),
+                  skv // _k.BLOCK_KV, hkv, b, nsp, hkv * nsp, stream))
+         # r13.i1.g42(c) -- round 14: the fold-back is now ONE device kernel over BOTH
+@@ -194,38 +198,11 @@
+         _launch("redsp", _k.launch_redsp,
+                 (dkp, dvp, dk_o, dv_o, _n_vec, nsp, _rblk, stream))
+ 
+-    # r17.i1.g52 -- SPLIT-K OVER k_dq's kv LOOP, derived from k_dq's OWN grid.
+-    # The `nsp` above is derived from the dkdv grid and was never applied to k_dq, which
+-    # has a different and much smaller one: ceil(Sq/BLOCK_Q)*Hq*B. At `fast` that is
+-    # 16*8*1 = 128 workgroups of one wave32 on 1024 SIMDs -- 87.5% of the machine idle --
+-    # while k_dq is 49.82% of that shape's kernel time
+-    # (rounds/017/1-profiling/kernel.yaml:55, SQ_WAVES = Grid/32 = 128 exactly). proxy
+-    # gives 64*32*1 = 2048 and prod 128*32*4 = 16384, so BOTH take nsp_q = 1 on the same
+-    # rule and run the shipped non-split k_dq object unchanged: the split cannot reach
+-    # the two shapes it would only cost. Same derivation as nsp above, deliberately --
+-    # the census that fitted it (rounds/014/1-opt/raw/census_sp.txt) is a statement about
+-    # dispatch waves on this part, not about which kernel is being dispatched.
+-    _wgs_q = ((sq + _k.BLOCK_Q - 1) // _k.BLOCK_Q) * hq * b
+-    nsp_q = 1
+-    while _wgs_q * nsp_q < 2048 and nsp_q < _NSP_Q_CAP:
+-        nsp_q *= 2
+-    if nsp_q == 1:
+-        dq_o = torch.empty((b, sq, hq, d), device=q.device, dtype=q.dtype)
+-        _launch("dq", _k.launch_dq,
+-                (q, k, v, do, lse, delta, dq_o, float(softmax_scale),
+-                 sq, skv, hq, hkv, g, skv // _k.KV_STEP, skv - sq, int(bool(causal)),
+-                 sq // _k.BLOCK_Q, hq, b, stream))
+-    else:
+-        dqp = torch.empty((nsp_q, b, sq, hq, d), device=q.device, dtype=torch.float32)
+-        _launch("dq_sp", _k.launch_dq_sp,
+-                (q, k, v, do, lse, delta, dqp, float(softmax_scale),
+-                 sq, skv, hq, hkv, g, skv // _k.KV_STEP, skv - sq, int(bool(causal)),
+-                 sq // _k.BLOCK_Q, hq, b, nsp_q, hq * nsp_q, stream))
+-        dq_o = torch.empty((b, sq, hq, d), device=q.device, dtype=q.dtype)
+-        _n_vec_q = (b * sq * hq * d) // _k.RED_VEC
+-        _rblk_q = (_n_vec_q + _k.RED_THREADS - 1) // _k.RED_THREADS
+-        _launch("redsp_q", _k.launch_redsp_q,
+-                (dqp, dq_o, _n_vec_q, nsp_q, _rblk_q, stream))
++    # FUSED5: fp32 -> bf16 convert. k_redsp_q with nsp = 1 is exactly that kernel.
++    dq_o = torch.empty((b, sq, hq, d), device=q.device, dtype=q.dtype)
++    _n_vec_q = (b * sq * hq * d) // _k.RED_VEC
++    _rblk_q = (_n_vec_q + _k.RED_THREADS - 1) // _k.RED_THREADS
++    _launch("cvt_dq", _k.launch_redsp_q, (dq_acc, dq_o, _n_vec_q, 1, _rblk_q, stream))
+ 
+     return dq_o, dk_o, dv_o
+ 
