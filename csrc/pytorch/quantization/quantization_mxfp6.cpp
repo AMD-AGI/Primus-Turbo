@@ -508,7 +508,7 @@ std::vector<at::Tensor> quantize_mxfp6_fused_dual(const at::Tensor              
 void quantize_mxfp6_fused_dual_out(const at::Tensor                input,
                                    const c10::optional<at::Tensor> aux,
                                    const c10::optional<at::Tensor> bias,
-                                   const int64_t                   mode,
+                                   const int64_t                   prologue_mode,
                                    at::Tensor                      row_packed,
                                    at::Tensor                      row_scale,
                                    at::Tensor                      col_packed,
@@ -534,7 +534,7 @@ void quantize_mxfp6_fused_dual_out(const at::Tensor                input,
     }
     float *col_sum_ptr = col_sum.has_value() ? col_sum->data_ptr<float>() : nullptr;
 
-    const MXFP6Prologue prologue = prologue_from_mode(mode);
+    const MXFP6Prologue prologue = prologue_from_mode(prologue_mode);
     auto                stream   = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
 
     if(input.scalar_type() == at::kBFloat16) {
