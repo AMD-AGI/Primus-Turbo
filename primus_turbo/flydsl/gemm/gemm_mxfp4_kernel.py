@@ -1845,6 +1845,9 @@ class MfmaScaleFp4:
                 + (["s", "s", "v", "s"] if _CST else [])  # C SRDs (L,R), voffset, row bytes
                 + (["v"] * (2 * nbuf_b * n_sub) if _BSPL else [])  # even-region B bases
                 + ([] if _ZACC else [str(q) for q in o_acc])  # tied accs (src2 imm 0 instead)
+                # The K-loop's own s_cmp/carry rewrites SCC. Without the clobber a caller that
+                # wraps this body in a loop keeps its back-edge condition in SCC across the blob.
+                + ["~{scc}"]
             )
             st = (
                 "!llvm.struct<("
@@ -2091,10 +2094,6 @@ def _build_mxfp4_gemm_kernel(
     # write-once and dead, so `nt` leaves the A/B band resident, while a split-K partial
     # is read straight back by the reduce and stays cached.
     _CST_AUX = _NT_AUX if ksplit == 1 else 0
-    # A tile costs a fixed overhead on top of its k-blocks, and the counters place all of
-    # it inside the wave (prologue and peel, not WG launch). Walking _TPW tiles amortises
-    # it; _CSTORE is what keeps the next tile's fill from racing the ring.
-    _TPW = _mxfp4_tiles_per_wg(n_pids, K, persist and _CSTORE)
     n_partial = n_tail != 0
     # A row of K/2 bytes off the 128-byte line costs its G2S two requests; each
     # operand's allocation decides that independently.
@@ -2116,6 +2115,14 @@ def _build_mxfp4_gemm_kernel(
     if mn is not None:
         n_pids = (ceildiv(mn[0], BLOCK_M), ceildiv(mn[1], _NCB))
         _NTILE = n_pids[0] * n_pids[1]
+    # A tile costs a fixed overhead on top of its k-blocks, and the counters place all of
+    # it inside the wave (prologue and peel, not WG launch). Walking _TPW tiles amortises
+    # it. What the next tile's fill may not overtake is the ring: the folded store already
+    # sits behind the mainloop's last g2s, and so does an epilogue that stages through no
+    # LDS of its own. The tile count comes from n_pids, so this has to be decided after
+    # the decode above is known.
+    _PERSIST = _CSTORE or not (glu or dglu or coop or beta_is_one or taccw)
+    _TPW = _mxfp4_tiles_per_wg(n_pids, K, persist and _PERSIST)
     N_TILES_BH = LDS_BN_HALF // 32  # 4: wave_n covers 64 N-cols/slice
     assert not glu or (glu_i > 0 and not beta_is_one and ksplit == 1 and not coop and not taccw)
     assert not glu or (mn is not None and mn[1] == glu_i), "glu needs mn=(M, I)"
@@ -2779,7 +2786,10 @@ def _build_mxfp4_gemm_kernel(
                 _store(o, accL, accR, _split)
         else:
             # Persistent tile loop: one WG walks _TPW tiles, paying launch/teardown once per _TPW.
-            # The stride is the grid, not 1, so a dispatch round's tiles stay in one swizzle band.
+            # The stride is the grid, not 1, so a dispatch round's tiles stay in one swizzle band:
+            # the band is what lets the WGs co-resident on an XCD share one B tile out of L2, and
+            # that concurrent sharing prices above the sequential reuse a per-WG walk would buy
+            # (a post-remap-consecutive walk widens the live n band by _TPW and costs 2.7-4.0%).
             _pid0 = fx.block_idx.x
             for _t in range_constexpr(0, _TPW):
                 if const_expr(_t > 0):
@@ -3229,6 +3239,13 @@ def _mxfp4_wave_eff(tiles, ncu):
 # default everywhere; 192 exists only to turn a grid whose dispatch rounds end ragged into one
 # that fills them, and pays a quarter of the tile's area for it.
 _MXFP4_BLOCK_N_ALT = 192
+# What the narrow tile also gives up, in k-blocks of its own tile: `_CSTORE` needs
+# ``BLOCK_N // 64 == _MXFP4_PACK_ILV``, so a 192 tile cannot fold its C store into the peel
+# and pays it exposed. That is a per-TILE epilogue, so it is a share of the tile that grows
+# as 1/K, which is why the trade reverses on short contractions. Solved from the one shape
+# the two widths were measured head to head on (8192x3072x3072, 12 k-blocks, 192 is 12.6%
+# slower); it then predicts the other five measured cells to within 1.6 points.
+_MXFP4_BN_ALT_CSTORE_KB = 3
 
 
 def _mxfp4_pick_block_n(M, N, K, glu=False):
@@ -3236,19 +3253,21 @@ def _mxfp4_pick_block_n(M, N, K, glu=False):
 
     A narrower tile buys CU fill and sells arithmetic intensity, so it can only win where it
     removes a whole ragged dispatch round: both grids then run the same number of rounds and
-    the narrow one's round is the shorter. Priced against the FEED cost ratio
-    ``(BM + BN) / 2*BM`` -- the pessimistic end, since a tile bound by its operand fill saves
-    only 12.5% where one bound by MFMA saves 25% -- so a shape switches only if it wins in
-    either regime. ``N % BN`` must be 0: a ragged N tile would put the packed scale group's
-    boundary off the column grid the preshuffle writes.
+    the narrow one's round is the shorter. Priced in tile-times, in k-blocks: the narrow
+    tile's k-block costs the FEED ratio ``(BM + BN) / 2*BM`` -- the pessimistic end, since a
+    tile bound by its operand fill saves only 12.5% where one bound by MFMA saves 25% -- plus
+    the one exposed C store it can no longer fold. ``N % BN`` must be 0: a ragged N tile would
+    put the packed scale group's boundary off the column grid the preshuffle writes.
     """
     bn = _MXFP4_BLOCK_N_ALT
     if glu or N % bn or M % 256:
         return 256
-    mt, ncu = M // 256, _mxfp4_ncu()
+    mt, ncu, kb = M // 256, _mxfp4_ncu(), K // 256
     r256 = ceildiv(mt * ceildiv(N, 256), ncu)
     ralt = ceildiv(mt * (N // bn), ncu)
-    return bn if ralt * (256 + bn) < r256 * 512 else 256
+    t256 = r256 * 512 * kb
+    talt = ralt * ((256 + bn) * kb + 512 * _MXFP4_BN_ALT_CSTORE_KB)
+    return bn if talt < t256 else 256
 
 
 def _mxfp4_pick_block_m(M, N, K, glu=False):
