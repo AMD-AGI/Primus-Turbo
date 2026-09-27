@@ -343,9 +343,56 @@ rounds:
     0.7560)'
   changed_disagreement: null
 - round: 7
+  progress:
+  - opt
+  - reflect
+  mode: fast
+  sessions:
+    opt: f4cb1535-2212-426c-8657-f841105a9ff9
+  seconds:
+    opt: 1614.9
+    reflect: 88.3
+    round: 1703.2
+  bound: latency
+  validation_exit_code: 2
+  validation_by: framework
+  validation_failures:
+  - 'speed: geomean candidate/beat 0.6724 < bar 1.0000 (fast 0.5427, proxy 0.7471, prod 0.7498)'
+  score: 0.69596
+  outcome: delivered
+  passed: false
+  accepted: false
+  tflops:
+    fast: 39.23
+    proxy: 794.93
+    prod: 1045.27
+  targets:
+    fast: 69.47
+    proxy: 1024.71
+    prod: 1398.49
+  beats:
+    fast: 69.47
+    proxy: 1024.71
+    prod: 1398.49
+  incumbents:
+    fast: 39.78
+    proxy: 801.8
+    prod: 1083.47
+  gain: 0.9808
+  changed: 1
+  flops:
+    fast: 2149580800.0
+    proxy: 137472507904.0
+    prod: 2199291691008.0
+  guards: {}
+  guard_failed: null
+  note: 'delivered: speed: geomean candidate/beat 0.6724 < bar 1.0000 (fast 0.5427, proxy 0.7471, prod
+    0.7498)'
+  changed_disagreement: null
+- round: 8
   progress: []
   mode: fast
   running:
     module: opt
     step: null
-    since: '2026-09-27T11:27:24'
+    since: '2026-09-27T11:57:52'

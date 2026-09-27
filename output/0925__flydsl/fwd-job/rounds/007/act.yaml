@@ -1,0 +1,95 @@
+round: 7
+mode: fast
+candidate: h24.p22s
+outcome: delivered
+
+correctness:
+  unit_tests: fail          # rc 2 only from ut's hard-coded 50 dB (gates.GATE_DB): the same 7 lines at the same dB as the round-4 champion (raw/ab/ut_inc.out)
+  precision: pass           # validation.py: 16/16 PASS at the spec's 49 dB; determinism 200/200, hash identical to champion
+  checked_with: op/validation.py
+  sqnr_db: 49.82            # worst o (short_q full); bitwise identical to the champion
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/004/op]
+  shapes:                   # mean of a1/a2 (all shapes, beat in the process, palindromic order)
+    - name: fast
+      this_round_tflops: 39.23
+      best_round_tflops: 39.78
+      beat_tflops: 69.47
+      target_tflops: 69.47
+      champion_round: 4
+      champion_tflops: 39.78
+      champion_rebuilt: true
+      ratio: 0.5647
+      vs_champion: 0.986
+    - name: proxy
+      this_round_tflops: 794.93
+      best_round_tflops: 801.80
+      beat_tflops: 1024.71
+      target_tflops: 1024.71
+      champion_round: 4
+      champion_tflops: 801.80
+      champion_rebuilt: true
+      ratio: 0.7758
+      vs_champion: 0.991
+    - name: prod
+      this_round_tflops: 1045.27
+      best_round_tflops: 1083.47
+      beat_tflops: 1398.49
+      target_tflops: 1398.49
+      champion_round: 4
+      champion_tflops: 1083.47
+      champion_rebuilt: true
+      ratio: 0.7474
+      vs_champion: 0.965
+  score: 0.6960
+  # Prod-only slot-rotated sessions (no beat): p22s/inc 0.9661, 0.9695, 0.9638 (s1-s3); raw/ab/summary.txt
+
+validation:
+  exit_code: 2              # speed bar only (geomean vs beat 0.6485 < 1.0); correctness and determinism PASS
+
+explored:
+  ran:
+    - "compile-only census of the champion's clean KV loop -- found the per-tile WG barrier that re-phases the two waves on a SIMD (they are one WG); it motivated the P1 probe"
+    - "P1 nobar probe (r7.i1.g17): per-tile barrier ceiling +4.5/+4.5/+5.2% prod -- set h24's expectation and its suspicion ceiling"
+    - "P2 nodefer probe (r7.i2.g18): L20 prod 0.914-0.919 -- closed h22 without an arm"
+    - "coexec (r4.i4.g12) compile-only on the r4 tree: sgpr spill 1 -- kept it off the card"
+    - "isa_loops.py on p22n/p22s vs champion: runtime tile%G branch, +10% instructions per tile -- the mechanism of the loss"
+  consulted:
+    - INDEX.md
+    - optimization/routes/1-metrics-to-techniques.md
+    - backends/flydsl/attention/techniques.md
+    - backends/flydsl/attention/dead-ends.md
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+  bound: latency
+  confidence: medium
+  why: >
+    prod is per-wave issue-latency bound. Adding about 53 SALU/branch/nop instructions per 64-KV tile
+    (+10%) cost 3.5-6%, and the halved barrier count did not pay for it. Deleting the barrier outright
+    bought only +4.7%. The serial per-tile instruction stream is what sets the time, not the rendezvous.
+
+arms:
+  - id: h24.p22s
+    built: "proto/barriers G2 NG2 split signal/wait, constants hard-coded, from op/current"
+    tflops: {fast: 39.23, proxy: 794.93, prod: 1045.27}
+    vs_champion: 0.965
+    shipped: true           # left in the working copy; acceptance will not promote it
+    note: "prod 0.966/0.970/0.964/0.967/0.963 in 5 same-session runs; VGPR 448, 0 spill; loop 553 -> 607 instructions"
+  - id: h24.p22n
+    built: "proto/barriers G2 NG2 no split, from op/current -- NOT on top of p22s"
+    tflops: {fast: 38.41, proxy: 760.19, prod: 1018.07}
+    vs_champion: 0.940
+    shipped: false
+    note: "prod 0.941/0.941/0.934/0.940/0.939; loop 553 -> 606, SALU 42 -> 72, v_nop 16 -> 25"
+
+expected: >
+  p22n about +1.5% at prod (range +0.5 to +3); p22s +0 to +1% over p22n; best arm about +2%, never above
+  the 4.7% ceiling. Falsified if both arms are within the 0.47% floor of control.
+
+added_to_pool: [r7.i3.g19]
+route_updated: true
+
+implementation:
+  files_changed: [op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py]
+  build_failures: []
