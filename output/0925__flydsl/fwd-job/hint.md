@@ -19,7 +19,7 @@ Source abbreviations used below:
 
 | id | type | title | status |
 | --- | --- | --- | --- |
-| h1 | must note | Round 1 instruction -- do this first | open |
+| h1 | must note | Round 1 instruction -- do this first | done r1-r2 (grid first: longest-first landed) |
 | h2 | standing note | Why the gap is efficiency, not structure | open |
 | h3 | advise note | `O_VARIANT` v1 (L1) | open |
 | h4 | standing note | ASM-vs-FlyDSL delta (from the ISA diff, per 256 KV per wave) | open |

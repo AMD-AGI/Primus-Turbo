@@ -1,0 +1,111 @@
+round: 4
+mode: fast
+candidate: r4.i1.g09          # lead id of the shipped arm; what rounds/004/op holds is the MERGE g09+g10 (see arms)
+outcome: delivered
+
+correctness:
+  unit_tests: pass            # ut: spec shapes + determinism PASS; the same 7 edge cases 49.82-49.99 dB under ut's hard-coded 50 (spec 49) as rounds 2-3; dB lines and determinism hash o=26a89a2db0cd lse=d6ac8da1e101 identical to the incumbent -> output bitwise = op/current
+  precision: pass             # validation.py on the shipped working copy: all 16 cases PASS at spec 49 dB
+  checked_with: op/validation.py
+  sqnr_db: 49.82              # worst o SQNR (short_q full); spec shapes 51.23 / 50.89 / 50.83
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/002/op, rounds/003/op]
+  shapes:                     # merge M, mean of 3 sessions with cyclically rotated arm order (raw/benchm{1,2,3}_*, raw/benchm_agg.txt)
+    - name: fast
+      this_round_tflops: 47.32
+      best_round_tflops: 44.63
+      beat_tflops: 71.00
+      target_tflops: 71.00
+      champion_round: 2
+      champion_tflops: 44.63
+      champion_rebuilt: true
+      ratio: 0.6665
+      vs_champion: 1.060
+    - name: proxy
+      this_round_tflops: 862.75
+      best_round_tflops: 803.18    # rounds/003/op in the same sessions (champion r2 786.64); slot noise +-8%
+      beat_tflops: 1025.86
+      target_tflops: 1025.86
+      champion_round: 2
+      champion_tflops: 786.64
+      champion_rebuilt: true
+      ratio: 0.8410
+      vs_champion: 1.097
+    - name: prod
+      this_round_tflops: 1082.09
+      best_round_tflops: 1019.69   # rounds/003/op in the same sessions (champion r2 1017.91)
+      beat_tflops: 1398.93
+      target_tflops: 1398.93
+      champion_round: 2
+      champion_tflops: 1017.91
+      champion_rebuilt: true
+      ratio: 0.7735
+      vs_champion: 1.063
+  score: 0.7603               # incumbent (r2) in the same sessions 0.7077, r3 0.7135, A alone 0.7330
+  note: >
+    Median of 101, 8 s warmup, unprofiled, one process per shape, beat last in each session, sclk
+    1019-1100 (VR-throttled box). prod same-session floor ~0.4%; M beat A in every prod session
+    (+3.0..+3.9%) and inc in every session at every shape. Batch 1 (A, B, inc, r3; raw/bench*) gave
+    A prod x1.030 / B x1.013 vs inc; batch 2 re-measured A at x1.030.
+
+validation:
+  exit_code: 2                # correctness + determinism PASS; speed geomean vs beat 0.6556 < 1.0 (fast 0.4979, proxy 0.7326, prod 0.7724)
+
+explored:
+  ran:
+    - "rocprofv3 --kernel-trace --stats (raw/survey_rocprofv3.txt) -- crashed in teardown ('corrupted double-linked list'), killed by PID; changed nothing except ruling the survey out as an instrument here"
+    - "COMPILE_ONLY ISA dumps + descriptors for cur/coexec/sumpv/pkfma/pkadd/merge (raw/descriptors.txt) -- spill gate (blocked coexec g12 from the card: 3 SGPR spills) and the per-arm instruction mix that picked packed-f32 over relocation"
+    - "sumpv throwaway (g11, row-sum after PV), 2 order-swapped sessions (raw/bench_probes.txt) -- lost prod -2.3%: intra-tile relocation cannot create overlap; removed it from the route"
+    - "pkfma throwaway (g09), 2 order-swapped sessions (raw/bench_probes.txt) -- prod +2.8/+3.0%, bitwise: put g09 at the top of the route and priced g10 at ~0.65 wall cycle per removed VALU slot"
+    - "benchmark.py x3 rotated sessions A/B/inc/r3/beat, then x3 M/A/inc/r3/beat; ut x3; validation.py x2"
+  consulted:
+    - arch/gfx1250/isa.md
+    - optimization/routes/1-metrics-to-techniques.md
+    - backends/flydsl/attention/techniques.md
+    - backends/flydsl/attention/dead-ends.md
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+    - optimization/techniques/3-pipelining-and-scheduling.md
+    - optimization/techniques/6-gfx1250-cdna5-mechanisms.md
+  bound: compute
+  confidence: medium
+  why: "round-3 floor probe (no exp2: prod -13.4% wall) + this round: removing softmax VALU issue slots converts to wall time (A -262 instrs -> +3.0%, M -288 -> +6.3%); VALU and WMMA serialise per wave, 310-330 GB/s at prod is far from memory-bound; clocks VR-throttled ~1030-1100 MHz"
+
+arms:
+  - id: r4.i1.g09+r4.i2.g10
+    built: "the merge, built only because neither arm lost; = A + raw/pkadd_g10.diff; this is rounds/004/op"
+    tflops: {fast: 47.32, proxy: 862.75, prod: 1082.09}
+    vs_champion: 1.073        # mean of 1.060 / 1.097 / 1.063
+    shipped: true
+    note: "super-additive (A +3.0, B +1.3, M +6.3% prod); VGPR 456, spill 0/0, v_nop 168->62, v_dual 259->148; bitwise = op/current"
+  - id: r4.i1.g09
+    built: "A alone, from op/current -- exp2 argument as v_pk_fma_f32 (2 elems/op), raw/pkfma_g09.diff"
+    tflops: {fast: 46.59, proxy: 825.46, prod: 1050.12}   # batch 1; batch 2 re-measure 46.34 / 817.42 / 1048.62
+    vs_champion: 1.029        # batch 1: 1.019 / 1.038 / 1.030
+    shipped: false
+    note: "ISA byte-identical to the planning-step probe; 207 v_fmamk -> 128 v_pk_fma, -262 instrs, VGPR 446"
+  - id: r4.i2.g10
+    built: "B alone, from op/current -- NOT on top of A; R=2 rows' sum trees in lockstep as one v2 tree -> v_pk_add_f32, raw/pkadd_g10.diff"
+    tflops: {fast: 45.76, proxy: 803.71, prod: 1033.57}
+    vs_champion: 1.008        # 1.001 / 1.010 / 1.013
+    shipped: false
+    note: "126 v_pk_add_f32, only +8 v_mov for pair-building; -60 instrs (scalar adds were already partly v_dual); VGPR 460"
+  - id: r4.i3.g11-probe
+    built: "throwaway in the planning step: row-sum deferred past _pv_gemm"
+    tflops: {}
+    vs_champion: 0.977        # prod -2.3%, proxy -1.5% (2 sessions, latency ratios)
+    shipped: false
+    note: "LLVM sank all exp+fma into the PV block next to dependent WMMAs; V ds_load latency lost its cover"
+
+expected: >
+  Expectation for the next step: A reproduces +2-3% prod / +2% proxy, fast ~0 (VALU-bound only in the
+  body); score ~0.676 -> ~0.69. B +1-2% alone; A+B ~+3-4% if additive (it may not be: once A removed the
+  fma nops, the sum tree may be the only filler between exps).
+
+added_to_pool: [r4.i1.g09, r4.i2.g10]
+route_updated: true
+
+implementation:
+  files_changed: [op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py]
+  build_failures: []

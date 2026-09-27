@@ -571,14 +571,19 @@ def _softmax(
         p, p_flat, idx = [], [], 0
         for kvt in range(NKV):
             pe = []
-            for i in range(8):
-                # exp2(s*log2e - m_new*log2e) via one fma.
-                pj = exp2(
-                    fx.Float32(fmath.fma(_raw(s_masked[idx]), _raw(log2e), _raw(neg_m)))
+            # r4 L15 probe: exp2 argument as packed fma (v_pk_fma_f32), 2 elems per op.
+            l2 = fx.Vector.from_elements([log2e], fx.Float32).broadcast_to(2)
+            n2 = fx.Vector.from_elements([neg_m], fx.Float32).broadcast_to(2)
+            for i in range(0, 8, 2):
+                sv = fx.Vector.from_elements(
+                    [s_masked[idx], s_masked[idx + 1]], fx.Float32
                 )
-                pe.append(pj)
-                p_flat.append(pj)
-                idx += 1
+                av = fx.Vector(fmath.fma(_ir(sv), _ir(l2), _ir(n2)))
+                for e in range(2):
+                    pj = exp2(fx.Float32(av[e]))
+                    pe.append(pj)
+                    p_flat.append(pj)
+                idx += 2
             p.append(fx.Vector.from_elements(pe, fx.Float32).to(elem_dtype))
         p_list.append(p)
         p_flat_list.append(p_flat)
@@ -586,7 +591,21 @@ def _softmax(
     # ---- Row sum: R rows' balanced sum-trees emitted INTERLEAVED. fadd_t (fast-math minus
     # reassoc) so LLVM's Reassociate does NOT re-linearize the tree into a serial chain. ----
     add3 = lambda a, b, c: fadd_t(fadd_t(a, b), c)
-    local_sum_list = _tree_reduce_multi(p_flat_list, add3, fadd_t)
+    if R == 2:
+        # r4 g10 (L16): the two rows' trees have the same shape, so run them in lockstep as
+        # one v2 tree (row0, row1) -> v_pk_add_f32; per-row association unchanged (bitwise).
+        def vadd_t(a, b):
+            return fx.Vector(arith.addf(_ir(a), _ir(b), fastmath=_no_reassoc))
+
+        vadd3 = lambda a, b, c: vadd_t(vadd_t(a, b), c)
+        leaves = [
+            fx.Vector.from_elements([p_flat_list[0][i], p_flat_list[1][i]], fx.Float32)
+            for i in range(len(p_flat_list[0]))
+        ]
+        (tot,) = _tree_reduce_multi([leaves], vadd3, vadd_t)
+        local_sum_list = [fx.Float32(tot[0]), fx.Float32(tot[1])]
+    else:
+        local_sum_list = _tree_reduce_multi(p_flat_list, add3, fadd_t)
 
     d_new_list = []
     for r in range(R):
