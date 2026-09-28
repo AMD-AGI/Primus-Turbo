@@ -312,6 +312,7 @@ class G2SLoader:
         wave_id,
         chunk_stride=1024,
         rebase=None,
+        wm_win=0,
         lds_step=0,
         lds_grp=0,
     ):
@@ -324,6 +325,10 @@ class G2SLoader:
         self.n_waves = fx.block_dim.x // 64
         # Padding the per-wave chunk stride moves a transposed read's four lane groups off one bank half; reader and LDS pool must agree.
         self.chunk_stride = chunk_stride
+        # Wave-major mode (steps per M0 window, 0 = step-major). The wave's chunks are
+        # contiguous and ``gl_offsets`` carries the asm's 12-bit immediate pre-subtracted,
+        # which this copy has no field for and so adds back.
+        self.wm_win = wm_win
         # i64-traversal mode. None -> the K-offset rides the 32-bit soffset (caps the operand
         # span at < 2^32 fp8). A (arg_i8, fp8_ir_t, base_elems, num_records_bytes) tuple re-bases
         # the SRD per load instead (k_offset folds into the i64 base), lifting the cap.
@@ -334,6 +339,7 @@ class G2SLoader:
         # M0 window in steps and must match the one ``gl_offsets`` was built with.
         self.lds_step = lds_step
         self.lds_grp = lds_grp
+        assert not (wm_win and lds_step), "wm_win and lds_step each restore the same immediate"
 
     def _src_div(self, k_offset):
         """(divided source tensor, soffset) for one load. int32 path returns the
@@ -353,7 +359,10 @@ class G2SLoader:
 
     def _lds_dst_at(self, lds_dst, step, base_off=None):
         cs = self.chunk_stride
-        if self.lds_step:
+        # Two wave-major fills share this layout: the grouped kernel's (``wm_win``, which
+        # puts the pre-subtracted immediate back on the voffset) and the dense kernel's
+        # (``lds_step``, which puts it back on the soffset). A loader uses one or neither.
+        if self.wm_win or self.lds_step:
             step_off = self.wave_id * (self.n_load_steps * cs) + step * cs
         else:
             step_off = self.wave_id * cs + step * (self.n_waves * cs)
@@ -367,7 +376,10 @@ class G2SLoader:
     def load(self, lds_dst, k_offset, base_off=None):
         src_div, soff = self._src_div(k_offset)
         for step in range_constexpr(self.n_load_steps):
-            src = fx.slice(src_div, (None, fx.Int32(self.gl_offsets[step])))
+            off = fx.Int32(self.gl_offsets[step])
+            if self.wm_win:
+                off = off + (step % self.wm_win) * self.chunk_stride
+            src = fx.slice(src_div, (None, off))
             dst = self._lds_dst_at(lds_dst, step, base_off)
             imm = g2s_lds_imm(step, self.lds_step, self.lds_grp)
             so = fx.Int32(soff) + fx.Int32(imm) if imm else fx.Int32(soff)
