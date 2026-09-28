@@ -1,0 +1,198 @@
+round: 28
+mode: fast
+candidate: r28.i2.g88
+outcome: delivered
+# Built, gated, measured, LOST, and LEFT IN THE WORKING COPY. `delivered` is the honest
+# code for built-and-lost: the tree really did change and the change really was measured.
+
+correctness:
+  unit_tests: pass
+  precision: pass
+  checked_with: op/validation.py
+  sqnr_db: 52.43
+  note: >
+    ut/test_correctness.py 15/15 PASS on the FIRST build of g88, no iteration, no mechanism
+    switch; every tensor 52.43-52.98 dB against the 50.0 dB gate. sqnr_db above is the WORST
+    tensor over all 15 cases (toy/causal dk). validation.py on rounds/028/op (tree md5
+    8cec300f, runner key r28_val_g88): correctness pass (fast 52.61/52.65/52.83, proxy
+    52.52/52.57/52.67, prod 52.56/52.60/52.71), determinism pass -- INCLUDING dk/dv bitwise
+    identical across 200 runs and dq above the 70 dB run-to-run floor -- speed FAIL.
+    The SQNR figures are identical to the unpaired tree, which is the mechanism's own
+    prediction: pairing changes WHICH workgroup owns a kv tile, never the per-tile
+    accumulation order.
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references:
+    - job_context/op/current   # the INCUMBENT ITSELF (r19h, installed by the h68 refactor),
+                               # entered as an arm directly rather than as a copy
+    - rounds/028/1-opt/arms/armA   # r19h + r27.i3.g86, this round's other built arm
+  note: >
+    ⚠ ROUNDS BEFORE 28 ARE NOT ELIGIBLE AS "best ever". The round-28 operator refactor (h68)
+    replaced the architecture they implement, and rounds/028/0-refactor/refactor.md is the
+    only account of the current design. Every figure below is therefore measured on the
+    CURRENT structure and re-measured in THIS session: base (= op/current), armA and cand
+    ran back to back, four arms interleaved inside ONE process per shape, blocked 9 + lead 4
+    with palindromic rounds, TWO passes; figures are the mean over both passes.
+    Cross-pass spread: prod 0.14-0.40%, proxy 0.37-1.40%, fast 0.52-2.84%.
+    ⚠ The device was idle at the start (`No KFD PIDs`), but at 07:23 mid-run a DIFFERENT
+    op-evolve job (attention FORWARD, rounds/015) appeared. Device mapping was checked with
+    `docker inspect`, not assumed: this job is fa-g3 -> renderD152, the neighbour is
+    fa-g2 -> renderD144 -- a different physical GPU; both containers pass /dev/kfd, which is
+    why rocm-smi inside the container enumerates it at all. All four prod arms report the
+    same sclk (1758->1835), and because arms are interleaved inside one process a neighbour
+    cannot create a difference BETWEEN arms. Recorded in raw/idle_witness_g88.txt.
+    Independent cross-check: validation.py's own separate-process measurement of the shipped
+    tree gives prod 637.0 TF/s against this harness's 637.2 -- 0.03% apart.
+  shapes:
+    - name: fast_b1_s1024_hq8_hkv2_d128
+      this_round_tflops: 98.3
+      best_round_tflops: 98.8           # base (= op/current), re-measured in this sweep
+      beat_tflops: 57.8                 # measured in the SAME sweep, not carried forward
+      target_tflops: 57.8               # beat_margin_pct = 0
+      champion_round: 28
+      champion_tflops: 98.8
+      champion_rebuilt: true
+      ratio: 1.0000                     # min(98.3/57.8, 1.0); uncapped it is 1.7008
+      vs_champion: 0.9949
+      note: >
+        g88 is INERT here by construction (fast derives nsp = 16 and takes k_dkdv_sp, while
+        pairing is applied only on the nsp == 1 branch), so cand-vs-armA here is a
+        derivational A/A null: +0.10%. This shape is above its target and stays above it.
+    - name: proxy_b1_s4096_hq32_hkv8_d128
+      this_round_tflops: 588.2
+      best_round_tflops: 588.2          # the shipped tree IS the best proxy arm measured
+      beat_tflops: 748.2
+      target_tflops: 748.2
+      champion_round: 28
+      champion_tflops: 587.9            # base (= op/current), re-measured beside it
+      champion_rebuilt: true
+      ratio: 0.7861
+      vs_champion: 1.0005
+      note: >
+        Also inert by construction (nsp = 2 -> k_dkdv_sp). cand-vs-armA here is the second
+        A/A null: +0.29%. That is the session floor, and the reason prod's -0.53% is
+        readable as a real effect rather than noise.
+    - name: prod_b4_s8192_hq32_hkv8_d128
+      this_round_tflops: 637.2
+      best_round_tflops: 640.6          # armA, this round's other arm, measured in the same
+                                        # process. The shipped tree is BELOW it.
+      beat_tflops: 816.8
+      target_tflops: 816.8
+      champion_round: 28
+      champion_tflops: 640.6
+      champion_rebuilt: true
+      ratio: 0.7801
+      vs_champion: 0.9947
+      note: >
+        The only shape on the changed path, and the one that decides the round. -0.53% vs
+        armA, reproduced with the same sign in both passes (0.9949, 0.9947), against a
+        same-process floor of +0.29%/+0.10%.
+  score: 0.8554                         # mean(0.7801, 0.7861, 1.0000)
+
+validation:
+  exit_code: 2
+  note: >
+    correctness pass, determinism pass, speed FAIL. Reported as measured. h69 replaced the
+    geomean gate with "proxy AND prod each >= 1.00x beat"; validation's own figures are
+    fast 1.652x / proxy 0.776x / prod 0.780x -> min 0.776x. The geomean it still prints
+    (1.000x) is reported only and decides nothing.
+
+explored:
+  ran:
+    - "static ISA gate on 21_final_isa.s for k_dkdv_pair vs k_dkdv (raw/isa2.sh, raw/gate.py) -- decided that the edit had not leaked into the hot body, which is what made the arm worth card time"
+    - "four-reading free gate as h18 requires: qloop_full body length, its s_set_vgpr_msb count, VGPR/spill/scratch/LDS, and the last buffer_load_b128 index (pool rule 1)"
+    - "two built-in derivational A/A nulls (proxy, fast) inside the same process and clock excursion -- gave the session floor at zero extra card time"
+    - "device-mapping check via docker inspect after a neighbour job appeared mid-run -- changed nothing about the numbers but is the reason I can say so"
+  consulted:
+    - backends/aiter/attention/recipes/fmha_v3_bwd_hd128_bf16.md
+    - backends/flydsl/attention/techniques.md
+    - backends/flydsl/attention/dead-ends.md
+    - optimization/techniques/1-grid-and-cache-locality.md
+    - optimization/techniques/5-autotune-and-sweeps.md
+    - arch/gfx1250/isa.md
+  bound: latency
+  confidence: medium
+  why: >
+    Round 28 eliminated the two remaining non-latency explanations for prod. g87 showed the
+    split-K axis is converged with an INTERIOR optimum (nsp 1/2/4/8 = 0.8162/1.0000/0.9382/
+    0.8485), so prod is not split-K limited. g88 showed prod is not dispatch-limited: its kv
+    grid is eight dispatch waves deep and greedy dispatch already balances the 256:1 causal
+    skew, so a second balancer collected nothing and cost 0.53%. And g86 showed a verified
+    -2.4% cut in ISSUED instructions returns +0.28-0.37%, a ~0.15x conversion, so the hot
+    body is not issue-limited at the margin either. What is left is dependent latency inside
+    the hot body. Confidence stays medium because all three are eliminations, not a direct
+    measurement of latency -- and h4 forbids rocprofv3 and PC sampling on this op, so a
+    direct measurement is not available to this job.
+
+arms:
+  - id: r27.i3.g86
+    built: "INHERITED id, re-applied alone to the r19h tree installed by h68"
+    tflops: {fast: 98.2, proxy: 586.5, prod: 640.6}
+    vs_champion: 1.0028        # at prod, vs base (= op/current) in the same process
+    shipped: false
+    note: >
+      The BEST arm this round built at prod, and it is not the shipped one. +0.28% at prod
+      in this sweep (+0.37% in the round's earlier sweep on the same tree), positive in both
+      passes. Inert at proxy/fast by construction, where it reads -0.24%/-0.67% as a null.
+  - id: r28.i1.g87
+    built: "split-K threshold probes; impl.py host constant only, kernels byte-identical"
+    tflops: {proxy_vs_base: 0.8162, proxy_nsp4: 0.9382, proxy_nsp8: 0.8485, proxy_nspq2: 0.9186}
+    vs_champion: 0.8162
+    shipped: false
+    note: >
+      Every probe lost. The base nsp = 2 is an INTERIOR optimum (1 < 2 > 4 > 8), so by the
+      corpus's own convergence test the axis is closed. This directly falsifies the refactor
+      report's ranked item 2, which called proxy's nsp "the classic unconverged-endpoint
+      signature". CLOSED.
+  - id: r28.i2.g88
+    built: "alone, on top of the g86 tree -- the base route row 16 names"
+    tflops: {fast: 98.3, proxy: 588.2, prod: 637.2}
+    vs_champion: 0.9947        # at prod, vs armA in the same process
+    shipped: true
+    note: >
+      LOST at prod by 0.53%, against a same-process A/A floor of +0.29%/+0.10%, with the
+      same sign in both passes. Free gate passed on every reading. Mechanism of the loss:
+      the causal imbalance pairing removes had ALREADY been removed by the hardware
+      dispatcher -- prod's kv grid is eight dispatch waves and greedy dispatch balances the
+      256:1 skew to a modelled 100%, so pairing collected nothing and paid +6 VGPR, +6/+10
+      instructions in qloop_mask, and a text section doubled from 2535 to 4764 lines.
+      Left in the working copy, not reverted.
+  # No merge was built. The round spec merges only if neither arm lost; g87 lost outright,
+  # and g88 was built ON TOP of g86 rather than beside it because route row 16 names the
+  # g86 tree as its base.
+
+expected: >
+  This job runs BLOCK_KV = 32. At prod the kv-outer grid is nhkv(8) x nblk(256) x nb(4) =
+  8192 workgroups onto ~1024 slots = EIGHT dispatch waves, and impl.py's own census comment
+  already says the greedy hardware dispatcher balances the 256:1 causal work skew to a
+  modelled 100%. Greedy list scheduling over eight waves is a load balancer; pairing is a
+  second one. You cannot collect the same imbalance twice. So: predicted prod cand/armA =
+  1.000 to 1.005. The residue pairing can still collect is tail-wave quantisation plus the
+  1/n block granularity = 1/256 = 0.39% at prod, NOT the corpus's 1/16 = 6.25%.
+  Downside risk priced too: the ISA gate shows VGPR 729 -> 735 and the masked q loop growing
+  650 -> 656/660, plus a doubled text section costing instruction cache. If prod comes back
+  BELOW 1.000 that is the mechanism I will name.
+  proxy and fast are predicted at exactly 1.000x: g88 is on the nsp == 1 branch only, so
+  there it is a derivational A/A null and any deviation is the session floor.
+  # Verbatim from raw/expected_g88.txt, written after the build and the free gate and BEFORE
+  # the benchmark produced a number; the file's mtime (07:23:49) is the evidence.
+  # OUTCOME: wrong. prod measured 0.9947 -- the downside clause, not the central estimate.
+
+added_to_pool: [r28.i1.g87, r28.i2.g88]
+route_updated: true
+
+implementation:
+  files_changed:
+    - rounds/028/op/kernels.py
+    - rounds/028/op/impl.py
+  build_failures: []
+  note: >
+    kernels.py carries both g86 (the dK/dV epilogue staged through the finished LDS ring,
+    inside the PARTIAL == False branch) and g88 (the kv-tile body lifted into a _tile(bid)
+    closure called twice under `if PAIR:`, plus k_dkdv_pair/launch_dkdv_pair). impl.py
+    carries only g88's dispatch on the nsp == 1 branch, with an odd-nblk fallback to the
+    unpaired kernel. The compile cache was cleared before the first build of the round
+    (~/.cache/comgr, 74 MB, inside the fa-g3 container) so that no stale kernel could be
+    measured in place of a new one. g88 needed no build iterations: it compiled and passed
+    all 15 unit-test cases on the first attempt.
