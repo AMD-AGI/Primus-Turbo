@@ -616,7 +616,6 @@ class MXFP4DualQuantStoreDglu:
         col_pad_rows,
         lds_base,
         group_words,
-        col_words,
         row_stride,
         lane_id,
         wave_n,
@@ -624,6 +623,7 @@ class MXFP4DualQuantStoreDglu:
         row_sr=False,
         col_sr=False,
         sr_seed=None,
+        col_words=None,
         co_words=None,
         co_bands=1,
     ):
@@ -636,7 +636,12 @@ class MXFP4DualQuantStoreDglu:
         self.lane_id = lane_id
         self.wave_n = wave_n
         self.group_words = group_words
-        self.col_words = col_words
+        # ``col_words`` gives the transpose words of its own. Left unset it shares the
+        # dact band's -- the only layout a caller whose LDS budget has no room past the
+        # band can use -- and the epilogue then keeps the two fences that sharing needs
+        # (see StoreCdSwiGLUQuadQuant.store_pair_quant).
+        self.col_aliases_dact = col_words is None
+        self.col_words = group_words if col_words is None else col_words
         self.co_bands = co_bands
         self.co_words = co_words
         if co_bands > 1:
@@ -2251,7 +2256,7 @@ class StoreCdSwiGLUQuadQuant(StoreCdSwiGLUQuadCShuffle):
         # Twice the parent's band -- it is a whole col-wise micro-block -- plus the
         # transpose region, which no longer shares the dact band's words, plus the
         # col-out staging the coalesced write-back deals its lanes out of.
-        cw = MXFP4DualQuantStoreDglu.col_words_per_group()
+        cw = 0 if self.q.col_aliases_dact else MXFP4DualQuantStoreDglu.col_words_per_group()
         ow = MXFP4DualQuantStoreDglu.co_words_per_group(self.q.co_bands)
         return 2 * (DGLU_BAND_ROWS * self.row_stride + cw + ow) * 4
 
@@ -2392,8 +2397,12 @@ class StoreCdSwiGLUQuadQuant(StoreCdSwiGLUQuadCShuffle):
                             # The row-wise operand is quantised from the values, not from
                             # the bf16 the col-wise staging rounds them to.
                             self.q.store_rowwise(rows[c][st], grow, gcol + fx.Int32(st * self.glu_i), ok)
-                    # No fence before the transpose: it has a region of its own, so
-                    # it is not writing over dact that another lane still owes a read.
+                    # A transpose with a region of its own needs no fence here. One that
+                    # shares the dact band is about to overwrite rows another lane may
+                    # still owe a read of, so every lane has to be past them first.
+                    if const_expr(self.q.col_aliases_dact):
+                        S2RLoaderTr._wait_lgkmcnt(0)
+                        rocdl.s_barrier()  # sub-tile read by all lanes, safe to overwrite
                     self.q.stage_col(
                         fx.Int32(sub * (DGLU_HALF_ROWS // 2)) + rp_local,
                         col_in,
@@ -2418,7 +2427,12 @@ class StoreCdSwiGLUQuadQuant(StoreCdSwiGLUQuadCShuffle):
                         pad_row_base + fx.Int32(band * MB),
                         gcol - col_in,
                     )
-                # No third rendezvous. Since the transpose got a region of its own
+                if const_expr(self.q.col_aliases_dact):
+                    # A shared band is restaged by the next band's dact write, which must
+                    # not land before every lane has read the transpose back out of it.
+                    S2RLoaderTr._wait_lgkmcnt(0)
+                    rocdl.s_barrier()  # band consumed, safe to restage
+                # With a transpose region of its own there is no third rendezvous: since then
                 # the band leaves two cross-wave hazards behind, and the next band's
                 # own two barriers already stand between both: its dact write comes
                 # after this band's "transposed" barrier, and its transpose write

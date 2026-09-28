@@ -847,9 +847,6 @@ def _build_grouped_mxfp4_nt_kernel(
                     aq_col_rows,
                     I32(fx.ptrtoint(lds.A_e.ptr)),
                     I32(wave_m) * I32(DGLU_BAND_ROWS * _row_stride),
-                    # The transpose sits past both wave_m groups' dact bands.
-                    I32(2 * DGLU_BAND_ROWS * _row_stride)
-                    + I32(wave_m) * I32(MXFP4DualQuantStoreDglu.col_words_per_group()),
                     _row_stride,
                     lane_id,
                     wave_n,
@@ -857,6 +854,9 @@ def _build_grouped_mxfp4_nt_kernel(
                     row_sr=epi_row_sr,
                     col_sr=epi_col_sr,
                     sr_seed=SR_SEED,
+                    # The transpose sits past both wave_m groups' dact bands.
+                    col_words=I32(2 * DGLU_BAND_ROWS * _row_stride)
+                    + I32(wave_m) * I32(MXFP4DualQuantStoreDglu.col_words_per_group()),
                     # The col-out staging sits past both groups' transposes.
                     co_words=I32(2 * DGLU_BAND_ROWS * _row_stride)
                     + I32(2 * MXFP4DualQuantStoreDglu.col_words_per_group())
