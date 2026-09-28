@@ -1,0 +1,15 @@
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm c_ku2 /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-kdq/oe/artifacts/job/job_context/op/c_ku2 grouped=True
+# arm c_k1f /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-kdq/oe/artifacts/job/job_context/op/c_k1f grouped=True
+# arm c_k1 /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-kdq/oe/artifacts/job/job_context/op/c_k1 grouped=True
+# arm cur /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-kdq/oe/artifacts/job/job_context/op/cur grouped=True
+KB shape=prod mode=blk what=dq arm=c_ku2 median_ms=2.9942 min=2.7991 max=3.0394 n=45 sclk_med=1838 order=c_ku2,c_k1f,c_k1,cur
+KB shape=prod mode=blk what=dq arm=c_k1f median_ms=2.9928 min=2.7874 max=3.0245 n=45 sclk_med=1839 order=c_ku2,c_k1f,c_k1,cur
+KB shape=prod mode=blk what=dq arm=c_k1 median_ms=2.9895 min=2.7873 max=3.0323 n=45 sclk_med=1838 order=c_ku2,c_k1f,c_k1,cur
+KB shape=prod mode=blk what=dq arm=cur median_ms=2.9933 min=2.7953 max=3.0267 n=45 sclk_med=1838 order=c_ku2,c_k1f,c_k1,cur
+KB shape=prod mode=blk what=full arm=c_ku2 median_ms=8.9293 min=8.8395 max=9.0222 n=45 sclk_med=1890 order=c_ku2,c_k1f,c_k1,cur
+KB shape=prod mode=blk what=full arm=c_k1f median_ms=8.3955 min=8.3313 max=8.4675 n=45 sclk_med=1852 order=c_ku2,c_k1f,c_k1,cur
+KB shape=prod mode=blk what=full arm=c_k1 median_ms=8.3518 min=8.2491 max=8.4440 n=45 sclk_med=1827 order=c_ku2,c_k1f,c_k1,cur
+KB shape=prod mode=blk what=full arm=cur median_ms=8.3002 min=8.2083 max=8.4470 n=45 sclk_med=1812 order=c_ku2,c_k1f,c_k1,cur
+KBDONE
+rc=0

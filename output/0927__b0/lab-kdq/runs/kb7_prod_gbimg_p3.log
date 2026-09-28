@@ -1,0 +1,3 @@
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm cur /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-kdq/oe/artifacts/job/job_context/op/cur grouped=True
+# arm c_k1 /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-kdq/oe/artifacts/job/job_context/op/c_k1 grouped=True

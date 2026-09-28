@@ -1,0 +1,18 @@
+kb7_prod_gbimg_p1 rc=0 newdmesg=0 bad=0
+  gb dq r19h 4.0449 sclk 1282.0
+  gb dq cur 3.7262 sclk 1277.5
+  gb dq c_epi 3.7369 sclk 1274.0
+  gb dq c_k1 3.7329 sclk 1273.5
+  gb full r19h 9.6091 sclk 1352.0
+  gb full cur 9.3093 sclk 1346.0
+  gb full c_epi 9.2992 sclk 1346.0
+  gb full c_k1 9.3383 sclk 1349.5
+kb7_prod_gbimg_p2 rc=0 newdmesg=0 bad=0
+  gb dq c_k1 3.7432 sclk 1272.0
+  gb dq c_epi 3.7424 sclk 1274.0
+  gb dq cur 3.7408 sclk 1276.5
+  gb dq r19h 4.0556 sclk 1281.0
+  gb full c_k1 9.3514 sclk 1348.0
+  gb full c_epi 9.3076 sclk 1346.5
+  gb full cur 9.3064 sclk 1344.0
+  gb full r19h 9.6266 sclk 1352.0

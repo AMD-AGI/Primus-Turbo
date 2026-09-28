@@ -1,0 +1,9 @@
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm r19h /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-kdq/oe/artifacts/job/job_context/op/r19h grouped=False
+# arm cur /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-kdq/oe/artifacts/job/job_context/op/cur grouped=True
+KB shape=prod mode=gb what=dq arm=r19h median_ms=2.9983 min=2.9711 max=3.0209 n=30 sclk_med=2179.0 sclk_pre=2179.0 pre_ms=467.70 order=r19h,cur
+KB shape=prod mode=gb what=dq arm=cur median_ms=2.7293 min=2.7071 max=2.7640 n=30 sclk_med=2180.0 sclk_pre=2180.0 pre_ms=467.69 order=r19h,cur
+KB shape=prod mode=gb what=full arm=r19h median_ms=8.3563 min=8.2870 max=8.4709 n=30 sclk_med=2178.0 sclk_pre=2178.0 pre_ms=467.77 order=r19h,cur
+KB shape=prod mode=gb what=full arm=cur median_ms=8.0539 min=7.9963 max=8.1178 n=30 sclk_med=2178.0 sclk_pre=2178.0 pre_ms=467.81 order=r19h,cur
+KBDONE
+rc=0

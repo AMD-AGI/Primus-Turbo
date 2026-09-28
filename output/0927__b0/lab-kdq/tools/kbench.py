@@ -89,10 +89,34 @@ for label, path in arms:
 ev0, ev1 = torch.cuda.Event(True), torch.cuda.Event(True)
 
 
+import threading
+_SAMP = []            # (perf_counter, sclk) from a 0.5 ms sysfs poller while a run is active
+_SAMP_ON = [False]
+
+
+def _sampler():
+    while True:
+        if _SAMP_ON[0]:
+            _SAMP.append((time.perf_counter(), sclk()))
+            if len(_SAMP) > 400000:
+                del _SAMP[:200000]
+        time.sleep(0.0005)
+
+
+threading.Thread(target=_sampler, daemon=True).start()
+
+
 def timed(f, pre):
+    """returns (kernel ms, sclk median inside the call's host window, sclk right after pre, pre ms)"""
+    tp = time.perf_counter()
     pre()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    c_pre = sclk()
     ev0.record(); f(); ev1.record(); ev1.synchronize()
-    return ev0.elapsed_time(ev1), sclk()
+    t1 = time.perf_counter()
+    win = [c for (t, c) in _SAMP[-4000:] if t0 <= t <= t1]
+    return ev0.elapsed_time(ev1), (statistics.median(win) if win else sclk()), c_pre, (t0 - tp) * 1e3
 
 
 def run(what, table, pre, lead, block):
@@ -103,6 +127,7 @@ def run(what, table, pre, lead, block):
             table[lb]()
         torch.cuda.synchronize()
     res = {lb: [] for lb in labels}
+    _SAMP_ON[0] = True
     rounds = -(-iters // block)
     for r in range(rounds):
         for lb in (labels if r % 2 == 0 else labels[::-1]):
@@ -110,10 +135,13 @@ def run(what, table, pre, lead, block):
                 timed(table[lb], pre)
             for _ in range(block):
                 res[lb].append(timed(table[lb], pre))
+    _SAMP_ON[0] = False
     for lb in labels:
-        ts = sorted(t for t, _ in res[lb]); ck = [c for _, c in res[lb]]
+        ts = sorted(x[0] for x in res[lb]); ck = [x[1] for x in res[lb]]
+        cp = [x[2] for x in res[lb]]; pm = [x[3] for x in res[lb]]
         print(f"KB shape={shape} mode={mode} what={what} arm={lb} median_ms={statistics.median(ts):.4f} "
               f"min={ts[0]:.4f} max={ts[-1]:.4f} n={len(ts)} sclk_med={statistics.median(ck)} "
+              f"sclk_pre={statistics.median(cp)} pre_ms={statistics.median(pm):.2f} "
               f"order={','.join(labels)}", flush=True)
 
 

@@ -7,3 +7,9 @@ KB shape=prod mode=blk what=dq arm=cur median_ms=2.9870 min=2.8300 max=3.0327 n=
 KB shape=prod mode=blk what=dq arm=c_k1 median_ms=2.9914 min=2.8129 max=3.0448 n=45 sclk_med=1838 order=cur,c_k1,c_k1f,c_ku2
 KB shape=prod mode=blk what=dq arm=c_k1f median_ms=2.9907 min=2.7866 max=3.0444 n=45 sclk_med=1836 order=cur,c_k1,c_k1f,c_ku2
 KB shape=prod mode=blk what=dq arm=c_ku2 median_ms=2.9918 min=2.8039 max=3.0166 n=45 sclk_med=1834 order=cur,c_k1,c_k1f,c_ku2
+KB shape=prod mode=blk what=full arm=cur median_ms=8.3539 min=8.1996 max=8.4150 n=45 sclk_med=1810 order=cur,c_k1,c_k1f,c_ku2
+KB shape=prod mode=blk what=full arm=c_k1 median_ms=8.3566 min=8.2610 max=8.4338 n=45 sclk_med=1837 order=cur,c_k1,c_k1f,c_ku2
+KB shape=prod mode=blk what=full arm=c_k1f median_ms=8.3812 min=8.3034 max=8.4604 n=45 sclk_med=1826 order=cur,c_k1,c_k1f,c_ku2
+KB shape=prod mode=blk what=full arm=c_ku2 median_ms=8.9136 min=8.8068 max=8.9925 n=45 sclk_med=1901 order=cur,c_k1,c_k1f,c_ku2
+KBDONE
+rc=0

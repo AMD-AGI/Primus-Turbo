@@ -1,0 +1,12 @@
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm cur /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-kdq/oe/artifacts/job/job_context/op/cur grouped=True
+# arm r19h /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-kdq/oe/artifacts/job/job_context/op/r19h grouped=False
+# arm c_epi /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-kdq/oe/artifacts/job/job_context/op/c_epi grouped=True
+KB shape=prod mode=gb what=dq arm=cur median_ms=2.7069 min=2.6894 max=2.7259 n=45 sclk_med=2176 order=cur,r19h,c_epi
+KB shape=prod mode=gb what=dq arm=r19h median_ms=2.9776 min=2.9678 max=2.9988 n=45 sclk_med=2177 order=cur,r19h,c_epi
+KB shape=prod mode=gb what=dq arm=c_epi median_ms=2.7065 min=2.6929 max=2.7324 n=45 sclk_med=2176 order=cur,r19h,c_epi
+KB shape=prod mode=gb what=full arm=cur median_ms=8.0277 min=7.9826 max=8.0923 n=45 sclk_med=2156 order=cur,r19h,c_epi
+KB shape=prod mode=gb what=full arm=r19h median_ms=8.3260 min=8.2552 max=8.3808 n=45 sclk_med=2157 order=cur,r19h,c_epi
+KB shape=prod mode=gb what=full arm=c_epi median_ms=8.0227 min=7.9957 max=8.0805 n=45 sclk_med=2156 order=cur,r19h,c_epi
+KBDONE
+rc=0

@@ -4,7 +4,7 @@ TAG=$1; shift
 L=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-kdq
 OP=$L/oe/artifacts/job/job_context/op; R=$L/runs
 N0=$(timeout 20 sudo -n dmesg | wc -l)
-flock /tmp/b0-gpu0.lock docker exec -e ARCH=gfx1250 -e FLYDSL_GPU_ARCH=gfx1250 -e OE_PHYS_GPU=0 -e KB_NG=${KB_NG:-4} fa-g0 bash -c "export TORCH_BLAS_PREFER_HIPBLASLT=1 HIPBLASLT_TENSILE_LIBPATH=/home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250 FLYDSL_RUNTIME_CACHE_DIR=/tmp/flycache_labkdq_g0; cd $OP && timeout 1500 python3 $*" > $R/$TAG.log 2>&1
+flock /tmp/b0-gpu0.lock docker exec -e ARCH=gfx1250 -e FLYDSL_GPU_ARCH=gfx1250 -e OE_PHYS_GPU=0 -e KB_NG=${KB_NG:-4} fa-g0 bash -c "export TORCH_BLAS_PREFER_HIPBLASLT=1 HIPBLASLT_TENSILE_LIBPATH=${KB_BLASLIB:-/home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250} FLYDSL_RUNTIME_CACHE_DIR=/tmp/flycache_labkdq_g0; cd $OP && timeout 1500 python3 $*" > $R/$TAG.log 2>&1
 echo "rc=$?" >> $R/$TAG.log
 timeout 20 sudo -n dmesg | tail -n +$((N0+1)) > $R/$TAG.dmesg
 grep -v '0002:04:00' $R/$TAG.dmesg | grep -iE 'amdgpu|fault|gcvm|mes|hang|reset' > $R/$TAG.dmesg.bad

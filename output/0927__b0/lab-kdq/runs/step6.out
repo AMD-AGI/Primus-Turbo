@@ -37,3 +37,52 @@ CORR shape=fast arm=c_ku2 dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
 DET shape=fast arm=c_ku2 runs=200 dkdv=bitwise dq_worst=bitwise  pass
 XARM shape=fast c_ku2 vs cur: dq=bitwise dk=bitwise dv=bitwise
 LABVAL fast PASS
+kb6_prod_blk_p1 rc=0 newdmesg=0 bad=0
+  blk dq cur 2.9870 sclk 1840
+  blk dq c_k1 2.9914 sclk 1838
+  blk dq c_k1f 2.9907 sclk 1836
+  blk dq c_ku2 2.9918 sclk 1834
+  blk full cur 8.3539 sclk 1810
+  blk full c_k1 8.3566 sclk 1837
+  blk full c_k1f 8.3812 sclk 1826
+  blk full c_ku2 8.9136 sclk 1901
+kb6_prod_blk_p2 rc=0 newdmesg=0 bad=0
+  blk dq c_ku2 2.9942 sclk 1838
+  blk dq c_k1f 2.9928 sclk 1839
+  blk dq c_k1 2.9895 sclk 1838
+  blk dq cur 2.9933 sclk 1838
+  blk full c_ku2 8.9293 sclk 1890
+  blk full c_k1f 8.3955 sclk 1852
+  blk full c_k1 8.3518 sclk 1827
+  blk full cur 8.3002 sclk 1812
+kb6_prod_blk_p3 rc=0 newdmesg=0 bad=0
+  blk dq c_k1 2.9974 sclk 1837
+  blk dq cur 2.9884 sclk 1837
+  blk dq c_ku2 2.9916 sclk 1836
+  blk dq c_k1f 2.9877 sclk 1838
+  blk full c_k1 8.3570 sclk 1829
+  blk full cur 8.3050 sclk 1814
+  blk full c_ku2 8.9290 sclk 1884
+  blk full c_k1f 8.3972 sclk 1847
+kb6_prod_gb_p1 rc=0 newdmesg=0 bad=0
+  gb dq r19h 2.9735 sclk 2177
+  gb dq cur 2.7037 sclk 2176
+  gb dq c_epi 2.7038 sclk 2176
+  gb full r19h 8.3141 sclk 2157
+  gb full cur 8.0133 sclk 2157
+  gb full c_epi 8.0143 sclk 2157
+kb6_prod_gb_p2 rc=0 newdmesg=0 bad=0
+  gb dq c_epi 2.7114 sclk 2176
+  gb dq cur 2.7096 sclk 2176
+  gb dq r19h 2.9831 sclk 2177
+  gb full c_epi 8.0590 sclk 2155
+  gb full cur 8.0575 sclk 2154
+  gb full r19h 8.3406 sclk 2154
+kb6_prod_gb_p3 rc=0 newdmesg=0 bad=0
+  gb dq cur 2.7069 sclk 2176
+  gb dq r19h 2.9776 sclk 2177
+  gb dq c_epi 2.7065 sclk 2176
+  gb full cur 8.0277 sclk 2156
+  gb full r19h 8.3260 sclk 2157
+  gb full c_epi 8.0227 sclk 2156
+STEP6 DONE
