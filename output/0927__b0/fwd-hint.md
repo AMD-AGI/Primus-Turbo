@@ -67,6 +67,7 @@ Source abbreviations used below:
 | h46 | must standing note | FlyDSL JIT CACHE HAZARD: the disk-cache key ignores module-level constants (e.g. SPEC_STALE_MAX) -- a path whose contents changed can serve the OLD binary. Every measurement uses a fresh FLYDSL_RUNTIME_CACHE_DIR per process (or per arm) | open |
 | h47 | must note | REDIRECT after 4 non-improving rounds (r14-r17): the remaining prod gap is issued work x clock sensitivity; rank candidates on the REAL dumps after a GEMM burst as well as randn, and target instruction count on the prod m32x8 hot loop | open |
 | h48 | must refactor | Adopt rounds/019/op verbatim as op/current: vs the champion +1.5% on real dumps after a GEMM burst (18/18 readings above the A/A max) and +1.7% on randn; rejected only by r18's unshipped best-ever record | open |
+| h50 | must standing | NEVER compute an fp32 reference on the card: round 20's adv_m32x8.py faulted GPU2 inside the hipBLASLt fp32 forward_reference GEMM (TCP permission fault) -- use refcache or a CPU reference; the job was hard-stopped to avoid a wedge | open |
 
 ---
 
@@ -857,3 +858,13 @@ Acceptance rejected it (0.9998) only because the per-shape best-ever records now
 promoted -- the same trap as h39 (see op-evolve suggestion 1). Operator decision per the h39 precedent: adopt it.
 **Refactor task**: copy `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/019/op/` into the working copy VERBATIM, run the correctness gate; promotion clears
 the stale best-ever records. Remember h46: clear /tmp/flycache after the promotion before re-measuring the champion.
+
+## h50 -- Never compute an fp32 reference on the card
+
+2026-09-28 ~11:55 UTC: round 20's act ran `adv_m32x8.py` (bitwise check vs rounds/019/op); on its first case it died
+rc=134 inside the hipBLASLt fp32 `forward_reference` GEMM (`Cijk_Ailk_Bljk_S_B_..._MT32x32x16`), page not present at
+0x280000; dmesg 106399.3 on 0003:04:00.0: TCP PERMISSION_FAULTS 0x3, AID1.XCD2. No MES hang. This is the same path that
+escalated into the 2026-09-22 power cycle. The act planned to re-run it; the operator hard-stopped the loop instead.
+Rules: bitwise/adversarial comparisons compare candidate vs champion (both bf16 kernels) or use refcache / a CPU fp64
+reference (as verify_r6/ and fwd-nospec/ did); no fp32 GEMM reference on the card, ever, and never re-run a script
+that just faulted the card. Round 20's act must be redone on resume (the refactor h48 applies at the next round head).

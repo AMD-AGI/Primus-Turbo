@@ -218,3 +218,11 @@ fwd ~10 ms. So **bwd first on A0** (reverses SKILL.md §1 "forward first", which
   Rulers: blocked timing (h40/h66), real q/k/v dumps after a GEMM burst (h47), fresh JIT cache per process (h46/h72).
   Before resuming either job on A0: final.yaml container `fa-repro` / host / gpu_id, append host hints h49 (fwd) / h74 (bwd).
 ```
+
+## 8. Late update (2026-09-28 ~12:00 UTC)
+- **fwd job hard-stopped in round 20 (deep, act step).** The act's `adv_m32x8.py` faulted GPU2 inside the hipBLASLt fp32
+  `forward_reference` GEMM (TCP permission fault, no MES hang); the loop was killed before it re-ran the script. New hint
+  **h50** forbids fp32 references on the card. On resume the round-20 act is redone from scratch.
+- **fwd hint h48 (must refactor) is pending**: adopt `rounds/019/op` (+1.5% real-dump, +1.7% randn vs champion; blocked only
+  by r18's unshipped best-ever record). It applies at the head of the next round after round 20.
+- Host hints for A0 are therefore numbered **h49 (fwd)** / h74 (bwd) (section 3).
