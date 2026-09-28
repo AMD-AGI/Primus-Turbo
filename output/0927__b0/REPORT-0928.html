@@ -89,7 +89,7 @@ footer{margin-top:48px;color:var(--muted);font-size:.8rem;border-top:1px solid v
 主机 <b>B0 = ctheliosp-1b112-a37-1</b>（4 × gfx1250 / MI455X，同一 XGMI hive） ·
 分支 <code>dev/lhz/flydsl-attn-b0</code> ·
 形状 prod：b4 s8192 hq32 hkv8 d128 bf16 causal（BSHD），FLOP fwd 2.199292e12 / bwd 5.498229e12<br>
-<b>数据截至：2026-09-28 10:38 UTC</b>（<code>fwd/progress.md</code> 最后一轮 r18 结束时间；e2e 终版测量 10:38–10:44，快照提交 <code>5188c9da</code> 11:00）
+<b>数据截至：2026-09-28 12:45 UTC（收工，两个 job 均已停止）</b>（第一版 10:38 UTC；12:45 的增补见第 0 节）
 </div>
 </header>
 
@@ -109,6 +109,16 @@ footer{margin-top:48px;color:var(--muted);font-size:.8rem;border-top:1px solid v
 </nav>
 
 <!-- ============================================================ -->
+<h2 id="s0">0. 收工增补（10:38 → 12:45 UTC）</h2>
+<ul>
+<li><b>收工时的冠军</b>：fwd = job <code>gfx1250-flydsl-attn-fwd-b0-20260927</code> r16（r13ns，关掉投机）；bwd = job <code>gfx1250-flydsl-attn-bwd-20260917-115934</code> r29（r19h + u2n，prod 656.5 TF/s，ASM 的 80.4%）。两棵树的逐字节快照在 <code>output/0927__b0/champions/</code>。</li>
+<li><b>e2e 终版</b>（fwd r13ns + bwd r29 vs aiter ASM，同进程 ABBA/BAAB）：单步 fly/asm = <b>1.0323 / 1.0328</b>，tps 20,070–20,091 对 20,697–20,747；剩余差距约 52 ms/步在 bwd、约 10 ms/步在 fwd（<code>e2e/RESULT-final.md</code>）。</li>
+<li><b>fwd r19</b>：新候选在两把尺子上都胜过冠军（真实数据 + GEMM 突发 +1.5%，18/18 读数高于 A/A 上界；randn +1.7%），但被 r18 未晋升 arm 留下的"历史最佳"记录挡住（第二次触发该陷阱）→ 已下发 refactor hint <b>h48</b>，将在下一轮开头采用。</li>
+<li><b>fwd r20（deep）中断</b>：act 的对抗测试在卡上跑 fp32 参考 GEMM（hipBLASLt）时触发 GPU2 page fault（TCP permission fault，无 MES hang）。为避免升级为 hive 级 wedge，operator 硬停了 fwd loop，并下发 <b>h50</b>：禁止在卡上算 fp32 参考。</li>
+<li><b>bwd r30–r32</b>：g89（dQ epilogue 经 LDS 合并 store）null；r31、r32 的 arm 全部持平或变慢（0.9915 / 0.9861）。冠军仍是 r29。k_dq lab 第二轮确认 u2n 在训练时钟（1272–1352 MHz）下整 op −3.2%、k_dq −7.8%，另外 9 个后续 arm 全部 null/loss（h73）。</li>
+<li><b>停止位置</b>：fwd 停在 r20 act（resume 会重做该轮 act）；bwd 停在 r33 opt 开头（resume 重做 r33）。A0 衔接：<code>output/0927__b0/HANDOFF-A0.md</code>（第 8、9 节为最终状态）。</li>
+<li><b>他人容器</b>：09:00–09:27 UTC 间先后自动停掉 weihuan（hipblaslt-bench，×5）和 andyye12（maxdiffusion / fp8 检查，×3）的容器。</li>
+</ul>
 <h2 id="s1">1. 摘要</h2>
 
 <div class="cards">

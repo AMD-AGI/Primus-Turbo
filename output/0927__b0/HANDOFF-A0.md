@@ -226,3 +226,17 @@ fwd ~10 ms. So **bwd first on A0** (reverses SKILL.md §1 "forward first", which
 - **fwd hint h48 (must refactor) is pending**: adopt `rounds/019/op` (+1.5% real-dump, +1.7% randn vs champion; blocked only
   by r18's unshipped best-ever record). It applies at the head of the next round after round 20.
 - Host hints for A0 are therefore numbered **h49 (fwd)** / h74 (bwd) (section 3).
+
+## 9. Final state at B0 shutdown (2026-09-28 12:45 UTC)
+- **Both loops stopped** (no op-evolve process, no KFD process on B0):
+  - fwd `gfx1250-flydsl-attn-fwd-b0-20260927`: stopped in **round 20 (deep), act step 01_implement** (hard stop after the
+    GPU2 fault, see section 8). best_round **16** (r13ns). Pending hint: h48 (must refactor, adopt rounds/019/op).
+  - bwd `gfx1250-flydsl-attn-bwd-20260917-115934`: stopped at the **start of round 33 (fast, opt)** (`.stop` flag + TERM;
+    `run_loop` removes a leftover `.stop` on the next resume). best_round **29** (r19h + u2n). Rounds 30-32 rejected
+    (0.9967... null g89; 0.9915; 0.9861): bwd has 3 non-improving rounds -> start A0 with the ranked next steps in section 5.
+- Champions unchanged since the `champions/` snapshot (commit 5188c9da): fwd r16 = `champions/fwd_r16_r13ns/`,
+  bwd r29 = `champions/bwd_r29_r19h_u2n/` (kernels.py md5 37f37052...).
+- Final e2e (fwd r13ns + bwd r29 vs ASM): per-step fly/asm 1.0323 / 1.0328 (`e2e/RESULT-final.md`).
+- Day report (Chinese, HTML): `output/0927__b0/REPORT-0928.html`.
+- B0 GPU1 is still wedged (MES failed to respond) and needs an AC cycle; containers fa-g0/fa-g2/fa-g3 are left running
+  (idle), fa-repro is parked as `fa-repro-parked`.
