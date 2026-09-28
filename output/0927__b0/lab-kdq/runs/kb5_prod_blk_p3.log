@@ -7,3 +7,21 @@
 # arm c_epi /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-kdq/oe/artifacts/job/job_context/op/c_epi grouped=True
 # arm c_u2b /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-kdq/oe/artifacts/job/job_context/op/c_u2b grouped=True
 # arm c_u2fb /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-kdq/oe/artifacts/job/job_context/op/c_u2fb grouped=True
+KB shape=prod mode=blk what=dq arm=c_u2f median_ms=3.0942 min=2.9731 max=3.1464 n=45 sclk_med=1949 order=c_u2f,cur,c_ku2b,c_u2nb,r19h,c_epi,c_u2b,c_u2fb
+KB shape=prod mode=blk what=dq arm=cur median_ms=2.9911 min=2.8163 max=3.0156 n=45 sclk_med=1948 order=c_u2f,cur,c_ku2b,c_u2nb,r19h,c_epi,c_u2b,c_u2fb
+KB shape=prod mode=blk what=dq arm=c_ku2b median_ms=2.9914 min=2.8904 max=3.0211 n=45 sclk_med=1979 order=c_u2f,cur,c_ku2b,c_u2nb,r19h,c_epi,c_u2b,c_u2fb
+KB shape=prod mode=blk what=dq arm=c_u2nb median_ms=3.6111 min=3.5724 max=3.6574 n=45 sclk_med=1994 order=c_u2f,cur,c_ku2b,c_u2nb,r19h,c_epi,c_u2b,c_u2fb
+KB shape=prod mode=blk what=dq arm=r19h median_ms=3.1802 min=3.0946 max=3.2325 n=45 sclk_med=1992 order=c_u2f,cur,c_ku2b,c_u2nb,r19h,c_epi,c_u2b,c_u2fb
+KB shape=prod mode=blk what=dq arm=c_epi median_ms=3.0014 min=2.8224 max=3.0411 n=45 sclk_med=1960 order=c_u2f,cur,c_ku2b,c_u2nb,r19h,c_epi,c_u2b,c_u2fb
+KB shape=prod mode=blk what=dq arm=c_u2b median_ms=3.4710 min=3.4456 max=3.5071 n=45 sclk_med=1987 order=c_u2f,cur,c_ku2b,c_u2nb,r19h,c_epi,c_u2b,c_u2fb
+KB shape=prod mode=blk what=dq arm=c_u2fb median_ms=3.5347 min=3.5002 max=3.5581 n=45 sclk_med=2047 order=c_u2f,cur,c_ku2b,c_u2nb,r19h,c_epi,c_u2b,c_u2fb
+KB shape=prod mode=blk what=full arm=c_u2f median_ms=8.4817 min=8.2906 max=8.5243 n=45 sclk_med=1841 order=c_u2f,cur,c_ku2b,c_u2nb,r19h,c_epi,c_u2b,c_u2fb
+KB shape=prod mode=blk what=full arm=cur median_ms=8.2771 min=8.1291 max=8.4148 n=45 sclk_med=1838 order=c_u2f,cur,c_ku2b,c_u2nb,r19h,c_epi,c_u2b,c_u2fb
+KB shape=prod mode=blk what=full arm=c_ku2b median_ms=9.0220 min=8.7647 max=9.0955 n=45 sclk_med=1920 order=c_u2f,cur,c_ku2b,c_u2nb,r19h,c_epi,c_u2b,c_u2fb
+KB shape=prod mode=blk what=full arm=c_u2nb median_ms=8.9774 min=8.9030 max=9.0463 n=45 sclk_med=1918 order=c_u2f,cur,c_ku2b,c_u2nb,r19h,c_epi,c_u2b,c_u2fb
+KB shape=prod mode=blk what=full arm=r19h median_ms=8.5740 min=8.3367 max=8.6345 n=45 sclk_med=1869 order=c_u2f,cur,c_ku2b,c_u2nb,r19h,c_epi,c_u2b,c_u2fb
+KB shape=prod mode=blk what=full arm=c_epi median_ms=8.2708 min=8.1543 max=8.4101 n=45 sclk_med=1839 order=c_u2f,cur,c_ku2b,c_u2nb,r19h,c_epi,c_u2b,c_u2fb
+KB shape=prod mode=blk what=full arm=c_u2b median_ms=8.8011 min=8.7492 max=8.8969 n=45 sclk_med=1885 order=c_u2f,cur,c_ku2b,c_u2nb,r19h,c_epi,c_u2b,c_u2fb
+KB shape=prod mode=blk what=full arm=c_u2fb median_ms=8.8703 min=8.8155 max=8.9271 n=45 sclk_med=1912 order=c_u2f,cur,c_ku2b,c_u2nb,r19h,c_epi,c_u2b,c_u2fb
+KBDONE
+rc=0

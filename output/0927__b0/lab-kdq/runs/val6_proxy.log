@@ -1,0 +1,15 @@
+refcache proxy: accepted with common_sha d441e55aba5c0b89
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+CORR shape=proxy arm=cur dq  52.52 dB  dk  52.57 dB  dv  52.67 dB  pass
+DET shape=proxy arm=cur runs=100 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=proxy arm=c_k1 dq  52.52 dB  dk  52.58 dB  dv  52.67 dB  pass
+DET shape=proxy arm=c_k1 runs=100 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=proxy c_k1 vs cur: dq=bitwise dk=50.0dB dv=76.0dB
+CORR shape=proxy arm=c_k1f dq  52.52 dB  dk  52.57 dB  dv  52.67 dB  pass
+DET shape=proxy arm=c_k1f runs=100 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=proxy c_k1f vs cur: dq=bitwise dk=76.7dB dv=76.0dB
+CORR shape=proxy arm=c_ku2 dq  52.52 dB  dk  52.57 dB  dv  52.67 dB  pass
+DET shape=proxy arm=c_ku2 runs=100 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=proxy c_ku2 vs cur: dq=bitwise dk=bitwise dv=bitwise
+LABVAL proxy PASS
+rc=0

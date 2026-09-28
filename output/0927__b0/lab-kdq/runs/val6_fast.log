@@ -1,0 +1,15 @@
+refcache fast: accepted with common_sha d441e55aba5c0b89
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+CORR shape=fast arm=cur dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=cur runs=200 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=fast arm=c_k1 dq  52.61 dB  dk  52.61 dB  dv  52.83 dB  pass
+DET shape=fast arm=c_k1 runs=200 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=fast c_k1 vs cur: dq=bitwise dk=50.1dB dv=76.9dB
+CORR shape=fast arm=c_k1f dq  52.61 dB  dk  52.64 dB  dv  52.83 dB  pass
+DET shape=fast arm=c_k1f runs=200 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=fast c_k1f vs cur: dq=bitwise dk=78.5dB dv=76.9dB
+CORR shape=fast arm=c_ku2 dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=c_ku2 runs=200 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=fast c_ku2 vs cur: dq=bitwise dk=bitwise dv=bitwise
+LABVAL fast PASS
+rc=0

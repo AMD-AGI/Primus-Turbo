@@ -65,6 +65,7 @@ Source abbreviations used below:
 | h44 | must refactor | Adopt r13ns verbatim as op/current (r13 with SPEC_STALE_MAX=False): real data + training clock 12-23% faster, e2e fwd 53-60 -> 49 ms/step; output bitwise = r13; randn ruler reads it 4.8% slower (ruler bias) | done (r16) |
 | h45 | must standing note | Speculative softmax is DEAD on real data -- never re-add stale-max / guessed-max / trigger-and-redo; any data-dependent candidate must also beat the champion on the real q/k/v dumps in the same process | open |
 | h46 | must standing note | FlyDSL JIT CACHE HAZARD: the disk-cache key ignores module-level constants (e.g. SPEC_STALE_MAX) -- a path whose contents changed can serve the OLD binary. Every measurement uses a fresh FLYDSL_RUNTIME_CACHE_DIR per process (or per arm) | open |
+| h47 | must note | REDIRECT after 4 non-improving rounds (r14-r17): the remaining prod gap is issued work x clock sensitivity; rank candidates on the REAL dumps after a GEMM burst as well as randn, and target instruction count on the prod m32x8 hot loop | open |
 
 ---
 
@@ -832,3 +833,16 @@ binary under op/current's path: a byte-identical A/A copy read 6.6% apart until 
 - after op/current changes (promotion, refactor), clear /tmp/flycache before re-measuring the champion;
 - experimental knobs belong in function arguments / closure scalars (part of the key), not module globals;
 - a result measured with a shared warm cache in which a path's contents changed is void.
+
+## h47 -- Redirect after four non-improving rounds
+
+Rounds 14, 15, 16-opt and 17 all landed within +-1% on the randn ruler. What is known (h42, h43, h45, profile/REPORT.md,
+fwd-nospec/REPORT.md): inside training our prod fwd runs at 1250-1690 MHz and is still 1.25-1.29x ASM there (r13ns),
+while it reads ~0.97x ASM on randn at the steady clock. The gap the e2e sees is issued work x clock sensitivity, which
+the randn blocked ruler barely weighs. For the next rounds:
+1. every arm is ALSO measured vs the champion on the real dumps right after a GEMM burst (tools in
+   `PT/output/0927__b0/fwd-nospec/tools/`, e.g. ab.py condition iii), fresh JIT cache per process (h46);
+2. target instruction count of the prod m32x8 hot loop (r13ns: 4130 instructions per the lab census): v_nop / s_delay,
+   SALU bookkeeping, redundant waits, barrier count per KV tile -- work that costs cycles at every clock;
+3. report both rulers in act.yaml notes; a candidate that wins >= 2% on real-dump-after-burst with the randn ruler
+   within its band is worth shipping, and the operator will promote it by refactor if the randn geomean blocks it.

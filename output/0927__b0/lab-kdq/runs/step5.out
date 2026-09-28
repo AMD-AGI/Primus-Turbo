@@ -32,3 +32,72 @@ kb5_prod_blk_p2 rc=0 newdmesg=104 bad=0
   blk full c_u2nb 8.9844 sclk 1909
   blk full r19h 8.5746 sclk 1871
   blk full cur 8.3194 sclk 1822
+kb5_prod_blk_p3 rc=0 newdmesg=95 bad=0
+  blk dq c_u2f 3.0942 sclk 1949
+  blk dq cur 2.9911 sclk 1948
+  blk dq c_ku2b 2.9914 sclk 1979
+  blk dq c_u2nb 3.6111 sclk 1994
+  blk dq r19h 3.1802 sclk 1992
+  blk dq c_epi 3.0014 sclk 1960
+  blk dq c_u2b 3.4710 sclk 1987
+  blk dq c_u2fb 3.5347 sclk 2047
+  blk full c_u2f 8.4817 sclk 1841
+  blk full cur 8.2771 sclk 1838
+  blk full c_ku2b 9.0220 sclk 1920
+  blk full c_u2nb 8.9774 sclk 1918
+  blk full r19h 8.5740 sclk 1869
+  blk full c_epi 8.2708 sclk 1839
+  blk full c_u2b 8.8011 sclk 1885
+  blk full c_u2fb 8.8703 sclk 1912
+kb5_proxy_blk_p1 rc=0 newdmesg=59 bad=0
+  blk dq cur 0.1918 sclk 2008
+  blk dq r19h 0.2018 sclk 2014
+  blk dq c_u2nb 0.2340 sclk 2014
+  blk dq c_u2b 0.2244 sclk 2014
+  blk dq c_u2f 0.2029 sclk 2027
+  blk dq c_u2fb 0.2303 sclk 2027
+  blk dq c_epi 0.1846 sclk 2027
+  blk dq c_ku2b 0.1898 sclk 2027
+  blk full cur 0.5659 sclk 2016
+  blk full r19h 0.5760 sclk 2014
+  blk full c_u2nb 0.6071 sclk 2012
+  blk full c_u2b 0.5981 sclk 2007
+  blk full c_u2f 0.5769 sclk 2003
+  blk full c_u2fb 0.5967 sclk 2003
+  blk full c_epi 0.5545 sclk 2005
+  blk full c_ku2b 0.6149 sclk 2005
+kb5_proxy_blk_p2 rc=0 newdmesg=38 bad=0
+  blk dq c_ku2b 0.1902 sclk 2013
+  blk dq c_epi 0.1845 sclk 2013
+  blk dq c_u2fb 0.2294 sclk 2013
+  blk dq c_u2f 0.2034 sclk 2013
+  blk dq c_u2b 0.2243 sclk 2025
+  blk dq c_u2nb 0.2342 sclk 2025
+  blk dq r19h 0.2011 sclk 2025
+  blk dq cur 0.1878 sclk 2036
+  blk full c_ku2b 0.6134 sclk 1972
+  blk full c_epi 0.5570 sclk 1981
+  blk full c_u2fb 0.6015 sclk 1981
+  blk full c_u2f 0.5745 sclk 1985
+  blk full c_u2b 0.5956 sclk 1985
+  blk full c_u2nb 0.6075 sclk 1987
+  blk full r19h 0.5770 sclk 1991
+  blk full cur 0.5623 sclk 1995
+kb5_proxy_blk_p3 rc=0 newdmesg=0 bad=0
+  blk dq c_u2f 0.2075 sclk 2134
+  blk dq cur 0.1898 sclk 2134
+  blk dq c_ku2b 0.1915 sclk 2134
+  blk dq c_u2nb 0.2327 sclk 2134
+  blk dq r19h 0.1999 sclk 2132
+  blk dq c_epi 0.1819 sclk 2132
+  blk dq c_u2b 0.2234 sclk 2131
+  blk dq c_u2fb 0.2284 sclk 2130
+  blk full c_u2f 0.5773 sclk 2010
+  blk full cur 0.5516 sclk 2010
+  blk full c_ku2b 0.6201 sclk 2005
+  blk full c_u2nb 0.6103 sclk 2007
+  blk full r19h 0.5773 sclk 2007
+  blk full c_epi 0.5592 sclk 2007
+  blk full c_u2b 0.5990 sclk 2005
+  blk full c_u2fb 0.6027 sclk 2001
+STEP5 DONE

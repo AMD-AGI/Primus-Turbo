@@ -1,0 +1,88 @@
+round: 17
+mode: fast
+candidate: r17.i1.g63             # route row 4: per-tile row sum on the matrix pipe (ones A-operand WMMA), m32x8 only
+outcome: delivered
+
+correctness:
+  unit_tests: pass                # ut/test_correctness.py --impl rounds/017/op: RESULT PASS (16/16)
+  precision: pass                 # validation.py 16/16; prod o 50.91 / lse 88.92 dB, proxy o 50.98 / lse 87.82 dB; det 200/200
+  checked_with: op/validation.py
+  sqnr_db: 49.82                  # min over the gate (short_q full), same as op/current
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/016/op, job_context/op/current]
+  # rounds/016/op is NOT byte-equal to op/current: it holds r16's g61 (not promoted). Both re-measured, plus a champ2
+  # byte copy of op/current (A/A), in 3 rotated sessions (cand cur r16 champ2 | champ2 cand cur r16 | r16 champ2 cand cur),
+  # one process each, fresh JIT cache, no beat (h31). fa-g2 idle, 09:39:45-09:47:21Z. No round before 16 measured.
+  # Figures = mean of the 3 session medians; raw: 1-opt/raw/measure/. beat_tflops from validation.py's own process on
+  # this working copy this round (raw/build/val.txt), in-process ratios fast 1.0777, proxy 0.9035, prod 0.9376.
+  shapes:
+    - name: fast
+      this_round_tflops: 166.99
+      best_round_tflops: 166.82
+      beat_tflops: 154.6
+      target_tflops: 154.6
+      champion_round: 16          # op/current (r13ns, adopted at r16); rounds/016/op 166.81
+      champion_tflops: 166.82
+      champion_rebuilt: true
+      ratio: 1.0
+      vs_champion: 1.0010         # m32x2 body untouched; A/A champ2 0.9995
+    - name: proxy
+      this_round_tflops: 1567.52
+      best_round_tflops: 1566.79
+      beat_tflops: 1665.8
+      target_tflops: 1665.8
+      champion_round: 16          # rounds/016/op; op/current 1561.13
+      champion_tflops: 1566.79
+      champion_rebuilt: true
+      ratio: 0.9410
+      vs_champion: 1.0005         # sessions 1.0005 0.9995 1.0014; vs op/current x1.0041; A/A 0.993..1.002
+    - name: prod
+      this_round_tflops: 1456.90
+      best_round_tflops: 1445.37
+      beat_tflops: 1553.3
+      target_tflops: 1553.3
+      champion_round: 16          # rounds/016/op; op/current 1443.53
+      champion_tflops: 1445.37
+      champion_rebuilt: true
+      ratio: 0.9379
+      vs_champion: 1.0080         # sessions 1.0063 1.0084 1.0092; vs op/current x1.0093 (3/3); A/A 0.998..1.001
+  score: 0.9596                   # op/current re-measured 0.9555, rounds/016/op 0.9583
+
+validation:
+  exit_code: 2                    # all correctness + determinism rows pass; fails only the speed bar (proxy 0.9035, prod 0.9376 vs in-process beat), as op/current does
+
+explored:
+  ran:
+    - "pmc (GRBM_GUI_ACTIVE cycles + wall + ticks/ns), orders A/B, throwaway nosum/nomax arms: priced the chain on r13ns (row sum ~3.4%, max tree ~1.9% prod wall at flat clock); chose the row sum as the lever and g63 over another max/vote edit"
+    - "pmc on r16's g61: cycles inside A/A -> the vote hop is off the critical path; dropped the vote family"
+    - "compile-only ISA gates (VGPR, scratch, wmma/pk_add/permlanex16/v_max/instr counts) per arm"
+    - "benchmark.py opt ranking with throwaway proxy-grid gates px2/px16 (-37%/-28%): killed the proxy grid-gate idea, not pooled"
+  consulted:
+    - backends/flydsl/attention/README.md
+    - backends/flydsl/attention/recipes/hd128.md
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+    - optimization/routes/1-metrics-to-techniques.md
+  bound: power
+  confidence: medium
+  why: "prod reads power/clock-limited (r15 profile); but at a flat clock the chain VALU converts: nosum -2.7..-4.0% cycles, +3.4% wall; g63 cycles x0.990/x0.995 at flat ticks/ns, wall +0.9%"
+
+arms:
+  - id: r17.i1.g63
+    built: "alone, from op/current (the opt-measured wsum arm, byte-identical)"
+    tflops: {fast: 166.99, proxy: 1567.52, prod: 1456.90}
+    vs_champion: 1.0080
+    shipped: true
+
+expected: >
+  wsum: between cur and nosum; wall +0..+2%. Could lose if 16 extra WMMA cost energy (clock down).
+  (opt, before the pmc run; the opt ranking then read prod x1.0091, and the route row 4 condition asked it to
+  re-read prod above the A/A maximum in 3/3 with proxy no worse than the A/A floor.)
+
+added_to_pool: [r17.i1.g63, r17.i2.g64]
+route_updated: true
+
+implementation:
+  files_changed: [op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py]
+  build_failures: []

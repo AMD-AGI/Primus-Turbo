@@ -1,0 +1,95 @@
+[97277.059725] docker0: port 1(vethb7f8ee5) entered blocking state
+[97277.072780] docker0: port 1(vethb7f8ee5) entered disabled state
+[97277.085839] vethb7f8ee5: entered allmulticast mode
+[97277.096421] vethb7f8ee5: entered promiscuous mode
+[97277.111089] eth0: renamed from vethe54dc6a
+[97277.120497] docker0: port 1(vethb7f8ee5) entered blocking state
+[97277.133550] docker0: port 1(vethb7f8ee5) entered forwarding state
+[97294.942311] docker0: port 1(vethb7f8ee5) entered disabled state
+[97294.955410] vethe54dc6a: renamed from eth0
+[97295.021641] docker0: port 1(vethb7f8ee5) entered disabled state
+[97295.034898] vethb7f8ee5 (unregistering): left allmulticast mode
+[97295.047933] vethb7f8ee5 (unregistering): left promiscuous mode
+[97295.060794] docker0: port 1(vethb7f8ee5) entered disabled state
+[97305.180505] docker0: port 1(vethcf63ee7) entered blocking state
+[97305.193557] docker0: port 1(vethcf63ee7) entered disabled state
+[97305.206617] vethcf63ee7: entered allmulticast mode
+[97305.217198] vethcf63ee7: entered promiscuous mode
+[97305.232325] eth0: renamed from veth0c61b3d
+[97305.241741] docker0: port 1(vethcf63ee7) entered blocking state
+[97305.254793] docker0: port 1(vethcf63ee7) entered forwarding state
+[97323.275388] docker0: port 1(vethcf63ee7) entered disabled state
+[97323.288487] veth0c61b3d: renamed from eth0
+[97323.353688] docker0: port 1(vethcf63ee7) entered disabled state
+[97323.367007] vethcf63ee7 (unregistering): left allmulticast mode
+[97323.380065] vethcf63ee7 (unregistering): left promiscuous mode
+[97323.392927] docker0: port 1(vethcf63ee7) entered disabled state
+[97336.589911] docker0: port 1(veth4427086) entered blocking state
+[97336.602965] docker0: port 1(veth4427086) entered disabled state
+[97336.616026] veth4427086: entered allmulticast mode
+[97336.626606] veth4427086: entered promiscuous mode
+[97336.640904] eth0: renamed from vethae545d9
+[97336.650313] docker0: port 1(veth4427086) entered blocking state
+[97336.663364] docker0: port 1(veth4427086) entered forwarding state
+[97354.421984] docker0: port 1(veth4427086) entered disabled state
+[97354.435081] vethae545d9: renamed from eth0
+[97354.495596] docker0: port 1(veth4427086) entered disabled state
+[97354.508802] veth4427086 (unregistering): left allmulticast mode
+[97354.521855] veth4427086 (unregistering): left promiscuous mode
+[97354.534717] docker0: port 1(veth4427086) entered disabled state
+[97355.328665] docker0: port 1(vethc4aaa6a) entered blocking state
+[97355.341719] docker0: port 1(vethc4aaa6a) entered disabled state
+[97355.354782] vethc4aaa6a: entered allmulticast mode
+[97355.365363] vethc4aaa6a: entered promiscuous mode
+[97355.379415] eth0: renamed from veth495839c
+[97355.388742] docker0: port 1(vethc4aaa6a) entered blocking state
+[97355.401776] docker0: port 1(vethc4aaa6a) entered forwarding state
+[97365.878016] docker0: port 1(vethc4aaa6a) entered disabled state
+[97365.891126] veth495839c: renamed from eth0
+[97365.954262] docker0: port 1(vethc4aaa6a) entered disabled state
+[97365.967556] vethc4aaa6a (unregistering): left allmulticast mode
+[97365.980613] vethc4aaa6a (unregistering): left promiscuous mode
+[97365.993477] docker0: port 1(vethc4aaa6a) entered disabled state
+[97373.600661] docker0: port 1(veth9f75ce4) entered blocking state
+[97373.613714] docker0: port 1(veth9f75ce4) entered disabled state
+[97373.626775] veth9f75ce4: entered allmulticast mode
+[97373.637360] veth9f75ce4: entered promiscuous mode
+[97373.652745] eth0: renamed from vethddd78be
+[97373.662137] docker0: port 1(veth9f75ce4) entered blocking state
+[97373.675189] docker0: port 1(veth9f75ce4) entered forwarding state
+[97391.423741] docker0: port 1(veth9f75ce4) entered disabled state
+[97391.436846] vethddd78be: renamed from eth0
+[97391.496455] docker0: port 1(veth9f75ce4) entered disabled state
+[97391.509795] veth9f75ce4 (unregistering): left allmulticast mode
+[97391.522852] veth9f75ce4 (unregistering): left promiscuous mode
+[97391.535717] docker0: port 1(veth9f75ce4) entered disabled state
+[97396.920312] docker0: port 1(veth01f2a98) entered blocking state
+[97396.933366] docker0: port 1(veth01f2a98) entered disabled state
+[97396.946422] veth01f2a98: entered allmulticast mode
+[97396.957000] veth01f2a98: entered promiscuous mode
+[97396.971317] eth0: renamed from vethcb12bba
+[97396.980665] docker0: port 1(veth01f2a98) entered blocking state
+[97396.993715] docker0: port 1(veth01f2a98) entered forwarding state
+[97397.070544] docker0: port 1(veth01f2a98) entered disabled state
+[97397.083631] vethcb12bba: renamed from eth0
+[97397.135187] docker0: port 1(veth01f2a98) entered disabled state
+[97397.148512] veth01f2a98 (unregistering): left allmulticast mode
+[97397.161569] veth01f2a98 (unregistering): left promiscuous mode
+[97397.174431] docker0: port 1(veth01f2a98) entered disabled state
+[97433.796593] docker0: port 1(veth4b43a61) entered blocking state
+[97433.809644] docker0: port 1(veth4b43a61) entered disabled state
+[97433.822705] veth4b43a61: entered allmulticast mode
+[97433.833282] veth4b43a61: entered promiscuous mode
+[97433.847811] eth0: renamed from vethb7509f7
+[97433.857208] docker0: port 1(veth4b43a61) entered blocking state
+[97433.870258] docker0: port 1(veth4b43a61) entered forwarding state
+[97436.507991] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97438.965177] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97441.422144] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97443.879085] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97446.339414] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97448.796652] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97451.254043] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97453.711806] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97456.168894] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97458.632479] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.

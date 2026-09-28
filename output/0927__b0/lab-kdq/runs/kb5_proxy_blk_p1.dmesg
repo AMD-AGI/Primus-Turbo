@@ -1,0 +1,59 @@
+[97461.091163] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97463.548167] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97466.009881] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97468.652921] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97471.109892] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97471.160861] docker0: port 1(veth4b43a61) entered disabled state
+[97471.173955] vethb7509f7: renamed from eth0
+[97473.597903] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97476.054890] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97478.511576] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97478.577486] docker0: port 1(veth4b43a61) entered disabled state
+[97478.590821] veth4b43a61 (unregistering): left allmulticast mode
+[97478.603877] veth4b43a61 (unregistering): left promiscuous mode
+[97478.616742] docker0: port 1(veth4b43a61) entered disabled state
+[97502.539253] docker0: port 1(veth56fabce) entered blocking state
+[97502.552304] docker0: port 1(veth56fabce) entered disabled state
+[97502.565365] veth56fabce: entered allmulticast mode
+[97502.575944] veth56fabce: entered promiscuous mode
+[97502.589851] eth0: renamed from veth96fa9c1
+[97502.599203] docker0: port 1(veth56fabce) entered blocking state
+[97502.612257] docker0: port 1(veth56fabce) entered forwarding state
+[97505.148490] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97507.605634] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97510.062356] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97512.519076] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97514.984501] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97517.441769] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97519.898975] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97522.356731] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97524.815797] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97527.272651] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97527.313102] docker0: port 1(veth56fabce) entered disabled state
+[97527.326194] veth96fa9c1: renamed from eth0
+[97529.750502] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97532.207494] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97534.664163] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97534.730656] docker0: port 1(veth56fabce) entered disabled state
+[97534.743993] veth56fabce (unregistering): left allmulticast mode
+[97534.757050] veth56fabce (unregistering): left promiscuous mode
+[97534.769915] docker0: port 1(veth56fabce) entered disabled state
+[97550.621329] docker0: port 1(vethfc02354) entered blocking state
+[97550.634383] docker0: port 1(vethfc02354) entered disabled state
+[97550.647444] vethfc02354: entered allmulticast mode
+[97550.658028] vethfc02354: entered promiscuous mode
+[97550.672613] eth0: renamed from veth805848e
+[97550.681998] docker0: port 1(vethfc02354) entered blocking state
+[97550.695048] docker0: port 1(vethfc02354) entered forwarding state
+[97553.235905] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97555.693194] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97558.150072] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97560.606864] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97563.067598] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97565.524708] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97567.982034] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97570.439660] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97572.903536] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97575.362390] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97577.820170] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
+[97580.277606] amdgpu 0002:04:00.0: MES(0, 0) ring buffer is full.
