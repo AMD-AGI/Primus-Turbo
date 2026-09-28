@@ -921,7 +921,7 @@ def _build_grouped_mxfp4_nt_kernel(
             cst_nt=cst_nt,
             b_base_even=b_even6,
             g2s_wm=(_WMA, _WMB),
-            kstep_c=KSTEP,
+            kstep_val=KSTEP,
         )
         if glu and const_expr(glu_act_quant):
             # The staging borrows the BL pool, so the mainloop's in-flight ds_reads
@@ -2047,7 +2047,7 @@ def _build_grouped_mxfp4_wgrad_kernel(
                 cst_ilv=_BILV,
                 cst_nt=cst_nt,
                 g2s_wm=(_WMA, _WMB),
-                kstep_c=KSTEP,
+                kstep_val=KSTEP,
             )
             if const_expr(not _CSTORE):
                 # H1a: wide transposed-accumulator store (paired with tacc=True above).
