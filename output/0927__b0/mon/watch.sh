@@ -21,7 +21,8 @@ while true; do
   done
   # 1b. foreign containers (anything running that is not ours)
   for c in $(docker ps --format '{{.Names}}'); do
-    case $c in fa-g0|fa-g2|fa-g3) ;; *) [ -z "${SEEN[fc$c]}" ] && { echo "FOREIGN CONTAINER: $c ($(docker inspect -f '{{.Config.Image}} started {{.State.StartedAt}}' $c 2>/dev/null))"; SEEN[fc$c]=1; } ;; esac
+    # user rule 2026-09-28: during our booked time, stop foreign containers immediately and report
+    case $c in fa-g0|fa-g2|fa-g3) ;; *) [ -z "${SEEN[fc$c]}" ] && { info=$(docker inspect -f '{{.Config.Image}} started {{.State.StartedAt}} mounts={{range .Mounts}}{{.Source}} {{end}}' $c 2>/dev/null); docker stop -t 10 $c >/dev/null 2>&1; echo "FOREIGN CONTAINER STOPPED: $c ($info) rc=$?"; SEEN[fc$c]=1; } ;; esac
   done
   # 2. new amdgpu faults since the watcher started
   timeout 20 sudo -n dmesg 2>/dev/null | awk -v t0=$T0 '{ts=substr($1,2)+0} ts>t0' | grep -v "0002:04:00.0" | grep -iE "ring buffer is full|failed to respond|GCVM_L2_PROTECTION|page fault|gpu reset|hang" | head -3 | while read -r l; do k=$(echo "$l" | cut -c1-40); [ -z "${SEEN[$k]}" ] && echo "DMESG: $l"; done

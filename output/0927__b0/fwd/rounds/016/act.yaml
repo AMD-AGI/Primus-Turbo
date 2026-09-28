@@ -1,0 +1,103 @@
+round: 16
+mode: fast
+candidate: r16.i2.g61             # route row 4 (ARM A): per-row deferred-rescale decision, m32x8 body only
+outcome: delivered
+
+correctness:
+  unit_tests: pass                # ut/test_correctness.py --determinism 200: PASS
+  precision: pass                 # 16/16; proxy o 50.89 / lse 88.24 dB, prod o 50.83 / lse 89.20 dB
+  checked_with: op/validation.py
+  sqnr_db: 49.82                  # min over the gate (short_q full), same as op/current
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/016/op]
+  # rounds/016/op = the incumbent (= op/current = r13ns), re-measured in the same 3 rotated sessions
+  # (orders inc g61 champ2 g62 | g62 inc g61 champ2 | champ2 g62 inc g61), one process each, fresh JIT cache,
+  # champ2 byte-copy A/A in every process, no beat in the ranking process (h31). fa-g2, idle, 08:48:53-08:56:30Z.
+  # No round before 16 re-measured. Figures = mean of the 3 session medians. raw: 1-opt/raw/bench/.
+  # beat_tflops from validation.py's own process on the g61 arm this round (08:3xZ); its in-process ratios were
+  # fast 1.0459, proxy 0.9008, prod 0.9320 (proxy sclk 1099->1299 there vs 1354->1554 in the ranking).
+  shapes:
+    - name: fast
+      this_round_tflops: 164.77
+      best_round_tflops: 164.60
+      beat_tflops: 156.9
+      target_tflops: 156.9
+      champion_round: 16
+      champion_tflops: 164.60
+      champion_rebuilt: true
+      ratio: 1.0
+      vs_champion: 1.0010         # m32x2 body untouched; A/A champ2 0.9969 (+-0.9%)
+    - name: proxy
+      this_round_tflops: 1571.40
+      best_round_tflops: 1570.43
+      beat_tflops: 1676.43
+      target_tflops: 1676.43
+      champion_round: 16
+      champion_tflops: 1570.43
+      champion_rebuilt: true
+      ratio: 0.9373
+      vs_champion: 1.0006         # sessions 1.0023 0.9991 1.0005; A/A 0.9950..1.0014
+    - name: prod
+      this_round_tflops: 1448.85
+      best_round_tflops: 1443.34
+      beat_tflops: 1556.07
+      target_tflops: 1556.07
+      champion_round: 16
+      champion_tflops: 1443.34
+      champion_rebuilt: true
+      ratio: 0.9311
+      vs_champion: 1.0038         # sessions 1.0014 1.0065 1.0036; A/A 0.9949..1.0033
+  score: 0.9561                   # inc re-measured: 0.9548
+
+validation:
+  exit_code: 2                    # every correctness + determinism row passes; fails only the speed bar (proxy 0.9008, prod 0.9320 vs in-process beat), as op/current does
+
+explored:
+  ran:
+    - "stale-JIT-cache A/A (r16.i1.g60): a fresh FLYDSL_RUNTIME_CACHE_DIR per process is required, else op/current runs r13-spec; changed every measurement protocol this round"
+    - "compile-only ISA gates per arm (VGPR, spill, .text, instr count, s_cselect, v_fmac/v_pk_fma count): caught g62's lost fma contraction (build failure 1) before any card run"
+    - "h16 adversarial suite (52 cases) + m32x8-only adversarial suite (15 cases) + det 200/200 at proxy/prod"
+    - "h45 real-dump A/B (6 dumps + randn, prod shape, 3 rotated sessions): g61/inc 1.0003-1.0012 vs A/A 0.9998-1.0009"
+  consulted:
+    - backends/flydsl/attention/README.md
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+    - optimization/routes/1-metrics-to-techniques.md
+    - pitfalls/measurement-traps.md
+    - pitfalls/compiler-and-toolchain.md
+  bound: power
+  confidence: low
+  why: "g61 removes 16 s_cselect / 47 instructions per prod body (ISA) but buys only +0.38% prod, inside the +-0.5% A/A; prod runs at ~1300 MHz sclk, and cycle cuts on the softmax chain convert to wall only partly (same pattern as g55/g24)"
+
+arms:
+  - id: r16.i2.g61
+    built: "A alone, from op/current: m_new = need.select(m_full, m_prev) per lane; the ballot gates only the O-rescale"
+    tflops: {fast: 164.77, proxy: 1571.40, prod: 1448.85}
+    vs_champion: 1.0038
+    shipped: true
+  - id: r16.i3.g62
+    built: "B alone, from op/current -- NOT on top of A: corr exp + d = fma(corr, d_prev, rowsum) only inside the rescale branch; bitwise = op/current"
+    tflops: {fast: 164.11, proxy: 1558.31, prod: 1448.41}
+    vs_champion: 0.9923
+    shipped: false
+    note: "lost proxy x0.9923 (3/3 < 0.995, beyond the A/A floor); prod x1.0035. The corr exp now sits serially on the rescale branch that early tiles always take; proxy has half of prod's kv tiles per row, so more of its tiles pay"
+  - id: r16.i2.g61+r16.i3.g62
+    built: "the merge; compiled and correctness-checked only (bitwise = g61 on 52 h16 cases, 49.82 dB min)"
+    tflops: {}
+    vs_champion: null
+    shipped: false
+    note: "not measured: B lost beyond the A/A floor, so the merge was not eligible"
+
+expected: >
+  g61 cuts prod cycles 1-2% at a flat-to-lower clock, for wall +0.5..1.0% at prod and
+  +0.3..0.8% at proxy. g62 removes 2 of 66 trans ops plus ~4 VALU per tile, all off the P chain, for wall
+  +0.1..0.4%. That is probably inside the A/A floor. Neither closes the 7% prod gap to beat that r13ns opened.
+
+added_to_pool: [r16.i2.g61, r16.i3.g62]
+route_updated: true
+
+implementation:
+  files_changed: [op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py]
+  build_failures:
+    - {attempt: 1, error: "g62 not bitwise-equivalent by ISA: the branch's d = corr*d_prev + rowsum lost its v_fmac/v_pk_fma contraction", root_cause: "a separate mul+add in the scf.if; LLVM sank the add past the branch phi (double rounding). Fixed with an explicit fmath.fma"}

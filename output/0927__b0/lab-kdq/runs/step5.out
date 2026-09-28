@@ -1,0 +1,34 @@
+kb5_prod_blk_p1 rc=0 newdmesg=130 bad=0
+  blk dq cur 3.0010 sclk 1942
+  blk dq r19h 3.1865 sclk 1921
+  blk dq c_u2nb 3.6156 sclk 1985
+  blk dq c_u2b 3.4727 sclk 2018
+  blk dq c_u2f 3.0871 sclk 2015
+  blk dq c_u2fb 3.5329 sclk 2041
+  blk dq c_epi 2.9987 sclk 2004
+  blk dq c_ku2b 3.0003 sclk 1946
+  blk full cur 8.3189 sclk 1824
+  blk full r19h 8.5914 sclk 1838
+  blk full c_u2nb 8.9928 sclk 1882
+  blk full c_u2b 8.8229 sclk 1896
+  blk full c_u2f 8.4900 sclk 1867
+  blk full c_u2fb 8.8898 sclk 1883
+  blk full c_epi 8.3571 sclk 1854
+  blk full c_ku2b 9.0581 sclk 1920
+kb5_prod_blk_p2 rc=0 newdmesg=104 bad=0
+  blk dq c_ku2b 2.9959 sclk 1928
+  blk dq c_epi 2.9975 sclk 1899
+  blk dq c_u2fb 3.5318 sclk 1956
+  blk dq c_u2f 3.0929 sclk 1978
+  blk dq c_u2b 3.4697 sclk 2016
+  blk dq c_u2nb 3.6125 sclk 2050
+  blk dq r19h 3.1796 sclk 2039
+  blk dq cur 2.9967 sclk 1973
+  blk full c_ku2b 9.0333 sclk 1914
+  blk full c_epi 8.3111 sclk 1857
+  blk full c_u2fb 8.8899 sclk 1887
+  blk full c_u2f 8.4983 sclk 1869
+  blk full c_u2b 8.8139 sclk 1899
+  blk full c_u2nb 8.9844 sclk 1909
+  blk full r19h 8.5746 sclk 1871
+  blk full cur 8.3194 sclk 1822

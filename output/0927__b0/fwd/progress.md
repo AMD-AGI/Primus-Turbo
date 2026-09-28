@@ -19,3 +19,4 @@ Baseline (vendored aiter FlyDSL) on B0: ~1.78 ms / ~1236 TF/s (probe, cross-sess
 | 14 | fast | 09-28 05:55-06:42 | no | 1509.7 (1.457) | r13 1500.5 | prod +0.6%, **proxy -5.4%**; geomean 0.9832 | ~+22% | 96.7% | 1535.2 / 163.3 | see rounds/014/opt.md |
 | 15 | deep | 09-28 06:42-08:16 | no | 1512.5 (1.454) | r13 1509.2 | prod +0.2%; geomean 1.0000 | ~+22% | 96.9% | 1622.1 / 163.6 | g59 per-lane partial row-sum with one peer fold in the epilogue: null |
 | 16 | refactor (h44) | 09-28 08:16 | **promoted** (correct vs eager) | -- | -- | adopt r13ns (SPEC_STALE_MAX=False) | -- | -- | -- | real-data/e2e win; randn ruler reads -4.8% |
+| 16 opt | fast | 09-28 08:21-~09:40 | no | 1448.9 (1.518) randn | r13ns 1443.3 (randn) | +0.4% prod; geomean 1.0018 | 93.1% randn (r13ns reads ~4% lower on randn by design, h44) | 1571.4 / 164.8 | first round on r13ns; arms null |
