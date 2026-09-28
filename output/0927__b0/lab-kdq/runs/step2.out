@@ -1,0 +1,40 @@
+kb3_prod_blk_p1 rc=0 newdmesg=0 bad=0
+  blk dq r19h 3.1877 sclk 1919
+  blk dq q1 2.9940 sclk 1919
+  blk dq u2 3.0505 sclk 1922
+  blk dq u2n 2.9960 sclk 1918
+  blk dq ku2 3.1913 sclk 1905
+  blk dq qu2ku2 3.0507 sclk 1922
+  blk full r19h 8.5792 sclk 1830
+  blk full q1 8.3687 sclk 1829
+  blk full u2 8.4763 sclk 1831
+  blk full u2n 8.3194 sclk 1823
+  blk full ku2 9.1473 sclk 1919
+  blk full qu2ku2 9.0273 sclk 1965
+kb3_prod_blk_p2 rc=0 newdmesg=4 bad=0
+  blk dq qu2ku2 3.0569 sclk 1934
+  blk dq ku2 3.1742 sclk 1940
+  blk dq u2n 2.9876 sclk 1919
+  blk dq u2 3.0698 sclk 1922
+  blk dq q1 3.0055 sclk 1923
+  blk dq r19h 3.1812 sclk 1921
+  blk full qu2ku2 9.0252 sclk 1965
+  blk full ku2 9.1385 sclk 1964
+  blk full u2n 8.3218 sclk 1872
+  blk full u2 8.4848 sclk 1843
+  blk full q1 8.3666 sclk 1830
+  blk full r19h 8.5828 sclk 1832
+kb3_prod_blk_p3 rc=0 newdmesg=0 bad=0
+  blk dq u2 3.0629 sclk 1934
+  blk dq r19h 3.1861 sclk 1928
+  blk dq qu2ku2 3.0373 sclk 1916
+  blk dq q1 2.9960 sclk 1920
+  blk dq ku2 3.1802 sclk 1914
+  blk dq u2n 2.9861 sclk 1899
+  blk full u2 8.4727 sclk 1847
+  blk full r19h 8.5788 sclk 1842
+  blk full qu2ku2 9.0172 sclk 1924
+  blk full q1 8.3952 sclk 1880
+  blk full ku2 9.1331 sclk 1917
+  blk full u2n 8.3112 sclk 1857
+STEP2 DONE

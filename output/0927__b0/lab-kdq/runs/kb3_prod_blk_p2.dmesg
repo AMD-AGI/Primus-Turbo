@@ -1,0 +1,4 @@
+[88937.089477] ifoe 0001:04:00.1: MC command 0x1b4 inlen 0 failed rc=-11 (raw 11)
+[88937.227242] ifoe 0003:04:00.1: MC command 0x1b4 inlen 0 failed rc=-11 (raw 11)
+[88937.243498] ifoe 0002:04:00.1: MC command 0x1b4 inlen 0 failed rc=-11 (raw 11)
+[88937.259560] ifoe 0004:04:00.1: MC command 0x1b4 inlen 0 failed rc=-11 (raw 11)

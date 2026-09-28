@@ -1,0 +1,21 @@
+refcache fast: accepted with common_sha d441e55aba5c0b89
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+CORR shape=fast arm=r19h dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=r19h runs=200 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=fast arm=u2n dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=u2n runs=200 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=fast u2n vs r19h: dq=bitwise dk=bitwise dv=bitwise
+CORR shape=fast arm=ku2 dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=ku2 runs=200 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=fast ku2 vs r19h: dq=bitwise dk=bitwise dv=bitwise
+CORR shape=fast arm=q1 dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=q1 runs=200 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=fast q1 vs r19h: dq=bitwise dk=bitwise dv=bitwise
+CORR shape=fast arm=u2 dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=u2 runs=200 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=fast u2 vs r19h: dq=bitwise dk=bitwise dv=bitwise
+CORR shape=fast arm=qu2ku2 dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=qu2ku2 runs=200 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=fast qu2ku2 vs r19h: dq=bitwise dk=bitwise dv=bitwise
+LABVAL fast PASS
+rc=0

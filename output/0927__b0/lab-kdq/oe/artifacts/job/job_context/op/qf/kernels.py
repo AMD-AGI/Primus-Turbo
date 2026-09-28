@@ -51,8 +51,8 @@ WAVE = 32                    # gfx1250 dispatches wave32; gfx942's odo says 64 h
 LOG2E = 1.4426950408889634
 NEG = -3.0e38
 VF_KV = False                # lab-kdq: fma softmax + scale-at-store in k_dkdv
-VF_Q = False                 # lab-kdq: same in k_dqg
-VF_QS = True                 # lab-kdq: with VF_Q, move the scale from dS to the dQ store
+VF_Q = True                 # lab-kdq: same in k_dqg
+VF_QS = False                 # lab-kdq: with VF_Q, move the scale from dS to the dQ store
 KV_U2 = False                # lab-kdq: k_dkdv qloop_full unrolled by 2
 BLOCK_KV = 32               # r1.i6.g06: kv rows one workgroup owns (was 16)
 S_ROW_B = BLOCK_KV * 2 + 16  # r4.i1.g16: 64 -> 80 B. 16 dwords is a 4-way bank
@@ -1110,7 +1110,7 @@ def launch_dq_sp(Q, K, V, DO, LSE, DEL, DQ, scale: fx.Float32,
 #   DQ_DFUSE compute delta = rowsum(dO * O) in the prologue from the dO fragments the
 #            wave already holds plus one O fragment load, use it in-register, and write
 #            it to DEL for k_dkdv (which then runs AFTER k_dqg); k_delta is not launched.
-DQ_NW = 4
+DQ_NW = 1
 DQ_BQW = 64
 DQ_PF = True
 DQ_DFUSE = False

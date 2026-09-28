@@ -1,12 +1,12 @@
 --- OP/r19h/kernels.py	2026-09-28 06:12:54.273200007 +0000
-+++ OP/qu2ku2/kernels.py	2026-09-28 06:43:50.863596280 +0000
++++ OP/u2n/kernels.py	2026-09-28 06:46:17.962292511 +0000
 @@ -50,6 +50,9 @@
  WAVE = 32                    # gfx1250 dispatches wave32; gfx942's odo says 64 here
  LOG2E = 1.4426950408889634
  NEG = -3.0e38
 +VF_KV = False                # lab-kdq: fma softmax + scale-at-store in k_dkdv
-+VF_Q = True                 # lab-kdq: same in k_dqg
-+KV_U2 = True                # lab-kdq: k_dkdv qloop_full unrolled by 2
++VF_Q = False                 # lab-kdq: same in k_dqg
++KV_U2 = False                # lab-kdq: k_dkdv qloop_full unrolled by 2
  BLOCK_KV = 32               # r1.i6.g06: kv rows one workgroup owns (was 16)
  S_ROW_B = BLOCK_KV * 2 + 16  # r4.i1.g16: 64 -> 80 B. 16 dwords is a 4-way bank
                               # collision at 64 banks; 20 dwords walks all 64.

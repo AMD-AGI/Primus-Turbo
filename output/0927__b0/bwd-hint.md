@@ -35,8 +35,10 @@ the head of a round, so direction can be changed here **without stopping the job
 | h65 | must standing | DAY 2 CARD MOVE: this job now runs on PHYSICAL GPU 3 via container fa-g3 ONLY (overrides h62 GPU 1 / fa-g1) | open |
 | h66 | must standing note | RULER: benchmark.py now times BLOCKED (lead 4 + block 9 per arm); interleaving biased FlyDSL-vs-ASM ~3.4% (old x-beat ratios ~3% too low), FlyDSL-vs-FlyDSL within 0.4% | open |
 | h67 | must note | Round 19 is 1.7% FASTER than champion r20 at prod (blocked, 3 rotated processes, spread 0.14%): re-decide the champion on all three shapes; build r19 + the h33 clamps as an arm | open |
-| h68 | must refactor | Adopt r19h verbatim as op/current (r19 + the three h33 clamps): vs r20 prod -1.72%, proxy -2.7%, fast -1.5% time (blocked, rotated, A/A +-0.07%), output bitwise = r19 | open |
+| h68 | must refactor | Adopt r19h verbatim as op/current (r19 + the three h33 clamps): vs r20 prod -1.72%, proxy -2.7%, fast -1.5% time (blocked, rotated, A/A +-0.07%), output bitwise = r19 | done (r28) |
 | h69 | must standing note | Target redefined (user-approved): speed passes only when proxy AND prod are each >= beat; fast is reported only (the geomean ended the job at prod 0.78x). refcache provenance refreshed -- the gate no longer recomputes the fp32 reference on the card | open |
+| h70 | must note | k_dq is ISSUE-bound, not latency-bound: unroll k_dq kvloop_full x2 (lab arm u2n, removes 65 back-edge v_mov_b64) -> prod op -3.06% (3 procs), output bitwise = r19h; build it next round and measure proxy too | open |
+| h71 | standing note | Closed by the k_dq lab (measured on card): 2 waves/SIMD k_dq (+13-15% op), GQA-grouped WG (+3-7%), k_delta fused into k_dq (null), k_dkdv unroll x2 (+6.5%), q1 fma-softmax stacked on u2n (worse) | open |
 
 ---
 
@@ -4531,3 +4533,24 @@ in-process beat; fast (launch-bound, where ASM itself is slow) is reported only.
 988c14ca -> d441e55a (ut/common.py changed after the build; make_inputs/references did not -- recomputed dB was bitwise equal
 in rounds 24-26); backups in `refcache.bak.pre-sha-update/`. The gate therefore no longer recomputes the fp32 reference on
 the card (the 09-22 power-cycle trigger). Absolute numbers: see h66 (blocked harness).
+
+## h70 -- k_dq is issue-bound: unroll its kv loop by 2
+
+Operator lab 2026-09-28 (`PT/output/0927__b0/lab-kdq/REPORT.md`, base = r19h = this job's champion after h68). Arm **u2n**:
+k_dq's `kvloop_full` unrolled x2 (k_dqg path: NW=1, BQW=64, PF, DQ_U2) plus impl routing nsp_q==1 to launch_dqg; the 65
+back-edge `v_mov_b64` that rotate the carried K/V prefetch disappear. Tree:
+`/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-kdq/oe/artifacts/job/job_context/op/u2n/` (kernels.py md5 1fda1828..., impl.py md5 08cb8533...; diffs `/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-kdq/u2n.kernels.diff`,
+`/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-kdq/u2n.impl.diff`). Measured on GPU 0 (blocked ruler, 3 rotated processes, prod): k_dq 0.939/0.940/0.937, whole op
+**0.9696/0.9697/0.9688 (-3.06%)**; output bitwise identical to r19h on fast/proxy/prod; 0 spill / 0 scratch; CPU bounds proof
+for the unrolled loop in `/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-kdq/bounds/bounds_u2.txt`.
+NOT yet measured: proxy timing (proxy also takes the k_dqg path), fast, and the lowered-clock condition. **Next fast round:**
+apply the two diffs to op/current (= r19h), gate it, and measure vs op/current on all three shapes with the blocked harness
+(>= 3 rotated processes, A/A copy in each). Do not stack q1 (fma softmax) on it -- measured worse (-1.19% only).
+
+## h71 -- Closed by the k_dq lab (measured on the card, do not retry)
+
+- k_dq at 2 waves/SIMD (BLOCK_Q=32, no prefetch, 445 VGPR): k_dq +41%, op +13-15% (K/V loads and staging per query double).
+- GQA-grouped WG (4 or 2 q heads sharing one kv head per WG): k_dq +7.4% / +3.4%.
+- k_delta fused into k_dq's prologue: op -0.3..+0.7% (null).
+- k_dkdv kv-loop unroll x2 (ku2, 638 VGPR, -16% instructions/iter): op +6.5%. VF on k_dkdv alone: +0.17% (null).
+- q1 (single-fma softmax, scale applied at dQ store) alone: op -2.37%, but stacked with u2n only -1.19% -- prefer u2n.

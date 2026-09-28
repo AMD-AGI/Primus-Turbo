@@ -1110,12 +1110,12 @@ def launch_dq_sp(Q, K, V, DO, LSE, DEL, DQ, scale: fx.Float32,
 #   DQ_DFUSE compute delta = rowsum(dO * O) in the prologue from the dO fragments the
 #            wave already holds plus one O fragment load, use it in-register, and write
 #            it to DEL for k_dkdv (which then runs AFTER k_dqg); k_delta is not launched.
-DQ_NW = 4
+DQ_NW = 1
 DQ_BQW = 64
 DQ_PF = True
 DQ_DFUSE = False
-DQ_U2 = False
-DQ_U2B = False
+DQ_U2 = True
+DQ_U2B = True
 
 
 def _dqg_impl(Q, K, V, DO, O, LSE, DEL, DQ,
