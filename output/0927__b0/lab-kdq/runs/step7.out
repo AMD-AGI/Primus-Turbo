@@ -16,3 +16,13 @@ kb7_prod_gbimg_p2 rc=0 newdmesg=0 bad=0
   gb full c_epi 9.3076 sclk 1346.5
   gb full cur 9.3064 sclk 1344.0
   gb full r19h 9.6266 sclk 1352.0
+kb7_prod_gbimg_p3 rc=0 newdmesg=0 bad=0
+  gb dq cur 3.7417 sclk 1273.0
+  gb dq c_k1 3.7378 sclk 1276.0
+  gb dq r19h 4.0522 sclk 1280.0
+  gb dq c_epi 3.7309 sclk 1272.5
+  gb full cur 9.3044 sclk 1345.5
+  gb full c_k1 9.3405 sclk 1351.5
+  gb full r19h 9.6118 sclk 1352.0
+  gb full c_epi 9.3115 sclk 1345.5
+STEP7 DONE

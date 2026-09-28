@@ -40,6 +40,7 @@ the head of a round, so direction can be changed here **without stopping the job
 | h70 | must note | k_dq is ISSUE-bound, not latency-bound: unroll k_dq kvloop_full x2 (lab arm u2n, removes 65 back-edge v_mov_b64) -> prod op -3.06% (3 procs), output bitwise = r19h; build it next round and measure proxy too | open |
 | h71 | standing note | Closed by the k_dq lab (measured on card): 2 waves/SIMD k_dq (+13-15% op), GQA-grouped WG (+3-7%), k_delta fused into k_dq (null), k_dkdv unroll x2 (+6.5%), q1 fma-softmax stacked on u2n (worse) | open |
 | h72 | must standing note | FlyDSL JIT CACHE HAZARD: the disk-cache key ignores module-level constants (e.g. SPEC_STALE_MAX) -- a path whose contents changed can serve the OLD binary. Every measurement uses a fresh FLYDSL_RUNTIME_CACHE_DIR per process (or per arm) | open |
+| h73 | standing note | k_dq lab round 2 on the r29 champion: u2n confirmed at the training clock (op -3.2%, k_dq -7.8% at 1272-1352 MHz); 9 follow-up arms null or loss -- do not rebuild them | open |
 
 ---
 
@@ -4568,3 +4569,15 @@ binary under op/current's path: a byte-identical A/A copy read 6.6% apart until 
 - after op/current changes (promotion, refactor), clear /tmp/flycache before re-measuring the champion;
 - experimental knobs belong in function arguments / closure scalars (part of the key), not module globals;
 - a result measured with a shared warm cache in which a path's contents changed is void.
+
+## h73 -- k_dq lab round 2: follow-ups on the r29 champion are closed
+
+`PT/output/0927__b0/lab-kdq/REPORT.md` (round-2 section). Base = op/current (r29 = r19h + u2n + g86).
+- Confirmed at the training operating point (10 bf16 GEMMs of 32768x4096x14336 before each timed call, IMAGE hipBLASLt
+  library, sclk 1272-1352 MHz): r29 vs r19h whole op 0.9667/0.9680/0.9688 (-3.2%), k_dq 0.922/0.923/0.921 (-7.8%).
+  k_dq IS clock-sensitive (4.05 ms there vs 2.98 ms at ~1950 MHz). Method trap: with the host ~/.local hipBLASLt library
+  the burst GEMM runs at ~80 TF/s and the clock stays at ~2155 MHz -- use the image library for any low-clock probe.
+- Dead, do not rebuild (prod whole op vs r29, blocked, 3 rotated processes): k_dq epilogue staged through LDS (b16->b128)
+  null (0.999; also this job's g89 in r30); k_dkdv fma-softmax +0.3..0.6% (null); fma-only VF_Q on the unrolled base
+  +2.0%; sched_barrier between the unrolled halves (u2nb/u2b/u2fb) +5.9..8.0% (k_dq +16..21%); k_dkdv unroll x2 +7.3%,
+  with barrier +8.7%.

@@ -1,4 +1,103 @@
-# k_dq 实验室（lab-kdq），2026-09-28，基线 r19h
+# k_dq 实验室（lab-kdq），2026-09-28
+
+## 第二轮（GPU0 / fa-g0，用户已放行）：以新冠军 r29（= r19h + u2n + g86）为基线
+
+- 基线树 `OP/cur` 是 job 的 `op/current` 的只读拷贝，tree_md5 为 `c6b95c2c`，其中 kernels.py 的 md5 是 `37f37052…`。
+- 所有新 arm 都从 `OP/lab2` 生成。`OP/lab2` 就是冠军代码加上 lab 的开关，开关默认值与冠军一致。我按 compile-only 核对过：`c0` 与 `cur` 在 k_dqg、k_dkdv、k_dkdv_sp 三个 kernel 上 ISA 字节完全相同。
+- arm 用 `tools/mkarm2.sh NAME KEY=VAL…` 生成。
+
+### 结论
+
+1. **训练工作点（低时钟）确认了 u2n 的收益，而且比高时钟下更大。**
+   - 条件：每次计时前跑 10 个 bf16 GEMM，形状 32768×4096×14336，每次约 25 ms、约 1.5 PF/s，使用 e2e 所用的 IMAGE hipBLASLt 库。kernel 执行期间的 sclk 为 **1272–1352 MHz**，与训练里 1250–1430 MHz 相符。
+   - 结果（cur 对 r19h，3 个轮换进程）：**k_dq 0.9224 / 0.9234 / 0.9212（−7.8%）；整个 op 0.9667 / 0.9680 / 0.9688（−3.2%）**。
+   - 对照：约 1840 MHz 下，k_dq −6.0%，整个 op −3.05%。
+   - 有一处与 profile/REPORT.md 不同：在这个低时钟状态下，k_dq 是 4.05 ms，而约 1950 MHz 时是 2.98 ms，**对时钟敏感（约 1.36×）**。profile 里说"k_dq 对时钟不敏感"，这一点这里没有复现。
+   - **方法注意**：GEMM 必须使用 IMAGE 库（`/opt/venv/.../_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/gfx1250`）。第一次测量（`kb6_prod_gb_*`）用的是 job 的 `~/.local` 库，一个 GEMM 要 47 ms（约 80 TF/s），时钟不降反升到 2155 MHz。那组数据作废，只作为"高时钟、无 L2 flush"条件下的旁证：cur/r19h = 0.9647。
+2. **operator 点名的 4 个后续 arm，外加 5 个新 arm，全部没有超过冠军。**
+   - u2nb / u2b：加 `sched_barrier(0)` 把展开的两半隔开。VGPR 从 991 降到 798，但 k_dq **慢 16–21%**，整个 op 慢 6–8%。h37 说过 k_dq 的 load 聚簇是承重的，这里又得到一次印证。
+   - u2f / u2fb：只把 softmax 改成 fma，scale 仍在 dS 里。整个 op 分别慢 2.0% 和 6.8%。
+   - qf：在已经展开 2 次的基线上，它和 u2f 等价，所以没有单独建。
+3. **k_dq 的 epilogue 经 LDS 转置（c_epi，把 k_dkdv 的 g86 移植过来）：null。**
+   - 输出与冠军逐位相同；256 条 `buffer_store_b16` 变成 32 条 `buffer_store_b128`。
+   - prod：整个 op 0.9992 / 0.9989 / 1.0008，k_dq +0.4%。
+   - proxy：k_dq −3.2%，整个 op −0.5%，但 proxy 的 op 噪声约 ±2%。
+   - 低时钟：整个 op 0.9999。
+   - 判定为 null。每个 WG 只执行一次 epilogue，在 prod 的约 64 次循环迭代面前占比太小。
+4. **k_dkdv 减发射槽位（operator 的第 3 点），全部 null 或 loss。**
+   - c_k1（VF_KV：fma softmax，scale 挪到 dK store）：循环体 659 → 609 条指令，v_pk 96 → 41。高时钟 +0.43%，**低时钟 +0.39%**。这个 kernel 对时钟敏感，但在低时钟下同样没有收益。
+   - c_k1f（只做 fma）：+0.86%。
+   - c_ku2（k_dkdv 展开 2 次，VGPR 729 → 644，消掉 64 条 v_mov_b64）：**+7.3%**。
+   - c_ku2b（再加 sched_barrier）：+8.7%。
+   - 结论：k_dkdv 在循环体内减 VALU 和轮转 mov 都拿不到时间。这与 h16/g60 的"发射槽位不是这个 kernel 的约束"一致。
+5. **这一轮没有新的冠军候选。** 最佳树仍然是冠军本身（u2n）。
+
+### 各 arm 的定义与结果
+
+| arm | 相对冠军的改动 | tree md5 | k_dq VGPR | k_dkdv VGPR | spill/scratch | 相对冠军的 dB | prod 整个 op（3 进程） | prod k_dq | proxy 整个 op / k_dq（3 进程） | 判定 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| cur | 冠军 | c6b95c2c | 991 | 729 | 0/0 | — | 1 | 1 | 1 | — |
+| r19h | 上一任冠军 | a791a047 | 960 | 724 | 0/0 | 逐位相同 | 1.0359/1.0300/1.0287 | 1.064 | 1.030 / 1.059 | 对照 |
+| c_u2nb | + sched_barrier | 480af77f | 798 | 729 | 0/0 | **逐位相同** | 1.0846/1.0800/1.0763 | **1.207** | 1.087 / 1.231 | loss |
+| c_u2b | + barrier + VF_Q | 41fff126 | 798 | 729 | 0/0 | dq 49.9 dB（参考 52.54） | 1.0633/1.0590/1.0560 | 1.161 | 1.067 / 1.181 | loss |
+| c_u2f | VF_Q 只做 fma | e3c7c318 | 998 | 729 | 0/0 | dq 80 dB（参考 52.56） | 1.0247/1.0197/1.0165 | 1.034 | 1.029 / 1.078 | loss |
+| c_u2fb | 同上 + barrier | 50ebc975 | 806 | 729 | 0/0 | dq 80 dB | 1.0717/1.0665/1.0656 | 1.181 | 1.072 / 1.209 | loss |
+| **c_epi** | dQ epilogue 经 LDS | 03afacee | 1000 | 729 | 0/0（LDS 24576） | **逐位相同** | 0.9992/0.9989/1.0008 | 1.004 | 0.995 / **0.968** | null |
+| c_ku2b | k_dkdv 展开 + barrier | c5f6d2cc | 991 | 644 | 0/0 | 逐位相同 | 1.0900/1.0878/1.0822 | 1.001 | 1.101 / 1.004 | loss |
+| c_ku2 | k_dkdv 展开 | 88079a87 | 991 | 644 | 0/0 | 逐位相同 | 1.0670/1.0751/1.0758 | 1.001 | — | loss |
+| c_k1 | VF_KV | 0e504495 | 991 | 746 | 0/0 | dk 50 dB（参考 52.59） | 1.0003/1.0063/1.0062 | 1.001 | — | null |
+| c_k1f | VF_KV 只做 fma | f8266569 | 991 | 748 | 0/0 | dk 75 dB | 1.0033/1.0111/1.0115 | 1.000 | — | null/loss |
+
+- 比值 = arm 的中位数 / 同一进程里 cur 的中位数。
+- 计时方法：`tools/kbench.py blk`，分块尺子，lead 4 + block 9，每轮回文，45 次计时，每次计时前 flush 256 MB L2。每个 shape 3 个轮换进程。
+- c_k1、c_k1f、c_ku2 的计时在单独的 3 个进程里做（`kb6_prod_blk_*`），arm 为 cur、c_k1、c_k1f、c_ku2。
+- 正确性（`runs/val5_*`、`val6_*`）：全部通过 fast ×200、proxy ×100、prod ×50 的门槛。对参考的 dB 全部 ≥ 52.52，dk/dv 逐位确定，dq 逐次逐位相同。
+- 编译：`compile/isa_summary_round2.txt` 里 33 个 kernel 全部是 0 spill、0 scratch。
+- 边界证明：
+  - `bounds/bounds_epi.txt`：LDS 每个 wave 占 24576 B，写入和 tr16 读回全部在界内，每个 (q, d) 恰好覆盖一次，违规 0 次。
+  - 全局下标与 bounds_dqg 已证的 Q 片段下标同形。
+  - KV_U2B 和 DQ_U2B 只加了 sched_barrier，不引入新的下标。
+
+**低时钟**（`runs/kb7_prod_gbimg_p{1,2,3}.log`，IMAGE 库，10 个 GEMM，sclk 由 0.5 ms 的 sysfs 轮询线程在 kernel 的 host 窗口内采样）：
+
+| arm | 整个 op 相对 cur | k_dq 相对 cur | 整个 op ms | sclk |
+|---|---|---|---|---|
+| cur | 1 | 1 | 9.304–9.309 | 1344–1346 |
+| r19h | 1.0344 / 1.0330 / 1.0322 | 1.0842 / 1.0830 / 1.0855 | 9.61–9.63 | 1352 |
+| c_epi | 1.0001 / 1.0008 / 0.9989 | 1.000 | 9.30–9.31 | 1346 |
+| c_k1 | 1.0048 / 1.0039 / 1.0031 | 1.000 | 9.34–9.35 | 1348–1352 |
+
+**外来负载**：09:00:31–约 09:10 UTC，别的用户在 GPU0 上跑了 hipblaslt-bench。与这段时间重叠的 `kb5_prod_blk_p1` 和 `p2` 已排除，并用 `p1r`、`p2r` 重测，arm 顺序相同。两组数据的比值差异在 0.5% 以内。之后的所有进程都在停掉外来负载之后运行。汇总见 `runs/round2_ratios.txt`。
+
+**卡上工作量**：第二轮在 GPU0 上共 18 个进程。每个进程之后都查了 dmesg，没有新的 amdgpu 故障行。唯一出现的 amdgpu 行是 `0002:04:00.0 MES ring buffer full`，那是已宕的 GPU1，按规则忽略。
+
+### 建议的 hint（第二轮；不是 must refactor，而是一条关闭记录）
+
+```
+| h70 | closed | k_dq/k_dkdv issue-count follow-ups on the r29 champion are all null or losses; u2n's gain is confirmed at the training clock (-3.2% op, -7.8% k_dq at 1272-1352 MHz) | closed |
+
+## h70 -- lab-kdq round 2 (GPU0, blocked ruler, 3 rotated processes per shape, vs r29 = op/current)
+Confirmed: r29 (u2n) vs r19h at the TRAINING operating point (10 x bf16 32768x4096x14336 GEMM
+  with the IMAGE hipBLASLt lib before every timed call; sclk 1272-1352 MHz): whole op
+  0.9667/0.9680/0.9688, k_dq 0.9224/0.9234/0.9212. At ~1840 MHz: op 0.970, k_dq 0.940.
+  Note: k_dq is clock-SENSITIVE in this state (4.05 ms at ~1280 MHz vs 2.98 at ~1950).
+  A GEMM burst with the ~/.local hipBLASLt lib runs at ~80 TF/s and does NOT lower the clock.
+Dead, do not rebuild (all 0 spill; all gates pass):
+  - sched_barrier(0) between the two unrolled k_dq bodies (u2nb): VGPR 991 -> 798 but k_dq
+    +20.7%, op +8.0% -- the load clump (h37) again. With VF_Q (u2b) +6%.
+  - fma-only softmax in k_dq keeping the scale in dS (u2f): op +2.0%; any VF_Q on top of the
+    unroll loses (the u2 result of round 1 holds).
+  - dQ epilogue through LDS (g86 ported to k_dqg: 256 buffer_store_b16 -> 32 b128, bitwise):
+    prod op 0.9996, low clock 0.9999, proxy k_dq -3% / op -0.5% (within proxy noise). Null.
+  - k_dkdv: VF_KV (fma softmax + scale at dK store, loop 659 -> 609 instr) +0.4% at both
+    ~1840 MHz and ~1345 MHz; unroll-by-2 (729 -> 644 VGPR, no rotation movs) +7.3%, with
+    sched_barrier +8.7%. Cutting VALU/mov slots in k_dkdv's loop does not buy time.
+```
+
+---
+
+# 第一轮（GPU3，之后改用 GPU0），基线 r19h
+
 
 卡：先用 GPU3 / fa-g3，06:45 起 GPU3 交还给 bwd job。之后改用 GPU0 / fa-g0。
 
@@ -195,3 +294,16 @@ Follow-ups prepared compile-only: u2nb (u2n + sched_barrier(0) between the halve
 - `tools/plan.sh`：未运行的卡上计划
 - `bounds/bounds_dqg.*`、`bounds/bounds_u2.*`：CPU 边界证明
 - `runs/`：所有卡上进程的日志、`.dmesg` 和 `.dmesg.bad`。`.dmesg.bad` 全部为空
+
+## 第二轮新增文件
+
+- `OP/cur`：冠军 r29 的拷贝
+- `OP/lab2`：冠军代码加 lab 开关，默认值与冠军一致
+- `OP/c_*`：第二轮各 arm 的代码树
+- `tools/mkarm2.sh`：生成第二轮 arm
+- `tools/step5.sh`、`step5r.sh`、`step6.sh`、`step7.sh`：已运行的卡上脚本
+- `tools/kbench.py`：新增 sclk 轮询线程、`sclk_pre` 和 `pre_ms` 字段
+- `tools/run1.sh`：新增 `KB_BLASLIB`，用于覆盖 hipBLASLt 库路径
+- `runs/val5_*`、`val6_*`、`kb5_*`、`kb6_*`、`kb7_*`：第二轮原始数据；汇总在 `runs/round2_ratios.txt`
+- `compile/isa_summary_round2.txt`、`bounds/bounds_epi.{py,txt}`
+- `tools/plan.sh`：第一轮留下的计划，其中所有项目都已经在第二轮完成或被取代
