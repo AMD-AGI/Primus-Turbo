@@ -216,5 +216,5 @@ fwd ~10 ms. So **bwd first on A0** (reverses SKILL.md §1 "forward first", which
   copied from B0 (the A0 bwd dir is kept as `*.a0-pre-b0`); the A0 fwd job `...-20260925-114644` is retired.
   e2e Llama-3.1-8B: FlyDSL/ASM 1.032 per step (bwd ~52 ms, fwd ~10 ms of the ~51-62 ms gap) -> bwd first.
   Rulers: blocked timing (h40/h66), real q/k/v dumps after a GEMM burst (h47), fresh JIT cache per process (h46/h72).
-  Before resuming either job on A0: final.yaml container `fa-repro` / host / gpu_id, append host hints h48 (fwd) / h74 (bwd).
+  Before resuming either job on A0: final.yaml container `fa-repro` / host / gpu_id, append host hints h49 (fwd) / h74 (bwd).
 ```

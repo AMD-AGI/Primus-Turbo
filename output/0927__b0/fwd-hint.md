@@ -66,6 +66,7 @@ Source abbreviations used below:
 | h45 | must standing note | Speculative softmax is DEAD on real data -- never re-add stale-max / guessed-max / trigger-and-redo; any data-dependent candidate must also beat the champion on the real q/k/v dumps in the same process | open |
 | h46 | must standing note | FlyDSL JIT CACHE HAZARD: the disk-cache key ignores module-level constants (e.g. SPEC_STALE_MAX) -- a path whose contents changed can serve the OLD binary. Every measurement uses a fresh FLYDSL_RUNTIME_CACHE_DIR per process (or per arm) | open |
 | h47 | must note | REDIRECT after 4 non-improving rounds (r14-r17): the remaining prod gap is issued work x clock sensitivity; rank candidates on the REAL dumps after a GEMM burst as well as randn, and target instruction count on the prod m32x8 hot loop | open |
+| h48 | must refactor | Adopt rounds/019/op verbatim as op/current: vs the champion +1.5% on real dumps after a GEMM burst (18/18 readings above the A/A max) and +1.7% on randn; rejected only by r18's unshipped best-ever record | open |
 
 ---
 
@@ -846,3 +847,13 @@ the randn blocked ruler barely weighs. For the next rounds:
    SALU bookkeeping, redundant waits, barrier count per KV tile -- work that costs cycles at every clock;
 3. report both rulers in act.yaml notes; a candidate that wins >= 2% on real-dump-after-burst with the randn ruler
    within its band is worth shipping, and the operator will promote it by refactor if the randn geomean blocks it.
+
+## h48 -- Adopt rounds/019/op verbatim as op/current
+
+Round 19 (`rounds/019/1-opt/opt.md`, "h47 real-dump ruler" and "Verdict"): the candidate in `rounds/019/op` is correct
+(16/16, worst 49.82 dB, determinism 200/200) and, against op/current in the same processes (3 rotated orders, fresh JIT
+cache): real q/k/v dumps after a GEMM burst geo **1.0150** (min 1.0078, above the A/A max 1.0070); randn geo 1.0167.
+Acceptance rejected it (0.9998) only because the per-shape best-ever records now belong to round 18's arm, which was never
+promoted -- the same trap as h39 (see op-evolve suggestion 1). Operator decision per the h39 precedent: adopt it.
+**Refactor task**: copy `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/019/op/` into the working copy VERBATIM, run the correctness gate; promotion clears
+the stale best-ever records. Remember h46: clear /tmp/flycache after the promotion before re-measuring the champion.

@@ -1,0 +1,117 @@
+round: 19
+mode: fast
+candidate: r19.i2.g67             # route row 5 (first idea row): g64 + RESCALE_THRESHOLD 8 -> 24 on m32x8
+outcome: delivered
+
+correctness:
+  unit_tests: pass                # job_context/op/ut/test_correctness.py --impl rounds/019/op: RESULT PASS
+  precision: pass                 # validation.py: every correctness row PASS, det 200/200 (o=9eb9b58556bf lse=bbf23654e600)
+  checked_with: op/validation.py
+  sqnr_db: 49.82                  # min over the gate (short_q full), same as op/current and r18
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/016/op, rounds/017/op, rounds/018/op, job_context/op/current]
+  # 3 rotated sessions (cand r16 r17 r18 cur champ2 | champ2 cur r18 r17 r16 cand | r18 cand cur champ2 r16 r17), one
+  # process each, fresh JIT cache per process, /tmp/flycache cleared before the build, no beat in process (h31);
+  # champ2 = byte copy of op/current (A/A). rounds/016/op is g61 and NOT byte-identical to op/current (r13ns); both
+  # measured. fa-g2 idle (0-4%), 11:00:17-11:13:12Z. Figures = mean of the 3 session medians; raw: 1-opt/raw/measure/.
+  # beat measured in its own process in the same sweep (raw/measure/beat.json).
+  shapes:
+    - name: fast
+      this_round_tflops: 165.46
+      best_round_tflops: 165.13
+      beat_tflops: 154.65
+      target_tflops: 154.65
+      champion_round: 16
+      champion_tflops: 165.13
+      champion_rebuilt: true
+      ratio: 1.0                  # 1.0699 uncapped; above target, stays above it
+      vs_champion: 1.0020         # m32x2 body byte-identical in every arm -> noise (A/A champ2 1.000..1.0015)
+    - name: proxy
+      this_round_tflops: 1580.41
+      best_round_tflops: 1583.29
+      beat_tflops: 1667.47
+      target_tflops: 1667.47
+      champion_round: 18
+      champion_tflops: 1583.29
+      champion_rebuilt: true
+      ratio: 0.9478
+      vs_champion: 0.9982         # vs cur x1.0090 (1.0108 1.0039 1.0123); A/A champ2 0.9923..1.0085
+    - name: prod
+      this_round_tflops: 1466.61
+      best_round_tflops: 1467.79
+      beat_tflops: 1553.19
+      target_tflops: 1553.19
+      champion_round: 18
+      champion_tflops: 1467.79
+      champion_rebuilt: true
+      ratio: 0.9443
+      vs_champion: 0.9992         # vs cur x1.0172 (1.0193 1.0151 1.0172); A/A champ2 1.0021..1.0036
+  score: 0.9640                   # capped mean; uncapped (fast 1.0699) 0.9873
+
+validation:
+  exit_code: 2                    # all correctness + determinism rows pass; fails only the speed bar (in-process min 0.8966 vs beat), as op/current does
+
+notes:
+  h47_real_dump_ruler: >
+    prod, 6 real q/k/v dump layers + randn, each timed call after a 10-GEMM burst (ab.py cond gb), 3 rotated orders,
+    no beat, fresh cache (raw/real/ab19act.py, summary_act.txt): rounds/019/op x1.0150 vs op/current (18 readings
+    1.0078..1.0259), r18 x1.0036 (0.9958..1.0115), A/A champ2 x1.0001 (0.9961..1.0070); randn under the same condition
+    cand x1.0167 = r18 x1.0160. So cand is +1.1% over r18 on real data and equal to it on randn. The opt read
+    (x1.0156) reproduced; under h47's >= 2% line.
+  why_randn_blind: >
+    The emulated rescale-branch rate (r19.i1.g66) is 11-24% of steps on the real dumps and 0% on randn, so a threshold
+    change is bitwise-inert on the scoring inputs. The candidate ties r18 on the scoring ruler by construction.
+  h16_adversarial: >
+    raw/build/adv_m32x8.py (arm=rounds/019/op, ref=rounds/018/op): finite 15/15; bitwise = r18 on randn/late_high;
+    ramp o -0.17/-0.48 dB vs r18 (51.73/51.67 dB), the rest equal. RESULT line FAIL = bitwise criterion only.
+  real_precision: >
+    raw/val/realchk.py: real-dump o vs fp32 reference 52.56..55.24 dB (= g64 within 0.01 dB, +0.3..0.6 above cur).
+
+explored:
+  ran:
+    - "torch emulation of the deferred-rescale branch predicate on the 6 real dumps + randn (r19.i1.g66): 11-24% of steps real at T=8, 0 randn -> located the randn ruler's blind spot and chose the threshold lever"
+    - "threshold arms (tinf/t24/t16/g64/g64t24) on the real-dump-after-GEMM-burst ruler, 3 rotated sessions: g64t24 x1.0156, super-additive over g64 x1.0035 and t24 x1.0062 -> made g64+T24 the candidate, T alone rejected"
+    - "real-dump precision vs fp32 reference (realchk): T24 alone -0.3..-0.9 dB, T24 on g64 = g64 -> T ships only with g64"
+  consulted:
+    - ops/attention/online-softmax.md
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+    - backends/flydsl/attention/techniques.md
+    - optimization/routes/1-metrics-to-techniques.md
+  bound: power
+  confidence: medium
+  why: "prod is power/clock-limited (r15 profile, r17/r18 pmc); the remaining lever this round priced is issued work in the rescale branch, which only real data executes (~18% of steps)"
+
+arms:
+  - id: r19.i2.g67
+    built: "g64 (rounds/018/op) + RESCALE_THRESHOLD 24, one line"
+    tflops: {fast: 165.46, proxy: 1580.41, prod: 1466.61}
+    vs_champion: 0.9992
+    shipped: true
+    note: "real dumps after GEMM burst x1.0150 vs op/current, x1.011 vs r18"
+  - id: r19.i2.g67-alone
+    built: "T=24 on op/current (no g64), opt real-dump ruler only"
+    tflops: {}
+    vs_champion: 1.0062           # real-dump geo vs op/current; randn = A/A (1.0033)
+    shipped: false
+    note: "loses 0.3..0.9 dB vs fp32 on real dumps; T=16 x1.0041; tinf ceiling x1.0096"
+
+expected: >
+  g67 (= rounds/018/op with one constant changed, the arm raw/arms/g64t24) is the real-data best of anything built
+  since r13ns: +1.56% real after a GEMM burst (range 1.0064..1.0220, min above the A/A max), where g64 alone read
+  +0.2..0.35%. Precision is free with g64 (>= 52.5 dB real, 16/16 randn). I expect act to re-read g64t24 at real
+  x1.012..1.020 vs op/current. On randn, benchmark.py cannot see the threshold at all (bitwise equal to g64 there), so it
+  scores what g64 scored: prod ~+1.5..1.8% vs current, proxy ~+0.5%, fast 0, which is ~+0.3% on the mean vs best-ever
+  per shape, below the 0.70% bar. So I expect the scoring rule NOT to accept it, and h47's ">= 2% real" not quite met
+  either. It is still the right thing to deliver: the only ruler it misses is the one that never runs the branch. A
+  T=32 arm on g64 (fires 2-11%) is the only cheap extra, worth <~0.3% by the tinf ceiling. Beyond that, the rescale
+  family is exhausted.
+
+added_to_pool: [r19.i2.g67]
+route_updated: true
+
+implementation:
+  files_changed: [op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py]
+  # relative to op/current, rounds/019/op also carries r18's g64 (same file) and r16's g61 lineage; the round's own edit is L166
+  build_failures: []

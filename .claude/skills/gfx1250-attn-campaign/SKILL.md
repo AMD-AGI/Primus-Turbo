@@ -50,7 +50,7 @@ FLOP from `op-evolve/tools/op_flops.py`: fwd 2.199292e12, bwd 5.498229e12. One g
   e2e Llama-3.1-8B: FlyDSL/ASM 1.032 per step (bwd ~52 ms, fwd ~10 ms of the gap) -> **bwd first** (overrides §1's
   "forward first"). Rulers: blocked timing (h40/h66), real q/k/v dumps after a GEMM burst (h47), fresh JIT cache per
   process (h46/h72). Before resuming either job on A0: final.yaml container `fa-repro` / host / gpu_id, host hints
-  h48 (fwd) / h74 (bwd). Day report: `output/0927__b0/REPORT-0928.html`.
+  h49 (fwd) / h74 (bwd). Day report: `output/0927__b0/REPORT-0928.html`.
 
 - **fwd job: being launched** (2026-09-25 11:46) on flydsl 0.3.4.1 (0.3.4.1 vs 0.3.2 A/B: perf-neutral).
   Spec fixes in: `precision_gate` split out, deep every 5th round (fast_rounds 4 / fast_per_deep 4),
