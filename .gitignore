@@ -1,5 +1,10 @@
 __pycache__
 *.so
+# Built kernel libraries: the versioned, target-suffixed names the build emits
+# (libprimus_turbo_kernels.so.0.hipv4-amdgcn-amd-amdhsa--gfx950) are NOT matched
+# by *.so, which is how a 38 MB artifact was committed once.
+*.so.*
+primus_turbo/lib/
 build
 *.egg-info
 .vscode
