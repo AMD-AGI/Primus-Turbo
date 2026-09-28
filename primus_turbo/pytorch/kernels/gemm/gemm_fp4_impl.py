@@ -187,7 +187,13 @@ class GEMMFP4AITERBackend(KernelBackend):
         inplace_add_to_out: bool = False,
         **kwargs,
     ) -> bool:
-        del preshuffled  # AITER handles both layouts
+        # A pre-shuffled scale tensor is self-identifying: AITER's is the canonical shape in
+        # uint8, another backend's packed layout is neither. Checking the tensor rather than
+        # taking the caller's word also means a mislabelled one is refused, not misread.
+        if preshuffled and not (
+            a_scale_inv.ndim == 2 and a_scale_inv.element_size() == 1 and b_scale_inv.ndim == 2
+        ):
+            return False
         supported = True
         # TODO: this backend has no beta=1 accumulate epilogue yet.
         supported &= not inplace_add_to_out
@@ -209,6 +215,14 @@ class GEMMFP4AITERBackend(KernelBackend):
         return supported
 
     @staticmethod
+    def tuning_kwargs(**kwargs):
+        # In deployment the quantiser hands this backend its own layout, so the three shuffle
+        # launches the raw-E8M0 path pays are not part of its steady state. Time it without
+        # them: the bytes are the wrong permutation, which costs nothing and is never read for
+        # anything but their timing.
+        return {**kwargs, "preshuffled": True}
+
+    @staticmethod
     def execute(
         a: torch.Tensor,
         a_scale_inv: torch.Tensor,
@@ -220,6 +234,7 @@ class GEMMFP4AITERBackend(KernelBackend):
         trans_c: bool,
         granularity: ScalingGranularity,
         preshuffled: bool = False,
+        **kwargs,
     ):
         if preshuffled:
             # Fast path: caller guarantees a_scale_inv, b_scale_inv, and b
@@ -278,8 +293,11 @@ class GEMMFP4FlyDSLBackend(KernelBackend):
         **kwargs,
     ) -> bool:
 
-        # No path for AITER-preshuffled inputs (this backend preshuffles raw E8M0 itself).
-        if preshuffled:
+        # `preshuffled` says the scales are already in some backend's layout; which one is
+        # legible from the tensor itself, so no flag has to carry it. This GEMM's packed slab is
+        # flat int32; AITER's is the canonical 2-D uint8 shape, and reading one as the other is
+        # exactly the silent-corruption case, so the shape decides rather than the caller.
+        if preshuffled and not (a_scale_inv.dtype == torch.int32 and a_scale_inv.ndim == 1):
             return False
 
         supported = True
@@ -302,6 +320,15 @@ class GEMMFP4FlyDSLBackend(KernelBackend):
         supported &= (m % mn_mul == 0) and (n % mn_mul == 0)
         supported &= k % GEMMFP4FlyDSLBackend.FLYDSL_FP4_K_MULTIPLE == 0
 
+        if preshuffled:
+            # ceil256(dim) * K/128 dwords, and no longer carrying the contraction -- hence the
+            # explicit `k=` at the call below, taken off the fp4 data.
+            def _packed_ok(s, dim):
+                return s.dtype == torch.int32 and s.numel() == (dim + 255) // 256 * 256 * (k // 128)
+
+            supported &= _packed_ok(a_scale_inv, m) and _packed_ok(b_scale_inv, n)
+            return supported
+
         # Raw E8M0 block scales, 1 byte/elem, [DIM, K//32] (the GEMM wrapper preshuffles
         # them into its lane-contiguous layout).
         def _scale_ok(s, dim):
@@ -310,6 +337,26 @@ class GEMMFP4FlyDSLBackend(KernelBackend):
         supported &= _scale_ok(a_scale_inv, m)
         supported &= _scale_ok(b_scale_inv, n)
         return supported
+
+    @staticmethod
+    def tuning_kwargs(**kwargs):
+        # Same reasoning as the AITER backend: the repack is an artefact of being handed raw
+        # E8M0, not part of the steady state, so time this one on a slab of the packed shape.
+        # Its contents are never read for anything but their timing.
+        if kwargs.get("preshuffled"):
+            return kwargs
+        a, b = kwargs["a"], kwargs["b"]
+        k128 = (a.size(1) * 2) // 128
+
+        def _slab(dim):
+            return torch.empty((dim + 255) // 256 * 256 * k128, dtype=torch.int32, device=a.device)
+
+        return {
+            **kwargs,
+            "a_scale_inv": _slab(a.size(0)),
+            "b_scale_inv": _slab(b.size(0)),
+            "preshuffled": True,
+        }
 
     @staticmethod
     def execute(
@@ -327,13 +374,12 @@ class GEMMFP4FlyDSLBackend(KernelBackend):
         out: torch.Tensor | None = None,
         **kwargs,
     ):
-        # preshuffled accepted only so the dispatcher's uniform execute(**kwargs)
-        # call works; can_handle already rejected the preshuffled=True case.
-        del preshuffled
-        # Raw E8M0 block scales ([DIM, K/32], 1 byte/elem) are passed straight through;
-        # the FlyDSL GEMM wrapper repacks them into its lane-contiguous layout via a
-        # separate preshuffle kernel on the same stream (quant stays generic). The
-        # whole-loop kernel consumes any K % 256 (KI//2 pairs + MFMA-only odd tail).
+        # Raw E8M0 block scales ([DIM, K/32], 1 byte/elem) are passed straight through; the
+        # FlyDSL GEMM wrapper repacks them into its lane-contiguous layout via a separate
+        # preshuffle kernel on the same stream (quant stays generic). The whole-loop kernel
+        # consumes any K % 256 (KI//2 pairs + MFMA-only odd tail). Scales already in that
+        # layout skip the repack, worth ~1.5% of the GEMM; being flat, they no longer carry
+        # the contraction, so K comes off the fp4 data instead.
         return gemm_mxfp4_flydsl_kernel(
             a,
             a_scale_inv,
@@ -343,13 +389,18 @@ class GEMMFP4FlyDSLBackend(KernelBackend):
             trans_c=trans_c,
             beta=1.0 if inplace_add_to_out else 0.0,
             out=out if inplace_add_to_out else None,
+            scales_prepacked=preshuffled,
+            k=(a.size(1) * 2) if preshuffled else None,
         )
 
 
+# Both race on raw E8M0, where they take the same operands and each converts them its own way.
+# AITER's three shuffle launches are its real cost under that contract; a caller that wants to
+# skip them passes `preshuffled=True`, and is then AITER's alone to serve.
 _GEMM_FP4_BACKENDS = {
-    BackendType.AITER: BackendEntry(GEMMFP4AITERBackend, autotune=False),
+    BackendType.AITER: BackendEntry(GEMMFP4AITERBackend),
     BackendType.HIPBLASLT: BackendEntry(GEMMFP4HipBLASLtBackend),
-    BackendType.FLYDSL: BackendEntry(GEMMFP4FlyDSLBackend, autotune=False),
+    BackendType.FLYDSL: BackendEntry(GEMMFP4FlyDSLBackend),
 }
 
 
@@ -372,6 +423,9 @@ class GEMMFP4KernelDispatcher(AutoKernelDispatcher):
         **kwargs,
     ):
         m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
+        # An fp4 row is K/2 bytes, so whether it starts on a 128-byte line is the caller's
+        # allocation to decide, and the backends do not pay for the misaligned case equally.
+        # Same logical shape, two allocations, two answers -- so the stride is part of the key.
         # Not every backend carries the beta=1 epilogue, so a choice tuned for the
         # plain GEMM must not be reused for the accumulating one (a cache hit skips
         # can_handle and would call a backend that ignores `out`).
@@ -388,7 +442,61 @@ class GEMMFP4KernelDispatcher(AutoKernelDispatcher):
             granularity,
             preshuffled,
             inplace_add_to_out,
+            a.stride(0),
+            b.stride(0),
         )
+
+
+_FP4_BACKEND_FOR_SHAPE: dict = {}
+
+
+def resolve_fp4_backend(
+    m: int,
+    n: int,
+    k: int,
+    *,
+    out_dtype: torch.dtype,
+    device: torch.device,
+    granularity: ScalingGranularity = ScalingGranularity.MX_BLOCKWISE,
+    default_backend: BackendType = BackendType.HIPBLASLT,
+) -> BackendType:
+    """Which backend will serve this GEMM, asked before there is anything to serve it with.
+
+    The scale layout a quantiser emits decides which backends can read it, so asking after the
+    fact only confirms a choice already made. This asks first, off the shapes alone: the race
+    times each candidate on the layout it would be fed (see ``KernelBackend.tuning_kwargs``),
+    and none of it reads the operands for anything but their timing, so empty ones will do.
+
+    Cached per shape -- the answer cannot change between two calls with the same arguments, and
+    running the race is not cheap.
+    """
+    key = (m, n, k, out_dtype, str(device), granularity, default_backend)
+    hit = _FP4_BACKEND_FOR_SHAPE.get(key)
+    if hit is not None:
+        return hit
+
+    def _fp4(rows):
+        return torch.empty((rows, k // 2), dtype=float4_e2m1fn_x2, device=device)
+
+    def _scale(rows):
+        return torch.empty((rows, k // 32), dtype=torch.uint8, device=device)
+
+    chosen = GEMMFP4KernelDispatcher.resolve(
+        default_backend,
+        GlobalBackendManager.get_gemm_backend(PrecisionType.FP4),
+        a=_fp4(m),
+        b=_fp4(n),
+        a_scale_inv=_scale(m),
+        b_scale_inv=_scale(n),
+        out_dtype=out_dtype,
+        trans_a=False,
+        trans_b=True,
+        trans_c=False,
+        granularity=granularity,
+        preshuffled=False,
+    )
+    _FP4_BACKEND_FOR_SHAPE[key] = chosen
+    return chosen
 
 
 @_torch_custom_op_wrapper("primus_turbo::gemm_fp4_impl", mutates_args=(), device_types="cuda")
