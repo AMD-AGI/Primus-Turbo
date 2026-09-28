@@ -1,0 +1,11 @@
+{"R": 4096, "C": 4096, "x_transposed_view": false, "bit_exact": true, "nonfinite": 0, "torch_ms": 0.061, "triton_ms": 0.027, "torch_GBs": 1100.1, "triton_GBs": 2485.5}
+{"R": 4096, "C": 14336, "x_transposed_view": false, "bit_exact": true, "nonfinite": 0, "torch_ms": 0.19, "triton_ms": 0.045, "torch_GBs": 1236.2, "triton_GBs": 5219.6}
+{"R": 14336, "C": 4096, "x_transposed_view": false, "bit_exact": true, "nonfinite": 0, "torch_ms": 0.214, "triton_ms": 0.042, "torch_GBs": 1097.6, "triton_GBs": 5592.4}
+{"R": 1024, "C": 4096, "x_transposed_view": false, "bit_exact": true, "nonfinite": 0, "torch_ms": 0.021, "triton_ms": 0.026, "torch_GBs": 798.9, "triton_GBs": 645.3}
+{"R": 32768, "C": 4096, "x_transposed_view": true, "bit_exact": true, "nonfinite": 0, "torch_ms": 0.08, "triton_ms": 0.086, "torch_GBs": 6710.9, "triton_GBs": 6242.7}
+{"R": 32768, "C": 1024, "x_transposed_view": true, "bit_exact": true, "nonfinite": 0, "torch_ms": 0.017, "triton_ms": 0.039, "torch_GBs": 7895.2, "triton_GBs": 3441.5}
+{"R": 32768, "C": 14336, "x_transposed_view": true, "bit_exact": true, "nonfinite": 0, "torch_ms": 0.261, "triton_ms": 0.25, "torch_GBs": 7199.4, "triton_GBs": 7516.2}
+{"R": 32768, "C": 4096, "x_transposed_view": false, "bit_exact": true, "nonfinite": 0, "torch_ms": 0.449, "triton_ms": 0.084, "torch_GBs": 1195.7, "triton_GBs": 6391.3}
+{"R": 32768, "C": 14336, "x_transposed_view": false, "bit_exact": true, "nonfinite": 0, "torch_ms": 1.551, "triton_ms": 0.229, "torch_GBs": 1211.5, "triton_GBs": 8205.5}
+{"R": 32768, "C": 8192, "x_transposed_view": true, "bit_exact": true, "nonfinite": 0, "torch_ms": 0.155, "triton_ms": 0.158, "torch_GBs": 6927.4, "triton_GBs": 6795.8}
+ALL_BIT_EXACT

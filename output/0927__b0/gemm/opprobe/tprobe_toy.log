@@ -1,0 +1,6 @@
+{"R": 1, "C": 1, "x_transposed_view": false, "bit_exact": true, "nonfinite": 0}
+{"R": 7, "C": 5, "x_transposed_view": false, "bit_exact": true, "nonfinite": 0}
+{"R": 65, "C": 130, "x_transposed_view": true, "bit_exact": true, "nonfinite": 0}
+{"R": 257, "C": 63, "x_transposed_view": false, "bit_exact": true, "nonfinite": 0}
+{"R": 300, "C": 1000, "x_transposed_view": true, "bit_exact": true, "nonfinite": 0}
+ALL_BIT_EXACT

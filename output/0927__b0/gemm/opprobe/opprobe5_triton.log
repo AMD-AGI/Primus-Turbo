@@ -1,0 +1,10 @@
+{"name": "dgrad_qo", "bit_equal": true, "triton_ms": 0.636, "torchcopy_ms": 0.665, "orig_ms": 14.036}
+{"name": "dgrad_kv", "bit_equal": true, "triton_ms": 0.327, "torchcopy_ms": 0.263, "orig_ms": 3.596}
+{"name": "dgrad_mlp13", "bit_equal": true, "triton_ms": 2.277, "torchcopy_ms": 2.471, "orig_ms": 49.425}
+{"name": "dgrad_mlp2", "bit_equal": true, "triton_ms": 2.573, "torchcopy_ms": 2.743, "orig_ms": 49.968}
+{"name": "dgrad_head", "bit_equal": true, "triton_ms": 19.727, "torchcopy_ms": 21.779, "orig_ms": 628.784}
+{"name": "wgrad_qo", "bit_equal": true, "triton_ms": 0.651, "torchcopy_ms": 1.564, "orig_ms": 15.837}
+{"name": "wgrad_kv", "bit_equal": true, "triton_ms": 0.31, "torchcopy_ms": 0.802, "orig_ms": 3.887}
+{"name": "wgrad_mlp13", "bit_equal": true, "triton_ms": 2.515, "torchcopy_ms": 4.218, "orig_ms": 66.435}
+{"name": "wgrad_mlp2", "bit_equal": true, "triton_ms": 2.827, "torchcopy_ms": 5.591, "orig_ms": 73.974}
+{"name": "wgrad_head", "bit_equal": true, "triton_ms": 21.525, "torchcopy_ms": 31.872, "orig_ms": 687.379}

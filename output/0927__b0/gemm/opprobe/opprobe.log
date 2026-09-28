@@ -1,0 +1,48 @@
+/opt/venv/lib/python3.12/site-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+[W928 04:52:42.064347011 collection.cpp:1148] Warning: ROCTracer produced duplicate flow start: 5 (function operator())
+fwd_qo       cv M=32768  N=4096   K=4096   orig    0.589 ms  1867.6 TF/s | nk None ms None TF/s xNone | swap None ms | eq=None ulp=None det=None nanfill=None sqnr o/n/s=None/None/None
+      orig Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x128_MI16x16x1_SN_LDSB0_AFC1_AG0_AGG(0.56)
+fwd_mlp13    cv M=32768  N=14336  K=4096   orig    2.364 ms  1627.8 TF/s | nk None ms None TF/s xNone | swap None ms | eq=None ulp=None det=None nanfill=None sqnr o/n/s=None/None/None
+      orig Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x128_MI16x16x1_SN_LDSB0_AFC1_AG0_AGG(2.44)
+dgrad_qo     cc M=32768  N=4096   K=4096   orig   13.989 ms    78.6 TF/s | nk 0.659 ms 1669.1 TF/s x21.23 | swap 14.762 ms | eq=False ulp=26860 det=True nanfill=0 sqnr o/n/s=55.6/55.6/55.6
+      orig Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA(13.99)
+      nk   void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.07);Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x128_MI16x16x1_SN_LDSB0_AFC1_AG0_AGG(0.56)
+      swap Cijk_Alik_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA(14.73)
+dgrad_kv     cc M=32768  N=4096   K=1024   orig    3.597 ms    76.4 TF/s | nk 0.259 ms 1060.2 TF/s x13.89 | swap 3.66 ms | eq=False ulp=26256 det=True nanfill=0 sqnr o/n/s=55.6/55.6/55.6
+      orig Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA(3.58)
+      nk   void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.03);Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x128_MI16x16x1_SN_LDSB0_AFC1_AG0_AGG(0.23)
+      swap Cijk_Alik_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA(3.64)
+dgrad_mlp13  cc M=32768  N=4096   K=14336  orig   49.421 ms    77.9 TF/s | nk 2.285 ms 1684.2 TF/s x21.63 | swap 55.558 ms | eq=False ulp=27405 det=True nanfill=0 sqnr o/n/s=55.59/55.59/55.59
+      orig Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA(49.46)
+      nk   void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.33);Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x128_MI16x16x1_SN_LDSB0_AFC1_AG0_AGG(2.09)
+      swap Cijk_Alik_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA(55.66)
+dgrad_mlp2   cc M=32768  N=14336  K=4096   orig   49.976 ms    77.0 TF/s | nk 2.547 ms 1511.1 TF/s x19.62 | swap 54.411 ms | eq=False ulp=26916 det=True nanfill=0 sqnr o/n/s=55.6/55.6/55.6
+      orig Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA(50.00)
+      nk   void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.29);Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x128_MI16x16x1_SN_LDSB0_AFC1_AG0_AGG(2.33)
+      swap Cijk_Alik_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA(54.48)
+dgrad_head   cc M=32768  N=4096   K=128256 orig  627.321 ms    54.9 TF/s | nk 21.117 ms 1630.3 TF/s x29.71 | swap 520.572 ms | eq=False ulp=28120 det=True nanfill=0 sqnr o/n/s=55.61/55.61/55.61
+      orig Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA(633.51)
+      nk   void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(2.68);Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x128_MI16x16x1_SN_LDSB0_AFC1_AG0_AGG(18.29)
+      swap Cijk_Alik_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA(521.13)
+wgrad_qo     vc M=4096   N=4096   K=32768  orig   15.876 ms    69.3 TF/s | nk 1.439 ms 764.3 TF/s x11.03 | swap 15.924 ms | eq=False ulp=28995 det=True nanfill=0 sqnr o/n/s=55.62/55.62/55.62
+      orig Cijk_Ailk_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA(15.75)
+      nk   void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.50);void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.45);Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x128_MI16x16x1_SN_LDSB0_AFC1_AG0_AGG(0.53)
+      swap Cijk_Ailk_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA(15.84)
+wgrad_kv     vc M=1024   N=4096   K=32768  orig    3.902 ms    70.4 TF/s | nk 0.749 ms 367.1 TF/s x5.21 | swap 3.889 ms | eq=False ulp=28937 det=True nanfill=0 sqnr o/n/s=55.63/55.63/55.63
+      orig Cijk_Ailk_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA(3.87)
+      nk   void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.12);void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.46);Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x128_MI16x16x1_SN_LDSB0_AFC1_AG0_AGG(0.16);Cijk_SB_BiasS_HAS_ScaleAlphaVec_PostGSU4_VW4(0.01)
+      swap Cijk_Ailk_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA(3.87)
+wgrad_mlp13  vc M=14336  N=4096   K=32768  orig   66.265 ms    58.1 TF/s | nk 4.239 ms 907.8 TF/s x15.63 | swap 74.743 ms | eq=False ulp=29250 det=True nanfill=0 sqnr o/n/s=55.62/55.62/55.62
+      orig Cijk_Ailk_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA(65.67)
+      nk   void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(2.00);void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.54);Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x128_MI16x16x1_SN_LDSB0_AFC1_AG0_AGG(1.72)
+      swap Cijk_Ailk_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA(74.39)
+wgrad_mlp2   vc M=4096   N=14336  K=32768  orig   73.550 ms    52.3 TF/s | nk 4.316 ms 891.7 TF/s x17.04 | swap 67.088 ms | eq=False ulp=28996 det=True nanfill=0 sqnr o/n/s=55.62/55.62/55.62
+      orig Cijk_Ailk_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA(74.18)
+      nk   void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.61);void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(1.93);Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x128_MI16x16x1_SN_LDSB0_AFC1_AG0_AGG(1.85)
+      swap Cijk_Ailk_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA(66.20)
+wgrad_head   vc M=128256 N=4096   K=32768  orig  685.092 ms    50.3 TF/s | nk 31.496 ms 1093.1 TF/s x21.75 | swap 724.593 ms | eq=False ulp=29264 det=True nanfill=0 sqnr o/n/s=55.62/55.62/55.62
+      orig Cijk_Ailk_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA(682.88)
+      nk   void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(1.14);void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(1.00);void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.87);void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.81);void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.78);void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.75);void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.74);void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.72);void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.72);void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.71);void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.71);void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.71);void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.71);void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.71);void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.70);void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.71);void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca(0.48);Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x128_MI16x16x1_SN_LDSB0_AFC1_AG0_AGG(18.36)
+      swap Cijk_Ailk_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA(739.70)
+wrote opprobe/opprobe.json

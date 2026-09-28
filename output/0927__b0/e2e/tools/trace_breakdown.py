@@ -12,6 +12,7 @@ Buckets (first match wins):
   attn_bwd         ancestor e2e::attn_bwd[..]
   optimizer        ancestor Optimizer.step* / *optimizer*step*
   gemm             kernel name looks like a BLAS GEMM (Cijk_/gemm/hipblaslt/MT..x..)
+  gemm_aux         any other kernel whose CPU ancestor is aten::mm (nkfix operand copies + checks)
   memcpy/memset    gpu_memcpy / gpu_memset events
   elementwise      everything else (norms, rope, silu, loss, casts, grad-accum adds, ...)
 idle = (last kernel end - first kernel start) - union(kernel busy intervals).
@@ -44,7 +45,7 @@ def analyse(path, top=12):
                 rt[c] = (e["pid"], e["tid"], e["ts"])
         elif cat in ("user_annotation", "cpu_op"):
             n = e["name"]
-            if n.startswith("e2e::") or "Optimizer" in n or ("optim" in n.lower() and "step" in n.lower()) \
+            if n.startswith("e2e::") or n == "aten::mm" or "Optimizer" in n or ("optim" in n.lower() and "step" in n.lower()) \
                     or n.startswith("ProfilerStep"):
                 ranges[(e["pid"], e["tid"])].append((e["ts"], e["ts"] + e.get("dur", 0), n))
     # per-thread: sorted starts for containment lookups (ranges of interest are few, nesting shallow)
@@ -101,6 +102,8 @@ def analyse(path, top=12):
                 b = "memset"
             elif GEMM_RE.search(e["name"]):
                 b = "gemm"
+            elif "aten::mm" in anc:
+                b = "gemm_aux"      # non-GEMM kernels inside aten::mm = the nkfix copies / checks
             else:
                 b = "elementwise"
         buckets[b] += d
@@ -139,7 +142,7 @@ def show(r):
         print(f"  {b:14s} {v:9.2f} ms")
     print(f"  FA path total  {r['fa_path_ms']:9.2f} ms   arm ranges: " +
           ", ".join(f"{k}={v:.1f}" for k, v in r["arm_ranges"].items()))
-    for b in ("attn_fwd", "attn_bwd", "attn_gqa_sum", "attn_copy", "gemm", "elementwise", "optimizer"):
+    for b in ("attn_fwd", "attn_bwd", "attn_gqa_sum", "attn_copy", "gemm", "gemm_aux", "elementwise", "optimizer"):
         if b in r["top"]:
             print(f"  -- {b}")
             for n, ms, c in r["top"][b][:8]:

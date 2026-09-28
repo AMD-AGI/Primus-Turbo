@@ -1,0 +1,37 @@
+[
+ {
+  "name": "dgrad_mlp13",
+  "orig_peak_MiB": 256.0,
+  "out_MiB": 256.0,
+  "nk_peak_MiB": 256.0,
+  "nk_check2_peak_MiB": 256.0
+ },
+ {
+  "name": "dgrad_head",
+  "orig_peak_MiB": 256.0,
+  "out_MiB": 256.0,
+  "nk_peak_MiB": 512.0,
+  "nk_check2_peak_MiB": 256.0
+ },
+ {
+  "name": "wgrad_mlp13",
+  "orig_peak_MiB": 112.0,
+  "out_MiB": 112.0,
+  "nk_peak_MiB": 112.0,
+  "nk_check2_peak_MiB": 1008.0
+ },
+ {
+  "name": "wgrad_mlp2",
+  "orig_peak_MiB": 112.0,
+  "out_MiB": 112.0,
+  "nk_peak_MiB": 112.0,
+  "nk_check2_peak_MiB": 368.0
+ },
+ {
+  "name": "wgrad_head",
+  "orig_peak_MiB": 1002.0,
+  "out_MiB": 1002.0,
+  "nk_peak_MiB": 1002.0,
+  "nk_check2_peak_MiB": 9018.0
+ }
+]

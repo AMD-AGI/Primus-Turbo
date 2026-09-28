@@ -165,13 +165,22 @@ train)
     done ) &
   WDPID=$!
   trap 'kill $CLKPID $MEMPID $WDPID 2>/dev/null' EXIT
+  # Opt-in GEMM layout workaround (../gemm/nkfix_b0.py, installed by the shim): E2E_NKFIX=1.
+  # NKFIX_* knobs pass through; per-run rule/non-finite stats land in ../gemm/logs/nkfix.<tag>.txt.
+  NKFIX_ENV=""; NKSTATS=""
+  if [ "${E2E_NKFIX:-0}" != 0 ]; then
+    NKSTATS=$E2E/../gemm/logs/nkfix.$TAG.txt; rm -f "$NKSTATS"
+    NKFIX_ENV="-e E2E_NKFIX=1 -e NKFIX_STATS_FILE=$NKSTATS"
+    for v in NKFIX_MIN_BYTES NKFIX_CHUNK_BYTES NKFIX_CHECK NKFIX_CHECK_EVERY NKFIX_RULES NKFIX_SHADOW NKFIX_TRANSPOSE; do
+      [ -n "${!v:-}" ] && NKFIX_ENV="$NKFIX_ENV -e $v=${!v}"; done
+  fi
   MARK=$(dmesg_mark)
   echo "[$(date +%T)] $TAG E2E_ATTN=$ATTN steps=$STEPS pfreq=$PFREQ waiting for $LOCK"
   flock $LOCK timeout ${E2E_TIMEOUT:-2700} docker exec \
     -e GPUS_PER_NODE=1 -e NNODES=1 -e NODE_RANK=0 -e PRIMUS_GPU_MODEL=MI455X \
     -e MASTER_PORT=$((20000 + RANDOM % 20000)) -e PRIMUS_EXP_NAME=$TAG -e E2E_RUN_MARKER=$TAG \
     -e TRITON_CACHE_DIR=/tmp/triton_cache_e2e -e ARCH=gfx1250 -e FLYDSL_GPU_ARCH=gfx1250 \
-    -e FLYDSL_RUNTIME_CACHE_DIR=/tmp/flycache_e2e -e E2E_ATTN="$ATTN" ${E2E_ENV:-} \
+    -e FLYDSL_RUNTIME_CACHE_DIR=/tmp/flycache_e2e -e E2E_ATTN="$ATTN" $NKFIX_ENV ${E2E_ENV:-} \
     $CT bash -c "ulimit -c 0; $BLAS_EXPORT; export PYTHONPATH=$PP; \
       echo E2E_ENV PREFER=\$TORCH_BLAS_PREFER_HIPBLASLT LIB=\$HIPBLASLT_TENSILE_LIBPATH E2E_ATTN=\$E2E_ATTN; \
       cd $PRIMUS && exec timeout --foreground -k 20 ${E2E_INNER:-2600} bash runner/primus-cli direct \
@@ -185,6 +194,9 @@ train)
   for d in $(find "$PRIMUS/outputs/profile_traces" -mindepth 1 -maxdepth 1 -type d -newer "$CFG" 2>/dev/null); do
     mkdir -p "$E2E/traces/$TAG" && cp -r "$d" "$E2E/traces/$TAG/"; done
   NANS=$(sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -ci "loss: *nan")
+  NONFIN=$(sed 's/\x1b\[[0-9;]*m//g' "$LOG" | grep -ciE "loss: *(nan|inf)|grad_norm: *(nan|inf)")
+  [ "${NONFIN:-0}" -gt 0 ] && echo "!! $TAG: $NONFIN step lines with a non-finite loss or grad_norm"
+  [ -n "$NKSTATS" ] && { echo "nkfix stats ($NKSTATS):"; head -3 "$NKSTATS" 2>/dev/null || echo "!! no nkfix stats file"; }
   echo "rc=$RC tag=$TAG log=$LOG nan_steps=$NANS"
   [ "${NANS:-0}" -gt 0 ] && echo "!! $TAG: loss went nan on $NANS steps -- DISCARD this run"
   NEW=$(dmesg_check "$MARK")

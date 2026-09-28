@@ -25,6 +25,16 @@ if _E2E_BACKENDS not in sys.path:
     sys.path.insert(0, _E2E_BACKENDS)
 
 IS_E2E_SHIM = True
+
+# Opt-in GEMM layout workaround (output/0927__b0/gemm/nkfix_b0.py). Installed here because this
+# package is imported exactly once, by the training worker, after torch is loaded and before
+# the first step -- in both P1 and P2. Off unless E2E_NKFIX=1.
+if os.environ.get("E2E_NKFIX", "0") not in ("", "0"):
+    _GEMM = str(Path(__file__).resolve().parents[4] / "gemm")
+    if _GEMM not in sys.path:
+        sys.path.insert(0, _GEMM)
+    import nkfix_b0
+    nkfix_b0.install()
 _MODE = "turbo" if os.environ.get("E2E_ATTN", "").strip() == "turbo" else "shim"
 _REAL = os.environ.get("E2E_REAL_PRIMUS_TURBO",
                        "/home/lihuzhan/code/2026_0903__turbo/wt-bakeoff/primus_turbo")
