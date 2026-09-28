@@ -1,0 +1,106 @@
+round: 12
+mode: fast
+candidate: r12.i3.g49             # route row 5 (h23: TDM prefetch depth 3), ported onto the m32x2 fast body only
+outcome: delivered
+
+correctness:
+  unit_tests: pass
+  precision: pass
+  checked_with: op/validation.py
+  sqnr_db: 49.82                  # min over all correctness rows (short_q full); fast 51.23, proxy 50.89, prod 50.83
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/011/op, rounds/010/op]
+  # 3 rotated sessions (blocked ruler) + beat in its own process, same idle card (fa-g2, 0003:04:00.0).
+  # Figures are the mean of the 3 session medians. raw: rounds/012/1-opt/raw/h23measure
+  shapes:
+    - name: fast
+      this_round_tflops: 151.4
+      best_round_tflops: 154.8
+      beat_tflops: 154.6
+      target_tflops: 154.6
+      champion_round: 11
+      champion_tflops: 154.8
+      champion_rebuilt: true
+      ratio: 0.9789
+      vs_champion: 0.9779
+    - name: proxy
+      this_round_tflops: 1594.5
+      best_round_tflops: 1595.1
+      beat_tflops: 1564.8
+      target_tflops: 1564.8
+      champion_round: 10
+      champion_tflops: 1595.1
+      champion_rebuilt: true
+      ratio: 1.0190
+      vs_champion: 0.9996
+    - name: prod
+      this_round_tflops: 1502.6
+      best_round_tflops: 1502.8
+      beat_tflops: 1552.7
+      target_tflops: 1552.7
+      champion_round: 11
+      champion_tflops: 1502.8
+      champion_rebuilt: true
+      ratio: 0.9677
+      vs_champion: 0.9999
+  score: 0.9885                   # uncapped mean of this_round / target (capped at 1.0: 0.9822)
+
+validation:
+  exit_code: 2                    # every correctness + determinism row passes; fails only the speed bar (geomean vs beat), as op/current does
+
+explored:
+  ran:
+    - "per-arm ISA dump of the m32x2 fast kernel (FLYDSL_DUMP_IR) + llvm-mc code size: rejected D as the shipped arm (42 540 B > 32 640 B prefetch cap), so C went into the working copy"
+    - "armcheck bitwise vs op/current, 22 cases incl. sq!=skv, skv%64!=0 (h23 gate request)"
+  consulted:
+    - optimization/routes/1-metrics-to-techniques.md
+    - backends/flydsl/attention/README.md
+    - backends/flydsl/attention/techniques.md
+    - backends/flydsl/attention/recipes/hd128.md
+    - optimization/techniques/6-gfx1250-cdna5-mechanisms.md
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+    - pitfalls/compiler-and-toolchain.md
+    - profiling/0-kernel-profiling.md
+    - backends/flydsl/official-skills-map.md
+  bound: latency
+  confidence: medium
+  why: "fast = F + 16P on the heaviest q-tile (flushed fit F 6.88 us, P 0.485 us/tile, grid x2 costs +4%); depth-3 TDM prefetch does not shorten P, so P is per-tile instruction latency, not TDM wait"
+
+arms:
+  - id: r12.i3.g49
+    built: "C: N_KV_PP=3, KV_UNROLL=1 on m32x2 only, from op/current"
+    tflops: {fast: 151.4, proxy: 1594.5, prod: 1502.6}
+    vs_champion: 0.9779
+    shipped: true
+  - id: r12.i3.g49+U2
+    built: "D: N_KV_PP=3, KV_UNROLL=2 on m32x2 only, from op/current (h23's default)"
+    tflops: {fast: 148.4, proxy: 1598.4, prod: 1500.5}
+    vs_champion: 0.9586
+    shipped: false
+    note: "code 42 540 B > 32 640 B instruction-prefetch cap (C 30 824, champ 29 892); fast x0.959 in 3/3 sessions"
+  - id: r12.i1.g47
+    built: "host fast path (impl-level shape cache), step 1-4 arm A"
+    tflops: {}
+    vs_champion: 1.0
+    shipped: false
+    note: "null on the ruler (within A/A), raw/measure; the L2 flush memset hides the host path"
+  - id: r12.i2.g48
+    built: "FlyDSL launch slab, step 1-4 arm B"
+    tflops: {}
+    vs_champion: 1.0
+    shipped: false
+    note: "null on the ruler (within A/A), raw/measure; also uses FlyDSL privates (h17)"
+
+expected: >
+  No number of my own was written before this build. The prior on record is h23's own: "U1PP3 vs U1PP2
+  ... If the champion really stalls on s_wait_tensorcnt 0 on the card: +2 to 8%. If one tile of compute
+  already hides TDM latency: -0.5 to -1.5%". U2 alone: null (-1 to +1%).
+
+added_to_pool: [r12.i1.g47, r12.i2.g48]
+route_updated: true
+
+implementation:
+  files_changed: [op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x2.py]
+  build_failures: []

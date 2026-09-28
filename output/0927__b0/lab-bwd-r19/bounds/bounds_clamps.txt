@@ -1,0 +1,17 @@
+fast              causal=1 nsp=16 nsp_q=8 sq%64=0 prefetches=   2496 OOB_r19=  223 OOB_r19h=0 nonneutral=0  dq_ext=33554432 int32=33554432
+fast              causal=0 nsp=16 nsp_q=8 sq%64=0 prefetches=   4608 OOB_r19=   32 OOB_r19h=0 nonneutral=0  dq_ext=33554432 int32=33554432
+proxy             causal=1 nsp= 2 nsp_q=1 sq%64=0 prefetches=  32768 OOB_r19=  130 OOB_r19h=0 nonneutral=0  dq_ext=67108864 int32=67108864 (dq_sp not used)
+prod              causal=1 nsp= 1 nsp_q=1 sq%64=0 prefetches= 130816 OOB_r19=  256 OOB_r19h=0 nonneutral=0  dq_ext=536870912 int32=536870912 (dq_sp not used)
+toy               causal=1 nsp=16 nsp_q=8 sq%64=0 prefetches=     76 OOB_r19=   61 OOB_r19h=0 nonneutral=0  dq_ext=1048576 int32=1048576
+toy               causal=0 nsp=16 nsp_q=8 sq%64=0 prefetches=     96 OOB_r19=   52 OOB_r19h=0 nonneutral=0  dq_ext=1048576 int32=1048576
+gqa4_small        causal=1 nsp=16 nsp_q=8 sq%64=0 prefetches=     88 OOB_r19=   61 OOB_r19h=0 nonneutral=0  dq_ext=8388608 int32=8388608
+gqa4_small        causal=0 nsp=16 nsp_q=8 sq%64=0 prefetches=    128 OOB_r19=   52 OOB_r19h=0 nonneutral=0  dq_ext=8388608 int32=8388608
+mha               causal=1 nsp=16 nsp_q=8 sq%64=0 prefetches=    156 OOB_r19=  107 OOB_r19h=0 nonneutral=0  dq_ext=4194304 int32=4194304
+mha               causal=0 nsp=16 nsp_q=8 sq%64=0 prefetches=    192 OOB_r19=   72 OOB_r19h=0 nonneutral=0  dq_ext=4194304 int32=4194304
+unequal_seqlen    causal=1 nsp=16 nsp_q=8 sq%64=0 prefetches=   2016 OOB_r19=  167 OOB_r19h=0 nonneutral=0  dq_ext=16777216 int32=16777216
+unequal_seqlen    causal=0 nsp=16 nsp_q=8 sq%64=0 prefetches=   2560 OOB_r19=   32 OOB_r19h=0 nonneutral=0  dq_ext=16777216 int32=16777216
+unequal_seqlen_2  causal=1 nsp=16 nsp_q=8 sq%64=0 prefetches=   7104 OOB_r19=  255 OOB_r19h=0 nonneutral=0  dq_ext=33554432 int32=33554432
+unequal_seqlen_2  causal=0 nsp=16 nsp_q=8 sq%64=0 prefetches=   9216 OOB_r19=   64 OOB_r19h=0 nonneutral=0  dq_ext=33554432 int32=33554432
+sq_gt_skv         causal=0 nsp=16 nsp_q=8 sq%64=0 prefetches=   2304 OOB_r19=   16 OOB_r19h=0 nonneutral=0  dq_ext=33554432 int32=33554432
+TOTAL {'pref': 194624, 'oob19': 1580, 'oob19h': 0, 'nonneutral': 0, 'groups': 0}
+BOUNDS PASS

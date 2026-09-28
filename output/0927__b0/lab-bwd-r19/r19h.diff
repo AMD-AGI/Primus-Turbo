@@ -1,0 +1,87 @@
+diff -ru /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-bwd-r19/oe/artifacts/job/job_context/op/r019/impl.py /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-bwd-r19/oe/artifacts/job/job_context/op/r19h/impl.py
+--- /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-bwd-r19/oe/artifacts/job/job_context/op/r019/impl.py	2026-09-28 05:13:22.402984791 +0000
++++ /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-bwd-r19/oe/artifacts/job/job_context/op/r19h/impl.py	2026-09-28 05:13:49.397838966 +0000
+@@ -112,9 +112,15 @@
+     skv, hkv = k.shape[1], k.shape[2]
+     assert d == _k.D, f"this kernel is head_dim {_k.D} only, got {d}"
+     assert hq % hkv == 0, f"heads_q {hq} is not a multiple of heads_kv {hkv}"
+-    assert sq % 32 == 0, (
+-        f"seqlen_q must be a multiple of 32 (k_dkdv consumes query tiles in pairs), "
+-        f"got {sq}")
++    # h33 defect a -- the assert guarded k_dkdv's query PAIR (32) but k_dq's grid is
++    # ceil(Sq/BLOCK_Q) tiles while impl.py's launch passes sq // BLOCK_Q. At
++    # sq % 64 == 32 the two disagree by one tile: dQ tile 0 is never computed and the
++    # kernel writes 262,144 B past the end. BLOCK_Q is the binding multiple, so assert
++    # it. Every scored and UT shape is already a multiple of 64, so nothing is rejected
++    # that used to work correctly.
++    assert sq % _k.BLOCK_Q == 0, (
++        f"seqlen_q must be a multiple of {_k.BLOCK_Q} (k_dq consumes query tiles of "
++        f"BLOCK_Q and the launch grid is sq // BLOCK_Q), got {sq}")
+     assert skv % _k.KV_STEP == 0, (
+         f"seqlen_kv must be a multiple of {_k.KV_STEP}, got {skv}")
+     assert skv % _k.BLOCK_KV == 0, (
+diff -ru /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-bwd-r19/oe/artifacts/job/job_context/op/r019/kernels.py /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-bwd-r19/oe/artifacts/job/job_context/op/r19h/kernels.py
+--- /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-bwd-r19/oe/artifacts/job/job_context/op/r019/kernels.py	2026-09-28 05:13:22.403009740 +0000
++++ /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-bwd-r19/oe/artifacts/job/job_context/op/r19h/kernels.py	2026-09-28 05:13:46.061725801 +0000
+@@ -317,6 +317,12 @@
+     # exactly zero to dK/dV (p = exp2(NEG*LOG2E) = 0), so skipping them is not an
+     # approximation -- the result is bit-identical, only the work is gone.
+     nqt2 = nqt // fx.Int32(2)                   # query tiles come in PAIRS now
++
++    def _clampqt(t):
++        """h33 defect c -- pin a prefetch's query pair into [0, nqt2-1]."""
++        t = (t < nqt2).select(t, nqt2 - fx.Int32(1))
++        return (t < fx.Int32(0)).select(fx.Int32(0), t)
++
+     _c = kv0 - cshift
+     qp_start = ((_c < fx.Int32(0)).select(fx.Int32(0), _c)) // fx.Int32(32)
+     qp_start = (causal != fx.Int32(0)).select(qp_start, fx.Int32(0))
+@@ -506,6 +512,12 @@
+             ii = fx.Int32(it)
+             qi = ii // G
+             jj = ii + fx.Int32(1)
++            # h33 defect c (r19h port of round 24's clamp) -- k_dkdv's Q/dO descriptors
++            # carry TRUE extents (r1.i7.g07), so this unclamped ii+1 is a live OOB READ
++            # held back only by the descriptor: the last iteration prefetches a pair
++            # that does not exist. Clamp exactly as k_dq's kvloop_full does. Value-neutral:
++            # the loads a clamp redirects are consumed by iterations that never run.
++            jj = (jj < n).select(jj, n - fx.Int32(1))
+             qj = jj // G
+             st = list(carried)
+             final = yield _body(st[:NST], [fx.Vector(v) for v in st[NST:]],
+@@ -544,14 +556,20 @@
+         _mk = (sp != fx.Int32(0)).select(fx.Int32(0), nmaskp)
+         _qt0 = qp_start + nmaskp + _off
+         out = qloop_mask(init, G * _mk, qp_start)
+-        out = list(out) + [_ir(v) for v in _ldqd(_qt0, fx.Int32(0))]
++        # h33 defect c -- the prologue issues iteration 0 unconditionally, even when the
++        # chunk is empty (_cnt == 0). Clamp the query pair to the last legal one.
++        # Value-neutral for every iteration that actually runs.
++        _pc0 = _clampqt(_qt0)
++        out = list(out) + [_ir(v) for v in _ldqd(_pc0, fx.Int32(0))]
+         out = qloop_full(out, G * _cnt, _qt0)
+         base_o = ((sp * B_ + bat) * Skv * Hkv) * fx.Int32(D) + hkv * fx.Int32(D)
+     else:
+         out = qloop_mask(init, G * nmaskp, qp_start)
+         # r9.i1.g25: the prologue issue now sits BETWEEN the loops, for qloop_full's
+         # first iteration (qi = 0, gh = 0) at query pair qp_start + nmaskp.
+-        out = list(out) + [_ir(v) for v in _ldqd(qp_start + nmaskp, fx.Int32(0))]
++        # h33 defect c -- same clamp on the non-split path.
++        _pc0 = _clampqt(qp_start + nmaskp)
++        out = list(out) + [_ir(v) for v in _ldqd(_pc0, fx.Int32(0))]
+         out = qloop_full(out, G * (nqp_eff - nmaskp), qp_start + nmaskp)
+         base_o = bat * Skv * Hkv * fx.Int32(D) + hkv * fx.Int32(D)
+     for kh in range_constexpr(NKV):
+@@ -691,7 +709,11 @@
+         # [nsp, B, Sq, Hq, D] fp32. TRUE byte extent, not the flat 1 GiB the bf16 path
+         # carries: the workspace is the one buffer in this kernel whose size depends on
+         # nsp, and an over-read of it would land in another split's slice.
+-        g_dq = _bv(DQ, nsp * B_ * Sq * Hq * fx.Int32(D * 4), fx.Float32)
++        # h33 defect b -- this product is evaluated in Int32. At prod with nsp_q = 8 it
++        # is 8*4*8192*32*512 = 4.398e11, which wraps to 0, and a descriptor with
++        # num_records 0 drops EVERY dQ write silently. Compute the extent in Int64.
++        g_dq = _bv(DQ, (nsp.to(fx.Int64) * B_.to(fx.Int64) * Sq.to(fx.Int64)
++                        * Hq.to(fx.Int64) * fx.Int64(D * 4)), fx.Float32)
+     else:
+         g_dq = _bv(DQ, 1 << 30, fx.BFloat16)   # r3.i2.g11: bf16 output, no host .to()
+ 

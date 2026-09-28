@@ -1,0 +1,4 @@
+# arm beat -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-bwd-r19/oe/artifacts/job/job_context/op/beat md5=2802a918
+# statistic median  iters 101  warmup 3.0s continuous  order blocked 9+lead 4, palindromic rounds  device gfx1250
+RESULT shape=proxy arm=beat stat=median iters=108 latency_ms=0.45948851108551025 min_ms=0.4296030104160309 max_ms=0.4831640124320984 tflops=747.9648815333303 bw_gbs=365.1280847123897 flop=343681269760.0 bytes_min=167772160 sclk_start=1900 sclk_end=1934 causal=True order=blocked9+lead4
+rc=0

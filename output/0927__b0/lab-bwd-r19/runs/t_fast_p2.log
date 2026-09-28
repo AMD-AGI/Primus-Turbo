@@ -1,0 +1,11 @@
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm r19h -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-bwd-r19/oe/artifacts/job/job_context/op/r19h md5=a791a047
+# arm current_copy -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-bwd-r19/oe/artifacts/job/job_context/op/current_copy md5=5c499890
+# arm current -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-bwd-r19/oe/artifacts/job/job_context/op/current md5=5c499890
+# arm r019 -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-bwd-r19/oe/artifacts/job/job_context/op/r019 md5=d7abe9e9
+# statistic median  iters 101  warmup 3.0s continuous  order blocked 9+lead 4, palindromic rounds  device gfx1250
+RESULT shape=fast arm=r19h stat=median iters=108 latency_ms=0.05326000042259693 min_ms=0.05163700133562088 max_ms=0.05752599984407425 tflops=100.9003371640974 bw_gbs=196.87870666165344 flop=5373952000.0 bytes_min=10485760 sclk_start=2256 sclk_end=2265 causal=True order=blocked9+lead4
+RESULT shape=fast arm=current_copy stat=median iters=108 latency_ms=0.05398100055754185 min_ms=0.05243799835443497 max_ms=0.23927800357341766 tflops=99.55265638827046 bw_gbs=194.2490856356497 flop=5373952000.0 bytes_min=10485760 sclk_start=2256 sclk_end=2265 causal=True order=blocked9+lead4
+RESULT shape=fast arm=current stat=median iters=108 latency_ms=0.05408100038766861 min_ms=0.05271900072693825 max_ms=0.06545799970626831 tflops=99.36857605217955 bw_gbs=193.88990449205764 flop=5373952000.0 bytes_min=10485760 sclk_start=2256 sclk_end=2265 causal=True order=blocked9+lead4
+RESULT shape=fast arm=r019 stat=median iters=108 latency_ms=0.05355999991297722 min_ms=0.05215799808502197 max_ms=0.1443759948015213 tflops=100.3351756671293 bw_gbs=195.77595252122794 flop=5373952000.0 bytes_min=10485760 sclk_start=2256 sclk_end=2265 causal=True order=blocked9+lead4
+rc=0

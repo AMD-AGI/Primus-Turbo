@@ -1,0 +1,44 @@
+t_fast_p1 rc=0 newdmesg=0 bad=0
+  current 0.05379999801516533 sclk 2248-2260 blocked9+lead4
+  r019 0.05303899943828583 sclk 2248-2260 blocked9+lead4
+  r19h 0.052999500185251236 sclk 2248-2260 blocked9+lead4
+  current_copy 0.05414099991321564 sclk 2248-2260 blocked9+lead4
+t_fast_p2 rc=0 newdmesg=0 bad=0
+  r19h 0.05326000042259693 sclk 2256-2265 blocked9+lead4
+  current_copy 0.05398100055754185 sclk 2256-2265 blocked9+lead4
+  current 0.05408100038766861 sclk 2256-2265 blocked9+lead4
+  r019 0.05355999991297722 sclk 2256-2265 blocked9+lead4
+t_fast_p3 rc=0 newdmesg=0 bad=0
+  r019 0.05265899933874607 sclk 2253-2261 blocked9+lead4
+  current 0.0534800011664629 sclk 2253-2261 blocked9+lead4
+  current_copy 0.05339999869465828 sclk 2253-2261 blocked9+lead4
+  r19h 0.05344000086188316 sclk 2253-2261 blocked9+lead4
+beat_fast rc=0 newdmesg=0 bad=0
+  beat 0.08899350091814995 sclk 2330-2328 blocked9+lead4
+t_proxy_p1 rc=0 newdmesg=0 bad=0
+  current 0.5991174876689911 sclk 1899-1938 blocked9+lead4
+  r019 0.5822319984436035 sclk 1899-1938 blocked9+lead4
+  r19h 0.5815709829330444 sclk 1899-1938 blocked9+lead4
+  current_copy 0.5970345139503479 sclk 1899-1938 blocked9+lead4
+t_proxy_p2 rc=0 newdmesg=0 bad=0
+  r19h 0.5843949913978577 sclk 1902-1927 blocked9+lead4
+  current_copy 0.5972950160503387 sclk 1902-1927 blocked9+lead4
+  current 0.5975345075130463 sclk 1902-1927 blocked9+lead4
+  r019 0.5786669850349426 sclk 1902-1927 blocked9+lead4
+t_proxy_p3 rc=0 newdmesg=0 bad=0
+  r019 0.5799685120582581 sclk 1901-1934 blocked9+lead4
+  current 0.5992980003356934 sclk 1901-1934 blocked9+lead4
+  current_copy 0.5967134833335876 sclk 1901-1934 blocked9+lead4
+  r19h 0.5813505053520203 sclk 1901-1934 blocked9+lead4
+beat_proxy rc=0 newdmesg=0 bad=0
+  beat 0.45948851108551025 sclk 1900-1934 blocked9+lead4
+t_prod_p1 rc=0 newdmesg=0 bad=0
+  current 8.739205360412598 sclk 1794-1809 blocked9+lead4
+  r019 8.59538984298706 sclk 1794-1809 blocked9+lead4
+  r19h 8.597654342651367 sclk 1794-1809 blocked9+lead4
+  current_copy 8.744954586029053 sclk 1794-1809 blocked9+lead4
+t_prod_p2 rc=0 newdmesg=0 bad=0
+  r19h 8.591926574707031 sclk 1830-1824 blocked9+lead4
+  current_copy 8.740469455718994 sclk 1830-1824 blocked9+lead4
+  current 8.744235038757324 sclk 1830-1824 blocked9+lead4
+  r019 8.595651626586914 sclk 1830-1824 blocked9+lead4

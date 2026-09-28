@@ -1,0 +1,8 @@
+step:  1  loss: 12.30858  grad_norm: 16.8931  memory: 93.90GiB(21.74%)  tps: 7,362
+step:  2  loss: 14.21544  grad_norm: 61.1494  memory: 109.56GiB(25.36%)  tps: 3,008
+step:  3  loss: 10.97717  grad_norm: 16.2892  memory: 109.56GiB(25.36%)  tps: 9,332
+step:  4  loss:  7.62884  grad_norm: 14.2244  memory: 109.56GiB(25.36%)  tps: 9,263
+step:  5  loss:  7.40834  grad_norm: 12.9307  memory: 109.56GiB(25.36%)  tps: 9,296
+step:  6  loss:  4.93381  grad_norm:  4.6837  memory: 109.56GiB(25.36%)  tps: 9,294
+step:  7  loss: 10.96017  grad_norm: 40.7983  memory: 109.56GiB(25.36%)  tps: 9,306
+step:  8  loss:  4.93936  grad_norm:  9.1421  memory: 109.56GiB(25.36%)  tps: 9,271

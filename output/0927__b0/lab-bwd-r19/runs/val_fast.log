@@ -1,0 +1,11 @@
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+CORR shape=fast arm=r19h dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=r19h runs=200 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=fast arm=r019 dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=r019 runs=200 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=fast r019 vs r19h: dq=bitwise dk=bitwise dv=bitwise
+CORR shape=fast arm=current dq  52.61 dB  dk  52.64 dB  dv  52.84 dB  pass
+DET shape=fast arm=current runs=200 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=fast current vs r19h: dq=bitwise dk=81.2dB dv=77.7dB
+LABVAL fast PASS
+rc=0
