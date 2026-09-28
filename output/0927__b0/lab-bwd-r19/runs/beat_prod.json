@@ -1,0 +1,19 @@
+[
+  {
+    "shape": "prod",
+    "arm": "beat",
+    "stat": "median",
+    "iters": 108,
+    "latency_ms": 6.721827030181885,
+    "min_ms": 6.614106178283691,
+    "max_ms": 6.82269811630249,
+    "tflops": 817.9664848310184,
+    "bw_gbs": 199.67447451019615,
+    "flop": 5498229227520.0,
+    "bytes_min": 1342177280,
+    "sclk_start": 1762,
+    "sclk_end": 1767,
+    "causal": true,
+    "order": "blocked9+lead4"
+  }
+]

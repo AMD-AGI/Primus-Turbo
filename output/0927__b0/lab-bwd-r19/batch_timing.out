@@ -42,3 +42,11 @@ t_prod_p2 rc=0 newdmesg=0 bad=0
   current_copy 8.740469455718994 sclk 1830-1824 blocked9+lead4
   current 8.744235038757324 sclk 1830-1824 blocked9+lead4
   r019 8.595651626586914 sclk 1830-1824 blocked9+lead4
+t_prod_p3 rc=0 newdmesg=0 bad=0
+  r019 8.573339462280273 sclk 1825-1817 blocked9+lead4
+  current 8.733038425445557 sclk 1825-1817 blocked9+lead4
+  current_copy 8.736844539642334 sclk 1825-1817 blocked9+lead4
+  r19h 8.575782775878906 sclk 1825-1817 blocked9+lead4
+beat_prod rc=0 newdmesg=0 bad=0
+  beat 6.721827030181885 sclk 1762-1767 blocked9+lead4
+BATCH DONE

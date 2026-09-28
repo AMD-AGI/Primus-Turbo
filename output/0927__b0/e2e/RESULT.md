@@ -1,3 +1,19 @@
+# 更新（05:30 UTC）：GEMM 修好之后（nkfix，E2E_NKFIX=1），attention 在 e2e 里能看出差别了
+
+| attn 实现 | tps | step ms | GEMM ms（+nkfix 开销） | FA path ms | attention 占单步 |
+|---|--:|--:|--:|--:|--:|
+| ASM（n5 / n6） | 20,718 / 20,792 | 1,582 / 1,576 | 850–859（+99） | 270–273 | 17.0–17.3% |
+| FlyDSL（n5 / n6） | 19,762 / 19,809 | 1,658 / 1,654 | 843–848（+98） | 352–364 | 21.4–21.8% |
+| turbo baseline（n7） | 14,563 | 2,250 | 830（+98） | 990 | 43.9% |
+
+- **FlyDSL 对 ASM（同进程配对）**：fly/asm 单步时间比 1.0475（n5，ABBA，17 组）和 1.0500（n6，BAAB，17 组），也就是 FlyDSL 每步慢 4.8–5.0%，约 77 ms。修复前这个差只有 0.42–0.45%。
+- **吞吐和 GEMM**：tps 约为修复前的 10 倍（turbo baseline 7.8 倍）。GEMM 占单步从 96% 降到约 53%，全部落在 MT256x256x128。
+- **数值**：step-1 loss 与未修复的运行逐位相同；8 次 nkfix 运行（486 步）没有出现 nan/inf。NaN 的根因没有找到，上界见 `../gemm/REPORT.md` §4。
+- **注意**：修复后 attention kernel 本身慢了 10–16%。比较绝对 ms 时要用修复后的数字。
+- **用法**：`E2E_NKFIX=1 E2E_MEM_STOP=89.5 NKFIX_CHECK=1 bash run_e2e.sh train …`，峰值显存 88.65–88.99%。
+
+---
+
 # B0 e2e 结果（2026-09-28）：Llama-3.1-8B BF16，MBS=GBS=4，seq 8192，1 卡，AC none，compile 关
 
 ## 0. 结论
