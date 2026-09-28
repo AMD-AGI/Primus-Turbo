@@ -1,0 +1,38 @@
+# PYTHONHASHSEED=None arms=['r6_a', 'l12_a', 'l12_b', 'r6_b']
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+RESULT mode=std arm=r6_a ms=1.43940 sclk=1252/1330 by_pred={'None': [1.05382, 1], 'l12_a': [1.45847, 50], 'r6_a': [1.42364, 50]}
+RESULT mode=std arm=l12_a ms=1.37462 sclk=1252/1330 by_pred={'r6_a': [1.36176, 51], 'l12_b': [1.38977, 50]}
+RESULT mode=std arm=l12_b ms=1.37619 sclk=1252/1330 by_pred={'l12_a': [1.38876, 51], 'r6_b': [1.36781, 50]}
+RESULT mode=std arm=r6_b ms=1.43744 sclk=1252/1330 by_pred={'l12_b': [1.45562, 51], 'r6_b': [1.4274, 50]}
+RESULT mode=blocked arm=r6_a ms=1.36960 n=108 sclk=1330/1290 by_pos=[1.48765, 1.41829, 1.39093, 1.38364, 1.37573, 1.37366, 1.37346, 1.36801, 1.37342, 1.36233, 1.36831, 1.37322, 1.36906]
+RESULT mode=blocked arm=l12_a ms=1.43057 n=108 sclk=1330/1290 by_pos=[1.43253, 1.41432, 1.43029, 1.43541, 1.43101, 1.42852, 1.43139, 1.43355, 1.42598, 1.43031, 1.42878, 1.43247, 1.43622]
+RESULT mode=blocked arm=l12_b ms=1.42876 n=108 sclk=1330/1290 by_pos=[1.44166, 1.42069, 1.43225, 1.43608, 1.42073, 1.42758, 1.43529, 1.43125, 1.42496, 1.43137, 1.43421, 1.42632, 1.42344]
+RESULT mode=blocked arm=r6_b ms=1.37150 n=108 sclk=1330/1290 by_pos=[1.48505, 1.42306, 1.39403, 1.37274, 1.37472, 1.37855, 1.37186, 1.3597, 1.36457, 1.3721, 1.36663, 1.37052, 1.36996]
+RESULT mode=stream arm=r6_a ms=1.44102 n=12
+RESULT mode=stream arm=l12_a ms=1.47448 n=12
+RESULT mode=stream arm=l12_b ms=1.47537 n=12
+RESULT mode=stream arm=r6_b ms=1.44212 n=12
+rc=0 newdmesg=0

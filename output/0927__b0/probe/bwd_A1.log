@@ -1,0 +1,6 @@
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm current -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/current
+# arm beat -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/beat
+# statistic median  iters 51  warmup 3.0s continuous  order palindromic  device gfx1250
+RESULT shape=prod arm=current stat=median iters=51 latency_ms=8.6993408203125 min_ms=8.557690620422363 max_ms=8.866512298583984 tflops=632.0282583574524 bw_gbs=154.28494040216094 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1796 sclk_end=1820 causal=True
+RESULT shape=prod arm=beat stat=median iters=51 latency_ms=6.45794677734375 min_ms=6.2594499588012695 max_ms=6.6390581130981445 tflops=851.389678033473 bw_gbs=207.83343782093812 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1796 sclk_end=1820 causal=True

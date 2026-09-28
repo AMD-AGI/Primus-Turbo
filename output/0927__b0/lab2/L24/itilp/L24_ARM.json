@@ -1,0 +1,6 @@
+{
+ "arm": "itilp",
+ "llvm_options_delta": {
+  "amdgpu-sched-strategy": "iterative-ilp"
+ }
+}

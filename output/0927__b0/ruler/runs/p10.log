@@ -1,0 +1,38 @@
+# arm l12_a -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/l12_a impl_mod=op_impl_3054043791918671430 kern_mod=flydsl_fwd__3054043791918671430.fmha_fwd_prefill_a16w16_m32x8
+# arm r6_a -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/r6_a impl_mod=op_impl_1700016794053415247 kern_mod=flydsl_fwd__1700016794053415247.fmha_fwd_prefill_a16w16_m32x8
+# arm l12_b -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/l12_b impl_mod=op_impl_3777969451389466559 kern_mod=flydsl_fwd__3777969451389466559.fmha_fwd_prefill_a16w16_m32x8
+# arm r6_b -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/r6_b impl_mod=op_impl_8204541041685811638 kern_mod=flydsl_fwd__8204541041685811638.fmha_fwd_prefill_a16w16_m32x8
+# PYTHONHASHSEED=None FLYDSL_RUNTIME_CACHE_DIR=/tmp/flycache
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+RESULT mode=std arm=l12_a ms=1.45366 sclk=1252/1232
+RESULT mode=std arm=r6_a ms=1.51660 sclk=1252/1232
+RESULT mode=std arm=l12_b ms=1.43952 sclk=1252/1232
+RESULT mode=std arm=r6_b ms=1.49452 sclk=1252/1232
+RESULT mode=shield arm=l12_a ms=1.21214 host_us=16.1 sclk=1232/1920
+RESULT mode=shield arm=r6_a ms=1.07646 host_us=16.2 sclk=1232/1920
+RESULT mode=shield arm=l12_b ms=1.22868 host_us=16.2 sclk=1232/1920
+RESULT mode=shield arm=r6_b ms=1.07149 host_us=16.0 sclk=1232/1920
+rc=0 newdmesg=0

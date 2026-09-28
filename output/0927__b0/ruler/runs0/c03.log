@@ -1,0 +1,38 @@
+# arm r6_c -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/r6_c kern_mod=flydsl_fwd__5334160724829995647.fmha_fwd_prefill_a16w16_m32x8 md5=a60bff8e
+# arm l12_c -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/l12_c kern_mod=flydsl_fwd__6569943507252258442.fmha_fwd_prefill_a16w16_m32x8 md5=3610fe68
+# arm r4_c -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/r4_c kern_mod=flydsl_fwd__2592836991445862342.fmha_fwd_prefill_a16w16_m32x8 md5=826b66f5
+# PYTHONHASHSEED=None arms=['r6_c', 'l12_c', 'r4_c'] modes=blocked,stream,std
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+RESULT mode=blocked arm=r6_c pos=0 ms=1.48196 sclk=1258/1235 by_pred={}
+RESULT mode=blocked arm=l12_c pos=1 ms=1.48801 sclk=1258/1235 by_pred={}
+RESULT mode=blocked arm=r4_c pos=2 ms=1.55024 sclk=1258/1235 by_pred={}
+RESULT mode=stream arm=r6_c pos=0 ms=1.48774 sclk=1235/1218 by_pred={}
+RESULT mode=stream arm=l12_c pos=1 ms=1.49588 sclk=1235/1218 by_pred={}
+RESULT mode=stream arm=r4_c pos=2 ms=1.55715 sclk=1235/1218 by_pred={}
+RESULT mode=std arm=r6_c pos=0 ms=1.51018 sclk=1218/1236 by_pred={'None': [1.40326, 1], 'l12_c': [1.50564, 50], 'r6_c': [1.51709, 50]}
+RESULT mode=std arm=l12_c pos=1 ms=1.42401 sclk=1218/1236 by_pred={'r6_c': [1.43351, 51], 'r4_c': [1.41748, 50]}
+RESULT mode=std arm=r4_c pos=2 ms=1.59018 sclk=1218/1236 by_pred={'l12_c': [1.59379, 51], 'r4_c': [1.58762, 50]}
+rc=0 newdmesg_g0=0

@@ -1,0 +1,323 @@
+round: 26
+mode: fast
+candidate: r26.i1.h33          # rounds/019/op (= r17 + g59) + the h33 defect fixes; shipped in rounds/026/op.
+                               # NOTE ON THE ID: this round's two `g` ids (g82, g83) are the two
+                               # route idea rows, and BOTH died at their free gates without being
+                               # built. The change that is actually in the working copy is the
+                               # h33 defect fixes on a rebased base tree -- an id from hint.md,
+                               # not from pool.md, because no pool entry ever described it. It is
+                               # reported under its real id rather than borrowed into a `g` form.
+outcome: delivered
+
+correctness:
+  precision: pass               # op/validation.py's own check only; never a hand-rolled tolerance
+  determinism: pass             # dk/dv bitwise identical across 200 runs
+  checked_with: op/validation.py
+  sqnr_db: 52.52                # worst of dq/dk/dv over fast/proxy/prod (gate 50.0); best 52.84
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/017/op, rounds/019/op, rounds/020/op, rounds/025/op, op/beat]
+  # STEP-6 ACCEPTANCE RUN, key r26_benchfinal, rc 0, raw/bench_final/. 2026-09-28, physical
+  # GPU 3 via container fa-g3 (h65). SIX arms per shape -- cand, r017, r019, r020, r025, beat --
+  # ALL INTERLEAVED IN ONE benchmark.py PROCESS per shape, palindromic, 51 timed iterations,
+  # 3 s continuous warmup, L2 flushed between timed iterations, so every arm of a shape shares
+  # ONE clock excursion. Two passes.
+  # This SUPERSEDES the five-arm table reported earlier in the round and CLOSES the gap recorded
+  # there: rounds/017/op and rounds/025/op had not been re-measured this session, and now they
+  # have been. The card was less throttled than during the earlier passes (fast sclk 2330,
+  # prod 1756 -> 1839), which is exactly why stored figures are not usable.
+  # Card verified idle before and after: rocm-smi --showuse 0% on GPU 3; all four KFD PIDs
+  # rocm-smi --showpids listed trace via /proc/<pid>/cgroup to c87432dadced (fa-g0) and
+  # 92bb52de5a27 (fa-g2), none to a1f5ab75082c (fa-g3). dmesg -W armed throughout: ZERO events.
+  # Figures below are PASS 1. Pass 2 is in the note on each row and in opt.md 11.
+  shapes:
+    - name: fast
+      this_round_tflops: 97.280        # p2 97.208; same-arm pass-to-pass spread 0.07%
+      best_round_tflops: 96.997        # rounds/019/op, re-measured in this session (p2 96.788)
+      beat_tflops: 51.556              # measured in the SAME sweep (p2 51.065)
+      target_tflops: 51.556            # margin 0%, so target == beat
+      champion_round: 19
+      champion_tflops: 96.997
+      champion_rebuilt: true
+      ratio: 1.8868                    # uncapped, per the round instruction
+      vs_champion: 1.0029              # p2 1.0043
+    - name: proxy
+      this_round_tflops: 596.189       # p2 593.016
+      best_round_tflops: 592.809       # rounds/019/op re-measured (p2 591.014); r017 592.769
+      beat_tflops: 756.075             # p2 750.976
+      target_tflops: 756.075
+      champion_round: 19
+      champion_tflops: 592.809
+      champion_rebuilt: true
+      ratio: 0.7885
+      vs_champion: 1.0057              # p2 1.0034
+    - name: prod
+      this_round_tflops: 639.975       # p2 638.885; same-arm pass-to-pass spread 0.17%
+      best_round_tflops: 638.626       # rounds/019/op re-measured (p2 638.003)
+      beat_tflops: 836.109             # p2 832.998
+      target_tflops: 836.109
+      champion_round: 19
+      champion_tflops: 638.626
+      champion_rebuilt: true
+      ratio: 0.7654
+      vs_champion: 1.0021              # p2 1.0014; vs the INCUMBENT rounds/020/op it is 1.0163
+  score: 1.1469                        # mean of the three UNCAPPED ratios. Pass 2 gives 1.1534.
+                                       # Computed from op/benchmark.py, which this schema names
+                                       # as the only source of the round's score. The framework
+                                       # will recompute from its own validation.py run; mine,
+                                       # taken on the same shipped tree, gives 1.0632. See the
+                                       # DISCREPANCY note below -- it is recorded, not resolved.
+  all_arms_this_session:               # TFLOP/s, pass 1 / pass 2, one process per shape
+    fast:  {cand: [97.280, 97.208], r017: [94.139, 93.809], r019: [96.997, 96.788],
+            r020: [96.027, 96.025], r025: [91.195, 89.852], beat: [51.556, 51.065]}
+    proxy: {cand: [596.189, 593.016], r017: [592.769, 589.795], r019: [592.809, 591.014],
+            r020: [576.673, 576.478], r025: [517.034, 516.040], beat: [756.075, 750.976]}
+    prod:  {cand: [639.975, 638.885], r017: [638.116, 637.002], r019: [638.626, 638.003],
+            r020: [629.716, 628.551], r025: [613.092, 610.775], beat: [836.109, 832.998]}
+  same_arm_pass_spread_prod_pct:       # the honest CROSS-PASS floor for this session
+    {cand: 0.17, r017: 0.17, r019: 0.10, r020: 0.19, r025: 0.38, beat: 0.37}
+  acceptance:
+    rule_1_improves_on_best_ever_remeasured: true    # all 3 shapes, both passes: 6 for 6
+    rule_2_below_target_shapes_ge_95pct_of_own_best: true   # proxy 100.6%, prod 100.2%
+    rule_3_no_at_target_shape_regresses: true        # only fast is at target; cand is 1.887x it
+    verdict: accepted
+    vs_incumbent_rounds_020_op: {fast: 1.0131, proxy: 1.0338, prod: 1.0163, geomean: 1.0210}
+    note: >
+      Accepted by the round's stated arithmetic. NOT accepted against the BAR: op/beat is not
+      beaten at proxy or prod and no claim is made that it is. The margins over the best-ever
+      champion are small (0.21-0.57%) and at prod the margin is smaller than the same-arm
+      cross-pass spread; what carries them is that the WITHIN-pass comparison shares one clock
+      excursion and both passes agree in sign at every shape. The margin over the INCUMBENT
+      (1.3-3.4%) is far outside any floor measured this session.
+
+validation:
+  exit_code: 2                         # correctness pass, determinism pass, speed FAIL.
+                                       # The bar is NOT beaten. Reported as measured; the
+                                       # framework re-runs this itself.
+  impl_path: rounds/026/op             # run explicitly against the round's tree, never the default
+  runs:
+    - {key: r26_valA2, path: rounds/026/1-opt/arms/armA, geomean: 0.984,
+       fast: 89.25, proxy: 583.34, prod: 635.28, beat_prod: 838.55}
+    - {key: r26_val_final, path: rounds/026/op, geomean: 0.988,
+       fast: 89.70, proxy: 584.52, prod: 628.63, beat_prod: 837.82}
+  # DISCREPANCY, recorded and NOT resolved in this round's favour.
+  # rounds/026/op and rounds/026/1-opt/arms/armA are byte-identical (diff -rq clean), and the
+  # tree was re-verified against r19 and op/current. The two validation runs of that identical
+  # code read prod 635.28 and 628.63 TF/s -- a 1.06% spread -- while the five-arm interleaved
+  # benchmark read 638.567 / 638.508 for the same code, a 0.009% spread. beat was stable across
+  # all of them (838.55 / 837.82) and sclk was the same band (1765-1812).
+  # Reading: validation.py times ONE arm against beat per shape, in separate processes per
+  # shape, so it does not share a clock excursion the way an interleaved five-arm process does.
+  # Its floor is therefore ~1% at prod, NOT the 0.10% this round measured interleaved, and the
+  # 628.63 figure coincides with rounds/020/op's interleaved number (628.38) by accident of
+  # that floor rather than by identity of code.
+  # What this means for the round's claim: the +1.617% prod over the incumbent is a
+  # SAME-PROCESS, SAME-CLOCK comparison and stands. It is NOT reproduced by comparing two
+  # separate validation.py invocations, and nothing here licenses doing that.
+
+explored:
+  ran:
+    - "SIX-arm two-pass acceptance A/B (cand, rounds/017/op, rounds/019/op, rounds/020/op,
+       rounds/025/op, beat) x 3 shapes, all arms of a shape interleaved in ONE process.
+       Key r26_benchfinal. This is the round's scoring measurement."
+    - "OFFLINE ISA GATE, key r26_isa2, ZERO card time beyond three compiles: FLYDSL_DUMP_IR
+       dumps of rounds/026/op, arms/armC (=g82) and rounds/019/op at prod shape. It decided
+       BOTH route idea rows -- g82 killed on pool rule 1, g83 killed on an empty mechanism."
+    - "five-arm two-pass A/B (A, B, rounds/020/op, rounds/019/op, beat) x 3 shapes, interleaved"
+    - "validation.py on arms/armA (key r26_valA2) and on rounds/026/op (key r26_val_final)"
+    - "P76 -- subtractive k_dq ceiling: op/current vs op/current-minus-k_dq's-S+dP GEMMs and
+       exp2/dS VALU chain, 51 iters, one process, key r26_p76. THE deciding number for g76."
+    - "G1a' -- g76's dS layout gate, read from source, zero card time"
+    - "WMMA-shape gate -- enumerated fx.rocdl's bf16 WMMA forms on gfx1250, zero card time"
+    - "rocprofv3 --stats --kernel-trace on armA at prod (key r26_stats4): the benchmark ran and
+       printed a real RESULT, then rocprofv3 1.3.2 died with `corrupted double-linked list`
+       inside its own output generation and hung. No CSV. h4 reconfirmed; NOT a GPU fault."
+  consulted:
+    - knowledge/optimization/routes/1-metrics-to-techniques.md
+    - knowledge/backends/flydsl/attention/techniques.md
+    - knowledge/backends/flydsl/attention/recipes/hd128.md
+    - knowledge/backends/flydsl/attention/README.md
+    - knowledge/backends/flydsl/attention/dead-ends.md
+    - knowledge/backends/aiter/attention/recipes/fmha_v3_bwd_hd128_bf16.md
+    - knowledge/backends/hipkittens/attention/recipes/gqa_d128.md
+  bound: latency
+  confidence: high
+  why: >
+    Unchanged and reinforced. Arm B landed its mechanism exactly -- g61 splits the S/P
+    dependent WMMA chain, which is the textbook fix for a dependence-bound body -- and lost
+    0.885% prod at 9x the floor on the g59 tree, while the same edit was measured NULL on the
+    tree without g59. A change's sign here is a property of the tree it lands in, not of the
+    mechanism. And P76 now prices the whole recompute at 22.36% while the memory route to
+    removing it costs the same 22.36%, which is the corpus's item-14 trade measured on this
+    part: marginal WMMA at one wave per SIMD is nearly free, so the redundant GEMMs are not
+    the defect they look like.
+
+arms:
+  - id: r26.i1.h33
+    built: "rounds/019/op + the h33 defect fixes (a/b/c), depth-1 transposition of defect c"
+    tflops: {fast: 97.457, proxy: 586.470, prod: 638.538}
+    vs_champion: 1.0067
+    shipped: true
+    note: "+1.617% prod / +2.50% proxy / +1.74% fast over the incumbent rounds/020/op, and
+           +0.672% prod / +0.52% proxy / +9.55% fast over PLAIN rounds/019/op -- from the h33
+           fixes alone, which facts.md records as free (0.9999, 0.99831) ON THE r20 TREE.
+           A 'free' verdict does not survive a base-tree change. This is r26.i2.g83."
+  - id: r26.i2.armB
+    built: "armA + g61 lifted verbatim from rounds/020/op kernels.py:398-428 (30 lines)"
+    tflops: {fast: 95.007, proxy: 583.063, prod: 632.893}
+    vs_champion: 0.9978
+    shipped: false
+    note: "-0.885% prod, -0.58% proxy against arm A at a <=0.10% floor. g61 and g59 are
+           SUBSTITUTES, not complements: both break the same dependent WMMA chain, and taking
+           both costs 64 extra v_add_f32 per iteration for a chain g59 has already broken.
+           Round 20 never measured this cell because it silently REVERTED g59 -- a fact
+           recorded nowhere in findings until this round diffed the trees.
+           The merge of the round's two ideas IS this arm, so no further merge exists."
+  - id: P76
+    built: "throwaway probe, numerically WRONG by construction, never in a speed table"
+    tflops: {prod_latency_ms: 6.7937, base_latency_ms: 8.7498}
+    vs_champion: null
+    shipped: false
+    note: "saving 1.9561 ms = 22.36% of prod. Passes its own >=1.2 ms threshold. Then KILLS
+           g76: the dS round trip is 17.18 GB (4.295e9 causal S elements x 2 B each way) which
+           at P78's BEST measured rates (8.79-8.93 write / 9.37-9.38 TB/s read) costs 1.886 ms.
+           Margin 0.07 ms, before k_dkdv pays for the extra store and against g76's own
+           prediction of up to +12% there. G1a' shows the applicable rate is BELOW that best
+           case. Gate fails, not built."
+  - id: r26.i1.g82
+    built: "NOT built -- ROUTE ROW 15, abandoned at its own free gate (c). ZERO card time.
+            Source kept at rounds/026/1-opt/arms/armC/ (21-line kernels.py diff, impl.py
+            untouched); its qloop_full body and prologue are textually identical to
+            rounds/024/op's apart from comments, so the lift is the established g62+h33 form."
+    tflops: {}
+    vs_champion: null
+    shipped: false
+    gate:
+      vgpr_spill_count: {bar: 0, base: 0, arm: 0, verdict: pass}
+      scratch:          {bar: 0, base: 0, arm: 0, verdict: pass}
+      vgpr_count:       {bar: "<=960 and >=1 wave/SIMD", base: 724, arm: 904, verdict: pass}
+      lds_bytes:        {bar: unchanged, base: 70656, arm: 70656, verdict: pass}
+      wmma_per_body:    {bar: 64, base: 64, arm: 64, verdict: pass}
+      qloop_mask_body:  {bar: unchanged, base: 620, arm: 620, verdict: pass}
+      last_prefetch_load_index_qloop_full: {bar: "not later", base: 116, arm: 187, verdict: KILL}
+      qloop_full_body_insns: {base: 675, arm: 750}
+    note: "Pool rule 1 -- anything that moves the last prefetch load's issue index later loses --
+           is now 9 for 9, and this is its FIRST confirmation on B0, so it is no longer a rule
+           fitted only to A0. Mechanism from the opcode histogram: +32 buffer_load_b128,
+           +64 v_mov_b64, +42 s_set_vgpr_msb, +6 s_clause, -12 s_wait_loadcnt. The second stage
+           does buy cover (twelve fewer waits) and pays for it by moving the whole load block
+           71 instructions later.
+           STILL UNKNOWN and not claimed otherwise: g62's SIGN on the g59 tree. The gate did not
+           measure it. A different mechanism for deeper cover that does NOT lengthen the load
+           block is a new candidate for a later round, not a quiet substitution inside this one.
+           SECOND-ORDER FACT, worth more than the entry: k_dkdv on the g59 base runs at 724 VGPR,
+           not 904. facts.md:381's 904 is a g61+g62 figure and does not describe B0."
+  - id: r26.i2.g83
+    built: "NOT built -- ROUTE ROW 16, abandoned at STEP 1 (the free compile-only ISA diff).
+            Step 2 not run. ZERO card time."
+    tflops: {}
+    vs_champion: null
+    shipped: false
+    isa_diff_r019_vs_rounds_026_op:
+      k_dq_0: "byte-identical (3598 insns both)"
+      k_delta_bshd_0: "byte-identical"
+      k_dkdv_0: "2968 -> 2973: +2 s_add_co_i32, +2 s_min_i32, +1 s_max_i32. Nothing else moves.
+                 The other 405 textual diff lines are SGPR renumbering, i.e. allocation noise."
+      hot_loop: "qloop_full 674 -> 675 insns (ONE of the five). qloop_mask 620 -> 620."
+      vgpr_count: "724 -> 724"
+      first_body_load_index: "81 -> 82"
+      last_body_load_index: "115 -> 116"
+    falsified_mechanisms:
+      - {predicted: "address math collapses, insn count FALLS", measured: "+5", verdict: falsified}
+      - {predicted: "compiler hoists prefetch address: first load EARLIER, last unmoved",
+         measured: "first 81->82, last 115->116, both one LATER", verdict: falsified}
+      - {predicted: "VGPR falls", measured: "724 -> 724", verdict: falsified}
+    note: "By this row's own written condition the +0.672% prod is RECLASSIFIED as an unexplained
+           floor violation and nothing may be built on it until it is re-measured. One scalar
+           s_min_i32 per iteration, against a 675-instruction body on a latency-bound kernel
+           whose scalar unit is not the bottleneck, cannot pay +0.672%.
+           Step 6 then re-measured the gap six arms deep in one process on a less-throttled card:
+           cand over rounds/019/op is +0.29%/+0.43% fast, +0.57%/+0.34% proxy, +0.21%/+0.14% prod
+           (p1/p2). Still positive in sign at every shape in both passes, but roughly a third of
+           the original figure and now at the cross-arm floor.
+           STANDING CONSEQUENCE: the h33 clamps are a CORRECTNESS fix costing one SALU per
+           iteration, not a speed lever. Round 24 priced them free on the r20 tree and round 24
+           was right; round 26's +0.672% was the artefact.
+           k_dq_0 being byte-identical is its own finding: h33 defect b rewrote g_dq's extent in
+           Int64 and at the compiled shape that rewrite costs NOTHING in emitted code."
+  - id: r25.i2.g76
+    built: "NOT built -- failed its own gate on P76 x P78 x G1a'. Cost: one 51-iter benchmark."
+    tflops: {}
+    vs_champion: null
+    shipped: false
+  - id: "aiter b4 / techniques.md 16 (MFMA shape per GEMM)"
+    built: "NOT built -- died at a free gate, ZERO card time"
+    tflops: {}
+    vs_champion: null
+    shipped: false
+    note: "gfx1250 emits only wmma_f32_16x16x16_bf16 and wmma_f32_16x16x32_bf16 for
+           bf16-in/fp32-out. One output tile shape, so there is nothing to choose between;
+           the only remaining axis (K 32->16) ADDS dependence. Closed for this part."
+
+expected: >
+  Written before the card ran. Arm A: the tree diff says rounds/019/op should beat op/current
+  on B0 at prod and proxy by roughly the 1.5-2.5% round 25 saw, and the h33 fixes should be
+  free (facts.md prices them at 0.9999 / 0.99831). Arm B: g61 was measured NULL on the tree
+  WITHOUT g59; on top of g59 it is a coin flip and the honest prior is "no worse than null".
+  Both halves of the second prediction were wrong: the fixes were NOT free (+0.672%) and g61
+  was NOT null (-0.885%).
+
+added_to_pool: [r26.i1.g82, r26.i2.g83]
+route_updated: true
+
+implementation:
+  files_changed: [op/impl.py, op/kernels.py]     # relative to rounds/019/op, the new base
+  base_tree_changed: true                        # op/current (r20) -> rounds/019/op + h33
+  build_failures:
+    - {attempt: 1, error: "validation.py: FAILED: no such implementation directory /tmp/.../armA",
+       root_cause: "the container mounts only /home/lihuzhan; the host /tmp is invisible inside
+                    fa-g3. Arm trees moved under rounds/026/1-opt/arms/ and re-run with a FRESH
+                    key (r26_valA2) -- a finished run is not a cache, so no key was reused."}
+    - {attempt: 2, error: "rocprofv3 RC 1, no artefacts on the host",
+       root_cause: "two causes at once: --stats ALONE is fatal on rocprofv3 1.3.2 ('No tracing
+                    options were enabled for --stats option'), it needs --kernel-trace; and
+                    -d /tmp/... wrote into the container's own /tmp."}
+    - {attempt: 3, error: "rc 127, bash: raw/stats.sh: No such file or directory",
+       root_cause: "the runner's cwd inside the container is not the caller's; the script
+                    needs an absolute path."}
+    - {attempt: 4, error: "RC 2, benchmark.py: arm 'cand': no impl.py under op/cand",
+       root_cause: "--arm-path cand=DIR already registers the arm; passing --arms cand as well
+                    makes the parser resolve 'cand' a second time as a name relative to op/."}
+    - {attempt: 5, error: "rocprofv3: corrupted double-linked list, process hung, no CSV",
+       root_cause: "host-side heap corruption inside rocprofv3 1.3.2's OWN output generation,
+                    after the kernels had already run and printed a correct RESULT. Not a GPU
+                    fault -- dmesg clean, GPU 3 at 0% afterwards. Killed explicitly (rc 137
+                    written by hand; the sentinel never appeared). h4 reconfirmed: the survey
+                    is unavailable on this op and no flag or path recovers it."}
+    - {attempt: 6, error: "r26_isa1 exited rc 0, all three compiles reported RC 0, and produced
+                           NO dumps at all -- only a log per tree",
+       root_cause: "FlyDSL's DebugEnvManager carries env_prefix=DEBUG but overrides the two dump
+                    options with EXPLICIT env_var names, FLYDSL_DUMP_IR and FLYDSL_DUMP_DIR
+                    (flydsl/utils/env.py:241,243). I passed the prefix-derived
+                    FLYDSL_DEBUG_DUMP_IR / FLYDSL_DEBUG_DUMP_DIR, which the manager silently
+                    ignores. MECHANISM: a successful-looking run that produced nothing, because
+                    for these two fields the option name is not derived from the prefix. Fixed
+                    and re-run under a FRESH key r26_isa2 (rc 0, three 21_final_isa.s). This is
+                    the round's only driver failure; NO arm failed to compile -- armC compiled
+                    on the first attempt."}
+
+compile_cache_cleared_before_first_build: true
+# FLYDSL_RUNTIME_CACHE_DIR defaults to ~/.flydsl/cache; removed inside fa-g3 (it was already
+# absent, which is itself worth recording -- the backend was not serving anything stale).
+# __pycache__ under job_context/op, op/beat and op/ut removed. op/current/ NOT touched per the
+# standing rule; its three .pyc were checked instead and every one is newer than its .py.
+
+working_copy:
+  path: rounds/026/op
+  contains: "arm A, unchanged, byte-identical to rounds/026/1-opt/arms/armA (diff -rq clean)"
+  reverted: false
+  note: "Rows 15 and 16 produced no measured arm, so nothing replaced arm A and nothing was
+         reverted. armC (the g82 source) is kept under 1-opt/arms/ and is deliberately NOT in
+         the working copy: it was never measured, and shipping an unmeasured arm is exactly the
+         failure the step-5 instructions warn about."

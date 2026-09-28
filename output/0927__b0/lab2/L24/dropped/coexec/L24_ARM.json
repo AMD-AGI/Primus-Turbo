@@ -1,0 +1,6 @@
+{
+ "arm": "coexec",
+ "llvm_options_delta": {
+  "amdgpu-sched-strategy": "coexec"
+ }
+}

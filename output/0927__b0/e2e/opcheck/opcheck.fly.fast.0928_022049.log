@@ -1,0 +1,7 @@
+ARM fly SHAPE fast (1, 1024, 1024, 8, 2, 128)
+device gfx1250
+Traceback (most recent call last):
+  File "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/attn_backends/opcheck.py", line 82, in <module>
+    assert prov["common_sha"] == sha(JOB_OP / "ut/common.py"), prov
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: {'seed': 0, 'eager_sha': '2b35dff2e7a109fa', 'common_sha': '988c14caed5d9a80', 'shape': 'fast', 'dims': (1, 1024, 1024, 8, 2, 128), 'torch': '2.11.0+rocm7.14.0a20260625', 'device': 'gfx1250', 'ref_device': 'cuda'}

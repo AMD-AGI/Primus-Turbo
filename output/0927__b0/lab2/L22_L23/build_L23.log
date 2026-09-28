@@ -1,0 +1,5 @@
+L23 prod prod rc=0 vgpr=456 sgpr=100 vspill=0 sspill=0 scratch=0 md5=de7e104b
+L23 prod proxy rc=0 vgpr=456 sgpr=100 vspill=0 sspill=0 scratch=0 md5=de7e104b
+L23 prod fast rc=0 vgpr=456 sgpr=100 vspill=0 sspill=0 scratch=0 md5=de7e104b
+L23 nc prod rc=0 vgpr=450 sgpr=107 vspill=0 sspill=4 scratch=0 md5=03dd1620
+L23 prod mha rc=0 vgpr=454 sgpr=105 vspill=0 sspill=0 scratch=0 md5=a9a7a452

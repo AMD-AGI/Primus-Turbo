@@ -1,0 +1,12 @@
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+ENV 1 /home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250
+flydsl 0.3.4.1 /home/lihuzhan/.local/flydsl0341/flydsl/__init__.py
+fwd ok <function flydsl_attn_fwd at 0x7f3fe9ac32e0>
+bwd ok <function flydsl_attn_bwd at 0x7f2fb83e8a40>
+aiter asm fwd ok <function fmha_fwd_with_sink_asm at 0x7f2fb84d91c0>
+asm bwd kernargs ok /home/lihuzhan/code/aiter-src/hsa/gfx1250/fmha_v3_bwd ['bwd_hd128_bf16_a32_pssk.co', 'bwd_hd128_bf16_a32_pssk_perf.co', 'bwd_hd128_bf16_causal_br_a32_pssk.co', 'bwd_hd128_bf16_causal_br_a32_pssk_perf.co', 'bwd_hd128_dq_convert_bf16.co', 'bwd_hd128_odo_bf16.co']
+flydsl still 0.3.4.1 /home/lihuzhan/.local/flydsl0341/flydsl/__init__.py
+primus llama3 Attention ok <class 'primus.backends.torchtitan.models.llama3.model.model.Attention'>
+primus_turbo loaded: []
+cuda initialized: True
+elapsed 2.9s

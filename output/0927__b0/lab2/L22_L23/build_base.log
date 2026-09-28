@@ -1,0 +1,5 @@
+base prod prod rc=0 vgpr=456 sgpr=100 vspill=0 sspill=0 scratch=0 md5=7b078261
+base prod proxy rc=0 vgpr=456 sgpr=100 vspill=0 sspill=0 scratch=0 md5=7b078261
+base prod fast rc=0 vgpr=456 sgpr=100 vspill=0 sspill=0 scratch=0 md5=7b078261
+base nc prod rc=0 vgpr=450 sgpr=107 vspill=0 sspill=4 scratch=0 md5=02756c67
+base prod mha rc=0 vgpr=454 sgpr=105 vspill=0 sspill=0 scratch=0 md5=26300e15

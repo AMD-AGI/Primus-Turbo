@@ -1,0 +1,24 @@
+fwd_A1 rc=0 3 results
+bwd_A1 rc=0 2 results
+[13467.759292] amdgpu 0001:04:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+[13467.797085] amdgpu 0001:04:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:157 vmid:2 pasid:696)
+[13467.813398] amdgpu 0001:04:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00804061
+[13467.835456] amdgpu 0001:04:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00804061
+[13467.860201] amdgpu 0001:04:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+[13468.213257] amdgpu 0001:04:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+DMESG FAULT
+fwd_B1 rc=0 3 results
+bwd_B1 rc=0 2 results
+[13467.759292] amdgpu 0001:04:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+[13467.797085] amdgpu 0001:04:00.0: [gfxhub0] no-retry page fault (src_id:0 ring:157 vmid:2 pasid:696)
+[13467.813398] amdgpu 0001:04:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00804061
+[13467.835456] amdgpu 0001:04:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_LO32:0x00804061
+[13467.860201] amdgpu 0001:04:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+[13468.213257] amdgpu 0001:04:00.0: GCVM_L2_PROTECTION_FAULT_STATUS_HI32:0x00000000
+DMESG FAULT
+fwd_A2 rc=143 0 results
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+[aiter] LoadKernel: _ZN5aiter41fmha_bf16_pertokenBf16_hd128_128x256_maskE hsaco: /home/lihuzhan/code/aiter-src/hsa//gfx1250/fmha_fwd_bf16/fmha_bf16_pertokenBf16_hd128_128x256_mask.co

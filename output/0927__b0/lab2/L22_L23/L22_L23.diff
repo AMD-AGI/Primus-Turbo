@@ -1,0 +1,27 @@
+--- base/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py	2026-09-27 12:42:45.092802504 +0000
++++ L22_L23/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py	2026-09-27 12:43:58.641306259 +0000
+@@ -645,8 +645,10 @@
+     d_tiles = v_hdim // WMMA_M  # output d-tiles (M axis, WMMA_M d rows each)
+     nkt = n_block // WMMA_K  # kv contraction tiles (K=32 kv each)
+ 
+-    # Drain the whole V transpose burst once; every v_values entry is now resident.
+-    rocdl.s_wait_dscnt(0)
++    # L22 (lab2): hand drain of the V transpose burst deleted. v_values are SSA-visible
++    # ds_load results, so SIInsertWaitcnts grades s_wait_dscnt per WMMA operand (same as
++    # the K burst); every v_values entry is consumed below, so all V reads of this tile
++    # retire before the next tile's top-of-body barrier (WAR vs the t+2 prefetch holds).
+ 
+     out_list = [[None] * d_tiles for _ in range(R)]
+     for dt in range(d_tiles):
+@@ -1099,9 +1101,9 @@
+                 tdm_ops.tensor_wait(0)
+             else:
+                 rocdl.s_wait_asynccnt(0)
+-            rocdl.sched_barrier(0)
++            # L23 (lab2): sched_barrier pair around the barrier deleted; ordering is kept
++            # by the gpu.barrier release/acquire fences and s_barrier side effects.
+             gpu.barrier()
+-            rocdl.sched_barrier(0)
+ 
+         def _prefetch(addr):
+             # Skip t+1 prefetch on the last tile: a dead copy into the O-epilogue slot

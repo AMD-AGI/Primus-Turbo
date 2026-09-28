@@ -1,0 +1,223 @@
+diff -ru base/flydsl_fwd/fmha_b16_buffer_managers.py arms/w4r2_occ2/flydsl_fwd/fmha_b16_buffer_managers.py
+--- base/flydsl_fwd/fmha_b16_buffer_managers.py	2026-09-25 11:37:42.000000000 +0000
++++ arms/w4r2_occ2/flydsl_fwd/fmha_b16_buffer_managers.py	2026-09-27 13:48:41.418795116 +0000
+@@ -949,6 +949,7 @@
+     pad_elems,
+     lds_base,
+     elem_dtype,
++    num_warps=_DEFAULT_NUM_WAVES,
+ ):
+     """Build a LIST of ``(atom, g_view, lds_view)`` TDM global->LDS copies for one
+     ``[n_rows, hdim]`` tile into a row-major padded (``hdim + pad_elems`` element row stride) LDS
+@@ -975,7 +976,7 @@
+             g_view,
+             [valid, None],
+             strides=[stride_seq, None],
+-            num_warps=_DEFAULT_NUM_WAVES,
++            num_warps=num_warps,
+             pad_interval=w,
+             pad_amount=row_elems - w,
+         )
+@@ -1012,7 +1013,7 @@
+         self.elem_dtype = elem_dtype
+         if qk_hdim % _WMMA_K != 0:
+             raise ValueError(f"qk_hdim must be a multiple of {_WMMA_K}; got {qk_hdim}")
+-        if num_waves != _DEFAULT_NUM_WAVES:
++        if num_waves not in (4, _DEFAULT_NUM_WAVES):  # L12: 4-wave legal
+             raise NotImplementedError("V2 TDM loader assumes 8 waves")
+         self.qk_hdim = qk_hdim  # compile-time
+         self.gqa_ratio = gqa_ratio  # compile-time
+@@ -1163,7 +1164,7 @@
+             raise ValueError(
+                 f"n_block must be one of {_N_BLOCK_CHOICES}; got {n_block}"
+             )
+-        if num_waves != _DEFAULT_NUM_WAVES:
++        if num_waves not in (4, _DEFAULT_NUM_WAVES):  # L12: 4-wave legal
+             raise NotImplementedError("V2 TDM loader assumes 8 waves")
+         self.qk_hdim = qk_hdim
+         self.n_block = n_block
+@@ -1193,6 +1194,7 @@
+             pad_elems=_K_PAD_ELEMS,
+             lds_base=ptr_lds,
+             elem_dtype=self.elem_dtype,
++            num_warps=self.num_waves,
+         )
+ 
+     def ds_load_ptrs(self, *, ptr_lds, lane_idx):
+@@ -1249,7 +1251,7 @@
+             raise ValueError(f"v_hdim must be a multiple of {_WMMA_M}; got {v_hdim}")
+         if n_block % _WMMA_K != 0:
+             raise ValueError(f"n_block must be a multiple of {_WMMA_K}; got {n_block}")
+-        if num_waves != _DEFAULT_NUM_WAVES:
++        if num_waves not in (4, _DEFAULT_NUM_WAVES):  # L12: 4-wave legal
+             raise NotImplementedError("V2 TDM loader assumes 8 waves")
+         self.v_hdim = v_hdim
+         self.n_block = n_block
+@@ -1278,6 +1280,7 @@
+             pad_elems=_V_PAD_ELEMS,
+             lds_base=ptr_lds,
+             elem_dtype=self.elem_dtype,
++            num_warps=self.num_waves,
+         )
+ 
+     def ds_load_ptrs(self, *, ptr_lds, lane_idx):
+@@ -1585,7 +1588,7 @@
+         self.elem_dtype = elem_dtype
+         if v_hdim % _WMMA_M != 0:
+             raise ValueError(f"v_hdim must be a multiple of {_WMMA_M}; got {v_hdim}")
+-        if num_waves != _DEFAULT_NUM_WAVES:
++        if num_waves not in (4, _DEFAULT_NUM_WAVES):  # L12: 4-wave legal
+             raise NotImplementedError("V2 TDM loader assumes 8 waves")
+         self.v_hdim = v_hdim
+         self.gqa_ratio = gqa_ratio
+@@ -1745,7 +1748,7 @@
+         self.elem_dtype = elem_dtype
+         if v_hdim % _WMMA_M != 0:
+             raise ValueError(f"v_hdim must be a multiple of {_WMMA_M}; got {v_hdim}")
+-        if num_waves != _DEFAULT_NUM_WAVES:
++        if num_waves not in (4, _DEFAULT_NUM_WAVES):  # L12: 4-wave legal
+             raise NotImplementedError("V3 assumes 8 waves")
+         self.v_hdim = v_hdim
+         self.gqa_ratio = gqa_ratio
+diff -ru base/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py arms/w4r2_occ2/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py
+--- base/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py	2026-09-27 09:13:58.000000000 +0000
++++ arms/w4r2_occ2/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py	2026-09-27 13:48:41.419507729 +0000
+@@ -109,7 +109,7 @@
+ # ============================================================================
+ 
+ WAVE_SIZE = 32  # gfx1250 kernels run wave32
+-NUM_WAVES = 8  # "m32x8" — 8 waves per threadgroup
++NUM_WAVES = 4  # L12 (was 8) -- "m32x8" — 8 waves per threadgroup
+ BLOCK_SIZE = WAVE_SIZE * NUM_WAVES  # 256 threads
+ 
+ # "m32x8": each wave owns WMMA_ROW_PER_WAVE adjacent 16-row (WMMA M) Q sub-tiles →
+@@ -118,7 +118,7 @@
+ WMMA_M = 16  # query rows per WMMA tile (the "m16" in m32x8)
+ WMMA_N = 16  # kv rows per WMMA tile (the S^T=K@Q^T output's n_block-direction axis)
+ WMMA_K = 32  # WMMA contraction depth (bf16 v_wmma_f32_16x16x32); d-tile width
+-WMMA_ROW_PER_WAVE = 2  # Q WMMA tiles per wave (the "x2" step from m16x8 to m32x8)
++WMMA_ROW_PER_WAVE = 2  # L12 (was 2) -- Q WMMA tiles per wave (the "x2" step from m16x8 to m32x8)
+ BLOCK_M = WMMA_M * WMMA_ROW_PER_WAVE * NUM_WAVES  # 256
+ 
+ 
+@@ -147,7 +147,7 @@
+ N_KV_PP = 2
+ 
+ # Each K/V ping-pong block is floored to this many bytes (reserved headroom).
+-MIN_KV_BLK_BYTES = 64 * 1024
++MIN_KV_BLK_BYTES = 0  # L12
+ 
+ # log2(e): exp(x) = exp2(x * LOG2E). Softmax uses the native ISA exp2 intrinsic.
+ 
+@@ -591,19 +591,26 @@
+     # ---- Row sum: R rows' balanced sum-trees emitted INTERLEAVED. fadd_t (fast-math minus
+     # reassoc) so LLVM's Reassociate does NOT re-linearize the tree into a serial chain. ----
+     add3 = lambda a, b, c: fadd_t(fadd_t(a, b), c)
+-    if R == 2:
+-        # r4 g10 (L16): the two rows' trees have the same shape, so run them in lockstep as
+-        # one v2 tree (row0, row1) -> v_pk_add_f32; per-row association unchanged (bitwise).
++    if R % 2 == 0:
++        # r4 g10 (L16), L12 generalised to any even R: rows (2i, 2i+1) run in lockstep as one
++        # v2 tree -> v_pk_add_f32; per-row association unchanged (bitwise).
+         def vadd_t(a, b):
+             return fx.Vector(arith.addf(_ir(a), _ir(b), fastmath=_no_reassoc))
+ 
+         vadd3 = lambda a, b, c: vadd_t(vadd_t(a, b), c)
+-        leaves = [
+-            fx.Vector.from_elements([p_flat_list[0][i], p_flat_list[1][i]], fx.Float32)
+-            for i in range(len(p_flat_list[0]))
++        pair_leaves = [
++            [
++                fx.Vector.from_elements(
++                    [p_flat_list[2 * pi][i], p_flat_list[2 * pi + 1][i]], fx.Float32
++                )
++                for i in range(len(p_flat_list[0]))
++            ]
++            for pi in range(R // 2)
+         ]
+-        (tot,) = _tree_reduce_multi([leaves], vadd3, vadd_t)
+-        local_sum_list = [fx.Float32(tot[0]), fx.Float32(tot[1])]
++        tots = _tree_reduce_multi(pair_leaves, vadd3, vadd_t)
++        local_sum_list = []
++        for tot in tots:
++            local_sum_list += [fx.Float32(tot[0]), fx.Float32(tot[1])]
+     else:
+         local_sum_list = _tree_reduce_multi(p_flat_list, add3, fadd_t)
+ 
+@@ -686,7 +693,7 @@
+     kernel body before the warp-type dispatch so both ``_core_attention`` traces share the
+     single SharedAllocator flydsl permits; K/V, Q, and the O epilogue all carve this base.
+     """
+-    smem = fx.SharedAllocator().allocate(get_lds_capacity_bytes("gfx1250"))
++    smem = fx.SharedAllocator().allocate(min(163840, get_lds_capacity_bytes("gfx1250")))  # L12
+     return fx.Int32(fx.ptrtoint(smem.peek().ptr))
+ 
+ 
+@@ -791,6 +798,8 @@
+     k_blk_bytes = max(k_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
+     v_blk_bytes = max(v_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
+     slot_bytes = max(k_blk_bytes + v_blk_bytes, q_mgr.get_lds_size_in_byte())
++    assert N_KV_PP * slot_bytes <= min(163840, get_lds_capacity_bytes('gfx1250')), (
++        f'L12: LDS ring {N_KV_PP}x{slot_bytes} exceeds allocation')
+ 
+     def _k_lds_buf(
+         pp,
+@@ -1468,19 +1477,21 @@
+         lse_rsrc = buffer_ops.create_buffer_resource(
+             ptr_LSE, num_records_bytes=lse_num_records_bytes
+         )
+-        prow = row0 + tid  # one LSE per packed row (BLOCK_SIZE threads == BLOCK_M)
+-        seq = prow // g
+-        head = kv_head * g + prow % g
+-        if has_sink:
+-            num_heads_q = gpu.grid_dim.y * g
+-            lse_val = _load_sink_logit(ptr_sink, head, num_heads_q)
+-        else:
+-            lse_val = fx.Float32(float("-inf"))
+-        off = (q_start + seq) * stride_lse_seq + head * stride_lse_head
+-        off_masked = (seq < q_len).select(off * fx.Int32(4), fx.Int32(0x7FFFFFFF))
+-        buffer_ops.buffer_store(
+-            lse_val, lse_rsrc, off_masked, mask=None, offset_is_bytes=True
+-        )
++        assert BLOCK_M % BLOCK_SIZE == 0
++        for zr in range(BLOCK_M // BLOCK_SIZE):  # L12: BLOCK_M may exceed BLOCK_SIZE
++            prow = row0 + fx.Int32(zr * BLOCK_SIZE) + tid
++            seq = prow // g
++            head = kv_head * g + prow % g
++            if has_sink:
++                num_heads_q = gpu.grid_dim.y * g
++                lse_val = _load_sink_logit(ptr_sink, head, num_heads_q)
++            else:
++                lse_val = fx.Float32(float("-inf"))
++            off = (q_start + seq) * stride_lse_seq + head * stride_lse_head
++            off_masked = (seq < q_len).select(off * fx.Int32(4), fx.Int32(0x7FFFFFFF))
++            buffer_ops.buffer_store(
++                lse_val, lse_rsrc, off_masked, mask=None, offset_is_bytes=True
++            )
+ 
+ 
+ # ============================================================================
+@@ -1868,7 +1879,7 @@
+         "amdgpu-expert-scheduling-mode": ENABLE_SCHED_MODE2,
+         # "amdgpu-sched-strategy": "coexec",  # gfx1250 co-exec sched; revisit after named barrier
+     }
+-    _launch.compile_hints["waves_per_eu"] = 2
++    _launch.compile_hints["waves_per_eu"] = 2  # L12
+     _launch_fns[key] = _launch
+ 
+ 
+@@ -1974,7 +1985,7 @@
+         "amdgpu-expert-scheduling-mode": ENABLE_SCHED_MODE2,
+         # "amdgpu-sched-strategy": "coexec",  # gfx1250 co-exec sched; revisit after named barrier
+     }
+-    _launch.compile_hints["waves_per_eu"] = 2
++    _launch.compile_hints["waves_per_eu"] = 2  # L12
+     _launch_fns[key] = _launch
+ 
+ 
+Binary files base/flydsl_fwd/__pycache__/buffer_ops.cpython-312.pyc and arms/w4r2_occ2/flydsl_fwd/__pycache__/buffer_ops.cpython-312.pyc differ
+Binary files base/flydsl_fwd/__pycache__/fmha_b16_buffer_managers.cpython-312.pyc and arms/w4r2_occ2/flydsl_fwd/__pycache__/fmha_b16_buffer_managers.cpython-312.pyc differ
+Binary files base/flydsl_fwd/__pycache__/fmha_fwd_prefill_a16w16_m32x8.cpython-312.pyc and arms/w4r2_occ2/flydsl_fwd/__pycache__/fmha_fwd_prefill_a16w16_m32x8.cpython-312.pyc differ
+Binary files base/flydsl_fwd/__pycache__/__init__.cpython-312.pyc and arms/w4r2_occ2/flydsl_fwd/__pycache__/__init__.cpython-312.pyc differ
+Binary files base/flydsl_fwd/__pycache__/kernels_common.cpython-312.pyc and arms/w4r2_occ2/flydsl_fwd/__pycache__/kernels_common.cpython-312.pyc differ
+Binary files base/flydsl_fwd/__pycache__/tensor_shim.cpython-312.pyc and arms/w4r2_occ2/flydsl_fwd/__pycache__/tensor_shim.cpython-312.pyc differ

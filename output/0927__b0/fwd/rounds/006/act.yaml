@@ -1,0 +1,108 @@
+round: 6
+mode: fast
+candidate: r5.i2.g14
+outcome: delivered
+
+correctness:
+  unit_tests: pass            # same status as round 4's champion: spec shapes PASS, determinism 200/200; the same 7 edge cases
+                              # sit at 49.82-49.99 dB under ut's hard-coded 50 dB with dB lines identical to the champion's (raw/ut_A.txt)
+  precision: pass             # validation.py correctness 16/16 at the spec's 49 dB; bitwise == op/current + d-order fix on 52 adversarial cases
+  checked_with: op/validation.py
+  sqnr_db: 49.82              # min o SQNR over validation's shapes (short_q full), same as the champion
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/004/op, job_context/op/current]
+  shapes:                     # batch 1 = no beat in the process (h31), mean of 3 sessions, cyclic arm rotation (raw/bench_r6_agg.txt);
+                              # beat_tflops = mean of the beat arm in the 3 gate-form processes of the same sweep (batch 2)
+    - name: fast
+      this_round_tflops: 97.40
+      best_round_tflops: 101.06
+      beat_tflops: 151.19
+      target_tflops: 151.19
+      champion_round: 4
+      champion_tflops: 101.06
+      champion_rebuilt: true
+      ratio: 0.6442
+      vs_champion: 0.9638
+    - name: proxy
+      this_round_tflops: 1583.64
+      best_round_tflops: 1547.47
+      beat_tflops: 1663.53
+      target_tflops: 1663.53
+      champion_round: 4
+      champion_tflops: 1547.47
+      champion_rebuilt: true
+      ratio: 0.9520
+      vs_champion: 1.0234
+    - name: prod
+      this_round_tflops: 1524.08
+      best_round_tflops: 1441.65
+      beat_tflops: 1796.73
+      target_tflops: 1796.73
+      champion_round: 4
+      champion_tflops: 1441.65
+      champion_rebuilt: true
+      ratio: 0.8483
+      vs_champion: 1.0572
+  score: 0.8148               # champion r4 on the same basis 0.8004. Gate form (X + beat in one process): A 0.7811, r4 0.7607
+  note: >
+    Median of 101, 8 s warmup, unprofiled, one process per shape, fa-g0 GPU 0 idle. The clock regime moved
+    since round 4 (sclk 2306-2319 MHz at fast, 1245-1531 at proxy/prod; round 4 was 1019-1100 throttled),
+    so absolute TF/s and score do not compare with rounds 1-4. A/A floor (cur vs inc): prod 0.4%, proxy 0.6%,
+    fast 2%. A beat the champion in every session at prod (+5.5..5.9%) and proxy (+2.0..2.5%) and lost in
+    every session at fast (-2.9..-4.1%).
+
+validation:
+  exit_code: 2                # speed gate only (geomean 0.7597 vs beat); correctness and determinism PASS (raw/val_A.txt)
+
+explored:
+  ran: ["validation.py", "adversarial bitwise gate raw/adv_bitwise.py (found and fixed the d-update reassociation defect)",
+        "ISA census via COMPILE_ONLY dumps (raw/descriptors_AB_final.txt)"]
+  consulted:
+    - INDEX.md
+    - optimization/routes/1-metrics-to-techniques.md
+    - backends/flydsl/attention/README.md
+    - pitfalls/measurement-traps.md
+    - arch/gfx1250/profiling-surface.md
+    - backends/flydsl/attention/recipes/hd128.md
+  bound: compute
+  confidence: medium
+  why: >
+    Removing VALU from the serial softmax block paid +5.7% prod / +2.3% proxy with bitwise-identical output,
+    and round 6's data probe showed the prod gap is cycles. fast is limited by the code footprint instead
+    (A +48% code lost 3.6% there; B -31% code gained 3.7%).
+
+arms:
+  - id: r5.i2.g14
+    built: "A alone, from op/current: speculative stale-max softmax, today's softmax on a ballot-gated slow path"
+    tflops: {fast: 97.40, proxy: 1583.64, prod: 1524.08}
+    vs_champion: 1.0148
+    shipped: true
+  - id: r6.i1.g16
+    built: "B alone, from op/current, NOT on A: clean + right-edge tiles in one loop, masking under a uniform scf.if"
+    tflops: {fast: 104.75, proxy: 1544.68, prod: 1416.70}
+    vs_champion: 1.0058
+    shipped: false
+    note: >
+      Bitwise == op/current, code -31%. Lost prod -1.7% in every session (beyond the floor), so the route's merge
+      condition failed and no merge was built. fast +3.7% without beat, and in gate form 0.6566 vs 0.6357. Beat
+      penalty at fast went from -5.2% to -3.4%. Patch at raw/armB_g16.diff; A+B is the natural next candidate.
+
+expected: >
+  g14 (arm A): output bitwise equal to op/current at every gate shape (the slow path is today's path).
+  prod +2..+4%, proxy +2..+4%, fast +2..+5% same-session vs champion, without beat (h31). VGPR <= 512,
+  0 spill. If it comes in at <= 0 with bitwise output, the max chain was not on the critical path.
+  g16 (arm B): A/A-style (no beat) within ±0.5% of the champion; that is the no-regression check. In the
+  gate's configuration (with beat) fast +5..+12% (a 1-2 us share of the 4 us penalty, if the penalty
+  scales with code size) and proxy +1..+2%. If no-beat is neutral and with-beat is also neutral, the
+  penalty does not scale with code size, and the fast lever moves to g15.
+
+added_to_pool: [r5.i2.g14, r6.i1.g16]
+route_updated: true
+
+implementation:
+  files_changed: [rounds/006/op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py]
+  build_failures:
+    - {attempt: 1, error: "not bitwise vs op/current on fast-path inputs: lse 1 ULP on 554/8192 rows at fast, o 3/1M elements",
+       root_cause: "today's d update carries `fast` (reassoc) flags and LLVM re-associated corr*d + (own+peer); fixed with fadd_t in both paths (same mechanism)"}

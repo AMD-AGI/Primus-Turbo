@@ -1,0 +1,6 @@
+{
+ "arm": "mmc",
+ "llvm_options_delta": {
+  "amdgpu-sched-strategy": "max-memory-clause"
+ }
+}

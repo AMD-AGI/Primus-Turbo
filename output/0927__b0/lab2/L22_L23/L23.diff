@@ -1,0 +1,14 @@
+--- base/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py	2026-09-27 12:42:45.092802504 +0000
++++ L23/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py	2026-09-27 12:43:58.640917968 +0000
+@@ -1099,9 +1099,9 @@
+                 tdm_ops.tensor_wait(0)
+             else:
+                 rocdl.s_wait_asynccnt(0)
+-            rocdl.sched_barrier(0)
++            # L23 (lab2): sched_barrier pair around the barrier deleted; ordering is kept
++            # by the gpu.barrier release/acquire fences and s_barrier side effects.
+             gpu.barrier()
+-            rocdl.sched_barrier(0)
+ 
+         def _prefetch(addr):
+             # Skip t+1 prefetch on the last tile: a dead copy into the O-epilogue slot

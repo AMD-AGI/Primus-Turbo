@@ -1,0 +1,117 @@
+p05 RESULT mode=std arm=r6_a ms=1.45566 sclk=1280/1298
+p05 RESULT mode=std arm=r4_a ms=1.54143 sclk=1280/1298
+p05 RESULT mode=std arm=r6_b ms=1.45114 sclk=1280/1298
+p05 RESULT mode=std arm=r4_b ms=1.53474 sclk=1280/1298
+p05 RESULT mode=shield arm=r6_a ms=1.07630 host_us=15.7 sclk=1298/2019
+p05 RESULT mode=shield arm=r4_a ms=1.12265 host_us=15.8 sclk=1298/2019
+p05 RESULT mode=shield arm=r6_b ms=1.06993 host_us=15.7 sclk=1298/2019
+p05 RESULT mode=shield arm=r4_b ms=1.11976 host_us=15.7 sclk=1298/2019
+p05 rc=0 newdmesg=0
+p06 RESULT mode=std arm=r4_c ms=1.53851 sclk=1250/1296
+p06 RESULT mode=std arm=r6_c ms=1.45683 sclk=1250/1296
+p06 RESULT mode=std arm=r4_d ms=1.54063 sclk=1250/1296
+p06 RESULT mode=std arm=r6_d ms=1.45723 sclk=1250/1296
+p06 RESULT mode=shield arm=r4_c ms=1.12825 host_us=15.6 sclk=1296/2026
+p06 RESULT mode=shield arm=r6_c ms=1.07209 host_us=15.6 sclk=1296/2026
+p06 RESULT mode=shield arm=r4_d ms=1.12116 host_us=15.5 sclk=1296/2026
+p06 RESULT mode=shield arm=r6_d ms=1.06632 host_us=15.6 sclk=1296/2026
+p06 rc=0 newdmesg=0
+p07 RESULT mode=std arm=r6_c ms=1.45571 sclk=1276/1297
+p07 RESULT mode=std arm=r4_c ms=1.54131 sclk=1276/1297
+p07 RESULT mode=std arm=r6_d ms=1.45506 sclk=1276/1297
+p07 RESULT mode=std arm=r4_d ms=1.53995 sclk=1276/1297
+p07 RESULT mode=shield arm=r6_c ms=1.07197 host_us=15.9 sclk=1297/2023
+p07 RESULT mode=shield arm=r4_c ms=1.12244 host_us=15.9 sclk=1297/2023
+p07 RESULT mode=shield arm=r6_d ms=1.07141 host_us=16.0 sclk=1297/2023
+p07 RESULT mode=shield arm=r4_d ms=1.11988 host_us=16.0 sclk=1297/2023
+p07 rc=0 newdmesg=0
+p08 RESULT mode=std arm=r4_d ms=1.52004 sclk=1281/1319
+p08 RESULT mode=std arm=r4_c ms=1.51988 sclk=1281/1319
+p08 RESULT mode=std arm=r4_b ms=1.51824 sclk=1281/1319
+p08 RESULT mode=std arm=r4_a ms=1.51724 sclk=1281/1319
+p08 RESULT mode=shield arm=r4_d ms=1.11543 host_us=16.2 sclk=1319/2028
+p08 RESULT mode=shield arm=r4_c ms=1.11507 host_us=16.1 sclk=1319/2028
+p08 RESULT mode=shield arm=r4_b ms=1.11279 host_us=16.2 sclk=1319/2028
+p08 RESULT mode=shield arm=r4_a ms=1.11491 host_us=16.1 sclk=1319/2028
+p08 rc=0 newdmesg=0
+p09 RESULT mode=std arm=r6_a ms=1.49584 sclk=1173/1233
+p09 RESULT mode=std arm=l12_a ms=1.43844 sclk=1173/1233
+p09 RESULT mode=std arm=r6_b ms=1.51167 sclk=1173/1233
+p09 RESULT mode=std arm=l12_b ms=1.45394 sclk=1173/1233
+p09 RESULT mode=shield arm=r6_a ms=1.07570 host_us=16.1 sclk=1233/1922
+p09 RESULT mode=shield arm=l12_a ms=1.22816 host_us=16.1 sclk=1233/1922
+p09 RESULT mode=shield arm=r6_b ms=1.07746 host_us=16.2 sclk=1233/1922
+p09 RESULT mode=shield arm=l12_b ms=1.19872 host_us=16.2 sclk=1233/1922
+p09 rc=0 newdmesg=0
+p10 RESULT mode=std arm=l12_a ms=1.45366 sclk=1252/1232
+p10 RESULT mode=std arm=r6_a ms=1.51660 sclk=1252/1232
+p10 RESULT mode=std arm=l12_b ms=1.43952 sclk=1252/1232
+p10 RESULT mode=std arm=r6_b ms=1.49452 sclk=1252/1232
+p10 RESULT mode=shield arm=l12_a ms=1.21214 host_us=16.1 sclk=1232/1920
+p10 RESULT mode=shield arm=r6_a ms=1.07646 host_us=16.2 sclk=1232/1920
+p10 RESULT mode=shield arm=l12_b ms=1.22868 host_us=16.2 sclk=1232/1920
+p10 RESULT mode=shield arm=r6_b ms=1.07149 host_us=16.0 sclk=1232/1920
+p10 rc=0 newdmesg=0
+p11 RESULT mode=std arm=r6_c ms=1.49240 sclk=1172/1232
+p11 RESULT mode=std arm=l12_c ms=1.43744 sclk=1172/1232
+p11 RESULT mode=std arm=r6_d ms=1.51496 sclk=1172/1232
+p11 RESULT mode=std arm=l12_d ms=1.45687 sclk=1172/1232
+p11 RESULT mode=shield arm=r6_c ms=1.07389 host_us=16.2 sclk=1232/1922
+p11 RESULT mode=shield arm=l12_c ms=1.23153 host_us=16.3 sclk=1232/1922
+p11 RESULT mode=shield arm=r6_d ms=1.07846 host_us=16.2 sclk=1232/1922
+p11 RESULT mode=shield arm=l12_d ms=1.18530 host_us=16.3 sclk=1232/1922
+p11 rc=0 newdmesg=0
+p12 RESULT mode=std arm=l12_d ms=1.45475 sclk=1252/1234
+p12 RESULT mode=std arm=r6_d ms=1.51515 sclk=1252/1234
+p12 RESULT mode=std arm=l12_c ms=1.43708 sclk=1252/1234
+p12 RESULT mode=std arm=r6_c ms=1.49020 sclk=1252/1234
+p12 RESULT mode=shield arm=l12_d ms=1.20950 host_us=15.8 sclk=1234/1923
+p12 RESULT mode=shield arm=r6_d ms=1.07545 host_us=15.8 sclk=1234/1923
+p12 RESULT mode=shield arm=l12_c ms=1.22913 host_us=15.7 sclk=1234/1923
+p12 RESULT mode=shield arm=r6_c ms=1.07181 host_us=15.8 sclk=1234/1923
+p12 rc=0 newdmesg=0
+p13 RESULT mode=std arm=l12_a ms=1.47758 sclk=1173/1193
+p13 RESULT mode=std arm=l12_b ms=1.47546 sclk=1173/1193
+p13 RESULT mode=std arm=l12_c ms=1.47429 sclk=1173/1193
+p13 RESULT mode=std arm=l12_d ms=1.48058 sclk=1173/1193
+p13 RESULT mode=shield arm=l12_a ms=1.19956 host_us=15.9 sclk=1193/1840
+p13 RESULT mode=shield arm=l12_b ms=1.20569 host_us=16.0 sclk=1193/1840
+p13 RESULT mode=shield arm=l12_c ms=1.20581 host_us=15.8 sclk=1193/1840
+p13 RESULT mode=shield arm=l12_d ms=1.21318 host_us=15.9 sclk=1193/1840
+p13 rc=0 newdmesg=0
+p14 RESULT mode=std arm=r4_b ms=1.55473 sclk=1173/1259
+p14 RESULT mode=std arm=r6_b ms=1.46039 sclk=1173/1259
+p14 RESULT mode=std arm=l12_b ms=1.40928 sclk=1173/1259
+p14 RESULT mode=std arm=r4_a ms=1.58602 sclk=1173/1259
+p14 RESULT mode=std arm=r6_a ms=1.51964 sclk=1173/1259
+p14 RESULT mode=std arm=l12_a ms=1.42610 sclk=1173/1259
+p14 RESULT mode=shield arm=r4_b ms=1.12529 host_us=16.3 sclk=1259/1957
+p14 RESULT mode=shield arm=r6_b ms=1.07537 host_us=16.4 sclk=1259/1957
+p14 RESULT mode=shield arm=l12_b ms=1.23850 host_us=16.4 sclk=1259/1957
+p14 RESULT mode=shield arm=r4_a ms=1.13234 host_us=16.3 sclk=1259/1957
+p14 RESULT mode=shield arm=r6_a ms=1.07810 host_us=16.3 sclk=1259/1957
+p14 RESULT mode=shield arm=l12_a ms=1.22624 host_us=16.4 sclk=1259/1957
+p14 rc=0 newdmesg=0
+p15 RESULT mode=std arm=l12_a ms=1.42522 sclk=1277/1257
+p15 RESULT mode=std arm=r6_a ms=1.51856 sclk=1277/1257
+p15 RESULT mode=std arm=r4_a ms=1.58530 sclk=1277/1257
+p15 RESULT mode=std arm=l12_b ms=1.40767 sclk=1277/1257
+p15 RESULT mode=std arm=r6_b ms=1.45755 sclk=1277/1257
+p15 RESULT mode=std arm=r4_b ms=1.55622 sclk=1277/1257
+p15 RESULT mode=shield arm=l12_a ms=1.22861 host_us=15.8 sclk=1257/1941
+p15 RESULT mode=shield arm=r6_a ms=1.07834 host_us=16.0 sclk=1257/1941
+p15 RESULT mode=shield arm=r4_a ms=1.13254 host_us=16.0 sclk=1257/1941
+p15 RESULT mode=shield arm=l12_b ms=1.21655 host_us=15.9 sclk=1257/1941
+p15 RESULT mode=shield arm=r6_b ms=1.07938 host_us=16.0 sclk=1257/1941
+p15 RESULT mode=shield arm=r4_b ms=1.13727 host_us=15.9 sclk=1257/1941
+p15 rc=0 newdmesg=0
+x01 RESULT mode=std arm=r4_a ms=0.09090 sclk=1312/1504
+x01 RESULT mode=std arm=r6_a ms=0.08789 sclk=1312/1504
+x01 RESULT mode=std arm=l12_a ms=0.09426 sclk=1312/1504
+x01 RESULT mode=std arm=r6_b ms=0.08837 sclk=1312/1504
+x01 RESULT mode=shield arm=r4_a ms=0.08629 host_us=18.0 sclk=1504/2130
+x01 RESULT mode=shield arm=r6_a ms=0.08184 host_us=18.1 sclk=1504/2130
+x01 RESULT mode=shield arm=l12_a ms=0.08717 host_us=18.0 sclk=1504/2130
+x01 RESULT mode=shield arm=r6_b ms=0.08128 host_us=18.1 sclk=1504/2130
+x01 rc=0 newdmesg=0
+BATCH1 DONE

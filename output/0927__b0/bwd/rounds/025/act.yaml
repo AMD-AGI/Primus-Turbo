@@ -1,0 +1,204 @@
+# CARRIED FORWARD from rounds/025/3-act.stale-20260927T153639/ after the framework
+# restarted the act step at 2026-09-28T01:51Z. All numbers below were measured on
+# PHYSICAL GPU 1 via container fa-g1, which no longer exists. The runner now points at
+# fa-g3 = physical GPU 3. Nothing here has been re-measured on that card.
+round: 25
+candidate: r25.i3.g77
+outcome: delivered
+
+# ---------------------------------------------------------------- correctness
+correctness:
+  unit_tests: pass                # op/ut/test_correctness.py, 15/15, full isfinite coverage
+  precision: pass
+  checked_with: op/validation.py
+  sqnr_db: 52.56                  # dq @ prod causal; 52.4-53.0 dB across all 15 UT cases
+  note: >
+    determinism also passes -- dk/dv bitwise identical across 200 runs. The reversed scan
+    does not touch the split-K reduction order, and it shows. An off-by-one in the mirrored
+    coverage would have collapsed dk/dv SQNR immediately; it did not.
+
+# ---------------------------------------------------------------- measurements
+measurements:
+  same_session_references: [rounds/020/op, rounds/019/op, rounds/017/op, job_context/op/beat]
+  benchmark: op/benchmark.py
+  device: {container: fa-g3, render_node: renderD152, physical_gpu: 3}
+  form: >-
+    TWO passes back to back, five arms each, three shapes, one process per pass
+    (.runs/step2_g3 rc 0 and .runs/step2_g3_rep rc 0). benchmark.py:132-134 interleaves arms
+    PER ITERATION with alternating order inside each shape, so every arm of a shape reads the
+    same clock, visible as identical sclk columns per shape. flycache and every
+    rounds/*/op/__pycache__ cleared first, so all arms are from-scratch compiles. Numbers
+    below are the mean of the two passes; per-pass scores were 0.8091 and 0.8097.
+  shapes:
+    - name: fast
+      this_round_tflops: 97.527
+      best_round_tflops: 92.294
+      target_tflops: 50.348
+      champion_round: 17
+      champion_tflops: 86.808
+      champion_rebuilt: true
+      ratio: 1.0000
+      vs_champion: 1.1235
+    - name: proxy
+      this_round_tflops: 515.700
+      best_round_tflops: 573.940
+      target_tflops: 753.353
+      champion_round: 17
+      champion_tflops: 589.737
+      champion_rebuilt: true
+      ratio: 0.6845
+      vs_champion: 0.8745
+    - name: prod
+      this_round_tflops: 615.630
+      best_round_tflops: 628.411
+      target_tflops: 827.834
+      champion_round: 19
+      champion_tflops: 637.567
+      champion_rebuilt: true
+      ratio: 0.7437
+      vs_champion: 0.9656
+  score: 0.8094
+  noise_floor_pct: {prod: 0.32, proxy: 0.64, fast: 2.16}
+  regressions:
+    - {shape: proxy, vs_champion: 0.8745, within_band: false}
+    - {shape: prod,  vs_champion: 0.9656, within_band: true}
+    - {shape: fast,  vs_champion: 1.1235, within_band: true}
+  champion_bookkeeping: >-
+    state.yaml champions has FOUR keys for three spec shapes: fast 17, proxy 17, prod 19, and
+    prod_b4_s8192_hq32_hkv8_d128 20. The fourth names exactly the production geometry and
+    points at a different round from prod. Both were measured rather than choosing. The table
+    uses r19, the stricter reading at 0.9656; against the prod_b4 key vs_champion is 0.9797.
+    Both are inside the 5 percent band, so the guard verdict is unchanged. Flagged for
+    reconciliation, not resolved here.
+  superseded_measurement: >-
+    An earlier full step 2 was taken on PHYSICAL GPU 1 via container fa-g1 and scored 0.8085.
+    fa-g1 no longer exists and the job spec now names fa-g3, physical GPU 3. GPU 3 is about
+    2 percent slower on every arm, prod beat 827.8 here against 847.2 there, so the GPU-1
+    table was replaced wholesale rather than merged. It is preserved in
+    rounds/025/3-act.stale-20260927T153639/.
+  measurement_hazard: >-
+    Physical GPU 3 was idle before and after, 0 percent use and no python in fa-g3. Two
+    foreign benchmarks were on the board during pass 2, pid 2094117 in fa-g0 on physical
+    GPU 0 and pid 2094685 in fa-g2 on physical GPU 2, both forward-attention jobs, identified
+    by cgroup id against docker inspect. Neither is on GPU 3. They cannot bias a within-shape
+    ratio, but this board couples power and clock, so the pass-to-pass spread quoted as the
+    noise floor is an upper bound.
+
+# ---------------------------------------------------------------- the prediction
+prediction_check:
+  metric: prod_vs_champion_same_session
+  predicted: {from: 1.000, to: ">= 1.030"}
+  measured: 0.9656
+  held: false
+  measurement: measurements/kdkdv_locus_g3/
+  reading: >
+    The regression is ISSUE/FETCH-SIDE, not the predicted memory-side effect.
+    SQC_ICACHE_REQ for k_dkdv grew +15.22% (275,152,320 -> 317,021,440, zero spread over five
+    dispatches), while k_delta_bshd and k_dq -- the two kernels g77 did not touch -- are
+    BIT-IDENTICAL between arms. The memory instruction mix did not change at all: 160
+    buffer_load_b128, 176 loads, 128 wmma in both. All static growth is 102 extra
+    s_set_vgpr_msb bank prefixes, +19/+16 instructions in the two hot bodies, and 6 -> 7
+    blocks -- every one of which the candidate predicted would NOT happen ("k_dkdv_body_isa:
+    identical except the loop bound, the address prologue, and _ldqd's argument sign").
+
+    Consequence for round 26: g77 DOES NOT TEST the L2 phase-alignment hypothesis. It carries
+    a 15.22% fetch perturbation the hypothesis never called for, so its loss is confounded
+    and refutes nothing on that axis. The only clean evidence bounding that family is P77,
+    the independent throwaway probe: 1.83% raw, ~0 clock-normalised.
+
+    NOT claimed: that the +15.22% fetch growth CAUSED the +7.22% profiled duration growth.
+    Campaign correction 3 forbids that conversion and it is not made. No cache-hit or traffic
+    counter exists on this part at any memory level (TCC/TCP/TA/TD absent; CHC/GL1C/CHA/
+    GLARBC accepted and read exactly zero), so the memory-side half is UNMEASURABLE, not
+    refuted.
+  cell: slower_failed
+  also_expect:
+    - {row: "qmask_probe_delta_prod >= 5%  (PRIMARY falsifier)", outcome: failed,
+       measured: "1.83 percent raw, about 0 clock-normalised; the pinned arm clocked 3.2 percent higher, sclk 1876 vs 1819"}
+    - {row: "k_dkdv_body_isa identical but for bound/prologue/sign", outcome: failed,
+       measured: "+19 and +16 instrs, 6 -> 7 blocks, s_set_vgpr_msb 393 -> 495"}
+    - {row: "last_prefetch_load_index_in_body unchanged", outcome: failed, measured: "189 -> 192"}
+    - {row: "prod_B1 >= 1.5x the end-to-end delta (backfill test)", outcome: sign_inverted,
+       measured: "B=1 -5.57%, B=2 -3.01%, B=4 -1.80%: magnitude 3.1x, but WORST where alignment is cleanest"}
+    - {row: "fast inside floor (h5)", outcome: failed, measured: "+12.35 percent vs champion on GPU 3"}
+    - {row: "spill: 0", outcome: held, measured: 0}
+    - {row: "wmma_per_body: 64", outcome: held, measured: 64}
+
+# ---------------------------------------------------------------- what actually got built
+implementation:
+  files_changed: [rounds/025/op/kernels.py, rounds/025/op/impl.py]
+  summary: >
+    k_dkdv's q loop walks its query pairs from the TOP of the range downwards instead of
+    upwards. Four surgical replacements in kernels.py, each applied under an
+    `assert s.count(old) == 1`: qloop_mask's induction variable, qloop_full's consumed AND
+    g62 depth-2 prefetch pair, the non-PARTIAL (prod) dispatch, and the PARTIAL (fast/proxy)
+    split-K dispatch. impl.py carries only the h33 defect-a assert. The three h33 defect
+    fixes ride under the arm and are measured out: the A/B base is the h33-patched code.
+  deviation_from_plan: >
+    (1) PREDICTION REVISED PRE-BUILD. The plan's own PRIMARY falsifier (P77, pass bar >= 5%)
+    returned 1.83% raw / ~0 clock-normalised, refuting `>= 1.030` before a line was built.
+    1.83% was neither the plan's pass nor its kill (0.32% floor) and the plan gave no rule
+    for the middle, so building anyway was recorded as a DECISION with grounds and the
+    prediction revised to `<= 1.018` BEFORE measuring. The bound held; the central estimate
+    ("inside the floor") was wrong in sign -- it is a clear loss.
+    (2) LOOP ORDER INVERTED. Under a descending scan the masked pairs are the LOWEST, so
+    qloop_mask runs after qloop_full and the r9.i1.g25 two-pair prologue moved from between
+    the loops to ahead of both. Flagged at Step 0. qloop_mask carries no prefetch
+    (carry=False), so no handoff needed re-plumbing.
+    (3) PARTIAL's split-K chunks are mirrored from the top (_qt0 = nqt2-1-_off) rather than
+    walked up from qp_start+nmaskp. Same partition of the same pairs, opposite direction.
+    (4) The `also_expect` ISA-neutrality rows were NOT met (see prediction_check.also_expect).
+    The candidate's central structural claim -- that this arm "does not test pool rule 1 at
+    all" -- is FALSE AS BUILT: the last prefetch load moved 189 -> 192 by register-allocator
+    accident, and pool rule 1 holds for an eighth time.
+    (5) k_dkdv's ISA VGPR count is 904 in BOTH arms (descriptor column 456 x 2 = 912),
+    not the campaign's 740. Occupancy conclusion (1 wave/SIMD) unaffected.
+  build_failures: []
+  build_note: >
+    No build failures. First compile, first UT pass, first validation pass. The absence is
+    itself the entry: this change adds no memory-space op, no intrinsic and no layout -- it
+    is index arithmetic on a loop that already existed, which is exactly what Step 0
+    concluded.
+
+# ---------------------------------------------------------------- abandonment
+abandoned: null
+
+guards: []            # op.guards in the spec is an empty list; no unscored shapes exist
+
+validation:
+  exit_code: 2
+  # NOT 0/1. validation.py returns 2 for the SPEED gate specifically. Run through the runner
+  # against rounds/025/op explicitly (.runs/step4_validation_g3) -- never the default
+  # op/current/, which is round 20's code and would be graded and reported as this round's
+  # with nothing in the output to say so.
+  ran_against: rounds/025/op
+  device: {container: fa-g3, physical_gpu: 3}
+  detail: {correctness: pass, determinism: pass, speed: FAIL, geomean_x_beat: 0.943}
+  per_shape_x_beat: {fast: 1.693, proxy: 0.678, prod: 0.731}
+  sqnr_prod_db: {dq: 52.56, dk: 52.60, dv: 52.71}
+  corroboration: >-
+    Three independent full validations now agree: 0.946 and 0.943 on physical GPU 1, and
+    0.943 here on physical GPU 3. The gate verdict is stable across both cards.
+
+disposition: >
+  The losing implementation STAYS in rounds/025/op per the standing rule -- reverting it
+  would destroy the only copy of what was learned and make the round indistinguishable from
+  one that built nothing. Correction 4 independently forbids promoting it.
+
+for_facts_md:
+  - >
+    A pure index-direction change is NOT ISA-neutral in this backend. Mirroring an induction
+    variable with net-zero arithmetic (s_add_co_i32 -1 / s_sub_co_i32 +1), adding no memory
+    operations, still moved the register allocator by 102 bank-switch prefixes, the hot body
+    by 19 instructions, and DYNAMIC INSTRUCTION FETCH by 15.22%. Any future candidate whose
+    argument is "this is just a reindex, the code is the same" is making a claim this round
+    measured to be false. SQC_ICACHE_REQ is the one-PMC-pass gate that catches it.
+  - >
+    Pool rule 1 survives an eighth test, and survived it BY ACCIDENT. g77 was selected partly
+    because it was believed to sit off that axis; it landed on it anyway, via the register
+    allocator rather than via the source.
+  - >
+    P77 (address-pin probe) is the first direct evidence on this host that memory traffic and
+    core clock are COUPLED: the pinned arm ran 3.2% faster in raw time while clocking 3.2%
+    higher, netting ~0. This strengthens the reviewer's side of the unresolved r25.i0.C2
+    disagreement.

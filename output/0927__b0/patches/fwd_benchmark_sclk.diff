@@ -1,0 +1,25 @@
+--- /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-20260925-114644/job_context/op/benchmark.py.bak.pre-b0-sclk	2026-09-27 12:05:00.375905848 +0000
++++ /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/job_context/op/benchmark.py	2026-09-27 12:05:00.376020095 +0000
+@@ -50,7 +50,21 @@
+ 
+ 
+ def sclk_mhz():
+-    """Current shader clock, or -1 if it cannot be read."""
++    """Current shader clock of the card under test, or -1 if it cannot be read.
++
++    B0 runs one container per card (fa-gN, OE_PHYS_GPU=N). rocm-smi reads sysfs for every
++    card and its first sclk line is GPU[0], so read this card's pp_dpm_sclk directly.
++    """
++    phys = os.environ.get("OE_PHYS_GPU")
++    if phys is not None:
++        try:
++            with open(f"/sys/class/drm/renderD{128 + 8 * int(phys)}/device/pp_dpm_sclk") as f:
++                for line in f:
++                    if line.rstrip().endswith("*"):
++                        return int(line.split(":")[1].strip().split("Mhz")[0])
++        except Exception:
++            pass
++        return -1
+     try:
+         out = subprocess.run([ROCM_SMI, "--showclocks"], capture_output=True, text=True,
+                              timeout=30).stdout

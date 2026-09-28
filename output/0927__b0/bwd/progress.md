@@ -1,0 +1,11 @@
+# B0 bwd job progress (gfx1250-flydsl-attn-bwd-20260917-115934, physical GPU 1 / fa-g1)
+
+prod FLOP 5.498229e12; ms = FLOP / TF/s. All figures are the round's own same-session measurement on B0.
+Champion before B0: round 20 (A0 511 TF/s; B0 re-measure ~633-650 TF/s, 0.74-0.76x ASM).
+
+| round | mode | UTC | accepted | prod TF/s (ms) | same-session champion prod | gain (geomean) | % ASM (prod) | proxy / fast TF/s | conclusion |
+|---|---|---|---|---|---|---|---|---|---|
+| 24 | fast | 12:34-13:32 | no | 638.8 (8.607) | 650.2 (8.456) | 0.9665 | 75.0% (champ 76.3%) | 578.1 / 93.5 | h60 unroll -4.5% DEAD; X1 0.804x (4-wave cost = barrier re-alignment); X2 0.872x DEAD; h33 defects a/b/c shipped in round tree only |
+| 25 | deep | 09-27 13:42 -> 09-28 02:39 (act re-run on GPU3 after day-1 stop) | no | 615.6 (8.931) | 637.6 (8.624) | prod 0.9656 / geomean 0.9878 | 74.4% (champ 77.0%) | 515.7 / 97.5 | g77 L2 phase-align via reversed scan: -3.4% prod; confounded by register allocation (I-fetch +15.2%, bit-identical on GPU1 and GPU3); family not decided |
+| 26 | fast | 09-28 02:52-03:54 | no | 640.0 (8.591) | 638.6 (8.610) | +0.21% prod / 1.0036 (< 1.007) | 76.5% (champ 76.4%) | 596.2 / 97.3 | armA (g62+h33 clamp form) null; g82/g83 abandoned at free gates; h33 clamps are a correctness fix with a VGPR cost |
+| ruler | audit | 09-28 03:02-04:19 | -- | -- | -- | blocked harness installed; FlyDSL-vs-ASM interleave bias ~3.4% (x-beat ~3% too low), FlyDSL-vs-FlyDSL <0.4%; **r19 1.7% faster than r20 at prod** (h67); r25 loss confirmed | -- | ~78.8% (blocked beat/current 0.7878) | -- | -- |

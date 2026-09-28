@@ -1,0 +1,76 @@
+$ python validation.py /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/008/op
+(cwd /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/job_context/op)
+exit 2
+
+--- stdout ---
+validation  impl=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/008/op
+  spec gfx1250-flydsl-attn-fwd_final.yaml: precision 49.0 dB, beat margin 0.0% -> bar 1.0000x beat
+  ENV TORCH_BLAS_PREFER_HIPBLASLT=1 HIPBLASLT_TENSILE_LIBPATH=/home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250
+correctness (o and lse separately, vs op/eager):
+  fast             causal o 1048576/1048576   51.23 dB  lse 8192/8192   85.48 dB  ref=refcache  PASS
+  proxy            causal o 16777216/16777216   50.89 dB  lse 131072/131072   88.24 dB  ref=refcache  PASS
+  prod             causal o 134217728/134217728   50.83 dB  lse 1048576/1048576   89.20 dB  ref=refcache  PASS
+  toy              causal o 65536/65536   51.86 dB  lse 512/512   81.85 dB  ref=eager (no cache)  PASS
+  toy              full   o 65536/65536   50.18 dB  lse 512/512   85.17 dB  ref=eager (non-causal)  PASS
+  short_q          causal o 65536/65536   49.93 dB  lse 512/512   86.44 dB  ref=eager (no cache)  PASS
+  short_q          full   o 65536/65536   49.82 dB  lse 512/512   86.73 dB  ref=eager (non-causal)  PASS
+  gqa4_batch2      causal o 524288/524288   51.76 dB  lse 4096/4096   81.51 dB  ref=eager (no cache)  PASS
+  gqa4_batch2      full   o 524288/524288   50.18 dB  lse 4096/4096   85.30 dB  ref=eager (non-causal)  PASS
+  mha              causal o 131072/131072   51.60 dB  lse 1024/1024   81.18 dB  ref=eager (no cache)  PASS
+  mha              full   o 131072/131072   49.98 dB  lse 1024/1024   85.15 dB  ref=eager (non-causal)  PASS
+  unequal_seqlen   causal o 524288/524288   49.98 dB  lse 4096/4096   87.38 dB  ref=eager (no cache)  PASS
+  unequal_seqlen   full   o 524288/524288   49.98 dB  lse 4096/4096   87.87 dB  ref=eager (non-causal)  PASS
+  unequal_seqlen2  causal o 1048576/1048576   49.97 dB  lse 8192/8192   88.36 dB  ref=eager (no cache)  PASS
+  unequal_seqlen2  full   o 1048576/1048576   50.00 dB  lse 8192/8192   88.79 dB  ref=eager (non-causal)  PASS
+  sq_gt_skv        full   o 1048576/1048576   49.99 dB  lse 8192/8192   86.70 dB  ref=eager (non-causal)  PASS
+determinism:
+  200 runs at fast: 200/200 bitwise identical, o=26a89a2db0cd lse=d6ac8da1e101  PASS
+speed (benchmark.py, candidate and beat in one process per shape):
+    # arm candidate -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/008/op  impl=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/008/op/impl.py kernel=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/008/op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py O_VARIANT=v3
+    # arm beat -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/job_context/op/beat  impl=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/job_context/op/beat/impl.py
+    # ENV TORCH_BLAS_PREFER_HIPBLASLT=1 HIPBLASLT_TENSILE_LIBPATH=/home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250
+    RESULT shape=fast arm=candidate stat=median iters=101 latency_ms=0.01667 min_ms=0.01462 max_ms=0.09422 tflops=128.99 bw_gbs=314.6 flop=2149580800.0 bytes_min=5242880 sclk_start=2305 sclk_end=2305 causal=True
+    RESULT shape=fast arm=beat stat=median iters=101 latency_ms=0.01378 min_ms=0.01338 max_ms=0.04078 tflops=155.99 bw_gbs=380.47 flop=2149580800.0 bytes_min=5242880 sclk_start=2305 sclk_end=2305 causal=True
+  fast   candidate    129.0 TF/s (0.0167 ms)  beat    156.0 TF/s (0.0138 ms)  ratio 0.8269  sclk 2305->2305  [median of 101]
+    # arm candidate -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/008/op  impl=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/008/op/impl.py kernel=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/008/op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py O_VARIANT=v3
+    # arm beat -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/job_context/op/beat  impl=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/job_context/op/beat/impl.py
+    # ENV TORCH_BLAS_PREFER_HIPBLASLT=1 HIPBLASLT_TENSILE_LIBPATH=/home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250
+    RESULT shape=proxy arm=candidate stat=median iters=101 latency_ms=0.09034 min_ms=0.07968 max_ms=0.14766 tflops=1521.79 bw_gbs=928.6 flop=137472507904.0 bytes_min=83886080 sclk_start=1130 sclk_end=1279 causal=True
+    RESULT shape=proxy arm=beat stat=median iters=101 latency_ms=0.08389 min_ms=0.07936 max_ms=0.1048 tflops=1638.8 bw_gbs=1000.0 flop=137472507904.0 bytes_min=83886080 sclk_start=1130 sclk_end=1279 causal=True
+  proxy  candidate   1521.8 TF/s (0.0903 ms)  beat   1638.8 TF/s (0.0839 ms)  ratio 0.9286  sclk 1130->1279  [median of 101]
+    # arm candidate -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/008/op  impl=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/008/op/impl.py kernel=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/008/op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py O_VARIANT=v3
+    # arm beat -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/job_context/op/beat  impl=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/job_context/op/beat/impl.py
+    # ENV TORCH_BLAS_PREFER_HIPBLASLT=1 HIPBLASLT_TENSILE_LIBPATH=/home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250
+    RESULT shape=prod arm=candidate stat=median iters=101 latency_ms=1.58001 min_ms=1.19543 max_ms=1.72014 tflops=1391.95 bw_gbs=424.74 flop=2199291691008.0 bytes_min=671088640 sclk_start=1002 sclk_end=1146 causal=True
+    RESULT shape=prod arm=beat stat=median iters=101 latency_ms=1.23241 min_ms=1.07338 max_ms=1.28096 tflops=1784.55 bw_gbs=544.54 flop=2199291691008.0 bytes_min=671088640 sclk_start=1002 sclk_end=1146 causal=True
+  prod   candidate   1392.0 TF/s (1.5800 ms)  beat   1784.5 TF/s (1.2324 ms)  ratio 0.7800  sclk 1002->1146  [median of 101]
+  sweep geomean candidate/beat = 0.8429  bar 1.0000  FAIL
+FAILED (1):
+  - speed: geomean candidate/beat 0.8429 < bar 1.0000 (fast 0.8269, proxy 0.9286, prod 0.7800)
+
+--- stderr ---
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+

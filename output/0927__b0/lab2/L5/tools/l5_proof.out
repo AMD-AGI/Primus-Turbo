@@ -1,0 +1,41 @@
+configs checked (x2 arms): 57806; P1-P5 hold for champion and L5 in every one
+aggregate KV-tile visits over the sweep (champion, L5, #configs where L5 visits MORE):
+  causal  gqa= 1       79995      77201  (-3.49%)  worse_in=0
+  causal  gqa= 2      134307     130979  (-2.48%)  worse_in=0
+  causal  gqa= 4      242979     239585  (-1.40%)  worse_in=0
+  causal  gqa= 8      462449     457713  (-1.02%)  worse_in=0
+  causal  gqa=16      896457     892609  (-0.43%)  worse_in=0
+  causal  gqa=32     1764781    1762663  (-0.12%)  worse_in=0
+  causal  gqa=64     3505063    3504347  (-0.02%)  worse_in=0
+  nc      gqa= 1      167080     167080  (+0.00%)  worse_in=0
+  nc      gqa= 2      306952     306952  (+0.00%)  worse_in=0
+  nc      gqa= 4      587580     587580  (+0.00%)  worse_in=0
+  nc      gqa= 8     1149328    1149328  (+0.00%)  worse_in=0
+  nc      gqa=16     2271528    2271528  (+0.00%)  worse_in=0
+  nc      gqa=32     4516334    4516334  (+0.00%)  worse_in=0
+  nc      gqa=64     9006030    9006030  (+0.00%)  worse_in=0
+  win128  gqa= 1       21966      22985  (+4.64%)  worse_in=885
+  win128  gqa= 2       29882      30267  (+1.29%)  worse_in=539
+  win128  gqa= 4       44666      45664  (+2.23%)  worse_in=577
+  win128  gqa= 8       76324      76505  (+0.24%)  worse_in=486
+  win128  gqa=16      137425     137527  (+0.07%)  worse_in=402
+  win128  gqa=32      258464     258929  (+0.18%)  worse_in=395
+  win128  gqa=64      498049     500700  (+0.53%)  worse_in=818
+scored shapes (B folds out; visits per (b, kv_head)):
+  fast  sq=1024 gqa=4 gx=16 pad=0 pad_w=0 row map identical=True visits 136 -> 136
+  proxy sq=4096 gqa=4 gx=64 pad=0 pad_w=0 row map identical=True visits 2080 -> 2080
+  prod  sq=8192 gqa=4 gx=128 pad=0 pad_w=0 row map identical=True visits 8256 -> 8256
+ragged examples (causal, sq == skv):
+  sq=8100 gqa=4 pad=112 pad_w=96 visits 8128 -> 8128 (+0.00%)
+  sq=8100 gqa=1 pad=92 pad_w=64 visits 2111 -> 2080 (-1.47%)
+  sq=8000 gqa=1 pad=192 pad_w=192 visits 2109 -> 2016 (-4.41%)
+  sq=8160 gqa=1 pad=32 pad_w=32 visits 2112 -> 2112 (+0.00%)
+  sq=4000 gqa=2 pad=192 pad_w=192 visits 1055 -> 1024 (-2.94%)
+  sq=3000 gqa=1 pad=72 pad_w=64 visits 311 -> 300 (-3.54%)
+  sq=8100 gqa=8 pad=224 pad_w=224 visits 16256 -> 16256 (+0.00%)
+ragged examples (causal bottom-right, sq != skv):
+  sq=8100 skv=8192 gqa=4 pad_w=96 visits 8381 -> 8381 (+0.00%)
+  sq=1000 skv=4096 gqa=4 pad_w=96 visits 919 -> 904 (-1.63%)
+  sq=4000 skv=4096 gqa=1 pad_w=96 visits 574 -> 544 (-5.23%)
+  sq=8100 skv=8192 gqa=1 pad_w=64 visits 2174 -> 2143 (-1.43%)
+PROOF_OK

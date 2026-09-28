@@ -1,0 +1,42 @@
+## XCD model: xcd = lin % 8; per-XCD = distinct (b,kvh) groups on each XCD
+prod           causal WGs= 4096 gyz= 32 | off: groups/XCD max   4 span 1064 | bmajor: groups/XCD max   4 span 1064 | spread: groups/XCD max  32 span 1064
+prod           nc     WGs= 4096 gyz= 32 | off: groups/XCD max   4 span 2080 | bmajor: groups/XCD max   4 span 2080 | spread: groups/XCD max  32 span 2080
+proxy          causal WGs=  512 gyz=  8 | off: groups/XCD max   1 span 69 | bmajor: groups/XCD max   1 span 69 | spread: groups/XCD max   8 span 69
+proxy          nc     WGs=  512 gyz=  8 | off: groups/XCD max   1 span 132 | bmajor: groups/XCD max   1 span 132 | spread: groups/XCD max   8 span 132
+fast           causal WGs=   32 gyz=  2 | off: groups/XCD max   1 span 18 | bmajor: groups/XCD max   1 span 18 | spread: groups/XCD max   1 span 18
+fast           nc     WGs=   32 gyz=  2 | off: groups/XCD max   1 span 18 | bmajor: groups/XCD max   1 span 18 | spread: groups/XCD max   1 span 18
+prod_g1        causal WGs= 4096 gyz=128 | off: groups/XCD max  16 span 1088 | bmajor: groups/XCD max  16 span 1088 | spread: groups/XCD max 128 span 1088
+prod_g1        nc     WGs= 4096 gyz=128 | off: groups/XCD max  16 span 2080 | bmajor: groups/XCD max  16 span 2080 | spread: groups/XCD max 128 span 2080
+proxy_g1       causal WGs=  512 gyz= 32 | off: groups/XCD max   4 span 72 | bmajor: groups/XCD max   4 span 72 | spread: groups/XCD max  32 span 72
+proxy_g1       nc     WGs=  512 gyz= 32 | off: groups/XCD max   4 span 132 | bmajor: groups/XCD max   4 span 132 | spread: groups/XCD max  32 span 132
+fast_g1        causal WGs=   32 gyz=  8 | off: groups/XCD max   1 span 18 | bmajor: groups/XCD max   1 span 18 | spread: groups/XCD max   4 span 18
+fast_g1        nc     WGs=   32 gyz=  8 | off: groups/XCD max   1 span 18 | bmajor: groups/XCD max   1 span 18 | spread: groups/XCD max   4 span 18
+toy            causal WGs=    2 gyz=  1 | off: groups/XCD max   1 span 6 | bmajor: groups/XCD max   1 span 6 | spread: groups/XCD max   1 span 6
+toy            nc     WGs=    2 gyz=  1 | off: groups/XCD max   1 span 6 | bmajor: groups/XCD max   1 span 6 | spread: groups/XCD max   1 span 6
+short_q        causal WGs=    2 gyz=  1 | off: groups/XCD max   1 span 10 | bmajor: groups/XCD max   1 span 10 | spread: groups/XCD max   1 span 10
+short_q        nc     WGs=    2 gyz=  1 | off: groups/XCD max   1 span 10 | bmajor: groups/XCD max   1 span 10 | spread: groups/XCD max   1 span 10
+gqa4_batch2    causal WGs=   16 gyz=  4 | off: groups/XCD max   1 span 6 | bmajor: groups/XCD max   1 span 6 | spread: groups/XCD max   2 span 6
+gqa4_batch2    nc     WGs=   16 gyz=  4 | off: groups/XCD max   1 span 6 | bmajor: groups/XCD max   1 span 6 | spread: groups/XCD max   2 span 6
+mha            causal WGs=    4 gyz=  4 | off: groups/XCD max   1 span 6 | bmajor: groups/XCD max   1 span 6 | spread: groups/XCD max   1 span 6
+mha            nc     WGs=    4 gyz=  4 | off: groups/XCD max   1 span 6 | bmajor: groups/XCD max   1 span 6 | spread: groups/XCD max   1 span 6
+unequal_seqlen causal WGs=   16 gyz=  2 | off: groups/XCD max   1 span 18 | bmajor: groups/XCD max   1 span 18 | spread: groups/XCD max   1 span 18
+unequal_seqlen nc     WGs=   16 gyz=  2 | off: groups/XCD max   1 span 18 | bmajor: groups/XCD max   1 span 18 | spread: groups/XCD max   1 span 18
+unequal2       causal WGs=   32 gyz=  2 | off: groups/XCD max   1 span 34 | bmajor: groups/XCD max   1 span 34 | spread: groups/XCD max   1 span 34
+unequal2       nc     WGs=   32 gyz=  2 | off: groups/XCD max   1 span 34 | bmajor: groups/XCD max   1 span 34 | spread: groups/XCD max   1 span 34
+sq_gt_skv      nc     WGs=   32 gyz=  2 | off: groups/XCD max   1 span 10 | bmajor: groups/XCD max   1 span 10 | spread: groups/XCD max   1 span 10
+odd129         causal WGs= 4128 gyz= 32 | off: groups/XCD max   4 span 1083 | bmajor: groups/XCD max   4 span 1083 | spread: groups/XCD max  32 span 1083
+odd129         nc     WGs= 4128 gyz= 32 | off: groups/XCD max   4 span 2227 | bmajor: groups/XCD max   4 span 2227 | spread: groups/XCD max  32 span 2227
+odd_tail       causal WGs=  336 gyz= 16 | off: groups/XCD max   2 span 23 | bmajor: groups/XCD max   2 span 23 | spread: groups/XCD max  16 span 23
+odd_tail       nc     WGs=  336 gyz= 16 | off: groups/XCD max   2 span 46 | bmajor: groups/XCD max   2 span 46 | spread: groups/XCD max  16 span 46
+gyz12          causal WGs=  384 gyz= 12 | off: groups/XCD max   3 span 34 | bmajor: groups/XCD max   3 span 34 | spread: groups/XCD max  12 span 34
+gyz12          nc     WGs=  384 gyz= 12 | off: groups/XCD max   3 span 68 | bmajor: groups/XCD max   3 span 68 | spread: groups/XCD max  12 span 68
+gyz24          causal WGs= 3072 gyz= 24 | off: groups/XCD max   3 span 415 | bmajor: groups/XCD max   3 span 415 | spread: groups/XCD max  24 span 415
+gyz24          nc     WGs= 3072 gyz= 24 | off: groups/XCD max   3 span 792 | bmajor: groups/XCD max   3 span 792 | spread: groups/XCD max  24 span 792
+gyz40          causal WGs= 1280 gyz= 40 | off: groups/XCD max   5 span 54 | bmajor: groups/XCD max   5 span 54 | spread: groups/XCD max  40 span 54
+gyz40          nc     WGs= 1280 gyz= 40 | off: groups/XCD max   5 span 90 | bmajor: groups/XCD max   5 span 90 | spread: groups/XCD max  40 span 90
+b3_mha         causal WGs=  144 gyz= 48 | off: groups/XCD max   6 span 14 | bmajor: groups/XCD max   6 span 14 | spread: groups/XCD max  18 span 14
+b3_mha         nc     WGs=  144 gyz= 48 | off: groups/XCD max   6 span 14 | bmajor: groups/XCD max   6 span 14 | spread: groups/XCD max  18 span 14
+gyz6           causal WGs=   48 gyz=  6 | off: groups/XCD max   3 span 10 | bmajor: groups/XCD max   3 span 10 | spread: groups/XCD max   5 span 10
+gyz6           nc     WGs=   48 gyz=  6 | off: groups/XCD max   3 span 10 | bmajor: groups/XCD max   3 span 10 | spread: groups/XCD max   5 span 10
+exhaustive sweep gx<20 gy<18 gz<7: 3876 grid x mode bijections, fails=0
+ALL OK

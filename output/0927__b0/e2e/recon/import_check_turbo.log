@@ -1,0 +1,24 @@
+Traceback (most recent call last):
+  File "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/recon/import_check_turbo.py", line 11, in <module>
+    import primus_turbo.pytorch as pt
+  File "/home/lihuzhan/code/2026_0903__turbo/wt-bakeoff/primus_turbo/pytorch/__init__.py", line 11, in <module>
+    import primus_turbo.pytorch.modules
+  File "/home/lihuzhan/code/2026_0903__turbo/wt-bakeoff/primus_turbo/pytorch/modules/__init__.py", line 7, in <module>
+    from .attention import *
+  File "/home/lihuzhan/code/2026_0903__turbo/wt-bakeoff/primus_turbo/pytorch/modules/attention.py", line 12, in <module>
+    from primus_turbo.pytorch.ops.attention import (
+  File "/home/lihuzhan/code/2026_0903__turbo/wt-bakeoff/primus_turbo/pytorch/ops/__init__.py", line 19, in <module>
+    from .attention import *
+  File "/home/lihuzhan/code/2026_0903__turbo/wt-bakeoff/primus_turbo/pytorch/ops/attention/__init__.py", line 17, in <module>
+    from .sparse_mla_interface import sparse_mla_func
+  File "/home/lihuzhan/code/2026_0903__turbo/wt-bakeoff/primus_turbo/pytorch/ops/attention/sparse_mla_interface.py", line 29, in <module>
+    from primus_turbo.pytorch.kernels.attention.sparse_mla_impl import (
+  File "/home/lihuzhan/code/2026_0903__turbo/wt-bakeoff/primus_turbo/pytorch/kernels/attention/sparse_mla_impl.py", line 25, in <module>
+    from primus_turbo.flydsl.attention.sparse_mla_bwd import sparse_mla_bwd_flydsl
+  File "/home/lihuzhan/code/2026_0903__turbo/wt-bakeoff/primus_turbo/flydsl/attention/sparse_mla_bwd.py", line 26, in <module>
+    from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
+ImportError: cannot import name 'buffer_ops' from 'flydsl.expr' (/home/lihuzhan/.local/flydsl0341/flydsl/expr/__init__.py)
+flydsl 0.3.4.1 /home/lihuzhan/.local/flydsl0341/flydsl/__init__.py
+flydsl still 0.3.4.1 /home/lihuzhan/.local/flydsl0341/flydsl/__init__.py
+flydsl-importing primus_turbo modules: ['primus_turbo.flydsl', 'primus_turbo.flydsl.attention']
+elapsed 0.9s

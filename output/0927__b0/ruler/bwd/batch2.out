@@ -1,0 +1,42 @@
+BI1 rc=0 (via batch1)
+C01 rc=0 newdmesg=0 bad=0
+  current 8.750550746917725 sclk 1816-1793 blocked9+lead4
+  r024 8.746304512023926 sclk 1816-1793 blocked9+lead4
+  r025 8.918401718139648 sclk 1816-1793 blocked9+lead4
+  r019 8.604432582855225 sclk 1816-1793 blocked9+lead4
+BB1 rc=0 newdmesg=0 bad=0
+  current 8.773146629333496 sclk 1723-1767 blocked9+lead4
+  beat 6.909413576126099 sclk 1723-1767 blocked9+lead4
+C02 rc=0 newdmesg=0 bad=0
+  r019 8.617292404174805 sclk 1776-1832 blocked9+lead4
+  r025 8.946225643157959 sclk 1776-1832 blocked9+lead4
+  r024 8.76194953918457 sclk 1776-1832 blocked9+lead4
+  current 8.76633596420288 sclk 1776-1832 blocked9+lead4
+BI2 rc=0 newdmesg=0 bad=0
+  beat 6.774150848388672 sclk 1780-1760 interleaved
+  current 8.915840148925781 sclk 1780-1760 interleaved
+C03 rc=0 newdmesg=0 bad=0
+  r024 8.751553535461426 sclk 1885-1782 blocked9+lead4
+  current 8.750451564788818 sclk 1885-1782 blocked9+lead4
+  r019 8.592094898223877 sclk 1885-1782 blocked9+lead4
+  r025 8.908247947692871 sclk 1885-1782 blocked9+lead4
+BB2 rc=0 newdmesg=0 bad=0
+  beat 6.900160074234009 sclk 1781-1751 blocked9+lead4
+  current 8.767758846282959 sclk 1781-1751 blocked9+lead4
+CI1 rc=0 newdmesg=0 bad=0
+  current 8.749831199645996 sclk 1809-1814 interleaved
+  r024 8.750150680541992 sclk 1809-1814 interleaved
+  r025 8.932024002075195 sclk 1809-1814 interleaved
+  r019 8.591593742370605 sclk 1809-1814 interleaved
+BI3 rc=0 newdmesg=0 bad=0
+  current 8.854667663574219 sclk 1726-1762 interleaved
+  beat 6.763615131378174 sclk 1726-1762 interleaved
+BB3 rc=0 newdmesg=0 bad=0
+  beat 6.9235944747924805 sclk 1779-1744 blocked9+lead4
+  current 8.777692794799805 sclk 1779-1744 blocked9+lead4
+CI2 rc=0 newdmesg=0 bad=0
+  r019 8.609339714050293 sclk 1774-1821 interleaved
+  r025 8.983741760253906 sclk 1774-1821 interleaved
+  r024 8.763530731201172 sclk 1774-1821 interleaved
+  current 8.765534400939941 sclk 1774-1821 interleaved
+BATCH-DONE

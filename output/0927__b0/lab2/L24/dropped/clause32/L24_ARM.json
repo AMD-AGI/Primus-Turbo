@@ -1,0 +1,6 @@
+{
+ "arm": "clause32",
+ "llvm_options_delta": {
+  "amdgpu-max-memory-clause": 32
+ }
+}

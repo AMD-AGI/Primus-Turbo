@@ -1,0 +1,138 @@
+--- benchmark.orig.py	2026-09-28 03:01:41.385515175 +0000
++++ benchmark.py	2026-09-28 04:19:18.933863206 +0000
+@@ -21,9 +21,16 @@
+   warmup       --warmup-seconds of CONTINUOUS load per arm, seconds not iterations, with
+                no sleeps anywhere: a paced or short warmup reads up to 40% off and is not
+                uniform across candidates, which is enough to invert a comparison.
+-  ordering     PALINDROMIC. Iteration i runs the arms forward, i+1 backward, so every arm
+-               has the same mean position. Repeating `A B C` instead convicts whichever
+-               arm runs first.
++  ordering     BLOCKED (default --block 9 --lead 4): per round each arm runs `lead` untimed
++               then `block` timed calls back to back; rounds are PALINDROMIC over arms
++               (round r forward, r+1 backward), so every arm has the same mean position.
++               --block 1 restores the old call-by-call palindromic interleave, where at
++               prod a call inherits the card state (power/clock controller, ms-scale
++               memory) left by the previous few calls of OTHER arms; identical code then
++               reads differently by position and by which other arms share the process
++               (B0 ruler audit, output/0927__b0/ruler/REPORT.md and ruler/bwd/REPORT.md).
++               With --block 1, --iters is the timed call count per arm as before; with
++               blocking it is rounded UP to a whole number of blocks.
+   inputs       one realistic input per shape, shared by every arm. Arms are compared, data
+                never is.
+   clock        sclk is read before and after every shape and printed on every line, so a
+@@ -36,6 +43,7 @@
+ from __future__ import annotations
+ 
+ import argparse
++import hashlib
+ import json
+ import os
+ import subprocess
+@@ -101,7 +109,18 @@
+     return arms
+ 
+ 
+-def measure(shape, arms, fns, iters, warmup_seconds, causal=True):
++def tree_md5(path):
++    """md5 over the arm's *.py AS LOADED: a path (e.g. op/current) is not an identity --
++    the fwd job's op/current was re-installed mid-session once and a round-to-round code
++    change read as a fake "bimodality"."""
++    h = hashlib.md5()
++    for f in sorted(Path(path).glob("*.py")):
++        h.update(f.name.encode())
++        h.update(f.read_bytes())
++    return h.hexdigest()[:8]
++
++
++def measure(shape, arms, fns, iters, warmup_seconds, causal=True, block=9, lead=4):
+     q, k, v, do = make_inputs(shape, seed=0)
+     # Was forward_reference(...). That is an fp32 Tensile GEMM at every shape including prod,
+     # in a subprocess that runs every round, and it is the dispatch that cost a power cycle
+@@ -129,15 +148,32 @@
+     sclk0 = sclk_mhz()
+     times = {label: [] for label in labels}
+     ev0, ev1 = torch.cuda.Event(True), torch.cuda.Event(True)
+-    for i in range(iters):
+-        order = labels if i % 2 == 0 else labels[::-1]
+-        for label in order:
+-            flush.zero_()
+-            ev0.record()
+-            call(label)
+-            ev1.record()
+-            ev1.synchronize()
+-            times[label].append(ev0.elapsed_time(ev1))
++
++    def timed(label):
++        flush.zero_()
++        ev0.record()
++        call(label)
++        ev1.record()
++        ev1.synchronize()
++        return ev0.elapsed_time(ev1)
++
++    if block <= 1:                             # legacy: arms interleaved call by call
++        for i in range(iters):
++            order = labels if i % 2 == 0 else labels[::-1]
++            for label in order:
++                times[label].append(timed(label))
++    else:
++        # BLOCKED: every timed call is preceded by >= `lead` calls of the SAME arm. At prod
++        # a call carries the state left by the previous few calls; interleaving call by call
++        # hands that to the neighbour arm, so identical code reads by position and by arm
++        # set (ruler/REPORT.md, ruler/bwd/REPORT.md). Rounds stay palindromic over arms.
++        rounds = -(-iters // block)
++        for r in range(rounds):
++            for label in (labels if r % 2 == 0 else labels[::-1]):
++                for _ in range(lead):
++                    timed(label)
++                for _ in range(block):
++                    times[label].append(timed(label))
+     sclk1 = sclk_mhz()
+ 
+     c = counts(shape)
+@@ -148,11 +184,12 @@
+                                                           + ts[len(ts) // 2])
+         secs = med / 1e3
+         rows.append({
+-            "shape": shape, "arm": label, "stat": STATISTIC, "iters": iters,
++            "shape": shape, "arm": label, "stat": STATISTIC, "iters": len(ts),
+             "latency_ms": med, "min_ms": ts[0], "max_ms": ts[-1],
+             "tflops": c.flop / secs / 1e12, "bw_gbs": c.bytes_min / secs / 1e9,
+             "flop": c.flop, "bytes_min": c.bytes_min,
+             "sclk_start": sclk0, "sclk_end": sclk1, "causal": bool(causal),
++            "order": "interleaved" if block <= 1 else f"blocked{block}+lead{lead}",
+         })
+     return rows
+ 
+@@ -166,6 +203,9 @@
+     ap.add_argument("--iters", type=int, default=51)
+     ap.add_argument("--warmup-seconds", type=float, default=3.0)
+     ap.add_argument("--non-causal", action="store_true")
++    ap.add_argument("--block", type=int, default=9,
++                    help="timed calls per arm per round (<=1: legacy call-by-call interleave)")
++    ap.add_argument("--lead", type=int, default=4, help="untimed same-arm calls before each block")
+     ap.add_argument("--json", help="also write every row here")
+     args = ap.parse_args()
+ 
+@@ -175,9 +215,10 @@
+     for label, path in arms:
+         if not (path / "impl.py").is_file():
+             ap.error(f"arm {label!r}: no impl.py under {path}")
+-        print(f"# arm {label} -> {path}")
++        print(f"# arm {label} -> {path} md5={tree_md5(path)}")
+     print(f"# statistic {STATISTIC}  iters {args.iters}  "
+-          f"warmup {args.warmup_seconds}s continuous  order palindromic  "
++          f"warmup {args.warmup_seconds}s continuous  order "
++          f"{'palindromic' if args.block <= 1 else f'blocked {args.block}+lead {args.lead}, palindromic rounds'}  "
+           f"device {torch.cuda.get_device_properties(0).gcnArchName}")
+ 
+     # r15 -- ONE module per arm for the WHOLE process, not one per shape.
+@@ -198,7 +239,7 @@
+     rows = []
+     for shape in [s for s in args.shapes.split(",") if s]:
+         rows += measure(shape, arms, fns, args.iters, args.warmup_seconds,
+-                        causal=not args.non_causal)
++                        causal=not args.non_causal, block=args.block, lead=args.lead)
+         for r in rows[-len(arms):]:
+             print("RESULT " + " ".join(f"{k}={v}" for k, v in r.items()), flush=True)
+     if args.json:

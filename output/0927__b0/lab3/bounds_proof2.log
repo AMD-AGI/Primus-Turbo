@@ -1,0 +1,11 @@
+B1 Sq1024 Skv1024 Hq8 Hkv2 nsp16: OK  max_idx=1048575 size=1048576 (sampled heads/batches) visits=4224
+B1 Sq1024 Skv1024 Hq8 Hkv2 nsp1: OK  max_idx=1048575 size=1048576 (sampled heads/batches) visits=4224
+B1 Sq4096 Skv4096 Hq32 Hkv8 nsp2: OK  max_idx=16777215 size=16777216 (sampled heads/batches) visits=66048
+B1 Sq4096 Skv4096 Hq32 Hkv8 nsp1: OK  max_idx=16777215 size=16777216 (sampled heads/batches) visits=66048
+B4 Sq8192 Skv8192 Hq32 Hkv8 nsp1: OK  max_idx=134217727 size=134217728 (sampled heads/batches) visits=526336
+B1 Sq512 Skv1024 Hq8 Hkv2 nsp1: OK  max_idx=524287 size=524288 (sampled heads/batches) visits=3136
+B1 Sq1024 Skv512 Hq8 Hkv2 nsp1: OK  max_idx=1048575 size=1048576 (sampled heads/batches) visits=1088
+B1 Sq1024 Skv512 Hq8 Hkv2 nsp4: OK  max_idx=1048575 size=1048576 (sampled heads/batches) visits=1088
+B1 Sq256 Skv256 Hq2 Hkv1 nsp16: OK  max_idx=65535 size=65536 (sampled heads/batches) visits=72
+B1 Sq256 Skv256 Hq2 Hkv1 nsp1: OK  max_idx=65535 size=65536 (sampled heads/batches) visits=72
+RC=0

@@ -1,0 +1,15 @@
+A02 rc=0 newdmesg=0 bad=0
+  current_copy 8.760023593902588 sclk 1779-1783 blocked9+lead4
+  current 8.757079124450684 sclk 1779-1783 blocked9+lead4
+A03 rc=0 newdmesg=0 bad=0
+  current 8.766805648803711 sclk 1778-1782 blocked9+lead4
+  current_copy 8.765423774719238 sclk 1778-1782 blocked9+lead4
+A04 rc=0 newdmesg=0 bad=0
+  current_copy 8.745436668395996 sclk 1777-1778 blocked9+lead4
+  current 8.741270065307617 sclk 1777-1778 blocked9+lead4
+I01 rc=0 newdmesg=0 bad=0
+  current 8.770989418029785 sclk 1781-1782 interleaved
+  current_copy 8.7679443359375 sclk 1781-1782 interleaved
+I02 rc=0 newdmesg=0 bad=0
+  current_copy 8.765422821044922 sclk 1774-1776 interleaved
+  current 8.772354125976562 sclk 1774-1776 interleaved

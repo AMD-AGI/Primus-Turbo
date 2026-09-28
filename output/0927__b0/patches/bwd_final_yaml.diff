@@ -1,0 +1,35 @@
+--- /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/gfx1250-flydsl-attn-bwd_final.yaml.bak.pre-b0-20260927	2026-09-27 12:06:37.264875441 +0000
++++ /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/gfx1250-flydsl-attn-bwd_final.yaml	2026-09-27 12:06:37.266748496 +0000
+@@ -221,7 +221,7 @@
+ evolve:
+   max_rounds: 40            # [user] failed rounds count against this
+   max_timeout: 48h          # [user]  [resolved] = 172800 s
+-  min_gain: 0.0             # [resolved] explicit default: anything above 1.0 counts as
++  min_gain: 0.007             # [resolved] explicit default: anything above 1.0 counts as
+                             # an improvement. Justified here rather than copied -- the
+                             # gap to the anchor is ~93x, so round gains are expected to
+                             # be integer factors, far above this machine's run-to-run
+@@ -244,7 +244,7 @@
+                                     # container's image is `fa-tune:deps`, recorded for
+                                     # provenance only -- do NOT move it into this field,
+                                     # which would make the runner own the container.
+-      container: fa-repro           # EXISTING container; the runner attaches, never
++      container: fa-g1              # B0 2026-09-27: per-card container (only renderD136 = physical GPU 1); was fa-repro. EXISTING container; the runner attaches, never
+                                     # recreates. flydsl 0.3.2 is at /home/lihuzhan/.local/flydsl032.
+                                     # [observed] Up, image fa-tune:deps, mounts
+                                     # /home/lihuzhan:/home/lihuzhan, /dev/kfd + /dev/dri,
+@@ -261,11 +261,11 @@
+   gpu_arch: gfx1250         # [observed] confirmed: rocm-smi GFX Version gfx1250,
+                             # rocminfo amdgcn-amd-amdhsa--gfx1250,
+                             # torch gcnArchName gfx1250. AMD Eng Sample 100-000001046-04.
+-  gpu_id: 0                 # [observed] usable: the only GPU on the node (device count 1)
+-  gpu_pool: []              # one card on this host. Not a placeholder.
++  gpu_id: 0                 # B0 2026-09-27: logical 0 inside fa-g1 = PHYSICAL GPU 1 (rocm-smi GPU[1], PCI 0002:04:00.0, kfd gpu_id 30548). Other 3 cards run other jobs.
++  gpu_pool: []              # B0: this job owns exactly one of 4 cards. Not a placeholder.
+   # [resolved] Everything below was observed by Job Setup on 2026-09-17 and is written
+   # here because every later stage needs it and none of it was in the job file.
+-  host: heliosr-1b114-c07-1
++  host: ctheliosp-1b112-a37-1   # B0 since 2026-09-27 (was heliosr-1b114-c07-1)
+   python_path:              # prepend IN THIS ORDER before `import flydsl` / `import aiter`
+     - /home/lihuzhan/.local/flydsl032     # flydsl 0.3.2, ahead of the image's 0.2.4
+     - /home/lihuzhan/code/aiter-src       # aiter is NOT installed in the container

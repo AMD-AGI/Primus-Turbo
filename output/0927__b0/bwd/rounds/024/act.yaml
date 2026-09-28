@@ -1,0 +1,150 @@
+round: 24
+mode: fast
+candidate: r24.i3.g75          # the h33 defect fixes (a/b/c), tree `D`; shipped in rounds/024/op
+outcome: delivered
+
+correctness:
+  unit_tests: pass              # ut/test_correctness.py --impl rounds/024/op -> 15/15 PASS
+  precision: pass               # correctness + determinism both pass inside validation.py
+  checked_with: op/validation.py
+  sqnr_db: 52.52                # worst of dq/dk/dv over fast/proxy/prod (gate 50.0); best 52.84
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/020/op, rounds/019/op, rounds/017/op, op/beat]
+  # Phase-5 session, 2026-09-27 13:20-13:28, B0 host ctheliosp-1b112-a37-1, physical GPU 1
+  # (kfd gpu_id 30548) via container fa-g1, card idle before and after, flydsl compile cache
+  # cleared before the first build, dmesg -W armed throughout with zero amdgpu events.
+  # r24_a / r24_b are two physically independent copies of rounds/024/op; every this_round
+  # figure below is their MEAN, and both raw values are in opt.md 8.2 -- a happened to be the
+  # faster slot at all three shapes, so reporting a alone would report this round high.
+  shapes:
+    - name: fast
+      this_round_tflops: 93.454        # r24_a 97.774 / r24_b 89.134 -- same-code floor 9.69%
+      best_round_tflops: 99.149        # rounds/019/op, re-measured in this session
+      beat_tflops: 51.536
+      target_tflops: 51.536            # margin 1.0
+      champion_round: 19
+      champion_tflops: 99.149
+      champion_rebuilt: true
+      ratio: 1.0                       # uncapped it is 1.8134; capped per this schema's min()
+      vs_champion: 0.9426              # BELOW the 95% floor. Reported as measured. The
+                                       # same-code floor at this shape was 9.69% this session,
+                                       # which is not an excuse and is not used as one: both
+                                       # slot figures are in the round's raw JSON.
+    - name: proxy
+      this_round_tflops: 578.056       # r24_a 579.478 / r24_b 576.635 -- floor 0.49%
+      best_round_tflops: 593.180       # rounds/017/op, re-measured in this session
+      beat_tflops: 759.421
+      target_tflops: 759.421
+      champion_round: 17
+      champion_tflops: 593.180
+      champion_rebuilt: true
+      ratio: 0.7612
+      vs_champion: 0.9745
+    - name: prod
+      this_round_tflops: 638.822       # r24_a 639.848 / r24_b 637.797 -- floor 0.32%
+      best_round_tflops: 650.246       # rounds/019/op, re-measured in this session
+      beat_tflops: 851.971
+      target_tflops: 851.971
+      champion_round: 19
+      champion_tflops: 650.246
+      champion_rebuilt: true
+      ratio: 0.7498
+      vs_champion: 0.9824              # against the incumbent rounds/020/op (638.895) it is
+                                       # 0.9999 -- a dead tie inside a 0.32% same-code floor
+  score: 0.8370                        # mean of the three capped ratios; uncapped it is 1.1081
+
+validation:
+  exit_code: 2                         # correctness pass, determinism pass, speed FAIL
+                                       # (geomean 0.978x beat). The speed gate is this job's
+                                       # standing one and the champion fails it too: `beat` is
+                                       # the aiter prebuilt gfx1250 ASM backward.
+
+explored:
+  ran:
+    - "compile-only screen (COMPILE_ONLY=1 ARCH=gfx1250 FLYDSL_GPU_ARCH=gfx1250) on cur_a/D/U"
+    - "ISA census of k_dkdv .LBB0_8 (loopcensus.py, cover2.py) -- decided arm B's gate"
+    - "g73 free gate: s_set_vgpr_msb clustering (g73gate.py) -- killed g73 and h14, zero card time"
+    - "four card sessions: D/U vs two rebuilt incumbent slots; w4/x1; nobar/x2; per-shape champions"
+    # rocprofv3 was NOT run: h4 says it faults the GPU on this op and PC sampling is banned.
+  consulted:
+    - knowledge/arch/gfx1250/isa-notes.md
+    - knowledge/arch/gfx1250/wmma-and-wave32.md
+    - knowledge/ops/attention/backward.md
+    - knowledge/backends/flydsl/attention/kernel-structure.md
+    - knowledge/backends/flydsl/attention/lds-and-transposes.md
+    - knowledge/optimization/routes/1-metrics-to-techniques.md
+    - knowledge/optimization/techniques/software-pipelining.md
+    - knowledge/optimization/techniques/loop-unrolling.md
+    - knowledge/optimization/techniques/instruction-scheduling.md
+    - knowledge/optimization/techniques/register-pressure.md
+    - knowledge/pitfalls/measurement.md
+    - knowledge/pitfalls/occupancy-myths.md
+  bound: latency
+  confidence: high
+  why: >
+    Four-for-four now: g63, g68, g71 and g72 each landed their ISA delta and lost on the card,
+    and g72 lost 4.52% at prod while its issue-slot count improved 6.8%. Bytes do not rank
+    either -- the 4-wave route cut k_dkdv's requested bytes fourfold and still measured 0.923x
+    the champion with both barriers illegally deleted. What moves this kernel is where a load
+    issues relative to its consumer inside the loop body, which is a latency verdict.
+
+arms:
+  - id: r24.i3.g75
+    built: "D alone, from op/current -- h33 defects a/b/c"
+    tflops: {fast: 93.454, proxy: 578.056, prod: 638.822}
+    vs_champion: 0.9824              # vs rounds/019/op at prod; vs the incumbent it is 0.9999
+    shipped: true
+  - id: r23.i2.g72
+    built: "U alone, from op/current -- NOT on top of D. h60's unroll of qloop_full"
+    tflops: {prod_vs_incumbent: 0.9548}
+    vs_champion: 0.9548              # -4.52% at prod against a 0.16% floor; DEAD in pool.md
+    shipped: false
+    note: "passed all three of its own free gates and h60's screen criteria, then lost 28x the floor"
+  - id: h59-X1
+    built: "census tree x1 = w4 minus barrier-1; diagnostic, not a shipping candidate"
+    tflops: {vs_w4_prod: 1.0605, vs_champion_prod: 0.804}
+    vs_champion: 0.804
+    shipped: false
+    note: "+6.05% over w4 at prod, no shape reached +15% -> h59's question answers H-align"
+  - id: h59-X2
+    built: "census tree x2 = both barriers deleted + private per-wave B ring (legal)"
+    tflops: {vs_champion_prod: 0.872}
+    vs_champion: 0.872
+    shipped: false
+  - id: h51-nobar
+    built: "census tree nobar = both barriers deleted, ILLEGAL; an upper-bound instrument"
+    tflops: {vs_champion_prod: 0.923}
+    vs_champion: 0.923
+    shipped: false
+    note: "prod floor 0.015% that session; closes the whole 4-wave/5-GEMM route, and tighter
+           than h51 had it (0.923x, not 0.950x)"
+  - id: r24.i1.g73
+    built: "NOT built -- died at its free ISA gate, zero card time"
+    tflops: {}
+    vs_champion: null
+    shipped: false
+    note: "161 prefixes carry 121 distinct operands, 62.1% singletons, no back-to-back pair;
+           perfect coalescing bounds the win at 7.8% of instruction count. Takes h14 with it."
+
+expected: >
+  Written before any of it was built. D (h33 defects a/b/c): free or near-free -- k_dkdv gains
+  only defect c's four clamps and k_dq is byte-identical, so expect prod inside the session
+  floor, and the value is the ~261 KB out-of-bounds read per launch and the silently dropped dQ
+  writes at nsp_q >= 8, not the clock. U (r23.i2.g72 / h60): h60 prices the forced drain at the
+  loop head at 67 rotation v_movs; if rule 1 binds only the cover distance, U should be worth a
+  few percent at prod. X1: h59 preregistered H-align <= +8% vs H-count >= +15% against w4.
+
+added_to_pool: [r24.i1.g73, r24.i2.g74]
+route_updated: true
+
+implementation:
+  files_changed: [op/impl.py, op/kernels.py]
+  build_failures:
+    - {attempt: 1, error: "run_screen.sh: No such file or directory (rc 127)",
+       root_cause: "B0 containers mount only /home/lihuzhan -- the brief's /tmp scratch path
+                    does not exist inside fa-g1. Real scratch moved under /home/lihuzhan,
+                    /tmp path kept as a symlink for the controller side."}
+    - {attempt: 2, error: "test_correctness.py: unrecognized arguments: <tree>, rc 2",
+       root_cause: "it takes --impl <dir>, not a positional; the tree was never loaded"}

@@ -1,0 +1,14 @@
+# arm l12_d -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/l12_d impl_mod=op_impl_2530322552263419379 kern_mod=flydsl_fwd__2530322552263419379.fmha_fwd_prefill_a16w16_m32x8
+# arm r6_d -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/r6_d impl_mod=op_impl_4541822010962018595 kern_mod=flydsl_fwd__4541822010962018595.fmha_fwd_prefill_a16w16_m32x8
+# arm l12_c -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/l12_c impl_mod=op_impl_2094057512579227111 kern_mod=flydsl_fwd__2094057512579227111.fmha_fwd_prefill_a16w16_m32x8
+# arm r6_c -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/r6_c impl_mod=op_impl_8224607090531075128 kern_mod=flydsl_fwd__8224607090531075128.fmha_fwd_prefill_a16w16_m32x8
+# PYTHONHASHSEED=0 FLYDSL_RUNTIME_CACHE_DIR=/tmp/flycache
+RESULT mode=std arm=l12_d ms=1.45475 sclk=1252/1234
+RESULT mode=std arm=r6_d ms=1.51515 sclk=1252/1234
+RESULT mode=std arm=l12_c ms=1.43708 sclk=1252/1234
+RESULT mode=std arm=r6_c ms=1.49020 sclk=1252/1234
+RESULT mode=shield arm=l12_d ms=1.20950 host_us=15.8 sclk=1234/1923
+RESULT mode=shield arm=r6_d ms=1.07545 host_us=15.8 sclk=1234/1923
+RESULT mode=shield arm=l12_c ms=1.22913 host_us=15.7 sclk=1234/1923
+RESULT mode=shield arm=r6_c ms=1.07181 host_us=15.8 sclk=1234/1923
+rc=0 newdmesg=0

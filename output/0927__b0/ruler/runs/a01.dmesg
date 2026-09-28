@@ -1,0 +1,13 @@
+[33611.376553] docker0: port 1(vethc739b25) entered blocking state
+[33611.389607] docker0: port 1(vethc739b25) entered disabled state
+[33611.402666] vethc739b25: entered allmulticast mode
+[33611.413254] vethc739b25: entered promiscuous mode
+[33611.428068] eth0: renamed from vethd3f978b
+[33611.437572] docker0: port 1(vethc739b25) entered blocking state
+[33611.450624] docker0: port 1(vethc739b25) entered forwarding state
+[33611.799255] docker0: port 1(vethc739b25) entered disabled state
+[33611.812343] vethd3f978b: renamed from eth0
+[33611.873480] docker0: port 1(vethc739b25) entered disabled state
+[33611.886775] vethc739b25 (unregistering): left allmulticast mode
+[33611.899829] vethc739b25 (unregistering): left promiscuous mode
+[33611.912691] docker0: port 1(vethc739b25) entered disabled state

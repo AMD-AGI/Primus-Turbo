@@ -1,0 +1,104 @@
+round: 8
+mode: fast
+candidate: h34                    # route row 1 (operator hint, no pool g id); shipped arm = h34-B (m16x8 gate)
+outcome: delivered
+
+correctness:
+  unit_tests: pass            # ut --determinism 200 PASS on A, B, AB; own validation.py: all 16 correctness cases PASS
+  precision: pass             # min o 49.82 dB (short_q full, = champion); verify_r6 adversarial suite on small grids 192 cases, 0 FAIL; B bitwise == r4 at fast
+  checked_with: op/validation.py
+  sqnr_db: 49.82
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/004/op, rounds/006/op, rounds/007/op]
+  shapes:                     # no beat in process (h31), 6 arms, mean of 3 rotated sessions (raw/bench_r8_agg.txt);
+                              # beat_tflops = mean of beat over the 6 gate-form processes of the same sweep
+    - name: fast
+      this_round_tflops: 139.33
+      best_round_tflops: 113.79
+      beat_tflops: 152.97
+      target_tflops: 152.97
+      champion_round: 7
+      champion_tflops: 113.79
+      champion_rebuilt: true
+      ratio: 0.9109
+      vs_champion: 1.2245     # vs incumbent r6 (107.69): x1.2938
+    - name: proxy
+      this_round_tflops: 1576.48
+      best_round_tflops: 1596.47
+      beat_tflops: 1665.02
+      target_tflops: 1665.02
+      champion_round: 7
+      champion_tflops: 1596.47
+      champion_rebuilt: true
+      ratio: 0.9468
+      vs_champion: 0.9875     # vs r6 (1585.00): x0.9946 -- same ISA as r6, inside the proxy spread (+-6% per session)
+    - name: prod
+      this_round_tflops: 1509.79
+      best_round_tflops: 1512.44
+      beat_tflops: 1790.51
+      target_tflops: 1790.51
+      champion_round: 7
+      champion_tflops: 1512.44
+      champion_rebuilt: true
+      ratio: 0.8432
+      vs_champion: 0.9982     # vs r6 (1507.68): x1.0014 -- same ISA as r6
+  score: 0.9003               # same sweep: r6 0.8327, r7 0.8491, r4 0.8237. Gate form (X/beat): B .833/.933/.776 vs r6 .622/.931/.775
+  note: >
+    Median of 101, unprofiled, one process per shape, fa-g0 GPU 0 idle before and after (only other KFD pid is on
+    another card). sclk fast 2305-2315, proxy 1292->1557, prod 1242->1278, the same for every arm in a process. Champions
+    are the best of r4/r6/r7 re-measured in this sweep (r7 was not accepted, but it is the fastest re-measured tree on
+    all three shapes). B's prod/proxy m32x8 ISA is byte-identical to r6's.
+
+validation:
+  exit_code: 2                # all correctness PASS; speed bar FAIL (geomean vs beat 0.8368 < 1.0: fast .8176 proxy .9311 prod .7697)
+
+explored:
+  ran: ["rocprofv3 --kernel-trace --stats (rc 0, writes NO file even without os._exit -- the tool, not the driver)",
+        "static port check of A0 r11 vs op/current (diff -rq): the nodelay port must be 2 lines, not A0's m32x8 file",
+        "CU count + grid arithmetic: 256 CUs, fast grid 32 -> m16x8, proxy 512 / prod 4096 -> m32x8 (decided B is inert at prod/proxy)",
+        "compile-only ISA census: A deletes 220 s_delay_alu at VGPR 448; B@fast VGPR 300, 0 spill; AB == A@prod, == B@fast",
+        "verify_r6 adversarial suite re-pointed at arm B on small grids: 192 cases 0 FAIL, bitwise == r4"]
+  consulted:
+    - INDEX.md
+    - backends/flydsl/attention/README.md
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+    - optimization/routes/1-metrics-to-techniques.md
+  bound: power
+  confidence: medium
+  why: >
+    prod/proxy still run at 1.0-1.5 GHz in the sustained power regime (sclk trace, unchanged since round 5), and
+    B leaves them byte-identical. Fast was latency/underfill (32 WGs on 256 CUs, top clock). B doubles its grid and
+    gains 29%, which confirms the round-5 c3 reading. Fast is now 0.91 of beat with no beat, so the job's largest
+    remaining gap is prod (0.84), which is power.
+
+arms:
+  - id: h34                  # arm B: m16x8 gate (== candidate)
+    built: "B alone, from op/current: A0's m16x8 (BLOCK_M=128) kernel + impl.py gate d==128 and grid_m32 < #CU"
+    tflops: {fast: 139.33, proxy: 1576.48, prod: 1509.79}
+    vs_champion: 1.0882       # geomean vs incumbent r6
+    shipped: true
+  - id: h34-A
+    built: "A alone, from op/current: amdgpu-enable-delay-alu=False in both m32x8 llvm_options (2 lines)"
+    tflops: {fast: 107.44, proxy: 1563.13, prod: 1482.81}
+    vs_champion: 0.9891
+    shipped: false
+    note: "LOST prod x0.9835 in 3/3 sessions (0.986/0.985/0.980), beyond the 0.4% floor; bitwise == current. Opposite sign to A0's +0.7% on the r4 body"
+  - id: h34-A+h34-B
+    built: "the merge; it was already in the same sweep, so it is reported although A lost"
+    tflops: {fast: 138.50, proxy: 1575.97, prod: 1487.05}
+    vs_champion: 1.0804
+    shipped: false
+    note: "carries A's prod loss (x0.986); ISA == A at prod, == B at fast"
+
+expected: >
+  A (nodelay): prod +0.3..0.8%, proxy/fast within +-0.5%, hash equal to current. B (m16x8 gate): fast +8..15%
+  no-beat vs current, prod/proxy exactly 1.000 (same kernel bytes). Merge: ~ A's prod + B's fast; score +2..+4% if B holds.
+
+added_to_pool: [r8.i1.g19]
+route_updated: true
+
+implementation:
+  files_changed: [op/impl.py, op/flydsl_fwd/fmha_fwd_prefill_a16w16_m16x8.py]
+  build_failures: []

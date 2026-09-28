@@ -1,0 +1,6 @@
+{
+ "arm": "postra_bu",
+ "llvm_options_delta": {
+  "misched-postra-direction": "bottomup"
+ }
+}

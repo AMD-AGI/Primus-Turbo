@@ -1,0 +1,9 @@
+fwd_S1 rc=0 3 results
+bwd_S1 rc=0 2 results
+bwd_P1 rc=0 2 results
+fwd_P1 rc=0 3 results
+fwd_S2 rc=0 3 results
+bwd_S2 rc=0 2 results
+bwd_P2 rc=0 2 results
+fwd_P2 rc=0 3 results
+PROBE2_DONE

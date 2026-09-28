@@ -1,0 +1,6 @@
+{
+ "arm": "nosink",
+ "llvm_options_delta": {
+  "disable-machine-sink": true
+ }
+}

@@ -1,0 +1,65 @@
+{
+ "arm": "turbo",
+ "shape": "prod",
+ "dims": [
+  4,
+  8192,
+  8192,
+  32,
+  8,
+  128
+ ],
+ "iters": 101,
+ "env": {
+  "TORCH_BLAS_PREFER_HIPBLASLT": "1",
+  "HIPBLASLT_TENSILE_LIBPATH": "/home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250",
+  "PYTHONPATH": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/attn_backends/shim:/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/attn_backends:/home/lihuzhan/code/2026_0903__turbo/wt-bakeoff:/home/lihuzhan/code/aiter-src"
+ },
+ "ref_provenance": {
+  "seed": "0",
+  "eager_sha": "2b35dff2e7a109fa",
+  "common_sha": "988c14caed5d9a80",
+  "torch": "2.11.0+rocm7.14.0a20260625",
+  "device": "gfx1250",
+  "ref_device": "cpu",
+  "shape": "prod",
+  "dims": "(4, 8192, 8192, 32, 8, 128)"
+ },
+ "versions": "primus_turbo /home/lihuzhan/code/2026_0903__turbo/wt-bakeoff/primus_turbo/__init__.py; flydsl 0.2.4",
+ "sqnr_chain_db": {
+  "o": 53.26,
+  "dq": 52.29,
+  "dk": 52.37,
+  "dv": 52.71
+ },
+ "adapter_copies": {
+  "copies": 0,
+  "copy_bytes": 0
+ },
+ "timing_ms": {
+  "m_fwd": {
+   "med": 5.1999,
+   "p10": 4.8996,
+   "p90": 5.397
+  },
+  "m_bwd": {
+   "med": 24.1603,
+   "p10": 24.0853,
+   "p90": 24.2239
+  },
+  "k_fwd": {
+   "med": 5.0901,
+   "p10": 4.8764,
+   "p90": 5.2972
+  },
+  "k_bwd": {
+   "med": 24.0489,
+   "p10": 23.983,
+   "p90": 24.1074
+  },
+  "overhead_fwd_ms": 0.1098,
+  "overhead_bwd_ms": 0.1114
+ },
+ "max_mem_alloc_gib": 3.88,
+ "wall_s": 8.9
+}

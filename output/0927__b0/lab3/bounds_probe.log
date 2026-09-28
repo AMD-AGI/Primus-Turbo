@@ -1,0 +1,4 @@
+KVG=1: iters=4210688 lane_ops=17246978048 payload_GB=68.99 min_idx=0 max_idx=134217727 size=134217728 OK
+KVG=2: iters=2113536 lane_ops=8657043456 payload_GB=34.63 min_idx=0 max_idx=134217727 size=134217728 OK
+KVG=4: iters=1064960 lane_ops=4362076160 payload_GB=17.45 min_idx=0 max_idx=134217727 size=134217728 OK
+RC=0

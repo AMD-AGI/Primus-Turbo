@@ -1,0 +1,1 @@
+BOUNDS_OK 135168 (shape, gqa, block_x, mask, window) configs: peeled partition == champion tile sequence, every tile under a superset of the champion's masks, n_tiles >= start_tile+1

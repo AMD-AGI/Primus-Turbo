@@ -1,0 +1,100 @@
+round: 7
+mode: fast
+candidate: r7.i2.g18
+outcome: delivered
+
+correctness:
+  unit_tests: pass            # ut rc 0 on both arms (raw/ut_A.txt, raw/ut_B.txt); determinism 200/200, hash o=9eb9b58556bf lse=bbf23654e600 = op/current's
+  precision: pass             # validation.py correctness PASS at the spec's 49 dB; adversarial 52/52 bitwise == op/current (raw/adv_B.txt)
+  checked_with: op/validation.py
+  sqnr_db: 49.82              # min o SQNR (short_q full), identical to the champion's; the output is bitwise identical
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/004/op, rounds/006/op]
+  shapes:                     # batch 1 = no beat in the process (h31), mean of 3 sessions, cyclic rotation A/B/r4/r6 (raw/bench_r7_agg.txt);
+                              # beat_tflops = mean of the beat arm over the 4 gate-form processes of the same sweep (batch 2)
+    - name: fast
+      this_round_tflops: 97.69
+      best_round_tflops: 98.53
+      beat_tflops: 154.19
+      target_tflops: 154.19
+      champion_round: 4
+      champion_tflops: 98.53
+      champion_rebuilt: true
+      ratio: 0.6336
+      vs_champion: 0.9915     # vs incumbent r6 (96.11): x1.0164
+    - name: proxy
+      this_round_tflops: 1592.51
+      best_round_tflops: 1568.07
+      beat_tflops: 1651.34
+      target_tflops: 1651.34
+      champion_round: 6
+      champion_tflops: 1568.07
+      champion_rebuilt: true
+      ratio: 0.9644
+      vs_champion: 1.0156
+    - name: prod
+      this_round_tflops: 1513.66
+      best_round_tflops: 1510.79
+      beat_tflops: 1786.32
+      target_tflops: 1786.32
+      champion_round: 6
+      champion_tflops: 1510.79
+      champion_rebuilt: true
+      ratio: 0.8474
+      vs_champion: 1.0019
+  score: 0.8151               # same sweep: r6 0.8062, r4 0.7918, A 0.8122. Gate form (X/beat): B .7766/.9354/.6247 vs r6 .7742/.9227/.6151
+  note: >
+    Median of 101, unprofiled, one process per shape, fa-g0 GPU 0 idle (0% use, no other python) before and
+    after every batch. sclk 2315 at fast, 1245-1308 -> 1275-1493 at prod/proxy, the same for every arm in a process.
+    A/A floor from round 6: prod 0.4%, proxy 0.6%, fast 2%. Fast depends on the process mix: r6 ran 96.1 TF/s
+    in the 4-arm process and 106.4 in the 3-arm g17-HI process at the same clock.
+
+validation:
+  exit_code: VAL_RC
+
+explored:
+  ran: ["rocprofv3 --kernel-trace --stats (rc 0, wrote no file)",
+        "rocprofv3 --pmc SQC_ICACHE_* with beat interleaved (0 steady-state misses per dispatch in every cell: pmc cannot see the beat penalty)",
+        "kernel-descriptor read of COMPUTE_PGM_RSRC3.INST_PREF_SIZE (current saturates at 255 = 32 640 B with 38 956 B of code: this chose both arms)",
+        "compile-only ISA census of both probes (confirmed both under the cap, 0 spill)"]
+  consulted:
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+    - arch/gfx1250/profiling-surface.md
+  bound: power
+  confidence: medium
+  why: >
+    prod/proxy run at 1.0-1.5 GHz in the sustained power regime, and the serial softmax VALU block is the
+    cycle term (round 6). Removing work pays in both cycles and energy: g18 took g14's speculation off the
+    masked tiles for +1.6% proxy and no prod loss. fast is a latency-bound small grid whose remaining term
+    depends on the process mix (r6 96 vs 106 TF/s at the same clock). The cap fix recovers 1.6-2.9% of it.
+
+arms:
+  - id: r7.i2.g18
+    built: "B alone, from op/current: speculation only on clean tiles, 30 780 B (under the prefetch cap)"
+    tflops: {fast: 97.69, proxy: 1592.51, prod: 1513.66}
+    vs_champion: 1.0113       # geomean vs incumbent r6 over the three shapes
+    shipped: true
+  - id: r7.i1.g17
+    built: "A alone, from op/current: all waves run the LO-warp body, 22 192 B"
+    tflops: {fast: 98.88, proxy: 1575.22, prod: 1503.08}
+    vs_champion: 1.0094
+    shipped: false
+    note: "prod x0.9949 in 6/6 sessions (below the 0.4% floor), so it is not kept and the A+B merge is not built. Fast x1.029 in the 4-arm process, x0.999 in a 3-arm one"
+  - id: r7.i1.g17-HI
+    built: "throwaway beside A: all waves in HI order (TDM prefetch issued before the K ds_load)"
+    tflops: {fast: 102.53, prod: 1429.86}
+    vs_champion: 0.95         # prod x0.9352, fast x0.9640 vs r6 (106.36 / 1528.86) in its own 3-arm sweep
+    shipped: false
+    note: "bitwise == op/current. The K-load/prefetch order is a first-order prod term; the 50/50 LO/HI stagger beats all-LO (-0.5%) and all-HI (-6.5%)"
+
+expected: >
+  g17 fast +3..6% no-beat (more in gate form), prod/proxy within the floor. g18 fast +1..4%, prod -0.2..-0.4%.
+
+added_to_pool: [r7.i1.g17, r7.i2.g18]
+route_updated: true
+
+implementation:
+  files_changed: [op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py]
+  build_failures: []

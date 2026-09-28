@@ -1,0 +1,107 @@
+round: 9
+mode: fast
+candidate: h37+r7.i2.g18          # route rows 1 + 4 merged (BG), left in rounds/009/op
+outcome: delivered
+
+correctness:
+  unit_tests: pass            # ut PASS on B, G, BG with determinism 200/200 bitwise; BG hash == B == r4 (o=26a89a2db0cd lse=d6ac8da1e101)
+  precision: pass             # validation.py on the working copy: all correctness/determinism PASS, worst o SQNR 49.82 dB (gate 49)
+  checked_with: op/validation.py
+  sqnr_db: 49.82
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/006/op, rounds/007/op, rounds/008/op]
+  shapes:                     # no beat in process (h31), 7 arms incl. champ2 A/A (h35), mean of 3 rotated sessions, PYTHONHASHSEED=0
+                              # (raw/bench_r9_agg_batch1.txt); beat_tflops = mean of beat over the 6 gate-form processes (raw/bench/wb_*.json)
+    - name: fast
+      this_round_tflops: 139.30
+      best_round_tflops: 139.09
+      beat_tflops: 152.74
+      target_tflops: 152.74
+      champion_round: 8
+      champion_tflops: 139.09
+      champion_rebuilt: true
+      ratio: 0.9120
+      vs_champion: 1.0015     # vs incumbent r6 (109.24): x1.2751
+    - name: proxy
+      this_round_tflops: 1587.21
+      best_round_tflops: 1596.26
+      beat_tflops: 1623.25
+      target_tflops: 1623.25
+      champion_round: 7
+      champion_tflops: 1596.26
+      champion_rebuilt: true
+      ratio: 0.9778
+      vs_champion: 0.9943     # vs r6 (1570.80): x1.0104. Proxy A/A this sweep 1.029/0.982/0.978, so this cannot be resolved
+    - name: prod
+      this_round_tflops: 1500.58
+      best_round_tflops: 1501.69
+      beat_tflops: 1751.01
+      target_tflops: 1751.01
+      champion_round: 7
+      champion_tflops: 1501.69
+      champion_rebuilt: true
+      ratio: 0.8570
+      vs_champion: 0.9993     # vs r6 (1494.28): x1.0042. Prod A/A 1.0038/0.9990/1.0010 (valid)
+  score: 0.9156               # same sweep, same beat: r8 0.9088, r7 0.8683, r6 0.8454. Gate-form mean (X/beat in process): BG 0.8509, r6 0.7793
+  note: >
+    Median of 101, unprofiled, one process per shape, fa-g2 physical GPU 2, idle before and after (0% busy, no live
+    process of ours, no new dmesg line for 0003:04:00.0). sclk: prod 1251-1278, proxy 1307-1577, fast 2306-2319 MHz.
+    Champions are the best of r6/r7/r8 re-measured in this sweep. BG is the union of r8 (fast) and r7 (prod/proxy) in
+    one tree. It is within noise of each shape's best, not beyond it. The gain over r8 is proxy's g18 term, inside the
+    proxy A/A spread.
+
+validation:
+  exit_code: 2                # all correctness PASS; speed bar FAIL (gate-form geomean vs beat 0.8471: fast .8250 proxy .9395 prod .7842)
+
+explored:
+  ran: ["rocprofv3 --kernel-trace --stats survey on GPU 2 (gate form): current/beat 0.635/0.896/0.759, the same regime as GPU 0, so the route order held",
+        "rocprofv3 around benchmark.py and around a minimal driver: malloc corruption then a hang, or zero kernels recorded (r9.i3.g22). Decided: price g19 by ISA plus wall time, not trace"]
+  consulted:
+    - optimization/routes/1-metrics-to-techniques.md
+    - backends/flydsl/attention/README.md
+    - backends/flydsl/attention/recipes/hd128.md
+    - backends/flydsl/attention/techniques.md
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+  bound: power
+  confidence: medium
+  why: >
+    prod/proxy run at 1.0-1.6 GHz in the sustained power regime; neither arm changes their kernel's work class. Fast was
+    underfill (32 WGs on 256 CUs at 2.31 GHz). The m16x8 gate doubles its grid for x1.26. The largest remaining gap is
+    prod at 0.857 of beat, which is power.
+
+arms:
+  - id: h37
+    built: "B alone, from op/current: impl.py m16x8 gate (d==128 and grid_m32 < #CU) + fmha_fwd_prefill_a16w16_m16x8.py"
+    tflops: {fast: 137.69, proxy: 1555.73, prod: 1495.65}
+    vs_champion: 1.0771       # geomean vs incumbent r6
+    shipped: false
+    note: "fast x1.260; proxy/prod byte-identical to current, within the A/A spread"
+  - id: r7.i2.g18
+    built: "G alone, from op/current: SPEC_STALE_MAX restricted to clean tiles (one condition in m32x8, 30.8 KB code)"
+    tflops: {fast: 116.57, proxy: 1601.11, prod: 1500.38}
+    vs_champion: 1.0298
+    shipped: false
+    note: "proxy x1.019, prod x1.004, fast x1.067; bitwise == current"
+  - id: h37+r7.i2.g18
+    built: "the merge BG, built because neither arm lost beyond the spread"
+    tflops: {fast: 139.30, proxy: 1587.21, prod: 1500.58}
+    vs_champion: 1.0896
+    shipped: true
+    note: "holds B's fast and G's prod; proxy is between B and G, inside the noise"
+
+expected: >
+  No beat in process, vs current, mean of 3 rotated sessions with champ/champ2 A/A:
+  B: fast x1.22..1.30, prod and proxy x1.000 +-0.5% (byte-identical kernels there).
+  G: proxy +1.0..1.6%, prod +0..0.3%, fast +1..2%.
+  BG: fast ~x1.25, proxy +1..1.6%, prod +0..0.3%. Gate-form score up ~8% vs current's 0.635/0.896/0.759 survey
+  ratios, i.e. fast to ~0.80 of beat.
+  If B's fast gain on GPU 2 is below x1.15, the underfill model is card-sensitive and g20 should drop in rank.
+
+added_to_pool: [r9.i3.g22]
+route_updated: true
+
+implementation:
+  files_changed: [op/impl.py, op/flydsl_fwd/fmha_fwd_prefill_a16w16_m16x8.py, op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py]
+  build_failures: []

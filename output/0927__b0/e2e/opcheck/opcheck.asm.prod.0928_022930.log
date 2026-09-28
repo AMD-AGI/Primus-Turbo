@@ -1,0 +1,29 @@
+ARM asm SHAPE prod (4, 8192, 8192, 32, 8, 128)
+device gfx1250
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+versions: flydsl 0.3.4.1 @ /home/lihuzhan/.local/flydsl0341/flydsl/__init__.py
+BLAS env: 1 /home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250
+[e2e_attn] E2E_ATTN='asm' schedule warm=[] cycle=[('asm', 'asm')]
+[aiter] LoadKernel: _ZN5aiter41fmha_bf16_pertokenBf16_hd128_128x256_maskE hsaco: /home/lihuzhan/code/aiter-src/hsa//gfx1250/fmha_fwd_bf16/fmha_bf16_pertokenBf16_hd128_128x256_mask.co
+[e2e_attn] BLAS TORCH_BLAS_PREFER_HIPBLASLT=1 HIPBLASLT_TENSILE_LIBPATH=/home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250 preferred_blas_library=_BlasBackend.Cublaslt
+[e2e_attn] flydsl 0.3.4.1 @ /home/lihuzhan/.local/flydsl0341/flydsl/__init__.py
+[e2e_attn] layout q(4, 8192, 32, 128) torch.bfloat16 contig=True k(4, 8192, 8, 128) contig=True v(4, 8192, 8, 128) contig=True
+[e2e_attn] step_idx=0 arm fwd=asm bwd=asm adapter_copies_so_far=0 (0 MiB)
+/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/ref/common.py:130: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at /__w/rocm-npi-dev/rocm-npi-dev/_therock/external-builds/pytorch/pytorch/torch/csrc/autograd/generated/python_variable_methods.cpp:836.)
+  return float(10.0 * torch.log10(num / den))
+SQNR chain (module fwd+autograd bwd vs fp32 ref): {'o': 53.19, 'dq': 52.29, 'dk': 50.64, 'dv': 50.83} adapter copies: {'copies': 0, 'copy_bytes': 0}
+SQNR kernel fwd: {'o': 53.19, 'lse': 139.96, 'lse_shape': [4, 32, 8192]}
+SQNR kernel bwd on reference o/lse (job gate form): {'dq': 52.54, 'dk': 50.79, 'dv': 50.83}
+[e2e_attn] step_idx=1 arm fwd=asm bwd=asm adapter_copies_so_far=0 (0 MiB)
+[e2e_attn] step_idx=2 arm fwd=asm bwd=asm adapter_copies_so_far=0 (0 MiB)
+  m_fwd                  {'med': 1.1457, 'p10': 1.0888, 'p90': 1.1939}
+  m_bwd                  {'med': 7.2228, 'p10': 7.1537, 'p90': 7.3403}
+  k_fwd                  {'med': 1.1289, 'p10': 1.0947, 'p90': 1.1716}
+  k_bwd                  {'med': 7.1065, 'p10': 7.0086, 'p90': 7.2192}
+  part_dq_acc_zero       {'med': 0.0866, 'p10': 0.0624, 'p90': 0.0901}
+  part_gqa_sum_dk_dv     {'med': 0.124, 'p10': 0.1216, 'p90': 0.1264}
+  overhead_fwd_ms        0.0168
+  overhead_bwd_ms        0.1163
+adapter copies after timing: {'copies': 0, 'copy_bytes': 0}
+DONE {"arm": "asm", "shape": "prod", "sqnr_chain_db": {"o": 53.19, "dq": 52.29, "dk": 50.64, "dv": 50.83}}

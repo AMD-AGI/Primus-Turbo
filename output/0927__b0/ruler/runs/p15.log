@@ -1,0 +1,20 @@
+# arm l12_a -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/l12_a impl_mod=op_impl_4115606700135454168 kern_mod=flydsl_fwd__4115606700135454168.fmha_fwd_prefill_a16w16_m32x8
+# arm r6_a -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/r6_a impl_mod=op_impl_7344678174244088329 kern_mod=flydsl_fwd__7344678174244088329.fmha_fwd_prefill_a16w16_m32x8
+# arm r4_a -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/r4_a impl_mod=op_impl_2056652242799479333 kern_mod=flydsl_fwd__2056652242799479333.fmha_fwd_prefill_a16w16_m32x8
+# arm l12_b -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/l12_b impl_mod=op_impl_6834716539157526428 kern_mod=flydsl_fwd__6834716539157526428.fmha_fwd_prefill_a16w16_m32x8
+# arm r6_b -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/r6_b impl_mod=op_impl_8761355626247241005 kern_mod=flydsl_fwd__8761355626247241005.fmha_fwd_prefill_a16w16_m32x8
+# arm r4_b -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/r4_b impl_mod=op_impl_7131966237380741364 kern_mod=flydsl_fwd__7131966237380741364.fmha_fwd_prefill_a16w16_m32x8
+# PYTHONHASHSEED=7 FLYDSL_RUNTIME_CACHE_DIR=/tmp/flycache
+RESULT mode=std arm=l12_a ms=1.42522 sclk=1277/1257
+RESULT mode=std arm=r6_a ms=1.51856 sclk=1277/1257
+RESULT mode=std arm=r4_a ms=1.58530 sclk=1277/1257
+RESULT mode=std arm=l12_b ms=1.40767 sclk=1277/1257
+RESULT mode=std arm=r6_b ms=1.45755 sclk=1277/1257
+RESULT mode=std arm=r4_b ms=1.55622 sclk=1277/1257
+RESULT mode=shield arm=l12_a ms=1.22861 host_us=15.8 sclk=1257/1941
+RESULT mode=shield arm=r6_a ms=1.07834 host_us=16.0 sclk=1257/1941
+RESULT mode=shield arm=r4_a ms=1.13254 host_us=16.0 sclk=1257/1941
+RESULT mode=shield arm=l12_b ms=1.21655 host_us=15.9 sclk=1257/1941
+RESULT mode=shield arm=r6_b ms=1.07938 host_us=16.0 sclk=1257/1941
+RESULT mode=shield arm=r4_b ms=1.13727 host_us=15.9 sclk=1257/1941
+rc=0 newdmesg=0

@@ -1,0 +1,6 @@
+{
+ "arm": "ilp",
+ "llvm_options_delta": {
+  "amdgpu-sched-strategy": "max-ilp"
+ }
+}

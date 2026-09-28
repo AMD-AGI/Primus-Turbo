@@ -1,0 +1,25 @@
+ARM turbo SHAPE prod (4, 8192, 8192, 32, 8, 128)
+device gfx1250
+[e2e_attn] P1: primus_turbo -> /home/lihuzhan/code/2026_0903__turbo/wt-bakeoff/primus_turbo
+versions: primus_turbo /home/lihuzhan/code/2026_0903__turbo/wt-bakeoff/primus_turbo/__init__.py; flydsl 0.2.4
+BLAS env: 1 /home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250
+[e2e_attn] P1: primus_turbo.pytorch.modules.TurboAttention -> e2e_attn.E2EAttention (real class from /home/lihuzhan/code/2026_0903__turbo/wt-bakeoff/primus_turbo/pytorch/modules/__init__.py)
+[e2e_attn] E2E_ATTN='turbo' schedule warm=[] cycle=[('turbo', 'turbo')]
+[2026-09-28 02:31:47] [WARNING] [primus_turbo] For inputs: q=Tensor(shape=torch.Size([4, 8192, 32, 128]), dtype=torch.bfloat16), k=Tensor(shape=torch.Size([4, 8192, 8, 128]), dtype=torch.bfloat16), v=Tensor(shape=torch.Size([4, 8192, 8, 128]), dtype=torch.bfloat16), dropout_p=0.0, softmax_scale=0.08838834764831843, causal=True, window_size=(-1, -1), bias=None, alibi_slopes=None, sink=None, qkv_format='bshd', return_softmax=False, needs_backward=True, the default backend is not compatible, fallback backend TRITON is selected. The fallback backend may hurt performance!
+[e2e_attn] BLAS TORCH_BLAS_PREFER_HIPBLASLT=1 HIPBLASLT_TENSILE_LIBPATH=/home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250 preferred_blas_library=_BlasBackend.Cublaslt
+[e2e_attn] layout q(4, 8192, 32, 128) torch.bfloat16 contig=True k(4, 8192, 8, 128) contig=True v(4, 8192, 8, 128) contig=True
+[e2e_attn] step_idx=0 arm fwd=turbo bwd=turbo adapter_copies_so_far=0 (0 MiB)
+/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/ref/common.py:130: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at /__w/rocm-npi-dev/rocm-npi-dev/_therock/external-builds/pytorch/pytorch/torch/csrc/autograd/generated/python_variable_methods.cpp:836.)
+  return float(10.0 * torch.log10(num / den))
+SQNR chain (module fwd+autograd bwd vs fp32 ref): {'o': 53.26, 'dq': 52.29, 'dk': 52.37, 'dv': 52.71} adapter copies: {'copies': 0, 'copy_bytes': 0}
+[e2e_attn] step_idx=1 arm fwd=turbo bwd=turbo adapter_copies_so_far=0 (0 MiB)
+[e2e_attn] step_idx=2 arm fwd=turbo bwd=turbo adapter_copies_so_far=0 (0 MiB)
+  m_fwd                  {'med': 5.1999, 'p10': 4.8996, 'p90': 5.397}
+  m_bwd                  {'med': 24.1603, 'p10': 24.0853, 'p90': 24.2239}
+  k_fwd                  {'med': 5.0901, 'p10': 4.8764, 'p90': 5.2972}
+  k_bwd                  {'med': 24.0489, 'p10': 23.983, 'p90': 24.1074}
+  overhead_fwd_ms        0.1098
+  overhead_bwd_ms        0.1114
+adapter copies after timing: {'copies': 0, 'copy_bytes': 0}
+DONE {"arm": "turbo", "shape": "prod", "sqnr_chain_db": {"o": 53.26, "dq": 52.29, "dk": 52.37, "dv": 52.71}}

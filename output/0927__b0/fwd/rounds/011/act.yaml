@@ -1,0 +1,115 @@
+round: 11
+mode: fast
+candidate: r9.i1.g20               # pool id kept (r9-born, unblocked by r10's m32x4 body); route row 4
+outcome: delivered
+
+# ---------------------------------------------------------------- correctness
+correctness:
+  unit_tests: pass                 # ut/test_correctness.py --impl rounds/011/op --determinism 200: RESULT PASS, rc 0 (raw/correct/ut.log)
+  precision: pass                  # validation.py: 16/16 correctness rows PASS at the spec 49.0 dB, o and lse (raw/correct/validation.log)
+  checked_with: op/validation.py
+  sqnr_db: 49.82                   # minimum o over all 16 (short_q full; same as baseline). fast 51.23, proxy 50.89, prod 50.83
+  determinism: "200/200 bitwise at fast"
+  extra: >
+    tools/g20_check.py (raw/correct/g20_check.log, rc 0), bitwise vs op/current forced into m32x8 (the verify_r6-verified body):
+    A 16/16 ut shapes/modes bitwise (14 dispatch m32x2); C verify_r6 adversarial 32 kinds x {toy, short_q, gqa4} x
+    {causal, non-causal} = 192/192 bitwise, 0 non-finite. ISA: m32x8 final ISA byte-identical current vs op at 6 configs;
+    m32x2 VGPR 454/448, 0 spill, 0 scratch, code 28.8-30.0 KB < 32 640 B cap (raw/isa_act/summary.txt).
+
+# ---------------------------------------------------------------- measurements
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [job_context/op/current, rounds/010/op, rounds/011/1-opt/arms/champ2]
+  protocol: >
+    3 rotated sessions, fa-g2 / physical GPU 2, default container user, PYTHONHASHSEED=0, blocked ruler (h40), median of 101.
+    Each session: one ranking process with cand, champ (op/current), champ2 (byte copy, A/A), r010 (rounds/010/op) and
+    the row-5 arm g46, no beat (h31); then beat alone in its own process. raw/measure/{s1,s2,s3,summary.txt}.
+    Figures are medians over the 3 sessions.
+  champion_note: >
+    Only round 10 is on the current structure. op/current (the r10 refactor tree) and rounds/010/op (r10's working copy,
+    which still carries the unshipped occ2 prod gate) were both re-run; best per shape is taken from them.
+  shapes:
+    - name: fast
+      this_round_tflops: 155.54
+      best_round_tflops: 143.47
+      beat_tflops: 155.98
+      target_tflops: 155.98
+      champion_round: 10
+      champion_tflops: 143.47      # op/current; rounds/010/op 142.53
+      champion_rebuilt: true
+      ratio: 0.9972
+      vs_champion: 1.0841          # medians; paired per session 1.100/1.091/1.081 (median 1.0905), A/A 1.0040
+    - name: proxy
+      this_round_tflops: 1597.98
+      best_round_tflops: 1600.96
+      beat_tflops: 1566.96
+      target_tflops: 1566.96
+      champion_round: 10
+      champion_tflops: 1600.96     # rounds/010/op; op/current 1600.58
+      champion_rebuilt: true
+      ratio: 1.0198                # uncapped this_round/target
+      vs_champion: 0.9981          # m32x8 ISA byte-identical; paired vs champ 0.9988, A/A 0.9977 -> noise
+    - name: prod
+      this_round_tflops: 1500.65
+      best_round_tflops: 1501.88
+      beat_tflops: 1557.09
+      target_tflops: 1557.09
+      champion_round: 10
+      champion_tflops: 1501.88     # op/current; rounds/010/op 1494.32
+      champion_rebuilt: true
+      ratio: 0.9638
+      vs_champion: 0.9992          # m32x8 ISA byte-identical; paired 0.9992, A/A 0.9976 -> noise
+  score: 0.9936                    # mean of uncapped ratios; capped at 1.0 per shape it is 0.9870
+  regressions:
+    - {shape: proxy, vs_champion: 0.9981, within_band: true, note: "same ISA as champion; inside A/A spread"}
+    - {shape: prod, vs_champion: 0.9992, within_band: true, note: "same ISA as champion; inside A/A spread"}
+
+validation:
+  exit_code: 2                     # correctness and determinism PASS; fails only the speed bar (geomean vs beat in-process 0.9602)
+
+# ---------------------------------------------------------------- fast-round only
+explored:
+  ran:
+    - "survey: benchmark.py blocked, fast 3 sessions + beat alone + proxy/prod champ/champ2 -> fast is the largest gap (0.927) and not clock-bound; chose the fast underfill lever"
+    - "ISA loop census + beat disassembly (s_set_vgpr_msb): msb is 17% of our prod loop but beat pays the same 1.7-1.8/WMMA -> ruled msb out as a candidate"
+    - "probe arms occ2fast / m32x2probe / m32x1probe at fast (3-rotation A/A) -> picked m32x2 (x1.08-1.09) over occ2 (x1.02) and m32x1 (x1.045)"
+  consulted:
+    - backends/flydsl/attention/README.md
+    - backends/flydsl/attention/recipes/hd128.md
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+    - optimization/routes/1-metrics-to-techniques.md
+  bound: latency
+  confidence: high
+  why: >
+    The lever is fast's grid underfill (64 WGs on 256 CUs at BLOCK_M=128). The fast clock is flat at ~2.3 GHz, so it is
+    not power-bound. Doubling the grid to 128 WGs gave +9% at identical per-row math (bitwise). Halving again to
+    256 x 1-wave lost 4%, so at 128 WGs fill is no longer the only limiter. prod, the job's remaining gap, stays
+    power/clock-bound (sclk 993-1257).
+
+arms:
+  - id: r9.i1.g20
+    built: "m32x2 (r10 m32x4 body, NUM_WAVES=2) for d==128 and grid_m32 < #CU, from op/current"
+    tflops: {fast: 155.54, proxy: 1597.98, prod: 1500.65}
+    vs_champion: 1.0841
+    shipped: true
+  - id: r11.i2.g46
+    built: "m32x1 (NUM_WAVES=1) in the same gate slot, separately from the same base (1-opt/arms/g46)"
+    tflops: {fast: 150.30, proxy: 1603.58, prod: 1500.55}
+    vs_champion: 1.0476            # fast; x0.9611 vs r9.i1.g20 in 3/3 sessions
+    shipped: false
+    note: "correct (49 dB, bitwise == g20). No merge: exclusive alternative for the same gate line"
+
+expected: >
+  fast +8-9% (to ~beat), proxy and prod unchanged (gate not taken).
+
+added_to_pool: [r11.i1.g45, r11.i2.g46]
+route_updated: true
+
+# ---------------------------------------------------------------- what got built
+implementation:
+  files_changed:
+    - op/impl.py
+    - op/flydsl_fwd/fmha_b16_buffer_managers.py
+    - op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x2.py
+  build_failures:
+    - {attempt: 1, error: "NotImplementedError: V2 TDM loader assumes 8 waves", root_cause: "fmha_b16_buffer_managers.py whitelists num_waves in 5 places (8, and 4 since r10); widened to (2, 4, 8). Met in the opt probe; act built first time"}

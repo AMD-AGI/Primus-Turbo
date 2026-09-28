@@ -1,0 +1,7 @@
+{
+ "arm": "mmc_nopm",
+ "llvm_options_delta": {
+  "amdgpu-sched-strategy": "max-memory-clause",
+  "enable-post-misched": false
+ }
+}

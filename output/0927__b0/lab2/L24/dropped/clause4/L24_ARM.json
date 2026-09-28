@@ -1,0 +1,6 @@
+{
+ "arm": "clause4",
+ "llvm_options_delta": {
+  "amdgpu-max-memory-clause": 4
+ }
+}

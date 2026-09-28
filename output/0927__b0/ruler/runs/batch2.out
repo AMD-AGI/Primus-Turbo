@@ -1,0 +1,41 @@
+a01 RESULT mode=std arm=r6_a ms=1.45046 sclk=1253/1297 by_pred={'None': [1.18714, 1], 'r4_a': [1.45162, 50], 'r6_a': [1.44875, 50]}
+a01 RESULT mode=std arm=r4_a ms=1.54199 sclk=1253/1297 by_pred={'r6_a': [1.53995, 51], 'r4_b': [1.54235, 50]}
+a01 RESULT mode=std arm=r4_b ms=1.54055 sclk=1253/1297 by_pred={'r4_a': [1.54316, 51], 'r6_b': [1.53799, 50]}
+a01 RESULT mode=std arm=r6_b ms=1.44974 sclk=1253/1297 by_pred={'r4_b': [1.45278, 51], 'r6_b': [1.44873, 50]}
+a01 RESULT mode=blocked arm=r6_a ms=1.46308 n=108 sclk=1297/1286 by_pos=[1.4671, 1.45484, 1.45609, 1.46392, 1.46129, 1.46927, 1.46448, 1.45931, 1.46179, 1.46927, 1.46368, 1.45959, 1.46125]
+a01 RESULT mode=blocked arm=r4_a ms=1.52094 n=108 sclk=1297/1286 by_pos=[1.55429, 1.5314, 1.52946, 1.52595, 1.52333, 1.52487, 1.52627, 1.5182, 1.52206, 1.52234, 1.51836, 1.5172, 1.51325]
+a01 RESULT mode=blocked arm=r4_b ms=1.52068 n=108 sclk=1297/1286 by_pos=[1.55994, 1.5338, 1.52503, 1.52415, 1.52299, 1.52228, 1.52523, 1.52126, 1.52178, 1.51896, 1.51816, 1.51816, 1.52002]
+a01 RESULT mode=blocked arm=r6_b ms=1.46598 n=108 sclk=1297/1286 by_pos=[1.47533, 1.45747, 1.46668, 1.46622, 1.46362, 1.45891, 1.46742, 1.47191, 1.4634, 1.46724, 1.46197, 1.47285, 1.47113]
+a01 RESULT mode=stream arm=r6_a ms=1.47480 n=12
+a01 RESULT mode=stream arm=r4_a ms=1.53491 n=12
+a01 RESULT mode=stream arm=r4_b ms=1.53449 n=12
+a01 RESULT mode=stream arm=r6_b ms=1.47480 n=12
+a01 rc=0 newdmesg=13
+a02 RESULT mode=std arm=r4_c ms=1.54087 sclk=1279/1295 by_pred={'None': [1.19263, 1], 'r6_c': [1.54798, 50], 'r4_c': [1.53567, 50]}
+a02 RESULT mode=std arm=r6_c ms=1.45414 sclk=1279/1295 by_pred={'r4_c': [1.44873, 51], 'r6_d': [1.46027, 50]}
+a02 RESULT mode=std arm=r6_d ms=1.45506 sclk=1279/1295 by_pred={'r6_c': [1.46284, 51], 'r4_d': [1.44771, 50]}
+a02 RESULT mode=std arm=r4_d ms=1.54187 sclk=1279/1295 by_pred={'r6_d': [1.55109, 51], 'r4_d': [1.53244, 50]}
+a02 RESULT mode=blocked arm=r4_c ms=1.52305 n=108 sclk=1295/1282 by_pos=[1.55674, 1.53891, 1.52627, 1.52805, 1.52238, 1.52389, 1.51554, 1.51906, 1.52116, 1.52865, 1.52765, 1.52086, 1.52745]
+a02 RESULT mode=blocked arm=r6_c ms=1.46712 n=108 sclk=1295/1282 by_pos=[1.47275, 1.4536, 1.45406, 1.45947, 1.47003, 1.46508, 1.463, 1.46544, 1.4658, 1.46264, 1.46738, 1.46728, 1.47041]
+a02 RESULT mode=blocked arm=r6_d ms=1.46670 n=108 sclk=1295/1282 by_pos=[1.48709, 1.4666, 1.46139, 1.45953, 1.46143, 1.46708, 1.46175, 1.46392, 1.46896, 1.46941, 1.46712, 1.46828, 1.47349]
+a02 RESULT mode=blocked arm=r4_d ms=1.51974 n=108 sclk=1295/1282 by_pos=[1.55313, 1.534, 1.52359, 1.52427, 1.52431, 1.52217, 1.51567, 1.52056, 1.51447, 1.51357, 1.51942, 1.52421, 1.52056]
+a02 RESULT mode=stream arm=r4_c ms=1.53901 n=12
+a02 RESULT mode=stream arm=r6_c ms=1.47280 n=12
+a02 RESULT mode=stream arm=r6_d ms=1.47456 n=12
+a02 RESULT mode=stream arm=r4_d ms=1.53939 n=12
+a02 rc=0 newdmesg=0
+a03 RESULT mode=std arm=r6_b ms=1.45250 sclk=1251/1297 by_pred={'None': [1.13342, 1], 'r4_b': [1.45552, 50], 'r6_b': [1.45112, 50]}
+a03 RESULT mode=std arm=r4_b ms=1.54420 sclk=1251/1297 by_pred={'r6_b': [1.54516, 51], 'r4_a': [1.54354, 50]}
+a03 RESULT mode=std arm=r4_a ms=1.54488 sclk=1251/1297 by_pred={'r4_b': [1.54532, 51], 'r6_a': [1.54406, 50]}
+a03 RESULT mode=std arm=r6_a ms=1.45438 sclk=1251/1297 by_pred={'r4_a': [1.45639, 51], 'r6_a': [1.45304, 50]}
+a03 RESULT mode=blocked arm=r6_b ms=1.46786 n=108 sclk=1297/1282 by_pos=[1.47776, 1.45376, 1.45877, 1.46242, 1.47533, 1.47139, 1.47067, 1.46192, 1.46145, 1.46111, 1.47101, 1.46722, 1.46989]
+a03 RESULT mode=blocked arm=r4_b ms=1.52189 n=108 sclk=1297/1282 by_pos=[1.55724, 1.53484, 1.52938, 1.52495, 1.52299, 1.5161, 1.5219, 1.52459, 1.52168, 1.51898, 1.52114, 1.51976, 1.51948]
+a03 RESULT mode=blocked arm=r4_a ms=1.52112 n=108 sclk=1297/1282 by_pos=[1.55948, 1.54131, 1.53302, 1.53044, 1.51922, 1.52483, 1.52295, 1.52683, 1.52343, 1.52597, 1.51996, 1.50993, 1.51481]
+a03 RESULT mode=blocked arm=r6_a ms=1.46852 n=108 sclk=1297/1282 by_pos=[1.47401, 1.46378, 1.46422, 1.46149, 1.46997, 1.46418, 1.47225, 1.46548, 1.46546, 1.46087, 1.46806, 1.47219, 1.4687]
+a03 RESULT mode=stream arm=r6_b ms=1.47337 n=12
+a03 RESULT mode=stream arm=r4_b ms=1.53742 n=12
+a03 RESULT mode=stream arm=r4_a ms=1.53154 n=12
+a03 RESULT mode=stream arm=r6_a ms=1.47619 n=12
+a03 rc=0 newdmesg=0
+a04 rc=137 newdmesg=0
+rc!=0 in a04 -- stopping

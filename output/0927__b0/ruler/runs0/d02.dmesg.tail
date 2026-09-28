@@ -1,0 +1,4 @@
+[69813.067512] amdgpu: process pid 2015598 DQM create queue type 0 failed. ret -110
+[69825.405234] traps: python3[2015598] general protection fault ip:7ff3584327cd sp:7ffed79c9498 error:0 in libamdhip64.so.7[5b77cd,7ff358015000+46a000]
+[69813.067512] amdgpu: process pid 2015598 DQM create queue type 0 failed. ret -110
+[69825.405234] traps: python3[2015598] general protection fault ip:7ff3584327cd sp:7ffed79c9498 error:0 in libamdhip64.so.7[5b77cd,7ff358015000+46a000]

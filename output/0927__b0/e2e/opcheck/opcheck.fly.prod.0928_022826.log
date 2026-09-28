@@ -1,0 +1,50 @@
+ARM fly SHAPE prod (4, 8192, 8192, 32, 8, 128)
+device gfx1250
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+versions: flydsl 0.3.4.1 @ /home/lihuzhan/.local/flydsl0341/flydsl/__init__.py
+BLAS env: 1 /home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250
+[e2e_attn] E2E_ATTN='fly' schedule warm=[] cycle=[('fly', 'fly')]
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+[e2e_attn] BLAS TORCH_BLAS_PREFER_HIPBLASLT=1 HIPBLASLT_TENSILE_LIBPATH=/home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250 preferred_blas_library=_BlasBackend.Cublaslt
+[e2e_attn] flydsl 0.3.4.1 @ /home/lihuzhan/.local/flydsl0341/flydsl/__init__.py
+[e2e_attn] layout q(4, 8192, 32, 128) torch.bfloat16 contig=True k(4, 8192, 8, 128) contig=True v(4, 8192, 8, 128) contig=True
+[e2e_attn] step_idx=0 arm fwd=fly bwd=fly adapter_copies_so_far=0 (0 MiB)
+/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/ref/common.py:130: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at /__w/rocm-npi-dev/rocm-npi-dev/_therock/external-builds/pytorch/pytorch/torch/csrc/autograd/generated/python_variable_methods.cpp:836.)
+  return float(10.0 * torch.log10(num / den))
+SQNR chain (module fwd+autograd bwd vs fp32 ref): {'o': 50.83, 'dq': 51.9, 'dk': 51.99, 'dv': 52.39} adapter copies: {'copies': 0, 'copy_bytes': 0}
+SQNR kernel fwd: {'o': 50.83, 'lse': 89.19, 'lse_shape': [4, 32, 8192]}
+SQNR kernel bwd on reference o/lse (job gate form): {'dq': 52.56, 'dk': 52.6, 'dv': 52.71}
+[e2e_attn] step_idx=1 arm fwd=fly bwd=fly adapter_copies_so_far=0 (0 MiB)
+[e2e_attn] step_idx=2 arm fwd=fly bwd=fly adapter_copies_so_far=0 (0 MiB)
+  m_fwd                  {'med': 1.146, 'p10': 1.1267, 'p90': 1.1674}
+  m_bwd                  {'med': 9.0082, 'p10': 8.9359, 'p90': 9.0654}
+  k_fwd                  {'med': 1.1341, 'p10': 1.1242, 'p90': 1.147}
+  k_bwd                  {'med': 9.0189, 'p10': 8.9196, 'p90': 9.0606}
+  overhead_fwd_ms        0.0119
+  overhead_bwd_ms        -0.0107
+adapter copies after timing: {'copies': 0, 'copy_bytes': 0}
+DONE {"arm": "fly", "shape": "prod", "sqnr_chain_db": {"o": 50.83, "dq": 51.9, "dk": 51.99, "dv": 52.39}}

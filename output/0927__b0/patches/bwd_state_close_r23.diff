@@ -1,0 +1,250 @@
+--- /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/state.yaml.bak.pre-b0-20260927	2026-09-27 12:06:37.265719821 +0000
++++ /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/state.yaml	2026-09-27 12:07:42.752634706 +0000
+@@ -202,8 +202,7 @@
+   guards: {}
+   guard_failed: null
+   note: null
+-  changed_disagreement: act.yaml reported 3 changed files; the working copy differs from op/current in
+-    2
++  changed_disagreement: act.yaml reported 3 changed files; the working copy differs from op/current in 2
+ - round: 3
+   progress:
+   - opt
+@@ -247,13 +246,12 @@
+     prod: 5498229227520.0
+   guards: {}
+   guard_failed: null
+-  note: 'CLOSED BY HAND 2026-09-22, not by the act module. The opt step shipped and validated this candidate
+-    on 2026-09-21 but was killed by a card wedge at 16:01:54 before writing act.yaml; the acceptance benchmark
+-    it had detached at 15:42:21 never returned. Every figure here is measured -- see rounds/003/1-opt/raw/bench_accept.json,
+-    a four-arm one-session sweep at 101 iterations taken after the 06:47:43 AC-cycle, and validation.py
+-    run against rounds/003/op on both 2026-09-21 and 2026-09-22. 2-reflect is marked done but was NOT
+-    re-run: its ledger writes had already landed before the wedge (pool.md 15:52, dead_ends.md 15:52,
+-    route.md 15:57).'
++  note: 'CLOSED BY HAND 2026-09-22, not by the act module. The opt step shipped and validated this candidate on 2026-09-21
++    but was killed by a card wedge at 16:01:54 before writing act.yaml; the acceptance benchmark it had detached at 15:42:21
++    never returned. Every figure here is measured -- see rounds/003/1-opt/raw/bench_accept.json, a four-arm one-session sweep
++    at 101 iterations taken after the 06:47:43 AC-cycle, and validation.py run against rounds/003/op on both 2026-09-21 and
++    2026-09-22. 2-reflect is marked done but was NOT re-run: its ledger writes had already landed before the wedge (pool.md
++    15:52, dead_ends.md 15:52, route.md 15:57).'
+   changed_disagreement: null
+ - round: 4
+   progress:
+@@ -301,8 +299,7 @@
+   guards: {}
+   guard_failed: null
+   note: null
+-  changed_disagreement: act.yaml reported 2 changed files; the working copy differs from op/current in
+-    1
++  changed_disagreement: act.yaml reported 2 changed files; the working copy differs from op/current in 1
+ - round: 5
+   progress:
+   - opt
+@@ -349,8 +346,7 @@
+   guards: {}
+   guard_failed: null
+   note: null
+-  changed_disagreement: act.yaml reported 3 changed files; the working copy differs from op/current in
+-    2
++  changed_disagreement: act.yaml reported 3 changed files; the working copy differs from op/current in 2
+ - round: 6
+   progress:
+   - opt
+@@ -484,20 +480,18 @@
+     prod: 5498229227520.0
+   guards: {}
+   guard_failed: null
+-  note: 'CLOSED BY HAND 2026-09-22 after the card wedged mid-round. The opt step built armA / armB / armAB
+-    and passed the full gate on armA and armB, then the GPU entered an unrecoverable MES state (GPU reset
+-    begin, unbounded REMOVE_QUEUE cascade across MES 0-7) and the one-session sweep never ran. The machine
+-    was AC-cycled at 14:40:38 and every figure here was re-measured after it. TWO CAVEATS. (1) ABSOLUTE
+-    FIGURES DO NOT COMPARE WITH ROUNDS 0-7: the identical round-7 kernel measures 404.06 at prod here
+-    against the 382.73 recorded in round 7''s own session, +5.6% on unchanged code (md5 3ad59da722a4),
+-    while beat at prod moved only -1.7%. (2) THE SCORE JUMP IS NOT PROGRESS: beat measured anomalously
+-    low at the small shapes this session -- fast 21.83 against 50.70, proxy 461.57 against 573.31, prod
+-    normal -- so score rises from 0.42321 to 0.60244 with no matching improvement. Rank on gain and on
+-    prod (h7); do not plot score across this boundary. champions.fast stays at 7 because fast regressed
+-    0.988x same-session. armAB''s correctness is bitwise identity to the incumbent (0 of 134,217,728 elements
+-    differing at prod), not a fresh SQNR: validation.py aborted at proxy with HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION
+-    inside op/eager/''s hipBLASLt GEMM (workgroup=[256,1,1], group_seg_size=6144), the same flake that
+-    aborted round 3. Determinism was run standalone and passed 200 runs. 2-reflect did not run.'
++  note: 'CLOSED BY HAND 2026-09-22 after the card wedged mid-round. The opt step built armA / armB / armAB and passed the
++    full gate on armA and armB, then the GPU entered an unrecoverable MES state (GPU reset begin, unbounded REMOVE_QUEUE cascade
++    across MES 0-7) and the one-session sweep never ran. The machine was AC-cycled at 14:40:38 and every figure here was re-measured
++    after it. TWO CAVEATS. (1) ABSOLUTE FIGURES DO NOT COMPARE WITH ROUNDS 0-7: the identical round-7 kernel measures 404.06
++    at prod here against the 382.73 recorded in round 7''s own session, +5.6% on unchanged code (md5 3ad59da722a4), while
++    beat at prod moved only -1.7%. (2) THE SCORE JUMP IS NOT PROGRESS: beat measured anomalously low at the small shapes this
++    session -- fast 21.83 against 50.70, proxy 461.57 against 573.31, prod normal -- so score rises from 0.42321 to 0.60244
++    with no matching improvement. Rank on gain and on prod (h7); do not plot score across this boundary. champions.fast stays
++    at 7 because fast regressed 0.988x same-session. armAB''s correctness is bitwise identity to the incumbent (0 of 134,217,728
++    elements differing at prod), not a fresh SQNR: validation.py aborted at proxy with HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION
++    inside op/eager/''s hipBLASLt GEMM (workgroup=[256,1,1], group_seg_size=6144), the same flake that aborted round 3. Determinism
++    was run standalone and passed 200 runs. 2-reflect did not run.'
+   changed_disagreement: null
+ - round: 9
+   progress:
+@@ -542,23 +536,20 @@
+     prod: 5498229227520.0
+   guards: {}
+   guard_failed: null
+-  note: 'CLOSED BY HAND 2026-09-23 after the 2026-09-22 16:01 card wedge. Unlike rounds 3 and 8 this needed
+-    NO further GPU work: _scratch/d_s2/out (rc=0) is a complete five-arm one-session 101-iteration palindromic
+-    sweep carrying cur AND beat at all three shapes, so the same-session champion reference that gain
+-    and score require was already on disk. The opt agent survived the wedge on the CPU side and had already
+-    written act.yaml, opt.md and the pool/route ledger entries; only this state entry and act.yaml''s
+-    canonical measurements.shapes block were missing. Shipped armAB = r9.i1.g25 + r9.i2.g26 (kernels.py
+-    md5 51a5d35f5b91). All three arms passed correctness (52.52-52.83 dB) and the 200-run determinism
+-    gate, and all three are BITWISE IDENTICAL to the incumbent in all nine shape x tensor cells, so unit_tests
+-    is pass by inheritance rather than by a fresh run -- act.yaml''s own note that pytest collected zero
+-    cases stands unsoftened. Zero hipBLASLt/Tensile firings this round: the 2026-09-22 refcache gate fix
+-    held. SCORE NOTE, opposite in sign to round 8''s: round 8''s 0.60244 was inflated by an anomalously
+-    low beat at the small shapes (fast 21.83 against round 7''s 50.70). Here beat is back on the round
+-    0-7 scale (48.90 / 572.01 / 720.32), so 0.52536 being numerically below 0.60244 is a return to normal,
+-    not a regression. Rank on gain and prod per h7: 1.1187 is the largest single-round gain since round
+-    4. champions.fast finally advances off 7 -- round 9 fast is 1.1074x round 8 same-session and round
+-    8 was 0.9878x round 7, i.e. about 1.0939x round 7 transitively. 2-reflect did not re-run; its ledger
+-    writes had already landed (pool.md 16:05, route.md 16:09).'
++  note: 'CLOSED BY HAND 2026-09-23 after the 2026-09-22 16:01 card wedge. Unlike rounds 3 and 8 this needed NO further GPU
++    work: _scratch/d_s2/out (rc=0) is a complete five-arm one-session 101-iteration palindromic sweep carrying cur AND beat
++    at all three shapes, so the same-session champion reference that gain and score require was already on disk. The opt agent
++    survived the wedge on the CPU side and had already written act.yaml, opt.md and the pool/route ledger entries; only this
++    state entry and act.yaml''s canonical measurements.shapes block were missing. Shipped armAB = r9.i1.g25 + r9.i2.g26 (kernels.py
++    md5 51a5d35f5b91). All three arms passed correctness (52.52-52.83 dB) and the 200-run determinism gate, and all three
++    are BITWISE IDENTICAL to the incumbent in all nine shape x tensor cells, so unit_tests is pass by inheritance rather than
++    by a fresh run -- act.yaml''s own note that pytest collected zero cases stands unsoftened. Zero hipBLASLt/Tensile firings
++    this round: the 2026-09-22 refcache gate fix held. SCORE NOTE, opposite in sign to round 8''s: round 8''s 0.60244 was
++    inflated by an anomalously low beat at the small shapes (fast 21.83 against round 7''s 50.70). Here beat is back on the
++    round 0-7 scale (48.90 / 572.01 / 720.32), so 0.52536 being numerically below 0.60244 is a return to normal, not a regression.
++    Rank on gain and prod per h7: 1.1187 is the largest single-round gain since round 4. champions.fast finally advances off
++    7 -- round 9 fast is 1.1074x round 8 same-session and round 8 was 0.9878x round 7, i.e. about 1.0939x round 7 transitively.
++    2-reflect did not re-run; its ledger writes had already landed (pool.md 16:05, route.md 16:09).'
+   changed_disagreement: null
+ - round: 10
+   progress:
+@@ -649,22 +640,19 @@
+     prod: 5498229227520.0
+   guards: {}
+   guard_failed: null
+-  note: 'CLOSED BY HAND 2026-09-23 after the fourth card wedge, which hit as validation.py began on the
+-    shipped tree (_scratch/d_s4/out has no rc). REJECTED, and correctly: gain 0.9291 with every shape
+-    below its same-session champion. Nothing promoted; best_round stays 9 and op/current is still round
+-    9''s ship. Every figure is the round''s own acceptance measurement from act.yaml, taken against rounds/009/op
+-    and beat in one session. A LATER session in the same round (raw/bench_final.json) disagrees in SIGN
+-    at the two small shapes -- candidate 20.02 vs incumbent 19.52 at fast and 269.22 vs 262.52 at proxy
+-    -- while agreeing at prod, 457.58 vs 461.43. Both sessions have prod at or below 1.0, and prod is
+-    what ranks (h7), so the verdict is the same either way; but the fast/proxy sign flip is another instance
+-    of the cross-session instability this ledger has recorded since round 8 and is not evidence for the
+-    candidate. Second consecutive rejection. Round 10 closed instruction-level scheduling of k_dkdv''s
+-    hot body; round 11''s arms RAISED the bank-switch count they were meant to cut (cur 323 at 740 VGPR,
+-    armA 339 at 772, armB 355 at 780), which the static screen showed before either reached the card.
+-    One thing did improve: UT_EXIT=0 with every shape PASS. The unit-test gate had been vacuous -- "no
+-    tests ran in 0.72s" -- until the 2026-09-23 fix to ut/test_correctness.py made it both reproducible
+-    (seed=0 instead of a PYTHONHASHSEED-salted hash) and cache-served. This round is the first whose UT
+-    gate actually checked anything.'
++  note: 'CLOSED BY HAND 2026-09-23 after the fourth card wedge, which hit as validation.py began on the shipped tree (_scratch/d_s4/out
++    has no rc). REJECTED, and correctly: gain 0.9291 with every shape below its same-session champion. Nothing promoted; best_round
++    stays 9 and op/current is still round 9''s ship. Every figure is the round''s own acceptance measurement from act.yaml,
++    taken against rounds/009/op and beat in one session. A LATER session in the same round (raw/bench_final.json) disagrees
++    in SIGN at the two small shapes -- candidate 20.02 vs incumbent 19.52 at fast and 269.22 vs 262.52 at proxy -- while agreeing
++    at prod, 457.58 vs 461.43. Both sessions have prod at or below 1.0, and prod is what ranks (h7), so the verdict is the
++    same either way; but the fast/proxy sign flip is another instance of the cross-session instability this ledger has recorded
++    since round 8 and is not evidence for the candidate. Second consecutive rejection. Round 10 closed instruction-level scheduling
++    of k_dkdv''s hot body; round 11''s arms RAISED the bank-switch count they were meant to cut (cur 323 at 740 VGPR, armA
++    339 at 772, armB 355 at 780), which the static screen showed before either reached the card. One thing did improve: UT_EXIT=0
++    with every shape PASS. The unit-test gate had been vacuous -- "no tests ran in 0.72s" -- until the 2026-09-23 fix to ut/test_correctness.py
++    made it both reproducible (seed=0 instead of a PYTHONHASHSEED-salted hash) and cache-served. This round is the first whose
++    UT gate actually checked anything.'
+   changed_disagreement: null
+ - round: 12
+   progress:
+@@ -850,9 +838,8 @@
+     prod: 5498229227520.0
+   guards: {}
+   guard_failed: null
+-  note: "FastError: {'id': 'r15.i1.g46', 'what': '\u628A k_dkdv \u5FAA\u73AF\u4F53\u91CC\u7684\u4E24\u5768\
+-    \u5168 drain\uFF08pops 74 / pops 22\uFF09\u6362\u6210\u624B\u5199\u7684\u5206\u7EA7\u7B49\u5F85 s_wait_loadcnt(N>0)\
+-    \ / s_wait_dscnt(N>0)'} was dropped without being written into facts.md or dead_ends.md, and without"
++  note: 'FastError: {''id'': ''r15.i1.g46'', ''what'': ''把 k_dkdv 循环体里的两坨全 drain（pops 74 / pops 22）换成手写的分级等待 s_wait_loadcnt(N>0)
++    / s_wait_dscnt(N>0)''} was dropped without being written into facts.md or dead_ends.md, and without'
+   changed_disagreement: null
+ - round: 16
+   progress:
+@@ -1135,9 +1122,8 @@
+     fast: 5498229227520.0
+   guards: {}
+   guard_failed: null
+-  note: 'FastError: {''id'': ''r21.i3.g65'', ''status'': ''CLOSED'', ''where'': ''offline screen, zero
+-    card time'', ''evidence'': ''k_dq ISA instruction-identical to incumbent after register renaming;
+-    k_dkdv and k_delta_bshd byte-ident'
++  note: 'FastError: {''id'': ''r21.i3.g65'', ''status'': ''CLOSED'', ''where'': ''offline screen, zero card time'', ''evidence'':
++    ''k_dq ISA instruction-identical to incumbent after register renaming; k_dkdv and k_delta_bshd byte-ident'
+   changed_disagreement: null
+ - round: 22
+   progress:
+@@ -1182,30 +1168,49 @@
+     fast: 5498229227520.0
+   guards: {}
+   guard_failed: null
+-  note: "FastError: {'id': 'r23.i1.g69', 'what': 'TDM / cluster \u591A\u64AD\u63A5\u7BA1 k_dq \u7684 K/V\
+-    \ staging\uFF08\u8BED\u6599\u5B9E\u6D4B +40.68%, n=5\uFF09', 'gate': '\u96F6\u5361\u65F6\u95F4\u2014\
+-    \u2014\u8BFB _ldkv \u7684\u6D88\u8D39\u8005\uFF0C\u5224\u5B9A K/V \u662F\u5426 dual-use\uFF1B\u662F\
+-    \u5219\u968F r5.i2.g18 \u514D\u8D39\u51FA\u5C40'} was dropped without being written into fact"
++  note: 'FastError: {''id'': ''r23.i1.g69'', ''what'': ''TDM / cluster 多播接管 k_dq 的 K/V staging（语料实测 +40.68%, n=5）'', ''gate'':
++    ''零卡时间——读 _ldkv 的消费者，判定 K/V 是否 dual-use；是则随 r5.i2.g18 免费出局''} was dropped without being written into fact'
+   changed_disagreement: null
+ - round: 23
+-  progress: []
++  progress:
++  - opt
++  - reflect
+   mode: fast
+-  running:
+-    module: opt
+-    step: null
+-    since: '2026-09-25T08:35:57'
+   seconds:
+     opt: 3245.7
+     round: 3245.7
+   closed_by_hand: true
+-  closed_at: '2026-09-24T14:45:00'
+-  closed_reason: 'Machine handed to another user at end of day. The job was stopped by explicit SIGTERM/
+-    SIGKILL on its own PID about two minutes into 1-opt, with the GPU idle and no work in flight. rounds/023/
+-    holds only op/, ids_before.yaml and timing.yaml -- no act.yaml, no raw/, no measurement was taken
+-    and no card time was spent. The next `resume` will move the partial 1-opt aside as stale; nothing
+-    needs reverting and op/current is untouched (byte-identical to rounds/020/op).
+-
+-    '
++  closed_at: '2026-09-27T12:30:00'
+   sessions:
+     opt: 1ea10b5c-e42a-4fbc-9c9c-534f4e3223b3
+   bound: latency
++  outcome: delivered
++  passed: false
++  accepted: false
++  validation_by: hand
++  validation_exit_code: null
++  tflops:
++    prod: 502.44
++    proxy: 438.65
++    fast: 48.93
++  incumbents:
++    prod: 511.33
++    proxy: 440.25
++    fast: 55.61
++  beats: &id001
++    prod: 716.48
++    proxy: 566.37
++    fast: 50.68
++  targets: *id001
++  gain: 0.9515
++  changed: 1
++  flops:
++    prod: 5498229227520.0
++    proxy: 343681269760.0
++    fast: 5373952000.0
++  guards: {}
++  guard_failed: null
++  note: 'CLOSED BY HAND 2026-09-27 on B0 before resuming on physical GPU 1 (container fa-g1). REJECTED: act.yaml (09-25 09:28,
++    g71) measured prod 502.44 vs champion 511.33 (0.983), proxy 0.996, fast 0.880 in one session; geomean 0.9515. rounds/023/op
++    is incomplete (no kernels.py), so redoing the round on resume would start from a broken tree. Nothing promoted; best_round
++    stays 20.'

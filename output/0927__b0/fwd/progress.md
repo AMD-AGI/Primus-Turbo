@@ -1,0 +1,16 @@
+# B0 fwd job progress (gfx1250-flydsl-attn-fwd-b0-20260927, physical GPU 0 / fa-g0)
+
+Clone of A0's job at round 4. prod FLOP 2.199292e12; ms = FLOP / TF/s. Same-session numbers per round.
+Baseline (vendored aiter FlyDSL) on B0: ~1.78 ms / ~1236 TF/s (probe, cross-session).
+
+| round | mode | UTC | accepted | prod TF/s (ms) | same-session champion prod | vs champion (prod / geomean-mean) | vs baseline (approx) | % ASM prod | proxy / fast TF/s | conclusion |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 5 | deep | 12:35-13:17 | failed | -- | -- | -- | -- | -- | -- | planner reviewer 401 (codex account missing on B0); reviewer switched to claude |
+| 6 | fast | 13:17-14:17 | **yes** | **1524.1 (1.443)** | r4 1441.7 (1.526) | **+5.7%** / 1.0148 | ~+23% | **84.8%** (r4 80.2%) | 1583.6 / 97.4 | speculative softmax (r5.i2.g14): skip row-max/rescale, ballot fallback to exact softmax; fast -3.6% (I$, +48% code); adversarial check PASS: 256 cases, r6 == all-slow-path variant bitwise, <=0.0004 dB vs r4 (verify_r6/REPORT.md) |
+| 7 | fast | 14:20-14:57 | no | 1513.7 (1.453) | r6 1510.8 (1.456) | +0.19% / 1.003 (< 1.007 bar) | ~+22% | 84.7% | 1592.5 / 97.7 | g18 (no speculation on masked tiles) proxy +1.6%, prod flat; g17 lost prod -0.5%; LO/HI prefetch order is a first-order prod term (all-HI -6.5%) |
+| 8 | fast | 14:59-15:34 | no | 1509.8 (1.457) | r6 1507.7 in-sweep (r7 1512.4) | +0.14% / 1.0030 (fast-weighted mean 1.07) | ~+22% | 84.3% | 1576.5 / 139.3 | h34: arm B m16x8 gate fast +29% with prod/proxy ISA == r6, rejected by proxy noise (98.7% < 0.993 band) -> band 0.98 + h37 re-land; nodelay -1.65% prod on r6 body (dead) |
+| 9 | fast | 09-28 ~02:00-02:40 | no (operator refactor h39 queued) | 1500.6 (1.466) | r6 1494.3 in-session (A/A 1.0012) | vs r6: prod +0.42%, proxy +1.04%, fast +27.5%; vs best-ever records 0.9984 | ~+21% | 85.7% | 1587.2 / 139.3 | BG = m16x8 gate + g18; rejected only by best-ever records of unshipped r7/r8 arms -> adopted via refactor hint h39 (clears champions) |
+| 10 | refactor (h39) | 09-28 | **promoted** | = r9 BG | -- | correct vs eager (1 turn); champions cleared | -- | -- | -- | op/current = r9 BG (m16x8 gate + g18); round 10 deep continues on top |
+| ruler | audit | 09-28 01:55-03:05 | -- | -- | -- | blocked-timing re-measure: r6 vs r4 **+4.6%** (real), L12 occ2 **dead** (-0.4% prod, -7% proxy), bnegg vs r6 +0.6%; r6 vs ASM steady-state **1.035x (faster)** | -- | -- | -- | harness switched to blocked timing (h40/h41) |
+| 10 | deep (blocked ruler from act) | 09-28 02:34-~04:40 | no | 1491.8 (1.474) | r10/BG 1502.5 (1.464) | prod 0.9929 / geomean 0.9972 | ~+21% | **95.8% (champ 96.5%) -- blocked ruler: ASM beat 1557.2 prod** | 1618.2 / 143.8 | g24 = L12 occ2 4-wave prod-gated: -0.7% prod, confirms h41 (L12 dead); proxy now 102% of ASM |
+| 11 | fast | 09-28 03:50-04:25 | **yes** | 1500.7 (1.466) | r10 1501.9 | prod -0.1% (flat), fast +8.4%, proxy -0.2%; geomean 1.0271 | ~+21% | 96.4% (beat 1557.1); proxy 102%; **fast 99.7% of ASM** | 1598.0 / 155.5 | r9.i1.g20: 2-wave m32x2 kernel for under-filled grids (fast only); 1-wave g46 lost |

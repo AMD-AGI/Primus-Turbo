@@ -1,0 +1,5 @@
+prod_causal base=6a5ed39f88 off=6a5ed39f88 gate=6a5ed39f88 rot=7132b9567c gate_l5=7132b9567c 
+proxy_causal base=6a5ed39f88 off=6a5ed39f88 gate=6a5ed39f88 rot=7132b9567c gate_l5=7132b9567c 
+fast_causal base=6a5ed39f88 off=6a5ed39f88 gate=6a5ed39f88 rot=7132b9567c gate_l5=7132b9567c 
+prod_nc base=769c753f86 off=769c753f86 gate=769c753f86 rot=769c753f86 gate_l5=769c753f86 
+gqa1_causal base=105a30a32e off=105a30a32e gate=105a30a32e rot=e4966db082 gate_l5=e4966db082 

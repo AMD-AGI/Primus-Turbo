@@ -1,0 +1,6 @@
+{
+ "arm": "nosm2",
+ "llvm_options_delta": {
+  "amdgpu-expert-scheduling-mode": false
+ }
+}

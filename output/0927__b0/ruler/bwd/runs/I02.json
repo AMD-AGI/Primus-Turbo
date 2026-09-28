@@ -1,0 +1,36 @@
+[
+  {
+    "shape": "prod",
+    "arm": "current_copy",
+    "stat": "median",
+    "iters": 101,
+    "latency_ms": 8.765422821044922,
+    "min_ms": 8.641837120056152,
+    "max_ms": 8.843859672546387,
+    "tflops": 627.263434950256,
+    "bw_gbs": 153.1217954229845,
+    "flop": 5498229227520.0,
+    "bytes_min": 1342177280,
+    "sclk_start": 1774,
+    "sclk_end": 1776,
+    "causal": true,
+    "order": "interleaved"
+  },
+  {
+    "shape": "prod",
+    "arm": "current",
+    "stat": "median",
+    "iters": 101,
+    "latency_ms": 8.772354125976562,
+    "min_ms": 8.71134090423584,
+    "max_ms": 8.823189735412598,
+    "tflops": 626.767814951602,
+    "bw_gbs": 153.00080921557478,
+    "flop": 5498229227520.0,
+    "bytes_min": 1342177280,
+    "sclk_start": 1774,
+    "sclk_end": 1776,
+    "causal": true,
+    "order": "interleaved"
+  }
+]

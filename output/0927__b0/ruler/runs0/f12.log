@@ -1,0 +1,37 @@
+# arm r4_a -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/r4_a  impl=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/r4_a/impl.py kernel=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/r4_a/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py md5=826b66f5 O_VARIANT=v3
+# arm r6_a -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/r6_a  impl=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/r6_a/impl.py kernel=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/r6_a/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py md5=a60bff8e O_VARIANT=v3
+# arm l12_a -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/l12_a  impl=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/l12_a/impl.py kernel=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/l12_a/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py md5=3610fe68 O_VARIANT=v3
+# arm r6_b -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/r6_b  impl=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/r6_b/impl.py kernel=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/r6_b/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py md5=a60bff8e O_VARIANT=v3
+# arm l12_b -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/l12_b  impl=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/l12_b/impl.py kernel=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/arms/l12_b/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py md5=3610fe68 O_VARIANT=v3
+# ENV TORCH_BLAS_PREFER_HIPBLASLT=1 HIPBLASLT_TENSILE_LIBPATH=/home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250
+# statistic median  iters 101  warmup 8.0s continuous  order blocked 9+lead 4, palindromic rounds  device gfx1250
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+RESULT shape=proxy arm=r4_a stat=median iters=101 latency_ms=0.08759 min_ms=0.0824 max_ms=0.10472 tflops=1569.48 bw_gbs=957.7 flop=137472507904.0 bytes_min=83886080 sclk_start=1290 sclk_end=1568 causal=True order=blocked9+lead4
+RESULT shape=proxy arm=r6_a stat=median iters=101 latency_ms=0.08541 min_ms=0.08156 max_ms=0.11565 tflops=1609.6 bw_gbs=982.18 flop=137472507904.0 bytes_min=83886080 sclk_start=1290 sclk_end=1568 causal=True order=blocked9+lead4
+RESULT shape=proxy arm=l12_a stat=median iters=101 latency_ms=0.09198 min_ms=0.08873 max_ms=0.09582 tflops=1494.62 bw_gbs=912.02 flop=137472507904.0 bytes_min=83886080 sclk_start=1290 sclk_end=1568 causal=True order=blocked9+lead4
+RESULT shape=proxy arm=r6_b stat=median iters=101 latency_ms=0.08583 min_ms=0.0836 max_ms=0.09078 tflops=1601.71 bw_gbs=977.37 flop=137472507904.0 bytes_min=83886080 sclk_start=1290 sclk_end=1568 causal=True order=blocked9+lead4
+RESULT shape=proxy arm=l12_b stat=median iters=101 latency_ms=0.09248 min_ms=0.08986 max_ms=0.09622 tflops=1486.53 bw_gbs=907.09 flop=137472507904.0 bytes_min=83886080 sclk_start=1290 sclk_end=1568 causal=True order=blocked9+lead4
+rc=0 newdmesg_g0=0

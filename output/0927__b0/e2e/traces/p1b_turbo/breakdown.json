@@ -1,0 +1,358 @@
+[
+ {
+  "trace": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/traces/p1b_turbo/iteration_21/rank0_trace.json",
+  "steps": [
+   "ProfilerStep#20"
+  ],
+  "cpu_step_ms": [
+   17665.89298046875
+  ],
+  "gpu_span_ms": 17663.77523339844,
+  "gpu_busy_ms": 17658.323443359375,
+  "idle_ms": 5.451790039063781,
+  "kernel_sum_ms": 17658.32342599999,
+  "buckets": {
+   "memcpy": 10.009531,
+   "elementwise": 254.68059000000048,
+   "gemm": 16406.012335999993,
+   "attn_fwd": 190.16681599999995,
+   "memset": 0.109971,
+   "attn_bwd": 770.4385990000002,
+   "optimizer": 26.90558299999998
+  },
+  "arm_ranges": {
+   "e2e::attn_fwd[turbo]": 190.16681599999995,
+   "e2e::attn_bwd[turbo]": 770.4385990000002
+  },
+  "top": {
+   "memcpy": [
+    [
+     "Memcpy DtoD (Device -> Device)",
+     9.994,
+     68
+    ],
+    [
+     "Memcpy HtoD (Host -> Device)",
+     0.016,
+     3
+    ]
+   ],
+   "elementwise": [
+    [
+     "void at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_impl_nocast<at::native::Binar",
+     47.977,
+     388
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase",
+     25.62,
+     492
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<8, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10:",
+     25.203,
+     96
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::b",
+     25.0,
+     262
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte",
+     20.678,
+     492
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*",
+     17.597,
+     224
+    ],
+    [
+     "void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous namespace)::TensorLis",
+     16.756,
+     768
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<8, at::native::(anonymous namespace)::silu_kernel(at::TensorIte",
+     11.727,
+     32
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<8, at::native::(anonymous namespace)::silu_backward_kernel(at::",
+     11.666,
+     32
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<float>, std::array<char*, 3ul> >",
+     8.617,
+     65
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_",
+     7.556,
+     130
+    ],
+    [
+     "void at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_impl_nocast<at::native::BUnar",
+     7.294,
+     65
+    ]
+   ],
+   "gemm": [
+    [
+     "Cijk_Ailk_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM",
+     9255.01,
+     225
+    ],
+    [
+     "Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM",
+     6867.431,
+     225
+    ],
+    [
+     "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x128_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_A",
+     283.571,
+     225
+    ]
+   ],
+   "attn_fwd": [
+    [
+     "attn_fwd",
+     190.102,
+     32
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<float>, std::array<char*, 1ul> >(int",
+     0.065,
+     32
+    ]
+   ],
+   "memset": [
+    [
+     "Memset (Device)",
+     0.11,
+     66
+    ]
+   ],
+   "attn_bwd": [
+    [
+     "_bwd_kernel_dkdv",
+     567.191,
+     32
+    ],
+    [
+     "_bwd_kernel_dq",
+     195.526,
+     32
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase",
+     3.91,
+     96
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<float>, std::array<char*, 1ul> >(int",
+     2.503,
+     128
+    ],
+    [
+     "_bwd_preprocess_use_o",
+     1.308,
+     32
+    ]
+   ],
+   "optimizer": [
+    [
+     "void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous namespace)::FusedOpti",
+     26.897,
+     384
+    ],
+    [
+     "void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous namespace)::TensorLis",
+     0.008,
+     3
+    ]
+   ]
+  },
+  "fa_path_ms": 960.6054150000001
+ },
+ {
+  "trace": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/traces/p1b_turbo/iteration_42/rank0_trace.json",
+  "steps": [
+   "ProfilerStep#41"
+  ],
+  "cpu_step_ms": [
+   17752.35784375
+  ],
+  "gpu_span_ms": 17749.499966796873,
+  "gpu_busy_ms": 17743.931088867186,
+  "idle_ms": 5.568877929687005,
+  "kernel_sum_ms": 17743.931077999994,
+  "buckets": {
+   "memcpy": 10.008608000000006,
+   "elementwise": 254.43206299999997,
+   "gemm": 16490.076632999993,
+   "attn_fwd": 191.40157299999998,
+   "memset": 0.11394800000000002,
+   "attn_bwd": 771.3425179999995,
+   "optimizer": 26.555734999999984
+  },
+  "arm_ranges": {
+   "e2e::attn_fwd[turbo]": 191.40157299999998,
+   "e2e::attn_bwd[turbo]": 771.3425179999995
+  },
+  "top": {
+   "memcpy": [
+    [
+     "Memcpy DtoD (Device -> Device)",
+     9.978,
+     68
+    ],
+    [
+     "Memcpy HtoD (Host -> Device)",
+     0.03,
+     3
+    ]
+   ],
+   "elementwise": [
+    [
+     "void at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_impl_nocast<at::native::Binar",
+     48.074,
+     388
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase",
+     25.646,
+     492
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<8, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10:",
+     25.066,
+     96
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::b",
+     24.897,
+     262
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte",
+     20.668,
+     492
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*",
+     17.588,
+     224
+    ],
+    [
+     "void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous namespace)::TensorLis",
+     16.656,
+     768
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<8, at::native::(anonymous namespace)::silu_kernel(at::TensorIte",
+     11.829,
+     32
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<8, at::native::(anonymous namespace)::silu_backward_kernel(at::",
+     11.715,
+     32
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<float>, std::array<char*, 3ul> >",
+     8.618,
+     65
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_",
+     7.569,
+     130
+    ],
+    [
+     "void at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_impl_nocast<at::native::BUnar",
+     7.29,
+     65
+    ]
+   ],
+   "gemm": [
+    [
+     "Cijk_Ailk_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM",
+     9322.209,
+     225
+    ],
+    [
+     "Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT32x16x32_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_AFEM",
+     6883.758,
+     225
+    ],
+    [
+     "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x128_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_A",
+     284.109,
+     225
+    ]
+   ],
+   "attn_fwd": [
+    [
+     "attn_fwd",
+     191.338,
+     32
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<float>, std::array<char*, 1ul> >(int",
+     0.064,
+     32
+    ]
+   ],
+   "memset": [
+    [
+     "Memset (Device)",
+     0.114,
+     66
+    ]
+   ],
+   "attn_bwd": [
+    [
+     "_bwd_kernel_dkdv",
+     567.563,
+     32
+    ],
+    [
+     "_bwd_kernel_dq",
+     196.059,
+     32
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase",
+     3.918,
+     96
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<float>, std::array<char*, 1ul> >(int",
+     2.487,
+     128
+    ],
+    [
+     "_bwd_preprocess_use_o",
+     1.314,
+     32
+    ]
+   ],
+   "optimizer": [
+    [
+     "void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous namespace)::FusedOpti",
+     26.548,
+     384
+    ],
+    [
+     "void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous namespace)::TensorLis",
+     0.008,
+     3
+    ]
+   ]
+  },
+  "fa_path_ms": 962.7440909999995
+ }
+]

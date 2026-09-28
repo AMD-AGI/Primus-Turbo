@@ -1,0 +1,6 @@
+{
+ "arm": "relaxocc",
+ "llvm_options_delta": {
+  "amdgpu-schedule-relaxed-occupancy": true
+ }
+}
