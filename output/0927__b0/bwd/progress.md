@@ -14,3 +14,4 @@ Champion before B0: round 20 (A0 511 TF/s; B0 re-measure ~633-650 TF/s, 0.74-0.7
 | 28 opt | fast | 09-28 06:50-~07:50 | no | 637.2 (8.629) | r19h 640.6 (8.583) | 0.9967 | 78.0% (beat 816.8) | 588.2 / 98.3 | round's own arms on top of the new r19h champion null; h70 (u2n) applies from r29 |
 | **29** | fast | 09-28 07:40-08:40 | **yes** | **656.5 (8.375)** | r19h 639.0 (8.604) | prod +2.7% (opt: +2.48%), proxy +2.8%; geomean 1.018 | **80.4%** (beat 817.0) | 603.8 / 98.6 | h70 u2n: k_dq kv-loop unroll x2 -- lab result confirmed on the job's card |
 | 30 | deep | 09-28 08:40-10:30 | no | 656.4 (8.377) | r29 657.7 | prod -0.2%, proxy +0.2%, fast +1.0%; geomean 1.0033 | 80.0% (beat 820.7) | 605.9 / 100.4 | g89 null (see rounds/030/act.md) |
+| 31 | fast | 09-28 10:30-11:21 | no | 653.1 (8.419) | r29 657.1 | prod -0.6%, proxy -2.5%; geomean 0.9915 | 79.8% (beat 818.6) | 588.4 / 98.7 | round arms null/loss (see rounds/031/opt.md) |

@@ -1,0 +1,50 @@
+$ python validation.py /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/031/op
+(cwd /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op)
+exit 2
+
+--- stdout ---
+validation.py  impl=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/031/op
+  gate 50.0 dB vs op/eager/ | dk,dv bitwise x200, dq >= 70 dB run-to-run | geomean speedup vs beat >= 1.00 | shapes ['fast', 'proxy', 'prod']
+
+  correctness fast     dq  52.61 dB  dk  52.65 dB  dv  52.83 dB
+  correctness proxy    dq  52.52 dB  dk  52.57 dB  dv  52.67 dB
+  correctness prod     dq  52.56 dB  dk  52.60 dB  dv  52.71 dB
+  determinism fast: dk/dv bitwise identical across 200 runs; dq bitwise (floor 70 dB)
+
+$ /opt/venv/bin/python /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/benchmark.py --arm-path candidate=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/031/op --arms beat --shapes fast --json /tmp/validation-pofiesy5/bench_fast.json
+# arm candidate -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/031/op md5=bb5380c2
+# arm beat -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/beat md5=2802a918
+# statistic median  iters 51  warmup 3.0s continuous  order blocked 9+lead 4, palindromic rounds  device gfx1250
+RESULT shape=fast arm=candidate stat=median iters=54 latency_ms=0.05440150015056133 min_ms=0.052678998559713364 max_ms=0.07162699848413467 tflops=98.78315827922164 bw_gbs=192.7476259106764 flop=5373952000.0 bytes_min=10485760 sclk_start=2331 sclk_end=2327 causal=True order=blocked9+lead4
+RESULT shape=fast arm=beat stat=median iters=54 latency_ms=0.09396100044250488 min_ms=0.08877299726009369 max_ms=0.16745099425315857 tflops=57.19343104789889 bw_gbs=111.59693863004662 flop=5373952000.0 bytes_min=10485760 sclk_start=2331 sclk_end=2327 causal=True order=blocked9+lead4
+$ /opt/venv/bin/python /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/benchmark.py --arm-path candidate=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/031/op --arms beat --shapes proxy --json /tmp/validation-pofiesy5/bench_proxy.json
+# arm candidate -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/031/op md5=bb5380c2
+# arm beat -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/beat md5=2802a918
+# statistic median  iters 51  warmup 3.0s continuous  order blocked 9+lead 4, palindromic rounds  device gfx1250
+RESULT shape=proxy arm=candidate stat=median iters=54 latency_ms=0.5817719995975494 min_ms=0.5633639693260193 max_ms=0.6082710027694702 tflops=590.7490735163386 bw_gbs=288.3812904644074 flop=343681269760.0 bytes_min=167772160 sclk_start=1895 sclk_end=1932 causal=True order=blocked9+lead4
+RESULT shape=proxy arm=beat stat=median iters=54 latency_ms=0.45952798426151276 min_ms=0.42844200134277344 max_ms=0.5286309719085693 tflops=747.9006318022504 bw_gbs=365.0967204306812 flop=343681269760.0 bytes_min=167772160 sclk_start=1895 sclk_end=1932 causal=True order=blocked9+lead4
+$ /opt/venv/bin/python /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/benchmark.py --arm-path candidate=/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/031/op --arms beat --shapes prod --json /tmp/validation-pofiesy5/bench_prod.json
+# arm candidate -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/rounds/031/op md5=bb5380c2
+# arm beat -> /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/beat md5=2802a918
+# statistic median  iters 51  warmup 3.0s continuous  order blocked 9+lead 4, palindromic rounds  device gfx1250
+RESULT shape=prod arm=candidate stat=median iters=54 latency_ms=8.41344404220581 min_ms=8.370380401611328 max_ms=8.473493576049805 tflops=653.5051757565967 bw_gbs=159.52768845516823 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1763 sclk_end=1810 causal=True order=blocked9+lead4
+RESULT shape=prod arm=beat stat=median iters=54 latency_ms=6.704864501953125 min_ms=6.565957069396973 max_ms=6.846096038818359 tflops=820.0358450075116 bw_gbs=200.17962773282355 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1763 sclk_end=1810 causal=True order=blocked9+lead4
+
+  shape     candidate ms     TF/s    beat ms     TF/s   x beat
+  fast            0.0544     98.8     0.0940     57.2    1.727
+  proxy           0.5818    590.7     0.4595    747.9    0.790
+  prod            8.4134    653.5     6.7049    820.0    0.797
+  geomean over 3 shapes (op.shape.mode=sweep): 1.028x beat (reported only)
+  target: proxy and prod each >= 1.00x beat -> min 0.790x
+
+  correctness  pass
+  determinism  pass
+  speed        FAIL
+RESULT: FAILED
+
+--- stderr ---
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+

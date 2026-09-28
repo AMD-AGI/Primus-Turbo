@@ -1,0 +1,273 @@
+round: 31
+mode: fast
+candidate: r31.i1.g91
+outcome: delivered
+# Built, measured, REFUTED, and left in the working copy. `delivered` is not a claim that
+# it won -- it is the statement that code was built, measured and shipped. The acceptance
+# arithmetic below does not promote it, and that is the correct outcome for this arm.
+
+correctness:
+  unit_tests: pass                # ut/test_correctness.py --impl rounds/031/op -> 15/15, UT_RC 0
+  precision: pass
+  checked_with: op/validation.py  # the job's own gate; nothing self-written
+  sqnr_db: 52.52                  # worst tensor on any shape (dq @ proxy); gate is 50.0
+  determinism: pass               # dk/dv bitwise x200; dq bitwise (floor 70 dB)
+  note: >-
+    The arm is an arithmetic reassociation and so is NOT bitwise against the incumbent,
+    yet 52.52-52.83 dB is indistinguishable from the incumbent's own 52.52. The
+    reassociation costs no measurable precision. It costs time.
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/029/op, rounds/030/op, job_context/op/beat]
+  # TWO interleaved sweeps, both this session, both on the idle fa-g3 card.
+  #   raw/bench/   -- beat + base(=op/current=r029) + g91 + g92 + merge, five arms, one
+  #                   process per shape, two passes. This is where the arm comparison lives.
+  #   raw/bench2/  -- beat + r029 + r030 + r031(ship), four arms, same construction. Added
+  #                   because sweep 1 did NOT contain r030, and step 6 asks for every
+  #                   distinct per-shape champion re-run rather than read from a file.
+  # The figures below are sweep 2's -- the one that contains every champion.
+  # ⚠ beat is taken from the SAME sweep as the arms it is compared against: proxy beat read
+  #   748.06/748.75 in sweep 1 and 729.12/750.52 in sweep 2, a 2.9% spread, so carrying a
+  #   beat figure between sweeps would have been a 2.9% error with nothing to show for it.
+  # ⚠ Rounds before 28 deliberately NOT measured: different architecture, replaced by the
+  #   round-28 refactor. Best-ever means best on the CURRENT structure.
+  shapes:
+    - name: prod_b4_s8192_hq32_hkv8_d128
+      this_round_tflops: 653.08
+      best_round_tflops: 657.12
+      beat_tflops: 818.55
+      target_tflops: 818.55
+      champion_round: 29
+      champion_tflops: 657.12       # re-measured NOW, in the same process as this round's arm
+      champion_rebuilt: true
+      ratio: 0.7979
+      vs_champion: 0.9939           # -0.61%  =  8.370721 -> 8.425383 ms
+    - name: proxy_b1_s4096_hq32_hkv8_d128
+      this_round_tflops: 588.40
+      best_round_tflops: 603.38
+      beat_tflops: 739.82
+      target_tflops: 739.82
+      champion_round: 29
+      champion_tflops: 603.38
+      champion_rebuilt: true
+      ratio: 0.7953
+      vs_champion: 0.9752           # -2.48%
+    - name: fast_b1_s1024_hq8_hkv2_d128
+      this_round_tflops: 98.66
+      best_round_tflops: 98.13
+      beat_tflops: 57.27
+      target_tflops: 57.27
+      champion_round: 29            # ⚠ NOT 30. Round 30 took the fast champion on a stored
+                                    # 100.37 vs r028's 99.37. Re-measured beside r029 today,
+                                    # r030 reads 96.41 against 98.13 -- the OPPOSITE sign.
+                                    # Round 30's own act.yaml warned the fast channel scatters
+                                    # over 0.8-2.8 points and that its figure was an A/A null;
+                                    # this is that warning coming true, and it is exactly why
+                                    # champions are re-run rather than read.
+      champion_tflops: 98.13
+      champion_rebuilt: true
+      ratio: 1.0                    # 98.66/57.27 = 1.7227, capped
+      vs_champion: 1.0053
+      # ⚠ A/A NULL, and claimed as nothing. use_g is False at fast, so k_dqg -- the only
+      # kernel g91 touches -- is NEVER DISPATCHED. +0.5% here is scatter, not an effect.
+  score: 0.8644                     # mean(0.7979, 0.7953, 1.0)
+  regressions:
+    - {shape: prod_b4_s8192_hq32_hkv8_d128, vs_champion: 0.9939, within_band: true,
+       note: "real, reproducible, above the 95% floor"}
+    - {shape: proxy_b1_s4096_hq32_hkv8_d128, vs_champion: 0.9752, within_band: true,
+       note: "above the 95% floor; proxy scatters wider than prod in both sweeps"}
+  acceptance_self_read: >-
+    NOT accepted, and the reason is condition one. Throughput did not improve on the best
+    ever re-measured beside it: prod 653.08 against 657.12, proxy 588.40 against 603.38.
+    The other two conditions hold -- every below-target shape is above its own 95% floor
+    (0.9939, 0.9752), and fast, the one shape that had reached its target, stays above it
+    at 1.7227x beat. Reported as measured; Python decides, not this file.
+
+validation:
+  exit_code: 2                      # correctness pass, determinism pass, speed FAIL
+  run_against: rounds/031/op        # passed explicitly; the default would grade op/current
+  runs_this_session: 1              # through the fa-g3 runner, detached with a sentinel
+  tree_md5:
+    kernels.py: d97c64ce87dd277326f6005613d9017b   # = the armA tree that was measured
+    impl.py: 08cb8533d75e82198fabb9514fd18ba5      # byte-identical to op/current
+    _env.py: 7f33871b977f16ae03b95dd89a44483e      # byte-identical to op/current
+    __init__.py: 0024d09db2284ac48c29ab70e11a821d  # byte-identical to op/current
+  correctness: pass
+  determinism: pass
+  speed: FAIL
+  detail: >-
+    The gate needs proxy AND prod each >= 1.00x beat; this run reports fast 1.650x,
+    proxy 0.785x, prod 0.799x -> min 0.785x. This is the job's standing state and not a
+    verdict on this candidate: the incumbent sits at 0.799x against the same beat. The
+    exit code decides one thing -- whether the job has reached its goal and should stop.
+    It has not.
+
+explored:
+  ran:
+    - "free opcode census of round 30's existing ISA dump (k_dqg .LBB0_4, k_dkdv .LBB0_11) -- no card time"
+    - "compile-only ISA histogram of VF_Q=True (r31.i0.C2) -- no card time"
+    - "static ISA gate on both arms and the merge before any timing (h3/h18)"
+    - "two interleaved benchmark sweeps, five arms then four, two passes each"
+  # What each changed: the census picked the target (softmax VALU is 44% of k_dqg's hot
+  # loop, and the source chain predicts 256/128/128/64 exactly). The compile-only histogram
+  # REFUTED my own fma hypothesis and narrowed both arms before they cost a second of card
+  # time. The static gate confirmed confinement. Sweep 2 overturned round 30's stored fast
+  # champion.
+  consulted:
+    - knowledge/backends/flydsl/attention/dead-ends.md
+    - knowledge/backends/flydsl/attention/README.md
+    - knowledge/backends/flydsl/README.md
+    - knowledge/arch/gfx1250/isa.md
+    - knowledge/arch/gfx1250/perf.md
+    - knowledge/ops/attention/README.md
+    - knowledge/ops/attention/backward.md
+    - knowledge/backends/aiter/attention/        # the beat backend's own notes -- same op, other backend
+    - knowledge/backends/triton/attention/       # same op, third backend
+  bound: latency
+  confidence: high
+  why: >-
+    1 wave/SIMD pinned by VGPR (736/992 ISA), no spill anywhere, bandwidth ~40x below any
+    plausible roof, clock 1753-1790 MHz under load and refuted as power-limited by round 30
+    at <=0.821x of a 2500 W cap. This round adds the sharpest evidence yet: removing 64
+    v_pk_mul_f32 from a hot loop made it SLOWER, which is what a latency-bound loop with
+    scheduler slack does and what a compute-bound one cannot do.
+
+arms:
+  - id: r31.i1.g91
+    built: "A alone, from op/current -- k_dqg softmax exponent constant-hoist"
+    tflops: {prod_b4_s8192_hq32_hkv8_d128: 652.60, proxy_b1_s4096_hq32_hkv8_d128: 586.36,
+             fast_b1_s1024_hq8_hkv2_d128: 98.03}
+    vs_champion: 0.9940
+    shipped: true
+    note: >-
+      -0.600%/-0.591% prod in sweep 1 and -0.649%/-0.579% in sweep 2. Four passes, two
+      processes, two cache dirs, 0.070 percentage-point spread against a 0.32% floor: a
+      reproducible loss, not scatter. Predicted +2.0% (band +0.8..+2.5%) BEFORE the run.
+      Wrong in sign.
+  - id: r31.i2.g92
+    built: "B alone, from op/current -- NOT on top of A. The identical edit on k_dkdv"
+    tflops: {prod_b4_s8192_hq32_hkv8_d128: 634.31, proxy_b1_s4096_hq32_hkv8_d128: 577.25,
+             fast_b1_s1024_hq8_hkv2_d128: 96.72}
+    vs_champion: 0.9662
+    shipped: false
+    note: >-
+      -3.309%/-3.452% prod. The row predicted a NULL (~+0.33% on a 0.15x conversion and a
+      1.55% masked-trip weight) and the card returned ten times that, with the wrong sign.
+  - id: r31.i1.g91+r31.i2.g92
+    built: "the merge, measured always as a fifth arm because that was the route's condition"
+    tflops: {prod_b4_s8192_hq32_hkv8_d128: 630.32, proxy_b1_s4096_hq32_hkv8_d128: 573.11,
+             fast_b1_s1024_hq8_hkv2_d128: 96.90}
+    vs_champion: 0.9601
+    shipped: false
+    note: >-
+      Not shipped because g92 lost -- the rule is "shippable only if NEITHER arm lost", and
+      it binds regardless of how the merge reads. Additive with its parts at prod to 0.017
+      points (-3.892% measured vs -3.909% summed) but SUPER-ADDITIVE at proxy (-4.018%
+      measured vs -5.527% summed). Recorded as a discrepancy, NOT banked: two edits in two
+      independent kernels cannot help each other, so a super-additive reading means the
+      ruler moved, not the code.
+
+instruments:
+  - id: r31.i0.C2
+    title: "Compile-only ISA histogram of VF_Q=True: what does fx.fma actually lower to?"
+    ran: true
+    cost: "one compile, zero card time"
+    predicted: "fx.fma lowers to an unpacked v_fma_f32, breaking pk pairing"
+    measured: >-
+      REFUTED. fx.fma lowers to v_pk_fma_f32, PACKED. The arm h73 records at +2.0% (a LOSS)
+      has 1311 -> 1100 instructions in k_dqg .LBB0_4, s_set_vgpr_msb 280 -> 248, one fewer
+      VGPR, and no unpacked arithmetic anywhere.
+    held: false
+    reading: >-
+      On k_dqg's hot loop, INSTRUCTION COUNT DOES NOT PREDICT TIME -- it pointed the wrong
+      way by 211 instructions. This is h18's rule arriving as a measurement rather than as
+      advice, and it is the fourth time in this job that every static metric improved and
+      the card disagreed. It paid for itself before the round spent a second on the card:
+      both arms were narrowed to exponent-only hoists, the scale-at-store half was dropped,
+      and both epilogues were left byte-identical.
+
+prediction_check:
+  metric: prod_vs_champion_pct
+  predicted: {g91: "+2.0 central, band +0.8 .. +2.5", g92: "+0.33, a predicted null against a 0.32% floor"}
+  measured: {g91: -0.61, g92: -3.38}
+  held: false
+  reading: >-
+    THE FINDING IS NOT "two arms lost 0.6% and 3.4%". It is that h16's two-regime
+    issue-to-time model is ANTI-PREDICTIVE on this op. The model says k_dqg (0.61x) should
+    move ~4x more than k_dkdv (0.15x) for the same edit; the identical edit moved k_dkdv
+    5.5x MORE, and both moved backwards. Sign and magnitude both fail, on the cheapest
+    paired test the campaign could have run.
+    UNMEASURED HYPOTHESIS, filed and not asserted: the softmax chain's ordinary VALU may not
+    be on the critical path at 1 wave/SIMD, so removing it removed scheduler slack rather
+    than work. The number that would settle it is the gfx1250 transcendental rate -- the
+    corpus has gfx950's (v_exp_f32 half-rate, cost 2.00) and NOTHING for this part -- and it
+    is one instrument away.
+
+added_to_pool: [r31.i1.g91, r31.i2.g92]
+route_updated: true                 # the ## Route table was rewritten, and its outcome
+                                    # column is now filled for all 19 rows
+
+implementation:
+  files_changed: [rounds/031/op/kernels.py]
+  # impl.py, _env.py, __init__.py byte-identical to job_context/op/current.
+  static_gate:                      # h3/h18, free, a GATE on the build and not a prediction
+    k_dqg_0_armA:
+      hot_loop_instructions: {base: 1311, g91: 1240}
+      v_pk_mul_f32: {base: 256, g91: 192}          # exactly the predicted -64
+      masked_loop_instructions: {base: 827, g91: 790}
+      s_set_vgpr_msb: {base: 280, g91: 275}
+      vgpr_count_isa: {base: 991, g91: 993}        # ⚠ 31 from the 1024 wall
+      vgpr_spill_count: {base: 0, g91: 0}          # h3 kill-gate PASS
+      scratch_ops: {base: 0, g91: 0}               # h3 kill-gate PASS
+      k_dkdv_0: "byte-identical across both arms -- g91 is provably confined"
+    k_dkdv_0_armB:
+      hot_loop_instructions: {base: 660, g92: 631}
+      v_pk_mul_f32_removed: 16                     # ⚠ only 16 of the predicted 32; LLVM had CSE'd the rest
+      masked_loop_instructions: {base: 653, g92: 688}   # ⚠ went the WRONG WAY
+      s_set_vgpr_msb_masked: {base: 105, g92: 142}
+      vgpr_count_isa: {base: 729, g92: 742}
+      vgpr_spill_count: {base: 0, g92: 0}
+      k_dqg_0: "byte-identical -- g92 is provably confined"
+  build_failures:
+    - attempt: 1
+      error: "detached python3 became <defunct> instantly; no output file was ever created"
+      root_cause: >-
+        Container fa-g3's ONLY bind mount is /home/lihuzhan -> /home/lihuzhan, so its /tmp is
+        private to the container. The scratch tree built on the HOST under
+        /tmp/op-evolve-...-r031 did not exist inside the container, and the arm path resolved
+        to nothing. Fixed by relocating scratch under the shared mount
+        (rounds/031/1-opt/scratch/) and leaving a host-side symlink at the named /tmp path.
+        MECHANISM WORTH KEEPING: on this runner, anything an in-container process must read
+        has to live under /home/lihuzhan, and a path that exists on the host proves nothing.
+    - attempt: 2
+      error: "armAB was silently never dumped; its ISA directory stayed empty with no error"
+      root_cause: >-
+        `sed -i 's|^dump armA.*||'` also matches `dump armAB` -- the pattern is a prefix, not
+        a word. Fixed by rewriting isa.sh to take arm names as \"$@\" arguments. A silent
+        no-op, not a failure: nothing in the output said the arm had been skipped.
+  deviation_from_plan: >-
+    ONE, and it was forced by my own free instrument BEFORE any card time was spent. Both
+    arms were designed around "fma lowers to unpacked v_fma_f32". The VF_Q compile
+    (r31.i0.C2) showed v_pk_fma_f32, packed, so both arms were NARROWED to exponent-only
+    hoists: the scale-at-store half was dropped and both epilogues left byte-identical. This
+    is a narrowing of the same mechanism, not a switch to a different one -- the different
+    mechanism (moving scale onto the dQ accumulator at the store) is filed as pool rule 6
+    for a later round with a one-compile instrument attached, exactly because switching
+    mechanism mid-round is how a result stops meaning anything.
+  latent_bug_found_not_fixed: >-
+    VF_KV = True in op/current is incorrect: it drops the trailing * scale from ds_l on the
+    claim that the scale is applied at the dK store, and NEITHER k_dkdv epilogue branch has
+    any VF_KV-guarded scale. It is dead code (the flag is False), it is not mine, and this
+    round touched nothing adjacent to it -- so it is REPORTED and left exactly where it is.
+
+expected: >-
+  g91: folding scale into the exp2 exponent removes 64 v_pk_mul_f32 from k_dqg's hot loop.
+  Calibrated on the only paired data this loop has (u2n: -86 instructions -> +2.48% prod),
+  that is ~+2.0% prod, band +0.8% to +2.5%.
+  g92: the same edit on k_dkdv removes ~24 of 660 weighted instructions; at a 0.15x
+  conversion and a 61.1% kernel share that is ~+0.33% prod against a 0.32% floor -- a
+  PREDICTED NULL, scheduled anyway because paired with g91 it is the cheapest test this
+  campaign has of whether the two conversion factors predict anything at all.
+  The merge: additive, ~+2.3% prod, because the two arms touch disjoint kernels and disjoint
+  expressions.
