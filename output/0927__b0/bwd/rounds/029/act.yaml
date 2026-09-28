@@ -1,0 +1,153 @@
+round: 29
+mode: fast
+candidate: r27.i3.g86
+outcome: delivered
+
+# NOTE on `candidate`, because the honest answer is not a round-29 g-id.
+# The tree shipped in rounds/029/op is the MERGE of two ids that BOTH already existed:
+#   h70          -- an operator HINT (route row 11), built here as lab arm u2n. Hints are
+#                   not pool ids, so it cannot be named in this field.
+#   r27.i3.g86   -- an INHERITED pool id, built and rejected with its round twice before,
+#                   rebuilt and SHIPPED here. Inherited candidates keep their original id.
+# `candidate` therefore names r27.i3.g86: it is a real pool id that this round executed and
+# left in the working copy. The round's larger share of the gain came from h70.
+# It would be WRONG to name r29.i1.g89 or r29.i2.g90 here -- both were FILED this round and
+# NOT BUILT, which is what route.md's outcome column for rows 17-18 says. Naming one would
+# make act.yaml contradict the route table and overstate the round.
+# `arms:` below is the complete account of what was built.
+
+correctness:
+  unit_tests: pass
+  precision: pass
+  checked_with: op/validation.py
+  sqnr_db: 52.52
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/028/op, job_context/op/current]
+  shapes:
+    - name: prod_b4_s8192_hq32_hkv8_d128
+      this_round_tflops: 656.5
+      best_round_tflops: 639.0
+      beat_tflops: 817.0
+      target_tflops: 817.0
+      champion_round: 28
+      champion_tflops: 639.0
+      champion_rebuilt: true
+      ratio: 0.8036
+      vs_champion: 1.0274
+    - name: proxy_b1_s4096_hq32_hkv8_d128
+      this_round_tflops: 603.8
+      best_round_tflops: 587.5
+      beat_tflops: 739.8
+      target_tflops: 739.8
+      champion_round: 28
+      champion_tflops: 587.5
+      champion_rebuilt: true
+      ratio: 0.8162
+      vs_champion: 1.0277
+    - name: fast_b1_s1024_hq8_hkv2_d128
+      this_round_tflops: 98.6
+      best_round_tflops: 98.7
+      beat_tflops: 58.6
+      target_tflops: 58.6
+      champion_round: 28
+      champion_tflops: 98.7
+      champion_rebuilt: true
+      ratio: 1.0
+      vs_champion: 0.9990
+  score: 0.8733
+
+validation:
+  exit_code: 2
+
+explored:
+  ran: []
+  # No rocprofv3: h4 forbids it on this op. The survey was the free static-ISA dump of every
+  # arm (raw/isa.sh -> per-kernel VGPR / spill / scratch / body-instruction / opcode census).
+  # It changed two decisions and is why it was worth its minutes: the k_dqg opcode census
+  # (256 buffer_store_b16, 649 s_set_vgpr_msb) produced BOTH pool entries, and the
+  # basic-block census of v_mov_b64 KILLED a third candidate before it was built.
+  consulted:
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+    - backends/flydsl/attention/dead-ends.md
+    - backends/flydsl/attention/techniques.md
+    - optimization/techniques/3-pipelining-and-scheduling.md
+    - optimization/routes/0-kernel-programming-principles.md
+  bound: latency
+  confidence: medium
+  why: >-
+    Split verdict, and the split is the round's finding. k_dkdv remains latency-bound at the
+    margin (round 27: a 2.4% instruction cut returned 0.35%, a ~0.15x conversion) and that
+    verdict is untouched. k_dq is ISSUE-bound: removing 65 back-edge v_mov_b64 rotation
+    copies (741 -> 655 instr/kv-block) returned +3.07% prod and +2.77% proxy against the
+    incumbent, far above 0.15x. Confidence is medium because the whole-op figure is still
+    dominated by k_dkdv, which no round has yet moved.
+
+arms:
+  - id: h70
+    built: "lab arm u2n adopted verbatim from op/current -- k_dq kvloop_full unrolled x2"
+    tflops: {prod: 653.6, proxy: 602.8, fast: 98.6}
+    vs_champion: 1.0248
+    shipped: false
+    note: >-
+      Measured in the step-4 exploratory run against base=op/current (prod 637.8). Free ISA
+      gate: 991 VGPR, 0 spill, 0 scratch, v_mov_b64 65 -> 1, k_dkdv byte-identical to base.
+  - id: r27.i3.g86
+    built: "inherited id, rebuilt on op/current -- dK/dV bf16 epilogue staged through LDS"
+    tflops: {prod: 639.8, proxy: 589.7, fast: 99.0}
+    vs_champion: 1.0032
+    shipped: false
+    note: >-
+      Third consistent measurement (+0.35%, +0.37%, +0.32%) but AT the prod floor, so it does
+      not clear on its own. proxy 0.9972 and fast 0.9960 are its own derivational A/A nulls.
+  - id: h70+r27.i3.g86
+    built: "the merge, built only because neither arm lost -- MEASURED, not inferred"
+    tflops: {prod: 656.5, proxy: 603.8, fast: 98.6}
+    vs_champion: 1.0307
+    shipped: true
+    note: >-
+      Shipped as rounds/029/op. Superposition predicted 1.0281, measured 1.0279 in the
+      exploratory run; re-measured in a fresh session on a cleared cache at 1.0307 vs the
+      incumbent rounds/028/op and 1.0275 vs pure r19h. Figures here are the cleared-cache run.
+  - id: u2nb
+    built: "throwaway probe, no g allocated -- u2n + sched_barrier(0) between the halves"
+    tflops: {prod: 608.8, proxy: 551.8, fast: 98.4}
+    vs_champion: 0.9545
+    shipped: false
+    note: >-
+      Clear LOSS, and it closes the k_dq lab's unrun plan.sh item 1. VGPR fell 991 -> 798 and
+      it still lost 4.55% prod / 6.68% proxy: both counts sit on the same 1-wave/SIMD rung, so
+      the registers bought no occupancy, while the barrier pushed the first prefetch group
+      from index 5 to 532 and collapsed its cover.
+
+expected: >-
+  The lab measured u2n at prod op -3.06% on time (3 rotated processes) with output bitwise
+  equal to r19h, and r27.i3.g86 at +0.35%/+0.37% on prod. Adopting u2n verbatim should
+  reproduce roughly +3% of throughput, and the merge with g86 should land near +3.5% if the
+  two are additive -- they touch disjoint kernels (k_dq/impl.py vs k_dkdv's epilogue), so
+  additivity is the expectation rather than a hope. I do not expect this to pass h69: ~3%
+  cannot close a ~22% gap to beat.
+
+added_to_pool: [r29.i1.g89, r29.i2.g90]
+route_updated: true
+
+implementation:
+  files_changed: [op/kernels.py, op/impl.py]
+  build_failures:
+    - attempt: 1
+      error: "patch -p0 < g86.patch -> 'Hunk #1 FAILED at 572', rejects to kernels.py.rej"
+      root_cause: >-
+        The lab's u2n kernels.py carries inert lab switch code in k_dkdv's epilogue
+        (okv = [ok_[si] * scale ...] if VF_KV else [...]), so the g86 patch context did not
+        match. Fixed by splicing on the anchor line 'base_o = bat * Skv' instead of
+        hand-editing; VF_KV is False so semantics are unchanged, and armAB's per-kernel ISA
+        counters were then verified identical to armA's k_dqg and armB's k_dkdv.
+    - attempt: 2
+      error: "detached launch produced no sentinel; docker exec returned 1, no out file"
+      root_cause: >-
+        Two independent faults. (1) '&' bound the whole '&&' list, so bash -c exited before
+        mkdir ran. (2) The sentinel path /host/artifacts/... exists INSIDE the container but
+        is not the bind mount -- the only mount is /home/lihuzhan -> /home/lihuzhan, so host
+        and container were writing to different directories. Confirmed via pgrep that nothing
+        was orphaned before relaunching, and deleted the /host decoy my own mkdir created.
