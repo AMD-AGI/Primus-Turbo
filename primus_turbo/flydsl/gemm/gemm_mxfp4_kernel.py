@@ -4574,7 +4574,8 @@ def gemm_mxfp4_flydsl_kernel(
             return _exec_plain(target, accum)
         return (_exec_split, _exec_tail, _exec_ntail)[mode - 1](s, target, accum)
 
-    ks = (0, 1) if K != Kw else _MXFP4_KSPLIT_CACHE.get((M, N, K, _row_b, out_fp16))
+    _kskey = (M, N, K, _row_b, out_fp16, scales_prepacked)
+    ks = (0, 1) if K != Kw else _MXFP4_KSPLIT_CACHE.get(_kskey)
     if ks is None:
         cands = _ksplit_candidates(M, N, K, _bn, _bm)
         if scales_prepacked:
@@ -4599,7 +4600,7 @@ def gemm_mxfp4_flydsl_kernel(
         if _capturing or len(modes) == 1:
             ks = (0, 1)  # cannot time inside capture / nothing to try
             if not _capturing:
-                _MXFP4_KSPLIT_CACHE[(M, N, K, _row_b, out_fp16)] = ks
+                _MXFP4_KSPLIT_CACHE[_kskey] = ks
         else:
             tgt = _tune_target()
             arms = []
@@ -4614,7 +4615,7 @@ def gemm_mxfp4_flydsl_kernel(
                     _MXFP4_MODE_ERRORS[(M, N, K, *mode_s)] = repr(ex)
                     continue
             ks = _race_mxfp4_ksplit(arms, base=(0, 1)) if len(arms) > 1 else (0, 1)
-            _MXFP4_KSPLIT_CACHE[(M, N, K, _row_b, out_fp16)] = ks
+            _MXFP4_KSPLIT_CACHE[_kskey] = ks
 
     out2 = _exec(ks[0], ks[1], out, beta_is_one)
     return out2.t().contiguous() if trans_c else out2

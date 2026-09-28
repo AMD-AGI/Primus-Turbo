@@ -608,8 +608,9 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
 
         # A backend that raised is not a winner, however alone it is: dropping it here leaves
         # the caller to fall through to its default rather than dispatch to something that
-        # just failed.
-        ranked = [(statistics.median(v), impl) for impl, v in samples.items() if min(v) != float("inf")]
+        # just failed. One raise is disqualifying: `min` would keep a backend that succeeded
+        # once, and a median over its good samples could then win and be cached.
+        ranked = [(statistics.median(v), impl) for impl, v in samples.items() if max(v) != float("inf")]
         if not ranked:
             return None
 
