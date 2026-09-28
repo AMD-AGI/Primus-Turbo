@@ -1,0 +1,8 @@
+W0928 05:54:37.436308   65075 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.000248 sec
+W0928 05:54:37.436425   65075 simple_timer.cpp:55] [rocprofv3] '/opt/venv/bin/python3 tools/tiny.py' ::     0.000000 sec
+W0928 05:54:38.295987   65075 tool.cpp:3082] HSA version 1.21.0 initialized (instance=0)
+TINY 1725.669677734375
+W0928 05:54:38.439575   65075 simple_timer.cpp:55] [rocprofv3] '/opt/venv/bin/python3 tools/tiny.py' ::     1.003149 sec
+W0928 05:54:38.441207   65075 simple_timer.cpp:55] [rocprofv3] output generation ::     0.000922 sec
+W0928 05:54:38.441327   65075 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.001066 sec
+rc=0

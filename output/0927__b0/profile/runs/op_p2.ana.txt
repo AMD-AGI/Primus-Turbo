@@ -1,0 +1,100 @@
+cond      sub        kernel                                 arm       n  med_ms     min   sclk sclk_pre     W
+blk                  fmha_bf16_pertokenBf16_hd128_128x256_m asm      45   1.447   1.322   1770     1777  2123
+blk                  fmha_bwd_hd128_bf16_causal_br_a32_pssk asm      45   6.564   6.406   1703     1697  2123
+blk                  fmha_bwd_hd128_dq_convert_bf16         asm      45   0.071   0.068   1704     1704  2123
+blk                  fmha_bwd_hd128_odo_bf16                asm      45   0.047   0.046   1697     1697  2123
+blk                  gqa_sum                                asm     110   0.062   0.058   1697     1697  2123
+blk                  k_delta_bshd                           fly      45   0.091   0.055   1809     1809  2123
+blk                  k_delta_bshd                           fly11    45   0.091   0.058   1740     1738  2123
+blk                  k_dkdv                                 fly      45   5.344   5.216   1809     1809  2123
+blk                  k_dkdv                                 fly11    45   5.342   5.239   1740     1738  2123
+blk                  k_dq                                   fly      45   3.324   3.229   1808     1808  2123
+blk                  k_dq                                   fly11    45   3.323   3.231   1744     1740  2123
+blk                  kn_fmha_fwd_prefill_a16w16_m32x8_bshd  fly      45   1.477   1.416   1903     1908  2123
+blk                  kn_fmha_fwd_prefill_a16w16_m32x8_bshd  fly11    45   1.473   1.437   1767     1767  2123
+eburst               fmha_bf16_pertokenBf16_hd128_128x256_m asm      25   1.132   1.078   1741     1741  2136
+eburst               fmha_bwd_hd128_bf16_causal_br_a32_pssk asm      25   6.487   6.421   1733     1734  2136
+eburst               fmha_bwd_hd128_dq_convert_bf16         asm      25   0.071   0.069   1734     1733  2136
+eburst               fmha_bwd_hd128_odo_bf16                asm      25   0.044   0.041   1733     1734  2136
+eburst               gqa_sum                                asm      50   0.061   0.059   1734     1733  2136
+eburst               k_delta_bshd                           fly      25   0.098   0.054   1669     1668  2136
+eburst               k_delta_bshd                           fly11    25   0.098   0.054   1733     1733  2136
+eburst               k_dkdv                                 fly      25   5.501   5.428   1671     1669  2136
+eburst               k_dkdv                                 fly11    25   5.500   5.449   1743     1733  2136
+eburst               k_dq                                   fly      25   3.315   3.295   1679     1673  2136
+eburst               k_dq                                   fly11    25   3.319   3.299   1744     1743  2136
+eburst               kn_fmha_fwd_prefill_a16w16_m32x8_bshd  fly      25   1.187   1.160   1497     1490  2136
+eburst               kn_fmha_fwd_prefill_a16w16_m32x8_bshd  fly11    25   1.179   1.142   1701     1696  2136
+gburst               fmha_bf16_pertokenBf16_hd128_128x256_m asm      25   1.260   1.236   1343     1346  2107
+gburst               fmha_bwd_hd128_bf16_causal_br_a32_pssk asm      25   7.283   7.211   1301     1308  2136
+gburst               fmha_bwd_hd128_dq_convert_bf16         asm      25   0.072   0.069   1301     1301  2136
+gburst               fmha_bwd_hd128_odo_bf16                asm      25   0.055   0.054   1303     1309  2136
+gburst               gqa_sum                                asm      50   0.061   0.059   1301     1301  2136
+gburst               k_delta_bshd                           fly      25   0.132   0.071   1397     1399  2136
+gburst               k_delta_bshd                           fly11    25   0.132   0.068   1318     1318  2136
+gburst               k_dkdv                                 fly      25   6.216   6.163   1397     1398  2136
+gburst               k_dkdv                                 fly11    25   6.211   6.187   1313     1318  2136
+gburst               k_dq                                   fly      25   3.358   3.331   1398     1397  2136
+gburst               k_dq                                   fly11    25   3.372   3.350   1317     1311  2136
+gburst               kn_fmha_fwd_prefill_a16w16_m32x8_bshd  fly      25   1.501   1.477   1555     1555  2107
+gburst               kn_fmha_fwd_prefill_a16w16_m32x8_bshd  fly11    25   1.494   1.477   1319     1319  2136
+iso                  fmha_bf16_pertokenBf16_hd128_128x256_m asm      25   1.219   1.207   2349     2348  1160
+iso                  fmha_bwd_hd128_bf16_causal_br_a32_pssk asm      25   6.026   5.965   2345     2345  1172
+iso                  fmha_bwd_hd128_dq_convert_bf16         asm      25   0.071   0.069   2345     2345  1172
+iso                  fmha_bwd_hd128_odo_bf16                asm      25   0.043   0.041   2345     2345  1167
+iso                  gqa_sum                                asm      50   0.061   0.058   2344     2345  1173
+iso                  k_delta_bshd                           fly      25   0.083   0.082   2343     2343  1173
+iso                  k_delta_bshd                           fly11    25   0.084   0.082   2344     2343  1172
+iso                  k_dkdv                                 fly      25   5.069   5.013   2344     2343  1173
+iso                  k_dkdv                                 fly11    25   5.065   5.010   2344     2343  1173
+iso                  k_dq                                   fly      25   3.307   3.280   2342     2343  1190
+iso                  k_dq                                   fly11    25   3.306   3.285   2342     2344  1182
+iso                  kn_fmha_fwd_prefill_a16w16_m32x8_bshd  fly      25   1.032   1.026   2349     2349  1166
+iso                  kn_fmha_fwd_prefill_a16w16_m32x8_bshd  fly11    25   1.027   1.023   2352     2352  1152
+layer                fill                                   asm      80   0.079   0.075   1392     1395  2136
+layer                fmha_bf16_pertokenBf16_hd128_128x256_m asm      80   1.005   0.965   1385     1385  2136
+layer                fmha_bwd_hd128_bf16_causal_br_a32_pssk asm      80   6.675   6.600   1384     1394  2136
+layer                fmha_bwd_hd128_dq_convert_bf16         asm      80   0.068   0.066   1380     1381  2136
+layer                fmha_bwd_hd128_odo_bf16                asm      80   0.058   0.055   1392     1395  2136
+layer                gqa_sum                                asm     160   0.055   0.053   1380     1380  2136
+layer                k_delta_bshd                           fly      80   0.097   0.057   1439     1443  2136
+layer                k_delta_bshd                           fly11    80   0.100   0.058   1444     1445  2136
+layer                k_dkdv                                 fly      80   5.842   5.764   1432     1443  2136
+layer                k_dkdv                                 fly11    80   5.836   5.747   1434     1445  2136
+layer                k_dq                                   fly      80   2.878   2.860   1426     1428  2136
+layer                k_dq                                   fly11    80   2.879   2.860   1427     1431  2136
+layer                kn_fmha_fwd_prefill_a16w16_m32x8_bshd  fly      80   1.200   1.160   1390     1388  2136
+layer                kn_fmha_fwd_prefill_a16w16_m32x8_bshd  fly11    80   1.200   1.163   1408     1406  2136
+layerbad             fill                                   asm      15   0.055   0.054   1855     1851  2136
+layerbad             fmha_bf16_pertokenBf16_hd128_128x256_m asm      15   1.278   1.103   1843     1851  2136
+layerbad             fmha_bwd_hd128_bf16_causal_br_a32_pssk asm      15   6.222   5.631   1856     1851  2136
+layerbad             fmha_bwd_hd128_dq_convert_bf16         asm      15   0.072   0.067   1861     1860  2136
+layerbad             fmha_bwd_hd128_odo_bf16                asm      15   0.042   0.041   1855     1851  2136
+layerbad             gqa_sum                                asm      30   0.061   0.053   1861     1860  2136
+layerbad             k_delta_bshd                           fly      15   0.062   0.052   1853     1843  2136
+layerbad             k_delta_bshd                           fly11    15   0.062   0.052   1858     1854  2136
+layerbad             k_dkdv                                 fly      15   5.244   5.005   1854     1843  2136
+layerbad             k_dkdv                                 fly11    15   5.240   4.993   1861     1855  2136
+layerbad             k_dq                                   fly      15   3.359   3.146   1858     1854  2136
+layerbad             k_dq                                   fly11    15   3.369   3.153   1867     1862  2136
+layerbad             kn_fmha_fwd_prefill_a16w16_m32x8_bshd  fly      15   1.779   1.133   1367     1367  2136
+layerbad             kn_fmha_fwd_prefill_a16w16_m32x8_bshd  fly11    15   1.774   1.097   1923     1938  2136
+scale     K::fwd_x1  fmha_bf16_pertokenBf16_hd128_128x256_m asm      25   1.452   1.131   1491     1491  2136
+scale     K::fwd_x1  kn_fmha_fwd_prefill_a16w16_m32x8_bshd  fly      25   1.449   1.279   1743     1754  2136
+scale     K::fwd_x1  kn_fmha_fwd_prefill_a16w16_m32x8_bshd  fly11    25   1.466   1.387   1583     1584  2136
+scale     K::fwd_x16 fmha_bf16_pertokenBf16_hd128_128x256_m asm      25   1.458   1.396   1325     1339  2136
+scale     K::fwd_x16 kn_fmha_fwd_prefill_a16w16_m32x8_bshd  fly      25   1.892   1.879   1600     1602  2136
+scale     K::fwd_x16 kn_fmha_fwd_prefill_a16w16_m32x8_bshd  fly11    25   1.889   1.856   1490     1492  2136
+scale     K::fwd_x2  fmha_bf16_pertokenBf16_hd128_128x256_m asm      25   1.461   1.416   1458     1458  2136
+scale     K::fwd_x2  kn_fmha_fwd_prefill_a16w16_m32x8_bshd  fly      25   1.481   1.455   1692     1723  2136
+scale     K::fwd_x2  kn_fmha_fwd_prefill_a16w16_m32x8_bshd  fly11    25   1.484   1.452   1550     1556  2136
+scale     K::fwd_x4  fmha_bf16_pertokenBf16_hd128_128x256_m asm      25   1.462   1.421   1409     1415  2136
+scale     K::fwd_x4  kn_fmha_fwd_prefill_a16w16_m32x8_bshd  fly      25   1.640   1.618   1651     1675  2136
+scale     K::fwd_x4  kn_fmha_fwd_prefill_a16w16_m32x8_bshd  fly11    25   1.636   1.623   1519     1522  2136
+scale     K::fwd_x8  fmha_bf16_pertokenBf16_hd128_128x256_m asm      25   1.459   1.416   1364     1376  2136
+scale     K::fwd_x8  kn_fmha_fwd_prefill_a16w16_m32x8_bshd  fly      25   1.776   1.753   1620     1631  2136
+scale     K::fwd_x8  kn_fmha_fwd_prefill_a16w16_m32x8_bshd  fly11    25   1.779   1.756   1498     1502  2136
+gemm ('layer', 'GEMM_?') 480 6.2 ms
+gemm ('layer', 'GEMM_MT256x256x128') 5040 5781.9 ms
+gemm ('layerbad', 'GEMM_MT256x256x128') 315 395.4 ms
+gemm ('layerbad', 'GEMM_MT32x16x32') 630 19637.9 ms

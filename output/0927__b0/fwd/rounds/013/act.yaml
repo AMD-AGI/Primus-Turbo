@@ -1,0 +1,92 @@
+round: 13
+mode: fast
+candidate: r13.i2.g51             # route row 4: fast-only d-split with redundant QK (4 waves in the m32x2 body)
+outcome: delivered
+
+correctness:
+  unit_tests: pass
+  precision: pass
+  checked_with: op/validation.py
+  sqnr_db: 49.82                  # min over all correctness rows (short_q full); fast 51.23, proxy 50.89, prod 50.83. Output is bitwise equal to op/current
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/011/op, rounds/010/op]
+  # 3 rotated sessions (blocked ruler; r11, r10, g51, champ2 byte-copy A/A in one process each) + beat in its own
+  # process, same idle card (fa-g2, physical GPU 2). Figures are the mean of the 3 session medians.
+  # raw: rounds/013/1-opt/raw/measure (summary.txt)
+  shapes:
+    - name: fast
+      this_round_tflops: 162.27
+      best_round_tflops: 153.61
+      beat_tflops: 153.75
+      target_tflops: 153.75
+      champion_round: 11
+      champion_tflops: 153.61
+      champion_rebuilt: true
+      ratio: 1.0
+      vs_champion: 1.0564
+    - name: proxy
+      this_round_tflops: 1606.33
+      best_round_tflops: 1610.36
+      beat_tflops: 1582.50
+      target_tflops: 1582.50
+      champion_round: 10
+      champion_tflops: 1610.36
+      champion_rebuilt: true
+      ratio: 1.0
+      vs_champion: 0.9975         # m32x8 untouched; inside the proxy A/A spread (champ2/r11 0.985-1.009)
+    - name: prod
+      this_round_tflops: 1502.81
+      best_round_tflops: 1502.37
+      beat_tflops: 1556.58
+      target_tflops: 1556.58
+      champion_round: 11
+      champion_tflops: 1502.37
+      champion_rebuilt: true
+      ratio: 0.9655
+      vs_champion: 1.0003
+  score: 0.9885                   # capped mean (r11 re-measured: 0.9881); uncapped 1.0120 (r11 0.9929)
+
+validation:
+  exit_code: 2                    # every correctness + determinism row passes; fails only the speed bar (geomean vs in-process beat 0.9859: fast 1.0474, proxy 0.9476, prod 0.9654), as op/current does
+
+explored:
+  ran:
+    - "throwaway probe (m32x2 with PV d-tiles 8->4, wrong output), fast only, 3 rotated sessions vs r11 + champ2 A/A: +8.0..+8.8% passed route row 4's >= 8% gate, so g51 was built"
+    - "per-arm ISA dump (FLYDSL_DUMP_IR) + llvm-mc code size: confirmed the probe really dropped PV WMMA (320 -> 256) and that g51 is 28 064 B < 32 640 B, 0 spill, VGPR 348"
+    - "armcheck (22 cases) and verify_r6 adversarial suite (192 cases) bitwise vs op/current"
+  consulted:
+    - knowledge/INDEX.md
+    - backends/flydsl/attention/README.md
+    - backends/flydsl/attention/recipes/hd128.md
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+    - optimization/routes/1-metrics-to-techniques.md
+  bound: latency
+  confidence: medium
+  why: "fast = F + 16P on the heaviest q-row group; removing 25% of a tile's WMMA (PV half) bought only ~8%, and moving it to idle SIMDs kept ~5.6%, so P is mostly the serial QK+softmax chain per row group, not one SIMD's WMMA throughput"
+
+arms:
+  - id: r13.i2.g51
+    built: "4 waves (2 row waves x 2 d-halves) in the m32x2 fast body, from op/current"
+    tflops: {fast: 162.27, proxy: 1606.33, prod: 1502.81}
+    vs_champion: 1.0564
+    shipped: true
+  - id: r13.i2.g51-probe
+    built: "throwaway: m32x2 with PV WMMA skipped for d-tiles 4..7 (wrong output), fast only"
+    tflops: {fast: 168.97}
+    vs_champion: 1.0843
+    shipped: false
+    note: "gate instrument only; mean of 169.01/168.74/169.27 vs r11 156.44/155.53/155.53 in its own 3 sessions (raw/probe)"
+
+expected: >
+  Expected from g51: fast 13.7 -> ~11.8-12.5 us (x1.10-1.16) if the chain is single-SIMD WMMA-bound and LDS keeps up
+  (4 waves read K twice: 1.5x LDS reads per CU per tile). Could be <= x1.0 if LDS bandwidth binds. proxy/prod
+  untouched (gated, ISA must stay byte-identical).
+
+added_to_pool: [r13.i1.g50, r13.i2.g51]
+route_updated: true
+
+implementation:
+  files_changed: [op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x2.py]
+  build_failures: []

@@ -28,3 +28,13 @@ rank*_trace.json
 /e2e/traces/p2b_flyasm/iteration_44/rank0_trace.json
 /e2e/traces/s2_p2smoke4L/iteration_3/rank0_trace.json
 /e2e/traces/s2_p2smoke4L/iteration_6/rank0_trace.json
+/profile/runs/op_p1.json
+/profile/runs/op_p1.rows.json
+/profile/runs/op_p2.json
+/profile/runs/op_p2.rows.json
+/profile/runs/op_p3.json
+/profile/runs/op_p3.rows.json
+/profile/runs/op_smoke.json
+/profile/runs/rp_p1.json
+/profile/runs/rp_p2.json
+/profile/runs/rp_p3.json
