@@ -1,0 +1,8 @@
+# raw kineto traces, per-kernel rows, raw clock samples and rocprofv3 dumps stay local (> 2 MB or raw)
+runs/*.json
+runs/*.clk
+runs/pmc/
+# full copies of kernel trees (provenance: arms/fwd_r11.sha256, arms/variants/*.diff)
+arms/fwd_r11/
+arms/fwd_r6_nospec/
+arms/fwd_r6_nodefer/

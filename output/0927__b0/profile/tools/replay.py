@@ -17,7 +17,10 @@ E2E = Path("/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2
 PROF = Path("/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/profile")
 sys.path.insert(0, str(E2E / "attn_backends")); sys.path.insert(0, "/home/lihuzhan/.local/flydsl0341")
 os.environ["E2E_ATTN"] = "asm"
-os.environ["E2E_FLY_TREES"] = json.dumps({"fly11": {"fwd": str(PROF / "arms" / "fwd_r11"), "bwd": str(E2E / "arms" / "bwd_r20_0341")}})
+_T = {"fly11": {"fwd": str(PROF / "arms" / "fwd_r11"), "bwd": str(E2E / "arms" / "bwd_r20_0341")}}
+for _v in ("nospec", "nodefer"):
+    _T[_v] = {"fwd": str(PROF / "arms" / f"fwd_r6_{_v}"), "bwd": str(E2E / "arms" / "bwd_r20_0341")}
+os.environ["E2E_FLY_TREES"] = json.dumps(_T)
 BLAS = {k: os.environ[k] for k in ("TORCH_BLAS_PREFER_HIPBLASLT", "HIPBLASLT_TENSILE_LIBPATH")}
 import torch  # noqa
 import torch.nn.functional as F  # noqa
@@ -83,7 +86,7 @@ def stats(name, q, k):
 
 STAT = {}
 with torch.no_grad():
-    for name, (q, k, v) in SETS.items():
+    for name, (q, k, v) in (SETS.items() if not os.environ.get("RP_NOSTAT") else []):
         stats(name, q, k)
         print("stat", name, {kk: vv for kk, vv in STAT[name].items() if kk != "heads_trig"}, flush=True)
 torch.cuda.empty_cache()

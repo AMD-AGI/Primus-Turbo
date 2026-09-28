@@ -1,0 +1,14 @@
+# FlyDSL: compile-only 22_final_isa.s (flydsl 0.3.4.1, prod b4 s8192 hq32 hkv8 d128 causal)
+fwd_r6/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/22_final_isa.s:  .group_segment_fixed_size: 327680  .private_segment_fixed_size: 0  .sgpr_count: 107  .sgpr_spill_count: 60  .vgpr_count: 448  .vgpr_spill_count: 0  v_wmma=384 static_inst=6068 v_nop=169 s_barrier=12 v_exp=520 permlane=24 readlane=143
+fwd_r11/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/22_final_isa.s:  .group_segment_fixed_size: 327680  .private_segment_fixed_size: 0  .sgpr_count: 98  .sgpr_spill_count: 0  .vgpr_count: 454  .vgpr_spill_count: 0  v_wmma=320 static_inst=5024 v_nop=162 s_barrier=12 v_exp=392 permlane=20 readlane=0
+fwd_nospec/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/22_final_isa.s:  .group_segment_fixed_size: 327680  .private_segment_fixed_size: 0  .sgpr_count: 100  .sgpr_spill_count: 0  .vgpr_count: 456  .vgpr_spill_count: 0  v_wmma=256 static_inst=4130 v_nop=77 s_barrier=12 v_exp=264 permlane=16 readlane=0
+fwd_nodefer/kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0/22_final_isa.s:  .group_segment_fixed_size: 327680  .private_segment_fixed_size: 0  .sgpr_count: 98  .sgpr_spill_count: 0  .vgpr_count: 453  .vgpr_spill_count: 0  v_wmma=256 static_inst=4133 v_nop=81 s_barrier=12 v_exp=264 permlane=16 readlane=0
+bwd_r20/delta/k_delta_bshd_0/22_final_isa.s:  .group_segment_fixed_size: 0  .private_segment_fixed_size: 0  .sgpr_count: 21  .sgpr_spill_count: 0  .vgpr_count: 40  .vgpr_spill_count: 0  v_wmma=0 static_inst=256 v_nop=1 s_barrier=0 v_exp=0 permlane=0 readlane=0
+bwd_r20/dkdv/k_dkdv_0/22_final_isa.s:  .group_segment_fixed_size: 70656  .private_segment_fixed_size: 0  .sgpr_count: 79  .sgpr_spill_count: 0  .vgpr_count: 904  .vgpr_spill_count: 0  v_wmma=128 static_inst=3168 v_nop=52 s_barrier=0 v_exp=64 permlane=0 readlane=0
+bwd_r20/dq/k_dq_0/22_final_isa.s:  .group_segment_fixed_size: 8704  .private_segment_fixed_size: 0  .sgpr_count: 89  .sgpr_spill_count: 0  .vgpr_count: 960  .vgpr_spill_count: 0  v_wmma=192 static_inst=3567 v_nop=41 s_barrier=0 v_exp=128 permlane=0 readlane=0
+
+# ASM: llvm-readobj --notes (aiter-src hsa/gfx1250)
+fmha_fwd_bf16/fmha_bf16_pertokenBf16_hd128_128x256_mask:  .group_segment_fixed_size: 327680  .private_segment_fixed_size: 0  .sgpr_count: 106  .vgpr_count: 1024 
+fmha_v3_bwd/bwd_hd128_odo_bf16:  .group_segment_fixed_size: 0  .private_segment_fixed_size: 0  .sgpr_count: 50  .vgpr_count: 35 
+fmha_v3_bwd/bwd_hd128_bf16_causal_br_a32_pssk:  .group_segment_fixed_size: 327680  .private_segment_fixed_size: 0  .sgpr_count: 128  .vgpr_count: 1024 
+fmha_v3_bwd/bwd_hd128_dq_convert_bf16:  .group_segment_fixed_size: 0  .private_segment_fixed_size: 0  .sgpr_count: 48  .vgpr_count: 32 

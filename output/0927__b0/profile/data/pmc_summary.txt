@@ -1,0 +1,103 @@
+== dispatch resources (rocprofv3)
+asm_fwd    {'Grid_Size': '524288', 'Workgroup_Size': '128', 'LDS_Block_Size': '327680', 'Scratch_Size': '0', 'VGPR_Count': '512', 'Accum_VGPR_Count': '0', 'SGPR_Count': '128'}
+asm_odo    {'Grid_Size': '1048576', 'Workgroup_Size': '128', 'LDS_Block_Size': '0', 'Scratch_Size': '0', 'VGPR_Count': '24', 'Accum_VGPR_Count': '0', 'SGPR_Count': '128'}
+asm_bwd    {'Grid_Size': '524288', 'Workgroup_Size': '128', 'LDS_Block_Size': '327680', 'Scratch_Size': '0', 'VGPR_Count': '512', 'Accum_VGPR_Count': '0', 'SGPR_Count': '128'}
+asm_dqcvt  {'Grid_Size': '2097152', 'Workgroup_Size': '128', 'LDS_Block_Size': '0', 'Scratch_Size': '0', 'VGPR_Count': '16', 'Accum_VGPR_Count': '0', 'SGPR_Count': '128'}
+fly_fwd    {'Grid_Size': '1048576', 'Workgroup_Size': '256', 'LDS_Block_Size': '327680', 'Scratch_Size': '0', 'VGPR_Count': '224', 'Accum_VGPR_Count': '0', 'SGPR_Count': '128'}
+fly_delta  {'Grid_Size': '8388608', 'Workgroup_Size': '256', 'LDS_Block_Size': '0', 'Scratch_Size': '0', 'VGPR_Count': '24', 'Accum_VGPR_Count': '0', 'SGPR_Count': '128'}
+fly_dkdv   {'Grid_Size': '262144', 'Workgroup_Size': '32', 'LDS_Block_Size': '70656', 'Scratch_Size': '0', 'VGPR_Count': '456', 'Accum_VGPR_Count': '0', 'SGPR_Count': '128'}
+fly_dq     {'Grid_Size': '524288', 'Workgroup_Size': '32', 'LDS_Block_Size': '8704', 'Scratch_Size': '0', 'VGPR_Count': '480', 'Accum_VGPR_Count': '0', 'SGPR_Count': '128'}
+
+== median counter per dispatch  (set L16 = real training layer-16 inputs, randn = N(0,1))
+asm_fwd    L16   CHA_BUSY=0  CHA_CYCLE=0  CHC_REQ_READ=0  CHC_REQ_READ_128B=0  CPC_CPC_STAT_BUSY=0  GL1A_BUSY=0  GL1A_CYCLE=0  GL1C_GL2_REQ_READ_LEVEL=0  GL1C_GL2_REQ_WRITE_LEVEL=0  GRBM_COUNT=1.154e+07  GRBM_GUI_ACTIVE=1.154e+07  SPI_RA_REQ_NO_ALLOC=0  SQC_ICACHE_HITS=1.13e+08  SQC_ICACHE_MISSES=1.703e+04  SQC_ICACHE_MISSES_DUPLICATE=1.113e+05  SQC_ICACHE_REQ=1.131e+08  SQ_BUSY_CYCLES=3.68e+08  SQ_CYCLES=3.694e+08  SQ_INSTS_SENDMSG=0  SQ_INSTS_VEC32_VALU_WMMA=0  SQ_INST_CYCLES_VALU_WMMA=0  SQ_ITEMS=5.243e+05  SQ_VALU_WMMA_FLOP_BF16=0  SQ_WAVES=1.638e+04  SQ_WAVE_CYCLES=0
+asm_fwd    randn SQC_ICACHE_HITS=1.13e+08  SQC_ICACHE_MISSES=1.704e+04  SQC_ICACHE_MISSES_DUPLICATE=1.097e+05  SQC_ICACHE_REQ=1.131e+08  SQ_INSTS_VEC32_VALU_WMMA=0  SQ_INST_CYCLES_VALU_WMMA=0  SQ_ITEMS=5.243e+05  SQ_VALU_WMMA_FLOP_BF16=0
+asm_odo    L16   CHA_BUSY=0  CHA_CYCLE=0  CHC_REQ_READ=0  CHC_REQ_READ_128B=0  CPC_CPC_STAT_BUSY=0  GL1A_BUSY=0  GL1A_CYCLE=0  GL1C_GL2_REQ_READ_LEVEL=0  GL1C_GL2_REQ_WRITE_LEVEL=0  GRBM_COUNT=8.194e+05  GRBM_GUI_ACTIVE=8.194e+05  SPI_RA_REQ_NO_ALLOC=0  SQC_ICACHE_HITS=9.929e+05  SQC_ICACHE_MISSES=1.178e+04  SQC_ICACHE_MISSES_DUPLICATE=4.087e+04  SQC_ICACHE_REQ=1.046e+06  SQ_BUSY_CYCLES=2.608e+07  SQ_CYCLES=2.622e+07  SQ_INSTS_SENDMSG=0  SQ_INSTS_VEC32_VALU_WMMA=0  SQ_INST_CYCLES_VALU_WMMA=0  SQ_ITEMS=1.049e+06  SQ_VALU_WMMA_FLOP_BF16=0  SQ_WAVES=3.277e+04  SQ_WAVE_CYCLES=0
+asm_odo    randn SQC_ICACHE_HITS=9.685e+05  SQC_ICACHE_MISSES=1.075e+04  SQC_ICACHE_MISSES_DUPLICATE=4.184e+04  SQC_ICACHE_REQ=1.021e+06  SQ_INSTS_VEC32_VALU_WMMA=0  SQ_INST_CYCLES_VALU_WMMA=0  SQ_ITEMS=1.049e+06  SQ_VALU_WMMA_FLOP_BF16=0
+asm_bwd    L16   CHA_BUSY=0  CHA_CYCLE=0  CHC_REQ_READ=0  CHC_REQ_READ_128B=0  CPC_CPC_STAT_BUSY=0  GL1A_BUSY=0  GL1A_CYCLE=0  GL1C_GL2_REQ_READ_LEVEL=0  GL1C_GL2_REQ_WRITE_LEVEL=0  GRBM_COUNT=9.061e+07  GRBM_GUI_ACTIVE=9.061e+07  SPI_RA_REQ_NO_ALLOC=0  SQC_ICACHE_HITS=2.905e+08  SQC_ICACHE_MISSES=1280  SQC_ICACHE_MISSES_DUPLICATE=9541  SQC_ICACHE_REQ=2.905e+08  SQ_BUSY_CYCLES=2.887e+09  SQ_CYCLES=2.899e+09  SQ_INSTS_SENDMSG=0  SQ_INSTS_VEC32_VALU_WMMA=0  SQ_INST_CYCLES_VALU_WMMA=0  SQ_ITEMS=5.243e+05  SQ_VALU_WMMA_FLOP_BF16=0  SQ_WAVES=1.638e+04  SQ_WAVE_CYCLES=0
+asm_bwd    randn SQC_ICACHE_HITS=2.905e+08  SQC_ICACHE_MISSES=768  SQC_ICACHE_MISSES_DUPLICATE=5951  SQC_ICACHE_REQ=2.905e+08  SQ_INSTS_VEC32_VALU_WMMA=0  SQ_INST_CYCLES_VALU_WMMA=0  SQ_ITEMS=5.243e+05  SQ_VALU_WMMA_FLOP_BF16=0
+asm_dqcvt  L16   CHA_BUSY=0  CHA_CYCLE=0  CHC_REQ_READ=0  CHC_REQ_READ_128B=0  CPC_CPC_STAT_BUSY=0  GL1A_BUSY=0  GL1A_CYCLE=0  GL1C_GL2_REQ_READ_LEVEL=0  GL1C_GL2_REQ_WRITE_LEVEL=0  GRBM_COUNT=1.09e+06  GRBM_GUI_ACTIVE=1.09e+06  SPI_RA_REQ_NO_ALLOC=0  SQC_ICACHE_HITS=3.011e+04  SQC_ICACHE_MISSES=1792  SQC_ICACHE_MISSES_DUPLICATE=2912  SQC_ICACHE_REQ=3.482e+04  SQ_BUSY_CYCLES=3.476e+07  SQ_CYCLES=3.487e+07  SQ_INSTS_SENDMSG=0  SQ_INSTS_VEC32_VALU_WMMA=0  SQ_INST_CYCLES_VALU_WMMA=0  SQ_ITEMS=2.097e+06  SQ_VALU_WMMA_FLOP_BF16=0  SQ_WAVES=6.554e+04  SQ_WAVE_CYCLES=0
+asm_dqcvt  randn SQC_ICACHE_HITS=2.356e+04  SQC_ICACHE_MISSES=1536  SQC_ICACHE_MISSES_DUPLICATE=9721  SQC_ICACHE_REQ=3.482e+04  SQ_INSTS_VEC32_VALU_WMMA=0  SQ_INST_CYCLES_VALU_WMMA=0  SQ_ITEMS=2.097e+06  SQ_VALU_WMMA_FLOP_BF16=0
+fly_fwd    L16   CHA_BUSY=0  CHA_CYCLE=0  CHC_REQ_READ=0  CHC_REQ_READ_128B=0  CPC_CPC_STAT_BUSY=0  GL1A_BUSY=0  GL1A_CYCLE=0  GL1C_GL2_REQ_READ_LEVEL=0  GL1C_GL2_REQ_WRITE_LEVEL=0  GRBM_COUNT=1.848e+07  GRBM_GUI_ACTIVE=1.848e+07  SPI_RA_REQ_NO_ALLOC=0  SQC_ICACHE_HITS=1.353e+08  SQC_ICACHE_MISSES=290  SQC_ICACHE_MISSES_DUPLICATE=1447  SQC_ICACHE_REQ=1.353e+08  SQ_BUSY_CYCLES=5.895e+08  SQ_CYCLES=5.915e+08  SQ_INSTS_SENDMSG=0  SQ_INSTS_VEC32_VALU_WMMA=0  SQ_INST_CYCLES_VALU_WMMA=0  SQ_ITEMS=1.049e+06  SQ_VALU_WMMA_FLOP_BF16=0  SQ_WAVES=3.277e+04  SQ_WAVE_CYCLES=0
+fly_fwd    randn SQC_ICACHE_HITS=1.2e+08  SQC_ICACHE_MISSES=220  SQC_ICACHE_MISSES_DUPLICATE=1540  SQC_ICACHE_REQ=1.2e+08  SQ_INSTS_VEC32_VALU_WMMA=0  SQ_INST_CYCLES_VALU_WMMA=0  SQ_ITEMS=1.049e+06  SQ_VALU_WMMA_FLOP_BF16=0
+fly_delta  L16   CHA_BUSY=0  CHA_CYCLE=0  CHC_REQ_READ=0  CHC_REQ_READ_128B=0  CPC_CPC_STAT_BUSY=0  GL1A_BUSY=0  GL1A_CYCLE=0  GL1C_GL2_REQ_READ_LEVEL=0  GL1C_GL2_REQ_WRITE_LEVEL=0  GRBM_COUNT=8.65e+05  GRBM_GUI_ACTIVE=8.65e+05  SPI_RA_REQ_NO_ALLOC=0  SQC_ICACHE_HITS=5827  SQC_ICACHE_MISSES=3072  SQC_ICACHE_MISSES_DUPLICATE=1.977e+04  SQC_ICACHE_REQ=2.867e+04  SQ_BUSY_CYCLES=2.757e+07  SQ_CYCLES=2.768e+07  SQ_INSTS_SENDMSG=0  SQ_INSTS_VEC32_VALU_WMMA=0  SQ_INST_CYCLES_VALU_WMMA=0  SQ_ITEMS=8.389e+06  SQ_VALU_WMMA_FLOP_BF16=0  SQ_WAVES=2.621e+05  SQ_WAVE_CYCLES=0
+fly_delta  randn SQC_ICACHE_HITS=2.867e+04  SQC_ICACHE_MISSES=0  SQC_ICACHE_MISSES_DUPLICATE=0  SQC_ICACHE_REQ=2.867e+04  SQ_INSTS_VEC32_VALU_WMMA=0  SQ_INST_CYCLES_VALU_WMMA=0  SQ_ITEMS=8.389e+06  SQ_VALU_WMMA_FLOP_BF16=0
+fly_dkdv   L16   CHA_BUSY=0  CHA_CYCLE=0  CHC_REQ_READ=0  CHC_REQ_READ_128B=0  CPC_CPC_STAT_BUSY=0  GL1A_BUSY=0  GL1A_CYCLE=0  GL1C_GL2_REQ_READ_LEVEL=0  GL1C_GL2_REQ_WRITE_LEVEL=0  GRBM_COUNT=7.534e+07  GRBM_GUI_ACTIVE=7.534e+07  SPI_RA_REQ_NO_ALLOC=0  SQC_ICACHE_HITS=2.96e+08  SQC_ICACHE_MISSES=6144  SQC_ICACHE_MISSES_DUPLICATE=1.453e+04  SQC_ICACHE_REQ=2.96e+08  SQ_BUSY_CYCLES=2.398e+09  SQ_CYCLES=2.411e+09  SQ_INSTS_SENDMSG=0  SQ_INSTS_VEC32_VALU_WMMA=0  SQ_INST_CYCLES_VALU_WMMA=0  SQ_ITEMS=2.621e+05  SQ_VALU_WMMA_FLOP_BF16=0  SQ_WAVES=8192  SQ_WAVE_CYCLES=0
+fly_dkdv   randn SQC_ICACHE_HITS=2.96e+08  SQC_ICACHE_MISSES=0  SQC_ICACHE_MISSES_DUPLICATE=0  SQC_ICACHE_REQ=2.96e+08  SQ_INSTS_VEC32_VALU_WMMA=0  SQ_INST_CYCLES_VALU_WMMA=0  SQ_ITEMS=2.621e+05  SQ_VALU_WMMA_FLOP_BF16=0
+fly_dq     L16   CHA_BUSY=0  CHA_CYCLE=0  CHC_REQ_READ=0  CHC_REQ_READ_128B=0  CPC_CPC_STAT_BUSY=0  GL1A_BUSY=0  GL1A_CYCLE=0  GL1C_GL2_REQ_READ_LEVEL=0  GL1C_GL2_REQ_WRITE_LEVEL=0  GRBM_COUNT=4.834e+07  GRBM_GUI_ACTIVE=4.834e+07  SPI_RA_REQ_NO_ALLOC=0  SQC_ICACHE_HITS=1.419e+08  SQC_ICACHE_MISSES=6144  SQC_ICACHE_MISSES_DUPLICATE=2.122e+04  SQC_ICACHE_REQ=1.419e+08  SQ_BUSY_CYCLES=1.54e+09  SQ_CYCLES=1.547e+09  SQ_INSTS_SENDMSG=0  SQ_INSTS_VEC32_VALU_WMMA=0  SQ_INST_CYCLES_VALU_WMMA=0  SQ_ITEMS=5.243e+05  SQ_VALU_WMMA_FLOP_BF16=0  SQ_WAVES=1.638e+04  SQ_WAVE_CYCLES=0
+fly_dq     randn SQC_ICACHE_HITS=1.419e+08  SQC_ICACHE_MISSES=0  SQC_ICACHE_MISSES_DUPLICATE=0  SQC_ICACHE_REQ=1.419e+08  SQ_INSTS_VEC32_VALU_WMMA=0  SQ_INST_CYCLES_VALU_WMMA=0  SQ_ITEMS=5.243e+05  SQ_VALU_WMMA_FLOP_BF16=0
+
+== derived
+asm_fwd    waves=16384 wave_cycles/busy=0.00 wmma_inst=0 wmma_cycles=0 bf16_flop=0 wmma_cyc/gui=0 icache_req=1.131e+08 icache_miss%=0.02 chc_rd=0 chc_rd128=0 cha_busy%=0.0 gl1a_busy%=0.0 gl2_rd_lvl=0 gl2_wr_lvl=0 spi_noalloc=0 gui=1.154e+07
+asm_odo    waves=32768 wave_cycles/busy=0.00 wmma_inst=0 wmma_cycles=0 bf16_flop=0 wmma_cyc/gui=0 icache_req=1.046e+06 icache_miss%=1.13 chc_rd=0 chc_rd128=0 cha_busy%=0.0 gl1a_busy%=0.0 gl2_rd_lvl=0 gl2_wr_lvl=0 spi_noalloc=0 gui=8.194e+05
+asm_bwd    waves=16384 wave_cycles/busy=0.00 wmma_inst=0 wmma_cycles=0 bf16_flop=0 wmma_cyc/gui=0 icache_req=2.905e+08 icache_miss%=0.00 chc_rd=0 chc_rd128=0 cha_busy%=0.0 gl1a_busy%=0.0 gl2_rd_lvl=0 gl2_wr_lvl=0 spi_noalloc=0 gui=9.061e+07
+asm_dqcvt  waves=65536 wave_cycles/busy=0.00 wmma_inst=0 wmma_cycles=0 bf16_flop=0 wmma_cyc/gui=0 icache_req=3.482e+04 icache_miss%=5.15 chc_rd=0 chc_rd128=0 cha_busy%=0.0 gl1a_busy%=0.0 gl2_rd_lvl=0 gl2_wr_lvl=0 spi_noalloc=0 gui=1.09e+06
+fly_fwd    waves=32768 wave_cycles/busy=0.00 wmma_inst=0 wmma_cycles=0 bf16_flop=0 wmma_cyc/gui=0 icache_req=1.353e+08 icache_miss%=0.00 chc_rd=0 chc_rd128=0 cha_busy%=0.0 gl1a_busy%=0.0 gl2_rd_lvl=0 gl2_wr_lvl=0 spi_noalloc=0 gui=1.848e+07
+fly_delta  waves=262144 wave_cycles/busy=0.00 wmma_inst=0 wmma_cycles=0 bf16_flop=0 wmma_cyc/gui=0 icache_req=2.867e+04 icache_miss%=10.71 chc_rd=0 chc_rd128=0 cha_busy%=0.0 gl1a_busy%=0.0 gl2_rd_lvl=0 gl2_wr_lvl=0 spi_noalloc=0 gui=8.65e+05
+fly_dkdv   waves=8192 wave_cycles/busy=0.00 wmma_inst=0 wmma_cycles=0 bf16_flop=0 wmma_cyc/gui=0 icache_req=2.96e+08 icache_miss%=0.00 chc_rd=0 chc_rd128=0 cha_busy%=0.0 gl1a_busy%=0.0 gl2_rd_lvl=0 gl2_wr_lvl=0 spi_noalloc=0 gui=7.534e+07
+fly_dq     waves=16384 wave_cycles/busy=0.00 wmma_inst=0 wmma_cycles=0 bf16_flop=0 wmma_cyc/gui=0 icache_req=1.419e+08 icache_miss%=0.00 chc_rd=0 chc_rd128=0 cha_busy%=0.0 gl1a_busy%=0.0 gl2_rd_lvl=0 gl2_wr_lvl=0 spi_noalloc=0 gui=4.834e+07
+
+== dispatch ms under the profiler (median per run)
+('asm_bwd', 'L16', 'g1_L16') 6.016
+('asm_bwd', 'L16', 'g2_L16') 5.998
+('asm_bwd', 'L16', 'g3_L16') 6.0
+('asm_bwd', 'L16', 'g4_L16') 6.306
+('asm_bwd', 'L16', 'g5_L16') 5.974
+('asm_bwd', 'L16', 'g6_L16') 6.05
+('asm_bwd', 'randn', 'g2_randn') 5.955
+('asm_bwd', 'randn', 'g3_randn') 5.975
+('asm_dqcvt', 'L16', 'g1_L16') 0.072
+('asm_dqcvt', 'L16', 'g2_L16') 0.073
+('asm_dqcvt', 'L16', 'g3_L16') 0.072
+('asm_dqcvt', 'L16', 'g4_L16') 0.07
+('asm_dqcvt', 'L16', 'g5_L16') 0.073
+('asm_dqcvt', 'L16', 'g6_L16') 0.07
+('asm_dqcvt', 'randn', 'g2_randn') 0.069
+('asm_dqcvt', 'randn', 'g3_randn') 0.07
+('asm_fwd', 'L16', 'g1_L16') 1.166
+('asm_fwd', 'L16', 'g2_L16') 1.164
+('asm_fwd', 'L16', 'g3_L16') 1.147
+('asm_fwd', 'L16', 'g4_L16') 1.216
+('asm_fwd', 'L16', 'g5_L16') 1.225
+('asm_fwd', 'L16', 'g6_L16') 1.219
+('asm_fwd', 'randn', 'g2_randn') 1.145
+('asm_fwd', 'randn', 'g3_randn') 1.113
+('asm_odo', 'L16', 'g1_L16') 0.046
+('asm_odo', 'L16', 'g2_L16') 0.043
+('asm_odo', 'L16', 'g3_L16') 0.043
+('asm_odo', 'L16', 'g4_L16') 0.048
+('asm_odo', 'L16', 'g5_L16') 0.049
+('asm_odo', 'L16', 'g6_L16') 0.046
+('asm_odo', 'randn', 'g2_randn') 0.044
+('asm_odo', 'randn', 'g3_randn') 0.044
+('fly_delta', 'L16', 'g1_L16') 0.049
+('fly_delta', 'L16', 'g2_L16') 0.049
+('fly_delta', 'L16', 'g3_L16') 0.052
+('fly_delta', 'L16', 'g4_L16') 0.055
+('fly_delta', 'L16', 'g5_L16') 0.053
+('fly_delta', 'L16', 'g6_L16') 0.055
+('fly_delta', 'randn', 'g2_randn') 0.051
+('fly_delta', 'randn', 'g3_randn') 0.048
+('fly_dkdv', 'L16', 'g1_L16') 4.989
+('fly_dkdv', 'L16', 'g2_L16') 5.002
+('fly_dkdv', 'L16', 'g3_L16') 4.998
+('fly_dkdv', 'L16', 'g4_L16') 5.164
+('fly_dkdv', 'L16', 'g5_L16') 5.042
+('fly_dkdv', 'L16', 'g6_L16') 5.111
+('fly_dkdv', 'randn', 'g2_randn') 4.938
+('fly_dkdv', 'randn', 'g3_randn') 4.967
+('fly_dq', 'L16', 'g1_L16') 3.122
+('fly_dq', 'L16', 'g2_L16') 3.136
+('fly_dq', 'L16', 'g3_L16') 3.123
+('fly_dq', 'L16', 'g4_L16') 3.256
+('fly_dq', 'L16', 'g5_L16') 3.185
+('fly_dq', 'L16', 'g6_L16') 3.21
+('fly_dq', 'randn', 'g2_randn') 3.114
+('fly_dq', 'randn', 'g3_randn') 3.116
+('fly_fwd', 'L16', 'g1_L16') 1.359
+('fly_fwd', 'L16', 'g2_L16') 1.338
+('fly_fwd', 'L16', 'g3_L16') 1.281
+('fly_fwd', 'L16', 'g4_L16') 1.307
+('fly_fwd', 'L16', 'g5_L16') 1.298
+('fly_fwd', 'L16', 'g6_L16') 1.344
+('fly_fwd', 'randn', 'g2_randn') 1.116
+('fly_fwd', 'randn', 'g3_randn') 1.107

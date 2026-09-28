@@ -1,0 +1,6 @@
+ GPU span 1640.2 ms busy 1625.4 idle 14.8 kernel-sum 1625.4  gemm 841.12 ms  FA path total 352.13 ms arm ranges: e2e::attn_fwd[flyd]=50.2, e2e::attn_bwd[flyd]=302.0  [it 10]
+ GPU span 1574.9 ms busy 1559.0 idle 15.8 kernel-sum 1559.0  gemm 848.00 ms  attn_gqa_sum 3.91 ms  FA path total 272.99 ms arm ranges: e2e::attn_fwd[asm]=38.8, e2e::attn_bwd[asm]=230.3  -- attn_gqa_sum  [it 20]
+ GPU span 1648.8 ms busy 1632.2 idle 16.6 kernel-sum 1632.2  gemm 844.49 ms  FA path total 355.30 ms arm ranges: e2e::attn_fwd[flyd]=55.3, e2e::attn_bwd[flyd]=300.0  [it 30]
+ GPU span 1587.1 ms busy 1570.4 idle 16.8 kernel-sum 1570.4  gemm 856.46 ms  attn_gqa_sum 3.89 ms  FA path total 272.90 ms arm ranges: e2e::attn_fwd[asm]=39.1, e2e::attn_bwd[asm]=230.0  -- attn_gqa_sum  [it 40]
+ GPU span 1661.0 ms busy 1645.5 idle 15.5 kernel-sum 1645.5  gemm 849.00 ms  FA path total 361.98 ms arm ranges: e2e::attn_fwd[flyd]=59.2, e2e::attn_bwd[flyd]=302.8  [it 50]
+ GPU span 1590.1 ms busy 1573.5 idle 16.6 kernel-sum 1573.5  gemm 857.86 ms  attn_gqa_sum 3.92 ms  FA path total 275.02 ms arm ranges: e2e::attn_fwd[asm]=39.3, e2e::attn_bwd[asm]=231.8  -- attn_gqa_sum  [it 60]
