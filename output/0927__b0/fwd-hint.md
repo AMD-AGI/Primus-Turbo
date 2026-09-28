@@ -62,8 +62,9 @@ Source abbreviations used below:
 | h41 | standing note | Re-measured under the fixed ruler: r6 vs r4 +4.6% prod (real), L12 4-wave occ2 DEAD (-0.4% prod, -7% proxy), bnegg/fixed-max vs r6 +0.6% (unconfirmed), ASM beat steady-state ~1.43-1.46 ms (r6/beat 1.035) | open |
 | h42 | advise standing note | E2E (Llama-3.1-8B training): our fwd runs 1.34-1.52x ASM per layer inside training (1.64-1.85 vs 1.22 ms) and is clock-sensitive (+13% across clock states); ASM is not -- prefer changes that cut work/power, and check candidates at a low clock state too | open |
 | h43 | must standing note | Speculative softmax (SPEC_STALE_MAX, r6/g14) LOSES on real training data: 13-25% of tiles recompute (score std 21-53 vs randn 1.0); the randn ruler mis-ranks it. Do not build more speculation variants; an operator nospec refactor is being validated | superseded by h44/h45 |
-| h44 | must refactor | Adopt r13ns verbatim as op/current (r13 with SPEC_STALE_MAX=False): real data + training clock 12-23% faster, e2e fwd 53-60 -> 49 ms/step; output bitwise = r13; randn ruler reads it 4.8% slower (ruler bias) | open |
+| h44 | must refactor | Adopt r13ns verbatim as op/current (r13 with SPEC_STALE_MAX=False): real data + training clock 12-23% faster, e2e fwd 53-60 -> 49 ms/step; output bitwise = r13; randn ruler reads it 4.8% slower (ruler bias) | done (r16) |
 | h45 | must standing note | Speculative softmax is DEAD on real data -- never re-add stale-max / guessed-max / trigger-and-redo; any data-dependent candidate must also beat the champion on the real q/k/v dumps in the same process | open |
+| h46 | must standing note | FlyDSL JIT CACHE HAZARD: the disk-cache key ignores module-level constants (e.g. SPEC_STALE_MAX) -- a path whose contents changed can serve the OLD binary. Every measurement uses a fresh FLYDSL_RUNTIME_CACHE_DIR per process (or per arm) | open |
 
 ---
 
@@ -818,3 +819,16 @@ depends on the data must ALSO be compared with the champion on the real dumps
 `/home/lihuzhan/_prof_dump/qkv_call0{672,673,674,680,688,703}.pt` ([B,S,H,D] bf16) in the same process (tools in
 `PT/output/0927__b0/fwd-nospec/tools/`), and a loss there is a loss. In the training operating point r13ns is still
 1.25-1.29x ASM: prefer reducing issued work and clock sensitivity (v_nop, SALU, barriers).
+
+## h46 -- FlyDSL JIT cache hazard: fresh cache dir for every measurement
+
+Found by the fwd job's round 16 (M1/M1b, `rounds/016/1-opt/opt.md`): FlyDSL 0.3.4.1's JIT key
+(`jit_function.py:580 _jit_function_cache_key`) hashes function sources and closure scalars, but NOT module-level
+constants read inside a function. After op/current was replaced by a tree differing only in such a constant
+(`SPEC_STALE_MAX`), the disk cache (`FLYDSL_RUNTIME_CACHE_DIR=/tmp/flycache` in the container) kept serving the old
+binary under op/current's path: a byte-identical A/A copy read 6.6% apart until the cache was emptied. Rules from now on:
+- every benchmark / validation / probe process gets its own fresh cache dir
+  (`FLYDSL_RUNTIME_CACHE_DIR=$(mktemp -d /tmp/flycache.XXXX)`), or at least one per arm path per round;
+- after op/current changes (promotion, refactor), clear /tmp/flycache before re-measuring the champion;
+- experimental knobs belong in function arguments / closure scalars (part of the key), not module globals;
+- a result measured with a shared warm cache in which a path's contents changed is void.

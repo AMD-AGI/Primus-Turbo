@@ -39,6 +39,7 @@ the head of a round, so direction can be changed here **without stopping the job
 | h69 | must standing note | Target redefined (user-approved): speed passes only when proxy AND prod are each >= beat; fast is reported only (the geomean ended the job at prod 0.78x). refcache provenance refreshed -- the gate no longer recomputes the fp32 reference on the card | open |
 | h70 | must note | k_dq is ISSUE-bound, not latency-bound: unroll k_dq kvloop_full x2 (lab arm u2n, removes 65 back-edge v_mov_b64) -> prod op -3.06% (3 procs), output bitwise = r19h; build it next round and measure proxy too | open |
 | h71 | standing note | Closed by the k_dq lab (measured on card): 2 waves/SIMD k_dq (+13-15% op), GQA-grouped WG (+3-7%), k_delta fused into k_dq (null), k_dkdv unroll x2 (+6.5%), q1 fma-softmax stacked on u2n (worse) | open |
+| h72 | must standing note | FlyDSL JIT CACHE HAZARD: the disk-cache key ignores module-level constants (e.g. SPEC_STALE_MAX) -- a path whose contents changed can serve the OLD binary. Every measurement uses a fresh FLYDSL_RUNTIME_CACHE_DIR per process (or per arm) | open |
 
 ---
 
@@ -4554,3 +4555,16 @@ apply the two diffs to op/current (= r19h), gate it, and measure vs op/current o
 - k_delta fused into k_dq's prologue: op -0.3..+0.7% (null).
 - k_dkdv kv-loop unroll x2 (ku2, 638 VGPR, -16% instructions/iter): op +6.5%. VF on k_dkdv alone: +0.17% (null).
 - q1 (single-fma softmax, scale applied at dQ store) alone: op -2.37%, but stacked with u2n only -1.19% -- prefer u2n.
+
+## h72 -- FlyDSL JIT cache hazard: fresh cache dir for every measurement
+
+Found by the fwd job's round 16 (M1/M1b, `rounds/016/1-opt/opt.md`): FlyDSL 0.3.4.1's JIT key
+(`jit_function.py:580 _jit_function_cache_key`) hashes function sources and closure scalars, but NOT module-level
+constants read inside a function. After op/current was replaced by a tree differing only in such a constant
+(`SPEC_STALE_MAX`), the disk cache (`FLYDSL_RUNTIME_CACHE_DIR=/tmp/flycache` in the container) kept serving the old
+binary under op/current's path: a byte-identical A/A copy read 6.6% apart until the cache was emptied. Rules from now on:
+- every benchmark / validation / probe process gets its own fresh cache dir
+  (`FLYDSL_RUNTIME_CACHE_DIR=$(mktemp -d /tmp/flycache.XXXX)`), or at least one per arm path per round;
+- after op/current changes (promotion, refactor), clear /tmp/flycache before re-measuring the champion;
+- experimental knobs belong in function arguments / closure scalars (part of the key), not module globals;
+- a result measured with a shared warm cache in which a path's contents changed is void.

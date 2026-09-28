@@ -71,3 +71,12 @@
 ### 14. refcache 的 sha 失配后被静默忽略，每轮都在卡上重算 fp32 参考
 - **现象**：bwd 的 `ut/common.py` 在 refcache 建好之后被改过，从 r24 起 gate 每轮都显示 "IGNORED … recomputing"，也就是在卡上重算 fp32 prod 参考。这正是 09-22 那次导致整机断电重启的触发条件。
 - **建议**：sha 失配时让 gate 直接失败并报警，而不是静默地重算；同时提供一个工具，在 `make_inputs` 没变时自动更新 provenance。
+
+### 15. FlyDSL 的 JIT 磁盘缓存 key 不包含模块级常量，同一路径下的新代码可能跑的还是旧二进制（P0）
+- **现象**：fwd r16 发现，op/current 被 refactor 换成只改了一个模块级常量（`SPEC_STALE_MAX`）的树之后，`/tmp/flycache` 仍然按旧 key 返回 r13 的二进制。逐字节相同的 A/A 副本因此读数差了 6.6%。
+- **原因**：`_jit_function_cache_key` 只哈希函数源码和闭包里的标量，不看函数里读到的模块全局变量。
+- **建议**：
+  - harness 每个进程用独立的 FLYDSL_RUNTIME_CACHE_DIR；
+  - promotion 或 refactor 之后，框架自动清空 job 的 JIT 缓存；
+  - 模板里的实验开关一律写成参数，不用模块全局变量；
+  - 向 FlyDSL 上游报告这个问题，建议把模块全局变量纳入 key。
