@@ -102,7 +102,7 @@ def _wgrad_grouped_gemm_fp4_impl_wrapper(
         return grouped_gemm_fp4_variable_k_impl(*inputs, **options)
 
     assert out is not None, "out should not be None when inplace_add_to_out is True"
-    grouped_gemm_fp4_variable_k_accum_impl(*inputs, out=out, **options)
+    grouped_gemm_fp4_variable_k_accum_impl(*inputs, out=out, allow_overwrite=True, **options)
     return _get_dummy_wgrad(out.shape, out_dtype)
 
 
