@@ -1100,7 +1100,12 @@ def get_autotune_bwd_configs():
             num_warps=4,
         ),
     ], [
-        "BLOCK_DMODEL",
+        # BLOCK_DMODEL was split into a QK and a V half; the ACTUAL_* keys below
+        # were updated at the time and this one was not. Triton 3.7 ignored a key
+        # that named no kernel argument, so it went unnoticed; 3.8 validates the
+        # list against the signature and raises at import.
+        "BLOCK_DMODEL_QK",
+        "BLOCK_DMODEL_V",
         "ACTUAL_BLOCK_DMODEL_QK",
         "ACTUAL_BLOCK_DMODEL_V",
         "SEQUENCE_PARALLEL",
