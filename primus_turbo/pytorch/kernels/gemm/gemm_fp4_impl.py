@@ -142,10 +142,12 @@ class GEMMFP4HipBLASLtBackend(KernelBackend):
         # preshuffled=True case.
         del preshuffled
         # TODO(ruibin): Add padding
+        # hipBLASLt takes the leading dimension off the shape: a row-pitched fp4 operand (the
+        # FlyDSL dual quant's) has to be compacted first.
         return torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm_fp4(
-            a,
+            a.contiguous(),
             a_scale_inv,
-            b,
+            b.contiguous(),
             b_scale_inv,
             out_dtype,
             trans_a,
@@ -236,6 +238,7 @@ class GEMMFP4AITERBackend(KernelBackend):
         preshuffled: bool = False,
         **kwargs,
     ):
+        a, b = a.contiguous(), b.contiguous()  # the row pitch is not an argument here
         if preshuffled:
             # Fast path: caller guarantees a_scale_inv, b_scale_inv, and b
             # were already produced in the AITER 16x16-tile layout (e.g. via

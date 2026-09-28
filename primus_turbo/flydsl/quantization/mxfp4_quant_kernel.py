@@ -437,8 +437,6 @@ def _emit_dual_body(
     rmsnorm_scale=False,
     RSTD=None,
     GAMMA=None,
-    tile_tr=None,
-    tile_tc=None,
     pack_row=None,
     pack_col=None,
 ):
@@ -1096,7 +1094,10 @@ def flydsl_dual_quant(
         grid_x,
         torch.cuda.current_stream(),
     )
-    row_data = ro.view(torch.uint8).view(fp4_dtype)  # [R, DP/2] fp4
+    # [R, CP/2] fp4 on a DP/2-byte row pitch. The shape is the true contraction every consumer
+    # reads K off (hipBLASLt, AITER, the preshuffled FlyDSL call, dequant); the line-aligned
+    # pitch travels as stride(0) for the FlyDSL GEMM to pick up without a copy.
+    row_data = ro.view(torch.uint8)[:, : CP // 2].view(fp4_dtype)
     col_data = co.view(torch.uint8).view(fp4_dtype)  # [C, RP/2] fp4
     # A packed slab is the GEMM's own i32 layout, so it goes back as i32 -- that is what the
     # backend looks at to recognise it. The canonical one stays e8m0.
@@ -1255,8 +1256,6 @@ def _build_rmsnorm_dual_kernel(row_rht, col_rht, col_locality=False):
             rmsnorm_scale=True,
             RSTD=RSTD,
             GAMMA=GAMMA,
-            tile_tr=_RMS_TR,
-            tile_tc=_RMS_TC,
         )
 
     return _rmsnorm_dual_kernel
@@ -1362,7 +1361,14 @@ def get_rmsnorm_dual_cast(R, C, row_rht, col_rht):
         gamma = torch.zeros((C,), dtype=torch.float32, device="cuda")
         grid_x = (R // _RMS_TR) * (C // _RMS_TC)
         stream = torch.cuda.current_stream()
-        fn = flyc.compile(raw, x, ro, rs, co, cs, rstd, gamma, R, C, 0, 1 << 21, grid_x, stream)
+        # The dual body reads its tile geometry from the module globals at trace time, and this
+        # grid and _RmsDualSS are sized for the half-height tile: trace under that geometry.
+        saved = (_TR, _TC)
+        _set_tile_geom(_RMS_TR, _RMS_TC)
+        try:
+            fn = flyc.compile(raw, x, ro, rs, co, cs, rstd, gamma, R, C, 0, 1 << 21, grid_x, stream)
+        finally:
+            _set_tile_geom(*saved)
         ent = (fn, grid_x)
         _RMSNORM_DUAL_COMPILED[key] = ent
     return ent

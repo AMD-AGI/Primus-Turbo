@@ -675,6 +675,8 @@ class MfmaScaleFp4:
         g2s_step=0,  # wave-major g2s: LDS bytes per step, carried in the buffer immediate
         g2s_grp=(0, 0),  # steps per M0 window, per (A, B) stream
         kstep_val=0,  # value of ``kstep`` (compile-time), so buf1's +1 block can ride that immediate
+        acc_dead=False,  # caller never reads the returned accumulators, so the fused store may recycle them
+        k1_watermark=False,  # caller's loop watermark covers the k=1 fill, so the prologue need not drain it
         _cache={},  # noqa: B006 -- deliberate cross-call asm compile cache
     ):
         """WHOLE-LOOP bare-asm K-loop: one inline-asm hw-loop, unroll-2 ping-pong with
@@ -758,6 +760,8 @@ class MfmaScaleFp4:
             _WMB,
             apre,
             _MXFP4_ARCH_ACC,
+            acc_dead,
+            k1_watermark,
             g2s_step,
             tuple(g2s_grp),
             kstep_val,
@@ -1184,7 +1188,11 @@ class MfmaScaleFp4:
                         b, wm = self.old.pop(0), min(4 * len(self.old), 60)
                     self.old.append(b)
                     q0 = sl * nq + ii * ntb
-                    if q0 + ntb <= _NAV:
+                    # Only when the caller has promised not to read the accumulators back.
+                    # A GLU caller does -- the fused store writes l1, and the epilogue then
+                    # builds the activation from the same registers -- so recycling them
+                    # there hands it registers later packs have already overwritten.
+                    if acc_dead and q0 + ntb <= _NAV:
                         self.bk += [_ACCV + 4 * q0, _ACCV + 4 * q0 + 8]
                     return b, wm
 
@@ -1499,13 +1507,20 @@ class MfmaScaleFp4:
                 L += emit_sc_vgpr(0) + _scv_adv()
                 L += emit_g2s_pre()
                 # The k=1 fill is still the only vmem in flight and lands in the slot the loop
-                # only reads a phase later, behind its own watermark, so the first MFMA does not
-                # have to wait it out -- this publishes k=0 alone.
+                # only reads a phase later -- behind a watermark the CALLER picks. Only a caller
+                # whose watermark was computed with this fill still outstanding may skip the
+                # drain; one written against a drained prologue reads k=1 before it lands.
+                # That fault is silent: the first tile on a CU finds the slot empty and gets it
+                # right, and only a later tile on the same CU reads the previous tile's k=1.
                 L.append(f"s_waitcnt vmcnt({_NPRE}) lgkmcnt(0)")
                 L.append("s_barrier")
+                _vk1 = _NPRE if k1_watermark else 0
                 if not _PSTAGE:
                     L += emit_ds(0, 0)
-                    L.append(f"s_waitcnt vmcnt({_NPRE}) lgkmcnt(0)")
+                    L.append(f"s_waitcnt vmcnt({_vk1}) lgkmcnt(0)")
+                    L.append("s_barrier")
+                elif not k1_watermark:
+                    L.append("s_waitcnt vmcnt(0)")
                     L.append("s_barrier")
             # K%256 (odd KI): the do-while processes 256-blocks in PAIRS; an odd trailing block is an MFMA tail (or _OPEEL).
             _has_loop = _RUNTIME or (ki >= 2)
@@ -2880,6 +2895,11 @@ def _build_mxfp4_gemm_kernel(
                 g2s_step=_GIMM,
                 g2s_grp=_GGRP,
                 kstep_val=_GKSV,
+                # Mirrors the store below: the accumulators are read back after the loop
+                # exactly when a GLU epilogue runs or there is no fused store.
+                acc_dead=bool(_CSTORE) and not glu,
+                # This builder's watermarks were set with the k=1 fill left in flight.
+                k1_watermark=True,
             )
 
         def _cbase(o, _split=None):
@@ -4307,6 +4327,25 @@ def _get_mxfp4_scale_ws(M, N, K, device, block_n=256, block_m=256):
     return e
 
 
+def _fp4_pitched(t):
+    """``t`` [rows, K/2] fp4 as a contiguous view whose width is its row pitch.
+
+    A row-strided operand (the dual quant seats each row on a 128 B line) widens over its own
+    allocation, so the kernel gets the pitch as ``row_bytes`` with no copy; the bytes past K/2
+    are masked by the contraction taken off the scales. Anything else is compacted.
+    """
+    rows, w = t.shape
+    p = t.stride(0)
+    if (
+        rows > 0
+        and t.stride(1) == 1
+        and p > w
+        and t.storage_offset() + rows * p <= t.untyped_storage().nbytes() // t.element_size()
+    ):
+        return t.as_strided((rows, p), (p, 1))
+    return t.contiguous()
+
+
 def gemm_mxfp4_flydsl_kernel(
     a: torch.Tensor,
     a_scale: torch.Tensor,
@@ -4338,6 +4377,7 @@ def gemm_mxfp4_flydsl_kernel(
             f"got trans_a={trans_a}, trans_b={trans_b}."
         )
 
+    a, b = _fp4_pitched(a), _fp4_pitched(b)
     M, Kb_a = a.shape
     N, Kb_b = b.shape
     # The true contraction comes from the SCALE and only the row stride from the fp4 tensors, so a caller can seat its rows on the line without a copy.
@@ -4958,6 +4998,10 @@ def gemm_mxfp4_glu_quant_flydsl_kernel(
     assert out_dtype == torch.bfloat16, "fused act quant is bf16-accumulator only"
     assert (not trans_a) and trans_b, "mxfp4 glu FlyDSL GEMM is NT only"
 
+    a, b = _fp4_pitched(a), _fp4_pitched(b)
+    if a.shape[1] != b.shape[1]:  # one pitch serves both operands here
+        kh = a_scale.shape[1] * 16
+        a, b = a[:, :kh].contiguous(), b[:, :kh].contiguous()
     M, Kb_a = a.shape
     two_i, Kb_b = b.shape
     assert two_i % 2 == 0, f"B rows must be 2I (gate||up), got {two_i}"
@@ -5098,6 +5142,10 @@ def gemm_mxfp4_dglu_quant_flydsl_kernel(
     assert out_dtype == torch.bfloat16
     assert (not trans_a) and trans_b, "mxfp4 dglu FlyDSL GEMM is NT only"
 
+    a, b = _fp4_pitched(a), _fp4_pitched(b)
+    if a.shape[1] != b.shape[1]:  # one pitch serves both operands here
+        kh = a_scale.shape[1] * 16
+        a, b = a[:, :kh].contiguous(), b[:, :kh].contiguous()
     M, Kb_a = a.shape
     I, Kb_b = b.shape
     K = a_scale.shape[1] * 32
