@@ -29,3 +29,7 @@
   kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
 /home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
   kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+RESULT shape=proxy arm=asm stat=median iters=101 latency_ms=0.08401 min_ms=0.08148 max_ms=0.08797 tflops=1636.46 bw_gbs=998.57 flop=137472507904.0 bytes_min=83886080 sclk_start=1315 sclk_end=1479 causal=True order=blocked9+lead4
+RESULT shape=proxy arm=r13 stat=median iters=101 latency_ms=0.08739 min_ms=0.0816 max_ms=0.11605 tflops=1573.08 bw_gbs=959.9 flop=137472507904.0 bytes_min=83886080 sclk_start=1315 sclk_end=1479 causal=True order=blocked9+lead4
+RESULT shape=proxy arm=r13ns stat=median iters=101 latency_ms=0.08963 min_ms=0.08501 max_ms=0.09727 tflops=1533.7 bw_gbs=935.87 flop=137472507904.0 bytes_min=83886080 sclk_start=1315 sclk_end=1479 causal=True order=blocked9+lead4
+rc=0

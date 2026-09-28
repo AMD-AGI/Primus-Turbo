@@ -61,7 +61,9 @@ Source abbreviations used below:
 | h40 | must standing note | RULER FIXED: benchmark.py now times BLOCKED (lead 4 + block 9 per arm, palindromic rounds); the old call-by-call interleave biased prod 3-7% FlyDSL-vs-FlyDSL and ~25% vs ASM | open |
 | h41 | standing note | Re-measured under the fixed ruler: r6 vs r4 +4.6% prod (real), L12 4-wave occ2 DEAD (-0.4% prod, -7% proxy), bnegg/fixed-max vs r6 +0.6% (unconfirmed), ASM beat steady-state ~1.43-1.46 ms (r6/beat 1.035) | open |
 | h42 | advise standing note | E2E (Llama-3.1-8B training): our fwd runs 1.34-1.52x ASM per layer inside training (1.64-1.85 vs 1.22 ms) and is clock-sensitive (+13% across clock states); ASM is not -- prefer changes that cut work/power, and check candidates at a low clock state too | open |
-| h43 | must standing note | Speculative softmax (SPEC_STALE_MAX, r6/g14) LOSES on real training data: 13-25% of tiles recompute (score std 21-53 vs randn 1.0); the randn ruler mis-ranks it. Do not build more speculation variants; an operator nospec refactor is being validated | open |
+| h43 | must standing note | Speculative softmax (SPEC_STALE_MAX, r6/g14) LOSES on real training data: 13-25% of tiles recompute (score std 21-53 vs randn 1.0); the randn ruler mis-ranks it. Do not build more speculation variants; an operator nospec refactor is being validated | superseded by h44/h45 |
+| h44 | must refactor | Adopt r13ns verbatim as op/current (r13 with SPEC_STALE_MAX=False): real data + training clock 12-23% faster, e2e fwd 53-60 -> 49 ms/step; output bitwise = r13; randn ruler reads it 4.8% slower (ruler bias) | open |
+| h45 | must standing note | Speculative softmax is DEAD on real data -- never re-add stale-max / guessed-max / trigger-and-redo; any data-dependent candidate must also beat the champion on the real q/k/v dumps in the same process | open |
 
 ---
 
@@ -792,3 +794,27 @@ on randn the nospec variant is 5% slower -- which is why every round's ruler kee
 1.45-1.72x ASM per layer; the gap is clock sensitivity x data (0.84 x 1.43 x 1.32).
 Until the operator's nospec validation lands (it will arrive as a `must refactor`): do not build new speculative /
 stale-max variants, and prefer levers that reduce issued work and clock sensitivity (v_nop, SALU, barriers).
+
+## h44 -- Adopt r13ns verbatim as op/current
+
+Operator lab on GPU 0, 2026-09-28 (`PT/output/0927__b0/fwd-nospec/REPORT.md`). r13ns = round 13 with `SPEC_STALE_MAX`
+True -> False in m32x8 (line 173) and m32x2 (line 178); nothing else. Compile-only: 16 configs 0 spill / 0 scratch;
+prod m32x8 5024 -> 4130 instructions. Gate-style checks (copy of gates.py): all PASS, 200/200 deterministic, output
+BITWISE EQUAL to r13 on every gate shape and on 6 real training dumps. Timing (prod, same process, 3 rotated):
+- randn blocked (this job's ruler): r13ns/r13 time 1.048 (4.8% slower) -- the ruler's bias, see h43;
+- real q/k/v dumps, blocked: 0.846-0.919 (8-15% faster);
+- real dumps right after a GEMM burst (training operating point): 0.774-0.880 (12-23% faster); ASM 1.27-1.30 ms,
+  r13 1.85-2.11 ms, r13ns 1.62-1.64 ms;
+- e2e Llama-3.1-8B (nkfix, 32 layers): fwd 53-60 -> 48-49 ms/step and no longer drifts with training step;
+  direct e2e r13ns vs r13 per-step 0.9966 (5/5 pairs < 1).
+**Refactor task**: copy `/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/fwd-nospec/arms/fwd_r13ns/` into the working copy VERBATIM (md5 list `arms/fwd_r13ns.md5` next to it) -- no edits --
+and let the correctness gate run. Do not re-measure it against the randn ruler to decide anything.
+
+## h45 -- Speculative softmax is dead on real data
+
+Never re-introduce stale-max / guessed-max / trigger-and-redo softmax variants: the randn ruler will always say +4.8%
+for them and training will always lose (real score std 21-53 -> 13-25% of tiles recompute). Any candidate whose cost
+depends on the data must ALSO be compared with the champion on the real dumps
+`/home/lihuzhan/_prof_dump/qkv_call0{672,673,674,680,688,703}.pt` ([B,S,H,D] bf16) in the same process (tools in
+`PT/output/0927__b0/fwd-nospec/tools/`), and a loss there is a loss. In the training operating point r13ns is still
+1.25-1.29x ASM: prefer reducing issued work and clock sensitivity (v_nop, SALU, barriers).

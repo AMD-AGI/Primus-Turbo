@@ -1,0 +1,48 @@
+--- OP/r19h/impl.py	2026-09-28 06:12:54.273175328 +0000
++++ OP/qu2ku2/impl.py	2026-09-28 06:43:50.861072009 +0000
+@@ -138,9 +138,29 @@
+     g = hq // hkv
+     stream = torch.cuda.current_stream()
+ 
++    # lab-kdq: nsp_q is derived up front (same rule as below) so that the grouped k_dqg
++    # can be chosen here; with DQ_DFUSE it computes delta itself and runs BEFORE k_dkdv.
++    _wgs_q0 = ((sq + _k.BLOCK_Q - 1) // _k.BLOCK_Q) * hq * b
++    _nsp_q0 = 1
++    while _wgs_q0 * _nsp_q0 < 2048 and _nsp_q0 < _NSP_Q_CAP:
++        _nsp_q0 *= 2
++    use_g = (_nsp_q0 == 1 and hq % _k.DQ_NW == 0 and sq % _k.DQ_BQW == 0)
++    fuse = use_g and _k.DQ_DFUSE
++
++    def _dqg():
++        out = torch.empty((b, sq, hq, d), device=q.device, dtype=q.dtype)
++        _launch("dqg", _k.launch_dqg,
++                (q, k, v, do, o, lse, delta, out, float(softmax_scale),
++                 sq, skv, hq, hkv, g, skv // _k.KV_STEP, skv - sq, int(bool(causal)),
++                 sq // _k.DQ_BQW, hq // _k.DQ_NW, b, stream))
++        return out
++
+     delta = torch.empty((b, hq, sq), device=q.device, dtype=torch.float32)
+-    _launch("delta", _k.launch_delta,
+-            (do, o, delta, sq, hq, n_rows, n_rows // _k.ROWS_DELTA, stream))
++    if fuse:
++        dq_g = _dqg()                   # writes delta, then k_dkdv reads it
++    else:
++        _launch("delta", _k.launch_delta,
++                (do, o, delta, sq, hq, n_rows, n_rows // _k.ROWS_DELTA, stream))
+ 
+     # r3.i2.g11 -- the kernels write bf16 straight out. Three `.to()` kernels and three
+     # fp32 temporaries are gone; the accumulators are still fp32 inside the kernel.
+@@ -215,7 +235,12 @@
+     nsp_q = 1
+     while _wgs_q * nsp_q < 2048 and nsp_q < _NSP_Q_CAP:
+         nsp_q *= 2
+-    if nsp_q == 1:
++    assert nsp_q == _nsp_q0
++    if fuse:
++        dq_o = dq_g
++    elif use_g:
++        dq_o = _dqg()
++    elif nsp_q == 1:
+         dq_o = torch.empty((b, sq, hq, d), device=q.device, dtype=q.dtype)
+         _launch("dq", _k.launch_dq,
+                 (q, k, v, do, lse, delta, dq_o, float(softmax_scale),

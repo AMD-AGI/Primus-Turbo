@@ -1,3 +1,4 @@
 harness/refcache/
 **/__pycache__/
 runs/*.json
+isa/*/

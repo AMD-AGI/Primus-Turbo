@@ -1,0 +1,3 @@
+index-sequence cases 4993, failures 0
+leftover-in-mask-loop predicate checks 64680, live-mask violations 0
+TOTAL 0
