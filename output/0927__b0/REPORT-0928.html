@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B0 注意力攻关报告</title>
+<style>
+:root{
+  --bg:#f7f7f5; --panel:#ffffff; --ink:#1d1f23; --muted:#5d636d; --line:#dfe1e5;
+  --accent:#2f5fb3; --accent-soft:#e7eefa; --good:#1f7a4a; --good-soft:#e3f3ea;
+  --bad:#b0412e; --bad-soft:#fbe9e5; --warn:#9a6a00; --warn-soft:#fbf2dc;
+  --code-bg:#f0f1f3; --row-alt:#fafafa;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#15171a; --panel:#1d2024; --ink:#e6e8eb; --muted:#9aa1ab; --line:#33373d;
+    --accent:#7aa7ff; --accent-soft:#1f2b40; --good:#5fcf94; --good-soft:#18301f;
+    --bad:#ff8a73; --bad-soft:#3a2019; --warn:#e8b64a; --warn-soft:#352a12;
+    --code-bg:#2a2e34; --row-alt:#202328;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#15171a; --panel:#1d2024; --ink:#e6e8eb; --muted:#9aa1ab; --line:#33373d;
+  --accent:#7aa7ff; --accent-soft:#1f2b40; --good:#5fcf94; --good-soft:#18301f;
+  --bad:#ff8a73; --bad-soft:#3a2019; --warn:#e8b64a; --warn-soft:#352a12;
+  --code-bg:#2a2e34; --row-alt:#202328;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",sans-serif}
+.wrap{max-width:1080px;margin:0 auto;padding:24px 16px 64px}
+header{border-bottom:1px solid var(--line);padding-bottom:16px;margin-bottom:8px}
+h1{font-size:1.6rem;line-height:1.3;margin:0 0 6px}
+h2{font-size:1.25rem;margin:40px 0 10px;padding-top:8px;border-top:1px solid var(--line)}
+h3{font-size:1.05rem;margin:22px 0 8px}
+p{margin:8px 0}
+.meta{color:var(--muted);font-size:.9rem}
+.meta b{color:var(--ink)}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.86em;background:var(--code-bg);padding:1px 4px;border-radius:4px;word-break:break-all}
+nav.toc{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin:16px 0;font-size:.92rem}
+nav.toc ol{margin:4px 0;padding-left:1.4em;columns:2;column-gap:28px}
+nav.toc a{color:var(--accent);text-decoration:none}
+@media (max-width:640px){nav.toc ol{columns:1}}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin:14px 0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.card .k{font-size:.8rem;color:var(--muted)}
+.card .v{font-size:1.35rem;font-weight:650;margin:2px 0;font-variant-numeric:tabular-nums}
+.card .s{font-size:.82rem;color:var(--muted)}
+.card.hl{border-color:var(--accent);background:var(--accent-soft)}
+ul.tight{margin:6px 0;padding-left:1.3em}
+ul.tight li{margin:3px 0}
+.tbl{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:10px 0 4px;border:1px solid var(--line);border-radius:8px;background:var(--panel)}
+table{border-collapse:collapse;width:100%;font-size:.86rem;font-variant-numeric:tabular-nums}
+th,td{padding:6px 9px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{background:var(--code-bg);font-weight:600;white-space:nowrap}
+tbody tr:nth-child(even){background:var(--row-alt)}
+tr.win td{background:var(--good-soft)}
+tr.ref td{background:var(--accent-soft)}
+tr.dead td{color:var(--muted)}
+td.n{text-align:right;white-space:nowrap}
+.src{font-size:.78rem;color:var(--muted);margin:2px 0 14px}
+.tag{display:inline-block;font-size:.74rem;padding:0 6px;border-radius:9px;font-weight:600;white-space:nowrap}
+.t-good{background:var(--good-soft);color:var(--good)}
+.t-bad{background:var(--bad-soft);color:var(--bad)}
+.t-warn{background:var(--warn-soft);color:var(--warn)}
+.t-info{background:var(--accent-soft);color:var(--accent)}
+.note{border-left:3px solid var(--warn);background:var(--warn-soft);padding:8px 12px;border-radius:0 8px 8px 0;margin:10px 0;font-size:.92rem}
+.key{border-left:3px solid var(--accent);background:var(--accent-soft);padding:8px 12px;border-radius:0 8px 8px 0;margin:10px 0;font-size:.92rem}
+.bars{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin:10px 0}
+.bar{display:grid;grid-template-columns:minmax(120px,210px) 1fr 64px;align-items:center;gap:10px;margin:6px 0;font-size:.85rem}
+.bar .track{height:14px;background:var(--code-bg);border-radius:7px;overflow:hidden}
+.bar .fill{height:100%;background:var(--accent);border-radius:7px}
+.bar .val{text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
+@media (max-width:520px){.bar{grid-template-columns:1fr 54px}.bar .lbl{grid-column:1 / -1}}
+.tl{list-style:none;padding:0;margin:8px 0}
+.tl li{display:grid;grid-template-columns:118px 1fr;gap:10px;padding:5px 0;border-bottom:1px dashed var(--line);font-size:.9rem}
+.tl .t{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+@media (max-width:520px){.tl li{grid-template-columns:1fr}.tl .t{font-weight:600}}
+footer{margin-top:48px;color:var(--muted);font-size:.8rem;border-top:1px solid var(--line);padding-top:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+<h1>B0 gfx1250 flash-attention 攻关报告（2026-09-27 / 28）</h1>
+<div class="meta">
+主机 <b>B0 = ctheliosp-1b112-a37-1</b>（4 × gfx1250 / MI455X，同一 XGMI hive） ·
+分支 <code>dev/lhz/flydsl-attn-b0</code> ·
+形状 prod：b4 s8192 hq32 hkv8 d128 bf16 causal（BSHD），FLOP fwd 2.199292e12 / bwd 5.498229e12<br>
+<b>数据截至：2026-09-28 10:38 UTC</b>（<code>fwd/progress.md</code> 最后一轮 r18 结束时间；e2e 终版测量 10:38–10:44，快照提交 <code>5188c9da</code> 11:00）
+</div>
+</header>
+
+<nav class="toc"><b>目录</b>
+<ol>
+<li><a href="#s1">摘要与核心指标</a></li>
+<li><a href="#s2">基线表</a></li>
+<li><a href="#s3">时间线</a></li>
+<li><a href="#s4">fwd 进展与发现</a></li>
+<li><a href="#s5">bwd 进展与发现</a></li>
+<li><a href="#s6">测量方法学的修正</a></li>
+<li><a href="#s7">端到端（e2e）</a></li>
+<li><a href="#s8">给 op-evolve 的改进建议</a></li>
+<li><a href="#s9">风险与未决事项</a></li>
+<li><a href="#s10">下一步建议</a></li>
+</ol>
+</nav>
+
+<!-- ============================================================ -->
+<h2 id="s1">1. 摘要</h2>
+
+<div class="cards">
+  <div class="card hl"><div class="k">e2e：FlyDSL 比 ASM 每步慢</div><div class="v">5.0% → 3.2%</div><div class="s">同进程配对单步时间比 1.0475/1.0500 → 1.0323/1.0328（GEMM 修复后）</div></div>
+  <div class="card"><div class="k">e2e 稳态 tps（今天的冠军）</div><div class="v">20,091 / 20,747</div><div class="s">FlyDSL r16+r29 / aiter ASM（fin_p2a；fin_p2b 为 20,070 / 20,697）</div></div>
+  <div class="card"><div class="k">GEMM 修复（nkfix）</div><div class="v">约 10×</div><div class="s">ASM 1,922 → 20,718 tps；turbo baseline 1,856 → 14,563</div></div>
+  <div class="card"><div class="k">bwd 冠军 r29（blocked 尺子）</div><div class="v">656.5 TF/s</div><div class="s">8.375 ms，ASM 的 80.4%（起点 r20 约 0.74–0.76×）</div></div>
+  <div class="card"><div class="k">fwd 冠军 r16 = r13ns</div><div class="v">ASM 的 1.25–1.29×（时间）</div><div class="s">真实数据 + 训练时钟；randn 分块尺子下时间比 1.080–1.084</div></div>
+  <div class="card"><div class="k">剩余 e2e 差距（每步）</div><div class="v">bwd ≈52 ms · fwd ≈10 ms</div><div class="s">FA path 差 58–65 ms/步；bwd 1.22×、fwd 1.25×</div></div>
+</div>
+
+<ol>
+<li><b>e2e 差距在两天内缩小了约 1.8 个百分点</b>：GEMM 修好后 FlyDSL 比 ASM 每步慢 4.8–5.0%，换 fwd r13ns 后 4.0–4.1%，再换 bwd r29 后 3.2–3.3%（约 51–52 ms/步）。</li>
+<li><b>GEMM 是 e2e 的第一瓶颈，已修</b>：反向 dgrad/wgrad 落在 hipBLASLt 回退 tile <code>MT32x16x32</code>，GEMM 占每步 96%。nkfix 把它们改写成 <code>MT256x256x128</code>，tps 提升约 10 倍；修复之后 attention 的差距才看得出来。</li>
+<li><b>op 级尺子两次选错方向</b>：(a) 逐次交错计时对功耗高的 arm 有系统偏差（fwd FlyDSL 对 ASM 约 25%，bwd 约 3.4%），造成 r6、L12、L21 三个假"赢"；(b) randn 输入奖励了投机 softmax，而它在真实数据上是负收益。</li>
+<li><b>fwd：投机 softmax 在真实数据上已判死</b>。关掉投机（r13ns）在 randn 上慢 4.8%，但在真实数据和训练时钟下快 12–23%，并已通过 refactor h44 采用。randn 尺子上 fwd 已接近饱和（约 ASM 的 0.97），r14–r18 连续 5 轮都没有提升。</li>
+<li><b>bwd：两次真实提升都来自回头看和 lab</b>：r19 在 prod 上其实比 r20 快 1.7%，于是采用 r19h（r19 加 h33 修复）；k_dq 的 kv 循环展开 2 次（u2n）让整个 op 快 3.06%，在训练时钟下快 3.2%，成为 r29。FUSED5 已判死（0.39×）。</li>
+<li><b>判据缺陷已修</b>：bwd job 曾因几何平均被 fast 形状（1.66×）拉高，在 prod 只有 0.78× 时误判为 target_met 并自行结束；现在要求 proxy 和 prod 都各自 ≥ beat（h69）。</li>
+<li><b>硬件与环境风险仍在</b>：GPU1 wedged（MES failed to respond），只能人工断电恢复；nkfix 的 NaN 根因未找到，目前只有统计上界；day1 容器被他人删除，day2 也出现过外来负载。</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2 id="s2">2. 基线表</h2>
+<div class="key"><b>计时口径说明</b>：op 级数字有三种口径，彼此不能混比。
+<b>交错</b> = 旧 harness 逐次交替各 arm（09-28 03:40 之前的默认方式，对 FlyDSL 对 ASM 有偏差）；
+<b>分块</b> = 新 harness，每个 arm 先跑 4 次不计时，再连续计时 9 次，randn 输入，接近高时钟稳态；
+<b>训练工作点</b> = 真实 q/k/v、紧跟 GEMM 突发（sclk 约 1250–1690 MHz），或直接取自 e2e trace。
+TF/s 列中带 * 的值由 FLOP / ms 换算得出。</div>
+
+<div class="tbl"><table>
+<thead><tr><th>实现</th><th>口径</th><th class="n">fwd ms</th><th class="n">fwd TF/s</th><th class="n">bwd ms</th><th class="n">bwd TF/s</th><th>备注</th></tr></thead>
+<tbody>
+<tr><td>turbo baseline（Triton stock @1cb2e183）</td><td>tune_attention.py，n=3 中位数</td><td class="n">5.318</td><td class="n">413.6*</td><td class="n">25.034</td><td class="n">219.6*</td><td>e2e 中 FA path 990 ms/步（修复后）</td></tr>
+<tr class="ref"><td>aiter ASM（beat）</td><td>交错</td><td class="n">1.144</td><td class="n">1922*</td><td class="n">6.504</td><td class="n">845*</td><td>PERF 表，2 次均值（旧尺子）</td></tr>
+<tr class="ref"><td>aiter ASM（beat）</td><td>分块</td><td class="n">1.43–1.46</td><td class="n">1552.7–1557.2</td><td class="n">6.911</td><td class="n">816.8–820.7</td><td>ms 取自尺子审计（fwd 稳态 beat、bwd 分块 beat）；TF/s 取自 job 各轮同会话 beat（fwd r10–r13，bwd r27–r30），两者不是同一次测量</td></tr>
+<tr><td>FlyDSL baseline（vendored aiter，op0341）</td><td>交错</td><td class="n">1.737（约 1.78）</td><td class="n">≈1236</td><td class="n">—</td><td class="n">—</td><td>fwd baseline/ASM 0.658</td></tr>
+<tr><td>FlyDSL 起点：fwd r4 / bwd r20</td><td>交错</td><td class="n">1.453（同会话 1.526）</td><td class="n">1441.7</td><td class="n">8.716</td><td class="n">633–650</td><td>ASM 的 0.787× / 0.746×</td></tr>
+<tr class="win"><td>FlyDSL 当前：fwd r16（= r13ns）</td><td>分块 randn</td><td class="n">≈1.51</td><td class="n">1443–1455</td><td class="n">—</td><td class="n">—</td><td>r13ns/ASM 时间比 1.080–1.084（randn）；真实数据 + GEMM 突发下 1.253–1.288</td></tr>
+<tr class="win"><td>FlyDSL 当前：bwd r29（= r19h + u2n）</td><td>分块</td><td class="n">—</td><td class="n">—</td><td class="n">8.375</td><td class="n">656.5</td><td>ASM 的 80.4%（beat 817.0）</td></tr>
+<tr><td>作参考：fwd r13（带投机，randn 最佳）</td><td>分块 randn</td><td class="n">1.463</td><td class="n">1502.8</td><td class="n">—</td><td class="n">—</td><td>ASM 的 96.5%，但在训练中是 1.44–1.66×</td></tr>
+</tbody></table></div>
+<div class="src">来源：<code>/home/lihuzhan/code/2026_0927__bak/PERF-A0-vs-B0.md</code> §1–2；<code>fwd/progress.md</code>；<code>bwd/progress.md</code>；<code>ruler/REPORT.md</code>；<code>ruler/bwd/REPORT.md</code>；<code>fwd-nospec/REPORT.md</code> §0</div>
+
+<h3>训练工作点（e2e trace，32 层，ms/步）</h3>
+<div class="tbl"><table>
+<thead><tr><th>项</th><th class="n">FlyDSL（r16 + r29）</th><th class="n">aiter ASM</th><th class="n">fly/ASM</th></tr></thead>
+<tbody>
+<tr><td>attn fwd</td><td class="n">48.0–49.3</td><td class="n">38.8–39.3</td><td class="n">≈1.25</td></tr>
+<tr><td>attn bwd（ASM 含 GQA 求和）</td><td class="n">285.4–290.0</td><td class="n">233.1–236.7</td><td class="n">≈1.22</td></tr>
+<tr><td>FA path 合计</td><td class="n">333.7–339.3</td><td class="n">272.1–275.7</td><td class="n">—</td></tr>
+<tr><td>attention 占单步</td><td class="n">20.5–20.6%</td><td class="n">17.2–17.4%</td><td class="n">—</td></tr>
+</tbody></table></div>
+<div class="src">来源：<code>output/0927__b0/e2e/RESULT-final.md</code> §0</div>
+
+<!-- ============================================================ -->
+<h2 id="s3">3. 时间线（UTC）</h2>
+<h3>Day 1 · 2026-09-27</h3>
+<ul class="tl">
+<li><span class="t">开局</span><span>4 卡隔离：每张卡一个容器 <code>fa-g0..fa-g3</code>，由 <code>docker commit</code> 快照而来，只挂 <code>/dev/kfd</code> 和一个 renderD；已核实 device_count 1，负载只落在本卡。原 <code>fa-repro</code> 停掉并改名为 <code>fa-repro-parked</code>。分工：GPU0 fwd job（从 A0 的 r4 克隆），GPU1 bwd job（从 r24 恢复），GPU2 fwd lab，GPU3 bwd FUSED5 lab。</span></li>
+<li><span class="t">上午</span><span>干扰探针：attention 负载之间互不干扰（波动约 0.5–1%），可以 4 卡并行；邻卡跑持续 GEMM 时，被测卡慢 3–11 倍，比值还会反转，因此禁止 GEMM burn。</span></li>
+<li><span class="t">12:34–13:32</span><span>bwd r24 被拒（0.9665）：h60 unroll −4.5%，X1/X2 判死。</span></li>
+<li><span class="t">13:14–13:43</span><span>lab2（GPU2）：L22/L23/L24/L4/L5 共 15 个 arm，没有 win；itilp 是最大的 loss（−6.6%）。</span></li>
+<li><span class="t">13:17–14:17</span><span><b>fwd r6 被接受</b>：投机 softmax，报告 +5.7%，占 ASM 84.8%。后来用分块尺子复核为 +4.6%。verify_r6 的 256 个对抗 case 全部通过。</span></li>
+<li><span class="t">14:14–15:10</span><span>lab3-L21 复核：+6.3% 被推翻（是尺子问题）；lab2-L12 复核：prod +6.4%，proxy −6.8%，之后被尺子审计推翻。FUSED5（lab3）：整个 op 只有冠军的 0.39×，判死。</span></li>
+<li><span class="t">14:20–15:34</span><span>fwd r7、r8 被拒；r8 的 arm B（m16x8 小 grid）让 fast +29%，但被 proxy 噪声拒掉。</span></li>
+<li><span class="t">~15:43</span><span><b>4 个容器被他人删除</b>，随后出现新容器 <code>gfx1250dbg_maxtext_g31fp8_L6_at4</code>。按规则全部停机，不重建。当时 bwd r25 act 进行到 04_report，fwd r9 刚开始。</span></li>
+</ul>
+<h3>Day 2 · 2026-09-28</h3>
+<ul class="tl">
+<li><span class="t">开局</span><span><b>GPU1 wedged</b>（dmesg 持续刷 <code>MES(0,0) failed to respond</code>，之前在 69813 s 有一个非本方进程的 GPF），不再使用。换卡：fwd 到 GPU2，bwd 到 GPU3，GPU0 做 e2e 和辅助测试（用 flock 共享）。</span></li>
+<li><span class="t">01:55–03:05</span><span>fwd 尺子审计：所谓"双峰"其实是 r4 对 r6；根因是逐次交错计时。改为分块计时，A/A 在 ±0.19% 以内。</span></li>
+<li><span class="t">02:00–02:40</span><span>fwd r9：BG（m16x8 + g18）三个 shape 全面胜过 r6，但因为历史最佳里混进了没被接受的 arm 而被拒；由 refactor h39 提升（r10）。</span></li>
+<li><span class="t">03:02–04:19</span><span>bwd 尺子审计：FlyDSL 对 ASM 的交错偏差约 3.4%；<b>r19 在 prod 上比 r20 快 1.7%</b>（h67）。</span></li>
+<li><span class="t">03:06–04:01</span><span>第一次 e2e（GEMM 修复前）：FlyDSL 只慢 0.42–0.45%；GEMM 占每步 96%。</span></li>
+<li><span class="t">03:50–05:55</span><span>fwd r11 被接受（m32x2 小 grid，fast +8.4%），r12 null，r13 被接受（小 grid 4 wave + d 切分，fast 达到 ASM 的 105.5%）。</span></li>
+<li><span class="t">~05:10</span><span>bwd r27：几何平均达到 1.007× beat（fast 1.66× 掩盖了 prod 的约 0.78×），job 误判 target_met 并结束。</span></li>
+<li><span class="t">05:31</span><span><b>GEMM 修复（nkfix）</b>：e2e 约提升 10 倍；FlyDSL 比 ASM 每步慢约 4.9%。</span></li>
+<li><span class="t">06:08</span><span>训练内 profiling：fwd 的损失来自时钟 × 数据（投机），bwd 的差距主要在 k_dq。</span></li>
+<li><span class="t">06:44–06:51</span><span>判据修复（h69：proxy 和 prod 各自 ≥ beat），refcache provenance 刷新；bwd 采用 r19h（h68，r28）。</span></li>
+<li><span class="t">06:47</span><span>nospec lab：关掉投机后，r13 在真实数据、训练时钟下快 12–23%（h44、h45）。</span></li>
+<li><span class="t">07:16</span><span>k_dq lab：u2n 让整个 op 快 3.06%，输出逐位相同（h70、h71）。</span></li>
+<li><span class="t">08:31 / 08:41</span><span>fwd 通过 refactor h44 采用 r13ns（r16）；<b>bwd r29 被接受</b>（u2n，prod +2.7%，占 ASM 80.4%）。</span></li>
+<li><span class="t">09:00–09:10</span><span>外来负载：别的用户在 GPU0 上跑 hipblaslt-bench；受影响的 lab 进程已剔除并重测。</span></li>
+<li><span class="t">09:19</span><span>发现 FlyDSL JIT 缓存陷阱（h46/h72）。</span></li>
+<li><span class="t">09:52</span><span>fwd r17 null；由于连续 4 轮没有提升，下发重定向 hint h47（真实数据尺子）。</span></li>
+<li><span class="t">10:30–10:38</span><span>bwd r30 null（g89）；k_dq lab 第二轮：u2n 在训练时钟下得到确认（−3.2%），9 个后续 arm 都是 null 或 loss；fwd r18 null（g64 只在 randn 上有收益）。</span></li>
+<li><span class="t">10:38–10:46</span><span>e2e 终版：差距 3.2–3.3%。11:00 为 A0 交接做冠军快照（<code>5188c9da</code>）。</span></li>
+</ul>
+<div class="src">来源：<code>README.md</code>、<code>interference.md</code>、<code>STOPPED.md</code>、<code>LAB-RULES.md</code>、<code>e2e/RECON.md</code> §6、<code>lab-kdq/REPORT.md</code>、<code>fwd/progress.md</code>、<code>bwd/progress.md</code>、<code>git log dev/lhz/flydsl-attn-b0</code>（09-28 04:45 起的提交时间）</div>
+
+<!-- ============================================================ -->
+<h2 id="s4">4. fwd 进展（job <code>gfx1250-flydsl-attn-fwd-b0-20260927</code>）</h2>
+<p>绿色行表示被接受或被提升的轮次。r10 之前是交错尺子；r10 act 起换成分块尺子；r16 起冠军为 r13ns，randn 读数按设计偏低约 4%。"% ASM" 均为当轮候选的读数。</p>
+<div class="tbl"><table>
+<thead><tr><th>轮</th><th>模式</th><th>时间</th><th>结果</th><th class="n">prod TF/s（ms）</th><th>对同会话冠军</th><th class="n">% ASM prod</th><th class="n">proxy / fast TF/s</th><th>要点</th></tr></thead>
+<tbody>
+<tr class="dead"><td>5</td><td>deep</td><td>09-27 12:35</td><td><span class="tag t-bad">失败</span></td><td class="n">—</td><td>—</td><td class="n">—</td><td class="n">—</td><td>reviewer 401（B0 上缺 codex 账号）</td></tr>
+<tr class="win"><td>6</td><td>fast</td><td>13:17</td><td><span class="tag t-good">接受</span></td><td class="n">1524.1（1.443）</td><td>+5.7%（复核 +4.6%）</td><td class="n">84.8%</td><td class="n">1583.6 / 97.4</td><td>投机 softmax g14；对抗 256 case 通过</td></tr>
+<tr><td>7</td><td>fast</td><td>14:20</td><td>拒</td><td class="n">1513.7（1.453）</td><td>+0.19%</td><td class="n">84.7%</td><td class="n">1592.5 / 97.7</td><td>g18 proxy +1.6%，prod 持平；LO/HI 预取顺序是一阶项</td></tr>
+<tr><td>8</td><td>fast</td><td>14:59</td><td>拒</td><td class="n">1509.8（1.457）</td><td>+0.14%</td><td class="n">84.3%</td><td class="n">1576.5 / 139.3</td><td>arm B m16x8 fast +29%，被 proxy 噪声拒；nodelay −1.65%</td></tr>
+<tr><td>9</td><td>fast</td><td>09-28 02:00</td><td>拒 → h39</td><td class="n">1500.6（1.466）</td><td>prod +0.42%，proxy +1.04%，fast +27.5%</td><td class="n">85.7%</td><td class="n">1587.2 / 139.3</td><td>只因"历史最佳"含未发布 arm 而被拒</td></tr>
+<tr class="win"><td>10</td><td>refactor h39</td><td>09-28</td><td><span class="tag t-good">提升</span></td><td class="n">= r9 BG</td><td>—</td><td class="n">—</td><td class="n">—</td><td>m16x8 gate + g18</td></tr>
+<tr class="ref"><td>尺子</td><td>审计</td><td>01:55–03:05</td><td>—</td><td class="n">—</td><td>r6/r4 +4.6%；L12 判死</td><td class="n">r6/ASM 1.035×</td><td class="n">—</td><td>harness 换成分块计时（h40/h41）</td></tr>
+<tr><td>10</td><td>deep</td><td>02:34</td><td>拒</td><td class="n">1491.8（1.474）</td><td>prod 0.9929</td><td class="n">95.8%</td><td class="n">1618.2 / 143.8</td><td>g24 = L12 occ2：−0.7%，再次确认判死</td></tr>
+<tr class="win"><td>11</td><td>fast</td><td>03:50</td><td><span class="tag t-good">接受</span></td><td class="n">1500.7（1.466）</td><td>prod 持平，fast +8.4%</td><td class="n">96.4%</td><td class="n">1598.0 / 155.5</td><td>m32x2 2-wave 小 grid kernel；fast 达到 ASM 的 99.7%</td></tr>
+<tr><td>12</td><td>fast</td><td>04:25</td><td>拒</td><td class="n">1502.6（1.464）</td><td>全在 A/A 内</td><td class="n">96.8%</td><td class="n">1594.5 / 151.4</td><td>host 路径节省：在分块尺子下 null</td></tr>
+<tr class="win"><td>13</td><td>fast</td><td>05:27</td><td><span class="tag t-good">接受</span></td><td class="n">1502.8（1.463）</td><td>fast +5.6%</td><td class="n">96.5%</td><td class="n">1606.3 / 162.3</td><td>g51 小 grid 4 wave + d 切分；fast 达到 ASM 的 105.5%</td></tr>
+<tr><td>14</td><td>fast</td><td>05:55</td><td>拒</td><td class="n">1509.7（1.457）</td><td>prod +0.6%，proxy −5.4%</td><td class="n">96.7%</td><td class="n">1535.2 / 163.3</td><td>—</td></tr>
+<tr><td>15</td><td>deep</td><td>06:42</td><td>拒</td><td class="n">1512.5（1.454）</td><td>+0.2%</td><td class="n">96.9%</td><td class="n">1622.1 / 163.6</td><td>g59 分 lane 部分行和：null</td></tr>
+<tr class="win"><td>16</td><td>refactor h44</td><td>08:16</td><td><span class="tag t-good">提升</span></td><td class="n">—</td><td>—</td><td class="n">—</td><td class="n">—</td><td>采用 r13ns（关掉投机）：真实数据和 e2e 上是 win，randn 上读 −4.8%</td></tr>
+<tr><td>16 opt</td><td>fast</td><td>08:21</td><td>拒</td><td class="n">1448.9（1.518）</td><td>+0.4%</td><td class="n">93.1%</td><td class="n">1571.4 / 164.8</td><td>r13ns 上的第一轮</td></tr>
+<tr><td>17</td><td>fast</td><td>09:40</td><td>拒</td><td class="n">1456.9（1.510）</td><td>+0.8%，geomean 1.0032</td><td class="n">93.8%</td><td class="n">1567.5 / 167.0</td><td>pmc 探针；每进程用新 JIT 缓存</td></tr>
+<tr><td>18</td><td>fast</td><td>09:52–10:38</td><td>拒</td><td class="n">1467.8（1.498）</td><td>randn +0.9%；真实数据 +0.2%</td><td class="n">94.8%</td><td class="n">1575.0 / 164.1</td><td>g64：只在 randn 上有收益；第一轮同时报告两把尺子</td></tr>
+</tbody></table></div>
+<div class="src">来源：<code>output/0927__b0/fwd/progress.md</code>；<code>ruler/REPORT.md</code></div>
+
+<h3>关键发现</h3>
+<ul class="tight">
+<li><b>投机 softmax 在真实数据上是负收益</b> <span class="tag t-bad">判死 h45</span>：真实 q/k/v 的 score 标准差为 21–53（randn 为 1），13–25% 的 tile 步会触发重算（randn 为 0%）。r6 在训练中每层是 ASM 的 1.45–1.72×，并且随训练步变慢（fwd 50.2 → 55.3 → 59.2 ms/步）。r13ns 与 r13 输出逐位相同，randn 上时间比为 1.048，真实数据分块下为 0.846–0.919，训练工作点下为 0.774–0.880。e2e 中 fwd 从 53–60 降到 48–49 ms/步，且不再随步数漂移。</li>
+<li><b>训练中 fwd 差距的分解</b>：0.84（2350 MHz、randn 下 fly 更快）× 1.43（时钟）× 1.32（数据）≈ 1.58。FlyDSL fwd 从 2350 MHz 降到 1350 MHz 时慢 1.25×，而 ASM 为 0.97×，基本不受时钟影响。</li>
+<li><b>小 grid 路线有效</b>：m16x8 gate（r9 fast +27.5%）→ m32x2 2-wave（r11 +8.4%）→ 4-wave + d 切分（r13 +5.6%），fast 形状从 97.4 TF/s（r6）升到 162.3 TF/s（r13，ASM 的 105.5%）。prod 不受影响。</li>
+<li><b>JIT 缓存陷阱</b> <span class="tag t-warn">h46</span>：FlyDSL 0.3.4.1 的 <code>_jit_function_cache_key</code> 不包含模块级常量。只改 <code>SPEC_STALE_MAX</code> 后，<code>/tmp/flycache</code> 仍然返回旧二进制，逐字节相同的 A/A 副本读数差了 6.6%。</li>
+<li><b>已关闭的方向</b>：L12 4-wave × 2 WG/CU（分块下 −0.4%，proxy −7%）；L21 bnegg（+0.3%，null）；L22/L23/L24/L4/L5（lab2 全部 null 或 loss）；在投机代码体上加 nodelay（−1.65%）。</li>
+<li><b>r14–r18 平台期</b>：在 randn 分块尺子上冠军约为 ASM 的 0.97，各轮提升都在 ±1% 以内。h47 已把目标改为减少发射量和时钟敏感度（v_nop、SALU、barrier）。</li>
+</ul>
+<div class="src">来源：<code>profile/REPORT.md</code> §0、§2；<code>fwd-nospec/REPORT.md</code> §0；<code>fwd-hint.md</code> h41–h47；<code>lab2/MEASURE.md</code>；<code>lab3-L21/VERIFY.md</code>；<code>OP-EVOLVE-SUGGESTIONS.md</code> #15、#16</div>
+
+<!-- ============================================================ -->
+<h2 id="s5">5. bwd 进展（job <code>gfx1250-flydsl-attn-bwd-20260917-115934</code>）</h2>
+<div class="tbl"><table>
+<thead><tr><th>轮</th><th>模式</th><th>时间</th><th>结果</th><th class="n">prod TF/s（ms）</th><th class="n">同会话冠军</th><th>增益</th><th class="n">% ASM</th><th>要点</th></tr></thead>
+<tbody>
+<tr><td>24</td><td>fast</td><td>09-27 12:34</td><td>拒</td><td class="n">638.8（8.607）</td><td class="n">650.2</td><td>0.9665</td><td class="n">75.0%</td><td>h60 unroll −4.5%；X1 0.804×、X2 0.872× 判死</td></tr>
+<tr><td>25</td><td>deep</td><td>→ 09-28 02:39</td><td>拒</td><td class="n">615.6（8.931）</td><td class="n">637.6</td><td>prod 0.9656</td><td class="n">74.4%</td><td>g77 反向扫描 −3.4%（分块下 −1.9%）</td></tr>
+<tr><td>26</td><td>fast</td><td>02:52</td><td>拒</td><td class="n">640.0（8.591）</td><td class="n">638.6</td><td>+0.21%</td><td class="n">76.5%</td><td>h33 clamp 是正确性修复，有 VGPR 代价</td></tr>
+<tr class="ref"><td>尺子</td><td>审计</td><td>03:02–04:19</td><td>—</td><td class="n">—</td><td class="n">—</td><td>r19 比 r20 快 1.7%</td><td class="n">≈78.8%</td><td>交错偏差约 3.4%；换成分块 harness</td></tr>
+<tr><td>27</td><td>fast</td><td>04:00</td><td><span class="tag t-bad">误判结束</span></td><td class="n">641.3（8.573）</td><td class="n">639.0</td><td>0.9929</td><td class="n">78.4%</td><td>geomean 1.007× beat（fast 1.66×）→ 假 target_met</td></tr>
+<tr class="win"><td>28</td><td>refactor h68</td><td>06:50</td><td><span class="tag t-good">提升</span></td><td class="n">—</td><td class="n">—</td><td>—</td><td class="n">—</td><td>采用 r19h；判据改为 proxy 和 prod 各自 ≥ beat（h69）</td></tr>
+<tr><td>28 opt</td><td>fast</td><td>06:50</td><td>拒</td><td class="n">637.2（8.629）</td><td class="n">640.6</td><td>0.9967</td><td class="n">78.0%</td><td>在 r19h 上本轮 arm 全部 null</td></tr>
+<tr class="win"><td>29</td><td>fast</td><td>07:40–08:40</td><td><span class="tag t-good">接受</span></td><td class="n">656.5（8.375）</td><td class="n">639.0</td><td>prod +2.7%，proxy +2.8%</td><td class="n">80.4%</td><td>h70 u2n：k_dq kv 循环展开 2 次</td></tr>
+<tr><td>30</td><td>deep</td><td>08:40–10:30</td><td>拒</td><td class="n">656.4（8.377）</td><td class="n">657.7</td><td>geomean 1.0033</td><td class="n">80.0%</td><td>g89（dQ epilogue 经 LDS）null</td></tr>
+</tbody></table></div>
+<div class="src">来源：<code>output/0927__b0/bwd/progress.md</code>；<code>ruler/bwd/REPORT.md</code>。注：<code>state.yaml</code> 从 r20 起 flops 的 shape 标签错位（OP-EVOLVE-SUGGESTIONS #10），表中 ms 是由 FLOP/TF/s 换算的。</div>
+
+<h3>关键发现</h3>
+<ul class="tight">
+<li><b>FUSED5 已判死</b> <span class="tag t-bad">h64</span>：把 dQ 用 fp32 SCOPE_DEV 原子操作融进 k_dkdv。整个 op 21.9 ms，冠军 8.57 ms，只有 0.39×。1-wave 的 P3 为 21.7–21.8 ms，门槛是 7.72 ms；4-wave 的 x 为 +30–33%，门槛是 7.6%。正确性完全没问题（dk/dv 与冠军逐位相同），输在速度。</li>
+<li><b>r19 其实比 r20 快</b> <span class="tag t-good">h67/h68</span>：分块尺子下 r19 在 prod 上快 1.7%，proxy 快 3.1%，fast 快 1.6–1.8%（r19h 分别为 1.72%、2.6–2.7%、约 1.4–1.5%）。r20 当初是靠三个 shape 的算术平均胜出的。r19h 是 r19 加上 h33 的三处 clamp：k_dkdv 的 VGPR 从 904 降到 724；r19 在 9 个 UT shape 上有 1,580 次越界预取，r19h 为 0；输出与 r19 逐位相同。</li>
+<li><b>h33 修复</b>：(a) impl 断言改为 <code>sq % BLOCK_Q</code>；(b) k_dq_sp 的 dq extent 改为 Int64；(c) k_dkdv 预取 clamp（<code>_clampqt</code>）。这是正确性修复，本身不影响速度（r24 对冠军 0.9997）。</li>
+<li><b>u2n</b> <span class="tag t-good">h70</span>：k_dq 的 full kv 循环展开 2 次后，回边上 65 条 <code>v_mov_b64</code> 轮转拷贝全部消失。k_dq −6.1%（3.185 → 2.990 ms），整个 op −3.06%，输出逐位相同。在训练时钟（1272–1352 MHz）下，整个 op −3.2%，k_dq −7.8%。e2e 中 k_dq 从 106.4–109.0 降到 96.0–98.3 ms/步。</li>
+<li><b>k_dq 是发射 bound</b>：只减少发射槽位就能快 6%。提 occupancy 的方向（445 VGPR、2 wave/SIMD）让 k_dq 慢 41%，已关闭。profile 报告说它"对时钟不敏感"（0.92×），但 lab-kdq 第二轮在低时钟下测到 4.05 ms 对 2.98 ms（约 1.36×），两者不一致，仍待确认。</li>
+<li><b>已关闭</b>（h71/h73）：GQA 分组 WG（+7.4% / +3.4%）；把 k_delta 融进 k_dq（null）；k_dkdv 展开 2 次（+6.5–7.3%）；在展开的两半之间加 sched_barrier（+5.9–8.0%）；VF_Q 只做 fma（+2.0%）；k_dq epilogue 经 LDS（null）。</li>
+</ul>
+<div class="src">来源：<code>lab3/FUSED5-RESULT.md</code> §0；<code>lab-bwd-r19/REPORT.md</code>；<code>lab-kdq/REPORT.md</code>（两轮）；<code>bwd-hint.md</code> h64–h73；<code>e2e/RESULT-final.md</code> §0；<code>profile/REPORT.md</code> §2.1</div>
+
+<!-- ============================================================ -->
+<h2 id="s6">6. 测量方法学的修正</h2>
+<div class="tbl"><table>
+<thead><tr><th>问题</th><th>现象（证据）</th><th>修正</th></tr></thead>
+<tbody>
+<tr><td><b>逐次交错计时偏差</b></td><td>每次调用会继承前几次调用的卡状态（推测是功耗/时钟控制器的记忆，2 GB flush 也消不掉）。同一份代码因位置不同差 2–3.5%；r6/beat 交错为 1.29×，稳态为 1.035×。bwd 的 FlyDSL 对 ASM 偏差约 3.4%，FlyDSL 之间 &lt;0.4%。以前说的"beat 之后 I-cache 惩罚"就是这个效应。</td><td>分块计时（lead 4 + block 9，palindromic）。fwd 9 个进程 A/A ±0.19%，bwd ±0.05%。已装进两个 job（h40、h66）</td></tr>
+<tr><td><b>三个假"赢"</b></td><td>r6 +5.7%（实为 +4.6%）；L12 +6.4%（实为 −0.4%）；L21 +6.3%（实为 +0.3%）</td><td>以往 ±3–7% 的交错结论一律打折（h41）</td></tr>
+<tr><td><b>randn 与真实数据</b></td><td>score 标准差 1 对 21–53；投机在 randn 上 +4.6%，在真实数据上 −13–23%</td><td>真实 dump（6 层，step 43）作为第二把尺子（h45、h47），从 r18 起两把尺子都报告</td></tr>
+<tr><td><b>工作点（GEMM 突发）</b></td><td>训练中 sclk 1250–1690 MHz，整板功耗顶在约 2.13 kW；fwd fly/ASM 在 iso 下为 0.84，在 gburst 下为 1.19–1.20</td><td>"紧跟 10 个 32768×4096×14336 GEMM"的计时条件；GEMM 必须使用 IMAGE hipBLASLt 库，否则 GEMM 只有约 80 TF/s，时钟也降不下来</td></tr>
+<tr><td><b>A/A 对照</b></td><td>lab3-L21 发现同一份代码 A/A 为 0.944（实为 r4 对 r6，op/current 在 session 中途被重装）</td><td>每个排名进程带一个 A/A 副本；偏离超过 0.5% 则整个进程作废（h35）</td></tr>
+<tr><td><b>JIT 缓存</b></td><td>key 不包含模块全局变量，逐字节相同的 A/A 副本读数差了 6.6%</td><td>每个进程用新的 <code>FLYDSL_RUNTIME_CACHE_DIR</code>；实验开关写成参数（h46、h72）</td></tr>
+<tr><td><b>达标判据用几何平均</b></td><td>bwd r27 的 fast 是 1.66×，把 prod/proxy 的约 0.78× 掩盖掉，geomean 1.007，job 误判结束</td><td>proxy 和 prod 各自 ≥ beat；fast 只报告（h69，用户批准，fwd 和 bwd 都改了）</td></tr>
+<tr><td><b>refcache sha 失配</b></td><td>从 r24 起每轮 gate 都在卡上重算 fp32 prod 参考，正是 09-22 那次断电的触发条件</td><td>provenance 从 988c14ca 更新为 d441e55a（重算得到的 dB 逐位相同）</td></tr>
+<tr><td><b>接受判定用算术平均</b></td><td>A0 r10 在 prod 上 +0.83%，被平均成 +0.22%；r20 在 prod 上其实比 r19 慢</td><td><code>evolve.gain_weights</code>（prod 1.0 / proxy 0.25 / fast 0）：A0 已实现，<b>B0 未合入</b></td></tr>
+</tbody></table></div>
+<div class="src">来源：<code>ruler/REPORT.md</code>；<code>ruler/bwd/REPORT.md</code>；<code>profile/REPORT.md</code> §2；<code>lab-kdq/REPORT.md</code> 第二轮；<code>lab3-L21/VERIFY.md</code>；<code>OP-EVOLVE-SUGGESTIONS.md</code> #2、#3、#11–#15；<code>bwd-hint.md</code> h69</div>
+
+<!-- ============================================================ -->
+<h2 id="s7">7. 端到端（Llama-3.1-8B BF16，32 层，MBS=GBS=4，seq 8192，单卡 GPU0）</h2>
+
+<h3>7.1 GEMM 修复（nkfix）</h3>
+<ul class="tight">
+<li>修复前，反向 dgrad/wgrad（<code>Ailk_Bjlk</code>、<code>Ailk_Bljk</code>）全部落在 <code>MT32x16x32</code> 回退 tile 上，GEMM 15.6–16.5 s/步，占 96%。</li>
+<li>nkfix 基于 TorchDispatchMode 只改写 <code>aten::mm</code>，把这些调用转成 TN 布局，落到 <code>MT256x256x128</code>；op 级快 11–32×，SQNR 不变（55.59–55.63 dB）。GEMM 降到 0.83–0.86 s/步，另加 0.1 s 的转置和检查开销。</li>
+<li>A0 的 <code>0915__opt/bin/nkfix.py</code> 在 HEAD 上是坏的（有未定义的名字），本次以 <code>1255557f</code> 为基础重建。</li>
+<li>副作用：修复后功耗顶到上限，bwd 阶段的 sclk 从约 1,820 MHz 降到约 1,390 MHz，时钟敏感的 attention kernel 变慢 10–18%（<code>k_dkdv</code> +18%，ASM 主 kernel +17%）。</li>
+</ul>
+
+<h3>7.2 三组 tps（同进程 ABBA / BAAB 配对）</h3>
+<div class="tbl"><table>
+<thead><tr><th>组</th><th>FlyDSL arm</th><th class="n">FlyDSL tps</th><th class="n">ASM tps</th><th class="n">fly/ASM 单步时间比</th><th class="n">FA path ms/步 fly / ASM</th></tr></thead>
+<tbody>
+<tr class="dead"><td>修复前（参考）</td><td>r6 + r20</td><td class="n">1,914（低档）</td><td class="n">1,922（低档）</td><td class="n">1.0045 / 1.0042</td><td class="n">321–328 / 240</td></tr>
+<tr><td>① 修复后第一版</td><td>r6 + r20</td><td class="n">19,762 / 19,809</td><td class="n">20,718 / 20,792</td><td class="n">1.0475 / 1.0500</td><td class="n">352–364 / 270–273</td></tr>
+<tr><td>② 换 fwd</td><td>r13ns + r20</td><td class="n">19,929 / 19,951</td><td class="n">20,761 / 20,760</td><td class="n">1.0403 / 1.0408</td><td class="n">348.7–355.3 / 272.6–275.5</td></tr>
+<tr class="win"><td>③ 今天的冠军</td><td>r16（= r13ns）+ r29</td><td class="n">20,091 / 20,070</td><td class="n">20,747 / 20,697</td><td class="n">1.0323 / 1.0328</td><td class="n">333.7–339.3 / 272.1–275.7</td></tr>
+</tbody></table></div>
+<div class="src">来源：<code>e2e/RESULT-final.md</code> §0；<code>e2e/RESULT.md</code> §0（修复前）；<code>gemm/REPORT.md</code> §0。turbo baseline（Triton）修复后为 14,563 tps（修复前 1,856），FA path 990 ms/步，attention 占单步 43.9%。</div>
+
+<div class="bars" role="img" aria-label="FlyDSL 相对 ASM 的每步慢速百分比">
+<div class="bar"><span class="lbl">修复前 r6+r20</span><span class="track"><span class="fill" style="width:9%;display:block"></span></span><span class="val">0.4%</span></div>
+<div class="bar"><span class="lbl">① r6+r20</span><span class="track"><span class="fill" style="width:100%;display:block"></span></span><span class="val">4.8–5.0%</span></div>
+<div class="bar"><span class="lbl">② r13ns+r20</span><span class="track"><span class="fill" style="width:81%;display:block"></span></span><span class="val">4.0–4.1%</span></div>
+<div class="bar"><span class="lbl">③ r16+r29</span><span class="track"><span class="fill" style="width:65%;display:block"></span></span><span class="val">3.2–3.3%</span></div>
+</div>
+<div class="src">FlyDSL 比 ASM 每步慢的百分比（= 单步时间比 − 1）。修复前的差距小，是因为 GEMM 占了单步的 96%，把 attention 的差别稀释了。</div>
+
+<h3>7.3 剩余差距拆分（③，ms/步）</h3>
+<div class="tbl"><table>
+<thead><tr><th>部分</th><th class="n">FlyDSL</th><th class="n">ASM</th><th class="n">差</th><th>组成与线索</th></tr></thead>
+<tbody>
+<tr><td>bwd</td><td class="n">≈287</td><td class="n">≈235</td><td class="n">≈52</td><td><code>k_dkdv</code> 185.7–188.0 + <code>k_dqg</code> 96.0–98.3 + <code>k_delta</code> 3.8；ASM 为单个融合 kernel，另含 GQA 求和 3.9、dq_convert 2.3、odo 1.6</td></tr>
+<tr><td>fwd</td><td class="n">48.7</td><td class="n">39.1</td><td class="n">≈10</td><td>时钟敏感（1350/2350 = 1.25×，ASM 0.97×）</td></tr>
+<tr><td>单步</td><td class="n">1,631 / 1,633</td><td class="n">1,579 / 1,583</td><td class="n">≈51–52</td><td>GEMM 主体 845–862 ms，另有 nkfix 辅助 98–100 ms，两边相同</td></tr>
+</tbody></table></div>
+<div class="src">来源：<code>e2e/RESULT-final.md</code> §0；<code>profile/REPORT.md</code> §2.1、§5</div>
+
+<p>本轮的收益全部来自 bwd：约 −15 ms/步，其中 k_dq −10%（u2n），k_dkdv −2%（r19h）。另外，profile 在 r6+r20 时测得每步差距约 87 ms，其中 bwd +71.0 ms、fwd +19.9 ms、ASM 独有的 GQA 求和 −3.9 ms；attention kernel 前后的间隔都是 0.8–1.0 µs，没有 launch 开销可省。</p>
+
+<h3>7.4 NaN 状态</h3>
+<ul class="tight">
+<li>B0 上的 nkfix 运行中没有出现任何非有限值：GEMM 报告记录 8 次运行共 486 步；终版的两次运行 <code>nonfinite_events: []</code>，峰值显存 88.99%。</li>
+<li>根因<b>没有找到</b>。A0 上带 nkfix 的 40 次运行里 8 次出现 nan，不带 nkfix 的 36 次里 0 次；所有发作都在 step ≤10，并且与 09-16 的 MES TLB 故障混在一起，无法分开。</li>
+<li>B0 的统计上界（32 层，7 次运行，466 步）：按步算，95% 上界为 2.2%/步；按运行算为 35%/次，还排除不了 A0 的 21%/次。要把按运行的上界压到 21% 以下，约需 13 次干净运行。nkfix 保持 opt-in，建议打开 <code>NKFIX_CHECK=1</code>（约 33 ms/步）。</li>
+</ul>
+<div class="src">来源：<code>gemm/REPORT.md</code> §0、§4；<code>e2e/RESULT-final.md</code> §0；<code>e2e/RESULT.md</code> 顶部更新</div>
+
+<!-- ============================================================ -->
+<h2 id="s8">8. 给 op-evolve 的改进建议（摘要）</h2>
+<div class="tbl"><table>
+<thead><tr><th>#</th><th>级别</th><th>问题</th><th>建议</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><span class="tag t-bad">P0</span></td><td>"历史最佳"混进了没被接受的 arm（r9 BG 永远合不进去）</td><td>champions 只记录已提升的轮次，或与同 session 重测的冠军比</td></tr>
+<tr><td>2</td><td><span class="tag t-bad">P0</span></td><td>模板默认用交错计时（3 个假"赢"）</td><td>默认分块计时；每个进程带 A/A；定期做"尺子体检"</td></tr>
+<tr><td>3</td><td><span class="tag t-bad">P0</span></td><td>3 个 shape 算术平均，稀释了 prod</td><td><code>evolve.gain_weights</code>（A0 已实现，B0 待批准）</td></tr>
+<tr><td>4</td><td>P1</td><td>多卡节点上 job 无法固定到某张卡</td><td>runner 支持 env/devices；sclk 读被测卡的 sysfs</td></tr>
+<tr><td>5</td><td>P1</td><td>reviewer 账号缺失，deep round 白费</td><td>resume 前做账号预检，不可用时自动回退</td></tr>
+<tr><td>6</td><td>P1</td><td>preflight 和 power_wall 按整机判断</td><td>只看本 job 的卡</td></tr>
+<tr><td>7</td><td>P1</td><td>固定的 regression band（proxy 离散 ±6%）</td><td>按每个 shape 的 A/A 噪声自动设置（例如 3σ）</td></tr>
+<tr><td>8</td><td>P1</td><td>平台期不回头看（r19 被埋没）</td><td>连续 K 轮不提升时，自动在新尺子下重测历史冠军</td></tr>
+<tr><td>9</td><td>P2</td><td>稳态计时 ≠ 训练工作点</td><td>增加 in-context（GEMM 前置）模式并计入 score</td></tr>
+<tr><td>10</td><td>P2</td><td>杂项：hints 只解析 <code>h&lt;N&gt;</code>；state.yaml flops 标签错位；refactor 清空全部 champions；act 不能断点续跑</td><td>逐项修复</td></tr>
+<tr><td>11</td><td><span class="tag t-bad">P0</span></td><td>randn 尺子选中了在真实数据上变慢的改动</td><td>真实 q/k/v dump 作为计分 shape 或第二把尺子</td></tr>
+<tr><td>12</td><td>P1</td><td>尺子时钟与训练不一致</td><td>"紧跟 GEMM 突发"计时模式，按权重计分</td></tr>
+<tr><td>13</td><td>P1</td><td>几何平均达标判据被 launch-bound 的小 shape 掩盖</td><td>每个计分 shape 各自 ≥ bar（B0 已改）</td></tr>
+<tr><td>14</td><td>P1</td><td>refcache sha 失配被静默忽略，在卡上重算参考</td><td>失配时 gate 直接失败；提供 provenance 更新工具</td></tr>
+<tr><td>15</td><td><span class="tag t-bad">P0</span></td><td>JIT 缓存 key 不包含模块全局变量</td><td>每个进程用独立缓存；提升后清缓存；向 FlyDSL 上游报告</td></tr>
+<tr><td>16</td><td>—</td><td>fwd 连续 4 轮没有提升：尺子与目标脱节</td><td>把"真实数据 + GEMM 突发"写进 validation 和 acceptance</td></tr>
+</tbody></table></div>
+<div class="src">来源：<code>output/0927__b0/OP-EVOLVE-SUGGESTIONS.md</code>（#11–#15 标注的级别见原文；#16 为 09-28 的分析）</div>
+
+<!-- ============================================================ -->
+<h2 id="s9">9. 风险与未决事项</h2>
+<div class="tbl"><table>
+<thead><tr><th>事项</th><th>状态</th><th>影响 / 处置</th></tr></thead>
+<tbody>
+<tr><td><b>GPU1 wedged</b></td><td><span class="tag t-bad">未恢复</span></td><td>dmesg 持续刷 <code>MES failed to respond</code> 或 <code>MES ring buffer full</code>，没有容器，禁止触碰。wedge 只能靠人工 AC 断电恢复，而 4 张卡在同一个 hive 里，断电会影响全部 4 张卡。在那之前只有 3 张卡可用，所有 dmesg 检查都要排除 <code>0002:04:00.0</code>。</td></tr>
+<tr><td><b>nkfix 的 NaN</b></td><td><span class="tag t-warn">只有上界</span></td><td>根因未知；按运行算的 95% 上界 35%/次，排除不了 A0 的 21%/次。长期使用时打开 <code>NKFIX_CHECK</code>，并继续积累干净的短运行（约需 13 次）。</td></tr>
+<tr><td><b>gain_weights 未合入 B0</b></td><td><span class="tag t-warn">待批准</span></td><td>改 op-evolve 源码需要用户批准。在那之前，接受判定仍按 3 个 shape 平均，prod 上的真实提升可能被拒，只能由 operator 用 refactor 手工提升。</td></tr>
+<tr><td><b>他人容器 / 负载</b></td><td><span class="tag t-warn">反复出现</span></td><td>day1 15:43 四个容器被删（出现 <code>gfx1250dbg_maxtext_*</code>）；day2 09:00–09:10 GPU0 上有外来的 hipblaslt-bench；GPU1 出事前有一个非本方的 python3 GPF。任何邻卡 GEMM 负载都会让被测卡慢 3–11 倍。</td></tr>
+<tr><td>fwd 尺子与目标脱节</td><td><span class="tag t-info">已下发 h47</span></td><td>job 的 score 仍然只看 randn；真实数据尺子目前只作为报告项，没有计入 acceptance。</td></tr>
+<tr><td>k_dq 时钟敏感度结论矛盾</td><td><span class="tag t-info">待核</span></td><td>profile 报告 0.92×（不敏感），lab-kdq 第二轮测到约 1.36×。</td></tr>
+<tr><td>显存余量</td><td><span class="tag t-info">观察</span></td><td>e2e 峰值 88.99%，<code>E2E_MEM_STOP=89.5</code>；修复前 P1 距 memguard 只差 0.06 个百分点。</td></tr>
+<tr><td>fwd 树的 <code>_env.py</code> 改 <code>HIPBLASLT_TENSILE_LIBPATH</code></td><td><span class="tag t-info">观察</span></td><td>加载时 hipBLASLt 已经初始化，两个 arm 的 GEMM 时间相同，本次没有影响。</td></tr>
+</tbody></table></div>
+<div class="src">来源：<code>LAB-RULES.md</code>；<code>STOPPED.md</code>；<code>e2e/RECON.md</code> §6；<code>lab-kdq/REPORT.md</code>；<code>gemm/REPORT.md</code> §4；<code>OP-EVOLVE-SUGGESTIONS.md</code> #3；<code>profile/REPORT.md</code> §2.1；<code>e2e/RESULT.md</code> §5；<code>e2e/RESULT-final.md</code> §1</div>
+
+<!-- ============================================================ -->
+<h2 id="s10">10. 下一步建议</h2>
+<ol>
+<li><b>bwd（约 52 ms/步，大头）</b>：
+  <ul class="tight">
+  <li>k_dkdv 在循环体内减少 VALU 和 mov 已被多次证明拿不到时间，需要结构性方向（7 对 5 GEMM 的结构差）。若能把时钟敏感度降到 ASM 的水平（1.24× → 1.16×），预计可省约 12 ms。</li>
+  <li>把 <code>k_delta</code> 融进 <code>k_dkdv</code> 开头，约 3.7 ms。</li>
+  <li>先核实 k_dq 在低时钟下的行为（两份报告的结论矛盾）。</li>
+  </ul></li>
+<li><b>fwd（约 10 ms/步）</b>：按 h47 减少 prod m32x8 热循环的发射量（r13ns 为 4130 条指令），包括 v_nop/s_delay、SALU 簿记、冗余 wait 和每个 KV tile 的 barrier 数，以降低时钟敏感度。任何依赖数据分布的机制都必须在真实 dump 上判定。</li>
+<li><b>尺子</b>：把"真实数据 + GEMM 突发"作为第二把尺子写进 validation 和 acceptance，并给它权重；每个进程用新的 JIT 缓存目录。</li>
+<li><b>框架</b>：请用户批准合入 <code>evolve.gain_weights</code>，以及建议 #1（champions 只记录已提升的轮次）和 #15（清 JIT 缓存）。</li>
+<li><b>e2e 系统层</b>：关掉 <code>NKFIX_CHECK</code> 可省 33 ms/步，而且降低 GEMM 功耗对 fly 更有利；q/k/v 共用一次转置，权重转置在一步内缓存。根本修复是让 hipBLASLt 补上 NN 布局的 bf16 调优库。</li>
+<li><b>NaN</b>：继续跑短运行，打开 <code>NKFIX_CHECK=2</code>，以收紧上界。</li>
+<li><b>硬件与交接</b>：安排 GPU1 断电恢复；冠军快照（fwd r16 = r13ns，bwd r29 = r19h + u2n）已为 A0 交接提交（<code>5188c9da</code>）。</li>
+</ol>
+<div class="src">来源：<code>profile/REPORT.md</code> §5；<code>fwd-hint.md</code> h47；<code>gemm/REPORT.md</code> §6；<code>OP-EVOLVE-SUGGESTIONS.md</code>；<code>bwd-hint.md</code> h64；git log</div>
+
+<footer>
+所有路径若未写绝对路径，均相对于 <code>/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/</code>。本报告只汇总已有文件中的数字，没有做新的 GPU 测量。带 * 的 TF/s 由 FLOP / ms 换算得出。
+</footer>
+
+</div>
+</body>
+</html>
