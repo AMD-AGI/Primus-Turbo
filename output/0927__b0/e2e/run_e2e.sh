@@ -58,7 +58,7 @@ opcheck)
   MARK=$(dmesg_mark)
   echo "[$(date +%T)] $TAG waiting for $LOCK"
   flock $LOCK timeout 1500 docker exec \
-    -e ARCH=gfx1250 -e FLYDSL_GPU_ARCH=gfx1250 -e FLYDSL_RUNTIME_CACHE_DIR=/tmp/flycache_e2e \
+    -e ARCH=gfx1250 -e FLYDSL_GPU_ARCH=gfx1250 -e FLYDSL_RUNTIME_CACHE_DIR=${E2E_FLYCACHE:-/tmp/flycache_e2e} \
     -e TRITON_CACHE_DIR=/tmp/triton_cache_e2e ${OPCHECK_ENV:-} $CT bash -c "ulimit -c 0; $BLAS_EXPORT; \
       export PYTHONPATH=$PP; cd $E2E && exec timeout --foreground -k 20 1400 \
       /opt/venv/bin/python3 attn_backends/opcheck.py --arm $ARM --shape $SHAPE --json $OUT/$TAG.json $*" \
@@ -180,7 +180,7 @@ train)
     -e GPUS_PER_NODE=1 -e NNODES=1 -e NODE_RANK=0 -e PRIMUS_GPU_MODEL=MI455X \
     -e MASTER_PORT=$((20000 + RANDOM % 20000)) -e PRIMUS_EXP_NAME=$TAG -e E2E_RUN_MARKER=$TAG \
     -e TRITON_CACHE_DIR=/tmp/triton_cache_e2e -e ARCH=gfx1250 -e FLYDSL_GPU_ARCH=gfx1250 \
-    -e FLYDSL_RUNTIME_CACHE_DIR=/tmp/flycache_e2e -e E2E_ATTN="$ATTN" $NKFIX_ENV ${E2E_ENV:-} \
+    -e FLYDSL_RUNTIME_CACHE_DIR=${E2E_FLYCACHE:-/tmp/flycache_e2e} -e E2E_ATTN="$ATTN" $NKFIX_ENV ${E2E_ENV:-} \
     $CT bash -c "ulimit -c 0; $BLAS_EXPORT; export PYTHONPATH=$PP; \
       echo E2E_ENV PREFER=\$TORCH_BLAS_PREFER_HIPBLASLT LIB=\$HIPBLASLT_TENSILE_LIBPATH E2E_ATTN=\$E2E_ATTN; \
       cd $PRIMUS && exec timeout --foreground -k 20 ${E2E_INNER:-2600} bash runner/primus-cli direct \

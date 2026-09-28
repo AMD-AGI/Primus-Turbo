@@ -1,0 +1,258 @@
+
+=== traces/fin_p2a_asmfly/iteration_10/rank0_trace.json
+  steps ['ProfilerStep#9'] cpu step ms [1633.5]
+  GPU span 1631.2 ms  busy 1613.6  idle 17.6  kernel-sum 1613.6
+  gemm              845.40 ms
+  elementwise       294.69 ms
+  attn_bwd          287.42 ms
+  gemm_aux           98.23 ms
+  attn_fwd           47.97 ms
+  optimizer          26.82 ms
+  memcpy             11.88 ms
+  memset              1.18 ms
+  FA path total     335.39 ms   arm ranges: e2e::attn_fwd[fly]=48.0, e2e::attn_bwd[fly]=287.4
+  -- attn_fwd
+          47.97 ms n=32    kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0
+  -- attn_bwd
+         187.00 ms n=32    k_dkdv_0
+          96.65 ms n=32    k_dqg_0
+           3.77 ms n=32    k_delta_bshd_0
+  -- gemm
+         844.52 ms n=997   Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x128_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_A
+           0.88 ms n=64    Cijk_SB_BiasS_HAS_ScaleAlphaVec_PostGSU4_VW4
+  -- gemm_aux
+          65.71 ms n=1093  _transpose_kernel
+          24.22 ms n=450   void at::native::reduce_kernel<512, 1, at::native::ReduceOp<c10::BFloat16, at::native::MinMaxOps<c10::BFloat16
+           2.25 ms n=900   void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::m
+           2.02 ms n=132   void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_nocast<at::native::direc
+           2.02 ms n=900   void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte
+           2.01 ms n=900   void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, std::array<char*, 2ul> >(int,
+  -- elementwise
+          54.96 ms n=388   void at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_impl_nocast<at::native::Binar
+          30.71 ms n=262   void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::b
+          30.05 ms n=96    void at::native::vectorized_elementwise_kernel<8, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10:
+          26.86 ms n=492   void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase
+          22.75 ms n=492   void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte
+          19.16 ms n=224   void at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*
+          17.32 ms n=32    void at::native::vectorized_elementwise_kernel<8, at::native::(anonymous namespace)::silu_backward_kernel(at::
+          16.77 ms n=768   void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous namespace)::TensorLis
+  -- optimizer
+          26.81 ms n=384   void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous namespace)::FusedOpti
+           0.01 ms n=3     void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous namespace)::TensorLis
+
+=== traces/fin_p2a_asmfly/iteration_20/rank0_trace.json
+  steps ['ProfilerStep#19'] cpu step ms [1578.9]
+  GPU span 1577.3 ms  busy 1561.9  idle 15.4  kernel-sum 1561.9
+  gemm              850.75 ms
+  elementwise       298.72 ms
+  attn_bwd          231.19 ms
+  gemm_aux           98.70 ms
+  attn_fwd           38.82 ms
+  optimizer          26.71 ms
+  memcpy             11.95 ms
+  attn_gqa_sum        3.91 ms
+  memset              1.19 ms
+  FA path total     273.92 ms   arm ranges: e2e::attn_fwd[asm]=38.8, e2e::attn_bwd[asm]=231.2
+  -- attn_fwd
+          38.82 ms n=32    aiter::fmha_bf16_pertokenBf16_hd128_128x256_mask
+  -- attn_bwd
+         225.20 ms n=32    aiter::fmha_bwd_hd128_bf16_causal_br_a32_pssk
+           2.31 ms n=32    aiter::fmha_bwd_hd128_dq_convert_bf16
+           2.10 ms n=32    void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<float>, std::array<char*, 1ul> >(int
+           1.58 ms n=32    aiter::fmha_bwd_hd128_odo_bf16
+  -- attn_gqa_sum
+           3.91 ms n=64    void at::native::reduce_kernel<128, 4, at::native::ReduceOp<c10::BFloat16, at::native::func_wrapper_t<c10::BFl
+  -- gemm
+         849.84 ms n=997   Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x128_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_A
+           0.90 ms n=64    Cijk_SB_BiasS_HAS_ScaleAlphaVec_PostGSU4_VW4
+  -- gemm_aux
+          65.82 ms n=1093  _transpose_kernel
+          24.46 ms n=450   void at::native::reduce_kernel<512, 1, at::native::ReduceOp<c10::BFloat16, at::native::MinMaxOps<c10::BFloat16
+           2.28 ms n=900   void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::m
+           2.05 ms n=900   void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte
+           2.05 ms n=900   void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, std::array<char*, 2ul> >(int,
+           2.03 ms n=132   void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_nocast<at::native::direc
+  -- elementwise
+          56.58 ms n=388   void at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_impl_nocast<at::native::Binar
+          30.87 ms n=262   void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::b
+          29.93 ms n=96    void at::native::vectorized_elementwise_kernel<8, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10:
+          27.66 ms n=492   void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase
+          23.03 ms n=492   void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte
+          19.50 ms n=224   void at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*
+          17.26 ms n=32    void at::native::vectorized_elementwise_kernel<8, at::native::(anonymous namespace)::silu_backward_kernel(at::
+          16.77 ms n=768   void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous namespace)::TensorLis
+  -- optimizer
+          26.70 ms n=384   void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous namespace)::FusedOpti
+           0.01 ms n=3     void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous namespace)::TensorLis
+
+=== traces/fin_p2a_asmfly/iteration_30/rank0_trace.json
+  steps ['ProfilerStep#29'] cpu step ms [1633.6]
+  GPU span 1632.2 ms  busy 1616.5  idle 15.7  kernel-sum 1616.5
+  gemm              848.50 ms
+  elementwise       295.22 ms
+  attn_bwd          285.95 ms
+  gemm_aux           98.30 ms
+  attn_fwd           48.70 ms
+  optimizer          26.83 ms
+  memcpy             11.84 ms
+  memset              1.18 ms
+  FA path total     334.65 ms   arm ranges: e2e::attn_fwd[fly]=48.7, e2e::attn_bwd[fly]=285.9
+  -- attn_fwd
+          48.70 ms n=32    kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0
+  -- attn_bwd
+         185.96 ms n=32    k_dkdv_0
+          96.23 ms n=32    k_dqg_0
+           3.76 ms n=32    k_delta_bshd_0
+  -- gemm
+         847.62 ms n=997   Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x128_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_A
+           0.87 ms n=64    Cijk_SB_BiasS_HAS_ScaleAlphaVec_PostGSU4_VW4
+  -- gemm_aux
+          65.79 ms n=1093  _transpose_kernel
+          24.20 ms n=450   void at::native::reduce_kernel<512, 1, at::native::ReduceOp<c10::BFloat16, at::native::MinMaxOps<c10::BFloat16
+           2.25 ms n=900   void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::m
+           2.02 ms n=132   void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_nocast<at::native::direc
+           2.02 ms n=900   void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte
+           2.02 ms n=900   void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, std::array<char*, 2ul> >(int,
+  -- elementwise
+          55.19 ms n=388   void at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_impl_nocast<at::native::Binar
+          30.59 ms n=262   void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::b
+          30.18 ms n=96    void at::native::vectorized_elementwise_kernel<8, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10:
+          27.06 ms n=492   void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase
+          22.83 ms n=492   void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte
+          19.18 ms n=224   void at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*
+          17.37 ms n=32    void at::native::vectorized_elementwise_kernel<8, at::native::(anonymous namespace)::silu_backward_kernel(at::
+          16.77 ms n=768   void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous namespace)::TensorLis
+  -- optimizer
+          26.82 ms n=384   void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous namespace)::FusedOpti
+           0.01 ms n=3     void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous namespace)::TensorLis
+
+=== traces/fin_p2a_asmfly/iteration_40/rank0_trace.json
+  steps ['ProfilerStep#39'] cpu step ms [1588.1]
+  GPU span 1586.7 ms  busy 1570.6  idle 16.0  kernel-sum 1570.6
+  gemm              858.52 ms
+  elementwise       300.55 ms
+  attn_bwd          229.23 ms
+  gemm_aux           99.50 ms
+  attn_fwd           39.03 ms
+  optimizer          26.63 ms
+  memcpy             12.09 ms
+  attn_gqa_sum        3.89 ms
+  memset              1.20 ms
+  FA path total     272.15 ms   arm ranges: e2e::attn_fwd[asm]=39.0, e2e::attn_bwd[asm]=229.2
+  -- attn_fwd
+          39.03 ms n=32    aiter::fmha_bf16_pertokenBf16_hd128_128x256_mask
+  -- attn_bwd
+         223.24 ms n=32    aiter::fmha_bwd_hd128_bf16_causal_br_a32_pssk
+           2.31 ms n=32    aiter::fmha_bwd_hd128_dq_convert_bf16
+           2.10 ms n=32    void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<float>, std::array<char*, 1ul> >(int
+           1.57 ms n=32    aiter::fmha_bwd_hd128_odo_bf16
+  -- attn_gqa_sum
+           3.89 ms n=64    void at::native::reduce_kernel<128, 4, at::native::ReduceOp<c10::BFloat16, at::native::func_wrapper_t<c10::BFl
+  -- gemm
+         857.60 ms n=997   Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x128_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_A
+           0.93 ms n=64    Cijk_SB_BiasS_HAS_ScaleAlphaVec_PostGSU4_VW4
+  -- gemm_aux
+          66.41 ms n=1093  _transpose_kernel
+          24.62 ms n=450   void at::native::reduce_kernel<512, 1, at::native::ReduceOp<c10::BFloat16, at::native::MinMaxOps<c10::BFloat16
+           2.29 ms n=900   void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::m
+           2.07 ms n=132   void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_nocast<at::native::direc
+           2.06 ms n=900   void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte
+           2.05 ms n=900   void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, std::array<char*, 2ul> >(int,
+  -- elementwise
+          56.90 ms n=388   void at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_impl_nocast<at::native::Binar
+          31.05 ms n=262   void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::b
+          30.25 ms n=96    void at::native::vectorized_elementwise_kernel<8, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10:
+          27.85 ms n=492   void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase
+          23.09 ms n=492   void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte
+          19.64 ms n=224   void at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*
+          17.47 ms n=32    void at::native::vectorized_elementwise_kernel<8, at::native::(anonymous namespace)::silu_backward_kernel(at::
+          16.77 ms n=768   void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous namespace)::TensorLis
+  -- optimizer
+          26.62 ms n=384   void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous namespace)::FusedOpti
+           0.01 ms n=3     void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous namespace)::TensorLis
+
+=== traces/fin_p2a_asmfly/iteration_50/rank0_trace.json
+  steps ['ProfilerStep#49'] cpu step ms [1643.5]
+  GPU span 1641.8 ms  busy 1626.8  idle 15.0  kernel-sum 1626.8
+  gemm              853.85 ms
+  elementwise       296.79 ms
+  attn_bwd          288.18 ms
+  gemm_aux           99.34 ms
+  attn_fwd           49.06 ms
+  optimizer          26.47 ms
+  memcpy             11.94 ms
+  memset              1.19 ms
+  FA path total     337.24 ms   arm ranges: e2e::attn_fwd[fly]=49.1, e2e::attn_bwd[fly]=288.2
+  -- attn_fwd
+          49.06 ms n=32    kn_fmha_fwd_prefill_a16w16_m32x8_bshd_0
+  -- attn_bwd
+         187.30 ms n=32    k_dkdv_0
+          97.12 ms n=32    k_dqg_0
+           3.77 ms n=32    k_delta_bshd_0
+  -- gemm
+         852.97 ms n=997   Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x128_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_A
+           0.88 ms n=64    Cijk_SB_BiasS_HAS_ScaleAlphaVec_PostGSU4_VW4
+  -- gemm_aux
+          66.47 ms n=1093  _transpose_kernel
+          24.47 ms n=450   void at::native::reduce_kernel<512, 1, at::native::ReduceOp<c10::BFloat16, at::native::MinMaxOps<c10::BFloat16
+           2.27 ms n=900   void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::m
+           2.06 ms n=132   void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_nocast<at::native::direc
+           2.04 ms n=900   void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, std::array<char*, 2ul> >(int,
+           2.03 ms n=900   void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte
+  -- elementwise
+          55.42 ms n=388   void at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_impl_nocast<at::native::Binar
+          30.86 ms n=262   void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::b
+          30.52 ms n=96    void at::native::vectorized_elementwise_kernel<8, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10:
+          27.08 ms n=492   void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase
+          22.96 ms n=492   void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte
+          19.27 ms n=224   void at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*
+          17.39 ms n=32    void at::native::vectorized_elementwise_kernel<8, at::native::(anonymous namespace)::silu_backward_kernel(at::
+          16.81 ms n=768   void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous namespace)::TensorLis
+  -- optimizer
+          26.47 ms n=384   void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous namespace)::FusedOpti
+           0.01 ms n=3     void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous namespace)::TensorLis
+
+=== traces/fin_p2a_asmfly/iteration_60/rank0_trace.json
+  steps ['ProfilerStep#59'] cpu step ms [1595.0]
+  GPU span 1593.0 ms  busy 1576.1  idle 16.9  kernel-sum 1576.1
+  gemm              859.93 ms
+  elementwise       301.03 ms
+  attn_bwd          232.07 ms
+  gemm_aux           99.90 ms
+  attn_fwd           39.32 ms
+  optimizer          26.70 ms
+  memcpy             12.03 ms
+  attn_gqa_sum        3.92 ms
+  memset              1.20 ms
+  FA path total     275.30 ms   arm ranges: e2e::attn_fwd[asm]=39.3, e2e::attn_bwd[asm]=232.1
+  -- attn_fwd
+          39.32 ms n=32    aiter::fmha_bf16_pertokenBf16_hd128_128x256_mask
+  -- attn_bwd
+         226.03 ms n=32    aiter::fmha_bwd_hd128_bf16_causal_br_a32_pssk
+           2.33 ms n=32    aiter::fmha_bwd_hd128_dq_convert_bf16
+           2.13 ms n=32    void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<float>, std::array<char*, 1ul> >(int
+           1.59 ms n=32    aiter::fmha_bwd_hd128_odo_bf16
+  -- attn_gqa_sum
+           3.92 ms n=64    void at::native::reduce_kernel<128, 4, at::native::ReduceOp<c10::BFloat16, at::native::func_wrapper_t<c10::BFl
+  -- gemm
+         859.01 ms n=997   Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x128_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSUA0_AGNTAB0_AFEM1_A
+           0.92 ms n=64    Cijk_SB_BiasS_HAS_ScaleAlphaVec_PostGSU4_VW4
+  -- gemm_aux
+          66.66 ms n=1093  _transpose_kernel
+          24.72 ms n=450   void at::native::reduce_kernel<512, 1, at::native::ReduceOp<c10::BFloat16, at::native::MinMaxOps<c10::BFloat16
+           2.31 ms n=900   void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::m
+           2.07 ms n=900   void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, std::array<char*, 2ul> >(int,
+           2.07 ms n=132   void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_nocast<at::native::direc
+           2.06 ms n=900   void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte
+  -- elementwise
+          57.07 ms n=388   void at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_impl_nocast<at::native::Binar
+          31.07 ms n=262   void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::b
+          30.36 ms n=96    void at::native::vectorized_elementwise_kernel<8, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10:
+          27.84 ms n=492   void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase
+          23.18 ms n=492   void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte
+          19.75 ms n=224   void at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*
+          17.43 ms n=32    void at::native::vectorized_elementwise_kernel<8, at::native::(anonymous namespace)::silu_backward_kernel(at::
+          16.77 ms n=768   void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous namespace)::TensorLis
+  -- optimizer
+          26.69 ms n=384   void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous namespace)::FusedOpti
+           0.01 ms n=3     void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous namespace)::TensorLis

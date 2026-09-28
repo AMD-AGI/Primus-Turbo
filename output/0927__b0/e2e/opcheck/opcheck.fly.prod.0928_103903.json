@@ -1,0 +1,80 @@
+{
+ "arm": "fly",
+ "shape": "prod",
+ "dims": [
+  4,
+  8192,
+  8192,
+  32,
+  8,
+  128
+ ],
+ "iters": 51,
+ "env": {
+  "TORCH_BLAS_PREFER_HIPBLASLT": "1",
+  "HIPBLASLT_TENSILE_LIBPATH": "/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/gfx1250",
+  "PYTHONPATH": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/attn_backends/shim:/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/attn_backends:/home/lihuzhan/.local/flydsl0341:/home/lihuzhan/code/aiter-src"
+ },
+ "ref_provenance": {
+  "seed": "0",
+  "eager_sha": "2b35dff2e7a109fa",
+  "common_sha": "d441e55aba5c0b89",
+  "torch": "2.11.0+rocm7.14.0a20260625",
+  "device": "gfx1250",
+  "ref_device": "cpu",
+  "shape": "prod",
+  "dims": "(4, 8192, 8192, 32, 8, 128)",
+  "common_sha_note": "2026-09-28 B0 operator (user-approved): 988c14caed5d9a80 -> d441e55aba5c0b89; ut/common.py changed after the build but make_inputs/references did not (recomputed dB bitwise equal in rounds 24-26)"
+ },
+ "versions": "flydsl 0.3.4.1 @ /home/lihuzhan/.local/flydsl0341/flydsl/__init__.py",
+ "sqnr_chain_db": {
+  "o": 50.83,
+  "dq": 51.9,
+  "dk": 51.99,
+  "dv": 52.39
+ },
+ "adapter_copies": {
+  "copies": 0,
+  "copy_bytes": 0
+ },
+ "sqnr_kfwd_db": {
+  "o": 50.83,
+  "lse": 89.19,
+  "lse_shape": [
+   4,
+   32,
+   8192
+  ]
+ },
+ "sqnr_kbwd_refolse_db": {
+  "dq": 52.56,
+  "dk": 52.6,
+  "dv": 52.71
+ },
+ "timing_ms": {
+  "m_fwd": {
+   "med": 1.2387,
+   "p10": 1.1905,
+   "p90": 1.2661
+  },
+  "m_bwd": {
+   "med": 8.5206,
+   "p10": 8.4527,
+   "p90": 8.5761
+  },
+  "k_fwd": {
+   "med": 1.2091,
+   "p10": 1.1926,
+   "p90": 1.2245
+  },
+  "k_bwd": {
+   "med": 8.5601,
+   "p10": 8.5071,
+   "p90": 8.612
+  },
+  "overhead_fwd_ms": 0.0296,
+  "overhead_bwd_ms": -0.0395
+ },
+ "max_mem_alloc_gib": 3.88,
+ "wall_s": 11.5
+}

@@ -1,0 +1,13 @@
+[10:39:30] start fin_p2a_asmfly
+[10:41:37] end fin_p2a_asmfly rc=0
+stats: {'dgrad': 13950, 'wgrad': 13950, 'chunked': 6076, 'miss': 13950, 'checked': 27900, 'syncs': 436, 'scratch_bytes': 603979776}
+nonfinite_events: []
+max_abs_by_tag: {'wgrad.out': '2.875', 'dgrad.out': '0.001686'}
+rc=0 tag=fin_p2a_asmfly log=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/logs/e2e.fin_p2a_asmfly.log nan_steps=0
+[10:41:37] start fin_p2b_flyasm
+[10:43:44] end fin_p2b_flyasm rc=0
+stats: {'dgrad': 13950, 'wgrad': 13950, 'chunked': 6076, 'miss': 13950, 'checked': 27900, 'syncs': 436, 'scratch_bytes': 603979776}
+nonfinite_events: []
+max_abs_by_tag: {'wgrad.out': '2.875', 'dgrad.out': '0.001038'}
+rc=0 tag=fin_p2b_flyasm log=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/logs/e2e.fin_p2b_flyasm.log nan_steps=0
+FINAL_E2E_DONE
