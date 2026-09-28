@@ -1385,8 +1385,8 @@ def build_flash_attn_bwd_dkdv_module(
     assert dtype_str == "bf16", "bwd dkdv kernel targets bf16"
     assert causal, "bwd dkdv kernel is causal-only for the GPT-OSS campaign"
 
-    # Prescale the owned K by sm*log2e and fold -log2e*lse into GEMM1a's MFMA C-init, so its
-    # accumulator already IS the base-2 softmax exponent. Not combinable with Schraudolph:
+    # Q arrives prescaled by sm*log2e (see _prescale_q) and -log2e*lse is folded into GEMM1a's
+    # MFMA C-init, so the accumulator already IS the base-2 softmax exponent. Not combinable with Schraudolph:
     # its lse*2^23+bias addend loses the low mantissa bits through the f32 MFMA accumulator.
     # buffer_load_dwordx4 ... lds (16B DMA-to-LDS) needs gfx950+ (gfx94x has only
     # the 4B dword variant). DMA bypasses the VGPR staging of the Q/dO tile loads,
@@ -2406,28 +2406,25 @@ def build_flash_attn_bwd_dkdv_module(
                         v_rsrc, global_idx_kv(_kvr, kv_col), vec_width=MFMA_LANE_K, dtype=elem_dtype
                     )
 
-        # ---- FOLD: prescale the owned K by sm*log2e once per kv-block (amortized over
-        # the GQA group's heads). K feeds GEMM1a only -- dK is a separate accumulator --
-        # so scaling k_b_packs is safe. Together with -log2e*lse folded into GEMM1a's
-        # C-init, GEMM1a's raw output already IS the base-2 softmax exponent. ----
-        if const_expr(True):
-            _kscale_v8 = Vec.filled(MFMA_LANE_K, sm_scale * _LOG2E, fx.Float32)
-            for h in range_constexpr(KV_HALVES):
-                for nt in range_constexpr(NT):
-                    for ks in range_constexpr(K_STEPS_QK):
-                        k_b_packs[h][nt][ks] = (
-                            (Vec(k_b_packs[h][nt][ks]).to(fx.Float32) * _kscale_v8).to(elem_dtype).ir_value()
-                        )
-
         # GEMM3 contracts over kv, so its A operand is K^T: stage the owned K (and, for
         # GEMM1b, V) into LDS as [kv][D] in the Q/dO tile layout and transpose-read it
         # back, once per kv-block -- a pure register->LDS repack that takes both B
         # operands off the register file for the whole kernel, avoiding the spill
-        # cliff. K goes in ALREADY PRESCALED, so GEMM1a reads it directly; that leaves
-        # the dQ partial scaled by sm*log2e, which `_reduce_dq_partials` divides out.
-        if const_expr(A16_NATIVE):
-            assert K_REG, "native dQ folds 1/log2e into GEMM3's LDS K copy, which needs K_REG"
-            _g3ks_v8 = Vec.filled(MFMA_LANE_K, 1.0 / _LOG2E, fx.Float32)
+        # cliff. The sm*log2e fold lands HERE rather than on the shared k_b_packs, so the
+        # score GEMM contracts against K exactly as the forward saw it (the scale rides in
+        # on Q instead -- see _prescale_q) -- but only while this tile is GEMM3's alone.
+        # Without K_REG the score GEMM's B operand IS this tile, so it goes in raw and the
+        # fold moves to the dQ reduce, which reads `dkdv_l.dq_scale` instead of assuming.
+        if const_expr(not K_REG):
+            # Native dQ cannot land here: it only builds at D=64, whose band never pairs.
+            assert not A16_NATIVE, "native dQ needs a scaled LDS K tile, which GEMM1a cannot share"
+            _g3ks_v8 = None
+        elif const_expr(A16_NATIVE):
+            # Native dQ wants k*sm, which it used to reach by scaling an ALREADY-rounded
+            # k*sm*log2e back down by 1/log2e -- two roundings where one will do.
+            _g3ks_v8 = Vec.filled(MFMA_LANE_K, sm_scale, fx.Float32)
+        else:
+            _g3ks_v8 = Vec.filled(MFMA_LANE_K, sm_scale * _LOG2E, fx.Float32)
         for h in range_constexpr(KV_HALVES):
             _kb_h, _vb_h = G3K_BASE + h * BKV_H * HEAD_DIM, G3V_BASE + h * BKV_H * HEAD_DIM
             for nt in range_constexpr(NT):
@@ -2451,7 +2448,10 @@ def build_flash_attn_bwd_dkdv_module(
                                 ],
                             )
                         continue
-                    Vec(k_b_packs[h][nt][ks]).store(lds, [_kv_lds_idx(_kb_h, nt, ks)])
+                    _kst = k_b_packs[h][nt][ks]
+                    if const_expr(_g3ks_v8 is not None):
+                        _kst = (Vec(_kst).to(fx.Float32) * _g3ks_v8).to(elem_dtype).ir_value()
+                    Vec(_kst).store(lds, [_kv_lds_idx(_kb_h, nt, ks)])
                     if const_expr(V_LDS):
                         Vec(v_b_packs[h][nt][ks]).store(lds, [_kv_lds_idx(_vb_h, nt, ks)])
         if const_expr(not K_REG):
@@ -2535,7 +2535,10 @@ def build_flash_attn_bwd_dkdv_module(
 
             b_packs is either a register list or, for a tile staged in LDS, its base: the
             fragments are then re-read per head-step so they are live only across this GEMM
-            rather than across the whole kernel."""
+            rather than across the whole kernel.
+
+            A(Q) arrives already scaled by sm*log2e (see _prescale_q), so the score GEMM's
+            accumulator is the base-2 exponent with nothing left to apply per fragment."""
             _mts = list(range_constexpr(MT)) if mts is None else list(mts)
             _nts = {mt: [nt for nt in range_constexpr(NT) if drop is None or not drop(mt, nt)] for mt in _mts}
             if const_expr(isinstance(b_packs, int)):
@@ -4211,7 +4214,8 @@ def build_flash_attn_bwd_dkdv_module(
         # ---- Store dV[kv,D], dK[kv,D]. The 16x16 C-layout gives each lane 4
         # CONTIGUOUS D values (D = dt*16 + kg*4 + t) at kv = nt*16 + lane16, so the
         # store is direct (no permlane32 transpose needed, unlike the 32x32 path). ----
-        sm_vec4 = Vec.from_elements([fx.Float32(sm_scale)], fx.Float32).broadcast_to(4)
+        # Q came in prescaled by sm*log2e (see _prescale_q), so dK's fold is 1/log2e.
+        dk_fold_v4 = Vec.from_elements([fx.Float32(1.0 / _LOG2E)], fx.Float32).broadcast_to(4)
 
         def _store(accs, rsrc, scale):
             for h in range_constexpr(KV_HALVES):
@@ -4219,7 +4223,7 @@ def build_flash_attn_bwd_dkdv_module(
                     for nt in range_constexpr(NT):
                         v = Vec(accs[(h * DT + dt) * NT + nt])
                         if const_expr(scale):
-                            v = v * sm_vec4
+                            v = v * dk_fold_v4
                         lo = rocdl.cvt_pk_bf16_f32(v[0], v[1])
                         hi = rocdl.cvt_pk_bf16_f32(v[2], v[3])
                         o_pack = Vec.from_elements([fx.Int32(_raw(lo)), fx.Int32(_raw(hi))], fx.Int32)
@@ -4781,8 +4785,9 @@ def _reduce_dq_partials(
     band hold stale data and are skipped -- which is also what keeps the traffic at the
     causal half. Fixed band order and fp32 accumulation -> bitwise deterministic.
 
-    ``scale`` is 1/log2e, not sm_scale: the fused kernel's fifth GEMM contracts against
-    the LDS K tile, which is staged already prescaled by sm*log2e for GEMM1a.
+    ``scale`` is whatever the body left on its dQ partials, so take it from the builder
+    (`dkdv_l.dq_scale`): the fused kernel's fifth GEMM contracts against the LDS K tile, and
+    whether that tile carries sm*log2e depends on whether the score GEMM has to share it.
 
     Band count is what this costs, and on the fused D128 body it is ALL that is left.
     Widening the reduce's band unit N-fold so it reads 1/N of the bands (diagnostic only,
@@ -5135,7 +5140,7 @@ def _fused_pipelined(
                 block_kv,
                 Hq,
                 D,
-                1.0 / _LOG2E,
+                dkdv_l.dq_scale,
                 red_q,
                 qsp=qsp,
                 causal_offset=Skv - Sq,
@@ -5211,7 +5216,7 @@ def _fused_bandgroups(
             block_kv,
             Hq,
             D,
-            1.0 / _LOG2E,
+            dkdv_l.dq_scale,
             stream,
             causal_offset=0,
             sbhd=cu is None,
@@ -5385,6 +5390,10 @@ def _get_bwd(
             return sub
 
         dkdv_l.chunk = _dkdv_chunk
+        # What the dQ partials still carry, published by the builder rather than assumed by
+        # the reduce: a paired body shares its LDS K tile with the score GEMM, so that tile
+        # stays raw and the sm fold lands here instead of being divided back out.
+        dkdv_l.dq_scale = scale if _pair else 1.0 / _LOG2E
         # DELTA has no other producer, so the standalone odo pass runs; ragged wants it
         # packed by token, the layout its LSE has.
         odo_kw = dict(
@@ -5549,6 +5558,20 @@ def _dense_plan(B, Sq, Skv, Hq, Hkv, D, scale, window_left, sbhd, deterministic)
 
 _LSET_TILE = 32
 _LSET_CACHE: dict = {}
+
+
+def _prescale_q(q, sm_scale):
+    """Q scaled by sm*log2e, rounded to bf16 exactly as the forward's own prescale rounds it.
+
+    The score the backward exponentiates is taken against an LSE the forward built from ITS
+    prescaled Q, so the two have to round the same way -- rounding the K side instead perturbs
+    the score by an amount that grows with |score|, which the exp2 turns into a multiplicative
+    error on P. Doing it here rather than on the fragments keeps it off the VALU-bound inner
+    loop: one pass over Q against the eight the kv-outer body already makes.
+
+    dK then comes out scaled by sm*log2e instead of sm, which its store divides back down.
+    """
+    return torch.mul(q, sm_scale * _LOG2E).reshape(-1)
 
 
 def _prescale_lse(lse_bhsq, stream):
@@ -5740,7 +5763,7 @@ def flydsl_varlen_backward(
     {64,128}; no learned sink on this path."""
     varlen = cu_seqlens_q is not None
     st = torch.cuda.current_stream()
-    qf, kf, vf, dof = q.reshape(-1), k.reshape(-1), v.reshape(-1), dout.reshape(-1)
+    qf, kf, vf, dof = _prescale_q(q, scale), k.reshape(-1), v.reshape(-1), dout.reshape(-1)
     o16 = out.to(q.dtype).reshape(-1)
 
     if varlen:
@@ -5845,7 +5868,7 @@ def flydsl_varlen_backward(
                 block_kv,
                 Hq,
                 D,
-                1.0 / _LOG2E,
+                dkdv_l.dq_scale,
                 st,
                 window_left=window_left,
                 cu=(cu_seqlens_q, cu_seqlens_kv),
@@ -5933,7 +5956,7 @@ def flydsl_varlen_backward(
         if _nbc == 1:
             _bodies[0](*_bufs, B, Sq, Skv, 0, st)
             if not a16_nat:
-                _unpermute_dq_a16(img, dq, B, Sq, Hq, D, 1.0 / _LOG2E, st)
+                _unpermute_dq_a16(img, dq, B, Sq, Hq, D, dkdv_l.dq_scale, st)
         else:
             # Only chunk 0's delta is due before any body, and a chunk's rows are final when it retires.
             _odos = [odo_l.bat(lo) for lo, _ in _plan]
@@ -6055,7 +6078,7 @@ def flydsl_varlen_backward(
             block_kv,
             Hq,
             D,
-            1.0 / _LOG2E,
+            dkdv_l.dq_scale,
             st,
             causal_offset=Skv - Sq,
             window_left=window_left,
