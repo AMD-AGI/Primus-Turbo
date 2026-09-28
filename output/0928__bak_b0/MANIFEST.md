@@ -69,18 +69,16 @@ tar -C /home/lihuzhan -xzf b0_real_qkv_dumps.tar.gz
 # 其余按需解包；然后按 output/0927__b0/HANDOFF-A0.md 第 2-3 节修改 final.yaml（容器 fa-repro、host、gpu_id）和 host hint（fwd h49 / bwd h74）
 ```
 
-## 4. 备份包大小与校验（2026-09-28 生成，全部通过 pigz -t 和 tar tzf 检查）
+## 4. 备份包大小与校验（2026-09-28 生成，全部通过 pigz -t 和 tar tzf 检查；完整 sha256 在 SHA256SUMS）
 
 | 文件 | 大小 | 条目数 | sha256（前 16 位） |
 |---|--:|--:|---|
-| `b0_claude_sessions.tar.gz` | 1928.0 MB | d5a8067987d48f4d | `` |
-| `b0_misc.tar.gz` | 1620.0 MB | aa0d3d9c7ac17b74 | `` |
-| `b0_opevolve_jobs.tar.gz` | 11072.0 MB | 9fe9ccc756236e54 | `` |
-| `b0_output_0927b0_full.tar.gz` | 12167.0 MB | 81081a6c6fdb4985 | `` |
-| `b0_real_qkv_dumps.tar.gz` | 7.0 MB | 38252482e0eb3903 | `` |
-| `op-evolve_lhz-gfx1250.bundle` | 0.0 MB | 873e7ea25e8b490a | `` |
-| `Primus-Turbo_b0-0927.bundle` | 0.0 MB | 82f3a698a2cb6580 | `` |
+| `Primus-Turbo_b0-0927.bundle` | 97.9 MB | - | `82f3a698a2cb6580` |
+| `b0_claude_sessions.tar.gz` | 113.0 MB | 1928 | `d5a8067987d48f4d` |
+| `b0_misc.tar.gz` | 3.3 MB | 1620 | `aa0d3d9c7ac17b74` |
+| `b0_opevolve_jobs.tar.gz` | 2,589.1 MB | 11072 | `9fe9ccc756236e54` |
+| `b0_output_0927b0_full.tar.gz` | 775.9 MB | 12167 | `81081a6c6fdb4985` |
+| `b0_real_qkv_dumps.tar.gz` | 1,621.5 MB | 7 | `38252482e0eb3903` |
+| `op-evolve_lhz-gfx1250.bundle` | 3.0 MB | - | `873e7ea25e8b490a` |
 
-说明：
-- 会话备份是 12:55 UTC 左右的快照，之后的对话（包括本清单的生成）不在里面。
-- `misc.err` 为空，说明 misc 包没有漏掉文件。
+总计约 5.1 GB。说明：会话备份是 12:55 UTC 左右的快照，之后的对话（包括本清单的生成）不在里面。`misc.err` 为空，说明 misc 包没有漏掉文件。
