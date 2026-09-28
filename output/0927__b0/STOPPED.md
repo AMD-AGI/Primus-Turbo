@@ -1,3 +1,5 @@
+> **Stale (day 1).** This note records the 2026-09-27 15:43 UTC stop. The campaign resumed on 2026-09-28; current state: `HANDOFF-A0.md`.
+
 # B0 campaign stopped 2026-09-27 ~15:44 UTC -- the machine was taken over
 
 At ~15:43 UTC all four per-card containers fa-g0..fa-g3 were REMOVED by someone else (`docker ps -a` no longer
