@@ -108,9 +108,9 @@ reference on the card (the 09-22 power-cycle trigger): copy it, or re-build and 
 
 **Hints that name B0 cards and must be superseded on A0** (append new `## hN` sections; the parser only reads `h<N>`):
 fwd h29 (`B/fwd-hint.md:603`, GPU0/fa-g0), h38 (`:725`, GPU2/fa-g2); bwd h62 (`B/bwd-hint.md:4431`, GPU1/fa-g1),
-h65 (`:4483`, GPU3/fa-g3). Proposed text (fwd `## h48`, bwd `## h74`):
+h65 (`:4483`, GPU3/fa-g3). Proposed text (fwd `## h49`, bwd `## h74`):
 ```
-## h48 -- HOST MOVE: A0 (heliosr-1b114-c07-1), one card, container fa-repro
+## h49 -- HOST MOVE: A0 (heliosr-1b114-c07-1), one card, container fa-repro
 From round <N> this job runs on A0: a single gfx1250 card, container `fa-repro` (logical device 0 = the only card).
 This supersedes h29 and h38 (and h62/h65 in the bwd job): no fa-gN containers, no OE_PHYS_GPU (unset -> the sclk
 witness falls back to rocm-smi, which is correct on one card), idle/contention checks = the whole node
