@@ -1,0 +1,21 @@
+refcache proxy: accepted with common_sha d441e55aba5c0b89
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+CORR shape=proxy arm=q1 dq  52.54 dB  dk  52.57 dB  dv  52.67 dB  pass
+DET shape=proxy arm=q1 runs=100 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=proxy arm=u2 dq  52.54 dB  dk  52.57 dB  dv  52.67 dB  pass
+DET shape=proxy arm=u2 runs=100 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=proxy u2 vs q1: dq=bitwise dk=bitwise dv=bitwise
+CORR shape=proxy arm=qu2ku2 dq  52.54 dB  dk  52.57 dB  dv  52.67 dB  pass
+DET shape=proxy arm=qu2ku2 runs=100 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=proxy qu2ku2 vs q1: dq=bitwise dk=bitwise dv=bitwise
+CORR shape=proxy arm=r19h dq  52.52 dB  dk  52.57 dB  dv  52.67 dB  pass
+DET shape=proxy arm=r19h runs=100 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=proxy r19h vs q1: dq=49.8dB dk=bitwise dv=bitwise
+CORR shape=proxy arm=u2n dq  52.52 dB  dk  52.57 dB  dv  52.67 dB  pass
+DET shape=proxy arm=u2n runs=100 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=proxy u2n vs q1: dq=49.8dB dk=bitwise dv=bitwise
+CORR shape=proxy arm=ku2 dq  52.52 dB  dk  52.57 dB  dv  52.67 dB  pass
+DET shape=proxy arm=ku2 runs=100 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=proxy ku2 vs q1: dq=49.8dB dk=bitwise dv=bitwise
+LABVAL proxy PASS
+rc=0

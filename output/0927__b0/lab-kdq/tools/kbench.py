@@ -23,7 +23,7 @@ from refcache_util import cached_forward
 shape, mode, iters = sys.argv[1], sys.argv[2], int(sys.argv[3])
 arms = [(a.split("=", 1)[0], Path(a.split("=", 1)[1]).resolve()) for a in sys.argv[4:]]
 NG = int(os.environ.get("KB_NG", "4"))
-PHYS = os.environ.get("OE_PHYS_GPU", "3")
+PHYS = os.environ.get("OE_PHYS_GPU", "0")
 
 
 def sclk():

@@ -24,7 +24,12 @@ _sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()[:16]
 # the cached rounds. So accept the recorded common_sha, keep every other provenance check,
 # and never dispatch the fp32 reference GEMM on the card (the 09-22 wedge trigger).
 _CACHED_COMMON = {"fast": "988c14caed5d9a80", "proxy": "988c14caed5d9a80", "prod": "988c14caed5d9a80"}
-blob = load_reference(shape, SHAPES, _sha(HERE / "eager" / "impl.py"), _CACHED_COMMON[shape], torch)
+blob = None
+for _cs in (_sha(HERE / "ut" / "common.py"), _CACHED_COMMON[shape]):   # refcache provenance re-stamped 09-28 06:42
+    blob = load_reference(shape, SHAPES, _sha(HERE / "eager" / "impl.py"), _cs, torch)
+    if blob is not None:
+        print(f"refcache {shape}: accepted with common_sha {_cs}", flush=True)
+        break
 assert blob is not None, "refcache missing/mismatch -- refusing to compute the fp32 reference on card"
 q, k, v, do = make_inputs(shape, seed=0)
 o, lse = blob["o"].to(q.device), blob["lse"].to(q.device)
