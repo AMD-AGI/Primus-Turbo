@@ -15,3 +15,4 @@ Champion before B0: round 20 (A0 511 TF/s; B0 re-measure ~633-650 TF/s, 0.74-0.7
 | **29** | fast | 09-28 07:40-08:40 | **yes** | **656.5 (8.375)** | r19h 639.0 (8.604) | prod +2.7% (opt: +2.48%), proxy +2.8%; geomean 1.018 | **80.4%** (beat 817.0) | 603.8 / 98.6 | h70 u2n: k_dq kv-loop unroll x2 -- lab result confirmed on the job's card |
 | 30 | deep | 09-28 08:40-10:30 | no | 656.4 (8.377) | r29 657.7 | prod -0.2%, proxy +0.2%, fast +1.0%; geomean 1.0033 | 80.0% (beat 820.7) | 605.9 / 100.4 | g89 null (see rounds/030/act.md) |
 | 31 | fast | 09-28 10:30-11:21 | no | 653.1 (8.419) | r29 657.1 | prod -0.6%, proxy -2.5%; geomean 0.9915 | 79.8% (beat 818.6) | 588.4 / 98.7 | round arms null/loss (see rounds/031/opt.md) |
+| 32 | fast | 09-28 11:21-12:37 | no | 636.3 (8.641) | r29 656.8 | prod -3.1%, proxy -1.1%; geomean 0.9861 | 77.8% (beat 818.3) | 599.4 / 98.5 | round arms lost (see rounds/032/opt.md) |

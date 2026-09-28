@@ -1,0 +1,165 @@
+round: 32
+mode: fast
+candidate: r32.i3.g95
+outcome: delivered
+
+# ---------------------------------------------------------------- correctness
+correctness:
+  unit_tests: pass                # op/ut/test_correctness.py --impl rounds/032/op
+                                  # 15 shape x mode cases, all PASS, exit 0
+  precision: pass
+  checked_with: op/validation.py
+  sqnr_db: 52.52                  # the WORST tensor over the three scored shapes
+                                  # (proxy dq). Range 52.52-52.83 dB against a 50.0 dB
+                                  # gate; determinism dk/dv bitwise over 200 runs, dq
+                                  # bitwise against a 70 dB floor.
+
+# ---------------------------------------------------------------- measurements
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/029/op, rounds/030/op, rounds/031/op]
+  # All five arms (beat, r029, r030, r031, r32C) interleaved in ONE process per shape,
+  # blocked ruler lead 4 + block 9 palindromic, two full passes, fresh
+  # FLYDSL_RUNTIME_CACHE_DIR, device idle before AND after (No KFD PIDs, GPU use 0%)
+  # against physical 0004:04:00.0 via container fa-g3. Every arm saw the SAME clock
+  # excursion at prod (sclk_start 1762 -> sclk_end 1796), so no arm is scored against
+  # a different clock. Rounds before 28 deliberately NOT measured (different
+  # architecture, replaced by the round-28 refactor).
+  # Session floor, same code two passes: prod 0.23%, proxy 0.81%, fast 2.18%.
+  shapes:
+    - name: fast
+      this_round_tflops: 98.46
+      best_round_tflops: 98.38     # r031, re-measured this session
+      beat_tflops: 58.00
+      target_tflops: 58.00
+      champion_round: 31
+      champion_tflops: 98.38
+      champion_rebuilt: true
+      ratio: 1.0
+      vs_champion: 1.001
+    - name: proxy
+      this_round_tflops: 599.43
+      best_round_tflops: 606.30    # r030, re-measured this session
+      beat_tflops: 746.68
+      target_tflops: 746.68
+      champion_round: 30
+      champion_tflops: 606.30
+      champion_rebuilt: true
+      ratio: 0.8028
+      vs_champion: 0.9887
+    - name: prod
+      this_round_tflops: 636.27
+      best_round_tflops: 656.76    # r029 (= op/current), re-measured this session
+      beat_tflops: 818.32
+      target_tflops: 818.32
+      champion_round: 29
+      champion_tflops: 656.76
+      champion_rebuilt: true
+      ratio: 0.7775
+      vs_champion: 0.9688
+  score: 0.8601                   # mean(1.0, 0.8028, 0.7775)
+
+validation:
+  exit_code: 2                    # correctness pass, determinism pass, speed FAIL
+                                  # (proxy 0.796x, prod 0.778x; each must be >= 1.00x)
+
+# ---------------------------------------------------------------- fast-round only
+explored:
+  ran:
+    - "r32.i0.C1 -- clock/thermal/power read from round 31's STORED traces (no card time)"
+    - "r32.i0.C2 -- HIP microbenchmark, transcendental throughput and latency"
+    - "r32.i0.C3 -- HIP microbenchmark, VALU/matrix overlap against waves/SIMD"
+    - "ISA disassembly census of k_dkdv and k_dqg (op/current, trees A, B, C)"
+    # rocprofv3 --stats NOT run: h4, the gfx1250 counter surface returns 8 counters,
+    # none of them an instruction, LDS or byte counter, so it would have changed no
+    # decision this round. C1/C2/C3 each changed one and are named in opt.md.
+  consulted:
+    - knowledge/arch/gfx1250/isa.md
+    - knowledge/arch/gfx1250/README.md
+    - knowledge/profiling/README.md
+  bound: latency
+  confidence: high                # raised from round 30's `medium`: the bound is no
+                                  # longer only classified, it is BUDGETED and now
+                                  # confirmed by a real arm that reached it.
+  why: >
+    k_dkdv's 2282-cycle iteration is ~646 cycles of WMMA issue + ~628 of other issue
+    + ~1008 that are NEITHER (44% wait). That wait term is ELASTIC: three arms this
+    round freed issue slots and none of them returned time. g94 does the same work in
+    14.5% fewer instructions per WMMA with 60% fewer v_nop and 85 fewer VGPR and lost
+    6.3%; g95 removed the blocking s_wait_dscnt 0x0 entirely, got the 64 dV/dK WMMAs
+    interleaved into the softmax VALU stream, cut v_nop 61% and shortened the loop --
+    and still lost 3.1%. r32.i0.C3 explains both: at 1 wave/SIMD gfx1250 gives no
+    VALU/matrix overlap (every mixed point within 2.5% of the strict sum), so neither
+    deleting instructions nor interleaving them buys anything. The bound is latency,
+    and the only mechanism left against it is a second resident wave.
+
+arms:
+  - id: r32.i1.g93
+    built: "double-buffered LDS rings for Q/dO/P/dS + hoisted dV/dK phase, on KV_U2"
+    tflops: {prod: 615.4, proxy: 530.6, fast: 95.5}
+    vs_champion: 0.9370
+    shipped: false
+    note: >
+      Refuted by its own static gate before the card: hot loop structurally identical
+      to g94's (1129 instrs, 128 WMMA, 53 v_nop, same wait list including the
+      s_wait_dscnt 0x0 it existed to remove), all 461 differing lines SGPR renaming.
+      The LDS parity DID reach the ISA (39 distinct offsets vs 19). Third independent
+      proof that LLVM will not hoist these loads for a scheduling hint.
+  - id: r32.i2.g94
+    built: "k_dkdv qloop_full unrolled by 2 (KV_U2), alone, from op/current"
+    tflops: {prod: 615.8, proxy: 529.0, fast: 93.8}
+    vs_champion: 0.9377
+    shipped: false
+    note: >
+      Replication, not discovery: h71 records the operator lab's ku2 at +6.5% slower on
+      another card; measured -6.3% here. First cross-card replication this job has
+      obtained. Improves EVERY static metric (instrs/WMMA 10.31 -> 8.82, v_nop/WMMA
+      1.031 -> 0.414, VGPR 729 -> 644, 0 spill) and still lost -- the h18 ledger's
+      strongest entry, and with g92 it closes the instruction-count axis on k_dkdv.
+  - id: r32.i3.g95
+    built: "P/dS transposed operands carried in the scf.for state across the back edge, from op/current, KV_U2=False"
+    tflops: {prod: 636.27, proxy: 599.43, fast: 98.46}
+    vs_champion: 0.9688
+    shipped: true
+    note: >
+      Round's best arm by 2x. Free kill gate PASSED: the s_wait_dscnt 0x0 no longer
+      heads the dV/dK run -- the run no longer exists, the 64 WMMAs are interleaved
+      into the softmax VALU stream. A carried SSA value did on the first attempt what
+      g22, five scheduling intrinsics and g93 could not. LOST anyway, -3.15%/-3.09%
+      prod against a 0.23% floor: the fourth and strongest confirmation of C3.
+  # No merge arm built: the merge rule requires that NEITHER arm lost, and all three lost.
+
+expected: >
+  Recorded before the measurement, in route.md row 17: "this is the first arm in the
+  campaign aimed at the wait term rather than the issue term, so a win is not bounded
+  by the count model -- but h14 says a loss must be read as a failure of the chain
+  re-attribution, not of register pressure." No TFLOP/s figure was predicted, because
+  the budget gives no conversion factor for the wait term -- that was the thing being
+  measured. The arm reached the wait term and the wait term did not move: the
+  prediction's own stated failure branch is what happened, and it is recorded as such.
+
+added_to_pool: [r32.i3.g95, r32.i4.g96]
+route_updated: true
+
+# ---------------------------------------------------------------- what got built
+implementation:
+  files_changed: [op/kernels.py]
+  build_failures:
+    - attempt: 1
+      error: "NameError: name 'pipe' is not defined at kernels.py:299 (arm A / g93)"
+      root_cause: >
+        The parity block was anchored on `q0 = qt * fx.Int32(32)`, which occurs in
+        _ldqd at line 273 BEFORE _body at line 355, so the insertion landed in the
+        wrong function. Re-anchored on the full _body signature. MECHANISM worth
+        carrying: in this file several short statements are textually identical across
+        _ldqd, _body and the three qloop variants, so a patch anchored on a statement
+        rather than on a def is a coin flip. Anchor on signatures.
+    - attempt: 2
+      error: "non-greedy regex captured one of two WMMA runs; an l[4:] dedent broke indentation (arm A / g93)"
+      root_cause: >
+        Caught by inspecting the generated source before compiling, not by the
+        compiler. Replaced the regex with index arithmetic plus an assertion that the
+        captured block contains exactly 2 occurrences of `reuseA=(dtile > 0)`. That
+        assertion was reused for g95 and held.
+  # g95 itself compiled on the first attempt (RC C 0). No failure with a repeated root
+  # cause, so the four-failure abandonment bound was never approached.
