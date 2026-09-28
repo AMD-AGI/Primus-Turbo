@@ -61,6 +61,7 @@ Source abbreviations used below:
 | h40 | must standing note | RULER FIXED: benchmark.py now times BLOCKED (lead 4 + block 9 per arm, palindromic rounds); the old call-by-call interleave biased prod 3-7% FlyDSL-vs-FlyDSL and ~25% vs ASM | open |
 | h41 | standing note | Re-measured under the fixed ruler: r6 vs r4 +4.6% prod (real), L12 4-wave occ2 DEAD (-0.4% prod, -7% proxy), bnegg/fixed-max vs r6 +0.6% (unconfirmed), ASM beat steady-state ~1.43-1.46 ms (r6/beat 1.035) | open |
 | h42 | advise standing note | E2E (Llama-3.1-8B training): our fwd runs 1.34-1.52x ASM per layer inside training (1.64-1.85 vs 1.22 ms) and is clock-sensitive (+13% across clock states); ASM is not -- prefer changes that cut work/power, and check candidates at a low clock state too | open |
+| h43 | must standing note | Speculative softmax (SPEC_STALE_MAX, r6/g14) LOSES on real training data: 13-25% of tiles recompute (score std 21-53 vs randn 1.0); the randn ruler mis-ranks it. Do not build more speculation variants; an operator nospec refactor is being validated | open |
 
 ---
 
@@ -780,3 +781,14 @@ Implications for this job: (1) a candidate that cuts issued work / power (fewer 
 more end to end than one that only wins at the steady high clock; (2) when a candidate wins, also measure it vs the
 champion with the process pinned to a lower clock state (e.g. interleave a GEMM between calls, or `--block 1` which
 reproduces the interleaved state) and report both. The prod ranking stays the blocked ruler (h40).
+
+## h43 -- Speculative softmax loses on real training data; the randn ruler mis-ranks it
+
+Profiling inside the e2e training on GPU 0 (`PT/output/0927__b0/profile/REPORT.md`): real q/k/v from the model (dumps
+`/home/lihuzhan/_prof_dump/qkv_call0*.pt`, [B,S,H,D] bf16) have attention-score std 21-53, randn has ~1.0. On real data
+the stale-max speculation recomputes on 13-25% of (32-row, 64-col) tile steps (0% on randn). Measured on real inputs at
+the training clock: r6 1.83-2.08 ms vs r6 with `SPEC_STALE_MAX=False` 1.59-1.60 ms (and 8-12% faster than ASM at 2350 MHz);
+on randn the nospec variant is 5% slower -- which is why every round's ruler keeps speculation. In training our fwd runs
+1.45-1.72x ASM per layer; the gap is clock sensitivity x data (0.84 x 1.43 x 1.32).
+Until the operator's nospec validation lands (it will arrive as a `must refactor`): do not build new speculative /
+stale-max variants, and prefer levers that reduce issued work and clock sensitivity (v_nop, SALU, barriers).

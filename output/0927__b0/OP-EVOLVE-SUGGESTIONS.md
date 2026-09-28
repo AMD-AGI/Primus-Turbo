@@ -53,3 +53,21 @@
 - bwd `state.yaml` 从 r20 起 `flops` 的 shape 标签错位，progress.md 里的 ms 列因此是错的。
 - refactor hint 的提升会清空全部 champions：这正好绕过了第 1 条的问题，但也把真实有效的记录一起清掉了。修好第 1 条之后，这里应该只清掉受影响的 shape。
 - 被 `op-evolve stop` 中断的 act module 重跑时会从头开始（bwd r25 的 act 跑了两遍）。建议支持 step 级断点续跑，或者在 stop 前等当前 step 完成。
+
+## 补充（09-28 profiling 之后）
+
+### 11. 尺子用 randn 输入，会选出在真实数据上变慢的改动（P0）
+- **现象**：fwd r6 的投机 softmax 在 randn 上是赢的（+4.6%），但真实训练数据的 score 标准差是 21–53，randn 只有 1，于是 13–25% 的 tile 要重算。在训练中，FlyDSL fwd 每层是 ASM 的 1.45–1.72 倍。关掉投机后，在真实数据上反而快 13–23%，在 randn 上则慢 5%，所以 randn 尺子会一直选中投机。详见 `profile/REPORT.md`。
+- **建议**：setup 时从目标模型里 dump 几层真实的 q/k/v，作为计分 shape 之一，或者作为必须同时满足的第二把尺子。任何依赖数据分布的机制（投机、跳过、早停）只能在真实数据上判定。
+
+### 12. 尺子的工作点和训练不一致（时钟）
+- **现象**：训练中 sclk 只有 1250–1690 MHz，功耗顶在约 2.13 kW；分块尺子测的是高时钟稳态。FlyDSL fwd 从 2350 MHz 到 1350 MHz 慢了 1.25 倍，ASM 基本不变。
+- **建议**：benchmark 增加一种"紧跟 GEMM 突发"的计时模式，候选胜出时两种模式都要报告，并把它按权重计入 score（见第 9 条）。
+
+### 13. job 的达标判据用几何平均，launch-bound 的小 shape 会掩盖计分 shape
+- **现象**：bwd r27 的 fast 是 ASM 的 1.66 倍，因为 ASM 在小 shape 上本身就很慢。这一项掩盖了 prod 和 proxy 只有约 0.78 的差距，几何平均 1.007，于是 job 被判"target_met"并自行结束。fwd 也快到这个临界点了。
+- **建议**：达标判据要求每个计分 shape 各自不低于 bar；launch-bound 的 shape 只报告，不参与判定。
+
+### 14. refcache 的 sha 失配后被静默忽略，每轮都在卡上重算 fp32 参考
+- **现象**：bwd 的 `ut/common.py` 在 refcache 建好之后被改过，从 r24 起 gate 每轮都显示 "IGNORED … recomputing"，也就是在卡上重算 fp32 prod 参考。这正是 09-22 那次导致整机断电重启的触发条件。
+- **建议**：sha 失配时让 gate 直接失败并报警，而不是静默地重算；同时提供一个工具，在 `make_inputs` 没变时自动更新 provenance。
