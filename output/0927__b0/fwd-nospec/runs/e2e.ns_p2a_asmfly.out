@@ -1,0 +1,6 @@
+[06:29:23] ns_p2a_asmfly E2E_ATTN=asm,fly,asm,fly;asm,fly,fly,asm steps=62 pfreq=10 waiting for /tmp/b0-gpu0.lock
+nkfix stats (/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/../gemm/logs/nkfix.ns_p2a_asmfly.txt):
+stats: {'dgrad': 13950, 'wgrad': 13950, 'chunked': 6076, 'miss': 13950, 'checked': 27900, 'syncs': 436, 'scratch_bytes': 603979776}
+nonfinite_events: []
+max_abs_by_tag: {'wgrad.out': '2.875', 'dgrad.out': '0.001038'}
+rc=0 tag=ns_p2a_asmfly log=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/logs/e2e.ns_p2a_asmfly.log nan_steps=0

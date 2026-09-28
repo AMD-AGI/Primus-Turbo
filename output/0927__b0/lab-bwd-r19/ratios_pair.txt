@@ -1,0 +1,12 @@
+t_fast_p1 vs_r20pair r019=0.9827 r19h=0.9820  r19h/r019=0.9993  AA=1.0063
+t_fast_p2 vs_r20pair r019=0.9913 r19h=0.9857  r19h/r019=0.9944  AA=0.9982
+t_fast_p3 vs_r20pair r019=0.9854 r19h=1.0000  r19h/r019=1.0148  AA=0.9985
+t_fast_p4 vs_r20pair r019=0.9822 r19h=0.9889  r19h/r019=1.0068  AA=0.9970
+t_fast_p5 vs_r20pair r019=0.9821 r19h=0.9844  r19h/r019=1.0023  AA=0.9985
+t_fast_p6 vs_r20pair r019=0.9800 r19h=0.9777  r19h/r019=0.9977  AA=0.9809
+t_proxy_p1 vs_r20pair r019=0.9735 r19h=0.9724  r19h/r019=0.9989  AA=0.9965
+t_proxy_p2 vs_r20pair r019=0.9686 r19h=0.9782  r19h/r019=1.0099  AA=0.9996
+t_proxy_p3 vs_r20pair r019=0.9698 r19h=0.9721  r19h/r019=1.0024  AA=0.9957
+t_prod_p1 vs_r20pair r019=0.9832 r19h=0.9835  r19h/r019=1.0003  AA=1.0007
+t_prod_p2 vs_r20pair r019=0.9832 r19h=0.9828  r19h/r019=0.9996  AA=0.9996
+t_prod_p3 vs_r20pair r019=0.9815 r19h=0.9818  r19h/r019=1.0003  AA=1.0004

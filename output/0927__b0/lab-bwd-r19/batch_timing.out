@@ -50,3 +50,18 @@ t_prod_p3 rc=0 newdmesg=0 bad=0
 beat_prod rc=0 newdmesg=0 bad=0
   beat 6.721827030181885 sclk 1762-1767 blocked9+lead4
 BATCH DONE
+t_fast_p4 rc=0 newdmesg=0 bad=0
+  current_copy 0.05400099977850914 sclk 2251-2269 blocked9+lead4
+  r19h 0.05347999930381775 sclk 2251-2269 blocked9+lead4
+  r019 0.0531190000474453 sclk 2251-2269 blocked9+lead4
+  current 0.05416100099682808 sclk 2251-2269 blocked9+lead4
+t_fast_p5 rc=0 newdmesg=0 bad=0
+  r019 0.05287899821996689 sclk 2235-2258 blocked9+lead4
+  r19h 0.05299999937415123 sclk 2235-2258 blocked9+lead4
+  current 0.053881000727415085 sclk 2235-2258 blocked9+lead4
+  current_copy 0.053801000118255615 sclk 2235-2258 blocked9+lead4
+t_fast_p6 rc=0 newdmesg=0 bad=0
+  r19h 0.05279900133609772 sclk 2245-2266 blocked9+lead4
+  current 0.05452200025320053 sclk 2245-2266 blocked9+lead4
+  r019 0.05291900038719177 sclk 2245-2266 blocked9+lead4
+  current_copy 0.05347999930381775 sclk 2245-2266 blocked9+lead4

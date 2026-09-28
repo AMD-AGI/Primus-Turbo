@@ -1,0 +1,61 @@
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+BLAS {'TORCH_BLAS_PREFER_HIPBLASLT': '1', 'HIPBLASLT_TENSILE_LIBPATH': '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/gfx1250'}
+arm r13ns /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/fwd-nospec/arms/fwd_r13ns/impl.py False
+arm asm /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/fwd-nospec/harness/beat/impl.py -
+arm r13 /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/fwd-nospec/arms/fwd_r13/impl.py True
+gburst 10 GEMMs 25.4 ms
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+[aiter] LoadKernel: _ZN5aiter41fmha_bf16_pertokenBf16_hd128_128x256_maskE hsaco: /home/lihuzhan/code/aiter-src/hsa//gfx1250/fmha_fwd_bf16/fmha_bf16_pertokenBf16_hd128_128x256_mask.co
+timed loop 11.4s
+RESULT cond=gb set=L00 arm=r13ns n=20 median_ms=1.6341 min=1.6126 max=1.6653
+RESULT cond=gb set=L00 arm=asm n=20 median_ms=1.2868 min=1.2710 max=1.3036
+RESULT cond=gb set=L00 arm=r13 n=20 median_ms=2.0024 min=1.9785 max=2.0230
+RATIO cond=gb set=L00 order=r13ns,asm,r13 r13ns/r13=0.8161 r13/asm=1.5561 r13ns/asm=1.2699
+RESULT cond=gb set=L01 arm=r13ns n=20 median_ms=1.6209 min=1.6047 max=1.6477
+RESULT cond=gb set=L01 arm=asm n=20 median_ms=1.2764 min=1.2529 max=1.3024
+RESULT cond=gb set=L01 arm=r13 n=20 median_ms=2.0091 min=1.9789 max=2.0324
+RATIO cond=gb set=L01 order=r13ns,asm,r13 r13ns/r13=0.8068 r13/asm=1.5741 r13ns/asm=1.2700
+RESULT cond=gb set=L02 arm=r13ns n=20 median_ms=1.6261 min=1.5961 max=1.6577
+RESULT cond=gb set=L02 arm=asm n=20 median_ms=1.2954 min=1.2701 max=1.3163
+RESULT cond=gb set=L02 arm=r13 n=20 median_ms=1.9727 min=1.9377 max=1.9985
+RATIO cond=gb set=L02 order=r13ns,asm,r13 r13ns/r13=0.8243 r13/asm=1.5229 r13ns/asm=1.2553
+RESULT cond=gb set=L08 arm=r13ns n=20 median_ms=1.6349 min=1.6193 max=1.6598
+RESULT cond=gb set=L08 arm=asm n=20 median_ms=1.2695 min=1.2482 max=1.2983
+RESULT cond=gb set=L08 arm=r13 n=20 median_ms=2.1064 min=2.0848 max=2.1211
+RATIO cond=gb set=L08 order=r13ns,asm,r13 r13ns/r13=0.7762 r13/asm=1.6592 r13ns/asm=1.2878
+RESULT cond=gb set=L16 arm=r13ns n=20 median_ms=1.6277 min=1.6029 max=1.6480
+RESULT cond=gb set=L16 arm=asm n=20 median_ms=1.2880 min=1.2687 max=1.3190
+RESULT cond=gb set=L16 arm=r13 n=20 median_ms=1.8501 min=1.8247 max=1.8804
+RATIO cond=gb set=L16 order=r13ns,asm,r13 r13ns/r13=0.8798 r13/asm=1.4363 r13ns/asm=1.2637
+RESULT cond=gb set=L31 arm=r13ns n=20 median_ms=1.6293 min=1.6069 max=1.6482
+RESULT cond=gb set=L31 arm=asm n=20 median_ms=1.2789 min=1.2587 max=1.3043
+RESULT cond=gb set=L31 arm=r13 n=20 median_ms=2.0047 min=1.9639 max=2.0324
+RATIO cond=gb set=L31 order=r13ns,asm,r13 r13ns/r13=0.8127 r13/asm=1.5676 r13ns/asm=1.2740
+RESULT cond=gb set=randn arm=r13ns n=20 median_ms=1.6097 min=1.5865 max=1.6242
+RESULT cond=gb set=randn arm=asm n=20 median_ms=1.2795 min=1.2573 max=1.3001
+RESULT cond=gb set=randn arm=r13 n=20 median_ms=1.5120 min=1.4898 max=1.5368
+RATIO cond=gb set=randn order=r13ns,asm,r13 r13ns/r13=1.0646 r13/asm=1.1817 r13ns/asm=1.2580
+rc=0

@@ -1,0 +1,99 @@
+round: 14
+mode: fast
+candidate: r14.i3.g54             # route row 4: 2-WG cluster TDM multicast of K/V on m32x8 (bshd, even grid x, no left window / sink)
+outcome: delivered                # built, correct, measured -- and it FAILS route row 4's own gates (probe cost, prod >= x1.02, proxy A/A). See opt.md
+
+correctness:
+  unit_tests: pass                # job_context/op/ut/test_correctness.py --impl rounds/014/op: RESULT PASS (raw/gates/ut.txt)
+  precision: pass
+  checked_with: op/validation.py
+  sqnr_db: 49.82                  # min over all correctness rows (short_q full); fast 51.23, proxy 50.89, prod 50.83. Output bitwise = op/current (raw/pair, raw/gates)
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/013/op, rounds/010/op]
+  # 3 rotated sessions (blocked ruler) on fa-g2 (physical GPU 2, idle before 0% / after 2%), each one process with
+  # r13 (incumbent = op/current), r10, g54 (= rounds/014/op), pairbar (the null-check probe) and champ2 (byte copy of
+  # op/current, A/A) in rotated order; beat alone in its own process afterwards. Figures = mean of the 3 session medians.
+  # Other users' processes were active on GPUs 0 and 3 during the run (shared board power). raw: rounds/014/1-opt/raw/measure
+  shapes:
+    - name: fast
+      this_round_tflops: 163.26
+      best_round_tflops: 163.59
+      beat_tflops: 156.67
+      target_tflops: 156.67
+      champion_round: 13
+      champion_tflops: 163.59
+      champion_rebuilt: true
+      ratio: 1.0
+      vs_champion: 0.9980         # m32x2 path untouched; inside A/A (champ2/r13 0.994-1.000)
+    - name: proxy
+      this_round_tflops: 1535.20
+      best_round_tflops: 1623.59
+      beat_tflops: 1497.88        # own process this session; r13's session read 1582.50 and validation's in-process beat 1678.48
+      target_tflops: 1497.88
+      champion_round: 10
+      champion_tflops: 1623.59
+      champion_rebuilt: true
+      ratio: 1.0
+      vs_champion: 0.9456         # REAL loss: g54/r13 0.948/0.950/0.945 in all 3 sessions, A/A 1.002-1.009. Stays >= target only because beat read low
+    - name: prod
+      this_round_tflops: 1509.65
+      best_round_tflops: 1500.53
+      beat_tflops: 1561.58
+      target_tflops: 1561.58
+      champion_round: 13
+      champion_tflops: 1500.53
+      champion_rebuilt: true
+      ratio: 0.9667
+      vs_champion: 1.0061         # g54/r13 1.0057/1.0083/1.0042, A/A 0.999-1.001; route gate is x1.02
+  score: 0.9889                   # capped mean; r13 re-measured 0.9870, champ2 0.9869
+
+validation:
+  exit_code: 2                    # every correctness row PASS at 49.0 dB, determinism 200/200; fails only the speed bar (geomean vs in-process beat 0.9639: fast 1.0434, proxy 0.8786, prod 0.9769)
+
+explored:
+  ran:
+    - "null-check probe arm (pairbar: cluster=(2,1,1) + paired LPT + per-tile cluster_barrier, loads unchanged) in the same 3 sessions: prod x0.983, proxy x0.950 vs r13 -> route row 4's <= 1% probe gate FAILS"
+    - "toy-first bitwise check in its own process (AMD_SERIALIZE_KERNEL=3), then 8 impl cases incl. proxy/prod, vs op/current (raw/pair): caught build failure 1"
+    - "per-arm ISA dump + llvm-mc: 0 spill, VGPR 454 (same as champ2), code 31 596 B < 32 640; workgroup_mask=3 present in 4 TDM descriptors (0x7510003/0xf510003)"
+    - "22-case armcheck and verify_r6 adversarial suite with BOTH arms forced through m32x8 (so the pair kernel runs): bitwise, G54_CHECK PASS"
+  consulted:
+    - optimization/techniques/6-gfx1250-cdna5-mechanisms.md
+    - backends/hipkittens/gemm/recipes/bf16_gfx1250_ladder.md
+    - arch/gfx1250/gfx1250.md
+    - arch/gfx1250/profiling-surface.md
+    - backends/flydsl/attention/README.md
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+    - optimization/routes/1-metrics-to-techniques.md
+    # outside knowledge/: FlyDSL tests/unit/test_tdm_mcast_add_gfx1250.py and kernels/gemm/gemm_bf16_gfx1250.py (multicast issue semantics)
+  bound: power
+  confidence: low
+  why: "prod's measured cost is K/V fetch past L2 (g52 l2hit x1.064). Merging the pair's K/V fetch gives x1.023 over the probe, but the pairing and cluster barrier cost 1.7% on prod and 5% on proxy. What remains at prod is not a fetch count one lever removes; on a card VR-throttled to ~1100 MHz under load the clock term is the leading candidate (unmeasured this round)"
+
+arms:
+  - id: r14.i3.g54
+    built: "pair + cluster barrier + TDM multicast (both WGs issue each shared K/V tile with workgroup_mask=3), from op/current"
+    tflops: {fast: 163.26, proxy: 1535.20, prod: 1509.65}
+    vs_champion: 1.0061           # prod
+    shipped: true                 # left in the working copy as measured; fails route row 4's gates
+  - id: r14.i3.g54-probe
+    built: "null check: same tree, PAIR_MCAST=False (cluster launch + paired LPT + cluster barriers, loads unchanged)"
+    tflops: {fast: 163.09, proxy: 1537.62, prod: 1475.25}
+    vs_champion: 0.9831           # prod
+    shipped: false
+    note: "route gate <= 1% prod cost: FAILS (x0.983). Built together with g54 before its number existed, to save card startups; the gate is applied here"
+
+expected: >
+  prod +2..4% if the cluster barrier costs < ~1% per tile (upper bound: g52 halfkv +4%); proxy/fast unchanged;
+  output bitwise = op/current (same math per WG).
+
+added_to_pool: []                 # g52 and g54 were filed in this round's route-design step
+route_updated: true               # route.md: outcome filled on rows 1-14 (row 4 measured, row 5 not executed)
+
+implementation:
+  files_changed: [op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py]
+  build_failures:
+    - attempt: 1
+      error: "multicast arm finite but not bitwise equal to op/current on every paired (even grid x) case, toy and full; odd-grid case and the probe arm bitwise equal (raw/pair/attempt1)"
+      root_cause: "split issue: WG 0 issued K and WG 1 issued V, each with workgroup_mask=3. TDM multicast is a join (every WG named in the mask issues the identical load and the fetch is merged; a WG that does not issue receives nothing), so each WG saw only its own half of K/V. Fixed by having both WGs issue both with the mask (FlyDSL test_tdm_mcast_add / gemm_bf16_gfx1250 pattern; corpus early_timeout text)"

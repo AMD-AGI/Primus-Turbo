@@ -1,0 +1,14 @@
+r19h fast cand=0.0540ms 99.6TF beat=0.0936ms 57.4TF xbeat=1.7350
+r19h proxy cand=0.5838ms 588.7TF beat=0.4601ms 747.0TF xbeat=0.7880
+r19h prod cand=8.5974ms 639.5TF beat=6.7139ms 818.9TF xbeat=0.7809
+current fast cand=0.0547ms 98.2TF beat=0.0928ms 57.9TF xbeat=1.6951
+current proxy cand=0.6015ms 571.3TF beat=0.4621ms 743.8TF xbeat=0.7681
+current prod cand=8.7454ms 628.7TF beat=6.7158ms 818.7TF xbeat=0.7679
+r19h fast cand=0.0540ms 99.6TF beat=0.0936ms 57.4TF xbeat=1.7350
+r19h proxy cand=0.5838ms 588.7TF beat=0.4601ms 747.0TF xbeat=0.7880
+r19h prod cand=8.5974ms 639.5TF beat=6.7139ms 818.9TF xbeat=0.7809
+current fast cand=0.0547ms 98.2TF beat=0.0928ms 57.9TF xbeat=1.6951
+current proxy cand=0.6015ms 571.3TF beat=0.4621ms 743.8TF xbeat=0.7681
+current prod cand=8.7454ms 628.7TF beat=6.7158ms 818.7TF xbeat=0.7679
+current geomean xbeat = 0.9999
+r19h geomean xbeat = 1.0221

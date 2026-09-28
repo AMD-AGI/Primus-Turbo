@@ -1,0 +1,6 @@
+ii_real_blk L00 | p1 0.8571 1.2638 1.0832 | p2 0.8571 1.2654 1.0846 | p3 0.8548 1.2648 1.0811
+ii_real_blk L01 | p1 0.8694 1.2495 1.0864 | p2 0.8720 1.2420 1.0831 | p3 0.8648 1.2529 1.0834
+ii_real_blk L02 | p1 0.8834 1.2151 1.0734 | p2 0.8849 1.2129 1.0733 | p3 0.8817 1.2182 1.0741
+ii_real_blk L08i_randn_blk r13 latency_ms=1.47952 latency_ms=1.4799 latency_ms=1.47958
+i_randn_blk r13ns latency_ms=1.5515 latency_ms=1.55116 latency_ms=1.55074
+i_randn_blk asm latency_ms=1.4317 latency_ms=1.43355 latency_ms=1.43631

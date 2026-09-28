@@ -1,0 +1,90 @@
+# per (cond,set): median_ms per arm, 3 processes (p1/p2/p3)
+blk L00 asm  1.4640 1.4657 1.4690
+blk L00 r13  1.8525 1.8525 1.8579
+blk L00 r13ns  1.5878 1.5877 1.5880
+blk L01 asm  1.4289 1.4269 1.4252
+blk L01 r13  1.7747 1.7829 1.7856
+blk L01 r13ns  1.5476 1.5501 1.5441
+blk L02 asm  1.4722 1.4701 1.4708
+blk L02 r13  1.7856 1.7863 1.7917
+blk L02 r13ns  1.5801 1.5779 1.5797
+blk L08 asm  1.4198 1.4233 1.4225
+blk L08 r13  1.8225 1.8243 1.8312
+blk L08 r13ns  1.5519 1.5530 1.5494
+blk L16 asm  1.4584 1.4590 1.4603
+blk L16 r13  1.7085 1.7123 1.7093
+blk L16 r13ns  1.5706 1.5731 1.5680
+blk L31 asm  1.4340 1.4337 1.4301
+blk L31 r13  1.7799 1.7844 1.7895
+blk L31 r13ns  1.5589 1.5615 1.5598
+blk randn asm  1.4318 1.4359 1.4393
+blk randn r13  1.4798 1.4802 1.4800
+blk randn r13ns  1.5513 1.5486 1.5517
+gb L00 asm  1.2904 1.2868 1.3003
+gb L00 r13  2.0004 2.0024 2.0051
+gb L00 r13ns  1.6379 1.6341 1.6369
+gb L01 asm  1.2733 1.2764 1.2791
+gb L01 r13  2.0086 2.0091 2.0029
+gb L01 r13ns  1.6313 1.6209 1.6277
+gb L02 asm  1.2891 1.2954 1.2952
+gb L02 r13  1.9797 1.9727 1.9772
+gb L02 r13ns  1.6353 1.6261 1.6230
+gb L08 asm  1.2687 1.2695 1.2734
+gb L08 r13  2.1040 2.1064 2.1083
+gb L08 r13ns  1.6341 1.6349 1.6316
+gb L16 asm  1.2833 1.2880 1.2924
+gb L16 r13  1.8553 1.8501 1.8548
+gb L16 r13ns  1.6280 1.6277 1.6272
+gb L31 asm  1.2743 1.2789 1.2798
+gb L31 r13  2.0044 2.0047 2.0039
+gb L31 r13ns  1.6371 1.6293 1.6268
+gb randn asm  1.2766 1.2795 1.2837
+gb randn r13  1.5193 1.5120 1.5218
+gb randn r13ns  1.6027 1.6097 1.6094
+# randn blocked (job benchmark.py) latency_ms p1/p2/p3
+blk-bench randn r13 1.47958 1.4799 1.47952
+blk-bench randn r13ns 1.5515 1.55074 1.55116
+blk-bench randn asm 1.43631 1.43355 1.4317
+# ratios (per process)
+RATIO cond=blk set=L00 order=r13ns,asm,r13 r13ns/r13=0.8571 r13/asm=1.2654 r13ns/asm=1.0846
+RATIO cond=blk set=L01 order=r13ns,asm,r13 r13ns/r13=0.8720 r13/asm=1.2420 r13ns/asm=1.0831
+RATIO cond=blk set=L02 order=r13ns,asm,r13 r13ns/r13=0.8849 r13/asm=1.2129 r13ns/asm=1.0733
+RATIO cond=blk set=L08 order=r13ns,asm,r13 r13ns/r13=0.8515 r13/asm=1.2836 r13ns/asm=1.0930
+RATIO cond=blk set=L16 order=r13ns,asm,r13 r13ns/r13=0.9193 r13/asm=1.1714 r13ns/asm=1.0769
+RATIO cond=blk set=L31 order=r13ns,asm,r13 r13ns/r13=0.8758 r13/asm=1.2412 r13ns/asm=1.0870
+RATIO cond=blk set=randn order=r13ns,asm,r13 r13ns/r13=1.0484 r13/asm=1.0335 r13ns/asm=1.0835
+RATIO cond=blk set=L00 order=asm,r13,r13ns r13ns/r13=0.8548 r13/asm=1.2648 r13ns/asm=1.0811
+RATIO cond=blk set=L01 order=asm,r13,r13ns r13ns/r13=0.8648 r13/asm=1.2529 r13ns/asm=1.0834
+RATIO cond=blk set=L02 order=asm,r13,r13ns r13ns/r13=0.8817 r13/asm=1.2182 r13ns/asm=1.0741
+RATIO cond=blk set=L08 order=asm,r13,r13ns r13ns/r13=0.8461 r13/asm=1.2873 r13ns/asm=1.0892
+RATIO cond=blk set=L16 order=asm,r13,r13ns r13ns/r13=0.9173 r13/asm=1.1705 r13ns/asm=1.0737
+RATIO cond=blk set=L31 order=asm,r13,r13ns r13ns/r13=0.8716 r13/asm=1.2513 r13ns/asm=1.0907
+RATIO cond=blk set=randn order=asm,r13,r13ns r13ns/r13=1.0485 r13/asm=1.0283 r13ns/asm=1.0781
+RATIO cond=blk set=L00 order=r13,r13ns,asm r13ns/r13=0.8571 r13/asm=1.2638 r13ns/asm=1.0832
+RATIO cond=blk set=L01 order=r13,r13ns,asm r13ns/r13=0.8694 r13/asm=1.2495 r13ns/asm=1.0864
+RATIO cond=blk set=L02 order=r13,r13ns,asm r13ns/r13=0.8834 r13/asm=1.2151 r13ns/asm=1.0734
+RATIO cond=blk set=L08 order=r13,r13ns,asm r13ns/r13=0.8513 r13/asm=1.2817 r13ns/asm=1.0911
+RATIO cond=blk set=L16 order=r13,r13ns,asm r13ns/r13=0.9187 r13/asm=1.1736 r13ns/asm=1.0782
+RATIO cond=blk set=L31 order=r13,r13ns,asm r13ns/r13=0.8751 r13/asm=1.2446 r13ns/asm=1.0891
+RATIO cond=blk set=randn order=r13,r13ns,asm r13ns/r13=1.0463 r13/asm=1.0308 r13ns/asm=1.0785
+RATIO cond=gb set=L00 order=r13,r13ns,asm r13ns/r13=0.8188 r13/asm=1.5502 r13ns/asm=1.2693
+RATIO cond=gb set=L01 order=r13,r13ns,asm r13ns/r13=0.8122 r13/asm=1.5775 r13ns/asm=1.2812
+RATIO cond=gb set=L02 order=r13,r13ns,asm r13ns/r13=0.8260 r13/asm=1.5357 r13ns/asm=1.2685
+RATIO cond=gb set=L08 order=r13,r13ns,asm r13ns/r13=0.7767 r13/asm=1.6583 r13ns/asm=1.2880
+RATIO cond=gb set=L16 order=r13,r13ns,asm r13ns/r13=0.8775 r13/asm=1.4458 r13ns/asm=1.2686
+RATIO cond=gb set=L31 order=r13,r13ns,asm r13ns/r13=0.8167 r13/asm=1.5729 r13ns/asm=1.2847
+RATIO cond=gb set=randn order=r13,r13ns,asm r13ns/r13=1.0549 r13/asm=1.1902 r13ns/asm=1.2555
+RATIO cond=gb set=L00 order=r13ns,asm,r13 r13ns/r13=0.8161 r13/asm=1.5561 r13ns/asm=1.2699
+RATIO cond=gb set=L01 order=r13ns,asm,r13 r13ns/r13=0.8068 r13/asm=1.5741 r13ns/asm=1.2700
+RATIO cond=gb set=L02 order=r13ns,asm,r13 r13ns/r13=0.8243 r13/asm=1.5229 r13ns/asm=1.2553
+RATIO cond=gb set=L08 order=r13ns,asm,r13 r13ns/r13=0.7762 r13/asm=1.6592 r13ns/asm=1.2878
+RATIO cond=gb set=L16 order=r13ns,asm,r13 r13ns/r13=0.8798 r13/asm=1.4363 r13ns/asm=1.2637
+RATIO cond=gb set=L31 order=r13ns,asm,r13 r13ns/r13=0.8127 r13/asm=1.5676 r13ns/asm=1.2740
+RATIO cond=gb set=randn order=r13ns,asm,r13 r13ns/r13=1.0646 r13/asm=1.1817 r13ns/asm=1.2580
+RATIO cond=gb set=L00 order=asm,r13,r13ns r13ns/r13=0.8164 r13/asm=1.5420 r13ns/asm=1.2588
+RATIO cond=gb set=L01 order=asm,r13,r13ns r13ns/r13=0.8127 r13/asm=1.5659 r13ns/asm=1.2726
+RATIO cond=gb set=L02 order=asm,r13,r13ns r13ns/r13=0.8209 r13/asm=1.5266 r13ns/asm=1.2531
+RATIO cond=gb set=L08 order=asm,r13,r13ns r13ns/r13=0.7739 r13/asm=1.6556 r13ns/asm=1.2813
+RATIO cond=gb set=L16 order=asm,r13,r13ns r13ns/r13=0.8773 r13/asm=1.4352 r13ns/asm=1.2591
+RATIO cond=gb set=L31 order=asm,r13,r13ns r13ns/r13=0.8118 r13/asm=1.5659 r13ns/asm=1.2712
+RATIO cond=gb set=randn order=asm,r13,r13ns r13ns/r13=1.0575 r13/asm=1.1855 r13ns/asm=1.2537

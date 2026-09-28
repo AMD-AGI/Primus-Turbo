@@ -1,0 +1,26 @@
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+CORR shape=proxy arm=r19h dq  52.52 dB  dk  52.57 dB  dv  52.67 dB  pass
+DET shape=proxy arm=r19h runs=100 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=proxy arm=n1 dq  52.52 dB  dk  52.57 dB  dv  52.67 dB  pass
+DET shape=proxy arm=n1 runs=100 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=proxy n1 vs r19h: dq=bitwise dk=bitwise dv=bitwise
+CORR shape=proxy arm=g4 dq  52.52 dB  dk  52.57 dB  dv  52.67 dB  pass
+DET shape=proxy arm=g4 runs=100 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=proxy g4 vs r19h: dq=bitwise dk=bitwise dv=bitwise
+CORR shape=proxy arm=g2 dq  52.52 dB  dk  52.57 dB  dv  52.67 dB  pass
+DET shape=proxy arm=g2 runs=100 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=proxy g2 vs r19h: dq=bitwise dk=bitwise dv=bitwise
+CORR shape=proxy arm=o1 dq  52.52 dB  dk  52.57 dB  dv  52.67 dB  pass
+DET shape=proxy arm=o1 runs=100 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=proxy o1 vs r19h: dq=bitwise dk=bitwise dv=bitwise
+CORR shape=proxy arm=g4o dq  52.52 dB  dk  52.57 dB  dv  52.67 dB  pass
+DET shape=proxy arm=g4o runs=100 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=proxy g4o vs r19h: dq=bitwise dk=bitwise dv=bitwise
+CORR shape=proxy arm=n1d dq  52.52 dB  dk  52.57 dB  dv  52.67 dB  pass
+DET shape=proxy arm=n1d runs=100 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=proxy n1d vs r19h: dq=98.9dB dk=94.4dB dv=bitwise
+CORR shape=proxy arm=g4d dq  52.52 dB  dk  52.57 dB  dv  52.67 dB  pass
+DET shape=proxy arm=g4d runs=100 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=proxy g4d vs r19h: dq=98.9dB dk=94.4dB dv=bitwise
+LABVAL proxy PASS
+rc=0

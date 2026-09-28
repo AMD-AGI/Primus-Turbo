@@ -1,0 +1,17 @@
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+CORR shape=proxy arm=r19h dq  52.52 dB  dk  52.57 dB  dv  52.67 dB  pass
+DET shape=proxy arm=r19h runs=100 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=proxy arm=q1 dq  52.54 dB  dk  52.57 dB  dv  52.67 dB  pass
+DET shape=proxy arm=q1 runs=100 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=proxy q1 vs r19h: dq=49.8dB dk=bitwise dv=bitwise
+CORR shape=proxy arm=k1 dq  52.52 dB  dk  52.58 dB  dv  52.67 dB  pass
+DET shape=proxy arm=k1 runs=100 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=proxy k1 vs r19h: dq=bitwise dk=50.0dB dv=76.0dB
+CORR shape=proxy arm=kq1 dq  52.54 dB  dk  52.58 dB  dv  52.67 dB  pass
+DET shape=proxy arm=kq1 runs=100 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=proxy kq1 vs r19h: dq=49.8dB dk=50.0dB dv=76.0dB
+CORR shape=proxy arm=kq1d dq  52.54 dB  dk  52.58 dB  dv  52.67 dB  pass
+DET shape=proxy arm=kq1d runs=100 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=proxy kq1d vs r19h: dq=49.8dB dk=50.0dB dv=76.0dB
+LABVAL proxy PASS
+rc=0

@@ -1,0 +1,15 @@
+fast beat n=1 mean_ms=0.089 mean_TF=60.4
+fast current n=6 mean_ms=0.054 mean_TF=99.5
+fast current_copy n=6 mean_ms=0.054 mean_TF=99.9
+fast r019 n=6 mean_ms=0.053 mean_TF=101.3
+fast r19h n=6 mean_ms=0.053 mean_TF=101.1
+proxy beat n=1 mean_ms=0.459 mean_TF=748
+proxy current n=3 mean_ms=0.599 mean_TF=574.1
+proxy current_copy n=3 mean_ms=0.597 mean_TF=575.7
+proxy r019 n=3 mean_ms=0.58 mean_TF=592.3
+proxy r19h n=3 mean_ms=0.582 mean_TF=590.1
+prod beat n=1 mean_ms=6.722 mean_TF=818
+prod current n=3 mean_ms=8.739 mean_TF=629.2
+prod current_copy n=3 mean_ms=8.741 mean_TF=629
+prod r019 n=3 mean_ms=8.588 mean_TF=640.2
+prod r19h n=3 mean_ms=8.588 mean_TF=640.2

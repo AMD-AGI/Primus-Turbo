@@ -1,0 +1,36 @@
+[
+  {
+    "shape": "proxy",
+    "arm": "candidate",
+    "stat": "median",
+    "iters": 54,
+    "latency_ms": 0.5838339924812317,
+    "min_ms": 0.5698930025100708,
+    "max_ms": 0.5996580123901367,
+    "tflops": 588.6626578548322,
+    "bw_gbs": 287.36278147660835,
+    "flop": 343681269760.0,
+    "bytes_min": 167772160,
+    "sclk_start": 1896,
+    "sclk_end": 1939,
+    "causal": true,
+    "order": "blocked9+lead4"
+  },
+  {
+    "shape": "proxy",
+    "arm": "beat",
+    "stat": "median",
+    "iters": 54,
+    "latency_ms": 0.4600889980792999,
+    "min_ms": 0.43677398562431335,
+    "max_ms": 0.5075600147247314,
+    "tflops": 746.9886721802548,
+    "bw_gbs": 364.65153633402724,
+    "flop": 343681269760.0,
+    "bytes_min": 167772160,
+    "sclk_start": 1896,
+    "sclk_end": 1939,
+    "causal": true,
+    "order": "blocked9+lead4"
+  }
+]

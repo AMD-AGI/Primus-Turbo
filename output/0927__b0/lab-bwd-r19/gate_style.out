@@ -1,0 +1,18 @@
+g_fast_r19h rc=0 newdmesg=0 bad=0
+  candidate 0.053961001336574554 sclk 2331-2327 blocked9+lead4
+  beat 0.09362049773335457 sclk 2331-2327 blocked9+lead4
+g_fast_current rc=0 newdmesg=0 bad=0
+  candidate 0.054721999913454056 sclk 2330-2326 blocked9+lead4
+  beat 0.09275900200009346 sclk 2330-2326 blocked9+lead4
+g_proxy_r19h rc=0 newdmesg=0 bad=0
+  candidate 0.5838339924812317 sclk 1896-1939 blocked9+lead4
+  beat 0.4600889980792999 sclk 1896-1939 blocked9+lead4
+g_proxy_current rc=0 newdmesg=0 bad=0
+  candidate 0.6015399992465973 sclk 1893-1939 blocked9+lead4
+  beat 0.4620715081691742 sclk 1893-1939 blocked9+lead4
+g_prod_r19h rc=0 newdmesg=0 bad=0
+  candidate 8.597358226776123 sclk 1766-1814 blocked9+lead4
+  beat 6.713857173919678 sclk 1766-1814 blocked9+lead4
+g_prod_current rc=0 newdmesg=0 bad=0
+  candidate 8.745402336120605 sclk 1760-1791 blocked9+lead4
+  beat 6.715802431106567 sclk 1760-1791 blocked9+lead4

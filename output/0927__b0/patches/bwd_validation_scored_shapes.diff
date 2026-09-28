@@ -1,0 +1,19 @@
+--- /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/validation.py.bak.pre-scored-shapes	2026-09-28 06:41:01.240408623 +0000
++++ /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/validation.py	2026-09-28 06:41:01.246413381 +0000
+@@ -306,8 +306,14 @@
+                   f"{b['latency_ms']:10.4f} {b['tflops']:8.1f} {r:8.3f}")
+         if ratios:
+             geo = math.exp(sum(math.log(r) for r in ratios) / len(ratios))
+-            fast_enough = geo >= 1.0 + BEAT_MARGIN / 100
+-            print(f"  geomean over {len(ratios)} shapes (op.shape.mode=sweep): {geo:.3f}x beat")
++            # B0 operator 2026-09-28 (user-approved): the geomean let the launch-bound `fast` shape (where the
++            # ASM bar is itself slow, ~1.66x) hide prod/proxy at ~0.78x and ended the job as "target met". The
++            # target is now: every SCORED shape (proxy, prod) at or above the bar; fast is reported only.
++            scored = [r for name, r in zip(shapes, ratios) if name in ("proxy", "prod")]
++            fast_enough = bool(scored) and min(scored) >= 1.0 + BEAT_MARGIN / 100
++            print(f"  geomean over {len(ratios)} shapes (op.shape.mode=sweep): {geo:.3f}x beat (reported only)")
++            print(f"  target: proxy and prod each >= {1.0 + BEAT_MARGIN / 100:.2f}x beat -> "
++                  f"min {min(scored) if scored else float('nan'):.3f}x")
+ 
+     print()
+     print(f"  correctness  {'pass' if correct else 'FAIL'}")

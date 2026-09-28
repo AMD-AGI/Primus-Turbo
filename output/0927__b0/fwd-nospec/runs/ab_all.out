@@ -1,0 +1,28 @@
+[06:17:09] i_randn_blk_p1 waiting for lock
+[06:18:21] i_randn_blk_p1 rc=0
+dmesg clean
+[06:18:21] ii_real_blk_p1 waiting for lock
+[06:19:42] ii_real_blk_p1 rc=0
+dmesg clean
+[06:19:42] iii_real_gb_p1 waiting for lock
+[06:21:09] iii_real_gb_p1 rc=0
+dmesg clean
+[06:21:10] i_randn_blk_p2 waiting for lock
+[06:22:21] i_randn_blk_p2 rc=0
+dmesg clean
+[06:22:22] ii_real_blk_p2 waiting for lock
+[06:23:42] ii_real_blk_p2 rc=0
+dmesg clean
+[06:23:43] iii_real_gb_p2 waiting for lock
+[06:25:10] iii_real_gb_p2 rc=0
+dmesg clean
+[06:25:10] i_randn_blk_p3 waiting for lock
+[06:26:22] i_randn_blk_p3 rc=0
+dmesg clean
+[06:26:22] ii_real_blk_p3 waiting for lock
+[06:27:43] ii_real_blk_p3 rc=0
+dmesg clean
+[06:27:43] iii_real_gb_p3 waiting for lock
+[06:29:10] iii_real_gb_p3 rc=0
+dmesg clean
+ALL_DONE

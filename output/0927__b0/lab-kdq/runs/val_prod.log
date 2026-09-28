@@ -1,0 +1,23 @@
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+CORR shape=prod arm=r19h dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=r19h runs=50 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=prod arm=g4 dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=g4 runs=50 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=prod g4 vs r19h: dq=bitwise dk=bitwise dv=bitwise
+CORR shape=prod arm=g2 dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=g2 runs=50 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=prod g2 vs r19h: dq=bitwise dk=bitwise dv=bitwise
+CORR shape=prod arm=o1 dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=o1 runs=50 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=prod o1 vs r19h: dq=bitwise dk=bitwise dv=bitwise
+CORR shape=prod arm=g4o dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=g4o runs=50 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=prod g4o vs r19h: dq=bitwise dk=bitwise dv=bitwise
+CORR shape=prod arm=n1d dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=n1d runs=50 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=prod n1d vs r19h: dq=96.1dB dk=92.7dB dv=bitwise
+CORR shape=prod arm=g4d dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=g4d runs=50 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=prod g4d vs r19h: dq=96.1dB dk=92.7dB dv=bitwise
+LABVAL prod PASS
+rc=0

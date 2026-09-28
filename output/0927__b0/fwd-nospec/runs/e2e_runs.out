@@ -1,0 +1,28 @@
+[06:29:23] start ns_p2a_asmfly
+[06:31:30] end ns_p2a_asmfly rc=0
+stats: {'dgrad': 13950, 'wgrad': 13950, 'chunked': 6076, 'miss': 13950, 'checked': 27900, 'syncs': 436, 'scratch_bytes': 603979776}
+nonfinite_events: []
+max_abs_by_tag: {'wgrad.out': '2.875', 'dgrad.out': '0.001038'}
+rc=0 tag=ns_p2a_asmfly log=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/logs/e2e.ns_p2a_asmfly.log nan_steps=0
+[06:31:30] start ns_p2b_flyasm
+[06:33:37] end ns_p2b_flyasm rc=0
+stats: {'dgrad': 13950, 'wgrad': 13950, 'chunked': 6076, 'miss': 13950, 'checked': 27900, 'syncs': 436, 'scratch_bytes': 603979776}
+nonfinite_events: []
+max_abs_by_tag: {'wgrad.out': '2.875', 'dgrad.out': '0.001427'}
+rc=0 tag=ns_p2b_flyasm log=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/logs/e2e.ns_p2b_flyasm.log nan_steps=0
+[06:33:37] start r13_p2a_asmfly
+[06:35:44] end r13_p2a_asmfly rc=0
+stats: {'dgrad': 13950, 'wgrad': 13950, 'chunked': 6076, 'miss': 13950, 'checked': 27900, 'syncs': 436, 'scratch_bytes': 603979776}
+nonfinite_events: []
+max_abs_by_tag: {'wgrad.out': '2.875', 'dgrad.out': '0.001038'}
+rc=0 tag=r13_p2a_asmfly log=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/logs/e2e.r13_p2a_asmfly.log nan_steps=0
+E2E_ALL_DONE
+[06:35:47] start r13_p2b_flyasm
+[06:37:55] end r13_p2b_flyasm rc=0
+max_abs_by_tag: {'wgrad.out': '2.875', 'dgrad.out': '0.001038'}
+rc=0 tag=r13_p2b_flyasm log=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/logs/e2e.r13_p2b_flyasm.log nan_steps=0
+[06:37:55] start nsr13_p2c
+[06:40:07] end nsr13_p2c rc=0
+max_abs_by_tag: {'wgrad.out': '2.875', 'dgrad.out': '0.001038'}
+rc=0 tag=nsr13_p2c log=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/logs/e2e.nsr13_p2c.log nan_steps=0
+E2E2_ALL_DONE

@@ -35,6 +35,8 @@ the head of a round, so direction can be changed here **without stopping the job
 | h65 | must standing | DAY 2 CARD MOVE: this job now runs on PHYSICAL GPU 3 via container fa-g3 ONLY (overrides h62 GPU 1 / fa-g1) | open |
 | h66 | must standing note | RULER: benchmark.py now times BLOCKED (lead 4 + block 9 per arm); interleaving biased FlyDSL-vs-ASM ~3.4% (old x-beat ratios ~3% too low), FlyDSL-vs-FlyDSL within 0.4% | open |
 | h67 | must note | Round 19 is 1.7% FASTER than champion r20 at prod (blocked, 3 rotated processes, spread 0.14%): re-decide the champion on all three shapes; build r19 + the h33 clamps as an arm | open |
+| h68 | must refactor | Adopt r19h verbatim as op/current (r19 + the three h33 clamps): vs r20 prod -1.72%, proxy -2.7%, fast -1.5% time (blocked, rotated, A/A +-0.07%), output bitwise = r19 | open |
+| h69 | must standing note | Target redefined (user-approved): speed passes only when proxy AND prod are each >= beat; fast is reported only (the geomean ended the job at prod 0.78x). refcache provenance refreshed -- the gate no longer recomputes the fp32 reference on the card | open |
 
 ---
 
@@ -4507,3 +4509,25 @@ three shapes; prod is the shape that matters end to end (the e2e training shape 
 2. build arm `r19h` = rounds/019/op + the three h33 clamps (the form shipped in round 24's tree) and measure it the same
    way (correctness gate + determinism as usual);
 3. ship r19h if it clears min_gain on the throughput-weighted comparison without breaking the band on fast/proxy.
+
+## h68 -- Adopt r19h verbatim as op/current
+
+Operator lab on GPU 3, 2026-09-28 (`PT/output/0927__b0/lab-bwd-r19/REPORT.md`). r19h = rounds/019/op + the three h33
+clamps in the form shipped by round 24 (a: impl assert `sq % BLOCK_Q`; b: k_dq_sp dq extent Int64; c: `_clampqt` on the
+prologue `_ldqd` and `jj = ii+1` clamped to n-1). Compile-only: 7 kernels 0 spill / 0 scratch, k_dkdv 724 VGPR (r20: 904).
+CPU bounds: r19 had 1,580 OOB prefetches over 9 UT shapes, r19h 0. Correctness at the gate's thresholds: dq/dk/dv
+52.6/52.6/52.7 dB (= r20), dk/dv bitwise x200/x100/x50, output bitwise equal to r19. Timing vs r20 (blocked harness, same
+process, rotated, A/A +-0.07%): prod 0.9838/0.9826/0.9820 (-1.72%), proxy -2.7%, fast -1.5%. The prod champion was
+r19 all along (h67); r20 won only on the old 3-shape geomean.
+
+**Refactor task**: copy `/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-bwd-r19/oe/artifacts/job/job_context/op/r19h/` into the working copy VERBATIM (tree md5 a791a047 per the lab report) -- no edits -- and let
+the correctness gate run. Promotion clears the per-shape champions; the next rounds build on r19h.
+
+## h69 -- Target redefined; refcache refreshed
+
+User-approved operator changes (2026-09-28): (1) `validation.py` speed now passes only when proxy AND prod are each >= the
+in-process beat; fast (launch-bound, where ASM itself is slow) is reported only. Round 27 had ended the job as
+"target_met" at prod 0.78x because fast 1.66x carried the geomean. (2) `refcache/*.pt` provenance `common_sha` updated
+988c14ca -> d441e55a (ut/common.py changed after the build; make_inputs/references did not -- recomputed dB was bitwise equal
+in rounds 24-26); backups in `refcache.bak.pre-sha-update/`. The gate therefore no longer recomputes the fp32 reference on
+the card (the 09-22 power-cycle trigger). Absolute numbers: see h66 (blocked harness).

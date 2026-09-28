@@ -1,0 +1,22 @@
+--- /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/job_context/op/validation.py.bak.pre-scored-shapes	2026-09-28 06:41:13.785297681 +0000
++++ /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/job_context/op/validation.py	2026-09-28 06:41:13.791464926 +0000
+@@ -128,10 +128,16 @@
+               f"sclk {c['sclk_start']}->{c['sclk_end']}  [{c['stat']} of {c['iters']}]", flush=True)
+     if len(ratios) == len(SPEC_SHAPES):
+         gm = math.exp(sum(math.log(x) for x in ratios.values()) / len(ratios))
+-        ok = gm >= bar
+-        print(f"  sweep geomean candidate/beat = {gm:.4f}  bar {bar:.4f}  {'PASS' if ok else 'FAIL'}")
++        # B0 operator 2026-09-28 (user-approved): a launch-bound `fast` shape can carry the geomean over the bar
++        # while the scored shapes are below it (the bwd job ended as "target met" at prod 0.78x). The target is
++        # now every SCORED shape (proxy, prod) at or above the bar; the geomean is reported only.
++        scored = {s: r for s, r in ratios.items() if s in ("proxy", "prod")}
++        ok = bool(scored) and min(scored.values()) >= bar
++        print(f"  sweep geomean candidate/beat = {gm:.4f} (reported only)")
++        print(f"  target: proxy and prod each >= bar {bar:.4f} -> min {min(scored.values()) if scored else float('nan'):.4f}  "
++              f"{'PASS' if ok else 'FAIL'}")
+         if not ok:
+-            failures.append(f"speed: geomean candidate/beat {gm:.4f} < bar {bar:.4f} ("
++            failures.append(f"speed: scored shapes below bar {bar:.4f} ("
+                             + ", ".join(f"{s} {r:.4f}" for s, r in ratios.items()) + ")")
+ 
+     if failures:

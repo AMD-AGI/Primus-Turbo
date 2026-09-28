@@ -1,0 +1,7 @@
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm candidate -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-bwd-r19/oe/artifacts/job/job_context/op/r19h md5=a791a047
+# arm beat -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/lab-bwd-r19/oe/artifacts/job/job_context/op/beat md5=2802a918
+# statistic median  iters 51  warmup 3.0s continuous  order blocked 9+lead 4, palindromic rounds  device gfx1250
+RESULT shape=fast arm=candidate stat=median iters=54 latency_ms=0.053961001336574554 min_ms=0.05243900045752525 max_ms=0.07202799618244171 tflops=99.58955295289445 bw_gbs=194.32107893247698 flop=5373952000.0 bytes_min=10485760 sclk_start=2331 sclk_end=2327 causal=True order=blocked9+lead4
+RESULT shape=fast arm=beat stat=median iters=54 latency_ms=0.09362049773335457 min_ms=0.08961399644613266 max_ms=0.14862200617790222 tflops=57.40144658604394 bw_gbs=112.00282260691499 flop=5373952000.0 bytes_min=10485760 sclk_start=2331 sclk_end=2327 causal=True order=blocked9+lead4
+rc=0
