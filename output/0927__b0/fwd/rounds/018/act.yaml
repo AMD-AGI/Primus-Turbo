@@ -1,0 +1,101 @@
+round: 18
+mode: fast
+candidate: r17.i2.g64             # route row 5 (first idea row); a pool candidate keeps its old id
+outcome: delivered
+
+correctness:
+  unit_tests: pass                # job_context/op/ut/test_correctness.py --impl rounds/018/op: RESULT PASS
+  precision: pass                 # validation.py: every correctness row PASS, det 200/200 (o=9eb9b58556bf lse=bbf23654e600)
+  checked_with: op/validation.py
+  sqnr_db: 49.82                  # min over the gate (short_q full), same as op/current
+
+measurements:
+  benchmark: op/benchmark.py
+  same_session_references: [rounds/016/op, rounds/017/op, job_context/op/current]
+  # 3 rotated sessions (cand r16 r17 cur champ2 | champ2 cand r16 r17 cur | r17 cur champ2 cand r16), one process each,
+  # fresh JIT cache per process, compile cache cleared before the build, no beat in process (h31); champ2 = byte copy of
+  # op/current (A/A: prod 0.998..1.003, proxy 0.988..1.005). fa-g2 idle, 10:17:41Z on. Figures = mean of the 3 session
+  # medians; raw: 1-opt/raw/measure/. beat measured in its own process in the same sweep (raw/measure/beat.txt).
+  shapes:
+    - name: fast
+      this_round_tflops: 164.10
+      best_round_tflops: 164.62
+      beat_tflops: 155.31
+      target_tflops: 155.31
+      champion_round: 16          # rounds/016/op re-measured; op/current 164.94, r17 164.52 (same m32x2 body in all)
+      champion_tflops: 164.62
+      champion_rebuilt: true
+      ratio: 1.0                  # 1.0566 uncapped; above target, stays above it
+      vs_champion: 0.9968         # m32x2 body untouched -> noise (A/A champ2 0.994..1.005)
+    - name: proxy
+      this_round_tflops: 1575.01
+      best_round_tflops: 1571.74
+      beat_tflops: 1602.45        # beat's own process this sweep; validation's in-process beat read 1676.84 (ratio 0.9035)
+      target_tflops: 1602.45
+      champion_round: 17
+      champion_tflops: 1571.74
+      champion_rebuilt: true
+      ratio: 0.9829
+      vs_champion: 1.0021         # vs r16 x1.0064 (sessions 1.0014 1.0091 1.0087)
+    - name: prod
+      this_round_tflops: 1467.80
+      best_round_tflops: 1454.55
+      beat_tflops: 1548.83
+      target_tflops: 1548.83
+      champion_round: 17
+      champion_tflops: 1454.55
+      champion_rebuilt: true
+      ratio: 0.9477
+      vs_champion: 1.0091         # vs r16 x1.0153 (3/3 1.0121..1.0198), vs op/current x1.0178
+  score: 0.9769                   # capped mean; uncapped (fast 1.0566) 0.9957
+
+validation:
+  exit_code: 2                    # all correctness + determinism rows pass; fails only the speed bar (proxy 0.9035, prod 0.9451 vs in-process beat), as op/current does
+
+notes:
+  h47_real_dump_ruler: >
+    prod, 6 real q/k/v dump layers timed right after a 10-GEMM burst (ab.py cond iii), 3 rotated orders, no beat
+    (raw/real/): g64 x1.0019 vs op/current (18 readings 0.9955..1.0091), A/A champ2 x0.9985 (0.9937..1.0014), r16
+    x1.0001; randn under the same condition x1.0136. On real data g64 sits inside the A/A band. It is neutral there,
+    not a loss, and not the >= 2% real-dump win h47 asks for. randn ruler: prod x1.0153 vs r16.
+
+explored:
+  ran:
+    - "compile-only ISA census (VGPR, scratch, instr, wmma/pk_add/permlanex16/v_max/nop/msb/cbranch): g64 4130 -> 4055 instr, 469 VGPR, 0 scratch; the h47 instruction-count target"
+    - "opt ranking, benchmark.py 3 rotated sessions with champ2 A/A: g64 prod x1.018, g65 prod x1.0075 / proxy x0.987 -> shipped g64, skipped the merge"
+    - "pmc GRBM cycles + ticks/ns: g64 cycles -0.5..-1.4% at a flat clock (work cut); g65 +2.5% cycles bought back by +2.5% clock (energy trade) -> g65 routed conditional"
+    - "h47 real-dump-after-GEMM-burst A/B: g64 x1.0019 (inside A/A) vs randn x1.0136 -> the gain is ruler-specific"
+  consulted:
+    - backends/flydsl/attention/README.md
+    - backends/flydsl/attention/techniques.md
+    - arch/gfx1250/isa.md
+    - backends/hipkittens/attention/recipes/gqa_d128.md
+    - optimization/routes/1-metrics-to-techniques.md
+  bound: power
+  confidence: medium
+  why: "prod is power/clock-limited (r15 profile, r17/r18 pmc): g65's prod gain was all clock; g64 cut cycles at a flat clock and converted on randn but not on real dumps after a GEMM burst, where the clock and the rescale rate differ"
+
+arms:
+  - id: r17.i2.g64
+    built: "A alone, from op/current"
+    tflops: {fast: 164.10, proxy: 1575.01, prod: 1467.80}
+    vs_champion: 1.0091
+    shipped: true
+  - id: r18.i1.g65
+    built: "B alone, from op/current -- NOT on top of A (opt ranking only, not in the act sweep)"
+    tflops: {}
+    vs_champion: 1.0075           # opt ranking vs op/current at prod; proxy 0.9871 (3/3 below A/A floor) -> lost
+    shipped: false
+    note: "bitwise = op/current; +2.5..2.8% cycles, +2.1..2.7% clock at prod; merge not built (B lost proxy)"
+
+expected: >
+  A: prod x1.012..1.025 vs cur (between g63's +0.9% and nosum's +3.4%), proxy x1.005..1.02. VGPR +14..16 (<= 472), 0
+  scratch. Could lose if the extra carried tile makes the rescale branch or RA worse (s_set_vgpr_msb / v_nop growth).
+
+added_to_pool: [r18.i1.g65]
+route_updated: true
+
+implementation:
+  files_changed: [op/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py]
+  build_failures:
+    - {attempt: 1, error: "TypeError: list indices must be integers or slices, not ArithValue", root_cause: "opt arm g65 (not shipped): a Python for-loop inside a @flyc.jit branch body is rewritten into scf.for, so the index is an SSA value; fixed by moving the per-row work into a plain helper"}

@@ -21,3 +21,4 @@ Baseline (vendored aiter FlyDSL) on B0: ~1.78 ms / ~1236 TF/s (probe, cross-sess
 | 16 | refactor (h44) | 09-28 08:16 | **promoted** (correct vs eager) | -- | -- | adopt r13ns (SPEC_STALE_MAX=False) | -- | -- | -- | real-data/e2e win; randn ruler reads -4.8% |
 | 16 opt | fast | 09-28 08:21-~09:40 | no | 1448.9 (1.518) randn | r13ns 1443.3 (randn) | +0.4% prod; geomean 1.0018 | 93.1% randn (r13ns reads ~4% lower on randn by design, h44) | 1571.4 / 164.8 | first round on r13ns; arms null |
 | 17 | fast | 09-28 ~09:40-10:15 | no | 1456.9 (1.510) randn | r13ns 1445.4 | +0.8% prod but geomean 1.0032 < 1.007 | 93.8% randn | 1567.5 / 167.0 | see rounds/017/opt.md (pmc probes, fresh JIT cache per process) |
+| 18 | fast | 09-28 09:52-10:38 | no | 1467.8 (1.498) randn | r13ns 1454.6 | randn prod +0.9%, geomean 1.0027; **real-dump ruler (h47) +0.2% (A/A band)** | 94.8% randn | 1575.0 / 164.1 | g64 row-sum restructure: randn-only gain; first round reporting both rulers |
