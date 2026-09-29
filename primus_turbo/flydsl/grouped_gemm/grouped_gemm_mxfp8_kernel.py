@@ -689,12 +689,18 @@ _GNT_FUSED_CACHE: dict = {}  # (K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, 
 _GNT_WS_CACHE: dict = {}  # (M_pad, N, K128, G, device, stream) -> (a_sp, b_sp, a_blocks, a_ngrp)
 
 # fwd/dgrad NT autotune. The launch is M-generic (M is a runtime arg), so the config race
-# keys on the static shape only (no M_pad) and is reused for every M.
+# keys on the static shape plus a coarse token regime (no M_pad) and is reused for every M
+# in that regime.
 
 # tokens/group points the race times on (geomean). The swizzle is not M-invariant: a single
 # midpoint mis-picks a cfg that wins there but loses at the range ends, so two spread steady
 # points reward range-robust cfgs.
 _GNT_PM_CANON = (2048, 8192)
+# Below this many average padded tokens/group most tile rows are padding and the ranking follows
+# the group-size distribution (tile count per group, tail, occupancy), which no balanced point
+# reproduces: bm=128 loses on balanced 192+ tokens/group yet wins on skewed ~100-token layouts.
+# That regime races on the first call's own layout instead (NT overwrites C, so it is idempotent).
+_GNT_SMALL_M = 1024
 
 
 def _gnt_nt_candidates(N):
@@ -770,16 +776,19 @@ def _gnt_entry(cfg, K, G, N, cbsz, blgp, out_fp16, persistent, tuned=True):
     return Entry(cfg, _get_nt_launch(K, G, N, *cfg, cbsz, blgp, out_fp16, persistent), tuned=tuned)
 
 
-def _gnt_probe(args, K, G, N):
-    """Canonical synthetic tensors: the race needs only the static shape (``args``' b-side)."""
+def _gnt_probe(args, K, G, N, call_point=None):
+    """Canonical synthetic tensors (the race needs only the static shape, ``args``' b-side), or
+    in the small-M regime the call's own ``call_point``."""
+    if call_point is not None:
+        return RealArgs(call_point)
     return Synthetic(lambda: [Point(*_canon_nt_targs(args, K, G, N, pm)) for pm in _GNT_PM_CANON])
 
 
-def _pick_gnt(key, args, K, G, N, cbsz, blgp, out_fp16, persistent):
+def _pick_gnt(key, args, K, G, N, cbsz, blgp, out_fp16, persistent, call_point=None):
     cfgs = _gnt_nt_candidates(N)
     space = staged(Refine(lambda _prev: cfgs, _GNT_RACE), base=cfgs[0])
     build = _GROUPED_GEMM_MXFP8.build(lambda cfg: _gnt_entry(cfg, K, G, N, cbsz, blgp, out_fp16, persistent))
-    res = _GROUPED_GEMM_MXFP8.pick(key, space, probe=_gnt_probe(args, K, G, N), build=build)
+    res = _GROUPED_GEMM_MXFP8.pick(key, space, probe=_gnt_probe(args, K, G, N, call_point), build=build)
     return build.winner(res)
 
 
@@ -937,10 +946,18 @@ def grouped_gemm_mxfp8_flydsl_kernel(
             stream,
         )
 
-    key = (N, K, G, cbsz, blgp, out_fp16, persistent)
-    entry = _GROUPED_GEMM_MXFP8.entry(
-        key, lambda: _pick_gnt(key, _args(0), K, G, N, cbsz, blgp, out_fp16, persistent)
-    )
+    small_m = M_pad < _GNT_SMALL_M * G
+    key = (N, K, G, cbsz, blgp, out_fp16, persistent, small_m)
+
+    def _make():
+        # small M races on this call, with the grid sized for the smallest candidate tile
+        call_point = None
+        if small_m:
+            min_bm = min(c[0] for c in _gnt_nt_candidates(N))
+            call_point = Point(_args(((M_pad + min_bm - 1) // min_bm + G) * n_blocks), out)
+        return _pick_gnt(key, _args(0), K, G, N, cbsz, blgp, out_fp16, persistent, call_point)
+
+    entry = _GROUPED_GEMM_MXFP8.entry(key, _make)
     # The device-side tile count sums ceildiv(tight length, bm) over the groups, so the
     # grid has to follow the chosen bm or the trailing tiles never launch.
     bm = entry.config[0]
