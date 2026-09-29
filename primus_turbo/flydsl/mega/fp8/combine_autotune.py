@@ -51,7 +51,13 @@ from collections import defaultdict
 
 import torch
 
-__all__ = ["choose_combine_cu", "observe_combine_cu", "autotune_enabled", "tuning_report"]
+__all__ = [
+    "choose_combine_cu",
+    "locked_combine_cu",
+    "observe_combine_cu",
+    "autotune_enabled",
+    "tuning_report",
+]
 
 
 def _env_int_list(name, default):
@@ -155,6 +161,21 @@ def choose_combine_cu(key, *, group=None, default=None):
     # Schedule exhausted -- wait out the last few launches, then commit.
     _drain(st, block=True)
     return _decide(key, st, group)
+
+
+def locked_combine_cu(key, *, default=None):
+    """The winner for ``key`` if tuning has locked one, else ``default``; never advances tuning.
+
+    This is the choice for a call inside CUDA graph capture. Tuning brackets each call with timing
+    events and finally syncs and all-reduces, and none of that may enter a graph -- an event pair
+    recorded during capture fails with ``invalid resource handle`` when a later call reads it. So a
+    captured call takes what eager calls have already settled on, which is the winner when the
+    capture follows eager warmup, as ``make_graphed_callables`` does.
+    """
+    if not _ENABLED:
+        return default
+    st = _STATE.get(key)
+    return default if st is None or st.winner is None else st.winner
 
 
 def observe_combine_cu(key, cu, ev_start, ev_end):

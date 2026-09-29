@@ -60,6 +60,7 @@ from flydsl.expr.typing import Vector as Vec
 from primus_turbo.flydsl.mega.fp8.combine_autotune import (
     autotune_enabled,
     choose_combine_cu,
+    locked_combine_cu,
     observe_combine_cu,
 )
 from primus_turbo.flydsl.mega.fp8.dispatch_grouped_gemm_mxfp8_kernel import (
@@ -1049,9 +1050,12 @@ def _launch_maybe_tuned(key, num_combine_cu, fallback, group, launch):
     ``num_combine_cu`` not None is an explicit pin: it is honoured as given and nothing is measured,
     so a caller that knows its shape keeps full control. Otherwise the tuner names the candidate and
     gets the event pair back. The events are read on a later call, never here -- this is on the
-    training critical path and must not sync."""
+    training critical path and must not sync. Under CUDA graph capture nothing is measured and the
+    graph takes the locked winner, or ``fallback`` if tuning has not finished (``locked_combine_cu``)."""
     if num_combine_cu is not None:
         return launch(int(num_combine_cu))
+    if torch.cuda.is_current_stream_capturing():
+        return launch(int(locked_combine_cu(key, default=fallback)))
     cu = choose_combine_cu(key, group=group, default=fallback)
     if not autotune_enabled():
         return launch(int(cu))
