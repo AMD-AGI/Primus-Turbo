@@ -241,6 +241,12 @@ enum class MXFP6Prologue {
     //
     // Appended rather than inserted: the mode is an integer on the Python side.
     LnModulate,
+    // AdaLN's gate, for the gradient a DiT block's gated residual hands its projections:
+    // input * gate[b, n], where input is the incoming gradient dy and row m carries batch
+    // m & batch_mask exactly as for LnModulate. Carried in MXFP6GateMulArgs. What the fusion
+    // removes is the elementwise kernel that materialised gate * dy only to be packed.
+    // Appended, like LnModulate: the mode is an integer on the Python side.
+    GateMul,
 };
 
 // Operands for MXFP6Prologue::QkNormRopeBackward.
@@ -291,6 +297,18 @@ template <typename DType> struct MXFP6QkNormRopeArgs {
 template <typename DType> struct MXFP6LnModulateArgs {
     const float *mean, *rstd;
     const DType *scale, *shift;
+    int32_t      batch_mask;
+};
+
+// Operands for MXFP6Prologue::GateMul, in the same 2D view as MXFP6LnModulateArgs:
+//
+//   gate         [B, N]   the per-batch gate, contiguous. Row m multiplies by row
+//                         m & batch_mask, and B must be a power of two, for the same reason.
+//
+// The product is formed in fp32 and rounded once to DType, which is what the elementwise
+// kernel it replaces stored.
+template <typename DType> struct MXFP6GateMulArgs {
+    const DType *gate;
     int32_t      batch_mask;
 };
 
@@ -377,6 +395,15 @@ void quantize_mxfp6_ln_modulate_impl(const DType *input, const MXFP6LnModulateAr
                                      uint8_t *row_packed, uint8_t *row_scale, uint8_t *col_packed,
                                      uint8_t *col_scale, float *col_sum, const int M, const int N,
                                      hipStream_t stream);
+
+// As above for MXFP6Prologue::GateMul. B must be a power of two (checked at the entry point).
+// N has no multiple-of-256 requirement: the prologue maps a zero input to zero, so padded
+// columns stage as zero on their own, as for the bias/GELU prologues.
+template <typename DType>
+void quantize_mxfp6_gate_mul_impl(const DType *input, const MXFP6GateMulArgs<DType> &args,
+                                  uint8_t *row_packed, uint8_t *row_scale, uint8_t *col_packed,
+                                  uint8_t *col_scale, float *col_sum, const int M, const int N,
+                                  hipStream_t stream);
 
 template <typename DType>
 void quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_output,

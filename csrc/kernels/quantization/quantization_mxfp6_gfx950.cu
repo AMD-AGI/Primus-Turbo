@@ -152,8 +152,10 @@ struct MXFP6NoPrologueArgs {};
 template <typename DType, MXFP6Prologue PROLOGUE>
 using prologue_args_t = std::conditional_t<
     PROLOGUE == MXFP6Prologue::QkNormRopeBackward, MXFP6QkNormRopeArgs<DType>,
-    std::conditional_t<PROLOGUE == MXFP6Prologue::LnModulate, MXFP6LnModulateArgs<DType>,
-                       MXFP6NoPrologueArgs>>;
+    std::conditional_t<
+        PROLOGUE == MXFP6Prologue::LnModulate, MXFP6LnModulateArgs<DType>,
+        std::conditional_t<PROLOGUE == MXFP6Prologue::GateMul, MXFP6GateMulArgs<DType>,
+                           MXFP6NoPrologueArgs>>>;
 
 using packed_fp6x32_t = uint32_t __attribute__((ext_vector_type(6)));
 using uint4_t         = uint32_t __attribute__((ext_vector_type(4)));
@@ -454,6 +456,52 @@ __device__ __forceinline__ void apply_ln_modulate(uint16_t (&staged)[kStageVec],
     }
 }
 
+// AdaLN's gate over one staged vector, in place: the product in fp32, rounded once.
+template <typename DType>
+__device__ __forceinline__ void apply_gate_mul(uint16_t (&staged)[kStageVec],
+                                               const MXFP6GateMulArgs<DType> &args,
+                                               const int32_t global_m, const int32_t global_n,
+                                               const int32_t N) {
+    uint16_t gate_staged[kStageVec];
+    stage_vector(gate_staged, reinterpret_cast<const uint16_t *>(args.gate),
+                 global_m & args.batch_mask, global_n, N);
+#pragma unroll
+    for (int i = 0; i < kStageVec; ++i)
+        staged[i] = from_float<DType>(to_float<DType>(staged[i]) * to_float<DType>(gate_staged[i]));
+}
+
+// The gate prologue over a whole bf16 tile already in LDS, for the async-staged arm. The
+// data movement of gelu_prologue_bf16 (16-byte LDS vectors, v_cvt_pk_bf16_f32) with
+// apply_gate_mul's arithmetic. The gate row changes with the tile row, so it is loaded per
+// pass: 16 bytes from a [B, N] table that stays in cache.
+template <int TILE_N, int LDS_PITCH, int TILE_M_ = TILE_M>
+__device__ __forceinline__ void gate_mul_prologue_bf16(uint16_t (*s_tile)[LDS_PITCH],
+                                                       const MXFP6GateMulArgs<bfloat16> &args,
+                                                       const int tile_m, const int tile_n,
+                                                       const int N) {
+    constexpr int VEC  = kStageVec;
+    constexpr int STEP = THREADS_PER_BLOCK * VEC;
+    static_assert(STEP % TILE_N == 0, "a thread's columns must not move between passes");
+    const int local_n = (threadIdx.x * VEC) % TILE_N;
+    const uint16_t *gate = reinterpret_cast<const uint16_t *>(args.gate);
+
+#pragma unroll
+    for (int base = threadIdx.x * VEC; base < TILE_M_ * TILE_N; base += STEP) {
+        const int local_m = base / TILE_N;
+        uint16_t g16[VEC];
+        stage_vector(g16, gate, (tile_m + local_m) & args.batch_mask, tile_n + local_n, N);
+        const uint32_t *gw = reinterpret_cast<const uint32_t *>(g16);
+        const uint4 in = *reinterpret_cast<const uint4 *>(&s_tile[local_m][local_n]);
+        const uint32_t *w = reinterpret_cast<const uint32_t *>(&in);
+        uint4 out;
+        uint32_t *o = reinterpret_cast<uint32_t *>(&out);
+#pragma unroll
+        for (int j = 0; j < VEC / 2; ++j)
+            o[j] = pack_bf16x2_rne(bf16_lo(w[j]) * bf16_lo(gw[j]), bf16_hi(w[j]) * bf16_hi(gw[j]));
+        *reinterpret_cast<uint4 *>(&s_tile[local_m][local_n]) = out;
+    }
+}
+
 /*
  * Quantize one 32-value group and scatter it into the packed blob.
  *
@@ -745,6 +793,9 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                     if constexpr (PROLOGUE == MXFP6Prologue::LnModulate) {
                         apply_ln_modulate<DType>(staged, pargs, tile_m + local_m,
                                                  tile_n + local_n, N);
+                    } else if constexpr (PROLOGUE == MXFP6Prologue::GateMul) {
+                        apply_gate_mul<DType>(staged, pargs, tile_m + local_m, tile_n + local_n,
+                                              N);
                     } else {
                         if (bias != nullptr)
                             stage_vector(bias_staged, reinterpret_cast<const uint16_t *>(bias), 0,
@@ -906,6 +957,10 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                 gelu_prologue_bf16<PROLOGUE, TILE_N, LDS_PITCH>(
                     s_tile, s_aux, reinterpret_cast<const uint16_t *>(bias), tile_n, N);
                 __syncthreads();
+            } else if constexpr (std::is_same_v<DType, bfloat16> &&
+                                 PROLOGUE == MXFP6Prologue::GateMul) {
+                gate_mul_prologue_bf16<TILE_N, LDS_PITCH>(s_tile, pargs, tile_m, tile_n, N);
+                __syncthreads();
             } else if constexpr (PROLOGUE != MXFP6Prologue::Identity) {
                 constexpr int VEC   = kStageVec;
                 constexpr int ELEMS = TILE_M * TILE_N;
@@ -926,6 +981,9 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                     if constexpr (PROLOGUE == MXFP6Prologue::LnModulate) {
                         apply_ln_modulate<DType>(staged, pargs, tile_m + local_m,
                                                  tile_n + local_n, N);
+                    } else if constexpr (PROLOGUE == MXFP6Prologue::GateMul) {
+                        apply_gate_mul<DType>(staged, pargs, tile_m + local_m, tile_n + local_n,
+                                              N);
                     } else {
                         if (bias != nullptr)
                             stage_vector(bias_staged, reinterpret_cast<const uint16_t *>(bias), 0,
@@ -1089,6 +1147,9 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                         // requires N to be a multiple of 256 so no padded column tile
                         // exists, which is why there is no per-element guard here.
                         apply_ln_modulate<DType>(staged, pargs, global_m, global_n, N);
+                    } else if constexpr (PROLOGUE == MXFP6Prologue::GateMul) {
+                        // Zero in, zero out, so padded columns need no guard.
+                        apply_gate_mul<DType>(staged, pargs, global_m, global_n, N);
                     } else if constexpr (PROLOGUE != MXFP6Prologue::Identity) {
                         // Every operand the prologue reads comes in through stage_vector,
                         // which zero-fills past N. That is what lets the epilogue run
@@ -1410,6 +1471,9 @@ void quantize_mxfp6_fused_impl(const DType *input, const DType *aux, const DType
         // tile width, so the separation is about the signature alone.
         PRIMUS_TURBO_CHECK(false, "LnModulate has its own entry point, not the fused packer");
         break;
+    case MXFP6Prologue::GateMul:
+        PRIMUS_TURBO_CHECK(false, "GateMul has its own entry point, not the fused packer");
+        break;
     }
     PRIMUS_TURBO_CHECK_HIP(hipGetLastError());
 }
@@ -1480,6 +1544,21 @@ void quantize_mxfp6_ln_modulate_impl(const DType *input, const MXFP6LnModulateAr
     PRIMUS_TURBO_CHECK_HIP(hipGetLastError());
 }
 
+template <typename DType>
+void quantize_mxfp6_gate_mul_impl(const DType *input, const MXFP6GateMulArgs<DType> &args,
+                                  uint8_t *row_packed, uint8_t *row_scale, uint8_t *col_packed,
+                                  uint8_t *col_scale, float *col_sum, const int M, const int N,
+                                  hipStream_t stream) {
+    PRIMUS_TURBO_CHECK(args.batch_mask >= 0 && (args.batch_mask & (args.batch_mask + 1)) == 0,
+                       "GateMul needs a power-of-two batch, passed as batch_mask = B - 1");
+    constexpr int kGateMulTileN = 128;
+    const auto [row_nk_pad, col_nk_pad, grid, block] = geometry_for<kGateMulTileN>(M, N);
+    launch_fused<DType, MXFP6Prologue::GateMul, kGateMulTileN>(
+        grid, block, stream, input, nullptr, nullptr, row_packed, row_scale, col_packed, col_scale,
+        col_sum, M, N, row_nk_pad, col_nk_pad, args);
+    PRIMUS_TURBO_CHECK_HIP(hipGetLastError());
+}
+
 template void quantize_mxfp6_impl<bfloat16>(const bfloat16 *, uint8_t *, uint8_t *, uint8_t *,
                                             uint8_t *, const int, const int, const MXFP6Direction,
                                             hipStream_t);
@@ -1516,5 +1595,14 @@ template void quantize_mxfp6_ln_modulate_impl<float16>(const float16 *,
                                                        const MXFP6LnModulateArgs<float16> &,
                                                        uint8_t *, uint8_t *, uint8_t *, uint8_t *,
                                                        float *, const int, const int, hipStream_t);
+
+template void quantize_mxfp6_gate_mul_impl<bfloat16>(const bfloat16 *,
+                                                     const MXFP6GateMulArgs<bfloat16> &, uint8_t *,
+                                                     uint8_t *, uint8_t *, uint8_t *, float *,
+                                                     const int, const int, hipStream_t);
+template void quantize_mxfp6_gate_mul_impl<float16>(const float16 *,
+                                                    const MXFP6GateMulArgs<float16> &, uint8_t *,
+                                                    uint8_t *, uint8_t *, uint8_t *, float *,
+                                                    const int, const int, hipStream_t);
 
 } // namespace primus_turbo

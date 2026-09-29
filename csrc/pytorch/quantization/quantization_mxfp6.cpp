@@ -380,6 +380,56 @@ std::vector<at::Tensor> run_ln_modulate(const at::Tensor &input, const at::Tenso
     return {row_p, row_s, col_p, col_s, col_sum};
 }
 
+std::vector<at::Tensor> run_gate_mul(const at::Tensor &input, const at::Tensor &gate,
+                                     const bool want_col_sum) {
+    check_input(input);
+    const c10::DeviceGuard device_guard(input.device());
+    const int64_t          M = input.size(0);
+    const int64_t          N = input.size(1);
+
+    // B from the gate's leading axis, as run_ln_modulate takes it from scale's.
+    PRIMUS_TURBO_CHECK(gate.dim() == 2, "gate must be 2D [B, N], got ", gate.dim(), "D");
+    const int64_t B = gate.size(0);
+    PRIMUS_TURBO_CHECK(B > 0 && (B & (B - 1)) == 0,
+                       "GateMul needs a power-of-two batch so the kernel can take the batch "
+                       "index as the low bits of the row; got B = ", B);
+    PRIMUS_TURBO_CHECK(M % B == 0,
+                       "input's rows must be a whole number of batches: M is ", M, " and B is ",
+                       B);
+    check_operand(gate, input, "gate", {B, N}, input.scalar_type());
+
+    const auto [row_p_bytes, row_s_bytes] = pack_sizes(M, N); // contract N
+    const auto [col_p_bytes, col_s_bytes] = pack_sizes(N, M); // contract M
+
+    at::Tensor row_p = empty_blob(row_p_bytes, input);
+    at::Tensor row_s = empty_blob(row_s_bytes, input);
+    at::Tensor col_p = empty_blob(col_p_bytes, input);
+    at::Tensor col_s = empty_blob(col_s_bytes, input);
+
+    const int  rows      = mxfp6_col_sum_rows(static_cast<int>(M));
+    const auto fp32_opts = input.options().dtype(at::kFloat);
+    at::Tensor col_sum = at::empty({want_col_sum ? rows : 0, want_col_sum ? N : 0}, fp32_opts);
+
+    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+
+    auto launch = [&]<typename T>() {
+        MXFP6GateMulArgs<T> args{};
+        args.gate       = reinterpret_cast<const T *>(gate.data_ptr());
+        args.batch_mask = static_cast<int32_t>(B - 1);
+        quantize_mxfp6_gate_mul_impl<T>(
+            reinterpret_cast<const T *>(input.data_ptr()), args, row_p.data_ptr<uint8_t>(),
+            row_s.data_ptr<uint8_t>(), col_p.data_ptr<uint8_t>(), col_s.data_ptr<uint8_t>(),
+            want_col_sum ? col_sum.data_ptr<float>() : nullptr, static_cast<int>(M),
+            static_cast<int>(N), stream);
+    };
+    if (input.scalar_type() == at::kBFloat16)
+        launch.template operator()<dtype::bfloat16>();
+    else
+        launch.template operator()<dtype::float16>();
+
+    return {row_p, row_s, col_p, col_s, col_sum};
+}
+
 } // namespace
 
 std::vector<at::Tensor> quantize_mxfp6(const at::Tensor input, const int64_t axis) {
@@ -579,6 +629,13 @@ std::vector<at::Tensor> quantize_mxfp6_ln_modulate(const at::Tensor input, const
     return run_ln_modulate(input, mean, rstd, scale, shift, want_col_sum);
 }
 
+// Dual pack of input * gate[m % B], for a gated residual's incoming gradient. Off `mode`
+// because its operand is not (aux, bias).
+std::vector<at::Tensor> quantize_mxfp6_gate_mul(const at::Tensor input, const at::Tensor gate,
+                                                const bool want_col_sum) {
+    return run_gate_mul(input, gate, want_col_sum);
+}
+
 // Meta implementations. Shapes are pure arithmetic on M and N, so torch.compile can trace
 // through the packer without a graph break.
 std::vector<at::Tensor> quantize_mxfp6_meta(const at::Tensor input, const int64_t axis) {
@@ -642,6 +699,16 @@ std::vector<at::Tensor>
 quantize_mxfp6_ln_modulate_meta(const at::Tensor input, const at::Tensor mean,
                                 const at::Tensor rstd, const at::Tensor scale,
                                 const at::Tensor shift, const bool want_col_sum) {
+    const int64_t M    = input.size(0);
+    const int64_t N    = input.size(1);
+    auto          out  = quantize_mxfp6_dual_meta(input);
+    const int64_t rows = want_col_sum ? mxfp6_col_sum_rows(static_cast<int>(M)) : 0;
+    out.push_back(at::empty({rows, want_col_sum ? N : 0}, input.options().dtype(at::kFloat)));
+    return out;
+}
+
+std::vector<at::Tensor> quantize_mxfp6_gate_mul_meta(const at::Tensor input, const at::Tensor gate,
+                                                     const bool want_col_sum) {
     const int64_t M    = input.size(0);
     const int64_t N    = input.size(1);
     auto          out  = quantize_mxfp6_dual_meta(input);

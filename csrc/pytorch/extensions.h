@@ -173,6 +173,13 @@ std::vector<at::Tensor>
 quantize_mxfp6_ln_modulate_meta(const at::Tensor input, const at::Tensor mean,
                                 const at::Tensor rstd, const at::Tensor scale,
                                 const at::Tensor shift, const bool want_col_sum);
+
+// Dual pack of input * gate[m % B] at [M, N], gate [B, N] with B a power of two. Returns the
+// four blobs and the column-sum partial, like quantize_mxfp6_ln_modulate.
+std::vector<at::Tensor> quantize_mxfp6_gate_mul(const at::Tensor input, const at::Tensor gate,
+                                                const bool want_col_sum);
+std::vector<at::Tensor> quantize_mxfp6_gate_mul_meta(const at::Tensor input, const at::Tensor gate,
+                                                     const bool want_col_sum);
 #endif // BUILD_MXFP6_BACKEND
 
 at::Tensor dequantize_fp8_rowwise(const at::Tensor input, const at::Tensor scale_inv,

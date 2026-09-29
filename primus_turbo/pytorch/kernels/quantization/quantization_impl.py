@@ -1182,6 +1182,34 @@ def quantize_mxfp6_ln_modulate_impl_meta(
 
 
 @torch.library.custom_op(
+    "primus_turbo::quantize_mxfp6_gate_mul_impl", mutates_args=(), device_types="cuda"
+)
+def quantize_mxfp6_gate_mul_impl(
+    x: torch.Tensor, gate: torch.Tensor, want_col_sum: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dual pack of ``x * gate[m % B]``; the product never reaches HBM.
+
+    Same five outputs as ``quantize_mxfp6_fused_dual_impl``. Opaque to inductor like the
+    other packers: the point is that inductor no longer emits the multiply ahead of the pack.
+    """
+    from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import quantize_mxfp6_gate_mul
+
+    return quantize_mxfp6_gate_mul(x, gate, want_col_sum)
+
+
+@quantize_mxfp6_gate_mul_impl.register_fake
+def quantize_mxfp6_gate_mul_impl_meta(
+    x: torch.Tensor, gate: torch.Tensor, want_col_sum: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import mxfp6_col_sum_rows
+
+    blobs = quantize_mxfp6_dual_impl_meta(x)
+    rows, cols = x.shape
+    shape = (mxfp6_col_sum_rows(rows), cols) if want_col_sum else (0, 0)
+    return (*blobs, torch.empty(shape, dtype=torch.float32, device=x.device))
+
+
+@torch.library.custom_op(
     "primus_turbo::quantize_mxfp6_qk_norm_rope_bwd_impl", mutates_args=(), device_types="cuda"
 )
 def quantize_mxfp6_qk_norm_rope_bwd_impl(

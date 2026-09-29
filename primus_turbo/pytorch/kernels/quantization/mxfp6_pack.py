@@ -581,3 +581,42 @@ def quantize_mxfp6_ln_modulate(
         want_col_sum,
     )
     return tuple(blobs)
+
+
+def mxfp6_gate_mul_reference(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    """Eager reference for the tensor ``quantize_mxfp6_gate_mul`` packs.
+
+    ``x * gate[m % B]`` in fp32, rounded once to ``x.dtype`` -- what the elementwise kernel
+    it replaces stored for the packer to read.
+    """
+    batch = torch.arange(x.shape[0], device=x.device) % gate.shape[0]
+    return (x.float() * gate[batch].float()).to(x.dtype)
+
+
+def quantize_mxfp6_gate_mul(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    want_col_sum: bool = False,
+    block_size: int = MXFP6_BLOCK_SIZE,
+) -> Tuple[torch.Tensor, ...]:
+    """Dual pack of ``x * gate[m % B]``, with the product formed in the staging read.
+
+    For a DiT block's gated residual ``y = residual + gate * h``: the gradient reaching ``h``
+    is ``gate * dy``, which otherwise exists only to be packed. ``x`` is ``dy`` at ``[M, N]``
+    and ``gate`` is ``[B, N]``, B a power of two.
+
+    Returns ``(row_packed, row_scale, col_packed, col_scale, col_sum)`` like
+    ``quantize_mxfp6_fused_dual``; with ``want_col_sum`` the partials sum to the column sums
+    of the product. Bit-identical to ``quantize_mxfp6_dual(mxfp6_gate_mul_reference(x, gate))``.
+    """
+    _require_supported(x.device)
+    _check_input(x, block_size)
+    if gate.device != x.device:
+        raise ValueError(
+            f"MXFP6 gate-mul pack needs both operands on one device: x is on {x.device} "
+            f"but gate is on {gate.device}."
+        )
+    blobs = torch.ops.primus_turbo_cpp_extension.quantize_mxfp6_gate_mul(
+        x.contiguous(), gate.contiguous(), want_col_sum
+    )
+    return tuple(blobs)
