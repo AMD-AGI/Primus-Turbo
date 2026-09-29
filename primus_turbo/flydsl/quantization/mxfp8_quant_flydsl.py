@@ -26,11 +26,16 @@ from flydsl.expr.typing import T as _T
 from flydsl.expr.typing import Vector as Vec
 
 from primus_turbo.flydsl.utils.gemm_helper import (
+    _lane_tbl_count_le,
+    _lane_tbl_get,
+    _lane_tbl_load,
+    _lane_tbl_scan,
     group_m_tile_decode,
     make_row_band_resource,
     make_row_band_resource_div,
     xcd_band_remap_pid,
 )
+from primus_turbo.flydsl.utils.prims import _readfirstlane_i32
 
 # Scale stores are byte-granular and rely on L2 merging the write masks into whole lines.
 _CM = 1  # glc
@@ -884,9 +889,9 @@ def compile_grouped_qdual(
 ):
     """Compile the grouped dual-cast mxfp8 quant. Tile [bm=64 x bk=128] (bm=64 divides the
     128-aligned col-pad boundary so each tile stays in one group). Each WG computes its band's
-    group metadata (RB/RO/RE/RIE) inline via an O(G) offset scan (no prologue kernel), then
-    quantizes ``tiles_per_wg`` consecutive column tiles of that band. Every wave runs the scan
-    on the scalar unit, so at large G it costs more than a tile; the loop amortizes it."""
+    group metadata (RB/RO/RE/RIE) inline from lane-resident offset tables (no prologue kernel),
+    then quantizes ``tiles_per_wg`` consecutive column tiles of that band; the loop amortizes
+    the offset loads and the band set-up."""
     if elt is None:
         elt = fx.BFloat16
     va, ep_sub, sat_bnd, cvt = fp8_params(out_fp8)
@@ -947,46 +952,37 @@ def compile_grouped_qdual(
         br, bkc0 = _decode_pid(pid, I32(NBK // TPW))
         base_m = br * I32(BMv)
 
-        # ---- per-band group metadata computed INLINE (no pad/meta prologue kernels):
-        # each WG does the O(G) 64/128-padded-offset scan from GO (loaded to registers
-        # first, no dependent load chain), yielding in_rebase / rowbase_out / real_end /
-        # in_end. The pid==0 WG also emits the padded lens/offs outputs (threads t<=G). ----
-        go_t = rocdl.make_buffer_tensor(GO, max_size=False, num_records_bytes=(G + 1) * 8)
-        go_div = fx.logical_divide(go_t, fx.make_layout(1, 1))
-        go_vals = [_load_i32_at(go_div, 2 * g) for g in range_constexpr(G + 1)]
-        found = z
-        go_orig_g = z
-        go_orig_g1 = z
-        go_row_g = z
-        go_col_g = z
-        acc_row = z
-        acc_col = z
-        cap_lr = z
-        cap_lc = z
-        cap_or = z
-        cap_oc = z
-        for g in range_constexpr(G):
-            prev = go_vals[g]
-            nxt = go_vals[g + 1]
-            ln = nxt - prev
-            lrow = ((ln + I32(63)) // I32(64)) * I32(64)
-            lcol = ((ln + I32(127)) // I32(128)) * I32(128)
-            inq = (base_m >= acc_col) & (base_m < acc_col + lcol)
-            go_col_g = arith.select(inq, acc_col, go_col_g)
-            go_orig_g = arith.select(inq, prev, go_orig_g)
-            go_orig_g1 = arith.select(inq, nxt, go_orig_g1)
-            go_row_g = arith.select(inq, acc_row, go_row_g)
-            found = arith.select(inq, I32(1), found)
-            atg = t == I32(g)
-            cap_lr = arith.select(atg, lrow, cap_lr)
-            cap_lc = arith.select(atg, lcol, cap_lc)
-            cap_or = arith.select(atg, acc_row, cap_or)  # offs before group g
-            cap_oc = arith.select(atg, acc_col, cap_oc)
-            acc_row = acc_row + lrow
-            acc_col = acc_col + lcol
-        cap_or = arith.select(t == I32(G), acc_row, cap_or)  # offs_row[G] = total padded
-        cap_oc = arith.select(t == I32(G), acc_col, cap_oc)
-        isreal = found == I32(1)
+        # ---- per-band group metadata computed INLINE (no pad/meta prologue kernels) from
+        # lane-resident tables (entry i in lane i%64 of chunk i//64, same in every wave):
+        # padded lens -> DPP prefix sums -> one ballot finds the band's group. A serial scalar
+        # scan here is ~30 SALU per group on every wave and dominates the kernel at G=32.
+        # The pid==0 WG also emits the padded lens/offs outputs (thread t writes entry t). ----
+        go_r = bo.create_buffer_resource(GO, max_size=False, num_records_bytes=(G + 1) * 8)
+        lane = t % I32(64)
+        prev_t = _lane_tbl_load(go_r, lane, G + 1, stride=2)  # go[i]
+        nxt_t = _lane_tbl_load(go_r, lane, G + 1, stride=2, first=1)  # go[i+1]; entry G reads 0
+        lrow_t, lcol_t = [], []
+        for c in range_constexpr(len(prev_t)):
+            ln = (lane + I32(64 * c) < I32(G)).select(nxt_t[c] - prev_t[c], z)
+            lrow_t.append((ln + I32(63)) & I32(-64))
+            lcol_t.append((ln + I32(127)) & I32(-128))
+        orow_t = [s - v for s, v in zip(_lane_tbl_scan(lrow_t), lrow_t)]  # offs before group i
+        ecol_t = _lane_tbl_scan(lcol_t)  # end of group i (entries >= G hold the total)
+        ocol_t = [s - v for s, v in zip(ecol_t, lcol_t)]
+        g_own = _readfirstlane_i32(_lane_tbl_count_le(ecol_t, base_m))  # empty groups tie, skipped
+        isreal = g_own < I32(G)
+        go_col_g = _lane_tbl_get(ocol_t, g_own)
+        go_row_g = _lane_tbl_get(orow_t, g_own)
+        go_orig_g = _lane_tbl_get(prev_t, g_own)
+        go_orig_g1 = _lane_tbl_get(nxt_t, g_own)
+        wave = t // I32(64)
+        cap_lr, cap_lc, cap_or, cap_oc = lrow_t[0], lcol_t[0], orow_t[0], ocol_t[0]
+        for c in range_constexpr(1, len(prev_t)):
+            onc = wave == I32(c)
+            cap_lr = onc.select(lrow_t[c], cap_lr)
+            cap_lc = onc.select(lcol_t[c], cap_lc)
+            cap_or = onc.select(orow_t[c], cap_or)
+            cap_oc = onc.select(ocol_t[c], cap_oc)
         mrel = base_m - go_col_g
         in_rebase = arith.select(isreal, go_orig_g + mrel, z)  # abs input row for local row 0
         rowbase_out = arith.select(isreal, go_row_g + mrel, z)  # row-64 output base
@@ -1102,7 +1098,9 @@ def compile_grouped_qdual(
                 cwords = []
                 for wi in range_constexpr(8):
                     word = I32(cvt(IRI, _sat(cq[4 * wi + 0], sat_bnd), _sat(cq[4 * wi + 1], sat_bnd), z, 0))
-                    word = I32(cvt(IRI, _sat(cq[4 * wi + 2], sat_bnd), _sat(cq[4 * wi + 3], sat_bnd), word, 1))
+                    word = I32(
+                        cvt(IRI, _sat(cq[4 * wi + 2], sat_bnd), _sat(cq[4 * wi + 3], sat_bnd), word, 1)
+                    )
                     cwords.append(word)
                 # stage the 8 contiguous col words as 2 vec4 LDS stores (c-major, bm M-bytes/K-col)
                 csbase = c * I32(DWPC) + mblk * I32(8)
@@ -1134,7 +1132,11 @@ def compile_grouped_qdual(
                     cache_modifier=_CM,
                 )
             _llvm.inline_asm(
-                res=None, operands_=[], asm_string="s_waitcnt lgkmcnt(0)", constraints="", has_side_effects=True
+                res=None,
+                operands_=[],
+                asm_string="s_waitcnt lgkmcnt(0)",
+                constraints="",
+                has_side_effects=True,
             )
             rocdl.s_barrier()
             # Coalesced transposed col write from the LDS stage. AtQd is col-major [N, M_pad_col],
@@ -1240,7 +1242,9 @@ def grouped_quant_mxfp8_raw(x, group_lens, group_offs, out_dtype):
     M_pad_col = ((total_M + G * 128) + 127) // 128 * 128
     num_cu = _GROUPED_QDUAL_NCU.get(x.device)
     if num_cu is None:
-        num_cu = _GROUPED_QDUAL_NCU[x.device] = torch.cuda.get_device_properties(x.device).multi_processor_count
+        num_cu = _GROUPED_QDUAL_NCU[x.device] = torch.cuda.get_device_properties(
+            x.device
+        ).multi_processor_count
     tpw = _grouped_qdual_tpw(M_pad_col, N, G, num_cu)
     grid = grouped_qdual_grid(M_pad_col, N, tpw)
     out_fp8 = "e5m2" if out_dtype == torch.float8_e5m2 else "e4m3"
