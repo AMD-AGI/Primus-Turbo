@@ -79,6 +79,17 @@ def _ep(amax, va, sub):
     return I32(ep)
 
 
+def _qd_off(r, c, rows, pitch, kblk):
+    """Byte offset of fp8 element (r, c) in one batch's [rows, pitch] plane. ``kblk`` stores the
+    plane K-blocked, [pitch/128, rows, 128]: a row past ``rows`` would then land in the next
+    block instead of past the end, so it is sent out of bounds."""
+    I32 = fx.Int32
+    if not kblk:
+        return r * I32(pitch) + c
+    off = (c >> I32(7)) * I32(rows * 128) + r * I32(128) + (c & I32(127))
+    return (r < I32(rows)).select(off, I32(_OOB))
+
+
 def _raw_scale_dword(free, blk, scale_n):
     """Raw E8M0 (plain row-major [free, contract//32]) byte address split into
     (dword, jbyte) for the shared scale store. off = free*scale_n + blk; a dword can
@@ -306,6 +317,7 @@ def compile_qdual(
     col_2d=False,
     sec_pair=False,
     flat_2d=True,
+    kblk=False,
 ):
     """Dense dual-cast mxfp8 quant, batched over B experts (B=1 = plain 2D). Tile [bm x bk]
     (bm*bk==16*nth); ROW half writes fp8+E8M0, COL half stages the transpose through LDS for a
@@ -322,7 +334,8 @@ def compile_qdual(
     whole 64B sectors; it needs the 4+ lanes per row of bk>=128 and the non-2d layout.
     ``flat_2d`` (see _QD_2D_FLAT) gives the 2d-block halves the same completion by handing a
     wave two whole 32x32 blocks instead of one chunk per warp, keeping the block amax
-    wave-local; it needs bm,bk>=64 and is bit-identical to the chunk-per-warp form."""
+    wave-local; it needs bm,bk>=64 and is bit-identical to the chunk-per-warp form.
+    ``kblk`` writes both fp8 planes K-blocked (see ``_qd_off``); the scales keep their layout."""
     if elt is None:
         elt = fx.BFloat16
     va, ep_sub, sat_bnd, cvt = fp8_params(out_fp8)
@@ -496,7 +509,7 @@ def compile_qdual(
                         bo.buffer_store(
                             Vec.from_elements(words, fx.Int32).ir_value(),
                             rqr,
-                            grow * I32(Kp) + bk * I32(BKv) + col0,
+                            _qd_off(grow, bk * I32(BKv) + col0, M, Kp, kblk),
                             cache_modifier=cm_data_row,
                             offset_is_bytes=True,
                         )
@@ -594,7 +607,7 @@ def compile_qdual(
                             bo.buffer_store(
                                 word,
                                 rqr,
-                                grow * I32(Kp) + gcol,
+                                _qd_off(grow, gcol, M, Kp, kblk),
                                 cache_modifier=cm_data_row,
                                 offset_is_bytes=True,
                             )
@@ -677,13 +690,13 @@ def compile_qdual(
                             word = I32(cvt(IRI, _sat(qf[0], sat_bnd), _sat(qf[1], sat_bnd), z, 0))
                             word = I32(cvt(IRI, _sat(qf[2], sat_bnd), _sat(qf[3], sat_bnd), word, 1))
                             words.append(word)
-                    row_byte0 = grow * I32(Kp) + bk * I32(BKv) + ccol
+                    row_col0 = bk * I32(BKv) + ccol
                     for v in range_constexpr(2):
                         v4 = Vec.from_elements(words[4 * v : 4 * v + 4], fx.Int32)
                         bo.buffer_store(
                             v4.ir_value(),
                             rqr,
-                            row_byte0 + I32(v * VSTEP),
+                            _qd_off(grow, row_col0 + I32(v * VSTEP), M, Kp, kblk),
                             cache_modifier=cm_data_row,
                             offset_is_bytes=True,
                         )
@@ -759,7 +772,7 @@ def compile_qdual(
                 bo.buffer_store(
                     v4.ir_value(),
                     raqd,
-                    gc * I32(Mp) + mbase + dwi0 * I32(4),
+                    _qd_off(gc, mbase + dwi0 * I32(4), K, Mp, kblk),
                     cache_modifier=cm_data_col,
                     offset_is_bytes=True,
                 )
@@ -777,11 +790,15 @@ def compile_qdual(
 _RAW_QDUAL_BATCHED_CACHE: dict = {}
 
 
-def quant_mxfp8_raw_batched(x_3d, out_dtype, row_2d=False, col_2d=False):
+def quant_mxfp8_raw_batched(x_3d, out_dtype, row_2d=False, col_2d=False, kblk=False):
     """Batched raw-E8M0 dual-cast mxfp8 quant for a uniform [B, M, K] input (grouped-gemm weight
     path), all B experts in ONE launch. Returns quant_mxfp8_raw's 4-tuple stacked to [B, ...]:
     row_fp8 [B, M, Kp] / row_scale [B, M, Kp//32] e8m0 / col_fp8 [B, K, Mp] / col_scale, with
-    Kp=ceil(K/128)*128, Mp=ceil(M/128)*128. Bit-identical to the HIP dual-cast per expert."""
+    Kp=ceil(K/128)*128, Mp=ceil(M/128)*128. Bit-identical to the HIP dual-cast per expert.
+
+    ``kblk``: the two fp8 planes keep those shapes but each expert's bytes are K-blocked,
+    row [Kp/128, M, 128] and col [Mp/128, K, 128] -- the contraction dim of the GEMM that
+    reads each plane is split into 128-wide blocks, all rows of a block back to back."""
     import flydsl.compiler as _flyc
     import torch
 
@@ -805,7 +822,7 @@ def quant_mxfp8_raw_batched(x_3d, out_dtype, row_2d=False, col_2d=False):
 
     # Tile / pid-walk / store-policy are build parameters, so they belong in the cache key.
     cfg = _qdual_tile_cfg(M, K, Mp, Kp)
-    key = (B, M, K, Mp, Kp, x_3d.dtype, out_dtype, row_2d, col_2d) + tuple(sorted(cfg.items()))
+    key = (B, M, K, Mp, Kp, x_3d.dtype, out_dtype, row_2d, col_2d, kblk) + tuple(sorted(cfg.items()))
     comp = _RAW_QDUAL_BATCHED_CACHE.get(key)
     if comp is None:
         launch = compile_qdual(
@@ -818,6 +835,7 @@ def quant_mxfp8_raw_batched(x_3d, out_dtype, row_2d=False, col_2d=False):
             Kp=Kp,
             row_2d=row_2d,
             col_2d=col_2d,
+            kblk=kblk,
             **cfg,
         )
         comp = _flyc.compile(launch, x_3d, Qr, ASp, AtQd, AtSp, stream)

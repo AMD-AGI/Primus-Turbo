@@ -718,6 +718,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
                 scaling_recipe=ScalingRecipe(use_2d_block=True),
                 scaling_recipe_for_trans=ScalingRecipe(use_2d_block=True),
             )
+            b_row_k_blocked = b_col_k_blocked = False
         else:
             quantized_b = b
             check_quantized_tensor(quantized_b, config, axis=-1, scaling_recipe=b_scaling_recipe)
@@ -739,6 +740,8 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             b_scale_row = quantized_b.scale_inv
             b_fp8_col = quantized_b_t.qdata
             b_scale_col = quantized_b_t.scale_inv
+            b_row_k_blocked = quantized_b.k_blocked
+            b_col_k_blocked = quantized_b_t.k_blocked
 
         total_m = int(a.size(0))
         # fwd: read rowwise-padded layout (group_offs_padded_rowwise); the output
@@ -758,6 +761,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             num_cu=num_cu,
             default_backend=BackendType.FLYDSL.value,
             group_offs_out=group_offs,
+            b_k_blocked=b_row_k_blocked,
         )
         out = out[:total_m]
 
@@ -773,6 +777,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
         ctx.total_m = total_m
+        ctx.b_col_k_blocked = b_col_k_blocked
         ctx.fuse_bgrad_accum = fuse_bgrad_accum
         ctx.main_grad = main_grad
         return out
@@ -818,6 +823,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             num_cu=ctx.num_cu,
             default_backend=BackendType.FLYDSL.value,
             group_offs_out=group_offs,
+            b_k_blocked=ctx.b_col_k_blocked,
         )
         grad_a = grad_a[: ctx.total_m]
 

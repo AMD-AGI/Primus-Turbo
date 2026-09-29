@@ -422,6 +422,8 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
             supported &= b.dtype in (float8_e4m3, float8_e5m2)
             supported &= out_dtype in (torch.float16, torch.bfloat16)
             supported &= trans_b
+            # Only the FlyDSL kernel reads a K-blocked B.
+            supported &= not kwargs.get("b_k_blocked", False)
         return supported
 
     @staticmethod
@@ -574,6 +576,7 @@ class GroupedGEMMFP8FlyDSLBackend(KernelBackend):
                 group_offs_out,
                 out_dtype=out_dtype,
                 num_cu=num_cu,
+                b_k_blocked=kwargs.get("b_k_blocked", False),
             )
 
         return grouped_gemm_fp8_tensorwise_flydsl_kernel(
@@ -618,8 +621,9 @@ class GroupedGEMMFP8KernelDispatcher(BaseGroupedGEMMKernelDispatcher):
         m = a.shape[1] if trans_a else a.shape[0]
         n = b.shape[-2] if trans_b else b.shape[-1]
         k = a.shape[0] if trans_a else a.shape[1]
-        # bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, granularity
-        return (bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, False, granularity)
+        b_k_blocked = kwargs.get("b_k_blocked", False)
+        # bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, granularity, b layout
+        return (bs, m, n, k, a.dtype, b.dtype, out_dtype, trans_a, trans_b, False, granularity, b_k_blocked)
 
 
 class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
@@ -949,6 +953,7 @@ def grouped_gemm_fp8_impl(
     maybe_pre_sync: bool = False,
     group_offs_out: torch.Tensor | None = None,
     n_real: int | None = None,
+    b_k_blocked: bool = False,
 ) -> torch.Tensor:
     default_backend_choice = BackendChoice(backend=BackendType(default_backend))
     user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
@@ -969,6 +974,7 @@ def grouped_gemm_fp8_impl(
         maybe_pre_sync=maybe_pre_sync,
         group_offs_out=group_offs_out,
         n_real=n_real,
+        b_k_blocked=b_k_blocked,
     )
 
     out = GroupedGEMMFP8KernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
@@ -1130,6 +1136,7 @@ def grouped_gemm_fp8_impl_meta(
     maybe_pre_sync: bool = False,
     group_offs_out: torch.Tensor | None = None,
     n_real: int | None = None,
+    b_k_blocked: bool = False,
 ) -> torch.Tensor:
     assert a.dim() == 2, f"a must be 2D, got {a.shape}"
     assert b.dim() == 3, f"b must be 3D, got {b.shape}"
@@ -1600,6 +1607,7 @@ def grouped_gemm_mxfp8_glu_impl(
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
     clamp_limit: float | None = None,
+    b_k_blocked: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """fc1 grouped MXFP8 GEMM with the GLU activation and its quantisation fused in.
 
@@ -1669,6 +1677,7 @@ def grouped_gemm_mxfp8_glu_impl(
         activation=activation,
         clamp_limit=clamp_limit,
         out_dtype=out_dtype,
+        b_k_blocked=b_k_blocked,
     )
     return intermediate, row_out, row_sc, col_out, col_sc
 
@@ -1691,6 +1700,7 @@ def grouped_gemm_mxfp8_glu_impl_meta(
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
     clamp_limit: float | None = None,
+    b_k_blocked: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     from primus_turbo.pytorch.ops.utils import _get_fp8_dtype
 
@@ -1733,6 +1743,7 @@ def grouped_gemm_mxfp8_dglu_impl(
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
     clamp_limit: float | None = None,
+    b_k_blocked: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """fc2 dgrad with the GLU activation gradient and its quantisation fused in.
 
@@ -1795,6 +1806,7 @@ def grouped_gemm_mxfp8_dglu_impl(
         activation=activation,
         clamp_limit=clamp_limit,
         out_dtype=out_dtype,
+        b_k_blocked=b_k_blocked,
     )
     # The partials are over-allocated to the padded rows but written in the tight space.
     return torch.sum(grad_probs_partial[:, :M], dim=0), row_out, row_sc, col_out, col_sc
@@ -1819,6 +1831,7 @@ def grouped_gemm_mxfp8_dglu_impl_meta(
     out_col_scaling_recipe: ScalingRecipe,
     activation: str = "silu",
     clamp_limit: float | None = None,
+    b_k_blocked: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     from primus_turbo.pytorch.ops.utils import _get_fp8_dtype
 
