@@ -360,9 +360,17 @@ def _build_grouped_mxfp8_nt_kernel(
     blgp: int = 0,
     out_fp16: bool = False,
     persistent: bool = False,
+    b_kblk: bool = False,
 ):
-    """Grouped MXFP8 NT (out = a @ b^T) with grouped per-tile addressing."""
+    """Grouped MXFP8 NT (out = a @ b^T) with grouped per-tile addressing.
+
+    ``b_kblk``: each group's B is stored K-blocked, [K/128, N, 128], so one K step of a
+    tile is a single contiguous run instead of 128 B from each of its rows.
+    """
     BLOCK_K = 128
+    # B row pitch within one K step, and the B offset of one K step.
+    B_ROW = BLOCK_K if b_kblk else K
+    B_KSTEP = N * BLOCK_K if b_kblk else BLOCK_K
     assert BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0 and BLOCK_M >= 128 and BLOCK_N >= 256
     assert K % BLOCK_K == 0 and G >= 1
     K_ITERS = K // BLOCK_K
@@ -477,9 +485,9 @@ def _build_grouped_mxfp8_nt_kernel(
 
             cn_i = arith.index_cast(T.index, c_n)
             a_base = arith.index_cast(T.index, m_row_a) * arith.index(K)
-            b_base = (
-                arith.index_cast(T.index, group_idx) * cn_i + arith.index_cast(T.index, block_n * BLOCK_N)
-            ) * arith.index(K)
+            b_base = arith.index_cast(T.index, group_idx) * cn_i * arith.index(K) + arith.index_cast(
+                T.index, block_n * BLOCK_N
+            ) * arith.index(B_ROW)
             a_nrec = (
                 arith.index_cast(T.index, m_total_pad) - arith.index_cast(T.index, m_row_a)
             ) * arith.index(K)
@@ -487,7 +495,7 @@ def _build_grouped_mxfp8_nt_kernel(
             A0_gl_offset = 0
             A1_gl_offset = LDS_BLOCK_M * K
             B0_gl_offset = 0
-            B1_gl_offset = LDS_BLOCK_N * K
+            B1_gl_offset = LDS_BLOCK_N * B_ROW
 
             gA = make_fp8_buffer_tensor_rebased(A, F8_IR_t, a_base, a_nrec)
             gB = make_fp8_buffer_tensor_rebased(B_T, F8_IR_t, b_base, b_nrec)
@@ -495,7 +503,7 @@ def _build_grouped_mxfp8_nt_kernel(
             b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
             gl_off_a = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False)
-            gl_off_b = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False)
+            gl_off_b = compute_global_swizzle(lane_id, wave_id, B_ROW, N_LDS_ROUNDS, preshuffled=False)
 
             mfma = MfmaScale16x16x128(N_TILES_A, N_TILES_B, cbsz=cbsz, blgp=blgp)
 
@@ -522,9 +530,9 @@ def _build_grouped_mxfp8_nt_kernel(
             c10_frag = [mfma.zero_value] * N_ACCUMS
             c11_frag = [mfma.zero_value] * N_ACCUMS
 
-            b_g2s.load(b_cur0, B0_gl_offset + 0 * BLOCK_K)
+            b_g2s.load(b_cur0, B0_gl_offset + 0 * B_KSTEP)
             a_g2s.load(a_cur0, A0_gl_offset + 0 * BLOCK_K)
-            b_g2s.load(b_cur1, B1_gl_offset + 0 * BLOCK_K)
+            b_g2s.load(b_cur1, B1_gl_offset + 0 * B_KSTEP)
             a_g2s.load(a_cur1, A1_gl_offset + 0 * BLOCK_K)
             if const_expr(persistent):
                 rocdl.s_barrier()
@@ -533,9 +541,9 @@ def _build_grouped_mxfp8_nt_kernel(
                 # it and a dynamic ``if`` has to be emitted through the rewrite's primitive.
                 emit_if_then(wave_m == 1, rocdl.s_barrier)
             wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
-            b_g2s.load(b_next0, B0_gl_offset + 1 * BLOCK_K)
+            b_g2s.load(b_next0, B0_gl_offset + 1 * B_KSTEP)
             a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K)
-            b_g2s.load(b_next1, B1_gl_offset + 1 * BLOCK_K)
+            b_g2s.load(b_next1, B1_gl_offset + 1 * B_KSTEP)
             # K_ITERS == 2 skips the main loop, so nothing drains k=1's b_next0/a_next0 before
             # the tails read them.
             wait_barrier(N_LDS_STEPS_B if K_ITERS == 2 else N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
@@ -557,7 +565,7 @@ def _build_grouped_mxfp8_nt_kernel(
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
                 b1_frag = b_s2r.load(b_cur1)
-                b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * BLOCK_K)
+                b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * B_KSTEP)
                 sb_alln = sb_s2r.load(sb_base0, k + 1, slab=group_idx)
                 rocdl.s_barrier()
                 rocdl.s_setprio(1)
@@ -572,7 +580,7 @@ def _build_grouped_mxfp8_nt_kernel(
                 c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, sa1, sb0)
                 rocdl.s_setprio(0)
                 rocdl.s_barrier()
-                b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * BLOCK_K)
+                b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_KSTEP)
                 wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
                 rocdl.s_setprio(1)
                 c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, sa1, sb1)
@@ -714,11 +722,13 @@ def _gnt_nt_candidates(N):
     ]
 
 
-def _get_nt_launch(K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent):
-    fk = (K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent)
+def _get_nt_launch(K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent, b_kblk=False):
+    fk = (K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent, b_kblk)
     launch = _GNT_FUSED_CACHE.get(fk)
     if launch is None:
-        launch = _compile_grouped_mxfp8_nt_fused(K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent)
+        launch = _compile_grouped_mxfp8_nt_fused(
+            K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent, b_kblk
+        )
         _GNT_FUSED_CACHE[fk] = launch
     return launch
 
@@ -772,8 +782,8 @@ _GNT_RACE = Race.interleaved(1, 50, warmup=250, visit=(0, 5), margin=0.985, chec
 _GROUPED_GEMM_MXFP8 = Op("grouped_gemm_mxfp8")
 
 
-def _gnt_entry(cfg, K, G, N, cbsz, blgp, out_fp16, persistent, tuned=True):
-    return Entry(cfg, _get_nt_launch(K, G, N, *cfg, cbsz, blgp, out_fp16, persistent), tuned=tuned)
+def _gnt_entry(cfg, K, G, N, cbsz, blgp, out_fp16, persistent, tuned=True, b_kblk=False):
+    return Entry(cfg, _get_nt_launch(K, G, N, *cfg, cbsz, blgp, out_fp16, persistent, b_kblk), tuned=tuned)
 
 
 def _gnt_probe(args, K, G, N, call_point=None):
@@ -784,15 +794,17 @@ def _gnt_probe(args, K, G, N, call_point=None):
     return Synthetic(lambda: [Point(*_canon_nt_targs(args, K, G, N, pm)) for pm in _GNT_PM_CANON])
 
 
-def _pick_gnt(key, args, K, G, N, cbsz, blgp, out_fp16, persistent, call_point=None):
+def _pick_gnt(key, args, K, G, N, cbsz, blgp, out_fp16, persistent, call_point=None, b_kblk=False):
     cfgs = _gnt_nt_candidates(N)
     space = staged(Refine(lambda _prev: cfgs, _GNT_RACE), base=cfgs[0])
-    build = _GROUPED_GEMM_MXFP8.build(lambda cfg: _gnt_entry(cfg, K, G, N, cbsz, blgp, out_fp16, persistent))
+    build = _GROUPED_GEMM_MXFP8.build(
+        lambda cfg: _gnt_entry(cfg, K, G, N, cbsz, blgp, out_fp16, persistent, b_kblk=b_kblk)
+    )
     res = _GROUPED_GEMM_MXFP8.pick(key, space, probe=_gnt_probe(args, K, G, N, call_point), build=build)
     return build.winner(res)
 
 
-def _compile_grouped_mxfp8_nt_fused(K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent):
+def _compile_grouped_mxfp8_nt_fused(K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent, b_kblk=False):
     K128 = K // 128
     pre_kern, n_kt, b_blocks_pg = _build_grouped_preshuffle_kernel(K128, G, N)
     gemm_kern, BM, BN, wpe = _build_grouped_mxfp8_nt_kernel(
@@ -808,6 +820,7 @@ def _compile_grouped_mxfp8_nt_fused(K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp
         blgp=blgp,
         out_fp16=out_fp16,
         persistent=persistent,
+        b_kblk=b_kblk,
     )
 
     @flyc.jit
@@ -883,12 +896,15 @@ def grouped_gemm_mxfp8_flydsl_kernel(
     out_dtype: torch.dtype = torch.bfloat16,
     num_cu: "int | None" = -1,
     out: "torch.Tensor | None" = None,
+    b_k_blocked: bool = False,
 ) -> "torch.Tensor":
     """FlyDSL MXFP8 grouped NT GEMM (fwd / dgrad).
 
     By default returns a newly allocated C [M_pad, N].  ``out`` lets fused
     multi-stage callers provide the tight [M, N] destination used with
     ``group_offs_out`` and avoid an otherwise redundant allocation/copy.
+    ``b_k_blocked``: ``b`` keeps its [G, N, K] shape but each group's bytes are laid
+    out [K/128, N, 128] (see ``quant_mxfp8_raw_batched(kblk=True)``).
     """
     assert a.ndim == 2 and b.ndim == 3
     M_pad = a.shape[0]
@@ -947,7 +963,7 @@ def grouped_gemm_mxfp8_flydsl_kernel(
         )
 
     small_m = M_pad < _GNT_SMALL_M * G
-    key = (N, K, G, cbsz, blgp, out_fp16, persistent, small_m)
+    key = (N, K, G, cbsz, blgp, out_fp16, persistent, small_m, b_k_blocked)
 
     def _make():
         # small M races on this call, with the grid sized for the smallest candidate tile
@@ -955,7 +971,7 @@ def grouped_gemm_mxfp8_flydsl_kernel(
         if small_m:
             min_bm = min(c[0] for c in _gnt_nt_candidates(N))
             call_point = Point(_args(((M_pad + min_bm - 1) // min_bm + G) * n_blocks), out)
-        return _pick_gnt(key, _args(0), K, G, N, cbsz, blgp, out_fp16, persistent, call_point)
+        return _pick_gnt(key, _args(0), K, G, N, cbsz, blgp, out_fp16, persistent, call_point, b_k_blocked)
 
     entry = _GROUPED_GEMM_MXFP8.entry(key, _make)
     # The device-side tile count sums ceildiv(tight length, bm) over the groups, so the
