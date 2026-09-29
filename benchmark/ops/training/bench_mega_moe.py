@@ -6,9 +6,10 @@
 
 """Benchmark the fused BF16 mega MoE kernels (EP, intra-node).
 
-Two modes, selected with --mode:
+Three modes, selected with --mode:
   dispatch_grouped_gemm : fused dispatch + grouped GEMM
   grouped_gemm_combine  : fused grouped GEMM + combine
+  activation            : the four gated-activation kernels (bf16/mxfp8, fwd/bwd), SiLU vs swigluoai
 
 Self-contained: the shared reference ops (routing/weight generation, the
 dense-GEMM roofline, the CUDA-event bench helper, the prologue-driven input
@@ -51,18 +52,6 @@ from flydsl.expr.typing import AddressSpace, PointerType  # noqa: E402
 
 # import primus_turbo.pytorch first to dodge the mega kernels' circular import
 import primus_turbo.pytorch  # noqa: E402,F401
-
-# primus_turbo.flydsl.* imported before primus_turbo.pytorch (kept from the
-# original mega_utils order; the two fused kernels below need pytorch first).
-from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (  # noqa: E402
-    _compile_dense_nt,
-    _get_compiled_dense,
-    _make_shared_storage,
-    gemm_bf16_tile,
-)
-from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (  # noqa: E402
-    _compile_grouped_bf16_wgrad,
-)
 from primus_turbo.flydsl.mega import (  # noqa: E402  # noqa: E402
     dispatch_grouped_gemm_bf16_flydsl_kernel,
     dispatch_prologue_flydsl_kernel,
@@ -76,6 +65,18 @@ from primus_turbo.flydsl.mega.bf16.ep_intranode import (  # noqa: E402
     dispatch_bf16_tile,
     topk_reduce_bf16_tile,
 )
+
+# primus_turbo.flydsl.* imported before primus_turbo.pytorch (kept from the
+# original mega_utils order; the two fused kernels below need pytorch first).
+from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (  # noqa: E402
+    _compile_dense_nt,
+    _get_compiled_dense,
+    _make_shared_storage,
+    gemm_bf16_tile,
+)
+from primus_turbo.flydsl.mega.bf16.grouped_gemm_bf16_kernel import (  # noqa: E402
+    _compile_grouped_bf16_wgrad,
+)
 from primus_turbo.flydsl.mega.bf16.symm_buffer import (  # noqa: E402
     BLOCK_M as _POOL_BLOCK_M,
 )
@@ -85,13 +86,25 @@ from primus_turbo.flydsl.mega.bf16.symm_buffer import (  # noqa: E402
     Workspace,
     get_symm_buffer_for_mega_moe,
 )
+from primus_turbo.flydsl.mega.fp8 import (  # noqa: E402
+    colwise_grouped_meta,
+    swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl,
+    swiglu_mxfp8_flydsl_kernel,
+)
 from primus_turbo.flydsl.utils.gemm_helper import (  # noqa: E402
-    _i64,
     ceildiv,
     make_value_attrs,
     xcd_remap_pid,
 )
-from primus_turbo.flydsl.utils.swiglu_kernel import swiglu_flydsl_kernel  # noqa: E402
+from primus_turbo.flydsl.utils.glu_activation import GLUActivation  # noqa: E402
+from primus_turbo.flydsl.utils.prims import _i64  # noqa: E402
+from primus_turbo.flydsl.utils.swiglu_kernel import (  # noqa: E402
+    swiglu_backward_flydsl_kernel,
+    swiglu_flydsl_kernel,
+)
+from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_fp8_weights import (  # noqa: E402
+    _DW_FP8_FORMAT,
+)
 from primus_turbo.pytorch.ops import grouped_gemm as turbo_grouped_gemm  # noqa: E402
 
 
@@ -1838,6 +1851,89 @@ def _report_case(mode, platform, gpu_name, world, args, case_name, per_rank):
     return rich_row, csv_row
 
 
+###############################################################################
+# Activation mode: the four gated-activation kernels, SiLU vs swigluoai
+###############################################################################
+_ACTIVATION_PORT = 8485
+_ACTIVATIONS = (("silu", None), ("swigluoai", GLUActivation.swigluoai()))
+
+
+def _activation_kernels(l1, dact, scale, num_tile_blocks, meta, activation):
+    """name -> zero-arg launcher, one per MegaMoE activation kernel, as the staged ops call them."""
+    return {
+        "bf16 fwd": lambda: swiglu_flydsl_kernel(l1, num_tile_blocks, activation=activation),
+        "bf16 bwd": lambda: swiglu_backward_flydsl_kernel(
+            dact, l1, num_tile_blocks, scale=scale, return_gate=True, return_act_w=True, activation=activation
+        ),
+        "mxfp8 fwd": lambda: swiglu_mxfp8_flydsl_kernel(l1, num_tile_blocks, activation=activation),
+        "mxfp8 bwd": lambda: swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl(
+            dact, l1, scale, _DW_FP8_FORMAT, meta=meta, activation=activation
+        ),
+    }
+
+
+def _activation_bench(group, args, reps=5):
+    """Time each activation kernel for SiLU and swigluoai on this rank's real dispatched pool.
+
+    The two activations run interleaved, ``reps`` rounds each, so drift hits both alike; the spread
+    of the SiLU rounds is the noise floor the swigluoai / SiLU ratio has to be read against. The L1
+    output is drawn at std 4 so both of swigluoai's clamps bite on a real share of elements.
+    """
+    rank = dist.get_rank()
+    for case in gen_moe_test_cases(args.models):
+        name = case["Case"]
+        if name in UNSUPPORTED:
+            continue
+        apply_case(args, case)
+        H, I, E, K, T = args.hidden, args.inter, args.num_experts, args.num_topk, args.num_tokens
+        symm = get_symm_buffer_for_mega_moe(
+            group, num_experts=E, num_max_tokens_per_rank=T, num_topk=K, hidden=H, intermediate_hidden=I
+        )
+        torch.manual_seed(rank)
+        handle = _get_dispatch_handle(symm, T=T, H=H, E=E, K=K)[3]
+        num_tile_blocks = handle[8]
+        P = symm.num_max_pool_tokens
+        l1 = (torch.randn(P, 2 * I, device="cuda") * 4.0).bfloat16()
+        dact = torch.randn(P, I, device="cuda").bfloat16()
+        scale = torch.rand(P, device="cuda")
+        meta = colwise_grouped_meta(handle[6], handle[7], pool_rows=P)
+        real_rows = int(num_tile_blocks.item()) * _POOL_BLOCK_M
+        kernels = {
+            act_name: _activation_kernels(l1, dact, scale, num_tile_blocks, meta, act)
+            for act_name, act in _ACTIVATIONS
+        }
+        times = {(k, a): [] for a in kernels for k in kernels[a]}
+        for _ in range(reps):
+            for act_name, fns in kernels.items():
+                for k, fn in fns.items():
+                    times[(k, act_name)].append(bench(fn, iters=args.iters))
+        sync_ranks(group)
+        per_rank = [None] * group.size()
+        dist.all_gather_object(per_rank, (real_rows, times), group=group)
+        if rank == 0:
+            rows = []
+            for k in kernels["silu"]:
+                # bottleneck rank per round, then the median round
+                silu = [max(r[1][(k, "silu")][i] for r in per_rank) for i in range(reps)]
+                oai = [max(r[1][(k, "swigluoai")][i] for r in per_rank) for i in range(reps)]
+                s_med, o_med = statistics.median(silu), statistics.median(oai)
+                rows.append(
+                    {
+                        "kernel": k,
+                        "silu ms": f"{s_med:.4f}",
+                        "swigluoai ms": f"{o_med:.4f}",
+                        "swigluoai/silu": f"{o_med / s_med:.3f}",
+                        "silu noise (max-min)/med": f"{(max(silu) - min(silu)) / s_med:.3f}",
+                    }
+                )
+            print(
+                f"\n=== activation kernels: {name}  EP{group.size()} T={T} H={H} I={I} E={E} topk={K}  "
+                f"pool rows {P} (real, max over ranks {max(r[0] for r in per_rank)})  median of {reps} ==="
+            )
+            print(tabulate(pd.DataFrame(rows), headers="keys", tablefmt="grid", showindex=False))
+        sync_ranks(group)
+
+
 def _init_dist(local_rank, world, default_port):
     """Bring up NCCL + the collective group for this spawn; returns the process group."""
     master_addr = os.getenv("MASTER_ADDR", "127.0.0.1")
@@ -1854,6 +1950,18 @@ def _init_dist(local_rank, world, default_port):
 
 def _benchmark(local_rank, world, args):
     """One spawn sweeps every MoE model for args.mode; unsupported / failing cases are skipped."""
+    if args.mode == "activation":
+        group = _init_dist(local_rank, world, _ACTIVATION_PORT)
+        try:
+            _activation_bench(group, args)
+        finally:
+            try:
+                get_symm_buffer_for_mega_moe().destroy()  # no-arg -> the active buffer
+            except RuntimeError:
+                pass  # none was ever built
+            dist.destroy_process_group()
+        return
+
     mode = MODES[args.mode]
     group = _init_dist(local_rank, world, mode.port)
     rank = dist.get_rank()
@@ -1942,7 +2050,7 @@ def _build_parser():
     parser = argparse.ArgumentParser(description="Benchmark the fused BF16 mega MoE kernels")
     parser.add_argument(
         "--mode",
-        choices=list(MODES),
+        choices=[*MODES, "activation"],
         required=True,
         help="which fused mega kernel to benchmark",
     )
