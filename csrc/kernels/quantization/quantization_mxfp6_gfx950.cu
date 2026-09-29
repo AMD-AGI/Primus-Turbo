@@ -381,38 +381,44 @@ __device__ __forceinline__ void gelu_prologue_bf16(uint16_t (*s_tile)[LDS_PITCH]
         for (int i = 0; i < VEC; ++i)
             bias_f[i] = bf16_lo(b[i]);
     }
-    // bias is uniform, so this is one branch per tile, not per element. It cannot become an
-    // add of zero: -0 + 0 is +0, and gelu keeps the sign of a zero.
-    const auto prep = [&](const float x, const int i) {
-        if (bias == nullptr)
-            return x;
-        const float s = x + bias_f[i];
-        return bf16_lo(pack_bf16x2_rne(s, 0.0f));
-    };
-
+    // bias is uniform, but a test of it inside the loop compiled to a compare and a branch per
+    // element, so the loop is instantiated twice instead. The no-bias loop cannot become an add
+    // of zero: -0 + 0 is +0, and gelu keeps the sign of a zero.
+    const auto run = [&](auto has_bias) {
 #pragma unroll
-    for (int base = threadIdx.x * VEC; base < TILE_M_ * TILE_N; base += STEP) {
-        const int local_m = base / TILE_N;
-        const uint4 in = *reinterpret_cast<const uint4 *>(&s_tile[local_m][local_n]);
-        const uint32_t *w = reinterpret_cast<const uint32_t *>(&in);
-        uint4 g = {};
-        if constexpr (PROLOGUE == MXFP6Prologue::BiasGeluBackward)
-            g = *reinterpret_cast<const uint4 *>(&s_aux[local_m * TILE_N + local_n]);
-        const uint32_t *gw = reinterpret_cast<const uint32_t *>(&g);
-        uint4 out;
-        uint32_t *o = reinterpret_cast<uint32_t *>(&out);
+        for (int base = threadIdx.x * VEC; base < TILE_M_ * TILE_N; base += STEP) {
+            const int local_m = base / TILE_N;
+            const uint4 in = *reinterpret_cast<const uint4 *>(&s_tile[local_m][local_n]);
+            const uint32_t *w = reinterpret_cast<const uint32_t *>(&in);
+            uint4 g = {};
+            if constexpr (PROLOGUE == MXFP6Prologue::BiasGeluBackward)
+                g = *reinterpret_cast<const uint4 *>(&s_aux[local_m * TILE_N + local_n]);
+            const uint32_t *gw = reinterpret_cast<const uint32_t *>(&g);
+            uint4 out;
+            uint32_t *o = reinterpret_cast<uint32_t *>(&out);
 #pragma unroll
-        for (int j = 0; j < VEC / 2; ++j) {
-            const float x0 = prep(bf16_lo(w[j]), 2 * j);
-            const float x1 = prep(bf16_hi(w[j]), 2 * j + 1);
-            if constexpr (PROLOGUE == MXFP6Prologue::BiasGelu)
-                o[j] = pack_bf16x2_rne(gelu_tanh(x0), gelu_tanh(x1));
-            else
-                o[j] = pack_bf16x2_rne(gelu_tanh_backward(bf16_lo(gw[j]), x0),
-                                       gelu_tanh_backward(bf16_hi(gw[j]), x1));
+            for (int j = 0; j < VEC / 2; ++j) {
+                float x0 = bf16_lo(w[j]);
+                float x1 = bf16_hi(w[j]);
+                if constexpr (decltype(has_bias)::value) {
+                    // Both bias sums rounded by one conversion; each lane rounds on its own.
+                    const uint32_t r = pack_bf16x2_rne(x0 + bias_f[2 * j], x1 + bias_f[2 * j + 1]);
+                    x0 = bf16_lo(r);
+                    x1 = bf16_hi(r);
+                }
+                if constexpr (PROLOGUE == MXFP6Prologue::BiasGelu)
+                    o[j] = pack_bf16x2_rne(gelu_tanh(x0), gelu_tanh(x1));
+                else
+                    o[j] = pack_bf16x2_rne(gelu_tanh_backward(bf16_lo(gw[j]), x0),
+                                           gelu_tanh_backward(bf16_hi(gw[j]), x1));
+            }
+            *reinterpret_cast<uint4 *>(&s_tile[local_m][local_n]) = out;
         }
-        *reinterpret_cast<uint4 *>(&s_tile[local_m][local_n]) = out;
-    }
+    };
+    if (bias != nullptr)
+        run(std::true_type{});
+    else
+        run(std::false_type{});
 }
 
 // AdaLN's modulated layer norm over one staged vector, in place.
