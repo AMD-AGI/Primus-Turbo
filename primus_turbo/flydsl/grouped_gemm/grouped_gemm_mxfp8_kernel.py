@@ -1496,7 +1496,14 @@ def _build_grouped_mxfp8_wgrad_kernel(
             m_end = _load_go(go_div, group_idx + 1)
             k_iters = (m_end - m_start) // BLOCK_K  # runtime; M_g padded to 128 -> exact
             ks0 = m_start // BLOCK_K  # scale K128-block base for this group
+            if const_expr(beta_is_one):
+                # An empty group adds nothing to C: skip its slab's read-modify-write.
+                if k_iters > fx.Int32(0):
+                    _tile_body(group_idx, block_m, block_n, m_start, k_iters, ks0)
+            else:
+                _tile_body(group_idx, block_m, block_n, m_start, k_iters, ks0)
 
+        def _tile_body(group_idx, block_m, block_n, m_start, k_iters, ks0):
             lane_id = fx.thread_idx.x % 64
             wave_id = fx.thread_idx.x // 64
             wave_m = wave_id // 4
