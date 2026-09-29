@@ -926,17 +926,23 @@ def _build_grouped_mxfp8_nt_kernel(
 
 _GNT_FUSED_CACHE: dict = {}  # (K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persist) -> launch
 _GNT_WS_CACHE: dict = {}  # (M_pad, N, K128, G, device, stream) -> (a_sp, b_sp, a_blocks, a_ngrp)
-_GNT_AT_CACHE: dict = {}  # (N, K, G, cbsz, blgp, out_fp16, persist) -> [raw, compiled]
+_GNT_AT_CACHE: dict = {}  # (N, K, G, cbsz, blgp, out_fp16, persist, small_m) -> [raw, compiled]
 _GNT_CFG_CACHE: dict = {}  # same key (NO M_pad) -> (bm, gm, xcd, gn) chosen by autotune
 
 # fwd/dgrad NT autotune. The launch is M-generic (M is a runtime arg), so the config race
-# keys on the static shape only (cfg_key, no M_pad) and is reused for every M.
+# keys on the static shape plus a coarse token regime (cfg_key, no M_pad) and is reused for
+# every M in that regime.
 _GNT_NT_DEFAULT_CFG = (256, 4, 4, 0)  # (BLOCK_M, GROUP_M, num_xcd, group_n); cand[0] = base ref
 
 # tokens/group points the race times on (geomean). The swizzle is not M-invariant: a single
 # midpoint mis-picks a cfg that wins there but loses at the range ends, so two spread steady
 # points reward range-robust cfgs.
 _GNT_PM_CANON = (2048, 8192)
+# Below this many average padded tokens/group most tile rows are padding and the ranking follows
+# the group-size distribution (tile count per group, tail, occupancy), which no balanced point
+# reproduces: bm=128 loses on balanced 192+ tokens/group yet wins on skewed ~100-token layouts.
+# That regime races on the first call's own layout instead (NT overwrites C, so it is idempotent).
+_GNT_SMALL_M = 1024
 
 
 def _gnt_nt_candidates(N):
@@ -1002,16 +1008,18 @@ def _canon_nt_targs(args, K, G, N, pm):
     return targs, out_c
 
 
-def _select_nt_cfg(cfg_key, K, G, N, cbsz, blgp, out_fp16, persistent, args):
-    """First-call race on synthetic canonical tensors; cache the winning cfg per static shape
-    (cfg_key, no M_pad -> reused for every M)."""
+def _select_nt_cfg(cfg_key, K, G, N, cbsz, blgp, out_fp16, persistent, args, points=None):
+    """First-call race; cache the winning cfg per static shape and token regime (cfg_key, no
+    M_pad -> reused for every M). ``points`` is a list of (targs, out_view) to time on; by default
+    synthetic canonical tensors at _GNT_PM_CANON tokens/group."""
     cached = _GNT_CFG_CACHE.get(cfg_key)
     if cached is not None:
         return cached
 
     cands = _gnt_nt_candidates(N)
     # one (targs, out_view) per steady point; candidates scored by geomean over points
-    points = [_canon_nt_targs(args, K, G, N, pm) for pm in _GNT_PM_CANON]
+    if points is None:
+        points = [_canon_nt_targs(args, K, G, N, pm) for pm in _GNT_PM_CANON]
 
     def _geomean(ts):
         return math.exp(sum(math.log(t) for t in ts) / len(ts))
@@ -1020,6 +1028,8 @@ def _select_nt_cfg(cfg_key, K, G, N, cbsz, blgp, out_fp16, persistent, args):
         base = _get_nt_launch(K, G, N, *cands[0], cbsz, blgp, out_fp16, persistent)
         refs, base_ts = [], []
         for targs, out_view in points:
+            # rows no tile owns (tight-output tail) must read the same for base and candidates
+            out_view.zero_()
             base(*targs)
             torch.cuda.synchronize()
             r = out_view.detach().clone().float()
@@ -1311,11 +1321,17 @@ def grouped_gemm_mxfp8_flydsl_kernel(
             stream,
         )
 
-    at_key = (N, K, G, cbsz, blgp, out_fp16, persistent)
+    small_m = M_pad < _GNT_SMALL_M * G
+    at_key = (N, K, G, cbsz, blgp, out_fp16, persistent, small_m)
     entry = _GNT_AT_CACHE.get(at_key)
     if entry is None:
-        # race on canonical synthetic tensors -> needs only the static shape (args' b-side)
-        bm, gm, xcd, gn = _select_nt_cfg(at_key, K, G, N, cbsz, blgp, out_fp16, persistent, _args(0))
+        # large M: race on canonical synthetic tensors (needs only the static shape, args' b-side);
+        # small M: race on this call, with the grid sized for the smallest candidate tile
+        points = None
+        if small_m:
+            min_bm = min(c[0] for c in _gnt_nt_candidates(N))
+            points = [(_args(((M_pad + min_bm - 1) // min_bm + G) * n_blocks), out)]
+        bm, gm, xcd, gn = _select_nt_cfg(at_key, K, G, N, cbsz, blgp, out_fp16, persistent, _args(0), points)
         launch = _get_nt_launch(K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent)
         entry = [launch, None, bm]
         _GNT_AT_CACHE[at_key] = entry
