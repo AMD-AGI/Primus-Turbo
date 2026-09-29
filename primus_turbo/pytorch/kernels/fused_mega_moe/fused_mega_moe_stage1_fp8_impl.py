@@ -10,7 +10,6 @@ Stage1 owns the forward dispatch + fc1 and the fc1-input pool requant for dW1; o
 L1 dgrad and the dW1 wgrad. Every call below is a helper the fused path already uses.
 """
 
-import os
 from typing import Optional, Tuple
 
 import torch
@@ -21,6 +20,7 @@ from primus_turbo.flydsl.mega.fp8 import (
     combine_l1_dgrad_mxfp8_flydsl_kernel,
     dispatch_l1_fwd_mxfp8_flydsl_kernel,
 )
+from primus_turbo.flydsl.mega.fp8.combine_autotune import env_combine_cu
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity
 from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_fp8_weights import (
@@ -85,9 +85,7 @@ def _mxfp8_variable_k_wgrad_dw1(
 # L1 dgrad combine CU split: 28 was unified w/ fwd L2 (task-based push; T=8192) on DSv3. Like
 # ``_L2_NUM_COMBINE_CU`` this optimum moves with the expert shape, so ``None`` lets the combine's
 # online autotune pick it; the env pins a value and skips tuning.
-_L1_NUM_COMBINE_CU = (
-    int(os.environ["PT_MEGA_FP8_L1_COMBINE_CU"]) if "PT_MEGA_FP8_L1_COMBINE_CU" in os.environ else None
-)
+_L1_NUM_COMBINE_CU = env_combine_cu("PT_MEGA_FP8_L1_COMBINE_CU")
 
 
 def _l1_dgrad_combine_mxfp8_flydsl_kernel(

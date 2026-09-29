@@ -64,6 +64,7 @@ from collections import defaultdict
 import torch
 
 __all__ = [
+    "env_combine_cu",
     "choose_combine_cu",
     "locked_combine_cu",
     "observe_combine_cu",
@@ -72,11 +73,29 @@ __all__ = [
 ]
 
 
+def _positive_cu(name, raw):
+    # 0 is not "off" for a CU split: the combine reads it as "no PUSH role", and with the reduce on,
+    # as in every production call, the reduce would then wait forever for arrivals nobody sends.
+    try:
+        cu = int(raw)
+    except ValueError:
+        cu = 0
+    if cu <= 0:
+        raise ValueError(f"{name}={raw!r}: the combine CU split must be a positive block count")
+    return cu
+
+
 def _env_int_list(name, default):
     raw = os.environ.get(name)
     if not raw:
         return default
-    return tuple(int(v) for v in raw.replace(",", " ").split())
+    return tuple(_positive_cu(name, v) for v in raw.replace(",", " ").split())
+
+
+def env_combine_cu(name):
+    """A ``PT_MEGA_FP8_L{1,2}_COMBINE_CU``-style pin: its positive CU count, or None when unset."""
+    raw = os.environ.get(name)
+    return _positive_cu(name, raw) if raw else None
 
 
 # Spans both regimes seen so far: 16-32 is where DSv3-sized experts land, 80-128 where Qwen3-sized

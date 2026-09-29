@@ -581,6 +581,11 @@ def _compile(
         "removed as slower than one-WG-per-tile."
     )
     assert num_reduce_cu >= 0, f"num_reduce_cu={num_reduce_cu}: a cap on the empty blocks, or 0 for off"
+    assert num_combine_cu >= 0, f"num_combine_cu={num_combine_cu}: a block count, or 0 for no PUSH role"
+    assert num_combine_cu > 0 or num_reduce_cu == 0, (
+        f"num_combine_cu=0 with num_reduce_cu={num_reduce_cu}: with no PUSH role nothing ever sends the "
+        "payload the reduce waits for, so every reduce block would spin forever"
+    )
     _no_gemm = num_gemm_cu == 0
     gemm_base = num_combine_cu
     H4 = out_features // 4

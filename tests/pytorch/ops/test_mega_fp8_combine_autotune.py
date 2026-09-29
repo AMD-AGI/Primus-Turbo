@@ -31,6 +31,7 @@ if is_gfx1250():
 
 import primus_turbo.flydsl.mega.fp8.combine_autotune as combine_autotune  # noqa: E402
 from primus_turbo.flydsl.mega.fp8.grouped_gemm_combine_fp8_kernel import (  # noqa: E402
+    _compile,
     _launch_maybe_tuned,
 )
 
@@ -170,6 +171,57 @@ def test_pinned_split_bypasses_the_tuner(no_events):
     _launch_maybe_tuned(key, 64, _FALLBACK, None, launch)
     assert launch.chosen == [64]
     assert key not in combine_autotune._STATE
+
+
+@pytest.mark.parametrize("raw", ["0", "-8", "abc"])
+def test_env_pin_must_be_a_positive_count(monkeypatch, raw):
+    # 0 would mean "no PUSH role" to the combine, with the reduce still waiting for its payload.
+    monkeypatch.setenv("PT_MEGA_FP8_L1_COMBINE_CU", raw)
+    with pytest.raises(ValueError, match="PT_MEGA_FP8_L1_COMBINE_CU"):
+        combine_autotune.env_combine_cu("PT_MEGA_FP8_L1_COMBINE_CU")
+
+
+def test_env_pin_parses_or_stays_unset(monkeypatch):
+    monkeypatch.setenv("PT_MEGA_FP8_L2_COMBINE_CU", "64")
+    assert combine_autotune.env_combine_cu("PT_MEGA_FP8_L2_COMBINE_CU") == 64
+    monkeypatch.delenv("PT_MEGA_FP8_L2_COMBINE_CU")
+    assert combine_autotune.env_combine_cu("PT_MEGA_FP8_L2_COMBINE_CU") is None
+
+
+def test_candidate_list_must_be_positive(monkeypatch):
+    # The tuner launches every candidate for real, so a 0 in the list would hang the tuning call.
+    monkeypatch.setenv("PT_MEGA_FP8_COMBINE_CU_CANDIDATES", "16 0 32")
+    with pytest.raises(ValueError, match="PT_MEGA_FP8_COMBINE_CU_CANDIDATES"):
+        combine_autotune._env_int_list("PT_MEGA_FP8_COMBINE_CU_CANDIDATES", (16,))
+
+
+_COMPILE_SHAPE = dict(
+    out_features=1024,  # the fp8 reduce needs hidden % 1024 == 0
+    hidden_size=256,
+    num_max_pool_tokens=256,
+    BLOCK_M=256,
+    BLOCK_N=256,
+    combine_slots=256,
+    topk=4,
+    num_experts=16,
+    rank=0,
+    num_ranks=8,
+    apply_weights=True,
+    with_gate=False,
+)
+
+
+@pytest.mark.parametrize("num_combine_cu, num_reduce_cu", [(0, 256), (-1, 0)])
+def test_combine_rejects_a_reduce_with_no_push(num_combine_cu, num_reduce_cu):
+    """Whatever the source -- env pin, candidate list, or an explicit argument -- the kernel builder
+    refuses a split that would leave the reduce spinning, before anything is launched."""
+    with pytest.raises(AssertionError, match="num_combine_cu"):
+        _compile(num_combine_cu=num_combine_cu, num_reduce_cu=num_reduce_cu, **_COMPILE_SHAPE)
+
+
+def test_combine_still_builds_the_push_free_isolation_variant():
+    # (0 PUSH, 0 reduce) is the GEMM-alone build the benches time; the guard must not refuse it.
+    assert _compile(num_combine_cu=0, num_reduce_cu=0, **_COMPILE_SHAPE) is not None
 
 
 class _Launch:
