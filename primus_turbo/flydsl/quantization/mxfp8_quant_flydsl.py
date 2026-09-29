@@ -1197,14 +1197,12 @@ _GROUPED_QDUAL_CACHE: dict = {}
 _GROUPED_QDUAL_NCU: dict = {}  # device -> CU count
 
 
-def _grouped_qdual_tpw(M_pad_col, N, G, num_cu):
-    """Column tiles per WG: amortize the O(G) band scan (<= G/4 tiles, G=32: 68 -> 29 us at
-    3072x4096) while keeping >= 1.5 WGs per CU in flight for latency hiding."""
+def _grouped_qdual_tpw(M_pad_col, N, num_cu):
+    """Column tiles per WG: 2 amortizes the per-WG offset-table set-up (most at large G); more
+    tiles lose latency hiding (3072x4096 G=32: 18.5 us at 2, 22.2 us at 8). 1 below 1.5 WGs/CU."""
     nbk = _ceil128(N) // _GQD_BK
-    min_grid = 3 * num_cu // 2
-    for tpw in (8, 4, 2):
-        if nbk % tpw == 0 and tpw <= G // 4 and grouped_qdual_grid(M_pad_col, N, tpw) >= min_grid:
-            return tpw
+    if nbk % 2 == 0 and grouped_qdual_grid(M_pad_col, N, 2) >= 3 * num_cu // 2:
+        return 2
     return 1
 
 
@@ -1245,7 +1243,7 @@ def grouped_quant_mxfp8_raw(x, group_lens, group_offs, out_dtype):
         num_cu = _GROUPED_QDUAL_NCU[x.device] = torch.cuda.get_device_properties(
             x.device
         ).multi_processor_count
-    tpw = _grouped_qdual_tpw(M_pad_col, N, G, num_cu)
+    tpw = _grouped_qdual_tpw(M_pad_col, N, num_cu)
     grid = grouped_qdual_grid(M_pad_col, N, tpw)
     out_fp8 = "e5m2" if out_dtype == torch.float8_e5m2 else "e4m3"
 
