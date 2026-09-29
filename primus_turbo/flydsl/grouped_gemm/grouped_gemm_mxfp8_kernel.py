@@ -1694,6 +1694,10 @@ _GWG_CFG_CACHE: dict = {}  # at_key -> (bm, bn, gm, xcd, gn) chosen by autotune
 
 # variable-K wgrad config autotune (mirrors the fwd/dgrad NT path).
 _GWG_WGRAD_DEFAULT_CFG = (256, 256, 4, 8, 0)  # (bm, bn, gm, xcd, gn); cand[0] = base ref (prior fixed cfg)
+# beta=1 (fused main_grad) cannot race, so it runs one fixed cfg. xcd=1: the XCD remap hands each
+# XCD a contiguous run of tiles, i.e. whole groups, so a heavy group piles onto one XCD
+# (DSV4 FC1 hot50 1001 -> 808 us, 16x65536x7168 random 1817 -> 974 us; never slower on uniform).
+_GWG_WGRAD_BETA1_CFG = (256, 256, 4, 1, 0)
 
 
 def _gwg_wgrad_candidates():
@@ -1713,7 +1717,9 @@ def _gwg_wgrad_candidates():
     ]
 
 
-def _get_wgrad_launch(OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one, out_fp32=False):
+def _get_wgrad_launch(
+    OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one, out_fp32=False
+):
     fk = (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one, out_fp32)
     launch = _GWG_FUSED_CACHE.get(fk)
     if launch is None:
@@ -1735,8 +1741,8 @@ def _select_wgrad_cfg(
     if beta_is_one:
         # beta=1 accumulates into out, so a re-launch is not idempotent: each candidate would add
         # another acc, which corrupts the caller's gradient and leaves the drift check below
-        # unable to ever pass. Tuning this path needs a scratch output; until then, base cfg.
-        return _GWG_WGRAD_DEFAULT_CFG
+        # unable to ever pass. Tuning this path needs a scratch output; until then, a fixed cfg.
+        return _GWG_WGRAD_BETA1_CFG
     if torch.cuda.is_current_stream_capturing():
         return _GWG_WGRAD_DEFAULT_CFG  # don't cache under capture -> autotune on a later eager call
     # The default cfg is the base, always: every other candidate is only ever accepted by
