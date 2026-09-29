@@ -89,7 +89,24 @@ def _env_int_list(name, default):
     raw = os.environ.get(name)
     if not raw:
         return default
-    return tuple(_positive_cu(name, v) for v in raw.replace(",", " ").split())
+    cands = tuple(_positive_cu(name, v) for v in raw.replace(",", " ").split())
+    if not cands:
+        raise ValueError(f"{name}={raw!r}: need at least one candidate CU split")
+    return cands
+
+
+def _env_positive_int(name, default):
+    # An empty schedule would lock in at the first call, on a candidate that was never measured.
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        raise ValueError(f"{name}={raw!r}: must be a positive integer")
+    return value
 
 
 def env_combine_cu(name):
@@ -105,7 +122,7 @@ _CANDIDATES = _env_int_list("PT_MEGA_FP8_COMBINE_CU_CANDIDATES", (16, 32, 48, 64
 
 # Samples per candidate. The first use of a candidate pays its kernel compile, so that sample is a
 # wild outlier -- taking the min over repeats discards it without a separate warmup phase.
-_REPS = int(os.environ.get("PT_MEGA_FP8_COMBINE_TUNE_REPS", "3"))
+_REPS = _env_positive_int("PT_MEGA_FP8_COMBINE_TUNE_REPS", 3)
 
 _ENABLED = os.environ.get("PT_MEGA_FP8_COMBINE_AUTOTUNE", "1") not in ("0", "false", "False")
 

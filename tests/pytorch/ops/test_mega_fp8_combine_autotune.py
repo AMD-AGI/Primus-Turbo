@@ -188,11 +188,28 @@ def test_env_pin_parses_or_stays_unset(monkeypatch):
     assert combine_autotune.env_combine_cu("PT_MEGA_FP8_L2_COMBINE_CU") is None
 
 
-def test_candidate_list_must_be_positive(monkeypatch):
-    # The tuner launches every candidate for real, so a 0 in the list would hang the tuning call.
-    monkeypatch.setenv("PT_MEGA_FP8_COMBINE_CU_CANDIDATES", "16 0 32")
+@pytest.mark.parametrize("raw", ["16 0 32", ",", " , "])
+def test_candidate_list_must_be_positive_and_non_empty(monkeypatch, raw):
+    # The tuner launches every candidate for real, so a 0 in the list would hang the tuning call,
+    # and an empty list leaves nothing to choose from.
+    monkeypatch.setenv("PT_MEGA_FP8_COMBINE_CU_CANDIDATES", raw)
     with pytest.raises(ValueError, match="PT_MEGA_FP8_COMBINE_CU_CANDIDATES"):
         combine_autotune._env_int_list("PT_MEGA_FP8_COMBINE_CU_CANDIDATES", (16,))
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "x"])
+def test_tune_reps_must_be_positive(monkeypatch, raw):
+    # 0 reps is an empty schedule, which would lock in an unmeasured candidate on the first call.
+    monkeypatch.setenv("PT_MEGA_FP8_COMBINE_TUNE_REPS", raw)
+    with pytest.raises(ValueError, match="PT_MEGA_FP8_COMBINE_TUNE_REPS"):
+        combine_autotune._env_positive_int("PT_MEGA_FP8_COMBINE_TUNE_REPS", 3)
+
+
+def test_tune_reps_parses_or_defaults(monkeypatch):
+    monkeypatch.setenv("PT_MEGA_FP8_COMBINE_TUNE_REPS", "5")
+    assert combine_autotune._env_positive_int("PT_MEGA_FP8_COMBINE_TUNE_REPS", 3) == 5
+    monkeypatch.delenv("PT_MEGA_FP8_COMBINE_TUNE_REPS")
+    assert combine_autotune._env_positive_int("PT_MEGA_FP8_COMBINE_TUNE_REPS", 3) == 3
 
 
 _COMPILE_SHAPE = dict(
