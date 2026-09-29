@@ -341,8 +341,12 @@ class FlashAttnFunc(torch.autograd.Function):
         _, seq_len_kv, num_heads_k, head_dim_k = k.size()
         _, _, num_heads_v, head_dim_v = v.size()
 
+        # dq is left uninitialised like dk/dv: aiter's backward either writes every element
+        # (dq_acc post-processing) or zeroes dq itself first when it accumulates in place.
+        # This was torch.ones() since #275 -- a full extra pass over dq that aiter then
+        # zeroed again anyway.
         if qkv_format == "sbhd":
-            dq = torch.ones(
+            dq = torch.empty(
                 (seq_len_q, batch_size, num_heads_q, head_dim_qk), dtype=q.dtype, device=q.device
             ).permute(1, 0, 2, 3)
             dk = torch.empty(
@@ -352,7 +356,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 (seq_len_kv, batch_size, num_heads_v, head_dim_v), dtype=v.dtype, device=v.device
             ).permute(1, 0, 2, 3)
         elif qkv_format == "bhsd":
-            dq = torch.ones(
+            dq = torch.empty(
                 (batch_size, num_heads_q, seq_len_q, head_dim_qk), dtype=q.dtype, device=q.device
             ).permute(0, 2, 1, 3)
             dk = torch.empty(
@@ -362,7 +366,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 (batch_size, num_heads_v, seq_len_kv, head_dim_v), dtype=v.dtype, device=v.device
             ).permute(0, 2, 1, 3)
         else:
-            dq = torch.ones((batch_size, seq_len_q, num_heads_q, head_dim_qk), dtype=q.dtype, device=q.device)
+            dq = torch.empty((batch_size, seq_len_q, num_heads_q, head_dim_qk), dtype=q.dtype, device=q.device)
             dk = torch.empty(
                 (batch_size, seq_len_kv, num_heads_k, head_dim_k), dtype=k.dtype, device=k.device
             )
