@@ -822,10 +822,8 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
         grad_a = grad_a[: ctx.total_m]
 
         # wgrad: grad_b[g] = grad_out_col[g] @ a_col[g]^T  (variable-K over colwise-128 M_g)
-        # FlyDSL is the default for the ordinary path, where it is faster. Its beta=1
-        # epilogue only writes 16-bit, so the fused path defaults to Triton, which also
-        # covers the fp32 main_grad Megatron allocates by default; pin FlyDSL through
-        # GlobalBackendManager when main_grad matches the weight's own bf16/fp16 dtype.
+        # FlyDSL on both paths: its beta=1 epilogue accumulates into a bf16/fp16/fp32
+        # main_grad (fp32 is what Megatron allocates by default).
         grad_b = _grouped_gemm_fp8_variable_k_impl_wrapper(
             grad_out_t_fp8,
             a_fp8_col,
@@ -839,7 +837,7 @@ class FP8GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=ctx.num_cu,
-            default_backend=(BackendType.TRITON.value if ctx.fuse_bgrad_accum else BackendType.FLYDSL.value),
+            default_backend=BackendType.FLYDSL.value,
             inplace_add_to_out=ctx.fuse_bgrad_accum,
             out=ctx.main_grad,
         )

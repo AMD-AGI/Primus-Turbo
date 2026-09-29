@@ -798,12 +798,7 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
     ) -> bool:
         supported = True
         if inplace_add_to_out:
-            _out_allowed = (
-                (torch.bfloat16, torch.float16)
-                if granularity == ScalingGranularity.MX_BLOCKWISE
-                else (torch.bfloat16, torch.float16, torch.float32)
-            )
-            supported &= out is not None and out.dtype in _out_allowed
+            supported &= out is not None and out.dtype in (torch.bfloat16, torch.float16, torch.float32)
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8VariableKFlyDSLBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8VariableKFlyDSLBackend.SUPPORTED_GRANULARITIES
@@ -858,6 +853,7 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
         m_real = kwargs.get("m_real", None)
         n_real = kwargs.get("n_real", None)
         c_tight = m_real is not None or n_real is not None
+        store_dtype = accum_out.dtype if accum_out is not None else out_dtype
 
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp8_kernel import (
@@ -876,13 +872,12 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
                 OUT_M,
                 OUT_N,
                 G,
-                out_dtype=out_dtype,
+                out_dtype=store_dtype,
                 num_cu=num_cu,
                 beta=beta,
                 out=accum_out,
             )
 
-        store_dtype = accum_out.dtype if accum_out is not None else out_dtype
         return grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
             lhs,
             rhs,

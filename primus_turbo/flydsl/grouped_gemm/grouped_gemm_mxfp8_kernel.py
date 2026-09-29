@@ -1041,6 +1041,7 @@ def _build_grouped_mxfp8_wgrad_kernel(
     out_fp16: bool = False,
     chunk: int = 8,
     beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
+    out_fp32: bool = False,  # C is fp32 (fused main_grad accumulate target)
 ):
     """Grouped MXFP8 variable-K wgrad (runtime per-group contraction M_g)."""
     BLOCK_K = 128
@@ -1086,7 +1087,7 @@ def _build_grouped_mxfp8_wgrad_kernel(
         m_total: fx.Int32,  # total padded contraction length (LHS/RHS leading dim)
     ):
         F8_IR_t = fx.Float8E4M3FN.ir_type
-        _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
+        _out_ty = fx.Float32 if out_fp32 else (fx.Float16 if out_fp16 else fx.BFloat16)
         go = fx.rocdl.make_buffer_tensor(group_offs, max_size=False, num_records_bytes=(G + 1) * 8)
         go_div = fx.logical_divide(go, fx.make_layout(1, 1))
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -1290,7 +1291,7 @@ def _build_grouped_mxfp8_wgrad_kernel(
 
 # ── wgrad host wrapper ───────────────────────────────────────────────────────
 
-_GWG_FUSED_CACHE: dict = {}  # (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta1) -> launch
+_GWG_FUSED_CACHE: dict = {}  # (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta1, out_fp32) -> launch
 _GWG_WS_CACHE: dict = {}  # (OUT_M, OUT_N, device, stream) -> (a_sp, b_sp), sized to the largest K128 seen
 
 # variable-K wgrad config autotune (mirrors the fwd/dgrad NT path).
@@ -1313,12 +1314,14 @@ def _gwg_wgrad_candidates():
     ]
 
 
-def _get_wgrad_launch(OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one):
-    fk = (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one)
+def _get_wgrad_launch(
+    OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one, out_fp32=False
+):
+    fk = (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one, out_fp32)
     launch = _GWG_FUSED_CACHE.get(fk)
     if launch is None:
         launch = _compile_grouped_mxfp8_wgrad_fused(
-            OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one
+            OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one, out_fp32
         )
         _GWG_FUSED_CACHE[fk] = launch
     return launch
@@ -1333,8 +1336,10 @@ _GWG_RACE = Race.interleaved(1, 50, warmup=250, visit=(0, 5), margin=0.985, chec
 _GROUPED_GEMM_MXFP8_VARIABLE_K = Op("grouped_gemm_mxfp8_variable_k", release=True)
 
 
-def _gwg_entry(cfg, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one, tuned=True):
-    launch = _get_wgrad_launch(OUT_M, OUT_N, G, *cfg, cbsz, blgp, out_fp16, beta_is_one=beta_is_one)
+def _gwg_entry(cfg, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one, tuned=True, out_fp32=False):
+    launch = _get_wgrad_launch(
+        OUT_M, OUT_N, G, *cfg, cbsz, blgp, out_fp16, beta_is_one=beta_is_one, out_fp32=out_fp32
+    )
     return Entry(cfg, launch, tuned=tuned)
 
 
@@ -1351,21 +1356,21 @@ def _gwg_probe(args, beta_is_one):
     return Synthetic(scratch)
 
 
-def _pick_gwg(key, args, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one):
+def _pick_gwg(key, args, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one, out_fp32=False):
     """The beta=0 entry for the shape (a beta=1 call runs it with the accumulating epilogue).
     Timed at beta=0 for either beta, unlike the fp8 wgrad, which times at beta=1 because the C
     read-back reorders its candidates; whether it reorders these is unmeasured."""
     cfgs = _gwg_wgrad_candidates()
     space = staged(Refine(lambda _prev: cfgs, _GWG_RACE), base=cfgs[0])
     build = _GROUPED_GEMM_MXFP8_VARIABLE_K.build(
-        lambda cfg: _gwg_entry(cfg, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, False)
+        lambda cfg: _gwg_entry(cfg, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, False, out_fp32=out_fp32)
     )
     res = _GROUPED_GEMM_MXFP8_VARIABLE_K.pick(key, space, probe=_gwg_probe(args, beta_is_one), build=build)
     return build.winner(res)
 
 
 def _compile_grouped_mxfp8_wgrad_fused(
-    OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one=False
+    OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one=False, out_fp32=False
 ):
     pre_kern, a_ngrp, b_ngrp = _build_grouped_wgrad_preshuffle_kernel(OUT_M, OUT_N)
     gemm_kern, BM, BN, wpe, TOTAL = _build_grouped_mxfp8_wgrad_kernel(
@@ -1381,6 +1386,7 @@ def _compile_grouped_mxfp8_wgrad_fused(
         blgp=blgp,
         out_fp16=out_fp16,
         beta_is_one=beta_is_one,
+        out_fp32=out_fp32,
     )
 
     @flyc.jit
@@ -1458,6 +1464,7 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
     assert rhs.shape[1] == M_total
     assert M_total % 128 == 0
     out_fp16 = out_dtype == torch.float16
+    out_fp32 = out_dtype == torch.float32
     cbsz = 1 if lhs.dtype == torch.float8_e5m2 else 0
     blgp = 1 if rhs.dtype == torch.float8_e5m2 else 0
     K128 = M_total // 128
@@ -1485,16 +1492,16 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
     args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, go, M_total, K128, n_kt, a_blocks, pre_grid, stream)
     # beta=1 takes the beta=0 pick for the shape (the same kernel with the accumulating
     # epilogue), and that race runs on a scratch output when beta=0 has not been picked yet.
-    key = (OUT_M, OUT_N, G, cbsz, blgp, out_fp16, False)
+    key = (OUT_M, OUT_N, G, cbsz, blgp, out_fp16, False, out_fp32)
     entry = _GROUPED_GEMM_MXFP8_VARIABLE_K.entry(
-        key, lambda: _pick_gwg(key, args, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one)
+        key, lambda: _pick_gwg(key, args, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one, out_fp32)
     )
     if beta_is_one:
         entry = _GROUPED_GEMM_MXFP8_VARIABLE_K.derived(
             key,
             True,
             entry,
-            lambda e: _gwg_entry(e.config, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, True, e.tuned),
+            lambda e: _gwg_entry(e.config, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, True, e.tuned, out_fp32),
         )
     _GROUPED_GEMM_MXFP8_VARIABLE_K.launch(entry, args)
     return out
