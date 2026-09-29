@@ -209,7 +209,6 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
             self.assertGreaterEqual(snr, _SNR_FLOOR_DB, f"[{tag}] SNR {snr:.2f} dB < {_SNR_FLOOR_DB}")
             self.assertGreaterEqual(cos, _COSINE_FLOOR, f"[{tag}] cosine {cos:.5f} < {_COSINE_FLOOR}")
 
-
     @skip_unless_mxfp8
     @skip_if_lt_x_gpu(8)
     @parametrize("num_topk", [8, 6])
@@ -285,7 +284,9 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
                     self.rank, self.world_size, seed=4200 + 91 * p, **shape
                 )
                 _g = torch.randn(x.shape, device=self.device, dtype=torch.float32)
-                passes.append((x, topk_idx, topk_weight, (_g / (_g.norm() + 1e-12) * _GRAD_OUT_NORM).bfloat16()))
+                passes.append(
+                    (x, topk_idx, topk_weight, (_g / (_g.norm() + 1e-12) * _GRAD_OUT_NORM).bfloat16())
+                )
 
             def accumulate(run_one):
                 """All layers per pass, then one backward -- so each layer's backward runs with
@@ -308,9 +309,7 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
                     for lyr in range(num_layers):
                         dx_acc[lyr] += xs[lyr].grad.float()
                         dtw_acc[lyr] += tws[lyr].grad.float()
-                return [
-                    (l1.grad, l2.grad, dx_acc[lyr], dtw_acc[lyr]) for lyr, (l1, l2) in enumerate(ws)
-                ]
+                return [(l1.grad, l2.grad, dx_acc[lyr], dtw_acc[lyr]) for lyr, (l1, l2) in enumerate(ws)]
 
             def mega(x, topk_idx, tw, l1, l2):
                 l1_out, dwib, handle, state = fused_mega_moe_fp8_stage1(x, topk_idx, tw, l1, group)
