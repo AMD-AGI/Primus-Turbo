@@ -1135,9 +1135,8 @@ def _run_grouped_gemm_fp8_fused_grad_accum_test(
     accumulate target instead of returning a gradient for autograd to add on top, so
     the check is that the buffer moved by exactly the wgrad the ordinary path produces.
 
-    ``main_grad_dtype`` is fp32 as Megatron allocates it; the tensorwise FlyDSL accumulate
-    epilogue now writes fp32 natively, so it takes the fp32 main_grad too. (MXFP8 FlyDSL
-    still stores 16-bit and keeps the weight's own dtype.)
+    ``main_grad_dtype`` is fp32 as Megatron allocates it; the tensorwise and MXFP8 FlyDSL
+    accumulate epilogues write fp32 natively, so they take the fp32 main_grad too.
     """
     seed = 42
     torch.manual_seed(seed)
@@ -1255,12 +1254,15 @@ def test_grouped_gemm_fp8_tensorwise_fused_grad_accum(ori_dtype, trans_b, backen
 
 @pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
 @pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.FLYDSL])
-def test_grouped_gemm_fp8_mx_fused_grad_accum(ori_dtype, backend):
+@pytest.mark.parametrize("main_grad_fp32", [True, False], ids=["main_grad_fp32", "main_grad_16bit"])
+def test_grouped_gemm_fp8_mx_fused_grad_accum(ori_dtype, backend, main_grad_fp32):
     """MXFP8 grouped GEMM is NT-only, so trans_b is fixed rather than swept."""
     if backend == BackendType.FLYDSL and get_device_compute_capability() < (9, 5):
         pytest.skip("FlyDSL MXFP8 grouped GEMM is gfx950-only")
-    # MXFP8 FlyDSL keeps the weight dtype (fp32 native accumulate is tensorwise-only).
-    main_grad_dtype = ori_dtype if backend == BackendType.FLYDSL else torch.float32
+    if not main_grad_fp32 and backend != BackendType.FLYDSL:
+        pytest.skip("16-bit main_grad accumulate is only exercised on the FlyDSL epilogue")
+    # MXFP8 FlyDSL accumulates into either Megatron's fp32 main_grad or one in the weight dtype.
+    main_grad_dtype = torch.float32 if main_grad_fp32 else ori_dtype
     _run_grouped_gemm_fp8_fused_grad_accum_test(
         B=4,
         M=256,

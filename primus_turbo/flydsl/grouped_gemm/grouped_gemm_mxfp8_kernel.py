@@ -1419,6 +1419,7 @@ def _build_grouped_mxfp8_wgrad_kernel(
     out_fp16: bool = False,
     chunk: int = 8,
     beta_is_one: bool = False,  # epilogue accumulates (C += acc) instead of overwriting
+    out_fp32: bool = False,  # C is fp32 (fused main_grad accumulate target)
 ):
     """Grouped MXFP8 variable-K wgrad (runtime per-group contraction M_g)."""
     BLOCK_K = 128
@@ -1464,7 +1465,7 @@ def _build_grouped_mxfp8_wgrad_kernel(
         m_total: fx.Int32,  # total padded contraction length (LHS/RHS leading dim)
     ):
         F8_IR_t = fx.Float8E4M3FN.ir_type
-        _out_ty = fx.Float16 if out_fp16 else fx.BFloat16
+        _out_ty = fx.Float32 if out_fp32 else (fx.Float16 if out_fp16 else fx.BFloat16)
         go = fx.rocdl.make_buffer_tensor(group_offs, max_size=False, num_records_bytes=(G + 1) * 8)
         go_div = fx.logical_divide(go, fx.make_layout(1, 1))
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -1670,9 +1671,9 @@ def _build_grouped_mxfp8_wgrad_kernel(
 
 # ── wgrad host wrapper ───────────────────────────────────────────────────────
 
-_GWG_FUSED_CACHE: dict = {}  # (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta1) -> launch
+_GWG_FUSED_CACHE: dict = {}  # (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta1, out_fp32) -> launch
 _GWG_WS_CACHE: dict = {}  # (OUT_M, OUT_N, K128, device, stream) -> (a_sp, b_sp)
-_GWG_AT_CACHE: dict = {}  # (OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta1) -> [raw, compiled]
+_GWG_AT_CACHE: dict = {}  # (OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta1, out_fp32) -> [raw, compiled]
 _GWG_CFG_CACHE: dict = {}  # at_key -> (bm, bn, gm, xcd, gn) chosen by autotune
 
 # variable-K wgrad config autotune (mirrors the fwd/dgrad NT path).
@@ -1696,18 +1697,20 @@ def _gwg_wgrad_candidates():
     ]
 
 
-def _get_wgrad_launch(OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one):
-    fk = (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one)
+def _get_wgrad_launch(OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one, out_fp32=False):
+    fk = (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one, out_fp32)
     launch = _GWG_FUSED_CACHE.get(fk)
     if launch is None:
         launch = _compile_grouped_mxfp8_wgrad_fused(
-            OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one
+            OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one, out_fp32
         )
         _GWG_FUSED_CACHE[fk] = launch
     return launch
 
 
-def _select_wgrad_cfg(at_key, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one, out_view, args):
+def _select_wgrad_cfg(
+    at_key, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one, out_view, args, out_fp32=False
+):
     """First-call micro-bench for this static shape; cache the winning (bm,bn,gm,xcd,gn).
     Guarded: falls back to the base cfg under CUDA-graph capture or if anything faults."""
     cached = _GWG_CFG_CACHE.get(at_key)
@@ -1728,7 +1731,7 @@ def _select_wgrad_cfg(at_key, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one
     # the OOB rows/cols, so every candidate is legal at any OUT_M/OUT_N.
     base_cfg = _GWG_WGRAD_DEFAULT_CFG
     try:
-        base = _get_wgrad_launch(OUT_M, OUT_N, G, *base_cfg, cbsz, blgp, out_fp16, beta_is_one)
+        base = _get_wgrad_launch(OUT_M, OUT_N, G, *base_cfg, cbsz, blgp, out_fp16, beta_is_one, out_fp32)
         base(*args)
         torch.cuda.synchronize()
         ref = out_view.detach().clone().float()
@@ -1747,7 +1750,7 @@ def _select_wgrad_cfg(at_key, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one
 
     for cfg in [c for c in _gwg_wgrad_candidates() if c != base_cfg]:
         try:
-            launch = _get_wgrad_launch(OUT_M, OUT_N, G, *cfg, cbsz, blgp, out_fp16, beta_is_one)
+            launch = _get_wgrad_launch(OUT_M, OUT_N, G, *cfg, cbsz, blgp, out_fp16, beta_is_one, out_fp32)
             launch(*args)
             torch.cuda.synchronize()
             if not _matches_base():  # never adopt a config that drifts from the base
@@ -1763,7 +1766,7 @@ def _select_wgrad_cfg(at_key, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one
 
 
 def _compile_grouped_mxfp8_wgrad_fused(
-    OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one=False
+    OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one=False, out_fp32=False
 ):
     pre_kern, a_ngrp, b_ngrp = _build_grouped_wgrad_preshuffle_kernel(OUT_M, OUT_N)
     gemm_kern, BM, BN, wpe, TOTAL = _build_grouped_mxfp8_wgrad_kernel(
@@ -1779,6 +1782,7 @@ def _compile_grouped_mxfp8_wgrad_fused(
         blgp=blgp,
         out_fp16=out_fp16,
         beta_is_one=beta_is_one,
+        out_fp32=out_fp32,
     )
 
     @flyc.jit
@@ -1854,6 +1858,7 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
     assert rhs.shape[1] == M_total
     assert M_total % 128 == 0
     out_fp16 = out_dtype == torch.float16
+    out_fp32 = out_dtype == torch.float32
     cbsz = 1 if lhs.dtype == torch.float8_e5m2 else 0
     blgp = 1 if rhs.dtype == torch.float8_e5m2 else 0
     K128 = M_total // 128
@@ -1879,14 +1884,16 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
 
     # Single universal variable-K kernel: chunk-local SSA accumulation, no balance detection.
     args = (a8, b8, out, a_raw, b_raw, a_sp, b_sp, go, M_total, K128, n_kt, a_blocks, pre_grid, stream)
-    at_key = (OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one)
+    at_key = (OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one, out_fp32)
     entry = _GWG_AT_CACHE.get(at_key)
     if entry is None:
         # first call for this shape: autotune (bm,bn,gm,xcd,gn) (eager only; base cfg under capture).
         bm, bn, gm, xcd, gn = _select_wgrad_cfg(
-            at_key, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one, out, args
+            at_key, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one, out, args, out_fp32
         )
-        launch = _get_wgrad_launch(OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one)
+        launch = _get_wgrad_launch(
+            OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one, out_fp32
+        )
         entry = [launch, None]
         _GWG_AT_CACHE[at_key] = entry
     run_eager_or_capture(entry, args, 1)
