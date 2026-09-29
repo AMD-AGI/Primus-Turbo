@@ -44,9 +44,21 @@ choice unanimous with one small all-reduce, once per key. It is optional: the CU
 partitions this rank's own push work -- a receiver's expectations come from the routing, not from
 how many blocks the sender split its push across -- so a divergent pick is a performance wart
 rather than a correctness bug.
+
+CUDA graphs
+-----------
+Tuning needs real, timed, synchronized launches, so it cannot happen inside a capture: a captured
+call takes the winner if eager calls have already locked one, and the fallback otherwise
+(``locked_combine_cu``). Replay never re-enters this code, so a graph captured before lock-in keeps
+the fallback -- the pre-autotune constant -- for its whole lifetime. That costs the speedup, never
+correctness, and it warns once per shape. Locking takes ``len(_CANDIDATES) * _REPS + 1`` eager calls
+of a shape (all MoE layers of a model share one), which a short ``make_graphed_callables`` warmup
+may not reach; run more eager steps before capturing, or pin the split with
+``PT_MEGA_FP8_L{1,2}_COMBINE_CU``.
 """
 
 import os
+import warnings
 from collections import defaultdict
 
 import torch
@@ -103,6 +115,7 @@ class _KeyState:
 
 
 _STATE: dict = {}
+_WARNED_CAPTURE: set = set()
 
 
 def _drain(st, *, block=False):
@@ -169,13 +182,27 @@ def locked_combine_cu(key, *, default=None):
     This is the choice for a call inside CUDA graph capture. Tuning brackets each call with timing
     events and finally syncs and all-reduces, and none of that may enter a graph -- an event pair
     recorded during capture fails with ``invalid resource handle`` when a later call reads it. So a
-    captured call takes what eager calls have already settled on, which is the winner when the
-    capture follows eager warmup, as ``make_graphed_callables`` does.
+    captured call takes what eager calls have already settled on: the winner when enough eager
+    warmup preceded the capture, else ``default``, which the graph then keeps for good. The latter
+    warns once per key, since nothing else would show that the graph runs untuned.
     """
     if not _ENABLED:
         return default
     st = _STATE.get(key)
-    return default if st is None or st.winner is None else st.winner
+    if st is not None and st.winner is not None:
+        return st.winner
+    if key not in _WARNED_CAPTURE:
+        _WARNED_CAPTURE.add(key)
+        total = len(_CANDIDATES) * _REPS
+        seen = st.next_idx if st is not None else 0
+        warnings.warn(
+            f"[mega fp8] combine CU split for key={key} is still tuning ({seen}/{total} calls "
+            f"observed), so this CUDA graph captures the fallback {default} for its whole lifetime. "
+            f"Run at least {total + 1} eager calls of this shape before capturing, or pin the split "
+            "with PT_MEGA_FP8_L1_COMBINE_CU / PT_MEGA_FP8_L2_COMBINE_CU.",
+            stacklevel=2,
+        )
+    return default
 
 
 def observe_combine_cu(key, cu, ev_start, ev_end):

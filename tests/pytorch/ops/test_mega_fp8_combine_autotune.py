@@ -13,6 +13,8 @@ a fresh shape, or any call mid-schedule. ``launch`` stands in for the combine he
 so this exercises the tuner's host logic alone and needs a single GPU.
 """
 
+import warnings
+
 import pytest
 import torch
 
@@ -36,6 +38,7 @@ def _tuning_on(monkeypatch):
     monkeypatch.setattr(combine_autotune, "_ENABLED", True)
     monkeypatch.setattr(combine_autotune, "_VERBOSE", False)
     monkeypatch.setattr(combine_autotune, "_STATE", {})
+    monkeypatch.setattr(combine_autotune, "_WARNED_CAPTURE", set())
 
 
 class _Launch:
@@ -66,6 +69,14 @@ def _capture(key, launch):
     return launch.chosen[-1]
 
 
+def _capture_without_fallback_warning(key, launch):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cu = _capture(key, launch)
+    assert not [w for w in caught if "captures the fallback" in str(w.message)]
+    return cu
+
+
 def _schedule_len():
     return len(combine_autotune._CANDIDATES) * combine_autotune._REPS
 
@@ -79,9 +90,12 @@ def test_capture_before_lock_takes_fallback_and_leaves_tuning_alone(eager_calls_
     before = combine_autotune._STATE.get(key)
     next_idx = before.next_idx if before else 0
 
-    assert _capture(key, launch) == _FALLBACK
+    # The graph keeps the fallback for good, so it must say so -- once per key, not per capture.
+    with pytest.warns(UserWarning, match=f"captures the fallback {_FALLBACK}"):
+        assert _capture(key, launch) == _FALLBACK
+    assert _capture_without_fallback_warning(key, launch) == _FALLBACK
 
-    # Tuning is neither advanced nor poisoned by the captured call: eager calls carry on and lock.
+    # Tuning is neither advanced nor poisoned by the captured calls: eager calls carry on and lock.
     st = combine_autotune._STATE.get(key)
     assert (st.next_idx if st else 0) == next_idx
     for _ in range(_schedule_len() - next_idx + 1):
@@ -99,4 +113,4 @@ def test_capture_after_lock_takes_the_winner():
     winner = combine_autotune._STATE[key].winner
     assert winner is not None
 
-    assert _capture(key, launch) == winner
+    assert _capture_without_fallback_warning(key, launch) == winner
