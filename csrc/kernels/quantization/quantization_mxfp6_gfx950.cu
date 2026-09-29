@@ -336,6 +336,83 @@ __device__ __forceinline__ void stage_vector(uint16_t (&dst)[kStageVec],
     }
 }
 
+// The bias+GELU prologues over a whole bf16 tile already in LDS, in place, for the
+// async-staged arm.
+//
+// Same arithmetic as the generic staging loop, element for element: the only change is how
+// values move. The generic loop, as compiled, spent ~29 instructions per element of which
+// the GELU itself is ~12 -- one ds_read_u16 and ds_write_b16 per element, the bias
+// re-staged from global on every pass, and bf16 round-to-nearest-even done in integer ALU
+// twice per element. Here the tile moves as 16-byte vectors, the bias once per thread (a
+// thread's columns are the same on every pass), and rounding is v_cvt_pk_bf16_f32, which
+// agrees with the integer RNE on every non-NaN fp32 (checked exhaustively, all 2^32
+// inputs). A NaN stays a NaN either way, which the integer form
+// did not quite promise.
+using bf16x2_t  = __bf16 __attribute__((ext_vector_type(2)));
+using float2_t_ = float __attribute__((ext_vector_type(2)));
+
+__device__ __forceinline__ uint32_t pack_bf16x2_rne(const float lo, const float hi) {
+    const float2_t_ v = {lo, hi};
+    return __builtin_bit_cast(uint32_t, __builtin_convertvector(v, bf16x2_t));
+}
+
+__device__ __forceinline__ float bf16_lo(const uint32_t w) { return __builtin_bit_cast(float, w << 16); }
+__device__ __forceinline__ float bf16_hi(const uint32_t w) {
+    return __builtin_bit_cast(float, w & 0xffff0000u);
+}
+
+template <MXFP6Prologue PROLOGUE, int TILE_N, int LDS_PITCH, int TILE_M_ = TILE_M>
+__device__ __forceinline__ void gelu_prologue_bf16(uint16_t (*s_tile)[LDS_PITCH],
+                                                   const uint16_t *s_aux,
+                                                   const uint16_t *__restrict__ bias,
+                                                   const int tile_n, const int N) {
+    constexpr int VEC  = kStageVec;
+    constexpr int STEP = THREADS_PER_BLOCK * VEC;
+    static_assert(STEP % TILE_N == 0, "a thread's columns must not move between passes");
+    const int local_n = (threadIdx.x * VEC) % TILE_N;
+
+    float bias_f[VEC];
+    if (bias != nullptr) {
+        uint16_t b[VEC];
+        stage_vector(b, bias, 0, tile_n + local_n, N);
+#pragma unroll
+        for (int i = 0; i < VEC; ++i)
+            bias_f[i] = bf16_lo(b[i]);
+    }
+    // bias is uniform, so this is one branch per tile, not per element. It cannot become an
+    // add of zero: -0 + 0 is +0, and gelu keeps the sign of a zero.
+    const auto prep = [&](const float x, const int i) {
+        if (bias == nullptr)
+            return x;
+        const float s = x + bias_f[i];
+        return bf16_lo(pack_bf16x2_rne(s, 0.0f));
+    };
+
+#pragma unroll
+    for (int base = threadIdx.x * VEC; base < TILE_M_ * TILE_N; base += STEP) {
+        const int local_m = base / TILE_N;
+        const uint4 in = *reinterpret_cast<const uint4 *>(&s_tile[local_m][local_n]);
+        const uint32_t *w = reinterpret_cast<const uint32_t *>(&in);
+        uint4 g = {};
+        if constexpr (PROLOGUE == MXFP6Prologue::BiasGeluBackward)
+            g = *reinterpret_cast<const uint4 *>(&s_aux[local_m * TILE_N + local_n]);
+        const uint32_t *gw = reinterpret_cast<const uint32_t *>(&g);
+        uint4 out;
+        uint32_t *o = reinterpret_cast<uint32_t *>(&out);
+#pragma unroll
+        for (int j = 0; j < VEC / 2; ++j) {
+            const float x0 = prep(bf16_lo(w[j]), 2 * j);
+            const float x1 = prep(bf16_hi(w[j]), 2 * j + 1);
+            if constexpr (PROLOGUE == MXFP6Prologue::BiasGelu)
+                o[j] = pack_bf16x2_rne(gelu_tanh(x0), gelu_tanh(x1));
+            else
+                o[j] = pack_bf16x2_rne(gelu_tanh_backward(bf16_lo(gw[j]), x0),
+                                       gelu_tanh_backward(bf16_hi(gw[j]), x1));
+        }
+        *reinterpret_cast<uint4 *>(&s_tile[local_m][local_n]) = out;
+    }
+}
+
 // AdaLN's modulated layer norm over one staged vector, in place.
 //
 // Factored out rather than written into each staging arm because the three arms differ
@@ -823,7 +900,13 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
             __syncthreads();
 
-            if constexpr (PROLOGUE != MXFP6Prologue::Identity) {
+            if constexpr (std::is_same_v<DType, bfloat16> &&
+                          (PROLOGUE == MXFP6Prologue::BiasGelu ||
+                           PROLOGUE == MXFP6Prologue::BiasGeluBackward)) {
+                gelu_prologue_bf16<PROLOGUE, TILE_N, LDS_PITCH>(
+                    s_tile, s_aux, reinterpret_cast<const uint16_t *>(bias), tile_n, N);
+                __syncthreads();
+            } else if constexpr (PROLOGUE != MXFP6Prologue::Identity) {
                 constexpr int VEC   = kStageVec;
                 constexpr int ELEMS = TILE_M * TILE_N;
 #pragma unroll
