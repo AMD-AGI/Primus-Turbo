@@ -6,7 +6,7 @@
 
 """Fused mega MoE forward custom op: dispatch grouped GEMM + SwiGLU + grouped GEMM combine (FlyDSL)."""
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch.distributed.distributed_c10d import _resolve_process_group
@@ -14,6 +14,10 @@ from torch.distributed.distributed_c10d import _resolve_process_group
 from primus_turbo.flydsl.mega import (
     dispatch_grouped_gemm_bf16_flydsl_kernel,
     grouped_gemm_combine_bf16_flydsl_kernel,
+)
+from primus_turbo.flydsl.utils.glu_activation import (
+    GLUActivation,
+    activation_constexpr,
 )
 from primus_turbo.flydsl.utils.swiglu_kernel import swiglu_flydsl_kernel
 from primus_turbo.pytorch.core.backend import (
@@ -59,6 +63,7 @@ class FusedMegaMoEForwardFlyDSLBackend(KernelBackend):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         layout: str,
+        activation: Optional[List[float]] = None,
         **kwargs,
     ):
 
@@ -77,7 +82,7 @@ class FusedMegaMoEForwardFlyDSLBackend(KernelBackend):
         )
 
         # bound swiglu by THIS handle's tile count (per-forward, not shared symm)
-        act = swiglu_flydsl_kernel(l1_out, num_tile_blocks=handle[_H_NUM_TILE_BLOCKS])
+        act = swiglu_flydsl_kernel(l1_out, num_tile_blocks=handle[_H_NUM_TILE_BLOCKS], activation=activation)
 
         # fused grouped L2 GEMM + combine PUSH + topk reduce
         y, _ = grouped_gemm_combine_bf16_flydsl_kernel(
@@ -141,6 +146,7 @@ def _fused_mega_moe_forward(
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
     layout: str,
+    activation: Optional[List[float]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
     group = _resolve_process_group(group_name)
     default_backend_choice = BackendChoice(backend=BackendType(default_backend))
@@ -153,6 +159,7 @@ def _fused_mega_moe_forward(
         topk_idx=topk_idx,
         topk_weights=topk_weights,
         layout=layout,
+        activation=activation,
     )
     return FusedMegaMoEForwardKernelDispatcher.dispatch(default_backend_choice, None, **kwargs)
 
@@ -167,6 +174,7 @@ def _fused_mega_moe_forward_meta(
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
     layout: str,
+    activation: Optional[List[float]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
     # eager-only path (EP rendezvous can't be traced); approximate meta for completeness.
     N2 = w2.shape[1] if layout == "nt" else w2.shape[2]
@@ -210,6 +218,7 @@ def fused_mega_moe_forward_impl(
     topk_weights: torch.Tensor,
     layout: str,
     default_backend: int,
+    activation: Optional[GLUActivation] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple]:
     """Fused MoE forward (dispatch grouped GEMM + SwiGLU + grouped GEMM combine).
 
@@ -229,6 +238,7 @@ def fused_mega_moe_forward_impl(
         topk_idx,
         topk_weights,
         layout,
+        None if activation is None else list(activation_constexpr(activation)),
     )
     return (
         y,

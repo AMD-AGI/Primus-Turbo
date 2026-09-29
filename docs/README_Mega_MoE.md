@@ -76,6 +76,13 @@ The backward pass is the **conjugate** of the forward: L2 dgrad (NN) + SwiGLUᵀ
 + L1 dgrad combine (NN) + dW1 (TN). Dispatch and combine swap roles, and the dispatched `x` is
 recomputed by `dispatch_grouped_gemm`.
 
+The gated activation is SiLU-SwiGLU by default (both halves clamped to ±10). The op that owns it
+(`fused_mega_moe`, `fused_mega_moe_stage2`, `fused_mega_moe_fp8_stage2`) also takes an
+`activation=GLUActivation(...)`, computing `g * sigmoid(alpha * g) * (u + glu_offset)` on the clamped
+halves. `GLUActivation.swigluoai()` is MiniMax-M3's `swigluoai` (Megatron's `quick_geglu`): alpha
+1.702, offset 1, gate clamped from above only, up clamped to ±7. The spec is a compile-time constant
+of the kernels, so it has no runtime cost, and the default reproduces the SiLU kernels bit for bit.
+
 ## Performance
 
 ### Test Configuration
@@ -129,6 +136,8 @@ python benchmark/ops/training/bench_mega_moe.py --mode grouped_gemm_combine --mo
 | Grouped GEMM + combine kernel | `primus_turbo/flydsl/mega/grouped_gemm_combine_bf16_kernel.py` |
 | Dispatch prologue (routing tables) | `primus_turbo/flydsl/mega/dispatch_prologue_kernel.py` |
 | SwiGLU fwd/bwd | `primus_turbo/flydsl/utils/swiglu_kernel.py` |
+| SwiGLU + MXFP8 quant fwd/bwd | `primus_turbo/flydsl/mega/fp8/swiglu_mxfp8_kernel.py` |
+| Activation spec (`GLUActivation`) | `primus_turbo/flydsl/utils/glu_activation.py` |
 | Cross-rank tiles (dispatch/combine/reduce) | `primus_turbo/flydsl/mega/ep_intranode.py` |
 
 ## Acknowledgements

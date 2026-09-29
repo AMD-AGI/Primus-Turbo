@@ -6,6 +6,8 @@
 
 """Two-stage MegaMoE stage2 (gate-down) FlyDSL kernel composition."""
 
+from typing import Optional
+
 import torch
 
 from primus_turbo.flydsl.mega import (
@@ -15,6 +17,7 @@ from primus_turbo.flydsl.mega import (
 from primus_turbo.flydsl.mega.bf16.grouped_gemm_bf16_kernel import (
     grouped_gemm_bf16_variable_k_flydsl_kernel,
 )
+from primus_turbo.flydsl.utils.glu_activation import GLUActivation
 from primus_turbo.flydsl.utils.swiglu_kernel import (
     swiglu_backward_flydsl_kernel,
     swiglu_flydsl_kernel,
@@ -32,12 +35,13 @@ def fused_mega_moe_stage2_forward_impl(
     handle: tuple,
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
+    activation: Optional[GLUActivation] = None,
 ) -> torch.Tensor:
     """SwiGLU + grouped L2 GEMM + combine (nt). Returns y."""
     topk_idx = topk_idx.to(torch.int64)
 
     # bound swiglu by THIS handle's tile count (per-forward, not shared symm)
-    act = swiglu_flydsl_kernel(l1_out, num_tile_blocks=handle[_H_NUM_TILE_BLOCKS])
+    act = swiglu_flydsl_kernel(l1_out, num_tile_blocks=handle[_H_NUM_TILE_BLOCKS], activation=activation)
 
     # fused grouped L2 GEMM + combine PUSH + topk reduce
     y, _ = grouped_gemm_combine_bf16_flydsl_kernel(
@@ -58,6 +62,7 @@ def fused_mega_moe_stage2_backward_impl(
     w2: torch.Tensor,
     handle: tuple,
     group,
+    activation: Optional[GLUActivation] = None,
 ):
     """L2 dgrad (nn) + SwiGLU^T + dW2. Returns ``(grad_l1, grad_gate, dW2)``."""
     real_count_per_expert = handle[_H_REAL_COUNT_PER_EXPERT]
@@ -82,6 +87,7 @@ def fused_mega_moe_stage2_backward_impl(
         return_gate=True,
         return_act_w=True,
         num_tile_blocks=handle[_H_NUM_TILE_BLOCKS],
+        activation=activation,
     )
 
     # dW2 = dispatched(dy)^ @ act_weighted (variable-K)
