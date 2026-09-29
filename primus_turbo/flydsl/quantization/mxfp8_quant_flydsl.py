@@ -836,10 +836,10 @@ def quant_mxfp8_raw_batched(x_3d, out_dtype, row_2d=False, col_2d=False):
 _GQD_BM, _GQD_BK, _GQD_NTH = 64, 128, 512
 
 
-def grouped_qdual_grid(M_pad_col, N):
+def grouped_qdual_grid(M_pad_col, N, tiles_per_wg=1):
     """Grid (in workgroups) for ``compile_grouped_qdual``'s kernel at this runtime M_pad_col.
     The M extent is a launch argument, so the host owns the tiling arithmetic."""
-    return (M_pad_col // _GQD_BM) * (_ceil128(N) // _GQD_BK)
+    return (M_pad_col // _GQD_BM) * (_ceil128(N) // _GQD_BK // tiles_per_wg)
 
 
 def _load_i32_at(div, idx):
@@ -880,10 +880,13 @@ def compile_grouped_qdual(
     pad_extra=4,
     col_data_band=True,
     col_scale_band=True,
+    tiles_per_wg=1,
 ):
     """Compile the grouped dual-cast mxfp8 quant. Tile [bm=64 x bk=128] (bm=64 divides the
-    128-aligned col-pad boundary so each tile stays in one group). Each WG computes its per-tile
-    group metadata (RB/RO/RE/RIE) inline via an O(G) offset scan (no prologue kernel)."""
+    128-aligned col-pad boundary so each tile stays in one group). Each WG computes its band's
+    group metadata (RB/RO/RE/RIE) inline via an O(G) offset scan (no prologue kernel), then
+    quantizes ``tiles_per_wg`` consecutive column tiles of that band. Every wave runs the scan
+    on the scalar unit, so at large G it costs more than a tile; the loop amortizes it."""
     if elt is None:
         elt = fx.BFloat16
     va, ep_sub, sat_bnd, cvt = fp8_params(out_fp8)
@@ -895,6 +898,8 @@ def compile_grouped_qdual(
     PAD_L = BKv + pad_extra
     LMASK = N_pad != N
     NBK = N_pad // BKv
+    TPW = tiles_per_wg
+    assert NBK % TPW == 0
     NKB = BKv // 32
     NMB = BMv // 32
     DWPC = BMv // 4
@@ -939,10 +944,10 @@ def compile_grouped_qdual(
         ldsc = sm.ldsc
         t = fx.thread_idx.x
         pid = fx.block_idx.x
-        br, bkc = _decode_pid(pid, I32(NBK))
+        br, bkc0 = _decode_pid(pid, I32(NBK // TPW))
         base_m = br * I32(BMv)
 
-        # ---- per-tile group metadata computed INLINE (no pad/meta prologue kernels):
+        # ---- per-band group metadata computed INLINE (no pad/meta prologue kernels):
         # each WG does the O(G) 64/128-padded-offset scan from GO (loaded to registers
         # first, no dependent load chain), yielding in_rebase / rowbase_out / real_end /
         # in_end. The pid==0 WG also emits the padded lens/offs outputs (threads t<=G). ----
@@ -1010,150 +1015,154 @@ def compile_grouped_qdual(
         # single masked base redirect is exact.
         VPR8 = BKv // 8
         ITERS8 = BMv * BKv // 8 // NTHv
-        for ls in range_constexpr(ITERS8):
-            lin = t + I32(ls * NTHv)
-            lr = lin // I32(VPR8)
-            cv = (lin - lr * I32(VPR8)) * I32(8)
-            pbase = lr * I32(PAD_L) + cv
-            fcol = bkc * I32(BKv) + cv
-            ioff = lr * I32(N) + fcol
-            if LMASK:
-                ioff = (fcol < I32(N)).select(ioff, I32(_OOB))
-            v = bo.buffer_load(rx, ioff, vec_width=8, dtype=BF)
-            p = fx.add_offset(tile.ptr, fx.make_int_tuple(pbase))
-            fx.make_view(p, fx.make_layout(8, 1)).store(Vec(v))
-        _llvm.inline_asm(
-            res=None,
-            operands_=[],
-            asm_string="s_waitcnt vmcnt(0) lgkmcnt(0)",
-            constraints="",
-            has_side_effects=True,
-        )
-        rocdl.s_barrier()
         half = t // I32(HALF)
         lt = t - half * I32(HALF)
-        if half == z:
-            # ROW half: (row, kb) = (lt//NKB, lt%NKB); bm rows x NKB K-blocks of 32.
-            row = lt // I32(NKB)
-            kb = lt - row * I32(NKB)
-            loff = row * I32(PAD_L) + kb * I32(32)
-            chunks = []
-            for i in range_constexpr(8):
-                p = fx.add_offset(tile.ptr, fx.make_int_tuple(loff + I32(4 * i)))
-                chunks.append(Vec(fx.make_view(p, fx.make_layout(4, 1)).load()).to(F32))
-            amax = F32(0.0)
-            for i in range_constexpr(8):
-                a = fm.absf(chunks[i]).reduce("max")
-                amax = (amax > a).select(amax, a)
-            grow = base_m + row
-            row_ok = grow < real_end
-            gcol0 = bkc * I32(BKv) + kb * I32(32)
-            ep = _ep(amax, va, ep_sub)
-            inv = F32(1.0) / fm.exp2(ep.to(F32))
-            # Re-base Qr at this tile's output row so the i32 voffset spans only the tile
-            # (base-0 row_out*N_pad overflows once M_pad_row*N_pad > 2^31).
-            rqr = make_row_band_resource(bo.extract_base_index(Qr), rowbase_out, m_pad_row, I32(N_pad), 1)
-            words = []
-            for wi in range_constexpr(8):
-                qf = chunks[wi] * inv
-                word = I32(cvt(IRI, _sat(qf[0], sat_bnd), _sat(qf[1], sat_bnd), z, 0))
-                word = I32(cvt(IRI, _sat(qf[2], sat_bnd), _sat(qf[3], sat_bnd), word, 1))
-                words.append(word)
-            # Coalesce 8 fp8 words (32 contiguous cols) into 2 vec4 (16B) stores.
-            row_byte0 = row * I32(N_pad) + gcol0  # local row within the [rowbase_out, ...) band
-            for v in range_constexpr(2):
-                off = row_ok.select(row_byte0 + I32(16 * v), I32(_OOB))
-                v4 = Vec.from_elements(words[4 * v : 4 * v + 4], fx.Int32)
-                bo.buffer_store(v4.ir_value(), rqr, off, cache_modifier=_CM, offset_is_bytes=True)
-            kcol = bkc * I32(BKv // 32) + kb
-            # Row scale byte matrix [M_pad_row, SCALEN_ROW]: same re-base at rowbase_out.
-            rasp = make_row_band_resource(
-                bo.extract_base_index(ASp), rowbase_out, m_pad_row, I32(SCALEN_ROW), 1
+        # The two barriers per tile also fence the next tile: its `tile` stores follow every
+        # read of this tile (barrier 2) and its `ldsc` stores follow this col write (barrier 1).
+        for j in range_constexpr(TPW):
+            bkc = bkc0 * I32(TPW) + I32(j)
+            for ls in range_constexpr(ITERS8):
+                lin = t + I32(ls * NTHv)
+                lr = lin // I32(VPR8)
+                cv = (lin - lr * I32(VPR8)) * I32(8)
+                pbase = lr * I32(PAD_L) + cv
+                fcol = bkc * I32(BKv) + cv
+                ioff = lr * I32(N) + fcol
+                if LMASK:
+                    ioff = (fcol < I32(N)).select(ioff, I32(_OOB))
+                v = bo.buffer_load(rx, ioff, vec_width=8, dtype=BF)
+                p = fx.add_offset(tile.ptr, fx.make_int_tuple(pbase))
+                fx.make_view(p, fx.make_layout(8, 1)).store(Vec(v))
+            _llvm.inline_asm(
+                res=None,
+                operands_=[],
+                asm_string="s_waitcnt vmcnt(0) lgkmcnt(0)",
+                constraints="",
+                has_side_effects=True,
             )
-            e8b = _e8_or_one(amax, ep)
-            bo.buffer_store(
-                ArithValue(e8b & I32(255)).trunci(_T.i8),
-                rasp,
-                row * I32(SCALEN_ROW) + kcol,
-                mask=row_ok,
-                offset_is_bytes=True,
-                cache_modifier=_CM,
-            )
-        else:
-            # COL half: (c, mblk) = (lt//NMB, lt%NMB); c = feature col, mblk = M-block of 32.
-            c = lt // I32(NMB)
-            mblk = lt - c * I32(NMB)
-            base = fx.add_offset(tile.ptr, fx.make_int_tuple(c + I32(mblk * 32) * I32(PAD_L)))
-            cv2 = Vec(fx.make_view(base, fx.make_layout(32, PAD_L)).load()).to(F32)
-            ca = fm.absf(cv2).reduce("max")
-            camax = (F32(0.0) > ca).select(F32(0.0), ca)
-            cep = _ep(camax, va, ep_sub)
-            cinv = F32(1.0) / fm.exp2(cep.to(F32))
-            cq = cv2 * cinv
-            cwords = []
-            for wi in range_constexpr(8):
-                word = I32(cvt(IRI, _sat(cq[4 * wi + 0], sat_bnd), _sat(cq[4 * wi + 1], sat_bnd), z, 0))
-                word = I32(cvt(IRI, _sat(cq[4 * wi + 2], sat_bnd), _sat(cq[4 * wi + 3], sat_bnd), word, 1))
-                cwords.append(word)
-            # stage the 8 contiguous col words as 2 vec4 LDS stores (c-major, bm M-bytes/K-col)
-            csbase = c * I32(DWPC) + mblk * I32(8)
-            for v in range_constexpr(2):
-                sp = fx.add_offset(ldsc.ptr, fx.make_int_tuple(csbase + I32(4 * v)))
-                fx.make_view(sp, fx.make_layout(4, 1)).store(
-                    Vec.from_elements(cwords[4 * v : 4 * v + 4], fx.Int32)
+            rocdl.s_barrier()
+            if half == z:
+                # ROW half: (row, kb) = (lt//NKB, lt%NKB); bm rows x NKB K-blocks of 32.
+                row = lt // I32(NKB)
+                kb = lt - row * I32(NKB)
+                loff = row * I32(PAD_L) + kb * I32(32)
+                chunks = []
+                for i in range_constexpr(8):
+                    p = fx.add_offset(tile.ptr, fx.make_int_tuple(loff + I32(4 * i)))
+                    chunks.append(Vec(fx.make_view(p, fx.make_layout(4, 1)).load()).to(F32))
+                amax = F32(0.0)
+                for i in range_constexpr(8):
+                    a = fm.absf(chunks[i]).reduce("max")
+                    amax = (amax > a).select(amax, a)
+                grow = base_m + row
+                row_ok = grow < real_end
+                gcol0 = bkc * I32(BKv) + kb * I32(32)
+                ep = _ep(amax, va, ep_sub)
+                inv = F32(1.0) / fm.exp2(ep.to(F32))
+                # Re-base Qr at this tile's output row so the i32 voffset spans only the tile
+                # (base-0 row_out*N_pad overflows once M_pad_row*N_pad > 2^31).
+                rqr = make_row_band_resource(bo.extract_base_index(Qr), rowbase_out, m_pad_row, I32(N_pad), 1)
+                words = []
+                for wi in range_constexpr(8):
+                    qf = chunks[wi] * inv
+                    word = I32(cvt(IRI, _sat(qf[0], sat_bnd), _sat(qf[1], sat_bnd), z, 0))
+                    word = I32(cvt(IRI, _sat(qf[2], sat_bnd), _sat(qf[3], sat_bnd), word, 1))
+                    words.append(word)
+                # Coalesce 8 fp8 words (32 contiguous cols) into 2 vec4 (16B) stores.
+                row_byte0 = row * I32(N_pad) + gcol0  # local row within the [rowbase_out, ...) band
+                for v in range_constexpr(2):
+                    off = row_ok.select(row_byte0 + I32(16 * v), I32(_OOB))
+                    v4 = Vec.from_elements(words[4 * v : 4 * v + 4], fx.Int32)
+                    bo.buffer_store(v4.ir_value(), rqr, off, cache_modifier=_CM, offset_is_bytes=True)
+                kcol = bkc * I32(BKv // 32) + kb
+                # Row scale byte matrix [M_pad_row, SCALEN_ROW]: same re-base at rowbase_out.
+                rasp = make_row_band_resource(
+                    bo.extract_base_index(ASp), rowbase_out, m_pad_row, I32(SCALEN_ROW), 1
                 )
-            gc = bkc * I32(BKv) + c
-            mcol = br * I32(BMv // 32) + mblk
-            # Col scale byte matrix [N, SCALEN_COL], transposed re-base (base-0 overflows once
-            # N*SCALEN_COL > 2^31).
-            ce8b = _e8_or_one(camax, cep)
-            catsp, csoff = _col_store_res(
-                COL_SCALE_BAND,
-                bo.extract_base_index(AtSp),
-                bkc * I32(BKv),
-                gc,
-                c,
-                I32(N),
-                scalen_col,
-                mcol,
+                e8b = _e8_or_one(amax, ep)
+                bo.buffer_store(
+                    ArithValue(e8b & I32(255)).trunci(_T.i8),
+                    rasp,
+                    row * I32(SCALEN_ROW) + kcol,
+                    mask=row_ok,
+                    offset_is_bytes=True,
+                    cache_modifier=_CM,
+                )
+            else:
+                # COL half: (c, mblk) = (lt//NMB, lt%NMB); c = feature col, mblk = M-block of 32.
+                c = lt // I32(NMB)
+                mblk = lt - c * I32(NMB)
+                base = fx.add_offset(tile.ptr, fx.make_int_tuple(c + I32(mblk * 32) * I32(PAD_L)))
+                cv2 = Vec(fx.make_view(base, fx.make_layout(32, PAD_L)).load()).to(F32)
+                ca = fm.absf(cv2).reduce("max")
+                camax = (F32(0.0) > ca).select(F32(0.0), ca)
+                cep = _ep(camax, va, ep_sub)
+                cinv = F32(1.0) / fm.exp2(cep.to(F32))
+                cq = cv2 * cinv
+                cwords = []
+                for wi in range_constexpr(8):
+                    word = I32(cvt(IRI, _sat(cq[4 * wi + 0], sat_bnd), _sat(cq[4 * wi + 1], sat_bnd), z, 0))
+                    word = I32(cvt(IRI, _sat(cq[4 * wi + 2], sat_bnd), _sat(cq[4 * wi + 3], sat_bnd), word, 1))
+                    cwords.append(word)
+                # stage the 8 contiguous col words as 2 vec4 LDS stores (c-major, bm M-bytes/K-col)
+                csbase = c * I32(DWPC) + mblk * I32(8)
+                for v in range_constexpr(2):
+                    sp = fx.add_offset(ldsc.ptr, fx.make_int_tuple(csbase + I32(4 * v)))
+                    fx.make_view(sp, fx.make_layout(4, 1)).store(
+                        Vec.from_elements(cwords[4 * v : 4 * v + 4], fx.Int32)
+                    )
+                gc = bkc * I32(BKv) + c
+                mcol = br * I32(BMv // 32) + mblk
+                # Col scale byte matrix [N, SCALEN_COL], transposed re-base (base-0 overflows once
+                # N*SCALEN_COL > 2^31).
+                ce8b = _e8_or_one(camax, cep)
+                catsp, csoff = _col_store_res(
+                    COL_SCALE_BAND,
+                    bo.extract_base_index(AtSp),
+                    bkc * I32(BKv),
+                    gc,
+                    c,
+                    I32(N),
+                    scalen_col,
+                    mcol,
+                )
+                bo.buffer_store(
+                    ArithValue(ce8b & I32(255)).trunci(_T.i8),
+                    catsp,
+                    csoff,
+                    offset_is_bytes=True,
+                    cache_modifier=_CM,
+                )
+            _llvm.inline_asm(
+                res=None, operands_=[], asm_string="s_waitcnt lgkmcnt(0)", constraints="", has_side_effects=True
             )
-            bo.buffer_store(
-                ArithValue(ce8b & I32(255)).trunci(_T.i8),
-                catsp,
-                csoff,
-                offset_is_bytes=True,
-                cache_modifier=_CM,
-            )
-        _llvm.inline_asm(
-            res=None, operands_=[], asm_string="s_waitcnt lgkmcnt(0)", constraints="", has_side_effects=True
-        )
-        rocdl.s_barrier()
-        # Coalesced transposed col write from the LDS stage. AtQd is col-major [N, M_pad_col],
-        # transposed re-base (base-0 gc*M_pad_col overflows once N*M_pad_col > 2^31).
-        for it in range_constexpr(CW_ITERS_V):
-            lo = (t + I32(it * NTHv)) * I32(4)
-            cc = lo // I32(DWPC)
-            dwi0 = lo - cc * I32(DWPC)
-            rp = fx.add_offset(ldsc.ptr, fx.make_int_tuple(lo))
-            v4 = Vec(fx.make_view(rp, fx.make_layout(4, 1)).load())
-            gc = bkc * I32(BKv) + cc
-            raqd, off = _col_store_res(
-                COL_DATA_BAND,
-                bo.extract_base_index(AtQd),
-                bkc * I32(BKv),
-                gc,
-                cc,
-                I32(N),
-                m_pad_col,
-                base_m + dwi0 * I32(4),
-            )
-            bo.buffer_store(
-                v4.ir_value(),
-                raqd,
-                off,
-                cache_modifier=_CM,
-                offset_is_bytes=True,
-            )
+            rocdl.s_barrier()
+            # Coalesced transposed col write from the LDS stage. AtQd is col-major [N, M_pad_col],
+            # transposed re-base (base-0 gc*M_pad_col overflows once N*M_pad_col > 2^31).
+            for it in range_constexpr(CW_ITERS_V):
+                lo = (t + I32(it * NTHv)) * I32(4)
+                cc = lo // I32(DWPC)
+                dwi0 = lo - cc * I32(DWPC)
+                rp = fx.add_offset(ldsc.ptr, fx.make_int_tuple(lo))
+                v4 = Vec(fx.make_view(rp, fx.make_layout(4, 1)).load())
+                gc = bkc * I32(BKv) + cc
+                raqd, off = _col_store_res(
+                    COL_DATA_BAND,
+                    bo.extract_base_index(AtQd),
+                    bkc * I32(BKv),
+                    gc,
+                    cc,
+                    I32(N),
+                    m_pad_col,
+                    base_m + dwi0 * I32(4),
+                )
+                bo.buffer_store(
+                    v4.ir_value(),
+                    raqd,
+                    off,
+                    cache_modifier=_CM,
+                    offset_is_bytes=True,
+                )
 
     @flyc.jit
     def launch(
@@ -1183,6 +1192,18 @@ def compile_grouped_qdual(
 
 
 _GROUPED_QDUAL_CACHE: dict = {}
+_GROUPED_QDUAL_NCU: dict = {}  # device -> CU count
+
+
+def _grouped_qdual_tpw(M_pad_col, N, G, num_cu):
+    """Column tiles per WG: amortize the O(G) band scan (<= G/4 tiles, G=32: 68 -> 29 us at
+    3072x4096) while keeping >= 1.5 WGs per CU in flight for latency hiding."""
+    nbk = _ceil128(N) // _GQD_BK
+    min_grid = 3 * num_cu // 2
+    for tpw in (8, 4, 2):
+        if nbk % tpw == 0 and tpw <= G // 4 and grouped_qdual_grid(M_pad_col, N, tpw) >= min_grid:
+            return tpw
+    return 1
 
 
 def quant_mxfp8_raw(x, out_dtype, row_2d=False, col_2d=False):
@@ -1217,7 +1238,11 @@ def grouped_quant_mxfp8_raw(x, group_lens, group_offs, out_dtype):
     N_pad = _ceil128(N)
     M_pad_row = ((total_M + G * 64) + 63) // 64 * 64
     M_pad_col = ((total_M + G * 128) + 127) // 128 * 128
-    grid = grouped_qdual_grid(M_pad_col, N)
+    num_cu = _GROUPED_QDUAL_NCU.get(x.device)
+    if num_cu is None:
+        num_cu = _GROUPED_QDUAL_NCU[x.device] = torch.cuda.get_device_properties(x.device).multi_processor_count
+    tpw = _grouped_qdual_tpw(M_pad_col, N, G, num_cu)
+    grid = grouped_qdual_grid(M_pad_col, N, tpw)
     out_fp8 = "e5m2" if out_dtype == torch.float8_e5m2 else "e4m3"
 
     # Padded per-group lens/offs are filled ON-DEVICE by the quant kernel (no host torch launches).
@@ -1242,7 +1267,7 @@ def grouped_quant_mxfp8_raw(x, group_lens, group_offs, out_dtype):
     scalen_col = M_pad_col // 32
     col_data_band = _GQD_BK * M_pad_col < (1 << 31)
     col_scale_band = _GQD_BK * scalen_col < (1 << 31)
-    key = (N, G, x.dtype, out_dtype, col_data_band, col_scale_band)
+    key = (N, G, x.dtype, out_dtype, col_data_band, col_scale_band, tpw)
     comp = _GROUPED_QDUAL_CACHE.get(key)
     stream = torch.cuda.current_stream()
     if comp is None:
@@ -1253,6 +1278,7 @@ def grouped_quant_mxfp8_raw(x, group_lens, group_offs, out_dtype):
             out_fp8=out_fp8,
             col_data_band=col_data_band,
             col_scale_band=col_scale_band,
+            tiles_per_wg=tpw,
         )
         comp = _flyc.compile(
             launch, x, Qr, ASp, AtQd, AtSp, go, gr, gc, lr, lc, M_pad_row, M_pad_col, scalen_col, grid, stream
