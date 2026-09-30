@@ -9,7 +9,7 @@
 | `--pmc` | 可用 | 可用（roofline 已验证） | `0930__roofline/runs/pmc` |
 | **ATT（thread trace）** | 对 FlyDSL JIT 什么也抓不到 | **可用**：FlyDSL k_dkdv / k_dqg 和 ASM `.co` 都得到逐指令 Hitcount/Latency/Stall/Idle（`stats_ui_output_*.csv`）+ wave 时间线 json；需要 `--att-library-path /opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib`、`--att-target-cu 1`、`--kernel-include-regex`（注意 shell 引号，`k_d[kq]` 可用） | `probe/p1d/`, `probe/p2_r29/`, `probe/p2_asm/` |
 | rocprof-compute | 未用 | 容器内未安装（`which` 为空）；按规则不 pip install → 不可用 | — |
-| PC sampling | 3/3 挂 MES（旧固件） | **待测**：按计划 D2 放在本轮所有 GPU 工作之后，只用 toy kernel | — |
+| PC sampling | 3/3 挂 MES（旧固件） | **不可用（工具层拒绝，不涉及卡）**：`-L` 列出 `SAMPLE_INTERVAL_SCLK_CYCLES` 32–65504，但 stochastic/cycles（间隔 65504 和 16384）、host_trap/cycles（16384）三次都在启动时报 `Given PC sampling configuration is not supported on any of the agents`，没有开始采样；dmesg 干净。按 D2 不再继续试 | `runs/p1f*_pcsampling.log` |
 
 ## prod ATT 首读（CU 1 上的 wave，`tools/attsum.py`）
 

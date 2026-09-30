@@ -40,3 +40,5 @@ bwd FLOP 5.498229e12；判定阈值 0.5%（同进程 A/A 0.01–0.07%）。每�
 | a20 | w4f 第 4 轮：r4a（q 反向扫描）/ r4b（signal 前 dscnt 0x12 + LSE TDM 后移）/ r4c（清零并入 k_delta，转换按源顺序读）/ r4ac / r4abc；同进程 r3、s5 | 19:00 | 否 | r4a 7.024 / **r4b 6.509** / r4c 6.544 / r4ac 6.862 / r4abc 6.770 / r3 6.667 / s5 5.323 / ASM 5.501 | 相对 r3：+5.4% / −2.4% / −1.8% / +2.9% / +1.6% | r4b 84.5% | r4a 的 LRU 局部性模型没有兑现（反而慢）；融合路径最好 6.51 ms，离 s5 还远，**暂时降级**（上限仍是 noatom 4.24 ms） |
 | **a21** | **s5_vtrim**（dqg_vtrim 的 VALU 精简移植到 TDM k_dqg：热循环 VALU 290→194，WMMA gap 均匀交错） | 19:20 | **接受（新冠军 s6）** | **5.300** / s5 5.347 / r29 6.582 / ASM 5.500 | **−19.5%**（相对 s5 −0.88%） | **103.8%** | proxy 上 dq 与 dqg_vtrim 逐位一致；与 s5 的 dq 相差 81 dB（packed 运算顺序），相对参考 SQNR 不变（52.5 dB），run-to-run 逐位 |
 | **s6 复核** | 反序（asm, s5, s5_vtrim） | 19:35 | **确认** | s6 **5.295** / s5 5.336 / ASM 5.497 | 相对 s5 −0.77% | **103.8%** | |
+| att/pmc s6 | s6 的 ATT + PMC | 19:50 | 信息 | — | — | — | k_dkdv 4.63e6 cyc（21.4 cyc/WMMA，最大剩余项 LSE/delta `s_wait_loadcnt 0x1` ~48 cyc/轮）；k_dqg 2.83e6 cyc（16.8 cyc/WMMA，WMMA 占 62%） |
+| p1f | PC sampling（toy elementwise kernel，3 种配置） | 19:55 | 不可用 | — | — | — | rocprofv3 1.3.2 在启动阶段拒绝所有配置，没有采样，卡正常 |

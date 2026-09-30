@@ -105,7 +105,7 @@ Unrecoverable markers: `wait for reset ack`, `ring gfx timeout`, `GPU reset begi
 
 | tool | status | evidence |
 |---|---|---|
-| rocprofv3 **PC sampling** | ❌ never -- wedged MES 2026-09-11, 3 attempts 3 faults | FWDSPEC safety block; h4 |
+| rocprofv3 **PC sampling** | ❌ never -- wedged MES 2026-09-11, 3 attempts 3 faults | FWDSPEC safety block; h4; 2026-09-30 reflashed A0: rocprofv3 1.3.2 rejects every PC-sampling config at startup ("not supported on any of the agents") although `-L` lists SCLK_CYCLES 32-65504 -> still unusable, no card risk taken |
 | rocprofv3 `--pmc` | ✅ works, ~2 min per counter group; 51 counters defined, only 9 trustworthy (h20 whitelist); `SQ_VALU_WMMA_FLOP_*` read 0 | STAGE2-S0-PROBE.md S0-c; h20 |
 | `--kernel-trace` / `--runtime-trace` / `--hip-trace` | ❌ produce a .db with **0 dispatch rows** (458 symbols registered) -- silently analyses nothing | S0-c; **still 0 rows after the reflash** (09-30) -> rocprofv3 1.3.2, use the PMC csv for kernel names/timestamps |
 | rocprofv3 VGPR column | ⚠ **half** the ISA count; read descriptors / `21_final_isa.s`, not derived percentages | FWDSPEC safety block |
