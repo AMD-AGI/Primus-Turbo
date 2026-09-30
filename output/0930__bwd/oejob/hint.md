@@ -45,7 +45,7 @@ refactor) and supersede the stale B0/A0 notes marked `superseded` in the status 
 | h72 | must standing note | FlyDSL JIT CACHE HAZARD: the disk-cache key ignores module-level constants (e.g. SPEC_STALE_MAX) -- a path whose contents changed can serve the OLD binary. Every measurement uses a fresh FLYDSL_RUNTIME_CACHE_DIR per process (or per arm) | open |
 | h73 | standing note | k_dq lab round 2 on the r29 champion: u2n confirmed at the training clock (op -3.2%, k_dq -7.8% at 1272-1352 MHz); 9 follow-up arms null or loss -- do not rebuild them | open |
 | h74 | must standing | HOST MOVE: A0 (heliosr-1b114-c07-1), one card, container fa-repro; supersedes h62/h65. B0's rounds 24-32 are not in this copy; refcache accepted by its recorded common_sha; the fp32 reference is NEVER computed on the card | open |
-| h75 | must refactor | Adopt s6 verbatim as op/current (prod 5.30 ms = 103.8% of the ASM bar, -19.5% vs r29, dk/dv bitwise vs r29); target raised to 1.20x beat on proxy AND prod | open |
+| h75 | must refactor | Adopt s6 verbatim as op/current (prod 5.30 ms = 103.8% of the ASM bar, -19.5% vs r29, dk/dv bitwise vs r29); target raised to 1.20x beat on proxy AND prod | done (r24) |
 | h76 | standing note | The s6 champion: kernel map and the levers that made it (TDM ring + carried operands in k_dkdv and k_dqg, divide-free counters, ATT-guided trims, k_dqg side stream, k_dq U2 off) | open |
 | h77 | standing note | Measured ablations: A2 (Q/dO already in VGPRs) -18.5%; abl_l2 says L2 bandwidth is not the limit; A5 (+16 WMMA = fused dQ matrix work) only +4% | open |
 | h78 | standing note | Closed on A0 2026-09-30: lse_late +4.1%, ku2 +8.2%, flip -0.5% (ceiling 1.4%), trorder_b +0.4%, dkdv_trim2 +1.3%, TDM without carried operands +1.7%, k_dq U2 +0.85% | open |
@@ -4787,3 +4787,14 @@ docker exec -e ARCH=gfx1250 -e FLYDSL_GPU_ARCH=gfx1250 -e FLYDSL_RUNTIME_CACHE_D
    not a kernel in isolation.
 4. The fused route (h79) is the only path past ~1.3x; it needs a cheaper dQ atomic path, not more tuning.
 Closed: see h78, h71, h73 and the lever table `.../0930__bwd/notes/levers-tried.md`.
+
+## h83 -- `fast` is scored on the MIN and weighted 0; round 24's acceptance was noise
+
+Round 24 was accepted at a geomean of 1.4263x, but the gain came entirely from `fast`: fast 2.275x, proxy
+1.0051 (inside its own A/A spread of 0.53%), prod 0.9986 (null). At `fast` both arms dispatch the identical
+`k_dq_sp` path; their min_ms agreed to 0.05% while their medians differed by 56% -- the 55 us shape is
+launch/scheduling-bound. The operator therefore changed two things on 2026-09-30 (backups `*.bak.pre-fastmin-0930`,
+`*.bak.pre-gainw-0930`): `op/benchmark.py` now reports the MIN for `fast` only (proxy/prod keep the median),
+and `evolve.gain_weights` is {prod: 1.0, proxy: 0.25, fast: 0.0}. Round 24's tree (s6 + DQT_VT_KEEP) is
+performance-equivalent to s6 on prod; it stays as the champion. Judge future rounds on prod first, proxy second;
+never cite a `fast` median as evidence.

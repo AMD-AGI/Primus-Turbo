@@ -42,3 +42,9 @@ bwd FLOP 5.498229e12；判定阈值 0.5%（同进程 A/A 0.01–0.07%）。每�
 | **s6 复核** | 反序（asm, s5, s5_vtrim） | 19:35 | **确认** | s6 **5.295** / s5 5.336 / ASM 5.497 | 相对 s5 −0.77% | **103.8%** | |
 | att/pmc s6 | s6 的 ATT + PMC | 19:50 | 信息 | — | — | — | k_dkdv 4.63e6 cyc（21.4 cyc/WMMA，最大剩余项 LSE/delta `s_wait_loadcnt 0x1` ~48 cyc/轮）；k_dqg 2.83e6 cyc（16.8 cyc/WMMA，WMMA 占 62%） |
 | p1f | PC sampling（toy elementwise kernel，3 种配置） | 19:55 | 不可用 | — | — | — | rocprofv3 1.3.2 在启动阶段拒绝所有配置，没有采样，卡正常 |
+
+## op-evolve job（A0，从 s6 重启）
+
+| round | 模式 | UTC | 接受 | prod TF/s（ms） | 相对冠军 prod | 占 ASM（同进程 beat） | proxy / fast TF/s | 结论 |
+|---|---|---|---|---|---|---|---|---|
+| 24 | deep（refactor h75 → s6） | 11:12–13:40 | 是（**假阳性**，fast 噪声） | 1038.3（5.295） | 0.9986 | 104.0% | 999.0 / 85.6（中位数噪声） | profiling：ATT ok、功耗墙（全零操作数 −34% 时间、+7.7% cycle）；act：DQT_VT_KEEP 在 prod/proxy 为 null；已改 fast=min + gain_weights（D7） |

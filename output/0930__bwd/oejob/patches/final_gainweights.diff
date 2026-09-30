@@ -1,0 +1,10 @@
+--- /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/gfx1250-flydsl-attn-bwd_final.yaml.bak.pre-gainw-0930	2026-09-30 11:01:36.766575107 +0000
++++ /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/gfx1250-flydsl-attn-bwd_final.yaml	2026-09-30 13:40:50.955407457 +0000
+@@ -221,6 +221,7 @@
+ evolve:
+   max_rounds: 48            # [user] failed rounds count against this
+   max_timeout: 120h          # [user]  [resolved] = 172800 s
++  gain_weights: {prod: 1.0, proxy: 0.25, fast: 0.0}   # A0 operator 2026-09-30 (h83): round 24's accept was carried by fast's median noise
+   min_gain: 0.007           # A0 operator 2026-09-30 (as B0 09-27): was 0.0; floor 0.24-0.66%. [resolved] explicit default: anything above 1.0 counts as
+                             # an improvement. Justified here rather than copied -- the
+                             # gap to the anchor is ~93x, so round gains are expected to

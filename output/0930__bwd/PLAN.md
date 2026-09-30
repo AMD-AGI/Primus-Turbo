@@ -23,3 +23,4 @@ k_dkdv 每轮 1766 cyc = WMMA 512 + 发射 ~450 + WMMA↔DS 切换 ~200（7 次�
 - D4 尺子：blocked（lead 4 + block 9，palindromic），同进程 r29 + r29_aa + ASM；每进程新 JIT cache；一个 shape 一个进程；判定阈值 0.5%。
 - D5 op-evolve 目标从 1.00× 提到 **1.20× ASM**（validation.py `BEAT_MARGIN=20.0` + final.yaml "beaten by 20%"）：s6 已是 1.038×，维持 1.00× 会让第一个通过的 round 直接以 target_met 结束、deep 轮跑不到；1.20× 取自 w4f 无原子写的 1.30× 上限。
 - D6 op-evolve bwd job 在 A0 以 s6 为起点重启（旧目录备份为 `*.a0-stale-0930`），round 24 为 deep（ATT 已恢复进 deep prompt，OE 未提交改动，补丁在 `oejob/deep_att_enable.patch`），之后 4 fast + 1 deep 循环，max_rounds 48。
+- D7 round 24（deep）被几何平均"接受"为 1.4263×，但完全来自 fast 的中位数噪声（fast 两 arm 跑同一 k_dq_sp，min 差 0.05%、median 差 56%；prod 0.9986、proxy 1.0051 在 A/A 内）。修正：benchmark.py 仅 fast 用 min；`evolve.gain_weights` = prod 1.0 / proxy 0.25 / fast 0（HANDOFF 原建议值）；hint h83。round 24 的树（s6 + DQT_VT_KEEP）在 prod 与 s6 等价，保留为冠军。stop → resume 使权重生效。

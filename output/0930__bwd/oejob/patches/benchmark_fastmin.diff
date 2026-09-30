@@ -1,0 +1,19 @@
+--- /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/benchmark.py.bak.pre-fastmin-0930	2026-09-30 11:00:05.843228536 +0000
++++ /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/benchmark.py	2026-09-30 13:40:40.557249998 +0000
+@@ -182,9 +182,15 @@
+         ts = sorted(times[label])
+         med = ts[len(ts) // 2] if len(ts) % 2 else 0.5 * (ts[len(ts) // 2 - 1]
+                                                           + ts[len(ts) // 2])
++        # A0 operator 2026-09-30 (h83): `fast` (~55 us) is launch/scheduling-bound; round 24
++        # measured two byte-identical k_dq_sp arms 56% apart on the median and 0.05% apart on
++        # the min, and the median noise carried the round's geomean (fast 2.275x, prod 0.9986).
++        # So `fast` alone is scored on the MIN; proxy/prod keep the median.
++        if shape == "fast":
++            med = ts[0]
+         secs = med / 1e3
+         rows.append({
+-            "shape": shape, "arm": label, "stat": STATISTIC, "iters": len(ts),
++            "shape": shape, "arm": label, "stat": ("min" if shape == "fast" else STATISTIC), "iters": len(ts),
+             "latency_ms": med, "min_ms": ts[0], "max_ms": ts[-1],
+             "tflops": c.flop / secs / 1e12, "bw_gbs": c.bytes_min / secs / 1e9,
+             "flop": c.flop, "bytes_min": c.bytes_min,
