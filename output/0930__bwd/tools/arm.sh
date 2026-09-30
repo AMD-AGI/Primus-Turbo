@@ -22,7 +22,7 @@ grep -q "LABVAL fast PASS" runs/${TAG}_valfast.log || { echo "GATE valfast not P
 tools/run.sh ${TAG}_valprod 1200 $V -- "/opt/venv/bin/python3 lab_validate.py prod 3 r29=$W/arms/r29 $AV" || { echo "GATE valprod FAIL"; exit 5; }
 grep -E "^CORR|^DET|LABVAL" runs/${TAG}_valprod.log
 grep -q "LABVAL prod PASS" runs/${TAG}_valprod.log || { echo "GATE valprod not PASS"; exit 5; }
-tools/run.sh ${TAG}_bench 1800 $OP -- "/opt/venv/bin/python3 benchmark.py --arm-path r29=$W/arms/r29 $AB --arm-path r29_aa=$W/arms/r29_aa --arm-path asm=$OP/beat --shapes prod --json $W/runs/${TAG}_bench.json" || { echo "GATE bench FAIL"; exit 6; }
+tools/run.sh ${TAG}_bench 1800 $OP -- "/opt/venv/bin/python3 benchmark.py --arm-path r29=$W/arms/r29 $AB ${EXTRA_ARMS:-} --arm-path r29_aa=$W/arms/r29_aa --arm-path asm=$OP/beat --shapes prod --json $W/runs/${TAG}_bench.json" || { echo "GATE bench FAIL"; exit 6; }
 python3 - "$W/runs/${TAG}_bench.log" <<'PY'
 import sys,re
 rows={}

@@ -1,0 +1,8 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+TOY shape=unequal_seqlen_2 arm=s3 dq  52.52dB fin=True dk  52.61dB fin=True dv  52.60dB fin=True vs_first: ref
+TOY shape=unequal_seqlen_2 arm=s3_df dq  52.52dB fin=True dk  52.61dB fin=True dv  52.60dB fin=True vs_first: dq=bitwise dk=bitwise dv=bitwise
+TOY shape=unequal_seqlen_2 arm=s3_trim dq  52.52dB fin=True dk  52.61dB fin=True dv  52.60dB fin=True vs_first: dq=bitwise dk=bitwise dv=bitwise
+TOY shape=unequal_seqlen_2 arm=s3_dqtrim dq  52.52dB fin=True dk  52.61dB fin=True dv  52.60dB fin=True vs_first: dq=bitwise dk=bitwise dv=bitwise
+TOYCHECK PASS
+rc=0
