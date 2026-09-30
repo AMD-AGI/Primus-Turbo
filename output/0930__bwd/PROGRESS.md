@@ -48,3 +48,4 @@ bwd FLOP 5.498229e12；判定阈值 0.5%（同进程 A/A 0.01–0.07%）。每�
 | round | 模式 | UTC | 接受 | prod TF/s（ms） | 相对冠军 prod | 占 ASM（同进程 beat） | proxy / fast TF/s | 结论 |
 |---|---|---|---|---|---|---|---|---|
 | 24 | deep（refactor h75 → s6） | 11:12–13:40 | 是（**假阳性**，fast 噪声） | 1038.3（5.295） | 0.9986 | 104.0% | 999.0 / 85.6（中位数噪声） | profiling：ATT ok、功耗墙（全零操作数 −34% 时间、+7.7% cycle）；act：DQT_VT_KEEP 在 prod/proxy 为 null；已改 fast=min + gain_weights（D7） |
+| 25 | fast | 13:50–14:28 | 否 | 1039.0（5.292） | 1.0019 | — | 1002.2 / 94.4（min） | 加权 1.0033 < 1.007；fast 用 min 后稳定（0.989）；g73（packed bf16 dQ 原子）在主机数值预筛中判死（精度合同） |
