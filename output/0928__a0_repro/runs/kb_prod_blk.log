@@ -1,0 +1,13 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm r20 /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/bwd_r20 grouped=False
+# arm r19h /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/bwd_r19h grouped=False
+# arm r29 /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/bwd_r29 grouped=True
+KB shape=prod mode=blk what=dq arm=r20 median_ms=3.5711 min=3.5591 max=3.5915 n=108 sclk_med=1011.0 sclk_pre=1011.0 pre_ms=0.09 order=r20,r19h,r29
+KB shape=prod mode=blk what=dq arm=r19h median_ms=3.5696 min=3.5560 max=3.5812 n=108 sclk_med=1013.0 sclk_pre=1013.0 pre_ms=0.09 order=r20,r19h,r29
+KB shape=prod mode=blk what=dq arm=r29 median_ms=3.8724 min=3.8600 max=3.8837 n=108 sclk_med=1014.0 sclk_pre=1013.5 pre_ms=0.09 order=r20,r19h,r29
+KB shape=prod mode=blk what=full arm=r20 median_ms=10.5093 min=10.4727 max=10.5467 n=108 sclk_med=1009.0 sclk_pre=1009.0 pre_ms=0.08 order=r20,r19h,r29
+KB shape=prod mode=blk what=full arm=r19h median_ms=10.7469 min=10.7137 max=10.7749 n=108 sclk_med=1012.5 sclk_pre=1012.5 pre_ms=0.08 order=r20,r19h,r29
+KB shape=prod mode=blk what=full arm=r29 median_ms=10.9237 min=10.9074 max=10.9448 n=108 sclk_med=1015.0 sclk_pre=1014.0 pre_ms=0.08 order=r20,r19h,r29
+KBDONE
+rc=0

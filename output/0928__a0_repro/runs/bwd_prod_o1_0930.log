@@ -1,0 +1,14 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm r20 -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/bwd_r20 md5=5c499890
+# arm r19h -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/bwd_r19h md5=a791a047
+# arm r29 -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/bwd_r29 md5=c6b95c2c
+# arm r29_aa -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/bwd_r29_aa md5=c6b95c2c
+# arm asm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/bwd/oe/artifacts/job/job_context/op/beat md5=2802a918
+# statistic median  iters 101  warmup 3.0s continuous  order blocked 9+lead 4, palindromic rounds  device gfx1250
+RESULT shape=prod arm=r20 stat=median iters=108 latency_ms=6.57051157951355 min_ms=6.509843826293945 max_ms=6.6373291015625 tflops=836.8038258486811 bw_gbs=204.27287339159798 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1872 sclk_end=2031 causal=True order=blocked9+lead4
+RESULT shape=prod arm=r19h stat=median iters=108 latency_ms=6.575417518615723 min_ms=6.472153186798096 max_ms=6.6922688484191895 tflops=836.1794839573175 bw_gbs=204.12046477659405 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1872 sclk_end=2031 causal=True order=blocked9+lead4
+RESULT shape=prod arm=r29 stat=median iters=108 latency_ms=6.583063364028931 min_ms=6.534736156463623 max_ms=6.663346767425537 tflops=835.2083100951658 bw_gbs=203.8833907226085 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1872 sclk_end=2031 causal=True order=blocked9+lead4
+RESULT shape=prod arm=r29_aa stat=median iters=108 latency_ms=6.586932420730591 min_ms=6.528005123138428 max_ms=6.669353008270264 tflops=834.7177223521845 bw_gbs=203.76363294328928 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1872 sclk_end=2031 causal=True order=blocked9+lead4
+RESULT shape=prod arm=asm stat=median iters=108 latency_ms=5.503438949584961 min_ms=5.444180965423584 max_ms=5.549677848815918 tflops=999.053369699803 bw_gbs=243.87974361035106 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1872 sclk_end=2031 causal=True order=blocked9+lead4
+rc=0

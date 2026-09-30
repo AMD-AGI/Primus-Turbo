@@ -1,0 +1,44 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm base -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/fwd_base  impl=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/fwd_base/impl.py kernel=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/fwd_base/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py md5=16837439 O_VARIANT=v3
+# arm a0r11 -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/fwd_a0r11  impl=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/fwd_a0r11/impl.py kernel=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/fwd_a0r11/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py md5=5d4530c8 O_VARIANT=v3
+# arm r6 -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/fwd_r6  impl=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/fwd_r6/impl.py kernel=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/fwd_r6/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py md5=a60bff8e O_VARIANT=v3
+# arm r13 -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/fwd_r13  impl=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/fwd_r13/impl.py kernel=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/fwd_r13/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py md5=e0097c2e O_VARIANT=v3
+# arm r13ns -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/fwd_r13ns  impl=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/fwd_r13ns/impl.py kernel=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/fwd_r13ns/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py md5=370769c9 O_VARIANT=v3
+# arm r13ns_aa -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/fwd_r13ns_aa  impl=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/fwd_r13ns_aa/impl.py kernel=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/fwd_r13ns_aa/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py md5=370769c9 O_VARIANT=v3
+# arm asm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/fwd-nospec/harness/beat  impl=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/fwd-nospec/harness/beat/impl.py
+# ENV TORCH_BLAS_PREFER_HIPBLASLT=1 HIPBLASLT_TENSILE_LIBPATH=/home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250
+# statistic median  iters 101  warmup 8.0s continuous  order blocked 9+lead 4, palindromic rounds  device gfx1250
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+[aiter] LoadKernel: _ZN5aiter41fmha_bf16_pertokenBf16_hd128_128x256_maskE hsaco: /home/lihuzhan/code/aiter-src/hsa//gfx1250/fmha_fwd_bf16/fmha_bf16_pertokenBf16_hd128_128x256_mask.co
+RESULT shape=proxy arm=base stat=median iters=101 latency_ms=0.24742 min_ms=0.23748 max_ms=0.25725 tflops=555.62 bw_gbs=339.04 flop=137472507904.0 bytes_min=83886080 sclk_start=1028 sclk_end=1058 causal=True order=blocked9+lead4
+RESULT shape=proxy arm=a0r11 stat=median iters=101 latency_ms=0.14803 min_ms=0.14591 max_ms=0.15599 tflops=928.66 bw_gbs=566.67 flop=137472507904.0 bytes_min=83886080 sclk_start=1028 sclk_end=1058 causal=True order=blocked9+lead4
+RESULT shape=proxy arm=r6 stat=median iters=101 latency_ms=0.14486 min_ms=0.14164 max_ms=0.15126 tflops=949.02 bw_gbs=579.09 flop=137472507904.0 bytes_min=83886080 sclk_start=1028 sclk_end=1058 causal=True order=blocked9+lead4
+RESULT shape=proxy arm=r13 stat=median iters=101 latency_ms=0.14404 min_ms=0.14134 max_ms=0.154 tflops=954.42 bw_gbs=582.39 flop=137472507904.0 bytes_min=83886080 sclk_start=1028 sclk_end=1058 causal=True order=blocked9+lead4
+RESULT shape=proxy arm=r13ns stat=median iters=101 latency_ms=0.14862 min_ms=0.1461 max_ms=0.15822 tflops=925.0 bw_gbs=564.44 flop=137472507904.0 bytes_min=83886080 sclk_start=1028 sclk_end=1058 causal=True order=blocked9+lead4
+RESULT shape=proxy arm=r13ns_aa stat=median iters=101 latency_ms=0.14844 min_ms=0.14626 max_ms=0.15446 tflops=926.14 bw_gbs=565.13 flop=137472507904.0 bytes_min=83886080 sclk_start=1028 sclk_end=1058 causal=True order=blocked9+lead4
+RESULT shape=proxy arm=asm stat=median iters=101 latency_ms=0.13304 min_ms=0.13138 max_ms=0.13698 tflops=1033.32 bw_gbs=630.54 flop=137472507904.0 bytes_min=83886080 sclk_start=1028 sclk_end=1058 causal=True order=blocked9+lead4
+rc=0
