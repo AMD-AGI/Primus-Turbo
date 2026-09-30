@@ -55,12 +55,18 @@ from enum import IntEnum
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+
+# UNSTABLE(gfx1250): raw upstream llvm.load for the sink logit (flat, SSA-visible address).
 from flydsl._mlir.dialects import llvm as llvm_dialect
+
+# UNSTABLE(gfx1250): rocdl.{wave_id,mbcnt_lo,ballot,permlanex16,exp2,wmma_*,s_wait_*,sched_barrier}
+# are ODS builders outside rocdl.__all__; no stable wrapper in 0.3.4.1.
 from flydsl.expr import arith, gpu, rocdl
 from flydsl.expr import math as fmath
+
+# UNSTABLE(gfx1250): TDM (cdna5) tensor_wait; no stable export in 0.3.4.1.
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
-from flydsl.expr.utils.arith import _to_raw as _raw
 
 from . import buffer_ops
 from .common import HAS_ASYNC_LDS_STORE, LOG2E, _run_compiled, ceildiv, create_llvm_ptr, imax, imin
@@ -102,17 +108,11 @@ def get_lds_capacity_bytes(gfx: str) -> int:
 # LLVM insert all depctr covers itself for the plain intrinsics the kernel emits.
 from .flash_attn_fwd_buffers import (
     ENABLE_SCHED_MODE2,
-    KManager16bV1,
     KManager16bV2,
     OManager16bV1,
-    OManager16bV2,
     OManager16bV3,
-    QManager16bV1,
     QManager16bV2,
-    VManager16bV1,
     VManager16bV2,
-    _async_load_to_lds,
-    _ir,
 )
 
 # ============================================================================
@@ -160,8 +160,6 @@ N_KV_PP = 2
 # Each K/V ping-pong block is floored to this many bytes (reserved headroom).
 MIN_KV_BLK_BYTES = 64 * 1024
 
-# log2(e): exp(x) = exp2(x * LOG2E). Softmax uses the native ISA exp2 intrinsic.
-
 # Deferred oaccu rescale (as in FlashAttention-4). Rescaling the
 # running O accumulator by corr = exp(m_prev - m_new) is a full-width VALU pass
 # (d_tiles*8 f32/lane) every tile, but corr == 1 when the running max doesn't
@@ -176,15 +174,9 @@ MIN_KV_BLK_BYTES = 64 * 1024
 ENABLE_DEFER_RESCALE = True
 RESCALE_THRESHOLD = 8.0
 
-# Speculative stale-max softmax. Common path: p = exp(S - m_prev) straight away (no row-max
-# tree, no permlane, no corr exp) -- exactly the deferred path above whenever it does not fire. A
-# wave-uniform trigger on the per-lane partial row sum (> e^(RESCALE_THRESHOLD-1): any p over e^8
-# forces it, with one logit unit of margin for fma/exp2 rounding) sends the wave to the regular
-# softmax after recomputing S from the still-resident K tile, so the output is bitwise unchanged.
-# Off: on real training data the trigger fires on 13-25% of tiles, each recomputed, which
-# costs more than the skipped row-max work saves.
-SPEC_STALE_MAX = False
-SPEC_TRIGGER = 1096.6331584284585  # e^7
+# A speculative stale-max softmax (p = exp(S - m_prev) straight away, recompute on a
+# wave-uniform trigger) was measured and removed: on real training data the trigger fired
+# on 13-25% of tiles, and the recomputes cost more than the skipped row-max work saved.
 
 # Running-max seed: a finite big-negative (not -inf) so a fully-masked row keeps m
 # finite -> softmax's (m_prev - m_new) and fma(s, .., -m) never hit -inf arithmetic
@@ -192,13 +184,12 @@ SPEC_TRIGGER = 1096.6331584284585  # e^7
 # -inf did. Masked scores stay -inf (p = exp2(-inf) = 0); only the max seed changes.
 BIG_NEG = -1.0e30
 
-# Compile-time Q/K/V loader select. False = V1 (Q ring async + swizzled LDS; K/V cluster_load_async +
-# swizzled LDS); True = V2 (Q per-warp TDM; K/V TDM global->LDS; all row-major padded LDS, HW OOB,
-# fewer address VGPRs). Gates all three loaders (Q, K and V); O is selected separately by O_VARIANT.
-USE_TDM_LOADER = True
-# O writer variant (decoupled from USE_TDM_LOADER): "v1" swizzled LDS + buffer_store (fastest so
-# far), "v2" TDM store (padding ignored -> contiguous LDS -> bank conflict, slow), "v3" padded LDS +
-# global_store_async_from_lds_b128 (needs a flydsl that ships that op; see common.py).
+# Q/K/V use the V2 (TDM) loaders: Q per-warp TDM, K/V TDM global->LDS, all row-major padded LDS
+# with HW OOB. They beat the V1 cluster_load_async + swizzled-LDS loaders (more address VGPRs),
+# which are no longer wired here.
+# O writer variant: "v1" swizzled LDS + buffer_store (fastest so far), "v3" padded LDS +
+# global_store_async_from_lds_b128 (needs a flydsl that ships that op; see common.py). The TDM
+# store ("v2": padding ignored -> contiguous LDS -> bank conflicts, slow) is not wired.
 O_VARIANT = "v3" if HAS_ASYNC_LDS_STORE else "v1"
 
 # NOTE: the remaining tiling constants (chunk sizes, K/V write-tile + V swizzle
@@ -242,7 +233,7 @@ def _load_seqlen_pair(ptr_tensor, idx):
     """
     p = fx.get_iter(ptr_tensor)
     pair = fx.ptr_load(p + fx.Int64(idx), result_type=fx.Vector.make_type(2, fx.Int32))
-    return fx.Int32(pair[0]), fx.Int32(pair[1])
+    return pair[0], pair[1]
 
 
 def _load_sink_logit(ptr_sink, q_head_idx, num_heads_q):
@@ -272,10 +263,10 @@ def _lpt_block_id(axis):
     the highest x of every (y, z), then the next-highest, and so on. Every consumer of a
     block id goes through here, so all of them see the same remapped triple.
     """
-    gx = fx.Int32(fx.grid_dim.x)
-    gy = fx.Int32(fx.grid_dim.y)
-    gz = fx.Int32(fx.grid_dim.z)
-    lin = fx.Int32(gpu.block_id("x")) + gx * (fx.Int32(gpu.block_id("y")) + gy * fx.Int32(gpu.block_id("z")))
+    gx = fx.grid_dim.x
+    gy = fx.grid_dim.y
+    gz = fx.grid_dim.z
+    lin = gpu.block_idx.x + gx * (gpu.block_idx.y + gy * gpu.block_idx.z)
     gyz = gy * gz
     rank = lin // gyz
     rem = lin - rank * gyz
@@ -326,7 +317,16 @@ def _wmma(a, b, c):
     v8f32 = fx.Vector.make_type(8, fx.Float32)
     wmma = rocdl.wmma_f32_16x16x32_f16 if a.dtype is fx.Float16 else rocdl.wmma_f32_16x16x32_bf16
     # modC defaults to WMMACModifier::none (== the old modC=0); omit it.
-    return wmma(v8f32, _ir(a), _ir(b), _ir(c), reuseA=False, reuseB=False).result
+    # UNSTABLE(gfx1250): raw WMMA intrinsic (SSA-returning, reuse disabled); fx.rocdl.WMMA +
+    # fx.gemm would change the fragment/ISA contract.
+    return wmma(
+        v8f32,
+        fx.as_ir_value(a),
+        fx.as_ir_value(b),
+        fx.as_ir_value(c),
+        reuseA=False,
+        reuseB=False,
+    ).result
 
 
 def _qk_gemm(*, k_values, q_frags_list, n_block):
@@ -415,7 +415,6 @@ def _softmax(
     q_min_list=None,
     kv_len=None,
     elem_dtype,
-    speculative=False,
 ):
     """Online-softmax update for one KV tile, for ALL R q-WMMA-tiles this wave owns.
 
@@ -457,10 +456,11 @@ def _softmax(
     log2e = fx.Float32(LOG2E)
 
     def fmax(a, b):
-        return fx.Float32(arith.MaxNumFOp(_raw(a), _raw(b), fastmath=fast).result)
+        return arith.maxnumf(a, b, fastmath=fast)
 
     def fadd(a, b):
-        return fx.Float32(arith.addf(_raw(a), _raw(b), fastmath=fast))
+        with arith.fastmath(fast):
+            return a + b
 
     # fast-math WITHOUT reassoc: LLVM's Reassociate pass otherwise re-linearizes the
     # sum tree back into a serial chain (max survives -- Reassociate ignores maxnum).
@@ -468,26 +468,29 @@ def _softmax(
     _no_reassoc = _FF.nnan | _FF.ninf | _FF.nsz | _FF.arcp | _FF.contract | _FF.afn
 
     def fadd_t(a, b):
-        return fx.Float32(arith.addf(_raw(a), _raw(b), fastmath=_no_reassoc))
+        with arith.fastmath(_no_reassoc):
+            return a + b
 
     def fsub(a, b):
-        return fx.Float32(arith.subf(_raw(a), _raw(b), fastmath=fast))
+        with arith.fastmath(fast):
+            return a - b
 
     def fmul(a, b):
-        return fx.Float32(arith.mulf(_raw(a), _raw(b), fastmath=fast))
+        with arith.fastmath(fast):
+            return a * b
 
-    def exp2(x):
-        return fx.Float32(rocdl.exp2(f32, _raw(x)))
+    def exp2(x):  # native v_exp_f32 (no denorm range reduction), unlike fx.math.exp2
+        return fx.Float32(rocdl.exp2(f32, x.ir_value()))
 
     # permlanex16 selectors: identity cross-16 gather (nibbles 0..15) => lane l<->l^16.
-    sel_lo, sel_hi = _raw(fx.Int32(0x76543210)), _raw(fx.Int32(0xFEDCBA98))
+    sel_lo, sel_hi = fx.Int32(0x76543210).ir_value(), fx.Int32(0xFEDCBA98).ir_value()
 
     def peer(v):  # cross-lane reduce partner: lane l <-> l^16 (the other kv half)
         return fx.Float32(
             rocdl.permlanex16(
                 f32,
-                _raw(v),
-                _raw(v),
+                v.ir_value(),
+                v.ir_value(),
                 sel_lo,
                 sel_hi,
                 fi=False,
@@ -509,9 +512,9 @@ def _softmax(
         q_max, q_min = q_max_list[r], q_min_list[r]
         s_masked = []
         for kvt in range(NKV):
-            svec = fx.Vector(_ir(s[kvt]))
+            svec = fx.Vector(s[kvt])
             for i in range(8):
-                sval = fx.Float32(svec[i])
+                sval = svec[i]
                 if q_max is not None or q_min is not None or kv_len is not None:
                     kv_pos = kv_pos_base + khalf * fx.Int32(8) + fx.Int32(kvt * WMMA_N + i)
                     if q_max is not None:
@@ -528,17 +531,11 @@ def _softmax(
     # across rows) so the backend dual-issues row0/row1 combines and hides the cross-lane
     # permlanex16 latency. ----
     m_new_list, corr_list, neg_m_list, do_rescale_list = [], [], [], []
-    if speculative:
-        # Stale max: m_new = m_prev, corr = 1 -- the deferred path, taken without looking.
-        for r in range(R):
-            m_new_list.append(m_prev_list[r])
-            neg_m_list.append(fsub(zero, fmul(m_prev_list[r], log2e)))
-    else:
-        max3 = lambda a, b, c: fmax(fmax(a, b), c)
-        local_max_list = _tree_reduce_multi(s_masked_list, max3, fmax)
+    max3 = lambda a, b, c: fmax(fmax(a, b), c)
+    local_max_list = _tree_reduce_multi(s_masked_list, max3, fmax)
 
     # ---- Per row: peer reduce + deferred-rescale decision + corr / neg_m. ----
-    for r in range(R if not speculative else 0):
+    for r in range(R):
         m_prev, q_min = m_prev_list[r], q_min_list[r]
         row_max = fmax(local_max_list[r], peer(local_max_list[r]))
         m_full = fmax(m_prev, row_max)
@@ -583,9 +580,9 @@ def _softmax(
             n2 = fx.Vector.from_elements([neg_m], fx.Float32).broadcast_to(2)
             for i in range(0, 8, 2):
                 sv = fx.Vector.from_elements([s_masked[idx], s_masked[idx + 1]], fx.Float32)
-                av = fx.Vector(fmath.fma(_ir(sv), _ir(l2), _ir(n2)))
+                av = fmath.fma(sv, l2, n2)
                 for e in range(2):
-                    pj = exp2(fx.Float32(av[e]))
+                    pj = exp2(av[e])
                     pe.append(pj)
                     p_flat.append(pj)
                 idx += 2
@@ -600,7 +597,8 @@ def _softmax(
         # The two rows' trees have the same shape, so run them in lockstep as
         # one v2 tree (row0, row1) -> v_pk_add_f32; per-row association unchanged (bitwise).
         def vadd_t(a, b):
-            return fx.Vector(arith.addf(_ir(a), _ir(b), fastmath=_no_reassoc))
+            with arith.fastmath(_no_reassoc):
+                return a + b
 
         vadd3 = lambda a, b, c: vadd_t(vadd_t(a, b), c)
         leaves = [
@@ -608,28 +606,12 @@ def _softmax(
             for i in range(len(p_flat_list[0]))
         ]
         (tot,) = _tree_reduce_multi([leaves], vadd3, vadd_t)
-        local_sum_list = [fx.Float32(tot[0]), fx.Float32(tot[1])]
+        local_sum_list = [tot[0], tot[1]]
     else:
         local_sum_list = _tree_reduce_multi(p_flat_list, add3, fadd_t)
 
-    if speculative:
-        # corr == 1: fma(1, d, x) == d + x, so this matches the stale path bitwise -- provided
-        # neither side may re-associate (see the d update below).
-        d_new_list = [
-            fadd_t(d_prev_list[r], fadd_t(local_sum_list[r], peer(local_sum_list[r]))) for r in range(R)
-        ]
-        # Trigger on this lane's half-row sum (both halves are in this wave, so the ballot
-        # sees every lane the regular row_max test would). Ordered OGT: inf fires, NaN never
-        # occurs (p >= 0, no -inf).
-        trig = local_sum_list[0] > fx.Float32(SPEC_TRIGGER)
-        for r in range(1, R):
-            trig = trig | (local_sum_list[r] > fx.Float32(SPEC_TRIGGER))
-        mask = rocdl.ballot(fx.Int32.ir_type, trig)
-        return p_list, m_new_list, d_new_list, fx.Int32(mask) != fx.Int32(0)
-
-    # fadd_t (no reassoc), so the order is corr*d + (own + peer) as written. With `fast`
-    # LLVM re-associated it (e.g. (corr*d + peer) + own), and the speculative path's d + (own + peer)
-    # then differed from the stale path by 1 ULP.
+    # fadd_t (no reassoc), so the order is corr*d + (own + peer) as written; with `fast`
+    # LLVM re-associated it (e.g. (corr*d + peer) + own).
     d_new_list = []
     for r in range(R):
         d_new_list.append(
@@ -773,36 +755,20 @@ def _core_attention(
     # be >= the Q staging footprint (at qk_hdim=256 that exceeds K|V+128KB -> we grow the
     # slot, "allocating additional space for K|V"; still occupancy=1). slot_bytes is
     # compile-time (no allocation; lds_base is passed in).
-    if USE_TDM_LOADER:
-        q_mgr = QManager16bV2(
-            qk_hdim=qk_hdim,
-            gqa_ratio=gqa_ratio,
-            num_waves=NUM_WAVES,
-            q_tiles_per_wave=WMMA_ROW_PER_WAVE,
-            elem_dtype=elem_dtype,
-        )
-        k_mgr = KManager16bV2(
-            qk_hdim=qk_hdim,
-            n_block=n_block,
-            num_waves=NUM_WAVES,
-            elem_dtype=elem_dtype,
-        )
-        v_mgr = VManager16bV2(v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=elem_dtype)
-    else:
-        q_mgr = QManager16bV1(
-            qk_hdim=qk_hdim,
-            gqa_ratio=gqa_ratio,
-            num_waves=NUM_WAVES,
-            q_tiles_per_wave=WMMA_ROW_PER_WAVE,
-            elem_dtype=elem_dtype,
-        )
-        k_mgr = KManager16bV1(
-            qk_hdim=qk_hdim,
-            n_block=n_block,
-            num_waves=NUM_WAVES,
-            elem_dtype=elem_dtype,
-        )
-        v_mgr = VManager16bV1(v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=elem_dtype)
+    q_mgr = QManager16bV2(
+        qk_hdim=qk_hdim,
+        gqa_ratio=gqa_ratio,
+        num_waves=NUM_WAVES,
+        q_tiles_per_wave=WMMA_ROW_PER_WAVE,
+        elem_dtype=elem_dtype,
+    )
+    k_mgr = KManager16bV2(
+        qk_hdim=qk_hdim,
+        n_block=n_block,
+        num_waves=NUM_WAVES,
+        elem_dtype=elem_dtype,
+    )
+    v_mgr = VManager16bV2(v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=elem_dtype)
     k_blk_bytes = max(k_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
     v_blk_bytes = max(v_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
     slot_bytes = max(k_blk_bytes + v_blk_bytes, q_mgr.get_lds_size_in_byte())
@@ -822,7 +788,7 @@ def _core_attention(
     # ---- Q staging TIME-SHARES slot 1: Q's LDS base = slot-1 base (kv_base +
     # slot_bytes). Q is loaded + drained into VGPR in the prologue, then dead; the
     # main loop's first slot-1 prefetch reuses the region. Safe with zero new sync --
-    # the prologue drains Q (part2) -> s_wait_asynccnt(0) -> gpu.barrier() BEFORE the
+    # the prologue drains Q (part2) -> tensor_wait(0) -> gpu.barrier() BEFORE the
     # loop, and prologue K/V loads target slot 0. slot_bytes >= Q footprint by
     # construction (see above), so Q always fits in slot 1. ----
     q_lds_base = lds_base + fx.Int32(slot_bytes)
@@ -868,7 +834,7 @@ def _core_attention(
         wg_min_seq = (block_x * fx.Int32(BLOCK_M)) // fx.Int32(gqa_ratio)
         kv_lo = imax(wg_min_seq + causal_off - window_left, fx.Int32(0))
         start_tile = kv_lo // fx.Int32(n_block)
-        start_tile = imin(start_tile, fx.Int32(n_tiles) - fx.Int32(1))
+        start_tile = imin(start_tile, n_tiles - fx.Int32(1))
     else:
         start_tile = fx.Int32(0)
 
@@ -879,15 +845,12 @@ def _core_attention(
         rem = imax(kv_len_wg - blk_row0, fx.Int32(0))
         return imin(rem, fx.Int32(n_block))
 
-    # ---- Prologue (ordered for sched mode 2): compute all K/V addresses AND the
-    # loop-init in the Q global-load shadow, then run part2 (Q ds_load), then issue
-    # the K/V cluster_loads LAST -- so NOTHING runs between the loads and the prologue
-    # barrier below. Sequence: (1) part1 [above] -> (2) KMgr
-    # param calc -> (3) loop init -> (4) part2 -> (5) K cluster_load -> (6) V
-    # cluster_load.
+    # ---- Prologue (ordered for sched mode 2): build the first tile's K/V TDM copy views
+    # in the Q global-load shadow, then run part2 (Q ds_load), then issue the K/V TDM
+    # copies LAST -- so NOTHING runs between the loads and the prologue barrier below.
 
-    # (2) KMgr param calc -- pure address arithmetic (no memory op), hoisted into the
-    # Q global-load shadow.
+    # K/V copy views -- pure address arithmetic (no memory op), hoisted into the Q
+    # global-load shadow.
     #
     # Ping-pong parity is LOCAL to this WG's tile stream: the prologue always loads the
     # first tile (start_tile) into buffer 0, and the main loop selects buffers by the
@@ -897,88 +860,52 @@ def _core_attention(
     # pointers via a constant immediate offset.
     start_pp = 0
     start_row0 = start_tile * fx.Int32(n_block)
-    if USE_TDM_LOADER:
-        # V2: build the TDM copy views for the first tile (pure), run Q part2, then issue
-        # the K/V TDM copies and drain with tensor_wait before the prologue barrier.
-        k_views = k_mgr.load_views(
-            ptr_lds=_k_lds_buf(start_pp),
-            ptr_K=ptr_K,
-            stride_k_seq=stride_k_seq,
-            stride_k_head=stride_k_head,
-            kv_head=kv_head,
-            kv_row0=kv_start + start_row0,
-            kv_valid=_kv_valid(start_row0),
-        )
-        v_views = v_mgr.load_views(
-            ptr_lds=_v_lds_buf(start_pp),
-            ptr_V=ptr_V,
-            stride_v_seq=stride_v_seq,
-            stride_v_head=stride_v_head,
-            kv_head=kv_head,
-            kv_row0=kv_start + start_row0,
-            kv_valid=_kv_valid(start_row0),
-        )
-        q_frags = q_mgr.load_q_to_vgpr_part2(scale=softmax_scale)
-        for _v in k_views:
-            fx.copy_atom_call(*_v)
-        for _v in v_views:
-            fx.copy_atom_call(*_v)
-        tdm_ops.tensor_wait(0)
-        gpu.barrier()
-    else:
-        k_gptrs, k_lds_ptrs, k_imm_offs = k_mgr.global_load_ptrs(
-            ptr_lds=_k_lds_buf(start_pp),
-            ptr_K=ptr_K,
-            stride_k_seq=stride_k_seq,
-            stride_k_head=stride_k_head,
-            kv_head=kv_head,
-            kv_row0=kv_start + start_row0,
-            kv_valid=_kv_valid(start_row0),
-            warp_idx=warp_idx,
-            lane_idx=lane_idx,
-        )
-        v_gptrs, v_lds_ptrs, v_imm_offs = v_mgr.global_load_ptrs(
-            ptr_lds=_v_lds_buf(start_pp),
-            ptr_V=ptr_V,
-            stride_v_seq=stride_v_seq,
-            stride_v_head=stride_v_head,
-            kv_head=kv_head,
-            kv_row0=kv_start + start_row0,
-            kv_valid=_kv_valid(start_row0),
-            warp_idx=warp_idx,
-            lane_idx=lane_idx,
-        )
-        # (3) QMgr part2 -- Q ds_load LDS->VGPR (drains the part1 Q async), issued AHEAD of
-        # the cluster_loads so its Q-scaling reg reuse leaves the load shadow.
-        q_frags = q_mgr.load_q_to_vgpr_part2(scale=softmax_scale)
-        # (4)+(5) Issue K then V cluster_loads LAST as ONE packed burst before the compiler
-        # reuses their source address VGPRs (part2 clobbers them). Only the cross-wave
-        # s_barrier is an immovable wall that packs the burst (mode-2 async-source-WAR fix).
-        _async_load_to_lds(k_gptrs, k_lds_ptrs, cluster=True, imm_offs=k_imm_offs)
-        _async_load_to_lds(v_gptrs, v_lds_ptrs, cluster=True, imm_offs=v_imm_offs)
-        rocdl.s_wait_asynccnt(0)
-        gpu.barrier()
+    k_views = k_mgr.load_views(
+        ptr_lds=_k_lds_buf(start_pp),
+        ptr_K=ptr_K,
+        stride_k_seq=stride_k_seq,
+        stride_k_head=stride_k_head,
+        kv_head=kv_head,
+        kv_row0=kv_start + start_row0,
+        kv_valid=_kv_valid(start_row0),
+    )
+    v_views = v_mgr.load_views(
+        ptr_lds=_v_lds_buf(start_pp),
+        ptr_V=ptr_V,
+        stride_v_seq=stride_v_seq,
+        stride_v_head=stride_v_head,
+        kv_head=kv_head,
+        kv_row0=kv_start + start_row0,
+        kv_valid=_kv_valid(start_row0),
+    )
+    q_frags = q_mgr.load_q_to_vgpr_part2(scale=softmax_scale)
+    for _v in k_views:
+        fx.copy_atom_call(*_v)
+    for _v in v_views:
+        fx.copy_atom_call(*_v)
+    tdm_ops.tensor_wait(0)
+    gpu.barrier()
 
-    # (7) Loop init -- placed after the prologue barrier. Online-softmax seed + O
+    # Loop init -- placed after the prologue barrier. Online-softmax seed + O
     # accumulators (iter_args) and loop bounds.
     #
     # Loop-carried state (scf.for_ iter_args): the online-softmax running max ``m`` and
     # denom ``d`` (per-lane f32), followed by the ``d_tiles`` fp32 O accumulators. Seed
-    # m=-inf, d=0, O=0: the first tile's corr=exp2(m_prev-m_new)=0 zeroes the
-    # (already-zero) O before its PV adds in -- the standard flash seed. (Fully-masked
-    # leading tiles under a finite-left window would make exp2(-inf-(-inf))=NaN;
-    # _softmax sanitizes that on the q_min path.)
+    # m=BIG_NEG (finite, see BIG_NEG), d=0, O=0: the first real tile's
+    # corr=exp2(m_prev-m_new) underflows to 0 and zeroes the (already-zero) O before its PV
+    # adds in -- the standard flash seed. Fully-masked leading tiles keep m finite, so
+    # no NaN.
     #
     # Attention sink (compile-time): the sink is one extra ``exp(sink)`` term in the
     # softmax denominator. Fold it in by seeding m=sink[q_head] and d=1.0 (=exp(sink-
     # sink)); the rescales carry that d seed to exactly exp(sink - m_final), the sink
-    # denom term. (Without a sink, m=-inf makes the first tile's corr zero the d seed,
-    # so d=1 would equal d=0 -- the no-sink path keeps d=0 to stay byte-for-byte.)
+    # denom term. (Without a sink, the BIG_NEG seed makes the first tile's corr zero the d
+    # seed, so d=1 would equal d=0 -- the no-sink path keeps d=0 to stay byte-for-byte.)
     d_tiles = v_hdim // WMMA_M
     R = WMMA_ROW_PER_WAVE
     _QS = 2 + d_tiles  # per-q-tile carried state: [m, d, O_0 .. O_{d_tiles-1}]
     if has_sink:
-        num_heads_q = gpu.grid_dim.y * fx.Int32(gqa_ratio)
+        num_heads_q = fx.grid_dim.y * fx.Int32(gqa_ratio)
         m_init = [_load_sink_logit(ptr_sink, q_head_idx[qt], num_heads_q) for qt in range(R)]
         d_init = [fx.Float32(1.0) for _ in range(R)]
     else:
@@ -989,20 +916,18 @@ def _core_attention(
     # partial O[q, d]), all zero. The R q-tiles have independent online-softmax state.
     _init = []
     for qt in range(R):
-        _init += [
-            _raw(m_init[qt]),
-            _raw(d_init[qt]),
-        ] + [_raw(fx.Vector.filled(8, 0.0, fx.Float32)) for _ in range(d_tiles)]
+        _init += fx.as_ir_value(
+            [m_init[qt], d_init[qt]] + [fx.Vector.filled(8, 0.0, fx.Float32) for _ in range(d_tiles)]
+        )
 
     # ---- ds_load LDS base pointers for both ping-pong buffers, carried as iter_args and
     # swapped curr<->next each iteration (buffer selected by pointer). Base count per mgr
-    # is manager-defined (V1: 2, V2: 1) -- carried generically. Same machinery for V1/V2;
-    # only the global->LDS ISSUE (_addr_phase/_prefetch/_drain) differs. ----
+    # is manager-defined -- carried generically. ----
     k_lds_ld_curr = k_mgr.ds_load_ptrs(ptr_lds=_k_lds_buf(0), lane_idx=lane_idx)
     v_lds_ld_curr = v_mgr.ds_load_ptrs(ptr_lds=_v_lds_buf(0), lane_idx=lane_idx)
     k_lds_ld_next = k_mgr.ds_load_ptrs(ptr_lds=_k_lds_buf(1), lane_idx=lane_idx)
     v_lds_ld_next = v_mgr.ds_load_ptrs(ptr_lds=_v_lds_buf(1), lane_idx=lane_idx)
-    _NKB = len(k_lds_ld_curr)  # ds bases per K buffer (V1: 2, V2: 1)
+    _NKB = len(k_lds_ld_curr)  # ds bases per K buffer
     _NVB = len(v_lds_ld_curr)
     _PTR_BASE = len(_init)
     _init = _init + k_lds_ld_curr + k_lds_ld_next + v_lds_ld_curr + v_lds_ld_next
@@ -1046,37 +971,15 @@ def _core_attention(
         # Warp-specialized preamble: same pieces, ordered so the SIMD-mate pair (i / i+4)
         # staggers K load vs prefetch around `_named_barrier_pair`. Correctness is
         # warp-type-independent (each wave reads its own resident K under the workgroup
-        # barrier); the rendezvous is a perf-only stagger. The READ (load_k_to_reg(k_curr))
-        # and ping-pong pointer machinery are UNIFORM; only the global->LDS ISSUE branches
-        # by USE_TDM_LOADER (V1 cluster_load_async / V2 TDM copy).
+        # barrier); the rendezvous is a perf-only stagger.
         nxt = t + fx.Int32(1)
         nxt_row0 = nxt * fx.Int32(n_block)
         nxt_valid = _kv_valid(nxt_row0)
 
         def _addr_phase():
-            # Pure (no memory op) -> hoistable: V2 the TDM copy views, V1 the per-lane
-            # global/LDS pointer lists, for tile t+1's K/V into the nxt_pp buffer.
-            if USE_TDM_LOADER:
-                k_views = k_mgr.load_views(
-                    ptr_lds=_k_lds_buf(nxt_pp),
-                    ptr_K=ptr_K,
-                    stride_k_seq=stride_k_seq,
-                    stride_k_head=stride_k_head,
-                    kv_head=kv_head,
-                    kv_row0=kv_start + nxt_row0,
-                    kv_valid=nxt_valid,
-                )
-                v_views = v_mgr.load_views(
-                    ptr_lds=_v_lds_buf(nxt_pp),
-                    ptr_V=ptr_V,
-                    stride_v_seq=stride_v_seq,
-                    stride_v_head=stride_v_head,
-                    kv_head=kv_head,
-                    kv_row0=kv_start + nxt_row0,
-                    kv_valid=nxt_valid,
-                )
-                return (k_views, v_views)
-            k_g, k_l, k_i = k_mgr.global_load_ptrs(
+            # Pure (no memory op) -> hoistable: the TDM copy views for tile t+1's K/V
+            # into the nxt_pp buffer.
+            k_views = k_mgr.load_views(
                 ptr_lds=_k_lds_buf(nxt_pp),
                 ptr_K=ptr_K,
                 stride_k_seq=stride_k_seq,
@@ -1084,10 +987,8 @@ def _core_attention(
                 kv_head=kv_head,
                 kv_row0=kv_start + nxt_row0,
                 kv_valid=nxt_valid,
-                warp_idx=warp_idx,
-                lane_idx=lane_idx,
             )
-            v_g, v_l, v_i = v_mgr.global_load_ptrs(
+            v_views = v_mgr.load_views(
                 ptr_lds=_v_lds_buf(nxt_pp),
                 ptr_V=ptr_V,
                 stride_v_seq=stride_v_seq,
@@ -1095,16 +996,11 @@ def _core_attention(
                 kv_head=kv_head,
                 kv_row0=kv_start + nxt_row0,
                 kv_valid=nxt_valid,
-                warp_idx=warp_idx,
-                lane_idx=lane_idx,
             )
-            return (k_g, k_l, k_i, v_g, v_l, v_i)
+            return (k_views, v_views)
 
         def _drain_barrier():
-            if USE_TDM_LOADER:
-                tdm_ops.tensor_wait(0)
-            else:
-                rocdl.s_wait_asynccnt(0)
+            tdm_ops.tensor_wait(0)
             rocdl.sched_barrier(0)
             gpu.barrier()
             rocdl.sched_barrier(0)
@@ -1114,17 +1010,12 @@ def _core_attention(
             # races the epilogue O write across waves.
             @flyc.jit
             def _issue():
-                if nxt < fx.Int32(n_tiles):
-                    if USE_TDM_LOADER:
-                        k_views, v_views = addr
-                        for _v in k_views:
-                            fx.copy_atom_call(*_v)
-                        for _v in v_views:
-                            fx.copy_atom_call(*_v)
-                    else:
-                        k_g, k_l, k_i, v_g, v_l, v_i = addr
-                        _async_load_to_lds(k_g, k_l, cluster=True, imm_offs=k_i)
-                        _async_load_to_lds(v_g, v_l, cluster=True, imm_offs=v_i)
+                if nxt < n_tiles:
+                    k_views, v_views = addr
+                    for _v in k_views:
+                        fx.copy_atom_call(*_v)
+                    for _v in v_views:
+                        fx.copy_atom_call(*_v)
 
             _issue()
 
@@ -1174,7 +1065,8 @@ def _core_attention(
         # INTERLEAVED (ILP): the rows are independent (own S, m, d) but share this tile's K/V.
         q_max_list = [seq_idx[qt] + causal_off + window_right if mask_right else None for qt in range(R)]
         q_min_list = [seq_idx[qt] + causal_off - window_left if mask_left else None for qt in range(R)]
-        _sm_kw = dict(
+        p_list, m_new_list, d_new_list, corr_list, do_rescale_list = _softmax(
+            s_list=s_list,
             m_prev_list=m_prev,
             d_prev_list=d_prev,
             lane_idx=lane_idx,
@@ -1185,66 +1077,6 @@ def _core_attention(
             kv_len=kv_len,
             elem_dtype=elem_dtype,
         )
-        # Speculate only on clean tiles (no mask, no kv tail); masked tiles run the regular
-        # softmax directly, so the slow-path copy exists in 2 bodies instead of 4.
-        if (
-            SPEC_STALE_MAX
-            and ENABLE_DEFER_RESCALE
-            and RESCALE_THRESHOLD >= 0.0
-            and mask_left is None
-            and mask_right is None
-            and kv_len is None
-        ):
-            # Fast stale-max pass; on a (rare, wave-uniform) trigger redo this tile with
-            # the regular softmax on S recomputed from the resident K slot. V is reloaded there too so
-            # the slow path does not hold K, S and V at once (the burst above is dead on it).
-            p_f, m_f, d_f, trig = _softmax(s_list=s_list, speculative=True, **_sm_kw)
-            NKV_ = n_block // WMMA_N
-            n_v = len(v_values)
-            fast_vals = (
-                [p for pl in p_f for p in pl]
-                + m_f
-                + d_f
-                + [fx.Float32(1.0) for _ in range(R)]
-                + [fx.Int32(0) for _ in range(R)]
-                + list(v_values)
-            )
-
-            @flyc.jit
-            def _spec_slow(vals, trig):
-                result = vals
-                if trig:
-                    k2 = k_mgr.load_k_to_reg(k_curr)
-                    s2 = _qk_gemm(k_values=k2, q_frags_list=q_frags, n_block=n_block)
-                    p2, m2, d2, c2, r2 = _softmax(s_list=s2, **_sm_kw)
-                    v2 = v_mgr.load_v_to_reg(v_curr)
-                    result = (
-                        [p for pl in p2 for p in pl]
-                        + m2
-                        + d2
-                        + c2
-                        + [x.select(fx.Int32(1), fx.Int32(0)) for x in r2]
-                        + list(v2)
-                    )
-                return result
-
-            outv = list(_spec_slow(fast_vals, trig))
-            i0 = 0
-            p_list = []
-            for qt in range(R):
-                p_list.append([fx.Vector(_ir(x)) for x in outv[i0 : i0 + NKV_]])
-                i0 += NKV_
-            m_new_list = [fx.Float32(x) for x in outv[i0 : i0 + R]]
-            i0 += R
-            d_new_list = [fx.Float32(x) for x in outv[i0 : i0 + R]]
-            i0 += R
-            corr_list = [fx.Float32(x) for x in outv[i0 : i0 + R]]
-            i0 += R
-            do_rescale_list = [fx.Int32(x) != fx.Int32(0) for x in outv[i0 : i0 + R]]
-            i0 += R
-            v_values = [fx.Vector(_ir(x)) for x in outv[i0 : i0 + n_v]]
-        else:
-            p_list, m_new_list, d_new_list, corr_list, do_rescale_list = _softmax(s_list=s_list, **_sm_kw)
 
         # ---- Rescale each q-tile's running O by its corr, then GEMM2 accumulates this
         # tile. When deferral is active (do_rescale is a wave-uniform i1) the wide
@@ -1272,7 +1104,7 @@ def _core_attention(
         o_resc_list = []
         for qt in range(R):
             corr_vec = fx.Vector.from_elements([corr_list[qt]], fx.Float32).broadcast_to(8)
-            o_vecs = [fx.Vector(_ir(o_acc[qt][dt])) for dt in range(d_tiles)]
+            o_vecs = list(o_acc[qt])
             if do_rescale_list[qt] is None:
                 o_resc = [ov * corr_vec for ov in o_vecs]
             else:
@@ -1292,7 +1124,7 @@ def _core_attention(
         # swapped curr<->next (4 s_swap_b32).
         out = []
         for qt in range(R):
-            out += [_raw(m_new_list[qt]), _raw(d_new_list[qt])] + [_raw(o) for o in o_new_list[qt]]
+            out += fx.as_ir_value([m_new_list[qt], d_new_list[qt], *o_new_list[qt]])
         # Swap curr<->next ds bases (manager-defined count each).
         out += k_next + k_curr + v_next + v_curr
         return out
@@ -1306,8 +1138,8 @@ def _core_attention(
     #   [start_tile, clean_lo) left boundary   (emitted only when mask_left)
     #   [clean_lo,   clean_hi) clean, no mask
     #   [clean_hi,   n_tiles)  right boundary + kv_len tail (last tile)
-    n_iter = fx.Int32(n_tiles) - start_tile
-    n_last = fx.Int32(n_tiles) - fx.Int32(1)  # last tile always carries the kv_len tail
+    n_iter = n_tiles - start_tile
+    n_last = n_tiles - fx.Int32(1)  # last tile always carries the kv_len tail
 
     # clean_hi = first tile that could need RIGHT masking = the WG's earliest query's
     # diagonal tile ((min q_max + 1)//n_block). Kept <= n_last so the tail tile stays in
@@ -1317,7 +1149,7 @@ def _core_attention(
         qmax_min = imax(wg_min_seq + causal_off + window_right, fx.Int32(0))
         clean_hi = (qmax_min + fx.Int32(1)) // fx.Int32(n_block)
     else:
-        clean_hi = fx.Int32(n_tiles)
+        clean_hi = n_tiles
     clean_hi = imax(imin(clean_hi, n_last), start_tile)
 
     # clean_lo = first tile fully at/above the WG's latest query's window start
@@ -1361,7 +1193,7 @@ def _core_attention(
     state = _run_tiles(
         state,
         clean_hi,
-        fx.Int32(n_tiles),
+        n_tiles,
         mask_left=mask_left,
         mask_right=mask_right,
         kv_len=kv_len,
@@ -1381,12 +1213,9 @@ def _core_attention(
     # last load into it was local tile n_iter-2 (issued during local tile n_iter-3,
     # consumed at n_iter-2), and the top-of-body barrier at local tile n_iter-1 already
     # synchronized every wave past that read. So the slot is idle here -- no cross-wave
-    # barrier needed. Only the V1 loader issues async loads (asynccnt); under TDM (V2/V3)
-    # K/V/Q load via tensorcnt, so nothing increments asynccnt and s_wait_asynccnt(0) is a
-    # pure no-op -- keep it only for V1 as a defensive per-wave WAR guard (retire any
-    # still-inflight async load into this slot before O's LDS write). The R q-tiles
-    # serialize through the same O ring (s_wait_dscnt(0) between them).
-    _OMgr = {"v1": OManager16bV1, "v2": OManager16bV2, "v3": OManager16bV3}[O_VARIANT]
+    # barrier needed. K/V/Q load via TDM (tensorcnt), so no async load is inflight here.
+    # The R q-tiles serialize through the same O ring (s_wait_dscnt(0) between them).
+    _OMgr = {"v1": OManager16bV1, "v3": OManager16bV3}[O_VARIANT]
     o_mgr = _OMgr(
         v_hdim=v_hdim,
         gqa_ratio=gqa_ratio,
@@ -1398,11 +1227,8 @@ def _core_attention(
         f"O ring budget {o_mgr.get_lds_size_in_byte()}B exceeds K|V slot {slot_bytes}B"
     )
     non_cur_pp = n_iter % fx.Int32(N_KV_PP)
-    if not USE_TDM_LOADER:
-        rocdl.s_wait_asynccnt(0)  # V1-only WAR: retire inflight async loads before slot reuse
-    # O strides are in ELEMENTS (OManager multiplies by _BF16_BYTES itself). Both V1/V2
-    # take ptr_O and build their own store descriptor internally (V1 a bounded buffer
-    # resource for the masked buffer_store; V2 the TDM store atom with HW OOB drop).
+    # O strides are in ELEMENTS (OManager multiplies by _BF16_BYTES itself). Both O writers
+    # take ptr_O and build their own store descriptor internally.
     o_lds_base = _k_lds_buf(non_cur_pp)
     for qt in range(R):
         # Normalize this q-tile's O by its running denom d, then reshape+store to VRAM.
@@ -1512,7 +1338,7 @@ def _zero_fill_attention(
         seq = prow // g
         head = kv_head * g + prow % g
         if has_sink:
-            num_heads_q = gpu.grid_dim.y * g
+            num_heads_q = fx.grid_dim.y * g
             lse_val = _load_sink_logit(ptr_sink, head, num_heads_q)
         else:
             lse_val = fx.Float32(float("-inf"))
