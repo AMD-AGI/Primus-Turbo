@@ -1,0 +1,85 @@
+DEV gfx1250 cus=256 clk_khz=2400000 lds_per_block_max=327680
+PLACE wmma_k1 wps=1 waves=1024 distinct_hwid=68 cyc_min=1049306 cyc_p50=1049723 cyc_max=1050163 h1[0]=0x20010c00 h1[1]=0x20010f00 h1[4]=0x20010800 h2[0]=0x2000110
+MB wmma_k1 wps=1 grid=256 iters=4096 ev_ms=0.5543 cyc_med=1049685 rt_med=53240 cyc_per_rt=19.716 cyc_per_op_simd=16.0169
+PLACE wmma_k1 wps=2 waves=2048 distinct_hwid=68 cyc_min=524972 cyc_p50=590819 cyc_max=591537 h1[0]=0x20010400 h1[1]=0x20010700 h1[4]=0x20010401 h2[0]=0x2000110
+MB wmma_k1 wps=2 grid=256 iters=2048 ev_ms=0.3728 cyc_med=590848 rt_med=34612 cyc_per_rt=17.071 cyc_per_op_simd=9.0156
+PLACE wmma_k1 wps=4 waves=4096 distinct_hwid=68 cyc_min=262901 cyc_p50=524141 cyc_max=558941 h1[0]=0x20002000 h1[1]=0x20002300 h1[4]=0x20002001 h2[0]=0x2000110
+MB wmma_k1 wps=4 grid=256 iters=1024 ev_ms=0.3041 cyc_med=524122 rt_med=29200 cyc_per_rt=17.949 cyc_per_op_simd=7.9975
+PLACE wmma_k2 wps=1 waves=1024 distinct_hwid=68 cyc_min=2163386 cyc_p50=2163746 cyc_max=2164019 h1[0]=0x20002000 h1[1]=0x20002300 h1[4]=0x20002000 h2[0]=0x2000110
+MB wmma_k2 wps=1 grid=256 iters=16384 ev_ms=1.2982 cyc_med=2163746 rt_med=125728 cyc_per_rt=17.210 cyc_per_op_simd=8.2540
+PLACE wmma_k2 wps=2 waves=2048 distinct_hwid=68 cyc_min=1114798 cyc_p50=2128589 cyc_max=2129573 h1[0]=0x20011800 h1[1]=0x20011b00 h1[4]=0x20011801 h2[0]=0x2000110
+MB wmma_k2 wps=2 grid=256 iters=8192 ev_ms=1.2458 cyc_med=2128589 rt_med=119892 cyc_per_rt=17.754 cyc_per_op_simd=8.1199
+PLACE wmma_k2 wps=4 waves=4096 distinct_hwid=68 cyc_min=559860 cyc_p50=1606424 cyc_max=2114170 h1[0]=0x20001400 h1[1]=0x20001700 h1[4]=0x20001401 h2[0]=0x2000110
+MB wmma_k2 wps=4 grid=256 iters=4096 ev_ms=1.2219 cyc_med=1606213 rt_med=91864 cyc_per_rt=17.485 cyc_per_op_simd=6.1272
+PLACE wmma_k4 wps=1 waves=1024 distinct_hwid=68 cyc_min=2146988 cyc_p50=2147275 cyc_max=2147589 h1[0]=0x20001400 h1[1]=0x20001700 h1[4]=0x20001000 h2[0]=0x2000110
+MB wmma_k4 wps=1 grid=256 iters=16384 ev_ms=1.2827 cyc_med=2147380 rt_med=125844 cyc_per_rt=17.064 cyc_per_op_simd=8.1916
+PLACE wmma_k4 wps=2 waves=2048 distinct_hwid=68 cyc_min=1114810 cyc_p50=2120930 cyc_max=2121857 h1[0]=0x20000800 h1[1]=0x20000b00 h1[4]=0x20000801 h2[0]=0x2000110
+MB wmma_k4 wps=2 grid=256 iters=8192 ev_ms=1.2489 cyc_med=2120911 rt_med=121720 cyc_per_rt=17.425 cyc_per_op_simd=8.0906
+PLACE wmma_k4 wps=4 waves=4096 distinct_hwid=68 cyc_min=559658 cyc_p50=1606248 cyc_max=2110548 h1[0]=0x20010800 h1[1]=0x20010b00 h1[4]=0x20010801 h2[0]=0x2000110
+MB wmma_k4 wps=4 grid=256 iters=4096 ev_ms=1.2297 cyc_med=1606209 rt_med=91896 cyc_per_rt=17.479 cyc_per_op_simd=6.1272
+PLACE wmma_k8 wps=1 waves=1024 distinct_hwid=68 cyc_min=2147027 cyc_p50=2147384 cyc_max=2147565 h1[0]=0x20010800 h1[1]=0x20010b00 h1[4]=0x20010400 h2[0]=0x2000110
+MB wmma_k8 wps=1 grid=256 iters=16384 ev_ms=1.2915 cyc_med=2147384 rt_med=127664 cyc_per_rt=16.821 cyc_per_op_simd=8.1916
+PLACE wmma_k8 wps=2 waves=2048 distinct_hwid=68 cyc_min=1114821 cyc_p50=2120938 cyc_max=2121778 h1[0]=0x20010000 h1[1]=0x20010300 h1[4]=0x20010001 h2[0]=0x2000110
+MB wmma_k8 wps=2 grid=256 iters=8192 ev_ms=1.2454 cyc_med=2120899 rt_med=121152 cyc_per_rt=17.506 cyc_per_op_simd=8.0906
+PLACE wmma_k8 wps=4 waves=4096 distinct_hwid=68 cyc_min=559692 cyc_p50=1606273 cyc_max=2110493 h1[0]=0x20002000 h1[1]=0x20002300 h1[4]=0x20002001 h2[0]=0x2000110
+MB wmma_k8 wps=4 grid=256 iters=4096 ev_ms=1.2407 cyc_med=1606248 rt_med=91076 cyc_per_rt=17.636 cyc_per_op_simd=6.1273
+PLACE wmma_k16 wps=1 waves=1024 distinct_hwid=68 cyc_min=2147033 cyc_p50=2147411 cyc_max=2147827 h1[0]=0x20002000 h1[1]=0x20002300 h1[4]=0x20011800 h2[0]=0x2000110
+MB wmma_k16 wps=1 grid=256 iters=16384 ev_ms=1.2757 cyc_med=2147420 rt_med=125864 cyc_per_rt=17.061 cyc_per_op_simd=8.1918
+PLACE wmma_k16 wps=2 waves=2048 distinct_hwid=68 cyc_min=1114825 cyc_p50=2120943 cyc_max=2121781 h1[0]=0x20011400 h1[1]=0x20011700 h1[4]=0x20011401 h2[0]=0x2000110
+MB wmma_k16 wps=2 grid=256 iters=8192 ev_ms=1.2709 cyc_med=2120934 rt_med=121580 cyc_per_rt=17.445 cyc_per_op_simd=8.0907
+PLACE wmma_k16 wps=4 waves=4096 distinct_hwid=68 cyc_min=559668 cyc_p50=1606225 cyc_max=2110490 h1[0]=0x20000c00 h1[1]=0x20000f00 h1[4]=0x20000c01 h2[0]=0x2000110
+MB wmma_k16 wps=4 grid=256 iters=4096 ev_ms=1.2312 cyc_med=1606217 rt_med=89912 cyc_per_rt=17.864 cyc_per_op_simd=6.1272
+PLACE exp8 wps=1 waves=1024 distinct_hwid=68 cyc_min=3867153 cyc_p50=3867466 cyc_max=3867555 h1[0]=0x20000c00 h1[1]=0x20000f00 h1[4]=0x20000c00 h2[0]=0x2000110
+MB exp8 wps=1 grid=256 iters=65536 ev_ms=1.7041 cyc_med=3867459 rt_med=168672 cyc_per_rt=22.929 cyc_per_op_simd=3.6883
+PLACE exp8 wps=2 waves=2048 distinct_hwid=68 cyc_min=1933838 cyc_p50=2900513 cyc_max=2900892 h1[0]=0x20000800 h1[1]=0x20000b00 h1[4]=0x20000801 h2[0]=0x2000110
+MB exp8 wps=2 grid=256 iters=32768 ev_ms=1.2866 cyc_med=2900514 rt_med=126460 cyc_per_rt=22.936 cyc_per_op_simd=2.7661
+PLACE exp8 wps=4 waves=4096 distinct_hwid=68 cyc_min=975503 cyc_p50=2157887 cyc_max=2761610 h1[0]=0x20010400 h1[1]=0x20010700 h1[4]=0x20010401 h2[0]=0x2000110
+MB exp8 wps=4 grid=256 iters=16384 ev_ms=1.2241 cyc_med=2157888 rt_med=94492 cyc_per_rt=22.837 cyc_per_op_simd=2.0579
+PLACE fma8 wps=1 waves=1024 distinct_hwid=68 cyc_min=1770048 cyc_p50=1770355 cyc_max=1770443 h1[0]=0x20010400 h1[1]=0x20010700 h1[4]=0x20010000 h2[0]=0x2000110
+MB fma8 wps=1 grid=256 iters=65536 ev_ms=0.7855 cyc_med=1770360 rt_med=77620 cyc_per_rt=22.808 cyc_per_op_simd=1.6883
+PLACE fma8 wps=2 waves=2048 distinct_hwid=68 cyc_min=885309 cyc_p50=1327720 cyc_max=1328509 h1[0]=0x20001800 h1[1]=0x20001b00 h1[4]=0x20001801 h2[0]=0x2000110
+MB fma8 wps=2 grid=256 iters=32768 ev_ms=0.5963 cyc_med=1327720 rt_med=58636 cyc_per_rt=22.643 cyc_per_op_simd=1.2662
+PLACE fma8 wps=4 waves=4096 distinct_hwid=68 cyc_min=446267 cyc_p50=925559 cyc_max=1194958 h1[0]=0x20011800 h1[1]=0x20011b00 h1[4]=0x20011801 h2[0]=0x2000110
+MB fma8 wps=4 grid=256 iters=16384 ev_ms=0.5415 cyc_med=925543 rt_med=41540 cyc_per_rt=22.281 cyc_per_op_simd=0.8827
+PLACE pkfma8 wps=1 waves=1024 distinct_hwid=68 cyc_min=2425433 cyc_p50=2425768 cyc_max=2425874 h1[0]=0x20011800 h1[1]=0x20011b00 h1[4]=0x20011400 h2[0]=0x2000110
+MB pkfma8 wps=1 grid=256 iters=65536 ev_ms=1.0790 cyc_med=2425732 rt_med=107036 cyc_per_rt=22.663 cyc_per_op_simd=2.3134
+PLACE pkfma8 wps=2 waves=2048 distinct_hwid=68 cyc_min=1212991 cyc_p50=1213373 cyc_max=1213856 h1[0]=0x20011000 h1[1]=0x20011300 h1[4]=0x20011001 h2[0]=0x2000110
+MB pkfma8 wps=2 grid=256 iters=32768 ev_ms=0.5751 cyc_med=1213339 rt_med=56920 cyc_per_rt=21.317 cyc_per_op_simd=1.1571
+PLACE pkfma8 wps=4 waves=4096 distinct_hwid=68 cyc_min=624075 cyc_p50=1078780 cyc_max=1194784 h1[0]=0x20000c00 h1[1]=0x20000f00 h1[4]=0x20000c01 h2[0]=0x2000110
+MB pkfma8 wps=4 grid=256 iters=16384 ev_ms=0.5737 cyc_med=1078786 rt_med=50940 cyc_per_rt=21.178 cyc_per_op_simd=1.0288
+PLACE mix_e1 wps=1 waves=1024 distinct_hwid=68 cyc_min=2458196 cyc_p50=2458643 cyc_max=2458966 h1[0]=0x20000c00 h1[1]=0x20000f00 h1[4]=0x20000800 h2[0]=0x2000110
+MB mix_e1 wps=1 grid=256 iters=16384 ev_ms=1.5156 cyc_med=2458551 rt_med=148320 cyc_per_rt=16.576 cyc_per_op_simd=9.3786
+PLACE mix_e1 wps=2 waves=2048 distinct_hwid=68 cyc_min=1446348 cyc_p50=2368080 cyc_max=2381269 h1[0]=0x20000000 h1[1]=0x20000300 h1[4]=0x20000001 h2[0]=0x2000110
+MB mix_e1 wps=2 grid=256 iters=8192 ev_ms=1.4527 cyc_med=2368092 rt_med=139268 cyc_per_rt=17.004 cyc_per_op_simd=9.0336
+PLACE mix_e2 wps=1 waves=1024 distinct_hwid=68 cyc_min=2900713 cyc_p50=2901075 cyc_max=2901361 h1[0]=0x20000000 h1[1]=0x20000300 h1[4]=0x20010400 h2[0]=0x2000110
+MB mix_e2 wps=1 grid=256 iters=16384 ev_ms=1.6594 cyc_med=2901020 rt_med=163536 cyc_per_rt=17.739 cyc_per_op_simd=11.0665
+PLACE mix_e2 wps=2 waves=2048 distinct_hwid=68 cyc_min=1815818 cyc_p50=2685973 cyc_max=2686998 h1[0]=0x20010000 h1[1]=0x20010300 h1[4]=0x20010001 h2[0]=0x2000110
+MB mix_e2 wps=2 grid=256 iters=8192 ev_ms=1.5953 cyc_med=2685971 rt_med=154448 cyc_per_rt=17.391 cyc_per_op_simd=10.2462
+PLACE mix_e4 wps=1 waves=1024 distinct_hwid=68 cyc_min=3687045 cyc_p50=3687618 cyc_max=3687949 h1[0]=0x20010000 h1[1]=0x20010300 h1[4]=0x20001c00 h2[0]=0x2000110
+MB mix_e4 wps=1 grid=256 iters=16384 ev_ms=1.9863 cyc_med=3687387 rt_med=195984 cyc_per_rt=18.815 cyc_per_op_simd=14.0663
+PLACE mix_e4 wps=2 waves=2048 distinct_hwid=68 cyc_min=1986642 cyc_p50=3625081 cyc_max=3625993 h1[0]=0x20001400 h1[1]=0x20001700 h1[4]=0x20001401 h2[0]=0x2000110
+MB mix_e4 wps=2 grid=256 iters=8192 ev_ms=1.9477 cyc_med=3625089 rt_med=189704 cyc_per_rt=19.109 cyc_per_op_simd=13.8286
+PLACE mix_v2 wps=1 waves=1024 distinct_hwid=68 cyc_min=2474607 cyc_p50=2474990 cyc_max=2475310 h1[0]=0x20001400 h1[1]=0x20001700 h1[4]=0x20011c00 h2[0]=0x2000110
+MB mix_v2 wps=1 grid=256 iters=16384 ev_ms=1.4772 cyc_med=2474979 rt_med=145432 cyc_per_rt=17.018 cyc_per_op_simd=9.4413
+PLACE mix_v2 wps=2 waves=2048 distinct_hwid=68 cyc_min=1331335 cyc_p50=2293484 cyc_max=2294407 h1[0]=0x20011400 h1[1]=0x20011700 h1[4]=0x20011401 h2[0]=0x2000110
+MB mix_v2 wps=2 grid=256 iters=8192 ev_ms=1.4115 cyc_med=2293462 rt_med=135992 cyc_per_rt=16.865 cyc_per_op_simd=8.7489
+PLACE mix_v4 wps=1 waves=1024 distinct_hwid=68 cyc_min=2736750 cyc_p50=2737160 cyc_max=2737447 h1[0]=0x20011400 h1[1]=0x20011700 h1[4]=0x20011000 h2[0]=0x2000110
+MB mix_v4 wps=1 grid=256 iters=16384 ev_ms=1.6529 cyc_med=2737160 rt_med=162756 cyc_per_rt=16.818 cyc_per_op_simd=10.4414
+PLACE mix_v4 wps=2 waves=2048 distinct_hwid=68 cyc_min=1479234 cyc_p50=2505329 cyc_max=2506177 h1[0]=0x20010c00 h1[1]=0x20010f00 h1[4]=0x20010c01 h2[0]=0x2000110
+MB mix_v4 wps=2 grid=256 iters=8192 ev_ms=1.5992 cyc_med=2505329 rt_med=152824 cyc_per_rt=16.394 cyc_per_op_simd=9.5571
+PLACE mix_v8 wps=1 waves=1024 distinct_hwid=68 cyc_min=4342454 cyc_p50=4342918 cyc_max=4343296 h1[0]=0x20010c00 h1[1]=0x20010f00 h1[4]=0x20000c00 h2[0]=0x2000110
+MB mix_v8 wps=1 grid=256 iters=16384 ev_ms=2.2289 cyc_med=4342901 rt_med=220008 cyc_per_rt=19.740 cyc_per_op_simd=16.5669
+PLACE mix_v8 wps=2 waves=2048 distinct_hwid=68 cyc_min=2646685 cyc_p50=3370569 cyc_max=3390308 h1[0]=0x20000800 h1[1]=0x20000b00 h1[4]=0x20000801 h2[0]=0x2000110
+MB mix_v8 wps=2 grid=256 iters=8192 ev_ms=1.9363 cyc_med=3370340 rt_med=186792 cyc_per_rt=18.043 cyc_per_op_simd=12.8568
+PLACE mix_e1v3 wps=1 waves=1024 distinct_hwid=68 cyc_min=3195587 cyc_p50=3195833 cyc_max=3196090 h1[0]=0x20000800 h1[1]=0x20000b00 h1[4]=0x20000400 h2[0]=0x2000110
+MB mix_e1v3 wps=1 grid=256 iters=16384 ev_ms=1.8726 cyc_med=3195833 rt_med=184396 cyc_per_rt=17.331 cyc_per_op_simd=12.1911
+PLACE mix_e1v3 wps=2 waves=2048 distinct_hwid=68 cyc_min=2036291 cyc_p50=2835138 cyc_max=2835950 h1[0]=0x20002000 h1[1]=0x20002300 h1[4]=0x20002001 h2[0]=0x2000110
+MB mix_e1v3 wps=2 grid=256 iters=8192 ev_ms=1.7231 cyc_med=2835038 rt_med=167204 cyc_per_rt=16.956 cyc_per_op_simd=10.8148
+PLACE mix_e1v6 wps=1 waves=1024 distinct_hwid=68 cyc_min=4833875 cyc_p50=4834235 cyc_max=4834532 h1[0]=0x20002000 h1[1]=0x20002300 h1[4]=0x20010000 h2[0]=0x2000110
+MB mix_e1v6 wps=1 grid=256 iters=16384 ev_ms=2.4731 cyc_med=4834346 rt_med=244528 cyc_per_rt=19.770 cyc_per_op_simd=18.4416
+PLACE mix_e1v6 wps=2 waves=2048 distinct_hwid=68 cyc_min=2889771 cyc_p50=3695398 cyc_max=3695992 h1[0]=0x20001c00 h1[1]=0x20001f00 h1[4]=0x20001c01 h2[0]=0x2000110
+MB mix_e1v6 wps=2 grid=256 iters=8192 ev_ms=2.1152 cyc_med=3695203 rt_med=205160 cyc_per_rt=18.011 cyc_per_op_simd=14.0961
+PLACE roles wps=2 waves=2048 distinct_hwid=68 cyc_min=797798 cyc_p50=1081503 cyc_max=1082400 h1[0]=0x20011800 h1[1]=0x20011b00 h1[4]=0x20011801 h2[0]=0x2000110
+MB roles wps=2 grid=256 iters=8192 ev_ms=0.6637 cyc_med=1081503 rt_med=63880 cyc_per_rt=16.930 cyc_per_op_simd=4.1256
+MBDONE
+rc=0

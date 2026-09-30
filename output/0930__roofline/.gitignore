@@ -1,0 +1,4 @@
+runs/*.clk
+mb/mb[0-9]
+mb/*.s
+mb/*.hsaco

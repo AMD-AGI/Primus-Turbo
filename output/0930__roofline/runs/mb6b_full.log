@@ -1,0 +1,23 @@
+MB6 read bytes=4194304 passes=4768 ev_ms=0.7457 TBps=26.818 f_rt=2129 B_per_clk_CU=49.2
+MB6 read bytes=16777216 passes=1192 ev_ms=0.3303 TBps=60.550 f_rt=2061 B_per_clk_CU=114.8
+MB6 read bytes=67108864 passes=298 ev_ms=0.5521 TBps=36.225 f_rt=2163 B_per_clk_CU=65.4
+MB6 read bytes=140509184 passes=142 ev_ms=0.5425 TBps=36.775 f_rt=2166 B_per_clk_CU=66.3
+MB6 read bytes=268435456 passes=74 ev_ms=0.5349 TBps=37.135 f_rt=2174 B_per_clk_CU=66.7
+MB6 read bytes=1073741824 passes=18 ev_ms=1.0554 TBps=18.312 f_rt=1980 B_per_clk_CU=36.1
+MB6 read bytes=4294967296 passes=4 ev_ms=0.9152 TBps=18.772 f_rt=2065 B_per_clk_CU=35.5
+MB6 write bytes=4194304 passes=4768 ev_ms=0.6442 TBps=31.042 f_rt=2117 B_per_clk_CU=57.3
+MB6 write bytes=16777216 passes=1192 ev_ms=0.6148 TBps=32.527 f_rt=2103 B_per_clk_CU=60.4
+MB6 write bytes=67108864 passes=298 ev_ms=0.6224 TBps=32.132 f_rt=2123 B_per_clk_CU=59.1
+MB6 write bytes=140509184 passes=142 ev_ms=0.6218 TBps=32.090 f_rt=2106 B_per_clk_CU=59.5
+MB6 write bytes=268435456 passes=74 ev_ms=0.9042 TBps=21.970 f_rt=1934 B_per_clk_CU=44.4
+MB6 write bytes=1073741824 passes=18 ev_ms=1.0263 TBps=18.832 f_rt=1951 B_per_clk_CU=37.7
+MB6 write bytes=4294967296 passes=4 ev_ms=0.9176 TBps=18.723 f_rt=1952 B_per_clk_CU=37.5
+MB6 copy bytes=4194304 passes=4768 ev_ms=1.0516 TBps=38.035 f_rt=2161 B_per_clk_CU=68.8
+MB6 copy bytes=16777216 passes=1192 ev_ms=0.9050 TBps=44.196 f_rt=2173 B_per_clk_CU=79.5
+MB6 copy bytes=67108864 passes=298 ev_ms=1.0631 TBps=37.624 f_rt=2130 B_per_clk_CU=69.0
+MB6 copy bytes=140509184 passes=142 ev_ms=1.3080 TBps=30.509 f_rt=2071 B_per_clk_CU=57.6
+MB6 copy bytes=268435456 passes=74 ev_ms=2.3751 TBps=16.727 f_rt=2142 B_per_clk_CU=30.5
+MB6 copy bytes=1073741824 passes=18 ev_ms=2.3249 TBps=16.626 f_rt=2164 B_per_clk_CU=30.0
+MB6 copy bytes=4294967296 passes=4 ev_ms=2.0612 TBps=16.669 f_rt=2165 B_per_clk_CU=30.1
+MBDONE
+rc=0

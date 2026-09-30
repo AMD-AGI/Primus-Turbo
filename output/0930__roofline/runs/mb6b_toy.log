@@ -1,0 +1,8 @@
+MB6 read bytes=4194304 passes=1 ev_ms=0.0766 TBps=0.055 f_rt=2312 B_per_clk_CU=0.1
+MB6 read bytes=67108864 passes=1 ev_ms=0.1141 TBps=0.588 f_rt=2310 B_per_clk_CU=1.0
+MB6 write bytes=4194304 passes=1 ev_ms=0.0482 TBps=0.087 f_rt=2286 B_per_clk_CU=0.1
+MB6 write bytes=67108864 passes=1 ev_ms=0.0782 TBps=0.858 f_rt=2277 B_per_clk_CU=1.5
+MB6 copy bytes=4194304 passes=1 ev_ms=0.0426 TBps=0.197 f_rt=2331 B_per_clk_CU=0.3
+MB6 copy bytes=67108864 passes=1 ev_ms=0.1380 TBps=0.973 f_rt=2334 B_per_clk_CU=1.6
+MBDONE
+rc=0

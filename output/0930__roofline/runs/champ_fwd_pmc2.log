@@ -1,0 +1,74 @@
+W0930 06:33:47.329260   83858 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.103779 sec
+W0930 06:33:47.329478   83858 simple_timer.cpp:55] [rocprofv3] '/opt/venv/bin/python3 benchmark.py --arm-path r13ns=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/fwd_r13ns --arm-path asm=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/fwd-nospec/harness/beat --shapes prod --iters 11 --warmup-seconds 1 --block 3 --lead 1' ::     0.000000 sec
+W0930 06:33:49.361074   84183 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.105989 sec
+W0930 06:33:49.361329   84183 simple_timer.cpp:55] [rocprofv3] '/opt/venv/bin/python /opt/venv/bin/hipconfig --version' ::     0.000000 sec
+W0930 06:33:49.522075   84183 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.103099 sec
+W0930 06:33:49.522372   84183 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/bin/hipconfig --version' ::     0.000000 sec
+W0930 06:33:49.665701   84188 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.104168 sec
+W0930 06:33:49.665953   84188 simple_timer.cpp:55] [rocprofv3] 'sh -c -- /opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/clang++ --version' ::     0.000000 sec
+W0930 06:33:49.821761   84191 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.110533 sec
+W0930 06:33:49.822003   84191 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/clang++ --version' ::     0.000000 sec
+W0930 06:33:49.964984   84191 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.103199 sec
+W0930 06:33:49.965186   84191 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/clang++ --version' ::     0.000000 sec
+W0930 06:33:50.111332   84191 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.107476 sec
+W0930 06:33:50.111565   84191 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/clang++ --version' ::     0.000000 sec
+W0930 06:33:50.112340   84191 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/clang++ --version' ::     0.000775 sec
+W0930 06:33:50.113489   84191 simple_timer.cpp:55] [rocprofv3] output generation ::     0.001032 sec
+W0930 06:33:50.113557   84191 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.001102 sec
+W0930 06:33:50.130649   84183 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/bin/hipconfig --version' ::     0.608277 sec
+W0930 06:33:50.131864   84183 simple_timer.cpp:55] [rocprofv3] output generation ::     0.001081 sec
+W0930 06:33:50.131902   84183 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.001121 sec
+W0930 06:33:50.664344   84206 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.102291 sec
+W0930 06:33:50.664557   84206 simple_timer.cpp:55] [rocprofv3] '/bin/sh -c cat /proc/sys/kernel/numa_balancing' ::     0.000000 sec
+W0930 06:33:50.811694   84209 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.103527 sec
+W0930 06:33:50.811873   84209 simple_timer.cpp:55] [rocprofv3] 'cat /proc/sys/kernel/numa_balancing' ::     0.000000 sec
+W0930 06:33:50.811956   84209 simple_timer.cpp:55] [rocprofv3] 'cat /proc/sys/kernel/numa_balancing' ::     0.000083 sec
+W0930 06:33:50.813082   84209 simple_timer.cpp:55] [rocprofv3] output generation ::     0.001046 sec
+W0930 06:33:50.813126   84209 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.001092 sec
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+W0930 06:33:51.259175   83858 tool.cpp:3082] HSA version 1.21.0 initialized (instance=0)
+W0930 06:33:51.451765   84223 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.106420 sec
+W0930 06:33:51.452035   84223 simple_timer.cpp:55] [rocprofv3] '/bin/sh /sbin/ldconfig -p' ::     0.000000 sec
+# arm r13ns -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/fwd_r13ns  impl=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/fwd_r13ns/impl.py kernel=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0928__a0_repro/arms/fwd_r13ns/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py md5=370769c9 O_VARIANT=v3
+# arm asm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/fwd-nospec/harness/beat  impl=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/fwd-nospec/harness/beat/impl.py
+# ENV TORCH_BLAS_PREFER_HIPBLASLT=1 HIPBLASLT_TENSILE_LIBPATH=/home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250
+# statistic median  iters 11  warmup 1.0s continuous  order blocked 3+lead 1, palindromic rounds  device gfx1250
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+W0930 06:33:54.456771   84233 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.106313 sec
+W0930 06:33:54.457040   84233 simple_timer.cpp:55] [rocprofv3] '/bin/bash /opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/llvm/bin/ld.lld -shared /tmp/kernelc6-76a375.o -o /tmp/kernel-9cd6df.hsaco' ::     0.000000 sec
+W0930 06:33:54.638140   84233 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.101284 sec
+W0930 06:33:54.638370   84233 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/ld.lld -shared /tmp/kernelc6-76a375.o -o /tmp/kernel-9cd6df.hsaco' ::     0.000000 sec
+W0930 06:33:54.781902   84233 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.103130 sec
+W0930 06:33:54.782127   84233 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/ld.lld -shared /tmp/kernelc6-76a375.o -o /tmp/kernel-9cd6df.hsaco' ::     0.000000 sec
+W0930 06:33:55.326386   84257 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.101948 sec
+W0930 06:33:55.326583   84257 simple_timer.cpp:55] [rocprofv3] '/bin/bash /opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/llvm/bin/ld.lld -shared /tmp/kernel83-bbcdf9.o -o /tmp/kernel-c0e263.hsaco' ::     0.000000 sec
+W0930 06:33:55.502153   84257 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.102923 sec
+W0930 06:33:55.502329   84257 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/ld.lld -shared /tmp/kernel83-bbcdf9.o -o /tmp/kernel-c0e263.hsaco' ::     0.000000 sec
+W0930 06:33:55.648528   84257 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.102728 sec
+W0930 06:33:55.648809   84257 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/ld.lld -shared /tmp/kernel83-bbcdf9.o -o /tmp/kernel-c0e263.hsaco' ::     0.000000 sec
+[aiter] LoadKernel: _ZN5aiter41fmha_bf16_pertokenBf16_hd128_128x256_maskE hsaco: /home/lihuzhan/code/aiter-src/hsa//gfx1250/fmha_fwd_bf16/fmha_bf16_pertokenBf16_hd128_128x256_mask.co
+rc=124

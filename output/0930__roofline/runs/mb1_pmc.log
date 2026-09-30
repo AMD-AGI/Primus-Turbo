@@ -1,0 +1,138 @@
+W0930 05:47:40.971581   82892 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.104950 sec
+W0930 05:47:40.971941   82892 simple_timer.cpp:55] [rocprofv3] './mb1 full' ::     0.000000 sec
+W0930 05:47:40.997644   82892 tool.cpp:3082] HSA version 1.21.0 initialized (instance=0)
+E0930 05:47:41.032400   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26913759140675 > 26913759114972) :: difference=25703. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0930 05:47:41.035225   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26913761984521 > 26913761977468) :: difference=7053. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+DEV gfx1250 cus=256 clk_khz=2400000 lds_per_block_max=327680
+PLACE wmma_k1 wps=1 waves=1024 distinct_hwid=68 cyc_min=1049291 cyc_p50=1049779 cyc_max=1050042 h1[0]=0x20000000 h1[1]=0x20000300 h1[4]=0x20000c00 h2[0]=0x2000110
+MB wmma_k1 wps=1 grid=256 iters=4096 ev_ms=0.8710 cyc_med=1049687 rt_med=50752 cyc_per_rt=20.683 cyc_per_op_simd=16.0170
+PLACE wmma_k1 wps=2 waves=2048 distinct_hwid=68 cyc_min=525010 cyc_p50=590621 cyc_max=591550 h1[0]=0x20011c00 h1[1]=0x20011f00 h1[4]=0x20011c01 h2[0]=0x2000110
+MB wmma_k1 wps=2 grid=256 iters=2048 ev_ms=0.6573 cyc_med=590767 rt_med=32440 cyc_per_rt=18.211 cyc_per_op_simd=9.0144
+PLACE wmma_k1 wps=4 waves=4096 distinct_hwid=68 cyc_min=262902 cyc_p50=524137 cyc_max=559471 h1[0]=0x20001400 h1[1]=0x20001700 h1[4]=0x20001401 h2[0]=0x2000110
+MB wmma_k1 wps=4 grid=256 iters=1024 ev_ms=0.6387 cyc_med=524120 rt_med=29376 cyc_per_rt=17.842 cyc_per_op_simd=7.9974
+E0930 05:47:41.063896   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26913790587212 > 26913790566817) :: difference=20395. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0930 05:47:41.065902   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26913792695488 > 26913792686245) :: difference=9243. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE wmma_k2 wps=1 waves=1024 distinct_hwid=68 cyc_min=2163385 cyc_p50=2163815 cyc_max=2164166 h1[0]=0x20001400 h1[1]=0x20001700 h1[4]=0x20010000 h2[0]=0x2000110
+MB wmma_k2 wps=1 grid=256 iters=16384 ev_ms=1.5729 cyc_med=2163713 rt_med=121704 cyc_per_rt=17.778 cyc_per_op_simd=8.2539
+E0930 05:47:41.077910   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26913804609540 > 26913804593256) :: difference=16284. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0930 05:47:41.082014   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26913808711322 > 26913808707740) :: difference=3582. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE wmma_k2 wps=2 waves=2048 distinct_hwid=68 cyc_min=1114788 cyc_p50=2128571 cyc_max=2129398 h1[0]=0x20000c00 h1[1]=0x20000f00 h1[4]=0x20000c01 h2[0]=0x2000110
+MB wmma_k2 wps=2 grid=256 iters=8192 ev_ms=1.5432 cyc_med=2128591 rt_med=117876 cyc_per_rt=18.058 cyc_per_op_simd=8.1199
+PLACE wmma_k2 wps=4 waves=4096 distinct_hwid=68 cyc_min=559670 cyc_p50=1606218 cyc_max=2114091 h1[0]=0x20010800 h1[1]=0x20010b00 h1[4]=0x20010801 h2[0]=0x2000110
+MB wmma_k2 wps=4 grid=256 iters=4096 ev_ms=1.4985 cyc_med=1606211 rt_med=86060 cyc_per_rt=18.664 cyc_per_op_simd=6.1272
+E0930 05:47:41.099123   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26913825819303 > 26913825809639) :: difference=9664. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0930 05:47:41.101064   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26913827751410 > 26913827738560) :: difference=12850. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE wmma_k4 wps=1 waves=1024 distinct_hwid=68 cyc_min=2147035 cyc_p50=2147397 cyc_max=2147636 h1[0]=0x20010800 h1[1]=0x20010b00 h1[4]=0x20011400 h2[0]=0x2000110
+MB wmma_k4 wps=1 grid=256 iters=16384 ev_ms=1.5734 cyc_med=2147364 rt_med=122064 cyc_per_rt=17.592 cyc_per_op_simd=8.1915
+PLACE wmma_k4 wps=2 waves=2048 distinct_hwid=68 cyc_min=1114804 cyc_p50=2120926 cyc_max=2121865 h1[0]=0x20010400 h1[1]=0x20010700 h1[4]=0x20010401 h2[0]=0x2000110
+MB wmma_k4 wps=2 grid=256 iters=8192 ev_ms=1.5301 cyc_med=2120891 rt_med=116284 cyc_per_rt=18.239 cyc_per_op_simd=8.0906
+E0930 05:47:41.133543   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26913860237421 > 26913860235336) :: difference=2085. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0930 05:47:41.135693   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26913862389345 > 26913862387529) :: difference=1816. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE wmma_k4 wps=4 waves=4096 distinct_hwid=68 cyc_min=559740 cyc_p50=1606323 cyc_max=2110399 h1[0]=0x20002000 h1[1]=0x20002300 h1[4]=0x20002001 h2[0]=0x2000110
+MB wmma_k4 wps=4 grid=256 iters=4096 ev_ms=1.5157 cyc_med=1606221 rt_med=87788 cyc_per_rt=18.297 cyc_per_op_simd=6.1272
+E0930 05:47:41.146239   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26913872928891 > 26913872927303) :: difference=1588. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE wmma_k8 wps=1 waves=1024 distinct_hwid=68 cyc_min=2146986 cyc_p50=2147361 cyc_max=2147817 h1[0]=0x20002000 h1[1]=0x20002300 h1[4]=0x20000800 h2[0]=0x2000110
+MB wmma_k8 wps=1 grid=256 iters=16384 ev_ms=1.5609 cyc_med=2147383 rt_med=120836 cyc_per_rt=17.771 cyc_per_op_simd=8.1916
+E0930 05:47:41.166464   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26913893160405 > 26913893159137) :: difference=1268. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE wmma_k8 wps=2 waves=2048 distinct_hwid=68 cyc_min=1114774 cyc_p50=2120891 cyc_max=2121734 h1[0]=0x20011400 h1[1]=0x20011700 h1[4]=0x20011401 h2[0]=0x2000110
+MB wmma_k8 wps=2 grid=256 iters=8192 ev_ms=1.5492 cyc_med=2120881 rt_med=116280 cyc_per_rt=18.239 cyc_per_op_simd=8.0905
+E0930 05:47:41.170627   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26913897323550 > 26913897322338) :: difference=1212. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE wmma_k8 wps=4 waves=4096 distinct_hwid=68 cyc_min=559316 cyc_p50=1605882 cyc_max=2110538 h1[0]=0x20001000 h1[1]=0x20001300 h1[4]=0x20001001 h2[0]=0x2000110
+MB wmma_k8 wps=4 grid=256 iters=4096 ev_ms=1.4958 cyc_med=1606194 rt_med=86316 cyc_per_rt=18.608 cyc_per_op_simd=6.1271
+E0930 05:47:41.189167   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26913915917754 > 26913915916835) :: difference=919. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE wmma_k16 wps=1 waves=1024 distinct_hwid=68 cyc_min=2146977 cyc_p50=2147381 cyc_max=2147527 h1[0]=0x20001000 h1[1]=0x20001300 h1[4]=0x20001c00 h2[0]=0x2000110
+MB wmma_k16 wps=1 grid=256 iters=16384 ev_ms=1.5864 cyc_med=2147336 rt_med=122616 cyc_per_rt=17.513 cyc_per_op_simd=8.1914
+E0930 05:47:41.199315   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26913926015792 > 26913926011236) :: difference=4556. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE wmma_k16 wps=2 waves=2048 distinct_hwid=68 cyc_min=1114793 cyc_p50=2120888 cyc_max=2121580 h1[0]=0x20000800 h1[1]=0x20000b00 h1[4]=0x20000801 h2[0]=0x2000110
+MB wmma_k16 wps=2 grid=256 iters=8192 ev_ms=1.5343 cyc_med=2120888 rt_med=116300 cyc_per_rt=18.236 cyc_per_op_simd=8.0905
+E0930 05:47:41.215572   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26913942286859 > 26913942281253) :: difference=5606. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE wmma_k16 wps=4 waves=4096 distinct_hwid=68 cyc_min=559641 cyc_p50=1606218 cyc_max=2110501 h1[0]=0x20010800 h1[1]=0x20010b00 h1[4]=0x20010801 h2[0]=0x2000110
+MB wmma_k16 wps=4 grid=256 iters=4096 ev_ms=1.5064 cyc_med=1606197 rt_med=87964 cyc_per_rt=18.260 cyc_per_op_simd=6.1272
+E0930 05:47:41.240592   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26913967297968 > 26913967291214) :: difference=6754. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE exp8 wps=1 waves=1024 distinct_hwid=68 cyc_min=3867768 cyc_p50=3867995 cyc_max=3868758 h1[0]=0x20010800 h1[1]=0x20010b00 h1[4]=0x20011000 h2[0]=0x2000110
+MB exp8 wps=1 grid=256 iters=65536 ev_ms=2.0325 cyc_med=3868676 rt_med=168620 cyc_per_rt=22.943 cyc_per_op_simd=3.6895
+PLACE exp8 wps=2 waves=2048 distinct_hwid=68 cyc_min=1934449 cyc_p50=2901129 cyc_max=2902102 h1[0]=0x20001c00 h1[1]=0x20001f00 h1[4]=0x20001c01 h2[0]=0x2000110
+MB exp8 wps=2 grid=256 iters=32768 ev_ms=1.6155 cyc_med=2901119 rt_med=126620 cyc_per_rt=22.912 cyc_per_op_simd=2.7667
+E0930 05:47:41.262017   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26913988727037 > 26913988724876) :: difference=2161. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE exp8 wps=4 waves=4096 distinct_hwid=68 cyc_min=976044 cyc_p50=2158426 cyc_max=2762828 h1[0]=0x20011800 h1[1]=0x20011b00 h1[4]=0x20011801 h2[0]=0x2000110
+MB exp8 wps=4 grid=256 iters=16384 ev_ms=1.5588 cyc_med=2158473 rt_med=94572 cyc_per_rt=22.824 cyc_per_op_simd=2.0585
+PLACE fma8 wps=1 waves=1024 distinct_hwid=68 cyc_min=1770612 cyc_p50=1771588 cyc_max=1771687 h1[0]=0x20011800 h1[1]=0x20011b00 h1[4]=0x20000400 h2[0]=0x2000110
+MB fma8 wps=1 grid=256 iters=65536 ev_ms=1.1160 cyc_med=1771567 rt_med=77788 cyc_per_rt=22.774 cyc_per_op_simd=1.6895
+E0930 05:47:41.288281   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914014987236 > 26914014984464) :: difference=2772. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0930 05:47:41.291091   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914017798626 > 26914017795761) :: difference=2865. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE fma8 wps=2 waves=2048 distinct_hwid=68 cyc_min=885821 cyc_p50=1328218 cyc_max=1329304 h1[0]=0x20011400 h1[1]=0x20011700 h1[4]=0x20011401 h2[0]=0x2000110
+MB fma8 wps=2 grid=256 iters=32768 ev_ms=0.9308 cyc_med=1328218 rt_med=58732 cyc_per_rt=22.615 cyc_per_op_simd=1.2667
+E0930 05:47:41.296632   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914023343168 > 26914023342964) :: difference=204. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0930 05:47:41.297893   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914024604551 > 26914024602048) :: difference=2503. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE fma8 wps=4 waves=4096 distinct_hwid=68 cyc_min=446772 cyc_p50=926061 cyc_max=1194996 h1[0]=0x20000c00 h1[1]=0x20000f00 h1[4]=0x20000c01 h2[0]=0x2000110
+MB fma8 wps=4 grid=256 iters=16384 ev_ms=0.8730 cyc_med=926036 rt_med=41604 cyc_per_rt=22.258 cyc_per_op_simd=0.8831
+E0930 05:47:41.310796   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914037504910 > 26914037504613) :: difference=297. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0930 05:47:41.316281   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914042989498 > 26914042989272) :: difference=226. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE pkfma8 wps=1 waves=1024 distinct_hwid=68 cyc_min=2425959 cyc_p50=2426939 cyc_max=2427047 h1[0]=0x20000c00 h1[1]=0x20000f00 h1[4]=0x20001800 h2[0]=0x2000110
+MB pkfma8 wps=1 grid=256 iters=65536 ev_ms=1.4140 cyc_med=2426939 rt_med=107140 cyc_per_rt=22.652 cyc_per_op_simd=2.3145
+E0930 05:47:41.318145   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914044857706 > 26914044857368) :: difference=338. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0930 05:47:41.319448   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914046160456 > 26914046156955) :: difference=3501. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0930 05:47:41.326166   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914052875738 > 26914052875498) :: difference=240. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE pkfma8 wps=2 waves=2048 distinct_hwid=68 cyc_min=1213471 cyc_p50=1214535 cyc_max=1214655 h1[0]=0x20000400 h1[1]=0x20000700 h1[4]=0x20000401 h2[0]=0x2000110
+MB pkfma8 wps=2 grid=256 iters=32768 ev_ms=0.9099 cyc_med=1214525 rt_med=56984 cyc_per_rt=21.313 cyc_per_op_simd=1.1583
+E0930 05:47:41.336106   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914062815296 > 26914062815132) :: difference=164. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE pkfma8 wps=4 waves=4096 distinct_hwid=68 cyc_min=624503 cyc_p50=1079209 cyc_max=1194775 h1[0]=0x20010000 h1[1]=0x20010300 h1[4]=0x20010001 h2[0]=0x2000110
+MB pkfma8 wps=4 grid=256 iters=16384 ev_ms=0.9030 cyc_med=1079246 rt_med=51012 cyc_per_rt=21.157 cyc_per_op_simd=1.0292
+E0930 05:47:41.337761   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914064469087 > 26914064468847) :: difference=240. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0930 05:47:41.342113   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914068809712 > 26914068809618) :: difference=94. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0930 05:47:41.344312   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914071019149 > 26914071018009) :: difference=1140. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE mix_e1 wps=1 waves=1024 distinct_hwid=68 cyc_min=2458183 cyc_p50=2458527 cyc_max=2458802 h1[0]=0x20010000 h1[1]=0x20010300 h1[4]=0x20010c00 h2[0]=0x2000110
+MB mix_e1 wps=1 grid=256 iters=16384 ev_ms=1.7317 cyc_med=2458529 rt_med=138056 cyc_per_rt=17.808 cyc_per_op_simd=9.3785
+E0930 05:47:41.355034   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914081743133 > 26914081743039) :: difference=94. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0930 05:47:41.359253   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914085961484 > 26914085961432) :: difference=52. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0930 05:47:41.361424   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914088128297 > 26914088128173) :: difference=124. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE mix_e1 wps=2 waves=2048 distinct_hwid=68 cyc_min=1446362 cyc_p50=2368072 cyc_max=2381021 h1[0]=0x20001800 h1[1]=0x20001b00 h1[4]=0x20001801 h2[0]=0x2000110
+MB mix_e1 wps=2 grid=256 iters=8192 ev_ms=1.6747 cyc_med=2368072 rt_med=129252 cyc_per_rt=18.321 cyc_per_op_simd=9.0335
+E0930 05:47:41.368160   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914094868064 > 26914094867959) :: difference=105. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0930 05:47:41.372798   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914099505415 > 26914099505393) :: difference=22. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE mix_e2 wps=1 waves=1024 distinct_hwid=68 cyc_min=2900556 cyc_p50=2900885 cyc_max=2901151 h1[0]=0x20001800 h1[1]=0x20001b00 h1[4]=0x20011c00 h2[0]=0x2000110
+MB mix_e2 wps=1 grid=256 iters=16384 ev_ms=1.8999 cyc_med=2900857 rt_med=155712 cyc_per_rt=18.630 cyc_per_op_simd=11.0659
+E0930 05:47:41.396112   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914122816698 > 26914122816660) :: difference=38. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0930 05:47:41.398435   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914125136350 > 26914125136325) :: difference=25. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE mix_e2 wps=2 waves=2048 distinct_hwid=68 cyc_min=1815496 cyc_p50=2685679 cyc_max=2686895 h1[0]=0x20011400 h1[1]=0x20011700 h1[4]=0x20011401 h2[0]=0x2000110
+MB mix_e2 wps=2 grid=256 iters=8192 ev_ms=1.8499 cyc_med=2685680 rt_med=145848 cyc_per_rt=18.414 cyc_per_op_simd=10.2451
+PLACE mix_e4 wps=1 waves=1024 distinct_hwid=68 cyc_min=3686976 cyc_p50=3687330 cyc_max=3687765 h1[0]=0x20011400 h1[1]=0x20011700 h1[4]=0x20000000 h2[0]=0x2000110
+MB mix_e4 wps=1 grid=256 iters=16384 ev_ms=2.2818 cyc_med=3687330 rt_med=191492 cyc_per_rt=19.256 cyc_per_op_simd=14.0660
+PLACE mix_e4 wps=2 waves=2048 distinct_hwid=68 cyc_min=1986638 cyc_p50=3625075 cyc_max=3626007 h1[0]=0x20011000 h1[1]=0x20011300 h1[4]=0x20011001 h2[0]=0x2000110
+MB mix_e4 wps=2 grid=256 iters=8192 ev_ms=2.2685 cyc_med=3625060 rt_med=188228 cyc_per_rt=19.259 cyc_per_op_simd=13.8285
+PLACE mix_v2 wps=1 waves=1024 distinct_hwid=68 cyc_min=2474601 cyc_p50=2474955 cyc_max=2475267 h1[0]=0x20011000 h1[1]=0x20011300 h1[4]=0x20000c00 h2[0]=0x2000110
+MB mix_v2 wps=1 grid=256 iters=16384 ev_ms=1.7124 cyc_med=2474941 rt_med=136420 cyc_per_rt=18.142 cyc_per_op_simd=9.4412
+E0930 05:47:41.454593   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914181292688 > 26914181291514) :: difference=1174. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0930 05:47:41.456715   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914183413102 > 26914183411087) :: difference=2015. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0930 05:47:41.463143   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914189847088 > 26914189845040) :: difference=2048. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE mix_v2 wps=2 waves=2048 distinct_hwid=68 cyc_min=1331315 cyc_p50=2293493 cyc_max=2294380 h1[0]=0x20000800 h1[1]=0x20000b00 h1[4]=0x20000801 h2[0]=0x2000110
+MB mix_v2 wps=2 grid=256 iters=8192 ev_ms=1.6422 cyc_med=2293408 rt_med=126488 cyc_per_rt=18.131 cyc_per_op_simd=8.7487
+PLACE mix_v4 wps=1 waves=1024 distinct_hwid=68 cyc_min=2736427 cyc_p50=2737015 cyc_max=2737332 h1[0]=0x20000800 h1[1]=0x20000b00 h1[4]=0x20001400 h2[0]=0x2000110
+MB mix_v4 wps=1 grid=256 iters=16384 ev_ms=1.8874 cyc_med=2737092 rt_med=152380 cyc_per_rt=17.962 cyc_per_op_simd=10.4412
+E0930 05:47:41.485844   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914212544974 > 26914212543751) :: difference=1223. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E0930 05:47:41.488039   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914214740633 > 26914214738741) :: difference=1892. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE mix_v4 wps=2 waves=2048 distinct_hwid=68 cyc_min=1479308 cyc_p50=2505344 cyc_max=2506184 h1[0]=0x20000000 h1[1]=0x20000300 h1[4]=0x20000001 h2[0]=0x2000110
+MB mix_v4 wps=2 grid=256 iters=8192 ev_ms=1.7922 cyc_med=2505293 rt_med=140720 cyc_per_rt=17.803 cyc_per_op_simd=9.5569
+E0930 05:47:41.510827   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914237538535 > 26914237537422) :: difference=1113. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE mix_v8 wps=1 waves=1024 distinct_hwid=68 cyc_min=4342371 cyc_p50=4342717 cyc_max=4343100 h1[0]=0x20000000 h1[1]=0x20000300 h1[4]=0x20010000 h2[0]=0x2000110
+MB mix_v8 wps=1 grid=256 iters=16384 ev_ms=2.5876 cyc_med=4342729 rt_med=221784 cyc_per_rt=19.581 cyc_per_op_simd=16.5662
+E0930 05:47:41.533665   82895 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (26914260363986 > 26914260363637) :: difference=349. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+PLACE mix_v8 wps=2 waves=2048 distinct_hwid=68 cyc_min=2646572 cyc_p50=3370243 cyc_max=3390158 h1[0]=0x20001c00 h1[1]=0x20001f00 h1[4]=0x20001c01 h2[0]=0x2000110
+MB mix_v8 wps=2 grid=256 iters=8192 ev_ms=2.2152 cyc_med=3370316 rt_med=180884 cyc_per_rt=18.632 cyc_per_op_simd=12.8567
+PLACE mix_e1v3 wps=1 waves=1024 distinct_hwid=68 cyc_min=3195445 cyc_p50=3195814 cyc_max=3196068 h1[0]=0x20001c00 h1[1]=0x20001f00 h1[4]=0x20010800 h2[0]=0x2000110
+MB mix_e1v3 wps=1 grid=256 iters=16384 ev_ms=2.1027 cyc_med=3195829 rt_med=175096 cyc_per_rt=18.252 cyc_per_op_simd=12.1911
+PLACE mix_e1v3 wps=2 waves=2048 distinct_hwid=68 cyc_min=2035868 cyc_p50=2834674 cyc_max=2835885 h1[0]=0x20001400 h1[1]=0x20001700 h1[4]=0x20001401 h2[0]=0x2000110
+MB mix_e1v3 wps=2 grid=256 iters=8192 ev_ms=1.9928 cyc_med=2834956 rt_med=159364 cyc_per_rt=17.789 cyc_per_op_simd=10.8145
+PLACE mix_e1v6 wps=1 waves=1024 distinct_hwid=68 cyc_min=4833855 cyc_p50=4834347 cyc_max=4834588 h1[0]=0x20001400 h1[1]=0x20001700 h1[4]=0x20011400 h2[0]=0x2000110
+MB mix_e1v6 wps=1 grid=256 iters=16384 ev_ms=2.8025 cyc_med=4834197 rt_med=244212 cyc_per_rt=19.795 cyc_per_op_simd=18.4410
+PLACE mix_e1v6 wps=2 waves=2048 distinct_hwid=68 cyc_min=2889222 cyc_p50=3694841 cyc_max=3695869 h1[0]=0x20011000 h1[1]=0x20011300 h1[4]=0x20011001 h2[0]=0x2000110
+MB mix_e1v6 wps=2 grid=256 iters=8192 ev_ms=2.3896 cyc_med=3695156 rt_med=199484 cyc_per_rt=18.524 cyc_per_op_simd=14.0959
+PLACE roles wps=2 waves=2048 distinct_hwid=68 cyc_min=797997 cyc_p50=1081485 cyc_max=1082074 h1[0]=0x20000c00 h1[1]=0x20000f00 h1[4]=0x20000c01 h2[0]=0x2000110
+MB roles wps=2 grid=256 iters=8192 ev_ms=0.9482 cyc_med=1081485 rt_med=59072 cyc_per_rt=18.308 cyc_per_op_simd=4.1255
+W0930 05:47:41.630001   82892 simple_timer.cpp:55] [rocprofv3] './mb1 full' ::     0.658060 sec
+E0930 05:47:41.636550   82892 output_stream.cpp:111] Opened result file: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__roofline/runs/pmc/mb1/pmc_counter_collection.csv
+E0930 05:47:41.645208   82892 output_stream.cpp:111] Opened result file: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__roofline/runs/pmc/mb1/pmc_agent_info.csv
+W0930 05:47:41.646072   82892 simple_timer.cpp:55] [rocprofv3] output generation ::     0.015692 sec
+W0930 05:47:41.646109   82892 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.015730 sec
+MBDONE
+rc=0

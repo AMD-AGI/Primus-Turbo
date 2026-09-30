@@ -1,0 +1,20 @@
+MB4 i1_b128_lag8 seg=0 wps=1 ev_ms=0.0643 cyc_max=10846 f_rt=2338 B_per_clk_CU=48.3 cyc_per_wmma_simd=42.367
+MB4 i1_b128_lag16 seg=0 wps=1 ev_ms=0.0560 cyc_max=10795 f_rt=2347 B_per_clk_CU=48.6 cyc_per_wmma_simd=42.168
+MB4 i1_b128_lag24 seg=0 wps=1 ev_ms=0.0732 cyc_max=10806 f_rt=2370 B_per_clk_CU=48.5 cyc_per_wmma_simd=42.211
+MB4 i1_b128_lag32 seg=0 wps=1 ev_ms=0.0621 cyc_max=10744 f_rt=2336 B_per_clk_CU=48.8 cyc_per_wmma_simd=41.969
+MB4 i2_b128_lag16 seg=0 wps=1 ev_ms=0.0621 cyc_max=11090 f_rt=2370 B_per_clk_CU=94.6 cyc_per_wmma_simd=43.320
+MB4 i2_b128_lag24 seg=0 wps=1 ev_ms=0.0619 cyc_max=11097 f_rt=2331 B_per_clk_CU=94.5 cyc_per_wmma_simd=43.348
+MB4 i2_b128_lag32 seg=0 wps=1 ev_ms=0.0425 cyc_max=11162 f_rt=2345 B_per_clk_CU=93.9 cyc_per_wmma_simd=43.602
+MB4 g1_b128_lag16 seg=0 wps=1 ev_ms=0.0485 cyc_max=4482 f_rt=2334 B_per_clk_CU=117.0 cyc_per_wmma_simd=17.508
+MB4 p_b128_lag32 seg=0 wps=1 ev_ms=0.0570 cyc_max=2744 f_rt=2366 B_per_clk_CU=191.1 cyc_per_wmma_simd=0.000
+MB4 i1_tr16_lag8 seg=0 wps=1 ev_ms=0.0444 cyc_max=10820 f_rt=2352 B_per_clk_CU=48.5 cyc_per_wmma_simd=42.266
+MB4 i1_tr16_lag16 seg=0 wps=1 ev_ms=0.0611 cyc_max=10723 f_rt=2352 B_per_clk_CU=48.9 cyc_per_wmma_simd=41.887
+MB4 i1_tr16_lag24 seg=0 wps=1 ev_ms=0.0361 cyc_max=10771 f_rt=2342 B_per_clk_CU=48.7 cyc_per_wmma_simd=42.074
+MB4 i1_tr16_lag32 seg=0 wps=1 ev_ms=0.0416 cyc_max=10773 f_rt=2342 B_per_clk_CU=48.7 cyc_per_wmma_simd=42.082
+MB4 i2_tr16_lag16 seg=0 wps=1 ev_ms=0.0693 cyc_max=11112 f_rt=2354 B_per_clk_CU=94.4 cyc_per_wmma_simd=43.406
+MB4 i2_tr16_lag24 seg=0 wps=1 ev_ms=0.0430 cyc_max=11132 f_rt=2339 B_per_clk_CU=94.2 cyc_per_wmma_simd=43.484
+MB4 i2_tr16_lag32 seg=0 wps=1 ev_ms=0.0520 cyc_max=11142 f_rt=2341 B_per_clk_CU=94.1 cyc_per_wmma_simd=43.523
+MB4 g1_tr16_lag16 seg=0 wps=1 ev_ms=0.0488 cyc_max=4657 f_rt=2328 B_per_clk_CU=112.6 cyc_per_wmma_simd=18.191
+MB4 p_tr16_lag32 seg=0 wps=1 ev_ms=0.0571 cyc_max=2801 f_rt=2334 B_per_clk_CU=187.2 cyc_per_wmma_simd=0.000
+MBDONE
+rc=0

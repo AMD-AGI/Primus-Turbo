@@ -1,0 +1,8 @@
+MB3 ld_b128 seg=0 wps=1 ev_ms=0.0311 cyc_max=2270 f_rt=2365 B_per_clk_CU=231.0 cyc_per_wmma_simd=0.000
+MB3 ld_tr16 seg=0 wps=1 ev_ms=0.0436 cyc_max=2250 f_rt=2344 B_per_clk_CU=233.0 cyc_per_wmma_simd=0.000
+MB3 wl1_b128 seg=0 wps=1 ev_ms=0.0320 cyc_max=6107 f_rt=2386 B_per_clk_CU=42.9 cyc_per_wmma_simd=47.711
+MB3 wl1_tr16 seg=0 wps=1 ev_ms=0.0629 cyc_max=6019 f_rt=2388 B_per_clk_CU=43.6 cyc_per_wmma_simd=47.023
+MB3 wl2_b128 seg=0 wps=1 ev_ms=0.0560 cyc_max=6315 f_rt=2356 B_per_clk_CU=83.0 cyc_per_wmma_simd=49.336
+MB3 wl2_tr16 seg=0 wps=1 ev_ms=0.0239 cyc_max=6343 f_rt=2367 B_per_clk_CU=82.7 cyc_per_wmma_simd=49.555
+MBDONE
+rc=0

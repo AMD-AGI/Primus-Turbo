@@ -1,0 +1,35 @@
+DEV gfx1250 cus=256 clk_khz=2400000 lds_per_block_max=327680
+PLACE wmma_k1 wps=1 waves=4 distinct_hwid=4 cyc_min=17485 cyc_p50=17819 cyc_max=17831 h1[0]=0x20011000 h1[1]=0x20011300 h1[4]=0x20011000 h2[0]=0x2000110
+MB wmma_k1 wps=1 grid=1 iters=64 ev_ms=0.0513 cyc_med=17623 rt_med=740 cyc_per_rt=23.815 cyc_per_op_simd=17.2100
+PLACE wmma_k2 wps=1 waves=4 distinct_hwid=4 cyc_min=9201 cyc_p50=9365 cyc_max=9377 h1[0]=0x20001800 h1[1]=0x20001b00 h1[4]=0x20001800 h2[0]=0x2000110
+MB wmma_k2 wps=1 grid=1 iters=64 ev_ms=0.0370 cyc_med=9489 rt_med=404 cyc_per_rt=23.488 cyc_per_op_simd=9.2666
+PLACE wmma_k4 wps=1 waves=4 distinct_hwid=4 cyc_min=9163 cyc_p50=9396 cyc_max=9570 h1[0]=0x20000400 h1[1]=0x20000700 h1[4]=0x20000400 h2[0]=0x2000110
+MB wmma_k4 wps=1 grid=1 iters=64 ev_ms=0.0368 cyc_med=9372 rt_med=396 cyc_per_rt=23.667 cyc_per_op_simd=9.1523
+PLACE wmma_k8 wps=1 waves=4 distinct_hwid=4 cyc_min=9144 cyc_p50=9583 cyc_max=9595 h1[0]=0x20011000 h1[1]=0x20011300 h1[4]=0x20011000 h2[0]=0x2000110
+MB wmma_k8 wps=1 grid=1 iters=64 ev_ms=0.0268 cyc_med=9523 rt_med=404 cyc_per_rt=23.572 cyc_per_op_simd=9.2998
+PLACE wmma_k16 wps=1 waves=4 distinct_hwid=4 cyc_min=9181 cyc_p50=9531 cyc_max=9661 h1[0]=0x20001800 h1[1]=0x20001b00 h1[4]=0x20001800 h2[0]=0x2000110
+MB wmma_k16 wps=1 grid=1 iters=64 ev_ms=0.0373 cyc_med=9415 rt_med=396 cyc_per_rt=23.775 cyc_per_op_simd=9.1943
+PLACE exp8 wps=1 waves=4 distinct_hwid=4 cyc_min=5492 cyc_p50=5494 cyc_max=5495 h1[0]=0x20000000 h1[1]=0x20000300 h1[4]=0x20000000 h2[0]=0x2000110
+MB exp8 wps=1 grid=1 iters=64 ev_ms=0.0338 cyc_med=5504 rt_med=164 cyc_per_rt=33.561 cyc_per_op_simd=5.3750
+PLACE fma8 wps=1 waves=4 distinct_hwid=4 cyc_min=2665 cyc_p50=2667 cyc_max=2668 h1[0]=0x20010c00 h1[1]=0x20010f00 h1[4]=0x20010c00 h2[0]=0x2000110
+MB fma8 wps=1 grid=1 iters=64 ev_ms=0.0375 cyc_med=2671 rt_med=116 cyc_per_rt=23.026 cyc_per_op_simd=2.6084
+PLACE pkfma8 wps=1 waves=4 distinct_hwid=4 cyc_min=3328 cyc_p50=3334 cyc_max=3338 h1[0]=0x20001400 h1[1]=0x20001700 h1[4]=0x20001400 h2[0]=0x2000110
+MB pkfma8 wps=1 grid=1 iters=64 ev_ms=0.0338 cyc_med=3323 rt_med=144 cyc_per_rt=23.076 cyc_per_op_simd=3.2451
+PLACE mix_e1 wps=1 waves=4 distinct_hwid=4 cyc_min=10229 cyc_p50=10542 cyc_max=10545 h1[0]=0x20000000 h1[1]=0x20000300 h1[4]=0x20000000 h2[0]=0x2000110
+MB mix_e1 wps=1 grid=1 iters=64 ev_ms=0.0294 cyc_med=10305 rt_med=444 cyc_per_rt=23.209 cyc_per_op_simd=10.0635
+PLACE mix_e2 wps=1 waves=4 distinct_hwid=4 cyc_min=11998 cyc_p50=12146 cyc_max=12295 h1[0]=0x20010c00 h1[1]=0x20010f00 h1[4]=0x20010c00 h2[0]=0x2000110
+MB mix_e2 wps=1 grid=1 iters=64 ev_ms=0.0390 cyc_med=12301 rt_med=524 cyc_per_rt=23.475 cyc_per_op_simd=12.0127
+PLACE mix_e4 wps=1 waves=4 distinct_hwid=4 cyc_min=15058 cyc_p50=15375 cyc_max=15603 h1[0]=0x20001400 h1[1]=0x20001700 h1[4]=0x20001400 h2[0]=0x2000110
+MB mix_e4 wps=1 grid=1 iters=64 ev_ms=0.0403 cyc_med=15176 rt_med=648 cyc_per_rt=23.420 cyc_per_op_simd=14.8203
+PLACE mix_v2 wps=1 waves=4 distinct_hwid=4 cyc_min=10361 cyc_p50=10509 cyc_max=10512 h1[0]=0x20002000 h1[1]=0x20002300 h1[4]=0x20002000 h2[0]=0x2000110
+MB mix_v2 wps=1 grid=1 iters=64 ev_ms=0.0370 cyc_med=10804 rt_med=460 cyc_per_rt=23.487 cyc_per_op_simd=10.5508
+PLACE mix_v4 wps=1 waves=4 distinct_hwid=4 cyc_min=11375 cyc_p50=11706 cyc_max=11732 h1[0]=0x20010800 h1[1]=0x20010b00 h1[4]=0x20010800 h2[0]=0x2000110
+MB mix_v4 wps=1 grid=1 iters=64 ev_ms=0.0280 cyc_med=11706 rt_med=500 cyc_per_rt=23.412 cyc_per_op_simd=11.4316
+PLACE mix_v8 wps=1 waves=4 distinct_hwid=4 cyc_min=17647 cyc_p50=17985 cyc_max=17988 h1[0]=0x20001000 h1[1]=0x20001300 h1[4]=0x20001000 h2[0]=0x2000110
+MB mix_v8 wps=1 grid=1 iters=64 ev_ms=0.0401 cyc_med=17762 rt_med=756 cyc_per_rt=23.495 cyc_per_op_simd=17.3457
+PLACE mix_e1v3 wps=1 waves=4 distinct_hwid=4 cyc_min=13136 cyc_p50=13167 cyc_max=13383 h1[0]=0x20002000 h1[1]=0x20002300 h1[4]=0x20002000 h2[0]=0x2000110
+MB mix_e1v3 wps=1 grid=1 iters=64 ev_ms=0.0392 cyc_med=13442 rt_med=572 cyc_per_rt=23.500 cyc_per_op_simd=13.1270
+PLACE mix_e1v6 wps=1 waves=4 distinct_hwid=4 cyc_min=19510 cyc_p50=19610 cyc_max=19613 h1[0]=0x20010800 h1[1]=0x20010b00 h1[4]=0x20010800 h2[0]=0x2000110
+MB mix_e1v6 wps=1 grid=1 iters=64 ev_ms=0.0491 cyc_med=19610 rt_med=836 cyc_per_rt=23.457 cyc_per_op_simd=19.1504
+MBDONE
+rc=0
