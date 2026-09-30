@@ -95,6 +95,7 @@ def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float):
                 sumsq = _wave_sum_f32(x * x)
                 mean = sumsq / fx.Float32(float(_D))
                 rstd = fx.Float32(fmath.rsqrt(mean + fx.Float32(eps)))
+                gamma = fx.Float32(0.0)
                 if is_q:
                     gamma = fx.Float32(
                         buffer_ops.buffer_load(qg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
@@ -181,6 +182,9 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int):
         while token < fx.Int32(total_rows):
             dst = (token * fx.Int32(packed_heads) + slot) * fx.Int32(_D) + lane
             if is_q | is_k:
+                grad = fx.Float32(0.0)
+                rstd = fx.Float32(0.0)
+                gamma = fx.Float32(0.0)
                 if is_q:
                     head = group * fx.Int32(NPG) + local
                     src = (token * fx.Int32(q_heads) + head) * fx.Int32(_D) + lane
