@@ -39,12 +39,13 @@ _WARP = 64
 _WAVES = 4
 _BLOCK_THREADS = _WARP * _WAVES
 
-# A cycle contains one persistent wave for every packed head slot.  Production
-# has 80 slots and 128 cycles, or 10,240 waves / 2,560 workgroups.  Each wave
-# walks 256 token rows at S=8192, B=4.  Keeping the grid-wave count a multiple
-# of the packed width makes every wave stay on one logical Q/K/V head, which in
-# turn gives it a single dgamma accumulator in backward.
-_GRID_CYCLES = 128
+# A cycle contains one persistent wave for every logical head slot.  Forward
+# keeps 128 cycles; backward uses 64 longer-lived cycles to halve its dgamma
+# partial workspace/finalization cost.  Keeping each grid-wave count a multiple
+# of its head width makes every wave stay on one logical head, which gives it a
+# single gamma value and dgamma accumulator.
+_FWD_GRID_CYCLES = 128
+_BWD_GRID_CYCLES = 64
 
 # Megatron passes the same full-sequence rotary table to every transformer
 # layer.  Materialize cos/sin once and reuse it across all fused launches rather
@@ -122,9 +123,10 @@ def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float):
                 buffer_ops.buffer_load(qg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
             )
         else:
-            gamma = fx.Float32(
-                buffer_ops.buffer_load(kg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
-            )
+            if is_k:
+                gamma = fx.Float32(
+                    buffer_ops.buffer_load(kg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
+                )
         q_head = group * fx.Int32(NPG) + local
 
         # All B token rows at one sequence position share the same rotary
@@ -178,7 +180,7 @@ def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float):
                             rstd, krstd_rsrc, token * fx.Int32(NG) + group
                         )
 
-            seq = seq + fx.Int32(_GRID_CYCLES)
+            seq = seq + fx.Int32(_FWD_GRID_CYCLES)
 
     return kernel
 
@@ -234,16 +236,19 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int):
         dgamma = fx.Float32(0.0)
         seq = cycle
         while seq < fx.Int32(S):
-            cosine = fx.Float32(
-                buffer_ops.buffer_load(
-                    cosine_rsrc, seq * fx.Int32(_D) + lane, vec_width=1, dtype=fx.T.f32()
+            cosine = fx.Float32(0.0)
+            sine = fx.Float32(0.0)
+            if is_q | is_k:
+                cosine = fx.Float32(
+                    buffer_ops.buffer_load(
+                        cosine_rsrc, seq * fx.Int32(_D) + lane, vec_width=1, dtype=fx.T.f32()
+                    )
                 )
-            )
-            sine = fx.Float32(
-                buffer_ops.buffer_load(
-                    sine_rsrc, seq * fx.Int32(_D) + lane, vec_width=1, dtype=fx.T.f32()
+                sine = fx.Float32(
+                    buffer_ops.buffer_load(
+                        sine_rsrc, seq * fx.Int32(_D) + lane, vec_width=1, dtype=fx.T.f32()
+                    )
                 )
-            )
             for batch_idx in range(B):
                 token = seq * fx.Int32(B) + fx.Int32(batch_idx)
                 dst = (token * fx.Int32(packed_heads) + slot) * fx.Int32(_D) + lane
@@ -299,7 +304,7 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int):
                     grad = buffer_ops.buffer_load(dv_rsrc, src, vec_width=1, dtype=fx.T.bf16())
                     buffer_ops.buffer_store(grad, dpacked_rsrc, dst)
 
-            seq = seq + fx.Int32(_GRID_CYCLES)
+            seq = seq + fx.Int32(_BWD_GRID_CYCLES)
 
         if is_q:
             part = (cycle * fx.Int32(q_heads) + q_head) * fx.Int32(_D) + lane
@@ -330,8 +335,8 @@ def _compiled_fwd(
     stream: fx.Stream,
 ):
     qk_heads = NG * (NPG + 1)
-    assert (_GRID_CYCLES * qk_heads) % _WAVES == 0
-    grid_x = _GRID_CYCLES * qk_heads // _WAVES
+    assert (_FWD_GRID_CYCLES * qk_heads) % _WAVES == 0
+    grid_x = _FWD_GRID_CYCLES * qk_heads // _WAVES
     kernel = _make_fwd_kernel(S, B, NG, NPG, EPS)
     kernel(PACKED, QG, KG, COSINE, SINE, QOUT, KOUT, QRSTD, KRSTD).launch(
         grid=(grid_x, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream
@@ -360,8 +365,8 @@ def _compiled_bwd(
     stream: fx.Stream,
 ):
     packed_heads = NG * (NPG + 2)
-    assert (_GRID_CYCLES * packed_heads) % _WAVES == 0
-    grid_x = _GRID_CYCLES * packed_heads // _WAVES
+    assert (_BWD_GRID_CYCLES * packed_heads) % _WAVES == 0
+    grid_x = _BWD_GRID_CYCLES * packed_heads // _WAVES
     kernel = _make_bwd_kernel(S, B, NG, NPG)
     kernel(
         DQ, DK, DV, PACKED, QG, KG, COSINE, SINE,
@@ -414,8 +419,8 @@ def flydsl_qkv_rmsnorm_rope_backward(
     npg = q_size // _D
     assert k_size == _D
     dqkv = torch.empty_like(qkv)
-    dqg_part = torch.empty((_GRID_CYCLES * NG * npg, _D), device=qkv.device, dtype=torch.float32)
-    dkg_part = torch.empty((_GRID_CYCLES * NG, _D), device=qkv.device, dtype=torch.float32)
+    dqg_part = torch.empty((_BWD_GRID_CYCLES * NG * npg, _D), device=qkv.device, dtype=torch.float32)
+    dkg_part = torch.empty((_BWD_GRID_CYCLES * NG, _D), device=qkv.device, dtype=torch.float32)
     cosine, sine = _cached_cos_sin(freqs)
     _compiled_bwd(
         DQ=dq,
