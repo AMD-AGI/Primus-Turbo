@@ -1,0 +1,48 @@
+--- op/refcache_util.py.bak.pre-a0-0930	2026-09-23 07:53:36.861706086 +0000
++++ op/refcache_util.py	2026-09-30 11:01:08.828508931 +0000
+@@ -26,6 +26,20 @@
+ REFCACHE = HERE / "refcache"
+ 
+ 
++# A0 operator 2026-09-30. The fp32 reference (forward_reference / op/eager) is never computed
++# on the GPU: it is the dispatch that cost the 2026-09-22 power cycle, and on 2026-09-28 it
++# faulted B0 GPU2 inside a round's own script (fwd h50). proxy and prod must come from
++# refcache/ (causal; they always do) and a miss is a hard error. fast non-causal and the six
++# small unscored edge shapes (<= 2x2048x1024) are computed on the CPU instead.
++
++
++def _refuse_on_card(shape):
++    if shape in ("proxy", "prod"):
++        raise RuntimeError(
++            f"refcache {shape}: unusable, and computing the fp32 reference for it is refused "
++            f"(never on the card; too large for the CPU). Restore op/refcache/{shape}.pt.")
++
++
+ def cached_forward(shape, q, k, v, causal=True):
+     """(o, lse) for `shape`, from the cache when it is usable, else computed as before.
+ 
+@@ -37,7 +51,10 @@
+     from common import SHAPES, forward_reference
+ 
+     def compute():
+-        return forward_reference(q, k, v, causal=causal)
++        # A0 operator 2026-09-30 (h50/h74): never on the card. Small shapes run on the CPU.
++        _refuse_on_card(shape)
++        o, lse = forward_reference(q.cpu(), k.cpu(), v.cpu(), causal=causal)
++        return o.to(q.device), lse.to(q.device)
+ 
+     if not causal:
+         return compute()
+@@ -79,7 +96,11 @@
+         import sys as _sys
+         _sys.path.insert(0, str(HERE / "ut"))
+         from common import load_impl
+-        return load_impl(HERE / "eager")(do, q, k, v, o, lse, causal=causal)
++        # A0 operator 2026-09-30 (h50/h74): never on the card. Small shapes run on the CPU.
++        _refuse_on_card(shape)
++        outs = load_impl(HERE / "eager")(do.cpu(), q.cpu(), k.cpu(), v.cpu(), o.cpu(),
++                                         lse.cpu(), causal=causal)
++        return tuple(t.to(q.device) for t in outs)
+ 
+     if not causal:
+         return compute()

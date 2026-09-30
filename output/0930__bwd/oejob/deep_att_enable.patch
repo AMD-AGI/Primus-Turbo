@@ -1,0 +1,458 @@
+diff --git a/op_evolve/modules/deep_loop/act/prompts/_preamble.md b/op_evolve/modules/deep_loop/act/prompts/_preamble.md
+index 3073127..26b2066 100644
+--- a/op_evolve/modules/deep_loop/act/prompts/_preamble.md
++++ b/op_evolve/modules/deep_loop/act/prompts/_preamble.md
+@@ -83,42 +83,40 @@ anyone. The same root cause three times means the direction is the problem, not
+ 
+ ---
+ 
+-## ⚠ CAMPAIGN CORRECTIONS — deep rounds do not receive `hint.md`, so they are inlined here
+-
+-`hints` is wired into `fast_loop` and into deep `reflect`, but **not** into `profiling`,
+-`plan` or `act` (verified: those three never import it). So 26 accumulated hints, several of
+-which reverse an earlier belief, are invisible to you. These are the ones that change
+-decisions. Each was measured on this machine.
+-
+-1. **`rocprofv3`'s `VGPR_Count` column is HALF the ISA allocation** — it reports
+-   `roundup(next_free_vgpr/2, 8)`. Verified: aiter's ASM forward declares `.vgpr_count: 1024`
+-   and the column reads **512**. So **multiply by 2 before deriving any occupancy step.**
+-   Corrected values: `k_dkdv` **740** VGPRs, `k_dq` **960** — *both at 1 wave/SIMD*.
+-   ⚠ Round 17's own `06_bound` got this wrong: it read `VGPR 480` for `k_dq` and concluded
+-   2 waves/SIMD. It is 1.
+-
+-2. **`k_dkdv` is VGPR-capped, NOT LDS-capped.** 740 VGPRs alone force 1 wave/SIMD, whatever
+-   LDS does. Its 70,656 B allocation is mostly a deliberate 48,128 B hole (r12.i1.g39) and
+-   **costs zero occupancy**. A candidate that shrinks `k_dkdv`'s LDS to "raise occupancy"
+-   buys nothing — this was measured, and `06_bound` attributing the 1 wave/SIMD to LDS is
+-   the same error as (1).
+-
+-3. **Static ISA metrics do not order candidates here.** Twice now an arm improved every
+-   static metric and lost on card — most recently by **16.25% at prod**. Use them as gates
+-   ("does this build spill?", "did this wait become a full drain?") which are facts about
+-   the build; never as a predictor of time. **Pricing goes on card.**
+-
+-4. **Never ship a candidate whose `prod` `vs_champion` is below the round's own noise
+-   floor**, whatever `fast` and `proxy` did. Acceptance is an arithmetic mean over three
+-   shapes with `min_gain: 0.0`, so a big `fast` win pays for a `prod` regression. That
+-   happened in round 15 and had to be reverted by hand. **`prod` is what this job exists to
+-   close.**
+-
+-5. **The stall-versus-issue question is CLOSED, not open.** Every wait/stall counter is
+-   rejected by this chip, and PC sampling faults it (measured at prod, round 17). Do not
+-   propose either. State it as a limitation.
+-
+-6. **TDM has no target in `k_dkdv`.** All 32 `buffer_load_b128` are global→register with
+-   dual-use registers feeding WMMA directly; there is no global→LDS staging burst left to
+-   replace. Adopting it means undoing `g09` and abandoning `g21`.
+-
++## ⚠ CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) — inlined because this step does not read `hint.md`
++
++`hints` is wired into `fast_loop`, deep `reflect` and `route.md`'s operator tables, but **not** into the
++`profiling`, `plan` or `act` prompts. The job's operator file is `{{job_context_dir}}/hint.md`; **read h74-h82
++there before you start** (h54 is the older one-page index; h76 is the current champion's map). What changes
++decisions, all measured on this card (A0, one gfx1250, container `fa-repro`, reflashed 2026-09-29):
++
++1. **The champion is s6** (adopted by refactor h75): prod 5.30 ms = **1.038x the ASM bar**; proxy ~1.13x. The
++   target is now **1.20x beat on proxy AND prod** (fast is reported only). Structure: `k_delta` -> `k_dkdv` (main
++   stream) concurrent with `k_dqg` (side stream); both kernels take their big operands through a **3-stage TDM
++   LDS ring whose next-iteration B operands are read back into carried VGPRs** (k_dkdv: Q/dO; k_dqg: K/V).
++   Any "TDM has no target in k_dkdv" or "k_dkdv 740 / k_dq 960 VGPR" statement in older findings is obsolete.
++2. **`rocprofv3`'s `VGPR_Count` column is HALF the ISA allocation** (reads 512 for aiter's 1024). Read
++   `.vgpr_count` from the ISA. s6: k_dkdv **713**, k_dkdv_sp 707, k_dqg **881** -- all **1 wave/SIMD**
++   (VGPR-capped, not LDS-capped). A second wave needs <= 512 VGPR per wave.
++3. **Static ISA metrics do not order candidates.** Arms that improved every static metric lost on the card
++   (ku2 +8.2%, trim2 +1.3%, earlier -16%). Use them as gates (spill, scratch, a wait turned into a full drain);
++   **price on the card** with the blocked benchmark.
++4. **`prod` ranks; fast/proxy are sentinels.** `min_gain` is 0.007 (floor 0.24-0.66%; blocked A/A on A0
++   0.01-0.07%). Never ship a candidate whose prod `vs_champion` is inside the noise, whatever fast did.
++5. **The stall question is OPEN again: ATT works on this card since the reflash** (per-instruction
++   Hitcount/Latency/Stall/Idle for FlyDSL JIT kernels and the ASM `.co`; recipe in h81 and in profiling step 4).
++   Every s6 lever was found from an ATT read. ATT tells you WHERE cycles go; it never ranks. **PC sampling
++   stays forbidden** (it wedged MES; rocprofv3 now rejects every PC-sampling config anyway). `--kernel-trace`
++   still records 0 dispatches: take kernel names/timestamps from the `--pmc` csv.
++6. **What bounds k_dkdv was measured by ablation** (h77): Q/dO already in VGPRs -18.5%; TDM source pinned in L2
++   -1.0% (**L2 bandwidth is not the limit**); +16 WMMA/iteration (fused dQ matrix work) only +4%. Size a lever with
++   an ablation before building it. Closed on A0 (h78): lse_late, ku2, flip, trorder_b, trim2, TDM without
++   carried operands, k_dq U2. The fused 4-wave w4f is correct but parked at 6.51 ms (h79; 4.24 ms without atomics).
++7. **k_dqg only runs at proxy and prod.** toy/fast dispatch k_dq_sp, so a toy/fast pass does not test a k_dqg
++   change; its first real run is a serialised proxy validation.
++8. **Machine rules.** The fp32 reference (`forward_reference`, `op/eager`) is **never computed on the card**: use
++   `op/refcache_util.py` (`cached_forward` / `cached_backward`) or `op/refcache/*.pt` (it faulted a card on
++   2026-09-28 and cost a power cycle on 2026-09-22). One shape per process. Compile-only first with BOTH
++   `ARCH=gfx1250` and `FLYDSL_GPU_ARCH=gfx1250`; spill or scratch > 0 is a kill. A fresh
++   `FLYDSL_RUNTIME_CACHE_DIR` per process and a new directory per arm (kernels.py arms are module-level switches,
++   which the JIT cache key ignores). Leave the card idle when you finish: no scoring process left running.
+diff --git a/op_evolve/modules/deep_loop/plan/prompts/_preamble.md b/op_evolve/modules/deep_loop/plan/prompts/_preamble.md
+index d38b0c1..d00a067 100644
+--- a/op_evolve/modules/deep_loop/plan/prompts/_preamble.md
++++ b/op_evolve/modules/deep_loop/plan/prompts/_preamble.md
+@@ -67,42 +67,40 @@ the other agent and the framework read.
+ 
+ ---
+ 
+-## ⚠ CAMPAIGN CORRECTIONS — deep rounds do not receive `hint.md`, so they are inlined here
+-
+-`hints` is wired into `fast_loop` and into deep `reflect`, but **not** into `profiling`,
+-`plan` or `act` (verified: those three never import it). So 26 accumulated hints, several of
+-which reverse an earlier belief, are invisible to you. These are the ones that change
+-decisions. Each was measured on this machine.
+-
+-1. **`rocprofv3`'s `VGPR_Count` column is HALF the ISA allocation** — it reports
+-   `roundup(next_free_vgpr/2, 8)`. Verified: aiter's ASM forward declares `.vgpr_count: 1024`
+-   and the column reads **512**. So **multiply by 2 before deriving any occupancy step.**
+-   Corrected values: `k_dkdv` **740** VGPRs, `k_dq` **960** — *both at 1 wave/SIMD*.
+-   ⚠ Round 17's own `06_bound` got this wrong: it read `VGPR 480` for `k_dq` and concluded
+-   2 waves/SIMD. It is 1.
+-
+-2. **`k_dkdv` is VGPR-capped, NOT LDS-capped.** 740 VGPRs alone force 1 wave/SIMD, whatever
+-   LDS does. Its 70,656 B allocation is mostly a deliberate 48,128 B hole (r12.i1.g39) and
+-   **costs zero occupancy**. A candidate that shrinks `k_dkdv`'s LDS to "raise occupancy"
+-   buys nothing — this was measured, and `06_bound` attributing the 1 wave/SIMD to LDS is
+-   the same error as (1).
+-
+-3. **Static ISA metrics do not order candidates here.** Twice now an arm improved every
+-   static metric and lost on card — most recently by **16.25% at prod**. Use them as gates
+-   ("does this build spill?", "did this wait become a full drain?") which are facts about
+-   the build; never as a predictor of time. **Pricing goes on card.**
+-
+-4. **Never ship a candidate whose `prod` `vs_champion` is below the round's own noise
+-   floor**, whatever `fast` and `proxy` did. Acceptance is an arithmetic mean over three
+-   shapes with `min_gain: 0.0`, so a big `fast` win pays for a `prod` regression. That
+-   happened in round 15 and had to be reverted by hand. **`prod` is what this job exists to
+-   close.**
+-
+-5. **The stall-versus-issue question is CLOSED, not open.** Every wait/stall counter is
+-   rejected by this chip, and PC sampling faults it (measured at prod, round 17). Do not
+-   propose either. State it as a limitation.
+-
+-6. **TDM has no target in `k_dkdv`.** All 32 `buffer_load_b128` are global→register with
+-   dual-use registers feeding WMMA directly; there is no global→LDS staging burst left to
+-   replace. Adopting it means undoing `g09` and abandoning `g21`.
+-
++## ⚠ CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) — inlined because this step does not read `hint.md`
++
++`hints` is wired into `fast_loop`, deep `reflect` and `route.md`'s operator tables, but **not** into the
++`profiling`, `plan` or `act` prompts. The job's operator file is `{{job_context_dir}}/hint.md`; **read h74-h82
++there before you start** (h54 is the older one-page index; h76 is the current champion's map). What changes
++decisions, all measured on this card (A0, one gfx1250, container `fa-repro`, reflashed 2026-09-29):
++
++1. **The champion is s6** (adopted by refactor h75): prod 5.30 ms = **1.038x the ASM bar**; proxy ~1.13x. The
++   target is now **1.20x beat on proxy AND prod** (fast is reported only). Structure: `k_delta` -> `k_dkdv` (main
++   stream) concurrent with `k_dqg` (side stream); both kernels take their big operands through a **3-stage TDM
++   LDS ring whose next-iteration B operands are read back into carried VGPRs** (k_dkdv: Q/dO; k_dqg: K/V).
++   Any "TDM has no target in k_dkdv" or "k_dkdv 740 / k_dq 960 VGPR" statement in older findings is obsolete.
++2. **`rocprofv3`'s `VGPR_Count` column is HALF the ISA allocation** (reads 512 for aiter's 1024). Read
++   `.vgpr_count` from the ISA. s6: k_dkdv **713**, k_dkdv_sp 707, k_dqg **881** -- all **1 wave/SIMD**
++   (VGPR-capped, not LDS-capped). A second wave needs <= 512 VGPR per wave.
++3. **Static ISA metrics do not order candidates.** Arms that improved every static metric lost on the card
++   (ku2 +8.2%, trim2 +1.3%, earlier -16%). Use them as gates (spill, scratch, a wait turned into a full drain);
++   **price on the card** with the blocked benchmark.
++4. **`prod` ranks; fast/proxy are sentinels.** `min_gain` is 0.007 (floor 0.24-0.66%; blocked A/A on A0
++   0.01-0.07%). Never ship a candidate whose prod `vs_champion` is inside the noise, whatever fast did.
++5. **The stall question is OPEN again: ATT works on this card since the reflash** (per-instruction
++   Hitcount/Latency/Stall/Idle for FlyDSL JIT kernels and the ASM `.co`; recipe in h81 and in profiling step 4).
++   Every s6 lever was found from an ATT read. ATT tells you WHERE cycles go; it never ranks. **PC sampling
++   stays forbidden** (it wedged MES; rocprofv3 now rejects every PC-sampling config anyway). `--kernel-trace`
++   still records 0 dispatches: take kernel names/timestamps from the `--pmc` csv.
++6. **What bounds k_dkdv was measured by ablation** (h77): Q/dO already in VGPRs -18.5%; TDM source pinned in L2
++   -1.0% (**L2 bandwidth is not the limit**); +16 WMMA/iteration (fused dQ matrix work) only +4%. Size a lever with
++   an ablation before building it. Closed on A0 (h78): lse_late, ku2, flip, trorder_b, trim2, TDM without
++   carried operands, k_dq U2. The fused 4-wave w4f is correct but parked at 6.51 ms (h79; 4.24 ms without atomics).
++7. **k_dqg only runs at proxy and prod.** toy/fast dispatch k_dq_sp, so a toy/fast pass does not test a k_dqg
++   change; its first real run is a serialised proxy validation.
++8. **Machine rules.** The fp32 reference (`forward_reference`, `op/eager`) is **never computed on the card**: use
++   `op/refcache_util.py` (`cached_forward` / `cached_backward`) or `op/refcache/*.pt` (it faulted a card on
++   2026-09-28 and cost a power cycle on 2026-09-22). One shape per process. Compile-only first with BOTH
++   `ARCH=gfx1250` and `FLYDSL_GPU_ARCH=gfx1250`; spill or scratch > 0 is a kill. A fresh
++   `FLYDSL_RUNTIME_CACHE_DIR` per process and a new directory per arm (kernels.py arms are module-level switches,
++   which the JIT cache key ignores). Leave the card idle when you finish: no scoring process left running.
+diff --git a/op_evolve/modules/deep_loop/profiling/prompts/01_select.md b/op_evolve/modules/deep_loop/profiling/prompts/01_select.md
+index c5cdea7..d7c655c 100644
+--- a/op_evolve/modules/deep_loop/profiling/prompts/01_select.md
++++ b/op_evolve/modules/deep_loop/profiling/prompts/01_select.md
+@@ -28,6 +28,13 @@ rocprofv3 --pmc SQ_WAVES,SQ_CYCLES,SQ_BUSY_CYCLES,SQ_ITEMS,GRBM_GUI_ACTIVE \
+   --output-format csv --output-file discover -d $SCRATCH -- <benchmark>
+ ```
+ 
++For `<benchmark>` use the job's own harness in one process, one shape:
++`/opt/venv/bin/python3 {{job_context_dir}}/op/benchmark.py --arm-path cur={{profile_target}} --shapes prod
++--iters 3 --warmup-seconds 0 --block 1 --lead 0`. **`--warmup-seconds 0` under `--pmc` is required**: the
++default continuous warmup issues unsynchronised launches that flood the profiler and look like a hang.
++This op's kernels differ by shape: `k_dqg` runs only at proxy and prod (fast dispatches `k_dq_sp`), so
++profile prod.
++
+ The four `SQC_ICACHE_*` counters are validated here too, but say nothing about time; leave
+ them to step 2 rather than risking a second hardware pass in the step everything depends on.
+ 
+diff --git a/op_evolve/modules/deep_loop/profiling/prompts/02_counters.md b/op_evolve/modules/deep_loop/profiling/prompts/02_counters.md
+index 9f9d081..33d8863 100644
+--- a/op_evolve/modules/deep_loop/profiling/prompts/02_counters.md
++++ b/op_evolve/modules/deep_loop/profiling/prompts/02_counters.md
+@@ -86,11 +86,20 @@ Note the two aggravating details, both visible above:
+ - **`Timeout while waiting for queue sync: 4 kernels still active`** — that is the queue
+   path that becomes `failed to suspend all gangs` and then `unrecoverable`. It came close.
+ 
+-**So: the stall question CANNOT be answered on this card.** Counters cannot (every wait and
+-stall counter is rejected by this chip), and PC sampling must not be attempted. Say so in
+-`analysis.md` as a stated limitation and move on. Do not substitute a static instruction
+-count for it — this job has twice measured static metrics improving on an arm that lost
+-(h26).
++2026-09-30, after the 09-29 reflash: rocprofv3 1.3.2 now **rejects every PC-sampling
++configuration at startup** ("not supported on any of the agents") although `-L` lists one. That is
++not a licence to retry it: the ban stands.
++
++**So: counters cannot answer the stall question here** (every wait and stall counter is rejected
++by this chip) **and PC sampling must not be attempted. The instruction trace (step 4) answers it**:
++since the 09-29 reflash ATT gives per-instruction stall and idle cycles for this op's FlyDSL kernels
++(verified 2026-09-30). In `analysis.md`, state the counter limitation and point at step 4. Do not
++substitute a static instruction count for it -- this job has measured static metrics improving on
++arms that lost, again and again (h26, h78).
++
++**Cycles.** `GRBM_GUI_ACTIVE / 8` per kernel is this card's cycle ruler (8 XCDs). Run the profiled
++benchmark with `--warmup-seconds 0` under `--pmc`: the unsynchronised warmup floods the profiler and
++looks like a hang.
+ 
+ 
+ Write `analysis.md` with the counters, their normalised values, and what each says -- and,
+diff --git a/op_evolve/modules/deep_loop/profiling/prompts/03_metrics.md b/op_evolve/modules/deep_loop/profiling/prompts/03_metrics.md
+index 536b2d1..3f6f3c2 100644
+--- a/op_evolve/modules/deep_loop/profiling/prompts/03_metrics.md
++++ b/op_evolve/modules/deep_loop/profiling/prompts/03_metrics.md
+@@ -31,8 +31,8 @@ reason: they import `matplotlib`. As of 2026-09-24 it IS available, but ONLY und
+ installed into it.
+ 
+ **What replaces this step.** Nothing does, completely. The questions it would have answered
+-are answered partially by step 2 (counters, plus stochastic PC sampling for stall reasons) and
+-step 4 (the instruction trace). Cache hit rates, byte traffic and matrix-unit utilisation are
++are answered partially by step 2 (counters; PC sampling is forbidden) and step 4 (the
++instruction trace, which since the 09-29 reflash gives per-instruction stall reasons for this op). Cache hit rates, byte traffic and matrix-unit utilisation are
+ simply **not measurable on this card** -- say that in the summary's `non_findings` rather than
+ leaving a gap that reads like an oversight.
+ 
+diff --git a/op_evolve/modules/deep_loop/profiling/prompts/04_thread_trace.md b/op_evolve/modules/deep_loop/profiling/prompts/04_thread_trace.md
+index a8020a2..4ea729e 100644
+--- a/op_evolve/modules/deep_loop/profiling/prompts/04_thread_trace.md
++++ b/op_evolve/modules/deep_loop/profiling/prompts/04_thread_trace.md
+@@ -24,34 +24,58 @@ download, or otherwise add anything to this container** -- it is shared and the
+ `owned: false`. If the pinned path does not resolve, this step fails: write
+ `status: failed` with the path you tried and stop.
+ 
+-**Smallest safe capture, and no larger.** One kernel, one iteration, one CU:
+-
+-```yaml
+-jobs:
+-  - kernel_include_regex: "<the exact kernel name from kernel.yaml>"
+-    kernel_iteration_range: "[3]"        # one dispatch, past warm-up
+-    advanced_thread_trace: true
+-    att_library_path: /opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib
+-    att_target_cu: 1
+-    att_shader_engine_mask: "0x1"
+-    att_simd_select: "0xf"
+-    att_buffer_size: "0x2000000"         # 32 MB. Raise ONLY if the trace truncates,
+-                                         # one doubling at a time.
+-    output_directory: <scratch>
+-    output_file: att
++**Smallest safe capture, and no larger: one call of the op, one CU, only the kernels you want.**
++This exact form was verified on this card on 2026-09-30 (after the 09-29 reflash) for the FlyDSL JIT
++kernels and for the ASM `.co`, with a clean `dmesg` every time. Run it in its own process, with a fresh
++FlyDSL cache directory, through the job's own benchmark so the kernels see their production inputs:
++
++```bash
++FLYDSL_RUNTIME_CACHE_DIR=$(mktemp -d /tmp/flycache_att.XXXX) \
++rocprofv3 --att \
++  --att-library-path /opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib \
++  --att-target-cu 1 \
++  --kernel-include-regex "<regex from kernel.yaml, QUOTED>" \
++  --output-format csv --output-file att -d {{scratch_dir}}/att_<slug> \
++  -- /opt/venv/bin/python3 {{job_context_dir}}/op/benchmark.py --arm-path cur={{profile_target}} \
++     --shapes prod --iters 1 --warmup-seconds 0 --block 1 --lead 0
+ ```
+ 
+-Start at that buffer size rather than the corpus's 384 MB: this card has one GPU and a
+-capture that overruns is paid for by the whole job. A truncated trace is a re-run; a wedged
+-card is a human power-cycle.
++(run from `{{job_context_dir}}/op`; the container env must carry `ARCH=gfx1250` and
++`FLYDSL_GPU_ARCH=gfx1250` as for every run here). For this op `"k_d[kq]"` captures `k_dkdv` and `k_dqg`
++at prod (two dispatch directories, ~tens of MB); **quote the regex** -- unquoted, the shell globs
++`k_d[kq]`. `--iters 1 --warmup-seconds 0 --block 1 --lead 0` keeps the run to one build call plus one
++timed call per kernel; a warmup window under the tracer only multiplies dispatches. Start with no
++buffer-size flag; if the trace truncates, pass `--att-buffer-size` **in bytes** (e.g. `67108864` for
++64 MiB), one doubling at a time.
++
++What you get per captured dispatch: `stats_ui_output_agent_<pid>_dispatch_<N>.csv` (one row per
++instruction: `Hitcount`, `Latency`, `Stall`, `Idle`, `Vaddr`, `Instruction`) and a
++`ui_output_agent_<pid>_dispatch_<N>/` directory with per-wave timelines (`se*_wv*.json`). A capture that
++produced only `*_code_object_id_*.out` files **armed nothing**: that is a NULL result, not a clean one --
++record it as failed with the file listing.
++
++Summarise each CSV with the operator's parser (read-only, stdlib only):
++`python3 /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/tools/attsum.py <csv> 30`
++-- per-class hit/latency/stall/idle, latency per WMMA, and the top stall sites with their `Vaddr`.
++Then map the top sites back to the ISA (`*_final_isa.s` from a compile-only dump of the same tree) and
++to source lines. Two reading rules learned on this op:
++- **The `Latency` column charges every WMMA 8 cycles** even when the next instruction issues a cycle
++  later, so class shares from it overstate WMMA. For a per-iteration budget use wall time: issue-time
++  differences between successive loop heads in the wave timelines.
++- **`stall = 7` on back-to-back WMMAs is not a dependency** -- it is one WMMA per 8 cycles.
++
++Comparable reads already on disk (same recipe, prod, CU 1):
++`/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/probe/att_s6/` (the champion s6),
++`.../probe/p2_r29/` (r29), `.../probe/p2_asm/` (the ASM bar's main kernel), with the operator's reading in
++`.../0930__bwd/notes/report_{dkdv,dqg,asm}.md`. If the target is byte-identical to s6, say so and
++spend the step on the question those reads leave open rather than re-deriving them.
+ 
+ **PMC and ATT cannot share a job.** Never add `--pmc` to this run, and do not use
+ `--att-perfcounters` / `--att-perfcounter-ctrl` / `--att-activity`: all three are accepted on
+ this stack and emit no counter file, silently.
+ 
+-**Narrow the capture from the start**, with an input file using `kernel_include_regex` and
+-`kernel_iteration_range`. Unfiltered, one HIP program produced 374 MB and two directories,
+-one of them the runtime's memset; filtered, the same GEMM produced one directory of 21 MB.
++**Narrow the capture from the start** with `--kernel-include-regex`. Unfiltered, one HIP program
++produced 374 MB and two directories, one of them the runtime's memset; filtered, one directory of 21 MB.
+ 
+ **Confirm which directory is yours.** One directory is one dispatch, and the number in its
+ name is the application's dispatch id -- not an index into your kernels. Gaps are normal.
+@@ -102,37 +126,28 @@ status: ok|failed
+ 
+ ---
+ 
+-## MEASURED ON THIS MACHINE, 2026-09-24 -- read this before spending a step here
+-
+-ATT was probed directly on this card while it was otherwise idle. Four runs, and the card
+-was **completely unharmed every time**: zero `MES ... failed to respond`, zero
+-`suspend all gangs`, zero `unrecoverable`, **zero page faults**, `docker exec` responsive
+-throughout. **ATT does not wedge this card.** The standing ban was inherited from PC
+-sampling, which is a different mechanism -- a per-wave interrupt that writes wave state to
+-a save area -- and it does not apply here.
+-
+-But ATT is **not usable on this job's kernels**, and that is the operative fact:
+-
+-| workload | result |
+-|---|---|
+-| a trivial `torch` elementwise kernel | **34 files, 11 MB, a real `.att` trace plus `ui_output_*_dispatch_*/`** |
+-| this op's FlyDSL kernels (`profdrv.py`), with `--kernel-include-regex` | 9 files, **every one a `*_code_object_id_*.out` ELF dump**, no trace |
+-| the same, **without** any regex filter | identical -- 9 files, no trace |
++## MEASURED ON THIS MACHINE -- ATT is the primary diagnostic for this op
+ 
+-So the filter is not the problem; **ATT captures nothing for FlyDSL JIT-compiled kernels
+-on this stack**, while capturing a torch kernel in the same container minutes apart. This
+-also explains the 2026-09-11 records, whose output was likewise ELF-dumps-only: those runs
+-were not "unarmed", they hit this same limitation.
++**2026-09-24 (old firmware):** ATT captured nothing for FlyDSL JIT kernels (ELF dumps only) while it did
++capture a torch kernel. **That finding is superseded.** **2026-09-30, after the 09-29 reflash
++(VBIOS 700E):** the recipe above captures FlyDSL `k_dkdv` / `k_dqg` and the ASM `.co` with full
++per-instruction statistics, every run rc 0 with no GPU fault line in `dmesg`
++(`/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/probe/P1-RESULTS.md`). The operator's
++hand campaign that day took this op from 83.5% to 103.8% of the ASM bar, and every accepted lever was
++found or confirmed from an ATT read (a `s_wait_loadcnt` stall pointing at operand latency, a
++`s_wait_dscnt` behind a readback burst, VALU and `v_nop` counts between WMMAs). So: **run this step; do
++not skip it.** A `status: skipped` here needs a measured reason from this round.
+ 
+-**Therefore:** attempting ATT on this op costs a step and returns nothing. Record
+-`status: skipped`, `reason: att_captures_no_flydsl_kernels`, and cite this block. If a
+-future round changes how kernels are loaded (away from runtime `hipModuleLoad` of a JIT'd
+-module), re-probe with the torch control alongside it.
++ATT does not wedge this card (probed 2026-09-24 and 2026-09-30). **PC sampling is a different mechanism
++and stays forbidden** (step 2); do not substitute it for, or add it to, this step.
+ 
+-Two traps found while probing, worth keeping:
++Traps worth keeping:
+ - **`--att-buffer-size` is in BYTES, not MB.** `--att-buffer-size 64` aborts with
+-  `F core.cpp:108] Invalid buffer size: 64`, and rocprofv3 then sits in its own SIGABRT
+-  handler until killed -- which reads exactly like a hung GPU and is not one. Use
+-  `67108864` for 64 MiB.
+-- Always verify a capture **armed** before quoting it as a pass: a directory containing
+-  only `*_code_object_id_*.out` is a NULL result, not a clean one.
++  `F core.cpp:108] Invalid buffer size: 64`, and rocprofv3 then sits in its own SIGABRT handler until
++  killed -- which reads exactly like a hung GPU and is not one.
++- Always verify a capture **armed** before quoting it: a directory containing only
++  `*_code_object_id_*.out` is a NULL result.
++- `--kernel-trace` still records zero dispatches on rocprofv3 1.3.2 -- take kernel names from step 1's
++  `--pmc` csv, not from a kernel trace.
++- One process on the card at a time: check `ls /sys/class/kfd/kfd/proc` is empty before the capture and
++  that your process is gone after it.
+diff --git a/op_evolve/modules/deep_loop/profiling/prompts/_preamble.md b/op_evolve/modules/deep_loop/profiling/prompts/_preamble.md
+index 3f866bb..720febc 100644
+--- a/op_evolve/modules/deep_loop/profiling/prompts/_preamble.md
++++ b/op_evolve/modules/deep_loop/profiling/prompts/_preamble.md
+@@ -73,42 +73,40 @@ So:
+ 
+ ---
+ 
+-## ⚠ CAMPAIGN CORRECTIONS — deep rounds do not receive `hint.md`, so they are inlined here
+-
+-`hints` is wired into `fast_loop` and into deep `reflect`, but **not** into `profiling`,
+-`plan` or `act` (verified: those three never import it). So 26 accumulated hints, several of
+-which reverse an earlier belief, are invisible to you. These are the ones that change
+-decisions. Each was measured on this machine.
+-
+-1. **`rocprofv3`'s `VGPR_Count` column is HALF the ISA allocation** — it reports
+-   `roundup(next_free_vgpr/2, 8)`. Verified: aiter's ASM forward declares `.vgpr_count: 1024`
+-   and the column reads **512**. So **multiply by 2 before deriving any occupancy step.**
+-   Corrected values: `k_dkdv` **740** VGPRs, `k_dq` **960** — *both at 1 wave/SIMD*.
+-   ⚠ Round 17's own `06_bound` got this wrong: it read `VGPR 480` for `k_dq` and concluded
+-   2 waves/SIMD. It is 1.
+-
+-2. **`k_dkdv` is VGPR-capped, NOT LDS-capped.** 740 VGPRs alone force 1 wave/SIMD, whatever
+-   LDS does. Its 70,656 B allocation is mostly a deliberate 48,128 B hole (r12.i1.g39) and
+-   **costs zero occupancy**. A candidate that shrinks `k_dkdv`'s LDS to "raise occupancy"
+-   buys nothing — this was measured, and `06_bound` attributing the 1 wave/SIMD to LDS is
+-   the same error as (1).
+-
+-3. **Static ISA metrics do not order candidates here.** Twice now an arm improved every
+-   static metric and lost on card — most recently by **16.25% at prod**. Use them as gates
+-   ("does this build spill?", "did this wait become a full drain?") which are facts about
+-   the build; never as a predictor of time. **Pricing goes on card.**
+-
+-4. **Never ship a candidate whose `prod` `vs_champion` is below the round's own noise
+-   floor**, whatever `fast` and `proxy` did. Acceptance is an arithmetic mean over three
+-   shapes with `min_gain: 0.0`, so a big `fast` win pays for a `prod` regression. That
+-   happened in round 15 and had to be reverted by hand. **`prod` is what this job exists to
+-   close.**
+-
+-5. **The stall-versus-issue question is CLOSED, not open.** Every wait/stall counter is
+-   rejected by this chip, and PC sampling faults it (measured at prod, round 17). Do not
+-   propose either. State it as a limitation.
+-
+-6. **TDM has no target in `k_dkdv`.** All 32 `buffer_load_b128` are global→register with
+-   dual-use registers feeding WMMA directly; there is no global→LDS staging burst left to
+-   replace. Adopting it means undoing `g09` and abandoning `g21`.
+-
++## ⚠ CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) — inlined because this step does not read `hint.md`
++
++`hints` is wired into `fast_loop`, deep `reflect` and `route.md`'s operator tables, but **not** into the
++`profiling`, `plan` or `act` prompts. The job's operator file is `{{job_context_dir}}/hint.md`; **read h74-h82
++there before you start** (h54 is the older one-page index; h76 is the current champion's map). What changes
++decisions, all measured on this card (A0, one gfx1250, container `fa-repro`, reflashed 2026-09-29):
++
++1. **The champion is s6** (adopted by refactor h75): prod 5.30 ms = **1.038x the ASM bar**; proxy ~1.13x. The
++   target is now **1.20x beat on proxy AND prod** (fast is reported only). Structure: `k_delta` -> `k_dkdv` (main
++   stream) concurrent with `k_dqg` (side stream); both kernels take their big operands through a **3-stage TDM
++   LDS ring whose next-iteration B operands are read back into carried VGPRs** (k_dkdv: Q/dO; k_dqg: K/V).
++   Any "TDM has no target in k_dkdv" or "k_dkdv 740 / k_dq 960 VGPR" statement in older findings is obsolete.
++2. **`rocprofv3`'s `VGPR_Count` column is HALF the ISA allocation** (reads 512 for aiter's 1024). Read
++   `.vgpr_count` from the ISA. s6: k_dkdv **713**, k_dkdv_sp 707, k_dqg **881** -- all **1 wave/SIMD**
++   (VGPR-capped, not LDS-capped). A second wave needs <= 512 VGPR per wave.
++3. **Static ISA metrics do not order candidates.** Arms that improved every static metric lost on the card
++   (ku2 +8.2%, trim2 +1.3%, earlier -16%). Use them as gates (spill, scratch, a wait turned into a full drain);
++   **price on the card** with the blocked benchmark.
++4. **`prod` ranks; fast/proxy are sentinels.** `min_gain` is 0.007 (floor 0.24-0.66%; blocked A/A on A0
++   0.01-0.07%). Never ship a candidate whose prod `vs_champion` is inside the noise, whatever fast did.
++5. **The stall question is OPEN again: ATT works on this card since the reflash** (per-instruction
++   Hitcount/Latency/Stall/Idle for FlyDSL JIT kernels and the ASM `.co`; recipe in h81 and in profiling step 4).
++   Every s6 lever was found from an ATT read. ATT tells you WHERE cycles go; it never ranks. **PC sampling
++   stays forbidden** (it wedged MES; rocprofv3 now rejects every PC-sampling config anyway). `--kernel-trace`
++   still records 0 dispatches: take kernel names/timestamps from the `--pmc` csv.
++6. **What bounds k_dkdv was measured by ablation** (h77): Q/dO already in VGPRs -18.5%; TDM source pinned in L2
++   -1.0% (**L2 bandwidth is not the limit**); +16 WMMA/iteration (fused dQ matrix work) only +4%. Size a lever with
++   an ablation before building it. Closed on A0 (h78): lse_late, ku2, flip, trorder_b, trim2, TDM without
++   carried operands, k_dq U2. The fused 4-wave w4f is correct but parked at 6.51 ms (h79; 4.24 ms without atomics).
++7. **k_dqg only runs at proxy and prod.** toy/fast dispatch k_dq_sp, so a toy/fast pass does not test a k_dqg
++   change; its first real run is a serialised proxy validation.
++8. **Machine rules.** The fp32 reference (`forward_reference`, `op/eager`) is **never computed on the card**: use
++   `op/refcache_util.py` (`cached_forward` / `cached_backward`) or `op/refcache/*.pt` (it faulted a card on
++   2026-09-28 and cost a power cycle on 2026-09-22). One shape per process. Compile-only first with BOTH
++   `ARCH=gfx1250` and `FLYDSL_GPU_ARCH=gfx1250`; spill or scratch > 0 is a kill. A fresh
++   `FLYDSL_RUNTIME_CACHE_DIR` per process and a new directory per arm (kernels.py arms are module-level switches,
++   which the JIT cache key ignores). Leave the card idle when you finish: no scoring process left running.

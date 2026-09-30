@@ -1,0 +1,35 @@
+--- gfx1250-flydsl-attn-bwd_final.yaml.bak.pre-a0-0930	2026-09-25 04:07:11.590601081 +0000
++++ gfx1250-flydsl-attn-bwd_final.yaml	2026-09-30 11:01:36.766575107 +0000
+@@ -199,9 +199,9 @@
+          flop: 5.49823e+12, bytes_min: 1.34218e+09}
+   guards: []                       # [resolved] none. Every shape above is scored.
+   target:
+-    beat: "aiter prebuilt gfx1250 ASM backward via tools/gfx1250/asm_bwd_launcher.py, dkdv_heads=q plus the host reduction -- must be beaten by 0%"  # [user]
++    beat: "aiter prebuilt gfx1250 ASM backward via tools/gfx1250/asm_bwd_launcher.py, dkdv_heads=q plus the host reduction -- must be beaten by 20%"  # [user]
+     beat_launcher: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/tools/gfx1250/asm_bwd_launcher.py  # [resolved] verified present 2026-09-17
+-    beat_margin_pct: 0             # [resolved] "by 0%" -- parity with the anchor is the
++    beat_margin_pct: 20            # A0 operator 2026-09-30: was 0 (s6 beats ASM; validation.py BEAT_MARGIN = 20.0). [resolved] "by 0%" -- parity with the anchor is the
+                                    # bar, which matches job.description ("REACH the ASM
+                                    # backward, not beat it by a margin").
+     beat_measured_same_run: true   # [resolved] the anchor is re-measured in the same run
+@@ -219,16 +219,16 @@
+   backend: [flydsl]         # [user] pinned
+ 
+ evolve:
+-  max_rounds: 40            # [user] failed rounds count against this
+-  max_timeout: 48h          # [user]  [resolved] = 172800 s
+-  min_gain: 0.0             # [resolved] explicit default: anything above 1.0 counts as
++  max_rounds: 48            # [user] failed rounds count against this
++  max_timeout: 120h          # [user]  [resolved] = 172800 s
++  min_gain: 0.007           # A0 operator 2026-09-30 (as B0 09-27): was 0.0; floor 0.24-0.66%. [resolved] explicit default: anything above 1.0 counts as
+                             # an improvement. Justified here rather than copied -- the
+                             # gap to the anchor is ~93x, so round gains are expected to
+                             # be integer factors, far above this machine's run-to-run
+                             # spread. Raise it only if measured spread says to.
+   turn_timeout: null        # [resolved] unset: each module keeps its own default (3 h).
+   schedule:
+-    fast_rounds: 24         # single card: deep rounds cannot parallelise, so front-load
++    fast_rounds: 23         # single card: deep rounds cannot parallelise, so front-load
+     fast_per_deep: 4        # [user]
+ 
+ runtime:

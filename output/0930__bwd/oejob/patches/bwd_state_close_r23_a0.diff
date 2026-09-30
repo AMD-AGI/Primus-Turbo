@@ -1,0 +1,77 @@
+--- state.yaml.bak.pre-a0-r23-close-0930	2026-09-25 09:28:48.350243733 +0000
++++ state.yaml	2026-09-30 11:02:16.599992509 +0000
+@@ -93,6 +93,10 @@
+ - at: '2026-09-25T08:35:57'
+   event: resumed
+   spec_version: v000
++- at: '2026-09-30T21:00:00'
++  event: hand_edit
++  reason: 'A0 0930: r23 closed by hand; schedule/min_gain/margin retuned; hint.md replaced (B0 corpus
++    + h74-h8x); see PT/output/0930__bwd/oejob/README.md'
+ best_round: 20
+ champions:
+   fast: 17
+@@ -1188,24 +1192,50 @@
+     \u5219\u968F r5.i2.g18 \u514D\u8D39\u51FA\u5C40'} was dropped without being written into fact"
+   changed_disagreement: null
+ - round: 23
+-  progress: []
++  progress:
++  - opt
++  - reflect
+   mode: fast
+-  running:
+-    module: opt
+-    step: null
+-    since: '2026-09-25T08:35:57'
+   seconds:
+     opt: 3245.7
+     round: 3245.7
+   closed_by_hand: true
+-  closed_at: '2026-09-24T14:45:00'
+-  closed_reason: 'Machine handed to another user at end of day. The job was stopped by explicit SIGTERM/
+-    SIGKILL on its own PID about two minutes into 1-opt, with the GPU idle and no work in flight. rounds/023/
+-    holds only op/, ids_before.yaml and timing.yaml -- no act.yaml, no raw/, no measurement was taken
+-    and no card time was spent. The next `resume` will move the partial 1-opt aside as stale; nothing
+-    needs reverting and op/current is untouched (byte-identical to rounds/020/op).
+-
+-    '
++  closed_at: '2026-09-30T21:00:00'
+   sessions:
+     opt: 1ea10b5c-e42a-4fbc-9c9c-534f4e3223b3
+   bound: latency
++  outcome: delivered
++  passed: false
++  accepted: false
++  validation_by: hand
++  validation_exit_code: null
++  tflops:
++    prod: 502.44
++    proxy: 438.65
++    fast: 48.93
++  incumbents:
++    prod: 511.33
++    proxy: 440.25
++    fast: 55.61
++  beats:
++    prod: 716.48
++    proxy: 566.37
++    fast: 50.68
++  targets:
++    prod: 716.48
++    proxy: 566.37
++    fast: 50.68
++  gain: 0.9515
++  changed: 1
++  flops:
++    prod: 5498229227520.0
++    proxy: 343681269760.0
++    fast: 5373952000.0
++  guards: {}
++  guard_failed: null
++  note: 'CLOSED BY HAND 2026-09-30 on A0 (same closure B0 applied 09-27, patch output/0927__b0/patches/bwd_state_close_r23.diff),
++    so that resume starts round 24 instead of redoing this one. REJECTED: rounds/023/1-opt/act.yaml (09-25
++    09:28, g71) measured prod 502.44 vs champion 511.33 (0.983), proxy 0.996, fast 0.880 in one session;
++    mean gain 0.9515. 2-reflect did not run. Nothing promoted; best_round stays 20 until hint h75 (refactor:
++    adopt s6) runs at the head of round 24. Previous closed_reason (09-24 hand-over stop) is in state.yaml.bak.pre-a0-r23-close-0930.
++    B0''s rounds 24-32 (champion r29) are NOT in this copy; A0 rounds 24+ are new rounds.'

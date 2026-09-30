@@ -21,3 +21,5 @@ k_dkdv 每轮 1766 cyc = WMMA 512 + 发射 ~450 + WMMA↔DS 切换 ~200（7 次�
 - D2 PC sampling 在旧固件上 3/3 挂卡：本次放在所有 GPU 工作之后，只用 toy HIP kernel，先 `-L` 确认支持；挂卡则停 GPU、记录 dmesg、转 CPU 工作。
 - D3 fwd 不动（e2e 上 bwd 占差距大头，HANDOFF §5）。
 - D4 尺子：blocked（lead 4 + block 9，palindromic），同进程 r29 + r29_aa + ASM；每进程新 JIT cache；一个 shape 一个进程；判定阈值 0.5%。
+- D5 op-evolve 目标从 1.00× 提到 **1.20× ASM**（validation.py `BEAT_MARGIN=20.0` + final.yaml "beaten by 20%"）：s6 已是 1.038×，维持 1.00× 会让第一个通过的 round 直接以 target_met 结束、deep 轮跑不到；1.20× 取自 w4f 无原子写的 1.30× 上限。
+- D6 op-evolve bwd job 在 A0 以 s6 为起点重启（旧目录备份为 `*.a0-stale-0930`），round 24 为 deep（ATT 已恢复进 deep prompt，OE 未提交改动，补丁在 `oejob/deep_att_enable.patch`），之后 4 fast + 1 deep 循环，max_rounds 48。

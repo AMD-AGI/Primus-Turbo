@@ -1,0 +1,76 @@
+--- op/validation.py.bak.pre-a0-0930	2026-09-25 04:10:01.918206796 +0000
++++ op/validation.py	2026-09-30 11:00:21.235385990 +0000
+@@ -42,7 +42,10 @@
+ GATE_DB = 50.0          # op.precision_sqnr_db
+ REFCACHE = HERE / "refcache"  # see load_reference() -- precomputed op/eager/ outputs
+ DETERMINISM_RUNS = 200  # op.config.determinism_gate
+-BEAT_MARGIN = 0.0       # op.target.beat_margin_pct, as a ratio floor of 1.0 + 0/100
++BEAT_MARGIN = 20.0      # A0 operator 2026-09-30: was 0.0. The adopted champion s6 already beats the
++                        # ASM bar (prod 1.038x, proxy 1.128x), so at 0% every passing round would end the
++                        # job as target_met. Kept in step with `op-evolve tune --beat-margin 1.2`
++                        # (final.yaml "beaten by 20%"); change both together.
+ 
+ 
+ def measure(impl_dir: Path, shapes):
+@@ -122,13 +125,26 @@
+     want = {"shape": name, "dims": tuple(shapes_table[name]), "seed": 0,
+             "eager_sha": eager_sha, "common_sha": common_sha}
+     bad = [k for k, v in want.items() if prov.get(k) != v]
+-    if bad:
+-        print(f"  refcache {name}: IGNORED, provenance differs on {bad} -- recomputing",
++    # A0 operator 2026-09-30 (same handling as B0's lab_validate.py _CACHED_COMMON, h69/h74):
++    # ut/common.py was edited on 2026-09-25 (r23: comment + `toy` shape) AFTER this cache was
++    # built, so its sha moved 988c14ca -> d441e55a while make_inputs / SHAPES / the references
++    # did not (B0 rounds 24-26 recomputed them: bitwise equal). The recorded sha is accepted;
++    # every other provenance field is still checked.
++    if bad == ["common_sha"] and prov.get("common_sha") == _CACHED_COMMON.get(name):
++        print(f"  refcache {name}: accepted with recorded common_sha {prov.get('common_sha')}",
+               flush=True)
++        return blob
++    if bad:
++        print(f"  refcache {name}: IGNORED, provenance differs on {bad}", flush=True)
+         return None
+     return blob
+ 
+ 
++# The common_sha each cache was built with (read from refcache/*.pt provenance 2026-09-30).
++_CACHED_COMMON = {"fast": "988c14caed5d9a80", "proxy": "988c14caed5d9a80",
++                  "prod": "988c14caed5d9a80"}
++
++
+ def check_correctness(impl_dir: Path, shapes):
+     import torch
+     from common import (forward_reference, load_impl, make_inputs,
+@@ -148,8 +164,13 @@
+         q, k, v, do = make_inputs(name, seed=0)
+         blob = load_reference(name, _SHAPES, eager_sha, common_sha, torch)
+         if blob is None:
+-            o, lse = forward_reference(q, k, v, causal=True)
+-            rq, rk, rv = eager_attn_bwd(do, q, k, v, o, lse, causal=True)
++            # A0 operator 2026-09-30 (h50/h74): the fp32 reference is NEVER computed on the
++            # card any more -- it is the dispatch that cost the 09-22 power cycle and faulted
++            # B0 GPU2 on 09-28. No usable cache = a loud correctness failure, not a recompute.
++            print(f"  correctness {name:8s} FAIL: refcache/{name}.pt missing or provenance "
++                  f"mismatch; refusing to compute the fp32 reference on the card", flush=True)
++            ok = False
++            continue
+         else:
+             # Move the reference to the device one tensor at a time rather than all five at
+             # once: at prod dq alone is 537 MB in fp32, and the candidate's own outputs plus
+@@ -306,8 +327,14 @@
+                   f"{b['latency_ms']:10.4f} {b['tflops']:8.1f} {r:8.3f}")
+         if ratios:
+             geo = math.exp(sum(math.log(r) for r in ratios) / len(ratios))
+-            fast_enough = geo >= 1.0 + BEAT_MARGIN / 100
+-            print(f"  geomean over {len(ratios)} shapes (op.shape.mode=sweep): {geo:.3f}x beat")
++            # B0 operator 2026-09-28 (user-approved): the geomean let the launch-bound `fast` shape (where the
++            # ASM bar is itself slow, ~1.66x) hide prod/proxy at ~0.78x and ended the job as "target met". The
++            # target is now: every SCORED shape (proxy, prod) at or above the bar; fast is reported only.
++            scored = [r for name, r in zip(shapes, ratios) if name in ("proxy", "prod")]
++            fast_enough = bool(scored) and min(scored) >= 1.0 + BEAT_MARGIN / 100
++            print(f"  geomean over {len(ratios)} shapes (op.shape.mode=sweep): {geo:.3f}x beat (reported only)")
++            print(f"  target: proxy and prod each >= {1.0 + BEAT_MARGIN / 100:.2f}x beat -> "
++                  f"min {min(scored) if scored else float('nan'):.3f}x")
+ 
+     print()
+     print(f"  correctness  {'pass' if correct else 'FAIL'}")
