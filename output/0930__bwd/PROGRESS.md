@@ -17,3 +17,4 @@ bwd FLOP 5.498229e12；判定阈值 0.5%（同进程 A/A 0.01–0.07%）。每�
 | a06 | dkdv_tdm（TDM 3 级 LDS ring 装 Q/dO，基于 c1） | 11:00 | 否 | tdm 6.628 / r29 6.577 / c1 6.517 / ASM 5.481 | 相对 c1 +1.7% | 82.7% | 逐位等价；ATT：loadcnt 等待消失，但 32 条 ring 回读 ds_load_b128 被逐条 dscnt 等待卡住；PMC k_dkdv cycle +13.5%（时钟升到 1939 MHz 抵掉一部分） |
 | a07 | TDM_DEPTH=2 | 11:15 | 否（持平） | tdm2 6.503 / tdm3 6.601 / c1 6.493 / c1_aa 6.498 | 相对 c1 +0.15% | — | 深 ring 更慢；TDM 本身只是去掉了加载等待，没有带来净收益 |
 | a08 | 消融 abl_l2（tdm2 源地址固定在 tile 0，永远命中 L2） | 11:25 | 信息 | abl_l2 6.508 / r29 6.574 | 相对 r29 −1.0%（≈ tdm2） | — | **L2 带宽不是限制**；A2 的 −18.5% 来自"B 操作数已在寄存器里"→ 下一步：tdm v3 在本轮就把下一轮的 B 操作数从 ring 读进寄存器 |
+| **a09** | **s1 = tailpf + trorder + streams**（patch 合并，逐位等价） | 11:45 | **接受（新冠军候选）** | **s1 6.329** / r29 6.575 / tailpf 6.369 / ASM 5.500 | **−3.74%** | **86.9%** | ATT：k_dqg 20.1 cyc/WMMA（WMMA 占 57%，基本健康）；k_dkdv 24.7 cyc/WMMA，VALU 占 37%（~4.6 VALU/WMMA，其中 Q/dO v_mov 轮转 + v_nop 约 130 条/轮）→ tdm v3 同时去掉这部分 |
