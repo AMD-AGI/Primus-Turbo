@@ -81,23 +81,28 @@ def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float):
     total_rows = S * B
     packed_heads = NG * (NPG + 2)
     q_heads = NG * NPG
+    qk_heads = NG * (NPG + 1)
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def kernel(PACKED: fx.Tensor, QG: fx.Tensor, KG: fx.Tensor,
                COSINE: fx.Tensor, SINE: fx.Tensor,
-               QOUT: fx.Tensor, KOUT: fx.Tensor, VOUT: fx.Tensor,
+               QOUT: fx.Tensor, KOUT: fx.Tensor,
                QRSTD: fx.Tensor, KRSTD: fx.Tensor):
         tid = fx.thread_idx.x
         block_x, _, _ = fx.block_idx
         lane = tid % fx.Int32(_WARP)
         wave = tid // fx.Int32(_WARP)
         global_wave = block_x * fx.Int32(_WAVES) + wave
-        slot = global_wave % fx.Int32(packed_heads)
-        cycle = global_wave // fx.Int32(packed_heads)
-        group = slot // fx.Int32(NPG + 2)
-        local = slot % fx.Int32(NPG + 2)
+        qk_slot = global_wave % fx.Int32(qk_heads)
+        cycle = global_wave // fx.Int32(qk_heads)
+        group = qk_slot // fx.Int32(NPG + 1)
+        local = qk_slot % fx.Int32(NPG + 1)
         is_q = local < fx.Int32(NPG)
-        is_k = local == fx.Int32(NPG)
+        # Skip the packed V slot.  V remains a zero-copy strided view of PACKED,
+        # exactly like the existing Megatron split path; copying it here costs
+        # bandwidth and one more buffer resource without contributing to the
+        # Q/K fusion.
+        slot = group * fx.Int32(NPG + 2) + local
 
         packed_rsrc = buffer_ops.create_buffer_resource(PACKED, max_size=True)
         qg_rsrc = buffer_ops.create_buffer_resource(QG, max_size=True)
@@ -106,7 +111,6 @@ def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float):
         sine_rsrc = buffer_ops.create_buffer_resource(SINE, max_size=True)
         qout_rsrc = buffer_ops.create_buffer_resource(QOUT, max_size=True)
         kout_rsrc = buffer_ops.create_buffer_resource(KOUT, max_size=True)
-        vout_rsrc = buffer_ops.create_buffer_resource(VOUT, max_size=True)
         qrstd_rsrc = buffer_ops.create_buffer_resource(QRSTD, max_size=True)
         krstd_rsrc = buffer_ops.create_buffer_resource(KRSTD, max_size=True)
 
@@ -115,56 +119,52 @@ def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float):
             src = (token * fx.Int32(packed_heads) + slot) * fx.Int32(_D) + lane
             x = fx.Float32(buffer_ops.buffer_load(packed_rsrc, src, vec_width=1, dtype=fx.T.bf16()))
 
-            if is_q | is_k:
-                sumsq = _wave_sum_f32(x * x)
-                mean = sumsq / fx.Float32(float(_D))
-                rstd = fx.Float32(fmath.rsqrt(mean + fx.Float32(eps)))
-                gamma = fx.Float32(0.0)
-                if is_q:
-                    gamma = fx.Float32(
-                        buffer_ops.buffer_load(qg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
-                    )
-                else:
-                    gamma = fx.Float32(
-                        buffer_ops.buffer_load(kg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
-                    )
-
-                # Match the existing two-kernel contract: RMSNorm writes BF16,
-                # then RoPE reads BF16 and promotes it for the rotation math.
-                norm = (x * rstd * gamma).to(fx.BFloat16).to(fx.Float32)
-                pair = fx.arith.ArithValue(norm).shuffle_xor(_HALF, _WARP)
-
-                seq = token // fx.Int32(B)
-                cosine = fx.Float32(
-                    buffer_ops.buffer_load(
-                        cosine_rsrc, seq * fx.Int32(_D) + lane, vec_width=1, dtype=fx.T.f32()
-                    )
+            sumsq = _wave_sum_f32(x * x)
+            mean = sumsq / fx.Float32(float(_D))
+            rstd = fx.Float32(fmath.rsqrt(mean + fx.Float32(eps)))
+            gamma = fx.Float32(0.0)
+            if is_q:
+                gamma = fx.Float32(
+                    buffer_ops.buffer_load(qg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
                 )
-                sine = fx.Float32(
-                    buffer_ops.buffer_load(
-                        sine_rsrc, seq * fx.Int32(_D) + lane, vec_width=1, dtype=fx.T.f32()
-                    )
-                )
-                low = norm * cosine - fx.Float32(pair) * sine
-                high = norm * cosine + fx.Float32(pair) * sine
-                rotated = fx.BFloat16(
-                    fx.arith.select(lane < fx.Int32(_HALF), low, high)
+            else:
+                gamma = fx.Float32(
+                    buffer_ops.buffer_load(kg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
                 )
 
-                if is_q:
-                    q_head = group * fx.Int32(NPG) + local
-                    dst = (token * fx.Int32(q_heads) + q_head) * fx.Int32(_D) + lane
-                    buffer_ops.buffer_store(rotated, qout_rsrc, dst)
-                    if lane == fx.Int32(0):
-                        buffer_ops.buffer_store(rstd, qrstd_rsrc, token * fx.Int32(q_heads) + q_head)
-                else:
-                    dst = (token * fx.Int32(NG) + group) * fx.Int32(_D) + lane
-                    buffer_ops.buffer_store(rotated, kout_rsrc, dst)
-                    if lane == fx.Int32(0):
-                        buffer_ops.buffer_store(rstd, krstd_rsrc, token * fx.Int32(NG) + group)
+            # Match the existing two-kernel contract: RMSNorm writes BF16,
+            # then RoPE reads BF16 and promotes it for the rotation math.
+            norm = (x * rstd * gamma).to(fx.BFloat16).to(fx.Float32)
+            pair = fx.arith.ArithValue(norm).shuffle_xor(_HALF, _WARP)
+
+            seq = token // fx.Int32(B)
+            cosine = fx.Float32(
+                buffer_ops.buffer_load(
+                    cosine_rsrc, seq * fx.Int32(_D) + lane, vec_width=1, dtype=fx.T.f32()
+                )
+            )
+            sine = fx.Float32(
+                buffer_ops.buffer_load(
+                    sine_rsrc, seq * fx.Int32(_D) + lane, vec_width=1, dtype=fx.T.f32()
+                )
+            )
+            low = norm * cosine - fx.Float32(pair) * sine
+            high = norm * cosine + fx.Float32(pair) * sine
+            rotated = fx.BFloat16(
+                fx.arith.select(lane < fx.Int32(_HALF), low, high)
+            )
+
+            if is_q:
+                q_head = group * fx.Int32(NPG) + local
+                dst = (token * fx.Int32(q_heads) + q_head) * fx.Int32(_D) + lane
+                buffer_ops.buffer_store(rotated, qout_rsrc, dst)
+                if lane == fx.Int32(0):
+                    buffer_ops.buffer_store(rstd, qrstd_rsrc, token * fx.Int32(q_heads) + q_head)
             else:
                 dst = (token * fx.Int32(NG) + group) * fx.Int32(_D) + lane
-                buffer_ops.buffer_store(x.to(fx.BFloat16), vout_rsrc, dst)
+                buffer_ops.buffer_store(rotated, kout_rsrc, dst)
+                if lane == fx.Int32(0):
+                    buffer_ops.buffer_store(rstd, krstd_rsrc, token * fx.Int32(NG) + group)
 
             token = token + fx.Int32(_GRID_CYCLES)
 
@@ -292,7 +292,6 @@ def _compiled_fwd(
     SINE,
     QOUT,
     KOUT,
-    VOUT,
     QRSTD,
     KRSTD,
     S: fx.Constexpr[int],
@@ -302,11 +301,11 @@ def _compiled_fwd(
     EPS: fx.Constexpr[float],
     stream: fx.Stream,
 ):
-    packed_heads = NG * (NPG + 2)
-    assert (_GRID_CYCLES * packed_heads) % _WAVES == 0
-    grid_x = _GRID_CYCLES * packed_heads // _WAVES
+    qk_heads = NG * (NPG + 1)
+    assert (_GRID_CYCLES * qk_heads) % _WAVES == 0
+    grid_x = _GRID_CYCLES * qk_heads // _WAVES
     kernel = _make_fwd_kernel(S, B, NG, NPG, EPS)
-    kernel(PACKED, QG, KG, COSINE, SINE, QOUT, KOUT, VOUT, QRSTD, KRSTD).launch(
+    kernel(PACKED, QG, KG, COSINE, SINE, QOUT, KOUT, QRSTD, KRSTD).launch(
         grid=(grid_x, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream
     )
 
@@ -352,7 +351,7 @@ def flydsl_qkv_rmsnorm_rope_forward(qkv, q_gamma, k_gamma, freqs, split_sizes, e
     assert k_size == _D
     q = torch.empty((S, B, NG * npg, _D), device=qkv.device, dtype=qkv.dtype)
     k = torch.empty((S, B, NG, _D), device=qkv.device, dtype=qkv.dtype)
-    v = torch.empty_like(k)
+    v = qkv[..., -_D:]
     q_rstd = torch.empty((S, B, NG * npg), device=qkv.device, dtype=torch.float32)
     k_rstd = torch.empty((S, B, NG), device=qkv.device, dtype=torch.float32)
     cosine, sine = _cached_cos_sin(freqs)
@@ -364,7 +363,6 @@ def flydsl_qkv_rmsnorm_rope_forward(qkv, q_gamma, k_gamma, freqs, split_sizes, e
         SINE=sine,
         QOUT=q,
         KOUT=k,
-        VOUT=v,
         QRSTD=q_rstd,
         KRSTD=k_rstd,
         S=S,
