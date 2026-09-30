@@ -194,8 +194,12 @@ cycle 数用 `m8/m8drive.py` 测：每个 arm 前先发一个 grid 不同的标�
 1. **最大的一块不是 softmax，而是骨架**：去掉全部 softmax 之后（wl，1.603e6），fly 仍然比**完整的** ASM（1.430e6）多用 12% 的 cycle。
    ASM 的非 causal 主体能跑到矩阵下限的 84%，fly 只有 55%。
    fly 每个 SIMD 2 个 wave，每个 tile 每个 wave 从 LDS 读 32 KB（每条 WMMA 512 B），刚好顶到单个 LDS 段的 256 B/clk/CU（§3）；再加上 TDM 写入，LDS 需求约 288 B/clk。
-   K 和 V 的 ping-pong 缓冲是相邻的（`_v_lds_buf = K base + k_blk_bytes`），很可能落在同一个 64 KB 段里，这一点下一步要核实。
-   如果确实在同一段，**把 K 和 V 分到不同的段**，理论上能把 LDS 从瓶颈上拿掉。
+   **K/V 布局已核实**（`fmha_fwd_prefill_a16w16_m32x8.py:835-845`）：`k_blk_bytes = max(K 大小, MIN_KV_BLK_BYTES = 64 KB)`，所以 K 和 V 各占一个 64 KB 段（slot0 的 K 在段 0、V 在段 1；slot1 分别在段 2、3）。
+   但 QK 阶段所有 wave 只读 K 所在的段，PV 阶段只读 V 所在的段，而同一 SIMD 上的 2 个 wave 被每个 tile 的 barrier 锁在同一相位（DESIGN.md 的结论）。
+   所以**任何时刻只有一个 LDS 读口在工作**，有效带宽是 256 B/clk/CU，正好等于 2 wave × 每条 WMMA 512 B 的需求，再加上 TDM 写入就超了。
+   可以尝试的两个方向：
+   (a) 把 K 和 V 的每个 tile 都按行拆到两个段（例如前 32 行放段 A、后 32 行放段 B），让 QK 和 PV 阶段都同时用上两个读口。这会改动 LDS 地址计算，需要先在 CPU 上做越界证明。
+   (b) 让同一 SIMD 上的两个 wave 错开半个相位（一个做 QK、一个做 PV，类似 FA3 的 ping-pong），这样两个读口会被同时使用。
 2. **softmax 占 19%，但 exp 本身只占 2%**：这和 §2 的结论一致（每条 WMMA 后面跟 1–2 条 exp 几乎免费）。softmax 的代价在 max/sum 的归约树、permlane、cvt 和 rescale 这些 VALU，以及它们和 WMMA 之间的依赖等待。
 3. per-tile barrier 占 5%，causal 的不均衡占 4%，mask 基本免费。
 4. **功耗和时钟**：ASM 的有效时钟只有 1.2–1.24 GHz，fly 各 arm 是 1.46–1.62 GHz。所以 wl 在时间上已经比 ASM 快 14%（0.993 对 1.152 ms），但在 cycle 上仍比 ASM 慢 12%。
