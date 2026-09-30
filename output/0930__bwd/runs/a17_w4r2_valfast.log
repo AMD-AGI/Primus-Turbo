@@ -1,0 +1,23 @@
+  refcache fast: IGNORED, provenance differs on ['common_sha'] -- recomputing
+refcache fast: accepted with common_sha 988c14caed5d9a80
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+CORR shape=fast arm=r29 dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=r29 runs=3 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=fast arm=w4f_r2a dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=w4f_r2a runs=3 dkdv=bitwise dq_worst=109.6 dB  pass
+XARM shape=fast w4f_r2a vs r29: dq=99.7dB dk=100.8dB dv=96.0dB
+CORR shape=fast arm=w4f_r2b dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=w4f_r2b runs=3 dkdv=bitwise dq_worst=111.9 dB  pass
+XARM shape=fast w4f_r2b vs r29: dq=99.9dB dk=100.8dB dv=96.0dB
+CORR shape=fast arm=w4f_r2ab dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=w4f_r2ab runs=3 dkdv=bitwise dq_worst=107.9 dB  pass
+XARM shape=fast w4f_r2ab vs r29: dq=100.2dB dk=100.8dB dv=96.0dB
+CORR shape=fast arm=w4f_relax dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=w4f_relax runs=3 dkdv=bitwise dq_worst=112.6 dB  pass
+XARM shape=fast w4f_relax vs r29: dq=100.4dB dk=100.8dB dv=96.0dB
+CORR shape=fast arm=s4 dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=s4 runs=3 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=fast s4 vs r29: dq=bitwise dk=bitwise dv=bitwise
+LABVAL fast PASS
+rc=0

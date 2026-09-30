@@ -1,0 +1,52 @@
+[compile w4f_r2a] RC=0
+dkdv         .group_segment_fixed_size: 70656 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     729 .vgpr_spill_count: 0  wmma=128 ds=224 
+dqg          .group_segment_fixed_size: 8704 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     1011 .vgpr_spill_count: 0  wmma=288 ds=96 
+[compile w4f_r2b] RC=0
+dkdv         .group_segment_fixed_size: 70656 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     729 .vgpr_spill_count: 0  wmma=128 ds=224 
+dqg          .group_segment_fixed_size: 8704 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     1011 .vgpr_spill_count: 0  wmma=288 ds=96 
+[compile w4f_r2ab] RC=0
+dkdv         .group_segment_fixed_size: 70656 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     729 .vgpr_spill_count: 0  wmma=128 ds=224 
+dqg          .group_segment_fixed_size: 8704 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     1011 .vgpr_spill_count: 0  wmma=288 ds=96 
+[compile w4f_relax] RC=0
+dkdv         .group_segment_fixed_size: 70656 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     729 .vgpr_spill_count: 0  wmma=128 ds=224 
+dqg          .group_segment_fixed_size: 8704 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     1011 .vgpr_spill_count: 0  wmma=288 ds=96 
+[compile s4] RC=0
+dkdv         .group_segment_fixed_size: 70656 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     713 .vgpr_spill_count: 0  wmma=128 ds=256 
+dqg          .group_segment_fixed_size: 8704 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     1020 .vgpr_spill_count: 0  wmma=288 ds=96 
+a17_w4r2_valfast rc=0 dmesg_bad=0 kfd=[]
+CORR shape=fast arm=r29 dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=r29 runs=3 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=fast arm=w4f_r2a dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=w4f_r2a runs=3 dkdv=bitwise dq_worst=109.6 dB  pass
+CORR shape=fast arm=w4f_r2b dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=w4f_r2b runs=3 dkdv=bitwise dq_worst=111.9 dB  pass
+CORR shape=fast arm=w4f_r2ab dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=w4f_r2ab runs=3 dkdv=bitwise dq_worst=107.9 dB  pass
+CORR shape=fast arm=w4f_relax dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=w4f_relax runs=3 dkdv=bitwise dq_worst=112.6 dB  pass
+CORR shape=fast arm=s4 dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=s4 runs=3 dkdv=bitwise dq_worst=bitwise  pass
+LABVAL fast PASS
+a17_w4r2_valprod rc=0 dmesg_bad=0 kfd=[]
+CORR shape=prod arm=r29 dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=r29 runs=3 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=prod arm=w4f_r2a dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=w4f_r2a runs=3 dkdv=bitwise dq_worst=103.1 dB  pass
+CORR shape=prod arm=w4f_r2b dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=w4f_r2b runs=3 dkdv=bitwise dq_worst=103.4 dB  pass
+CORR shape=prod arm=w4f_r2ab dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=w4f_r2ab runs=3 dkdv=bitwise dq_worst=102.0 dB  pass
+CORR shape=prod arm=w4f_relax dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=w4f_relax runs=3 dkdv=bitwise dq_worst=103.7 dB  pass
+CORR shape=prod arm=s4 dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=s4 runs=3 dkdv=bitwise dq_worst=bitwise  pass
+LABVAL prod PASS
+a17_w4r2_bench rc=0 dmesg_bad=0 kfd=[]
+BENCH r29        6.5679 ms  vs_r29 +0.00%  asm/arm 83.5%
+BENCH w4f_r2a    9.2716 ms  vs_r29 +41.16%  asm/arm 59.2%
+BENCH w4f_r2b    9.8207 ms  vs_r29 +49.53%  asm/arm 55.8%
+BENCH w4f_r2ab   9.3970 ms  vs_r29 +43.07%  asm/arm 58.4%
+BENCH w4f_relax  9.5176 ms  vs_r29 +44.91%  asm/arm 57.6%
+BENCH s4         5.4942 ms  vs_r29 -16.35%  asm/arm 99.8%
+BENCH r29_aa     6.5700 ms  vs_r29 +0.03%  asm/arm 83.5%
+BENCH asm        5.4842 ms  vs_r29 -16.50%  asm/arm 100.0%
