@@ -1,0 +1,12 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm asm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/bwd/oe/artifacts/job/job_context/op/beat md5=2802a918
+# arm s5 -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/s5 md5=640d49f2
+# arm s4 -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/s4 md5=fb5dc6b7
+# arm r29 -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/r29 md5=c6b95c2c
+# statistic median  iters 51  warmup 3.0s continuous  order blocked 9+lead 4, palindromic rounds  device gfx1250
+RESULT shape=prod arm=asm stat=median iters=54 latency_ms=5.501036882400513 min_ms=5.438505172729492 max_ms=5.548325061798096 tflops=999.4896135145912 bw_gbs=243.98623544845384 flop=5498229227520.0 bytes_min=1342177280 sclk_start=2086 sclk_end=1965 causal=True order=blocked9+lead4
+RESULT shape=prod arm=s5 stat=median iters=54 latency_ms=5.339385509490967 min_ms=5.277503967285156 max_ms=5.394360065460205 tflops=1029.749437973093 bw_gbs=251.37298620117002 flop=5498229227520.0 bytes_min=1342177280 sclk_start=2086 sclk_end=1965 causal=True order=blocked9+lead4
+RESULT shape=prod arm=s4 stat=median iters=54 latency_ms=5.52049446105957 min_ms=5.464219093322754 max_ms=5.58226203918457 tflops=995.9668044780001 bw_gbs=243.12627962358115 flop=5498229227520.0 bytes_min=1342177280 sclk_start=2086 sclk_end=1965 causal=True order=blocked9+lead4
+RESULT shape=prod arm=r29 stat=median iters=54 latency_ms=6.582016944885254 min_ms=6.516343116760254 max_ms=6.617232799530029 tflops=835.3410927926215 bw_gbs=203.9158044166048 flop=5498229227520.0 bytes_min=1342177280 sclk_start=2086 sclk_end=1965 causal=True order=blocked9+lead4
+rc=0

@@ -1,0 +1,20 @@
+  refcache prod: IGNORED, provenance differs on ['common_sha'] -- recomputing
+refcache prod: accepted with common_sha 988c14caed5d9a80
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+CORR shape=prod arm=r29 dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=r29 runs=3 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=prod arm=dqg_tdm dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=dqg_tdm runs=3 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=prod dqg_tdm vs r29: dq=bitwise dk=bitwise dv=bitwise
+CORR shape=prod arm=dqg_vtrim dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=dqg_vtrim runs=3 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=prod dqg_vtrim vs r29: dq=79.5dB dk=bitwise dv=bitwise
+CORR shape=prod arm=dkdv_trim2 dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=dkdv_trim2 runs=3 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=prod dkdv_trim2 vs r29: dq=bitwise dk=bitwise dv=bitwise
+CORR shape=prod arm=s4 dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=s4 runs=3 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=prod s4 vs r29: dq=bitwise dk=bitwise dv=bitwise
+LABVAL prod PASS
+rc=0

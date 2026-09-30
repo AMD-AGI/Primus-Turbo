@@ -43,6 +43,8 @@ FLOP from `op-evolve/tools/op_flops.py`: fwd 2.199292e12, bwd 5.498229e12. One g
 
 ## 3. Current state and next step
 
+- **2026-09-30 18:10: bwd champion s5 BEATS ASM: prod 5.339 vs 5.501 ms (103.0%), proxy 0.338 vs 0.381 (112.8%)**, bitwise vs r29;
+  s5 = s4 + k_dqg through its own TDM ring with carried operands (`arms/dqg_tdm`). Source: `output/0930__bwd/armsrc/s5/`.
 - **2026-09-30 (afternoon): bwd hand campaign on A0 reached ASM parity.** Work dir `output/0930__bwd/` (PLAN.md, PROGRESS.md = per-arm
   table, `armsrc/` = source of every arm, `tools/{run.sh,arm.sh,abl.sh,compile.sh,toycheck.py,attsum.py}`). Champion **s4 = 5.532 ms vs ASM
   5.517 (99.7%), r29 6.590**, bitwise vs r29. Levers: k_dkdv Q/dO through a 3-stage **TDM LDS ring with the next iteration's B operands read

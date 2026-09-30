@@ -1,0 +1,44 @@
+[compile dqg_tdm] RC=0
+dkdv         .group_segment_fixed_size: 70656 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     713 .vgpr_spill_count: 0  wmma=128 ds=256 
+dqg          .group_segment_fixed_size: 52224 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     878 .vgpr_spill_count: 0  wmma=192 ds=128 
+[compile dqg_vtrim] RC=0
+dkdv         .group_segment_fixed_size: 70656 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     713 .vgpr_spill_count: 0  wmma=128 ds=256 
+dqg          .group_segment_fixed_size: 8704 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     966 .vgpr_spill_count: 0  wmma=288 ds=96 
+[compile dkdv_trim2] RC=0
+dkdv         .group_segment_fixed_size: 70656 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     712 .vgpr_spill_count: 0  wmma=128 ds=260 
+dqg          .group_segment_fixed_size: 8704 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     1020 .vgpr_spill_count: 0  wmma=288 ds=96 
+[compile s4] RC=0
+dkdv         .group_segment_fixed_size: 70656 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     713 .vgpr_spill_count: 0  wmma=128 ds=256 
+dqg          .group_segment_fixed_size: 8704 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     1020 .vgpr_spill_count: 0  wmma=288 ds=96 
+a19_r3s4_valfast rc=0 dmesg_bad=0 kfd=[]
+CORR shape=fast arm=r29 dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=r29 runs=3 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=fast arm=dqg_tdm dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=dqg_tdm runs=3 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=fast arm=dqg_vtrim dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=dqg_vtrim runs=3 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=fast arm=dkdv_trim2 dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=dkdv_trim2 runs=3 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=fast arm=s4 dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=s4 runs=3 dkdv=bitwise dq_worst=bitwise  pass
+LABVAL fast PASS
+a19_r3s4_valprod rc=0 dmesg_bad=0 kfd=[]
+CORR shape=prod arm=r29 dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=r29 runs=3 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=prod arm=dqg_tdm dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=dqg_tdm runs=3 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=prod arm=dqg_vtrim dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=dqg_vtrim runs=3 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=prod arm=dkdv_trim2 dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=dkdv_trim2 runs=3 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=prod arm=s4 dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=s4 runs=3 dkdv=bitwise dq_worst=bitwise  pass
+LABVAL prod PASS
+a19_r3s4_bench rc=0 dmesg_bad=0 kfd=[]
+BENCH r29        6.5781 ms  vs_r29 +0.00%  asm/arm 83.7%
+BENCH dqg_tdm    5.3382 ms  vs_r29 -18.85%  asm/arm 103.1%
+BENCH dqg_vtrim  5.4027 ms  vs_r29 -17.87%  asm/arm 101.9%
+BENCH dkdv_trim2 5.5262 ms  vs_r29 -15.99%  asm/arm 99.6%
+BENCH s4         5.4531 ms  vs_r29 -17.10%  asm/arm 100.9%
+BENCH r29_aa     6.5747 ms  vs_r29 -0.05%  asm/arm 83.7%
+BENCH asm        5.5045 ms  vs_r29 -16.32%  asm/arm 100.0%
