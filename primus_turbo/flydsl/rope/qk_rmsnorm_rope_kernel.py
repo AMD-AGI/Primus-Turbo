@@ -78,7 +78,6 @@ def _wave_sum_f32(value):
 
 
 def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float):
-    total_rows = S * B
     packed_heads = NG * (NPG + 2)
     q_heads = NG * NPG
     qk_heads = NG * (NPG + 1)
@@ -126,22 +125,13 @@ def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float):
             gamma = fx.Float32(
                 buffer_ops.buffer_load(kg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
             )
+        q_head = group * fx.Int32(NPG) + local
 
-        token = cycle
-        while token < fx.Int32(total_rows):
-            src = (token * fx.Int32(packed_heads) + slot) * fx.Int32(_D) + lane
-            x = fx.Float32(buffer_ops.buffer_load(packed_rsrc, src, vec_width=1, dtype=fx.T.bf16()))
-
-            sumsq = _wave_sum_f32(x * x)
-            mean = sumsq / fx.Float32(float(_D))
-            rstd = fx.Float32(fmath.rsqrt(mean + fx.Float32(eps)))
-
-            # Match the existing two-kernel contract: RMSNorm writes BF16,
-            # then RoPE reads BF16 and promotes it for the rotation math.
-            norm = (x * rstd * gamma).to(fx.BFloat16).to(fx.Float32)
-            pair = fx.arith.ArithValue(norm).shuffle_xor(_HALF, _WARP)
-
-            seq = token // fx.Int32(B)
+        # All B token rows at one sequence position share the same rotary
+        # values.  Process them together so each wave loads cos/sin once per
+        # sequence instead of once per batch element.
+        seq = cycle
+        while seq < fx.Int32(S):
             cosine = fx.Float32(
                 buffer_ops.buffer_load(
                     cosine_rsrc, seq * fx.Int32(_D) + lane, vec_width=1, dtype=fx.T.f32()
@@ -152,31 +142,48 @@ def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float):
                     sine_rsrc, seq * fx.Int32(_D) + lane, vec_width=1, dtype=fx.T.f32()
                 )
             )
-            low = norm * cosine - fx.Float32(pair) * sine
-            high = norm * cosine + fx.Float32(pair) * sine
-            rotated = fx.BFloat16(
-                fx.arith.select(lane < fx.Int32(_HALF), low, high)
-            )
+            for batch_idx in range(B):
+                token = seq * fx.Int32(B) + fx.Int32(batch_idx)
+                src = (token * fx.Int32(packed_heads) + slot) * fx.Int32(_D) + lane
+                x = fx.Float32(
+                    buffer_ops.buffer_load(packed_rsrc, src, vec_width=1, dtype=fx.T.bf16())
+                )
 
-            if is_q:
-                q_head = group * fx.Int32(NPG) + local
-                dst = (token * fx.Int32(q_heads) + q_head) * fx.Int32(_D) + lane
-                buffer_ops.buffer_store(rotated, qout_rsrc, dst)
-                if lane == fx.Int32(0):
-                    buffer_ops.buffer_store(rstd, qrstd_rsrc, token * fx.Int32(q_heads) + q_head)
-            else:
-                dst = (token * fx.Int32(NG) + group) * fx.Int32(_D) + lane
-                buffer_ops.buffer_store(rotated, kout_rsrc, dst)
-                if lane == fx.Int32(0):
-                    buffer_ops.buffer_store(rstd, krstd_rsrc, token * fx.Int32(NG) + group)
+                sumsq = _wave_sum_f32(x * x)
+                mean = sumsq / fx.Float32(float(_D))
+                rstd = fx.Float32(fmath.rsqrt(mean + fx.Float32(eps)))
 
-            token = token + fx.Int32(_GRID_CYCLES)
+                # Match the existing two-kernel contract: RMSNorm writes BF16,
+                # then RoPE reads BF16 and promotes it for the rotation math.
+                norm = (x * rstd * gamma).to(fx.BFloat16).to(fx.Float32)
+                pair = fx.arith.ArithValue(norm).shuffle_xor(_HALF, _WARP)
+                low = norm * cosine - fx.Float32(pair) * sine
+                high = norm * cosine + fx.Float32(pair) * sine
+                rotated = fx.BFloat16(
+                    fx.arith.select(lane < fx.Int32(_HALF), low, high)
+                )
+
+                if is_q:
+                    dst = (token * fx.Int32(q_heads) + q_head) * fx.Int32(_D) + lane
+                    buffer_ops.buffer_store(rotated, qout_rsrc, dst)
+                    if lane == fx.Int32(0):
+                        buffer_ops.buffer_store(
+                            rstd, qrstd_rsrc, token * fx.Int32(q_heads) + q_head
+                        )
+                else:
+                    dst = (token * fx.Int32(NG) + group) * fx.Int32(_D) + lane
+                    buffer_ops.buffer_store(rotated, kout_rsrc, dst)
+                    if lane == fx.Int32(0):
+                        buffer_ops.buffer_store(
+                            rstd, krstd_rsrc, token * fx.Int32(NG) + group
+                        )
+
+            seq = seq + fx.Int32(_GRID_CYCLES)
 
     return kernel
 
 
 def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int):
-    total_rows = S * B
     packed_heads = NG * (NPG + 2)
     q_heads = NG * NPG
 
@@ -225,61 +232,74 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int):
         q_head = group * fx.Int32(NPG) + local
 
         dgamma = fx.Float32(0.0)
-        token = cycle
-        while token < fx.Int32(total_rows):
-            dst = (token * fx.Int32(packed_heads) + slot) * fx.Int32(_D) + lane
-            if is_q | is_k:
-                grad = fx.Float32(0.0)
-                rstd = fx.Float32(0.0)
-                if is_q:
-                    src = (token * fx.Int32(q_heads) + q_head) * fx.Int32(_D) + lane
-                    grad = fx.Float32(buffer_ops.buffer_load(dq_rsrc, src, vec_width=1, dtype=fx.T.bf16()))
-                    rstd = fx.Float32(
-                        buffer_ops.buffer_load(
-                            qrstd_rsrc, token * fx.Int32(q_heads) + q_head, vec_width=1, dtype=fx.T.f32()
+        seq = cycle
+        while seq < fx.Int32(S):
+            cosine = fx.Float32(
+                buffer_ops.buffer_load(
+                    cosine_rsrc, seq * fx.Int32(_D) + lane, vec_width=1, dtype=fx.T.f32()
+                )
+            )
+            sine = fx.Float32(
+                buffer_ops.buffer_load(
+                    sine_rsrc, seq * fx.Int32(_D) + lane, vec_width=1, dtype=fx.T.f32()
+                )
+            )
+            for batch_idx in range(B):
+                token = seq * fx.Int32(B) + fx.Int32(batch_idx)
+                dst = (token * fx.Int32(packed_heads) + slot) * fx.Int32(_D) + lane
+                if is_q | is_k:
+                    grad = fx.Float32(0.0)
+                    rstd = fx.Float32(0.0)
+                    if is_q:
+                        src = (token * fx.Int32(q_heads) + q_head) * fx.Int32(_D) + lane
+                        grad = fx.Float32(
+                            buffer_ops.buffer_load(dq_rsrc, src, vec_width=1, dtype=fx.T.bf16())
                         )
+                        rstd = fx.Float32(
+                            buffer_ops.buffer_load(
+                                qrstd_rsrc,
+                                token * fx.Int32(q_heads) + q_head,
+                                vec_width=1,
+                                dtype=fx.T.f32(),
+                            )
+                        )
+                    else:
+                        src = (token * fx.Int32(NG) + group) * fx.Int32(_D) + lane
+                        grad = fx.Float32(
+                            buffer_ops.buffer_load(dk_rsrc, src, vec_width=1, dtype=fx.T.bf16())
+                        )
+                        rstd = fx.Float32(
+                            buffer_ops.buffer_load(
+                                krstd_rsrc,
+                                token * fx.Int32(NG) + group,
+                                vec_width=1,
+                                dtype=fx.T.f32(),
+                            )
+                        )
+
+                    pair_grad = fx.arith.ArithValue(grad).shuffle_xor(_HALF, _WARP)
+                    low = grad * cosine + fx.Float32(pair_grad) * sine
+                    high = grad * cosine - fx.Float32(pair_grad) * sine
+                    # Match the materialized BF16 gradient at the RoPE -> RMSNorm boundary.
+                    dnorm = fx.Float32(
+                        fx.BFloat16(fx.arith.select(lane < fx.Int32(_HALF), low, high))
                     )
+
+                    x = fx.Float32(
+                        buffer_ops.buffer_load(packed_rsrc, dst, vec_width=1, dtype=fx.T.bf16())
+                    )
+                    unit = x * rstd
+                    dunit = dnorm * gamma
+                    dot = _wave_sum_f32(unit * dunit)
+                    dx = (dunit - unit * (dot / fx.Float32(float(_D)))) * rstd
+                    buffer_ops.buffer_store(dx.to(fx.BFloat16), dpacked_rsrc, dst)
+                    dgamma = dgamma + dnorm * unit
                 else:
                     src = (token * fx.Int32(NG) + group) * fx.Int32(_D) + lane
-                    grad = fx.Float32(buffer_ops.buffer_load(dk_rsrc, src, vec_width=1, dtype=fx.T.bf16()))
-                    rstd = fx.Float32(
-                        buffer_ops.buffer_load(
-                            krstd_rsrc, token * fx.Int32(NG) + group, vec_width=1, dtype=fx.T.f32()
-                        )
-                    )
+                    grad = buffer_ops.buffer_load(dv_rsrc, src, vec_width=1, dtype=fx.T.bf16())
+                    buffer_ops.buffer_store(grad, dpacked_rsrc, dst)
 
-                pair_grad = fx.arith.ArithValue(grad).shuffle_xor(_HALF, _WARP)
-                seq = token // fx.Int32(B)
-                cosine = fx.Float32(
-                    buffer_ops.buffer_load(
-                        cosine_rsrc, seq * fx.Int32(_D) + lane, vec_width=1, dtype=fx.T.f32()
-                    )
-                )
-                sine = fx.Float32(
-                    buffer_ops.buffer_load(
-                        sine_rsrc, seq * fx.Int32(_D) + lane, vec_width=1, dtype=fx.T.f32()
-                    )
-                )
-                low = grad * cosine + fx.Float32(pair_grad) * sine
-                high = grad * cosine - fx.Float32(pair_grad) * sine
-                # Match the materialized BF16 gradient at the RoPE -> RMSNorm boundary.
-                dnorm = fx.Float32(
-                    fx.BFloat16(fx.arith.select(lane < fx.Int32(_HALF), low, high))
-                )
-
-                x = fx.Float32(buffer_ops.buffer_load(packed_rsrc, dst, vec_width=1, dtype=fx.T.bf16()))
-                unit = x * rstd
-                dunit = dnorm * gamma
-                dot = _wave_sum_f32(unit * dunit)
-                dx = (dunit - unit * (dot / fx.Float32(float(_D)))) * rstd
-                buffer_ops.buffer_store(dx.to(fx.BFloat16), dpacked_rsrc, dst)
-                dgamma = dgamma + dnorm * unit
-            else:
-                src = (token * fx.Int32(NG) + group) * fx.Int32(_D) + lane
-                grad = buffer_ops.buffer_load(dv_rsrc, src, vec_width=1, dtype=fx.T.bf16())
-                buffer_ops.buffer_store(grad, dpacked_rsrc, dst)
-
-            token = token + fx.Int32(_GRID_CYCLES)
+            seq = seq + fx.Int32(_GRID_CYCLES)
 
         if is_q:
             part = (cycle * fx.Int32(q_heads) + q_head) * fx.Int32(_D) + lane
