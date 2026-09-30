@@ -123,10 +123,13 @@ def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float):
                 buffer_ops.buffer_load(qg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
             )
         else:
-            if is_k:
-                gamma = fx.Float32(
-                    buffer_ops.buffer_load(kg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
-                )
+            # qk_slot contains only Q slots followed by one K slot per group,
+            # so the non-Q branch is always K.  Keep this as a single
+            # FlyDSL-rewritten branch; a nested condition here loses its local
+            # predicate when the AST rewriter outlines the else body.
+            gamma = fx.Float32(
+                buffer_ops.buffer_load(kg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
+            )
         q_head = group * fx.Int32(NPG) + local
 
         # All B token rows at one sequence position share the same rotary
