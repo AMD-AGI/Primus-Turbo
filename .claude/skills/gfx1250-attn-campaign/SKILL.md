@@ -43,6 +43,15 @@ FLOP from `op-evolve/tools/op_flops.py`: fwd 2.199292e12, bwd 5.498229e12. One g
 
 ## 3. Current state and next step
 
+- **2026-09-30: roofline measured on A0** (`output/0930__roofline/REPORT.md`). W = 8 cycles per bf16 WMMA (2048 FLOP/SIMD-cycle);
+  LDS 256 B/clk/CU per 64 KB segment (512 across two); a WMMA->ds_load->WMMA switch costs ~29 cycles per wave (hidden only by a
+  second wave on the SIMD); per WMMA ~4 VALU / ~2 v_exp co-issue free; HBM ~18.5 TB/s; dense WMMA runs at ~1.7 GHz (power).
+  Cycle ruler: `GRBM_GUI_ACTIVE`/8 per kernel (`rocprofv3 --pmc`, harness with `--warmup-seconds 0`, else the unsynced warmup
+  floods the profiler and looks like a hang). fwd r13ns 1.985e6 cycles (53% of the matrix floor) vs ASM 1.452e6 (72%, but at 1.36 GHz);
+  bwd both ~1/3 of the floor; k_dkdv's missing cycles are ~200 switch + ~600 load-wait per iteration at 1 wave/SIMD.
+- **2026-09-30: A0 was reflashed 09-29** (VBIOS 700E): no 1100 MHz cap any more; pre-09-29 A0 numbers are void
+  (`output/0928__a0_repro/REPORT.md` §6).
+
 - **2026-09-28: the campaign moved B0 -> A0. Read `output/0927__b0/HANDOFF-A0.md` first**; it supersedes the fwd/bwd
   bullets below and §1's numbers. Champions: fwd = job `gfx1250-flydsl-attn-fwd-b0-20260927` round 16 (r13ns,
   speculation off), bwd = job `gfx1250-flydsl-attn-bwd-20260917-115934` round 29 (r19h + u2n); byte copies in git at
