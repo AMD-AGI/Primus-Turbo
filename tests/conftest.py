@@ -34,6 +34,8 @@ _GFX1250_ENABLED_TESTS = (
     # bf16 grouped GEMM through the backend registry: Triton, plus the FlyDSL
     # WMMA/TDM kernels in grouped_gemm_bf16_kernel_gfx1250.py.
     "tests/pytorch/ops/test_grouped_gemm.py",
+    # Dense FlyDSL attention (primus_turbo/flydsl/attention/gfx1250), bf16 head_dim 128.
+    "tests/pytorch/ops/test_attention_flydsl_gfx1250.py",
 )
 
 
