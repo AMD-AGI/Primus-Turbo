@@ -326,3 +326,156 @@ ALL PASS in all four directories.
 - The L section now models each wave's TDM FIFO: at every signal, all but the newest `tw` ops retire.
 - The ISA section expects `s_wait_tensorcnt 0x{TW_LOOP}` and 0 or 32 atomics accordingly.
 - Negative controls fail as they should: relax with a loop wait of 0x4, or with the TDM lead raised to 4.
+
+## 10. Round 2 (r2a / r2b / r2ab), all built on w4f_relax
+
+**Card round 1b** (as reported by the coordinator), prod timings from one process:
+
+| arm | ms |
+|---|--:|
+| w4f | 15.83 |
+| w4f_relax | 9.53 |
+| w4f_noatom | 4.34 |
+| w4f_relax_noatom | 4.24 |
+| s4 (1-wave champion) | 5.53 |
+| ASM | 5.50 |
+
+The fused structure itself is worth about 4.2 ms. The dQ atomics cost about 5.3 ms in w4f_relax.
+
+**Diagnosis of the `s_wait_loadcnt 0x0` stall in w4f_relax** (ATT Vaddr 21852):
+- The 4 LSE/delta `buffer_load_b32` of step s+1 are loop-carried. The register allocator copies them into the
+  PHI registers with a `v_mov`, and that copy needs `loadcnt 0`.
+- The wait therefore sits in the dQ phase, right after the 32 atomics have been issued, so the b32 returns
+  queue behind them.
+- r2a also hit this in its first build: LSE carried from LDS produced a `v_dual_mov` that forced `dscnt 0` in
+  the dQ burst. Hence the final design reads LSE/delta at the step top, not carried.
+
+**New constants in kernels.py** (all default False; the other dirs are unchanged). With all r2 flags off the new
+code compiles to ISA byte-identical to the card-run w4f_relax, for both w4f and w4f_sp (checked with `cmp`).
+
+| dir | flags | change |
+|---|---|---|
+| `arms/w4f_r2a` | RELAX, `W4_LDS_LSE` | LSE/delta ride the TDM ring. Each wave issues 2 more `tensor_load_to_lds` per step (8 LSE + 8 delta fp32 into slot +17408/+17536; slot = 17664 B), 4 ops per wave-step in total. Tensor waits: prologue 0x8, loop 0x4, epilogue 0x0. The step reads its own slot's LSE/delta at the step top with 2 `ds_load_2addr_b32`; they are not carried |
+| `arms/w4f_r2b` | RELAX, `W4_XCD` | XCD-aware workgroup order. Linear id → XCD c = id % 8, slot = id // 8; within an XCD the slot walks kv block ascending (longest-first kept), then the XCD's gpx = B·Hkv/8 groups, then the split. group = c·gpx + gl → (bat, hkv). So every workgroup adding into one (b, hkv) group's dQ rows lands on one XCD. Active only when B·Hkv % 8 == 0 (prod: 4 groups/XCD, proxy: 1); identity elsewhere. SALU only, in the prologue |
+| `arms/w4f_r2ab` | RELAX, LDS_LSE, XCD | both |
+
+**(C) buffer_atomic form: not built.** I found no concrete reason the current form is worse.
+- The current `global_atomic_add_f32 v_off, v_data, s[base] offset:imm scale_offset scope:SCOPE_DEV` already
+  has the ASM's addressing structure: an SGPR base, one VGPR offset per step, and immediates.
+- It is no-return, device scope, one per WMMA gap, with 1 VGPR offset.
+- The buffer form would only add V# range checking.
+- The measured loss is chip-wide atomic throughput and memory-return ordering, and the instruction form
+  changes neither.
+
+**Compile.** Run from each dir: `./compile_w4f.sh w4f w4f_sp cvt redsp delta` (same docker line as
+`tools/compile.sh`). All give RC=0, 0 spill, 0 scratch, LDS 231424.
+
+| dir | VGPR w4f / sp | SGPR | full loop instr | loop VMEM loads | TDM/step | loop tensor wait | atomics/step |
+|---|---|--:|--:|--:|--:|---|--:|
+| w4f_relax | 714 / 706 | 94 | 758 | 4 b32 | 2 | 0x2 | 32 |
+| w4f_r2a | 706 / 698 | 78 | 737 | **0** | 4 | 0x4 | 32 |
+| w4f_r2b | 724 / 706 | 94 | 763 | 4 b32 | 2 | 0x2 | 32 |
+| w4f_r2ab | 716 / 698 | 84 | 735 | **0** | 4 | 0x4 | 32 |
+
+- **r2a/r2ab event string**: `d0x1e W L2 A ... (W A)x32 ... S8 d0x0 t0x4 |sig| L36 ... W8 |wait| T4 L48 d0x2e W2 ... d0x20 W2`.
+  - The dQ burst has only partial dscnt waits, and the readback stays in flight across the back edge.
+  - The loop-top `s_wait_loadcnt 0xe..0x0` waits come from the compiler's model of the prologue's 16 V-fragment
+    `buffer_load_b128` (first use in the dP WMMA). No VMEM is issued in the loop, so in steady state they are
+    no-ops, provided the hardware does not count TDM on LOADcnt (dkdv_tdm3 has the same pattern).
+
+**Proof.** `bounds_proof.py` reads the flags from the `kernels.py` next to it. It gives ALL PASS in w4f,
+w4f_relax, w4f_noatom, w4f_relax_noatom, w4f_r2a, w4f_r2b and w4f_r2ab.
+- The noatom dirs have no `.dump` now, so their ISA section is skipped.
+- New checks:
+  - LSE TDM extents are at least 8 and in bounds.
+  - The step-top LSE read sees TDM(s) from all 4 waves.
+  - The ISA shows exactly the 2addr b32 loads before the signal and no `buffer_load` in the loop.
+  - X section: the remap is a bijection onto (bat, hkv·nsp+sp, blk) for every shape, one XCD per group, the
+    group count per XCD is balanced, and the kv block is ascending within each XCD.
+- Proof-model fix: a TDM batch now retires only when all of its ops have. The old model credited a partial
+  wait with retiring a whole 4-op batch.
+- Negative controls: r2a loop waits 0x5/0x6/0x8 fail; 0x4 passes.
+
+## 11. Round 3: atomic footprint, ASM vs w4f, and arm w4f_r3
+
+**Card results, round 2** (as reported by the coordinator), prod timings from one process:
+
+| arm | ms |
+|---|--:|
+| w4f_r2a | 9.272 |
+| w4f_r2b | 9.821 |
+| w4f_r2ab | 9.397 |
+| w4f_relax | 9.518 |
+| s4 | 5.494 |
+| ASM | 5.484 |
+
+B (the XCD remap) is dropped.
+
+**ASM per-instruction footprint.** Reconstructed from `probe/p2_asm/stats_ui_output_agent_29978_dispatch_11.csv`,
+lines 244-251 and the 192 `buffer_atomic_add_f32` rows.
+- **Offset registers.** `v56 = v0*4 + s2*0x80`, where v0 is the lane id and s2 the wave id. The other three
+  offset registers are offsets of v56: `v60 = v56 + s63*16`, `v64 = v56 + s63*64`, `v68 = v60 + s63*64`.
+- **Instruction pattern.** Each of the 4 offset registers carries 8 atomics, with imm offsets
+  0/512/1024/1536/4096/4608/5120/5632. The data registers are v204..v235, which are the four dQ WMMA C tiles,
+  unpermuted.
+- **Lane → address.** Lane l writes base + 128·wave + 4·l. That is 32 lanes × 4 B = **one contiguous,
+  128 B-aligned line per instruction** (4 sectors, fully written).
+- **Walk.** The 32 instructions step through 512 B slots (slot 0..31 in order if s63 = 128).
+- **Consequence for the workspace layout.** A C tile holds rows m = 8·(l/16) + si and columns n = l%16, yet the
+  address is linear in the lane. So the ASM's dq_acc cannot be a plain [q][d] matrix. It is laid out in
+  **C-fragment order**: one 512 B slot per accumulator register, and 4 waves × 128 B per slot. A per-(head,
+  32-row block) chunk is 16 KB. The separate dq_convert kernel de-swizzles it.
+- **Caveat.** The ATT disassembly hides the VGPR-MSB bank. I identified `v0` as the lane id because lines
+  193-222 use v0 that way, after a bank-1 write to "v0" at line 171.
+
+**w4f_r2a footprint.** From the source: `base = ((b·Hq+qh)·Sq + qt·32 + half·8)·D + 32w + row`, plus
+`imm = (qh16·16+si)·512 + j·64`.
+- Lanes 0-15 write 16 consecutive d (64 B) of q row r; lanes 16-31 write the same d range of row r+8.
+- So each instruction touches **2 lines, each half-written** (4 sectors).
+- The two j instructions hit the same two lines again, so every line of the tile gets 2 atomic instructions.
+
+| per atomic instruction | ASM | w4f..r2a | **w4f_r3** |
+|---|---|---|---|
+| distinct 128 B lines | 1 | 2 | **1** |
+| 32 B sectors | 4 | 4 | 4 |
+| bytes of lines touched / payload | 1× | 2× | **1×** |
+| line-level atomic requests per step per wave | 32 | 64 | **32** |
+| offset form | 4 VGPRs + imm | 1 VGPR + imm (scale_offset) | 1 VGPR + imm 0..15872 step 512 |
+| walk over 32 instructions | slots 0..31 of 512 B | rows 0-7/8-15/16-23/24-31, with d halves interleaved | slots 0..31 of 512 B (same as ASM) |
+
+**Workspace layout.**
+- Ours was [B,Hq,Sq,D] fp32: 512 B rows, and a q row's 32-d wave slice is one aligned line.
+- The ASM's is in C-fragment order: 512 B register slots, the 4 waves' 128 B lines adjacent, one 16 KB block
+  per (head, 32-q block).
+- Both are the same size and 128 B-aligned. The difference is how one instruction's lanes map onto lines, not
+  padding.
+
+**w4f_r3** = w4f_r2a + `W4_DQ_TILED = True` (flags: RELAX, LDS_LSE, DQ_TILED).
+- The workspace is the ASM's C-fragment order. Element (q, d) of pair qt goes to
+  `block(b,qh,qt)·4096 + ((qh16·2+j)·8+si)·128 + 32·wave + lane`.
+- The atomics use one VGPR offset plus imm 0..15872.
+- `k_dq_cvt_t` de-swizzles to bf16 [B,Sq,Hq,D], one 16 B load and one 8 B store per thread.
+- There is no permute and no extra VGPR. The atomic data is the unmodified C registers, as in the ASM.
+
+**Compile.** `./compile_w4f.sh w4f w4f_sp cvt_t cvt redsp delta` gives RC=0, 0 spill, 0 scratch.
+
+| kernel | VGPR | LDS B |
+|---|--:|--:|
+| k_dkdv_w4f | 704 | 231424 |
+| k_dkdv_w4f_sp | 698 | 231424 |
+| k_dq_cvt_t | 14 | 0 |
+
+- The hot loop `.LBB0_9` has 734 instructions and 80 WMMA, and its event string is identical to r2a's.
+- It has 32 `global_atomic_add_f32 v141, vX, s[44:45] offset:{0,512,...,15872} scale_offset scope:SCOPE_DEV`,
+  one per WMMA gap, and no buffer_load.
+
+**Proof** (`bounds_proof.py` in w4f_r3): ALL PASS.
+- New **T section.**
+  - The atomic offsets of a step are a bijection onto the 16 KB block.
+  - Each instruction's 32 lanes are exactly one aligned 128 B line.
+  - The 4 waves stay disjoint.
+  - `k_dq_cvt_t` reads exactly the element the atomics wrote for every (q, d), and its vec4 is 4 consecutive d
+    within one line.
+  - cvt_t is exhaustively a bijection on the small shapes and corner-checked on prod.
+- **F section** prints the footprint table above.
+- The G, A, S, L, I and B sections are as before. Atomic maxima on prod: 134217728 = size.

@@ -1,0 +1,16 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm r29 -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/r29 md5=c6b95c2c
+# arm w4f_r3 -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/w4f_r3 md5=093a7acd
+# arm w4f_r2a -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/w4f_r2a md5=75e7686d
+# arm s4 -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/s4 md5=fb5dc6b7
+# arm r29_aa -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/r29_aa md5=c6b95c2c
+# arm asm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/bwd/oe/artifacts/job/job_context/op/beat md5=2802a918
+# statistic median  iters 51  warmup 3.0s continuous  order blocked 9+lead 4, palindromic rounds  device gfx1250
+RESULT shape=prod arm=r29 stat=median iters=54 latency_ms=6.561413526535034 min_ms=6.5035600662231445 max_ms=6.608419895172119 tflops=837.9641376487846 bw_gbs=204.55611806390445 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1833 sclk_end=2092 causal=True order=blocked9+lead4
+RESULT shape=prod arm=w4f_r3 stat=median iters=54 latency_ms=6.630017042160034 min_ms=6.579191207885742 max_ms=6.680113792419434 tflops=829.2933777631283 bw_gbs=202.4394917034367 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1833 sclk_end=2092 causal=True order=blocked9+lead4
+RESULT shape=prod arm=w4f_r2a stat=median iters=54 latency_ms=9.268758773803711 min_ms=9.212326049804688 max_ms=9.35391902923584 tflops=593.2001643045932 bw_gbs=144.80658227867522 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1833 sclk_end=2092 causal=True order=blocked9+lead4
+RESULT shape=prod arm=s4 stat=median iters=54 latency_ms=5.515462398529053 min_ms=5.430781841278076 max_ms=5.601566791534424 tflops=996.8754802836387 bw_gbs=243.34809722534817 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1833 sclk_end=2092 causal=True order=blocked9+lead4
+RESULT shape=prod arm=r29_aa stat=median iters=54 latency_ms=6.555641174316406 min_ms=6.514068126678467 max_ms=6.620545864105225 tflops=838.7019791536 bw_gbs=204.73623316333453 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1833 sclk_end=2092 causal=True order=blocked9+lead4
+RESULT shape=prod arm=asm stat=median iters=54 latency_ms=5.48473334312439 min_ms=5.429914951324463 max_ms=5.536852836608887 tflops=1002.4606272632249 bw_gbs=244.7114920696265 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1833 sclk_end=2092 causal=True order=blocked9+lead4
+rc=0
