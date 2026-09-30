@@ -9,17 +9,25 @@ from typing import Optional
 import pytest
 import torch
 
+from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
 from primus_turbo.pytorch.core.low_precision import (
     MXFP4_BLOCK_SIZE,
     MXFP8_BLOCK_SIZE,
+    Float8QuantConfig,
+    ScaleDtype,
     ScalingGranularity,
     ScalingRecipe,
     check_mxfp4_support,
     check_mxfp8_support,
     float4_e2m1fn_x2,
     float8_e4m3,
+    float8_e5m2,
 )
-from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
+from primus_turbo.pytorch.core.quantized_tensor import (
+    QuantizedTensor,
+    create_quantized_weight,
+)
+from primus_turbo.pytorch.core.utils import is_gfx950
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     group_offs_from_lens,
 )
@@ -625,3 +633,61 @@ class TestGroupedViewFunc:
         assert viewed._orig_group_offs.data_ptr() == qt._orig_group_offs.data_ptr()
         assert viewed.group_lens.data_ptr() == qt.group_lens.data_ptr()
         assert viewed.group_offs.data_ptr() == qt.group_offs.data_ptr()
+
+
+# =====================================================================
+# K-blocked MXFP8 expert weight (``create_quantized_weight``)
+# =====================================================================
+def _mx_weight_config() -> Float8QuantConfig:
+    return Float8QuantConfig(
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        scale_dtype=ScaleDtype.E8M0,
+        block_size=MXFP8_BLOCK_SIZE,
+    )
+
+
+def _bytes(t: torch.Tensor) -> torch.Tensor:
+    return t.view(torch.uint8)
+
+
+@SKIP_MXFP8
+@pytest.mark.skipif(not is_gfx950(), reason="the K-blocked expert weight is gfx950-only")
+class TestKBlockedExpertWeight:
+    # Rows and columns off the 128 grid take the padded tail of the last K block.
+    @pytest.mark.parametrize("shape", [(4, 1024, 512), (3, 1056, 800), (2, 160, 4160)])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("dest_dtype", [float8_e4m3, float8_e5m2])
+    def test_matches_row_major_pair(self, shape, dtype, dest_dtype):
+        w = torch.randn(shape, dtype=dtype, device=DEVICE)
+        qw, qw_t = create_quantized_weight(
+            w, dest_dtype, _mx_weight_config(), need_weight_transpose_cache=True
+        )
+        ref = _make_quantized_tensor(w, dest_dtype=dest_dtype, use_2d_block=True)
+        ref_t = _make_quantized_tensor(w, dest_dtype=dest_dtype, axis=-2, use_2d_block=True)
+
+        for q, r in ((qw, ref), (qw_t, ref_t)):
+            assert q.k_blocked and not r.k_blocked
+            assert q.shape == r.shape and q.qdata.shape == r.qdata.shape
+            assert q.quantized_axis == r.quantized_axis and q.scaling_recipe == r.scaling_recipe
+            torch.testing.assert_close(_bytes(q.scale_inv), _bytes(r.scale_inv), rtol=0, atol=0)
+            torch.testing.assert_close(_bytes(q._row_major_data()), _bytes(r.qdata), rtol=0, atol=0)
+            assert not torch.equal(_bytes(q.qdata), _bytes(r.qdata))
+            torch.testing.assert_close(q.dequantize(), r.dequantize(), rtol=0, atol=0)
+            assert q.detach().k_blocked
+            torch.testing.assert_close(_bytes(q[1]), _bytes(r[1]), rtol=0, atol=0)
+
+    def test_row_major_without_transpose_cache(self):
+        w = torch.randn(4, 1024, 512, dtype=torch.bfloat16, device=DEVICE)
+        qw, qw_t = create_quantized_weight(w, float8_e4m3, _mx_weight_config())
+        assert qw_t is None and not qw.k_blocked
+
+    def test_row_major_when_backend_forced(self):
+        w = torch.randn(4, 1024, 512, dtype=torch.bfloat16, device=DEVICE)
+        GlobalBackendManager.set_grouped_gemm_backend(BackendType.TRITON)
+        try:
+            qw, qw_t = create_quantized_weight(
+                w, float8_e4m3, _mx_weight_config(), need_weight_transpose_cache=True
+            )
+        finally:
+            GlobalBackendManager.reset()
+        assert not qw.k_blocked and not qw_t.k_blocked

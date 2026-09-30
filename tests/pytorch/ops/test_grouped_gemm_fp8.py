@@ -19,7 +19,11 @@ from primus_turbo.pytorch.core.low_precision import (
     float8_e4m3,
     float8_e5m2,
 )
-from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
+from primus_turbo.pytorch.core.quantized_tensor import (
+    QuantizedTensor,
+    QuantizedTensorPair,
+    create_quantized_weight,
+)
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.ops import grouped_gemm_fp8
 from tests.pytorch.ops.gemm_shapes_helper import (
@@ -720,6 +724,58 @@ def test_grouped_gemm_fp8_mx_blockwise_quantized_tensor(
     )
 
 
+# N and K off the 128 grid put a partial N tile and a padded K block on the K-blocked weight.
+@pytest.mark.parametrize("B, M, N, K", [(4, 256, 1024, 512), (3, 320, 1056, 800), (8, 128, 512, 4096)])
+@pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
+@pytest.mark.parametrize("format", FORMAT_VALUES)
+def test_grouped_gemm_fp8_mx_k_blocked_weight(B, M, N, K, ori_dtype, format):
+    """``create_quantized_weight``'s K-blocked expert weight holds the same values as the
+    row-major pair, so forward and dgrad must match it bit for bit."""
+    if get_device_compute_capability() < (9, 5):
+        pytest.skip("the K-blocked expert weight is gfx950-only")
+    device = "cuda:0"
+    torch.manual_seed(42)
+    config = Float8QuantConfig(
+        format=format,
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        block_size=MXFP8_BLOCK_SIZE,
+        scale_dtype=ScaleDtype.E8M0,
+    )
+    fwd_dtype = _get_fp8_dtype(format, is_fwd=True)
+    group_lens = generate_grouped_gemm_group_lens(B, M, balance=False).to(device)
+    a = torch.randn((B * M, K), dtype=ori_dtype, device=device)
+    b = torch.randn((B, N, K), dtype=ori_dtype, device=device)
+    grad_out = torch.randn((B * M, N), dtype=ori_dtype, device=device)
+
+    qb, qb_t = create_quantized_weight(b, fwd_dtype, config, need_weight_transpose_cache=True)
+    assert qb.k_blocked and qb_t.k_blocked
+    recipe = ScalingRecipe(use_2d_block=True)
+    ref_pair = QuantizedTensorPair(
+        *(
+            QuantizedTensor.quantize(
+                b,
+                fwd_dtype,
+                ScalingGranularity.MX_BLOCKWISE,
+                block_size=MXFP8_BLOCK_SIZE,
+                scaling_recipe=recipe,
+                axis=axis,
+            )
+            for axis in (-1, -2)
+        )
+    )
+
+    results = []
+    for pair in (QuantizedTensorPair(qb, qb_t), ref_pair):
+        a_leaf = a.clone().requires_grad_(True)
+        out = grouped_gemm_fp8(a_leaf, pair, group_lens, trans_b=True, config=config)
+        out.backward(grad_out)
+        results.append((out.detach(), a_leaf.grad))
+    (out, grad_a), (out_ref, grad_a_ref) = results
+    torch.testing.assert_close(out, out_ref, rtol=0, atol=0)
+    torch.testing.assert_close(grad_a, grad_a_ref, rtol=0, atol=0)
+    GlobalBackendManager.reset()
+
+
 @pytest.mark.parametrize("B, M, N, K", GROUPED_GEMM_SHAPES_SMALL)
 @pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
 @pytest.mark.parametrize("format", FORMAT_VALUES)
@@ -1135,9 +1191,8 @@ def _run_grouped_gemm_fp8_fused_grad_accum_test(
     accumulate target instead of returning a gradient for autograd to add on top, so
     the check is that the buffer moved by exactly the wgrad the ordinary path produces.
 
-    ``main_grad_dtype`` is fp32 as Megatron allocates it; the tensorwise FlyDSL accumulate
-    epilogue now writes fp32 natively, so it takes the fp32 main_grad too. (MXFP8 FlyDSL
-    still stores 16-bit and keeps the weight's own dtype.)
+    ``main_grad_dtype`` is fp32 as Megatron allocates it; the tensorwise and MXFP8 FlyDSL
+    accumulate epilogues write fp32 natively, so they take the fp32 main_grad too.
     """
     seed = 42
     torch.manual_seed(seed)
@@ -1255,12 +1310,15 @@ def test_grouped_gemm_fp8_tensorwise_fused_grad_accum(ori_dtype, trans_b, backen
 
 @pytest.mark.parametrize("ori_dtype", ORI_DTYPE_VALUES)
 @pytest.mark.parametrize("backend", [None, BackendType.TRITON, BackendType.FLYDSL])
-def test_grouped_gemm_fp8_mx_fused_grad_accum(ori_dtype, backend):
+@pytest.mark.parametrize("main_grad_fp32", [True, False], ids=["main_grad_fp32", "main_grad_16bit"])
+def test_grouped_gemm_fp8_mx_fused_grad_accum(ori_dtype, backend, main_grad_fp32):
     """MXFP8 grouped GEMM is NT-only, so trans_b is fixed rather than swept."""
     if backend == BackendType.FLYDSL and get_device_compute_capability() < (9, 5):
         pytest.skip("FlyDSL MXFP8 grouped GEMM is gfx950-only")
-    # MXFP8 FlyDSL keeps the weight dtype (fp32 native accumulate is tensorwise-only).
-    main_grad_dtype = ori_dtype if backend == BackendType.FLYDSL else torch.float32
+    if not main_grad_fp32 and backend != BackendType.FLYDSL:
+        pytest.skip("16-bit main_grad accumulate is only exercised on the FlyDSL epilogue")
+    # MXFP8 FlyDSL accumulates into either Megatron's fp32 main_grad or one in the weight dtype.
+    main_grad_dtype = torch.float32 if main_grad_fp32 else ori_dtype
     _run_grouped_gemm_fp8_fused_grad_accum_test(
         B=4,
         M=256,

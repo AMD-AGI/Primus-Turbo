@@ -442,7 +442,8 @@ def _quantize_weight(
     w_t: Optional[QuantizedTensor],
     config: Float8QuantConfig,
 ):
-    """(row-wise, col-wise) MXFP8 operands for one 3D expert weight.
+    """(row-wise, col-wise) MXFP8 operands for one 3D expert weight, then whether each
+    half's data is K-blocked (see ``QuantizedTensor.k_blocked``).
 
     Both halves take the per-32x32 tile scale, which is weight-only; sharing one amax
     across the tile keeps the forward and dgrad operands consistent. A cached ``w_t``
@@ -451,13 +452,17 @@ def _quantize_weight(
     recipe = ScalingRecipe(use_2d_block=True)
     w_dtype = _get_fp8_dtype(config.format, True)
     if not isinstance(w, QuantizedTensor):
-        return quantize_fp8_with_trans(
-            w,
-            w_dtype,
-            ScalingGranularity.MX_BLOCKWISE,
-            block_size=MXFP8_BLOCK_SIZE,
-            scaling_recipe=recipe,
-            scaling_recipe_for_trans=recipe,
+        return (
+            *quantize_fp8_with_trans(
+                w,
+                w_dtype,
+                ScalingGranularity.MX_BLOCKWISE,
+                block_size=MXFP8_BLOCK_SIZE,
+                scaling_recipe=recipe,
+                scaling_recipe_for_trans=recipe,
+            ),
+            False,
+            False,
         )
 
     assert not w._is_grouped_tensor, "an expert weight must not be a grouped tensor"
@@ -473,7 +478,7 @@ def _quantize_weight(
         )
     else:
         assert isinstance(w_t, QuantizedTensor)
-    return w.qdata, w.scale_inv, w_t.qdata, w_t.scale_inv
+    return w.qdata, w.scale_inv, w_t.qdata, w_t.scale_inv, w.k_blocked, w_t.k_blocked
 
 
 class FP8GroupedMLPMXFunc(torch.autograd.Function):
@@ -559,8 +564,12 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
                 assert isinstance(x_t, QuantizedTensor)
             x_col, x_col_scale = x_t.qdata, x_t.scale_inv
 
-        w1_row, w1_row_scale, w1_col, w1_col_scale = _quantize_weight(w1, w1_t, config)
-        w2_row, w2_row_scale, w2_col, w2_col_scale = _quantize_weight(w2, w2_t, config)
+        w1_row, w1_row_scale, w1_col, w1_col_scale, w1_row_kblk, w1_col_kblk = _quantize_weight(
+            w1, w1_t, config
+        )
+        w2_row, w2_row_scale, w2_col, w2_col_scale, w2_row_kblk, w2_col_kblk = _quantize_weight(
+            w2, w2_t, config
+        )
 
         # The activation is quantised inside the epilogue: it feeds nothing but the
         # quantiser, so staging it in out_dtype would be an [M, I] round trip through HBM.
@@ -581,6 +590,7 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
             out_col_scaling_recipe=ScalingRecipe(),
             activation=activation,
             clamp_limit=clamp_limit,
+            b_k_blocked=w1_row_kblk,
         )
 
         # act_row shares x_row's padded rows, so it reads under ``offs_row`` and writes
@@ -599,6 +609,7 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
             num_cu=num_cu,
             default_backend=BackendType.FLYDSL.value,
             group_offs_out=group_offs,
+            b_k_blocked=w2_row_kblk,
         )[:M]
 
         ctx.save_for_backward(
@@ -622,6 +633,8 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
         ctx.num_cu = num_cu
         ctx.fuse_w1_accum = fuse_w1_accum
         ctx.fuse_w2_accum = fuse_w2_accum
+        ctx.w1_col_kblk = w1_col_kblk
+        ctx.w2_col_kblk = w2_col_kblk
         # Off save_for_backward: the wgrad writes these in place, which would bump the
         # version counter saved tensors are checked against.
         ctx.w1_main_grad = w1_main_grad
@@ -706,6 +719,7 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
             out_col_scaling_recipe=ScalingRecipe(),
             activation=ctx.activation,
             clamp_limit=ctx.clamp_limit,
+            b_k_blocked=ctx.w2_col_kblk,
         )
         # grad_x = grad_l1 @ w1_col^T, contracting 2I. grad_l1 reuses gradO's tables --
         # the two have the same M and group_lens.
@@ -723,6 +737,7 @@ class FP8GroupedMLPMXFunc(torch.autograd.Function):
             num_cu=ctx.num_cu,
             default_backend=default_backend,
             group_offs_out=group_offs,
+            b_k_blocked=ctx.w1_col_kblk,
         )[:M]
 
         # grad_w1 = grad_l1_col @ x_col^T, contracting M.
