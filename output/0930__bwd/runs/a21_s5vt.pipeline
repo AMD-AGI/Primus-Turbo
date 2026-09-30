@@ -1,0 +1,28 @@
+[compile s5_vtrim] RC=0
+dkdv         .group_segment_fixed_size: 70656 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     713 .vgpr_spill_count: 0  wmma=128 ds=256 
+dqg          .group_segment_fixed_size: 52224 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     881 .vgpr_spill_count: 0  wmma=192 ds=128 
+[compile s5] RC=0
+dkdv         .group_segment_fixed_size: 70656 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     713 .vgpr_spill_count: 0  wmma=128 ds=256 
+dqg          .group_segment_fixed_size: 52224 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     878 .vgpr_spill_count: 0  wmma=192 ds=128 
+a21_s5vt_valfast rc=0 dmesg_bad=0 kfd=[]
+CORR shape=fast arm=r29 dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=r29 runs=3 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=fast arm=s5_vtrim dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=s5_vtrim runs=3 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=fast arm=s5 dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=s5 runs=3 dkdv=bitwise dq_worst=bitwise  pass
+LABVAL fast PASS
+a21_s5vt_valprod rc=0 dmesg_bad=0 kfd=[]
+CORR shape=prod arm=r29 dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=r29 runs=3 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=prod arm=s5_vtrim dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=s5_vtrim runs=3 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=prod arm=s5 dq  52.56 dB  dk  52.60 dB  dv  52.71 dB  pass
+DET shape=prod arm=s5 runs=3 dkdv=bitwise dq_worst=bitwise  pass
+LABVAL prod PASS
+a21_s5vt_bench rc=0 dmesg_bad=0 kfd=[]
+BENCH r29        6.5823 ms  vs_r29 +0.00%  asm/arm 83.6%
+BENCH s5_vtrim   5.3002 ms  vs_r29 -19.48%  asm/arm 103.8%
+BENCH s5         5.3472 ms  vs_r29 -18.76%  asm/arm 102.9%
+BENCH r29_aa     6.5778 ms  vs_r29 -0.07%  asm/arm 83.6%
+BENCH asm        5.5004 ms  vs_r29 -16.44%  asm/arm 100.0%

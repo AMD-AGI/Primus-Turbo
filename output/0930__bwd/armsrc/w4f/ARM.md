@@ -479,3 +479,88 @@ lines 244-251 and the 192 `buffer_atomic_add_f32` rows.
   - cvt_t is exhaustively a bijection on the small shapes and corner-checked on prod.
 - **F section** prints the footprint table above.
 - The G, A, S, L, I and B sections are as before. Atomic maxima on prod: 134217728 = size.
+
+## 12. Round 4 (r4a / r4b / r4c and combinations, all built on w4f_r3)
+
+**Card result for r3** (as reported by the coordinator):
+
+| | value |
+|---|--:|
+| r3 op time | 6.630 ms |
+| s4 / ASM | 5.516 / 5.485 ms |
+| k_dkdv_w4f cycles (PMC) | 1.142e7, about 2745 cyc/step over 4160 steps per SIMD |
+| ASM main kernel cycles | 7.71e6, about 1853 cyc/step |
+| ATT, CU1 | 20.8 cycles per WMMA, the same as the ASM |
+
+The ATT on CU1 therefore accounts for only about 1660 cyc/step. The rest (about 1.65× instead of the ASM's
+1.12× PMC/ATT ratio) is chip-level: atomic back-pressure (740 cyc/step at issue) and memory-side effects.
+
+**(a) ASM work decomposition.** 4096 WGs = B4 × Hq32 × 32 (near/far kv-block pairs j, 63−j) × 1 q head.
+- Each WG runs exactly 260 steps. That is 16 WGs per CU, perfectly balanced.
+- dK/dV are per q head in the ASM, so the GQA reduction happens outside the WG.
+- Our WG (b, hkv, one 128-kv block, all 4 q heads in-register) has 1–4× longer and unequal jobs.
+- A greedy 256-slot dispatch model (`w4f_r4a/order_model.py`) gives a makespan/average of **1.000** for our
+  current grid, and also 1.000 for near/far pairing. With a per-WG overhead of 10 steps: 1.019 vs 1.010.
+- **So there is no tail/imbalance to recover; pairing is worth ≤ 1%. Not built.**
+
+**What the model does show is locality.**
+- An LRU over the 64 KB dQ blocks (4 heads × 16 KB per (b, hkv, pair)), fed with the dispatch-model event
+  stream, gives these miss rates:
+
+| grid order / sweep | makespan | 8 MB | 16 MB | 32 MB | 64 MB |
+|---|---|--:|--:|--:|--:|
+| current (b, blk, hkv), ascending | 1.000 | 0.76 | 0.75 | 0.70 | 0.03 |
+| **current, descending** | **1.000** | **0.28** | **0.27** | **0.23** | 0.05 |
+| group-major (b, hkv, blk), descending | 1.138 | 0.13 | 0.03 | 0.03 | 0.03 |
+
+- **Why descending helps.** Ascending, WG blk j reaches pair p at 4(p − 4j) steps after its start, so pair p's
+  64 contributions are spread over up to about 1000 steps. Descending, all co-resident blocks of a group reach
+  pair p at the same time (4(255 − p) after they start).
+- The same applies to the Q/dO/LSE TDM reads, which every block of a group repeats.
+- The group-major grid is even better on locality but loses 13.8% on balance, so it is off (`W4_GRPMAJOR`,
+  not used).
+
+**r4a** = r3 + `W4_LOCK` (descending sweep: full pairs first, masked diagonal pairs last; loops swapped).
+- It adds the same contributions and atomics.
+- dK/dV accumulation order is reversed, so dK/dV are deterministic but not bitwise vs s1/r3.
+
+**r4b** = r3 + `W4_SIG_LATE` + `W4_TDM_LSE_LATE`. It targets the ATT's `s_wait_dscnt 0x0` before the signal
+(55 cyc/step) and the idle on the 3rd `tensor_load` (58 cyc/step).
+- **SIG_LATE:** the 18 R1 tr16 loads (a_p kh0 + b_do) are issued right after the P/dS store burst. The signal
+  then waits `s_wait_dscnt 0x12` instead of 0: DS completes in order, so every store and older load has retired.
+- **TDM_LSE_LATE:** the 2 LSE/delta tensor ops of the batch are issued after the dQ WMMAs. The batch and the
+  wait B_s → signal B_{s+1} interval are unchanged, so the ring protocol is unchanged.
+- ISA: `S8 L18 d0x12 t0x4 |sig| L22 … |wait| T2 L48 … T2`.
+
+**r4c** = r3 + `W4_DELTA_ZERO` + `W4_CVT_SRC`.
+- `k_delta_z` writes delta and zeroes the tiled workspace rows it owns: two 16 B stores per thread per row.
+  `impl.py` then uses `torch.empty` and there is no memset.
+- `k_dq_cvt_s` de-swizzles in source order. Each wave reads two whole 512 B slots, and each thread reads 2×16 B
+  and writes 2×8 B.
+- The old cvt_t read half-lines of two different q rows, 64 B apart per warp, so each 128 B line was fetched
+  twice. That is the likely cause of the 0.135 ms (≈ 5.8 TB/s effective).
+- k_dkdv_w4f / _sp ISA is byte-identical to r3 (`cmp`).
+
+**Combinations:** r4ac = r4a + r4c; **r4abc** = all three.
+
+**Compile.** Run from each dir: `./compile_w4f.sh w4f w4f_sp cvt_s cvt_t delta_z delta redsp`. All give RC=0,
+0 spill, 0 scratch, LDS 231424.
+
+| dir | VGPR w4f / sp | hot-loop instr |
+|---|---|--:|
+| r4a | 716 / 696 | 732 |
+| r4b | 704 / 698 | 733 |
+| r4c | 704 / 698 | = r3 |
+| r4ac | 716 / 696 | 732 |
+| r4abc | 716 / 696 | 731 |
+
+Auxiliary kernels: k_delta_z 54 VGPR, k_dq_cvt_s 17 VGPR.
+
+**Proof additions.**
+- r4a: the descending tile map; masked steps are the last `n_mask`.
+- r4b: the ISA check requires exactly 18 tr16 younger than the last P/dS store at the signal, and a
+  `s_wait_dscnt 0x12` after them. The counter simulation checks dscnt ≤ 18 at every signal. Negative control:
+  R1 = 17 fails.
+- r4c: **Z** — the zero stores cover every workspace vec4 exactly once, in bounds. **C** — cvt_s writes every
+  output vec4 exactly once, from the source vec4 that holds exactly that (q, d..d+3). Both are exhaustive on
+  the small shapes and sampled plus corner-checked on prod/proxy.

@@ -1,0 +1,14 @@
+  refcache proxy: IGNORED, provenance differs on ['common_sha'] -- recomputing
+refcache proxy: accepted with common_sha 988c14caed5d9a80
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+CORR shape=proxy arm=dqg_vtrim dq  52.52 dB  dk  52.57 dB  dv  52.67 dB  pass
+DET shape=proxy arm=dqg_vtrim runs=3 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=proxy arm=s5_vtrim dq  52.52 dB  dk  52.57 dB  dv  52.67 dB  pass
+DET shape=proxy arm=s5_vtrim runs=3 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=proxy s5_vtrim vs dqg_vtrim: dq=bitwise dk=bitwise dv=bitwise
+CORR shape=proxy arm=s5 dq  52.52 dB  dk  52.57 dB  dv  52.67 dB  pass
+DET shape=proxy arm=s5 runs=3 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=proxy s5 vs dqg_vtrim: dq=81.0dB dk=bitwise dv=bitwise
+LABVAL proxy PASS
+rc=0
