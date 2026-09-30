@@ -79,6 +79,7 @@ def _wave_sum_f32(value):
 
 
 def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float):
+    total_rows = S * B
     packed_heads = NG * (NPG + 2)
     q_heads = NG * NPG
     qk_heads = NG * (NPG + 1)
@@ -130,13 +131,23 @@ def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float):
             gamma = fx.Float32(
                 buffer_ops.buffer_load(kg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
             )
-        q_head = group * fx.Int32(NPG) + local
+        token = cycle
+        while token < fx.Int32(total_rows):
+            src = (token * fx.Int32(packed_heads) + slot) * fx.Int32(_D) + lane
+            x = fx.Float32(
+                buffer_ops.buffer_load(packed_rsrc, src, vec_width=1, dtype=fx.T.bf16())
+            )
 
-        # All B token rows at one sequence position share the same rotary
-        # values.  Process them together so each wave loads cos/sin once per
-        # sequence instead of once per batch element.
-        seq = cycle
-        while seq < fx.Int32(S):
+            sumsq = _wave_sum_f32(x * x)
+            mean = sumsq / fx.Float32(float(_D))
+            rstd = fx.Float32(fmath.rsqrt(mean + fx.Float32(eps)))
+
+            # Match the existing two-kernel contract: RMSNorm writes BF16,
+            # then RoPE reads BF16 and promotes it for the rotation math.
+            norm = (x * rstd * gamma).to(fx.BFloat16).to(fx.Float32)
+            pair = fx.arith.ArithValue(norm).shuffle_xor(_HALF, _WARP)
+
+            seq = token // fx.Int32(B)
             cosine = fx.Float32(
                 buffer_ops.buffer_load(
                     cosine_rsrc, seq * fx.Int32(_D) + lane, vec_width=1, dtype=fx.T.f32()
@@ -147,43 +158,29 @@ def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float):
                     sine_rsrc, seq * fx.Int32(_D) + lane, vec_width=1, dtype=fx.T.f32()
                 )
             )
-            for batch_idx in range(B):
-                token = seq * fx.Int32(B) + fx.Int32(batch_idx)
-                src = (token * fx.Int32(packed_heads) + slot) * fx.Int32(_D) + lane
-                x = fx.Float32(
-                    buffer_ops.buffer_load(packed_rsrc, src, vec_width=1, dtype=fx.T.bf16())
-                )
+            low = norm * cosine - fx.Float32(pair) * sine
+            high = norm * cosine + fx.Float32(pair) * sine
+            rotated = fx.BFloat16(
+                fx.arith.select(lane < fx.Int32(_HALF), low, high)
+            )
 
-                sumsq = _wave_sum_f32(x * x)
-                mean = sumsq / fx.Float32(float(_D))
-                rstd = fx.Float32(fmath.rsqrt(mean + fx.Float32(eps)))
+            if is_q:
+                q_head = group * fx.Int32(NPG) + local
+                dst = (token * fx.Int32(q_heads) + q_head) * fx.Int32(_D) + lane
+                buffer_ops.buffer_store(rotated, qout_rsrc, dst)
+                if lane == fx.Int32(0):
+                    buffer_ops.buffer_store(
+                        rstd, qrstd_rsrc, token * fx.Int32(q_heads) + q_head
+                    )
+            else:
+                dst = (token * fx.Int32(NG) + group) * fx.Int32(_D) + lane
+                buffer_ops.buffer_store(rotated, kout_rsrc, dst)
+                if lane == fx.Int32(0):
+                    buffer_ops.buffer_store(
+                        rstd, krstd_rsrc, token * fx.Int32(NG) + group
+                    )
 
-                # Match the existing two-kernel contract: RMSNorm writes BF16,
-                # then RoPE reads BF16 and promotes it for the rotation math.
-                norm = (x * rstd * gamma).to(fx.BFloat16).to(fx.Float32)
-                pair = fx.arith.ArithValue(norm).shuffle_xor(_HALF, _WARP)
-                low = norm * cosine - fx.Float32(pair) * sine
-                high = norm * cosine + fx.Float32(pair) * sine
-                rotated = fx.BFloat16(
-                    fx.arith.select(lane < fx.Int32(_HALF), low, high)
-                )
-
-                if is_q:
-                    dst = (token * fx.Int32(q_heads) + q_head) * fx.Int32(_D) + lane
-                    buffer_ops.buffer_store(rotated, qout_rsrc, dst)
-                    if lane == fx.Int32(0):
-                        buffer_ops.buffer_store(
-                            rstd, qrstd_rsrc, token * fx.Int32(q_heads) + q_head
-                        )
-                else:
-                    dst = (token * fx.Int32(NG) + group) * fx.Int32(_D) + lane
-                    buffer_ops.buffer_store(rotated, kout_rsrc, dst)
-                    if lane == fx.Int32(0):
-                        buffer_ops.buffer_store(
-                            rstd, krstd_rsrc, token * fx.Int32(NG) + group
-                        )
-
-            seq = seq + fx.Int32(_FWD_GRID_CYCLES)
+            token = token + fx.Int32(_FWD_GRID_CYCLES)
 
     return kernel
 
