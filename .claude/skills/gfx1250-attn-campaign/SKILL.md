@@ -43,6 +43,14 @@ FLOP from `op-evolve/tools/op_flops.py`: fwd 2.199292e12, bwd 5.498229e12. One g
 
 ## 3. Current state and next step
 
+- **2026-09-30 (afternoon): bwd hand campaign on A0 reached ASM parity.** Work dir `output/0930__bwd/` (PLAN.md, PROGRESS.md = per-arm
+  table, `armsrc/` = source of every arm, `tools/{run.sh,arm.sh,abl.sh,compile.sh,toycheck.py,attsum.py}`). Champion **s4 = 5.532 ms vs ASM
+  5.517 (99.7%), r29 6.590**, bitwise vs r29. Levers: k_dkdv Q/dO through a 3-stage **TDM LDS ring with the next iteration's B operands read
+  back into carried VGPRs** (dkdv_tdm3, -11%), divide-free counters, VALU/v_nop trim; k_dqg tailpf + soffset; k_dqg on a side stream.
+  **ATT now works** (P1-RESULTS.md) and drove every lever. Ablation A2 (Q/dO operands already in VGPRs) predicted the TDM win; abl_l2
+  showed L2 bandwidth is not the limit. Fused 5-GEMM 4-wave kernel `w4f` (split barriers, fp32 dQ atomics) is correct on card; without
+  atomics it runs **4.24 ms (23% faster than ASM)**, with atomics 9.53 ms (LSE/delta loads queued behind atomics + chip-wide atomic
+  throughput) -> next: LSE/delta via TDM, XCD-local grid. s4 PMC: k_dkdv 4.66e6 + k_dqg 3.07e6 cycles (concurrent) = ASM's 7.71e6; power-limited.
 - **2026-09-30: roofline measured on A0** (`output/0930__roofline/REPORT.md`). W = 8 cycles per bf16 WMMA (2048 FLOP/SIMD-cycle);
   LDS 256 B/clk/CU per 64 KB segment (512 across two); a WMMA->ds_load->WMMA switch costs ~29 cycles per wave (hidden only by a
   second wave on the SIMD); per WMMA ~4 VALU / ~2 v_exp co-issue free; HBM ~18.5 TB/s; dense WMMA runs at ~1.7 GHz (power).
