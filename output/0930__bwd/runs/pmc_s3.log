@@ -1,0 +1,76 @@
+W0930 09:09:54.519284  171567 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.102847 sec
+W0930 09:09:54.519528  171567 simple_timer.cpp:55] [rocprofv3] '/opt/venv/bin/python3 benchmark.py --arm-path s3=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/s3 --shapes prod --iters 11 --warmup-seconds 0 --block 3 --lead 1' ::     0.000000 sec
+W0930 09:09:55.662530  171567 tool.cpp:3082] HSA version 1.21.0 initialized (instance=0)
+W0930 09:09:56.648212  171895 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.101957 sec
+W0930 09:09:56.648482  171895 simple_timer.cpp:55] [rocprofv3] '/opt/venv/bin/python /opt/venv/bin/hipconfig --version' ::     0.000000 sec
+W0930 09:09:56.806548  171895 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.103002 sec
+W0930 09:09:56.806808  171895 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/bin/hipconfig --version' ::     0.000000 sec
+W0930 09:09:56.954593  171900 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.102520 sec
+W0930 09:09:56.954995  171900 simple_timer.cpp:55] [rocprofv3] 'sh -c -- /opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/clang++ --version' ::     0.000000 sec
+W0930 09:09:57.100810  171903 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.101958 sec
+W0930 09:09:57.101011  171903 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/clang++ --version' ::     0.000000 sec
+W0930 09:09:57.242612  171903 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.102199 sec
+W0930 09:09:57.242846  171903 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/clang++ --version' ::     0.000000 sec
+W0930 09:09:57.392554  171903 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.106283 sec
+W0930 09:09:57.392815  171903 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/clang++ --version' ::     0.000000 sec
+W0930 09:09:57.393604  171903 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/clang++ --version' ::     0.000789 sec
+W0930 09:09:57.395106  171903 simple_timer.cpp:55] [rocprofv3] output generation ::     0.001405 sec
+W0930 09:09:57.395166  171903 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.001466 sec
+W0930 09:09:57.411801  171895 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/bin/hipconfig --version' ::     0.604992 sec
+W0930 09:09:57.413534  171895 simple_timer.cpp:55] [rocprofv3] output generation ::     0.001604 sec
+W0930 09:09:57.413602  171895 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.001674 sec
+W0930 09:09:57.940106  171918 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.103768 sec
+W0930 09:09:57.940326  171918 simple_timer.cpp:55] [rocprofv3] '/bin/sh -c cat /proc/sys/kernel/numa_balancing' ::     0.000000 sec
+W0930 09:09:58.092109  171921 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.107087 sec
+W0930 09:09:58.092342  171921 simple_timer.cpp:55] [rocprofv3] 'cat /proc/sys/kernel/numa_balancing' ::     0.000000 sec
+W0930 09:09:58.092426  171921 simple_timer.cpp:55] [rocprofv3] 'cat /proc/sys/kernel/numa_balancing' ::     0.000084 sec
+W0930 09:09:58.094038  171921 simple_timer.cpp:55] [rocprofv3] output generation ::     0.001493 sec
+W0930 09:09:58.094099  171921 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.001555 sec
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+W0930 09:09:58.645920  171932 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.101393 sec
+W0930 09:09:58.646124  171932 simple_timer.cpp:55] [rocprofv3] '/bin/sh /sbin/ldconfig -p' ::     0.000000 sec
+W0930 09:09:59.931711  171942 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.107935 sec
+W0930 09:09:59.931962  171942 simple_timer.cpp:55] [rocprofv3] '/bin/bash /opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/llvm/bin/ld.lld -shared /tmp/kernel5e-c23dbe.o -o /tmp/kernel-5cd9a3.hsaco' ::     0.000000 sec
+W0930 09:10:00.114305  171942 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.103603 sec
+W0930 09:10:00.114548  171942 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/ld.lld -shared /tmp/kernel5e-c23dbe.o -o /tmp/kernel-5cd9a3.hsaco' ::     0.000000 sec
+W0930 09:10:00.260828  171942 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.106959 sec
+W0930 09:10:00.261057  171942 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/ld.lld -shared /tmp/kernel5e-c23dbe.o -o /tmp/kernel-5cd9a3.hsaco' ::     0.000000 sec
+W0930 09:10:00.441425  171966 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.107392 sec
+W0930 09:10:00.441637  171966 simple_timer.cpp:55] [rocprofv3] '/bin/bash /opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/llvm/bin/ld.lld -shared /tmp/kernelcd-27d999.o -o /tmp/kernel-771b05.hsaco' ::     0.000000 sec
+W0930 09:10:00.623178  171966 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.104389 sec
+W0930 09:10:00.623379  171966 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/ld.lld -shared /tmp/kernelcd-27d999.o -o /tmp/kernel-771b05.hsaco' ::     0.000000 sec
+W0930 09:10:00.762754  171966 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.100428 sec
+W0930 09:10:00.762969  171966 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/ld.lld -shared /tmp/kernelcd-27d999.o -o /tmp/kernel-771b05.hsaco' ::     0.000000 sec
+W0930 09:10:02.358136  171990 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.104412 sec
+W0930 09:10:02.358378  171990 simple_timer.cpp:55] [rocprofv3] '/bin/bash /opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/llvm/bin/ld.lld -shared /tmp/kernelae-bfd720.o -o /tmp/kernel-4de99b.hsaco' ::     0.000000 sec
+W0930 09:10:02.538420  171990 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.101479 sec
+W0930 09:10:02.538633  171990 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/ld.lld -shared /tmp/kernelae-bfd720.o -o /tmp/kernel-4de99b.hsaco' ::     0.000000 sec
+W0930 09:10:02.679663  171990 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.101214 sec
+W0930 09:10:02.679902  171990 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/ld.lld -shared /tmp/kernelae-bfd720.o -o /tmp/kernel-4de99b.hsaco' ::     0.000000 sec
+W0930 09:10:03.039664  172014 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.105919 sec
+W0930 09:10:03.039859  172014 simple_timer.cpp:55] [rocprofv3] '/bin/bash /opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/llvm/bin/ld.lld -shared /tmp/kernel33-ef006e.o -o /tmp/kernel-9f7078.hsaco' ::     0.000000 sec
+W0930 09:10:03.203593  172014 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.102729 sec
+W0930 09:10:03.203775  172014 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/ld.lld -shared /tmp/kernel33-ef006e.o -o /tmp/kernel-9f7078.hsaco' ::     0.000000 sec
+W0930 09:10:03.347404  172014 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.103786 sec
+W0930 09:10:03.347629  172014 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/ld.lld -shared /tmp/kernel33-ef006e.o -o /tmp/kernel-9f7078.hsaco' ::     0.000000 sec
+W0930 09:10:06.356735  172038 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.103245 sec
+W0930 09:10:06.356991  172038 simple_timer.cpp:55] [rocprofv3] '/bin/bash /opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/llvm/bin/ld.lld -shared /tmp/kernelb7-d66853.o -o /tmp/kernel-f73341.hsaco' ::     0.000000 sec
+W0930 09:10:06.539865  172038 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.102545 sec
+W0930 09:10:06.540082  172038 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/ld.lld -shared /tmp/kernelb7-d66853.o -o /tmp/kernel-f73341.hsaco' ::     0.000000 sec
+W0930 09:10:06.696551  172038 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.108603 sec
+W0930 09:10:06.696871  172038 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/ld.lld -shared /tmp/kernelb7-d66853.o -o /tmp/kernel-f73341.hsaco' ::     0.000000 sec
+W0930 09:10:07.197549  172062 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.102192 sec
+W0930 09:10:07.197746  172062 simple_timer.cpp:55] [rocprofv3] '/bin/bash /opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/llvm/bin/ld.lld -shared /tmp/kerneldd-c00af1.o -o /tmp/kernel-a5f456.hsaco' ::     0.000000 sec
+W0930 09:10:07.377407  172062 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.104773 sec
+W0930 09:10:07.377615  172062 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/ld.lld -shared /tmp/kerneldd-c00af1.o -o /tmp/kernel-a5f456.hsaco' ::     0.000000 sec
+W0930 09:10:07.528229  172062 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.107606 sec
+W0930 09:10:07.528493  172062 simple_timer.cpp:55] [rocprofv3] '/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/llvm/bin/ld.lld -shared /tmp/kerneldd-c00af1.o -o /tmp/kernel-a5f456.hsaco' ::     0.000000 sec
+# arm s3 -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/s3 md5=a3fb836d
+# statistic median  iters 11  warmup 0.0s continuous  order blocked 3+lead 1, palindromic rounds  device gfx1250
+RESULT shape=prod arm=s3 stat=median iters=12 latency_ms=5.880096673965454 min_ms=5.8100690841674805 max_ms=6.416049957275391 tflops=935.0576244543394 bw_gbs=228.25768935782727 flop=5498229227520.0 bytes_min=1342177280 sclk_start=2353 sclk_end=2350 causal=True order=blocked3+lead1
+E0930 09:10:09.171815  171567 output_stream.cpp:111] Opened result file: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/probe/pmc_s3/pmc_counter_collection.csv
+E0930 09:10:09.175562  171567 output_stream.cpp:111] Opened result file: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/probe/pmc_s3/pmc_agent_info.csv
+W0930 09:10:09.176751  171567 simple_timer.cpp:55] [rocprofv3] output generation ::     0.016280 sec
+W0930 09:10:09.177261  171567 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.016795 sec
+rc=0
