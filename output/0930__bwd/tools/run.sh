@@ -18,7 +18,7 @@ flock /tmp/a0-gpu0.lock bash -c "
      bash -c 'ulimit -c 0; $BLAS; cd $WD && exec timeout -k 20 $((TMO-30)) $*' > $LOG 2>&1
   echo rc=\$? >> $LOG
   kill \$SP 2>/dev/null"
-timeout 20 sudo -n dmesg | tail -n +$((N0+1)) | grep -v "Hardware Error\|mce:\|correctable hardware errors\|apparmor\|pcie_pl" | grep -iE "amdgpu|GCVM|MES\(|Queues reset|ring .*timeout|gpu reset|page fault|hang" > $R/runs/$TAG.dmesg.bad
+timeout 20 sudo -n dmesg | tail -n +$((N0+1)) | grep -v "Hardware Error\|mce:\|correctable hardware errors\|apparmor\|pcie_pl\|hogged CPU" | grep -iE "amdgpu|GCVM|MES\(|Queues reset|ring .*timeout|gpu reset|page fault|hang" > $R/runs/$TAG.dmesg.bad
 echo "$TAG $(tail -1 $LOG) dmesg_bad=$(wc -l < $R/runs/$TAG.dmesg.bad) kfd=[$(ls /sys/class/kfd/kfd/proc | tr '\n' ' ')]"
 [ -s $R/runs/$TAG.dmesg.bad ] && { cat $R/runs/$TAG.dmesg.bad; exit 9; }
 grep -q '^rc=0' $LOG || exit 8

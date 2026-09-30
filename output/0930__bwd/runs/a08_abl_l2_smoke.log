@@ -1,0 +1,6 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm abl_l2 -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_l2 md5=380e140b
+# statistic median  iters 3  warmup 0.0s continuous  order palindromic  device gfx1250
+RESULT shape=fast arm=abl_l2 stat=median iters=3 latency_ms=0.23096400499343872 min_ms=0.20252400636672974 max_ms=0.4330970048904419 tflops=23.26748707077826 bw_gbs=45.39997477225026 flop=5373952000.0 bytes_min=10485760 sclk_start=2354 sclk_end=2354 causal=True order=interleaved
+rc=0

@@ -4,7 +4,7 @@
 set -u
 T=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/tools
 A=$(readlink -f "$1"); shift
-rm -rf "$A/.dump"; mkdir -p "$A/.dump"
+timeout 60 docker exec fa-repro rm -rf "$A/.dump" 2>/dev/null; rm -rf "$A/.dump" 2>/dev/null; mkdir -p "$A/.dump"
 timeout 1800 docker exec -e COMPILE_ONLY=1 -e ARCH=gfx1250 -e FLYDSL_GPU_ARCH=gfx1250 -e HIP_VISIBLE_DEVICES=-1 \
   -e FLYDSL_RUNTIME_ENABLE_CACHE=0 -e FLYDSL_RUNTIME_CACHE_DIR=/tmp/flycache_c_$(basename $A)_$$ -e FLYDSL_DUMP_IR=1 \
   -e FLYDSL_DUMP_DIR=$A/.dump -e PYTHONDONTWRITEBYTECODE=1 fa-repro \

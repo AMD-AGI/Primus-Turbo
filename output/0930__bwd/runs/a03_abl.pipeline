@@ -1,0 +1,157 @@
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dqg/k_dqg_0/19_gpu_module_to_binary.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dqg/k_dqg_0/11_rocdl_attach_target.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dqg/k_dqg_0/17_convert_func_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dqg/k_dqg_0/15_convert_vector_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dqg/k_dqg_0/14_gpu_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dqg/k_dqg_0/21_final_isa.s': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dqg/k_dqg_0/18_reconcile_unrealized_casts.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dqg/k_dqg_0/13_convert_cf_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dqg/k_dqg_0/04_fly_int_swizzle_simplify.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dqg/k_dqg_0/12_convert_scf_to_cf.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dqg/k_dqg_0/06_fly_convert_atom_call_to_ssa_form.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dqg/k_dqg_0/00_origin.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dqg/k_dqg_0/08_convert_fly_to_rocdl.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dqg/k_dqg_0/02_fly_canonicalize.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dqg/k_dqg_0/16_convert_arith_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dqg/k_dqg_0/07_fly_promote_regmem_to_vectorssa.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dqg/k_dqg_0/09_canonicalize.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dqg/k_dqg_0/20_llvm_ir.ll': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dqg/k_dqg_0/10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dqg/k_dqg_0/01_fly_rewrite_func_signature.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dqg/k_dqg_0/05_canonicalize.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dqg/k_dqg_0/03_fly_layout_lowering.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dkdv/k_dkdv_0/19_gpu_module_to_binary.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dkdv/k_dkdv_0/11_rocdl_attach_target.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dkdv/k_dkdv_0/17_convert_func_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dkdv/k_dkdv_0/15_convert_vector_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dkdv/k_dkdv_0/14_gpu_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dkdv/k_dkdv_0/21_final_isa.s': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dkdv/k_dkdv_0/18_reconcile_unrealized_casts.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dkdv/k_dkdv_0/13_convert_cf_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dkdv/k_dkdv_0/04_fly_int_swizzle_simplify.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dkdv/k_dkdv_0/12_convert_scf_to_cf.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dkdv/k_dkdv_0/06_fly_convert_atom_call_to_ssa_form.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dkdv/k_dkdv_0/00_origin.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dkdv/k_dkdv_0/08_convert_fly_to_rocdl.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dkdv/k_dkdv_0/02_fly_canonicalize.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dkdv/k_dkdv_0/16_convert_arith_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dkdv/k_dkdv_0/07_fly_promote_regmem_to_vectorssa.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dkdv/k_dkdv_0/09_canonicalize.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dkdv/k_dkdv_0/20_llvm_ir.ll': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dkdv/k_dkdv_0/10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dkdv/k_dkdv_0/01_fly_rewrite_func_signature.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dkdv/k_dkdv_0/05_canonicalize.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a1/.dump/dkdv/k_dkdv_0/03_fly_layout_lowering.mlir': Permission denied
+[compile abl_a1] RC=0
+dkdv         .group_segment_fixed_size: 70656 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     735 .vgpr_spill_count: 0  wmma=128 ds=192 
+dqg          .group_segment_fixed_size: 8704 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     991 .vgpr_spill_count: 0  wmma=288 ds=96 
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a2/.dump/dkdv/k_dkdv_0/19_gpu_module_to_binary.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a2/.dump/dkdv/k_dkdv_0/11_rocdl_attach_target.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a2/.dump/dkdv/k_dkdv_0/17_convert_func_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a2/.dump/dkdv/k_dkdv_0/15_convert_vector_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a2/.dump/dkdv/k_dkdv_0/14_gpu_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a2/.dump/dkdv/k_dkdv_0/21_final_isa.s': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a2/.dump/dkdv/k_dkdv_0/18_reconcile_unrealized_casts.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a2/.dump/dkdv/k_dkdv_0/13_convert_cf_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a2/.dump/dkdv/k_dkdv_0/04_fly_int_swizzle_simplify.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a2/.dump/dkdv/k_dkdv_0/12_convert_scf_to_cf.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a2/.dump/dkdv/k_dkdv_0/06_fly_convert_atom_call_to_ssa_form.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a2/.dump/dkdv/k_dkdv_0/00_origin.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a2/.dump/dkdv/k_dkdv_0/08_convert_fly_to_rocdl.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a2/.dump/dkdv/k_dkdv_0/02_fly_canonicalize.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a2/.dump/dkdv/k_dkdv_0/16_convert_arith_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a2/.dump/dkdv/k_dkdv_0/07_fly_promote_regmem_to_vectorssa.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a2/.dump/dkdv/k_dkdv_0/09_canonicalize.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a2/.dump/dkdv/k_dkdv_0/20_llvm_ir.ll': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a2/.dump/dkdv/k_dkdv_0/10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a2/.dump/dkdv/k_dkdv_0/01_fly_rewrite_func_signature.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a2/.dump/dkdv/k_dkdv_0/05_canonicalize.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a2/.dump/dkdv/k_dkdv_0/03_fly_layout_lowering.mlir': Permission denied
+[compile abl_a2] RC=0
+dkdv         .group_segment_fixed_size: 70656 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     712 .vgpr_spill_count: 0  wmma=128 ds=224 
+dqg          .group_segment_fixed_size: 8704 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     991 .vgpr_spill_count: 0  wmma=288 ds=96 
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a3/.dump/dkdv/k_dkdv_0/19_gpu_module_to_binary.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a3/.dump/dkdv/k_dkdv_0/11_rocdl_attach_target.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a3/.dump/dkdv/k_dkdv_0/17_convert_func_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a3/.dump/dkdv/k_dkdv_0/15_convert_vector_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a3/.dump/dkdv/k_dkdv_0/14_gpu_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a3/.dump/dkdv/k_dkdv_0/21_final_isa.s': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a3/.dump/dkdv/k_dkdv_0/18_reconcile_unrealized_casts.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a3/.dump/dkdv/k_dkdv_0/13_convert_cf_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a3/.dump/dkdv/k_dkdv_0/04_fly_int_swizzle_simplify.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a3/.dump/dkdv/k_dkdv_0/12_convert_scf_to_cf.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a3/.dump/dkdv/k_dkdv_0/06_fly_convert_atom_call_to_ssa_form.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a3/.dump/dkdv/k_dkdv_0/00_origin.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a3/.dump/dkdv/k_dkdv_0/08_convert_fly_to_rocdl.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a3/.dump/dkdv/k_dkdv_0/02_fly_canonicalize.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a3/.dump/dkdv/k_dkdv_0/16_convert_arith_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a3/.dump/dkdv/k_dkdv_0/07_fly_promote_regmem_to_vectorssa.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a3/.dump/dkdv/k_dkdv_0/09_canonicalize.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a3/.dump/dkdv/k_dkdv_0/20_llvm_ir.ll': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a3/.dump/dkdv/k_dkdv_0/10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a3/.dump/dkdv/k_dkdv_0/01_fly_rewrite_func_signature.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a3/.dump/dkdv/k_dkdv_0/05_canonicalize.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a3/.dump/dkdv/k_dkdv_0/03_fly_layout_lowering.mlir': Permission denied
+[compile abl_a3] RC=0
+dkdv         .group_segment_fixed_size: 70656 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     734 .vgpr_spill_count: 0  wmma=128 ds=224 
+dqg          .group_segment_fixed_size: 8704 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     991 .vgpr_spill_count: 0  wmma=288 ds=96 
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a4/.dump/dqg/k_dqg_0/19_gpu_module_to_binary.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a4/.dump/dqg/k_dqg_0/11_rocdl_attach_target.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a4/.dump/dqg/k_dqg_0/17_convert_func_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a4/.dump/dqg/k_dqg_0/15_convert_vector_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a4/.dump/dqg/k_dqg_0/14_gpu_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a4/.dump/dqg/k_dqg_0/21_final_isa.s': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a4/.dump/dqg/k_dqg_0/18_reconcile_unrealized_casts.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a4/.dump/dqg/k_dqg_0/13_convert_cf_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a4/.dump/dqg/k_dqg_0/04_fly_int_swizzle_simplify.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a4/.dump/dqg/k_dqg_0/12_convert_scf_to_cf.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a4/.dump/dqg/k_dqg_0/06_fly_convert_atom_call_to_ssa_form.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a4/.dump/dqg/k_dqg_0/00_origin.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a4/.dump/dqg/k_dqg_0/08_convert_fly_to_rocdl.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a4/.dump/dqg/k_dqg_0/02_fly_canonicalize.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a4/.dump/dqg/k_dqg_0/16_convert_arith_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a4/.dump/dqg/k_dqg_0/07_fly_promote_regmem_to_vectorssa.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a4/.dump/dqg/k_dqg_0/09_canonicalize.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a4/.dump/dqg/k_dqg_0/20_llvm_ir.ll': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a4/.dump/dqg/k_dqg_0/10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a4/.dump/dqg/k_dqg_0/01_fly_rewrite_func_signature.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a4/.dump/dqg/k_dqg_0/05_canonicalize.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a4/.dump/dqg/k_dqg_0/03_fly_layout_lowering.mlir': Permission denied
+[compile abl_a4] RC=0
+dkdv         .group_segment_fixed_size: 70656 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     729 .vgpr_spill_count: 0  wmma=128 ds=224 
+dqg          .group_segment_fixed_size: 8704 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     806 .vgpr_spill_count: 0  wmma=288 ds=96 
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a5/.dump/dkdv/k_dkdv_0/19_gpu_module_to_binary.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a5/.dump/dkdv/k_dkdv_0/11_rocdl_attach_target.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a5/.dump/dkdv/k_dkdv_0/17_convert_func_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a5/.dump/dkdv/k_dkdv_0/15_convert_vector_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a5/.dump/dkdv/k_dkdv_0/14_gpu_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a5/.dump/dkdv/k_dkdv_0/21_final_isa.s': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a5/.dump/dkdv/k_dkdv_0/18_reconcile_unrealized_casts.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a5/.dump/dkdv/k_dkdv_0/13_convert_cf_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a5/.dump/dkdv/k_dkdv_0/04_fly_int_swizzle_simplify.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a5/.dump/dkdv/k_dkdv_0/12_convert_scf_to_cf.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a5/.dump/dkdv/k_dkdv_0/06_fly_convert_atom_call_to_ssa_form.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a5/.dump/dkdv/k_dkdv_0/00_origin.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a5/.dump/dkdv/k_dkdv_0/08_convert_fly_to_rocdl.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a5/.dump/dkdv/k_dkdv_0/02_fly_canonicalize.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a5/.dump/dkdv/k_dkdv_0/16_convert_arith_to_llvm.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a5/.dump/dkdv/k_dkdv_0/07_fly_promote_regmem_to_vectorssa.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a5/.dump/dkdv/k_dkdv_0/09_canonicalize.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a5/.dump/dkdv/k_dkdv_0/20_llvm_ir.ll': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a5/.dump/dkdv/k_dkdv_0/10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a5/.dump/dkdv/k_dkdv_0/01_fly_rewrite_func_signature.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a5/.dump/dkdv/k_dkdv_0/05_canonicalize.mlir': Permission denied
+rm: cannot remove '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/abl_a5/.dump/dkdv/k_dkdv_0/03_fly_layout_lowering.mlir': Permission denied
+[compile abl_a5] RC=0
+dkdv         .group_segment_fixed_size: 70656 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     761 .vgpr_spill_count: 0  wmma=160 ds=224 
+dqg          .group_segment_fixed_size: 8704 .private_segment_fixed_size: 0 .sgpr_spill_count: 0 .vgpr_count:     991 .vgpr_spill_count: 0  wmma=288 ds=96 
+a03_abl_smoke rc=0 dmesg_bad=0 kfd=[]
+a03_abl_bench rc=0 dmesg_bad=0 kfd=[]
+BENCH r29        6.5888 ms  vs_r29 +0.00%  asm/arm 83.4%
+BENCH abl_a1     6.4968 ms  vs_r29 -1.40%  asm/arm 84.6%
+BENCH abl_a2     5.3697 ms  vs_r29 -18.50%  asm/arm 102.3%
+BENCH abl_a3     6.4579 ms  vs_r29 -1.99%  asm/arm 85.1%
+BENCH abl_a4     6.4784 ms  vs_r29 -1.68%  asm/arm 84.8%
+BENCH abl_a5     6.8514 ms  vs_r29 +3.98%  asm/arm 80.2%
+BENCH r29_aa     6.5814 ms  vs_r29 -0.11%  asm/arm 83.5%
+BENCH asm        5.4945 ms  vs_r29 -16.61%  asm/arm 100.0%

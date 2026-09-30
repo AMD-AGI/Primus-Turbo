@@ -1,0 +1,18 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm r29 -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/r29 md5=c6b95c2c
+# arm dqg_tailpf -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/dqg_tailpf md5=4ee6d47d
+# arm mem_soffset_q -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/mem_soffset_q md5=5fec0fc2
+# arm dqg_dkdv_streams -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/dqg_dkdv_streams md5=0c10c218
+# arm dkdv_flip -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/dkdv_flip md5=ca1833bf
+# arm r29_aa -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/r29_aa md5=c6b95c2c
+# arm asm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/bwd/oe/artifacts/job/job_context/op/beat md5=2802a918
+# statistic median  iters 51  warmup 3.0s continuous  order blocked 9+lead 4, palindromic rounds  device gfx1250
+RESULT shape=prod arm=r29 stat=median iters=54 latency_ms=6.602193117141724 min_ms=6.512279033660889 max_ms=6.70212984085083 tflops=832.7883068498214 bw_gbs=203.29264173070214 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1922 sclk_end=2072 causal=True order=blocked9+lead4
+RESULT shape=prod arm=dqg_tailpf stat=median iters=54 latency_ms=6.382190942764282 min_ms=6.302145957946777 max_ms=6.485490798950195 tflops=861.4955705381299 bw_gbs=210.30039559090196 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1922 sclk_end=2072 causal=True order=blocked9+lead4
+RESULT shape=prod arm=mem_soffset_q stat=median iters=54 latency_ms=6.55929160118103 min_ms=6.48947286605835 max_ms=6.645251750946045 tflops=838.2352183473622 bw_gbs=204.62229179723232 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1922 sclk_end=2072 causal=True order=blocked9+lead4
+RESULT shape=prod arm=dqg_dkdv_streams stat=median iters=54 latency_ms=6.543179035186768 min_ms=6.501821994781494 max_ms=6.604098796844482 tflops=840.2993709865773 bw_gbs=205.1261738036317 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1922 sclk_end=2072 causal=True order=blocked9+lead4
+RESULT shape=prod arm=dkdv_flip stat=median iters=54 latency_ms=6.5720534324646 min_ms=6.5286478996276855 max_ms=6.66788387298584 tflops=836.607505404608 bw_gbs=204.22494944577272 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1922 sclk_end=2072 causal=True order=blocked9+lead4
+RESULT shape=prod arm=r29_aa stat=median iters=54 latency_ms=6.596452951431274 min_ms=6.522742748260498 max_ms=6.64293909072876 tflops=833.5129906940388 bw_gbs=203.4695449027313 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1922 sclk_end=2072 causal=True order=blocked9+lead4
+RESULT shape=prod arm=asm stat=median iters=54 latency_ms=5.503185987472534 min_ms=5.416757106781006 max_ms=5.56028413772583 tflops=999.0992926708605 bw_gbs=243.89095390476274 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1922 sclk_end=2072 causal=True order=blocked9+lead4
+rc=0

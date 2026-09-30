@@ -1,0 +1,53 @@
+[
+  {
+    "shape": "prod",
+    "arm": "asm",
+    "stat": "median",
+    "iters": 54,
+    "latency_ms": 5.483050584793091,
+    "min_ms": 5.426417827606201,
+    "max_ms": 5.536733150482178,
+    "tflops": 1002.7682842775529,
+    "bw_gbs": 244.78659447761572,
+    "flop": 5498229227520.0,
+    "bytes_min": 1342177280,
+    "sclk_start": 2059,
+    "sclk_end": 1994,
+    "causal": true,
+    "order": "blocked9+lead4"
+  },
+  {
+    "shape": "prod",
+    "arm": "c1",
+    "stat": "median",
+    "iters": 54,
+    "latency_ms": 6.509696006774902,
+    "min_ms": 6.451900005340576,
+    "max_ms": 6.614964008331299,
+    "tflops": 844.6215033386769,
+    "bw_gbs": 206.18125310354617,
+    "flop": 5498229227520.0,
+    "bytes_min": 1342177280,
+    "sclk_start": 2059,
+    "sclk_end": 1994,
+    "causal": true,
+    "order": "blocked9+lead4"
+  },
+  {
+    "shape": "prod",
+    "arm": "r29",
+    "stat": "median",
+    "iters": 54,
+    "latency_ms": 6.562044382095337,
+    "min_ms": 6.529049873352051,
+    "max_ms": 6.6168317794799805,
+    "tflops": 837.8835782522324,
+    "bw_gbs": 204.53645264304464,
+    "flop": 5498229227520.0,
+    "bytes_min": 1342177280,
+    "sclk_start": 2059,
+    "sclk_end": 1994,
+    "causal": true,
+    "order": "blocked9+lead4"
+  }
+]

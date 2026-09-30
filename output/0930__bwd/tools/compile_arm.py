@@ -30,6 +30,11 @@ jobs = {
     "delta": (K.launch_delta, (do, o, delta, sq, hq, n_rows, n_rows // K.ROWS_DELTA, None)),
     "dkdv": (K.launch_dkdv, (q, k, v, do, lse, delta, torch.empty_like(k), torch.empty_like(k),
              scale, sq, skv, hq, hkv, g, sq // 16, skv - sq, 1, skv // K.BLOCK_KV, hkv, b, None)),
+    "dkdv_sp": (K.launch_dkdv_sp, (q, k, v, do, lse, delta,
+                torch.empty((2, b, skv, hkv, d), dtype=f32, device=M),
+                torch.empty((2, b, skv, hkv, d), dtype=f32, device=M),
+                scale, sq, skv, hq, hkv, g, sq // 16, skv - sq, 1, skv // K.BLOCK_KV, hkv, b,
+                2, hkv * 2, None)),
     "dqg": (K.launch_dqg, (q, k, v, do, o, lse, delta, torch.empty_like(q), scale,
             sq, skv, hq, hkv, g, skv // K.KV_STEP, skv - sq, 1, sq // K.DQ_BQW, hq // K.DQ_NW, b, None)),
 }
