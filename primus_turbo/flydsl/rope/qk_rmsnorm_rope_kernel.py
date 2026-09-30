@@ -120,7 +120,9 @@ def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float):
                 sine = fx.Float32(fmath.sin(angle))
                 low = norm * cosine - fx.Float32(pair) * sine
                 high = norm * cosine + fx.Float32(pair) * sine
-                rotated = fx.arith.select(lane < fx.Int32(_HALF), low, high).to(fx.BFloat16)
+                rotated = fx.BFloat16(
+                    fx.arith.select(lane < fx.Int32(_HALF), low, high)
+                )
 
                 if is_q:
                     q_head = group * fx.Int32(NPG) + local
@@ -221,7 +223,9 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int):
                 low = grad * cosine + fx.Float32(pair_grad) * sine
                 high = grad * cosine - fx.Float32(pair_grad) * sine
                 # Match the materialized BF16 gradient at the RoPE -> RMSNorm boundary.
-                dnorm = fx.arith.select(lane < fx.Int32(_HALF), low, high).to(fx.BFloat16).to(fx.Float32)
+                dnorm = fx.Float32(
+                    fx.BFloat16(fx.arith.select(lane < fx.Int32(_HALF), low, high))
+                )
 
                 x = fx.Float32(buffer_ops.buffer_load(packed_rsrc, dst, vec_width=1, dtype=fx.T.bf16()))
                 unit = x * rstd
