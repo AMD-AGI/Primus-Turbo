@@ -1,0 +1,20 @@
+W0930 07:46:49.258325   92454 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.033601 sec
+W0930 07:46:49.258571   92454 simple_timer.cpp:55] [rocprofv3] '/opt/venv/bin/python3 benchmark.py --arm-path asm=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/../0927__b0/ruler/bwd/oe/artifacts/job/job_context/op/beat --shapes prod --iters 1 --warmup-seconds 0 --block 1 --lead 0' ::     0.000000 sec
+W0930 07:46:50.237018   92454 tool.cpp:3082] HSA version 1.21.0 initialized (instance=0)
+E0930 07:46:50.252839   92454 output_stream.cpp:111] Opened result file: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/probe/p2_asm/att_gfx1250_code_object_id_1.out
+E0930 07:46:50.277571   92454 output_stream.cpp:111] Opened result file: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/probe/p2_asm/att_gfx1250_code_object_id_2.out
+E0930 07:46:50.297142   92454 output_stream.cpp:111] Opened result file: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/probe/p2_asm/att_gfx1250_code_object_id_3.out
+E0930 07:46:50.577167   92454 output_stream.cpp:111] Opened result file: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/probe/p2_asm/att_gfx1250_code_object_id_4.out
+E0930 07:46:50.583989   92454 output_stream.cpp:111] Opened result file: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/probe/p2_asm/att_gfx1250_code_object_id_5.out
+E0930 07:46:50.584617   92454 output_stream.cpp:111] Opened result file: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/probe/p2_asm/att_gfx1250_code_object_id_6.out
+E0930 07:46:50.585081   92454 output_stream.cpp:111] Opened result file: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/probe/p2_asm/att_gfx1250_code_object_id_7.out
+E0930 07:46:50.592857   92776 output_stream.cpp:111] Opened result file: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/probe/p2_asm/att_29978_shader_engine_0_11.att
+E0930 07:46:50.592992   92454 output_stream.cpp:111] Opened result file: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/probe/p2_asm/att_gfx1250_code_object_id_8.out
+# arm asm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/bwd/oe/artifacts/job/job_context/op/beat md5=2802a918
+# statistic median  iters 1  warmup 0.0s continuous  order palindromic  device gfx1250
+RESULT shape=prod arm=asm stat=median iters=1 latency_ms=5.858644962310791 min_ms=5.858644962310791 max_ms=5.858644962310791 tflops=938.4813831339194 bw_gbs=229.0934659182032 flop=5498229227520.0 bytes_min=1342177280 sclk_start=2352 sclk_end=2351 causal=True order=interleaved
+W0930 07:46:51.405847   92454 hsa_util.cpp:200] Failed to destroy queue: 4107
+E0930 07:46:51.410843   92454 output_stream.cpp:111] Opened result file: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/probe/p2_asm/att_agent_info.csv
+W0930 07:46:54.721059   92454 simple_timer.cpp:55] [rocprofv3] output generation ::     3.314745 sec
+W0930 07:46:54.721970   92454 simple_timer.cpp:55] [rocprofv3] tool finalization ::     3.315661 sec
+rc=0
