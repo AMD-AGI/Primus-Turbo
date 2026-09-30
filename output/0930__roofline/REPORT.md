@@ -158,3 +158,45 @@ bwd k_dkdv 请求 71 GB，按 37 TB/s 算需要 1.9 ms，而 k_dkdv 本身约 4.
 ## 8. PMC 冠军测量踩的坑
 
 harness 的 warmup 在 1 秒内不做同步地连续提交 kernel，rocprofv3 `--pmc` 下每次 dispatch 都要串行采集计数，于是积压几万次 dispatch，看起来像卡死（两次 timeout，卡没有问题）。解决办法：`--warmup-seconds 0`。
+
+## 9. M8：fwd 冠军的光速消融（2026-09-30，A0）
+
+arm 是 r13ns 的拷贝，每个只加一个开关（`m8/build_arms.py`，每处改动都用断言确认唯一命中；不动任何 index 或地址计算；输出结果本来就是错的，只看时间）。
+所有 arm 都通过了 compile-only 检查（0 spill，0 scratch），ISA 统计确认开关生效（`m8/dump/*`：noexp 和 nosm 的 exp 为 0，nobar 的 barrier 从 12 降到 4，WMMA/DS 条数全部保持 256/304）。
+toy（proxy 形状）单独一个进程，开 `AMD_SERIALIZE_KERNEL=3`，全部通过；prod 分计时 / 非 causal / PMC 三个进程，全部 rc=0，dmesg 干净。
+cycle 数用 `m8/m8drive.py` 测：每个 arm 前先发一个 grid 不同的标记 kernel，用来切分 dispatch 序列；每个 arm 丢掉前 3 次，取 7 次的中位数（`m8/m8sum.py`）。
+
+| arm | 改动 | cycle/SIMD（PMC） | 相对 base | 有效时钟 | harness 计时 ms |
+|---|---|--:|--:|--:|--:|
+| base | r13ns 原样 | **1.979e6** | 1 | 1.46 GHz | 1.377 |
+| noexp | exp2 换成一条 v_mul | 1.936e6 | −2.2% | 1.60 | 1.333 |
+| nosm | 去掉 max/exp/sum/rescale，P = cvt(S) | 1.612e6 | **−18.6%** | 1.62 | 1.113 |
+| nomask | 所有 tile 走无 mask 的主体 | 1.978e6 | −0.1% | 1.61 | 1.358 |
+| nobar | 每个 tile 去掉 WG barrier（保留 TDM wait） | 1.883e6 | −4.9% | 1.61 | 1.307 |
+| wl | nosm + nomask：只剩 WMMA + LDS + TDM + barrier | **1.603e6** | −19.0% | 1.61 | 1.118 |
+| ASM | | 1.430e6 | 0.722 | **1.24** | 1.264 |
+| base，非 causal | 2 倍 FLOP | 3.814e6（矩阵下限 2.097e6 的 55%） | | 1.58 | 2.704 |
+| ASM，非 causal | | 2.490e6（**84%**） | | 1.20 | 2.459 |
+
+**fly fwd 的 cycle 构成**（每 SIMD，合计 1.979e6）：
+
+| 项 | cycle | 占比 | 依据 |
+|---|--:|--:|---|
+| 矩阵下限（fly 分块） | 1.057e6 | 53% | W=8 |
+| **骨架开销**：LDS/TDM/同步/prologue/epilogue | **0.546e6** | **28%** | wl − 矩阵下限 |
+| 其中 per-tile barrier | 约 0.096e6 | 5% | nobar |
+| 其中 causal 的不均衡和尾部 | 约 0.07e6 | 4% | base − 非 causal/2 = 1.979 − 1.907 |
+| **softmax**（max/sum/cvt/rescale/permlane 及依赖等待） | **0.376e6** | **19%** | base − nosm |
+| 其中 exp 本身（trans） | 约 0.043e6 | 2% | noexp |
+| mask | 约 0 | 0% | nomask |
+
+结论：
+1. **最大的一块不是 softmax，而是骨架**：去掉全部 softmax 之后（wl，1.603e6），fly 仍然比**完整的** ASM（1.430e6）多用 12% 的 cycle。
+   ASM 的非 causal 主体能跑到矩阵下限的 84%，fly 只有 55%。
+   fly 每个 SIMD 2 个 wave，每个 tile 每个 wave 从 LDS 读 32 KB（每条 WMMA 512 B），刚好顶到单个 LDS 段的 256 B/clk/CU（§3）；再加上 TDM 写入，LDS 需求约 288 B/clk。
+   K 和 V 的 ping-pong 缓冲是相邻的（`_v_lds_buf = K base + k_blk_bytes`），很可能落在同一个 64 KB 段里，这一点下一步要核实。
+   如果确实在同一段，**把 K 和 V 分到不同的段**，理论上能把 LDS 从瓶颈上拿掉。
+2. **softmax 占 19%，但 exp 本身只占 2%**：这和 §2 的结论一致（每条 WMMA 后面跟 1–2 条 exp 几乎免费）。softmax 的代价在 max/sum 的归约树、permlane、cvt 和 rescale 这些 VALU，以及它们和 WMMA 之间的依赖等待。
+3. per-tile barrier 占 5%，causal 的不均衡占 4%，mask 基本免费。
+4. **功耗和时钟**：ASM 的有效时钟只有 1.2–1.24 GHz，fly 各 arm 是 1.46–1.62 GHz。所以 wl 在时间上已经比 ASM 快 14%（0.993 对 1.152 ms），但在 cycle 上仍比 ASM 慢 12%。
+   减少 cycle 的改动会提高 WMMA 密度，进而拉低时钟；这一点在评估时必须和 cycle 一起看。
