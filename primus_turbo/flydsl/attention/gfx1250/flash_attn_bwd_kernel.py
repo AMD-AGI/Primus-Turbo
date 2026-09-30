@@ -40,7 +40,7 @@ from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import const_expr, range_constexpr, rocdl
 
 from .common import _to_raw as _ir
-from .common import create_llvm_ptr
+from .common import create_llvm_ptr, shuffle_xor
 
 D = 128
 DV8 = D // 8  # vec8 tiles per row of one head
@@ -144,7 +144,7 @@ def k_delta_bshd(DO: fx.Tensor, O: fx.Tensor, DEL: fx.Tensor, S: fx.Int32, H: fx
             e1 = e1 + fx.Float32(do8[2 * c + 1]) * fx.Float32(o8[2 * c + 1])
         acc = e0 + e1
         for sft in range_constexpr(4):
-            acc = acc + acc.shuffle_xor(1 << sft, WAVE)
+            acc = acc + shuffle_xor(acc, 1 << sft, WAVE)
         idx = bid * fx.Int32(ROWS_DELTA) + u * fx.Int32(ROWS_PER_PASS) + row_in_group
         ok = (lane_in_row == fx.Int32(0)) & (idx < n_rows)
         b = idx // (S * H)
@@ -1337,7 +1337,7 @@ def _dqg_impl(Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G, nkvt, cs
                     e0 = e0 + fx.Float32(d16[2 * i]) * fx.Float32(o16[2 * i])
                     e1 = e1 + fx.Float32(d16[2 * i + 1]) * fx.Float32(o16[2 * i + 1])
             part = e0 + e1
-            tot = part + part.shuffle_xor(16, WAVE)
+            tot = part + shuffle_xor(part, 16, WAVE)
             _st1(tot, g_del, base_l + q_glob[qh_], fx.Float32)
             del_q.append(tot)
     else:

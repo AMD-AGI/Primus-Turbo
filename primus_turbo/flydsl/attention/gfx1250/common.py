@@ -42,10 +42,10 @@ def create_llvm_ptr(value, address_space=1):
     if hasattr(fx, "to_llvm_ptr"):
         space = {1: fx.AddressSpace.Global, 3: fx.AddressSpace.Shared}.get(address_space, address_space)
         pt = fx.PointerType.get(fx.Int32.ir_type, address_space=space, alignment=4)
-        ptr = fx.to_llvm_ptr(fx.inttoptr(pt, value))
-        return ptr._value if hasattr(ptr, "_value") else ptr
+        return fx.as_ir_value(fx.to_llvm_ptr(fx.inttoptr(pt, value)))
+    # UNSTABLE(flydsl 0.2.4 fallback): raw llvm.inttoptr, the op fx.to_llvm_ptr emits.
     ptr_type = ir.Type.parse(f"!llvm.ptr<{_LLVM_ADDRESS_SPACE[address_space]}>")
-    return _llvm.IntToPtrOp(ptr_type, _to_raw(value)).result
+    return _llvm.IntToPtrOp(ptr_type, fx.as_ir_value(value)).result
 
 
 def _as_int(v, like):
@@ -58,7 +58,8 @@ def _int_binop(signed_op, unsigned_op, lhs, rhs):
     if not isinstance(lhs, (fx.Int32, fx.Uint32)) and not isinstance(rhs, (fx.Int32, fx.Uint32)):
         raise TypeError(f"expected an fx.Int32/fx.Uint32 operand, got {type(lhs)}, {type(rhs)}")
     op = unsigned_op if cls is fx.Uint32 else signed_op
-    return cls(op(_to_raw(_as_int(lhs, cls)), _to_raw(_as_int(rhs, cls))))
+    # UNSTABLE(flydsl 0.2.4 fallback): raw arith ops, the ones fx.ceildiv/max/min emit.
+    return cls(op(fx.as_ir_value(_as_int(lhs, cls)), fx.as_ir_value(_as_int(rhs, cls))))
 
 
 def ceildiv(lhs, rhs):
@@ -82,6 +83,14 @@ def imin(lhs, rhs):
     return _int_binop(_arith.minsi, _arith.minui, lhs, rhs)
 
 
+def shuffle_xor(value, offset, width):
+    """Lane ``k`` reads lane ``k ^ offset`` (``fx.gpu.shuffle_xor``; 0.2.4 only has the
+    since-deprecated ``Numeric.shuffle_xor`` method, which emits the same gpu.shuffle)."""
+    if hasattr(fx.gpu, "shuffle_xor"):
+        return fx.gpu.shuffle_xor(value, offset, width)
+    return value.shuffle_xor(offset, width)
+
+
 # The forward's fastest O writer stages O through LDS and drains it with
 # global_store_async_from_lds_b128. flydsl 0.2.4 has no op for it, and the intrinsic, emitted
 # by hand, faults on the card: the LLVM bundled with 0.2.4 addresses global memory with the
@@ -92,25 +101,23 @@ HAS_ASYNC_LDS_STORE = hasattr(_rocdl, "global_store_async_from_lds_b128")
 
 
 def _to_raw(v):
-    """Convert an ArithValue / Numeric (Int32, Boolean, ...) to a raw ir.Value."""
-    if isinstance(v, ir.Value):
-        return v
-    if hasattr(v, "ir_value"):
-        return _to_raw(v.ir_value())
-    return ir.Value._CAPICreate(v._CAPIPtr)
+    """A typed flydsl value (Int32, Vector, ...) as a raw ir.Value."""
+    return fx.as_ir_value(v)
+
+
+_COMPILED = {}
 
 
 def _run_compiled(exe, *args):
     """First call: ``flyc.compile(exe, *args)`` compiles **and** launches the kernel.
     Later calls go straight to the cached ``CompiledFunction``.
     """
-    cf = getattr(exe, "_cf", None)
+    cf = _COMPILED.get(exe)
     if cf is not None:
         cf(*args)
         return
     try:
-        cf = flyc.compile(exe, *args)
-        exe._cf = cf
+        _COMPILED[exe] = flyc.compile(exe, *args)
     except Exception:
         # flyc.compile leaks ir.Context on failure; pop it so a retry takes the right path.
         try:
