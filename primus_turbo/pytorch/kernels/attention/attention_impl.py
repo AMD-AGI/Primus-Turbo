@@ -99,11 +99,13 @@ def _flydsl_common_ok(
 ) -> bool:
     """Shared FlyDSL eligibility gate (gfx950, causal, D in {64,128}, bf16, ...).
 
-    ``sink`` and the GQA group are checked separately, where Hq is known.
+    ``sink`` and the GQA group are checked separately, where Hq is known. The arch test is
+    an equality: these kernels are gfx950 code, and gfx1250 compares greater than gfx950, so
+    ``>=`` handed gfx1250 calls to a builder that raises on any other arch.
     """
     head_dim = q.shape[-1]
     return (
-        get_device_compute_capability() >= _GFX950
+        get_device_compute_capability() == _GFX950
         and bool(causal)
         and q.dtype == torch.bfloat16
         and head_dim in (64, 128)
