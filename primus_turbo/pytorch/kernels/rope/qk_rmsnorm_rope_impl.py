@@ -54,7 +54,9 @@ def qk_rmsnorm_rope_fwd_impl(qkv, q_gamma, k_gamma, freqs, split_sizes, eps):
     why = qk_rmsnorm_rope_shape_error(qkv, q_gamma, k_gamma, freqs, split_sizes)
     if why is not None:
         raise ValueError(f"fused_qkv_rmsnorm_rope: unsupported input ({why})")
-    return flydsl_qkv_rmsnorm_rope_forward(qkv, q_gamma, k_gamma, freqs, split_sizes, eps)
+    return flydsl_qkv_rmsnorm_rope_forward(
+        qkv, q_gamma, k_gamma, freqs, split_sizes, eps
+    )
 
 
 def qk_rmsnorm_rope_bwd_impl(

@@ -135,13 +135,27 @@ def _srd(t, nrec_bytes):
 
 
 def _lds_store1(lds_ptr, off, val):
-    fx.make_view(fx.add_offset(lds_ptr, fx.make_int_tuple(off)), fx.make_layout(1, 1)).store(
-        Vec.from_elements([val], fx.Int32)
-    )
+    fx.make_view(
+        fx.add_offset(lds_ptr, fx.make_int_tuple(off)), fx.make_layout(1, 1)
+    ).store(Vec.from_elements([val], fx.Int32))
 
 
 def _emit_fused_body(
-    lds, tid, bid, X, RES, GAM, XPR, RSTD, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, EPS, BIAS
+    lds,
+    tid,
+    bid,
+    X,
+    RES,
+    GAM,
+    XPR,
+    RSTD,
+    ROW_OUT,
+    ROW_SC,
+    COL_OUT,
+    COL_SC,
+    R,
+    EPS,
+    BIAS,
 ):
     """Emit the fused body from plain Python.
 
@@ -201,7 +215,9 @@ def _emit_fused_body(
     for m in range_constexpr(3):
         idx = (lane ^ I32(1 << m)) << I32(2)
         other = _f32(
-            fx.Int32(rocdl.ds_bpermute(IRI, _raw(idx), _raw(arith.bitcast(T.i32, _raw(ssq)))))
+            fx.Int32(
+                rocdl.ds_bpermute(IRI, _raw(idx), _raw(arith.bitcast(T.i32, _raw(ssq))))
+            )
         )
         ssq = ssq + other
     rstd = fm.rsqrt(ssq / F32(float(_H)) + EPS)
@@ -229,7 +245,9 @@ def _emit_fused_body(
             if i < kwvec:
                 pwords = [hold[(i, q)] for q in range_constexpr(4)]
             else:
-                xv = buffer_ops.buffer_load(xps, rowbase + woff, vec_width=4, dtype=T.i32)
+                xv = buffer_ops.buffer_load(
+                    xps, rowbase + woff, vec_width=4, dtype=T.i32
+                )
                 pwords = [fx.Int32(xv[q]) for q in range_constexpr(4)]
             # Both branches now yield a packed-bf16 i32 word per lane; unpack
             # uniformly regardless of whether it came from a register or HBM.
@@ -360,7 +378,11 @@ def _build_launcher():
 def _fused_supported(x, residual, gamma) -> bool:
     if not (x.is_cuda and residual.is_cuda and gamma.is_cuda):
         return False
-    if x.dtype is not torch.bfloat16 or residual.dtype != x.dtype or gamma.dtype != x.dtype:
+    if (
+        x.dtype is not torch.bfloat16
+        or residual.dtype != x.dtype
+        or gamma.dtype != x.dtype
+    ):
         return False
     if x.shape != residual.shape or gamma.ndim != 1 or gamma.shape[0] != _H:
         return False
@@ -512,4 +534,11 @@ def rmsnorm_residual_mxfp4_fused(
     buffers = _allocate(x2)
     y, xpr = _FusedRMSNormMXFP4SkipY.apply(x2, r2, gamma, eps, buffers)
     row, row_scale, col, col_scale = _as_quant_views(buffers)
-    return y.reshape(orig_shape), xpr.reshape(orig_shape), row, row_scale, col, col_scale
+    return (
+        y.reshape(orig_shape),
+        xpr.reshape(orig_shape),
+        row,
+        row_scale,
+        col,
+        col_scale,
+    )
