@@ -1,0 +1,294 @@
+ 10808-10820  v                  x3    wall     3.1 cum       3
+ 10824-10824  s                  x1    wall    16.0 cum      19
+ 10828-10880  VM                 x5    wall    14.0 cum      33
+ 10892-10908  v                  x4    wall     4.0 cum      37
+ 10916-10916  s                  x1    wall    15.0 cum      52
+ 10920-10956  VM                 x4    wall    10.0 cum      62
+ 10968-10992  v                  x4    wall     4.0 cum      66
+ 11000-11000  s                  x1    wall    15.0 cum      81
+ 11004-11040  VM                 x4    wall     4.0 cum      85
+ 11056-11056  s                  x1    wall     4.0 cum      89
+ 11060-11116  VM                 x5    wall    11.0 cum     100
+ 11128-11128  wait:xcnt 0x2      x1    wall   106.4 cum     207
+ 11132-11132  v                  x1    wall     1.0 cum     208
+ 11140-11140  wait:xcnt 0x1      x1    wall     8.4 cum     216
+ 11144-11144  v                  x1    wall     1.0 cum     217
+ 11152-11152  wait:xcnt 0x0      x1    wall     4.5 cum     222
+ 11156-11156  v                  x1    wall     1.0 cum     223
+ 11164-11164  s                  x1    wall    15.0 cum     238
+ 11168-11192  VM                 x3    wall     3.0 cum     241
+ 11204-11204  s                  x1    wall     3.0 cum     244
+ 11208-11328  VM                 x11   wall    23.7 cum     267
+ 11344-11344  wait:loadcnt 0x20  x1    wall   122.1 cum     389
+ 11348-11348  W                  x1    wall     9.0 cum     398
+ 11356-11356  v                  x1    wall    20.1 cum     418
+ 11364-11484  DS                 x16   wall    58.4 cum     477
+ 11496-11496  v                  x1    wall    18.0 cum     495
+ 11508-11516  DL                 x2    wall     8.1 cum     503
+ 11528-11528  W                  x1    wall     1.0 cum     504
+ 11536-11544  s                  x3    wall     5.0 cum     509
+ 11552-11552  v                  x1    wall     5.0 cum     514
+ 11556-11560  s                  x2    wall     2.0 cum     516
+ 11568-11844  W                  x28   wall   217.0 cum     733
+ 11852-11864  nop                x4    wall    15.0 cum     748
+ 11876-11876  v                  x1    wall     1.0 cum     749
+ 11888-11888  W                  x1    wall     1.0 cum     750
+ 11900-11952  v                  x6    wall    10.0 cum     760
+ 11964-11964  W                  x1    wall     1.0 cum     761
+ 11976-12016  v                  x5    wall     9.0 cum     770
+ 12028-12028  X                  x1    wall     1.0 cum     771
+ 12032-12032  W                  x1    wall     1.0 cum     772
+ 12040-12068  X                  x7    wall    17.0 cum     789
+ 12076-12088  W                  x2    wall     9.0 cum     798
+ 12096-12108  nop                x4    wall    15.0 cum     813
+ 12120-12120  v                  x1    wall     1.0 cum     814
+ 12132-12132  W                  x1    wall     1.0 cum     815
+ 12144-12188  v                  x6    wall    10.0 cum     825
+ 12200-12200  W                  x1    wall     1.0 cum     826
+ 12212-12248  v                  x5    wall     9.0 cum     835
+ 12256-12256  X                  x1    wall     1.0 cum     836
+ 12264-12264  W                  x1    wall     1.0 cum     837
+ 12276-12300  v                  x4    wall     7.0 cum     844
+ 12312-12312  X                  x1    wall     2.0 cum     846
+ 12316-12324  v                  x2    wall     2.0 cum     848
+ 12336-12336  W                  x1    wall     1.0 cum     849
+ 12348-12372  v                  x4    wall     7.0 cum     856
+ 12380-12380  X                  x1    wall     2.0 cum     858
+ 12384-12392  v                  x2    wall     2.0 cum     860
+ 12404-12404  W                  x1    wall     1.0 cum     861
+ 12416-12440  X                  x7    wall    17.0 cum     878
+ 12448-12448  W                  x1    wall     1.0 cum     879
+ 12460-12480  X                  x6    wall    15.0 cum     894
+ 12488-12488  W                  x1    wall     1.0 cum     895
+ 12496-12508  nop                x4    wall     7.0 cum     902
+ 12516-12532  v                  x3    wall     4.0 cum     906
+ 12544-12544  W                  x1    wall     1.0 cum     907
+ 12556-12604  v                  x6    wall    10.0 cum     917
+ 12616-12616  W                  x1    wall     1.0 cum     918
+ 12628-12644  v                  x3    wall     6.0 cum     924
+ 12652-12664  X                  x4    wall     7.0 cum     931
+ 12672-12672  W                  x1    wall     1.0 cum     932
+ 12684-12696  X                  x4    wall    11.0 cum     943
+ 12704-12704  v                  x1    wall     1.0 cum     944
+ 12716-12716  W                  x1    wall     1.0 cum     945
+ 12728-12772  v                  x6    wall    10.0 cum     955
+ 12784-12784  W                  x1    wall     1.0 cum     956
+ 12796-12848  v                  x7    wall    13.0 cum     969
+ 12860-12860  W                  x1    wall     1.0 cum     970
+ 12872-12936  v                  x8    wall    13.0 cum     983
+ 12948-12948  W                  x1    wall     1.0 cum     984
+ 12960-13008  v                  x7    wall    11.0 cum     995
+ 13020-13020  W                  x1    wall     1.0 cum     996
+ 13032-13084  v                  x7    wall    11.0 cum    1007
+ 13096-13096  W                  x1    wall     1.0 cum    1008
+ 13108-13132  v                  x4    wall     7.0 cum    1015
+ 13144-13152  X                  x3    wall     6.0 cum    1021
+ 13160-13160  W                  x1    wall     1.0 cum    1022
+ 13172-13196  X                  x7    wall    17.0 cum    1039
+ 13204-13204  W                  x1    wall     1.0 cum    1040
+ 13216-13244  X                  x7    wall    17.0 cum    1057
+ 13252-13252  W                  x1    wall     1.0 cum    1058
+ 13264-13288  X                  x7    wall    17.0 cum    1075
+ 13296-13296  W                  x1    wall    31.0 cum    1106
+ 13308-13416  DL                 x14   wall    23.9 cum    1130
+ 13428-13452  v                  x4    wall     4.0 cum    1134
+ 13464-13464  wait:loadcnt 0x1f  x1    wall    16.0 cum    1150
+ 13468-13468  DS                 x1    wall     9.3 cum    1159
+ 13480-13480  W                  x1    wall     1.0 cum    1160
+ 13492-13516  v                  x4    wall     7.0 cum    1167
+ 13528-13528  wait:loadcnt 0x1d  x1    wall    21.0 cum    1188
+ 13532-13532  DS                 x1    wall     3.0 cum    1191
+ 13540-13540  wait:loadcnt 0x1c  x1    wall     1.0 cum    1192
+ 13544-13544  DS                 x1    wall     3.0 cum    1195
+ 13552-13552  wait:loadcnt 0x1a  x1    wall     1.0 cum    1196
+ 13556-13556  DS                 x1    wall     9.2 cum    1205
+ 13568-13572  X                  x2    wall     3.0 cum    1208
+ 13580-13580  W                  x1    wall     1.0 cum    1209
+ 13592-13612  X                  x6    wall    16.0 cum    1225
+ 13620-13620  wait:loadcnt 0x19  x1    wall    18.0 cum    1243
+ 13624-13624  DS                 x1    wall     3.0 cum    1246
+ 13632-13632  wait:loadcnt 0x16  x1    wall     1.0 cum    1247
+ 13636-13636  DS                 x1    wall     9.3 cum    1257
+ 13648-13648  W                  x1    wall     3.0 cum    1260
+ 13660-13660  wait:loadcnt 0x15  x1    wall    26.0 cum    1286
+ 13664-13664  DS                 x1    wall     3.0 cum    1289
+ 13672-13672  wait:loadcnt 0xd   x1    wall     1.0 cum    1290
+ 13676-13724  DS                 x7    wall     9.0 cum    1299
+ 13732-13732  wait:loadcnt 0xc   x1    wall     1.0 cum    1300
+ 13736-13736  DS                 x1    wall     3.0 cum    1303
+ 13744-13744  wait:loadcnt 0xb   x1    wall     1.0 cum    1304
+ 13748-13748  DS                 x1    wall     1.0 cum    1305
+ 13756-13772  DL                 x3    wall    23.1 cum    1328
+ 13784-13784  W                  x1    wall     1.0 cum    1329
+ 13792-13800  nop                x3    wall     6.0 cum    1335
+ 13808-13852  v                  x6    wall     7.0 cum    1342
+ 13864-13864  W                  x1    wall     1.0 cum    1343
+ 13876-13932  v                  x7    wall    11.0 cum    1354
+ 13944-13944  W                  x1    wall     1.0 cum    1355
+ 13956-14008  v                  x7    wall    11.0 cum    1366
+ 14020-14020  W                  x1    wall     1.0 cum    1367
+ 14032-14084  v                  x7    wall    11.0 cum    1378
+ 14096-14096  W                  x1    wall     1.0 cum    1379
+ 14108-14160  v                  x7    wall    11.0 cum    1390
+ 14172-14172  W                  x1    wall     1.0 cum    1391
+ 14184-14724  v                  x64   wall    70.5 cum    1461
+ 14736-14736  wait:dscnt 0x21    x1    wall     3.0 cum    1464
+ 14740-14740  W                  x1    wall     1.0 cum    1465
+ 14752-14800  v                  x7    wall    11.0 cum    1476
+ 14812-14812  W                  x1    wall     1.0 cum    1477
+ 14824-14872  v                  x7    wall    11.0 cum    1488
+ 14884-14884  wait:dscnt 0x1f    x1    wall     3.0 cum    1491
+ 14888-14888  W                  x1    wall     1.0 cum    1492
+ 14900-14948  v                  x7    wall    11.0 cum    1503
+ 14960-14960  W                  x1    wall     1.0 cum    1504
+ 14972-15020  v                  x7    wall    11.0 cum    1515
+ 15032-15032  wait:dscnt 0x1d    x1    wall     3.0 cum    1518
+ 15036-15036  W                  x1    wall     1.0 cum    1519
+ 15048-15056  v                  x2    wall     7.0 cum    1526
+ 15068-15068  W                  x1    wall     3.0 cum    1529
+ 15080-15080  wait:dscnt 0x1b    x1    wall     1.0 cum    1530
+ 15084-15096  W                  x2    wall    15.0 cum    1545
+ 15108-15108  wait:dscnt 0x19    x1    wall     1.0 cum    1546
+ 15112-15124  W                  x2    wall    15.0 cum    1561
+ 15136-15136  wait:dscnt 0x17    x1    wall     1.0 cum    1562
+ 15140-15152  W                  x2    wall    15.0 cum    1577
+ 15164-15164  wait:dscnt 0x15    x1    wall     1.0 cum    1578
+ 15168-15180  W                  x2    wall    15.0 cum    1593
+ 15192-15192  wait:dscnt 0x13    x1    wall     1.0 cum    1594
+ 15196-15660  W                  x42   wall   335.0 cum    1929
+ 15668-15668  wait:loadcnt 0x7   x1    wall     1.0 cum    1930
+ 15672-15704  W                  x4    wall    29.0 cum    1959
+ 15712-15724  nop                x4    wall    15.0 cum    1974
+ 15736-15736  v                  x1    wall     1.0 cum    1975
+ 15748-15748  W                  x1    wall     1.0 cum    1976
+ 15760-15804  v                  x6    wall    10.0 cum    1986
+ 15816-15816  W                  x1    wall     1.0 cum    1987
+ 15828-15876  v                  x7    wall    11.0 cum    1998
+ 15888-15888  W                  x1    wall     1.0 cum    1999
+ 15900-15948  v                  x7    wall    11.0 cum    2010
+ 15960-15960  W                  x1    wall     1.0 cum    2011
+ 15972-16020  v                  x7    wall    11.0 cum    2022
+ 16032-16032  W                  x1    wall     1.0 cum    2023
+ 16040-16088  v                  x7    wall    11.0 cum    2034
+ 16100-16100  W                  x1    wall     1.0 cum    2035
+ 16108-16108  v                  x1    wall     2.0 cum    2037
+ 16116-16136  X                  x6    wall    13.0 cum    2050
+ 16144-16144  W                  x1    wall     1.0 cum    2051
+ 16152-16176  X                  x7    wall    17.0 cum    2068
+ 16180-16180  W                  x1    wall     1.0 cum    2069
+ 16188-16212  X                  x7    wall    17.0 cum    2086
+ 16220-16220  W                  x1    wall     1.0 cum    2087
+ 16228-16240  X                  x4    wall    11.0 cum    2098
+ 16248-16260  W                  x2    wall    11.0 cum    2109
+ 16272-16272  wait:loadcnt 0x3   x1    wall     1.0 cum    2110
+ 16276-16388  W                  x12   wall    93.0 cum    2203
+ 16396-16408  nop                x4    wall    15.0 cum    2218
+ 16420-16420  v                  x1    wall     1.0 cum    2219
+ 16432-16432  W                  x1    wall     1.0 cum    2220
+ 16444-16488  v                  x6    wall    10.0 cum    2230
+ 16500-16500  wait:loadcnt 0x0   x1    wall     3.0 cum    2233
+ 16504-16504  W                  x1    wall     1.0 cum    2234
+ 16516-16564  v                  x7    wall    11.0 cum    2245
+ 16576-16576  W                  x1    wall     1.0 cum    2246
+ 16588-16636  v                  x7    wall    11.0 cum    2257
+ 16648-16648  W                  x1    wall     1.0 cum    2258
+ 16656-16672  v                  x3    wall     6.0 cum    2264
+ 16680-16692  X                  x4    wall     7.0 cum    2271
+ 16696-16696  W                  x1    wall     1.0 cum    2272
+ 16708-16732  v                  x4    wall     7.0 cum    2279
+ 16744-16744  X                  x1    wall     2.0 cum    2281
+ 16748-16756  v                  x2    wall     2.0 cum    2283
+ 16768-16768  W                  x1    wall     1.0 cum    2284
+ 16780-16804  v                  x4    wall     7.0 cum    2291
+ 16812-16812  X                  x1    wall     2.0 cum    2293
+ 16816-16824  v                  x2    wall     2.0 cum    2295
+ 16836-16836  W                  x1    wall     1.0 cum    2296
+ 16848-16872  v                  x4    wall     7.0 cum    2303
+ 16880-16880  X                  x1    wall     2.0 cum    2305
+ 16888-16896  v                  x2    wall     2.0 cum    2307
+ 16908-16908  W                  x1    wall     1.0 cum    2308
+ 16920-16972  v                  x7    wall    11.0 cum    2319
+ 16984-16984  W                  x1    wall     1.0 cum    2320
+ 16996-17048  v                  x7    wall    11.0 cum    2331
+ 17060-17060  W                  x1    wall     1.0 cum    2332
+ 17072-17096  v                  x4    wall     8.0 cum    2340
+ 17104-17104  X                  x1    wall     2.0 cum    2342
+ 17112-17120  v                  x2    wall     2.0 cum    2344
+ 17132-17132  W                  x1    wall     1.0 cum    2345
+ 17144-17152  v                  x2    wall     3.0 cum    2348
+ 17164-17168  X                  x2    wall     6.0 cum    2354
+ 17176-17280  v                  x14   wall    15.0 cum    2369
+ 17292-17292  W                  x1    wall     1.0 cum    2370
+ 17304-17360  v                  x8    wall    12.0 cum    2382
+ 17372-17372  W                  x1    wall     1.0 cum    2383
+ 17380-17420  v                  x6    wall    10.0 cum    2393
+ 17428-17544  X                  x30   wall    59.0 cum    2452
+ 17552-17724  v                  x22   wall    40.0 cum    2492
+ 17736-17744  DL                 x2    wall     8.4 cum    2501
+ 17756-18348  v                  x74   wall    74.1 cum    2575
+ 18360-18360  wait:dscnt 0x0     x1    wall     3.4 cum    2578
+ 18364-18364  W                  x1    wall    30.0 cum    2608
+ 18376-18384  DL                 x2    wall    14.4 cum    2623
+ 18392-18396  v                  x2    wall    18.0 cum    2641
+ 18400-18408  DL                 x2    wall     8.1 cum    2649
+ 18416-18416  v                  x1    wall     2.0 cum    2651
+ 18428-18428  W                  x1    wall    15.0 cum    2666
+ 18436-18436  s                  x1    wall     1.0 cum    2667
+ 18444-18452  W                  x2    wall    38.0 cum    2705
+ 18464-18472  DL                 x2    wall    10.0 cum    2715
+ 18484-18512  W                  x4    wall    53.9 cum    2769
+ 18524-18524  DL                 x1    wall     1.0 cum    2770
+ 18536-18536  wait:dscnt 0x1     x1    wall     7.1 cum    2777
+ 18540-18568  W                  x4    wall    54.0 cum    2831
+ 18580-18580  DL                 x1    wall     7.9 cum    2839
+ 18588-18600  nop                x4    wall     4.0 cum    2843
+ 18608-18616  v                  x2    wall     8.0 cum    2851
+ 18628-18628  W                  x1    wall     4.0 cum    2855
+ 18644-18652  v                  x2    wall     4.0 cum    2859
+ 18664-18664  W                  x1    wall    30.9 cum    2890
+ 18676-18676  VM                 x1    wall     7.4 cum    2897
+ 18688-18688  v                  x1    wall     1.0 cum    2898
+ 18692-18692  s                  x1    wall    16.0 cum    2914
+ 18696-18708  VM                 x2    wall     8.1 cum    2922
+ 18720-18720  v                  x1    wall     1.0 cum    2923
+ 18728-18728  W                  x1    wall     1.0 cum    2924
+ 18740-18788  v                  x7    wall    11.0 cum    2935
+ 18796-18796  W                  x1    wall    30.0 cum    2965
+ 18808-18816  DL                 x2    wall     8.0 cum    2973
+ 18824-18840  v                  x3    wall    19.0 cum    2992
+ 18852-18864  VM                 x2    wall     2.0 cum    2994
+ 18876-18876  s                  x1    wall     3.0 cum    2997
+ 18880-18892  VM                 x2    wall     2.0 cum    2999
+ 18904-18904  s                  x1    wall     3.0 cum    3002
+ 18908-18932  VM                 x3    wall     3.0 cum    3005
+ 18948-18948  wait:dscnt 0x3     x1    wall     6.1 cum    3011
+ 18952-18980  W                  x4    wall    54.0 cum    3065
+ 18992-18992  VM                 x1    wall     7.1 cum    3072
+ 19008-19008  DL                 x1    wall     1.0 cum    3073
+ 19020-19020  wait:dscnt 0x1     x1    wall     6.0 cum    3079
+ 19024-19052  W                  x4    wall    25.0 cum    3104
+ 19060-19072  nop                x4    wall     7.0 cum    3111
+ 19080-19084  v                  x2    wall    22.1 cum    3133
+ 19092-19092  VM                 x1    wall     1.0 cum    3134
+ 19104-19104  s                  x1    wall     3.0 cum    3137
+ 19108-19120  VM                 x2    wall     2.0 cum    3139
+ 19132-19132  s                  x1    wall     3.0 cum    3142
+ 19136-19160  VM                 x3    wall     3.0 cum    3145
+ 19176-19176  wait:dscnt 0x0     x1    wall     6.7 cum    3152
+ 19180-19180  W                  x1    wall    30.0 cum    3182
+ 19192-19216  VM                 x3    wall     3.0 cum    3185
+ 19228-19228  s                  x1    wall     3.0 cum    3188
+ 19232-19244  VM                 x2    wall     2.0 cum    3190
+ 19256-19256  s                  x1    wall     3.0 cum    3193
+ 19260-19272  VM                 x2    wall     9.4 cum    3202
+ 19288-19316  W                  x4    wall    54.1 cum    3256
+ 19328-19328  VM                 x1    wall     7.0 cum    3263
+ 19344-19344  W                  x1    wall     3.0 cum    3266
+ 19356-19356  s                  x1    wall    26.1 cum    3293
+ 19360-19372  VM                 x2    wall     2.0 cum    3295
+ 19384-19384  s                  x1    wall     3.0 cum    3298
+ 19388-19400  VM                 x2    wall     2.0 cum    3300
+ 19412-19412  s                  x1    wall     3.0 cum    3303
+ 19416-19440  VM                 x3    wall    11.2 cum    3314
+ 19456-19464  W                  x2    wall     9.0 cum    3323
+ 19476-19476  s                  x1    wall    24.9 cum    3348

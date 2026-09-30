@@ -1,0 +1,550 @@
+  0  15628 w=   1.0 st=  0.0 lat=  1.0 cum=    1.0 s_add_co_i32 s14, s4, 1
+  1  15632 w=   1.0 st=  0.0 lat=  1.0 cum=    2.0 s_min_i32 s14, s14, s10
+  2  15636 w=   1.0 st=  0.0 lat=  1.0 cum=    3.0 s_abs_i32 s15, s14
+  3  15640 w=   1.0 st=  0.0 lat=  1.0 cum=    4.0 s_ashr_i32 s17, s14, 31
+  4  15644 w=   1.0 st=  0.0 lat=  2.0 cum=    5.0 s_mul_hi_u32 s16, s15, s13
+  5  15648 w=   1.0 st=  0.0 lat=  1.0 cum=    6.0 s_xor_b32 s17, s17, s12
+  6  15652 w=   1.0 st=  0.0 lat=  2.0 cum=    7.0 s_mul_i32 s18, s16, s11
+  7  15656 w=   1.0 st=  0.0 lat=  1.0 cum=    8.0 s_sub_co_i32 s15, s15, s18
+  8  15660 w=   2.0 st=  1.0 lat=  2.0 cum=   10.0 s_add_co_i32 s18, s16, 1
+  9  15664 w=   2.0 st=  1.0 lat=  2.0 cum=   12.0 s_sub_co_i32 s19, s15, s11
+ 10  15668 w=   1.0 st=  0.0 lat=  1.0 cum=   13.0 s_cmp_ge_u32 s15, s11
+ 11  15672 w=   2.0 st=  1.0 lat=  2.0 cum=   15.0 s_cselect_b32 s16, s18, s16
+ 12  15676 w=   1.0 st=  0.0 lat=  1.0 cum=   16.0 s_cselect_b32 s15, s19, s15
+ 13  15680 w=   2.0 st=  1.0 lat=  2.0 cum=   18.0 s_add_co_i32 s18, s16, 1
+ 14  15684 w=   2.0 st=  1.0 lat=  2.0 cum=   20.0 s_cmp_ge_u32 s15, s11
+ 15  15688 w=   1.0 st=  0.0 lat=  1.0 cum=   21.0 s_cselect_b32 s15, s18, s16
+ 16  15692 w=   1.0 st=  0.0 lat=  1.0 cum=   22.0 s_xor_b32 s15, s15, s17
+ 17  15696 w=   1.0 st=  0.0 lat=  1.0 cum=   23.0 s_sub_co_i32 s16, s15, s17
+ 18  15700 w=   2.0 st=  1.0 lat=  3.0 cum=   25.0 s_mul_i32 s16, s16, s41
+ 19  15704 w=   1.0 st=  0.0 lat=  1.0 cum=   26.0 s_cmp_lg_u32 s14, s16
+ 20  15708 w=   1.0 st=  0.0 lat=  1.0 cum=   27.0 s_cselect_b32 s16, -1, 0
+ 21  15712 w=   1.0 st=  0.0 lat=  1.0 cum=   28.0 s_xor_b32 s18, s14, s41
+ 22  15716 w=   2.0 st=  1.0 lat=  2.0 cum=   30.0 s_cmp_lt_i32 s18, 0
+ 23  15720 w=   2.0 st=  1.0 lat=  2.0 cum=   32.0 s_cselect_b32 s18, -1, 0
+ 24  15724 w=   2.0 st=  1.0 lat=  2.0 cum=   34.0 s_and_b32 s16, s18, s16
+ 25  15728 w=   3.0 st=  2.0 lat=  3.0 cum=   37.0 s_sub_co_ci_u32 s15, s15, s17
+ 26  15732 w=   2.0 st=  1.0 lat=  3.0 cum=   39.0 s_mul_i32 s16, s15, s41
+ 27  15736 w=   2.0 st=  1.0 lat=  2.0 cum=   41.0 s_add_co_i32 s15, s15, s7
+ 28  15740 w=   1.0 st=  0.0 lat=  1.0 cum=   42.0 s_sub_co_i32 s14, s14, s16
+ 29  15744 w=   2.0 st=  1.0 lat=  2.0 cum=   44.0 s_lshl_b32 s15, s15, 5
+ 30  15748 w=   2.0 st=  1.0 lat=  2.0 cum=   46.0 s_add_co_i32 s16, s8, s14
+ 31  15756 w=   2.0 st=  1.0 lat=  2.0 cum=   48.0 v_or_b32_e32 v2, s15, v139
+ 32  15760 w=  10.0 st=  0.0 lat=  1.0 cum=   58.0 v_or_b32_e32 v3, s15, v143
+ 33  15764 w=   1.0 st=  0.0 lat=  2.0 cum=   59.0 s_mul_i32 s16, s16, s37
+ 34  15768 w=   1.0 st=  0.0 lat=  1.0 cum=   60.0 s_lshl4_add_u32 s14, s14, s9
+ 35  15772 w=   1.0 st=  0.0 lat=  1.0 cum=   61.0 v_add_lshl_u32 v4, s16, v2, 2
+ 36  15780 w=   1.0 st=  0.0 lat=  1.0 cum=   62.0 v_add_lshl_u32 v5, s16, v3, 2
+ 37  15788 w=  16.0 st=  2.0 lat=  3.0 cum=   78.0 s_clause 0x1
+ 38  15792 w=   1.0 st=  0.0 lat=  1.0 cum=   79.0 buffer_load_b32 v181, v4, s[56:59], null offen
+ 39  15804 w=   1.0 st=  0.0 lat=  1.0 cum=   80.0 buffer_load_b32 v214, v5, s[56:59], null offen
+ 40  15816 w=   3.0 st=  2.0 lat=  3.0 cum=   83.0 s_clause 0x1
+ 41  15820 w=   1.0 st=  0.0 lat=  1.0 cum=   84.0 buffer_load_b32 v215, v4, s[60:63], null offen
+ 42  15832 w=   8.2 st=  0.0 lat=  1.0 cum=   92.2 buffer_load_b32 v216, v5, s[60:63], null offen
+ 43  15844 w=   4.0 st=  0.0 lat=  4.0 cum=   96.2 v_mad_u32 v2, v2, s35, s14
+ 44  15852 w=   3.0 st=  0.0 lat=  4.0 cum=   99.2 v_mad_u32 v3, v3, s35, s14
+ 45  15864 w=  16.7 st=  0.8 lat=  1.8 cum=  115.9 s_wait_loadcnt 0xc
+ 46  15868 w=   1.0 st=  0.0 lat=  3.0 cum=  116.9 ds_store_b128 v144, v[210:213]
+ 47  15876 w=   3.0 st=  0.0 lat=  3.0 cum=  119.9 ds_store_b128 v144, v[214:217] offset:32
+ 48  15884 w=   1.2 st=  0.2 lat=  1.2 cum=  121.0 s_wait_loadcnt 0x4
+ 49  15888 w=   1.0 st=  0.0 lat=  3.0 cum=  122.0 ds_store_b128 v144, v[250:253] offset:8704
+ 50  15896 w=   1.0 st=  0.0 lat=  3.0 cum=  123.0 ds_store_b128 v144, v[254:257] offset:8736
+ 51  15904 w=   1.0 st=  0.0 lat=  3.0 cum=  124.0 ds_store_b128 v144, v[218:221] offset:64
+ 52  15912 w=   1.0 st=  0.0 lat=  3.0 cum=  125.0 ds_store_b128 v144, v[242:245] offset:8768
+ 53  15920 w=  25.8 st=  0.0 lat=  3.0 cum=  150.8 ds_store_b128 v144, v[222:225] offset:96
+ 54  15932 w=   1.0 st=  0.0 lat=  8.0 cum=  151.8 v_wmma_f32_16x16x32_bf16 v[190:197], v[42:49], v[250:257], 0
+ 55  15940 w=   1.0 st=  0.0 lat=  1.0 cum=  152.8 s_add_nc_u64 s[4:5], s[4:5], 1
+ 56  15944 w=   1.0 st=  0.0 lat=  1.0 cum=  153.8 s_cmp_lg_u64 s[4:5], s[2:3]
+ 57  15952 w=   1.0 st=  0.0 lat=  1.0 cum=  154.8 v_or_b32_e32 v3, v3, v142
+ 58  15956 w=   3.0 st=  2.0 lat=  3.0 cum=  157.8 v_dual_lshlrev_b32 v98, 4, v3 :: v_dual_bitop2_b32 v2, v2, v142 bitop3:0x54
+ 59  15968 w=   1.0 st=  0.0 lat=  1.0 cum=  158.8 v_lshlrev_b32_e32 v34, 4, v2
+ 60  15976 w=   1.0 st=  0.0 lat=  8.0 cum=  159.8 v_wmma_f32_16x16x32_bf16 v[190:197], v[50:57], v[242:249], v[190:197]
+ 61  15988 w=   2.0 st=  1.0 lat=  2.0 cum=  161.8 v_or_b32_e32 v99, 32, v98
+ 62  15992 w=   1.0 st=  0.0 lat=  1.0 cum=  162.8 v_or_b32_e32 v35, 32, v34
+ 63  15996 w=   3.0 st=  2.0 lat=  3.0 cum=  165.8 v_or_b32_e32 v38, 64, v34
+ 64  16000 w=   1.0 st=  0.0 lat=  1.0 cum=  166.8 v_or_b32_e32 v42, 0x60, v34
+ 65  16008 w=   2.0 st=  1.0 lat=  2.0 cum=  168.8 v_or_b32_e32 v46, 0x80, v34
+ 66  16016 w=   1.0 st=  0.0 lat=  1.0 cum=  169.8 v_or_b32_e32 v50, 0xa0, v34
+ 67  16024 w=   1.0 st=  0.0 lat=  1.0 cum=  170.8 v_or_b32_e32 v54, 0xc0, v34
+ 68  16032 w=   1.0 st=  0.0 lat=  1.0 cum=  171.8 v_or_b32_e32 v62, 0xe0, v34
+ 69  16040 w=   1.0 st=  0.0 lat=  1.0 cum=  172.8 v_or_b32_e32 v102, 64, v98
+ 70  16044 w=   1.0 st=  0.0 lat=  1.0 cum=  173.8 v_or_b32_e32 v106, 0x60, v98
+ 71  16052 w=   5.0 st=  4.0 lat=  5.0 cum=  178.8 v_or_b32_e32 v114, 0x80, v98
+ 72  16060 w=   1.0 st=  0.0 lat=  1.0 cum=  179.8 v_or_b32_e32 v118, 0xa0, v98
+ 73  16068 w=   3.0 st=  2.0 lat=  3.0 cum=  182.8 v_or_b32_e32 v122, 0xc0, v98
+ 74  16076 w=   1.0 st=  0.0 lat=  1.0 cum=  183.8 v_or_b32_e32 v126, 0xe0, v98
+ 75  16084 w=  17.0 st=  2.0 lat=  3.0 cum=  200.8 s_clause 0x7
+ 76  16088 w=   1.0 st=  0.0 lat=  1.0 cum=  201.8 buffer_load_b128 v[30:33], v34, s[52:55], null offen
+ 77  16100 w=   1.0 st=  0.0 lat=  1.0 cum=  202.8 buffer_load_b128 v[2:5], v35, s[52:55], null offen
+ 78  16112 w=   2.9 st=  0.0 lat=  1.0 cum=  205.7 buffer_load_b128 v[6:9], v38, s[52:55], null offen
+ 79  16124 w=   1.0 st=  0.0 lat=  1.0 cum=  206.7 buffer_load_b128 v[10:13], v42, s[52:55], null offen
+ 80  16136 w=   1.0 st=  0.0 lat=  1.0 cum=  207.7 buffer_load_b128 v[14:17], v46, s[52:55], null offen
+ 81  16148 w=   1.0 st=  0.0 lat=  1.0 cum=  208.7 buffer_load_b128 v[18:21], v50, s[52:55], null offen
+ 82  16160 w=   2.0 st=  0.0 lat=  1.0 cum=  210.7 buffer_load_b128 v[22:25], v54, s[52:55], null offen
+ 83  16172 w=   1.0 st=  0.0 lat=  1.0 cum=  211.7 buffer_load_b128 v[26:29], v62, s[52:55], null offen
+ 84  16184 w=   3.0 st=  2.0 lat=  3.0 cum=  214.7 s_clause 0x7
+ 85  16188 w=   1.0 st=  0.0 lat=  1.0 cum=  215.7 buffer_load_b128 v[58:61], v34, s[48:51], null offen
+ 86  16200 w=   1.1 st=  0.1 lat=  1.1 cum=  216.9 buffer_load_b128 v[34:37], v35, s[48:51], null offen
+ 87  16212 w=   1.1 st=  0.0 lat=  1.0 cum=  217.9 buffer_load_b128 v[38:41], v38, s[48:51], null offen
+ 88  16224 w=   2.1 st=  0.1 lat=  1.1 cum=  220.0 buffer_load_b128 v[42:45], v42, s[48:51], null offen
+ 89  16236 w=   1.1 st=  0.1 lat=  1.1 cum=  221.1 buffer_load_b128 v[46:49], v46, s[48:51], null offen
+ 90  16248 w=   1.5 st=  0.5 lat=  1.5 cum=  222.6 buffer_load_b128 v[50:53], v50, s[48:51], null offen
+ 91  16260 w=   1.7 st=  0.1 lat=  1.1 cum=  224.3 buffer_load_b128 v[54:57], v54, s[48:51], null offen
+ 92  16272 w=   1.0 st=  0.0 lat=  1.0 cum=  225.3 buffer_load_b128 v[62:65], v62, s[48:51], null offen
+ 93  16284 w=   3.0 st=  2.0 lat=  3.0 cum=  228.3 s_clause 0x7
+ 94  16288 w=   1.1 st=  0.1 lat=  1.1 cum=  229.3 buffer_load_b128 v[82:85], v98, s[52:55], null offen
+ 95  16300 w=   1.2 st=  0.2 lat=  1.2 cum=  230.5 buffer_load_b128 v[66:69], v99, s[52:55], null offen
+ 96  16312 w=   1.1 st=  0.1 lat=  1.1 cum=  231.6 buffer_load_b128 v[70:73], v102, s[52:55], null offen
+ 97  16324 w=   1.7 st=  0.7 lat=  1.7 cum=  233.3 buffer_load_b128 v[74:77], v106, s[52:55], null offen
+ 98  16336 w=   1.9 st=  0.0 lat=  1.0 cum=  235.2 buffer_load_b128 v[78:81], v114, s[52:55], null offen
+ 99  16348 w=   1.7 st=  0.7 lat=  1.7 cum=  236.9 buffer_load_b128 v[86:89], v118, s[52:55], null offen
+100  16360 w=   1.4 st=  0.1 lat=  1.1 cum=  238.3 buffer_load_b128 v[90:93], v122, s[52:55], null offen
+101  16372 w=   1.0 st=  0.0 lat=  1.0 cum=  239.3 buffer_load_b128 v[94:97], v126, s[52:55], null offen
+102  16384 w=   3.0 st=  2.0 lat=  3.0 cum=  242.3 s_clause 0x7
+103  16388 w=   1.1 st=  0.1 lat=  1.1 cum=  243.4 buffer_load_b128 v[110:113], v98, s[48:51], null offen
+104  16400 w=   1.8 st=  0.8 lat=  1.8 cum=  245.1 buffer_load_b128 v[98:101], v99, s[48:51], null offen
+105  16412 w=   1.2 st=  0.2 lat=  1.2 cum=  246.3 buffer_load_b128 v[102:105], v102, s[48:51], null offen
+106  16424 w=   2.0 st=  1.0 lat=  2.0 cum=  248.2 buffer_load_b128 v[106:109], v106, s[48:51], null offen
+107  16436 w=   1.2 st=  0.2 lat=  1.2 cum=  249.5 buffer_load_b128 v[114:117], v114, s[48:51], null offen
+108  16448 w=   2.3 st=  0.5 lat=  1.5 cum=  251.8 buffer_load_b128 v[118:121], v118, s[48:51], null offen
+109  16460 w=   2.3 st=  0.2 lat=  1.2 cum=  254.1 buffer_load_b128 v[122:125], v122, s[48:51], null offen
+110  16472 w=  13.0 st=  0.0 lat=  1.0 cum=  267.1 buffer_load_b128 v[126:129], v126, s[48:51], null offen
+111  16488 w=  29.0 st=  0.0 lat=  8.0 cum=  296.1 v_wmma_f32_16x16x32_bf16 v[190:197], v[58:65], v[234:241], v[190:197]
+112  16500 w=   1.0 st=  0.0 lat=  3.0 cum=  297.1 ds_store_b128 v144, v[246:249] offset:8800
+113  16508 w=   1.0 st=  0.0 lat=  3.0 cum=  298.1 ds_store_b128 v144, v[202:205] offset:128
+114  16516 w=   1.0 st=  0.0 lat=  3.0 cum=  299.1 ds_store_b128 v144, v[206:209] offset:160
+115  16524 w=  25.7 st=  0.0 lat=  3.0 cum=  324.8 ds_store_b128 v144, v[234:237] offset:8832
+116  16536 w=   1.0 st=  0.0 lat=  8.0 cum=  325.8 v_wmma_f32_16x16x32_bf16 v[182:189], v[2:9], v[250:257], 0
+117  16544 w=   8.0 st=  7.0 lat= 15.0 cum=  333.8 v_wmma_f32_16x16x32_bf16 v[190:197], v[66:73], v[226:233], v[190:197]
+118  16552 w=   8.0 st=  7.0 lat= 15.0 cum=  341.8 v_wmma_f32_16x16x32_bf16 v[182:189], v[10:17], v[242:249], v[182:189]
+119  16560 w=   2.0 st=  1.0 lat=  2.0 cum=  343.8 v_nop
+120  16564 w=   1.0 st=  0.0 lat=  1.0 cum=  344.8 v_nop
+121  16568 w=   3.0 st=  2.0 lat=  3.0 cum=  347.8 v_nop
+122  16572 w=   1.0 st=  0.0 lat=  1.0 cum=  348.8 v_nop
+123  16580 w=   2.0 st=  1.0 lat=  2.0 cum=  350.8 v_pk_mul_f32 v[242:243], v[130:131], v[190:191]
+124  16592 w=   1.0 st=  0.0 lat=  1.0 cum=  351.8 v_pk_mul_f32 v[190:191], v[130:131], v[194:195]
+125  16604 w=   1.0 st=  0.0 lat=  1.0 cum=  352.8 v_pk_mul_f32 v[244:245], v[130:131], v[192:193]
+126  16616 w=   1.0 st=  0.0 lat=  1.0 cum=  353.8 v_pk_mul_f32 v[192:193], v[130:131], v[196:197]
+127  16628 w=   1.0 st=  0.0 lat=  8.0 cum=  354.8 v_wmma_f32_16x16x32_bf16 v[182:189], v[18:25], v[234:241], v[182:189]
+128  16640 w=   2.0 st=  1.0 lat=  2.0 cum=  356.8 v_pk_add_f32 v[242:243], v[242:243], v[138:139] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+129  16652 w=   3.0 st=  0.0 lat=  1.0 cum=  359.8 v_pk_add_f32 v[190:191], v[190:191], v[138:139] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+130  16664 w=   4.0 st=  0.0 lat=  1.0 cum=  363.8 v_pk_add_f32 v[244:245], v[244:245], v[138:139] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+131  16676 w=   1.0 st=  0.0 lat=  1.0 cum=  364.8 v_pk_add_f32 v[198:199], v[192:193], v[138:139] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+132  16688 w=   1.0 st=  0.0 lat=  1.0 cum=  365.8 v_pk_mul_f32 v[242:243], v[242:243], s[6:7] op_sel_hi:[1,0]
+133  16700 w=   1.0 st=  0.0 lat=  1.0 cum=  366.8 v_pk_mul_f32 v[200:201], v[190:191], s[6:7] op_sel_hi:[1,0]
+134  16712 w=   1.0 st=  0.0 lat=  1.0 cum=  367.8 v_pk_mul_f32 v[244:245], v[244:245], s[6:7] op_sel_hi:[1,0]
+135  16724 w=   1.0 st=  0.0 lat=  8.0 cum=  368.8 v_wmma_f32_16x16x32_bf16 v[190:197], v[2:9], v[154:161], 0
+136  16736 w=   2.0 st=  1.0 lat=  2.0 cum=  370.8 v_pk_mul_f32 v[206:207], v[198:199], s[6:7] op_sel_hi:[1,0]
+137  16748 w=   4.0 st=  0.0 lat=  2.0 cum=  374.8 v_exp_f32_e32 v208, v242
+138  16756 w=   1.0 st=  0.0 lat=  2.0 cum=  375.8 v_exp_f32_e32 v212, v200
+139  16760 w=   2.0 st=  1.0 lat=  3.0 cum=  377.8 v_exp_f32_e32 v213, v201
+140  16768 w=   2.0 st=  1.0 lat=  3.0 cum=  379.8 v_exp_f32_e32 v209, v243
+141  16772 w=   2.0 st=  1.0 lat=  3.0 cum=  381.8 v_exp_f32_e32 v210, v244
+142  16776 w=   2.0 st=  1.0 lat=  3.0 cum=  383.8 v_exp_f32_e32 v211, v245
+143  16784 w=   1.0 st=  0.0 lat=  8.0 cum=  384.8 v_wmma_f32_16x16x32_bf16 v[198:205], v[42:49], v[154:161], 0
+144  16796 w=   2.0 st=  1.0 lat=  3.0 cum=  386.8 v_exp_f32_e32 v206, v206
+145  16800 w=   4.0 st=  3.0 lat=  5.0 cum=  390.8 v_exp_f32_e32 v207, v207
+146  16808 w=   1.0 st=  0.0 lat=  1.0 cum=  391.8 v_cvt_pk_bf16_f32 v244, v212, v213
+147  16816 w=   2.0 st=  1.0 lat=  2.0 cum=  393.8 v_cvt_pk_bf16_f32 v242, v208, v209
+148  16824 w=   1.0 st=  0.0 lat=  1.0 cum=  394.8 v_cvt_pk_bf16_f32 v243, v210, v211
+149  16836 w=   2.0 st=  0.0 lat=  8.0 cum=  396.8 v_wmma_f32_16x16x32_bf16 v[190:197], v[10:17], v[186:193], v[190:197]
+150  16848 w=  28.0 st=  0.0 lat=  1.0 cum=  424.8 v_cvt_pk_bf16_f32 v245, v206, v207
+151  16860 w=   1.0 st=  0.0 lat=  3.0 cum=  425.8 ds_store_b128 v144, v[238:241] offset:8864
+152  16868 w=   1.0 st=  0.0 lat=  3.0 cum=  426.8 ds_store_b128 v144, v[194:197] offset:192
+153  16876 w=   1.0 st=  0.0 lat=  3.0 cum=  427.8 ds_store_b128 v144, v[198:201] offset:224
+154  16884 w=   1.0 st=  0.0 lat=  3.0 cum=  428.8 ds_store_b128 v144, v[226:229] offset:8896
+155  16892 w=   1.0 st=  0.0 lat=  3.0 cum=  429.8 ds_store_b128 v144, v[230:233] offset:8928
+156  16900 w=  26.5 st=  0.0 lat=  3.0 cum=  456.3 ds_store_b128 v159, v[242:245] offset:32
+157  16912 w=   1.0 st=  0.0 lat=  8.0 cum=  457.3 v_wmma_f32_16x16x32_bf16 v[198:205], v[50:57], v[186:193], v[198:205]
+158  16924 w=   8.0 st=  7.0 lat= 15.0 cum=  465.3 v_wmma_f32_16x16x32_bf16 v[234:241], v[74:81], v[210:217], 0
+159  16932 w=   8.0 st=  7.0 lat= 15.0 cum=  473.3 v_wmma_f32_16x16x32_bf16 v[242:249], v[114:121], v[210:217], 0
+160  16944 w=   8.0 st=  7.0 lat= 15.0 cum=  481.3 v_wmma_f32_16x16x32_bf16 v[190:197], v[18:25], v[178:185], v[190:197]
+161  16952 w=   8.0 st=  7.0 lat= 15.0 cum=  489.3 v_wmma_f32_16x16x32_bf16 v[198:205], v[58:65], v[178:185], v[198:205]
+162  16964 w=   8.0 st=  7.0 lat= 15.0 cum=  497.3 v_wmma_f32_16x16x32_bf16 v[250:257], v[74:81], v[146:153], 0
+163  16972 w=   8.0 st=  7.0 lat= 15.0 cum=  505.3 v_wmma_f32_16x16x32_bf16 v[210:217], v[114:121], v[146:153], 0
+164  16984 w=   8.0 st=  7.0 lat= 15.0 cum=  513.3 v_wmma_f32_16x16x32_bf16 v[182:189], v[26:33], v[226:233], v[182:189]
+165  16992 w=   2.0 st=  1.0 lat=  2.0 cum=  515.3 v_nop
+166  16996 w=   1.0 st=  0.0 lat=  1.0 cum=  516.3 v_nop
+167  17000 w=   3.0 st=  2.0 lat=  3.0 cum=  519.3 v_nop
+168  17004 w=   1.0 st=  0.0 lat=  1.0 cum=  520.3 v_nop
+169  17012 w=   2.0 st=  1.0 lat=  2.0 cum=  522.3 v_pk_mul_f32 v[226:227], v[130:131], v[182:183]
+170  17024 w=   1.0 st=  0.0 lat=  8.0 cum=  523.3 v_wmma_f32_16x16x32_bf16 v[234:241], v[82:89], v[218:225], v[234:241]
+171  17036 w=   2.0 st=  1.0 lat=  2.0 cum=  525.3 v_pk_mul_f32 v[228:229], v[130:131], v[184:185]
+172  17044 w=   1.0 st=  0.0 lat=  1.0 cum=  526.3 v_pk_mul_f32 v[230:231], v[130:131], v[186:187]
+173  17052 w=   3.0 st=  2.0 lat=  3.0 cum=  529.3 v_pk_mul_f32 v[232:233], v[130:131], v[188:189]
+174  17064 w=   1.0 st=  0.0 lat=  1.0 cum=  530.3 v_pk_add_f32 v[226:227], v[226:227], v[138:139] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+175  17072 w=   2.0 st=  1.0 lat=  2.0 cum=  532.3 v_pk_add_f32 v[228:229], v[228:229], v[138:139] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+176  17080 w=   1.0 st=  0.0 lat=  1.0 cum=  533.3 v_pk_add_f32 v[230:231], v[230:231], v[138:139] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+177  17092 w=   1.0 st=  0.0 lat=  8.0 cum=  534.3 v_wmma_f32_16x16x32_bf16 v[242:249], v[122:129], v[218:225], v[242:249]
+178  17104 w=   2.0 st=  1.0 lat=  2.0 cum=  536.3 v_pk_add_f32 v[232:233], v[232:233], v[138:139] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+179  17112 w=   1.0 st=  0.0 lat=  1.0 cum=  537.3 v_pk_mul_f32 v[226:227], v[226:227], s[6:7] op_sel_hi:[1,0]
+180  17120 w=   5.0 st=  4.0 lat=  5.0 cum=  542.3 v_pk_mul_f32 v[228:229], v[228:229], s[6:7] op_sel_hi:[1,0]
+181  17128 w=   1.0 st=  0.0 lat=  1.0 cum=  543.3 v_pk_mul_f32 v[230:231], v[230:231], s[6:7] op_sel_hi:[1,0]
+182  17140 w= 133.9 st=132.9 lat=133.9 cum=  677.2 s_wait_loadcnt 0x23
+183  17144 w=   1.0 st=  0.0 lat=  1.0 cum=  678.2 v_mov_b32_e32 v138, v181
+184  17152 w=   1.0 st=  0.0 lat=  1.0 cum=  679.2 v_pk_mul_f32 v[232:233], v[232:233], s[6:7] op_sel_hi:[1,0]
+185  17160 w=   1.0 st=  0.0 lat=  2.0 cum=  680.2 v_exp_f32_e32 v226, v226
+186  17168 w=   1.0 st=  0.0 lat=  8.0 cum=  681.2 v_wmma_f32_16x16x32_bf16 v[190:197], v[26:33], v[162:169], v[190:197]
+187  17180 w=   2.0 st=  1.0 lat=  3.0 cum=  683.2 v_exp_f32_e32 v227, v227
+188  17184 w=   1.0 st=  0.0 lat=  1.0 cum=  684.2 v_nop
+189  17188 w=   3.0 st=  2.0 lat=  3.0 cum=  687.2 v_nop
+190  17192 w=   1.0 st=  0.0 lat=  1.0 cum=  688.2 v_nop
+191  17200 w=   2.0 st=  1.0 lat=  2.0 cum=  690.2 v_pk_mul_f32 v[182:183], v[130:131], v[190:191]
+192  17212 w=   1.0 st=  0.0 lat=  8.0 cum=  691.2 v_wmma_f32_16x16x32_bf16 v[198:205], v[66:73], v[162:169], v[198:205]
+193  17224 w=   2.0 st=  1.0 lat=  2.0 cum=  693.2 v_pk_mul_f32 v[184:185], v[130:131], v[192:193]
+194  17232 w=   1.0 st=  0.0 lat=  1.0 cum=  694.2 v_pk_mul_f32 v[186:187], v[130:131], v[194:195]
+195  17240 w=   3.0 st=  2.0 lat=  3.0 cum=  697.2 v_pk_mul_f32 v[188:189], v[130:131], v[196:197]
+196  17252 w=   1.0 st=  0.0 lat=  1.0 cum=  698.2 v_pk_add_f32 v[218:219], v[182:183], v[136:137] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+197  17260 w=   2.0 st=  1.0 lat=  2.0 cum=  700.2 v_pk_add_f32 v[220:221], v[184:185], v[136:137] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+198  17268 w=   1.0 st=  0.0 lat=  1.0 cum=  701.2 v_pk_add_f32 v[222:223], v[186:187], v[136:137] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+199  17280 w=   1.0 st=  0.0 lat=  8.0 cum=  702.2 v_wmma_f32_16x16x32_bf16 v[250:257], v[82:89], v[170:177], v[250:257]
+200  17292 w=   2.0 st=  1.0 lat=  2.0 cum=  704.2 v_pk_mul_f32 v[190:191], v[130:131], v[198:199]
+201  17300 w=   1.0 st=  0.0 lat=  1.0 cum=  705.2 v_pk_mul_f32 v[192:193], v[130:131], v[200:201]
+202  17308 w=   5.6 st=  4.6 lat=  5.6 cum=  710.8 v_pk_mul_f32 v[194:195], v[130:131], v[202:203]
+203  17316 w=   1.0 st=  0.0 lat=  1.0 cum=  711.8 v_pk_mul_f32 v[196:197], v[130:131], v[204:205]
+204  17328 w=   2.0 st=  1.0 lat=  2.0 cum=  713.8 v_pk_add_f32 v[224:225], v[188:189], v[136:137] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+205  17340 w=   1.0 st=  0.0 lat=  1.0 cum=  714.8 v_pk_add_f32 v[182:183], v[190:191], v[136:137] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+206  17348 w=   1.0 st=  0.0 lat=  1.0 cum=  715.8 v_pk_add_f32 v[184:185], v[192:193], v[136:137] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+207  17360 w=   1.0 st=  0.0 lat=  8.0 cum=  716.8 v_wmma_f32_16x16x32_bf16 v[210:217], v[122:129], v[170:177], v[210:217]
+208  17372 w=   2.0 st=  1.0 lat=  2.0 cum=  718.8 v_pk_add_f32 v[186:187], v[194:195], v[136:137] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+209  17380 w=   3.0 st=  2.0 lat=  3.0 cum=  721.8 v_pk_add_f32 v[188:189], v[196:197], v[136:137] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+210  17392 w=   3.0 st=  2.0 lat=  3.0 cum=  724.8 v_pk_mul_f32 v[218:219], v[218:219], s[6:7] op_sel_hi:[1,0]
+211  17400 w=   1.0 st=  0.0 lat=  1.0 cum=  725.8 v_pk_mul_f32 v[220:221], v[220:221], s[6:7] op_sel_hi:[1,0]
+212  17408 w=   2.0 st=  1.0 lat=  2.0 cum=  727.8 v_pk_mul_f32 v[222:223], v[222:223], s[6:7] op_sel_hi:[1,0]
+213  17416 w=   1.0 st=  0.0 lat=  1.0 cum=  728.8 v_pk_mul_f32 v[224:225], v[224:225], s[6:7] op_sel_hi:[1,0]
+214  17428 w=   1.0 st=  0.0 lat=  1.0 cum=  729.8 v_pk_mul_f32 v[182:183], v[182:183], s[6:7] op_sel_hi:[1,0]
+215  17440 w=   1.0 st=  0.0 lat=  8.0 cum=  730.8 v_wmma_f32_16x16x32_bf16 v[234:241], v[98:105], v[202:209], v[234:241]
+216  17452 w=   2.0 st=  1.0 lat=  2.0 cum=  732.8 v_pk_mul_f32 v[184:185], v[184:185], s[6:7] op_sel_hi:[1,0]
+217  17460 w=   1.0 st=  0.0 lat=  1.0 cum=  733.8 v_pk_mul_f32 v[186:187], v[186:187], s[6:7] op_sel_hi:[1,0]
+218  17468 w=   3.0 st=  2.0 lat=  3.0 cum=  736.8 v_pk_mul_f32 v[188:189], v[188:189], s[6:7] op_sel_hi:[1,0]
+219  17480 w=   1.0 st=  0.0 lat=  2.0 cum=  737.8 v_exp_f32_e32 v218, v218
+220  17484 w=   2.0 st=  1.0 lat=  3.0 cum=  739.8 v_exp_f32_e32 v219, v219
+221  17488 w=   2.0 st=  1.0 lat=  3.0 cum=  741.8 v_exp_f32_e32 v220, v220
+222  17492 w=   2.0 st=  1.0 lat=  3.0 cum=  743.8 v_exp_f32_e32 v221, v221
+223  17500 w=   1.0 st=  0.0 lat=  8.0 cum=  744.8 v_wmma_f32_16x16x32_bf16 v[242:249], v[130:137], v[202:209], v[242:249]
+224  17512 w=   2.0 st=  1.0 lat=  3.0 cum=  746.8 v_exp_f32_e32 v222, v222
+225  17516 w=   4.0 st=  3.0 lat=  5.0 cum=  750.8 v_exp_f32_e32 v223, v223
+226  17520 w=   3.0 st=  2.0 lat=  4.0 cum=  753.8 v_exp_f32_e32 v224, v224
+227  17524 w=   2.0 st=  1.0 lat=  3.0 cum=  755.8 v_exp_f32_e32 v225, v225
+228  17528 w=   2.0 st=  1.0 lat=  3.0 cum=  757.8 v_exp_f32_e32 v202, v228
+229  17532 w=   2.0 st=  1.0 lat=  3.0 cum=  759.8 v_exp_f32_e32 v203, v229
+230  17536 w=   2.0 st=  1.0 lat=  3.0 cum=  761.8 v_exp_f32_e32 v204, v230
+231  17544 w=   1.0 st=  0.0 lat=  8.0 cum=  762.8 v_wmma_f32_16x16x32_bf16 v[250:257], v[98:105], v[138:145], v[250:257]
+232  17556 w=   2.0 st=  1.0 lat=  3.0 cum=  764.8 v_exp_f32_e32 v205, v231
+233  17560 w=   4.0 st=  3.0 lat=  5.0 cum=  768.8 v_exp_f32_e32 v206, v232
+234  17564 w=   3.0 st=  2.0 lat=  4.0 cum=  771.8 v_exp_f32_e32 v207, v233
+235  17572 w=   2.0 st=  1.0 lat=  3.0 cum=  773.8 v_exp_f32_e32 v228, v182
+236  17576 w=   2.0 st=  1.0 lat=  3.0 cum=  775.8 v_exp_f32_e32 v229, v183
+237  17580 w=   2.0 st=  1.0 lat=  3.0 cum=  777.8 v_exp_f32_e32 v230, v184
+238  17584 w=   2.0 st=  1.0 lat=  3.0 cum=  779.8 v_exp_f32_e32 v231, v185
+239  17592 w=   1.0 st=  0.0 lat=  8.0 cum=  780.8 v_wmma_f32_16x16x32_bf16 v[210:217], v[130:137], v[138:145], v[210:217]
+240  17604 w=   2.0 st=  1.0 lat=  3.0 cum=  782.8 v_exp_f32_e32 v232, v186
+241  17608 w=   4.0 st=  3.0 lat=  5.0 cum=  786.8 v_exp_f32_e32 v233, v187
+242  17616 w=   4.0 st=  2.0 lat=  4.0 cum=  790.8 v_exp_f32_e32 v182, v188
+243  17620 w=   2.0 st=  0.0 lat=  2.0 cum=  792.8 v_exp_f32_e32 v183, v189
+244  17624 w=   2.0 st=  1.0 lat=  2.0 cum=  794.8 s_wait_loadcnt 0x22
+245  17628 w=   1.0 st=  0.0 lat=  1.0 cum=  795.8 v_mov_b32_e32 v136, v214
+246  17636 w=   1.0 st=  0.0 lat=  8.0 cum=  796.8 v_wmma_f32_16x16x32_bf16 v[234:241], v[106:113], v[194:201], v[234:241]
+247  17644 w=   8.0 st=  7.0 lat= 15.0 cum=  804.8 v_wmma_f32_16x16x32_bf16 v[242:249], v[146:153], v[194:201], v[242:249]
+248  17652 w=   2.0 st=  1.0 lat=  2.0 cum=  806.8 v_nop
+249  17656 w=   1.0 st=  0.0 lat=  1.0 cum=  807.8 v_nop
+250  17660 w=   3.0 st=  2.0 lat=  3.0 cum=  810.8 v_nop
+251  17664 w=   1.0 st=  0.0 lat=  1.0 cum=  811.8 v_nop
+252  17672 w=   2.0 st=  1.0 lat=  2.0 cum=  813.8 v_pk_add_f32 v[194:195], v[234:235], v[134:135] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+253  17680 w=   1.0 st=  0.0 lat=  1.0 cum=  814.8 v_pk_add_f32 v[196:197], v[236:237], v[134:135] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+254  17688 w=   1.0 st=  0.0 lat=  1.0 cum=  815.8 v_pk_add_f32 v[198:199], v[238:239], v[134:135] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+255  17700 w=   1.0 st=  0.0 lat=  8.0 cum=  816.8 v_wmma_f32_16x16x32_bf16 v[250:257], v[106:113], v[130:137], v[250:257]
+256  17712 w=   2.0 st=  1.0 lat=  2.0 cum=  818.8 v_pk_add_f32 v[200:201], v[240:241], v[134:135] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+257  17720 w=   1.0 st=  0.0 lat=  1.0 cum=  819.8 v_pk_add_f32 v[208:209], v[242:243], v[134:135] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+258  17728 w=   3.0 st=  2.0 lat=  3.0 cum=  822.8 v_pk_add_f32 v[234:235], v[244:245], v[134:135] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+259  17736 w=   1.0 st=  0.0 lat=  1.0 cum=  823.8 v_pk_add_f32 v[236:237], v[246:247], v[134:135] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+260  17744 w=   2.0 st=  1.0 lat=  2.0 cum=  825.8 v_pk_add_f32 v[238:239], v[248:249], v[134:135] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+261  17756 w=   1.0 st=  0.0 lat=  1.0 cum=  826.8 v_pk_mul_f32 v[194:195], v[194:195], v[226:227]
+262  17764 w=   1.0 st=  0.0 lat=  1.0 cum=  827.8 v_pk_mul_f32 v[196:197], v[196:197], v[202:203]
+263  17776 w=   1.0 st=  0.0 lat=  8.0 cum=  828.8 v_wmma_f32_16x16x32_bf16 v[210:217], v[146:153], v[130:137], v[210:217]
+264  17788 w=   2.0 st=  1.0 lat=  2.0 cum=  830.8 v_pk_add_f32 v[250:251], v[250:251], v[132:133] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+265  17796 w=   1.0 st=  0.0 lat=  1.0 cum=  831.8 v_pk_add_f32 v[252:253], v[252:253], v[132:133] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+266  17804 w=   3.0 st=  2.0 lat=  3.0 cum=  834.8 v_pk_add_f32 v[254:255], v[254:255], v[132:133] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+267  17816 w=   1.0 st=  0.0 lat=  1.0 cum=  835.8 v_pk_add_f32 v[0:1], v[0:1], v[132:133] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+268  17828 w=   2.0 st=  1.0 lat=  2.0 cum=  837.8 v_pk_mul_f32 v[198:199], v[198:199], v[204:205]
+269  17836 w=   1.0 st=  0.0 lat=  1.0 cum=  838.8 v_pk_mul_f32 v[200:201], v[200:201], v[206:207]
+270  17848 w=   1.0 st=  0.0 lat=  1.0 cum=  839.8 v_pk_mul_f32 v[208:209], v[208:209], v[208:209]
+271  17856 w=   1.0 st=  0.0 lat=  1.0 cum=  840.8 v_pk_add_f32 v[210:211], v[210:211], v[132:133] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+272  17864 w=   1.0 st=  0.0 lat=  1.0 cum=  841.8 v_pk_add_f32 v[212:213], v[212:213], v[132:133] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+273  17872 w=   1.0 st=  0.0 lat=  1.0 cum=  842.8 v_pk_add_f32 v[214:215], v[214:215], v[132:133] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+274  17880 w=   2.0 st=  1.0 lat=  2.0 cum=  844.8 v_pk_add_f32 v[216:217], v[216:217], v[132:133] op_sel_hi:[1,0] neg_lo:[0,1] neg_hi:[0,1]
+275  17888 w=   1.0 st=  0.0 lat=  1.0 cum=  845.8 v_pk_mul_f32 v[234:235], v[234:235], v[210:211]
+276  17896 w=   2.0 st=  1.0 lat=  2.0 cum=  847.8 v_pk_mul_f32 v[236:237], v[236:237], v[212:213]
+277  17904 w=   1.0 st=  0.0 lat=  1.0 cum=  848.8 v_pk_mul_f32 v[238:239], v[238:239], v[206:207]
+278  17916 w=   1.0 st=  0.0 lat=  1.0 cum=  849.8 v_pk_mul_f32 v[240:241], v[250:251], v[218:219]
+279  17924 w=   1.0 st=  0.0 lat=  1.0 cum=  850.8 v_pk_mul_f32 v[242:243], v[252:253], v[220:221]
+280  17932 w=   1.0 st=  0.0 lat=  1.0 cum=  851.8 v_pk_mul_f32 v[244:245], v[254:255], v[222:223]
+281  17944 w=   1.0 st=  0.0 lat=  1.0 cum=  852.8 v_pk_mul_f32 v[246:247], v[0:1], v[224:225]
+282  17956 w=   1.0 st=  0.0 lat=  1.0 cum=  853.8 v_pk_mul_f32 v[210:211], v[210:211], v[228:229]
+283  17964 w=   1.0 st=  0.0 lat=  1.0 cum=  854.8 v_pk_mul_f32 v[212:213], v[212:213], v[230:231]
+284  17972 w=   3.0 st=  2.0 lat=  3.0 cum=  857.8 v_pk_mul_f32 v[214:215], v[214:215], v[232:233]
+285  17984 w=   1.0 st=  0.0 lat=  1.0 cum=  858.8 v_pk_mul_f32 v[216:217], v[216:217], v[182:183]
+286  17992 w=   1.0 st=  0.0 lat=  1.0 cum=  859.8 v_pk_mul_f32 v[194:195], v[194:195], v[130:131]
+287  18000 w=   1.0 st=  0.0 lat=  1.0 cum=  860.8 v_pk_mul_f32 v[196:197], v[196:197], v[130:131]
+288  18008 w=   1.0 st=  0.0 lat=  1.0 cum=  861.8 v_pk_mul_f32 v[198:199], v[198:199], v[130:131]
+289  18016 w=   1.0 st=  0.0 lat=  1.0 cum=  862.8 v_pk_mul_f32 v[200:201], v[200:201], v[130:131]
+290  18024 w=   1.0 st=  0.0 lat=  1.0 cum=  863.8 v_pk_mul_f32 v[208:209], v[208:209], v[130:131]
+291  18032 w=   1.0 st=  0.0 lat=  1.0 cum=  864.8 v_pk_mul_f32 v[234:235], v[234:235], v[130:131]
+292  18040 w=   1.0 st=  0.0 lat=  1.0 cum=  865.8 v_pk_mul_f32 v[236:237], v[236:237], v[130:131]
+293  18048 w=   1.0 st=  0.0 lat=  1.0 cum=  866.8 v_pk_mul_f32 v[238:239], v[238:239], v[130:131]
+294  18056 w=   1.0 st=  0.0 lat=  1.0 cum=  867.8 v_pk_mul_f32 v[240:241], v[240:241], v[130:131]
+295  18064 w=   1.0 st=  0.0 lat=  1.0 cum=  868.8 v_pk_mul_f32 v[242:243], v[242:243], v[130:131]
+296  18072 w=   1.0 st=  0.0 lat=  1.0 cum=  869.8 v_pk_mul_f32 v[244:245], v[244:245], v[130:131]
+297  18080 w=   1.0 st=  0.0 lat=  1.0 cum=  870.8 v_pk_mul_f32 v[246:247], v[246:247], v[130:131]
+298  18088 w=   1.0 st=  0.0 lat=  1.0 cum=  871.8 v_pk_mul_f32 v[248:249], v[210:211], v[130:131]
+299  18096 w=   1.0 st=  0.0 lat=  1.0 cum=  872.8 v_pk_mul_f32 v[250:251], v[212:213], v[130:131]
+300  18104 w=   1.0 st=  0.0 lat=  1.0 cum=  873.8 v_pk_mul_f32 v[252:253], v[214:215], v[130:131]
+301  18112 w=   1.0 st=  0.0 lat=  1.0 cum=  874.8 v_pk_mul_f32 v[254:255], v[216:217], v[130:131]
+302  18124 w=   1.0 st=  0.0 lat=  1.0 cum=  875.8 v_cvt_pk_bf16_f32 v194, v194, v195
+303  18132 w=   1.0 st=  0.0 lat=  1.0 cum=  876.8 v_cvt_pk_bf16_f32 v195, v196, v197
+304  18140 w=   1.0 st=  0.0 lat=  1.0 cum=  877.8 v_cvt_pk_bf16_f32 v196, v198, v199
+305  18148 w=   1.0 st=  0.0 lat=  1.0 cum=  878.8 v_cvt_pk_bf16_f32 v197, v200, v201
+306  18156 w=   1.0 st=  0.0 lat=  1.0 cum=  879.8 v_cvt_pk_bf16_f32 v201, v206, v207
+307  18164 w=   1.0 st=  0.0 lat=  1.0 cum=  880.8 v_cvt_pk_bf16_f32 v200, v204, v205
+308  18172 w=   1.0 st=  0.0 lat=  1.0 cum=  881.8 v_cvt_pk_bf16_f32 v199, v202, v203
+309  18180 w=   1.0 st=  0.0 lat=  1.0 cum=  882.8 v_cvt_pk_bf16_f32 v198, v226, v227
+310  18188 w=   1.0 st=  0.0 lat=  1.0 cum=  883.8 v_cvt_pk_bf16_f32 v202, v208, v209
+311  18196 w=   1.0 st=  0.0 lat=  1.0 cum=  884.8 v_cvt_pk_bf16_f32 v203, v234, v235
+312  18204 w=   1.0 st=  0.0 lat=  1.0 cum=  885.8 v_cvt_pk_bf16_f32 v204, v236, v237
+313  18212 w=   1.0 st=  0.0 lat=  1.0 cum=  886.8 v_cvt_pk_bf16_f32 v205, v238, v239
+314  18220 w=   1.0 st=  0.0 lat=  1.0 cum=  887.8 v_cvt_pk_bf16_f32 v206, v240, v241
+315  18228 w=   1.0 st=  0.0 lat=  1.0 cum=  888.8 v_cvt_pk_bf16_f32 v207, v242, v243
+316  18236 w=   1.0 st=  0.0 lat=  1.0 cum=  889.8 v_cvt_pk_bf16_f32 v208, v244, v245
+317  18244 w=   1.0 st=  0.0 lat=  1.0 cum=  890.8 v_cvt_pk_bf16_f32 v209, v246, v247
+318  18252 w=   1.0 st=  0.0 lat=  1.0 cum=  891.8 v_cvt_pk_bf16_f32 v213, v224, v225
+319  18260 w=   1.0 st=  0.0 lat=  1.0 cum=  892.8 v_cvt_pk_bf16_f32 v212, v222, v223
+320  18268 w=   1.0 st=  0.0 lat=  1.0 cum=  893.8 v_cvt_pk_bf16_f32 v211, v220, v221
+321  18276 w=   1.0 st=  0.0 lat=  1.0 cum=  894.8 v_cvt_pk_bf16_f32 v210, v218, v219
+322  18284 w=   1.0 st=  0.0 lat=  1.0 cum=  895.8 v_cvt_pk_bf16_f32 v214, v248, v249
+323  18292 w=   1.0 st=  0.0 lat=  1.0 cum=  896.8 v_cvt_pk_bf16_f32 v215, v250, v251
+324  18300 w=   1.0 st=  0.0 lat=  1.0 cum=  897.8 v_cvt_pk_bf16_f32 v216, v252, v253
+325  18308 w=   1.0 st=  0.0 lat=  1.0 cum=  898.8 v_cvt_pk_bf16_f32 v217, v254, v255
+326  18320 w=   1.0 st=  0.0 lat=  1.0 cum=  899.8 v_cvt_pk_bf16_f32 v221, v182, v183
+327  18332 w=   1.0 st=  0.0 lat=  1.0 cum=  900.8 v_cvt_pk_bf16_f32 v220, v232, v233
+328  18340 w=   1.0 st=  0.0 lat=  1.0 cum=  901.8 v_cvt_pk_bf16_f32 v219, v230, v231
+329  18348 w=  18.0 st=  0.0 lat=  1.0 cum=  919.8 v_cvt_pk_bf16_f32 v218, v228, v229
+330  18360 w=   1.0 st=  0.0 lat=  3.0 cum=  920.8 ds_store_b128 v159, v[198:201]
+331  18368 w=   1.0 st=  0.0 lat=  3.0 cum=  921.8 ds_store_b128 v159, v[194:197] offset:2560
+332  18376 w=   1.0 st=  0.0 lat=  3.0 cum=  922.8 ds_store_b128 v159, v[202:205] offset:2592
+333  18384 w=   1.0 st=  0.0 lat=  3.0 cum=  923.8 ds_store_b128 v145, v[146:149]
+334  18392 w=   1.0 st=  0.0 lat=  3.0 cum=  924.8 ds_store_b128 v145, v[150:153] offset:32
+335  18400 w=   1.0 st=  0.0 lat=  3.0 cum=  925.8 ds_store_b128 v145, v[154:157] offset:8704
+336  18408 w=   1.0 st=  0.0 lat=  3.0 cum=  926.8 ds_store_b128 v145, v[158:161] offset:8736
+337  18416 w=   1.0 st=  0.0 lat=  3.0 cum=  927.8 ds_store_b128 v145, v[170:173] offset:64
+338  18424 w=   1.0 st=  0.0 lat=  3.0 cum=  928.8 ds_store_b128 v145, v[174:177] offset:96
+339  18432 w=   1.1 st=  0.1 lat=  3.1 cum=  929.9 ds_store_b128 v145, v[186:189] offset:8768
+340  18440 w=   4.1 st=  3.1 lat=  6.1 cum=  934.0 ds_store_b128 v145, v[190:193] offset:8800
+341  18448 w=   3.3 st=  2.3 lat=  5.3 cum=  937.2 ds_store_b128 v145, v[138:141] offset:128
+342  18456 w=   3.7 st=  2.7 lat=  5.7 cum=  941.0 ds_store_b128 v145, v[142:145] offset:160
+343  18464 w=   3.4 st=  2.4 lat=  5.4 cum=  944.4 ds_store_b128 v145, v[178:181] offset:8832
+344  18472 w=   3.8 st=  2.8 lat=  5.8 cum=  948.1 ds_store_b128 v145, v[182:185] offset:8864
+345  18480 w=   3.4 st=  2.4 lat=  5.4 cum=  951.6 ds_store_b128 v145, v[130:133] offset:192
+346  18488 w=   3.5 st=  2.5 lat=  5.5 cum=  955.1 ds_store_b128 v145, v[134:137] offset:224
+347  18496 w=   4.2 st=  3.2 lat=  6.2 cum=  959.3 ds_store_b128 v145, v[162:165] offset:8896
+348  18504 w=   4.6 st=  3.6 lat=  6.6 cum=  963.8 ds_store_b128 v145, v[166:169] offset:8928
+349  18512 w=   4.4 st=  3.4 lat=  6.4 cum=  968.2 ds_store_b128 v160, v[210:213]
+350  18520 w=   3.2 st=  2.2 lat=  5.2 cum=  971.4 ds_store_b128 v160, v[218:221] offset:32
+351  18528 w=   3.5 st=  2.5 lat=  5.5 cum=  975.0 ds_store_b128 v160, v[206:209] offset:2560
+352  18536 w=   3.2 st=  2.2 lat=  5.2 cum=  978.1 ds_store_b128 v160, v[214:217] offset:2592
+353  18544 w=   3.3 st=  2.3 lat=  3.3 cum=  981.4 ds_load_tr16_b128 v[130:133], v161
+354  18552 w=   3.1 st=  2.1 lat=  3.1 cum=  984.6 ds_load_tr16_b128 v[134:137], v161 offset:4352
+355  18560 w=   3.1 st=  2.1 lat=  3.1 cum=  987.7 ds_load_tr16_b128 v[138:141], v162
+356  18568 w=   3.2 st=  2.2 lat=  3.2 cum=  990.9 ds_load_tr16_b128 v[142:145], v162 offset:4352
+357  18576 w=   3.1 st=  2.1 lat=  3.1 cum=  993.9 ds_load_tr16_b128 v[146:149], v163
+358  18584 w=   3.0 st=  2.0 lat=  3.0 cum=  997.0 ds_load_tr16_b128 v[150:153], v163 offset:4352
+359  18592 w=   3.0 st=  2.0 lat=  3.0 cum= 1000.0 ds_load_tr16_b128 v[154:157], v164
+360  18600 w=   3.0 st=  2.0 lat=  3.0 cum= 1003.0 ds_load_tr16_b128 v[158:161], v164 offset:4352
+361  18608 w=   3.0 st=  2.0 lat=  3.0 cum= 1006.1 ds_load_tr16_b128 v[162:165], v165
+362  18616 w=   3.0 st=  2.0 lat=  3.0 cum= 1009.1 ds_load_tr16_b128 v[166:169], v165 offset:4352
+363  18624 w=   1.0 st=  0.0 lat=  1.0 cum= 1010.1 ds_load_tr16_b128 v[170:173], v166
+364  18632 w=   1.0 st=  0.0 lat=  1.0 cum= 1011.1 ds_load_tr16_b128 v[174:177], v166 offset:4352
+365  18640 w=   1.1 st=  0.1 lat=  1.1 cum= 1012.2 ds_load_tr16_b128 v[178:181], v167
+366  18648 w=   1.0 st=  0.0 lat=  1.0 cum= 1013.2 ds_load_tr16_b128 v[182:185], v167 offset:4352
+367  18656 w=   1.0 st=  0.0 lat=  1.0 cum= 1014.2 ds_load_tr16_b128 v[186:189], v168
+368  18664 w=   1.1 st=  0.1 lat=  1.1 cum= 1015.3 ds_load_tr16_b128 v[190:193], v168 offset:4352
+369  18672 w=   1.0 st=  0.0 lat=  1.0 cum= 1016.3 ds_load_tr16_b128 v[194:197], v169
+370  18680 w=   1.0 st=  0.0 lat=  1.0 cum= 1017.3 ds_load_tr16_b128 v[198:201], v169 offset:4352
+371  18688 w=   1.1 st=  0.1 lat=  1.1 cum= 1018.4 ds_load_tr16_b128 v[202:205], v170
+372  18696 w=   1.0 st=  0.0 lat=  1.0 cum= 1019.4 ds_load_tr16_b128 v[206:209], v170 offset:4352
+373  18704 w=   1.1 st=  0.1 lat=  1.1 cum= 1020.5 ds_load_tr16_b128 v[210:213], v171
+374  18712 w=   1.1 st=  0.1 lat=  1.1 cum= 1021.6 ds_load_tr16_b128 v[214:217], v171 offset:4352
+375  18720 w=   1.0 st=  0.0 lat=  1.0 cum= 1022.6 ds_load_tr16_b128 v[218:221], v172
+376  18728 w=   1.1 st=  0.1 lat=  1.1 cum= 1023.7 ds_load_tr16_b128 v[222:225], v172 offset:4352
+377  18736 w=   1.1 st=  0.1 lat=  1.1 cum= 1024.8 ds_load_tr16_b128 v[226:229], v173
+378  18744 w=   1.0 st=  0.0 lat=  1.0 cum= 1025.8 ds_load_tr16_b128 v[230:233], v173 offset:4352
+379  18752 w=   1.1 st=  0.1 lat=  1.1 cum= 1026.9 ds_load_tr16_b128 v[234:237], v174
+380  18760 w=   1.1 st=  0.1 lat=  1.1 cum= 1028.0 ds_load_tr16_b128 v[238:241], v174 offset:4352
+381  18768 w=   1.0 st=  0.0 lat=  1.0 cum= 1029.0 ds_load_tr16_b128 v[242:245], v175
+382  18776 w=   1.1 st=  0.1 lat=  1.1 cum= 1030.1 ds_load_tr16_b128 v[246:249], v175 offset:4352
+383  18784 w=   1.1 st=  0.1 lat=  1.1 cum= 1031.2 ds_load_tr16_b128 v[250:253], v176
+384  18792 w=   4.0 st=  0.0 lat=  1.0 cum= 1035.2 ds_load_tr16_b128 v[254:257], v176 offset:4352
+385  18804 w=   1.0 st=  0.0 lat=  1.0 cum= 1036.2 ds_load_tr16_b128 v[182:185], v177
+386  18812 w=   1.0 st=  0.0 lat=  1.0 cum= 1037.2 ds_load_tr16_b128 v[186:189], v177 offset:1280
+387  18820 w=   1.0 st=  0.0 lat=  1.0 cum= 1038.2 ds_load_tr16_b128 v[190:193], v178
+388  18828 w=   1.1 st=  0.1 lat=  1.1 cum= 1039.3 ds_load_tr16_b128 v[194:197], v178 offset:1280
+389  18836 w=   1.0 st=  0.0 lat=  1.0 cum= 1040.3 ds_load_tr16_b128 v[198:201], v179
+390  18844 w=   1.0 st=  0.0 lat=  1.0 cum= 1041.3 ds_load_tr16_b128 v[202:205], v179 offset:1280
+391  18852 w=   1.1 st=  0.1 lat=  1.1 cum= 1042.4 ds_load_tr16_b128 v[206:209], v180
+392  18860 w=   1.0 st=  0.0 lat=  1.0 cum= 1043.4 ds_load_tr16_b128 v[210:213], v180 offset:1280
+393  18872 w= 188.0 st=187.0 lat=188.0 cum= 1231.4 s_wait_dscnt 0x6
+394  18876 w=   3.0 st=  0.0 lat=  8.0 cum= 1234.4 v_wmma_f32_16x16x32_bf16 v[42:49], v[182:189], v[130:137], v[42:49]
+395  18888 w=   3.0 st=  0.0 lat=  1.0 cum= 1237.4 s_wait_loadcnt 0x20
+396  18892 w=   1.0 st=  0.0 lat=  1.0 cum= 1238.4 v_dual_mov_b32 v132, v216 :: v_dual_mov_b32 v134, v215
+397  18908 w=  10.7 st=  9.7 lat= 10.7 cum= 1249.1 s_wait_dscnt 0x2
+398  18912 w=   7.1 st=  0.0 lat=  8.0 cum= 1256.2 v_wmma_f32_16x16x32_bf16 v[178:185], v[198:205], v[146:153], v[178:185] matrix_a_reuse
+399  18924 w=   1.9 st=  0.9 lat=  1.9 cum= 1258.0 s_wait_dscnt 0x0
+400  18928 w=   1.0 st=  0.0 lat=  8.0 cum= 1259.1 v_wmma_f32_16x16x32_bf16 v[2:9], v[206:213], v[154:161], v[2:9] matrix_a_reuse
+401  18940 w=   8.0 st=  7.0 lat= 15.0 cum= 1267.1 v_wmma_f32_16x16x32_bf16 v[242:249], v[206:213], v[170:177], v[242:249] matrix_a_reuse
+402  18948 w=   8.0 st=  7.0 lat= 15.0 cum= 1275.1 v_wmma_f32_16x16x32_bf16 v[234:241], v[206:213], v[186:193], v[234:241] matrix_a_reuse
+403  18956 w=   8.0 st=  7.0 lat= 15.0 cum= 1283.1 v_wmma_f32_16x16x32_bf16 v[218:225], v[206:213], v[202:209], v[218:225] matrix_a_reuse
+404  18964 w=   8.0 st=  7.0 lat= 15.0 cum= 1291.1 v_wmma_f32_16x16x32_bf16 v[210:217], v[206:213], v[218:225], v[210:217] matrix_a_reuse
+405  18972 w=   8.0 st=  7.0 lat= 15.0 cum= 1299.1 v_wmma_f32_16x16x32_bf16 v[202:209], v[206:213], v[234:241], v[202:209] matrix_a_reuse
+406  18980 w=   8.0 st=  7.0 lat= 15.0 cum= 1307.1 v_wmma_f32_16x16x32_bf16 v[170:177], v[198:205], v[162:169], v[170:177] matrix_a_reuse
+407  18988 w=   8.0 st=  7.0 lat= 15.0 cum= 1315.1 v_wmma_f32_16x16x32_bf16 v[162:169], v[198:205], v[178:185], v[162:169] matrix_a_reuse
+408  18996 w=  15.0 st=  7.0 lat= 15.0 cum= 1330.1 v_wmma_f32_16x16x32_bf16 v[154:161], v[198:205], v[194:201], v[154:161] matrix_a_reuse
+409  19008 w=   3.0 st=  0.0 lat=  8.0 cum= 1333.1 v_wmma_f32_16x16x32_bf16 v[58:65], v[182:189], v[146:153], v[58:65] matrix_a_reuse
+410  19016 w=   1.5 st=  0.5 lat=  1.5 cum= 1334.6 s_wait_loadcnt 0x7
+411  19020 w=   3.0 st=  2.0 lat=  3.0 cum= 1337.6 v_nop
+412  19024 w=   1.0 st=  0.0 lat=  1.0 cum= 1338.6 v_nop
+413  19028 w=   2.0 st=  1.0 lat=  2.0 cum= 1340.6 v_nop
+414  19032 w=   1.0 st=  0.0 lat=  1.0 cum= 1341.6 v_nop
+415  19036 w=   2.0 st=  0.0 lat=  2.0 cum= 1343.6 v_mov_b64_e32 v[146:147], v[110:111]
+416  19040 w=   1.0 st=  0.0 lat=  2.0 cum= 1344.6 v_mov_b64_e32 v[148:149], v[112:113]
+417  19044 w=   3.0 st=  2.0 lat=  3.0 cum= 1347.6 s_wait_loadcnt 0x6
+418  19048 w=   2.0 st=  0.0 lat=  2.0 cum= 1349.6 v_mov_b64_e32 v[150:151], v[98:99]
+419  19052 w=   8.0 st=  0.0 lat=  8.0 cum= 1357.6 v_wmma_f32_16x16x32_bf16 v[50:57], v[182:189], v[162:169], v[50:57] matrix_a_reuse
+420  19060 w=   2.0 st=  1.0 lat=  3.0 cum= 1359.6 v_mov_b64_e32 v[152:153], v[100:101]
+421  19064 w=   2.0 st=  1.0 lat=  2.0 cum= 1361.6 v_nop
+422  19068 w=   1.0 st=  0.0 lat=  1.0 cum= 1362.6 v_nop
+423  19072 w=   1.0 st=  0.0 lat=  1.0 cum= 1363.6 v_nop
+424  19076 w=   1.0 st=  0.0 lat=  2.0 cum= 1364.6 v_mov_b64_e32 v[166:167], v[94:95]
+425  19080 w=   2.0 st=  1.0 lat=  3.0 cum= 1366.6 v_mov_b64_e32 v[168:169], v[96:97]
+426  19084 w=   3.0 st=  1.0 lat=  3.0 cum= 1369.6 v_mov_b64_e32 v[162:163], v[90:91]
+427  19088 w=   8.0 st=  0.0 lat=  8.0 cum= 1377.6 v_wmma_f32_16x16x32_bf16 v[34:41], v[182:189], v[178:185], v[34:41] matrix_a_reuse
+428  19096 w=   2.0 st=  1.0 lat=  3.0 cum= 1379.6 v_mov_b64_e32 v[164:165], v[92:93]
+429  19100 w=   2.0 st=  1.0 lat=  2.0 cum= 1381.6 v_nop
+430  19104 w=   1.0 st=  0.0 lat=  1.0 cum= 1382.6 v_nop
+431  19108 w=   1.0 st=  0.0 lat=  1.0 cum= 1383.6 v_nop
+432  19112 w=   1.0 st=  0.0 lat=  2.0 cum= 1384.6 v_mov_b64_e32 v[182:183], v[86:87]
+433  19116 w=   2.0 st=  1.0 lat=  3.0 cum= 1386.6 v_mov_b64_e32 v[184:185], v[88:89]
+434  19120 w=   3.0 st=  1.0 lat=  3.0 cum= 1389.6 v_mov_b64_e32 v[178:179], v[78:79]
+435  19124 w=   8.0 st=  0.0 lat=  8.0 cum= 1397.6 v_wmma_f32_16x16x32_bf16 v[26:33], v[182:189], v[194:201], v[26:33] matrix_a_reuse
+436  19132 w=   2.0 st=  1.0 lat=  3.0 cum= 1399.6 v_mov_b64_e32 v[180:181], v[80:81]
+437  19136 w=   2.0 st=  1.0 lat=  2.0 cum= 1401.6 v_nop
+438  19140 w=   1.0 st=  0.0 lat=  1.0 cum= 1402.6 v_nop
+439  19144 w=   1.0 st=  0.0 lat=  1.0 cum= 1403.6 v_nop
+440  19148 w=   1.0 st=  0.0 lat=  2.0 cum= 1404.6 v_mov_b64_e32 v[198:199], v[62:63]
+441  19152 w=   2.0 st=  1.0 lat=  3.0 cum= 1406.6 v_mov_b64_e32 v[200:201], v[64:65]
+442  19156 w=   3.0 st=  1.0 lat=  3.0 cum= 1409.6 v_mov_b64_e32 v[194:195], v[54:55]
+443  19160 w=   8.0 st=  0.0 lat=  8.0 cum= 1417.6 v_wmma_f32_16x16x32_bf16 v[10:17], v[182:189], v[210:217], v[10:17] matrix_a_reuse
+444  19168 w=   2.0 st=  1.0 lat=  3.0 cum= 1419.6 v_mov_b64_e32 v[196:197], v[56:57]
+445  19176 w=   2.0 st=  1.0 lat=  9.0 cum= 1421.6 v_wmma_f32_16x16x32_bf16 v[250:257], v[182:189], v[226:233], v[250:257] matrix_a_reuse
+446  19184 w=   8.0 st=  7.0 lat= 15.0 cum= 1429.6 v_wmma_f32_16x16x32_bf16 v[226:233], v[182:189], v[242:249], v[226:233] matrix_a_reuse
+447  19196 w=   8.0 st=  7.0 lat= 15.0 cum= 1437.6 v_wmma_f32_16x16x32_bf16 v[122:129], v[190:197], v[138:145], v[122:129]
+448  19204 w=   8.0 st=  7.0 lat= 15.0 cum= 1445.6 v_wmma_f32_16x16x32_bf16 v[114:121], v[190:197], v[154:161], v[114:121] matrix_a_reuse
+449  19212 w=   2.0 st=  1.0 lat=  2.0 cum= 1447.6 v_nop
+450  19216 w=   1.0 st=  0.0 lat=  1.0 cum= 1448.6 v_nop
+451  19220 w=   3.0 st=  2.0 lat=  3.0 cum= 1451.6 v_nop
+452  19224 w=   1.0 st=  0.0 lat=  1.0 cum= 1452.6 v_nop
+453  19228 w=   2.0 st=  1.0 lat=  3.0 cum= 1454.6 v_mov_b64_e32 v[154:155], v[82:83]
+454  19232 w=   2.0 st=  1.0 lat=  3.0 cum= 1456.6 v_mov_b64_e32 v[156:157], v[84:85]
+455  19236 w=   3.0 st=  1.0 lat=  3.0 cum= 1459.6 v_mov_b64_e32 v[158:159], v[66:67]
+456  19240 w=   9.0 st=  0.0 lat=  8.0 cum= 1468.6 v_wmma_f32_16x16x32_bf16 v[106:113], v[190:197], v[170:177], v[106:113] matrix_a_reuse
+457  19248 w=   1.0 st=  0.0 lat=  2.0 cum= 1469.6 v_mov_b64_e32 v[160:161], v[68:69]
+458  19252 w=   3.0 st=  2.0 lat=  3.0 cum= 1472.6 s_wait_loadcnt 0x4
+459  19256 w=   1.0 st=  0.0 lat=  1.0 cum= 1473.6 v_nop
+460  19260 w=   1.0 st=  0.0 lat=  1.0 cum= 1474.6 v_nop
+461  19264 w=   1.0 st=  0.0 lat=  1.0 cum= 1475.6 v_nop
+462  19268 w=   1.0 st=  0.0 lat=  2.0 cum= 1476.6 v_mov_b64_e32 v[174:175], v[106:107]
+463  19272 w=   2.0 st=  1.0 lat=  3.0 cum= 1478.6 v_mov_b64_e32 v[176:177], v[108:109]
+464  19276 w=   3.0 st=  1.0 lat=  3.0 cum= 1481.6 v_mov_b64_e32 v[170:171], v[102:103]
+465  19280 w=   8.0 st=  0.0 lat=  8.0 cum= 1489.6 v_wmma_f32_16x16x32_bf16 v[98:105], v[190:197], v[186:193], v[98:105] matrix_a_reuse
+466  19288 w=   2.0 st=  1.0 lat=  3.0 cum= 1491.6 v_mov_b64_e32 v[172:173], v[104:105]
+467  19292 w=   2.0 st=  1.0 lat=  2.0 cum= 1493.6 v_nop
+468  19296 w=   1.0 st=  0.0 lat=  1.0 cum= 1494.6 v_nop
+469  19300 w=   1.0 st=  0.0 lat=  1.0 cum= 1495.6 v_nop
+470  19304 w=   1.0 st=  0.0 lat=  2.0 cum= 1496.6 v_mov_b64_e32 v[190:191], v[74:75]
+471  19308 w=   2.0 st=  1.0 lat=  3.0 cum= 1498.6 v_mov_b64_e32 v[192:193], v[76:77]
+472  19312 w=   3.0 st=  1.0 lat=  3.0 cum= 1501.6 v_mov_b64_e32 v[186:187], v[70:71]
+473  19316 w=   8.0 st=  0.0 lat=  8.0 cum= 1509.6 v_wmma_f32_16x16x32_bf16 v[90:97], v[190:197], v[202:209], v[90:97] matrix_a_reuse
+474  19324 w=   2.0 st=  1.0 lat=  3.0 cum= 1511.6 v_mov_b64_e32 v[188:189], v[72:73]
+475  19328 w=   2.0 st=  1.0 lat=  2.0 cum= 1513.6 v_nop
+476  19332 w=   1.0 st=  0.0 lat=  1.0 cum= 1514.6 v_nop
+477  19336 w=   1.0 st=  0.0 lat=  1.0 cum= 1515.6 v_nop
+478  19340 w=   1.0 st=  0.0 lat=  2.0 cum= 1516.6 v_mov_b64_e32 v[206:207], v[50:51]
+479  19344 w=   2.0 st=  1.0 lat=  3.0 cum= 1518.6 v_mov_b64_e32 v[208:209], v[52:53]
+480  19348 w=   3.0 st=  1.0 lat=  3.0 cum= 1521.6 v_mov_b64_e32 v[202:203], v[46:47]
+481  19352 w=   8.0 st=  0.0 lat=  8.0 cum= 1529.6 v_wmma_f32_16x16x32_bf16 v[82:89], v[190:197], v[218:225], v[82:89] matrix_a_reuse
+482  19360 w=   2.0 st=  1.0 lat=  3.0 cum= 1531.6 v_mov_b64_e32 v[204:205], v[48:49]
+483  19364 w=   2.0 st=  1.0 lat=  2.0 cum= 1533.6 v_nop
+484  19368 w=   1.0 st=  0.0 lat=  1.0 cum= 1534.6 v_nop
+485  19372 w=   1.0 st=  0.0 lat=  1.0 cum= 1535.6 v_nop
+486  19376 w=   1.0 st=  0.0 lat=  2.0 cum= 1536.6 v_mov_b64_e32 v[222:223], v[42:43]
+487  19380 w=   2.0 st=  1.0 lat=  3.0 cum= 1538.6 v_mov_b64_e32 v[224:225], v[44:45]
+488  19384 w=   3.0 st=  1.0 lat=  3.0 cum= 1541.6 v_mov_b64_e32 v[218:219], v[38:39]
+489  19388 w=   8.0 st=  0.0 lat=  8.0 cum= 1549.6 v_wmma_f32_16x16x32_bf16 v[74:81], v[190:197], v[234:241], v[74:81] matrix_a_reuse
+490  19396 w=   2.0 st=  1.0 lat=  3.0 cum= 1551.6 v_mov_b64_e32 v[220:221], v[40:41]
+491  19400 w=   2.0 st=  1.0 lat=  2.0 cum= 1553.6 v_nop
+492  19404 w=   1.0 st=  0.0 lat=  1.0 cum= 1554.6 v_nop
+493  19408 w=   1.0 st=  0.0 lat=  1.0 cum= 1555.6 v_nop
+494  19412 w=   1.0 st=  0.0 lat=  2.0 cum= 1556.6 v_mov_b64_e32 v[238:239], v[18:19]
+495  19416 w=   2.0 st=  1.0 lat=  3.0 cum= 1558.6 v_mov_b64_e32 v[240:241], v[20:21]
+496  19420 w=   3.0 st=  1.0 lat=  3.0 cum= 1561.6 v_mov_b64_e32 v[234:235], v[14:15]
+497  19424 w=   8.0 st=  0.0 lat=  8.0 cum= 1569.6 v_wmma_f32_16x16x32_bf16 v[66:73], v[190:197], v[250:257], v[66:73] matrix_a_reuse
+498  19432 w=   3.0 st=  1.0 lat=  3.0 cum= 1572.6 v_mov_b64_e32 v[236:237], v[16:17]
+499  19440 w=   3.0 st=  0.0 lat=  8.0 cum= 1575.6 v_wmma_f32_16x16x32_bf16 v[186:193], v[198:205], v[130:137], v[186:193]
+500  19448 w=   1.0 st=  0.0 lat=  1.0 cum= 1576.6 s_wait_loadcnt 0x0
+501  19452 w=   3.0 st=  2.0 lat=  3.0 cum= 1579.6 v_nop
+502  19456 w=   1.0 st=  0.0 lat=  1.0 cum= 1580.6 v_nop
+503  19460 w=   2.0 st=  1.0 lat=  2.0 cum= 1582.6 v_nop
+504  19464 w=   1.0 st=  0.0 lat=  1.0 cum= 1583.6 v_nop
+505  19472 w=   1.0 st=  0.0 lat=  2.0 cum= 1584.6 v_mov_b64_e32 v[134:135], v[126:127]
+506  19476 w=   2.0 st=  1.0 lat=  3.0 cum= 1586.6 v_mov_b64_e32 v[136:137], v[128:129]
+507  19480 w=   3.0 st=  1.0 lat=  3.0 cum= 1589.6 v_mov_b64_e32 v[130:131], v[122:123]
+508  19488 w=   8.0 st=  0.0 lat=  8.0 cum= 1597.6 v_wmma_f32_16x16x32_bf16 v[138:145], v[198:205], v[210:217], v[138:145] matrix_a_reuse
+509  19500 w=   2.0 st=  1.0 lat=  3.0 cum= 1599.6 v_mov_b64_e32 v[132:133], v[124:125]
+510  19504 w=   2.0 st=  1.0 lat=  2.0 cum= 1601.6 v_nop
+511  19508 w=   1.0 st=  0.0 lat=  1.0 cum= 1602.6 v_nop
+512  19512 w=   1.0 st=  0.0 lat=  1.0 cum= 1603.6 v_nop
+513  19516 w=   1.0 st=  0.0 lat=  2.0 cum= 1604.6 v_mov_b64_e32 v[210:211], v[58:59]
+514  19520 w=   2.0 st=  1.0 lat=  3.0 cum= 1606.6 v_mov_b64_e32 v[212:213], v[60:61]
+515  19524 w=   3.0 st=  1.0 lat=  3.0 cum= 1609.6 v_mov_b64_e32 v[214:215], v[34:35]
+516  19532 w=   8.0 st=  0.0 lat=  8.0 cum= 1617.6 v_wmma_f32_16x16x32_bf16 v[90:97], v[198:205], v[226:233], v[90:97] matrix_a_reuse
+517  19544 w=   2.0 st=  1.0 lat=  3.0 cum= 1619.6 v_mov_b64_e32 v[216:217], v[36:37]
+518  19548 w=   2.0 st=  1.0 lat=  2.0 cum= 1621.6 v_nop
+519  19552 w=   1.0 st=  0.0 lat=  1.0 cum= 1622.6 v_nop
+520  19556 w=   1.0 st=  0.0 lat=  1.0 cum= 1623.6 v_nop
+521  19560 w=   1.0 st=  0.0 lat=  2.0 cum= 1624.6 v_mov_b64_e32 v[230:231], v[26:27]
+522  19564 w=   2.0 st=  1.0 lat=  3.0 cum= 1626.6 v_mov_b64_e32 v[232:233], v[28:29]
+523  19568 w=   3.0 st=  1.0 lat=  3.0 cum= 1629.6 v_mov_b64_e32 v[226:227], v[22:23]
+524  19576 w=   8.0 st=  0.0 lat=  8.0 cum= 1637.6 v_wmma_f32_16x16x32_bf16 v[34:41], v[198:205], v[242:249], v[34:41] matrix_a_reuse
+525  19588 w=   2.0 st=  1.0 lat=  3.0 cum= 1639.6 v_mov_b64_e32 v[228:229], v[24:25]
+526  19592 w=   2.0 st=  1.0 lat=  2.0 cum= 1641.6 v_nop
+527  19596 w=   1.0 st=  0.0 lat=  1.0 cum= 1642.6 v_nop
+528  19600 w=   1.0 st=  0.0 lat=  1.0 cum= 1643.6 v_nop
+529  19604 w=   1.0 st=  0.0 lat=  2.0 cum= 1644.6 v_mov_b64_e32 v[246:247], v[10:11]
+530  19608 w=   2.0 st=  1.0 lat=  3.0 cum= 1646.6 v_mov_b64_e32 v[248:249], v[12:13]
+531  19612 w=   3.0 st=  1.0 lat=  3.0 cum= 1649.6 v_mov_b64_e32 v[242:243], v[6:7]
+532  19616 w=   8.0 st=  0.0 lat=  8.0 cum= 1657.6 v_wmma_f32_16x16x32_bf16 v[18:25], v[206:213], v[138:145], v[18:25]
+533  19624 w=   2.0 st=  1.0 lat=  3.0 cum= 1659.6 v_mov_b64_e32 v[244:245], v[8:9]
+534  19628 w=   2.0 st=  1.0 lat=  2.0 cum= 1661.6 v_nop
+535  19632 w=   1.0 st=  0.0 lat=  1.0 cum= 1662.6 v_nop
+536  19636 w=   1.0 st=  0.0 lat=  1.0 cum= 1663.6 v_nop
+537  19640 w=   1.0 st=  0.0 lat=  2.0 cum= 1664.6 v_mov_b64_e32 v[142:143], v[118:119]
+538  19644 w=   2.0 st=  1.0 lat=  3.0 cum= 1666.6 v_mov_b64_e32 v[144:145], v[120:121]
+539  19648 w=   3.0 st=  1.0 lat=  3.0 cum= 1669.6 v_mov_b64_e32 v[138:139], v[114:115]
+540  19656 w=   8.0 st=  0.0 lat=  8.0 cum= 1677.6 v_wmma_f32_16x16x32_bf16 v[194:201], v[206:213], v[250:257], v[194:201] matrix_a_reuse
+541  19668 w=   2.0 st=  1.0 lat=  3.0 cum= 1679.6 v_mov_b64_e32 v[140:141], v[116:117]
+542  19672 w=   2.0 st=  1.0 lat=  2.0 cum= 1681.6 v_nop
+543  19676 w=   1.0 st=  0.0 lat=  1.0 cum= 1682.6 v_nop
+544  19680 w=   1.0 st=  0.0 lat=  1.0 cum= 1683.6 v_nop
+545  19684 w=   1.0 st=  0.0 lat=  2.0 cum= 1684.6 v_mov_b64_e32 v[250:251], v[30:31]
+546  19688 w=   2.0 st=  1.0 lat=  3.0 cum= 1686.6 v_mov_b64_e32 v[252:253], v[32:33]
+547  19692 w=   2.0 st=  1.0 lat=  3.0 cum= 1688.6 v_mov_b64_e32 v[254:255], v[2:3]
+548  19700 w=   2.0 st=  1.0 lat=  3.0 cum= 1690.6 v_mov_b64_e32 v[0:1], v[4:5]
+549  19708 w=  24.1 st=  0.0 lat=  1.0 cum= 1714.7 s_cbranch_scc1 64515

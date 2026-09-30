@@ -1,0 +1,207 @@
+{
+ "queue": [
+  {
+   "rank": 1,
+   "name": "dqg_u2off",
+   "kernel": "k_dqg",
+   "change_spec": "Copy arms/r29 to arms/dqg_u2off and set kernels.py:1174 DQ_U2 = True -> False (verified at that line). k_dkdv, impl.py and _env.py stay byte-identical. Compile gate: k_dkdv stays at 729 VGPR / 70656 B, and k_dqg must match r19h's ISA shape (0 spill). Then arm.sh prod blocked, plus kbench prod blk for the k_dq split. Also take one ATT of k_dqg so the tail-clump loadcnt wait can be compared against U2.",
+   "expected_gain_pct": 1.1,
+   "risk": "Very low: this configuration already shipped as r19h. No wedge path.",
+   "why_this_rank": "One flag, about 10 minutes of card time. It is a control for every other k_dqg arm: if the non-U2 form wins, dqg_tailpf loses its target, because the non-U2 loop has a single head clump with full lead. Evidence 0928__a0_repro/REPORT.md:176-182 (k_dq r19h 2.214 vs r29 2.290 ms) confirms the reversal on A0.",
+   "kill_criterion": "Prod op time is not at least 0.5% faster than r29 in the same process, or kbench k_dq is not below r29's. If it loses, U2 stays and dqg_tailpf proceeds. If it wins, promote it as the k_dqg base and drop dqg_tailpf."
+  },
+  {
+   "rank": 2,
+   "name": "dkdv_lse_late (merges dkdv_lsefence + dkdv_lse_late)",
+   "kernel": "k_dkdv",
+   "change_spec": "Variant a (dkdv_lsefence): insert rocdl.sched_barrier(0) after the b_do/b_q construction loop, before `new = [None]*...` (kernels.py ~L482), so the PHI copy V650<-V693 cannot rise to Vaddr 17140. Variant b, only if variant a's ISA gate fails: issue the hh=0 LSE b32 load after hh=0's last use, with an exp2-anchored z=smin(bits,0) index dependency, so the load lands directly in the carried register. Both variants are bitwise. ISA gate (free): the `s_wait_loadcnt 0x23` + `v_mov v138` pair (CSV:1600-1601, ISA:1611-1612) is gone or moved below the first dK/dV WMMA; no loadcnt wait with a threshold above 0x10 sits between the S/dP WMMAs and phase K; VGPR at most 737; 0 spill. Then arm.sh plus an ATT of k_dkdv.",
+   "expected_gain_pct": 3,
+   "risk": "Low. sched_barrier(0) acts as a boundary, not a clamp (bwd-history closed-axes table), and COPYs may be placed after scheduling, so variant a can yield identical ISA. The free ISA gate catches that. No index change in variant a.",
+   "why_this_rank": "Verified: CSV dispatch_10 line 1600 shows s_wait_loadcnt 0x23 with stall 502310/3780 = 133 cyc/iter, immediately followed by v_mov_b32 v138,v181. This is the single cleanest bitwise target and also removes the iteration-time spread. I discount the proposers' 4% to about 3%, because single-wave schedule edits have historically lost part of their ATT attribution (for example ku2 +7.3% despite removing 64 v_mov).",
+   "kill_criterion": "The ISA gate shows the wait still in front of the copy under both variants (dead at zero card cost). Or prod is below +0.5%, or the ATT phase-H wait is still above 40 cyc/iter."
+  },
+  {
+   "rank": 3,
+   "name": "dkdv_ku2_att (re-measure, closed-axis reopen)",
+   "kernel": "k_dkdv",
+   "change_spec": "Copy arms/r29 and set kernels.py:55 KV_U2 = False -> True (verified the flag exists and is off). Compile gate: 0 v_mov_b64 in the loop, VGPR at most 740, 0 spill. Run arm.sh at prod and take an ATT of k_dkdv. Read phase M (the WMMA gaps in the dK/dV tail) and the dscnt wait before the first dK/dV WMMA in both bodies.",
+   "expected_gain_pct": 1,
+   "risk": "Low: the code already exists and is bitwise. The only risk is wasted card time; the prior is negative (c_ku2 +7.3% on B0, lab-kdq REPORT.md:30).",
+   "why_this_rank": "Flag flip, high information. The ATT attributes 192 cyc/iter to rotation copies and WAR nops, but removing them on B0 lost 7.3%. The ATT of ku2 tells us whether that attribution is real on A0, and why ku2 lost (probably a longer DS drain), before we invest in dkdv_flip_tdm, whose gain relies on the same M-phase cycles.",
+   "kill_criterion": "Prod is not at least +0.5%: record the ATT phase deltas and close it again. Whatever the result, the ATT must show where the removed ~190 cycles went; if they reappear as dscnt or loadcnt wait, mark the M-phase attribution as non-recoverable in single-wave form."
+  },
+  {
+   "rank": 4,
+   "name": "dkdv_divfree",
+   "kernel": "k_dkdv",
+   "change_spec": "Remove the two runtime signed divisions ii//G and jj//G in qloop_full, qloop_mask and qloop_full2 (kernels.py:531,539). Preferred form: carry (qi, gh) as loop-state counters, where gh+1 wraps to 0 and increments qi, and the clamped jj reuses the same wrap. Fallback: lgG shift/mask with a host power-of-two assert and the old path kept behind a constexpr flag. Bitwise. ISA gate: no s_mul_hi/s_abs/s_cselect division sequence in .LBB0_11. Today about 27 SALU are at CSV:1374-1400, Vaddr 15628-15732.",
+   "expected_gain_pct": 1.2,
+   "risk": "Very low. SGPR only. CPU proof needed for the counter wrap and the jj clamp at n-1.",
+   "why_this_rank": "Verified: CSV:1376-1400 holds the full signed-division expansion (s_abs, s_mul_hi, 2x s_cselect, sign fixup) inside the hot loop, 46 cyc/iter by wall. The change is small, stacks with everything, and involves no scheduling gamble.",
+   "kill_criterion": "Loop SALU count is not reduced in the ISA, or prod is below +0.3% when stacked on the rank-2 winner. Promote only as part of a stack if its standalone gain is below the 0.5% threshold."
+  },
+  {
+   "rank": 5,
+   "name": "dkdv_trorder (+ qdoburst as variant b)",
+   "kernel": "k_dkdv",
+   "change_spec": "Variant a: fenced 4-region emission of the final DS phase. a_p(kh0) + b_do first, then a_ds(kh0) + b_q with 8 dV WMMAs, then kh1's A operands with the dK kh0 WMMAs, then the rest. Per-slot accumulator order is unchanged, so the result is bitwise. Variant b: also split the hh loop so all 32 Q/dO staging ds_stores are one fenced burst at the top of _body, after nxt=_ldqd (dkdv_qdoburst). ISA gate: the first dK/dV WMMA is preceded by s_wait_dscnt with a threshold of at least 0x10 (today 0x6, CSV:1857); no dscnt 0x0 before the 17th tail WMMA; VGPR at most 760; 0 spill.",
+   "expected_gain_pct": 3,
+   "risk": "Low to medium. Bitwise, no index change. g93 and g94 showed LLVM ignoring order hints, so the free ISA gate decides. Fences can inflate VGPR.",
+   "why_this_rank": "Verified: CSV:1857 s_wait_dscnt 0x6 has stall 706737/3780 = 187 cyc/iter, the largest single stall in k_dkdv. It is cheaper than dkdv_flip and tells us how much of the DS drain is ordering versus the P/dS round trip. The closed-axes table lists 'LDS port pressure P3 -8.19%', so the gain must come from latency and order, not bandwidth.",
+   "kill_criterion": "ISA dscnt threshold before the first dK/dV WMMA is still at most 0x8 (dead for free). Or prod is below +0.5%. Or ATT phase L is still above 120 cyc/iter."
+  },
+  {
+   "rank": 6,
+   "name": "dqg_tailpf (merges dqg_earlyclump a/b + dqg_tailpf)",
+   "kernel": "k_dqg",
+   "change_spec": "Only if dqg_u2off did not win. Keep U2. Issue body 2's K/V prefetch for block ii+2 as one contiguous clump right after the point where the carried set dies. Variant b (preferred for VGPR) splits it per kt, issuing 16 loads once each kt half dies, with a rocdl.sched_barrier(0x78F) VMEM-only fence after each. Same _ldkv(jj*KV_STEP) with the existing clamp, so the output is bitwise. ISA gate: at least ~100 WMMAs between the last clump load and the loop-head s_wait_loadcnt 0x20 (verified today at CSV dispatch_11 line 670, stall 207607/1018 = 204 cyc/trip); VGPR at most 1024; 0 spill; 0 scratch.",
+   "expected_gain_pct": 2,
+   "risk": "Medium on VGPR: k_dqg is at 991/1024 and the fence may stop reuse of registers, which spills. The gate catches it. No wedge path.",
+   "why_this_rank": "This is the largest k_dqg stall and it has a clear mechanism (the tail clump gets only 214-490 cycles of lead). It is ranked after u2off because u2off may make it moot.",
+   "kill_criterion": "Spill > 0 in both variants. Or the clump lead in the ISA does not grow. Or prod is below +0.5% against the better of r29 and dqg_u2off."
+  },
+  {
+   "rank": 7,
+   "name": "mem_soffset_q (xcnt fold; = dqg_earlyclump variant c)",
+   "kernel": "k_dqg",
+   "change_spec": "In gfrag2/_ldkv (kernels.py ~1230-1275), build K/V loop-load addresses as a loop-invariant per-lane voffset, plus a readfirstlane'd uniform soffset (kv0 row base), plus an immediate dt*64[+32], using rocdl.raw_ptr_buffer_load. The target is the v_or_b32 v90,0xc0,v69 rebuild at CSV dispatch_11:648 and the s_wait_xcnt 0x2 at :647 (verified at 110970/1018 = 109 cyc/trip). The k_dqg descriptors stay fake 1<<30; do not 'fix' them. ISA gate: 0 s_wait_xcnt and at most 2 v_or in the loop; VGPR at most 991.",
+   "expected_gain_pct": 1.2,
+   "risk": "Medium bounds attention: the address rewrite needs a CPU byte-exact proof over all lanes, dt, kv0 and shapes. No wedge path unless an address goes OOB with a fake descriptor, which is exactly why the proof is mandatory.",
+   "why_this_rank": "Verified mechanism (TA register recycle), orthogonal to tailpf, stacks. The k_dkdv half (mem_soffset_kv) is deferred because k_dkdv has no xcnt waits and its phase-B gain is small (~50 cyc).",
+   "kill_criterion": "xcnt waits remain in the ISA, the CPU proof fails, or prod is below +0.3% when stacked on the rank-1/6 winner."
+  },
+  {
+   "rank": 8,
+   "name": "dqg_dkdv_streams",
+   "kernel": "both",
+   "change_spec": "impl.py only: after k_delta, launch k_dqg on a side stream (s2.wait_stream(main)) concurrently with k_dkdv; record_stream on the inputs and dq_o; main.wait_stream(s2) before return. Check that the _launch cache does not bake in the stream. Variant b swaps the launch order. Run the 200-run dk/dv bitwise gate.",
+   "expected_gain_pct": 0.7,
+   "risk": "Low: no kernel change. With 729/991 VGPR, each SIMD holds one wave of either kernel, so the overlap is only at the tail and ramp boundaries. Possible interference with training-stream semantics in e2e.",
+   "why_this_rank": "Cheap, orthogonal, zero wedge risk, but the gain is bounded by the inter-kernel boundary (~1-3% of one kernel's tail). It goes after the kernel-internal cheap arms.",
+   "kill_criterion": "Prod is below +0.4%, or kbench shows the kernels' sum rising (interference) by more than the saved boundary."
+  },
+  {
+   "rank": 9,
+   "name": "dkdv_flip",
+   "kernel": "k_dkdv",
+   "change_spec": "As proposed: S = Q*K^T, dP = dO*V^T (swap the WMMA operands at ~L410-415). P and dS become the B operand of dV^T = dO^T*P and dK^T = Q^T*dS directly from the C registers via cvt_pk plus a v8 concat of hh0 and hh1. Delete the P/dS LDS stores and a_p/a_ds tr16. LSE/delta become per-element (8 q rows per lane per hh): budget 16+16 VGPR current plus 32 carried, not +24 as the proposer claimed. Swap the roles in the causal predicate. Write the epilogue directly with row=kv. Host-dispatch r29 when Sq%8 != 0. Validate ≥50 dB and run-to-run bitwise; it cannot be bitwise versus r29, because WMMA operand roles change. Before building, run ablation A1 (noPdS_lds) to price the upper bound.",
+   "expected_gain_pct": 5,
+   "risk": "Medium: new index expressions (vec4 LSE, epilogue, mask) need a CPU proof. VGPR 729 -> ~790. No TDM, no atomics, no wedge path.",
+   "why_this_rank": "The largest single-wave structural lever, and the enabler for TDM, 2-wave and w4. The ASM trace shows P/dS never touch LDS. It is gated behind ablation A1 so we do not repeat the 'deleting LDS ops was not faster' surprise (P3 -8.19%).",
+   "kill_criterion": "Ablation A1 shows less than 4% k_dkdv gain (then do not build it). Or the compile has spills or VGPR above 850. Or prod is below +1% after stacking on ranks 2-5."
+  },
+  {
+   "rank": 10,
+   "name": "dkdv_flip_tdm",
+   "kernel": "k_dkdv",
+   "change_spec": "On top of dkdv_flip: Q/dO come through TDM (aiter shim, explicit pad, true extents) into a 2-deep LDS ring. S/dP A operands use ds_load_b128 one hh ahead; the dV^T/dK^T A operands use tr16 from the ring. LSE/delta stay on VMEM. Remove the 32 b128 loads, the 32 ds_stores, the carried 128-VGPR prefetch and the v_mov rotation. tensor_wait is never 0 in the loop. First, a toy TDM launch in its own flocked process per gfx1250-card-safety, plus a CPU proof enumerating every TDM tile origin including the clamped prefetch.",
+   "expected_gain_pct": 6,
+   "risk": "High wedge risk: the TDM extent-error hang path requires the toy first, run alone. L effort.",
+   "why_this_rank": "After flip, the premise that closed h49/#34 (dual-use staging) is gone. Ranked after flip because it depends on it and carries the wedge risk. Ablation A2 (noQdO_vmem) prices it first.",
+   "kill_criterion": "Ablation A2 shows less than 8% k_dkdv headroom. Or the TDM toy fails or hangs (stop TDM for the day and switch to CPU). Or prod is below +1.5% over dkdv_flip."
+  },
+  {
+   "rank": 11,
+   "name": "dqg_tdm_kvlds",
+   "kernel": "k_dqg",
+   "change_spec": "As proposed, behind DQ_TDM: K/V for block ii+1 go through TDM into a double-buffered LDS ring. S/dP read their A operands with ds_load_b128 one kt ahead; dQ reads K^T with tr16 from the same buffer. The carry holds only the accumulators. Reuse the TDM toy and shim from rank 10.",
+   "expected_gain_pct": 2.5,
+   "risk": "High (TDM wedge path), and new DS switches at 1 wave/SIMD may eat the gain. L effort.",
+   "why_this_rank": "Ablation A4 (noKV_vmem in k_dqg) must first show at least ~12% k_dqg headroom. It reuses rank 10's TDM infrastructure, so it goes after that.",
+   "kill_criterion": "A4 headroom below 10%, VGPR not below ~800, or prod below +1%."
+  },
+  {
+   "rank": 12,
+   "name": "dkdv_flip_tdm_2w",
+   "kernel": "k_dkdv",
+   "change_spec": "As proposed: VGPR at most 512 from the code shape only (no maxnreg/waves_per_eu), LDS at most 40 KB, with the V-in-LDS fallback. Gate: .vgpr_count at most 512, 0 spill, then PMC and ATT confirm 2 waves per SIMD.",
+   "expected_gain_pct": 6,
+   "risk": "High VGPR risk: 384 resident plus streaming is very tight. The 2-wave k_dq history (o1 +14.7%) was a different form.",
+   "why_this_rank": "Only buildable after rank 10 reports its VGPR. It is the only single-kernel way to hide the 29-cycle switches that the roofline measured.",
+   "kill_criterion": "Compile above 512 VGPR with 0 spill after both fallbacks, or prod below +2% over dkdv_flip_tdm."
+  },
+  {
+   "rank": 13,
+   "name": "w4_tdm_share",
+   "kernel": "k_dkdv",
+   "change_spec": "As proposed: a 4-wave BLOCK_KV=128 WG with a shared TDM Q/dO ring, bare s_barrier_signal/wait split barriers (no fx.barrier fences), partial dscnt only, and near/far pairing. The BARRIER-CENSUS gate runs first on the ISA.",
+   "expected_gain_pct": 1.5,
+   "risk": "Medium-high: barrier cost history (w4 0.664x, nobar 0.923), plus the TDM wedge path, plus new kv0/wave index proofs.",
+   "why_this_rank": "It is a go/no-go gate for the fused dQ, not a win in itself. It only makes sense after flip+TDM have proven themselves.",
+   "kill_criterion": "The ISA shows a loadcnt/dscnt 0x0 before any signal, or fewer than 3 WMMAs between signal and wait. Or the ATT barrier stall is above 15% of step cycles. Or it is more than 3% slower than dkdv_flip_tdm."
+  },
+  {
+   "rank": 14,
+   "name": "w4_fused_dq",
+   "kernel": "both",
+   "change_spec": "As proposed, staged: A = the dQ WMMA with a resident K slice and the dS LDS exchange, with the result sunk (ATOM=0). B = add SCOPE_DEV fp32 atomics, deferred one step, 1 per WMMA gap, immediate offsets, no storecnt waits. Drop k_dqg and convert via redsp nsp=1.",
+   "expected_gain_pct": 10,
+   "risk": "High: bounds, VGPR ~700, and atomic back-pressure under full-chip load (ASM pays 208-634 cyc/step). FUSED5 died at 0.391x. L effort.",
+   "why_this_rank": "This is the only lever that removes the 7-vs-5 GEMM gap, so it is required to beat ASM rather than match it. It is last because it depends on ranks 9, 10 and 13, and ablation A5 prices its matrix-work increment.",
+   "kill_criterion": "Stage A adds more than 20% over w4_tdm_share. Or stage B's op time is not below the best non-fused champion. Or dq run-to-run SNR is below 70 dB."
+  }
+ ],
+ "ablations": [
+  {
+   "name": "A0_base_att",
+   "spec": "The r29 byte copy re-run under the same M8 driver (marker kernel, discard 3, median of 7, PMC GRBM_GUI_ACTIVE/8) plus ATT on CU1, as the reference for every ablation below. No change.",
+   "answers": "The same-session noise floor, and the reference per-phase ATT used to compare the ablations."
+  },
+  {
+   "name": "A1_dkdv_noPdS_lds",
+   "spec": "In k_dkdv _body: stop the P/dS round trip. Guard the two P/dS llvm_dialect.store ops with a runtime-false wave-uniform predicate (e.g. qt < 0) so the P/dS VALU is not dead-code eliminated. Replace a_p/a_ds with the already-loaded b_q[0]/b_do[0] fragments, so the 8 tr16 A-operand loads disappear. No index or address change. Output is wrong. ISA check: 0 P/dS ds_store in the loop, 32 tr16 instead of 40, WMMA count unchanged at 64.",
+   "answers": "The upper bound of dkdv_flip (and partly of trorder): how many of the 199 dscnt + ~50 switch + ~30 DS-issue cycles are really recoverable once the P/dS LDS dependence is gone. It also rechecks, on reflashed A0, the old P3 finding that deleting LDS ops was not faster."
+  },
+  {
+   "name": "A2_dkdv_noQdO_vmem",
+   "spec": "In qloop_full, carry the previous iteration's Q/dO registers unchanged (nxt Q/dO = pre Q/dO; the LSE/delta loads stay). The 32 buffer_load_b128, the back-edge v_mov_b64 rotation and the WAR v_nops should all vanish; the Q/dO LDS staging and tr16 stay. Output is wrong. ISA check: 4 b32 and 0 b128 loads in the loop, 0 v_mov_b64.",
+   "answers": "The light-speed of the Q/dO global path in k_dkdv (phases D, M and part of H/B): the upper bound for dkdv_flip_tdm and the TDM ring. It also shows whether ku2's loss came from something other than the rotation copies."
+  },
+  {
+   "name": "A3_dkdv_nosm",
+   "spec": "In k_dkdv, P = cvt(S) and dS = cvt(dP): skip the scale, -lse, exp2, -delta and multiply. The lse/delta loads stay issued, with their values sunk through a single v_add into one element so they are not removed. Output is wrong. ISA check: 0 v_exp in the loop; WMMA and DS counts unchanged.",
+   "answers": "How much of the exposed VALU (phase J 91 plus I/F/G ~78 cyc/iter) is real time, which bounds any fine-grained 3-stage software-pipeline rewrite in the ASM style. Compare with fwd M8, where nosm gave -18.6%."
+  },
+  {
+   "name": "A4_dqg_noKV_vmem",
+   "spec": "In k_dqg's U2 kvloop_full, carry the K/V prefetch set unchanged in both bodies (nxt = pre), so the 64 buffer_load_b128 per trip and the xcnt/loadcnt waits disappear. The K ds_store and tr16 path stays. Output is wrong. ISA check: 0 buffer_load_b128 in the loop, 0 s_wait_xcnt.",
+   "answers": "The upper bound of the k_dqg memory path (loadcnt 302 + VMEM issue 214 + xcnt 124 + back-pressure ~60 per trip). It sizes dqg_tailpf, mem_soffset_q and dqg_tdm_kvlds together, and says whether the slow-wave population (wv0/4/8/12) is purely memory."
+  },
+  {
+   "name": "A5_dkdv_plus_dqwmma",
+   "spec": "Add 16 extra WMMAs per k_dkdv iteration, shaped like the fused dQ GEMM (A = the existing dS bf16 fragment or a_ds, B = the resident kf fragments, chained 4 deep from zero). Sink the result once after the loop into an unused accumulator lane via a single add, so it is not dead-code eliminated. No atomics, no new loads. ISA check: 80 WMMA per iteration, VGPR at most 1024, 0 spill.",
+   "answers": "What 25% more matrix work costs inside the current 1-wave k_dkdv when the operands are resident. This is stage A of w4_fused_dq without the barrier and w4 confounders, and it separates FUSED5 P1's +30% into the WMMA cost versus the tr16 reload."
+  }
+ ],
+ "rejected": [
+  {
+   "name": "dkdv_lsefence (standalone)",
+   "reason": "Duplicate of dkdv_lse_late. It is folded in as variant a (fence), with the anchor-dependency load as variant b if the fence yields identical ISA. sched_barrier(0) is recorded as a boundary, not a clamp, so a fallback is needed."
+  },
+  {
+   "name": "dqg_earlyclump (standalone)",
+   "reason": "Variants a/b duplicate dqg_tailpf and are merged into it (rank 6). Variant c duplicates mem_soffset's k_dqg half and becomes mem_soffset_q (rank 7). Both are gated on dqg_u2off losing."
+  },
+  {
+   "name": "dkdv_qdoburst (standalone)",
+   "reason": "The same final-DS-phase mechanism as dkdv_trorder (moving the 16 hh=1 stores out of the drain). It is folded in as trorder variant b so the two are measured as one ordering experiment rather than two 10-minute card slots."
+  },
+  {
+   "name": "mem_soffset_kv (k_dkdv half)",
+   "reason": "Deferred rather than killed. k_dkdv's loop has no xcnt waits, and the address VALU is about 50 cyc/iter, much of it hidden. It adds bounds-proof risk on true-extent descriptors for about 1% at best. Revisit only if dkdv_flip_tdm is abandoned, because TDM removes these loads anyway."
+  },
+  {
+   "name": "dkdv_ku2 stacked with trorder fences in both bodies",
+   "reason": "Build it only if dkdv_ku2_att itself is not a loss. Stacking fences on a variant that lost 7.3% on B0 repeats the closed c_ku2b (+8.7%) without new evidence."
+  },
+  {
+   "name": "'16-18% of k_dkdv from low-risk bitwise fixes -> ~5.9 ms' projection (dkdv report)",
+   "reason": "Rejected as a plan assumption, not as an arm. On this kernel, removing attributed cycles has repeatedly failed to translate into time: ku2 removed 64 v_mov and was +7.3% slower; VF_KV removed 50 instructions and was null; P3 deleting all LDS ops and P1 were both slower. The queue discounts roughly 50% and puts ablations A1-A4 before any structural build."
+  },
+  {
+   "name": "ASM 'dependent chain 8 cycles' claim as a design input",
+   "reason": "This contradicts the roofline's measured 16-cycle dependent latency (0930__roofline/REPORT.md:13), and the SQ issue timestamps may not reflect matrix-core start. No arm may rely on back-to-back same-accumulator chains until a GPU microbenchmark settles it. Keep the 2-accumulator alternation."
+  }
+ ],
+ "summary_zh": "抽查结论：各报告里的关键数字，我按 ATT csv 和源码逐条核对，都对得上。\n- k_dkdv：dispatch_10.csv:1600 的 s_wait_loadcnt 0x23 是 502310/3780 = 133 cyc/轮，紧接着一条 v_mov v138,v181（LSE 回边拷贝）；:1857 的 s_wait_dscnt 0x6 是 187 cyc/轮。\n- k_dqg：dispatch_11.csv:670 的 loadcnt 0x20 是 204 cyc/trip；:647 的 xcnt 0x2 是 109 cyc/trip，原因是 v_or 重建地址寄存器。\n- 其他：CSV:1376-1400 确实有一整段有符号除法 ii//G 的展开；KV_U2=False 在 L55，DQ_U2=True 在 L1174。\nfly 相对 ASM 的差距（每个 32q×32kv 单元，ATT 口径 2606 vs 1581）：\n- k_dqg 重算 S/dP 多 256；\n- DS 往返和 WMMA↔DS 切换多约 620，其中 P/dS 过 LDS 和末段 in-order drain 是大头；\n- 全局访存 staging（VMEM 发射 + 回边 v_mov 轮转 + LSE 拷贝过早）多约 450；\n- VALU 成团没藏住多约 370；\n- ASM 反过来要付 atomic 430 和 barrier 208。\n怀疑点：历史上\"删掉某类指令\"这种手段在 k_dkdv 上屡次不兑现：\n- ku2 去掉 64 条 v_mov 反而 +7.3%；\n- VF_KV 少 50 条指令，结果 null；\n- P3 删光 LDS 指令、P1 去掉 Q/dO 往返，都反而变慢。\n所以报告里\"低风险 bitwise 修改能拿 16-18%\"这个说法我打五折。结构性改动开工前，先跑 M8 消融定上限：A1 去掉 P/dS 过 LDS，A2 去掉 Q/dO 的 VMEM，A3 nosm，A4 k_dqg 去掉 K/V 的 VMEM，A5 在 k_dkdv 里多加 16 条 dQ WMMA。\n合并：lsefence 并入 lse_late；earlyclump 拆进 tailpf 和 mem_soffset_q；qdoburst 并入 trorder 当变体 b。\n执行顺序：\n1) dqg_u2off：只改一个开关，A0 上 U2 已经反转（k_dq 2.290 vs 2.214 ms），它同时是 k_dqg 各 arm 的对照；\n2) dkdv_lse_late，bitwise，约 3%；\n3) ku2 带 ATT 重测，便宜、信息量高；\n4) divfree；\n5) trorder；\n6) tailpf，前提是 u2off 输了；\n7) soffset_q；\n8) 双 stream 并发；\n9) 然后跑消融；\n10) dkdv_flip，约 5%，是后续 TDM、2-wave、w4 的前提；\n11) flip_tdm（先 toy，有挂卡路径）；\n12) dqg_tdm；\n13) flip_tdm_2w（VGPR 要 ≤512）；\n14) w4_tdm_share（barrier 的 go/no-go）；\n15) w4_fused_dq（5-GEMM，约 10%，要超过 ASM 只能靠它）。\n预期：前 8 项便宜的合计约 8-10%，约 6.58 → 6.0 ms；flip 加 TDM 再拿约 10%，大致追平 5.5 ms；要超过 ASM 需要融合 dQ。\n另外，ASM 报告说\"同一累加器的依赖链只要 8 cyc\"，这和 roofline 实测的 16 cyc 冲突，要先用 GPU 微基准定下来，在那之前不作为设计依据。"
+}

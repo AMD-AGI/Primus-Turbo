@@ -107,9 +107,9 @@ Unrecoverable markers: `wait for reset ack`, `ring gfx timeout`, `GPU reset begi
 |---|---|---|
 | rocprofv3 **PC sampling** | ❌ never -- wedged MES 2026-09-11, 3 attempts 3 faults | FWDSPEC safety block; h4 |
 | rocprofv3 `--pmc` | ✅ works, ~2 min per counter group; 51 counters defined, only 9 trustworthy (h20 whitelist); `SQ_VALU_WMMA_FLOP_*` read 0 | STAGE2-S0-PROBE.md S0-c; h20 |
-| `--kernel-trace` / `--runtime-trace` / `--hip-trace` | ❌ produce a .db with **0 dispatch rows** (458 symbols registered) -- silently analyses nothing | S0-c |
+| `--kernel-trace` / `--runtime-trace` / `--hip-trace` | ❌ produce a .db with **0 dispatch rows** (458 symbols registered) -- silently analyses nothing | S0-c; **still 0 rows after the reflash** (09-30) -> rocprofv3 1.3.2, use the PMC csv for kernel names/timestamps |
 | rocprofv3 VGPR column | ⚠ **half** the ISA count; read descriptors / `21_final_isa.s`, not derived percentages | FWDSPEC safety block |
-| ATT (thread trace) | ⚠ safe (4 runs, zero faults) but **captures nothing for FlyDSL JIT kernels** (only `*_code_object_id_*.out`); `--att-buffer-size` is bytes (`64` aborts and looks like a hang) | h25 |
+| ATT (thread trace) | ✅ **works since the 09-29 A0 reflash** (2026-09-30): per-instruction Hitcount/Latency/Stall/Idle for FlyDSL JIT *and* ASM `.co` (`stats_ui_output_*.csv`). Recipe: `rocprofv3 --att --att-library-path /opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib --att-target-cu 1 --kernel-include-regex k_d[kq] --output-format csv --output-file att -d <dir> -- python3 benchmark.py ... --iters 1 --warmup-seconds 0 --block 1 --lead 0`; summariser `output/0930__bwd/tools/attsum.py`. Old state: captured nothing for FlyDSL (h25) | `output/0930__bwd/probe/P1-RESULTS.md` |
 | rocprof-compute | ❌ not used: gfx1250 panels map to near-empty counters, and it overrides the counter table | h25 |
 | static ISA metrics as a ranking signal | ❌ wrong four times; use them to screen (spill/VGPR/LDS), not to rank | h26, h54 §2 |
 

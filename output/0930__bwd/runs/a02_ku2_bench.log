@@ -1,0 +1,12 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+# arm r29 -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/r29 md5=c6b95c2c
+# arm dkdv_ku2 -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/dkdv_ku2 md5=00180042
+# arm r29_aa -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0930__bwd/arms/r29_aa md5=c6b95c2c
+# arm asm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/ruler/bwd/oe/artifacts/job/job_context/op/beat md5=2802a918
+# statistic median  iters 51  warmup 3.0s continuous  order blocked 9+lead 4, palindromic rounds  device gfx1250
+RESULT shape=prod arm=r29 stat=median iters=54 latency_ms=6.563048362731934 min_ms=6.503313064575195 max_ms=6.622532844543457 tflops=837.7554032271838 bw_gbs=204.50516373176708 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1882 sclk_end=2081 causal=True order=blocked9+lead4
+RESULT shape=prod arm=dkdv_ku2 stat=median iters=54 latency_ms=7.09934401512146 min_ms=7.015608787536621 max_ms=7.166975021362305 tflops=774.4700377681208 bw_gbs=189.05652087589914 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1882 sclk_end=2081 causal=True order=blocked9+lead4
+RESULT shape=prod arm=r29_aa stat=median iters=54 latency_ms=6.55837345123291 min_ms=6.508111000061035 max_ms=6.5992841720581055 tflops=838.3525684232553 bw_gbs=204.65093822122674 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1882 sclk_end=2081 causal=True order=blocked9+lead4
+RESULT shape=prod arm=asm stat=median iters=54 latency_ms=5.489072799682617 min_ms=5.417338848114014 max_ms=5.531767845153809 tflops=1001.6681192200462 bw_gbs=244.51803227634468 flop=5498229227520.0 bytes_min=1342177280 sclk_start=1882 sclk_end=2081 causal=True order=blocked9+lead4
+rc=0

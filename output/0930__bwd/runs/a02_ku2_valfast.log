@@ -1,0 +1,11 @@
+  refcache fast: IGNORED, provenance differs on ['common_sha'] -- recomputing
+refcache fast: accepted with common_sha 988c14caed5d9a80
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+CORR shape=fast arm=r29 dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=r29 runs=3 dkdv=bitwise dq_worst=bitwise  pass
+CORR shape=fast arm=dkdv_ku2 dq  52.61 dB  dk  52.65 dB  dv  52.83 dB  pass
+DET shape=fast arm=dkdv_ku2 runs=3 dkdv=bitwise dq_worst=bitwise  pass
+XARM shape=fast dkdv_ku2 vs r29: dq=bitwise dk=bitwise dv=bitwise
+LABVAL fast PASS
+rc=0
