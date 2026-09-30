@@ -41,12 +41,21 @@ def qk_rmsnorm_rope_shape_error(
         return f"packed width {qkv.shape[-1]} != q+k+v {q_size + k_size + v_size}"
     if q_gamma.shape != (D,) or k_gamma.shape != (D,):
         return f"q/k gamma must both be [{D}], got {tuple(q_gamma.shape)}/{tuple(k_gamma.shape)}"
-    if q_gamma.dtype != torch.bfloat16 or k_gamma.dtype != torch.bfloat16:
-        return f"q/k gamma must be bfloat16, got {q_gamma.dtype}/{k_gamma.dtype}"
+    if (
+        q_gamma.dtype != torch.bfloat16
+        or k_gamma.dtype != torch.bfloat16
+        or not q_gamma.is_contiguous()
+        or not k_gamma.is_contiguous()
+    ):
+        return "q/k gamma must be contiguous bfloat16"
     if freqs.shape != (qkv.shape[0], 1, 1, D):
         return f"freqs must be [{qkv.shape[0]},1,1,{D}], got {tuple(freqs.shape)}"
     if freqs.dtype != torch.float32 or not freqs.is_contiguous():
         return f"freqs must be contiguous float32, got dtype={freqs.dtype} contiguous={freqs.is_contiguous()}"
+    if not (qkv.is_cuda and q_gamma.is_cuda and k_gamma.is_cuda and freqs.is_cuda):
+        return "qkv, q/k gamma, and freqs must be CUDA tensors"
+    if not (qkv.device == q_gamma.device == k_gamma.device == freqs.device):
+        return "qkv, q/k gamma, and freqs must be on the same device"
     return None
 
 

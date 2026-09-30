@@ -192,6 +192,7 @@ def _emit_fused_body(
         goff = arith.select(w < I32(_HW), w, I32(_OOB))
         gv = buffer_ops.buffer_load(gs, goff, vec_width=1, dtype=T.i32)
         _lds_store1(lds.gam.ptr, w, fx.Int32(gv))
+    fx.barrier()
 
     # ---- phase A: streaming residual add -> x_plus_r, fp32 sum of squares
     acc = [F32(0.0), F32(0.0), F32(0.0), F32(0.0)]
@@ -381,10 +382,15 @@ def _fused_supported(x, residual, gamma) -> bool:
         return False
     if x.shape != residual.shape or gamma.ndim != 1 or gamma.shape[0] != _H:
         return False
+    if not (x.device == residual.device == gamma.device):
+        return False
+    arch = str(torch.cuda.get_device_properties(x.device).gcnArchName).split(":", 1)[0]
+    if arch != "gfx950":
+        return False
     if x.shape[-1] != _H:
         return False
     rows = x.numel() // _H
-    if rows % _BR or rows == 0:
+    if rows % 256 or rows == 0:
         return False
     return x.is_contiguous() and residual.is_contiguous() and gamma.is_contiguous()
 
@@ -489,7 +495,7 @@ class _FusedRMSNormMXFP4SkipY(torch.autograd.Function):
 def _reference_path(x, residual, gamma, eps):
     y, xpr = rmsnorm_residual(x, residual, gamma, eps)
     row, row_scale, col, col_scale = quantize_fp4_with_trans(
-        y.reshape(-1, _H).contiguous(),
+        y.reshape(-1, y.shape[-1]).contiguous(),
         float4_e2m1fn_x2,
         _GRANULARITY,
         block_size=MXFP4_BLOCK_SIZE,

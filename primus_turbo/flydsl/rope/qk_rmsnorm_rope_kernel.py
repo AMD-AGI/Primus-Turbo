@@ -54,23 +54,28 @@ _BWD_GRID_CYCLES = 64
 # Megatron passes the same full-sequence rotary table to every transformer
 # layer.  Materialize cos/sin once and reuse it across all fused launches rather
 # than evaluating transcendental functions independently for every Q/K head.
-# Keep only one entry per device so a regenerated table cannot grow the cache.
+# Keep one entry per device and stream. Same-stream ordering makes reuse safe;
+# another stream builds its own table rather than racing an asynchronous fill.
 _ROTARY_TABLE_CACHE = {}
 
 
 def _cached_cos_sin(freqs):
     import weakref
 
+    import torch
+
     device = freqs.device.index
+    stream = torch.cuda.current_stream(freqs.device).cuda_stream
     version = freqs._version
-    cached = _ROTARY_TABLE_CACHE.get(device)
+    key = (device, stream)
+    cached = _ROTARY_TABLE_CACHE.get(key)
     if cached is not None:
         ref, cached_version, cosine, sine = cached
         if ref() is freqs and cached_version == version:
             return cosine, sine
     cosine = freqs.cos()
     sine = freqs.sin()
-    _ROTARY_TABLE_CACHE[device] = (weakref.ref(freqs), version, cosine, sine)
+    _ROTARY_TABLE_CACHE[key] = (weakref.ref(freqs), version, cosine, sine)
     return cosine, sine
 
 

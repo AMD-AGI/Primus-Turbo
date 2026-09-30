@@ -51,7 +51,7 @@ def _inputs(S=8, B=4, NG=2, NPG=8, seed=123):
     return qkv, q_gamma, k_gamma, freqs, split
 
 
-@pytest.mark.parametrize("S,B,NG", [(4, 1, 1), (8, 4, 2)])
+@pytest.mark.parametrize("S,B,NG", [(4, 1, 1), (8, 4, 2), (129, 1, 1)])
 def test_fused_qkv_rmsnorm_rope_forward(S, B, NG):
     eps = 1.0e-5
     args = _inputs(S=S, B=B, NG=NG)
@@ -64,7 +64,7 @@ def test_fused_qkv_rmsnorm_rope_forward(S, B, NG):
 
 def test_fused_qkv_rmsnorm_rope_backward():
     eps = 1.0e-5
-    qkv, q_gamma, k_gamma, freqs, split = _inputs(seed=321)
+    qkv, q_gamma, k_gamma, freqs, split = _inputs(S=65, B=1, NG=1, seed=321)
     qkv.requires_grad_()
     q_gamma.requires_grad_()
     k_gamma.requires_grad_()
@@ -90,3 +90,11 @@ def test_fused_qkv_rmsnorm_rope_rejects_wrong_head_dim():
     qkv, q_gamma, k_gamma, freqs, _ = _inputs()
     with pytest.raises(ValueError, match="unsupported input"):
         fused_qkv_rmsnorm_rope(qkv, q_gamma, k_gamma, freqs, [8 * _D, 128, 128], 1.0e-5)
+
+
+def test_fused_qkv_rmsnorm_rope_rejects_strided_gamma():
+    qkv, _, k_gamma, freqs, split = _inputs()
+    q_gamma = torch.randn(2 * _D, device="cuda", dtype=torch.bfloat16)[::2]
+    assert not q_gamma.is_contiguous()
+    with pytest.raises(ValueError, match="contiguous bfloat16"):
+        fused_qkv_rmsnorm_rope(qkv, q_gamma, k_gamma, freqs, split, 1.0e-5)
