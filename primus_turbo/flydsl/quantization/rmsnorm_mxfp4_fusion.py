@@ -1,7 +1,14 @@
 ###############################################################################
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
-# See LICENSE for license information.
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2025 FlyDSL Project Contributors
+#
+# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL)
+# Modified by the Primus-Turbo team.
+#
+# This file is distributed under the Apache License 2.0 (see LICENSE-APACHE),
+# not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
 """Single-launch residual RMSNorm + row/column MXFP4 quantization (GPT-OSS).
@@ -30,11 +37,11 @@ kept by a real backward over the saved ``x_plus_r`` / ``rstd``.
 import functools
 from typing import Tuple
 
-import torch
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, buffer_ops, math as fm, range_constexpr, rocdl
+import torch
+from flydsl.expr import arith, buffer_ops, range_constexpr, rocdl
+from flydsl.expr import math as fm
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
@@ -135,9 +142,9 @@ def _srd(t, nrec_bytes):
 
 
 def _lds_store1(lds_ptr, off, val):
-    fx.make_view(
-        fx.add_offset(lds_ptr, fx.make_int_tuple(off)), fx.make_layout(1, 1)
-    ).store(Vec.from_elements([val], fx.Int32))
+    fx.make_view(fx.add_offset(lds_ptr, fx.make_int_tuple(off)), fx.make_layout(1, 1)).store(
+        Vec.from_elements([val], fx.Int32)
+    )
 
 
 def _emit_fused_body(
@@ -214,11 +221,7 @@ def _emit_fused_body(
     ssq = (acc[0] + acc[1]) + (acc[2] + acc[3])
     for m in range_constexpr(3):
         idx = (lane ^ I32(1 << m)) << I32(2)
-        other = _f32(
-            fx.Int32(
-                rocdl.ds_bpermute(IRI, _raw(idx), _raw(arith.bitcast(T.i32, _raw(ssq))))
-            )
-        )
+        other = _f32(fx.Int32(rocdl.ds_bpermute(IRI, _raw(idx), _raw(arith.bitcast(T.i32, _raw(ssq))))))
         ssq = ssq + other
     rstd = fm.rsqrt(ssq / F32(float(_H)) + EPS)
 
@@ -245,9 +248,7 @@ def _emit_fused_body(
             if i < kwvec:
                 pwords = [hold[(i, q)] for q in range_constexpr(4)]
             else:
-                xv = buffer_ops.buffer_load(
-                    xps, rowbase + woff, vec_width=4, dtype=T.i32
-                )
+                xv = buffer_ops.buffer_load(xps, rowbase + woff, vec_width=4, dtype=T.i32)
                 pwords = [fx.Int32(xv[q]) for q in range_constexpr(4)]
             # Both branches now yield a packed-bf16 i32 word per lane; unpack
             # uniformly regardless of whether it came from a register or HBM.
@@ -266,9 +267,7 @@ def _emit_fused_body(
             # words 32..127 of every tile row are hidden padding -> must read 0
             zer = Vec.from_elements([I32(0)] * 4, fx.Int32)
             for k in range_constexpr(3):
-                _lds_store_vec4(
-                    lds.buf.ptr, rr * I32(_TCW) + I32(32 + k * 32) + jj * I32(4), zer
-                )
+                _lds_store_vec4(lds.buf.ptr, rr * I32(_TCW) + I32(32 + k * 32) + jj * I32(4), zer)
         fx.barrier()
 
         # ---- ROW phase: one 32-element microblock per thread, no RHT
@@ -378,11 +377,7 @@ def _build_launcher():
 def _fused_supported(x, residual, gamma) -> bool:
     if not (x.is_cuda and residual.is_cuda and gamma.is_cuda):
         return False
-    if (
-        x.dtype is not torch.bfloat16
-        or residual.dtype != x.dtype
-        or gamma.dtype != x.dtype
-    ):
+    if x.dtype is not torch.bfloat16 or residual.dtype != x.dtype or gamma.dtype != x.dtype:
         return False
     if x.shape != residual.shape or gamma.ndim != 1 or gamma.shape[0] != _H:
         return False

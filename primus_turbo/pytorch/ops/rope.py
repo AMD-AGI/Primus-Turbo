@@ -121,6 +121,4 @@ def fused_qkv_rmsnorm_rope(
     why = qk_rmsnorm_rope_shape_error(qkv, q_gamma, k_gamma, freqs, qkv_split_arg_list)
     if why is not None:
         raise ValueError(f"fused_qkv_rmsnorm_rope: unsupported input ({why})")
-    return _FusedQKVRMSNormRoPEFunction.apply(
-        qkv, q_gamma, k_gamma, freqs, qkv_split_arg_list, float(eps)
-    )
+    return _FusedQKVRMSNormRoPEFunction.apply(qkv, q_gamma, k_gamma, freqs, qkv_split_arg_list, float(eps))

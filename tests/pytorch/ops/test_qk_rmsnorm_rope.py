@@ -24,9 +24,7 @@ def _rope(x, freqs):
     angle = freqs[:, :half].float()[:, None, None, :]
     cosine, sine = angle.cos(), angle.sin()
     lo, hi = x[..., :half].float(), x[..., half:].float()
-    return torch.cat(
-        (lo * cosine - hi * sine, hi * cosine + lo * sine), dim=-1
-    ).bfloat16()
+    return torch.cat((lo * cosine - hi * sine, hi * cosine + lo * sine), dim=-1).bfloat16()
 
 
 def _reference(qkv, q_gamma, k_gamma, freqs, split, eps):
@@ -44,15 +42,9 @@ def _reference(qkv, q_gamma, k_gamma, freqs, split, eps):
 def _inputs(S=8, B=4, NG=2, NPG=8, seed=123):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     split = [NPG * _D, _D, _D]
-    qkv = torch.randn(
-        S, B, NG, sum(split), device="cuda", generator=gen, dtype=torch.float32
-    ).bfloat16()
-    q_gamma = torch.randn(
-        _D, device="cuda", generator=gen, dtype=torch.float32
-    ).bfloat16()
-    k_gamma = torch.randn(
-        _D, device="cuda", generator=gen, dtype=torch.float32
-    ).bfloat16()
+    qkv = torch.randn(S, B, NG, sum(split), device="cuda", generator=gen, dtype=torch.float32).bfloat16()
+    q_gamma = torch.randn(_D, device="cuda", generator=gen, dtype=torch.float32).bfloat16()
+    k_gamma = torch.randn(_D, device="cuda", generator=gen, dtype=torch.float32).bfloat16()
     # Megatron supplies duplicated rotate-half angles in [S,1,1,D].
     half = torch.randn(S, _D // 2, device="cuda", generator=gen, dtype=torch.float32)
     freqs = torch.cat((half, half), dim=-1).reshape(S, 1, 1, _D).contiguous()
@@ -84,10 +76,7 @@ def test_fused_qkv_rmsnorm_rope_backward():
     expected = _reference(qkv_ref, q_gamma_ref, k_gamma_ref, freqs, split, eps)
     gen = torch.Generator(device="cuda").manual_seed(456)
     grads = tuple(
-        torch.randn(
-            x.shape, device="cuda", generator=gen, dtype=torch.float32
-        ).bfloat16()
-        for x in actual
+        torch.randn(x.shape, device="cuda", generator=gen, dtype=torch.float32).bfloat16() for x in actual
     )
     torch.autograd.backward(actual, grads)
     torch.autograd.backward(expected, grads)

@@ -2,9 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (c) 2026 FlyDSL Project Contributors
 #
-# See LICENSE for license information.
+# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL)
+# Modified by the Primus-Turbo team.
+#
+# This file is distributed under the Apache License 2.0 (see LICENSE-APACHE),
+# not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
 """GPT-OSS packed-QKV RMSNorm + RoPE FlyDSL kernels.
@@ -127,23 +131,17 @@ def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float):
         # BF16 buffer load per normalized row (millions of loads per launch).
         gamma = fx.Float32(0.0)
         if is_q:
-            gamma = fx.Float32(
-                buffer_ops.buffer_load(qg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
-            )
+            gamma = fx.Float32(buffer_ops.buffer_load(qg_rsrc, lane, vec_width=1, dtype=fx.T.bf16()))
         else:
             # qk_slot contains only Q slots followed by one K slot per group,
             # so the non-Q branch is always K.  Keep this as a single
             # FlyDSL-rewritten branch; a nested condition here loses its local
             # predicate when the AST rewriter outlines the else body.
-            gamma = fx.Float32(
-                buffer_ops.buffer_load(kg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
-            )
+            gamma = fx.Float32(buffer_ops.buffer_load(kg_rsrc, lane, vec_width=1, dtype=fx.T.bf16()))
         token = cycle
         while token < fx.Int32(total_rows):
             src = (token * fx.Int32(packed_heads) + slot) * fx.Int32(_D) + lane
-            x = fx.Float32(
-                buffer_ops.buffer_load(packed_rsrc, src, vec_width=1, dtype=fx.T.bf16())
-            )
+            x = fx.Float32(buffer_ops.buffer_load(packed_rsrc, src, vec_width=1, dtype=fx.T.bf16()))
 
             sumsq = _wave_sum_f32(x * x)
             mean = sumsq / fx.Float32(float(_D))
@@ -164,9 +162,7 @@ def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float):
                 )
             )
             sine = fx.Float32(
-                buffer_ops.buffer_load(
-                    sine_rsrc, seq * fx.Int32(_D) + lane, vec_width=1, dtype=fx.T.f32()
-                )
+                buffer_ops.buffer_load(sine_rsrc, seq * fx.Int32(_D) + lane, vec_width=1, dtype=fx.T.f32())
             )
             low = norm * cosine - fx.Float32(pair) * sine
             high = norm * cosine + fx.Float32(pair) * sine
@@ -177,16 +173,12 @@ def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float):
                 dst = (token * fx.Int32(q_heads) + q_head) * fx.Int32(_D) + lane
                 buffer_ops.buffer_store(rotated, qout_rsrc, dst)
                 if lane == fx.Int32(0):
-                    buffer_ops.buffer_store(
-                        rstd, qrstd_rsrc, token * fx.Int32(q_heads) + q_head
-                    )
+                    buffer_ops.buffer_store(rstd, qrstd_rsrc, token * fx.Int32(q_heads) + q_head)
             else:
                 dst = (token * fx.Int32(NG) + group) * fx.Int32(_D) + lane
                 buffer_ops.buffer_store(rotated, kout_rsrc, dst)
                 if lane == fx.Int32(0):
-                    buffer_ops.buffer_store(
-                        rstd, krstd_rsrc, token * fx.Int32(NG) + group
-                    )
+                    buffer_ops.buffer_store(rstd, krstd_rsrc, token * fx.Int32(NG) + group)
 
             token = token + fx.Int32(_FWD_GRID_CYCLES)
 
@@ -243,13 +235,9 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int):
         # the Q head index are loop invariant.
         gamma = fx.Float32(0.0)
         if is_q:
-            gamma = fx.Float32(
-                buffer_ops.buffer_load(qg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
-            )
+            gamma = fx.Float32(buffer_ops.buffer_load(qg_rsrc, lane, vec_width=1, dtype=fx.T.bf16()))
         else:
-            gamma = fx.Float32(
-                buffer_ops.buffer_load(kg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
-            )
+            gamma = fx.Float32(buffer_ops.buffer_load(kg_rsrc, lane, vec_width=1, dtype=fx.T.bf16()))
         q_head = group * fx.Int32(NPG) + local
 
         dgamma = fx.Float32(0.0)
@@ -283,9 +271,7 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int):
                     if is_q:
                         src = (token * fx.Int32(q_heads) + q_head) * fx.Int32(_D) + lane
                         grad = fx.Float32(
-                            buffer_ops.buffer_load(
-                                dq_rsrc, src, vec_width=1, dtype=fx.T.bf16()
-                            )
+                            buffer_ops.buffer_load(dq_rsrc, src, vec_width=1, dtype=fx.T.bf16())
                         )
                         rstd = fx.Float32(
                             buffer_ops.buffer_load(
@@ -298,9 +284,7 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int):
                     else:
                         src = (token * fx.Int32(NG) + group) * fx.Int32(_D) + lane
                         grad = fx.Float32(
-                            buffer_ops.buffer_load(
-                                dk_rsrc, src, vec_width=1, dtype=fx.T.bf16()
-                            )
+                            buffer_ops.buffer_load(dk_rsrc, src, vec_width=1, dtype=fx.T.bf16())
                         )
                         rstd = fx.Float32(
                             buffer_ops.buffer_load(
@@ -315,15 +299,9 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int):
                     low = grad * cosine + fx.Float32(pair_grad) * sine
                     high = grad * cosine - fx.Float32(pair_grad) * sine
                     # Match the materialized BF16 gradient at the RoPE -> RMSNorm boundary.
-                    dnorm = fx.Float32(
-                        fx.BFloat16(fx.arith.select(lane < fx.Int32(_HALF), low, high))
-                    )
+                    dnorm = fx.Float32(fx.BFloat16(fx.arith.select(lane < fx.Int32(_HALF), low, high)))
 
-                    x = fx.Float32(
-                        buffer_ops.buffer_load(
-                            packed_rsrc, dst, vec_width=1, dtype=fx.T.bf16()
-                        )
-                    )
+                    x = fx.Float32(buffer_ops.buffer_load(packed_rsrc, dst, vec_width=1, dtype=fx.T.bf16()))
                     unit = x * rstd
                     dunit = dnorm * gamma
                     dot = _wave_sum_f32(unit * dunit)
@@ -332,9 +310,7 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int):
                     dgamma = dgamma + dnorm * unit
                 else:
                     src = (token * fx.Int32(NG) + group) * fx.Int32(_D) + lane
-                    grad = buffer_ops.buffer_load(
-                        dv_rsrc, src, vec_width=1, dtype=fx.T.bf16()
-                    )
+                    grad = buffer_ops.buffer_load(dv_rsrc, src, vec_width=1, dtype=fx.T.bf16())
                     buffer_ops.buffer_store(grad, dpacked_rsrc, dst)
 
             seq = seq + fx.Int32(_BWD_GRID_CYCLES)
@@ -452,9 +428,7 @@ def flydsl_qkv_rmsnorm_rope_forward(qkv, q_gamma, k_gamma, freqs, split_sizes, e
     return q, k, v, q_rstd, k_rstd
 
 
-def flydsl_qkv_rmsnorm_rope_backward(
-    dq, dk, dv, qkv, q_gamma, k_gamma, freqs, q_rstd, k_rstd, split_sizes
-):
+def flydsl_qkv_rmsnorm_rope_backward(dq, dk, dv, qkv, q_gamma, k_gamma, freqs, q_rstd, k_rstd, split_sizes):
     """Raw backward entry point returning packed dQKV and dgamma partials."""
     import torch
 
@@ -463,12 +437,8 @@ def flydsl_qkv_rmsnorm_rope_backward(
     npg = q_size // _D
     assert k_size == _D
     dqkv = torch.empty_like(qkv)
-    dqg_part = torch.empty(
-        (_BWD_GRID_CYCLES * NG * npg, _D), device=qkv.device, dtype=torch.float32
-    )
-    dkg_part = torch.empty(
-        (_BWD_GRID_CYCLES * NG, _D), device=qkv.device, dtype=torch.float32
-    )
+    dqg_part = torch.empty((_BWD_GRID_CYCLES * NG * npg, _D), device=qkv.device, dtype=torch.float32)
+    dkg_part = torch.empty((_BWD_GRID_CYCLES * NG, _D), device=qkv.device, dtype=torch.float32)
     cosine, sine = _cached_cos_sin(freqs)
     _compiled_bwd(
         DQ=dq,
