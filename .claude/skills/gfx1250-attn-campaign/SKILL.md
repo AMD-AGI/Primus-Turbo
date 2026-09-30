@@ -43,6 +43,10 @@ FLOP from `op-evolve/tools/op_flops.py`: fwd 2.199292e12, bwd 5.498229e12. One g
 
 ## 3. Current state and next step
 
+- **2026-09-30 14:34 UTC: everything STOPPED, A0 handed to another user.** Read `output/0930__bwd/REPORT.md` first (results, levers,
+  job state, next steps, and the node's firmware/driver/ROCm/clock table -- A0 changes often, re-check before quoting numbers).
+  bwd job stopped cleanly before round 26 (plain `resume` restarts at round 26); OE has uncommitted deep-prompt edits (diff in
+  `output/0930__bwd/oejob/oe_uncommitted_0930.diff`).
 - **2026-09-30 19:35: bwd champion s6 = s5 + k_dqg VALU trim (`armsrc/s6`): prod 5.295-5.300 vs ASM 5.497-5.500 ms (103.8%)**; dq differs
   from s5 by 81 dB (packed-op order), SQNR vs reference unchanged, run-to-run bitwise. Fused w4f best 6.51 ms (r4b) -> parked.
 - **2026-09-30 18:10: bwd champion s5 BEATS ASM: prod 5.339 vs 5.501 ms (103.0%), proxy 0.338 vs 0.381 (112.8%)**, bitwise vs r29;
