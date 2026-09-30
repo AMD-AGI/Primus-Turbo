@@ -114,6 +114,19 @@ def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float):
         qrstd_rsrc = buffer_ops.create_buffer_resource(QRSTD, max_size=True)
         krstd_rsrc = buffer_ops.create_buffer_resource(KRSTD, max_size=True)
 
+        # A persistent wave never changes logical head or lane, so gamma is
+        # invariant for its entire token loop.  Hoisting avoids one redundant
+        # BF16 buffer load per normalized row (millions of loads per launch).
+        gamma = fx.Float32(0.0)
+        if is_q:
+            gamma = fx.Float32(
+                buffer_ops.buffer_load(qg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
+            )
+        else:
+            gamma = fx.Float32(
+                buffer_ops.buffer_load(kg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
+            )
+
         token = cycle
         while token < fx.Int32(total_rows):
             src = (token * fx.Int32(packed_heads) + slot) * fx.Int32(_D) + lane
@@ -122,15 +135,6 @@ def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float):
             sumsq = _wave_sum_f32(x * x)
             mean = sumsq / fx.Float32(float(_D))
             rstd = fx.Float32(fmath.rsqrt(mean + fx.Float32(eps)))
-            gamma = fx.Float32(0.0)
-            if is_q:
-                gamma = fx.Float32(
-                    buffer_ops.buffer_load(qg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
-                )
-            else:
-                gamma = fx.Float32(
-                    buffer_ops.buffer_load(kg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
-                )
 
             # Match the existing two-kernel contract: RMSNorm writes BF16,
             # then RoPE reads BF16 and promotes it for the rotation math.
@@ -207,6 +211,19 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int):
         dqg_part_rsrc = buffer_ops.create_buffer_resource(DQG_PART, max_size=True)
         dkg_part_rsrc = buffer_ops.create_buffer_resource(DKG_PART, max_size=True)
 
+        # Like forward, every persistent wave owns one head/lane, so gamma and
+        # the Q head index are loop invariant.
+        gamma = fx.Float32(0.0)
+        if is_q:
+            gamma = fx.Float32(
+                buffer_ops.buffer_load(qg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
+            )
+        else:
+            gamma = fx.Float32(
+                buffer_ops.buffer_load(kg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
+            )
+        q_head = group * fx.Int32(NPG) + local
+
         dgamma = fx.Float32(0.0)
         token = cycle
         while token < fx.Int32(total_rows):
@@ -214,18 +231,13 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int):
             if is_q | is_k:
                 grad = fx.Float32(0.0)
                 rstd = fx.Float32(0.0)
-                gamma = fx.Float32(0.0)
                 if is_q:
-                    head = group * fx.Int32(NPG) + local
-                    src = (token * fx.Int32(q_heads) + head) * fx.Int32(_D) + lane
+                    src = (token * fx.Int32(q_heads) + q_head) * fx.Int32(_D) + lane
                     grad = fx.Float32(buffer_ops.buffer_load(dq_rsrc, src, vec_width=1, dtype=fx.T.bf16()))
                     rstd = fx.Float32(
                         buffer_ops.buffer_load(
-                            qrstd_rsrc, token * fx.Int32(q_heads) + head, vec_width=1, dtype=fx.T.f32()
+                            qrstd_rsrc, token * fx.Int32(q_heads) + q_head, vec_width=1, dtype=fx.T.f32()
                         )
-                    )
-                    gamma = fx.Float32(
-                        buffer_ops.buffer_load(qg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
                     )
                 else:
                     src = (token * fx.Int32(NG) + group) * fx.Int32(_D) + lane
@@ -234,9 +246,6 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int):
                         buffer_ops.buffer_load(
                             krstd_rsrc, token * fx.Int32(NG) + group, vec_width=1, dtype=fx.T.f32()
                         )
-                    )
-                    gamma = fx.Float32(
-                        buffer_ops.buffer_load(kg_rsrc, lane, vec_width=1, dtype=fx.T.bf16())
                     )
 
                 pair_grad = fx.arith.ArithValue(grad).shuffle_xor(_HALF, _WARP)
@@ -273,7 +282,6 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int):
             token = token + fx.Int32(_GRID_CYCLES)
 
         if is_q:
-            q_head = group * fx.Int32(NPG) + local
             part = (cycle * fx.Int32(q_heads) + q_head) * fx.Int32(_D) + lane
             buffer_ops.buffer_store(dgamma, dqg_part_rsrc, part)
         elif is_k:
