@@ -490,7 +490,7 @@ def _run_fused(x2, r2, gamma, eps, buffers):
         float(eps),
         _mxfp4_scale_rounding_bias(_SCALE_ROUNDING_MODE),
         rows // _BR,
-        torch.cuda.current_stream(),
+        torch.cuda.current_stream(x2.device),
     )
     _compiled(rows, args)(*args)
     del y
@@ -596,8 +596,10 @@ def rmsnorm_residual_mxfp4_fused(
     buffers = _allocate(x2)
     y, xpr = _FusedRMSNormMXFP4SkipY.apply(x2, r2, gamma, eps, buffers)
     row, row_scale, col, col_scale = _as_quant_views(buffers)
+    y = y.reshape(orig_shape)
+    y._primus_turbo_rmsnorm_mxfp4_fused = True
     return (
-        y.reshape(orig_shape),
+        y,
         xpr.reshape(orig_shape),
         row,
         row_scale,

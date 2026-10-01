@@ -14,6 +14,7 @@ import torch
 
 from primus_turbo.flydsl.rope.qk_rmsnorm_rope_kernel import (
     QK_RMSNORM_ROPE_HEAD_DIM,
+    _check_row_tileable,
     flydsl_qkv_rmsnorm_rope_backward,
     flydsl_qkv_rmsnorm_rope_forward,
 )
@@ -39,6 +40,10 @@ def qk_rmsnorm_rope_shape_error(
         return f"expected q multiple of {D} and k=v={D}, got {list(split_sizes)}"
     if qkv.shape[-1] != q_size + k_size + v_size:
         return f"packed width {qkv.shape[-1]} != q+k+v {q_size + k_size + v_size}"
+    try:
+        _check_row_tileable(qkv.shape[1], qkv.shape[2], q_size // D)
+    except ValueError as exc:
+        return str(exc)
     if q_gamma.shape != (D,) or k_gamma.shape != (D,):
         return f"q/k gamma must both be [{D}], got {tuple(q_gamma.shape)}/{tuple(k_gamma.shape)}"
     if (
@@ -56,6 +61,9 @@ def qk_rmsnorm_rope_shape_error(
         return "qkv, q/k gamma, and freqs must be CUDA tensors"
     if not (qkv.device == q_gamma.device == k_gamma.device == freqs.device):
         return "qkv, q/k gamma, and freqs must be on the same device"
+    arch = str(torch.cuda.get_device_properties(qkv.device).gcnArchName).split(":", 1)[0]
+    if arch != "gfx950":
+        return f"fused QK RMSNorm + RoPE requires gfx950, got {arch}"
     return None
 
 

@@ -43,9 +43,11 @@ def test_rmsnorm_mxfp4_skip_y_forward_backward():
     reference = rmsnorm_residual_mxfp4_fused(x_ref, residual_ref, gamma_ref, skip_y_store=False)
     fused = rmsnorm_residual_mxfp4_fused(x, residual, gamma, skip_y_store=True)
 
+    assert not getattr(reference[0], "_primus_turbo_rmsnorm_mxfp4_fused", False)
+    assert getattr(fused[0], "_primus_turbo_rmsnorm_mxfp4_fused", False)
     torch.testing.assert_close(fused[1], reference[1], rtol=0, atol=0)
     for actual, expected in zip(fused[2:], reference[2:]):
-        mismatch = (actual != expected).float().mean()
+        mismatch = (actual.view(torch.uint8) != expected.view(torch.uint8)).float().mean()
         assert mismatch <= 0.05
 
     grad_y = torch.randn_like(x)

@@ -12,6 +12,14 @@ from primus_turbo.pytorch.ops.rope import fused_qkv_rmsnorm_rope
 _D = 64
 
 
+def _require_gfx950():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    arch = str(torch.cuda.get_device_properties(0).gcnArchName).split(":", 1)[0]
+    if arch != "gfx950":
+        pytest.skip("fused QK RMSNorm + RoPE requires gfx950")
+
+
 def _rmsnorm(x, gamma, eps):
     rstd = torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + eps)
     # This cast is part of the production contract: standalone RMSNorm writes
@@ -40,6 +48,7 @@ def _reference(qkv, q_gamma, k_gamma, freqs, split, eps):
 
 
 def _inputs(S=8, B=4, NG=2, NPG=8, seed=123):
+    _require_gfx950()
     gen = torch.Generator(device="cuda").manual_seed(seed)
     split = [NPG * _D, _D, _D]
     qkv = torch.randn(S, B, NG, sum(split), device="cuda", generator=gen, dtype=torch.float32).bfloat16()
@@ -51,10 +60,10 @@ def _inputs(S=8, B=4, NG=2, NPG=8, seed=123):
     return qkv, q_gamma, k_gamma, freqs, split
 
 
-@pytest.mark.parametrize("S,B,NG", [(4, 1, 1), (8, 4, 2), (129, 1, 1)])
-def test_fused_qkv_rmsnorm_rope_forward(S, B, NG):
+@pytest.mark.parametrize("S,B,NG,NPG", [(4, 8, 2, 8), (8, 2, 8, 8), (129, 4, 4, 8), (4, 1, 16, 1)])
+def test_fused_qkv_rmsnorm_rope_forward(S, B, NG, NPG):
     eps = 1.0e-5
-    args = _inputs(S=S, B=B, NG=NG)
+    args = _inputs(S=S, B=B, NG=NG, NPG=NPG)
     actual = fused_qkv_rmsnorm_rope(*args, eps)
     expected = _reference(*args, eps)
     for got, want in zip(actual[:2], expected[:2]):
@@ -62,9 +71,10 @@ def test_fused_qkv_rmsnorm_rope_forward(S, B, NG):
     torch.testing.assert_close(actual[2], expected[2], rtol=0, atol=0)
 
 
-def test_fused_qkv_rmsnorm_rope_backward():
+@pytest.mark.parametrize("B,NG,NPG", [(2, 8, 8), (1, 16, 1)])
+def test_fused_qkv_rmsnorm_rope_backward(B, NG, NPG):
     eps = 1.0e-5
-    qkv, q_gamma, k_gamma, freqs, split = _inputs(S=65, B=1, NG=1, seed=321)
+    qkv, q_gamma, k_gamma, freqs, split = _inputs(S=65, B=B, NG=NG, NPG=NPG, seed=321)
     qkv.requires_grad_()
     q_gamma.requires_grad_()
     k_gamma.requires_grad_()
@@ -90,6 +100,12 @@ def test_fused_qkv_rmsnorm_rope_rejects_wrong_head_dim():
     qkv, q_gamma, k_gamma, freqs, _ = _inputs()
     with pytest.raises(ValueError, match="unsupported input"):
         fused_qkv_rmsnorm_rope(qkv, q_gamma, k_gamma, freqs, [8 * _D, 128, 128], 1.0e-5)
+
+
+def test_fused_qkv_rmsnorm_rope_rejects_untileable_shape():
+    args = _inputs(S=8, B=4, NG=2)
+    with pytest.raises(ValueError, match="ROWS_PER_WAVE"):
+        fused_qkv_rmsnorm_rope(*args, 1.0e-5)
 
 
 def test_fused_qkv_rmsnorm_rope_rejects_strided_gamma():

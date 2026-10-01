@@ -480,6 +480,8 @@ _XCD = 8
 
 
 def _xcd_chunk(block_x, nwg, chunk):
+    if chunk <= 0:
+        return block_x
     sb = _XCD * chunk
     if nwg % sb:
         return block_x
@@ -988,12 +990,9 @@ def _launch(compiled, key, kwargs_fn, args):
 def flydsl_qkv_rmsnorm_rope_forward(qkv, q_gamma, k_gamma, freqs, split_sizes, eps):
     """Raw forward entry point.
 
-    General input-contract validation (dtype/shape/contiguity) lives in the
-    PyTorch wrapper (``qk_rmsnorm_rope_shape_error``). CODE-REVIEW note: the
-    ``_check_row_tileable`` call below is *not* duplicating that -- it is
-    specific to this kernel's internal P0a row/lane tiling (an
-    implementation detail the wrapper has no reason to know about), so it
-    stays here rather than leaking tiling internals into the wrapper.
+    General input-contract validation, including the row/lane tiling guard,
+    lives in the PyTorch wrapper (``qk_rmsnorm_rope_shape_error``). Keep the
+    check here as defense in depth for direct callers of the raw entry point.
     """
     S, B, NG, _ = qkv.shape
     q_size, k_size, _ = split_sizes
@@ -1011,7 +1010,7 @@ def flydsl_qkv_rmsnorm_rope_forward(qkv, q_gamma, k_gamma, freqs, split_sizes, e
     k_rstd = q_rstd
     # Q6: read the stream once and thread it into _cached_cos_sin (see
     # module docstring) instead of two independent current-stream queries.
-    stream = torch.cuda.current_stream()
+    stream = torch.cuda.current_stream(qkv.device)
     cosine, sine = _cached_cos_sin(freqs, stream)
     args = (qkv, q_gamma, k_gamma, cosine, sine, q, k, q_rstd, k_rstd, S, B, NG, npg, eps_f, stream)
     _launch(
@@ -1042,9 +1041,8 @@ def flydsl_qkv_rmsnorm_rope_forward(qkv, q_gamma, k_gamma, freqs, split_sizes, e
 def flydsl_qkv_rmsnorm_rope_backward(dq, dk, dv, qkv, q_gamma, k_gamma, freqs, q_rstd, k_rstd, split_sizes):
     """Raw backward entry point returning packed dQKV and dgamma partials.
 
-    See ``flydsl_qkv_rmsnorm_rope_forward`` re: ``_check_row_tileable`` below
-    being tiling-internal validation, not a duplicate of the wrapper's
-    general input-contract check.
+    See ``flydsl_qkv_rmsnorm_rope_forward`` for why the tiling guard is also
+    retained at this raw entry point.
     """
     S, B, NG, _ = qkv.shape
     q_size, k_size, _ = split_sizes
@@ -1059,7 +1057,7 @@ def flydsl_qkv_rmsnorm_rope_backward(dq, dk, dv, qkv, q_gamma, k_gamma, freqs, q
     dkg_part = torch.empty((_BWD_GRID_CYCLES * kv_slots, _D), device=qkv.device, dtype=torch.float32)
     # Q6: see flydsl_qkv_rmsnorm_rope_forward -- one stream query threaded
     # into _cached_cos_sin instead of two independent ones.
-    stream = torch.cuda.current_stream()
+    stream = torch.cuda.current_stream(qkv.device)
     cosine, sine = _cached_cos_sin(freqs, stream)
     args = (
         dq,
