@@ -16,8 +16,6 @@
 #include <algorithm>
 #include <climits>
 #include <cstdint>
-#include <mutex>
-#include <unordered_map>
 
 namespace primus_turbo {
 
@@ -317,53 +315,52 @@ __launch_bounds__(kNumThreads, 1) __global__
         }
         if (thread_id == 0)
             *num_dispatched_tokens_out = s_total_dispatched;
-        for (int i = thread_id; i < layout.num_memset_int64; i += kNumThreads)
-            layout.prev_tile_state[i] = 0;
     }
 }
 
-// Per-stream double-buffered tile_state cache + optional vsmem region.
-static inline TempStorageLayout get_temp_storage_layout(size_t lookback_bytes,
-                                                        size_t vsmem_bytes_per_block,
-                                                        size_t grid_size, hipStream_t stream) {
-    constexpr size_t kMinBytes = 512 * 1024;
+static constexpr int kPreprocessingNumThreads = 512;
 
-    const size_t buf_bytes   = ALIGN(lookback_bytes, kVsmemCacheLineSize);
-    const size_t vsmem_bytes = ALIGN(vsmem_bytes_per_block, kVsmemCacheLineSize);
-    const size_t total_bytes = std::max(2 * buf_bytes + vsmem_bytes * grid_size, kMinBytes);
+struct PreprocessingLaunchConfig {
+    int    grid_size;
+    size_t lds_bytes;             // dynamic LDS per block; 0 when spilling to vsmem
+    size_t tile_state_bytes;      // (E + 1) lookback cols per block
+    size_t vsmem_bytes_per_block; // 0 when the temp storage fits in LDS
+};
 
-    static std::mutex                                     mu;
-    static std::unordered_map<hipStream_t, LookbackCache> cache;
-    std::lock_guard<std::mutex>                           lk(mu);
+static PreprocessingLaunchConfig get_preprocessing_launch_config(int num_local_experts,
+                                                                 int max_num_dispatched_tokens) {
+    constexpr int kNumThreads = kPreprocessingNumThreads;
 
-    LookbackCache &c = cache[stream];
+    int device_id = 0;
+    PRIMUS_TURBO_CHECK_HIP(hipGetDevice(&device_id));
+    const int        num_cu              = get_multi_processor_count(device_id);
+    static const int max_shmem_per_block = get_max_shmem_per_block(device_id);
 
-    const bool grow = c.total < total_bytes;
-    if (grow || c.buf_bytes != buf_bytes) {
-        if (grow) {
-            if (c.ptr != nullptr)
-                PRIMUS_TURBO_CHECK_HIP(hipFreeAsync(c.ptr, stream));
-            PRIMUS_TURBO_CHECK_HIP(hipMallocAsync(&c.ptr, total_bytes, stream));
-            c.total = total_bytes;
-        }
-        c.buf_bytes  = buf_bytes;
-        c.active_idx = 0;
-        PRIMUS_TURBO_CHECK_HIP(hipMemsetAsync(c.ptr, 0, 2 * buf_bytes, stream));
-    }
+    const int num_token_tiles = (max_num_dispatched_tokens + kNumThreads - 1) / kNumThreads;
 
-    char *const base = static_cast<char *>(c.ptr);
-    const int   cur = c.active_idx, nxt = 1 - cur;
+    // (T + 4) * E ints: s_tile (T*E) + s_acc + s_excl_prefix + s_tpe_prefix + s_num_padded.
+    const size_t required_temp_storage_bytes =
+        static_cast<size_t>(num_local_experts) * (kNumThreads + 4) * sizeof(int);
+    // Spill to vsmem when LDS is too small.
+    const bool use_vsmem = required_temp_storage_bytes > static_cast<size_t>(max_shmem_per_block);
 
-    TempStorageLayout layout{};
-    layout.tile_state       = reinterpret_cast<uint64_t *>(base + cur * buf_bytes);
-    layout.prev_tile_state  = reinterpret_cast<uint64_t *>(base + nxt * buf_bytes);
-    layout.num_memset_int64 = buf_bytes / sizeof(uint64_t);
-    // Null gmem_ptr signals the kernel to use LDS instead of vsmem.
-    layout.vsmem.gmem_ptr        = (vsmem_bytes_per_block > 0) ? (base + 2 * buf_bytes) : nullptr;
-    layout.vsmem.bytes_per_block = vsmem_bytes;
+    PreprocessingLaunchConfig cfg{};
+    cfg.grid_size = std::min(num_token_tiles, num_cu);
+    cfg.lds_bytes = use_vsmem ? 0 : required_temp_storage_bytes;
+    // (E + 1) lookback cols per block: [0, E) per-expert + col E for dispatched count.
+    cfg.tile_state_bytes =
+        ALIGN(static_cast<size_t>(cfg.grid_size) * (num_local_experts + 1) * sizeof(uint64_t),
+              kVsmemCacheLineSize);
+    cfg.vsmem_bytes_per_block =
+        use_vsmem ? ALIGN(required_temp_storage_bytes, kVsmemCacheLineSize) : 0;
+    return cfg;
+}
 
-    c.active_idx = nxt;
-    return layout;
+size_t permute_preprocessing_workspace_bytes(int num_local_experts, int max_num_dispatched_tokens) {
+    if (num_local_experts <= 0 || max_num_dispatched_tokens <= 0)
+        return 0;
+    const auto cfg = get_preprocessing_launch_config(num_local_experts, max_num_dispatched_tokens);
+    return cfg.tile_state_bytes + cfg.vsmem_bytes_per_block * cfg.grid_size;
 }
 
 template <typename expert_map_t>
@@ -371,9 +368,9 @@ void permute_preprocessing_impl(const expert_map_t *expert_map, int num_topk,
                                 int *num_dispatched_tokens_out, int num_local_experts,
                                 int max_num_dispatched_tokens, int pad_multiple,
                                 int64_t *tokens_per_expert, int *row_id_map, int *overflow_flag,
-                                int64_t num_permuted_tokens, int probs_topk_stride,
+                                int64_t num_permuted_tokens, int probs_topk_stride, void *workspace,
                                 hipStream_t stream) {
-    constexpr int kNumThreads = 512;
+    constexpr int kNumThreads = kPreprocessingNumThreads;
     PRIMUS_TURBO_CHECK(num_local_experts > 0, "num_local_experts must be > 0");
     // Strict ``<``: thread E owns the dispatched-count lookback column.
     PRIMUS_TURBO_CHECK(num_local_experts < kNumThreads, "num_local_experts must be < kNumThreads");
@@ -387,36 +384,25 @@ void permute_preprocessing_impl(const expert_map_t *expert_map, int num_topk,
                                               sizeof(*num_dispatched_tokens_out), stream));
         return;
     }
+    PRIMUS_TURBO_CHECK(workspace != nullptr, "permute_preprocessing workspace must be allocated");
 
-    int device_id = 0;
-    PRIMUS_TURBO_CHECK_HIP(hipGetDevice(&device_id));
-    const int        num_cu              = get_multi_processor_count(device_id);
-    static const int max_shmem_per_block = get_max_shmem_per_block(device_id);
+    const auto cfg = get_preprocessing_launch_config(num_local_experts, max_num_dispatched_tokens);
+    char      *ws  = static_cast<char *>(workspace);
 
-    const int num_token_tiles = (max_num_dispatched_tokens + kNumThreads - 1) / kNumThreads;
+    // Lookback flags must start at kInvalid; captured into CUDA graphs together with the kernel.
+    PRIMUS_TURBO_CHECK_HIP(hipMemsetAsync(ws, 0, cfg.tile_state_bytes, stream));
 
-    // (T + 4) * E ints: s_tile (T*E) + s_acc + s_excl_prefix + s_tpe_prefix + s_num_padded.
-    const size_t required_temp_storage_bytes =
-        static_cast<size_t>(num_local_experts) * (kNumThreads + 4) * sizeof(int);
-    // Spill to vsmem when LDS is too small.
-    const bool   use_vsmem = required_temp_storage_bytes > static_cast<size_t>(max_shmem_per_block);
-    const size_t kernel_lds_bytes       = use_vsmem ? 0 : required_temp_storage_bytes;
-    const size_t vshmem_bytes_per_block = use_vsmem ? required_temp_storage_bytes : 0;
-
-    const int grid_size = std::min(num_token_tiles, num_cu);
-
-    // (E + 1) lookback cols per block: [0, E) per-expert + col E for dispatched count.
-    const size_t lookback_workspace_bytes =
-        static_cast<size_t>(grid_size) * (num_local_experts + 1) * sizeof(uint64_t);
-
-    auto tmp_layout = get_temp_storage_layout(lookback_workspace_bytes, vshmem_bytes_per_block,
-                                              grid_size, stream);
+    TempStorageLayout layout{};
+    layout.tile_state = reinterpret_cast<uint64_t *>(ws);
+    // Null gmem_ptr signals the kernel to use LDS instead of vsmem.
+    layout.vsmem.gmem_ptr = (cfg.vsmem_bytes_per_block > 0) ? (ws + cfg.tile_state_bytes) : nullptr;
+    layout.vsmem.bytes_per_block = cfg.vsmem_bytes_per_block;
 
     permute_preprocessing_kernel<kNumThreads, expert_map_t>
-        <<<grid_size, kNumThreads, kernel_lds_bytes, stream>>>(
+        <<<cfg.grid_size, kNumThreads, cfg.lds_bytes, stream>>>(
             expert_map, max_num_dispatched_tokens, num_dispatched_tokens_out, num_local_experts,
             num_topk, pad_multiple, tokens_per_expert, row_id_map, overflow_flag,
-            num_permuted_tokens, probs_topk_stride, tmp_layout);
+            num_permuted_tokens, probs_topk_stride, layout);
 
     PRIMUS_TURBO_CHECK_HIP(hipGetLastError());
 }

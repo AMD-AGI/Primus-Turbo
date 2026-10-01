@@ -77,6 +77,10 @@ permute_preprocessing(torch::Tensor expert_map, int64_t num_local_experts, int64
     auto overflow_flag     = at::empty({1}, int_opts);
     // ``at::zeros`` keeps the init CUDA-graph-capturable (no host sync).
     auto num_dispatched_tokens = at::zeros({1}, int_opts);
+    auto workspace             = at::empty(
+        {static_cast<int64_t>(permute_preprocessing_workspace_bytes(
+            static_cast<int>(num_local_experts), static_cast<int>(max_num_dispatched_tokens)))},
+        at::TensorOptions().dtype(at::kByte).device(device));
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -87,7 +91,7 @@ permute_preprocessing(torch::Tensor expert_map, int64_t num_local_experts, int64
         static_cast<int>(max_num_dispatched_tokens), static_cast<int>(pad_multiple),               \
         tokens_per_expert.data_ptr<int64_t>(), row_id_map.data_ptr<int>(),                         \
         overflow_flag.data_ptr<int>(), static_cast<int64_t>(num_permuted_tokens),                  \
-        static_cast<int>(probs_topk_stride), stream);
+        static_cast<int>(probs_topk_stride), workspace.data_ptr(), stream);
 
     SWITCH_EXPERT_MAP_TYPE(DISPATCH_EXPERT_MAP_TYPE);
 
