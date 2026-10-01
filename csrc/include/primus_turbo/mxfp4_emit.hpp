@@ -38,9 +38,10 @@ constexpr int kPackedTileBytes = 16384; // MXFP6's is 24576
 constexpr int kScaleTileBytes  = 1024;
 constexpr int kBytesPerBlock   = 16;
 
-// 1/sqrt(32) rounded to bf16, not to the nearest float: the reference packers apply the
-// rotation as a bf16 dot, so their normalisation carries bf16 precision.
-constexpr float kHadamard32Norm = 0.1767578125f;
+// 1/sqrt(32) at fp32 precision, the same constant as the MXFP6 packer: A6W4 pairs an
+// MXFP4 operand with an MXFP6 one, so both rotations must carry the same normalisation
+// for the product to be scaled by 32 c^2 = 1 (see quantization_mxfp6_gfx950.cu).
+constexpr float kHadamard32Norm = 0.17677669529663687f;
 // E2M1 RCEIL block scale, ceil_pow2(amax / max_pos) with max_pos = 6.0.
 constexpr float kFp4InvMaxPos = 1.0f / 6.0f;
 

@@ -1087,9 +1087,9 @@ def test_bias_falls_back_to_a_separate_add_on_an_older_aiter():
     assert bool((diff <= ulp(unbiased) + ulp(fallback)).all())
 
 
-# 1/sqrt(32) rounded to bf16, which is what the packer's Hadamard multiplies by. Exact
-# in binary (181 * 2**-10), so the model below stays exact too.
-_HADAMARD32_NORM = 0.1767578125
+# 1/sqrt(32) at fp32 precision, which is what the packer's Hadamard multiplies by. The
+# model below multiplies in fp32 too, so it rounds exactly as the packer does.
+_HADAMARD32_NORM = float(torch.tensor(1.0 / 32**0.5, dtype=torch.float32))
 
 
 def _e2m3_levels():
@@ -1138,7 +1138,8 @@ def _pack_constant_group(a):
     """
     import math
 
-    value = 32.0 * a * _HADAMARD32_NORM
+    # The butterfly sum 32a is exact for a bf16 input; the normalisation is one fp32 multiply.
+    value = float(torch.tensor(32.0 * a, dtype=torch.float32) * torch.tensor(_HADAMARD32_NORM, dtype=torch.float32))
     if value == 0.0:
         return 0.0, 0, 0.0, 1.0
     _, exponent = math.frexp(abs(value))  # abs(value) = mantissa * 2**exponent
@@ -1161,8 +1162,8 @@ def test_production_packer_rounds_e2m3_to_nearest_even():
     Two honest limits. The single nonzero is always its own amax, so ``value / scale``
     only ever lands in ``[4, 8)``: this covers the top octave, at step 0.5, not the
     subnormals. And an exact tie is unreachable through this path at all, because every
-    post-Hadamard value carries the factor ``181 * 2**-10`` from the bf16-rounded
-    ``1/sqrt(32)`` while every midpoint is dyadic. The test therefore drives the closest
+    post-Hadamard value carries the odd 24-bit significand of the fp32 ``1/sqrt(32)``
+    while every midpoint is dyadic. The test therefore drives the closest
     approach to each midpoint that a bf16 input can produce, and records the distance.
     """
     _skip_if_unsupported()

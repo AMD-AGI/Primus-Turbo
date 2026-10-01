@@ -59,11 +59,13 @@ constexpr int kC1PlaneOffset   = 16384; // byte offset of the C1 plane within a 
 constexpr int kC0BytesPerBlock = 16;    // of 24 bytes per group, 16 land in C0
 constexpr int kC1BytesPerBlock = 8;
 
-// 1/sqrt(32) rounded to bf16, NOT the nearest float. The reference packers apply the
-// rotation as a bf16 dot, so their normalisation carries bf16 precision; using the exact
-// fp32 constant instead shifts every rotated value by ~1e-4 relative, which is enough to
-// push values sitting just under a rounding boundary over it and change ~0.1% of codes.
-constexpr float kHadamard32Norm = 0.1767578125f;
+// 1/sqrt(32) at fp32 precision, so the rotation is orthonormal to fp32 rounding: both GEMM
+// operands carry the factor and the product scales by 32 c^2 = 1 - O(1e-8). An earlier
+// revision used 1/sqrt(32) rounded to bf16 (0.1767578125), copied from aiter's Triton packer
+// that applied H as a bf16 dot; that scaled every MXFP6 GEMM result by 0.99979 -- a change to
+// the real-valued function, which MLPerf closed division does not allow for a numerically
+// safe transform. The switch changes ~0.1% of codes relative to that revision.
+constexpr float kHadamard32Norm = 0.17677669529663687f;
 
 // ---------------------------------------------------------------------------
 // Blocking. TILE_M/TILE_N are multiples of kGroupSize so every staged patch holds
