@@ -219,7 +219,6 @@ def _emit_fused_body(
         # nobody re-reads. Loads only -- never mark a store nt in this kernel.
         xv = buffer_ops.buffer_load(xs, goff, vec_width=4, dtype=T.i32, cache_modifier=2)
         rv = buffer_ops.buffer_load(rsrc, goff, vec_width=4, dtype=T.i32, cache_modifier=2)
-        outw = []
         for q in range_constexpr(4):
             xw = fx.Int32(xv[q])
             rw = fx.Int32(rv[q])
@@ -227,13 +226,26 @@ def _emit_fused_body(
             hi = _f32(xw & 0xFFFF0000) + _f32(rw & 0xFFFF0000)
             acc[q] = acc[q] + lo * lo + hi * hi
             packed = _pack_bf16(lo, hi)
-            outw.append(packed)
+            # Reuse the word already packed for the x_plus_r store instead
+            # of holding the wider (lo, hi) fp32 pair: one i32 register per
+            # held element instead of two.
+            #
+            # The x_plus_r store itself is deferred out of this loop (it used
+            # to be an unconditional buffer_store right here). A buffer_store
+            # counts toward this wave's vmcnt exactly like a buffer_load does,
+            # so storing every iteration made s_waitcnt vmcnt(1) retire
+            # iteration i-1's store before iteration i's two loads above could
+            # be consumed -- 45 iterations of a store-wait-load chain with
+            # zero slack. hold[(i, q)] below is the only place this word now
+            # lives until it is written out from phase B's "if i < kwvec:"
+            # staging branch (same bytes, same rowbase+woff address, just a
+            # later issue point that drains under phase B's own VALU instead
+            # of blocking this loop's next load). Safe only because _KWCH=12
+            # gives kwvec=48 >= _NVEC=45 (full residency, see the _KWCH
+            # comment above), so every i is covered and every x_plus_r word
+            # is still written exactly once.
             if i < kwvec:
-                # Reuse the word already packed for the x_plus_r store instead
-                # of holding the wider (lo, hi) fp32 pair: one i32 register
-                # per held element instead of two.
                 hold[(i, q)] = packed
-        buffer_ops.buffer_store(Vec.from_elements(outw, fx.Int32), xps, goff)
 
     ssq = (acc[0] + acc[1]) + (acc[2] + acc[3])
     for m in range_constexpr(3):
@@ -264,6 +276,14 @@ def _emit_fused_body(
             g4 = _lds_load_vec4(lds.gam.ptr, woff)
             if i < kwvec:
                 pwords = [hold[(i, q)] for q in range_constexpr(4)]
+                # Deferred x_plus_r store (see the phase-A loop comment): same
+                # bytes as hold[(i, q)], same address as phase A's goff for
+                # this i (rowbase + woff reproduces it exactly), only the
+                # issue point moved -- bit-exact by construction. Spreading
+                # these 45 stores through this staging loop lets each one
+                # drain under phase B's own VALU instead of serialising phase
+                # A's load pipeline.
+                buffer_ops.buffer_store(Vec.from_elements(list(pwords), fx.Int32), xps, rowbase + woff)
             else:
                 xv = buffer_ops.buffer_load(xps, rowbase + woff, vec_width=4, dtype=T.i32)
                 pwords = [fx.Int32(xv[q]) for q in range_constexpr(4)]
