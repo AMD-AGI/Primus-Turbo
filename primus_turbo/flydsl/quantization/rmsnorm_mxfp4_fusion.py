@@ -54,6 +54,7 @@ from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import (
     _mxfp4_scale_rounding_bias,
     _store_words_vec4,
 )
+from primus_turbo.flydsl.utils.gemm_helper import xcd_remap_pid
 from primus_turbo.pytorch.core.low_precision import (
     MXFP4_BLOCK_SIZE,
     ScalingGranularity,
@@ -175,6 +176,16 @@ def _emit_fused_body(
     IRI = fx.Int32.ir_type
     kwvec = _KWCH * _VPC
 
+    # XCD-contiguous remap: the hardware dispatches consecutive block ids
+    # round-robin across the 8 XCD chiplets, so the 4 (COL_OUT) / 64 (COL_SC)
+    # workgroups that share one output cache line are scattered across all 8
+    # L2 slices and never combine into a full-line write. Gathering each
+    # XCD's 1/8 share of the grid into one contiguous id range puts every
+    # line-sharing block in the same XCD's L2. Pure index permutation over
+    # the traced row count (never a hardcoded grid size) -- every block still
+    # owns exactly one whole _BR-row panel, so outputs are bit-identical.
+    bid = xcd_remap_pid(bid, R >> 5, 8)
+
     r0 = bid * I32(_BR)
     rr = tid // I32(_TPR)
     jj = tid - rr * I32(_TPR)
@@ -201,8 +212,13 @@ def _emit_fused_body(
     for i in range_constexpr(_NVEC):
         woff = I32(i * _TPR * 4) + jj * I32(4)
         goff = rowbase + woff
-        xv = buffer_ops.buffer_load(xs, goff, vec_width=4, dtype=T.i32)
-        rv = buffer_ops.buffer_load(rsrc, goff, vec_width=4, dtype=T.i32)
+        # nt (aux bit 1): x/res are each read exactly once over this kernel's
+        # 668 MB footprint (~2.6x the 256 MB last-level cache), so marking
+        # them non-temporal protects the COL_OUT/COL_SC/ROW_OUT write streams
+        # (which DO have reuse, see R1 above) from being evicted by a stream
+        # nobody re-reads. Loads only -- never mark a store nt in this kernel.
+        xv = buffer_ops.buffer_load(xs, goff, vec_width=4, dtype=T.i32, cache_modifier=2)
+        rv = buffer_ops.buffer_load(rsrc, goff, vec_width=4, dtype=T.i32, cache_modifier=2)
         outw = []
         for q in range_constexpr(4):
             xw = fx.Int32(xv[q])
