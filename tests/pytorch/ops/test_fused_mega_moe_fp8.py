@@ -59,6 +59,7 @@ from primus_turbo.flydsl.mega.fp8.symm_buffer import (  # noqa: E402
 from primus_turbo.pytorch.kernels.fused_mega_moe import (  # noqa: E402
     advance_weight_generation,
 )
+from primus_turbo.pytorch.ops.moe.fused_mega_moe import GLUActivation  # noqa: E402
 from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import (  # noqa: E402
     fused_mega_moe_fp8_stage1,
     fused_mega_moe_fp8_stage2,
@@ -132,6 +133,40 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
     )
     def test_staged_forward_backward(self, hidden, inter, num_experts, num_topk, num_tokens):
         """stage1 + stage2 fwd+bwd vs the bf16 turbo DeepEP reference, on identical inputs."""
+        self._staged_forward_backward(hidden, inter, num_experts, num_topk, num_tokens)
+
+    @skip_unless_mxfp8
+    @skip_if_lt_x_gpu(8)
+    @parametrize(
+        "hidden, inter, num_experts, num_topk, num_tokens",
+        [
+            # MiniMax-M3's expert shape, at this class's token count.
+            (6144, 3072, 128, 4, 8192),
+        ],
+    )
+    def test_staged_forward_backward_swigluoai(self, hidden, inter, num_experts, num_topk, num_tokens):
+        """The same comparison with MiniMax-M3's swigluoai threaded through stage2.
+
+        At this suite's L1 output (std ~2) the clamp rarely bites, so this checks the wiring (alpha,
+        offset, and that the spec reaches both fp8 kernels); the clamp semantics are checked per
+        regime by tests/pytorch/ops/test_mega_moe_activation.py, and at a clamp-heavy input by the
+        bf16 suite. Here a clamp-heavy input is not a fair gate: the fp8 L1 output moves elements
+        across the limit, where the gradient jumps between full and zero. Measured at std ~5 (8 x
+        MI355X, EP8): dx / dW1 at 17.2 / 17.3 dB with swigluoai, 17.4 / 17.6 dB with SiLU under the
+        same +-7 clamp, 21.1 / 21.5 dB with the clamp removed -- the clamp's cost, not the kernels'.
+        """
+        self._staged_forward_backward(
+            hidden,
+            inter,
+            num_experts,
+            num_topk,
+            num_tokens,
+            activation=GLUActivation.swigluoai(),
+        )
+
+    def _staged_forward_backward(
+        self, hidden, inter, num_experts, num_topk, num_tokens, activation=None, l1_gain=1.0
+    ):
         torch.cuda.set_device(self.device)
         torch.manual_seed(42 + self.rank)
         group = dist.group.WORLD
@@ -145,6 +180,7 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
             num_experts=num_experts,
             num_topk=num_topk,
             device=self.device,
+            l1_gain=l1_gain,
         )
         symm = get_symm_buffer_for_mega_moe(
             group,
@@ -165,7 +201,9 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
             l2_m = l2_weight.detach().requires_grad_(True)
             tw_m = topk_weight.detach().requires_grad_(True)
             l1_out, dwib, handle, state = fused_mega_moe_fp8_stage1(x_m, topk_idx, tw_m, l1_m, group)
-            y_m = fused_mega_moe_fp8_stage2(l1_out, dwib, handle, state, topk_idx, tw_m, l2_m, group)
+            y_m = fused_mega_moe_fp8_stage2(
+                l1_out, dwib, handle, state, topk_idx, tw_m, l2_m, group, activation
+            )
             dx_m, dl1_m, dl2_m, dtw_m = torch.autograd.grad(y_m, [x_m, l1_m, l2_m, tw_m], grad_y)
             torch.cuda.synchronize()
             group.barrier()
@@ -183,6 +221,7 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
                 l2_t,
                 num_experts=num_experts,
                 num_topk=num_topk,
+                activation=activation,
             )
             dx_t, dl1_t, dl2_t, dtw_t = torch.autograd.grad(y_t, [x_t, l1_t, l2_t, tw_t], grad_y)
             torch.cuda.synchronize()
@@ -200,8 +239,9 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
 
         measured = [(tag, *self._metrics(a, r)) for tag, a, r in results]
         if self.rank == 0:
+            act_name = "silu" if activation is None else repr(activation)
             print(f"\n{'=' * 72}")
-            print(f"[staged fp8 mega MoE vs turbo DeepEP]  EP{self.world_size} T={num_tokens}")
+            print(f"[staged fp8 mega MoE vs turbo DeepEP]  EP{self.world_size} T={num_tokens} act={act_name}")
             print(f"{'=' * 72}")
             for tag, snr, cos in measured:
                 print(f"  {tag:<12}: min SNR = {snr:7.2f} dB  min cos = {cos:.5f}", flush=True)

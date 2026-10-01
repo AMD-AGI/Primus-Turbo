@@ -11,7 +11,7 @@ dual-quant, and the dW2 wgrad. The dual-quant emits grad_l1 only as quantized op
 backward returns them for the op layer to hand to stage1 out of band.
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -24,6 +24,7 @@ from primus_turbo.flydsl.mega.fp8 import (
     swiglu_mxfp8_flydsl_kernel,
 )
 from primus_turbo.flydsl.mega.fp8.combine_autotune import env_combine_cu
+from primus_turbo.flydsl.utils.glu_activation import GLUActivation
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity
 from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_fp8_weights import (
@@ -101,12 +102,13 @@ def fused_mega_moe_stage2_forward_fp8_impl(
     group,
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
+    activation: Optional[GLUActivation] = None,
 ) -> torch.Tensor:
     """SwiGLU + mxfp8 quant + grouped fc2 GEMM + combine (nt). Returns y."""
     topk_idx = topk_idx.to(torch.int64)
 
     # bound swiglu by THIS handle's tile count (per-forward, not shared symm)
-    act_fp8, act_a_sp = swiglu_mxfp8_flydsl_kernel(l1, handle[_H_NUM_TILE_BLOCKS])
+    act_fp8, act_a_sp = swiglu_mxfp8_flydsl_kernel(l1, handle[_H_NUM_TILE_BLOCKS], activation=activation)
 
     w2q, w2s = _w2_fp8_cached(w2)
 
@@ -131,6 +133,7 @@ def fused_mega_moe_stage2_backward_fp8_impl(
     handle: tuple,
     group,
     colwise_meta: dict,
+    activation: Optional[GLUActivation] = None,
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
     """L2 dgrad + fused SwiGLU^T dual-quant + dW2 (variable-K wgrad).
 
@@ -160,6 +163,7 @@ def fused_mega_moe_stage2_backward_fp8_impl(
         dispatch_weights,
         _DW_FP8_FORMAT,
         meta=colwise_meta,
+        activation=activation,
     )
 
     # dW2 = dispatched(dy)^T @ act_weighted -- must run before anything overwrites symm.pool_fp8
