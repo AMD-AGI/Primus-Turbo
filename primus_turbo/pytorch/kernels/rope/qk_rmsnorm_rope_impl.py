@@ -41,7 +41,7 @@ def qk_rmsnorm_rope_shape_error(
     if qkv.shape[-1] != q_size + k_size + v_size:
         return f"packed width {qkv.shape[-1]} != q+k+v {q_size + k_size + v_size}"
     try:
-        _check_row_tileable(qkv.shape[1], qkv.shape[2], q_size // D)
+        _check_row_tileable(qkv.shape[0], qkv.shape[1], qkv.shape[2], q_size // D)
     except ValueError as exc:
         return str(exc)
     if q_gamma.shape != (D,) or k_gamma.shape != (D,):

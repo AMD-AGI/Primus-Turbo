@@ -121,3 +121,16 @@ def test_fused_qkv_rmsnorm_rope_rejects_zero_query_width():
     qkv = qkv[..., -2 * _D :].contiguous()
     with pytest.raises(ValueError, match="q multiple"):
         fused_qkv_rmsnorm_rope(qkv, q_gamma, k_gamma, freqs, [0, _D, _D], 1.0e-5)
+
+
+@pytest.mark.parametrize("dim", [0, 1, 2])
+def test_fused_qkv_rmsnorm_rope_rejects_zero_dimensions(dim):
+    qkv, q_gamma, k_gamma, freqs, split = _inputs(S=8, B=2, NG=8)
+    slices = [slice(None)] * qkv.ndim
+    slices[dim] = slice(0)
+    qkv = qkv[tuple(slices)].contiguous()
+    if dim == 0:
+        freqs = freqs[:0].contiguous()
+
+    with pytest.raises(ValueError, match="must be positive"):
+        fused_qkv_rmsnorm_rope(qkv, q_gamma, k_gamma, freqs, split, 1.0e-5)

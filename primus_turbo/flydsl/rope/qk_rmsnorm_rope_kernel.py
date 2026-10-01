@@ -81,7 +81,7 @@ already collapses a cycle's cos/sin reuse to one 128 B line, but it costs
 nothing extra, so it rides along unconditionally.
 
 Host-side launches go through a small per-configuration call-state cache
-(``_CALL_STATE_CACHE``, keyed on shape/dtype — never on tensor ``id()``, see
+(``_CALL_STATE_CACHE``, keyed on device/shape/dtype — never on tensor ``id()``, see
 Rule 11) that re-dispatches a previously bound FlyDSL launcher directly instead
 of re-binding the signature on every call.
 
@@ -163,7 +163,7 @@ _EPL = _HALF // _LANES_PER_ROW  # 8 elements per lane per half
 _ROWS_PER_WAVE = _WARP // _LANES_PER_ROW  # 16
 
 
-def _check_row_tileable(B: int, NG: int, NPG: int) -> None:
+def _check_row_tileable(S: int, B: int, NG: int, NPG: int) -> None:
     """CODE-REVIEW fix: the P0a row/lane tiling packs ``_ROWS_PER_WAVE`` (16)
     head rows into one wave and derives slot counts via plain integer
     division (``q_heads // _ROWS_PER_WAVE``, ``(B * NG) // _ROWS_PER_WAVE``
@@ -177,6 +177,8 @@ def _check_row_tileable(B: int, NG: int, NPG: int) -> None:
     multiple of 2) was validated against this tiling; fail loudly here
     instead of silently returning garbage for anything else.
     """
+    if min(S, B, NG, NPG) <= 0:
+        raise ValueError(f"qk_rmsnorm_rope: S/B/NG/NPG must be positive, got {S}/{B}/{NG}/{NPG}")
     q_heads = NG * NPG
     if q_heads % _ROWS_PER_WAVE:
         raise ValueError(
@@ -994,7 +996,7 @@ def flydsl_qkv_rmsnorm_rope_forward(qkv, q_gamma, k_gamma, freqs, split_sizes, e
     q_size, k_size, _ = split_sizes
     npg = q_size // _D
     assert k_size == _D
-    _check_row_tileable(B, NG, npg)
+    _check_row_tileable(S, B, NG, npg)
     q = torch.empty((S, B, NG * npg, _D), device=qkv.device, dtype=qkv.dtype)
     k = torch.empty((S, B, NG, _D), device=qkv.device, dtype=qkv.dtype)
     v = qkv[..., -_D:].contiguous()
@@ -1008,7 +1010,7 @@ def flydsl_qkv_rmsnorm_rope_forward(qkv, q_gamma, k_gamma, freqs, split_sizes, e
     args = (qkv, q_gamma, k_gamma, cosine, sine, q, k, q_rstd, k_rstd, S, B, NG, npg, eps_f, stream)
     _launch(
         _compiled_fwd,
-        ("fwd", S, B, NG, npg, eps_f, qkv.dtype),
+        ("fwd", qkv.device.index, S, B, NG, npg, eps_f, qkv.dtype),
         lambda: dict(
             PACKED=qkv,
             QG=q_gamma,
@@ -1041,7 +1043,7 @@ def flydsl_qkv_rmsnorm_rope_backward(dq, dk, dv, qkv, q_gamma, k_gamma, freqs, q
     q_size, k_size, _ = split_sizes
     npg = q_size // _D
     assert k_size == _D
-    _check_row_tileable(B, NG, npg)
+    _check_row_tileable(S, B, NG, npg)
     dqkv = torch.empty_like(qkv)
     # P0c: the dgamma partial-row count is now driven by the new slot layout
     # (q_slots / kv_slots), not q_heads / NG directly -- see _bwd_slot_counts.
@@ -1074,7 +1076,7 @@ def flydsl_qkv_rmsnorm_rope_backward(dq, dk, dv, qkv, q_gamma, k_gamma, freqs, q
     )
     _launch(
         _compiled_bwd,
-        ("bwd", S, B, NG, npg, qkv.dtype),
+        ("bwd", qkv.device.index, S, B, NG, npg, qkv.dtype),
         lambda: dict(
             DQ=dq,
             DK=dk,
@@ -1116,7 +1118,7 @@ def flydsl_qkv_rmsnorm_rope_backward(dq, dk, dv, qkv, q_gamma, k_gamma, freqs, q
     )
     _launch(
         _compiled_fold,
-        ("fold", B, NG, npg),
+        ("fold", qkv.device.index, B, NG, npg),
         lambda: dict(
             DQG_PART=dqg_part,
             DKG_PART=dkg_part,
