@@ -109,8 +109,15 @@ def test_fused_qkv_rmsnorm_rope_rejects_untileable_shape():
 
 
 def test_fused_qkv_rmsnorm_rope_rejects_strided_gamma():
-    qkv, _, k_gamma, freqs, split = _inputs()
+    qkv, _, k_gamma, freqs, split = _inputs(B=8, NG=2)
     q_gamma = torch.randn(2 * _D, device="cuda", dtype=torch.bfloat16)[::2]
     assert not q_gamma.is_contiguous()
     with pytest.raises(ValueError, match="contiguous bfloat16"):
         fused_qkv_rmsnorm_rope(qkv, q_gamma, k_gamma, freqs, split, 1.0e-5)
+
+
+def test_fused_qkv_rmsnorm_rope_rejects_zero_query_width():
+    qkv, q_gamma, k_gamma, freqs, _ = _inputs(B=1, NG=16, NPG=1)
+    qkv = qkv[..., -2 * _D :].contiguous()
+    with pytest.raises(ValueError, match="q multiple"):
+        fused_qkv_rmsnorm_rope(qkv, q_gamma, k_gamma, freqs, [0, _D, _D], 1.0e-5)

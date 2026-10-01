@@ -36,7 +36,7 @@ def qk_rmsnorm_rope_shape_error(
     if len(split_sizes) != 3:
         return f"split_sizes must be [q,k,v], got {list(split_sizes)}"
     q_size, k_size, v_size = split_sizes
-    if q_size % D or k_size != D or v_size != D:
+    if q_size <= 0 or q_size % D or k_size != D or v_size != D:
         return f"expected q multiple of {D} and k=v={D}, got {list(split_sizes)}"
     if qkv.shape[-1] != q_size + k_size + v_size:
         return f"packed width {qkv.shape[-1]} != q+k+v {q_size + k_size + v_size}"

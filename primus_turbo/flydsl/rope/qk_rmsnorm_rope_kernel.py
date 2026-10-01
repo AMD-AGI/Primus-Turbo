@@ -243,17 +243,13 @@ def _cached_cos_sin(freqs, stream):
     return cosine, sine
 
 
-# P0b: the forward's QRSTD/KRSTD outputs no longer carry per-row rstd -- they
-# carry one cached FP32 scalar holding eps, so the backward can recompute
-# rstd itself.  Keyed on (device, eps): both are configuration, not a tensor
-# id() (Rule 11) -- eps comes from task.yaml/the call site, never from an
-# activation, so this cache hits on every call in both the benchmark loop and
-# real training.
+# Backward recomputes rstd from a cached scalar eps tensor. Cache per stream so
+# an asynchronous first fill cannot be observed from another stream.
 _EPS_TENSOR_CACHE = {}
 
 
-def _eps_tensor(device, eps):
-    key = (device.type, device.index, eps)
+def _eps_tensor(device, eps, stream):
+    key = (device.type, device.index, stream.cuda_stream, eps)
     t = _EPS_TENSOR_CACHE.get(key)
     if t is None:
         t = torch.full((1,), eps, device=device, dtype=torch.float32)
@@ -1001,16 +997,13 @@ def flydsl_qkv_rmsnorm_rope_forward(qkv, q_gamma, k_gamma, freqs, split_sizes, e
     _check_row_tileable(B, NG, npg)
     q = torch.empty((S, B, NG * npg, _D), device=qkv.device, dtype=qkv.dtype)
     k = torch.empty((S, B, NG, _D), device=qkv.device, dtype=qkv.dtype)
-    v = qkv[..., -_D:]
+    v = qkv[..., -_D:].contiguous()
     eps_f = float(eps)
-    # P0b: QRSTD/KRSTD no longer materialize per-row rstd (the backward
-    # recomputes it).  They now carry a single cached eps scalar that the
-    # autograd wrapper passes straight through to the backward unexamined.
-    q_rstd = _eps_tensor(qkv.device, eps_f)
+    stream = torch.cuda.current_stream(qkv.device)
+    q_rstd = _eps_tensor(qkv.device, eps_f, stream)
     k_rstd = q_rstd
     # Q6: read the stream once and thread it into _cached_cos_sin (see
     # module docstring) instead of two independent current-stream queries.
-    stream = torch.cuda.current_stream(qkv.device)
     cosine, sine = _cached_cos_sin(freqs, stream)
     args = (qkv, q_gamma, k_gamma, cosine, sine, q, k, q_rstd, k_rstd, S, B, NG, npg, eps_f, stream)
     _launch(
