@@ -30,6 +30,8 @@ we probe, not a switch we expose -- an older aiter gets the separate pass added 
 callers pass a bias unconditionally and never branch on aiter's version themselves.
 """
 
+from typing import Optional
+
 import torch
 
 from primus_turbo.common.aiter_utils import get_aiter
@@ -384,8 +386,9 @@ def gemm_fp6_out_impl(
     k: int,
     granularity: int,
     weight_is_fp4: bool = False,
+    bias: Optional[torch.Tensor] = None,
 ) -> None:
-    """``out[M, N] = A[M, K] @ B[N, K].T``, writing into a caller-owned buffer.
+    """``out[M, N] = A[M, K] @ B[N, K].T (+ bias)``, writing into a caller-owned buffer.
 
     This exists so a weight gradient can land straight in ``param.main_grad`` instead of
     being allocated and then added in by Megatron's DDP hook. Two things make that safe
@@ -398,9 +401,18 @@ def gemm_fp6_out_impl(
       caller-provided buffer is only writable when the launch needs no padding. Hence the
       exact-alignment requirement below, which is stricter than ``can_handle``'s
       padding-waste guard.
+
+    ``bias`` (bf16 ``[N]``) is added in the store epilogue, exactly as ``gemm_fp6_impl``
+    adds it, so a projection written into a shared buffer stays bit-identical to the
+    allocating call. A6W6 only.
     """
     granularity_enum = ScalingGranularity(granularity)
     _validate_blobs(a, a_scale, b, b_scale, m, n, k, weight_is_fp4)
+    if bias is not None:
+        if weight_is_fp4:
+            raise ValueError("MXFP6 out-GEMM bias is supported for A6W6 only, not A6W4.")
+        if bias.dim() != 1 or bias.numel() != n:
+            raise ValueError(f"MXFP6 out-GEMM bias must be a 1D tensor of length N={n}, got {tuple(bias.shape)}.")
 
     if granularity_enum not in GEMMFP6AITERBackend.SUPPORTED_GRANULARITIES:
         raise ValueError(f"MXFP6 out-GEMM needs MX_BLOCKWISE scaling, got {granularity_enum}.")
@@ -429,7 +441,11 @@ def gemm_fp6_out_impl(
         return
     config = aiter.get_GEMM_A6W6_config(m, n, k)
     kernel_name = str(config["kernelName"]) if config is not None else None
-    aiter.gemm_a6w6_asm(a, b, a_scale, b_scale, out, _pad_k(k), kernel_name)
+    if bias is None:
+        aiter.gemm_a6w6_asm(a, b, a_scale, b_scale, out, _pad_k(k), kernel_name)
+    else:
+        # aiter refuses a kernel with no bias epilogue rather than silently dropping it.
+        aiter.gemm_a6w6_asm(a, b, a_scale, b_scale, out, _pad_k(k), kernel_name, 1.0, bias)
 
 
 @gemm_fp6_out_impl.register_fake
@@ -444,5 +460,6 @@ def gemm_fp6_out_impl_meta(
     k: int,
     granularity: int,
     weight_is_fp4: bool = False,
+    bias: Optional[torch.Tensor] = None,
 ) -> None:
     return None
