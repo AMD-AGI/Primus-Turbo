@@ -120,6 +120,12 @@ _KWCH = 12
 
 _SCALE_ROUNDING_MODE = 2
 _GRANULARITY = ScalingGranularity.MX_BLOCKWISE
+# Non-temporal (`slc`) aux bit for `buffer_load`; see the call site comment in
+# `_emit_fused_body` for why phase A's x/res loads use it. Same encoding as
+# `mxfp4_quant_kernel._pick_load_aux`'s `_LOAD_AUX`, named here because this
+# kernel's fixed GPT-OSS geometry always lands in the band where it pays, so
+# there is no per-call footprint check to attach the magic number to.
+_LOAD_AUX_NT = 2
 
 
 def _f32(bits):
@@ -217,8 +223,8 @@ def _emit_fused_body(
         # them non-temporal protects the COL_OUT/COL_SC/ROW_OUT write streams
         # (which DO have reuse, see R1 above) from being evicted by a stream
         # nobody re-reads. Loads only -- never mark a store nt in this kernel.
-        xv = buffer_ops.buffer_load(xs, goff, vec_width=4, dtype=T.i32, cache_modifier=2)
-        rv = buffer_ops.buffer_load(rsrc, goff, vec_width=4, dtype=T.i32, cache_modifier=2)
+        xv = buffer_ops.buffer_load(xs, goff, vec_width=4, dtype=T.i32, cache_modifier=_LOAD_AUX_NT)
+        rv = buffer_ops.buffer_load(rsrc, goff, vec_width=4, dtype=T.i32, cache_modifier=_LOAD_AUX_NT)
         for q in range_constexpr(4):
             xw = fx.Int32(xv[q])
             rw = fx.Int32(rv[q])
@@ -283,7 +289,7 @@ def _emit_fused_body(
                 # these 45 stores through this staging loop lets each one
                 # drain under phase B's own VALU instead of serialising phase
                 # A's load pipeline.
-                buffer_ops.buffer_store(Vec.from_elements(list(pwords), fx.Int32), xps, rowbase + woff)
+                buffer_ops.buffer_store(Vec.from_elements(pwords, fx.Int32), xps, rowbase + woff)
             else:
                 xv = buffer_ops.buffer_load(xps, rowbase + woff, vec_width=4, dtype=T.i32)
                 pwords = [fx.Int32(xv[q]) for q in range_constexpr(4)]
@@ -329,10 +335,29 @@ def _emit_fused_body(
         # ---- COL phase: one thread per column, 32-row microblock, RHT-16
         cw = tid >> I32(1)
         half = tid & I32(1)
+        # O2: lifting a lane's bf16 half into f32 position -- both branches
+        # place the selected halfword into the output's HIGH 16 bits and
+        # zero the low 16 bits; only which half of `word` gets selected
+        # differs (low half for half==0, matching `word << 16`; high half
+        # for half==1, matching `word & 0xFFFF0000`). That is a pure byte
+        # permutation, so one `v_perm_b32` replaces the (and, shl, cndmask)
+        # triple this loop used to run per row -- 32 triples per chunk
+        # sitting directly on each microblock's 16-deep amax dependency
+        # chain (every cvt below depends on that chain's last element, so
+        # path position, not instruction count, is what pays here). Selector
+        # byte 0x0C always emits a literal zero byte; bytes 4..7 or 0..3 of
+        # the two (identical) operand copies pick the source word's own
+        # low/high byte pair. Only the selector depends on the lane (`half`),
+        # and `half` is already chunk-loop invariant (same as `cw` above), so
+        # `hsel` is computed once per chunk here, not re-derived 32 times
+        # inside the row loop. Bit-exact by construction (verified byte by
+        # byte against the `and`/`shl` formulas above). Verbatim precedent:
+        # mxfp4_quant_kernel._col_half / hsel.
+        hsel = arith.select(half != I32(0), I32(0x07060C0C), I32(0x05040C0C))
         cbits = []
         for row in range_constexpr(32):
             word = fx.Int32(_lds_load1(lds.buf.ptr, I32(row * _TCW) + cw))
-            cbits.append(arith.select(half != I32(0), word & I32(-65536), word << 16))
+            cbits.append(fx.Int32(rocdl.perm_b32(word, word, hsel)))
         cwords, cb = _finish_microblock(cbits, True, BIAS)
         gcol = I32(c * _TC) + tid
         cob = gcol * (R >> 3) + bid * I32(4)
