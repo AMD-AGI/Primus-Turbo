@@ -30,20 +30,9 @@ struct vsmem_t {
     size_t bytes_per_block;
 };
 
-struct LookbackCache {
-    void  *ptr        = nullptr;
-    size_t total      = 0;
-    size_t buf_bytes  = 0; // bytes per tile_state half
-    int    active_idx = 0; // 0 or 1
-};
-
 struct TempStorageLayout {
-    uint64_t *tile_state;      // active tile_state for THIS launch
-    uint64_t *prev_tile_state; // tile_state used by the PREVIOUS launch on this
-                               // stream; the last block's Phase 8 zeros it for
-                               // the launch that will re-use this slot
-    size_t  num_memset_int64;  // length of EACH tile_state buffer, in uint64 units
-    vsmem_t vsmem;             // gmem_ptr == nullptr ⇒ kernel uses LDS
+    uint64_t *tile_state; // zeroed on the launch stream right before the kernel
+    vsmem_t   vsmem;      // gmem_ptr == nullptr ⇒ kernel uses LDS
 };
 
 struct TileState {

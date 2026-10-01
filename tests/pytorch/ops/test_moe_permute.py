@@ -558,3 +558,51 @@ def test_moe_permute_pad_multiple_fwd_bwd(num_topk, pad_multiple):
     torch.testing.assert_close(unp_in_pad.grad[real_mask_pad], unp_in_ref.grad, **tol)
     if unp_in_pad.grad.shape[0] > real_total:
         assert torch.all(unp_in_pad.grad[~real_mask_pad] == 0)
+
+
+# -----------------------------------------------------------------------------
+# CUDA graphs: every replay must see a fresh lookback workspace, and nothing the
+# preprocessing kernel uses may outlive the graph it was captured into.
+# -----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("warmup_on_capture_stream", [False, True])
+def test_moe_permute_cuda_graph_replay(warmup_on_capture_stream):
+    num_tokens, num_experts, num_topk, hidden_size = 4096, 16, 4, 128
+    capacity = num_tokens * num_topk
+    static_map = generate_routing_map(num_tokens, num_experts, num_topk, seed=0)
+    static_tokens = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
+
+    def step():
+        permuted, _, tokens_per_expert, _, _, _, _ = moe_permute(
+            static_tokens,
+            static_map,
+            num_local_experts=num_experts,
+            num_permuted_tokens=capacity,
+            probs_layout="routing_map",
+        )
+        return permuted, tokens_per_expert
+
+    capture_stream = torch.cuda.Stream()
+    warmup_stream = capture_stream if warmup_on_capture_stream else torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            step()
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    # Capture twice on the same stream: the second graph must not inherit state from the first.
+    for capture in range(2):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=capture_stream):
+            graph_out = step()
+        for replay in range(4):
+            static_map.copy_(
+                generate_routing_map(num_tokens, num_experts, num_topk, seed=100 * capture + replay + 1)
+            )
+            static_tokens.normal_()
+            graph.replay()
+            eager_permuted, eager_tokens_per_expert = step()
+            torch.testing.assert_close(graph_out[1], eager_tokens_per_expert, rtol=0, atol=0)
+            torch.testing.assert_close(graph_out[0], eager_permuted, rtol=0, atol=0)
+        del graph, graph_out
