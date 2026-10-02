@@ -1,0 +1,53 @@
+--- validation.py.bak.pre-cache-1002
++++ validation.py
+@@ -14,6 +14,8 @@
+                   from the spec's `beat: ... beaten by N%` line.
+ Every timing number comes from benchmark.py -- one subprocess per shape; there is no second
+ timing loop here. Exit 2 on any failure; any other non-zero exit is a crash.
++JIT cache (A0 operator 2026-10-02, h46/h49): this process and every benchmark.py subprocess get their OWN fresh
++FLYDSL_RUNTIME_CACHE_DIR, so the gate never runs a stale binary from a shared cache.
+ """
+ from __future__ import annotations
+ 
+@@ -29,6 +31,22 @@
+ import sys  # noqa: E402
+ import tempfile  # noqa: E402
+ from pathlib import Path  # noqa: E402
++import atexit  # noqa: E402
++import shutil  # noqa: E402
++
++
++def fresh_flycache(tag: str) -> str:
++    """A0 operator 2026-10-02 (h46/h49): a FRESH FlyDSL JIT cache directory per process this gate runs -- this one
++    (correctness, determinism) and each benchmark.py subprocess (speed). FlyDSL 0.3.4.1's disk-cache key ignores
++    module-level constants (RESCALE_THRESHOLD, SPEC_STALE_MAX), and fa-repro sets no FLYDSL_RUNTIME_CACHE_DIR, so a
++    gate that set none shared /root/.flydsl/cache with every other process and could time a stale binary of a path
++    whose contents changed. Removed when this process exits. Not part of the refcache provenance."""
++    path = tempfile.mkdtemp(prefix=f"flycache_val_{tag}.", dir="/tmp")
++    atexit.register(shutil.rmtree, path, True)
++    return path
++
++
++os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = fresh_flycache("main")   # before torch / flydsl are imported
+ 
+ HERE = Path(__file__).resolve().parent
+ JOB_CONTEXT = HERE.parent
+@@ -56,7 +74,8 @@
+         out = Path(td) / "rows.json"
+         cmd = [sys.executable, str(HERE / "benchmark.py"), "--arm-path", f"candidate={impl}",
+                "--arm-path", f"beat={HERE / 'beat'}", "--shapes", shape, "--json", str(out)]
+-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
++        p = subprocess.run(cmd, capture_output=True, text=True, timeout=1800,
++                           env=dict(os.environ, FLYDSL_RUNTIME_CACHE_DIR=fresh_flycache(shape)))
+         for line in p.stdout.splitlines():
+             if line.startswith(("RESULT", "# ENV", "# arm")):
+                 print("    " + line)
+@@ -74,6 +93,8 @@
+     print(f"  spec {SPEC.name}: precision {gate_db} dB, beat margin {margin}% -> bar {bar:.4f}x beat")
+     print(f"  ENV TORCH_BLAS_PREFER_HIPBLASLT={os.environ.get('TORCH_BLAS_PREFER_HIPBLASLT')} "
+           f"HIPBLASLT_TENSILE_LIBPATH={os.environ.get('HIPBLASLT_TENSILE_LIBPATH')}")
++    print(f"  JIT cache FLYDSL_RUNTIME_CACHE_DIR={os.environ['FLYDSL_RUNTIME_CACHE_DIR']} (fresh; every benchmark.py "
++          f"subprocess gets its own)")
+     failures = []
+ 
+     import torch

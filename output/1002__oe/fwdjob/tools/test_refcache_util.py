@@ -18,6 +18,10 @@ import sys
 import types
 from pathlib import Path
 
+# Never write __pycache__/*.pyc next to the job's own modules (refcache_util.py, eager/impl.py) -- the job directory
+# is checked file by file before a launch. Same effect as `python3 -B`, for callers that forget it.
+sys.dont_write_bytecode = True
+
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import refcache_prov  # noqa: E402  (stdlib-only reader of torch zip files)

@@ -1,0 +1,19 @@
+--- state.yaml.bak.pre-realign-1002
++++ state.yaml
+@@ -43,8 +43,14 @@
+   spec_version: v000
+ - at: '2026-10-02T10:31:53'
+   event: hand_edit
+-  reason: 'A0 1002: restored from the B0 backup; round 20 sessions removed (planner d694338b, reviewer 82966052:
+-    B0-only Claude sessions, so act/reflect start fresh agents from the files); see PT/output/1002__oe/FWDJOB.md'
++  reason: 'A0 1002: restored from the B0 backup; round 20 sessions removed (planner d694338b, reviewer
++    82966052: B0-only Claude sessions, so act/reflect start fresh agents from the files); see PT/output/1002__oe/FWDJOB.md'
++- at: '2026-10-02T11:37:27'
++  event: hand_edit
++  reason: 'A0 1002: rounds/016/op realigned to op/current (r13ns, m32x8 370769c9); round 16''s rejected
++    candidate g61 (m32x8 96583ca5, = rounds/016/1-opt/raw/arms/g61) moved to rounds/016/op.rejected-g61-1002,
++    so setup''s promote(best_round 16) is a no-op and every prompt that names rounds/016/op as the incumbent
++    measures r13ns; file re-dumped with the framework''s settings; see PT/output/1002__oe/FWDJOB.md'
+ best_round: 16
+ champions:
+   fast: 19

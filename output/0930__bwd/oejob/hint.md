@@ -53,6 +53,8 @@ refactor) and supersede the stale B0/A0 notes marked `superseded` in the status 
 | h80 | must standing | Rulers on A0: arm pipeline (compile-only, fast serial, prod validation, blocked prod A/B with A/A + beat); k_dqg runs only at proxy/prod so toy/fast do not test it; fresh JIT cache + new dir per arm | open |
 | h81 | must standing | ATT works since the 09-29 reflash and is the PRIMARY diagnostic: recipe, outputs, limits (PC sampling still banned) | open |
 | h82 | advise note | Where to look next from the s6 ATT/PMC: k_dkdv LSE/delta wait, remaining VALU/msb/nop sites, concurrency under the power limit, fused route only via a cheaper atomic path | open |
+| h83 | must standing | `fast` is scored on the MIN and weighted 0 (gain_weights prod 1 / proxy 0.25 / fast 0); round 24's accept was fast-median noise -- judge on prod first, proxy second | open |
+| h85 | must standing | HARD RULE after the round-27 wedge: ISA/VGPR probes are COMPILE-ONLY; a never-launched kernel runs first ALONE at toy, AMD_SERIALIZE_KERNEL=3, via the lock/KFD wrapper, before proxy/prod; image hipBLASLt only (never ~/.local/hipblaslt-gfx1250); no fp32 GEMM on the card | open |
 
 ---
 
@@ -4798,3 +4800,21 @@ launch/scheduling-bound. The operator therefore changed two things on 2026-09-30
 and `evolve.gain_weights` is {prod: 1.0, proxy: 0.25, fast: 0.0}. Round 24's tree (s6 + DQT_VT_KEEP) is
 performance-equivalent to s6 on prod; it stays as the champion. Judge future rounds on prod first, proxy second;
 never cite a `fast` median as evidence.
+
+## h85 -- STANDING HARD RULE: never launch an unproven kernel at prod; never the host hipBLASLt lib (round 27 wedged the card)
+
+On 2026-10-02 11:40 UTC round 27's opt ran `rounds/027/1-opt/raw/build_cmd.sh`: two never-launched w4f fused-kernel variants
+(`_scratch/arms/A_g74`, `B_g82`: 4-wave WG, split barriers, dQ atomics) were called directly at the PROD shape, with no toy run, no
+AMD_SERIALIZE_KERNEL, no lock/KFD wrapper, and `HIPBLASLT_TENSILE_LIBPATH=~/.local/hipblaslt-gfx1250` (the host library). Two minutes
+later MES stopped responding and the driver began a GPU reset (`MES might be in unrecoverable state`) -- an AC power cycle by the user.
+The probe only wanted `.vgpr_count`, which COMPILE-ONLY gives without any launch.
+Rules, effective immediately, for every round and every script:
+1. Anything that only needs ISA/VGPR/LDS numbers is COMPILE-ONLY (`COMPILE_ONLY=1 ARCH=gfx1250 FLYDSL_GPU_ARCH=gfx1250 HIP_VISIBLE_DEVICES=-1`).
+2. A kernel or arm that has never run on this card must first run ALONE at the `toy` shape, in its own process, with
+   `AMD_SERIALIZE_KERNEL=3`, through a lock/KFD-empty wrapper (e.g. `PT/output/0930__bwd/tools/run.sh`, which also classifies dmesg), then
+   `gqa4_small` and `unequal_seqlen_2`, then proxy, and only then prod. Fused/atomic/barrier/TDM kernels without a CPU bounds proof
+   that covers every new index, atomic address, TDM descriptor and barrier count are not launched at all.
+3. The hipBLASLt library is ALWAYS the image one: `HIPBLASLT_TENSILE_LIBPATH=/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/gfx1250`.
+   `~/.local/hipblaslt-gfx1250` is forbidden in every script.
+4. No fp32 matmul/einsum/GEMM on the card in any script (references and measurement probes alike): use device='cpu'.
+A round that breaks any of these is a failed round regardless of its numbers.

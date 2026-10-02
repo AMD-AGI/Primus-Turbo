@@ -18,27 +18,38 @@ for s6 vs ASM (~6%): the e2e step runs at ~1.5 GHz median, between the two ruler
 
 METHOD (identical to output/1002__e2e/tools/realab.py RA_COND=gb and output/0927__b0/fwd-nospec/tools/ab.py
 AB_COND=gb, which produced those numbers):
-  burst      before EVERY timed call: torch.cuda.synchronize(), then --gb-ng (10) x F.linear of bf16
-             x[32768,4096] by w[14336,4096]^T (~21.5 ms on A0), then the call with no sync in between. The CUDA
-             events time the call only; the burst's own time is recorded as gb_burst_ms.
+  burst      before EVERY timed call: torch.cuda.synchronize(), then --gb-ng (NG) x F.linear of bf16
+             x[32768,4096] by w[14336,4096]^T (~2.15 ms each on A0; NG 10 = ~21.5 ms), then the call with no sync
+             in between. The CUDA events time the call only; the burst's own time is recorded as gb_burst_ms.
+             NG defaults to GB_NG_DEFAULT, the CALIBRATED burst length: calib/gbcal.py measures the call-window
+             clock and fwd r16/ASM, bwd s6/ASM for NG in {0,2,3,5,10} in one card process, and
+             tools/install_fwd_ruler.py writes the chosen NG into the installed copy (RULER.md section 8.1).
+             NG 0 = synchronize + call, no GEMM (no library dependence, never void).
   library    the IMAGE hipBLASLt library (IMAGE_BLAS). preimport() ASSIGNS the env before torch is imported,
              the burst's warm-up initialises hipBLASLt BEFORE any arm is loaded (an arm's _env.py may re-point
              HIPBLASLT_TENSILE_LIBPATH: the fwd trees assign the host library, with which this GEMM runs at
              ~80 TF/s, the clock stays ~2.1 GHz and the ruler is void), and the env is assigned again after
              the arms are loaded.
   void       3 timed bursts right after the arms are loaded, and every timed call's own burst: a median above
-             --gb-max-burst-ms (80) means the image library is not in use. Then no RESULT row is printed for
-             that shape and benchmark.py exits VOID_RC (4) with a "SPEED RULER VOID" line on stdout and stderr.
+             --gb-max-burst-ms (default 8 ms x NG; image library ~2.15 ms per GEMM, host library ~48) means the
+             image library is not in use. Then no RESULT row is printed for that shape and benchmark.py exits
+             VOID_RC (4) with a "SPEED RULER VOID" line on stdout and stderr.
   ordering   rounds palindromic over arms, an even number of them, --gb-block (5) timed calls per arm per
              round, no lead calls (the burst, not the previous call, sets the card state). Timed calls per arm
              = ceil(gb_iters / gb_block) rounded up to an even round count, times gb_block.
   statistic  median of the per-call CUDA-event times (the bwd job keeps the MIN for `fast`, h83).
   witness    the card's hwmon freq1_input, sampled every 1 ms by a thread while (and only while) the gb loop
              runs: per call the median inside the call's window [t_end - ms, t_end] (gb_sclk) and in the 3 ms
-             before it (gb_sclk_pre, the end of the burst). Expected on A0: call ~1.26-1.39 GHz, burst ~21-23 ms.
+             before it (gb_sclk_pre, the end of the burst). Expected on A0 at NG 10: call ~1.26-1.39 GHz,
+             burst ~21-23 ms; at the calibrated NG see RULER.md 8.1.
              A call-window median above --gb-max-sclk is reported (gb_clock_ok=False), not voided.
   A/A        --aa LABEL measures a byte copy of that arm (fresh temp dir) as LABEL_aa in the same rounds; the
              copy's row carries aa_of / aa_ratio (time ratio copy/original) = this session's noise floor.
+  fallback   gb never runs under a profiler (LD_PRELOAD naming a rocprofiler library, any ROCPROF* variable,
+             ROCP_TOOL_LIBRARIES / HSA_TOOLS_LIB naming one) or with --warmup-seconds 0 (every profiling recipe):
+             whatever --ruler says, every shape then uses the blocked ruler only and the header says why
+             (resolve_ruler). The GEMMs would otherwise fill the trace and the PMC/ATT capture, and GEMMs under
+             PMC/ATT were never validated on this card.
 
 Nothing here imports torch at module level: preimport() has to run before `import torch`.
 """
@@ -61,9 +72,43 @@ IMAGE_BLAS = "/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250
 GB_M, GB_K, GB_N = 32768, 4096, 14336          # one bf16 GEMM of the burst: [M,K] x [N,K]^T
 VOID_RC = 4
 RULERS = ("auto", "blk", "gb", "both")
+GB_NG_DEFAULT = 10   # INSTALL: the calibrated burst length (RULER.md 8.1); tools/install_fwd_ruler.py sets the number
+GB_VOID_MS_PER_GEMM = 8.0          # void threshold per GEMM of the burst (image ~2.15 ms, host library ~48 ms)
 
 
 # ------------------------------------------------------------------------------------------------ arguments
+def profiler_reason(environ=None):
+    """Why this process runs under a profiler (rocprofv3 & co), or None.
+
+    rocprofv3 appends librocprofiler-sdk-tool.so / librocprofiler-sdk.so to LD_PRELOAD and exports ROCPROF_* (and
+    ROCP_TOOL_LIBRARIES); the older rocprof sets HSA_TOOLS_LIB to librocprofiler64.so.
+    """
+    env = os.environ if environ is None else environ
+    pre = env.get("LD_PRELOAD") or ""
+    if "rocprof" in pre.lower():
+        return f"LD_PRELOAD names a profiler library ({pre[:120]})"
+    keys = sorted(k for k in env if k.upper().startswith("ROCPROF"))
+    if keys:
+        return f"profiler environment ({', '.join(keys[:3])}{', ...' if len(keys) > 3 else ''})"
+    for k in ("ROCP_TOOL_LIBRARIES", "HSA_TOOLS_LIB"):
+        if "rocprof" in (env.get(k) or "").lower():
+            return f"{k} names a profiler library"
+    return None
+
+
+def resolve_ruler(ruler: str, warmup_seconds=None, environ=None):
+    """(ruler actually used, note). Under a profiler or with --warmup-seconds 0 the gb ruler never runs: every mode
+    (auto, gb, both) falls back to the blocked ruler, and the note says why -- the profiling recipes all pass
+    --warmup-seconds 0, and a GEMM burst inside a PMC/ATT capture both swamps the trace and was never validated on
+    this card. An explicit --ruler blk is returned as is."""
+    why = profiler_reason(environ)
+    if why is None and warmup_seconds is not None and float(warmup_seconds) <= 0:
+        why = "--warmup-seconds 0 (profiling / smoke recipe)"
+    if why and ruler != "blk":
+        return "blk", f"gb ruler disabled, blocked only: {why}"
+    return ruler, ""
+
+
 def rulers_for(shape: str, ruler: str) -> tuple:
     """Which rulers run for a shape. The LAST one is the scored one.
 
@@ -80,16 +125,22 @@ def rulers_for(shape: str, ruler: str) -> tuple:
 
 
 def add_args(ap: argparse.ArgumentParser) -> None:
-    g = ap.add_argument_group("gb ruler (training operating point; gbruler.py, PT/output/1002__oe/RULER.md)")
+    g = ap.add_argument_group(
+        "gb ruler (training operating point; gbruler.py, PT/output/1002__oe/RULER.md)",
+        "Under a profiler (rocprofv3: LD_PRELOAD / ROCPROF*) or with --warmup-seconds 0 every shape uses the blocked "
+        "ruler only, whatever --ruler says (the header says why).")
     g.add_argument("--ruler", choices=RULERS, default="auto",
                    help="auto: fast blk; proxy/prod blk (reported) + gb (scored) | blk: blocked only (pre-10-02 "
                         "behaviour) | gb: gb only | both: blk + gb on every shape, gb scored")
     g.add_argument("--gb-iters", type=int, default=None,
                    help="timed calls per arm under gb (default: --iters; rounded up to whole even rounds)")
     g.add_argument("--gb-block", type=int, default=5, help="timed calls per arm per palindromic gb round")
-    g.add_argument("--gb-ng", type=int, default=10, help="bf16 GEMMs per burst")
-    g.add_argument("--gb-max-burst-ms", type=float, default=80.0,
-                   help="burst median above this = image hipBLASLt not in use = ruler void (exit 4)")
+    g.add_argument("--gb-ng", type=int, default=GB_NG_DEFAULT,
+                   help=f"bf16 GEMMs per burst (default {GB_NG_DEFAULT} = the calibrated value; 0 = synchronize "
+                        f"and call, no GEMM)")
+    g.add_argument("--gb-max-burst-ms", type=float, default=None,
+                   help=f"burst median above this = image hipBLASLt not in use = ruler void (exit 4); default "
+                        f"{GB_VOID_MS_PER_GEMM:g} ms x --gb-ng")
     g.add_argument("--gb-max-sclk", type=float, default=1700.0,
                    help="call-window sclk median (MHz) above this is reported as gb_clock_ok=False")
     g.add_argument("--aa", action="append", default=[],
@@ -102,18 +153,29 @@ def assign_image_blas() -> None:
     os.environ["HIPBLASLT_TENSILE_LIBPATH"] = IMAGE_BLAS
 
 
-def preimport(argv, default_shapes: str) -> bool:
-    """Call BEFORE `import torch`. Assigns the image hipBLASLt env iff a gb ruler will run in this process.
+def preimport(argv, default_shapes: str, environ=None) -> bool:
+    """Call BEFORE `import torch`, from `if __name__ == "__main__":` only (a script that imports benchmark.py
+    must not have its BLAS environment changed). Assigns the image hipBLASLt env iff a gb ruler with at least one
+    GEMM will run in this process.
 
-    `--ruler blk` (or auto with only `fast`) leaves the environment exactly as before this patch.
+    `--ruler blk`, auto with only `fast`, a profiler, `--warmup-seconds 0` and `--gb-ng 0` all leave the
+    environment exactly as before this patch.
     """
     p = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     p.add_argument("--ruler", default="auto")
     p.add_argument("--shapes", default=default_shapes)
+    p.add_argument("--warmup-seconds", default=None)
+    p.add_argument("--gb-ng", default=None)
     a, _ = p.parse_known_args(list(argv))
     if a.ruler not in RULERS:
         return False                                   # main()'s parser reports the error
-    if any("gb" in rulers_for(s, a.ruler) for s in a.shapes.split(",") if s):
+    try:
+        warm = None if a.warmup_seconds is None else float(a.warmup_seconds)
+        ng = GB_NG_DEFAULT if a.gb_ng is None else int(a.gb_ng)
+    except ValueError:
+        return False                                   # main()'s parser reports the error
+    ruler, _ = resolve_ruler(a.ruler, warm, environ)
+    if ng > 0 and any("gb" in rulers_for(s, ruler) for s in a.shapes.split(",") if s):
         assign_image_blas()
         return True
     return False
@@ -326,17 +388,38 @@ class _Burst:
             self.F.linear(self.x, self.w)
 
 
+class _SyncOnly:
+    """NG 0: the call follows a synchronize and nothing else."""
+
+    ng = 0
+    backend = "none (NG 0)"
+
+    def __init__(self, torch):
+        self.torch = torch
+
+    def sync(self) -> None:
+        self.torch.cuda.synchronize()
+
+    def launch(self) -> None:
+        pass
+
+
 class GbRuler:
     """Construct BEFORE loading any arm; call after_load() after loading them; run() per shape."""
 
     def __init__(self, torch, args, default_iters: int):
         self.torch = torch
         self.iters = args.gb_iters or default_iters
-        self.block, self.ng = max(1, args.gb_block), max(1, args.gb_ng)
-        self.max_ms, self.max_sclk = args.gb_max_burst_ms, args.gb_max_sclk
+        self.block, self.ng = max(1, args.gb_block), max(0, args.gb_ng)
+        self.max_ms = (args.gb_max_burst_ms if args.gb_max_burst_ms is not None
+                       else GB_VOID_MS_PER_GEMM * self.ng)
+        self.max_sclk = args.gb_max_sclk
         self.order = f"gb{self.ng}x{GB_M}x{GB_K}x{GB_N}bf16+palindromic{self.block}"
         self.burst, self.sclk, self.check_ms, self.env_before = None, None, [], None
         self.void, self.note = None, ""
+        if self.ng == 0:
+            self.burst = _SyncOnly(torch)              # no GEMM: no library to check, nothing to void
+            return
         if os.environ.get("HIPBLASLT_TENSILE_LIBPATH") != IMAGE_BLAS:
             # preimport() did not assign it (e.g. an abbreviated --ruler). hipBLASLt reads the path at its first
             # use, which is the warm-up below, and the backend is forced there too: assign now and say so.
@@ -354,6 +437,9 @@ class GbRuler:
         """Re-assert the image env (an arm's _env.py may have re-pointed it), time 3 bursts, start the witness."""
         if self.void:
             return self.void
+        if self.ng == 0:
+            self.sclk = Sclk(find_sclk_file())
+            return None
         self.env_before = os.environ.get("HIPBLASLT_TENSILE_LIBPATH")
         assign_image_blas()
         t = self.torch
@@ -374,8 +460,12 @@ class GbRuler:
         return self.void
 
     def header(self) -> str:
-        return (f"gb ruler: {self.note}{self.order}, {gb_rounds(self.iters, self.block) * self.block} timed calls "
-                f"per arm; "
+        if self.ng == 0:
+            return (f"gb ruler: NG 0 (synchronize + call, no GEMM), {self.order}, "
+                    f"{gb_rounds(self.iters, self.block) * self.block} timed calls per arm; sclk witness "
+                    f"{self.sclk.path if self.sclk else None}")
+        return (f"gb ruler: {self.note}{self.order} (NG {self.ng}, void above {self.max_ms:g} ms), "
+                f"{gb_rounds(self.iters, self.block) * self.block} timed calls per arm; "
                 f"blas {self.burst.backend if self.burst else '?'}; HIPBLASLT_TENSILE_LIBPATH re-assigned "
                 f"{self.env_before} -> {IMAGE_BLAS}; burst {' '.join(f'{x:.1f}' for x in self.check_ms)} ms; "
                 f"sclk witness {self.sclk.path if self.sclk else None} now "
@@ -386,6 +476,8 @@ class GbRuler:
                       self.iters, self.block)
 
     def check(self, rec, shape: str):
+        if self.ng == 0:
+            return None
         return void_reason([x for rr in rec.values() for x in rr["pre_ms"]], self.max_ms, shape)
 
 

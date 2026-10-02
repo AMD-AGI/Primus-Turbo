@@ -7,6 +7,8 @@
 
 Every anchor must occur exactly once in BASE; otherwise it stops and names the anchor, so a harness that a round
 edited after 2026-10-02 is merged by hand instead of being patched blindly. Stdlib only.
+Revision 2 (2026-10-02 afternoon, after review): preimport only under `if __name__ == "__main__"`, and the scored
+ruler is resolve_ruler(--ruler, --warmup-seconds): blocked only under a profiler or with --warmup-seconds 0.
 """
 import sys
 from pathlib import Path
@@ -14,12 +16,15 @@ from pathlib import Path
 BWD_BENCH = [
     ('''  L2           flushed between timed iterations, outside the event window.
 ''', '''  L2           flushed between timed iterations, outside the event window.
-  ruler        --ruler auto (default, A0 operator 2026-10-02, hint h84): `fast` keeps the blocked ruler
-               above (MIN, h83); `proxy` and `prod` run it too (reported as blk_*) and are then SCORED on the
-               gb ruler = the training operating point: before EVERY timed call 10 bf16 GEMMs
-               32768x4096x14336 with the IMAGE hipBLASLt library (~21.5 ms), then the call; palindromic
-               rounds of --gb-block calls per arm; median; clock witness gb_sclk per call; a burst slower
-               than --gb-max-burst-ms voids the ruler (exit 4). --ruler blk = the pre-10-02 behaviour.
+  ruler        --ruler auto (default; prepared by the A0 operator 2026-10-02 as hint h84 and NOT installed:
+               the bwd job keeps the blocked ruler, whose s6/ASM 0.972 matches the e2e's 0.974): `fast` keeps
+               the blocked ruler above (MIN, h83); `proxy` and `prod` run it too (reported as blk_*) and are
+               then SCORED on the gb ruler = the training operating point: before EVERY timed call NG bf16
+               GEMMs 32768x4096x14336 with the IMAGE hipBLASLt library (~2.15 ms each), then the call; NG =
+               --gb-ng, default the CALIBRATED gbruler.GB_NG_DEFAULT (RULER.md 8.1); palindromic rounds of
+               --gb-block calls per arm; median; clock witness gb_sclk per call; a burst slower than
+               --gb-max-burst-ms (8 ms x NG) voids the ruler (exit 4). --ruler blk = the pre-10-02 behaviour,
+               and what every shape falls back to under a profiler (rocprofv3) or with --warmup-seconds 0.
                --aa LABEL adds a byte copy of an arm as LABEL_aa (A/A floor, aa_ratio). Code: gbruler.py;
                why: it ranks FlyDSL arms like the e2e does (s6/r29: e2e 0.754, gb 0.774, blocked 0.806;
                PT/output/1002__e2e/RESULT-{realab,e2e}.md, PT/output/1002__oe/RULER.md).
@@ -31,7 +36,8 @@ import torch  # noqa: E402
 sys.path.insert(0, str(HERE))                                          # gbruler.py
 
 import gbruler  # noqa: E402  -- stdlib only; it must run BEFORE torch is imported
-gbruler.preimport(sys.argv[1:], default_shapes="fast,proxy,prod")      # image hipBLASLt env iff gb runs
+if __name__ == "__main__":       # a script that imports this module keeps its own BLAS environment
+    gbruler.preimport(sys.argv[1:], default_shapes="fast,proxy,prod")  # image hipBLASLt env iff gb runs
 
 import torch  # noqa: E402
 '''),
@@ -99,8 +105,11 @@ import torch  # noqa: E402
     ('''          f"device {torch.cuda.get_device_properties(0).gcnArchName}")
 ''', '''          f"device {torch.cuda.get_device_properties(0).gcnArchName}")
     shapes = [s for s in args.shapes.split(",") if s]
-    plan = {s: gbruler.rulers_for(s, args.ruler) for s in shapes}
-    print(f"# ruler {args.ruler}: " + "  ".join(f"{s}={'+'.join(r)} (scored {r[-1]})" for s, r in plan.items()))
+    ruler, ruler_note = gbruler.resolve_ruler(args.ruler, args.warmup_seconds)  # profiler / warmup 0 -> blk
+    plan = {s: gbruler.rulers_for(s, ruler) for s in shapes}
+    print(f"# ruler {args.ruler}{'' if ruler == args.ruler else ' -> ' + ruler}: "
+          + "  ".join(f"{s}={'+'.join(r)} (scored {r[-1]})" for s, r in plan.items())
+          + (f"  [{ruler_note}]" if ruler_note else ""))
     # BEFORE load_impl: the burst initialises hipBLASLt with the image library before any arm's _env.py runs.
     gb = (gbruler.GbRuler(torch, args, default_iters=args.iters)
           if any("gb" in r for r in plan.values()) else None)
@@ -136,12 +145,14 @@ FWD_BENCH = [
 """''', '''  counts       FLOP and bytes from the shipped tools/op_flops.py, forward (backward=False).
   ruler        --ruler auto (default, A0 operator 2026-10-02, hint h51): `fast` keeps the blocked ruler above;
                `proxy` and `prod` run it too (reported as blk_*) and are then SCORED on the gb ruler = the
-               training operating point: before EVERY timed call 10 bf16 GEMMs 32768x4096x14336 with the IMAGE
-               hipBLASLt library (~21.5 ms), then the call; palindromic rounds of --gb-block calls per arm;
-               median; clock witness gb_sclk per call; a burst slower than --gb-max-burst-ms voids the ruler
-               (exit 4). --ruler blk = the pre-10-02 behaviour. --aa LABEL adds a byte copy of an arm as
+               training operating point: before EVERY timed call NG bf16 GEMMs 32768x4096x14336 with the IMAGE
+               hipBLASLt library (~2.15 ms each), then the call; NG = --gb-ng, default the CALIBRATED
+               gbruler.GB_NG_DEFAULT (RULER.md 8.1); palindromic rounds of --gb-block calls per arm; median;
+               clock witness gb_sclk per call; a burst slower than --gb-max-burst-ms (8 ms x NG) voids the
+               ruler (exit 4). --ruler blk = the pre-10-02 behaviour, and what every shape falls back to under
+               a profiler (rocprofv3) or with --warmup-seconds 0. --aa LABEL adds a byte copy of an arm as
                LABEL_aa (A/A floor, aa_ratio). Code: gbruler.py; why: r16/ASM is 1.263 in the e2e, 1.349 on
-               gb, 1.081 blocked (PT/output/1002__e2e/RESULT-{realab,e2e}.md, PT/output/1002__oe/RULER.md).
+               gb at NG 10, 1.081 blocked (PT/output/1002__e2e/RESULT-{realab,e2e}.md, PT/output/1002__oe/RULER.md).
 """'''),
     ('''sys.path.insert(0, str(TOOLS))
 
@@ -150,7 +161,8 @@ import torch  # noqa: E402
 sys.path.insert(0, str(HERE))                                        # gbruler.py
 
 import gbruler  # noqa: E402  -- stdlib only; it must run BEFORE torch is imported
-gbruler.preimport(sys.argv[1:], default_shapes="fast,proxy,prod")    # image hipBLASLt env iff gb runs
+if __name__ == "__main__":       # a script that imports this module keeps its own BLAS environment
+    gbruler.preimport(sys.argv[1:], default_shapes="fast,proxy,prod")  # image hipBLASLt env iff gb runs
 
 import torch  # noqa: E402
 '''),
@@ -234,7 +246,8 @@ import torch  # noqa: E402
         if not (path / "impl.py").is_file():
             ap.error(f"arm {label!r}: no impl.py under {path}")
     shapes = [s for s in a.shapes.split(",") if s]
-    plan = {s: gbruler.rulers_for(s, a.ruler) for s in shapes}
+    ruler, ruler_note = gbruler.resolve_ruler(a.ruler, a.warmup_seconds)   # profiler / warmup 0 -> blk
+    plan = {s: gbruler.rulers_for(s, ruler) for s in shapes}
     # BEFORE load_impl: the burst initialises hipBLASLt with the image library before any arm's _env.py
     # runs (this job's _env.py ASSIGNS the host library, with which the burst is void).
     gb = gbruler.GbRuler(torch, a, default_iters=a.iters) if any("gb" in r for r in plan.values()) else None
@@ -250,8 +263,9 @@ import torch  # noqa: E402
         print(f"# arm {label} -> {path}  {witness(fns[label])}")
     print(f"# ENV TORCH_BLAS_PREFER_HIPBLASLT={os.environ.get('TORCH_BLAS_PREFER_HIPBLASLT')} "
           f"HIPBLASLT_TENSILE_LIBPATH={os.environ.get('HIPBLASLT_TENSILE_LIBPATH')}  "
-          f"ruler {a.ruler}: " + " ".join(f"{s}={'+'.join(r)}" for s, r in plan.items())
-          + (f" | {gb.header()}" if gb is not None else ""))
+          f"ruler {a.ruler}{'' if ruler == a.ruler else ' -> ' + ruler}: "
+          + " ".join(f"{s}={'+'.join(r)}" for s, r in plan.items())
+          + (f" [{ruler_note}]" if ruler_note else "") + (f" | {gb.header()}" if gb is not None else ""))
 '''),
     ('''    for shape in [s for s in a.shapes.split(",") if s]:
         new = measure(shape, labels, fns, a.iters, a.warmup_seconds, causal=not a.non_causal,

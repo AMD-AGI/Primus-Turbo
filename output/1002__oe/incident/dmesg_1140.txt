@@ -1,0 +1,91 @@
+[50797.650596] amdgpu 0001:01:00.0: {9}[Hardware Error]: ACA[01/01].CONTROL_MASK=0x0000000000000000
+[50797.650601] amdgpu 0001:01:00.0: {9} socket: 7, die: 0, 71 new correctable hardware errors detected in pcie_pl block
+[50797.650603] amdgpu 0001:01:00.0: {9} socket: 7, die: 0, 581 correctable hardware errors detected in total in pcie_pl block
+[50797.660939] [Hardware Error]: PPIN: 0x00831df01b0e0007
+[50797.660943] [Hardware Error]: IPID: 0x000001e11ccc0007, Syndrome: 0x000000005a000001
+
+[50797.678738] [Hardware Error]: cache level: L3/GEN, mem/io: IO, mem-tx: GEN, part-proc: SRC (no timeout)
+[51452.982886] mce: [Hardware Error]: Machine check events logged
+[51452.982918] [Hardware Error]: Corrected error, no action required.
+[51452.982951] amdgpu 0001:01:00.0: {10}[Hardware Error]: Accelerator Check Architecture events logged
+[51452.989827] [Hardware Error]: CPU:8 (1a:51:0) MC60_STATUS[-|CE|MiscV|-|-|-
+[51452.990275] amdgpu 0001:01:00.0: {10}[Hardware Error]: ACA[01/01].CONTROL=0x0000000000000000
+[51452.990558] kauditd_printk_skb: 5 callbacks suppressed
+[51452.997967] |SyndV
+[51452.998347] amdgpu 0001:01:00.0: {10}[Hardware Error]: ACA[01/01].STATUS=0x982000000012080b
+[51452.998355] |-
+[51452.998355] amdgpu 0001:01:00.0: {10}[Hardware Error]: ACA[01/01].ADDR=0x0000000000000000
+[51452.998360] |-
+[51452.998359] amdgpu 0001:01:00.0: {10}[Hardware Error]: ACA[01/01].MISC=0xd01a004800000000
+[51452.998366] |-
+[51452.998365] amdgpu 0001:01:00.0: {10}[Hardware Error]: ACA[01/01].CONFIG=0x0000000000000000
+[51452.998367] ]: 0x982000000012080b
+[51452.998370] [Hardware Error]: PPIN: 0x00831df01b0e0007
+[51452.998373] [Hardware Error]: IPID: 0x000001e11ccc0007
+[51453.004112] amdgpu 0001:01:00.0: {10}[Hardware Error]: ACA[01/01].IPID=0x000001e11ccc0007
+[51453.006657] , Syndrome: 0x000000005a000001
+[51453.010241] amdgpu 0001:01:00.0: {10}[Hardware Error]: ACA[01/01].SYND=0x000000005a000001
+[51453.010436] amdgpu 0001:01:00.0: {10}[Hardware Error]: ACA[01/01].DESTAT=0x0000000000000000
+[51453.010438] amdgpu 0001:01:00.0: {10}[Hardware Error]: ACA[01/01].DEADDR=0x0000000000000000
+[51453.010440] amdgpu 0001:01:00.0: {10}[Hardware Error]: ACA[01/01].CONTROL_MASK=0x0000000000000000
+[51453.010446] amdgpu 0001:01:00.0: {10} socket: 7, die: 0, 72 new correctable hardware errors detected in pcie_pl block
+[51453.010448] amdgpu 0001:01:00.0: {10} socket: 7, die: 0, 653 correctable hardware errors detected in total in pcie_pl block
+
+[51453.012571] [Hardware Error]: cache level: L3/GEN, mem/io: IO, mem-tx: GEN, part-proc: SRC (no timeout)
+[53746.675180] mce: [Hardware Error]: Machine check events logged
+[53746.675203] [Hardware Error]: Corrected error, no action required.
+[53746.675236] amdgpu 0001:01:00.0: {11}[Hardware Error]: Accelerator Check Architecture events logged
+[53746.682111] [Hardware Error]: CPU:8 (1a:51:0) MC60_STATUS[-|CE|MiscV|-|-|-|SyndV|-|-|-]: 0x982000000012080b
+[53746.682850] kauditd_printk_skb: 5 callbacks suppressed
+[53746.683025] amdgpu 0001:01:00.0: {11}[Hardware Error]: ACA[01/01].CONTROL=0x0000000000000000
+[53746.683033] amdgpu 0001:01:00.0: {11}[Hardware Error]: ACA[01/01].STATUS=0x982000000012080b
+[53746.683036] amdgpu 0001:01:00.0: {11}[Hardware Error]: ACA[01/01].ADDR=0x0000000000000000
+[53746.683038] amdgpu 0001:01:00.0: {11}[Hardware Error]: ACA[01/01].MISC=0xd01a004900000000
+[53746.683040] amdgpu 0001:01:00.0: {11}[Hardware Error]: ACA[01/01].CONFIG=0x0000000000000000
+[53746.683041] amdgpu 0001:01:00.0: {11}[Hardware Error]: ACA[01/01].IPID=0x000001e11ccc0007
+[53746.683042] amdgpu 0001:01:00.0: {11}[Hardware Error]: ACA[01/01].SYND=0x000000005a000001
+[53746.683044] amdgpu 0001:01:00.0: {11}[Hardware Error]: ACA[01/01].DESTAT=0x0000000000000000
+[53746.683045] amdgpu 0001:01:00.0: {11}[Hardware Error]: ACA[01/01].DEADDR=0x0000000000000000
+[53746.683046] amdgpu 0001:01:00.0: {11}[Hardware Error]: ACA[01/01].CONTROL_MASK=0x0000000000000000
+[53746.683051] amdgpu 0001:01:00.0: {11} socket: 7, die: 0, 73 new correctable hardware errors detected in pcie_pl block
+[53746.683054] amdgpu 0001:01:00.0: {11} socket: 7, die: 0, 726 correctable hardware errors detected in total in pcie_pl block
+[53746.693425] [Hardware Error]: PPIN: 0x00831df01b0e0007
+[53746.700095] [Hardware Error]: IPID: 0x000001e11ccc0007, Syndrome: 0x000000005a000001
+
+[53746.711287] [Hardware Error]: cache level: L3/GEN, mem/io: IO, mem-tx: GEN, part-proc: SRC (no timeout)
+[53863.156075] amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=REMOVE_QUEUE
+[53865.168175] amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=SUSPEND
+[53865.177936] amdgpu 0001:01:00.0: failed to suspend all gangs
+[53867.188122] amdgpu 0001:01:00.0: queue id 0x1 at pasid 405030 is reset
+[53869.658358] amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=RESET
+[53869.666640] amdgpu 0001:01:00.0: failed to reset user queue
+[53869.673802] kfd kfd: Error resetting queue
+[53872.141432] amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=RESUME
+[53872.149908] amdgpu 0001:01:00.0: failed to resume all gangs
+[53872.156344] amdgpu 0001:01:00.0: failed to remove queue from MES, doorbell=0x1004
+[53872.164862] amdgpu 0001:01:00.0: MES might be in unrecoverable state, issue a GPU reset
+[53872.175802] amdgpu 0001:01:00.0: Failed to evict queue 3
+[53872.175828] amdgpu 0001:01:00.0: GPU reset begin!. Source:  3
+[53872.181729] amdgpu 0001:01:00.0: Failed to evict process queues
+[53874.646834] amdgpu 0001:01:00.0: MES(0, 0) failed to respond to msg=ADD_QUEUE
+[53874.654999] amdgpu 0001:01:00.0: failed to add hardware queue to MES, doorbell=0x1004
+[53874.666020] amdgpu 0001:01:00.0: MES might be in unrecoverable state, issue a GPU reset
+[53874.677280] amdgpu 0001:01:00.0: Failed to restore queue 3
+[53874.685736] amdgpu 0001:01:00.0: Failed to restore process queues
+[53874.685763] amdgpu 0001:01:00.0: remove_all_kfd_queues_mes: Failed to remove queue 3 for dev 56179
+[53877.170361] amdgpu 0001:01:00.0: MES(0, 1) failed to respond to msg=REMOVE_QUEUE
+[53877.179359] amdgpu 0001:01:00.0: failed to unmap legacy queue
+[53879.650568] amdgpu 0001:01:00.0: MES(1, 1) failed to respond to msg=REMOVE_QUEUE
+[53879.659282] amdgpu 0001:01:00.0: failed to unmap legacy queue
+[53882.126791] amdgpu 0001:01:00.0: MES(2, 1) failed to respond to msg=REMOVE_QUEUE
+[53882.135966] amdgpu 0001:01:00.0: failed to unmap legacy queue
+[53884.604931] amdgpu 0001:01:00.0: MES(3, 1) failed to respond to msg=REMOVE_QUEUE
+[53884.613407] amdgpu 0001:01:00.0: failed to unmap legacy queue
+[53887.081439] amdgpu 0001:01:00.0: MES(4, 1) failed to respond to msg=REMOVE_QUEUE
+[53887.090580] amdgpu 0001:01:00.0: failed to unmap legacy queue
+[53889.557956] amdgpu 0001:01:00.0: MES(5, 1) failed to respond to msg=REMOVE_QUEUE
+[53889.567019] amdgpu 0001:01:00.0: failed to unmap legacy queue
+[53892.037642] amdgpu 0001:01:00.0: MES(6, 1) failed to respond to msg=REMOVE_QUEUE
+[53892.047301] amdgpu 0001:01:00.0: failed to unmap legacy queue
+[53894.517886] amdgpu 0001:01:00.0: MES(7, 1) failed to respond to msg=REMOVE_QUEUE
+[53894.526707] amdgpu 0001:01:00.0: failed to unmap legacy queue
