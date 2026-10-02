@@ -1,3 +1,8 @@
-# kineto traces (16-66 MB each) stay local; logs, event JSONL, clocks, run summaries and tables are small and kept
+# kineto traces (16-66 MB each) stay local; logs, event JSONL, clocks, run summaries and tables are small and kept.
+# The repo's top-level .gitignore ignores every "logs/" directory: re-include this kit's logs/ (main training logs
+# ~110 KB, attn_ev JSONL, clk CSV, env, tree.sha256, nkfix stats, hang.* evidence) so a plain `git add` commits them.
+!/logs/
 traces/
 __pycache__/
+# drive.sh STOP sentinel (touch to stop before the next launch): never committed
+/STOP

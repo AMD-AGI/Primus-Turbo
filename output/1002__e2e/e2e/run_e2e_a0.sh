@@ -8,19 +8,31 @@
 # Normally called by drive.sh, which holds /tmp/a0-gpu0.lock for the whole sequence and exports
 # E2E_LOCK_HELD=1 (then this script does not take the lock itself). Standalone it takes the lock.
 #
-# Differences from the 09-28 A0 copy (each one a 09-28 lesson; E2E-PLAN.md section 3):
+# Differences from the 09-28 A0 copy (each one a 09-28 lesson or a 10-02 review item; E2E-PLAN.md section 3):
 #   * adapter = this kit's attn_backends (BLAS guard + per-step CUDA-event attention timing,
 #     E2E_ATTN_EVENTS) and FlyDSL trees only from E2E_FLY_TREES (no silent default)
 #   * E2E_EXPECT_BLAS_LIB = the IMAGE hipBLASLt library, assigned before python starts (bash -c, not -lc)
-#   * watchdog also stops the run (ONE SIGTERM to torchrun, never SIGKILL) on the first non-finite
+#   * watchdog also stops the run (ONE SIGTERM to torchrun by PID) on the first non-finite
 #     loss / grad_norm, the first "[nkfix] NON-FINITE", or a "!! BLAS-REPOINT" line
 #   * dmesg is classified: FAULT (stop) vs INFO (CPU MCE, GPU RAS *correctable* pcie_pl reports, which
 #     A0 logs during normal work, e.g. 2026-10-02 07:58:50) -- the 09-28 filter would have stopped on INFO
 #   * evidence: worker /proc/<pid>/environ (E2E_FLY_TREES, FLYDSL_RUNTIME_CACHE_DIR, BLAS env), sha256 of
-#     every file that runs, a key: value post-run summary runs/<tag>.post.txt
+#     every file that runs, a key: value post-run summary runs/<tag>.post.txt, the [e2e_attn]/[nkfix]/
+#     [flydsl_bwd]/BLAS-REPOINT lines of the rank-0 debug.log (outside the repo) -> runs/<tag>.dbg.txt
+#   * right before the docker exec (both modes): KFD empty, no op-evolve run/resume loop and no realab driver
+#     (neither takes the lock), the three trees at their pinned md5, and every file that runs unchanged since
+#     the driver started (E2E_TREE_BASE) -- else refuse (97 other client / 93 drift)
+#   * during the run (both modes, every 5 s): every KFD holder must carry E2E_RUN_MARKER=<this tag> in its
+#     environ (docker exec -e; torchrun and its workers inherit it). Any other holder is a second GPU client:
+#     "!! FOREIGN KFD <pid> <cmd>", ONE SIGTERM to this run's torchrun / opcheck python, run INVALID, exit 91
+#   * after a training run the files that ran are hashed again: a change during the run -> INVALID, the
+#     driver stops (93)
+# Signals: only SIGTERM, by PID, at most once per process (watchdog, memguard, foreign-KFD watch). The one
+# SIGKILL anywhere is `timeout -k 20` as the last backstop of a hard timeout (opcheck 600 s, training 2600 s)
+# when the process still runs 20 s after timeout's own SIGTERM.
 set -u
-KIT=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e
-B0E=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e
+. /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/trees.sh   # KIT, B0E, trees, guards
+KFD_DIR=$KFD_PROC                     # the real card, always (KFD_DIR is a dry-run override of drive.sh only)
 PRIMUS=/home/lihuzhan/code/2026_0828__primus/Primus
 FLY=/home/lihuzhan/.local/flydsl0341
 AITER=/home/lihuzhan/code/aiter-src
@@ -52,27 +64,81 @@ leftovers() {   # our own container only
   timeout 20 docker top $CT -eo pid,etime,args 2>/dev/null | grep -E "torchrun|primus/cli/main.py|opcheck.py" | grep -v grep || true
 }
 
+# Immediately before the docker exec: no other GPU client, the pinned trees, nothing changed since the driver
+# started. (drive.sh ran the same checks after its cool-down; this closes the gap to the exec itself.)
+pre_exec_guard() {
+  local x
+  x=$(kfd_holders); [ -n "$x" ] && { echo "!! refusing to start $TAG: KFD holders $(pid_desc $x)"; exit 97; }
+  x=$(oe_loops); [ -n "$x" ] && { echo "!! refusing to start $TAG: op-evolve loop running $(pid_desc $x)"; exit 97; }
+  x=$(realab_drivers); [ -n "$x" ] && { echo "!! refusing to start $TAG: realab driver running $(pid_desc $x)"; exit 97; }
+  if [ "${PREFLIGHT_ALLOW_SRC_DIFF:-0}" != 1 ]; then
+    x=$(trees_check); [ -n "$x" ] && { echo "!! refusing to start $TAG: tree drift: $x"; exit 93; }
+  fi
+  if [ -n "${E2E_TREE_BASE:-}" ]; then
+    x=$(run_files_sha | diff "$E2E_TREE_BASE" - | grep '^[<>]' | awk '{print $NF}' | sort -u | head -6 | tr '\n' ' ')
+    [ -n "$x" ] && { echo "!! refusing to start $TAG: run files changed since the driver started: $x"; exit 93; }
+  fi
+  echo "[$(date +%T)] pre-exec guard ok: KFD empty, no op-evolve/realab, trees pinned${E2E_TREE_BASE:+, run files = $E2E_TREE_BASE}"
+}
+
+# Foreign-KFD watch (background, both modes). $1 = file for the "!! FOREIGN KFD" lines, $2 = docker-top args
+# pattern of the process to stop (torchrun / opcheck.py). Every KFD holder must be this run's process; the first
+# foreign one is reported (each pid once) and then each of this run's matching processes gets ONE SIGTERM --
+# also one that only starts after the detection (a foreign holder can appear before our exec).
+kfd_watch() {
+  local p o c t own=" " sent=" "
+  while :; do
+    for p in $(kfd_holders); do
+      case "$own" in *" $p "*) continue ;; esac
+      o=$(kfd_owner "$p" "$TAG" $CT)
+      case $o in
+        ours|unverified) own="$own$p " ;;
+        foreign)
+          own="$own$p "
+          c=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-200)
+          echo "$(date +%T) !! FOREIGN KFD $p ${c:-?} (no E2E_RUN_MARKER=$TAG: a second GPU client) -- run INVALID, stopping it" >> "$1" ;;
+      esac
+    done
+    if [ -s "$1" ]; then
+      for t in $(timeout 20 docker top $CT -eo pid,args 2>/dev/null | grep -E "$2" | grep -v -E "timeout |bash " | awk '{print $1}'); do
+        case "$sent" in *" $t "*) continue ;; esac
+        [ "$(kfd_owner "$t" "$TAG" $CT)" = ours ] || continue
+        echo "$(date +%T) SIGTERM pid $t (this run's; foreign KFD holder present)" >> "$1"
+        sudo -n kill -TERM "$t" 2>/dev/null; sent="$sent$t "
+      done
+    fi
+    sleep 5
+  done
+}
+
 MODE=${1:?mode: train|opcheck}; shift
 case "$MODE" in
 opcheck)
   ARM=${1:?arm}; SHAPE=${2:?shape}; shift 2
   TAG=opcheck.$ARM.$SHAPE.$(date +%m%d_%H%M%S)
-  OUT=$KIT/runs; MARK=$(dmesg_mark)
-  echo "[$(date +%T)] $TAG start (lock: ${LOCKCMD:-held by driver})"
-  $LOCKCMD timeout 1500 docker exec \
+  OUT=$KIT/runs; FOREIGN=$OUT/$TAG.foreign; rm -f "$FOREIGN"
+  OTMO=${E2E_OPC_TIMEOUT:-600}        # B0 09-28: fast 9 s, prod 12 s of python wall (+ imports / JIT)
+  echo "[$(date +%T)] $TAG start (lock: ${LOCKCMD:-held by driver}; env: ${OPCHECK_ENV:-none}; timeout ${OTMO}s)"
+  MARK=$(dmesg_mark)
+  kfd_watch "$FOREIGN" "opcheck.py" 2>/dev/null & KWPID=$!
+  trap 'kill $KWPID 2>/dev/null' EXIT
+  pre_exec_guard
+  $LOCKCMD timeout $((OTMO + 60)) docker exec \
     -e ARCH=gfx1250 -e FLYDSL_GPU_ARCH=gfx1250 -e FLYDSL_RUNTIME_CACHE_DIR=${E2E_FLYCACHE:?fresh dir per process} \
-    -e TRITON_CACHE_DIR=/tmp/triton_cache_e2e -e E2E_EXPECT_BLAS_LIB=$BLAS_LIB \
+    -e TRITON_CACHE_DIR=/tmp/triton_cache_e2e -e E2E_EXPECT_BLAS_LIB=$BLAS_LIB -e E2E_RUN_MARKER=$TAG \
     -e E2E_FLY_TREES="${E2E_FLY_TREES_JSON:-}" \
     -e E2E_ATTN_EVENTS=$OUT/$TAG.attn_ev.jsonl ${OPCHECK_ENV:-} $CT bash -c "ulimit -c 0; $BLAS_EXPORT; \
-      export PYTHONPATH=$PP; cd $KIT/attn_backends && exec timeout --foreground -k 20 1400 \
+      export PYTHONPATH=$PP; cd $KIT/attn_backends && exec timeout --foreground -k 20 $OTMO \
       /opt/venv/bin/python3 opcheck.py --arm $ARM --shape $SHAPE --json $OUT/$TAG.json $*" \
     > "$OUT/$TAG.log" 2>&1
   RC=$?
+  kill $KWPID 2>/dev/null
   echo "rc=$RC log=$OUT/$TAG.log json=$OUT/$TAG.json"
   INFO=$(dmesg_info "$MARK"); [ -n "$INFO" ] && { echo "dmesg INFO (not a stop):"; echo "$INFO" | head -5; }
   NEW=$(dmesg_fault "$MARK")
   if [ -n "$NEW" ]; then echo "!! NEW dmesg FAULT lines -- stop all card work:"; echo "$NEW" | head -40; exit 99; fi
   L=$(leftovers); [ -n "$L" ] && echo "!! leftover processes in $CT (kill by PID only): $L"
+  if [ -s "$FOREIGN" ]; then cat "$FOREIGN"; echo "!! $TAG INVALID: a second GPU client held KFD during the run"; exit 91; fi
   exit $RC ;;
 train)
   TAG=${1:?tag}; ATTN=${2:?E2E_ATTN}; STEPS=${3:-30}; PFREQ=${4:-10}
@@ -83,25 +149,26 @@ train)
     "$B0E/configs/l8b_e2e.template.yaml" > "$CFG"
   RUNDIR=/home/lihuzhan/_dbg_l8b/$TAG; mkdir -p "$RUNDIR"
   LOG=$KIT/logs/e2e.$TAG.log; CLK=$KIT/logs/clk.$TAG.csv; EVF=$KIT/logs/attn_ev.$TAG.jsonl
-  POST=$KIT/runs/$TAG.post.txt; WDF=$LOG.watchdog
-  rm -f "$EVF" "$WDF" "$LOG.memguard" "$POST"
+  POST=$KIT/runs/$TAG.post.txt; WDF=$LOG.watchdog; FOREIGN=$LOG.foreign; TREEF=$KIT/logs/tree.$TAG.sha256
+  rm -f "$EVF" "$WDF" "$LOG.memguard" "$POST" "$FOREIGN"
   L=$(leftovers); [ -n "$L" ] && { echo "!! refusing to start: leftovers in $CT: $L"; exit 98; }
-  KFD=$(ls /sys/class/kfd/kfd/proc 2>/dev/null | tr '\n' ' '); [ -n "$KFD" ] && { echo "!! refusing to start: KFD holders: $KFD"; exit 97; }
-  # snapshot of every file that runs (the arm trees can move under us)
-  TREES=$(python3 -c 'import json,os,sys; t=json.loads(os.environ.get("E2E_FLY_TREES_JSON","{}")); print(" ".join(sorted({d for a in t.values() for d in a.values()})))')
-  ( cd / && find $KIT/attn_backends $B0E/arms/asm $TREES -name '*.py' -type f -not -path '*/__pycache__/*' | sort | xargs sha256sum
-    sha256sum /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/gemm/nkfix_b0.py "$CFG" ) > "$KIT/logs/tree.$TAG.sha256"
-  echo "t,busy_pct,sclk_mhz,fclk_mhz,power_uw,temp_mc" > "$CLK"
+  KFD=$(kfd_holders); [ -n "$KFD" ] && { echo "!! refusing to start: KFD holders: $KFD"; exit 97; }
+  # snapshot of every file that runs (the arm trees can move under us); hashed again after the run
+  { run_files_sha; sha256sum "$CFG"; } > "$TREEF"
+  echo "t,busy_pct,sclk_mhz,fclk_mhz,power_uw,temp_mc,kfd" > "$CLK"
   ( H=$(ls -d $CARD/hwmon/hwmon* 2>/dev/null | head -1)
     while :; do
-      printf '%s,%s,%s,%s,%s,%s\n' "$(date +%s)" "$(timeout 5 cat $CARD/gpu_busy_percent 2>/dev/null)" \
+      printf '%s,%s,%s,%s,%s,%s,%s\n' "$(date +%s)" "$(timeout 5 cat $CARD/gpu_busy_percent 2>/dev/null)" \
         "$(grep '\*' $CARD/pp_dpm_sclk 2>/dev/null | grep -oE '[0-9]+Mhz' | tr -d Mhz)" \
         "$(grep '\*' $CARD/pp_dpm_fclk 2>/dev/null | grep -oE '[0-9]+Mhz' | tr -d Mhz)" \
         "$(cat $H/power1_average 2>/dev/null || cat $H/power1_input 2>/dev/null)" \
-        "$(cat $H/temp2_input 2>/dev/null || cat $H/temp1_input 2>/dev/null)"
+        "$(cat $H/temp2_input 2>/dev/null || cat $H/temp1_input 2>/dev/null)" \
+        "$(kfd_holders | tr ' ' ';')"
       sleep 5
     done ) >> "$CLK" 2>/dev/null &
   CLKPID=$!
+  kfd_watch "$FOREIGN" "torchrun.*primus|pt_elastic" 2>/dev/null &
+  KWPID=$!
   # Memory guard: peak reserved above E2E_MEM_STOP (89.5, B0 final recipe) -> ONE SIGTERM to torchrun.
   ( STOP=${E2E_MEM_STOP:-89.5}; sent=0
     while [ $sent = 0 ]; do
@@ -184,7 +251,7 @@ train)
       fi
     done ) &
   WDPID=$!
-  trap 'kill $CLKPID $MEMPID $WDPID 2>/dev/null' EXIT
+  trap 'kill $CLKPID $KWPID $MEMPID $WDPID 2>/dev/null' EXIT
   # nkfix (E2E_NKFIX=1): every bwd GEMM off hipBLASLt's MT32x16x32 fallback; NKFIX_CHECK=1 = non-finite check
   NKFIX_ENV=""; NKSTATS=""
   if [ "${E2E_NKFIX:-0}" != 0 ]; then
@@ -196,6 +263,7 @@ train)
   MARK=$(dmesg_mark); MCE0=$(timeout 20 sudo -n dmesg 2>/dev/null | grep -c "mce: \[Hardware Error\]")
   T0=$(date +%s)
   echo "[$(date +%T)] $TAG E2E_ATTN=$ATTN steps=$STEPS pfreq=$PFREQ nlayers=${E2E_NLAYERS:-32} (lock: ${LOCKCMD:-held by driver})"
+  pre_exec_guard
   $LOCKCMD timeout ${E2E_TIMEOUT:-2700} docker exec \
     -e GPUS_PER_NODE=1 -e NNODES=1 -e NODE_RANK=0 -e PRIMUS_GPU_MODEL=MI455X \
     -e MASTER_PORT=$((20000 + RANDOM % 20000)) -e PRIMUS_EXP_NAME=$TAG -e E2E_RUN_MARKER=$TAG \
@@ -210,12 +278,18 @@ train)
     > "$LOG" 2>&1
   RC=$?
   T1=$(date +%s)
-  kill $CLKPID $MEMPID $WDPID 2>/dev/null
+  kill $CLKPID $KWPID $MEMPID $WDPID 2>/dev/null
   [ -s "$WDF" ] && { echo "!! watchdog fired:"; cat "$WDF"; }
   [ -s "$LOG.memguard" ] && { echo "!! memguard fired:"; cat "$LOG.memguard"; }
+  [ -s "$FOREIGN" ] && { cat "$FOREIGN"; echo "!! $TAG INVALID: a second GPU client held KFD during the run"; }
+  # the files that ran, hashed again: a change during the run means the code that ran is unknown
+  TCHG=$(diff <(grep -vF " $CFG" "$TREEF") <(run_files_sha) | grep '^[<>]' | awk '{print $NF}' | sort -u | tr '\n' ' ')
+  [ -n "$TCHG" ] && echo "!! TREE CHANGED DURING RUN $TAG (run INVALID): $TCHG"
   # torchtitan writes traces to the shared $PRIMUS/outputs/profile_traces/iteration_N: keep this run's copy
   for d in $(find "$PRIMUS/outputs/profile_traces" -mindepth 1 -maxdepth 1 -type d -newer "$CFG" 2>/dev/null); do
     mkdir -p "$KIT/traces/$TAG" && cp -r "$d" "$KIT/traces/$TAG/"; done
+  # rank-0 debug.log lives outside the repo: keep its evidence lines with the run
+  grep -aE "\[e2e_attn\]|\[nkfix\]|\[flydsl_bwd|BLAS-REPOINT" "$DBG" 2>/dev/null | head -2000 > "$KIT/runs/$TAG.dbg.txt"
   CLEAN=$(sed 's/\x1b\[[0-9;]*m//g' "$LOG")
   NSTEP=$(echo "$CLEAN" | grep -cE "step: *[0-9]+ +loss")
   NONFIN=$(echo "$CLEAN" | grep -E "step: *[0-9]+ +loss" | grep -ciE "loss: *-?(nan|inf)\b|grad_norm: *-?(nan|inf)\b")
@@ -228,18 +302,26 @@ train)
   INFO=$(dmesg_info "$MARK"); FAULT=$(dmesg_fault "$MARK")
   MCE1=$(timeout 20 sudo -n dmesg 2>/dev/null | grep -c "mce: \[Hardware Error\]")
   L=$(leftovers)
+  INV=""
+  [ -s "$FOREIGN" ] && INV="$INV foreign-KFD"; [ -n "$TCHG" ] && INV="$INV tree-changed"
+  [ "${NONFIN:-0}" -gt 0 ] || [ "${NKNF:-0}" -gt 0 ] && INV="$INV non-finite"
+  [ "${REPT:-0}" -gt 0 ] && INV="$INV BLAS-repoint"; [ -s "$WDF" ] && INV="$INV watchdog"; [ -n "$FAULT" ] && INV="$INV dmesg-FAULT"
   { echo "tag: $TAG"; echo "spec: $ATTN"; echo "steps: $STEPS"; echo "pfreq: $PFREQ"; echo "nlayers: ${E2E_NLAYERS:-32}"
     echo "rc: $RC"; echo "wall_s: $((T1-T0))"; echo "steps_logged: $NSTEP"; echo "nonfinite_lines: $NONFIN"
     echo "nkfix_nonfinite_lines: $NKNF"; echo "nkfix_events: $(grep -m1 '^nonfinite_events' "$NKSTATS" 2>/dev/null | cut -d: -f2-)"
     echo "blas_repoints: $REPT"; echo "event_steps: $NEV"; echo "watchdog: $(cat "$WDF" 2>/dev/null | head -1)"
     echo "memguard: $(cat "$LOG.memguard" 2>/dev/null | head -1)"; echo "dmesg_fault_lines: $(echo -n "$FAULT" | grep -c .)"
     echo "dmesg_info_lines: $(echo -n "$INFO" | grep -c .)"; echo "cpu_mce_new: $((MCE1-MCE0))"
+    echo "foreign_kfd: $(grep -m1 'FOREIGN KFD' "$FOREIGN" 2>/dev/null)"; echo "tree_changed_during_run: ${TCHG:-no}"
+    echo "valid: $([ -n "$INV" ] && echo "INVALID ($INV )" || echo yes)"
     echo "leftovers: $(echo -n "$L" | tr '\n' ' ')"; echo "flycache: ${E2E_FLYCACHE}"
     echo "bwd_stream_mode: $(grep -m1 -oE '\[flydsl_bwd [^]]+\] DQ_SIDE_STREAM=[01] DQ_SIDE_RECORD=[01]' "$DBG" 2>/dev/null)"
-    echo "log: $LOG"; echo "events: $EVF"; echo "clk: $CLK"; echo "env: $KIT/logs/env.$TAG.txt"; } > "$POST"
+    echo "log: $LOG"; echo "events: $EVF"; echo "clk: $CLK"; echo "env: $KIT/logs/env.$TAG.txt"; echo "tree: $TREEF"
+    echo "dbg: $KIT/runs/$TAG.dbg.txt ($(wc -l < "$KIT/runs/$TAG.dbg.txt") lines of $DBG)"; } > "$POST"
   [ -n "$INFO" ] && { echo "dmesg INFO (RAS correctable / MCE; not a stop):"; echo "$INFO" | head -5; }
   if [ -n "$FAULT" ]; then echo "!! NEW dmesg FAULT lines on a live card -- stop all card work:"; echo "$FAULT" | head -40; exit 99; fi
   [ -n "$L" ] && echo "!! leftover processes in $CT (kill by PID only): $L"
+  [ -s "$FOREIGN" ] && exit 91
   exit $RC ;;
 *) echo "unknown mode $MODE"; exit 2 ;;
 esac

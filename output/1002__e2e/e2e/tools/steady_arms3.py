@@ -13,7 +13,11 @@ output/0928__a0_repro/tools/e2e_arms3.py (N arms), same rules, so numbers compar
   * cycle ratio: for every schedule cycle fully inside the window, mean(arm b)/mean(arm a); median over cycles
   * adjacent pairs: every two consecutive in-window steps with different arms -> ratio and
     difference (ms); median per arm pair (both orders pooled; the per-order medians are printed too)
-Also: non-finite loss / grad_norm steps (any -> the run is void), per-arm peak reserved memory.
+  * arm order is FIXED (--order, default asm,flyr29,fly; arms not listed follow in first-appearance
+    order; --ref first): a pair is always reported as later/earlier, so p1 and p2 both give fly/flyr29
+    (= fly - flyr29) even though their schedules list flyr29 and fly in opposite order
+Also: non-finite loss / grad_norm steps (any -> the run is void), peak reserved memory of the PROCESS
+(reserved memory is process-level and only grows: it is not a property of the arm whose step hit it).
 """
 import argparse
 import json
@@ -21,6 +25,7 @@ import re
 import statistics as st
 
 TOK = 4 * 8192
+ORDER = "asm,flyr29,fly"
 
 
 def parse(path):
@@ -55,6 +60,19 @@ def arm(spec, s):
     return w[i] if i < len(w) else c[(i - len(w)) % len(c)]
 
 
+def arm_order(spec, order=ORDER, ref="asm"):
+    """Arms of the schedule's cycle in a fixed order: those named in `order` first (in that order), then any
+    other arm in first-appearance order, `ref` moved to the front. Pairs are keyed (later, earlier)."""
+    _, c = sched(spec)
+    seen = list(dict.fromkeys(c))
+    want = [x.strip() for x in (order or "").split(",") if x.strip()]
+    arms = [x for x in want if x in seen] + [x for x in seen if x not in want]
+    if ref in arms:
+        arms.remove(ref)
+        arms.insert(0, ref)
+    return arms
+
+
 def finite(x):
     try:
         v = float(x)
@@ -78,6 +96,7 @@ def main():
     ap.add_argument("pfreq", type=int)
     ap.add_argument("--warmup", type=int, default=7)
     ap.add_argument("--ref", default="asm")
+    ap.add_argument("--order", default=ORDER, help="fixed arm order (pair direction later/earlier)")
     ap.add_argument("--json")
     a = ap.parse_args()
     rows = parse(a.log)
@@ -100,24 +119,24 @@ def main():
     if bad:
         print("!! NON-FINITE STEPS: this run is void (card-safety section 8: corrupted runs look fastest)")
     w, c = sched(a.spec)
-    arms = list(dict.fromkeys(c))
-    if a.ref in arms:
-        arms.remove(a.ref)
-        arms.insert(0, a.ref)
+    arms = arm_order(a.spec, a.order, a.ref)
+    out["arm_order"] = arms
+    memrows = [r for r in rows if r["mem_pct"] is not None]
+    pk = max(memrows, key=lambda r: r["mem_pct"]) if memrows else None
+    out["peak_mem_process"] = ({"gib": pk["mem_gib"], "pct": pk["mem_pct"], "step": pk["step"],
+                                "arm_of_step": arm(a.spec, pk["step"])} if pk else None)
+    if pk:
+        print(f"peak reserved memory (process-level, only grows): {pk['mem_gib']} GiB ({pk['mem_pct']}%) "
+              f"first at step {pk['step']}")
     for x in arms:
         t = [ms[s] for s in range(1, last + 1) if ok(s) and arm(a.spec, s) == x]
         if not t:
             continue
-        mem = [r for r in rows if arm(a.spec, r["step"]) == x and r["mem_pct"] is not None]
-        pk = max(mem, key=lambda r: r["mem_pct"]) if mem else None
         out["arms"][x] = {"n": len(t), "ms_median": st.median(t), "ms_iqr": q(t),
-                          "ms_range": [min(t), max(t)], "tps_median": TOK / st.median(t) * 1000,
-                          "peak_mem_gib": pk["mem_gib"] if pk else None,
-                          "peak_mem_pct": pk["mem_pct"] if pk else None}
+                          "ms_range": [min(t), max(t)], "tps_median": TOK / st.median(t) * 1000}
         r_ = out["arms"][x]
         print(f"arm {x:8s} n={len(t):3d} step ms median {r_['ms_median']:8.1f}  IQR {r_['ms_iqr'][0]:.1f}-"
-              f"{r_['ms_iqr'][1]:.1f}  range {min(t):.1f}-{max(t):.1f}  tps {r_['tps_median']:8.0f}  "
-              f"peak mem {r_['peak_mem_gib']} GiB ({r_['peak_mem_pct']}%)")
+              f"{r_['ms_iqr'][1]:.1f}  range {min(t):.1f}-{max(t):.1f}  tps {r_['tps_median']:8.0f}")
     # cycles fully inside the window
     cyc = {}
     s0 = len(w) + 1

@@ -2,7 +2,7 @@
 """Per-step attention GPU time from the adapter's CUDA-event JSONL (no torch, no GPU).
 
   attn_events.py <attn_ev.jsonl> <E2E_ATTN spec> <profile_freq|0> --log <main log> [--warmup 7]
-                 [--ref asm] [--layers 32] [--json out.json]
+                 [--ref asm] [--order asm,flyr29,fly] [--layers 32] [--json out.json]
 
 Input lines come from attn_backends/e2e_attn/attn_timer.py (one per training step):
   fwd_ms / bwd_ms = sum over layers of the GPU time between an event pair recorded around each
@@ -12,6 +12,8 @@ Same steady window as steady_arms3.py (warmup and F-1, F, F+1 around profiled st
 Prints, per arm: n, median fwd / bwd / FA ms per step, IQR, the FA share of the step (step ms from
 the log's tps), per-layer medians; per arm pair: median of adjacent-step differences (b - a) of
 fwd / bwd / FA ms, i.e. the attention part of the step-time difference that steady_arms3.py measures.
+Pairs use steady_arms3's FIXED arm order (--order; default asm,flyr29,fly), so a pair key means the same
+difference in every process (fly/flyr29 = fly - flyr29 in p1 and in p2).
 Checks: every window step has n_fwd == n_bwd == --layers and its arms match the schedule.
 """
 import argparse
@@ -21,7 +23,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from steady_arms3 import TOK, arm, parse, sched  # noqa: E402
+from steady_arms3 import ORDER, TOK, arm, arm_order, parse  # noqa: E402
 
 
 def med(xs):
@@ -36,6 +38,7 @@ def main():
     ap.add_argument("--log", required=True)
     ap.add_argument("--warmup", type=int, default=7)
     ap.add_argument("--ref", default="asm")
+    ap.add_argument("--order", default=ORDER, help="fixed arm order (pair direction later/earlier)")
     ap.add_argument("--layers", type=int, default=32)
     ap.add_argument("--json")
     a = ap.parse_args()
@@ -60,17 +63,13 @@ def main():
         if r["n_fwd"] != a.layers or r["n_bwd"] != a.layers:
             problems.append(f"step {s}: n_fwd {r['n_fwd']} n_bwd {r['n_bwd']} != {a.layers}")
     ok = lambda s: s not in excl and s in ev and ev[s]["n_fwd"] == a.layers and ev[s]["n_bwd"] == a.layers  # noqa
-    w, c = sched(a.spec)
-    arms = list(dict.fromkeys(c))
-    if a.ref in arms:
-        arms.remove(a.ref)
-        arms.insert(0, a.ref)
+    arms = arm_order(a.spec, a.order, a.ref)
     missing = [s for s in range(a.warmup + 1, last + 1) if s not in excl and s not in ev]
     print(f"events {a.events}: {len(ev)} steps (last {last}); window {sum(ok(s) for s in range(1, last + 1))} "
           f"steps; window steps without events: {missing if missing else 'none'}")
     for p in problems[:10]:
         print("!!", p)
-    out = {"events": a.events, "spec": a.spec, "pfreq": a.pfreq, "problems": problems,
+    out = {"events": a.events, "spec": a.spec, "pfreq": a.pfreq, "arm_order": arms, "problems": problems,
            "missing_window_steps": missing, "arms": {}, "pairs": {}}
     for x in arms:
         ss = [s for s in range(1, last + 1) if ok(s) and arm(a.spec, s) == x]

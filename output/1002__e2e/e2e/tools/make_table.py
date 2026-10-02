@@ -5,7 +5,11 @@
                 [--op-label "real dumps after GEMM burst, A0 10-02"] [--layers 32]
 
 Inputs per tag (written by analyze.sh): <tag>.steady.json (steady_arms3.py), <tag>.events.json
-(attn_events.py), <tag>.trace.json (trace_breakdown2.py, optional), <tag>.clk.json, <tag>.post.txt.
+(attn_events.py), <tag>.trace.json (trace_breakdown2.py, optional), <tag>.clk.json, <tag>.post.txt,
+<tag>.treecmp.txt (analyze.sh: the files that ran vs the first tag's).
+Pair keys come from the tools' FIXED arm order (asm, flyr29, fly), so "fly/flyr29" is fly - flyr29 in
+every process and the cross-process table (section 4 rule 3 of the plan) compares like with like.
+Peak reserved memory is a PROCESS number (it only grows), shown in the health table, not per arm.
 --op: op-level per-CALL ms of the arms at the training operating point (from the real-dump +
 GEMM-burst A/B of today's op job); used for the "expected vs measured" table:
 expected per-step delta = layers x (per-call delta). bwd arms: asm_bwd, s6, r29; fwd: asm_fwd, r16.
@@ -38,6 +42,19 @@ def post(p):
     return d
 
 
+def txt(p):
+    try:
+        return open(p).read().strip()
+    except Exception:
+        return None
+
+
+def pair_ratio(pr):
+    if not pr:
+        return "—"
+    return f"{f(pr.get('adjacent_median'), 4)}（n={pr.get('adjacent_n')}）/ {f(pr.get('cycles_median'), 4)}（n={pr.get('cycles_n')}）"
+
+
 def f(x, n=1, sign=False):
     if x is None:
         return "—"
@@ -57,19 +74,20 @@ def main():
     for t in a.tags:
         R[t] = {k: jload(os.path.join(a.runs, f"{t}.{k}.json")) for k in ("steady", "events", "trace", "clk")}
         R[t]["post"] = post(os.path.join(a.runs, f"{t}.post.txt"))
+        R[t]["treecmp"] = txt(os.path.join(a.runs, f"{t}.treecmp.txt"))
     print("## 1. 每个进程、每个 arm 的稳态数字\n")
-    print("| 进程 | arm | n | 单步 ms 中位数（IQR） | tps | 对 asm 单步比：相邻配对 / 周期 | attn fwd ms/步 | attn bwd ms/步 | FA ms/步 | FA 占单步 | 峰值显存 |")
+    print("| 进程 | arm | n | 单步 ms 中位数（IQR） | tps | 对 asm 单步比：相邻配对 / 周期 | 对 flyr29 单步比：相邻配对 / 周期 | attn fwd ms/步 | attn bwd ms/步 | FA ms/步 | FA 占单步 |")
     print("|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|")
     for t, r in R.items():
         s, e = r["steady"] or {}, r["events"] or {}
         for arm, x in (s.get("arms") or {}).items():
             ev = (e.get("arms") or {}).get(arm, {})
-            pr = (s.get("pairs") or {}).get(f"{arm}/asm", {})
-            ratio = "1" if arm == "asm" else f"{f(pr.get('adjacent_median'), 4)}（n={pr.get('adjacent_n')}）/ {f(pr.get('cycles_median'), 4)}（n={pr.get('cycles_n')}）"
+            ratio = "1" if arm == "asm" else pair_ratio((s.get("pairs") or {}).get(f"{arm}/asm"))
+            r29 = ("1" if arm == "flyr29" else
+                   pair_ratio((s.get("pairs") or {}).get(f"{arm}/flyr29")) if f"{arm}/flyr29" in (s.get("pairs") or {}) else "—")
             print(f"| {t} | {arm} | {x['n']} | {f(x['ms_median'])}（{f(x['ms_iqr'][0])}–{f(x['ms_iqr'][1])}） | "
-                  f"{x['tps_median']:,.0f} | {ratio} | {f(ev.get('fwd_ms'), 2)} | {f(ev.get('bwd_ms'), 2)} | "
-                  f"{f(ev.get('fa_ms'), 2)} | {f(100 * ev['fa_share_of_step'], 2) + '%' if ev.get('fa_share_of_step') else '—'} | "
-                  f"{x.get('peak_mem_gib')} GiB（{x.get('peak_mem_pct')}%） |")
+                  f"{x['tps_median']:,.0f} | {ratio} | {r29} | {f(ev.get('fwd_ms'), 2)} | {f(ev.get('bwd_ms'), 2)} | "
+                  f"{f(ev.get('fa_ms'), 2)} | {f(100 * ev['fa_share_of_step'], 2) + '%' if ev.get('fa_share_of_step') else '—'} |")
     print(f"\nB0 对照：fly/asm 单步比 {B0['fly/asm']}；B0 fly fwd 48.0–49.3 / bwd 285.4–290.0，asm fwd 38.8–39.3 / bwd 233.1–236.7 ms/步（trace）。\n")
     print("## 2. 两两对比（相邻两步、arm 不同、都在稳态窗口内；差值 = 前者 − 后者）\n")
     print("| 进程 | 对比 | 相邻 n | 单步比（相邻 / 周期） | Δ单步 ms | ΔFA ms（events） | 其中 Δfwd | 其中 Δbwd | Δ单步 − ΔFA |")
@@ -82,6 +100,21 @@ def main():
             print(f"| {t} | {b_} vs {a_} | {pr.get('adjacent_n')} | {f(pr.get('adjacent_median'), 4)} / {f(pr.get('cycles_median'), 4)} | "
                   f"{f(pr.get('adjacent_diff_ms_median'), 1, True)} | {f(d.get('fa'), 2, True)} | {f(d.get('fwd'), 2, True)} | "
                   f"{f(d.get('bwd'), 2, True)} | {f(d.get('unexplained_ms'), 1, True)} |")
+    print("\n## 2b. 两个进程的一致性（计划 §4 判定 3：同一对比的单步比，两进程相差 ≤0.3%；B0 为 0.05%）\n")
+    keys = []
+    for r in R.values():
+        for k in ((r["steady"] or {}).get("pairs") or {}):
+            if k not in keys:
+                keys.append(k)
+    print("| 对比 | " + " | ".join(f"{t} 相邻中位数（n）" for t in R) + " | 最大相对差 | 判定 |")
+    print("|---|" + "--:|" * len(R) + "--:|---|")
+    for k in keys:
+        vals = [((r["steady"] or {}).get("pairs") or {}).get(k, {}) for r in R.values()]
+        xs = [v.get("adjacent_median") for v in vals if v.get("adjacent_median") is not None]
+        rel = (max(xs) - min(xs)) / st.mean(xs) if len(xs) >= 2 else None
+        verdict = "—" if rel is None else ("正常" if rel <= 0.003 else "!! 超过 0.3%")
+        print(f"| {k.replace('/', ' / ')} | " + " | ".join(f"{f(v.get('adjacent_median'), 4)}（{v.get('adjacent_n', '—')}）" for v in vals)
+              + f" | {f(None if rel is None else 100 * rel, 2) + '%' if rel is not None else '—'} | {verdict} |")
     if op:
         L = a.layers
         print(f"\n## 3. 预期（op 级 × {L} 层）对实测（e2e，events）\n")
@@ -118,14 +151,20 @@ def main():
                   f"{f(x['attn_call_span_ms'].get('attn_bwd_span'))} | {f(b.get('gemm'))} | {f(b.get('gemm_aux'))} | "
                   f"{f(b.get('elementwise'))} | {f(x['idle_ms'])} |")
     print("\n## 5. 运行健康\n")
-    print("| 进程 | rc | 步数 | 非有限步 | nkfix 事件 | BLAS 改写 | watchdog | memguard | dmesg 故障 / INFO | 新 CPU MCE | sclk 负载中位数 MHz | 功耗中位数 W | 墙钟 s | loss 首 / 末 |")
-    print("|---|--:|--:|--:|---|--:|---|---|--:|--:|--:|--:|--:|---|")
+    print("| 进程 | 有效 | rc | 步数 | 非有限步 | nkfix 事件 | BLAS 改写 | watchdog | memguard | 外来 KFD | 代码树 | dmesg 故障 / INFO | 新 CPU MCE | sclk 负载中位数 MHz | 功耗中位数 W | 峰值显存（进程级） | 墙钟 s | loss 首 / 末 |")
+    print("|---|---|--:|--:|--:|---|--:|---|---|---|---|--:|--:|--:|--:|--:|--:|---|")
     for t, r in R.items():
         p, c, s = r["post"], (r["clk"] or {}).get("load", {}), r["steady"] or {}
-        print(f"| {t} | {p.get('rc')} | {p.get('steps_logged')} | {p.get('nonfinite_lines')} | {p.get('nkfix_events') or '—'} | "
-              f"{p.get('blas_repoints')} | {p.get('watchdog') or '—'} | {p.get('memguard') or '—'} | "
+        pm = s.get("peak_mem_process") or {}
+        tree = r["treecmp"] or "—"
+        if p.get("tree_changed_during_run") not in (None, "", "no"):
+            tree = f"!! 运行中改变：{p['tree_changed_during_run']}；{tree}"
+        print(f"| {t} | {p.get('valid') or '—'} | {p.get('rc')} | {p.get('steps_logged')} | {p.get('nonfinite_lines')} | {p.get('nkfix_events') or '—'} | "
+              f"{p.get('blas_repoints')} | {p.get('watchdog') or '—'} | {p.get('memguard') or '—'} | {p.get('foreign_kfd') or '—'} | {tree} | "
               f"{p.get('dmesg_fault_lines')} / {p.get('dmesg_info_lines')} | {p.get('cpu_mce_new')} | "
-              f"{c.get('sclk_median')} | {c.get('power_w_median')} | {p.get('wall_s')} | {s.get('loss_first')} / {s.get('loss_last')} |")
+              f"{c.get('sclk_median')} | {c.get('power_w_median')} | "
+              f"{str(pm.get('gib')) + ' GiB（' + str(pm.get('pct')) + '%）' if pm else '—'} | {p.get('wall_s')} | "
+              f"{s.get('loss_first')} / {s.get('loss_last')} |")
 
 
 if __name__ == "__main__":
