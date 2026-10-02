@@ -1,0 +1,111 @@
+# 2026-10-02T10:35:21Z swap_deep_prompts.sh (md5 f125667b), fwd diff md5 4b787f48, tested on a scratch clone of OE. FORCE=1 because a real loop (bwd job, PID 319624, started 10:21:42 UTC by someone else) is running; the clone is not its tree.
+ee16d5b acceptance: per-shape gain weights (evolve.gain_weights)
+clone: bwd diff applied (= today's OE tree)
+$ swap status
+[swap_deep_prompts] OE /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__oe/fwdjob/scratch/oe: deep prompts = bwd
+  act       CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+  plan      CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+  profiling CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+rc=0
+$ swap fwd
+[swap_deep_prompts] OE /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__oe/fwdjob/scratch/oe: deep prompts = bwd
+  act       CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+  plan      CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+  profiling CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+[swap_deep_prompts] backup of the current files: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__oe/fwdjob/scratch/bk/oe_deep_prompts.20261002T103521Z.was-bwd.tar
+[swap_deep_prompts] done: bwd -> fwd
+  act       CAMPAIGN CORRECTIONS (fwd job, A0, written 2026-10-02) 
+  plan      CAMPAIGN CORRECTIONS (fwd job, A0, written 2026-10-02) 
+  profiling CAMPAIGN CORRECTIONS (fwd job, A0, written 2026-10-02) 
+ 7 files changed, 286 insertions(+), 178 deletions(-)
+rc=0
+compare with fwd variant: IDENTICAL
+$ swap fwd
+[swap_deep_prompts] OE /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__oe/fwdjob/scratch/oe: deep prompts = fwd
+  act       CAMPAIGN CORRECTIONS (fwd job, A0, written 2026-10-02) 
+  plan      CAMPAIGN CORRECTIONS (fwd job, A0, written 2026-10-02) 
+  profiling CAMPAIGN CORRECTIONS (fwd job, A0, written 2026-10-02) 
+[swap_deep_prompts] already fwd; nothing to do
+rc=0
+$ swap bwd
+[swap_deep_prompts] OE /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__oe/fwdjob/scratch/oe: deep prompts = fwd
+  act       CAMPAIGN CORRECTIONS (fwd job, A0, written 2026-10-02) 
+  plan      CAMPAIGN CORRECTIONS (fwd job, A0, written 2026-10-02) 
+  profiling CAMPAIGN CORRECTIONS (fwd job, A0, written 2026-10-02) 
+[swap_deep_prompts] backup of the current files: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__oe/fwdjob/scratch/bk/oe_deep_prompts.20261002T103522Z.was-fwd.tar
+[swap_deep_prompts] done: fwd -> bwd
+  act       CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+  plan      CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+  profiling CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+ 7 files changed, 200 insertions(+), 175 deletions(-)
+rc=0
+compare with bwd variant: IDENTICAL
+$ swap head
+[swap_deep_prompts] OE /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__oe/fwdjob/scratch/oe: deep prompts = bwd
+  act       CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+  plan      CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+  profiling CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+[swap_deep_prompts] backup of the current files: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__oe/fwdjob/scratch/bk/oe_deep_prompts.20261002T103522Z.was-bwd.tar
+[swap_deep_prompts] done: bwd -> head
+  act       CAMPAIGN CORRECTIONS 
+  plan      CAMPAIGN CORRECTIONS 
+  profiling CAMPAIGN CORRECTIONS 
+rc=0
+compare with head variant: IDENTICAL
+$ swap fwd
+[swap_deep_prompts] OE /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__oe/fwdjob/scratch/oe: deep prompts = head
+  act       CAMPAIGN CORRECTIONS 
+  plan      CAMPAIGN CORRECTIONS 
+  profiling CAMPAIGN CORRECTIONS 
+[swap_deep_prompts] backup of the current files: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__oe/fwdjob/scratch/bk/oe_deep_prompts.20261002T103522Z.was-head.tar
+[swap_deep_prompts] done: head -> fwd
+  act       CAMPAIGN CORRECTIONS (fwd job, A0, written 2026-10-02) 
+  plan      CAMPAIGN CORRECTIONS (fwd job, A0, written 2026-10-02) 
+  profiling CAMPAIGN CORRECTIONS (fwd job, A0, written 2026-10-02) 
+ 7 files changed, 286 insertions(+), 178 deletions(-)
+rc=0
+compare with fwd variant: IDENTICAL
+$ swap bwd
+[swap_deep_prompts] OE /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__oe/fwdjob/scratch/oe: deep prompts = fwd
+  act       CAMPAIGN CORRECTIONS (fwd job, A0, written 2026-10-02) 
+  plan      CAMPAIGN CORRECTIONS (fwd job, A0, written 2026-10-02) 
+  profiling CAMPAIGN CORRECTIONS (fwd job, A0, written 2026-10-02) 
+[swap_deep_prompts] backup of the current files: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__oe/fwdjob/scratch/bk/oe_deep_prompts.20261002T103522Z.was-fwd.tar
+[swap_deep_prompts] done: fwd -> bwd
+  act       CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+  plan      CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+  profiling CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+ 7 files changed, 200 insertions(+), 175 deletions(-)
+rc=0
+compare with bwd variant: IDENTICAL
+# unknown-state refusal
+$ swap fwd
+[swap_deep_prompts] OE /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__oe/fwdjob/scratch/oe: deep prompts = unknown
+  act       CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+  plan      CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+  profiling CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+[swap_deep_prompts] REFUSED: the seven prompt files are 'unknown' -- inspect 'git -C /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__oe/fwdjob/scratch/oe diff -- op_evolve/modules/deep_loop' by hand
+rc=3
+# staged refusal
+$ swap head
+[swap_deep_prompts] OE /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__oe/fwdjob/scratch/oe: deep prompts = staged
+  act       CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+  plan      CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+  profiling CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+[swap_deep_prompts] REFUSED: the seven prompt files are 'staged' -- inspect 'git -C /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__oe/fwdjob/scratch/oe diff -- op_evolve/modules/deep_loop' by hand
+rc=3
+$ swap status
+[swap_deep_prompts] OE /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__oe/fwdjob/scratch/oe: deep prompts = bwd
+  act       CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+  plan      CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+  profiling CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+rc=0
+# running-loop refusal (no FORCE)
+$ swap fwd (no FORCE)
+[swap_deep_prompts] OE /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__oe/fwdjob/scratch/oe: deep prompts = bwd
+  act       CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+  plan      CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+  profiling CAMPAIGN CORRECTIONS (bwd job, A0, rewritten 2026-09-30) 
+[swap_deep_prompts] REFUSED: an op-evolve loop is running:  319624 /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/.venv/bin/python3 /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/.venv/bin/op-evolve resume --job gfx1250-flydsl-attn-bwd-20260917-115934; -- stop it (op-evolve stop --job <job>) or wait for it to end
+rc=4
+backups written: 4

@@ -1,0 +1,89 @@
+--- job_context/op/refcache_util.py.bak.pre-a0-1002
++++ job_context/op/refcache_util.py
+@@ -8,8 +8,14 @@
+ of them occasionally kills its process; caching removes that exposure from every round's gate.
+ 
+ Provenance (shape, dims, seed, sha256 of eager/impl.py and ut/common.py) is checked on
+-load; a mismatch RECOMPUTES from op/eager and says so -- a stale reference must never be
+-used silently. Lives outside the two hashed files so editing it invalidates nothing.
++load -- a stale reference must never be used silently. Lives outside the two hashed files so
++editing it invalidates nothing.
++
++A0 operator 2026-10-02 (hints h49/h50; the same rule the bwd job got on 2026-09-30): the fp32
++reference is NEVER computed on the card. proxy and prod come from refcache/ (causal; validation
++only asks for causal there) and a miss is a hard error. Everything else -- fast on a miss, any
++non-causal call, the seven unscored edge shapes -- is computed on the CPU from the device inputs
++and moved back. `build` computes on the CPU too.
+ """
+ from __future__ import annotations
+ 
+@@ -42,24 +48,45 @@
+     return load_impl(HERE / "eager")
+ 
+ 
++# eager/impl.py gained a device guard on 2026-10-02 (CUDA inputs -> CPU; arithmetic unchanged), which moved its
++# sha. The caches in refcache/ were built on A0 at setup (2026-09-25) from the pre-guard file. That one transition
++# is accepted -- recorded 6bc438c3... AND the file on disk now 5584c5be... -- and nothing else: any other edit of
++# eager/impl.py, or any change of ut/common.py, dims, seed or shape, still invalidates the cache.
++_EAGER_SHA_ACCEPTED = {"6bc438c3784c3f67": "5584c5bebd6516a5"}   # recorded (pre-guard) -> current (guarded)
++
++
++def _usable(want, got):
++    """[] when the cache matches the files on disk, else the names of the fields that differ."""
++    bad = [k_ for k_ in want if (tuple(got.get(k_, ())) if k_ == "dims" else got.get(k_)) != want[k_]]
++    if bad == ["eager_sha"] and _EAGER_SHA_ACCEPTED.get(got.get("eager_sha")) == want["eager_sha"]:
++        return []
++    return bad
++
++
++def _refuse_on_card(shape, why):
++    if shape in ("proxy", "prod"):
++        raise RuntimeError(
++            f"refcache {shape}: {why}; computing its fp32 reference is refused (never on the card, h50; "
++            f"the scored shapes must come from the cache). Restore op/refcache/{shape}.pt")
++
++
+ def reference(shape, q, k, v, causal=True):
+-    """(o, lse, source). source is 'refcache' or 'eager (<why>)'."""
++    """(o, lse, source). source is 'refcache' or 'cpu (<why>)'. Never runs the reference on the card."""
+     import torch
+     path = REFCACHE / f"{shape}.pt"
+     why = "non-causal" if not causal else "no cache"
+     if causal and path.exists():
+         try:
+             blob = torch.load(path, map_location="cpu")
+-            want, got = provenance(shape), blob.get("provenance", {})
+-            bad = [k_ for k_ in want if (tuple(got.get(k_, ())) if k_ == "dims"
+-                                         else got.get(k_)) != want[k_]]
++            bad = _usable(provenance(shape), blob.get("provenance", {}))
+             if not bad:
+                 return blob["o"].to(q.device), blob["lse"].to(q.device), "refcache"
+             why = "provenance differs: " + ",".join(bad)
+         except Exception as exc:  # a broken cache must never be worse than no cache
+             why = f"unloadable: {exc}"
+-    o, lse = _eager()(q, k, v, causal=causal)
+-    return o, lse, f"eager ({why})"
++    _refuse_on_card(shape, why)
++    o, lse = _eager()(q.cpu(), k.cpu(), v.cpu(), causal=causal)   # A0 2026-10-02 (h50): on the CPU
++    return o.to(q.device), lse.to(q.device), f"cpu ({why})"
+ 
+ 
+ def build(shapes):
+@@ -68,14 +95,13 @@
+     REFCACHE.mkdir(exist_ok=True)
+     fn = _eager()
+     for shape in shapes:
+-        q, k, v = make_inputs(shape, seed=0)
+-        o, lse = fn(q, k, v, causal=True)
+-        torch.cuda.synchronize()
++        q, k, v = make_inputs(shape, seed=0)      # drawn on the card: cpu and cuda generators differ
++        o, lse = fn(q.cpu(), k.cpu(), v.cpu(), causal=True)   # A0 2026-10-02 (h50): reference on the CPU
+         for tag, t in (("o", o), ("lse", lse)):
+             if not bool(torch.isfinite(t).all()):
+                 raise SystemExit(f"{shape}: {tag} not all finite -- refusing to cache")
+         prov = dict(provenance(shape), torch=str(torch.__version__),
+-                    device=torch.cuda.get_device_properties(0).gcnArchName)
++                    device=torch.cuda.get_device_properties(0).gcnArchName, reference_on="cpu")
+         torch.save({"provenance": prov, "o": o.cpu(), "lse": lse.cpu()},
+                    REFCACHE / f"{shape}.pt")
+         print(f"  {shape:6s} cached o{tuple(o.shape)} lse{tuple(lse.shape)}  {prov}", flush=True)

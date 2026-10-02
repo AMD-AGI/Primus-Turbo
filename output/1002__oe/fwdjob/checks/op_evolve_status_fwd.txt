@@ -1,0 +1,44 @@
+gfx1250-flydsl-attn-fwd-b0-20260927  spec v000  best_round 16
+  setup/job_setup  done (v000)
+  setup/op_setup   done (v000)
+  round   0      score   None  delivered  accepted=True  [-]
+  round   1 fast score 0.72501  delivered  accepted=False [or]
+  round   2 fast score 0.70866  delivered  accepted=True  [or]
+  round   3 fast score 0.67596  delivered  accepted=False [or]
+  round   4 fast score 0.76033  delivered  accepted=True  [or]
+  round   5 deep score   None  failed     accepted=False [p]
+  round   6 fast score 0.81482  delivered  accepted=True  [or]
+  round   7 fast score 0.8151  delivered  accepted=False [or]
+  round   8 fast score 0.90029  delivered  accepted=False [or]
+  round   9 fast score 0.91559  delivered  accepted=False [or]
+  round  10 deep score 0.96728  delivered  accepted=False [ppar]
+  round  11 fast score 0.99358  delivered  accepted=True  [or]
+  round  12 fast score 0.98867  delivered  accepted=False [or]
+  round  13 fast score 1.01198  delivered  accepted=True  [or]
+  round  14 fast score 1.01124  delivered  accepted=False [or]
+  round  15 deep score 1.03191  delivered  accepted=False [ppar]
+  round  16 fast score 0.97287  delivered  accepted=False [or]
+  round  17 fast score 0.98636  delivered  accepted=False [or]
+  round  18 fast score 0.99572  delivered  accepted=False [or]
+  round  19 fast score 0.98732  delivered  accepted=False [or]
+  round  20 deep score   None  None       accepted=None  [pp]  running act/01_implement since 11:50:52
+  per shape (TFLOP/s): fast, proxy, prod  -- full table in progress.md
+    round   1       44.2      813.4     1015.4
+    round   2       44.5      778.5     1018.0
+    round   3       36.3      778.2     1013.6
+    round   4       47.3      862.8     1082.1
+    round   6       97.4     1583.6     1524.1
+    round   7       97.7     1592.5     1513.7
+    round   8      139.3     1576.5     1509.8
+    round   9      139.3     1587.2     1500.6
+    round  10      143.8     1618.2     1491.8
+    round  11      155.5     1598.0     1500.7
+    round  12      151.4     1594.5     1502.6
+    round  13      162.3     1606.3     1502.8
+    round  14      163.3     1535.2     1509.7
+    round  15      163.6     1622.1     1512.5
+    round  16      164.8     1571.4     1448.8
+    round  17      167.0     1567.5     1456.9
+    round  18      164.1     1575.0     1467.8
+    round  19      165.5     1580.4     1466.6
+  last: hand_edit at 2026-10-02T10:31:53 (A0 1002: restored from the B0 backup; round 20 sessions removed (planner d694338b, reviewer 82966052: B0-only Claude sessions, so act/reflect start fresh agents from the files); see PT/output/1002__oe/FWDJOB.md)

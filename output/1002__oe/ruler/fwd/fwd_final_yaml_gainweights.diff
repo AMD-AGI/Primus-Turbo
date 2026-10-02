@@ -1,0 +1,10 @@
+--- /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/job_context/gfx1250-flydsl-attn-fwd_final.yaml.bak.pre-gb-1002
++++ /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/job_context/gfx1250-flydsl-attn-fwd_final.yaml
+@@ -689,6 +689,7 @@
+   max_timeout: 120h         # [resolved] = 432000 s (NOT 172800 s, which is 48h -- R3).
+                             # [user comment follows] = 172800 s. Unchanged [bwd-spec:210]; 12 rounds
+                             # will not reach it, and it is a backstop, not a plan.
++  gain_weights: {prod: 1.0, proxy: 0.25, fast: 0.0}   # A0 operator 2026-10-02 (h51, as A0 fwd job r10 and bwd D7/h83): prod ranks; fast is blk-ruled and launch-bound
+   min_gain: 0.007  # [2026-09-25] just above this operator's 0.24-0.66% same-session noise floor.
+   # [stage2, 2026-09-23] LOWERED from an earlier draft's 0.015. That value was set
+   # from the ~1.5% drift the same code showed ACROSS sessions, but cross-session drift is

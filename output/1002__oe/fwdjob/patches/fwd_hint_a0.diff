@@ -1,0 +1,104 @@
+--- job_context/hint.md.bak.pre-a0-1002
++++ job_context/hint.md
+@@ -47,7 +47,7 @@
+ | h26 | standing note | Closed levers from the 2026-09-27 compile-only prototypes | open |
+ | h27 | must standing note | Prototypes h21-h25 are based on ROUND 2 -- port their diff, never copy their files over the round-4+ champion | open |
+ | h28 | must note | A0 results for rounds 5-7 (their fork of this job): three losses and one harness artifact -- read before choosing | open |
+-| h29 | must standing | B0 host, ONE card of four: physical GPU 0 via container fa-g0 only; other cards are busy by design | open |
++| h29 | must | B0 host, ONE card of four: physical GPU 0 via container fa-g0 only; other cards are busy by design | superseded by h49 (A0 host move, 2026-10-02) |
+ | h30 | must standing | Division of labour with A0 and the GPU-2 lab: this fork owns the softmax max/rescale and row-sum structure levers and the 4-wave roadblock | open |
+ | h31 | must standing note | Rank candidate vs champion in a process WITHOUT beat; beat only in its own process (A0 h28, 2026-09-27) | open |
+ | h32 | standing note | A0 r8: nodelay (amdgpu-enable-delay-alu=False) +0.7% prod -- A0 re-lands it; do not duplicate, stack on it only if it reaches our champion via a must hint | open |
+@@ -56,7 +56,7 @@
+ | h35 | must standing note | RULER ALERT: identical champion code measures bimodally at prod (~1.44 vs ~1.52 ms per process/arm path). Every ranking process must carry an in-process A/A (a byte-identical champion copy); results where A/A is off by > 0.5% are void | done -- superseded by h40 (cause found and fixed) |
+ | h36 | standing note | A0 fwd job paused at round 13 (~15:30 UTC, machine handover): champion r11 = r4 + nodelay + BLOCK_M=128 gate; h23 and h25 are open to this job again | open |
+ | h37 | must note | Re-land round 8 arm B ALONE (m16x8 BLOCK_M=128 gate for under-filled grids on top of op/current): fast +29%, prod/proxy ISA byte-identical to r6; rejected only by proxy noise. nodelay (arm A) is dead on this body | open |
+-| h38 | must standing | DAY 2 CARD MOVE: this job now runs on PHYSICAL GPU 2 via container fa-g2 ONLY (overrides h29 GPU 0 / fa-g0) | open |
++| h38 | must | DAY 2 CARD MOVE: this job now runs on PHYSICAL GPU 2 via container fa-g2 ONLY (overrides h29 GPU 0 / fa-g0) | superseded by h49 (A0 host move, 2026-10-02) |
+ | h39 | must refactor | Adopt round 9 arm BG verbatim as op/current (h37 m16x8 gate + r7.i2.g18): beats r6 on every shape in-session; rejected only by best-ever records of unshipped arms | done (r10) |
+ | h40 | must standing note | RULER FIXED: benchmark.py now times BLOCKED (lead 4 + block 9 per arm, palindromic rounds); the old call-by-call interleave biased prod 3-7% FlyDSL-vs-FlyDSL and ~25% vs ASM | open |
+ | h41 | standing note | Re-measured under the fixed ruler: r6 vs r4 +4.6% prod (real), L12 4-wave occ2 DEAD (-0.4% prod, -7% proxy), bnegg/fixed-max vs r6 +0.6% (unconfirmed), ASM beat steady-state ~1.43-1.46 ms (r6/beat 1.035) | open |
+@@ -67,6 +67,7 @@
+ | h46 | must standing note | FlyDSL JIT CACHE HAZARD: the disk-cache key ignores module-level constants (e.g. SPEC_STALE_MAX) -- a path whose contents changed can serve the OLD binary. Every measurement uses a fresh FLYDSL_RUNTIME_CACHE_DIR per process (or per arm) | open |
+ | h47 | must note | REDIRECT after 4 non-improving rounds (r14-r17): the remaining prod gap is issued work x clock sensitivity; rank candidates on the REAL dumps after a GEMM burst as well as randn, and target instruction count on the prod m32x8 hot loop | open |
+ | h48 | must refactor | Adopt rounds/019/op verbatim as op/current: vs the champion +1.5% on real dumps after a GEMM burst (18/18 readings above the A/A max) and +1.7% on randn; rejected only by r18's unshipped best-ever record | open |
++| h49 | must standing | HOST MOVE: A0 (heliosr-1b114-c07-1), one card, container fa-repro; supersedes h29 and h38. Round 20's act is redone here; the fp32 reference never runs on the card (refcache + CPU); FlyDSL cache /root/.flydsl/cache | open |
+ | h50 | must standing | NEVER compute an fp32 reference on the card: round 20's adv_m32x8.py faulted GPU2 inside the hipBLASLt fp32 forward_reference GEMM (TCP permission fault) -- use refcache or a CPU reference; the job was hard-stopped to avoid a wedge | open |
+ 
+ ---
+@@ -859,6 +860,24 @@
+ **Refactor task**: copy `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/019/op/` into the working copy VERBATIM, run the correctness gate; promotion clears
+ the stale best-ever records. Remember h46: clear /tmp/flycache after the promotion before re-measuring the champion.
+ 
++**A0 amendment (operator, 2026-10-02) -- read before executing.** On A0 this refactor runs at the head of round 21,
++AFTER round 20's act has been redone (round 20's plan already builds its candidate, r18.i1.g65 folded into the
++rescale branch, on `rounds/019/op`). Check `best_round` in `job_context/state.yaml` first:
++- `best_round: 16` (round 20 was not accepted; `op/current` is still r13ns): copy `rounds/019/op/` VERBATIM as above.
++  Verified on A0 2026-10-02 (`md5sum`, `__pycache__` excluded): `flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py`
++  e4485ba08d49bdbaef36987c94ae1c1f (r13ns + g64 d-tile + `RESCALE_THRESHOLD` 8.0 -> 24.0); every other source file is
++  byte-identical to `op/current` (m32x2 b09721562d696d5c1edc7eba29857a88, m16x8 1af89c64d2d3b3fcf28a280054a30c16,
++  `impl.py` 35f4247ad75b0907b83d467b3f8bf33f, `_env.py` fe602c25556302ce80e0fff8b3c168ec).
++- `best_round: 20` (round 20 was accepted, so `op/current` = `rounds/019/op` + the g65 fold, a superset of this
++  refactor): do NOT copy `rounds/019/op` -- that would throw round 20's gain away. Leave the working copy (a copy of
++  `op/current`) unchanged, let the gate run, and report `outcome: refactored` with the summary "no-op: op/current
++  (round 20) already contains rounds/019/op". The promotion then only retires the stale best-ever records, which is
++  the other half of this hint.
++- Either way: `RESCALE_THRESHOLD` is a module-level constant, which the FlyDSL JIT key ignores (h46). The framework's
++  gate sets no cache directory, so on A0 it uses fa-repro's shared default `/root/.flydsl/cache` (h49): empty it
++  (`rm -rf /root/.flydsl/cache/*` inside fa-repro) before you run the gate, and again after the promotion before
++  anyone re-measures the champion. The fp32 reference never runs on the card (h50, h49).
++
+ ## h50 -- Never compute an fp32 reference on the card
+ 
+ 2026-09-28 ~11:55 UTC: round 20's act ran `adv_m32x8.py` (bitwise check vs rounds/019/op); on its first case it died
+@@ -868,3 +887,50 @@
+ Rules: bitwise/adversarial comparisons compare candidate vs champion (both bf16 kernels) or use refcache / a CPU fp64
+ reference (as verify_r6/ and fwd-nospec/ did); no fp32 GEMM reference on the card, ever, and never re-run a script
+ that just faulted the card. Round 20's act must be redone on resume (the refactor h48 applies at the next round head).
++
++## h49 -- HOST MOVE: A0 (heliosr-1b114-c07-1), one card, container fa-repro
++
++From round 20 this job runs on A0: a single gfx1250 card, container `fa-repro` (logical device 0 = the only card).
++This supersedes h29 and h38 (and h62/h65 in the bwd job): no fa-gN containers, no OE_PHYS_GPU (unset -> the sclk
++witness falls back to rocm-smi, which is correct on one card), idle/contention checks = the whole node
++(`ls /sys/class/kfd/kfd/proc`, `rocm-smi --showpids`). The fwd and bwd jobs share this card and NEVER run at the same
++time. A0 absolute numbers are not comparable with B0's: re-measure champion and beat in the same process. Everything
++else stands: blocked ruler (h40/h66), fresh FlyDSL JIT cache per process (h46/h72), real-dump + GEMM-burst ruler (h47).
++
++What else changed with the move (operator, 2026-10-02; every change, backup and diff is listed in
++`/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__oe/FWDJOB.md`; `PT` below =
++`/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo`):
++- This directory was restored on A0 from B0's backup of 2026-09-28 (sha256-verified). B0 hard-stopped the loop in
++  round 20 (deep) during the act, so on resume **round 20's act is redone from scratch**: the B0 attempt is moved to
++  `rounds/020/3-act.stale-*`, its profiling and plan stand, and its working copy `rounds/020/op` (rounds/019/op plus
++  the g65 fold) is kept. That attempt faulted the card inside `adv_m32x8.py`'s fp32 `forward_reference` (h50): do not
++  re-run the script as written; check the candidate bitwise against `rounds/019/op` instead (both bf16 kernels).
++- The spec: `runtime.runner.docker.container` fa-g2 -> fa-repro, `runtime.host` -> heliosr-1b114-c07-1, `gpu_id` 0
++  (the only GPU). Nothing else changed; `spec_version` stays v000 (no setup re-run).
++- **The fp32 reference never runs on the card.** `op/refcache_util.py` `reference()` serves fast/proxy/prod (causal)
++  from `op/refcache/` -- provenance checked on A0 2026-10-02: built on A0 at setup on 2026-09-25 and byte-identical to
++  the retired A0 fwd job's cache -- and computes every other case (the seven unscored edge shapes, any non-causal
++  call, a fast miss) on the CPU; a proxy/prod miss is a hard error. `op/eager/impl.py` `forward_reference` now moves
++  CUDA inputs to the CPU itself (the arithmetic is unchanged), so a round's own script that calls it cannot put the
++  fp32 GEMMs on the card either; the cache stays valid through the recorded pre-guard `eager_sha`. A CPU reference
++  costs seconds at proxy and up to about a minute at prod: prefer bitwise candidate-vs-champion checks.
++- **FlyDSL JIT cache on A0**: fa-repro sets no `FLYDSL_RUNTIME_CACHE_DIR`, so every process that sets none (the
++  framework's validation.py and benchmark.py) shares `/root/.flydsl/cache`. Wherever h46/h48 say `/tmp/flycache`,
++  read `/root/.flydsl/cache`; in your own runs use `FLYDSL_RUNTIME_CACHE_DIR=$(mktemp -d /tmp/flycache.XXXX)`.
++- **Real-dump ruler on A0 (h47)**: the six dumps are at `/home/lihuzhan/_prof_dump/qkv_call0{672,673,674,680,688,703}.pt`.
++  B0's arm trees `PT/output/0927__b0/fwd-nospec/arms/` are NOT on A0: point copies of `fwd-nospec/tools/ab.py` at
++  `job_context/op/current` and your round's `rounds/<n>/op` (rounds 18/19 kept theirs under `1-opt/raw/real/`).
++  `PT/output/1002__e2e/tools/realab.py` is the A0 version of the ruler (fwd arms via `RA_FWD_ARMS`); its wrapper
++  `realab.sh` refuses to run while an op-evolve loop is alive, so inside this job run the python through the runner.
++  The GEMM burst must use the IMAGE hipBLASLt
++  (`/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/gfx1250`): this job's
++  env assigns `/home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250`, with which the burst runs slowly and the clock stays
++  high (ruler void; 10 GEMMs should take ~21-25 ms).
++- **What A0 reads now** (2026-10-02, `PT/output/1002__e2e/RESULT-realab.md`, champion r16 = r13ns vs the ASM bar,
++  time ratios): randn blocked 1.080 (1.285 vs 1.190 ms); real dumps blocked 1.081; real dumps right after a GEMM burst
++  (~1.28 GHz, the training operating point) **1.349** (1.535 vs 1.137 ms); randn after a burst 1.343. The ruler that
++  gates this job hides most of the training gap -- report the burst ruler for every candidate (h47). PMC cycle census
++  and light-speed ablations of r13ns on A0: `PT/output/0930__roofline/REPORT.md` §6 and §9.
++- Files written on B0 still name B0 cards: `findings/*.md`, `knowledge_gaps.md`, `note.md` and the scripts under
++  `rounds/0NN/`. Any fa-g0/fa-g2, OE_PHYS_GPU, renderD128/144, card16, kfd gpu_id 34992/57865 or `/tmp/flycache` in
++  them is B0-only; this hint wins where they disagree.

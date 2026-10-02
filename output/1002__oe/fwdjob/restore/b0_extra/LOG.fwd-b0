@@ -1,0 +1,1182 @@
+  0-setup/job_setup: done at v000, skipping the agent
+
+======================================================================
+review: /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/job_context/history/review/job_setup_v000.md
+======================================================================
+# Job Setup v000 -- gfx1250-flydsl-attn-fwd-20260925-114644
+
+**SUCCESS** -- all four LLM roles answer and resume; host, container, GPU (gfx1250, id 0), rocm-smi and torch verified; all five runner checks pass (including the decoder). Four spec conflicts were resolved and are listed below for your review. The most consequential is R4: the vendored baseline `_env.py` sets the BLAS variable to the wrong value, and Op Setup must fix it.
+
+## Account checks (`logs/step3_llm_accounts.log`)
+
+| Item | Expected | Observed | Pass |
+| --- | --- | --- | --- |
+| setup: claude / claude-opus-5-5 call | answers | answered in 1.69 s | pass |
+| setup: session resume | context intact | resumed, context intact | pass |
+| profiler: claude / claude-opus-5-5 call | answers | answered in 1.49 s | pass |
+| profiler: session resume | context intact | resumed, context intact | pass |
+| planner: claude / claude-opus-5-5 call | answers | answered in 2.03 s | pass |
+| planner: session resume | context intact | resumed, context intact | pass |
+| reviewer: codex / gpt-5.6-sol call | answers | answered in 2.97 s | pass |
+| reviewer: session resume | context intact | resumed, context intact | pass |
+| account files | anthropic file + openai file | `.op_evolve_openai` is a symlink to `.op_evolve_anthropic` (contents not read) | pass |
+
+## Environment checks (`logs/step4_environment.log`, `logs/step5_runner.log`)
+
+| Item | Expected | Observed | Pass |
+| --- | --- | --- | --- |
+| ssh hops | none (`ssh: null`) | none; `hostname` = heliosr-1b114-c07-1, local docker | pass |
+| container | existing `fa-repro`, attach only | running, image fa-tune:deps, started 11:33:03Z; ipc/net host, shm 16 GiB, seccomp unconfined, kfd+dri, groups video/993, `/home/lihuzhan` bind | pass |
+| GPU present | 1 card | 1 (torch count 1, rocm-smi GPU[0]), 256 CUs, 432 GiB | pass |
+| gpu_arch | gfx1250 | gfx1250 (rocm-smi and torch) | pass |
+| gpu_id 0 usable | yes | torch ops and a bf16 GEMM ran on it | pass |
+| card free | backward job stopped | no bwd op-evolve process; 0% use, no KFD PIDs; container runs only `sleep infinity` | pass |
+| card health | no fault signatures | dmesg since boot: only the boot-time VR throttle warning; sclk DPM 500/1100 MHz; dmesg monitor clean during all checks | pass |
+| rocm-smi | installed, runs | `/opt/venv/bin/rocm-smi` rc=0; ROCM-SMI 4.0.0, LIB 7.8.0, driver 7.1.1.31300009 | pass |
+| torch | imports, sees GPU, runs op | 2.11.0+rocm7.14.0a20260625, hip 7.14.60850; elementwise and GEMM OK | pass |
+| job BLAS env | `=1` + LIBPATH takes effect when assigned | default in container is `0` (sitecustomize setdefault); with `-e` assigned: `1`, backend Cublaslt(hipBLASLt), GEMM finite | pass |
+| flydsl selection | 0.3.4.1 from flydsl0341 | 0.3.4.1 at `/home/lihuzhan/.local/flydsl0341/flydsl` | pass |
+| sudo | (policy false) | `sudo -n true` succeeds; not used by the job | info |
+| runner: reach | ok | heliosr-1b114-c07-1 (kfd) via docker | pass |
+| runner: torch gemm | ok | 4096^3 bf16 5.019 ms, 27.4 TFLOP/s (a cold figure: an immediate re-run measured 75.0) | pass |
+| runner: shared path | same dir both sides | verified both directions | pass |
+| runner: counters | rocprofv3 rows | GRBM_COUNT, 29 rows | pass |
+| runner: ATT decoder | recorded | reachable | pass |
+
+## Resolved op spec
+
+| Field | Value | Source |
+| --- | --- | --- |
+| job.name / id / started_at | gfx1250-flydsl-attn-fwd / 20260925-114644 / 2026-09-25T11:46:44 | user / framework / framework |
+| op.type, backend | attention, [flydsl] | user |
+| config | causal bottom-right, no window, dense, no sink, hd 128/128, GQA 4, BSHD, fwd only | user |
+| softmax_scale | 0.08838834764831845 | user |
+| dtype | qkv/out bf16; qk_acc, softmax, pv_acc, lse fp32 | user |
+| reference | fp32 torch `forward_reference`, copied as a function from the bwd job's `op/ut/common.py:53-82` | user |
+| api | `attn_fwd(q,k,v,softmax_scale=None,causal=True) -> (o, lse)`; lse natural log [b,hq,sq] | user |
+| baseline.root | `.../Primus-Turbo/output/0925__flydsl/fwd-job/op_baseline` (present, non-empty, no aiter import, `attn_fwd` at impl.py:124) | user; contents observed |
+| baseline import rewrites | 11 sites; `get_lds_capacity_bytes` inlined | observed (R6) |
+| precision gate | o and lse separately ≥ 50 dB, NaN-prefill plus an isfinite check | user |
+| determinism gate | o and lse bitwise identical over 200 runs at the fast shape | user (still unverified; Op Setup runs it) |
+| shapes (sweep, no guards) | (1,1024,8/2), (1,4096,32/8), (4,8192,32/8); flop 2.14958e9 / 1.37473e11 / 2.19929e12 | user |
+| target | aiter ASM `fmha_fwd_with_sink_asm`, sink=None, "beaten by 0%", measured in the same run; tflops/roofline null | user |
+| evolve | max_rounds 30, max_timeout 120h (=432000 s), min_gain 0.007, fast_rounds 4, fast_per_deep 4, turn_timeout null | user; 432000 s resolved (R3) |
+| runtime | local docker attach `fa-repro`, not owned, gpu 0, pool [], sudo false | user; observed |
+| python_path | flydsl0341, then aiter-src (documentation only; each `_env.py` applies it) | user; resolved (R4) |
+| env | TORCH_BLAS_PREFER_HIPBLASLT=1 and HIPBLASLT_TENSILE_LIBPATH, assigned (not setdefault) | user |
+| flydsl version | 0.3.4.1 | resolved (R2) |
+| review.auto_approve_after | 10m | user |
+
+## Inferred / resolved conflicts
+
+- **R1** The header's "backward job is LIVE on the card" is historical. Its state.yaml ends in `resumed` at 08:35 with no `stopped`, but no process for it is running, and the host rebooted around 10:11. **Do not `op-evolve resume` the backward job while this job is running.**
+- **R2** The header prose and `sources` notes require flydsl **0.3.2 / flydsl032**. `python_path`, `observed.flydsl_selected` and the vendored `_env.py` all say **0.3.4.1 / flydsl0341**. Resolved to 0.3.4.1, the dated structured fields.
+- **R3** Prose in the `evolve` section still argues for 12 rounds, min_gain 0.015 and 6 fast rounds. The fields dated 2026-09-25 say 30 / 0.007 / 4 and win. The `max_timeout` comment "= 172800 s" is wrong: 120h = 432000 s.
+- **R4 (needs Op Setup action)** `op_baseline/_env.py` does `setdefault("TORCH_BLAS_PREFER_HIPBLASLT","0")` and never sets `HIPBLASLT_TENSILE_LIBPATH`, which contradicts `runtime.env`. Because sitecustomize already sets 0, that setdefault leaves the value at 0. No framework code reads `runtime.env` or `python_path`. `OPEVOLVE_KEEP_BLAS_ENV` exists nowhere, in either op_evolve/ or sitecustomize.
+- **R5** Line numbers in the spec refer to the aiter-src original. In the vendored copy they are +31, e.g. `O_VARIANT` :150 becomes :181.
+- **R6 / R7** 11 rewrites, not 8. The kernel is 2264 lines vendored and 2233 in the original.
+
+## Still unresolved (belongs to Op Setup, not verified here)
+
+- The 200-run bitwise determinism gate has never been run.
+- Whether 50 dB is the right bar for fp32 `lse` is open. Op Setup must report the baseline lse SQNR.
+- The import proof (O_VARIANT v3→v1→v3 moves the number, confirmed by descriptor) is not done yet.
+- The ASM target's first-call JIT build time has not been measured.
+- The `min_gain` 0.007 noise floor has not been re-measured on today's boot.
+
+
+---
+
+## Review verdict
+
+- 2026-09-25T11:51:00 -- approved (non_interactive)
+
+
+---
+
+## Review verdict
+
+- 2026-09-25T12:16:10 -- approved (non_interactive)
+
+
+---
+
+## Review verdict
+
+- 2026-09-25T12:38:23 -- approved (non_interactive)
+
+
+---
+
+## Review verdict
+
+- 2026-09-27T08:30:04 -- approved (non_interactive)
+
+[review] no terminal to ask; approved automatically
+  0-setup/op_setup: done at v000, skipping the agent
+
+======================================================================
+review: /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/job_context/history/review/op_setup_v000.md
+======================================================================
+# Op Setup v000 — gfx1250-flydsl-attn-fwd
+
+**FAILED — the baseline misses the 50 dB `o` precision gate on 7 of 13 edge-shape cases (49.82–49.98 dB, every buffer fully covered). Per step 6 ("stop on any failure"), steps 7–9 were not run: no benchmark measurement and no validation run.**
+
+The three spec shapes pass (o 51.23 / 50.89 / 50.83 dB). The 200-run determinism gate passes. The beat arm works. The misses are a precision floor about 0.02–0.2 dB below the bar, not unwritten output. Clearing it needs an operator decision (options in §7), not a kernel fix from setup.
+
+## 1. Branch, source, commit, config diff
+
+- **Branch:** "neither corpus nor from-scratch: baseline supplied by op.baseline.root, copied verbatim". This is the branch the spec mandates.
+- **Source:** `/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0925__flydsl/fwd-job/op_baseline/`
+  - Copied with `rsync -a --exclude __pycache__`.
+  - `diff -r` against the root was empty before the one edit below.
+- **Upstream commit:** `/home/lihuzhan/code/aiter-src` HEAD `6963ae9d77acb207d8f03fc92dddd8a57faf8fa6` (2026-09-17, clean).
+  - Changed lines versus upstream: kernels_common 0, buffer_ops 0, tensor_shim 6, buffer_managers 6, fmha_fwd_prefill 39.
+  - All of those changes are import rewrites plus the inlined `get_lds_capacity_bytes`.
+- **Files read:** root `impl.py`, `_env.py`, `__init__.py`, `PROVENANCE.md`; the vendored kernel's host entry and its `O_VARIANT` / builder region (:175-185, :1447-1460, :2093-2264); `kernels_common.py`.
+- **Corpus, checked first** (knowledge HEAD 58b2134):
+  - `recipes/hd128.md` (last touched 8ebf3e4) differs from this job on every one of these fields:
+
+    | field | hd128.md | this job |
+    |---|---|---|
+    | `heads_q_per_kv` | pow2 in [8,256] | 4 |
+    | `format` | thd-varlen / sbhd | bshd |
+    | `direction` | fwd+bwd | fwd |
+    | `applies_to.arch` | gfx950 | gfx1250 |
+    | `determinism` | differs | — |
+    | implementation | Primus-Turbo FlyDSL, which refuses gfx1250 | — |
+
+    `softmax_scale` is the same value.
+  - `recipes/hd64.md`: head dim 64, gfx950.
+  - Nothing was taken from either recipe.
+- **Config edit (the only one):** `baseline/_env.py`.
+  - Old: `setdefault("TORCH_BLAS_PREFER_HIPBLASLT","0")`.
+  - New: it now ASSIGNS `TORCH_BLAS_PREFER_HIPBLASLT=1` and `HIPBLASLT_TENSILE_LIBPATH=/home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250`, and adds an `env_line()` helper.
+  - Why: the spec's runtime.env requires these values, and sitecustomize.py:18 makes a setdefault a no-op.
+  - Recorded in `op/baseline/PROVENANCE.md`.
+- **Effective values printed from inside every measuring process:** `ENV TORCH_BLAS_PREFER_HIPBLASLT=1 HIPBLASLT_TENSILE_LIBPATH=/home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250`.
+
+## 2. What was created and how it was verified
+
+| item | what | verified by |
+|---|---|---|
+| `op/baseline/` | the root copied verbatim, plus the `_env.py` edit and a PROVENANCE addendum | `diff -r` was empty before the edit; py_compile; toy smoke with `AMD_SERIALIZE_KERNEL=3` (rc 0); correctness runs in §4 |
+| `op/beat/` | `impl.py` wraps `aiter.ops.mha.fmha_fwd_with_sink_asm(..., sink=None)` from aiter-src and asserts the module path; `_env.py`; `PROVENANCE.md` (commit, .so and .co hashes) | smoke with `AMD_SERIALIZE_KERNEL=3`: aiter's `LoadKernel` line named the `_mask.co` and plain `.co`. Results: toy causal o 54.10 / lse 145.57 dB; toy non-causal 52.64 / 146.07; fast 53.56 / 147.17 |
+| `op/eager/` | `forward_reference` copied verbatim from the bwd job's `ut/common.py:53-82`, wrapped as `attn_fwd` | Python check: the lines are identical at `eager/impl.py:32`. The mask is built explicitly (`kj > qi + (skv-sq)`); SDPA is not used |
+| `op/ut/common.py`, `ut/test_correctness.py` | 3 spec shapes and 7 edge shapes (below); `load_impl` by PATH, getattr `attn_fwd` | ran through the runner (§4) |
+| `op/gates.py` | correctness check: poison, `isfinite` coverage, then o and lse SQNR separately. Also the 200-run bitwise determinism check | used by the runs in §4 |
+| `op/poison_util.py` | the bwd job's 0x7FC07FC0 poison sized to the largest output (docstring rewritten) | exercised in every correctness call |
+| `op/refcache_util.py`, `op/refcache/{fast,proxy,prod}.pt` | fp32 causal (o, lse). Provenance holds shape, dims, seed, and the sha of `eager/impl.py` and `ut/common.py`. On a mismatch it recomputes and says so | built via the runner (rc 0, all finite); served the spec-shape run (`ref=refcache`) |
+| `op/benchmark.py` | arms by name or `--arm-path`; median of 101; 8 s continuous warmup per arm; palindromic order; 256 MB L2 flush outside the events; sclk before and after; `op_flops.attention(..., backward=False)`; prints the ENV line and a per-arm import witness (impl file, kernel file, `O_VARIANT`); `RESULT ... stat= iters= latency_ms= tflops= bw_gbs=` | py_compile only. **Not run (stopped at step 6)** |
+| `op/validation.py` | details in the next table | py_compile only. **Not run (stopped at step 6)** |
+| `op/runner_util.py`, `op/drive.py` | the bwd job's detached-run helper, keyed by `op/.runs/<key>`: attaches to a run in flight, re-runs a finished one. SPEC/name changed to fwd | every GPU run above went through it |
+| not created | `op/current/`, `rounds/000/` | — |
+
+What `op/validation.py` does:
+
+1. Correctness on all 10 shapes, in every allowed causal mode.
+2. Determinism: 200 runs at fast.
+3. Speed: for each spec shape, one `benchmark.py` process that runs `candidate` and `beat` together.
+4. Pass condition: the geomean of candidate/beat is at least 1 + margin/100.
+   - The margin is read at runtime from the `beaten by N%` substring of `op.target.beat`, using tune.py's regex.
+   - The dB threshold is read from `op.precision_sqnr_db`.
+5. Arguments: one optional impl PATH, defaulting to `op/current`.
+6. Exit codes: 0 if everything passes, 2 on any failure.
+7. Output format: a `FAILED (n):` line followed by `  - ` bullets, which `core/gate.py` parses.
+
+**Grep gate:**
+
+```
+$ grep -rn "attn_bwd" JC/op/ ; echo "grep rc=$?"
+grep rc=1
+```
+
+This prints zero lines.
+
+## 3. Shapes
+
+| shape | b, sq, skv, hq, hkv, d | modes | purpose |
+|---|---|---|---|
+| fast / proxy / prod | from spec | causal | scored |
+| toy | 1,256,256,2,1,128 | causal, full | smoke; GQA 2 |
+| short_q | 1,128,512,4,1,128 | causal, full | sq below BLOCK_M=256; sq≠skv |
+| gqa4_batch2 | 2,256,256,8,2,128 | causal, full | the job's GQA 4 with batch > 1 |
+| mha | 1,256,256,4,4,128 | causal, full | GQA 1 |
+| unequal_seqlen | 1,512,1024,8,2,128 | causal, full | sq≠skv, so bottom-right applies |
+| unequal_seqlen2 | 2,1024,2048,4,1,128 | causal, full | sq≠skv with batch > 1 |
+| sq_gt_skv | 2,1024,512,4,1,128 | full only | bottom-right causal leaves empty rows here (NaN in every implementation) |
+
+## 4. Measurements
+
+Every row is the baseline measured through the runner, with the card exclusive (no other KFD holders). There are no speed columns, because steps 7–9 were not run. Run dirs: `op/.runs/ut_baseline_edges`, `op/.runs/ut_baseline_spec`.
+
+| shape | mode | o finite | o SQNR dB | lse SQNR dB | ref | pass |
+|---|---|---|---|---|---|---|
+| fast | causal | 1048576/1048576 | 51.23 | 85.48 | refcache | PASS |
+| proxy | causal | full | 50.89 | 88.24 | refcache | PASS |
+| prod | causal | full | 50.83 | 89.20 | refcache | PASS |
+| toy | causal | full | 51.86 | 81.85 | eager | PASS |
+| toy | full | full | 50.18 | 85.17 | eager | PASS |
+| short_q | causal | full | **49.93** | 86.44 | eager | **FAIL** |
+| short_q | full | full | **49.82** | 86.73 | eager | **FAIL** |
+| gqa4_batch2 | causal | full | 51.76 | 81.51 | eager | PASS |
+| gqa4_batch2 | full | full | 50.18 | 85.30 | eager | PASS |
+| mha | causal | full | 51.60 | 81.18 | eager | PASS |
+| mha | full | full | **49.98** | 85.15 | eager | **FAIL** |
+| unequal_seqlen | causal | full | **49.98** | 87.38 | eager | **FAIL** |
+| unequal_seqlen | full | full | **49.98** | 87.87 | eager | **FAIL** |
+| unequal_seqlen2 | causal | full | **49.97** | 88.36 | eager | **FAIL** |
+| unequal_seqlen2 | full | full | 50.00 | 88.79 | eager | PASS |
+| sq_gt_skv | full | full | **49.99** | 86.70 | eager | **FAIL** |
+
+- **Determinism:** 200 runs at fast, 200/200 bitwise identical (o=26a89a2db0cd, lse=d6ac8da1e101). PASS. This is the first time the gate has actually been executed on this machine.
+- **Speed (baseline / current / beat):** **not measured**; setup stopped at step 6.
+- **Sanity figures from the spec (2026-09-23, not this session):** at prod, FlyDSL runs 2.356 ms (933.5 TF/s) and ASM 1.557 ms (1412.5 TF/s).
+- **lse SQNR (the spec's OPEN item):** the baseline reads 81–89 dB and the ASM reads about 146 dB. Against a 50 dB bar, lse is nowhere near binding.
+
+## 5. Success condition and benchmark method
+
+**Success condition:** `validation.py` exits 0 only if both hold:
+
+1. On every shape and mode, o and lse are fully finite and each is ≥ 50 dB against op/eager, and o/lse are bitwise identical over 200 runs at fast.
+2. The geomean over fast/proxy/prod of candidate/beat TF/s, measured in the same benchmark process, is ≥ 1.00 ("beaten by 0%").
+
+**Benchmark statistic:** median of 101 CUDA-event-timed iterations per arm per shape, after 8 s of continuous warmup per arm, in palindromic order, with the L2 flushed outside the timing window.
+
+## 6. Live anchor
+
+**There is no live anchor.** Beat was never timed in this session, and neither were baseline and current, so there are no ratios. `current == baseline` agreement has not been shown. The import proof (`O_VARIANT` v3 → v1 → v3) has not been done.
+
+## 7. Inferences, weaknesses, and what the operator must decide
+
+- **The cause is inferred, not proven.** It is a precision floor rather than a bug:
+  - coverage is full everywhere;
+  - misses cluster at 49.8–50.0 dB;
+  - non-causal (longer rows, smaller |o|) is about 1.6 dB below causal at the same shape;
+  - the independent ASM kernel sits about 2.5 dB higher on the same reference.
+- **The reference also rounds.** The verbatim reference casts `o` to bf16, so the measured SQNR includes the reference's own rounding noise, not just the candidate's. Scoring against an unrounded fp32 `o` would likely raise every figure, by up to about 3 dB if the two rounding errors are independent.
+  - I did not change this: the spec says to copy that function verbatim.
+- **The spec shapes have little headroom.** They clear 50 dB by only 0.83–1.23 dB, below the 51.6 dB calibration quoted in the spec (which came from a different harness and different inputs).
+  - Any round that costs about 1 dB at prod will fail.
+- **Options, all needing an operator or spec change:**
+  - (a) Keep 50 dB for the spec shapes and set a lower documented floor (for example 49.5 dB) for the edge shapes.
+  - (b) Score `o` against an fp32 (unrounded) reference, which is a deviation from "verbatim".
+  - (c) Lower `precision_sqnr_db` globally.
+  - (d) Drop the failing edge shapes. Not recommended: step 5 requires a seqlen_q≠seqlen_kv shape, and every such shape fails by 0.02 dB.
+  - Once one is chosen, rerun `ut/test_correctness.py`, then continue at step 7. The tooling is already written.
+- **Other weaknesses of the baseline:**
+  - Its lse is about 60 dB less precise than the ASM's (81–89 vs about 146 dB). This is harmless at the current bar, but relevant if lse feeds a backward.
+  - flydsl emits a `Pointer`-vs-`Tensor` annotation UserWarning on every build. This is noise.
+- **Beat caveat:** the beat's causal alignment for sq≠skv is untested. It is only used at the equal-length spec shapes.
+- **Housekeeping:**
+  - Runs inside the container write as root. I chowned `op/` back to uid 12850 and deleted the `__pycache__` directories.
+  - Later runs pass `PYTHONDONTWRITEBYTECODE=1`, but the framework's own gate run does not.
+- **Card health:**
+  - The dmesg monitor was armed for all GPU work and produced zero events.
+  - No KFD holders afterwards. sclk 1100 MHz (VR-throttled, as known).
+  - The monitor was stopped at the end.
+
+
+---
+
+## Review verdict
+
+- 2026-09-25T12:01:13 -- approved (non_interactive)
+
+
+---
+
+## Review verdict
+
+- 2026-09-25T12:16:10 -- approved (non_interactive)
+
+
+---
+
+## Review verdict
+
+- 2026-09-25T12:38:23 -- approved (non_interactive)
+
+
+---
+
+## Review verdict
+
+- 2026-09-27T08:30:04 -- approved (non_interactive)
+
+[review] no terminal to ask; approved automatically
+  0-setup: round 0 is on disk; op/current/ is round 4
+round 5 (deep):
+    00_preflight: done
+    01_select: done
+    02_counters, 03_metrics, 04_thread_trace: in parallel on GPU 0
+    02_counters: ok
+    03_metrics: skipped
+    04_thread_trace: skipped
+    05_power_wall: ok
+    06_bound: ok
+    07_summary: done
+    profiling op/beat/ as well: the first deep round is the only one that sees it
+    00_preflight: already ok, skipped
+    01_select: already ok, skipped
+    02_counters: already ok, skipped
+    03_metrics: already skipped, skipped
+    04_thread_trace: already ok, skipped
+    05_power_wall: skipped
+child process pid 669464 exit status already read:  will report returncode 255
+    06_bound: ok
+    07_summary: done
+  1-profiling: done
+    round 5 could not be completed: PlanError: 00_analyse (reviewer) failed: RuntimeError: unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses, cf-ray: a41abeaeb840aaa7-YYZ, request id: req_fc750c89b08047cf892effeaa4a676bd
+    recorded as a failed round; the loop continues
+round 6 (fast):
+    1-opt: delivered
+    gate: validation.py exit 2
+    gate: output kept at /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/006/gate.log
+    accepted: 1.0148x its best ever (score 0.81482 over 0.80035); op/current/ is round 6
+  1-opt: done
+job gfx1250-flydsl-attn-fwd-b0-20260927 stopped
+  0-setup/job_setup: done at v000, skipping the agent
+
+======================================================================
+review: /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/job_context/history/review/job_setup_v000.md
+======================================================================
+# Job Setup v000 -- gfx1250-flydsl-attn-fwd-20260925-114644
+
+**SUCCESS** -- all four LLM roles answer and resume; host, container, GPU (gfx1250, id 0), rocm-smi and torch verified; all five runner checks pass (including the decoder). Four spec conflicts were resolved and are listed below for your review. The most consequential is R4: the vendored baseline `_env.py` sets the BLAS variable to the wrong value, and Op Setup must fix it.
+
+## Account checks (`logs/step3_llm_accounts.log`)
+
+| Item | Expected | Observed | Pass |
+| --- | --- | --- | --- |
+| setup: claude / claude-opus-5-5 call | answers | answered in 1.69 s | pass |
+| setup: session resume | context intact | resumed, context intact | pass |
+| profiler: claude / claude-opus-5-5 call | answers | answered in 1.49 s | pass |
+| profiler: session resume | context intact | resumed, context intact | pass |
+| planner: claude / claude-opus-5-5 call | answers | answered in 2.03 s | pass |
+| planner: session resume | context intact | resumed, context intact | pass |
+| reviewer: codex / gpt-5.6-sol call | answers | answered in 2.97 s | pass |
+| reviewer: session resume | context intact | resumed, context intact | pass |
+| account files | anthropic file + openai file | `.op_evolve_openai` is a symlink to `.op_evolve_anthropic` (contents not read) | pass |
+
+## Environment checks (`logs/step4_environment.log`, `logs/step5_runner.log`)
+
+| Item | Expected | Observed | Pass |
+| --- | --- | --- | --- |
+| ssh hops | none (`ssh: null`) | none; `hostname` = heliosr-1b114-c07-1, local docker | pass |
+| container | existing `fa-repro`, attach only | running, image fa-tune:deps, started 11:33:03Z; ipc/net host, shm 16 GiB, seccomp unconfined, kfd+dri, groups video/993, `/home/lihuzhan` bind | pass |
+| GPU present | 1 card | 1 (torch count 1, rocm-smi GPU[0]), 256 CUs, 432 GiB | pass |
+| gpu_arch | gfx1250 | gfx1250 (rocm-smi and torch) | pass |
+| gpu_id 0 usable | yes | torch ops and a bf16 GEMM ran on it | pass |
+| card free | backward job stopped | no bwd op-evolve process; 0% use, no KFD PIDs; container runs only `sleep infinity` | pass |
+| card health | no fault signatures | dmesg since boot: only the boot-time VR throttle warning; sclk DPM 500/1100 MHz; dmesg monitor clean during all checks | pass |
+| rocm-smi | installed, runs | `/opt/venv/bin/rocm-smi` rc=0; ROCM-SMI 4.0.0, LIB 7.8.0, driver 7.1.1.31300009 | pass |
+| torch | imports, sees GPU, runs op | 2.11.0+rocm7.14.0a20260625, hip 7.14.60850; elementwise and GEMM OK | pass |
+| job BLAS env | `=1` + LIBPATH takes effect when assigned | default in container is `0` (sitecustomize setdefault); with `-e` assigned: `1`, backend Cublaslt(hipBLASLt), GEMM finite | pass |
+| flydsl selection | 0.3.4.1 from flydsl0341 | 0.3.4.1 at `/home/lihuzhan/.local/flydsl0341/flydsl` | pass |
+| sudo | (policy false) | `sudo -n true` succeeds; not used by the job | info |
+| runner: reach | ok | heliosr-1b114-c07-1 (kfd) via docker | pass |
+| runner: torch gemm | ok | 4096^3 bf16 5.019 ms, 27.4 TFLOP/s (a cold figure: an immediate re-run measured 75.0) | pass |
+| runner: shared path | same dir both sides | verified both directions | pass |
+| runner: counters | rocprofv3 rows | GRBM_COUNT, 29 rows | pass |
+| runner: ATT decoder | recorded | reachable | pass |
+
+## Resolved op spec
+
+| Field | Value | Source |
+| --- | --- | --- |
+| job.name / id / started_at | gfx1250-flydsl-attn-fwd / 20260925-114644 / 2026-09-25T11:46:44 | user / framework / framework |
+| op.type, backend | attention, [flydsl] | user |
+| config | causal bottom-right, no window, dense, no sink, hd 128/128, GQA 4, BSHD, fwd only | user |
+| softmax_scale | 0.08838834764831845 | user |
+| dtype | qkv/out bf16; qk_acc, softmax, pv_acc, lse fp32 | user |
+| reference | fp32 torch `forward_reference`, copied as a function from the bwd job's `op/ut/common.py:53-82` | user |
+| api | `attn_fwd(q,k,v,softmax_scale=None,causal=True) -> (o, lse)`; lse natural log [b,hq,sq] | user |
+| baseline.root | `.../Primus-Turbo/output/0925__flydsl/fwd-job/op_baseline` (present, non-empty, no aiter import, `attn_fwd` at impl.py:124) | user; contents observed |
+| baseline import rewrites | 11 sites; `get_lds_capacity_bytes` inlined | observed (R6) |
+| precision gate | o and lse separately ≥ 50 dB, NaN-prefill plus an isfinite check | user |
+| determinism gate | o and lse bitwise identical over 200 runs at the fast shape | user (still unverified; Op Setup runs it) |
+| shapes (sweep, no guards) | (1,1024,8/2), (1,4096,32/8), (4,8192,32/8); flop 2.14958e9 / 1.37473e11 / 2.19929e12 | user |
+| target | aiter ASM `fmha_fwd_with_sink_asm`, sink=None, "beaten by 0%", measured in the same run; tflops/roofline null | user |
+| evolve | max_rounds 30, max_timeout 120h (=432000 s), min_gain 0.007, fast_rounds 4, fast_per_deep 4, turn_timeout null | user; 432000 s resolved (R3) |
+| runtime | local docker attach `fa-repro`, not owned, gpu 0, pool [], sudo false | user; observed |
+| python_path | flydsl0341, then aiter-src (documentation only; each `_env.py` applies it) | user; resolved (R4) |
+| env | TORCH_BLAS_PREFER_HIPBLASLT=1 and HIPBLASLT_TENSILE_LIBPATH, assigned (not setdefault) | user |
+| flydsl version | 0.3.4.1 | resolved (R2) |
+| review.auto_approve_after | 10m | user |
+
+## Inferred / resolved conflicts
+
+- **R1** The header's "backward job is LIVE on the card" is historical. Its state.yaml ends in `resumed` at 08:35 with no `stopped`, but no process for it is running, and the host rebooted around 10:11. **Do not `op-evolve resume` the backward job while this job is running.**
+- **R2** The header prose and `sources` notes require flydsl **0.3.2 / flydsl032**. `python_path`, `observed.flydsl_selected` and the vendored `_env.py` all say **0.3.4.1 / flydsl0341**. Resolved to 0.3.4.1, the dated structured fields.
+- **R3** Prose in the `evolve` section still argues for 12 rounds, min_gain 0.015 and 6 fast rounds. The fields dated 2026-09-25 say 30 / 0.007 / 4 and win. The `max_timeout` comment "= 172800 s" is wrong: 120h = 432000 s.
+- **R4 (needs Op Setup action)** `op_baseline/_env.py` does `setdefault("TORCH_BLAS_PREFER_HIPBLASLT","0")` and never sets `HIPBLASLT_TENSILE_LIBPATH`, which contradicts `runtime.env`. Because sitecustomize already sets 0, that setdefault leaves the value at 0. No framework code reads `runtime.env` or `python_path`. `OPEVOLVE_KEEP_BLAS_ENV` exists nowhere, in either op_evolve/ or sitecustomize.
+- **R5** Line numbers in the spec refer to the aiter-src original. In the vendored copy they are +31, e.g. `O_VARIANT` :150 becomes :181.
+- **R6 / R7** 11 rewrites, not 8. The kernel is 2264 lines vendored and 2233 in the original.
+
+## Still unresolved (belongs to Op Setup, not verified here)
+
+- The 200-run bitwise determinism gate has never been run.
+- Whether 50 dB is the right bar for fp32 `lse` is open. Op Setup must report the baseline lse SQNR.
+- The import proof (O_VARIANT v3→v1→v3 moves the number, confirmed by descriptor) is not done yet.
+- The ASM target's first-call JIT build time has not been measured.
+- The `min_gain` 0.007 noise floor has not been re-measured on today's boot.
+
+
+---
+
+## Review verdict
+
+- 2026-09-25T11:51:00 -- approved (non_interactive)
+
+
+---
+
+## Review verdict
+
+- 2026-09-25T12:16:10 -- approved (non_interactive)
+
+
+---
+
+## Review verdict
+
+- 2026-09-25T12:38:23 -- approved (non_interactive)
+
+
+---
+
+## Review verdict
+
+- 2026-09-27T08:30:04 -- approved (non_interactive)
+
+
+---
+
+## Review verdict
+
+- 2026-09-27T12:35:50 -- approved (non_interactive)
+
+[review] no terminal to ask; approved automatically
+  0-setup/op_setup: done at v000, skipping the agent
+
+======================================================================
+review: /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/job_context/history/review/op_setup_v000.md
+======================================================================
+# Op Setup v000 — gfx1250-flydsl-attn-fwd
+
+**FAILED — the baseline misses the 50 dB `o` precision gate on 7 of 13 edge-shape cases (49.82–49.98 dB, every buffer fully covered). Per step 6 ("stop on any failure"), steps 7–9 were not run: no benchmark measurement and no validation run.**
+
+The three spec shapes pass (o 51.23 / 50.89 / 50.83 dB). The 200-run determinism gate passes. The beat arm works. The misses are a precision floor about 0.02–0.2 dB below the bar, not unwritten output. Clearing it needs an operator decision (options in §7), not a kernel fix from setup.
+
+## 1. Branch, source, commit, config diff
+
+- **Branch:** "neither corpus nor from-scratch: baseline supplied by op.baseline.root, copied verbatim". This is the branch the spec mandates.
+- **Source:** `/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0925__flydsl/fwd-job/op_baseline/`
+  - Copied with `rsync -a --exclude __pycache__`.
+  - `diff -r` against the root was empty before the one edit below.
+- **Upstream commit:** `/home/lihuzhan/code/aiter-src` HEAD `6963ae9d77acb207d8f03fc92dddd8a57faf8fa6` (2026-09-17, clean).
+  - Changed lines versus upstream: kernels_common 0, buffer_ops 0, tensor_shim 6, buffer_managers 6, fmha_fwd_prefill 39.
+  - All of those changes are import rewrites plus the inlined `get_lds_capacity_bytes`.
+- **Files read:** root `impl.py`, `_env.py`, `__init__.py`, `PROVENANCE.md`; the vendored kernel's host entry and its `O_VARIANT` / builder region (:175-185, :1447-1460, :2093-2264); `kernels_common.py`.
+- **Corpus, checked first** (knowledge HEAD 58b2134):
+  - `recipes/hd128.md` (last touched 8ebf3e4) differs from this job on every one of these fields:
+
+    | field | hd128.md | this job |
+    |---|---|---|
+    | `heads_q_per_kv` | pow2 in [8,256] | 4 |
+    | `format` | thd-varlen / sbhd | bshd |
+    | `direction` | fwd+bwd | fwd |
+    | `applies_to.arch` | gfx950 | gfx1250 |
+    | `determinism` | differs | — |
+    | implementation | Primus-Turbo FlyDSL, which refuses gfx1250 | — |
+
+    `softmax_scale` is the same value.
+  - `recipes/hd64.md`: head dim 64, gfx950.
+  - Nothing was taken from either recipe.
+- **Config edit (the only one):** `baseline/_env.py`.
+  - Old: `setdefault("TORCH_BLAS_PREFER_HIPBLASLT","0")`.
+  - New: it now ASSIGNS `TORCH_BLAS_PREFER_HIPBLASLT=1` and `HIPBLASLT_TENSILE_LIBPATH=/home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250`, and adds an `env_line()` helper.
+  - Why: the spec's runtime.env requires these values, and sitecustomize.py:18 makes a setdefault a no-op.
+  - Recorded in `op/baseline/PROVENANCE.md`.
+- **Effective values printed from inside every measuring process:** `ENV TORCH_BLAS_PREFER_HIPBLASLT=1 HIPBLASLT_TENSILE_LIBPATH=/home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250`.
+
+## 2. What was created and how it was verified
+
+| item | what | verified by |
+|---|---|---|
+| `op/baseline/` | the root copied verbatim, plus the `_env.py` edit and a PROVENANCE addendum | `diff -r` was empty before the edit; py_compile; toy smoke with `AMD_SERIALIZE_KERNEL=3` (rc 0); correctness runs in §4 |
+| `op/beat/` | `impl.py` wraps `aiter.ops.mha.fmha_fwd_with_sink_asm(..., sink=None)` from aiter-src and asserts the module path; `_env.py`; `PROVENANCE.md` (commit, .so and .co hashes) | smoke with `AMD_SERIALIZE_KERNEL=3`: aiter's `LoadKernel` line named the `_mask.co` and plain `.co`. Results: toy causal o 54.10 / lse 145.57 dB; toy non-causal 52.64 / 146.07; fast 53.56 / 147.17 |
+| `op/eager/` | `forward_reference` copied verbatim from the bwd job's `ut/common.py:53-82`, wrapped as `attn_fwd` | Python check: the lines are identical at `eager/impl.py:32`. The mask is built explicitly (`kj > qi + (skv-sq)`); SDPA is not used |
+| `op/ut/common.py`, `ut/test_correctness.py` | 3 spec shapes and 7 edge shapes (below); `load_impl` by PATH, getattr `attn_fwd` | ran through the runner (§4) |
+| `op/gates.py` | correctness check: poison, `isfinite` coverage, then o and lse SQNR separately. Also the 200-run bitwise determinism check | used by the runs in §4 |
+| `op/poison_util.py` | the bwd job's 0x7FC07FC0 poison sized to the largest output (docstring rewritten) | exercised in every correctness call |
+| `op/refcache_util.py`, `op/refcache/{fast,proxy,prod}.pt` | fp32 causal (o, lse). Provenance holds shape, dims, seed, and the sha of `eager/impl.py` and `ut/common.py`. On a mismatch it recomputes and says so | built via the runner (rc 0, all finite); served the spec-shape run (`ref=refcache`) |
+| `op/benchmark.py` | arms by name or `--arm-path`; median of 101; 8 s continuous warmup per arm; palindromic order; 256 MB L2 flush outside the events; sclk before and after; `op_flops.attention(..., backward=False)`; prints the ENV line and a per-arm import witness (impl file, kernel file, `O_VARIANT`); `RESULT ... stat= iters= latency_ms= tflops= bw_gbs=` | py_compile only. **Not run (stopped at step 6)** |
+| `op/validation.py` | details in the next table | py_compile only. **Not run (stopped at step 6)** |
+| `op/runner_util.py`, `op/drive.py` | the bwd job's detached-run helper, keyed by `op/.runs/<key>`: attaches to a run in flight, re-runs a finished one. SPEC/name changed to fwd | every GPU run above went through it |
+| not created | `op/current/`, `rounds/000/` | — |
+
+What `op/validation.py` does:
+
+1. Correctness on all 10 shapes, in every allowed causal mode.
+2. Determinism: 200 runs at fast.
+3. Speed: for each spec shape, one `benchmark.py` process that runs `candidate` and `beat` together.
+4. Pass condition: the geomean of candidate/beat is at least 1 + margin/100.
+   - The margin is read at runtime from the `beaten by N%` substring of `op.target.beat`, using tune.py's regex.
+   - The dB threshold is read from `op.precision_sqnr_db`.
+5. Arguments: one optional impl PATH, defaulting to `op/current`.
+6. Exit codes: 0 if everything passes, 2 on any failure.
+7. Output format: a `FAILED (n):` line followed by `  - ` bullets, which `core/gate.py` parses.
+
+**Grep gate:**
+
+```
+$ grep -rn "attn_bwd" JC/op/ ; echo "grep rc=$?"
+grep rc=1
+```
+
+This prints zero lines.
+
+## 3. Shapes
+
+| shape | b, sq, skv, hq, hkv, d | modes | purpose |
+|---|---|---|---|
+| fast / proxy / prod | from spec | causal | scored |
+| toy | 1,256,256,2,1,128 | causal, full | smoke; GQA 2 |
+| short_q | 1,128,512,4,1,128 | causal, full | sq below BLOCK_M=256; sq≠skv |
+| gqa4_batch2 | 2,256,256,8,2,128 | causal, full | the job's GQA 4 with batch > 1 |
+| mha | 1,256,256,4,4,128 | causal, full | GQA 1 |
+| unequal_seqlen | 1,512,1024,8,2,128 | causal, full | sq≠skv, so bottom-right applies |
+| unequal_seqlen2 | 2,1024,2048,4,1,128 | causal, full | sq≠skv with batch > 1 |
+| sq_gt_skv | 2,1024,512,4,1,128 | full only | bottom-right causal leaves empty rows here (NaN in every implementation) |
+
+## 4. Measurements
+
+Every row is the baseline measured through the runner, with the card exclusive (no other KFD holders). There are no speed columns, because steps 7–9 were not run. Run dirs: `op/.runs/ut_baseline_edges`, `op/.runs/ut_baseline_spec`.
+
+| shape | mode | o finite | o SQNR dB | lse SQNR dB | ref | pass |
+|---|---|---|---|---|---|---|
+| fast | causal | 1048576/1048576 | 51.23 | 85.48 | refcache | PASS |
+| proxy | causal | full | 50.89 | 88.24 | refcache | PASS |
+| prod | causal | full | 50.83 | 89.20 | refcache | PASS |
+| toy | causal | full | 51.86 | 81.85 | eager | PASS |
+| toy | full | full | 50.18 | 85.17 | eager | PASS |
+| short_q | causal | full | **49.93** | 86.44 | eager | **FAIL** |
+| short_q | full | full | **49.82** | 86.73 | eager | **FAIL** |
+| gqa4_batch2 | causal | full | 51.76 | 81.51 | eager | PASS |
+| gqa4_batch2 | full | full | 50.18 | 85.30 | eager | PASS |
+| mha | causal | full | 51.60 | 81.18 | eager | PASS |
+| mha | full | full | **49.98** | 85.15 | eager | **FAIL** |
+| unequal_seqlen | causal | full | **49.98** | 87.38 | eager | **FAIL** |
+| unequal_seqlen | full | full | **49.98** | 87.87 | eager | **FAIL** |
+| unequal_seqlen2 | causal | full | **49.97** | 88.36 | eager | **FAIL** |
+| unequal_seqlen2 | full | full | 50.00 | 88.79 | eager | PASS |
+| sq_gt_skv | full | full | **49.99** | 86.70 | eager | **FAIL** |
+
+- **Determinism:** 200 runs at fast, 200/200 bitwise identical (o=26a89a2db0cd, lse=d6ac8da1e101). PASS. This is the first time the gate has actually been executed on this machine.
+- **Speed (baseline / current / beat):** **not measured**; setup stopped at step 6.
+- **Sanity figures from the spec (2026-09-23, not this session):** at prod, FlyDSL runs 2.356 ms (933.5 TF/s) and ASM 1.557 ms (1412.5 TF/s).
+- **lse SQNR (the spec's OPEN item):** the baseline reads 81–89 dB and the ASM reads about 146 dB. Against a 50 dB bar, lse is nowhere near binding.
+
+## 5. Success condition and benchmark method
+
+**Success condition:** `validation.py` exits 0 only if both hold:
+
+1. On every shape and mode, o and lse are fully finite and each is ≥ 50 dB against op/eager, and o/lse are bitwise identical over 200 runs at fast.
+2. The geomean over fast/proxy/prod of candidate/beat TF/s, measured in the same benchmark process, is ≥ 1.00 ("beaten by 0%").
+
+**Benchmark statistic:** median of 101 CUDA-event-timed iterations per arm per shape, after 8 s of continuous warmup per arm, in palindromic order, with the L2 flushed outside the timing window.
+
+## 6. Live anchor
+
+**There is no live anchor.** Beat was never timed in this session, and neither were baseline and current, so there are no ratios. `current == baseline` agreement has not been shown. The import proof (`O_VARIANT` v3 → v1 → v3) has not been done.
+
+## 7. Inferences, weaknesses, and what the operator must decide
+
+- **The cause is inferred, not proven.** It is a precision floor rather than a bug:
+  - coverage is full everywhere;
+  - misses cluster at 49.8–50.0 dB;
+  - non-causal (longer rows, smaller |o|) is about 1.6 dB below causal at the same shape;
+  - the independent ASM kernel sits about 2.5 dB higher on the same reference.
+- **The reference also rounds.** The verbatim reference casts `o` to bf16, so the measured SQNR includes the reference's own rounding noise, not just the candidate's. Scoring against an unrounded fp32 `o` would likely raise every figure, by up to about 3 dB if the two rounding errors are independent.
+  - I did not change this: the spec says to copy that function verbatim.
+- **The spec shapes have little headroom.** They clear 50 dB by only 0.83–1.23 dB, below the 51.6 dB calibration quoted in the spec (which came from a different harness and different inputs).
+  - Any round that costs about 1 dB at prod will fail.
+- **Options, all needing an operator or spec change:**
+  - (a) Keep 50 dB for the spec shapes and set a lower documented floor (for example 49.5 dB) for the edge shapes.
+  - (b) Score `o` against an fp32 (unrounded) reference, which is a deviation from "verbatim".
+  - (c) Lower `precision_sqnr_db` globally.
+  - (d) Drop the failing edge shapes. Not recommended: step 5 requires a seqlen_q≠seqlen_kv shape, and every such shape fails by 0.02 dB.
+  - Once one is chosen, rerun `ut/test_correctness.py`, then continue at step 7. The tooling is already written.
+- **Other weaknesses of the baseline:**
+  - Its lse is about 60 dB less precise than the ASM's (81–89 vs about 146 dB). This is harmless at the current bar, but relevant if lse feeds a backward.
+  - flydsl emits a `Pointer`-vs-`Tensor` annotation UserWarning on every build. This is noise.
+- **Beat caveat:** the beat's causal alignment for sq≠skv is untested. It is only used at the equal-length spec shapes.
+- **Housekeeping:**
+  - Runs inside the container write as root. I chowned `op/` back to uid 12850 and deleted the `__pycache__` directories.
+  - Later runs pass `PYTHONDONTWRITEBYTECODE=1`, but the framework's own gate run does not.
+- **Card health:**
+  - The dmesg monitor was armed for all GPU work and produced zero events.
+  - No KFD holders afterwards. sclk 1100 MHz (VR-throttled, as known).
+  - The monitor was stopped at the end.
+
+
+---
+
+## Review verdict
+
+- 2026-09-25T12:01:13 -- approved (non_interactive)
+
+
+---
+
+## Review verdict
+
+- 2026-09-25T12:16:10 -- approved (non_interactive)
+
+
+---
+
+## Review verdict
+
+- 2026-09-25T12:38:23 -- approved (non_interactive)
+
+
+---
+
+## Review verdict
+
+- 2026-09-27T08:30:04 -- approved (non_interactive)
+
+
+---
+
+## Review verdict
+
+- 2026-09-27T12:35:50 -- approved (non_interactive)
+
+[review] no terminal to ask; approved automatically
+  0-setup: round 0 is on disk; op/current/ is round 6
+round 6 (fast):
+  2-reflect: done
+round 7 (fast):
+    1-opt: the reply holds no fenced yaml block; asking for the block alone
+    1-opt: delivered
+    gate: validation.py exit 2
+    gate: output kept at /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/007/gate.log
+    gate: act.yaml reported validation exit VAL_RC; the framework's run exited 2
+    not accepted: throughput 1.0030x its best ever does not improve on it by more than the 0.70% it must clear (score 0.81510, incumbent 0.81145)
+  1-opt: done
+  2-reflect: done
+round 8 (fast):
+    1-opt: delivered
+    gate: validation.py exit 2
+    gate: output kept at /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/008/gate.log
+    not accepted: proxy: 1576.5 is 98.7% of its best ever 1596.5
+  1-opt: done
+  2-reflect: done
+round 9 (fast):
+    1-opt/plan: h23 (advise) is outstanding and is not in the Route table: L13+L14 TDM prefetch depth 3 and clean-loop unroll x2 -- 4 compiled arms (proto `unroll`); asking for the table again (1/2)
+    1-opt/plan: route accepted after 1 re-ask(s)
+  0-setup/job_setup: done at v000, skipping the agent
+
+======================================================================
+review: /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/job_context/history/review/job_setup_v000.md
+======================================================================
+# Job Setup v000 -- gfx1250-flydsl-attn-fwd-20260925-114644
+
+**SUCCESS** -- all four LLM roles answer and resume; host, container, GPU (gfx1250, id 0), rocm-smi and torch verified; all five runner checks pass (including the decoder). Four spec conflicts were resolved and are listed below for your review. The most consequential is R4: the vendored baseline `_env.py` sets the BLAS variable to the wrong value, and Op Setup must fix it.
+
+## Account checks (`logs/step3_llm_accounts.log`)
+
+| Item | Expected | Observed | Pass |
+| --- | --- | --- | --- |
+| setup: claude / claude-opus-5-5 call | answers | answered in 1.69 s | pass |
+| setup: session resume | context intact | resumed, context intact | pass |
+| profiler: claude / claude-opus-5-5 call | answers | answered in 1.49 s | pass |
+| profiler: session resume | context intact | resumed, context intact | pass |
+| planner: claude / claude-opus-5-5 call | answers | answered in 2.03 s | pass |
+| planner: session resume | context intact | resumed, context intact | pass |
+| reviewer: codex / gpt-5.6-sol call | answers | answered in 2.97 s | pass |
+| reviewer: session resume | context intact | resumed, context intact | pass |
+| account files | anthropic file + openai file | `.op_evolve_openai` is a symlink to `.op_evolve_anthropic` (contents not read) | pass |
+
+## Environment checks (`logs/step4_environment.log`, `logs/step5_runner.log`)
+
+| Item | Expected | Observed | Pass |
+| --- | --- | --- | --- |
+| ssh hops | none (`ssh: null`) | none; `hostname` = heliosr-1b114-c07-1, local docker | pass |
+| container | existing `fa-repro`, attach only | running, image fa-tune:deps, started 11:33:03Z; ipc/net host, shm 16 GiB, seccomp unconfined, kfd+dri, groups video/993, `/home/lihuzhan` bind | pass |
+| GPU present | 1 card | 1 (torch count 1, rocm-smi GPU[0]), 256 CUs, 432 GiB | pass |
+| gpu_arch | gfx1250 | gfx1250 (rocm-smi and torch) | pass |
+| gpu_id 0 usable | yes | torch ops and a bf16 GEMM ran on it | pass |
+| card free | backward job stopped | no bwd op-evolve process; 0% use, no KFD PIDs; container runs only `sleep infinity` | pass |
+| card health | no fault signatures | dmesg since boot: only the boot-time VR throttle warning; sclk DPM 500/1100 MHz; dmesg monitor clean during all checks | pass |
+| rocm-smi | installed, runs | `/opt/venv/bin/rocm-smi` rc=0; ROCM-SMI 4.0.0, LIB 7.8.0, driver 7.1.1.31300009 | pass |
+| torch | imports, sees GPU, runs op | 2.11.0+rocm7.14.0a20260625, hip 7.14.60850; elementwise and GEMM OK | pass |
+| job BLAS env | `=1` + LIBPATH takes effect when assigned | default in container is `0` (sitecustomize setdefault); with `-e` assigned: `1`, backend Cublaslt(hipBLASLt), GEMM finite | pass |
+| flydsl selection | 0.3.4.1 from flydsl0341 | 0.3.4.1 at `/home/lihuzhan/.local/flydsl0341/flydsl` | pass |
+| sudo | (policy false) | `sudo -n true` succeeds; not used by the job | info |
+| runner: reach | ok | heliosr-1b114-c07-1 (kfd) via docker | pass |
+| runner: torch gemm | ok | 4096^3 bf16 5.019 ms, 27.4 TFLOP/s (a cold figure: an immediate re-run measured 75.0) | pass |
+| runner: shared path | same dir both sides | verified both directions | pass |
+| runner: counters | rocprofv3 rows | GRBM_COUNT, 29 rows | pass |
+| runner: ATT decoder | recorded | reachable | pass |
+
+## Resolved op spec
+
+| Field | Value | Source |
+| --- | --- | --- |
+| job.name / id / started_at | gfx1250-flydsl-attn-fwd / 20260925-114644 / 2026-09-25T11:46:44 | user / framework / framework |
+| op.type, backend | attention, [flydsl] | user |
+| config | causal bottom-right, no window, dense, no sink, hd 128/128, GQA 4, BSHD, fwd only | user |
+| softmax_scale | 0.08838834764831845 | user |
+| dtype | qkv/out bf16; qk_acc, softmax, pv_acc, lse fp32 | user |
+| reference | fp32 torch `forward_reference`, copied as a function from the bwd job's `op/ut/common.py:53-82` | user |
+| api | `attn_fwd(q,k,v,softmax_scale=None,causal=True) -> (o, lse)`; lse natural log [b,hq,sq] | user |
+| baseline.root | `.../Primus-Turbo/output/0925__flydsl/fwd-job/op_baseline` (present, non-empty, no aiter import, `attn_fwd` at impl.py:124) | user; contents observed |
+| baseline import rewrites | 11 sites; `get_lds_capacity_bytes` inlined | observed (R6) |
+| precision gate | o and lse separately ≥ 50 dB, NaN-prefill plus an isfinite check | user |
+| determinism gate | o and lse bitwise identical over 200 runs at the fast shape | user (still unverified; Op Setup runs it) |
+| shapes (sweep, no guards) | (1,1024,8/2), (1,4096,32/8), (4,8192,32/8); flop 2.14958e9 / 1.37473e11 / 2.19929e12 | user |
+| target | aiter ASM `fmha_fwd_with_sink_asm`, sink=None, "beaten by 0%", measured in the same run; tflops/roofline null | user |
+| evolve | max_rounds 30, max_timeout 120h (=432000 s), min_gain 0.007, fast_rounds 4, fast_per_deep 4, turn_timeout null | user; 432000 s resolved (R3) |
+| runtime | local docker attach `fa-repro`, not owned, gpu 0, pool [], sudo false | user; observed |
+| python_path | flydsl0341, then aiter-src (documentation only; each `_env.py` applies it) | user; resolved (R4) |
+| env | TORCH_BLAS_PREFER_HIPBLASLT=1 and HIPBLASLT_TENSILE_LIBPATH, assigned (not setdefault) | user |
+| flydsl version | 0.3.4.1 | resolved (R2) |
+| review.auto_approve_after | 10m | user |
+
+## Inferred / resolved conflicts
+
+- **R1** The header's "backward job is LIVE on the card" is historical. Its state.yaml ends in `resumed` at 08:35 with no `stopped`, but no process for it is running, and the host rebooted around 10:11. **Do not `op-evolve resume` the backward job while this job is running.**
+- **R2** The header prose and `sources` notes require flydsl **0.3.2 / flydsl032**. `python_path`, `observed.flydsl_selected` and the vendored `_env.py` all say **0.3.4.1 / flydsl0341**. Resolved to 0.3.4.1, the dated structured fields.
+- **R3** Prose in the `evolve` section still argues for 12 rounds, min_gain 0.015 and 6 fast rounds. The fields dated 2026-09-25 say 30 / 0.007 / 4 and win. The `max_timeout` comment "= 172800 s" is wrong: 120h = 432000 s.
+- **R4 (needs Op Setup action)** `op_baseline/_env.py` does `setdefault("TORCH_BLAS_PREFER_HIPBLASLT","0")` and never sets `HIPBLASLT_TENSILE_LIBPATH`, which contradicts `runtime.env`. Because sitecustomize already sets 0, that setdefault leaves the value at 0. No framework code reads `runtime.env` or `python_path`. `OPEVOLVE_KEEP_BLAS_ENV` exists nowhere, in either op_evolve/ or sitecustomize.
+- **R5** Line numbers in the spec refer to the aiter-src original. In the vendored copy they are +31, e.g. `O_VARIANT` :150 becomes :181.
+- **R6 / R7** 11 rewrites, not 8. The kernel is 2264 lines vendored and 2233 in the original.
+
+## Still unresolved (belongs to Op Setup, not verified here)
+
+- The 200-run bitwise determinism gate has never been run.
+- Whether 50 dB is the right bar for fp32 `lse` is open. Op Setup must report the baseline lse SQNR.
+- The import proof (O_VARIANT v3→v1→v3 moves the number, confirmed by descriptor) is not done yet.
+- The ASM target's first-call JIT build time has not been measured.
+- The `min_gain` 0.007 noise floor has not been re-measured on today's boot.
+
+
+---
+
+## Review verdict
+
+- 2026-09-25T11:51:00 -- approved (non_interactive)
+
+
+---
+
+## Review verdict
+
+- 2026-09-25T12:16:10 -- approved (non_interactive)
+
+
+---
+
+## Review verdict
+
+- 2026-09-25T12:38:23 -- approved (non_interactive)
+
+
+---
+
+## Review verdict
+
+- 2026-09-27T08:30:04 -- approved (non_interactive)
+
+
+---
+
+## Review verdict
+
+- 2026-09-27T12:35:50 -- approved (non_interactive)
+
+
+---
+
+## Review verdict
+
+- 2026-09-27T14:19:45 -- approved (non_interactive)
+
+[review] no terminal to ask; approved automatically
+  0-setup/op_setup: done at v000, skipping the agent
+
+======================================================================
+review: /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/job_context/history/review/op_setup_v000.md
+======================================================================
+# Op Setup v000 — gfx1250-flydsl-attn-fwd
+
+**FAILED — the baseline misses the 50 dB `o` precision gate on 7 of 13 edge-shape cases (49.82–49.98 dB, every buffer fully covered). Per step 6 ("stop on any failure"), steps 7–9 were not run: no benchmark measurement and no validation run.**
+
+The three spec shapes pass (o 51.23 / 50.89 / 50.83 dB). The 200-run determinism gate passes. The beat arm works. The misses are a precision floor about 0.02–0.2 dB below the bar, not unwritten output. Clearing it needs an operator decision (options in §7), not a kernel fix from setup.
+
+## 1. Branch, source, commit, config diff
+
+- **Branch:** "neither corpus nor from-scratch: baseline supplied by op.baseline.root, copied verbatim". This is the branch the spec mandates.
+- **Source:** `/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0925__flydsl/fwd-job/op_baseline/`
+  - Copied with `rsync -a --exclude __pycache__`.
+  - `diff -r` against the root was empty before the one edit below.
+- **Upstream commit:** `/home/lihuzhan/code/aiter-src` HEAD `6963ae9d77acb207d8f03fc92dddd8a57faf8fa6` (2026-09-17, clean).
+  - Changed lines versus upstream: kernels_common 0, buffer_ops 0, tensor_shim 6, buffer_managers 6, fmha_fwd_prefill 39.
+  - All of those changes are import rewrites plus the inlined `get_lds_capacity_bytes`.
+- **Files read:** root `impl.py`, `_env.py`, `__init__.py`, `PROVENANCE.md`; the vendored kernel's host entry and its `O_VARIANT` / builder region (:175-185, :1447-1460, :2093-2264); `kernels_common.py`.
+- **Corpus, checked first** (knowledge HEAD 58b2134):
+  - `recipes/hd128.md` (last touched 8ebf3e4) differs from this job on every one of these fields:
+
+    | field | hd128.md | this job |
+    |---|---|---|
+    | `heads_q_per_kv` | pow2 in [8,256] | 4 |
+    | `format` | thd-varlen / sbhd | bshd |
+    | `direction` | fwd+bwd | fwd |
+    | `applies_to.arch` | gfx950 | gfx1250 |
+    | `determinism` | differs | — |
+    | implementation | Primus-Turbo FlyDSL, which refuses gfx1250 | — |
+
+    `softmax_scale` is the same value.
+  - `recipes/hd64.md`: head dim 64, gfx950.
+  - Nothing was taken from either recipe.
+- **Config edit (the only one):** `baseline/_env.py`.
+  - Old: `setdefault("TORCH_BLAS_PREFER_HIPBLASLT","0")`.
+  - New: it now ASSIGNS `TORCH_BLAS_PREFER_HIPBLASLT=1` and `HIPBLASLT_TENSILE_LIBPATH=/home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250`, and adds an `env_line()` helper.
+  - Why: the spec's runtime.env requires these values, and sitecustomize.py:18 makes a setdefault a no-op.
+  - Recorded in `op/baseline/PROVENANCE.md`.
+- **Effective values printed from inside every measuring process:** `ENV TORCH_BLAS_PREFER_HIPBLASLT=1 HIPBLASLT_TENSILE_LIBPATH=/home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250`.
+
+## 2. What was created and how it was verified
+
+| item | what | verified by |
+|---|---|---|
+| `op/baseline/` | the root copied verbatim, plus the `_env.py` edit and a PROVENANCE addendum | `diff -r` was empty before the edit; py_compile; toy smoke with `AMD_SERIALIZE_KERNEL=3` (rc 0); correctness runs in §4 |
+| `op/beat/` | `impl.py` wraps `aiter.ops.mha.fmha_fwd_with_sink_asm(..., sink=None)` from aiter-src and asserts the module path; `_env.py`; `PROVENANCE.md` (commit, .so and .co hashes) | smoke with `AMD_SERIALIZE_KERNEL=3`: aiter's `LoadKernel` line named the `_mask.co` and plain `.co`. Results: toy causal o 54.10 / lse 145.57 dB; toy non-causal 52.64 / 146.07; fast 53.56 / 147.17 |
+| `op/eager/` | `forward_reference` copied verbatim from the bwd job's `ut/common.py:53-82`, wrapped as `attn_fwd` | Python check: the lines are identical at `eager/impl.py:32`. The mask is built explicitly (`kj > qi + (skv-sq)`); SDPA is not used |
+| `op/ut/common.py`, `ut/test_correctness.py` | 3 spec shapes and 7 edge shapes (below); `load_impl` by PATH, getattr `attn_fwd` | ran through the runner (§4) |
+| `op/gates.py` | correctness check: poison, `isfinite` coverage, then o and lse SQNR separately. Also the 200-run bitwise determinism check | used by the runs in §4 |
+| `op/poison_util.py` | the bwd job's 0x7FC07FC0 poison sized to the largest output (docstring rewritten) | exercised in every correctness call |
+| `op/refcache_util.py`, `op/refcache/{fast,proxy,prod}.pt` | fp32 causal (o, lse). Provenance holds shape, dims, seed, and the sha of `eager/impl.py` and `ut/common.py`. On a mismatch it recomputes and says so | built via the runner (rc 0, all finite); served the spec-shape run (`ref=refcache`) |
+| `op/benchmark.py` | arms by name or `--arm-path`; median of 101; 8 s continuous warmup per arm; palindromic order; 256 MB L2 flush outside the events; sclk before and after; `op_flops.attention(..., backward=False)`; prints the ENV line and a per-arm import witness (impl file, kernel file, `O_VARIANT`); `RESULT ... stat= iters= latency_ms= tflops= bw_gbs=` | py_compile only. **Not run (stopped at step 6)** |
+| `op/validation.py` | details in the next table | py_compile only. **Not run (stopped at step 6)** |
+| `op/runner_util.py`, `op/drive.py` | the bwd job's detached-run helper, keyed by `op/.runs/<key>`: attaches to a run in flight, re-runs a finished one. SPEC/name changed to fwd | every GPU run above went through it |
+| not created | `op/current/`, `rounds/000/` | — |
+
+What `op/validation.py` does:
+
+1. Correctness on all 10 shapes, in every allowed causal mode.
+2. Determinism: 200 runs at fast.
+3. Speed: for each spec shape, one `benchmark.py` process that runs `candidate` and `beat` together.
+4. Pass condition: the geomean of candidate/beat is at least 1 + margin/100.
+   - The margin is read at runtime from the `beaten by N%` substring of `op.target.beat`, using tune.py's regex.
+   - The dB threshold is read from `op.precision_sqnr_db`.
+5. Arguments: one optional impl PATH, defaulting to `op/current`.
+6. Exit codes: 0 if everything passes, 2 on any failure.
+7. Output format: a `FAILED (n):` line followed by `  - ` bullets, which `core/gate.py` parses.
+
+**Grep gate:**
+
+```
+$ grep -rn "attn_bwd" JC/op/ ; echo "grep rc=$?"
+grep rc=1
+```
+
+This prints zero lines.
+
+## 3. Shapes
+
+| shape | b, sq, skv, hq, hkv, d | modes | purpose |
+|---|---|---|---|
+| fast / proxy / prod | from spec | causal | scored |
+| toy | 1,256,256,2,1,128 | causal, full | smoke; GQA 2 |
+| short_q | 1,128,512,4,1,128 | causal, full | sq below BLOCK_M=256; sq≠skv |
+| gqa4_batch2 | 2,256,256,8,2,128 | causal, full | the job's GQA 4 with batch > 1 |
+| mha | 1,256,256,4,4,128 | causal, full | GQA 1 |
+| unequal_seqlen | 1,512,1024,8,2,128 | causal, full | sq≠skv, so bottom-right applies |
+| unequal_seqlen2 | 2,1024,2048,4,1,128 | causal, full | sq≠skv with batch > 1 |
+| sq_gt_skv | 2,1024,512,4,1,128 | full only | bottom-right causal leaves empty rows here (NaN in every implementation) |
+
+## 4. Measurements
+
+Every row is the baseline measured through the runner, with the card exclusive (no other KFD holders). There are no speed columns, because steps 7–9 were not run. Run dirs: `op/.runs/ut_baseline_edges`, `op/.runs/ut_baseline_spec`.
+
+| shape | mode | o finite | o SQNR dB | lse SQNR dB | ref | pass |
+|---|---|---|---|---|---|---|
+| fast | causal | 1048576/1048576 | 51.23 | 85.48 | refcache | PASS |
+| proxy | causal | full | 50.89 | 88.24 | refcache | PASS |
+| prod | causal | full | 50.83 | 89.20 | refcache | PASS |
+| toy | causal | full | 51.86 | 81.85 | eager | PASS |
+| toy | full | full | 50.18 | 85.17 | eager | PASS |
+| short_q | causal | full | **49.93** | 86.44 | eager | **FAIL** |
+| short_q | full | full | **49.82** | 86.73 | eager | **FAIL** |
+| gqa4_batch2 | causal | full | 51.76 | 81.51 | eager | PASS |
+| gqa4_batch2 | full | full | 50.18 | 85.30 | eager | PASS |
+| mha | causal | full | 51.60 | 81.18 | eager | PASS |
+| mha | full | full | **49.98** | 85.15 | eager | **FAIL** |
+| unequal_seqlen | causal | full | **49.98** | 87.38 | eager | **FAIL** |
+| unequal_seqlen | full | full | **49.98** | 87.87 | eager | **FAIL** |
+| unequal_seqlen2 | causal | full | **49.97** | 88.36 | eager | **FAIL** |
+| unequal_seqlen2 | full | full | 50.00 | 88.79 | eager | PASS |
+| sq_gt_skv | full | full | **49.99** | 86.70 | eager | **FAIL** |
+
+- **Determinism:** 200 runs at fast, 200/200 bitwise identical (o=26a89a2db0cd, lse=d6ac8da1e101). PASS. This is the first time the gate has actually been executed on this machine.
+- **Speed (baseline / current / beat):** **not measured**; setup stopped at step 6.
+- **Sanity figures from the spec (2026-09-23, not this session):** at prod, FlyDSL runs 2.356 ms (933.5 TF/s) and ASM 1.557 ms (1412.5 TF/s).
+- **lse SQNR (the spec's OPEN item):** the baseline reads 81–89 dB and the ASM reads about 146 dB. Against a 50 dB bar, lse is nowhere near binding.
+
+## 5. Success condition and benchmark method
+
+**Success condition:** `validation.py` exits 0 only if both hold:
+
+1. On every shape and mode, o and lse are fully finite and each is ≥ 50 dB against op/eager, and o/lse are bitwise identical over 200 runs at fast.
+2. The geomean over fast/proxy/prod of candidate/beat TF/s, measured in the same benchmark process, is ≥ 1.00 ("beaten by 0%").
+
+**Benchmark statistic:** median of 101 CUDA-event-timed iterations per arm per shape, after 8 s of continuous warmup per arm, in palindromic order, with the L2 flushed outside the timing window.
+
+## 6. Live anchor
+
+**There is no live anchor.** Beat was never timed in this session, and neither were baseline and current, so there are no ratios. `current == baseline` agreement has not been shown. The import proof (`O_VARIANT` v3 → v1 → v3) has not been done.
+
+## 7. Inferences, weaknesses, and what the operator must decide
+
+- **The cause is inferred, not proven.** It is a precision floor rather than a bug:
+  - coverage is full everywhere;
+  - misses cluster at 49.8–50.0 dB;
+  - non-causal (longer rows, smaller |o|) is about 1.6 dB below causal at the same shape;
+  - the independent ASM kernel sits about 2.5 dB higher on the same reference.
+- **The reference also rounds.** The verbatim reference casts `o` to bf16, so the measured SQNR includes the reference's own rounding noise, not just the candidate's. Scoring against an unrounded fp32 `o` would likely raise every figure, by up to about 3 dB if the two rounding errors are independent.
+  - I did not change this: the spec says to copy that function verbatim.
+- **The spec shapes have little headroom.** They clear 50 dB by only 0.83–1.23 dB, below the 51.6 dB calibration quoted in the spec (which came from a different harness and different inputs).
+  - Any round that costs about 1 dB at prod will fail.
+- **Options, all needing an operator or spec change:**
+  - (a) Keep 50 dB for the spec shapes and set a lower documented floor (for example 49.5 dB) for the edge shapes.
+  - (b) Score `o` against an fp32 (unrounded) reference, which is a deviation from "verbatim".
+  - (c) Lower `precision_sqnr_db` globally.
+  - (d) Drop the failing edge shapes. Not recommended: step 5 requires a seqlen_q≠seqlen_kv shape, and every such shape fails by 0.02 dB.
+  - Once one is chosen, rerun `ut/test_correctness.py`, then continue at step 7. The tooling is already written.
+- **Other weaknesses of the baseline:**
+  - Its lse is about 60 dB less precise than the ASM's (81–89 vs about 146 dB). This is harmless at the current bar, but relevant if lse feeds a backward.
+  - flydsl emits a `Pointer`-vs-`Tensor` annotation UserWarning on every build. This is noise.
+- **Beat caveat:** the beat's causal alignment for sq≠skv is untested. It is only used at the equal-length spec shapes.
+- **Housekeeping:**
+  - Runs inside the container write as root. I chowned `op/` back to uid 12850 and deleted the `__pycache__` directories.
+  - Later runs pass `PYTHONDONTWRITEBYTECODE=1`, but the framework's own gate run does not.
+- **Card health:**
+  - The dmesg monitor was armed for all GPU work and produced zero events.
+  - No KFD holders afterwards. sclk 1100 MHz (VR-throttled, as known).
+  - The monitor was stopped at the end.
+
+
+---
+
+## Review verdict
+
+- 2026-09-25T12:01:13 -- approved (non_interactive)
+
+
+---
+
+## Review verdict
+
+- 2026-09-25T12:16:10 -- approved (non_interactive)
+
+
+---
+
+## Review verdict
+
+- 2026-09-25T12:38:23 -- approved (non_interactive)
+
+
+---
+
+## Review verdict
+
+- 2026-09-27T08:30:04 -- approved (non_interactive)
+
+
+---
+
+## Review verdict
+
+- 2026-09-27T12:35:50 -- approved (non_interactive)
+
+
+---
+
+## Review verdict
+
+- 2026-09-27T14:19:45 -- approved (non_interactive)
+
+[review] no terminal to ask; approved automatically
+  0-setup: round 0 is on disk; op/current/ is round 6
+round 9 (fast):
+    1-opt: an unfinished attempt was moved to 1-opt.stale-20260927T154032
+child process pid 2028647 exit status already read:  will report returncode 255
+    1-opt: delivered
+    gate: validation.py exit 2
+    gate: output kept at /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/009/gate.log
+    not accepted: throughput 0.9984x its best ever does not improve on it by more than the 0.70% it must clear (score 0.91559, incumbent 0.91721)
+  1-opt: done
+  2-reflect: done
+round 10 (deep):
+    0-refactor: executing operator hint h39 -- Adopt round 9 arm BG verbatim as op/current (h37 m16x8 gate + r7.i2.g18): beats r6 on every shape in-session; rejected only by best-ever records of unshipped arms
+    0-refactor: correct against op/eager (after 1 turn)
+    hints: op/current/ is round 10 -- the new structure; champions cleared
+    00_preflight: done
+    01_select: done
+    02_counters, 03_metrics, 04_thread_trace: in parallel on GPU 0
+    02_counters: ok
+    03_metrics: skipped
+    04_thread_trace: skipped
+    05_power_wall: skipped, the node is not idle
+    06_bound: ok
+    07_summary: done
+  1-profiling: done
+    00_analyse: planner answered
+    00_analyse: reviewer answered
+    01_synthesis: planner answered
+    02_review: reviewer answered
+    03_response: planner answered
+    04_close: reviewer answered
+    05_finalize: planner answered
+  2-plan: done
+    00_feasibility: True
+    01_implement: delivered
+    02_measure: done
+    03_verify: done
+    04_report: delivered
+    gate: validation.py exit 2
+    gate: output kept at /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/010/gate.log
+    not accepted: prod: 1491.8 is 99.3% of its best ever 1502.5
+    not accepted: throughput 0.9972x its best ever does not improve on it by more than the 0.70% it must clear (score 0.96728, incumbent 0.96995)
+  3-act: done
+    00_analyse: done
+    02_write: done
+  4-reflect: done
+round 11 (fast):
+    1-opt/plan: h28 (must) is outstanding and is not in the Route table: A0 results for rounds 5-7 (their fork of this job): three losses and one harness artifact -- read before choosing; asking for the table again (1/2)
+child process pid 2703174 exit status already read:  will report returncode 255
+    1-opt/plan: route accepted after 1 re-ask(s)
+    1-opt: delivered
+    gate: validation.py exit 2
+    gate: output kept at /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/011/gate.log
+    accepted: 1.0271x its best ever (score 0.99358 over 0.96868); op/current/ is round 11
+  1-opt: done
+  2-reflect: done
+round 12 (fast):
+    1-opt/plan: h28 (must) is outstanding and is not in the Route table: A0 results for rounds 5-7 (their fork of this job): three losses and one harness artifact -- read before choosing; asking for the table again (1/2)
+    1-opt/plan: route accepted after 1 re-ask(s)
+    1-opt: delivered
+    gate: validation.py exit 2
+    gate: output kept at /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/012/gate.log
+    not accepted: fast: was at target and fell to 151.4 of 154.6
+    not accepted: throughput 0.9925x its best ever does not improve on it by more than the 0.70% it must clear (score 0.98867, incumbent 0.99617)
+  1-opt: done
+  2-reflect: done
+round 13 (fast):
+    1-opt: delivered
+    gate: validation.py exit 2
+    gate: output kept at /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/013/gate.log
+    accepted: 1.0181x its best ever (score 1.01198 over 0.99396); op/current/ is round 13
+  1-opt: done
+  2-reflect: done
+round 14 (fast):
+    1-opt: delivered
+    gate: validation.py exit 2
+    gate: output kept at /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/014/gate.log
+    not accepted: throughput 0.9832x its best ever does not improve on it by more than the 0.70% it must clear (score 1.01124, incumbent 1.02967)
+  1-opt: done
+  2-reflect: done
+round 15 (deep):
+    00_preflight: done
+    01_select: done
+    02_counters, 03_metrics, 04_thread_trace: in parallel on GPU 0
+    02_counters: ok
+    03_metrics: skipped
+    04_thread_trace: skipped
+    05_power_wall: skipped, the node is not idle
+    06_bound: ok
+    07_summary: done
+  1-profiling: done
+    00_analyse: planner answered
+    00_analyse: reviewer answered
+    01_synthesis: planner answered
+    02_review: reviewer answered
+    03_response: planner answered
+    04_close: reviewer answered
+    05_finalize: planner answered
+  2-plan: done
+    00_feasibility: True
+Background tasks still running after 600s; terminating. Set CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 to wait indefinitely.
+    01_implement: delivered
+    02_measure: done
+    03_verify: done
+    04_report: delivered
+    gate: validation.py exit 2
+    gate: output kept at /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/015/gate.log
+    not accepted: throughput 1.0000x its best ever does not improve on it by more than the 0.70% it must clear (score 1.03191, incumbent 1.03201)
+  3-act: done
+    00_analyse: done
+    02_write: done
+  4-reflect: done
+round 16 (fast):
+    0-refactor: executing operator hint h44 -- Adopt r13ns verbatim as op/current (r13 with SPEC_STALE_MAX=False): real data + training clock 12-23% faster, e2e fwd 53-60 -> 49 ms/step; output bitwise = r13; randn ruler reads it 4.8% slower (ruler bias)
+    0-refactor: correct against op/eager (after 1 turn)
+    hints: op/current/ is round 16 -- the new structure; champions cleared
+    1-opt/plan: h25 (advise) is outstanding and is not in the Route table: L3+L29 in-WG q-tile pairing -- O-store overlap only, dispatch gain is zero (proto `pairing`); asking for the table again (1/2)
+    1-opt/plan: route accepted after 1 re-ask(s)
+    1-opt: delivered
+    gate: validation.py exit 2
+    gate: output kept at /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/016/gate.log
+    not accepted: throughput 1.0018x its best ever does not improve on it by more than the 0.70% it must clear (score 0.97287, incumbent 0.97113)
+  1-opt: done
+  2-reflect: done
+round 17 (fast):
+    1-opt: delivered
+    gate: validation.py exit 2
+    gate: output kept at /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/017/gate.log
+    not accepted: throughput 1.0032x its best ever does not improve on it by more than the 0.70% it must clear (score 0.98636, incumbent 0.98337)
+  1-opt: done
+  2-reflect: done
+round 18 (fast):
+    1-opt/plan: h47 (must) is outstanding and is not in the Route table: REDIRECT after 4 non-improving rounds (r14-r17): the remaining prod gap is issued work x clock sensitivity; rank candidates on the REAL dumps after a GEMM burst as well as randn, and target instruction count on the prod m32x8 hot loop; asking for the table again (1/2)
+    1-opt/plan: route accepted after 1 re-ask(s)
+    1-opt: delivered
+    gate: validation.py exit 2
+    gate: output kept at /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/018/gate.log
+    not accepted: throughput 1.0027x its best ever does not improve on it by more than the 0.70% it must clear (score 0.99572, incumbent 0.99330)
+  1-opt: done
+  2-reflect: done
+round 19 (fast):
+    1-opt: delivered
+    gate: validation.py exit 2
+    gate: output kept at /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/rounds/019/gate.log
+    not accepted: throughput 0.9998x its best ever does not improve on it by more than the 0.70% it must clear (score 0.98732, incumbent 0.98743)
+  1-opt: done
+  2-reflect: done
+round 20 (deep):
+    00_preflight: done
+    01_select: done
+    02_counters, 03_metrics, 04_thread_trace: in parallel on GPU 0
+    02_counters: ok
+    03_metrics: skipped
+    04_thread_trace: skipped
+    05_power_wall: ok
+    06_bound: ok
+    07_summary: done
+  1-profiling: done
+    00_analyse: planner answered
+    00_analyse: reviewer answered
+    01_synthesis: planner answered
+    02_review: reviewer answered
+    03_response: planner answered
+    04_close: reviewer answered
+    05_finalize: planner answered
+  2-plan: done
+    00_feasibility: True

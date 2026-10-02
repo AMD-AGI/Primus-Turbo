@@ -1,0 +1,12 @@
+_env.py: OK
+flydsl_fwd/buffer_ops.py: OK
+flydsl_fwd/fmha_b16_buffer_managers.py: OK
+flydsl_fwd/fmha_fwd_prefill_a16w16_m16x8.py: OK
+flydsl_fwd/fmha_fwd_prefill_a16w16_m32x2.py: OK
+flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py: OK
+flydsl_fwd/__init__.py: OK
+flydsl_fwd/kernels_common.py: OK
+flydsl_fwd/tensor_shim.py: OK
+impl.py: OK
+__init__.py: OK
+op/current == git output/0927__b0/champions/fwd_r16_r13ns (diff -rq empty)

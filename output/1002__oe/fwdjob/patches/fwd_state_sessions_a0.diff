@@ -1,0 +1,23 @@
+--- job_context/state.yaml.bak.pre-a0-1002
++++ job_context/state.yaml
+@@ -41,6 +41,10 @@
+ - at: '2026-09-28T01:47:22'
+   event: resumed
+   spec_version: v000
++- at: '2026-10-02T10:31:53'
++  event: hand_edit
++  reason: 'A0 1002: restored from the B0 backup; round 20 sessions removed (planner d694338b, reviewer 82966052:
++    B0-only Claude sessions, so act/reflect start fresh agents from the files); see PT/output/1002__oe/FWDJOB.md'
+ best_round: 16
+ champions:
+   fast: 19
+@@ -977,9 +981,6 @@
+     act: 358.9
+     round: 2019.5
+   bound: power
+-  sessions:
+-    planner: d694338b-7e16-4b10-a4cd-658bb1ea8e13
+-    reviewer: 82966052-afe9-4407-948b-657df93c4362
+ hint_attempts:
+   h39: 1
+   h44: 1

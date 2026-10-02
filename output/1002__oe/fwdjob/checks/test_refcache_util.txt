@@ -1,0 +1,26 @@
+eager/impl.py sha16 now 5584c5bebd6516a5, ut/common.py e6f623771c679b7a
+PASS  fast causal served from refcache  refcache
+PASS  proxy causal served from refcache  refcache
+PASS  prod causal served from refcache  refcache
+PASS  toy causal=True on the CPU  cpu (no cache)
+PASS  toy causal=False on the CPU  cpu (non-causal)
+PASS  short_q causal=True on the CPU  cpu (no cache)
+PASS  short_q causal=False on the CPU  cpu (non-causal)
+PASS  gqa4_batch2 causal=True on the CPU  cpu (no cache)
+PASS  gqa4_batch2 causal=False on the CPU  cpu (non-causal)
+PASS  mha causal=True on the CPU  cpu (no cache)
+PASS  mha causal=False on the CPU  cpu (non-causal)
+PASS  unequal_seqlen causal=True on the CPU  cpu (no cache)
+PASS  unequal_seqlen causal=False on the CPU  cpu (non-causal)
+PASS  unequal_seqlen2 causal=True on the CPU  cpu (no cache)
+PASS  unequal_seqlen2 causal=False on the CPU  cpu (non-causal)
+PASS  sq_gt_skv non-causal on the CPU  cpu (non-causal)
+PASS  fast non-causal on the CPU  cpu (non-causal)
+PASS  proxy non-causal refused  REFUSED: refcache proxy: non-causal; computing its fp32 reference is refused (never on the
+PASS  prod non-causal refused  REFUSED: refcache prod: non-causal; computing its fp32 reference is refused (never on the 
+PASS  prod common_sha drift refused  REFUSED: refcache prod: provenance differs: eager_sha,common_sha; computing its fp32 reference is re
+PASS  proxy unknown eager_sha refused  REFUSED: refcache proxy: provenance differs: eager_sha; computing its fp32 reference is refused (nev
+PASS  fast dims drift -> CPU recompute  cpu (provenance differs: dims,eager_sha)
+PASS  a further eager/impl.py edit invalidates prod  REFUSED: refcache prod: provenance differs: eager_sha; computing its fp32 reference is refused (neve
+PASS  eager guard is the first statement of forward_reference  if q.is_cuda or k.is_cuda or v.is_cuda:   # A0 2026-10-02 (h50): never on the card -- see the module docstring
+RESULT: PASS

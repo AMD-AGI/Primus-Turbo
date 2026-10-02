@@ -1,0 +1,14 @@
+fe602c25556302ce80e0fff8b3c168ec  ./_env.py
+460ff8184ec63ee0033a6d7436e6d6d7  ./flydsl_fwd/buffer_ops.py
+f8c13205da229f095394f8708aeb15d7  ./flydsl_fwd/fmha_b16_buffer_managers.py
+1af89c64d2d3b3fcf28a280054a30c16  ./flydsl_fwd/fmha_fwd_prefill_a16w16_m16x8.py
+b09721562d696d5c1edc7eba29857a88  ./flydsl_fwd/fmha_fwd_prefill_a16w16_m32x2.py
+e4485ba08d49bdbaef36987c94ae1c1f  ./flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py
+4abc9e3fec2e469b3fb4e5b68760dfea  ./flydsl_fwd/__init__.py
+2b9503767a11562190df9b0c2d0f519a  ./flydsl_fwd/kernels_common.py
+0cffb56680e0d03eacb89846c023e928  ./flydsl_fwd/tensor_shim.py
+35f4247ad75b0907b83d467b3f8bf33f  ./impl.py
+5a346292af29b590865a11d101d94145  ./__init__.py
+f375558cf3b2fa48022b3d2ef85bb1c0  ./PROVENANCE.md
+--- diff -rq vs op/current:
+Files ./flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py and /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-fwd-b0-20260927/job_context/op/current/flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py differ

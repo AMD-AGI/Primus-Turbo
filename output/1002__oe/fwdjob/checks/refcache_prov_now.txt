@@ -1,0 +1,17 @@
+on disk: eager/impl.py sha16=5584c5bebd6516a5  ut/common.py sha16=e6f623771c679b7a
+fast.pt: provenance {'shape': 'fast', 'dims': (1, 1024, 1024, 8, 2, 128), 'seed': 0, 'eager_sha': '6bc438c3784c3f67', 'common_sha': 'e6f623771c679b7a', 'torch': '2.11.0+rocm7.14.0a20260625', 'device': 'gfx1250'}
+  o   Tensor(dtype=torch.BFloat16Storage, key=0, numel_storage=1048576, size=(1, 1024, 8, 128))
+  lse Tensor(dtype=torch.FloatStorage, key=1, numel_storage=8192, size=(1, 8, 1024))
+  storages sha16 {'0': 'c6ead0269aee5e12', '1': '3f66f47ef36d798f'}
+  check vs disk: MISMATCH on eager_sha
+prod.pt: provenance {'shape': 'prod', 'dims': (4, 8192, 8192, 32, 8, 128), 'seed': 0, 'eager_sha': '6bc438c3784c3f67', 'common_sha': 'e6f623771c679b7a', 'torch': '2.11.0+rocm7.14.0a20260625', 'device': 'gfx1250'}
+  o   Tensor(dtype=torch.BFloat16Storage, key=0, numel_storage=134217728, size=(4, 8192, 32, 128))
+  lse Tensor(dtype=torch.FloatStorage, key=1, numel_storage=1048576, size=(4, 32, 8192))
+  storages sha16 {'0': '7b0249a1cd828ba0', '1': '6fa4e0af2ed03308'}
+  check vs disk: MISMATCH on eager_sha
+proxy.pt: provenance {'shape': 'proxy', 'dims': (1, 4096, 4096, 32, 8, 128), 'seed': 0, 'eager_sha': '6bc438c3784c3f67', 'common_sha': 'e6f623771c679b7a', 'torch': '2.11.0+rocm7.14.0a20260625', 'device': 'gfx1250'}
+  o   Tensor(dtype=torch.BFloat16Storage, key=0, numel_storage=16777216, size=(1, 4096, 32, 128))
+  lse Tensor(dtype=torch.FloatStorage, key=1, numel_storage=131072, size=(1, 32, 4096))
+  storages sha16 {'0': 'ace8c9f11aa549e8', '1': 'c70f68ad89ea7579'}
+  check vs disk: MISMATCH on eager_sha
+RESULT: MISMATCH

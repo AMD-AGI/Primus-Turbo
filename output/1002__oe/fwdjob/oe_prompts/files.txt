@@ -1,0 +1,7 @@
+op_evolve/modules/deep_loop/act/prompts/_preamble.md
+op_evolve/modules/deep_loop/plan/prompts/_preamble.md
+op_evolve/modules/deep_loop/profiling/prompts/01_select.md
+op_evolve/modules/deep_loop/profiling/prompts/02_counters.md
+op_evolve/modules/deep_loop/profiling/prompts/03_metrics.md
+op_evolve/modules/deep_loop/profiling/prompts/04_thread_trace.md
+op_evolve/modules/deep_loop/profiling/prompts/_preamble.md

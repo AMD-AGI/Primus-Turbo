@@ -1,0 +1,38 @@
+--- job_context/gfx1250-flydsl-attn-fwd_final.yaml.bak.pre-a0-1002
++++ job_context/gfx1250-flydsl-attn-fwd_final.yaml
+@@ -781,7 +781,7 @@
+                                     # recorded for provenance only -- do NOT move
+                                     # it into this field, which would make the
+                                     # runner own the container.
+-      container: fa-g2              # B0 2026-09-28: per-card container (only renderD144 = physical GPU 2); day 1 was fa-g0; was fa-repro. EXISTING container; the runner attaches,
++      container: fa-repro           # A0 2026-10-02: back on A0 (B0 used fa-g0 on 09-27 and fa-g2 on 09-28; h49). EXISTING container; the runner attaches,
+                                     # never recreates. flydsl 0.3.2 is at
+                                     # /home/lihuzhan/.local/flydsl032. Mounts
+                                     # /home/lihuzhan:/home/lihuzhan, /dev/kfd + /dev/dri,
+@@ -800,13 +800,13 @@
+                             # rocminfo amdgcn-amd-amdhsa--gfx1250,
+                             # torch gcnArchName gfx1250.
+                             # AMD Eng Sample 100-000001046-04.
+-  gpu_id: 0                 # B0 2026-09-28: logical 0 inside fa-g2 = PHYSICAL GPU 2 (rocm-smi GPU[2], PCI 0003:04:00.0, kfd gpu_id 57865). Other 3 cards run other jobs.
++  gpu_id: 0                 # A0 2026-10-02: the only GPU on the node (device count 1). On B0 this was logical 0 inside fa-g2 = physical GPU 2.
+   gpu_pool: []              # ⚠ ONE card on this host. Not a placeholder. Deep
+                             # rounds cannot parallelise their analyses. AND this
+                             # job cannot coexist with
+                             # gfx1250-flydsl-attn-bwd-20260917-115934 -- see the
+                             # banner at the top of this file.
+-  host: ctheliosp-1b112-a37-1   # B0 fork since 2026-09-27 (A0 heliosr-1b114-c07-1 runs the original job)
++  host: heliosr-1b114-c07-1   # A0 2026-10-02 (h49); B0 ctheliosp-1b112-a37-1 ran this fork on 2026-09-27/28
+   python_path:              # prepend IN THIS ORDER before `import flydsl` / `import aiter`
+                             # [resolved] documentation only: no framework code reads it
+                             # (R4). Each arm's _env.py implements it. op/baseline/ omits
+@@ -866,8 +866,8 @@
+     flydsl_selected: 0.3.4.1              # /home/lihuzhan/.local/flydsl0341/flydsl
+     # [observed] Job Setup, 2026-09-25 -- see env/README.md for the full table.
+     job_setup_2026_09_25:
+-      host: ctheliosp-1b112-a37-1        # zero ssh hops
+-      container: fa-g2                 # image fa-tune:deps, running, started 2026-09-25T11:33:03Z
++      host: heliosr-1b114-c07-1        # zero ssh hops (2026-10-02: restored; this setup ran on A0, B0 had rewritten it)
++      container: fa-repro              # image fa-tune:deps, running, started 2026-09-25T11:33:03Z
+       gpu_count: 1
+       gpu_arch: gfx1250                # rocm-smi GFX Version + torch gcnArchName
+       gpu_id_usable: 0

@@ -1,0 +1,25 @@
+--- job_context/op/eager/impl.py.bak.pre-a0-1002
++++ job_context/op/eager/impl.py
+@@ -16,6 +16,11 @@
+ 
+ Chunked over (batch, q head) and query blocks only to fit in memory -- a dense
+ [4, 32, 8192, 8192] fp32 score tensor is 34 GB.
++
++A0 operator 2026-10-02 (hints h49/h50): CUDA inputs are computed ON THE CPU and the result is moved back to their
++device. The fp32 GEMMs of this reference faulted B0 GPU2 inside round 20's act (2026-09-28) and are the path that
++escalated into the 2026-09-22 power cycle. The arithmetic below is unchanged; only the device it runs on is. This
++edit moves the file's sha256, so op/refcache_util.py accepts the caches stamped with the pre-guard sha.
+ """
+ import os
+ 
+@@ -35,6 +40,10 @@
+     Written here rather than taken from a library: the backward under test consumes o and
+     lse, so a library forward would put a library in the reference chain.
+     """
++    if q.is_cuda or k.is_cuda or v.is_cuda:   # A0 2026-10-02 (h50): never on the card -- see the module docstring
++        o, lse = forward_reference(q.cpu(), k.cpu(), v.cpu(), causal=causal,
++                                   softmax_scale=softmax_scale, q_chunk=q_chunk)
++        return o.to(q.device), lse.to(q.device)
+     b, sq, hq, d = q.shape
+     skv, hkv = k.shape[1], k.shape[2]
+     g = hq // hkv
