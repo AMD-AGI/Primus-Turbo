@@ -1,0 +1,9 @@
+# compile-only IR dumps: keep the final ISA (.s), LLVM IR (.ll), the gpu.binary stage (embedded ELF code
+# object) and the logs; the ~66 MB of intermediate MLIR stages stay local (regenerate: tools/compile_s6.sh).
+isa/**/*.mlir
+!isa/**/*_gpu_module_to_binary.mlir
+__pycache__/
+# tools/realab.sh: A/A tree copies (regenerated every run), kineto traces (10-50 MB), host clock samples
+/arms/aa/
+/traces/
+/runs/*.clk

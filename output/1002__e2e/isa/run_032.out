@@ -1,0 +1,5 @@
+RC=0
+delta      .group_segment_fixed_size: 0 .private_segment_fixed_size: 0 .sgpr_count:     21 .sgpr_spill_count: 0 .vgpr_count:     40 .vgpr_spill_count: 0  wmma=0 ds=0 
+dkdv       .group_segment_fixed_size: 70656 .private_segment_fixed_size: 0 .sgpr_count:     69 .sgpr_spill_count: 0 .vgpr_count:     713 .vgpr_spill_count: 0  wmma=128 ds=256 
+dkdv_sp    .group_segment_fixed_size: 70656 .private_segment_fixed_size: 0 .sgpr_count:     78 .sgpr_spill_count: 0 .vgpr_count:     707 .vgpr_spill_count: 0  wmma=128 ds=192 
+dqg        .group_segment_fixed_size: 52224 .private_segment_fixed_size: 0 .sgpr_count:     95 .sgpr_spill_count: 0 .vgpr_count:     881 .vgpr_spill_count: 0  wmma=192 ds=128 

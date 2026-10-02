@@ -1,0 +1,8 @@
+[flydsl_bwd bwd_s6_0341] DQ_SIDE_STREAM=1 DQ_SIDE_RECORD=0 (FLY_BWD_SIDE_STREAM=None FLY_BWD_RECORD_STREAM='0')
+{"mode": "norecord", "env": {"FLY_BWD_RECORD_STREAM": "0"}, "DQ_SIDE_STREAM": true, "DQ_SIDE_RECORD": false, "side_streams_created": 1, "flydsl": "/home/lihuzhan/.local/flydsl0341/flydsl/__init__.py"}
+   ('launch', 'delta', 'main')
+   ('wait_stream', 'side1', 'main')
+   ('launch', 'dkdv', 'main')
+   ('launch', 'dqg', 'side1')
+   ('wait_stream', 'main', 'side1')
+MOCK_OK norecord

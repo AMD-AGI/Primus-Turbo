@@ -1,0 +1,3 @@
+# kineto traces (16-66 MB each) stay local; logs, event JSONL, clocks, run summaries and tables are small and kept
+traces/
+__pycache__/

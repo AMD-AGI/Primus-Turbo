@@ -1,0 +1,20 @@
+[09:13:33] realab 1002_091333: conds=[blk gb] rot=0 aa=1 kineto=1 timeout=360s budget=870s cool=30s
+[09:13:33] trees: fwd=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/fwd_r16  r29=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/bwd_r29_0341  s6=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/bwd_s6_0341 (impl md5 46e0e812, _env 7df61bba)
+[09:13:33] ISA s6 delta flydsl 0.3.2 vs 0.3.4.1: 0 differing lines
+[09:13:33] ISA s6 dkdv flydsl 0.3.2 vs 0.3.4.1: 0 differing lines
+[09:13:33] ISA s6 dqg flydsl 0.3.2 vs 0.3.4.1: 0 differing lines
+[09:13:33] A/A copies: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/arms/aa/fwd_r16_aa /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/arms/aa/bwd_s6_0341_aa (byte-identical .py)
+[09:13:33] plan: blk:o1 gb:o1  (o1 fwd asm,fly,fly_aa bwd asm,s6,r29,s6_aa; o2 reversed)
+[09:13:33] RA_DRYRUN=1: preflight passed, no card process started. env file of the first process:
+    RA_COND=blk
+    RA_JSON=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/runs/realab_blk_o1_1002_091333.json
+    RA_TRACE=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/traces/realab_blk_o1_1002_091333.trace.json
+    RA_KINETO=1
+    RA_DEADLINE_S=285
+    RA_FWD=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/fwd_r16
+    RA_S6=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/bwd_s6_0341
+    RA_R29=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/bwd_r29_0341
+    RA_FWD_AA=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/arms/aa/fwd_r16_aa
+    RA_S6_AA=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/arms/aa/bwd_s6_0341_aa
+    RA_ORDER_FWD=asm,fly,fly_aa
+    RA_ORDER_BWD=asm,s6,r29,s6_aa

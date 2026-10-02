@@ -1,0 +1,16 @@
+[flydsl_bwd bwd_s6_0341] DQ_SIDE_STREAM=1 DQ_SIDE_RECORD=1 (FLY_BWD_SIDE_STREAM=None FLY_BWD_RECORD_STREAM=None)
+{"mode": "default", "env": {}, "DQ_SIDE_STREAM": true, "DQ_SIDE_RECORD": true, "side_streams_created": 1, "flydsl": "/home/lihuzhan/.local/flydsl0341/flydsl/__init__.py"}
+   ('launch', 'delta', 'main')
+   ('wait_stream', 'side1', 'main')
+   ('launch', 'dkdv', 'main')
+   ('launch', 'dqg', 'side1')
+   ('record_stream', 'side1', (4, 8192, 32, 128), 'torch.bfloat16')
+   ('record_stream', 'side1', (4, 8192, 8, 128), 'torch.bfloat16')
+   ('record_stream', 'side1', (4, 8192, 8, 128), 'torch.bfloat16')
+   ('record_stream', 'side1', (4, 8192, 32, 128), 'torch.bfloat16')
+   ('record_stream', 'side1', (4, 8192, 32, 128), 'torch.bfloat16')
+   ('record_stream', 'side1', (4, 32, 8192), 'torch.float32')
+   ('record_stream', 'side1', (4, 32, 8192), 'torch.float32')
+   ('record_stream', 'side1', (4, 8192, 32, 128), 'torch.bfloat16')
+   ('wait_stream', 'main', 'side1')
+MOCK_OK default

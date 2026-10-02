@@ -1,0 +1,30 @@
+# s6 bwd kernels: flydsl 0.3.2 (output/0930__bwd/armsrc/s6, _env pins ~/.local/flydsl032) vs flydsl 0.3.4.1 (output/0927__b0/e2e/arms/bwd_s6_0341)
+# compile-only, prod b4 s8192 hq32 hkv8 d128 causal, arch=gfx1250 warp=32 asserted; tools/compile_s6.sh; 2026-10-02 08:11:41 UTC
+# kernels.py md5 5e61678d53260a2fc17c68286298f4b9 (= armsrc/s6, MD5SUMS)
+s6_032/delta/k_delta_bshd_0/21_final_isa.s   .group_segment_fixed_size=0 .private_segment_fixed_size=0 .sgpr_count=21 .sgpr_spill_count=0 .vgpr_count=40 .vgpr_spill_count=0   instr=256 wmma=0 tensor_load_to_lds=0 s_wait_tensorcnt=0 s_wait_dscnt=0 s_wait_loadcnt=2 s_barrier*=0 v_nop=1
+s6_0341/delta/k_delta_bshd_0/22_final_isa.s  .group_segment_fixed_size=0 .private_segment_fixed_size=0 .sgpr_count=21 .sgpr_spill_count=0 .vgpr_count=40 .vgpr_spill_count=0   instr=256 wmma=0 tensor_load_to_lds=0 s_wait_tensorcnt=0 s_wait_dscnt=0 s_wait_loadcnt=2 s_barrier*=0 v_nop=1
+  final_isa: diff lines=0 md5 328be1e0fbf8 / 328be1e0fbf8
+  llvm_ir:   diff lines=0 md5 945b9694b7b1 / 945b9694b7b1
+  gpu.binary (embedded ELF code object): diff lines=0 md5 5d5204d625eb / 5d5204d625eb
+s6_032/dkdv/k_dkdv_0/21_final_isa.s          .group_segment_fixed_size=70656 .private_segment_fixed_size=0 .sgpr_count=69 .sgpr_spill_count=0 .vgpr_count=713 .vgpr_spill_count=0   instr=2083 wmma=128 tensor_load_to_lds=8 s_wait_tensorcnt=4 s_wait_dscnt=66 s_wait_loadcnt=23 s_barrier*=0 v_nop=26
+s6_0341/dkdv/k_dkdv_0/22_final_isa.s         .group_segment_fixed_size=70656 .private_segment_fixed_size=0 .sgpr_count=69 .sgpr_spill_count=0 .vgpr_count=713 .vgpr_spill_count=0   instr=2083 wmma=128 tensor_load_to_lds=8 s_wait_tensorcnt=4 s_wait_dscnt=66 s_wait_loadcnt=23 s_barrier*=0 v_nop=26
+  final_isa: diff lines=0 md5 fec69cb9ea3d / fec69cb9ea3d
+  llvm_ir:   diff lines=0 md5 6ab7edd6a4c3 / 6ab7edd6a4c3
+  gpu.binary (embedded ELF code object): diff lines=0 md5 a38f6a23c408 / a38f6a23c408
+s6_032/dkdv_sp/k_dkdv_sp_0/21_final_isa.s    .group_segment_fixed_size=70656 .private_segment_fixed_size=0 .sgpr_count=78 .sgpr_spill_count=0 .vgpr_count=707 .vgpr_spill_count=0   instr=2413 wmma=128 tensor_load_to_lds=8 s_wait_tensorcnt=4 s_wait_dscnt=35 s_wait_loadcnt=24 s_barrier*=0 v_nop=27
+s6_0341/dkdv_sp/k_dkdv_sp_0/22_final_isa.s   .group_segment_fixed_size=70656 .private_segment_fixed_size=0 .sgpr_count=78 .sgpr_spill_count=0 .vgpr_count=707 .vgpr_spill_count=0   instr=2413 wmma=128 tensor_load_to_lds=8 s_wait_tensorcnt=4 s_wait_dscnt=35 s_wait_loadcnt=24 s_barrier*=0 v_nop=27
+  final_isa: diff lines=0 md5 6b9414eaed7b / 6b9414eaed7b
+  llvm_ir:   diff lines=0 md5 f84be3b8074d / f84be3b8074d
+  gpu.binary (embedded ELF code object): diff lines=0 md5 fcf2f51cf938 / fcf2f51cf938
+s6_032/dqg/k_dqg_0/21_final_isa.s            .group_segment_fixed_size=52224 .private_segment_fixed_size=0 .sgpr_count=95 .sgpr_spill_count=0 .vgpr_count=881 .vgpr_spill_count=0   instr=3387 wmma=192 tensor_load_to_lds=8 s_wait_tensorcnt=4 s_wait_dscnt=41 s_wait_loadcnt=7 s_barrier*=0 v_nop=35
+s6_0341/dqg/k_dqg_0/22_final_isa.s           .group_segment_fixed_size=52224 .private_segment_fixed_size=0 .sgpr_count=95 .sgpr_spill_count=0 .vgpr_count=881 .vgpr_spill_count=0   instr=3387 wmma=192 tensor_load_to_lds=8 s_wait_tensorcnt=4 s_wait_dscnt=41 s_wait_loadcnt=7 s_barrier*=0 v_nop=35
+  final_isa: diff lines=0 md5 e6d1ed4a40a4 / e6d1ed4a40a4
+  llvm_ir:   diff lines=0 md5 0a222683c46c / 0a222683c46c
+  gpu.binary (embedded ELF code object): diff lines=0 md5 c4c2884d6ff9 / c4c2884d6ff9
+# every MLIR stage, loc() stripped, paired by pass name: identical; 0.3.4.1's extra fly-rocdl-expand-ops pass is a no-op on all 4 kernels (02 == 03)
+# native compiler libs differ (flydsl032 vs flydsl0341 *.so md5 aggregate a0b6a20a vs 11dd2cc0), so the identity is not trivial
+# host side: the LLVM-dialect stages (which hold the host launch code) are identical too, and the launch runtime
+# libfly_jit_runtime.so + _mlirExecutionEngine are byte-identical between the two installs (md5 0b6ab884 / 18093b00);
+# python-side launch path (CompiledFunction/CallState fills, fx.Stream fill re-reading .cuda_stream per call) is
+# unchanged apart from zlib-compressed IR in the disk-cache pickle (jit_executor.py). => s6 under 0.3.4.1 executes the
+# same code objects through the same launch runtime as under 0.3.2.

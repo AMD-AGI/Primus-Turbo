@@ -1,0 +1,100 @@
+flydsl 0.3.2 /home/lihuzhan/.local/flydsl032/flydsl/__init__.py arch=gfx1250 warp=32 torch=2.11.0+rocm7.14.0a20260625
+aiter modules loaded: ['aiter.ops.flydsl.kernels.kernels_common', 'aiter.ops.flydsl.kernels.tensor_shim']
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/delta/k_delta_bshd_0
+[flydsl.compile] dump 00_origin -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/delta/k_delta_bshd_0/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/delta/k_delta_bshd_0/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/delta/k_delta_bshd_0/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_layout_lowering -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/delta/k_delta_bshd_0/03_fly_layout_lowering.mlir
+[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/delta/k_delta_bshd_0/04_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 05_canonicalize -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/delta/k_delta_bshd_0/05_canonicalize.mlir
+[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/delta/k_delta_bshd_0/06_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/delta/k_delta_bshd_0/07_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 08_convert_fly_to_rocdl -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/delta/k_delta_bshd_0/08_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 09_canonicalize -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/delta/k_delta_bshd_0/09_canonicalize.mlir
+[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/delta/k_delta_bshd_0/10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 11_rocdl_attach_target -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/delta/k_delta_bshd_0/11_rocdl_attach_target.mlir
+[flydsl.compile] dump 12_convert_scf_to_cf -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/delta/k_delta_bshd_0/12_convert_scf_to_cf.mlir
+[flydsl.compile] dump 13_convert_cf_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/delta/k_delta_bshd_0/13_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 14_gpu_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/delta/k_delta_bshd_0/14_gpu_to_llvm.mlir
+[flydsl.compile] dump 15_convert_vector_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/delta/k_delta_bshd_0/15_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 16_convert_arith_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/delta/k_delta_bshd_0/16_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 17_convert_func_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/delta/k_delta_bshd_0/17_convert_func_to_llvm.mlir
+[flydsl.compile] dump 18_reconcile_unrealized_casts -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/delta/k_delta_bshd_0/18_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 19_gpu_module_to_binary -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/delta/k_delta_bshd_0/19_gpu_module_to_binary.mlir
+[flydsl.compile] dump 20_llvm_ir -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/delta/k_delta_bshd_0/20_llvm_ir.ll
+[flydsl.compile] dump 21_final_isa -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/delta/k_delta_bshd_0/21_final_isa.s
+[delta] compile returned NoneType
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv/k_dkdv_0
+[flydsl.compile] dump 00_origin -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv/k_dkdv_0/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv/k_dkdv_0/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv/k_dkdv_0/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_layout_lowering -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv/k_dkdv_0/03_fly_layout_lowering.mlir
+[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv/k_dkdv_0/04_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 05_canonicalize -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv/k_dkdv_0/05_canonicalize.mlir
+[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv/k_dkdv_0/06_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv/k_dkdv_0/07_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 08_convert_fly_to_rocdl -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv/k_dkdv_0/08_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 09_canonicalize -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv/k_dkdv_0/09_canonicalize.mlir
+[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv/k_dkdv_0/10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 11_rocdl_attach_target -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv/k_dkdv_0/11_rocdl_attach_target.mlir
+[flydsl.compile] dump 12_convert_scf_to_cf -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv/k_dkdv_0/12_convert_scf_to_cf.mlir
+[flydsl.compile] dump 13_convert_cf_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv/k_dkdv_0/13_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 14_gpu_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv/k_dkdv_0/14_gpu_to_llvm.mlir
+[flydsl.compile] dump 15_convert_vector_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv/k_dkdv_0/15_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 16_convert_arith_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv/k_dkdv_0/16_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 17_convert_func_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv/k_dkdv_0/17_convert_func_to_llvm.mlir
+[flydsl.compile] dump 18_reconcile_unrealized_casts -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv/k_dkdv_0/18_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 19_gpu_module_to_binary -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv/k_dkdv_0/19_gpu_module_to_binary.mlir
+[flydsl.compile] dump 20_llvm_ir -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv/k_dkdv_0/20_llvm_ir.ll
+[flydsl.compile] dump 21_final_isa -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv/k_dkdv_0/21_final_isa.s
+[dkdv] compile returned NoneType
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv_sp/k_dkdv_sp_0
+[flydsl.compile] dump 00_origin -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv_sp/k_dkdv_sp_0/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv_sp/k_dkdv_sp_0/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv_sp/k_dkdv_sp_0/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_layout_lowering -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv_sp/k_dkdv_sp_0/03_fly_layout_lowering.mlir
+[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv_sp/k_dkdv_sp_0/04_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 05_canonicalize -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv_sp/k_dkdv_sp_0/05_canonicalize.mlir
+[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv_sp/k_dkdv_sp_0/06_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv_sp/k_dkdv_sp_0/07_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 08_convert_fly_to_rocdl -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv_sp/k_dkdv_sp_0/08_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 09_canonicalize -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv_sp/k_dkdv_sp_0/09_canonicalize.mlir
+[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv_sp/k_dkdv_sp_0/10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 11_rocdl_attach_target -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv_sp/k_dkdv_sp_0/11_rocdl_attach_target.mlir
+[flydsl.compile] dump 12_convert_scf_to_cf -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv_sp/k_dkdv_sp_0/12_convert_scf_to_cf.mlir
+[flydsl.compile] dump 13_convert_cf_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv_sp/k_dkdv_sp_0/13_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 14_gpu_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv_sp/k_dkdv_sp_0/14_gpu_to_llvm.mlir
+[flydsl.compile] dump 15_convert_vector_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv_sp/k_dkdv_sp_0/15_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 16_convert_arith_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv_sp/k_dkdv_sp_0/16_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 17_convert_func_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv_sp/k_dkdv_sp_0/17_convert_func_to_llvm.mlir
+[flydsl.compile] dump 18_reconcile_unrealized_casts -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv_sp/k_dkdv_sp_0/18_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 19_gpu_module_to_binary -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv_sp/k_dkdv_sp_0/19_gpu_module_to_binary.mlir
+[flydsl.compile] dump 20_llvm_ir -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv_sp/k_dkdv_sp_0/20_llvm_ir.ll
+[flydsl.compile] dump 21_final_isa -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dkdv_sp/k_dkdv_sp_0/21_final_isa.s
+[dkdv_sp] compile returned NoneType
+[flydsl.compile] FLYDSL_DUMP_IR=1 dir=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dqg/k_dqg_0
+[flydsl.compile] dump 00_origin -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dqg/k_dqg_0/00_origin.mlir
+[flydsl.compile] dump 01_fly_rewrite_func_signature -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dqg/k_dqg_0/01_fly_rewrite_func_signature.mlir
+[flydsl.compile] dump 02_fly_canonicalize -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dqg/k_dqg_0/02_fly_canonicalize.mlir
+[flydsl.compile] dump 03_fly_layout_lowering -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dqg/k_dqg_0/03_fly_layout_lowering.mlir
+[flydsl.compile] dump 04_fly_int_swizzle_simplify -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dqg/k_dqg_0/04_fly_int_swizzle_simplify.mlir
+[flydsl.compile] dump 05_canonicalize -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dqg/k_dqg_0/05_canonicalize.mlir
+[flydsl.compile] dump 06_fly_convert_atom_call_to_ssa_form -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dqg/k_dqg_0/06_fly_convert_atom_call_to_ssa_form.mlir
+[flydsl.compile] dump 07_fly_promote_regmem_to_vectorssa -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dqg/k_dqg_0/07_fly_promote_regmem_to_vectorssa.mlir
+[flydsl.compile] dump 08_convert_fly_to_rocdl -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dqg/k_dqg_0/08_convert_fly_to_rocdl.mlir
+[flydsl.compile] dump 09_canonicalize -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dqg/k_dqg_0/09_canonicalize.mlir
+[flydsl.compile] dump 10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dqg/k_dqg_0/10_convert_scf_to_cf_cse_convert_rocdl_fastmath_ops_convert_gpu_to_rocdl.mlir
+[flydsl.compile] dump 11_rocdl_attach_target -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dqg/k_dqg_0/11_rocdl_attach_target.mlir
+[flydsl.compile] dump 12_convert_scf_to_cf -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dqg/k_dqg_0/12_convert_scf_to_cf.mlir
+[flydsl.compile] dump 13_convert_cf_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dqg/k_dqg_0/13_convert_cf_to_llvm.mlir
+[flydsl.compile] dump 14_gpu_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dqg/k_dqg_0/14_gpu_to_llvm.mlir
+[flydsl.compile] dump 15_convert_vector_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dqg/k_dqg_0/15_convert_vector_to_llvm.mlir
+[flydsl.compile] dump 16_convert_arith_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dqg/k_dqg_0/16_convert_arith_to_llvm.mlir
+[flydsl.compile] dump 17_convert_func_to_llvm -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dqg/k_dqg_0/17_convert_func_to_llvm.mlir
+[flydsl.compile] dump 18_reconcile_unrealized_casts -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dqg/k_dqg_0/18_reconcile_unrealized_casts.mlir
+[flydsl.compile] dump 19_gpu_module_to_binary -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dqg/k_dqg_0/19_gpu_module_to_binary.mlir
+[flydsl.compile] dump 20_llvm_ir -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dqg/k_dqg_0/20_llvm_ir.ll
+[flydsl.compile] dump 21_final_isa -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/isa/s6_032/dqg/k_dqg_0/21_final_isa.s
+[dqg] compile returned NoneType
+COMPILE_DONE
+RC=0

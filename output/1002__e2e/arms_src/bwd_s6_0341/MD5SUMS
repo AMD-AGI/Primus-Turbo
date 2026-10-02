@@ -1,0 +1,12 @@
+# bwd_s6_0341 = 0930__bwd/armsrc/s6 (kernels.py, __init__.py byte-identical) + _env.py of 0927__b0/e2e/arms/bwd_r29_0341 (flydsl 0.3.4.1 pin)
+# + impl.py env switches FLY_BWD_SIDE_STREAM / FLY_BWD_RECORD_STREAM (defaults = s6; diff: ../../patches/s6_impl_env_switch.diff)
+# e2e copy (gitignored): 0927__b0/e2e/arms/bwd_s6_0341 -- must stay byte-identical to this dir
+7df61bba26309ffc14b84a432fb451a7  _env.py
+0024d09db2284ac48c29ab70e11a821d  __init__.py
+46e0e8127bd57c888944bbc6ee96249b  impl.py
+5e61678d53260a2fc17c68286298f4b9  kernels.py
+# sources:
+5e61678d53260a2fc17c68286298f4b9  0930__bwd/armsrc/s6/kernels.py
+0024d09db2284ac48c29ab70e11a821d  0930__bwd/armsrc/s6/__init__.py
+e8015b959bd35d74c10f0ec879f101f0  0930__bwd/armsrc/s6/impl.py
+7df61bba26309ffc14b84a432fb451a7  0927__b0/e2e/arms/bwd_r29_0341/_env.py

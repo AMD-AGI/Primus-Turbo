@@ -1,0 +1,58 @@
+--- 0930__bwd/armsrc/s6/impl.py	2026-09-30 10:52:06.823600887 +0000
++++ 1002__e2e/arms_src/bwd_s6_0341/impl.py	2026-10-02 08:08:48.767241850 +0000
+@@ -26,6 +26,8 @@
+ _env = _sibling("_env")
+ 
+ import math
++import os
++import sys
+ 
+ import torch
+ 
+@@ -76,6 +78,12 @@
+     global _ENV_CHECKED
+     if not _ENV_CHECKED:
+         _env.assert_environment()
++        # e2e port 1002: one line of evidence of the stream mode this process runs.
++        print(f"[flydsl_bwd {_HERE.name}] DQ_SIDE_STREAM={int(DQ_SIDE_STREAM)} "
++              f"DQ_SIDE_RECORD={int(DQ_SIDE_RECORD)} "
++              f"(FLY_BWD_SIDE_STREAM={os.environ.get('FLY_BWD_SIDE_STREAM')!r} "
++              f"FLY_BWD_RECORD_STREAM={os.environ.get('FLY_BWD_RECORD_STREAM')!r})",
++              file=sys.stderr, flush=True)
+         _ENV_CHECKED = True
+ 
+ 
+@@ -107,7 +115,18 @@
+ # The flyc.compile fast path does NOT bake the stream: fx.Stream's __c_abi_spec__ fill
+ # re-reads `.cuda_stream` on every call and its __cache_signature__ is the type only.
+ # With DQ_DFUSE = True, k_dkdv depends on k_dqg (delta), so that path stays serial.
+-DQ_SIDE_STREAM = True
++# e2e port 1002 (output/1002__e2e) -- two env switches, read once at import; both unset = s6.
++#   FLY_BWD_SIDE_STREAM=0    the dQ chain runs on the caller's stream after k_dkdv (r29's
++#                            serial order). Same kernels and arguments, disjoint outputs, no
++#                            atomics -> dq/dk/dv bitwise identical to the side-stream mode.
++#   FLY_BWD_RECORD_STREAM=0  keep the side stream, skip the record_stream() calls at the join.
++#                            Every block s2 touches was allocated on the caller's stream (or by
++#                            the caller) and the caller's stream waits for s2 before we return,
++#                            so any reuse of those blocks is stream-ordered after s2's work
++#                            anyway; record_stream only defers their reuse (~1.1 GiB per call at
++#                            b4 s8192 hq32) until s2's event completes while the host runs ahead.
++DQ_SIDE_STREAM = os.environ.get("FLY_BWD_SIDE_STREAM", "1") != "0"
++DQ_SIDE_RECORD = os.environ.get("FLY_BWD_RECORD_STREAM", "1") != "0"
+ # variant b: submit the dQ chain (side stream) BEFORE the dK/dV chain (main stream).
+ DQ_SIDE_FIRST = False
+ _SIDE = {}
+@@ -308,9 +327,10 @@
+     # allocator must not hand its block to main-stream work that could run before s2
+     # finishes), and the caller's stream waits for s2 before anything after us runs.
+     if split:
+-        for t in (q, k, v, do, o, lse, delta, dq_o, dqp):
+-            if t is not None:
+-                t.record_stream(s2)
++        if DQ_SIDE_RECORD:
++            for t in (q, k, v, do, o, lse, delta, dq_o, dqp):
++                if t is not None:
++                    t.record_stream(s2)
+         stream.wait_stream(s2)
+ 
+     return dq_o, dk_o, dv_o

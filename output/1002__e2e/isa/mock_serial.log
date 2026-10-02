@@ -1,0 +1,6 @@
+[flydsl_bwd bwd_s6_0341] DQ_SIDE_STREAM=0 DQ_SIDE_RECORD=1 (FLY_BWD_SIDE_STREAM='0' FLY_BWD_RECORD_STREAM=None)
+{"mode": "serial", "env": {"FLY_BWD_SIDE_STREAM": "0"}, "DQ_SIDE_STREAM": false, "DQ_SIDE_RECORD": true, "side_streams_created": 0, "flydsl": "/home/lihuzhan/.local/flydsl0341/flydsl/__init__.py"}
+   ('launch', 'delta', 'main')
+   ('launch', 'dkdv', 'main')
+   ('launch', 'dqg', 'main')
+MOCK_OK serial

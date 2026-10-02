@@ -1,0 +1,26 @@
+--- 0930__bwd/armsrc/s6/_env.py	2026-09-30 10:52:06.823545737 +0000
++++ 1002__e2e/arms_src/bwd_s6_0341/_env.py	2026-09-28 11:26:38.305006176 +0000
+@@ -15,7 +15,7 @@
+ 
+ os.environ.setdefault("TORCH_BLAS_PREFER_HIPBLASLT", "0")
+ 
+-for _p in ("/home/lihuzhan/.local/flydsl032", "/tmp/flydsl032"):
++for _p in ("/home/lihuzhan/.local/flydsl0341",):
+     if os.path.isdir(_p) and _p not in sys.path:
+         sys.path.insert(0, _p)
+         break
+@@ -27,10 +27,10 @@
+     """Assert the two things that silently produce wrong answers if they are wrong."""
+     import flydsl
+     import torch
+-    assert flydsl.__version__.startswith("0.3.2"), (
+-        f"flydsl 0.3.2 required, got {flydsl.__version__} at {flydsl.__file__}")
+-    assert "flydsl032" in flydsl.__file__, (
+-        f"flydsl resolved to the image copy, not the 0.3.2 install: {flydsl.__file__}")
++    assert flydsl.__version__.startswith("0.3.4"), (
++        f"flydsl 0.3.4.x required, got {flydsl.__version__} at {flydsl.__file__}")
++    assert "flydsl0341" in flydsl.__file__, (
++        f"flydsl resolved to the image copy, not the 0.3.4.1 install: {flydsl.__file__}")
+     arch = torch.cuda.get_device_properties(0).gcnArchName
+     assert "gfx1250" in arch, f"these kernels target gfx1250, got {arch}"
+     return flydsl.__version__, flydsl.__file__, arch
