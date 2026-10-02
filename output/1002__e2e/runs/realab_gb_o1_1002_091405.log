@@ -1,0 +1,230 @@
+[    0.7s] realab cond=gb mock=False shape=(4, 8192, 32, 8, 128) dirs=['fwd', 'bwd'] order={'fwd': ['asm', 'fly', 'fly_aa'], 'bwd': ['asm', 's6', 'r29', 's6_aa']} json=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/runs/realab_gb_o1_1002_091405.json
+[    0.7s] sclk witness /sys/class/drm/card1/device/hwmon/hwmon3/freq1_input now 2355 MHz
+[    0.8s] DEVICE {'name': 'AMD Radeon Graphics', 'arch': 'gfx1250', 'cus': 256, 'torch': '2.11.0+rocm7.14.0a20260625', 'hip': '7.14.60850'}
+[    0.9s] GEMM burst ready: 10 x bf16 32768x4096x14336, preferred_blas_library=_BlasBackend.Cublaslt
+[    0.9s] LOAD asm fwd (aiter) + asm bwd (hand-launched ASM + GQA sum)
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+[    2.3s] LOAD fwd fly <- /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/fwd_r16 env={}
+[    2.3s] LOAD fwd fly_aa <- /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/arms/aa/fwd_r16_aa env={}
+[    2.3s] LOAD bwd s6 <- /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/bwd_s6_0341 env={}
+[    2.4s] LOAD bwd r29 <- /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/bwd_r29_0341 env={}
+[    2.4s] LOAD bwd s6_aa <- /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/arms/aa/bwd_s6_0341_aa env={}
+[    2.4s] BLAS env restored: HIPBLASLT_TENSILE_LIBPATH /home/lihuzhan/.local/hipblaslt-gfx1250/gfx1250 -> /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/gfx1250
+[    2.4s] VERSIONS flydsl 0.3.4.1 @ /home/lihuzhan/.local/flydsl0341/flydsl/__init__.py  aiter /home/lihuzhan/code/aiter-src/aiter/ops/mha.py
+[    2.4s] TREE fwd:fly /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/fwd_r16 md5_tree=42d7e192 impl.py=35f4247a _env.py=fe602c25 flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py=370769c9 flydsl_fwd/fmha_fwd_prefill_a16w16_m32x2.py=b0972156
+[    2.4s] TREE fwd:fly_aa /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/arms/aa/fwd_r16_aa md5_tree=42d7e192 impl.py=35f4247a _env.py=fe602c25 flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py=370769c9 flydsl_fwd/fmha_fwd_prefill_a16w16_m32x2.py=b0972156
+[    2.4s] TREE bwd:s6 /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/bwd_s6_0341 md5_tree=f8129830 kernels.py=5e61678d impl.py=46e0e812 _env.py=7df61bba
+[    2.4s] TREE bwd:r29 /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/bwd_r29_0341 md5_tree=d2448786 kernels.py=37f37052 impl.py=08cb8533 _env.py=7df61bba
+[    2.4s] TREE bwd:s6_aa /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/arms/aa/bwd_s6_0341_aa md5_tree=f8129830 kernels.py=5e61678d impl.py=46e0e812 _env.py=7df61bba
+[    2.4s] PHASE load_arms done (1.7s)
+[    3.0s] SETS ['L00', 'L01', 'L02', 'L08', 'L16', 'L31', 'randn'] dO=randn draw 4 x 1.0
+[    3.0s] PHASE load_sets done (0.6s)
+[    3.0s] FIRST fwd asm launching
+[aiter] LoadKernel: _ZN5aiter41fmha_bf16_pertokenBf16_hd128_128x256_maskE hsaco: /home/lihuzhan/code/aiter-src/hsa//gfx1250/fmha_fwd_bf16/fmha_bf16_pertokenBf16_hd128_128x256_mask.co
+[    3.0s] FIRST fwd asm ok (0.0s)
+[    3.0s] FIRST fwd fly launching
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+[    5.5s] FIRST fwd fly ok (2.5s)
+[    5.5s] FIRST fwd fly_aa launching
+[    8.0s] FIRST fwd fly_aa ok (2.5s)
+[    8.0s] FIRST bwd asm launching
+[flydsl_bwd bwd_s6_0341] DQ_SIDE_STREAM=1 DQ_SIDE_RECORD=1 (FLY_BWD_SIDE_STREAM=None FLY_BWD_RECORD_STREAM=None)
+[    8.0s] FIRST bwd asm ok (0.0s)
+[    8.0s] FIRST bwd s6 launching
+[   12.2s] FIRST bwd s6 ok (4.2s)
+[   12.2s] FIRST bwd r29 launching
+[flydsl_bwd bwd_s6_0341_aa] DQ_SIDE_STREAM=1 DQ_SIDE_RECORD=1 (FLY_BWD_SIDE_STREAM=None FLY_BWD_RECORD_STREAM=None)
+[   17.2s] FIRST bwd r29 ok (5.0s)
+[   17.2s] FIRST bwd s6_aa launching
+[   21.5s] FIRST bwd s6_aa ok (4.2s)
+[   21.5s] PHASE first_launch done (18.4s)
+CORR set=L00 dir=fwd arm=asm finite=True
+CORR set=L00 dir=fwd arm=fly finite=True o_vs_asm=55.60dB lse_maxabs_vs_asm=0.746
+CORR set=L00 dir=fwd arm=fly_aa finite=True o_vs_asm=55.60dB lse_maxabs_vs_asm=0.746 vs_fly=bitwise
+CORR set=L00 dir=bwd arm=asm finite=True
+CORR set=L00 dir=bwd arm=s6 finite=True | vs_asm dq=51.21dB dk=48.64dB dv=51.39dB | vs_r29 dq=86.44dB dk=bitwise dv=bitwise
+CORR set=L00 dir=bwd arm=r29 finite=True | vs_asm dq=51.21dB dk=48.64dB dv=51.39dB
+CORR set=L00 dir=bwd arm=s6_aa finite=True | vs_asm dq=51.21dB dk=48.64dB dv=51.39dB | vs_s6 dq=bitwise dk=bitwise dv=bitwise
+CORR set=L01 dir=fwd arm=asm finite=True
+CORR set=L01 dir=fwd arm=fly finite=True o_vs_asm=55.73dB lse_maxabs_vs_asm=0.317
+CORR set=L01 dir=fwd arm=fly_aa finite=True o_vs_asm=55.73dB lse_maxabs_vs_asm=0.317 vs_fly=bitwise
+CORR set=L01 dir=bwd arm=asm finite=True
+CORR set=L01 dir=bwd arm=s6 finite=True | vs_asm dq=49.29dB dk=48.85dB dv=51.49dB | vs_r29 dq=78.13dB dk=bitwise dv=bitwise
+CORR set=L01 dir=bwd arm=r29 finite=True | vs_asm dq=49.29dB dk=48.85dB dv=51.49dB
+CORR set=L01 dir=bwd arm=s6_aa finite=True | vs_asm dq=49.29dB dk=48.85dB dv=51.49dB | vs_s6 dq=bitwise dk=bitwise dv=bitwise
+CORR set=L02 dir=fwd arm=asm finite=True
+CORR set=L02 dir=fwd arm=fly finite=True o_vs_asm=53.93dB lse_maxabs_vs_asm=0.255
+CORR set=L02 dir=fwd arm=fly_aa finite=True o_vs_asm=53.93dB lse_maxabs_vs_asm=0.255 vs_fly=bitwise
+CORR set=L02 dir=bwd arm=asm finite=True
+CORR set=L02 dir=bwd arm=s6 finite=True | vs_asm dq=48.92dB dk=48.69dB dv=51.41dB | vs_r29 dq=78.48dB dk=bitwise dv=bitwise
+CORR set=L02 dir=bwd arm=r29 finite=True | vs_asm dq=48.92dB dk=48.69dB dv=51.41dB
+CORR set=L02 dir=bwd arm=s6_aa finite=True | vs_asm dq=48.92dB dk=48.69dB dv=51.41dB | vs_s6 dq=bitwise dk=bitwise dv=bitwise
+CORR set=L08 dir=fwd arm=asm finite=True
+CORR set=L08 dir=fwd arm=fly finite=True o_vs_asm=52.65dB lse_maxabs_vs_asm=0.42
+CORR set=L08 dir=fwd arm=fly_aa finite=True o_vs_asm=52.65dB lse_maxabs_vs_asm=0.42 vs_fly=bitwise
+CORR set=L08 dir=bwd arm=asm finite=True
+CORR set=L08 dir=bwd arm=s6 finite=True | vs_asm dq=47.75dB dk=48.68dB dv=51.46dB | vs_r29 dq=70.58dB dk=bitwise dv=bitwise
+CORR set=L08 dir=bwd arm=r29 finite=True | vs_asm dq=47.75dB dk=48.68dB dv=51.46dB
+CORR set=L08 dir=bwd arm=s6_aa finite=True | vs_asm dq=47.75dB dk=48.68dB dv=51.46dB | vs_s6 dq=bitwise dk=bitwise dv=bitwise
+CORR set=L16 dir=fwd arm=asm finite=True
+CORR set=L16 dir=fwd arm=fly finite=True o_vs_asm=55.06dB lse_maxabs_vs_asm=0.193
+CORR set=L16 dir=fwd arm=fly_aa finite=True o_vs_asm=55.06dB lse_maxabs_vs_asm=0.193 vs_fly=bitwise
+CORR set=L16 dir=bwd arm=asm finite=True
+CORR set=L16 dir=bwd arm=s6 finite=True | vs_asm dq=50.01dB dk=48.72dB dv=51.42dB | vs_r29 dq=82.28dB dk=bitwise dv=bitwise
+CORR set=L16 dir=bwd arm=r29 finite=True | vs_asm dq=50.01dB dk=48.72dB dv=51.42dB
+CORR set=L16 dir=bwd arm=s6_aa finite=True | vs_asm dq=50.01dB dk=48.72dB dv=51.42dB | vs_s6 dq=bitwise dk=bitwise dv=bitwise
+CORR set=L31 dir=fwd arm=asm finite=True
+CORR set=L31 dir=fwd arm=fly finite=True o_vs_asm=56.59dB lse_maxabs_vs_asm=0.227
+CORR set=L31 dir=fwd arm=fly_aa finite=True o_vs_asm=56.59dB lse_maxabs_vs_asm=0.227 vs_fly=bitwise
+CORR set=L31 dir=bwd arm=asm finite=True
+CORR set=L31 dir=bwd arm=s6 finite=True | vs_asm dq=46.81dB dk=48.82dB dv=51.52dB | vs_r29 dq=71.07dB dk=bitwise dv=bitwise
+CORR set=L31 dir=bwd arm=r29 finite=True | vs_asm dq=46.80dB dk=48.82dB dv=51.52dB
+CORR set=L31 dir=bwd arm=s6_aa finite=True | vs_asm dq=46.81dB dk=48.82dB dv=51.52dB | vs_s6 dq=bitwise dk=bitwise dv=bitwise
+CORR set=randn dir=fwd arm=asm finite=True
+CORR set=randn dir=fwd arm=fly finite=True o_vs_asm=49.93dB lse_maxabs_vs_asm=0.00496
+CORR set=randn dir=fwd arm=fly_aa finite=True o_vs_asm=49.93dB lse_maxabs_vs_asm=0.00496 vs_fly=bitwise
+CORR set=randn dir=bwd arm=asm finite=True
+CORR set=randn dir=bwd arm=s6 finite=True | vs_asm dq=49.88dB dk=48.76dB dv=51.42dB | vs_r29 dq=79.62dB dk=bitwise dv=bitwise
+CORR set=randn dir=bwd arm=r29 finite=True | vs_asm dq=49.88dB dk=48.76dB dv=51.42dB
+CORR set=randn dir=bwd arm=s6_aa finite=True | vs_asm dq=49.88dB dk=48.76dB dv=51.42dB | vs_s6 dq=bitwise dk=bitwise dv=bitwise
+[   21.8s] PHASE correctness done (0.4s)
+[   21.9s] BURST 10 GEMMs: 22.3 21.6 21.3 ms; sclk now 1638 MHz
+[   24.9s] WARM fwd asm: 2168 calls in 3.0s on randn
+[   27.9s] WARM fwd fly: 2136 calls in 3.0s on randn
+[   30.9s] WARM fwd fly_aa: 2136 calls in 3.0s on randn
+[   34.0s] WARM bwd asm: 552 calls in 3.0s on randn
+[   37.0s] WARM bwd s6: 544 calls in 3.0s on randn
+[   40.0s] WARM bwd r29: 464 calls in 3.0s on randn
+[   43.1s] WARM bwd s6_aa: 544 calls in 3.0s on randn
+[   43.1s] PHASE warmup done (21.2s)
+[   44.5s] TIMED gb fwd L00: 4 rounds x 5 (+0 lead) in 1.5s  asm=1.1465 fly=1.5441 fly_aa=1.5485
+[   46.9s] TIMED gb bwd L00: 4 rounds x 5 (+0 lead) in 2.3s  asm=5.5486 s6=5.8002 r29=7.4673 s6_aa=5.7916
+[   48.3s] TIMED gb fwd L01: 4 rounds x 5 (+0 lead) in 1.5s  asm=1.1303 fly=1.5264 fly_aa=1.5392
+[   50.6s] TIMED gb bwd L01: 4 rounds x 5 (+0 lead) in 2.3s  asm=5.4989 s6=5.6658 r29=7.3611 s6_aa=5.6546
+[   52.1s] TIMED gb fwd L02: 4 rounds x 5 (+0 lead) in 1.5s  asm=1.1380 fly=1.5364 fly_aa=1.5332
+[   54.4s] TIMED gb bwd L02: 4 rounds x 5 (+0 lead) in 2.3s  asm=5.5526 s6=5.8087 r29=7.4714 s6_aa=5.8054
+[   55.9s] TIMED gb fwd L08: 4 rounds x 5 (+0 lead) in 1.5s  asm=1.1349 fly=1.5549 fly_aa=1.5321
+[   58.2s] TIMED gb bwd L08: 4 rounds x 5 (+0 lead) in 2.3s  asm=5.5125 s6=5.6752 r29=7.3899 s6_aa=5.6903
+[   59.7s] TIMED gb fwd L16: 4 rounds x 5 (+0 lead) in 1.5s  asm=1.1534 fly=1.5332 fly_aa=1.5272
+[   62.0s] TIMED gb bwd L16: 4 rounds x 5 (+0 lead) in 2.3s  asm=5.5612 s6=5.7854 r29=7.4402 s6_aa=5.7775
+[   63.5s] TIMED gb fwd L31: 4 rounds x 5 (+0 lead) in 1.5s  asm=1.1350 fly=1.5321 fly_aa=1.5384
+[   65.8s] TIMED gb bwd L31: 4 rounds x 5 (+0 lead) in 2.3s  asm=5.5049 s6=5.7195 r29=7.3947 s6_aa=5.7011
+[   67.3s] TIMED gb fwd randn: 4 rounds x 5 (+0 lead) in 1.5s  asm=1.1393 fly=1.5304 fly_aa=1.5174
+[   69.6s] TIMED gb bwd randn: 4 rounds x 5 (+0 lead) in 2.3s  asm=5.5336 s6=5.6527 r29=7.3593 s6_aa=5.6543
+[   69.6s] PHASE timed done (26.5s)
+RESULT cond=gb dir=fwd set=L00 arm=asm n=20 median_ms=1.1465 min_ms=1.1109 max_ms=1.1742 tflops=1918.2 sclk=1278 sclk_pre=1278 sclk_post=1278 pre_ms=23.42 order=asm,fly,fly_aa
+RESULT cond=gb dir=fwd set=L00 arm=fly n=20 median_ms=1.5441 min_ms=1.4965 max_ms=1.6090 tflops=1424.3 sclk=1284 sclk_pre=1284 sclk_post=1284 pre_ms=22.97 order=asm,fly,fly_aa
+RESULT cond=gb dir=fwd set=L00 arm=fly_aa n=20 median_ms=1.5485 min_ms=1.5001 max_ms=1.5947 tflops=1420.3 sclk=1284 sclk_pre=1284 sclk_post=1284 pre_ms=23.00 order=asm,fly,fly_aa
+RATIO cond=gb dir=fwd set=L00 fly/asm=1.3468 fly_aa/asm=1.3506 fly_aa/fly=1.0028  (min-based: fly/asm=1.3471 fly_aa/asm=1.3504 fly_aa/fly=1.0024)
+RESULT cond=gb dir=bwd set=L00 arm=asm n=20 median_ms=5.5486 min_ms=5.5013 max_ms=5.5876 tflops=990.9 sclk=1270 sclk_pre=1270 sclk_post=1270 pre_ms=23.09 order=asm,s6,r29,s6_aa
+RESULT cond=gb dir=bwd set=L00 arm=s6 n=20 median_ms=5.8002 min_ms=5.6326 max_ms=5.8804 tflops=947.9 sclk=1294 sclk_pre=1295 sclk_post=1293 pre_ms=23.05 order=asm,s6,r29,s6_aa
+RESULT cond=gb dir=bwd set=L00 arm=r29 n=20 median_ms=7.4673 min_ms=7.4189 max_ms=7.5971 tflops=736.3 sclk=1329 sclk_pre=1328 sclk_post=1332 pre_ms=21.75 order=asm,s6,r29,s6_aa
+RESULT cond=gb dir=bwd set=L00 arm=s6_aa n=20 median_ms=5.7916 min_ms=5.6350 max_ms=5.8559 tflops=949.3 sclk=1308 sclk_pre=1308 sclk_post=1306 pre_ms=23.07 order=asm,s6,r29,s6_aa
+RATIO cond=gb dir=bwd set=L00 s6/asm=1.0453 r29/asm=1.3458 s6_aa/asm=1.0438 s6_aa/s6=0.9985 s6/r29=0.7767  (min-based: s6/asm=1.0239 r29/asm=1.3486 s6_aa/asm=1.0243 s6_aa/s6=1.0004 s6/r29=0.7592)
+RESULT cond=gb dir=fwd set=L01 arm=asm n=20 median_ms=1.1303 min_ms=1.1014 max_ms=1.1672 tflops=1945.8 sclk=1282 sclk_pre=1281 sclk_post=1282 pre_ms=23.22 order=asm,fly,fly_aa
+RESULT cond=gb dir=fwd set=L01 arm=fly n=20 median_ms=1.5264 min_ms=1.4865 max_ms=1.5584 tflops=1440.9 sclk=1286 sclk_pre=1286 sclk_post=1286 pre_ms=22.89 order=asm,fly,fly_aa
+RESULT cond=gb dir=fwd set=L01 arm=fly_aa n=20 median_ms=1.5392 min_ms=1.4933 max_ms=1.5971 tflops=1428.8 sclk=1286 sclk_pre=1286 sclk_post=1285 pre_ms=23.04 order=asm,fly,fly_aa
+RATIO cond=gb dir=fwd set=L01 fly/asm=1.3504 fly_aa/asm=1.3618 fly_aa/fly=1.0084  (min-based: fly/asm=1.3497 fly_aa/asm=1.3558 fly_aa/fly=1.0046)
+RESULT cond=gb dir=bwd set=L01 arm=asm n=20 median_ms=5.4989 min_ms=5.4610 max_ms=5.5321 tflops=999.9 sclk=1278 sclk_pre=1278 sclk_post=1278 pre_ms=23.10 order=asm,s6,r29,s6_aa
+RESULT cond=gb dir=bwd set=L01 arm=s6 n=20 median_ms=5.6658 min_ms=5.4885 max_ms=5.7601 tflops=970.4 sclk=1304 sclk_pre=1305 sclk_post=1304 pre_ms=22.96 order=asm,s6,r29,s6_aa
+RESULT cond=gb dir=bwd set=L01 arm=r29 n=20 median_ms=7.3611 min_ms=7.3266 max_ms=7.5105 tflops=746.9 sclk=1338 sclk_pre=1338 sclk_post=1339 pre_ms=21.59 order=asm,s6,r29,s6_aa
+RESULT cond=gb dir=bwd set=L01 arm=s6_aa n=20 median_ms=5.6546 min_ms=5.4754 max_ms=5.7031 tflops=972.3 sclk=1322 sclk_pre=1326 sclk_post=1322 pre_ms=22.83 order=asm,s6,r29,s6_aa
+RATIO cond=gb dir=bwd set=L01 s6/asm=1.0304 r29/asm=1.3386 s6_aa/asm=1.0283 s6_aa/s6=0.9980 s6/r29=0.7697  (min-based: s6/asm=1.0050 r29/asm=1.3416 s6_aa/asm=1.0026 s6_aa/s6=0.9976 s6/r29=0.7491)
+RESULT cond=gb dir=fwd set=L02 arm=asm n=20 median_ms=1.1380 min_ms=1.1151 max_ms=1.1774 tflops=1932.5 sclk=1284 sclk_pre=1284 sclk_post=1284 pre_ms=23.29 order=asm,fly,fly_aa
+RESULT cond=gb dir=fwd set=L02 arm=fly n=20 median_ms=1.5364 min_ms=1.4854 max_ms=1.5905 tflops=1431.5 sclk=1286 sclk_pre=1286 sclk_post=1286 pre_ms=23.07 order=asm,fly,fly_aa
+RESULT cond=gb dir=fwd set=L02 arm=fly_aa n=20 median_ms=1.5332 min_ms=1.4868 max_ms=1.5832 tflops=1434.4 sclk=1284 sclk_pre=1284 sclk_post=1284 pre_ms=23.05 order=asm,fly,fly_aa
+RATIO cond=gb dir=fwd set=L02 fly/asm=1.3500 fly_aa/asm=1.3472 fly_aa/fly=0.9979  (min-based: fly/asm=1.3320 fly_aa/asm=1.3333 fly_aa/fly=1.0009)
+RESULT cond=gb dir=bwd set=L02 arm=asm n=20 median_ms=5.5526 min_ms=5.5059 max_ms=5.5818 tflops=990.2 sclk=1275 sclk_pre=1274 sclk_post=1274 pre_ms=23.02 order=asm,s6,r29,s6_aa
+RESULT cond=gb dir=bwd set=L02 arm=s6 n=20 median_ms=5.8087 min_ms=5.6739 max_ms=5.8742 tflops=946.5 sclk=1294 sclk_pre=1294 sclk_post=1294 pre_ms=23.04 order=asm,s6,r29,s6_aa
+RESULT cond=gb dir=bwd set=L02 arm=r29 n=20 median_ms=7.4714 min_ms=7.4152 max_ms=7.6361 tflops=735.9 sclk=1333 sclk_pre=1332 sclk_post=1333 pre_ms=21.77 order=asm,s6,r29,s6_aa
+RESULT cond=gb dir=bwd set=L02 arm=s6_aa n=20 median_ms=5.8054 min_ms=5.5910 max_ms=5.8859 tflops=947.1 sclk=1312 sclk_pre=1314 sclk_post=1312 pre_ms=23.05 order=asm,s6,r29,s6_aa
+RATIO cond=gb dir=bwd set=L02 s6/asm=1.0461 r29/asm=1.3456 s6_aa/asm=1.0455 s6_aa/s6=0.9994 s6/r29=0.7775  (min-based: s6/asm=1.0305 r29/asm=1.3468 s6_aa/asm=1.0154 s6_aa/s6=0.9854 s6/r29=0.7652)
+RESULT cond=gb dir=fwd set=L08 arm=asm n=20 median_ms=1.1349 min_ms=1.0903 max_ms=1.1733 tflops=1937.9 sclk=1276 sclk_pre=1276 sclk_post=1276 pre_ms=23.40 order=asm,fly,fly_aa
+RESULT cond=gb dir=fwd set=L08 arm=fly n=20 median_ms=1.5549 min_ms=1.4946 max_ms=1.6077 tflops=1414.4 sclk=1286 sclk_pre=1286 sclk_post=1286 pre_ms=22.98 order=asm,fly,fly_aa
+RESULT cond=gb dir=fwd set=L08 arm=fly_aa n=20 median_ms=1.5321 min_ms=1.4901 max_ms=1.6197 tflops=1435.5 sclk=1288 sclk_pre=1288 sclk_post=1288 pre_ms=22.95 order=asm,fly,fly_aa
+RATIO cond=gb dir=fwd set=L08 fly/asm=1.3702 fly_aa/asm=1.3501 fly_aa/fly=0.9853  (min-based: fly/asm=1.3709 fly_aa/asm=1.3667 fly_aa/fly=0.9970)
+RESULT cond=gb dir=bwd set=L08 arm=asm n=20 median_ms=5.5125 min_ms=5.4745 max_ms=5.5354 tflops=997.4 sclk=1280 sclk_pre=1280 sclk_post=1280 pre_ms=23.10 order=asm,s6,r29,s6_aa
+RESULT cond=gb dir=bwd set=L08 arm=s6 n=20 median_ms=5.6752 min_ms=5.4735 max_ms=5.7400 tflops=968.8 sclk=1304 sclk_pre=1304 sclk_post=1302 pre_ms=23.01 order=asm,s6,r29,s6_aa
+RESULT cond=gb dir=bwd set=L08 arm=r29 n=20 median_ms=7.3899 min_ms=7.3481 max_ms=7.4843 tflops=744.0 sclk=1338 sclk_pre=1338 sclk_post=1338 pre_ms=21.66 order=asm,s6,r29,s6_aa
+RESULT cond=gb dir=bwd set=L08 arm=s6_aa n=20 median_ms=5.6903 min_ms=5.5125 max_ms=5.7541 tflops=966.2 sclk=1316 sclk_pre=1320 sclk_post=1316 pre_ms=22.94 order=asm,s6,r29,s6_aa
+RATIO cond=gb dir=bwd set=L08 s6/asm=1.0295 r29/asm=1.3406 s6_aa/asm=1.0322 s6_aa/s6=1.0027 s6/r29=0.7680  (min-based: s6/asm=0.9998 r29/asm=1.3422 s6_aa/asm=1.0069 s6_aa/s6=1.0071 s6/r29=0.7449)
+RESULT cond=gb dir=fwd set=L16 arm=asm n=20 median_ms=1.1534 min_ms=1.0785 max_ms=1.1873 tflops=1906.8 sclk=1282 sclk_pre=1282 sclk_post=1282 pre_ms=23.33 order=asm,fly,fly_aa
+RESULT cond=gb dir=fwd set=L16 arm=fly n=20 median_ms=1.5332 min_ms=1.4809 max_ms=1.6221 tflops=1434.5 sclk=1282 sclk_pre=1284 sclk_post=1282 pre_ms=23.07 order=asm,fly,fly_aa
+RESULT cond=gb dir=fwd set=L16 arm=fly_aa n=20 median_ms=1.5272 min_ms=1.4721 max_ms=1.5776 tflops=1440.1 sclk=1285 sclk_pre=1286 sclk_post=1285 pre_ms=23.01 order=asm,fly,fly_aa
+RATIO cond=gb dir=fwd set=L16 fly/asm=1.3293 fly_aa/asm=1.3241 fly_aa/fly=0.9961  (min-based: fly/asm=1.3732 fly_aa/asm=1.3650 fly_aa/fly=0.9941)
+RESULT cond=gb dir=bwd set=L16 arm=asm n=20 median_ms=5.5612 min_ms=5.5246 max_ms=5.5921 tflops=988.7 sclk=1283 sclk_pre=1283 sclk_post=1282 pre_ms=23.00 order=asm,s6,r29,s6_aa
+RESULT cond=gb dir=bwd set=L16 arm=s6 n=20 median_ms=5.7854 min_ms=5.5764 max_ms=5.8588 tflops=950.4 sclk=1296 sclk_pre=1296 sclk_post=1295 pre_ms=23.05 order=asm,s6,r29,s6_aa
+RESULT cond=gb dir=bwd set=L16 arm=r29 n=20 median_ms=7.4402 min_ms=7.3919 max_ms=7.5552 tflops=739.0 sclk=1334 sclk_pre=1333 sclk_post=1336 pre_ms=21.73 order=asm,s6,r29,s6_aa
+RESULT cond=gb dir=bwd set=L16 arm=s6_aa n=20 median_ms=5.7775 min_ms=5.5872 max_ms=5.8728 tflops=951.7 sclk=1308 sclk_pre=1311 sclk_post=1308 pre_ms=23.03 order=asm,s6,r29,s6_aa
+RATIO cond=gb dir=bwd set=L16 s6/asm=1.0403 r29/asm=1.3379 s6_aa/asm=1.0389 s6_aa/s6=0.9986 s6/r29=0.7776  (min-based: s6/asm=1.0094 r29/asm=1.3380 s6_aa/asm=1.0113 s6_aa/s6=1.0019 s6/r29=0.7544)
+RESULT cond=gb dir=fwd set=L31 arm=asm n=20 median_ms=1.1350 min_ms=1.0981 max_ms=1.1550 tflops=1937.7 sclk=1276 sclk_pre=1276 sclk_post=1276 pre_ms=23.47 order=asm,fly,fly_aa
+RESULT cond=gb dir=fwd set=L31 arm=fly n=20 median_ms=1.5321 min_ms=1.4841 max_ms=1.6128 tflops=1435.5 sclk=1286 sclk_pre=1286 sclk_post=1286 pre_ms=22.96 order=asm,fly,fly_aa
+RESULT cond=gb dir=fwd set=L31 arm=fly_aa n=20 median_ms=1.5384 min_ms=1.4913 max_ms=1.5839 tflops=1429.6 sclk=1287 sclk_pre=1287 sclk_post=1287 pre_ms=22.95 order=asm,fly,fly_aa
+RATIO cond=gb dir=fwd set=L31 fly/asm=1.3499 fly_aa/asm=1.3555 fly_aa/fly=1.0041  (min-based: fly/asm=1.3515 fly_aa/asm=1.3580 fly_aa/fly=1.0049)
+RESULT cond=gb dir=bwd set=L31 arm=asm n=20 median_ms=5.5049 min_ms=5.4880 max_ms=5.5301 tflops=998.8 sclk=1274 sclk_pre=1274 sclk_post=1274 pre_ms=23.05 order=asm,s6,r29,s6_aa
+RESULT cond=gb dir=bwd set=L31 arm=s6 n=20 median_ms=5.7195 min_ms=5.5105 max_ms=5.7626 tflops=961.3 sclk=1298 sclk_pre=1300 sclk_post=1298 pre_ms=23.02 order=asm,s6,r29,s6_aa
+RESULT cond=gb dir=bwd set=L31 arm=r29 n=20 median_ms=7.3947 min_ms=7.3449 max_ms=7.5099 tflops=743.5 sclk=1338 sclk_pre=1338 sclk_post=1338 pre_ms=21.69 order=asm,s6,r29,s6_aa
+RESULT cond=gb dir=bwd set=L31 arm=s6_aa n=20 median_ms=5.7011 min_ms=5.5255 max_ms=5.7703 tflops=964.4 sclk=1320 sclk_pre=1322 sclk_post=1318 pre_ms=22.98 order=asm,s6,r29,s6_aa
+RATIO cond=gb dir=bwd set=L31 s6/asm=1.0390 r29/asm=1.3433 s6_aa/asm=1.0357 s6_aa/s6=0.9968 s6/r29=0.7735  (min-based: s6/asm=1.0041 r29/asm=1.3384 s6_aa/asm=1.0068 s6_aa/s6=1.0027 s6/r29=0.7502)
+RESULT cond=gb dir=fwd set=randn arm=asm n=20 median_ms=1.1393 min_ms=1.1194 max_ms=1.1756 tflops=1930.4 sclk=1278 sclk_pre=1278 sclk_post=1278 pre_ms=23.32 order=asm,fly,fly_aa
+RESULT cond=gb dir=fwd set=randn arm=fly n=20 median_ms=1.5304 min_ms=1.4590 max_ms=1.5754 tflops=1437.1 sclk=1282 sclk_pre=1282 sclk_post=1282 pre_ms=23.06 order=asm,fly,fly_aa
+RESULT cond=gb dir=fwd set=randn arm=fly_aa n=20 median_ms=1.5174 min_ms=1.4465 max_ms=1.5517 tflops=1449.4 sclk=1285 sclk_pre=1285 sclk_post=1284 pre_ms=22.96 order=asm,fly,fly_aa
+RATIO cond=gb dir=fwd set=randn fly/asm=1.3433 fly_aa/asm=1.3319 fly_aa/fly=0.9915  (min-based: fly/asm=1.3034 fly_aa/asm=1.2922 fly_aa/fly=0.9914)
+RESULT cond=gb dir=bwd set=randn arm=asm n=20 median_ms=5.5336 min_ms=5.5004 max_ms=5.5629 tflops=993.6 sclk=1276 sclk_pre=1276 sclk_post=1276 pre_ms=23.08 order=asm,s6,r29,s6_aa
+RESULT cond=gb dir=bwd set=randn arm=s6 n=20 median_ms=5.6527 min_ms=5.4399 max_ms=5.7255 tflops=972.7 sclk=1306 sclk_pre=1306 sclk_post=1306 pre_ms=22.86 order=asm,s6,r29,s6_aa
+RESULT cond=gb dir=bwd set=randn arm=r29 n=20 median_ms=7.3593 min_ms=7.3069 max_ms=7.4457 tflops=747.1 sclk=1345 sclk_pre=1344 sclk_post=1345 pre_ms=21.68 order=asm,s6,r29,s6_aa
+RESULT cond=gb dir=bwd set=randn arm=s6_aa n=20 median_ms=5.6543 min_ms=5.4700 max_ms=5.7207 tflops=972.4 sclk=1318 sclk_pre=1321 sclk_post=1318 pre_ms=22.93 order=asm,s6,r29,s6_aa
+RATIO cond=gb dir=bwd set=randn s6/asm=1.0215 r29/asm=1.3299 s6_aa/asm=1.0218 s6_aa/s6=1.0003 s6/r29=0.7681  (min-based: s6/asm=0.9890 r29/asm=1.3284 s6_aa/asm=0.9945 s6_aa/s6=1.0055 s6/r29=0.7445)
+== SUMMARY cond=gb  median ms of CUDA-event times; ratio = arm/ref (<1: arm faster); sclk = MHz median in the call window
+fwd set         asm      fly   fly_aa |    fly/asm fly_aa/asm fly_aa/fly | sclk asm/fly/fly_aa
+fwd L00      1.1465   1.5441   1.5485 |     1.3468     1.3506     1.0028 | 1278/1284/1284
+fwd L01      1.1303   1.5264   1.5392 |     1.3504     1.3618     1.0084 | 1282/1286/1286
+fwd L02      1.1380   1.5364   1.5332 |     1.3500     1.3472     0.9979 | 1284/1286/1284
+fwd L08      1.1349   1.5549   1.5321 |     1.3702     1.3501     0.9853 | 1276/1286/1288
+fwd L16      1.1534   1.5332   1.5272 |     1.3293     1.3241     0.9961 | 1282/1282/1285
+fwd L31      1.1350   1.5321   1.5384 |     1.3499     1.3555     1.0041 | 1276/1286/1287
+fwd randn    1.1393   1.5304   1.5174 |     1.3433     1.3319     0.9915 | 1278/1282/1285
+fwd real6                             |     1.3494     1.3482     0.9991 | geomean over the real sets
+bwd set         asm       s6      r29    s6_aa |     s6/asm    r29/asm  s6_aa/asm   s6_aa/s6     s6/r29 | sclk asm/s6/r29/s6_aa
+bwd L00      5.5486   5.8002   7.4673   5.7916 |     1.0453     1.3458     1.0438     0.9985     0.7767 | 1270/1294/1329/1308
+bwd L01      5.4989   5.6658   7.3611   5.6546 |     1.0304     1.3386     1.0283     0.9980     0.7697 | 1278/1304/1338/1322
+bwd L02      5.5526   5.8087   7.4714   5.8054 |     1.0461     1.3456     1.0455     0.9994     0.7775 | 1275/1294/1333/1312
+bwd L08      5.5125   5.6752   7.3899   5.6903 |     1.0295     1.3406     1.0322     1.0027     0.7680 | 1280/1304/1338/1316
+bwd L16      5.5612   5.7854   7.4402   5.7775 |     1.0403     1.3379     1.0389     0.9986     0.7776 | 1283/1296/1334/1308
+bwd L31      5.5049   5.7195   7.3947   5.7011 |     1.0390     1.3433     1.0357     0.9968     0.7735 | 1274/1298/1338/1320
+bwd randn    5.5336   5.6527   7.3593   5.6543 |     1.0215     1.3299     1.0218     1.0003     0.7681 | 1276/1306/1345/1318
+bwd real6                                      |     1.0384     1.3420     1.0374     0.9990     0.7738 | geomean over the real sets
+== END SUMMARY
+OP_STRING cond=gb stat=mean_of_6_real_sets OP="asm_bwd=5.5298,s6=5.7425,r29=7.4208,asm_fwd=1.1397,r16=1.5378"
+OP_STRING cond=gb stat=median_of_6_real_sets OP="asm_bwd=5.5305,s6=5.7524,r29=7.4175,asm_fwd=1.1365,r16=1.5348"
+/opt/venv/lib/python3.12/site-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+[W1002 09:17:33.195993604 collection.cpp:1148] Warning: ROCTracer produced duplicate flow start: 7 (function operator())
+[   83.0s] KINETO trace /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/traces/realab_gb_o1_1002_091405.trace.json
+[   83.0s] PHASE kineto done (13.4s)
+[   83.0s] REALAB_DONE cond=gb rc=0 excluded={'fwd': [], 'bwd': []} warn=0 json=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/runs/realab_gb_o1_1002_091405.json
+rc=0

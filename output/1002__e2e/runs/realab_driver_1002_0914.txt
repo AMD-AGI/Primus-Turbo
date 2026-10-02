@@ -1,0 +1,196 @@
+[09:14:05] realab 1002_091405: conds=[blk gb] rot=0 aa=1 kineto=1 timeout=360s budget=870s cool=30s
+[09:14:05] trees: fwd=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/fwd_r16  r29=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/bwd_r29_0341  s6=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/bwd_s6_0341 (impl md5 46e0e812, _env 7df61bba)
+[09:14:05] ISA s6 delta flydsl 0.3.2 vs 0.3.4.1: 0 differing lines
+[09:14:05] ISA s6 dkdv flydsl 0.3.2 vs 0.3.4.1: 0 differing lines
+[09:14:05] ISA s6 dqg flydsl 0.3.2 vs 0.3.4.1: 0 differing lines
+[09:14:05] A/A copies: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/arms/aa/fwd_r16_aa /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/arms/aa/bwd_s6_0341_aa (byte-identical .py)
+[09:14:05] plan: blk:o1 gb:o1  (o1 fwd asm,fly,fly_aa bwd asm,s6,r29,s6_aa; o2 reversed)
+[09:14:05] cool-down 30s (KFD empty, lock free) before realab_blk_o1_1002_091405
+[09:14:35] start realab_blk_o1_1002_091405 (fwd asm,fly,fly_aa | bwd asm,s6,r29,s6_aa)
+realab_blk_o1_1002_091405 rc=0 dmesg_bad=0 kfd=[]
+[09:15:39] end realab_blk_o1_1002_091405 rc=0 card 64s (total 64s of 870s)
+    [    2.3s] PHASE load_arms done (1.6s)
+    [    2.9s] PHASE load_sets done (0.6s)
+    [   21.5s] PHASE first_launch done (18.6s)
+    [   21.9s] PHASE correctness done (0.4s)
+    [   43.1s] PHASE warmup done (21.1s)
+    [   60.4s] PHASE timed done (17.4s)
+    OP_STRING cond=blk stat=mean_of_6_real_sets OP="asm_bwd=5.4747,s6=5.3240,r29=6.6038,asm_fwd=1.2095,r16=1.3076"
+    OP_STRING cond=blk stat=median_of_6_real_sets OP="asm_bwd=5.4629,s6=5.3155,r29=6.5980,asm_fwd=1.2052,r16=1.3108"
+    [   63.6s] KINETO trace /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/traces/realab_blk_o1_1002_091405.trace.json
+    [   63.6s] PHASE kineto done (3.1s)
+    [   63.6s] REALAB_DONE cond=blk rc=0 excluded={'fwd': [], 'bwd': []} warn=0 json=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/runs/realab_blk_o1_1002_091405.json
+== SUMMARY cond=blk  median ms of CUDA-event times; ratio = arm/ref (<1: arm faster); sclk = MHz median in the call window
+fwd set         asm      fly   fly_aa |    fly/asm fly_aa/asm fly_aa/fly | sclk asm/fly/fly_aa
+fwd L00      1.2163   1.3272   1.3100 |     1.0912     1.0770     0.9870 | 1418/1392/1389
+fwd L01      1.1897   1.2778   1.2652 |     1.0741     1.0635     0.9901 | 1483/1458/1461
+fwd L02      1.2386   1.3417   1.3135 |     1.0832     1.0605     0.9790 | 1446/1432/1412
+fwd L08      1.1776   1.2774   1.2708 |     1.0848     1.0792     0.9948 | 1477/1446/1448
+fwd L16      1.2410   1.3236   1.2890 |     1.0666     1.0387     0.9738 | 1444/1444/1415
+fwd L31      1.1941   1.2979   1.2800 |     1.0869     1.0719     0.9862 | 1466/1448/1446
+fwd randn    1.1902   1.2849   1.2785 |     1.0796     1.0742     0.9950 | 1466/1460/1434
+fwd real6                             |     1.0811     1.0650     0.9851 | geomean over the real sets
+bwd set         asm       s6      r29    s6_aa |     s6/asm    r29/asm  s6_aa/asm   s6_aa/s6     s6/r29 | sclk asm/s6/r29/s6_aa
+bwd L00      5.4885   5.3984   6.6741   5.3936 |     0.9836     1.2160     0.9827     0.9991     0.8089 | 1440/1469/1530/1483
+bwd L01      5.4313   5.2445   6.5295   5.2405 |     0.9656     1.2022     0.9649     0.9992     0.8032 | 1494/1502/1574/1528
+bwd L02      5.5221   5.3996   6.6691   5.3865 |     0.9778     1.2077     0.9754     0.9976     0.8096 | 1436/1454/1530/1481
+bwd L08      5.4374   5.2788   6.5577   5.2707 |     0.9708     1.2060     0.9693     0.9985     0.8050 | 1482/1496/1566/1520
+bwd L16      5.5399   5.3522   6.6383   5.3536 |     0.9661     1.1983     0.9664     1.0003     0.8063 | 1415/1459/1535/1494
+bwd L31      5.4290   5.2705   6.5541   5.2718 |     0.9708     1.2072     0.9711     1.0003     0.8042 | 1486/1494/1566/1528
+bwd randn    5.4800   5.2437   6.5567   5.2455 |     0.9569     1.1965     0.9572     1.0003     0.7998 | 1475/1488/1573/1525
+bwd real6                                      |     0.9724     1.2062     0.9716     0.9992     0.8062 | geomean over the real sets
+== END SUMMARY
+[09:15:39] opana -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/runs/realab_blk_o1_1002_091405.opana.txt (1 lines)
+[09:15:39] cool-down 30s (KFD empty, lock free) before realab_gb_o1_1002_091405
+[09:16:10] start realab_gb_o1_1002_091405 (fwd asm,fly,fly_aa | bwd asm,s6,r29,s6_aa)
+realab_gb_o1_1002_091405 rc=0 dmesg_bad=0 kfd=[]
+[09:17:33] end realab_gb_o1_1002_091405 rc=0 card 83s (total 147s of 870s)
+    [    2.4s] PHASE load_arms done (1.7s)
+    [    3.0s] PHASE load_sets done (0.6s)
+    [   21.5s] PHASE first_launch done (18.4s)
+    [   21.8s] PHASE correctness done (0.4s)
+    [   21.9s] BURST 10 GEMMs: 22.3 21.6 21.3 ms; sclk now 1638 MHz
+    [   43.1s] PHASE warmup done (21.2s)
+    [   69.6s] PHASE timed done (26.5s)
+    OP_STRING cond=gb stat=mean_of_6_real_sets OP="asm_bwd=5.5298,s6=5.7425,r29=7.4208,asm_fwd=1.1397,r16=1.5378"
+    OP_STRING cond=gb stat=median_of_6_real_sets OP="asm_bwd=5.5305,s6=5.7524,r29=7.4175,asm_fwd=1.1365,r16=1.5348"
+    [   83.0s] KINETO trace /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/traces/realab_gb_o1_1002_091405.trace.json
+    [   83.0s] PHASE kineto done (13.4s)
+    [   83.0s] REALAB_DONE cond=gb rc=0 excluded={'fwd': [], 'bwd': []} warn=0 json=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/runs/realab_gb_o1_1002_091405.json
+== SUMMARY cond=gb  median ms of CUDA-event times; ratio = arm/ref (<1: arm faster); sclk = MHz median in the call window
+fwd set         asm      fly   fly_aa |    fly/asm fly_aa/asm fly_aa/fly | sclk asm/fly/fly_aa
+fwd L00      1.1465   1.5441   1.5485 |     1.3468     1.3506     1.0028 | 1278/1284/1284
+fwd L01      1.1303   1.5264   1.5392 |     1.3504     1.3618     1.0084 | 1282/1286/1286
+fwd L02      1.1380   1.5364   1.5332 |     1.3500     1.3472     0.9979 | 1284/1286/1284
+fwd L08      1.1349   1.5549   1.5321 |     1.3702     1.3501     0.9853 | 1276/1286/1288
+fwd L16      1.1534   1.5332   1.5272 |     1.3293     1.3241     0.9961 | 1282/1282/1285
+fwd L31      1.1350   1.5321   1.5384 |     1.3499     1.3555     1.0041 | 1276/1286/1287
+fwd randn    1.1393   1.5304   1.5174 |     1.3433     1.3319     0.9915 | 1278/1282/1285
+fwd real6                             |     1.3494     1.3482     0.9991 | geomean over the real sets
+bwd set         asm       s6      r29    s6_aa |     s6/asm    r29/asm  s6_aa/asm   s6_aa/s6     s6/r29 | sclk asm/s6/r29/s6_aa
+bwd L00      5.5486   5.8002   7.4673   5.7916 |     1.0453     1.3458     1.0438     0.9985     0.7767 | 1270/1294/1329/1308
+bwd L01      5.4989   5.6658   7.3611   5.6546 |     1.0304     1.3386     1.0283     0.9980     0.7697 | 1278/1304/1338/1322
+bwd L02      5.5526   5.8087   7.4714   5.8054 |     1.0461     1.3456     1.0455     0.9994     0.7775 | 1275/1294/1333/1312
+bwd L08      5.5125   5.6752   7.3899   5.6903 |     1.0295     1.3406     1.0322     1.0027     0.7680 | 1280/1304/1338/1316
+bwd L16      5.5612   5.7854   7.4402   5.7775 |     1.0403     1.3379     1.0389     0.9986     0.7776 | 1283/1296/1334/1308
+bwd L31      5.5049   5.7195   7.3947   5.7011 |     1.0390     1.3433     1.0357     0.9968     0.7735 | 1274/1298/1338/1320
+bwd randn    5.5336   5.6527   7.3593   5.6543 |     1.0215     1.3299     1.0218     1.0003     0.7681 | 1276/1306/1345/1318
+bwd real6                                      |     1.0384     1.3420     1.0374     0.9990     0.7738 | geomean over the real sets
+== END SUMMARY
+[09:17:34] opana -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/runs/realab_gb_o1_1002_091405.opana.txt (1 lines)
+== SUMMARY blk_o1_1002_091405  median ms of CUDA-event times; ratio = arm/ref (<1: arm faster); sclk = MHz median in the call window
+fwd set         asm      fly   fly_aa |    fly/asm fly_aa/asm fly_aa/fly | sclk asm/fly/fly_aa
+fwd L00      1.2163   1.3272   1.3100 |     1.0912     1.0770     0.9870 | 1418/1392/1389
+fwd L01      1.1897   1.2778   1.2652 |     1.0741     1.0635     0.9901 | 1483/1458/1461
+fwd L02      1.2386   1.3417   1.3135 |     1.0832     1.0605     0.9790 | 1446/1432/1412
+fwd L08      1.1776   1.2774   1.2708 |     1.0848     1.0792     0.9948 | 1477/1446/1448
+fwd L16      1.2410   1.3236   1.2890 |     1.0666     1.0387     0.9738 | 1444/1444/1415
+fwd L31      1.1941   1.2979   1.2800 |     1.0869     1.0719     0.9862 | 1466/1448/1446
+fwd randn    1.1902   1.2849   1.2785 |     1.0796     1.0742     0.9950 | 1466/1460/1434
+fwd real6                             |     1.0811     1.0650     0.9851 | geomean over the real sets
+bwd set         asm       s6      r29    s6_aa |     s6/asm    r29/asm  s6_aa/asm   s6_aa/s6     s6/r29 | sclk asm/s6/r29/s6_aa
+bwd L00      5.4885   5.3984   6.6741   5.3936 |     0.9836     1.2160     0.9827     0.9991     0.8089 | 1440/1469/1530/1483
+bwd L01      5.4313   5.2445   6.5295   5.2405 |     0.9656     1.2022     0.9649     0.9992     0.8032 | 1494/1502/1574/1528
+bwd L02      5.5221   5.3996   6.6691   5.3865 |     0.9778     1.2077     0.9754     0.9976     0.8096 | 1436/1454/1530/1481
+bwd L08      5.4374   5.2788   6.5577   5.2707 |     0.9708     1.2060     0.9693     0.9985     0.8050 | 1482/1496/1566/1520
+bwd L16      5.5399   5.3522   6.6383   5.3536 |     0.9661     1.1983     0.9664     1.0003     0.8063 | 1415/1459/1535/1494
+bwd L31      5.4290   5.2705   6.5541   5.2718 |     0.9708     1.2072     0.9711     1.0003     0.8042 | 1486/1494/1566/1528
+bwd randn    5.4800   5.2437   6.5567   5.2455 |     0.9569     1.1965     0.9572     1.0003     0.7998 | 1475/1488/1573/1525
+bwd real6                                      |     0.9724     1.2062     0.9716     0.9992     0.8062 | geomean over the real sets
+== END SUMMARY
+OP_STRING blk_o1_1002_091405 stat=mean_of_6_real_sets OP="asm_bwd=5.4747,s6=5.3240,r29=6.6038,asm_fwd=1.2095,r16=1.3076"
+OP_STRING blk_o1_1002_091405 stat=median_of_6_real_sets OP="asm_bwd=5.4629,s6=5.3155,r29=6.5980,asm_fwd=1.2052,r16=1.3108"
+   phases {'load_arms': 1.6, 'load_sets': 0.6, 'first_launch': 18.6, 'correctness': 0.4, 'warmup': 21.1, 'timed': 17.4, 'kineto': 3.1}  burst_ms -  excluded {'fwd': [], 'bwd': []}  warn 0
+
+== SUMMARY gb_o1_1002_091405  median ms of CUDA-event times; ratio = arm/ref (<1: arm faster); sclk = MHz median in the call window
+fwd set         asm      fly   fly_aa |    fly/asm fly_aa/asm fly_aa/fly | sclk asm/fly/fly_aa
+fwd L00      1.1465   1.5441   1.5485 |     1.3468     1.3506     1.0028 | 1278/1284/1284
+fwd L01      1.1303   1.5264   1.5392 |     1.3504     1.3618     1.0084 | 1282/1286/1286
+fwd L02      1.1380   1.5364   1.5332 |     1.3500     1.3472     0.9979 | 1284/1286/1284
+fwd L08      1.1349   1.5549   1.5321 |     1.3702     1.3501     0.9853 | 1276/1286/1288
+fwd L16      1.1534   1.5332   1.5272 |     1.3293     1.3241     0.9961 | 1282/1282/1285
+fwd L31      1.1350   1.5321   1.5384 |     1.3499     1.3555     1.0041 | 1276/1286/1287
+fwd randn    1.1393   1.5304   1.5174 |     1.3433     1.3319     0.9915 | 1278/1282/1285
+fwd real6                             |     1.3494     1.3482     0.9991 | geomean over the real sets
+bwd set         asm       s6      r29    s6_aa |     s6/asm    r29/asm  s6_aa/asm   s6_aa/s6     s6/r29 | sclk asm/s6/r29/s6_aa
+bwd L00      5.5486   5.8002   7.4673   5.7916 |     1.0453     1.3458     1.0438     0.9985     0.7767 | 1270/1294/1329/1308
+bwd L01      5.4989   5.6658   7.3611   5.6546 |     1.0304     1.3386     1.0283     0.9980     0.7697 | 1278/1304/1338/1322
+bwd L02      5.5526   5.8087   7.4714   5.8054 |     1.0461     1.3456     1.0455     0.9994     0.7775 | 1275/1294/1333/1312
+bwd L08      5.5125   5.6752   7.3899   5.6903 |     1.0295     1.3406     1.0322     1.0027     0.7680 | 1280/1304/1338/1316
+bwd L16      5.5612   5.7854   7.4402   5.7775 |     1.0403     1.3379     1.0389     0.9986     0.7776 | 1283/1296/1334/1308
+bwd L31      5.5049   5.7195   7.3947   5.7011 |     1.0390     1.3433     1.0357     0.9968     0.7735 | 1274/1298/1338/1320
+bwd randn    5.5336   5.6527   7.3593   5.6543 |     1.0215     1.3299     1.0218     1.0003     0.7681 | 1276/1306/1345/1318
+bwd real6                                      |     1.0384     1.3420     1.0374     0.9990     0.7738 | geomean over the real sets
+== END SUMMARY
+OP_STRING gb_o1_1002_091405 stat=mean_of_6_real_sets OP="asm_bwd=5.5298,s6=5.7425,r29=7.4208,asm_fwd=1.1397,r16=1.5378"
+OP_STRING gb_o1_1002_091405 stat=median_of_6_real_sets OP="asm_bwd=5.5305,s6=5.7524,r29=7.4175,asm_fwd=1.1365,r16=1.5348"
+   phases {'load_arms': 1.7, 'load_sets': 0.6, 'first_launch': 18.4, 'correctness': 0.4, 'warmup': 21.2, 'timed': 26.5, 'kineto': 13.4}  burst_ms [22.324504852294922, 21.554031372070312, 21.33539581298828]  excluded {'fwd': [], 'bwd': []}  warn 0
+
+== CROSS ratio per set across runs (median-based)
+ratio        set      blk_o1_1002_091405  gb_o1_1002_091405
+fly/asm      L00                  1.0912             1.3468
+fly/asm      L01                  1.0741             1.3504
+fly/asm      L02                  1.0832             1.3500
+fly/asm      L08                  1.0848             1.3702
+fly/asm      L16                  1.0666             1.3293
+fly/asm      L31                  1.0869             1.3499
+fly/asm      randn                1.0796             1.3433
+fly/asm      real(gm)             1.0811             1.3494
+fly_aa/asm   L00                  1.0770             1.3506
+fly_aa/asm   L01                  1.0635             1.3618
+fly_aa/asm   L02                  1.0605             1.3472
+fly_aa/asm   L08                  1.0792             1.3501
+fly_aa/asm   L16                  1.0387             1.3241
+fly_aa/asm   L31                  1.0719             1.3555
+fly_aa/asm   randn                1.0742             1.3319
+fly_aa/asm   real(gm)             1.0650             1.3482
+fly_aa/fly   L00                  0.9870             1.0028
+fly_aa/fly   L01                  0.9901             1.0084
+fly_aa/fly   L02                  0.9790             0.9979
+fly_aa/fly   L08                  0.9948             0.9853
+fly_aa/fly   L16                  0.9738             0.9961
+fly_aa/fly   L31                  0.9862             1.0041
+fly_aa/fly   randn                0.9950             0.9915
+fly_aa/fly   real(gm)             0.9851             0.9991
+s6/asm       L00                  0.9836             1.0453
+s6/asm       L01                  0.9656             1.0304
+s6/asm       L02                  0.9778             1.0461
+s6/asm       L08                  0.9708             1.0295
+s6/asm       L16                  0.9661             1.0403
+s6/asm       L31                  0.9708             1.0390
+s6/asm       randn                0.9569             1.0215
+s6/asm       real(gm)             0.9724             1.0384
+r29/asm      L00                  1.2160             1.3458
+r29/asm      L01                  1.2022             1.3386
+r29/asm      L02                  1.2077             1.3456
+r29/asm      L08                  1.2060             1.3406
+r29/asm      L16                  1.1983             1.3379
+r29/asm      L31                  1.2072             1.3433
+r29/asm      randn                1.1965             1.3299
+r29/asm      real(gm)             1.2062             1.3420
+s6_aa/asm    L00                  0.9827             1.0438
+s6_aa/asm    L01                  0.9649             1.0283
+s6_aa/asm    L02                  0.9754             1.0455
+s6_aa/asm    L08                  0.9693             1.0322
+s6_aa/asm    L16                  0.9664             1.0389
+s6_aa/asm    L31                  0.9711             1.0357
+s6_aa/asm    randn                0.9572             1.0218
+s6_aa/asm    real(gm)             0.9716             1.0374
+s6_aa/s6     L00                  0.9991             0.9985
+s6_aa/s6     L01                  0.9992             0.9980
+s6_aa/s6     L02                  0.9976             0.9994
+s6_aa/s6     L08                  0.9985             1.0027
+s6_aa/s6     L16                  1.0003             0.9986
+s6_aa/s6     L31                  1.0003             0.9968
+s6_aa/s6     randn                1.0003             1.0003
+s6_aa/s6     real(gm)             0.9992             0.9990
+s6/r29       L00                  0.8089             0.7767
+s6/r29       L01                  0.8032             0.7697
+s6/r29       L02                  0.8096             0.7775
+s6/r29       L08                  0.8050             0.7680
+s6/r29       L16                  0.8063             0.7776
+s6/r29       L31                  0.8042             0.7735
+s6/r29       randn                0.7998             0.7681
+s6/r29       real(gm)             0.8062             0.7738
+== END CROSS
+[09:17:34] REALAB_DRIVER_DONE rc=0 card_time=147s runs: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/runs/realab_blk_o1_1002_091405.json /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/runs/realab_gb_o1_1002_091405.json
