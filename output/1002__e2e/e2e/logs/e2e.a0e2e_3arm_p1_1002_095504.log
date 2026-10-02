@@ -1,0 +1,661 @@
+E2E_ENV PREFER=1 LIB=/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/gfx1250 E2E_ATTN=asm;asm,fly,flyr29,asm,flyr29,fly
+[2026-10-02 10:10:29] [NODE-0(heliosr-1b114-c07-1)] [INFO] [main] Loaded config: /home/lihuzhan/code/2026_0828__primus/Primus/runner/.primus.yaml
+[2026-10-02 10:10:29] [NODE-0(heliosr-1b114-c07-1)] [INFO] [main] Would execute: bash /home/lihuzhan/code/2026_0828__primus/Primus/runner/primus-cli-direct.sh --log_file /home/lihuzhan/_dbg_l8b/a0e2e_3arm_p1_1002_095504/launcher.log -- train pretrain --config /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/configs/run.a0e2e_3arm_p1_1002_095504.yaml
+[2026-10-02 10:10:29] [NODE-0(heliosr-1b114-c07-1)] [INFO] [main] Executing: bash /home/lihuzhan/code/2026_0828__primus/Primus/runner/primus-cli-direct.sh --log_file /home/lihuzhan/_dbg_l8b/a0e2e_3arm_p1_1002_095504/launcher.log -- train pretrain --config /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/configs/run.a0e2e_3arm_p1_1002_095504.yaml
+[2026-10-02 10:10:29] [NODE-0(heliosr-1b114-c07-1)] [INFO] -----------------------------------------------
+[2026-10-02 10:10:29] [NODE-0(heliosr-1b114-c07-1)] [INFO] primus-cli-direct.sh
+[2026-10-02 10:10:29] [NODE-0(heliosr-1b114-c07-1)] [INFO] -----------------------------------------------
+[2026-10-02 10:10:29] [NODE-0(heliosr-1b114-c07-1)] [INFO] [direct] PRE_PARSE_ARGS (runner options): --log_file /home/lihuzhan/_dbg_l8b/a0e2e_3arm_p1_1002_095504/launcher.log
+[2026-10-02 10:10:29] [NODE-0(heliosr-1b114-c07-1)] [INFO] [direct] PRIMUS_ARGS (python module args): train pretrain --config /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/configs/run.a0e2e_3arm_p1_1002_095504.yaml
+[2026-10-02 10:10:29] [NODE-0(heliosr-1b114-c07-1)] [INFO] [direct] Combined args for second pass: --log_file /home/lihuzhan/_dbg_l8b/a0e2e_3arm_p1_1002_095504/launcher.log -- train pretrain --config /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/configs/run.a0e2e_3arm_p1_1002_095504.yaml
+[2026-10-02 10:10:29] [NODE-0(heliosr-1b114-c07-1)] [INFO] [direct] Loaded config: /home/lihuzhan/code/2026_0828__primus/Primus/runner/.primus.yaml
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [direct] CLI: log_file += /home/lihuzhan/_dbg_l8b/a0e2e_3arm_p1_1002_095504/launcher.log
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] ========== Training Cluster Info ==========
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     MASTER_ADDR=localhost
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     MASTER_PORT=38963
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     NNODES=1
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     NODE_RANK=0
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     GPUS_PER_NODE=1
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] ========== Python Path and Data Paths ==========
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     PRIMUS_PATH=/home/lihuzhan/code/2026_0828__primus/Primus
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     PRIMUS_IMPORT_ROOT=/home/lihuzhan/code/2026_0828__primus/Primus
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     DATA_PATH=/home/lihuzhan/code/2026_0828__primus/Primus/data
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     HF_HOME=/home/lihuzhan/code/2026_0828__primus/Primus/data/huggingface
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     PYTHONPATH=/home/lihuzhan/code/2026_0828__primus/Primus:/opt/venv/lib/python3.12/site-packages:/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/attn_backends/shim:/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/attn_backends:/home/lihuzhan/.local/flydsl0341:/home/lihuzhan/code/aiter-src
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] ========== NCCL and Network Settings ==========
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     HIP_VISIBLE_DEVICES=0
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     NCCL_DEBUG=<unset>
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     NCCL_CHECKS_DISABLE=1
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     NCCL_IB_GID_INDEX=3
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     NCCL_CROSS_NIC=0
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     NCCL_IB_HCA=ionic_0:1
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     IP_INTERFACE=enx00249b8d4d1e
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     NCCL_SOCKET_IFNAME=enx00249b8d4d1e
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     GLOO_SOCKET_IFNAME=enx00249b8d4d1e
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] ========== RCCL Settings ==========
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     RCCL_MSCCL_ENABLE=0
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     RCCL_MSCCLPP_ENABLE=0
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     RCCL_MSCCLPP_FORCE_ENABLE=0
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     RCCL_MSCCLPP_THRESHOLD=1073741824
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     MSCCLPP_DISABLE_CHANNEL_CACHE=FALSE
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK=0
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] ========== AMD GPU Optimizations ==========
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     HSA_ENABLE_SDMA=1
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     HSA_NO_SCRATCH_RECLAIM=1
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] ========== General Performance Tuning ==========
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     GPU_MAX_HW_QUEUES=2
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     ENABLE_NUMA_BINDING=0
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     HSA_KERNARG_POOL_SIZE=<unset>
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     CUDA_DEVICE_MAX_CONNECTIONS=1
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     TORCH_NCCL_HIGH_PRIORITY=1
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     NCCL_PXN_DISABLE=1
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     NCCL_P2P_NET_CHUNKSIZE=524288
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] ========== Transformer Engine Optimizations ==========
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     NVTE_USE_CAST_TRANSPOSE_TRITON=1
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     NVTE_USE_OPTIMIZED_HIPIFIED_CAST_TRANSPOSE=0
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     NVTE_CK_USES_BWD_V3=1
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32=0
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     NVTE_DEBUG=0
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     NVTE_DEBUG_LEVEL=0
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     NVTE_FUSED_ATTN_LOG_CONFIG=0
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     PATCH_TE_FLASH_ATTN=0
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     PRIMUS_DETERMINISTIC=<unset>
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     NCCL_ALGO=<unset>
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     NVTE_ALLOW_NONDETERMINISTIC_ALGO=<unset>
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     ROCBLAS_DEFAULT_ATOMICS_MODE=<unset>
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     TORCH_COMPILE_DISABLE=<unset>
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO]     PRIMUS_TURBO_DEEPEP_TIMEOUT=600
+
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] === Loading Primus Environment Configuration ===
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] Detected GPU model: MI455X
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] Loading GPU-specific configuration: /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/envs/MI455X.sh
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] Loading MI455X (gfx1250) specific settings...
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] MI455X: using private RCCL from /opt/rccl-gfx1250
+
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] === Validating Configuration ===
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] ✓ Configuration validation passed
+
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] === Environment Configuration Complete ===
+
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Detected hooks directory: /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Executing hook: /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/00_rebuild_primus_turbo.sh train pretrain --config /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/configs/run.a0e2e_3arm_p1_1002_095504.yaml
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Hook /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/00_rebuild_primus_turbo.sh finished in 0s
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Executing hook: /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/01_patch_te_flash_attn_max_version.sh train pretrain --config /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/configs/run.a0e2e_3arm_p1_1002_095504.yaml
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Hook /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/01_patch_te_flash_attn_max_version.sh finished in 0s
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Executing hook: /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/02_rebuild_bnxt.sh train pretrain --config /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/configs/run.a0e2e_3arm_p1_1002_095504.yaml
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Hook /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/02_rebuild_bnxt.sh finished in 0s
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Executing hook: /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/03_detect_nccl_ib_tc.sh train pretrain --config /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/configs/run.a0e2e_3arm_p1_1002_095504.yaml
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Hook /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/03_detect_nccl_ib_tc.sh finished in 0s
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Executing hook: /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/03_enable_ainic.sh train pretrain --config /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/configs/run.a0e2e_3arm_p1_1002_095504.yaml
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Hook /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/03_enable_ainic.sh finished in 0s
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Executing hook: /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/03_enable_aiter.sh train pretrain --config /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/configs/run.a0e2e_3arm_p1_1002_095504.yaml
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] exported env from hook: AITER_LOG_LEVEL=ERROR
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Hook /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/03_enable_aiter.sh finished in 0s
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Executing hook: /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/04_rebuild_uep.sh train pretrain --config /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/configs/run.a0e2e_3arm_p1_1002_095504.yaml
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Hook /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/04_rebuild_uep.sh finished in 0s
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Executing hook: /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/05_check_primus_requirements.sh train pretrain --config /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/configs/run.a0e2e_3arm_p1_1002_095504.yaml
+
+[WARN] Primus requirements not satisfied. Missing packages:
+         - matplotlib
+         - markdown2
+         - weasyprint
+         - torchao
+         - blobfile
+         - mlflow
+         - pyrsmi
+         - pulp
+         - hip-python
+         - mlperf-logging
+         - mlperf-common
+         - megatron-energon
+         - webdataset
+         - flash-linear-attention
+
+       To install:  pip install -r /home/lihuzhan/code/2026_0828__primus/Primus/requirements.txt
+
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Hook /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/05_check_primus_requirements.sh finished in 0s
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Executing hook: /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/05_deterministic.sh train pretrain --config /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/configs/run.a0e2e_3arm_p1_1002_095504.yaml
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Hook /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/05_deterministic.sh finished in 0s
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Executing hook: /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/05_using_uep.sh train pretrain --config /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/configs/run.a0e2e_3arm_p1_1002_095504.yaml
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] USING_UEP is disabled. PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND set to TURBO
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] exported env from hook: PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND=TURBO
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Hook /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/05_using_uep.sh finished in 0s
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Executing hook: /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/06_enable_sdma_all_gather.sh train pretrain --config /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/configs/run.a0e2e_3arm_p1_1002_095504.yaml
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Hook /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/06_enable_sdma_all_gather.sh finished in 0s
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Executing hook: /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/06_fix_aiter_asm_dir.sh train pretrain --config /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/configs/run.a0e2e_3arm_p1_1002_095504.yaml
+[fix_aiter_asm_dir] aiter_meta/hsa not found, skipping
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Hook /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/06_fix_aiter_asm_dir.sh finished in 0s
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Executing hook: /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/10_auto_nccl_net.sh train pretrain --config /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/configs/run.a0e2e_3arm_p1_1002_095504.yaml
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Hook /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/10_auto_nccl_net.sh finished in 0s
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Detected hooks directory: /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/train/pretrain
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Executing hook: /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/train/pretrain/prepare_experiment.sh train pretrain --config /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/configs/run.a0e2e_3arm_p1_1002_095504.yaml
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] prepare_experiment.sh: patch args file: /tmp/primus_patch_args.txt
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] prepare_experiment.sh: executing shell hook 00_install_requirements.sh
+[INFO] Using pip cache: ./data//pip_cache
+[2026-10-02 10:10:30] [NODE-0(heliosr-1b114-c07-1)] [INFO] prepare_experiment.sh: framework=torchtitan script=/home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/train/pretrain/torchtitan/prepare.py
+[NODE-0(heliosr-1b114-c07-1)] [INFO] ========== Prepare Torchtitan dataset ==========
+[NODE-0(heliosr-1b114-c07-1)] [INFO] PRIMUS_PATH: /home/lihuzhan/code/2026_0828__primus/Primus
+[NODE-0(heliosr-1b114-c07-1)] [INFO] DATA_PATH: /home/lihuzhan/code/2026_0828__primus/Primus/data
+[NODE-0(heliosr-1b114-c07-1)] [INFO] EXP: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/configs/run.a0e2e_3arm_p1_1002_095504.yaml
+[NODE-0(heliosr-1b114-c07-1)] [INFO] BACKEND_PATH: None
+[NODE-0(heliosr-1b114-c07-1)] [INFO] PATCH-ARGS: /tmp/primus_patch_args.txt
+[NODE-0(heliosr-1b114-c07-1)] [INFO] TORCHTITAN_PATH not found, falling back to: /home/lihuzhan/code/2026_0828__primus/Primus/third_party/torchtitan
+[NODE-0(heliosr-1b114-c07-1)] [INFO] Installing TorchTitan in editable (compat) mode via pip (path: /home/lihuzhan/code/2026_0828__primus/Primus/third_party/torchtitan)
+Found existing installation: torchtitan 0.2.2
+Uninstalling torchtitan-0.2.2:
+  Successfully uninstalled torchtitan-0.2.2
+
+[notice] A new release of pip is available: 26.1.2 -> 26.2.1
+[notice] To update, run: pip install --upgrade pip
+[NODE-0(heliosr-1b114-c07-1)] [INFO] Detected local HF assets path: /home/lihuzhan/_hfassets/llama31_8B
+[NODE-0(heliosr-1b114-c07-1)] [INFO] HF assets already available locally at /home/lihuzhan/_hfassets/llama31_8B
+[NODE-0(heliosr-1b114-c07-1)] [INFO] Exposing resolved HF assets path via extra.model.hf_assets_path=/home/lihuzhan/_hfassets/llama31_8B
+[NODE-0(heliosr-1b114-c07-1)] [INFO] Exposing resolved backend path via extra.backend_path=/home/lihuzhan/code/2026_0828__primus/Primus/third_party/torchtitan
+[2026-10-02 10:10:33] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] extra arg from hook: --model.hf_assets_path /home/lihuzhan/_hfassets/llama31_8B
+[2026-10-02 10:10:33] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] extra arg from hook: --backend_path /home/lihuzhan/code/2026_0828__primus/Primus/third_party/torchtitan
+[2026-10-02 10:10:33] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Hook /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/train/pretrain/prepare_experiment.sh finished in 3s
+[2026-10-02 10:10:33] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Executing hook: /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/train/pretrain/utils.py train pretrain --config /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/configs/run.a0e2e_3arm_p1_1002_095504.yaml
+[2026-10-02 10:10:33] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] Hook /home/lihuzhan/code/2026_0828__primus/Primus/runner/helpers/hooks/train/pretrain/utils.py finished in 0s
+[2026-10-02 10:10:33] [NODE-0(heliosr-1b114-c07-1)] [INFO] [Hooks] All hooks executed successfully
+[2026-10-02 10:10:33] [NODE-0(heliosr-1b114-c07-1)] [INFO] [direct] NUMA binding: AUTO (default OFF)
+
+==========================================
+  Primus Direct Launch Configuration
+==========================================
+  Run Mode        : torchrun
+  Script Path     : primus/cli/main.py
+  Config File     : <none>
+  Log File        : /home/lihuzhan/_dbg_l8b/a0e2e_3arm_p1_1002_095504/launcher.log
+  NUMA Binding    : auto
+  Patch Scripts   : <none>
+  Primus Args     : train pretrain --config /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/configs/run.a0e2e_3arm_p1_1002_095504.yaml --model.hf_assets_path /home/lihuzhan/_hfassets/llama31_8B --backend_path /home/lihuzhan/code/2026_0828__primus/Primus/third_party/torchtitan
+
+  Distributed Settings:
+    NNODES          : 1
+    NODE_RANK       : 0
+    GPUS_PER_NODE   : 1
+    MASTER_ADDR     : localhost
+    MASTER_PORT     : 38963
+
+========== System Information ==========
+    Hostname: heliosr-1b114-c07-1
+    Kernel: 6.14.0-37-generic
+    CPUs: 255
+    Memory: 251 GB
+    Container: Yes
+    Slurm Job: No
+    GPUs: 1
+  Full Command:
+    Executing: torchrun --nproc_per_node 1 --nnodes 1 --node_rank 0 --master_addr localhost --master_port 38963 --local-ranks-filter 0 primus/cli/main.py train pretrain --config /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/configs/run.a0e2e_3arm_p1_1002_095504.yaml --model.hf_assets_path /home/lihuzhan/_hfassets/llama31_8B --backend_path /home/lihuzhan/code/2026_0828__primus/Primus/third_party/torchtitan 2>&1 | tee /home/lihuzhan/_dbg_l8b/a0e2e_3arm_p1_1002_095504/launcher.log
+
+==========================================
+  
+==========================================
+[Primus:Runtime] Applying CLI overrides: {'model': {'hf_assets_path': '/home/lihuzhan/_hfassets/llama31_8B'}}
+[Primus:Env] HF_HOME already set: /home/lihuzhan/code/2026_0828__primus/Primus/data/huggingface
+[Primus:Env] rank=0, world_size=1, local_rank=0, master=localhost:38963
+[[32m20261002 10:10:36[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[backend_registry.py:119] : [Primus:BackendRegistry] lazy-load backend='torchtitan' module='primus.backends.torchtitan'[0m
+[[32m20261002 10:10:36[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[--backend_adapter.py:90] : [Primus:torchtitan] Backend prepared[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[torchtitan_adapter.py:88] : [Primus:TorchTitanAdapter] Converted Primus module params → TorchTitan args[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[----train_runtime.py:216] : [Runtime] Applying build_args patches...[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------patch_runner.py:92] : --------------------------------------------------------------------------------[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------patch_runner.py:93] : [Patch] Executing patches: backend=torchtitan, phase=build_args, backend_version=0.2.2, primus_version=None, model=namespace(name='llama3', flavor='8B_flex', hf_assets_path='/home/lihuzhan/_hfassets/llama31_8B', converters=['primus_turbo']), module=pre_trainer, platform=None, dry_run=False, enabled_ids=None[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----patch_runner.py:107] : [Patch] Pre-filtered 0 patches (out of 0 total) for torchtitan/build_args[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----patch_runner.py:143] : [Patch] Applied 0/0 patches for torchtitan/build_args: [][0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----patch_runner.py:146] : --------------------------------------------------------------------------------[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:239] : --------------------------------------------------------------------------------[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:249] : Final backend args (after patches): (164 parameters)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   activation_checkpoint.debug                                        : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   activation_checkpoint.determinism_check                            : default (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   activation_checkpoint.early_stop                                   : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   activation_checkpoint.memory_budget                                : 0.5 (float)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   activation_checkpoint.mode                                         : none (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   activation_checkpoint.per_op_sac_force_recompute_mm_shapes_by_fqns : ['moe.router.gate'] (list)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   activation_checkpoint.preserve_rng_state                           : True (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   activation_checkpoint.selective_ac_option                          : op (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   activation_checkpoint.visualize_memory_budget_pareto               : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   checkpoint.async_mode                                              : disabled (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   checkpoint.create_seed_checkpoint                                  : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   checkpoint.enable                                                  : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   checkpoint.enable_first_step_checkpoint                            : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   checkpoint.enable_ft_dataloader_checkpoints                        : True (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   checkpoint.exclude_from_loading                                    : [] (list)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   checkpoint.export_dtype                                            : float32 (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   checkpoint.folder                                                  : checkpoint (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   checkpoint.initial_load_in_hf                                      : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   checkpoint.initial_load_in_hf_quantized                            : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   checkpoint.initial_load_model_only                                 : True (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   checkpoint.initial_load_path                                       : None (NoneType)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   checkpoint.interval                                                : 500 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   checkpoint.keep_latest_k                                           : 10 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   checkpoint.last_save_in_hf                                         : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   checkpoint.last_save_model_only                                    : True (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   checkpoint.load_only                                               : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   checkpoint.load_step                                               : -1 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   comm.init_timeout_seconds                                          : 300 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   comm.mode                                                          : default (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   comm.save_traces_file_prefix                                       : rank_ (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   comm.save_traces_folder                                            : comm_traces (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   comm.trace_buf_size                                                : 20000 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   comm.train_timeout_seconds                                         : 100 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   compile.backend                                                    : inductor (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   compile.components                                                 : ['model', 'loss'] (list)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   compile.enable                                                     : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   debug.deterministic                                                : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   debug.deterministic_warn_only                                      : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   debug.moe_force_load_balance                                       : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   debug.seed                                                         : 1234 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   experimental.custom_args_module                                    : primus.backends.torchtitan.primus_turbo_extensions.config_extension (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   experimental.custom_import                                         :  (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   fault_tolerance.enable                                             : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   fault_tolerance.group_size                                         : 0 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   fault_tolerance.min_replica_size                                   : 1 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   fault_tolerance.process_group                                      : gloo (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   fault_tolerance.process_group_timeout_ms                           : 10000 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   fault_tolerance.replica_id                                         : 0 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   fault_tolerance.semi_sync_method                                   : None (NoneType)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   file_sink_level                                                    : DEBUG (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   job.config_file                                                    : None (NoneType)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   job.custom_config_module                                           :  (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   job.description                                                    : Llama 3.1 8B training (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   job.dump_folder                                                    : ./outputs (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   job.print_config                                                   : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   job.save_config_file                                               : None (NoneType)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   lr_scheduler.decay_ratio                                           : None (NoneType)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   lr_scheduler.decay_type                                            : linear (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   lr_scheduler.min_lr_factor                                         : 0.0 (float)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   lr_scheduler.total_steps                                           : None (NoneType)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   lr_scheduler.warmup_steps                                          : 10 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   memory_estimation.disable_fake_mode                                : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   memory_estimation.enable                                           : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   metrics.disable_color_printing                                     : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   metrics.enable_tensorboard                                         : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   metrics.enable_wandb                                               : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   metrics.log_freq                                                   : 1 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   metrics.save_for_all_ranks                                         : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   metrics.save_tb_folder                                             : tb (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   model.converters                                                   : ['primus_turbo'] (list)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   model.flavor                                                       : 8B_flex (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   model.hf_assets_path                                               : /home/lihuzhan/_hfassets/llama31_8B (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   model.name                                                         : llama3 (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   model.print_after_conversion                                       : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   model.tokenizer_path                                               : None (NoneType)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   optimizer.beta1                                                    : 0.9 (float)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   optimizer.beta2                                                    : 0.95 (float)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   optimizer.early_step_in_backward                                   : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   optimizer.eps                                                      : 1e-08 (float)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   optimizer.implementation                                           : fused (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   optimizer.lr                                                       : 0.0008 (float)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   optimizer.name                                                     : AdamW (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   optimizer.weight_decay                                             : 0.1 (float)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   parallelism.context_parallel_degree                                : 1 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   parallelism.context_parallel_load_balancer                         : headtail (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   parallelism.context_parallel_rotate_method                         : allgather (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   parallelism.data_parallel_replicate_degree                         : 1 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   parallelism.data_parallel_shard_degree                             : 1 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   parallelism.disable_loss_parallel                                  : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   parallelism.enable_async_tensor_parallel                           : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   parallelism.expert_parallel_comm_backend                           : standard (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   parallelism.expert_parallel_degree                                 : 1 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   parallelism.expert_tensor_parallel_degree                          : 1 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   parallelism.fsdp_reshard_after_forward                             : default (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   parallelism.module_fqns_per_model_part                             : None (NoneType)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   parallelism.pipeline_parallel_degree                               : 1 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   parallelism.pipeline_parallel_expert_parallel_overlap              : True (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   parallelism.pipeline_parallel_first_stage_less_layers              : 1 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   parallelism.pipeline_parallel_last_stage_less_layers               : 1 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   parallelism.pipeline_parallel_layers_per_stage                     : None (NoneType)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   parallelism.pipeline_parallel_microbatch_size                      : 1 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   parallelism.pipeline_parallel_schedule                             : 1F1B (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   parallelism.pipeline_parallel_schedule_csv                         :  (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   parallelism.tensor_parallel_degree                                 : 1 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   primus_turbo.enable_attention_float8                               : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   primus_turbo.enable_embedding_autocast                             : True (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   primus_turbo.enable_primus_turbo                                   : True (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   primus_turbo.use_classic_attention                                 : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   primus_turbo.use_moe_fp8                                           : True (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   primus_turbo.use_turbo_async_tp                                    : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   primus_turbo.use_turbo_attention                                   : True (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   primus_turbo.use_turbo_float8_linear                               : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   primus_turbo.use_turbo_grouped_gemm                                : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   primus_turbo.use_turbo_mx_linear                                   : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   profiling.enable_memory_snapshot                                   : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   profiling.enable_profiling                                         : True (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   profiling.profile_freq                                             : 11 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   profiling.profiler_active                                          : 1 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   profiling.profiler_warmup                                          : 1 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   profiling.save_memory_snapshot_folder                              : memory_snapshot (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   profiling.save_traces_folder                                       : profile_traces (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   quantize.grouped_mm.float8.fqns                                    : [] (list)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   quantize.grouped_mm.mx.fqns                                        : [] (list)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   quantize.grouped_mm.mx.recipe_name                                 : mxfp8 (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   quantize.linear.float8.emulate                                     : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   quantize.linear.float8.enable_fsdp_float8_all_gather               : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   quantize.linear.float8.filter_fqns                                 : [] (list)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   quantize.linear.float8.precompute_float8_dynamic_scale_for_fsdp    : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   quantize.linear.float8.recipe_name                                 : None (NoneType)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   quantize.linear.mx.filter_fqns                                     : ['output'] (list)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   quantize.linear.mx.mxfp8_dim1_cast_kernel_choice                   : triton (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   quantize.linear.mx.recipe_name                                     : mxfp8_cublas (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   sink_level                                                         : None (NoneType)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   stderr_sink_level                                                  : INFO (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   trainable                                                          : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   training.dataloader.num_workers                                    : 1 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   training.dataloader.persistent_workers                             : True (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   training.dataloader.pin_memory                                     : True (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   training.dataloader.prefetch_factor                                : 4 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   training.dataset                                                   : c4 (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   training.dataset_path                                              : None (NoneType)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   training.dtype                                                     : float32 (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   training.enable_cpu_offload                                        : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   training.gc_debug                                                  : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   training.gc_freq                                                   : 100 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   training.global_batch_size                                         : 4 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   training.local_batch_size                                          : 4 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   training.max_norm                                                  : 1.0 (float)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   training.mixed_precision_param                                     : bfloat16 (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   training.mixed_precision_reduce                                    : float32 (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   training.mock_data                                                 : True (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   training.seq_len                                                   : 8192 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   training.steps                                                     : 92 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   validation.dataloader.num_workers                                  : 0 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   validation.dataloader.persistent_workers                           : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   validation.dataloader.pin_memory                                   : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   validation.dataloader.prefetch_factor                              : None (NoneType)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   validation.dataset                                                 : c4_validation (str)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   validation.dataset_path                                            : None (NoneType)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   validation.enable                                                  : False (bool)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   validation.freq                                                    : 10 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   validation.local_batch_size                                        : 8 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   validation.seq_len                                                 : 2048 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:256] :   validation.steps                                                   : -1 (int)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----module_utils.py:259] : --------------------------------------------------------------------------------[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[----train_runtime.py:474] : [TrainRuntime] WARNING: trainer_class not found, will use default for stage[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[----train_runtime.py:479] : [TrainRuntime] Loading trainer: stage=pretrain, trainer_class=None[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[----train_runtime.py:487] : [TrainRuntime] Loaded trainer class: TorchTitanPretrainTrainer[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[----train_runtime.py:216] : [Runtime] Applying setup patches...[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------patch_runner.py:92] : --------------------------------------------------------------------------------[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------patch_runner.py:93] : [Patch] Executing patches: backend=torchtitan, phase=setup, backend_version=0.2.2, primus_version=None, model=namespace(name='llama3', flavor='8B_flex', hf_assets_path='/home/lihuzhan/_hfassets/llama31_8B', converters=['primus_turbo']), module=pre_trainer, platform=None, dry_run=False, enabled_ids=None[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch.py:115] : [Patch] ⊘ Skipped: torchtitan.dsv3.whole_block_compile (condition not met)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch.py:115] : [Patch] ⊘ Skipped: torchtitan.dsv3.moe_bf16_combine (condition not met)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch.py:115] : [Patch] ⊘ Skipped: torchtitan.fsdp.sdma_symm_mem_collectives (condition not met)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch.py:115] : [Patch] ⊘ Skipped: torchtitan.primus_turbo.turbo_async_tp (condition not met)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch.py:115] : [Patch] ⊘ Skipped: torchtitan.primus_turbo.deepseek_v3_classic_attention (condition not met)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch.py:115] : [Patch] ⊘ Skipped: torchtitan.primus_turbo.turbo_float8_linear (condition not met)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch.py:115] : [Patch] ⊘ Skipped: torchtitan.primus_turbo.gptoss_sink_attention (condition not met)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch.py:115] : [Patch] ⊘ Skipped: torchtitan.primus_turbo.moe_grouped_mm (condition not met)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch.py:115] : [Patch] ⊘ Skipped: torchtitan.primus_turbo.turbo_mx_linear (condition not met)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch.py:115] : [Patch] ⊘ Skipped: torchtitan.metrics.wandb_env (condition not met)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----patch_runner.py:107] : [Patch] Pre-filtered 10 patches (out of 20 total) for torchtitan/setup[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----patch_runner.py:116] : --------------------------------------------------------------------------------[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----patch_runner.py:126] : [Patch] Applying torchtitan.torch.dcp_consolidate_fallback: Provide a fallback consolidate_safetensors_files_on_every_rank to avoid ImportError in older torch builds[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[dcp_consolidate_patches.py:44] : [Patch:torchtitan.torch.dcp_consolidate_fallback] Checking for consolidate_safetensors_files_on_every_rank in torch.distributed.checkpoint._consolidate_hf_safetensors...[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[dcp_consolidate_patches.py:51] : [Patch:torchtitan.torch.dcp_consolidate_fallback] consolidate_safetensors_files_on_every_rank available in torch.distributed.checkpoint._consolidate_hf_safetensors, no patch needed.[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[----------patch_runner.py:130] : [Patch] ✓ Applied: torchtitan.torch.dcp_consolidate_fallback (priority=50)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[----------patch_runner.py:116] : --------------------------------------------------------------------------------[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[----------patch_runner.py:126] : [Patch] Applying torchtitan.embedding.amp_alignment: Align nn.Embedding outputs with AMP/autocast dtype[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[--embedding_amp_patches.py:41] : [Patch:torchtitan.embedding.amp_alignment] Installing nn.Embedding AMP/mixed precision alignment patch...[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[--embedding_amp_patches.py:63] : [Patch:torchtitan.embedding.amp_alignment] nn.Embedding.__init__ patched for AMP/mixed precision alignment.[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[----------patch_runner.py:130] : [Patch] ✓ Applied: torchtitan.embedding.amp_alignment (priority=50)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[----------patch_runner.py:116] : --------------------------------------------------------------------------------[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[----------patch_runner.py:126] : [Patch] Applying torchtitan.torch.flex_attention_auxoutput: Ensure torch.nn.attention.flex_attention has an AuxOutput symbol[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-flex_attention_patches.py:45] : [Patch:torchtitan.torch.flex_attention_auxoutput] AuxOutput available, no patch needed.[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[----------patch_runner.py:130] : [Patch] ✓ Applied: torchtitan.torch.flex_attention_auxoutput (priority=50)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[----------patch_runner.py:116] : --------------------------------------------------------------------------------[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[----------patch_runner.py:126] : [Patch] Applying torchtitan.fsdp.weight_tying: Group tied tok_embeddings/output weights in one FSDP2 shard group for models with enable_weight_tying (Qwen3 on PyTorch 2.12+).[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[fsdp_weight_tying_patches.py:99] : [Patch:torchtitan.fsdp.weight_tying] Patched apply_fsdp for weight tying in: llama4, qwen3[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch_runner.py:130] : [Patch] ✓ Applied: torchtitan.fsdp.weight_tying (priority=50)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch_runner.py:116] : --------------------------------------------------------------------------------[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch_runner.py:126] : [Patch] Applying torchtitan.logger: Redirect TorchTitan logger to Primus unified logger[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----------logger_patches.py:52] : [Patch:torchtitan.logger] Monkey patching TorchTitan logger to use Primus unified logger...[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----------logger_patches.py:63] : [Patch:torchtitan.logger] TorchTitan logger successfully redirected to Primus logger.[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch_runner.py:130] : [Patch] ✓ Applied: torchtitan.logger (priority=50)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch_runner.py:116] : --------------------------------------------------------------------------------[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch_runner.py:126] : [Patch] Applying torchtitan.training.mock_hf_dataset: Enable mock HuggingFace dataset mode for TorchTitan[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----mock_dataset_patches.py:72] : [Patch:torchtitan.training.mock_hf_dataset] Enabling mock HuggingFace dataset mode.[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----mock_dataset_patches.py:99] : [Patch:torchtitan.training.mock_hf_dataset] Patched datasets.load_dataset successfully.[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch_runner.py:130] : [Patch] ✓ Applied: torchtitan.training.mock_hf_dataset (priority=50)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch_runner.py:116] : --------------------------------------------------------------------------------[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch_runner.py:126] : [Patch] Applying torchtitan.model_override: Override TorchTitan model args dynamically via config[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[--model_override_patches.py:204] : [Patch:torchtitan.model_override] Standard model config fields: {'converters', 'hf_assets_path', 'tokenizer_path', 'flavor', 'print_after_conversion', 'name'}[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[--model_override_patches.py:213] : [Patch:torchtitan.model_override] No model override params provided (only standard config fields: ['converters', 'hf_assets_path', 'tokenizer_path', 'flavor', 'print_after_conversion', 'name']), skip patch.[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch_runner.py:130] : [Patch] ✓ Applied: torchtitan.model_override (priority=50)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch_runner.py:116] : --------------------------------------------------------------------------------[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch_runner.py:126] : [Patch] Applying torchtitan.peak_flops: Add MI350X/MI355X peak FLOPS so MFU is computed correctly[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch_runner.py:130] : [Patch] ✓ Applied: torchtitan.peak_flops (priority=50)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch_runner.py:116] : --------------------------------------------------------------------------------[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------patch_runner.py:126] : [Patch] Applying torchtitan.torch.pipelining_schedules_dualpipev: Ensure torch.distributed.pipelining.schedules.ScheduleDualPipeV exists, installing a fallback alias if necessary[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[pipelining_schedule_patches.py:47] : [Patch:torchtitan.torch.pipelining_schedules_dualpipev] ScheduleDualPipeV available, no patch needed.[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[--------------patch_runner.py:130] : [Patch] ✓ Applied: torchtitan.torch.pipelining_schedules_dualpipev (priority=50)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[--------------patch_runner.py:116] : --------------------------------------------------------------------------------[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[--------------patch_runner.py:126] : [Patch] Applying torchtitan.primus_turbo.turbo_attention: Use Primus-Turbo Attention kernels for supported models[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[----------attention_patches.py:36] : [Patch:torchtitan.primus_turbo.turbo_attention] Enabling Primus-Turbo Attention for LLaMA3/LLaMA4/DeepSeek-V3/Qwen3...[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[----------attention_patches.py:77] : [Patch:torchtitan.primus_turbo.turbo_attention] Primus-Turbo Attention successfully installed for LLaMA3, LLaMA4, DeepSeek-V3 and Qwen3.[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[--------------patch_runner.py:130] : [Patch] ✓ Applied: torchtitan.primus_turbo.turbo_attention (priority=50)[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[--------------patch_runner.py:143] : [Patch] Applied 10/10 patches for torchtitan/setup: ['torchtitan.torch.dcp_consolidate_fallback', 'torchtitan.embedding.amp_alignment', 'torchtitan.torch.flex_attention_auxoutput', 'torchtitan.fsdp.weight_tying', 'torchtitan.logger', 'torchtitan.training.mock_hf_dataset', 'torchtitan.model_override', 'torchtitan.peak_flops', 'torchtitan.torch.pipelining_schedules_dualpipev', 'torchtitan.primus_turbo.turbo_attention'][0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[--------------patch_runner.py:146] : --------------------------------------------------------------------------------[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-------------train_runtime.py:530] : ================================================================================[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-------------train_runtime.py:531] : Setup started.[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-------------train_runtime.py:532] : ================================================================================[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-------------train_runtime.py:534] : ================================================================================[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-------------train_runtime.py:535] : Setup completed.[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-------------train_runtime.py:536] : ================================================================================[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-------------train_runtime.py:530] : ================================================================================[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-------------train_runtime.py:531] : Init started.[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-------------train_runtime.py:532] : ================================================================================[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[---------------config_utils.py:62] : Loaded and merged custom JobConfig from primus.backends.torchtitan.primus_turbo_extensions.config_extension[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mStarting job: Llama 3.1 8B training[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][33m[1m[WARNING]  [0m[33m[1mENV[TORCH_NCCL_ASYNC_ERROR_HANDLING] = 1 will be overridden to 3 based on job config[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----------------------root.py:73] : [GC] Initial GC collection took 0.00 seconds[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[----------------------root.py:106] : Loading tokenizer from tokenizer.json[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mPreparing c4 dataset from allenai/c4[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-------mock_dataset_patches.py:82] : [Patch:torchtitan.training.mock_hf_dataset] load_dataset('allenai/c4') is mocked.[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mBuilding llama3 8B_flexwith {
+  "_enforced": "This field is used to enforce all fields have defaults.",
+  "dim": 4096,
+  "n_layers": 32,
+  "n_heads": 32,
+  "n_kv_heads": 8,
+  "vocab_size": 128256,
+  "multiple_of": 1024,
+  "ffn_dim_multiplier": 1.3,
+  "norm_eps": 1e-05,
+  "rope_theta": 500000,
+  "rope_scaling_args": {
+    "scaling_factor": 8.0,
+    "low_freq_factor": 1.0,
+    "high_freq_factor": 4.0,
+    "original_max_position_embeddings": 8192
+  },
+  "max_seq_len": 8192,
+  "depth_init": true,
+  "attn_type": "flex",
+  "attn_mask_type": "block_causal",
+  "eos_id": 0
+}[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mCUDA capacity: AMD Radeon Graphics with 432.00GiB memory[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][33m[1m[WARNING]  [0m[33m[1m[-----------------------root.py:90] : Error running lspci: [Errno 2] No such file or directory: 'lspci', fallback to use device_name[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][33m[1m[WARNING]  [0m[33m[1m[----------------------root.py:143] : Peak flops undefined for: AMD Radeon Graphics, fallback to A100[0m
+[[32m20261002 10:10:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[34mModel llama3 8B_flex [31msize: 8,030,261,248 total parameters[39m[0m
+[[32m20261002 10:10:38[0m][[36mrank-0/1[0m][33m[1m[WARNING]  [0m[33m[1m[-----------------------root.py:90] : Error running lspci: [Errno 2] No such file or directory: 'lspci', fallback to use device_name[0m
+[[32m20261002 10:10:38[0m][[36mrank-0/1[0m][33m[1m[WARNING]  [0m[33m[1m[----------------------root.py:143] : Peak flops undefined for: AMD Radeon Graphics, fallback to A100[0m
+[[32m20261002 10:10:38[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mPeak FLOPS used for computing MFU: 3.120e+14[0m
+[[32m20261002 10:10:38[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mCUDA memory usage for model: 29.94GiB(6.93%)[0m
+[[32m20261002 10:10:38[0m][[36mrank-0/1[0m][33m[1m[WARNING]  [0m[33m[1m[-----------------------root.py:96] : model.safetensors.index.json not found at hf_assets_path: /home/lihuzhan/_hfassets/llama31_8B/model.safetensors.index.json.                     Defaulting to saving a single safetensors file if checkpoint is saved in HF format[0m
+[[32m20261002 10:10:38[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mMixed precision training is handled by AMP[0m
+[[32m20261002 10:10:38[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mTrainer is initialized with local batch size 4, global batch size 4, gradient accumulation steps 1, sequence length 8192, total steps 92 (warmup 10)[0m
+[[32m20261002 10:10:38[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-------------train_runtime.py:534] : ================================================================================[0m
+[[32m20261002 10:10:38[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-------------train_runtime.py:535] : Init completed.[0m
+[[32m20261002 10:10:38[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-------------train_runtime.py:536] : ================================================================================[0m
+[[32m20261002 10:10:38[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-------------train_runtime.py:216] : [Runtime] Applying before_train patches...[0m
+[[32m20261002 10:10:38[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[---------------patch_runner.py:92] : --------------------------------------------------------------------------------[0m
+[[32m20261002 10:10:38[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[---------------patch_runner.py:93] : [Patch] Executing patches: backend=torchtitan, phase=before_train, backend_version=0.2.2, primus_version=None, model=namespace(name='llama3', flavor='8B_flex', hf_assets_path='/home/lihuzhan/_hfassets/llama31_8B', converters=['primus_turbo']), module=pre_trainer, platform=None, dry_run=False, enabled_ids=None[0m
+[[32m20261002 10:10:38[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[--------------patch_runner.py:107] : [Patch] Pre-filtered 0 patches (out of 0 total) for torchtitan/before_train[0m
+[[32m20261002 10:10:38[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[--------------patch_runner.py:143] : [Patch] Applied 0/0 patches for torchtitan/before_train: [][0m
+[[32m20261002 10:10:38[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[--------------patch_runner.py:146] : --------------------------------------------------------------------------------[0m
+[[32m20261002 10:10:38[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-------------train_runtime.py:556] : Python GC disabled for training (matching NeMo memory management)[0m
+[[32m20261002 10:10:38[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-------------train_runtime.py:530] : ================================================================================[0m
+[[32m20261002 10:10:38[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-------------train_runtime.py:531] : Training started.[0m
+[[32m20261002 10:10:38[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-------------train_runtime.py:532] : ================================================================================[0m
+[[32m20261002 10:10:38[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mTraining starts at step 1[0m
+[[32m20261002 10:10:38[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mProfiling active. Traces will be saved at ./outputs/profile_traces[0m
+/opt/venv/lib/python3.12/site-packages/torch/nn/functional.py:2954: UserWarning: Mismatch dtype between input and weight: input dtype = c10::BFloat16, weight dtype = float, Cannot dispatch to fused implementation. (Triggered internally at /__w/rocm-npi-dev/rocm-npi-dev/_therock/external-builds/pytorch/pytorch/aten/src/ATen/native/layer_norm.cpp:344.)
+  return torch.rms_norm(input, normalized_shape, weight, eps)
+[[32m20261002 10:10:41[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[----------------------root.py:130] : Building device mesh with parallelism: pp=1, dp_replicate=1, dp_shard=1, cp=1, tp=1, ep=1, etp=1[0m
+[[32m20261002 10:10:41[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[----------------------root.py:183] : Successfully created meshes with active dimensions: [][0m
+[[32m20261002 10:10:41[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep:  1  [32mloss: 12.25951  [38;2;180;60;0mgrad_norm: 42.3810  [38;2;54;234;195mmemory: 313.66GiB(72.61%)  [34mtps: 10,049  [36mtflops: 581.97  [35mmfu: 186.53%[39m[0m
+[[32m20261002 10:10:41[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mSynchronizing and adjusting timeout for all ProcessGroups to 0:01:40[0m
+[[32m20261002 10:10:43[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep:  2  [32mloss: 26.02735  [38;2;180;60;0mgrad_norm: 69.7719  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 15,840  [36mtflops: 917.36  [35mmfu: 294.02%[39m[0m
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+[[32m20261002 10:10:50[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep:  3  [32mloss: 19.82621  [38;2;180;60;0mgrad_norm: 91.1762  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 4,200  [36mtflops: 243.21  [35mmfu: 77.95%[39m[0m
+[[32m20261002 10:10:57[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep:  4  [32mloss: 10.20370  [38;2;180;60;0mgrad_norm: 88.8892  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 5,404  [36mtflops: 312.98  [35mmfu: 100.31%[39m[0m
+[[32m20261002 10:10:58[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep:  5  [32mloss:  8.01867  [38;2;180;60;0mgrad_norm: 104.3643  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,342  [36mtflops: 1,409.77  [35mmfu: 451.85%[39m[0m
+[[32m20261002 10:10:59[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep:  6  [32mloss: 17.34566  [38;2;180;60;0mgrad_norm: 23.5775  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 23,760  [36mtflops: 1,376.04  [35mmfu: 441.04%[39m[0m
+[[32m20261002 10:11:01[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep:  7  [32mloss:  9.20556  [38;2;180;60;0mgrad_norm: 33.7111  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,351  [36mtflops: 1,410.30  [35mmfu: 452.02%[39m[0m
+[[32m20261002 10:11:02[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep:  8  [32mloss: 12.63416  [38;2;180;60;0mgrad_norm: 22.0124  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,262  [36mtflops: 1,405.10  [35mmfu: 450.35%[39m[0m
+[[32m20261002 10:11:03[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep:  9  [32mloss:  7.30777  [38;2;180;60;0mgrad_norm: 21.7264  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,482  [36mtflops: 1,417.84  [35mmfu: 454.44%[39m[0m
+/opt/venv/lib/python3.12/site-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+[[32m20261002 10:11:05[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 10  [32mloss:  9.27646  [38;2;180;60;0mgrad_norm: 42.6745  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 23,585  [36mtflops: 1,365.93  [35mmfu: 437.80%[39m[0m
+[[32m20261002 10:11:06[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 11  [32mloss:  6.99580  [38;2;180;60;0mgrad_norm: 39.8298  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,128  [36mtflops: 1,397.38  [35mmfu: 447.88%[39m[0m
+[rank0]:[W1002 10:11:06.771226595 collection.cpp:1148] Warning: ROCTracer produced duplicate flow start: 16819 (function operator())
+[[32m20261002 10:11:06[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mDumping profiler traces at step 11[0m
+[[32m20261002 10:11:06[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mFinished dumping profiler traces in 0.11 seconds[0m
+[[32m20261002 10:11:08[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 12  [32mloss:  8.07708  [38;2;180;60;0mgrad_norm: 24.9672  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 18,313  [36mtflops: 1,060.58  [35mmfu: 339.93%[39m[0m
+[[32m20261002 10:11:09[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 13  [32mloss:  7.46637  [38;2;180;60;0mgrad_norm: 21.9181  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,444  [36mtflops: 1,415.67  [35mmfu: 453.74%[39m[0m
+[[32m20261002 10:11:11[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 14  [32mloss:  6.00781  [38;2;180;60;0mgrad_norm: 17.6507  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,353  [36mtflops: 1,410.36  [35mmfu: 452.04%[39m[0m
+[[32m20261002 10:11:12[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 15  [32mloss:  6.33721  [38;2;180;60;0mgrad_norm: 37.2847  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,505  [36mtflops: 1,419.22  [35mmfu: 454.88%[39m[0m
+[[32m20261002 10:11:13[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 16  [32mloss:  6.79513  [38;2;180;60;0mgrad_norm: 38.7298  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 23,871  [36mtflops: 1,382.46  [35mmfu: 443.10%[39m[0m
+[[32m20261002 10:11:15[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 17  [32mloss:  6.20628  [38;2;180;60;0mgrad_norm: 13.9399  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,426  [36mtflops: 1,414.63  [35mmfu: 453.41%[39m[0m
+[[32m20261002 10:11:16[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 18  [32mloss:  6.24035  [38;2;180;60;0mgrad_norm: 17.8122  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 23,838  [36mtflops: 1,380.56  [35mmfu: 442.49%[39m[0m
+[[32m20261002 10:11:17[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 19  [32mloss:  5.89368  [38;2;180;60;0mgrad_norm: 18.4805  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,490  [36mtflops: 1,418.35  [35mmfu: 454.60%[39m[0m
+[[32m20261002 10:11:19[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 20  [32mloss:  5.28899  [38;2;180;60;0mgrad_norm: 12.1055  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,363  [36mtflops: 1,410.98  [35mmfu: 452.24%[39m[0m
+[[32m20261002 10:11:20[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 21  [32mloss:  5.12512  [38;2;180;60;0mgrad_norm: 16.1766  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 22,989  [36mtflops: 1,331.41  [35mmfu: 426.73%[39m[0m
+[[32m20261002 10:11:21[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 22  [32mloss:  5.24621  [38;2;180;60;0mgrad_norm: 17.4825  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 23,666  [36mtflops: 1,370.63  [35mmfu: 439.30%[39m[0m
+[[32m20261002 10:11:22[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mDumping profiler traces at step 22[0m
+[[32m20261002 10:11:22[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mFinished dumping profiler traces in 0.10 seconds[0m
+[[32m20261002 10:11:23[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 23  [32mloss:  5.26519  [38;2;180;60;0mgrad_norm:  3.7659  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 18,748  [36mtflops: 1,085.77  [35mmfu: 348.00%[39m[0m
+[[32m20261002 10:11:25[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 24  [32mloss:  5.04272  [38;2;180;60;0mgrad_norm:  2.9610  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 23,840  [36mtflops: 1,380.70  [35mmfu: 442.53%[39m[0m
+[[32m20261002 10:11:26[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 25  [32mloss:  4.83524  [38;2;180;60;0mgrad_norm:  9.2662  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,507  [36mtflops: 1,419.29  [35mmfu: 454.90%[39m[0m
+[[32m20261002 10:11:27[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 26  [32mloss:  4.78260  [38;2;180;60;0mgrad_norm:  5.0838  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,395  [36mtflops: 1,412.81  [35mmfu: 452.82%[39m[0m
+[[32m20261002 10:11:29[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 27  [32mloss:  4.63609  [38;2;180;60;0mgrad_norm:  5.5977  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,377  [36mtflops: 1,411.76  [35mmfu: 452.49%[39m[0m
+[[32m20261002 10:11:30[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 28  [32mloss:  4.50787  [38;2;180;60;0mgrad_norm:  2.2092  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 23,684  [36mtflops: 1,371.65  [35mmfu: 439.63%[39m[0m
+[[32m20261002 10:11:31[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 29  [32mloss:  4.31561  [38;2;180;60;0mgrad_norm:  1.9299  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,294  [36mtflops: 1,406.98  [35mmfu: 450.96%[39m[0m
+[[32m20261002 10:11:33[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 30  [32mloss:  4.24137  [38;2;180;60;0mgrad_norm:  2.2965  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 23,680  [36mtflops: 1,371.44  [35mmfu: 439.56%[39m[0m
+[[32m20261002 10:11:34[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 31  [32mloss:  4.27039  [38;2;180;60;0mgrad_norm:  2.0997  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,307  [36mtflops: 1,407.75  [35mmfu: 451.20%[39m[0m
+[[32m20261002 10:11:36[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 32  [32mloss:  4.27607  [38;2;180;60;0mgrad_norm:  1.7355  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 22,679  [36mtflops: 1,313.46  [35mmfu: 420.98%[39m[0m
+[[32m20261002 10:11:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 33  [32mloss:  4.26992  [38;2;180;60;0mgrad_norm:  1.9823  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,146  [36mtflops: 1,398.40  [35mmfu: 448.20%[39m[0m
+[[32m20261002 10:11:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mDumping profiler traces at step 33[0m
+[[32m20261002 10:11:37[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mFinished dumping profiler traces in 0.11 seconds[0m
+[[32m20261002 10:11:39[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 34  [32mloss:  4.19858  [38;2;180;60;0mgrad_norm:  1.6087  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 18,515  [36mtflops: 1,072.29  [35mmfu: 343.68%[39m[0m
+[[32m20261002 10:11:40[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 35  [32mloss:  4.13550  [38;2;180;60;0mgrad_norm:  1.4975  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,246  [36mtflops: 1,404.18  [35mmfu: 450.06%[39m[0m
+[[32m20261002 10:11:41[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 36  [32mloss:  4.12609  [38;2;180;60;0mgrad_norm:  1.4663  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 23,581  [36mtflops: 1,365.70  [35mmfu: 437.72%[39m[0m
+[[32m20261002 10:11:43[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 37  [32mloss:  4.12351  [38;2;180;60;0mgrad_norm:  1.5947  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,291  [36mtflops: 1,406.79  [35mmfu: 450.90%[39m[0m
+[[32m20261002 10:11:44[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 38  [32mloss:  4.10226  [38;2;180;60;0mgrad_norm:  1.4064  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,286  [36mtflops: 1,406.49  [35mmfu: 450.80%[39m[0m
+[[32m20261002 10:11:45[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 39  [32mloss:  4.08427  [38;2;180;60;0mgrad_norm:  1.1799  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,414  [36mtflops: 1,413.95  [35mmfu: 453.19%[39m[0m
+[[32m20261002 10:11:47[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 40  [32mloss:  4.09603  [38;2;180;60;0mgrad_norm:  3.0181  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 23,661  [36mtflops: 1,370.30  [35mmfu: 439.20%[39m[0m
+[[32m20261002 10:11:48[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 41  [32mloss:  4.03467  [38;2;180;60;0mgrad_norm:  1.2387  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,274  [36mtflops: 1,405.81  [35mmfu: 450.58%[39m[0m
+[[32m20261002 10:11:50[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 42  [32mloss:  4.06462  [38;2;180;60;0mgrad_norm:  3.1589  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 23,642  [36mtflops: 1,369.20  [35mmfu: 438.85%[39m[0m
+[[32m20261002 10:11:51[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 43  [32mloss:  4.00265  [38;2;180;60;0mgrad_norm:  1.9200  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 22,401  [36mtflops: 1,297.34  [35mmfu: 415.82%[39m[0m
+[[32m20261002 10:11:52[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 44  [32mloss:  4.05792  [38;2;180;60;0mgrad_norm:  3.4716  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,084  [36mtflops: 1,394.82  [35mmfu: 447.06%[39m[0m
+[[32m20261002 10:11:53[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mDumping profiler traces at step 44[0m
+[[32m20261002 10:11:53[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mFinished dumping profiler traces in 0.11 seconds[0m
+[[32m20261002 10:11:54[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 45  [32mloss:  3.95915  [38;2;180;60;0mgrad_norm:  2.0752  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 18,857  [36mtflops: 1,092.11  [35mmfu: 350.04%[39m[0m
+[[32m20261002 10:11:55[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 46  [32mloss:  3.95441  [38;2;180;60;0mgrad_norm:  1.6023  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 23,674  [36mtflops: 1,371.09  [35mmfu: 439.45%[39m[0m
+[[32m20261002 10:11:57[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 47  [32mloss:  3.87955  [38;2;180;60;0mgrad_norm:  1.5143  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,282  [36mtflops: 1,406.31  [35mmfu: 450.74%[39m[0m
+[[32m20261002 10:11:58[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 48  [32mloss:  3.89389  [38;2;180;60;0mgrad_norm:  2.2828  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 23,586  [36mtflops: 1,365.99  [35mmfu: 437.82%[39m[0m
+[[32m20261002 10:12:00[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 49  [32mloss:  3.79776  [38;2;180;60;0mgrad_norm:  0.8154  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,234  [36mtflops: 1,403.52  [35mmfu: 449.85%[39m[0m
+[[32m20261002 10:12:01[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 50  [32mloss:  3.75876  [38;2;180;60;0mgrad_norm:  0.9107  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,233  [36mtflops: 1,403.41  [35mmfu: 449.81%[39m[0m
+[[32m20261002 10:12:02[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 51  [32mloss:  3.74127  [38;2;180;60;0mgrad_norm:  2.0387  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,284  [36mtflops: 1,406.40  [35mmfu: 450.77%[39m[0m
+[[32m20261002 10:12:04[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 52  [32mloss:  3.65337  [38;2;180;60;0mgrad_norm:  0.9784  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 23,565  [36mtflops: 1,364.77  [35mmfu: 437.43%[39m[0m
+[[32m20261002 10:12:05[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 53  [32mloss:  3.62004  [38;2;180;60;0mgrad_norm:  0.9464  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,312  [36mtflops: 1,407.99  [35mmfu: 451.28%[39m[0m
+[[32m20261002 10:12:07[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 54  [32mloss:  3.58560  [38;2;180;60;0mgrad_norm:  1.0074  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 22,024  [36mtflops: 1,275.51  [35mmfu: 408.82%[39m[0m
+[[32m20261002 10:12:08[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 55  [32mloss:  3.56927  [38;2;180;60;0mgrad_norm:  0.7225  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,100  [36mtflops: 1,395.76  [35mmfu: 447.36%[39m[0m
+[[32m20261002 10:12:08[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mDumping profiler traces at step 55[0m
+[[32m20261002 10:12:08[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mFinished dumping profiler traces in 0.11 seconds[0m
+[[32m20261002 10:12:10[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 56  [32mloss:  3.57564  [38;2;180;60;0mgrad_norm:  0.9235  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 18,821  [36mtflops: 1,090.03  [35mmfu: 349.37%[39m[0m
+[[32m20261002 10:12:11[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 57  [32mloss:  3.56135  [38;2;180;60;0mgrad_norm:  0.7542  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,283  [36mtflops: 1,406.34  [35mmfu: 450.75%[39m[0m
+[[32m20261002 10:12:12[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 58  [32mloss:  3.56509  [38;2;180;60;0mgrad_norm:  0.8794  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 23,538  [36mtflops: 1,363.19  [35mmfu: 436.92%[39m[0m
+[[32m20261002 10:12:14[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 59  [32mloss:  3.56122  [38;2;180;60;0mgrad_norm:  0.7976  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,201  [36mtflops: 1,401.61  [35mmfu: 449.23%[39m[0m
+[[32m20261002 10:12:15[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 60  [32mloss:  3.54795  [38;2;180;60;0mgrad_norm:  0.7451  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 23,564  [36mtflops: 1,364.68  [35mmfu: 437.40%[39m[0m
+[[32m20261002 10:12:16[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 61  [32mloss:  3.55683  [38;2;180;60;0mgrad_norm:  0.7982  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,151  [36mtflops: 1,398.67  [35mmfu: 448.29%[39m[0m
+[[32m20261002 10:12:18[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 62  [32mloss:  3.55015  [38;2;180;60;0mgrad_norm:  0.7711  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,162  [36mtflops: 1,399.31  [35mmfu: 448.50%[39m[0m
+[[32m20261002 10:12:19[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 63  [32mloss:  3.54669  [38;2;180;60;0mgrad_norm:  0.7788  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,189  [36mtflops: 1,400.87  [35mmfu: 449.00%[39m[0m
+[[32m20261002 10:12:21[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 64  [32mloss:  3.54703  [38;2;180;60;0mgrad_norm:  0.7344  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 23,501  [36mtflops: 1,361.03  [35mmfu: 436.23%[39m[0m
+[[32m20261002 10:12:22[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 65  [32mloss:  3.53537  [38;2;180;60;0mgrad_norm:  0.6406  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 22,551  [36mtflops: 1,306.04  [35mmfu: 418.60%[39m[0m
+[[32m20261002 10:12:23[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 66  [32mloss:  3.53639  [38;2;180;60;0mgrad_norm:  0.7539  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 23,409  [36mtflops: 1,355.71  [35mmfu: 434.52%[39m[0m
+[[32m20261002 10:12:24[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mDumping profiler traces at step 66[0m
+[[32m20261002 10:12:24[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mFinished dumping profiler traces in 0.11 seconds[0m
+[[32m20261002 10:12:25[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 67  [32mloss:  3.52705  [38;2;180;60;0mgrad_norm:  0.5872  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 18,779  [36mtflops: 1,087.56  [35mmfu: 348.58%[39m[0m
+[[32m20261002 10:12:27[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 68  [32mloss:  3.53576  [38;2;180;60;0mgrad_norm:  0.6561  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,203  [36mtflops: 1,401.73  [35mmfu: 449.27%[39m[0m
+[[32m20261002 10:12:28[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 69  [32mloss:  3.53699  [38;2;180;60;0mgrad_norm:  0.6585  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,199  [36mtflops: 1,401.45  [35mmfu: 449.18%[39m[0m
+[[32m20261002 10:12:29[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 70  [32mloss:  3.52602  [38;2;180;60;0mgrad_norm:  0.6227  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 23,522  [36mtflops: 1,362.27  [35mmfu: 436.62%[39m[0m
+[[32m20261002 10:12:31[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 71  [32mloss:  3.51956  [38;2;180;60;0mgrad_norm:  0.5988  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,170  [36mtflops: 1,399.79  [35mmfu: 448.65%[39m[0m
+[[32m20261002 10:12:32[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 72  [32mloss:  3.51985  [38;2;180;60;0mgrad_norm:  0.6190  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 23,545  [36mtflops: 1,363.57  [35mmfu: 437.04%[39m[0m
+[[32m20261002 10:12:33[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 73  [32mloss:  3.52388  [38;2;180;60;0mgrad_norm:  0.5333  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,229  [36mtflops: 1,403.22  [35mmfu: 449.75%[39m[0m
+[[32m20261002 10:12:35[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 74  [32mloss:  3.51975  [38;2;180;60;0mgrad_norm:  0.5163  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,235  [36mtflops: 1,403.55  [35mmfu: 449.86%[39m[0m
+[[32m20261002 10:12:36[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 75  [32mloss:  3.51831  [38;2;180;60;0mgrad_norm:  0.5070  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,203  [36mtflops: 1,401.71  [35mmfu: 449.27%[39m[0m
+[[32m20261002 10:12:38[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 76  [32mloss:  3.51916  [38;2;180;60;0mgrad_norm:  0.5036  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 22,004  [36mtflops: 1,274.36  [35mmfu: 408.45%[39m[0m
+[[32m20261002 10:12:39[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 77  [32mloss:  3.52053  [38;2;180;60;0mgrad_norm:  0.5464  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,095  [36mtflops: 1,395.44  [35mmfu: 447.25%[39m[0m
+[[32m20261002 10:12:39[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mDumping profiler traces at step 77[0m
+[[32m20261002 10:12:39[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mFinished dumping profiler traces in 0.11 seconds[0m
+[[32m20261002 10:12:41[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 78  [32mloss:  3.51647  [38;2;180;60;0mgrad_norm:  0.4616  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 18,320  [36mtflops: 1,060.99  [35mmfu: 340.06%[39m[0m
+[[32m20261002 10:12:42[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 79  [32mloss:  3.51430  [38;2;180;60;0mgrad_norm:  0.4966  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,228  [36mtflops: 1,403.18  [35mmfu: 449.74%[39m[0m
+[[32m20261002 10:12:43[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 80  [32mloss:  3.51677  [38;2;180;60;0mgrad_norm:  0.4940  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,203  [36mtflops: 1,401.72  [35mmfu: 449.27%[39m[0m
+[[32m20261002 10:12:45[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 81  [32mloss:  3.51514  [38;2;180;60;0mgrad_norm:  0.4073  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,207  [36mtflops: 1,401.96  [35mmfu: 449.34%[39m[0m
+[[32m20261002 10:12:46[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 82  [32mloss:  3.51069  [38;2;180;60;0mgrad_norm:  0.4219  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 23,528  [36mtflops: 1,362.63  [35mmfu: 436.74%[39m[0m
+[[32m20261002 10:12:48[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 83  [32mloss:  3.50912  [38;2;180;60;0mgrad_norm:  0.4399  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,214  [36mtflops: 1,402.34  [35mmfu: 449.47%[39m[0m
+[[32m20261002 10:12:49[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 84  [32mloss:  3.51471  [38;2;180;60;0mgrad_norm:  0.4297  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 23,565  [36mtflops: 1,364.74  [35mmfu: 437.42%[39m[0m
+[[32m20261002 10:12:50[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 85  [32mloss:  3.51328  [38;2;180;60;0mgrad_norm:  0.3929  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,209  [36mtflops: 1,402.06  [35mmfu: 449.38%[39m[0m
+[[32m20261002 10:12:52[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 86  [32mloss:  3.50787  [38;2;180;60;0mgrad_norm:  0.4402  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,271  [36mtflops: 1,405.65  [35mmfu: 450.53%[39m[0m
+[[32m20261002 10:12:53[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 87  [32mloss:  3.51207  [38;2;180;60;0mgrad_norm:  0.4186  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 22,506  [36mtflops: 1,303.41  [35mmfu: 417.76%[39m[0m
+[[32m20261002 10:12:54[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 88  [32mloss:  3.50755  [38;2;180;60;0mgrad_norm:  0.3964  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 23,391  [36mtflops: 1,354.68  [35mmfu: 434.19%[39m[0m
+[[32m20261002 10:12:55[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mDumping profiler traces at step 88[0m
+[[32m20261002 10:12:55[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mFinished dumping profiler traces in 0.11 seconds[0m
+[[32m20261002 10:12:56[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 89  [32mloss:  3.50816  [38;2;180;60;0mgrad_norm:  0.4008  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 18,711  [36mtflops: 1,083.64  [35mmfu: 347.32%[39m[0m
+[[32m20261002 10:12:58[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 90  [32mloss:  3.50746  [38;2;180;60;0mgrad_norm:  0.3903  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 23,520  [36mtflops: 1,362.17  [35mmfu: 436.59%[39m[0m
+[[32m20261002 10:12:59[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 91  [32mloss:  3.50897  [38;2;180;60;0mgrad_norm:  0.3891  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,246  [36mtflops: 1,404.17  [35mmfu: 450.05%[39m[0m
+[[32m20261002 10:13:00[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[31mstep: 92  [32mloss:  3.50734  [38;2;180;60;0mgrad_norm:  0.3556  [38;2;54;234;195mmemory: 384.44GiB(88.99%)  [34mtps: 24,218  [36mtflops: 1,402.59  [35mmfu: 449.55%[39m[0m
+[[32m20261002 10:13:00[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mSleeping 2 seconds for other ranks to complete[0m
+[[32m20261002 10:13:02[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1mTraining completed[0m
+[[32m20261002 10:13:02[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----------------train_runtime.py:534] : ================================================================================[0m
+[[32m20261002 10:13:02[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----------------train_runtime.py:535] : Training completed.[0m
+[[32m20261002 10:13:02[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----------------train_runtime.py:536] : ================================================================================[0m
+[[32m20261002 10:13:02[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----------------train_runtime.py:561] : Python GC re-enabled after training[0m
+[[32m20261002 10:13:02[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----------------train_runtime.py:216] : [Runtime] Applying after_train patches...[0m
+[[32m20261002 10:13:02[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-------------------patch_runner.py:92] : --------------------------------------------------------------------------------[0m
+[[32m20261002 10:13:02[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-------------------patch_runner.py:93] : [Patch] Executing patches: backend=torchtitan, phase=after_train, backend_version=0.2.2, primus_version=None, model=namespace(name='llama3', flavor='8B_flex', hf_assets_path='/home/lihuzhan/_hfassets/llama31_8B', converters=['primus_turbo']), module=pre_trainer, platform=None, dry_run=False, enabled_ids=None[0m
+[[32m20261002 10:13:02[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------------patch_runner.py:107] : [Patch] Pre-filtered 0 patches (out of 0 total) for torchtitan/after_train[0m
+[[32m20261002 10:13:02[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------------patch_runner.py:143] : [Patch] Applied 0/0 patches for torchtitan/after_train: [][0m
+[[32m20261002 10:13:02[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[------------------patch_runner.py:146] : --------------------------------------------------------------------------------[0m
+[[32m20261002 10:13:02[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----------------train_runtime.py:530] : ================================================================================[0m
+[[32m20261002 10:13:03[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----------------train_runtime.py:531] : Cleanup started.[0m
+[[32m20261002 10:13:03[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----------------train_runtime.py:532] : ================================================================================[0m
+[[32m20261002 10:13:03[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----------------train_runtime.py:534] : ================================================================================[0m
+[[32m20261002 10:13:03[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----------------train_runtime.py:535] : Cleanup completed.[0m
+[[32m20261002 10:13:03[0m][[36mrank-0/1[0m][1m[INFO]     [0m[1m[-----------------train_runtime.py:536] : ================================================================================[0m
+[rank0]:[W1002 10:13:08.423265954 ProcessGroupNCCL.cpp:1576] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+[2026-10-02 10:13:09] [NODE-0(heliosr-1b114-c07-1)] [INFO] [direct] torchrun finished successfully (code 0)

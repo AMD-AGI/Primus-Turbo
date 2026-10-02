@@ -1,0 +1,19 @@
+{
+ "csv": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/clk.a0e2e_3arm_p1_1002_095504.csv",
+ "n_load": 32,
+ "n_idle": 0,
+ "load": {
+  "sclk_median": 1510.5,
+  "sclk_p10": 1432.0,
+  "sclk_p90": 2356.0,
+  "power_w_median": 1132.118,
+  "power_w_p90": 1135.118
+ },
+ "idle": {
+  "sclk_median": null,
+  "sclk_p10": null,
+  "sclk_p90": null,
+  "power_w_median": null,
+  "power_w_p90": null
+ }
+}

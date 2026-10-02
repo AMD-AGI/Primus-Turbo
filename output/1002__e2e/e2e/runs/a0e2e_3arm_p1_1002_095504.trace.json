@@ -1,0 +1,518 @@
+[
+ {
+  "trace": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p1_1002_095504/iteration_11/rank0_trace.json",
+  "steps": [
+   "ProfilerStep#10"
+  ],
+  "cpu_step_ms": [
+   1357.9876009979248
+  ],
+  "gpu_kernels": 9,
+  "gpu_span_ms": 1315.1890469970704,
+  "gpu_busy_ms": 1110.0558079833984,
+  "idle_ms": 205.13323901367198,
+  "kernel_sum_ms": 2036.2018420000002,
+  "buckets": {
+   "elementwise": 663.7230870000001,
+   "gemm_aux": 1080.419458,
+   "memset": 292.059297
+  },
+  "wall": {
+   "elementwise": 638.1892099914551,
+   "gemm_aux": 998.1672419891357,
+   "memset": 292.0592969970703
+  },
+  "attn_call_span_ms": {},
+  "attn_calls": {},
+  "arm_ranges": {},
+  "attn_streams": {},
+  "top": {
+   "elementwise": [
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add<float>, std::array<char*, ",
+     483.7,
+     1
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::b",
+     112.832,
+     1
+    ],
+    [
+     "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<long, at::native::func_wrapper_t<long, at::native:",
+     67.191,
+     1
+    ]
+   ],
+   "gemm_aux": [
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::m",
+     633.384,
+     3
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte",
+     447.035,
+     3
+    ]
+   ],
+   "memset": [
+    [
+     "Memset (Device)",
+     292.059,
+     3
+    ]
+   ]
+  },
+  "fa_path_ms": 0,
+  "fa_path_wall_ms": 0.0,
+  "arms": [],
+  "valid": false,
+  "invalid_reason": "9 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range"
+ },
+ {
+  "trace": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p1_1002_095504/iteration_22/rank0_trace.json",
+  "steps": [
+   "ProfilerStep#21"
+  ],
+  "cpu_step_ms": [
+   1384.5900420074463
+  ],
+  "gpu_kernels": 9,
+  "gpu_span_ms": 795.0591109924317,
+  "gpu_busy_ms": 607.0146909942627,
+  "idle_ms": 188.04441999816902,
+  "kernel_sum_ms": 962.7744129999999,
+  "buckets": {
+   "gemm_aux": 775.0279019999999,
+   "memset": 187.746511
+  },
+  "wall": {
+   "gemm_aux": 569.8885679931641,
+   "memset": 187.74651100158692
+  },
+  "attn_call_span_ms": {},
+  "attn_calls": {},
+  "arm_ranges": {},
+  "attn_streams": {},
+  "top": {
+   "gemm_aux": [
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte",
+     482.0,
+     4
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, std::array<char*, 2ul> >(int,",
+     222.739,
+     4
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::m",
+     70.289,
+     1
+    ]
+   ],
+   "memset": [
+    [
+     "Memset (Device)",
+     187.747,
+     1
+    ]
+   ]
+  },
+  "fa_path_ms": 0,
+  "fa_path_wall_ms": 0.0,
+  "arms": [],
+  "valid": false,
+  "invalid_reason": "9 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range"
+ },
+ {
+  "trace": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p1_1002_095504/iteration_33/rank0_trace.json",
+  "steps": [
+   "ProfilerStep#32"
+  ],
+  "cpu_step_ms": [
+   1357.11250100708
+  ],
+  "gpu_kernels": 8,
+  "gpu_span_ms": 751.9754690093994,
+  "gpu_busy_ms": 561.1791490325928,
+  "idle_ms": 190.79631997680656,
+  "kernel_sum_ms": 711.617405,
+  "buckets": {
+   "gemm_aux": 509.99888699999997,
+   "elementwise": 69.83401300000001,
+   "memset": 131.784505
+  },
+  "wall": {
+   "gemm_aux": 406.3407790222168,
+   "elementwise": 69.83401300048828,
+   "memset": 131.78450500488282
+  },
+  "attn_call_span_ms": {},
+  "attn_calls": {},
+  "arm_ranges": {},
+  "attn_streams": {},
+  "top": {
+   "gemm_aux": [
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte",
+     289.452,
+     4
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::m",
+     151.247,
+     2
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, std::array<char*, 2ul> >(int,",
+     69.299,
+     1
+    ]
+   ],
+   "elementwise": [
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::b",
+     69.834,
+     1
+    ]
+   ],
+   "memset": [
+    [
+     "Memset (Device)",
+     131.785,
+     1
+    ]
+   ]
+  },
+  "fa_path_ms": 0,
+  "fa_path_wall_ms": 0.0,
+  "arms": [],
+  "valid": false,
+  "invalid_reason": "8 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range"
+ },
+ {
+  "trace": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p1_1002_095504/iteration_44/rank0_trace.json",
+  "steps": [
+   "ProfilerStep#43"
+  ],
+  "cpu_step_ms": [
+   1360.9039309997559
+  ],
+  "gpu_kernels": 15,
+  "gpu_span_ms": 1256.8207440032959,
+  "gpu_busy_ms": 1169.0143159942627,
+  "idle_ms": 87.8064280090332,
+  "kernel_sum_ms": 2292.0877539999997,
+  "buckets": {
+   "memset": 512.820573,
+   "gemm_aux": 1665.702032,
+   "elementwise": 113.565149
+  },
+  "wall": {
+   "memset": 512.8205729980468,
+   "gemm_aux": 647.3985980072022,
+   "elementwise": 113.5651490020752
+  },
+  "attn_call_span_ms": {},
+  "attn_calls": {},
+  "arm_ranges": {},
+  "attn_streams": {},
+  "top": {
+   "memset": [
+    [
+     "Memset (Device)",
+     512.821,
+     1
+    ]
+   ],
+   "gemm_aux": [
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, std::array<char*, 2ul> >(int,",
+     743.373,
+     6
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte",
+     495.132,
+     4
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::m",
+     322.213,
+     3
+    ],
+    [
+     "_transpose_kernel",
+     104.984,
+     1
+    ]
+   ],
+   "elementwise": [
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::b",
+     113.565,
+     1
+    ]
+   ]
+  },
+  "fa_path_ms": 0,
+  "fa_path_wall_ms": 0.0,
+  "arms": [],
+  "valid": false,
+  "invalid_reason": "15 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range"
+ },
+ {
+  "trace": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p1_1002_095504/iteration_55/rank0_trace.json",
+  "steps": [
+   "ProfilerStep#54"
+  ],
+  "cpu_step_ms": [
+   1359.6862910003663
+  ],
+  "gpu_kernels": 8,
+  "gpu_span_ms": 1330.4092959899901,
+  "gpu_busy_ms": 698.0269210205078,
+  "idle_ms": 632.3823749694824,
+  "kernel_sum_ms": 1024.023819,
+  "buckets": {
+   "elementwise": 99.40660000000001,
+   "gemm_aux": 590.20739,
+   "memset": 334.409829
+  },
+  "wall": {
+   "elementwise": 99.40660000610352,
+   "gemm_aux": 418.1631070098877,
+   "memset": 327.4940919952393
+  },
+  "attn_call_span_ms": {},
+  "attn_calls": {},
+  "arm_ranges": {},
+  "attn_streams": {},
+  "top": {
+   "elementwise": [
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add<float>, std::array<char*, ",
+     99.407,
+     1
+    ]
+   ],
+   "gemm_aux": [
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte",
+     335.385,
+     4
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, std::array<char*, 2ul> >(int,",
+     145.841,
+     2
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::m",
+     108.981,
+     1
+    ]
+   ],
+   "memset": [
+    [
+     "Memset (Device)",
+     334.41,
+     3
+    ]
+   ]
+  },
+  "fa_path_ms": 0,
+  "fa_path_wall_ms": 0.0,
+  "arms": [],
+  "valid": false,
+  "invalid_reason": "8 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range"
+ },
+ {
+  "trace": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p1_1002_095504/iteration_66/rank0_trace.json",
+  "steps": [
+   "ProfilerStep#65"
+  ],
+  "cpu_step_ms": [
+   1399.823722000122
+  ],
+  "gpu_kernels": 8,
+  "gpu_span_ms": 1276.9193379974365,
+  "gpu_busy_ms": 915.4589819946289,
+  "idle_ms": 361.46035600280766,
+  "kernel_sum_ms": 1312.6197659999998,
+  "buckets": {
+   "gemm_aux": 1312.6197659999998
+  },
+  "wall": {
+   "gemm_aux": 915.4589819946289
+  },
+  "attn_call_span_ms": {},
+  "attn_calls": {},
+  "arm_ranges": {},
+  "attn_streams": {},
+  "top": {
+   "gemm_aux": [
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte",
+     555.752,
+     4
+    ],
+    [
+     "_transpose_kernel",
+     510.921,
+     1
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, std::array<char*, 2ul> >(int,",
+     221.177,
+     2
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::m",
+     24.771,
+     1
+    ]
+   ]
+  },
+  "fa_path_ms": 0,
+  "fa_path_wall_ms": 0.0,
+  "arms": [],
+  "valid": false,
+  "invalid_reason": "8 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range"
+ },
+ {
+  "trace": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p1_1002_095504/iteration_77/rank0_trace.json",
+  "steps": [
+   "ProfilerStep#76"
+  ],
+  "cpu_step_ms": [
+   1360.1180780029297
+  ],
+  "gpu_kernels": 8,
+  "gpu_span_ms": 1070.7151860046388,
+  "gpu_busy_ms": 944.7472470092773,
+  "idle_ms": 125.96793899536146,
+  "kernel_sum_ms": 2169.5130400000003,
+  "buckets": {
+   "elementwise": 415.373715,
+   "gemm_aux": 1403.2405590000003,
+   "memset": 350.89876599999997
+  },
+  "wall": {
+   "elementwise": 415.3737150115967,
+   "gemm_aux": 861.91474899292,
+   "memset": 274.48360899353025
+  },
+  "attn_call_span_ms": {},
+  "attn_calls": {},
+  "arm_ranges": {},
+  "attn_streams": {},
+  "top": {
+   "elementwise": [
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add<float>, std::array<char*, ",
+     308.716,
+     1
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::conj_kernel_cuda(at::TensorIteratorBase&)::{lamb",
+     106.657,
+     1
+    ]
+   ],
+   "gemm_aux": [
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::m",
+     738.746,
+     4
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, std::array<char*, 2ul> >(int,",
+     664.495,
+     2
+    ]
+   ],
+   "memset": [
+    [
+     "Memset (Device)",
+     350.899,
+     3
+    ]
+   ]
+  },
+  "fa_path_ms": 0,
+  "fa_path_wall_ms": 0.0,
+  "arms": [],
+  "valid": false,
+  "invalid_reason": "8 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range"
+ },
+ {
+  "trace": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p1_1002_095504/iteration_88/rank0_trace.json",
+  "steps": [
+   "ProfilerStep#87"
+  ],
+  "cpu_step_ms": [
+   1400.9251499938964
+  ],
+  "gpu_kernels": 10,
+  "gpu_span_ms": 1270.9794660034179,
+  "gpu_busy_ms": 1187.6951389923095,
+  "idle_ms": 83.28432701110842,
+  "kernel_sum_ms": 2286.108752,
+  "buckets": {
+   "elementwise": 440.49235200000004,
+   "gemm_aux": 1416.233877,
+   "memset": 429.382523
+  },
+  "wall": {
+   "elementwise": 440.4923520050049,
+   "gemm_aux": 1009.5668759765625,
+   "memset": 429.3825230102539
+  },
+  "attn_call_span_ms": {},
+  "attn_calls": {},
+  "arm_ranges": {},
+  "attn_streams": {},
+  "top": {
+   "elementwise": [
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add<float>, std::array<char*, ",
+     440.492,
+     1
+    ]
+   ],
+   "gemm_aux": [
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, std::array<char*, 2ul> >(int,",
+     840.259,
+     4
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::m",
+     365.476,
+     2
+    ],
+    [
+     "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte",
+     210.499,
+     3
+    ]
+   ],
+   "memset": [
+    [
+     "Memset (Device)",
+     429.383,
+     3
+    ]
+   ]
+  },
+  "fa_path_ms": 0,
+  "fa_path_wall_ms": 0.0,
+  "arms": [],
+  "valid": false,
+  "invalid_reason": "10 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range"
+ }
+]

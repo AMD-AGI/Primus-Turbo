@@ -1,0 +1,118 @@
+
+=== /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p1_1002_095504/iteration_11/rank0_trace.json
+  INVALID: 9 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range  arms []  steps ['ProfilerStep#10'] cpu step ms [1358.0]
+  GPU kernels 9  span 1315.2 ms  busy 1110.1  idle 205.1  kernel-sum 2036.2
+  gemm_aux       sum   1080.42 ms  wall    998.17 ms
+  elementwise    sum    663.72 ms  wall    638.19 ms
+  memset         sum    292.06 ms  wall    292.06 ms
+  FA path sum      0.00 ms  wall      0.00 ms  call spans 
+  arm ranges: 
+  -- gemm_aux
+         633.38 ms n=3     void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::m
+         447.04 ms n=3     void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte
+  -- elementwise
+         483.70 ms n=1     void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add<float>, std::array<char*, 
+         112.83 ms n=1     void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::b
+          67.19 ms n=1     void at::native::reduce_kernel<512, 1, at::native::ReduceOp<long, at::native::func_wrapper_t<long, at::native:
+
+=== /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p1_1002_095504/iteration_22/rank0_trace.json
+  INVALID: 9 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range  arms []  steps ['ProfilerStep#21'] cpu step ms [1384.6]
+  GPU kernels 9  span 795.1 ms  busy 607.0  idle 188.0  kernel-sum 962.8
+  gemm_aux       sum    775.03 ms  wall    569.89 ms
+  memset         sum    187.75 ms  wall    187.75 ms
+  FA path sum      0.00 ms  wall      0.00 ms  call spans 
+  arm ranges: 
+  -- gemm_aux
+         482.00 ms n=4     void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte
+         222.74 ms n=4     void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, std::array<char*, 2ul> >(int,
+          70.29 ms n=1     void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::m
+
+=== /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p1_1002_095504/iteration_33/rank0_trace.json
+  INVALID: 8 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range  arms []  steps ['ProfilerStep#32'] cpu step ms [1357.1]
+  GPU kernels 8  span 752.0 ms  busy 561.2  idle 190.8  kernel-sum 711.6
+  gemm_aux       sum    510.00 ms  wall    406.34 ms
+  memset         sum    131.78 ms  wall    131.78 ms
+  elementwise    sum     69.83 ms  wall     69.83 ms
+  FA path sum      0.00 ms  wall      0.00 ms  call spans 
+  arm ranges: 
+  -- gemm_aux
+         289.45 ms n=4     void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte
+         151.25 ms n=2     void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::m
+          69.30 ms n=1     void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, std::array<char*, 2ul> >(int,
+  -- elementwise
+          69.83 ms n=1     void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::b
+
+=== /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p1_1002_095504/iteration_44/rank0_trace.json
+  INVALID: 15 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range  arms []  steps ['ProfilerStep#43'] cpu step ms [1360.9]
+  GPU kernels 15  span 1256.8 ms  busy 1169.0  idle 87.8  kernel-sum 2292.1
+  gemm_aux       sum   1665.70 ms  wall    647.40 ms
+  memset         sum    512.82 ms  wall    512.82 ms
+  elementwise    sum    113.57 ms  wall    113.57 ms
+  FA path sum      0.00 ms  wall      0.00 ms  call spans 
+  arm ranges: 
+  -- gemm_aux
+         743.37 ms n=6     void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, std::array<char*, 2ul> >(int,
+         495.13 ms n=4     void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte
+         322.21 ms n=3     void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::m
+         104.98 ms n=1     _transpose_kernel
+  -- elementwise
+         113.56 ms n=1     void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::b
+
+=== /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p1_1002_095504/iteration_55/rank0_trace.json
+  INVALID: 8 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range  arms []  steps ['ProfilerStep#54'] cpu step ms [1359.7]
+  GPU kernels 8  span 1330.4 ms  busy 698.0  idle 632.4  kernel-sum 1024.0
+  gemm_aux       sum    590.21 ms  wall    418.16 ms
+  memset         sum    334.41 ms  wall    327.49 ms
+  elementwise    sum     99.41 ms  wall     99.41 ms
+  FA path sum      0.00 ms  wall      0.00 ms  call spans 
+  arm ranges: 
+  -- gemm_aux
+         335.38 ms n=4     void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte
+         145.84 ms n=2     void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, std::array<char*, 2ul> >(int,
+         108.98 ms n=1     void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::m
+  -- elementwise
+          99.41 ms n=1     void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add<float>, std::array<char*, 
+
+=== /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p1_1002_095504/iteration_66/rank0_trace.json
+  INVALID: 8 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range  arms []  steps ['ProfilerStep#65'] cpu step ms [1399.8]
+  GPU kernels 8  span 1276.9 ms  busy 915.5  idle 361.5  kernel-sum 1312.6
+  gemm_aux       sum   1312.62 ms  wall    915.46 ms
+  FA path sum      0.00 ms  wall      0.00 ms  call spans 
+  arm ranges: 
+  -- gemm_aux
+         555.75 ms n=4     void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte
+         510.92 ms n=1     _transpose_kernel
+         221.18 ms n=2     void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, std::array<char*, 2ul> >(int,
+          24.77 ms n=1     void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::m
+
+=== /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p1_1002_095504/iteration_77/rank0_trace.json
+  INVALID: 8 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range  arms []  steps ['ProfilerStep#76'] cpu step ms [1360.1]
+  GPU kernels 8  span 1070.7 ms  busy 944.7  idle 126.0  kernel-sum 2169.5
+  gemm_aux       sum   1403.24 ms  wall    861.91 ms
+  elementwise    sum    415.37 ms  wall    415.37 ms
+  memset         sum    350.90 ms  wall    274.48 ms
+  FA path sum      0.00 ms  wall      0.00 ms  call spans 
+  arm ranges: 
+  -- gemm_aux
+         738.75 ms n=4     void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::m
+         664.50 ms n=2     void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, std::array<char*, 2ul> >(int,
+  -- elementwise
+         308.72 ms n=1     void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add<float>, std::array<char*, 
+         106.66 ms n=1     void at::native::vectorized_elementwise_kernel<4, at::native::conj_kernel_cuda(at::TensorIteratorBase&)::{lamb
+
+=== /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p1_1002_095504/iteration_88/rank0_trace.json
+  INVALID: 10 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range  arms []  steps ['ProfilerStep#87'] cpu step ms [1400.9]
+  GPU kernels 10  span 1271.0 ms  busy 1187.7  idle 83.3  kernel-sum 2286.1
+  gemm_aux       sum   1416.23 ms  wall   1009.57 ms
+  elementwise    sum    440.49 ms  wall    440.49 ms
+  memset         sum    429.38 ms  wall    429.38 ms
+  FA path sum      0.00 ms  wall      0.00 ms  call spans 
+  arm ranges: 
+  -- gemm_aux
+         840.26 ms n=4     void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, std::array<char*, 2ul> >(int,
+         365.48 ms n=2     void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, float, at::native::m
+         210.50 ms n=3     void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kernel_cuda(at::TensorIte
+  -- elementwise
+         440.49 ms n=1     void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add<float>, std::array<char*, 
+
+!! 8/8 traces INVALID (kineto dropped GPU records?) -- use attn_events.py numbers

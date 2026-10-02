@@ -1,0 +1,84 @@
+{
+ "arm": "fly",
+ "shape": "prod",
+ "dims": [
+  4,
+  8192,
+  8192,
+  32,
+  8,
+  128
+ ],
+ "iters": 51,
+ "env": {
+  "TORCH_BLAS_PREFER_HIPBLASLT": "1",
+  "HIPBLASLT_TENSILE_LIBPATH": "/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/gfx1250",
+  "PYTHONPATH": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/attn_backends/shim:/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/attn_backends:/home/lihuzhan/.local/flydsl0341:/home/lihuzhan/code/aiter-src"
+ },
+ "ref_provenance": {
+  "seed": "0",
+  "eager_sha": "2b35dff2e7a109fa",
+  "common_sha": "988c14caed5d9a80",
+  "torch": "2.11.0+rocm7.14.0a20260625",
+  "device": "gfx1250",
+  "ref_device": "cpu",
+  "shape": "prod",
+  "dims": "(4, 8192, 8192, 32, 8, 128)"
+ },
+ "versions": "flydsl 0.3.4.1 @ /home/lihuzhan/.local/flydsl0341/flydsl/__init__.py",
+ "sqnr_chain_db": {
+  "o": 50.83,
+  "dq": 51.9,
+  "dk": 51.99,
+  "dv": 52.39
+ },
+ "adapter_copies": {
+  "copies": 0,
+  "copy_bytes": 0
+ },
+ "sqnr_kfwd_db": {
+  "o": 50.83,
+  "lse": 89.19,
+  "lse_shape": [
+   4,
+   32,
+   8192
+  ]
+ },
+ "sqnr_kbwd_refolse_db": {
+  "dq": 52.56,
+  "dk": 52.6,
+  "dv": 52.71
+ },
+ "timing_ms": {
+  "m_fwd": {
+   "med": 1.4145,
+   "p10": 1.3491,
+   "p90": 1.4876
+  },
+  "m_bwd": {
+   "med": 4.9709,
+   "p10": 4.9192,
+   "p90": 5.0521
+  },
+  "k_fwd": {
+   "med": 1.3482,
+   "p10": 1.3211,
+   "p90": 1.3652
+  },
+  "k_bwd": {
+   "med": 4.951,
+   "p10": 4.8856,
+   "p90": 5.0149
+  },
+  "overhead_fwd_ms": 0.0663,
+  "overhead_bwd_ms": 0.0199
+ },
+ "max_mem_alloc_gib": 3.88,
+ "wall_s": 9.3,
+ "blas_repoints": [],
+ "attn_timer": {
+  "ok": true,
+  "path": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/opcheck.fly.prod.1002_100518.attn_ev.jsonl"
+ }
+}

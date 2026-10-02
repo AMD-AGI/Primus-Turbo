@@ -1,0 +1,57 @@
+ARM fly SHAPE fast (1, 1024, 1024, 8, 2, 128)
+device gfx1250
+[e2e_attn] attn timer on -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/opcheck.fly.fast.1002_100007.attn_ev.jsonl
+[e2e_attn] tree fly/fwd /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/arms/fwd_r16_imglib md5 {'__init__.py': '5a346292', '_env.py': 'd695af4b', 'flydsl_fwd/__init__.py': '4abc9e3f', 'flydsl_fwd/buffer_ops.py': '460ff818', 'flydsl_fwd/fmha_b16_buffer_managers.py': 'f8c13205', 'flydsl_fwd/fmha_fwd_prefill_a16w16_m16x8.py': '1af89c64', 'flydsl_fwd/fmha_fwd_prefill_a16w16_m32x2.py': 'b0972156', 'flydsl_fwd/fmha_fwd_prefill_a16w16_m32x8.py': '370769c9', 'flydsl_fwd/kernels_common.py': '2b950376', 'flydsl_fwd/tensor_shim.py': '0cffb566', 'impl.py': '35f4247a'}
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /home/lihuzhan/code/aiter-src/aiter/jit/module_aiter_core.so
+[e2e_attn] tree fly/bwd /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/bwd_s6_0341 md5 {'__init__.py': '0024d09d', '_env.py': '7df61bba', 'impl.py': '46e0e812', 'kernels.py': '5e61678d'}
+versions: flydsl 0.3.4.1 @ /home/lihuzhan/.local/flydsl0341/flydsl/__init__.py
+BLAS env: 1 /opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/gfx1250
+[e2e_attn] E2E_ATTN='fly' schedule warm=[] cycle=[('fly', 'fly')]
+[e2e_attn] fly trees: {'fly': {'fwd': '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/arms/fwd_r16_imglib', 'bwd': '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/bwd_s6_0341'}, 'flyr29': {'fwd': '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/arms/fwd_r16_imglib', 'bwd': '/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/bwd_r29_0341'}}
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/jit_function.py:1681: UserWarning: @jit parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  jf(*args)
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_O' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_Q' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_K' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_V' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_LSE' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+/home/lihuzhan/.local/flydsl0341/flydsl/compiler/kernel_function.py:360: UserWarning: @kernel parameter 'ptr_sink' is annotated as 'Pointer', but the argument resolves to 'Tensor'. The annotation is not enforced; the actual value type is used.
+  kernel_name, kernel_args, gpu_func_op, smem_bytes = self._kernel_function._emit_kernel(
+[e2e_attn] BLAS TORCH_BLAS_PREFER_HIPBLASLT=1 HIPBLASLT_TENSILE_LIBPATH=/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/gfx1250 preferred_blas_library=_BlasBackend.Cublaslt expected_lib=/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/gfx1250
+[e2e_attn] flydsl 0.3.4.1 @ /home/lihuzhan/.local/flydsl0341/flydsl/__init__.py
+[e2e_attn] layout q(1, 1024, 8, 128) torch.bfloat16 contig=True k(1, 1024, 2, 128) contig=True v(1, 1024, 2, 128) contig=True
+[e2e_attn] step_idx=0 arm fwd=fly bwd=fly adapter_copies_so_far=0 (0 MiB)
+[flydsl_bwd bwd_s6_0341] DQ_SIDE_STREAM=1 DQ_SIDE_RECORD=0 (FLY_BWD_SIDE_STREAM='1' FLY_BWD_RECORD_STREAM='0')
+/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/ref/common.py:130: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at /__w/rocm-npi-dev/rocm-npi-dev/_therock/external-builds/pytorch/pytorch/torch/csrc/autograd/generated/python_variable_methods.cpp:836.)
+  return float(10.0 * torch.log10(num / den))
+SQNR chain (module fwd+autograd bwd vs fp32 ref): {'o': 51.23, 'dq': 51.71, 'dk': 51.7, 'dv': 52.32} adapter copies: {'copies': 0, 'copy_bytes': 0}
+SQNR kernel fwd: {'o': 51.23, 'lse': 85.48, 'lse_shape': [1, 8, 1024]}
+SQNR kernel bwd on reference o/lse (job gate form): {'dq': 52.61, 'dk': 52.65, 'dv': 52.83}
+[e2e_attn] step_idx=1 arm fwd=fly bwd=fly adapter_copies_so_far=0 (0 MiB)
+[e2e_attn] step_idx=2 arm fwd=fly bwd=fly adapter_copies_so_far=0 (0 MiB)
+  m_fwd                  {'med': 0.2614, 'p10': 0.2484, 'p90': 0.2729}
+  m_bwd                  {'med': 0.5092, 'p10': 0.4922, 'p90': 0.5305}
+  k_fwd                  {'med': 0.0993, 'p10': 0.0623, 'p90': 0.1047}
+  k_bwd                  {'med': 0.2128, 'p10': 0.1738, 'p90': 0.2212}
+  overhead_fwd_ms        0.1621
+  overhead_bwd_ms        0.2964
+adapter copies after timing: {'copies': 0, 'copy_bytes': 0}
+DONE {"arm": "fly", "shape": "fast", "sqnr_chain_db": {"o": 51.23, "dq": 51.71, "dk": 51.7, "dv": 52.32}}
+[e2e_attn] attn timer closed: 57 steps written, 0 pairs unwritten -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/opcheck.fly.fast.1002_100007.attn_ev.jsonl

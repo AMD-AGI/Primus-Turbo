@@ -1,0 +1,292 @@
+################ a0e2e_3arm_p1_1002_095504  spec 'asm;asm,fly,flyr29,asm,flyr29,fly' pfreq 11
+---- post-run summary
+tag: a0e2e_3arm_p1_1002_095504
+spec: asm;asm,fly,flyr29,asm,flyr29,fly
+steps: 92
+pfreq: 11
+nlayers: 32
+rc: 0
+wall_s: 160
+steps_logged: 92
+nonfinite_lines: 0
+nkfix_nonfinite_lines: 0
+nkfix_events:  []
+blas_repoints: 0
+event_steps: 92
+watchdog: 
+memguard: 
+dmesg_fault_lines: 0
+dmesg_info_lines: 0
+cpu_mce_new: 0
+foreign_kfd: 
+tree_changed_during_run: no
+valid: yes
+leftovers: 
+flycache: /tmp/flycache_a0e2e_3arm_p1_1002_095504_101029
+bwd_stream_mode: [flydsl_bwd bwd_s6_0341] DQ_SIDE_STREAM=1 DQ_SIDE_RECORD=0
+log: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/e2e.a0e2e_3arm_p1_1002_095504.log
+events: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/attn_ev.a0e2e_3arm_p1_1002_095504.jsonl
+clk: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/clk.a0e2e_3arm_p1_1002_095504.csv
+env: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/env.a0e2e_3arm_p1_1002_095504.txt
+tree: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/tree.a0e2e_3arm_p1_1002_095504.sha256
+dbg: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/a0e2e_3arm_p1_1002_095504.dbg.txt (106 lines of /home/lihuzhan/_dbg_l8b/output/amd/root/a0e2e_3arm_p1_1002_095504/logs/pre_trainer/rank-0/debug.log)
+---- nkfix
+stats: {'dgrad': 20700, 'wgrad': 20700, 'chunked': 9016, 'miss': 20700, 'checked': 41400, 'syncs': 647, 'scratch_bytes': 603979776}
+nonfinite_events: []
+max_abs_by_tag: {'wgrad.out': '2.875', 'dgrad.out': '0.001038'}
+---- env evidence
+AMD_SERIALIZE_COPY=0
+CUDA_DEVICE_MAX_CONNECTIONS=1
+E2E_ATTN=asm;asm,fly,flyr29,asm,flyr29,fly
+E2E_ATTN_EVENTS=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/attn_ev.a0e2e_3arm_p1_1002_095504.jsonl
+E2E_EXPECT_BLAS_LIB=/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/gfx1250
+E2E_FLY_TREES={"fly":{"fwd":"/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/arms/fwd_r16_imglib","bwd":"/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/bwd_s6_0341"},"flyr29":{"fwd":"/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/arms/fwd_r16_imglib","bwd":"/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/bwd_r29_0341"}}
+E2E_NKFIX=1
+E2E_RUN_MARKER=a0e2e_3arm_p1_1002_095504
+FLY_BWD_RECORD_STREAM=0
+FLY_BWD_SIDE_STREAM=1
+FLYDSL_GPU_ARCH=gfx1250
+FLYDSL_RUNTIME_CACHE_DIR=/tmp/flycache_a0e2e_3arm_p1_1002_095504_101029
+GPU_MAX_HW_QUEUES=2
+HIPBLASLT_TENSILE_LIBPATH=/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/gfx1250
+HIP_VISIBLE_DEVICES=0
+HSA_ENABLE_SDMA=1
+HSA_NO_SCRATCH_RECLAIM=1
+NKFIX_CHECK=1
+NKFIX_STATS_FILE=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/nkfix.a0e2e_3arm_p1_1002_095504.txt
+PYTHONPATH=/home/lihuzhan/code/2026_0828__primus/Primus:/opt/venv/lib/python3.12/site-packages:/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/attn_backends/shim:/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/attn_backends:/home/lihuzhan/.local/flydsl0341:/home/lihuzhan/code/aiter-src
+TORCH_BLAS_PREFER_HIPBLASLT=1
+---- code that ran (logs/tree.a0e2e_3arm_p1_1002_095504.sha256, config excluded) vs the first process
+基准（31 个文件）
+---- steady state (step ms from tps)
+log /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/e2e.a0e2e_3arm_p1_1002_095504.log
+steps 92 last 92; window 61 steps; excluded [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 21, 22, 23, 32, 33, 34, 43, 44, 45, 54, 55, 56, 65, 66, 67, 76, 77, 78, 87, 88, 89]
+non-finite loss/grad_norm steps: none; loss first/last 12.25951 / 3.50734
+peak reserved memory (process-level, only grows): 384.44 GiB (88.99%) first at step 2
+arm asm      n= 21 step ms median   1350.6  IQR 1348.3-1353.6  range 1341.5-1356.2  tps    24262
+arm flyr29   n= 19 step ms median   1389.6  IQR 1383.8-1392.1  range 1372.7-1394.3  tps    23581
+arm fly      n= 21 step ms median   1349.4  IQR 1341.4-1353.6  range 1337.1-1356.8  tps    24283
+RATIO flyr29/asm: cycles n=4 median 1.0279 range 1.0224-1.0281; adjacent n=16 median 1.0269 (diff +36.3 ms; flyr29-first 1.0267, flyr29-second 1.0269); per-arm medians 1.0289  (<1 = flyr29 faster)
+RATIO fly/asm: cycles n=4 median 0.9994 range 0.9956-1.0001; adjacent n=19 median 0.9990 (diff -1.4 ms; fly-first 0.9994, fly-second 0.9989); per-arm medians 0.9991  (<1 = fly faster)
+RATIO fly/flyr29: cycles n=4 median 0.9728 range 0.9719-0.9738; adjacent n=17 median 0.9720 (diff -39.1 ms; fly-first 0.9716, fly-second 0.9733); per-arm medians 0.9711  (<1 = fly faster)
+---- attention per step (CUDA events)
+events /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/attn_ev.a0e2e_3arm_p1_1002_095504.jsonl: 92 steps (last 92); window 61 steps; window steps without events: none
+arm asm      n= 21  attn fwd   34.75 ms/step (34.44-34.95)  bwd  166.54 (165.62-169.20)  FA  201.40  share of step 14.89%  per layer fwd 1.073-1.111 bwd 5.114-5.292 ms; fwd early/late window 34.76/34.74
+arm flyr29   n= 19  attn fwd   43.86 ms/step (42.96-44.34)  bwd  214.76 (212.68-217.22)  FA  258.57  share of step 18.66%  per layer fwd 1.359-1.398 bwd 6.561-6.867 ms; fwd early/late window 43.53/44.07
+arm fly      n= 21  attn fwd   43.88 ms/step (43.03-44.21)  bwd  162.15 (160.02-165.01)  FA  206.03  share of step 15.27%  per layer fwd 1.343-1.388 bwd 4.967-5.177 ms; fwd early/late window 43.34/44.07
+DIFF flyr29-asm (adjacent n=16): attn fwd   +9.07  bwd  +48.36  FA  +57.36 ms/step; step  +36.34 ms; step - FA = -21.02 ms
+DIFF fly-asm (adjacent n=19): attn fwd   +9.18  bwd   -4.50  FA   +4.89 ms/step; step   -1.40 ms; step - FA =  -6.29 ms
+DIFF fly-flyr29 (adjacent n=17): attn fwd   +0.05  bwd  -53.08  FA  -53.04 ms/step; step  -39.07 ms; step - FA = +13.98 ms
+---- kineto traces
+=== /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p1_1002_095504/iteration_11/rank0_trace.json
+  INVALID: 9 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range  arms []  steps ['ProfilerStep#10'] cpu step ms [1358.0]
+  FA path sum      0.00 ms  wall      0.00 ms  call spans 
+  arm ranges: 
+=== /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p1_1002_095504/iteration_22/rank0_trace.json
+  INVALID: 9 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range  arms []  steps ['ProfilerStep#21'] cpu step ms [1384.6]
+  FA path sum      0.00 ms  wall      0.00 ms  call spans 
+  arm ranges: 
+=== /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p1_1002_095504/iteration_33/rank0_trace.json
+  INVALID: 8 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range  arms []  steps ['ProfilerStep#32'] cpu step ms [1357.1]
+  FA path sum      0.00 ms  wall      0.00 ms  call spans 
+  arm ranges: 
+=== /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p1_1002_095504/iteration_44/rank0_trace.json
+  INVALID: 15 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range  arms []  steps ['ProfilerStep#43'] cpu step ms [1360.9]
+  FA path sum      0.00 ms  wall      0.00 ms  call spans 
+  arm ranges: 
+=== /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p1_1002_095504/iteration_55/rank0_trace.json
+  INVALID: 8 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range  arms []  steps ['ProfilerStep#54'] cpu step ms [1359.7]
+  FA path sum      0.00 ms  wall      0.00 ms  call spans 
+  arm ranges: 
+=== /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p1_1002_095504/iteration_66/rank0_trace.json
+  INVALID: 8 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range  arms []  steps ['ProfilerStep#65'] cpu step ms [1399.8]
+  FA path sum      0.00 ms  wall      0.00 ms  call spans 
+  arm ranges: 
+=== /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p1_1002_095504/iteration_77/rank0_trace.json
+  INVALID: 8 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range  arms []  steps ['ProfilerStep#76'] cpu step ms [1360.1]
+  FA path sum      0.00 ms  wall      0.00 ms  call spans 
+  arm ranges: 
+=== /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p1_1002_095504/iteration_88/rank0_trace.json
+  INVALID: 10 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range  arms []  steps ['ProfilerStep#87'] cpu step ms [1400.9]
+  FA path sum      0.00 ms  wall      0.00 ms  call spans 
+  arm ranges: 
+!! 8/8 traces INVALID (kineto dropped GPU records?) -- use attn_events.py numbers
+---- clocks
+load  n=  32 sclk median 1510.5 MHz (p10 1432.0, p90 2356.0)  power median 1132.118 W (p90 1135.118)
+idle  n=   0 sclk median None MHz (p10 None, p90 None)  power median None W (p90 None)
+################ a0e2e_3arm_p2_1002_095504  spec 'asm;asm,flyr29,fly,asm,fly,flyr29' pfreq 11
+---- post-run summary
+tag: a0e2e_3arm_p2_1002_095504
+spec: asm;asm,flyr29,fly,asm,fly,flyr29
+steps: 92
+pfreq: 11
+nlayers: 32
+rc: 0
+wall_s: 158
+steps_logged: 92
+nonfinite_lines: 0
+nkfix_nonfinite_lines: 0
+nkfix_events:  []
+blas_repoints: 0
+event_steps: 92
+watchdog: 
+memguard: 
+dmesg_fault_lines: 0
+dmesg_info_lines: 3
+cpu_mce_new: 1
+foreign_kfd: 
+tree_changed_during_run: no
+valid: yes
+leftovers: 
+flycache: /tmp/flycache_a0e2e_3arm_p2_1002_095504_101811
+bwd_stream_mode: [flydsl_bwd bwd_s6_0341] DQ_SIDE_STREAM=1 DQ_SIDE_RECORD=0
+log: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/e2e.a0e2e_3arm_p2_1002_095504.log
+events: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/attn_ev.a0e2e_3arm_p2_1002_095504.jsonl
+clk: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/clk.a0e2e_3arm_p2_1002_095504.csv
+env: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/env.a0e2e_3arm_p2_1002_095504.txt
+tree: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/tree.a0e2e_3arm_p2_1002_095504.sha256
+dbg: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/a0e2e_3arm_p2_1002_095504.dbg.txt (106 lines of /home/lihuzhan/_dbg_l8b/output/amd/root/a0e2e_3arm_p2_1002_095504/logs/pre_trainer/rank-0/debug.log)
+---- nkfix
+stats: {'dgrad': 20700, 'wgrad': 20700, 'chunked': 9016, 'miss': 20700, 'checked': 41400, 'syncs': 647, 'scratch_bytes': 603979776}
+nonfinite_events: []
+max_abs_by_tag: {'wgrad.out': '2.875', 'dgrad.out': '0.001038'}
+---- env evidence
+AMD_SERIALIZE_COPY=0
+CUDA_DEVICE_MAX_CONNECTIONS=1
+E2E_ATTN=asm;asm,flyr29,fly,asm,fly,flyr29
+E2E_ATTN_EVENTS=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/attn_ev.a0e2e_3arm_p2_1002_095504.jsonl
+E2E_EXPECT_BLAS_LIB=/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/gfx1250
+E2E_FLY_TREES={"fly":{"fwd":"/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/arms/fwd_r16_imglib","bwd":"/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/bwd_s6_0341"},"flyr29":{"fwd":"/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/arms/fwd_r16_imglib","bwd":"/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/arms/bwd_r29_0341"}}
+E2E_NKFIX=1
+E2E_RUN_MARKER=a0e2e_3arm_p2_1002_095504
+FLY_BWD_RECORD_STREAM=0
+FLY_BWD_SIDE_STREAM=1
+FLYDSL_GPU_ARCH=gfx1250
+FLYDSL_RUNTIME_CACHE_DIR=/tmp/flycache_a0e2e_3arm_p2_1002_095504_101811
+GPU_MAX_HW_QUEUES=2
+HIPBLASLT_TENSILE_LIBPATH=/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/gfx1250
+HIP_VISIBLE_DEVICES=0
+HSA_ENABLE_SDMA=1
+HSA_NO_SCRATCH_RECLAIM=1
+NKFIX_CHECK=1
+NKFIX_STATS_FILE=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/nkfix.a0e2e_3arm_p2_1002_095504.txt
+PYTHONPATH=/home/lihuzhan/code/2026_0828__primus/Primus:/opt/venv/lib/python3.12/site-packages:/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/attn_backends/shim:/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/attn_backends:/home/lihuzhan/.local/flydsl0341:/home/lihuzhan/code/aiter-src
+TORCH_BLAS_PREFER_HIPBLASLT=1
+---- code that ran (logs/tree.a0e2e_3arm_p2_1002_095504.sha256, config excluded) vs the first process
+同 a0e2e_3arm_p1_1002_095504（31 个文件）
+---- steady state (step ms from tps)
+log /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/e2e.a0e2e_3arm_p2_1002_095504.log
+steps 92 last 92; window 61 steps; excluded [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 21, 22, 23, 32, 33, 34, 43, 44, 45, 54, 55, 56, 65, 66, 67, 76, 77, 78, 87, 88, 89]
+non-finite loss/grad_norm steps: none; loss first/last 12.25951 / 3.50642
+peak reserved memory (process-level, only grows): 384.44 GiB (88.99%) first at step 2
+arm asm      n= 21 step ms median   1350.6  IQR 1346.1-1351.9  range 1339.6-1356.6  tps    24262
+arm flyr29   n= 21 step ms median   1388.5  IQR 1379.0-1390.6  range 1374.8-1393.6  tps    23599
+arm fly      n= 19 step ms median   1349.9  IQR 1342.3-1353.6  range 1333.4-1356.1  tps    24275
+RATIO flyr29/asm: cycles n=4 median 1.0280 range 1.0247-1.0303; adjacent n=19 median 1.0273 (diff +36.9 ms; flyr29-first 1.0275, flyr29-second 1.0273); per-arm medians 1.0281  (<1 = flyr29 faster)
+RATIO fly/asm: cycles n=4 median 1.0015 range 0.9956-1.0035; adjacent n=16 median 0.9985 (diff -2.0 ms; fly-first 0.9995, fly-second 0.9977); per-arm medians 0.9995  (<1 = fly faster)
+RATIO fly/flyr29: cycles n=4 median 0.9734 range 0.9716-0.9756; adjacent n=17 median 0.9732 (diff -37.0 ms; fly-first 0.9712, fly-second 0.9735); per-arm medians 0.9722  (<1 = fly faster)
+---- attention per step (CUDA events)
+events /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/attn_ev.a0e2e_3arm_p2_1002_095504.jsonl: 92 steps (last 92); window 61 steps; window steps without events: none
+arm asm      n= 21  attn fwd   34.63 ms/step (34.39-35.01)  bwd  166.41 (165.26-168.52)  FA  201.01  share of step 14.87%  per layer fwd 1.071-1.100 bwd 5.110-5.288 ms; fwd early/late window 34.52/34.69
+arm flyr29   n= 21  attn fwd   43.82 ms/step (43.07-44.40)  bwd  215.41 (212.55-218.54)  FA  259.67  share of step 18.69%  per layer fwd 1.355-1.394 bwd 6.587-6.895 ms; fwd early/late window 43.18/44.03
+arm fly      n= 19  attn fwd   43.91 ms/step (43.10-44.29)  bwd  162.62 (160.41-165.30)  FA  206.17  share of step 15.27%  per layer fwd 1.353-1.393 bwd 4.923-5.175 ms; fwd early/late window 43.50/44.14
+DIFF flyr29-asm (adjacent n=19): attn fwd   +9.16  bwd  +49.79  FA  +58.98 ms/step; step  +36.91 ms; step - FA = -22.06 ms
+DIFF fly-asm (adjacent n=16): attn fwd   +9.24  bwd   -4.56  FA   +4.27 ms/step; step   -2.04 ms; step - FA =  -6.31 ms
+DIFF fly-flyr29 (adjacent n=17): attn fwd   +0.01  bwd  -52.89  FA  -52.99 ms/step; step  -36.98 ms; step - FA = +16.00 ms
+---- kineto traces
+=== /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p2_1002_095504/iteration_11/rank0_trace.json
+  INVALID: 9 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range  arms []  steps ['ProfilerStep#10'] cpu step ms [1360.9]
+  FA path sum      0.00 ms  wall      0.00 ms  call spans 
+  arm ranges: 
+=== /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p2_1002_095504/iteration_22/rank0_trace.json
+  INVALID: 5 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range  arms []  steps ['ProfilerStep#21'] cpu step ms [1341.8]
+  FA path sum      0.00 ms  wall      0.00 ms  call spans 
+  arm ranges: 
+=== /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p2_1002_095504/iteration_33/rank0_trace.json
+  INVALID: 8 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range  arms []  steps ['ProfilerStep#32'] cpu step ms [1397.3]
+  FA path sum      0.00 ms  wall      0.00 ms  call spans 
+  arm ranges: 
+=== /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p2_1002_095504/iteration_44/rank0_trace.json
+  INVALID: 12 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range  arms []  steps ['ProfilerStep#43'] cpu step ms [1358.2]
+  FA path sum      0.00 ms  wall      0.00 ms  call spans 
+  arm ranges: 
+=== /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p2_1002_095504/iteration_55/rank0_trace.json
+  INVALID: 8 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range  arms []  steps ['ProfilerStep#54'] cpu step ms [1400.1]
+  FA path sum      0.00 ms  wall      0.00 ms  call spans 
+  arm ranges: 
+=== /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p2_1002_095504/iteration_66/rank0_trace.json
+  INVALID: 10 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range  arms []  steps ['ProfilerStep#65'] cpu step ms [1360.4]
+  FA path sum      0.00 ms  wall      0.00 ms  call spans 
+  arm ranges: 
+=== /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p2_1002_095504/iteration_77/rank0_trace.json
+  INVALID: 5 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range  arms []  steps ['ProfilerStep#76'] cpu step ms [1361.9]
+  FA path sum      0.00 ms  wall      0.00 ms  call spans 
+  arm ranges: 
+=== /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/traces/a0e2e_3arm_p2_1002_095504/iteration_88/rank0_trace.json
+  INVALID: 4 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range  arms []  steps ['ProfilerStep#87'] cpu step ms [1361.4]
+  FA path sum      0.00 ms  wall      0.00 ms  call spans 
+  arm ranges: 
+!! 8/8 traces INVALID (kineto dropped GPU records?) -- use attn_events.py numbers
+---- clocks
+load  n=  32 sclk median 1500.5 MHz (p10 1418.0, p90 2353.0)  power median 1137.051 W (p90 1168.625)
+idle  n=   0 sclk median None MHz (p10 None, p90 None)  power median None W (p90 None)
+################ table -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/TABLE.1002_095504.md
+## 1. 每个进程、每个 arm 的稳态数字
+
+| 进程 | arm | n | 单步 ms 中位数（IQR） | tps | 对 asm 单步比：相邻配对 / 周期 | 对 flyr29 单步比：相邻配对 / 周期 | attn fwd ms/步 | attn bwd ms/步 | FA ms/步 | FA 占单步 |
+|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| a0e2e_3arm_p1_1002_095504 | asm | 21 | 1350.6（1348.3–1353.6） | 24,262 | 1 | — | 34.75 | 166.54 | 201.40 | 14.89% |
+| a0e2e_3arm_p1_1002_095504 | flyr29 | 19 | 1389.6（1383.8–1392.1） | 23,581 | 1.0269（n=16）/ 1.0279（n=4） | 1 | 43.86 | 214.76 | 258.57 | 18.66% |
+| a0e2e_3arm_p1_1002_095504 | fly | 21 | 1349.4（1341.4–1353.6） | 24,283 | 0.9990（n=19）/ 0.9994（n=4） | 0.9720（n=17）/ 0.9728（n=4） | 43.88 | 162.15 | 206.03 | 15.27% |
+| a0e2e_3arm_p2_1002_095504 | asm | 21 | 1350.6（1346.1–1351.9） | 24,262 | 1 | — | 34.63 | 166.41 | 201.01 | 14.87% |
+| a0e2e_3arm_p2_1002_095504 | flyr29 | 21 | 1388.5（1379.0–1390.6） | 23,599 | 1.0273（n=19）/ 1.0280（n=4） | 1 | 43.82 | 215.41 | 259.67 | 18.69% |
+| a0e2e_3arm_p2_1002_095504 | fly | 19 | 1349.9（1342.3–1353.6） | 24,275 | 0.9985（n=16）/ 1.0015（n=4） | 0.9732（n=17）/ 0.9734（n=4） | 43.91 | 162.62 | 206.17 | 15.27% |
+
+B0 对照：fly/asm 单步比 1.0323 / 1.0328（B0 09-28，fwd r16 + bwd r29）；B0 fly fwd 48.0–49.3 / bwd 285.4–290.0，asm fwd 38.8–39.3 / bwd 233.1–236.7 ms/步（trace）。
+
+## 2. 两两对比（相邻两步、arm 不同、都在稳态窗口内；差值 = 前者 − 后者）
+
+| 进程 | 对比 | 相邻 n | 单步比（相邻 / 周期） | Δ单步 ms | ΔFA ms（events） | 其中 Δfwd | 其中 Δbwd | Δ单步 − ΔFA |
+|---|---|--:|--:|--:|--:|--:|--:|--:|
+| a0e2e_3arm_p1_1002_095504 | flyr29 vs asm | 16 | 1.0269 / 1.0279 | +36.3 | +57.36 | +9.07 | +48.36 | -21.0 |
+| a0e2e_3arm_p1_1002_095504 | fly vs asm | 19 | 0.9990 / 0.9994 | -1.4 | +4.89 | +9.18 | -4.50 | -6.3 |
+| a0e2e_3arm_p1_1002_095504 | fly vs flyr29 | 17 | 0.9720 / 0.9728 | -39.1 | -53.04 | +0.05 | -53.08 | +14.0 |
+| a0e2e_3arm_p2_1002_095504 | flyr29 vs asm | 19 | 1.0273 / 1.0280 | +36.9 | +58.98 | +9.16 | +49.79 | -22.1 |
+| a0e2e_3arm_p2_1002_095504 | fly vs asm | 16 | 0.9985 / 1.0015 | -2.0 | +4.27 | +9.24 | -4.56 | -6.3 |
+| a0e2e_3arm_p2_1002_095504 | fly vs flyr29 | 17 | 0.9732 / 0.9734 | -37.0 | -52.99 | +0.01 | -52.89 | +16.0 |
+
+## 2b. 两个进程的一致性（计划 §4 判定 3：同一对比的单步比，两进程相差 ≤0.3%；B0 为 0.05%）
+
+| 对比 | a0e2e_3arm_p1_1002_095504 相邻中位数（n） | a0e2e_3arm_p2_1002_095504 相邻中位数（n） | 最大相对差 | 判定 |
+|---|--:|--:|--:|---|
+| flyr29 / asm | 1.0269（16） | 1.0273（19） | 0.04% | 正常 |
+| fly / asm | 0.9990（19） | 0.9985（16） | 0.05% | 正常 |
+| fly / flyr29 | 0.9720（17） | 0.9732（17） | 0.13% | 正常 |
+
+## 4. trace（kineto；A0 09-28 曾只记录 ~4 个 kernel/步，INVALID 的不用）
+
+| 进程 | trace | 有效 | arm | GPU kernels | FA sum / wall ms | attn_fwd ms | attn_bwd sum / wall / span ms | gemm | gemm_aux | elementwise | idle |
+|---|---|---|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| a0e2e_3arm_p1_1002_095504 | iteration_11 | 否：9 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range |  | 9 | 0.0 / 0.0 | — | — / — / — | — | 1080.4 | 663.7 | 205.1 |
+| a0e2e_3arm_p1_1002_095504 | iteration_22 | 否：9 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range |  | 9 | 0.0 / 0.0 | — | — / — / — | — | 775.0 | — | 188.0 |
+| a0e2e_3arm_p1_1002_095504 | iteration_33 | 否：8 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range |  | 8 | 0.0 / 0.0 | — | — / — / — | — | 510.0 | 69.8 | 190.8 |
+| a0e2e_3arm_p1_1002_095504 | iteration_44 | 否：15 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range |  | 15 | 0.0 / 0.0 | — | — / — / — | — | 1665.7 | 113.6 | 87.8 |
+| a0e2e_3arm_p1_1002_095504 | iteration_55 | 否：8 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range |  | 8 | 0.0 / 0.0 | — | — / — / — | — | 590.2 | 99.4 | 632.4 |
+| a0e2e_3arm_p1_1002_095504 | iteration_66 | 否：8 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range |  | 8 | 0.0 / 0.0 | — | — / — / — | — | 1312.6 | — | 361.5 |
+| a0e2e_3arm_p1_1002_095504 | iteration_77 | 否：8 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range |  | 8 | 0.0 / 0.0 | — | — / — / — | — | 1403.2 | 415.4 | 126.0 |
+| a0e2e_3arm_p1_1002_095504 | iteration_88 | 否：10 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range |  | 10 | 0.0 / 0.0 | — | — / — / — | — | 1416.2 | 440.5 | 83.3 |
+| a0e2e_3arm_p2_1002_095504 | iteration_11 | 否：9 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range |  | 9 | 0.0 / 0.0 | — | — / — / — | — | 951.9 | 429.0 | 210.4 |
+| a0e2e_3arm_p2_1002_095504 | iteration_22 | 否：5 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range |  | 5 | 0.0 / 0.0 | — | — / — / — | — | 709.2 | 100.8 | 508.6 |
+| a0e2e_3arm_p2_1002_095504 | iteration_33 | 否：8 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range |  | 8 | 0.0 / 0.0 | — | — / — / — | — | 734.3 | 134.5 | 158.1 |
+| a0e2e_3arm_p2_1002_095504 | iteration_44 | 否：12 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range |  | 12 | 0.0 / 0.0 | — | — / — / — | — | 942.2 | 681.4 | 92.3 |
+| a0e2e_3arm_p2_1002_095504 | iteration_55 | 否：8 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range |  | 8 | 0.0 / 0.0 | — | — / — / — | — | 720.2 | 169.9 | 482.2 |
+| a0e2e_3arm_p2_1002_095504 | iteration_66 | 否：10 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range |  | 10 | 0.0 / 0.0 | — | — / — / — | — | 389.7 | 126.0 | 838.5 |
+| a0e2e_3arm_p2_1002_095504 | iteration_77 | 否：5 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range |  | 5 | 0.0 / 0.0 | — | — / — / — | — | 522.2 | 52.6 | 244.8 |
+| a0e2e_3arm_p2_1002_095504 | iteration_88 | 否：4 GPU kernels < 1500; no kernel attributed to an e2e::attn_* range |  | 4 | 0.0 / 0.0 | — | — / — / — | — | 218.9 | 14.1 | 501.0 |
+
+## 5. 运行健康
+
+| 进程 | 有效 | rc | 步数 | 非有限步 | nkfix 事件 | BLAS 改写 | watchdog | memguard | 外来 KFD | 代码树 | dmesg 故障 / INFO | 新 CPU MCE | sclk 负载中位数 MHz | 功耗中位数 W | 峰值显存（进程级） | 墙钟 s | loss 首 / 末 |
+|---|---|--:|--:|--:|---|--:|---|---|---|---|--:|--:|--:|--:|--:|--:|---|
+| a0e2e_3arm_p1_1002_095504 | yes | 0 | 92 | 0 | [] | 0 | — | — | — | 基准（31 个文件） | 0 / 0 | 0 | 1510.5 | 1132.118 | 384.44 GiB（88.99%） | 160 | 12.25951 / 3.50734 |
+| a0e2e_3arm_p2_1002_095504 | yes | 0 | 92 | 0 | [] | 0 | — | — | — | 同 a0e2e_3arm_p1_1002_095504（31 个文件） | 0 / 3 | 1 | 1500.5 | 1137.051 | 384.44 GiB（88.99%） | 158 | 12.25951 / 3.50642 |

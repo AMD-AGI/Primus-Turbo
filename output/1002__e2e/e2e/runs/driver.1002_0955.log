@@ -1,0 +1,35 @@
+[09:55:04] waiting for /tmp/a0-gpu0.lock
+[09:55:04] lock held by driver pid 288037 (mode 3arm runs 'opc opcprod p1 p2' steps 92 pfreq 11; s6 stream env: -e FLY_BWD_SIDE_STREAM=1 -e FLY_BWD_RECORD_STREAM=0)
+[09:55:06] preflight ok (/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/preflight.1002_095504.log)
+[09:55:06] run files: 31 hashed -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/tree.1002_095504.sha256; trees pinned (s6 impl 46e0e812, kernels 5e61678d; r29 37f37052/08cb8533; fwd MD5SUMS)
+[10:00:07] idle before opcheck fast: KFD empty, cooled 300s, no op-evolve/realab, trees unchanged, sclk 1: 2356Mhz *
+[10:00:18] opcheck fly fast rc=0 (/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/opc.fast.1002_095504.out)
+[10:00:07] opcheck.fly.fast.1002_100007 start (lock: held by driver; env: -e AMD_SERIALIZE_KERNEL=3 -e FLY_BWD_SIDE_STREAM=1 -e FLY_BWD_RECORD_STREAM=0; timeout 600s)
+[10:00:08] pre-exec guard ok: KFD empty, no op-evolve/realab, trees pinned, run files = /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/tree.1002_095504.sha256
+rc=0 log=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/opcheck.fly.fast.1002_100007.log json=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/opcheck.fly.fast.1002_100007.json
+  opcheck fast gate: PASS {"chain.o": 51.23, "chain.dq": 51.71, "chain.dk": 51.7, "chain.dv": 52.32, "kbwd.dq": 52.61, "kbwd.dk": 52.65, "kbwd.dv": 52.83, "kfwd.o": 51.23, "kfwd.lse": 85.48} copies {'copies': 0, 'copy_bytes': 0} | ms k_fwd 0.0993 k_bwd 0.2128 m_fwd 0.2614 m_bwd 0.5092
+[10:05:18] idle before opcheck prod: KFD empty, cooled 300s, no op-evolve/realab, trees unchanged, sclk 1: 2356Mhz *
+[10:05:29] opcheck fly prod rc=0 (/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/opc.prod.1002_095504.out)
+[10:05:18] opcheck.fly.prod.1002_100518 start (lock: held by driver; env:  -e FLY_BWD_SIDE_STREAM=1 -e FLY_BWD_RECORD_STREAM=0; timeout 600s)
+[10:05:18] pre-exec guard ok: KFD empty, no op-evolve/realab, trees pinned, run files = /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/tree.1002_095504.sha256
+rc=0 log=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/opcheck.fly.prod.1002_100518.log json=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/opcheck.fly.prod.1002_100518.json
+  opcheck prod gate: PASS {"chain.o": 50.83, "chain.dq": 51.9, "chain.dk": 51.99, "chain.dv": 52.39, "kbwd.dq": 52.56, "kbwd.dk": 52.6, "kbwd.dv": 52.71, "kfwd.o": 50.83, "kfwd.lse": 89.19} copies {'copies': 0, 'copy_bytes': 0} | ms k_fwd 1.3482 k_bwd 4.951 m_fwd 1.4145 m_bwd 4.9709
+[10:10:29] idle before train a0e2e_3arm_p1_1002_095504: KFD empty, cooled 300s, no op-evolve/realab, trees unchanged, sclk 1: 2357Mhz *
+[10:13:10] train a0e2e_3arm_p1_1002_095504 rc=0 (/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/e2e.a0e2e_3arm_p1_1002_095504.out)
+[10:10:29] pre-exec guard ok: KFD empty, no op-evolve/realab, trees pinned, run files = /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/tree.1002_095504.sha256
+nkfix stats (/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/nkfix.a0e2e_3arm_p1_1002_095504.txt):
+stats: {'dgrad': 20700, 'wgrad': 20700, 'chunked': 9016, 'miss': 20700, 'checked': 41400, 'syncs': 647, 'scratch_bytes': 603979776}
+nonfinite_events: []
+max_abs_by_tag: {'wgrad.out': '2.875', 'dgrad.out': '0.001038'}
+rc=0 tag=a0e2e_3arm_p1_1002_095504 log=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/e2e.a0e2e_3arm_p1_1002_095504.log steps_logged=92 nonfinite_lines=0 nkfix_nonfinite=0 blas_repoints=0 event_steps=92 wall_s=160
+[10:18:11] idle before train a0e2e_3arm_p2_1002_095504: KFD empty, cooled 300s, no op-evolve/realab, trees unchanged, sclk 1: 2356Mhz *
+[10:20:49] train a0e2e_3arm_p2_1002_095504 rc=0 (/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/e2e.a0e2e_3arm_p2_1002_095504.out)
+max_abs_by_tag: {'wgrad.out': '2.875', 'dgrad.out': '0.001038'}
+rc=0 tag=a0e2e_3arm_p2_1002_095504 log=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/e2e.a0e2e_3arm_p2_1002_095504.log steps_logged=92 nonfinite_lines=0 nkfix_nonfinite=0 blas_repoints=0 event_steps=92 wall_s=158
+dmesg INFO (RAS correctable / MCE; not a stop):
+[49159.287341] mce: [Hardware Error]: Machine check events logged
+[49159.315201] amdgpu 0001:01:00.0: {6} socket: 7, die: 0, 67 new correctable hardware errors detected in pcie_pl block
+[49159.315204] amdgpu 0001:01:00.0: {6} socket: 7, die: 0, 371 correctable hardware errors detected in total in pcie_pl block
+[10:20:49] card work done; lock released
+[10:20:55] analysis -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/analysis.1002_095504.txt, table -> /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/TABLE.1002_095504.md
+[10:20:55] E2E_DRIVE_DONE

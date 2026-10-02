@@ -1,0 +1,30 @@
+tag: a0e2e_3arm_p2_1002_095504
+spec: asm;asm,flyr29,fly,asm,fly,flyr29
+steps: 92
+pfreq: 11
+nlayers: 32
+rc: 0
+wall_s: 158
+steps_logged: 92
+nonfinite_lines: 0
+nkfix_nonfinite_lines: 0
+nkfix_events:  []
+blas_repoints: 0
+event_steps: 92
+watchdog: 
+memguard: 
+dmesg_fault_lines: 0
+dmesg_info_lines: 3
+cpu_mce_new: 1
+foreign_kfd: 
+tree_changed_during_run: no
+valid: yes
+leftovers: 
+flycache: /tmp/flycache_a0e2e_3arm_p2_1002_095504_101811
+bwd_stream_mode: [flydsl_bwd bwd_s6_0341] DQ_SIDE_STREAM=1 DQ_SIDE_RECORD=0
+log: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/e2e.a0e2e_3arm_p2_1002_095504.log
+events: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/attn_ev.a0e2e_3arm_p2_1002_095504.jsonl
+clk: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/clk.a0e2e_3arm_p2_1002_095504.csv
+env: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/env.a0e2e_3arm_p2_1002_095504.txt
+tree: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/tree.a0e2e_3arm_p2_1002_095504.sha256
+dbg: /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/a0e2e_3arm_p2_1002_095504.dbg.txt (106 lines of /home/lihuzhan/_dbg_l8b/output/amd/root/a0e2e_3arm_p2_1002_095504/logs/pre_trainer/rank-0/debug.log)

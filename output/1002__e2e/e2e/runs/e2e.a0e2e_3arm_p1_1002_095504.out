@@ -1,0 +1,7 @@
+[10:10:29] a0e2e_3arm_p1_1002_095504 E2E_ATTN=asm;asm,fly,flyr29,asm,flyr29,fly steps=92 pfreq=11 nlayers=32 (lock: held by driver)
+[10:10:29] pre-exec guard ok: KFD empty, no op-evolve/realab, trees pinned, run files = /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/tree.1002_095504.sha256
+nkfix stats (/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/nkfix.a0e2e_3arm_p1_1002_095504.txt):
+stats: {'dgrad': 20700, 'wgrad': 20700, 'chunked': 9016, 'miss': 20700, 'checked': 41400, 'syncs': 647, 'scratch_bytes': 603979776}
+nonfinite_events: []
+max_abs_by_tag: {'wgrad.out': '2.875', 'dgrad.out': '0.001038'}
+rc=0 tag=a0e2e_3arm_p1_1002_095504 log=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/logs/e2e.a0e2e_3arm_p1_1002_095504.log steps_logged=92 nonfinite_lines=0 nkfix_nonfinite=0 blas_repoints=0 event_steps=92 wall_s=160

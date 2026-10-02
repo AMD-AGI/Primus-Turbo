@@ -1,0 +1,55 @@
+== host / card / container
+  ok   host A0
+  ok   sclk DPM table 0: 500Mhz 1: 2355Mhz * 2: 2400Mhz  (top 2400 MHz, not VR-capped)
+  info driver 1:7.1.0.31300009-2412954.24.04 vbios 113-M4500001-700E
+  ok   KFD empty
+  ok   no op-evolve run/resume loop
+  ok   no realab driver
+  ok   /tmp/a0-gpu0.lock held by the driver (pid 288040)
+  ok   container fa-repro up
+  ok   no GPU workload in fa-repro
+  ok   image hipBLASLt library present in fa-repro
+  ok   disk 750G free
+== dmesg since amdgpu load (fault class only; RAS correctable / MCE are INFO on A0)
+  ok   no fault-class dmesg line since amdgpu load (t=39712.163398)
+  info 3 GPU RAS correctable reports since boot (pcie_pl; INFO, not a stop)
+== trees
+  ok   fwd_r16_imglib matches its MD5SUMS
+  ok   fwd copy differs from champions/fwd_r16_r13ns only in _env.py
+  ok   bwd_s6_0341 e2e copy == output/1002__e2e/arms_src/bwd_s6_0341 (MD5SUMS)
+  ok   trees_check: fwd MD5SUMS, s6 5e61678d/46e0e812/_env 7df61bba = arms_src, r29 37f37052/08cb8533
+  ok   bwd s6 kernels.py/impl.py = champion (5e61678d53260a2fc17c68286298f4b9 / 46e0e8127bd57c888944bbc6ee96249b)
+  ok   bwd s6 _env.py = the 0.3.4.1 pin (7df61bba26309ffc14b84a432fb451a7)
+  ok   bwd r29 kernels.py/impl.py = champion (37f37052eb739579555d6bdf62a829cc / 08cb8533d75e82198fabb9514fd18ba5)
+  ok   bwd r29 _env.py = the 0.3.4.1 pin (7df61bba26309ffc14b84a432fb451a7)
+  ok   asm launcher present
+== no tree touches the hipBLASLt env (09-28 a0_p3b NaN / a0_p4b wedge)
+  ok   no assignment/setdefault of HIPBLASLT_TENSILE_LIBPATH in any tree
+  ok   no tree ASSIGNS TORCH_BLAS_PREFER_HIPBLASLT=0 (the bwd trees' setdefault(...,'0') is a no-op: the launcher assigns 1 first)
+== s6 ISA identical under flydsl 0.3.2 and 0.3.4.1 (compile-only evidence in output/1002__e2e/isa)
+  ok   delta: 272 instructions, 0 differing, 0 spill/scratch
+  ok   dkdv: 2116 instructions, 0 differing, 0 spill/scratch
+  ok   dqg: 3419 instructions, 0 differing, 0 spill/scratch
+== dependencies
+  ok   /home/lihuzhan/code/2026_0828__primus/Primus/runner/primus-cli
+  ok   /home/lihuzhan/code/aiter-src/aiter
+  ok   /home/lihuzhan/_hfassets/llama31_8B
+  ok   /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/e2e/configs/l8b_e2e.template.yaml
+  ok   /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/gemm/nkfix_b0.py
+  ok   /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/0927__b0/gemm/transpose_triton.py
+  ok   /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/refcache/fast.pt
+  ok   /home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/gfx1250-flydsl-attn-bwd-20260917-115934/job_context/op/refcache/prod.pt
+  info flydsl0341 /home/lihuzhan/.local/flydsl0341/flydsl/__init__.py:__version__ = "0.3.4.1"
+== adapter code (host python, no torch)
+  ok   py_compile
+  ok   attn timer self-test
+  ok   bash -n launcher/driver/trees/analyze/stub
+== schedules (3arm)
+  ok   'asm;asm,fly,flyr29,asm,flyr29,fly': step1=asm first FlyDSL step=3 unknown=[] window steps/arm={'asm': 21, 'fly': 21, 'flyr29': 19} profiled steps/arm={'asm': [11, 44, 77], 'fly': [33, 55], 'flyr29': [22, 66, 88]} first 8: ['asm', 'asm', 'fly', 'flyr29', 'asm', 'flyr29', 'fly', 'asm']
+  ok   'asm;asm,flyr29,fly,asm,fly,flyr29': step1=asm first FlyDSL step=3 unknown=[] window steps/arm={'asm': 21, 'flyr29': 21, 'fly': 19} profiled steps/arm={'asm': [11, 44, 77], 'flyr29': [33, 55], 'fly': [22, 66, 88]} first 8: ['asm', 'asm', 'flyr29', 'fly', 'asm', 'fly', 'flyr29', 'asm']
+== container import check (HIP_VISIBLE_DEVICES=-1: imports the adapter, builds E2EAttention, loads no arm)
+  ok   IMPORT_CHECK_OK {"shim": "/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/attn_backends/shim/primus_turbo/__init__.py", "e2e_attn": "/home/lihuzhan/code/2026_0903__turbo/Primus-...
+  ok   adapter functional test (fake trees, Function called without the autograd engine, no HIP init)
+  ok   KFD holders unchanged by the container checks
+== reminder: commit + push output/1002__e2e before the card run (code + configs; KIT/logs is tracked -- KIT/.gitignore re-includes it -- only traces/ is ignored); no git operation while the e2e runs -- A0 host crashed again before the 10-01 20:41 reboot (BERT fatal L3)
+PREFLIGHT_OK

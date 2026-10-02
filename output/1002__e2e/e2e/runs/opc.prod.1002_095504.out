@@ -1,0 +1,3 @@
+[10:05:18] opcheck.fly.prod.1002_100518 start (lock: held by driver; env:  -e FLY_BWD_SIDE_STREAM=1 -e FLY_BWD_RECORD_STREAM=0; timeout 600s)
+[10:05:18] pre-exec guard ok: KFD empty, no op-evolve/realab, trees pinned, run files = /home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/tree.1002_095504.sha256
+rc=0 log=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/opcheck.fly.prod.1002_100518.log json=/home/lihuzhan/code/2026_0903__turbo/Primus-Turbo/output/1002__e2e/e2e/runs/opcheck.fly.prod.1002_100518.json
