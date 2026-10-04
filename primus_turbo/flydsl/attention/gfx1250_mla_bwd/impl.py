@@ -61,15 +61,19 @@ def _launch(name, launcher, args):
 
 _ENV_CHECKED = False
 
-# The dQ chain (k_dqg) runs on a SIDE stream concurrently with the dK/dV chain (k_dkdv) on
-# the caller's stream: both only read q/k/v/do/lse/delta (delta is written by k_delta on
-# the main stream BEFORE the fork) and write disjoint outputs, so the fork is legal and the
-# outputs are bitwise identical to the serial order. Env switches, read once at import:
-#   FLY_BWD_SIDE_STREAM=0    serial: k_dqg on the caller's stream after k_dkdv.
-#   FLY_BWD_RECORD_STREAM=0  keep the side stream, skip the record_stream() calls at the
+# The dQ chain (k_dqg) runs on the caller's stream AFTER the dK/dV chain (k_dkdv) by default.
+# It may instead run on a SIDE stream concurrently with k_dkdv: both only read
+# q/k/v/do/lse/delta (delta is written by k_delta on the main stream BEFORE the fork) and
+# write disjoint outputs, so the fork is legal and the outputs are bitwise identical to the
+# serial order. For MHA at DeepSeek-V3 shapes each kernel alone fills every SIMD (prod: 32768
+# one-wave workgroups each), and running the two concurrently was 28% SLOWER than serial at
+# b2 s4096 h128 (7.06 vs 5.52 ms) and no faster at b1 s4096 h64; the side stream paid off
+# only for the hd128 GQA shape it was built for. Env switches, read once at import:
+#   FLY_BWD_SIDE_STREAM=1    side stream: k_dqg concurrently with k_dkdv.
+#   FLY_BWD_RECORD_STREAM=0  with the side stream, skip the record_stream() calls at the
 #                            join (every block s2 touches was allocated on the caller's
 #                            stream, which waits for s2 before we return).
-DQ_SIDE_STREAM = os.environ.get("FLY_BWD_SIDE_STREAM", "1") != "0"
+DQ_SIDE_STREAM = os.environ.get("FLY_BWD_SIDE_STREAM", "0") != "0"
 DQ_SIDE_RECORD = os.environ.get("FLY_BWD_RECORD_STREAM", "1") != "0"
 _SIDE = {}
 # Validation only: allocate delta/dq/dk/dv NaN-filled, so an element the kernels never write
