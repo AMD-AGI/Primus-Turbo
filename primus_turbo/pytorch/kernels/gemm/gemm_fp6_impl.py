@@ -30,6 +30,10 @@ we probe, not a switch we expose -- an older aiter gets the separate pass added 
 callers pass a bias unconditionally and never branch on aiter's version themselves.
 """
 
+import csv
+import functools
+import glob
+import os
 from typing import Optional
 
 import torch
@@ -59,7 +63,15 @@ from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import (
 
 _torch_custom_op_wrapper = torch.library.custom_op
 
-__all__ = ["GEMMFP6AITERBackend", "gemm_fp6_impl", "gemm_fp6_out_impl"]
+__all__ = [
+    "GEMMFP6AITERBackend",
+    "a4w4_fly_shapes",
+    "a6w6_fly_available",
+    "a6w6_fly_shapes",
+    "set_a6w6_backend",
+    "gemm_fp6_impl",
+    "gemm_fp6_out_impl",
+]
 
 
 class GEMMFP6AITERBackend(KernelBackend):
@@ -303,8 +315,46 @@ def gemm_fp6_impl(
     bias: torch.Tensor | None = None,
     weight_is_fp4: bool = False,
     a_is_fp4: bool = False,
+    a4w4: int = 0,
+    a6w6_fly: bool = False,
 ) -> torch.Tensor:
     granularity_enum = ScalingGranularity(granularity)
+    if a6w6_fly:
+        # MXFP6 both operands in the FlyDSL A6W6 GEMM's layout (fly6_fmt packs) on the assembly ports of that
+        # kernel in aiter; bias in its store epilogue.
+        if weight_is_fp4 or a_is_fp4 or a4w4:
+            raise ValueError("a6w6_fly excludes weight_is_fp4 / a_is_fp4 / a4w4: both operands are MXFP6")
+        return _a6w6_fly(a, a_scale, b, b_scale, m, n, k, out_dtype, bias)
+    if a4w4 in (2, 3):
+        # Both operands MXFP4 on FlyDSL's GEMM: plain scales (2, fmt 8 / 9 / 12) or scales
+        # already in its packed per-tile layout (3, fly_fmt).
+        return _a4w4_flydsl(a, a_scale, b, b_scale, m, n, k, out_dtype, bias, packed=a4w4 == 3)
+    if a4w4 == 4:
+        # Same operands as 3 (fly_fmt packs, scales in the packed per-tile layout), on the assembly ports
+        # of FlyDSL's 256-wide kernel in aiter: AOT, no FlyDSL at runtime.
+        if weight_is_fp4 or a_is_fp4:
+            raise ValueError("a4w4 excludes weight_is_fp4 / a_is_fp4: both operands are MXFP4")
+        return _a4w4_aiter_fly(a, a_scale, b, b_scale, m, n, k, out_dtype, bias)
+    if a4w4 == 5:
+        # Both operands in the A4W4 tile blob (MX_FMT_BLOB_* rows) on aiter's tile-blob kernel: any shape, the same
+        # exact fp32 sum as a4w4=4 -- the fallback where no fly code object exists for (M, N, K).
+        if weight_is_fp4 or a_is_fp4:
+            raise ValueError("a4w4 excludes weight_is_fp4 / a_is_fp4: both operands are MXFP4")
+        return _a4w4_aiter_blob(a, a_scale, b, b_scale, m, n, k, out_dtype, bias)
+    if a4w4:
+        # Both operands MXFP4 in AITER's f4gemm layout (quantize_mx_* fmt 1-4): A plain, B
+        # (16, 16)-shuffled, scales shuffle_scale()'d. gemm_a4w4 picks the tuned kernel.
+        if weight_is_fp4 or a_is_fp4:
+            raise ValueError("a4w4 excludes weight_is_fp4 / a_is_fp4: both operands are MXFP4")
+        from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import a4w4_operand
+
+        A, As = a4w4_operand(a, a_scale, m, k)
+        B, Bs = a4w4_operand(b, b_scale, n, k)
+        out = get_aiter().gemm_a4w4(A, B, As, Bs, bpreshuffle=True)
+        out = out[:m, :n]
+        if out_dtype != out.dtype:
+            out = out.to(out_dtype)
+        return out if bias is None else out + bias
     if weight_is_fp4 and a_is_fp4:
         raise ValueError(
             "weight_is_fp4 selects A6W4 and a_is_fp4 selects A4W6; they are mutually "
@@ -313,6 +363,8 @@ def gemm_fp6_impl(
     _validate_blobs(a, a_scale, b, b_scale, m, n, k, weight_is_fp4, a_is_fp4)
     if bias is not None and (bias.dim() != 1 or bias.numel() != n):
         raise ValueError(f"MXFP6 GEMM bias must be a 1D tensor of length N={n}, got {tuple(bias.shape)}.")
+    if not (weight_is_fp4 or a_is_fp4) and _a6w6_flydsl_ok(m, n, k, out_dtype, granularity_enum):
+        return _a6w6_flydsl(a, a_scale, b, b_scale, m, n, k, bias)
     backend = _resolve_backend()
     # One flag rather than a second op: the two differ only in which aiter entry point
     # runs and how b is sized, and sharing the op keeps every caller's autograd, fake
@@ -360,6 +412,8 @@ def gemm_fp6_impl_meta(
     bias: torch.Tensor | None = None,
     weight_is_fp4: bool = False,
     a_is_fp4: bool = False,
+    a4w4: int = 0,
+    a6w6_fly: bool = False,
 ) -> torch.Tensor:
     # Pure arithmetic on purpose: this must not reach into AITER, whose kernel
     # selection does lru_cached pandas lookups that SymInts would break. The output
@@ -387,6 +441,8 @@ def gemm_fp6_out_impl(
     granularity: int,
     weight_is_fp4: bool = False,
     bias: Optional[torch.Tensor] = None,
+    a4w4: int = 0,
+    a6w6_fly: bool = False,
 ) -> None:
     """``out[M, N] = A[M, K] @ B[N, K].T (+ bias)``, writing into a caller-owned buffer.
 
@@ -407,6 +463,45 @@ def gemm_fp6_out_impl(
     allocating call. A6W6 only.
     """
     granularity_enum = ScalingGranularity(granularity)
+    if a6w6_fly:
+        if weight_is_fp4 or a4w4:
+            raise ValueError("a6w6_fly out-GEMM excludes weight_is_fp4 / a4w4: both operands are MXFP6")
+        _a6w6_fly(a, a_scale, b, b_scale, m, n, k, out.dtype, bias, out=out)
+        return
+    if a4w4 in (2, 3):
+        if weight_is_fp4 or bias is not None:
+            raise ValueError("FlyDSL a4w4 out-GEMM takes no bias and excludes weight_is_fp4")
+        _a4w4_flydsl(a, a_scale, b, b_scale, m, n, k, out.dtype, None, out=out, packed=a4w4 == 3)
+        return
+    if a4w4 == 4:
+        if weight_is_fp4 or bias is not None:
+            raise ValueError("aiter fly a4w4 out-GEMM takes no bias and excludes weight_is_fp4")
+        _a4w4_aiter_fly(a, a_scale, b, b_scale, m, n, k, out.dtype, None, out=out)
+        return
+    if a4w4:
+        # A4W4 (f4gemm layouts). Like A6W6, the asm stores with beta=0 (overwrites), so the
+        # same one-microbatch-per-step contract applies; the tuned row picks the kernel.
+        if weight_is_fp4 or bias is not None:
+            raise ValueError("a4w4 out-GEMM takes no bias and excludes weight_is_fp4")
+        if out.dtype != torch.bfloat16 or tuple(out.shape) != (m, n) or not out.is_contiguous():
+            raise ValueError(
+                f"a4w4 out-GEMM expects a contiguous bf16 [{m}, {n}] out, got {tuple(out.shape)} {out.dtype}"
+            )
+        if m % 32 != 0:
+            raise ValueError(f"a4w4 out-GEMM needs M a multiple of 32, got {m}")
+        from aiter.ops.gemm_op_a4w4 import get_GEMM_config
+
+        from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import a4w4_operand
+
+        A, As = a4w4_operand(a, a_scale, m, k)
+        B, Bs = a4w4_operand(b, b_scale, n, k)
+        cfg = get_GEMM_config(m, n, k)
+        kernel = "" if cfg is None else str(cfg["kernelName"])
+        split_k = 0 if cfg is None or cfg.get("splitK") is None else int(cfg["splitK"])
+        if kernel and kernel.find("_ZN") == -1:
+            raise RuntimeError(f"a4w4 out-GEMM: tuned row for {(m, n, k)} is a CK kernel; asm only")
+        get_aiter().gemm_a4w4_asm(A[:m], B, As, Bs, out, kernel, None, bpreshuffle=True, log2_k_split=split_k)
+        return
     _validate_blobs(a, a_scale, b, b_scale, m, n, k, weight_is_fp4)
     if bias is not None:
         if weight_is_fp4:
@@ -432,6 +527,9 @@ def gemm_fp6_out_impl(
     if not is_gfx950_device(a.device):
         raise RuntimeError("MXFP6 out-GEMM requires gfx950.")
 
+    if not weight_is_fp4 and _a6w6_flydsl_ok(m, n, k, out.dtype, granularity_enum):
+        _a6w6_flydsl(a, a_scale, b, b_scale, m, n, k, bias, out=out)
+        return
     aiter = get_aiter()
     if weight_is_fp4:
         # wgrad with the B operand narrowed. gemm_a6w4_asm takes the same physical buffers
@@ -461,5 +559,166 @@ def gemm_fp6_out_impl_meta(
     granularity: int,
     weight_is_fp4: bool = False,
     bias: Optional[torch.Tensor] = None,
+    a4w4: int = 0,
+    a6w6_fly: bool = False,
 ) -> None:
     return None
+
+
+def _a4w4_aiter_blob(a, a_scale, b, b_scale, m, n, k, out_dtype, bias):
+    """A4W4 on aiter's tile-blob kernel (``a4w4=5``, ``gemm_a4w4_blob_asm``, its default ``stnt_allk``): both operands
+    as the packers write MX_FMT_BLOB_* rows (C0 tile blob, +2 guard K tiles). M / N are padded to the 256 tile."""
+    from aiter.ops.gemm_op_a4w4_blob import gemm_a4w4_blob_asm
+
+    if out_dtype != torch.bfloat16:
+        raise ValueError(f"aiter blob a4w4 writes bf16, got {out_dtype}")
+    mp, np_, kp = -(-m // 256) * 256, -(-n // 256) * 256, -(-k // 128) * 128
+    out = torch.empty(mp, np_, dtype=torch.bfloat16, device=a.device)
+    flat = lambda t: t.view(torch.uint8).reshape(-1)  # noqa: E731
+    gemm_a4w4_blob_asm(flat(a), flat(b), flat(a_scale), flat(b_scale), out, kp)
+    out = out[:m, :n] if (mp, np_) != (m, n) else out
+    return out if bias is None else out + bias
+
+
+def _manifest_rows(family):
+    try:
+        from aiter.jit.core import get_asm_dir
+    except ImportError:
+        return []
+    rows = []
+    for path in glob.glob(os.path.join(get_asm_dir(), family, "*.csv")):
+        with open(path) as f:
+            rows += list(csv.DictReader(f))
+    return rows
+
+
+# A6W6 backend: "aiter" (the tuned asm table) or "flydsl" (Turbo's FlyDSL MXFP6 GEMM compiled at runtime,
+# reading the same mxfp6_c0c1_256_padk2 blobs, one tile per WG; bit-identical to AITER's A6W6, bias included). Shapes the
+# FlyDSL kernel does not take (K not a multiple of 512, M / N off the 256 tile) stay on AITER, on the same operands.
+_A6W6_BACKEND = os.environ.get("PRIMUS_TURBO_A6W6_BACKEND", "aiter")
+
+
+def set_a6w6_backend(name: str) -> None:
+    """Select the A6W6 (MXFP6 x MXFP6) GEMM backend: "aiter" or "flydsl"."""
+    global _A6W6_BACKEND
+    if name not in ("aiter", "flydsl"):
+        raise ValueError(f"A6W6 backend must be 'aiter' or 'flydsl', got {name!r}")
+    _A6W6_BACKEND = name
+
+
+def _a6w6_flydsl_ok(m, n, k, out_dtype, granularity_enum) -> bool:
+    return (
+        _A6W6_BACKEND == "flydsl"
+        and out_dtype == torch.bfloat16
+        and granularity_enum == ScalingGranularity.MX_BLOCKWISE
+        and m % 256 == 0
+        and n % 256 == 0
+        and k % 512 == 0
+    )
+
+
+def _a6w6_flydsl(a, a_scale, b, b_scale, m, n, k, bias, out=None):
+    """A6W6 on Turbo's FlyDSL MXFP6 GEMM (``layout="aiter"``, one tile per WG): the standard MXFP6 tile blobs, beta 0
+    into ``out`` if given, bias as fp32(acc) + fp32(bias) with one rounding (A6W6's epilogue)."""
+    from primus_turbo.flydsl.gemm.gemm_mxfp6_kernel import gemm_mxfp6_persistent
+
+    if out is None:
+        out = torch.empty(m, n, dtype=torch.bfloat16, device=a.device)
+    flat = lambda t: t.view(torch.uint8).reshape(-1)  # noqa: E731
+    gemm_mxfp6_persistent(
+        flat(a),
+        None,
+        flat(b),
+        None,
+        flat(a_scale),
+        flat(b_scale),
+        out=out,
+        tpw=1,
+        bias=bias,
+        layout="aiter",
+        m=m,
+        n=n,
+        k=k,
+    )
+    return out
+
+
+@functools.lru_cache(maxsize=None)
+def a4w4_fly_shapes() -> frozenset:
+    """{(M, N, K)} with a code object in aiter's f4flygemm family (``a4w4=4``); empty for an aiter without it. Reads
+    files: call it outside compiled regions."""
+    return frozenset((int(r["M"]), int(r["N"]), int(r["K"])) for r in _manifest_rows("f4flygemm"))
+
+
+@functools.lru_cache(maxsize=None)
+def a6w6_fly_shapes() -> frozenset:
+    """{(M, N, K, bias)} with a code object in aiter's f6flygemm family (empty for an aiter without it). Reads files:
+    call it outside compiled regions (a caller deciding per GEMM inside torch.compile should hold the set)."""
+    return frozenset(
+        (int(r["M"]), int(r["N"]), int(r["K"]), bool(int(r["bias"]))) for r in _manifest_rows("f6flygemm")
+    )
+
+
+def a6w6_fly_available(m: int, n: int, k: int, has_bias: bool) -> bool:
+    """Whether aiter has the A6W6 fly kernel (``gemm_a6w6_fly_asm``) for exactly this GEMM: the caller packs the
+    operands in ``fly6_fmt`` only then, and in the A6W6 tile blob otherwise."""
+    return (int(m), int(n), int(k), bool(has_bias)) in a6w6_fly_shapes()
+
+
+def _a6w6_fly(a, a_scale, b, b_scale, m, n, k, out_dtype, bias, out=None):
+    """A6W6 on the assembly ports of the FlyDSL MXFP6 GEMM (``a6w6_fly``, aiter ``gemm_a6w6_fly_asm``).
+
+    Operands as ``fly6_fmt`` packed them: one buffer per operand with the K128-blocked C0 then C1 planes, scales in
+    FlyDSL's packed slab. Bit-identical to the A6W6 tile-blob kernels on the same values (bias: fp32(acc) + fp32(bias),
+    one rounding). One code object per (M, N, K, bias); see ``a6w6_fly_available``."""
+    from aiter.ops.gemm_op_a6w6_fly import gemm_a6w6_fly_asm
+
+    if out_dtype != torch.bfloat16:
+        raise ValueError(f"a6w6_fly writes bf16, got {out_dtype}")
+    if out is None:
+        out = torch.empty(m, n, dtype=torch.bfloat16, device=a.device)
+    flat = lambda t: t.view(torch.uint8).reshape(-1)  # noqa: E731
+    gemm_a6w6_fly_asm(flat(a), flat(b), flat(a_scale), flat(b_scale), out, k, bias)
+    return out
+
+
+def _a4w4_aiter_fly(a, a_scale, b, b_scale, m, n, k, out_dtype, bias, out=None):
+    """A4W4 on the assembly ports of FlyDSL's 256-wide MXFP4 GEMM (``a4w4=4``, aiter ``gemm_a4w4_fly_asm``).
+
+    Operands exactly as ``a4w4=3``: the packers wrote plain MXFP4 rows and the scales in the packed per-tile layout
+    for the 256-wide N tile (``fly_fmt``, ``fly_b_params``). One code object per (M, N, K); a shape without one
+    raises in aiter."""
+    from aiter.ops.gemm_op_a4w4_fly import gemm_a4w4_fly_asm
+
+    from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import fly_operand
+
+    if out_dtype != torch.bfloat16:
+        raise ValueError(f"aiter fly a4w4 writes bf16, got {out_dtype}")
+    A, As = fly_operand(a, a_scale, m, k)
+    B, Bs = fly_operand(b, b_scale, n, k)
+    if out is None:
+        out = torch.empty(m, n, dtype=torch.bfloat16, device=A.device)
+    gemm_a4w4_fly_asm(A, B, As, Bs, out, k)
+    return out if bias is None else out + bias
+
+
+def _a4w4_flydsl(a, a_scale, b, b_scale, m, n, k, out_dtype, bias, out=None, packed=False):
+    """A4W4 on FlyDSL's MXFP4 GEMM (``a4w4=2``): plain-layout operands, beta 0 into ``out`` if given.
+
+    FlyDSL repacks the plain E8M0 scales into its per-tile layout itself (its own workspace,
+    sized per tile). Deliberately not the prepacked entry: Turbo's FlyDSL backend wrapper sizes a
+    caller's packed slab per 256 rows, 1.33x short for block_n = 192."""
+    from primus_turbo.flydsl.gemm.gemm_mxfp4_kernel import gemm_mxfp4_flydsl_kernel
+    from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import fly_operand, plain_operand
+
+    if packed:
+        # The packers stored the scales in the layout this GEMM reads (sized per tile, as
+        # FlyDSL's own workspace is), so no repack kernel runs.
+        A, As = fly_operand(a, a_scale, m, k)
+        B, Bs = fly_operand(b, b_scale, n, k)
+        res = gemm_mxfp4_flydsl_kernel(A, As, B, Bs, out_dtype=out_dtype, out=out, scales_prepacked=True, k=k)
+        return res if bias is None else res + bias
+    A, As = plain_operand(a, a_scale, m, k)
+    B, Bs = plain_operand(b, b_scale, n, k)
+    res = gemm_mxfp4_flydsl_kernel(A, As.contiguous(), B, Bs.contiguous(), out_dtype=out_dtype, out=out)
+    return res if bias is None else res + bias
