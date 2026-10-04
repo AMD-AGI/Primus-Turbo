@@ -38,6 +38,11 @@ from primus_turbo.pytorch.kernels.attention.attention_flydsl_gfx1250_impl import
     flash_attn_flydsl_gfx1250_forward_impl,
     flydsl_gfx1250_unsupported_reason,
 )
+from primus_turbo.pytorch.kernels.attention.attention_flydsl_gfx1250_mla_impl import (
+    flash_attn_flydsl_gfx1250_mla_forward_impl,
+    flydsl_gfx1250_mla_unsupported_reason,
+    is_mla_head_dims,
+)
 from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
     flash_attn_sbhd_flydsl_forward_impl,
     flash_attn_varlen_flydsl_forward_impl,
@@ -224,6 +229,8 @@ def _flydsl_gfx1250_ok(
     bf16, head_dim 128, GQA, bottom-right causal or full attention; the shape rules (sequence
     multiples, sq <= skv when causal) are the kernels' own, asked rather than restated. Any
     byte order: the tensors are [b, s, h, d]-shaped and the adapter makes them contiguous.
+    The DeepSeek-V3 MLA head dims (qk 192 / v 128, MHA) go to their own kernels
+    (primus_turbo/flydsl/attention/gfx1250_mla_{fwd,bwd}), with their own shape rules.
     """
     if k is None or v is None or any(t.ndim != 4 for t in (q, k, v)):
         return False
@@ -239,6 +246,8 @@ def _flydsl_gfx1250_ok(
         return False
     if softmax_scale is not None and (not isinstance(softmax_scale, Real) or isinstance(softmax_scale, bool)):
         return False
+    if is_mla_head_dims(q, k, v):
+        return flydsl_gfx1250_mla_unsupported_reason(q, k, v, bool(causal)) is None
     return flydsl_gfx1250_unsupported_reason(q, k, v, bool(causal)) is None
 
 
@@ -290,7 +299,10 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
     @staticmethod
     def execute(q, k, v, softmax_scale, causal, window_size, return_lse=True, **kwargs):
         if is_gfx1250():
-            out, lse = flash_attn_flydsl_gfx1250_forward_impl(q, k, v, softmax_scale, causal)
+            if is_mla_head_dims(q, k, v):
+                out, lse, _, _ = flash_attn_flydsl_gfx1250_mla_forward_impl(q, k, v, softmax_scale, causal)
+            else:
+                out, lse = flash_attn_flydsl_gfx1250_forward_impl(q, k, v, softmax_scale, causal)
             return (out, lse) if return_lse else out
         # Under autotune, off the op layer's path, so the sbhd view is taken here too.
         q, k, v = (t.permute(1, 0, 2, 3) for t in (q, k, v))

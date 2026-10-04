@@ -372,3 +372,186 @@ def test_llama31_8b_training_shape():
     ref = _reference(*sub, True)
     out, lse, dq, dk, dv = got
     _check((out[:1, :, :g], lse[:1, :g], dq[:1, :, :g], dk[:1, :, :1], dv[:1, :, :1]), ref)
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek-V3 MLA head dims: qk 192 / v 128, MHA (primus_turbo/flydsl/attention/gfx1250_mla_*)
+# ---------------------------------------------------------------------------
+
+D_QK, D_V = 192, 128
+# DeepSeek-V3's softmax scale (yarn mscale^2 / sqrt(192)); a runtime argument, not 1/sqrt(192).
+MLA_SCALE = 0.1352337788608801
+
+
+def _meta_mla(b, sq, skv, hq, hkv, dtype=torch.bfloat16, dv=D_V):
+    q = torch.empty(b, sq, hq, D_QK, dtype=dtype, device="meta")
+    k = torch.empty(b, skv, hkv, D_QK, dtype=dtype, device="meta")
+    v = torch.empty(b, skv, hkv, dv, dtype=dtype, device="meta")
+    return q, k, v
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [(2, 4096, 4096, 128, 128), (1, 256, 256, 2, 2), (1, 256, 512, 4, 4), (4, 64, 64, 1, 1)],
+    ids=["dsv3_mbs2", "toy", "sq_lt_skv", "smallest"],
+)
+def test_mla_gate_accepts(monkeypatch, shape):
+    q, k, v = _meta_mla(*shape)
+    assert _gate(monkeypatch, q, k, v, causal=True, softmax_scale=MLA_SCALE) is True
+
+
+@pytest.mark.parametrize(
+    ("shape", "kwargs"),
+    [
+        ((1, 256, 256, 4, 2), {}),
+        ((1, 256, 256, 2, 2, torch.float16), {}),
+        ((1, 256, 256, 2, 2, torch.bfloat16, 192), {}),
+        ((1, 96, 96, 2, 2), {}),
+        ((1, 256, 240, 2, 2), {}),
+        ((1, 512, 256, 2, 2), {}),
+        ((1, 256, 256, 2, 2), {"dropout_p": 0.1}),
+        ((1, 256, 256, 2, 2), {"sink": torch.empty(2)}),
+        ((1, 256, 256, 2, 2), {"window_size": (128, 0)}),
+        ((1, 256, 256, 2, 2), {"window_size": (-1, 0), "causal": False}),
+        ((1, 256, 256, 2, 2), {"return_softmax": True}),
+        ((1, 256, 256, 2, 2), {"causal": False}),
+    ],
+    ids=[
+        "gqa",
+        "fp16",
+        "v_192",
+        "sq_not_multiple_of_64",
+        "skv_not_multiple_of_32",
+        "causal_sq_gt_skv",
+        "dropout",
+        "sink",
+        "sliding_window",
+        "window_without_causal",
+        "return_softmax",
+        "non_causal_forward_spills",
+    ],
+)
+def test_mla_gate_refuses(monkeypatch, shape, kwargs):
+    q, k, v = _meta_mla(*shape)
+    assert _gate(monkeypatch, q, k, v, **kwargs) is False
+
+
+def _mla_reference(q, k, v, dout, causal, scale):
+    """fp32 CPU attention + grads for [b, s, h, d] tensors (MHA, bottom-right causal)."""
+    with torch.enable_grad():
+        q, k, v = (t.detach().float().requires_grad_() for t in (q, k, v))
+        sq, skv = q.shape[1], k.shape[1]
+        s = torch.einsum("bqhd,bkhd->bhqk", q, k) * scale
+        if causal:
+            s = s.masked_fill(torch.ones(sq, skv, dtype=torch.bool).triu(skv - sq + 1), float("-inf"))
+        lse = torch.logsumexp(s, -1)
+        out = torch.einsum("bhqk,bkhd->bqhd", s.softmax(-1), v)
+        out.backward(dout.float())
+    return out.detach(), lse.detach(), q.grad, k.grad, v.grad
+
+
+def _mla_inputs(b, sq, skv, h, layout="sbhd", seed=0):
+    """[b, s, h, d]-shaped bf16 q/k/v/dout whose bytes are in ``layout`` order."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+
+    def make(s, d):
+        if layout == "bshd":
+            t = torch.randn(b, s, h, d, generator=g)
+        elif layout == "sbhd":
+            t = torch.randn(s, b, h, d, generator=g).permute(1, 0, 2, 3)
+        else:  # bhsd
+            t = torch.randn(b, h, s, d, generator=g).transpose(1, 2)
+        return t.to(torch.bfloat16)
+
+    return make(sq, D_QK), make(skv, D_QK), make(skv, D_V), make(sq, D_V)
+
+
+@pytest.mark.parametrize("layout", ["sbhd", "bshd"])
+def test_mla_routes_to_the_mla_kernels_without_copies(monkeypatch, layout):
+    """FlashAttnFunc on "gfx1250" with MLA head dims: the MLA kernels get contiguous tensors --
+    for b > 1 sbhd storage the batch folded into the heads, [1, s, b*h, d], with no copy -- and
+    the results come back [b, s, h, d] (views of sbhd storage), equal to an fp32 reference. The
+    kernels are replaced by that reference on the kernel layout, so this runs on the CPU."""
+    monkeypatch.setattr(attention_impl, "is_gfx1250", lambda: True)
+    monkeypatch.setattr(flash_attn_interface, "is_gfx1250", lambda: True)
+    from primus_turbo.pytorch.kernels.attention import (
+        attention_flydsl_gfx1250_mla_impl as mla_impl,
+    )
+
+    b, s, h = 2, 128, 4
+    calls = []
+
+    def fwd(q, k, v, softmax_scale, causal):
+        calls.append(("fwd", tuple(q.shape), q.is_contiguous(), q.data_ptr(), softmax_scale, causal))
+        out, lse, *_ = _mla_reference(q, k, v, torch.zeros(*q.shape[:3], D_V), causal, softmax_scale)
+        return out.to(q.dtype).contiguous(), lse.contiguous()  # the kernels' outputs are contiguous
+
+    def bwd(dout, q, k, v, out, lse, softmax_scale, causal):
+        calls.append(("bwd", tuple(dout.shape), dout.is_contiguous(), tuple(lse.shape)))
+        _, _, dq, dk, dv = _mla_reference(q, k, v, dout, causal, softmax_scale)
+        return tuple(g.to(q.dtype).contiguous() for g in (dq, dk, dv))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("head-dim-128 gfx1250 impl reached for MLA head dims")
+
+    monkeypatch.setattr(mla_impl, "_forward", fwd)
+    monkeypatch.setattr(mla_impl, "_backward", bwd)
+    monkeypatch.setattr(flash_attn_interface, "flash_attn_flydsl_gfx1250_forward_impl", forbidden)
+    monkeypatch.setattr(flash_attn_interface, "flash_attn_flydsl_gfx1250_backward_impl", forbidden)
+
+    q, k, v, dout = _mla_inputs(b, s, s, h, layout=layout)
+    qg, kg, vg = (t.requires_grad_() for t in (q, k, v))
+    with _pinned_flydsl():
+        out, lse = flash_attn_func(qg, kg, vg, softmax_scale=MLA_SCALE, causal=True, return_lse=True)
+    out.backward(dout)
+
+    fold = layout == "sbhd"
+    kshape = (1, s, b * h, D_QK) if fold else (b, s, h, D_QK)
+    assert calls[0] == ("fwd", kshape, True, q.data_ptr(), MLA_SCALE, True)
+    assert calls[1] == ("bwd", kshape[:3] + (D_V,), True, (kshape[0], kshape[2], s))
+    assert out.shape == (b, s, h, D_V) and lse.shape == (b, h, s)
+    for x in (out, qg.grad, kg.grad, vg.grad):
+        assert x.transpose(0, 1).is_contiguous() == fold
+    ref = _mla_reference(q, k, v, dout, True, MLA_SCALE)
+    for name, x, r in zip(("out", "lse", "dq", "dk", "dv"), (out, lse, qg.grad, kg.grad, vg.grad), ref):
+        assert compute_snr(r, x.detach().float()) > 40, name
+
+
+def _run_mla(q, k, v, dout, causal, scale=MLA_SCALE):
+    q, k, v = (t.to("cuda").requires_grad_() for t in (q, k, v))
+    with _pinned_flydsl():
+        out, lse = flash_attn_func(q, k, v, softmax_scale=scale, causal=causal, return_lse=True)
+    out.backward(dout.to("cuda"))
+    torch.cuda.synchronize()
+    return out, lse, q.grad, k.grad, v.grad
+
+
+# Toy shapes: the gfx1250 numeric tests are meant to run one test per process (the card rule for
+# new kernels); `pytest -k mla_matches` selects them.
+@needs_gfx1250
+@pytest.mark.parametrize(
+    ("shape", "layout", "causal"),
+    [
+        ((1, 256, 256, 2), "sbhd", True),
+        ((2, 256, 256, 4), "sbhd", True),
+        ((2, 256, 256, 4), "bshd", True),
+        ((2, 256, 256, 2), "bhsd", True),
+        ((1, 256, 512, 2), "sbhd", True),
+    ],
+    ids=["toy", "b2_sbhd_folded", "b2_bshd", "b2_bhsd_copied", "sq_lt_skv"],
+)
+def test_mla_matches_reference(shape, layout, causal):
+    q, k, v, dout = _mla_inputs(*shape, layout=layout)
+    _check(_run_mla(q, k, v, dout, causal), _mla_reference(q, k, v, dout, causal, MLA_SCALE), min_db=48.0)
+
+
+@needs_gfx1250
+def test_mla_folded_equals_unfolded_and_is_deterministic():
+    """Folding the batch into the heads relabels work, it does not change arithmetic: sbhd and
+    bshd storage of the same values give bitwise-equal results, and so does a rerun."""
+    q, k, v, dout = _mla_inputs(2, 256, 256, 4, layout="sbhd")
+    folded = _run_mla(q, k, v, dout, True)
+    again = _run_mla(q, k, v, dout, True)
+    plain = _run_mla(*(t.contiguous() for t in (q, k, v, dout)), True)
+    for a, b_, c in zip(folded, again, plain):
+        assert torch.equal(a, b_) and torch.equal(a, c)

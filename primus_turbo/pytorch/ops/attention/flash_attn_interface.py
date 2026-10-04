@@ -28,6 +28,11 @@ from primus_turbo.pytorch.kernels.attention.attention_flydsl_gfx1250_impl import
     flash_attn_flydsl_gfx1250_backward_impl,
     flash_attn_flydsl_gfx1250_forward_impl,
 )
+from primus_turbo.pytorch.kernels.attention.attention_flydsl_gfx1250_mla_impl import (
+    flash_attn_flydsl_gfx1250_mla_backward_impl,
+    flash_attn_flydsl_gfx1250_mla_forward_impl,
+    is_mla_head_dims,
+)
 from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
     flash_attn_sbhd_flydsl_backward_impl,
     flash_attn_sbhd_flydsl_forward_impl,
@@ -183,6 +188,19 @@ class FlashAttnFunc(torch.autograd.Function):
                 raise ValueError(
                     f"gfx1250 flydsl attention has no sliding window, got {window_size} (causal={causal})"
                 )
+            ctx.mla_fold = None
+            if is_mla_head_dims(q, k, v):
+                # DeepSeek-V3 MLA (qk 192 / v 128): sbhd storage is folded, not copied; the
+                # backward takes the kernel-layout tensors the forward impl hands back.
+                out, lse, saved, fold = flash_attn_flydsl_gfx1250_mla_forward_impl(
+                    q, k, v, softmax_scale=softmax_scale, causal=causal
+                )
+                if is_grad_enabled and _any_requires_grad(q, k, v):
+                    ctx.save_for_backward(*saved)
+                    ctx.mla_fold, ctx.mla_batch = fold, q.shape[0]
+                    ctx.softmax_scale = softmax_scale
+                    ctx.causal = causal
+                return (out, lse) if return_lse else out
             # [b, s, h, d] in any byte order; the adapter makes q/k/v contiguous BSHD and the
             # backward consumes exactly those tensors and lse [B, Hq, Sq].
             q_c, k_c, v_c = (t.contiguous() for t in (q, k, v))
@@ -332,6 +350,22 @@ class FlashAttnFunc(torch.autograd.Function):
                 window_size=ctx.window_size,
             )
             return _flash_attn_grads(dq, dk, dv, None, dsink)
+
+        if ctx.flydsl_gfx1250 and ctx.mla_fold is not None:
+            q, k, v, out, lse = ctx.saved_tensors
+            dq, dk, dv = flash_attn_flydsl_gfx1250_mla_backward_impl(
+                dout,
+                q,
+                k,
+                v,
+                out,
+                lse,
+                ctx.mla_fold,
+                ctx.mla_batch,
+                softmax_scale=ctx.softmax_scale,
+                causal=ctx.causal,
+            )
+            return _flash_attn_grads(dq, dk, dv, None, None)
 
         if ctx.flydsl_gfx1250:
             q, k, v, out, lse = ctx.saved_tensors
