@@ -13,7 +13,6 @@ from primus_turbo.pytorch.ops.deoscillation import (
     weight_deosc_update,
 )
 
-
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP required")
 
 
