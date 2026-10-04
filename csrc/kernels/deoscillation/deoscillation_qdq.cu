@@ -26,7 +26,7 @@ weight_deosc_qdq_kernel(float *__restrict__ master, dtype::bfloat16 *__restrict_
     const int64_t tile      = static_cast<int64_t>(blockIdx.x) * 4 + threadIdx.x / kWave;
     const int64_t tile_cols = (cols + 31) / 32;
     if (tile >= tile_row_count * tile_cols)
-        return; // Uniform within each wave; all following reductions are wave-local.
+        return; // Partial final blocks use only wave-local count reduction.
     const int64_t tile_row             = first_tile_row + tile / tile_cols;
     const int64_t tile_rows_per_matrix = (rows + 31) / 32;
     const int64_t matrix               = tile_row / tile_rows_per_matrix;
@@ -187,8 +187,23 @@ weight_deosc_qdq_kernel(float *__restrict__ master, dtype::bfloat16 *__restrict_
 #pragma unroll
         for (int delta = 32; delta > 0; delta >>= 1)
             count += __shfl_down(count, delta, kWave);
-        if (lane == 0 && count)
+        // Only full blocks enter the barrier: some waves of the final block
+        // may have returned above. Combining the four waves reduces pressure
+        // on the shared diagnostic counter without a scratch allocation.
+        if (static_cast<int64_t>(blockIdx.x) * 4 + 3 < tile_row_count * tile_cols) {
+            __shared__ unsigned int wave_counts[4];
+            if (lane == 0)
+                wave_counts[threadIdx.x / kWave] = count;
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                const unsigned int block_count =
+                    wave_counts[0] + wave_counts[1] + wave_counts[2] + wave_counts[3];
+                if (block_count)
+                    atomicAdd(reset_count, static_cast<unsigned long long>(block_count));
+            }
+        } else if (lane == 0 && count) {
             atomicAdd(reset_count, static_cast<unsigned long long>(count));
+        }
     }
 #else
     __builtin_trap(); // The PyTorch entry point rejects unsupported architectures.

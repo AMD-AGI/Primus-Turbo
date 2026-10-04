@@ -207,6 +207,18 @@ def test_direct_qdq_multiple_windows_match_reference(mode, count_enabled, start,
         assert count.item() == expected_count.item()
 
 
+@pytest.mark.parametrize("n", [1, 1024, 1025, 4096, 4097])
+def test_direct_qdq_count_full_and_partial_blocks(n):
+    master = torch.zeros(n, device="cuda")
+    state = _state_like(master)
+    weight_deosc_qdq(master, *state, 32, 32, 0, seed=True)
+    state[2].fill_(1.0)
+    state[3].fill_(10.0)
+    count = torch.zeros((), device="cuda", dtype=torch.int64)
+    weight_deosc_qdq(master, *state, 32, 32, 0, close=True, reset_count=count)
+    assert count.item() == n
+
+
 def test_direct_qdq_empty_and_non_default_stream():
     master = torch.empty(0, device="cuda")
     weight_deosc_qdq(master, *_state_like(master), 32, 32, 0, seed=True)
