@@ -10,3 +10,7 @@
 # This file is distributed under the Apache License 2.0 (see LICENSE-APACHE),
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
+
+from primus_turbo.flydsl._compat import install as _install_flydsl_compat
+
+_install_flydsl_compat()
