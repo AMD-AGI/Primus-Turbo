@@ -199,6 +199,20 @@ QK_DMAJOR = True
 # starts each group at kv 2: first wait releases 6 loads instead of 2).
 QK_KV_FENCE = True
 
+# ---- fwd_r4_a: head-grouped LPT dispatch order (K/V reuse in L2/MALL) ----
+# Pure LPT hands the first gy*gz dispatched WGs the last q-block of every (b, h): at prod
+# (gyz 256) the 256 resident WGs stream 256 different heads' K/V, and each later rank of a
+# head re-reads that K/V ~gyz WGs later, after it was evicted. When gx % KV_GROUP == 0 and
+# gy*gz % KV_HEAD_CHUNK == 0 (runtime-uniform select in _lpt_block_id), a window of
+# KV_GROUP ranks is dispatched chunk by chunk: KV_HEAD_CHUNK heads x KV_GROUP ranks at a
+# time, so KV_GROUP WGs of one head run together (linear-id stride KV_HEAD_CHUNK, as pure
+# LPT does at proxy where gyz == 64). Otherwise pure LPT. Still a bijection; at gyz ==
+# KV_HEAD_CHUNK it equals pure LPT exactly. KV_GROUP = 1 == fwd_r3_a's code path. Both
+# knobs are powers of two (shift/mask arithmetic). CPU proof: ../bounds_proof.py.
+KV_GROUP = 16  # fwd_r5_a_g16: 16 WGs of a head together, 1 window per head at prod (fwd_r4_a: 4)
+KV_HEAD_CHUNK = 16  # fwd_r5_a_g16 (fwd_r4_a: 64): proxy (gyz 64) takes the grouped path
+assert KV_GROUP & (KV_GROUP - 1) == 0 and KV_HEAD_CHUNK & (KV_HEAD_CHUNK - 1) == 0
+
 # log2(e): exp(x) = exp2(x * LOG2E). Softmax uses the native ISA exp2 intrinsic.
 
 # Deferred oaccu rescale (FAv4 innovation, hk_mla spec §9.1.1). Rescaling the
@@ -359,6 +373,27 @@ def _lpt_block_id(axis):
     gyz = gy * gz
     rank = lin // gyz
     rem = lin - rank * gyz
+    if KV_GROUP > 1:
+        # Head-grouped LPT (fwd_r4_a), G = KV_GROUP, HB = KV_HEAD_CHUNK, from the pure-LPT
+        # pair (rank, rem): win = lin // (G*gyz) = rank // G, r = lin % (G*gyz) =
+        # (rank % G)*gyz + rem, c = r % (G*HB); rank' = win*G + c // HB,
+        # j = (r // (G*HB))*HB + c % HB; then lin' = rank'*gyz + j goes through the same
+        # pure-LPT split as before (a second runtime division, prologue only: this form
+        # keeps every loop body equal to fwd_r3_a's up to SGPR numbering; the direct select
+        # of (rank', j) perturbed the masked-loop register allocation). Taken iff
+        # gx % G == 0 and gyz % HB == 0 (uniform over the grid).
+        lg, lhb = KV_GROUP.bit_length() - 1, KV_HEAD_CHUNK.bit_length() - 1
+        r = (rank & fx.Int32(KV_GROUP - 1)) * gyz + rem
+        c = r & fx.Int32(KV_GROUP * KV_HEAD_CHUNK - 1)
+        grouped = ((gx & fx.Int32(KV_GROUP - 1)) | (gyz & fx.Int32(KV_HEAD_CHUNK - 1))) == fx.Int32(0)
+        lin = grouped.select(
+            ((rank & fx.Int32(-KV_GROUP)) + (c >> fx.Int32(lhb))) * gyz
+            + ((r >> fx.Int32(lg + lhb)) << fx.Int32(lhb))
+            + (c & fx.Int32(KV_HEAD_CHUNK - 1)),
+            lin,
+        )
+        rank = lin // gyz
+        rem = lin - rank * gyz
     if axis == "x":
         return gx - fx.Int32(1) - rank
     if axis == "y":

@@ -66,3 +66,15 @@ b2 s4096 h128, bf16, causal):
     every wait releases at most one d-step. Same addresses and per-chain accumulation order:
     o / lse bitwise equal to item 9; with both knobs off the kernel compiles to item 9's binary.
     0.5% faster at b2 s4096 h128 (1.1% at b1 s4096 h64).
+11. Head-grouped LPT dispatch (`KV_GROUP = 16`, `KV_HEAD_CHUNK = 16`, in `_lpt_block_id`): pure
+    LPT hands the first `gy*gz` dispatched workgroups the last q block of every (batch, head), so
+    at b2 s4096 h128 the 256 resident workgroups stream 256 different heads' K/V and every later
+    q block of a head re-reads it after eviction. When `gx % KV_GROUP == 0` and
+    `gy*gz % KV_HEAD_CHUNK == 0` (a runtime-uniform select), windows of `KV_GROUP` LPT ranks are
+    dispatched `KV_HEAD_CHUNK` heads at a time, so at b2 s4096 h128 and at the folded launch
+    [1, 4096, 256, D] every 256-id dispatch block holds 16 heads x all 16 q blocks and a head's
+    K/V is shared in L2. Other grids (small ones included) keep pure LPT. The remap is a
+    bijection of the block id (checked on the CPU for gx 1..64, gy*gz 1..1024), every workgroup
+    still computes one (batch, head, q block): o / lse bitwise equal to item 10. About 13% faster
+    than item 10 at b2 s4096 h128 (0.777 ms there, 0.99x aiter's gfx1250 ASM forward in the same
+    process).
