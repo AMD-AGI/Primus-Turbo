@@ -8,7 +8,51 @@ from typing import Optional
 
 import torch
 
-__all__ = ["weight_deosc_update", "weight_deosc_close"]
+__all__ = ["weight_deosc_update", "weight_deosc_close", "weight_deosc_qdq"]
+
+
+def weight_deosc_qdq(
+    master: torch.Tensor,
+    previous: torch.Tensor,
+    previous_qdq: torch.Tensor,
+    dist: torch.Tensor,
+    dist_qdq: torch.Tensor,
+    rows: int,
+    cols: int,
+    start: int,
+    *,
+    scale_rounding_mode: int = 0,
+    seed: bool = False,
+    close: bool = False,
+    ratio_threshold: float = 4.0,
+    eps: float = 1e-12,
+    reset_count: Optional[torch.Tensor] = None,
+) -> None:
+    """Fuse local MXFP4 QDQ, tracking, snapshots and optional closure (gfx950).
+
+    ``master`` is a contiguous flattened FP32 shard starting at ``start`` in
+    one matrix or a flattened batch of ``[rows, cols]`` matrices. Each 32x32
+    tile uses BF16-rounded input and zeroes for elements outside the shard.
+    Persistent state tensors have the same number of elements as ``master``.
+    ``seed=True`` initializes them without observing movement. No packed FP4,
+    scale, transpose, BF16 input or dequantized temporary is materialized.
+    """
+    torch.ops.primus_turbo_cpp_extension.weight_deosc_qdq(
+        master,
+        previous,
+        previous_qdq,
+        dist,
+        dist_qdq,
+        rows,
+        cols,
+        start,
+        scale_rounding_mode,
+        seed,
+        close,
+        ratio_threshold,
+        eps,
+        reset_count,
+    )
 
 
 def weight_deosc_update(

@@ -101,6 +101,10 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("shuffle_weight(Tensor weight, int[] layout) -> Tensor");
 
     // ********* Weight de-oscillation *********
+    m.def("weight_deosc_qdq(Tensor(a!) master, Tensor(b!) previous, Tensor(c!) previous_qdq, "
+          "Tensor(d!) dist, Tensor(e!) dist_qdq, int rows, int cols, int start, "
+          "int scale_rounding_mode, bool seed, bool close, float ratio_threshold, float eps, "
+          "Tensor(f!)? reset_count=None) -> ()");
     m.def("weight_deosc_update(Tensor current, Tensor current_qdq, Tensor previous, "
           "Tensor previous_qdq, Tensor(a!) dist, Tensor(b!) dist_qdq) -> ()");
     m.def("weight_deosc_close(Tensor(a!) master, Tensor(b!) previous, Tensor current_qdq, "
@@ -214,6 +218,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
 
     // ********* Weight de-oscillation *********
     m.impl("weight_deosc_update", weight_deosc_update);
+    m.impl("weight_deosc_qdq", weight_deosc_qdq);
     m.impl("weight_deosc_close", weight_deosc_close);
 
     // ********* Permute *********
@@ -279,6 +284,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
 
     // ********* Weight de-oscillation *********
     m.impl("weight_deosc_update", weight_deosc_update_meta);
+    m.impl("weight_deosc_qdq", weight_deosc_qdq_meta);
     m.impl("weight_deosc_close", weight_deosc_close_meta);
 
     // ********* Permute *********

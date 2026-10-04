@@ -14,12 +14,12 @@ namespace {
 
 constexpr int kThreads = 256;
 
-__global__ void weight_deosc_update_kernel(
-    const dtype::bfloat16 *__restrict__ current,
-    const dtype::bfloat16 *__restrict__ current_qdq,
-    const dtype::bfloat16 *__restrict__ previous,
-    const dtype::bfloat16 *__restrict__ previous_qdq, float *__restrict__ dist,
-    float *__restrict__ dist_qdq, int64_t numel) {
+__global__ void weight_deosc_update_kernel(const dtype::bfloat16 *__restrict__ current,
+                                           const dtype::bfloat16 *__restrict__ current_qdq,
+                                           const dtype::bfloat16 *__restrict__ previous,
+                                           const dtype::bfloat16 *__restrict__ previous_qdq,
+                                           float *__restrict__ dist, float *__restrict__ dist_qdq,
+                                           int64_t numel) {
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= numel)
         return;
@@ -33,11 +33,13 @@ __global__ void weight_deosc_update_kernel(
     dist_qdq[index] += fabsf(static_cast<float>(delta_qdq));
 }
 
-__global__ void weight_deosc_close_kernel(
-    float *__restrict__ master, dtype::bfloat16 *__restrict__ previous,
-    const dtype::bfloat16 *__restrict__ current_qdq, float *__restrict__ dist,
-    float *__restrict__ dist_qdq, unsigned long long *__restrict__ reset_count,
-    int64_t numel, float ratio_threshold, float eps, bool collect_count) {
+__global__ void weight_deosc_close_kernel(float *__restrict__ master,
+                                          dtype::bfloat16 *__restrict__ previous,
+                                          const dtype::bfloat16 *__restrict__ current_qdq,
+                                          float *__restrict__ dist, float *__restrict__ dist_qdq,
+                                          unsigned long long *__restrict__ reset_count,
+                                          int64_t numel, float ratio_threshold, float eps,
+                                          bool collect_count) {
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     bool          reset = false;
 
@@ -52,8 +54,8 @@ __global__ void weight_deosc_close_kernel(
 
         if (reset) {
             const dtype::bfloat16 snapped = current_qdq[index];
-            master[index]                  = static_cast<float>(snapped);
-            previous[index]                = snapped;
+            master[index]                 = static_cast<float>(snapped);
+            previous[index]               = snapped;
         }
 
         dist[index]     = 0.0f;
@@ -78,32 +80,29 @@ __global__ void weight_deosc_close_kernel(
 
 } // namespace
 
-void weight_deosc_update(const dtype::bfloat16 *current,
-                         const dtype::bfloat16 *current_qdq,
-                         const dtype::bfloat16 *previous,
-                         const dtype::bfloat16 *previous_qdq, float *dist,
-                         float *dist_qdq, int64_t numel, hipStream_t stream) {
+void weight_deosc_update(const dtype::bfloat16 *current, const dtype::bfloat16 *current_qdq,
+                         const dtype::bfloat16 *previous, const dtype::bfloat16 *previous_qdq,
+                         float *dist, float *dist_qdq, int64_t numel, hipStream_t stream) {
     if (numel == 0)
         return;
     const dim3 block(kThreads);
     const dim3 grid(DIVUP<int64_t>(numel, kThreads));
-    weight_deosc_update_kernel<<<grid, block, 0, stream>>>(
-        current, current_qdq, previous, previous_qdq, dist, dist_qdq, numel);
+    weight_deosc_update_kernel<<<grid, block, 0, stream>>>(current, current_qdq, previous,
+                                                           previous_qdq, dist, dist_qdq, numel);
 }
 
 void weight_deosc_close(float *master, dtype::bfloat16 *previous,
-                        const dtype::bfloat16 *current_qdq, float *dist,
-                        float *dist_qdq, int64_t *reset_count, int64_t numel,
-                        float ratio_threshold, float eps, bool collect_count,
-                        hipStream_t stream) {
+                        const dtype::bfloat16 *current_qdq, float *dist, float *dist_qdq,
+                        int64_t *reset_count, int64_t numel, float ratio_threshold, float eps,
+                        bool collect_count, hipStream_t stream) {
     if (numel == 0)
         return;
     const dim3 block(kThreads);
     const dim3 grid(DIVUP<int64_t>(numel, kThreads));
     weight_deosc_close_kernel<<<grid, block, 0, stream>>>(
         master, previous, current_qdq, dist, dist_qdq,
-        reinterpret_cast<unsigned long long *>(reset_count), numel,
-        ratio_threshold, eps, collect_count);
+        reinterpret_cast<unsigned long long *>(reset_count), numel, ratio_threshold, eps,
+        collect_count);
 }
 
 } // namespace primus_turbo

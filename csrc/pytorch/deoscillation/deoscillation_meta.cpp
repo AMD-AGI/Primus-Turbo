@@ -8,13 +8,18 @@
 
 namespace primus_turbo::pytorch {
 
+void weight_deosc_qdq_meta(at::Tensor master, at::Tensor previous, at::Tensor previous_qdq,
+                           at::Tensor dist, at::Tensor dist_qdq, int64_t rows, int64_t cols,
+                           int64_t start, int64_t scale_rounding_mode, bool seed, bool close,
+                           double ratio_threshold, double eps,
+                           c10::optional<at::Tensor> reset_count) {}
+
 void weight_deosc_update_meta(const at::Tensor current, const at::Tensor current_qdq,
                               const at::Tensor previous, const at::Tensor previous_qdq,
                               at::Tensor dist, at::Tensor dist_qdq) {}
 
-void weight_deosc_close_meta(at::Tensor master, at::Tensor previous,
-                             const at::Tensor current_qdq, at::Tensor dist,
-                             at::Tensor dist_qdq, double ratio_threshold, double eps,
-                             c10::optional<at::Tensor> reset_count) {}
+void weight_deosc_close_meta(at::Tensor master, at::Tensor previous, const at::Tensor current_qdq,
+                             at::Tensor dist, at::Tensor dist_qdq, double ratio_threshold,
+                             double eps, c10::optional<at::Tensor> reset_count) {}
 
 } // namespace primus_turbo::pytorch

@@ -7,7 +7,11 @@
 import pytest
 import torch
 
-from primus_turbo.pytorch.ops.deoscillation import weight_deosc_close, weight_deosc_update
+from primus_turbo.pytorch.ops.deoscillation import (
+    weight_deosc_close,
+    weight_deosc_qdq,
+    weight_deosc_update,
+)
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP required")
@@ -73,3 +77,148 @@ def test_weight_deosc_rejects_non_contiguous_input():
     dist = torch.zeros(16, device="cuda")
     with pytest.raises(RuntimeError, match="current must be contiguous"):
         weight_deosc_update(current, contiguous, contiguous, contiguous, dist, dist.clone())
+
+
+def _reference_qdq(master, rows, cols, start, mode):
+    """Independent staging + existing forward quantizer, including split tiles."""
+    from primus_turbo.pytorch.core import QuantizedTensor
+    from primus_turbo.pytorch.core.low_precision import (
+        ScalingGranularity,
+        ScalingRecipe,
+        float4_e2m1fn_x2,
+    )
+
+    result = torch.empty_like(master, dtype=torch.bfloat16)
+    end = start + master.numel()
+    matrix_size = rows * cols
+    for matrix in range(start // matrix_size, (end - 1) // matrix_size + 1):
+        begin = max(start, matrix * matrix_size)
+        stop = min(end, (matrix + 1) * matrix_size)
+        tile_begin = ((begin - matrix * matrix_size) // cols // 32) * 32 * cols
+        tile_end = (((stop - matrix * matrix_size - 1) // cols // 32) + 1) * 32 * cols
+        tile = torch.zeros(
+            ((tile_end - tile_begin) // cols, cols), dtype=torch.bfloat16, device=master.device
+        )
+        left = begin - matrix * matrix_size - tile_begin
+        right = stop - matrix * matrix_size - tile_begin
+        tile.view(-1)[left:right].copy_(master[begin - start : stop - start])
+        qt = QuantizedTensor.quantize(
+            tile,
+            dest_dtype=float4_e2m1fn_x2,
+            granularity=ScalingGranularity.MX_BLOCKWISE,
+            block_size=32,
+            scaling_recipe=ScalingRecipe(use_2d_block=True),
+            axis=-1,
+            scale_rounding_mode=mode,
+        )
+        qdq = qt.dequantize()[: tile.shape[0], :cols].contiguous().view(-1)
+        result[begin - start : stop - start].copy_(qdq[left:right])
+    return result
+
+
+def _state_like(master):
+    return (
+        torch.empty_like(master, dtype=torch.bfloat16),
+        torch.empty_like(master, dtype=torch.bfloat16),
+        torch.empty_like(master),
+        torch.empty_like(master),
+    )
+
+
+@pytest.mark.parametrize("mode", [0, 1, 2])
+@pytest.mark.parametrize(
+    "rows,cols,start,n",
+    [
+        (64, 64, 0, 4096),
+        (96, 160, 17, 19013),  # Odd start, split matrix and end.
+        (64, 64, 4093, 9),  # Straddles experts with almost entirely missing tiles.
+        (64, 64, 37, 1),
+        (2880, 2880, 65537, 2880 * 64 + 17),
+        (5760, 2880, 5760 * 2880 - 17, 2880 * 96 + 31),
+    ],
+)
+def test_direct_qdq_seed_matches_forward(rows, cols, start, n, mode):
+    gen = torch.Generator(device="cuda").manual_seed(101)
+    master = torch.randn(n, device="cuda", generator=gen) * 0.037
+    if n > 1024:
+        master[:1024] = 0
+    previous, previous_qdq, dist, dist_qdq = _state_like(master)
+    expected = _reference_qdq(master, rows, cols, start, mode)
+    weight_deosc_qdq(
+        master, previous, previous_qdq, dist, dist_qdq, rows, cols, start, scale_rounding_mode=mode, seed=True
+    )
+    torch.testing.assert_close(previous, master.bfloat16(), rtol=0, atol=0)
+    torch.testing.assert_close(previous_qdq, expected, rtol=0, atol=0)
+    assert torch.count_nonzero(dist).item() == 0
+    assert torch.count_nonzero(dist_qdq).item() == 0
+
+
+@pytest.mark.parametrize("mode", [0, 1, 2])
+@pytest.mark.parametrize("count_enabled", [False, True])
+def test_direct_qdq_multiple_windows_match_reference(mode, count_enabled):
+    gen = torch.Generator(device="cuda").manual_seed(202)
+    master = torch.randn(8193, device="cuda", generator=gen) * 0.01
+    rows, cols, start = 64, 64, 31
+    state = _state_like(master)
+    reference_master = master.clone()
+    reference_prev = master.bfloat16()
+    reference_q = _reference_qdq(master, rows, cols, start, mode)
+    distance = torch.zeros_like(master)
+    distance_q = torch.zeros_like(master)
+    weight_deosc_qdq(master, *state, rows, cols, start, scale_rounding_mode=mode, seed=True)
+    count = torch.zeros((), dtype=torch.int64, device="cuda") if count_enabled else None
+    expected_count = torch.zeros((), dtype=torch.int64, device="cuda")
+    for step in range(1, 10):
+        delta = torch.randn(master.shape, device="cuda", generator=gen) * 0.0001
+        master.add_(delta)
+        reference_master.add_(delta)
+        current = reference_master.bfloat16()
+        qdq = _reference_qdq(reference_master, rows, cols, start, mode)
+        distance.add_((current - reference_prev).abs())
+        distance_q.add_((qdq - reference_q).abs())
+        close = step % 3 == 0
+        reference_prev = current
+        reference_q = qdq
+        if close:
+            mask = (distance > 0) & (distance_q / distance.clamp(min=1e-12) >= 4.0)
+            expected_count.add_(mask.sum())
+            reference_master = torch.where(mask, qdq, reference_master)
+            reference_prev = torch.where(mask, qdq, current)
+            distance.zero_()
+            distance_q.zero_()
+        weight_deosc_qdq(
+            master, *state, rows, cols, start, scale_rounding_mode=mode, close=close, reset_count=count
+        )
+        for actual, expected in zip(
+            (master, *state),
+            (
+                reference_master,
+                reference_prev,
+                reference_q,
+                distance,
+                distance_q,
+            ),
+        ):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    if count_enabled:
+        assert count.item() == expected_count.item()
+
+
+def test_direct_qdq_empty_and_non_default_stream():
+    master = torch.empty(0, device="cuda")
+    weight_deosc_qdq(master, *_state_like(master), 32, 32, 0, seed=True)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        master = torch.ones(1025, device="cuda")
+        state = _state_like(master)
+        weight_deosc_qdq(master, *state, 64, 64, 7, seed=True)
+    stream.synchronize()
+    torch.testing.assert_close(state[0], master.bfloat16(), rtol=0, atol=0)
+    torch.testing.assert_close(state[1], master.bfloat16(), rtol=0, atol=0)
+
+
+def test_direct_qdq_rejects_overlapping_state():
+    master = torch.ones(1024, device="cuda")
+    state = _state_like(master)
+    with pytest.raises(RuntimeError):
+        weight_deosc_qdq(master, state[0], state[0], state[2], state[3], 32, 32, 0, seed=True)
