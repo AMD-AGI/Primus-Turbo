@@ -15,6 +15,8 @@
 A [M, K] fp4 (packed 2/byte), B [N, K] fp4, C = a @ b^T. One wave per SIMD lets the
 256-AGPR file hold the N-sliced accumulator; swizzle/depth/epilogue are autotuned."""
 
+import os
+
 import torch
 
 # isort: off
@@ -116,7 +118,9 @@ def _fp4_g2s_src(row, ilv):
     return udiv(row, 64) * 64 + ilv * umod(q, 16) + udiv(q, 16)
 
 
-def fp4_g2s_offsets(lane_id, wave_id, K, n_steps, bytes_per_row, swizzle=False, ilv=0, lds_step=0, lds_grp=0):
+def fp4_g2s_offsets(
+    lane_id, wave_id, K, n_steps, bytes_per_row, swizzle=False, ilv=0, lds_step=0, lds_grp=0, addr=None
+):
     """Per-lane gmem byte offsets for fp4 G2S into identity LDS slots. ``swizzle``
     pre-applies the inverse bank-swizzle; ``ilv`` column-interleaves source rows;
     ``lds_step`` switches the fill to wave-major (see ``_g2s_lds_row``) and ``lds_grp``
@@ -133,8 +137,35 @@ def fp4_g2s_offsets(lane_id, wave_id, K, n_steps, bytes_per_row, swizzle=False, 
         chunk = umod(umod(lane_id, lpr) + lpr - umod(row, lpr), lpr) if swizzle else umod(lane_id, lpr)
         src = _fp4_g2s_src(row, ilv)
         imm = g2s_lds_imm(r, lds_step, lds_grp)
+        if addr is not None:  # another source layout: byte of (source row, logical 16-B chunk)
+            a_ = addr(src, chunk)
+            offs.append(a_ - imm if imm else a_)
+            continue
         offs.append(src * (K // 2) + chunk * 16 - imm if imm else src * (K // 2) + chunk * 16)
     return offs
+
+
+def a4w4_b_addr(k2):
+    """Source byte of (row, logical 16-B chunk c of a 256-K block) in aiter's shuffle_weight(16, 16)
+    B (relative to the 256-K block): [row/16][K/128][kg 4][row%16][16 B] -- 1 KiB per 16 rows per
+    128 K, the MFMA's lane order; c = s*4 + kg."""
+
+    def _a(src, chunk):
+        d = (lambda x, y: x // y) if isinstance(src, int) else udiv
+        m = (lambda x, y: x % y) if isinstance(src, int) else umod
+        return d(src, 16) * (16 * k2) + d(chunk, 4) * 1024 + m(chunk, 4) * 256 + m(src, 16) * 16
+
+    return _a
+
+
+def fp4_g2s_min_addr(n_steps, rows_per_step, n_waves, r, ilv, wave_major, addr):
+    """Smallest source byte step ``r`` reads (any lane/wave/chunk), for a non-plain layout."""
+    return min(
+        addr(_fp4_g2s_src(_fp4_g2s_row(ph, w, r, n_steps, rows_per_step, n_waves, wave_major), ilv), c)
+        for w in range(n_waves)
+        for ph in range(rows_per_step)
+        for c in range(8)
+    )
 
 
 def fp4_g2s_offsets_split(lane_id, wave_id, K, n_steps, row_par, shift, ilv=0):
@@ -598,6 +629,10 @@ class MfmaScaleFp4:
         g2s_step=0,  # wave-major g2s: LDS bytes per step, carried in the buffer immediate
         g2s_grp=(0, 0),  # steps per M0 window, per (A, B) stream
         kstep_val=0,  # value of ``kstep`` (compile-time), so buf1's +1 block can ride that immediate
+        layout="fly",  # operand/scale layout read ("fly" = FlyDSL's own; "a4w4" = aiter gemm_a4w4's)
+        g2s_step_b=None,  # B's LDS bytes per g2s step when it differs from A's (layout="a4w4": padded units)
+        a4w4_in=None,  # layout="a4w4": per-lane scale voffsets / byte selectors (see _build_mxfp4_gemm_kernel)
+        kstep_val_b=None,  # B's k-block soffset stride when it differs from A's (layout="a4w4")
         _cache={},  # noqa: B006 -- deliberate cross-call asm compile cache
     ):
         """WHOLE-LOOP bare-asm K-loop: one inline-asm hw-loop, unroll-2 ping-pong with
@@ -667,7 +702,9 @@ class MfmaScaleFp4:
             g2s_step,
             tuple(g2s_grp),
             kstep_val,
-        )
+        ) + (((layout, kstep_val_b, g2s_step_b),) if layout != "fly" else ())
+        _A4 = layout == "a4w4"
+        assert layout in ("fly", "a4w4")
         _SPLIT = split is not None
         _CST = cst is not None
         _CILV = cst_ilv
@@ -685,10 +722,19 @@ class MfmaScaleFp4:
         _GGA, _GGB = tuple(g2s_grp) if _GSTEP else (1, 1)
         _KSV = kstep_val
         _GBSK = _KSV if _GSTEP else 0
+        # layout="a4w4": B (shuffle_weight) advances 2 KiB per 256-K block, A (plain rows) 128 B.
+        _KSVB = kstep_val_b if kstep_val_b is not None else _KSV
+        _GSTEPB = g2s_step_b if (g2s_step_b is not None and _GSTEP) else _GSTEP
+        _GBSKB = _KSVB if _GSTEP else 0
+        assert not _A4 or (_GSTEP and _KSV and not _SPLIT and not self.coop and not self.tacc), (
+            "layout='a4w4' rides the wave-major immediate path"
+        )
         # Static trip count: start the counter at (first - bound) so its own carry-out ends the
         # loop and the separate `s_cmp_lt_u32` goes away.
         _CARRY = bool(_KSV) and not _RUNTIME
-        assert (max(_GGA, _GGB) - 1) * _GSTEP + _GBSK <= 4095, "g2s LDS step + buf skew overflows offset:"
+        assert max((_GGA - 1) * _GSTEP + _GBSK, (_GGB - 1) * _GSTEPB + _GBSKB) <= 4095, (
+            "g2s LDS step + buf skew overflows offset:"
+        )
         # 3-slot odd ring (skewed rows) rotates ds_read bases; a 2-slot ring is byte-exact/static.
         _ROT = _SPLIT and len(split[0]) == 3
         _NOD = len(split[0]) if _SPLIT else 0
@@ -770,6 +816,14 @@ class MfmaScaleFp4:
             o_par = nout  # runtime dispatch: parity scratch, never the loop bound
             if _RUNTIME:
                 nout += 1
+            # layout="a4w4": 8 raw B-scale dwords (two dwordx4: BL, BR) + 1 pack temp, pinned
+            # right above the wide-store pool.
+            _A4RAW = _CDV + _NCDV
+            if _A4:
+                assert _CST and _CILV == 4 and _PSTAGE and _KPEEL and half_n is None and not half_k, (
+                    "layout='a4w4': the interleaved folded-store path (production) only"
+                )
+                nout += 9
             # scale temp accessors (group: 0=A-g0, 1=A-g1, 2=BL, 3=BR; slot=grp*n_sub+s)
             # _scb[0] = ping-pong scale-set base (0 or nsct), set per phase.
             _scb = [0]
@@ -840,6 +894,10 @@ class MfmaScaleFp4:
             i += nbuf_b * n_sub if _BSPL else 0
             i_bre = [[i + b * n_sub + s for s in range(n_sub)] for b in range(nbuf_b)]
             i += nbuf_b * n_sub if _BSPL else 0
+            # layout="a4w4": A scale voffsets (4 32-row blocks), B scale voffset, byte selectors
+            # (selA, selB) for sub-block 0 and 1.
+            i_a4 = list(range(i, i + 9))
+            i += 9 if _A4 else 0
             if _ROT:
                 f_ab, f_blb, f_brb = i_ab, i_blb, i_brb
                 i_ab, i_blb, i_brb = o_nb[0], o_nb[1], o_nb[2]
@@ -887,10 +945,10 @@ class MfmaScaleFp4:
                                 )
                     return r
                 r = []
-                for dst, gl, rs, so, n, gg in (
-                    (i_g_ab[buf], i_gla, i_rsa, sa_op, 0 if b_only else nsa, _GGA),
-                    (i_g_blb[buf], i_glb, i_rsb, sbl_op, nsb, _GGB),
-                    (i_g_brb[buf], i_glb, i_rsb, sbl_op if half else sbr_op, nsb, _GGB),
+                for dst, gl, rs, so, n, gg, gbsk, gstep in (
+                    (i_g_ab[buf], i_gla, i_rsa, sa_op, 0 if b_only else nsa, _GGA, _GBSK, _GSTEP),
+                    (i_g_blb[buf], i_glb, i_rsb, sbl_op, nsb, _GGB, _GBSKB, _GSTEPB),
+                    (i_g_brb[buf], i_glb, i_rsb, sbl_op if half else sbr_op, nsb, _GGB, _GBSKB, _GSTEPB),
                 ):
                     for st in range(n):
                         if not _GSTEP:
@@ -901,10 +959,10 @@ class MfmaScaleFp4:
                             continue
                         # M0 moves only when this stream's immediate window rolls over; the
                         # buf skew rides the same field, so buf1 shares buf0's soffset.
-                        m0 = f"s_add_u32 m0, ${dst}, {(st // gg) * gg * _GSTEP}\n" if st % gg == 0 else ""
+                        m0 = f"s_add_u32 m0, ${dst}, {(st // gg) * gg * gstep}\n" if st % gg == 0 else ""
                         r.append(
                             f"{m0}buffer_load_dwordx4 ${gl[st]}, ${rs}, ${so} "
-                            f"offen offset:{g2s_lds_imm(st, _GSTEP, gg) + buf * _GBSK} lds"
+                            f"offen offset:{g2s_lds_imm(st, gstep, gg) + buf * gbsk} lds"
                         )
                 return r
 
@@ -1124,6 +1182,8 @@ class MfmaScaleFp4:
                     at = t_a + ii * n_sub + s
                     bt = tb + ji * n_sub + s
                     sat = sa_t(s, ii // _ANG)
+                    if _A4:  # a4w4: A's set is [32-row block 0..3], byte s*2 + (16-row half)
+                        sat, oa = t_sc + _scb[0] + ii // 2, s * 2 + ii % 2
                     sbt = sbfn(s)
                     # A quad's opening k sub-step (cells run s-ascending per quad) may take the
                     # src2 immediate 0 instead of its own accumulator: same result bit for bit,
@@ -1235,7 +1295,8 @@ class MfmaScaleFp4:
             _scw = 2 * n_sub  # scale dwords per operand (2 region groups x n_sub subs)
             _scwx = {1: "", 2: "x2", 4: "x4"}.get(_scw, f"x{_scw}")  # buffer_load width suffix
 
-            _scvstep = 64 * (2 * n_sub) * 4  # lane-contig kk stride in bytes
+            # lane-contig kk stride in bytes (a4w4: shuffle_scale's 256-B (32 rows x 256 K) block)
+            _scvstep = 256 if _A4 else 64 * (2 * n_sub) * 4
             # A pair's two phases sit one kk stride apart, so the odd phase reads at an
             # immediate off the even phase's soffset and the pair advances once, not twice.
             _SCIMM = _KSV and not _COOP and _scvstep <= 4095
@@ -1243,6 +1304,20 @@ class MfmaScaleFp4:
             def emit_sc_vgpr(tb, odd=False):
                 p = _pbsc + tb
                 o = f" offset:{_scvstep}" if (_SCIMM and odd) else ""
+                if _A4:
+                    # aiter shuffle_scale: a lane's dword (kg*16 + r16)*4 of a 32-row x 256-K block holds
+                    # [s0 rows 0-15, s0 rows 16-31, s1 rows 0-15, s1 rows 16-31] of row r16: A's four
+                    # blocks load straight into the set (m-fragment ii = block ii//2, byte s*2 + ii%2);
+                    # B's interleaved columns come from 4 consecutive records -> raw, packed by emit_sc_pack.
+                    r = [
+                        f"buffer_load_dword v{p + k}, ${i_a4[k]}, ${i_scrsa}, ${o_sca[0]} offen{o}"
+                        for k in range(4)
+                    ]
+                    r += [
+                        f"buffer_load_dwordx4 v[{_A4RAW}:{_A4RAW + 3}], ${i_a4[4]}, ${i_scrsb}, ${o_sca[2]} offen{o}",
+                        f"buffer_load_dwordx4 v[{_A4RAW + 4}:{_A4RAW + 7}], ${i_a4[4]}, ${i_scrsb}, ${o_sca[3]} offen{o}",
+                    ]
+                    return r
                 return [
                     f"buffer_load_dword{_scwx} v[{p}:{p + _scw - 1}], ${i_scvoff}, ${i_scrsa}, ${o_sca[0]} offen{o}",
                     f"buffer_load_dword{_scwx} v[{p + _scw}:{p + 2 * _scw - 1}], ${i_scvoff}, ${i_scrsb}, ${o_sca[2]} offen{o}",
@@ -1254,7 +1329,26 @@ class MfmaScaleFp4:
                 return [
                     f"s_add_u32 ${o_sca[0]}, ${o_sca[0]}, {n * _scvstep}",
                     f"s_add_u32 ${o_sca[2]}, ${o_sca[2]}, {n * _scvstep}",
-                ]
+                ] + ([f"s_add_u32 ${o_sca[3]}, ${o_sca[3]}, {n * _scvstep}"] if _A4 else [])
+
+            def emit_sc_pack(tb):
+                """a4w4: B scale set (BL s0, BL s1, BR s0, BR s1) from the raw records: byte ji of each
+                = byte (s*2 + i1(lane)) of record ji -- two v_perm_b32 with per-lane selectors + v_or."""
+                if not _A4:
+                    return []
+                p = _pbsc + tb
+                t = _A4RAW + 8
+                ls = []
+                for sl in range(2):
+                    r0 = _A4RAW + 4 * sl
+                    for s_ in range(2):
+                        d = p + _scw + sl * 2 + s_
+                        ls += [
+                            f"v_perm_b32 v{t}, v{r0 + 1}, v{r0}, ${i_a4[5 + 2 * s_]}",
+                            f"v_perm_b32 v{d}, v{r0 + 3}, v{r0 + 2}, ${i_a4[6 + 2 * s_]}",
+                            f"v_or_b32 v{d}, v{d}, v{t}",
+                        ]
+                return ls
 
             # COOP 2-deep pipeline: each wave loads one group to SC_lds, s_barrier, then ds_reads A+B.
             def emit_sc_coop_g2s(buf):
@@ -1292,10 +1386,11 @@ class MfmaScaleFp4:
                 # buf1 stages the k=1 block; when its instructions add a k-block themselves,
                 # the soffset they get has to start one block lower again.
                 _pk = f"{2 * _GBSK}" if _GBSK else f"${i_kstep}"
+                _pkb = f"{2 * _GBSKB}" if _GBSKB else f"${i_kstep}"
                 _sb = [
                     f"s_sub_u32 ${o_ta}, ${i_sa0}, {_pk}",
-                    f"s_sub_u32 ${o_tbl}, ${i_sbl0}, {_pk}",
-                    f"s_sub_u32 ${o_tbr}, ${i_sbr0}, {_pk}",
+                    f"s_sub_u32 ${o_tbl}, ${i_sbl0}, {_pkb}",
+                    f"s_sub_u32 ${o_tbr}, ${i_sbr0}, {_pkb}",
                 ]
                 if not _SPLIT:
                     return _sb + emit_g2s(1, o_ta, o_tbl, o_tbr, b_only=_bo)
@@ -1372,7 +1467,8 @@ class MfmaScaleFp4:
                     if _ROT:  # rotate first (phase A's own g2s dest is the new head)
                         _gA = emit_rot() + mix_g2s(_gA, emit_bases(0))
                     return (
-                        _scA
+                        emit_sc_pack(0)
+                        + _scA
                         + emit_inplace(1, _gA, half, zero=zero, pre_buf=pre_buf)
                         + _scv_adv(0 if _SCIMM else 1)
                     )
@@ -1436,12 +1532,12 @@ class MfmaScaleFp4:
                     _gB = emit_g2s(1, *_bs, half and half_g2s)
                     if _ROT:
                         _gB = mix_g2s(_gB, emit_bases(1))
-                    B += _scB + _mid_sync(emit_inplace(0, _gB, half))
+                    B += emit_sc_pack(nsct) + _scB + _mid_sync(emit_inplace(0, _gB, half))
                     B += _scv_adv(2 if _SCIMM else 1)
                     B.append(_ipend)
                     for _so in (o_sa, o_sbl, o_sbr):
                         if _KSV:
-                            B.append(f"s_add_u32 ${_so}, ${_so}, {2 * _KSV}")
+                            B.append(f"s_add_u32 ${_so}, ${_so}, {2 * (_KSV if _so == o_sa else _KSVB)}")
                         else:
                             B.append(f"s_add_u32 ${_so}, ${_so}, ${i_kstep}")
                             B.append(f"s_add_u32 ${_so}, ${_so}, ${i_kstep}")
@@ -1500,6 +1596,8 @@ class MfmaScaleFp4:
                         at = aw(ii, s)
                         bt = (t_bl if sl == 0 else t_br) + ji * n_sub + se if s < n_sub else b1(sl, ji, se)
                         sat = t_sc + scb + (ii // _ANG) * n_sub + se
+                        if _A4:
+                            sat, oa = t_sc + scb + ii // 2, se * 2 + ii % 2
                         sbt = t_sc + scb + (2 + sl) * n_sub + se
                         if _TACC:  # acc = C^T (swap operands/scales/op_sel)
                             osel = (
@@ -1540,11 +1638,12 @@ class MfmaScaleFp4:
                             _sg["lgk"] = due[-1] + 1
                         if not _sg["vm"] and j >= n_sub * ntb:
                             ls.append("s_waitcnt vmcnt(0)")  # trailing scales; no store in flight
+                            ls += emit_sc_pack(sc_t)
                             _sg["vm"] = True
                         return ls
 
                     B = ["s_waitcnt vmcnt(0) lgkmcnt(0)", "s_barrier"]
-                    B += emit_sc_vgpr(sc_t)
+                    B += emit_sc_pack(sc_f) + emit_sc_vgpr(sc_t)
                     mi = 0
                     for ii in range(nta):
                         if ii:
@@ -1829,6 +1928,7 @@ class MfmaScaleFp4:
                 + [f"=&{{v{_CDV + j}}}" for j in range(_NCDV)]  # wide store data pool
                 + (["=&s"] if _RTPEEL else [])  # runtime peel loop bound
                 + (["=&s"] if _RUNTIME else [])  # runtime dispatch parity scratch
+                + ([f"=&{{v{_A4RAW + j}}}" for j in range(9)] if _A4 else [])  # a4w4 raw B scales + temp
                 + ["v"] * ((nbuf + 2 * nbuf_b) * n_sub)  # a(nbuf)/bl/br(nbuf_b) ds_read bases
                 + ["s"] * (nbuf + 2 * nbuf_b)  # g2s dest bases
                 + ["v"] * (nsa + nsb)  # voffsets
@@ -1844,6 +1944,7 @@ class MfmaScaleFp4:
                 + (["v"] * 2 if _ROT else [])  # odd-ring per-lane slot strides
                 + (["s", "s", "v", "s"] if _CST else [])  # C SRDs (L,R), voffset, row bytes
                 + (["v"] * (2 * nbuf_b * n_sub) if _BSPL else [])  # even-region B bases
+                + (["v"] * 9 if _A4 else [])  # a4w4 scale voffsets + byte selectors
                 + ([] if _ZACC else [str(q) for q in o_acc])  # tied accs (src2 imm 0 instead)
                 # The K-loop's own s_cmp/carry rewrites SCC. Without the clobber a caller that
                 # wraps this body in a loop keeps its back-edge condition in SCC across the blob.
@@ -1860,6 +1961,7 @@ class MfmaScaleFp4:
                     + ["i32"] * _NCDV
                     + ["i32"] * (1 if _RTPEEL else 0)
                     + ["i32"] * (1 if _RUNTIME else 0)
+                    + ["i32"] * (9 if _A4 else 0)
                 )
                 + ")>"
             )
@@ -1916,6 +2018,9 @@ class MfmaScaleFp4:
                 for _b in range_constexpr(nbuf_b):
                     for _s in range_constexpr(n_sub):
                         ins.append(_raw(_fr[_b][_s]))
+        if _A4:
+            for _v in a4w4_in:
+                ins.append(_raw(_v))
         if not _ZACC:
             for q in range_constexpr(nq):
                 ins.append(_raw(cL[q]))
@@ -2032,8 +2137,13 @@ def _build_mxfp4_gemm_kernel(
     persist: bool = False,  # let one WG walk several tiles (the caller divides the grid by _TPW)
     block_n: int = 256,  # N tile width; 192 trades tile area for a whole dispatch round
     block_m: int = 256,  # M tile height; the same trade on the other axis
+    # Operand layout read: "fly" (plain rows + FlyDSL-prepacked scales) or "a4w4" = aiter gemm_a4w4's
+    # (bpreshuffle): A plain rows, B shuffle_weight(16, 16), both scales shuffle_scale'd [rows, K/32].
+    layout: str = "fly",
 ):
     BLOCK_M = block_m
+    _A4L = layout == "a4w4"
+    assert layout in ("fly", "a4w4")
     BLOCK_N = block_n
     BLOCK_K = 256
     # A wave owns BLOCK_N/4 columns as two half-slices of 16*N_TILES_BH, so the width has to
@@ -2143,6 +2253,13 @@ def _build_mxfp4_gemm_kernel(
     LDS_ROW_STRIDE = BPR
     a_lds_size = BLOCK_M * LDS_ROW_STRIDE  # 256 rows
     bh_lds_size = LDS_BN_HALF * LDS_ROW_STRIDE  # 128 rows per B half
+    # a4w4: B (shuffle_weight: 1 KiB per 16 rows x 128 K, [kg][row16][16 B]) is staged one g2s per
+    # "column block" (wave region w2 = 64 rows, sub-block s, k-group kg): 64 rows x 16 B gathered from
+    # the four units' 256-B kg slices (2 full lines each, so a g2s still touches 8 whole lines), row
+    # r at slot r//4 + 16*(r%4). An interleaved n-fragment ji (row 4*l16 + ji) then sits at a uniform
+    # 256-B offset and a read pass's lanes hit distinct bank groups; the LDS image is 16 KiB per half
+    # as for "fly". Block j = w2*8 + s*4 + kg, g2s step st of wave w fills block w*nsb + st.
+    _A4U = 1024
 
     _ROWS_PER_STEP = 64 // (BPR // 16) * (256 // 64)  # n_waves = 256//64 = 4
     N_LDS_STEPS_A = BLOCK_M // _ROWS_PER_STEP
@@ -2164,21 +2281,52 @@ def _build_mxfp4_gemm_kernel(
     _GSTREAM = ((N_LDS_STEPS_A, 0, K2A), (N_LDS_STEPS_BH, _BILV, K2B))
     _GIMM = _GWSTEP if ((_MXFP4_G2S_IMM & 2) and not _ROWSPLIT and 4096 % _GWSTEP == 0) else 0
     _GKSV = KSTEP if (_MXFP4_G2S_IMM & 1) else 0  # k-block soffset stride, known here
+    # a4w4: B's 256-K block is two 1 KiB lane-order units per 16 rows, so it advances 2 KiB.
+    KSTEP_B = 2048 if _A4L else KSTEP
+    _GKSVB = KSTEP_B if (_MXFP4_G2S_IMM & 1) else 0
+    _B_ADDR = None
+    if _A4L:
+        assert _GIMM and _GKSV and not _ROWSPLIT and not coop and not taccw and ksplit == 1 and block_n == 256
+        assert block_m == 256 and not glu and not dglu
 
-    def _g2s_grp(n_steps, ilv, k2):
+    def _g2s_grp(n_steps, ilv, k2, addr=None, ksv=None):
         """Steps this stream can share one M0 write over: the window has to stay inside the
         12-bit immediate (the buf skew rides the same field) and inside every step's source
         headroom. 1 = an M0 write per step, which is always legal (its immediate is 0)."""
         for _g in range(min(n_steps, 4096 // _GIMM), 1, -1):
-            if (_g - 1) * _GIMM + _GKSV <= 4095 and all(
-                fp4_g2s_min_row(n_steps, 64 // (BPR // 16), 4, _r, ilv, True) * k2
+            if (_g - 1) * _GIMM + (_GKSV if ksv is None else ksv) <= 4095 and all(
+                (
+                    fp4_g2s_min_row(n_steps, 64 // (BPR // 16), 4, _r, ilv, True) * k2
+                    if addr is None
+                    else fp4_g2s_min_addr(n_steps, 64 // (BPR // 16), 4, _r, ilv, True, addr)
+                )
                 >= g2s_lds_imm(_r, _GIMM, _g)
                 for _r in range(n_steps)
             ):
                 return _g
         return 1
 
-    _GGRP = tuple(_g2s_grp(*_s) for _s in _GSTREAM) if _GIMM else (1, 1)
+    if _A4L:
+
+        def _b_src(j, i):  # source byte (tile-relative, 256-K block 0) of block j's lane i
+            w2, s_, kg = j // 8, (j // 4) % 2, j % 4
+            r = 4 * (i % 16) + i // 16
+            return (w2 * 4 + r // 16) * 16 * K2B + s_ * 1024 + kg * 256 + (r % 16) * 16
+
+        def _b_grp():
+            n = N_LDS_STEPS_BH
+            for _g in range(min(n, 4096 // _A4U), 1, -1):
+                if (_g - 1) * _A4U + _GKSVB <= 4095 and all(
+                    min(_b_src(w * n + st, i) for w in range(4) for i in range(64))
+                    >= g2s_lds_imm(st, _A4U, _g)
+                    for st in range(n)
+                ):
+                    return _g
+            return 1
+
+        _GGRP = (_g2s_grp(*_GSTREAM[0]), _b_grp())
+    else:
+        _GGRP = tuple(_g2s_grp(*_s) for _s in _GSTREAM) if _GIMM else (1, 1)
 
     _PRELL = const_expr(2)  # operand buffers prefilled (k=0..PRELL-1)
     # Hand the k=1 A slot to the asm prologue: the tile's first s_waitcnt then covers a
@@ -2278,7 +2426,23 @@ def _build_mxfp4_gemm_kernel(
                 ilv=_BILV,
                 lds_step=_GIMM,
                 lds_grp=_GGRP[1],
+                addr=_B_ADDR,
             )
+            if const_expr(_A4L):
+                # column block j = wave*nsb + st; lane i writes slot i = row r with r//4 + 16*(r%4) = i
+                gl_off_b = []
+                _r = umod(lane_id, 16) * fx.Int32(4) + udiv(lane_id, 16)
+                _rsrc = udiv(_r, 16) * fx.Int32(16 * K2B) + umod(_r, 16) * fx.Int32(16)
+                for _st in range_constexpr(N_LDS_STEPS_BH):
+                    _j = wave_id * fx.Int32(N_LDS_STEPS_BH) + fx.Int32(_st)
+                    _imm = g2s_lds_imm(_st, _A4U, _GGRP[1])
+                    gl_off_b.append(
+                        udiv(_j, 8) * fx.Int32(64 * K2B)
+                        + umod(udiv(_j, 4), 2) * fx.Int32(1024)
+                        + umod(_j, 4) * fx.Int32(256)
+                        + _rsrc
+                        - fx.Int32(_imm)
+                    )
         # Operand SRDs/loaders are rebased per-tile (_bind): the tile's row/col base exceeds int32 for large M*K/N*K.
         _ld: dict = {}
 
@@ -2308,6 +2472,8 @@ def _build_mxfp4_gemm_kernel(
                 return
             _ga = dict(lds_step=_GIMM, lds_grp=_GGRP[0])
             _gb = dict(lds_step=_GIMM, lds_grp=_GGRP[1])
+            if const_expr(_A4L):
+                _gb = dict(lds_step=_A4U, lds_grp=_GGRP[1], chunk_stride=_A4U)
             _ld["a_g2s"] = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id, **_ga)
             _ld["bl_g2s"] = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_BH, F8_IR_t, wave_id, **_gb)
             _ld["br_g2s"] = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_BH, F8_IR_t, wave_id, **_gb)
@@ -2502,13 +2668,32 @@ def _build_mxfp4_gemm_kernel(
             br_base6 = [
                 [b_s2r.base_addr(BR_buf[b], s) for s in range_constexpr(N_SUB)] for b in range_constexpr(NBB)
             ]
+            if const_expr(_A4L):
+                # n-fragment ji of lane (l16, kg) = row 4*l16 + ji of the wave's 64 = slot l16 + 16*ji
+                # of block (wave_n, s, kg): ji rides the 256-B ds_read offset.
+                _u = (wave_n * fx.Int32(8) + udiv(lane_id, 16)) * fx.Int32(1024) + umod(
+                    lane_id, 16
+                ) * fx.Int32(16)
+
+                def _a4b(buf, s_):
+                    return fx.Int32(fx.ptrtoint(buf.ptr)) + _u + fx.Int32(s_ * 4 * 1024)
+
+                bl_base6 = [
+                    [_a4b(BL_buf[b], s) for s in range_constexpr(N_SUB)] for b in range_constexpr(NBB)
+                ]
+                br_base6 = [
+                    [_a4b(BR_buf[b], s) for s in range_constexpr(N_SUB)] for b in range_constexpr(NBB)
+                ]
             # Wave-major: a wave owns one contiguous run of the buffer, and buf1's g2s adds a
             # whole k-block in its immediate, so its LDS base comes in that much lower.
-            _gws = (_GIMM * N_LDS_STEPS_A, _GIMM * N_LDS_STEPS_BH) if _GIMM else (1024, 1024)
+            _gws = (
+                (_GIMM * N_LDS_STEPS_A, (_A4U if _A4L else _GIMM) * N_LDS_STEPS_BH) if _GIMM else (1024, 1024)
+            )
             _gsk = _GKSV if _GIMM else 0
             abase6 = [_gbase(A_buf[b], slot=-b * _gsk, wstride=_gws[0]) for b in range_constexpr(NABUF)]
-            blbase6 = [_gbase(BL_buf[b], slot=-b * _gsk, wstride=_gws[1]) for b in range_constexpr(NBB)]
-            brbase6 = [_gbase(BR_buf[b], slot=-b * _gsk, wstride=_gws[1]) for b in range_constexpr(NBB)]
+            _gskb = _GKSVB if _GIMM else 0
+            blbase6 = [_gbase(BL_buf[b], slot=-b * _gskb, wstride=_gws[1]) for b in range_constexpr(NBB)]
+            brbase6 = [_gbase(BR_buf[b], slot=-b * _gskb, wstride=_gws[1]) for b in range_constexpr(NBB)]
         gl_a6 = [fx.Int32(o) for o in gl_off_a]
         gl_b6 = [fx.Int32(o) for o in gl_off_b]
         scv6 = fx.Int32(0x7F7F7F7F)
@@ -2633,16 +2818,16 @@ def _build_mxfp4_gemm_kernel(
                     _ld["a_g2s"].load(A_buf[_pp], a_off + _pp * KSTEP)
             for _pp in range_constexpr(0, _PRELL - 1):
                 if const_expr(KI > _pp):
-                    _ld["bl_g2s"].load(BL_buf[_pp], bl_off + _pp * KSTEP)
-                    _ld["br_g2s"].load(BR_buf[_pp], br_off + _pp * KSTEP)
+                    _ld["bl_g2s"].load(BL_buf[_pp], bl_off + _pp * KSTEP_B)
+                    _ld["br_g2s"].load(BR_buf[_pp], br_off + _pp * KSTEP_B)
 
         def _compute(o, _split=None):
             _, _, a_off, bl_off, br_off, sa_b, sbl_b, sbr_b = o
             accL = [mfma.zero_value] * (N_TILES_A * N_TILES_BH)
             accR = [mfma.zero_value] * (N_TILES_A * N_TILES_BH)
             soff6_a = rocdl.readfirstlane(T.i32, a_off + fx.Int32(_PRELL * KSTEP))
-            soff6_bl = rocdl.readfirstlane(T.i32, bl_off + fx.Int32(_PRELL * KSTEP))
-            soff6_br = rocdl.readfirstlane(T.i32, br_off + fx.Int32(_PRELL * KSTEP))
+            soff6_bl = rocdl.readfirstlane(T.i32, bl_off + fx.Int32(_PRELL * KSTEP_B))
+            soff6_br = rocdl.readfirstlane(T.i32, br_off + fx.Int32(_PRELL * KSTEP_B))
             # VGPR-direct scale soffsets: A-group0 (_soa) and B (_sob) per the wave's
             # region-group id; A-group1 (+64 rows) and BR keep the packed-group soffset.
             _sc1 = _scsoff(sa_b, _SCGA, _SCGA)
@@ -2652,6 +2837,31 @@ def _build_mxfp4_gemm_kernel(
             _soa = rocdl.readfirstlane(T.i32, _wia * fx.Int32(K128) * fx.Int32(512))
             _sob = rocdl.readfirstlane(T.i32, _wib * fx.Int32(K128) * fx.Int32(512))
             sc_soff06 = [_soa, _sc1, _sob, _sc3]
+            _a4_in = None
+            if const_expr(_A4L):
+                # aiter shuffle_scale [rows, K/32]: a 32-row x 256-K block is 256 B, a block row K B.
+                _ab = udiv(sa_b, 32) * fx.Int32(K)
+                _bb = udiv(sbl_b, 32) * fx.Int32(K)
+                sc_soff06 = [
+                    rocdl.readfirstlane(T.i32, _ab),
+                    fx.Int32(0),
+                    rocdl.readfirstlane(T.i32, _bb),
+                    rocdl.readfirstlane(T.i32, _bb + fx.Int32(4 * K)),
+                ]
+                _l16 = umod(lane_id, 16)
+                _kg = udiv(lane_id, 16)
+                _i1 = udiv(umod(_l16, 8), 4)
+                _a4_in = [lane_id * fx.Int32(4) + fx.Int32(_k * K) for _k in range_constexpr(4)]
+                _a4_in.append(
+                    udiv(_l16, 8) * fx.Int32(K)
+                    + (_kg * fx.Int32(16) + umod(_l16, 4) * fx.Int32(4)) * fx.Int32(4)
+                )
+                for _s in range_constexpr(2):
+                    _b = _i1 + fx.Int32(2 * _s)
+                    _a4_in.append(_b + (_b + fx.Int32(4)) * fx.Int32(256) + fx.Int32(0x0C0C0000))
+                    _a4_in.append(
+                        fx.Int32(0x0C0C) + _b * fx.Int32(1 << 16) + (_b + fx.Int32(4)) * fx.Int32(1 << 24)
+                    )
             _sc_rsa_arg = _scrsa_v
             if const_expr(coop):
                 # per-wave group soffset: waves 0/1 -> A region (2*bm + wave_id),
@@ -2688,7 +2898,7 @@ def _build_mxfp4_gemm_kernel(
                 bl_base6,
                 br_base6,
                 a_s2r.tile_stride,
-                b_s2r.tile_stride,
+                256 if _A4L else b_s2r.tile_stride,  # a4w4: n-fragment ji is 256 B on in its column block
                 abase6,
                 blbase6,
                 brbase6,
@@ -2727,6 +2937,7 @@ def _build_mxfp4_gemm_kernel(
                 g2s_step=_GIMM,
                 g2s_grp=_GGRP,
                 kstep_val=_GKSV,
+                **(dict(layout="a4w4", a4w4_in=_a4_in, kstep_val_b=_GKSVB, g2s_step_b=_A4U) if _A4L else {}),
             )
 
         def _cbase(o, _split=None):
@@ -3004,6 +3215,7 @@ def _autotune_mxfp4_config(
     prepacked=False,
     block_n=256,
     block_m=256,
+    layout="fly",
 ):
     """Pick (group_m, group_n, num_xcds) for this (M, N, K, out dtype) by a quick timed
     sweep over ``_mxfp4_swizzle_candidates`` on the real operands; cached per shape
@@ -3014,7 +3226,8 @@ def _autotune_mxfp4_config(
     Skipped (falls back to the static heuristic) during CUDA-graph capture (cannot
     time inside capture). Compiled winners are stashed in _MXFP4_AT_CACHE so the
     subsequent real launch reuses them with no recompile."""
-    key = (M, N, K, row_bytes, out_fp16)
+    _lk = (layout,) if layout != "fly" else ()
+    key = (M, N, K, row_bytes, out_fp16) + _lk
     cached = _MXFP4_CFG_CACHE.get(key)
     if cached is not None:
         return cached
@@ -3054,7 +3267,7 @@ def _autotune_mxfp4_config(
                     out_fp16,
                     False,
                     prepacked,
-                )
+                ) + _lk
                 entry = _MXFP4_AT_CACHE.get(at_key)
                 if entry is None:
                     raw = _get_mxfp4_fused_launch(
@@ -3073,6 +3286,7 @@ def _autotune_mxfp4_config(
                         mn=_mxfp4_mn_specialise(M, N, block_n, block_m),
                         block_n=block_n,
                         block_m=block_m,
+                        layout=layout,
                     )
                     entry = [raw, compile_with_scratch_out(raw, args)]
                     _MXFP4_AT_CACHE[at_key] = entry
@@ -3113,12 +3327,12 @@ def _autotune_mxfp4_config(
         best = (*_mxfp4_nt_config(M, N, K), 10, 9)
     # Time the {TACCW,COOP,both} epilogue twins against the plain winner, keep the fastest.
     best = (*best, False, False)  # append (taccw, coop) = (False, False)
-    _try_var = best_t < float("inf")
+    _try_var = best_t < float("inf") and layout == "fly"
     if _try_var:
         gm0, gn0, xcd0, w0, e0 = best[:5]
         try:
             df_compiled = _MXFP4_AT_CACHE[
-                (M, N, K, gm0, xcd0, gn0, w0, e0, False, False, out_fp16, False, prepacked)
+                (M, N, K, gm0, xcd0, gn0, w0, e0, False, False, out_fp16, False, prepacked) + _lk
             ][1]
             variants = []  # (taccw, coop, compiled)
             for _cp, _tw in ((False, True), (True, False), (True, True)):
@@ -3206,6 +3420,21 @@ def _autotune_mxfp4_config(
 # (M, N, K, row_bytes, out_fp16) -> (mode, ksplit): 0 plain / 1 uniform split / 2 tail split.
 # Timed per shape against the plain launch, so it never regresses one.
 _MXFP4_KSPLIT_CACHE: dict = {}
+
+
+def _mxfp4_load_pinned():
+    """Seed the config / k-split caches with the pinned per-shape picks (``mxfp4_pinned.PINNED``) so those shapes run
+    a fixed, verified kernel with no timed sweep. Off with PRIMUS_TURBO_MXFP4_PINNED=0."""
+    if os.environ.get("PRIMUS_TURBO_MXFP4_PINNED", "1") == "0":
+        return
+    from primus_turbo.flydsl.gemm.mxfp4_pinned import PINNED
+
+    for (M, N, K), (cfg, mode) in PINNED.items():
+        _MXFP4_CFG_CACHE.setdefault((M, N, K, None, False), tuple(cfg))
+        _MXFP4_KSPLIT_CACHE.setdefault((M, N, K, None, False, True), tuple(mode))
+
+
+_mxfp4_load_pinned()
 _MXFP4_MODE_ERRORS: dict = {}  # (M, N, K, mode, ksplit) -> why that arm never reached the race
 
 
@@ -3239,6 +3468,10 @@ def _mxfp4_wave_eff(tiles, ncu):
 # default everywhere; 192 exists only to turn a grid whose dispatch rounds end ragged into one
 # that fills them, and pays a quarter of the tile's area for it.
 _MXFP4_BLOCK_N_ALT = 192
+# OFF: the 192-wide tile races. Under sustained back-to-back calls it returns wrong elements (a different set on most
+# calls; the first calls after compile are usually clean) on shapes that pick it, and never on the 256-wide one;
+# device-wide syncs, the plain launch and #514's row-split fix do not change it.
+_MXFP4_BLOCK_N_ALT_ON = False
 # What the narrow tile also gives up, in k-blocks of its own tile: `_CSTORE` needs
 # ``BLOCK_N // 64 == _MXFP4_PACK_ILV``, so a 192 tile cannot fold its C store into the peel
 # and pays it exposed. That is a per-TILE epilogue, so it is a share of the tile that grows
@@ -3260,7 +3493,7 @@ def _mxfp4_pick_block_n(M, N, K, glu=False):
     put the packed scale group's boundary off the column grid the preshuffle writes.
     """
     bn = _MXFP4_BLOCK_N_ALT
-    if glu or N % bn or M % 256:
+    if not _MXFP4_BLOCK_N_ALT_ON or glu or N % bn or M % 256:
         return 256
     mt, ncu, kb = M // 256, _mxfp4_ncu(), K // 256
     r256 = ceildiv(mt * ceildiv(N, 256), ncu)
@@ -3291,7 +3524,10 @@ def _mxfp4_pick_block_m(M, N, K, glu=False):
 # Tiles one persistent WG walks.  The loop is a range_constexpr, so this is also how many
 # copies of prologue + head + k-loop + peel the module carries; _MXFP4_TPW_KBLK already keeps
 # the long-K rows (whose bodies are the big ones) out of the persistent path entirely.
-_MXFP4_TPW_MAX = 4
+# 1 = one tile per WG (no persistent loop). A persistent grid is one WG per CU, and nothing else co-resides with it
+# (registers, LDS), so whenever a collective holds CUs (e.g. an RCCL all-gather / reduce-scatter overlapping the GEMM)
+# the WGs without a CU wait a whole tpw-long round. PRIMUS_TURBO_MXFP4_TPW_MAX restores the old cap.
+_MXFP4_TPW_MAX = int(os.environ.get("PRIMUS_TURBO_MXFP4_TPW_MAX", "1"))
 _MXFP4_TPW_KBLK = 56  # K/256 above which the per-tile launch is already amortised
 
 
@@ -3309,12 +3545,19 @@ def _mxfp4_tiles_per_wg(n_pids, K, persist):
 
 
 _MXFP4_SPLIT_WS_MAX = 1 << 30  # cap on a candidate's extra partial bytes (device memory)
+# OFF: every split-K variant (uniform and both tails) stores its partials in the output dtype and folds them with bf16
+# adds (`_fold_mxfp4_partials`), two roundings a plain launch's single fp32 sum does not have, so a split launch is not
+# bit-identical to the plain one (8192x3072x12288 picks one when on). Plain only keeps every shape exact; the
+# split variants only ever won where a grid's last dispatch round runs ragged.
+_MXFP4_KSPLIT_ON = False
 
 
 def _ksplit_candidates(M, N, K, block_n=256, block_m=256):
     """Split-K candidates for the timed ksplit autotune, gated on wave quantisation: a tile
     count that is not a whole multiple of the CU count leaves the last round half empty,
     and cutting the contraction is the only knob that makes work for those idle CUs."""
+    if not _MXFP4_KSPLIT_ON:
+        return [1]
     tiles = ceildiv(M, block_m) * ceildiv(N, block_n)
     ncu = _mxfp4_ncu()
     kb = K // 256
@@ -3434,6 +3677,7 @@ def _compile_mxfp4_fused(
     prepacked=False,  # caller supplies scales already in the packed layout: skip the repack
     block_n=256,  # N tile width (see _mxfp4_pick_block_n); sets B's packed scale group too
     block_m=256,  # M tile height (see _mxfp4_pick_block_m); sets A's packed scale group too
+    layout="fly",  # "a4w4": read aiter gemm_a4w4's operand/scale layout (prepacked stub only)
 ):
     """Turbo/mxfp8-style fused @flyc.jit stub: ONE host dispatch enqueues the A scale
     preshuffle, the B scale preshuffle, then the NT GEMM on the same stream (no separate
@@ -3473,7 +3717,9 @@ def _compile_mxfp4_fused(
         persist=True,
         block_n=block_n,
         block_m=block_m,
+        **({"layout": layout} if layout != "fly" else {}),
     )
+    assert layout == "fly" or prepacked, "layout='a4w4' takes its scales as they are (prepacked stub)"
     pre_ab = _build_mxfp4_preshuffle_kernel_ab(
         b_ilv=_bilv,
         byte_src=_sc_row != K128 * 4,
@@ -3836,6 +4082,7 @@ def _get_mxfp4_fused_launch(
     prepacked=False,
     block_n=256,
     block_m=256,
+    layout="fly",
 ):
     lk = (
         K,
@@ -3865,7 +4112,7 @@ def _get_mxfp4_fused_launch(
         epi_activation,
         epi_clamp_limit,
         prepacked,
-    )
+    ) + ((layout,) if layout != "fly" else ())
     launch = _MXFP4_LAUNCH_CACHE.get(lk)
     if launch is None:
         launch = _compile_mxfp4_fused(
@@ -3896,6 +4143,7 @@ def _get_mxfp4_fused_launch(
             epi_activation=epi_activation,
             epi_clamp_limit=epi_clamp_limit,
             prepacked=prepacked,
+            layout=layout,
         )
         _MXFP4_LAUNCH_CACHE[lk] = launch
     return launch
@@ -4168,6 +4416,7 @@ def gemm_mxfp4_flydsl_kernel(
     out: "torch.Tensor | None" = None,
     scales_prepacked: bool = False,
     k: "int | None" = None,
+    layout: str = "fly",
 ) -> torch.Tensor:
     """MXFP4 dense NT GEMM for gfx950: A [M, K] and B [N, K] fp4, C = a @ b^T, M/N/K on 64.
     The contraction comes from ``a_scale``/``b_scale`` (canonical E8M0, [dim, K/32]) and the
@@ -4185,6 +4434,10 @@ def gemm_mxfp4_flydsl_kernel(
             f"got trans_a={trans_a}, trans_b={trans_b}."
         )
 
+    # layout="a4w4": aiter gemm_a4w4's own operands (bpreshuffle): a plain [M, K/2], b shuffle_weight(16, 16)
+    # [N, K/2], a_scale / b_scale shuffle_scale'd [rows, K/32]; requires scales_prepacked=True (taken as they are).
+    assert layout == "fly" or scales_prepacked, "layout='a4w4' needs scales_prepacked=True and k="
+    _lk = (layout,) if layout != "fly" else ()
     M, Kb_a = a.shape
     N, Kb_b = b.shape
     # The true contraction comes from the SCALE and only the row stride from the fp4 tensors, so a caller can seat its rows on the line without a copy.
@@ -4280,7 +4533,7 @@ def gemm_mxfp4_flydsl_kernel(
         # default one-WG-per-tile path (autotuned swizzle / pipe depth / scale-load / wide store).
         target = out if target is None else target
         # The racer keys on the padded extent: keying on the true K would miss on every padded launch.
-        cfg = _MXFP4_CFG_CACHE.get((M, N, Kw, _row_b, out_fp16))
+        cfg = _MXFP4_CFG_CACHE.get((M, N, Kw, _row_b, out_fp16) + _lk)
         if cfg is None:
             cfg = _autotune_mxfp4_config(
                 M,
@@ -4293,6 +4546,7 @@ def gemm_mxfp4_flydsl_kernel(
                 prepacked=scales_prepacked,
                 block_n=_bn,
                 block_m=_bm,
+                **({"layout": layout} if _lk else {}),
             )
         gm, gn, xcd, _wlv, _elgk, _tw, _coop = cfg
         if scales_prepacked:
@@ -4319,9 +4573,25 @@ def gemm_mxfp4_flydsl_kernel(
             mn=_mxfp4_mn_specialise(M, N, _bn, _bm),
             block_n=_bn,
             block_m=_bm,
+            **({"layout": layout} if _lk else {}),
         )
         # row_bytes must be in the artifact key too: one logical shape, two allocations, two kernels.
-        at_key = (M, N, K, _row_b, gm, xcd, gn, _wlv, _elgk, _tw, _coop, out_fp16, accum, scales_prepacked)
+        at_key = (
+            M,
+            N,
+            K,
+            _row_b,
+            gm,
+            xcd,
+            gn,
+            _wlv,
+            _elgk,
+            _tw,
+            _coop,
+            out_fp16,
+            accum,
+            scales_prepacked,
+        ) + _lk
         fused_args = _args_for(target)
         entry = _MXFP4_AT_CACHE.get(at_key)
         if entry is None:
