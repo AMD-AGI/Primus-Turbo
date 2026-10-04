@@ -100,6 +100,13 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("shuffle_scale(Tensor scale, int[] layout) -> Tensor");
     m.def("shuffle_weight(Tensor weight, int[] layout) -> Tensor");
 
+    // ********* Weight de-oscillation *********
+    m.def("weight_deosc_update(Tensor current, Tensor current_qdq, Tensor previous, "
+          "Tensor previous_qdq, Tensor(a!) dist, Tensor(b!) dist_qdq) -> ()");
+    m.def("weight_deosc_close(Tensor(a!) master, Tensor(b!) previous, Tensor current_qdq, "
+          "Tensor(c!) dist, Tensor(d!) dist_qdq, float ratio_threshold, float eps, "
+          "Tensor(e!)? reset_count=None) -> ()");
+
     // ********* Permute (MoE token (un)permute) *********
     m.def("permute_preprocessing(Tensor expert_map, int num_local_experts, int num_topk, "
           "int pad_multiple, int num_permuted_tokens, int probs_topk_stride=0) "
@@ -205,6 +212,10 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("shuffle_scale", shuffle_scale_impl);
     m.impl("shuffle_weight", shuffle_weight_impl);
 
+    // ********* Weight de-oscillation *********
+    m.impl("weight_deosc_update", weight_deosc_update);
+    m.impl("weight_deosc_close", weight_deosc_close);
+
     // ********* Permute *********
     m.impl("permute_preprocessing", permute_preprocessing);
     m.impl("permute", permute);
@@ -265,6 +276,10 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     // ********* Shuffle *********
     m.impl("shuffle_scale", shuffle_scale_impl_meta);
     m.impl("shuffle_weight", shuffle_weight_impl_meta);
+
+    // ********* Weight de-oscillation *********
+    m.impl("weight_deosc_update", weight_deosc_update_meta);
+    m.impl("weight_deosc_close", weight_deosc_close_meta);
 
     // ********* Permute *********
     m.impl("permute_preprocessing", permute_preprocessing_meta);
