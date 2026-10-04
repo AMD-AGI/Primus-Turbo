@@ -33,7 +33,8 @@ void check_same_numel(const at::Tensor &reference, const at::Tensor &tensor, con
 void weight_deosc_qdq(at::Tensor master, at::Tensor previous, at::Tensor previous_qdq,
                       at::Tensor dist, at::Tensor dist_qdq, int64_t rows, int64_t cols,
                       int64_t start, int64_t scale_rounding_mode, bool seed, bool close,
-                      double ratio_threshold, double eps, c10::optional<at::Tensor> reset_count) {
+                      double ratio_threshold, double eps, c10::optional<at::Tensor> reset_count,
+                      bool grouped) {
     const std::vector<at::Tensor> tensors = {master, previous, previous_qdq, dist, dist_qdq};
     for (const auto &tensor : tensors) {
         check_cuda_contiguous(tensor, "deosc_qdq tensor");
@@ -51,6 +52,7 @@ void weight_deosc_qdq(at::Tensor master, at::Tensor previous, at::Tensor previou
                        "snapshots must be bfloat16");
     PRIMUS_TURBO_CHECK(rows > 0 && cols > 0 && rows <= std::numeric_limits<int64_t>::max() / cols,
                        "rows and cols must be positive, without int64 overflow");
+    PRIMUS_TURBO_CHECK(cols % 32 == 0, "cols must be divisible by 32, as in the forward quantizer");
     PRIMUS_TURBO_CHECK(start >= 0 && start <= std::numeric_limits<int64_t>::max() - master.numel(),
                        "invalid shard start or extent");
     PRIMUS_TURBO_CHECK(scale_rounding_mode >= 0 && scale_rounding_mode <= 2,
@@ -76,7 +78,7 @@ void weight_deosc_qdq(at::Tensor master, at::Tensor previous, at::Tensor previou
         dist_qdq.data_ptr<float>(),
         reset_count.has_value() ? reset_count->data_ptr<int64_t>() : nullptr, master.numel(), rows,
         cols, start, static_cast<int>(scale_rounding_mode), seed, close,
-        static_cast<float>(ratio_threshold), static_cast<float>(eps),
+        static_cast<float>(ratio_threshold), static_cast<float>(eps), grouped,
         at::cuda::getCurrentCUDAStream());
 }
 
