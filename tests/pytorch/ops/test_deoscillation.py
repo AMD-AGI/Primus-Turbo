@@ -133,6 +133,8 @@ def _state_like(master):
         (96, 160, 17, 19013),  # Odd start, split matrix and end.
         (64, 64, 4093, 9),  # Straddles experts with almost entirely missing tiles.
         (64, 64, 37, 1),
+        (37, 64, 17, 37 * 64 * 2 - 20),
+        (64, 64, 2, 8192),
         (2880, 2880, 65537, 2880 * 64 + 17),
         (5760, 2880, 5760 * 2880 - 17, 2880 * 96 + 31),
     ],
@@ -155,10 +157,11 @@ def test_direct_qdq_seed_matches_forward(rows, cols, start, n, mode):
 
 @pytest.mark.parametrize("mode", [0, 1, 2])
 @pytest.mark.parametrize("count_enabled", [False, True])
-def test_direct_qdq_multiple_windows_match_reference(mode, count_enabled):
+@pytest.mark.parametrize("start,n", [(31, 8193), (0, 8192), (2, 8192)])
+def test_direct_qdq_multiple_windows_match_reference(mode, count_enabled, start, n):
     gen = torch.Generator(device="cuda").manual_seed(202)
-    master = torch.randn(8193, device="cuda", generator=gen) * 0.01
-    rows, cols, start = 64, 64, 31
+    master = torch.randn(n, device="cuda", generator=gen) * 0.01
+    rows, cols = 64, 64
     state = _state_like(master)
     reference_master = master.clone()
     reference_prev = master.bfloat16()
@@ -222,3 +225,44 @@ def test_direct_qdq_rejects_overlapping_state():
     state = _state_like(master)
     with pytest.raises(RuntimeError):
         weight_deosc_qdq(master, state[0], state[0], state[2], state[3], 32, 32, 0, seed=True)
+
+
+@pytest.mark.parametrize("mode", [0, 1, 2])
+@pytest.mark.parametrize("value", [0.0, 1e-35, 1e-20, 1e20, float("inf"), float("nan")])
+def test_direct_qdq_special_scales(mode, value):
+    master = torch.full((1024,), value, device="cuda")
+    master[1::2].neg_()
+    state = _state_like(master)
+    expected = _reference_qdq(master, 32, 32, 0, mode)
+    weight_deosc_qdq(master, *state, 32, 32, 0, seed=True, scale_rounding_mode=mode)
+    torch.testing.assert_close(state[0], master.bfloat16(), rtol=0, atol=0, equal_nan=True)
+    torch.testing.assert_close(state[1], expected, rtol=0, atol=0, equal_nan=True)
+
+
+def test_direct_qdq_unaligned_contiguous_views():
+    # Tensor contiguity does not imply vector-load alignment.
+    master = torch.randn(8194, device="cuda")[1:-1]
+    previous = torch.empty(8194, device="cuda", dtype=torch.bfloat16)[1:-1]
+    previous_q = torch.empty_like(previous)
+    distance = torch.empty(8194, device="cuda")[1:-1]
+    distance_q = torch.empty_like(distance)
+    expected = _reference_qdq(master, 64, 64, 0, 2)
+    weight_deosc_qdq(
+        master, previous, previous_q, distance, distance_q, 64, 64, 0, seed=True, scale_rounding_mode=2
+    )
+    torch.testing.assert_close(previous_q, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="two GPUs required")
+def test_direct_qdq_uses_tensor_device():
+    with torch.cuda.device(0):
+        master = torch.ones(1024, device="cuda:1")
+        state = _state_like(master)
+        weight_deosc_qdq(master, *state, 32, 32, 0, seed=True)
+        torch.testing.assert_close(state[1], master.bfloat16(), rtol=0, atol=0)
+
+
+def test_direct_qdq_rejects_unaligned_columns():
+    master = torch.ones(1024, device="cuda")
+    with pytest.raises(RuntimeError, match="cols must be divisible by 32"):
+        weight_deosc_qdq(master, *_state_like(master), 32, 61, 0, seed=True)

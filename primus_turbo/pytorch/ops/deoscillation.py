@@ -27,6 +27,7 @@ def weight_deosc_qdq(
     ratio_threshold: float = 4.0,
     eps: float = 1e-12,
     reset_count: Optional[torch.Tensor] = None,
+    grouped: bool = False,
 ) -> None:
     """Fuse local MXFP4 QDQ, tracking, snapshots and optional closure (gfx950).
 
@@ -36,6 +37,8 @@ def weight_deosc_qdq(
     Persistent state tensors have the same number of elements as ``master``.
     ``seed=True`` initializes them without observing movement. No packed FP4,
     scale, transpose, BF16 input or dequantized temporary is materialized.
+    ``cols`` must be divisible by 32. ``grouped=True`` reproduces the batched
+    forward quantizer's row-then-tile NaN reduction; finite inputs are identical.
     """
     torch.ops.primus_turbo_cpp_extension.weight_deosc_qdq(
         master,
@@ -52,6 +55,7 @@ def weight_deosc_qdq(
         ratio_threshold,
         eps,
         reset_count,
+        grouped,
     )
 
 

@@ -104,7 +104,7 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("weight_deosc_qdq(Tensor(a!) master, Tensor(b!) previous, Tensor(c!) previous_qdq, "
           "Tensor(d!) dist, Tensor(e!) dist_qdq, int rows, int cols, int start, "
           "int scale_rounding_mode, bool seed, bool close, float ratio_threshold, float eps, "
-          "Tensor(f!)? reset_count=None) -> ()");
+          "Tensor(f!)? reset_count=None, bool grouped=False) -> ()");
     m.def("weight_deosc_update(Tensor current, Tensor current_qdq, Tensor previous, "
           "Tensor previous_qdq, Tensor(a!) dist, Tensor(b!) dist_qdq) -> ()");
     m.def("weight_deosc_close(Tensor(a!) master, Tensor(b!) previous, Tensor current_qdq, "
