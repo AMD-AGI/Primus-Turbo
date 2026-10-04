@@ -281,7 +281,7 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
         base_l = (bat * Hq + qh) * Sq
         if const_expr(trim):
             # byte address 4*(base_l + q0 + hh*16 + row) split as voffset = 4*row +
-            # soffset = 4*(base_l + q0) + 64*hh (bounds_proof.py A3: same address)
+            # soffset = 4*(base_l + q0) + 64*hh: the same address (bounds_proof.py K3)
             sb = fx.Int32(rocdl.readfirstlane(
                 fx.Int32.ir_type, ((base_l + q0) * fx.Int32(4)).ir_value()))
             for hh in range_constexpr(2):
@@ -817,7 +817,7 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
     def _tdm_kv(kv0p, stage_off):
         """K then V tile [kv0p, kv0p+32) of (bat, hkv) into stage_off / +VOFF: TDM_OPS_KV
         ops. Origin element ((bat*Skv + kv0p)*Hkv + hkv)*D, row stride Hkv*D, outer extent
-        Skv - kv0p >= 32 (kv0p <= (nkvt-1)*32, bounds_proof.py)."""
+        Skv - kv0p >= 32 (kv0p <= (nkvt-1)*32, bounds_proof.py Q1)."""
         row0 = fx.Int64(bat * Skv + kv0p) * fx.Int64(Hkv) + fx.Int64(hkv)
         off_k = row0 * fx.Int64(D_QK)
         off_v = off_k if SAME_D else row0 * fx.Int64(D_V)
