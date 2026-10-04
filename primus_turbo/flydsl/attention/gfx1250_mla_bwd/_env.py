@@ -1,27 +1,18 @@
-"""sys.path / env preamble shared by every module in this job.
+"""sys.path preamble for this kernel tree; import it BEFORE `import flydsl`.
 
-Import this BEFORE `import flydsl` or `import aiter`, from any implementation directory.
-It is duplicated per implementation on purpose: `op/baseline/` must stay importable on its
-own after the framework copies it into `rounds/<n>/op/`.
-
-Order is fixed by runtime.python_path in the spec:
-  $FLYDSL_PATH   flydsl 0.3.4.1 (`pip install --target`), ahead of the image's 0.2.4
-  $AITER_SRC     aiter source checkout, not installed in the container
-NEVER import primus_turbo in this process: its FlyDSL tree imports
-`flydsl.expr.buffer_ops`, which 0.3.2 removed.
+The kernels need flydsl 0.3.4.x. The container image ships 0.2.4 in site-packages, so a
+`pip install --target` copy named by $FLYDSL_PATH is prepended to sys.path. Loaded by path
+under a directory-unique module name (see impl._sibling), so two trees in one process never
+share it. Never import primus_turbo in the same process: its gfx950 FlyDSL tree imports
+`flydsl.expr.buffer_ops`, which 0.3.x removed.
 """
 import os
 import sys
-
-os.environ.setdefault("TORCH_BLAS_PREFER_HIPBLASLT", "0")
 
 for _p in (os.environ.get("FLYDSL_PATH", ""),):
     if _p and os.path.isdir(_p) and _p not in sys.path:
         sys.path.insert(0, _p)
         break
-_aiter = os.environ.get("AITER_SRC", "")
-if _aiter and _aiter not in sys.path:
-    sys.path.insert(0, _aiter)
 
 
 def assert_environment():
