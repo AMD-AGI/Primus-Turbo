@@ -217,3 +217,68 @@ so a Q/dO (K/V) tile streamed by one workgroup is less often still in L2 for the
   0 spill / 0 scratch / 0 lane spill; +36 / +24 / +54 instructions (prologue decode); the hot
   loops of k_dkdv64 are opcode-identical to r3_a's, k_dqg96 loops have 4 / 6 fewer s_set_vgpr_msb,
   k_dqg loops +1 s_set_vgpr_msb / +1 s_delay_alu; WMMA counts equal.
+
+## Round 5 arm bwd_r5_oe3: op-evolve job dsv3-attn-bwd-20261004-073206, round 3 (arm ABx)
+
+Source: the accepted round-3 working copy of the op-evolve bwd job
+`op-evolve/artifacts/dsv3-attn-bwd-20261004-073206/rounds/003/op` (op-evolve clone, branch
+`lhz/dsv3-attn`, HEAD f4a883ae; `artifacts/` is git-ignored there, so the files are pinned by
+sha256 below), copied verbatim on 2026-10-04 11:52 UTC except this section (the job's
+`.OP_SETUP_PROVENANCE.md` describes the job's round-0 baseline setup and was not copied). The tree
+is self-contained: it imports only its own siblings (`_env.py`, `kernels.py`, `impl.py`) by path
+and flydsl from `FLYDSL_PATH`, like every other arm. The job's own records: `rounds/003/1-opt/
+act.yaml` and `opt.md` (round 3), `rounds/003/0-refactor/refactor.md` (h10 rebase onto bwd_r4_a).
+
+    3a8a1f292de77e5b6a14c4cdc32d2905c06ef71efb0a6363050c7c3a86c91fce  kernels.py
+    734a4c595ee59b35af1e36f2744fa79768dde226cab2d028b2bed5264bc3e436  bounds_proof.py
+    e857d065f7d4215ddee23d133a0660ef7cadf7e0399a363064c4b3a2f636438d  impl.py (== bwd_r4_a)
+    1c2d32fb5bcb27120fcd9f2bee32f8a8128425340dcacdb9af4e308ae9452d35  _env.py (== bwd_r4_a)
+    4854b3a3b8818e95403b6bb18695843b8e97d466297d45d8cde0e0a2c678d4db  __init__.py (== bwd_r4_a)
+    3833f5b03f3f7d23ae021a2686875b806e4250f719d233c5f6d8cce008dc5721  PROVENANCE.md (before this section, == bwd_r4_a)
+
+Base: arms/bwd_r4_a (hand champion, hash aa55313a; the job's incumbent after its h10 refactor).
+Only kernels.py and bounds_proof.py differ. Three changes, all instruction placement (no data,
+WMMA order or launch change; outputs bitwise identical to bwd_r4_a per the job's validation):
+
+- r2.i3.g06 (k_dqg96, nwave > 1): the 24 K^T `ds_load_tr16_b128` of the dQ B operands are issued
+  as one burst at the step top, after the TDM and an explicit `s_wait_dscnt(0)` that retires the
+  carried readback, so they drain under the kt0/kt1 S/dP WMMAs instead of at the `_wg_sync`
+  dscnt 0 (one WMMA<->memory switch, as before). PMC: k_dqg96 cycles -10.2% at prod.
+- r2.i4.g07 (k_dkdv64, nw > 1): the Q/dO prefetch is issued for tile min(ii+3, n-1) into stage
+  ii%3 right after BARRIER(ii), behind the readback (`sched_barrier` mask 0x004: only SALU may
+  cross), instead of tile ii+2 at the loop top; its counters / address SALU (`_tdm_qdo_prep`) are
+  emitted inside the kh0 WMMA run, placed by `sched_group_barrier` as 20 x {1 WMMA, KH0_SALU = 2
+  SALU}; the LSE/delta loads for it+1 stay at the top; the prologue fills stage 2 (tile
+  min(2, n-1)) after its RAW barrier. bounds_proof's K2/K6 ring replay follows the new schedule.
+- `rocdl.disable_xdl_arb_stall()` (SCHED_MODE.DISABLE_XDL_ARB_STALL) at the top of k_dkdv64 and
+  k_dqg96.
+
+Job measurements (benchmark.py, contiguous launch, same process as the incumbent): prod 3.86355
+vs 3.89926 ms (0.9908x), proxy 0.9545x, fast 0.9513x; compile-only k_dkdv64 865 VGPR / 102 SGPR
+(code_sha e5fcfc7b0b6921ab), k_dqg96 872 / 68 (2a2a5d5f4b667478), k_dqg 709 / 68 and k_delta
+unchanged (4c3cd3d5b464dc92, 69e06c22a4d3bb22); 0 spill / 0 scratch. Finding: the bwd is on the
+power wall (zeros inputs 23.6% faster at prod at the same hwmon sclk, cycles equal to 0.7%);
+removed stall cycles convert to time at ~0.2 at prod, ~0.6-0.7 at proxy.
+
+## Round 5 arm bwd_r5_oe4: op-evolve job dsv3-attn-bwd-20261004-073206, round 4 (arm A, r3.i1.g08)
+
+Source: the accepted round-4 working copy `op-evolve/artifacts/dsv3-attn-bwd-20261004-073206/rounds/004/op`
+(op-evolve clone `lhz/dsv3-attn` HEAD f4a883ae; `artifacts/` git-ignored there), copied verbatim on
+2026-10-04 12:50 UTC; this PROVENANCE.md = bwd_r5_oe3's (the job's own file is bwd_r4_a's verbatim,
+sha256 3833f5b0...) plus this section. Records: `rounds/004/1-opt/act.yaml`, `opt.md`.
+
+    afd473ae4eb0a258106c56c9e8f2a4cf4c067af99fe4dd88dea83119c9eb143e  kernels.py
+    734a4c595ee59b35af1e36f2744fa79768dde226cab2d028b2bed5264bc3e436  bounds_proof.py (== bwd_r5_oe3)
+    impl.py / _env.py / __init__.py == bwd_r5_oe3 == bwd_r4_a
+
+Base: bwd_r5_oe3 (the job's round-3 champion). One change, kernels.py `_dkdv_impl._body` (both
+loops of k_dkdv64): softmax/dS in k_dqg96's FMA form, p = exp2(fma(s, scale*LOG2E, -lse*LOG2E)),
+ds = bf16(p * fma(dp, scale, -delta*scale)) with scale*LOG2E hoisted: 3 packed ops per element
+pair instead of 6 (full loop 633 -> 592 instructions). dq is bitwise equal to bwd_r5_oe3's; dk/dv
+differ by bf16 rounding of P and dS (max abs 1.56e-2 at prod), SQNR unchanged to 0.01 dB.
+
+Job measurements: prod 3.82048 vs round 3 3.85776 ms (0.9903x, same session; mean 0.9921x over
+four sessions), proxy 0.9967x, fast void. Compile-only: k_dkdv64 861 VGPR / 107 SGPR with 16
+SGPR->VGPR-lane spills (32 readlane/writelane, all between the two loops, none in a loop body;
+code_sha 7b0c1b65963ad347), k_dqg96 2a2a5d5f4b667478, k_dqg 4c3cd3d5b464dc92, k_delta
+69e06c22a4d3bb22 (= bwd_r5_oe3); 0 VGPR spill / 0 scratch.

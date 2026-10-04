@@ -121,6 +121,11 @@ EPI_W = NKV * (D_V + D_QK) * EPI_CB          # one wave's dV + dK epilogue image
 DKDV_NW = 2
 PDS_B = 2 * 32 * S_ROW_B     # one wave's P + dS tiles (5120 B)
 BAR_KH = NKV // 2            # k_dkdv64 full loop: the ring barrier sits before kv sub-tile BAR_KH's WMMAs
+# k_dkdv64 full loop: the Q/dO prefetch (tile it+3 -> stage it%3) is issued after BARRIER(it)
+# behind the readback; its scalar math rides the kh0 WMMA run, KH0_SALU SALU per WMMA
+# (sched_group_barrier), and SALU (only) may cross the fence between the readback and the TDM.
+KH0_SALU = 2
+KB_SALU_MASK = 0x004         # llvm.amdgcn.sched.barrier mask: SALU may be scheduled across
 assert TDM_DEPTH * QDO_B <= LDS_SEG, "the Q/dO ring must stay inside LDS segment 0"
 assert DKDV_NW * EPI_W <= TDM_DEPTH * QDO_B, "epilogue images must fit the dead ring"
 assert 32 % DKDV_NW == 0 and (DKDV_NW & (DKDV_NW - 1)) == 0, "TDM num_warps splits 32 rows evenly"
@@ -369,6 +374,7 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
     rsrc_lse = rocdl.get_buffer_rsrc(fx.get_iter(g_lse))
     rsrc_del = rocdl.get_buffer_rsrc(fx.get_iter(g_del))
     voff_l = row * fx.Int32(4)
+    c1_sm = scale * fx.Float32(LOG2E)           # softmax exp2 multiplier, hoisted (see _body)
 
     def _ldl(qt, gh, trim=True):
         """The 4 LSE/delta loads (hh x {lse, delta}) of query pair qt, q head hkv*G+gh,
@@ -407,7 +413,8 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
     _q_rs_v = Hq * fx.Int32(D_V)                # elements between consecutive do rows
     _q_rs_k = _q_rs_v if SAME_D else Hq * fx.Int32(D_QK)
 
-    def _tdm_qdo(qt, gh, stage_off):
+    def _tdm_qdo_prep(qt, gh, stage_off):
+        """The scalar address math of one stage's TDM (emitted where it is called)."""
         qh = hkv * G + gh
         q0 = qt * fx.Int32(32)
         row0 = fx.Int64(bat * Sq + q0) * fx.Int64(Hq) + fx.Int64(qh)
@@ -416,9 +423,16 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
         valid = Sq - q0
         lb_v = _lds0 + stage_off
         lb_k = _lds0 + stage_off + fx.Int32(QOFF)
+        return (off_v, off_k, valid, lb_v, lb_k)
+
+    def _tdm_qdo_issue(p):
+        off_v, off_k, valid, lb_v, lb_k = p
         # nw > 1: cooperative, wave w moves rows [16w, 16w + 16) (own tensorcnt)
         _tdm_rows(DO, off_v, D_V, 32, valid, _q_rs_v, lb_v, _lds_bf_ty, nw)
         _tdm_rows(Q, off_k, D_QK, 32, valid, _q_rs_k, lb_k, _lds_bf_ty, nw)
+
+    def _tdm_qdo(qt, gh, stage_off):
+        _tdm_qdo_issue(_tdm_qdo_prep(qt, gh, stage_off))
 
     # K and V fragments of this kv tile are invariant over every query and every q head.
     kf = [[gfrag(g_k, base_k, rs_k, kv0 + fx.Int32(kh * 16), dt) for dt in range(NDT_QK)]
@@ -480,17 +494,26 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
         return out
 
     def _body(acc, pre, qt, gh, do_mask, qt_n, gh_n, carry=True,
-              cur_off=None, nxt_off=None, pf_qt=None, pf_gh=None, qd=None, rb_off=None):
+              cur_off=None, nxt_off=None, pf_qt=None, pf_gh=None, qd=None, rb_off=None,
+              pf3=None):
         q0 = qt * fx.Int32(32)
 
         # carry=True (qloop_full): this iteration's S/dP B operands arrive in VGPRs (qd),
-        # read back from stage it%3 during iteration it-1 (or by the prologue). The TDM for
-        # iteration it+2 goes into stage (it+2)%3 == (it-1)%3 at the top, with NO wait: that
-        # stage's last readers (tr16 of it-1, readback in it-2) were consumed by WMMAs of
-        # it-1, hence retired. The tensor wait sits at the readback below.
+        # read back from stage it%3 during iteration it-1 (or by the prologue).
+        # nw = 1: the TDM for iteration it+2 goes into stage (it+2)%3 == (it-1)%3 at the top,
+        # with NO wait: that stage's last readers (tr16 of it-1, readback in it-2) were
+        # consumed by WMMAs of it-1, hence retired. The tensor wait sits at the readback below.
+        # nw > 1 (k_dkdv64): no TDM at the top. The prefetch of tile it+3 into stage it%3 is
+        # issued right after BARRIER(it), behind the readback (see there); only its scalar
+        # address math is emitted in the kh0 run below, where SALU between WMMAs is free.
         # carry=False (qloop_mask): load its own tile into stage 0 and wait for it.
         rb_base = None
-        if const_expr(carry):
+        if const_expr(carry and nw > 1):
+            # the LSE/delta prefetch for it+1 stays at the top: it needs ~1.4k cycles before
+            # its back-edge copy
+            rocdl.sched_barrier(0)
+            nxt = _ldl(qt_n, gh_n)
+        elif const_expr(carry):
             # TDM first, then the LSE/delta prefetch: their soffset SGPRs are then not
             # recycled by the TDM descriptor SALU right after the loads.
             rocdl.sched_barrier(0)
@@ -531,6 +554,10 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
             q_glob = q0 + fx.Int32(hh * 16) + row
             lse_q = pre[hh * 2][0]
             del_q = pre[hh * 2 + 1][0]
+            # softmax/dS in k_dqg96's FMA form (_smx): p = exp2(fma(s, scale*LOG2E, -lse*LOG2E)),
+            # ds = bf16(p * fma(dp, scale, -delta*scale)) -- 3 packed ops per element pair, not 6
+            nl_q = lse_q * fx.Float32(-LOG2E)
+            nd_q = del_q * (fx.Float32(0.0) - scale)
             for kh in range_constexpr(NKV):
                 s_acc = _ir(fx.Vector.filled(8, 0.0, fx.Float32))
                 p_acc = _ir(fx.Vector.filled(8, 0.0, fx.Float32))
@@ -546,18 +573,17 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
                 sv, pv_ = fx.Vector(s_acc), fx.Vector(p_acc)
                 # causal, BOTTOM-RIGHT: query q attends kv <= q + (Skv - Sq).
                 kvb = kv0 + fx.Int32(kh * 16) + half * fx.Int32(8)
+                tt = [fx.Float32(fx.fma(sv[si], c1_sm, nl_q)) for si in range(8)]
                 if const_expr(do_mask):
-                    masked = [
+                    tt = [
                         ((kvb + fx.Int32(si) > q_glob + cshift)
                          & (causal != fx.Int32(0))
-                         ).select(fx.Float32(NEG), sv[si] * scale)
+                         ).select(fx.Float32(NEG), tt[si])
                         for si in range(8)
                     ]
-                else:
-                    masked = [sv[si] * scale for si in range(8)]
-                pf = [_exp2((masked[si] - lse_q) * fx.Float32(LOG2E)) for si in range(8)]
+                pf = [_exp2(tt[si]) for si in range(8)]
                 p_l = [x.to(fx.BFloat16) for x in pf]
-                ds_l = [(pf[si] * (pv_[si] - del_q) * scale).to(fx.BFloat16)
+                ds_l = [(pf[si] * fx.Float32(fx.fma(pv_[si], scale, nd_q))).to(fx.BFloat16)
                         for si in range(8)]
                 off = ((fx.Int32(hh * 16) + row) * fx.Int32(S_ROW_B)
                        + fx.Int32(kh * 32) + half * fx.Int32(16))
@@ -634,20 +660,31 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
             rocdl.sched_barrier(0)
             rb = _rdqd(rb_off, rb_base)
         rocdl.sched_barrier(0)
+        tdm_p = None
+        if const_expr(carry and nw > 1):
+            # k_dkdv64: the counters and address math of the prefetch (tile it+3 into stage
+            # it%3), emitted inside the kh0 run's scheduling region; the sched_group_barriers
+            # after the kh0 WMMAs place them between those WMMAs.
+            pq, pg = pf3()
+            tdm_p = _tdm_qdo_prep(pq, pg, cur_off)
         new = [None] * NST
         for kh in range_constexpr(NKV):
             if const_expr(carry and nw > 1 and kh == BAR_KH):
                 # k_dkdv64: the ring barrier, after the WMMAs of kv sub-tiles < BAR_KH (their
                 # run hides the drain of this iteration's tr16 reads). tensor_wait retires
-                # this wave's half of stage (it+1)%3; the barrier's release fence drains its
-                # DS reads of stage it%3 (WAR for the TDM at the top of it+1); after it every
-                # wave's half of (it+1)%3 is in LDS, so the readback may start.
+                # this wave's half of stage (it+1)%3; the barrier's release fence drains every
+                # wave's DS reads of stage it%3 (WAR for the prefetch below); after it every
+                # wave's half of (it+1)%3 is in LDS, so the readback may start. Then the
+                # prefetch of tile it+3 into stage it%3 (read again only after BARRIER(it+2)),
+                # in the same memory window as the readback: one WMMA<->memory switch.
                 rocdl.sched_barrier(0)
                 tdm_ops.tensor_wait(TW_QDO)
                 rocdl.sched_barrier(0)
                 _lds_barrier()
                 rocdl.sched_barrier(0)
                 rb = _rdqd(rb_off, rb_base)
+                rocdl.sched_barrier(KB_SALU_MASK)   # readback before the TDM; SALU may cross
+                _tdm_qdo_issue(tdm_p)
                 rocdl.sched_barrier(0)
             a_p = a_pk[kh]
             a_ds = a_dsk[kh]
@@ -661,6 +698,11 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
                 new[DK0 + kh * NDO_QK + dtile] = rocdl.wmma_f32_16x16x32_bf16(
                     v8f, _ir(a_ds), _ir(b_q[dtile]), acc[DK0 + kh * NDO_QK + dtile],
                     reuseA=(dtile > 0), reuseB=False).result
+            if const_expr(carry and nw > 1 and kh + 1 == BAR_KH):
+                # {1 WMMA, KH0_SALU SALU} per kh0 WMMA: the prefetch's scalar math rides the run
+                for _ in range_constexpr(BAR_KH * (NDO_V + NDO_QK)):
+                    rocdl.sched_group_barrier(0x008, 1, 0)
+                    rocdl.sched_group_barrier(0x004, KH0_SALU, 0)
         if const_expr(carry):
             # Fence the dK/dV WMMAs off from the back-edge copies of the LSE/delta prefetch,
             # so their s_wait_loadcnt sits at the END of the body.
@@ -703,21 +745,39 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
             live = jj < n                              # else jj clamps to n-1 == ii
             qj = fx.Int32(live.select(qn, qi))
             gj = fx.Int32(live.select(gn, gh))
-            q2, g2 = _wrap(qn, gn)                     # decomposition of ii+2
-            live2 = (ii + fx.Int32(2)) < n             # else kk clamps to n-1 == jj
-            pf_qt = qt0 + fx.Int32(live2.select(q2, qj))
-            pf_gh = fx.Int32(live2.select(g2, gj))
-            # prefetch stage (ii+2)%3 == (ii-1)%3: the stage before cur
-            nxo = fx.Int32((cur == fx.Int32(0)).select(
-                fx.Int32(2 * QDO_B), cur - fx.Int32(QDO_B)))
             # (ii+1)%3: next iteration's stage == this iteration's readback stage
             ncur = fx.Int32((cur == fx.Int32(2 * QDO_B)).select(
                 fx.Int32(0), cur + fx.Int32(QDO_B)))
-            res = _body(st[:NST], [fx.Vector(v) for v in st[NST:NST + 4]],
-                        qt0 + qi, gh, False,
-                        qt0 + qj, gj, True,
-                        cur, nxo, pf_qt, pf_gh,
-                        [fx.Vector(v) for v in st[NST + 4:-3]], ncur)
+            if const_expr(nw > 1):
+                # k_dkdv64: the prefetch tile is min(ii+3, n-1), issued after BARRIER(ii) into
+                # stage ii%3 == cur; _body emits these counters inside its kh0 run.
+                def _pf3(qn=qn, gn=gn, qj=qj, gj=gj, ii=ii):
+                    q2, g2 = _wrap(qn, gn)             # decomposition of ii+2
+                    live2 = (ii + fx.Int32(2)) < n     # else clamps to min(ii+1, n-1)
+                    q2c = fx.Int32(live2.select(q2, qj))
+                    g2c = fx.Int32(live2.select(g2, gj))
+                    q3, g3 = _wrap(q2, g2)             # decomposition of ii+3
+                    live3 = (ii + fx.Int32(3)) < n     # else clamps to min(ii+2, n-1)
+                    return (qt0 + fx.Int32(live3.select(q3, q2c)),
+                            fx.Int32(live3.select(g3, g2c)))
+                res = _body(st[:NST], [fx.Vector(v) for v in st[NST:NST + 4]],
+                            qt0 + qi, gh, False,
+                            qt0 + qj, gj, True,
+                            cur, None, None, None,
+                            [fx.Vector(v) for v in st[NST + 4:-3]], ncur, pf3=_pf3)
+            else:
+                q2, g2 = _wrap(qn, gn)                 # decomposition of ii+2
+                live2 = (ii + fx.Int32(2)) < n         # else kk clamps to n-1 == jj
+                pf_qt = qt0 + fx.Int32(live2.select(q2, qj))
+                pf_gh = fx.Int32(live2.select(g2, gj))
+                # prefetch stage (ii+2)%3 == (ii-1)%3: the stage before cur
+                nxo = fx.Int32((cur == fx.Int32(0)).select(
+                    fx.Int32(2 * QDO_B), cur - fx.Int32(QDO_B)))
+                res = _body(st[:NST], [fx.Vector(v) for v in st[NST:NST + 4]],
+                            qt0 + qi, gh, False,
+                            qt0 + qj, gj, True,
+                            cur, nxo, pf_qt, pf_gh,
+                            [fx.Vector(v) for v in st[NST + 4:-3]], ncur)
             res = res + [fx.as_ir_value(ncur), fx.as_ir_value(qn), fx.as_ir_value(gn)]
             final = yield res
         return final
@@ -726,7 +786,9 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
         """Fill stages 0..1 for qloop_full's first two iterations: stage 0 gets iteration 0's
         tile (qt0, gh 0), stage 1 iteration min(1, n-1)'s, clamped to a legal query pair, so
         an empty or 1-iteration loop still issues only in-bounds tiles (never read). Then
-        retire stage 0 and read back iteration 0's B operands."""
+        retire stage 0 and read back iteration 0's B operands. nw > 1 (k_dkdv64): then also
+        stage 2 <- tile min(2, n-1) -- the prefetch the full loop's iteration 0 no longer
+        issues -- after the RAW barrier, so only one stage is in flight at that barrier."""
         if const_expr(nw > 1):
             # WAR: every wave's reads of stage 0 in the masked loop retired
             rocdl.sched_barrier(0)
@@ -745,7 +807,17 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
         if const_expr(nw > 1):
             _lds_barrier()                    # RAW: every wave's half of stage 0 landed
             rocdl.sched_barrier(0)
-        return [_ir(v) for v in _rdqd(fx.Int32(0))]
+        rb0 = _rdqd(fx.Int32(0))
+        if const_expr(nw > 1):
+            # j2 = min(2, n-1) (>= 0): 2 == wrap(wrap(0, 0)) iff n > 2, else j1
+            q2w, g2w = _wrap(q1w, g1w)
+            three = fx.Int32(2) < n
+            q2 = fx.Int32(three.select(q2w, q1))
+            g2 = fx.Int32(three.select(g2w, g1))
+            rocdl.sched_barrier(0)            # readback before the TDM (one region, R4 order)
+            _tdm_qdo(_clampqt(qt0 + q2), g2, fx.Int32(2 * QDO_B))
+            rocdl.sched_barrier(0)
+        return [_ir(v) for v in rb0]
 
     # Query pair `qt` is fully unmasked iff this workgroup's LARGEST key index is attended
     # by the pair's SMALLEST query: kv0g + nw*BLOCK_KV-1 <= qt*32 + cshift, i.e.
@@ -860,6 +932,7 @@ def k_dkdv64(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, DO: fx.Tensor,
              scale: fx.Float32, Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32,
              G: fx.Int32, nqt: fx.Int32, cshift: fx.Int32, causal: fx.Int32, B_: fx.Int32,
              HG: fx.Int32):
+    rocdl.disable_xdl_arb_stall()  # lock_simd (SCHED_MODE.DISABLE_XDL_ARB_STALL), round 2 probe P1
     _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK, scale, Sq, Skv, Hq, Hkv,
                G, nqt, cshift, causal, B_, DKDV_NW, HG)
 
@@ -1143,6 +1216,18 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
         rocdl.sched_barrier(0)
         _tdm_kv(pf_kv0, nxo)
         rocdl.sched_barrier(0)
+        if const_expr(nwave > 1):
+            # k_dqg96: the dQ B operands (K^T of stage cur) as ONE tr16 burst at the step top,
+            # beside the TDM (one WMMA<->memory switch, as before), so they drain under the kt0/kt1
+            # WMMAs instead of at the _wg_sync dscnt 0. Stage cur was published by the previous
+            # step's _wg_sync and is next re-targeted by the TDM at the top of i+1, after this
+            # step's _wg_sync (dscnt 0 + barrier): same data, same WMMA order. The explicit wait
+            # retires the carried readback `pre` (issued a whole dQ run ago) so the backend never
+            # charges the burst to the first kt0 WMMA.
+            # UNSTABLE(gfx1250): s_wait_dscnt
+            rocdl.s_wait_dscnt(0)
+            b_ks = _bks(cur)
+            rocdl.sched_barrier(0)
         sp_acc = []
         ds_halves = [[] for _ in range_constexpr(NQW)]
         for kt in range_constexpr(NKT):
@@ -1169,9 +1254,9 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
         s1, p1 = sp_acc[1]
         # the DS phase
         rocdl.sched_barrier(0)
-        b_ks = _bks(cur)
-        rocdl.sched_barrier(0)
         if const_expr(nwave == 1):
+            b_ks = _bks(cur)
+            rocdl.sched_barrier(0)
             tdm_ops.tensor_wait(DQT_TW)
             rocdl.sched_barrier(0)
             rb = _rdkv(ncur)
@@ -1179,10 +1264,11 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
             ds_halves[0].append(_smx(fx.Vector(s1[0]), fx.Vector(p1[0]), 0, 1, kv0, False))
             rocdl.sched_barrier(0)
         else:
-            # k_dqg96: softmax/dS (kt1, qh 0) covers the tr16 latency, then this wave's half
-            # of stage ncur retires (tensor_wait), the tr16 drains and the workgroup syncs
-            # (_wg_sync): both halves of ncur landed, every wave's reads of stage cur retired
-            # (the TDM at the top of i+1 targets it). Only then the readback of ncur.
+            # k_dqg96: softmax/dS (kt1, qh 0), then this wave's half of stage ncur retires
+            # (tensor_wait) and the workgroup syncs (_wg_sync; the step-top tr16 burst drained
+            # under the S/dP WMMAs, so its dscnt 0 finds nothing in flight): both halves of ncur
+            # landed, every wave's reads of stage cur retired (the TDM at the top of i+1 targets
+            # it). Only then the readback of ncur.
             ds_halves[0].append(_smx(fx.Vector(s1[0]), fx.Vector(p1[0]), 0, 1, kv0, False))
             rocdl.sched_barrier(0)
             tdm_ops.tensor_wait(DQT_TW)
@@ -1386,6 +1472,7 @@ def k_dqg96(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, DO: fx.Tensor, O: fx.Tenso
             scale: fx.Float32, Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32,
             G: fx.Int32, nkvt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
             q_off: fx.Int32, ntile: fx.Int32, HG: fx.Int32):
+    rocdl.disable_xdl_arb_stall()  # lock_simd (SCHED_MODE.DISABLE_XDL_ARB_STALL), round 2 probe P1
     _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G,
                   nkvt, cshift, causal, q_off, ntile, NQW48, DQ_NWAVE, HG)
 

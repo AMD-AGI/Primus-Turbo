@@ -15,7 +15,9 @@ waves per workgroup, grid (Hkv, Skv/64, B), wave w owns kv rows kv0g + 32w + [0,
       segment inside q / do; LDS data writes inside their stage image, the waves' slices and
       the segments tile each image row's [0, 2D) and all 32 rows exactly, ring in segment 0.
   K2  k_dkdv ring schedule with TDM_OPS_QDO ops per stage per wave (each wave its own
-      tensorcnt) and waits TW_QDO / 0 (in-order retirement), replayed for both waves.
+      tensorcnt) and waits TW_QDO / 0 (in-order retirement), replayed for both waves. The full
+      loop prefetches tile min(ii+3, n-1) into stage ii%3 right after BARRIER(ii) (behind the
+      readback); the prologue fills stages 0, 1 before its RAW barrier and stage 2 after it.
   K3  k_dkdv LDS reads (readback, tr16, P/dS) inside written bytes; DS immediates < 64 KiB;
       per-wave P/dS tiles and epilogue images disjoint, inside the allocation / dead ring;
       K/V fragment and LSE/delta loads in bounds (each wave its own kv rows).
@@ -466,7 +468,8 @@ def dkdv_shape(B, Sq, Skv, Hq, Hkv, causal, written_kv):
                 n = G * (nqp_eff - nmaskp)
                 qt0 = qp_start + nmaskp
                 ldl(clampqt(qt0), 0)
-                # prologue: BARRIER, tile(0) -> s0, tile(min(1, n-1)) -> s1, wait, BARRIER, read s0
+                # prologue: BARRIER, tile(0) -> s0, tile(min(1, n-1)) -> s1, wait, BARRIER, read s0,
+                # then tile(min(2, n-1)) -> s2 (the prefetch full iteration 0 no longer issues)
                 ring.barrier()
                 ring.issue(0, tdm(clampqt(qt0), 0, 0))
                 q1w, g1w = wrap(0, 0, G)
@@ -475,6 +478,10 @@ def dkdv_shape(B, Sq, Skv, Hq, Hkv, causal, written_kv):
                 ring.wait(TW_QDO)
                 ring.barrier()
                 ring.read(0, (clampqt(qt0), 0))
+                q2w, g2w = wrap(q1w, g1w, G)
+                q2p, g2p = (q2w, g2w) if 2 < n else (q1, g1)
+                ok((q2p, g2p) == divmod(max(min(2, n - 1), 0), G), "K4", "prologue stage-2 tile == min(2, n-1)")
+                ring.issue(2, tdm(clampqt(qt0 + q2p), g2p, 2))
                 cur, qi, gh = 0, 0, 0
                 for ii in range(n):
                     ok((qi, gh) == divmod(ii, G), "K4", "full-loop counters")
@@ -482,18 +489,19 @@ def dkdv_shape(B, Sq, Skv, Hq, Hkv, causal, written_kv):
                     qn, gn = wrap(qi, gh, G)
                     qj, gj = (qn, gn) if ii + 1 < n else (qi, gh)
                     q2, g2 = wrap(qn, gn, G)
-                    pf = (q2, g2) if ii + 2 < n else (qj, gj)
-                    kk = min(ii + 2, n - 1)
-                    ok(pf == divmod(kk, G), "K4", "prefetch counters == min(ii+2, n-1)")
-                    nxo = 2 if cur == 0 else cur - 1
+                    pf2 = (q2, g2) if ii + 2 < n else (qj, gj)
+                    q3, g3 = wrap(q2, g2, G)
+                    pf = (q3, g3) if ii + 3 < n else pf2
+                    kk = min(ii + 3, n - 1)
+                    ok(pf == divmod(kk, G), "K4", "prefetch counters == min(ii+3, n-1)")
                     ncur = 0 if cur == 2 else cur + 1
-                    ok(nxo == (ii + 2) % 3 and ncur == (ii + 1) % 3 and st == ii % 3, "K2", "stage rotation")
-                    ring.issue(nxo, tdm(qt0 + pf[0], pf[1], nxo))   # top of the body, no wait
-                    ldl(qt0 + qj, gj)
+                    ok(ncur == (ii + 1) % 3 and st == ii % 3, "K2", "stage rotation")
+                    ldl(qt0 + qj, gj)                    # LSE/delta prefetch at the top
                     ring.read(st, (qt0 + qi, gh))       # tr16 of this iteration's stage
                     ring.wait(TW_QDO)                    # after the WMMAs of kv sub-tiles < BAR_KH
                     ring.barrier()
                     ring.read(ncur, (qt0 + qj, gj))      # readback for ii+1 (min(ii+1, n-1))
+                    ring.issue(st, tdm(qt0 + pf[0], pf[1], st))   # prefetch ii+3 -> stage ii%3, after BARRIER(ii)
                     cur, qi, gh = ncur, qn, gn
                 ring.wait(0)
                 ring.barrier()                           # epilogue barrier
