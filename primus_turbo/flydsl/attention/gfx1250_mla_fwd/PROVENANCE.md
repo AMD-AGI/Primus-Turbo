@@ -28,8 +28,13 @@ b2 s4096 h128, bf16, causal):
    unscaled, `c = softmax_scale * log2(e)` in fp32 is the multiplier of the exp2 FMA
    `p = exp2(fma(s, c, -m))`, the running max is carried in log2 units, and
    `lse = (m + log2(l)) * ln(2)`. o 54.5 dB, lse 145 dB, the same as aiter's ASM kernel.
-5. `RESCALE_THRESHOLD = 0.0`: exact running max (with the deferred-rescale threshold of 8 the
-   dominant P weight is no longer exactly 1.0 when rounded to bf16 for the PV GEMM: o 53.2 dB
-   instead of 54.5 dB at b2 s4096 h128).
+5. `RESCALE_THRESHOLD = 1.0` (aiter: 8.0): the running max may stay stale by at most one
+   natural-log unit. With 8 the dominant P weight is no longer exactly 1.0 when rounded to bf16
+   for the PV GEMM (o 53.2 dB at b2 s4096 h128); 1.0 keeps o at 54.2 dB and is 1.4% faster than
+   an exact max (0.0) on random inputs, 3.3% on DeepSeek-V3 training activations.
 6. Only the `m32x8` kernel is kept (the `m32x2` small-grid and `m16x8` variants carried the same
    bf16-scale issue and are never selected at head dim 192).
+7. `MODULE_KNOBS`: FlyDSL keys its compile cache by function sources and closure scalars, not by
+   module globals, so builds differing only in a module-level knob (such as item 5) would share a
+   cached binary. Both kernels reference a closure tuple of every module-level scalar knob, which
+   puts their values into the key. Codegen is unchanged (same ISA hash as without it).

@@ -169,7 +169,7 @@ MIN_KV_BLK_BYTES = 64 * 1024
 # max leaves the dominant P weight != 1.0 in bf16: CPU emulation at the DSV3 scale gives o
 # 53.2-53.6 dB with r16's 8.0 vs 54.5-54.6 dB with 0.0 (= ASM/Triton), bench/emu_fwd_c0.py.
 ENABLE_DEFER_RESCALE = True
-RESCALE_THRESHOLD = 0.0
+RESCALE_THRESHOLD = 1.0  # fwd_c0t9: bounded stale max (bench/emu_fwd_c0.py sweep)
 
 # r6 g14: speculative stale-max softmax. Common path: p = exp(S - m_prev) straight away (no row-max
 # tree, no permlane, no corr exp) -- exactly the deferred path above whenever it does not fire. A
@@ -256,6 +256,16 @@ def _load_sink_logit(ptr_sink, q_head_idx, num_heads_q):
     addr = sink_base_i64 + byte_off
     gptr = create_llvm_ptr(addr, address_space=1)
     return fx.Float32(llvm_dialect.load(T.f32, gptr))
+
+
+def _module_knobs():
+    """Every module-level scalar knob of this file, as a tuple the kernel closures capture."""
+    g = globals()
+    return tuple(
+        (n, g[n])
+        for n in sorted(g)
+        if n.isupper() and isinstance(g[n], (bool, int, float, str)) and not n.startswith("_")
+    )
 
 
 def _lpt_block_id(axis):
@@ -1636,6 +1646,11 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
         n_block in N_BLOCK_CHOICES
     ), f"n_block must be in {N_BLOCK_CHOICES}, got {n_block}"
 
+    # FlyDSL's JIT cache key hashes function sources and closure scalars, not module globals:
+    # two builds that differ only in a module-level knob (e.g. RESCALE_THRESHOLD) would share
+    # a cached binary. Every kernel below references MODULE_KNOBS, which puts the knobs'
+    # values into the key.
+    MODULE_KNOBS = _module_knobs()
     QK_HDIM = qk_hdim
     V_HDIM = v_hdim
     N_BLOCK = int(n_block)
@@ -1677,6 +1692,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
 
             THD: this batch's token ranges come from cu_seqlens (batch = grid.z).
             """
+            _ = MODULE_KNOBS  # cache key only (see _module_knobs)
             batch = _lpt_block_id("z")
             q_start, q_end = _load_seqlen_pair(ptr_cu_seqlens_q, batch)
             kv_start, kv_end = _load_seqlen_pair(ptr_cu_seqlens_k, batch)
@@ -1802,6 +1818,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
         cu_seqlens — nothing transient, so this path is CUDA-graph safe.
         Token base is batch_idx * seq_len (batch = grid.z).
         """
+        _ = MODULE_KNOBS  # cache key only (see _module_knobs)
         batch = _lpt_block_id("z")
 
         # LSE is [B, nheads_q, seq_q]: base = batch*stride_lse_batch; every valid

@@ -555,3 +555,29 @@ def test_mla_folded_equals_unfolded_and_is_deterministic():
     plain = _run_mla(*(t.contiguous() for t in (q, k, v, dout)), True)
     for a, b_, c in zip(folded, again, plain):
         assert torch.equal(a, b_) and torch.equal(a, c)
+
+
+def test_mla_fwd_jit_key_covers_module_knobs(monkeypatch):
+    """FlyDSL keys its compile cache by function source and closure scalars, not module globals.
+    The MLA forward routes its module-level knobs through the kernels' closures, so a build with
+    another value of one (here RESCALE_THRESHOLD) never reuses a cached binary."""
+    from flydsl.compiler import jit_function
+
+    from primus_turbo.flydsl.attention.gfx1250_mla_fwd import (
+        fmha_fwd_prefill_a16w16_m32x8 as kern,
+    )
+
+    def key():
+        monkeypatch.setattr(kern, "_launch_fns", {})
+        kern.build_fmha_fwd_prefill_a16w16_m32x8.cache_clear()
+        kern._ensure_bshd_kernel(False, True, True, False, 1, qk_hdim=D_QK, dtype_str="bf16")
+        (fn,) = kern._launch_fns.values()
+        return jit_function._jit_function_cache_key(fn.func)
+
+    try:
+        base = key()
+        monkeypatch.setattr(kern, "RESCALE_THRESHOLD", kern.RESCALE_THRESHOLD + 1.0)
+        assert key() != base
+    finally:
+        monkeypatch.undo()
+        kern.build_fmha_fwd_prefill_a16w16_m32x8.cache_clear()
