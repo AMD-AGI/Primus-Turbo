@@ -93,7 +93,11 @@ def flydsl_gfx1250_mla_unsupported_reason(
     if (b * sq * hq) % kern.ROWS_DELTA:
         return f"batch*seqlen_q*heads_q must be a multiple of {kern.ROWS_DELTA}"
     # Byte extents the backward computes in 32-bit arithmetic or hard-codes as descriptor sizes.
-    if b * sq * hq * D_QK * 2 > (1 << 30) or b * skv * hkv * D_QK * 2 >= (1 << 31) or b * hq * sq * 4 > (1 << 28):
+    if (
+        b * sq * hq * D_QK * 2 > (1 << 30)
+        or b * skv * hkv * D_QK * 2 >= (1 << 31)
+        or b * hq * sq * 4 > (1 << 28)
+    ):
         return "q/k/lse too large for the backward's 32-bit descriptor extents"
     return None
 
