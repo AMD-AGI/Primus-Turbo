@@ -72,6 +72,15 @@ _ENV_CHECKED = False
 DQ_SIDE_STREAM = os.environ.get("FLY_BWD_SIDE_STREAM", "1") != "0"
 DQ_SIDE_RECORD = os.environ.get("FLY_BWD_RECORD_STREAM", "1") != "0"
 _SIDE = {}
+# Validation only: allocate delta/dq/dk/dv NaN-filled, so an element the kernels never write
+# shows up as non-finite instead of as stale memory.
+POISON = False
+
+
+def _alloc(shape, device, dtype):
+    if POISON:
+        return torch.full(shape, float("nan"), device=device, dtype=dtype)
+    return torch.empty(shape, device=device, dtype=dtype)
 
 
 def _check_env_once():
@@ -140,10 +149,10 @@ def _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, dq_stream=None):
     n_rows = b * sq * hq
     c = int(bool(causal))
     dq_stream = stream if dq_stream is None else dq_stream
-    delta = torch.empty((b, hq, sq), device=q.device, dtype=torch.float32)
-    dq = torch.empty((b, sq, hq, _k.D_QK), device=q.device, dtype=q.dtype)
-    dk = torch.empty((b, skv, hkv, _k.D_QK), device=k.device, dtype=k.dtype)
-    dv = torch.empty((b, skv, hkv, _k.D_V), device=v.device, dtype=v.dtype)
+    delta = _alloc((b, hq, sq), q.device, torch.float32)
+    dq = _alloc((b, sq, hq, _k.D_QK), q.device, q.dtype)
+    dk = _alloc((b, skv, hkv, _k.D_QK), k.device, k.dtype)
+    dv = _alloc((b, skv, hkv, _k.D_V), v.device, v.dtype)
     launches = [
         ("delta", _k.launch_delta,
          (do, o, delta, sq, hq, n_rows, n_rows // _k.ROWS_DELTA, stream), "main"),
