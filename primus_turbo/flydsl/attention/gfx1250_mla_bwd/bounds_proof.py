@@ -8,24 +8,52 @@ kernels.py itself, so the proof cannot drift from the kernel's constants; the pe
 index formulas are re-derived here line by line from kernels.py and replayed for every
 lane, every loop iteration and every kv/query tile of the extreme (head, batch) workgroups.
 
-Checks (each prints its count; any violation raises):
-  K1  k_dkdv TDM tiles: q pair in [0, Sq/32), outer extent Sq - q0 >= 32 (TDM ignores
-      bounds), every segment's global elements inside q / do; LDS data writes inside their
-      stage image, segments tile each row's [0, 2D) exactly, rings inside segment 0.
-  K2  k_dkdv ring schedule with TDM_OPS_QDO ops per stage and tensorcnt waits TW_QDO / 0
-      (in-order retirement): every LDS read hits a retired stage holding the right tile,
-      no TDM targets a stage with an unconsumed read; tensorcnt 0 at exit.
+Checks (each prints its count; any violation raises). k_dkdv = k_dkdv64 here: DKDV_NW = 2
+waves per workgroup, grid (Hkv, Skv/64, B), wave w owns kv rows kv0g + 32w + [0, 32).
+  K1  k_dkdv TDM tiles: q pair in [0, Sq/32), outer extent Sq - q0 >= 32 and the per-wave
+      clamp Sq - q0 - 16w >= 16 (TDM ignores bounds), every wave's 16-row slice of every
+      segment inside q / do; LDS data writes inside their stage image, the waves' slices and
+      the segments tile each image row's [0, 2D) and all 32 rows exactly, ring in segment 0.
+  K2  k_dkdv ring schedule with TDM_OPS_QDO ops per stage per wave (each wave its own
+      tensorcnt) and waits TW_QDO / 0 (in-order retirement), replayed for both waves.
   K3  k_dkdv LDS reads (readback, tr16, P/dS) inside written bytes; DS immediates < 64 KiB;
-      epilogue images inside the dead ring; K/V fragment and LSE/delta loads in bounds.
-  K4  causal split: query pairs < qp_start fully masked, pairs >= qp_start + nmaskp fully
-      unmasked; division-free (qi, gh) counters == (ii // G, ii % G) for every ii.
-  K5  dk/dv: every output element written exactly once (all workgroups, all lanes).
+      per-wave P/dS tiles and epilogue images disjoint, inside the allocation / dead ring;
+      K/V fragment and LSE/delta loads in bounds (each wave its own kv rows).
+  K4  causal split at WORKGROUP level (block id only): for EACH wave's 32 kv rows, query
+      pairs < qp_start fully masked, pairs >= qp_start + nmaskp fully unmasked; division-free
+      (qi, gh) counters == (ii // G, ii % G) for every ii.
+  K5  dk/dv: every output element written exactly once (all workgroups, both waves, lanes).
+  K6  k_dkdv64 barrier protocol: both waves run one program (no wave-dependent branch or trip
+      count: source scan of _dkdv_impl), so per wave #barriers == 2*G*nmaskp + 2 + n_full + 1;
+      phase model (ops between two barriers run in any cross-wave order, the barrier's release
+      fence drains DS): a read hits a stage whose every wave-slice was retired by its issuing
+      wave before an earlier barrier and not re-targeted since; no TDM targets a stage read in
+      the same phase; at the epilogue barrier no TDM is pending and the ring is not read again.
   Q1  k_dqg TDM tiles (kv block <= nkvt-1, extent >= 32, K/V elements in bounds), LDS
       writes; Q2 ring schedule with TDM_OPS_KV ops per stage, waits DQT_TW / 0;
       Q3 LDS reads (readback, tr16) inside written bytes, DS immediates; Q/dO fragment
       and LSE/delta loads in bounds, inside k_dqg's fake 1 GiB / 256 MiB extents;
       Q4 causal split (nfull iterations fully unmasked, nkvt_eff covers every attended
       kv); Q5 dq written exactly once; the XCD q-head remap is a bijection.
+  Q6  k_dqg / k_dqg96 split (kernels.dq_split, as impl._plan launches it): k_dqg96 workgroup
+      tiles (96 rows, q0g = q_split + bid*96; wave w owns [q0g + 48w, q0g + 48w + 48)) and k_dqg
+      tiles (32 rows, q0 = bid*32) over bid = ntile-1-grid.y partition [0, Sq) exactly (per-wave
+      ranges); per workgroup and per ROW (brute force) the kv range [0, 32*nkvt_eff) (from the
+      workgroup tile, the same for both waves) holds every attended key, iterations < nfull are
+      fully unmasked for every row of the workgroup, every masked-loop iteration has a masked
+      entry; at cshift 0 a 96-row workgroup has 3 masked steps (32-row: 1); per wave the masked
+      steps split into partial / fully masked (wave 0: 1-2 fully masked steps, whose ds is 0:
+      exp2(NEG) = 0; the last wave: none), recorded in the log.
+  W1  k_dqg96 TDM per wave (num_warps 2: wave w issues rows [16w, 16w+16) of every op): global
+      elements in bounds, per-wave extent Skv - kv0p - 16w >= 16, and the two waves' LDS writes
+      tile each stage image exactly like the single-wave TDM (SPAN_K / SPAN_V).
+  W2  k_dqg96 2-wave ring protocol with one barrier per kv step: every LDS read sees both halves
+      of the right tile retired (RAW across waves through a barrier), no TDM write overlaps an
+      unretired read of either wave (WAR), no two TDM writes of a stage half in flight (WAW),
+      equal barrier counts (no hang), tensorcnt 0 at exit; happens-before = program order in a
+      wave, barrier epochs across waves; N = 1..160 plus every shape's trip counts. Mutations
+      (drain dropped, readback above the barrier, wait one stage too deep, TDM above the WAR
+      barrier) must each be caught (N1..N4).
 """
 import pathlib
 import re
@@ -53,8 +81,12 @@ NDT_QK, NDT_V, NDO_QK, NDO_V, NKV, EPI_CB = (g("NDT_QK"), g("NDT_V"), g("NDO_QK"
                                              g("NKV"), g("EPI_CB"))
 DQ_BQW, VOFF, KV_B, TDM_OPS_KV, DQT_TW = g("DQ_BQW"), g("VOFF"), g("KV_B"), g("TDM_OPS_KV"), g("DQT_TW")
 RD_ORDER, NKT, NQW = g("_RD_ORDER"), g("NKT"), g("NQW")
+DQ_BQW48, NQW48, dq_split = g("DQ_BQW48"), g("NQW48"), g("dq_split")
+DQ_NWAVE, DQ_BQW96 = g("DQ_NWAVE"), g("DQ_BQW96")
 segs = g("_pow2_segments")
-ALLOC_KV = LDS_SEG + 2 * 32 * S_ROW_B
+DKDV_NW, PDS_B, EPI_W, BAR_KH = g("DKDV_NW"), g("PDS_B"), g("EPI_W"), g("BAR_KH")
+ALLOC_KV = LDS_SEG + DKDV_NW * PDS_B
+ROWS_W = 32 // DKDV_NW          # rows of every 32-row Q/dO tile one wave's TDM moves
 LANES = range(32)
 
 
@@ -72,6 +104,7 @@ SHAPES = {  # name: (B, Sq, Skv, Hq, Hkv, causal)
     "rect": (1, 256, 384, 2, 2, 1), "edge64": (2, 64, 64, 2, 2, 1),
     "gqa": (2, 512, 512, 8, 2, 1), "noncausal": (1, 256, 256, 2, 2, 0),
     "rect_short_kv": (1, 384, 256, 2, 2, 1),
+    "s128": (1, 128, 128, 2, 2, 1), "s192": (2, 192, 192, 2, 2, 1),
 }
 COUNT = {}
 
@@ -105,6 +138,16 @@ def tdm_image_writes(d, xrow):
 
 SPAN_K = tdm_image_writes(D_QK, XK)
 SPAN_V = tdm_image_writes(D_V, XV)
+# cooperative TDM (num_warps = DKDV_NW): wave w's ops write image rows [w*ROWS_W, (w+1)*ROWS_W)
+# (FlyDSL CopyAtom: warps[0] = DKDV_NW, bpw[0] = 32/DKDV_NW, lds offset w*bpw[0]*row stride);
+# the waves' slices partition the 32 rows.
+ok(32 % DKDV_NW == 0 and DKDV_NW & (DKDV_NW - 1) == 0, "K1", "TDM warp split")
+for d_, xr in ((D_QK, XK), (D_V, XV)):
+    rows_w = [set(range(w * ROWS_W, (w + 1) * ROWS_W)) for w in range(DKDV_NW)]
+    ok(set().union(*rows_w) == set(range(32)) and sum(map(len, rows_w)) == 32, "K1", "wave slices")
+    for w in range(DKDV_NW):
+        lds_off = w * ROWS_W * xr          # = warpOff * ldsStride[0] * 2 B
+        ok(lds_off == w * ROWS_W * ((d_ + 8) * 2), "K1", "slice LDS offset")
 ok(QOFF == 32 * XV and QDO_B == QOFF + 32 * XK, "K1", "k_dkdv stage = dO image + Q image")
 ok(TDM_DEPTH * QDO_B <= LDS_SEG, "K1", "Q/dO ring inside segment 0")
 ok(VOFF == 32 * XK and KV_B == VOFF + 32 * XV, "Q1", "k_dqg stage = K image + V image")
@@ -155,7 +198,7 @@ for lane in LANES:
             a = lr * XK + lc * 2 + imm
             DS_IMM.append(imm)
             ok(written(SPAN_K, QOFF, a, a + 16), "K3", f"b_q tr16 {a}")
-    # P/dS tiles [32 q][BLOCK_KV kv] bf16 at LDS_SEG (+32*S_ROW_B for dS)
+    # P/dS tiles [32 q][BLOCK_KV kv] bf16 at LDS_SEG + w*PDS_B (+32*S_ROW_B for dS), per wave
     for hh in range(2):
         for kh in range(NKV):
             off = (hh * 16 + row) * S_ROW_B + kh * 32 + half * 16
@@ -181,7 +224,10 @@ for lane in LANES:
                 ok(ev + a + 16 + 0 <= ek and (a % EPI_CB) + 16 <= 32, "K3", "dV image tr16")
             if sub < NDO_QK:
                 ok(ek + a + 16 <= ek + D_QK * EPI_CB, "K3", "dK image tr16")
-ok(NKV * (D_V + D_QK) * EPI_CB <= TDM_DEPTH * QDO_B <= LDS_SEG, "K3", "epilogue inside dead ring")
+ok(NKV * (D_V + D_QK) * EPI_CB == EPI_W and DKDV_NW * EPI_W <= TDM_DEPTH * QDO_B <= LDS_SEG, "K3",
+   "per-wave epilogue images [w*EPI_W, (w+1)*EPI_W) disjoint, inside the dead ring")
+ok(PDS_B == 2 * 32 * S_ROW_B and LDS_SEG + DKDV_NW * PDS_B == ALLOC_KV and ALLOC_KV <= 160 * 1024, "K3",
+   "per-wave P/dS tiles [LDS_SEG + w*PDS_B, +PDS_B) disjoint, inside the allocation; 2 workgroups/CU fit")
 ok(max(DS_IMM) < 65536 and 2 * QDO_B + max(DS_IMM) + 16 <= LDS_SEG + 2 * 32 * S_ROW_B, "K3",
    f"DS immediate {max(DS_IMM)}")
 
@@ -247,6 +293,80 @@ def wrap(qc, gc, G):
     return (qc, g1) if g1 < G else (qc + 1, 0)
 
 
+class Ring2:
+    """k_dkdv64 Q/dO ring shared by DKDV_NW waves (K2, K6). Every wave issues TDM_OPS_QDO ops per
+    stage for its own 16-row slice and retires them with its own tensorcnt (in order: wait(n)
+    leaves the newest n). Ops between two barriers form a PHASE whose cross-wave order is
+    arbitrary; the barrier's release fence drains every wave's DS reads. Hence: a stage is
+    readable iff at the last barrier every wave's slice of it was retired and nothing targeted
+    it since; a TDM may not target a stage any wave reads in the same phase."""
+
+    def __init__(self, nw, nst, k):
+        self.nw, self.k = nw, k
+        self.q = [[] for _ in range(nw)]               # per wave: stage of each unretired op
+        self.slice_tile = [[None] * nw for _ in range(nst)]
+        self.visible = [None] * nst                   # tile readable since the last barrier
+        self.phase_tdm, self.phase_read = set(), set()
+        self.nbar = [0] * nw
+
+    def issue(self, stage, tile):
+        ok(stage not in self.phase_read, "K6", f"TDM into stage {stage} read in the same phase")
+        for w in range(self.nw):
+            self.q[w] += [stage] * self.k
+            self.slice_tile[stage][w] = tile
+            ok(len(self.q[w]) <= 2 * self.k, "K2", "more than two stages in flight")
+        self.phase_tdm.add(stage)
+        self.visible[stage] = None
+
+    def wait(self, n):
+        for w in range(self.nw):
+            while len(self.q[w]) > n:
+                self.q[w].pop(0)
+
+    def barrier(self):
+        for w in range(self.nw):
+            self.nbar[w] += 1
+        for st in range(len(self.visible)):
+            done = all(st not in self.q[w] for w in range(self.nw))
+            tiles = set(self.slice_tile[st])
+            if done and len(tiles) == 1 and None not in tiles:
+                self.visible[st] = self.slice_tile[st][0]
+        self.phase_tdm, self.phase_read = set(), set()
+
+    def read(self, stage, tile):
+        ok(stage not in self.phase_tdm, "K6", f"read of stage {stage} TDM'd in the same phase")
+        ok(self.visible[stage] == tile, "K2", f"stage {stage} visible {self.visible[stage]} not {tile}")
+        self.phase_read.add(stage)
+
+    def epilogue(self):
+        ok(all(not q for q in self.q), "K6", "TDM pending when the epilogue overwrites the ring")
+        ok(not self.phase_tdm and not self.phase_read, "K6", "ring traffic in the epilogue phase")
+
+
+# Static scan of _dkdv_impl (K6): the wave index `wv` only offsets addresses, every `if` is a
+# compile-time const_expr (no scf.if, so no wave-dependent branch), the loop trip counts derive
+# from kv0g (block id) only, and the barrier call sites are the six of the protocol.
+_DKDV_SRC = _block("def _dkdv_impl(", "@flyc.kernel(known_block_size=[32, 1, 1])")
+_WV_OK = (r"^wv = fx\.Int32\(rocdl\.wave_id\(\)\)", r"^kv0 = kv0g \+ wv \* fx\.Int32\(BLOCK_KV\)",
+          r"^lds_p = lds_p \+ wv \* fx\.Int32\(PDS_B\)", r"^_epi0 = _lds0 \+ wv \* fx\.Int32\(EPI_W\)")
+for ln in _DKDV_SRC.splitlines():
+    t = ln.split("#", 1)[0].strip()
+    if re.search(r"\bwv\b", t):
+        ok(any(re.match(p_, t) for p_ in _WV_OK), "K6", f"wave index used outside addressing: {t}")
+    if re.match(r"^(el)?if\b", t):
+        ok("const_expr(" in t, "K6", f"runtime branch in _dkdv_impl: {t}")
+    if re.match(r"^while\b", t):
+        ok(False, "K6", f"while loop in _dkdv_impl: {t}")
+for pat in (r"_c = kv0g - cshift", r"_u = kv0g \+ fx\.Int32\(nw \* BLOCK_KV - 1\) - cshift",
+            r"qloop_mask\(init \+ _z2, G \* nmaskp, qp_start\)",
+            r"qloop_full\(out, G \* \(nqp_eff - nmaskp\), qp_start \+ nmaskp\)"):
+    ok(len(re.findall(pat, _DKDV_SRC)) == 1, "K6", f"trip-count source {pat}")
+ok(sum(ln.split("#", 1)[0].strip() == "_lds_barrier()" for ln in _DKDV_SRC.splitlines()) == 6, "K6",
+   "six barrier call sites (2 mask, 2 prologue, 1 full, 1 exit)")
+ok(len(re.findall(r"const_expr\(carry and nw > 1 and kh == BAR_KH\)", _DKDV_SRC)) == 1
+   and 0 < BAR_KH < NKV, "K6", "full-loop barrier between the kv sub-tiles' WMMAs")
+
+
 # ------------------------------------------------------------------- k_dkdv replay
 def dkdv_shape(B, Sq, Skv, Hq, Hkv, causal, written_kv):
     G = Hq // Hkv
@@ -255,6 +375,8 @@ def dkdv_shape(B, Sq, Skv, Hq, Hkv, causal, written_kv):
     cshift = Skv - Sq
     n_q = B * Sq * Hq
     ldl_max = B * Hq * Sq
+    NW, BKG = DKDV_NW, DKDV_NW * BLOCK_KV          # waves, kv rows per workgroup
+    ok(Skv % BKG == 0, "K1", "Skv % 64 (impl._check)")
 
     def clampqt(t):
         t = t if t < nqt2 else nqt2 - 1
@@ -262,36 +384,41 @@ def dkdv_shape(B, Sq, Skv, Hq, Hkv, causal, written_kv):
 
     for bat in sorted({0, B - 1}):
         for hkv in sorted({0, Hkv - 1}):
-            for bid in range(Skv // BLOCK_KV):
-                kv0 = bid * BLOCK_KV
-                _c = kv0 - cshift
+            for bid in range(Skv // BKG):
+                kv0g = bid * BKG                      # block id only
+                _c = kv0g - cshift
                 qp_start = (0 if _c < 0 else _c) // 32 if causal else 0
                 nqp_eff = nqt2 - qp_start
-                _u = kv0 + BLOCK_KV - 1 - cshift
+                _u = kv0g + BKG - 1 - cshift
                 qsf = 0 if _u < 0 else (_u + 31) // 32
                 qsf = min(qsf, nqt2)
                 nm = min(max(qsf - qp_start, 0), nqp_eff)
                 nmaskp = nm if causal else 0
-                # K4: masked/unmasked classification by brute force over the 32x32 pair
-                for qt in range(nqt2):
-                    full = (not causal) or (kv0 + BLOCK_KV - 1 <= 32 * qt + cshift)
-                    none = causal and (kv0 > 32 * qt + 31 + cshift)
-                    if qt < qp_start:
-                        ok(none, "K4", f"pair {qt} < qp_start {qp_start} not fully masked")
-                    elif qt >= qp_start + nmaskp:
-                        ok(full, "K4", f"pair {qt} in the full loop has masked entries")
+                kv0w = [kv0g + w * BLOCK_KV for w in range(NW)]
+                # K4: masked/unmasked classification by brute force, for EACH wave's 32 kv rows
+                for w in range(NW):
+                    kv0 = kv0w[w]
+                    for qt in range(nqt2):
+                        full = (not causal) or (kv0 + BLOCK_KV - 1 <= 32 * qt + cshift)
+                        none = causal and (kv0 > 32 * qt + 31 + cshift)
+                        if qt < qp_start:
+                            ok(none, "K4", f"wave {w} pair {qt} < qp_start {qp_start} not fully masked")
+                        elif qt >= qp_start + nmaskp:
+                            ok(full, "K4", f"wave {w} pair {qt} in the full loop has masked entries")
 
                 def tdm(qt, gh, stage):
                     ok(0 <= qt < nqt2 and 0 <= gh < G, "K1", f"tile ({qt},{gh})")
                     q0 = qt * 32
                     ok(Sq - q0 >= 32, "K1", "TDM outer extent < 32")
                     qh = hkv * G + gh
-                    row0 = (bat * Sq + q0) * Hq + qh
-                    for d in (D_V, D_QK):
-                        for c0, w in segs(d):
-                            first = row0 * d + c0
-                            last = first + 31 * Hq * d + w - 1
-                            ok(0 <= first and last < n_q * d, "K1", f"TDM global [{first},{last}]")
+                    for w in range(NW):                  # wave w's slice: rows q0 + w*ROWS_W + [0, ROWS_W)
+                        ok(Sq - q0 - w * ROWS_W >= ROWS_W, "K1", "per-wave TDM extent clamp")
+                        row0 = (bat * Sq + q0 + w * ROWS_W) * Hq + qh
+                        for d in (D_V, D_QK):
+                            for c0, w_ in segs(d):
+                                first = row0 * d + c0
+                                last = first + (ROWS_W - 1) * Hq * d + w_ - 1
+                                ok(0 <= first and last < n_q * d, "K1", f"TDM global [{first},{last}]")
                     return (qt, gh)
 
                 def ldl(qt, gh):
@@ -302,27 +429,30 @@ def dkdv_shape(B, Sq, Skv, Hq, Hkv, causal, written_kv):
                             idx = base_l + qt * 32 + hh * 16 + row
                             ok(0 <= idx < ldl_max, "K3", "LSE/delta index")
 
-                ring = Ring("K2", TDM_OPS_QDO, TDM_DEPTH)
-                # qloop_mask: own tile -> stage 0, wait 0, read stage 0 (consumed in-iteration)
+                ring = Ring2(NW, TDM_DEPTH, TDM_OPS_QDO)
+                # qloop_mask: BARRIER, own tile -> stage 0, wait 0, BARRIER, read stage 0
                 qi = gh = 0
                 for ii in range(G * nmaskp):
                     ok((qi, gh) == divmod(ii, G), "K4", "mask-loop counters")
-                    t = tdm(qp_start + qi, gh, 0)
                     ldl(qp_start + qi, gh)
+                    ring.barrier()
+                    t = tdm(qp_start + qi, gh, 0)
                     ring.issue(0, t)
                     ring.wait(0)
-                    ring.read(0, t)
-                    ring.consume(0)
+                    ring.barrier()
+                    ring.read(0, t)                      # readback + tr16, consumed in-iteration
                     qi, gh = wrap(qi, gh, G)
                 n = G * (nqp_eff - nmaskp)
                 qt0 = qp_start + nmaskp
                 ldl(clampqt(qt0), 0)
-                # prologue: tile(0) -> s0, tile(min(1, n-1)) -> s1, wait, read back s0
+                # prologue: BARRIER, tile(0) -> s0, tile(min(1, n-1)) -> s1, wait, BARRIER, read s0
+                ring.barrier()
                 ring.issue(0, tdm(clampqt(qt0), 0, 0))
                 q1w, g1w = wrap(0, 0, G)
                 q1, g1 = (q1w, g1w) if 1 < n else (0, 0)
                 ring.issue(1, tdm(clampqt(qt0 + q1), g1, 1))
                 ring.wait(TW_QDO)
+                ring.barrier()
                 ring.read(0, (clampqt(qt0), 0))
                 cur, qi, gh = 0, 0, 0
                 for ii in range(n):
@@ -339,152 +469,381 @@ def dkdv_shape(B, Sq, Skv, Hq, Hkv, causal, written_kv):
                     ok(nxo == (ii + 2) % 3 and ncur == (ii + 1) % 3 and st == ii % 3, "K2", "stage rotation")
                     ring.issue(nxo, tdm(qt0 + pf[0], pf[1], nxo))   # top of the body, no wait
                     ldl(qt0 + qj, gj)
-                    ring.consume(st)                     # carried readback -> S/dP WMMAs
                     ring.read(st, (qt0 + qi, gh))       # tr16 of this iteration's stage
-                    ring.consume(st)                     # consumed by the dK/dV WMMAs
-                    ring.wait(TW_QDO)
+                    ring.wait(TW_QDO)                    # after the WMMAs of kv sub-tiles < BAR_KH
+                    ring.barrier()
                     ring.read(ncur, (qt0 + qj, gj))      # readback for ii+1 (min(ii+1, n-1))
                     cur, qi, gh = ncur, qn, gn
                 ring.wait(0)
-                ok(not ring.q, "K2", "tensorcnt 0 at exit")
-                # K/V fragments of this tile, dk/dv epilogue stores (vec8 index)
+                ring.barrier()                           # epilogue barrier
+                ring.epilogue()
+                # K6: every wave took the same barriers, as many as the protocol says
+                nb_exp = 2 * G * nmaskp + 2 + n + 1
+                ok(all(x == nb_exp for x in ring.nbar), "K6", f"barriers {ring.nbar} != {nb_exp}")
+                # K/V fragments of each wave's tile, dk/dv epilogue stores (vec8 index)
                 rs_k, rs_v = Hkv * D_QK // 8, Hkv * D_V // 8
                 base_k = bat * Skv * rs_k + hkv * D_QK // 8
                 base_v = bat * Skv * rs_v + hkv * D_V // 8
-                for kh in range(NKV):
-                    for lane in LANES:
-                        row, half = lane_rc(lane)
-                        for base, rs, ndt, d in ((base_k, rs_k, NDT_QK, D_QK), (base_v, rs_v, NDT_V, D_V)):
-                            for dt in range(ndt):
-                                for t in (base + (kv0 + kh * 16 + row) * rs + half + dt * 4,):
-                                    for tt in (t, t + 2):
-                                        ok(0 <= tt * 8 and tt * 8 + 8 <= B * Skv * Hkv * d, "K3", "K/V frag")
-                                        ok((tt * 8) % d + 8 <= d, "K3", "K/V frag inside its row")
-                        for sub in range(max(NDO_V, NDO_QK)):
-                            for base, rs, nd, d, key in ((base_v, rs_v, NDO_V, D_V, "v"),
-                                                         (base_k, rs_k, NDO_QK, D_QK, "k")):
-                                if sub < nd:
-                                    t = base + (kv0 + kh * 16 + row) * rs + sub * 2 + half
-                                    for e in range(8):
-                                        el = t * 8 + e
-                                        ok(0 <= el < B * Skv * Hkv * d, "K5", "dk/dv store")
-                                        written_kv[key][el] = written_kv[key].get(el, 0) + 1
+                for kv0 in kv0w:
+                    for kh in range(NKV):
+                        for lane in LANES:
+                            row, half = lane_rc(lane)
+                            for base, rs, ndt, d in ((base_k, rs_k, NDT_QK, D_QK), (base_v, rs_v, NDT_V, D_V)):
+                                for dt in range(ndt):
+                                    for t in (base + (kv0 + kh * 16 + row) * rs + half + dt * 4,):
+                                        for tt in (t, t + 2):
+                                            ok(0 <= tt * 8 and tt * 8 + 8 <= B * Skv * Hkv * d, "K3", "K/V frag")
+                                            ok((tt * 8) % d + 8 <= d, "K3", "K/V frag inside its row")
+                            for sub in range(max(NDO_V, NDO_QK)):
+                                for base, rs, nd, d, key in ((base_v, rs_v, NDO_V, D_V, "v"),
+                                                             (base_k, rs_k, NDO_QK, D_QK, "k")):
+                                    if sub < nd:
+                                        t = base + (kv0 + kh * 16 + row) * rs + sub * 2 + half
+                                        for e in range(8):
+                                            el = t * 8 + e
+                                            ok(0 <= el < B * Skv * Hkv * d, "K5", "dk/dv store")
+                                            written_kv[key][el] = written_kv[key].get(el, 0) + 1
 
 
 def dkdv_cover(B, Sq, Skv, Hq, Hkv):
-    """K5 exactly-once over ALL workgroups, by closed form (cheap): each (bat, hkv, bid, kh,
-    row, sub, half) writes 8 consecutive elements of one row; the map is injective."""
+    """K5 exactly-once over ALL workgroups, by closed form (cheap): each (bat, hkv, bid, w, kh,
+    row, sub, half) writes 8 consecutive elements of row kv0g + 32w + 16kh + row; the map is
+    injective and onto the workgroup's 64 kv rows x d."""
     for key, d, nd in (("v", D_V, NDO_V), ("k", D_QK, NDO_QK)):
         seen = set()
-        for kvr in range(BLOCK_KV):                 # kh*16 + row
-            for sub in range(nd):
-                for half in range(2):
-                    c = (sub * 2 + half) * 8        # column of the 8-element run
-                    ok(c + 8 <= d, "K5", "run inside the row")
-                    seen.add((kvr, c))
-        ok(len(seen) == BLOCK_KV * d // 8, "K5", f"d{key} tile coverage {len(seen)}")
+        for w in range(DKDV_NW):
+            for kvr in range(BLOCK_KV):             # kh*16 + row
+                for sub in range(nd):
+                    for half in range(2):
+                        c = (sub * 2 + half) * 8    # column of the 8-element run
+                        ok(c + 8 <= d, "K5", "run inside the row")
+                        seen.add((w * BLOCK_KV + kvr, c))
+        ok(len(seen) == DKDV_NW * BLOCK_KV * d // 8, "K5", f"d{key} tile coverage {len(seen)}")
 
 
 # -------------------------------------------------------------------- k_dqg replay
-def dqg_shape(B, Sq, Skv, Hq, Hkv, causal, written_q):
+def tdm_wave_blocks(nwave):
+    """W1: per-wave TDM blocks of one stage (num_warps = nwave splits the 32 rows into nwave
+    contiguous blocks, wave w = rows [w*32/nwave, (w+1)*32/nwave)). Returns {w: rows}."""
+    ok(KV_STEP % nwave == 0, "W1", "rows split evenly")
+    bpw = KV_STEP // nwave
+    blocks = {w: list(range(w * bpw, (w + 1) * bpw)) for w in range(nwave)}
+    for d, xrow, span in ((D_QK, XK, SPAN_K), (D_V, XV, SPAN_V)):
+        got = []
+        for w, rows in blocks.items():
+            for c0, wd in segs(d):
+                for r in rows:
+                    got.append((r * xrow + 2 * c0, r * xrow + 2 * c0 + 2 * wd))
+        ok(sorted(got) == sorted(span), "W1", f"per-wave LDS writes != single-wave image d{d}")
+    return blocks
+
+
+WAVE_BLOCKS = tdm_wave_blocks(DQ_NWAVE)
+
+
+def ring2_events(N, nwave, mut=None):
+    """Program-order event list per wave of k_dqg96 (kernels._dqg_tdm_impl, nwave > 1):
+    ('tdm', stage, tile) | ('twait', n) | ('dscnt0',) | ('bar',) | ('read', stage, tile, kind) |
+    ('use', kind) (a WMMA consuming that read kind: the compiler's s_wait_dscnt) | ('end',).
+    mut: None, 'no_drain', 'read_above_bar', 'deep_wait', 'tdm_above_bar'."""
+    TW = DQT_TW
+    out = {}
+    for w in range(nwave):
+        ev = [("tdm", 0, 0), ("tdm", 1, min(1, N - 1)), ("twait", TW)]
+        ev += [("dscnt0",), ("bar",), ("read", 0, 0, "rb")]
+        for i in range(N):
+            cur, nxo, ncur = i % 3, (i + 2) % 3, (i + 1) % 3
+            ev.append(("tdm", nxo, min(i + 2, N - 1)))
+            ev.append(("use", "rb"))                         # S/dP WMMAs: carried readback
+            ev.append(("read", cur, i, "tr"))                # dQ B operands (tr16)
+            ev.append(("twait", TW + 3 if mut == "deep_wait" else TW))
+            if mut == "read_above_bar":
+                ev.append(("read", ncur, min(i + 1, N - 1), "rb"))
+            if mut != "no_drain":
+                ev.append(("dscnt0",))
+            ev.append(("bar",))
+            if mut != "read_above_bar":
+                ev.append(("read", ncur, min(i + 1, N - 1), "rb"))
+            ev.append(("use", "tr"))                         # dQ WMMAs
+        ev.append(("twait", 0))
+        ev.append(("end",))
+        out[w] = ev
+    if mut == "tdm_above_bar":
+        # wave 1 issues its prefetch for iteration i+1 BEFORE barrier i (no WAR protection)
+        ev = out[1]
+        for k in range(len(ev) - 1, 0, -1):
+            if ev[k][0] == "bar" and k + 3 < len(ev) and ev[k + 3][0] == "tdm":
+                ev.insert(k, ev.pop(k + 3))
+        out[1] = ev
+    return out
+
+
+class Viol(Exception):
+    pass
+
+
+def ring2_check(N, nwave, mut=None):
+    """W2 happens-before replay. Returns the number of barriers per wave; raises Viol."""
+    evs = ring2_events(N, nwave, mut)
+    owner = {w: w for w in range(nwave)}             # half w of every stage is written by wave w
+    # per wave: annotate epoch (barriers passed) and completion indices
+    writes = []      # (stage, half, tile, wave, issue_pos, done_pos)  pos = (wave, idx, epoch)
+    reads = []       # (stage, tile, wave, issue_pos, done_pos, kind)
+    nbar = {}
+    for w, ev in evs.items():
+        ep = 0
+        q = []           # outstanding TDM ops of this wave: [write index] (one entry per op)
+        open_reads = []  # read indices not yet completed
+        last_kind = {}
+        for k, e in enumerate(ev):
+            pos = (w, k, ep)
+            if e[0] == "tdm":
+                for wr in writes:
+                    if wr[3] == w and wr[0] == e[1] and wr[5] is None:
+                        raise Viol(f"WAW: wave {w} TDM into stage {e[1]} with one in flight")
+                writes.append([e[1], w, e[2], w, pos, None])
+                for _ in range(TDM_OPS_KV):
+                    q.append(len(writes) - 1)
+                if len(q) > 2 * TDM_OPS_KV:
+                    raise Viol("more than two stages in flight")
+            elif e[0] == "twait":
+                while len(q) > e[1]:
+                    wi = q.pop(0)
+                    if wi not in q:
+                        writes[wi][5] = pos
+            elif e[0] == "read":
+                reads.append([e[1], e[2], w, pos, None, e[3]])
+                open_reads.append(len(reads) - 1)
+            elif e[0] == "use":
+                # in-order LDS returns: waiting for the newest read of this kind retires all
+                # older reads of this wave too
+                idx = [r for r in open_reads if reads[r][5] == e[1]]
+                if idx:
+                    newest = max(idx)
+                    for r in [r for r in open_reads if r <= newest]:
+                        reads[r][4] = pos
+                    open_reads = [r for r in open_reads if r > newest]
+            elif e[0] == "dscnt0":
+                for r in open_reads:
+                    reads[r][4] = pos
+                open_reads = []
+            elif e[0] == "bar":
+                ep += 1
+            elif e[0] == "end":
+                if q:
+                    raise Viol(f"wave {w} ends with TDM in flight")
+        nbar[w] = ep
+    if len(set(nbar.values())) != 1:
+        raise Viol(f"barrier counts differ {nbar} (hang)")
+
+    def hb(a, b):
+        if a is None or b is None:
+            return False
+        return a[1] < b[1] if a[0] == b[0] else a[2] < b[2]
+
+    for st, tile, w, ri, rd, kind in reads:
+        for half in range(nwave):
+            ws = [x for x in writes if x[0] == st and x[1] == half]
+            seen = None
+            for x in ws:
+                if hb(x[5], ri):
+                    seen = x if seen is None or x[4][1] > seen[4][1] else seen
+                elif not hb(rd, x[4]):
+                    raise Viol(f"RAW/WAR: {kind} of stage {st} by wave {w} at {ri} races TDM of "
+                               f"half {half} (tile {x[2]}) by wave {x[3]} issued {x[4]}")
+            if seen is None or seen[2] != tile:
+                raise Viol(f"RAW: {kind} of stage {st} half {half} by wave {w} expects tile {tile}, "
+                           f"sees {None if seen is None else seen[2]}")
+    return nbar[0]
+
+
+def ring2_selftest():
+    for N in range(1, 161):
+        nb = ring2_check(N, DQ_NWAVE)
+        ok(nb == N + 1, "W2", f"barriers {nb} for N {N}")
+    for tag, mut in (("N1", "no_drain"), ("N2", "read_above_bar"), ("N3", "deep_wait"),
+                     ("N4", "tdm_above_bar")):
+        caught = 0
+        for N in (1, 2, 3, 4, 7, 32):
+            try:
+                ring2_check(N, DQ_NWAVE, mut)
+            except Viol:
+                caught += 1
+        ok(caught > 0, tag, f"mutation {mut} not caught")
+        print(f"  mutation {tag} {mut}: caught at {caught}/6 trip counts", flush=True)
+
+
+def dqg_shape(B, Sq, Skv, Hq, Hkv, causal, written_q, stats):
     G = Hq // Hkv
     nkvt = Skv // KV_STEP
     cshift = Skv - Sq
-    BQW = DQ_BQW
     # XCD remap bijection
     if Hq % 8 == 0:
         m = sorted((x % 8) * (Hq // 8) + x // 8 for x in range(Hq))
         ok(m == list(range(Hq)), "Q5", "XCD remap is a bijection")
-    nblk = Sq // BQW
-    ok(sorted(nblk - 1 - y for y in range(nblk)) == list(range(nblk)), "Q5", "descending tile walk")
+    # Q6: the launches impl._plan issues for the dQ chain, (nqw, nwave, q_off, ntile) in order
+    q_split, n32, n96 = dq_split(Sq)
+    ok(q_split in (0, 32, 64) and q_split + DQ_BQW96 * n96 == Sq and DQ_BQW * n32 == q_split
+       and NQW48 * 16 * DQ_NWAVE == DQ_BQW96 and NQW * 16 == DQ_BQW, "Q6",
+       f"split {q_split} {n32} {n96}")
+    launches = (([(NQW48, DQ_NWAVE, q_split, n96)] if n96 else [])
+                + ([(NQW, 1, 0, n32)] if n32 else []))
+    tiles = []                                   # (nqw, nwave, q0g) of every workgroup row of grid.y
+    for nqw, nwave, q_off, ntile in launches:
+        bqwg = 16 * nqw * nwave
+        bids = [ntile - 1 - y for y in range(ntile)]          # kernel: bid = ntile-1-block_idx.y
+        ok(sorted(bids) == list(range(ntile)), "Q5", "descending tile walk")
+        for bid in bids:
+            q0g = q_off + bid * bqwg
+            ok(0 <= q0g and q0g + bqwg <= Sq and q0g % 16 == 0, "Q6", f"tile [{q0g}, {q0g + bqwg})")
+            tiles.append((nqw, nwave, q0g))
+        q0s = [q_off + b_ * bqwg for b_ in bids]
+        ok(all(q0s[i] > q0s[i + 1] for i in range(len(q0s) - 1)), "Q6", "longest-first order")
+    cov = sorted((q0g + w * 16 * nqw, q0g + (w + 1) * 16 * nqw)
+                 for nqw, nwave, q0g in tiles for w in range(nwave))
+    ok(cov[0][0] == 0 and cov[-1][1] == Sq and all(cov[i][1] == cov[i + 1][0]
+                                                   for i in range(len(cov) - 1)),
+       "Q6", "per-wave dQ tiles partition [0, Sq)")
+    trips = set()
     for bat in sorted({0, B - 1}):
         for qh in sorted({0, Hq - 1}):
             hkv = qh // G
-            for bid in range(nblk):
-                q0 = bid * BQW
-                lim = (q0 + BQW + cshift + KV_STEP - 1) // KV_STEP
+            for nqw, nwave, q0g in tiles:
+                BQW = 16 * nqw
+                BQWG = BQW * nwave
+                # kv range of the WORKGROUP tile (kernels._dqg_tdm_impl), shared by its waves
+                lim = (q0g + BQWG + cshift + KV_STEP - 1) // KV_STEP
                 lim = min(max(lim, 1), nkvt)
                 nkvt_eff = lim if causal else nkvt
-                t_ = q0 + cshift + 1
+                t_ = q0g + cshift + 1
                 nf = 0 if t_ < 0 else t_ // KV_STEP
                 nf = min(nf, nkvt_eff)
                 nfull = nf if causal else nkvt_eff
                 nlast = nkvt_eff - 1
                 ok(nlast >= 0 and nfull <= nkvt_eff, "Q4", "loop bounds")
-                # Q4: every attended kv of every query of the tile is inside [0, 32*nkvt_eff);
-                # iterations < nfull are fully unmasked for every query of the tile
-                for q in (q0, q0 + BQW - 1):
+                rows_wg = range(q0g, q0g + BQWG)
+                for q in (q0g, q0g + BQWG - 1):
                     hi = min(q + cshift, Skv - 1) if causal else Skv - 1
                     ok(hi < KV_STEP * nkvt_eff, "Q4", "kv coverage")
                 for i in range(nfull):
-                    ok((not causal) or KV_STEP * i + KV_STEP - 1 <= q0 + cshift, "Q4", "full iteration masked")
+                    ok((not causal) or KV_STEP * i + KV_STEP - 1 <= q0g + cshift, "Q4", "full iteration masked")
+                if bat == 0 and qh == 0:         # Q6 per row (tile math is (bat, qh)-independent)
+                    for q in rows_wg:
+                        att = range(0, min(q + cshift, Skv - 1) + 1) if causal else range(Skv)
+                        ok(len(att) == 0 or att[-1] < KV_STEP * nkvt_eff, "Q6", f"row {q} kv coverage")
+                        for i in range(nfull):
+                            ok(KV_STEP * i + KV_STEP - 1 in att, "Q6", f"row {q} full iteration {i}")
+                    if causal:
+                        for i in range(nfull, nkvt_eff):
+                            ok(any(KV_STEP * i + j > q + cshift for q in rows_wg
+                                   for j in range(KV_STEP)), "Q6", f"masked iteration {i} has no mask")
+                        nm = nkvt_eff - nfull
+                        if cshift == 0:
+                            ok(nm == (3 if nwave == DQ_NWAVE else 1), "Q6",
+                               f"masked steps {nm} for a {BQWG}-row tile at {q0g}")
+                        ok(nm <= 4, "Q6", f"masked steps {nm} > 4")
+                        # per wave: partial vs fully masked masked-loop steps
+                        for w in range(nwave):
+                            rows = range(q0g + w * BQW, q0g + (w + 1) * BQW)
+                            full_m = sum(all(KV_STEP * i + j > q + cshift for q in rows
+                                             for j in range(KV_STEP))
+                                         for i in range(nfull, nkvt_eff))
+                            unm = sum(all(KV_STEP * i + j <= q + cshift for q in rows
+                                          for j in range(KV_STEP))
+                                      for i in range(nfull, nkvt_eff))
+                            key = (nwave, w, nm, full_m, unm)
+                            stats[key] = stats.get(key, 0) + 1
+                            if nwave == DQ_NWAVE and cshift == 0 and q0g + cshift >= 0:
+                                ok(full_m == (1 if w == 0 else 0), "Q6",
+                                   f"wave {w} fully masked steps {full_m} at {q0g}")
+                trips.add(nkvt_eff)
 
-                def tdm(kb):
+                def tdm(kb, w=None):
                     ok(0 <= kb <= nkvt - 1, "Q1", f"kv block {kb}")
                     kv0p = kb * KV_STEP
                     ok(Skv - kv0p >= KV_STEP, "Q1", "TDM outer extent")
-                    row0 = (bat * Skv + kv0p) * Hkv + hkv
+                    rows = range(KV_STEP) if w is None else WAVE_BLOCKS[w]
+                    if w is not None:
+                        ok(Skv - kv0p - rows[0] >= len(rows), "W1", "per-wave TDM extent")
                     for d in (D_QK, D_V):
-                        for c0, w in segs(d):
+                        for c0, wd in segs(d):
+                            row0 = (bat * Skv + kv0p + rows[0]) * Hkv + hkv
                             first = row0 * d + c0
-                            last = first + (KV_STEP - 1) * Hkv * d + w - 1
-                            ok(0 <= first and last < B * Skv * Hkv * d, "Q1", "TDM global")
+                            last = first + (len(rows) - 1) * Hkv * d + wd - 1
+                            ok(0 <= first and last < B * Skv * Hkv * d, "W1" if w is not None else "Q1",
+                               "TDM global")
                     return kb
 
-                ring = Ring("Q2", TDM_OPS_KV, TDM_DEPTH)
-                ring.issue(0, tdm(0))
-                for s_ in range(1, TDM_DEPTH - 1):
-                    ring.issue(s_, tdm(min(s_, nlast)))
-                ring.wait(DQT_TW)
-                ring.read(0, 0)
-                cur = 0
-                for ii in range(nkvt_eff):
-                    kk = min(ii + TDM_DEPTH - 1, nlast)
-                    nxo = (TDM_DEPTH - 1) if cur == 0 else cur - 1
-                    ncur = 0 if cur == TDM_DEPTH - 1 else cur + 1
-                    ok(cur == ii % 3 and nxo == (ii + 2) % 3 and ncur == (ii + 1) % 3, "Q2", "rotation")
-                    ring.issue(nxo, tdm(kk))              # top of the body, no wait
-                    ring.consume(cur)                     # carried K/V A operands -> S/dP WMMAs
-                    ring.read(cur, ii)                    # dQ B operand tr16 of K(ii)
+                if nwave == 1:
+                    ring = Ring("Q2", TDM_OPS_KV, TDM_DEPTH)
+                    ring.issue(0, tdm(0))
+                    for s_ in range(1, TDM_DEPTH - 1):
+                        ring.issue(s_, tdm(min(s_, nlast)))
                     ring.wait(DQT_TW)
-                    ring.read(ncur, min(ii + 1, nlast))   # readback for ii+1
-                    ring.consume(cur)                     # tr16 operands -> dQ WMMAs
-                    cur = ncur
-                ring.wait(0)
-                ok(not ring.q, "Q2", "tensorcnt 0 at exit")
-                # Q/dO fragments, LSE/delta, dQ stores
+                    ring.read(0, 0)
+                    cur = 0
+                    for ii in range(nkvt_eff):
+                        kk = min(ii + TDM_DEPTH - 1, nlast)
+                        nxo = (TDM_DEPTH - 1) if cur == 0 else cur - 1
+                        ncur = 0 if cur == TDM_DEPTH - 1 else cur + 1
+                        ok(cur == ii % 3 and nxo == (ii + 2) % 3 and ncur == (ii + 1) % 3, "Q2", "rotation")
+                        ring.issue(nxo, tdm(kk))              # top of the body, no wait
+                        ring.consume(cur)                     # carried K/V A operands -> S/dP WMMAs
+                        ring.read(cur, ii)                    # dQ B operand tr16 of K(ii)
+                        ring.wait(DQT_TW)
+                        ring.read(ncur, min(ii + 1, nlast))   # readback for ii+1
+                        ring.consume(cur)                     # tr16 operands -> dQ WMMAs
+                        cur = ncur
+                    ring.wait(0)
+                    ok(not ring.q, "Q2", "tensorcnt 0 at exit")
+                else:
+                    # every TDM tile the 2-wave replay issues, per wave block, in bounds
+                    for kb in sorted({0, min(1, nlast)} | {min(i + 2, nlast) for i in range(nkvt_eff)}):
+                        for w in range(nwave):
+                            tdm(kb, w)
+                # Q/dO fragments, LSE/delta, dQ stores: per wave
                 base_l = (bat * Hq + qh) * Sq
-                for lane in LANES:
-                    row, half = lane_rc(lane)
-                    for qh_ in range(NQW):
-                        qg = q0 + qh_ * 16 + row
-                        ok(0 <= base_l + qg < B * Hq * Sq and (base_l + qg) * 4 < (1 << 28), "Q3", "lse")
-                        for d, ndt in ((D_QK, NDT_QK), (D_V, NDT_V)):
-                            rs = Hq * d // 8
-                            base = bat * Sq * rs + qh * d // 8
-                            for dt in range(ndt):
-                                t = base + qg * rs + half + dt * 4
-                                for tt in (t, t + 2):
-                                    ok(tt * 8 + 8 <= B * Sq * Hq * d and tt * 16 < (1 << 30), "Q3", "Q/dO frag")
-                                    ok((tt * 8) % d + 8 <= d, "Q3", "frag inside its row")
-                        base_dq = bat * Sq * Hq * D_QK + qh * D_QK
-                        for dtile in range(NDO_QK):
-                            for si in range(8):
-                                q_i = q0 + qh_ * 16 + half * 8 + si
-                                el = base_dq + q_i * Hq * D_QK + dtile * 16 + row
-                                ok(0 <= el < B * Sq * Hq * D_QK and el * 2 < (1 << 30), "Q5", "dq store")
-                                written_q[el] = written_q.get(el, 0) + 1
+                for w in range(nwave):
+                    q0 = q0g + w * BQW
+                    for lane in LANES:
+                        row, half = lane_rc(lane)
+                        for qh_ in range(nqw):
+                            qg = q0 + qh_ * 16 + row
+                            ok(0 <= base_l + qg < B * Hq * Sq and (base_l + qg) * 4 < (1 << 28), "Q3", "lse")
+                            for d, ndt in ((D_QK, NDT_QK), (D_V, NDT_V)):
+                                rs = Hq * d // 8
+                                base = bat * Sq * rs + qh * d // 8
+                                for dt in range(ndt):
+                                    t = base + qg * rs + half + dt * 4
+                                    for tt in (t, t + 2):
+                                        ok(tt * 8 + 8 <= B * Sq * Hq * d and tt * 16 < (1 << 30), "Q3", "Q/dO frag")
+                                        ok((tt * 8) % d + 8 <= d, "Q3", "frag inside its row")
+                            base_dq = bat * Sq * Hq * D_QK + qh * D_QK
+                            for dtile in range(NDO_QK):
+                                for si in range(8):
+                                    q_i = q0 + qh_ * 16 + half * 8 + si
+                                    el = base_dq + q_i * Hq * D_QK + dtile * 16 + row
+                                    ok(0 <= el < B * Sq * Hq * D_QK and el * 2 < (1 << 30), "Q5", "dq store")
+                                    written_q[el] = written_q.get(el, 0) + 1
+    # W2 on this shape's 2-wave trip counts (the self-test covers N = 1..160 as well)
+    for N in sorted(trips):
+        ring2_check(N, DQ_NWAVE)
+        COUNT["W2"] = COUNT.get("W2", 0) + 1
 
 
 def main(names):
+    print("[W2] 2-wave ring protocol self-test, N = 1..160 + mutations", flush=True)
+    ring2_selftest()
     for name in names:
         B, Sq, Skv, Hq, Hkv, causal = SHAPES[name]
         assert Sq % 64 == 0 and Sq % DQ_BQW == 0 and Skv % 32 == 0 and Hq % Hkv == 0  # impl.py
+        print(f"[{name}] dq_split {dq_split(Sq)} (q_split, n32, n96)", flush=True)
         wkv = {"k": {}, "v": {}}
         wq = {}
+        stats = {}
         dkdv_shape(B, Sq, Skv, Hq, Hkv, causal, wkv)
         dkdv_cover(B, Sq, Skv, Hq, Hkv)
-        dqg_shape(B, Sq, Skv, Hq, Hkv, causal, wq)
+        dqg_shape(B, Sq, Skv, Hq, Hkv, causal, wq, stats)
         # exactly-once on the replayed (extreme) workgroups: every replayed element once
         ok(all(v == 1 for v in wkv["k"].values()) and all(v == 1 for v in wkv["v"].values()),
            "K5", "dk/dv element written twice")
@@ -493,12 +852,17 @@ def main(names):
         ok(len(wkv["k"]) == nb * nh * Skv * D_QK and len(wkv["v"]) == nb * nh * Skv * D_V,
            "K5", f"dk/dv coverage {len(wkv['k'])}")
         ok(len(wq) == len({0, B - 1}) * len({0, Hq - 1}) * Sq * D_QK, "Q5", "dq coverage")
-        print(f"[{name}] B{B} Sq{Sq} Skv{Skv} Hq{Hq} Hkv{Hkv} causal{causal}: ok", flush=True)
+        print(f"[{name}] B{B} Sq{Sq} Skv{Skv} Hq{Hq} Hkv{Hkv} causal{causal}: ok; masked-step classes "
+              "(nwave, wave, masked, fully_masked, unmasked): count = "
+              + ", ".join(f"{k}: {v}" for k, v in sorted(stats.items())), flush=True)
     print("checks:", " ".join(f"{k}={v}" for k, v in sorted(COUNT.items())))
     print(f"layout: D_QK {D_QK} D_V {D_V} rows {XK}/{XV} B, segments qk {segs(D_QK)} v {segs(D_V)}; "
-          f"k_dkdv stage {QDO_B} B x {TDM_DEPTH} = {TDM_DEPTH * QDO_B} B, {TDM_OPS_QDO} TDM ops/stage, "
+          f"k_dkdv64 {DKDV_NW} waves, stage {QDO_B} B x {TDM_DEPTH} = {TDM_DEPTH * QDO_B} B shared, "
+          f"{TDM_OPS_QDO} TDM ops/stage/wave ({ROWS_W} rows each), P/dS {PDS_B} B/wave, alloc {ALLOC_KV} B, "
+          f"epilogue {EPI_W} B/wave, "
           f"wait {TW_QDO}; k_dqg stage {KV_B} B x {TDM_DEPTH} = {TDM_DEPTH * KV_B} B, {TDM_OPS_KV} ops, "
-          f"wait {DQT_TW}; DS imm max {max(DS_IMM)} / {max(DSQ_IMM)}")
+          f"wait {DQT_TW}; k_dqg96 {DQ_NWAVE} waves x {KV_STEP // DQ_NWAVE} TDM rows; "
+          f"DS imm max {max(DS_IMM)} / {max(DSQ_IMM)}")
     print("BOUNDS_PROOF PASS")
 
 

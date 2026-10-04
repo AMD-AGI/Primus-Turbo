@@ -1,4 +1,4 @@
-"""flydsl_attn_bwd: the gfx1250 FlyDSL backward (k_delta, k_dkdv, k_dqg in kernels.py)."""
+"""flydsl_attn_bwd: the gfx1250 FlyDSL backward (k_delta, k_dkdv64, k_dqg96 + k_dqg in kernels.py)."""
 import importlib.util as _ilu
 import pathlib as _pl
 
@@ -45,7 +45,9 @@ _COMPILED = {}
 
 def _launch(name, launcher, args):
     """Launch `launcher(*args)`, via flyc.compile's fast path after the first call."""
-    key = (name, tuple((a.dtype, a.dim()) for a in args if isinstance(a, torch.Tensor)),
+    # id(launcher): one plan name may map to different launchers by shape (k_dqg96 vs k_dqg).
+    key = (name, id(launcher),
+           tuple((a.dtype, a.dim()) for a in args if isinstance(a, torch.Tensor)),
            args[0].device.index)
     fn = _COMPILED.get(key)
     if fn is not None:
@@ -116,11 +118,13 @@ def _check(do, q, k, v, o, lse):
     assert o.shape == (b, sq, hq, dv) and do.shape == o.shape, (q.shape, o.shape, do.shape)
     assert lse.shape == (b, hq, sq), f"lse must be [B, Hq, Sq], got {tuple(lse.shape)}"
     assert hq % hkv == 0, f"heads_q {hq} is not a multiple of heads_kv {hkv}"
-    # k_dkdv consumes query PAIRS of 32 rows and k_dqg query tiles of DQ_BQW (grid.y =
-    # sq // DQ_BQW): a remainder would leave rows uncomputed and write past the end.
+    # k_dkdv consumes query PAIRS of 32 rows; k_dqg tiles [0, q_split) by DQ_BQW and k_dqg96
+    # [q_split, sq) by DQ_BQW96 (kernels.dq_split): a remainder would leave rows uncomputed and
+    # write past the end.
     assert sq % 64 == 0 and sq % _k.DQ_BQW == 0, f"seqlen_q must be a multiple of 64, got {sq}"
-    assert skv % _k.KV_STEP == 0 and skv % _k.BLOCK_KV == 0, (
-        f"seqlen_kv must be a multiple of {_k.KV_STEP}, got {skv}")
+    # k_dkdv64 consumes DKDV_NW*BLOCK_KV = 64-row kv blocks (one 32-row tile per wave).
+    assert skv % _k.KV_STEP == 0 and skv % (_k.BLOCK_KV * _k.DKDV_NW) == 0, (
+        f"seqlen_kv must be a multiple of {_k.BLOCK_KV * _k.DKDV_NW}, got {skv}")
     n_rows = b * sq * hq
     assert n_rows % _k.ROWS_DELTA == 0, (
         f"batch*seqlen_q*heads_q must be a multiple of {_k.ROWS_DELTA}, got {n_rows}")
@@ -160,19 +164,32 @@ def _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, dq_stream=None):
     launches = [
         ("delta", _k.launch_delta,
          (do, o, delta, sq, hq, n_rows, n_rows // _k.ROWS_DELTA, stream), "main"),
-        ("dkdv", _k.launch_dkdv,
+        # k_dkdv64: 2 waves per 64-row kv block share one Q/dO ring (bwd_r2_a)
+        ("dkdv", _k.launch_dkdv64,
          (q, k, v, do, lse, delta, dv, dk, float(softmax_scale),
           sq, skv, hq, hkv, g, sq // 16, skv - sq, c,
-          skv // _k.BLOCK_KV, hkv, b, stream), "main"),
-        ("dqg", _k.launch_dqg,
-         (q, k, v, do, o, lse, delta, dq, float(softmax_scale),
-          sq, skv, hq, hkv, g, skv // _k.KV_STEP, skv - sq, c,
-          sq // _k.DQ_BQW, hq, b, dq_stream), "dq"),
+          skv // (_k.BLOCK_KV * _k.DKDV_NW), hkv, b, stream), "main"),
     ]
     grids = {"delta": (n_rows // _k.ROWS_DELTA, 1, 1),
-             "dkdv": (hkv, skv // _k.BLOCK_KV, b),
-             "dqg": (hq, sq // _k.DQ_BQW, b)}
-    return {"launches": launches, "outputs": (dq, dk, dv), "delta": delta, "grids": grids}
+             "dkdv": (hkv, skv // (_k.BLOCK_KV * _k.DKDV_NW), b)}
+    # dQ chain: k_dqg96 (2 waves x 48 queries on one K/V ring, bwd_r2_b) over [q_split, sq),
+    # longest-first, then the 32-query k_dqg over the head [0, q_split) (the shortest tiles). Plan
+    # name "dqg" is the main dQ launch (k_dqg96; k_dqg when there is no 96-query part), "dqg_head"
+    # the head launch. Both are single-kernel modules, so the compile-only dump/ISA table sees each
+    # kernel on its own.
+    q_split, n32, n96 = _k.dq_split(sq)
+    assert q_split + n96 * _k.DQ_BQW96 == sq and n32 * _k.DQ_BQW == q_split, (sq, q_split, n32, n96)
+    dq_args = (q, k, v, do, o, lse, delta, dq, float(softmax_scale),
+               sq, skv, hq, hkv, g, skv // _k.KV_STEP, skv - sq, c)
+    if n96:
+        launches.append(("dqg", _k.launch_dqg96, dq_args + (q_split, n96, hq, b, dq_stream), "dq"))
+        grids["dqg"] = (hq, n96, b)
+    if n32:
+        nm = "dqg_head" if n96 else "dqg"
+        launches.append((nm, _k.launch_dqg, dq_args + (0, n32, hq, b, dq_stream), "dq"))
+        grids[nm] = (hq, n32, b)
+    return {"launches": launches, "outputs": (dq, dk, dv), "delta": delta, "grids": grids,
+            "dq_split": (q_split, n32, n96)}
 
 
 def flydsl_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True):

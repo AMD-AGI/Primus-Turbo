@@ -1,8 +1,11 @@
 """gfx1250 FlyDSL flash-attention backward: k_delta, k_dkdv, k_dqg (wave32 WMMA, bf16).
 
     delta[b,h,s] = sum_d dO*O                                   k_delta_bshd
-    dV[kv,:] = sum_q P^T dO ;  dK[kv,:] = sum_q dS^T Q           k_dkdv  (one wave per kv tile)
-    dQ[q,:]  = sum_kv dS K                                       k_dqg   (one wave per q tile)
+    dV[kv,:] = sum_q P^T dO ;  dK[kv,:] = sum_q dS^T Q           k_dkdv64 (two waves per 64-row kv
+                                                                 block, one shared Q/dO ring)
+    dQ[q,:]  = sum_kv dS K                                       k_dqg96 (two waves x 48 queries
+                                                                 share one K/V ring) + k_dqg
+                                                                 (32-query head tiles)
 
 Head dims: D_QK for q/k/dq/dk (S = Q K^T contracts D_QK), D_V for v/o/do/dv (dP = dO V^T
 contracts D_V); DeepSeek-V3 MLA is D_QK = 192 (128 nope + 64 rope), D_V = 128.
@@ -14,8 +17,12 @@ element written once, deterministic.
 
 k_dkdv stages Q/dO through a 3-stage Tensor-Data-Mover LDS ring (prefetch two iterations
 ahead) and reads the next iteration's S/dP B operands back into VGPRs one iteration early;
-k_dqg does the same with a 3-stage K/V ring. Both run one wave32 per workgroup, so there is
-no s_barrier anywhere. The design history behind every choice is in PROVENANCE.md.
+k_dqg does the same with a 3-stage K/V ring. k_delta, k_dqg and the legacy one-wave k_dkdv
+run one wave32 per workgroup with no s_barrier; k_dkdv64 runs two waves (one per SIMD) over ONE
+Q/dO ring and synchronises it with one workgroup barrier per full-loop iteration (protocol at
+_dkdv_impl); k_dqg96 runs two waves on one K/V ring (each TDMs half of every tile) with one
+workgroup barrier per kv step (_wg_sync). The design history behind every choice is in
+PROVENANCE.md.
 """
 import importlib.util as _ilu
 import pathlib as _pl
@@ -31,6 +38,7 @@ _sp.loader.exec_module(_env)
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir as _mlir_ir  # UNSTABLE(gfx1250): gpu.barrier memfence attribute
 from flydsl._mlir.dialects import llvm as llvm_dialect  # UNSTABLE(gfx1250): LDS load/store
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.rocdl import tdm_ops  # UNSTABLE(gfx1250): tensor_wait
@@ -105,8 +113,17 @@ NQE = 2 * NDT_QK             # carried Q readback entries per 16-query half (u =
 NHB = NQE + 2 * NDT_V        # + dO entries
 DK0 = NKV * NDO_V            # dK accumulators follow the dV ones
 EPI_CB = 48                  # epilogue d-row: 32 B of kv row + 16 B pad (12 dwords)
+EPI_W = NKV * (D_V + D_QK) * EPI_CB          # one wave's dV + dK epilogue images (30720 B)
+# k_dkdv64: DKDV_NW waves per workgroup; wave w owns kv rows [kv0g + 32w, kv0g + 32w + 32) of the
+# workgroup's DKDV_NW*BLOCK_KV-row block. The waves share ONE Q/dO ring (TDM issued cooperatively,
+# num_warps = DKDV_NW: wave w moves rows [16w, 16w + 16) of every 32-row tile); each keeps its own
+# P/dS tiles at LDS_SEG + w*PDS_B and its own epilogue image at w*EPI_W inside the dead ring.
+DKDV_NW = 2
+PDS_B = 2 * 32 * S_ROW_B     # one wave's P + dS tiles (5120 B)
+BAR_KH = NKV // 2            # k_dkdv64 full loop: the ring barrier sits before kv sub-tile BAR_KH's WMMAs
 assert TDM_DEPTH * QDO_B <= LDS_SEG, "the Q/dO ring must stay inside LDS segment 0"
-assert NKV * (D_V + D_QK) * EPI_CB <= TDM_DEPTH * QDO_B, "epilogue images must fit the dead ring"
+assert DKDV_NW * EPI_W <= TDM_DEPTH * QDO_B, "epilogue images must fit the dead ring"
+assert 32 % DKDV_NW == 0 and (DKDV_NW & (DKDV_NW - 1)) == 0, "TDM num_warps splits 32 rows evenly"
 
 DELTA_THREADS = 256
 LANES_PER_ROW = D_V // 8
@@ -152,14 +169,27 @@ def _stv(vals, buf, tile, dt):
     fx.copy_atom_call(_atom(dt, n), f, fx.slice(buf, (tile, None)))
 
 
+def _lds_barrier():
+    """Workgroup barrier whose fences cover LDS only (gpu.barrier memfence [workgroup]): the
+    release side drains this wave's DS ops (s_wait_dscnt 0) but not its in-flight global
+    loads (the LSE/delta prefetch), which a plain gpu.barrier() also waits for."""
+    fx.gpu.barrier(address_spaces=_mlir_ir.Attribute.parse("[#gpu.address_space<workgroup>]"))
+
+
 def _exp2(x):
     return fx.Float32(fx.rocdl.exp2(fx.Float32.ir_type, x.ir_value()))
 
 
-def _tdm_rows(src, off, d, rows, valid, rs_el, lds_row0, lds_ty):
+def _tdm_rows(src, off, d, rows, valid, rs_el, lds_row0, lds_ty, num_warps=1):
     """TDM the [rows][d] bf16 tile at element `off` of `src` (row stride rs_el elements,
     outer extent `valid` rows) into LDS at byte address lds_row0, row stride d*2+16 bytes:
-    one TDM op per power-of-two column segment, so len(_pow2_segments(d)) ops."""
+    one TDM op per power-of-two column segment, so len(_pow2_segments(d)) ops. num_warps > 1
+    is the cooperative form: every wave of the workgroup issues the same ops and wave w moves
+    rows [w*rows/num_warps, (w+1)*rows/num_warps) (FlyDSL splits the outer dim by wave_id; the
+    per-wave outer extent clamp is valid - w*rows/num_warps). Used by k_dkdv64 (Q/dO ring) and
+    k_dqg96 (K/V ring): each wave's tensorcnt then counts only its own len(_pow2_segments(d))
+    ops (FlyDSL GFX1250 TDM lowering: per-wave global/LDS offset from rocdl.wave_id, the fwd's
+    num_warps 8 pattern)."""
     x_el = d + 8
     for c0, w in _pow2_segments(d):
         g_off = off if c0 == 0 else off + fx.Int64(c0)
@@ -167,7 +197,7 @@ def _tdm_rows(src, off, d, rows, valid, rs_el, lds_row0, lds_ty):
         g_view = fx.Tensor(fx.make_view(fx.add_offset(fx.get_iter(src), g_off),
                                         fx.make_layout((rows, w), (d, 1))))
         atom = fx.rocdl.cdna5.make_tdm_atom(
-            g_view, [valid, None], strides=[rs_el, None], num_warps=1,
+            g_view, [valid, None], strides=[rs_el, None], num_warps=num_warps,
             pad_interval=w, pad_amount=x_el - w)
         l_view = fx.Tensor(fx.make_view(fx.inttoptr(lds_ty, lb),
                                         fx.make_layout((rows, w), (x_el, 1))))
@@ -223,19 +253,50 @@ def launch_delta(DO, O, DEL, S: fx.Int32, H: fx.Int32, n_rows: fx.Int32,
 
 # =================================================================== dkdv =========
 def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
-               scale, Sq, Skv, Hq, Hkv, G, nqt, cshift, causal, B_):
+               scale, Sq, Skv, Hq, Hkv, G, nqt, cshift, causal, B_, nw=1):
     """One wave owns a BLOCK_KV-row kv tile of one kv head and streams every (q head, q pair).
 
-    grid = (Hkv, Skv/BLOCK_KV, B). The accumulators persist across the G q heads that share
-    this kv head, so the GQA reduction happens in registers -- atomic-free, written once.
+    nw (compile-time) waves per workgroup. nw = 1: the legacy k_dkdv, grid = (Hkv,
+    Skv/BLOCK_KV, B), no barrier. nw = DKDV_NW: k_dkdv64, grid = (Hkv, Skv/(nw*BLOCK_KV), B);
+    wave w (rocdl.wave_id, an SGPR) owns kv rows kv0g + w*BLOCK_KV + [0, BLOCK_KV) and every
+    wave streams the SAME (q pair, q head) sequence -- the workgroup's -- out of ONE Q/dO ring.
+    The accumulators persist across the G q heads that share this kv head, so the GQA
+    reduction happens in registers -- atomic-free, written once.
+
+    k_dkdv64 ring protocol. Every wave runs the same instruction stream: the wave index only
+    offsets addresses (kv rows, P/dS tiles, epilogue image, its TDM half), no branch depends on
+    it, and every trip count comes from the block ids and kernel args, so every wave takes the
+    same barriers: 2 per masked iteration + 2 in the prologue + 1 per full iteration + 1 before
+    the epilogue (bounds_proof.py K6 replays them). BARRIER = _lds_barrier(): LDS-only
+    workgroup release fence (s_wait_dscnt 0: this wave's DS ops retired; TDM retirement is the
+    explicit tensor_wait before it) + s_barrier_signal/wait + acquire fence.
+      masked iteration: BARRIER (WAR: every wave's reads of stage 0 retired) -> TDM own half of
+        the tile into stage 0 -> tensor_wait(0) -> BARRIER (RAW) -> readback/tr16 of stage 0.
+      prologue: BARRIER (WAR vs the masked loop) -> TDM stages 0, 1 -> tensor_wait(TW_QDO)
+        (own half of stage 0) -> BARRIER (RAW) -> readback of stage 0.
+      full iteration ii: TDM into (ii+2)%3 at the top [WAR: its last readers -- readback in
+        ii-2, tr16 in ii-1 -- retired before BARRIER(ii-1)]; tr16 of stage ii%3; dK/dV WMMAs of
+        kv sub-tiles < BAR_KH; tensor_wait(TW_QDO) (own half of stage (ii+1)%3); BARRIER(ii);
+        readback of stage (ii+1)%3 [RAW: every wave's half retired before BARRIER(ii)]; WMMAs
+        of kv sub-tiles >= BAR_KH (they hide the readback latency).
+      exit: tensor_wait(0) -> BARRIER (every wave's last TDM landed, every ring read retired)
+        -> the epilogue images overwrite the ring.
     """
-    lane = fx.Int32(fx.thread_idx.x)
+    if const_expr(nw == 1):
+        lane = fx.Int32(fx.thread_idx.x)
+    else:
+        lane = fx.Int32(fx.thread_idx.x) % fx.Int32(WAVE)
     hkv = fx.Int32(fx.block_idx.x)              # kv head (cheap axis fastest)
-    bid = fx.Int32(fx.block_idx.y)              # kv tile
+    bid = fx.Int32(fx.block_idx.y)              # kv tile (nw = 1) / kv block (nw > 1)
     bat = fx.Int32(fx.block_idx.z)              # batch
     row = lane % fx.Int32(16)
     half = lane // fx.Int32(16)
     kv0 = bid * fx.Int32(BLOCK_KV)
+    kv0g = kv0                                  # the workgroup's first kv row (loop bounds)
+    if const_expr(nw > 1):
+        wv = fx.Int32(rocdl.wave_id())          # wave in the workgroup, [0, nw), SGPR
+        kv0g = bid * fx.Int32(nw * BLOCK_KV)
+        kv0 = kv0g + wv * fx.Int32(BLOCK_KV)    # this wave's kv tile
 
     # TRUE byte extents on every k_dkdv descriptor: an over-read returns 0 instead of
     # walking into the next page, and a clamp that hit a LIVE access would crater SQNR.
@@ -255,9 +316,12 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
     # LDS: the Q/dO ring at offset 0 (segment 0), the P/dS tiles exactly one 64 KB segment
     # up, so the output GEMM's A reads (P, dS) and B reads (dO, Q) use different LDS read
     # ports whatever the workgroup's physical LDS base is.
-    smem = fx.SharedAllocator().allocate(LDS_SEG + 2 * 32 * S_ROW_B)
+    # nw > 1: one shared ring, a P/dS tile pair per wave (wave w at LDS_SEG + w*PDS_B).
+    smem = fx.SharedAllocator().allocate(LDS_SEG + nw * PDS_B)
     _lds0 = fx.Int32(fx.ptrtoint(smem.peek().ptr))
     lds_p = _lds0 + fx.Int32(LDS_SEG)
+    if const_expr(nw > 1):
+        lds_p = lds_p + wv * fx.Int32(PDS_B)
     lds_ds = lds_p + fx.Int32(32 * S_ROW_B)
     v8b = fx.Vector.make_type(8, fx.BFloat16)
     v8f = fx.Vector.make_type(8, fx.Float32)
@@ -318,8 +382,9 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
         valid = Sq - q0
         lb_v = _lds0 + stage_off
         lb_k = _lds0 + stage_off + fx.Int32(QOFF)
-        _tdm_rows(DO, off_v, D_V, 32, valid, _q_rs_v, lb_v, _lds_bf_ty)
-        _tdm_rows(Q, off_k, D_QK, 32, valid, _q_rs_k, lb_k, _lds_bf_ty)
+        # nw > 1: cooperative, wave w moves rows [16w, 16w + 16) (own tensorcnt)
+        _tdm_rows(DO, off_v, D_V, 32, valid, _q_rs_v, lb_v, _lds_bf_ty, nw)
+        _tdm_rows(Q, off_k, D_QK, 32, valid, _q_rs_k, lb_k, _lds_bf_ty, nw)
 
     # K and V fragments of this kv tile are invariant over every query and every q head.
     kf = [[gfrag(g_k, base_k, rs_k, kv0 + fx.Int32(kh * 16), dt) for dt in range(NDT_QK)]
@@ -342,7 +407,10 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
         return (b_v, b_v) if SAME_D else (_lds0 + stage_off + lb_rd_k, b_v)
 
     # Causal tile skip: under bottom-right causal, kv row j is attended only by queries
-    # q >= j - cshift, so query pairs below qp_start contribute exactly zero to dK/dV.
+    # q >= j - cshift, so query pairs below qp_start contribute exactly zero to dK/dV. All loop
+    # bounds use the WORKGROUP's kv rows [kv0g, kv0g + nw*BLOCK_KV) (block id only): a pair
+    # below qp_start is fully masked for every wave, a pair from qp_start + nmaskp on fully
+    # unmasked for every wave; inside the masked pairs each wave masks with its own kv0.
     nqt2 = nqt // fx.Int32(2)                   # query tiles come in PAIRS
 
     def _clampqt(t):
@@ -350,7 +418,7 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
         t = (t < nqt2).select(t, nqt2 - fx.Int32(1))
         return (t < fx.Int32(0)).select(fx.Int32(0), t)
 
-    _c = kv0 - cshift
+    _c = kv0g - cshift
     qp_start = ((_c < fx.Int32(0)).select(fx.Int32(0), _c)) // fx.Int32(32)
     qp_start = (causal != fx.Int32(0)).select(qp_start, fx.Int32(0))
     nqp_eff = nqt2 - qp_start
@@ -399,10 +467,18 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
             nxt = None
             cur_off = fx.Int32(0)
             pre = _ldl(qt, gh, trim=False)
+            if const_expr(nw > 1):
+                # WAR: every wave's reads of stage 0 (previous masked iteration) retired
+                rocdl.sched_barrier(0)
+                _lds_barrier()
+                rocdl.sched_barrier(0)
             _tdm_qdo(qt, gh, cur_off)
             rocdl.sched_barrier(0)
             tdm_ops.tensor_wait(0)
             rocdl.sched_barrier(0)
+            if const_expr(nw > 1):
+                _lds_barrier()                # RAW: every wave's half of the tile landed
+                rocdl.sched_barrier(0)
         lds_do = _lds0 + cur_off
 
         # The S/dP B operands, read back from the TDM image: lane (row, half) reads row
@@ -466,8 +542,9 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
         rocdl.sched_barrier(0)
         for v_, a_ in pst:
             llvm_dialect.store(fx.as_ir_value(v_), create_llvm_ptr(a_, address_space=3))
-        # One wave per workgroup: no barrier between the P/dS stores and their tr16 reads;
-        # the backend derives the dscnt wait from the LDS dependence.
+        # The P/dS tiles are private to the wave (one per wave at nw > 1): no barrier between
+        # the P/dS stores and their tr16 reads; the backend derives the dscnt wait from the
+        # LDS dependence.
 
         # 32 queries staged, so the contraction is FULL: rows [lane_r] and [lane_r+16]
         # concatenate in lane into a v16 operand.
@@ -514,7 +591,7 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
                     b_do.append(tr(tr_v + fx.Int32(dtile * 32), XV_ROW_B))
                 if const_expr(dtile < NDO_QK):
                     b_q.append(tr(tr_k + fx.Int32(QOFF + dtile * 32), XK_ROW_B))
-        if const_expr(carry):
+        if const_expr(carry and nw == 1):
             # Outstanding TDM here: stage (it+1)%3 (issued in it-1) and (it+2)%3 (issued at
             # the top of this iteration), TDM_OPS_QDO ops each. Waiting down to TDM_OPS_QDO
             # retires the older stage, the one about to be read (TDM ops retire in order).
@@ -525,6 +602,19 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
         rocdl.sched_barrier(0)
         new = [None] * NST
         for kh in range_constexpr(NKV):
+            if const_expr(carry and nw > 1 and kh == BAR_KH):
+                # k_dkdv64: the ring barrier, after the WMMAs of kv sub-tiles < BAR_KH (their
+                # run hides the drain of this iteration's tr16 reads). tensor_wait retires
+                # this wave's half of stage (it+1)%3; the barrier's release fence drains its
+                # DS reads of stage it%3 (WAR for the TDM at the top of it+1); after it every
+                # wave's half of (it+1)%3 is in LDS, so the readback may start.
+                rocdl.sched_barrier(0)
+                tdm_ops.tensor_wait(TW_QDO)
+                rocdl.sched_barrier(0)
+                _lds_barrier()
+                rocdl.sched_barrier(0)
+                rb = _rdqd(rb_off, rb_base)
+                rocdl.sched_barrier(0)
             a_p = a_pk[kh]
             a_ds = a_dsk[kh]
             # A-operand reuse hint: within a run of WMMAs, A is one 16x32 subtile held
@@ -603,6 +693,11 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
         tile (qt0, gh 0), stage 1 iteration min(1, n-1)'s, clamped to a legal query pair, so
         an empty or 1-iteration loop still issues only in-bounds tiles (never read). Then
         retire stage 0 and read back iteration 0's B operands."""
+        if const_expr(nw > 1):
+            # WAR: every wave's reads of stage 0 in the masked loop retired
+            rocdl.sched_barrier(0)
+            _lds_barrier()
+            rocdl.sched_barrier(0)
         _tdm_qdo(_clampqt(qt0), fx.Int32(0), fx.Int32(0))
         # j1 = max(min(1, n-1), 0) is 1 iff n > 1, and 1 == wrap(0, 0).
         q1w, g1w = _wrap(fx.Int32(0), fx.Int32(0))
@@ -613,12 +708,15 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
         rocdl.sched_barrier(0)
         tdm_ops.tensor_wait(TW_QDO)
         rocdl.sched_barrier(0)
+        if const_expr(nw > 1):
+            _lds_barrier()                    # RAW: every wave's half of stage 0 landed
+            rocdl.sched_barrier(0)
         return [_ir(v) for v in _rdqd(fx.Int32(0))]
 
     # Query pair `qt` is fully unmasked iff this workgroup's LARGEST key index is attended
-    # by the pair's SMALLEST query: kv0 + BLOCK_KV-1 <= qt*32 + cshift, i.e.
-    # qt >= ceil((kv0 + BLOCK_KV-1 - cshift)/32). cshift = Skv - Sq can be negative.
-    _u = kv0 + fx.Int32(BLOCK_KV - 1) - cshift
+    # by the pair's SMALLEST query: kv0g + nw*BLOCK_KV-1 <= qt*32 + cshift, i.e.
+    # qt >= ceil((kv0g + nw*BLOCK_KV-1 - cshift)/32). cshift = Skv - Sq can be negative.
+    _u = kv0g + fx.Int32(nw * BLOCK_KV - 1) - cshift
     _qsf = (_u < fx.Int32(0)).select(fx.Int32(0), (_u + fx.Int32(31)) // fx.Int32(32))
     _qsf = (_qsf < nqt2).select(_qsf, nqt2)
     _nm = _qsf - qp_start
@@ -641,6 +739,14 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
     # Retire the last iteration's (clamped) prefetch -- or the prologue's, when the loop ran
     # 0 times -- before the epilogue reuses the start of LDS, which overlaps the ring.
     tdm_ops.tensor_wait(0)
+    _epi0 = _lds0
+    if const_expr(nw > 1):
+        # every wave's TDM landed and every wave's ring reads (incl. the dead final readback)
+        # retired before any wave's image overwrites the ring; wave w's image at w*EPI_W
+        rocdl.sched_barrier(0)
+        _lds_barrier()
+        rocdl.sched_barrier(0)
+        _epi0 = _lds0 + wv * fx.Int32(EPI_W)
 
     # Epilogue: stage the dK/dV accumulators through the finished ring as COLUMN-major
     # images M[d][kv] (a lane's 8 kv rows of one d column are contiguous: one ds_write_b128
@@ -651,8 +757,8 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
     g_dv8 = _bv(DV_, nv_b, fx.BFloat16, 8)
     g_dk8 = _bv(DK, nk_b, fx.BFloat16, 8)
     for kh in range_constexpr(NKV):
-        lds_ev = _lds0 + fx.Int32(kh * (D_V + D_QK) * EPI_CB)
-        lds_ek = _lds0 + fx.Int32((kh * (D_V + D_QK) + D_V) * EPI_CB)
+        lds_ev = _epi0 + fx.Int32(kh * (D_V + D_QK) * EPI_CB)
+        lds_ek = _epi0 + fx.Int32((kh * (D_V + D_QK) + D_V) * EPI_CB)
         for dtile in range_constexpr(NDO_MAX):
             o = (fx.Int32(dtile * 16) + row) * fx.Int32(EPI_CB) + half * fx.Int32(16)
             if const_expr(dtile < NDO_V):
@@ -711,6 +817,29 @@ def launch_dkdv(Q, K, V, DO, LSE, DEL, DV_, DK, scale: fx.Float32,
         grid=(nhkv, nblk, nb), block=(32, 1, 1), stream=stream)
 
 
+# k_dkdv64: DKDV_NW = 2 waves per workgroup (one per SIMD at 1 wave/SIMD), 64 kv rows per
+# Q/dO fetch, so the Q/dO TDM bytes and LDS writes per dK/dV FLOP halve. Same body as k_dkdv
+# (each wave keeps its 887-VGPR register plan), one shared ring, barriers per _dkdv_impl.
+@flyc.kernel(known_block_size=[WAVE * DKDV_NW, 1, 1])
+def k_dkdv64(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, DO: fx.Tensor,
+             LSE: fx.Tensor, DEL: fx.Tensor, DV_: fx.Tensor, DK: fx.Tensor,
+             scale: fx.Float32, Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32,
+             G: fx.Int32, nqt: fx.Int32, cshift: fx.Int32, causal: fx.Int32, B_: fx.Int32):
+    _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK, scale, Sq, Skv, Hq, Hkv,
+               G, nqt, cshift, causal, B_, DKDV_NW)
+
+
+@flyc.jit
+def launch_dkdv64(Q, K, V, DO, LSE, DEL, DV_, DK, scale: fx.Float32,
+                  Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32, G: fx.Int32,
+                  nqt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
+                  nblk: fx.Int32, nhkv: fx.Int32, nb: fx.Int32, stream: fx.Stream):
+    # grid = (Hkv kv heads, Skv/64 kv blocks, B); kv block g ascending = longest first (causal)
+    k_dkdv64(Q, K, V, DO, LSE, DEL, DV_, DK, scale, Sq, Skv, Hq, Hkv, G,
+             nqt, cshift, causal, nb).launch(
+        grid=(nhkv, nblk, nb), block=(WAVE * DKDV_NW, 1, 1), stream=stream)
+
+
 # ===================================================================== dqg ========
 # k_dqg -- one wave owns DQ_BQW queries of one q head and streams every KV_STEP-row kv
 # block through a 3-stage TDM K/V LDS ring. Global loop index i (full loop, then masked):
@@ -726,6 +855,58 @@ NKT = KV_STEP // 16
 # and Q/dO fragments grow 1.5x); 32 halves both (709 VGPR, no spill).
 DQ_BQW = 64 if D_QK <= 128 else 32
 NQW = DQ_BQW // 16
+# k_dqg48: the same kernel at 48 queries per wave (NQW48 = 3 query sub-tiles). Per 32-row kv step
+# it issues the same 64 DS loads and 20 KB of TDM as the 32-query kernel but 96 WMMA (S 36, dP 24,
+# dQ 36) instead of 64. Sq % 48 != 0 in general, so the 32-query k_dqg covers the head [0, q_split)
+# and k_dqg48 the rest; dq_split() is the single source of that split (impl._plan, bounds_proof).
+DQ_BQW48 = 48
+NQW48 = DQ_BQW48 // 16
+# k_dqg96: DQ_NWAVE waves per workgroup, each the k_dqg48 body over its own 48 queries, consume
+# ONE K/V TDM ring: 96 queries per K/V fetch. Wave w owns [q0 + 48w, q0 + 48w + 48), q0 =
+# q_off + bid*96; the kv range runs to the last wave's diagonal (both waves run the same trip
+# count; wave 0's extra steps are masked through do_mask). One barrier per kv step.
+DQ_NWAVE = 2
+DQ_BQW96 = DQ_NWAVE * DQ_BQW48
+DQ_SPLITS = (0, 32, 64)      # q_split candidates: multiples of DQ_BQW; lcm(32, 96) = 96 > 64
+
+
+def dq_split(sq, bqw=DQ_BQW96):
+    """(q_split, n32, nm) for Sq = sq: k_dqg runs n32 = q_split/32 tiles over queries [0, q_split),
+    the main dQ kernel (bqw 96: k_dqg96, the launched one; 48: k_dqg48) nm = (sq - q_split)/bqw
+    tiles over [q_split, sq); q_split is the smallest of DQ_SPLITS with (sq - q_split) % bqw == 0
+    (exists for every sq % 32 == 0: sq % 96 in {0, 32, 64}, sq % 48 in {0, 32, 16})."""
+    assert DQ_BQW == 32, "the k_dqg48/k_dqg96 split assumes the 32-query head kernel (D_QK 192)"
+    for qs in DQ_SPLITS:
+        if qs <= sq and (sq - qs) % bqw == 0:
+            return qs, qs // DQ_BQW, (sq - qs) // bqw
+    raise ValueError(f"no k_dqg/main split for seqlen_q {sq} at {bqw} queries per tile")
+
+
+# Workgroup sync of k_dqg96, one per kv step and one in the prologue. Every LDS read this wave
+# issued before it (the dQ tr16 of stage i%3, the readback of i-1) has retired (dscnt 0), and
+# every TDM op of this wave except the newest stage has retired (the caller's tensor_wait).
+# Raw split barrier with nothing between signal and wait; sched_barrier(0) on both sides keeps
+# every DS/TDM op on its side (checked on the ISA by tools/flydsl/isa_ring_barrier_check.py).
+# DQ_BARRIER_FENCE: workgroup release/acquire fences around signal/wait (gpu.barrier()'s
+# semantics), so no IR pass moves an LDS access across the barrier either. Measured at compile
+# time: the fences add no s_wait_tensorcnt 0 (the newest ring stage stays in flight) and no wait
+# the kernel did not already have (prologue loadcnt 0 is needed by the softmax constants anyway).
+DQ_BARRIER_FENCE = True
+
+
+def _wg_sync():
+    # UNSTABLE(gfx1250): s_wait_dscnt, raw s_barrier_signal/wait (id -1), llvm.fence
+    rocdl.sched_barrier(0)
+    rocdl.s_wait_dscnt(0)
+    if const_expr(DQ_BARRIER_FENCE):
+        llvm_dialect.fence(llvm_dialect.AtomicOrdering.release, syncscope="workgroup")
+    rocdl.s_barrier_signal(-1)
+    rocdl.s_barrier_wait(-1)
+    if const_expr(DQ_BARRIER_FENCE):
+        llvm_dialect.fence(llvm_dialect.AtomicOrdering.acquire, syncscope="workgroup")
+    rocdl.sched_barrier(0)
+
+
 VOFF = KV_STEP * XK_ROW_B    # ring stage: K [32][D_QK] at +0, V [32][D_V] at +VOFF
 KV_B = KV_STEP * (XK_ROW_B + XV_ROW_B)       # one ring stage (21504 B at 192/128)
 TDM_OPS_KV = len(_pow2_segments(D_QK)) + len(_pow2_segments(D_V))   # TDM ops per stage
@@ -747,9 +928,24 @@ DQT_VT_SGB = (2, 1)
 
 
 def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
-                  scale, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal):
-    BQW = DQ_BQW
-    lane = fx.Int32(fx.thread_idx.x)
+                  scale, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, q_off, ntile, nqw,
+                  nwave=1):
+    # nqw (compile-time): 16-query sub-tiles per wave (NQW 2 = k_dqg, NQW48 3 = k_dqg48/96).
+    # nwave (compile-time): waves per workgroup sharing the K/V ring (1, or DQ_NWAVE = k_dqg96).
+    # The workgroup owns queries [q0g, q0g + nwave*16*nqw), q0g = q_off + bid*BQWG, bid in
+    # [0, ntile) (runtime); wave wv owns [q0, q0 + BQW), q0 = q0g + wv*BQW. nwave == 1 is the
+    # single-wave kernel unchanged (q0 == q0g, lane == thread id, no barrier).
+    NQW = nqw
+    BQW = 16 * NQW
+    BQWG = BQW * nwave
+    if const_expr(nwave == 1):
+        lane = fx.Int32(fx.thread_idx.x)
+    else:
+        _tid = fx.Int32(fx.thread_idx.x)
+        lane = _tid % fx.Int32(WAVE)
+        # wave index in the workgroup (threads [32w, 32w+32) form wave w), made uniform (SGPR)
+        wv = fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type,
+                                          (_tid // fx.Int32(WAVE)).ir_value()))
     # XCD-major q-head remap: workgroups go to the 8 XCDs round-robin on the linear id, so
     # x -> (x%8)*(Hq/8) + x/8 puts adjacent q heads (one kv head under GQA) on one XCD.
     # A bijection of [0, Hq) whenever Hq % 8 == 0, else the identity.
@@ -757,12 +953,16 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
     _gx = fx.Int32(fx.block_idx.x)
     ngrp = Hq
     qh = (ngrp % _nx == fx.Int32(0)).select((_gx % _nx) * (ngrp // _nx) + _gx // _nx, _gx)
-    # longest-first: the query tile is walked DESCENDING on grid.y
-    bid = (Sq // fx.Int32(BQW) - fx.Int32(1) - fx.Int32(fx.block_idx.y))
+    # longest-first: the query tile is walked DESCENDING on grid.y (grid.y == ntile)
+    bid = ntile - fx.Int32(1) - fx.Int32(fx.block_idx.y)
     bat = fx.Int32(fx.block_idx.z)
     row = lane % fx.Int32(16)
     half = lane // fx.Int32(16)
-    q0 = bid * fx.Int32(BQW)
+    q0g = q_off + bid * fx.Int32(BQWG)
+    if const_expr(nwave == 1):
+        q0 = q0g
+    else:
+        q0 = q0g + wv * fx.Int32(BQW)
     hkv = qh // G
 
     # Fake 1 GiB / 256 MiB extents (impl.py asserts every tensor fits): never "fix" these to
@@ -817,15 +1017,16 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
     def _tdm_kv(kv0p, stage_off):
         """K then V tile [kv0p, kv0p+32) of (bat, hkv) into stage_off / +VOFF: TDM_OPS_KV
         ops. Origin element ((bat*Skv + kv0p)*Hkv + hkv)*D, row stride Hkv*D, outer extent
-        Skv - kv0p >= 32 (kv0p <= (nkvt-1)*32, bounds_proof.py Q1)."""
+        Skv - kv0p >= 32 (kv0p <= (nkvt-1)*32, bounds_proof.py Q1). nwave > 1: each wave
+        issues its KV_STEP/nwave-row block of every op (bounds_proof.py W1)."""
         row0 = fx.Int64(bat * Skv + kv0p) * fx.Int64(Hkv) + fx.Int64(hkv)
         off_k = row0 * fx.Int64(D_QK)
         off_v = off_k if SAME_D else row0 * fx.Int64(D_V)
         valid = Skv - kv0p
         lb_k = _lds0 + stage_off
         lb_v = _lds0 + stage_off + fx.Int32(VOFF)
-        _tdm_rows(K, off_k, D_QK, KV_STEP, valid, _kv_rs_k, lb_k, _lds_bf_ty)
-        _tdm_rows(V, off_v, D_V, KV_STEP, valid, _kv_rs_v, lb_v, _lds_bf_ty)
+        _tdm_rows(K, off_k, D_QK, KV_STEP, valid, _kv_rs_k, lb_k, _lds_bf_ty, nwave)
+        _tdm_rows(V, off_v, D_V, KV_STEP, valid, _kv_rs_v, lb_v, _lds_bf_ty, nwave)
 
     def _rdkv(stage_off):
         """NP ds_load_b128 in _RD_ORDER: K/V row kt*16+row, bytes half*16 + dt*64 + u*32."""
@@ -924,12 +1125,24 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
         rocdl.sched_barrier(0)
         b_ks = _bks(cur)
         rocdl.sched_barrier(0)
-        tdm_ops.tensor_wait(DQT_TW)
-        rocdl.sched_barrier(0)
-        rb = _rdkv(ncur)
-        rocdl.sched_barrier(0)
-        ds_halves[0].append(_smx(fx.Vector(s1[0]), fx.Vector(p1[0]), 0, 1, kv0, False))
-        rocdl.sched_barrier(0)
+        if const_expr(nwave == 1):
+            tdm_ops.tensor_wait(DQT_TW)
+            rocdl.sched_barrier(0)
+            rb = _rdkv(ncur)
+            rocdl.sched_barrier(0)
+            ds_halves[0].append(_smx(fx.Vector(s1[0]), fx.Vector(p1[0]), 0, 1, kv0, False))
+            rocdl.sched_barrier(0)
+        else:
+            # k_dqg96: softmax/dS (kt1, qh 0) covers the tr16 latency, then this wave's half
+            # of stage ncur retires (tensor_wait), the tr16 drains and the workgroup syncs
+            # (_wg_sync): both halves of ncur landed, every wave's reads of stage cur retired
+            # (the TDM at the top of i+1 targets it). Only then the readback of ncur.
+            ds_halves[0].append(_smx(fx.Vector(s1[0]), fx.Vector(p1[0]), 0, 1, kv0, False))
+            rocdl.sched_barrier(0)
+            tdm_ops.tensor_wait(DQT_TW)
+            _wg_sync()
+            rb = _rdkv(ncur)
+            rocdl.sched_barrier(0)
         new = [None] * (NQW * NDO_QK)
         for qh_ in range_constexpr(NQW):
             a_ds = fx.Vector.from_elements(ds_halves[qh_][0] + ds_halves[qh_][1],
@@ -980,11 +1193,21 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
         rocdl.sched_barrier(0)
         b_ks = _bks(cur)
         rocdl.sched_barrier(0)
-        tdm_ops.tensor_wait(DQT_TW)
-        rocdl.sched_barrier(0)
-        rb = _rdkv(ncur)
-        rocdl.sched_barrier(0)
-        ds_halves = _softmax()
+        if const_expr(nwave == 1):
+            tdm_ops.tensor_wait(DQT_TW)
+            rocdl.sched_barrier(0)
+            rb = _rdkv(ncur)
+            rocdl.sched_barrier(0)
+            ds_halves = _softmax()
+        else:
+            # k_dqg96: the softmax VALU covers the tr16 latency before the drain + sync (as in
+            # _body_ck); the readback of ncur follows the sync.
+            ds_halves = _softmax()
+            rocdl.sched_barrier(0)
+            tdm_ops.tensor_wait(DQT_TW)
+            _wg_sync()
+            rb = _rdkv(ncur)
+            rocdl.sched_barrier(0)
         a_ds = [fx.Vector.from_elements(ds_halves[qh_][0] + ds_halves[qh_][1],
                                         dtype=fx.BFloat16)
                 for qh_ in range_constexpr(NQW)]
@@ -1023,11 +1246,14 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
     kvloop_full = _mkloop(False)
     kvloop_mask = _mkloop(True)
 
-    _lim = (q0 + fx.Int32(BQW) + cshift + fx.Int32(KV_STEP - 1)) // fx.Int32(KV_STEP)
+    # kv range of the WORKGROUP tile [q0g, q0g + BQWG) (== the wave's when nwave == 1): every
+    # wave runs the same nfull full + (nkvt_eff - nfull) masked steps, so the barrier counts
+    # match; rows of an earlier wave past their own diagonal are masked by do_mask (ds = 0).
+    _lim = (q0g + fx.Int32(BQWG) + cshift + fx.Int32(KV_STEP - 1)) // fx.Int32(KV_STEP)
     _lim = (_lim < fx.Int32(1)).select(fx.Int32(1), _lim)
     _lim = (_lim < nkvt).select(_lim, nkvt)
     nkvt_eff = (causal != fx.Int32(0)).select(_lim, nkvt)
-    _t = q0 + cshift + fx.Int32(1)
+    _t = q0g + cshift + fx.Int32(1)
     _nf = (_t < fx.Int32(0)).select(fx.Int32(0), _t // fx.Int32(KV_STEP))
     _nf = (_nf < nkvt_eff).select(_nf, nkvt_eff)
     nfull = (causal != fx.Int32(0)).select(_nf, nkvt_eff)
@@ -1040,6 +1266,8 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
         _tdm_kv(t1 * fx.Int32(KV_STEP), fx.Int32(s_ * KV_B))
     rocdl.sched_barrier(0)
     tdm_ops.tensor_wait(DQT_TW)
+    if const_expr(nwave > 1):
+        _wg_sync()                                       # both halves of stage 0 landed
     rocdl.sched_barrier(0)
     rb0 = _rdkv(fx.Int32(0))
 
@@ -1065,17 +1293,63 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
 def k_dqg(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, DO: fx.Tensor, O: fx.Tensor,
           LSE: fx.Tensor, DEL: fx.Tensor, DQ: fx.Tensor,
           scale: fx.Float32, Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32,
-          G: fx.Int32, nkvt: fx.Int32, cshift: fx.Int32, causal: fx.Int32):
+          G: fx.Int32, nkvt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
+          q_off: fx.Int32, ntile: fx.Int32):
     _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G,
-                  nkvt, cshift, causal)
+                  nkvt, cshift, causal, q_off, ntile, NQW)
+
+
+@flyc.kernel(known_block_size=[32, 1, 1])
+def k_dqg48(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, DO: fx.Tensor, O: fx.Tensor,
+            LSE: fx.Tensor, DEL: fx.Tensor, DQ: fx.Tensor,
+            scale: fx.Float32, Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32,
+            G: fx.Int32, nkvt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
+            q_off: fx.Int32, ntile: fx.Int32):
+    _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G,
+                  nkvt, cshift, causal, q_off, ntile, NQW48)
 
 
 @flyc.jit
 def launch_dqg(Q, K, V, DO, O, LSE, DEL, DQ, scale: fx.Float32,
                Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32, G: fx.Int32,
                nkvt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
-               nblk: fx.Int32, ngrp: fx.Int32, nb: fx.Int32, stream: fx.Stream):
-    # grid = (Hq q heads, Sq / DQ_BQW query tiles, B)
+               q_off: fx.Int32, ntile: fx.Int32, ngrp: fx.Int32, nb: fx.Int32,
+               stream: fx.Stream):
+    # grid = (Hq q heads, ntile DQ_BQW-query tiles from q_off, B)
     k_dqg(Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G,
-          nkvt, cshift, causal).launch(
-        grid=(ngrp, nblk, nb), block=(32, 1, 1), stream=stream)
+          nkvt, cshift, causal, q_off, ntile).launch(
+        grid=(ngrp, ntile, nb), block=(32, 1, 1), stream=stream)
+
+
+@flyc.jit
+def launch_dqg48(Q, K, V, DO, O, LSE, DEL, DQ, scale: fx.Float32,
+                 Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32, G: fx.Int32,
+                 nkvt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
+                 q_off: fx.Int32, ntile: fx.Int32, ngrp: fx.Int32, nb: fx.Int32,
+                 stream: fx.Stream):
+    # grid = (Hq q heads, ntile DQ_BQW48-query tiles from q_off, B)
+    k_dqg48(Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G,
+            nkvt, cshift, causal, q_off, ntile).launch(
+        grid=(ngrp, ntile, nb), block=(32, 1, 1), stream=stream)
+
+
+@flyc.kernel(known_block_size=[DQ_NWAVE * WAVE, 1, 1])
+def k_dqg96(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, DO: fx.Tensor, O: fx.Tensor,
+            LSE: fx.Tensor, DEL: fx.Tensor, DQ: fx.Tensor,
+            scale: fx.Float32, Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32,
+            G: fx.Int32, nkvt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
+            q_off: fx.Int32, ntile: fx.Int32):
+    _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G,
+                  nkvt, cshift, causal, q_off, ntile, NQW48, DQ_NWAVE)
+
+
+@flyc.jit
+def launch_dqg96(Q, K, V, DO, O, LSE, DEL, DQ, scale: fx.Float32,
+                 Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32, G: fx.Int32,
+                 nkvt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
+                 q_off: fx.Int32, ntile: fx.Int32, ngrp: fx.Int32, nb: fx.Int32,
+                 stream: fx.Stream):
+    # grid = (Hq q heads, ntile DQ_BQW96-query tiles from q_off, B), DQ_NWAVE waves per workgroup
+    k_dqg96(Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G,
+            nkvt, cshift, causal, q_off, ntile).launch(
+        grid=(ngrp, ntile, nb), block=(DQ_NWAVE * WAVE, 1, 1), stream=stream)

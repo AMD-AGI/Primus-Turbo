@@ -60,8 +60,9 @@ def flydsl_gfx1250_mla_unsupported_reason(
     """Why the gfx1250 MLA kernels cannot take these [b, s, h, d]-shaped tensors, or None.
 
     Covers forward AND backward (the autograd path always needs both). The sequence rules are
-    the backward's: k_dkdv consumes query pairs of 32 rows and kv tiles of BLOCK_KV, k_dqg
-    query tiles of DQ_BQW and kv steps of KV_STEP, k_delta rows in groups of ROWS_DELTA.
+    the backward's: k_dkdv64 consumes query pairs of 32 rows and kv blocks of
+    DKDV_NW * BLOCK_KV (two waves of BLOCK_KV rows each), the dQ kernels (k_dqg96 / k_dqg) query
+    tiles of a multiple of DQ_BQW and kv steps of KV_STEP, k_delta rows in groups of ROWS_DELTA.
     """
     if q.dtype != torch.bfloat16 or k.dtype != q.dtype or v.dtype != q.dtype:
         return f"dtype must be bfloat16, got {q.dtype}/{k.dtype}/{v.dtype}"
@@ -82,7 +83,7 @@ def flydsl_gfx1250_mla_unsupported_reason(
     except ImportError as exc:  # flydsl missing or incompatible
         return f"flydsl gfx1250 MLA attention is unavailable: {exc}"
     q_mult = max(64, kern.DQ_BQW)
-    kv_mult = max(kern.KV_STEP, kern.BLOCK_KV)
+    kv_mult = max(kern.KV_STEP, kern.BLOCK_KV * kern.DKDV_NW)
     if sq == 0 or sq % q_mult:
         return f"seqlen_q must be a positive multiple of {q_mult}, got {sq}"
     if skv == 0 or skv % kv_mult:
