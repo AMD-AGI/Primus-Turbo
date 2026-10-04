@@ -185,3 +185,35 @@ their union, nothing else.
 - Risk named in the round plan: both 2-wave kernels now run back to back in one entry, so the
   L2/MALL state each kernel inherits changes (k_dqg96 starts after k_dkdv64 instead of k_dkdv);
   measured by the per-kernel arms of the same-process A/B.
+
+## Round 4 arm bwd_r4_a: head-group launch of k_dkdv64 / k_dqg96 / k_dqg (fold traversal)
+
+Base: arms/bwd_r3_a (champion, hash 698f5628). Finding (integration refresh, same process): r3_a
+at the fold launch the e2e arm and the Turbo adapter use for Megatron's b2 h128 SBHD views,
+[1, 4096, 256, d], took 4.387 ms against 3.928 ms for the b2 h128 launch over contiguous BSHD
+(+11.7%; b4 h64 3.724 ms). The kernels' grids are (heads, tiles, B) with the head fastest; a
+256-head row leaves half as many tiles of one head resident at a time (per XCD) as a 128-head row,
+so a Q/dO (K/V) tile streamed by one workgroup is less often still in L2 for the next one.
+
+- kernels.py: `HEAD_GROUP` (128) and `head_group(nh, target)` (shared constants block). k_dkdv64,
+  k_dqg96 and k_dqg take one more i32 kernel argument `HG`; `_dkdv_impl` / `_dqg_tdm_impl` take
+  it as `HG=None` (None = r3_a's code, kept for the unlaunched k_dkdv / k_dqg48). With HG the
+  launch grid is (HG, tiles, B*nh/HG) -- the same workgroup count -- and the kernel decodes
+  hb = block_idx.z*HG + x (k_dqg*: x after the XCD-major remap, now taken within the group of
+  HG), bat = hb // nh, head = hb - bat*nh: one scalar division per workgroup. Every workgroup
+  does exactly one (bat, head, tile) of r3_a, so outputs are bitwise identical for any HG.
+- impl.py: `_plan` picks hg = head_group(Hkv) for k_dkdv64 and head_group(Hq) for the dQ chain:
+  nh when nh <= HEAD_GROUP (toy/fast/proxy/prod b2h128: r3_a's grids), else the largest multiple
+  of 8 dividing nh that is <= HEAD_GROUP (the fold [1, s, 256, d]: 128, i.e. grid (128, tiles, 2),
+  the b2h128 grid). Launch-only knobs, one binary for every value: env FLY_BWD_HEAD_GROUP (read at
+  import; 0 = r3_a's grids everywhere) and `flydsl_attn_bwd(..., head_group=N)` per call.
+- bounds_proof.py: R1 (decode is a bijection onto [0, B) x [0, nh) for every launched kernel, every
+  target in R_TARGETS and every shape; hg == nh reproduces r3_a's map; hg % 8 == 0 keeps a head
+  on one XCD; source tie of the decode, grid and plan lines), R2 (prodfold at 128 walks (folded
+  head, tile) exactly like r3_a's b2h128 launch, for all three kernels); new shapes prodfold,
+  gqafold, gqa_hg. K/Q/W/N counts on r3_a's 11 shapes equal r3_a's except K6 +1 (the new
+  const_expr branch in _dkdv_impl is one more scanned `if`).
+- Compile-only (every variant incl. prodfold/toyfold): VGPR/SGPR 859/102, 868/68, 709/68 as r3_a,
+  0 spill / 0 scratch / 0 lane spill; +36 / +24 / +54 instructions (prologue decode); the hot
+  loops of k_dkdv64 are opcode-identical to r3_a's, k_dqg96 loops have 4 / 6 fewer s_set_vgpr_msb,
+  k_dqg loops +1 s_set_vgpr_msb / +1 s_delay_alu; WMMA counts equal.

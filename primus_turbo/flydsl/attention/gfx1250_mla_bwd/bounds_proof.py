@@ -54,6 +54,20 @@ waves per workgroup, grid (Hkv, Skv/64, B), wave w owns kv rows kv0g + 32w + [0,
       wave, barrier epochs across waves; N = 1..160 plus every shape's trip counts. Mutations
       (drain dropped, readback above the barrier, wait one stage too deep, TDM above the WAR
       barrier) must each be caught (N1..N4).
+  R1  head-group launch (bwd_r4_a; kernels.HEAD_GROUP / head_group, impl._plan): for every launched
+      kernel (k_dkdv64 over Hkv, k_dqg96 and the head k_dqg over Hq) and every target in
+      R_TARGETS, hg = head_group(nh, target) divides nh, the grid (hg, tiles, B*nh/hg) has the
+      workgroup count of (nh, tiles, B), and the kernel's decode of (block_idx.x, block_idx.z)
+      (k_dkdv64: z*hg + x; k_dqg*: z*hg + the in-group XCD remap of x, then bat = hb // nh,
+      h = hb - bat*nh) is a bijection onto [0, B) x [0, nh) with grid.y passed through, so every
+      workgroup runs exactly one (bat, head, tile) of r3_a and the K/Q replays above (which take
+      (bat, head, tile) as inputs) cover every launched workgroup; i32 intermediates < 2^31;
+      hg == nh reproduces r3_a's (bat, head) of every workgroup exactly; hg % 8 == 0 keeps all
+      workgroups of one head on one XCD (linear id % 8 constant), counted.
+  R2  traversal equivalence: on the fold launch [1, s, 256, d] (prodfold) at the default target
+      the sequence of (folded head b*128 + h, tile) over the linear workgroup id equals the
+      sequence r3_a's b2 h128 launch walks, for k_dkdv64, k_dqg96 and k_dqg; and at target 0 the
+      grids and decodes are r3_a's for every shape.
 """
 import pathlib
 import re
@@ -85,6 +99,8 @@ DQ_BQW48, NQW48, dq_split = g("DQ_BQW48"), g("NQW48"), g("dq_split")
 DQ_NWAVE, DQ_BQW96 = g("DQ_NWAVE"), g("DQ_BQW96")
 segs = g("_pow2_segments")
 DKDV_NW, PDS_B, EPI_W, BAR_KH = g("DKDV_NW"), g("PDS_B"), g("EPI_W"), g("BAR_KH")
+HEAD_GROUP, head_group = g("HEAD_GROUP"), g("head_group")
+R_TARGETS = (0, 8, 16, 24, 32, 64, 96, HEAD_GROUP, 256)
 ALLOC_KV = LDS_SEG + DKDV_NW * PDS_B
 ROWS_W = 32 // DKDV_NW          # rows of every 32-row Q/dO tile one wave's TDM moves
 LANES = range(32)
@@ -105,6 +121,11 @@ SHAPES = {  # name: (B, Sq, Skv, Hq, Hkv, causal)
     "gqa": (2, 512, 512, 8, 2, 1), "noncausal": (1, 256, 256, 2, 2, 0),
     "rect_short_kv": (1, 384, 256, 2, 2, 1),
     "s128": (1, 128, 128, 2, 2, 1), "s192": (2, 192, 192, 2, 2, 1),
+    # bwd_r4_a: the fold launch of prod (Megatron b2 h128 SBHD views as [1, s, 256, d]), the fold
+    # of gqa, and a GQA shape whose q launch is head-grouped (hg 128 of 256, B 2) while the kv
+    # launch keeps r3_a's grid
+    "prodfold": (1, 4096, 4096, 256, 256, 1), "gqafold": (1, 512, 512, 16, 4, 1),
+    "gqa_hg": (2, 128, 128, 256, 64, 1),
 }
 COUNT = {}
 
@@ -831,13 +852,139 @@ def dqg_shape(B, Sq, Skv, Hq, Hkv, causal, written_q, stats):
         COUNT["W2"] = COUNT.get("W2", 0) + 1
 
 
+# ------------------------------------------------------------------ head-group launch
+def _xcd_remap(x, ngrp):
+    """kernels._dqg_tdm_impl: x -> (x%8)*(ngrp/8) + x/8 when ngrp % 8 == 0, else x."""
+    return (x % 8) * (ngrp // 8) + x // 8 if ngrp % 8 == 0 else x
+
+
+
+# R1 source tie: the decode / grid / plan lines hg_decode, hg_launches and impl._plan replay
+_IMPL_SRC = (HERE / "impl.py").read_text()
+for src, pats in (
+        (SRC, (r"_hb = fx\.Int32\(fx\.block_idx\.z\) \* HG \+ fx\.Int32\(fx\.block_idx\.x\)\n"
+               r"\s+bat = _hb // Hkv\n\s+hkv = _hb - bat \* Hkv\n",
+               r"ngrp = HG\n",
+               r"qh = \(ngrp % _nx == fx\.Int32\(0\)\)\.select\(\(_gx % _nx\) \* \(ngrp // _nx\) \+ _gx // _nx, _gx\)",
+               r"_hb = fx\.Int32\(fx\.block_idx\.z\) \* HG \+ qh\n\s+bat = _hb // Hq\n\s+qh = _hb - bat \* Hq\n",
+               r"nqt, cshift, causal, nb, hg\)\.launch\(\n\s+grid=\(hg, nblk, ngz\)",
+               r"nkvt, cshift, causal, q_off, ntile, hg\)\.launch\(\n\s+grid=\(hg, ntile, ngz\), block=\(32,",
+               r"nkvt, cshift, causal, q_off, ntile, hg\)\.launch\(\n\s+grid=\(hg, ntile, ngz\), block=\(DQ_NWAVE",
+               r"G, nqt, cshift, causal, B_, DKDV_NW, HG\)", r"nkvt, cshift, causal, q_off, ntile, NQW, 1, HG\)",
+               r"nkvt, cshift, causal, q_off, ntile, NQW48, DQ_NWAVE, HG\)")),
+        (_IMPL_SRC, (r"hg_kv, hg_q = _k\.head_group\(hkv, tgt\), _k\.head_group\(hq, tgt\)",
+                     r"ngz_kv, ngz_q = b \* hkv // hg_kv, b \* hq // hg_q",
+                     r"skv // \(_k\.BLOCK_KV \* _k\.DKDV_NW\), hg_kv, ngz_kv, b, stream\)",
+                     r"_k\.launch_dqg96, dq_args \+ \(q_split, n96, hg_q, ngz_q, dq_stream\)",
+                     r"_k\.launch_dqg, dq_args \+ \(0, n32, hg_q, ngz_q, dq_stream\)",
+                     r"tgt = HEAD_GROUP if head_group is None else int\(head_group\)"))):
+    for pat in pats:
+        ok(len(re.findall(pat, src)) == 1, "R1", f"source line {pat}")
+
+
+def hg_decode(kind, x, z, hg, nh):
+    """(bat, head) the kernel derives from (block_idx.x, block_idx.z) under head group hg."""
+    xx = x if kind == "kv" else _xcd_remap(x, hg)
+    hb = z * hg + xx
+    ok(0 <= hb < (1 << 31) and z * hg < (1 << 31), "R1", "i32 head index")
+    bat = hb // nh
+    return bat, hb - bat * nh
+
+
+def r3a_decode(kind, x, z, nh):
+    """r3_a: grid (nh, tiles, B); k_dkdv (bat, hkv) = (z, x), k_dqg* (z, XCD remap of x over nh)."""
+    return z, (x if kind == "kv" else _xcd_remap(x, nh))
+
+
+def hg_launches(B, Sq, Skv, Hq, Hkv):
+    """impl._plan's head-grouped launches: (name, kind, nh, tiles)."""
+    q_split, n32, n96 = dq_split(Sq)
+    out = [("dkdv", "kv", Hkv, Skv // (DKDV_NW * BLOCK_KV))]
+    if n96:
+        out.append(("dqg", "q", Hq, n96))
+    if n32:
+        out.append(("dqg_head" if n96 else "dqg", "q", Hq, n32))
+    return out
+
+
+def hg_order(kind, B, nh, tiles, target):
+    """(bat*nh + head, tile) of every workgroup in linear-id order (x fastest, then y, then z)."""
+    hg = head_group(nh, target)
+    ngz = B * nh // hg
+    seq = []
+    for z in range(ngz):
+        for y in range(tiles):
+            for x in range(hg):
+                bat, h = hg_decode(kind, x, z, hg, nh)
+                seq.append((bat * nh + h, y))
+    return seq
+
+
+def headgroup_shape(B, Sq, Skv, Hq, Hkv, name):
+    launched = {}
+    for lname, kind, nh, tiles in hg_launches(B, Sq, Skv, Hq, Hkv):
+        for target in R_TARGETS:
+            hg = head_group(nh, target)
+            ok(1 <= hg <= nh and nh % hg == 0 and (B * nh) % hg == 0, "R1", f"{lname} hg {hg} of {nh}")
+            ok(hg == nh or (hg % 8 == 0 and hg <= target), "R1", f"{lname} hg {hg} target {target}")
+            ok(target > 0 and nh > target or hg == nh, "R1", f"{lname} identity rule hg {hg}")
+            ngz = B * nh // hg
+            ok(hg * tiles * ngz == nh * tiles * B, "R1", "workgroup count unchanged")
+            img = {}
+            xcd = {}
+            for z in range(ngz):
+                for x in range(hg):
+                    bat, h = hg_decode(kind, x, z, hg, nh)
+                    ok(0 <= bat < B and 0 <= h < nh, "R1", f"{lname} decode ({x},{z}) -> ({bat},{h})")
+                    ok((bat, h) not in img, "R1", f"{lname} ({bat},{h}) twice")
+                    img[(bat, h)] = (x, z)
+                    if hg == nh:
+                        ok((bat, h) == r3a_decode(kind, x, z, nh), "R1", f"{lname} hg == nh is r3_a's map")
+                    if hg % 8 == 0:
+                        for y in range(tiles):
+                            xcd.setdefault((bat, h), set()).add((x + hg * (y + tiles * z)) % 8)
+            ok(len(img) == B * nh, "R1", f"{lname} decode onto [0,B)x[0,nh)")
+            if hg % 8 == 0:
+                ok(all(len(v) == 1 for v in xcd.values()), "R1", f"{lname} head split across XCDs")
+                COUNT["R1_xcd"] = COUNT.get("R1_xcd", 0) + 1
+            if target == HEAD_GROUP:
+                launched[lname] = (hg, tiles, ngz)
+            if target == 0:
+                ok(hg == nh and ngz == B, "R2", f"{lname} target 0 is r3_a's grid")
+    return launched
+
+
+def fold_equivalence():
+    """R2: prodfold at the default target walks (folded head, tile) exactly like r3_a's b2h128."""
+    Bp, S, H = 2, 4096, 128
+    for (lname, kind, nh, tiles), (lname2, kind2, nh2, tiles2) in zip(
+            hg_launches(1, S, S, Bp * H, Bp * H), hg_launches(Bp, S, S, H, H)):
+        ok((lname, kind, tiles) == (lname2, kind2, tiles2) and nh == Bp * nh2, "R2", "launch lists")
+        fold = hg_order(kind, 1, nh, tiles, HEAD_GROUP)
+        ref = []                                   # r3_a grid (H, tiles, Bp) over BSHD b2 h128
+        for z in range(Bp):
+            for y in range(tiles):
+                for x in range(H):
+                    bat, h = r3a_decode(kind, x, z, H)
+                    ref.append((bat * H + h, y))   # = the folded head of (bat, h)
+        ok(fold == ref, "R2", f"{lname}: fold traversal != b2h128 traversal")
+        old = hg_order(kind, 1, nh, tiles, 0)      # r3_a on the fold launch, for the record
+        same = sum(a == b for a, b in zip(old, ref))
+        print(f"[R2] {lname}: prodfold@{HEAD_GROUP} == b2h128 order over {len(ref)} workgroups "
+              f"(r3_a's fold order agrees at {same})", flush=True)
+
+
 def main(names):
     print("[W2] 2-wave ring protocol self-test, N = 1..160 + mutations", flush=True)
     ring2_selftest()
+    fold_equivalence()
     for name in names:
         B, Sq, Skv, Hq, Hkv, causal = SHAPES[name]
         assert Sq % 64 == 0 and Sq % DQ_BQW == 0 and Skv % 32 == 0 and Hq % Hkv == 0  # impl.py
         print(f"[{name}] dq_split {dq_split(Sq)} (q_split, n32, n96)", flush=True)
+        hgl = headgroup_shape(B, Sq, Skv, Hq, Hkv, name)
+        print(f"[{name}] launched grids at HEAD_GROUP {HEAD_GROUP} (hg, tiles, B*nh/hg): "
+              + ", ".join(f"{k}={v}" for k, v in hgl.items()), flush=True)
         wkv = {"k": {}, "v": {}}
         wq = {}
         stats = {}

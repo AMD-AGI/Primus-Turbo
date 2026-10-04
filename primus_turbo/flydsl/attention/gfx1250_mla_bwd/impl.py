@@ -77,6 +77,12 @@ _ENV_CHECKED = False
 #                            stream, which waits for s2 before we return).
 DQ_SIDE_STREAM = os.environ.get("FLY_BWD_SIDE_STREAM", "0") != "0"
 DQ_SIDE_RECORD = os.environ.get("FLY_BWD_RECORD_STREAM", "1") != "0"
+# Head-group traversal target of k_dkdv64 / k_dqg96 / k_dqg (kernels.HEAD_GROUP note): a launch
+# with more than HEAD_GROUP heads per batch runs as head groups of kernels.head_group(nh) heads
+# (the fold launch [1, s, 256, d] -> 128, the b2h128 grid). Launch-only (a runtime kernel
+# argument, one binary for every value): FLY_BWD_HEAD_GROUP=0 restores r3_a's grid for every
+# shape; flydsl_attn_bwd(..., head_group=N) overrides it per call (in-process A/B controls).
+HEAD_GROUP = int(os.environ.get("FLY_BWD_HEAD_GROUP", str(_k.HEAD_GROUP)))
 _SIDE = {}
 # Validation only: allocate delta/dq/dk/dv NaN-filled, so an element the kernels never write
 # shows up as non-finite instead of as stale memory.
@@ -94,7 +100,8 @@ def _check_env_once():
     if not _ENV_CHECKED:
         _env.assert_environment()
         print(f"[flydsl_bwd {_HERE.name}] DQ_SIDE_STREAM={int(DQ_SIDE_STREAM)} "
-              f"DQ_SIDE_RECORD={int(DQ_SIDE_RECORD)}", file=sys.stderr, flush=True)
+              f"DQ_SIDE_RECORD={int(DQ_SIDE_RECORD)} HEAD_GROUP={HEAD_GROUP}",
+              file=sys.stderr, flush=True)
         _ENV_CHECKED = True
 
 
@@ -142,15 +149,21 @@ def _check(do, q, k, v, o, lse):
     return b, sq, skv, hq, hkv
 
 
-def _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, dq_stream=None):
+def _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, dq_stream=None, head_group=None):
     """Every launch flydsl_attn_bwd makes for these inputs, in issue order, plus the
     tensors it allocates. Used verbatim by the launcher below and by the compile-only gate
     (tools/flydsl/drivers/bwd_mla.py, meta tensors, stream=None), so the compiled set is
     exactly the launched set.
 
     launches: [(name, launcher, args, chain)], chain "main" (caller's stream) or "dq".
+    head_group: target of kernels.head_group (None: HEAD_GROUP; 0: r3_a's grids).
     """
     b, sq, skv, hq, hkv = _check(do, q, k, v, o, lse)
+    tgt = HEAD_GROUP if head_group is None else int(head_group)
+    # head groups: grid (hg, tiles, b*nh/hg), the same workgroup count as (nh, tiles, b)
+    hg_kv, hg_q = _k.head_group(hkv, tgt), _k.head_group(hq, tgt)
+    assert hkv % hg_kv == 0 and hq % hg_q == 0, (hkv, hg_kv, hq, hg_q)
+    ngz_kv, ngz_q = b * hkv // hg_kv, b * hq // hg_q
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(_k.D_QK)
     g = hq // hkv
@@ -168,10 +181,10 @@ def _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, dq_stream=None):
         ("dkdv", _k.launch_dkdv64,
          (q, k, v, do, lse, delta, dv, dk, float(softmax_scale),
           sq, skv, hq, hkv, g, sq // 16, skv - sq, c,
-          skv // (_k.BLOCK_KV * _k.DKDV_NW), hkv, b, stream), "main"),
+          skv // (_k.BLOCK_KV * _k.DKDV_NW), hg_kv, ngz_kv, b, stream), "main"),
     ]
     grids = {"delta": (n_rows // _k.ROWS_DELTA, 1, 1),
-             "dkdv": (hkv, skv // (_k.BLOCK_KV * _k.DKDV_NW), b)}
+             "dkdv": (hg_kv, skv // (_k.BLOCK_KV * _k.DKDV_NW), ngz_kv)}
     # dQ chain: k_dqg96 (2 waves x 48 queries on one K/V ring, bwd_r2_b) over [q_split, sq),
     # longest-first, then the 32-query k_dqg over the head [0, q_split) (the shortest tiles). Plan
     # name "dqg" is the main dQ launch (k_dqg96; k_dqg when there is no 96-query part), "dqg_head"
@@ -182,17 +195,17 @@ def _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, dq_stream=None):
     dq_args = (q, k, v, do, o, lse, delta, dq, float(softmax_scale),
                sq, skv, hq, hkv, g, skv // _k.KV_STEP, skv - sq, c)
     if n96:
-        launches.append(("dqg", _k.launch_dqg96, dq_args + (q_split, n96, hq, b, dq_stream), "dq"))
-        grids["dqg"] = (hq, n96, b)
+        launches.append(("dqg", _k.launch_dqg96, dq_args + (q_split, n96, hg_q, ngz_q, dq_stream), "dq"))
+        grids["dqg"] = (hg_q, n96, ngz_q)
     if n32:
         nm = "dqg_head" if n96 else "dqg"
-        launches.append((nm, _k.launch_dqg, dq_args + (0, n32, hq, b, dq_stream), "dq"))
-        grids[nm] = (hq, n32, b)
+        launches.append((nm, _k.launch_dqg, dq_args + (0, n32, hg_q, ngz_q, dq_stream), "dq"))
+        grids[nm] = (hg_q, n32, ngz_q)
     return {"launches": launches, "outputs": (dq, dk, dv), "delta": delta, "grids": grids,
-            "dq_split": (q_split, n32, n96)}
+            "dq_split": (q_split, n32, n96), "head_group": {"kv": hg_kv, "q": hg_q, "target": tgt}}
 
 
-def flydsl_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True):
+def flydsl_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, head_group=None):
     """Flash-attention backward on gfx1250.
 
     q [B, Sq, Hq, D_QK], o/do [B, Sq, Hq, D_V], k [B, Skv, Hkv, D_QK], v [B, Skv, Hkv, D_V],
@@ -201,13 +214,15 @@ def flydsl_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True):
     Returns (dq, dk, dv) in q/k/v's dtype, laid out like q/k/v.
 
     causal is BOTTOM-RIGHT: query i attends keys j <= i + (Skv - Sq).
+    head_group: launch traversal only (outputs bitwise identical for every value); None =
+    HEAD_GROUP, 0 = r3_a's grids. See kernels.HEAD_GROUP.
     """
     _check_env_once()
     lse = lse.contiguous().float()
     stream = torch.cuda.current_stream()
     split = DQ_SIDE_STREAM
     s2 = _side_stream(q.device) if split else stream
-    plan = _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, s2)
+    plan = _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, s2, head_group)
     for name, fn, args, chain in plan["launches"]:
         _launch(name, fn, args)
         if name == "delta" and split:

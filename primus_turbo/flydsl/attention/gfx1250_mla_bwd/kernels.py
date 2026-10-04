@@ -125,6 +125,33 @@ assert TDM_DEPTH * QDO_B <= LDS_SEG, "the Q/dO ring must stay inside LDS segment
 assert DKDV_NW * EPI_W <= TDM_DEPTH * QDO_B, "epilogue images must fit the dead ring"
 assert 32 % DKDV_NW == 0 and (DKDV_NW & (DKDV_NW - 1)) == 0, "TDM num_warps splits 32 rows evenly"
 
+# Head-group traversal (bwd_r4_a) of k_dkdv64 / k_dqg96 / k_dqg. Their grids are (heads,
+# tiles, batch) with the head fastest, so the dispatch order -- and with it how many kv (q)
+# tiles of ONE head are resident at once, i.e. how often a Q/dO (K/V) tile streamed by one
+# workgroup is still in L2 for the next -- depends on the head count per launch row. The
+# e2e/Turbo fold launches Megatron's b2 h128 SBHD views as [1, s, 256, d]: 256 heads per row,
+# half the resident tiles per head of the b2h128 launch over the same bytes (4.39 vs 3.93 ms
+# for r3_a). With a head group hg (hg | nh) the launch grid is (hg, tiles, B*nh/hg) -- the
+# same workgroup count -- and the kernel decodes (block_idx.z, block_idx.x) as the batch-major
+# head index z*hg + x = bat*nh + h. hg = nh is r3_a's grid and mapping exactly; hg = 128 on
+# the fold launch IS the b2h128 grid. Every workgroup still does the work of exactly one
+# (bat, head, tile) of r3_a (bounds_proof.py R1), so outputs are bitwise identical.
+HEAD_GROUP = 128
+
+
+def head_group(nh, target=HEAD_GROUP):
+    """Head group of a launch with nh heads per batch: nh itself (r3_a's grid) when nh <=
+    target or target <= 0; else the largest multiple of 8 that divides nh and is <= target
+    (a multiple of 8 keeps every head's workgroups on one XCD under the round-robin linear-id
+    dispatch: grid.x % 8 == 0), nh when there is none."""
+    if target <= 0 or nh <= target:
+        return nh
+    for d in range(target - target % 8, 7, -8):
+        if nh % d == 0:
+            return d
+    return nh
+
+
 DELTA_THREADS = 256
 LANES_PER_ROW = D_V // 8
 ROWS_PER_PASS = DELTA_THREADS // LANES_PER_ROW
@@ -253,7 +280,7 @@ def launch_delta(DO, O, DEL, S: fx.Int32, H: fx.Int32, n_rows: fx.Int32,
 
 # =================================================================== dkdv =========
 def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
-               scale, Sq, Skv, Hq, Hkv, G, nqt, cshift, causal, B_, nw=1):
+               scale, Sq, Skv, Hq, Hkv, G, nqt, cshift, causal, B_, nw=1, HG=None):
     """One wave owns a BLOCK_KV-row kv tile of one kv head and streams every (q head, q pair).
 
     nw (compile-time) waves per workgroup. nw = 1: the legacy k_dkdv, grid = (Hkv,
@@ -286,9 +313,16 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
         lane = fx.Int32(fx.thread_idx.x)
     else:
         lane = fx.Int32(fx.thread_idx.x) % fx.Int32(WAVE)
-    hkv = fx.Int32(fx.block_idx.x)              # kv head (cheap axis fastest)
+    if const_expr(HG is None):
+        hkv = fx.Int32(fx.block_idx.x)          # kv head (cheap axis fastest)
+        bat = fx.Int32(fx.block_idx.z)          # batch
+    else:
+        # head group (HEAD_GROUP note): grid (HG, Skv/64, B*Hkv/HG), HG | Hkv (impl._plan);
+        # z*HG + x is the batch-major kv head index bat*Hkv + hkv (bounds_proof.py R1)
+        _hb = fx.Int32(fx.block_idx.z) * HG + fx.Int32(fx.block_idx.x)
+        bat = _hb // Hkv
+        hkv = _hb - bat * Hkv
     bid = fx.Int32(fx.block_idx.y)              # kv tile (nw = 1) / kv block (nw > 1)
-    bat = fx.Int32(fx.block_idx.z)              # batch
     row = lane % fx.Int32(16)
     half = lane // fx.Int32(16)
     kv0 = bid * fx.Int32(BLOCK_KV)
@@ -824,20 +858,22 @@ def launch_dkdv(Q, K, V, DO, LSE, DEL, DV_, DK, scale: fx.Float32,
 def k_dkdv64(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, DO: fx.Tensor,
              LSE: fx.Tensor, DEL: fx.Tensor, DV_: fx.Tensor, DK: fx.Tensor,
              scale: fx.Float32, Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32,
-             G: fx.Int32, nqt: fx.Int32, cshift: fx.Int32, causal: fx.Int32, B_: fx.Int32):
+             G: fx.Int32, nqt: fx.Int32, cshift: fx.Int32, causal: fx.Int32, B_: fx.Int32,
+             HG: fx.Int32):
     _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK, scale, Sq, Skv, Hq, Hkv,
-               G, nqt, cshift, causal, B_, DKDV_NW)
+               G, nqt, cshift, causal, B_, DKDV_NW, HG)
 
 
 @flyc.jit
 def launch_dkdv64(Q, K, V, DO, LSE, DEL, DV_, DK, scale: fx.Float32,
                   Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32, G: fx.Int32,
                   nqt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
-                  nblk: fx.Int32, nhkv: fx.Int32, nb: fx.Int32, stream: fx.Stream):
-    # grid = (Hkv kv heads, Skv/64 kv blocks, B); kv block g ascending = longest first (causal)
+                  nblk: fx.Int32, hg: fx.Int32, ngz: fx.Int32, nb: fx.Int32, stream: fx.Stream):
+    # grid = (hg kv heads of a head group, Skv/64 kv blocks, ngz = B*Hkv/hg head groups); kv block
+    # ascending = longest first (causal); hg = Hkv is (Hkv, Skv/64, B), r3_a's grid
     k_dkdv64(Q, K, V, DO, LSE, DEL, DV_, DK, scale, Sq, Skv, Hq, Hkv, G,
-             nqt, cshift, causal, nb).launch(
-        grid=(nhkv, nblk, nb), block=(WAVE * DKDV_NW, 1, 1), stream=stream)
+             nqt, cshift, causal, nb, hg).launch(
+        grid=(hg, nblk, ngz), block=(WAVE * DKDV_NW, 1, 1), stream=stream)
 
 
 # ===================================================================== dqg ========
@@ -929,7 +965,7 @@ DQT_VT_SGB = (2, 1)
 
 def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
                   scale, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, q_off, ntile, nqw,
-                  nwave=1):
+                  nwave=1, HG=None):
     # nqw (compile-time): 16-query sub-tiles per wave (NQW 2 = k_dqg, NQW48 3 = k_dqg48/96).
     # nwave (compile-time): waves per workgroup sharing the K/V ring (1, or DQ_NWAVE = k_dqg96).
     # The workgroup owns queries [q0g, q0g + nwave*16*nqw), q0g = q_off + bid*BQWG, bid in
@@ -947,15 +983,25 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
         wv = fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type,
                                           (_tid // fx.Int32(WAVE)).ir_value()))
     # XCD-major q-head remap: workgroups go to the 8 XCDs round-robin on the linear id, so
-    # x -> (x%8)*(Hq/8) + x/8 puts adjacent q heads (one kv head under GQA) on one XCD.
-    # A bijection of [0, Hq) whenever Hq % 8 == 0, else the identity.
+    # x -> (x%8)*(ngrp/8) + x/8 puts adjacent q heads (one kv head under GQA) on one XCD.
+    # A bijection of [0, ngrp) whenever ngrp % 8 == 0, else the identity. ngrp = grid.x: Hq
+    # (HG None), else the head group HG (HEAD_GROUP note; grid (HG, ntile, B*Hq/HG), HG | Hq).
     _nx = fx.Int32(8)
     _gx = fx.Int32(fx.block_idx.x)
-    ngrp = Hq
+    if const_expr(HG is None):
+        ngrp = Hq
+    else:
+        ngrp = HG
     qh = (ngrp % _nx == fx.Int32(0)).select((_gx % _nx) * (ngrp // _nx) + _gx // _nx, _gx)
     # longest-first: the query tile is walked DESCENDING on grid.y (grid.y == ntile)
     bid = ntile - fx.Int32(1) - fx.Int32(fx.block_idx.y)
-    bat = fx.Int32(fx.block_idx.z)
+    if const_expr(HG is None):
+        bat = fx.Int32(fx.block_idx.z)
+    else:
+        # z*HG + (remapped x) is the batch-major q head index bat*Hq + qh (bounds_proof.py R1)
+        _hb = fx.Int32(fx.block_idx.z) * HG + qh
+        bat = _hb // Hq
+        qh = _hb - bat * Hq
     row = lane % fx.Int32(16)
     half = lane // fx.Int32(16)
     q0g = q_off + bid * fx.Int32(BQWG)
@@ -1294,9 +1340,9 @@ def k_dqg(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, DO: fx.Tensor, O: fx.Tensor,
           LSE: fx.Tensor, DEL: fx.Tensor, DQ: fx.Tensor,
           scale: fx.Float32, Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32,
           G: fx.Int32, nkvt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
-          q_off: fx.Int32, ntile: fx.Int32):
+          q_off: fx.Int32, ntile: fx.Int32, HG: fx.Int32):
     _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G,
-                  nkvt, cshift, causal, q_off, ntile, NQW)
+                  nkvt, cshift, causal, q_off, ntile, NQW, 1, HG)
 
 
 @flyc.kernel(known_block_size=[32, 1, 1])
@@ -1313,12 +1359,13 @@ def k_dqg48(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, DO: fx.Tensor, O: fx.Tenso
 def launch_dqg(Q, K, V, DO, O, LSE, DEL, DQ, scale: fx.Float32,
                Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32, G: fx.Int32,
                nkvt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
-               q_off: fx.Int32, ntile: fx.Int32, ngrp: fx.Int32, nb: fx.Int32,
+               q_off: fx.Int32, ntile: fx.Int32, hg: fx.Int32, ngz: fx.Int32,
                stream: fx.Stream):
-    # grid = (Hq q heads, ntile DQ_BQW-query tiles from q_off, B)
+    # grid = (hg q heads of a head group, ntile DQ_BQW-query tiles from q_off, ngz = B*Hq/hg
+    # head groups); hg = Hq is (Hq, ntile, B), r3_a's grid
     k_dqg(Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G,
-          nkvt, cshift, causal, q_off, ntile).launch(
-        grid=(ngrp, ntile, nb), block=(32, 1, 1), stream=stream)
+          nkvt, cshift, causal, q_off, ntile, hg).launch(
+        grid=(hg, ntile, ngz), block=(32, 1, 1), stream=stream)
 
 
 @flyc.jit
@@ -1338,18 +1385,19 @@ def k_dqg96(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, DO: fx.Tensor, O: fx.Tenso
             LSE: fx.Tensor, DEL: fx.Tensor, DQ: fx.Tensor,
             scale: fx.Float32, Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32,
             G: fx.Int32, nkvt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
-            q_off: fx.Int32, ntile: fx.Int32):
+            q_off: fx.Int32, ntile: fx.Int32, HG: fx.Int32):
     _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G,
-                  nkvt, cshift, causal, q_off, ntile, NQW48, DQ_NWAVE)
+                  nkvt, cshift, causal, q_off, ntile, NQW48, DQ_NWAVE, HG)
 
 
 @flyc.jit
 def launch_dqg96(Q, K, V, DO, O, LSE, DEL, DQ, scale: fx.Float32,
                  Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32, G: fx.Int32,
                  nkvt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
-                 q_off: fx.Int32, ntile: fx.Int32, ngrp: fx.Int32, nb: fx.Int32,
+                 q_off: fx.Int32, ntile: fx.Int32, hg: fx.Int32, ngz: fx.Int32,
                  stream: fx.Stream):
-    # grid = (Hq q heads, ntile DQ_BQW96-query tiles from q_off, B), DQ_NWAVE waves per workgroup
+    # grid = (hg q heads of a head group, ntile DQ_BQW96-query tiles from q_off, ngz = B*Hq/hg
+    # head groups), DQ_NWAVE waves per workgroup; hg = Hq is (Hq, ntile, B), r3_a's grid
     k_dqg96(Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G,
-            nkvt, cshift, causal, q_off, ntile).launch(
-        grid=(ngrp, ntile, nb), block=(DQ_NWAVE * WAVE, 1, 1), stream=stream)
+            nkvt, cshift, causal, q_off, ntile, hg).launch(
+        grid=(hg, ntile, ngz), block=(DQ_NWAVE * WAVE, 1, 1), stream=stream)
