@@ -93,11 +93,14 @@ def _side_stream(dev):
 
 def _check(do, q, k, v, o, lse):
     """Shape/dtype/layout contract of the kernels; returns (b, sq, skv, hq, hkv)."""
-    b, sq, hq, d = q.shape
+    b, sq, hq, dqk = q.shape
     skv, hkv = k.shape[1], k.shape[2]
-    assert d == _k.D, f"this kernel is head_dim {_k.D} only, got {d}"
-    assert k.shape == (b, skv, hkv, d) and v.shape == (b, skv, hkv, d), (q.shape, k.shape, v.shape)
-    assert o.shape == q.shape and do.shape == q.shape, (q.shape, o.shape, do.shape)
+    dv = v.shape[-1]
+    assert (dqk, dv) == (_k.D_QK, _k.D_V), (
+        f"these kernels are head dims (qk {_k.D_QK}, v {_k.D_V}) only, got ({dqk}, {dv})")
+    assert k.shape == (b, skv, hkv, dqk) and v.shape == (b, skv, hkv, dv), (
+        q.shape, k.shape, v.shape)
+    assert o.shape == (b, sq, hq, dv) and do.shape == o.shape, (q.shape, o.shape, do.shape)
     assert lse.shape == (b, hq, sq), f"lse must be [B, Hq, Sq], got {tuple(lse.shape)}"
     assert hq % hkv == 0, f"heads_q {hq} is not a multiple of heads_kv {hkv}"
     # k_dkdv consumes query PAIRS of 32 rows and k_dqg query tiles of DQ_BQW (grid.y =
@@ -113,10 +116,12 @@ def _check(do, q, k, v, o, lse):
         assert t.dtype == torch.bfloat16, f"{name} must be bf16, got {t.dtype}"
     # Byte extents the kernels compute in 32-bit arithmetic or hard-code as descriptor
     # num_records (k_dqg: 1 GiB for q/do/dq, 256 MiB for lse/delta).
-    assert q.numel() * 2 <= (1 << 30), "q/do/dq larger than k_dqg's 1 GiB descriptor extent"
+    assert max(q.numel(), o.numel()) * 2 <= (1 << 30), (
+        "q/do/dq larger than k_dqg's 1 GiB descriptor extent")
     assert lse.numel() * 4 <= (1 << 28), "lse/delta larger than k_dqg's 256 MiB descriptor extent"
-    assert k.numel() * 2 < (1 << 31), "k/v byte extent overflows k_dkdv's int32 descriptor size"
-    assert n_rows * _k.D * 2 < (1 << 31), "o/do byte extent overflows k_delta's int32 size"
+    assert max(k.numel(), v.numel()) * 2 < (1 << 31), (
+        "k/v byte extent overflows k_dkdv's int32 descriptor size")
+    assert n_rows * _k.D_V * 2 < (1 << 31), "o/do byte extent overflows k_delta's int32 size"
     return b, sq, skv, hq, hkv
 
 
@@ -129,17 +134,16 @@ def _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, dq_stream=None):
     launches: [(name, launcher, args, chain)], chain "main" (caller's stream) or "dq".
     """
     b, sq, skv, hq, hkv = _check(do, q, k, v, o, lse)
-    d = q.shape[-1]
     if softmax_scale is None:
-        softmax_scale = 1.0 / math.sqrt(d)
+        softmax_scale = 1.0 / math.sqrt(_k.D_QK)
     g = hq // hkv
     n_rows = b * sq * hq
     c = int(bool(causal))
     dq_stream = stream if dq_stream is None else dq_stream
     delta = torch.empty((b, hq, sq), device=q.device, dtype=torch.float32)
-    dq = torch.empty((b, sq, hq, d), device=q.device, dtype=q.dtype)
-    dk = torch.empty((b, skv, hkv, d), device=k.device, dtype=k.dtype)
-    dv = torch.empty_like(dk)
+    dq = torch.empty((b, sq, hq, _k.D_QK), device=q.device, dtype=q.dtype)
+    dk = torch.empty((b, skv, hkv, _k.D_QK), device=k.device, dtype=k.dtype)
+    dv = torch.empty((b, skv, hkv, _k.D_V), device=v.device, dtype=v.dtype)
     launches = [
         ("delta", _k.launch_delta,
          (do, o, delta, sq, hq, n_rows, n_rows // _k.ROWS_DELTA, stream), "main"),
@@ -161,7 +165,8 @@ def _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, dq_stream=None):
 def flydsl_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True):
     """Flash-attention backward on gfx1250.
 
-    q/o/do  [B, Sq, Hq, D] bf16      k/v  [B, Skv, Hkv, D] bf16
+    q [B, Sq, Hq, D_QK], o/do [B, Sq, Hq, D_V], k [B, Skv, Hkv, D_QK], v [B, Skv, Hkv, D_V],
+    all bf16 and contiguous (DeepSeek-V3 MLA: D_QK = 192, D_V = 128).
     lse     [B, Hq, Sq] fp32, NATURAL log, as the gfx1250 forward emits it.
     Returns (dq, dk, dv) in q/k/v's dtype, laid out like q/k/v.
 
