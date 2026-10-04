@@ -58,3 +58,11 @@ b2 s4096 h128, bf16, causal):
    tile lies past the band edge of every valid row of the wave, so the skipped body was an
    exact no-op: o / lse bitwise equal to item 8. With the knob off the kernel compiles to item
    8's binary. 2.2% faster at b2 s4096 h128 (4.4% of the wave-tiles are skipped there).
+10. QK K loads issued and consumed d-step-major (`QK_DMAJOR = True`, `QK_KV_FENCE = True`): the
+    48 K `ds_load_b128` of a tile were issued kv-tile-major while LLVM ordered the QK WMMAs
+    d-step-major, and `s_wait_dscnt` retires in order, so a wave waited for 26-38 of 48 loads
+    before its first WMMAs. `load_k_to_reg(dmajor=True)` issues them (d-step, kv tile, half) and
+    `_qk_gemm` runs d-step-major with `sched_barrier(0)` between d-step groups and kv pairs, so
+    every wait releases at most one d-step. Same addresses and per-chain accumulation order:
+    o / lse bitwise equal to item 9; with both knobs off the kernel compiles to item 9's binary.
+    0.5% faster at b2 s4096 h128 (1.1% at b1 s4096 h64).

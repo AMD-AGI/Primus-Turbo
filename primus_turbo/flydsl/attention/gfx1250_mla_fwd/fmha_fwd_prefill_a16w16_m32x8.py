@@ -185,6 +185,20 @@ BARRIER_FENCE = True
 # CPU proof: ../bounds_proof.py (W: bounds/exactness, P/S: protocol with per-wave skips).
 SKIP_MASKED_TILES = True
 
+# ---- fwd_r3_a: QK K-load consumption order ----
+# fwd_r2_c issues the 48 K ds_load_b128 kv-tile-major while LLVM orders the QK WMMAs
+# d-step-major across the 4 kv tiles; dscnt retires in order, so a wave waited for 26-38 of
+# 48 loads before its first few WMMAs. QK_DMAJOR issues the burst (dt, kv, half) and runs
+# _qk_gemm d-step-major with sched_barrier(0) between d-step groups (NKV*R = 8 independent
+# chains each): every wait then releases at most one d-step (8 loads). Same addresses and
+# immediates, same per-chain accumulation order: o/lse bitwise equal to fwd_r2_c.
+# False == fwd_r2_c's code path. CPU proof: ../bounds_proof.py.
+QK_DMAJOR = True
+# Also fence every kv pair inside a d-step group (consumption order == issue order). With
+# d-step fences only, LLVM still reorders the 4 kv pairs inside a group (the masked HI loop
+# starts each group at kv 2: first wait releases 6 loads instead of 2).
+QK_KV_FENCE = True
+
 # log2(e): exp(x) = exp2(x * LOG2E). Softmax uses the native ISA exp2 intrinsic.
 
 # Deferred oaccu rescale (FAv4 innovation, hk_mla spec §9.1.1). Rescaling the
@@ -402,7 +416,7 @@ def _wmma(a, b, c):
     return wmma(v8f32, _ir(a), _ir(b), _ir(c), reuseA=False, reuseB=False).result
 
 
-def _qk_gemm(*, k_values, q_frags_list, n_block):
+def _qk_gemm(*, k_values, q_frags_list, n_block, dmajor=False, kv_fence=False):
     """GEMM1: S^T = K @ Q^T for one resident KV tile, for all R q-WMMA-tiles this
     wave owns. K is **shared** across the q-tiles (loaded once), so each K fragment
     is shuffled once and fed into R independent WMMA chains.
@@ -434,6 +448,28 @@ def _qk_gemm(*, k_values, q_frags_list, n_block):
     # K fragment (shared by all q-tiles); NDT d-tiles accumulate into one kv-tile's
     # s_acc, independently per q-tile.
     s_acc_list = [[None] * NKV for _ in range(R)]
+    if dmajor:
+        # fwd_r3_a: d-step-major groups of NKV*R independent WMMA chains, fenced so LLVM
+        # cannot regroup them; matches the d-major K issue order (load_k_to_reg(dmajor)).
+        # Each chain (qt, kv) still accumulates dt = 0..NDT-1 in order: S is bitwise equal.
+        # kv_fence: also fence each kv pair (R WMMAs sharing one K fragment) inside a group,
+        # so the consumption order is exactly the issue order (dt, kv).
+        for dt in range(NDT):
+            if dt > 0:
+                rocdl.sched_barrier(0)
+            for kv in range(NKV):
+                if kv_fence and kv > 0:
+                    rocdl.sched_barrier(0)
+                j = (kv * NDT + dt) * 2
+                k_frag = k_values[j].shuffle(k_values[j + 1], list(range(16)))
+                for qt in range(R):
+                    acc = (
+                        s_acc_list[qt][kv]
+                        if dt > 0
+                        else fx.Vector.filled(8, 0.0, fx.Float32)
+                    )
+                    s_acc_list[qt][kv] = _wmma(k_frag, q_frags_list[qt][dt], acc)
+        return s_acc_list
     j = 0
     for kv in range(NKV):
         for dt in range(NDT):
@@ -1292,14 +1328,14 @@ def _core_attention(
             return k_next + k_curr + v_next + v_curr
         if warp_type == WarpType.LO_WARP:
             _drain_barrier()
-            k_values = k_mgr.load_k_to_reg(k_curr)
+            k_values = k_mgr.load_k_to_reg(k_curr, dmajor=QK_DMAJOR)
             _prefetch(addr)
             _named_barrier_pair(warp_idx)
         else:
             _drain_barrier()
             _prefetch(addr)
             _named_barrier_pair(warp_idx)
-            k_values = k_mgr.load_k_to_reg(k_curr)
+            k_values = k_mgr.load_k_to_reg(k_curr, dmajor=QK_DMAJOR)
 
         # Fence the K burst out of the WMMA stream (no wmma<-ds_load bubble). No explicit
         # s_wait_dscnt: the K ds_load is SSA-visible, so mode-2 inserts the dscnt cover
@@ -1312,6 +1348,8 @@ def _core_attention(
             k_values=k_values,
             q_frags_list=q_frags,
             n_block=n_block,
+            dmajor=QK_DMAJOR,
+            kv_fence=QK_KV_FENCE,
         )
 
         # ---- Burst ALL this-tile V transpose ds_loads (out of the WMMA stream), now

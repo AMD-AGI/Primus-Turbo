@@ -1222,27 +1222,34 @@ class KManager16bV2:
         )
         return [create_llvm_ptr(lane_base, address_space=3)]
 
-    def load_k_to_reg(self, base_ptrs, lds_imm_offset=0):
-        """Burst all K ``ds_load_b128`` from the row-major padded block, in ``_qk_gemm``
-        order ``[(kv, dt, half)...]``, off the single base of ``ds_load_ptrs``. Fragment
-        (kv, dt, half) = base + ``kv*16*row_bytes + (dt*32 + half*16)*2`` bytes."""
+    def load_k_to_reg(self, base_ptrs, lds_imm_offset=0, dmajor=False):
+        """Burst all K ``ds_load_b128`` from the row-major padded block, off the single base
+        of ``ds_load_ptrs``. Fragment (kv, dt, half) = base + ``kv*16*row_bytes + (dt*32 +
+        half*16)*2`` bytes. The returned list is always in ``_qk_gemm`` order
+        ``[(kv, dt, half)...]``; ``dmajor`` (fwd_r3_a) only changes the ISSUE order to
+        ``(dt, kv, half)``, so the in-order dscnt releases a whole d-step (all kv tiles)
+        first, matching a d-step-major QK."""
         v8_ty = fx.Vector.make_type(8, self.elem_dtype)
         NKV = self.n_block // _WMMA_M
         NDT = self.qk_hdim // _WMMA_K
         base = base_ptrs[0]
-        out = []
-        for kv in range(NKV):
-            for dt in range(NDT):
-                for half in range(2):
-                    imm = (
-                        kv * _WMMA_M * self.row_bytes
-                        + (dt * _WMMA_K + half * _WMMA_M) * _BF16_BYTES
-                        + lds_imm_offset
-                    )
-                    p = base
-                    if imm:
-                        p = buffer_ops.get_element_ptr(base, static_byte_offset=imm)
-                    out.append(fx.Vector(llvm_dialect.load(v8_ty, p)))
+        out = [None] * (NKV * NDT * 2)
+        order = (
+            [(kv, dt) for dt in range(NDT) for kv in range(NKV)]
+            if dmajor
+            else [(kv, dt) for kv in range(NKV) for dt in range(NDT)]
+        )
+        for kv, dt in order:
+            for half in range(2):
+                imm = (
+                    kv * _WMMA_M * self.row_bytes
+                    + (dt * _WMMA_K + half * _WMMA_M) * _BF16_BYTES
+                    + lds_imm_offset
+                )
+                p = base
+                if imm:
+                    p = buffer_ops.get_element_ptr(base, static_byte_offset=imm)
+                out[(kv * NDT + dt) * 2 + half] = fx.Vector(llvm_dialect.load(v8_ty, p))
         return out
 
 
