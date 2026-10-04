@@ -35,6 +35,9 @@
 
 #include <hip/hip_runtime.h>
 
+#include <atomic>
+#include <type_traits>
+
 #include "primus_turbo/common.h"
 #include "primus_turbo/mxfp4_emit.hpp"
 #include "primus_turbo/quantization.h"
@@ -537,10 +540,11 @@ __device__ __forceinline__ void gate_mul_prologue_bf16(uint16_t (*s_tile)[LDS_PI
  * that version assembled from four lanes' strided pieces collapses to the identity
  * even[i] = v[2i], odd[i] = v[2i+1].
  */
-__device__ __forceinline__ void mxfp6_emit_group(float (&values)[kGroupSize], const int64_t out_row,
-                                                 const int32_t group, const int32_t nk_pad,
-                                                 uint8_t *__restrict__ packed,
-                                                 uint8_t *__restrict__ packed_scale) {
+template <bool KBLK = false>
+__device__ __forceinline__ void
+mxfp6_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32_t group,
+                 const int32_t nk_pad, uint8_t *__restrict__ packed,
+                 uint8_t *__restrict__ packed_scale, const mxfp4_emit::FlyPackArgs fly = {}) {
 #pragma unroll
     for (int stage = 0; stage < 5; ++stage) {
         const int h = 1 << stage;
@@ -597,6 +601,26 @@ __device__ __forceinline__ void mxfp6_emit_group(float (&values)[kGroupSize], co
     const packed_fp6x32_t fp6{};
 #endif
 
+    if constexpr (KBLK) {
+        // FlyDSL A6W6: the same 24 bytes (C0 = bytes 0..15, C1 = 16..23) stored K128-blocked so one
+        // LDS-DMA instruction reads a contiguous KiB: C0 [rows/16, K/128, 16, 64], C1 [rows/32,
+        // K/128, 32, 32], C1 after C0 in one buffer; scales in FlyDSL's packed layout (nt 4, ilv
+        // 0).
+        if (out_row >= fly.rows || group >= fly.k128 * 4)
+            return;
+        const int64_t nk = fly.k128;
+        const int64_t rpad =
+            (static_cast<int64_t>(fly.rows) + kTileRows - 1) / kTileRows * kTileRows;
+        const int64_t s = group >> 2, g = group & 3;
+        const int64_t c0 = (((out_row >> 4) * nk + s) * 16 + (out_row & 15)) * 64 + g * 16;
+        const int64_t c1 =
+            rpad * nk * 64 + (((out_row >> 5) * nk + s) * 32 + (out_row & 31)) * 32 + g * 8;
+        *reinterpret_cast<uint4_t *>(packed + c0) = *reinterpret_cast<const uint4_t *>(&fp6);
+        *reinterpret_cast<uint2_t *>(packed + c1) =
+            *reinterpret_cast<const uint2_t *>(reinterpret_cast<const uint8_t *>(&fp6) + 16);
+        packed_scale[mxfp4_emit::fly_scale_byte(out_row, group, fly)] = scale_exp;
+        return;
+    }
     const int32_t tile_row  = static_cast<int32_t>(out_row / kTileRows);
     const int32_t rem       = static_cast<int32_t>(out_row % kTileRows);
     const int32_t row_block = rem / 16;
@@ -619,6 +643,91 @@ __device__ __forceinline__ void mxfp6_emit_group(float (&values)[kGroupSize], co
     packed_scale[scale_address] = scale_exp;
 }
 
+// Logical block coordinates. MI355X dispatches consecutive workgroups round-robin over its 8
+// XCDs, each with its own L2, so with a grid width that is a multiple of 8 a block's XCD is
+// blockIdx.x % 8. The A4W4 A layout writes each block's output in short runs that a neighbour
+// along the contraction completes to a 128-byte line:
+//   * row direction: blocks x and x+1 each write 64 bytes of the same rows -- on different XCDs
+//     in dispatch order, so no L2 ever holds the whole line;
+//   * column direction: blocks y .. y+3 write 32 bytes each -- same x, so already one XCD.
+// Within every 8 P blocks along x (P = 256 / TILE_N: the blocks one row-direction line spans),
+// logical blocks P c .. P c + P - 1 are taken from the hardware positions on XCD c. Columns keep
+// their XCD, a row line's writers share one. A trailing partial group keeps the identity. With a
+// grid width that is a multiple of 16 and a height that is a multiple of 4, the dispatch order also
+// walks bands of 4 block rows, so the column direction's four writers of a line run close together
+// in time. Order only: every block computes what it did. (A contiguous-range-per-XCD remap fixes
+// rows but breaks column locality.)
+template <bool REMAP, int TILE_N>
+__device__ __forceinline__ void logical_block(int32_t &bx, int32_t &by) {
+    by = int32_t(blockIdx.y);
+    bx = int32_t(blockIdx.x);
+    if constexpr (REMAP) {
+        // A row-direction line (128 bytes) takes P = 256 / TILE_N blocks along x (64-byte runs
+        // at TILE_N 128, 32-byte runs at 64). Give each XCD P consecutive x.
+        constexpr uint32_t P  = 256 / TILE_N;
+        constexpr uint32_t G  = 8 * P; // x-extent of one round over the 8 XCDs
+        const uint32_t     gx = gridDim.x, gy = gridDim.y;
+        if (gx % G == 0 && gy % 4 == 0) {
+            // Bands of 4 block rows; in each, a chunk of 32 dispatch slots covers rows y .. y+3
+            // of 8 x-values, one per XCD, and P chunks complete G x-values. Slot w runs on XCD
+            // w % 8 and becomes x = G (q / P) + P (w % 8) + q % P: the XCD depends on x alone,
+            // and a column line's four writers finish within ~32 P dispatches.
+            const uint32_t hw   = blockIdx.y * gx + blockIdx.x;
+            const uint32_t band = hw / (4 * gx), idx = hw % (4 * gx);
+            const uint32_t q = idx / 32, w = idx % 32;
+            bx = int32_t(G * (q / P) + P * (w % 8) + q % P);
+            by = int32_t(4 * band + w / 8);
+        } else if (gx % 8 == 0) {
+            const uint32_t x = blockIdx.x;
+            if ((x / G + 1) * G <= gx) {
+                const uint32_t r = x % G;
+                bx               = int32_t((x / G) * G + P * (r % 8) + r / 8);
+            }
+        }
+    }
+}
+
+// One emit per output format. The FP4 formats share mxfp4_emit_group's quantization and
+// differ only in the store address (see mxfp4_emit::Layout).
+template <MXPackFmt FMT>
+__device__ __forceinline__ void
+emit_group_fmt(float (&values)[kGroupSize], const int64_t out_row, const int32_t group,
+               const int32_t  nk, uint8_t *__restrict__ packed, uint8_t *__restrict__ packed_scale,
+               const uint32_t sr_seed, const mxfp4_emit::FlyPackArgs fly) {
+    if constexpr (FMT == MXPackFmt::Fp6) {
+        mxfp6_emit_group(values, out_row, group, nk, packed, packed_scale);
+    } else if constexpr (FMT == MXPackFmt::Fp6KBlk) {
+        mxfp6_emit_group<true>(values, out_row, group, nk, packed, packed_scale, fly);
+    } else if constexpr (FMT == MXPackFmt::Fp4Blob) {
+        mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::A6W4Blob>(values, out_row, group, nk,
+                                                                   packed, packed_scale);
+    } else if constexpr (FMT == MXPackFmt::Fp4A) {
+        mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::A4W4A>(values, out_row, group, nk, packed,
+                                                                packed_scale);
+    } else if constexpr (FMT == MXPackFmt::Fp4ASr) {
+        mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::A4W4A, true>(
+            values, out_row, group, nk, packed, packed_scale, sr_seed);
+    } else if constexpr (FMT == MXPackFmt::Fp4Plain) {
+        mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::Plain>(values, out_row, group, nk, packed,
+                                                                packed_scale);
+    } else if constexpr (FMT == MXPackFmt::Fp4PlainSr) {
+        mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::Plain, true>(
+            values, out_row, group, nk, packed, packed_scale, sr_seed);
+    } else if constexpr (FMT == MXPackFmt::Fp4BlobSr) {
+        mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::A6W4Blob, true>(
+            values, out_row, group, nk, packed, packed_scale, sr_seed);
+    } else if constexpr (FMT == MXPackFmt::Fp4Fly) {
+        mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::Fly>(values, out_row, group, nk, packed,
+                                                              packed_scale, 0u, fly);
+    } else if constexpr (FMT == MXPackFmt::Fp4FlySr) {
+        mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::Fly, true>(
+            values, out_row, group, nk, packed, packed_scale, sr_seed, fly);
+    } else {
+        mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::A4W4B>(values, out_row, group, nk, packed,
+                                                                packed_scale);
+    }
+}
+
 /*
  * Fused dual MXFP6 packer.
  *
@@ -628,20 +737,23 @@ __device__ __forceinline__ void mxfp6_emit_group(float (&values)[kGroupSize], co
  * fall out of the LDS zero-fill produces it for free -- otherwise the host would have to
  * memset the whole blob, which costs more than the packing.
  */
-// COL_FP4 emits the column direction as MXFP4 instead of MXFP6, from the same staged
-// tile. That is what makes wgrad eligible for a mixed-format GEMM: wgrad contracts the
-// token dimension, so its operands are a gradient and an activation rather than the
-// weight, and narrowing one of them needs a tensor packed fp6 one way and fp4 the other.
-// Nothing else changes -- the two blobs share tile geometry, block indexing and the scale
-// plane, and differ only in the code plane, so the switch is local to the emit.
+// ROW_FMT / COL_FMT pick each direction's output format (MXPackFmt). The hybrid's FP4
+// column direction (Fp4Blob) emits the column direction as MXFP4 instead of MXFP6, from the same
+// staged tile. That is what makes wgrad eligible for a mixed-format GEMM: wgrad contracts the token
+// dimension, so its operands are a gradient and an activation rather than the weight, and narrowing
+// one of them needs a tensor packed fp6 one way and fp4 the other. Nothing else changes -- the two
+// blobs share tile geometry, block indexing and the scale plane, and differ only in the code plane,
+// so the switch is local to the emit.
 template <typename DType, bool DO_ROW, bool DO_COL, MXFP6Prologue PROLOGUE, bool DO_COL_SUM,
-          int TILE_N = kDefaultTileN, bool COL_FP4 = false>
+          int TILE_N = kDefaultTileN, MXPackFmt ROW_FMT = MXPackFmt::Fp6,
+          MXPackFmt COL_FMT = MXPackFmt::Fp6>
 __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
     const DType *__restrict__ input, const DType *__restrict__ aux, const DType *__restrict__ bias,
     uint8_t *__restrict__ row_packed, uint8_t *__restrict__ row_scale,
     uint8_t *__restrict__ col_packed, uint8_t *__restrict__ col_scale, float *__restrict__ col_sum,
     const int32_t M, const int32_t N, const int32_t row_nk_pad, const int32_t col_nk_pad,
-    const prologue_args_t<DType, PROLOGUE> pargs) {
+    const prologue_args_t<DType, PROLOGUE> pargs, const uint32_t sr_seed,
+    const mxfp4_emit::FlyPackArgs row_fly, const mxfp4_emit::FlyPackArgs col_fly) {
     static_assert(TILE_N % kGroupSize == 0, "a staged patch must hold whole groups both ways");
     static_assert(TILE_N <= THREADS_PER_BLOCK,
                   "the column-sum pass assigns one column per thread");
@@ -670,8 +782,19 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
     // a thread owns a fixed set of columns; kDwGroups threads share each one.
     __shared__ float s_dw[kQkr ? kChunksPerRow * kDwGroups * kStageVec : 1];
 
-    const int32_t tile_m = blockIdx.y * TILE_M;
-    const int32_t tile_n = blockIdx.x * TILE_N;
+    constexpr bool kXcdRemap = ROW_FMT == MXPackFmt::Fp4A || ROW_FMT == MXPackFmt::Fp4B ||
+                               ROW_FMT == MXPackFmt::Fp4ASr || ROW_FMT == MXPackFmt::Fp4Plain ||
+                               ROW_FMT == MXPackFmt::Fp4PlainSr || COL_FMT == MXPackFmt::Fp4A ||
+                               COL_FMT == MXPackFmt::Fp4B || COL_FMT == MXPackFmt::Fp4ASr ||
+                               COL_FMT == MXPackFmt::Fp4Plain || COL_FMT == MXPackFmt::Fp4PlainSr ||
+                               ROW_FMT == MXPackFmt::Fp4Fly || ROW_FMT == MXPackFmt::Fp4FlySr ||
+                               COL_FMT == MXPackFmt::Fp4Fly || COL_FMT == MXPackFmt::Fp4FlySr;
+    // Row and column packs of one launch draw from different streams.
+    const uint32_t row_seed = sr_seed, col_seed = sr_seed ^ 0x5bd1e995u;
+    int32_t        bx, by;
+    logical_block<kXcdRemap, TILE_N>(bx, by);
+    const int32_t tile_m          = by * TILE_M;
+    const int32_t tile_n          = bx * TILE_N;
     const bool async_full_tile = tile_m + TILE_M <= M && tile_n + TILE_N <= N;
 
     // q, k and v are per-head slices of mixed_qkv at stride 3D, and TILE_N is D, so a block
@@ -680,8 +803,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
     // runtime value compiles to a ~20-instruction reciprocal sequence that every block would
     // pay before its first load could issue. The host asserts the geometry that makes this
     // valid, so the kernel does not have to re-derive it.
-    const int32_t qkv_slot = kQkr ? int32_t(blockIdx.x % 3) : 0; // 0 = q, 1 = k, 2 = v
-    const int32_t head     = kQkr ? int32_t(blockIdx.x / 3) : 0;
+    const int32_t qkv_slot = kQkr ? int32_t(bx % 3) : 0; // 0 = q, 1 = k, 2 = v
+    const int32_t head     = kQkr ? int32_t(bx / 3) : 0;
     const bool    normed   = kQkr && qkv_slot < 2;               // v is packed plainly
 
     /*
@@ -854,9 +977,9 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                         for (int i = 0; i < kGroupSize; ++i)
                             values[i] =
                                 to_dot_operand<DType>(s_tile[local_m][n_offset + i]);
-                        mxfp6_emit_group(values, tile_m + local_m,
-                                         tile_n / kGroupSize + k_block, row_nk_pad, row_packed,
-                                         row_scale);
+                        emit_group_fmt<ROW_FMT>(values, tile_m + local_m,
+                                                tile_n / kGroupSize + k_block, row_nk_pad,
+                                                row_packed, row_scale, row_seed, row_fly);
                     }
                 }
                 if constexpr (DO_COL) {
@@ -867,23 +990,16 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                         for (int i = 0; i < kGroupSize; ++i)
                             values[i] = to_dot_operand<DType>(
                                 s_tile[stage * kStageRows + i][col_slot]);
-                        if constexpr (COL_FP4) {
-                            mxfp4_emit::mxfp4_emit_group(values, tile_n + col_slot,
-                                                         tile_m / kGroupSize + stage,
-                                                         col_nk_pad, col_packed, col_scale);
-                        } else {
-                            mxfp6_emit_group(values, tile_n + col_slot,
-                                             tile_m / kGroupSize + stage, col_nk_pad,
-                                             col_packed, col_scale);
-                        }
+                        emit_group_fmt<COL_FMT>(values, tile_n + col_slot,
+                                                tile_m / kGroupSize + stage, col_nk_pad, col_packed,
+                                                col_scale, col_seed, col_fly);
                     }
                 }
             }
 
             if constexpr (DO_COL_SUM) {
                 if (threadIdx.x < TILE_N)
-                    col_sum[static_cast<int64_t>(blockIdx.y) * N + tile_n + threadIdx.x] =
-                        col_sum_acc;
+                    col_sum[static_cast<int64_t>(by) * N + tile_n + threadIdx.x] = col_sum_acc;
             }
             return;
         }
@@ -1242,7 +1358,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
             for (int gr = 0; gr < kDwGroups; ++gr)
                 acc += s_dw[(chunk * kDwGroups + gr) * kStageVec + j];
             float *__restrict__ dst = qkv_slot == 0 ? pargs.dw_q : pargs.dw_k;
-            dst[(int64_t(blockIdx.y) * pargs.num_heads + head) * TILE_N + threadIdx.x] = acc;
+            dst[(int64_t(by) * pargs.num_heads + head) * TILE_N + threadIdx.x] = acc;
         }
         __syncthreads();
     }
@@ -1261,7 +1377,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                 // resident, so there is nothing here to schedule around.
                 for (int i = 0; i < TILE_M; ++i)
                     acc += to_float<DType>(s_tile[i][threadIdx.x]);
-                col_sum[static_cast<int64_t>(blockIdx.y) * N + global_n] = acc;
+                col_sum[static_cast<int64_t>(by) * N + global_n] = acc;
             }
         }
     }
@@ -1283,8 +1399,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
             for (int i = 0; i < kGroupSize; ++i)
                 values[i] = to_dot_operand<DType>(s_tile[local_m][n_offset + i]);
 
-            mxfp6_emit_group(values, tile_m + local_m, tile_n / kGroupSize + k_block, row_nk_pad,
-                             row_packed, row_scale);
+            emit_group_fmt<ROW_FMT>(values, tile_m + local_m, tile_n / kGroupSize + k_block,
+                                    row_nk_pad, row_packed, row_scale, row_seed, row_fly);
         }
     }
 
@@ -1304,14 +1420,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
             for (int i = 0; i < kGroupSize; ++i)
                 values[i] = to_dot_operand<DType>(s_tile[m_offset + i][local_n]);
 
-            if constexpr (COL_FP4) {
-                mxfp4_emit::mxfp4_emit_group(values, tile_n + local_n,
-                                             tile_m / kGroupSize + k_block, col_nk_pad,
-                                             col_packed, col_scale);
-            } else {
-                mxfp6_emit_group(values, tile_n + local_n, tile_m / kGroupSize + k_block,
-                                 col_nk_pad, col_packed, col_scale);
-            }
+            emit_group_fmt<COL_FMT>(values, tile_n + local_n, tile_m / kGroupSize + k_block,
+                                    col_nk_pad, col_packed, col_scale, col_seed, col_fly);
         }
     }
 }
@@ -1332,21 +1442,148 @@ struct launch_geometry {
 // The bias-gradient pass is a template parameter rather than a runtime null check, so that
 // a caller who does not want it provably pays nothing rather than measurably nothing. The
 // cost is six kernel instantiations per dtype instead of three.
+// The format pairs the packers are instantiated for: both FP6 (the A6W6 blobs), FP6 + the
+// MXFP4 blob (the A6W4 wgrad hybrid), and the two A4W4 pairs -- a gradient, packed as the A
+// operand both ways (dgrad contracts its columns, wgrad its rows), and an activation or
+// weight, FP6 for the forward and the B operand the other way.
+inline bool is_a4w4(const MXPackFmt f) {
+    return f == MXPackFmt::Fp4A || f == MXPackFmt::Fp4B || f == MXPackFmt::Fp4ASr ||
+           f == MXPackFmt::Fp4Plain || f == MXPackFmt::Fp4PlainSr || f == MXPackFmt::Fp4Fly ||
+           f == MXPackFmt::Fp4FlySr;
+}
+
+// The FlyDSL packed-scale parameters of the current launch (MXFlyPackScope, set by the op layer).
+namespace {
+MXFlyPack               g_fly_row, g_fly_col;
+mxfp4_emit::FlyPackArgs to_args(const MXFlyPack &p) {
+    return {p.is_b, p.nt, p.ilv, p.k128, p.rows};
+}
+} // namespace
+
+// One seed per SR launch: a process-wide counter, hashed. Deterministic for a given launch
+// sequence; distinct across launches, so a tensor packed twice gets independent rounding.
+inline uint32_t next_sr_seed() {
+    static std::atomic<uint32_t> counter{0};
+    uint32_t                     x = counter.fetch_add(1, std::memory_order_relaxed) + 0x9e3779b9u;
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+template <typename DType, bool DO_ROW, bool DO_COL, MXFP6Prologue PROLOGUE, int TILE_N>
+void launch_dual(const dim3 grid, const dim3 block, hipStream_t stream, const DType *input,
+                 const DType *aux, const DType *bias, uint8_t *row_packed, uint8_t *row_scale,
+                 uint8_t *col_packed, uint8_t *col_scale, float *col_sum, const int32_t M,
+                 const int32_t N, int32_t row_nk_pad, int32_t col_nk_pad,
+                 const prologue_args_t<DType, PROLOGUE> &pargs, const MXPackFmt row_fmt,
+                 const MXPackFmt col_fmt) {
+    // AITER's A4W4 operands carry no guard tiles: a row is exactly ceil(K, 256) / 2 bytes.
+    if (is_a4w4(row_fmt))
+        row_nk_pad = ceil_div(N, kTileRows) * (kTileRows / kKTile);
+    if (is_a4w4(col_fmt))
+        col_nk_pad = ceil_div(M, kTileRows) * (kTileRows / kKTile);
+    const uint32_t sr_seed =
+        (row_fmt == MXPackFmt::Fp4ASr || col_fmt == MXPackFmt::Fp4ASr ||
+         row_fmt == MXPackFmt::Fp4PlainSr || col_fmt == MXPackFmt::Fp4PlainSr ||
+         row_fmt == MXPackFmt::Fp4FlySr || col_fmt == MXPackFmt::Fp4FlySr ||
+         row_fmt == MXPackFmt::Fp4BlobSr || col_fmt == MXPackFmt::Fp4BlobSr)
+            ? next_sr_seed()
+            : 0u;
+    const mxfp4_emit::FlyPackArgs row_fly = to_args(mx_fly_pack_row());
+    const mxfp4_emit::FlyPackArgs col_fly = to_args(mx_fly_pack_col());
+    auto                          go      = [&](auto r, auto c) {
+        constexpr MXPackFmt R = decltype(r)::value;
+        constexpr MXPackFmt C = decltype(c)::value;
+        if (col_sum != nullptr) {
+            quantize_mxfp6_dual_kernel<DType, DO_ROW, DO_COL, PROLOGUE, true, TILE_N, R, C>
+                <<<grid, block, 0, stream>>>(input, aux, bias, row_packed, row_scale, col_packed,
+                                                                           col_scale, col_sum, M, N, row_nk_pad, col_nk_pad,
+                                                                           pargs, sr_seed, row_fly, col_fly);
+        } else {
+            quantize_mxfp6_dual_kernel<DType, DO_ROW, DO_COL, PROLOGUE, false, TILE_N, R, C>
+                <<<grid, block, 0, stream>>>(input, aux, bias, row_packed, row_scale, col_packed,
+                                                                           col_scale, nullptr, M, N, row_nk_pad, col_nk_pad,
+                                                                           pargs, sr_seed, row_fly, col_fly);
+        }
+    };
+    using F6       = std::integral_constant<MXPackFmt, MXPackFmt::Fp6>;
+    using F4Blob   = std::integral_constant<MXPackFmt, MXPackFmt::Fp4Blob>;
+    using F4A      = std::integral_constant<MXPackFmt, MXPackFmt::Fp4A>;
+    using F4B      = std::integral_constant<MXPackFmt, MXPackFmt::Fp4B>;
+    using F4ASr    = std::integral_constant<MXPackFmt, MXPackFmt::Fp4ASr>;
+    using F4P      = std::integral_constant<MXPackFmt, MXPackFmt::Fp4Plain>;
+    using F4PSr    = std::integral_constant<MXPackFmt, MXPackFmt::Fp4PlainSr>;
+    using F4F      = std::integral_constant<MXPackFmt, MXPackFmt::Fp4Fly>;
+    using F4BlobSr = std::integral_constant<MXPackFmt, MXPackFmt::Fp4BlobSr>;
+    using F4FSr    = std::integral_constant<MXPackFmt, MXPackFmt::Fp4FlySr>;
+    using F6K      = std::integral_constant<MXPackFmt, MXPackFmt::Fp6KBlk>;
+    // A direction that is not emitted does not constrain the pair.
+    const MXPackFmt r = DO_ROW ? row_fmt : MXPackFmt::Fp6;
+    const MXPackFmt c = DO_COL ? col_fmt : MXPackFmt::Fp6;
+    if (r == MXPackFmt::Fp6 && c == MXPackFmt::Fp6)
+        go(F6{}, F6{});
+    else if (r == MXPackFmt::Fp4A && c == MXPackFmt::Fp4A)
+        go(F4A{}, F4A{});
+    else if (r == MXPackFmt::Fp6 && c == MXPackFmt::Fp4B)
+        go(F6{}, F4B{});
+    else if (r == MXPackFmt::Fp6 && c == MXPackFmt::Fp4Blob)
+        go(F6{}, F4Blob{});
+    else if (r == MXPackFmt::Fp6 && c == MXPackFmt::Fp4A) // gradient, wgrad-only MXFP4
+        go(F6{}, F4A{});
+    else if (r == MXPackFmt::Fp4A && c == MXPackFmt::Fp6) // gradient, dgrad-only MXFP4
+        go(F4A{}, F6{});
+    else if (r == MXPackFmt::Fp4ASr && c == MXPackFmt::Fp4ASr) // the same three, SR
+        go(F4ASr{}, F4ASr{});
+    else if (r == MXPackFmt::Fp6 && c == MXPackFmt::Fp4ASr)
+        go(F6{}, F4ASr{});
+    else if (r == MXPackFmt::Fp4ASr && c == MXPackFmt::Fp6)
+        go(F4ASr{}, F6{});
+    else if (r == MXPackFmt::Fp4Plain && c == MXPackFmt::Fp4Plain) // FlyDSL operands
+        go(F4P{}, F4P{});
+    else if (r == MXPackFmt::Fp6 && c == MXPackFmt::Fp4Plain)
+        go(F6{}, F4P{});
+    else if (r == MXPackFmt::Fp4Plain && c == MXPackFmt::Fp6) // row-only plain FP4 (forward-only)
+        go(F4P{}, F6{});
+    else if (r == MXPackFmt::Fp4PlainSr && c == MXPackFmt::Fp4PlainSr)
+        go(F4PSr{}, F4PSr{});
+    else if (r == MXPackFmt::Fp4Blob && c == MXPackFmt::Fp4Blob) // A4W4 tile-blob kernels
+        go(F4Blob{}, F4Blob{});
+    else if (r == MXPackFmt::Fp4BlobSr && c == MXPackFmt::Fp4BlobSr)
+        go(F4BlobSr{}, F4BlobSr{});
+    else if (r == MXPackFmt::Fp4Blob && c == MXPackFmt::Fp6) // row-only blob (forward / eval)
+        go(F4Blob{}, F6{});
+    else if (r == MXPackFmt::Fp4Fly && c == MXPackFmt::Fp4Fly) // FlyDSL packed scales
+        go(F4F{}, F4F{});
+    else if (r == MXPackFmt::Fp4FlySr && c == MXPackFmt::Fp4FlySr)
+        go(F4FSr{}, F4FSr{});
+    else if (r == MXPackFmt::Fp6 && c == MXPackFmt::Fp4Fly)
+        go(F6{}, F4F{});
+    else if (r == MXPackFmt::Fp4Fly && c == MXPackFmt::Fp6) // row-only fly FP4 (forward-only)
+        go(F4F{}, F6{});
+    else if (r == MXPackFmt::Fp6KBlk &&
+             c == MXPackFmt::Fp4Fly) // FlyDSL A6W6 forward + fly FP4 backward
+        go(F6K{}, F4F{});
+    else if (r == MXPackFmt::Fp6KBlk && c == MXPackFmt::Fp6) // row-only (forward / eval)
+        go(F6K{}, F6{});
+    else
+        PRIMUS_TURBO_CHECK(false, "unsupported MX pack format pair (row ", int(row_fmt), ", col ",
+                           int(col_fmt), ")");
+}
+
 template <typename DType, MXFP6Prologue PROLOGUE, int TILE_N = kDefaultTileN>
 void launch_fused(const dim3 grid, const dim3 block, hipStream_t stream, const DType *input,
                   const DType *aux, const DType *bias, uint8_t *row_packed, uint8_t *row_scale,
                   uint8_t *col_packed, uint8_t *col_scale, float *col_sum, const int32_t M,
                   const int32_t N, const int32_t row_nk_pad, const int32_t col_nk_pad,
-                  const prologue_args_t<DType, PROLOGUE> &pargs = {}) {
-    if (col_sum != nullptr) {
-        quantize_mxfp6_dual_kernel<DType, true, true, PROLOGUE, true, TILE_N>
-            <<<grid, block, 0, stream>>>(input, aux, bias, row_packed, row_scale, col_packed,
-                                         col_scale, col_sum, M, N, row_nk_pad, col_nk_pad, pargs);
-    } else {
-        quantize_mxfp6_dual_kernel<DType, true, true, PROLOGUE, false, TILE_N>
-            <<<grid, block, 0, stream>>>(input, aux, bias, row_packed, row_scale, col_packed,
-                                         col_scale, nullptr, M, N, row_nk_pad, col_nk_pad, pargs);
-    }
+                  const prologue_args_t<DType, PROLOGUE> &pargs   = {},
+                  const MXPackFmt                         row_fmt = MXPackFmt::Fp6,
+                  const MXPackFmt                         col_fmt = MXPackFmt::Fp6) {
+    launch_dual<DType, true, true, PROLOGUE, TILE_N>(
+        grid, block, stream, input, aux, bias, row_packed, row_scale, col_packed, col_scale,
+        col_sum, M, N, row_nk_pad, col_nk_pad, pargs, row_fmt, col_fmt);
 }
 
 template <int TILE_N> launch_geometry geometry_for(const int M, const int N) {
@@ -1370,33 +1607,34 @@ template <int TILE_N> launch_geometry geometry_for(const int M, const int N) {
 template <typename DType>
 void quantize_mxfp6_impl(const DType *input, uint8_t *row_packed, uint8_t *row_scale,
                          uint8_t *col_packed, uint8_t *col_scale, const int M, const int N,
-                         const MXFP6Direction direction, hipStream_t stream) {
+                         const MXFP6Direction direction, hipStream_t stream,
+                         const MXPackFmt row_fmt, const MXPackFmt col_fmt) {
     constexpr auto kNoPrologue = MXFP6Prologue::Identity;
 
     switch (direction) {
     case MXFP6Direction::Row: {
         const auto [row_nk_pad, col_nk_pad, grid, block] =
             geometry_for<kDefaultTileN>(M, N);
-        quantize_mxfp6_dual_kernel<DType, true, false, kNoPrologue, false>
-            <<<grid, block, 0, stream>>>(input, nullptr, nullptr, row_packed, row_scale, col_packed,
-                                         col_scale, nullptr, M, N, row_nk_pad, col_nk_pad, {});
+        launch_dual<DType, true, false, kNoPrologue, kDefaultTileN>(
+            grid, block, stream, input, nullptr, nullptr, row_packed, row_scale, col_packed,
+            col_scale, nullptr, M, N, row_nk_pad, col_nk_pad, {}, row_fmt, col_fmt);
         break;
     }
     case MXFP6Direction::Col: {
         const auto [row_nk_pad, col_nk_pad, grid, block] =
             geometry_for<kDefaultTileN>(M, N);
-        quantize_mxfp6_dual_kernel<DType, false, true, kNoPrologue, false>
-            <<<grid, block, 0, stream>>>(input, nullptr, nullptr, row_packed, row_scale, col_packed,
-                                         col_scale, nullptr, M, N, row_nk_pad, col_nk_pad, {});
+        launch_dual<DType, false, true, kNoPrologue, kDefaultTileN>(
+            grid, block, stream, input, nullptr, nullptr, row_packed, row_scale, col_packed,
+            col_scale, nullptr, M, N, row_nk_pad, col_nk_pad, {}, row_fmt, col_fmt);
         break;
     }
     case MXFP6Direction::Dual: {
         constexpr int kIdentityTileN = 128;
         const auto [row_nk_pad, col_nk_pad, grid, block] =
             geometry_for<kIdentityTileN>(M, N);
-        quantize_mxfp6_dual_kernel<DType, true, true, kNoPrologue, false, kIdentityTileN>
-            <<<grid, block, 0, stream>>>(input, nullptr, nullptr, row_packed, row_scale, col_packed,
-                                         col_scale, nullptr, M, N, row_nk_pad, col_nk_pad, {});
+        launch_dual<DType, true, true, kNoPrologue, kIdentityTileN>(
+            grid, block, stream, input, nullptr, nullptr, row_packed, row_scale, col_packed,
+            col_scale, nullptr, M, N, row_nk_pad, col_nk_pad, {}, row_fmt, col_fmt);
         break;
     }
     }
@@ -1419,10 +1657,10 @@ void quantize_mxfp6_row_mxfp4_col_impl(const DType *input, uint8_t *row_packed,
                                        hipStream_t stream) {
     constexpr int kIdentityTileN = 128;
     const auto [row_nk_pad, col_nk_pad, grid, block] = geometry_for<kIdentityTileN>(M, N);
-    quantize_mxfp6_dual_kernel<DType, true, true, MXFP6Prologue::Identity, false,
-                               kIdentityTileN, true>
-        <<<grid, block, 0, stream>>>(input, nullptr, nullptr, row_packed, row_scale, col_packed,
-                                     col_scale, nullptr, M, N, row_nk_pad, col_nk_pad, {});
+    quantize_mxfp6_dual_kernel<DType, true, true, MXFP6Prologue::Identity, false, kIdentityTileN,
+                               MXPackFmt::Fp6, MXPackFmt::Fp4Blob><<<grid, block, 0, stream>>>(
+        input, nullptr, nullptr, row_packed, row_scale, col_packed, col_scale, nullptr, M, N,
+        row_nk_pad, col_nk_pad, {}, 0u, {}, {});
     PRIMUS_TURBO_CHECK_HIP(hipGetLastError());
 }
 
@@ -1437,7 +1675,8 @@ template <typename DType>
 void quantize_mxfp6_fused_impl(const DType *input, const DType *aux, const DType *bias,
                                uint8_t *row_packed, uint8_t *row_scale, uint8_t *col_packed,
                                uint8_t *col_scale, float *col_sum, const int M, const int N,
-                               const MXFP6Prologue prologue, hipStream_t stream) {
+                               const MXFP6Prologue prologue, hipStream_t stream,
+                               const MXPackFmt row_fmt, const MXPackFmt col_fmt) {
     // Dual only, by design: see the declaration in quantization.h.
     switch (prologue) {
     case MXFP6Prologue::Identity: {
@@ -1446,7 +1685,7 @@ void quantize_mxfp6_fused_impl(const DType *input, const DType *aux, const DType
             geometry_for<kIdentityTileN>(M, N);
         launch_fused<DType, MXFP6Prologue::Identity, kIdentityTileN>(
             grid, block, stream, input, aux, bias, row_packed, row_scale, col_packed, col_scale,
-            col_sum, M, N, row_nk_pad, col_nk_pad);
+            col_sum, M, N, row_nk_pad, col_nk_pad, {}, row_fmt, col_fmt);
         break;
     }
     case MXFP6Prologue::BiasGelu: {
@@ -1455,7 +1694,7 @@ void quantize_mxfp6_fused_impl(const DType *input, const DType *aux, const DType
             geometry_for<kBiasGeluTileN>(M, N);
         launch_fused<DType, MXFP6Prologue::BiasGelu, kBiasGeluTileN>(
             grid, block, stream, input, aux, bias, row_packed, row_scale, col_packed, col_scale,
-            col_sum, M, N, row_nk_pad, col_nk_pad);
+            col_sum, M, N, row_nk_pad, col_nk_pad, {}, row_fmt, col_fmt);
         break;
     }
     case MXFP6Prologue::BiasGeluBackward: {
@@ -1463,7 +1702,7 @@ void quantize_mxfp6_fused_impl(const DType *input, const DType *aux, const DType
             geometry_for<kDefaultTileN>(M, N);
         launch_fused<DType, MXFP6Prologue::BiasGeluBackward>(
             grid, block, stream, input, aux, bias, row_packed, row_scale, col_packed, col_scale,
-            col_sum, M, N, row_nk_pad, col_nk_pad);
+            col_sum, M, N, row_nk_pad, col_nk_pad, {}, row_fmt, col_fmt);
         break;
     }
     case MXFP6Prologue::QkNormRopeBackward:
@@ -1487,11 +1726,12 @@ void quantize_mxfp6_fused_impl(const DType *input, const DType *aux, const DType
 }
 
 template <typename DType>
-void quantize_mxfp6_qk_norm_rope_bwd_impl(const DType *input,
+void quantize_mxfp6_qk_norm_rope_bwd_impl(const DType                      *input,
                                           const MXFP6QkNormRopeArgs<DType> &args,
                                           uint8_t *row_packed, uint8_t *row_scale,
                                           uint8_t *col_packed, uint8_t *col_scale, float *col_sum,
-                                          const int M, const int N, hipStream_t stream) {
+                                          const int M, const int N, hipStream_t stream,
+                                          const MXPackFmt row_fmt, const MXPackFmt col_fmt) {
     // The tile width *is* head_dim, because the norm's reduction spans head_dim and the
     // kernel only knows how to reduce inside a block. Every supported head_dim needs its own
     // instantiation; 128 is Flux's and the only one built. Anything else is a hard error
@@ -1522,7 +1762,7 @@ void quantize_mxfp6_qk_norm_rope_bwd_impl(const DType *input,
 
     launch_fused<DType, MXFP6Prologue::QkNormRopeBackward, kTileN>(
         grid, block, stream, input, nullptr, nullptr, row_packed, row_scale, col_packed, col_scale,
-        col_sum, M, N, row_nk_pad, col_nk_pad, args);
+        col_sum, M, N, row_nk_pad, col_nk_pad, args, row_fmt, col_fmt);
     PRIMUS_TURBO_CHECK_HIP(hipGetLastError());
 }
 
@@ -1530,7 +1770,8 @@ template <typename DType>
 void quantize_mxfp6_ln_modulate_impl(const DType *input, const MXFP6LnModulateArgs<DType> &args,
                                      uint8_t *row_packed, uint8_t *row_scale, uint8_t *col_packed,
                                      uint8_t *col_scale, float *col_sum, const int M, const int N,
-                                     hipStream_t stream) {
+                                     hipStream_t stream, const MXPackFmt row_fmt,
+                                     const MXPackFmt col_fmt) {
     // The prologue leaves -mean * rstd where a zero-filled column should stage zero, and
     // that column is on the column-direction blob's contraction axis. Rather than pay a
     // per-element bounds branch in the innermost loop to mask it -- the same branch the
@@ -1548,7 +1789,7 @@ void quantize_mxfp6_ln_modulate_impl(const DType *input, const MXFP6LnModulateAr
     const auto [row_nk_pad, col_nk_pad, grid, block] = geometry_for<kLnModulateTileN>(M, N);
     launch_fused<DType, MXFP6Prologue::LnModulate, kLnModulateTileN>(
         grid, block, stream, input, nullptr, nullptr, row_packed, row_scale, col_packed, col_scale,
-        col_sum, M, N, row_nk_pad, col_nk_pad, args);
+        col_sum, M, N, row_nk_pad, col_nk_pad, args, row_fmt, col_fmt);
     PRIMUS_TURBO_CHECK_HIP(hipGetLastError());
 }
 
@@ -1556,61 +1797,74 @@ template <typename DType>
 void quantize_mxfp6_gate_mul_impl(const DType *input, const MXFP6GateMulArgs<DType> &args,
                                   uint8_t *row_packed, uint8_t *row_scale, uint8_t *col_packed,
                                   uint8_t *col_scale, float *col_sum, const int M, const int N,
-                                  hipStream_t stream) {
+                                  hipStream_t stream, const MXPackFmt row_fmt,
+                                  const MXPackFmt col_fmt) {
     PRIMUS_TURBO_CHECK(args.batch_mask >= 0 && (args.batch_mask & (args.batch_mask + 1)) == 0,
                        "GateMul needs a power-of-two batch, passed as batch_mask = B - 1");
     constexpr int kGateMulTileN = 128;
     const auto [row_nk_pad, col_nk_pad, grid, block] = geometry_for<kGateMulTileN>(M, N);
     launch_fused<DType, MXFP6Prologue::GateMul, kGateMulTileN>(
         grid, block, stream, input, nullptr, nullptr, row_packed, row_scale, col_packed, col_scale,
-        col_sum, M, N, row_nk_pad, col_nk_pad, args);
+        col_sum, M, N, row_nk_pad, col_nk_pad, args, row_fmt, col_fmt);
     PRIMUS_TURBO_CHECK_HIP(hipGetLastError());
 }
 
 template void quantize_mxfp6_impl<bfloat16>(const bfloat16 *, uint8_t *, uint8_t *, uint8_t *,
                                             uint8_t *, const int, const int, const MXFP6Direction,
-                                            hipStream_t);
+                                            hipStream_t, MXPackFmt, MXPackFmt);
 template void quantize_mxfp6_impl<float16>(const float16 *, uint8_t *, uint8_t *, uint8_t *,
                                            uint8_t *, const int, const int, const MXFP6Direction,
-                                           hipStream_t);
+                                           hipStream_t, MXPackFmt, MXPackFmt);
 
 template void quantize_mxfp6_fused_impl<bfloat16>(const bfloat16 *, const bfloat16 *,
                                                   const bfloat16 *, uint8_t *, uint8_t *, uint8_t *,
                                                   uint8_t *, float *, const int, const int,
-                                                  const MXFP6Prologue, hipStream_t);
+                                                  const MXFP6Prologue, hipStream_t, MXPackFmt,
+                                                  MXPackFmt);
 template void quantize_mxfp6_fused_impl<float16>(const float16 *, const float16 *, const float16 *,
                                                  uint8_t *, uint8_t *, uint8_t *, uint8_t *,
                                                  float *, const int, const int, const MXFP6Prologue,
-                                                 hipStream_t);
+                                                 hipStream_t, MXPackFmt, MXPackFmt);
 
-template void quantize_mxfp6_qk_norm_rope_bwd_impl<bfloat16>(const bfloat16 *,
-                                                             const MXFP6QkNormRopeArgs<bfloat16> &,
-                                                             uint8_t *, uint8_t *, uint8_t *,
-                                                             uint8_t *, float *, const int,
-                                                             const int, hipStream_t);
-template void quantize_mxfp6_qk_norm_rope_bwd_impl<float16>(const float16 *,
-                                                            const MXFP6QkNormRopeArgs<float16> &,
-                                                            uint8_t *, uint8_t *, uint8_t *,
-                                                            uint8_t *, float *, const int,
-                                                            const int, hipStream_t);
+template void quantize_mxfp6_qk_norm_rope_bwd_impl<bfloat16>(
+    const bfloat16 *, const MXFP6QkNormRopeArgs<bfloat16> &, uint8_t *, uint8_t *, uint8_t *,
+    uint8_t *, float *, const int, const int, hipStream_t, MXPackFmt, MXPackFmt);
+template void quantize_mxfp6_qk_norm_rope_bwd_impl<float16>(
+    const float16 *, const MXFP6QkNormRopeArgs<float16> &, uint8_t *, uint8_t *, uint8_t *,
+    uint8_t *, float *, const int, const int, hipStream_t, MXPackFmt, MXPackFmt);
 
 template void quantize_mxfp6_ln_modulate_impl<bfloat16>(const bfloat16 *,
                                                         const MXFP6LnModulateArgs<bfloat16> &,
                                                         uint8_t *, uint8_t *, uint8_t *, uint8_t *,
-                                                        float *, const int, const int,
-                                                        hipStream_t);
+                                                        float *, const int, const int, hipStream_t,
+                                                        MXPackFmt, MXPackFmt);
 template void quantize_mxfp6_ln_modulate_impl<float16>(const float16 *,
                                                        const MXFP6LnModulateArgs<float16> &,
                                                        uint8_t *, uint8_t *, uint8_t *, uint8_t *,
-                                                       float *, const int, const int, hipStream_t);
+                                                       float *, const int, const int, hipStream_t,
+                                                       MXPackFmt, MXPackFmt);
 
 template void quantize_mxfp6_gate_mul_impl<bfloat16>(const bfloat16 *,
                                                      const MXFP6GateMulArgs<bfloat16> &, uint8_t *,
                                                      uint8_t *, uint8_t *, uint8_t *, float *,
-                                                     const int, const int, hipStream_t);
+                                                     const int, const int, hipStream_t, MXPackFmt,
+                                                     MXPackFmt);
 template void quantize_mxfp6_gate_mul_impl<float16>(const float16 *,
                                                     const MXFP6GateMulArgs<float16> &, uint8_t *,
                                                     uint8_t *, uint8_t *, uint8_t *, float *,
-                                                    const int, const int, hipStream_t);
+                                                    const int, const int, hipStream_t, MXPackFmt,
+                                                    MXPackFmt);
+
+// Outside the file's anonymous namespace: the op layer (another translation unit) calls these.
+void mx_fly_pack_set(const MXFlyPack &row, const MXFlyPack &col) {
+    g_fly_row = row;
+    g_fly_col = col;
+}
+MXFlyPack mx_fly_pack_row() {
+    return g_fly_row;
+}
+MXFlyPack mx_fly_pack_col() {
+    return g_fly_col;
+}
 
 } // namespace primus_turbo

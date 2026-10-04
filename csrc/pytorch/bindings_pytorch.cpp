@@ -189,12 +189,26 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("quantize_mxfp6_fused_dual(Tensor input, Tensor? aux, Tensor? bias, int mode, "
           "bool want_col_sum) -> Tensor[]");
     m.def("quantize_mxfp6_fused_dual_out(Tensor input, Tensor? aux, Tensor? bias, int prologue_mode, Tensor(a!) row_packed, Tensor(b!) row_scale, Tensor(c!) col_packed, Tensor(d!) col_scale, Tensor(e!)? col_sum=None) -> ()");
+    m.def("quantize_mx_dual_out(Tensor input, Tensor(a!) row_packed, Tensor(b!) row_scale, Tensor(c!) col_packed, Tensor(d!) col_scale, int fmt) -> ()");
+    m.def("quantize_mx_fused_dual_out(Tensor input, Tensor? aux, Tensor? bias, int prologue_mode, Tensor(a!) row_packed, Tensor(b!) row_scale, Tensor(c!) col_packed, Tensor(d!) col_scale, Tensor(e!)? col_sum, int fmt) -> ()");
     m.def("quantize_mxfp6_qk_norm_rope_bwd(Tensor input, Tensor dq, Tensor dk, Tensor dv, "
           "Tensor cos, Tensor sin, Tensor wq, Tensor wk, Tensor rstd_q, Tensor rstd_k, "
           "bool want_col_sum) -> Tensor[]");
     m.def("quantize_mxfp6_ln_modulate(Tensor input, Tensor mean, Tensor rstd, Tensor scale, "
           "Tensor shift, bool want_col_sum) -> Tensor[]");
     m.def("quantize_mxfp6_gate_mul(Tensor input, Tensor gate, bool want_col_sum) -> Tensor[]");
+    // The same packers with a trailing output-format code (0 fp6, 1 A4W4 gradient, 2 A4W4
+    // activation/weight); see fmt_pair in quantization_mxfp6.cpp.
+    m.def("quantize_mx(Tensor input, int axis, int fmt) -> Tensor[]");
+    m.def("quantize_mx_dual(Tensor input, int fmt) -> Tensor[]");
+    m.def("quantize_mx_fused_dual(Tensor input, Tensor? aux, Tensor? bias, int mode, "
+          "bool want_col_sum, int fmt) -> Tensor[]");
+    m.def("quantize_mx_qk_norm_rope_bwd(Tensor input, Tensor dq, Tensor dk, Tensor dv, "
+          "Tensor cos, Tensor sin, Tensor wq, Tensor wk, Tensor rstd_q, Tensor rstd_k, "
+          "bool want_col_sum, int fmt) -> Tensor[]");
+    m.def("quantize_mx_ln_modulate(Tensor input, Tensor mean, Tensor rstd, Tensor scale, "
+          "Tensor shift, bool want_col_sum, int fmt) -> Tensor[]");
+    m.def("quantize_mx_gate_mul(Tensor input, Tensor gate, bool want_col_sum, int fmt) -> Tensor[]");
 #endif // BUILD_MXFP6_BACKEND
 }
 
@@ -229,9 +243,17 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("quantize_mxfp6_dual_out", quantize_mxfp6_dual_out);
     m.impl("quantize_mxfp6_fused_dual", quantize_mxfp6_fused_dual);
     m.impl("quantize_mxfp6_fused_dual_out", quantize_mxfp6_fused_dual_out);
+    m.impl("quantize_mx_dual_out", quantize_mx_dual_out);
+    m.impl("quantize_mx_fused_dual_out", quantize_mx_fused_dual_out);
     m.impl("quantize_mxfp6_qk_norm_rope_bwd", quantize_mxfp6_qk_norm_rope_bwd);
     m.impl("quantize_mxfp6_ln_modulate", quantize_mxfp6_ln_modulate);
     m.impl("quantize_mxfp6_gate_mul", quantize_mxfp6_gate_mul);
+    m.impl("quantize_mx", quantize_mx);
+    m.impl("quantize_mx_dual", quantize_mx_dual);
+    m.impl("quantize_mx_fused_dual", quantize_mx_fused_dual);
+    m.impl("quantize_mx_qk_norm_rope_bwd", quantize_mx_qk_norm_rope_bwd);
+    m.impl("quantize_mx_ln_modulate", quantize_mx_ln_modulate);
+    m.impl("quantize_mx_gate_mul", quantize_mx_gate_mul);
 #endif // BUILD_MXFP6_BACKEND
     m.impl("dequantize_mxfp4", dequantize_mxfp4);
     m.impl("grouped_quantize_mxfp4_dual", grouped_quantize_mxfp4_dual);
@@ -306,9 +328,17 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     m.impl("quantize_mxfp6_dual_out", quantize_mxfp6_dual_out_meta);
     m.impl("quantize_mxfp6_fused_dual", quantize_mxfp6_fused_dual_meta);
     m.impl("quantize_mxfp6_fused_dual_out", quantize_mxfp6_fused_dual_out_meta);
+    m.impl("quantize_mx_dual_out", quantize_mx_dual_out_meta);
+    m.impl("quantize_mx_fused_dual_out", quantize_mx_fused_dual_out_meta);
     m.impl("quantize_mxfp6_qk_norm_rope_bwd", quantize_mxfp6_qk_norm_rope_bwd_meta);
     m.impl("quantize_mxfp6_ln_modulate", quantize_mxfp6_ln_modulate_meta);
     m.impl("quantize_mxfp6_gate_mul", quantize_mxfp6_gate_mul_meta);
+    m.impl("quantize_mx", quantize_mx_meta);
+    m.impl("quantize_mx_dual", quantize_mx_dual_meta);
+    m.impl("quantize_mx_fused_dual", quantize_mx_fused_dual_meta);
+    m.impl("quantize_mx_qk_norm_rope_bwd", quantize_mx_qk_norm_rope_bwd_meta);
+    m.impl("quantize_mx_ln_modulate", quantize_mx_ln_modulate_meta);
+    m.impl("quantize_mx_gate_mul", quantize_mx_gate_mul_meta);
 #endif // BUILD_MXFP6_BACKEND
     m.impl("dequantize_mxfp4", dequantize_mxfp4_meta);
     m.impl("grouped_quantize_mxfp4_dual", grouped_quantize_mxfp4_dual_meta);

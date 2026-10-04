@@ -117,6 +117,21 @@ void quantize_mxfp6_out_meta(const at::Tensor input, const int64_t axis, at::Ten
 std::vector<at::Tensor> quantize_mxfp6_dual(const at::Tensor input);
 void quantize_mxfp6_dual_out(const at::Tensor input, at::Tensor row_packed, at::Tensor row_scale, at::Tensor col_packed, at::Tensor col_scale);
 void quantize_mxfp6_dual_out_meta(const at::Tensor input, at::Tensor row_packed, at::Tensor row_scale, at::Tensor col_packed, at::Tensor col_scale);
+void quantize_mx_dual_out(const at::Tensor input, at::Tensor row_packed, at::Tensor row_scale,
+                          at::Tensor col_packed, at::Tensor col_scale, const int64_t fmt);
+void quantize_mx_dual_out_meta(const at::Tensor input, at::Tensor row_packed, at::Tensor row_scale,
+                               at::Tensor col_packed, at::Tensor col_scale, const int64_t fmt);
+void quantize_mx_fused_dual_out(const at::Tensor input, const c10::optional<at::Tensor> aux,
+                                const c10::optional<at::Tensor> bias, const int64_t prologue_mode,
+                                at::Tensor row_packed, at::Tensor row_scale, at::Tensor col_packed,
+                                at::Tensor col_scale, c10::optional<at::Tensor> col_sum,
+                                const int64_t fmt);
+void quantize_mx_fused_dual_out_meta(const at::Tensor input, const c10::optional<at::Tensor> aux,
+                                     const c10::optional<at::Tensor> bias,
+                                     const int64_t prologue_mode, at::Tensor row_packed,
+                                     at::Tensor row_scale, at::Tensor col_packed,
+                                     at::Tensor col_scale, c10::optional<at::Tensor> col_sum,
+                                     const int64_t fmt);
 std::vector<at::Tensor> quantize_mxfp6_meta(const at::Tensor input, const int64_t axis);
 std::vector<at::Tensor> quantize_mxfp6_dual_meta(const at::Tensor input);
 
@@ -180,6 +195,44 @@ std::vector<at::Tensor> quantize_mxfp6_gate_mul(const at::Tensor input, const at
                                                 const bool want_col_sum);
 std::vector<at::Tensor> quantize_mxfp6_gate_mul_meta(const at::Tensor input, const at::Tensor gate,
                                                      const bool want_col_sum);
+// quantize_mx_*: the MXFP6 packers with a trailing output-format code (fmt_pair).
+std::vector<at::Tensor> quantize_mx(const at::Tensor input, const int64_t axis, const int64_t fmt);
+std::vector<at::Tensor> quantize_mx_dual(const at::Tensor input, const int64_t fmt);
+std::vector<at::Tensor> quantize_mx_fused_dual(const at::Tensor                input,
+                                               const c10::optional<at::Tensor> aux,
+                                               const c10::optional<at::Tensor> bias,
+                                               const int64_t mode, const bool want_col_sum,
+                                               const int64_t fmt);
+std::vector<at::Tensor>
+quantize_mx_qk_norm_rope_bwd(const at::Tensor input, const at::Tensor dq, const at::Tensor dk,
+                             const at::Tensor dv, const at::Tensor cos, const at::Tensor sin,
+                             const at::Tensor wq, const at::Tensor wk, const at::Tensor rstd_q,
+                             const at::Tensor rstd_k, const bool want_col_sum, const int64_t fmt);
+std::vector<at::Tensor> quantize_mx_ln_modulate(const at::Tensor input, const at::Tensor mean,
+                                                const at::Tensor rstd, const at::Tensor scale,
+                                                const at::Tensor shift, const bool want_col_sum,
+                                                const int64_t fmt);
+std::vector<at::Tensor> quantize_mx_gate_mul(const at::Tensor input, const at::Tensor gate,
+                                             const bool want_col_sum, const int64_t fmt);
+std::vector<at::Tensor> quantize_mx_meta(const at::Tensor input, const int64_t axis,
+                                         const int64_t fmt);
+std::vector<at::Tensor> quantize_mx_dual_meta(const at::Tensor input, const int64_t fmt);
+std::vector<at::Tensor> quantize_mx_fused_dual_meta(const at::Tensor                input,
+                                                    const c10::optional<at::Tensor> aux,
+                                                    const c10::optional<at::Tensor> bias,
+                                                    const int64_t mode, const bool want_col_sum,
+                                                    const int64_t fmt);
+std::vector<at::Tensor> quantize_mx_qk_norm_rope_bwd_meta(
+    const at::Tensor input, const at::Tensor dq, const at::Tensor dk, const at::Tensor dv,
+    const at::Tensor cos, const at::Tensor sin, const at::Tensor wq, const at::Tensor wk,
+    const at::Tensor rstd_q, const at::Tensor rstd_k, const bool want_col_sum, const int64_t fmt);
+std::vector<at::Tensor> quantize_mx_ln_modulate_meta(const at::Tensor input, const at::Tensor mean,
+                                                     const at::Tensor rstd, const at::Tensor scale,
+                                                     const at::Tensor shift,
+                                                     const bool want_col_sum, const int64_t fmt);
+std::vector<at::Tensor> quantize_mx_gate_mul_meta(const at::Tensor input, const at::Tensor gate,
+                                                  const bool want_col_sum, const int64_t fmt);
+
 #endif // BUILD_MXFP6_BACKEND
 
 at::Tensor dequantize_fp8_rowwise(const at::Tensor input, const at::Tensor scale_inv,

@@ -187,6 +187,45 @@ void quantize_mxfp4_impl(const DType *input, uint8_t *row_packed, uint8_t *row_s
 // space is mandatory: the assembly derives its row-tile stride from k/128 + 2.
 constexpr int MXFP6_GUARD_K_TILES = 2;
 
+// Output format of one direction of the MX packers. Fp6 is the A6W6 blob; Fp4Blob the A6W4 /
+// A4W6 MXFP4 blob (the hybrid's column direction); Fp4A and Fp4B the A and B operands of
+// AITER's f4gemm A4W4 kernels (plain row-major / (16, 16)-shuffled codes, shuffle_scale()
+// scales, no guard tiles). The quantization is the same MXFP4 emit for all three FP4 formats.
+// Fp4ASr: the Fp4A layout with stochastic rounding (gradients only).
+// Fp4Plain / Fp4PlainSr: plain row-major codes and plain row-major E8M0 scales [rows, K/32], the
+// operand form FlyDSL's MXFP4 GEMM takes for both A and B.
+enum class MXPackFmt : int {
+    Fp6        = 0,
+    Fp4Blob    = 1,
+    Fp4A       = 2,
+    Fp4B       = 3,
+    Fp4ASr     = 4,
+    Fp4Plain   = 5,
+    Fp4PlainSr = 6,
+    Fp4Fly     = 7,
+    Fp4FlySr   = 8,
+    Fp4BlobSr  = 9, // Fp4Blob with stochastic rounding (the A4W4 tile-blob kernels' gradient)
+    Fp6KBlk =
+        10 // MXFP6 for the FlyDSL A6W6 kernel: K128-blocked C0 / C1 planes + FlyDSL packed scales
+};
+
+// Fp4Fly / Fp4FlySr: plain row-major codes and the E8M0 scales stored straight
+// into FlyDSL's packed per-tile layout, the one `gemm_mxfp4_flydsl_kernel(scales_prepacked=True)`
+// reads, so FlyDSL does not repack them per GEMM. The layout depends on the CONSUMING GEMM's
+// operand role and tile: is_b, nt = tile/64 (3 or 4), ilv = B interleave (0 or 4), and the
+// contraction's k128. rows = the logical extent; padded rows are not stored (the slab is sized per
+// tile, so with nt = 3 a padded row would land outside it). Set per launch by MXFlyPackScope.
+struct MXFlyPack {
+    int32_t is_b = 0, nt = 4, ilv = 0, k128 = 0, rows = 0;
+};
+void      mx_fly_pack_set(const MXFlyPack &row, const MXFlyPack &col);
+MXFlyPack mx_fly_pack_row();
+MXFlyPack mx_fly_pack_col();
+struct MXFlyPackScope {
+    MXFlyPackScope(const MXFlyPack &row, const MXFlyPack &col) { mx_fly_pack_set(row, col); }
+    ~MXFlyPackScope() { mx_fly_pack_set(MXFlyPack{}, MXFlyPack{}); }
+};
+
 enum class MXFP6Direction {
     Row,  // contract along the last axis
     Col,  // contract along the first axis, i.e. pack the rows of x.T
@@ -199,7 +238,8 @@ enum class MXFP6Direction {
 template <typename DType>
 void quantize_mxfp6_impl(const DType *input, uint8_t *row_packed, uint8_t *row_scale,
                          uint8_t *col_packed, uint8_t *col_scale, const int M, const int N,
-                         const MXFP6Direction direction, hipStream_t stream);
+                         const MXFP6Direction direction, hipStream_t stream,
+                         MXPackFmt row_fmt = MXPackFmt::Fp6, MXPackFmt col_fmt = MXPackFmt::Fp6);
 
 // Hybrid pack: MXFP6 row direction, MXFP4 column direction, from one pass. Exists so
 // wgrad can run a mixed-format GEMM -- it contracts the token dimension, so its operands
@@ -350,7 +390,9 @@ template <typename DType>
 void quantize_mxfp6_fused_impl(const DType *input, const DType *aux, const DType *bias,
                                uint8_t *row_packed, uint8_t *row_scale, uint8_t *col_packed,
                                uint8_t *col_scale, float *col_sum, const int M, const int N,
-                               const MXFP6Prologue prologue, hipStream_t stream);
+                               const MXFP6Prologue prologue, hipStream_t stream,
+                               MXPackFmt row_fmt = MXPackFmt::Fp6,
+                               MXPackFmt col_fmt = MXPackFmt::Fp6);
 
 // As above for MXFP6Prologue::QkNormRopeBackward, which needs its own entry point because
 // its operands do not fit the (input, aux, bias) shape and because it runs at a different
@@ -372,11 +414,13 @@ void quantize_mxfp6_fused_impl(const DType *input, const DType *aux, const DType
 //     pairs d with d + head_dim/2, in a different thread. This one the caller must uphold --
 //     it is not visible in any argument.
 template <typename DType>
-void quantize_mxfp6_qk_norm_rope_bwd_impl(const DType *input,
+void quantize_mxfp6_qk_norm_rope_bwd_impl(const DType                      *input,
                                           const MXFP6QkNormRopeArgs<DType> &args,
                                           uint8_t *row_packed, uint8_t *row_scale,
                                           uint8_t *col_packed, uint8_t *col_scale, float *col_sum,
-                                          const int M, const int N, hipStream_t stream);
+                                          const int M, const int N, hipStream_t stream,
+                                          MXPackFmt row_fmt = MXPackFmt::Fp6,
+                                          MXPackFmt col_fmt = MXPackFmt::Fp6);
 
 // As above for MXFP6Prologue::LnModulate. Separate for the same reason QkNormRopeBackward is:
 // its operands do not fit the (input, aux, bias) shape. It does run at the shipped tile
@@ -394,7 +438,8 @@ template <typename DType>
 void quantize_mxfp6_ln_modulate_impl(const DType *input, const MXFP6LnModulateArgs<DType> &args,
                                      uint8_t *row_packed, uint8_t *row_scale, uint8_t *col_packed,
                                      uint8_t *col_scale, float *col_sum, const int M, const int N,
-                                     hipStream_t stream);
+                                     hipStream_t stream, MXPackFmt row_fmt = MXPackFmt::Fp6,
+                                     MXPackFmt col_fmt = MXPackFmt::Fp6);
 
 // As above for MXFP6Prologue::GateMul. B must be a power of two (checked at the entry point).
 // N has no multiple-of-256 requirement: the prologue maps a zero input to zero, so padded
@@ -403,7 +448,8 @@ template <typename DType>
 void quantize_mxfp6_gate_mul_impl(const DType *input, const MXFP6GateMulArgs<DType> &args,
                                   uint8_t *row_packed, uint8_t *row_scale, uint8_t *col_packed,
                                   uint8_t *col_scale, float *col_sum, const int M, const int N,
-                                  hipStream_t stream);
+                                  hipStream_t stream, MXPackFmt row_fmt = MXPackFmt::Fp6,
+                                  MXPackFmt col_fmt = MXPackFmt::Fp6);
 
 template <typename DType>
 void quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_output,

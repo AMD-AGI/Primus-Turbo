@@ -43,6 +43,132 @@ std::pair<int64_t, int64_t> pack_sizes(const int64_t rows, const int64_t k) {
     return {row_tiles * k_tiles * kPackedTileBytes, row_tiles * k_tiles * kScaleTileBytes};
 }
 
+// The `fmt` argument of the quantize_mx_* ops: which format each direction is emitted in.
+//   0  FP6 both ways             -- the A6W6 blobs, as the quantize_mxfp6_* ops
+//   1  A4W4 gradient             -- AITER f4gemm A operand both ways (dgrad contracts the
+//                                   gradient's columns, wgrad its rows)
+//   2  A4W4 activation / weight  -- FP6 rows for the forward, f4gemm B operand columns
+//   3  gradient, wgrad-only A4W4 -- FP6 rows (A6W6 dgrad), f4gemm A operand columns
+//   4  gradient, dgrad-only A4W4 -- f4gemm A operand rows, FP6 columns (A6W6 wgrad)
+//   5, 6, 7  formats 1, 3, 4 with stochastic rounding in their FP4 directions
+//   8  gradient, FlyDSL operands both ways (plain codes + plain E8M0 scales); 12 = 8 with SR
+//   9  activation / weight for FlyDSL: FP6 rows, plain FP4 columns
+// fmt >= 0x1000: FlyDSL packed scales. 0x1000 | sr * 0x800 | col_code << 4 |
+// row_code, a direction code being 0 (FP6) or 0x8 | is_b | (nt == 3) << 1 | (ilv == 4) << 2 for the
+// consuming GEMM operand (see MXFlyPack). Gradients pass two codes, activations / weights FP6 rows.
+constexpr int64_t kFlyFmt = 0x1000, kFlySr = 0x800;
+
+MXPackFmt fly_dir_fmt(const int64_t fmt, const bool col) {
+    const int64_t code = col ? (fmt >> 4) & 0xF : fmt & 0xF;
+    if (code == 0)
+        return MXPackFmt::Fp6;
+    if (!(code & 0x8)) {
+        // 0x1 | is_b << 1: MXFP6, K128-blocked C0/C1 planes + FlyDSL packed scales (nt 4, ilv 0).
+        PRIMUS_TURBO_CHECK((code & 0x1) && !(code & 0x4), "bad FlyDSL direction code ", code, " in fmt ", fmt);
+        PRIMUS_TURBO_CHECK(!(fmt & kFlySr), "MXFP6 K128-blocked directions take no stochastic rounding");
+        return MXPackFmt::Fp6KBlk;
+    }
+    return (fmt & kFlySr) ? MXPackFmt::Fp4FlySr : MXPackFmt::Fp4Fly;
+}
+
+// The consuming GEMM's operand parameters for one direction of a [M, N] input (row direction
+// contracts N, column direction contracts M).
+MXFlyPack fly_dir(const int64_t fmt, const int64_t M, const int64_t N, const bool col) {
+    MXFlyPack p;
+    if (!(fmt & kFlyFmt))
+        return p;
+    const int64_t code = col ? (fmt >> 4) & 0xF : fmt & 0xF;
+    if (code == 0)
+        return p;
+    const int64_t k = col ? M : N;
+    if (!(code & 0x8)) { // MXFP6 K128-blocked: 0x1 | is_b << 1, scales nt 4 / ilv 0
+        p.is_b = (code >> 1) & 1;
+        p.nt   = 4;
+        p.ilv  = 0;
+        p.k128 = static_cast<int32_t>((k + 255) / 256 * 2);
+        p.rows = static_cast<int32_t>(col ? N : M);
+        return p;
+    }
+    p.is_b = code & 1;
+    p.nt   = (code & 2) ? 3 : 4;
+    p.ilv  = (code & 4) ? 4 : 0;
+    p.k128 = static_cast<int32_t>((k + 255) / 256 * 2);
+    p.rows = static_cast<int32_t>(col ? N : M);
+    return p;
+}
+
+std::pair<MXPackFmt, MXPackFmt> fmt_pair(const int64_t fmt) {
+    if (fmt & kFlyFmt)
+        return {fly_dir_fmt(fmt, false), fly_dir_fmt(fmt, true)};
+    switch (fmt) {
+    case 0:
+        return {MXPackFmt::Fp6, MXPackFmt::Fp6};
+    case 1:
+        return {MXPackFmt::Fp4A, MXPackFmt::Fp4A};
+    case 2:
+        return {MXPackFmt::Fp6, MXPackFmt::Fp4B};
+    case 3:
+        return {MXPackFmt::Fp6, MXPackFmt::Fp4A};
+    case 4:
+        return {MXPackFmt::Fp4A, MXPackFmt::Fp6};
+    case 5:
+        return {MXPackFmt::Fp4ASr, MXPackFmt::Fp4ASr};
+    case 6:
+        return {MXPackFmt::Fp6, MXPackFmt::Fp4ASr};
+    case 7:
+        return {MXPackFmt::Fp4ASr, MXPackFmt::Fp6};
+    case 8:
+        return {MXPackFmt::Fp4Plain, MXPackFmt::Fp4Plain};
+    case 9:
+        return {MXPackFmt::Fp6, MXPackFmt::Fp4Plain};
+    case 12:
+        return {MXPackFmt::Fp4PlainSr, MXPackFmt::Fp4PlainSr};
+    case 16:  // A4W4 tile-blob kernels: gradient, the C0 FP4 tile blob both ways
+        return {MXPackFmt::Fp4Blob, MXPackFmt::Fp4Blob};
+    case 17:  // activation / weight for them: FP6 rows (forward), FP4 blob columns
+        return {MXPackFmt::Fp6, MXPackFmt::Fp4Blob};
+    case 18:  // 16 with stochastic rounding
+        return {MXPackFmt::Fp4BlobSr, MXPackFmt::Fp4BlobSr};
+    default:
+        PRIMUS_TURBO_CHECK(false, "fmt must be 0 (fp6), 1 (a4w4 gradient), 2 (a4w4 "
+                                  "activation/weight), 3 (gradient, wgrad-only a4w4) or 4 "
+                                  "(gradient, dgrad-only a4w4), 5-7 (1, 3, 4 with SR), 8 / 9 / 12 (FlyDSL operands), got ", fmt);
+        return {MXPackFmt::Fp6, MXPackFmt::Fp6};
+    }
+}
+
+// Byte sizes of (codes, scales) for one direction. The A4W4 operands carry no guard tiles:
+// codes [ceil(rows, 256), ceil(k, 256) / 2], scales [ceil(rows, 256), ceil(k, 256) / 32] in
+// shuffle_scale()'s layout (whose padding is exactly these).
+std::pair<int64_t, int64_t> sizes_for(const MXPackFmt f, const int64_t rows, const int64_t k,
+                                      const MXFlyPack &fly = {}) {
+    if (f == MXPackFmt::Fp6)
+        return pack_sizes(rows, k);
+    if (f == MXPackFmt::Fp4Blob || f == MXPackFmt::Fp4BlobSr) {
+        // The A6W4 MXFP4 tile blob: 16384 code bytes + 1024 scale bytes per 256x128 tile, K padded by
+        // MXFP6_GUARD_K_TILES (2) tiles like the MXFP6 blob.
+        const int64_t rt = cdiv(rows, kTileRows), kt = cdiv(k, 128) + 2;
+        return {rt * kt * 16384, rt * kt * 1024};
+    }
+    if (f == MXPackFmt::Fp6KBlk) {
+        // C0 [rows/16, K/128, 16, 64] then C1 [rows/32, K/128, 32, 32] (rows to 256, K to 256), and FlyDSL's
+        // packed scale slab at nt 4.
+        const int64_t r = cdiv(rows, kTileRows) * kTileRows, c = cdiv(k, kTileRows) * kTileRows;
+        return {r * c * 3 / 4, cdiv(rows, 64 * 4) * 256 * (c / 128) * 4};
+    }
+    if (f == MXPackFmt::Fp4Fly || f == MXPackFmt::Fp4FlySr) {
+        // FlyDSL's per-tile slab (_get_mxfp4_scale_ws): ceil(rows / tile) * 256 * K/128 dwords.
+        const int64_t r = cdiv(rows, kTileRows) * kTileRows, c = cdiv(k, kTileRows) * kTileRows;
+        return {r * c / 2, cdiv(rows, 64 * fly.nt) * 256 * (c / 128) * 4};
+    }
+    PRIMUS_TURBO_CHECK(f == MXPackFmt::Fp4A || f == MXPackFmt::Fp4B || f == MXPackFmt::Fp4ASr ||
+                           f == MXPackFmt::Fp4Plain || f == MXPackFmt::Fp4PlainSr,
+                       "sizes_for: unsupported format ", int(f));
+    const int64_t r = cdiv(rows, kTileRows) * kTileRows;
+    const int64_t c = cdiv(k, kTileRows) * kTileRows;
+    return {r * c / 2, r * c / kBlockSize};
+}
+
 void check_input(const at::Tensor &input) {
     PRIMUS_TURBO_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
     PRIMUS_TURBO_CHECK(input.dim() == 2, "Input must be 2D");
@@ -63,7 +189,9 @@ at::Tensor empty_blob(const int64_t bytes, const at::Tensor &like) {
     return at::empty({bytes}, like.options().dtype(at::kByte));
 }
 
-std::vector<at::Tensor> run(const at::Tensor &input, const MXFP6Direction direction) {
+std::vector<at::Tensor> run(const at::Tensor &input, const MXFP6Direction direction,
+                            const int64_t fmt = 0) {
+    const auto [row_fmt, col_fmt] = fmt_pair(fmt);
     check_input(input);
     // Allocate and launch on the operand's device rather than the ambient one, which the
     // caller is under no obligation to have set.
@@ -74,8 +202,9 @@ std::vector<at::Tensor> run(const at::Tensor &input, const MXFP6Direction direct
     const bool want_row = direction != MXFP6Direction::Col;
     const bool want_col = direction != MXFP6Direction::Row;
 
-    const auto [row_p_bytes, row_s_bytes] = pack_sizes(M, N); // contract N
-    const auto [col_p_bytes, col_s_bytes] = pack_sizes(N, M); // contract M
+    const auto [row_p_bytes, row_s_bytes] = sizes_for(row_fmt, M, N, fly_dir(fmt, M, N, false)); // contract N
+    const auto [col_p_bytes, col_s_bytes] = sizes_for(col_fmt, N, M, fly_dir(fmt, M, N, true)); // contract M
+    MXFlyPackScope fly_scope(fly_dir(fmt, M, N, false), fly_dir(fmt, M, N, true));
 
     at::Tensor row_p = empty_blob(want_row ? row_p_bytes : 0, input);
     at::Tensor row_s = empty_blob(want_row ? row_s_bytes : 0, input);
@@ -88,12 +217,12 @@ std::vector<at::Tensor> run(const at::Tensor &input, const MXFP6Direction direct
         quantize_mxfp6_impl<dtype::bfloat16>(
             reinterpret_cast<const dtype::bfloat16 *>(input.data_ptr()), row_p.data_ptr<uint8_t>(),
             row_s.data_ptr<uint8_t>(), col_p.data_ptr<uint8_t>(), col_s.data_ptr<uint8_t>(),
-            static_cast<int>(M), static_cast<int>(N), direction, stream);
+            static_cast<int>(M), static_cast<int>(N), direction, stream, row_fmt, col_fmt);
     } else {
         quantize_mxfp6_impl<dtype::float16>(
             reinterpret_cast<const dtype::float16 *>(input.data_ptr()), row_p.data_ptr<uint8_t>(),
             row_s.data_ptr<uint8_t>(), col_p.data_ptr<uint8_t>(), col_s.data_ptr<uint8_t>(),
-            static_cast<int>(M), static_cast<int>(N), direction, stream);
+            static_cast<int>(M), static_cast<int>(N), direction, stream, row_fmt, col_fmt);
     }
 
     if (direction == MXFP6Direction::Row)
@@ -144,7 +273,9 @@ void check_bias(const at::Tensor &bias, const at::Tensor &input, const int64_t N
 
 std::vector<at::Tensor> run_fused(const at::Tensor &input, const c10::optional<at::Tensor> &aux,
                                   const c10::optional<at::Tensor> &bias,
-                                  const MXFP6Prologue prologue, const bool want_col_sum) {
+                                  const MXFP6Prologue prologue, const bool want_col_sum,
+                                  const int64_t fmt = 0) {
+    const auto [row_fmt, col_fmt] = fmt_pair(fmt);
     check_input(input);
     const c10::DeviceGuard device_guard(input.device());
     const int64_t          M = input.size(0);
@@ -165,8 +296,9 @@ std::vector<at::Tensor> run_fused(const at::Tensor &input, const c10::optional<a
     if (bias.has_value())
         check_bias(*bias, input, N);
 
-    const auto [row_p_bytes, row_s_bytes] = pack_sizes(M, N); // contract N
-    const auto [col_p_bytes, col_s_bytes] = pack_sizes(N, M); // contract M
+    const auto [row_p_bytes, row_s_bytes] = sizes_for(row_fmt, M, N, fly_dir(fmt, M, N, false)); // contract N
+    const auto [col_p_bytes, col_s_bytes] = sizes_for(col_fmt, N, M, fly_dir(fmt, M, N, true)); // contract M
+    MXFlyPackScope fly_scope(fly_dir(fmt, M, N, false), fly_dir(fmt, M, N, true));
 
     at::Tensor row_p = empty_blob(row_p_bytes, input);
     at::Tensor row_s = empty_blob(row_s_bytes, input);
@@ -189,7 +321,7 @@ std::vector<at::Tensor> run_fused(const at::Tensor &input, const c10::optional<a
             bias.has_value() ? reinterpret_cast<const T *>(bias->data_ptr()) : nullptr,
             row_p.data_ptr<uint8_t>(), row_s.data_ptr<uint8_t>(), col_p.data_ptr<uint8_t>(),
             col_s.data_ptr<uint8_t>(), want_col_sum ? col_sum.data_ptr<float>() : nullptr,
-            static_cast<int>(M), static_cast<int>(N), prologue, stream);
+            static_cast<int>(M), static_cast<int>(N), prologue, stream, row_fmt, col_fmt);
     } else {
         using T = dtype::float16;
         quantize_mxfp6_fused_impl<T>(
@@ -198,7 +330,7 @@ std::vector<at::Tensor> run_fused(const at::Tensor &input, const c10::optional<a
             bias.has_value() ? reinterpret_cast<const T *>(bias->data_ptr()) : nullptr,
             row_p.data_ptr<uint8_t>(), row_s.data_ptr<uint8_t>(), col_p.data_ptr<uint8_t>(),
             col_s.data_ptr<uint8_t>(), want_col_sum ? col_sum.data_ptr<float>() : nullptr,
-            static_cast<int>(M), static_cast<int>(N), prologue, stream);
+            static_cast<int>(M), static_cast<int>(N), prologue, stream, row_fmt, col_fmt);
     }
 
     return {row_p, row_s, col_p, col_s, col_sum};
@@ -232,7 +364,9 @@ std::vector<at::Tensor>
 run_qk_norm_rope_bwd(const at::Tensor &input, const at::Tensor &dq, const at::Tensor &dk,
                      const at::Tensor &dv, const at::Tensor &cos, const at::Tensor &sin,
                      const at::Tensor &wq, const at::Tensor &wk, const at::Tensor &rstd_q,
-                     const at::Tensor &rstd_k, const bool want_col_sum) {
+                     const at::Tensor &rstd_k, const bool want_col_sum,
+                     const int64_t fmt = 0) {
+    const auto [row_fmt, col_fmt] = fmt_pair(fmt);
     check_input(input);
     const c10::DeviceGuard device_guard(input.device());
     const int64_t          M = input.size(0);
@@ -267,8 +401,9 @@ run_qk_norm_rope_bwd(const at::Tensor &input, const at::Tensor &dq, const at::Te
     check_operand(rstd_q, input, "rstd_q", {M * num_heads}, at::kFloat);
     check_operand(rstd_k, input, "rstd_k", {M * num_heads}, at::kFloat);
 
-    const auto [row_p_bytes, row_s_bytes] = pack_sizes(M, N); // contract N
-    const auto [col_p_bytes, col_s_bytes] = pack_sizes(N, M); // contract M
+    const auto [row_p_bytes, row_s_bytes] = sizes_for(row_fmt, M, N, fly_dir(fmt, M, N, false)); // contract N
+    const auto [col_p_bytes, col_s_bytes] = sizes_for(col_fmt, N, M, fly_dir(fmt, M, N, true)); // contract M
+    MXFlyPackScope fly_scope(fly_dir(fmt, M, N, false), fly_dir(fmt, M, N, true));
 
     at::Tensor row_p = empty_blob(row_p_bytes, input);
     at::Tensor row_s = empty_blob(row_s_bytes, input);
@@ -309,7 +444,7 @@ run_qk_norm_rope_bwd(const at::Tensor &input, const at::Tensor &dq, const at::Te
             reinterpret_cast<const T *>(input.data_ptr()), args, row_p.data_ptr<uint8_t>(),
             row_s.data_ptr<uint8_t>(), col_p.data_ptr<uint8_t>(), col_s.data_ptr<uint8_t>(),
             want_col_sum ? col_sum.data_ptr<float>() : nullptr, static_cast<int>(M),
-            static_cast<int>(N), stream);
+            static_cast<int>(N), stream, row_fmt, col_fmt);
     };
     if (dt == at::kBFloat16)
         launch.template operator()<dtype::bfloat16>();
@@ -321,7 +456,9 @@ run_qk_norm_rope_bwd(const at::Tensor &input, const at::Tensor &dq, const at::Te
 
 std::vector<at::Tensor> run_ln_modulate(const at::Tensor &input, const at::Tensor &mean,
                                         const at::Tensor &rstd, const at::Tensor &scale,
-                                        const at::Tensor &shift, const bool want_col_sum) {
+                                        const at::Tensor &shift, const bool want_col_sum,
+                     const int64_t fmt = 0) {
+    const auto [row_fmt, col_fmt] = fmt_pair(fmt);
     check_input(input);
     const c10::DeviceGuard device_guard(input.device());
     const int64_t          M = input.size(0);
@@ -345,8 +482,9 @@ std::vector<at::Tensor> run_ln_modulate(const at::Tensor &input, const at::Tenso
     check_operand(scale, input, "scale", {B, N}, dt);
     check_operand(shift, input, "shift", {B, N}, dt);
 
-    const auto [row_p_bytes, row_s_bytes] = pack_sizes(M, N); // contract N
-    const auto [col_p_bytes, col_s_bytes] = pack_sizes(N, M); // contract M
+    const auto [row_p_bytes, row_s_bytes] = sizes_for(row_fmt, M, N, fly_dir(fmt, M, N, false)); // contract N
+    const auto [col_p_bytes, col_s_bytes] = sizes_for(col_fmt, N, M, fly_dir(fmt, M, N, true)); // contract M
+    MXFlyPackScope fly_scope(fly_dir(fmt, M, N, false), fly_dir(fmt, M, N, true));
 
     at::Tensor row_p = empty_blob(row_p_bytes, input);
     at::Tensor row_s = empty_blob(row_s_bytes, input);
@@ -370,7 +508,7 @@ std::vector<at::Tensor> run_ln_modulate(const at::Tensor &input, const at::Tenso
             reinterpret_cast<const T *>(input.data_ptr()), args, row_p.data_ptr<uint8_t>(),
             row_s.data_ptr<uint8_t>(), col_p.data_ptr<uint8_t>(), col_s.data_ptr<uint8_t>(),
             want_col_sum ? col_sum.data_ptr<float>() : nullptr, static_cast<int>(M),
-            static_cast<int>(N), stream);
+            static_cast<int>(N), stream, row_fmt, col_fmt);
     };
     if (dt == at::kBFloat16)
         launch.template operator()<dtype::bfloat16>();
@@ -381,7 +519,9 @@ std::vector<at::Tensor> run_ln_modulate(const at::Tensor &input, const at::Tenso
 }
 
 std::vector<at::Tensor> run_gate_mul(const at::Tensor &input, const at::Tensor &gate,
-                                     const bool want_col_sum) {
+                                     const bool want_col_sum,
+                     const int64_t fmt = 0) {
+    const auto [row_fmt, col_fmt] = fmt_pair(fmt);
     check_input(input);
     const c10::DeviceGuard device_guard(input.device());
     const int64_t          M = input.size(0);
@@ -398,8 +538,9 @@ std::vector<at::Tensor> run_gate_mul(const at::Tensor &input, const at::Tensor &
                        B);
     check_operand(gate, input, "gate", {B, N}, input.scalar_type());
 
-    const auto [row_p_bytes, row_s_bytes] = pack_sizes(M, N); // contract N
-    const auto [col_p_bytes, col_s_bytes] = pack_sizes(N, M); // contract M
+    const auto [row_p_bytes, row_s_bytes] = sizes_for(row_fmt, M, N, fly_dir(fmt, M, N, false)); // contract N
+    const auto [col_p_bytes, col_s_bytes] = sizes_for(col_fmt, N, M, fly_dir(fmt, M, N, true)); // contract M
+    MXFlyPackScope fly_scope(fly_dir(fmt, M, N, false), fly_dir(fmt, M, N, true));
 
     at::Tensor row_p = empty_blob(row_p_bytes, input);
     at::Tensor row_s = empty_blob(row_s_bytes, input);
@@ -420,7 +561,7 @@ std::vector<at::Tensor> run_gate_mul(const at::Tensor &input, const at::Tensor &
             reinterpret_cast<const T *>(input.data_ptr()), args, row_p.data_ptr<uint8_t>(),
             row_s.data_ptr<uint8_t>(), col_p.data_ptr<uint8_t>(), col_s.data_ptr<uint8_t>(),
             want_col_sum ? col_sum.data_ptr<float>() : nullptr, static_cast<int>(M),
-            static_cast<int>(N), stream);
+            static_cast<int>(N), stream, row_fmt, col_fmt);
     };
     if (input.scalar_type() == at::kBFloat16)
         launch.template operator()<dtype::bfloat16>();
@@ -494,15 +635,17 @@ std::vector<at::Tensor> quantize_mxfp6_dual(const at::Tensor input) {
 // pair at [8192,3072], which is a large fraction of what the grouping wins. This keeps it
 // a single kernel and hands each direction its own destination, so the split costs
 // nothing.
-void quantize_mxfp6_dual_out(const at::Tensor input, at::Tensor row_packed, at::Tensor row_scale,
-                             at::Tensor col_packed, at::Tensor col_scale) {
+static void dual_out_fmt(const at::Tensor input, at::Tensor row_packed, at::Tensor row_scale,
+                         at::Tensor col_packed, at::Tensor col_scale, const int64_t fmt) {
     check_input(input);
     const c10::DeviceGuard device_guard(input.device());
     const int64_t          M = input.size(0);
     const int64_t          N = input.size(1);
 
-    const auto [rp_bytes, rs_bytes] = pack_sizes(M, N);
-    const auto [cp_bytes, cs_bytes] = pack_sizes(N, M);
+    const auto [row_fmt, col_fmt]   = fmt_pair(fmt);
+    const auto [rp_bytes, rs_bytes] = sizes_for(row_fmt, M, N, fly_dir(fmt, M, N, false));
+    const auto [cp_bytes, cs_bytes] = sizes_for(col_fmt, N, M, fly_dir(fmt, M, N, true));
+    MXFlyPackScope fly_scope(fly_dir(fmt, M, N, false), fly_dir(fmt, M, N, true));
     TORCH_CHECK(row_packed.numel() == rp_bytes && row_scale.numel() == rs_bytes &&
                     col_packed.numel() == cp_bytes && col_scale.numel() == cs_bytes,
                 "quantize_mxfp6_dual_out: output buffers do not match the packed layout size");
@@ -519,14 +662,28 @@ void quantize_mxfp6_dual_out(const at::Tensor input, at::Tensor row_packed, at::
             reinterpret_cast<const dtype::bfloat16 *>(input.data_ptr()),
             row_packed.data_ptr<uint8_t>(), row_scale.data_ptr<uint8_t>(),
             col_packed.data_ptr<uint8_t>(), col_scale.data_ptr<uint8_t>(), static_cast<int>(M),
-            static_cast<int>(N), MXFP6Direction::Dual, stream);
+            static_cast<int>(N), MXFP6Direction::Dual, stream, row_fmt, col_fmt);
     else
         quantize_mxfp6_impl<dtype::float16>(
             reinterpret_cast<const dtype::float16 *>(input.data_ptr()),
             row_packed.data_ptr<uint8_t>(), row_scale.data_ptr<uint8_t>(),
             col_packed.data_ptr<uint8_t>(), col_scale.data_ptr<uint8_t>(), static_cast<int>(M),
-            static_cast<int>(N), MXFP6Direction::Dual, stream);
+            static_cast<int>(N), MXFP6Direction::Dual, stream, row_fmt, col_fmt);
 }
+
+void quantize_mxfp6_dual_out(const at::Tensor input, at::Tensor row_packed, at::Tensor row_scale,
+                             at::Tensor col_packed, at::Tensor col_scale) {
+    dual_out_fmt(input, row_packed, row_scale, col_packed, col_scale, 0);
+}
+
+// The same with an output format (see fmt_pair): e.g. a grouped MLP's packs under A4W4.
+void quantize_mx_dual_out(const at::Tensor input, at::Tensor row_packed, at::Tensor row_scale,
+                          at::Tensor col_packed, at::Tensor col_scale, const int64_t fmt) {
+    dual_out_fmt(input, row_packed, row_scale, col_packed, col_scale, fmt);
+}
+
+void quantize_mx_dual_out_meta(const at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+                               const int64_t) {}
 
 void quantize_mxfp6_dual_out_meta(const at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                                   at::Tensor) {}
@@ -551,17 +708,19 @@ std::vector<at::Tensor> quantize_mxfp6_fused_dual(const at::Tensor              
 // here, fc1's dgrad could not use this out-variant at all and so could not be grouped --
 // and copying the row blob out of the allocating form costs about as much as grouping
 // saves. Pass None when the prologue has no reduction, which is the forward case.
-void quantize_mxfp6_fused_dual_out(const at::Tensor input, const c10::optional<at::Tensor> aux,
-                                   const c10::optional<at::Tensor> bias,
-                                   const int64_t prologue_mode, at::Tensor row_packed,
-                                   at::Tensor row_scale, at::Tensor col_packed,
-                                   at::Tensor col_scale, c10::optional<at::Tensor> col_sum) {
+static void fused_dual_out_fmt(const at::Tensor input, const c10::optional<at::Tensor> aux,
+                               const c10::optional<at::Tensor> bias, const int64_t prologue_mode,
+                               at::Tensor row_packed, at::Tensor row_scale, at::Tensor col_packed,
+                               at::Tensor col_scale, c10::optional<at::Tensor> col_sum,
+                               const int64_t fmt) {
     const c10::DeviceGuard device_guard(input.device());
     const int64_t          M = input.size(0);
     const int64_t          N = input.size(1);
 
-    const auto [rp_bytes, rs_bytes] = pack_sizes(M, N);
-    const auto [cp_bytes, cs_bytes] = pack_sizes(N, M);
+    const auto [row_fmt, col_fmt]   = fmt_pair(fmt);
+    const auto [rp_bytes, rs_bytes] = sizes_for(row_fmt, M, N, fly_dir(fmt, M, N, false));
+    const auto [cp_bytes, cs_bytes] = sizes_for(col_fmt, N, M, fly_dir(fmt, M, N, true));
+    MXFlyPackScope fly_scope(fly_dir(fmt, M, N, false), fly_dir(fmt, M, N, true));
     TORCH_CHECK(row_packed.numel() == rp_bytes && row_scale.numel() == rs_bytes &&
                     col_packed.numel() == cp_bytes && col_scale.numel() == cs_bytes,
                 "quantize_mxfp6_fused_dual_out: buffers do not match the packed layout size");
@@ -587,7 +746,7 @@ void quantize_mxfp6_fused_dual_out(const at::Tensor input, const c10::optional<a
             bias.has_value() ? reinterpret_cast<const T *>(bias->data_ptr()) : nullptr,
             row_packed.data_ptr<uint8_t>(), row_scale.data_ptr<uint8_t>(),
             col_packed.data_ptr<uint8_t>(), col_scale.data_ptr<uint8_t>(), col_sum_ptr,
-            static_cast<int>(M), static_cast<int>(N), prologue, stream);
+            static_cast<int>(M), static_cast<int>(N), prologue, stream, row_fmt, col_fmt);
     } else {
         using T = dtype::float16;
         quantize_mxfp6_fused_impl<T>(
@@ -596,9 +755,32 @@ void quantize_mxfp6_fused_dual_out(const at::Tensor input, const c10::optional<a
             bias.has_value() ? reinterpret_cast<const T *>(bias->data_ptr()) : nullptr,
             row_packed.data_ptr<uint8_t>(), row_scale.data_ptr<uint8_t>(),
             col_packed.data_ptr<uint8_t>(), col_scale.data_ptr<uint8_t>(), col_sum_ptr,
-            static_cast<int>(M), static_cast<int>(N), prologue, stream);
+            static_cast<int>(M), static_cast<int>(N), prologue, stream, row_fmt, col_fmt);
     }
 }
+
+void quantize_mxfp6_fused_dual_out(const at::Tensor input, const c10::optional<at::Tensor> aux,
+                                   const c10::optional<at::Tensor> bias,
+                                   const int64_t prologue_mode, at::Tensor row_packed,
+                                   at::Tensor row_scale, at::Tensor col_packed,
+                                   at::Tensor col_scale, c10::optional<at::Tensor> col_sum) {
+    fused_dual_out_fmt(input, aux, bias, prologue_mode, row_packed, row_scale, col_packed,
+                       col_scale, col_sum, 0);
+}
+
+void quantize_mx_fused_dual_out(const at::Tensor input, const c10::optional<at::Tensor> aux,
+                                const c10::optional<at::Tensor> bias, const int64_t prologue_mode,
+                                at::Tensor row_packed, at::Tensor row_scale, at::Tensor col_packed,
+                                at::Tensor col_scale, c10::optional<at::Tensor> col_sum,
+                                const int64_t fmt) {
+    fused_dual_out_fmt(input, aux, bias, prologue_mode, row_packed, row_scale, col_packed,
+                       col_scale, col_sum, fmt);
+}
+
+void quantize_mx_fused_dual_out_meta(const at::Tensor, const c10::optional<at::Tensor>,
+                                     const c10::optional<at::Tensor>, const int64_t, at::Tensor,
+                                     at::Tensor, at::Tensor, at::Tensor, c10::optional<at::Tensor>,
+                                     const int64_t) {}
 
 void quantize_mxfp6_fused_dual_out_meta(const at::Tensor, const c10::optional<at::Tensor>,
                                         const c10::optional<at::Tensor>, const int64_t, at::Tensor,
@@ -715,6 +897,116 @@ std::vector<at::Tensor> quantize_mxfp6_gate_mul_meta(const at::Tensor input, con
     const int64_t rows = want_col_sum ? mxfp6_col_sum_rows(static_cast<int>(M)) : 0;
     out.push_back(at::empty({rows, want_col_sum ? N : 0}, input.options().dtype(at::kFloat)));
     return out;
+}
+
+// ---------------------------------------------------------------------------------------
+// quantize_mx_*: the same packers with a trailing `fmt` (see fmt_pair). fmt = 0 is exactly
+// the quantize_mxfp6_* op; 1 and 2 emit AITER's A4W4 (f4gemm) operand layouts, for MXFP4 in
+// the backward GEMMs. Outputs are the same tensors in the same order.
+// ---------------------------------------------------------------------------------------
+std::vector<at::Tensor> quantize_mx(const at::Tensor input, const int64_t axis, const int64_t fmt) {
+    return run(input, direction_from_axis(axis), fmt);
+}
+
+std::vector<at::Tensor> quantize_mx_dual(const at::Tensor input, const int64_t fmt) {
+    return run(input, MXFP6Direction::Dual, fmt);
+}
+
+std::vector<at::Tensor> quantize_mx_fused_dual(const at::Tensor input,
+                                               const c10::optional<at::Tensor> aux,
+                                               const c10::optional<at::Tensor> bias,
+                                               const int64_t mode, const bool want_col_sum,
+                                               const int64_t fmt) {
+    return run_fused(input, aux, bias, prologue_from_mode(mode), want_col_sum, fmt);
+}
+
+std::vector<at::Tensor>
+quantize_mx_qk_norm_rope_bwd(const at::Tensor input, const at::Tensor dq, const at::Tensor dk,
+                             const at::Tensor dv, const at::Tensor cos, const at::Tensor sin,
+                             const at::Tensor wq, const at::Tensor wk, const at::Tensor rstd_q,
+                             const at::Tensor rstd_k, const bool want_col_sum, const int64_t fmt) {
+    return run_qk_norm_rope_bwd(input, dq, dk, dv, cos, sin, wq, wk, rstd_q, rstd_k, want_col_sum,
+                                fmt);
+}
+
+std::vector<at::Tensor> quantize_mx_ln_modulate(const at::Tensor input, const at::Tensor mean,
+                                                const at::Tensor rstd, const at::Tensor scale,
+                                                const at::Tensor shift, const bool want_col_sum,
+                                                const int64_t fmt) {
+    return run_ln_modulate(input, mean, rstd, scale, shift, want_col_sum, fmt);
+}
+
+std::vector<at::Tensor> quantize_mx_gate_mul(const at::Tensor input, const at::Tensor gate,
+                                             const bool want_col_sum, const int64_t fmt) {
+    return run_gate_mul(input, gate, want_col_sum, fmt);
+}
+
+namespace {
+// Replace the four blobs of an FP6 meta result with the sizes `fmt` emits.
+std::vector<at::Tensor> with_fmt_blobs(std::vector<at::Tensor> out, const at::Tensor &input,
+                                       const int64_t fmt) {
+    const int64_t M                = input.size(0);
+    const int64_t N                = input.size(1);
+    const auto [row_fmt, col_fmt]  = fmt_pair(fmt);
+    const auto [rp, rs]            = sizes_for(row_fmt, M, N, fly_dir(fmt, M, N, false));
+    const auto [cp, cs]            = sizes_for(col_fmt, N, M, fly_dir(fmt, M, N, true));
+    auto opts                      = input.options().dtype(at::kByte);
+    out[0] = at::empty({rp}, opts);
+    out[1] = at::empty({rs}, opts);
+    out[2] = at::empty({cp}, opts);
+    out[3] = at::empty({cs}, opts);
+    return out;
+}
+} // namespace
+
+std::vector<at::Tensor> quantize_mx_meta(const at::Tensor input, const int64_t axis,
+                                         const int64_t fmt) {
+    const int64_t M               = input.size(0);
+    const int64_t N               = input.size(1);
+    const bool    row             = direction_from_axis(axis) == MXFP6Direction::Row;
+    const auto [row_fmt, col_fmt] = fmt_pair(fmt);
+    const auto [packed, scale]    = row ? sizes_for(row_fmt, M, N, fly_dir(fmt, M, N, false))
+                                        : sizes_for(col_fmt, N, M, fly_dir(fmt, M, N, true));
+    auto opts                     = input.options().dtype(at::kByte);
+    return {at::empty({packed}, opts), at::empty({scale}, opts)};
+}
+
+std::vector<at::Tensor> quantize_mx_dual_meta(const at::Tensor input, const int64_t fmt) {
+    return with_fmt_blobs(quantize_mxfp6_dual_meta(input), input, fmt);
+}
+
+std::vector<at::Tensor> quantize_mx_fused_dual_meta(const at::Tensor input,
+                                                    const c10::optional<at::Tensor> aux,
+                                                    const c10::optional<at::Tensor> bias,
+                                                    const int64_t mode, const bool want_col_sum,
+                                                    const int64_t fmt) {
+    return with_fmt_blobs(quantize_mxfp6_fused_dual_meta(input, aux, bias, mode, want_col_sum),
+                          input, fmt);
+}
+
+std::vector<at::Tensor>
+quantize_mx_qk_norm_rope_bwd_meta(const at::Tensor input, const at::Tensor dq, const at::Tensor dk,
+                                  const at::Tensor dv, const at::Tensor cos, const at::Tensor sin,
+                                  const at::Tensor wq, const at::Tensor wk,
+                                  const at::Tensor rstd_q, const at::Tensor rstd_k,
+                                  const bool want_col_sum, const int64_t fmt) {
+    return with_fmt_blobs(quantize_mxfp6_qk_norm_rope_bwd_meta(input, dq, dk, dv, cos, sin, wq, wk,
+                                                               rstd_q, rstd_k, want_col_sum),
+                          input, fmt);
+}
+
+std::vector<at::Tensor> quantize_mx_ln_modulate_meta(const at::Tensor input, const at::Tensor mean,
+                                                     const at::Tensor rstd, const at::Tensor scale,
+                                                     const at::Tensor shift,
+                                                     const bool want_col_sum, const int64_t fmt) {
+    return with_fmt_blobs(
+        quantize_mxfp6_ln_modulate_meta(input, mean, rstd, scale, shift, want_col_sum), input,
+        fmt);
+}
+
+std::vector<at::Tensor> quantize_mx_gate_mul_meta(const at::Tensor input, const at::Tensor gate,
+                                                  const bool want_col_sum, const int64_t fmt) {
+    return with_fmt_blobs(quantize_mxfp6_gate_mul_meta(input, gate, want_col_sum), input, fmt);
 }
 
 } // namespace primus_turbo::pytorch
