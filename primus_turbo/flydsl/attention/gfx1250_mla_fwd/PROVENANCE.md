@@ -38,3 +38,23 @@ b2 s4096 h128, bf16, causal):
    module globals, so builds differing only in a module-level knob (such as item 5) would share a
    cached binary. Both kernels reference a closure tuple of every module-level scalar knob, which
    puts their values into the key. Codegen is unchanged (same ISA hash as without it).
+8. Split per-tile barrier (`SPLIT_TILE_BARRIER = True`, `HI_SKEW_SLEEP = 0`, `BARRIER_FENCE =
+   True`): the tile-top `tensor_wait(0)` + full workgroup barrier is split into a raw
+   `s_barrier_signal` / `s_barrier_wait` pair (id -1, workgroup release / acquire fences around
+   them, each site wrapped in `sched_barrier(0)`). The prologue signals after the Q reads and
+   tile 0's TDM slice retire; the tile top only waits; mid tile, after softmax and before
+   rescale / PV, each wave drains its K/V reads of slot t (`s_wait_dscnt(0)`) and its TDM(t+1)
+   slice (`tensor_wait(0)`) and signals; one wait follows the loop (#signal == #wait == n + 1
+   for every wave). A wave may run up to one PV (register-only) ahead of its slowest peer, so
+   the SIMD partners (wave i / i + 4) stop running QK and softmax in lockstep. Same LDS slots,
+   no new addresses; outputs bitwise equal to item 7. 2.8% faster at b2 s4096 h128.
+9. Per-wave skip of fully masked diagonal tiles (`SKIP_MASKED_TILES = True`, only when
+   `mask_right`): each wave splits its right-boundary sub-loop `[clean_hi, n_tiles)` at the
+   wave-uniform `wave_end = clamp(ceildiv(max(wave_q_max, -1) + 1, n_block), clean_hi, n_tiles)`,
+   `wave_q_max = min(last packed row of the wave // gqa, q_len - 1) + causal_off +
+   window_right`, into full tiles `[clean_hi, wave_end)` and sync-only tiles
+   `[wave_end, n_tiles)` that keep only the wave's share of the item-8 protocol (wait, its
+   TDM(t+1) slice, drained signal, pointer swap) and bypass m / d / O. Every kv of a skipped
+   tile lies past the band edge of every valid row of the wave, so the skipped body was an
+   exact no-op: o / lse bitwise equal to item 8. With the knob off the kernel compiles to item
+   8's binary. 2.2% faster at b2 s4096 h128 (4.4% of the wave-tiles are skipped there).

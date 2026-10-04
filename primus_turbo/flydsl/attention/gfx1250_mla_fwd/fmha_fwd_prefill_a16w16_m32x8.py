@@ -149,6 +149,42 @@ N_KV_PP = 2
 # Each K/V ping-pong block is floored to this many bytes (reserved headroom).
 MIN_KV_BLK_BYTES = 64 * 1024
 
+# ---- fwd_r1_a: split per-tile barrier (SIMD-pair ping-pong that forms at runtime) ----
+# The champion's per-tile `_drain_barrier` (tensor_wait(0) + full gpu.barrier at the tile
+# top) lines up all 8 waves every tile, so the SIMD partners (wave i / i+4) run QK together
+# and softmax together. SPLIT_TILE_BARRIER splits that barrier (same 2 slots, no new
+# addresses):
+#   prologue  s_wait_dscnt(0) (Q reads retired) -> tensor_wait(0) (tile 0) -> SIGNAL
+#   tile top  WAIT only (then prefetch t+1 into the other slot, K reads of slot t)
+#   mid tile  after softmax, before rescale/PV: s_wait_dscnt(0) (this wave's K/V reads of
+#             slot t retired) -> tensor_wait(0) (this wave's TDM(t+1) slice landed) -> SIGNAL
+#   epilogue  one WAIT after the loop, so #signal == #wait == n_iter + 1 for every wave.
+# RAW: tile t+1's reads follow WAIT(t+1), which needs every wave's tensor_wait before its
+# mid-tile SIGNAL(t). WAR: TDM(t+2) into slot t follows WAIT(t+1), i.e. every wave's
+# dscnt(0) over its slot-t reads. PV (register-only) + loop tail run between SIGNAL and WAIT,
+# so a wave may run up to one PV ahead of its slowest peer. CPU model: ../bounds_proof.py.
+SPLIT_TILE_BARRIER = True
+# Seed the SIMD-pair offset: HI waves (4..7) sleep once after the prologue signal,
+# s_sleep(N) ~ 64*N cycles (8 -> ~512, about one softmax of the partner). 0 = no skew.
+HI_SKEW_SLEEP = 0
+# Workgroup-scope LLVM fences around the raw split barrier (release before signal, acquire
+# after wait), so no IR pass moves an LDS access across it: s_barrier_signal/wait carry no
+# memory semantics of their own (gpu.barrier() emits the same fences around signal+wait).
+BARRIER_FENCE = True
+
+# ---- fwd_r2_c: wave-uniform skip of fully masked right-boundary tiles ----
+# A 256-row q-block's diagonal kv tiles are fully masked for the low waves (n_block 64: tile
+# +1 waves 0-1, +2 waves 0-3, +3 waves 0-5), yet each wave still ran K/V reads, 80 WMMA and
+# a masked softmax there. Per wave, the right-boundary sub-loop [clean_hi, n_tiles) splits at
+#   wave_end = clamp(ceildiv(max(wave_q_max, -1) + 1, n_block), clean_hi, n_tiles),
+#   wave_q_max = min(last packed row of the wave // gqa, q_len - 1) + causal_off + window_right
+# into full main_loop tiles [clean_hi, wave_end) and sync-only tiles [wave_end, n_tiles) that
+# keep WAIT, this wave's TDM(t+1) slice, dscnt(0) + tensor_wait(0) + SIGNAL and the ds-pointer
+# swap; m/d/O bypass that loop. Every kv of a skipped tile is > the band edge of every row of
+# the wave, so the full body was an exact no-op there (p = 0, m unchanged, corr = 1, O += 0).
+# CPU proof: ../bounds_proof.py (W: bounds/exactness, P/S: protocol with per-wave skips).
+SKIP_MASKED_TILES = True
+
 # log2(e): exp(x) = exp2(x * LOG2E). Softmax uses the native ISA exp2 intrinsic.
 
 # Deferred oaccu rescale (FAv4 innovation, hk_mla spec §9.1.1). Rescaling the
@@ -202,6 +238,29 @@ O_VARIANT = "v3"
 # ============================================================================
 # Small device helpers
 # ============================================================================
+
+
+# UNSTABLE(gfx1250): raw split workgroup barrier (rocdl.s_barrier_signal/wait, id -1) and
+# llvm.fence; ported from B:output/0927__flydsl/proto/barriers/op/flydsl_fwd/
+# fmha_fwd_prefill_a16w16_m32x8.py:236-253. Callers wrap them in sched_barrier(0).
+def _wg_fence(release):
+    if BARRIER_FENCE:
+        llvm_dialect.fence(
+            llvm_dialect.AtomicOrdering.release
+            if release
+            else llvm_dialect.AtomicOrdering.acquire,
+            syncscope="workgroup",
+        )
+
+
+def _split_signal():
+    _wg_fence(True)
+    rocdl.s_barrier_signal(-1)
+
+
+def _split_wait():
+    rocdl.s_barrier_wait(-1)
+    _wg_fence(False)
 
 
 def _warp_id():
@@ -968,9 +1027,23 @@ def _core_attention(
             fx.copy_atom_call(*_v)
         for _v in v_views:
             fx.copy_atom_call(*_v)
-        tdm_ops.tensor_wait(0)
-        gpu.barrier()
+        if SPLIT_TILE_BARRIER:
+            # fwd_r1_a: Q reads retired (slot 1 is TDM(1)'s target after WAIT(0)) and this
+            # wave's tile-0 slice landed, then SIGNAL(0) without waiting; WAIT(0) is at the
+            # top of the first tile. HI waves then sleep once to seed the SIMD-pair offset.
+            rocdl.sched_barrier(0)
+            rocdl.s_wait_dscnt(0)
+            tdm_ops.tensor_wait(0)
+            _split_signal()
+            rocdl.sched_barrier(0)
+            if warp_type == WarpType.HI_WARP and HI_SKEW_SLEEP > 0:
+                rocdl.s_sleep(HI_SKEW_SLEEP)
+                rocdl.sched_barrier(0)
+        else:
+            tdm_ops.tensor_wait(0)
+            gpu.barrier()
     else:
+        assert not SPLIT_TILE_BARRIER, "SPLIT_TILE_BARRIER is implemented for the TDM loader only"
         k_gptrs, k_lds_ptrs, k_imm_offs = k_mgr.global_load_ptrs(
             ptr_lds=_k_lds_buf(start_pp),
             ptr_K=ptr_K,
@@ -1078,13 +1151,18 @@ def _core_attention(
     # TODO(perf): go finer still -- per-write-tile async_load interleaved between the
     # QK/softmax/PV ops (order tuned by thread trace) rather than one bulk burst.
     # ========================================================================
-    def main_loop(t, state, *, mask_left, mask_right, kv_len):
+    def main_loop(t, state, *, mask_left, mask_right, kv_len, sync_only=False):
         # mask_left/mask_right/kv_len shadow the closure flags: the caller splits the
         # tile stream into a mask-free clean region + boundary loops and passes None for
         # any edge this sub-loop provably doesn't cross (compile-time gate).
         #
         # Runtime ping-pong: this tile reads its curr buffer (carried curr pointers); the
         # tile t+1 prefetch writes the next buffer, and curr<->next are swapped in the yield.
+        #
+        # fwd_r2_c sync_only: `state` is the ds pointers alone (m/d/O bypass the loop); the
+        # tile keeps only this wave's share of the protocol (WAIT, its TDM(t+1) slice,
+        # dscnt(0) + tensor_wait(0) + SIGNAL, pointer swap).
+        _pb = 0 if sync_only else _PTR_BASE
         nxt_pp = (t - start_tile + fx.Int32(1)) % fx.Int32(2)
 
         kv_tile_start = t * fx.Int32(
@@ -1093,15 +1171,16 @@ def _core_attention(
 
         # Unpack loop-carried state — R independent per-q-tile (m, d, O) groups,
         # then the shared K/V ds pointers.
-        m_prev = [fx.Float32(state[qt * _QS + 0]) for qt in range(R)]
-        d_prev = [fx.Float32(state[qt * _QS + 1]) for qt in range(R)]
-        o_acc = [
-            [fx.Vector(state[qt * _QS + 2 + dt]) for dt in range(d_tiles)]
-            for qt in range(R)
-        ]
-        k_curr = list(state[_PTR_BASE + 0 * _NKB : _PTR_BASE + 1 * _NKB])
-        k_next = list(state[_PTR_BASE + 1 * _NKB : _PTR_BASE + 2 * _NKB])
-        _VB0 = _PTR_BASE + 2 * _NKB
+        if not sync_only:
+            m_prev = [fx.Float32(state[qt * _QS + 0]) for qt in range(R)]
+            d_prev = [fx.Float32(state[qt * _QS + 1]) for qt in range(R)]
+            o_acc = [
+                [fx.Vector(state[qt * _QS + 2 + dt]) for dt in range(d_tiles)]
+                for qt in range(R)
+            ]
+        k_curr = list(state[_pb + 0 * _NKB : _pb + 1 * _NKB])
+        k_next = list(state[_pb + 1 * _NKB : _pb + 2 * _NKB])
+        _VB0 = _pb + 2 * _NKB
         v_curr = list(state[_VB0 + 0 * _NVB : _VB0 + 1 * _NVB])
         v_next = list(state[_VB0 + 1 * _NVB : _VB0 + 2 * _NVB])
 
@@ -1163,6 +1242,13 @@ def _core_attention(
             return (k_g, k_l, k_i, v_g, v_l, v_i)
 
         def _drain_barrier():
+            if SPLIT_TILE_BARRIER:
+                # fwd_r1_a: WAIT only; the drain (dscnt + tensorcnt) and the SIGNAL ran
+                # mid-tile in the previous tile (or the prologue).
+                rocdl.sched_barrier(0)
+                _split_wait()
+                rocdl.sched_barrier(0)
+                return
             if USE_TDM_LOADER:
                 tdm_ops.tensor_wait(0)
             else:
@@ -1193,6 +1279,17 @@ def _core_attention(
         # Address VALU up front (no barrier dependency) so it overlaps the drain; only
         # the async issue in _prefetch must stay after the barrier.
         addr = _addr_phase()
+        if sync_only:
+            # fwd_r2_c: no K/V reads, no compute (this tile is fully masked for every row
+            # of this wave); same WAIT / TDM(t+1) slice / drained SIGNAL as a full tile.
+            _drain_barrier()
+            _prefetch(addr)
+            rocdl.sched_barrier(0)
+            rocdl.s_wait_dscnt(0)
+            tdm_ops.tensor_wait(0)
+            _split_signal()
+            rocdl.sched_barrier(0)
+            return k_next + k_curr + v_next + v_curr
         if warp_type == WarpType.LO_WARP:
             _drain_barrier()
             k_values = k_mgr.load_k_to_reg(k_curr)
@@ -1311,6 +1408,16 @@ def _core_attention(
                 s_list=s_list, **_sm_kw
             )
 
+        if SPLIT_TILE_BARRIER:
+            # fwd_r1_a mid-tile SIGNAL(t): this wave's K and V (tr16) reads of slot t are
+            # retired (V burst landed, so _pv_gemm's own dscnt(0) is free) and its TDM(t+1)
+            # slice landed. Only register work (rescale, PV, loop tail) until WAIT(t+1).
+            rocdl.sched_barrier(0)
+            rocdl.s_wait_dscnt(0)
+            tdm_ops.tensor_wait(0)
+            _split_signal()
+            rocdl.sched_barrier(0)
+
         # ---- Rescale each q-tile's running O by its corr, then GEMM2 accumulates this
         # tile. When deferral is active (do_rescale is a wave-uniform i1) the wide
         # `o_acc *= corr` multiply (d_tiles*8 f32/lane) is gated behind a non-divergent
@@ -1408,6 +1515,22 @@ def _core_attention(
             final_state = yield next_state
         return final_state
 
+    @flyc.jit
+    def _run_sync_tiles(ptrs, lo_i32, hi_i32):
+        # fwd_r2_c: sync-only tiles; carries only the ds pointers (m/d/O bypass this loop).
+        final_ptrs = ptrs
+        for tile, carried in range(fx.Index(lo_i32), fx.Index(hi_i32), 1, init=ptrs):
+            next_ptrs = main_loop(
+                fx.Int32(tile),
+                list(carried),
+                mask_left=None,
+                mask_right=None,
+                kv_len=None,
+                sync_only=True,
+            )
+            final_ptrs = yield next_ptrs
+        return final_ptrs
+
     state = _init
     if mask_left:
         state = _run_tiles(
@@ -1421,15 +1544,43 @@ def _core_attention(
     state = _run_tiles(
         state, clean_lo, clean_hi, mask_left=None, mask_right=None, kv_len=None
     )
+    # fwd_r2_c: this wave's right-boundary tiles split at wave_end (wave-uniform scalar):
+    # full tiles [clean_hi, wave_end), sync-only tiles [wave_end, n_tiles). wave_q_max is the
+    # band edge of the wave's last valid row; clamped at -1 so the ceildiv divides a value >= 0.
+    skip = SKIP_MASKED_TILES and mask_right
+    if skip:
+        assert SPLIT_TILE_BARRIER, "SKIP_MASKED_TILES needs the split per-tile barrier"
+        wave_max_seq = fx.min(
+            (
+                block_x * fx.Int32(BLOCK_M)
+                + warp_idx * fx.Int32(R * WMMA_M)
+                + fx.Int32(R * WMMA_M - 1)
+            )
+            // fx.Int32(gqa_ratio),
+            q_len - fx.Int32(1),
+        )
+        wave_q_max = fx.max(wave_max_seq + causal_off + window_right, fx.Int32(-1))
+        wave_end = (wave_q_max + fx.Int32(n_block)) // fx.Int32(n_block)
+        wave_end = fx.max(fx.min(wave_end, fx.Int32(n_tiles)), clean_hi)
+    else:
+        wave_end = fx.Int32(n_tiles)
     state = _run_tiles(
         state,
         clean_hi,
-        fx.Int32(n_tiles),
+        wave_end,
         mask_left=mask_left,
         mask_right=mask_right,
         kv_len=kv_len,
     )
     final = state
+    if skip:
+        _run_sync_tiles(list(state[_PTR_BASE:]), wave_end, fx.Int32(n_tiles))
+
+    if SPLIT_TILE_BARRIER:
+        # fwd_r1_a: the WAIT matching the last tile's mid-tile SIGNAL (#signal == #wait).
+        rocdl.sched_barrier(0)
+        _split_wait()
+        rocdl.sched_barrier(0)
 
     # ========================================================================
     # Epilogue: normalize O by the running denom d, then reshape+store to VRAM.
@@ -1443,7 +1594,9 @@ def _core_attention(
     # iteration's dead prefetch skipped, no wave ever writes that slot near the end: the
     # last load into it was local tile n_iter-2 (issued during local tile n_iter-3,
     # consumed at n_iter-2), and the top-of-body barrier at local tile n_iter-1 already
-    # synchronized every wave past that read. So the slot is idle here -- no cross-wave
+    # synchronized every wave past that read (fwd_r1_a: WAIT(n_iter-1) follows every wave's
+    # mid-tile dscnt(0) + SIGNAL of tile n_iter-2; with n_iter == 1 the slot is Q's, whose
+    # reads precede the prologue SIGNAL). So the slot is idle here -- no cross-wave
     # barrier needed. Only the V1 loader issues async loads (asynccnt); under TDM (V2/V3)
     # K/V/Q load via tensorcnt, so nothing increments asynccnt and s_wait_asynccnt(0) is a
     # pure no-op -- keep it only for V1 as a defensive per-wave WAR guard (retire any
