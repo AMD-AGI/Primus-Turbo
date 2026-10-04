@@ -11,10 +11,8 @@
 // ---------------
 // Training needs every tensor packed along two axes (fprop contracts K, dgrad
 // contracts N, wgrad contracts M). AITER only ships a row-direction packer, so the
-// column direction previously went through `pack(x.t().contiguous())`. Profiling a
-// Flux 12B step attributed 82% of the MXFP6-vs-MXFP4 step-time gap to exactly that
-// materialised transpose -- 420 ms of a 512 ms gap -- dwarfing both the GEMM
-// difference and the packing itself.
+// column direction previously went through `pack(x.t().contiguous())`, and that
+// materialised transpose cost more than both the GEMM difference and the packing itself.
 //
 // The fix is to never materialise it. A block stages one TILE_M x TILE_N patch of the
 // input in LDS with coalesced reads, then packs rows and columns out of that patch.
@@ -84,13 +82,12 @@ constexpr float kHadamard32Norm = 0.17677669529663687f;
 // ---------------------------------------------------------------------------
 // Overridable only so a sweep can be driven from the command line without editing this
 // file; the defaults below are the shipped, measured values and are what any normal
-// build uses. The sweep that chose them ran at MBS=64 row extents, which is why the
-// MBS=32 extents (8192 rows) were re-examined separately.
+// build uses; they were checked at the row extents the training shapes present.
 #ifndef MXFP6_TILE_M
 #define MXFP6_TILE_M 64
 #endif
 // A 256-thread block, from a cold-operand sweep of TILE_M 32..128 x TILE_N 64..256 x
-// block 128..512 at the row extents MBS=32 and MBS=64 actually present. Cold is the
+// block 128..512 at the row extents the training shapes present. Cold is the
 // operative word: the previous 128-thread default came from a sweep with the input
 // resident, which is not the state a packer call ever finds its operand in -- every one
 // of them reads a tensor a GEMM or an optimizer step has just written.
@@ -763,7 +760,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
     // padded pitch unchanged.
     // QkNormRopeBackward opts out deliberately: its head-pair reduction wants a row's
     // chunks laid out the way the padded pitch leaves them, and staging it this way
-    // measured 33.6 ms/step against 24.7 for the padded pitch on the Flux QKV shapes.
+    // is markedly slower than the padded pitch on the Flux QKV shapes.
     constexpr bool kAsyncStage = MXFP6_ASYNC_STAGE && !kQkr && TILE_M == 64 &&
                                  (TILE_N == 64 || TILE_N == 128) &&
                                  THREADS_PER_BLOCK == 256;

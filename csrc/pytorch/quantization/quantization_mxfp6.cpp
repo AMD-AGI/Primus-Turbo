@@ -582,7 +582,7 @@ std::vector<at::Tensor> quantize_mxfp6(const at::Tensor input, const int64_t axi
 // A grouped A6W6 GEMM runs G GEMMs in one launch, so its packed operands must form one
 // contiguous buffer with each group written into its own slice. The allocating variant
 // cannot target a slice, and both workarounds measure NEGATIVE against the grouped
-// kernel's gain: aiter's caller-buffer packer is ~36% slower than this kernel, and
+// kernel's gain: aiter's caller-buffer packer is markedly slower than this kernel, and
 // pack-then-copy is worse still. Either is enough to turn the grouped GEMM's gain into a
 // net loss. The kernel is unchanged; only its destination moves.
 void quantize_mxfp6_out(const at::Tensor input, const int64_t axis, at::Tensor packed,
@@ -631,8 +631,8 @@ std::vector<at::Tensor> quantize_mxfp6_dual(const at::Tensor input) {
 //
 // A grouped GEMM needs the ROW blob of both groups in one contiguous buffer, while the
 // COLUMN blob (which contracts along M) must stay per-stream for wgrad. Splitting the
-// fused dual pack into a row call plus a column call to achieve that costs +19.7 us per
-// pair at [8192,3072], which is a large fraction of what the grouping wins. This keeps it
+// fused dual pack into a row call plus a column call to achieve that costs a large fraction
+// of what the grouping wins. This keeps it
 // a single kernel and hands each direction its own destination, so the split costs
 // nothing.
 static void dual_out_fmt(const at::Tensor input, at::Tensor row_packed, at::Tensor row_scale,
