@@ -11,8 +11,12 @@ any machine. The numeric tests need a gfx1250 card; their fp32 reference runs on
 """
 
 import contextlib
+import importlib
 import math
 import os
+import pathlib
+import sys
+import types
 
 import pytest
 import torch
@@ -33,6 +37,31 @@ from tests.pytorch.test_utils import compute_snr, pinned_backend_takes
 
 _ON_GFX1250 = torch.cuda.is_available() and is_gfx1250()
 needs_gfx1250 = pytest.mark.skipif(not _ON_GFX1250, reason="gfx1250 FlyDSL attention kernels")
+
+# The gfx1250 kernel packages; importing primus_turbo (the imports above) must not import any of them.
+_GFX1250_KERNEL_PACKAGES = tuple(
+    f"primus_turbo.flydsl.attention.{p}" for p in ("gfx1250", "gfx1250_mla_fwd", "gfx1250_mla_bwd")
+)
+
+
+def _gfx1250_kernel_modules():
+    return sorted(m for m in sys.modules for p in _GFX1250_KERNEL_PACKAGES if m == p or m.startswith(p + "."))
+
+
+_GFX1250_KERNEL_MODULES_AT_IMPORT = _gfx1250_kernel_modules()
+
+
+def _mla_flydsl_reason():
+    from primus_turbo.flydsl.attention.gfx1250_mla_version import (
+        flydsl_unavailable_reason,
+    )
+
+    return flydsl_unavailable_reason()
+
+
+# MLA tests that need the MLA kernel modules importable (flydsl 0.3.4.x); with another flydsl the
+# gate refuses every MLA call, which test_mla_gate_falls_back_without_flydsl_0_3_4 covers.
+needs_mla_flydsl = pytest.mark.skipif(_mla_flydsl_reason() is not None, reason=str(_mla_flydsl_reason()))
 
 D = 128
 
@@ -395,6 +424,7 @@ def _meta_mla(b, sq, skv, hq, hkv, dtype=torch.bfloat16, dv=D_V):
     [(2, 4096, 4096, 128, 128), (1, 256, 256, 2, 2), (1, 256, 512, 4, 4), (4, 64, 64, 1, 1)],
     ids=["dsv3_mbs2", "toy", "sq_lt_skv", "smallest"],
 )
+@needs_mla_flydsl
 def test_mla_gate_accepts(monkeypatch, shape):
     q, k, v = _meta_mla(*shape)
     assert _gate(monkeypatch, q, k, v, causal=True, softmax_scale=MLA_SCALE) is True
@@ -468,6 +498,7 @@ def _mla_inputs(b, sq, skv, h, layout="sbhd", seed=0):
     return make(sq, D_QK), make(skv, D_QK), make(skv, D_V), make(sq, D_V)
 
 
+@needs_mla_flydsl
 @pytest.mark.parametrize("layout", ["sbhd", "bshd"])
 def test_mla_routes_to_the_mla_kernels_without_copies(monkeypatch, layout):
     """FlashAttnFunc on "gfx1250" with MLA head dims: the MLA kernels get contiguous tensors --
@@ -559,6 +590,7 @@ def test_mla_folded_equals_unfolded_and_is_deterministic():
         assert torch.equal(a, b_) and torch.equal(a, c)
 
 
+@needs_mla_flydsl
 def test_mla_fwd_jit_key_covers_module_knobs(monkeypatch):
     """FlyDSL keys its compile cache by function source and closure scalars, not module globals.
     The MLA forward routes its module-level knobs through the kernels' closures, so a build with
@@ -589,9 +621,52 @@ def _mla_bwd_impl():
     """The MLA backward host module, or a skip where its flydsl 0.3.4 kernels cannot be imported."""
     try:
         from primus_turbo.flydsl.attention.gfx1250_mla_bwd import impl
-    except Exception as exc:  # noqa: BLE001 -- flydsl missing or another version
+    except ImportError as exc:  # flydsl missing or another version (the package says which)
         pytest.skip(f"gfx1250 MLA backward not importable: {exc}")
     return impl
+
+
+def test_mla_bwd_jit_key_covers_module_knobs():
+    """FlyDSL keys a launch by the sources of the launcher and its kernels, their closure scalars and
+    the module globals a static walk of their top-level code finds. The MLA backward's kernels read
+    most module constants inside nested helpers, which that walk misses (DQ_BARRIER_FENCE, KH0_SALU,
+    TDM_DEPTH, ...), so every kernel reads MODULE_KNOBS, the value of every knob of kernels.py. A copy
+    of kernels.py with one knob edited gets a new key for every launcher; an unedited copy the same
+    key, so the persistent cache still hits across processes."""
+    from flydsl.compiler import jit_function
+
+    kern = _mla_bwd_impl()._k
+    assert kern.MODULE_KNOBS == kern._module_knobs()
+    names = {n for n, _ in kern.MODULE_KNOBS}
+    assert {"TDM_DEPTH", "KH0_SALU", "DQ_BARRIER_FENCE", "DQT_VT_SGB", "HEAD_GROUP", "D_QK"} <= names
+    launchers = ("launch_delta", "launch_dkdv", "launch_dkdv64", "launch_dqg", "launch_dqg96")
+    src = pathlib.Path(kern.__file__).read_text()
+
+    def keys(mod):
+        # the two parts of FlyDSL's key that depend on the module: per-function (source, closure
+        # scalars) and the snapshot of the discovered module globals
+        out = {}
+        for name in launchers:
+            fn = getattr(mod, name).func
+            refs = jit_function._snapshot_refs(jit_function._discover_global_refs(fn), stable=True)
+            out[name] = (jit_function._jit_function_cache_key(fn), tuple(sorted(refs.items())))
+        return out
+
+    def copy(old="", new=""):
+        assert not old or src.count(old) == 1, old
+        mod = types.ModuleType(kern.__name__)
+        mod.__file__, mod.__package__ = kern.__file__, kern.__package__
+        exec(compile(src.replace(old, new) if old else src, kern.__file__, "exec"), mod.__dict__)
+        return mod
+
+    base = keys(kern)
+    assert keys(copy()) == base
+    for old, new in (
+        ("\nDQ_BARRIER_FENCE = True\n", "\nDQ_BARRIER_FENCE = False\n"),
+        ("\nKH0_SALU = 2\n", "\nKH0_SALU = 1\n"),
+    ):
+        edited = keys(copy(old, new))
+        assert [n for n in launchers if edited[n] == base[n]] == [], old.strip()
 
 
 @pytest.mark.parametrize(
@@ -622,6 +697,136 @@ def test_mla_bwd_small_grid_launch_set(dims, expect):
         assert geo["dq"] == [(impl._k.NQW, 1, 0, sq // impl._k.DQ_BQW)]
     for forced in (True, False):
         assert impl._geometry(b, sq, skv, hq, hkv, small_grid=forced)["small"] == (forced, forced)
+
+
+# ---------------------------------------------------------------------------
+# Packaging: lazy imports, the flydsl version gate, other archs
+# ---------------------------------------------------------------------------
+
+
+def test_importing_primus_turbo_does_not_import_the_gfx1250_kernels():
+    """The gfx1250 kernel packages are imported on the first gfx1250 call, never by
+    ``import primus_turbo``: they are wave32 code for one arch, and the MLA ones need flydsl 0.3.4.x."""
+    assert _GFX1250_KERNEL_MODULES_AT_IMPORT == []
+
+
+def _fake_flydsl(monkeypatch, version):
+    """Make ``import flydsl`` fail (version None) or find a flydsl reporting ``version``."""
+    if version is None:
+        monkeypatch.setitem(sys.modules, "flydsl", None)
+    else:
+        fake = types.ModuleType("flydsl")
+        fake.__version__ = version
+        monkeypatch.setitem(sys.modules, "flydsl", fake)
+
+
+@pytest.mark.parametrize("packaging", [True, False], ids=["packaging", "no_packaging"])
+@pytest.mark.parametrize(
+    ("version", "ok"),
+    [
+        ("0.3.4", True),
+        ("0.3.4.1", True),
+        ("0.3.4.1+g1234567", True),
+        ("0.3.4.post1", True),
+        (None, False),
+        ("0.2.4", False),
+        ("0.3.3", False),
+        ("0.3.5", False),
+        ("0.4.0", False),
+        ("unknown", False),
+    ],
+)
+def test_mla_flydsl_version_requirement(monkeypatch, version, ok, packaging):
+    from primus_turbo.flydsl.attention import gfx1250_mla_version as ver
+
+    if not packaging:  # the release-number fallback
+        monkeypatch.setitem(sys.modules, "packaging.specifiers", None)
+        monkeypatch.setattr(ver, "_version_ok", ver._satisfies)  # uncached
+    _fake_flydsl(monkeypatch, version)
+    reason = ver.flydsl_unavailable_reason()
+    assert (reason is None) == ok, reason
+    if not ok:
+        assert f"flydsl{ver.FLYDSL_REQUIREMENT}" in reason
+        with pytest.raises(ImportError):
+            ver.require_flydsl()
+
+
+@pytest.mark.parametrize("version", ["0.3.4.dev1", "0.3.5rc1"])
+def test_mla_flydsl_version_requirement_excludes_prereleases_outside(monkeypatch, version):
+    from primus_turbo.flydsl.attention import gfx1250_mla_version as ver
+
+    _fake_flydsl(monkeypatch, version)
+    assert ver.flydsl_unavailable_reason() is not None
+
+
+@pytest.mark.parametrize("version", [None, "0.2.4", "0.3.5"], ids=["missing", "0.2.4", "0.3.5"])
+def test_mla_gate_falls_back_without_flydsl_0_3_4(monkeypatch, version):
+    """With flydsl missing or another release the MLA gate gives the reason before importing any
+    kernel module, FlyDSL declines the call and the dispatcher falls back to another backend."""
+    from primus_turbo.pytorch.kernels.attention import (
+        attention_flydsl_gfx1250_mla_impl as mla_impl,
+    )
+
+    def forbidden():
+        raise AssertionError("gfx1250 MLA kernel module imported without flydsl 0.3.4.x")
+
+    monkeypatch.setattr(mla_impl, "_bwd_kernels", forbidden)
+    monkeypatch.setattr(mla_impl, "_fwd_interface", forbidden)
+    _fake_flydsl(monkeypatch, version)
+    q, k, v = _meta_mla(2, 4096, 4096, 128, 128)
+    reason = mla_impl.flydsl_gfx1250_mla_unsupported_reason(q, k, v, True)
+    assert reason is not None and "flydsl>=0.3.4,<0.3.5" in reason, reason
+    assert _gate(monkeypatch, q, k, v, causal=True, softmax_scale=MLA_SCALE) is False
+    assert pinned_backend_takes(BackendType.FLYDSL, **_resolve_kwargs(q, k, v)) is False
+    assert resolve_flash_attn_backend(False, None, **_resolve_kwargs(q, k, v)) != BackendType.FLYDSL
+
+
+@pytest.mark.parametrize("pkg", ["gfx1250_mla_fwd", "gfx1250_mla_bwd"])
+def test_mla_packages_refuse_import_without_flydsl_0_3_4(monkeypatch, pkg):
+    """Importing an MLA kernel package with another flydsl raises ImportError naming the requirement
+    (no assert, no kernel module loaded), the error the gate and the tests' skips expect."""
+    name = f"primus_turbo.flydsl.attention.{pkg}"
+    for m in [m for m in sys.modules if m == name or m.startswith(name + ".")]:
+        monkeypatch.delitem(sys.modules, m)
+    _fake_flydsl(monkeypatch, "0.2.4")
+    with pytest.raises(ImportError, match=r"flydsl>=0\.3\.4,<0\.3\.5, found flydsl 0\.2\.4"):
+        importlib.import_module(name + (".interface" if pkg.endswith("fwd") else ".impl"))
+    assert [m for m in sys.modules if m == name or m.startswith(name + ".")] == []
+
+
+@pytest.mark.parametrize("layout", ["sbhd", "bshd"])
+def test_mla_head_dims_route_as_before_on_gfx950(monkeypatch, layout):
+    """On gfx950 the gfx1250 MLA gate, its flydsl check and its kernels are never consulted: MLA head
+    dims go to another backend as before (the gfx950 FlyDSL kernels take head dims 64 / 128), and
+    head dim 128 in sbhd storage still goes to the gfx950 FlyDSL kernels."""
+    from primus_turbo.pytorch.kernels.attention import (
+        attention_flydsl_gfx1250_mla_impl as mla_impl,
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("gfx1250 MLA code consulted on gfx950")
+
+    monkeypatch.setattr(attention_impl, "is_gfx1250", lambda: False)
+    monkeypatch.setattr(attention_impl, "get_device_compute_capability", lambda: (9, 5))
+    monkeypatch.setattr(attention_impl, "flydsl_gfx1250_mla_unsupported_reason", forbidden)
+    for fn in ("_flydsl_unavailable_reason", "_bwd_kernels", "_fwd_interface"):
+        monkeypatch.setattr(mla_impl, fn, forbidden)
+
+    def tensors(d_qk, d_v):
+        def make(d):
+            if layout == "sbhd":
+                return torch.empty(4096, 2, 128, d, dtype=torch.bfloat16, device="meta").permute(1, 0, 2, 3)
+            return torch.empty(2, 4096, 128, d, dtype=torch.bfloat16, device="meta")
+
+        return make(d_qk), make(d_qk), make(d_v)
+
+    kwargs = dict(causal=True, window_size=(-1, -1), qkv_format=layout, needs_backward=True)
+    q, k, v = tensors(D_QK, D_V)
+    assert attention_impl.DenseAttnFwdFlydslBackend.can_handle(q, k=k, v=v, **kwargs) is False
+    assert resolve_flash_attn_backend(False, None, q=q, k=k, v=v, **kwargs) != BackendType.FLYDSL
+    q, k, v = tensors(D, D)
+    got = resolve_flash_attn_backend(False, None, q=q, k=k, v=v, **kwargs)
+    assert (got == BackendType.FLYDSL) == (layout == "sbhd"), got
 
 
 @pytest.mark.parametrize("dynamic", [False, True])
