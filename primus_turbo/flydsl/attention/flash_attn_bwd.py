@@ -39,8 +39,19 @@ _LOG2E = host_math.log2(host_math.e)
 # a second compute queue interferes with application communication (#520).
 _ATTN_SINGLE_STREAM = os.getenv("PRIMUS_TURBO_ATTN_SINGLE_STREAM", "0") == "1"
 _ATTN_Q_PREP = os.getenv("PRIMUS_TURBO_ATTN_Q_PREP", "standalone")
-if _ATTN_Q_PREP not in ("standalone", "odo"):
-    raise ValueError("PRIMUS_TURBO_ATTN_Q_PREP must be standalone or odo")
+if _ATTN_Q_PREP not in ("standalone", "odo", "inline", "inline_swa"):
+    raise ValueError("PRIMUS_TURBO_ATTN_Q_PREP must be standalone, odo, inline, or inline_swa")
+
+
+def _inline_q_for(sbhd, varlen, head_dim, window_left):
+    return (
+        sbhd
+        and not varlen
+        and head_dim == 64
+        and (_ATTN_Q_PREP == "inline" or (_ATTN_Q_PREP == "inline_swa" and window_left >= 0))
+    )
+
+
 # q rows one dkdv work-group folds per q-loop step. A wider tile, and warp specialisation,
 # are both register-walled: neither leaves room to co-reside two waves per SIMD.
 _BWD_BLOCK_Q = 64
@@ -1411,6 +1422,7 @@ def build_flash_attn_bwd_dkdv_module(
     # four-wave form the right pick is the registers per SIMD it leaves free, which is
     # what lets the dQ reduce co-reside (see `_dq_partial_ws` / `_fused_pipelined`).
     flat_wg=256,
+    q_scale_on_load=False,
 ):
     """Build the dK/dV KV-outer backward launcher (clean mirror of the forward).
 
@@ -1684,6 +1696,7 @@ def build_flash_attn_bwd_dkdv_module(
     # ring would retire the staging pair's WAR barrier too, but the register cost of a
     # second live slot outweighs that barrier's price on this body.
     Q_PREF = bool(q_pref) and ENABLE_DMA and not PF_RING and DMA_GRP == 1
+    assert not q_scale_on_load or Q_PREF, "inline Q scaling requires the VGPR-prefetched Q path"
     # gfx950 has one in-order vmcnt, so D128 issues this fetch at point 0 to keep the dQ partial
     # stores in flight. D64 issues it at the head-step top instead: the tile is waited on a whole
     # head-step later, three times the cover, and the extra live loads do not move the count.
@@ -3224,7 +3237,13 @@ def build_flash_attn_bwd_dkdv_module(
             """Publish a prefetched Q/dO tile pair into the LDS slot."""
             for d in range_constexpr(NUM_DMA_Q):
                 _i = slot + fx.Index(d * (DMA_BATCH_BYTES // 2)) + tid * fx.Index(8)
-                Vec(vals[2 * d]).store(lds, [_i])
+                _qv = Vec(vals[2 * d])
+                if const_expr(q_scale_on_load):
+                    # Both score and dK GEMMs read this LDS image. Round here,
+                    # exactly where the standalone bf16 materialization rounded,
+                    # to avoid a global Q workspace without changing their inputs.
+                    _qv = (_qv.to(fx.Float32) * Vec.filled(8, sm_scale * _LOG2E, fx.Float32)).to(elem_dtype)
+                _qv.store(lds, [_i])
                 Vec(vals[2 * d + 1]).store(lds, [fx.Index(LDS_DO_BASE) + _i])
 
         def _vgpr_load_head(head_local, q_start):
@@ -5414,6 +5433,7 @@ def _get_bwd(
             g1_ks_outer=None,
             agpr=_DKDV_AGPR,
             wsq_a16=a16,
+            q_scale_on_load=_inline_q_for(sbhd, varlen, D, window_left),
             **common,
         )
         dkdv_l = build_flash_attn_bwd_dkdv_module(**dkdv_kw)
@@ -5804,7 +5824,8 @@ def flydsl_varlen_backward(
     varlen = cu_seqlens_q is not None
     st = torch.cuda.current_stream()
     fuse_q = _ATTN_Q_PREP == "odo" and sbhd and not varlen and D == 64
-    qf = torch.empty_like(q).reshape(-1) if fuse_q else _prescale_q(q, scale)
+    inline_q = _inline_q_for(sbhd, varlen, D, -1 if Skv - 1 <= window_left else window_left)
+    qf = q.reshape(-1) if inline_q else (torch.empty_like(q).reshape(-1) if fuse_q else _prescale_q(q, scale))
     odo_q = dict(q=q.reshape(-1), qs=qf) if fuse_q else {}
     kf, vf, dof = k.reshape(-1), v.reshape(-1), dout.reshape(-1)
     o16 = out.to(q.dtype).reshape(-1)

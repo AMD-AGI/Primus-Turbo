@@ -1,0 +1,72 @@
+"""Compare candidate gradients with the pinned baseline before a training run.
+
+The baseline file path is supplied by the workflow's immutable source bundle.
+Timing results are deliberately left to the PyTorch-profiled training workload.
+"""
+
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+import torch
+
+from primus_turbo.flydsl.attention.flash_attn_bwd import flydsl_varlen_backward
+from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import flash_attn_sbhd_flydsl_forward_impl
+
+
+def relative_l2(a, b):
+    return ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-12)).item()
+
+
+def main():
+    spec = importlib.util.spec_from_file_location("attention_campaign_baseline", sys.argv[1])
+    baseline = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = baseline
+    spec.loader.exec_module(baseline)
+    torch.manual_seed(30279)
+    results = []
+    for seq, window, spike in [(512, -1, 16), (512, 128, 16), (8192, -1, 1), (8192, 128, 1)]:
+        batch, hq, hkv, dim = 4, 64, 8, 64
+        q = torch.randn(seq, batch, hq, dim, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(seq, batch, hkv, dim, device="cuda", dtype=torch.bfloat16)
+        v = torch.randn_like(k)
+        if spike > 1:
+            q[::127] *= spike
+            k[::131] *= spike
+        sink = torch.randn(hq, device="cuda")
+        out, lse = flash_attn_sbhd_flydsl_forward_impl(
+            q, k, v, return_lse=True, window_size=(window, 0), sink=sink
+        )
+        lse = lse.view(batch, seq, hq).permute(0, 2, 1)
+        dout = torch.randn_like(out)
+        args = (dout, q, k, v, out, lse, batch, seq, seq, hq, hkv, dim, 0.125)
+        kwargs = dict(sbhd=True, window_left=window, sink=sink)
+        ref = baseline.flydsl_varlen_backward(*args, **kwargs)
+        repeat = baseline.flydsl_varlen_backward(*args, **kwargs)
+        candidate = flydsl_varlen_backward(*args, **kwargs)
+        torch.cuda.synchronize()
+        gradients = {}
+        for name, expected, repeated, actual in zip(("dq", "dk", "dv", "dsink"), ref, repeat, candidate):
+            assert torch.isfinite(expected).all(), f"baseline {name} is nonfinite"
+            assert torch.isfinite(actual).all(), f"candidate {name} is nonfinite"
+            noise = relative_l2(repeated, expected)
+            error = relative_l2(actual, expected)
+            tolerance = max(0.002, 4 * noise)
+            gradients[name] = dict(
+                relative_l2=error,
+                baseline_repeat_relative_l2=noise,
+                tolerance=tolerance,
+                exact=torch.equal(actual, expected),
+            )
+            assert error <= tolerance, (seq, window, spike, name, gradients[name])
+        results.append(dict(sequence=seq, window=window, spike=spike, gradients=gradients))
+        print("ATTENTION_GRADIENT_CASE " + json.dumps(results[-1]), flush=True)
+        del q, k, v, out, lse, dout, args, kwargs, ref, repeat, candidate
+    Path("/results/attention_backward_preflight.json").write_text(
+        json.dumps(dict(passed=True, cases=results), indent=2) + "\n"
+    )
+
+
+if __name__ == "__main__":
+    main()
