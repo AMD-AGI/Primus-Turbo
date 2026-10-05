@@ -29,7 +29,7 @@ def main():
     torch.manual_seed(30279)
     results = []
     cases = [(512, -1, 16), (512, 128, 16), (8192, -1, 1), (8192, 128, 1)]
-    if os.getenv("PRIMUS_TURBO_ATTN_Q_PREP") in ("forward", "lse"):
+    if os.getenv("PRIMUS_TURBO_ATTN_Q_PREP") in ("forward", "forward_hybrid", "lse"):
         cases += [(513, -1, 16), (513, 128, 16)]
     for seq, window, spike in cases:
         batch, hq, hkv, dim = 4, 64, 8, 64
@@ -60,7 +60,9 @@ def main():
         kwargs = dict(sbhd=True, window_left=window, sink=sink)
         ref = baseline.flydsl_varlen_backward(*args, **kwargs)
         repeat = baseline.flydsl_varlen_backward(*args, **kwargs)
-        if os.getenv("PRIMUS_TURBO_ATTN_Q_PREP") == "forward":
+        if os.getenv("PRIMUS_TURBO_ATTN_Q_PREP") == "forward" or (
+            os.getenv("PRIMUS_TURBO_ATTN_Q_PREP") == "forward_hybrid" and window < 0
+        ):
             original_q = q.clone()
             saved_out, saved_lse, scaled_q = flash_attn_sbhd_flydsl_forward_impl(
                 q,
