@@ -1413,6 +1413,15 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
         __syncthreads();
     }
 
+    // When the row and column groups together fit in one pass of the block (TILE_N 64: 128 +
+    // 128), the column groups go to the threads the row groups leave idle. Starting both loops at
+    // `slot` gave threads 0..127 one group of each and left two of the block's four waves idle
+    // through the emit. Same groups, same outputs: an emit depends on its group's position, not on
+    // the thread that runs it (the SR word is hashed from row and group).
+    constexpr int  kAllRowGroups = DO_ROW ? TILE_M * (TILE_N / kGroupSize) : 0;
+    constexpr int  kAllColGroups = DO_COL ? TILE_N * (TILE_M / kGroupSize) : 0;
+    constexpr bool kSplitSlots   = DO_ROW && DO_COL && kAllRowGroups + kAllColGroups <= THREADS_PER_BLOCK;
+
     // Row direction: contract along N. Each staged row contributes TILE_N/32 groups.
     if constexpr (DO_ROW) {
         constexpr int kBlocksPerRow = TILE_N / kGroupSize;
@@ -1440,8 +1449,9 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
     if constexpr (DO_COL) {
         constexpr int kBlocksPerCol = TILE_M / kGroupSize;
         constexpr int kColGroups    = TILE_N * kBlocksPerCol;
+        const int     first         = kSplitSlots ? slot - kAllRowGroups : slot;
 #pragma unroll
-        for (int gi = slot; gi < kColGroups; gi += THREADS_PER_BLOCK) {
+        for (int gi = first; gi >= 0 && gi < kColGroups; gi += THREADS_PER_BLOCK) {
             const int local_n  = gi / kBlocksPerCol;
             const int k_block  = gi % kBlocksPerCol;
             const int m_offset = k_block * kGroupSize;
