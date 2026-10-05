@@ -282,3 +282,34 @@ four sessions), proxy 0.9967x, fast void. Compile-only: k_dkdv64 861 VGPR / 107 
 SGPR->VGPR-lane spills (32 readlane/writelane, all between the two loops, none in a loop body;
 code_sha 7b0c1b65963ad347), k_dqg96 2a2a5d5f4b667478, k_dqg 4c3cd3d5b464dc92, k_delta
 69e06c22a4d3bb22 (= bwd_r5_oe3); 0 VGPR spill / 0 scratch.
+
+## Round 5b arm bwd_r5_hg64: launch-only head-group target 64 (bwd_r5_oe4 + HEAD_GROUP 64)
+
+Parent: arms/bwd_r5_oe4 (champion, arm hash 9f86d179). Decision of the main session after the
+head-group side measurement (runs/flags/bwd_hg_side.json; notes/bwd-rounds.md, section
+"r5 旁路：head-group"). Files vs the parent (sha256):
+
+    28711b9043e79801e1ae2f7231d2db3ab36480b415b86e8e28c4c76bf57613bd  kernels.py (one line)
+    dce634140ac19d4ad1245c298a9f236d7ce03270c32111ed27b275d832b510e2  bounds_proof.py (R2 retarget)
+    impl.py / _env.py / __init__.py == bwd_r5_oe4 (byte-identical)
+
+- kernels.py, the only runtime change: `HEAD_GROUP = 128` -> `HEAD_GROUP = 64`. HG is a runtime
+  i32 kernel argument (bwd_r4_a), so every kernel binary is the parent's (k_delta 69e06c22,
+  k_dkdv64 7b0c1b65, k_dqg96 2a2a5d5f, k_dqg 4c3cd3d5) and dq/dk/dv are bitwise identical for
+  every target. Launch effect: impl._plan's hg = head_group(nh, 64): the e2e fold launch
+  [1, 4096, 256, D] runs grids (64, tiles, 4) instead of (128, tiles, 2) (the b2h128 walk); the
+  contiguous b2 h128 launch also (64, tiles, 4) instead of r3_a's (128, tiles, 2); launches with
+  nh <= 64 (toy/fast/proxy) keep r3_a's grids. A head group of 64 keeps twice as many tiles of one
+  head resident per XCD as 128 (more L2 reuse of a streamed Q/dO or K/V tile).
+  `FLY_BWD_HEAD_GROUP=128` (or `head_group=128` per call) restores the parent's launch exactly.
+- bounds_proof.py: R2 asserted "prodfold at the DEFAULT target walks like r3_a's b2h128", which is
+  true only at 128. It now pins that claim to the explicit target 128 (B2H128_TARGET) and adds:
+  prodfold at the default target HEAD_GROUP walks (folded head, tile) exactly like the contiguous
+  b2h128 launch at the same target (the op-evolve job's boundary). R_TARGETS lists 128 explicitly
+  (was the HEAD_GROUP token; 64 was already in it). Counts equal the parent's except R2 45 -> 48 and
+  R1 147494 -> 202790 (the decode checks of the two new R2 walks: 2 x (16384 + 10752 + 512)).
+- Evidence (side measurement, bwd_r5_oe4 binary, impl.HEAD_GROUP set per call; e2e boundary, one
+  process per run, blocked9 + lead4 x6 palindromic, mirror-placed A/A for each hg, Triton centred,
+  gb ruler 10 GEMMs): hg64 vs hg128 gb x0.9788 (real dump L0s15), x0.9882 / x0.9861 (randn); blocked
+  x0.9431 (real dump); all with valid A/A; dq/dk/dv bitwise equal across hg 32 / 64 / 128 / 0;
+  code_sha unchanged across the hg calls (no recompile).

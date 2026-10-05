@@ -66,10 +66,11 @@ waves per workgroup, grid (Hkv, Skv/64, B), wave w owns kv rows kv0g + 32w + [0,
       (bat, head, tile) as inputs) cover every launched workgroup; i32 intermediates < 2^31;
       hg == nh reproduces r3_a's (bat, head) of every workgroup exactly; hg % 8 == 0 keeps all
       workgroups of one head on one XCD (linear id % 8 constant), counted.
-  R2  traversal equivalence: on the fold launch [1, s, 256, d] (prodfold) at the default target
-      the sequence of (folded head b*128 + h, tile) over the linear workgroup id equals the
-      sequence r3_a's b2 h128 launch walks, for k_dkdv64, k_dqg96 and k_dqg; and at target 0 the
-      grids and decodes are r3_a's for every shape.
+  R2  traversal equivalence: on the fold launch [1, s, 256, d] (prodfold) at target 128 (bwd_r4_a's
+      default) the sequence of (folded head b*128 + h, tile) over the linear workgroup id equals the
+      sequence r3_a's b2 h128 launch walks, for k_dkdv64, k_dqg96 and k_dqg; at the default target
+      HEAD_GROUP (bwd_r5_hg64: 64) it equals the sequence the contiguous b2 h128 launch walks at that
+      same target; and at target 0 the grids and decodes are r3_a's for every shape.
 """
 import pathlib
 import re
@@ -102,7 +103,9 @@ DQ_NWAVE, DQ_BQW96 = g("DQ_NWAVE"), g("DQ_BQW96")
 segs = g("_pow2_segments")
 DKDV_NW, PDS_B, EPI_W, BAR_KH = g("DKDV_NW"), g("PDS_B"), g("EPI_W"), g("BAR_KH")
 HEAD_GROUP, head_group = g("HEAD_GROUP"), g("head_group")
-R_TARGETS = (0, 8, 16, 24, 32, 64, 96, HEAD_GROUP, 256)
+R_TARGETS = (0, 8, 16, 24, 32, 64, 96, 128, 256)
+B2H128_TARGET = 128             # bwd_r4_a's default: prodfold at 128 IS r3_a's b2h128 grid (R2)
+assert HEAD_GROUP in R_TARGETS and B2H128_TARGET in R_TARGETS
 ALLOC_KV = LDS_SEG + DKDV_NW * PDS_B
 ROWS_W = 32 // DKDV_NW          # rows of every 32-row Q/dO tile one wave's TDM moves
 LANES = range(32)
@@ -963,12 +966,13 @@ def headgroup_shape(B, Sq, Skv, Hq, Hkv, name):
 
 
 def fold_equivalence():
-    """R2: prodfold at the default target walks (folded head, tile) exactly like r3_a's b2h128."""
+    """R2: prodfold at target 128 walks (folded head, tile) exactly like r3_a's b2h128; prodfold at
+    the default target HEAD_GROUP walks like the contiguous b2h128 launch at the same target."""
     Bp, S, H = 2, 4096, 128
     for (lname, kind, nh, tiles), (lname2, kind2, nh2, tiles2) in zip(
             hg_launches(1, S, S, Bp * H, Bp * H), hg_launches(Bp, S, S, H, H)):
         ok((lname, kind, tiles) == (lname2, kind2, tiles2) and nh == Bp * nh2, "R2", "launch lists")
-        fold = hg_order(kind, 1, nh, tiles, HEAD_GROUP)
+        fold = hg_order(kind, 1, nh, tiles, B2H128_TARGET)
         ref = []                                   # r3_a grid (H, tiles, Bp) over BSHD b2 h128
         for z in range(Bp):
             for y in range(tiles):
@@ -978,8 +982,14 @@ def fold_equivalence():
         ok(fold == ref, "R2", f"{lname}: fold traversal != b2h128 traversal")
         old = hg_order(kind, 1, nh, tiles, 0)      # r3_a on the fold launch, for the record
         same = sum(a == b for a, b in zip(old, ref))
-        print(f"[R2] {lname}: prodfold@{HEAD_GROUP} == b2h128 order over {len(ref)} workgroups "
+        print(f"[R2] {lname}: prodfold@{B2H128_TARGET} == b2h128 order over {len(ref)} workgroups "
               f"(r3_a's fold order agrees at {same})", flush=True)
+        fold_d = hg_order(kind, 1, nh, tiles, HEAD_GROUP)
+        ref_d = hg_order(kind, Bp, nh2, tiles2, HEAD_GROUP)   # (bat*128 + h, tile) = folded head
+        ok(fold_d == ref_d, "R2", f"{lname}: fold@{HEAD_GROUP} != b2h128@{HEAD_GROUP} traversal")
+        agree = sum(a == b for a, b in zip(fold_d, ref))
+        print(f"[R2] {lname}: prodfold@{HEAD_GROUP} == b2h128@{HEAD_GROUP} order over {len(ref_d)} "
+              f"workgroups (agrees with r3_a's b2h128 order at {agree})", flush=True)
 
 
 def main(names):

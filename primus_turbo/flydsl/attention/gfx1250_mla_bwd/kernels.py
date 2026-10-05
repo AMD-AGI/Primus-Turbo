@@ -141,7 +141,7 @@ assert 32 % DKDV_NW == 0 and (DKDV_NW & (DKDV_NW - 1)) == 0, "TDM num_warps spli
 # head index z*hg + x = bat*nh + h. hg = nh is r3_a's grid and mapping exactly; hg = 128 on
 # the fold launch IS the b2h128 grid. Every workgroup still does the work of exactly one
 # (bat, head, tile) of r3_a (bounds_proof.py R1), so outputs are bitwise identical.
-HEAD_GROUP = 128
+HEAD_GROUP = 64
 
 
 def head_group(nh, target=HEAD_GROUP):
