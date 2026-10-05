@@ -50,6 +50,9 @@ print(c.shape)
 
 ### 1.2 Attention
 
+Backend selection, and what the FlyDSL kernels support on gfx1250 (MI455X), including
+DeepSeek-V3 MLA (q/k head dim 192, v head dim 128): [Attention Backends](./attention_backends.md).
+
 + Simple Attention
 ```python
 import torch
@@ -682,7 +685,11 @@ export PRIMUS_TURBO_AUTO_TUNE=1
 export PRIMUS_TURBO_GEMM_BACKEND=HIPBLASLT
 export PRIMUS_TURBO_GROUPED_GEMM_BACKEND=CK
 export PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND=DEEP_EP
+export PRIMUS_TURBO_ATTN_BACKEND=FLYDSL
 ```
+
+`PRIMUS_TURBO_ATTN_BACKEND` takes a backend name only (AutoTune for attention comes from
+`PRIMUS_TURBO_AUTO_TUNE=1`); see [Attention Backends](./attention_backends.md#1-selecting-a-backend).
 
 `PRIMUS_TURBO_*_BACKEND` also accepts `autotune` as a backend name, which enables
 AutoTune for that operator alone instead of the whole library. It composes with
