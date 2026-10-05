@@ -141,7 +141,7 @@ import weakref
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import arith, buffer_ops, range_constexpr
+from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Vector as Vec
 
@@ -316,7 +316,7 @@ def _store_f32_chunks(rsrc, base, vals):
         i += w
 
 
-def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float, cycles: int):
+def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float, cycles: int, save_scaled_q=False):
     packed_heads = NG * (NPG + 2)
     q_heads = NG * NPG
     q_groups_per_token = q_heads // _ROWS_PER_WAVE  # 4
@@ -380,6 +380,10 @@ def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float, cycles: int)
         sine_rsrc = buffer_ops.create_buffer_resource(SINE, max_size=True)
         qout_rsrc = buffer_ops.create_buffer_resource(QOUT, max_size=True)
         kout_rsrc = buffer_ops.create_buffer_resource(KOUT, max_size=True)
+        if const_expr(save_scaled_q):
+            # Forward otherwise leaves QRSTD unused. This optional output uses
+            # that ABI slot; the host still returns the cached eps scalar to bwd.
+            qs_rsrc = buffer_ops.create_buffer_resource(QRSTD, max_size=True)
 
         # gamma is loop invariant: 2 x dwordx4 per gamma tensor, selected once.
         qg_lo = buffer_ops.buffer_load(qg_rsrc, chunk, vec_width=_EPL, dtype=fx.BFloat16)
@@ -434,6 +438,13 @@ def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float, cycles: int)
             if is_q:
                 buffer_ops.buffer_store(_raw(v_lo), qout_rsrc, dst)
                 buffer_ops.buffer_store(_raw(v_hi), qout_rsrc, dst, soffset_bytes=_HALF * 2)
+                if const_expr(save_scaled_q):
+                    # Preserve BOTH boundaries: RoPE -> BF16 Q -> scaled BF16 Q.
+                    scale = Vec.filled(_EPL, 0.125 * 1.4426950408889634, fx.Float32)
+                    qs_lo = (v_lo.to(fx.Float32) * scale).to(fx.BFloat16)
+                    qs_hi = (v_hi.to(fx.Float32) * scale).to(fx.BFloat16)
+                    buffer_ops.buffer_store(_raw(qs_lo), qs_rsrc, dst)
+                    buffer_ops.buffer_store(_raw(qs_hi), qs_rsrc, dst, soffset_bytes=_HALF * 2)
             else:
                 buffer_ops.buffer_store(_raw(v_lo), kout_rsrc, dst)
                 buffer_ops.buffer_store(_raw(v_hi), kout_rsrc, dst, soffset_bytes=_HALF * 2)
@@ -900,9 +911,10 @@ def _compiled_fwd(
     NG: fx.Constexpr[int],
     NPG: fx.Constexpr[int],
     EPS: fx.Constexpr[float],
+    SAVE_Q: fx.Constexpr[bool],
     stream: fx.Stream,
 ):
-    kernel, slots = _make_fwd_kernel(S, B, NG, NPG, EPS, _FWD_GRID_CYCLES)
+    kernel, slots = _make_fwd_kernel(S, B, NG, NPG, EPS, _FWD_GRID_CYCLES, SAVE_Q)
     assert (_FWD_GRID_CYCLES * slots) % _WAVES == 0
     grid_x = _FWD_GRID_CYCLES * slots // _WAVES
     kernel(PACKED, QG, KG, COSINE, SINE, QOUT, KOUT, QRSTD, KRSTD).launch(
@@ -985,7 +997,7 @@ def _launch(compiled, key, kwargs_fn, args):
     state(args)
 
 
-def flydsl_qkv_rmsnorm_rope_forward(qkv, q_gamma, k_gamma, freqs, split_sizes, eps):
+def flydsl_qkv_rmsnorm_rope_forward(qkv, q_gamma, k_gamma, freqs, split_sizes, eps, return_scaled_q=False):
     """Raw forward entry point.
 
     General input-contract validation, including the row/lane tiling guard,
@@ -1002,15 +1014,34 @@ def flydsl_qkv_rmsnorm_rope_forward(qkv, q_gamma, k_gamma, freqs, split_sizes, e
     v = qkv[..., -_D:].contiguous()
     eps_f = float(eps)
     stream = torch.cuda.current_stream(qkv.device)
+    scaled_q = torch.empty_like(q) if return_scaled_q else None
     q_rstd = _eps_tensor(qkv.device, eps_f, stream)
     k_rstd = q_rstd
     # Q6: read the stream once and thread it into _cached_cos_sin (see
     # module docstring) instead of two independent current-stream queries.
     cosine, sine = _cached_cos_sin(freqs, stream)
-    args = (qkv, q_gamma, k_gamma, cosine, sine, q, k, q_rstd, k_rstd, S, B, NG, npg, eps_f, stream)
+    q_forward_slot = scaled_q if return_scaled_q else q_rstd
+    args = (
+        qkv,
+        q_gamma,
+        k_gamma,
+        cosine,
+        sine,
+        q,
+        k,
+        q_forward_slot,
+        k_rstd,
+        S,
+        B,
+        NG,
+        npg,
+        eps_f,
+        bool(return_scaled_q),
+        stream,
+    )
     _launch(
         _compiled_fwd,
-        ("fwd", qkv.device.index, S, B, NG, npg, eps_f, qkv.dtype),
+        ("fwd", qkv.device.index, S, B, NG, npg, eps_f, qkv.dtype, bool(return_scaled_q)),
         lambda: dict(
             PACKED=qkv,
             QG=q_gamma,
@@ -1019,18 +1050,20 @@ def flydsl_qkv_rmsnorm_rope_forward(qkv, q_gamma, k_gamma, freqs, split_sizes, e
             SINE=sine,
             QOUT=q,
             KOUT=k,
-            QRSTD=q_rstd,
+            QRSTD=q_forward_slot,
             KRSTD=k_rstd,
             S=S,
             B=B,
             NG=NG,
             NPG=npg,
             EPS=eps_f,
+            SAVE_Q=bool(return_scaled_q),
             stream=stream,
         ),
         args,
     )
-    return q, k, v, q_rstd, k_rstd
+    outputs = (q, k, v, q_rstd, k_rstd)
+    return outputs + (scaled_q,) if return_scaled_q else outputs
 
 
 def flydsl_qkv_rmsnorm_rope_backward(dq, dk, dv, qkv, q_gamma, k_gamma, freqs, q_rstd, k_rstd, split_sizes):

@@ -78,18 +78,33 @@ def fused_qkv_rope(
 
 class _FusedQKVRMSNormRoPEFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, qkv, q_gamma, k_gamma, freqs, qkv_split_arg_list, eps):
+    def forward(ctx, qkv, q_gamma, k_gamma, freqs, qkv_split_arg_list, eps, return_scaled_q=False):
         freqs = freqs.float().contiguous()
-        q, k, v, q_rstd, k_rstd = qk_rmsnorm_rope_fwd_impl(
-            qkv, q_gamma, k_gamma, freqs, qkv_split_arg_list, eps
+        outputs = qk_rmsnorm_rope_fwd_impl(
+            qkv, q_gamma, k_gamma, freqs, qkv_split_arg_list, eps, return_scaled_q=return_scaled_q
         )
+        q, k, v, q_rstd, k_rstd = outputs[:5]
         ctx.save_for_backward(qkv, q_gamma, k_gamma, freqs, q_rstd, k_rstd)
         ctx.qkv_split_arg_list = tuple(qkv_split_arg_list)
+        if return_scaled_q:
+            # Auxiliary cache only: all gradients flow through original Q/K/V.
+            # Avoid materializing a tensor of zeros for its unused gradient.
+            ctx.set_materialize_grads(False)
+            ctx.mark_non_differentiable(outputs[5])
+            return q, k, v, outputs[5]
         return q, k, v
 
     @staticmethod
-    def backward(ctx, dq, dk, dv):
+    def backward(ctx, dq, dk, dv, dscaled_q=None):
         qkv, q_gamma, k_gamma, freqs, q_rstd, k_rstd = ctx.saved_tensors
+        S, B, NG, _ = qkv.shape
+        D = ctx.qkv_split_arg_list[1]
+        if dq is None:
+            dq = qkv.new_zeros((S, B, NG * (ctx.qkv_split_arg_list[0] // D), D))
+        if dk is None:
+            dk = qkv.new_zeros((S, B, NG, D))
+        if dv is None:
+            dv = qkv.new_zeros((S, B, NG, D))
         dqkv, dq_gamma, dk_gamma = qk_rmsnorm_rope_bwd_impl(
             dq,
             dk,
@@ -102,7 +117,8 @@ class _FusedQKVRMSNormRoPEFunction(torch.autograd.Function):
             k_rstd,
             ctx.qkv_split_arg_list,
         )
-        return dqkv, dq_gamma, dk_gamma, None, None, None
+        gradients = (dqkv, dq_gamma, dk_gamma, None, None, None, None)
+        return gradients[: len(ctx.needs_input_grad)]
 
 
 def fused_qkv_rmsnorm_rope(
@@ -112,13 +128,18 @@ def fused_qkv_rmsnorm_rope(
     freqs: torch.Tensor,
     qkv_split_arg_list: Sequence[int],
     eps: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_scaled_q: bool = False,
+) -> Tuple[torch.Tensor, ...]:
     """Split packed GPT-OSS QKV while fusing per-head Q/K RMSNorm and RoPE.
 
     The normalization result and inverse-RoPE gradient are rounded to BF16 in
     registers, preserving the numerical boundaries of the unfused training path.
+    ``return_scaled_q`` additionally emits a nondifferentiable BF16 attention Q
+    cache after the original RoPE rounding; Q/K/V and their gradients are unchanged.
     """
     why = qk_rmsnorm_rope_shape_error(qkv, q_gamma, k_gamma, freqs, qkv_split_arg_list)
     if why is not None:
         raise ValueError(f"fused_qkv_rmsnorm_rope: unsupported input ({why})")
-    return _FusedQKVRMSNormRoPEFunction.apply(qkv, q_gamma, k_gamma, freqs, qkv_split_arg_list, float(eps))
+    return _FusedQKVRMSNormRoPEFunction.apply(
+        qkv, q_gamma, k_gamma, freqs, qkv_split_arg_list, float(eps), bool(return_scaled_q)
+    )

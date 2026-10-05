@@ -107,6 +107,7 @@ class FlashAttnFunc(torch.autograd.Function):
         sink: Optional[torch.Tensor] = None,
         qkv_format: Optional[str] = "bshd",
         backend: BackendType = BackendType.AITER,
+        q_for_backward: Optional[torch.Tensor] = None,
     ):
         ctx.backend = backend
         if backend == BackendType.TRITON:
@@ -192,6 +193,13 @@ class FlashAttnFunc(torch.autograd.Function):
             )
             out_s, lse = forward_result[:2]
             saved_q = forward_result[2] if save_q else q_s
+            if q_for_backward is not None:
+                assert not save_q and q_s.shape[-1] == 64
+                assert q_for_backward.shape == q.shape and q_for_backward.dtype == q.dtype
+                assert not q_for_backward.requires_grad, "prepared Q is a nondifferentiable cache"
+                saved_q = q_for_backward.permute(1, 0, 2, 3)
+                assert saved_q.is_contiguous()
+                save_q = True
             B, Sq, Hq = q.shape[0], q.shape[1], q.shape[2]
             if is_grad_enabled and _any_requires_grad(q, k, v, sink):
                 ctx.save_for_backward(saved_q, k_s, v_s, out_s, lse)
@@ -337,7 +345,8 @@ class FlashAttnFunc(torch.autograd.Function):
             )
             dq, dk, dv = (g.permute(1, 0, 2, 3) for g in grads[:3])
             # backward returns (dq,dk,dv), plus dsink when a sink was given.
-            return _flash_attn_grads(dq, dk, dv, None, grads[3] if len(grads) > 3 else None)
+            result = _flash_attn_grads(dq, dk, dv, None, grads[3] if len(grads) > 3 else None)
+            return result + (None,) * (len(ctx.needs_input_grad) - len(result))
 
         head_size_q_og = ctx.head_size_q_og
         head_size_v_og = ctx.head_size_v_og
@@ -536,6 +545,7 @@ def flash_attn_func(
     return_lse=False,
     return_attn_probs=False,
     sink: Optional[torch.Tensor] = None,
+    q_for_backward: Optional[torch.Tensor] = None,
 ):
     """q/k/v are ``[b, s, h, d]``-shaped; an sbhd caller passes a permuted view and permutes
     the result back. aiter reads the memory layout to allocate outputs and grads matching it;
@@ -563,7 +573,7 @@ def flash_attn_func(
         needs_backward=needs_backward,
     )
 
-    return FlashAttnFunc.apply(
+    arguments = (
         q,
         k,
         v,
@@ -582,6 +592,11 @@ def flash_attn_func(
         qkv_format,
         backend,
     )
+    # Prepared Q is an optimization hint for the native FlyDSL backward. Other
+    # backends still consume the unchanged Q input and use their normal path.
+    if q_for_backward is not None and backend == BackendType.FLYDSL:
+        return FlashAttnFunc.apply(*arguments, q_for_backward)
+    return FlashAttnFunc.apply(*arguments)
 
 
 def flash_attn_fp8_func(

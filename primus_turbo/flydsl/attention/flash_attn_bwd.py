@@ -39,9 +39,9 @@ _LOG2E = host_math.log2(host_math.e)
 # a second compute queue interferes with application communication (#520).
 _ATTN_SINGLE_STREAM = os.getenv("PRIMUS_TURBO_ATTN_SINGLE_STREAM", "0") == "1"
 _ATTN_Q_PREP = os.getenv("PRIMUS_TURBO_ATTN_Q_PREP", "standalone")
-if _ATTN_Q_PREP not in ("standalone", "odo", "inline", "inline_swa", "forward", "hybrid"):
+if _ATTN_Q_PREP not in ("standalone", "odo", "inline", "inline_swa", "forward", "hybrid", "producer"):
     raise ValueError(
-        "PRIMUS_TURBO_ATTN_Q_PREP must be standalone, odo, inline, inline_swa, forward, or hybrid"
+        "PRIMUS_TURBO_ATTN_Q_PREP must be standalone, odo, inline, inline_swa, forward, hybrid, or producer"
     )
 
 
