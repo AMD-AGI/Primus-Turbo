@@ -34,9 +34,6 @@ def main():
     cases = [(512, -1, 16), (512, 128, 16), (8192, -1, 1), (8192, 128, 1)]
     cases = [(seq, window, spike, False) for seq, window, spike in cases]
     cases.append((8192, -1, 1, True))
-    if os.getenv("PRIMUS_TURBO_ATTN_Q_PREP") in ("forward", "forward_hybrid"):
-        # Test the odd tail exactly before testing its native atomic variant.
-        cases += [(513, -1, 16, True), (513, -1, 16, False), (513, 128, 16, False)]
     for seq, window, spike, deterministic in cases:
         # Extra deterministic diagnostics must not change the native test inputs.
         rng_state = torch.cuda.get_rng_state() if deterministic else None
@@ -58,16 +55,6 @@ def main():
         ref = baseline.flydsl_varlen_backward(*args, **kwargs)
         repeat = baseline.flydsl_varlen_backward(*args, **kwargs)
         repeat_errors = [[relative_l2(b, a)] for a, b in zip(ref, repeat)]
-        if seq == 513 and window < 0 and not deterministic:
-            # One repeated atomic accumulation can coincide with the reference
-            # by chance. Measure baseline variability rather than changing the
-            # tolerance multiplier or attributing that variability to caching.
-            for _ in range(7):
-                repeated = baseline.flydsl_varlen_backward(*args, **kwargs)
-                for errors, expected, actual in zip(repeat_errors, ref, repeated):
-                    assert torch.isfinite(actual).all(), "nonfinite baseline repeat"
-                    errors.append(relative_l2(actual, expected))
-            del repeated
         if os.getenv("PRIMUS_TURBO_ATTN_Q_PREP") == "forward" or (
             os.getenv("PRIMUS_TURBO_ATTN_Q_PREP") == "forward_hybrid" and window < 0
         ):
@@ -159,8 +146,37 @@ def main():
         del original_q, public_out, public_grads
         if rng_state is not None:
             torch.cuda.set_rng_state(rng_state)
+    rejected_unaligned = []
+    if os.getenv("PRIMUS_TURBO_ATTN_Q_PREP") in ("forward", "forward_hybrid"):
+        # The baseline's ragged deterministic dQ was not reproducible in the
+        # campaign diagnostic. Do not use it as a gold reference or enable the
+        # experimental cache there; verify an explicit rejection before launch.
+        bad_q = torch.empty(513, 1, 64, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        bad_k = torch.empty(513, 1, 8, 64, device="cuda", dtype=torch.bfloat16)
+        bad_v = torch.empty_like(bad_k)
+        for window in (-1, 128):
+            try:
+                flash_attn_func(
+                    bad_q.permute(1, 0, 2, 3),
+                    bad_k.permute(1, 0, 2, 3),
+                    bad_v.permute(1, 0, 2, 3),
+                    causal=True,
+                    window_size=(window, 0),
+                )
+            except ValueError as error:
+                assert "64-aligned" in str(error)
+                rejected_unaligned.append(dict(sequence=513, window=window, entry="public"))
+            else:
+                raise AssertionError("unaligned experimental cache was not rejected")
+        try:
+            flash_attn_sbhd_flydsl_forward_impl(bad_q, bad_k, bad_v, return_lse=True, return_scaled_q=True)
+        except ValueError as error:
+            assert "64-aligned" in str(error)
+            rejected_unaligned.append(dict(sequence=513, entry="saved_q_forward"))
+        else:
+            raise AssertionError("unaligned saved-Q entry was not rejected")
     Path("/results/attention_backward_preflight.json").write_text(
-        json.dumps(dict(passed=True, cases=results), indent=2) + "\n"
+        json.dumps(dict(passed=True, cases=results, rejected_unaligned=rejected_unaligned), indent=2) + "\n"
     )
 
 

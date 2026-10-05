@@ -173,6 +173,14 @@ class FlashAttnFunc(torch.autograd.Function):
             assert _sbhd_layout(q, qkv_format), f"flydsl dense attention is sbhd only, got {qkv_format}"
             q_s, k_s, v_s = (t.permute(1, 0, 2, 3) for t in (q, k, v))
             q_prep = os.getenv("PRIMUS_TURBO_ATTN_Q_PREP", "standalone")
+            if (
+                q_prep in ("forward", "forward_hybrid")
+                and is_grad_enabled
+                and _any_requires_grad(q, k, v, sink)
+                and q_s.shape[-1] == 64
+                and (q_s.shape[0] != k_s.shape[0] or q_s.shape[0] % 64)
+            ):
+                raise ValueError("experimental Q caching requires equal, 64-aligned sequence lengths")
             save_q = (
                 (
                     q_prep == "forward"

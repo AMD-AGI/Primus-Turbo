@@ -5796,6 +5796,14 @@ def flydsl_varlen_backward(
     bottom-right causal + cross-segment masking). Grid tiles by max_seqlen_q/kv. D in
     {64,128}; no learned sink on this path."""
     varlen = cu_seqlens_q is not None
+    if (
+        (q_is_scaled or _ATTN_Q_PREP in ("forward", "forward_hybrid"))
+        and sbhd
+        and not varlen
+        and D == 64
+        and (Sq != Skv or Sq % 64)
+    ):
+        raise ValueError("experimental Q caching requires equal, 64-aligned sequence lengths")
     st = torch.cuda.current_stream()
     assert not q_is_scaled or (sbhd and not varlen and D == 64)
     inline_q = _inline_q_for(sbhd, varlen, D, -1 if Skv - 1 <= window_left else window_left)
