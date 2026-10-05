@@ -39,8 +39,8 @@ _LOG2E = host_math.log2(host_math.e)
 # a second compute queue interferes with application communication (#520).
 _ATTN_SINGLE_STREAM = os.getenv("PRIMUS_TURBO_ATTN_SINGLE_STREAM", "0") == "1"
 _ATTN_Q_PREP = os.getenv("PRIMUS_TURBO_ATTN_Q_PREP", "standalone")
-if _ATTN_Q_PREP not in ("standalone", "odo", "inline", "inline_swa"):
-    raise ValueError("PRIMUS_TURBO_ATTN_Q_PREP must be standalone, odo, inline, or inline_swa")
+if _ATTN_Q_PREP not in ("standalone", "odo", "inline", "inline_swa", "forward"):
+    raise ValueError("PRIMUS_TURBO_ATTN_Q_PREP must be standalone, odo, inline, inline_swa, or forward")
 
 
 def _inline_q_for(sbhd, varlen, head_dim, window_left):
@@ -5803,6 +5803,7 @@ def flydsl_varlen_backward(
     max_seqlen_q=None,
     max_seqlen_kv=None,
     deterministic=False,
+    q_is_scaled=False,
 ):
     """Run the 16x16x32 flydsl bwd.
     THD (sbhd=False): q,dout,dq,out:[B*Sq,Hq,D]; k,v,dk,dv:[B*Skv,Hkv,D].
@@ -5823,9 +5824,15 @@ def flydsl_varlen_backward(
     {64,128}; no learned sink on this path."""
     varlen = cu_seqlens_q is not None
     st = torch.cuda.current_stream()
-    fuse_q = _ATTN_Q_PREP == "odo" and sbhd and not varlen and D == 64
+    assert not q_is_scaled or (sbhd and not varlen and D == 64)
+    fuse_q = not q_is_scaled and _ATTN_Q_PREP == "odo" and sbhd and not varlen and D == 64
     inline_q = _inline_q_for(sbhd, varlen, D, -1 if Skv - 1 <= window_left else window_left)
-    qf = q.reshape(-1) if inline_q else (torch.empty_like(q).reshape(-1) if fuse_q else _prescale_q(q, scale))
+    assert not (q_is_scaled and inline_q), "saved forward Q is already scaled"
+    qf = (
+        q.reshape(-1)
+        if inline_q or q_is_scaled
+        else (torch.empty_like(q).reshape(-1) if fuse_q else _prescale_q(q, scale))
+    )
     odo_q = dict(q=q.reshape(-1), qs=qf) if fuse_q else {}
     kf, vf, dof = k.reshape(-1), v.reshape(-1), dout.reshape(-1)
     o16 = out.to(q.dtype).reshape(-1)

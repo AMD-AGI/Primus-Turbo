@@ -6,6 +6,8 @@ Timing results are deliberately left to the PyTorch-profiled training workload.
 
 import importlib.util
 import json
+import math
+import os
 import sys
 from pathlib import Path
 
@@ -26,7 +28,10 @@ def main():
     spec.loader.exec_module(baseline)
     torch.manual_seed(30279)
     results = []
-    for seq, window, spike in [(512, -1, 16), (512, 128, 16), (8192, -1, 1), (8192, 128, 1)]:
+    cases = [(512, -1, 16), (512, 128, 16), (8192, -1, 1), (8192, 128, 1)]
+    if os.getenv("PRIMUS_TURBO_ATTN_Q_PREP") == "forward":
+        cases += [(513, -1, 16), (513, 128, 16)]
+    for seq, window, spike in cases:
         batch, hq, hkv, dim = 4, 64, 8, 64
         q = torch.randn(seq, batch, hq, dim, device="cuda", dtype=torch.bfloat16)
         k = torch.randn(seq, batch, hkv, dim, device="cuda", dtype=torch.bfloat16)
@@ -44,7 +49,27 @@ def main():
         kwargs = dict(sbhd=True, window_left=window, sink=sink)
         ref = baseline.flydsl_varlen_backward(*args, **kwargs)
         repeat = baseline.flydsl_varlen_backward(*args, **kwargs)
-        candidate = flydsl_varlen_backward(*args, **kwargs)
+        if os.getenv("PRIMUS_TURBO_ATTN_Q_PREP") == "forward":
+            original_q = q.clone()
+            saved_out, saved_lse, scaled_q = flash_attn_sbhd_flydsl_forward_impl(
+                q,
+                k,
+                v,
+                return_lse=True,
+                window_size=(window, 0),
+                sink=sink,
+                return_scaled_q=True,
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(q, original_q), "forward modified its Q input"
+            assert torch.equal(scaled_q, torch.mul(q, 0.125 * math.log2(math.e))), "saved Q rounding mismatch"
+            assert torch.equal(out, saved_out), "saving Q changed forward output"
+            assert torch.equal(lse, saved_lse.view(batch, seq, hq).permute(0, 2, 1)), "saving Q changed LSE"
+            saved_args = (dout, scaled_q, k, v, out, lse, batch, seq, seq, hq, hkv, dim, 0.125)
+            candidate = flydsl_varlen_backward(*saved_args, **kwargs, q_is_scaled=True)
+            del original_q, saved_out, saved_lse, scaled_q, saved_args
+        else:
+            candidate = flydsl_varlen_backward(*args, **kwargs)
         torch.cuda.synchronize()
         gradients = {}
         for name, expected, repeated, actual in zip(("dq", "dk", "dv", "dsink"), ref, repeat, candidate):
