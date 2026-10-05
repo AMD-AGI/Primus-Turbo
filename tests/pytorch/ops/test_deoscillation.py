@@ -7,6 +7,7 @@
 import pytest
 import torch
 
+from primus_turbo.pytorch.core.utils import is_gfx950
 from primus_turbo.pytorch.ops.deoscillation import (
     weight_deosc_close,
     weight_deosc_qdq,
@@ -14,6 +15,12 @@ from primus_turbo.pytorch.ops.deoscillation import (
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP required")
+
+# Only the direct MXFP4 QDQ kernel requires gfx950. Tracking, closure, and
+# input-validation coverage must continue running on gfx942 CI workers.
+requires_direct_qdq = pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx950()), reason="direct deosc QDQ requires gfx950"
+)
 
 
 def test_weight_deosc_update_matches_pytorch():
@@ -138,6 +145,7 @@ def _state_like(master):
         (5760, 2880, 5760 * 2880 - 17, 2880 * 96 + 31),
     ],
 )
+@requires_direct_qdq
 def test_direct_qdq_seed_matches_forward(rows, cols, start, n, mode):
     gen = torch.Generator(device="cuda").manual_seed(101)
     master = torch.randn(n, device="cuda", generator=gen) * 0.037
@@ -157,6 +165,7 @@ def test_direct_qdq_seed_matches_forward(rows, cols, start, n, mode):
 @pytest.mark.parametrize("mode", [0, 1, 2])
 @pytest.mark.parametrize("count_enabled", [False, True])
 @pytest.mark.parametrize("start,n", [(31, 8193), (0, 8192), (2, 8192)])
+@requires_direct_qdq
 def test_direct_qdq_multiple_windows_match_reference(mode, count_enabled, start, n):
     gen = torch.Generator(device="cuda").manual_seed(202)
     master = torch.randn(n, device="cuda", generator=gen) * 0.01
@@ -207,6 +216,7 @@ def test_direct_qdq_multiple_windows_match_reference(mode, count_enabled, start,
 
 
 @pytest.mark.parametrize("n", [1, 1024, 1025, 4096, 4097])
+@requires_direct_qdq
 def test_direct_qdq_count_full_and_partial_blocks(n):
     master = torch.zeros(n, device="cuda")
     state = _state_like(master)
@@ -218,6 +228,7 @@ def test_direct_qdq_count_full_and_partial_blocks(n):
     assert count.item() == n
 
 
+@requires_direct_qdq
 def test_direct_qdq_empty_and_non_default_stream():
     master = torch.empty(0, device="cuda")
     weight_deosc_qdq(master, *_state_like(master), 32, 32, 0, seed=True)
@@ -240,6 +251,7 @@ def test_direct_qdq_rejects_overlapping_state():
 
 @pytest.mark.parametrize("mode", [0, 1, 2])
 @pytest.mark.parametrize("value", [0.0, 1e-35, 1e-20, 1e20, float("inf"), float("nan")])
+@requires_direct_qdq
 def test_direct_qdq_special_scales(mode, value):
     master = torch.full((1024,), value, device="cuda")
     master[1::2].neg_()
@@ -250,6 +262,7 @@ def test_direct_qdq_special_scales(mode, value):
     torch.testing.assert_close(state[1], expected, rtol=0, atol=0, equal_nan=True)
 
 
+@requires_direct_qdq
 def test_direct_qdq_unaligned_contiguous_views():
     # Tensor contiguity does not imply vector-load alignment.
     master = torch.randn(8194, device="cuda")[1:-1]
@@ -265,6 +278,7 @@ def test_direct_qdq_unaligned_contiguous_views():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="two GPUs required")
+@requires_direct_qdq
 def test_direct_qdq_uses_tensor_device():
     with torch.cuda.device(0):
         master = torch.ones(1024, device="cuda:1")
@@ -277,3 +291,12 @@ def test_direct_qdq_rejects_unaligned_columns():
     master = torch.ones(1024, device="cuda")
     with pytest.raises(RuntimeError, match="cols must be divisible by 32"):
         weight_deosc_qdq(master, *_state_like(master), 32, 61, 0, seed=True)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or is_gfx950(), reason="requires a GPU without direct QDQ support"
+)
+def test_direct_qdq_rejects_unsupported_architecture():
+    master = torch.ones(1024, device="cuda")
+    with pytest.raises(RuntimeError, match="direct deosc QDQ currently requires gfx950"):
+        weight_deosc_qdq(master, *_state_like(master), 32, 32, 0, seed=True)
