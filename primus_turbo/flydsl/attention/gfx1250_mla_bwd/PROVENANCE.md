@@ -8,8 +8,10 @@ the environment (removed later; see Packaging).
 
 The sections follow the development rounds. Code comments refer to them by label: `bwd_c1` (the
 port below, with the dQ chain serial on the caller's stream), `r1_b`, `r2_a`, `r2_b`, `r3_a`,
-`r4_a`, `r4_c`, `r5_oe3` / `r5_oe4` and `r5_hg64`. Shapes named here and in the comments,
-(B, Sq, Skv, Hq, Hkv), all causal:
+`r4_a`, `r4_c`, `r5_oe3` / `r5_oe4`, `r5_hg64`, `r8_oe6` and `r9_a`; labels of the form
+`rR.iI.gG` (`r5.i3.g17`, `r5.i4.g18`, `r6.i1.g21`, `r6.i2.g22`) name candidates of the automated
+tuning job (round, iteration, generation) that `r8_oe6` adopted. Shapes named here and in the
+comments, (B, Sq, Skv, Hq, Hkv), all causal:
 
 | name | shape | note |
 |---|---|---|
@@ -362,3 +364,91 @@ anyway; bounds_proof.py binds its replay helpers' loop variables as default argu
 the argument lists the formatter wraps). Every file's AST other than those lint edits is unchanged,
 and so are the compiled kernels (code hash, registers, spills, LDS, instruction count, in all 41
 variants) and the bounds proof's per-check counts.
+
+## Rounds 5-6 of the tuning job, r8_oe6: P/dS from registers, whole-line k_delta and dq stores
+
+Source: rounds 5 and 6 of the same automated tuning job, adopted unchanged as hand round 8. Base:
+r5_hg64 (the job's round-5 champion r5.i4.g18 is r5_hg64's launch on r5_oe4's binaries). All four
+kernels are new binaries; dq, dk and dv are bitwise identical to r5_hg64's at prod.
+
+- r5.i4.g18 (impl.py): the head-group launch default 64 moves from kernels.HEAD_GROUP (back to 128,
+  r4_a's value, still the R2 reference target of bounds_proof.py) to `impl.HEAD_GROUP_DEFAULT`, so a
+  launch-only change leaves kernels.py, and with it every kernel's JIT key, alone. The launch is
+  r5_hg64's.
+- r5.i3.g17 (`_dkdv_impl`: k_dkdv64 and the one-wave k_dkdv): S = Q K^T and dP = dO V^T, the operands
+  of the former S^T / dP^T WMMAs swapped (same registers; the per-element sum is unchanged). Their C
+  layout (lane = kv row, element si = query row hh*16 + half*8 + si) makes the bf16 pack of P (dS) per
+  kv sub-tile the dV (dK) WMMA operand directly, so the 8 P/dS `ds_store_b128`, the 8 A-operand
+  `ds_load_tr16_b128` and the P/dS LDS tiles are gone (k_dkdv64 LDS 75776 -> 64512 B). The softmax
+  reads its per-row constants per element (8 query rows per lane) from two new k_delta outputs,
+  NL = -LOG2E*lse and ND = -scale*delta ([B, H, S] fp32 each, 8 `buffer_load_b128` per iteration):
+  bitwise the fp32 products k_dkdv64 formed per lane before.
+- r6.i1.g21 (k_delta): grid (Sq/32, B*Hq) instead of (B*Sq*Hq/32); a workgroup owns 32 consecutive
+  queries of one head, so each of DEL / NL / ND gets one whole 128-B line per workgroup (before: 32
+  one-lane 4-B stores Sq*4 B apart). Row sums are bitwise unchanged (same lane mapping, FMA chains and
+  reduction); the 32 sums meet in LDS behind one barrier. impl.py allocates nl / nd (2 x 4 MiB at prod)
+  and requires Sq % 32 == 0 (implied by Sq % 64).
+- r6.i2.g22 (k_dqg96 and the k_dqg head): dQ^T = wmma(K^T tile, dS pack), the mirror image of the
+  previous dQ WMMA (bitwise identical on gfx1250), so the C fragment holds 8 consecutive d of one query
+  row. The epilogue stages each wave's dQ tile as a row-major image (row stride 400 B) in the dead K/V
+  ring (k_dqg96: one more workgroup sync first) and writes it back with `buffer_store_b128`s of 4 whole
+  128-B lines each: per k_dqg96 wave 36 stores instead of 288 2-byte stores (epilogue 1356 -> 441
+  instructions).
+- bounds_proof.py: K3 rewritten for the NL/ND vec4 loads; new D1 (k_delta: every row read once, every
+  [B, H, S] element written once, at the element of the row it summed; LDS slots), E1 (dq image writes
+  and reads, every 8-lane run of a store one aligned 128-B line); W2 replays the k_dqg96 epilogue sync
+  (mutation N5, the sync dropped, is caught).
+- Compile-only: k_delta 28 VGPR; k_dkdv64 890 VGPR with 13 SGPR->VGPR lane spills (outside both loops);
+  k_dqg96 872; k_dqg 710; 0 VGPR spill, 0 scratch.
+- Job measurements (contiguous b2 h128, same process as its round-5 champion): prod x0.9730 (x0.9721
+  in a second session), proxy x0.964, prod under a GEMM-loaded ruler (the training clock regime)
+  x0.962. Hand A/B through the fold launch the Turbo adapter uses (real activations, same process as
+  r5_hg64): x0.9712 back to back, x0.9626 under the GEMM-loaded ruler; random inputs x0.9725-0.9730 /
+  x0.9625-0.9670.
+
+## Round 9, r9_a: whole-line k_dkdv64 epilogue (dV^T / dK^T + row-major LDS images)
+
+Base: r8_oe6. Lever: r6.i2.g22's dq mechanism applied to dK/dV. r8_oe6's epilogue wrote dK/dV as 40
+`buffer_store_b128` of 16 kv rows x 32 B each per wave (640 32-B write segments per wave).
+
+- kernels.py `_body` (both loops): dV^T += dO^T P = wmma(A = dO tile, B = P pack) and dK^T += Q^T dS,
+  r5.i3.g17's dV/dK WMMAs with the operands swapped (same registers; bitwise-neutral, as in r5.i3.g17
+  and r6.i2.g22). The C fragment now holds kv row kh*16 + row x 8 consecutive d; the 72 A-operand
+  reuse hints became 72 B-operand reuse hints.
+- Epilogue (after the unchanged tensor_wait(0) and, for k_dkdv64, the exit barrier): each C fragment
+  -> 8 bf16 -> ONE `ds_store_b128` into this wave's row-major images, dV [32][D_V] at row stride 272 B
+  and dK [32][D_QK] at row stride 400 B (21504 B per wave; both waves inside the 64512-B ring
+  allocation); then per 4-row block the dV lines, then the dK lines, each a `ds_load_b128` followed by
+  its `buffer_store_b128`, so every 8-lane run of a store is one aligned 128-B line and one store
+  covers 4 lines: 160 line requests per wave instead of 640 segments. No new barrier (the images are
+  wave-local and one wave's DS operations execute in order). Interleaving the two images per row
+  block compiles to 15 `s_wait_xcnt` (all dV then all dK: 21).
+- Compile-only: k_dkdv64 868 VGPR (r8_oe6 890), 106 SGPR, 0 SGPR->VGPR lane spills (13), 0 VGPR
+  spill, 0 scratch, LDS 64512 B; full loop 539 instructions (544); epilogue 40 `ds_store_b128`, 40
+  `ds_load_b128`, 40 `buffer_store_b128`. k_delta, k_dqg96 and k_dqg are byte-identical to r8_oe6's.
+- bounds_proof.py: new EK replaces K3's column-major image checks: the waves' images disjoint and
+  inside the allocation, every data byte written exactly once, every whole-line read reads only bytes
+  its own wave wrote, each once, every store writes exactly the (kv, d) its image bytes hold, every
+  8-lane run one aligned 128-B line, DS immediates < 64 KiB, source ties incl. the swapped WMMA
+  operands; six negative controls (EKN1..EKN6) must each be caught. K5 is replayed through EK's store
+  map.
+- dq, dk and dv are bitwise identical to r8_oe6's. Same process through the fold launch (real
+  activations): x0.9798 of r8_oe6 back to back, x0.9711 under the GEMM-loaded ruler (random inputs
+  x0.9731-0.9735 / x0.9650-0.9660); k_dkdv64 alone x0.948 / x0.940.
+
+## Integration: r9_a on the package
+
+kernels.py, impl.py and bounds_proof.py are three-way merges (base r5_hg64, this package, r9_a) that
+keep the package's own changes (small-grid fallback, relative imports, MODULE_KNOBS, license header,
+formatting and lint fixes). With the same packaging edits removed, the kernels.py AST equals r9_a's.
+
+- k_delta, k_dkdv64, k_dqg96 and k_dqg have r9_a's binaries (code hash, registers, spills, LDS and
+  instruction count) in every compiled launch variant; the launch plans of prod, prodfold and proxy
+  equal r9_a's, and every plan equals the previous package's except the k_delta grid.
+- The one-wave k_dkdv of the small-grid fallback is the nw = 1 instantiation of the same
+  `_dkdv_impl`, so it now carries r5.i3.g17 (no P/dS tiles, NL/ND per element) and r9_a's epilogue
+  (one image at offset 0 of the ring allocation, no barrier): a new binary, 924 VGPR, 107 SGPR, 5
+  SGPR->VGPR lane spills, 0 VGPR spill, 0 scratch, LDS 64512 B (was 70656); its ISA is byte-identical
+  to r9_a's own nw = 1 instantiation. bounds_proof.py replays its epilogue through EK as well
+  (one wave, image at 0) and keeps the one-wave ring replay (K1-K5).
+- impl.py passes nl / nd to both k_dkdv launches and the new k_delta grid; the dQ chain is unchanged.

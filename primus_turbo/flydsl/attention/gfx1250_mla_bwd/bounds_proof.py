@@ -50,13 +50,16 @@ whole-tile TDM, the single-wave ring of bwd_c1/r1_b with no barrier: K2 in-order
       tensorcnt) and waits TW_QDO / 0 (in-order retirement), replayed for both waves. The full
       loop prefetches tile min(ii+3, n-1) into stage ii%3 right after BARRIER(ii) (behind the
       readback); the prologue fills stages 0, 1 before its RAW barrier and stage 2 after it.
-  K3  k_dkdv LDS reads (readback, tr16, P/dS) inside written bytes; DS immediates < 64 KiB;
-      per-wave P/dS tiles and epilogue images disjoint, inside the allocation / dead ring;
-      K/V fragment and LSE/delta loads in bounds (each wave its own kv rows).
+  K3  k_dkdv LDS reads (readback, B-operand tr16) inside written bytes; DS immediates < 64 KiB;
+      the allocation is the Q/dO ring only (r5.i3.g17: P/dS reach the dV/dK WMMAs from the S/dP
+      accumulators, no P/dS tiles; the epilogue images inside it are EK's);
+      K/V fragment loads and the NL/ND vec4 loads (k_delta's -LOG2E*lse / -scale*delta at q rows
+      q0 + hh*16 + half*8 + [0, 8), 16-B aligned) in bounds (each wave its own kv rows).
   K4  causal split at WORKGROUP level (block id only): for EACH wave's 32 kv rows, query
       pairs < qp_start fully masked, pairs >= qp_start + nmaskp fully unmasked; division-free
       (qi, gh) counters == (ii // G, ii % G) for every ii.
-  K5  dk/dv: every output element written exactly once (all workgroups, both waves, lanes).
+  K5  dk/dv: every output element written exactly once (all workgroups, both waves, lanes), replayed
+      through EK's store map (bwd_r9_a).
   K6  k_dkdv64 barrier protocol: both waves run one program (no wave-dependent branch or trip
       count: source scan of _dkdv_impl), so per wave #barriers == 2*G*nmaskp + 2 + n_full + 1;
       phase model (ops between two barriers run in any cross-wave order, the barrier's release
@@ -89,6 +92,28 @@ whole-tile TDM, the single-wave ring of bwd_c1/r1_b with no barrier: K2 in-order
       wave, barrier epochs across waves; N = 1..160 plus every shape's trip counts. Mutations
       (drain dropped, readback above the barrier, wait one stage too deep, TDM above the WAR
       barrier) must each be caught (N1..N4).
+  EK  k_dkdv64 epilogue (bwd_r9_a; replaces K3's EPI_CB column-major image checks): dV^T/dK^T C fragments
+      (lane (row, half): kv row kh*16 + row, d = dtile*16 + half*8 + [0, 8)) -> ONE ds_store_b128 each into
+      per-wave ROW-major images, dV [32][D_V] at row stride XV_ROW_B at w*EPI_W, dK [32][D_QK] at row
+      stride XK_ROW_B at w*EPI_W + EPI_DK: the images of the two waves disjoint and inside the 64512-B
+      allocation, every data byte of each image written exactly once (pad never); every whole-line read
+      (lane l: kv row 4rb + l//8, bytes li*128 + (l%8)*16) reads only bytes its own wave wrote, each
+      exactly once, 8 consecutive d of one kv row; its store (vec8 index base + (kv0 + 4rb + l//8)*rs +
+      li*8 + l%8) writes element ((bat*Skv + kv0 + kv)*Hkv + hkv)*D + d of exactly the (kv, d) the image
+      byte holds; byte offsets inside nv_b / nk_b and < 2^31; every 8-lane run of a store is one aligned
+      128-B line; DS immediates < 64 KiB; source ties for every replayed formula incl. the swapped WMMA
+      operands. Negative controls EKN1..EKN6 (48-B row stride, no half*16, lrow/lcol swapped, dK at
+      XV_ROW_B/D_V, both waves at offset 0, li*64) must each be caught.
+      The one-wave k_dkdv (nw = 1, small-grid fallback) runs the same epilogue with its one image at 0
+      (allocation max(TDM_DEPTH*QDO_B, EPI_W) = the ring): replayed the same way (EK_STORES_NW[1]).
+  E1  dq epilogue (r6.i2.g22): the per-wave row-major dQ image [BQW][D_QK] at row stride DQ_IMG_ROW_B,
+      wave w at w*BQW*DQ_IMG_ROW_B: every write (lane (row, half): row qh*16 + row, bytes dtile*32 +
+      half*16, 16 B) inside the wave's image and the images of the waves disjoint and inside the ring
+      allocation; every whole-line read (lane l: row 4rb + l//8, bytes li*128 + (l%8)*16) reads only
+      bytes this wave wrote, each image byte read exactly once; the global store of that read is
+      element ((bat*Sq + q0 + 4rb + l//8)*Hq + qh)*D_QK + li*64 + (l%8)*8 + [0, 8): the SAME (q, d)
+      the image byte holds (so the store set is today's, checked by Q5); each 8-lane run of a store
+      is one aligned 128-B line; W2 replays the epilogue barrier (mutation N5 drops it: caught).
   R1  head-group launch (bwd_r4_a; kernels.HEAD_GROUP / head_group, impl._plan): for every launched
       kernel (k_dkdv64 over Hkv, k_dqg96 and the head k_dqg over Hq) and every target in
       R_TARGETS, hg = head_group(nh, target) divides nh, the grid (hg, tiles, B*nh/hg) has the
@@ -101,11 +126,19 @@ whole-tile TDM, the single-wave ring of bwd_c1/r1_b with no barrier: K2 in-order
       workgroups of one head on one XCD (linear id % 8 constant), counted. In the one_wave set the
       single k_dqg over [0, Sq) is head-grouped the same way, and the one-wave k_dkdv has no head
       group (grid (Hkv, Skv/32, B), (bat, hkv) = (block_idx.z, block_idx.x), source-tied).
+  D1  k_delta (r6.i1.g21): grid (Sq/ROWS_DELTA, B*Hq); workgroup (sblk, bh) reads BSHD rows
+      (b*Sq + sblk*32 + u*16 + row_in_group)*Hq + h, 16 lanes x one vec8 tile each, in bounds; over
+      the grid every row is read exactly once (its 16 tiles exactly once); the LDS gather index
+      u*16 + row_in_group is in [0, ROWS_DELTA) and each slot is written by exactly one row; wave 0's
+      lane l reads slot l and writes element bh*Sq + sblk*32 + l of DEL / ND / NL (and reads LSE
+      there) -- the incumbent's (b*Hq + h)*Sq + s of the row it summed -- in bounds, every (b,h,s)
+      exactly once; the other waves' store index is n_rows (past every buffer); source ties.
   R2  traversal equivalence: on the fold launch [1, s, 256, d] (prodfold) at target 128 (bwd_r4_a's
-      default) the sequence of (folded head b*128 + h, tile) over the linear workgroup id equals the
-      sequence r3_a's b2 h128 launch walks, for k_dkdv64, k_dqg96 and k_dqg; at the default target
-      HEAD_GROUP (bwd_r5_hg64: 64) it equals the sequence the contiguous b2 h128 launch walks at that
-      same target; and at target 0 the grids and decodes are r3_a's for every shape.
+      default, kernels.HEAD_GROUP) the sequence of (folded head b*128 + h, tile) over the linear
+      workgroup id equals the sequence r3_a's b2 h128 launch walks, for k_dkdv64, k_dqg96 and k_dqg;
+      at the launch default impl.HEAD_GROUP_DEFAULT (r5.i4.g18 / bwd_r5_hg64: 64) it equals the
+      sequence the contiguous b2 h128 launch walks at that same target; and at target 0 the grids
+      and decodes are r3_a's for every shape. The launch default is read from impl.py (source tie).
 """
 
 import pathlib
@@ -133,25 +166,38 @@ g = C.get
 D_QK, D_V, BLOCK_KV, KV_STEP, TDM_DEPTH = g("D_QK"), g("D_V"), g("BLOCK_KV"), g("KV_STEP"), g("TDM_DEPTH")
 XK, XV, S_ROW_B, LDS_SEG = g("XK_ROW_B"), g("XV_ROW_B"), g("S_ROW_B"), g("LDS_SEG")
 QOFF, QDO_B, TDM_OPS_QDO, TW_QDO = g("QOFF"), g("QDO_B"), g("TDM_OPS_QDO"), g("TW_QDO")
-NDT_QK, NDT_V, NDO_QK, NDO_V, NKV, EPI_CB = (
-    g("NDT_QK"),
-    g("NDT_V"),
-    g("NDO_QK"),
-    g("NDO_V"),
-    g("NKV"),
-    g("EPI_CB"),
-)
+NDT_QK, NDT_V, NDO_QK, NDO_V, NKV = g("NDT_QK"), g("NDT_V"), g("NDO_QK"), g("NDO_V"), g("NKV")
+EPI_DK, EPI_LINE_B, DK0 = g("EPI_DK"), g("EPI_LINE_B"), g("DK0")
+assert "EPI_CB" not in C, "bwd_r9_a: the column-major EPI_CB images are gone"
 DQ_BQW, VOFF, KV_B, TDM_OPS_KV, DQT_TW = g("DQ_BQW"), g("VOFF"), g("KV_B"), g("TDM_OPS_KV"), g("DQT_TW")
 RD_ORDER, NKT, NQW = g("_RD_ORDER"), g("NKT"), g("NQW")
 DQ_BQW48, NQW48, dq_split = g("DQ_BQW48"), g("NQW48"), g("dq_split")
 DQ_NWAVE, DQ_BQW96 = g("DQ_NWAVE"), g("DQ_BQW96")
 segs = g("_pow2_segments")
 DKDV_NW, PDS_B, EPI_W, BAR_KH = g("DKDV_NW"), g("PDS_B"), g("EPI_W"), g("BAR_KH")
-HEAD_GROUP, head_group = g("HEAD_GROUP"), g("head_group")
+head_group = g("head_group")
+# The launch default target is impl.py's (r5.i4.g18), not kernels.HEAD_GROUP: read it from the source, tied
+# to the one line that applies it, so the proof covers the target the launcher actually uses.
+_IMPL_TXT = (HERE / "impl.py").read_text()
+_m_def = re.findall(r"^HEAD_GROUP_DEFAULT = (\d+)$", _IMPL_TXT, re.M)
+assert (
+    len(_m_def) == 1
+    and len(
+        re.findall(
+            r'^HEAD_GROUP = int\(os\.environ\.get\("FLY_BWD_HEAD_GROUP", str\(HEAD_GROUP_DEFAULT\)\)\)$',
+            _IMPL_TXT,
+            re.M,
+        )
+    )
+    == 1
+), "impl.py launch default target (source tie)"
+HEAD_GROUP = int(_m_def[0])  # the launch default target (impl.HEAD_GROUP_DEFAULT)
+B2H128_TARGET = g(
+    "HEAD_GROUP"
+)  # kernels.HEAD_GROUP = bwd_r4_a's default: prodfold at 128 IS r3_a's b2h128 grid (R2)
 R_TARGETS = (0, 8, 16, 24, 32, 64, 96, 128, 256)
-B2H128_TARGET = 128  # bwd_r4_a's default: prodfold at 128 IS r3_a's b2h128 grid (R2)
-assert HEAD_GROUP in R_TARGETS and B2H128_TARGET in R_TARGETS
-ALLOC_KV = LDS_SEG + DKDV_NW * PDS_B
+assert HEAD_GROUP in R_TARGETS and B2H128_TARGET in R_TARGETS and B2H128_TARGET == 128
+ALLOC_KV = max(TDM_DEPTH * QDO_B, DKDV_NW * EPI_W)  # r5.i3.g17: the ring only (no P/dS tiles)
 ROWS_W = 32 // DKDV_NW  # rows of every 32-row Q/dO tile one wave's TDM moves
 LANES = range(32)
 
@@ -356,53 +402,24 @@ for lane in LANES:
             a = lr * XK + lc * 2 + imm
             DS_IMM.append(imm)
             ok(written(SPAN_K, QOFF, a, a + 16), "K3", f"b_q tr16 {a}")
-    # P/dS tiles [32 q][BLOCK_KV kv] bf16 at LDS_SEG + w*PDS_B (+32*S_ROW_B for dS), per wave
-    for hh in range(2):
-        for kh in range(NKV):
-            off = (hh * 16 + row) * S_ROW_B + kh * 32 + half * 16
-            ok(off + 16 <= 32 * S_ROW_B and (off % S_ROW_B) + 16 <= BLOCK_KV * 2, "K3", "P/dS store")
-    for kh in range(NKV):
-        for r2 in (0, 16):
-            a = lr * S_ROW_B + lc * 2 + kh * 32 + r2 * S_ROW_B
-            ok(a + 16 <= 32 * S_ROW_B and (a % S_ROW_B) + 16 <= BLOCK_KV * 2, "K3", "P/dS tr16")
-    # epilogue images: per kh dV [D_V rows] then dK [D_QK rows], EPI_CB bytes per d row
-    for kh in range(NKV):
-        ev = kh * (D_V + D_QK) * EPI_CB
-        ek = ev + D_V * EPI_CB
-        for dtile in range(max(NDO_V, NDO_QK)):
-            o = (dtile * 16 + row) * EPI_CB + half * 16
-            if dtile < NDO_V:
-                ok(ev + o + 16 <= ek, "K3", "dV image store")
-            if dtile < NDO_QK:
-                ok(ek + o + 16 <= ek + D_QK * EPI_CB, "K3", "dK image store")
-            ok(o % EPI_CB + 16 <= 32, "K3", "image store stays in the 32 B kv row")
-        for sub in range(max(NDO_V, NDO_QK)):
-            a = (sub * 16 + lr) * EPI_CB + lc * 2
-            if sub < NDO_V:
-                ok(ev + a + 16 + 0 <= ek and (a % EPI_CB) + 16 <= 32, "K3", "dV image tr16")
-            if sub < NDO_QK:
-                ok(ek + a + 16 <= ek + D_QK * EPI_CB, "K3", "dK image tr16")
+    # r5.i3.g17: no P/dS tiles -- P^T / dS^T reach the dV/dK WMMAs from the S/dP accumulators
+    # bwd_r9_a: the epilogue images (row-major, whole-line readback) are checked by EK below
 ok(
-    NKV * (D_V + D_QK) * EPI_CB == EPI_W and DKDV_NW * EPI_W <= TDM_DEPTH * QDO_B <= LDS_SEG,
+    ALLOC_KV == TDM_DEPTH * QDO_B and 2 * ALLOC_KV <= 320 * 1024,
     "K3",
-    "per-wave epilogue images [w*EPI_W, (w+1)*EPI_W) disjoint, inside the dead ring",
+    "allocation = the Q/dO ring (no P/dS tiles, r5.i3.g17); 2 workgroups/CU fit",
 )
 ok(
-    PDS_B == 2 * 32 * S_ROW_B and LDS_SEG + DKDV_NW * PDS_B == ALLOC_KV and ALLOC_KV <= 160 * 1024,
+    max(DS_IMM) < 65536 and max(hi for _, hi in RD_KV) <= QDO_B and TDM_DEPTH * QDO_B <= ALLOC_KV,
     "K3",
-    "per-wave P/dS tiles [LDS_SEG + w*PDS_B, +PDS_B) disjoint, inside the allocation; 2 workgroups/CU fit",
+    f"DS immediate {max(DS_IMM)}; every readback inside its stage, every stage inside the allocation",
 )
+# one-wave k_dkdv (nw = 1): the same allocation formula, max(TDM_DEPTH*QDO_B, 1*EPI_W) = the ring; its
+# single epilogue image (EK) at 0, whole-tile TDM (rows [0, 32))
 ok(
-    max(DS_IMM) < 65536 and 2 * QDO_B + max(DS_IMM) + 16 <= LDS_SEG + 2 * 32 * S_ROW_B,
+    max(TDM_DEPTH * QDO_B, 1 * EPI_W) == ALLOC_KV and EPI_W <= TDM_DEPTH * QDO_B,
     "K3",
-    f"DS immediate {max(DS_IMM)}",
-)
-# one-wave k_dkdv (nw = 1): allocation LDS_SEG + PDS_B, its P/dS tiles at LDS_SEG (wave 0's slot
-# above) and its epilogue image at 0 (wave 0's image above), whole-tile TDM (rows [0, 32))
-ok(
-    EPI_W <= TDM_DEPTH * QDO_B and LDS_SEG + PDS_B <= ALLOC_KV and LDS_SEG + PDS_B <= 80 * 1024,
-    "K3",
-    "nw = 1: epilogue image inside the dead ring, P/dS tiles inside the 70656 B allocation",
+    "nw = 1: allocation = the Q/dO ring, its epilogue image inside it",
 )
 
 # k_dqg LDS reads relative to the stage base
@@ -558,6 +575,233 @@ ok(
 )
 
 
+# ------------------------------------------------------------- k_dkdv64 epilogue (EK)
+# bwd_r9_a: dV^T / dK^T C fragments -> per-wave ROW-major images (dV [32][D_V] at row stride XV at +0,
+# dK [32][D_QK] at row stride XK at +EPI_DK, wave w at w*EPI_W) -> whole-line ds_load_b128 (lane l: kv
+# row 4rb + l//8, bytes li*128 + (l%8)*16) -> buffer_store_b128 of the same 16 B at vec8 index
+# base + (kv0 + 4rb + l//8)*rs + li*8 + l%8. Source ties (inside _dkdv_impl) for every formula replayed.
+DV8_QK_, DV8_V_ = g("DV8_QK"), g("DV8_V")
+for _pat in (
+    r"v8f,\s+_ir\(b_do\[dtile\]\),\s+_ir\(a_p\),\s+acc\[kh \* NDO_V \+ dtile\],"
+    r"\s+reuseA=False,\s+reuseB=\(dtile > 0\),?\s*\)\.result",
+    r"v8f,\s+_ir\(b_q\[dtile\]\),\s+_ir\(a_ds\),\s+acc\[DK0 \+ kh \* NDO_QK \+ dtile\],"
+    r"\s+reuseA=False,\s+reuseB=\(dtile > 0\),?\s*\)\.result",
+    r"\n    _epi0 = _lds0\n",
+    r"\n        _epi0 = _lds0 \+ wv \* fx\.Int32\(EPI_W\)\n",
+    r"wr_v = _epi0 \+ row \* fx\.Int32\(XV_ROW_B\) \+ half \* fx\.Int32\(16\)\n",
+    r"wr_k = _epi0 \+ fx\.Int32\(EPI_DK\) \+ row \* fx\.Int32\(XK_ROW_B\) \+ half \* fx\.Int32\(16\)\n",
+    r"ov = fx\.Vector\(out\[kh \* NDO_V \+ dtile\]\)\n",
+    r"ok_ = fx\.Vector\(out\[DK0 \+ kh \* NDO_QK \+ dtile\]\)\n",
+    r"create_llvm_ptr\(wr_v \+ fx\.Int32\(kh \* 16 \* XV_ROW_B \+ dtile \* 32\), address_space=3\),?\s*\)\n",
+    r"create_llvm_ptr\(wr_k \+ fx\.Int32\(kh \* 16 \* XK_ROW_B \+ dtile \* 32\), address_space=3\),?\s*\)\n",
+    r"lrow = lane // fx\.Int32\(8\) ",
+    r"lcol = lane % fx\.Int32\(8\) ",
+    r"rd_v = _epi0 \+ lrow \* fx\.Int32\(XV_ROW_B\) \+ lcol \* fx\.Int32\(16\)\n",
+    r"rd_k = _epi0 \+ fx\.Int32\(EPI_DK\) \+ lrow \* fx\.Int32\(XK_ROW_B\) \+ lcol \* fx\.Int32\(16\)\n",
+    r"for rb in range_constexpr\(BLOCK_KV // 4\):\n",
+    r"gt_v = base_v \+ \(kv0 \+ fx\.Int32\(rb \* 4\) \+ lrow\) \* rs_v \+ lcol\n",
+    r"gt_k = base_k \+ \(kv0 \+ fx\.Int32\(rb \* 4\) \+ lrow\) \* rs_k \+ lcol\n",
+    r"for li in range_constexpr\(D_V \* 2 // EPI_LINE_B\):\n",
+    r"for li in range_constexpr\(D_QK \* 2 // EPI_LINE_B\):\n",
+    r"rd_v \+ fx\.Int32\(rb \* 4 \* XV_ROW_B \+ li \* EPI_LINE_B\), address_space=3\),?\s*\)\s*\)\n"
+    r"\s+_stv\(\s*\[vv\[e\] for e in range_constexpr\(8\)\],\s+g_dv8,\s+gt_v \+ fx\.Int32\(li \* \(EPI_LINE_B // 16\)\),",
+    r"rd_k \+ fx\.Int32\(rb \* 4 \* XK_ROW_B \+ li \* EPI_LINE_B\), address_space=3\),?\s*\)\s*\)\n"
+    r"\s+_stv\(\s*\[kk\[e\] for e in range_constexpr\(8\)\],\s+g_dk8,\s+gt_k \+ fx\.Int32\(li \* \(EPI_LINE_B // 16\)\),",
+    r"g_dv8 = _bv\(DV_, nv_b, fx\.BFloat16, 8\)\n",
+    r"g_dk8 = _bv\(DK, nk_b, fx\.BFloat16, 8\)\n",
+    r"nk_b = B_ \* Skv \* Hkv \* fx\.Int32\(D_QK \* 2\) ",
+    r"nv_b = nk_b if SAME_D else B_ \* Skv \* Hkv \* fx\.Int32\(D_V \* 2\) ",
+    r"rs_k = Hkv \* fx\.Int32\(DV8_QK\) ",
+    r"base_k = bat \* Skv \* rs_k \+ hkv \* fx\.Int32\(DV8_QK\)\n",
+    r"rs_v = rs_k if SAME_D else Hkv \* fx\.Int32\(DV8_V\)\n",
+    r"base_v = base_k if SAME_D else bat \* Skv \* rs_v \+ hkv \* fx\.Int32\(DV8_V\)\n",
+    r"smem = fx\.SharedAllocator\(\)\.allocate\(max\(TDM_DEPTH \* QDO_B, nw \* EPI_W\)\)\n",
+):
+    ok(len(re.findall(_pat, _DKDV_SRC)) == 1, "EK", f"kernels.py _dkdv_impl source tie {_pat[:60]}")
+ok(
+    EPI_DK == 32 * XV
+    and EPI_W == 32 * XV + 32 * XK
+    and EPI_LINE_B == 128
+    and DKDV_NW * EPI_W <= ALLOC_KV
+    and (2 * D_V) % EPI_LINE_B == 0
+    and (2 * D_QK) % EPI_LINE_B == 0
+    and BLOCK_KV % 4 == 0,
+    "EK",
+    "image geometry",
+)
+ok(DK0 == NKV * NDO_V, "EK", "dK accumulators follow the dV ones")
+# epilogue DS immediates (image offset folded in, worst case): writes kh*16*R + dtile*32, reads 4rb*R + li*128
+_ek_imm = [
+    EPI_DK * (k == "k") + (NKV - 1) * 16 * r + (n - 1) * 32
+    for k, r, n in (("v", XV, NDO_V), ("k", XK, NDO_QK))
+]
+_ek_imm += [
+    EPI_DK * (k == "k") + (BLOCK_KV // 4 - 1) * 4 * r + (2 * d // EPI_LINE_B - 1) * EPI_LINE_B
+    for k, r, d in (("v", XV, D_V), ("k", XK, D_QK))
+]
+ok(
+    max(_ek_imm) + 16 <= EPI_W and max(_ek_imm) < 65536,
+    "EK",
+    f"epilogue DS immediates {max(_ek_imm)} < 64 KiB",
+)
+# bank groups of the image row starts (perf, not safety): 16 distinct 4-bank groups for the 16 rows of
+# one ds_store_b128 half-wave (dV rows 68r, dK rows 100r dwords)
+for _r in (XV, XK):
+    ok(len({(r * _r // 4) % 64 // 4 for r in range(16)}) == 16, "EK", f"image row bank groups {_r}")
+
+EK_MUTS = (
+    ("EKN1", "stride48"),
+    ("EKN2", "no_half"),
+    ("EKN3", "lrow_lcol"),
+    ("EKN4", "dk_as_dv"),
+    ("EKN5", "wave0"),
+    ("EKN6", "li64"),
+)
+
+
+def ek_image(mut=None, nw=DKDV_NW):
+    """EK, LDS side, for one workgroup (its nw waves; workgroup-independent): replay the 40 image writes
+    and the 40 whole-line reads of every lane. Returns the store list [(w, key, rb, li, lane, lrow, lcol,
+    kv_local, d0)]: lane `lane` of wave w stores the 8 bf16 of kv row kv0 + kv_local, d0 + [0, 8) that its
+    read returned. mut (negative controls, each must raise): stride48 (both images at the old EPI_CB 48 B
+    row stride), no_half (write address without half*16), lrow_lcol (lrow = lane%4, lcol = lane//4),
+    dk_as_dv (dK image at XV row stride and D_V width), wave0 (both waves' images at offset 0), li64
+    (read at li*64 instead of li*128)."""
+    m = mut or ""
+    holds = {}  # LDS byte -> (wave, tensor, kv_local, d)
+    read = set()
+    stores = []
+    alloc = max(TDM_DEPTH * QDO_B, nw * EPI_W)  # kernels._dkdv_impl's allocation (source-tied above)
+    ok(alloc == ALLOC_KV, "EK", f"nw = {nw}: allocation {alloc}")
+    for w in range(nw):
+        base = 0 if m == "wave0" else w * EPI_W  # _epi0: _lds0 (nw = 1) / _lds0 + wv*EPI_W
+        ok(0 <= base and base + EPI_W <= alloc, "EK", "wave image area inside the allocation")
+        for key, off, rstride, d_img, ndo, acc0 in (
+            ("v", 0, 48 if m == "stride48" else XV, D_V, NDO_V, 0),
+            (
+                "k",
+                EPI_DK,
+                48 if m == "stride48" else (XV if m == "dk_as_dv" else XK),
+                D_V if m == "dk_as_dv" else D_QK,
+                NDO_QK,
+                DK0,
+            ),
+        ):
+            d_true = D_V if key == "v" else D_QK
+            img = base + off
+            img_end = img + 32 * rstride
+            ok(img_end <= base + EPI_W, "EK", "image inside the wave's area")
+            # writes: accumulator acc0 + kh*ndo + dtile of lane (row, half) = C of dV^T / dK^T: kv row
+            # kh*16 + row, d = dtile*16 + half*8 + e (A = dO^T / Q^T rows = d, B = P / dS columns = kv)
+            for lane in LANES:
+                row, half = lane_rc(lane)
+                for kh in range(NKV):
+                    for dtile in range(ndo):
+                        a = (
+                            img
+                            + (kh * 16 + row) * rstride
+                            + dtile * 32
+                            + (0 if m == "no_half" else half * 16)
+                        )
+                        ok(
+                            a % 16 == 0 and img <= a and a + 16 <= img_end,
+                            "EK",
+                            "image write inside its image",
+                        )
+                        ok((a - img) % rstride + 16 <= 2 * d_img, "EK", "image write in the row's data bytes")
+                        for e in range(8):
+                            for byte in (a + 2 * e, a + 2 * e + 1):
+                                ok(byte not in holds, "EK", "image byte written twice")
+                                holds[byte] = (w, key, kh * 16 + row, dtile * 16 + half * 8 + e)
+            nbytes = sum(1 for v in holds.values() if v[0] == w and v[1] == key)
+            ok(nbytes == 32 * 2 * d_true, "EK", f"{key} image: every data byte written once")
+            # reads (whole-line order) and the store each one feeds
+            lstep = 64 if m == "li64" else EPI_LINE_B
+            for rb in range(BLOCK_KV // 4):
+                for li in range(2 * d_img // EPI_LINE_B):
+                    for lane in LANES:
+                        lrow, lcol = (lane % 4, lane // 4) if m == "lrow_lcol" else (lane // 8, lane % 8)
+                        a = img + (4 * rb + lrow) * rstride + li * lstep + lcol * 16
+                        ok(a % 16 == 0, "EK", "ds_load_b128 16-B aligned")
+                        cells = []
+                        for e in range(8):
+                            for byte in (a + 2 * e, a + 2 * e + 1):
+                                ok(
+                                    byte in holds and holds[byte][0] == w and byte not in read,
+                                    "EK",
+                                    "image read: written by this wave, read once",
+                                )
+                                read.add(byte)
+                            cells.append(holds[a + 2 * e])
+                        kvl, d0 = cells[0][2], cells[0][3]
+                        ok(
+                            all(c[1] == key and c[2] == kvl and c[3] == d0 + e for e, c in enumerate(cells)),
+                            "EK",
+                            "16 B read = 8 consecutive d of one kv row of this tensor",
+                        )
+                        stores.append((w, key, rb, li, lane, lrow, lcol, kvl, d0))
+    ok(read == set(holds), "EK", "every image byte read exactly once")
+    ok(len(stores) == nw * 32 * (BLOCK_KV // 4) * (2 * D_V + 2 * D_QK) // EPI_LINE_B, "EK", "40 stores/wave")
+    return stores
+
+
+def ek_stores(stores, B, Skv, Hkv, bat, hkv, kv0g, written_kv=None):
+    """EK, global side, for workgroup (bat, hkv, kv0g): every store's vec8 index (the kernel's formula)
+    is the element of (kv0 + kv_local, d0) the image held; byte offsets inside the true extents nv_b /
+    nk_b and < 2^31; every run of 8 consecutive lanes (8j .. 8j+7) of one store is one aligned 128-B line.
+    K5 tallies."""
+    lines = {}
+    nb = {"v": B * Skv * Hkv * D_V * 2, "k": B * Skv * Hkv * D_QK * 2}
+    ok(nb["k"] < (1 << 31) and nb["v"] < (1 << 31), "EK", "i32 byte extents nk_b / nv_b")
+    for w, key, rb, li, lane, lrow, lcol, kvl, d0 in stores:
+        d, dv8 = (D_V, DV8_V_) if key == "v" else (D_QK, DV8_QK_)
+        rs = Hkv * dv8
+        base = bat * Skv * rs + hkv * dv8
+        kv0 = kv0g + w * BLOCK_KV
+        gt = base + (kv0 + rb * 4 + lrow) * rs + li * (EPI_LINE_B // 16) + lcol
+        el = gt * 8
+        ok(el == ((bat * Skv + kv0 + kvl) * Hkv + hkv) * d + d0, "EK", "store element == image (kv, d)")
+        ok(
+            0 <= el and 2 * (el + 8) <= nb[key] and 16 * gt < (1 << 31),
+            "EK",
+            "store bytes inside nv_b / nk_b, < 2^31",
+        )
+        lines.setdefault((w, key, rb, li, lane // 8), []).append(16 * gt)  # 8 consecutive lanes
+        if written_kv is not None:
+            for e in range(8):
+                ok(0 <= el + e < B * Skv * Hkv * d, "K5", "dk/dv store")
+                written_kv[key][el + e] = written_kv[key].get(el + e, 0) + 1
+    for starts in lines.values():
+        lo = min(starts)
+        ok(
+            lo % EPI_LINE_B == 0 and sorted(starts) == list(range(lo, lo + EPI_LINE_B, 16)),
+            "EK",
+            "each 8-lane run of a store is one aligned 128-B line",
+        )
+
+
+EK_STORES = ek_image()
+# per launched k_dkdv width: k_dkdv64 (DKDV_NW waves) and the one-wave k_dkdv (small-grid fallback)
+EK_STORES_NW = {DKDV_NW: EK_STORES, 1: ek_image(nw=1)}
+
+
+def ek_selftest():
+    """EK negative controls: each mutation must be caught by ek_image or by ek_stores on a prod workgroup."""
+    for tag, mut in EK_MUTS:
+        snap = dict(COUNT)
+        caught = False
+        try:
+            st = ek_image(mut)
+            ek_stores(st, 2, 4096, 128, 1, 127, 64)
+        except AssertionError as ex:
+            caught = True
+            why = str(ex)
+        COUNT.clear()
+        COUNT.update(snap)
+        ok(caught, tag, f"EK mutation {mut} not caught")
+        print(f"  EK mutation {tag} {mut}: caught ({why[:70]})", flush=True)
+
+
 # ------------------------------------------------------------------- k_dkdv replay
 def dkdv_shape(B, Sq, Skv, Hq, Hkv, causal, written_kv, nw=DKDV_NW):
     """nw = DKDV_NW: k_dkdv64 (grid (Hkv, Skv/64, B)); nw = 1: k_dkdv (grid (Hkv, Skv/32, B))."""
@@ -616,12 +860,26 @@ def dkdv_shape(B, Sq, Skv, Hq, Hkv, causal, written_kv, nw=DKDV_NW):
                     return (qt, gh)
 
                 def ldl(qt, gh, bat=bat, hkv=hkv):
+                    # kernels._dkdv_impl._ldl (r5.i3.g17): lane (row, half) loads NL and ND elements
+                    # base_l + q0 + hh*16 + half*8 + 4u + [0, 4) as one 16-B vec4 (u = 0, 1);
+                    # byte offset = voffset 32*half + soffset 4*(base_l + q0) + 64*hh + 16u
                     qh = hkv * G + gh
                     base_l = (bat * Hq + qh) * Sq
                     for hh in range(2):
-                        for row in range(16):
-                            idx = base_l + qt * 32 + hh * 16 + row
-                            ok(0 <= idx < ldl_max, "K3", "LSE/delta index")
+                        for half in range(2):
+                            for u in range(2):
+                                e0 = base_l + qt * 32 + hh * 16 + half * 8 + 4 * u
+                                ok(
+                                    4 * e0 == 32 * half + 4 * (base_l + qt * 32) + 64 * hh + 16 * u,
+                                    "K3",
+                                    "NL/ND voffset + soffset split",
+                                )
+                                ok(e0 % 4 == 0, "K3", "NL/ND vec4 16-B aligned")
+                                ok(
+                                    0 <= e0 and e0 + 4 <= ldl_max and 4 * (e0 + 4) < (1 << 31),
+                                    "K3",
+                                    "NL/ND index",
+                                )
 
                 if NW == 1:
                     # k_dkdv (nw = 1, bwd_c1/r1_b's instruction stream: no barrier; one wave issues
@@ -738,7 +996,7 @@ def dkdv_shape(B, Sq, Skv, Hq, Hkv, causal, written_kv, nw=DKDV_NW):
                     # K6: every wave took the same barriers, as many as the protocol says
                     nb_exp = 2 * G * nmaskp + 2 + n + 1
                     ok(all(x == nb_exp for x in ring.nbar), "K6", f"barriers {ring.nbar} != {nb_exp}")
-                # K/V fragments of each wave's tile, dk/dv epilogue stores (vec8 index)
+                # K/V fragments of each wave's tile (vec8 index); the dk/dv epilogue stores: EK below
                 rs_k, rs_v = Hkv * D_QK // 8, Hkv * D_V // 8
                 base_k = bat * Skv * rs_k + hkv * D_QK // 8
                 base_v = bat * Skv * rs_v + hkv * D_V // 8
@@ -759,32 +1017,25 @@ def dkdv_shape(B, Sq, Skv, Hq, Hkv, causal, written_kv, nw=DKDV_NW):
                                                 "K/V frag",
                                             )
                                             ok((tt * 8) % d + 8 <= d, "K3", "K/V frag inside its row")
-                            for sub in range(max(NDO_V, NDO_QK)):
-                                for base, rs, nd, d, key in (
-                                    (base_v, rs_v, NDO_V, D_V, "v"),
-                                    (base_k, rs_k, NDO_QK, D_QK, "k"),
-                                ):
-                                    if sub < nd:
-                                        t = base + (kv0 + kh * 16 + row) * rs + sub * 2 + half
-                                        for e in range(8):
-                                            el = t * 8 + e
-                                            ok(0 <= el < B * Skv * Hkv * d, "K5", "dk/dv store")
-                                            written_kv[key][el] = written_kv[key].get(el, 0) + 1
+                # EK + K5: the workgroup's whole-line epilogue stores (every wave), tallied per element
+                ek_stores(EK_STORES_NW[NW], B, Skv, Hkv, bat, hkv, kv0g, written_kv)
 
 
 def dkdv_cover(B, Sq, Skv, Hq, Hkv, nw=DKDV_NW):
-    """K5 exactly-once over ALL workgroups, by closed form (cheap): each (bat, hkv, bid, w, kh,
-    row, sub, half) writes 8 consecutive elements of row kv0g + 32w + 16kh + row; the map is
-    injective and onto the workgroup's nw*32 kv rows x d."""
-    for key, d, nd in (("v", D_V, NDO_V), ("k", D_QK, NDO_QK)):
+    """K5 exactly-once over ALL workgroups, by closed form (cheap; bwd_r9_a whole-line epilogue): each
+    store (bat, hkv, bid, w, rb, li, lane) writes 8 consecutive elements of kv row kv0g + 32w + 4rb +
+    lane//8, columns li*64 + (lane%8)*8 (EK_STORES: the replayed stores); the map is injective and onto
+    the workgroup's nw*32 kv rows x d (nw = 1: the one-wave k_dkdv's 32), so with R1's bijective (bat, hkv, bid) decode every element of
+    dk/dv is written exactly once."""
+    for key, d in (("v", D_V), ("k", D_QK)):
         seen = set()
-        for w in range(nw):
-            for kvr in range(BLOCK_KV):  # kh*16 + row
-                for sub in range(nd):
-                    for half in range(2):
-                        c = (sub * 2 + half) * 8  # column of the 8-element run
-                        ok(c + 8 <= d, "K5", "run inside the row")
-                        seen.add((w * BLOCK_KV + kvr, c))
+        for w, k_, rb, li, lane, lrow, lcol, kvl, d0 in EK_STORES_NW[nw]:
+            if k_ != key:
+                continue
+            c = li * (EPI_LINE_B // 2) + lcol * 8  # column of the 8-element run
+            ok(c + 8 <= d and (kvl, d0) == (4 * rb + lrow, c), "K5", "run inside the row")
+            ok((w * BLOCK_KV + kvl, c) not in seen, "K5", "run written twice")
+            seen.add((w * BLOCK_KV + kvl, c))
         ok(len(seen) == nw * BLOCK_KV * d // 8, "K5", f"d{key} tile coverage {len(seen)}")
 
 
@@ -812,7 +1063,7 @@ def ring2_events(N, nwave, mut=None):
     """Program-order event list per wave of k_dqg96 (kernels._dqg_tdm_impl, nwave > 1):
     ('tdm', stage, tile) | ('twait', n) | ('dscnt0',) | ('bar',) | ('read', stage, tile, kind) |
     ('use', kind) (a WMMA consuming that read kind: the compiler's s_wait_dscnt) | ('end',).
-    mut: None, 'no_drain', 'read_above_bar', 'deep_wait', 'tdm_above_bar'."""
+    mut: None, 'no_drain', 'read_above_bar', 'deep_wait', 'tdm_above_bar', 'no_epi_bar'."""
     TW = DQT_TW
     out = {}
     for w in range(nwave):
@@ -833,6 +1084,10 @@ def ring2_events(N, nwave, mut=None):
                 ev.append(("read", ncur, min(i + 1, N - 1), "rb"))
             ev.append(("use", "tr"))  # dQ WMMAs
         ev.append(("twait", 0))
+        if mut != "no_epi_bar":  # r6.i2.g22 epilogue: _wg_sync
+            ev.append(("dscnt0",))
+            ev.append(("bar",))
+        ev.append(("imgw",))  # the dQ image overwrites the ring
         ev.append(("end",))
         out[w] = ev
     if mut == "tdm_above_bar":
@@ -856,6 +1111,7 @@ def ring2_check(N, nwave, mut=None):
     # per wave: annotate epoch (barriers passed) and completion indices
     writes = []  # (stage, half, tile, wave, issue_pos, done_pos)  pos = (wave, idx, epoch)
     reads = []  # (stage, tile, wave, issue_pos, done_pos, kind)
+    imgw = []  # positions of the dQ image writes (r6.i2.g22)
     nbar = {}
     for w, ev in evs.items():
         ep = 0
@@ -895,6 +1151,8 @@ def ring2_check(N, nwave, mut=None):
                 open_reads = []
             elif e[0] == "bar":
                 ep += 1
+            elif e[0] == "imgw":
+                imgw.append(pos)
             elif e[0] == "end":
                 if q:
                     raise Viol(f"wave {w} ends with TDM in flight")
@@ -924,18 +1182,28 @@ def ring2_check(N, nwave, mut=None):
                     f"RAW: {kind} of stage {st} half {half} by wave {w} expects tile {tile}, "
                     f"sees {None if seen is None else seen[2]}"
                 )
+    # r6.i2.g22: the dQ image may overwrite any ring byte, so every wave's every TDM write and every
+    # ring read must be complete before every wave's image write
+    for p_ in imgw:
+        for x in writes:
+            if not hb(x[5], p_):
+                raise Viol(f"epilogue: image write {p_} not after TDM of wave {x[3]} (stage {x[0]})")
+        for r in reads:
+            if not hb(r[4], p_):
+                raise Viol(f"epilogue: image write {p_} not after ring read of wave {r[2]} (stage {r[0]})")
     return nbar[0]
 
 
 def ring2_selftest():
     for N in range(1, 161):
         nb = ring2_check(N, DQ_NWAVE)
-        ok(nb == N + 1, "W2", f"barriers {nb} for N {N}")
+        ok(nb == N + 2, "W2", f"barriers {nb} for N {N}")  # + the epilogue sync (r6.i2.g22)
     for tag, mut in (
         ("N1", "no_drain"),
         ("N2", "read_above_bar"),
         ("N3", "deep_wait"),
         ("N4", "tdm_above_bar"),
+        ("N5", "no_epi_bar"),
     ):
         caught = 0
         for N in (1, 2, 3, 4, 7, 32):
@@ -945,6 +1213,88 @@ def ring2_selftest():
                 caught += 1
         ok(caught > 0, tag, f"mutation {mut} not caught")
         print(f"  mutation {tag} {mut}: caught at {caught}/6 trip counts", flush=True)
+
+
+DQ_IMG_ROW_B, DQ_LINE_EL, DV8_QK = g("DQ_IMG_ROW_B"), g("DQ_LINE_EL"), g("DV8_QK")
+for _pat in (
+    r"img = _lds0 \+ wv \* fx\.Int32\(BQW \* DQ_IMG_ROW_B\)\n",
+    r"create_llvm_ptr\(\s*img\s+\+ \(fx\.Int32\(qh_ \* 16\) \+ row\) \* fx\.Int32\(DQ_IMG_ROW_B\)"
+    r"\s+\+ fx\.Int32\(dtile \* 32\)\s+\+ half \* fx\.Int32\(16\),\s+address_space=3,?\s*\)",
+    r"rd0 = img \+ lrow \* fx\.Int32\(DQ_IMG_ROW_B\) \+ lcol \* fx\.Int32\(16\)\n",
+    r"gt = \(\(bat \* Sq \+ q0 \+ fx\.Int32\(rb \* 4\) \+ lrow\) \* Hq \+ qh\) \* fx\.Int32\(DV8_QK\) \+ lcol\n",
+    r"rd0 \+ fx\.Int32\(rb \* 4 \* DQ_IMG_ROW_B \+ li \* 128\), address_space=3\),?\s*\)\s*\)\n"
+    r"\s+_stv\(\s*\[vv\[e\] for e in range_constexpr\(8\)\],\s+g_dq8,\s+gt \+ fx\.Int32\(li \* \(DQ_LINE_EL // 8\)\),",
+    r"v8f, _ir\(b_ks\[dtile\]\), _ir\(a_ds\), acc\[qh_ \* NDO_QK \+ dtile\],",
+    r"v8f,\s+_ir\(b_ks\[dtile\]\),\s+_ir\(a_ds\[qh_\]\),\s+acc\[qh_ \* NDO_QK \+ dtile\],",
+):
+    ok(len(re.findall(_pat, SRC)) == 1, "E1", f"kernels.py source tie {_pat[:60]}")
+ok(
+    DQ_IMG_ROW_B % 16 == 0
+    and DQ_IMG_ROW_B >= D_QK * 2
+    and (D_QK * 2) % 128 == 0
+    and DQ_LINE_EL * 2 == 128
+    and D_QK % DQ_LINE_EL == 0,
+    "E1",
+    "image row / line geometry",
+)
+ok(
+    len({(36 * r) % 64 for r in range(16)}) == 16 and DQ_IMG_ROW_B // 4 % 64 == 36,
+    "E1",
+    "image rows 36r mod 64 dwords: 16 distinct 4-bank groups",
+)
+
+
+def dq_epilogue(B, Sq, Hq, bat, qh, q0, nqw, w, nwave, written_q):
+    """E1 + Q5 for one wave (r6.i2.g22): replay the image writes and the whole-line reads/stores."""
+    bqw = 16 * nqw
+    base = (w * bqw * DQ_IMG_ROW_B) if nwave > 1 else 0
+    alloc = TDM_DEPTH * KV_B
+    ok(
+        nwave * bqw * DQ_IMG_ROW_B <= alloc and base + bqw * DQ_IMG_ROW_B <= alloc,
+        "E1",
+        "per-wave images disjoint, inside the ring allocation",
+    )
+    holds = {}  # image byte -> (q, d) of the bf16 it holds
+    for lane in LANES:
+        row, half = lane_rc(lane)
+        for qh_ in range(nqw):
+            for dtile in range(NDO_QK):
+                a = base + (qh_ * 16 + row) * DQ_IMG_ROW_B + dtile * 32 + half * 16
+                ok(a % 16 == 0 and base <= a and a + 16 <= base + bqw * DQ_IMG_ROW_B, "E1", "image write")
+                for e in range(8):  # C of dQ^T: q row qh_*16 + row, d = dtile*16 + half*8 + e
+                    for byte in (a + 2 * e, a + 2 * e + 1):
+                        ok(byte not in holds, "E1", "image byte written twice")
+                        holds[byte] = (q0 + qh_ * 16 + row, dtile * 16 + half * 8 + e)
+    read = set()
+    for rb in range(bqw // 4):
+        lines = {}
+        for lane in LANES:
+            lrow, lcol = lane // 8, lane % 8
+            for li in range(D_QK // DQ_LINE_EL):
+                a = base + (rb * 4 + lrow) * DQ_IMG_ROW_B + li * 128 + lcol * 16
+                gt = ((bat * Sq + q0 + rb * 4 + lrow) * Hq + qh) * DV8_QK + lcol + li * (DQ_LINE_EL // 8)
+                for e in range(8):
+                    for byte in (a + 2 * e, a + 2 * e + 1):
+                        ok(byte in holds and byte not in read, "E1", "image read: written by this wave, once")
+                        read.add(byte)
+                    q, d = holds[a + 2 * e]
+                    el = gt * 8 + e
+                    ok(
+                        el == (bat * Sq + q) * Hq * D_QK + qh * D_QK + d,
+                        "E1",
+                        "store element == image (q, d)",
+                    )
+                    ok(0 <= el < B * Sq * Hq * D_QK and el * 2 < (1 << 30), "Q5", "dq store")
+                    written_q[el] = written_q.get(el, 0) + 1
+                lines.setdefault((li, lrow), []).append(gt * 16)
+        for key, starts in lines.items():
+            lo = min(starts)
+            ok(
+                lo % 128 == 0 and sorted(starts) == list(range(lo, lo + 128, 16)),
+                "E1",
+                "each 8-lane run is one aligned 128-B line",
+            )
+    ok(len(read) == len(holds) == bqw * D_QK * 2, "E1", "every image byte read exactly once")
 
 
 def dqg_shape(B, Sq, Skv, Hq, Hkv, causal, written_q, stats, launches):
@@ -1130,13 +1480,7 @@ def dqg_shape(B, Sq, Skv, Hq, Hkv, causal, written_q, stats, launches):
                                             "Q/dO frag",
                                         )
                                         ok((tt * 8) % d + 8 <= d, "Q3", "frag inside its row")
-                            base_dq = bat * Sq * Hq * D_QK + qh * D_QK
-                            for dtile in range(NDO_QK):
-                                for si in range(8):
-                                    q_i = q0 + qh_ * 16 + half * 8 + si
-                                    el = base_dq + q_i * Hq * D_QK + dtile * 16 + row
-                                    ok(0 <= el < B * Sq * Hq * D_QK and el * 2 < (1 << 30), "Q5", "dq store")
-                                    written_q[el] = written_q.get(el, 0) + 1
+                    dq_epilogue(B, Sq, Hq, bat, qh, q0, nqw, w, nwave, written_q)
     # W2 on this shape's 2-wave trip counts (the self-test covers N = 1..160 as well)
     for N in sorted(trips):
         ring2_check(N, DQ_NWAVE)
@@ -1281,7 +1625,7 @@ def headgroup_shape(B, Sq, Skv, Hq, Hkv, name, mode="two_wave"):
 
 def fold_equivalence():
     """R2: prodfold at target 128 walks (folded head, tile) exactly like r3_a's b2h128; prodfold at
-    the default target HEAD_GROUP walks like the contiguous b2h128 launch at the same target."""
+    the launch default HEAD_GROUP walks like the contiguous b2h128 launch at the same target."""
     Bp, S, H = 2, 4096, 128
     for (lname, kind, nh, tiles), (lname2, kind2, nh2, tiles2) in zip(
         hg_launches(1, S, S, Bp * H, Bp * H), hg_launches(Bp, S, S, H, H)
@@ -1379,16 +1723,85 @@ def g1_dispatch(name, B, Sq, Skv, Hq, Hkv):
     return {"dkdv": "one_wave" if want[0] else "two_wave", "dq": "one_wave" if want[1] else "two_wave"}
 
 
+# ------------------------------------------------------------------ k_delta (r6.i1.g21)
+ROWS_DELTA, ROWS_PER_PASS, PASSES_PER_WG = g("ROWS_DELTA"), g("ROWS_PER_PASS"), g("PASSES_PER_WG")
+LANES_PER_ROW, DELTA_THREADS, DV8_V = g("LANES_PER_ROW"), g("DELTA_THREADS"), g("DV8_V")
+for _pat in (
+    r"tiles = \[\s*\(\(b \* S \+ s0 \+ fx\.Int32\(u \* ROWS_PER_PASS\) \+ row_in_group\) \* H \+ h\) \* fx\.Int32\(DV8_V\)",
+    r"r = fx\.Int32\(u \* ROWS_PER_PASS\) \+ row_in_group\n",
+    r"l32 = tid % fx\.Int32\(ROWS_DELTA\)\n",
+    r"dst = bh \* S \+ s0 \+ l32\n",
+    r"w0 = tid < fx\.Int32\(ROWS_DELTA\)\n",
+    r"grid=\(nsblk, nbh, 1\)",
+):
+    ok(len(re.findall(_pat, SRC)) == 1, "D1", f"kernels.py source tie {_pat}")
+ok(
+    len(re.findall(r"sq // _k\.ROWS_DELTA,\s+b \* hq,\s+stream,?\s*\),\s+\"main\",?\s*\)", _IMPL_TXT)) == 1,
+    "D1",
+    "impl.py delta grid tie",
+)
+ok(
+    ROWS_DELTA == PASSES_PER_WG * ROWS_PER_PASS
+    and DELTA_THREADS == ROWS_PER_PASS * LANES_PER_ROW
+    and LANES_PER_ROW == DV8_V
+    and ROWS_DELTA == 32
+    and DELTA_THREADS % 32 == 0,
+    "D1",
+    "k_delta geometry",
+)
+
+
+def delta_shape(B, Sq, Hq):
+    n_rows = B * Sq * Hq
+    ok(Sq % ROWS_DELTA == 0, "D1", "Sq % ROWS_DELTA")
+    seen_in = bytearray(n_rows)
+    seen_out = bytearray(n_rows)
+    for bh in range(B * Hq):
+        b, h = bh // Hq, bh - (bh // Hq) * Hq
+        for sblk in range(Sq // ROWS_DELTA):
+            s0 = sblk * ROWS_DELTA
+            slot_row = {}
+            for u in range(PASSES_PER_WG):
+                for rig in range(ROWS_PER_PASS):  # row_in_group = tid // LANES_PER_ROW
+                    s = s0 + u * ROWS_PER_PASS + rig
+                    idx = (b * Sq + s) * Hq + h
+                    # its 16 lanes read vec8 tiles idx*16 + [0, 16): bytes [32*idx*8, ...) of n_rows*D_V*2
+                    ok(
+                        0 <= idx < n_rows
+                        and (idx * DV8_V + DV8_V) * 16 <= n_rows * D_V * 2
+                        and (idx * DV8_V + DV8_V) * 16 < (1 << 31),
+                        "D1",
+                        "dO/O tile",
+                    )
+                    ok(seen_in[idx] == 0, "D1", "row read twice")
+                    seen_in[idx] = 1
+                    r = u * ROWS_PER_PASS + rig
+                    ok(0 <= r < ROWS_DELTA and r not in slot_row, "D1", "LDS slot")
+                    slot_row[r] = (b, h, s)
+            for l in range(32):  # wave 0, lane l reads slot l
+                b_, h_, s_ = slot_row[l]
+                dst = bh * Sq + s0 + l
+                ok(dst == (b_ * Hq + h_) * Sq + s_, "D1", "dst is the summed row's [B,H,S] element")
+                ok(0 <= dst < n_rows and dst * 4 + 4 <= n_rows * 4, "D1", "DEL/ND/NL/LSE index")
+                ok(seen_out[dst] == 0, "D1", "output written twice")
+                seen_out[dst] = 1
+    ok(all(seen_in) and all(seen_out), "D1", "coverage")
+    COUNT["D1"] = COUNT.get("D1", 0) + 2 * n_rows
+
+
 def main(names, modes):
     print(f"[G1] SMALL_GRID_WAVES {SMALL_GRID_WAVES} (impl.py); modes {modes}", flush=True)
     print("[W2] 2-wave ring protocol self-test, N = 1..160 + mutations", flush=True)
     ring2_selftest()
+    print("[EK] k_dkdv64 whole-line epilogue negative controls", flush=True)
+    ek_selftest()
     fold_equivalence()
     for name in names:
         B, Sq, Skv, Hq, Hkv, causal = SHAPES[name]
         assert Sq % 64 == 0 and Sq % DQ_BQW == 0 and Skv % 64 == 0 and Hq % Hkv == 0  # impl.py _check
         assert (B * Sq * Hq) % 32 == 0  # ROWS_DELTA
         sel = g1_dispatch(name, B, Sq, Skv, Hq, Hkv)
+        delta_shape(B, Sq, Hq)  # k_delta: the same launch in both sets
         geo = geometry(B, Sq, Skv, Hq, Hkv)
         print(
             f"[{name}] launched: dkdv {sel['dkdv']} {geo['dkdv']} (one-wave WGs {B * Hkv * (Skv // BLOCK_KV)}), "
@@ -1432,8 +1845,8 @@ def main(names, modes):
     print(
         f"layout: D_QK {D_QK} D_V {D_V} rows {XK}/{XV} B, segments qk {segs(D_QK)} v {segs(D_V)}; "
         f"k_dkdv64 {DKDV_NW} waves, stage {QDO_B} B x {TDM_DEPTH} = {TDM_DEPTH * QDO_B} B shared, "
-        f"{TDM_OPS_QDO} TDM ops/stage/wave ({ROWS_W} rows each), P/dS {PDS_B} B/wave, alloc {ALLOC_KV} B, "
-        f"epilogue {EPI_W} B/wave, "
+        f"{TDM_OPS_QDO} TDM ops/stage/wave ({ROWS_W} rows each), no P/dS tiles, alloc {ALLOC_KV} B, "
+        f"epilogue {EPI_W} B/wave (dV {EPI_DK} + dK {EPI_W - EPI_DK}, row-major, whole-line readback), "
         f"wait {TW_QDO}; k_dqg stage {KV_B} B x {TDM_DEPTH} = {TDM_DEPTH * KV_B} B, {TDM_OPS_KV} ops, "
         f"wait {DQT_TW}; k_dqg96 {DQ_NWAVE} waves x {KV_STEP // DQ_NWAVE} TDM rows; "
         f"DS imm max {max(DS_IMM)} / {max(DSQ_IMM)}"

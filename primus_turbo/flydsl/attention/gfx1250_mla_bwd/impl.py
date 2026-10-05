@@ -71,11 +71,16 @@ _DEVICES_CHECKED = set()
 DQ_SIDE_STREAM = os.environ.get("FLY_BWD_SIDE_STREAM", "0") != "0"
 DQ_SIDE_RECORD = os.environ.get("FLY_BWD_RECORD_STREAM", "1") != "0"
 # Head-group traversal target of k_dkdv64 / k_dqg96 / k_dqg (kernels.HEAD_GROUP note): a launch
-# with more than HEAD_GROUP heads per batch runs as head groups of kernels.head_group(nh) heads
-# (the fold launch [1, s, 256, d] -> 128, the b2h128 grid). Launch-only (a runtime kernel
-# argument, one binary for every value): FLY_BWD_HEAD_GROUP=0 restores r3_a's grid for every
-# shape; flydsl_attn_bwd(..., head_group=N) overrides it per call (in-process A/B controls).
-HEAD_GROUP = int(os.environ.get("FLY_BWD_HEAD_GROUP", str(_k.HEAD_GROUP)))
+# with more than HEAD_GROUP heads per batch runs as head groups of kernels.head_group(nh, HEAD_GROUP)
+# heads. Launch-only (a runtime kernel argument, one binary for every value): FLY_BWD_HEAD_GROUP=0
+# restores r3_a's grid for every shape; flydsl_attn_bwd(..., head_group=N) overrides it per call
+# (in-process A/B controls).
+# Default 64 (r5_hg64 / r5.i4.g18, PROVENANCE.md): prod b2h128 launches (64, tiles, 4), twice the
+# resident tiles per head of target 128 (kernels.HEAD_GROUP, r4_a's default); nh <= 64 (proxy, fast,
+# toy) launches exactly as before. The default lives here, not in kernels.py: kernels.py is device
+# source, and a launch-only change should leave its text (and so every kernel's JIT key) alone.
+HEAD_GROUP_DEFAULT = 64
+HEAD_GROUP = int(os.environ.get("FLY_BWD_HEAD_GROUP", str(HEAD_GROUP_DEFAULT)))
 _SIDE = {}
 
 # Small-grid fallback (bwd_r4_c's host rule, per chain, on the head-group launches). The two-wave
@@ -176,8 +181,8 @@ def _check(do, q, k, v, o, lse):
         f"seqlen_kv must be a multiple of {_k.BLOCK_KV * _k.DKDV_NW}, got {skv}"
     )
     n_rows = b * sq * hq
-    assert n_rows % _k.ROWS_DELTA == 0, (
-        f"batch*seqlen_q*heads_q must be a multiple of {_k.ROWS_DELTA}, got {n_rows}"
+    assert n_rows % _k.ROWS_DELTA == 0 and sq % _k.ROWS_DELTA == 0, (
+        f"seqlen_q must be a multiple of {_k.ROWS_DELTA} (k_delta query blocks), got {sq}"
     )
     for name, t in (("do", do), ("q", q), ("k", k), ("v", v), ("o", o)):
         assert t.is_contiguous(), f"{name} must be contiguous"
@@ -218,6 +223,10 @@ def _plan(
     c = int(bool(causal))
     dq_stream = stream if dq_stream is None else dq_stream
     delta = _alloc((b, hq, sq), q.device, torch.float32)
+    # k_dkdv64's / k_dkdv's per-row softmax constants, written by k_delta (r5.i3.g17): -LOG2E*lse,
+    # -scale*delta
+    nl = _alloc((b, hq, sq), q.device, torch.float32)
+    nd = _alloc((b, hq, sq), q.device, torch.float32)
     dq = _alloc((b, sq, hq, _k.D_QK), q.device, q.dtype)
     dk = _alloc((b, skv, hkv, _k.D_QK), k.device, k.dtype)
     dv = _alloc((b, skv, hkv, _k.D_V), v.device, v.dtype)
@@ -228,8 +237,8 @@ def _plan(
         k,
         v,
         do,
-        lse,
-        delta,
+        nl,
+        nd,
         dv,
         dk,
         float(softmax_scale),
@@ -244,9 +253,28 @@ def _plan(
         nblk,
     )
     launches = [
-        ("delta", _k.launch_delta, (do, o, delta, sq, hq, n_rows, n_rows // _k.ROWS_DELTA, stream), "main"),
+        (
+            "delta",
+            _k.launch_delta,
+            (
+                do,
+                o,
+                delta,
+                lse,
+                nl,
+                nd,
+                float(softmax_scale),
+                sq,
+                hq,
+                n_rows,
+                sq // _k.ROWS_DELTA,
+                b * hq,
+                stream,
+            ),
+            "main",
+        ),
     ]
-    grids = {"delta": (n_rows // _k.ROWS_DELTA, 1, 1)}
+    grids = {"delta": (sq // _k.ROWS_DELTA, b * hq, 1)}
     if nw == _k.DKDV_NW:
         # k_dkdv64: 2 waves per 64-row kv block share one Q/dO ring (bwd_r2_a)
         launches.append(("dkdv", _k.launch_dkdv64, dkdv_args + (hg_kv, ngz_kv, b, stream), "main"))
@@ -292,6 +320,8 @@ def _plan(
         "launches": launches,
         "outputs": (dq, dk, dv),
         "delta": delta,
+        "nl": nl,
+        "nd": nd,
         "grids": grids,
         "dq_split": (q_split, n32, n96),
         "head_group": {"kv": hg_kv, "q": hg_q, "target": tgt},
