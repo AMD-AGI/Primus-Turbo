@@ -39,8 +39,10 @@ _LOG2E = host_math.log2(host_math.e)
 # a second compute queue interferes with application communication (#520).
 _ATTN_SINGLE_STREAM = os.getenv("PRIMUS_TURBO_ATTN_SINGLE_STREAM", "0") == "1"
 _ATTN_Q_PREP = os.getenv("PRIMUS_TURBO_ATTN_Q_PREP", "standalone")
-if _ATTN_Q_PREP not in ("standalone", "odo", "inline", "inline_swa", "forward"):
-    raise ValueError("PRIMUS_TURBO_ATTN_Q_PREP must be standalone, odo, inline, inline_swa, or forward")
+if _ATTN_Q_PREP not in ("standalone", "odo", "inline", "inline_swa", "forward", "hybrid"):
+    raise ValueError(
+        "PRIMUS_TURBO_ATTN_Q_PREP must be standalone, odo, inline, inline_swa, forward, or hybrid"
+    )
 
 
 def _inline_q_for(sbhd, varlen, head_dim, window_left):
@@ -48,7 +50,16 @@ def _inline_q_for(sbhd, varlen, head_dim, window_left):
         sbhd
         and not varlen
         and head_dim == 64
-        and (_ATTN_Q_PREP == "inline" or (_ATTN_Q_PREP == "inline_swa" and window_left >= 0))
+        and (_ATTN_Q_PREP == "inline" or (_ATTN_Q_PREP in ("inline_swa", "hybrid") and window_left >= 0))
+    )
+
+
+def _fuse_q_for(sbhd, varlen, head_dim, window_left):
+    return (
+        sbhd
+        and not varlen
+        and head_dim == 64
+        and (_ATTN_Q_PREP == "odo" or (_ATTN_Q_PREP == "hybrid" and window_left < 0))
     )
 
 
@@ -5460,7 +5471,7 @@ def _get_bwd(
             sbhd=sbhd,
             token_major=varlen,
             fill_img=bool(a16),
-            q_scale=scale * _LOG2E if (_ATTN_Q_PREP == "odo" and sbhd and not varlen and D == 64) else None,
+            q_scale=scale * _LOG2E if _fuse_q_for(sbhd, varlen, D, window_left) else None,
         )
         odo_l = build_flash_attn_bwd_odo_module(q_split=q_split if sbhd else 1, **odo_kw)
         _odo_subs: dict = {}
@@ -5578,7 +5589,7 @@ def _dense_plan(B, Sq, Skv, Hq, Hkv, D, scale, window_left, sbhd, deterministic)
     # when the chunk's own compute dwarfs the dispatch it costs (see _DQ_PIPE_AREA_FLOOR).
     pipe = (
         _DQ_PIPE
-        and not (_ATTN_Q_PREP == "odo" and sbhd and D == 64)
+        and not _fuse_q_for(sbhd, False, D, wl)
         and not a16  # a16 has no fold to hide, so it has nothing to pipeline against
         and not band_span  # band groups drive their own dispatch order (see _fused_bandgroups)
         # a ragged top band makes the split->q-block map band-dependent (see _pipe_chunks),
@@ -5825,8 +5836,9 @@ def flydsl_varlen_backward(
     varlen = cu_seqlens_q is not None
     st = torch.cuda.current_stream()
     assert not q_is_scaled or (sbhd and not varlen and D == 64)
-    fuse_q = not q_is_scaled and _ATTN_Q_PREP == "odo" and sbhd and not varlen and D == 64
-    inline_q = _inline_q_for(sbhd, varlen, D, -1 if Skv - 1 <= window_left else window_left)
+    effective_window = -1 if Skv - 1 <= window_left else window_left
+    fuse_q = not q_is_scaled and _fuse_q_for(sbhd, varlen, D, effective_window)
+    inline_q = _inline_q_for(sbhd, varlen, D, effective_window)
     assert not (q_is_scaled and inline_q), "saved forward Q is already scaled"
     qf = (
         q.reshape(-1)
