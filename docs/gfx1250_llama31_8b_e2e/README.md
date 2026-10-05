@@ -36,12 +36,12 @@ We ran **one GPU only**, so anything about RCCL is outside our data.
 |---|---|---|---|
 | backward many times slower than forward (compute) | **yes** | The image's hipBLASLt ships the tuned plain-bf16 library only for the forward's TN layout. Every Linear dgrad (`Cijk_Ailk_Bljk`) and wgrad (`Cijk_Ailk_Bjlk`) falls to an untuned table whose nearest entry is a GEMV tile, `MT32x16x32`: 50-80 TF/s vs 1.5-1.9 PF/s forward, 11-32x slower per call; backward GEMMs took ~50x the forward GEMMs per step (~16 s/step) | nkfix (section 3.2): re-lays out the backward operands so every GEMM hits the forward's tuned kernel. 10.3x faster step. Check your trace for `MT32x16x32` kernel names to confirm |
 | backward slower than forward (RCCL) | **unknown** | We never ran multi-GPU. Note: with FSDP2 the backward moves ~3x the forward's bytes by design (re-all-gather + fp32 reduce-scatter). The GEMM problem above also makes ranks run at different speeds (hipBLASLt picks the NN fallback per process), which collectives then absorb as waiting | Fix the GEMMs first, then profile collectives per rank. The image ships a private RCCL (`/opt/rccl-gfx1250`, ref `rccl/gfx1250_merge`); launch through `runner/primus-cli` so Primus' `MI455X.sh` env applies |
-| version incompatibilities, no e2e result | **yes** -- the stock image never completed a training step for us | (a) the stock image lacks torchtitan deps (tyro, torchdata, tabulate, tensorboard, wandb); Primus' patch runner then *skips* the turbo-attention patch ("missing dependency: tensorboard") and torchtitan's own attention passes `enable_gqa` to `TurboAttention.forward` -> `TypeError`; (b) the image ships its own editable `primus-turbo 0.4.1.dev12` whose import hook **wins over `PYTHONPATH`**, so your checkout is silently ignored; (c) flydsl: the image and Primus-Turbo pin 0.2.4, aiter pins 0.3.2, and Primus-Turbo does not import under 0.3.x; (d) Primus-Turbo `main` has no working default gfx1250 attention backend (section 2) | section 4 (image) + section 5 (setup). Everything in this tutorial runs on the image's own torch / triton / flydsl 0.2.4 |
-| page fault / GPU hang, root-caused to hipBLASLt | **yes, several variants** | (a) default library search path is one directory too high -> every matmul raises `HIPBLAS_STATUS_INVALID_VALUE`; the common workaround `TORCH_BLAS_PREFER_HIPBLASLT=0` (rocBLAS) is 8x slower and its fp32 Tensile kernels page-faulted the card; (b) a non-image hipBLASLt library (we tried a host-built copy) gave NaN from step 4 and wedges in step 1-2; (c) fp32 GEMMs on the card (e.g. test references) faulted in `Cijk_Ailk_Bljk_*` kernels (`GCVM_L2_PROTECTION_FAULT`) | Use only the image library and set it explicitly: `TORCH_BLAS_PREFER_HIPBLASLT=1 HIPBLASLT_TENSILE_LIBPATH=/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/gfx1250`. Never the `_rocm_sdk_devel/.../gfx1250` copy (incomplete, SIGSEGV). No fp32 GEMMs on the card. With the image library: 12 e2e launches since 2026-09-28 (8 on a 4-GPU box, 4 here) without a GPU fault; one earlier wedge on the image library, on this card before its 2026-09-29 firmware update, is unexplained |
+| version incompatibilities, no e2e result | **yes** -- the stock image never completed a training step for us | (a) the stock image lacks torchtitan's deps (tyro, torchdata, tabulate, tensorboard, wandb). `primus-cli ... train pretrain` re-installs torchtitan with its declared deps on every launch when PyPI is reachable, so this bites with plain `torchrun` or offline: Primus' patch runner then *skips* the turbo-attention patch ("missing dependency: tensorboard") and torchtitan's own attention passes `enable_gqa` to `TurboAttention.forward` -> `TypeError` (the same TypeError appears whenever the converter is on but `use_turbo_attention` is false); (b) the image ships its own editable `primus-turbo 0.4.1.dev12` whose import hook **wins over `PYTHONPATH`**, so your checkout is silently ignored; (c) flydsl: the image and Primus-Turbo pin 0.2.4, aiter pins 0.3.2, and Primus-Turbo does not import under 0.3.x; (d) Primus-Turbo `main` has no working default gfx1250 attention backend (section 2) | section 4 (image) + section 5 (setup). Everything in this tutorial runs on the image's own torch / triton / flydsl 0.2.4 |
+| page fault / GPU hang, root-caused to hipBLASLt | **yes, several variants** | (a) default library search path is one directory too high -> every matmul raises `HIPBLAS_STATUS_INVALID_VALUE`; the common workaround `TORCH_BLAS_PREFER_HIPBLASLT=0` (rocBLAS) is 8x slower and its fp32 Tensile kernels page-faulted the card; (b) a non-image hipBLASLt library (we tried a host-built copy) was live in a run that went NaN from step 4 and in another that wedged the GPU in step 1; (c) fp32 GEMMs on the card (e.g. test references) faulted in `Cijk_Ailk_Bljk_*` kernels (`GCVM_L2_PROTECTION_FAULT`) | Use only the image library and set it explicitly: `TORCH_BLAS_PREFER_HIPBLASLT=1 HIPBLASLT_TENSILE_LIBPATH=/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx1250/lib/hipblaslt/library/gfx1250`. Never the `_rocm_sdk_devel/.../gfx1250` copy (incomplete, SIGSEGV). No fp32 GEMMs on the card. With the image library: 12 e2e launches since 2026-09-28 (8 on a 4-GPU box, 4 here) without a GPU fault -- too few to prove low risk; one earlier wedge on the image library, on this card before its 2026-09-29 firmware update, is unexplained |
 
 Other hangs we hit that look GPU-side: `converters: []` (torchtitan flex attention -> inductor autotune -> MES
 "failed to respond" wedge), `compile.enable: true` (inductor autotune -> `hipErrorLaunchFailure`), plain
-`8B` flavor (SDPA MATH materialises [4,32,8192,8192] -> SIGBUS), and starting a run while another process
+`8B` flavor with the converter off (SDPA MATH materialises [4,32,8192,8192] -> SIGBUS), and starting a run while another process
 still holds the GPU. A wedged MI455X needs an AC power cycle; never `modprobe -r amdgpu`.
 
 ## 2. What goes wrong with Primus-Turbo `main` (and what the branch changes)
@@ -54,8 +54,8 @@ branch; 2.2-2.5 apply to **both** and are handled by this tutorial's setup.
    with aiter, CK's backward rejects the call mid-step. With batch 1 or SBHD the gfx950 gate (`cc >= (9,5)`)
    also accepts gfx1250 and raises `requires gfx950+ (uses ds_read_tr16_b64)`. The only working path on `main`
    is `PRIMUS_TURBO_ATTN_BACKEND=TRITON`, ~4x slower forward and ~3.4x slower backward than the branch's
-   FlyDSL kernels (36-shape geomean). Estimated e2e on `main` + Triton: ~2.0 s/step (~16k tokens/s) vs
-   1.36 s/step on the branch. The branch's FlyDSL backend covers bf16, head_dim 128, Hq/Hkv in
+   FlyDSL kernels (36-shape geomean). Estimated e2e on `main` + Triton: ~1.9-2.05 s/step (~16-17k
+   tokens/s; not measured on `main`) vs 1.36 s/step on the branch. The branch's FlyDSL backend covers bf16, head_dim 128, Hq/Hkv in
    {1,2,4,8,16}, Sq % 64 == 0, Skv % 32 == 0; other shapes still fall to AITER/CK -- pin TRITON for those models.
    Unset any leftover `PRIMUS_TURBO_ATTN_BACKEND` on the branch: a pin beats the default.
 2. **Backward GEMMs (both).** See section 1, row 1. Not fixed in any branch; nkfix is a runtime workaround.
@@ -159,6 +159,10 @@ and prints a summary (median steady-state tokens/s and ms/step, peak memory, los
 What to check in the log:
 - `primus_turbo <path>` printed at the top must be your branch checkout (and `flydsl 0.2.4`).
 - `[nkfix] installed` and **no** `[nkfix] triton transpose unavailable` (that means `transpose_triton.py` is missing).
+- `Primus-Turbo Attention successfully installed for LLaMA3, ...` (the turbo_attention patch was applied; if it
+  was skipped for a missing dependency, the run dies with an `enable_gqa` TypeError).
+- the first start on a fresh host can sit minutes before step 1 (torchtitan compiles its block-mask builder for
+  `8B_flex`); keep `TRITON_CACHE_DIR` persistent. With a warm cache step 1 comes ~17 s after launch.
 - steps 1-2 are slow (FlyDSL JIT on first use, allocator growth); from step 3 on torchtitan's `tps` should
   read ~24k. A steady ~19.4k means nkfix is running without `transpose_triton.py`; ~2k means nkfix is not
   installed at all.
@@ -180,10 +184,11 @@ rc=0 wall=53 s (container start to exit, incl. model init and JIT)
 | configuration (same machine, same config) | ms/step | tokens/s | source |
 |---|--:|--:|---|
 | **this tutorial: branch FlyDSL attention + nkfix (`NKFIX_CHECK=0`)** | **1,362** | **24,061** | measured 2026-10-05 |
+| same, re-run from `docs/gfx1250_llama31_8b_e2e/` exactly as committed | 1,360 | 24,099 | measured 2026-10-05 |
 | same, but `transpose_triton.py` missing (nkfix torch copies) | 1,689 | 19,406 | measured 2026-10-05 |
 | aiter prebuilt ASM attention + nkfix (`NKFIX_CHECK=1`, our A/B kit) | 1,351 | 24,262 | measured 2026-10-02 |
 | FlyDSL fwd r16 + newer bwd "s6" (`NKFIX_CHECK=1`, not yet in the branch) | 1,349 | 24,283 | measured 2026-10-02 |
-| `main` + `PRIMUS_TURBO_ATTN_BACKEND=TRITON` + nkfix | ~2,050 | ~16,000 | estimate from op-level timings |
+| `main` + `PRIMUS_TURBO_ATTN_BACKEND=TRITON` + nkfix | ~1,900-2,050 | ~16,000-17,000 | estimate (op-level and in-training attention times); not measured on `main` |
 | no nkfix (any attention) | ~16,000 | ~2,000 | measured 2026-09-28 (B0) |
 | `TORCH_BLAS_PREFER_HIPBLASLT=0` (rocBLAS), no nkfix | ~134,000 | ~245 | measured 2026-09-13 (A0, 1.1 GHz clock cap) |
 

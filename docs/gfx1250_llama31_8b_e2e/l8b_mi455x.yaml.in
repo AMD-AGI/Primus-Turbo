@@ -16,10 +16,11 @@ modules:
       stderr_sink_level: INFO
 
       model:
-        # 8B_flex == 8B except attn_type=flex. Do NOT use plain 8B (attn_type=sdpa): on gfx1250
-        # SDPA falls back to the MATH backend, which materialises the [4,32,8192,8192] score
-        # matrix and dies with SIGBUS. With the primus_turbo converter below, the flex wrapper is
-        # replaced by TurboAttention, so neither flex nor inductor is ever reached.
+        # 8B_flex == 8B except attn_type=flex. The primus_turbo converter below replaces the flex
+        # (and the SDPA) attention wrapper with TurboAttention. torchtitan still compiles its
+        # block-mask builder for 8B_flex every step; TurboAttention ignores the mask (plain causal).
+        # Without the converter, plain 8B (SDPA) falls to the MATH backend on gfx1250, which
+        # materialises the [4,32,8192,8192] score matrix and dies with SIGBUS.
         flavor: 8B_flex
         # Local tokenizer assets (the HF repo is gated); mock data needs only the tokenizer.
         hf_assets_path: @HF_ASSETS@
@@ -71,8 +72,10 @@ modules:
         mode: "none"
         selective_ac_option: "op"
 
-      # The converter registers on enable_primus_turbo; use_turbo_attention picks TurboAttention,
-      # which on gfx1250 dispatches to the FlyDSL kernels of the dev/lhz/llama31_attn_opt branch.
+      # enable_primus_turbo + use_turbo_attention install Primus' Attention.forward, which calls
+      # TurboAttention as (q, k, v). Without it torchtitan's own forward passes enable_gqa, which
+      # TurboAttention rejects (TypeError). On gfx1250 TurboAttention dispatches to the FlyDSL
+      # kernels of the dev/lhz/llama31_attn_opt branch.
       primus_turbo:
         enable_primus_turbo: true
         enable_attention_float8: false
