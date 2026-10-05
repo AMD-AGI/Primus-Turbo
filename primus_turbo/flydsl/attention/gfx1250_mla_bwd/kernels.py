@@ -37,11 +37,12 @@ _dkdv_impl); k_dqg96 runs two waves on one K/V ring (each TDMs half of every til
 workgroup barrier per kv step (_wg_sync). The design history behind every choice is in
 PROVENANCE.md.
 """
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir as _mlir_ir  # UNSTABLE(gfx1250): gpu.barrier memfence attribute
 from flydsl._mlir.dialects import llvm as llvm_dialect  # UNSTABLE(gfx1250): LDS load/store
-from flydsl.expr import range_constexpr, rocdl
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.rocdl import tdm_ops  # UNSTABLE(gfx1250): tensor_wait
 
 
@@ -73,31 +74,31 @@ def _ir(v):
     return fx.as_ir_value(v)
 
 
-D_QK = 192                   # q/k head dim
-D_V = 128                    # v/o head dim
-DV8_QK = D_QK // 8           # vec8 tiles per row: q, k, dq, dk
-DV8_V = D_V // 8             # vec8 tiles per row: v, o, do, dv
-NDT_QK = D_QK // 32          # WMMA k-steps contracting S = K Q^T
-NDT_V = D_V // 32            # WMMA k-steps contracting dP = V dO^T
+D_QK = 192  # q/k head dim
+D_V = 128  # v/o head dim
+DV8_QK = D_QK // 8  # vec8 tiles per row: q, k, dq, dk
+DV8_V = D_V // 8  # vec8 tiles per row: v, o, do, dv
+NDT_QK = D_QK // 32  # WMMA k-steps contracting S = K Q^T
+NDT_V = D_V // 32  # WMMA k-steps contracting dP = V dO^T
 NDT_MAX = max(NDT_QK, NDT_V)
-NDO_QK = D_QK // 16          # 16-wide output tiles across d: dK, dQ
-NDO_V = D_V // 16            # 16-wide output tiles across d: dV
+NDO_QK = D_QK // 16  # 16-wide output tiles across d: dK, dQ
+NDO_V = D_V // 16  # 16-wide output tiles across d: dV
 NDO_MAX = max(NDO_QK, NDO_V)
-SAME_D = D_QK == D_V         # one shared address family when the row strides agree
-NKV = 2                      # 16-row kv sub-tiles per k_dkdv workgroup
+SAME_D = D_QK == D_V  # one shared address family when the row strides agree
+NKV = 2  # 16-row kv sub-tiles per k_dkdv workgroup
 NST = NKV * (NDO_V + NDO_QK)  # dV then dK accumulators carried by k_dkdv
-WAVE = 32                    # gfx1250 dispatches wave32
+WAVE = 32  # gfx1250 dispatches wave32
 LOG2E = 1.4426950408889634
 NEG = -3.0e38
-TDM_DEPTH = 3                # Q/dO (k_dkdv) and K/V (k_dqg) LDS ring stages
-BLOCK_KV = 32                # kv rows one k_dkdv workgroup owns
+TDM_DEPTH = 3  # Q/dO (k_dkdv) and K/V (k_dqg) LDS ring stages
+BLOCK_KV = 32  # kv rows one k_dkdv workgroup owns
 S_ROW_B = BLOCK_KV * 2 + 16  # padded P/dS LDS row: 80 B = 20 dwords walks all 64 banks
 # Padded LDS rows of the TDM-staged tiles: D*2 + 16 bytes. An unpadded 256 B row puts every
 # row on bank 0 (64-way conflict on the 16 rows of a tr16 read); +16 B makes row r start at
 # dword 4r (D=128, 68-dword stride) or 36r (D=192, 100-dword stride) mod 64 -- 16 distinct
 # 4-bank groups either way.
-XK_ROW_B = D_QK * 2 + 16     # q / k rows (400 B at D_QK = 192)
-XV_ROW_B = D_V * 2 + 16      # do / v rows (272 B at D_V = 128)
+XK_ROW_B = D_QK * 2 + 16  # q / k rows (400 B at D_QK = 192)
+XV_ROW_B = D_V * 2 + 16  # do / v rows (272 B at D_V = 128)
 
 
 def _pow2_segments(d):
@@ -123,26 +124,26 @@ for _d in (D_QK, D_V):
 # [32][D_QK] Q tile at +QOFF -- and the P/dS tiles one 64 KB segment up (LDS_SEG).
 LDS_SEG = 65536
 QOFF = 32 * XV_ROW_B
-QDO_B = 32 * (XV_ROW_B + XK_ROW_B)           # 21504 B at 192/128 (17408 at 128/128)
+QDO_B = 32 * (XV_ROW_B + XK_ROW_B)  # 21504 B at 192/128 (17408 at 128/128)
 TDM_OPS_QDO = len(_pow2_segments(D_V)) + len(_pow2_segments(D_QK))  # TDM ops per stage
-TW_QDO = TDM_OPS_QDO * (TDM_DEPTH - 2)      # tensorcnt that retires all but the newest stage
-NQE = 2 * NDT_QK             # carried Q readback entries per 16-query half (u = 0, 1)
-NHB = NQE + 2 * NDT_V        # + dO entries
-DK0 = NKV * NDO_V            # dK accumulators follow the dV ones
-EPI_CB = 48                  # epilogue d-row: 32 B of kv row + 16 B pad (12 dwords)
-EPI_W = NKV * (D_V + D_QK) * EPI_CB          # one wave's dV + dK epilogue images (30720 B)
+TW_QDO = TDM_OPS_QDO * (TDM_DEPTH - 2)  # tensorcnt that retires all but the newest stage
+NQE = 2 * NDT_QK  # carried Q readback entries per 16-query half (u = 0, 1)
+NHB = NQE + 2 * NDT_V  # + dO entries
+DK0 = NKV * NDO_V  # dK accumulators follow the dV ones
+EPI_CB = 48  # epilogue d-row: 32 B of kv row + 16 B pad (12 dwords)
+EPI_W = NKV * (D_V + D_QK) * EPI_CB  # one wave's dV + dK epilogue images (30720 B)
 # k_dkdv64: DKDV_NW waves per workgroup; wave w owns kv rows [kv0g + 32w, kv0g + 32w + 32) of the
 # workgroup's DKDV_NW*BLOCK_KV-row block. The waves share ONE Q/dO ring (TDM issued cooperatively,
 # num_warps = DKDV_NW: wave w moves rows [16w, 16w + 16) of every 32-row tile); each keeps its own
 # P/dS tiles at LDS_SEG + w*PDS_B and its own epilogue image at w*EPI_W inside the dead ring.
 DKDV_NW = 2
-PDS_B = 2 * 32 * S_ROW_B     # one wave's P + dS tiles (5120 B)
-BAR_KH = NKV // 2            # k_dkdv64 full loop: the ring barrier sits before kv sub-tile BAR_KH's WMMAs
+PDS_B = 2 * 32 * S_ROW_B  # one wave's P + dS tiles (5120 B)
+BAR_KH = NKV // 2  # k_dkdv64 full loop: the ring barrier sits before kv sub-tile BAR_KH's WMMAs
 # k_dkdv64 full loop: the Q/dO prefetch (tile it+3 -> stage it%3) is issued after BARRIER(it)
 # behind the readback; its scalar math rides the kh0 WMMA run, KH0_SALU SALU per WMMA
 # (sched_group_barrier), and SALU (only) may cross the fence between the readback and the TDM.
 KH0_SALU = 2
-KB_SALU_MASK = 0x004         # llvm.amdgcn.sched.barrier mask: SALU may be scheduled across
+KB_SALU_MASK = 0x004  # llvm.amdgcn.sched.barrier mask: SALU may be scheduled across
 assert TDM_DEPTH * QDO_B <= LDS_SEG, "the Q/dO ring must stay inside LDS segment 0"
 assert DKDV_NW * EPI_W <= TDM_DEPTH * QDO_B, "epilogue images must fit the dead ring"
 assert 32 % DKDV_NW == 0 and (DKDV_NW & (DKDV_NW - 1)) == 0, "TDM num_warps splits 32 rows evenly"
@@ -243,20 +244,24 @@ def _tdm_rows(src, off, d, rows, valid, rs_el, lds_row0, lds_ty, num_warps=1):
     for c0, w in _pow2_segments(d):
         g_off = off if c0 == 0 else off + fx.Int64(c0)
         lb = lds_row0 if c0 == 0 else lds_row0 + fx.Int32(c0 * 2)
-        g_view = fx.Tensor(fx.make_view(fx.add_offset(fx.get_iter(src), g_off),
-                                        fx.make_layout((rows, w), (d, 1))))
+        g_view = fx.Tensor(
+            fx.make_view(fx.add_offset(fx.get_iter(src), g_off), fx.make_layout((rows, w), (d, 1)))
+        )
         atom = fx.rocdl.cdna5.make_tdm_atom(
-            g_view, [valid, None], strides=[rs_el, None], num_warps=num_warps,
-            pad_interval=w, pad_amount=x_el - w)
-        l_view = fx.Tensor(fx.make_view(fx.inttoptr(lds_ty, lb),
-                                        fx.make_layout((rows, w), (x_el, 1))))
+            g_view,
+            [valid, None],
+            strides=[rs_el, None],
+            num_warps=num_warps,
+            pad_interval=w,
+            pad_amount=x_el - w,
+        )
+        l_view = fx.Tensor(fx.make_view(fx.inttoptr(lds_ty, lb), fx.make_layout((rows, w), (x_el, 1))))
         fx.copy_atom_call(atom, g_view, l_view)
 
 
 # ================================================================== delta ==========
 @flyc.kernel(known_block_size=[DELTA_THREADS, 1, 1])
-def k_delta_bshd(DO: fx.Tensor, O: fx.Tensor, DEL: fx.Tensor,
-                 S: fx.Int32, H: fx.Int32, n_rows: fx.Int32):
+def k_delta_bshd(DO: fx.Tensor, O: fx.Tensor, DEL: fx.Tensor, S: fx.Int32, H: fx.Int32, n_rows: fx.Int32):
     """delta[b, h, s] = sum_d dO[b, s, h, d] * O[b, s, h, d], fp32."""
     _ = MODULE_KNOBS  # cache key only (see MODULE_KNOBS)
     tid = fx.Int32(fx.thread_idx.x)
@@ -266,10 +271,14 @@ def k_delta_bshd(DO: fx.Tensor, O: fx.Tensor, DEL: fx.Tensor,
     g_delta = _bv(DEL, n_rows * 4, fx.Float32)
 
     tile = bid * (ROWS_DELTA * DV8_V) + tid
-    do_vecs = [_ldv(g_do, tile + u * (ROWS_PER_PASS * DV8_V), fx.BFloat16, 8).ir_value()
-               for u in range_constexpr(PASSES_PER_WG)]
-    o_vecs = [_ldv(g_o, tile + u * (ROWS_PER_PASS * DV8_V), fx.BFloat16, 8).ir_value()
-              for u in range_constexpr(PASSES_PER_WG)]
+    do_vecs = [
+        _ldv(g_do, tile + u * (ROWS_PER_PASS * DV8_V), fx.BFloat16, 8).ir_value()
+        for u in range_constexpr(PASSES_PER_WG)
+    ]
+    o_vecs = [
+        _ldv(g_o, tile + u * (ROWS_PER_PASS * DV8_V), fx.BFloat16, 8).ir_value()
+        for u in range_constexpr(PASSES_PER_WG)
+    ]
 
     lane_in_row = tid % fx.Int32(LANES_PER_ROW)
     row_in_group = tid // fx.Int32(LANES_PER_ROW)
@@ -278,11 +287,11 @@ def k_delta_bshd(DO: fx.Tensor, O: fx.Tensor, DEL: fx.Tensor,
         o8 = fx.Vector(o_vecs[u])
         e0 = fx.Float32(0.0)
         e1 = fx.Float32(0.0)
-        for c in range_constexpr(4):   # 8 elements of the lane's vec8, 2 chains
+        for c in range_constexpr(4):  # 8 elements of the lane's vec8, 2 chains
             e0 = e0 + fx.Float32(do8[2 * c]) * fx.Float32(o8[2 * c])
             e1 = e1 + fx.Float32(do8[2 * c + 1]) * fx.Float32(o8[2 * c + 1])
         acc = e0 + e1
-        for sft in range_constexpr(LANES_PER_ROW.bit_length() - 1):   # LANES_PER_ROW lanes/row
+        for sft in range_constexpr(LANES_PER_ROW.bit_length() - 1):  # LANES_PER_ROW lanes/row
             acc = acc + fx.gpu.shuffle_xor(acc, 1 << sft, WAVE)
         idx = bid * fx.Int32(ROWS_DELTA) + u * fx.Int32(ROWS_PER_PASS) + row_in_group
         ok = (lane_in_row == fx.Int32(0)) & (idx < n_rows)
@@ -295,15 +304,16 @@ def k_delta_bshd(DO: fx.Tensor, O: fx.Tensor, DEL: fx.Tensor,
 
 
 @flyc.jit
-def launch_delta(DO, O, DEL, S: fx.Int32, H: fx.Int32, n_rows: fx.Int32,
-                 nblk: fx.Int32, stream: fx.Stream):
+def launch_delta(DO, O, DEL, S: fx.Int32, H: fx.Int32, n_rows: fx.Int32, nblk: fx.Int32, stream: fx.Stream):
     k_delta_bshd(DO, O, DEL, S, H, n_rows).launch(
-        grid=(nblk, 1, 1), block=(DELTA_THREADS, 1, 1), stream=stream)
+        grid=(nblk, 1, 1), block=(DELTA_THREADS, 1, 1), stream=stream
+    )
 
 
 # =================================================================== dkdv =========
-def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
-               scale, Sq, Skv, Hq, Hkv, G, nqt, cshift, causal, B_, nw=1, HG=None):
+def _dkdv_impl(
+    Q, K, V, DO, LSE, DEL, DV_, DK, scale, Sq, Skv, Hq, Hkv, G, nqt, cshift, causal, B_, nw=1, HG=None
+):
     """One wave owns a BLOCK_KV-row kv tile of one kv head and streams every (q head, q pair).
 
     nw (compile-time) waves per workgroup. nw = 1: the legacy k_dkdv, grid = (Hkv,
@@ -337,35 +347,35 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
     else:
         lane = fx.Int32(fx.thread_idx.x) % fx.Int32(WAVE)
     if const_expr(HG is None):
-        hkv = fx.Int32(fx.block_idx.x)          # kv head (cheap axis fastest)
-        bat = fx.Int32(fx.block_idx.z)          # batch
+        hkv = fx.Int32(fx.block_idx.x)  # kv head (cheap axis fastest)
+        bat = fx.Int32(fx.block_idx.z)  # batch
     else:
         # head group (HEAD_GROUP note): grid (HG, Skv/64, B*Hkv/HG), HG | Hkv (impl._plan);
         # z*HG + x is the batch-major kv head index bat*Hkv + hkv (bounds_proof.py R1)
         _hb = fx.Int32(fx.block_idx.z) * HG + fx.Int32(fx.block_idx.x)
         bat = _hb // Hkv
         hkv = _hb - bat * Hkv
-    bid = fx.Int32(fx.block_idx.y)              # kv tile (nw = 1) / kv block (nw > 1)
+    bid = fx.Int32(fx.block_idx.y)  # kv tile (nw = 1) / kv block (nw > 1)
     row = lane % fx.Int32(16)
     half = lane // fx.Int32(16)
     kv0 = bid * fx.Int32(BLOCK_KV)
-    kv0g = kv0                                  # the workgroup's first kv row (loop bounds)
+    kv0g = kv0  # the workgroup's first kv row (loop bounds)
     if const_expr(nw > 1):
-        wv = fx.Int32(rocdl.wave_id())          # wave in the workgroup, [0, nw), SGPR
+        wv = fx.Int32(rocdl.wave_id())  # wave in the workgroup, [0, nw), SGPR
         kv0g = bid * fx.Int32(nw * BLOCK_KV)
-        kv0 = kv0g + wv * fx.Int32(BLOCK_KV)    # this wave's kv tile
+        kv0 = kv0g + wv * fx.Int32(BLOCK_KV)  # this wave's kv tile
 
     # TRUE byte extents on every k_dkdv descriptor: an over-read returns 0 instead of
     # walking into the next page, and a clamp that hit a LIVE access would crater SQNR.
     nk_b = B_ * Skv * Hkv * fx.Int32(D_QK * 2)  # k / dk bf16 [B, Skv, Hkv, D_QK]
     nv_b = nk_b if SAME_D else B_ * Skv * Hkv * fx.Int32(D_V * 2)  # v / dv [.., D_V]
-    nl_b = B_ * Hq * Sq * fx.Int32(4)           # lse / delta fp32 [B, Hq, Sq]
+    nl_b = B_ * Hq * Sq * fx.Int32(4)  # lse / delta fp32 [B, Hq, Sq]
     g_k = _bv(K, nk_b, fx.BFloat16, 8)
     g_v = _bv(V, nv_b, fx.BFloat16, 8)
     g_lse = _bv(LSE, nl_b, fx.Float32)
     g_del = _bv(DEL, nl_b, fx.Float32)
 
-    rs_k = Hkv * fx.Int32(DV8_QK)               # vec8 tiles between consecutive k rows
+    rs_k = Hkv * fx.Int32(DV8_QK)  # vec8 tiles between consecutive k rows
     base_k = bat * Skv * rs_k + hkv * fx.Int32(DV8_QK)
     rs_v = rs_k if SAME_D else Hkv * fx.Int32(DV8_V)
     base_v = base_k if SAME_D else bat * Skv * rs_v + hkv * fx.Int32(DV8_V)
@@ -386,13 +396,14 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
     def gfrag(buf, base, rs, r, dt):
         t = base + (r + row) * rs + half + fx.Int32(dt * 4)
         return _ldv(buf, t, fx.BFloat16, 8).shuffle(
-            _ldv(buf, t + fx.Int32(2), fx.BFloat16, 8), list(range(16)))
+            _ldv(buf, t + fx.Int32(2), fx.BFloat16, 8), list(range(16))
+        )
 
     # LSE/delta prefetch address: voffset = 4*row (loop-invariant VGPR) + soffset (SGPR).
     rsrc_lse = rocdl.get_buffer_rsrc(fx.get_iter(g_lse))
     rsrc_del = rocdl.get_buffer_rsrc(fx.get_iter(g_del))
     voff_l = row * fx.Int32(4)
-    c1_sm = scale * fx.Float32(LOG2E)           # softmax exp2 multiplier, hoisted (see _body)
+    c1_sm = scale * fx.Float32(LOG2E)  # softmax exp2 multiplier, hoisted (see _body)
 
     def _ldl(qt, gh, trim=True):
         """The 4 LSE/delta loads (hh x {lse, delta}) of query pair qt, q head hkv*G+gh,
@@ -404,8 +415,7 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
         if const_expr(trim):
             # byte address 4*(base_l + q0 + hh*16 + row) split as voffset = 4*row +
             # soffset = 4*(base_l + q0) + 64*hh: the same address (bounds_proof.py K3)
-            sb = fx.Int32(rocdl.readfirstlane(
-                fx.Int32.ir_type, ((base_l + q0) * fx.Int32(4)).ir_value()))
+            sb = fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, ((base_l + q0) * fx.Int32(4)).ir_value()))
             for hh in range_constexpr(2):
                 so = sb + fx.Int32(hh * 64)
                 for rs_ in (rsrc_lse, rsrc_del):
@@ -426,9 +436,10 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
     # (_tdm_rows). Tile origin element ((bat*Sq + q0)*Hq + qh)*D, outer stride Hq*D, outer
     # extent Sq - q0 (>= 32 for every issued tile: Sq % 64 == 0 is asserted by impl.py and
     # qt is clamped to [0, nqt2-1]).
-    _lds_bf_ty = fx.PointerType.get(elem_ty=fx.BFloat16.ir_type,
-                                    address_space=fx.AddressSpace.Shared, alignment=16)
-    _q_rs_v = Hq * fx.Int32(D_V)                # elements between consecutive do rows
+    _lds_bf_ty = fx.PointerType.get(
+        elem_ty=fx.BFloat16.ir_type, address_space=fx.AddressSpace.Shared, alignment=16
+    )
+    _q_rs_v = Hq * fx.Int32(D_V)  # elements between consecutive do rows
     _q_rs_k = _q_rs_v if SAME_D else Hq * fx.Int32(D_QK)
 
     def _tdm_qdo_prep(qt, gh, stage_off):
@@ -453,17 +464,17 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
         _tdm_qdo_issue(_tdm_qdo_prep(qt, gh, stage_off))
 
     # K and V fragments of this kv tile are invariant over every query and every q head.
-    kf = [[gfrag(g_k, base_k, rs_k, kv0 + fx.Int32(kh * 16), dt) for dt in range(NDT_QK)]
-          for kh in range(NKV)]
-    vf = [[gfrag(g_v, base_v, rs_v, kv0 + fx.Int32(kh * 16), dt) for dt in range(NDT_V)]
-          for kh in range(NKV)]
+    kf = [
+        [gfrag(g_k, base_k, rs_k, kv0 + fx.Int32(kh * 16), dt) for dt in range(NDT_QK)] for kh in range(NKV)
+    ]
+    vf = [[gfrag(g_v, base_v, rs_v, kv0 + fx.Int32(kh * 16), dt) for dt in range(NDT_V)] for kh in range(NKV)]
     lane_r = (lane // fx.Int32(16)) * fx.Int32(8) + lane % fx.Int32(8)
     lane_c = ((lane // fx.Int32(8)) % fx.Int32(2)) * fx.Int32(8)
     # Lane-only parts of the DS-phase address families (dO rows / Q rows); every per-op
     # difference is a compile-time constant ISel folds into the 16-bit DS immediate
     # (bounds_proof.py: max immediate < 65536).
-    lb_tr_v = lane_r * fx.Int32(XV_ROW_B) + lane_c * fx.Int32(2)   # b_do tr16
-    lb_rd_v = row * fx.Int32(XV_ROW_B) + half * fx.Int32(16)        # dO readback
+    lb_tr_v = lane_r * fx.Int32(XV_ROW_B) + lane_c * fx.Int32(2)  # b_do tr16
+    lb_rd_v = row * fx.Int32(XV_ROW_B) + half * fx.Int32(16)  # dO readback
     lb_tr_k = lb_tr_v if SAME_D else lane_r * fx.Int32(XK_ROW_B) + lane_c * fx.Int32(2)
     lb_rd_k = lb_rd_v if SAME_D else row * fx.Int32(XK_ROW_B) + half * fx.Int32(16)
 
@@ -477,7 +488,7 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
     # bounds use the WORKGROUP's kv rows [kv0g, kv0g + nw*BLOCK_KV) (block id only): a pair
     # below qp_start is fully masked for every wave, a pair from qp_start + nmaskp on fully
     # unmasked for every wave; inside the masked pairs each wave masks with its own kv0.
-    nqt2 = nqt // fx.Int32(2)                   # query tiles come in PAIRS
+    nqt2 = nqt // fx.Int32(2)  # query tiles come in PAIRS
 
     def _clampqt(t):
         """Pin a prefetch's query pair into [0, nqt2-1]."""
@@ -501,19 +512,42 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
             rbase = _rd_bases(stage_off)
         out = []
         for hh in range_constexpr(2):
-            for rb_, img, xrow, ndt in ((rbase[0], QOFF, XK_ROW_B, NDT_QK),
-                                        (rbase[1], 0, XV_ROW_B, NDT_V)):   # Q then dO
+            for rb_, img, xrow, ndt in (
+                (rbase[0], QOFF, XK_ROW_B, NDT_QK),
+                (rbase[1], 0, XV_ROW_B, NDT_V),
+            ):  # Q then dO
                 for dt in range_constexpr(ndt):
                     for u in range_constexpr(2):
-                        out.append(fx.Vector(llvm_dialect.load(
-                            v8b, create_llvm_ptr(
-                                rb_ + fx.Int32(hh * 16 * xrow + img + dt * 64 + u * 32),
-                                address_space=3))))
+                        out.append(
+                            fx.Vector(
+                                llvm_dialect.load(
+                                    v8b,
+                                    create_llvm_ptr(
+                                        rb_ + fx.Int32(hh * 16 * xrow + img + dt * 64 + u * 32),
+                                        address_space=3,
+                                    ),
+                                )
+                            )
+                        )
         return out
 
-    def _body(acc, pre, qt, gh, do_mask, qt_n, gh_n, carry=True,
-              cur_off=None, nxt_off=None, pf_qt=None, pf_gh=None, qd=None, rb_off=None,
-              pf3=None):
+    def _body(
+        acc,
+        pre,
+        qt,
+        gh,
+        do_mask,
+        qt_n,
+        gh_n,
+        carry=True,
+        cur_off=None,
+        nxt_off=None,
+        pf_qt=None,
+        pf_gh=None,
+        qd=None,
+        rb_off=None,
+        pf3=None,
+    ):
         q0 = qt * fx.Int32(32)
 
         # carry=True (qloop_full): this iteration's S/dP B operands arrive in VGPRs (qd),
@@ -552,23 +586,22 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
             tdm_ops.tensor_wait(0)
             rocdl.sched_barrier(0)
             if const_expr(nw > 1):
-                _lds_barrier()                # RAW: every wave's half of the tile landed
+                _lds_barrier()  # RAW: every wave's half of the tile landed
                 rocdl.sched_barrier(0)
         lds_do = _lds0 + cur_off
 
         # The S/dP B operands, read back from the TDM image: lane (row, half) reads row
         # hh*16+row, bytes half*16 + dt*64 (+32).
         ops = qd if const_expr(carry) else _rdqd(cur_off)
-        pst = []                    # P/dS stores deferred into one DS burst
+        pst = []  # P/dS stores deferred into one DS burst
         for hh in range_constexpr(2):
-            qp = [(ops[hh * NHB + dt * 2], ops[hh * NHB + dt * 2 + 1])
-                  for dt in range_constexpr(NDT_QK)]
-            dp = [(ops[hh * NHB + NQE + dt * 2], ops[hh * NHB + NQE + dt * 2 + 1])
-                  for dt in range_constexpr(NDT_V)]
-            qfr = [qp[dt][0].shuffle(qp[dt][1], list(range(16)))
-                   for dt in range_constexpr(NDT_QK)]
-            dfr = [dp[dt][0].shuffle(dp[dt][1], list(range(16)))
-                   for dt in range_constexpr(NDT_V)]
+            qp = [(ops[hh * NHB + dt * 2], ops[hh * NHB + dt * 2 + 1]) for dt in range_constexpr(NDT_QK)]
+            dp = [
+                (ops[hh * NHB + NQE + dt * 2], ops[hh * NHB + NQE + dt * 2 + 1])
+                for dt in range_constexpr(NDT_V)
+            ]
+            qfr = [qp[dt][0].shuffle(qp[dt][1], list(range(16))) for dt in range_constexpr(NDT_QK)]
+            dfr = [dp[dt][0].shuffle(dp[dt][1], list(range(16))) for dt in range_constexpr(NDT_V)]
             q_glob = q0 + fx.Int32(hh * 16) + row
             lse_q = pre[hh * 2][0]
             del_q = pre[hh * 2 + 1][0]
@@ -580,31 +613,31 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
                 s_acc = _ir(fx.Vector.filled(8, 0.0, fx.Float32))
                 p_acc = _ir(fx.Vector.filled(8, 0.0, fx.Float32))
                 for dt in range_constexpr(NDT_MAX):
-                    if const_expr(dt < NDT_QK):     # S^T = K Q^T contracts D_QK
+                    if const_expr(dt < NDT_QK):  # S^T = K Q^T contracts D_QK
                         s_acc = rocdl.wmma_f32_16x16x32_bf16(
-                            v8f, _ir(kf[kh][dt]), _ir(qfr[dt]), s_acc,
-                            reuseA=False, reuseB=False).result
-                    if const_expr(dt < NDT_V):      # dP^T = V dO^T contracts D_V
+                            v8f, _ir(kf[kh][dt]), _ir(qfr[dt]), s_acc, reuseA=False, reuseB=False
+                        ).result
+                    if const_expr(dt < NDT_V):  # dP^T = V dO^T contracts D_V
                         p_acc = rocdl.wmma_f32_16x16x32_bf16(
-                            v8f, _ir(vf[kh][dt]), _ir(dfr[dt]), p_acc,
-                            reuseA=False, reuseB=False).result
+                            v8f, _ir(vf[kh][dt]), _ir(dfr[dt]), p_acc, reuseA=False, reuseB=False
+                        ).result
                 sv, pv_ = fx.Vector(s_acc), fx.Vector(p_acc)
                 # causal, BOTTOM-RIGHT: query q attends kv <= q + (Skv - Sq).
                 kvb = kv0 + fx.Int32(kh * 16) + half * fx.Int32(8)
                 tt = [fx.Float32(fx.fma(sv[si], c1_sm, nl_q)) for si in range(8)]
                 if const_expr(do_mask):
                     tt = [
-                        ((kvb + fx.Int32(si) > q_glob + cshift)
-                         & (causal != fx.Int32(0))
-                         ).select(fx.Float32(NEG), tt[si])
+                        ((kvb + fx.Int32(si) > q_glob + cshift) & (causal != fx.Int32(0))).select(
+                            fx.Float32(NEG), tt[si]
+                        )
                         for si in range(8)
                     ]
                 pf = [_exp2(tt[si]) for si in range(8)]
                 p_l = [x.to(fx.BFloat16) for x in pf]
-                ds_l = [(pf[si] * fx.Float32(fx.fma(pv_[si], scale, nd_q))).to(fx.BFloat16)
-                        for si in range(8)]
-                off = ((fx.Int32(hh * 16) + row) * fx.Int32(S_ROW_B)
-                       + fx.Int32(kh * 32) + half * fx.Int32(16))
+                ds_l = [
+                    (pf[si] * fx.Float32(fx.fma(pv_[si], scale, nd_q))).to(fx.BFloat16) for si in range(8)
+                ]
+                off = (fx.Int32(hh * 16) + row) * fx.Int32(S_ROW_B) + fx.Int32(kh * 32) + half * fx.Int32(16)
                 pst.append((fx.Vector.from_elements(p_l, dtype=fx.BFloat16), lds_p + off))
                 pst.append((fx.Vector.from_elements(ds_l, dtype=fx.BFloat16), lds_ds + off))
         # ONE DS phase per iteration. Fence off the S/dP/softmax part, then issue: the 8 P/dS
@@ -627,11 +660,12 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
         # 32 queries staged, so the contraction is FULL: rows [lane_r] and [lane_r+16]
         # concatenate in lane into a v16 operand.
         def tr(base, rowb):
-            return fx.Vector(rocdl.ds_load_tr16_b128(
-                v8b, create_llvm_ptr(base, address_space=3))).shuffle(
-                fx.Vector(rocdl.ds_load_tr16_b128(
-                    v8b, create_llvm_ptr(base + fx.Int32(16 * rowb),
-                                         address_space=3))), list(range(16)))
+            return fx.Vector(rocdl.ds_load_tr16_b128(v8b, create_llvm_ptr(base, address_space=3))).shuffle(
+                fx.Vector(
+                    rocdl.ds_load_tr16_b128(v8b, create_llvm_ptr(base + fx.Int32(16 * rowb), address_space=3))
+                ),
+                list(range(16)),
+            )
 
         # The B operands (dO, Q) are shared by BOTH kv sub-tiles; the A operands differ
         # only by a 16-column (32-byte) offset into the same [q][kv] tile.
@@ -650,8 +684,7 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
             rocdl.sched_barrier(0)
             a_dsk[0] = _a_tr(0, lds_ds)
             rocdl.sched_barrier(0)
-            b_q = [tr(tr_k + fx.Int32(QOFF + dtile * 32), XK_ROW_B)
-                   for dtile in range_constexpr(NDO_QK)]
+            b_q = [tr(tr_k + fx.Int32(QOFF + dtile * 32), XK_ROW_B) for dtile in range_constexpr(NDO_QK)]
             rocdl.sched_barrier(0)
             for kh in range_constexpr(1, NKV):
                 a_pk[kh] = _a_tr(kh, lds_p)
@@ -701,21 +734,26 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
                 _lds_barrier()
                 rocdl.sched_barrier(0)
                 rb = _rdqd(rb_off, rb_base)
-                rocdl.sched_barrier(KB_SALU_MASK)   # readback before the TDM; SALU may cross
+                rocdl.sched_barrier(KB_SALU_MASK)  # readback before the TDM; SALU may cross
                 _tdm_qdo_issue(tdm_p)
                 rocdl.sched_barrier(0)
             a_p = a_pk[kh]
             a_ds = a_dsk[kh]
             # A-operand reuse hint: within a run of WMMAs, A is one 16x32 subtile held
             # across all dtiles, so instructions 2.. of each run may reuse it.
-            for dtile in range_constexpr(NDO_V):                       # dV += P^T dO
+            for dtile in range_constexpr(NDO_V):  # dV += P^T dO
                 new[kh * NDO_V + dtile] = rocdl.wmma_f32_16x16x32_bf16(
-                    v8f, _ir(a_p), _ir(b_do[dtile]), acc[kh * NDO_V + dtile],
-                    reuseA=(dtile > 0), reuseB=False).result
-            for dtile in range_constexpr(NDO_QK):                      # dK += dS^T Q
+                    v8f, _ir(a_p), _ir(b_do[dtile]), acc[kh * NDO_V + dtile], reuseA=(dtile > 0), reuseB=False
+                ).result
+            for dtile in range_constexpr(NDO_QK):  # dK += dS^T Q
                 new[DK0 + kh * NDO_QK + dtile] = rocdl.wmma_f32_16x16x32_bf16(
-                    v8f, _ir(a_ds), _ir(b_q[dtile]), acc[DK0 + kh * NDO_QK + dtile],
-                    reuseA=(dtile > 0), reuseB=False).result
+                    v8f,
+                    _ir(a_ds),
+                    _ir(b_q[dtile]),
+                    acc[DK0 + kh * NDO_QK + dtile],
+                    reuseA=(dtile > 0),
+                    reuseB=False,
+                ).result
             if const_expr(carry and nw > 1 and kh + 1 == BAR_KH):
                 # {1 WMMA, KH0_SALU SALU} per kh0 WMMA: the prefetch's scalar math rides the run
                 for _ in range_constexpr(BAR_KH * (NDO_V + NDO_QK)):
@@ -744,8 +782,10 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
             st = list(carried)
             qi, gh = fx.Int32(st[NST]), fx.Int32(st[NST + 1])
             qn, gn = _wrap(qi, gh)
-            res = _body(st[:NST], None, qt0 + qi, gh, True,
-                        None, None, False) + [fx.as_ir_value(qn), fx.as_ir_value(gn)]
+            res = _body(st[:NST], None, qt0 + qi, gh, True, None, None, False) + [
+                fx.as_ir_value(qn),
+                fx.as_ir_value(gn),
+            ]
             final = yield res
         return final
 
@@ -759,43 +799,64 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
             # counters (cur, qi, gh) at st[-3:], LSE/delta at st[NST:NST+4], carried B
             # operands at st[NST+4:-3].
             cur, qi, gh = fx.Int32(st[-3]), fx.Int32(st[-2]), fx.Int32(st[-1])
-            qn, gn = _wrap(qi, gh)                     # decomposition of ii+1
-            live = jj < n                              # else jj clamps to n-1 == ii
+            qn, gn = _wrap(qi, gh)  # decomposition of ii+1
+            live = jj < n  # else jj clamps to n-1 == ii
             qj = fx.Int32(live.select(qn, qi))
             gj = fx.Int32(live.select(gn, gh))
             # (ii+1)%3: next iteration's stage == this iteration's readback stage
-            ncur = fx.Int32((cur == fx.Int32(2 * QDO_B)).select(
-                fx.Int32(0), cur + fx.Int32(QDO_B)))
+            ncur = fx.Int32((cur == fx.Int32(2 * QDO_B)).select(fx.Int32(0), cur + fx.Int32(QDO_B)))
             if const_expr(nw > 1):
                 # k_dkdv64: the prefetch tile is min(ii+3, n-1), issued after BARRIER(ii) into
                 # stage ii%3 == cur; _body emits these counters inside its kh0 run.
                 def _pf3(qn=qn, gn=gn, qj=qj, gj=gj, ii=ii):
-                    q2, g2 = _wrap(qn, gn)             # decomposition of ii+2
-                    live2 = (ii + fx.Int32(2)) < n     # else clamps to min(ii+1, n-1)
+                    q2, g2 = _wrap(qn, gn)  # decomposition of ii+2
+                    live2 = (ii + fx.Int32(2)) < n  # else clamps to min(ii+1, n-1)
                     q2c = fx.Int32(live2.select(q2, qj))
                     g2c = fx.Int32(live2.select(g2, gj))
-                    q3, g3 = _wrap(q2, g2)             # decomposition of ii+3
-                    live3 = (ii + fx.Int32(3)) < n     # else clamps to min(ii+2, n-1)
-                    return (qt0 + fx.Int32(live3.select(q3, q2c)),
-                            fx.Int32(live3.select(g3, g2c)))
-                res = _body(st[:NST], [fx.Vector(v) for v in st[NST:NST + 4]],
-                            qt0 + qi, gh, False,
-                            qt0 + qj, gj, True,
-                            cur, None, None, None,
-                            [fx.Vector(v) for v in st[NST + 4:-3]], ncur, pf3=_pf3)
+                    q3, g3 = _wrap(q2, g2)  # decomposition of ii+3
+                    live3 = (ii + fx.Int32(3)) < n  # else clamps to min(ii+2, n-1)
+                    return (qt0 + fx.Int32(live3.select(q3, q2c)), fx.Int32(live3.select(g3, g2c)))
+
+                res = _body(
+                    st[:NST],
+                    [fx.Vector(v) for v in st[NST : NST + 4]],
+                    qt0 + qi,
+                    gh,
+                    False,
+                    qt0 + qj,
+                    gj,
+                    True,
+                    cur,
+                    None,
+                    None,
+                    None,
+                    [fx.Vector(v) for v in st[NST + 4 : -3]],
+                    ncur,
+                    pf3=_pf3,
+                )
             else:
-                q2, g2 = _wrap(qn, gn)                 # decomposition of ii+2
-                live2 = (ii + fx.Int32(2)) < n         # else kk clamps to n-1 == jj
+                q2, g2 = _wrap(qn, gn)  # decomposition of ii+2
+                live2 = (ii + fx.Int32(2)) < n  # else kk clamps to n-1 == jj
                 pf_qt = qt0 + fx.Int32(live2.select(q2, qj))
                 pf_gh = fx.Int32(live2.select(g2, gj))
                 # prefetch stage (ii+2)%3 == (ii-1)%3: the stage before cur
-                nxo = fx.Int32((cur == fx.Int32(0)).select(
-                    fx.Int32(2 * QDO_B), cur - fx.Int32(QDO_B)))
-                res = _body(st[:NST], [fx.Vector(v) for v in st[NST:NST + 4]],
-                            qt0 + qi, gh, False,
-                            qt0 + qj, gj, True,
-                            cur, nxo, pf_qt, pf_gh,
-                            [fx.Vector(v) for v in st[NST + 4:-3]], ncur)
+                nxo = fx.Int32((cur == fx.Int32(0)).select(fx.Int32(2 * QDO_B), cur - fx.Int32(QDO_B)))
+                res = _body(
+                    st[:NST],
+                    [fx.Vector(v) for v in st[NST : NST + 4]],
+                    qt0 + qi,
+                    gh,
+                    False,
+                    qt0 + qj,
+                    gj,
+                    True,
+                    cur,
+                    nxo,
+                    pf_qt,
+                    pf_gh,
+                    [fx.Vector(v) for v in st[NST + 4 : -3]],
+                    ncur,
+                )
             res = res + [fx.as_ir_value(ncur), fx.as_ir_value(qn), fx.as_ir_value(gn)]
             final = yield res
         return final
@@ -823,7 +884,7 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
         tdm_ops.tensor_wait(TW_QDO)
         rocdl.sched_barrier(0)
         if const_expr(nw > 1):
-            _lds_barrier()                    # RAW: every wave's half of stage 0 landed
+            _lds_barrier()  # RAW: every wave's half of stage 0 landed
             rocdl.sched_barrier(0)
         rb0 = _rdqd(fx.Int32(0))
         if const_expr(nw > 1):
@@ -832,7 +893,7 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
             three = fx.Int32(2) < n
             q2 = fx.Int32(three.select(q2w, q1))
             g2 = fx.Int32(three.select(g2w, g1))
-            rocdl.sched_barrier(0)            # readback before the TDM (one region, R4 order)
+            rocdl.sched_barrier(0)  # readback before the TDM (one region, R4 order)
             _tdm_qdo(_clampqt(qt0 + q2), g2, fx.Int32(2 * QDO_B))
             rocdl.sched_barrier(0)
         return [_ir(v) for v in rb0]
@@ -888,17 +949,23 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
             if const_expr(dtile < NDO_V):
                 ov = fx.Vector(out[kh * NDO_V + dtile])
                 llvm_dialect.store(
-                    fx.as_ir_value(fx.Vector.from_elements(
-                        [ov[si].to(fx.BFloat16) for si in range_constexpr(8)],
-                        dtype=fx.BFloat16)),
-                    create_llvm_ptr(lds_ev + o, address_space=3))
+                    fx.as_ir_value(
+                        fx.Vector.from_elements(
+                            [ov[si].to(fx.BFloat16) for si in range_constexpr(8)], dtype=fx.BFloat16
+                        )
+                    ),
+                    create_llvm_ptr(lds_ev + o, address_space=3),
+                )
             if const_expr(dtile < NDO_QK):
                 ok_ = fx.Vector(out[DK0 + kh * NDO_QK + dtile])
                 llvm_dialect.store(
-                    fx.as_ir_value(fx.Vector.from_elements(
-                        [ok_[si].to(fx.BFloat16) for si in range_constexpr(8)],
-                        dtype=fx.BFloat16)),
-                    create_llvm_ptr(lds_ek + o, address_space=3))
+                    fx.as_ir_value(
+                        fx.Vector.from_elements(
+                            [ok_[si].to(fx.BFloat16) for si in range_constexpr(8)], dtype=fx.BFloat16
+                        )
+                    ),
+                    create_llvm_ptr(lds_ek + o, address_space=3),
+                )
         # lane_r / lane_c are the transposing-load address form of tr(): lane l addresses
         # row (l//16)*8 + l%8, column ((l//8)%2)*8, and receives column l%16 of rows
         # (l//16)*8 + e.
@@ -906,67 +973,133 @@ def _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK,
         gt_v = base_v + kvr * rs_v
         gt_k = gt_v if SAME_D else base_k + kvr * rs_k
         for sub in range_constexpr(NDO_MAX):
-            a = ((fx.Int32(sub * 16) + lane_r) * fx.Int32(EPI_CB)
-                 + lane_c * fx.Int32(2))
+            a = (fx.Int32(sub * 16) + lane_r) * fx.Int32(EPI_CB) + lane_c * fx.Int32(2)
             if const_expr(sub < NDO_V):
-                vv = fx.Vector(rocdl.ds_load_tr16_b128(
-                    v8b, create_llvm_ptr(lds_ev + a, address_space=3)))
+                vv = fx.Vector(rocdl.ds_load_tr16_b128(v8b, create_llvm_ptr(lds_ev + a, address_space=3)))
             if const_expr(sub < NDO_QK):
-                kk = fx.Vector(rocdl.ds_load_tr16_b128(
-                    v8b, create_llvm_ptr(lds_ek + a, address_space=3)))
+                kk = fx.Vector(rocdl.ds_load_tr16_b128(v8b, create_llvm_ptr(lds_ek + a, address_space=3)))
             if const_expr(sub < NDO_V):
-                _stv([vv[e] for e in range_constexpr(8)], g_dv8,
-                     gt_v + fx.Int32(sub * 2) + half, fx.BFloat16)
+                _stv([vv[e] for e in range_constexpr(8)], g_dv8, gt_v + fx.Int32(sub * 2) + half, fx.BFloat16)
             if const_expr(sub < NDO_QK):
-                _stv([kk[e] for e in range_constexpr(8)], g_dk8,
-                     gt_k + fx.Int32(sub * 2) + half, fx.BFloat16)
+                _stv([kk[e] for e in range_constexpr(8)], g_dk8, gt_k + fx.Int32(sub * 2) + half, fx.BFloat16)
 
 
 @flyc.kernel(known_block_size=[32, 1, 1])
-def k_dkdv(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, DO: fx.Tensor,
-           LSE: fx.Tensor, DEL: fx.Tensor, DV_: fx.Tensor, DK: fx.Tensor,
-           scale: fx.Float32, Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32,
-           G: fx.Int32, nqt: fx.Int32, cshift: fx.Int32, causal: fx.Int32, B_: fx.Int32):
+def k_dkdv(
+    Q: fx.Tensor,
+    K: fx.Tensor,
+    V: fx.Tensor,
+    DO: fx.Tensor,
+    LSE: fx.Tensor,
+    DEL: fx.Tensor,
+    DV_: fx.Tensor,
+    DK: fx.Tensor,
+    scale: fx.Float32,
+    Sq: fx.Int32,
+    Skv: fx.Int32,
+    Hq: fx.Int32,
+    Hkv: fx.Int32,
+    G: fx.Int32,
+    nqt: fx.Int32,
+    cshift: fx.Int32,
+    causal: fx.Int32,
+    B_: fx.Int32,
+):
     _ = MODULE_KNOBS  # cache key only (see MODULE_KNOBS)
-    _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK, scale, Sq, Skv, Hq, Hkv,
-               G, nqt, cshift, causal, B_)
+    _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK, scale, Sq, Skv, Hq, Hkv, G, nqt, cshift, causal, B_)
 
 
 @flyc.jit
-def launch_dkdv(Q, K, V, DO, LSE, DEL, DV_, DK, scale: fx.Float32,
-                Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32, G: fx.Int32,
-                nqt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
-                nblk: fx.Int32, nhkv: fx.Int32, nb: fx.Int32, stream: fx.Stream):
-    k_dkdv(Q, K, V, DO, LSE, DEL, DV_, DK, scale, Sq, Skv, Hq, Hkv, G,
-           nqt, cshift, causal, nb).launch(
-        grid=(nhkv, nblk, nb), block=(32, 1, 1), stream=stream)
+def launch_dkdv(
+    Q,
+    K,
+    V,
+    DO,
+    LSE,
+    DEL,
+    DV_,
+    DK,
+    scale: fx.Float32,
+    Sq: fx.Int32,
+    Skv: fx.Int32,
+    Hq: fx.Int32,
+    Hkv: fx.Int32,
+    G: fx.Int32,
+    nqt: fx.Int32,
+    cshift: fx.Int32,
+    causal: fx.Int32,
+    nblk: fx.Int32,
+    nhkv: fx.Int32,
+    nb: fx.Int32,
+    stream: fx.Stream,
+):
+    k_dkdv(Q, K, V, DO, LSE, DEL, DV_, DK, scale, Sq, Skv, Hq, Hkv, G, nqt, cshift, causal, nb).launch(
+        grid=(nhkv, nblk, nb), block=(32, 1, 1), stream=stream
+    )
 
 
 # k_dkdv64: DKDV_NW = 2 waves per workgroup (one per SIMD at 1 wave/SIMD), 64 kv rows per
 # Q/dO fetch, so the Q/dO TDM bytes and LDS writes per dK/dV FLOP halve. Same body as k_dkdv
 # (each wave keeps its 887-VGPR register plan), one shared ring, barriers per _dkdv_impl.
 @flyc.kernel(known_block_size=[WAVE * DKDV_NW, 1, 1])
-def k_dkdv64(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, DO: fx.Tensor,
-             LSE: fx.Tensor, DEL: fx.Tensor, DV_: fx.Tensor, DK: fx.Tensor,
-             scale: fx.Float32, Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32,
-             G: fx.Int32, nqt: fx.Int32, cshift: fx.Int32, causal: fx.Int32, B_: fx.Int32,
-             HG: fx.Int32):
+def k_dkdv64(
+    Q: fx.Tensor,
+    K: fx.Tensor,
+    V: fx.Tensor,
+    DO: fx.Tensor,
+    LSE: fx.Tensor,
+    DEL: fx.Tensor,
+    DV_: fx.Tensor,
+    DK: fx.Tensor,
+    scale: fx.Float32,
+    Sq: fx.Int32,
+    Skv: fx.Int32,
+    Hq: fx.Int32,
+    Hkv: fx.Int32,
+    G: fx.Int32,
+    nqt: fx.Int32,
+    cshift: fx.Int32,
+    causal: fx.Int32,
+    B_: fx.Int32,
+    HG: fx.Int32,
+):
     _ = MODULE_KNOBS  # cache key only (see MODULE_KNOBS)
     rocdl.disable_xdl_arb_stall()  # lock_simd (SCHED_MODE.DISABLE_XDL_ARB_STALL), round 2 probe P1
-    _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK, scale, Sq, Skv, Hq, Hkv,
-               G, nqt, cshift, causal, B_, DKDV_NW, HG)
+    _dkdv_impl(
+        Q, K, V, DO, LSE, DEL, DV_, DK, scale, Sq, Skv, Hq, Hkv, G, nqt, cshift, causal, B_, DKDV_NW, HG
+    )
 
 
 @flyc.jit
-def launch_dkdv64(Q, K, V, DO, LSE, DEL, DV_, DK, scale: fx.Float32,
-                  Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32, G: fx.Int32,
-                  nqt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
-                  nblk: fx.Int32, hg: fx.Int32, ngz: fx.Int32, nb: fx.Int32, stream: fx.Stream):
+def launch_dkdv64(
+    Q,
+    K,
+    V,
+    DO,
+    LSE,
+    DEL,
+    DV_,
+    DK,
+    scale: fx.Float32,
+    Sq: fx.Int32,
+    Skv: fx.Int32,
+    Hq: fx.Int32,
+    Hkv: fx.Int32,
+    G: fx.Int32,
+    nqt: fx.Int32,
+    cshift: fx.Int32,
+    causal: fx.Int32,
+    nblk: fx.Int32,
+    hg: fx.Int32,
+    ngz: fx.Int32,
+    nb: fx.Int32,
+    stream: fx.Stream,
+):
     # grid = (hg kv heads of a head group, Skv/64 kv blocks, ngz = B*Hkv/hg head groups); kv block
     # ascending = longest first (causal); hg = Hkv is (Hkv, Skv/64, B), r3_a's grid
-    k_dkdv64(Q, K, V, DO, LSE, DEL, DV_, DK, scale, Sq, Skv, Hq, Hkv, G,
-             nqt, cshift, causal, nb, hg).launch(
-        grid=(hg, nblk, ngz), block=(WAVE * DKDV_NW, 1, 1), stream=stream)
+    k_dkdv64(Q, K, V, DO, LSE, DEL, DV_, DK, scale, Sq, Skv, Hq, Hkv, G, nqt, cshift, causal, nb, hg).launch(
+        grid=(hg, nblk, ngz), block=(WAVE * DKDV_NW, 1, 1), stream=stream
+    )
 
 
 # ===================================================================== dqg ========
@@ -978,7 +1111,7 @@ def launch_dkdv64(Q, K, V, DO, LSE, DEL, DV_, DK, scale: fx.Float32,
 #   stage (i+2)%3    : TDM for tile min(i+2, N-1), issued at the top of iteration i
 # N = nkvt_eff. The mask loop continues the SAME ring, so the full->mask handoff is just the
 # carried state. No VMEM in the hot loop.
-KV_STEP = 32                 # kv rows per k_dqg iteration: one WMMA contraction of dS
+KV_STEP = 32  # kv rows per k_dqg iteration: one WMMA contraction of dS
 NKT = KV_STEP // 16
 # queries per k_dqg wave: at D_QK = 192, 64 needs 1024 VGPR + 148 spilled (the accumulators
 # and Q/dO fragments grow 1.5x); 32 halves both (709 VGPR, no spill).
@@ -996,7 +1129,7 @@ NQW48 = DQ_BQW48 // 16
 # count; wave 0's extra steps are masked through do_mask). One barrier per kv step.
 DQ_NWAVE = 2
 DQ_BQW96 = DQ_NWAVE * DQ_BQW48
-DQ_SPLITS = (0, 32, 64)      # q_split candidates: multiples of DQ_BQW; lcm(32, 96) = 96 > 64
+DQ_SPLITS = (0, 32, 64)  # q_split candidates: multiples of DQ_BQW; lcm(32, 96) = 96 > 64
 
 
 def dq_split(sq, bqw=DQ_BQW96):
@@ -1036,16 +1169,22 @@ def _wg_sync():
     rocdl.sched_barrier(0)
 
 
-VOFF = KV_STEP * XK_ROW_B    # ring stage: K [32][D_QK] at +0, V [32][D_V] at +VOFF
-KV_B = KV_STEP * (XK_ROW_B + XV_ROW_B)       # one ring stage (21504 B at 192/128)
-TDM_OPS_KV = len(_pow2_segments(D_QK)) + len(_pow2_segments(D_V))   # TDM ops per stage
-DQT_TW = TDM_OPS_KV * (TDM_DEPTH - 2)        # tensorcnt that retires all but the newest stage
+VOFF = KV_STEP * XK_ROW_B  # ring stage: K [32][D_QK] at +0, V [32][D_V] at +VOFF
+KV_B = KV_STEP * (XK_ROW_B + XV_ROW_B)  # one ring stage (21504 B at 192/128)
+TDM_OPS_KV = len(_pow2_segments(D_QK)) + len(_pow2_segments(D_V))  # TDM ops per stage
+DQT_TW = TDM_OPS_KV * (TDM_DEPTH - 2)  # tensorcnt that retires all but the newest stage
 assert TDM_DEPTH * KV_B <= LDS_SEG
 # Carried S/dP A operands (read back one iteration early), in issue order: per (kt, dt)
 # K u0, K u1 (dt < NDT_QK) then V u0, V u1 (dt < NDT_V) -- the 16 B chunks of row kt*16+row
 # at bytes half*16 + dt*64 + u*32.
-_RD_ORDER = [(kt, dt, w, u) for kt in range(NKT) for dt in range(NDT_MAX) for w in "kv"
-             if dt < (NDT_QK if w == "k" else NDT_V) for u in range(2)]
+_RD_ORDER = [
+    (kt, dt, w, u)
+    for kt in range(NKT)
+    for dt in range(NDT_MAX)
+    for w in "kv"
+    if dt < (NDT_QK if w == "k" else NDT_V)
+    for u in range(2)
+]
 _RD_IDX = {e: i for i, e in enumerate(_RD_ORDER)}
 NP = len(_RD_ORDER)
 # Full-loop schedule ("ck"): kt0 S/dP WMMAs; kt1 S/dP in NDT_MAX chunks {the WMMAs of dtile j
@@ -1056,9 +1195,30 @@ NP = len(_RD_ORDER)
 DQT_VT_SGB = (2, 1)
 
 
-def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
-                  scale, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, q_off, ntile, nqw,
-                  nwave=1, HG=None):
+def _dqg_tdm_impl(
+    Q,
+    K,
+    V,
+    DO,
+    O,
+    LSE,
+    DEL,
+    DQ,
+    scale,
+    Sq,
+    Skv,
+    Hq,
+    Hkv,
+    G,
+    nkvt,
+    cshift,
+    causal,
+    q_off,
+    ntile,
+    nqw,
+    nwave=1,
+    HG=None,
+):
     # nqw (compile-time): 16-query sub-tiles per wave (NQW 2 = k_dqg, NQW48 3 = k_dqg48/96).
     # nwave (compile-time): waves per workgroup sharing the K/V ring (1, or DQ_NWAVE = k_dqg96).
     # The workgroup owns queries [q0g, q0g + nwave*16*nqw), q0g = q_off + bid*BQWG, bid in
@@ -1073,8 +1233,7 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
         _tid = fx.Int32(fx.thread_idx.x)
         lane = _tid % fx.Int32(WAVE)
         # wave index in the workgroup (threads [32w, 32w+32) form wave w), made uniform (SGPR)
-        wv = fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type,
-                                          (_tid // fx.Int32(WAVE)).ir_value()))
+        wv = fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, (_tid // fx.Int32(WAVE)).ir_value()))
     # XCD-major q-head remap: workgroups go to the 8 XCDs round-robin on the linear id, so
     # x -> (x%8)*(ngrp/8) + x/8 puts adjacent q heads (one kv head under GQA) on one XCD.
     # A bijection of [0, ngrp) whenever ngrp % 8 == 0, else the identity. ngrp = grid.x: Hq
@@ -1112,7 +1271,7 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
     g_del = _bv(DEL, 1 << 28, fx.Float32)
     g_dq = _bv(DQ, 1 << 30, fx.BFloat16)
 
-    rs_q = Hq * fx.Int32(DV8_QK)                # vec8 tiles between consecutive q rows
+    rs_q = Hq * fx.Int32(DV8_QK)  # vec8 tiles between consecutive q rows
     base_q = bat * Sq * rs_q + qh * fx.Int32(DV8_QK)
     rs_o = rs_q if SAME_D else Hq * fx.Int32(DV8_V)
     base_o = base_q if SAME_D else bat * Sq * rs_o + qh * fx.Int32(DV8_V)
@@ -1126,12 +1285,15 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
     def gfrag(buf, base, rs, r, dt):
         t = base + (r + row) * rs + half + fx.Int32(dt * 4)
         return _ldv(buf, t, fx.BFloat16, 8).shuffle(
-            _ldv(buf, t + fx.Int32(2), fx.BFloat16, 8), list(range(16)))
+            _ldv(buf, t + fx.Int32(2), fx.BFloat16, 8), list(range(16))
+        )
 
-    qf = [[gfrag(g_q, base_q, rs_q, q0 + fx.Int32(qh_ * 16), dt) for dt in range(NDT_QK)]
-          for qh_ in range(NQW)]
-    dof = [[gfrag(g_do, base_o, rs_o, q0 + fx.Int32(qh_ * 16), dt) for dt in range(NDT_V)]
-           for qh_ in range(NQW)]
+    qf = [
+        [gfrag(g_q, base_q, rs_q, q0 + fx.Int32(qh_ * 16), dt) for dt in range(NDT_QK)] for qh_ in range(NQW)
+    ]
+    dof = [
+        [gfrag(g_do, base_o, rs_o, q0 + fx.Int32(qh_ * 16), dt) for dt in range(NDT_V)] for qh_ in range(NQW)
+    ]
     q_glob = [q0 + fx.Int32(qh_ * 16) + row for qh_ in range(NQW)]
     lse_q = [_ld1(g_lse, base_l + q_glob[qh_], fx.Float32) for qh_ in range(NQW)]
     del_q = [_ld1(g_del, base_l + q_glob[qh_], fx.Float32) for qh_ in range(NQW)]
@@ -1144,13 +1306,14 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
     lane_c = ((lane // fx.Int32(8)) % fx.Int32(2)) * fx.Int32(8)
     # lane-only parts of the DS address families; every per-op difference is a compile-time
     # immediate (bounds_proof.py: max immediate < 65536).
-    lb_tr = lane_r * fx.Int32(XK_ROW_B) + lane_c * fx.Int32(2)    # dQ B operand (K) tr16
-    lb_rd_k = row * fx.Int32(XK_ROW_B) + half * fx.Int32(16)       # S/dP A readback, K rows
+    lb_tr = lane_r * fx.Int32(XK_ROW_B) + lane_c * fx.Int32(2)  # dQ B operand (K) tr16
+    lb_rd_k = row * fx.Int32(XK_ROW_B) + half * fx.Int32(16)  # S/dP A readback, K rows
     lb_rd_v = lb_rd_k if SAME_D else row * fx.Int32(XV_ROW_B) + half * fx.Int32(16)
 
-    _lds_bf_ty = fx.PointerType.get(elem_ty=fx.BFloat16.ir_type,
-                                    address_space=fx.AddressSpace.Shared, alignment=16)
-    _kv_rs_k = Hkv * fx.Int32(D_QK)             # elements between consecutive k rows
+    _lds_bf_ty = fx.PointerType.get(
+        elem_ty=fx.BFloat16.ir_type, address_space=fx.AddressSpace.Shared, alignment=16
+    )
+    _kv_rs_k = Hkv * fx.Int32(D_QK)  # elements between consecutive k rows
     _kv_rs_v = _kv_rs_k if SAME_D else Hkv * fx.Int32(D_V)
 
     def _tdm_kv(kv0p, stage_off):
@@ -1186,23 +1349,31 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
         out = []
         for dtile in range_constexpr(NDO_QK):
             base = tb + fx.Int32(dtile * 32)
-            out.append(fx.Vector(rocdl.ds_load_tr16_b128(
-                v8b, create_llvm_ptr(base, address_space=3))
-            ).shuffle(fx.Vector(rocdl.ds_load_tr16_b128(
-                v8b, create_llvm_ptr(base + fx.Int32(16 * XK_ROW_B), address_space=3))),
-                list(range(16))))
+            out.append(
+                fx.Vector(rocdl.ds_load_tr16_b128(v8b, create_llvm_ptr(base, address_space=3))).shuffle(
+                    fx.Vector(
+                        rocdl.ds_load_tr16_b128(
+                            v8b, create_llvm_ptr(base + fx.Int32(16 * XK_ROW_B), address_space=3)
+                        )
+                    ),
+                    list(range(16)),
+                )
+            )
         return out
 
     def _smx(sv, pv_, qh_, kt, kv0, do_mask):
         """softmax/dS of one (kt, qh) -> 8 bf16."""
         tt = [fx.Float32(fx.fma(sv[si], _c1q, _nlq[qh_])) for si in range(8)]
         if const_expr(do_mask):
-            tt = [((kv0 + fx.Int32(kt * 16) + half * fx.Int32(8) + fx.Int32(si)
-                    > q_glob[qh_] + cshift) & (causal != fx.Int32(0))
-                   ).select(fx.Float32(NEG), tt[si]) for si in range(8)]
+            tt = [
+                (
+                    (kv0 + fx.Int32(kt * 16) + half * fx.Int32(8) + fx.Int32(si) > q_glob[qh_] + cshift)
+                    & (causal != fx.Int32(0))
+                ).select(fx.Float32(NEG), tt[si])
+                for si in range(8)
+            ]
         pf = [_exp2(tt[si]) for si in range(8)]
-        return [(pf[si] * fx.Float32(fx.fma(pv_[si], scale, _ndq[qh_])))
-                .to(fx.BFloat16) for si in range(8)]
+        return [(pf[si] * fx.Float32(fx.fma(pv_[si], scale, _ndq[qh_]))).to(fx.BFloat16) for si in range(8)]
 
     def _sgb(nw):
         # {1 WMMA, DQT_VT_SGB[0] VALU, DQT_VT_SGB[1] TRANS} x nw
@@ -1216,20 +1387,18 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
     def _sdp(pre, kt, dt, s_acc, p_acc):
         """k-step dt of S^T = K Q^T (dt < NDT_QK) and dP^T = V dO^T (dt < NDT_V), all qh."""
         if const_expr(dt < NDT_QK):
-            kfr = pre[_RD_IDX[(kt, dt, "k", 0)]].shuffle(
-                pre[_RD_IDX[(kt, dt, "k", 1)]], list(range(16)))
+            kfr = pre[_RD_IDX[(kt, dt, "k", 0)]].shuffle(pre[_RD_IDX[(kt, dt, "k", 1)]], list(range(16)))
         if const_expr(dt < NDT_V):
-            vfr = pre[_RD_IDX[(kt, dt, "v", 0)]].shuffle(
-                pre[_RD_IDX[(kt, dt, "v", 1)]], list(range(16)))
+            vfr = pre[_RD_IDX[(kt, dt, "v", 0)]].shuffle(pre[_RD_IDX[(kt, dt, "v", 1)]], list(range(16)))
         for qh_ in range_constexpr(NQW):
             if const_expr(dt < NDT_QK):
                 s_acc[qh_] = rocdl.wmma_f32_16x16x32_bf16(
-                    v8f, _ir(kfr), _ir(qf[qh_][dt]), s_acc[qh_],
-                    reuseA=False, reuseB=False).result
+                    v8f, _ir(kfr), _ir(qf[qh_][dt]), s_acc[qh_], reuseA=False, reuseB=False
+                ).result
             if const_expr(dt < NDT_V):
                 p_acc[qh_] = rocdl.wmma_f32_16x16x32_bf16(
-                    v8f, _ir(vfr), _ir(dof[qh_][dt]), p_acc[qh_],
-                    reuseA=False, reuseB=False).result
+                    v8f, _ir(vfr), _ir(dof[qh_][dt]), p_acc[qh_], reuseA=False, reuseB=False
+                ).result
 
     def _body_ck(acc, pre, kv0, pf_kv0, cur, nxo, ncur):
         # Full loop: the WMMA<->softmax interleave described at DQT_VT_SGB.
@@ -1251,22 +1420,19 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
         sp_acc = []
         ds_halves = [[] for _ in range_constexpr(NQW)]
         for kt in range_constexpr(NKT):
-            s_acc = [_ir(fx.Vector.filled(8, 0.0, fx.Float32))
-                     for _ in range_constexpr(NQW)]
-            p_acc = [_ir(fx.Vector.filled(8, 0.0, fx.Float32))
-                     for _ in range_constexpr(NQW)]
+            s_acc = [_ir(fx.Vector.filled(8, 0.0, fx.Float32)) for _ in range_constexpr(NQW)]
+            p_acc = [_ir(fx.Vector.filled(8, 0.0, fx.Float32)) for _ in range_constexpr(NQW)]
             for dt in range_constexpr(NDT_MAX):
                 _sdp(pre, kt, dt, s_acc, p_acc)
                 if const_expr(kt == 1):
                     # chunk dt: this dtile's kt1 WMMAs + softmax/dS of (kt0, qh = dt)
                     if const_expr(dt < NQW):
                         s0, p0 = sp_acc[0]
-                        ds_halves[dt].append(_smx(fx.Vector(s0[dt]), fx.Vector(p0[dt]),
-                                                  dt, 0, kv0, False))
+                        ds_halves[dt].append(_smx(fx.Vector(s0[dt]), fx.Vector(p0[dt]), dt, 0, kv0, False))
                     _sgb(NQW * (int(dt < NDT_QK) + int(dt < NDT_V)))
                     rocdl.sched_barrier(0)
             if const_expr(kt == 0):
-                rocdl.sched_barrier(0)            # kt0 S/dP WMMAs: their own region
+                rocdl.sched_barrier(0)  # kt0 S/dP WMMAs: their own region
             sp_acc.append((s_acc, p_acc))
         for j in range_constexpr(NDT_MAX, NQW):  # kt0 rows without a kt1 chunk (NQW > NDT)
             s0, p0 = sp_acc[0]
@@ -1297,16 +1463,15 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
             rocdl.sched_barrier(0)
         new = [None] * (NQW * NDO_QK)
         for qh_ in range_constexpr(NQW):
-            a_ds = fx.Vector.from_elements(ds_halves[qh_][0] + ds_halves[qh_][1],
-                                           dtype=fx.BFloat16)
+            a_ds = fx.Vector.from_elements(ds_halves[qh_][0] + ds_halves[qh_][1], dtype=fx.BFloat16)
             for dtile in range_constexpr(NDO_QK):
                 new[qh_ * NDO_QK + dtile] = rocdl.wmma_f32_16x16x32_bf16(
-                    v8f, _ir(a_ds), _ir(b_ks[dtile]), acc[qh_ * NDO_QK + dtile],
-                    reuseA=False, reuseB=False).result
+                    v8f, _ir(a_ds), _ir(b_ks[dtile]), acc[qh_ * NDO_QK + dtile], reuseA=False, reuseB=False
+                ).result
             if const_expr(qh_ + 1 < NQW):
-                ds_halves[qh_ + 1].append(_smx(fx.Vector(s1[qh_ + 1]),
-                                               fx.Vector(p1[qh_ + 1]),
-                                               qh_ + 1, 1, kv0, False))
+                ds_halves[qh_ + 1].append(
+                    _smx(fx.Vector(s1[qh_ + 1]), fx.Vector(p1[qh_ + 1]), qh_ + 1, 1, kv0, False)
+                )
                 _sgb(NDO_QK)
             rocdl.sched_barrier(0)
         return new + [_ir(v) for v in rb]
@@ -1322,10 +1487,8 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
         rocdl.sched_barrier(0)
         sp_acc = []
         for kt in range_constexpr(NKT):
-            s_acc = [_ir(fx.Vector.filled(8, 0.0, fx.Float32))
-                     for _ in range_constexpr(NQW)]
-            p_acc = [_ir(fx.Vector.filled(8, 0.0, fx.Float32))
-                     for _ in range_constexpr(NQW)]
+            s_acc = [_ir(fx.Vector.filled(8, 0.0, fx.Float32)) for _ in range_constexpr(NQW)]
+            p_acc = [_ir(fx.Vector.filled(8, 0.0, fx.Float32)) for _ in range_constexpr(NQW)]
             for dt in range_constexpr(NDT_MAX):
                 _sdp(pre, kt, dt, s_acc, p_acc)
             sp_acc.append((s_acc, p_acc))
@@ -1360,15 +1523,21 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
             _wg_sync()
             rb = _rdkv(ncur)
             rocdl.sched_barrier(0)
-        a_ds = [fx.Vector.from_elements(ds_halves[qh_][0] + ds_halves[qh_][1],
-                                        dtype=fx.BFloat16)
-                for qh_ in range_constexpr(NQW)]
+        a_ds = [
+            fx.Vector.from_elements(ds_halves[qh_][0] + ds_halves[qh_][1], dtype=fx.BFloat16)
+            for qh_ in range_constexpr(NQW)
+        ]
         new = [None] * (NQW * NDO_QK)
         for qh_ in range_constexpr(NQW):
             for dtile in range_constexpr(NDO_QK):
                 new[qh_ * NDO_QK + dtile] = rocdl.wmma_f32_16x16x32_bf16(
-                    v8f, _ir(a_ds[qh_]), _ir(b_ks[dtile]), acc[qh_ * NDO_QK + dtile],
-                    reuseA=False, reuseB=False).result
+                    v8f,
+                    _ir(a_ds[qh_]),
+                    _ir(b_ks[dtile]),
+                    acc[qh_ * NDO_QK + dtile],
+                    reuseA=False,
+                    reuseB=False,
+                ).result
         return new + [_ir(v) for v in rb]
 
     NACC = NQW * NDO_QK
@@ -1383,16 +1552,28 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
                 cur = fx.Int32(st[-1])
                 ii = fx.Int32(it) + i0
                 kk = ii + fx.Int32(TDM_DEPTH - 1)
-                kk = (kk < nlast).select(kk, nlast)              # min(i+2, N-1)
-                nxo = fx.Int32((cur == fx.Int32(0)).select(      # (i+2)%3 == (i-1)%3
-                    fx.Int32((TDM_DEPTH - 1) * KV_B), cur - fx.Int32(KV_B)))
-                ncur = fx.Int32((cur == fx.Int32((TDM_DEPTH - 1) * KV_B)).select(
-                    fx.Int32(0), cur + fx.Int32(KV_B)))         # (i+1)%3
-                res = _body(st[:NACC], [fx.Vector(v) for v in st[NACC:NACC + NP]],
-                            ii * fx.Int32(KV_STEP), do_mask,
-                            kk * fx.Int32(KV_STEP), cur, nxo, ncur)
+                kk = (kk < nlast).select(kk, nlast)  # min(i+2, N-1)
+                nxo = fx.Int32(
+                    (cur == fx.Int32(0)).select(  # (i+2)%3 == (i-1)%3
+                        fx.Int32((TDM_DEPTH - 1) * KV_B), cur - fx.Int32(KV_B)
+                    )
+                )
+                ncur = fx.Int32(
+                    (cur == fx.Int32((TDM_DEPTH - 1) * KV_B)).select(fx.Int32(0), cur + fx.Int32(KV_B))
+                )  # (i+1)%3
+                res = _body(
+                    st[:NACC],
+                    [fx.Vector(v) for v in st[NACC : NACC + NP]],
+                    ii * fx.Int32(KV_STEP),
+                    do_mask,
+                    kk * fx.Int32(KV_STEP),
+                    cur,
+                    nxo,
+                    ncur,
+                )
                 final = yield res + [fx.as_ir_value(ncur)]
             return final
+
         return kvloop
 
     kvloop_full = _mkloop(False)
@@ -1409,7 +1590,7 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
     _nf = (_t < fx.Int32(0)).select(fx.Int32(0), _t // fx.Int32(KV_STEP))
     _nf = (_nf < nkvt_eff).select(_nf, nkvt_eff)
     nfull = (causal != fx.Int32(0)).select(_nf, nkvt_eff)
-    nlast = nkvt_eff - fx.Int32(1)                       # >= 0: nkvt_eff >= 1
+    nlast = nkvt_eff - fx.Int32(1)  # >= 0: nkvt_eff >= 1
 
     # prologue: stage s = tile min(s, N-1) for s = 0..1; retire stage 0, read it back.
     _tdm_kv(fx.Int32(0), fx.Int32(0))
@@ -1419,13 +1600,12 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
     rocdl.sched_barrier(0)
     tdm_ops.tensor_wait(DQT_TW)
     if const_expr(nwave > 1):
-        _wg_sync()                                       # both halves of stage 0 landed
+        _wg_sync()  # both halves of stage 0 landed
     rocdl.sched_barrier(0)
     rb0 = _rdkv(fx.Int32(0))
 
     init = [_ir(fx.Vector.filled(8, 0.0, fx.Float32)) for _ in range(NACC)]
-    out = kvloop_full(init + [_ir(v) for v in rb0] + [fx.as_ir_value(fx.Int32(0))],
-                      nfull, fx.Int32(0), nlast)
+    out = kvloop_full(init + [_ir(v) for v in rb0] + [fx.as_ir_value(fx.Int32(0))], nfull, fx.Int32(0), nlast)
     out = kvloop_mask(list(out), nkvt_eff - nfull, nfull, nlast)
     # retire the last two (clamped, never read) prefetches before the wave ends: the
     # workgroup's LDS must not be written after it is released.
@@ -1436,81 +1616,236 @@ def _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ,
             ov = fx.Vector(out[qh_ * NDO_QK + dtile])
             for si in range_constexpr(8):
                 q_i = q0 + fx.Int32(qh_ * 16) + half * fx.Int32(8) + fx.Int32(si)
-                _st1(ov[si].to(fx.BFloat16), g_dq,
-                     base_dq + q_i * Hq * fx.Int32(D_QK) + fx.Int32(dtile * 16) + row,
-                     fx.BFloat16)
+                _st1(
+                    ov[si].to(fx.BFloat16),
+                    g_dq,
+                    base_dq + q_i * Hq * fx.Int32(D_QK) + fx.Int32(dtile * 16) + row,
+                    fx.BFloat16,
+                )
 
 
 @flyc.kernel(known_block_size=[32, 1, 1])
-def k_dqg(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, DO: fx.Tensor, O: fx.Tensor,
-          LSE: fx.Tensor, DEL: fx.Tensor, DQ: fx.Tensor,
-          scale: fx.Float32, Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32,
-          G: fx.Int32, nkvt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
-          q_off: fx.Int32, ntile: fx.Int32, HG: fx.Int32):
+def k_dqg(
+    Q: fx.Tensor,
+    K: fx.Tensor,
+    V: fx.Tensor,
+    DO: fx.Tensor,
+    O: fx.Tensor,
+    LSE: fx.Tensor,
+    DEL: fx.Tensor,
+    DQ: fx.Tensor,
+    scale: fx.Float32,
+    Sq: fx.Int32,
+    Skv: fx.Int32,
+    Hq: fx.Int32,
+    Hkv: fx.Int32,
+    G: fx.Int32,
+    nkvt: fx.Int32,
+    cshift: fx.Int32,
+    causal: fx.Int32,
+    q_off: fx.Int32,
+    ntile: fx.Int32,
+    HG: fx.Int32,
+):
     _ = MODULE_KNOBS  # cache key only (see MODULE_KNOBS)
-    _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G,
-                  nkvt, cshift, causal, q_off, ntile, NQW, 1, HG)
+    _dqg_tdm_impl(
+        Q,
+        K,
+        V,
+        DO,
+        O,
+        LSE,
+        DEL,
+        DQ,
+        scale,
+        Sq,
+        Skv,
+        Hq,
+        Hkv,
+        G,
+        nkvt,
+        cshift,
+        causal,
+        q_off,
+        ntile,
+        NQW,
+        1,
+        HG,
+    )
 
 
 @flyc.kernel(known_block_size=[32, 1, 1])
-def k_dqg48(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, DO: fx.Tensor, O: fx.Tensor,
-            LSE: fx.Tensor, DEL: fx.Tensor, DQ: fx.Tensor,
-            scale: fx.Float32, Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32,
-            G: fx.Int32, nkvt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
-            q_off: fx.Int32, ntile: fx.Int32):
+def k_dqg48(
+    Q: fx.Tensor,
+    K: fx.Tensor,
+    V: fx.Tensor,
+    DO: fx.Tensor,
+    O: fx.Tensor,
+    LSE: fx.Tensor,
+    DEL: fx.Tensor,
+    DQ: fx.Tensor,
+    scale: fx.Float32,
+    Sq: fx.Int32,
+    Skv: fx.Int32,
+    Hq: fx.Int32,
+    Hkv: fx.Int32,
+    G: fx.Int32,
+    nkvt: fx.Int32,
+    cshift: fx.Int32,
+    causal: fx.Int32,
+    q_off: fx.Int32,
+    ntile: fx.Int32,
+):
     _ = MODULE_KNOBS  # cache key only (see MODULE_KNOBS)
-    _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G,
-                  nkvt, cshift, causal, q_off, ntile, NQW48)
+    _dqg_tdm_impl(
+        Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, q_off, ntile, NQW48
+    )
 
 
 @flyc.jit
-def launch_dqg(Q, K, V, DO, O, LSE, DEL, DQ, scale: fx.Float32,
-               Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32, G: fx.Int32,
-               nkvt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
-               q_off: fx.Int32, ntile: fx.Int32, hg: fx.Int32, ngz: fx.Int32,
-               stream: fx.Stream):
+def launch_dqg(
+    Q,
+    K,
+    V,
+    DO,
+    O,
+    LSE,
+    DEL,
+    DQ,
+    scale: fx.Float32,
+    Sq: fx.Int32,
+    Skv: fx.Int32,
+    Hq: fx.Int32,
+    Hkv: fx.Int32,
+    G: fx.Int32,
+    nkvt: fx.Int32,
+    cshift: fx.Int32,
+    causal: fx.Int32,
+    q_off: fx.Int32,
+    ntile: fx.Int32,
+    hg: fx.Int32,
+    ngz: fx.Int32,
+    stream: fx.Stream,
+):
     # grid = (hg q heads of a head group, ntile DQ_BQW-query tiles from q_off, ngz = B*Hq/hg
     # head groups); hg = Hq is (Hq, ntile, B), r3_a's grid
-    k_dqg(Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G,
-          nkvt, cshift, causal, q_off, ntile, hg).launch(
-        grid=(hg, ntile, ngz), block=(32, 1, 1), stream=stream)
+    k_dqg(
+        Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, q_off, ntile, hg
+    ).launch(grid=(hg, ntile, ngz), block=(32, 1, 1), stream=stream)
 
 
 @flyc.jit
-def launch_dqg48(Q, K, V, DO, O, LSE, DEL, DQ, scale: fx.Float32,
-                 Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32, G: fx.Int32,
-                 nkvt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
-                 q_off: fx.Int32, ntile: fx.Int32, ngrp: fx.Int32, nb: fx.Int32,
-                 stream: fx.Stream):
+def launch_dqg48(
+    Q,
+    K,
+    V,
+    DO,
+    O,
+    LSE,
+    DEL,
+    DQ,
+    scale: fx.Float32,
+    Sq: fx.Int32,
+    Skv: fx.Int32,
+    Hq: fx.Int32,
+    Hkv: fx.Int32,
+    G: fx.Int32,
+    nkvt: fx.Int32,
+    cshift: fx.Int32,
+    causal: fx.Int32,
+    q_off: fx.Int32,
+    ntile: fx.Int32,
+    ngrp: fx.Int32,
+    nb: fx.Int32,
+    stream: fx.Stream,
+):
     # grid = (Hq q heads, ntile DQ_BQW48-query tiles from q_off, B)
-    k_dqg48(Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G,
-            nkvt, cshift, causal, q_off, ntile).launch(
-        grid=(ngrp, ntile, nb), block=(32, 1, 1), stream=stream)
+    k_dqg48(
+        Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, q_off, ntile
+    ).launch(grid=(ngrp, ntile, nb), block=(32, 1, 1), stream=stream)
 
 
 @flyc.kernel(known_block_size=[DQ_NWAVE * WAVE, 1, 1])
-def k_dqg96(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, DO: fx.Tensor, O: fx.Tensor,
-            LSE: fx.Tensor, DEL: fx.Tensor, DQ: fx.Tensor,
-            scale: fx.Float32, Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32,
-            G: fx.Int32, nkvt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
-            q_off: fx.Int32, ntile: fx.Int32, HG: fx.Int32):
+def k_dqg96(
+    Q: fx.Tensor,
+    K: fx.Tensor,
+    V: fx.Tensor,
+    DO: fx.Tensor,
+    O: fx.Tensor,
+    LSE: fx.Tensor,
+    DEL: fx.Tensor,
+    DQ: fx.Tensor,
+    scale: fx.Float32,
+    Sq: fx.Int32,
+    Skv: fx.Int32,
+    Hq: fx.Int32,
+    Hkv: fx.Int32,
+    G: fx.Int32,
+    nkvt: fx.Int32,
+    cshift: fx.Int32,
+    causal: fx.Int32,
+    q_off: fx.Int32,
+    ntile: fx.Int32,
+    HG: fx.Int32,
+):
     _ = MODULE_KNOBS  # cache key only (see MODULE_KNOBS)
     rocdl.disable_xdl_arb_stall()  # lock_simd (SCHED_MODE.DISABLE_XDL_ARB_STALL), round 2 probe P1
-    _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G,
-                  nkvt, cshift, causal, q_off, ntile, NQW48, DQ_NWAVE, HG)
+    _dqg_tdm_impl(
+        Q,
+        K,
+        V,
+        DO,
+        O,
+        LSE,
+        DEL,
+        DQ,
+        scale,
+        Sq,
+        Skv,
+        Hq,
+        Hkv,
+        G,
+        nkvt,
+        cshift,
+        causal,
+        q_off,
+        ntile,
+        NQW48,
+        DQ_NWAVE,
+        HG,
+    )
 
 
 @flyc.jit
-def launch_dqg96(Q, K, V, DO, O, LSE, DEL, DQ, scale: fx.Float32,
-                 Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32, G: fx.Int32,
-                 nkvt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
-                 q_off: fx.Int32, ntile: fx.Int32, hg: fx.Int32, ngz: fx.Int32,
-                 stream: fx.Stream):
+def launch_dqg96(
+    Q,
+    K,
+    V,
+    DO,
+    O,
+    LSE,
+    DEL,
+    DQ,
+    scale: fx.Float32,
+    Sq: fx.Int32,
+    Skv: fx.Int32,
+    Hq: fx.Int32,
+    Hkv: fx.Int32,
+    G: fx.Int32,
+    nkvt: fx.Int32,
+    cshift: fx.Int32,
+    causal: fx.Int32,
+    q_off: fx.Int32,
+    ntile: fx.Int32,
+    hg: fx.Int32,
+    ngz: fx.Int32,
+    stream: fx.Stream,
+):
     # grid = (hg q heads of a head group, ntile DQ_BQW96-query tiles from q_off, ngz = B*Hq/hg
     # head groups), DQ_NWAVE waves per workgroup; hg = Hq is (Hq, ntile, B), r3_a's grid
-    k_dqg96(Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G,
-            nkvt, cshift, causal, q_off, ntile, hg).launch(
-        grid=(hg, ntile, ngz), block=(DQ_NWAVE * WAVE, 1, 1), stream=stream)
+    k_dqg96(
+        Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G, nkvt, cshift, causal, q_off, ntile, hg
+    ).launch(grid=(hg, ntile, ngz), block=(DQ_NWAVE * WAVE, 1, 1), stream=stream)
 
 
 # FlyDSL keys its JIT cache by the launcher's and its kernels' source, their closure scalars, and the

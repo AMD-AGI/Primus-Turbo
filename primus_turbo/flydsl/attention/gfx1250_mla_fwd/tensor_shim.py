@@ -37,12 +37,8 @@ from .kernels_common import get_warp_size
 # kernels. Enabled by default; set AITER_FLYDSL_KERNARG_PRELOAD=0 to disable it
 # globally for all kernels. AITER_FLYDSL_KERNARG_PRELOAD_COUNT overrides the
 # number of kernel arguments to preload.
-AITER_FLYDSL_KERNARG_PRELOAD = bool(
-    int(os.environ.get("AITER_FLYDSL_KERNARG_PRELOAD", "1"))
-)
-AITER_FLYDSL_KERNARG_PRELOAD_COUNT = int(
-    os.environ.get("AITER_FLYDSL_KERNARG_PRELOAD_COUNT", "32")
-)
+AITER_FLYDSL_KERNARG_PRELOAD = bool(int(os.environ.get("AITER_FLYDSL_KERNARG_PRELOAD", "1")))
+AITER_FLYDSL_KERNARG_PRELOAD_COUNT = int(os.environ.get("AITER_FLYDSL_KERNARG_PRELOAD_COUNT", "32"))
 
 # Toggle for the amdgpu-expert-scheduling-mode compile hint on the MoE GEMM
 # kernels. Disabled by default; set AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1
@@ -143,9 +139,7 @@ def ptr_buf_tensor(
     """
     unit_stride = unit_elems if unit_stride is None else unit_stride
     layout = (
-        fx.make_layout((n,), (1,))
-        if unit_elems == 1
-        else fx.make_layout((n, unit_elems), (unit_stride, 1))
+        fx.make_layout((n,), (1,)) if unit_elems == 1 else fx.make_layout((n, unit_elems), (unit_stride, 1))
     )
     pt = fx.PointerType.get(
         elem.ir_type,
@@ -230,9 +224,7 @@ def buf_copy_load(buffer, index, elem=fx.Int32, unit_elems=1, cache_modifier=0):
     """Load one vector unit, preserving an explicit buffer cache policy."""
     fragment = fx.make_rmem_tensor(unit_elems, elem)
     fx.copy(
-        buf_copy_atom(
-            unit_elems * (elem.width // 8), elem, cache_modifier=cache_modifier
-        ),
+        buf_copy_atom(unit_elems * (elem.width // 8), elem, cache_modifier=cache_modifier),
         _buf_copy_slice(buffer, index, unit_elems),
         fragment,
     )
@@ -245,9 +237,7 @@ def buf_copy_store(buffer, index, value, elem=fx.Int32, unit_elems=1, cache_modi
     fragment = fx.make_rmem_tensor(unit_elems, elem)
     fragment.store(Vec.from_elements([value], elem) if unit_elems == 1 else Vec(value))
     fx.copy(
-        buf_copy_atom(
-            unit_elems * (elem.width // 8), elem, cache_modifier=cache_modifier
-        ),
+        buf_copy_atom(unit_elems * (elem.width // 8), elem, cache_modifier=cache_modifier),
         fragment,
         _buf_copy_slice(buffer, index, unit_elems),
     )
@@ -444,9 +434,7 @@ class TensorView:
         src_offset = src_tensor.base_offset
         dst_offset = self.base_offset
         for d in range_constexpr(ndim):
-            src_offset = (
-                src_offset + thread_idxs[d] * value_layout[d] * src_tensor.stride[d]
-            )
+            src_offset = src_offset + thread_idxs[d] * value_layout[d] * src_tensor.stride[d]
             dst_offset = dst_offset + thread_idxs[d] * value_layout[d] * self.stride[d]
         value_layout_v = value_layout[:-1] + (value_layout[-1] // vec_size,)
         coords = tuple(product(*(range_constexpr(s) for s in value_layout_v)))
@@ -455,12 +443,8 @@ class TensorView:
             dst_vec_offset = dst_offset
             for d in range_constexpr(len(coord)):
                 if d == len(coord) - 1:
-                    src_vec_offset = (
-                        src_vec_offset + coord[d] * src_tensor.stride[d] * vec_size
-                    )
-                    dst_vec_offset = (
-                        dst_vec_offset + coord[d] * self.stride[d] * vec_size
-                    )
+                    src_vec_offset = src_vec_offset + coord[d] * src_tensor.stride[d] * vec_size
+                    dst_vec_offset = dst_vec_offset + coord[d] * self.stride[d] * vec_size
                 else:
                     src_vec_offset = src_vec_offset + coord[d] * src_tensor.stride[d]
                     dst_vec_offset = dst_vec_offset + coord[d] * self.stride[d]
@@ -555,6 +539,4 @@ class GTensor(TensorBase):
     @property
     def rsrc(self):
         """The raw V#, for callers still issuing `buffer_ops` byte-offset ops."""
-        return fx.rocdl.get_buffer_rsrc(
-            fx.get_iter(self._view(_fx_elem(self.dtype), 1))
-        )
+        return fx.rocdl.get_buffer_rsrc(fx.get_iter(self._view(_fx_elem(self.dtype), 1)))

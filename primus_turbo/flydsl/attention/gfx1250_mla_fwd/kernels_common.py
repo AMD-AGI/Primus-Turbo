@@ -64,10 +64,7 @@ def kernel_signature(**params: object) -> str:
     through ``format_kernel_name`` because a negative config value is legal here
     and a hyphen is not legal in a symbol.
     """
-    parts = [
-        f"{name}{int(value) if isinstance(value, bool) else value}"
-        for name, value in params.items()
-    ]
+    parts = [f"{name}{int(value) if isinstance(value, bool) else value}" for name, value in params.items()]
     return format_kernel_name("_".join(parts))
 
 
@@ -190,9 +187,7 @@ def dtype_to_elem_type(dtype_str: str):
         return T.f16
     if dtype_str == "bf16":
         return T.bf16
-    raise ValueError(
-        f"unsupported dtype: {dtype_str!r} (expected 'f32', 'f16', or 'bf16')"
-    )
+    raise ValueError(f"unsupported dtype: {dtype_str!r} (expected 'f32', 'f16', or 'bf16')")
 
 
 # LLVM address-space numbers as fx spaces: Global(1) and Shared, which is 2 in
@@ -215,9 +210,7 @@ def stream_ptr_to_async_token(stream_ptr_value, loc=None, ip=None):
     stream_llvm_ptr = create_llvm_ptr(stream_ptr_value)
 
     async_token_type = _gpu.AsyncTokenType.get()
-    cast_op = builtin.UnrealizedConversionCastOp(
-        [async_token_type], [stream_llvm_ptr], loc=loc, ip=ip
-    )
+    cast_op = builtin.UnrealizedConversionCastOp([async_token_type], [stream_llvm_ptr], loc=loc, ip=ip)
     return cast_op.results[0]
 
 

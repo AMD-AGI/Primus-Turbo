@@ -13,6 +13,7 @@
 
 """flydsl_attn_bwd: the gfx1250 FlyDSL backward (k_delta, k_dkdv64, k_dqg96 + k_dqg in kernels.py;
 k_dkdv + one k_dqg on grids too small to give every SIMD a wave: _geometry)."""
+
 import math
 import os
 
@@ -35,16 +36,19 @@ _COMPILED = {}
 def _launch(name, launcher, args):
     """Launch `launcher(*args)`, via flyc.compile's fast path after the first call."""
     # id(launcher): one plan name may map to different launchers by shape (k_dqg96 vs k_dqg).
-    key = (name, id(launcher),
-           tuple((a.dtype, a.dim()) for a in args if isinstance(a, torch.Tensor)),
-           args[0].device.index)
+    key = (
+        name,
+        id(launcher),
+        tuple((a.dtype, a.dim()) for a in args if isinstance(a, torch.Tensor)),
+        args[0].device.index,
+    )
     fn = _COMPILED.get(key)
     if fn is not None:
         fn(*args)
         return
     # flyc.compile() ISSUES this launch itself, so it must not be repeated here.
     fn = _flyc.compile(launcher, *args)
-    if fn is None:                      # COMPILE_ONLY builds return None
+    if fn is None:  # COMPILE_ONLY builds return None
         launcher(*args)
         return
     _COMPILED[key] = fn
@@ -88,7 +92,7 @@ _SIDE = {}
 # (32768 per chain) keeps the two-wave launches. FLY_BWD_SMALL_GRID=0 turns the fallback off;
 # flydsl_attn_bwd(..., small_grid=True/False) forces one set for both chains per call (A/B controls,
 # tests). Pure Python from here to _geometry's end (no torch): bounds_proof.py execs it.
-N_CU = 256                       # MI455X (gfx1250) compute units, 4 SIMDs each
+N_CU = 256  # MI455X (gfx1250) compute units, 4 SIMDs each
 SMALL_GRID_WAVES = {"dkdv": 4 * N_CU, "dq": 8 * N_CU}
 if os.environ.get("FLY_BWD_SMALL_GRID", "1") == "0":
     SMALL_GRID_WAVES = {"dkdv": 0, "dq": 0}
@@ -113,8 +117,7 @@ def _geometry(b, sq, skv, hq, hkv, small_grid=None):
         dq = [(_k.NQW, 1, 0, sq // _k.DQ_BQW)]
     else:
         q_split, n32, n96 = _k.dq_split(sq)
-        dq = (([(_k.NQW48, _k.DQ_NWAVE, q_split, n96)] if n96 else [])
-              + ([(_k.NQW, 1, 0, n32)] if n32 else []))
+        dq = ([(_k.NQW48, _k.DQ_NWAVE, q_split, n96)] if n96 else []) + ([(_k.NQW, 1, 0, n32)] if n32 else [])
     return {"dkdv": (nw, skv // (_k.BLOCK_KV * nw)), "dq": dq, "small": (dkdv_small, dq_small)}
 
 
@@ -158,9 +161,9 @@ def _check(do, q, k, v, o, lse):
     skv, hkv = k.shape[1], k.shape[2]
     dv = v.shape[-1]
     assert (dqk, dv) == (_k.D_QK, _k.D_V), (
-        f"these kernels are head dims (qk {_k.D_QK}, v {_k.D_V}) only, got ({dqk}, {dv})")
-    assert k.shape == (b, skv, hkv, dqk) and v.shape == (b, skv, hkv, dv), (
-        q.shape, k.shape, v.shape)
+        f"these kernels are head dims (qk {_k.D_QK}, v {_k.D_V}) only, got ({dqk}, {dv})"
+    )
+    assert k.shape == (b, skv, hkv, dqk) and v.shape == (b, skv, hkv, dv), (q.shape, k.shape, v.shape)
     assert o.shape == (b, sq, hq, dv) and do.shape == o.shape, (q.shape, o.shape, do.shape)
     assert lse.shape == (b, hq, sq), f"lse must be [B, Hq, Sq], got {tuple(lse.shape)}"
     assert hq % hkv == 0, f"heads_q {hq} is not a multiple of heads_kv {hkv}"
@@ -170,26 +173,29 @@ def _check(do, q, k, v, o, lse):
     assert sq % 64 == 0 and sq % _k.DQ_BQW == 0, f"seqlen_q must be a multiple of 64, got {sq}"
     # k_dkdv64 consumes DKDV_NW*BLOCK_KV = 64-row kv blocks (one 32-row tile per wave).
     assert skv % _k.KV_STEP == 0 and skv % (_k.BLOCK_KV * _k.DKDV_NW) == 0, (
-        f"seqlen_kv must be a multiple of {_k.BLOCK_KV * _k.DKDV_NW}, got {skv}")
+        f"seqlen_kv must be a multiple of {_k.BLOCK_KV * _k.DKDV_NW}, got {skv}"
+    )
     n_rows = b * sq * hq
     assert n_rows % _k.ROWS_DELTA == 0, (
-        f"batch*seqlen_q*heads_q must be a multiple of {_k.ROWS_DELTA}, got {n_rows}")
+        f"batch*seqlen_q*heads_q must be a multiple of {_k.ROWS_DELTA}, got {n_rows}"
+    )
     for name, t in (("do", do), ("q", q), ("k", k), ("v", v), ("o", o)):
         assert t.is_contiguous(), f"{name} must be contiguous"
         assert t.dtype == torch.bfloat16, f"{name} must be bf16, got {t.dtype}"
     # Byte extents the kernels compute in 32-bit arithmetic or hard-code as descriptor
     # num_records (k_dqg: 1 GiB for q/do/dq, 256 MiB for lse/delta).
-    assert max(q.numel(), o.numel()) * 2 <= (1 << 30), (
-        "q/do/dq larger than k_dqg's 1 GiB descriptor extent")
+    assert max(q.numel(), o.numel()) * 2 <= (1 << 30), "q/do/dq larger than k_dqg's 1 GiB descriptor extent"
     assert lse.numel() * 4 <= (1 << 28), "lse/delta larger than k_dqg's 256 MiB descriptor extent"
     assert max(k.numel(), v.numel()) * 2 < (1 << 31), (
-        "k/v byte extent overflows k_dkdv's int32 descriptor size")
+        "k/v byte extent overflows k_dkdv's int32 descriptor size"
+    )
     assert n_rows * _k.D_V * 2 < (1 << 31), "o/do byte extent overflows k_delta's int32 size"
     return b, sq, skv, hq, hkv
 
 
-def _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, dq_stream=None, head_group=None,
-          small_grid=None):
+def _plan(
+    do, q, k, v, o, lse, softmax_scale, causal, stream, dq_stream=None, head_group=None, small_grid=None
+):
     """Every launch flydsl_attn_bwd makes for these inputs, in issue order, plus the
     tensors it allocates. Used verbatim by the launcher below and by the compile-only gate
     (tools/flydsl/drivers/bwd_mla.py, meta tensors, stream=None), so the compiled set is
@@ -217,11 +223,28 @@ def _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, dq_stream=None, he
     dv = _alloc((b, skv, hkv, _k.D_V), v.device, v.dtype)
     geo = _geometry(b, sq, skv, hq, hkv, small_grid)
     nw, nblk = geo["dkdv"]
-    dkdv_args = (q, k, v, do, lse, delta, dv, dk, float(softmax_scale),
-                 sq, skv, hq, hkv, g, sq // 16, skv - sq, c, nblk)
+    dkdv_args = (
+        q,
+        k,
+        v,
+        do,
+        lse,
+        delta,
+        dv,
+        dk,
+        float(softmax_scale),
+        sq,
+        skv,
+        hq,
+        hkv,
+        g,
+        sq // 16,
+        skv - sq,
+        c,
+        nblk,
+    )
     launches = [
-        ("delta", _k.launch_delta,
-         (do, o, delta, sq, hq, n_rows, n_rows // _k.ROWS_DELTA, stream), "main"),
+        ("delta", _k.launch_delta, (do, o, delta, sq, hq, n_rows, n_rows // _k.ROWS_DELTA, stream), "main"),
     ]
     grids = {"delta": (n_rows // _k.ROWS_DELTA, 1, 1)}
     if nw == _k.DKDV_NW:
@@ -240,21 +263,43 @@ def _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, dq_stream=None, he
     q_split, n32, n96 = _k.dq_split(sq)
     assert q_split + n96 * _k.DQ_BQW96 == sq and n32 * _k.DQ_BQW == q_split, (sq, q_split, n32, n96)
     if geo["small"][1]:
-        q_split, n32, n96 = sq, sq // _k.DQ_BQW, 0        # k_dqg covers [0, sq)
-    dq_args = (q, k, v, do, o, lse, delta, dq, float(softmax_scale),
-               sq, skv, hq, hkv, g, skv // _k.KV_STEP, skv - sq, c)
+        q_split, n32, n96 = sq, sq // _k.DQ_BQW, 0  # k_dqg covers [0, sq)
+    dq_args = (
+        q,
+        k,
+        v,
+        do,
+        o,
+        lse,
+        delta,
+        dq,
+        float(softmax_scale),
+        sq,
+        skv,
+        hq,
+        hkv,
+        g,
+        skv // _k.KV_STEP,
+        skv - sq,
+        c,
+    )
     for i, (_, nwave, q_off, ntile) in enumerate(geo["dq"]):
         nm = "dqg" if i == 0 else "dqg_head"
         fn = _k.launch_dqg96 if nwave == _k.DQ_NWAVE else _k.launch_dqg
         launches.append((nm, fn, dq_args + (q_off, ntile, hg_q, ngz_q, dq_stream), "dq"))
         grids[nm] = (hg_q, ntile, ngz_q)
-    return {"launches": launches, "outputs": (dq, dk, dv), "delta": delta, "grids": grids,
-            "dq_split": (q_split, n32, n96), "head_group": {"kv": hg_kv, "q": hg_q, "target": tgt},
-            "small_grid": geo["small"]}
+    return {
+        "launches": launches,
+        "outputs": (dq, dk, dv),
+        "delta": delta,
+        "grids": grids,
+        "dq_split": (q_split, n32, n96),
+        "head_group": {"kv": hg_kv, "q": hg_q, "target": tgt},
+        "small_grid": geo["small"],
+    }
 
 
-def flydsl_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, head_group=None,
-                    small_grid=None):
+def flydsl_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, head_group=None, small_grid=None):
     """Flash-attention backward on gfx1250.
 
     q [B, Sq, Hq, D_QK], o/do [B, Sq, Hq, D_V], k [B, Skv, Hkv, D_QK], v [B, Skv, Hkv, D_V],
@@ -289,4 +334,4 @@ def flydsl_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, head_g
     return dq, dk, dv
 
 
-attn_bwd = flydsl_attn_bwd   # uniform name every loader uses
+attn_bwd = flydsl_attn_bwd  # uniform name every loader uses

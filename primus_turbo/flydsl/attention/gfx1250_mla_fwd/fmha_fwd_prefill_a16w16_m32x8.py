@@ -62,7 +62,6 @@ from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 
 from . import buffer_ops
-
 from .kernels_common import LOG2E, create_llvm_ptr
 from .tensor_shim import _run_compiled
 
@@ -97,6 +96,7 @@ def get_lds_capacity_bytes(gfx: str) -> int:
         return _LDS_CAPACITY_BYTES[arch]
     except KeyError as exc:
         raise ValueError(f"Unknown LDS capacity for architecture {arch!r}") from exc
+
 
 # Single source of truth for gfx1250 Expert Scheduling Mode 2 (DEP_MODE=2). Lives
 # in fmha_b16_buffer_managers. Under mode 2 the LLVM setreg (via the
@@ -287,9 +287,7 @@ O_VARIANT = "v3"
 def _wg_fence(release):
     if BARRIER_FENCE:
         llvm_dialect.fence(
-            llvm_dialect.AtomicOrdering.release
-            if release
-            else llvm_dialect.AtomicOrdering.acquire,
+            llvm_dialect.AtomicOrdering.release if release else llvm_dialect.AtomicOrdering.acquire,
             syncscope="workgroup",
         )
 
@@ -323,9 +321,7 @@ def _named_barrier_pair(warp_idx):
 
 def _lane_id():
     """Lane index within the wave (wave32), matching opus ``lane_id()``."""
-    return fx.Int32(
-        rocdl.mbcnt_lo(T.i32, fx.Int32(-1).ir_value(), fx.Int32(0).ir_value())
-    )
+    return fx.Int32(rocdl.mbcnt_lo(T.i32, fx.Int32(-1).ir_value(), fx.Int32(0).ir_value()))
 
 
 def _load_seqlen_pair(ptr_tensor, idx):
@@ -380,9 +376,7 @@ def _lpt_block_id(axis):
     gx = fx.Int32(fx.grid_dim.x)
     gy = fx.Int32(fx.grid_dim.y)
     gz = fx.Int32(fx.grid_dim.z)
-    lin = fx.Int32(gpu.block_id("x")) + gx * (
-        fx.Int32(gpu.block_id("y")) + gy * fx.Int32(gpu.block_id("z"))
-    )
+    lin = fx.Int32(gpu.block_id("x")) + gx * (fx.Int32(gpu.block_id("y")) + gy * fx.Int32(gpu.block_id("z")))
     gyz = gy * gz
     rank = lin // gyz
     rem = lin - rank * gyz
@@ -430,9 +424,7 @@ def _packed_tile_indices(gqa_ratio, warp_idx, lane_idx):
     at ``warp_row0 + qt*WMMA_M``.
     """
     kv_head = _lpt_block_id("y")
-    warp_row0 = _lpt_block_id("x") * BLOCK_M + warp_idx * (
-        WMMA_ROW_PER_WAVE * WMMA_M
-    )
+    warp_row0 = _lpt_block_id("x") * BLOCK_M + warp_idx * (WMMA_ROW_PER_WAVE * WMMA_M)
     q_head_idx = []
     seq_idx = []
     for qt in range(WMMA_ROW_PER_WAVE):
@@ -455,11 +447,7 @@ def _wmma(a, b, c):
     a/b: v16 16-bit fragments; c: v8 f32 accumulator; returns the v8 f32 result
     (raw MLIR value, feed straight back as ``c`` to accumulate)."""
     v8f32 = fx.Vector.make_type(8, fx.Float32)
-    wmma = (
-        rocdl.wmma_f32_16x16x32_f16
-        if a.dtype is fx.Float16
-        else rocdl.wmma_f32_16x16x32_bf16
-    )
+    wmma = rocdl.wmma_f32_16x16x32_f16 if a.dtype is fx.Float16 else rocdl.wmma_f32_16x16x32_bf16
     # modC defaults to WMMACModifier::none (== the old modC=0); omit it.
     return wmma(v8f32, _ir(a), _ir(b), _ir(c), reuseA=False, reuseB=False).result
 
@@ -511,11 +499,7 @@ def _qk_gemm(*, k_values, q_frags_list, n_block, dmajor=False, kv_fence=False):
                 j = (kv * NDT + dt) * 2
                 k_frag = k_values[j].shuffle(k_values[j + 1], list(range(16)))
                 for qt in range(R):
-                    acc = (
-                        s_acc_list[qt][kv]
-                        if dt > 0
-                        else fx.Vector.filled(8, 0.0, fx.Float32)
-                    )
+                    acc = s_acc_list[qt][kv] if dt > 0 else fx.Vector.filled(8, 0.0, fx.Float32)
                     s_acc_list[qt][kv] = _wmma(k_frag, q_frags_list[qt][dt], acc)
         return s_acc_list
     j = 0
@@ -526,11 +510,7 @@ def _qk_gemm(*, k_values, q_frags_list, n_block, dmajor=False, kv_fence=False):
             j += 2
             k_frag = lo.shuffle(hi, list(range(16)))
             for qt in range(R):
-                acc = (
-                    s_acc_list[qt][kv]
-                    if dt > 0
-                    else fx.Vector.filled(8, 0.0, fx.Float32)
-                )
+                acc = s_acc_list[qt][kv] if dt > 0 else fx.Vector.filled(8, 0.0, fx.Float32)
                 s_acc_list[qt][kv] = _wmma(k_frag, q_frags_list[qt][dt], acc)
     return s_acc_list
 
@@ -680,15 +660,9 @@ def _softmax(
             for i in range(8):
                 sval = fx.Float32(svec[i])
                 if q_max is not None or q_min is not None or kv_len is not None:
-                    kv_pos = (
-                        kv_pos_base + khalf * fx.Int32(8) + fx.Int32(kvt * WMMA_N + i)
-                    )
+                    kv_pos = kv_pos_base + khalf * fx.Int32(8) + fx.Int32(kvt * WMMA_N + i)
                     if q_max is not None:
-                        ubound = (
-                            q_max
-                            if kv_len is None
-                            else fx.min(q_max, kv_len - fx.Int32(1))
-                        )
+                        ubound = q_max if kv_len is None else fx.min(q_max, kv_len - fx.Int32(1))
                         sval = (kv_pos > ubound).select(neg_inf, sval)
                     if q_min is not None:
                         sval = (kv_pos < q_min).select(neg_inf, sval)
@@ -757,9 +731,7 @@ def _softmax(
             l2 = fx.Vector.from_elements([c_exp2], fx.Float32).broadcast_to(2)
             n2 = fx.Vector.from_elements([neg_m], fx.Float32).broadcast_to(2)
             for i in range(0, 8, 2):
-                sv = fx.Vector.from_elements(
-                    [s_masked[idx], s_masked[idx + 1]], fx.Float32
-                )
+                sv = fx.Vector.from_elements([s_masked[idx], s_masked[idx + 1]], fx.Float32)
                 av = fx.Vector(fmath.fma(_ir(sv), _ir(l2), _ir(n2)))
                 for e in range(2):
                     pj = exp2(fx.Float32(av[e]))
@@ -793,8 +765,7 @@ def _softmax(
         # corr == 1: fma(1, d, x) == d + x, so this matches the stale path bitwise -- provided
         # neither side may re-associate (see the d update below).
         d_new_list = [
-            fadd_t(d_prev_list[r], fadd_t(local_sum_list[r], peer(local_sum_list[r])))
-            for r in range(R)
+            fadd_t(d_prev_list[r], fadd_t(local_sum_list[r], peer(local_sum_list[r]))) for r in range(R)
         ]
         # Trigger on this lane's half-row sum (both halves are in this wave, so the ballot
         # sees every lane today's row_max test would). Ordered OGT: inf fires, NaN never
@@ -852,11 +823,7 @@ def _pv_gemm(*, v_values, p_list, v_hdim, n_block, o_acc_list=None):
     out_list = [[None] * d_tiles for _ in range(R)]
     for dt in range(d_tiles):
         accs = [
-            (
-                o_acc_list[qt][dt]
-                if o_acc_list is not None
-                else fx.Vector.filled(8, 0.0, fx.Float32)
-            )
+            (o_acc_list[qt][dt] if o_acc_list is not None else fx.Vector.filled(8, 0.0, fx.Float32))
             for qt in range(R)
         ]
         j = dt * nkt * 2
@@ -969,9 +936,7 @@ def _core_attention(
             num_waves=NUM_WAVES,
             elem_dtype=elem_dtype,
         )
-        v_mgr = VManager16bV2(
-            v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=elem_dtype
-        )
+        v_mgr = VManager16bV2(v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=elem_dtype)
     else:
         q_mgr = QManager16bV1(
             qk_hdim=qk_hdim,
@@ -986,9 +951,7 @@ def _core_attention(
             num_waves=NUM_WAVES,
             elem_dtype=elem_dtype,
         )
-        v_mgr = VManager16bV1(
-            v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=elem_dtype
-        )
+        v_mgr = VManager16bV1(v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=elem_dtype)
     k_blk_bytes = max(k_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
     v_blk_bytes = max(v_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
     slot_bytes = max(k_blk_bytes + v_blk_bytes, q_mgr.get_lds_size_in_byte())
@@ -1037,9 +1000,7 @@ def _core_attention(
     block_x = _lpt_block_id("x")
     causal_off = kv_len - q_len
     if mask_right:
-        wg_max_seq = (block_x * fx.Int32(BLOCK_M) + fx.Int32(BLOCK_M - 1)) // fx.Int32(
-            gqa_ratio
-        )
+        wg_max_seq = (block_x * fx.Int32(BLOCK_M) + fx.Int32(BLOCK_M - 1)) // fx.Int32(gqa_ratio)
         wg_max_seq = fx.min(wg_max_seq, q_len - fx.Int32(1))
         kv_len_wg = wg_max_seq + causal_off + window_right + fx.Int32(1)
         kv_len_wg = fx.min(kv_len_wg, kv_len)
@@ -1249,19 +1210,14 @@ def _core_attention(
         _pb = 0 if sync_only else _PTR_BASE
         nxt_pp = (t - start_tile + fx.Int32(1)) % fx.Int32(2)
 
-        kv_tile_start = t * fx.Int32(
-            n_block
-        )  # this tile's first (batch-relative) kv row
+        kv_tile_start = t * fx.Int32(n_block)  # this tile's first (batch-relative) kv row
 
         # Unpack loop-carried state — R independent per-q-tile (m, d, O) groups,
         # then the shared K/V ds pointers.
         if not sync_only:
             m_prev = [fx.Float32(state[qt * _QS + 0]) for qt in range(R)]
             d_prev = [fx.Float32(state[qt * _QS + 1]) for qt in range(R)]
-            o_acc = [
-                [fx.Vector(state[qt * _QS + 2 + dt]) for dt in range(d_tiles)]
-                for qt in range(R)
-            ]
+            o_acc = [[fx.Vector(state[qt * _QS + 2 + dt]) for dt in range(d_tiles)] for qt in range(R)]
         k_curr = list(state[_pb + 0 * _NKB : _pb + 1 * _NKB])
         k_next = list(state[_pb + 1 * _NKB : _pb + 2 * _NKB])
         _VB0 = _pb + 2 * _NKB
@@ -1417,14 +1373,8 @@ def _core_attention(
         # mask). K/V are shared, but each q-tile has its own S and running m/d. ----
         # Softmax for ALL R q-tiles in ONE call so the rows' max/sum tree reductions emit
         # INTERLEAVED (ILP): the rows are independent (own S, m, d) but share this tile's K/V.
-        q_max_list = [
-            seq_idx[qt] + causal_off + window_right if mask_right else None
-            for qt in range(R)
-        ]
-        q_min_list = [
-            seq_idx[qt] + causal_off - window_left if mask_left else None
-            for qt in range(R)
-        ]
+        q_max_list = [seq_idx[qt] + causal_off + window_right if mask_right else None for qt in range(R)]
+        q_min_list = [seq_idx[qt] + causal_off - window_left if mask_left else None for qt in range(R)]
         _sm_kw = dict(
             m_prev_list=m_prev,
             d_prev_list=d_prev,
@@ -1439,8 +1389,14 @@ def _core_attention(
         )
         # r7 g18: speculate only on clean tiles (no mask, no kv tail); masked tiles run today's
         # softmax directly, so the slow-path copy exists in 2 bodies instead of 4.
-        if (SPEC_STALE_MAX and ENABLE_DEFER_RESCALE and RESCALE_THRESHOLD >= 0.0
-                and mask_left is None and mask_right is None and kv_len is None):
+        if (
+            SPEC_STALE_MAX
+            and ENABLE_DEFER_RESCALE
+            and RESCALE_THRESHOLD >= 0.0
+            and mask_left is None
+            and mask_right is None
+            and kv_len is None
+        ):
             # r6 g14: fast stale-max pass; on a (rare, wave-uniform) trigger redo this tile with
             # today's softmax on S recomputed from the resident K slot. V is reloaded there too so
             # the slow path does not hold K, S and V at once (the burst above is dead on it).
@@ -1490,9 +1446,7 @@ def _core_attention(
             i0 += R
             v_values = [fx.Vector(_ir(x)) for x in outv[i0 : i0 + n_v]]
         else:
-            p_list, m_new_list, d_new_list, corr_list, do_rescale_list = _softmax(
-                s_list=s_list, **_sm_kw
-            )
+            p_list, m_new_list, d_new_list, corr_list, do_rescale_list = _softmax(s_list=s_list, **_sm_kw)
 
         if SPLIT_TILE_BARRIER:
             # fwd_r1_a mid-tile SIGNAL(t): this wave's K and V (tr16) reads of slot t are
@@ -1520,9 +1474,7 @@ def _core_attention(
 
         o_resc_list = []
         for qt in range(R):
-            corr_vec = fx.Vector.from_elements(
-                [corr_list[qt]], fx.Float32
-            ).broadcast_to(8)
+            corr_vec = fx.Vector.from_elements([corr_list[qt]], fx.Float32).broadcast_to(8)
             o_vecs = [fx.Vector(_ir(o_acc[qt][dt])) for dt in range(d_tiles)]
             if do_rescale_list[qt] is None:
                 o_resc = [ov * corr_vec for ov in o_vecs]
@@ -1543,9 +1495,7 @@ def _core_attention(
         # swapped curr<->next (4 s_swap_b32).
         out = []
         for qt in range(R):
-            out += [_raw(m_new_list[qt]), _raw(d_new_list[qt])] + [
-                _raw(o) for o in o_new_list[qt]
-            ]
+            out += [_raw(m_new_list[qt]), _raw(d_new_list[qt])] + [_raw(o) for o in o_new_list[qt]]
         # Swap curr<->next ds bases (manager-defined count each).
         out += k_next + k_curr + v_next + v_curr
         return out
@@ -1577,8 +1527,7 @@ def _core_attention(
     # (ceildiv(max q_min, n_block)); clamped into [start_tile, clean_hi].
     if mask_left:
         wg_max_seq = fx.min(
-            (block_x * fx.Int32(BLOCK_M) + fx.Int32(BLOCK_M - 1))
-            // fx.Int32(gqa_ratio),
+            (block_x * fx.Int32(BLOCK_M) + fx.Int32(BLOCK_M - 1)) // fx.Int32(gqa_ratio),
             q_len - fx.Int32(1),
         )
         qmin_max = fx.max(wg_max_seq + causal_off - window_left, fx.Int32(0))
@@ -1627,9 +1576,7 @@ def _core_attention(
             mask_right=mask_right,
             kv_len=None,
         )
-    state = _run_tiles(
-        state, clean_lo, clean_hi, mask_left=None, mask_right=None, kv_len=None
-    )
+    state = _run_tiles(state, clean_lo, clean_hi, mask_left=None, mask_right=None, kv_len=None)
     # fwd_r2_c: this wave's right-boundary tiles split at wave_end (wave-uniform scalar):
     # full tiles [clean_hi, wave_end), sync-only tiles [wave_end, n_tiles). wave_q_max is the
     # band edge of the wave's last valid row; clamped at -1 so the ceildiv divides a value >= 0.
@@ -1637,11 +1584,7 @@ def _core_attention(
     if skip:
         assert SPLIT_TILE_BARRIER, "SKIP_MASKED_TILES needs the split per-tile barrier"
         wave_max_seq = fx.min(
-            (
-                block_x * fx.Int32(BLOCK_M)
-                + warp_idx * fx.Int32(R * WMMA_M)
-                + fx.Int32(R * WMMA_M - 1)
-            )
+            (block_x * fx.Int32(BLOCK_M) + warp_idx * fx.Int32(R * WMMA_M) + fx.Int32(R * WMMA_M - 1))
             // fx.Int32(gqa_ratio),
             q_len - fx.Int32(1),
         )
@@ -1696,14 +1639,12 @@ def _core_attention(
         q_tiles_per_wave=R,
         elem_dtype=elem_dtype,
     )
-    assert (
-        o_mgr.get_lds_size_in_byte() <= slot_bytes
-    ), f"O ring budget {o_mgr.get_lds_size_in_byte()}B exceeds K|V slot {slot_bytes}B"
+    assert o_mgr.get_lds_size_in_byte() <= slot_bytes, (
+        f"O ring budget {o_mgr.get_lds_size_in_byte()}B exceeds K|V slot {slot_bytes}B"
+    )
     non_cur_pp = n_iter % fx.Int32(N_KV_PP)
     if not USE_TDM_LOADER:
-        rocdl.s_wait_asynccnt(
-            0
-        )  # V1-only WAR: retire inflight async loads before slot reuse
+        rocdl.s_wait_asynccnt(0)  # V1-only WAR: retire inflight async loads before slot reuse
     # O strides are in ELEMENTS (OManager multiplies by _BF16_BYTES itself). Both V1/V2
     # take ptr_O and build their own store descriptor internally (V1 a bounded buffer
     # resource for the masked buffer_store; V2 the TDM store atom with HW OOB drop).
@@ -1716,9 +1657,7 @@ def _core_attention(
         d_final = fx.Float32(final[qt * _QS + 1])
         o_final = [fx.Vector(final[qt * _QS + 2 + dt]) for dt in range(d_tiles)]
         # Fully-masked row (d_final==0): 1/0=inf, o_final=0, 0*inf=NaN -> guard to O=0.
-        inv = (d_final > fx.Float32(0.0)).select(
-            fx.Float32(1.0) / d_final, fx.Float32(0.0)
-        )
+        inv = (d_final > fx.Float32(0.0)).select(fx.Float32(1.0) / d_final, fx.Float32(0.0))
         inv_vec = fx.Vector.from_elements([inv], fx.Float32).broadcast_to(8)
         # NOTE (mode-2): tying o_final through va_vdst here (to cover the final PV-wmma
         # writeback -> this normalize mul) was MEASURED HARMFUL: 8192nc 1/80 -> 9/80 with
@@ -1751,9 +1690,7 @@ def _core_attention(
     # 0x7FFFFFFF, so lse_rsrc is bounded. Emitted per q-tile.
     if return_lse:
         khalf0 = (lane_idx // fx.Int32(WMMA_M)) == fx.Int32(0)
-        lse_rsrc = buffer_ops.create_buffer_resource(
-            ptr_LSE, num_records_bytes=lse_num_records_bytes
-        )
+        lse_rsrc = buffer_ops.create_buffer_resource(ptr_LSE, num_records_bytes=lse_num_records_bytes)
         for qt in range(R):
             m_final = fx.Float32(final[qt * _QS + 0])
             d_final = fx.Float32(final[qt * _QS + 1])
@@ -1761,19 +1698,11 @@ def _core_attention(
             # one multiply by ln2 (= 1/LOG2E) gives the natural-log LSE.
             lse_val = (m_final + fx.log2(d_final)) * fx.Float32(1.0 / LOG2E)
             lse_mask = khalf0 & (seq_idx[qt] < q_len)
-            lse_off_el = (
-                lse_base_elems
-                + seq_idx[qt] * stride_lse_seq
-                + q_head_idx[qt] * stride_lse_head
-            )
+            lse_off_el = lse_base_elems + seq_idx[qt] * stride_lse_seq + q_head_idx[qt] * stride_lse_head
             # Pre-mask the offset (OOB rows -> 0x7fffffff) and pass mask=None so the
             # store maps 1:1 to a single buffer_store with masking already SSA-visible.
-            lse_off_masked = lse_mask.select(
-                lse_off_el * fx.Int32(4), fx.Int32(0x7FFFFFFF)
-            )
-            buffer_ops.buffer_store(
-                lse_val, lse_rsrc, lse_off_masked, mask=None, offset_is_bytes=True
-            )
+            lse_off_masked = lse_mask.select(lse_off_el * fx.Int32(4), fx.Int32(0x7FFFFFFF))
+            buffer_ops.buffer_store(lse_val, lse_rsrc, lse_off_masked, mask=None, offset_is_bytes=True)
 
 
 def _zero_fill_attention(
@@ -1807,12 +1736,8 @@ def _zero_fill_attention(
 
     # i64: an i32 product (large total_q * stride) can overflow negative, then the
     # descriptor sign-extends it to a huge bound, defeating the 0x7FFFFFFF OOB drop.
-    o_num_records_bytes = (
-        fx.Int64(q_start + q_len) * fx.Int64(stride_o_seq) * fx.Int64(2)
-    )
-    o_rsrc = buffer_ops.create_buffer_resource(
-        ptr_O, num_records_bytes=o_num_records_bytes
-    )
+    o_num_records_bytes = fx.Int64(q_start + q_len) * fx.Int64(stride_o_seq) * fx.Int64(2)
+    o_rsrc = buffer_ops.create_buffer_resource(ptr_O, num_records_bytes=o_num_records_bytes)
     zero_o = fx.Vector.filled(_CH, 0.0, elem_dtype)
     for r in range(BLOCK_M * cpr // BLOCK_SIZE):
         cix = fx.Int32(r * BLOCK_SIZE) + tid  # flat b128-chunk index this round
@@ -1822,14 +1747,10 @@ def _zero_fill_attention(
         head = kv_head * g + prow % g
         off = (q_start + seq) * stride_o_seq + head * stride_o_head + d
         off_masked = (seq < q_len).select(off * fx.Int32(2), fx.Int32(0x7FFFFFFF))
-        buffer_ops.buffer_store(
-            zero_o, o_rsrc, off_masked, mask=None, offset_is_bytes=True
-        )
+        buffer_ops.buffer_store(zero_o, o_rsrc, off_masked, mask=None, offset_is_bytes=True)
 
     if return_lse:
-        lse_rsrc = buffer_ops.create_buffer_resource(
-            ptr_LSE, num_records_bytes=lse_num_records_bytes
-        )
+        lse_rsrc = buffer_ops.create_buffer_resource(ptr_LSE, num_records_bytes=lse_num_records_bytes)
         prow = row0 + tid  # one LSE per packed row (BLOCK_SIZE threads == BLOCK_M)
         seq = prow // g
         head = kv_head * g + prow % g
@@ -1840,9 +1761,7 @@ def _zero_fill_attention(
             lse_val = fx.Float32(float("-inf"))
         off = (q_start + seq) * stride_lse_seq + head * stride_lse_head
         off_masked = (seq < q_len).select(off * fx.Int32(4), fx.Int32(0x7FFFFFFF))
-        buffer_ops.buffer_store(
-            lse_val, lse_rsrc, off_masked, mask=None, offset_is_bytes=True
-        )
+        buffer_ops.buffer_store(lse_val, lse_rsrc, off_masked, mask=None, offset_is_bytes=True)
 
 
 # ============================================================================
@@ -1873,17 +1792,13 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
     """
     assert layout in ("thd", "bshd"), f"layout must be thd|bshd, got {layout!r}"
     # qk_hdim in {128,192,256} (D_qk, WMMA_K multiple); v_hdim fixed at 128 (D_v).
-    assert (
-        qk_hdim in SUPPORTED_QK_HDIM and v_hdim == 128
-    ), f"supports qk_hdim in {SUPPORTED_QK_HDIM} with v_hdim==128, got {qk_hdim}/{v_hdim}"
-    assert (
-        dtype_str in _DTYPE_MAP
-    ), f"dtype_str must be in {list(_DTYPE_MAP)}, got {dtype_str!r}"
+    assert qk_hdim in SUPPORTED_QK_HDIM and v_hdim == 128, (
+        f"supports qk_hdim in {SUPPORTED_QK_HDIM} with v_hdim==128, got {qk_hdim}/{v_hdim}"
+    )
+    assert dtype_str in _DTYPE_MAP, f"dtype_str must be in {list(_DTYPE_MAP)}, got {dtype_str!r}"
     ELEM_DTYPE = _DTYPE_MAP[dtype_str]
     assert gqa_ratio >= 1, f"gqa_ratio must be >= 1, got {gqa_ratio}"
-    assert (
-        n_block in N_BLOCK_CHOICES
-    ), f"n_block must be in {N_BLOCK_CHOICES}, got {n_block}"
+    assert n_block in N_BLOCK_CHOICES, f"n_block must be in {N_BLOCK_CHOICES}, got {n_block}"
 
     # FlyDSL's JIT cache key hashes function sources and closure scalars, not module globals:
     # two builds that differ only in a module-level knob (e.g. RESCALE_THRESHOLD) would share
@@ -1941,9 +1856,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
             # LSE is [total_q, nheads_q]: base = q_start*stride_lse_seq; every valid
             # element offset is < (q_start+q_len)*stride_lse_seq (< the 0x7FFFFFFF drop).
             lse_base_elems = q_start * stride_lse_seq
-            lse_num_records_bytes = (
-                fx.Int64(q_start + q_len) * fx.Int64(stride_lse_seq) * fx.Int64(4)
-            )
+            lse_num_records_bytes = fx.Int64(q_start + q_len) * fx.Int64(stride_lse_seq) * fx.Int64(4)
 
             # An empty batch (no queries OR no keys) must NOT enter the core:
             # kv_len==0 gives an empty softmax denom (d=0) and the epilogue would
@@ -2063,9 +1976,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
         # LSE is [B, nheads_q, seq_q]: base = batch*stride_lse_batch; every valid
         # element offset is < base + stride_lse_batch (< the 0x7FFFFFFF drop).
         lse_base_elems = batch * stride_lse_batch
-        lse_num_records_bytes = fx.Int64(lse_base_elems + stride_lse_batch) * fx.Int64(
-            4
-        )
+        lse_num_records_bytes = fx.Int64(lse_base_elems + stride_lse_batch) * fx.Int64(4)
 
         _ca_kw = {
             "qk_hdim": QK_HDIM,
@@ -2128,9 +2039,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
 # Launch wrappers + host entries
 # ============================================================================
 
-_launch_fns = (
-    {}
-)  # {(layout, mask_left, mask_right, return_lse, has_sink, gqa_ratio): fn}
+_launch_fns = {}  # {(layout, mask_left, mask_right, return_lse, has_sink, gqa_ratio): fn}
 
 
 def _ensure_thd_kernel(
@@ -2196,9 +2105,7 @@ def _ensure_thd_kernel(
     ):
         # 3D grid: x = tiles over (seq, q_head_in_group) per kv-head,
         #          y = kv_head, z = batch. block = 256 (8 waves x wave32).
-        grid_x = fx.Index(
-            fx.ceildiv(fx.Uint32(max_seqlen_q * gqa_ratio), fx.Uint32(BLOCK_M))
-        )
+        grid_x = fx.Index(fx.ceildiv(fx.Uint32(max_seqlen_q * gqa_ratio), fx.Uint32(BLOCK_M)))
         grid_y = fx.Index(num_heads_kv)
         grid_z = fx.Index(batch_size)
 
@@ -2303,9 +2210,7 @@ def _ensure_bshd_kernel(
     ):
         # 3D grid: x = tiles over (seq, q_head_in_group) per kv-head,
         #          y = kv_head, z = batch. block = 256 (8 waves x wave32).
-        grid_x = fx.Index(
-            fx.ceildiv(fx.Uint32(seq_len_q * gqa_ratio), fx.Uint32(BLOCK_M))
-        )
+        grid_x = fx.Index(fx.ceildiv(fx.Uint32(seq_len_q * gqa_ratio), fx.Uint32(BLOCK_M)))
         grid_y = fx.Index(num_heads_kv)
         grid_z = fx.Index(batch_size)
 
@@ -2379,31 +2284,27 @@ def flash_attn_varlen_m32x8(
     used only when ``return_lse``; allocated here when ``return_lse`` and None.
     """
     assert q.dtype in _TORCH_DTYPE_MAP.values(), f"Expected bf16 or fp16, got {q.dtype}"
-    assert (
-        k.dtype == q.dtype and v.dtype == q.dtype
-    ), f"q/k/v dtype must match, got {q.dtype}/{k.dtype}/{v.dtype}"
+    assert k.dtype == q.dtype and v.dtype == q.dtype, (
+        f"q/k/v dtype must match, got {q.dtype}/{k.dtype}/{v.dtype}"
+    )
     dtype_str = "bf16" if q.dtype == torch.bfloat16 else "fp16"
     qk_hdim = q.shape[-1]
-    assert (
-        qk_hdim in SUPPORTED_QK_HDIM
-    ), f"Expected qk_hdim in {SUPPORTED_QK_HDIM}, got {qk_hdim}"
+    assert qk_hdim in SUPPORTED_QK_HDIM, f"Expected qk_hdim in {SUPPORTED_QK_HDIM}, got {qk_hdim}"
     assert v.shape[-1] == 128, f"Expected v_hdim=128, got {v.shape[-1]}"
 
     total_q_tokens = q.shape[0]
     batch = cu_seqlens_q.shape[0] - 1
     nheads_q = q.shape[1]
     nheads_k = k.shape[1]
-    assert (
-        nheads_q % nheads_k == 0
-    ), f"nheads_q={nheads_q} must be a multiple of nheads_k={nheads_k}"
+    assert nheads_q % nheads_k == 0, f"nheads_q={nheads_q} must be a multiple of nheads_k={nheads_k}"
     gqa = nheads_q // nheads_k
 
     has_sink = sink is not None
     if has_sink:
         assert sink.dtype == torch.float32, f"sink must be fp32, got {sink.dtype}"
-        assert (
-            sink.dim() == 1 and sink.shape[0] == nheads_q
-        ), f"sink must be [nheads_q={nheads_q}], got {tuple(sink.shape)}"
+        assert sink.dim() == 1 and sink.shape[0] == nheads_q, (
+            f"sink must be [nheads_q={nheads_q}], got {tuple(sink.shape)}"
+        )
     # ptr_sink is only read when has_sink; pass q as a valid placeholder otherwise.
     sink_ptr = sink if has_sink else q
 
@@ -2421,14 +2322,10 @@ def flash_attn_varlen_m32x8(
     window_right = max(win_right, 0)
 
     if out is None:
-        out = torch.empty(
-            (total_q_tokens, nheads_q, 128), dtype=q.dtype, device=q.device
-        )
+        out = torch.empty((total_q_tokens, nheads_q, 128), dtype=q.dtype, device=q.device)
     if return_lse:
         if lse is None:
-            lse = torch.empty(
-                (total_q_tokens, nheads_q), dtype=torch.float32, device=q.device
-            )
+            lse = torch.empty((total_q_tokens, nheads_q), dtype=torch.float32, device=q.device)
         lse_ptr = lse
         stride_lse_seq = lse.stride(0)
         stride_lse_head = lse.stride(1)
@@ -2533,31 +2430,27 @@ def flash_attn_batch_m32x8(
     used only when ``return_lse``; allocated here when ``return_lse`` and None.
     """
     assert q.dtype in _TORCH_DTYPE_MAP.values(), f"Expected bf16 or fp16, got {q.dtype}"
-    assert (
-        k.dtype == q.dtype and v.dtype == q.dtype
-    ), f"q/k/v dtype must match, got {q.dtype}/{k.dtype}/{v.dtype}"
+    assert k.dtype == q.dtype and v.dtype == q.dtype, (
+        f"q/k/v dtype must match, got {q.dtype}/{k.dtype}/{v.dtype}"
+    )
     dtype_str = "bf16" if q.dtype == torch.bfloat16 else "fp16"
     assert q.dim() == 4, f"Expected 4D BSHD tensor, got rank {q.dim()}"
     qk_hdim = q.shape[-1]
-    assert (
-        qk_hdim in SUPPORTED_QK_HDIM
-    ), f"Expected qk_hdim in {SUPPORTED_QK_HDIM}, got {qk_hdim}"
+    assert qk_hdim in SUPPORTED_QK_HDIM, f"Expected qk_hdim in {SUPPORTED_QK_HDIM}, got {qk_hdim}"
     assert v.shape[-1] == 128, f"Expected v_hdim=128, got {v.shape[-1]}"
 
     batch, seq_len_q, nheads_q, _ = q.shape
     seq_len_k = k.shape[1]
     nheads_k = k.shape[2]
-    assert (
-        nheads_q % nheads_k == 0
-    ), f"nheads_q={nheads_q} must be a multiple of nheads_k={nheads_k}"
+    assert nheads_q % nheads_k == 0, f"nheads_q={nheads_q} must be a multiple of nheads_k={nheads_k}"
     gqa = nheads_q // nheads_k
 
     has_sink = sink is not None
     if has_sink:
         assert sink.dtype == torch.float32, f"sink must be fp32, got {sink.dtype}"
-        assert (
-            sink.dim() == 1 and sink.shape[0] == nheads_q
-        ), f"sink must be [nheads_q={nheads_q}], got {tuple(sink.shape)}"
+        assert sink.dim() == 1 and sink.shape[0] == nheads_q, (
+            f"sink must be [nheads_q={nheads_q}], got {tuple(sink.shape)}"
+        )
     # ptr_sink is only read when has_sink; pass q as a valid placeholder otherwise.
     sink_ptr = sink if has_sink else q
 
@@ -2575,14 +2468,10 @@ def flash_attn_batch_m32x8(
     window_right = max(win_right, 0)
 
     if out is None:
-        out = torch.empty(
-            (batch, seq_len_q, nheads_q, 128), dtype=q.dtype, device=q.device
-        )
+        out = torch.empty((batch, seq_len_q, nheads_q, 128), dtype=q.dtype, device=q.device)
     if return_lse:
         if lse is None:
-            lse = torch.empty(
-                (batch, nheads_q, seq_len_q), dtype=torch.float32, device=q.device
-            )
+            lse = torch.empty((batch, nheads_q, seq_len_q), dtype=torch.float32, device=q.device)
         lse_ptr = lse
         stride_lse_seq = lse.stride(2)
         stride_lse_head = lse.stride(1)
@@ -2602,11 +2491,7 @@ def flash_attn_batch_m32x8(
             out.zero_()
             if return_lse:
                 if sink is not None:
-                    lse.copy_(
-                        sink.to(device=lse.device, dtype=lse.dtype)
-                        .view(1, -1, 1)
-                        .expand_as(lse)
-                    )
+                    lse.copy_(sink.to(device=lse.device, dtype=lse.dtype).view(1, -1, 1).expand_as(lse))
                 else:
                     lse.fill_(float("-inf"))
         return (out, lse) if return_lse else out

@@ -107,6 +107,7 @@ whole-tile TDM, the single-wave ring of bwd_c1/r1_b with no barrier: K2 in-order
       HEAD_GROUP (bwd_r5_hg64: 64) it equals the sequence the contiguous b2 h128 launch walks at that
       same target; and at target 0 the grids and decodes are r3_a's for every shape.
 """
+
 import pathlib
 import re
 import sys
@@ -126,14 +127,20 @@ def _block(start, end, src=None):
 
 
 C = {}
-exec(_block("D_QK = ", "def _bv("), C)                 # noqa: S102  head dims, LDS layout
+exec(_block("D_QK = ", "def _bv("), C)  # noqa: S102  head dims, LDS layout
 exec(_block("KV_STEP = 32", "def _dqg_tdm_impl("), C)  # noqa: S102  k_dqg constants
 g = C.get
 D_QK, D_V, BLOCK_KV, KV_STEP, TDM_DEPTH = g("D_QK"), g("D_V"), g("BLOCK_KV"), g("KV_STEP"), g("TDM_DEPTH")
 XK, XV, S_ROW_B, LDS_SEG = g("XK_ROW_B"), g("XV_ROW_B"), g("S_ROW_B"), g("LDS_SEG")
 QOFF, QDO_B, TDM_OPS_QDO, TW_QDO = g("QOFF"), g("QDO_B"), g("TDM_OPS_QDO"), g("TW_QDO")
-NDT_QK, NDT_V, NDO_QK, NDO_V, NKV, EPI_CB = (g("NDT_QK"), g("NDT_V"), g("NDO_QK"), g("NDO_V"),
-                                             g("NKV"), g("EPI_CB"))
+NDT_QK, NDT_V, NDO_QK, NDO_V, NKV, EPI_CB = (
+    g("NDT_QK"),
+    g("NDT_V"),
+    g("NDO_QK"),
+    g("NDO_V"),
+    g("NKV"),
+    g("EPI_CB"),
+)
 DQ_BQW, VOFF, KV_B, TDM_OPS_KV, DQT_TW = g("DQ_BQW"), g("VOFF"), g("KV_B"), g("TDM_OPS_KV"), g("DQT_TW")
 RD_ORDER, NKT, NQW = g("_RD_ORDER"), g("NKT"), g("NQW")
 DQ_BQW48, NQW48, dq_split = g("DQ_BQW48"), g("NQW48"), g("dq_split")
@@ -142,21 +149,28 @@ segs = g("_pow2_segments")
 DKDV_NW, PDS_B, EPI_W, BAR_KH = g("DKDV_NW"), g("PDS_B"), g("EPI_W"), g("BAR_KH")
 HEAD_GROUP, head_group = g("HEAD_GROUP"), g("head_group")
 R_TARGETS = (0, 8, 16, 24, 32, 64, 96, 128, 256)
-B2H128_TARGET = 128             # bwd_r4_a's default: prodfold at 128 IS r3_a's b2h128 grid (R2)
+B2H128_TARGET = 128  # bwd_r4_a's default: prodfold at 128 IS r3_a's b2h128 grid (R2)
 assert HEAD_GROUP in R_TARGETS and B2H128_TARGET in R_TARGETS
 ALLOC_KV = LDS_SEG + DKDV_NW * PDS_B
-ROWS_W = 32 // DKDV_NW          # rows of every 32-row Q/dO tile one wave's TDM moves
+ROWS_W = 32 // DKDV_NW  # rows of every 32-row Q/dO tile one wave's TDM moves
 LANES = range(32)
 
 # impl._geometry (the host dispatch, bwd_r4_c) exec'd from impl.py with the kernel constants it
 # reads through `_k`; the block is pure Python by contract (no torch).
-_KNS = types.SimpleNamespace(BLOCK_KV=BLOCK_KV, DQ_BQW=DQ_BQW, DKDV_NW=DKDV_NW, NQW=NQW,
-                             NQW48=NQW48, DQ_NWAVE=DQ_NWAVE, dq_split=dq_split)
+_KNS = types.SimpleNamespace(
+    BLOCK_KV=BLOCK_KV,
+    DQ_BQW=DQ_BQW,
+    DKDV_NW=DKDV_NW,
+    NQW=NQW,
+    NQW48=NQW48,
+    DQ_NWAVE=DQ_NWAVE,
+    dq_split=dq_split,
+)
 IG = {"_k": _KNS, "os": types.SimpleNamespace(environ={})}  # the default threshold, not the caller's env
 exec(_block("N_CU = ", "# Validation only", IMPL_SRC), IG)  # noqa: S102
 SMALL_GRID_WAVES = IG["SMALL_GRID_WAVES"]
-assert SMALL_GRID_WAVES == {"dkdv": 1024, "dq": 2048}, SMALL_GRID_WAVES   # impl.py's measured crossovers
-MODES = {"two_wave": 0, "one_wave": 1 << 62}      # both chains' SMALL_GRID_WAVES forced: never / always small
+assert SMALL_GRID_WAVES == {"dkdv": 1024, "dq": 2048}, SMALL_GRID_WAVES  # impl.py's measured crossovers
+MODES = {"two_wave": 0, "one_wave": 1 << 62}  # both chains' SMALL_GRID_WAVES forced: never / always small
 
 
 def geometry(B, Sq, Skv, Hq, Hkv, thr=None):
@@ -172,49 +186,80 @@ def geometry(B, Sq, Skv, Hq, Hkv, thr=None):
 
 
 def lane_rc(lane):
-    return lane % 16, lane // 16                                     # row, half
+    return lane % 16, lane // 16  # row, half
 
 
 def lane_tr(lane):
-    return (lane // 16) * 8 + lane % 8, ((lane // 8) % 2) * 8         # lane_r, lane_c
+    return (lane // 16) * 8 + lane % 8, ((lane // 8) % 2) * 8  # lane_r, lane_c
 
 
 SHAPES = {  # name: (B, Sq, Skv, Hq, Hkv, causal)
-    "toy": (1, 256, 256, 2, 2, 1), "fast": (1, 1024, 1024, 8, 8, 1),
-    "proxy": (1, 4096, 4096, 64, 64, 1), "prod": (2, 4096, 4096, 128, 128, 1),
-    "rect": (1, 256, 384, 2, 2, 1), "edge64": (2, 64, 64, 2, 2, 1),
-    "gqa": (2, 512, 512, 8, 2, 1), "noncausal": (1, 256, 256, 2, 2, 0),
+    "toy": (1, 256, 256, 2, 2, 1),
+    "fast": (1, 1024, 1024, 8, 8, 1),
+    "proxy": (1, 4096, 4096, 64, 64, 1),
+    "prod": (2, 4096, 4096, 128, 128, 1),
+    "rect": (1, 256, 384, 2, 2, 1),
+    "edge64": (2, 64, 64, 2, 2, 1),
+    "gqa": (2, 512, 512, 8, 2, 1),
+    "noncausal": (1, 256, 256, 2, 2, 0),
     "rect_short_kv": (1, 384, 256, 2, 2, 1),
-    "s128": (1, 128, 128, 2, 2, 1), "s192": (2, 192, 192, 2, 2, 1),
+    "s128": (1, 128, 128, 2, 2, 1),
+    "s192": (2, 192, 192, 2, 2, 1),
     # bwd_r4_a: the fold launch of prod (Megatron b2 h128 SBHD views as [1, s, 256, d]), the fold
     # of gqa, and a GQA shape whose q launch is head-grouped (hg 128 of 256, B 2) while the kv
     # launch keeps r3_a's grid
-    "prodfold": (1, 4096, 4096, 256, 256, 1), "gqafold": (1, 512, 512, 16, 4, 1),
+    "prodfold": (1, 4096, 4096, 256, 256, 1),
+    "gqafold": (1, 512, 512, 16, 4, 1),
     "gqa_hg": (2, 128, 128, 256, 64, 1),
     # small-grid fallback (bwd_r4_c's rule on the head-group launches): b4h64 (prod's bytes), the
     # threshold edges (992 / 1024 one-wave workgroups), a GQA shape whose chains decide differently
     # (k_dkdv 512 small, k_dqg 4096 not), the second small-grid A/B shape b1 s2048 h16 (1024: two-wave)
     # and the card-coverage shapes of the tests (sq % 256 != 0, sq < skv rectangles, b2 folds)
     "b4h64": (4, 4096, 4096, 64, 64, 1),
-    "thr_below": (1, 1024, 1024, 31, 31, 1), "thr_at": (1, 1024, 1024, 32, 32, 1),
-    "thr_dq_below": (1, 1024, 1024, 62, 62, 1), "thr_dq_at": (1, 1024, 1024, 64, 64, 1),
+    "thr_below": (1, 1024, 1024, 31, 31, 1),
+    "thr_at": (1, 1024, 1024, 32, 32, 1),
+    "thr_dq_below": (1, 1024, 1024, 62, 62, 1),
+    "thr_dq_at": (1, 1024, 1024, 64, 64, 1),
     "sg32": (1, 2048, 2048, 32, 32, 1),
-    "gqa_mixed": (1, 2048, 2048, 64, 8, 1), "sg16": (1, 2048, 2048, 16, 16, 1),
-    "s64": (1, 64, 64, 2, 2, 1), "b2s64fold": (1, 64, 64, 4, 4, 1),
-    "r64x128": (1, 64, 128, 2, 2, 1), "r128x384": (1, 128, 384, 2, 2, 1),
+    "gqa_mixed": (1, 2048, 2048, 64, 8, 1),
+    "sg16": (1, 2048, 2048, 16, 16, 1),
+    "s64": (1, 64, 64, 2, 2, 1),
+    "b2s64fold": (1, 64, 64, 4, 4, 1),
+    "r64x128": (1, 64, 128, 2, 2, 1),
+    "r128x384": (1, 128, 384, 2, 2, 1),
     "r192x448fold": (1, 192, 448, 4, 4, 1),
 }
 # G1: the launch set impl._geometry must select per shape at the real threshold:
 # (dkdv one-wave?, dq one-wave?)
-EXPECT_SMALL = {"proxy": (False, False), "prod": (False, False), "prodfold": (False, False),
-                "b4h64": (False, False), "sg32": (False, False), "thr_dq_at": (False, False),
-                "sg16": (False, True), "thr_at": (False, True), "thr_dq_below": (False, True),
-                "gqa_mixed": (True, False), "gqa_hg": (True, False),
-                "toy": (True, True), "fast": (True, True), "rect": (True, True), "edge64": (True, True),
-                "gqa": (True, True), "gqafold": (True, True), "noncausal": (True, True),
-                "rect_short_kv": (True, True), "s64": (True, True), "s128": (True, True),
-                "s192": (True, True), "b2s64fold": (True, True), "r64x128": (True, True),
-                "r128x384": (True, True), "r192x448fold": (True, True), "thr_below": (True, True)}
+EXPECT_SMALL = {
+    "proxy": (False, False),
+    "prod": (False, False),
+    "prodfold": (False, False),
+    "b4h64": (False, False),
+    "sg32": (False, False),
+    "thr_dq_at": (False, False),
+    "sg16": (False, True),
+    "thr_at": (False, True),
+    "thr_dq_below": (False, True),
+    "gqa_mixed": (True, False),
+    "gqa_hg": (True, False),
+    "toy": (True, True),
+    "fast": (True, True),
+    "rect": (True, True),
+    "edge64": (True, True),
+    "gqa": (True, True),
+    "gqafold": (True, True),
+    "noncausal": (True, True),
+    "rect_short_kv": (True, True),
+    "s64": (True, True),
+    "s128": (True, True),
+    "s192": (True, True),
+    "b2s64fold": (True, True),
+    "r64x128": (True, True),
+    "r128x384": (True, True),
+    "r192x448fold": (True, True),
+    "thr_below": (True, True),
+}
 COUNT = {}
 
 
@@ -238,10 +283,14 @@ def tdm_image_writes(d, xrow):
             spans.append((r * xrow + 2 * c0, r * xrow + 2 * c0 + 2 * w))
     # segments tile each row's data [0, 2d) exactly, no overlap
     for r in range(32):
-        row = sorted((a - r * xrow, b - r * xrow) for a, b in spans
-                     if r * xrow <= a < (r + 1) * xrow)
-        ok(row[0][0] == 0 and row[-1][1] == 2 * d
-           and all(row[i][1] == row[i + 1][0] for i in range(len(row) - 1)), "K1", f"row tiling {row}")
+        row = sorted((a - r * xrow, b - r * xrow) for a, b in spans if r * xrow <= a < (r + 1) * xrow)
+        ok(
+            row[0][0] == 0
+            and row[-1][1] == 2 * d
+            and all(row[i][1] == row[i + 1][0] for i in range(len(row) - 1)),
+            "K1",
+            f"row tiling {row}",
+        )
     return spans
 
 
@@ -255,7 +304,7 @@ for d_, xr in ((D_QK, XK), (D_V, XV)):
     rows_w = [set(range(w * ROWS_W, (w + 1) * ROWS_W)) for w in range(DKDV_NW)]
     ok(set().union(*rows_w) == set(range(32)) and sum(map(len, rows_w)) == 32, "K1", "wave slices")
     for w in range(DKDV_NW):
-        lds_off = w * ROWS_W * xr          # = warpOff * ldsStride[0] * 2 B
+        lds_off = w * ROWS_W * xr  # = warpOff * ldsStride[0] * 2 B
         ok(lds_off == w * ROWS_W * ((d_ + 8) * 2), "K1", "slice LDS offset")
 ok(QOFF == 32 * XV and QDO_B == QOFF + 32 * XK, "K1", "k_dkdv stage = dO image + Q image")
 ok(TDM_DEPTH * QDO_B <= LDS_SEG, "K1", "Q/dO ring inside segment 0")
@@ -276,7 +325,7 @@ def written(img_spans, img_base, lo, hi):
 
 # k_dkdv LDS reads relative to the stage base, and their DS immediates
 DS_IMM = []
-RD_KV = []      # (lo, hi) of every readback/tr16 byte range, stage-relative, per lane
+RD_KV = []  # (lo, hi) of every readback/tr16 byte range, stage-relative, per lane
 for lane in LANES:
     row, half = lane_rc(lane)
     lr, lc = lane_tr(lane)
@@ -333,16 +382,28 @@ for lane in LANES:
                 ok(ev + a + 16 + 0 <= ek and (a % EPI_CB) + 16 <= 32, "K3", "dV image tr16")
             if sub < NDO_QK:
                 ok(ek + a + 16 <= ek + D_QK * EPI_CB, "K3", "dK image tr16")
-ok(NKV * (D_V + D_QK) * EPI_CB == EPI_W and DKDV_NW * EPI_W <= TDM_DEPTH * QDO_B <= LDS_SEG, "K3",
-   "per-wave epilogue images [w*EPI_W, (w+1)*EPI_W) disjoint, inside the dead ring")
-ok(PDS_B == 2 * 32 * S_ROW_B and LDS_SEG + DKDV_NW * PDS_B == ALLOC_KV and ALLOC_KV <= 160 * 1024, "K3",
-   "per-wave P/dS tiles [LDS_SEG + w*PDS_B, +PDS_B) disjoint, inside the allocation; 2 workgroups/CU fit")
-ok(max(DS_IMM) < 65536 and 2 * QDO_B + max(DS_IMM) + 16 <= LDS_SEG + 2 * 32 * S_ROW_B, "K3",
-   f"DS immediate {max(DS_IMM)}")
+ok(
+    NKV * (D_V + D_QK) * EPI_CB == EPI_W and DKDV_NW * EPI_W <= TDM_DEPTH * QDO_B <= LDS_SEG,
+    "K3",
+    "per-wave epilogue images [w*EPI_W, (w+1)*EPI_W) disjoint, inside the dead ring",
+)
+ok(
+    PDS_B == 2 * 32 * S_ROW_B and LDS_SEG + DKDV_NW * PDS_B == ALLOC_KV and ALLOC_KV <= 160 * 1024,
+    "K3",
+    "per-wave P/dS tiles [LDS_SEG + w*PDS_B, +PDS_B) disjoint, inside the allocation; 2 workgroups/CU fit",
+)
+ok(
+    max(DS_IMM) < 65536 and 2 * QDO_B + max(DS_IMM) + 16 <= LDS_SEG + 2 * 32 * S_ROW_B,
+    "K3",
+    f"DS immediate {max(DS_IMM)}",
+)
 # one-wave k_dkdv (nw = 1): allocation LDS_SEG + PDS_B, its P/dS tiles at LDS_SEG (wave 0's slot
 # above) and its epilogue image at 0 (wave 0's image above), whole-tile TDM (rows [0, 32))
-ok(EPI_W <= TDM_DEPTH * QDO_B and LDS_SEG + PDS_B <= ALLOC_KV and LDS_SEG + PDS_B <= 80 * 1024, "K3",
-   "nw = 1: epilogue image inside the dead ring, P/dS tiles inside the 70656 B allocation")
+ok(
+    EPI_W <= TDM_DEPTH * QDO_B and LDS_SEG + PDS_B <= ALLOC_KV and LDS_SEG + PDS_B <= 80 * 1024,
+    "K3",
+    "nw = 1: epilogue image inside the dead ring, P/dS tiles inside the 70656 B allocation",
+)
 
 # k_dqg LDS reads relative to the stage base
 DSQ_IMM = []
@@ -376,9 +437,9 @@ class Ring:
 
     def __init__(self, tag, ops_per_stage, nst):
         self.tag, self.k, self.q = tag, ops_per_stage, []
-        self.stage_tile = [None] * nst       # tile whose TDM ops last targeted the stage
-        self.pending = [0] * nst             # unretired ops per stage
-        self.reads = [0] * nst               # reads of the stage not yet consumed
+        self.stage_tile = [None] * nst  # tile whose TDM ops last targeted the stage
+        self.pending = [0] * nst  # unretired ops per stage
+        self.reads = [0] * nst  # reads of the stage not yet consumed
 
     def issue(self, stage, tile):
         ok(self.reads[stage] == 0, self.tag, f"TDM into stage {stage} with an unconsumed read")
@@ -394,7 +455,11 @@ class Ring:
 
     def read(self, stage, tile):
         ok(self.pending[stage] == 0, self.tag, f"read of stage {stage} with TDM in flight")
-        ok(self.stage_tile[stage] == tile, self.tag, f"stage {stage} holds {self.stage_tile[stage]} not {tile}")
+        ok(
+            self.stage_tile[stage] == tile,
+            self.tag,
+            f"stage {stage} holds {self.stage_tile[stage]} not {tile}",
+        )
         self.reads[stage] += 1
 
     def consume(self, stage):
@@ -416,9 +481,9 @@ class Ring2:
 
     def __init__(self, nw, nst, k):
         self.nw, self.k = nw, k
-        self.q = [[] for _ in range(nw)]               # per wave: stage of each unretired op
+        self.q = [[] for _ in range(nw)]  # per wave: stage of each unretired op
         self.slice_tile = [[None] * nw for _ in range(nst)]
-        self.visible = [None] * nst                   # tile readable since the last barrier
+        self.visible = [None] * nst  # tile readable since the last barrier
         self.phase_tdm, self.phase_read = set(), set()
         self.nbar = [0] * nw
 
@@ -460,8 +525,12 @@ class Ring2:
 # compile-time const_expr (no scf.if, so no wave-dependent branch), the loop trip counts derive
 # from kv0g (block id) only, and the barrier call sites are the six of the protocol.
 _DKDV_SRC = _block("def _dkdv_impl(", "@flyc.kernel(known_block_size=[32, 1, 1])")
-_WV_OK = (r"^wv = fx\.Int32\(rocdl\.wave_id\(\)\)", r"^kv0 = kv0g \+ wv \* fx\.Int32\(BLOCK_KV\)",
-          r"^lds_p = lds_p \+ wv \* fx\.Int32\(PDS_B\)", r"^_epi0 = _lds0 \+ wv \* fx\.Int32\(EPI_W\)")
+_WV_OK = (
+    r"^wv = fx\.Int32\(rocdl\.wave_id\(\)\)",
+    r"^kv0 = kv0g \+ wv \* fx\.Int32\(BLOCK_KV\)",
+    r"^lds_p = lds_p \+ wv \* fx\.Int32\(PDS_B\)",
+    r"^_epi0 = _lds0 \+ wv \* fx\.Int32\(EPI_W\)",
+)
 for ln in _DKDV_SRC.splitlines():
     t = ln.split("#", 1)[0].strip()
     if re.search(r"\bwv\b", t):
@@ -470,14 +539,23 @@ for ln in _DKDV_SRC.splitlines():
         ok("const_expr(" in t, "K6", f"runtime branch in _dkdv_impl: {t}")
     if re.match(r"^while\b", t):
         ok(False, "K6", f"while loop in _dkdv_impl: {t}")
-for pat in (r"_c = kv0g - cshift", r"_u = kv0g \+ fx\.Int32\(nw \* BLOCK_KV - 1\) - cshift",
-            r"qloop_mask\(init \+ _z2, G \* nmaskp, qp_start\)",
-            r"qloop_full\(out, G \* \(nqp_eff - nmaskp\), qp_start \+ nmaskp\)"):
+for pat in (
+    r"_c = kv0g - cshift",
+    r"_u = kv0g \+ fx\.Int32\(nw \* BLOCK_KV - 1\) - cshift",
+    r"qloop_mask\(init \+ _z2, G \* nmaskp, qp_start\)",
+    r"qloop_full\(out, G \* \(nqp_eff - nmaskp\), qp_start \+ nmaskp\)",
+):
     ok(len(re.findall(pat, _DKDV_SRC)) == 1, "K6", f"trip-count source {pat}")
-ok(sum(ln.split("#", 1)[0].strip() == "_lds_barrier()" for ln in _DKDV_SRC.splitlines()) == 6, "K6",
-   "six barrier call sites (2 mask, 2 prologue, 1 full, 1 exit)")
-ok(len(re.findall(r"const_expr\(carry and nw > 1 and kh == BAR_KH\)", _DKDV_SRC)) == 1
-   and 0 < BAR_KH < NKV, "K6", "full-loop barrier between the kv sub-tiles' WMMAs")
+ok(
+    sum(ln.split("#", 1)[0].strip() == "_lds_barrier()" for ln in _DKDV_SRC.splitlines()) == 6,
+    "K6",
+    "six barrier call sites (2 mask, 2 prologue, 1 full, 1 exit)",
+)
+ok(
+    len(re.findall(r"const_expr\(carry and nw > 1 and kh == BAR_KH\)", _DKDV_SRC)) == 1 and 0 < BAR_KH < NKV,
+    "K6",
+    "full-loop barrier between the kv sub-tiles' WMMAs",
+)
 
 
 # ------------------------------------------------------------------- k_dkdv replay
@@ -490,8 +568,8 @@ def dkdv_shape(B, Sq, Skv, Hq, Hkv, causal, written_kv, nw=DKDV_NW):
     n_q = B * Sq * Hq
     ldl_max = B * Hq * Sq
     ok(nw in (1, DKDV_NW), "K1", f"k_dkdv waves {nw}")
-    NW, BKG = nw, nw * BLOCK_KV                    # waves, kv rows per workgroup
-    RW = 32 // NW                                  # TDM rows per wave (cooperative num_warps = nw)
+    NW, BKG = nw, nw * BLOCK_KV  # waves, kv rows per workgroup
+    RW = 32 // NW  # TDM rows per wave (cooperative num_warps = nw)
     ok(Skv % BKG == 0, "K1", f"Skv % {BKG} (impl._check: Skv % 64)")
 
     def clampqt(t):
@@ -501,7 +579,7 @@ def dkdv_shape(B, Sq, Skv, Hq, Hkv, causal, written_kv, nw=DKDV_NW):
     for bat in sorted({0, B - 1}):
         for hkv in sorted({0, Hkv - 1}):
             for bid in range(Skv // BKG):
-                kv0g = bid * BKG                      # block id only
+                kv0g = bid * BKG  # block id only
                 _c = kv0g - cshift
                 qp_start = (0 if _c < 0 else _c) // 32 if causal else 0
                 nqp_eff = nqt2 - qp_start
@@ -522,12 +600,12 @@ def dkdv_shape(B, Sq, Skv, Hq, Hkv, causal, written_kv, nw=DKDV_NW):
                         elif qt >= qp_start + nmaskp:
                             ok(full, "K4", f"wave {w} pair {qt} in the full loop has masked entries")
 
-                def tdm(qt, gh, stage):
+                def tdm(qt, gh, stage, bat=bat, hkv=hkv):
                     ok(0 <= qt < nqt2 and 0 <= gh < G, "K1", f"tile ({qt},{gh})")
                     q0 = qt * 32
                     ok(Sq - q0 >= 32, "K1", "TDM outer extent < 32")
                     qh = hkv * G + gh
-                    for w in range(NW):                  # wave w's slice: rows q0 + w*RW + [0, RW)
+                    for w in range(NW):  # wave w's slice: rows q0 + w*RW + [0, RW)
                         ok(Sq - q0 - w * RW >= RW, "K1", "per-wave TDM extent clamp")
                         row0 = (bat * Sq + q0 + w * RW) * Hq + qh
                         for d in (D_V, D_QK):
@@ -537,7 +615,7 @@ def dkdv_shape(B, Sq, Skv, Hq, Hkv, causal, written_kv, nw=DKDV_NW):
                                 ok(0 <= first and last < n_q * d, "K1", f"TDM global [{first},{last}]")
                     return (qt, gh)
 
-                def ldl(qt, gh):
+                def ldl(qt, gh, bat=bat, hkv=hkv):
                     qh = hkv * G + gh
                     base_l = (bat * Hq + qh) * Sq
                     for hh in range(2):
@@ -582,18 +660,21 @@ def dkdv_shape(B, Sq, Skv, Hq, Hkv, causal, written_kv, nw=DKDV_NW):
                         ok(pf == divmod(kk, G), "K4", "prefetch counters == min(ii+2, n-1)")
                         nxo = 2 if cur == 0 else cur - 1
                         ncur = 0 if cur == 2 else cur + 1
-                        ok(nxo == (ii + 2) % 3 and ncur == (ii + 1) % 3 and st == ii % 3, "K2",
-                           "stage rotation")
-                        ring.issue(nxo, tdm(qt0 + pf[0], pf[1], nxo))   # top of the body, no wait
+                        ok(
+                            nxo == (ii + 2) % 3 and ncur == (ii + 1) % 3 and st == ii % 3,
+                            "K2",
+                            "stage rotation",
+                        )
+                        ring.issue(nxo, tdm(qt0 + pf[0], pf[1], nxo))  # top of the body, no wait
                         ldl(qt0 + qj, gj)
-                        ring.consume(st)                     # carried readback -> S/dP WMMAs
-                        ring.read(st, (qt0 + qi, gh))       # tr16 of this iteration's stage
-                        ring.consume(st)                     # consumed by the dK/dV WMMAs
+                        ring.consume(st)  # carried readback -> S/dP WMMAs
+                        ring.read(st, (qt0 + qi, gh))  # tr16 of this iteration's stage
+                        ring.consume(st)  # consumed by the dK/dV WMMAs
                         ring.wait(TW_QDO)
-                        ring.read(ncur, (qt0 + qj, gj))      # readback for ii+1 (min(ii+1, n-1))
+                        ring.read(ncur, (qt0 + qj, gj))  # readback for ii+1 (min(ii+1, n-1))
                         cur, qi, gh = ncur, qn, gn
                     ring.wait(0)
-                    ok(not ring.q, "K2", "tensorcnt 0 at exit")     # epilogue overwrites the ring
+                    ok(not ring.q, "K2", "tensorcnt 0 at exit")  # epilogue overwrites the ring
                 else:
                     ring = Ring2(NW, TDM_DEPTH, TDM_OPS_QDO)
                     # qloop_mask: BARRIER, own tile -> stage 0, wait 0, BARRIER, read stage 0
@@ -606,7 +687,7 @@ def dkdv_shape(B, Sq, Skv, Hq, Hkv, causal, written_kv, nw=DKDV_NW):
                         ring.issue(0, t)
                         ring.wait(0)
                         ring.barrier()
-                        ring.read(0, t)                      # readback + tr16, consumed in-iteration
+                        ring.read(0, t)  # readback + tr16, consumed in-iteration
                         qi, gh = wrap(qi, gh, G)
                     n = G * (nqp_eff - nmaskp)
                     qt0 = qp_start + nmaskp
@@ -622,7 +703,11 @@ def dkdv_shape(B, Sq, Skv, Hq, Hkv, causal, written_kv, nw=DKDV_NW):
                     ring.read(0, (clampqt(qt0), 0))
                     q2w, g2w = wrap(q1w, g1w, G)
                     q2p, g2p = (q2w, g2w) if 2 < n else (q1, g1)
-                    ok((q2p, g2p) == divmod(max(min(2, n - 1), 0), G), "K4", "prologue stage-2 tile == min(2, n-1)")
+                    ok(
+                        (q2p, g2p) == divmod(max(min(2, n - 1), 0), G),
+                        "K4",
+                        "prologue stage-2 tile == min(2, n-1)",
+                    )
                     ring.issue(2, tdm(clampqt(qt0 + q2p), g2p, 2))
                     cur, qi, gh = 0, 0, 0
                     for ii in range(n):
@@ -638,15 +723,17 @@ def dkdv_shape(B, Sq, Skv, Hq, Hkv, causal, written_kv, nw=DKDV_NW):
                         ok(pf == divmod(kk, G), "K4", "prefetch counters == min(ii+3, n-1)")
                         ncur = 0 if cur == 2 else cur + 1
                         ok(ncur == (ii + 1) % 3 and st == ii % 3, "K2", "stage rotation")
-                        ldl(qt0 + qj, gj)                    # LSE/delta prefetch at the top
-                        ring.read(st, (qt0 + qi, gh))       # tr16 of this iteration's stage
-                        ring.wait(TW_QDO)                    # after the WMMAs of kv sub-tiles < BAR_KH
+                        ldl(qt0 + qj, gj)  # LSE/delta prefetch at the top
+                        ring.read(st, (qt0 + qi, gh))  # tr16 of this iteration's stage
+                        ring.wait(TW_QDO)  # after the WMMAs of kv sub-tiles < BAR_KH
                         ring.barrier()
-                        ring.read(ncur, (qt0 + qj, gj))      # readback for ii+1 (min(ii+1, n-1))
-                        ring.issue(st, tdm(qt0 + pf[0], pf[1], st))   # prefetch ii+3 -> stage ii%3, after BARRIER(ii)
+                        ring.read(ncur, (qt0 + qj, gj))  # readback for ii+1 (min(ii+1, n-1))
+                        ring.issue(
+                            st, tdm(qt0 + pf[0], pf[1], st)
+                        )  # prefetch ii+3 -> stage ii%3, after BARRIER(ii)
                         cur, qi, gh = ncur, qn, gn
                     ring.wait(0)
-                    ring.barrier()                           # epilogue barrier
+                    ring.barrier()  # epilogue barrier
                     ring.epilogue()
                     # K6: every wave took the same barriers, as many as the protocol says
                     nb_exp = 2 * G * nmaskp + 2 + n + 1
@@ -659,15 +746,24 @@ def dkdv_shape(B, Sq, Skv, Hq, Hkv, causal, written_kv, nw=DKDV_NW):
                     for kh in range(NKV):
                         for lane in LANES:
                             row, half = lane_rc(lane)
-                            for base, rs, ndt, d in ((base_k, rs_k, NDT_QK, D_QK), (base_v, rs_v, NDT_V, D_V)):
+                            for base, rs, ndt, d in (
+                                (base_k, rs_k, NDT_QK, D_QK),
+                                (base_v, rs_v, NDT_V, D_V),
+                            ):
                                 for dt in range(ndt):
                                     for t in (base + (kv0 + kh * 16 + row) * rs + half + dt * 4,):
                                         for tt in (t, t + 2):
-                                            ok(0 <= tt * 8 and tt * 8 + 8 <= B * Skv * Hkv * d, "K3", "K/V frag")
+                                            ok(
+                                                0 <= tt * 8 and tt * 8 + 8 <= B * Skv * Hkv * d,
+                                                "K3",
+                                                "K/V frag",
+                                            )
                                             ok((tt * 8) % d + 8 <= d, "K3", "K/V frag inside its row")
                             for sub in range(max(NDO_V, NDO_QK)):
-                                for base, rs, nd, d, key in ((base_v, rs_v, NDO_V, D_V, "v"),
-                                                             (base_k, rs_k, NDO_QK, D_QK, "k")):
+                                for base, rs, nd, d, key in (
+                                    (base_v, rs_v, NDO_V, D_V, "v"),
+                                    (base_k, rs_k, NDO_QK, D_QK, "k"),
+                                ):
                                     if sub < nd:
                                         t = base + (kv0 + kh * 16 + row) * rs + sub * 2 + half
                                         for e in range(8):
@@ -683,10 +779,10 @@ def dkdv_cover(B, Sq, Skv, Hq, Hkv, nw=DKDV_NW):
     for key, d, nd in (("v", D_V, NDO_V), ("k", D_QK, NDO_QK)):
         seen = set()
         for w in range(nw):
-            for kvr in range(BLOCK_KV):             # kh*16 + row
+            for kvr in range(BLOCK_KV):  # kh*16 + row
                 for sub in range(nd):
                     for half in range(2):
-                        c = (sub * 2 + half) * 8    # column of the 8-element run
+                        c = (sub * 2 + half) * 8  # column of the 8-element run
                         ok(c + 8 <= d, "K5", "run inside the row")
                         seen.add((w * BLOCK_KV + kvr, c))
         ok(len(seen) == nw * BLOCK_KV * d // 8, "K5", f"d{key} tile coverage {len(seen)}")
@@ -725,8 +821,8 @@ def ring2_events(N, nwave, mut=None):
         for i in range(N):
             cur, nxo, ncur = i % 3, (i + 2) % 3, (i + 1) % 3
             ev.append(("tdm", nxo, min(i + 2, N - 1)))
-            ev.append(("use", "rb"))                         # S/dP WMMAs: carried readback
-            ev.append(("read", cur, i, "tr"))                # dQ B operands (tr16)
+            ev.append(("use", "rb"))  # S/dP WMMAs: carried readback
+            ev.append(("read", cur, i, "tr"))  # dQ B operands (tr16)
             ev.append(("twait", TW + 3 if mut == "deep_wait" else TW))
             if mut == "read_above_bar":
                 ev.append(("read", ncur, min(i + 1, N - 1), "rb"))
@@ -735,7 +831,7 @@ def ring2_events(N, nwave, mut=None):
             ev.append(("bar",))
             if mut != "read_above_bar":
                 ev.append(("read", ncur, min(i + 1, N - 1), "rb"))
-            ev.append(("use", "tr"))                         # dQ WMMAs
+            ev.append(("use", "tr"))  # dQ WMMAs
         ev.append(("twait", 0))
         ev.append(("end",))
         out[w] = ev
@@ -756,16 +852,15 @@ class Viol(Exception):
 def ring2_check(N, nwave, mut=None):
     """W2 happens-before replay. Returns the number of barriers per wave; raises Viol."""
     evs = ring2_events(N, nwave, mut)
-    owner = {w: w for w in range(nwave)}             # half w of every stage is written by wave w
+    # half w of every stage is written by wave w
     # per wave: annotate epoch (barriers passed) and completion indices
-    writes = []      # (stage, half, tile, wave, issue_pos, done_pos)  pos = (wave, idx, epoch)
-    reads = []       # (stage, tile, wave, issue_pos, done_pos, kind)
+    writes = []  # (stage, half, tile, wave, issue_pos, done_pos)  pos = (wave, idx, epoch)
+    reads = []  # (stage, tile, wave, issue_pos, done_pos, kind)
     nbar = {}
     for w, ev in evs.items():
         ep = 0
-        q = []           # outstanding TDM ops of this wave: [write index] (one entry per op)
+        q = []  # outstanding TDM ops of this wave: [write index] (one entry per op)
         open_reads = []  # read indices not yet completed
-        last_kind = {}
         for k, e in enumerate(ev):
             pos = (w, k, ep)
             if e[0] == "tdm":
@@ -820,11 +915,15 @@ def ring2_check(N, nwave, mut=None):
                 if hb(x[5], ri):
                     seen = x if seen is None or x[4][1] > seen[4][1] else seen
                 elif not hb(rd, x[4]):
-                    raise Viol(f"RAW/WAR: {kind} of stage {st} by wave {w} at {ri} races TDM of "
-                               f"half {half} (tile {x[2]}) by wave {x[3]} issued {x[4]}")
+                    raise Viol(
+                        f"RAW/WAR: {kind} of stage {st} by wave {w} at {ri} races TDM of "
+                        f"half {half} (tile {x[2]}) by wave {x[3]} issued {x[4]}"
+                    )
             if seen is None or seen[2] != tile:
-                raise Viol(f"RAW: {kind} of stage {st} half {half} by wave {w} expects tile {tile}, "
-                           f"sees {None if seen is None else seen[2]}")
+                raise Viol(
+                    f"RAW: {kind} of stage {st} half {half} by wave {w} expects tile {tile}, "
+                    f"sees {None if seen is None else seen[2]}"
+                )
     return nbar[0]
 
 
@@ -832,8 +931,12 @@ def ring2_selftest():
     for N in range(1, 161):
         nb = ring2_check(N, DQ_NWAVE)
         ok(nb == N + 1, "W2", f"barriers {nb} for N {N}")
-    for tag, mut in (("N1", "no_drain"), ("N2", "read_above_bar"), ("N3", "deep_wait"),
-                     ("N4", "tdm_above_bar")):
+    for tag, mut in (
+        ("N1", "no_drain"),
+        ("N2", "read_above_bar"),
+        ("N3", "deep_wait"),
+        ("N4", "tdm_above_bar"),
+    ):
         caught = 0
         for N in (1, 2, 3, 4, 7, 32):
             try:
@@ -855,15 +958,27 @@ def dqg_shape(B, Sq, Skv, Hq, Hkv, causal, written_q, stats, launches):
         ok(m == list(range(Hq)), "Q5", "XCD remap is a bijection")
     # Q6: the launches impl._plan issues for the dQ chain, (nqw, nwave, q_off, ntile) in order
     q_split, n32, n96 = dq_split(Sq)
-    ok(q_split in (0, 32, 64) and q_split + DQ_BQW96 * n96 == Sq and DQ_BQW * n32 == q_split
-       and NQW48 * 16 * DQ_NWAVE == DQ_BQW96 and NQW * 16 == DQ_BQW, "Q6",
-       f"split {q_split} {n32} {n96}")
-    ok(len(launches) >= 1 and all((nqw, nw_) in ((NQW48, DQ_NWAVE), (NQW, 1)) and ntile >= 1
-                                  for nqw, nw_, _, ntile in launches), "Q6", f"dq launches {launches}")
-    tiles = []                                   # (nqw, nwave, q0g) of every workgroup row of grid.y
+    ok(
+        q_split in (0, 32, 64)
+        and q_split + DQ_BQW96 * n96 == Sq
+        and DQ_BQW * n32 == q_split
+        and NQW48 * 16 * DQ_NWAVE == DQ_BQW96
+        and NQW * 16 == DQ_BQW,
+        "Q6",
+        f"split {q_split} {n32} {n96}",
+    )
+    ok(
+        len(launches) >= 1
+        and all(
+            (nqw, nw_) in ((NQW48, DQ_NWAVE), (NQW, 1)) and ntile >= 1 for nqw, nw_, _, ntile in launches
+        ),
+        "Q6",
+        f"dq launches {launches}",
+    )
+    tiles = []  # (nqw, nwave, q0g) of every workgroup row of grid.y
     for nqw, nwave, q_off, ntile in launches:
         bqwg = 16 * nqw * nwave
-        bids = [ntile - 1 - y for y in range(ntile)]          # kernel: bid = ntile-1-block_idx.y
+        bids = [ntile - 1 - y for y in range(ntile)]  # kernel: bid = ntile-1-block_idx.y
         ok(sorted(bids) == list(range(ntile)), "Q5", "descending tile walk")
         for bid in bids:
             q0g = q_off + bid * bqwg
@@ -871,11 +986,14 @@ def dqg_shape(B, Sq, Skv, Hq, Hkv, causal, written_q, stats, launches):
             tiles.append((nqw, nwave, q0g))
         q0s = [q_off + b_ * bqwg for b_ in bids]
         ok(all(q0s[i] > q0s[i + 1] for i in range(len(q0s) - 1)), "Q6", "longest-first order")
-    cov = sorted((q0g + w * 16 * nqw, q0g + (w + 1) * 16 * nqw)
-                 for nqw, nwave, q0g in tiles for w in range(nwave))
-    ok(cov[0][0] == 0 and cov[-1][1] == Sq and all(cov[i][1] == cov[i + 1][0]
-                                                   for i in range(len(cov) - 1)),
-       "Q6", "per-wave dQ tiles partition [0, Sq)")
+    cov = sorted(
+        (q0g + w * 16 * nqw, q0g + (w + 1) * 16 * nqw) for nqw, nwave, q0g in tiles for w in range(nwave)
+    )
+    ok(
+        cov[0][0] == 0 and cov[-1][1] == Sq and all(cov[i][1] == cov[i + 1][0] for i in range(len(cov) - 1)),
+        "Q6",
+        "per-wave dQ tiles partition [0, Sq)",
+    )
     trips = set()
     for bat in sorted({0, B - 1}):
         for qh in sorted({0, Hq - 1}):
@@ -898,8 +1016,12 @@ def dqg_shape(B, Sq, Skv, Hq, Hkv, causal, written_q, stats, launches):
                     hi = min(q + cshift, Skv - 1) if causal else Skv - 1
                     ok(hi < KV_STEP * nkvt_eff, "Q4", "kv coverage")
                 for i in range(nfull):
-                    ok((not causal) or KV_STEP * i + KV_STEP - 1 <= q0g + cshift, "Q4", "full iteration masked")
-                if bat == 0 and qh == 0:         # Q6 per row (tile math is (bat, qh)-independent)
+                    ok(
+                        (not causal) or KV_STEP * i + KV_STEP - 1 <= q0g + cshift,
+                        "Q4",
+                        "full iteration masked",
+                    )
+                if bat == 0 and qh == 0:  # Q6 per row (tile math is (bat, qh)-independent)
                     for q in rows_wg:
                         att = range(0, min(q + cshift, Skv - 1) + 1) if causal else range(Skv)
                         ok(len(att) == 0 or att[-1] < KV_STEP * nkvt_eff, "Q6", f"row {q} kv coverage")
@@ -907,30 +1029,41 @@ def dqg_shape(B, Sq, Skv, Hq, Hkv, causal, written_q, stats, launches):
                             ok(KV_STEP * i + KV_STEP - 1 in att, "Q6", f"row {q} full iteration {i}")
                     if causal:
                         for i in range(nfull, nkvt_eff):
-                            ok(any(KV_STEP * i + j > q + cshift for q in rows_wg
-                                   for j in range(KV_STEP)), "Q6", f"masked iteration {i} has no mask")
+                            ok(
+                                any(KV_STEP * i + j > q + cshift for q in rows_wg for j in range(KV_STEP)),
+                                "Q6",
+                                f"masked iteration {i} has no mask",
+                            )
                         nm = nkvt_eff - nfull
                         if cshift == 0:
-                            ok(nm == (3 if nwave == DQ_NWAVE else 1), "Q6",
-                               f"masked steps {nm} for a {BQWG}-row tile at {q0g}")
+                            ok(
+                                nm == (3 if nwave == DQ_NWAVE else 1),
+                                "Q6",
+                                f"masked steps {nm} for a {BQWG}-row tile at {q0g}",
+                            )
                         ok(nm <= 4, "Q6", f"masked steps {nm} > 4")
                         # per wave: partial vs fully masked masked-loop steps
                         for w in range(nwave):
                             rows = range(q0g + w * BQW, q0g + (w + 1) * BQW)
-                            full_m = sum(all(KV_STEP * i + j > q + cshift for q in rows
-                                             for j in range(KV_STEP))
-                                         for i in range(nfull, nkvt_eff))
-                            unm = sum(all(KV_STEP * i + j <= q + cshift for q in rows
-                                          for j in range(KV_STEP))
-                                      for i in range(nfull, nkvt_eff))
+                            full_m = sum(
+                                all(KV_STEP * i + j > q + cshift for q in rows for j in range(KV_STEP))
+                                for i in range(nfull, nkvt_eff)
+                            )
+                            unm = sum(
+                                all(KV_STEP * i + j <= q + cshift for q in rows for j in range(KV_STEP))
+                                for i in range(nfull, nkvt_eff)
+                            )
                             key = (nwave, w, nm, full_m, unm)
                             stats[key] = stats.get(key, 0) + 1
                             if nwave == DQ_NWAVE and cshift == 0 and q0g + cshift >= 0:
-                                ok(full_m == (1 if w == 0 else 0), "Q6",
-                                   f"wave {w} fully masked steps {full_m} at {q0g}")
+                                ok(
+                                    full_m == (1 if w == 0 else 0),
+                                    "Q6",
+                                    f"wave {w} fully masked steps {full_m} at {q0g}",
+                                )
                 trips.add(nkvt_eff)
 
-                def tdm(kb, w=None):
+                def tdm(kb, w=None, bat=bat, hkv=hkv):
                     ok(0 <= kb <= nkvt - 1, "Q1", f"kv block {kb}")
                     kv0p = kb * KV_STEP
                     ok(Skv - kv0p >= KV_STEP, "Q1", "TDM outer extent")
@@ -942,8 +1075,11 @@ def dqg_shape(B, Sq, Skv, Hq, Hkv, causal, written_q, stats, launches):
                             row0 = (bat * Skv + kv0p + rows[0]) * Hkv + hkv
                             first = row0 * d + c0
                             last = first + (len(rows) - 1) * Hkv * d + wd - 1
-                            ok(0 <= first and last < B * Skv * Hkv * d, "W1" if w is not None else "Q1",
-                               "TDM global")
+                            ok(
+                                0 <= first and last < B * Skv * Hkv * d,
+                                "W1" if w is not None else "Q1",
+                                "TDM global",
+                            )
                     return kb
 
                 if nwave == 1:
@@ -959,12 +1095,12 @@ def dqg_shape(B, Sq, Skv, Hq, Hkv, causal, written_q, stats, launches):
                         nxo = (TDM_DEPTH - 1) if cur == 0 else cur - 1
                         ncur = 0 if cur == TDM_DEPTH - 1 else cur + 1
                         ok(cur == ii % 3 and nxo == (ii + 2) % 3 and ncur == (ii + 1) % 3, "Q2", "rotation")
-                        ring.issue(nxo, tdm(kk))              # top of the body, no wait
-                        ring.consume(cur)                     # carried K/V A operands -> S/dP WMMAs
-                        ring.read(cur, ii)                    # dQ B operand tr16 of K(ii)
+                        ring.issue(nxo, tdm(kk))  # top of the body, no wait
+                        ring.consume(cur)  # carried K/V A operands -> S/dP WMMAs
+                        ring.read(cur, ii)  # dQ B operand tr16 of K(ii)
                         ring.wait(DQT_TW)
-                        ring.read(ncur, min(ii + 1, nlast))   # readback for ii+1
-                        ring.consume(cur)                     # tr16 operands -> dQ WMMAs
+                        ring.read(ncur, min(ii + 1, nlast))  # readback for ii+1
+                        ring.consume(cur)  # tr16 operands -> dQ WMMAs
                         cur = ncur
                     ring.wait(0)
                     ok(not ring.q, "Q2", "tensorcnt 0 at exit")
@@ -988,7 +1124,11 @@ def dqg_shape(B, Sq, Skv, Hq, Hkv, causal, written_q, stats, launches):
                                 for dt in range(ndt):
                                     t = base + qg * rs + half + dt * 4
                                     for tt in (t, t + 2):
-                                        ok(tt * 8 + 8 <= B * Sq * Hq * d and tt * 16 < (1 << 30), "Q3", "Q/dO frag")
+                                        ok(
+                                            tt * 8 + 8 <= B * Sq * Hq * d and tt * 16 < (1 << 30),
+                                            "Q3",
+                                            "Q/dO frag",
+                                        )
                                         ok((tt * 8) % d + 8 <= d, "Q3", "frag inside its row")
                             base_dq = bat * Sq * Hq * D_QK + qh * D_QK
                             for dtile in range(NDO_QK):
@@ -1009,31 +1149,43 @@ def _xcd_remap(x, ngrp):
     return (x % 8) * (ngrp // 8) + x // 8 if ngrp % 8 == 0 else x
 
 
-
 # R1 source tie: the decode / grid / plan lines hg_decode, hg_launches and impl._plan replay
+# (argument lists the formatter may wrap are matched with \s between the arguments)
 _IMPL_SRC = (HERE / "impl.py").read_text()
 for src, pats in (
-        (SRC, (r"_hb = fx\.Int32\(fx\.block_idx\.z\) \* HG \+ fx\.Int32\(fx\.block_idx\.x\)\n"
-               r"\s+bat = _hb // Hkv\n\s+hkv = _hb - bat \* Hkv\n",
-               r"ngrp = HG\n",
-               r"qh = \(ngrp % _nx == fx\.Int32\(0\)\)\.select\(\(_gx % _nx\) \* \(ngrp // _nx\) \+ _gx // _nx, _gx\)",
-               r"_hb = fx\.Int32\(fx\.block_idx\.z\) \* HG \+ qh\n\s+bat = _hb // Hq\n\s+qh = _hb - bat \* Hq\n",
-               r"nqt, cshift, causal, nb, hg\)\.launch\(\n\s+grid=\(hg, nblk, ngz\)",
-               r"nkvt, cshift, causal, q_off, ntile, hg\)\.launch\(\n\s+grid=\(hg, ntile, ngz\), block=\(32,",
-               r"nkvt, cshift, causal, q_off, ntile, hg\)\.launch\(\n\s+grid=\(hg, ntile, ngz\), block=\(DQ_NWAVE",
-               r"G, nqt, cshift, causal, B_, DKDV_NW, HG\)", r"nkvt, cshift, causal, q_off, ntile, NQW, 1, HG\)",
-               r"nkvt, cshift, causal, q_off, ntile, NQW48, DQ_NWAVE, HG\)",
-               # the one-wave k_dkdv: no head group (grid (Hkv, Skv/32, B), (bat, hkv) = (z, x))
-               r"G, nqt, cshift, causal, B_\)\n\n\n@flyc\.jit\ndef launch_dkdv\(",
-               r"nqt, cshift, causal, nb\)\.launch\(\n\s+grid=\(nhkv, nblk, nb\), block=\(32, 1, 1\)")),
-        (_IMPL_SRC, (r"hg_kv, hg_q = _k\.head_group\(hkv, tgt\), _k\.head_group\(hq, tgt\)",
-                     r"ngz_kv, ngz_q = b \* hkv // hg_kv, b \* hq // hg_q",
-                     r"_k\.launch_dkdv64, dkdv_args \+ \(hg_kv, ngz_kv, b, stream\)",
-                     r"_k\.launch_dkdv, dkdv_args \+ \(hkv, b, stream\)",
-                     r"sq, skv, hq, hkv, g, sq // 16, skv - sq, c, nblk\)\n",
-                     r"fn = _k\.launch_dqg96 if nwave == _k\.DQ_NWAVE else _k\.launch_dqg\n",
-                     r"launches\.append\(\(nm, fn, dq_args \+ \(q_off, ntile, hg_q, ngz_q, dq_stream\), \"dq\"\)\)",
-                     r"tgt = HEAD_GROUP if head_group is None else int\(head_group\)"))):
+    (
+        SRC,
+        (
+            r"_hb = fx\.Int32\(fx\.block_idx\.z\) \* HG \+ fx\.Int32\(fx\.block_idx\.x\)\n"
+            r"\s+bat = _hb // Hkv\n\s+hkv = _hb - bat \* Hkv\n",
+            r"ngrp = HG\n",
+            r"qh = \(ngrp % _nx == fx\.Int32\(0\)\)\.select\(\(_gx % _nx\) \* \(ngrp // _nx\) \+ _gx // _nx, _gx\)",
+            r"_hb = fx\.Int32\(fx\.block_idx\.z\) \* HG \+ qh\n\s+bat = _hb // Hq\n\s+qh = _hb - bat \* Hq\n",
+            r"nqt, cshift, causal, nb, hg\)\.launch\(\n\s+grid=\(hg, nblk, ngz\)",
+            r"nkvt, cshift, causal, q_off, ntile, hg\s*\)\.launch\(\s*grid=\(hg, ntile, ngz\), block=\(32,",
+            r"nkvt, cshift, causal, q_off, ntile, hg\s*\)\.launch\(\s*grid=\(hg, ntile, ngz\), block=\(DQ_NWAVE",
+            r"G, nqt, cshift, causal, B_, DKDV_NW, HG\s*\)",
+            r"nkvt,\s+cshift,\s+causal,\s+q_off,\s+ntile,\s+NQW,\s+1,\s+HG,?\s*\)",
+            r"nkvt,\s+cshift,\s+causal,\s+q_off,\s+ntile,\s+NQW48,\s+DQ_NWAVE,\s+HG,?\s*\)",
+            # the one-wave k_dkdv: no head group (grid (Hkv, Skv/32, B), (bat, hkv) = (z, x))
+            r"G, nqt, cshift, causal, B_\)\n\n\n@flyc\.jit\ndef launch_dkdv\(",
+            r"nqt, cshift, causal, nb\)\.launch\(\n\s+grid=\(nhkv, nblk, nb\), block=\(32, 1, 1\)",
+        ),
+    ),
+    (
+        _IMPL_SRC,
+        (
+            r"hg_kv, hg_q = _k\.head_group\(hkv, tgt\), _k\.head_group\(hq, tgt\)",
+            r"ngz_kv, ngz_q = b \* hkv // hg_kv, b \* hq // hg_q",
+            r"_k\.launch_dkdv64, dkdv_args \+ \(hg_kv, ngz_kv, b, stream\)",
+            r"_k\.launch_dkdv, dkdv_args \+ \(hkv, b, stream\)",
+            r"sq,\s+skv,\s+hq,\s+hkv,\s+g,\s+sq // 16,\s+skv - sq,\s+c,\s+nblk,?\s*\)\n",
+            r"fn = _k\.launch_dqg96 if nwave == _k\.DQ_NWAVE else _k\.launch_dqg\n",
+            r"launches\.append\(\(nm, fn, dq_args \+ \(q_off, ntile, hg_q, ngz_q, dq_stream\), \"dq\"\)\)",
+            r"tgt = HEAD_GROUP if head_group is None else int\(head_group\)",
+        ),
+    ),
+):
     for pat in pats:
         ok(len(re.findall(pat, src)) == 1, "R1", f"source line {pat}")
 
@@ -1061,11 +1213,16 @@ def hg_launches(B, Sq, Skv, Hq, Hkv, mode="two_wave"):
     out = [("dkdv", "kv", Hkv, nblk)] if nw == DKDV_NW else []
     for i, (_, _, _, ntile) in enumerate(g_["dq"]):
         out.append(("dqg" if i == 0 else "dqg_head", "q", Hq, ntile))
-    if mode == "two_wave":                         # == bwd_r4_a's list (dq_split)
+    if mode == "two_wave":  # == bwd_r4_a's list (dq_split)
         q_split, n32, n96 = dq_split(Sq)
-        ok([(a, b) for a, _, _, b in out] == [("dkdv", Skv // (DKDV_NW * BLOCK_KV))]
-           + ([("dqg", n96)] if n96 else []) + ([("dqg_head" if n96 else "dqg", n32)] if n32 else []),
-           "R1", f"two_wave launches {out}")
+        ok(
+            [(a, b) for a, _, _, b in out]
+            == [("dkdv", Skv // (DKDV_NW * BLOCK_KV))]
+            + ([("dqg", n96)] if n96 else [])
+            + ([("dqg_head" if n96 else "dqg", n32)] if n32 else []),
+            "R1",
+            f"two_wave launches {out}",
+        )
     return out
 
 
@@ -1127,33 +1284,42 @@ def fold_equivalence():
     the default target HEAD_GROUP walks like the contiguous b2h128 launch at the same target."""
     Bp, S, H = 2, 4096, 128
     for (lname, kind, nh, tiles), (lname2, kind2, nh2, tiles2) in zip(
-            hg_launches(1, S, S, Bp * H, Bp * H), hg_launches(Bp, S, S, H, H)):
+        hg_launches(1, S, S, Bp * H, Bp * H), hg_launches(Bp, S, S, H, H)
+    ):
         ok((lname, kind, tiles) == (lname2, kind2, tiles2) and nh == Bp * nh2, "R2", "launch lists")
         fold = hg_order(kind, 1, nh, tiles, B2H128_TARGET)
-        ref = []                                   # r3_a grid (H, tiles, Bp) over BSHD b2 h128
+        ref = []  # r3_a grid (H, tiles, Bp) over BSHD b2 h128
         for z in range(Bp):
             for y in range(tiles):
                 for x in range(H):
                     bat, h = r3a_decode(kind, x, z, H)
-                    ref.append((bat * H + h, y))   # = the folded head of (bat, h)
+                    ref.append((bat * H + h, y))  # = the folded head of (bat, h)
         ok(fold == ref, "R2", f"{lname}: fold traversal != b2h128 traversal")
-        old = hg_order(kind, 1, nh, tiles, 0)      # r3_a on the fold launch, for the record
+        old = hg_order(kind, 1, nh, tiles, 0)  # r3_a on the fold launch, for the record
         same = sum(a == b for a, b in zip(old, ref))
-        print(f"[R2] {lname}: prodfold@{B2H128_TARGET} == b2h128 order over {len(ref)} workgroups "
-              f"(r3_a's fold order agrees at {same})", flush=True)
+        print(
+            f"[R2] {lname}: prodfold@{B2H128_TARGET} == b2h128 order over {len(ref)} workgroups "
+            f"(r3_a's fold order agrees at {same})",
+            flush=True,
+        )
         fold_d = hg_order(kind, 1, nh, tiles, HEAD_GROUP)
-        ref_d = hg_order(kind, Bp, nh2, tiles2, HEAD_GROUP)   # (bat*128 + h, tile) = folded head
+        ref_d = hg_order(kind, Bp, nh2, tiles2, HEAD_GROUP)  # (bat*128 + h, tile) = folded head
         ok(fold_d == ref_d, "R2", f"{lname}: fold@{HEAD_GROUP} != b2h128@{HEAD_GROUP} traversal")
         agree = sum(a == b for a, b in zip(fold_d, ref))
-        print(f"[R2] {lname}: prodfold@{HEAD_GROUP} == b2h128@{HEAD_GROUP} order over {len(ref_d)} "
-              f"workgroups (agrees with r3_a's b2h128 order at {agree})", flush=True)
+        print(
+            f"[R2] {lname}: prodfold@{HEAD_GROUP} == b2h128@{HEAD_GROUP} order over {len(ref_d)} "
+            f"workgroups (agrees with r3_a's b2h128 order at {agree})",
+            flush=True,
+        )
 
 
 def r3a_geometry(B, Sq, Skv, Hq, Hkv):
     """bwd_r3_a's _plan dispatch, restated (G1 reference): k_dkdv64 + dq_split's k_dqg96 / head."""
     q_split, n32, n96 = dq_split(Sq)
-    return {"dkdv": (DKDV_NW, Skv // (BLOCK_KV * DKDV_NW)),
-            "dq": (([(NQW48, DQ_NWAVE, q_split, n96)] if n96 else []) + ([(NQW, 1, 0, n32)] if n32 else []))}
+    return {
+        "dkdv": (DKDV_NW, Skv // (BLOCK_KV * DKDV_NW)),
+        "dq": (([(NQW48, DQ_NWAVE, q_split, n96)] if n96 else []) + ([(NQW, 1, 0, n32)] if n32 else [])),
+    }
 
 
 def c1_geometry(B, Sq, Skv, Hq, Hkv):
@@ -1164,24 +1330,52 @@ def c1_geometry(B, Sq, Skv, Hq, Hkv):
 def g1_dispatch(name, B, Sq, Skv, Hq, Hkv):
     """G1: which launch set the real threshold selects; returns {'two_wave'|'one_wave' per chain}."""
     geo = geometry(B, Sq, Skv, Hq, Hkv)
-    want = (B * Hkv * (Skv // BLOCK_KV) < SMALL_GRID_WAVES["dkdv"], B * Hq * (Sq // DQ_BQW) < SMALL_GRID_WAVES["dq"])
+    want = (
+        B * Hkv * (Skv // BLOCK_KV) < SMALL_GRID_WAVES["dkdv"],
+        B * Hq * (Sq // DQ_BQW) < SMALL_GRID_WAVES["dq"],
+    )
     ok(geo["small"] == want, "G1", f"{name}: small {geo['small']} != {want}")
     if name in EXPECT_SMALL:
-        ok(geo["small"] == EXPECT_SMALL[name], "G1", f"{name}: small {geo['small']} != expected {EXPECT_SMALL[name]}")
-    two, one = geometry(B, Sq, Skv, Hq, Hkv, MODES["two_wave"]), geometry(B, Sq, Skv, Hq, Hkv, MODES["one_wave"])
+        ok(
+            geo["small"] == EXPECT_SMALL[name],
+            "G1",
+            f"{name}: small {geo['small']} != expected {EXPECT_SMALL[name]}",
+        )
+    two, one = (
+        geometry(B, Sq, Skv, Hq, Hkv, MODES["two_wave"]),
+        geometry(B, Sq, Skv, Hq, Hkv, MODES["one_wave"]),
+    )
     ok(two["small"] == (False, False) and one["small"] == (True, True), "G1", "forced modes")
     r3, c1 = r3a_geometry(B, Sq, Skv, Hq, Hkv), c1_geometry(B, Sq, Skv, Hq, Hkv)
-    ok(two["dkdv"] == r3["dkdv"] and two["dq"] == r3["dq"], "G1", f"{name}: two_wave set != bwd_r3_a's {two} {r3}")
-    ok(one["dkdv"] == c1["dkdv"] and one["dq"] == c1["dq"], "G1", f"{name}: one_wave set != bwd_c1's {one} {c1}")
-    ok(geo["dkdv"] == (one if want[0] else two)["dkdv"] and geo["dq"] == (one if want[1] else two)["dq"], "G1",
-       f"{name}: launched geometry is not the replayed mode of its decision")
+    ok(
+        two["dkdv"] == r3["dkdv"] and two["dq"] == r3["dq"],
+        "G1",
+        f"{name}: two_wave set != bwd_r3_a's {two} {r3}",
+    )
+    ok(
+        one["dkdv"] == c1["dkdv"] and one["dq"] == c1["dq"],
+        "G1",
+        f"{name}: one_wave set != bwd_c1's {one} {c1}",
+    )
+    ok(
+        geo["dkdv"] == (one if want[0] else two)["dkdv"] and geo["dq"] == (one if want[1] else two)["dq"],
+        "G1",
+        f"{name}: launched geometry is not the replayed mode of its decision",
+    )
     for g_ in (two, one):
         nw, nblk = g_["dkdv"]
-        ok(nblk * nw * BLOCK_KV == Skv and nblk >= 1, "G1", f"{name}: dkdv grid ({Hkv}, {nblk}, {B}) tiles Skv")
+        ok(
+            nblk * nw * BLOCK_KV == Skv and nblk >= 1,
+            "G1",
+            f"{name}: dkdv grid ({Hkv}, {nblk}, {B}) tiles Skv",
+        )
     # fold invariance: [B, S, H, D] views of SBHD storage launch as [1, S, B*H, D] (MHA and GQA alike)
     gf = geometry(1, Sq, Skv, B * Hq, B * Hkv)
-    ok(gf["small"] == geo["small"] and gf["dkdv"] == geo["dkdv"] and gf["dq"] == geo["dq"], "G1",
-       f"{name}: fold launch decides differently {gf} vs {geo}")
+    ok(
+        gf["small"] == geo["small"] and gf["dkdv"] == geo["dkdv"] and gf["dq"] == geo["dq"],
+        "G1",
+        f"{name}: fold launch decides differently {gf} vs {geo}",
+    )
     return {"dkdv": "one_wave" if want[0] else "two_wave", "dq": "one_wave" if want[1] else "two_wave"}
 
 
@@ -1193,12 +1387,15 @@ def main(names, modes):
     for name in names:
         B, Sq, Skv, Hq, Hkv, causal = SHAPES[name]
         assert Sq % 64 == 0 and Sq % DQ_BQW == 0 and Skv % 64 == 0 and Hq % Hkv == 0  # impl.py _check
-        assert (B * Sq * Hq) % 32 == 0                                                  # ROWS_DELTA
+        assert (B * Sq * Hq) % 32 == 0  # ROWS_DELTA
         sel = g1_dispatch(name, B, Sq, Skv, Hq, Hkv)
         geo = geometry(B, Sq, Skv, Hq, Hkv)
-        print(f"[{name}] launched: dkdv {sel['dkdv']} {geo['dkdv']} (one-wave WGs {B * Hkv * (Skv // BLOCK_KV)}), "
-              f"dq {sel['dq']} {geo['dq']} (one-wave WGs {B * Hq * (Sq // DQ_BQW)}); "
-              f"dq_split {dq_split(Sq)} (q_split, n32, n96)", flush=True)
+        print(
+            f"[{name}] launched: dkdv {sel['dkdv']} {geo['dkdv']} (one-wave WGs {B * Hkv * (Skv // BLOCK_KV)}), "
+            f"dq {sel['dq']} {geo['dq']} (one-wave WGs {B * Hq * (Sq // DQ_BQW)}); "
+            f"dq_split {dq_split(Sq)} (q_split, n32, n96)",
+            flush=True,
+        )
         for mode in modes:
             g_ = geometry(B, Sq, Skv, Hq, Hkv, MODES[mode])
             nw = g_["dkdv"][0]
@@ -1210,26 +1407,37 @@ def main(names, modes):
             dkdv_cover(B, Sq, Skv, Hq, Hkv, nw)
             dqg_shape(B, Sq, Skv, Hq, Hkv, causal, wq, stats, g_["dq"])
             # exactly-once on the replayed (extreme) workgroups: every replayed element once
-            ok(all(v == 1 for v in wkv["k"].values()) and all(v == 1 for v in wkv["v"].values()),
-               "K5", "dk/dv element written twice")
+            ok(
+                all(v == 1 for v in wkv["k"].values()) and all(v == 1 for v in wkv["v"].values()),
+                "K5",
+                "dk/dv element written twice",
+            )
             ok(all(v == 1 for v in wq.values()), "Q5", "dq element written twice")
             nb, nh = len({0, B - 1}), len({0, Hkv - 1})
-            ok(len(wkv["k"]) == nb * nh * Skv * D_QK and len(wkv["v"]) == nb * nh * Skv * D_V,
-               "K5", f"dk/dv coverage {len(wkv['k'])}")
+            ok(
+                len(wkv["k"]) == nb * nh * Skv * D_QK and len(wkv["v"]) == nb * nh * Skv * D_V,
+                "K5",
+                f"dk/dv coverage {len(wkv['k'])}",
+            )
             ok(len(wq) == len({0, B - 1}) * len({0, Hq - 1}) * Sq * D_QK, "Q5", "dq coverage")
-            print(f"[{name}/{mode}] B{B} Sq{Sq} Skv{Skv} Hq{Hq} Hkv{Hkv} causal{causal}: dkdv nw {nw}, dq "
-                  f"{g_['dq']}; grids at HEAD_GROUP {HEAD_GROUP} (hg, tiles, B*nh/hg): "
-                  + ", ".join(f"{k}={v}" for k, v in hgl.items())
-                  + "; masked-step classes (nwave, wave, masked, fully_masked, unmasked): count = "
-                  + ", ".join(f"{k}: {v}" for k, v in sorted(stats.items())), flush=True)
+            print(
+                f"[{name}/{mode}] B{B} Sq{Sq} Skv{Skv} Hq{Hq} Hkv{Hkv} causal{causal}: dkdv nw {nw}, dq "
+                f"{g_['dq']}; grids at HEAD_GROUP {HEAD_GROUP} (hg, tiles, B*nh/hg): "
+                + ", ".join(f"{k}={v}" for k, v in hgl.items())
+                + "; masked-step classes (nwave, wave, masked, fully_masked, unmasked): count = "
+                + ", ".join(f"{k}: {v}" for k, v in sorted(stats.items())),
+                flush=True,
+            )
     print("checks:", " ".join(f"{k}={v}" for k, v in sorted(COUNT.items())))
-    print(f"layout: D_QK {D_QK} D_V {D_V} rows {XK}/{XV} B, segments qk {segs(D_QK)} v {segs(D_V)}; "
-          f"k_dkdv64 {DKDV_NW} waves, stage {QDO_B} B x {TDM_DEPTH} = {TDM_DEPTH * QDO_B} B shared, "
-          f"{TDM_OPS_QDO} TDM ops/stage/wave ({ROWS_W} rows each), P/dS {PDS_B} B/wave, alloc {ALLOC_KV} B, "
-          f"epilogue {EPI_W} B/wave, "
-          f"wait {TW_QDO}; k_dqg stage {KV_B} B x {TDM_DEPTH} = {TDM_DEPTH * KV_B} B, {TDM_OPS_KV} ops, "
-          f"wait {DQT_TW}; k_dqg96 {DQ_NWAVE} waves x {KV_STEP // DQ_NWAVE} TDM rows; "
-          f"DS imm max {max(DS_IMM)} / {max(DSQ_IMM)}")
+    print(
+        f"layout: D_QK {D_QK} D_V {D_V} rows {XK}/{XV} B, segments qk {segs(D_QK)} v {segs(D_V)}; "
+        f"k_dkdv64 {DKDV_NW} waves, stage {QDO_B} B x {TDM_DEPTH} = {TDM_DEPTH * QDO_B} B shared, "
+        f"{TDM_OPS_QDO} TDM ops/stage/wave ({ROWS_W} rows each), P/dS {PDS_B} B/wave, alloc {ALLOC_KV} B, "
+        f"epilogue {EPI_W} B/wave, "
+        f"wait {TW_QDO}; k_dqg stage {KV_B} B x {TDM_DEPTH} = {TDM_DEPTH * KV_B} B, {TDM_OPS_KV} ops, "
+        f"wait {DQT_TW}; k_dqg96 {DQ_NWAVE} waves x {KV_STEP // DQ_NWAVE} TDM rows; "
+        f"DS imm max {max(DS_IMM)} / {max(DSQ_IMM)}"
+    )
     print("BOUNDS_PROOF PASS")
 
 
