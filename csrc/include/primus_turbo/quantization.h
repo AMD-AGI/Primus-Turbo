@@ -217,6 +217,10 @@ enum class MXPackFmt : int {
 // tile, so with nt = 3 a padded row would land outside it). Set per launch by MXFlyPackScope.
 struct MXFlyPack {
     int32_t is_b = 0, nt = 4, ilv = 0, k128 = 0, rows = 0;
+    // Per-direction FP4 options from the fmt extension bits (see quantization_mxfp6.cpp), for any
+    // FP4 layout, not only FlyDSL's: scale rule (0 RCEIL, 1-3 = scale_rounding_mode 0-2), Hadamard
+    // (0 H32, 1 none, 2 H16) and 2-D 32x32 block scaling. All 0 is today's emit, bit for bit.
+    int32_t fp4_round = 0, fp4_had = 0, fp4_tile2d = 0;
 };
 void      mx_fly_pack_set(const MXFlyPack &row, const MXFlyPack &col);
 MXFlyPack mx_fly_pack_row();

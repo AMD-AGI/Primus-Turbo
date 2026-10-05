@@ -60,6 +60,41 @@ MX_FMT_FLY = 0x1000
 MX_FMT_FLY_SR = 0x800
 FLY_A = (False, 4, 0)  # every A operand: block_m is always 256, no interleave
 
+# fmt bits 16-24: per-direction options of the FP4 directions, on top of any format above (see
+# ``fp4_options``). All zero is the default emit. ``mx_fmt_base`` strips them.
+MX_FMT_BASE_MASK = 0xFFFF
+FP4_ROUND = {"rceil": 0, "m0": 1, "m1": 2, "m2": 3}  # m0-m2 = scale_rounding_mode 0-2
+FP4_HADAMARD = {"h32": 0, "none": 1, "h16": 2}
+MX_FMT_FP4_TILE2D = 1 << 24
+
+
+def mx_fmt_base(fmt: int) -> int:
+    return fmt & MX_FMT_BASE_MASK
+
+
+def fp4_options(
+    fmt: int,
+    row_round: str = "rceil",
+    col_round: str = "rceil",
+    row_hadamard: str = "h32",
+    col_hadamard: str = "h32",
+    tile2d: bool = False,
+) -> int:
+    """``fmt`` with the FP4 directions' options set: scale rule (``FP4_ROUND``: RCEIL, the default, never
+    saturates; m0 / m1 / m2 step the scale up at mantissa >= 1.75 / 1.5 / 1.8125 and saturate the rest to 6),
+    Hadamard along the contraction axis (``FP4_HADAMARD``), and 2-D 32x32 block scaling (one amax per tile for
+    both directions; needs no Hadamard). The packer rejects options on an FP6 direction. Both operands of a GEMM
+    must carry the same Hadamard choice for that GEMM's contraction."""
+    assert not fmt >> 16, f"fmt {fmt:#x} already carries FP4 options"
+    return (
+        fmt
+        | FP4_ROUND[row_round] << 16
+        | FP4_ROUND[col_round] << 18
+        | FP4_HADAMARD[row_hadamard] << 20
+        | FP4_HADAMARD[col_hadamard] << 22
+        | (MX_FMT_FP4_TILE2D if tile2d else 0)
+    )
+
 
 def _fly_code(p):
     is_b, nt, ilv = p
@@ -87,10 +122,11 @@ def fly6_fmt(row_is_b: bool, col=None) -> int:
 def with_fly6_row(fmt: int, row_is_b: bool) -> int:
     """``fmt`` (0 or a fly fmt with no row direction: an FP6-row activation / weight pack) with its row direction
     switched to ``fly6_fmt``'s layout; the column direction is kept."""
+    ext, fmt = fmt & ~MX_FMT_BASE_MASK, mx_fmt_base(fmt)
     if fmt == 0:
-        return fly6_fmt(row_is_b)
+        return fly6_fmt(row_is_b) | ext
     assert fmt & MX_FMT_FLY and not fmt & 0xF and not fmt & MX_FMT_FLY_SR, hex(fmt)
-    return fmt | 0x1 | (int(row_is_b) << 1)
+    return fmt | 0x1 | (int(row_is_b) << 1) | ext
 
 
 def kblk_operand(codes: torch.Tensor, scales: torch.Tensor, rows: int, k: int):
@@ -118,6 +154,7 @@ def fly_b_params(M: int, N: int, K: int):
 
 
 def _fly_dir(fmt, col):
+    fmt = mx_fmt_base(fmt)
     code = (fmt >> 4) & 0xF if col else fmt & 0xF
     if code == 0:
         return None
@@ -223,9 +260,22 @@ _DIR_FP4 = {
 }
 
 
+def mx_fp4_dirs(fmt: int) -> Tuple[bool, bool]:
+    """Whether the (row, column) directions of a ``fmt`` pack are FP4 (the ones ``fp4_options`` may set)."""
+    fmt = mx_fmt_base(fmt)
+    if fmt & MX_FMT_FLY:
+        return tuple(isinstance(_fly_dir(fmt, col), tuple) for col in (False, True))
+    if fmt in (MX_FMT_BLOB_GRAD, MX_FMT_BLOB_GRAD_SR):
+        return (True, True)
+    if fmt == MX_FMT_BLOB_ACT:
+        return (False, True)
+    return _DIR_FP4[fmt]
+
+
 def mx_dir_sizes(rows: int, k: int, fmt: int, col: bool) -> Tuple[int, int]:
     """Byte sizes ``(codes, scales)`` of one direction of a ``fmt`` pack of a ``rows x k``
     operand contracted along ``k`` (for the column direction pass the transposed extent)."""
+    fmt = mx_fmt_base(fmt)
     if fmt in (MX_FMT_BLOB_GRAD, MX_FMT_BLOB_ACT, MX_FMT_BLOB_GRAD_SR):
         if fmt == MX_FMT_BLOB_ACT and not col:
             from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import mxfp6_pack_sizes

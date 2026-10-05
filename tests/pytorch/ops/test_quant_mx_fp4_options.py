@@ -1,0 +1,298 @@
+###############################################################################
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
+"""The FP4 directions' options of the quantize_mx_* ops (fmt bits 16-24, ``fp4_options``): scale rule,
+Hadamard along the contraction axis, 2-D 32x32 block scaling.
+
+Every option combination is held, byte for byte, to a pure-PyTorch MXFP4 reference: the 32-group optionally
+Hadamard-rotated (H32 or two H16, normalisation first, the packer's butterfly order), rounded to bf16, an E8M0
+scale from the group amax (or the 32x32 tile amax) by the selected rule, and E2M1 round-to-nearest-even with
+saturation at 6. Options must not touch an FP6 direction, and the defaults must not move a byte.
+"""
+
+import itertools
+
+import pytest
+import torch
+
+from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import (
+    FLY_A,
+    MX_FMT_A4W4_GRAD,
+    MX_FMT_FLY_ACT,
+    MX_FMT_FLY_GRAD,
+    MX_FMT_FLY_GRAD_SR,
+    a4w4_logical,
+    fly_fmt,
+    fly_operand,
+    fp4_options,
+    plain_operand,
+    quantize_mx,
+    quantize_mx_dual,
+    quantize_mx_ln_modulate,
+)
+from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import mxfp6_data_region
+
+SHAPES = [(256, 256), (512, 3072), (768, 1280)]
+ROUNDS = ["rceil", "m0", "m1", "m2"]
+HADS = ["h32", "none", "h16"]
+_E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+
+
+def _skip():
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+    if not hasattr(torch.ops.primus_turbo_cpp_extension, "quantize_mx_dual"):
+        pytest.skip("Primus-Turbo built without the quantize_mx_* ops")
+
+
+def _rand(rows, cols, seed=0):
+    """Gaussian with a per-column magnitude sweep over five decades, so groups cover many exponents and
+    every mantissa position of their amax."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    x = torch.randn((rows, cols), device="cuda", generator=g)
+    return (x * torch.logspace(-3, 2, cols, device="cuda")).to(torch.bfloat16)
+
+
+def _butterfly(v, stages, first=0):
+    """The packer's in-place network on [.., 32] fp32: stage h pairs (i, i + h) in blocks of 2h."""
+    for s in range(first, stages):
+        h = 1 << s
+        b = v.reshape(*v.shape[:-1], 32 // (2 * h), 2, h)
+        x0, x1 = b[..., 0, :], b[..., 1, :]
+        v = torch.stack([x0 + x1, x0 - x1], -2).reshape(v.shape)
+    return v
+
+
+def _ref_fp4(x, rnd="rceil", had="h32", tile2d=False):
+    """MXFP4 of x [rows, k] along k: (codes [rows, k] uint8, one per element, sign in bit 3; scales
+    [rows, k / 32] uint8)."""
+    rows, k = x.shape
+    v = x.float().cpu().reshape(rows, k // 32, 32)
+    if had == "h32":
+        # Normalisation fused into the first stage, as AITER computes it: fma(a, n, b n), fma(a, n, -b n);
+        # in float64 the fp32 product a n is exact, so one rounding to fp32 is the fma's.
+        n = torch.tensor(0.17677669529663687, dtype=torch.float32)
+        a, b = v[..., 0::2].double(), (v[..., 1::2] * n).double()
+        an = a * n.double()
+        v = torch.stack([(an + b).float(), (an - b).float()], -1).reshape(v.shape)
+        v = _butterfly(v, 5, first=1)
+    elif had == "h16":
+        v = _butterfly(v * 0.25, 4)
+    v = v.to(torch.bfloat16).float()
+    if tile2d:
+        t = v.abs().reshape(rows // 32, 32, k // 32, 32).amax(dim=(1, 3))
+        amax = t.repeat_interleave(32, 0)
+    else:
+        amax = v.abs().amax(-1)
+    amax = amax.clamp_min(1e-10)
+    if rnd == "rceil":
+        bits = (
+            (amax * torch.tensor(1.0 / 6.0, dtype=torch.float32))
+            .view(torch.int32)
+            .long()
+        )
+        e = (bits >> 23) & 0xFF
+        e = e + ((e < 0xFF) & ((bits & 0x7FFFFF) != 0)).long()
+    else:
+        bias = {"m0": 1 << 21, "m1": 1 << 22, "m2": 3 << 19}[rnd]
+        e = (((amax.view(torch.int32).long() + bias) >> 23) & 0x1FF) - 129
+        e = e.clamp(-127, 128) + 127
+    scale = torch.where(
+        e == 0, torch.tensor(2.0**-127), torch.pow(2.0, (e - 127).double()).float()
+    )
+    q = (v / scale[..., None]).abs()
+    d = (q[..., None] - _E2M1).abs()
+    best = d.min(-1, keepdim=True).values
+    # Ties to the even code; above 6 everything saturates (6 is then the unique nearest).
+    tie_even = (d == best) & (torch.arange(8) % 2 == 0)
+    code = torch.where(
+        tie_even.any(-1), tie_even.float().argmax(-1), (d == best).float().argmax(-1)
+    )
+    code = (
+        code | torch.signbit(v).long() << 3
+    )  # the convert keeps the sign of a value that rounds to 0
+    return code.reshape(rows, k).to(torch.uint8), e.to(torch.uint8)
+
+
+def _unpack(codes):
+    """[rows, k / 2] packed nibbles (first element in the low nibble) -> [rows, k]."""
+    c = codes.cpu()
+    return torch.stack([c & 0xF, c >> 4], -1).reshape(c.shape[0], -1)
+
+
+def _plain(pack, rows, cols, which):
+    if which == "row":
+        c, s = plain_operand(pack[0], pack[1], rows, cols)
+    else:
+        c, s = plain_operand(pack[2], pack[3], cols, rows)
+    return _unpack(c), s.cpu()
+
+
+def _check(got, ref, what):
+    (gc, gs), (rc, rs) = got, ref
+    assert torch.equal(
+        gs, rs
+    ), f"{what}: scales differ at {(gs != rs).sum().item()} of {rs.numel()}"
+    assert torch.equal(
+        gc, rc
+    ), f"{what}: codes differ at {(gc != rc).sum().item()} of {rc.numel()}"
+
+
+def test_reference_is_the_default_packer():
+    """Anchors the reference: with no options it reproduces today's plain gradient pack (H32, RCEIL)."""
+    _skip()
+    rows, cols = 512, 3072
+    x = _rand(rows, cols, seed=1)
+    p = quantize_mx_dual(x, MX_FMT_FLY_GRAD)
+    _check(_plain(p, rows, cols, "row"), _ref_fp4(x), "row")
+    _check(_plain(p, rows, cols, "col"), _ref_fp4(x.t()), "col")
+
+
+def test_all_zero_options_are_the_default():
+    for fmt in (
+        MX_FMT_A4W4_GRAD,
+        MX_FMT_FLY_GRAD,
+        MX_FMT_FLY_ACT,
+        fly_fmt(FLY_A, FLY_A),
+    ):
+        assert fp4_options(fmt) == fmt, hex(fmt)
+
+
+@pytest.mark.parametrize("rows,cols", SHAPES)
+@pytest.mark.parametrize("rnd,had", list(itertools.product(ROUNDS, HADS)))
+def test_gradient_options_bit_exact(rows, cols, rnd, had):
+    """Both FP4 directions of a gradient pack, each with its own options (the column direction gets the
+    next rule / Hadamard in the lists, so a row / column mix-up cannot pass)."""
+    _skip()
+    x = _rand(rows, cols, seed=3)
+    col_rnd, col_had = (
+        ROUNDS[(ROUNDS.index(rnd) + 1) % 4],
+        HADS[(HADS.index(had) + 1) % 3],
+    )
+    fmt = fp4_options(MX_FMT_FLY_GRAD, rnd, col_rnd, had, col_had)
+    p = quantize_mx_dual(x, fmt)
+    _check(_plain(p, rows, cols, "row"), _ref_fp4(x, rnd, had), "row")
+    _check(_plain(p, rows, cols, "col"), _ref_fp4(x.t(), col_rnd, col_had), "col")
+
+
+@pytest.mark.parametrize("rnd,had", [("m0", "none"), ("m2", "h16"), ("rceil", "none")])
+def test_options_reach_every_fp4_layout(rnd, had):
+    """The emit is shared, so the A4W4 and packed-FlyDSL layouts carry the same codes and scales as plain."""
+    _skip()
+    rows, cols = 512, 3072
+    x = _rand(rows, cols, seed=4)
+    ref = _ref_fp4(x, rnd, had)
+    a = quantize_mx_dual(x, fp4_options(MX_FMT_A4W4_GRAD, rnd, rnd, had, had))
+    c, s = a4w4_logical(a[0], a[1], rows, cols, is_b=False)
+    _check((_unpack(c[:rows, : cols // 2]), s[:rows, : cols // 32].cpu()), ref, "a4w4")
+    f = quantize_mx_dual(x, fp4_options(fly_fmt(FLY_A, FLY_A), rnd, rnd, had, had))
+    fc, fs = fly_operand(f[0], f[1], rows, cols)
+    assert torch.equal(_unpack(fc), ref[0]), "fly codes"
+    # The packed slab is a permutation of the scales (its layout is tested elsewhere).
+    got = fs.view(torch.uint8)[: rows * cols // 32].cpu().sort().values
+    assert torch.equal(got, ref[1].reshape(-1).sort().values), "fly scales"
+
+
+@pytest.mark.parametrize("rnd", ROUNDS)
+def test_weight_column_options_leave_fp6_rows(rnd):
+    """An activation / weight pack: options on its FP4 column direction; the FP6 forward rows unchanged."""
+    _skip()
+    rows, cols = 768, 1280
+    x = _rand(rows, cols, seed=5)
+    base = quantize_mx_dual(x, MX_FMT_FLY_ACT)
+    p = quantize_mx_dual(
+        x, fp4_options(MX_FMT_FLY_ACT, col_round=rnd, col_hadamard="h16")
+    )
+    assert torch.equal(
+        mxfp6_data_region(p[0], rows, cols), mxfp6_data_region(base[0], rows, cols)
+    )
+    assert torch.equal(
+        mxfp6_data_region(p[1], rows, cols, is_scale=True),
+        mxfp6_data_region(base[1], rows, cols, is_scale=True),
+    )
+    _check(_plain(p, rows, cols, "col"), _ref_fp4(x.t(), rnd, "h16"), "col")
+
+
+@pytest.mark.parametrize("rows,cols", SHAPES)
+@pytest.mark.parametrize("rnd", ["rceil", "m0"])
+def test_tile2d(rows, cols, rnd):
+    """2-D: one scale per 32x32 tile in both directions, and -- with no Hadamard -- the column codes are the
+    row codes transposed, so one quantized weight serves the forward and the backward.
+    """
+    _skip()
+    x = _rand(rows, cols, seed=6)
+    fmt = fp4_options(MX_FMT_FLY_GRAD, rnd, rnd, "none", "none", tile2d=True)
+    p = quantize_mx_dual(x, fmt)
+    row, col = _plain(p, rows, cols, "row"), _plain(p, rows, cols, "col")
+    _check(row, _ref_fp4(x, rnd, "none", tile2d=True), "row")
+    _check(col, _ref_fp4(x.t(), rnd, "none", tile2d=True), "col")
+    assert torch.equal(col[0], row[0].t())
+    assert torch.equal(row[1][::32], col[1][::32].t())
+
+
+def test_tile2d_single_direction():
+    """The single-direction op stages the same tiles, so it gets the same 2-D scales."""
+    _skip()
+    rows, cols = 512, 1280
+    x = _rand(rows, cols, seed=7)
+    fmt = fp4_options(MX_FMT_FLY_GRAD, "m0", "m0", "none", "none", tile2d=True)
+    dual = quantize_mx_dual(x, fmt)
+    for axis, which in ((1, "row"), (0, "col")):
+        c, s = quantize_mx(x, axis, fmt)
+        got = _plain((c, s, c, s), rows, cols, which)
+        assert all(
+            torch.equal(u, v) for u, v in zip(got, _plain(dual, rows, cols, which))
+        ), which
+
+
+def test_sr_keeps_the_option_scale():
+    """SR changes codes, not scales: an SR pack's scales are the RTN pack's under the same options."""
+    _skip()
+    rows, cols = 512, 3072
+    x = _rand(rows, cols, seed=8)
+    opts = dict(row_round="m0", col_round="m2", row_hadamard="none", col_hadamard="h16")
+    rtn = quantize_mx_dual(x, fp4_options(MX_FMT_FLY_GRAD, **opts))
+    sr = quantize_mx_dual(x, fp4_options(MX_FMT_FLY_GRAD_SR, **opts))
+    for which in ("row", "col"):
+        assert torch.equal(
+            _plain(rtn, rows, cols, which)[1], _plain(sr, rows, cols, which)[1]
+        ), which
+
+
+def test_saturating_rules_clip_and_rceil_does_not():
+    """A group whose amax mantissa is 1.7: m0 / m2 keep the scale low and clip it to 6, RCEIL / m1 do not."""
+    _skip()
+    x = torch.full((256, 256), 0.25, device="cuda")
+    x[:, ::32] = 1.7
+    x = x.to(torch.bfloat16)
+    for rnd, clips in (("rceil", False), ("m1", False), ("m0", True), ("m2", True)):
+        c, s = _plain(
+            quantize_mx_dual(x, fp4_options(MX_FMT_FLY_GRAD, rnd, rnd, "none", "none")),
+            256,
+            256,
+            "row",
+        )
+        assert (c[:, 0] == 7).all().item() == clips, rnd  # 7 = 6.0, the saturated code
+        _check((c, s), _ref_fp4(x, rnd, "none"), rnd)
+
+
+def test_bad_option_combinations_are_rejected():
+    _skip()
+    x = _rand(256, 256)
+    with pytest.raises(RuntimeError, match="FP6"):
+        quantize_mx_dual(x, fp4_options(MX_FMT_FLY_ACT, row_round="m0"))
+    with pytest.raises(RuntimeError, match="FP6"):
+        quantize_mx_dual(x, fp4_options(MX_FMT_FLY_ACT, row_hadamard="none"))
+    with pytest.raises(RuntimeError, match="no Hadamard"):
+        quantize_mx_dual(x, fp4_options(MX_FMT_FLY_GRAD, tile2d=True))
+    with pytest.raises(RuntimeError, match="prologue"):
+        mean, mod = torch.zeros(256, device="cuda"), _rand(1, 256)
+        tile2d = fp4_options(
+            MX_FMT_FLY_GRAD, "rceil", "rceil", "none", "none", tile2d=True
+        )
+        quantize_mx_ln_modulate(x, mean, mean + 1, mod, mod, False, tile2d)
+    with pytest.raises(RuntimeError, match="unknown fmt bits"):
+        quantize_mx_dual(x, 1 << 25)

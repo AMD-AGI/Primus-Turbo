@@ -97,8 +97,19 @@ __device__ __forceinline__ uint32_t sr_mix(uint32_t x) {
 // (flydsl/utils/gemm_helper.py), checked byte-for-byte against `preshuffle_mxfp4_scales` on the
 // Flux training shapes. n_sub = 2, nd = ng = 4; ku = 2 when (k128 / 2) is even, else 1.
 struct FlyPackArgs {
-    int32_t is_b, nt, ilv, k128, rows;
+    int32_t is_b = 0, nt = 4, ilv = 0, k128 = 0, rows = 0;
+    // FP4 emit options (every layout): scale rule, Hadamard, 2-D block scaling. See MXFlyPack.
+    int32_t fp4_round = 0, fp4_had = 0, fp4_tile2d = 0;
 };
+
+// Scale rules. 0 is RCEIL, ceil_pow2(amax / 6): never saturates. 1-3 are Turbo's
+// scale_rounding_mode 0-2 (detail::mxfp4_scale_rounding_bias): add a bias to amax's fp32 bits and
+// take exponent - 2, i.e. with amax = m * 2^e the scale steps up at m >= 1.75 / 1.5 / 1.8125; the
+// largest scaled value is then 7.0 / 6.0 / 7.25 and anything above 6 saturates to 6 in the convert.
+enum : int32_t { kRoundRceil = 0, kRoundMode0 = 1, kRoundMode1 = 2, kRoundMode2 = 3 };
+// Hadamard along the contraction axis: 32-point (the default, shared with MXFP6), none, or two
+// independent 16-point transforms per 32-group (normalisation 1/4, applied first like the H32's).
+enum : int32_t { kHadH32 = 0, kHadNone = 1, kHadH16 = 2 };
 __device__ __forceinline__ int64_t fly_scale_byte(const int64_t row, const int32_t kblk,
                                                   const FlyPackArgs &f) {
     if (f.nt == 4 && (f.ilv == 0 || f.ilv == 4)) {
@@ -159,34 +170,68 @@ __device__ __forceinline__ int64_t fly_scale_byte(const int64_t row, const int32
     return (base + int64_t(u) * 256 + int64_t(g) * 64 + last) * 4 + t;
 }
 
+// `tile_amax` >= 0 replaces the group's own amax (2-D block scaling: the caller passes the amax of
+// the 32x32 tile, taken from the same bf16 values; only valid with fly.fp4_had == kHadNone).
 template <Layout LAYOUT = Layout::A6W4Blob, bool SR = false>
 __device__ __forceinline__ void
 mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32_t group,
                  const int32_t nk_pad, uint8_t *__restrict__ packed,
                  uint8_t *__restrict__ packed_scale, const uint32_t sr_seed = 0,
-                 const FlyPackArgs fly = {}) {
+                 const FlyPackArgs fly = {}, const float tile_amax = -1.0f) {
     // The normalisation goes in FIRST, before the butterfly -- which is where AITER's
     // MXFP4 packer puts it, and NOT where the MXFP6 packer puts it (MXFP6 multiplies the
     // rotated result at the end). The two orders differ in floating point, so copying the
     // MXFP6 emit here produces a blob that is close but not equal, and `gemm_a6w4` has no
     // way to detect the difference. Matching AITER is the contract.
+    //
+    // The first stage's adds take the even element's normalisation as a fused multiply-add,
+    // fma(a, norm, b * norm) and fma(a, norm, -(b * norm)): that is the arithmetic AITER's packer
+    // compiles to, and it is spelled out because the compiler's own contraction choice depends on
+    // the surrounding code -- left implicit, adding the other Hadamard modes moved it and flipped
+    // the sign of a few zero codes. Measured against AITER on its codes, signed zeros included.
+    if (fly.fp4_had == kHadH32) {
 #pragma unroll
-    for (int i = 0; i < kGroupSize; ++i)
-        values[i] *= kHadamard32Norm;
+        for (int i = 0; i < kGroupSize; i += 2) {
+            const float a = values[i];
+            const float b = values[i + 1] * kHadamard32Norm;
+            values[i]     = __builtin_fmaf(a, kHadamard32Norm, b);
+            values[i + 1] = __builtin_fmaf(a, kHadamard32Norm, -b);
+        }
 
 #pragma unroll
-    for (int stage = 0; stage < 5; ++stage) {
-        const int h = 1 << stage;
+        for (int stage = 1; stage < 5; ++stage) {
+            const int h = 1 << stage;
 #pragma unroll
-        for (int pair = 0; pair < kGroupSize / 2; ++pair) {
-            const int   butterfly = pair / h;
-            const int   offset    = pair % h;
-            const int   i0        = butterfly * (2 * h) + offset;
-            const int   i1        = i0 + h;
-            const float x0        = values[i0];
-            const float x1        = values[i1];
-            values[i0]            = x0 + x1;
-            values[i1]            = x0 - x1;
+            for (int pair = 0; pair < kGroupSize / 2; ++pair) {
+                const int   butterfly = pair / h;
+                const int   offset    = pair % h;
+                const int   i0        = butterfly * (2 * h) + offset;
+                const int   i1        = i0 + h;
+                const float x0        = values[i0];
+                const float x1        = values[i1];
+                values[i0]            = x0 + x1;
+                values[i1]            = x0 - x1;
+            }
+        }
+    } else if (fly.fp4_had == kHadH16) {
+        // Stages h = 1, 2, 4, 8 of the same network: two independent 16-point transforms.
+#pragma unroll
+        for (int i = 0; i < kGroupSize; ++i)
+            values[i] *= 0.25f;
+#pragma unroll
+        for (int stage = 0; stage < 4; ++stage) {
+            const int h = 1 << stage;
+#pragma unroll
+            for (int pair = 0; pair < kGroupSize / 2; ++pair) {
+                const int   butterfly = pair / h;
+                const int   offset    = pair % h;
+                const int   i0        = butterfly * (2 * h) + offset;
+                const int   i1        = i0 + h;
+                const float x0        = values[i0];
+                const float x1        = values[i1];
+                values[i0]            = x0 + x1;
+                values[i1]            = x0 - x1;
+            }
         }
     }
 
@@ -230,19 +275,38 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
     // the scale for an all-zero group so RCEIL cannot emit byte 0 there. Above that floor
     // it has no effect, so it never perturbs a real weight.
     float amax = 1.0e-10f;
+    if (tile_amax >= 0.0f) {
+        amax = fmaxf(amax, tile_amax);
+    } else {
 #pragma unroll
-    for (int i = 0; i < kGroupSize / 2; ++i) {
-        amax = fmaxf(amax, fabsf(static_cast<float>(pairs[i][0])));
-        amax = fmaxf(amax, fabsf(static_cast<float>(pairs[i][1])));
+        for (int i = 0; i < kGroupSize / 2; ++i) {
+            amax = fmaxf(amax, fabsf(static_cast<float>(pairs[i][0])));
+            amax = fmaxf(amax, fabsf(static_cast<float>(pairs[i][1])));
+        }
     }
 
-    // RCEIL: ceil_pow2(amax / 6). Bump the exponent whenever any mantissa bit survives
-    // the divide, which is what makes it a ceiling rather than a truncation.
-    const uint32_t scaled   = __builtin_bit_cast(uint32_t, amax * kFp4InvMaxPos);
-    uint32_t       exponent = (scaled >> 23) & 0xFFu;
-    if (exponent < 0xFFu && (scaled & 0x7FFFFFu))
-        exponent += 1;
-    const uint8_t scale_exp = static_cast<uint8_t>(exponent);
+    uint8_t scale_exp;
+    if (fly.fp4_round == kRoundRceil) {
+        // RCEIL: ceil_pow2(amax / 6). Bump the exponent whenever any mantissa bit survives
+        // the divide, which is what makes it a ceiling rather than a truncation.
+        const uint32_t scaled   = __builtin_bit_cast(uint32_t, amax * kFp4InvMaxPos);
+        uint32_t       exponent = (scaled >> 23) & 0xFFu;
+        if (exponent < 0xFFu && (scaled & 0x7FFFFFu))
+            exponent += 1;
+        scale_exp = static_cast<uint8_t>(exponent);
+    } else {
+        // Turbo's compute_tile_scale: exponent of (amax bits + bias) minus FP4's target max pow2
+        // (2), clamped to the E8M0 range.
+        const uint32_t bias = fly.fp4_round == kRoundMode0   ? (1u << 21)
+                              : fly.fp4_round == kRoundMode1 ? (1u << 22)
+                                                             : (3u << 19);
+        int32_t        e =
+            static_cast<int32_t>(((__builtin_bit_cast(uint32_t, amax) + bias) >> 23) & 0x1FFu) -
+            127 - 2;
+        e         = e > -127 ? e : -127;
+        e         = e < 128 ? e : 128;
+        scale_exp = static_cast<uint8_t>(e + 127);
+    }
 
     // E8M0 byte zero means the minimum scale 2^-127. An f32 with a zero exponent field is
     // numeric zero, so feed the hardware the normal/subnormal boundary instead.

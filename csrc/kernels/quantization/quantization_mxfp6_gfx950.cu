@@ -690,38 +690,39 @@ template <MXPackFmt FMT>
 __device__ __forceinline__ void
 emit_group_fmt(float (&values)[kGroupSize], const int64_t out_row, const int32_t group,
                const int32_t  nk, uint8_t *__restrict__ packed, uint8_t *__restrict__ packed_scale,
-               const uint32_t sr_seed, const mxfp4_emit::FlyPackArgs fly) {
+               const uint32_t sr_seed, const mxfp4_emit::FlyPackArgs fly,
+               const float tile_amax = -1.0f) {
     if constexpr (FMT == MXPackFmt::Fp6) {
         mxfp6_emit_group(values, out_row, group, nk, packed, packed_scale);
     } else if constexpr (FMT == MXPackFmt::Fp6KBlk) {
         mxfp6_emit_group<true>(values, out_row, group, nk, packed, packed_scale, fly);
     } else if constexpr (FMT == MXPackFmt::Fp4Blob) {
-        mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::A6W4Blob>(values, out_row, group, nk,
-                                                                   packed, packed_scale);
+        mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::A6W4Blob>(
+            values, out_row, group, nk, packed, packed_scale, 0u, fly, tile_amax);
     } else if constexpr (FMT == MXPackFmt::Fp4A) {
         mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::A4W4A>(values, out_row, group, nk, packed,
-                                                                packed_scale);
+                                                                packed_scale, 0u, fly, tile_amax);
     } else if constexpr (FMT == MXPackFmt::Fp4ASr) {
         mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::A4W4A, true>(
-            values, out_row, group, nk, packed, packed_scale, sr_seed);
+            values, out_row, group, nk, packed, packed_scale, sr_seed, fly, tile_amax);
     } else if constexpr (FMT == MXPackFmt::Fp4Plain) {
         mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::Plain>(values, out_row, group, nk, packed,
-                                                                packed_scale);
+                                                                packed_scale, 0u, fly, tile_amax);
     } else if constexpr (FMT == MXPackFmt::Fp4PlainSr) {
         mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::Plain, true>(
-            values, out_row, group, nk, packed, packed_scale, sr_seed);
+            values, out_row, group, nk, packed, packed_scale, sr_seed, fly, tile_amax);
     } else if constexpr (FMT == MXPackFmt::Fp4BlobSr) {
         mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::A6W4Blob, true>(
-            values, out_row, group, nk, packed, packed_scale, sr_seed);
+            values, out_row, group, nk, packed, packed_scale, sr_seed, fly, tile_amax);
     } else if constexpr (FMT == MXPackFmt::Fp4Fly) {
         mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::Fly>(values, out_row, group, nk, packed,
-                                                              packed_scale, 0u, fly);
+                                                              packed_scale, 0u, fly, tile_amax);
     } else if constexpr (FMT == MXPackFmt::Fp4FlySr) {
         mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::Fly, true>(
-            values, out_row, group, nk, packed, packed_scale, sr_seed, fly);
+            values, out_row, group, nk, packed, packed_scale, sr_seed, fly, tile_amax);
     } else {
         mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::A4W4B>(values, out_row, group, nk, packed,
-                                                                packed_scale);
+                                                                packed_scale, 0u, fly, tile_amax);
     }
 }
 
@@ -1381,6 +1382,35 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
 
     const int32_t slot = threadIdx.x;
 
+    // 2-D block scaling (weights): one amax per 32x32 tile of the staged patch, shared by the
+    // tile's 32 row groups and 32 column groups, so both directions get the same scale and -- with
+    // no Hadamard, which the host enforces -- the column codes are the row codes transposed. Taken
+    // on the bf16-rounded values the emit converts. The flag is a launch constant, so every thread
+    // takes the same branch and reaches both barriers.
+    constexpr int    kTiles2dM = TILE_M / kGroupSize, kTiles2dN = TILE_N / kGroupSize;
+    __shared__ float s_colmax2d[kTiles2dM][TILE_N];
+    __shared__ float s_tilemax2d[kTiles2dM][kTiles2dN];
+    const bool       tile2d = row_fly.fp4_tile2d || col_fly.fp4_tile2d;
+    if (tile2d) {
+        for (int c = slot; c < kTiles2dM * TILE_N; c += THREADS_PER_BLOCK) {
+            const int mb = c / TILE_N, col = c % TILE_N;
+            float     m = 0.0f;
+            for (int i = 0; i < kGroupSize; ++i)
+                m = fmaxf(m, fabsf(static_cast<float>(static_cast<__bf16>(
+                                 to_dot_operand<DType>(s_tile[mb * kGroupSize + i][col])))));
+            s_colmax2d[mb][col] = m;
+        }
+        __syncthreads();
+        for (int t = slot; t < kTiles2dM * kTiles2dN; t += THREADS_PER_BLOCK) {
+            const int mb = t / kTiles2dN, nb = t % kTiles2dN;
+            float     m = 0.0f;
+            for (int j = 0; j < kGroupSize; ++j)
+                m = fmaxf(m, s_colmax2d[mb][nb * kGroupSize + j]);
+            s_tilemax2d[mb][nb] = m;
+        }
+        __syncthreads();
+    }
+
     // Row direction: contract along N. Each staged row contributes TILE_N/32 groups.
     if constexpr (DO_ROW) {
         constexpr int kBlocksPerRow = TILE_N / kGroupSize;
@@ -1397,7 +1427,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                 values[i] = to_dot_operand<DType>(s_tile[local_m][n_offset + i]);
 
             emit_group_fmt<ROW_FMT>(values, tile_m + local_m, tile_n / kGroupSize + k_block,
-                                    row_nk_pad, row_packed, row_scale, row_seed, row_fly);
+                                    row_nk_pad, row_packed, row_scale, row_seed, row_fly,
+                                    tile2d ? s_tilemax2d[local_m / kGroupSize][k_block] : -1.0f);
         }
     }
 
@@ -1418,7 +1449,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                 values[i] = to_dot_operand<DType>(s_tile[m_offset + i][local_n]);
 
             emit_group_fmt<COL_FMT>(values, tile_n + local_n, tile_m / kGroupSize + k_block,
-                                    col_nk_pad, col_packed, col_scale, col_seed, col_fly);
+                                    col_nk_pad, col_packed, col_scale, col_seed, col_fly,
+                                    tile2d ? s_tilemax2d[k_block][local_n / kGroupSize] : -1.0f);
         }
     }
 }
@@ -1453,7 +1485,7 @@ inline bool is_a4w4(const MXPackFmt f) {
 namespace {
 MXFlyPack               g_fly_row, g_fly_col;
 mxfp4_emit::FlyPackArgs to_args(const MXFlyPack &p) {
-    return {p.is_b, p.nt, p.ilv, p.k128, p.rows};
+    return {p.is_b, p.nt, p.ilv, p.k128, p.rows, p.fp4_round, p.fp4_had, p.fp4_tile2d};
 }
 } // namespace
 
@@ -1491,6 +1523,14 @@ void launch_dual(const dim3 grid, const dim3 block, hipStream_t stream, const DT
             : 0u;
     const mxfp4_emit::FlyPackArgs row_fly = to_args(mx_fly_pack_row());
     const mxfp4_emit::FlyPackArgs col_fly = to_args(mx_fly_pack_col());
+    if (row_fly.fp4_tile2d || col_fly.fp4_tile2d) {
+        // The tile amax is taken on the staged values in the whole-tile emit path: it must see what
+        // the emit converts (no prologue, no rotation), and the experimental per-stage schedule
+        // (MXFP6_ASYNC_STAGE 2) has its own emit that does not take it.
+        PRIMUS_TURBO_CHECK(PROLOGUE == MXFP6Prologue::Identity,
+                           "2-D block scaling is for plain packs (weights), not prologue packs");
+        PRIMUS_TURBO_CHECK(MXFP6_ASYNC_STAGE != 2, "2-D block scaling needs the whole-tile emit");
+    }
     auto                          go      = [&](auto r, auto c) {
         constexpr MXPackFmt R = decltype(r)::value;
         constexpr MXPackFmt C = decltype(c)::value;
