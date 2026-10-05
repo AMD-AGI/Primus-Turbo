@@ -17,6 +17,7 @@ Bitwise deterministic except the a16 dQ path (see _dq_a16_for), which accumulate
 """
 
 import math as host_math
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -34,6 +35,9 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from primus_turbo.flydsl.utils.gemm_helper import xcd_remap_pid
 
 _LOG2E = host_math.log2(host_math.e)
+# Opt in before importing Turbo. Keep attention on the caller's stream when
+# a second compute queue interferes with application communication (#520).
+_ATTN_SINGLE_STREAM = os.getenv("PRIMUS_TURBO_ATTN_SINGLE_STREAM", "0") == "1"
 # q rows one dkdv work-group folds per q-loop step. A wider tile, and warp specialisation,
 # are both register-walled: neither leaves room to co-reside two waves per SIMD.
 _BWD_BLOCK_Q = 64
@@ -4912,7 +4916,7 @@ def _reduce_dq_partials(
 # the eight-wave geometry had to use since it leaves no room for a co-resident reduce
 # wave; the pipeline is only worth its chunking overhead at the four-wave geometry,
 # where the fused work-group leaves enough registers for a reduce work-group to land.
-_DQ_PIPE = True
+_DQ_PIPE = not _ATTN_SINGLE_STREAM
 # Causal area at which chunking stops paying. At and below it a chunk's own compute no longer
 # dwarfs the dispatch it costs and the overlap is a double-digit loss, whatever the batch or
 # head count -- and the fewer heads, the worse, until the fixed cost is the whole backward.
@@ -5969,6 +5973,20 @@ def flydsl_varlen_backward(
             _bodies[0](*_bufs, B, Sq, Skv, 0, st)
             if not a16_nat:
                 _unpermute_dq_a16(img, dq, B, Sq, Hq, D, dkdv_l.dq_scale, st)
+        elif _ATTN_SINGLE_STREAM:
+            # Preserve the batch plan and per-chunk slot folds, but queue every
+            # producer/consumer on the caller's stream. No side stream or events
+            # are needed; each delta/image fill precedes the body that reads it.
+            _slot_plan = _slot_sub_plan(_plan, Skv, B, Hkv * D) if sbhd and q_split > 1 else None
+            if _slot_plan is not None:
+                _slot_out = tuple(
+                    torch.empty(w.numel() // q_split, device=w.device, dtype=w.dtype) for w in (ws_dk, ws_dv)
+                )
+            for j, (_body, (lo, size)) in enumerate(zip(_bodies, _plan)):
+                odo_l.bat(lo)(o16, dof16, df, size, Sq, st, img=img)
+                _body(*_bufs, size, Sq, Skv, 0, st)
+                if _slot_plan is not None:
+                    _reduce_dkdv_slots(ws_dk, ws_dv, q_split, 1, st, _slot_plan[j], _slot_out)
         else:
             # Only chunk 0's delta is due before any body, and a chunk's rows are final when it retires.
             _odos = [odo_l.bat(lo) for lo, _ in _plan]
