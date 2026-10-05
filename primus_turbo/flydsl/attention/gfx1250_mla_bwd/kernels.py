@@ -32,6 +32,22 @@ from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.rocdl import tdm_ops  # UNSTABLE(gfx1250): tensor_wait
 
 
+def _module_knobs():
+    """Every module-level knob of this file -- upper-case scalars and tuples of scalars -- as
+    sorted (name, value) pairs; MODULE_KNOBS (end of file) is this, taken at import."""
+    g = globals()
+
+    def knob(v):
+        scalar = (bool, int, float, str)
+        return isinstance(v, scalar) or (isinstance(v, tuple) and all(isinstance(x, scalar) for x in v))
+
+    return tuple(
+        (n, g[n])
+        for n in sorted(g)
+        if n.isupper() and not n.startswith("_") and n != "MODULE_KNOBS" and knob(g[n])
+    )
+
+
 def create_llvm_ptr(value, address_space=1):
     """Raw LLVM pointer from an i32 address (1 = global, 3 = LDS); aiter kernels_common's."""
     space = {1: fx.AddressSpace.Global, 3: fx.AddressSpace.Shared}.get(address_space, address_space)
@@ -229,6 +245,7 @@ def _tdm_rows(src, off, d, rows, valid, rs_el, lds_row0, lds_ty, num_warps=1):
 def k_delta_bshd(DO: fx.Tensor, O: fx.Tensor, DEL: fx.Tensor,
                  S: fx.Int32, H: fx.Int32, n_rows: fx.Int32):
     """delta[b, h, s] = sum_d dO[b, s, h, d] * O[b, s, h, d], fp32."""
+    _ = MODULE_KNOBS  # cache key only (see MODULE_KNOBS)
     tid = fx.Int32(fx.thread_idx.x)
     bid = fx.Int32(fx.block_idx.x)
     g_do = _bv(DO, n_rows * (D_V * 2), fx.BFloat16, 8)
@@ -897,6 +914,7 @@ def k_dkdv(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, DO: fx.Tensor,
            LSE: fx.Tensor, DEL: fx.Tensor, DV_: fx.Tensor, DK: fx.Tensor,
            scale: fx.Float32, Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32,
            G: fx.Int32, nqt: fx.Int32, cshift: fx.Int32, causal: fx.Int32, B_: fx.Int32):
+    _ = MODULE_KNOBS  # cache key only (see MODULE_KNOBS)
     _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK, scale, Sq, Skv, Hq, Hkv,
                G, nqt, cshift, causal, B_)
 
@@ -920,6 +938,7 @@ def k_dkdv64(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, DO: fx.Tensor,
              scale: fx.Float32, Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32,
              G: fx.Int32, nqt: fx.Int32, cshift: fx.Int32, causal: fx.Int32, B_: fx.Int32,
              HG: fx.Int32):
+    _ = MODULE_KNOBS  # cache key only (see MODULE_KNOBS)
     rocdl.disable_xdl_arb_stall()  # lock_simd (SCHED_MODE.DISABLE_XDL_ARB_STALL), round 2 probe P1
     _dkdv_impl(Q, K, V, DO, LSE, DEL, DV_, DK, scale, Sq, Skv, Hq, Hkv,
                G, nqt, cshift, causal, B_, DKDV_NW, HG)
@@ -1415,6 +1434,7 @@ def k_dqg(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, DO: fx.Tensor, O: fx.Tensor,
           scale: fx.Float32, Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32,
           G: fx.Int32, nkvt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
           q_off: fx.Int32, ntile: fx.Int32, HG: fx.Int32):
+    _ = MODULE_KNOBS  # cache key only (see MODULE_KNOBS)
     _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G,
                   nkvt, cshift, causal, q_off, ntile, NQW, 1, HG)
 
@@ -1425,6 +1445,7 @@ def k_dqg48(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, DO: fx.Tensor, O: fx.Tenso
             scale: fx.Float32, Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32,
             G: fx.Int32, nkvt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
             q_off: fx.Int32, ntile: fx.Int32):
+    _ = MODULE_KNOBS  # cache key only (see MODULE_KNOBS)
     _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G,
                   nkvt, cshift, causal, q_off, ntile, NQW48)
 
@@ -1460,6 +1481,7 @@ def k_dqg96(Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, DO: fx.Tensor, O: fx.Tenso
             scale: fx.Float32, Sq: fx.Int32, Skv: fx.Int32, Hq: fx.Int32, Hkv: fx.Int32,
             G: fx.Int32, nkvt: fx.Int32, cshift: fx.Int32, causal: fx.Int32,
             q_off: fx.Int32, ntile: fx.Int32, HG: fx.Int32):
+    _ = MODULE_KNOBS  # cache key only (see MODULE_KNOBS)
     rocdl.disable_xdl_arb_stall()  # lock_simd (SCHED_MODE.DISABLE_XDL_ARB_STALL), round 2 probe P1
     _dqg_tdm_impl(Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G,
                   nkvt, cshift, causal, q_off, ntile, NQW48, DQ_NWAVE, HG)
@@ -1476,3 +1498,12 @@ def launch_dqg96(Q, K, V, DO, O, LSE, DEL, DQ, scale: fx.Float32,
     k_dqg96(Q, K, V, DO, O, LSE, DEL, DQ, scale, Sq, Skv, Hq, Hkv, G,
             nkvt, cshift, causal, q_off, ntile, hg).launch(
         grid=(hg, ntile, ngz), block=(DQ_NWAVE * WAVE, 1, 1), stream=stream)
+
+
+# FlyDSL keys its JIT cache by the launcher's and its kernels' source, their closure scalars, and the
+# module globals a static walk of their top-level code finds; a constant read only inside a nested
+# helper (TDM_DEPTH, KH0_SALU, DQ_BARRIER_FENCE, ...) is not found, so two builds that differ only in
+# its value would share a cached binary. Every kernel above reads MODULE_KNOBS, which puts the value
+# of every knob of this file into the key. It is taken at import: edit a knob in this file, not at
+# run time (FlyDSL refuses a captured global that changes after the first compile anyway).
+MODULE_KNOBS = _module_knobs()

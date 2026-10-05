@@ -342,3 +342,27 @@ forces one set for both chains per call.
   workgroups, hence the per-chain thresholds. With them: b1 s2048 h16 (k_dkdv64 + one k_dqg) x0.870
   of the two-wave set, b1 s2048 h8 x0.824, b1 s2048 h32 x1.001 (two-wave). dq/dk/dv are bitwise equal
   across the sets.
+
+## Packaging: package-relative imports, flydsl version gate, MODULE_KNOBS JIT key
+
+Host / import code only; no kernel instruction changed.
+
+- `_env.py` (prepended `$FLYDSL_PATH` to `sys.path`, asserted `flydsl.__version__` / `__file__` and
+  the device arch on the first call) and impl.py's `_sibling` loader (imported `kernels.py` by path
+  under a directory-unique module name) are removed. impl.py imports `kernels` relatively; the
+  package `__init__` (and the forward's) calls `gfx1250_mla_version.require_flydsl()`, which raises
+  ImportError unless the importable flydsl satisfies `>=0.3.4,<0.3.5`, and the Turbo gate asks
+  `flydsl_unavailable_reason()` before importing any kernel module, so another flydsl falls back to
+  another backend instead of asserting. impl.py checks the device arch once per device and raises
+  RuntimeError (no assert); the knob banner goes to the Turbo logger at debug level.
+- JIT cache key: FlyDSL keys a launch by the sources of the launcher and its kernels, their closure
+  scalars, and the module globals a static walk of their top-level code finds. Constants read only
+  inside nested helpers (TDM_DEPTH, KH0_SALU, DQ_BARRIER_FENCE, DQT_VT_SGB, NEG, ...) were missing,
+  so a persistent cache could return a binary built with another value. Every kernel now reads
+  MODULE_KNOBS (every upper-case scalar / tuple-of-scalars constant of kernels.py, taken at import),
+  as the forward does. With the old directory-unique module names the globals part of the key also
+  changed every process (str hash randomization), so the persistent cache never hit across
+  processes; the package module name is stable now, which is what makes the knob key necessary.
+- Codegen-neutral: every kernel (k_delta, k_dkdv64, k_dqg96, k_dqg and the one-wave k_dkdv) has the
+  same code_sha, registers, spills, LDS and instruction count as before in each of the 41 compiled
+  launch variants, and every launch plan (grids, dQ split, head group, small-grid choice) is equal.
