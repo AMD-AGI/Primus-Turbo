@@ -1064,7 +1064,7 @@ def k_dkdv64(
     HG: fx.Int32,
 ):
     _ = MODULE_KNOBS  # cache key only (see MODULE_KNOBS)
-    rocdl.disable_xdl_arb_stall()  # lock_simd (SCHED_MODE.DISABLE_XDL_ARB_STALL), round 2 probe P1
+    rocdl.disable_xdl_arb_stall()  # lock_simd (SCHED_MODE.DISABLE_XDL_ARB_STALL); PROVENANCE.md, round 5
     _dkdv_impl(
         Q, K, V, DO, LSE, DEL, DV_, DK, scale, Sq, Skv, Hq, Hkv, G, nqt, cshift, causal, B_, DKDV_NW, HG
     )
@@ -1148,7 +1148,7 @@ def dq_split(sq, bqw=DQ_BQW96):
 # issued before it (the dQ tr16 of stage i%3, the readback of i-1) has retired (dscnt 0), and
 # every TDM op of this wave except the newest stage has retired (the caller's tensor_wait).
 # Raw split barrier with nothing between signal and wait; sched_barrier(0) on both sides keeps
-# every DS/TDM op on its side (checked on the ISA by tools/flydsl/isa_ring_barrier_check.py).
+# every DS/TDM op on its side (checked on the compiled ISA during development).
 # DQ_BARRIER_FENCE: workgroup release/acquire fences around signal/wait (gpu.barrier()'s
 # semantics), so no IR pass moves an LDS access across the barrier either. Measured at compile
 # time: the fences add no s_wait_tensorcnt 0 (the newest ring stage stays in flight) and no wait
@@ -1789,7 +1789,7 @@ def k_dqg96(
     HG: fx.Int32,
 ):
     _ = MODULE_KNOBS  # cache key only (see MODULE_KNOBS)
-    rocdl.disable_xdl_arb_stall()  # lock_simd (SCHED_MODE.DISABLE_XDL_ARB_STALL), round 2 probe P1
+    rocdl.disable_xdl_arb_stall()  # lock_simd (SCHED_MODE.DISABLE_XDL_ARB_STALL); PROVENANCE.md, round 5
     _dqg_tdm_impl(
         Q,
         K,

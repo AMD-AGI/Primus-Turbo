@@ -175,7 +175,8 @@ MIN_KV_BLK_BYTES = 64 * 1024
 # RAW: tile t+1's reads follow WAIT(t+1), which needs every wave's tensor_wait before its
 # mid-tile SIGNAL(t). WAR: TDM(t+2) into slot t follows WAIT(t+1), i.e. every wave's
 # dscnt(0) over its slot-t reads. PV (register-only) + loop tail run between SIGNAL and WAIT,
-# so a wave may run up to one PV ahead of its slowest peer. CPU model: ../bounds_proof.py.
+# so a wave may run up to one PV ahead of its slowest peer. A CPU model of this protocol was
+# checked during development (PROVENANCE.md, item 8).
 SPLIT_TILE_BARRIER = True
 # Seed the SIMD-pair offset: HI waves (4..7) sleep once after the prologue signal,
 # s_sleep(N) ~ 64*N cycles (8 -> ~512, about one softmax of the partner). 0 = no skew.
@@ -195,7 +196,8 @@ BARRIER_FENCE = True
 # keep WAIT, this wave's TDM(t+1) slice, dscnt(0) + tensor_wait(0) + SIGNAL and the ds-pointer
 # swap; m/d/O bypass that loop. Every kv of a skipped tile is > the band edge of every row of
 # the wave, so the full body was an exact no-op there (p = 0, m unchanged, corr = 1, O += 0).
-# CPU proof: ../bounds_proof.py (W: bounds/exactness, P/S: protocol with per-wave skips).
+# Bounds, exactness and the protocol with per-wave skips were checked on the CPU during
+# development (PROVENANCE.md, item 9).
 SKIP_MASKED_TILES = True
 
 # ---- fwd_r3_a: QK K-load consumption order ----
@@ -205,7 +207,7 @@ SKIP_MASKED_TILES = True
 # _qk_gemm d-step-major with sched_barrier(0) between d-step groups (NKV*R = 8 independent
 # chains each): every wait then releases at most one d-step (8 loads). Same addresses and
 # immediates, same per-chain accumulation order: o/lse bitwise equal to fwd_r2_c.
-# False == fwd_r2_c's code path. CPU proof: ../bounds_proof.py.
+# False == fwd_r2_c's code path (PROVENANCE.md, item 10).
 QK_DMAJOR = True
 # Also fence every kv pair inside a d-step group (consumption order == issue order). With
 # d-step fences only, LLVM still reorders the 4 kv pairs inside a group (the masked HI loop
@@ -221,7 +223,8 @@ QK_KV_FENCE = True
 # time, so KV_GROUP WGs of one head run together (linear-id stride KV_HEAD_CHUNK, as pure
 # LPT does at proxy where gyz == 64). Otherwise pure LPT. Still a bijection; at gyz ==
 # KV_HEAD_CHUNK it equals pure LPT exactly. KV_GROUP = 1 == fwd_r3_a's code path. Both
-# knobs are powers of two (shift/mask arithmetic). CPU proof: ../bounds_proof.py.
+# knobs are powers of two (shift/mask arithmetic). The bijection was checked on the CPU
+# (PROVENANCE.md, item 11).
 KV_GROUP = 16  # fwd_r5_a_g16: 16 WGs of a head together, 1 window per head at prod (fwd_r4_a: 4)
 KV_HEAD_CHUNK = 16  # fwd_r5_a_g16 (fwd_r4_a: 64): proxy (gyz 64) takes the grouped path
 assert KV_GROUP & (KV_GROUP - 1) == 0 and KV_HEAD_CHUNK & (KV_HEAD_CHUNK - 1) == 0
@@ -244,9 +247,9 @@ assert KV_GROUP & (KV_GROUP - 1) == 0 and KV_HEAD_CHUNK & (KV_HEAD_CHUNK - 1) ==
 # fwd_c0: threshold 0.0 = exact running max (the wave rescales whenever any of its rows'
 # max moved; the multiply is still skipped when none did, where corr == 1 anyway). A stale
 # max leaves the dominant P weight != 1.0 in bf16: CPU emulation at the DSV3 scale gives o
-# 53.2-53.6 dB with r16's 8.0 vs 54.5-54.6 dB with 0.0 (= ASM/Triton), bench/emu_fwd_c0.py.
+# 53.2-53.6 dB with r16's 8.0 vs 54.5-54.6 dB with 0.0 (= ASM/Triton).
 ENABLE_DEFER_RESCALE = True
-RESCALE_THRESHOLD = 1.0  # fwd_c0t9: bounded stale max (bench/emu_fwd_c0.py sweep)
+RESCALE_THRESHOLD = 1.0  # fwd_c0t9: bounded stale max (CPU emulation sweep, PROVENANCE.md item 5)
 
 # r6 g14: speculative stale-max softmax. Common path: p = exp(S - m_prev) straight away (no row-max
 # tree, no permlane, no corr exp) -- exactly the deferred path above whenever it does not fire. A
@@ -282,8 +285,8 @@ O_VARIANT = "v3"
 
 
 # UNSTABLE(gfx1250): raw split workgroup barrier (rocdl.s_barrier_signal/wait, id -1) and
-# llvm.fence; ported from B:output/0927__flydsl/proto/barriers/op/flydsl_fwd/
-# fmha_fwd_prefill_a16w16_m32x8.py:236-253. Callers wrap them in sched_barrier(0).
+# llvm.fence; ported from an earlier gfx1250 FlyDSL barrier prototype of this kernel.
+# Callers wrap them in sched_barrier(0).
 def _wg_fence(release):
     if BARRIER_FENCE:
         llvm_dialect.fence(

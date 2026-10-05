@@ -197,9 +197,9 @@ def _plan(
     do, q, k, v, o, lse, softmax_scale, causal, stream, dq_stream=None, head_group=None, small_grid=None
 ):
     """Every launch flydsl_attn_bwd makes for these inputs, in issue order, plus the
-    tensors it allocates. Used verbatim by the launcher below and by the compile-only gate
-    (tools/flydsl/drivers/bwd_mla.py, meta tensors, stream=None), so the compiled set is
-    exactly the launched set.
+    tensors it allocates. Used verbatim by the launcher below and by compile-only builds
+    (meta tensors, stream=None, COMPILE_ONLY=1), so the compiled set is exactly the
+    launched set.
 
     launches: [(name, launcher, args, chain)], chain "main" (caller's stream) or "dq".
     head_group: target of kernels.head_group (None: HEAD_GROUP; 0: r3_a's grids).
