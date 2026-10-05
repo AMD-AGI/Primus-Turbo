@@ -1,39 +1,14 @@
 """flydsl_attn_bwd: the gfx1250 FlyDSL backward (k_delta, k_dkdv64, k_dqg96 + k_dqg in kernels.py;
 k_dkdv + one k_dqg on grids too small to give every SIMD a wave: _geometry)."""
-import importlib.util as _ilu
-import pathlib as _pl
-
-_HERE = _pl.Path(__file__).resolve().parent
-
-
-def _sibling(stem):
-    """Import a module from THIS directory under a name unique to this directory.
-
-    A plain `import kernels` binds `sys.modules["kernels"]`, so loading a second
-    implementation in the same process would silently reuse the first one's module -- and
-    with it the first one's JIT-compiled kernels. The directory is the identity, so the
-    module name has to carry it.
-    """
-    name = f"{stem}__{abs(hash(str(_HERE)))}"
-    spec = _ilu.spec_from_file_location(name, _HERE / f"{stem}.py")
-    mod = _ilu.module_from_spec(spec)
-    import sys as _sys
-    _sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-_env = _sibling("_env")
-
 import math
 import os
-import sys
 
+import flydsl.compiler as _flyc
 import torch
 
-_k = _sibling("kernels")
+from primus_turbo.common.logger import logger
 
-import flydsl.compiler as _flyc  # kernels.py has already put the pinned flydsl on sys.path
+from . import kernels as _k
 
 # FlyDSL's @flyc.jit __call__ re-derives the whole cache key on every launch (~0.27 ms of
 # host time per call). flyc.compile(launcher, *args) performs the first launch and returns
@@ -62,7 +37,7 @@ def _launch(name, launcher, args):
     _COMPILED[key] = fn
 
 
-_ENV_CHECKED = False
+_DEVICES_CHECKED = set()
 
 # The dQ chain (k_dqg) runs on the caller's stream AFTER the dK/dV chain (k_dkdv) by default.
 # It may instead run on a SIDE stream concurrently with k_dkdv: both only read
@@ -141,15 +116,19 @@ def _alloc(shape, device, dtype):
     return torch.empty(shape, device=device, dtype=dtype)
 
 
-def _check_env_once():
-    global _ENV_CHECKED
-    if not _ENV_CHECKED:
-        _env.assert_environment()
-        print(f"[flydsl_bwd {_HERE.name}] DQ_SIDE_STREAM={int(DQ_SIDE_STREAM)} "
-              f"DQ_SIDE_RECORD={int(DQ_SIDE_RECORD)} HEAD_GROUP={HEAD_GROUP} "
-              f"SMALL_GRID_WAVES={SMALL_GRID_WAVES}",
-              file=sys.stderr, flush=True)
-        _ENV_CHECKED = True
+def _check_device_once(device):
+    """Raise unless `device` is a gfx1250 (the kernels are wave32 WMMA code for it); log the knobs."""
+    if device in _DEVICES_CHECKED:
+        return
+    arch = torch.cuda.get_device_properties(device).gcnArchName
+    if "gfx1250" not in arch:
+        raise RuntimeError(f"the gfx1250 MLA backward kernels cannot run on {arch}")
+    logger.debug(
+        f"gfx1250 MLA backward: DQ_SIDE_STREAM={int(DQ_SIDE_STREAM)} DQ_SIDE_RECORD={int(DQ_SIDE_RECORD)} "
+        f"HEAD_GROUP={HEAD_GROUP} SMALL_GRID_WAVES={SMALL_GRID_WAVES}",
+        once=True,
+    )
+    _DEVICES_CHECKED.add(device)
 
 
 def _side_stream(dev):
@@ -276,7 +255,7 @@ def flydsl_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, head_g
     small_grid: None = the per-chain SMALL_GRID_WAVES rule (_geometry); True / False force the
     one-wave / two-wave launch set for both chains.
     """
-    _check_env_once()
+    _check_device_once(q.device)
     lse = lse.contiguous().float()
     stream = torch.cuda.current_stream()
     split = DQ_SIDE_STREAM

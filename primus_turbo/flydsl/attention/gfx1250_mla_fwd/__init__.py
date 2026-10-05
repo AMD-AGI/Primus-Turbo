@@ -16,5 +16,10 @@
 q/k head dim 192, v/o head dim 128, bf16, bottom-right causal or full attention. The
 kernel is aiter's gfx1250 ``m32x8`` forward prefill (vendored, see PROVENANCE.md) with the
 softmax scale applied in fp32 inside the exp2 argument instead of being folded into Q in
-bf16. Import only on gfx1250 with flydsl 0.3.4.x; the entry point lives in ``interface``.
+bf16. Runs on gfx1250 only; the entry point lives in ``interface``. Importing the package raises
+ImportError unless flydsl satisfies ``gfx1250_mla_version.FLYDSL_REQUIREMENT`` (0.3.4.x).
 """
+
+from ..gfx1250_mla_version import require_flydsl
+
+require_flydsl()

@@ -24,18 +24,6 @@ _dkdv_impl); k_dqg96 runs two waves on one K/V ring (each TDMs half of every til
 workgroup barrier per kv step (_wg_sync). The design history behind every choice is in
 PROVENANCE.md.
 """
-import importlib.util as _ilu
-import pathlib as _pl
-import sys as _sys
-
-# _env sets sys.path (flydsl 0.3.4.1). It must run before flydsl is imported, and it is
-# loaded by path so two implementation directories in one process never share a module.
-_n = f"_env__{abs(hash(str(_pl.Path(__file__).resolve().parent)))}"
-_sp = _ilu.spec_from_file_location(_n, _pl.Path(__file__).resolve().parent / "_env.py")
-_env = _ilu.module_from_spec(_sp)
-_sys.modules[_n] = _env
-_sp.loader.exec_module(_env)
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir as _mlir_ir  # UNSTABLE(gfx1250): gpu.barrier memfence attribute

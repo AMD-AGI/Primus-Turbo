@@ -42,7 +42,8 @@ def is_mla_head_dims(q: torch.Tensor, k: Optional[torch.Tensor], v: Optional[tor
 
 
 def _bwd_kernels():
-    # Imported on first use: wave32 WMMA code for gfx1250 that needs flydsl 0.3.4.x.
+    # Imported on first use (never on other archs): wave32 WMMA code for gfx1250 that needs
+    # flydsl 0.3.4.x; the package raises ImportError on any other flydsl.
     from primus_turbo.flydsl.attention.gfx1250_mla_bwd import impl
 
     return impl
@@ -54,6 +55,15 @@ def _fwd_interface():
     return interface
 
 
+def _flydsl_unavailable_reason() -> Optional[str]:
+    # stdlib-only module, imported here so importing this adapter never imports flydsl
+    from primus_turbo.flydsl.attention.gfx1250_mla_version import (
+        flydsl_unavailable_reason,
+    )
+
+    return flydsl_unavailable_reason()
+
+
 def flydsl_gfx1250_mla_unsupported_reason(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool
 ) -> Optional[str]:
@@ -63,6 +73,8 @@ def flydsl_gfx1250_mla_unsupported_reason(
     the backward's: k_dkdv64 consumes query pairs of 32 rows and kv blocks of
     DKDV_NW * BLOCK_KV (two waves of BLOCK_KV rows each), the dQ kernels (k_dqg96 / k_dqg) query
     tiles of a multiple of DQ_BQW and kv steps of KV_STEP, k_delta rows in groups of ROWS_DELTA.
+    A missing flydsl or one outside ``gfx1250_mla_version.FLYDSL_REQUIREMENT`` is a reason too
+    (checked before any kernel module is imported), so the call falls back to another backend.
     """
     if q.dtype != torch.bfloat16 or k.dtype != q.dtype or v.dtype != q.dtype:
         return f"dtype must be bfloat16, got {q.dtype}/{k.dtype}/{v.dtype}"
@@ -78,9 +90,12 @@ def flydsl_gfx1250_mla_unsupported_reason(
         return f"MHA only (heads_q == heads_kv), got {hq} / {hkv}"
     if not causal:
         return "causal only: the non-causal forward variant spills at head dim 192"
+    reason = _flydsl_unavailable_reason()
+    if reason is not None:
+        return reason
     try:
         kern = _bwd_kernels()._k
-    except ImportError as exc:  # flydsl missing or incompatible
+    except ImportError as exc:  # a flydsl that passes the version check but cannot load the kernels
         return f"flydsl gfx1250 MLA attention is unavailable: {exc}"
     q_mult = max(64, kern.DQ_BQW)
     kv_mult = max(kern.KV_STEP, kern.BLOCK_KV * kern.DKDV_NW)
