@@ -583,3 +583,160 @@ def test_mla_fwd_jit_key_covers_module_knobs(monkeypatch):
     finally:
         monkeypatch.undo()
         kern.build_fmha_fwd_prefill_a16w16_m32x8.cache_clear()
+
+
+def _mla_bwd_impl():
+    """The MLA backward host module, or a skip where its flydsl 0.3.4 kernels cannot be imported."""
+    try:
+        from primus_turbo.flydsl.attention.gfx1250_mla_bwd import impl
+    except Exception as exc:  # noqa: BLE001 -- flydsl missing or another version
+        pytest.skip(f"gfx1250 MLA backward not importable: {exc}")
+    return impl
+
+
+@pytest.mark.parametrize(
+    ("dims", "expect"),
+    [
+        ((1, 256, 256, 2, 2), (True, True)),
+        ((1, 1024, 1024, 8, 8), (True, True)),
+        ((1, 2048, 2048, 8, 8), (True, True)),
+        ((1, 2048, 2048, 16, 16), (False, True)),
+        ((1, 2048, 2048, 32, 32), (False, False)),
+        ((2, 4096, 4096, 128, 128), (False, False)),
+        ((1, 4096, 4096, 256, 256), (False, False)),
+    ],
+    ids=["toy", "b1s1k_h8", "b1s2k_h8", "b1s2k_h16", "b1s2k_h32", "dsv3_mbs2", "dsv3_mbs2_folded"],
+)
+def test_mla_bwd_small_grid_launch_set(dims, expect):
+    """Small grids launch the one-wave k_dkdv / one k_dqg over [0, Sq) per chain; the DeepSeek-V3
+    training shapes keep the two-wave kernels. A fold [1, s, b*h, d] decides like [b, s, h, d]."""
+    impl = _mla_bwd_impl()
+    b, sq, skv, hq, hkv = dims
+    geo = impl._geometry(b, sq, skv, hq, hkv)
+    assert geo["small"] == expect
+    assert impl._geometry(1, sq, skv, b * hq, b * hkv)["small"] == expect
+    nw, nblk = geo["dkdv"]
+    assert nw * nblk * impl._k.BLOCK_KV == skv and nw == (1 if expect[0] else impl._k.DKDV_NW)
+    assert sum(ntile * 16 * nqw * nwave for nqw, nwave, _, ntile in geo["dq"]) == sq
+    if expect[1]:
+        assert geo["dq"] == [(impl._k.NQW, 1, 0, sq // impl._k.DQ_BQW)]
+    for forced in (True, False):
+        assert impl._geometry(b, sq, skv, hq, hkv, small_grid=forced)["small"] == (forced, forced)
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("layout", ["sbhd", "bshd"])
+def test_mla_torch_compile_traces_the_custom_ops(monkeypatch, layout, dynamic):
+    """torch.compile(fullgraph) of FlashAttnFunc on MLA head dims, with meta tensors: the forward and
+    backward AOT graphs each hold the MLA custom op exactly once, and its registered fake impls give
+    the eager path's shapes, dtypes and (folded sbhd view) strides. No kernel runs."""
+    from functorch.compile import make_boxed_func
+    from torch._dynamo.backends.common import aot_autograd
+
+    _mla_bwd_impl()  # the gate asks the backward's kernel constants
+    monkeypatch.setattr(attention_impl, "is_gfx1250", lambda: True)
+    monkeypatch.setattr(flash_attn_interface, "is_gfx1250", lambda: True)
+    b, s, h = 2, 256, 4
+    seen = {"fw": [], "bw": []}
+
+    def record(kind):
+        def compiler(gm, example_inputs):
+            seen[kind] += [str(n.target) for n in gm.graph.nodes if n.op == "call_function"]
+            return make_boxed_func(gm.forward)
+
+        return compiler
+
+    def make(d):
+        dims = (s, b, h, d) if layout == "sbhd" else (b, s, h, d)
+        t = torch.empty(*dims, dtype=torch.bfloat16, device="meta")
+        return (t.permute(1, 0, 2, 3) if layout == "sbhd" else t).requires_grad_()
+
+    q, k, v = make(D_QK), make(D_QK), make(D_V)
+    backend = aot_autograd(fw_compiler=record("fw"), bw_compiler=record("bw"))
+
+    @torch.compile(fullgraph=True, dynamic=dynamic, backend=backend)
+    def fn(q, k, v):
+        return flash_attn_func(q, k, v, softmax_scale=MLA_SCALE, causal=True, return_lse=True)
+
+    torch._dynamo.reset()
+    try:
+        with _pinned_flydsl():
+            out, lse = fn(q, k, v)
+            (out.float().sum() + lse.sum()).backward()
+    finally:
+        torch._dynamo.reset()
+    ops = {kind: [t for t in targets if t.startswith("primus_turbo.")] for kind, targets in seen.items()}
+    assert ops == {
+        "fw": ["primus_turbo.flash_attn_flydsl_gfx1250_mla_forward.default"],
+        "bw": ["primus_turbo.flash_attn_flydsl_gfx1250_mla_backward.default"],
+    }
+    assert out.shape == (b, s, h, D_V) and out.dtype == torch.bfloat16
+    assert lse.shape == (b, h, s) and lse.dtype == torch.float32 and lse.is_contiguous()
+    for x, ref in ((out, None), (q.grad, q), (k.grad, k), (v.grad, v)):
+        assert x.transpose(0, 1).is_contiguous() == (layout == "sbhd")
+        if ref is not None:
+            assert x.shape == ref.shape and x.dtype == ref.dtype
+
+
+@needs_gfx1250
+def test_mla_torch_compile_fullgraph():
+    """The compiled MLA path on the card (b2 sbhd: the folded launch) equals the eager path bitwise
+    and the CPU fp32 reference."""
+    q, k, v, dout = _mla_inputs(2, 256, 256, 4, layout="sbhd")
+    ref = _mla_reference(q, k, v, dout, True, MLA_SCALE)
+    eager = _run_mla(q, k, v, dout, True)
+
+    @torch.compile(fullgraph=True)
+    def fn(q, k, v):
+        return flash_attn_func(q, k, v, softmax_scale=MLA_SCALE, causal=True, return_lse=True)
+
+    q_, k_, v_ = (t.to("cuda").requires_grad_() for t in (q, k, v))
+    torch._dynamo.reset()
+    try:
+        with _pinned_flydsl():
+            out, lse = fn(q_, k_, v_)
+        out.backward(dout.to("cuda"))
+        torch.cuda.synchronize()
+    finally:
+        torch._dynamo.reset()
+    got = (out, lse, q_.grad, k_.grad, v_.grad)
+    _check(got, ref, min_db=48.0)
+    for a, b_ in zip(got, eager):
+        assert torch.equal(a, b_)
+
+
+# Shapes the gate accepts beyond the full 256-row forward tiles: seqlen_q % 256 != 0 leaves whole
+# forward waves past seqlen_q (empty Q TDM, skipped O stores, masked LSE lanes), the backward's dQ
+# split takes its other forms (sq 64: q_split 64 and no k_dqg96 tile; 128: q_split 32 + one tile;
+# 192: no head launch), and sq < skv shifts the causal diagonal. Each runs the backward's default
+# launch set (one-wave kernels at these sizes) and the two-wave set.
+@needs_gfx1250
+@pytest.mark.parametrize("bwd_set", ["default", "two_wave"])
+@pytest.mark.parametrize(
+    ("shape", "layout"),
+    [
+        ((1, 64, 64, 2), "sbhd"),
+        ((1, 128, 128, 2), "sbhd"),
+        ((1, 192, 192, 2), "sbhd"),
+        ((2, 64, 64, 2), "sbhd"),
+        ((2, 64, 64, 2), "bshd"),
+        ((1, 64, 128, 2), "sbhd"),
+        ((1, 128, 384, 2), "sbhd"),
+        ((2, 192, 448, 2), "sbhd"),
+    ],
+    ids=[
+        "s64",
+        "s128",
+        "s192",
+        "b2_s64_folded",
+        "b2_s64_bshd",
+        "sq64_skv128",
+        "sq128_skv384",
+        "b2_sq192_skv448_folded",
+    ],
+)
+def test_mla_partial_tiles_match_reference(monkeypatch, shape, layout, bwd_set):
+    if bwd_set == "two_wave":
+        monkeypatch.setattr(_mla_bwd_impl(), "SMALL_GRID_WAVES", {"dkdv": 0, "dq": 0})
+    q, k, v, dout = _mla_inputs(*shape, layout=layout)
+    _check(_run_mla(q, k, v, dout, True), _mla_reference(q, k, v, dout, True, MLA_SCALE), min_db=48.0)
