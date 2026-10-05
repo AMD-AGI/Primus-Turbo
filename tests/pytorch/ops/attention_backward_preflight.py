@@ -32,11 +32,14 @@ def main():
     torch.manual_seed(30279)
     results = []
     cases = [(512, -1, 16), (512, 128, 16), (8192, -1, 1), (8192, 128, 1)]
-    if os.getenv("PRIMUS_TURBO_ATTN_Q_PREP") in ("forward", "forward_hybrid", "lse"):
-        cases += [(513, -1, 16), (513, 128, 16)]
     cases = [(seq, window, spike, False) for seq, window, spike in cases]
     cases.append((8192, -1, 1, True))
+    if os.getenv("PRIMUS_TURBO_ATTN_Q_PREP") in ("forward", "forward_hybrid", "lse"):
+        # Test the odd tail exactly before testing its native atomic variant.
+        cases += [(513, -1, 16, True), (513, -1, 16, False), (513, 128, 16, False)]
     for seq, window, spike, deterministic in cases:
+        # Extra deterministic diagnostics must not change the native test inputs.
+        rng_state = torch.cuda.get_rng_state() if deterministic else None
         batch, hq, hkv, dim = 4, 64, 8, 64
         q = torch.randn(seq, batch, hq, dim, device="cuda", dtype=torch.bfloat16)
         k = torch.randn(seq, batch, hkv, dim, device="cuda", dtype=torch.bfloat16)
@@ -65,6 +68,17 @@ def main():
         kwargs = dict(sbhd=True, window_left=window, sink=sink, deterministic=deterministic)
         ref = baseline.flydsl_varlen_backward(*args, **kwargs)
         repeat = baseline.flydsl_varlen_backward(*args, **kwargs)
+        repeat_errors = [[relative_l2(b, a)] for a, b in zip(ref, repeat)]
+        if seq == 513 and window < 0 and not deterministic:
+            # One repeated atomic accumulation can coincide with the reference
+            # by chance. Measure baseline variability rather than changing the
+            # tolerance multiplier or attributing that variability to caching.
+            for _ in range(7):
+                repeated = baseline.flydsl_varlen_backward(*args, **kwargs)
+                for errors, expected, actual in zip(repeat_errors, ref, repeated):
+                    assert torch.isfinite(actual).all(), "nonfinite baseline repeat"
+                    errors.append(relative_l2(actual, expected))
+            del repeated
         if os.getenv("PRIMUS_TURBO_ATTN_Q_PREP") == "forward" or (
             os.getenv("PRIMUS_TURBO_ATTN_Q_PREP") == "forward_hybrid" and window < 0
         ):
@@ -90,10 +104,12 @@ def main():
             candidate = flydsl_varlen_backward(*args, **kwargs)
         torch.cuda.synchronize()
         gradients = {}
-        for name, expected, repeated, actual in zip(("dq", "dk", "dv", "dsink"), ref, repeat, candidate):
+        for name, expected, repeated, actual, errors in zip(
+            ("dq", "dk", "dv", "dsink"), ref, repeat, candidate, repeat_errors
+        ):
             assert torch.isfinite(expected).all(), f"baseline {name} is nonfinite"
             assert torch.isfinite(actual).all(), f"candidate {name} is nonfinite"
-            noise = relative_l2(repeated, expected)
+            noise = max(errors)
             error = relative_l2(actual, expected)
             if deterministic:
                 assert torch.equal(repeated, expected), ("baseline deterministic repeat", name, noise)
@@ -101,10 +117,16 @@ def main():
             gradients[name] = dict(
                 relative_l2=error,
                 baseline_repeat_relative_l2=noise,
+                baseline_repeat_relative_l2_samples=errors,
                 tolerance=tolerance,
                 exact=torch.equal(actual, expected),
             )
             assert error <= tolerance, (seq, window, spike, name, gradients[name])
+        print(
+            "ATTENTION_GRADIENT_REFERENCE "
+            + json.dumps(dict(sequence=seq, window=window, deterministic=deterministic, gradients=gradients)),
+            flush=True,
+        )
         # Exercise the public autograd path as well as the raw backward entry:
         # saved-Q gradients must still flow into the original Q/K/V inputs.
         original_q = q.clone()
@@ -146,6 +168,8 @@ def main():
         print("ATTENTION_GRADIENT_CASE " + json.dumps(results[-1]), flush=True)
         del q, k, v, out, lse, dout, args, kwargs, ref, repeat, candidate
         del original_q, public_out, public_grads
+        if rng_state is not None:
+            torch.cuda.set_rng_state(rng_state)
     Path("/results/attention_backward_preflight.json").write_text(
         json.dumps(dict(passed=True, cases=results), indent=2) + "\n"
     )
