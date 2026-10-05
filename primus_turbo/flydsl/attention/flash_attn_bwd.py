@@ -39,9 +39,9 @@ _LOG2E = host_math.log2(host_math.e)
 # a second compute queue interferes with application communication (#520).
 _ATTN_SINGLE_STREAM = os.getenv("PRIMUS_TURBO_ATTN_SINGLE_STREAM", "0") == "1"
 _ATTN_Q_PREP = os.getenv("PRIMUS_TURBO_ATTN_Q_PREP", "standalone")
-if _ATTN_Q_PREP not in ("standalone", "odo", "inline", "inline_swa", "forward", "hybrid", "producer"):
+if _ATTN_Q_PREP not in ("standalone", "odo", "inline", "inline_swa", "forward", "hybrid", "producer", "lse"):
     raise ValueError(
-        "PRIMUS_TURBO_ATTN_Q_PREP must be standalone, odo, inline, inline_swa, forward, hybrid, or producer"
+        "PRIMUS_TURBO_ATTN_Q_PREP must be standalone, odo, inline, inline_swa, forward, hybrid, producer, or lse"
     )
 
 
@@ -5629,6 +5629,66 @@ def _dense_plan(B, Sq, Skv, Hq, Hkv, D, scale, window_left, sbhd, deterministic)
 
 _LSET_TILE = 32
 _LSET_CACHE: dict = {}
+_QLSE_CACHE: dict = {}
+
+
+def _prescale_q_lse(q, qs, lse_bhsq, sm_scale, stream):
+    """Prepare rounded SBHD Q and transposed/scaled LSE in one bandwidth pass."""
+    Sq, B, Hq, D = q.shape
+    assert q.is_contiguous() and q.dtype == torch.bfloat16 and D == 64
+    assert lse_bhsq.dtype == torch.float32 and lse_bhsq.stride() == (Sq * Hq, 1, Hq)
+    out = torch.empty(B, Hq, Sq, device=q.device, dtype=torch.float32)
+    key = (B, Sq, Hq, float(sm_scale))
+    launcher = _QLSE_CACHE.get(key)
+    if launcher is None:
+        rows = Sq * B * Hq
+        block, vec, lanes_per_row = 256, 8, 8
+
+        @flyc.kernel(known_block_size=[block, 1, 1])
+        def flash_attn_bwd_qlse_kernel(Q: fx.Tensor, QS: fx.Tensor, LSE: fx.Tensor, LS: fx.Tensor):
+            tid = fx.Index(gpu.block_idx.x) * fx.Index(block) + fx.Index(gpu.thread_idx.x)
+            row, chunk = tid // fx.Index(lanes_per_row), tid % fx.Index(lanes_per_row)
+            off = tid * fx.Index(vec)
+            qr = buffer_ops.create_buffer_resource(Q, max_size=False, num_records_bytes=rows * D * 2)
+            qsr = buffer_ops.create_buffer_resource(QS, max_size=False, num_records_bytes=rows * D * 2)
+            qv = Vec(buffer_ops.buffer_load(qr, off, vec_width=vec, dtype=fx.BFloat16, cache_modifier=2))
+            scaled = (qv.to(fx.Float32) * Vec.filled(vec, sm_scale * _LOG2E, fx.Float32)).to(fx.BFloat16)
+            buffer_ops.buffer_store(scaled.ir_value(), qsr, off * fx.Index(2), offset_is_bytes=True)
+            if chunk == fx.Index(0):
+                h = row % fx.Index(Hq)
+                b = row // fx.Index(Hq) % fx.Index(B)
+                s = row // fx.Index(Hq * B)
+                lr = buffer_ops.create_buffer_resource(LSE, max_size=False, num_records_bytes=rows * 4)
+                lsr = buffer_ops.create_buffer_resource(LS, max_size=False, num_records_bytes=rows * 4)
+                value = fx.Float32(
+                    buffer_ops.buffer_load(
+                        lr, (b * fx.Index(Sq) + s) * fx.Index(Hq) + h, vec_width=1, dtype=fx.Float32
+                    )
+                )
+                buffer_ops.buffer_store(
+                    value * fx.Float32(-_LOG2E),
+                    lsr,
+                    ((b * fx.Index(Hq) + h) * fx.Index(Sq) + s) * fx.Index(4),
+                    mask=ArithValue(row < fx.Index(rows)),
+                    offset_is_bytes=True,
+                )
+
+        @flyc.jit
+        def launch(Q: fx.Tensor, QS: fx.Tensor, LSE: fx.Tensor, LS: fx.Tensor, st: fx.Stream):
+            flash_attn_bwd_qlse_kernel(Q, QS, LSE, LS).launch(
+                grid=((rows * lanes_per_row + block - 1) // block, 1, 1), block=(block, 1, 1), stream=st
+            )
+
+        compiled = {}
+
+        def launcher(*args):
+            return _cached_launch(compiled, launch, None, args, {})
+
+        if len(_QLSE_CACHE) >= 32:
+            _QLSE_CACHE.clear()
+        _QLSE_CACHE[key] = launcher
+    launcher(q.reshape(-1), qs.reshape(-1), lse_bhsq.permute(0, 2, 1).reshape(-1), out.reshape(-1), stream)
+    return out
 
 
 def _prescale_q(q, sm_scale):
@@ -5839,11 +5899,23 @@ def flydsl_varlen_backward(
     effective_window = -1 if Skv - 1 <= window_left else window_left
     fuse_q = not q_is_scaled and _fuse_q_for(sbhd, varlen, D, effective_window)
     inline_q = _inline_q_for(sbhd, varlen, D, effective_window)
+    fuse_lse = (
+        _ATTN_Q_PREP == "lse"
+        and not q_is_scaled
+        and sbhd
+        and not varlen
+        and D == 64
+        and q.dtype == torch.bfloat16
+        and q.is_contiguous()
+        and lse_bhsq.dtype == torch.float32
+        and lse_bhsq.shape == (B, Hq, Sq)
+        and lse_bhsq.stride() == (Sq * Hq, 1, Hq)
+    )
     assert not (q_is_scaled and inline_q), "saved forward Q is already scaled"
     qf = (
         q.reshape(-1)
         if inline_q or q_is_scaled
-        else (torch.empty_like(q).reshape(-1) if fuse_q else _prescale_q(q, scale))
+        else (torch.empty_like(q).reshape(-1) if fuse_q or fuse_lse else _prescale_q(q, scale))
     )
     odo_q = dict(q=q.reshape(-1), qs=qf) if fuse_q else {}
     kf, vf, dof = k.reshape(-1), v.reshape(-1), dout.reshape(-1)
@@ -6004,7 +6076,9 @@ def flydsl_varlen_backward(
     # Only the body reads the scaled lse, so the fold is queued AFTER the delta pass: the
     # launcher's remaining host time then runs in that pass's shadow rather than in front of
     # an idle queue, which a per-call-timed backward pays for in full.
-    lsef = _prescale_lse(lse_bhsq, st).reshape(-1)
+    lsef = (_prescale_q_lse(q, qf, lse_bhsq, scale, st) if fuse_lse else _prescale_lse(lse_bhsq, st)).reshape(
+        -1
+    )
     cu_ph = _cu_placeholder(q.device)
     ws_dq, ws_carry = (
         (None, None)

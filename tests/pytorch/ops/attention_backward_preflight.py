@@ -29,7 +29,7 @@ def main():
     torch.manual_seed(30279)
     results = []
     cases = [(512, -1, 16), (512, 128, 16), (8192, -1, 1), (8192, 128, 1)]
-    if os.getenv("PRIMUS_TURBO_ATTN_Q_PREP") == "forward":
+    if os.getenv("PRIMUS_TURBO_ATTN_Q_PREP") in ("forward", "lse"):
         cases += [(513, -1, 16), (513, 128, 16)]
     for seq, window, spike in cases:
         batch, hq, hkv, dim = 4, 64, 8, 64
@@ -44,6 +44,17 @@ def main():
             q, k, v, return_lse=True, window_size=(window, 0), sink=sink
         )
         lse = lse.view(batch, seq, hq).permute(0, 2, 1)
+        if os.getenv("PRIMUS_TURBO_ATTN_Q_PREP") == "lse":
+            from primus_turbo.flydsl.attention.flash_attn_bwd import _prescale_q_lse
+
+            original_q, original_lse = q.clone(), lse.clone()
+            scaled_q = torch.empty_like(q)
+            scaled_lse = _prescale_q_lse(q, scaled_q, lse, 0.125, torch.cuda.current_stream())
+            torch.cuda.synchronize()
+            assert torch.equal(q, original_q) and torch.equal(lse, original_lse)
+            assert torch.equal(scaled_q, torch.mul(q, 0.125 * math.log2(math.e))), "Q/LSE Q rounding"
+            assert torch.equal(scaled_lse, torch.mul(lse, -math.log2(math.e))), "Q/LSE LSE rounding"
+            del original_q, original_lse, scaled_q, scaled_lse
         dout = torch.randn_like(out)
         args = (dout, q, k, v, out, lse, batch, seq, seq, hq, hkv, dim, 0.125)
         kwargs = dict(sbhd=True, window_left=window, sink=sink)
