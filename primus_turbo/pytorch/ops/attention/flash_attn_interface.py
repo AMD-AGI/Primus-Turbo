@@ -177,6 +177,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 and is_grad_enabled
                 and _any_requires_grad(q, k, v, sink)
                 and q_s.shape[-1] == 64
+                and q_s.shape[0] == k_s.shape[0]
             )
             forward_result = flash_attn_sbhd_flydsl_forward_impl(
                 q_s,

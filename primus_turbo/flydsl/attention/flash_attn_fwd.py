@@ -69,7 +69,7 @@ def build_flash_attn_dualwave_swp_module(
     Supports dense (SBHD) and varlen packed QKV (THD) layouts. has_sink folds a learned
     per-q-head attention sink (SINK[Hq] fp32) into the online-softmax denominator.
     """
-    assert not save_scaled_q or (sbhd and not varlen and head_dim == 64)
+    assert not save_scaled_q or (sbhd and not varlen and not cross_seqlen and head_dim == 64)
     gpu_arch = get_hip_arch()
 
     if not gpu_arch.startswith("gfx950"):
