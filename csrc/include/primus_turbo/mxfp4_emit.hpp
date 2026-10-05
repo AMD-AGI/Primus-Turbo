@@ -172,7 +172,11 @@ __device__ __forceinline__ int64_t fly_scale_byte(const int64_t row, const int32
 
 // `tile_amax` >= 0 replaces the group's own amax (2-D block scaling: the caller passes the amax of
 // the 32x32 tile, taken from the same bf16 values; only valid with fly.fp4_had == kHadNone).
-template <Layout LAYOUT = Layout::A6W4Blob, bool SR = false>
+// OPTS: compile the FP4 options (fly.fp4_round / fp4_had, tile_amax) in. Without them the emit is
+// the fixed H32 + RCEIL one -- a separate instantiation because the option paths raise the register
+// count, and so lower the occupancy, of every kernel that inlines them, whether or not an option is
+// set.
+template <Layout LAYOUT = Layout::A6W4Blob, bool SR = false, bool OPTS = false>
 __device__ __forceinline__ void
 mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32_t group,
                  const int32_t nk_pad, uint8_t *__restrict__ packed,
@@ -189,7 +193,7 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
     // compiles to, and it is spelled out because the compiler's own contraction choice depends on
     // the surrounding code -- left implicit, adding the other Hadamard modes moved it and flipped
     // the sign of a few zero codes. Measured against AITER on its codes, signed zeros included.
-    if (fly.fp4_had == kHadH32) {
+    if (!OPTS || fly.fp4_had == kHadH32) {
 #pragma unroll
         for (int i = 0; i < kGroupSize; i += 2) {
             const float a = values[i];
@@ -213,7 +217,7 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
                 values[i1]            = x0 - x1;
             }
         }
-    } else if (fly.fp4_had == kHadH16) {
+    } else if (fly.fp4_had == kHadH16) { // OPTS only
         // Stages h = 1, 2, 4, 8 of the same network: two independent 16-point transforms.
 #pragma unroll
         for (int i = 0; i < kGroupSize; ++i)
@@ -275,7 +279,7 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
     // the scale for an all-zero group so RCEIL cannot emit byte 0 there. Above that floor
     // it has no effect, so it never perturbs a real weight.
     float amax = 1.0e-10f;
-    if (tile_amax >= 0.0f) {
+    if (OPTS && tile_amax >= 0.0f) {
         amax = fmaxf(amax, tile_amax);
     } else {
 #pragma unroll
@@ -286,7 +290,7 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
     }
 
     uint8_t scale_exp;
-    if (fly.fp4_round == kRoundRceil) {
+    if (!OPTS || fly.fp4_round == kRoundRceil) {
         // RCEIL: ceil_pow2(amax / 6). Bump the exponent whenever any mantissa bit survives
         // the divide, which is what makes it a ceiling rather than a truncation.
         const uint32_t scaled   = __builtin_bit_cast(uint32_t, amax * kFp4InvMaxPos);
