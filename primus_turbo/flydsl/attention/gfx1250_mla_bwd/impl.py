@@ -1,4 +1,5 @@
-"""flydsl_attn_bwd: the gfx1250 FlyDSL backward (k_delta, k_dkdv64, k_dqg96 + k_dqg in kernels.py)."""
+"""flydsl_attn_bwd: the gfx1250 FlyDSL backward (k_delta, k_dkdv64, k_dqg96 + k_dqg in kernels.py;
+k_dkdv + one k_dqg on grids too small to give every SIMD a wave: _geometry)."""
 import importlib.util as _ilu
 import pathlib as _pl
 
@@ -84,6 +85,51 @@ DQ_SIDE_RECORD = os.environ.get("FLY_BWD_RECORD_STREAM", "1") != "0"
 # shape; flydsl_attn_bwd(..., head_group=N) overrides it per call (in-process A/B controls).
 HEAD_GROUP = int(os.environ.get("FLY_BWD_HEAD_GROUP", str(_k.HEAD_GROUP)))
 _SIDE = {}
+
+# Small-grid fallback (bwd_r4_c's host rule, per chain, on the head-group launches). The two-wave
+# kernels (k_dkdv64, k_dqg96) put two waves of one workgroup on one CU to halve the TDM bytes per
+# FLOP; on a small grid the fetch bandwidth is idle and the pairing only concentrates the work on
+# fewer CUs (and the dQ chain pays a second launch for its head). A chain whose ONE-wave kernel has
+# fewer than SMALL_GRID_WAVES[chain] workgroups launches that kernel instead: k_dkdv (nw = 1, grid
+# (Hkv, Skv/32, B); no head group) for dK/dV, ONE k_dqg over [0, Sq) (grid (hg, Sq/32, B*Hq/hg); the
+# binary _plan launches over the head [0, q_split)) for dQ. Thresholds from same-process A/Bs at
+# b1 MHA (one-wave workgroups 256 / 512 / 1024 / 2048 per chain; one-wave / two-wave kernel time):
+# k_dkdv 0.91 / 0.94 / 1.12 / 1.29, dQ chain 0.63 / 0.64-0.72 / 0.80 / 1.04, so k_dkdv switches
+# below 1024 and the dQ chain below 2048. Each chain decides from B*H*S alone, so the fold launch
+# [1, S, B*H, D] and the [B, S, H, D] launch of the same tensors decide alike; Megatron's prod fold
+# (32768 per chain) keeps the two-wave launches. FLY_BWD_SMALL_GRID=0 turns the fallback off;
+# flydsl_attn_bwd(..., small_grid=True/False) forces one set for both chains per call (A/B controls,
+# tests). Pure Python from here to _geometry's end (no torch): bounds_proof.py execs it.
+N_CU = 256                       # MI455X (gfx1250) compute units, 4 SIMDs each
+SMALL_GRID_WAVES = {"dkdv": 4 * N_CU, "dq": 8 * N_CU}
+if os.environ.get("FLY_BWD_SMALL_GRID", "1") == "0":
+    SMALL_GRID_WAVES = {"dkdv": 0, "dq": 0}
+
+
+def _geometry(b, sq, skv, hq, hkv, small_grid=None):
+    """Launch set of both gradient chains for these sizes.
+
+    dkdv: (nw, nblk): nw = DKDV_NW -> k_dkdv64 (nblk = Skv/64), nw = 1 -> k_dkdv (nblk = Skv/32).
+    dq:   [(nqw, nwave, q_off, ntile)] in issue order: (NQW48, DQ_NWAVE) -> k_dqg96 (96-query
+          tiles), (NQW, 1) -> k_dqg (32-query tiles); the tiles partition [0, Sq).
+    small: (dkdv_small, dq_small). small_grid None decides each chain by SMALL_GRID_WAVES,
+    True / False forces both chains to the one-wave / two-wave set.
+    """
+    if small_grid is None:
+        dkdv_small = b * hkv * (skv // _k.BLOCK_KV) < SMALL_GRID_WAVES["dkdv"]
+        dq_small = b * hq * (sq // _k.DQ_BQW) < SMALL_GRID_WAVES["dq"]
+    else:
+        dkdv_small = dq_small = bool(small_grid)
+    nw = 1 if dkdv_small else _k.DKDV_NW
+    if dq_small:
+        dq = [(_k.NQW, 1, 0, sq // _k.DQ_BQW)]
+    else:
+        q_split, n32, n96 = _k.dq_split(sq)
+        dq = (([(_k.NQW48, _k.DQ_NWAVE, q_split, n96)] if n96 else [])
+              + ([(_k.NQW, 1, 0, n32)] if n32 else []))
+    return {"dkdv": (nw, skv // (_k.BLOCK_KV * nw)), "dq": dq, "small": (dkdv_small, dq_small)}
+
+
 # Validation only: allocate delta/dq/dk/dv NaN-filled, so an element the kernels never write
 # shows up as non-finite instead of as stale memory.
 POISON = False
@@ -100,7 +146,8 @@ def _check_env_once():
     if not _ENV_CHECKED:
         _env.assert_environment()
         print(f"[flydsl_bwd {_HERE.name}] DQ_SIDE_STREAM={int(DQ_SIDE_STREAM)} "
-              f"DQ_SIDE_RECORD={int(DQ_SIDE_RECORD)} HEAD_GROUP={HEAD_GROUP}",
+              f"DQ_SIDE_RECORD={int(DQ_SIDE_RECORD)} HEAD_GROUP={HEAD_GROUP} "
+              f"SMALL_GRID_WAVES={SMALL_GRID_WAVES}",
               file=sys.stderr, flush=True)
         _ENV_CHECKED = True
 
@@ -149,7 +196,8 @@ def _check(do, q, k, v, o, lse):
     return b, sq, skv, hq, hkv
 
 
-def _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, dq_stream=None, head_group=None):
+def _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, dq_stream=None, head_group=None,
+          small_grid=None):
     """Every launch flydsl_attn_bwd makes for these inputs, in issue order, plus the
     tensors it allocates. Used verbatim by the launcher below and by the compile-only gate
     (tools/flydsl/drivers/bwd_mla.py, meta tensors, stream=None), so the compiled set is
@@ -157,6 +205,7 @@ def _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, dq_stream=None, he
 
     launches: [(name, launcher, args, chain)], chain "main" (caller's stream) or "dq".
     head_group: target of kernels.head_group (None: HEAD_GROUP; 0: r3_a's grids).
+    small_grid: _geometry's override (None: SMALL_GRID_WAVES decides per chain).
     """
     b, sq, skv, hq, hkv = _check(do, q, k, v, o, lse)
     tgt = HEAD_GROUP if head_group is None else int(head_group)
@@ -174,38 +223,46 @@ def _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, dq_stream=None, he
     dq = _alloc((b, sq, hq, _k.D_QK), q.device, q.dtype)
     dk = _alloc((b, skv, hkv, _k.D_QK), k.device, k.dtype)
     dv = _alloc((b, skv, hkv, _k.D_V), v.device, v.dtype)
+    geo = _geometry(b, sq, skv, hq, hkv, small_grid)
+    nw, nblk = geo["dkdv"]
+    dkdv_args = (q, k, v, do, lse, delta, dv, dk, float(softmax_scale),
+                 sq, skv, hq, hkv, g, sq // 16, skv - sq, c, nblk)
     launches = [
         ("delta", _k.launch_delta,
          (do, o, delta, sq, hq, n_rows, n_rows // _k.ROWS_DELTA, stream), "main"),
-        # k_dkdv64: 2 waves per 64-row kv block share one Q/dO ring (bwd_r2_a)
-        ("dkdv", _k.launch_dkdv64,
-         (q, k, v, do, lse, delta, dv, dk, float(softmax_scale),
-          sq, skv, hq, hkv, g, sq // 16, skv - sq, c,
-          skv // (_k.BLOCK_KV * _k.DKDV_NW), hg_kv, ngz_kv, b, stream), "main"),
     ]
-    grids = {"delta": (n_rows // _k.ROWS_DELTA, 1, 1),
-             "dkdv": (hg_kv, skv // (_k.BLOCK_KV * _k.DKDV_NW), ngz_kv)}
+    grids = {"delta": (n_rows // _k.ROWS_DELTA, 1, 1)}
+    if nw == _k.DKDV_NW:
+        # k_dkdv64: 2 waves per 64-row kv block share one Q/dO ring (bwd_r2_a)
+        launches.append(("dkdv", _k.launch_dkdv64, dkdv_args + (hg_kv, ngz_kv, b, stream), "main"))
+        grids["dkdv"] = (hg_kv, nblk, ngz_kv)
+    else:
+        # small grid: the one-wave k_dkdv, one 32-row kv tile per workgroup, grid (Hkv, Skv/32, B)
+        launches.append(("dkdv", _k.launch_dkdv, dkdv_args + (hkv, b, stream), "main"))
+        grids["dkdv"] = (hkv, nblk, b)
     # dQ chain: k_dqg96 (2 waves x 48 queries on one K/V ring, bwd_r2_b) over [q_split, sq),
-    # longest-first, then the 32-query k_dqg over the head [0, q_split) (the shortest tiles). Plan
-    # name "dqg" is the main dQ launch (k_dqg96; k_dqg when there is no 96-query part), "dqg_head"
-    # the head launch. Both are single-kernel modules, so the compile-only dump/ISA table sees each
-    # kernel on its own.
+    # longest-first, then the 32-query k_dqg over the head [0, q_split) (the shortest tiles); on a
+    # small grid one k_dqg launch over [0, sq). Plan name "dqg" is the main dQ launch (k_dqg96; k_dqg
+    # when there is no 96-query part), "dqg_head" the head launch. Both are single-kernel modules, so
+    # the compile-only dump/ISA table sees each kernel on its own.
     q_split, n32, n96 = _k.dq_split(sq)
     assert q_split + n96 * _k.DQ_BQW96 == sq and n32 * _k.DQ_BQW == q_split, (sq, q_split, n32, n96)
+    if geo["small"][1]:
+        q_split, n32, n96 = sq, sq // _k.DQ_BQW, 0        # k_dqg covers [0, sq)
     dq_args = (q, k, v, do, o, lse, delta, dq, float(softmax_scale),
                sq, skv, hq, hkv, g, skv // _k.KV_STEP, skv - sq, c)
-    if n96:
-        launches.append(("dqg", _k.launch_dqg96, dq_args + (q_split, n96, hg_q, ngz_q, dq_stream), "dq"))
-        grids["dqg"] = (hg_q, n96, ngz_q)
-    if n32:
-        nm = "dqg_head" if n96 else "dqg"
-        launches.append((nm, _k.launch_dqg, dq_args + (0, n32, hg_q, ngz_q, dq_stream), "dq"))
-        grids[nm] = (hg_q, n32, ngz_q)
+    for i, (_, nwave, q_off, ntile) in enumerate(geo["dq"]):
+        nm = "dqg" if i == 0 else "dqg_head"
+        fn = _k.launch_dqg96 if nwave == _k.DQ_NWAVE else _k.launch_dqg
+        launches.append((nm, fn, dq_args + (q_off, ntile, hg_q, ngz_q, dq_stream), "dq"))
+        grids[nm] = (hg_q, ntile, ngz_q)
     return {"launches": launches, "outputs": (dq, dk, dv), "delta": delta, "grids": grids,
-            "dq_split": (q_split, n32, n96), "head_group": {"kv": hg_kv, "q": hg_q, "target": tgt}}
+            "dq_split": (q_split, n32, n96), "head_group": {"kv": hg_kv, "q": hg_q, "target": tgt},
+            "small_grid": geo["small"]}
 
 
-def flydsl_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, head_group=None):
+def flydsl_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, head_group=None,
+                    small_grid=None):
     """Flash-attention backward on gfx1250.
 
     q [B, Sq, Hq, D_QK], o/do [B, Sq, Hq, D_V], k [B, Skv, Hkv, D_QK], v [B, Skv, Hkv, D_V],
@@ -216,13 +273,15 @@ def flydsl_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, head_g
     causal is BOTTOM-RIGHT: query i attends keys j <= i + (Skv - Sq).
     head_group: launch traversal only (outputs bitwise identical for every value); None =
     HEAD_GROUP, 0 = r3_a's grids. See kernels.HEAD_GROUP.
+    small_grid: None = the per-chain SMALL_GRID_WAVES rule (_geometry); True / False force the
+    one-wave / two-wave launch set for both chains.
     """
     _check_env_once()
     lse = lse.contiguous().float()
     stream = torch.cuda.current_stream()
     split = DQ_SIDE_STREAM
     s2 = _side_stream(q.device) if split else stream
-    plan = _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, s2, head_group)
+    plan = _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, s2, head_group, small_grid)
     for name, fn, args, chain in plan["launches"]:
         _launch(name, fn, args)
         if name == "delta" and split:

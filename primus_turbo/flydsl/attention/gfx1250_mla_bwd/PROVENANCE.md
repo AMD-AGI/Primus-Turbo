@@ -313,3 +313,32 @@ head-group side measurement (runs/flags/bwd_hg_side.json; notes/bwd-rounds.md, s
   gb ruler 10 GEMMs): hg64 vs hg128 gb x0.9788 (real dump L0s15), x0.9882 / x0.9861 (randn); blocked
   x0.9431 (real dump); all with valid A/A; dq/dk/dv bitwise equal across hg 32 / 64 / 128 / 0;
   code_sha unchanged across the hg calls (no recompile).
+
+## Integration: small-grid fallback per chain (bwd_r4_c's host rule on the head-group launches)
+
+Host-only (impl.py `_geometry`, bounds_proof.py one-wave mode); kernels.py unchanged. The two-wave
+kernels (k_dkdv64, k_dqg96) halve the TDM bytes per FLOP by pairing two waves of one workgroup on one
+CU; on a grid too small to use the fetch bandwidth the pairing only concentrates the work on fewer CUs,
+and the dQ chain pays a second launch for its head. Each chain now launches its one-wave kernel when its
+one-wave workgroup count is below a measured threshold: k_dkdv (nw = 1, grid (Hkv, Skv/32, B), no head
+group) below 1024, one k_dqg over [0, Sq) (head-grouped grid (hg, Sq/32, B*Hq/hg), the binary the head
+launch uses) below 2048. Each chain decides from B*H*S alone, so the fold [1, S, B*H, D] and the
+[B, S, H, D] launch of the same tensors decide alike; the DeepSeek-V3 training shapes (32768 per chain)
+keep the two-wave launches exactly. `FLY_BWD_SMALL_GRID=0` disables the rule, `small_grid=True/False`
+forces one set for both chains per call.
+
+- New binary: k_dkdv (the nw = 1 instantiation of `_dkdv_impl`; its index math is bwd_r3_a's, the
+  arithmetic carries bwd_r5_oe4's FMA-form softmax/dS): 888 VGPR, 107 SGPR, 4 SGPR->VGPR lane spills,
+  0 VGPR spill, 0 scratch, LDS 70656 B. k_delta / k_dkdv64 / k_dqg96 / k_dqg are byte-identical to
+  bwd_r5_hg64 (code_sha, registers, spills, LDS, instruction count) in every compiled variant.
+- bounds_proof.py replays every shape in both launch sets (two_wave / one_wave, chains independent),
+  checks which set the real thresholds select per chain (G1, incl. the threshold edges and mixed
+  sets), the one-wave k_dkdv ring (K1-K5, no barrier) and the one-wave k_dqg over [0, Sq) (Q6, R1).
+- Same-process A/B through flydsl_attn_bwd (b1 MHA, blocked palindromic ruler with a 250 us GPU pad,
+  A/A valid in every run), one-wave set / two-wave set: b1 s1024 h8 x0.733-0.741, b1 s2048 h8 x0.823,
+  b1 s1024 h16 x0.777, b1 s2048 h16 x0.910-0.964, b1 s2048 h32 x1.144-1.174, b1 s4096 h16 x1.227,
+  b1 s2048 h64 x1.276, b1 s4096 h32 x1.400. Per kernel (one-wave / two-wave): k_dkdv x0.91 / 0.94 /
+  1.12 / 1.29 and the dQ chain x0.63 / 0.64-0.72 / 0.80 / 1.04 at 256 / 512 / 1024 / 2048 one-wave
+  workgroups, hence the per-chain thresholds. With them: b1 s2048 h16 (k_dkdv64 + one k_dqg) x0.870
+  of the two-wave set, b1 s2048 h8 x0.824, b1 s2048 h32 x1.001 (two-wave). dq/dk/dv are bitwise equal
+  across the sets.
