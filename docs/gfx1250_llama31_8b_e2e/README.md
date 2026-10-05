@@ -192,8 +192,20 @@ rc=0 wall=53 s (container start to exit, incl. model init and JIT)
 | no nkfix (any attention) | ~16,000 | ~2,000 | measured 2026-09-28 (B0) |
 | `TORCH_BLAS_PREFER_HIPBLASLT=0` (rocBLAS), no nkfix | ~134,000 | ~245 | measured 2026-09-13 (A0, 1.1 GHz clock cap) |
 
-Absolute numbers depend on the platform state: A0 ran at a 1.1 GHz cap until a VBIOS/SMU update on
-2026-09-29, after which these numbers were taken. Check `cat /sys/class/drm/card*/device/pp_dpm_sclk`.
+Absolute numbers depend on the platform state. A0 ran with its sclk capped at 1,100 MHz (VR throttle;
+1.01-1.06 GHz under load) until a firmware update on 2026-09-29 (VBIOS 630A -> 700E, SMU 125.7.1 ->
+125.12.0, amdgpu-dkms 7.1.1-2397345 -> 7.1.0-2411946); since then it runs 1.74-2.03 GHz at op level and ~1.5 GHz in
+training. Same code and method, before -> after the update:
+
+| measurement (b4 s8192 hq32 hkv8 d128 causal / Llama-3.1-8B 32L) | before | after | speedup |
+|---|--:|--:|--:|
+| FlyDSL fwd (op) | 2.02 ms | 1.35 ms | 1.50x |
+| aiter ASM fwd (op) | 1.56 ms | 1.26 ms | 1.24x |
+| FlyDSL bwd r29 (op) | 11.01 ms | 6.58 ms | 1.67x |
+| aiter ASM bwd (op) | 7.65 ms | 5.50 ms | 1.39x |
+| e2e step, ASM attention + nkfix | 1,947 ms | 1,351 ms | 1.44x |
+
+So any number taken on an MI455X still on the old firmware is not comparable with this tutorial. Check `cat /sys/class/drm/card*/device/pp_dpm_sclk`.
 torchtitan's `mfu` column is meaningless on this part (it falls back to the A100's peak FLOPs); use tokens/s.
 
 ## 8. Safety notes (MI455X)
