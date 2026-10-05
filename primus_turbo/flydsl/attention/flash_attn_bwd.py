@@ -38,6 +38,9 @@ _LOG2E = host_math.log2(host_math.e)
 # Opt in before importing Turbo. Keep attention on the caller's stream when
 # a second compute queue interferes with application communication (#520).
 _ATTN_SINGLE_STREAM = os.getenv("PRIMUS_TURBO_ATTN_SINGLE_STREAM", "0") == "1"
+_ATTN_Q_PREP = os.getenv("PRIMUS_TURBO_ATTN_Q_PREP", "standalone")
+if _ATTN_Q_PREP not in ("standalone", "odo"):
+    raise ValueError("PRIMUS_TURBO_ATTN_Q_PREP must be standalone or odo")
 # q rows one dkdv work-group folds per q-loop step. A wider tile, and warp specialisation,
 # are both register-walled: neither leaves room to co-reside two waves per SIMD.
 _BWD_BLOCK_Q = 64
@@ -281,6 +284,7 @@ def build_flash_attn_bwd_odo_module(
     fill_img=False,
     bat_lo=0,
     bat_all=None,
+    q_scale=None,
 ):
     """Identity-delta ("odo") kernel: DELTA[b,hq,s] = -sum_d O[b,s,hq,d]*dO[b,s,hq,d].
 
@@ -340,6 +344,8 @@ def build_flash_attn_bwd_odo_module(
         DO: fx.Tensor,
         DELTA: fx.Tensor,
         IMG: fx.Tensor,
+        Q: fx.Tensor,
+        QS: fx.Tensor,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
     ):
@@ -409,6 +415,19 @@ def build_flash_attn_bwd_odo_module(
         off = base + chunk * fx.Index(VEC)
         ov = buffer_ops.buffer_load(o_rsrc, off, vec_width=VEC, dtype=elem_dtype_l, cache_modifier=2)
         dv = buffer_ops.buffer_load(do_rsrc, off, vec_width=VEC, dtype=elem_dtype_l, cache_modifier=2)
+        if const_expr(q_scale is not None):
+            # The score GEMM must consume the same bf16-rounded scaled Q as
+            # forward. Fuse only its materialization, preserving that rounding
+            # boundary and the original Q needed by the rest of autograd.
+            q_rsrc = buffer_ops.create_buffer_resource(Q, max_size=True)
+            qs_rsrc = buffer_ops.create_buffer_resource(
+                QS, max_size=False, num_records_bytes=_raw(total * fx.Index(HEAD_DIM * 2))
+            )
+            qv = buffer_ops.buffer_load(q_rsrc, off, vec_width=VEC, dtype=elem_dtype_l, cache_modifier=2)
+            qscaled = (Vec(qv).to(fx.Float32) * Vec.filled(VEC, q_scale, fx.Float32)).to(elem_dtype_l)
+            buffer_ops.buffer_store(
+                qscaled.ir_value(), qs_rsrc, off * fx.Index(2), mask=in_range, offset_is_bytes=True
+            )
         if const_expr(FILL_IMG):
             img_rsrc = buffer_ops.create_buffer_resource(
                 IMG, max_size=False, num_records_bytes=_raw(total * fx.Index(HEAD_DIM * 2))
@@ -457,6 +476,8 @@ def build_flash_attn_bwd_odo_module(
         DO: fx.Tensor,
         DELTA: fx.Tensor,
         IMG: fx.Tensor,
+        Q: fx.Tensor,
+        QS: fx.Tensor,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         stream: fx.Stream,
@@ -470,6 +491,8 @@ def build_flash_attn_bwd_odo_module(
             DO,
             DELTA,
             IMG,
+            Q,
+            QS,
             batch_size,
             seq_len,
             value_attrs={
@@ -480,9 +503,20 @@ def build_flash_attn_bwd_odo_module(
 
     _compiled: dict = {}
 
-    def _launch(O, DO, DELTA, batch_size, seq_len, stream, img=None):
+    def _launch(O, DO, DELTA, batch_size, seq_len, stream, img=None, q=None, qs=None):
         assert img is not None or not FILL_IMG, "fill_img build needs an img argument"
-        args = (O, DO, DELTA, DELTA if img is None else img, batch_size, seq_len, stream)
+        assert q_scale is None or (q is not None and qs is not None), "fused Q prep needs q and qs"
+        args = (
+            O,
+            DO,
+            DELTA,
+            DELTA if img is None else img,
+            DELTA if q is None else q,
+            DELTA if qs is None else qs,
+            batch_size,
+            seq_len,
+            stream,
+        )
         return _cached_launch(_compiled, launch_flash_attn_bwd_odo, None, args, {})
 
     def _compile(*args):
@@ -5406,6 +5440,7 @@ def _get_bwd(
             sbhd=sbhd,
             token_major=varlen,
             fill_img=bool(a16),
+            q_scale=scale * _LOG2E if (_ATTN_Q_PREP == "odo" and sbhd and not varlen and D == 64) else None,
         )
         odo_l = build_flash_attn_bwd_odo_module(q_split=q_split if sbhd else 1, **odo_kw)
         _odo_subs: dict = {}
@@ -5523,6 +5558,7 @@ def _dense_plan(B, Sq, Skv, Hq, Hkv, D, scale, window_left, sbhd, deterministic)
     # when the chunk's own compute dwarfs the dispatch it costs (see _DQ_PIPE_AREA_FLOOR).
     pipe = (
         _DQ_PIPE
+        and not (_ATTN_Q_PREP == "odo" and sbhd and D == 64)
         and not a16  # a16 has no fold to hide, so it has nothing to pipeline against
         and not band_span  # band groups drive their own dispatch order (see _fused_bandgroups)
         # a ragged top band makes the split->q-block map band-dependent (see _pipe_chunks),
@@ -5767,7 +5803,10 @@ def flydsl_varlen_backward(
     {64,128}; no learned sink on this path."""
     varlen = cu_seqlens_q is not None
     st = torch.cuda.current_stream()
-    qf, kf, vf, dof = _prescale_q(q, scale), k.reshape(-1), v.reshape(-1), dout.reshape(-1)
+    fuse_q = _ATTN_Q_PREP == "odo" and sbhd and not varlen and D == 64
+    qf = torch.empty_like(q).reshape(-1) if fuse_q else _prescale_q(q, scale)
+    odo_q = dict(q=q.reshape(-1), qs=qf) if fuse_q else {}
+    kf, vf, dof = k.reshape(-1), v.reshape(-1), dout.reshape(-1)
     o16 = out.to(q.dtype).reshape(-1)
 
     if varlen:
@@ -5910,7 +5949,7 @@ def flydsl_varlen_backward(
     # but a single-chunk plan has nothing to stage. Queueing the delta pass here, ahead of the
     # workspace and the lse fold, puts the launcher's remaining host time in its shadow.
     if not pipe and (not a16 or len(_plan) == 1):
-        odo_l(o16, dof16, df, B, Sq, st, img=img)
+        odo_l(o16, dof16, df, B, Sq, st, img=img, **odo_q)
     if dq is None:
         dq = torch.empty_like(q)
     # SBHD workspace [q_split,Skv,B,Hkv,D]: summing the leading q_split axis yields
@@ -5954,6 +5993,10 @@ def flydsl_varlen_backward(
         _pk = (B, Sq, Skv, Hq, D)
         if _pk not in _primed:
             _primed.add(_pk)
+            if fuse_q:
+                # The burn launches precede the chunked odo producers. Their
+                # outputs are discarded, but they must still read initialized Q.
+                qf.copy_(_prescale_q(q, scale))
             for _body, (_, _n) in zip(_bodies, _plan):
                 _body(*_bufs, _n, Sq, Skv, 0, st)
             img.zero_()
@@ -5971,7 +6014,7 @@ def flydsl_varlen_backward(
                     torch.empty(w.numel() // q_split, device=w.device, dtype=w.dtype) for w in (ws_dk, ws_dv)
                 )
             for j, (_body, (lo, size)) in enumerate(zip(_bodies, _plan)):
-                odo_l.bat(lo)(o16, dof16, df, size, Sq, st, img=img)
+                odo_l.bat(lo)(o16, dof16, df, size, Sq, st, img=img, **odo_q)
                 _body(*_bufs, size, Sq, Skv, 0, st)
                 if _slot_plan is not None:
                     _reduce_dkdv_slots(ws_dk, ws_dv, q_split, 1, st, _slot_plan[j], _slot_out)
@@ -5995,11 +6038,11 @@ def flydsl_varlen_backward(
                 )
             # The side queue runs _A16_ODO_AHEAD deltas in front of the body that reads them, so
             # each one rides a body rather than every one of them queueing behind chunk 0's.
-            _odos[0](o16, dof16, df, _plan[0][1], Sq, st, img=img)
+            _odos[0](o16, dof16, df, _plan[0][1], Sq, st, img=img, **odo_q)
             _side.wait_stream(st)
             _queued = min(_A16_ODO_AHEAD, _nbc)
             for j in range(1, _queued):
-                _odos[j](o16, dof16, df, _plan[j][1], Sq, _side, img=img)
+                _odos[j](o16, dof16, df, _plan[j][1], Sq, _side, img=img, **odo_q)
                 _dev[j].record(_side)
             for j, _body in enumerate(_bodies):
                 if j:
@@ -6010,7 +6053,7 @@ def flydsl_varlen_backward(
                 _sev[j].record(st)
                 _side.wait_event(_sev[j])
                 if _queued < _nbc:
-                    _odos[_queued](o16, dof16, df, _plan[_queued][1], Sq, _side, img=img)
+                    _odos[_queued](o16, dof16, df, _plan[_queued][1], Sq, _side, img=img, **odo_q)
                     _dev[_queued].record(_side)
                     _queued += 1
                 if _slot_plan is not None:
