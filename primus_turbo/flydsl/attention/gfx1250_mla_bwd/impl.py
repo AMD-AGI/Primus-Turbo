@@ -1,3 +1,16 @@
+###############################################################################
+# SPDX-License-Identifier: Apache-2.0
+#
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 FlyDSL Project Contributors
+#
+# Adapted from FlyDSL (https://github.com/ROCm/FlyDSL)
+# Modified by the Primus-Turbo team.
+#
+# This file is distributed under the Apache License 2.0 (see LICENSE-APACHE),
+# not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
+###############################################################################
+
 """flydsl_attn_bwd: the gfx1250 FlyDSL backward (k_delta, k_dkdv64, k_dqg96 + k_dqg in kernels.py;
 k_dkdv + one k_dqg on grids too small to give every SIMD a wave: _geometry)."""
 import math
