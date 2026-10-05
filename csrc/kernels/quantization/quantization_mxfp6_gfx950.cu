@@ -1489,19 +1489,6 @@ mxfp4_emit::FlyPackArgs to_args(const MXFlyPack &p) {
 }
 } // namespace
 
-// One seed per SR launch: a process-wide counter, hashed. Deterministic for a given launch
-// sequence; distinct across launches, so a tensor packed twice gets independent rounding.
-inline uint32_t next_sr_seed() {
-    static std::atomic<uint32_t> counter{0};
-    uint32_t                     x = counter.fetch_add(1, std::memory_order_relaxed) + 0x9e3779b9u;
-    x ^= x >> 16;
-    x *= 0x7feb352du;
-    x ^= x >> 15;
-    x *= 0x846ca68bu;
-    x ^= x >> 16;
-    return x;
-}
-
 template <typename DType, bool DO_ROW, bool DO_COL, MXFP6Prologue PROLOGUE, int TILE_N>
 void launch_dual(const dim3 grid, const dim3 block, hipStream_t stream, const DType *input,
                  const DType *aux, const DType *bias, uint8_t *row_packed, uint8_t *row_scale,
@@ -1519,7 +1506,7 @@ void launch_dual(const dim3 grid, const dim3 block, hipStream_t stream, const DT
          row_fmt == MXPackFmt::Fp4PlainSr || col_fmt == MXPackFmt::Fp4PlainSr ||
          row_fmt == MXPackFmt::Fp4FlySr || col_fmt == MXPackFmt::Fp4FlySr ||
          row_fmt == MXPackFmt::Fp4BlobSr || col_fmt == MXPackFmt::Fp4BlobSr)
-            ? next_sr_seed()
+            ? sr_next_seed(SRStream::MXPack)
             : 0u;
     const mxfp4_emit::FlyPackArgs row_fly = to_args(mx_fly_pack_row());
     const mxfp4_emit::FlyPackArgs col_fly = to_args(mx_fly_pack_col());
@@ -1598,6 +1585,14 @@ void launch_dual(const dim3 grid, const dim3 block, hipStream_t stream, const DT
         go(F4FSr{}, F4FSr{});
     else if (r == MXPackFmt::Fp6 && c == MXPackFmt::Fp4Fly)
         go(F6{}, F4F{});
+    // Column-only SR (fmt bit 25): the backward copy rounds stochastically, the forward rows do
+    // not.
+    else if (r == MXPackFmt::Fp6 && c == MXPackFmt::Fp4FlySr)
+        go(F6{}, F4FSr{});
+    else if (r == MXPackFmt::Fp6KBlk && c == MXPackFmt::Fp4FlySr)
+        go(F6K{}, F4FSr{});
+    else if (r == MXPackFmt::Fp4Fly && c == MXPackFmt::Fp4FlySr)
+        go(F4F{}, F4FSr{});
     else if (r == MXPackFmt::Fp4Fly && c == MXPackFmt::Fp6) // row-only fly FP4 (forward-only)
         go(F4F{}, F6{});
     else if (r == MXPackFmt::Fp6KBlk &&

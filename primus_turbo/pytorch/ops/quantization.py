@@ -39,6 +39,8 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
 )
 
 __all__ = [
+    "set_sr_seed",
+    "sr_step_seed",
     "quantize_fp8",
     "quantize_fp8_with_trans",
     "dequantize_fp8",
@@ -564,3 +566,35 @@ def grouped_dequantize_fp4(
         return dequantize_mxfp4_impl(x, out_dtype, axis, block_size, scale_inv)
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
+
+
+_MASK64 = (1 << 64) - 1
+
+
+def _splitmix64(x: int) -> int:
+    x = (x + 0x9E3779B97F4A7C15) & _MASK64
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _MASK64
+    return x ^ (x >> 31)
+
+
+def sr_step_seed(run_seed: int, rank: int, iteration: int) -> int:
+    """The base seed of one training step's stochastic rounding: a 64-bit hash of the run seed, the global rank and
+    the iteration. Different per rank (data-parallel ranks quantize different gradients at the same positions, so
+    shared bits would correlate their rounding errors across the all-reduce), per run seed, and per step; the same
+    again when a run resumes at that iteration."""
+    h = _splitmix64(run_seed & _MASK64)
+    h = _splitmix64(h ^ (rank & _MASK64))
+    return _splitmix64(h ^ (iteration & _MASK64))
+
+
+def set_sr_seed(seed: int) -> None:
+    """Set the base seed of every stochastic-rounding quantizer (the ``quantize_mx*`` packers and the MXFP4
+    quantizer) and reset their launch counters: each SR launch's seed is then a hash of the base, the quantizer and
+    the launch index since this call. Call it at the start of every training step (``sr_step_seed``), outside any
+    compiled region. The seed is a kernel argument, so a captured CUDA graph freezes it.
+    """
+    seed &= _MASK64
+    torch.ops.primus_turbo_cpp_extension.set_sr_seed(
+        seed - (1 << 64) if seed >= 1 << 63 else seed
+    )

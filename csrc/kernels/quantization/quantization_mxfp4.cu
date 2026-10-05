@@ -55,10 +55,9 @@ constexpr int THREADS_PER_ROW =
 // Shared memory optimization
 constexpr int SMEM_PADDING = 2; // Padding to avoid bank conflicts
 
-// Stochastic rounding: per-launch atomic counter provides a unique seed to
-// each kernel invocation.  Combined with a Wang hash for avalanche diffusion,
-// this gives decorrelated random bits across threads and launches.
-static std::atomic<uint32_t> global_sr_counter{0};
+// Stochastic rounding: every launch takes the next seed of the MXFP4Quant stream (sr_seed.cu: per
+// step, rank and run seed once the trainer calls set_sr_seed). Combined with a Wang hash for
+// avalanche diffusion, this gives decorrelated random bits across threads and launches.
 
 __device__ __forceinline__ uint32_t sr_hash(uint32_t seed) {
     seed = (seed ^ 61u) ^ (seed >> 16);
@@ -1138,7 +1137,7 @@ void quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *rowwise_
     // blockIdx.z; each z-slice quantizes one (M, N) group offset by its stride.
     dim3           grid((M_pad + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N, G);
     dim3           block(warp_size() * WARPS_PER_BLOCK);
-    const uint32_t sr_seed             = global_sr_counter.fetch_add(1, std::memory_order_relaxed);
+    const uint32_t sr_seed             = sr_next_seed(SRStream::MXFP4Quant);
     const int      scale_rounding_bias = detail::mxfp4_scale_rounding_bias(scale_rounding_mode);
 
     // Per-group strides into the contiguous (G, ...) output/scale buffers. FP4
@@ -1252,7 +1251,7 @@ void quantize_mxfp4_impl(const DType *input, dtype::float4x2_e2m1 *output, uint8
     // each z-slice quantizes one (M, N) group offset by its per-group stride.
     dim3           grid((M_pad + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N, G);
     dim3           block(warp_size() * WARPS_PER_BLOCK);
-    const uint32_t sr_seed             = global_sr_counter.fetch_add(1, std::memory_order_relaxed);
+    const uint32_t sr_seed             = sr_next_seed(SRStream::MXFP4Quant);
     const int      scale_rounding_bias = detail::mxfp4_scale_rounding_bias(scale_rounding_mode);
 
     // Per-group strides into the contiguous (G, ...) output/scale buffers. FP4
@@ -1717,7 +1716,7 @@ void grouped_quantize_mxfp4_dual_impl(const DType *input, dtype::float4x2_e2m1 *
 
     dim3           grid((M_pad_col + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N);
     dim3           block(warp_size() * WARPS_PER_BLOCK);
-    const uint32_t sr_seed             = global_sr_counter.fetch_add(1, std::memory_order_relaxed);
+    const uint32_t sr_seed             = sr_next_seed(SRStream::MXFP4Quant);
     const int      scale_rounding_bias = detail::mxfp4_scale_rounding_bias(scale_rounding_mode);
 
 #define GROUPED_QUANTIZE_MXFP4_DUAL_ARGS                                                           \
@@ -2060,7 +2059,7 @@ void grouped_quantize_mxfp4_impl(const DType *input, dtype::float4x2_e2m1 *outpu
 
     dim3           grid((M_pad_col + BLOCK_M - 1) / BLOCK_M, (N_pad + BLOCK_N - 1) / BLOCK_N);
     dim3           block(warp_size() * WARPS_PER_BLOCK);
-    const uint32_t sr_seed             = global_sr_counter.fetch_add(1, std::memory_order_relaxed);
+    const uint32_t sr_seed             = sr_next_seed(SRStream::MXFP4Quant);
     const int      scale_rounding_bias = detail::mxfp4_scale_rounding_bias(scale_rounding_mode);
 
 #define GROUPED_QUANTIZE_MXFP4_ARGS                                                                \

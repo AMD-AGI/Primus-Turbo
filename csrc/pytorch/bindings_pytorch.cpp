@@ -31,6 +31,9 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
         "ScalarType out_dtype, bool transA, bool transB, bool transC, str granularity) -> Tensor");
 
     // ********* Quantization *********
+    // Base seed of the stochastic-rounding quantizers. No tensor arguments, so no dispatch key to
+    // infer: registered with its kernel (catch-all).
+    m.def("set_sr_seed(int seed) -> ()", &set_sr_seed);
     m.def("quantize_fp8_tensorwise(Tensor input, ScalarType dest_dtype, Tensor? scale_opt=None, "
           "int padding_align_size=128, int pad_penultimate_align_size=1, "
           "Tensor? amax_partials=None) -> Tensor[]");

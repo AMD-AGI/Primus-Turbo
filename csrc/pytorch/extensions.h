@@ -27,6 +27,9 @@ namespace primus_turbo::pytorch {
 //  Quantization
 //==================================================================
 
+// Base seed of the stochastic-rounding quantizers (resets their launch counters).
+void set_sr_seed(const int64_t seed);
+
 std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
                                                 const at::ScalarType      dest_dtype,
                                                 c10::optional<at::Tensor> scale_opt,

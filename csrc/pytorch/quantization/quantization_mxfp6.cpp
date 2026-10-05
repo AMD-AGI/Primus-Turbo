@@ -64,16 +64,21 @@ constexpr int64_t kFlyFmt = 0x1000, kFlySr = 0x800;
 //   bits 16-17 / 18-19  row / column scale rule: 0 RCEIL, 1-3 = scale_rounding_mode 0-2
 //   bits 20-21 / 22-23  row / column Hadamard:   0 H32, 1 none, 2 H16
 //   bit  24             2-D 32x32 block scaling of every FP4 direction (weights); needs no Hadamard
+//   bit  25             stochastic rounding of the column direction only (packed-FlyDSL FP4
+//   columns): the
+//                       backward copy of an activation / weight, whose forward rows stay
+//                       round-to-nearest
 // The Hadamard is applied along the contraction axis, so a GEMM's two operands must carry the same
 // choice; the caller (Primus) derives both operands' flags from one per-GEMM setting.
 constexpr int64_t kFmtBaseMask = 0xFFFF;
 
 int64_t fmt_base(const int64_t fmt) {
-    PRIMUS_TURBO_CHECK((fmt >> 25) == 0, "unknown fmt bits in ", fmt);
+    PRIMUS_TURBO_CHECK((fmt >> 26) == 0, "unknown fmt bits in ", fmt);
     return fmt & kFmtBaseMask;
 }
 
 MXPackFmt fly_dir_fmt(int64_t fmt, const bool col) {
+    const bool col_sr  = col && ((fmt >> 25) & 1);
     fmt                = fmt_base(fmt);
     const int64_t code = col ? (fmt >> 4) & 0xF : fmt & 0xF;
     if (code == 0)
@@ -84,7 +89,7 @@ MXPackFmt fly_dir_fmt(int64_t fmt, const bool col) {
         PRIMUS_TURBO_CHECK(!(fmt & kFlySr), "MXFP6 K128-blocked directions take no stochastic rounding");
         return MXPackFmt::Fp6KBlk;
     }
-    return (fmt & kFlySr) ? MXPackFmt::Fp4FlySr : MXPackFmt::Fp4Fly;
+    return (fmt & kFlySr) || col_sr ? MXPackFmt::Fp4FlySr : MXPackFmt::Fp4Fly;
 }
 
 // The consuming GEMM's operand parameters for one direction of a [M, N] input (row direction
@@ -105,6 +110,9 @@ void set_fp4_options(MXFlyPack &p, const int64_t fmt, const bool col) {
         return;
     }
     PRIMUS_TURBO_CHECK(had != 3, "fmt Hadamard code 3 is undefined (fmt ", fmt, ")");
+    PRIMUS_TURBO_CHECK(!((fmt >> 25) & 1) || (fmt_base(fmt) & kFlyFmt),
+                       "column-only stochastic rounding is for packed-FlyDSL formats (fmt ", fmt,
+                       ")");
     PRIMUS_TURBO_CHECK(!tile2d || had == 1, "2-D block scaling needs no Hadamard (fmt ", fmt, ")");
     p.fp4_round  = static_cast<int32_t>(round);
     p.fp4_had    = static_cast<int32_t>(had);
@@ -138,9 +146,9 @@ MXFlyPack fly_dir(const int64_t fmt_in, const int64_t M, const int64_t N, const 
 }
 
 std::pair<MXPackFmt, MXPackFmt> fmt_pair(int64_t fmt) {
-    fmt = fmt_base(fmt);
-    if (fmt & kFlyFmt)
+    if (fmt_base(fmt) & kFlyFmt) // fly_dir_fmt reads the column-SR bit, so it takes the full fmt
         return {fly_dir_fmt(fmt, false), fly_dir_fmt(fmt, true)};
+    fmt = fmt_base(fmt);
     switch (fmt) {
     case 0:
         return {MXPackFmt::Fp6, MXPackFmt::Fp6};

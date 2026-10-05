@@ -66,6 +66,9 @@ MX_FMT_BASE_MASK = 0xFFFF
 FP4_ROUND = {"rceil": 0, "m0": 1, "m1": 2, "m2": 3}  # m0-m2 = scale_rounding_mode 0-2
 FP4_HADAMARD = {"h32": 0, "none": 1, "h16": 2}
 MX_FMT_FP4_TILE2D = 1 << 24
+MX_FMT_FP4_COL_SR = (
+    1 << 25
+)  # stochastic rounding of the (packed-FlyDSL) column direction only
 
 
 def mx_fmt_base(fmt: int) -> int:
@@ -79,11 +82,13 @@ def fp4_options(
     row_hadamard: str = "h32",
     col_hadamard: str = "h32",
     tile2d: bool = False,
+    col_sr: bool = False,
 ) -> int:
     """``fmt`` with the FP4 directions' options set: scale rule (``FP4_ROUND``: RCEIL, the default, never
     saturates; m0 / m1 / m2 step the scale up at mantissa >= 1.75 / 1.5 / 1.8125 and saturate the rest to 6),
     Hadamard along the contraction axis (``FP4_HADAMARD``), and 2-D 32x32 block scaling (one amax per tile for
-    both directions; needs no Hadamard). The packer rejects options on an FP6 direction. Both operands of a GEMM
+    both directions; needs no Hadamard), and SR of the column direction alone (``col_sr``: the backward copy of
+    an activation / weight; packed-FlyDSL formats). The packer rejects options on an FP6 direction. Both operands of a GEMM
     must carry the same Hadamard choice for that GEMM's contraction."""
     assert not fmt >> 16, f"fmt {fmt:#x} already carries FP4 options"
     return (
@@ -93,6 +98,7 @@ def fp4_options(
         | FP4_HADAMARD[row_hadamard] << 20
         | FP4_HADAMARD[col_hadamard] << 22
         | (MX_FMT_FP4_TILE2D if tile2d else 0)
+        | (MX_FMT_FP4_COL_SR if col_sr else 0)
     )
 
 

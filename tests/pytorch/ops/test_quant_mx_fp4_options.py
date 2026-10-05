@@ -18,6 +18,7 @@ import itertools
 import pytest
 import torch
 
+from primus_turbo.pytorch.kernels.quantization import mx_a4w4_pack as P
 from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import (
     FLY_A,
     MX_FMT_A4W4_GRAD,
@@ -295,4 +296,43 @@ def test_bad_option_combinations_are_rejected():
         )
         quantize_mx_ln_modulate(x, mean, mean + 1, mod, mod, False, tile2d)
     with pytest.raises(RuntimeError, match="unknown fmt bits"):
-        quantize_mx_dual(x, 1 << 25)
+        quantize_mx_dual(x, 1 << 26)
+
+
+@pytest.mark.parametrize("row", [None, "fp4"])
+def test_column_only_sr(row):
+    """col_sr: the column direction (a backward copy) rounds stochastically, the row direction (an FP6 or FP4
+    forward operand) stays round-to-nearest, byte for byte; column scales are the RTN pack's.
+    """
+    _skip()
+    rows, cols = 512, 3072
+    x = _rand(rows, cols, seed=9)
+    col = P.fly_b_params(rows, cols, rows)
+    base = P.fly_fmt(row=P.FLY_A if row else None, col=col)
+    rtn = quantize_mx_dual(x, base)
+    sr1 = quantize_mx_dual(x, fp4_options(base, col_sr=True))
+    sr2 = quantize_mx_dual(x, fp4_options(base, col_sr=True))
+    if row:
+        assert torch.equal(sr1[0], rtn[0]) and torch.equal(
+            sr1[1], rtn[1]
+        ), "row direction must stay RTN"
+    else:
+        assert torch.equal(
+            mxfp6_data_region(sr1[0], rows, cols), mxfp6_data_region(rtn[0], rows, cols)
+        )
+    c_rtn, s_rtn = fly_operand(rtn[2], rtn[3], cols, rows)
+    c1, s1 = fly_operand(sr1[2], sr1[3], cols, rows)
+    c2, _ = fly_operand(sr2[2], sr2[3], cols, rows)
+    assert torch.equal(s1, s_rtn), "SR keeps the scales"
+    assert not torch.equal(c1, c2), "two launches draw independently"
+    assert not torch.equal(c1, c_rtn)
+    # Every SR code is the RTN code or a grid neighbour of the same sign (codes 0-7 per sign, magnitude ordered).
+    u1, ur = _unpack(c1).long(), _unpack(c_rtn).long()
+    mag1, magr = u1 & 7, ur & 7
+    assert ((mag1 - magr).abs() <= 1).all()
+
+
+def test_column_only_sr_rejected_off_fly():
+    _skip()
+    with pytest.raises(RuntimeError, match="column-only stochastic"):
+        quantize_mx_dual(_rand(256, 256), fp4_options(MX_FMT_FLY_ACT, col_sr=True))

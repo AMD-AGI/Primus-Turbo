@@ -222,6 +222,13 @@ struct MXFlyPack {
     // (0 H32, 1 none, 2 H16) and 2-D 32x32 block scaling. All 0 is today's emit, bit for bit.
     int32_t fp4_round = 0, fp4_had = 0, fp4_tile2d = 0;
 };
+// Stochastic-rounding seed streams (sr_seed.cu): one launch counter per SR quantizer.
+enum class SRStream : int { MXPack = 0, MXFP4Quant = 1, kCount = 2 };
+// Set the base seed and reset every stream's counter (the trainer calls this once per step).
+void sr_set_base_seed(uint64_t base);
+// The seed of the next SR launch of `stream`.
+uint32_t sr_next_seed(SRStream stream);
+
 void      mx_fly_pack_set(const MXFlyPack &row, const MXFlyPack &col);
 MXFlyPack mx_fly_pack_row();
 MXFlyPack mx_fly_pack_col();
