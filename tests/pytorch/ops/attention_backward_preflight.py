@@ -34,7 +34,9 @@ def main():
     cases = [(512, -1, 16), (512, 128, 16), (8192, -1, 1), (8192, 128, 1)]
     if os.getenv("PRIMUS_TURBO_ATTN_Q_PREP") in ("forward", "forward_hybrid"):
         cases += [(513, -1, 16), (513, 128, 16)]
-    for seq, window, spike in cases:
+    cases = [(seq, window, spike, False) for seq, window, spike in cases]
+    cases.append((8192, -1, 1, True))
+    for seq, window, spike, deterministic in cases:
         batch, hq, hkv, dim = 4, 64, 8, 64
         q = torch.randn(seq, batch, hq, dim, device="cuda", dtype=torch.bfloat16)
         k = torch.randn(seq, batch, hkv, dim, device="cuda", dtype=torch.bfloat16)
@@ -49,7 +51,7 @@ def main():
         lse = lse.view(batch, seq, hq).permute(0, 2, 1)
         dout = torch.randn_like(out)
         args = (dout, q, k, v, out, lse, batch, seq, seq, hq, hkv, dim, 0.125)
-        kwargs = dict(sbhd=True, window_left=window, sink=sink)
+        kwargs = dict(sbhd=True, window_left=window, sink=sink, deterministic=deterministic)
         ref = baseline.flydsl_varlen_backward(*args, **kwargs)
         repeat = baseline.flydsl_varlen_backward(*args, **kwargs)
         if os.getenv("PRIMUS_TURBO_ATTN_Q_PREP") == "forward" or (
@@ -82,7 +84,9 @@ def main():
             assert torch.isfinite(actual).all(), f"candidate {name} is nonfinite"
             noise = relative_l2(repeated, expected)
             error = relative_l2(actual, expected)
-            tolerance = max(0.002, 4 * noise)
+            if deterministic:
+                assert torch.equal(repeated, expected), ("baseline deterministic repeat", name, noise)
+            tolerance = 0.0 if deterministic else max(0.002, 4 * noise)
             gradients[name] = dict(
                 relative_l2=error,
                 baseline_repeat_relative_l2=noise,
@@ -102,6 +106,7 @@ def main():
             causal=True,
             window_size=(window, 0),
             sink=sink,
+            deterministic=deterministic,
         )
         assert torch.equal(public_out.permute(1, 0, 2, 3), out), "public forward output changed"
         public_grads = torch.autograd.grad(public_out, (q, k, v, sink), dout.permute(1, 0, 2, 3))
@@ -121,6 +126,7 @@ def main():
                 sequence=seq,
                 window=window,
                 spike=spike,
+                deterministic=deterministic,
                 gradients=gradients,
                 exact_public_output=True,
                 autograd_gradients=autograd_gradients,
