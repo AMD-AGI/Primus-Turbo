@@ -526,7 +526,9 @@ def flash_attn_sbhd_flydsl_forward_impl(
     Hq, D = q.shape[2], q.shape[3]
     window_left = _check_fwd(q, k, v, softmax_scale, causal, window_size, sink, Hq, D, sbhd=True)
     if return_scaled_q:
-        assert return_lse and D == 64 and q.shape[0] == k.shape[0]
+        assert return_lse and D == 64
+        if q.shape[0] != k.shape[0] or q.shape[0] % 64:
+            raise ValueError("experimental Q caching requires equal, 64-aligned sequence lengths")
         return _sbhd_forward_saved_q_op(q, k, v, window_left, True, sink)
     out, lse = _sbhd_forward_op(q, k, v, window_left, bool(return_lse), sink)
     return (out, lse) if return_lse else out
