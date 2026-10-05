@@ -14,7 +14,9 @@ from pathlib import Path
 import torch
 
 from primus_turbo.flydsl.attention.flash_attn_bwd import flydsl_varlen_backward
+from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager, PrecisionType
 from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import flash_attn_sbhd_flydsl_forward_impl
+from primus_turbo.pytorch.ops.attention.flash_attn_interface import flash_attn_func
 
 
 def relative_l2(a, b):
@@ -26,6 +28,7 @@ def main():
     baseline = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = baseline
     spec.loader.exec_module(baseline)
+    GlobalBackendManager.set_attn_backend(BackendType.FLYDSL, PrecisionType.BF16_FP16_FP32)
     torch.manual_seed(30279)
     results = []
     cases = [(512, -1, 16), (512, 128, 16), (8192, -1, 1), (8192, 128, 1)]
@@ -98,9 +101,45 @@ def main():
                 exact=torch.equal(actual, expected),
             )
             assert error <= tolerance, (seq, window, spike, name, gradients[name])
-        results.append(dict(sequence=seq, window=window, spike=spike, gradients=gradients))
+        # Exercise the public autograd path as well as the raw backward entry:
+        # saved-Q gradients must still flow into the original Q/K/V inputs.
+        original_q = q.clone()
+        for tensor in (q, k, v, sink):
+            tensor.requires_grad_(True)
+        public_out = flash_attn_func(
+            q.permute(1, 0, 2, 3),
+            k.permute(1, 0, 2, 3),
+            v.permute(1, 0, 2, 3),
+            causal=True,
+            window_size=(window, 0),
+            sink=sink,
+        )
+        assert torch.equal(public_out.permute(1, 0, 2, 3), out), "public forward output changed"
+        public_grads = torch.autograd.grad(public_out, (q, k, v, sink), dout.permute(1, 0, 2, 3))
+        assert torch.equal(q, original_q), "public attention changed original Q"
+        autograd_gradients = {}
+        for name, expected, actual in zip(("dq", "dk", "dv", "dsink"), ref, public_grads):
+            error = relative_l2(actual, expected)
+            assert torch.isfinite(actual).all() and error <= gradients[name]["tolerance"], (
+                seq,
+                window,
+                name,
+                error,
+            )
+            autograd_gradients[name] = dict(relative_l2=error, exact=torch.equal(actual, expected))
+        results.append(
+            dict(
+                sequence=seq,
+                window=window,
+                spike=spike,
+                gradients=gradients,
+                exact_public_output=True,
+                autograd_gradients=autograd_gradients,
+            )
+        )
         print("ATTENTION_GRADIENT_CASE " + json.dumps(results[-1]), flush=True)
         del q, k, v, out, lse, dout, args, kwargs, ref, repeat, candidate
+        del original_q, public_out, public_grads
     Path("/results/attention_backward_preflight.json").write_text(
         json.dumps(dict(passed=True, cases=results), indent=2) + "\n"
     )
