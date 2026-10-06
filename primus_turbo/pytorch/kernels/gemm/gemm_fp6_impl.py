@@ -30,9 +30,7 @@ we probe, not a switch we expose -- an older aiter gets the separate pass added 
 callers pass a bias unconditionally and never branch on aiter's version themselves.
 """
 
-import csv
 import functools
-import glob
 import os
 from typing import Optional
 
@@ -597,16 +595,13 @@ def _a4w4_aiter_blob(a, a_scale, b, b_scale, m, n, k, out_dtype, bias):
     return out if bias is None else out + bias
 
 
-def _manifest_rows(family):
+def _tilescale_rows() -> frozenset:
+    """aiter's tilescale GEMM manifest as (a_fmt, b_fmt, b_codes, b_ilv, bias, M, N, K) tuples (empty without it)."""
     try:
-        from aiter.jit.core import get_asm_dir
+        from aiter.ops.gemm_op_tilescale import _rows
     except ImportError:
-        return []
-    rows = []
-    for path in glob.glob(os.path.join(get_asm_dir(), family, "*.csv")):
-        with open(path) as f:
-            rows += list(csv.DictReader(f))
-    return rows
+        return frozenset()
+    return _rows()
 
 
 # A6W6 backend: "aiter" (the tuned asm table) or "flydsl" (Turbo's FlyDSL MXFP6 GEMM compiled at runtime,
@@ -664,16 +659,14 @@ def _a6w6_flydsl(a, a_scale, b, b_scale, m, n, k, bias, out=None):
 def a4w4_fly_shapes() -> frozenset:
     """{(M, N, K)} with a code object in aiter's f4flygemm family (``a4w4=4``); empty for an aiter without it. Reads
     files: call it outside compiled regions."""
-    return frozenset((int(r["M"]), int(r["N"]), int(r["K"])) for r in _manifest_rows("f4flygemm"))
+    return frozenset((r[5], r[6], r[7]) for r in _tilescale_rows() if r[:3] == (4, 4, 0) and not r[4])
 
 
 @functools.lru_cache(maxsize=None)
 def a6w6_fly_shapes() -> frozenset:
     """{(M, N, K, bias)} with a code object in aiter's f6flygemm family (empty for an aiter without it). Reads files:
     call it outside compiled regions (a caller deciding per GEMM inside torch.compile should hold the set)."""
-    return frozenset(
-        (int(r["M"]), int(r["N"]), int(r["K"]), bool(int(r["bias"]))) for r in _manifest_rows("f6flygemm")
-    )
+    return frozenset((r[5], r[6], r[7], bool(r[4])) for r in _tilescale_rows() if r[:4] == (6, 6, 0, 0))
 
 
 def a6w6_fly_available(m: int, n: int, k: int, has_bias: bool) -> bool:
@@ -688,14 +681,14 @@ def _a6w6_fly(a, a_scale, b, b_scale, m, n, k, out_dtype, bias, out=None):
     Operands as ``fly6_fmt`` packed them: one buffer per operand with the K128-blocked C0 then C1 planes, scales in
     FlyDSL's packed slab. Bit-identical to the A6W6 tile-blob kernels on the same values (bias: fp32(acc) + fp32(bias),
     one rounding). One code object per (M, N, K, bias); see ``a6w6_fly_available``."""
-    from aiter.ops.gemm_op_a6w6_fly import gemm_a6w6_fly_asm
+    from aiter.ops.gemm_op_tilescale import gemm_a6w6_tilescale
 
     if out_dtype != torch.bfloat16:
         raise ValueError(f"a6w6_fly writes bf16, got {out_dtype}")
     if out is None:
         out = torch.empty(m, n, dtype=torch.bfloat16, device=a.device)
     flat = lambda t: t.view(torch.uint8).reshape(-1)  # noqa: E731
-    gemm_a6w6_fly_asm(flat(a), flat(b), flat(a_scale), flat(b_scale), out, k, bias)
+    gemm_a6w6_tilescale(flat(a), flat(b), flat(a_scale), flat(b_scale), out, k, bias)
     return out
 
 
@@ -729,23 +722,33 @@ def _a6w4_ts(a, a_scale, b, b_scale, m, n, k, out_dtype, bias, out=None):
     return out
 
 
+@functools.lru_cache(maxsize=None)
+def _warn_a4w4_fallback(m, n, k):
+    import warnings
+
+    warnings.warn(f"no aiter A4W4 tilescale kernel for {m}x{n}x{k}; running FlyDSL's kernel on the same operands")
+
+
 def _a4w4_aiter_fly(a, a_scale, b, b_scale, m, n, k, out_dtype, bias, out=None):
     """A4W4 on the assembly ports of FlyDSL's 256-wide MXFP4 GEMM (``a4w4=4``, aiter ``gemm_a4w4_fly_asm``).
 
     Operands exactly as ``a4w4=3``: the packers wrote plain MXFP4 rows and the scales in the packed per-tile layout
-    for the 256-wide N tile (``fly_fmt``, ``fly_b_params``). One code object per (M, N, K); a shape without one
-    raises in aiter."""
-    from aiter.ops.gemm_op_a4w4_fly import gemm_a4w4_fly_asm
+    for the 256-wide N tile (``fly_fmt``, ``fly_b_params``). One code object per (M, N, K): a shape without one runs
+    FlyDSL's kernel on the same operands instead (``a4w4=3``, bit-identical), with a one-time warning per shape."""
+    from aiter.ops.gemm_op_tilescale import a4w4_b_ilv, gemm_a4w4_tilescale
 
     from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import fly_operand
 
     if out_dtype != torch.bfloat16:
         raise ValueError(f"aiter fly a4w4 writes bf16, got {out_dtype}")
+    if (int(m), int(n), int(k)) not in a4w4_fly_shapes():
+        _warn_a4w4_fallback(int(m), int(n), int(k))
+        return _a4w4_flydsl(a, a_scale, b, b_scale, m, n, k, out_dtype, bias, out=out, packed=True)
     A, As = fly_operand(a, a_scale, m, k)
     B, Bs = fly_operand(b, b_scale, n, k)
     if out is None:
         out = torch.empty(m, n, dtype=torch.bfloat16, device=A.device)
-    gemm_a4w4_fly_asm(A, B, As, Bs, out, k)
+    gemm_a4w4_tilescale(A, B, As, Bs, out, k, a4w4_b_ilv(m, n, k))
     return out if bias is None else out + bias
 
 
