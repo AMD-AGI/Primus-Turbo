@@ -16,13 +16,18 @@ from typing import Sequence, Tuple
 
 import torch
 
+from primus_turbo.pytorch.kernels.rope.qk_rmsnorm_rope_impl import (
+    qk_rmsnorm_rope_bwd_impl,
+    qk_rmsnorm_rope_fwd_impl,
+    qk_rmsnorm_rope_shape_error,
+)
 from primus_turbo.pytorch.kernels.rope.rope_impl import (
     rope_bwd_impl,
     rope_fwd_impl,
     rope_shape_error,
 )
 
-__all__ = ["fused_qkv_rope"]
+__all__ = ["fused_qkv_rope", "fused_qkv_rmsnorm_rope"]
 
 
 class _FusedQKVRoPEFunction(torch.autograd.Function):
@@ -69,3 +74,51 @@ def fused_qkv_rope(
     if why is not None:
         raise ValueError(f"fused_qkv_rope: unsupported input ({why})")
     return _FusedQKVRoPEFunction.apply(qkv, q_freqs, k_freqs, qkv_split_arg_list)
+
+
+class _FusedQKVRMSNormRoPEFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, qkv, q_gamma, k_gamma, freqs, qkv_split_arg_list, eps):
+        freqs = freqs.float().contiguous()
+        q, k, v, q_rstd, k_rstd = qk_rmsnorm_rope_fwd_impl(
+            qkv, q_gamma, k_gamma, freqs, qkv_split_arg_list, eps
+        )
+        ctx.save_for_backward(qkv, q_gamma, k_gamma, freqs, q_rstd, k_rstd)
+        ctx.qkv_split_arg_list = tuple(qkv_split_arg_list)
+        return q, k, v
+
+    @staticmethod
+    def backward(ctx, dq, dk, dv):
+        qkv, q_gamma, k_gamma, freqs, q_rstd, k_rstd = ctx.saved_tensors
+        dqkv, dq_gamma, dk_gamma = qk_rmsnorm_rope_bwd_impl(
+            dq,
+            dk,
+            dv,
+            qkv,
+            q_gamma,
+            k_gamma,
+            freqs,
+            q_rstd,
+            k_rstd,
+            ctx.qkv_split_arg_list,
+        )
+        return dqkv, dq_gamma, dk_gamma, None, None, None
+
+
+def fused_qkv_rmsnorm_rope(
+    qkv: torch.Tensor,
+    q_gamma: torch.Tensor,
+    k_gamma: torch.Tensor,
+    freqs: torch.Tensor,
+    qkv_split_arg_list: Sequence[int],
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split packed GPT-OSS QKV while fusing per-head Q/K RMSNorm and RoPE.
+
+    The normalization result and inverse-RoPE gradient are rounded to BF16 in
+    registers, preserving the numerical boundaries of the unfused training path.
+    """
+    why = qk_rmsnorm_rope_shape_error(qkv, q_gamma, k_gamma, freqs, qkv_split_arg_list)
+    if why is not None:
+        raise ValueError(f"fused_qkv_rmsnorm_rope: unsupported input ({why})")
+    return _FusedQKVRMSNormRoPEFunction.apply(qkv, q_gamma, k_gamma, freqs, qkv_split_arg_list, float(eps))
