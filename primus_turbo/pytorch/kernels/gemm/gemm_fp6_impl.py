@@ -67,6 +67,8 @@ __all__ = [
     "a6w6_fly_available",
     "a6w6_fly_shapes",
     "a6w4_ts_available",
+    "tilescale_table",
+    "tilescale_table_has",
     "set_a6w6_backend",
     "gemm_fp6_impl",
     "gemm_fp6_out_impl",
@@ -593,6 +595,32 @@ def _a4w4_aiter_blob(a, a_scale, b, b_scale, m, n, k, out_dtype, bias):
     gemm_a4w4_blob_asm(flat(a), flat(b), flat(a_scale), flat(b_scale), out, kp)
     out = out[:m, :n] if (mp, np_) != (m, n) else out
     return out if bias is None else out + bias
+
+
+def tilescale_table(a_fmt: int, b_fmt: int, b_codes: int = 0, b_ilv: int = 0):
+    """aiter's tilescale kernels for one format pair as plain data, for callers that decide per GEMM inside compiled
+    regions (read it once, outside them): (exact {(M, N, K, bias)}, generic {(bias, K-loop class): kmin}). A GEMM has a
+    kernel if its (M, N, K, bias) is exact, or M, N are multiples of 256, K a multiple of 512, and the generic entry of
+    (bias, K/128 mod 12) exists with K >= kmin -- see ``tilescale_table_has``."""
+    try:
+        from aiter.ops.gemm_op_tilescale import _generic, _rows
+    except ImportError:
+        return frozenset(), {}
+    key = (a_fmt, b_fmt, b_codes, b_ilv)
+    exact = frozenset((r[5], r[6], r[7], bool(r[4])) for r in _rows() if r[:4] == key and r[5])
+    generic = {(bool(k[4]), k[5]): v for k, v in _generic().items() if k[:4] == key}
+    return exact, generic
+
+
+def tilescale_table_has(table, m: int, n: int, k: int, has_bias: bool) -> bool:
+    """Whether ``table`` (``tilescale_table``) has a kernel for the GEMM; plain arithmetic, safe to trace."""
+    exact, generic = table
+    if (m, n, k, has_bias) in exact:
+        return True
+    if m % 256 or n % 256 or k % 512:
+        return False
+    kmin = generic.get((has_bias, (k // 128) % 12))
+    return kmin is not None and k >= kmin
 
 
 def _tilescale_rows() -> frozenset:
