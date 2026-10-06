@@ -619,8 +619,11 @@ def tilescale_table_has(table, m: int, n: int, k: int, has_bias: bool) -> bool:
         return True
     if m % 256 or n % 256 or k % 512:
         return False
-    kmin = generic.get((has_bias, (k // 128) % 12))
-    return kmin is not None and k >= kmin
+    for kcls in ((k // 128) % 12, 12):  # 12: a generic row serving every K-loop class
+        kmin = generic.get((has_bias, kcls))
+        if kmin is not None and k >= kmin:
+            return True
+    return False
 
 
 def _tilescale_rows() -> frozenset:
@@ -687,7 +690,7 @@ def _a6w6_flydsl(a, a_scale, b, b_scale, m, n, k, bias, out=None):
 def a4w4_fly_shapes() -> frozenset:
     """{(M, N, K)} with a code object in aiter's f4flygemm family (``a4w4=4``); empty for an aiter without it. Reads
     files: call it outside compiled regions."""
-    return frozenset((r[5], r[6], r[7]) for r in _tilescale_rows() if r[:3] == (4, 4, 0) and not r[4])
+    return frozenset((r[5], r[6], r[7]) for r in _tilescale_rows() if r[:3] == (4, 4, 0) and not r[4] and r[5])
 
 
 @functools.lru_cache(maxsize=None)
@@ -751,32 +754,30 @@ def _a6w4_ts(a, a_scale, b, b_scale, m, n, k, out_dtype, bias, out=None):
 
 
 @functools.lru_cache(maxsize=None)
-def _warn_a4w4_fallback(m, n, k):
-    import warnings
-
-    warnings.warn(f"no aiter A4W4 tilescale kernel for {m}x{n}x{k}; running FlyDSL's kernel on the same operands")
+def _a4w4_table(ilv):
+    return tilescale_table(4, 4, 0, ilv)
 
 
 def _a4w4_aiter_fly(a, a_scale, b, b_scale, m, n, k, out_dtype, bias, out=None):
     """A4W4 on the assembly ports of FlyDSL's 256-wide MXFP4 GEMM (``a4w4=4``, aiter ``gemm_a4w4_fly_asm``).
 
     Operands exactly as ``a4w4=3``: the packers wrote plain MXFP4 rows and the scales in the packed per-tile layout
-    for the 256-wide N tile (``fly_fmt``, ``fly_b_params``). One code object per (M, N, K): a shape without one runs
-    FlyDSL's kernel on the same operands instead (``a4w4=3``, bit-identical), with a one-time warning per shape."""
+    for the 256-wide N tile (``fly_fmt``, ``fly_b_params``), on aiter's A4W4 tilescale kernels: an exact-shape one
+    or the K-generic one (K a multiple of 512, at least its minimum)."""
     from aiter.ops.gemm_op_tilescale import a4w4_b_ilv, gemm_a4w4_tilescale
 
     from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import fly_operand
 
     if out_dtype != torch.bfloat16:
         raise ValueError(f"aiter fly a4w4 writes bf16, got {out_dtype}")
-    if (int(m), int(n), int(k)) not in a4w4_fly_shapes():
-        _warn_a4w4_fallback(int(m), int(n), int(k))
-        return _a4w4_flydsl(a, a_scale, b, b_scale, m, n, k, out_dtype, bias, out=out, packed=True)
+    ilv = a4w4_b_ilv(m, n, k)
+    if not tilescale_table_has(_a4w4_table(ilv), int(m), int(n), int(k), False):
+        raise ValueError(f"no aiter A4W4 tilescale kernel for {m}x{n}x{k} (K must be a multiple of 512, >= 1024)")
     A, As = fly_operand(a, a_scale, m, k)
     B, Bs = fly_operand(b, b_scale, n, k)
     if out is None:
         out = torch.empty(m, n, dtype=torch.bfloat16, device=A.device)
-    gemm_a4w4_tilescale(A, B, As, Bs, out, k, a4w4_b_ilv(m, n, k))
+    gemm_a4w4_tilescale(A, B, As, Bs, out, k, ilv)
     return out if bias is None else out + bias
 
 
