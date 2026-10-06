@@ -720,6 +720,9 @@ emit_group_fmt(float (&values)[kGroupSize], const int64_t out_row, const int32_t
     } else if constexpr (FMT == MXPackFmt::Fp4FlySr) {
         mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::Fly, true, OPTS>(
             values, out_row, group, nk, packed, packed_scale, sr_seed, fly, tile_amax);
+    } else if constexpr (FMT == MXPackFmt::Fp4FlyK128) {
+        mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::FlyK128, false, OPTS>(
+            values, out_row, group, nk, packed, packed_scale, 0u, fly, tile_amax);
     } else {
         mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::A4W4B, false, OPTS>(
             values, out_row, group, nk, packed, packed_scale, 0u, fly, tile_amax);
@@ -786,7 +789,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                                COL_FMT == MXPackFmt::Fp4B || COL_FMT == MXPackFmt::Fp4ASr ||
                                COL_FMT == MXPackFmt::Fp4Plain || COL_FMT == MXPackFmt::Fp4PlainSr ||
                                ROW_FMT == MXPackFmt::Fp4Fly || ROW_FMT == MXPackFmt::Fp4FlySr ||
-                               COL_FMT == MXPackFmt::Fp4Fly || COL_FMT == MXPackFmt::Fp4FlySr;
+                               COL_FMT == MXPackFmt::Fp4Fly || COL_FMT == MXPackFmt::Fp4FlySr ||
+                               ROW_FMT == MXPackFmt::Fp4FlyK128;
     // Row and column packs of one launch draw from different streams.
     const uint32_t row_seed = sr_seed, col_seed = sr_seed ^ 0x5bd1e995u;
     int32_t        bx, by;
@@ -1492,7 +1496,7 @@ struct launch_geometry {
 inline bool is_a4w4(const MXPackFmt f) {
     return f == MXPackFmt::Fp4A || f == MXPackFmt::Fp4B || f == MXPackFmt::Fp4ASr ||
            f == MXPackFmt::Fp4Plain || f == MXPackFmt::Fp4PlainSr || f == MXPackFmt::Fp4Fly ||
-           f == MXPackFmt::Fp4FlySr;
+           f == MXPackFmt::Fp4FlySr || f == MXPackFmt::Fp4FlyK128;
 }
 
 // The FlyDSL packed-scale parameters of the current launch (MXFlyPackScope, set by the op layer).
@@ -1576,6 +1580,7 @@ void launch_dual(const dim3 grid, const dim3 block, hipStream_t stream, const DT
     using F4BlobSr = std::integral_constant<MXPackFmt, MXPackFmt::Fp4BlobSr>;
     using F4FSr    = std::integral_constant<MXPackFmt, MXPackFmt::Fp4FlySr>;
     using F6K      = std::integral_constant<MXPackFmt, MXPackFmt::Fp6KBlk>;
+    using F4FK     = std::integral_constant<MXPackFmt, MXPackFmt::Fp4FlyK128>;
     // A direction that is not emitted does not constrain the pair.
     const MXPackFmt r = DO_ROW ? row_fmt : MXPackFmt::Fp6;
     const MXPackFmt c = DO_COL ? col_fmt : MXPackFmt::Fp6;
@@ -1632,6 +1637,13 @@ void launch_dual(const dim3 grid, const dim3 block, hipStream_t stream, const DT
         go(F6K{}, F4F{});
     else if (r == MXPackFmt::Fp6KBlk && c == MXPackFmt::Fp6) // row-only (forward / eval)
         go(F6K{}, F6{});
+    // A6W4 tilescale weight: K128-blocked FP4 rows (forward B), fly FP4 columns (A4W4 dgrad B)
+    else if (r == MXPackFmt::Fp4FlyK128 && c == MXPackFmt::Fp4FlySr)
+        go(F4FK{}, F4FSr{});
+    else if (r == MXPackFmt::Fp4FlyK128 && c == MXPackFmt::Fp4Fly)
+        go(F4FK{}, F4F{});
+    else if (r == MXPackFmt::Fp4FlyK128 && c == MXPackFmt::Fp6) // row-only (forward / eval)
+        go(F4FK{}, F6{});
     else
         PRIMUS_TURBO_CHECK(false, "unsupported MX pack format pair (row ", int(row_fmt), ", col ",
                            int(col_fmt), ")");

@@ -58,7 +58,9 @@ using bf16x2_t = __bf16 __attribute__((ext_vector_type(2)));
 //              with the same scale layout.
 // For the two A4W4 layouts `nk` is ceil(K, 256) / 128 (no guard tiles), so a row is 64 * nk
 // bytes and the scale plane has 4 * nk columns, a multiple of 8 as shuffle_scale requires.
-enum class Layout { A6W4Blob, A4W4A, A4W4B, Plain, Fly };
+// FlyK128: Fly's scales with the codes K128-blocked, [rows/16, K/128, 16, 64] (each 16-row x 128-K block one
+// contiguous KiB), for GEMMs that stage K128 per step.
+enum class Layout { A6W4Blob, A4W4A, A4W4B, Plain, Fly, FlyK128 };
 
 #ifndef MXFP4_ABLATE_BF16
 #define MXFP4_ABLATE_BF16 0
@@ -403,6 +405,9 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
         int64_t       address;
         if constexpr (LAYOUT == Layout::A4W4A || LAYOUT == Layout::Plain || LAYOUT == Layout::Fly) {
             address = out_row * row_bytes + static_cast<int64_t>(group) * kBytesPerBlock;
+        } else if constexpr (LAYOUT == Layout::FlyK128) {
+            address = ((out_row / 16) * nk_pad + group / 4) * 1024 + (out_row % 16) * 64 +
+                      static_cast<int64_t>(group % 4) * kBytesPerBlock;
         } else {
             // shuffle_weight((16, 16)): view (N/16, 16, Kb/32, 2, 16) -> permute (0, 2, 3, 1, 4).
             const int64_t n0     = out_row / 16;
@@ -420,7 +425,7 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
             packed_scale[out_row * sp + group] = scale_exp;
             return;
         }
-        if constexpr (LAYOUT == Layout::Fly) {
+        if constexpr (LAYOUT == Layout::Fly || LAYOUT == Layout::FlyK128) {
             if (out_row < fly.rows && group < fly.k128 * 4)
                 packed_scale[fly_scale_byte(out_row, group, fly)] = scale_exp;
             return;

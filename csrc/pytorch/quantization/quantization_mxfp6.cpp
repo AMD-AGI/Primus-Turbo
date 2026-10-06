@@ -56,6 +56,8 @@ std::pair<int64_t, int64_t> pack_sizes(const int64_t rows, const int64_t k) {
 // fmt >= 0x1000: FlyDSL packed scales. 0x1000 | sr * 0x800 | col_code << 4 |
 // row_code, a direction code being 0 (FP6) or 0x8 | is_b | (nt == 3) << 1 | (ilv == 4) << 2 for the
 // consuming GEMM operand (see MXFlyPack). Gradients pass two codes, activations / weights FP6 rows.
+// Codes without 0x8: 0x1 | is_b << 1 = MXFP6 K128-blocked planes; 0x5 | is_b << 1 = MXFP4 with
+// K128-blocked codes (row direction, round to nearest); both with scales at nt 4, no interleave.
 constexpr int64_t kFlyFmt = 0x1000, kFlySr = 0x800;
 //
 // fmt bits 16-24: per-direction FP4 options, on top of any of the formats above, for the FP4
@@ -84,6 +86,11 @@ MXPackFmt fly_dir_fmt(int64_t fmt, const bool col) {
     if (code == 0)
         return MXPackFmt::Fp6;
     if (!(code & 0x8)) {
+        if (code & 0x4) { // 0x5 | is_b << 1: MXFP4, K128-blocked codes + FlyDSL packed scales (nt 4, ilv 0)
+            PRIMUS_TURBO_CHECK((code & 0x1) && !col, "K128-blocked FP4 is a row direction (fmt ", fmt, ")");
+            PRIMUS_TURBO_CHECK(!(fmt & kFlySr), "K128-blocked FP4 rows take no stochastic rounding");
+            return MXPackFmt::Fp4FlyK128;
+        }
         // 0x1 | is_b << 1: MXFP6, K128-blocked C0/C1 planes + FlyDSL packed scales (nt 4, ilv 0).
         PRIMUS_TURBO_CHECK((code & 0x1) && !(code & 0x4), "bad FlyDSL direction code ", code, " in fmt ", fmt);
         PRIMUS_TURBO_CHECK(!(fmt & kFlySr), "MXFP6 K128-blocked directions take no stochastic rounding");
@@ -129,7 +136,7 @@ MXFlyPack fly_dir(const int64_t fmt_in, const int64_t M, const int64_t N, const 
     if (code == 0)
         return p;
     const int64_t k = col ? M : N;
-    if (!(code & 0x8)) { // MXFP6 K128-blocked: 0x1 | is_b << 1, scales nt 4 / ilv 0
+    if (!(code & 0x8)) { // MXFP6 / MXFP4 K128-blocked: 0x1 (| 0x4) | is_b << 1, scales nt 4 / ilv 0
         p.is_b = (code >> 1) & 1;
         p.nt   = 4;
         p.ilv  = 0;
@@ -205,7 +212,7 @@ std::pair<int64_t, int64_t> sizes_for(const MXPackFmt f, const int64_t rows, con
         const int64_t r = cdiv(rows, kTileRows) * kTileRows, c = cdiv(k, kTileRows) * kTileRows;
         return {r * c * 3 / 4, cdiv(rows, 64 * 4) * 256 * (c / 128) * 4};
     }
-    if (f == MXPackFmt::Fp4Fly || f == MXPackFmt::Fp4FlySr) {
+    if (f == MXPackFmt::Fp4Fly || f == MXPackFmt::Fp4FlySr || f == MXPackFmt::Fp4FlyK128) {
         // FlyDSL's per-tile slab (_get_mxfp4_scale_ws): ceil(rows / tile) * 256 * K/128 dwords.
         const int64_t r = cdiv(rows, kTileRows) * kTileRows, c = cdiv(k, kTileRows) * kTileRows;
         return {r * c / 2, cdiv(rows, 64 * fly.nt) * 256 * (c / 128) * 4};

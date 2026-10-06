@@ -135,6 +135,25 @@ def with_fly6_row(fmt: int, row_is_b: bool) -> int:
     return fmt | 0x1 | (int(row_is_b) << 1) | ext
 
 
+def with_ts4_row(fmt: int, row_is_b: bool = True) -> int:
+    """``fmt`` (0 or a fly fmt with no row direction) with its row direction switched to MXFP4 with K128-blocked
+    codes ``[rows/16, K/128, 16, 64]`` (the tilescale FP4 "k128" layout: the A6W4 tilescale GEMM's weight operand),
+    scales FlyDSL's packed slab at nt 4 / no interleave, round to nearest. The column direction is kept."""
+    ext, base = fmt & ~MX_FMT_BASE_MASK, mx_fmt_base(fmt)
+    code = 0x5 | (int(row_is_b) << 1)
+    if base == 0:
+        return MX_FMT_FLY | code | ext
+    assert base & MX_FMT_FLY and not base & 0xF and not base & MX_FMT_FLY_SR, hex(fmt)
+    return fmt | code
+
+
+def ts4_operand(codes: torch.Tensor, scales: torch.Tensor, rows: int, k: int):
+    """A ``with_ts4_row`` row direction as the A6W4 tilescale GEMM takes it: codes ``[rows, k/2]`` uint8
+    (K128-blocked), scales the flat uint8 slab. Rows and K must be multiples of 256."""
+    assert rows % _TILE == 0 and k % _TILE == 0, (rows, k)
+    return codes.view(torch.uint8).reshape(rows, k // 2), scales.view(torch.uint8).reshape(-1)
+
+
 def kblk_operand(codes: torch.Tensor, scales: torch.Tensor, rows: int, k: int):
     """A ``fly6_fmt`` row direction as the A6W6 GEMM takes it: C0 [rows, k/2], C1 [rows, k/4] (K128-blocked, see
     ``gemm_mxfp6_kernel.kblk_planes``), scales the flat int32 slab. Rows and K must be multiples of 256."""
@@ -164,8 +183,8 @@ def _fly_dir(fmt, col):
     code = (fmt >> 4) & 0xF if col else fmt & 0xF
     if code == 0:
         return None
-    if not code & 0x8:  # fly6_fmt: MXFP6 K128-blocked, scales at nt 4 / ilv 0
-        return "kblk"
+    if not code & 0x8:  # K128-blocked, scales at nt 4 / ilv 0: MXFP4 (with_ts4_row) or MXFP6 (fly6_fmt)
+        return "k128fp4" if code & 0x4 else "kblk"
     return (bool(code & 1), 3 if code & 2 else 4, 4 if code & 4 else 0)
 
 
@@ -270,7 +289,7 @@ def mx_fp4_dirs(fmt: int) -> Tuple[bool, bool]:
     """Whether the (row, column) directions of a ``fmt`` pack are FP4 (the ones ``fp4_options`` may set)."""
     fmt = mx_fmt_base(fmt)
     if fmt & MX_FMT_FLY:
-        return tuple(isinstance(_fly_dir(fmt, col), tuple) for col in (False, True))
+        return tuple(isinstance(_fly_dir(fmt, col), tuple) or _fly_dir(fmt, col) == "k128fp4" for col in (False, True))
     if fmt in (MX_FMT_BLOB_GRAD, MX_FMT_BLOB_GRAD_SR):
         return (True, True)
     if fmt == MX_FMT_BLOB_ACT:
@@ -298,6 +317,8 @@ def mx_dir_sizes(rows: int, k: int, fmt: int, col: bool) -> Tuple[int, int]:
         rp, kp = _ceil(rows, _TILE), _ceil(k, _TILE)
         if p == "kblk":
             return rp * kp * 3 // 4, -(-rows // 256) * 256 * (kp // 128) * 4
+        if p == "k128fp4":
+            return rp * kp // 2, -(-rows // 256) * 256 * (kp // 128) * 4
         return rp * kp // 2, -(-rows // (64 * p[1])) * 256 * (kp // 128) * 4
     if _DIR_FP4[fmt][1 if col else 0]:
         rp, kp = _ceil(rows, _TILE), _ceil(k, _TILE)

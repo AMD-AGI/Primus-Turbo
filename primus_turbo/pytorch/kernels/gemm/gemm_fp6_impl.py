@@ -68,6 +68,7 @@ __all__ = [
     "a4w4_fly_shapes",
     "a6w6_fly_available",
     "a6w6_fly_shapes",
+    "a6w4_ts_available",
     "set_a6w6_backend",
     "gemm_fp6_impl",
     "gemm_fp6_out_impl",
@@ -317,8 +318,16 @@ def gemm_fp6_impl(
     a_is_fp4: bool = False,
     a4w4: int = 0,
     a6w6_fly: bool = False,
+    a6w4_ts: bool = False,
 ) -> torch.Tensor:
     granularity_enum = ScalingGranularity(granularity)
+    if a6w4_ts:
+        # A6W4 on the tilescale layout: A as fly6_fmt packed it, B as with_ts4_row packed it (K128-blocked MXFP4
+        # codes); aiter gemm_a6w4_tilescale, bias in its store epilogue. weight_is_fp4 (the A6W4 tile blob) is
+        # not consulted: a6w4_ts names the weight format itself.
+        if a_is_fp4 or a4w4 or a6w6_fly:
+            raise ValueError("a6w4_ts excludes a_is_fp4 / a4w4 / a6w6_fly")
+        return _a6w4_ts(a, a_scale, b, b_scale, m, n, k, out_dtype, bias)
     if a6w6_fly:
         # MXFP6 both operands in the FlyDSL A6W6 GEMM's layout (fly6_fmt packs) on the assembly ports of that
         # kernel in aiter; bias in its store epilogue.
@@ -414,6 +423,7 @@ def gemm_fp6_impl_meta(
     a_is_fp4: bool = False,
     a4w4: int = 0,
     a6w6_fly: bool = False,
+    a6w4_ts: bool = False,
 ) -> torch.Tensor:
     # Pure arithmetic on purpose: this must not reach into AITER, whose kernel
     # selection does lru_cached pandas lookups that SymInts would break. The output
@@ -443,6 +453,7 @@ def gemm_fp6_out_impl(
     bias: Optional[torch.Tensor] = None,
     a4w4: int = 0,
     a6w6_fly: bool = False,
+    a6w4_ts: bool = False,
 ) -> None:
     """``out[M, N] = A[M, K] @ B[N, K].T (+ bias)``, writing into a caller-owned buffer.
 
@@ -463,6 +474,11 @@ def gemm_fp6_out_impl(
     allocating call. A6W6 only.
     """
     granularity_enum = ScalingGranularity(granularity)
+    if a6w4_ts:
+        if a4w4 or a6w6_fly:
+            raise ValueError("a6w4_ts out-GEMM excludes a4w4 / a6w6_fly")
+        _a6w4_ts(a, a_scale, b, b_scale, m, n, k, out.dtype, bias, out=out)
+        return
     if a6w6_fly:
         if weight_is_fp4 or a4w4:
             raise ValueError("a6w6_fly out-GEMM excludes weight_is_fp4 / a4w4: both operands are MXFP6")
@@ -561,6 +577,7 @@ def gemm_fp6_out_impl_meta(
     bias: Optional[torch.Tensor] = None,
     a4w4: int = 0,
     a6w6_fly: bool = False,
+    a6w4_ts: bool = False,
 ) -> None:
     return None
 
@@ -679,6 +696,36 @@ def _a6w6_fly(a, a_scale, b, b_scale, m, n, k, out_dtype, bias, out=None):
         out = torch.empty(m, n, dtype=torch.bfloat16, device=a.device)
     flat = lambda t: t.view(torch.uint8).reshape(-1)  # noqa: E731
     gemm_a6w6_fly_asm(flat(a), flat(b), flat(a_scale), flat(b_scale), out, k, bias)
+    return out
+
+
+@functools.lru_cache(maxsize=None)
+def _a6w4_ts_rows() -> frozenset:
+    try:
+        from aiter.ops.gemm_op_tilescale import _rows
+    except ImportError:
+        return frozenset()
+    return frozenset((r[5], r[6], r[7], bool(r[4])) for r in _rows() if r[:4] == (6, 4, 1, 0))
+
+
+def a6w4_ts_available(m: int, n: int, k: int, has_bias: bool) -> bool:
+    """Whether aiter has the A6W4 tilescale kernel for exactly this GEMM (K128-blocked FP4 weight, role-B scales
+    without interleave). Reads the manifest once; call it outside compiled regions or hold the answer."""
+    return (int(m), int(n), int(k), bool(has_bias)) in _a6w4_ts_rows()
+
+
+def _a6w4_ts(a, a_scale, b, b_scale, m, n, k, out_dtype, bias, out=None):
+    """A6W4 on the tilescale layout (``a6w4_ts``, aiter ``gemm_a6w4_tilescale``): A = MXFP6 K128-blocked C0 / C1
+    planes (``fly6_fmt``), B = MXFP4 K128-blocked codes (``with_ts4_row``), scales FlyDSL's packed slab (B without
+    interleave). Bit-identical to A6W6 on the FP6 re-encoding of B; bias: fp32(acc) + fp32(bias), one rounding."""
+    from aiter.ops.gemm_op_tilescale import gemm_a6w4_tilescale
+
+    if out_dtype != torch.bfloat16:
+        raise ValueError(f"a6w4_ts writes bf16, got {out_dtype}")
+    if out is None:
+        out = torch.empty(m, n, dtype=torch.bfloat16, device=a.device)
+    flat = lambda t: t.view(torch.uint8).reshape(-1)  # noqa: E731
+    gemm_a6w4_tilescale(flat(a), flat(b), flat(a_scale), flat(b_scale), out, k, bias)
     return out
 
 
