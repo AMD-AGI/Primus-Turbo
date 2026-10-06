@@ -20,14 +20,14 @@ import torch
 
 from primus_turbo.pytorch.kernels.quantization import mx_a4w4_pack as P
 from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import (
-    FLY_A,
+    TS_A,
     MX_FMT_A4W4_GRAD,
     MX_FMT_FLY_ACT,
     MX_FMT_FLY_GRAD,
     MX_FMT_FLY_GRAD_SR,
     a4w4_logical,
-    fly_fmt,
-    fly_operand,
+    ts_fmt,
+    ts_operand,
     fp4_options,
     plain_operand,
     quantize_mx,
@@ -157,7 +157,7 @@ def test_all_zero_options_are_the_default():
         MX_FMT_A4W4_GRAD,
         MX_FMT_FLY_GRAD,
         MX_FMT_FLY_ACT,
-        fly_fmt(FLY_A, FLY_A),
+        ts_fmt(TS_A, TS_A),
     ):
         assert fp4_options(fmt) == fmt, hex(fmt)
 
@@ -189,8 +189,8 @@ def test_options_reach_every_fp4_layout(rnd, had):
     a = quantize_mx_dual(x, fp4_options(MX_FMT_A4W4_GRAD, rnd, rnd, had, had))
     c, s = a4w4_logical(a[0], a[1], rows, cols, is_b=False)
     _check((_unpack(c[:rows, : cols // 2]), s[:rows, : cols // 32].cpu()), ref, "a4w4")
-    f = quantize_mx_dual(x, fp4_options(fly_fmt(FLY_A, FLY_A), rnd, rnd, had, had))
-    fc, fs = fly_operand(f[0], f[1], rows, cols)
+    f = quantize_mx_dual(x, fp4_options(ts_fmt(TS_A, TS_A), rnd, rnd, had, had))
+    fc, fs = ts_operand(f[0], f[1], rows, cols)
     assert torch.equal(_unpack(fc), ref[0]), "fly codes"
     # The packed slab is a permutation of the scales (its layout is tested elsewhere).
     got = fs.view(torch.uint8)[: rows * cols // 32].cpu().sort().values
@@ -307,8 +307,8 @@ def test_column_only_sr(row):
     _skip()
     rows, cols = 512, 3072
     x = _rand(rows, cols, seed=9)
-    col = P.fly_b_params(rows, cols, rows)
-    base = P.fly_fmt(row=P.FLY_A if row else None, col=col)
+    col = P.ts_b_params(rows, cols, rows)
+    base = P.ts_fmt(row=P.TS_A if row else None, col=col)
     rtn = quantize_mx_dual(x, base)
     sr1 = quantize_mx_dual(x, fp4_options(base, col_sr=True))
     sr2 = quantize_mx_dual(x, fp4_options(base, col_sr=True))
@@ -320,9 +320,9 @@ def test_column_only_sr(row):
         assert torch.equal(
             mxfp6_data_region(sr1[0], rows, cols), mxfp6_data_region(rtn[0], rows, cols)
         )
-    c_rtn, s_rtn = fly_operand(rtn[2], rtn[3], cols, rows)
-    c1, s1 = fly_operand(sr1[2], sr1[3], cols, rows)
-    c2, _ = fly_operand(sr2[2], sr2[3], cols, rows)
+    c_rtn, s_rtn = ts_operand(rtn[2], rtn[3], cols, rows)
+    c1, s1 = ts_operand(sr1[2], sr1[3], cols, rows)
+    c2, _ = ts_operand(sr2[2], sr2[3], cols, rows)
     assert torch.equal(s1, s_rtn), "SR keeps the scales"
     assert not torch.equal(c1, c2), "two launches draw independently"
     assert not torch.equal(c1, c_rtn)

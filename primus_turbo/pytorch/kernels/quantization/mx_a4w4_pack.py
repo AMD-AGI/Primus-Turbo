@@ -50,15 +50,15 @@ MX_FMT_FLY_ACT = 9
 MX_FMT_FLY_GRAD_SR = 12
 # FlyDSL with PACKED scales: codes plain, scales stored in the per-tile layout the
 # GEMM's scales_prepacked=True reads, so FlyDSL does not repack them per launch. The layout belongs
-# to the consuming GEMM operand, so the fmt carries it per direction (fly_fmt).
+# to the consuming GEMM operand, so the fmt carries it per direction (ts_fmt).
 # The A4W4 tile-blob kernels (aiter `gemm_a4w4_blob_asm`): both operands in the A6W4 MXFP4
 # tile blob (Fp4Blob: C0 codes rb*1024 + L*16 per 256x128 tile, scales row*4 + block, +2 guard K tiles).
 MX_FMT_BLOB_GRAD = 16
 MX_FMT_BLOB_ACT = 17
 MX_FMT_BLOB_GRAD_SR = 18
-MX_FMT_FLY = 0x1000
-MX_FMT_FLY_SR = 0x800
-FLY_A = (False, 4, 0)  # every A operand: block_m is always 256, no interleave
+MX_FMT_TS = 0x1000
+MX_FMT_TS_SR = 0x800
+TS_A = (False, 4, 0)  # every A operand: block_m is always 256, no interleave
 
 # fmt bits 16-24: per-direction options of the FP4 directions, on top of any format above (see
 # ``fp4_options``). All zero is the default emit. ``mx_fmt_base`` strips them.
@@ -108,30 +108,30 @@ def _fly_code(p):
     return 0x8 | int(is_b) | (2 if nt == 3 else 0) | (4 if ilv == 4 else 0)
 
 
-def fly_fmt(row=None, col=None, sr=False) -> int:
+def ts_fmt(row=None, col=None, sr=False) -> int:
     """fmt for packed FlyDSL scales; ``row`` / ``col`` = (is_b, nt, ilv) of the GEMM operand each
     direction feeds, None for an FP6 direction (the forward rows of an activation / weight)."""
     return (
-        MX_FMT_FLY
-        | (MX_FMT_FLY_SR if sr else 0)
+        MX_FMT_TS
+        | (MX_FMT_TS_SR if sr else 0)
         | (_fly_code(col) << 4 if col else 0)
         | (_fly_code(row) if row else 0)
     )
 
 
-def fly6_fmt(row_is_b: bool, col=None) -> int:
+def ts6_fmt(row_is_b: bool, col=None) -> int:
     """fmt whose row direction is MXFP6 in the FlyDSL A6W6 GEMM's layout: codes as the K128-blocked
-    C0 / C1 planes (``kblk_operand``), scales FlyDSL's packed slab at nt 4 / no interleave. ``col`` as in ``fly_fmt``."""
-    return MX_FMT_FLY | (_fly_code(col) << 4 if col else 0) | 0x1 | (int(row_is_b) << 1)
+    C0 / C1 planes (``ts6_operand``), scales FlyDSL's packed slab at nt 4 / no interleave. ``col`` as in ``ts_fmt``."""
+    return MX_FMT_TS | (_fly_code(col) << 4 if col else 0) | 0x1 | (int(row_is_b) << 1)
 
 
-def with_fly6_row(fmt: int, row_is_b: bool) -> int:
+def with_ts6_row(fmt: int, row_is_b: bool) -> int:
     """``fmt`` (0 or a fly fmt with no row direction: an FP6-row activation / weight pack) with its row direction
-    switched to ``fly6_fmt``'s layout; the column direction is kept."""
+    switched to ``ts6_fmt``'s layout; the column direction is kept."""
     ext, fmt = fmt & ~MX_FMT_BASE_MASK, mx_fmt_base(fmt)
     if fmt == 0:
-        return fly6_fmt(row_is_b) | ext
-    assert fmt & MX_FMT_FLY and not fmt & 0xF and not fmt & MX_FMT_FLY_SR, hex(fmt)
+        return ts6_fmt(row_is_b) | ext
+    assert fmt & MX_FMT_TS and not fmt & 0xF and not fmt & MX_FMT_TS_SR, hex(fmt)
     return fmt | 0x1 | (int(row_is_b) << 1) | ext
 
 
@@ -142,8 +142,8 @@ def with_ts4_row(fmt: int, row_is_b: bool = True) -> int:
     ext, base = fmt & ~MX_FMT_BASE_MASK, mx_fmt_base(fmt)
     code = 0x5 | (int(row_is_b) << 1)
     if base == 0:
-        return MX_FMT_FLY | code | ext
-    assert base & MX_FMT_FLY and not base & 0xF and not base & MX_FMT_FLY_SR, hex(fmt)
+        return MX_FMT_TS | code | ext
+    assert base & MX_FMT_TS and not base & 0xF and not base & MX_FMT_TS_SR, hex(fmt)
     return fmt | code
 
 
@@ -154,8 +154,8 @@ def ts4_operand(codes: torch.Tensor, scales: torch.Tensor, rows: int, k: int):
     return codes.view(torch.uint8).reshape(rows, k // 2), scales.view(torch.uint8).reshape(-1)
 
 
-def kblk_operand(codes: torch.Tensor, scales: torch.Tensor, rows: int, k: int):
-    """A ``fly6_fmt`` row direction as the A6W6 GEMM takes it: C0 [rows, k/2], C1 [rows, k/4] (K128-blocked, see
+def ts6_operand(codes: torch.Tensor, scales: torch.Tensor, rows: int, k: int):
+    """A ``ts6_fmt`` row direction as the A6W6 GEMM takes it: C0 [rows, k/2], C1 [rows, k/4] (K128-blocked, see
     ``gemm_mxfp6_kernel.kblk_planes``), scales the flat int32 slab. Rows and K must be multiples of 256."""
     assert rows % _TILE == 0 and k % _TILE == 0, (rows, k)
     flat = codes.view(torch.uint8).reshape(-1)
@@ -167,7 +167,7 @@ def kblk_operand(codes: torch.Tensor, scales: torch.Tensor, rows: int, k: int):
     )
 
 
-def fly_b_params(M: int, N: int, K: int):
+def ts_b_params(M: int, N: int, K: int):
     """(is_b, nt, ilv) of the B operand of the FlyDSL-layout MXFP4 GEMM [M, K] x [N, K]^T.
 
     The N tile is always 256 wide: the 192-wide one races (FlyDSL `_MXFP4_BLOCK_N_ALT_ON`), and the assembly
@@ -183,12 +183,12 @@ def _fly_dir(fmt, col):
     code = (fmt >> 4) & 0xF if col else fmt & 0xF
     if code == 0:
         return None
-    if not code & 0x8:  # K128-blocked, scales at nt 4 / ilv 0: MXFP4 (with_ts4_row) or MXFP6 (fly6_fmt)
+    if not code & 0x8:  # K128-blocked, scales at nt 4 / ilv 0: MXFP4 (with_ts4_row) or MXFP6 (ts6_fmt)
         return "k128fp4" if code & 0x4 else "kblk"
     return (bool(code & 1), 3 if code & 2 else 4, 4 if code & 4 else 0)
 
 
-def fly_operand(codes: torch.Tensor, scales: torch.Tensor, rows: int, k: int):
+def ts_operand(codes: torch.Tensor, scales: torch.Tensor, rows: int, k: int):
     """A packed-FlyDSL direction as the GEMM takes it: codes [rows, k/2], scales the flat int32 slab."""
     rp, kp = _ceil(rows, _TILE), _ceil(k, _TILE)
     return codes.view(rp, kp // 2)[:rows, : k // 2], scales.view(torch.int32).reshape(-1)
@@ -288,7 +288,7 @@ _DIR_FP4 = {
 def mx_fp4_dirs(fmt: int) -> Tuple[bool, bool]:
     """Whether the (row, column) directions of a ``fmt`` pack are FP4 (the ones ``fp4_options`` may set)."""
     fmt = mx_fmt_base(fmt)
-    if fmt & MX_FMT_FLY:
+    if fmt & MX_FMT_TS:
         return tuple(isinstance(_fly_dir(fmt, col), tuple) or _fly_dir(fmt, col) == "k128fp4" for col in (False, True))
     if fmt in (MX_FMT_BLOB_GRAD, MX_FMT_BLOB_GRAD_SR):
         return (True, True)
@@ -308,7 +308,7 @@ def mx_dir_sizes(rows: int, k: int, fmt: int, col: bool) -> Tuple[int, int]:
             return mxfp6_pack_sizes(rows, k)
         rt, kt = -(-rows // _TILE), -(-k // 128) + 2  # the A6W4 FP4 tile blob, +2 guard K tiles
         return rt * kt * 16384, rt * kt * 1024
-    if fmt & MX_FMT_FLY:
+    if fmt & MX_FMT_TS:
         p = _fly_dir(fmt, col)
         if p is None:
             from primus_turbo.pytorch.kernels.quantization.mxfp6_pack import mxfp6_pack_sizes
@@ -380,3 +380,9 @@ def a6w4_blob_logical(codes: torch.Tensor, scales: torch.Tensor, rows: int, k: i
     saddr = tile * 1024 + (rem // 128) * 512 + k_group * 128 + (rem % 16) * 8 + (rem % 128) // 16
     s = scales.view(torch.uint8)[saddr]
     return c, s
+
+
+# Pre-tilescale names (the layout was first named after the FlyDSL kernels that read it).
+MX_FMT_FLY, MX_FMT_FLY_SR, FLY_A = MX_FMT_TS, MX_FMT_TS_SR, TS_A
+fly_fmt, fly6_fmt, with_fly6_row, fly_b_params = ts_fmt, ts6_fmt, with_ts6_row, ts_b_params
+fly_operand, kblk_operand = ts_operand, ts6_operand

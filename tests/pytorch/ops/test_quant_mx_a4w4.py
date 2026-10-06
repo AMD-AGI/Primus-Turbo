@@ -513,7 +513,7 @@ def test_flydsl_a4w4_matches_aiter_a4w4(m, n, k):
     assert torch.isfinite(buf).all() and ((buf.float() - ref).norm() / ref.norm()).item() < 1e-2
 
 
-# ---- FlyDSL packed scales written by the packers (fly_fmt, a4w4=3) ----
+# ---- FlyDSL packed scales written by the packers (ts_fmt, a4w4=3) ----
 
 
 @pytest.mark.parametrize(
@@ -534,7 +534,7 @@ def test_fly_packed_scales_match_flydsl_repack(m, n, k):
     pytest.importorskip("flydsl")
     from primus_turbo.pytorch.core.low_precision import ScalingGranularity
     from primus_turbo.pytorch.kernels.gemm.gemm_fp6_impl import gemm_fp6_impl, gemm_fp6_out_impl
-    from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import FLY_A, fly_b_params, fly_fmt
+    from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import TS_A, ts_b_params, ts_fmt
 
     gemm_a4w4_blob_asm = pytest.importorskip("aiter.ops.gemm_op_a4w4_blob").gemm_a4w4_blob_asm
 
@@ -547,8 +547,8 @@ def test_fly_packed_scales_match_flydsl_repack(m, n, k):
     b16, b16s = quantize_mx(w.t().contiguous(), 1, 16)
     ref = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
     gemm_a4w4_blob_asm(a16, b16, a16s, b16s, ref, k)
-    fa, fas, _, _ = quantize_mx_dual(dy, fly_fmt(row=FLY_A, col=FLY_A))
-    _, _, fb, fbs = quantize_mx_dual(w, fly_fmt(col=fly_b_params(m, n, k)))
+    fa, fas, _, _ = quantize_mx_dual(dy, ts_fmt(row=TS_A, col=TS_A))
+    _, _, fb, fbs = quantize_mx_dual(w, ts_fmt(col=ts_b_params(m, n, k)))
     got = gemm_fp6_impl(fa, fas, fb, fbs, m, n, k, torch.bfloat16, gran, None, a4w4=3)
     assert torch.equal(got, ref)
     buf = torch.full((m, n), float("nan"), device="cuda", dtype=torch.bfloat16)
@@ -577,9 +577,9 @@ def test_aiter_fly_matches_blob(m, n, k):
     from primus_turbo.pytorch.core.low_precision import ScalingGranularity
     from primus_turbo.pytorch.kernels.gemm.gemm_fp6_impl import gemm_fp6_impl, gemm_fp6_out_impl
     from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import (
-        FLY_A,
-        fly_b_params,
-        fly_fmt,
+        TS_A,
+        ts_b_params,
+        ts_fmt,
         quantize_mx,
     )
 
@@ -589,8 +589,8 @@ def test_aiter_fly_matches_blob(m, n, k):
     b16, b16s = quantize_mx(w.t().contiguous(), 1, 16)
     ref = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
     gemm_a4w4_blob_asm(a16, b16, a16s, b16s, ref, k)
-    fa, fas, _, _ = quantize_mx_dual(dy, fly_fmt(row=FLY_A, col=FLY_A))
-    _, _, fb, fbs = quantize_mx_dual(w, fly_fmt(col=fly_b_params(m, n, k)))
+    fa, fas, _, _ = quantize_mx_dual(dy, ts_fmt(row=TS_A, col=TS_A))
+    _, _, fb, fbs = quantize_mx_dual(w, ts_fmt(col=ts_b_params(m, n, k)))
     for _ in range(10):
         assert torch.equal(gemm_fp6_impl(fa, fas, fb, fbs, m, n, k, torch.bfloat16, gran, None, a4w4=4), ref)
     buf = torch.full((m, n), float("nan"), device="cuda", dtype=torch.bfloat16)
@@ -600,14 +600,14 @@ def test_aiter_fly_matches_blob(m, n, k):
 
 @pytest.mark.parametrize("k", [3072, 8192, 9216, 12288, 16384, 512, 768, 1024, 1280])
 def test_fly_b_params_matches_flydsl(k):
-    """`fly_b_params` computes the B layout without importing FlyDSL; it must equal FlyDSL's own rule at the 256 tile,
+    """`ts_b_params` computes the B layout without importing FlyDSL; it must equal FlyDSL's own rule at the 256 tile,
     and FlyDSL must never pick the racing 192 tile."""
     pytest.importorskip("flydsl")
     import primus_turbo.flydsl.gemm.gemm_mxfp4_kernel as FK
-    from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import fly_b_params
+    from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import ts_b_params
 
     kw = (k + 255) // 256 * 256
-    assert fly_b_params(8192, 3072, k) == (True, 4, FK.mxfp4_packed_scale_ilv(kw, block_n=256))
+    assert ts_b_params(8192, 3072, k) == (True, 4, FK.mxfp4_packed_scale_ilv(kw, block_n=256))
     for m, n, kk in _FLY_SHAPES:
         assert FK._mxfp4_pick_block_n(m, n, kk) == 256
 
@@ -615,10 +615,10 @@ def test_fly_b_params_matches_flydsl(k):
 def test_fly_packed_sr_gradient():
     _skip()
     pytest.importorskip("flydsl")
-    from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import FLY_A, fly_fmt
+    from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import TS_A, ts_fmt
 
     x = _rand(1024, 3072, seed=82)
-    f = fly_fmt(row=FLY_A, col=FLY_A, sr=True)
+    f = ts_fmt(row=TS_A, col=TS_A, sr=True)
     a, b = quantize_mx_dual(x, f), quantize_mx_dual(x, f)
     assert torch.equal(a[1], b[1]) and not torch.equal(a[0], b[0])  # same packed scales, new draws
 
@@ -646,9 +646,9 @@ def test_flydsl_exact_on_fly_shapes(m, n, k):
     from primus_turbo.pytorch.core.low_precision import ScalingGranularity
     from primus_turbo.pytorch.kernels.gemm.gemm_fp6_impl import gemm_fp6_impl
     from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import (
-        FLY_A,
-        fly_b_params,
-        fly_fmt,
+        TS_A,
+        ts_b_params,
+        ts_fmt,
         quantize_mx,
     )
 
@@ -660,14 +660,14 @@ def test_flydsl_exact_on_fly_shapes(m, n, k):
     gemm_a4w4_blob_asm(a16, b16, a16s, b16s, ref, k)
     pa, pas, _, _ = quantize_mx_dual(dy, 8)
     _, _, pb, pbs = quantize_mx_dual(w, 9)
-    fa, fas, _, _ = quantize_mx_dual(dy, fly_fmt(row=FLY_A, col=FLY_A))
-    _, _, fb, fbs = quantize_mx_dual(w, fly_fmt(col=fly_b_params(m, n, k)))
+    fa, fas, _, _ = quantize_mx_dual(dy, ts_fmt(row=TS_A, col=TS_A))
+    _, _, fb, fbs = quantize_mx_dual(w, ts_fmt(col=ts_b_params(m, n, k)))
     for _ in range(10):
         assert torch.equal(gemm_fp6_impl(pa, pas, pb, pbs, m, n, k, torch.bfloat16, gran, None, a4w4=2), ref)
         assert torch.equal(gemm_fp6_impl(fa, fas, fb, fbs, m, n, k, torch.bfloat16, gran, None, a4w4=3), ref)
 
 
-# ---- MXFP6 in the FlyDSL A6W6 GEMM's layout (fly6_fmt) ----
+# ---- MXFP6 in the FlyDSL A6W6 GEMM's layout (ts6_fmt) ----
 
 
 def _fp6_blob_unpack(blob, sblob, rows, k):
@@ -694,7 +694,7 @@ def _fp6_blob_unpack(blob, sblob, rows, k):
     "m,n,k", [(16384, 12288, 3072), (16384, 9216, 3072), (8192, 3072, 12288), (512, 768, 1024)]
 )
 def test_fly6_kblk_matches_fp6_blob(m, n, k):
-    """fly6_fmt rows (activation as A, weight as B) carry exactly the codes and scales of the MXFP6 tile blob,
+    """ts6_fmt rows (activation as A, weight as B) carry exactly the codes and scales of the MXFP6 tile blob,
     laid out as the FlyDSL A6W6 GEMM reads them: the K128-blocked C0 / C1 planes (kblk_planes of the plain-row planes)
     and FlyDSL's packed scale slab (preshuffle_mxfp6_scales, b_ilv 0). The column direction it is paired with is
     unchanged. The GEMM on them is bit-identical to AITER's A6W6 on the blobs."""
@@ -708,19 +708,19 @@ def test_fly6_kblk_matches_fp6_blob(m, n, k):
         preshuffle_mxfp6_scales,
     )
     from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import (
-        FLY_A,
-        fly6_fmt,
-        fly_b_params,
-        fly_fmt,
-        kblk_operand,
+        TS_A,
+        ts6_fmt,
+        ts_b_params,
+        ts_fmt,
+        ts6_operand,
     )
 
     x, w = _rand(m, k, seed=90), _rand(n, k, seed=91)  # activation [m, k]; weight as stored [out = n, in = k]
-    col_x, col_w = FLY_A, fly_b_params(m, k, n)  # column directions: any fly operand (here A, and dgrad B)
-    ra, ras, ca, cas = quantize_mx_dual(x, fly_fmt(col=col_x))
-    rb, rbs, cb, cbs = quantize_mx_dual(w, fly_fmt(col=col_w))
-    ga, gas, gca, gcas = quantize_mx_dual(x, fly6_fmt(False, col=col_x))
-    gb, gbs, gcb, gcbs = quantize_mx_dual(w, fly6_fmt(True, col=col_w))
+    col_x, col_w = TS_A, ts_b_params(m, k, n)  # column directions: any fly operand (here A, and dgrad B)
+    ra, ras, ca, cas = quantize_mx_dual(x, ts_fmt(col=col_x))
+    rb, rbs, cb, cbs = quantize_mx_dual(w, ts_fmt(col=col_w))
+    ga, gas, gca, gcas = quantize_mx_dual(x, ts6_fmt(False, col=col_x))
+    gb, gbs, gcb, gcbs = quantize_mx_dual(w, ts6_fmt(True, col=col_w))
     for got, ref in ((gca, ca), (gcas, cas), (gcb, cb), (gcbs, cbs)):
         assert torch.equal(got.view(torch.uint8), ref.view(torch.uint8))
     pa, sa = _fp6_blob_unpack(ra, ras, m, k)
@@ -732,8 +732,8 @@ def test_fly6_kblk_matches_fp6_blob(m, n, k):
         pb[..., :16].reshape(n, k // 2).contiguous(), pb[..., 16:].reshape(n, k // 4).contiguous()
     )
     esa, esb = preshuffle_mxfp6_scales(sa, sb, m, n, k)
-    a0, a1, asp = kblk_operand(ga, gas, m, k)
-    b0, b1, bsp = kblk_operand(gb, gbs, n, k)
+    a0, a1, asp = ts6_operand(ga, gas, m, k)
+    b0, b1, bsp = ts6_operand(gb, gbs, n, k)
     assert (
         ga.numel() * ga.element_size() == m * k * 3 // 4 and gb.numel() * gb.element_size() == n * k * 3 // 4
     )
@@ -757,25 +757,25 @@ _A6W6_FLY_SHAPES = [
 
 @pytest.mark.parametrize("m,n,k,has_bias", _A6W6_FLY_SHAPES)
 def test_a6w6_fly_matches_a6w6(m, n, k, has_bias):
-    """a6w6_fly (aiter `gemm_a6w6_fly_asm`, assembly ports of the FlyDSL MXFP6 GEMM) on operands packed in
-    fly6_fmt rows -- with the fly FP4 column directions the backward reads -- is bit-identical to the A6W6
+    """a6w6_ts (aiter `gemm_a6w6_fly_asm`, assembly ports of the FlyDSL MXFP6 GEMM) on operands packed in
+    ts6_fmt rows -- with the fly FP4 column directions the backward reads -- is bit-identical to the A6W6
     tile-blob GEMM on the same tensors, allocating and out variants, bias in the epilogue, over repeated calls. The
     Flux forward shapes."""
     _skip()
     pytest.importorskip("aiter.ops.gemm_op_a6w6_fly")
     from primus_turbo.pytorch.core.low_precision import ScalingGranularity
     from primus_turbo.pytorch.kernels.gemm.gemm_fp6_impl import (
-        a6w6_fly_available,
+        a6w6_ts_available,
         gemm_fp6_impl,
         gemm_fp6_out_impl,
     )
     from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import (
-        fly_b_params,
-        fly_fmt,
-        with_fly6_row,
+        ts_b_params,
+        ts_fmt,
+        with_ts6_row,
     )
 
-    if not a6w6_fly_available(m, n, k, has_bias):
+    if not a6w6_ts_available(m, n, k, has_bias):
         pytest.skip("aiter has no f6flygemm kernel for this shape")
     gran = ScalingGranularity.MX_BLOCKWISE.value
     x, w = _rand(m, k, seed=92), _rand(n, k, seed=93)
@@ -783,21 +783,21 @@ def test_a6w6_fly_matches_a6w6(m, n, k, has_bias):
     ra, ras, ca, cas = quantize_mx_dual(x, MX_FMT_FP6)
     rb, rbs, _, _ = quantize_mx_dual(w, MX_FMT_FP6)
     ref = gemm_fp6_impl(ra, ras, rb, rbs, m, n, k, torch.bfloat16, gran, bias)
-    col_x, col_w = fly_fmt(col=fly_b_params(n, k, m)), fly_fmt(col=fly_b_params(m, k, n))
-    fa, fas, fca, fcas = quantize_mx_dual(x, with_fly6_row(col_x, False))
-    fb, fbs, fcb, fcbs = quantize_mx_dual(w, with_fly6_row(col_w, True))
+    col_x, col_w = ts_fmt(col=ts_b_params(n, k, m)), ts_fmt(col=ts_b_params(m, k, n))
+    fa, fas, fca, fcas = quantize_mx_dual(x, with_ts6_row(col_x, False))
+    fb, fbs, fcb, fcbs = quantize_mx_dual(w, with_ts6_row(col_w, True))
     _, _, eca, ecas = quantize_mx_dual(x, col_x)
     assert torch.equal(fca.view(torch.uint8), eca.view(torch.uint8)) and torch.equal(
         fcas.view(torch.uint8), ecas.view(torch.uint8)
     )
     for _ in range(10):
         assert torch.equal(
-            gemm_fp6_impl(fa, fas, fb, fbs, m, n, k, torch.bfloat16, gran, bias, a6w6_fly=True), ref
+            gemm_fp6_impl(fa, fas, fb, fbs, m, n, k, torch.bfloat16, gran, bias, a6w6_ts=True), ref
         )
     buf = torch.full((m, n), float("nan"), device="cuda", dtype=torch.bfloat16)
-    gemm_fp6_out_impl(fa, fas, fb, fbs, buf, m, n, k, gran, False, bias, a6w6_fly=True)
+    gemm_fp6_out_impl(fa, fas, fb, fbs, buf, m, n, k, gran, False, bias, a6w6_ts=True)
     assert torch.equal(buf, ref)
-    assert not a6w6_fly_available(m, n, k, not has_bias) or (m, n, k) in (
+    assert not a6w6_ts_available(m, n, k, not has_bias) or (m, n, k) in (
         (16384, 9216, 3072),
         (8192, 9216, 3072),
     )
@@ -808,10 +808,10 @@ def test_row_only_fly_packs_match_dual(row_is_b):
     """Row-only packs (eval forwards: no column direction) in the fly layouts write the same row bytes as the dual
     packs: FP4 fly rows (forward MXFP4) and fly6 rows."""
     _skip()
-    from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import FLY_A, fly6_fmt, fly_b_params, fly_fmt
+    from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import TS_A, ts6_fmt, ts_b_params, ts_fmt
 
     x = _rand(512, 1024, seed=94)
-    for fmt in (fly_fmt(row=fly_b_params(256, 512, 1024) if row_is_b else FLY_A), fly6_fmt(row_is_b)):
+    for fmt in (ts_fmt(row=ts_b_params(256, 512, 1024) if row_is_b else TS_A), ts6_fmt(row_is_b)):
         rc, rs = quantize_mx(x, 1, fmt)
         dc, ds, _, _ = quantize_mx_dual(x, fmt)
         assert torch.equal(rc.view(torch.uint8), dc.view(torch.uint8)) and torch.equal(
@@ -831,12 +831,12 @@ def test_a4w4_blob_fallback_matches_fly(m, n, k):
     pytest.importorskip("aiter.ops.gemm_op_a4w4_fly")
     pytest.importorskip("aiter.ops.gemm_op_a4w4_blob")
     from primus_turbo.pytorch.core.low_precision import ScalingGranularity
-    from primus_turbo.pytorch.kernels.gemm.gemm_fp6_impl import a4w4_fly_shapes, gemm_fp6_impl
+    from primus_turbo.pytorch.kernels.gemm.gemm_fp6_impl import a4w4_ts_shapes, gemm_fp6_impl
     from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import (
-        FLY_A,
+        TS_A,
         MX_FMT_BLOB_GRAD,
-        fly_b_params,
-        fly_fmt,
+        ts_b_params,
+        ts_fmt,
     )
 
     gran = ScalingGranularity.MX_BLOCKWISE.value
@@ -844,9 +844,9 @@ def test_a4w4_blob_fallback_matches_fly(m, n, k):
     xa, xas = quantize_mx(x, 1, MX_FMT_BLOB_GRAD)
     wb, wbs = quantize_mx(w, 1, MX_FMT_BLOB_GRAD)
     got = gemm_fp6_impl(xa, xas, wb, wbs, m, n, k, torch.bfloat16, gran, None, a4w4=5)
-    fa, fas = quantize_mx(x, 1, fly_fmt(row=FLY_A))
-    fb, fbs = quantize_mx(w, 1, fly_fmt(row=fly_b_params(m, n, k)))
-    if (m, n, k) in a4w4_fly_shapes():
+    fa, fas = quantize_mx(x, 1, ts_fmt(row=TS_A))
+    fb, fbs = quantize_mx(w, 1, ts_fmt(row=ts_b_params(m, n, k)))
+    if (m, n, k) in a4w4_ts_shapes():
         ref = gemm_fp6_impl(fa, fas, fb, fbs, m, n, k, torch.bfloat16, gran, None, a4w4=4)
     else:
         pytest.importorskip("flydsl")
@@ -854,7 +854,7 @@ def test_a4w4_blob_fallback_matches_fly(m, n, k):
             -(-m // 256) * 256
         )  # FlyDSL's packed path wants M on the tile: zero rows give the same leading rows
         xp = torch.cat([x, x.new_zeros(mp - m, k)]) if mp != m else x
-        fa, fas = quantize_mx(xp, 1, fly_fmt(row=FLY_A))
+        fa, fas = quantize_mx(xp, 1, ts_fmt(row=TS_A))
         ref = gemm_fp6_impl(fa, fas, fb, fbs, mp, n, k, torch.bfloat16, gran, None, a4w4=3)[:m]
     assert got.shape == (m, n) and torch.equal(got, ref)
 
@@ -868,7 +868,7 @@ def test_flydsl_mxfp4_pinned_configs_skip_autotune():
     from primus_turbo.flydsl.gemm.mxfp4_pinned import PINNED
     from primus_turbo.pytorch.core.low_precision import ScalingGranularity
     from primus_turbo.pytorch.kernels.gemm.gemm_fp6_impl import gemm_fp6_impl
-    from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import FLY_A, fly_b_params, fly_fmt
+    from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import TS_A, ts_b_params, ts_fmt
 
     if os.environ.get("PRIMUS_TURBO_MXFP4_TPW_MAX") is None:
         assert FK._MXFP4_TPW_MAX == 1
@@ -876,8 +876,8 @@ def test_flydsl_mxfp4_pinned_configs_skip_autotune():
     assert (m, n, k) in PINNED
     at_before = {key for key in FK._MXFP4_AT_CACHE if key[:3] == (m, n, k)}
     dy, w = _rand(m, k, seed=97), _rand(k, n, seed=98)
-    fa, fas, _, _ = quantize_mx_dual(dy, fly_fmt(row=FLY_A, col=FLY_A))
-    _, _, fb, fbs = quantize_mx_dual(w, fly_fmt(col=fly_b_params(m, n, k)))
+    fa, fas, _, _ = quantize_mx_dual(dy, ts_fmt(row=TS_A, col=TS_A))
+    _, _, fb, fbs = quantize_mx_dual(w, ts_fmt(col=ts_b_params(m, n, k)))
     gemm_fp6_impl(
         fa, fas, fb, fbs, m, n, k, torch.bfloat16, ScalingGranularity.MX_BLOCKWISE.value, None, a4w4=3
     )

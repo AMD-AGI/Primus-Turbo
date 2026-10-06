@@ -58,9 +58,9 @@ using bf16x2_t = __bf16 __attribute__((ext_vector_type(2)));
 //              with the same scale layout.
 // For the two A4W4 layouts `nk` is ceil(K, 256) / 128 (no guard tiles), so a row is 64 * nk
 // bytes and the scale plane has 4 * nk columns, a multiple of 8 as shuffle_scale requires.
-// FlyK128: Fly's scales with the codes K128-blocked, [rows/16, K/128, 16, 64] (each 16-row x 128-K block one
+// TileK128: Tile's scales with the codes K128-blocked, [rows/16, K/128, 16, 64] (each 16-row x 128-K block one
 // contiguous KiB), for GEMMs that stage K128 per step.
-enum class Layout { A6W4Blob, A4W4A, A4W4B, Plain, Fly, FlyK128 };
+enum class Layout { A6W4Blob, A4W4A, A4W4B, Plain, Tile, TileK128 };
 
 #ifndef MXFP4_ABLATE_BF16
 #define MXFP4_ABLATE_BF16 0
@@ -98,9 +98,9 @@ __device__ __forceinline__ uint32_t sr_mix(uint32_t x) {
 // FlyDSL's packed-scale byte offset for (row, kblk): a port of `mxfp4_packed_scale_byte`
 // (flydsl/utils/gemm_helper.py), checked byte-for-byte against `preshuffle_mxfp4_scales` on the
 // Flux training shapes. n_sub = 2, nd = ng = 4; ku = 2 when (k128 / 2) is even, else 1.
-struct FlyPackArgs {
+struct TilePackArgs {
     int32_t is_b = 0, nt = 4, ilv = 0, k128 = 0, rows = 0;
-    // FP4 emit options (every layout): scale rule, Hadamard, 2-D block scaling. See MXFlyPack.
+    // FP4 emit options (every layout): scale rule, Hadamard, 2-D block scaling. See MXTilePack.
     int32_t fp4_round = 0, fp4_had = 0, fp4_tile2d = 0;
 };
 
@@ -112,8 +112,8 @@ enum : int32_t { kRoundRceil = 0, kRoundMode0 = 1, kRoundMode1 = 2, kRoundMode2 
 // Hadamard along the contraction axis: 32-point (the default, shared with MXFP6), none, or two
 // independent 16-point transforms per 32-group (normalisation 1/4, applied first like the H32's).
 enum : int32_t { kHadH32 = 0, kHadNone = 1, kHadH16 = 2 };
-__device__ __forceinline__ int64_t fly_scale_byte(const int64_t row, const int32_t kblk,
-                                                  const FlyPackArgs &f) {
+__device__ __forceinline__ int64_t ts_scale_byte(const int64_t row, const int32_t kblk,
+                                                  const TilePackArgs &f) {
     if (f.nt == 4 && (f.ilv == 0 || f.ilv == 4)) {
         // Every packer in use takes this path: the 256-wide N tile (nt = 4; the 192-wide one races)
         // with interleave 0 or 4. All divisors are then powers of two -- gspan 64, ilv 4, nw = 2 *
@@ -183,7 +183,7 @@ __device__ __forceinline__ void
 mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32_t group,
                  const int32_t nk_pad, uint8_t *__restrict__ packed,
                  uint8_t *__restrict__ packed_scale, const uint32_t sr_seed = 0,
-                 const FlyPackArgs fly = {}, const float tile_amax = -1.0f) {
+                 const TilePackArgs fly = {}, const float tile_amax = -1.0f) {
     // The normalisation goes in FIRST, before the butterfly -- which is where AITER's
     // MXFP4 packer puts it, and NOT where the MXFP6 packer puts it (MXFP6 multiplies the
     // rotated result at the end). The two orders differ in floating point, so copying the
@@ -403,9 +403,9 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
         // Codes. Row stride 64 * nk bytes; group g is bytes [16 g, 16 g + 16) of its row.
         const int64_t row_bytes = static_cast<int64_t>(nk_pad) * 64;
         int64_t       address;
-        if constexpr (LAYOUT == Layout::A4W4A || LAYOUT == Layout::Plain || LAYOUT == Layout::Fly) {
+        if constexpr (LAYOUT == Layout::A4W4A || LAYOUT == Layout::Plain || LAYOUT == Layout::Tile) {
             address = out_row * row_bytes + static_cast<int64_t>(group) * kBytesPerBlock;
-        } else if constexpr (LAYOUT == Layout::FlyK128) {
+        } else if constexpr (LAYOUT == Layout::TileK128) {
             address = ((out_row / 16) * nk_pad + group / 4) * 1024 + (out_row % 16) * 64 +
                       static_cast<int64_t>(group % 4) * kBytesPerBlock;
         } else {
@@ -425,9 +425,9 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
             packed_scale[out_row * sp + group] = scale_exp;
             return;
         }
-        if constexpr (LAYOUT == Layout::Fly || LAYOUT == Layout::FlyK128) {
+        if constexpr (LAYOUT == Layout::Tile || LAYOUT == Layout::TileK128) {
             if (out_row < fly.rows && group < fly.k128 * 4)
-                packed_scale[fly_scale_byte(out_row, group, fly)] = scale_exp;
+                packed_scale[ts_scale_byte(out_row, group, fly)] = scale_exp;
             return;
         }
         const int64_t i0 = out_row / 32, i1 = (out_row % 32) / 16, i2 = out_row % 16;

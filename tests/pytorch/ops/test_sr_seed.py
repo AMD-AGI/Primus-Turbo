@@ -18,8 +18,8 @@ import torch
 
 import primus_turbo.pytorch as turbo
 from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import (
-    FLY_A,
-    fly_fmt,
+    TS_A,
+    ts_fmt,
     quantize_mx_dual,
 )
 from primus_turbo.pytorch.ops.quantization import set_sr_seed, sr_step_seed
@@ -39,7 +39,7 @@ def _x(seed=0, rows=512, cols=3072):
 
 def _mx_sr(x):
     """quantize_mx* packer, gradient format with SR on both FP4 directions: the codes of both directions."""
-    p = quantize_mx_dual(x, fly_fmt(FLY_A, FLY_A, sr=True))
+    p = quantize_mx_dual(x, ts_fmt(TS_A, TS_A, sr=True))
     return p[0].clone(), p[2].clone()
 
 

@@ -202,21 +202,21 @@ enum class MXPackFmt : int {
     Fp4ASr     = 4,
     Fp4Plain   = 5,
     Fp4PlainSr = 6,
-    Fp4Fly     = 7,
-    Fp4FlySr   = 8,
+    Fp4Tile     = 7,
+    Fp4TileSr   = 8,
     Fp4BlobSr  = 9, // Fp4Blob with stochastic rounding (the A4W4 tile-blob kernels' gradient)
-    Fp6KBlk =
+    Fp6Tile =
         10, // MXFP6 for the FlyDSL A6W6 kernel: K128-blocked C0 / C1 planes + FlyDSL packed scales
-    Fp4FlyK128 = 11 // Fp4Fly with K128-blocked codes [rows/16, K/128, 16, 64] (tilescale FP4 "k128")
+    Fp4TileK128 = 11 // Fp4Tile with K128-blocked codes [rows/16, K/128, 16, 64] (tilescale FP4 "k128")
 };
 
-// Fp4Fly / Fp4FlySr: plain row-major codes and the E8M0 scales stored straight
+// Fp4Tile / Fp4TileSr: plain row-major codes and the E8M0 scales stored straight
 // into FlyDSL's packed per-tile layout, the one `gemm_mxfp4_flydsl_kernel(scales_prepacked=True)`
 // reads, so FlyDSL does not repack them per GEMM. The layout depends on the CONSUMING GEMM's
 // operand role and tile: is_b, nt = tile/64 (3 or 4), ilv = B interleave (0 or 4), and the
 // contraction's k128. rows = the logical extent; padded rows are not stored (the slab is sized per
-// tile, so with nt = 3 a padded row would land outside it). Set per launch by MXFlyPackScope.
-struct MXFlyPack {
+// tile, so with nt = 3 a padded row would land outside it). Set per launch by MXTilePackScope.
+struct MXTilePack {
     int32_t is_b = 0, nt = 4, ilv = 0, k128 = 0, rows = 0;
     // Per-direction FP4 options from the fmt extension bits (see quantization_mxfp6.cpp), for any
     // FP4 layout, not only FlyDSL's: scale rule (0 RCEIL, 1-3 = scale_rounding_mode 0-2), Hadamard
@@ -230,12 +230,12 @@ void sr_set_base_seed(uint64_t base);
 // The seed of the next SR launch of `stream`.
 uint32_t sr_next_seed(SRStream stream);
 
-void      mx_fly_pack_set(const MXFlyPack &row, const MXFlyPack &col);
-MXFlyPack mx_fly_pack_row();
-MXFlyPack mx_fly_pack_col();
-struct MXFlyPackScope {
-    MXFlyPackScope(const MXFlyPack &row, const MXFlyPack &col) { mx_fly_pack_set(row, col); }
-    ~MXFlyPackScope() { mx_fly_pack_set(MXFlyPack{}, MXFlyPack{}); }
+void      mx_tile_pack_set(const MXTilePack &row, const MXTilePack &col);
+MXTilePack mx_tile_pack_row();
+MXTilePack mx_tile_pack_col();
+struct MXTilePackScope {
+    MXTilePackScope(const MXTilePack &row, const MXTilePack &col) { mx_tile_pack_set(row, col); }
+    ~MXTilePackScope() { mx_tile_pack_set(MXTilePack{}, MXTilePack{}); }
 };
 
 enum class MXFP6Direction {

@@ -541,7 +541,7 @@ template <bool KBLK = false>
 __device__ __forceinline__ void
 mxfp6_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32_t group,
                  const int32_t nk_pad, uint8_t *__restrict__ packed,
-                 uint8_t *__restrict__ packed_scale, const mxfp4_emit::FlyPackArgs fly = {}) {
+                 uint8_t *__restrict__ packed_scale, const mxfp4_emit::TilePackArgs fly = {}) {
 #pragma unroll
     for (int stage = 0; stage < 5; ++stage) {
         const int h = 1 << stage;
@@ -615,7 +615,7 @@ mxfp6_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
         *reinterpret_cast<uint4_t *>(packed + c0) = *reinterpret_cast<const uint4_t *>(&fp6);
         *reinterpret_cast<uint2_t *>(packed + c1) =
             *reinterpret_cast<const uint2_t *>(reinterpret_cast<const uint8_t *>(&fp6) + 16);
-        packed_scale[mxfp4_emit::fly_scale_byte(out_row, group, fly)] = scale_exp;
+        packed_scale[mxfp4_emit::ts_scale_byte(out_row, group, fly)] = scale_exp;
         return;
     }
     const int32_t tile_row  = static_cast<int32_t>(out_row / kTileRows);
@@ -690,11 +690,11 @@ template <MXPackFmt FMT, bool OPTS = false>
 __device__ __forceinline__ void
 emit_group_fmt(float (&values)[kGroupSize], const int64_t out_row, const int32_t group,
                const int32_t  nk, uint8_t *__restrict__ packed, uint8_t *__restrict__ packed_scale,
-               const uint32_t sr_seed, const mxfp4_emit::FlyPackArgs fly,
+               const uint32_t sr_seed, const mxfp4_emit::TilePackArgs fly,
                const float tile_amax = -1.0f) {
     if constexpr (FMT == MXPackFmt::Fp6) {
         mxfp6_emit_group(values, out_row, group, nk, packed, packed_scale);
-    } else if constexpr (FMT == MXPackFmt::Fp6KBlk) {
+    } else if constexpr (FMT == MXPackFmt::Fp6Tile) {
         mxfp6_emit_group<true>(values, out_row, group, nk, packed, packed_scale, fly);
     } else if constexpr (FMT == MXPackFmt::Fp4Blob) {
         mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::A6W4Blob, false, OPTS>(
@@ -714,14 +714,14 @@ emit_group_fmt(float (&values)[kGroupSize], const int64_t out_row, const int32_t
     } else if constexpr (FMT == MXPackFmt::Fp4BlobSr) {
         mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::A6W4Blob, true, OPTS>(
             values, out_row, group, nk, packed, packed_scale, sr_seed, fly, tile_amax);
-    } else if constexpr (FMT == MXPackFmt::Fp4Fly) {
-        mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::Fly, false, OPTS>(
+    } else if constexpr (FMT == MXPackFmt::Fp4Tile) {
+        mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::Tile, false, OPTS>(
             values, out_row, group, nk, packed, packed_scale, 0u, fly, tile_amax);
-    } else if constexpr (FMT == MXPackFmt::Fp4FlySr) {
-        mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::Fly, true, OPTS>(
+    } else if constexpr (FMT == MXPackFmt::Fp4TileSr) {
+        mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::Tile, true, OPTS>(
             values, out_row, group, nk, packed, packed_scale, sr_seed, fly, tile_amax);
-    } else if constexpr (FMT == MXPackFmt::Fp4FlyK128) {
-        mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::FlyK128, false, OPTS>(
+    } else if constexpr (FMT == MXPackFmt::Fp4TileK128) {
+        mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::TileK128, false, OPTS>(
             values, out_row, group, nk, packed, packed_scale, 0u, fly, tile_amax);
     } else {
         mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::A4W4B, false, OPTS>(
@@ -754,7 +754,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
     uint8_t *__restrict__ col_packed, uint8_t *__restrict__ col_scale, float *__restrict__ col_sum,
     const int32_t M, const int32_t N, const int32_t row_nk_pad, const int32_t col_nk_pad,
     const prologue_args_t<DType, PROLOGUE> pargs, const uint32_t sr_seed,
-    const mxfp4_emit::FlyPackArgs row_fly, const mxfp4_emit::FlyPackArgs col_fly) {
+    const mxfp4_emit::TilePackArgs row_fly, const mxfp4_emit::TilePackArgs col_fly) {
     static_assert(TILE_N % kGroupSize == 0, "a staged patch must hold whole groups both ways");
     static_assert(TILE_N <= THREADS_PER_BLOCK,
                   "the column-sum pass assigns one column per thread");
@@ -788,9 +788,9 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                                ROW_FMT == MXPackFmt::Fp4PlainSr || COL_FMT == MXPackFmt::Fp4A ||
                                COL_FMT == MXPackFmt::Fp4B || COL_FMT == MXPackFmt::Fp4ASr ||
                                COL_FMT == MXPackFmt::Fp4Plain || COL_FMT == MXPackFmt::Fp4PlainSr ||
-                               ROW_FMT == MXPackFmt::Fp4Fly || ROW_FMT == MXPackFmt::Fp4FlySr ||
-                               COL_FMT == MXPackFmt::Fp4Fly || COL_FMT == MXPackFmt::Fp4FlySr ||
-                               ROW_FMT == MXPackFmt::Fp4FlyK128;
+                               ROW_FMT == MXPackFmt::Fp4Tile || ROW_FMT == MXPackFmt::Fp4TileSr ||
+                               COL_FMT == MXPackFmt::Fp4Tile || COL_FMT == MXPackFmt::Fp4TileSr ||
+                               ROW_FMT == MXPackFmt::Fp4TileK128;
     // Row and column packs of one launch draw from different streams.
     const uint32_t row_seed = sr_seed, col_seed = sr_seed ^ 0x5bd1e995u;
     int32_t        bx, by;
@@ -1495,14 +1495,14 @@ struct launch_geometry {
 // weight, FP6 for the forward and the B operand the other way.
 inline bool is_a4w4(const MXPackFmt f) {
     return f == MXPackFmt::Fp4A || f == MXPackFmt::Fp4B || f == MXPackFmt::Fp4ASr ||
-           f == MXPackFmt::Fp4Plain || f == MXPackFmt::Fp4PlainSr || f == MXPackFmt::Fp4Fly ||
-           f == MXPackFmt::Fp4FlySr || f == MXPackFmt::Fp4FlyK128;
+           f == MXPackFmt::Fp4Plain || f == MXPackFmt::Fp4PlainSr || f == MXPackFmt::Fp4Tile ||
+           f == MXPackFmt::Fp4TileSr || f == MXPackFmt::Fp4TileK128;
 }
 
-// The FlyDSL packed-scale parameters of the current launch (MXFlyPackScope, set by the op layer).
+// The FlyDSL packed-scale parameters of the current launch (MXTilePackScope, set by the op layer).
 namespace {
-MXFlyPack               g_fly_row, g_fly_col;
-mxfp4_emit::FlyPackArgs to_args(const MXFlyPack &p) {
+MXTilePack               g_ts_row, g_ts_col;
+mxfp4_emit::TilePackArgs to_args(const MXTilePack &p) {
     return {p.is_b, p.nt, p.ilv, p.k128, p.rows, p.fp4_round, p.fp4_had, p.fp4_tile2d};
 }
 } // namespace
@@ -1522,12 +1522,12 @@ void launch_dual(const dim3 grid, const dim3 block, hipStream_t stream, const DT
     const uint32_t sr_seed =
         (row_fmt == MXPackFmt::Fp4ASr || col_fmt == MXPackFmt::Fp4ASr ||
          row_fmt == MXPackFmt::Fp4PlainSr || col_fmt == MXPackFmt::Fp4PlainSr ||
-         row_fmt == MXPackFmt::Fp4FlySr || col_fmt == MXPackFmt::Fp4FlySr ||
+         row_fmt == MXPackFmt::Fp4TileSr || col_fmt == MXPackFmt::Fp4TileSr ||
          row_fmt == MXPackFmt::Fp4BlobSr || col_fmt == MXPackFmt::Fp4BlobSr)
             ? sr_next_seed(SRStream::MXPack)
             : 0u;
-    const mxfp4_emit::FlyPackArgs row_fly = to_args(mx_fly_pack_row());
-    const mxfp4_emit::FlyPackArgs col_fly = to_args(mx_fly_pack_col());
+    const mxfp4_emit::TilePackArgs row_fly = to_args(mx_tile_pack_row());
+    const mxfp4_emit::TilePackArgs col_fly = to_args(mx_tile_pack_col());
     if (row_fly.fp4_tile2d || col_fly.fp4_tile2d) {
         // The tile amax is taken on the staged values in the whole-tile emit path: it must see what
         // the emit converts (no prologue, no rotation), and the experimental per-stage schedule
@@ -1559,8 +1559,8 @@ void launch_dual(const dim3 grid, const dim3 block, hipStream_t stream, const DT
     auto go = [&](auto r, auto c) {
         constexpr MXPackFmt R      = decltype(r)::value;
         constexpr MXPackFmt C      = decltype(c)::value;
-        constexpr bool      has_f4 = !(R == MXPackFmt::Fp6 || R == MXPackFmt::Fp6KBlk) ||
-                                !(C == MXPackFmt::Fp6 || C == MXPackFmt::Fp6KBlk);
+        constexpr bool      has_f4 = !(R == MXPackFmt::Fp6 || R == MXPackFmt::Fp6Tile) ||
+                                !(C == MXPackFmt::Fp6 || C == MXPackFmt::Fp6Tile);
         if constexpr (has_f4) {
             if (opts) {
                 launch(r, c, std::true_type{});
@@ -1576,11 +1576,11 @@ void launch_dual(const dim3 grid, const dim3 block, hipStream_t stream, const DT
     using F4ASr    = std::integral_constant<MXPackFmt, MXPackFmt::Fp4ASr>;
     using F4P      = std::integral_constant<MXPackFmt, MXPackFmt::Fp4Plain>;
     using F4PSr    = std::integral_constant<MXPackFmt, MXPackFmt::Fp4PlainSr>;
-    using F4F      = std::integral_constant<MXPackFmt, MXPackFmt::Fp4Fly>;
+    using F4F      = std::integral_constant<MXPackFmt, MXPackFmt::Fp4Tile>;
     using F4BlobSr = std::integral_constant<MXPackFmt, MXPackFmt::Fp4BlobSr>;
-    using F4FSr    = std::integral_constant<MXPackFmt, MXPackFmt::Fp4FlySr>;
-    using F6K      = std::integral_constant<MXPackFmt, MXPackFmt::Fp6KBlk>;
-    using F4FK     = std::integral_constant<MXPackFmt, MXPackFmt::Fp4FlyK128>;
+    using F4FSr    = std::integral_constant<MXPackFmt, MXPackFmt::Fp4TileSr>;
+    using F6K      = std::integral_constant<MXPackFmt, MXPackFmt::Fp6Tile>;
+    using F4FK     = std::integral_constant<MXPackFmt, MXPackFmt::Fp4TileK128>;
     // A direction that is not emitted does not constrain the pair.
     const MXPackFmt r = DO_ROW ? row_fmt : MXPackFmt::Fp6;
     const MXPackFmt c = DO_COL ? col_fmt : MXPackFmt::Fp6;
@@ -1616,33 +1616,33 @@ void launch_dual(const dim3 grid, const dim3 block, hipStream_t stream, const DT
         go(F4BlobSr{}, F4BlobSr{});
     else if (r == MXPackFmt::Fp4Blob && c == MXPackFmt::Fp6) // row-only blob (forward / eval)
         go(F4Blob{}, F6{});
-    else if (r == MXPackFmt::Fp4Fly && c == MXPackFmt::Fp4Fly) // FlyDSL packed scales
+    else if (r == MXPackFmt::Fp4Tile && c == MXPackFmt::Fp4Tile) // FlyDSL packed scales
         go(F4F{}, F4F{});
-    else if (r == MXPackFmt::Fp4FlySr && c == MXPackFmt::Fp4FlySr)
+    else if (r == MXPackFmt::Fp4TileSr && c == MXPackFmt::Fp4TileSr)
         go(F4FSr{}, F4FSr{});
-    else if (r == MXPackFmt::Fp6 && c == MXPackFmt::Fp4Fly)
+    else if (r == MXPackFmt::Fp6 && c == MXPackFmt::Fp4Tile)
         go(F6{}, F4F{});
     // Column-only SR (fmt bit 25): the backward copy rounds stochastically, the forward rows do
     // not.
-    else if (r == MXPackFmt::Fp6 && c == MXPackFmt::Fp4FlySr)
+    else if (r == MXPackFmt::Fp6 && c == MXPackFmt::Fp4TileSr)
         go(F6{}, F4FSr{});
-    else if (r == MXPackFmt::Fp6KBlk && c == MXPackFmt::Fp4FlySr)
+    else if (r == MXPackFmt::Fp6Tile && c == MXPackFmt::Fp4TileSr)
         go(F6K{}, F4FSr{});
-    else if (r == MXPackFmt::Fp4Fly && c == MXPackFmt::Fp4FlySr)
+    else if (r == MXPackFmt::Fp4Tile && c == MXPackFmt::Fp4TileSr)
         go(F4F{}, F4FSr{});
-    else if (r == MXPackFmt::Fp4Fly && c == MXPackFmt::Fp6) // row-only fly FP4 (forward-only)
+    else if (r == MXPackFmt::Fp4Tile && c == MXPackFmt::Fp6) // row-only fly FP4 (forward-only)
         go(F4F{}, F6{});
-    else if (r == MXPackFmt::Fp6KBlk &&
-             c == MXPackFmt::Fp4Fly) // FlyDSL A6W6 forward + fly FP4 backward
+    else if (r == MXPackFmt::Fp6Tile &&
+             c == MXPackFmt::Fp4Tile) // FlyDSL A6W6 forward + fly FP4 backward
         go(F6K{}, F4F{});
-    else if (r == MXPackFmt::Fp6KBlk && c == MXPackFmt::Fp6) // row-only (forward / eval)
+    else if (r == MXPackFmt::Fp6Tile && c == MXPackFmt::Fp6) // row-only (forward / eval)
         go(F6K{}, F6{});
     // A6W4 tilescale weight: K128-blocked FP4 rows (forward B), fly FP4 columns (A4W4 dgrad B)
-    else if (r == MXPackFmt::Fp4FlyK128 && c == MXPackFmt::Fp4FlySr)
+    else if (r == MXPackFmt::Fp4TileK128 && c == MXPackFmt::Fp4TileSr)
         go(F4FK{}, F4FSr{});
-    else if (r == MXPackFmt::Fp4FlyK128 && c == MXPackFmt::Fp4Fly)
+    else if (r == MXPackFmt::Fp4TileK128 && c == MXPackFmt::Fp4Tile)
         go(F4FK{}, F4F{});
-    else if (r == MXPackFmt::Fp4FlyK128 && c == MXPackFmt::Fp6) // row-only (forward / eval)
+    else if (r == MXPackFmt::Fp4TileK128 && c == MXPackFmt::Fp6) // row-only (forward / eval)
         go(F4FK{}, F6{});
     else
         PRIMUS_TURBO_CHECK(false, "unsupported MX pack format pair (row ", int(row_fmt), ", col ",
@@ -1932,15 +1932,15 @@ template void quantize_mxfp6_gate_mul_impl<float16>(const float16 *,
                                                     MXPackFmt);
 
 // Outside the file's anonymous namespace: the op layer (another translation unit) calls these.
-void mx_fly_pack_set(const MXFlyPack &row, const MXFlyPack &col) {
-    g_fly_row = row;
-    g_fly_col = col;
+void mx_tile_pack_set(const MXTilePack &row, const MXTilePack &col) {
+    g_ts_row = row;
+    g_ts_col = col;
 }
-MXFlyPack mx_fly_pack_row() {
-    return g_fly_row;
+MXTilePack mx_tile_pack_row() {
+    return g_ts_row;
 }
-MXFlyPack mx_fly_pack_col() {
-    return g_fly_col;
+MXTilePack mx_tile_pack_col() {
+    return g_ts_col;
 }
 
 } // namespace primus_turbo

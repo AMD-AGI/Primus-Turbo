@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""The shift/mask fast path of ``fly_scale_byte`` (csrc/include/primus_turbo/mxfp4_emit.hpp) equals the generic
+"""The shift/mask fast path of ``ts_scale_byte`` (csrc/include/primus_turbo/mxfp4_emit.hpp) equals the generic
 mapping for the 256-wide N tile (nt 4) and interleave 0 / 4. Python ports of both, checked over every kblk, is_b,
 ilv, a dense row range and rows near 16384 (the mapping is periodic in row beyond the group / block structure)."""
 
@@ -53,7 +53,7 @@ def _fast(row, kblk, is_b, ilv, k128):
 
 
 @pytest.mark.parametrize("k", [512, 768, 1024, 3072, 8192, 9216, 12288, 16384])
-def test_fly_scale_byte_fast_path_matches_generic(k):
+def test_ts_scale_byte_fast_path_matches_generic(k):
     k128 = k // 128
     rows = list(range(1024)) + list(range(16384 - 64, 16384))
     for is_b in (0, 1):

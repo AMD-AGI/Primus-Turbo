@@ -55,10 +55,10 @@ std::pair<int64_t, int64_t> pack_sizes(const int64_t rows, const int64_t k) {
 //   9  activation / weight for FlyDSL: FP6 rows, plain FP4 columns
 // fmt >= 0x1000: FlyDSL packed scales. 0x1000 | sr * 0x800 | col_code << 4 |
 // row_code, a direction code being 0 (FP6) or 0x8 | is_b | (nt == 3) << 1 | (ilv == 4) << 2 for the
-// consuming GEMM operand (see MXFlyPack). Gradients pass two codes, activations / weights FP6 rows.
+// consuming GEMM operand (see MXTilePack). Gradients pass two codes, activations / weights FP6 rows.
 // Codes without 0x8: 0x1 | is_b << 1 = MXFP6 K128-blocked planes; 0x5 | is_b << 1 = MXFP4 with
 // K128-blocked codes (row direction, round to nearest); both with scales at nt 4, no interleave.
-constexpr int64_t kFlyFmt = 0x1000, kFlySr = 0x800;
+constexpr int64_t kTileFmt = 0x1000, kTileSr = 0x800;
 //
 // fmt bits 16-24: per-direction FP4 options, on top of any of the formats above, for the FP4
 // directions only (FP6 directions keep their own rotation and scale rule; setting a row or column
@@ -79,7 +79,7 @@ int64_t fmt_base(const int64_t fmt) {
     return fmt & kFmtBaseMask;
 }
 
-MXPackFmt fly_dir_fmt(int64_t fmt, const bool col) {
+MXPackFmt ts_dir_fmt(int64_t fmt, const bool col) {
     const bool col_sr  = col && ((fmt >> 25) & 1);
     fmt                = fmt_base(fmt);
     const int64_t code = col ? (fmt >> 4) & 0xF : fmt & 0xF;
@@ -88,15 +88,15 @@ MXPackFmt fly_dir_fmt(int64_t fmt, const bool col) {
     if (!(code & 0x8)) {
         if (code & 0x4) { // 0x5 | is_b << 1: MXFP4, K128-blocked codes + FlyDSL packed scales (nt 4, ilv 0)
             PRIMUS_TURBO_CHECK((code & 0x1) && !col, "K128-blocked FP4 is a row direction (fmt ", fmt, ")");
-            PRIMUS_TURBO_CHECK(!(fmt & kFlySr), "K128-blocked FP4 rows take no stochastic rounding");
-            return MXPackFmt::Fp4FlyK128;
+            PRIMUS_TURBO_CHECK(!(fmt & kTileSr), "K128-blocked FP4 rows take no stochastic rounding");
+            return MXPackFmt::Fp4TileK128;
         }
         // 0x1 | is_b << 1: MXFP6, K128-blocked C0/C1 planes + FlyDSL packed scales (nt 4, ilv 0).
         PRIMUS_TURBO_CHECK((code & 0x1) && !(code & 0x4), "bad FlyDSL direction code ", code, " in fmt ", fmt);
-        PRIMUS_TURBO_CHECK(!(fmt & kFlySr), "MXFP6 K128-blocked directions take no stochastic rounding");
-        return MXPackFmt::Fp6KBlk;
+        PRIMUS_TURBO_CHECK(!(fmt & kTileSr), "MXFP6 K128-blocked directions take no stochastic rounding");
+        return MXPackFmt::Fp6Tile;
     }
-    return (fmt & kFlySr) || col_sr ? MXPackFmt::Fp4FlySr : MXPackFmt::Fp4Fly;
+    return (fmt & kTileSr) || col_sr ? MXPackFmt::Fp4TileSr : MXPackFmt::Fp4Tile;
 }
 
 // The consuming GEMM's operand parameters for one direction of a [M, N] input (row direction
@@ -104,20 +104,20 @@ MXPackFmt fly_dir_fmt(int64_t fmt, const bool col) {
 std::pair<MXPackFmt, MXPackFmt> fmt_pair(int64_t fmt);
 
 // The FP4 options of one direction (fmt bits 16-24), checked against that direction's format.
-void set_fp4_options(MXFlyPack &p, const int64_t fmt, const bool col) {
+void set_fp4_options(MXTilePack &p, const int64_t fmt, const bool col) {
     const int64_t round  = (fmt >> (col ? 18 : 16)) & 0x3;
     const int64_t had    = (fmt >> (col ? 22 : 20)) & 0x3;
     const bool    tile2d = (fmt >> 24) & 0x1;
     const auto    dirs   = fmt_pair(fmt);
     const auto    f      = col ? dirs.second : dirs.first;
-    if (f == MXPackFmt::Fp6 || f == MXPackFmt::Fp6KBlk) {
+    if (f == MXPackFmt::Fp6 || f == MXPackFmt::Fp6Tile) {
         PRIMUS_TURBO_CHECK(round == 0 && had == 0,
                            "FP4 scale rule / Hadamard options set on an FP6 ",
                            col ? "column" : "row", " direction (fmt ", fmt, ")");
         return;
     }
     PRIMUS_TURBO_CHECK(had != 3, "fmt Hadamard code 3 is undefined (fmt ", fmt, ")");
-    PRIMUS_TURBO_CHECK(!((fmt >> 25) & 1) || (fmt_base(fmt) & kFlyFmt),
+    PRIMUS_TURBO_CHECK(!((fmt >> 25) & 1) || (fmt_base(fmt) & kTileFmt),
                        "column-only stochastic rounding is for packed-FlyDSL formats (fmt ", fmt,
                        ")");
     PRIMUS_TURBO_CHECK(!tile2d || had == 1, "2-D block scaling needs no Hadamard (fmt ", fmt, ")");
@@ -126,11 +126,11 @@ void set_fp4_options(MXFlyPack &p, const int64_t fmt, const bool col) {
     p.fp4_tile2d = tile2d ? 1 : 0;
 }
 
-MXFlyPack fly_dir(const int64_t fmt_in, const int64_t M, const int64_t N, const bool col) {
-    MXFlyPack p;
+MXTilePack ts_dir(const int64_t fmt_in, const int64_t M, const int64_t N, const bool col) {
+    MXTilePack p;
     set_fp4_options(p, fmt_in, col);
     const int64_t fmt = fmt_base(fmt_in);
-    if (!(fmt & kFlyFmt))
+    if (!(fmt & kTileFmt))
         return p;
     const int64_t code = col ? (fmt >> 4) & 0xF : fmt & 0xF;
     if (code == 0)
@@ -153,8 +153,8 @@ MXFlyPack fly_dir(const int64_t fmt_in, const int64_t M, const int64_t N, const 
 }
 
 std::pair<MXPackFmt, MXPackFmt> fmt_pair(int64_t fmt) {
-    if (fmt_base(fmt) & kFlyFmt) // fly_dir_fmt reads the column-SR bit, so it takes the full fmt
-        return {fly_dir_fmt(fmt, false), fly_dir_fmt(fmt, true)};
+    if (fmt_base(fmt) & kTileFmt) // ts_dir_fmt reads the column-SR bit, so it takes the full fmt
+        return {ts_dir_fmt(fmt, false), ts_dir_fmt(fmt, true)};
     fmt = fmt_base(fmt);
     switch (fmt) {
     case 0:
@@ -197,7 +197,7 @@ std::pair<MXPackFmt, MXPackFmt> fmt_pair(int64_t fmt) {
 // codes [ceil(rows, 256), ceil(k, 256) / 2], scales [ceil(rows, 256), ceil(k, 256) / 32] in
 // shuffle_scale()'s layout (whose padding is exactly these).
 std::pair<int64_t, int64_t> sizes_for(const MXPackFmt f, const int64_t rows, const int64_t k,
-                                      const MXFlyPack &fly = {}) {
+                                      const MXTilePack &fly = {}) {
     if (f == MXPackFmt::Fp6)
         return pack_sizes(rows, k);
     if (f == MXPackFmt::Fp4Blob || f == MXPackFmt::Fp4BlobSr) {
@@ -206,13 +206,13 @@ std::pair<int64_t, int64_t> sizes_for(const MXPackFmt f, const int64_t rows, con
         const int64_t rt = cdiv(rows, kTileRows), kt = cdiv(k, 128) + 2;
         return {rt * kt * 16384, rt * kt * 1024};
     }
-    if (f == MXPackFmt::Fp6KBlk) {
+    if (f == MXPackFmt::Fp6Tile) {
         // C0 [rows/16, K/128, 16, 64] then C1 [rows/32, K/128, 32, 32] (rows to 256, K to 256), and FlyDSL's
         // packed scale slab at nt 4.
         const int64_t r = cdiv(rows, kTileRows) * kTileRows, c = cdiv(k, kTileRows) * kTileRows;
         return {r * c * 3 / 4, cdiv(rows, 64 * 4) * 256 * (c / 128) * 4};
     }
-    if (f == MXPackFmt::Fp4Fly || f == MXPackFmt::Fp4FlySr || f == MXPackFmt::Fp4FlyK128) {
+    if (f == MXPackFmt::Fp4Tile || f == MXPackFmt::Fp4TileSr || f == MXPackFmt::Fp4TileK128) {
         // FlyDSL's per-tile slab (_get_mxfp4_scale_ws): ceil(rows / tile) * 256 * K/128 dwords.
         const int64_t r = cdiv(rows, kTileRows) * kTileRows, c = cdiv(k, kTileRows) * kTileRows;
         return {r * c / 2, cdiv(rows, 64 * fly.nt) * 256 * (c / 128) * 4};
@@ -258,9 +258,9 @@ std::vector<at::Tensor> run(const at::Tensor &input, const MXFP6Direction direct
     const bool want_row = direction != MXFP6Direction::Col;
     const bool want_col = direction != MXFP6Direction::Row;
 
-    const auto [row_p_bytes, row_s_bytes] = sizes_for(row_fmt, M, N, fly_dir(fmt, M, N, false)); // contract N
-    const auto [col_p_bytes, col_s_bytes] = sizes_for(col_fmt, N, M, fly_dir(fmt, M, N, true)); // contract M
-    MXFlyPackScope fly_scope(fly_dir(fmt, M, N, false), fly_dir(fmt, M, N, true));
+    const auto [row_p_bytes, row_s_bytes] = sizes_for(row_fmt, M, N, ts_dir(fmt, M, N, false)); // contract N
+    const auto [col_p_bytes, col_s_bytes] = sizes_for(col_fmt, N, M, ts_dir(fmt, M, N, true)); // contract M
+    MXTilePackScope fly_scope(ts_dir(fmt, M, N, false), ts_dir(fmt, M, N, true));
 
     at::Tensor row_p = empty_blob(want_row ? row_p_bytes : 0, input);
     at::Tensor row_s = empty_blob(want_row ? row_s_bytes : 0, input);
@@ -352,9 +352,9 @@ std::vector<at::Tensor> run_fused(const at::Tensor &input, const c10::optional<a
     if (bias.has_value())
         check_bias(*bias, input, N);
 
-    const auto [row_p_bytes, row_s_bytes] = sizes_for(row_fmt, M, N, fly_dir(fmt, M, N, false)); // contract N
-    const auto [col_p_bytes, col_s_bytes] = sizes_for(col_fmt, N, M, fly_dir(fmt, M, N, true)); // contract M
-    MXFlyPackScope fly_scope(fly_dir(fmt, M, N, false), fly_dir(fmt, M, N, true));
+    const auto [row_p_bytes, row_s_bytes] = sizes_for(row_fmt, M, N, ts_dir(fmt, M, N, false)); // contract N
+    const auto [col_p_bytes, col_s_bytes] = sizes_for(col_fmt, N, M, ts_dir(fmt, M, N, true)); // contract M
+    MXTilePackScope fly_scope(ts_dir(fmt, M, N, false), ts_dir(fmt, M, N, true));
 
     at::Tensor row_p = empty_blob(row_p_bytes, input);
     at::Tensor row_s = empty_blob(row_s_bytes, input);
@@ -457,9 +457,9 @@ run_qk_norm_rope_bwd(const at::Tensor &input, const at::Tensor &dq, const at::Te
     check_operand(rstd_q, input, "rstd_q", {M * num_heads}, at::kFloat);
     check_operand(rstd_k, input, "rstd_k", {M * num_heads}, at::kFloat);
 
-    const auto [row_p_bytes, row_s_bytes] = sizes_for(row_fmt, M, N, fly_dir(fmt, M, N, false)); // contract N
-    const auto [col_p_bytes, col_s_bytes] = sizes_for(col_fmt, N, M, fly_dir(fmt, M, N, true)); // contract M
-    MXFlyPackScope fly_scope(fly_dir(fmt, M, N, false), fly_dir(fmt, M, N, true));
+    const auto [row_p_bytes, row_s_bytes] = sizes_for(row_fmt, M, N, ts_dir(fmt, M, N, false)); // contract N
+    const auto [col_p_bytes, col_s_bytes] = sizes_for(col_fmt, N, M, ts_dir(fmt, M, N, true)); // contract M
+    MXTilePackScope fly_scope(ts_dir(fmt, M, N, false), ts_dir(fmt, M, N, true));
 
     at::Tensor row_p = empty_blob(row_p_bytes, input);
     at::Tensor row_s = empty_blob(row_s_bytes, input);
@@ -538,9 +538,9 @@ std::vector<at::Tensor> run_ln_modulate(const at::Tensor &input, const at::Tenso
     check_operand(scale, input, "scale", {B, N}, dt);
     check_operand(shift, input, "shift", {B, N}, dt);
 
-    const auto [row_p_bytes, row_s_bytes] = sizes_for(row_fmt, M, N, fly_dir(fmt, M, N, false)); // contract N
-    const auto [col_p_bytes, col_s_bytes] = sizes_for(col_fmt, N, M, fly_dir(fmt, M, N, true)); // contract M
-    MXFlyPackScope fly_scope(fly_dir(fmt, M, N, false), fly_dir(fmt, M, N, true));
+    const auto [row_p_bytes, row_s_bytes] = sizes_for(row_fmt, M, N, ts_dir(fmt, M, N, false)); // contract N
+    const auto [col_p_bytes, col_s_bytes] = sizes_for(col_fmt, N, M, ts_dir(fmt, M, N, true)); // contract M
+    MXTilePackScope fly_scope(ts_dir(fmt, M, N, false), ts_dir(fmt, M, N, true));
 
     at::Tensor row_p = empty_blob(row_p_bytes, input);
     at::Tensor row_s = empty_blob(row_s_bytes, input);
@@ -594,9 +594,9 @@ std::vector<at::Tensor> run_gate_mul(const at::Tensor &input, const at::Tensor &
                        B);
     check_operand(gate, input, "gate", {B, N}, input.scalar_type());
 
-    const auto [row_p_bytes, row_s_bytes] = sizes_for(row_fmt, M, N, fly_dir(fmt, M, N, false)); // contract N
-    const auto [col_p_bytes, col_s_bytes] = sizes_for(col_fmt, N, M, fly_dir(fmt, M, N, true)); // contract M
-    MXFlyPackScope fly_scope(fly_dir(fmt, M, N, false), fly_dir(fmt, M, N, true));
+    const auto [row_p_bytes, row_s_bytes] = sizes_for(row_fmt, M, N, ts_dir(fmt, M, N, false)); // contract N
+    const auto [col_p_bytes, col_s_bytes] = sizes_for(col_fmt, N, M, ts_dir(fmt, M, N, true)); // contract M
+    MXTilePackScope fly_scope(ts_dir(fmt, M, N, false), ts_dir(fmt, M, N, true));
 
     at::Tensor row_p = empty_blob(row_p_bytes, input);
     at::Tensor row_s = empty_blob(row_s_bytes, input);
@@ -699,9 +699,9 @@ static void dual_out_fmt(const at::Tensor input, at::Tensor row_packed, at::Tens
     const int64_t          N = input.size(1);
 
     const auto [row_fmt, col_fmt]   = fmt_pair(fmt);
-    const auto [rp_bytes, rs_bytes] = sizes_for(row_fmt, M, N, fly_dir(fmt, M, N, false));
-    const auto [cp_bytes, cs_bytes] = sizes_for(col_fmt, N, M, fly_dir(fmt, M, N, true));
-    MXFlyPackScope fly_scope(fly_dir(fmt, M, N, false), fly_dir(fmt, M, N, true));
+    const auto [rp_bytes, rs_bytes] = sizes_for(row_fmt, M, N, ts_dir(fmt, M, N, false));
+    const auto [cp_bytes, cs_bytes] = sizes_for(col_fmt, N, M, ts_dir(fmt, M, N, true));
+    MXTilePackScope fly_scope(ts_dir(fmt, M, N, false), ts_dir(fmt, M, N, true));
     TORCH_CHECK(row_packed.numel() == rp_bytes && row_scale.numel() == rs_bytes &&
                     col_packed.numel() == cp_bytes && col_scale.numel() == cs_bytes,
                 "quantize_mxfp6_dual_out: output buffers do not match the packed layout size");
@@ -774,9 +774,9 @@ static void fused_dual_out_fmt(const at::Tensor input, const c10::optional<at::T
     const int64_t          N = input.size(1);
 
     const auto [row_fmt, col_fmt]   = fmt_pair(fmt);
-    const auto [rp_bytes, rs_bytes] = sizes_for(row_fmt, M, N, fly_dir(fmt, M, N, false));
-    const auto [cp_bytes, cs_bytes] = sizes_for(col_fmt, N, M, fly_dir(fmt, M, N, true));
-    MXFlyPackScope fly_scope(fly_dir(fmt, M, N, false), fly_dir(fmt, M, N, true));
+    const auto [rp_bytes, rs_bytes] = sizes_for(row_fmt, M, N, ts_dir(fmt, M, N, false));
+    const auto [cp_bytes, cs_bytes] = sizes_for(col_fmt, N, M, ts_dir(fmt, M, N, true));
+    MXTilePackScope fly_scope(ts_dir(fmt, M, N, false), ts_dir(fmt, M, N, true));
     TORCH_CHECK(row_packed.numel() == rp_bytes && row_scale.numel() == rs_bytes &&
                     col_packed.numel() == cp_bytes && col_scale.numel() == cs_bytes,
                 "quantize_mxfp6_fused_dual_out: buffers do not match the packed layout size");
@@ -1004,8 +1004,8 @@ std::vector<at::Tensor> with_fmt_blobs(std::vector<at::Tensor> out, const at::Te
     const int64_t M                = input.size(0);
     const int64_t N                = input.size(1);
     const auto [row_fmt, col_fmt]  = fmt_pair(fmt);
-    const auto [rp, rs]            = sizes_for(row_fmt, M, N, fly_dir(fmt, M, N, false));
-    const auto [cp, cs]            = sizes_for(col_fmt, N, M, fly_dir(fmt, M, N, true));
+    const auto [rp, rs]            = sizes_for(row_fmt, M, N, ts_dir(fmt, M, N, false));
+    const auto [cp, cs]            = sizes_for(col_fmt, N, M, ts_dir(fmt, M, N, true));
     auto opts                      = input.options().dtype(at::kByte);
     out[0] = at::empty({rp}, opts);
     out[1] = at::empty({rs}, opts);
@@ -1021,8 +1021,8 @@ std::vector<at::Tensor> quantize_mx_meta(const at::Tensor input, const int64_t a
     const int64_t N               = input.size(1);
     const bool    row             = direction_from_axis(axis) == MXFP6Direction::Row;
     const auto [row_fmt, col_fmt] = fmt_pair(fmt);
-    const auto [packed, scale]    = row ? sizes_for(row_fmt, M, N, fly_dir(fmt, M, N, false))
-                                        : sizes_for(col_fmt, N, M, fly_dir(fmt, M, N, true));
+    const auto [packed, scale]    = row ? sizes_for(row_fmt, M, N, ts_dir(fmt, M, N, false))
+                                        : sizes_for(col_fmt, N, M, ts_dir(fmt, M, N, true));
     auto opts                     = input.options().dtype(at::kByte);
     return {at::empty({packed}, opts), at::empty({scale}, opts)};
 }
