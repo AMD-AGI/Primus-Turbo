@@ -15,6 +15,10 @@ from pathlib import Path
 
 from setuptools import find_packages, setup
 
+# The build imports primus_turbo (tools/build_utils.py) while the tree may still hold a previous development
+# build's _build_info.py; the import guard is for users of a build, not for (re)building one.
+os.environ["PRIMUS_TURBO_ALLOW_DEV_BUILD"] = "1"
+
 PROJECT_ROOT = Path(os.path.dirname(__file__)).resolve()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -57,9 +61,24 @@ CK_DISABLED_SOURCE_MARKERS = (
     "/grouped_gemm/ck_grouped_gemm.cu",
 )
 
+# -------- Dev build without rocSHMEM (never for production) --------
+# PRIMUS_TURBO_DEV_NO_ROCSHMEM=1 builds as if rocSHMEM were absent: DeepEP internode and the ODC
+# GPU-direct kernels are compiled out, and the device link is no longer forced into one LTO
+# partition (that is needed only to keep rocSHMEM's device context and the ODC kernels together),
+# so it runs in parallel. For fast development rebuilds only. The build records it in
+# _build_info.py and `import primus_turbo` refuses such a build unless PRIMUS_TURBO_ALLOW_DEV_BUILD=1
+# is set in the environment, so a dev build that reaches a production image fails at import.
+DEV_NO_ROCSHMEM = os.environ.get("PRIMUS_TURBO_DEV_NO_ROCSHMEM", "0") == "1"
+
 # -------- ROCSHMEM LIB ---------------
 # try to found rocshmem in default path or enviorment
-ROCSHMEM_LIBRARY = find_rocshmem_library()
+ROCSHMEM_LIBRARY = None if DEV_NO_ROCSHMEM else find_rocshmem_library()
+if DEV_NO_ROCSHMEM:
+    print("=" * 80)
+    print("[Primus-Turbo Setup] DEV BUILD: PRIMUS_TURBO_DEV_NO_ROCSHMEM=1 -- rocSHMEM, DeepEP internode and")
+    print("[Primus-Turbo Setup] ODC are compiled out. Not for production: importing this build requires")
+    print("[Primus-Turbo Setup] PRIMUS_TURBO_ALLOW_DEV_BUILD=1.")
+    print("=" * 80)
 
 
 def get_submodule_folders():
@@ -204,6 +223,8 @@ def write_build_info():
         f'__git_commit__ = "{commit}"\n'
         f'__build_time__ = "{build_time}"\n'
         f"BUILD_CK_BACKEND = {ck_backend_enabled()}\n"
+        f"ROCSHMEM = {ROCSHMEM_LIBRARY is not None}\n"
+        f"DEV_NO_ROCSHMEM = {DEV_NO_ROCSHMEM}\n"
     )
     if old_content != content:
         build_info_path.write_text(content, encoding="utf-8")
@@ -391,16 +412,19 @@ def build_kernels_extension():
     extra_flags["extra_link_args"] += [
         "-shared",
         "-Wl,-soname,libprimus_turbo_kernels.so",
-        # [experiment A] Force a single device-LTO partition so the rocSHMEM
-        # device runtime (default context) and the ODC GDA device kernels stay
-        # in ONE device-LTO unit. The default multi-partition device link
-        # (--lto-partitions=8 + -amdgpu-internalize-symbols) splits the rocSHMEM
-        # device default context away from the ODC kernels -> device getmem reads
-        # zero -> dual-node grad_norm=0. Keeping them in one partition mirrors the
-        # single-TU pinfix .so that works.
-        "-Xoffload-linker",
-        "--lto-partitions=1",
     ]
+    if ROCSHMEM_LIBRARY is not None:
+        extra_flags["extra_link_args"] += [
+            # [experiment A] Force a single device-LTO partition so the rocSHMEM
+            # device runtime (default context) and the ODC GDA device kernels stay
+            # in ONE device-LTO unit. The default multi-partition device link
+            # (--lto-partitions=8 + -amdgpu-internalize-symbols) splits the rocSHMEM
+            # device default context away from the ODC kernels -> device getmem reads
+            # zero -> dual-node grad_norm=0. Keeping them in one partition mirrors the
+            # single-TU pinfix .so that works.
+            "-Xoffload-linker",
+            "--lto-partitions=1",
+        ]
 
     kernels_source_files = Path(PROJECT_ROOT / "csrc" / "kernels")
     kernels_sources = all_files_in_dir(kernels_source_files, name_extensions=["cpp", "cc", "cu"])
