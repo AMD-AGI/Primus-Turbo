@@ -313,6 +313,13 @@ enum class MXFP6Prologue {
     // removes is the elementwise kernel that materialised gate * dy only to be packed.
     // Appended, like LnModulate: the mode is an integer on the Python side.
     GateMul,
+    // The optimizer step of the tensor being packed, for a weight packed right after its update: input is
+    // the bf16 parameter whose fp32 master is (input, int16 remainder) as Transformer Engine's FusedAdam
+    // stores it with store_param_remainders, and the prologue applies that optimizer's Adam / AdamW step
+    // (same arithmetic) to it, writes the parameter, remainder and moments back, and packs the updated
+    // parameter. Carried in MXFP6AdamArgs. Removes the separate optimizer pass over these elements and the
+    // packer's read of the parameter it just wrote. Requires M and N multiples of 256 (every tile whole).
+    AdamRemainder,
 };
 
 // Operands for MXFP6Prologue::QkNormRopeBackward.
@@ -376,6 +383,24 @@ template <typename DType> struct MXFP6LnModulateArgs {
 template <typename DType> struct MXFP6GateMulArgs {
     const DType *gate;
     int32_t      batch_mask;
+};
+
+// Operands for MXFP6Prologue::AdamRemainder, all [M, N] contiguous like the input (the parameter):
+//
+//   grad         the gradient, DType
+//   exp_avg, exp_avg_sq   the moments, fp32
+//   remainder    the master weight's low 16 bits, int16
+//   param        the input again, writable: the updated parameter is stored here
+//
+// The scalars are Transformer Engine's: step_size = lr / (1 - beta1^step), beta2_corr_inv =
+// 1 / (1 - beta2^step), adamw = decoupled weight decay (else L2).
+template <typename DType> struct MXFP6AdamArgs {
+    const DType *grad;
+    float       *exp_avg, *exp_avg_sq;
+    int16_t     *remainder;
+    DType       *param;
+    float        beta1, beta2, step_size, beta2_corr_inv, epsilon, lr, decay;
+    int32_t      adamw;
 };
 
 // M-rows per row of the bias-gradient partial buffer, i.e. the packer's M-tile height.
@@ -460,6 +485,12 @@ void quantize_mxfp6_qk_norm_rope_bwd_impl(const DType                      *inpu
 //     contraction axis, where a nonzero code corrupts the dot product rather than sitting
 //     harmlessly in the guard region.
 //   * B must be a power of two, for the index arithmetic described above.
+template <typename DType>
+void quantize_mxfp6_adam_impl(const MXFP6AdamArgs<DType> &args, uint8_t *row_packed,
+                              uint8_t *row_scale, uint8_t *col_packed, uint8_t *col_scale,
+                              const int M, const int N, const MXFP6Direction direction,
+                              hipStream_t stream, const MXPackFmt row_fmt, const MXPackFmt col_fmt);
+
 template <typename DType>
 void quantize_mxfp6_ln_modulate_impl(const DType *input, const MXFP6LnModulateArgs<DType> &args,
                                      uint8_t *row_packed, uint8_t *row_scale, uint8_t *col_packed,

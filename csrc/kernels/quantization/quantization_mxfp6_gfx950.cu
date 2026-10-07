@@ -156,8 +156,10 @@ using prologue_args_t = std::conditional_t<
     PROLOGUE == MXFP6Prologue::QkNormRopeBackward, MXFP6QkNormRopeArgs<DType>,
     std::conditional_t<
         PROLOGUE == MXFP6Prologue::LnModulate, MXFP6LnModulateArgs<DType>,
-        std::conditional_t<PROLOGUE == MXFP6Prologue::GateMul, MXFP6GateMulArgs<DType>,
-                           MXFP6NoPrologueArgs>>>;
+        std::conditional_t<
+            PROLOGUE == MXFP6Prologue::GateMul, MXFP6GateMulArgs<DType>,
+            std::conditional_t<PROLOGUE == MXFP6Prologue::AdamRemainder, MXFP6AdamArgs<DType>,
+                               MXFP6NoPrologueArgs>>>>;
 
 using packed_fp6x32_t = uint32_t __attribute__((ext_vector_type(6)));
 using uint4_t         = uint32_t __attribute__((ext_vector_type(4)));
@@ -476,6 +478,97 @@ __device__ __forceinline__ void apply_gate_mul(uint16_t (&staged)[kStageVec],
 #pragma unroll
     for (int i = 0; i < kStageVec; ++i)
         staged[i] = from_float<DType>(to_float<DType>(staged[i]) * to_float<DType>(gate_staged[i]));
+}
+
+// Transformer Engine's param-remainder Adam step (custom_adam_param_remainder_kernel, ROCm) on the
+// kStageVec parameters in `staged`, written verbatim so the update is bit-identical: the fp32 master is
+// (param bits, remainder), rebuilt with the remainder's rounding undone, stepped, and split again with
+// the bf16 half rounded to nearest. Writes the parameter, remainder and moments back and leaves the
+// updated parameter in `staged` for the pack.
+// One staged vector's optimizer operands, loaded ahead of the tile they belong to (see the async arm).
+struct AdamOps {
+    uint4  g, rem;
+    float4 m0, m1, v0, v1;
+};
+
+template <typename DType>
+__device__ __forceinline__ AdamOps load_adam_ops(const MXFP6AdamArgs<DType> &args, const int64_t off) {
+    AdamOps o;
+    o.g   = *reinterpret_cast<const uint4 *>(args.grad + off);
+    o.rem = *reinterpret_cast<const uint4 *>(args.remainder + off);
+    o.m0  = *reinterpret_cast<const float4 *>(args.exp_avg + off);
+    o.m1  = *reinterpret_cast<const float4 *>(args.exp_avg + off + 4);
+    o.v0  = *reinterpret_cast<const float4 *>(args.exp_avg_sq + off);
+    o.v1  = *reinterpret_cast<const float4 *>(args.exp_avg_sq + off + 4);
+    return o;
+}
+
+template <typename DType>
+__device__ __forceinline__ void apply_adam_remainder(uint16_t (&staged)[kStageVec],
+                                                     const MXFP6AdamArgs<DType> &args,
+                                                     const int64_t off, const AdamOps &ops) {
+#pragma clang fp contract(off)
+    static_assert(kStageVec == 8, "one 16-byte vector of each 16-bit operand");
+    uint16_t g16[kStageVec];
+    int16_t  rem[kStageVec];
+    float    m[kStageVec], v[kStageVec];
+    *reinterpret_cast<uint4 *>(g16)    = ops.g;
+    *reinterpret_cast<uint4 *>(rem)    = ops.rem;
+    *reinterpret_cast<float4 *>(m)     = ops.m0;
+    *reinterpret_cast<float4 *>(m + 4) = ops.m1;
+    *reinterpret_cast<float4 *>(v)     = ops.v0;
+    *reinterpret_cast<float4 *>(v + 4) = ops.v1;
+    union fp32_or_int162 {
+        float   fp32;
+        int16_t int16[2];
+    };
+#pragma unroll
+    for (int i = 0; i < kStageVec; ++i) {
+        int16_t p = static_cast<int16_t>(staged[i]);
+        if (rem[i] < 0)
+            p--; // undo rounding
+        fp32_or_int162 master;
+        master.int16[1] = p;
+        master.int16[0] = rem[i];
+        float       r_p = master.fp32;
+        float       r_g = to_float<DType>(g16[i]);
+        const float b1 = args.beta1, b2 = args.beta2;
+        // The operation sequence of Transformer Engine's compiled kernel (gfx950 disassembly): which products
+        // fuse into FMAs, correctly rounded sqrt and divide. Spelled out, with contraction off, so this
+        // compiler cannot choose another one.
+        if (!args.adamw)
+            r_g = __fmaf_rn(args.decay, r_p, r_g);
+        m[i] = __fmaf_rn(1 - b1, r_g, b1 * m[i]);
+        v[i] = __fmaf_rn((1 - b2) * r_g, r_g, b2 * v[i]);
+        // sqrtf, not __fsqrt_rn: on gfx950 the latter compiles to a bare v_sqrt_f32 (not correctly rounded),
+        // sqrtf to the corrected sequence TE has.
+        const float denom = sqrtf(v[i] * args.beta2_corr_inv) + args.epsilon;
+        const float q     = __fdiv_rn(m[i], denom);
+        r_p               = __fmaf_rn(-args.step_size, q, r_p);
+        if (args.adamw)
+            r_p = __fmaf_rn(-(args.lr * args.decay), master.fp32, r_p);
+        master.fp32 = r_p;
+        p           = master.int16[1];
+        rem[i]      = master.int16[0];
+        if (rem[i] < 0)
+            p++; // round up
+        staged[i] = static_cast<uint16_t>(p);
+    }
+    *reinterpret_cast<uint4 *>(args.param + off)     = *reinterpret_cast<const uint4 *>(staged);
+    *reinterpret_cast<uint4 *>(args.remainder + off) = *reinterpret_cast<const uint4 *>(rem);
+    *reinterpret_cast<float4 *>(args.exp_avg + off)        = *reinterpret_cast<const float4 *>(m);
+    *reinterpret_cast<float4 *>(args.exp_avg + off + 4)    = *reinterpret_cast<const float4 *>(m + 4);
+    *reinterpret_cast<float4 *>(args.exp_avg_sq + off)     = *reinterpret_cast<const float4 *>(v);
+    *reinterpret_cast<float4 *>(args.exp_avg_sq + off + 4) = *reinterpret_cast<const float4 *>(v + 4);
+}
+
+template <typename DType>
+__device__ __forceinline__ void apply_adam_remainder(uint16_t (&staged)[kStageVec],
+                                                     const MXFP6AdamArgs<DType> &args,
+                                                     const int32_t global_m, const int32_t global_n,
+                                                     const int32_t N) {
+    const int64_t off = static_cast<int64_t>(global_m) * N + global_n;
+    apply_adam_remainder<DType>(staged, args, off, load_adam_ops<DType>(args, off));
 }
 
 // The gate prologue over a whole bf16 tile already in LDS, for the async-staged arm. The
@@ -929,6 +1022,9 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                     } else if constexpr (PROLOGUE == MXFP6Prologue::GateMul) {
                         apply_gate_mul<DType>(staged, pargs, tile_m + local_m, tile_n + local_n,
                                               N);
+                    } else if constexpr (PROLOGUE == MXFP6Prologue::AdamRemainder) {
+                        apply_adam_remainder<DType>(staged, pargs, tile_m + local_m,
+                                                    tile_n + local_n, N);
                     } else {
                         if (bias != nullptr)
                             stage_vector(bias_staged, reinterpret_cast<const uint16_t *>(bias), 0,
@@ -1074,6 +1170,18 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                     }
                 }
             }
+            // The optimizer step's operands for every vector this thread will stage, issued now so they are in
+            // flight together with the tile (one memory latency per block, not one per vector after the tile).
+            constexpr int kAdamIters = TILE_M * TILE_N / (THREADS_PER_BLOCK * kStageVec);
+            AdamOps adam_ops[PROLOGUE == MXFP6Prologue::AdamRemainder ? kAdamIters : 1];
+            if constexpr (PROLOGUE == MXFP6Prologue::AdamRemainder) {
+#pragma unroll
+                for (int it = 0; it < kAdamIters; ++it) {
+                    const int base = (threadIdx.x + it * THREADS_PER_BLOCK) * kStageVec;
+                    adam_ops[it]   = load_adam_ops<DType>(
+                        pargs, static_cast<int64_t>(tile_m + base / TILE_N) * N + tile_n + base % TILE_N);
+                }
+            }
             asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
             __syncthreads();
 
@@ -1110,6 +1218,11 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                     } else if constexpr (PROLOGUE == MXFP6Prologue::GateMul) {
                         apply_gate_mul<DType>(staged, pargs, tile_m + local_m, tile_n + local_n,
                                               N);
+                    } else if constexpr (PROLOGUE == MXFP6Prologue::AdamRemainder) {
+                        const int it = (base - static_cast<int>(threadIdx.x) * VEC) / (THREADS_PER_BLOCK * VEC);
+                        apply_adam_remainder<DType>(
+                            staged, pargs,
+                            static_cast<int64_t>(tile_m + local_m) * N + tile_n + local_n, adam_ops[it]);
                     } else {
                         if (bias != nullptr)
                             stage_vector(bias_staged, reinterpret_cast<const uint16_t *>(bias), 0,
@@ -1276,6 +1389,9 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                     } else if constexpr (PROLOGUE == MXFP6Prologue::GateMul) {
                         // Zero in, zero out, so padded columns need no guard.
                         apply_gate_mul<DType>(staged, pargs, global_m, global_n, N);
+                    } else if constexpr (PROLOGUE == MXFP6Prologue::AdamRemainder) {
+                        // The entry point requires whole tiles, so every column here is real.
+                        apply_adam_remainder<DType>(staged, pargs, global_m, global_n, N);
                     } else if constexpr (PROLOGUE != MXFP6Prologue::Identity) {
                         // Every operand the prologue reads comes in through stage_vector,
                         // which zero-fills past N. That is what lets the epilogue run
@@ -1798,6 +1914,9 @@ void quantize_mxfp6_fused_impl(const DType *input, const DType *aux, const DType
     case MXFP6Prologue::GateMul:
         PRIMUS_TURBO_CHECK(false, "GateMul has its own entry point, not the fused packer");
         break;
+    case MXFP6Prologue::AdamRemainder:
+        PRIMUS_TURBO_CHECK(false, "AdamRemainder has its own entry point, not the fused packer");
+        break;
     }
     PRIMUS_TURBO_CHECK_HIP(hipGetLastError());
 }
@@ -1869,6 +1988,46 @@ void quantize_mxfp6_ln_modulate_impl(const DType *input, const MXFP6LnModulateAr
         col_sum, M, N, row_nk_pad, col_nk_pad, args, row_fmt, col_fmt);
     PRIMUS_TURBO_CHECK_HIP(hipGetLastError());
 }
+
+template <typename DType>
+void quantize_mxfp6_adam_impl(const MXFP6AdamArgs<DType> &args, uint8_t *row_packed,
+                              uint8_t *row_scale, uint8_t *col_packed, uint8_t *col_scale,
+                              const int M, const int N, const MXFP6Direction direction,
+                              hipStream_t stream, const MXPackFmt row_fmt, const MXPackFmt col_fmt) {
+    // Every element must be stepped exactly once, so no padded tile may exist.
+    PRIMUS_TURBO_CHECK(M % kTileRows == 0 && N % kTileRows == 0,
+                       "the Adam prologue needs M and N to be multiples of 256");
+    constexpr int kAdamTileN = 128;
+    const auto [row_nk_pad, col_nk_pad, grid, block] = geometry_for<kAdamTileN>(M, N);
+    constexpr auto P = MXFP6Prologue::AdamRemainder;
+    const DType   *in = args.param;
+    switch (direction) {
+    case MXFP6Direction::Row:
+        launch_dual<DType, true, false, P, kAdamTileN>(grid, block, stream, in, nullptr, nullptr,
+                                                       row_packed, row_scale, col_packed, col_scale,
+                                                       nullptr, M, N, row_nk_pad, col_nk_pad, args,
+                                                       row_fmt, col_fmt);
+        break;
+    case MXFP6Direction::Col:
+        launch_dual<DType, false, true, P, kAdamTileN>(grid, block, stream, in, nullptr, nullptr,
+                                                       row_packed, row_scale, col_packed, col_scale,
+                                                       nullptr, M, N, row_nk_pad, col_nk_pad, args,
+                                                       row_fmt, col_fmt);
+        break;
+    case MXFP6Direction::Dual:
+        launch_dual<DType, true, true, P, kAdamTileN>(grid, block, stream, in, nullptr, nullptr,
+                                                      row_packed, row_scale, col_packed, col_scale,
+                                                      nullptr, M, N, row_nk_pad, col_nk_pad, args,
+                                                      row_fmt, col_fmt);
+        break;
+    }
+    PRIMUS_TURBO_CHECK_HIP(hipGetLastError());
+}
+
+template void quantize_mxfp6_adam_impl<bfloat16>(const MXFP6AdamArgs<bfloat16> &, uint8_t *,
+                                                 uint8_t *, uint8_t *, uint8_t *, const int,
+                                                 const int, const MXFP6Direction, hipStream_t,
+                                                 MXPackFmt, MXPackFmt);
 
 template <typename DType>
 void quantize_mxfp6_gate_mul_impl(const DType *input, const MXFP6GateMulArgs<DType> &args,

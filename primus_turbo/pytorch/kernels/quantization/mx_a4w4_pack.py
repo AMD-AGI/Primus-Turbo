@@ -271,6 +271,21 @@ def quantize_mx_dual_out(
     )
 
 
+def quantize_mx_dual_out_adam(
+    param, grad, exp_avg, exp_avg_sq, remainder, row_packed, row_scale, col_packed, col_scale, fmt: int, *,
+    lr: float, beta1: float, beta2: float, eps: float, weight_decay: float, step: int, adamw: bool = True,
+    bias_correction: bool = True, row_c1=None, draws=1, draw_codes=0, draw_scales=0,
+) -> None:
+    """``quantize_mx_dual_out`` of a bf16 parameter fused with its optimizer step: Transformer Engine's FusedAdam
+    with ``store_param_remainders`` (fp32 master = ``param`` bits + int16 ``remainder``, fp32 moments), the same
+    arithmetic, applied in place to ``param`` / ``remainder`` / ``exp_avg`` / ``exp_avg_sq``; the updated
+    parameter is what gets packed. All operands contiguous, ``param``'s size; rows and columns multiples of 256."""
+    _ops().quantize_mx_dual_out_adam(
+        param, grad, exp_avg, exp_avg_sq, remainder, row_packed, row_scale, col_packed, col_scale, fmt, row_c1,
+        draws, draw_codes, draw_scales, lr, beta1, beta2, eps, weight_decay, step, adamw, bias_correction
+    )
+
+
 def quantize_mx_fused_dual_out(
     x, aux, bias, mode: int, row_packed, row_scale, col_packed, col_scale, col_sum, fmt: int
 ) -> None:

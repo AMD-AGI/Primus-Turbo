@@ -700,7 +700,8 @@ std::vector<at::Tensor> quantize_mxfp6_dual(const at::Tensor input) {
 static void dual_out_fmt(const at::Tensor input, at::Tensor row_packed, at::Tensor row_scale,
                          at::Tensor col_packed, at::Tensor col_scale, const int64_t fmt,
                          const c10::optional<at::Tensor> row_c1 = c10::nullopt, const int64_t draws = 1,
-                         const int64_t draw_codes = 0, const int64_t draw_scales = 0) {
+                         const int64_t draw_codes = 0, const int64_t draw_scales = 0,
+                         const MXFP6AdamArgs<dtype::bfloat16> *adam = nullptr) {
     check_input(input);
     const c10::DeviceGuard device_guard(input.device());
     const int64_t          M = input.size(0);
@@ -755,7 +756,12 @@ static void dual_out_fmt(const at::Tensor input, at::Tensor row_packed, at::Tens
                 "quantize_mxfp6_dual_out: output buffers must be uint8");
 
     auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
-    if (input.scalar_type() == at::kBFloat16)
+    if (adam != nullptr)
+        quantize_mxfp6_adam_impl<dtype::bfloat16>(
+            *adam, row_packed.data_ptr<uint8_t>(), row_scale.data_ptr<uint8_t>(),
+            col_packed.data_ptr<uint8_t>(), col_scale.data_ptr<uint8_t>(), static_cast<int>(M),
+            static_cast<int>(N), dir, stream, row_fmt, col_fmt);
+    else if (input.scalar_type() == at::kBFloat16)
         quantize_mxfp6_impl<dtype::bfloat16>(
             reinterpret_cast<const dtype::bfloat16 *>(input.data_ptr()),
             row_packed.data_ptr<uint8_t>(), row_scale.data_ptr<uint8_t>(),
@@ -786,6 +792,60 @@ void quantize_mx_dual_out(const at::Tensor input, at::Tensor row_packed, at::Ten
 void quantize_mx_dual_out_meta(const at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                                const int64_t, const c10::optional<at::Tensor>, const int64_t,
                                const int64_t, const int64_t) {}
+
+// quantize_mx_dual_out of a bf16 parameter right after (and fused with) its optimizer step: Transformer
+// Engine's FusedAdam with store_param_remainders (master = parameter bits + int16 remainder, fp32 moments),
+// the same arithmetic, on `param` in place (MXFP6Prologue::AdamRemainder). The host scalars are computed
+// exactly as that optimizer computes them.
+void quantize_mx_dual_out_adam(at::Tensor param, const at::Tensor grad, at::Tensor exp_avg,
+                               at::Tensor exp_avg_sq, at::Tensor remainder, at::Tensor row_packed,
+                               at::Tensor row_scale, at::Tensor col_packed, at::Tensor col_scale,
+                               const int64_t fmt, const c10::optional<at::Tensor> row_c1,
+                               const int64_t draws, const int64_t draw_codes, const int64_t draw_scales,
+                               const double lr, const double beta1, const double beta2,
+                               const double eps, const double weight_decay, const int64_t step,
+                               const bool adamw, const bool bias_correction) {
+    check_input(param);
+    TORCH_CHECK(param.scalar_type() == at::kBFloat16 && grad.scalar_type() == at::kBFloat16 &&
+                    exp_avg.scalar_type() == at::kFloat && exp_avg_sq.scalar_type() == at::kFloat &&
+                    remainder.scalar_type() == at::kShort,
+                "quantize_mx_dual_out_adam: bf16 param / grad, fp32 moments, int16 remainder");
+    for (const at::Tensor *t : std::initializer_list<const at::Tensor *>{&grad, &exp_avg, &exp_avg_sq, &remainder})
+        TORCH_CHECK(t->is_contiguous() && t->numel() == param.numel() && t->device() == param.device(),
+                    "quantize_mx_dual_out_adam: operands must be contiguous and the parameter's size");
+    TORCH_CHECK(param.is_contiguous(), "quantize_mx_dual_out_adam: param must be contiguous");
+    // Transformer Engine's host side (multi_tensor_adam_param_remainder_cuda_custom), in its types.
+    const float f_lr = static_cast<float>(lr), f_b1 = static_cast<float>(beta1),
+                f_b2 = static_cast<float>(beta2);
+    float bias_correction1 = 1.0f, bias_correction2 = 1.0f;
+    if (bias_correction) {
+        bias_correction1 = 1 - std::pow(f_b1, static_cast<int>(step));
+        bias_correction2 = 1 - std::pow(f_b2, static_cast<int>(step));
+    }
+    MXFP6AdamArgs<dtype::bfloat16> args{};
+    args.grad           = reinterpret_cast<const dtype::bfloat16 *>(grad.data_ptr());
+    args.exp_avg        = exp_avg.data_ptr<float>();
+    args.exp_avg_sq     = exp_avg_sq.data_ptr<float>();
+    args.remainder      = reinterpret_cast<int16_t *>(remainder.data_ptr());
+    args.param          = reinterpret_cast<dtype::bfloat16 *>(param.data_ptr());
+    args.beta1          = f_b1;
+    args.beta2          = f_b2;
+    args.step_size      = f_lr / bias_correction1;
+    args.beta2_corr_inv = 1.0f / bias_correction2;
+    args.epsilon        = static_cast<float>(eps);
+    args.lr             = f_lr;
+    args.decay          = static_cast<float>(weight_decay);
+    args.adamw          = adamw ? 1 : 0;
+    dual_out_fmt(param, row_packed, row_scale, col_packed, col_scale, fmt, row_c1, draws, draw_codes,
+                 draw_scales, &args);
+}
+
+void quantize_mx_dual_out_adam_meta(at::Tensor, const at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+                                    at::Tensor, at::Tensor, at::Tensor, at::Tensor, const int64_t,
+                                    const c10::optional<at::Tensor>, const int64_t, const int64_t,
+                                    const int64_t, const double, const double, const double,
+                                    const double, const double, const int64_t, const bool,
+                                    const bool) {}
 
 void quantize_mxfp6_dual_out_meta(const at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                                   at::Tensor) {}
