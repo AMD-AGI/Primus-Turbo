@@ -927,3 +927,43 @@ def test_a6w6_flydsl_backend_matches_aiter(m, n, k, has_bias):
         assert torch.equal(buf, ref)
     finally:
         GI.set_a6w6_backend(prev)
+
+
+@pytest.mark.parametrize("m", [16384, 8192])
+def test_aiter_fly_softmax_d_epilogue(m):
+    """gemm_a4w4_ts_softmax_d_out, the a4w4=4 out-GEMM with the softmax_d epilogue (an attention out-projection's dgrad: n = k = 3072, sbhd rows of
+    B 32, S 512): out bitwise equal to the plain call; softmax_d [B, n/128, S] the per-row, per-head fp32 sum of
+    out * O within fp32 summation error of fp64. 8192 rows cover the sequence in two calls (a joint block's text
+    and image rows) adding into one softmax_d."""
+    _skip()
+    pytest.importorskip("aiter.ops.gemm_op_tilescale")
+    from primus_turbo.pytorch.core.low_precision import ScalingGranularity
+    from primus_turbo.pytorch.kernels.gemm.gemm_fp6_impl import (
+        a4w4_softmax_d_ok,
+        a4w4_softmax_d_table,
+        gemm_a4w4_ts_softmax_d_out,
+        gemm_fp6_out_impl,
+    )
+    from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import TS_A, ts_b_params, ts_fmt
+
+    n = k = 3072
+    B, S = 32, 512
+    if not a4w4_softmax_d_ok(a4w4_softmax_d_table(), m, n, k, B, S):
+        pytest.skip("no softmax_d kernel in this aiter")
+    gran = ScalingGranularity.MX_BLOCKWISE.value
+    o = _rand(S * B, n, seed=90)
+    d = torch.zeros(B, n // 128, S, device="cuda", dtype=torch.float32)
+    outs = []
+    for i in range(S * B // m):
+        dy, w = _rand(m, k, seed=91 + i), _rand(k, n, seed=93 + i)
+        fa, fas, _, _ = quantize_mx_dual(dy, ts_fmt(row=TS_A, col=TS_A))
+        _, _, fb, fbs = quantize_mx_dual(w, ts_fmt(col=ts_b_params(m, n, k)))
+        ref = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+        gemm_fp6_out_impl(fa, fas, fb, fbs, ref, m, n, k, gran, a4w4=4)
+        out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+        gemm_a4w4_ts_softmax_d_out(fa, fas, fb, fbs, out, m, n, k, o[i * m : (i + 1) * m], d, i * m // B)
+        assert torch.equal(out, ref)
+        outs.append(out)
+    prod = (torch.cat(outs).double() * o.double()).view(S, B, n // 128, 128)
+    err = (d.double() - prod.sum(-1).permute(1, 2, 0)).abs() / prod.abs().sum(-1).permute(1, 2, 0)
+    assert err.max().item() < 1e-5

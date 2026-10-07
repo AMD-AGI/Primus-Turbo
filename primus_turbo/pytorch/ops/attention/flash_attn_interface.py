@@ -66,7 +66,7 @@ __all__ = ["flash_attn_func", "flash_attn_fp8_func", "flash_attn_varlen_func"]
 
 def _flash_attn_grads(dq, dk, dv, dbias, dsink):
     """One gradient per FlashAttnFunc.forward argument; only these five ever take one."""
-    return (dq, dk, dv) + (None,) * 4 + (dbias,) + (None,) * 6 + (dsink, None, None)
+    return (dq, dk, dv) + (None,) * 4 + (dbias,) + (None,) * 6 + (dsink, None, None, None)
 
 
 def _flash_attn_varlen_grads(dq, dk, dv, dsink):
@@ -106,8 +106,12 @@ class FlashAttnFunc(torch.autograd.Function):
         sink: Optional[torch.Tensor] = None,
         qkv_format: Optional[str] = "bshd",
         backend: BackendType = BackendType.AITER,
+        softmax_d_slot: bool = False,
     ):
         ctx.backend = backend
+        ctx.softmax_d_slot = softmax_d_slot
+        if softmax_d_slot and backend != BackendType.AITER:
+            raise ValueError("softmax_d_slot is implemented for the aiter backend only")
         if backend == BackendType.TRITON:
             # The dispatcher only picks this backend when DenseAttnFwdTritonBackend.can_handle
             # said yes, but FlashAttnFunc.apply is reachable directly, and these arguments have
@@ -261,6 +265,12 @@ class FlashAttnFunc(torch.autograd.Function):
             result.append(softmax_lse)
         if return_softmax:
             result.append(S_dmask)
+        if softmax_d_slot:
+            # A placeholder whose gradient, if the consumer of `out` supplies one, is softmax_d = rowsum(dO * O)
+            # [b, h, s] fp32 already computed (e.g. by the GEMM producing dO); the backward then uses it instead of
+            # computing it. Without one, the gradient arrives as None (grads are not materialised).
+            ctx.set_materialize_grads(False)
+            result.append(torch.empty((q.size(0), q.size(2), q.size(1)), dtype=torch.float32, device=q.device))
 
         return result[0] if len(result) == 1 else tuple(result)
 
@@ -331,6 +341,9 @@ class FlashAttnFunc(torch.autograd.Function):
 
         q, k, v, out_padded, softmax_lse, rng_state = ctx.saved_tensors
         qkv_format = ctx.qkv_format
+        softmax_d = args[-1] if ctx.softmax_d_slot else None
+        if dout is None:  # softmax_d_slot turns off grad materialisation
+            dout = torch.zeros_like(out_padded[..., :head_size_v_og])
 
         dout_padded = dout
         if head_size_v_og % 8 != 0:
@@ -401,6 +414,7 @@ class FlashAttnFunc(torch.autograd.Function):
             dsink=dsink,
             sink=ctx.sink,
             qkv_format=qkv_format,
+            softmax_d=softmax_d,
         )
 
         dq = dq[..., :head_size_q_og]
@@ -527,10 +541,15 @@ def flash_attn_func(
     return_lse=False,
     return_attn_probs=False,
     sink: Optional[torch.Tensor] = None,
+    return_softmax_d_slot: bool = False,
 ):
     """q/k/v are ``[b, s, h, d]``-shaped; an sbhd caller passes a permuted view and permutes
     the result back. aiter reads the memory layout to allocate outputs and grads matching it;
     FlyDSL is sbhd-native and takes that layout only.
+
+    ``return_softmax_d_slot`` (aiter backend): also return a [b, h, s] fp32 placeholder, last. A consumer of the
+    output that computes softmax_d = rowsum(dO * O) while producing dO (e.g. in its dgrad GEMM) returns it as this
+    placeholder's gradient, and the attention backward skips computing it; with no gradient it computes it as usual.
     """
     qkv_format = _infer_qkv_format(q, k, v)
     is_grad_enabled = torch.is_grad_enabled()
@@ -572,6 +591,7 @@ def flash_attn_func(
         sink,
         qkv_format,
         backend,
+        return_softmax_d_slot,
     )
 
 

@@ -224,6 +224,7 @@ class AttnBwdAiterBackend(KernelBackend):
         sink: Optional[torch.Tensor] = None,
         dsink: Optional[torch.Tensor] = None,
         qkv_format: Optional[str] = "bshd",
+        softmax_d: Optional[torch.Tensor] = None,
     ) -> bool:
         if sink is not None:
             head_dim_qk = q.size(-1)
@@ -261,6 +262,7 @@ class AttnBwdAiterBackend(KernelBackend):
         sink: Optional[torch.Tensor] = None,
         dsink: Optional[torch.Tensor] = None,
         qkv_format: Optional[str] = "bshd",
+        softmax_d: Optional[torch.Tensor] = None,
     ):
         if sink is None:
             result = _get_aiter_attn_kernels()["flash_attn_backward"](
@@ -285,6 +287,7 @@ class AttnBwdAiterBackend(KernelBackend):
                 rng_state,
                 is_v3_atomic_fp32,
                 how_v3_bf16_cvt,
+                **({} if softmax_d is None else {"softmax_d": softmax_d}),
             )
         else:
             assert (
@@ -447,6 +450,7 @@ def attention_aiter_backward_impl(
     dsink: Optional[torch.Tensor] = None,
     sink: Optional[torch.Tensor] = None,
     qkv_format: Optional[str] = "bshd",
+    softmax_d: Optional[torch.Tensor] = None,
 ) -> None:
     kwargs = {
         "dout": dout,
@@ -473,6 +477,9 @@ def attention_aiter_backward_impl(
         "dsink": dsink,
         "sink": sink,
         "qkv_format": qkv_format,
+        # softmax_d = rowsum(dO * O), fp32 [b, h, s], when a producer of dO already computed it (the v3 path then
+        # skips its own kernel for it)
+        "softmax_d": softmax_d,
     }
 
     # TODO(ruibin): Add unified attention kernel dispatcher
@@ -511,6 +518,7 @@ def _attention_aiter_backward_impl_fake(
     dsink: Optional[torch.Tensor] = None,
     sink: Optional[torch.Tensor] = None,
     qkv_format: Optional[str] = "bshd",
+    softmax_d: Optional[torch.Tensor] = None,
 ) -> None:
     return None
 

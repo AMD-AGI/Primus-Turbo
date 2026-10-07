@@ -586,6 +586,56 @@ def gemm_fp6_out_impl_meta(
     return None
 
 
+@_torch_custom_op_wrapper(
+    "primus_turbo::gemm_a4w4_ts_softmax_d_out", mutates_args=("out", "softmax_d"), device_types="cuda"
+)
+def gemm_a4w4_ts_softmax_d_out(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    out: torch.Tensor,
+    m: int,
+    n: int,
+    k: int,
+    o: torch.Tensor,
+    softmax_d: torch.Tensor,
+    s0: int,
+) -> None:
+    """``gemm_fp6_out_impl(..., a4w4=4)`` that also emits an attention's softmax_d (``a4w4_softmax_d_ok``).
+
+    ``out`` is the attention output's gradient dO in sbhd rows (row = s * B + b) and ``o`` that attention's output O,
+    same layout; the GEMM also adds, per row and 128-column head, the fp32 sum of out * O into ``softmax_d``
+    [B, n/128, S] (zeroed by the caller) from sequence position ``s0`` on -- the rowsum(dO * O) the attention backward
+    would otherwise compute. ``out`` is bit-identical to the plain call."""
+    _a4w4_ts(a, a_scale, b, b_scale, m, n, k, out.dtype, None, out=out, epi=(o, softmax_d, s0))
+
+
+@gemm_a4w4_ts_softmax_d_out.register_fake
+def _gemm_a4w4_ts_softmax_d_out_meta(a, a_scale, b, b_scale, out, m, n, k, o, softmax_d, s0) -> None:
+    return None
+
+
+def a4w4_softmax_d_table() -> frozenset:
+    """The shapes ``gemm_a4w4_ts_softmax_d_out`` has kernels for, as plain data for callers that decide inside
+    compiled regions (read it once, outside them): {(kouter, M, N, K, batch, seq)}; see ``a4w4_softmax_d_ok``."""
+    try:
+        from aiter.ops.gemm_op_tilescale import _rows, a4w4_b_ilv
+    except ImportError:
+        return frozenset()
+    return frozenset(
+        (r[2] == 2, *r[5:10])
+        for r in _rows()
+        if len(r) > 8 and r[8] and r[:2] == (4, 4) and r[2] in (0, 2) and r[3] == a4w4_b_ilv(*r[5:8])
+    )
+
+
+def a4w4_softmax_d_ok(table, m: int, n: int, k: int, batch: int, seq: int, kouter: bool = False) -> bool:
+    """Whether ``table`` (``a4w4_softmax_d_table``) has a kernel for ``m x n x k`` emitting softmax_d
+    [batch, n/128, seq]; plain arithmetic, safe to trace."""
+    return (kouter, m, n, k, batch, seq) in table
+
+
 def _a4w4_aiter_blob(a, a_scale, b, b_scale, m, n, k, out_dtype, bias):
     """A4W4 on aiter's tile-blob kernel (``a4w4=5``, ``gemm_a4w4_blob_asm``, its default ``stnt_allk``): both operands
     as the packers write MX_FMT_BLOB_* rows (C0 tile blob, +2 guard K tiles). M / N are padded to the 256 tile."""
@@ -611,7 +661,8 @@ def tilescale_table(a_fmt: int, b_fmt: int, b_codes: int = 0, b_ilv: int = 0):
     except ImportError:
         return frozenset(), {}
     key = (a_fmt, b_fmt, b_codes, b_ilv)
-    exact = frozenset((r[5], r[6], r[7], bool(r[4])) for r in _rows() if r[:4] == key and r[5])
+    # (rows with an epilogue, r[8:] nonzero, are not the plain GEMM)
+    exact = frozenset((r[5], r[6], r[7], bool(r[4])) for r in _rows() if r[:4] == key and r[5] and not any(r[8:]))
     generic = {(bool(k[4]), k[5]): v for k, v in _generic().items() if k[:4] == key}
     return exact, generic
 
@@ -631,12 +682,13 @@ def tilescale_table_has(table, m: int, n: int, k: int, has_bias: bool) -> bool:
 
 
 def _tilescale_rows() -> frozenset:
-    """aiter's tilescale GEMM manifest as (a_fmt, b_fmt, b_codes, b_ilv, bias, M, N, K) tuples (empty without it)."""
+    """aiter's plain tilescale GEMM rows as (a_fmt, b_fmt, b_codes, b_ilv, bias, M, N, K, ...) tuples (empty without
+    it); rows with an epilogue (nonzero past K) are left out."""
     try:
         from aiter.ops.gemm_op_tilescale import _rows
     except ImportError:
         return frozenset()
-    return _rows()
+    return frozenset(r for r in _rows() if not any(r[8:]))
 
 
 # A6W6 backend: "aiter" (the tuned asm table) or "flydsl" (Turbo's FlyDSL MXFP6 GEMM compiled at runtime,
@@ -764,7 +816,7 @@ def _a4w4_table(ilv, b_codes=0):
     return tilescale_table(4, 4, b_codes, ilv)
 
 
-def _a4w4_ts(a, a_scale, b, b_scale, m, n, k, out_dtype, bias, out=None):
+def _a4w4_ts(a, a_scale, b, b_scale, m, n, k, out_dtype, bias, out=None, epi=(None, None, 0)):
     """A4W4 on the assembly ports of FlyDSL's 256-wide MXFP4 GEMM (``a4w4=4``, aiter ``gemm_a4w4_fly_asm``).
 
     Operands exactly as ``a4w4=3``: the packers wrote plain MXFP4 rows and the scales in the packed per-tile layout
@@ -790,7 +842,7 @@ def _a4w4_ts(a, a_scale, b, b_scale, m, n, k, out_dtype, bias, out=None):
         B, Bs = ts_operand(b, b_scale, n, k)
     if out is None:
         out = torch.empty(m, n, dtype=torch.bfloat16, device=A.device)
-    gemm_a4w4_tilescale(A, B, As, Bs, out, k, ilv, b_codes)
+    gemm_a4w4_tilescale(A, B, As, Bs, out, k, ilv, b_codes, *epi)
     return out if bias is None else out + bias
 
 
