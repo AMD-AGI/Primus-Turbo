@@ -1,8 +1,8 @@
 ###############################################################################
 # SPDX-License-Identifier: Apache-2.0
 #
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026 FlyDSL Project Contributors
 #
 # Adapted from FlyDSL (https://github.com/ROCm/FlyDSL)
 # Modified by the Primus-Turbo team.
@@ -15,10 +15,10 @@
 
 from primus_turbo.common.flux import enabled
 
-if enabled("FLUX_ATTN_FLYDSL"):
-    from . import attn_helper_flux as _implementation
+if enabled("FLUX_A6W4_GEMM_V0"):
+    from . import gemm_a6w4_kernel_v0 as _implementation
 else:
-    from . import attn_helper_stock as _implementation
+    from . import gemm_a6w4_kernel_tuned as _implementation
 
 __all__ = [name for name in dir(_implementation) if not name.startswith("_")]
 
