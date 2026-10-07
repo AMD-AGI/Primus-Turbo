@@ -11,12 +11,16 @@
 
 namespace primus_turbo {
 
+// `workspace` for permute_preprocessing_impl: at least this many bytes on the current device,
+// any contents, alive until the launch on `stream` completes.
+size_t permute_preprocessing_workspace_bytes(int num_local_experts, int max_num_dispatched_tokens);
+
 template <typename expert_map_t>
 void permute_preprocessing_impl(const expert_map_t *expert_map, int num_topk,
                                 int *num_dispatched_tokens_out, int num_local_experts,
                                 int max_num_dispatched_tokens, int pad_multiple,
                                 int64_t *tokens_per_expert, int *row_id_map, int *overflow_flag,
-                                int64_t num_permuted_tokens, int probs_topk_stride,
+                                int64_t num_permuted_tokens, int probs_topk_stride, void *workspace,
                                 hipStream_t stream);
 
 template <typename dtype_t, typename prob_t, typename scalar_t>
