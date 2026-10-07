@@ -724,8 +724,9 @@ static void dual_out_fmt(const at::Tensor input, at::Tensor row_packed, at::Tens
     if (draws != 1) {
         // Draw d of the column pack lands at d * draw_codes / d * draw_scales bytes past the given buffers, inside
         // the same allocations.
-        TORCH_CHECK(draws > 1 && col_fmt != MXPackFmt::Fp6 && col_fmt != MXPackFmt::Fp6Tile,
-                    "quantize_mx_dual_out: draws > 1 is for an FP4 column direction");
+        TORCH_CHECK(draws > 1 && (col_fmt == MXPackFmt::Fp4TileSr || col_fmt == MXPackFmt::Fp4PlainSr ||
+                                  col_fmt == MXPackFmt::Fp4ASr || col_fmt == MXPackFmt::Fp4BlobSr),
+                    "quantize_mx_dual_out: draws > 1 is for a stochastically rounded FP4 column direction");
         const auto room = [](const at::Tensor &t, int64_t span) {
             return (t.storage_offset() + span) * t.element_size() <= int64_t(t.storage().nbytes());
         };

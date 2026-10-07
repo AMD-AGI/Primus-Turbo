@@ -337,118 +337,133 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
     // induction variable there even under `#pragma unroll`, because the constraint is
     // checked in the frontend before unrolling. Hence the explicit four, matching the
     // reference packer's `static_for` over the same range.
-    uint4_t words = {0u, 0u, 0u, 0u};
-#if defined(__gfx950__) && !MXFP4_ABLATE_CVT
-    if (SR && amax != 0.0f) {
-        // The SR conversion does not preserve the accumulator's other bytes the way the RTN
-        // one does (probed on gfx950: with sel=1 byte 0 is cleared and the upper half holds
-        // stale register contents), so each pair converts into byte 0 of a fresh register and
-        // is shifted into place. The instruction takes its random bits from the top of the seed
-        // (bit 31 decides the first value of a pair, bit 30 the second), hence a fresh
-        // well-mixed word per pair.
-        uint32_t rng = sr_mix(sr_seed ^ sr_mix(static_cast<uint32_t>(out_row) * 0x9e3779b1u ^
-                                               static_cast<uint32_t>(group)));
-#pragma unroll
-        for (int w = 0; w < 4; ++w) {
-            uint32_t b[4];
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                // Weyl step: one add per pair. Marginally uniform from the hashed base, which
-                // is all unbiased rounding needs; a xorshift per pair costs noticeably more packer
-                // time.
-                rng += 0x9e3779b9u;
-                // Inline asm, not the builtin: the compiler folds builtin + mask + shift back
-                // into the byte-select form (old = word, sel = j), which this instruction
-                // does not honour -- measured, only every fourth byte survived. Not volatile:
-                // it is pure, and the scheduler should interleave it.
-                const uint32_t src = __builtin_bit_cast(uint32_t, pairs[4 * w + j]);
-                asm("v_cvt_scalef32_sr_pk_fp4_bf16 %0, %1, %2, %3"
-                    : "=v"(b[j])
-                    : "v"(src), "v"(rng), "v"(conversion_scale));
+    // Everything above is independent of the rounding draw. With fly.draws > 1 (SR, a column copy for several
+    // receivers) only the conversion and the store repeat, draw d at d * draw_codes / d * draw_scales bytes and
+    // seeded from (sr_seed, d) -- draw 0 is the single-draw emit exactly.
+    const int32_t ndraws = SR ? fly.draws : 1;
+    for (int32_t d = 0; d < ndraws; ++d) {
+        const uint32_t seed_d = d == 0 ? sr_seed : sr_mix(sr_seed + 0x9e3779b9u * static_cast<uint32_t>(d));
+        uint8_t *__restrict__ pk = packed + d * fly.draw_codes;
+        uint8_t *__restrict__ ps = packed_scale + d * fly.draw_scales;
+        // The scales do not depend on the draw: with draw_scales == 0 the draws share one scale plane, stored once.
+        const bool store_scale = d == 0 || fly.draw_scales != 0;
+        uint4_t words = {0u, 0u, 0u, 0u};
+    #if defined(__gfx950__) && !MXFP4_ABLATE_CVT
+        if (SR && amax != 0.0f) {
+            // The SR conversion does not preserve the accumulator's other bytes the way the RTN
+            // one does (probed on gfx950: with sel=1 byte 0 is cleared and the upper half holds
+            // stale register contents), so each pair converts into byte 0 of a fresh register and
+            // is shifted into place. The instruction takes its random bits from the top of the seed
+            // (bit 31 decides the first value of a pair, bit 30 the second), hence a fresh
+            // well-mixed word per pair.
+            uint32_t rng = sr_mix(seed_d ^ sr_mix(static_cast<uint32_t>(out_row) * 0x9e3779b1u ^
+                                                   static_cast<uint32_t>(group)));
+    #pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                uint32_t b[4];
+    #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    // Weyl step: one add per pair. Marginally uniform from the hashed base, which
+                    // is all unbiased rounding needs; a xorshift per pair costs noticeably more packer
+                    // time.
+                    rng += 0x9e3779b9u;
+                    // Inline asm, not the builtin: the compiler folds builtin + mask + shift back
+                    // into the byte-select form (old = word, sel = j), which this instruction
+                    // does not honour -- measured, only every fourth byte survived. Not volatile:
+                    // it is pure, and the scheduler should interleave it.
+                    const uint32_t src = __builtin_bit_cast(uint32_t, pairs[4 * w + j]);
+                    asm("v_cvt_scalef32_sr_pk_fp4_bf16 %0, %1, %2, %3"
+                        : "=v"(b[j])
+                        : "v"(src), "v"(rng), "v"(conversion_scale));
+                }
+                // Byte 0 of each result, assembled with three v_perm_b32 (selector bytes 0-3 pick
+                // from the second operand, 4-7 from the first, 0x0c is zero).
+                const uint32_t lo = __builtin_amdgcn_perm(b[1], b[0], 0x0c0c0400u);
+                const uint32_t hi = __builtin_amdgcn_perm(b[3], b[2], 0x0c0c0400u);
+                words[w]          = __builtin_amdgcn_perm(hi, lo, 0x05040100u);
             }
-            // Byte 0 of each result, assembled with three v_perm_b32 (selector bytes 0-3 pick
-            // from the second operand, 4-7 from the first, 0x0c is zero).
-            const uint32_t lo = __builtin_amdgcn_perm(b[1], b[0], 0x0c0c0400u);
-            const uint32_t hi = __builtin_amdgcn_perm(b[3], b[2], 0x0c0c0400u);
-            words[w]          = __builtin_amdgcn_perm(hi, lo, 0x05040100u);
+        } else if (amax != 0.0f) {
+    #pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                const int p    = 4 * w;
+                uint32_t  word = 0;
+                word = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(word, pairs[p + 0],
+                                                                 conversion_scale, 0);
+                word = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(word, pairs[p + 1],
+                                                                 conversion_scale, 1);
+                word = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(word, pairs[p + 2],
+                                                                 conversion_scale, 2);
+                word = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(word, pairs[p + 3],
+                                                                 conversion_scale, 3);
+                words[w] = word;
+            }
         }
-    } else if (amax != 0.0f) {
-#pragma unroll
-        for (int w = 0; w < 4; ++w) {
-            const int p    = 4 * w;
-            uint32_t  word = 0;
-            word = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(word, pairs[p + 0],
-                                                             conversion_scale, 0);
-            word = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(word, pairs[p + 1],
-                                                             conversion_scale, 1);
-            word = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(word, pairs[p + 2],
-                                                             conversion_scale, 2);
-            word = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(word, pairs[p + 3],
-                                                             conversion_scale, 3);
-            words[w] = word;
-        }
-    }
-#endif
+    #endif
 
-    if constexpr (LAYOUT == Layout::A6W4Blob) {
-        const int32_t tile_row  = static_cast<int32_t>(out_row / kTileRows);
-        const int32_t rem       = static_cast<int32_t>(out_row % kTileRows);
-        const int32_t row_block = rem / 16;
-        const int32_t row16     = rem % 16;
-        const int32_t step      = group / kGroupsPerKTile;
-        const int32_t k_group   = group % kGroupsPerKTile;
-        const int32_t block     = row_block * 64 + k_group * 16 + row16;
-        const int64_t tile_base =
-            (static_cast<int64_t>(tile_row) * nk_pad + step) * kPackedTileBytes;
-        *reinterpret_cast<uint4_t *>(packed + tile_base + block * kBytesPerBlock) = words;
+        if constexpr (LAYOUT == Layout::A6W4Blob) {
+            const int32_t tile_row  = static_cast<int32_t>(out_row / kTileRows);
+            const int32_t rem       = static_cast<int32_t>(out_row % kTileRows);
+            const int32_t row_block = rem / 16;
+            const int32_t row16     = rem % 16;
+            const int32_t step      = group / kGroupsPerKTile;
+            const int32_t k_group   = group % kGroupsPerKTile;
+            const int32_t block     = row_block * 64 + k_group * 16 + row16;
+            const int64_t tile_base =
+                (static_cast<int64_t>(tile_row) * nk_pad + step) * kPackedTileBytes;
+            *reinterpret_cast<uint4_t *>(pk + tile_base + block * kBytesPerBlock) = words;
 
-        const int32_t scale_upper = rem / 128;
-        const int32_t scale_sub   = (rem % 128) / 16;
-        const int64_t scale_address =
-            (static_cast<int64_t>(tile_row) * nk_pad + step) * kScaleTileBytes + scale_upper * 512 +
-            k_group * 128 + row16 * 8 + scale_sub;
-        packed_scale[scale_address] = scale_exp;
-    } else {
-        // Codes. Row stride 64 * nk bytes; group g is bytes [16 g, 16 g + 16) of its row.
-        const int64_t row_bytes = static_cast<int64_t>(nk_pad) * 64;
-        int64_t       address;
-        if constexpr (LAYOUT == Layout::Tile) {
-            address = fly.kouter // K256-outer: [K/256, rows_pad, 128]
-                          ? ((group >> 3) * ((int64_t(fly.rows) + 255) / 256 * 256) + out_row) * 128 +
-                                static_cast<int64_t>(group & 7) * kBytesPerBlock
-                          : out_row * row_bytes + static_cast<int64_t>(group) * kBytesPerBlock;
-        } else if constexpr (LAYOUT == Layout::A4W4A || LAYOUT == Layout::Plain) {
-            address = out_row * row_bytes + static_cast<int64_t>(group) * kBytesPerBlock;
-        } else if constexpr (LAYOUT == Layout::TileK128) {
-            address = ((out_row / 16) * nk_pad + group / 4) * 1024 + (out_row % 16) * 64 +
-                      static_cast<int64_t>(group % 4) * kBytesPerBlock;
+            const int32_t scale_upper = rem / 128;
+            const int32_t scale_sub   = (rem % 128) / 16;
+            const int64_t scale_address =
+                (static_cast<int64_t>(tile_row) * nk_pad + step) * kScaleTileBytes + scale_upper * 512 +
+                k_group * 128 + row16 * 8 + scale_sub;
+            if (store_scale)
+                ps[scale_address] = scale_exp;
         } else {
-            // shuffle_weight((16, 16)): view (N/16, 16, Kb/32, 2, 16) -> permute (0, 2, 3, 1, 4).
-            const int64_t n0     = out_row / 16;
-            const int64_t r16    = out_row % 16;
-            const int64_t kblock = group / 2; // 32-byte K block
-            const int64_t half   = group % 2; // which 16 bytes of it
-            address = (((n0 * (row_bytes / 32) + kblock) * 2 + half) * 16 + r16) * kBytesPerBlock;
-        }
-        *reinterpret_cast<uint4_t *>(packed + address) = words;
+            // Codes. Row stride 64 * nk bytes; group g is bytes [16 g, 16 g + 16) of its row.
+            const int64_t row_bytes = static_cast<int64_t>(nk_pad) * 64;
+            int64_t       address;
+            if constexpr (LAYOUT == Layout::Tile) {
+                address = fly.kouter // K256-outer: [K/256, rows_pad, 128]
+                              ? ((group >> 3) * ((int64_t(fly.rows) + 255) / 256 * 256) + out_row) * 128 +
+                                    static_cast<int64_t>(group & 7) * kBytesPerBlock
+                              : out_row * row_bytes + static_cast<int64_t>(group) * kBytesPerBlock;
+            } else if constexpr (LAYOUT == Layout::A4W4A || LAYOUT == Layout::Plain) {
+                address = out_row * row_bytes + static_cast<int64_t>(group) * kBytesPerBlock;
+            } else if constexpr (LAYOUT == Layout::TileK128) {
+                address = ((out_row / 16) * nk_pad + group / 4) * 1024 + (out_row % 16) * 64 +
+                          static_cast<int64_t>(group % 4) * kBytesPerBlock;
+            } else {
+                // shuffle_weight((16, 16)): view (N/16, 16, Kb/32, 2, 16) -> permute (0, 2, 3, 1, 4).
+                const int64_t n0     = out_row / 16;
+                const int64_t r16    = out_row % 16;
+                const int64_t kblock = group / 2; // 32-byte K block
+                const int64_t half   = group % 2; // which 16 bytes of it
+                address = (((n0 * (row_bytes / 32) + kblock) * 2 + half) * 16 + r16) * kBytesPerBlock;
+            }
+            *reinterpret_cast<uint4_t *>(pk + address) = words;
 
-        // Scales. Plain: row-major [rows, K/32]. Otherwise shuffle_scale(): view (Mp/32, 2, 16,
-        // Sp/8, 2, 4) -> permute (0, 3, 5, 2, 4, 1), with Sp = K/32 = 4 * nk.
-        const int64_t sp = static_cast<int64_t>(nk_pad) * 4;
-        if constexpr (LAYOUT == Layout::Plain) {
-            packed_scale[out_row * sp + group] = scale_exp;
-            return;
+            // Scales. Plain: row-major [rows, K/32]. Otherwise shuffle_scale(): view (Mp/32, 2, 16,
+            // Sp/8, 2, 4) -> permute (0, 3, 5, 2, 4, 1), with Sp = K/32 = 4 * nk.
+            const int64_t sp = static_cast<int64_t>(nk_pad) * 4;
+            if constexpr (LAYOUT == Layout::Plain) {
+                if (store_scale)
+                    ps[out_row * sp + group] = scale_exp;
+                continue;
+            }
+            if constexpr (LAYOUT == Layout::Tile || LAYOUT == Layout::TileK128) {
+                if (out_row < fly.rows && group < fly.k128 * 4)
+                    if (store_scale)
+                        ps[ts_scale_byte(out_row, group, fly)] = scale_exp;
+                continue;
+            }
+            const int64_t i0 = out_row / 32, i1 = (out_row % 32) / 16, i2 = out_row % 16;
+            const int64_t j0 = group / 8, j1 = (group % 8) / 4, j2 = group % 4;
+            const int64_t scale_address =
+                ((((i0 * (sp / 8) + j0) * 4 + j2) * 16 + i2) * 2 + j1) * 2 + i1;
+            if (store_scale)
+                ps[scale_address] = scale_exp;
         }
-        if constexpr (LAYOUT == Layout::Tile || LAYOUT == Layout::TileK128) {
-            if (out_row < fly.rows && group < fly.k128 * 4)
-                packed_scale[ts_scale_byte(out_row, group, fly)] = scale_exp;
-            return;
-        }
-        const int64_t i0 = out_row / 32, i1 = (out_row % 32) / 16, i2 = out_row % 16;
-        const int64_t j0 = group / 8, j1 = (group % 8) / 4, j2 = group % 4;
-        const int64_t scale_address =
-            ((((i0 * (sp / 8) + j0) * 4 + j2) * 16 + i2) * 2 + j1) * 2 + i1;
-        packed_scale[scale_address] = scale_exp;
     }
 }
 
