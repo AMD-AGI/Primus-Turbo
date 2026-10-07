@@ -6,11 +6,12 @@
 - **声明**：本报告只整理已有记录（`output/` 下的各日报告、op-evolve 账本、会话记录、git 历史），未运行任何 GPU 任务。A0 的 GPU 当前由同事使用。
 - **文件清单**（都在 `Primus-Turbo/output/1007__summary/` 下）：
   - `SUMMARY.md`：本报告，定稿；与下面任何文件不一致时以 SUMMARY.md 为准。
-  - `rounds.csv`：每一轮一行的明细，198 行，不合并（与 `parts/rounds.csv` 相同）。
+  - `rounds.xlsx`：每一轮一行的明细（198 行，不合并）。第 1 个 sheet "全部轮次" 为全部明细，第 2 个 sheet "有提升的轮次" 单独列出带来提升的轮次及提升幅度，第 3 个 sheet "说明" 解释各列、机器代号和颜色。数据源是 `parts/rounds.csv`。
   - `REPORT-1007.html`：本报告的 HTML 版，自包含，浏览器直接打开即可。
-  - `parts/`：分节草稿。SUMMARY.md 由 `0_head.md`（标题、说明、一页结论、时间线）、`a_mainline.md`、`b_backends.md`、`c_rounds.md`、`d_problems.md`、`z_appendix.md`（附录 A/B/C）按此顺序直接拼接而成；另有 `rounds.csv`。内容以 SUMMARY.md 为准。
+  - 英文版：`SUMMARY.en.md`、`REPORT-1007.en.html`、`rounds.en.xlsx`，内容与中文版一一对应（源文件在 `parts/en/`）；两者不一致时以中文版为准。
+  - `parts/`：分节草稿。SUMMARY.md 由 `0_head.md`（标题、说明、一页结论、时间线）、`a_mainline.md`、`b_backends.md`、`c_rounds.md`、`d_problems.md`、`z_appendix.md`（附录 A/B/C）按此顺序直接拼接而成；`rounds.csv` 是 rounds.xlsx 的数据源（含阶段、是否提升、提升幅度等列）；`en/` 下是对应的英文源文件。内容以 SUMMARY.md 为准。
   - `_work/`：草稿区：会话文本导出（`sessions/`）、各子任务的中间文件与修改前备份（`scratch/`）、v1 分节稿（`v1/`）、审查前全文 `SUMMARY.v1.md`、会话导出脚本（`tools/`）。可以整个删除，不影响上面的文件（`_work/.gitignore` 已忽略其全部内容）。
-  - `tools/`：`build.sh` 把 `parts/` 拼成 SUMMARY.md、复制 rounds.csv 并重新生成 HTML（只用 CPU）；`md2html.py` 是 HTML 转换脚本。改了 `parts/` 之后跑 `tools/build.sh` 即可。
+  - `tools/`：`build.sh` 把 `parts/` 拼成 SUMMARY.md / SUMMARY.en.md，生成两份 HTML 和两份 xlsx（只用 CPU）；`md2html.py` 是 HTML 转换脚本，`build_xlsx.py` 生成 xlsx。改了 `parts/` 之后跑 `tools/build.sh` 即可。
 - **记号**：A0 = `heliosr-1b114-c07-1`（本机，单卡）；B0 = `ctheliosp-1b112-a37-1`（4 卡）。A0 在 09-29 刷固件之前处于 VR 限频（sclk 上限 1100 MHz），**09-29 之前 A0 的绝对数既不能和之后的 A0 比，也不能和 B0 比**。四节对同一时钟阶段的叫法不同（A0-VR / E1 / A0-T / A0-限频 等），对照见附录 A.1。时间一律为 UTC。
 
 ## 0. 一页结论
@@ -455,7 +456,7 @@ E1/E3/E3′ 期间的 A0 绝对数在 09-29 刷固件后作废。刷固件后时
 
 ## (c) 优化过程每一轮的进展
 
-本节先用一张里程碑速览（c.2a）给出主线，再把 09-10 到 10-05 的每个冠军变化点按时间排成一张总表（c.2），最后给当前最优版本（c.3）和进展要点（c.4）。每一轮单独成行的明细见 `parts/rounds.csv`（198 行，不合并）。路径若无前缀，均相对 `Primus-Turbo/output/`；`OE:` 表示 `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/`。
+本节先用一张里程碑速览（c.2a）给出主线，再把 09-10 到 10-05 的每个冠军变化点按时间排成一张总表（c.2），最后给当前最优版本（c.3）和进展要点（c.4）。每一轮单独成行的明细见 `rounds.xlsx`（198 行，不合并；第 2 个 sheet 单独列出有提升的轮次）。路径若无前缀，均相对 `Primus-Turbo/output/`；`OE:` 表示 `/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/`。
 
 ### c.1 口径说明
 
@@ -553,7 +554,7 @@ E1/E3/E3′ 期间的 A0 绝对数在 09-29 刷固件后作废。刷固件后时
 
 ### c.2 总表
 
-单行“算子耗时 ms”里写成 a / b / c 的，依次是 fwd / bwd / total。TF/s 列的每个数后面都注明口径：“（合计）”= 7.697e12 ÷ fwd+bwd 总 ms，是 tune_attention 和 Primus bench 的报法，阶段 1–2 除 #13 外都是它；“（bwd）”“（fwd）”是单方向，分别按 5.498229e12、2.199292e12 计，#13 的 B0 Triton job 和阶段 3 起都是单方向。合计口径的数与单方向的数不能直接比。被否决的连续轮次合并成一行，每轮明细见 rounds.csv。
+单行“算子耗时 ms”里写成 a / b / c 的，依次是 fwd / bwd / total。TF/s 列的每个数后面都注明口径：“（合计）”= 7.697e12 ÷ fwd+bwd 总 ms，是 tune_attention 和 Primus bench 的报法，阶段 1–2 除 #13 外都是它；“（bwd）”“（fwd）”是单方向，分别按 5.498229e12、2.199292e12 计，#13 的 B0 Triton job 和阶段 3 起都是单方向。合计口径的数与单方向的数不能直接比。被否决的连续轮次合并成一行，每轮明细见 rounds.xlsx。
 
 | 序号 | 日期 | 方向 | 轮次 | 算子耗时 ms | TF/s | 占 ASM | e2e 耗时/吞吐 | 机器 | 优化内容 | 备注（驱动/固件/口径） |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -1244,7 +1245,7 @@ ASM 自身的正确性问题，见 (b) 节：GQA 下 dk/dv 越界写（−0.94/�
 - `0928__a0_repro/REPORT.md`；`0930__bwd/{REPORT.md,PROGRESS.md,notes/report_asm.md}`；`0930__roofline/REPORT.md`；`0930__port/{PR_BODY.md,runs/}`；`1002__e2e/{E2E-PLAN.md,RESULT-realab.md,RESULT-e2e.md}`、`1002__e2e/e2e/runs/TABLE.1002_095504.md`；skill:`references/baselines.md`。
 
 **(c) 每一轮的进展**
-- `rounds.csv`（= `parts/rounds.csv`）；上面列出的各 op-evolve job 的 `job_context/state.yaml`、`rounds/NNN/{1-opt,3-act}/act.yaml`、`timing.yaml`、`opt.md`。
+- `rounds.xlsx`（数据源 `parts/rounds.csv`）；上面列出的各 op-evolve job 的 `job_context/state.yaml`、`rounds/NNN/{1-opt,3-act}/act.yaml`、`timing.yaml`、`opt.md`。
 - `0923__flydsl/{hint.md,STAGE2-FWD-SWEEP.md}`；`0924__flydsl/DAY-SUMMARY.md`；`0925__flydsl/fwd-job/hint.md`；`0927__flydsl/asm-structure/DESIGN.md`。
 - `0927__b0/{fwd,bwd}/progress.md`、`0927__b0/fwd/rounds/`、`0927__b0/lab-kdq/REPORT.md`、`0927__b0/lab-bwd-r19/REPORT.md`、`0927__b0/champions/`。
 - `0930__bwd/{PROGRESS.md,REPORT.md,armsrc/}`、`0930__bwd/probe/P1-RESULTS.md`；`0930__roofline/REPORT.md`；`1002__oe/{RULER.md,FWDJOB.md,incident/WEDGE-1002.md}`；`1002__e2e/arms_src/bwd_s6_0341`；skill:`references/{bwd-history,fwd}.md`。

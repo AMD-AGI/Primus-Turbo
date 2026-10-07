@@ -6,11 +6,12 @@
 - **声明**：本报告只整理已有记录（`output/` 下的各日报告、op-evolve 账本、会话记录、git 历史），未运行任何 GPU 任务。A0 的 GPU 当前由同事使用。
 - **文件清单**（都在 `Primus-Turbo/output/1007__summary/` 下）：
   - `SUMMARY.md`：本报告，定稿；与下面任何文件不一致时以 SUMMARY.md 为准。
-  - `rounds.csv`：每一轮一行的明细，198 行，不合并（与 `parts/rounds.csv` 相同）。
+  - `rounds.xlsx`：每一轮一行的明细（198 行，不合并）。第 1 个 sheet "全部轮次" 为全部明细，第 2 个 sheet "有提升的轮次" 单独列出带来提升的轮次及提升幅度，第 3 个 sheet "说明" 解释各列、机器代号和颜色。数据源是 `parts/rounds.csv`。
   - `REPORT-1007.html`：本报告的 HTML 版，自包含，浏览器直接打开即可。
-  - `parts/`：分节草稿。SUMMARY.md 由 `0_head.md`（标题、说明、一页结论、时间线）、`a_mainline.md`、`b_backends.md`、`c_rounds.md`、`d_problems.md`、`z_appendix.md`（附录 A/B/C）按此顺序直接拼接而成；另有 `rounds.csv`。内容以 SUMMARY.md 为准。
+  - 英文版：`SUMMARY.en.md`、`REPORT-1007.en.html`、`rounds.en.xlsx`，内容与中文版一一对应（源文件在 `parts/en/`）；两者不一致时以中文版为准。
+  - `parts/`：分节草稿。SUMMARY.md 由 `0_head.md`（标题、说明、一页结论、时间线）、`a_mainline.md`、`b_backends.md`、`c_rounds.md`、`d_problems.md`、`z_appendix.md`（附录 A/B/C）按此顺序直接拼接而成；`rounds.csv` 是 rounds.xlsx 的数据源（含阶段、是否提升、提升幅度等列）；`en/` 下是对应的英文源文件。内容以 SUMMARY.md 为准。
   - `_work/`：草稿区：会话文本导出（`sessions/`）、各子任务的中间文件与修改前备份（`scratch/`）、v1 分节稿（`v1/`）、审查前全文 `SUMMARY.v1.md`、会话导出脚本（`tools/`）。可以整个删除，不影响上面的文件（`_work/.gitignore` 已忽略其全部内容）。
-  - `tools/`：`build.sh` 把 `parts/` 拼成 SUMMARY.md、复制 rounds.csv 并重新生成 HTML（只用 CPU）；`md2html.py` 是 HTML 转换脚本。改了 `parts/` 之后跑 `tools/build.sh` 即可。
+  - `tools/`：`build.sh` 把 `parts/` 拼成 SUMMARY.md / SUMMARY.en.md，生成两份 HTML 和两份 xlsx（只用 CPU）；`md2html.py` 是 HTML 转换脚本，`build_xlsx.py` 生成 xlsx。改了 `parts/` 之后跑 `tools/build.sh` 即可。
 - **记号**：A0 = `heliosr-1b114-c07-1`（本机，单卡）；B0 = `ctheliosp-1b112-a37-1`（4 卡）。A0 在 09-29 刷固件之前处于 VR 限频（sclk 上限 1100 MHz），**09-29 之前 A0 的绝对数既不能和之后的 A0 比，也不能和 B0 比**。四节对同一时钟阶段的叫法不同（A0-VR / E1 / A0-T / A0-限频 等），对照见附录 A.1。时间一律为 UTC。
 
 ## 0. 一页结论

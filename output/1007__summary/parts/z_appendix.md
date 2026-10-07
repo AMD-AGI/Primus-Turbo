@@ -158,7 +158,7 @@
 - `0928__a0_repro/REPORT.md`；`0930__bwd/{REPORT.md,PROGRESS.md,notes/report_asm.md}`；`0930__roofline/REPORT.md`；`0930__port/{PR_BODY.md,runs/}`；`1002__e2e/{E2E-PLAN.md,RESULT-realab.md,RESULT-e2e.md}`、`1002__e2e/e2e/runs/TABLE.1002_095504.md`；skill:`references/baselines.md`。
 
 **(c) 每一轮的进展**
-- `rounds.csv`（= `parts/rounds.csv`）；上面列出的各 op-evolve job 的 `job_context/state.yaml`、`rounds/NNN/{1-opt,3-act}/act.yaml`、`timing.yaml`、`opt.md`。
+- `rounds.xlsx`（数据源 `parts/rounds.csv`）；上面列出的各 op-evolve job 的 `job_context/state.yaml`、`rounds/NNN/{1-opt,3-act}/act.yaml`、`timing.yaml`、`opt.md`。
 - `0923__flydsl/{hint.md,STAGE2-FWD-SWEEP.md}`；`0924__flydsl/DAY-SUMMARY.md`；`0925__flydsl/fwd-job/hint.md`；`0927__flydsl/asm-structure/DESIGN.md`。
 - `0927__b0/{fwd,bwd}/progress.md`、`0927__b0/fwd/rounds/`、`0927__b0/lab-kdq/REPORT.md`、`0927__b0/lab-bwd-r19/REPORT.md`、`0927__b0/champions/`。
 - `0930__bwd/{PROGRESS.md,REPORT.md,armsrc/}`、`0930__bwd/probe/P1-RESULTS.md`；`0930__roofline/REPORT.md`；`1002__oe/{RULER.md,FWDJOB.md,incident/WEDGE-1002.md}`；`1002__e2e/arms_src/bwd_s6_0341`；skill:`references/{bwd-history,fwd}.md`。

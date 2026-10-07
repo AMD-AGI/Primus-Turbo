@@ -7,7 +7,7 @@ rules, paragraphs, and inline code / **bold** / ~~strike~~ / [links](url).
 Single '*' is deliberately NOT treated as emphasis (the report uses a
 trailing '*' to mark derived TF/s values).
 
-Usage: python3 -I md2html.py IN.md OUT.html
+Usage: python3 -I md2html.py IN.md OUT.html [zh|en]
 """
 import html
 import re
@@ -239,8 +239,8 @@ def strip_tags(s):
     return re.sub(r'<[^>]+>', '', s)
 
 
-def build_toc(toc):
-    out = ['<nav class="toc" aria-label="目录"><details open><summary>目录</summary>']
+def build_toc(toc, label):
+    out = ['<nav class="toc" aria-label="%s"><details open><summary>%s</summary>' % (label, label)]
     cur = None
     for level, anchor, text in toc:
         if level not in (2, 3):
@@ -354,22 +354,32 @@ footer { color: var(--muted); font-size: 0.85em; margin-top: 3em; border-top: 1p
 """
 
 
+UI = {
+    'zh': dict(html_lang='zh-CN', toc='目录', title='Llama-3.1-8B Attention 优化进展',
+               footer='由 <code>SUMMARY.md</code> 生成（output/1007__summary）。本报告只整理已有记录，未运行任何 GPU 任务。'),
+    'en': dict(html_lang='en', toc='Contents', title='Llama-3.1-8B Attention Optimization Progress',
+               footer='Generated from <code>SUMMARY.en.md</code> (output/1007__summary). This report only collates existing records; no GPU jobs were run.'),
+}
+
+
 def main():
     src, dst = sys.argv[1], sys.argv[2]
+    lang = sys.argv[3] if len(sys.argv) > 3 else 'zh'
+    ui = UI[lang]
     md = open(src, encoding='utf-8').read()
     body, toc = convert(md)
-    title = 'Llama-3.1-8B Attention 优化进展'
-    toc_html = build_toc(toc)
+    title = ui['title']
+    toc_html = build_toc(toc, ui['toc'])
     idx = body.find('</h1>')
     if idx >= 0:
         body = body[:idx + 5] + '\n' + toc_html + body[idx + 5:]
     else:
         body = toc_html + body
-    doc = ('<!doctype html>\n<html lang="zh-CN">\n<head>\n<meta charset="utf-8">\n'
+    doc = ('<!doctype html>\n<html lang="' + ui['html_lang'] + '">\n<head>\n<meta charset="utf-8">\n'
            '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
            '<meta name="color-scheme" content="light dark">\n'
            '<title>%s</title>\n<style>%s</style>\n</head>\n<body>\n<main>\n%s\n'
-           '<footer>由 <code>SUMMARY.md</code> 生成（output/1007__summary）。本报告只整理已有记录，未运行任何 GPU 任务。</footer>\n'
+           '<footer>' + ui['footer'] + '</footer>\n'
            '</main>\n</body>\n</html>\n') % (title, CSS, body)
     open(dst, 'w', encoding='utf-8').write(doc)
 

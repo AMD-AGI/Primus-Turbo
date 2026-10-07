@@ -157,15 +157,17 @@ footer { color: var(--muted); font-size: 0.85em; margin-top: 3em; border-top: 1p
 <ul>
 <li><code>SUMMARY.md</code>：本报告，定稿；与下面任何文件不一致时以 SUMMARY.md 为准。
 </li>
-<li><code>rounds.csv</code>：每一轮一行的明细，198 行，不合并（与 <code>parts/rounds.csv</code> 相同）。
+<li><code>rounds.xlsx</code>：每一轮一行的明细（198 行，不合并）。第 1 个 sheet "全部轮次" 为全部明细，第 2 个 sheet "有提升的轮次" 单独列出带来提升的轮次及提升幅度，第 3 个 sheet "说明" 解释各列、机器代号和颜色。数据源是 <code>parts/rounds.csv</code>。
 </li>
 <li><code>REPORT-1007.html</code>：本报告的 HTML 版，自包含，浏览器直接打开即可。
 </li>
-<li><code>parts/</code>：分节草稿。SUMMARY.md 由 <code>0_head.md</code>（标题、说明、一页结论、时间线）、<code>a_mainline.md</code>、<code>b_backends.md</code>、<code>c_rounds.md</code>、<code>d_problems.md</code>、<code>z_appendix.md</code>（附录 A/B/C）按此顺序直接拼接而成；另有 <code>rounds.csv</code>。内容以 SUMMARY.md 为准。
+<li>英文版：<code>SUMMARY.en.md</code>、<code>REPORT-1007.en.html</code>、<code>rounds.en.xlsx</code>，内容与中文版一一对应（源文件在 <code>parts/en/</code>）；两者不一致时以中文版为准。
+</li>
+<li><code>parts/</code>：分节草稿。SUMMARY.md 由 <code>0_head.md</code>（标题、说明、一页结论、时间线）、<code>a_mainline.md</code>、<code>b_backends.md</code>、<code>c_rounds.md</code>、<code>d_problems.md</code>、<code>z_appendix.md</code>（附录 A/B/C）按此顺序直接拼接而成；<code>rounds.csv</code> 是 rounds.xlsx 的数据源（含阶段、是否提升、提升幅度等列）；<code>en/</code> 下是对应的英文源文件。内容以 SUMMARY.md 为准。
 </li>
 <li><code>_work/</code>：草稿区：会话文本导出（<code>sessions/</code>）、各子任务的中间文件与修改前备份（<code>scratch/</code>）、v1 分节稿（<code>v1/</code>）、审查前全文 <code>SUMMARY.v1.md</code>、会话导出脚本（<code>tools/</code>）。可以整个删除，不影响上面的文件（<code>_work/.gitignore</code> 已忽略其全部内容）。
 </li>
-<li><code>tools/</code>：<code>build.sh</code> 把 <code>parts/</code> 拼成 SUMMARY.md、复制 rounds.csv 并重新生成 HTML（只用 CPU）；<code>md2html.py</code> 是 HTML 转换脚本。改了 <code>parts/</code> 之后跑 <code>tools/build.sh</code> 即可。
+<li><code>tools/</code>：<code>build.sh</code> 把 <code>parts/</code> 拼成 SUMMARY.md / SUMMARY.en.md，生成两份 HTML 和两份 xlsx（只用 CPU）；<code>md2html.py</code> 是 HTML 转换脚本，<code>build_xlsx.py</code> 生成 xlsx。改了 <code>parts/</code> 之后跑 <code>tools/build.sh</code> 即可。
 </li></ul>
 </li>
 <li><strong>记号</strong>：A0 = <code>heliosr-1b114-c07-1</code>（本机，单卡）；B0 = <code>ctheliosp-1b112-a37-1</code>（4 卡）。A0 在 09-29 刷固件之前处于 VR 限频（sclk 上限 1100 MHz），<strong>09-29 之前 A0 的绝对数既不能和之后的 A0 比，也不能和 B0 比</strong>。四节对同一时钟阶段的叫法不同（A0-VR / E1 / A0-T / A0-限频 等），对照见附录 A.1。时间一律为 UTC。
@@ -768,7 +770,7 @@ footer { color: var(--muted); font-size: 0.85em; margin-top: 3em; border-top: 1p
 <li><strong>结果</strong>：bwd 已反超 ASM（s6），fwd 在 op 级仍差约 8%，在 e2e 中每步约差 9 ms。
 </li></ol>
 <h2 id="s18">(c) 优化过程每一轮的进展</h2>
-<p>本节先用一张里程碑速览（c.2a）给出主线，再把 09-10 到 10-05 的每个冠军变化点按时间排成一张总表（c.2），最后给当前最优版本（c.3）和进展要点（c.4）。每一轮单独成行的明细见 <code>parts/rounds.csv</code>（198 行，不合并）。路径若无前缀，均相对 <code>Primus-Turbo/output/</code>；<code>OE:</code> 表示 <code>/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/</code>。</p>
+<p>本节先用一张里程碑速览（c.2a）给出主线，再把 09-10 到 10-05 的每个冠军变化点按时间排成一张总表（c.2），最后给当前最优版本（c.3）和进展要点（c.4）。每一轮单独成行的明细见 <code>rounds.xlsx</code>（198 行，不合并；第 2 个 sheet 单独列出有提升的轮次）。路径若无前缀，均相对 <code>Primus-Turbo/output/</code>；<code>OE:</code> 表示 <code>/home/lihuzhan/code/2026_0910__op-evolve/op-evolve/artifacts/</code>。</p>
 <h3 id="s19">c.1 口径说明</h3>
 <p><strong>机器与时钟阶段。</strong> 绝对值只在同一阶段内比较；跨阶段只比较同进程比值。</p>
 <div class="tw"><table style="min-width:32.5em">
@@ -913,7 +915,7 @@ footer { color: var(--muted); font-size: 0.85em; margin-top: 3em; border-top: 1p
 <tr><td>87</td><td>10-05</td><td>产品分支教程 e2e：fwd r16 + bwd r29（flydsl 0.2.4）</td><td>—</td><td>—</td><td>折算到同口径约慢 3%（推算，未实测）</td><td>1,361.9 ms/步，24,061 tps（NKFIX_CHECK=0）</td><td>A0-D；与 #81 的 NKFIX_CHECK=1 不同口径</td></tr>
 </tbody></table></div>
 <h3 id="s21">c.2 总表</h3>
-<p>单行“算子耗时 ms”里写成 a / b / c 的，依次是 fwd / bwd / total。TF/s 列的每个数后面都注明口径：“（合计）”= 7.697e12 ÷ fwd+bwd 总 ms，是 tune_attention 和 Primus bench 的报法，阶段 1–2 除 #13 外都是它；“（bwd）”“（fwd）”是单方向，分别按 5.498229e12、2.199292e12 计，#13 的 B0 Triton job 和阶段 3 起都是单方向。合计口径的数与单方向的数不能直接比。被否决的连续轮次合并成一行，每轮明细见 rounds.csv。</p>
+<p>单行“算子耗时 ms”里写成 a / b / c 的，依次是 fwd / bwd / total。TF/s 列的每个数后面都注明口径：“（合计）”= 7.697e12 ÷ fwd+bwd 总 ms，是 tune_attention 和 Primus bench 的报法，阶段 1–2 除 #13 外都是它；“（bwd）”“（fwd）”是单方向，分别按 5.498229e12、2.199292e12 计，#13 的 B0 Triton job 和阶段 3 起都是单方向。合计口径的数与单方向的数不能直接比。被否决的连续轮次合并成一行，每轮明细见 rounds.xlsx。</p>
 <div class="tw"><table style="min-width:71.5em">
 <thead><tr>
 <th>序号</th>
@@ -1884,7 +1886,7 @@ export PYTHONPATH=$TURBO/docs/gfx1250_llama31_8b_e2e/nkfix:$TURBO   # nkfix.py �
 </li></ul>
 <p><strong>(c) 每一轮的进展</strong></p>
 <ul>
-<li><code>rounds.csv</code>（= <code>parts/rounds.csv</code>）；上面列出的各 op-evolve job 的 <code>job_context/state.yaml</code>、<code>rounds/NNN/{1-opt,3-act}/act.yaml</code>、<code>timing.yaml</code>、<code>opt.md</code>。
+<li><code>rounds.xlsx</code>（数据源 <code>parts/rounds.csv</code>）；上面列出的各 op-evolve job 的 <code>job_context/state.yaml</code>、<code>rounds/NNN/{1-opt,3-act}/act.yaml</code>、<code>timing.yaml</code>、<code>opt.md</code>。
 </li>
 <li><code>0923__flydsl/{hint.md,STAGE2-FWD-SWEEP.md}</code>；<code>0924__flydsl/DAY-SUMMARY.md</code>；<code>0925__flydsl/fwd-job/hint.md</code>；<code>0927__flydsl/asm-structure/DESIGN.md</code>。
 </li>
