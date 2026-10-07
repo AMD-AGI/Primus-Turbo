@@ -610,8 +610,8 @@ mxfp6_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
             (static_cast<int64_t>(fly.rows) + kTileRows - 1) / kTileRows * kTileRows;
         const int64_t s = group >> 2, g = group & 3;
         const int64_t c0 = (((out_row >> 4) * nk + s) * 16 + (out_row & 15)) * 64 + g * 16;
-        const int64_t c1 =
-            rpad * nk * 64 + (((out_row >> 5) * nk + s) * 32 + (out_row & 31)) * 32 + g * 8;
+        const int64_t c1 = (fly.c1_split ? fly.c1_delta : rpad * nk * 64) +
+                           (((out_row >> 5) * nk + s) * 32 + (out_row & 31)) * 32 + g * 8;
         *reinterpret_cast<uint4_t *>(packed + c0) = *reinterpret_cast<const uint4_t *>(&fp6);
         *reinterpret_cast<uint2_t *>(packed + c1) =
             *reinterpret_cast<const uint2_t *>(reinterpret_cast<const uint8_t *>(&fp6) + 16);
@@ -682,6 +682,11 @@ __device__ __forceinline__ void logical_block(int32_t &bx, int32_t &by) {
             }
         }
     }
+}
+
+// The seed of column draw d (draw 0 = the launch's column seed).
+__device__ __forceinline__ uint32_t draw_seed(const uint32_t seed, const int32_t d) {
+    return d == 0 ? seed : mxfp4_emit::sr_mix(seed + 0x9e3779b9u * static_cast<uint32_t>(d));
 }
 
 // One emit per output format. The FP4 formats share mxfp4_emit_group's quantization and
@@ -987,14 +992,17 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                 if constexpr (DO_COL) {
                     const int col_slot = slot - kRowGroups;
                     if (col_slot >= 0 && col_slot < kColGroups) {
-                        float values[kGroupSize];
+                        for (int d = 0; d < col_fly.draws; ++d) {
+                            float values[kGroupSize];
 #pragma unroll
-                        for (int i = 0; i < kGroupSize; ++i)
-                            values[i] = to_dot_operand<DType>(
-                                s_tile[stage * kStageRows + i][col_slot]);
-                        emit_group_fmt<COL_FMT, FP4_OPTS>(values, tile_n + col_slot,
-                                                          tile_m / kGroupSize + stage, col_nk_pad,
-                                                          col_packed, col_scale, col_seed, col_fly);
+                            for (int i = 0; i < kGroupSize; ++i)
+                                values[i] = to_dot_operand<DType>(
+                                    s_tile[stage * kStageRows + i][col_slot]);
+                            emit_group_fmt<COL_FMT, FP4_OPTS>(
+                                values, tile_n + col_slot, tile_m / kGroupSize + stage, col_nk_pad,
+                                col_packed + d * col_fly.draw_codes, col_scale + d * col_fly.draw_scales,
+                                draw_seed(col_seed, d), col_fly);
+                        }
                     }
                 }
             }
@@ -1460,15 +1468,18 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
             const int k_block  = gi % kBlocksPerCol;
             const int m_offset = k_block * kGroupSize;
 
-            float values[kGroupSize];
+            for (int d = 0; d < col_fly.draws; ++d) {
+                float values[kGroupSize];
 #pragma unroll
-            for (int i = 0; i < kGroupSize; ++i)
-                values[i] = to_dot_operand<DType>(s_tile[m_offset + i][local_n]);
+                for (int i = 0; i < kGroupSize; ++i)
+                    values[i] = to_dot_operand<DType>(s_tile[m_offset + i][local_n]);
 
-            emit_group_fmt<COL_FMT, FP4_OPTS>(
-                values, tile_n + local_n, tile_m / kGroupSize + k_block, col_nk_pad, col_packed,
-                col_scale, col_seed, col_fly,
-                tile2d ? s_tilemax2d[k_block][local_n / kGroupSize] : -1.0f);
+                emit_group_fmt<COL_FMT, FP4_OPTS>(
+                    values, tile_n + local_n, tile_m / kGroupSize + k_block, col_nk_pad,
+                    col_packed + d * col_fly.draw_codes, col_scale + d * col_fly.draw_scales,
+                    draw_seed(col_seed, d), col_fly,
+                    tile2d ? s_tilemax2d[k_block][local_n / kGroupSize] : -1.0f);
+            }
         }
     }
 }
@@ -1503,7 +1514,8 @@ inline bool is_a4w4(const MXPackFmt f) {
 namespace {
 MXTilePack               g_ts_row, g_ts_col;
 mxfp4_emit::TilePackArgs to_args(const MXTilePack &p) {
-    return {p.is_b, p.nt, p.ilv, p.k128, p.rows, p.fp4_round, p.fp4_had, p.fp4_tile2d};
+    return {p.is_b, p.nt, p.ilv, p.k128, p.rows, p.fp4_round, p.fp4_had, p.fp4_tile2d, p.kouter, p.c1_split, p.c1_delta,
+            p.draws, p.draw_codes, p.draw_scales};
 }
 } // namespace
 

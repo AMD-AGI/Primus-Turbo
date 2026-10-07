@@ -40,6 +40,7 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
 
 __all__ = [
     "set_sr_seed",
+    "set_sr_seed_next_pack",
     "sr_step_seed",
     "quantize_fp8",
     "quantize_fp8_with_trans",
@@ -586,6 +587,13 @@ def sr_step_seed(run_seed: int, rank: int, iteration: int) -> int:
     h = _splitmix64(run_seed & _MASK64)
     h = _splitmix64(h ^ (rank & _MASK64))
     return _splitmix64(h ^ (iteration & _MASK64))
+
+
+def set_sr_seed_next_pack(seed: int) -> None:
+    """The next ``quantize_mx*`` packer launch takes ``seed`` (32 bits) as its stochastic-rounding seed, without
+    moving the packers' launch counter: its SR bits are then a function of the caller's key alone (a pack made on
+    whichever rank owns the data). Outside compiled regions."""
+    torch.ops.primus_turbo_cpp_extension.set_sr_seed_next_pack(int(seed) & 0xFFFFFFFF)
 
 
 def set_sr_seed(seed: int) -> None:

@@ -102,6 +102,11 @@ struct TilePackArgs {
     int32_t is_b = 0, nt = 4, ilv = 0, k128 = 0, rows = 0;
     // FP4 emit options (every layout): scale rule, Hadamard, 2-D block scaling. See MXTilePack.
     int32_t fp4_round = 0, fp4_had = 0, fp4_tile2d = 0;
+    int32_t kouter   = 0;  // K256-outer codes and scales (see MXTilePack)
+    int32_t c1_split = 0;  // MXFP6 K128-blocked: C1 plane at c1_delta from the codes pointer (see MXTilePack)
+    int64_t c1_delta = 0;
+    int32_t draws = 1;     // independent column draws per launch (see MXTilePack)
+    int64_t draw_codes = 0, draw_scales = 0;
 };
 
 // Scale rules. 0 is RCEIL, ceil_pow2(amax / 6): never saturates. 1-3 are Turbo's
@@ -140,6 +145,10 @@ __device__ __forceinline__ int64_t ts_scale_byte(const int64_t row, const int32_
         const uint32_t r    = f.ilv ? (loc >> 2) : (loc & 15u);
         const uint32_t t    = f.ilv ? (loc & 3u) : (loc >> 4);
         const uint32_t last = r_region * 2u + lo;
+        if (f.kouter) { // [J, wi, 1 KiB], J = kblk / 8; role B
+            const int64_t nwi = (int64_t(f.rows) + 255) / 256 * 2;
+            return ((int64_t(kblk >> 3) * nwi + wi) * 1024) + g * 256 + r * 16 + last * 4 + t;
+        }
         const int64_t  base = ((int64_t(wi) * kk + int64_t(kh << ku_shift)) * 64 + r) * 4;
         return (base + int64_t(u) * 256 + int64_t(g) * 64 + last) * 4 + t;
     }
@@ -403,7 +412,12 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
         // Codes. Row stride 64 * nk bytes; group g is bytes [16 g, 16 g + 16) of its row.
         const int64_t row_bytes = static_cast<int64_t>(nk_pad) * 64;
         int64_t       address;
-        if constexpr (LAYOUT == Layout::A4W4A || LAYOUT == Layout::Plain || LAYOUT == Layout::Tile) {
+        if constexpr (LAYOUT == Layout::Tile) {
+            address = fly.kouter // K256-outer: [K/256, rows_pad, 128]
+                          ? ((group >> 3) * ((int64_t(fly.rows) + 255) / 256 * 256) + out_row) * 128 +
+                                static_cast<int64_t>(group & 7) * kBytesPerBlock
+                          : out_row * row_bytes + static_cast<int64_t>(group) * kBytesPerBlock;
+        } else if constexpr (LAYOUT == Layout::A4W4A || LAYOUT == Layout::Plain) {
             address = out_row * row_bytes + static_cast<int64_t>(group) * kBytesPerBlock;
         } else if constexpr (LAYOUT == Layout::TileK128) {
             address = ((out_row / 16) * nk_pad + group / 4) * 1024 + (out_row % 16) * 64 +

@@ -69,6 +69,9 @@ MX_FMT_FP4_TILE2D = 1 << 24
 MX_FMT_FP4_COL_SR = (
     1 << 25
 )  # stochastic rounding of the (packed-FlyDSL) column direction only
+# The column direction (packed FP4 tile, role B) K256-outer: codes [K/256, rows, 128] and the scale slab K256-outer
+# (aiter tilescale "kouter"), so any 256-aligned range of the contraction is one contiguous byte range of both.
+MX_FMT_COL_KOUTER = 1 << 26
 
 
 def mx_fmt_base(fmt: int) -> int:
@@ -255,9 +258,17 @@ def quantize_mx_gate_mul(x, gate, want_col_sum: bool, fmt: int) -> Tuple[torch.T
     return tuple(_ops().quantize_mx_gate_mul(x.contiguous(), gate.contiguous(), want_col_sum, fmt))
 
 
-def quantize_mx_dual_out(x, row_packed, row_scale, col_packed, col_scale, fmt: int) -> None:
-    """``quantize_mx_dual`` into caller buffers (size them with ``mx_dir_sizes``)."""
-    _ops().quantize_mx_dual_out(x.contiguous(), row_packed, row_scale, col_packed, col_scale, fmt)
+def quantize_mx_dual_out(
+    x, row_packed, row_scale, col_packed, col_scale, fmt: int, row_c1=None, draws=1, draw_codes=0, draw_scales=0
+) -> None:
+    """``quantize_mx_dual`` into caller buffers (size them with ``mx_dir_sizes``). A direction whose two buffers are
+    empty is not emitted. ``row_c1``: MXFP6 K128-blocked rows (``ts6_fmt``) with the C1 plane in its own buffer
+    (``row_packed`` then holds the C0 plane). ``draws``: that many independent draws of an FP4 column direction from
+    one read of ``x`` (stochastic rounding: draw d's seed derives from the launch seed and d), draw d at
+    ``d * draw_codes`` / ``d * draw_scales`` bytes past ``col_packed`` / ``col_scale`` in the same allocations."""
+    _ops().quantize_mx_dual_out(
+        x.contiguous(), row_packed, row_scale, col_packed, col_scale, fmt, row_c1, draws, draw_codes, draw_scales
+    )
 
 
 def quantize_mx_fused_dual_out(

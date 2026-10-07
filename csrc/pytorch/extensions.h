@@ -29,6 +29,7 @@ namespace primus_turbo::pytorch {
 
 // Base seed of the stochastic-rounding quantizers (resets their launch counters).
 void set_sr_seed(const int64_t seed);
+void set_sr_seed_next_pack(const int64_t seed);
 
 std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
                                                 const at::ScalarType      dest_dtype,
@@ -121,9 +122,13 @@ std::vector<at::Tensor> quantize_mxfp6_dual(const at::Tensor input);
 void quantize_mxfp6_dual_out(const at::Tensor input, at::Tensor row_packed, at::Tensor row_scale, at::Tensor col_packed, at::Tensor col_scale);
 void quantize_mxfp6_dual_out_meta(const at::Tensor input, at::Tensor row_packed, at::Tensor row_scale, at::Tensor col_packed, at::Tensor col_scale);
 void quantize_mx_dual_out(const at::Tensor input, at::Tensor row_packed, at::Tensor row_scale,
-                          at::Tensor col_packed, at::Tensor col_scale, const int64_t fmt);
+                          at::Tensor col_packed, at::Tensor col_scale, const int64_t fmt,
+                          const c10::optional<at::Tensor> row_c1, const int64_t draws,
+                          const int64_t draw_codes, const int64_t draw_scales);
 void quantize_mx_dual_out_meta(const at::Tensor input, at::Tensor row_packed, at::Tensor row_scale,
-                               at::Tensor col_packed, at::Tensor col_scale, const int64_t fmt);
+                               at::Tensor col_packed, at::Tensor col_scale, const int64_t fmt,
+                               const c10::optional<at::Tensor> row_c1, const int64_t draws,
+                               const int64_t draw_codes, const int64_t draw_scales);
 void quantize_mx_fused_dual_out(const at::Tensor input, const c10::optional<at::Tensor> aux,
                                 const c10::optional<at::Tensor> bias, const int64_t prologue_mode,
                                 at::Tensor row_packed, at::Tensor row_scale, at::Tensor col_packed,

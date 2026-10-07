@@ -66,6 +66,8 @@ constexpr int64_t kTileFmt = 0x1000, kTileSr = 0x800;
 //   bits 16-17 / 18-19  row / column scale rule: 0 RCEIL, 1-3 = scale_rounding_mode 0-2
 //   bits 20-21 / 22-23  row / column Hadamard:   0 H32, 1 none, 2 H16
 //   bit  24             2-D 32x32 block scaling of every FP4 direction (weights); needs no Hadamard
+//   bit  26             the column direction (packed FP4 tile, role B) K256-outer: codes [K/256, rows, 128]
+//                       and the scale slab K256-outer, so any 256-aligned K range is contiguous in both
 //   bit  25             stochastic rounding of the column direction only (packed-FlyDSL FP4
 //   columns): the
 //                       backward copy of an activation / weight, whose forward rows stay
@@ -75,7 +77,7 @@ constexpr int64_t kTileFmt = 0x1000, kTileSr = 0x800;
 constexpr int64_t kFmtBaseMask = 0xFFFF;
 
 int64_t fmt_base(const int64_t fmt) {
-    PRIMUS_TURBO_CHECK((fmt >> 26) == 0, "unknown fmt bits in ", fmt);
+    PRIMUS_TURBO_CHECK((fmt >> 27) == 0, "unknown fmt bits in ", fmt);
     return fmt & kFmtBaseMask;
 }
 
@@ -149,6 +151,10 @@ MXTilePack ts_dir(const int64_t fmt_in, const int64_t M, const int64_t N, const 
     p.ilv  = (code & 4) ? 4 : 0;
     p.k128 = static_cast<int32_t>((k + 255) / 256 * 2);
     p.rows = static_cast<int32_t>(col ? N : M);
+    if (col && ((fmt_in >> 26) & 1)) {
+        PRIMUS_TURBO_CHECK(p.is_b && p.nt == 4, "a K256-outer column is a role-B 256-tile direction (fmt ", fmt_in, ")");
+        p.kouter = 1;
+    }
     return p;
 }
 
@@ -692,7 +698,9 @@ std::vector<at::Tensor> quantize_mxfp6_dual(const at::Tensor input) {
 // a single kernel and hands each direction its own destination, so the split costs
 // nothing.
 static void dual_out_fmt(const at::Tensor input, at::Tensor row_packed, at::Tensor row_scale,
-                         at::Tensor col_packed, at::Tensor col_scale, const int64_t fmt) {
+                         at::Tensor col_packed, at::Tensor col_scale, const int64_t fmt,
+                         const c10::optional<at::Tensor> row_c1 = c10::nullopt, const int64_t draws = 1,
+                         const int64_t draw_codes = 0, const int64_t draw_scales = 0) {
     check_input(input);
     const c10::DeviceGuard device_guard(input.device());
     const int64_t          M = input.size(0);
@@ -701,10 +709,43 @@ static void dual_out_fmt(const at::Tensor input, at::Tensor row_packed, at::Tens
     const auto [row_fmt, col_fmt]   = fmt_pair(fmt);
     const auto [rp_bytes, rs_bytes] = sizes_for(row_fmt, M, N, ts_dir(fmt, M, N, false));
     const auto [cp_bytes, cs_bytes] = sizes_for(col_fmt, N, M, ts_dir(fmt, M, N, true));
-    MXTilePackScope fly_scope(ts_dir(fmt, M, N, false), ts_dir(fmt, M, N, true));
-    TORCH_CHECK(row_packed.numel() == rp_bytes && row_scale.numel() == rs_bytes &&
-                    col_packed.numel() == cp_bytes && col_scale.numel() == cs_bytes,
+    MXTilePack row_ts = ts_dir(fmt, M, N, false);
+    // row_c1: MXFP6 K128-blocked rows with the C1 plane in its own buffer (row_packed then holds C0: 2/3 of it)
+    const int64_t row_bytes = row_packed.numel() + (row_c1.has_value() ? row_c1->numel() : 0);
+    if (row_c1.has_value()) {
+        TORCH_CHECK(row_fmt == MXPackFmt::Fp6Tile && row_c1->numel() * 2 == row_packed.numel() &&
+                        row_c1->is_contiguous() && row_c1->scalar_type() == at::kByte,
+                    "quantize_mx_dual_out: row_c1 is the C1 plane of MXFP6 K128-blocked rows (half C0's bytes)");
+        row_ts.c1_split = 1;
+        row_ts.c1_delta = reinterpret_cast<intptr_t>(row_c1->data_ptr()) -
+                          reinterpret_cast<intptr_t>(row_packed.data_ptr());
+    }
+    MXTilePack col_ts = ts_dir(fmt, M, N, true);
+    if (draws != 1) {
+        // Draw d of the column pack lands at d * draw_codes / d * draw_scales bytes past the given buffers, inside
+        // the same allocations.
+        TORCH_CHECK(draws > 1 && col_fmt != MXPackFmt::Fp6 && col_fmt != MXPackFmt::Fp6Tile,
+                    "quantize_mx_dual_out: draws > 1 is for an FP4 column direction");
+        const auto room = [](const at::Tensor &t, int64_t span) {
+            return (t.storage_offset() + span) * t.element_size() <= int64_t(t.storage().nbytes());
+        };
+        TORCH_CHECK(room(col_packed, (draws - 1) * draw_codes + col_packed.numel()) &&
+                        room(col_scale, (draws - 1) * draw_scales + col_scale.numel()),
+                    "quantize_mx_dual_out: the column draws run past their allocations");
+        col_ts.draws       = static_cast<int32_t>(draws);
+        col_ts.draw_codes  = draw_codes;
+        col_ts.draw_scales = draw_scales;
+    }
+    MXTilePackScope fly_scope(row_ts, col_ts);
+    // A direction whose two buffers are both empty is not emitted (a row-only or column-only pack of the fmt).
+    const bool do_row = row_bytes || row_scale.numel(), do_col = col_packed.numel() || col_scale.numel();
+    TORCH_CHECK(do_row || do_col, "quantize_mx_dual_out: no direction to emit");
+    TORCH_CHECK((!do_row || (row_bytes == rp_bytes && row_scale.numel() == rs_bytes)) &&
+                    (!do_col || (col_packed.numel() == cp_bytes && col_scale.numel() == cs_bytes)),
                 "quantize_mxfp6_dual_out: output buffers do not match the packed layout size");
+    const MXFP6Direction dir = do_row && do_col ? MXFP6Direction::Dual
+                               : do_row         ? MXFP6Direction::Row
+                                                : MXFP6Direction::Col;
     TORCH_CHECK(row_packed.is_contiguous() && row_scale.is_contiguous() &&
                     col_packed.is_contiguous() && col_scale.is_contiguous(),
                 "quantize_mxfp6_dual_out: output buffers must be contiguous");
@@ -718,13 +759,13 @@ static void dual_out_fmt(const at::Tensor input, at::Tensor row_packed, at::Tens
             reinterpret_cast<const dtype::bfloat16 *>(input.data_ptr()),
             row_packed.data_ptr<uint8_t>(), row_scale.data_ptr<uint8_t>(),
             col_packed.data_ptr<uint8_t>(), col_scale.data_ptr<uint8_t>(), static_cast<int>(M),
-            static_cast<int>(N), MXFP6Direction::Dual, stream, row_fmt, col_fmt);
+            static_cast<int>(N), dir, stream, row_fmt, col_fmt);
     else
         quantize_mxfp6_impl<dtype::float16>(
             reinterpret_cast<const dtype::float16 *>(input.data_ptr()),
             row_packed.data_ptr<uint8_t>(), row_scale.data_ptr<uint8_t>(),
             col_packed.data_ptr<uint8_t>(), col_scale.data_ptr<uint8_t>(), static_cast<int>(M),
-            static_cast<int>(N), MXFP6Direction::Dual, stream, row_fmt, col_fmt);
+            static_cast<int>(N), dir, stream, row_fmt, col_fmt);
 }
 
 void quantize_mxfp6_dual_out(const at::Tensor input, at::Tensor row_packed, at::Tensor row_scale,
@@ -734,12 +775,16 @@ void quantize_mxfp6_dual_out(const at::Tensor input, at::Tensor row_packed, at::
 
 // The same with an output format (see fmt_pair): e.g. a grouped MLP's packs under A4W4.
 void quantize_mx_dual_out(const at::Tensor input, at::Tensor row_packed, at::Tensor row_scale,
-                          at::Tensor col_packed, at::Tensor col_scale, const int64_t fmt) {
-    dual_out_fmt(input, row_packed, row_scale, col_packed, col_scale, fmt);
+                          at::Tensor col_packed, at::Tensor col_scale, const int64_t fmt,
+                          const c10::optional<at::Tensor> row_c1, const int64_t draws,
+                          const int64_t draw_codes, const int64_t draw_scales) {
+    dual_out_fmt(input, row_packed, row_scale, col_packed, col_scale, fmt, row_c1, draws, draw_codes,
+                 draw_scales);
 }
 
 void quantize_mx_dual_out_meta(const at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
-                               const int64_t) {}
+                               const int64_t, const c10::optional<at::Tensor>, const int64_t,
+                               const int64_t, const int64_t) {}
 
 void quantize_mxfp6_dual_out_meta(const at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                                   at::Tensor) {}

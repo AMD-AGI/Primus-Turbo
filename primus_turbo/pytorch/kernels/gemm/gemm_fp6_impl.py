@@ -319,6 +319,7 @@ def gemm_fp6_impl(
     a4w4: int = 0,
     a6w6_ts: bool = False,
     a6w4_ts: bool = False,
+    b_c1: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     granularity_enum = ScalingGranularity(granularity)
     if a6w4_ts:
@@ -333,7 +334,7 @@ def gemm_fp6_impl(
         # kernel in aiter; bias in its store epilogue.
         if weight_is_fp4 or a_is_fp4 or a4w4:
             raise ValueError("a6w6_ts excludes weight_is_fp4 / a_is_fp4 / a4w4: both operands are MXFP6")
-        return _a6w6_ts(a, a_scale, b, b_scale, m, n, k, out_dtype, bias)
+        return _a6w6_ts(a, a_scale, b, b_scale, m, n, k, out_dtype, bias, b_c1=b_c1)
     if a4w4 in (2, 3):
         # Both operands MXFP4 on FlyDSL's GEMM: plain scales (2, fmt 8 / 9 / 12) or scales
         # already in its packed per-tile layout (3, ts_fmt).
@@ -424,6 +425,7 @@ def gemm_fp6_impl_meta(
     a4w4: int = 0,
     a6w6_ts: bool = False,
     a6w4_ts: bool = False,
+    b_c1: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # Pure arithmetic on purpose: this must not reach into AITER, whose kernel
     # selection does lru_cached pandas lookups that SymInts would break. The output
@@ -454,6 +456,7 @@ def gemm_fp6_out_impl(
     a4w4: int = 0,
     a6w6_ts: bool = False,
     a6w4_ts: bool = False,
+    b_c1: Optional[torch.Tensor] = None,
 ) -> None:
     """``out[M, N] = A[M, K] @ B[N, K].T (+ bias)``, writing into a caller-owned buffer.
 
@@ -482,7 +485,7 @@ def gemm_fp6_out_impl(
     if a6w6_ts:
         if weight_is_fp4 or a4w4:
             raise ValueError("a6w6_ts out-GEMM excludes weight_is_fp4 / a4w4: both operands are MXFP6")
-        _a6w6_ts(a, a_scale, b, b_scale, m, n, k, out.dtype, bias, out=out)
+        _a6w6_ts(a, a_scale, b, b_scale, m, n, k, out.dtype, bias, out=out, b_c1=b_c1)
         return
     if a4w4 in (2, 3):
         if weight_is_fp4 or bias is not None:
@@ -578,6 +581,7 @@ def gemm_fp6_out_impl_meta(
     a4w4: int = 0,
     a6w6_ts: bool = False,
     a6w4_ts: bool = False,
+    b_c1: Optional[torch.Tensor] = None,
 ) -> None:
     return None
 
@@ -706,7 +710,7 @@ def a6w6_ts_available(m: int, n: int, k: int, has_bias: bool) -> bool:
     return (int(m), int(n), int(k), bool(has_bias)) in a6w6_ts_shapes()
 
 
-def _a6w6_ts(a, a_scale, b, b_scale, m, n, k, out_dtype, bias, out=None):
+def _a6w6_ts(a, a_scale, b, b_scale, m, n, k, out_dtype, bias, out=None, b_c1=None):
     """A6W6 on the assembly ports of the FlyDSL MXFP6 GEMM (``a6w6_ts``, aiter ``gemm_a6w6_fly_asm``).
 
     Operands as ``ts6_fmt`` packed them: one buffer per operand with the K128-blocked C0 then C1 planes, scales in
@@ -719,7 +723,9 @@ def _a6w6_ts(a, a_scale, b, b_scale, m, n, k, out_dtype, bias, out=None):
     if out is None:
         out = torch.empty(m, n, dtype=torch.bfloat16, device=a.device)
     flat = lambda t: t.view(torch.uint8).reshape(-1)  # noqa: E731
-    gemm_a6w6_tilescale(flat(a), flat(b), flat(a_scale), flat(b_scale), out, k, bias)
+    # b_c1: B's C1 plane in its own buffer (b then holds C0 only), as a packed parameter gather delivers it
+    gemm_a6w6_tilescale(flat(a), flat(b), flat(a_scale), flat(b_scale), out, k, bias,
+                        None if b_c1 is None else flat(b_c1))
     return out
 
 
@@ -754,8 +760,8 @@ def _a6w4_ts(a, a_scale, b, b_scale, m, n, k, out_dtype, bias, out=None):
 
 
 @functools.lru_cache(maxsize=None)
-def _a4w4_table(ilv):
-    return tilescale_table(4, 4, 0, ilv)
+def _a4w4_table(ilv, b_codes=0):
+    return tilescale_table(4, 4, b_codes, ilv)
 
 
 def _a4w4_ts(a, a_scale, b, b_scale, m, n, k, out_dtype, bias, out=None):
@@ -771,13 +777,20 @@ def _a4w4_ts(a, a_scale, b, b_scale, m, n, k, out_dtype, bias, out=None):
     if out_dtype != torch.bfloat16:
         raise ValueError(f"aiter fly a4w4 writes bf16, got {out_dtype}")
     ilv = a4w4_b_ilv(m, n, k)
-    if not tilescale_table_has(_a4w4_table(ilv), int(m), int(n), int(k), False):
-        raise ValueError(f"no aiter A4W4 tilescale kernel for {m}x{n}x{k} (K must be a multiple of 512, >= 1024)")
+    # A 3-D B is the K256-outer form [K/256, N, 128] (aiter tilescale "kouter", its scale slab K256-outer too): a
+    # weight's dgrad copy assembled from per-device contraction ranges.
+    b_codes = 2 if b.dim() == 3 else 0
+    if not tilescale_table_has(_a4w4_table(ilv, b_codes), int(m), int(n), int(k), False):
+        raise ValueError(f"no aiter A4W4 tilescale kernel for {m}x{n}x{k} (K must be a multiple of 512, >= 1024)"
+                         + (" with a K256-outer B" if b_codes else ""))
     A, As = ts_operand(a, a_scale, m, k)
-    B, Bs = ts_operand(b, b_scale, n, k)
+    if b_codes:
+        B, Bs = b.view(torch.uint8).reshape(n, k // 2), b_scale.view(torch.int32).reshape(-1)
+    else:
+        B, Bs = ts_operand(b, b_scale, n, k)
     if out is None:
         out = torch.empty(m, n, dtype=torch.bfloat16, device=A.device)
-    gemm_a4w4_tilescale(A, B, As, Bs, out, k, ilv)
+    gemm_a4w4_tilescale(A, B, As, Bs, out, k, ilv, b_codes)
     return out if bias is None else out + bias
 
 

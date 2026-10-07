@@ -34,6 +34,7 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     // Base seed of the stochastic-rounding quantizers. No tensor arguments, so no dispatch key to
     // infer: registered with its kernel (catch-all).
     m.def("set_sr_seed(int seed) -> ()", &set_sr_seed);
+    m.def("set_sr_seed_next_pack(int seed) -> ()", &set_sr_seed_next_pack);
     m.def("quantize_fp8_tensorwise(Tensor input, ScalarType dest_dtype, Tensor? scale_opt=None, "
           "int padding_align_size=128, int pad_penultimate_align_size=1, "
           "Tensor? amax_partials=None) -> Tensor[]");
@@ -192,7 +193,7 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("quantize_mxfp6_fused_dual(Tensor input, Tensor? aux, Tensor? bias, int mode, "
           "bool want_col_sum) -> Tensor[]");
     m.def("quantize_mxfp6_fused_dual_out(Tensor input, Tensor? aux, Tensor? bias, int prologue_mode, Tensor(a!) row_packed, Tensor(b!) row_scale, Tensor(c!) col_packed, Tensor(d!) col_scale, Tensor(e!)? col_sum=None) -> ()");
-    m.def("quantize_mx_dual_out(Tensor input, Tensor(a!) row_packed, Tensor(b!) row_scale, Tensor(c!) col_packed, Tensor(d!) col_scale, int fmt) -> ()");
+    m.def("quantize_mx_dual_out(Tensor input, Tensor(a!) row_packed, Tensor(b!) row_scale, Tensor(c!) col_packed, Tensor(d!) col_scale, int fmt, Tensor(e!)? row_c1=None, int draws=1, int draw_codes=0, int draw_scales=0) -> ()");
     m.def("quantize_mx_fused_dual_out(Tensor input, Tensor? aux, Tensor? bias, int prologue_mode, Tensor(a!) row_packed, Tensor(b!) row_scale, Tensor(c!) col_packed, Tensor(d!) col_scale, Tensor(e!)? col_sum, int fmt) -> ()");
     m.def("quantize_mxfp6_qk_norm_rope_bwd(Tensor input, Tensor dq, Tensor dk, Tensor dv, "
           "Tensor cos, Tensor sin, Tensor wq, Tensor wk, Tensor rstd_q, Tensor rstd_k, "

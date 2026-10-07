@@ -222,6 +222,18 @@ struct MXTilePack {
     // FP4 layout, not only FlyDSL's: scale rule (0 RCEIL, 1-3 = scale_rounding_mode 0-2), Hadamard
     // (0 H32, 1 none, 2 H16) and 2-D 32x32 block scaling. All 0 is today's emit, bit for bit.
     int32_t fp4_round = 0, fp4_had = 0, fp4_tile2d = 0;
+    // kouter: role-B FP4 codes K256-outer, [K/256, rows_pad, 128], and the scale slab K256-outer (fmt bit 26, the
+    // column direction: a weight's dgrad copy, whose contraction is the weight's sharded row axis).
+    int32_t kouter = 0;
+    // MXFP6 K128-blocked rows: the C1 plane in its own buffer, at byte offset c1_delta from the codes pointer
+    // (c1_split = 0: right after C0, the default).
+    int32_t c1_split = 0;
+    int64_t c1_delta = 0;
+    // draws > 1 (column direction, SR): the launch emits that many independent draws of the column pack, draw d at
+    // byte offsets d * draw_codes / d * draw_scales, seeded from the launch seed and d (draw 0 = the launch seed).
+    // The input is read once.
+    int32_t draws = 1;
+    int64_t draw_codes = 0, draw_scales = 0;
 };
 // Stochastic-rounding seed streams (sr_seed.cu): one launch counter per SR quantizer.
 enum class SRStream : int { MXPack = 0, MXFP4Quant = 1, kCount = 2 };
@@ -229,6 +241,8 @@ enum class SRStream : int { MXPack = 0, MXFP4Quant = 1, kCount = 2 };
 void sr_set_base_seed(uint64_t base);
 // The seed of the next SR launch of `stream`.
 uint32_t sr_next_seed(SRStream stream);
+// The next launch of `stream` takes `seed` instead of its counter's (one shot; the counter does not move).
+void sr_override_next_seed(SRStream stream, uint32_t seed);
 
 void      mx_tile_pack_set(const MXTilePack &row, const MXTilePack &col);
 MXTilePack mx_tile_pack_row();
