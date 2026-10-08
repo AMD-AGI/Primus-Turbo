@@ -1657,7 +1657,10 @@ __device__ __forceinline__ float e2m3_value(const uint32_t c) {
 // 24 bytes of a group are 32 little-endian 6-bit codes, C0 = bytes 0-15, C1 = 16-23), then each thread emits one
 // column's 32 values (contraction over the rows) through the FP4 tile emit -- exactly what the column direction of a
 // dual pack of the dequantized weight emits.
-template <bool SR>
+// UNROT: the rows carry the forward's 32-point Hadamard along K (row Hadamard H32). Each decoded K group is rotated back
+// (the transform is its own inverse; the FP4 emit's operation order, hadamard32) before it is staged, so the column is
+// the dual pack of the dequantized, un-rotated weight.
+template <bool SR, bool UNROT>
 __global__ __launch_bounds__(256) void mxfp6_tile_to_fp4_col_kernel(
     const uint8_t *__restrict__ c0, const uint8_t *__restrict__ c1, const uint8_t *__restrict__ row_scale,
     uint8_t *__restrict__ col_packed, uint8_t *__restrict__ col_scale, const uint32_t seed,
@@ -1674,14 +1677,20 @@ __global__ __launch_bounds__(256) void mxfp6_tile_to_fp4_col_kernel(
         const uint32_t w[7] = {a.x, a.y, a.z, a.w, b.x, b.y, 0u};
         const uint8_t  se   = row_scale[mxfp4_emit::ts_scale_byte(row, group, row_ts)];
         const float    sc   = __builtin_bit_cast(float, se == 0 ? 0x00400000u : static_cast<uint32_t>(se) << 23);
+        float          v[kGroupSize];
 #pragma unroll
         for (int i = 0; i < kGroupSize; ++i) {
             const int bit = 6 * i, wi = bit >> 5, sh = bit & 31;
             uint32_t  c   = w[wi] >> sh;
             if (sh > 26)
                 c |= w[wi + 1] << (32 - sh);
-            tile[lr][g * kGroupSize + i] = e2m3_value(c & 63u) * sc;
+            v[i] = e2m3_value(c & 63u) * sc;
         }
+        if constexpr (UNROT)
+            mxfp4_emit::hadamard32(v);
+#pragma unroll
+        for (int i = 0; i < kGroupSize; ++i)
+            tile[lr][g * kGroupSize + i] = v[i];
     }
     __syncthreads();
     float values[kGroupSize];

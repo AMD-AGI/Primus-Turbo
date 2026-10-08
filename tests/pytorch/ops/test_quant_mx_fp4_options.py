@@ -67,19 +67,39 @@ def _butterfly(v, stages, first=0):
     return v
 
 
-def _ref_fp4(x, rnd="rceil", had="h32", tile2d=False):
+def _fma_f32(a, n, b):
+    """fp32 fma(a, n, b) exactly (one rounding), for fp32 tensors a, b and an fp32 scalar n.
+
+    a n is exact in float64 (24 + 24 significant bits), so a n + b has one float64 rounding; rounding that sum to
+    fp32 directly could round twice. The float64 sum is therefore taken round-to-odd (TwoSum gives its exact error:
+    if inexact, truncate toward zero and set the last bit), and round-to-odd at 53 bits >= 2 * 24 + 2 makes the
+    following rounding to fp32 the correctly rounded one."""
+    an, bd = a.double() * n.double(), b.double()
+    s = an + bd
+    bb = s - an
+    e = (an - (s - bb)) + (bd - bb)
+    bits = s.view(torch.int64)
+    away = (e != 0) & ((e > 0) != (s > 0))  # s is above the exact sum in magnitude
+    bits = (bits - away.long()) | (e != 0).long()
+    return bits.view(torch.float64).float()
+
+
+def _h32(v):
+    """The FP4 emit's H32 on fp32 [.., 32], bit for bit: the normalisation fused into the first stage,
+    fma(a, n, b n) and fma(a, n, -(b n)) (b n rounded to fp32), then the fp32 butterflies h = 2 .. 16."""
+    n = torch.tensor(0.17677669529663687, dtype=torch.float32)
+    a, b = v[..., 0::2], v[..., 1::2] * n.to(v.device)
+    v = torch.stack([_fma_f32(a, n, b), _fma_f32(a, n, -b)], -1).reshape(v.shape)
+    return _butterfly(v, 5, first=1)
+
+
+def _ref_fp4(x, rnd="rceil", had="h32", tile2d=False, device="cpu"):
     """MXFP4 of x [rows, k] along k: (codes [rows, k] uint8, one per element, sign in bit 3; scales
     [rows, k / 32] uint8)."""
     rows, k = x.shape
-    v = x.float().cpu().reshape(rows, k // 32, 32)
+    v = x.float().to(device).reshape(rows, k // 32, 32)
     if had == "h32":
-        # Normalisation fused into the first stage, as AITER computes it: fma(a, n, b n), fma(a, n, -b n);
-        # in float64 the fp32 product a n is exact, so one rounding to fp32 is the fma's.
-        n = torch.tensor(0.17677669529663687, dtype=torch.float32)
-        a, b = v[..., 0::2].double(), (v[..., 1::2] * n).double()
-        an = a * n.double()
-        v = torch.stack([(an + b).float(), (an - b).float()], -1).reshape(v.shape)
-        v = _butterfly(v, 5, first=1)
+        v = _h32(v)
     elif had == "h16":
         v = _butterfly(v * 0.25, 4)
     v = v.to(torch.bfloat16).float()
@@ -105,10 +125,10 @@ def _ref_fp4(x, rnd="rceil", had="h32", tile2d=False):
         e == 0, torch.tensor(2.0**-127), torch.pow(2.0, (e - 127).double()).float()
     )
     q = (v / scale[..., None]).abs()
-    d = (q[..., None] - _E2M1).abs()
+    d = (q[..., None] - _E2M1.to(q.device)).abs()
     best = d.min(-1, keepdim=True).values
     # Ties to the even code; above 6 everything saturates (6 is then the unique nearest).
-    tie_even = (d == best) & (torch.arange(8) % 2 == 0)
+    tie_even = (d == best) & (torch.arange(8, device=q.device) % 2 == 0)
     code = torch.where(
         tie_even.any(-1), tie_even.float().argmax(-1), (d == best).float().argmax(-1)
     )
@@ -387,6 +407,129 @@ def test_column_prob4_deferred_sr(rows, cols, bits):
     assert torch.equal(a, b) and not torch.equal(a, c)
 
 
+def _ts_scale_idx(rows, groups, *, k128, is_b, ilv, kouter=False):
+    """Byte offsets [rows, groups] of the tilescale scale slab (nt 4) -- a vectorised port of the kernels'
+    ts_scale_byte, including the K256-outer column slab."""
+    row = torch.arange(rows, device="cuda").view(-1, 1)
+    kblk = torch.arange(groups, device="cuda").view(1, -1)
+    kk = k128 >> 1
+    ku_shift = 1 if kk % 2 == 0 else 0
+    nw_shift = ku_shift + 1
+    kdw, g = kblk >> 2, kblk & 3
+    kh, rem = kdw >> nw_shift, kdw & ((1 << nw_shift) - 1)
+    u, lo = rem >> 1, rem & 1
+    grp, loc = row >> 6, row & 63
+    if is_b:
+        r_region, wi = (grp & 3) >> 1, (grp >> 2) * 2 + (grp & 1)
+    else:
+        wi, r_region = grp >> 1, grp & 1
+    r, t = (loc >> 2, loc & 3) if ilv else (loc & 15, loc >> 4)
+    last = r_region * 2 + lo
+    if kouter:
+        nwi = (rows + 255) // 256 * 2
+        return ((kblk >> 3) * nwi + wi) * 1024 + g * 256 + r * 16 + last * 4 + t
+    base = ((wi * kk + (kh << ku_shift)) * 64 + r) * 4
+    return (base + u * 256 + g * 64 + last) * 4 + t
+
+
+def _decode_ts6_rows(c0, c1, rsc, R, K):
+    """K128-blocked MXFP6 rows (role B) -> (values [R, K] float64, exact; scale bytes [R, K / 32]). C0
+    [R/16, K/128, 16, 64], C1 [R/32, K/128, 32, 32]; a group's 24 bytes are 32 little-endian 6-bit E2M3 codes."""
+    nk = K // 128
+    b0 = c0.view(R // 16, nk, 16, 64).permute(0, 2, 1, 3).reshape(R, nk, 4, 16)
+    b1 = c1.view(R // 32, nk, 32, 32).permute(0, 2, 1, 3).reshape(R, nk, 4, 8)
+    b = torch.cat([b0, b1], -1).reshape(R, K // 32, 8, 3).long()
+    word = b[..., 0] | (b[..., 1] << 8) | (b[..., 2] << 16)
+    codes = torch.stack([(word >> (6 * i)) & 63 for i in range(4)], -1).reshape(R, K)
+    m, e = codes & 7, (codes >> 3) & 3
+    mag = torch.where(e == 0, m.double() / 8, torch.exp2(e.double() - 1) * (1 + m.double() / 8))
+    val = torch.where(codes & 32 > 0, -mag, mag)
+    sbyte = rsc[_ts_scale_idx(R, K // 32, k128=nk, is_b=True, ilv=0)].long()
+    return (val.view(R, K // 32, 32) * torch.exp2(sbyte.double() - 127).unsqueeze(-1)).reshape(R, K), sbyte
+
+
+def _decode_fp4_col(cp, cs, R, K, ilv):
+    """The K256-outer FP4 tile column of an [R, K] weight (the [K, R] operand contracting R) -> (codes [K, R],
+    sign in bit 3; scale bytes [K, R / 32]; values [K, R] float64)."""
+    codes = _unpack(cp.view(R // 256, K, 128).permute(1, 0, 2).reshape(K, R // 2)).cuda()
+    s = cs[_ts_scale_idx(K, R // 32, k128=R // 128, is_b=True, ilv=ilv, kouter=True)]
+    mag = _E2M1.double().cuda()[(codes & 7).long()]
+    val = torch.where(codes & 8 > 0, -mag, mag).view(K, R // 32, 32) * torch.exp2(s.double() - 127).unsqueeze(-1)
+    return codes, s, val.reshape(K, R)
+
+
+@pytest.mark.parametrize("R,K", [(3072, 12288), (12288, 3072)])
+@pytest.mark.parametrize("sr", [False, True], ids=["rn", "sr"])
+def test_mxfp6_rows_to_fp4_col_unrot(R, K, sr):
+    """mxfp6_tile_to_fp4_col on a weight's forward rows (K128-blocked MXFP6, role-B scales, H32 along K -- the
+    dual weight pack's rows) with the dual pack's dgrad column format (RCEIL, H32 along the rows, K256-outer): the
+    receiver rotates each decoded K group back, so its column is the column pack of H32_K(dequant(rows)).
+
+    Reference: the rows decoded exactly, the emit's H32 along K in its fp32 operation order (the fused first stage
+    emulated as an exactly rounded fma, see _fma_f32), then the column emit (H32 along R, bf16, group amax, RCEIL,
+    E2M1 round to nearest even with saturation). RN: codes, scale bytes and decoded values bitwise. SR: the RN
+    scales, codes the RN code or a grid neighbour, one draw per seed. Both: close to the column pack of the
+    original bf16 weight, at that pack's error plus the FP6 rows'."""
+    _skip()
+    x = _rand(R, K, seed=12)
+    # the weight pack of a dgrad GEMM [m, R] x [K, R]^T: ts6 rows (B), the FP4 column with Primus' default options
+    fmt = P.fp4_options(
+        P.with_ts6_row(P.ts_fmt(col=P.ts_b_params(256, K, R)), True), col_round="rceil", col_hadamard="h32"
+    ) | P.MX_FMT_COL_KOUTER
+    ilv = P.ts_b_params(256, K, R)[2]
+    rp, rs = P.mx_dir_sizes(R, K, fmt, False)
+    cp, cs = P.mx_dir_sizes(R, K, fmt, True)
+    nb = lambda n: torch.empty(n, dtype=torch.uint8, device="cuda")  # noqa: E731
+    c0, c1, rsc = nb(rp * 2 // 3), nb(rp // 3), nb(rs)
+    full = [nb(cp), nb(cs)]
+    P.quantize_mx_dual_out(x, c0, rsc, *full, fmt, row_c1=c1)  # the owner's dual pack: rows + today's column
+
+    w_deq, _ = _decode_ts6_rows(c0, c1, rsc, R, K)
+    v = w_deq.float()
+    assert torch.equal(v.double(), w_deq), "FP6 values are exact in fp32"
+    unrot = _h32(v.view(R, K // 32, 32)).reshape(R, K)  # the receiver's staged values
+    ref_c, ref_s = _ref_fp4(unrot.t().contiguous(), device="cuda")
+
+    got_c, got_s = nb(cp), nb(cs)
+    seed = 0x2545F491
+    P.mxfp6_tile_to_fp4_col(c0, c1, rsc, R, K, got_c, got_s, fmt | (P.MX_FMT_FP4_COL_SR if sr else 0), sr, seed)
+    gc, gs, gv = _decode_fp4_col(got_c, got_s, R, K, ilv)
+    assert torch.equal(gs.long(), ref_s.long()), f"scales differ at {(gs.long() != ref_s.long()).sum().item()}"
+    mag_r = _E2M1.double().cuda()[(ref_c & 7).long()]
+    ref_v = torch.where(ref_c & 8 > 0, -mag_r, mag_r).view(K, R // 32, 32) * torch.exp2(
+        ref_s.double() - 127
+    ).unsqueeze(-1)
+    if not sr:
+        assert torch.equal(gc, ref_c), f"codes differ at {(gc != ref_c).sum().item()} of {ref_c.numel()}"
+        assert torch.equal(gv.view(-1).view(torch.int64), ref_v.view(-1).view(torch.int64)), "decoded values"
+    else:
+        mg, mr = (gc & 7).long(), (ref_c & 7).long()
+        assert ((mg - mr).abs() <= 1).all()
+        nz = (mg > 0) & (mr > 0)
+        assert ((gc & 8) == (ref_c & 8))[nz].all()
+        assert not torch.equal(gc, ref_c)
+        again = [nb(cp), nb(cs)]
+        P.mxfp6_tile_to_fp4_col(c0, c1, rsc, R, K, *again, fmt | P.MX_FMT_FP4_COL_SR, sr, seed)
+        assert torch.equal(again[0], got_c) and torch.equal(again[1], got_s), "one draw per seed"
+
+    # close to today's column pack of the bf16 weight: both rotated back along R, against the weight
+    hr = torch.tensor([[(-1) ** bin(i & j).count("1") for j in range(32)] for i in range(32)], device="cuda")
+    hr = hr.double() / 32**0.5
+
+    def err(vals, rows, cols, ref):
+        back = (vals.view(rows, cols // 32, 32) @ hr).reshape(rows, cols)
+        return ((back - ref).norm() / ref.norm()).item()
+
+    xd = x.double()
+    e_got, e_today = err(gv, K, R, xd.t()), err(_decode_fp4_col(*full, R, K, ilv)[2], K, R, xd.t())
+    e_fp6 = err(w_deq, R, K, xd)
+    print(f"\n[{R}x{K} {'sr' if sr else 'rn'}] rel err vs the bf16 weight: receiver {e_got:.4f}, today's RN column "
+          f"{e_today:.4f}, FP6 rows {e_fp6:.4f}")
+    assert e_fp6 < 0.05
+    # RN: today's column error and the rows' FP6 error, independent; SR's error is about sqrt(2) RN's
+    assert e_got < (e_today**2 + e_fp6**2) ** 0.5 * (1.6 if sr else 1.02)
+
+
 @pytest.mark.parametrize("sr", [False, True])
 def test_mxfp6_tile_to_fp4_col(sr):
     """mxfp6_tile_to_fp4_col: the FP4 column (dgrad copy) made from a weight's K128-blocked MXFP6 rows -- here an
@@ -408,20 +551,11 @@ def test_mxfp6_tile_to_fp4_col(sr):
     c0, c1, rsc = nb(rp * 2 // 3), nb(rp // 3), nb(rs)
     P.quantize_mx_dual_out(x, c0, rsc, nb(0), nb(0), fmt, row_c1=c1)  # the plane: rows only
 
-    # decode the plane: C0 [R/16, K/128, 16, 64], C1 [R/32, K/128, 32, 32]; a group's 24 bytes = 32 LE 6-bit codes
     nk = K // 128
-    b0 = c0.view(R // 16, nk, 16, 64).permute(0, 2, 1, 3).reshape(R, nk, 4, 16)
-    b1 = c1.view(R // 32, nk, 32, 32).permute(0, 2, 1, 3).reshape(R, nk, 4, 8)
-    b = torch.cat([b0, b1], -1).reshape(R, K // 32, 8, 3).long()
-    word = b[..., 0] | (b[..., 1] << 8) | (b[..., 2] << 16)
-    codes = torch.stack([(word >> (6 * i)) & 63 for i in range(4)], -1).reshape(R, K)
-    m, e = codes & 7, (codes >> 3) & 3
-    mag = torch.where(e == 0, m.double() / 8, torch.exp2(e.double() - 1) * (1 + m.double() / 8))
-    val = torch.where(codes & 32 > 0, -mag, mag)
     sidx = torch.tensor([[mxfp4_packed_scale_byte(r, g, k128=nk, b_ilv=0, is_b=True) for g in range(K // 32)]
                          for r in range(R)], device="cuda")
-    sbyte = rsc[sidx].long()
-    w_deq = (val.view(R, K // 32, 32) * torch.exp2(sbyte.double() - 127).unsqueeze(-1)).reshape(R, K)
+    assert torch.equal(sidx, _ts_scale_idx(R, K // 32, k128=nk, is_b=True, ilv=0)), "scale index port"
+    w_deq, sbyte = _decode_ts6_rows(c0, c1, rsc, R, K)
     assert (sbyte.view(R // 32, 32, K // 32) == sbyte.view(R // 32, 32, K // 32)[:, :1]).all(), "tile scales"
     assert ((w_deq - x.double()).norm() / x.double().norm()).item() < 0.05
     wb = w_deq.to(torch.bfloat16)

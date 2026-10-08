@@ -812,7 +812,8 @@ void quantize_mx_dual_out(const at::Tensor input, at::Tensor row_packed, at::Ten
 }
 
 // The deferred FP4 dgrad copy of a gathered MXFP6 tile weight (see mxfp6_tile_to_fp4_col_impl). `fmt` is the dual
-// pack format of the [R, K] weight: K128-blocked FP6 rows (the planes given), an FP4 tile column (the output).
+// pack format of the [R, K] weight: K128-blocked FP6 rows (the planes given), an FP4 tile column (the output). The
+// rows' Hadamard decides the decode: H32 (a weight's forward rows) is rotated back along K, none is taken as is.
 void mxfp6_tile_to_fp4_col(const at::Tensor c0, const at::Tensor c1, const at::Tensor row_scale, const int64_t R,
                            const int64_t K, at::Tensor col_packed, at::Tensor col_scale, const int64_t fmt,
                            const bool sr, const int64_t seed) {

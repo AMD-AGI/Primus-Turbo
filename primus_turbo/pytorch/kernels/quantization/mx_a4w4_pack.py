@@ -72,6 +72,9 @@ MX_FMT_FP4_COL_SR = (
 # The column direction (packed FP4 tile, role B) K256-outer: codes [K/256, rows, 128] and the scale slab K256-outer
 # (aiter tilescale "kouter"), so any 256-aligned range of the contraction is one contiguous byte range of both.
 MX_FMT_COL_KOUTER = 1 << 26
+# Capability: mxfp6_tile_to_fp4_col takes rows with the H32 along K (a weight's forward rows) and rotates them back
+# before the column emit. Without it the column of such rows would be built in the rotated basis.
+MXFP6_COL_FROM_ROTATED_ROWS = True
 
 
 def mx_fmt_base(fmt: int) -> int:
@@ -282,7 +285,9 @@ def mxfp6_tile_to_fp4_col(c0, c1, row_scale, R: int, K: int, col_packed, col_sca
     role-B ``row_scale`` slab, as a dual pack with ``fmt`` writes them -- into ``col_packed`` / ``col_scale`` (the
     sizes ``mx_dir_sizes(R, K, fmt, True)``): bitwise what that dual pack of the dequantized weight emits as its
     column direction, stochastically rounded from ``seed`` when ``sr`` (the dual pack's column seed is its launch seed
-    ^ 0x5bd1e995)."""
+    ^ 0x5bd1e995). With ``fmt``'s row Hadamard H32 (a weight's forward rows) each decoded K group is first rotated
+    back (the FP4 emit's H32, its own inverse); with row Hadamard none the rows are taken as is (see
+    ``MXFP6_COL_FROM_ROTATED_ROWS``)."""
     _ops().mxfp6_tile_to_fp4_col(c0, c1, row_scale, R, K, col_packed, col_scale, fmt, sr, seed & 0xFFFFFFFF)
 
 

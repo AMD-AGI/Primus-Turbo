@@ -183,6 +183,40 @@ __device__ __forceinline__ int64_t ts_scale_byte(const int64_t row, const int32_
     return (base + int64_t(u) * 256 + int64_t(g) * 64 + last) * 4 + t;
 }
 
+// The FP4 emit's 32-point Hadamard of one group, in place: normalised Sylvester (symmetric and orthogonal, so its own
+// inverse), the normalisation folded into the first stage, then the butterflies h = 2, 4, 8, 16. The order is part of
+// the contract (see mxfp4_emit_group); anything that must match the emit bit for bit calls this.
+__device__ __forceinline__ void hadamard32(float (&values)[kGroupSize]) {
+    // The first stage's adds take the even element's normalisation as a fused multiply-add,
+    // fma(a, norm, b * norm) and fma(a, norm, -(b * norm)): that is the arithmetic AITER's packer
+    // compiles to, and it is spelled out because the compiler's own contraction choice depends on
+    // the surrounding code -- left implicit, adding the other Hadamard modes moved it and flipped
+    // the sign of a few zero codes. Measured against AITER on its codes, signed zeros included.
+#pragma unroll
+    for (int i = 0; i < kGroupSize; i += 2) {
+        const float a = values[i];
+        const float b = values[i + 1] * kHadamard32Norm;
+        values[i]     = __builtin_fmaf(a, kHadamard32Norm, b);
+        values[i + 1] = __builtin_fmaf(a, kHadamard32Norm, -b);
+    }
+
+#pragma unroll
+    for (int stage = 1; stage < 5; ++stage) {
+        const int h = 1 << stage;
+#pragma unroll
+        for (int pair = 0; pair < kGroupSize / 2; ++pair) {
+            const int   butterfly = pair / h;
+            const int   offset    = pair % h;
+            const int   i0        = butterfly * (2 * h) + offset;
+            const int   i1        = i0 + h;
+            const float x0        = values[i0];
+            const float x1        = values[i1];
+            values[i0]            = x0 + x1;
+            values[i1]            = x0 - x1;
+        }
+    }
+}
+
 // `tile_amax` >= 0 replaces the group's own amax (2-D block scaling: the caller passes the amax of
 // the 32x32 tile, taken from the same bf16 values; only valid with ts.fp4_had == kHadNone).
 // OPTS: compile the FP4 options (ts.fp4_round / fp4_had, tile_amax) in. Without them the emit is
@@ -199,37 +233,9 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
     // MXFP4 packer puts it, and NOT where the MXFP6 packer puts it (MXFP6 multiplies the
     // rotated result at the end). The two orders differ in floating point, so copying the
     // MXFP6 emit here produces a blob that is close but not equal, and `gemm_a6w4` has no
-    // way to detect the difference. Matching AITER is the contract.
-    //
-    // The first stage's adds take the even element's normalisation as a fused multiply-add,
-    // fma(a, norm, b * norm) and fma(a, norm, -(b * norm)): that is the arithmetic AITER's packer
-    // compiles to, and it is spelled out because the compiler's own contraction choice depends on
-    // the surrounding code -- left implicit, adding the other Hadamard modes moved it and flipped
-    // the sign of a few zero codes. Measured against AITER on its codes, signed zeros included.
+    // way to detect the difference. Matching AITER is the contract (see hadamard32).
     if (!OPTS || ts.fp4_had == kHadH32) {
-#pragma unroll
-        for (int i = 0; i < kGroupSize; i += 2) {
-            const float a = values[i];
-            const float b = values[i + 1] * kHadamard32Norm;
-            values[i]     = __builtin_fmaf(a, kHadamard32Norm, b);
-            values[i + 1] = __builtin_fmaf(a, kHadamard32Norm, -b);
-        }
-
-#pragma unroll
-        for (int stage = 1; stage < 5; ++stage) {
-            const int h = 1 << stage;
-#pragma unroll
-            for (int pair = 0; pair < kGroupSize / 2; ++pair) {
-                const int   butterfly = pair / h;
-                const int   offset    = pair % h;
-                const int   i0        = butterfly * (2 * h) + offset;
-                const int   i1        = i0 + h;
-                const float x0        = values[i0];
-                const float x1        = values[i1];
-                values[i0]            = x0 + x1;
-                values[i1]            = x0 - x1;
-            }
-        }
+        hadamard32(values);
     } else if (ts.fp4_had == kHadH16) { // OPTS only
         // Stages h = 1, 2, 4, 8 of the same network: two independent 16-point transforms.
 #pragma unroll
