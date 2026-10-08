@@ -69,6 +69,16 @@ CK_DISABLED_SOURCE_MARKERS = (
 # _build_info.py and `import primus_turbo` refuses such a build unless PRIMUS_TURBO_ALLOW_DEV_BUILD=1
 # is set in the environment, so a dev build that reaches a production image fails at import.
 DEV_NO_ROCSHMEM = os.environ.get("PRIMUS_TURBO_DEV_NO_ROCSHMEM", "0") == "1"
+# PRIMUS_TURBO_DEV_NO_RDC=1 (with PRIMUS_TURBO_DEV_NO_ROCSHMEM=1 only): no relocatable device code. Each translation
+# unit generates its own device code at compile time, in parallel, and the kernel library's link no longer runs one
+# whole-library device LTO (single-threaded, minutes per rebuild). For the edit-build-test loop: the kernels are
+# compiled without cross-unit LTO, so they may differ from a production build -- never time with it. Recorded in
+# _build_info.py; `import primus_turbo` warns.
+DEV_NO_RDC = os.environ.get("PRIMUS_TURBO_DEV_NO_RDC", "0") == "1"
+if DEV_NO_RDC and not DEV_NO_ROCSHMEM:
+    raise SystemExit(
+        "PRIMUS_TURBO_DEV_NO_RDC=1 needs PRIMUS_TURBO_DEV_NO_ROCSHMEM=1 (rocSHMEM needs relocatable device code)"
+    )
 
 # -------- ROCSHMEM LIB ---------------
 # try to found rocshmem in default path or enviorment
@@ -225,6 +235,7 @@ def write_build_info():
         f"BUILD_CK_BACKEND = {ck_backend_enabled()}\n"
         f"ROCSHMEM = {ROCSHMEM_LIBRARY is not None}\n"
         f"DEV_NO_ROCSHMEM = {DEV_NO_ROCSHMEM}\n"
+        f"DEV_NO_RDC = {DEV_NO_RDC}\n"
     )
     if old_content != content:
         build_info_path.write_text(content, encoding="utf-8")
@@ -345,6 +356,11 @@ def get_common_flags():
         "-fgpu-rdc",
         "-Wno-unknown-warning-option",
     ]
+
+    if DEV_NO_RDC:  # see DEV_NO_RDC: device code per translation unit, no whole-library device LTO at the link
+        extra_link_args = [a for a in extra_link_args if a != "-fgpu-rdc"]
+        cxx_flags = [a for a in cxx_flags if a != "-fgpu-rdc"]
+        nvcc_flags = [a for a in nvcc_flags if a != "-fgpu-rdc"]
 
     # Check and add optional compiler flags (for ROCm version compatibility)
     if check_hip_compiler_flag("-mllvm -amdgpu-coerce-illegal-types=1"):

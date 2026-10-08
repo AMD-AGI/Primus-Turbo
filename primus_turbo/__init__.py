@@ -33,3 +33,11 @@ if _DEV_NO_ROCSHMEM:
     import warnings as _warnings
 
     _warnings.warn("Primus-Turbo development build: rocSHMEM, DeepEP internode and ODC are compiled out.")
+    try:
+        from ._build_info import DEV_NO_RDC as _DEV_NO_RDC
+    except Exception:
+        _DEV_NO_RDC = False
+    if _DEV_NO_RDC:
+        _warnings.warn(
+            "Primus-Turbo PRIMUS_TURBO_DEV_NO_RDC build: kernels compiled without device LTO; not for timing."
+        )
