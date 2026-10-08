@@ -193,3 +193,59 @@ class MXFP4WireLayout:
                 cd.view(float4_e2m1fn_x2), cs.view(torch.float8_e8m0fnu), quantized_axis=1, **common
             ),
         )
+
+
+class MXFP4StripGatherPlan:
+    """Persistent strip addresses for assembling a cache in one GPU launch.
+
+    Metadata is uploaded once. Every refresh reads the gathered bytes directly
+    into the four padded compute operands, avoiding cats, transposed temporary
+    tensors, and separate zero-fill/copy kernels. Quantization is unchanged.
+    """
+
+    def __init__(self, layout, ownership, offsets, rank_width, device):
+        self.layout = layout
+        g, n, k = layout.shape
+        self.rank_width = rank_width
+        self.world = len(ownership)
+        if len(offsets) != self.world or self.world == 0:
+            raise ValueError("ownership and offsets must describe the same nonempty rank set")
+        bases = [[], [], [], []]
+        cursor = 0
+        for rank, ((first, count), offset) in enumerate(zip(ownership, offsets)):
+            if first != cursor or count < 0 or offset < 0:
+                raise ValueError("strip ownership must cover the weight in rank order")
+            sizes = (count * 16 * k, count * k, count * 16 * k, count * k)
+            if offset + sum(sizes) > rank_width:
+                raise ValueError("strip payload exceeds rank width")
+            base = rank * rank_width + offset
+            for component, (size, step) in enumerate(zip(sizes, (16 * k, k, 16 * k, k))):
+                bases[component].extend(base + index * step for index in range(count))
+                base += size
+            cursor += count
+        if cursor != g * n // 32:
+            raise ValueError("strip ownership does not cover the full weight")
+        self.strip_bases = torch.tensor(bases, device=device, dtype=torch.int64)
+        self.shapes = tuple(
+            (*shape[:-1], (shape[-1] + alignment - 1) // alignment * alignment)
+            for shape, alignment in zip(layout.component_shapes, (64, 4, 64, 4))
+        )
+        self.sizes = tuple(prod(shape) for shape in self.shapes)
+
+    def assemble(self, wire):
+        from primus_turbo.pytorch.kernels.quantization.mxfp4_comm import assemble_mxfp4_strips_kernel
+
+        if (
+            wire.dtype != torch.uint8
+            or not wire.is_contiguous()
+            or wire.numel() != self.world * self.rank_width
+            or wire.device != self.strip_bases.device
+        ):
+            raise ValueError("wire storage does not match the gather plan")
+        output = torch.empty(sum(self.sizes), device=wire.device, dtype=torch.uint8)
+        block = 1024
+        grid = (sum((size + block - 1) // block for size in self.sizes),)
+        assemble_mxfp4_strips_kernel[grid](
+            wire, self.strip_bases, output, *self.layout.shape, *self.sizes, BLOCK=block, num_warps=4
+        )
+        return tuple(part.view(shape) for part, shape in zip(output.split(self.sizes), self.shapes))
