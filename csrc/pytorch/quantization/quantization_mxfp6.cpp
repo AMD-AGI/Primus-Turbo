@@ -701,7 +701,8 @@ static void dual_out_fmt(const at::Tensor input, at::Tensor row_packed, at::Tens
                          at::Tensor col_packed, at::Tensor col_scale, const int64_t fmt,
                          const c10::optional<at::Tensor> row_c1 = c10::nullopt, const int64_t draws = 1,
                          const int64_t draw_codes = 0, const int64_t draw_scales = 0,
-                         const MXFP6AdamArgs<dtype::bfloat16> *adam = nullptr) {
+                         const MXFP6AdamArgs<dtype::bfloat16> *adam = nullptr,
+                         const c10::optional<at::Tensor> col_prob = c10::nullopt) {
     check_input(input);
     const c10::DeviceGuard device_guard(input.device());
     const int64_t          M = input.size(0);
@@ -737,6 +738,16 @@ static void dual_out_fmt(const at::Tensor input, at::Tensor row_packed, at::Tens
         col_ts.draws       = static_cast<int32_t>(draws);
         col_ts.draw_codes  = draw_codes;
         col_ts.draw_scales = draw_scales;
+    }
+    if (col_prob.has_value()) {
+        // Floor codes in col_packed, 4-bit round-up probabilities in col_prob (same size and layout).
+        TORCH_CHECK(col_fmt == MXPackFmt::Fp4Tile && draws == 1 && col_prob->numel() == col_packed.numel() &&
+                        col_prob->is_contiguous() && col_prob->scalar_type() == at::kByte,
+                    "quantize_mx_dual_out: col_prob takes a round-to-nearest FP4 tile column, one draw, and a uint8 "
+                    "buffer the size of col_packed");
+        col_ts.prob4      = 1;
+        col_ts.prob_delta = reinterpret_cast<intptr_t>(col_prob->data_ptr()) -
+                            reinterpret_cast<intptr_t>(col_packed.data_ptr());
     }
     MXTilePackScope fly_scope(row_ts, col_ts);
     // A direction whose two buffers are both empty is not emitted (a row-only or column-only pack of the fmt).
@@ -784,14 +795,15 @@ void quantize_mxfp6_dual_out(const at::Tensor input, at::Tensor row_packed, at::
 void quantize_mx_dual_out(const at::Tensor input, at::Tensor row_packed, at::Tensor row_scale,
                           at::Tensor col_packed, at::Tensor col_scale, const int64_t fmt,
                           const c10::optional<at::Tensor> row_c1, const int64_t draws,
-                          const int64_t draw_codes, const int64_t draw_scales) {
+                          const int64_t draw_codes, const int64_t draw_scales,
+                          const c10::optional<at::Tensor> col_prob) {
     dual_out_fmt(input, row_packed, row_scale, col_packed, col_scale, fmt, row_c1, draws, draw_codes,
-                 draw_scales);
+                 draw_scales, nullptr, col_prob);
 }
 
 void quantize_mx_dual_out_meta(const at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                                const int64_t, const c10::optional<at::Tensor>, const int64_t,
-                               const int64_t, const int64_t) {}
+                               const int64_t, const int64_t, const c10::optional<at::Tensor>) {}
 
 // quantize_mx_dual_out of a bf16 parameter right after (and fused with) its optimizer step: Transformer
 // Engine's FusedAdam with store_param_remainders (master = parameter bits + int16 remainder, fp32 moments),

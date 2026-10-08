@@ -296,7 +296,7 @@ def test_bad_option_combinations_are_rejected():
         )
         quantize_mx_ln_modulate(x, mean, mean + 1, mod, mod, False, tile2d)
     with pytest.raises(RuntimeError, match="unknown fmt bits"):
-        quantize_mx_dual(x, 1 << 26)
+        quantize_mx_dual(x, 1 << 27)  # bit 26 is MX_FMT_COL_KOUTER
 
 
 @pytest.mark.parametrize("row", [None, "fp4"])
@@ -336,3 +336,45 @@ def test_column_only_sr_rejected_off_fly():
     _skip()
     with pytest.raises(RuntimeError, match="column-only stochastic"):
         quantize_mx_dual(_rand(256, 256), fp4_options(MX_FMT_FLY_ACT, col_sr=True))
+
+
+@pytest.mark.parametrize("rows,cols", [(512, 3072), (256, 12288)])
+def test_column_prob4_deferred_sr(rows, cols):
+    """col_prob: the FP4 tile column (K256-outer) emitted rounded down, with each code's 4-bit round-up probability
+    in a second buffer of the same layout; fp4_prob_round finishes the stochastic rounding in place. The row
+    direction and the column scales equal the round-to-nearest pack's; a floor code is the RTN code or one below
+    it, as its probability says; a receiver rounds a code up with frequency p / 16, deterministically per seed.
+    """
+    _skip()
+    from primus_turbo.triton.quantization.fp4_prob_round import fp4_prob_round
+
+    x = _rand(rows, cols, seed=11)
+    fmt = P.ts_fmt(row=P.TS_A, col=P.ts_b_params(rows, cols, rows)) | P.MX_FMT_COL_KOUTER
+    rp, rs = P.mx_dir_sizes(rows, cols, fmt, False)
+    cp, cs = P.mx_dir_sizes(rows, cols, fmt, True)
+    nb = lambda n: torch.empty(n, dtype=torch.uint8, device="cuda")  # noqa: E731
+    rn, fl, prob = [nb(rp), nb(rs), nb(cp), nb(cs)], [nb(rp), nb(rs), nb(cp), nb(cs)], nb(cp)
+    P.quantize_mx_dual_out(x, *rn, fmt)
+    P.quantize_mx_dual_out(x, *fl, fmt, col_prob=prob)
+    assert torch.equal(fl[0], rn[0]) and torch.equal(fl[1], rn[1]) and torch.equal(fl[3], rn[3])
+
+    def nib(t):
+        return torch.stack([t & 15, t >> 4], -1).reshape(-1).long()
+
+    c_rn, c_fl, p = nib(rn[2]), nib(fl[2]), nib(prob)
+    m_rn, m_fl = c_rn & 7, c_fl & 7
+    assert ((m_fl == m_rn) | (p >= 8)).all() and ((m_fl + 1 == m_rn) | (p <= 8)).all()
+    assert (p[m_fl == 7] == 0).all()
+    nz = (m_rn > 0) & (m_fl > 0)
+    assert ((c_rn & 8) == (c_fl & 8))[nz].all()
+    ups, S = torch.zeros_like(p, dtype=torch.float32), 128
+    for seed in range(S):
+        c = fl[2].clone()
+        fp4_prob_round(c, prob, seed)
+        d = (nib(c) & 7) - m_fl
+        assert ((d == 0) | (d == 1)).all() and ((nib(c) & 8) == (c_fl & 8)).all()
+        ups += d.float()
+    assert abs((ups / S - p.float() / 16).mean().item()) < 3e-3 and (ups[p == 0] == 0).all()
+    a, b, c = fl[2].clone(), fl[2].clone(), fl[2].clone()
+    fp4_prob_round(a, prob, 5), fp4_prob_round(b, prob, 5), fp4_prob_round(c, prob, 6)
+    assert torch.equal(a, b) and not torch.equal(a, c)

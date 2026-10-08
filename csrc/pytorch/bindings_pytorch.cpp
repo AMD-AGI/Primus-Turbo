@@ -193,7 +193,7 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     m.def("quantize_mxfp6_fused_dual(Tensor input, Tensor? aux, Tensor? bias, int mode, "
           "bool want_col_sum) -> Tensor[]");
     m.def("quantize_mxfp6_fused_dual_out(Tensor input, Tensor? aux, Tensor? bias, int prologue_mode, Tensor(a!) row_packed, Tensor(b!) row_scale, Tensor(c!) col_packed, Tensor(d!) col_scale, Tensor(e!)? col_sum=None) -> ()");
-    m.def("quantize_mx_dual_out(Tensor input, Tensor(a!) row_packed, Tensor(b!) row_scale, Tensor(c!) col_packed, Tensor(d!) col_scale, int fmt, Tensor(e!)? row_c1=None, int draws=1, int draw_codes=0, int draw_scales=0) -> ()");
+    m.def("quantize_mx_dual_out(Tensor input, Tensor(a!) row_packed, Tensor(b!) row_scale, Tensor(c!) col_packed, Tensor(d!) col_scale, int fmt, Tensor(e!)? row_c1=None, int draws=1, int draw_codes=0, int draw_scales=0, Tensor(f!)? col_prob=None) -> ()");
     m.def("quantize_mx_dual_out_adam(Tensor(p!) param, Tensor grad, Tensor(m!) exp_avg, Tensor(v!) exp_avg_sq, Tensor(r!) remainder, Tensor(a!) row_packed, Tensor(b!) row_scale, Tensor(c!) col_packed, Tensor(d!) col_scale, int fmt, Tensor(e!)? row_c1, int draws, int draw_codes, int draw_scales, float lr, float beta1, float beta2, float eps, float weight_decay, int step, bool adamw, bool bias_correction) -> ()");
     m.def("quantize_mx_fused_dual_out(Tensor input, Tensor? aux, Tensor? bias, int prologue_mode, Tensor(a!) row_packed, Tensor(b!) row_scale, Tensor(c!) col_packed, Tensor(d!) col_scale, Tensor(e!)? col_sum, int fmt) -> ()");
     m.def("quantize_mxfp6_qk_norm_rope_bwd(Tensor input, Tensor dq, Tensor dk, Tensor dv, "

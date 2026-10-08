@@ -107,6 +107,8 @@ struct TilePackArgs {
     int64_t c1_delta = 0;
     int32_t draws = 1;     // independent column draws per launch (see MXTilePack)
     int64_t draw_codes = 0, draw_scales = 0;
+    int32_t prob4 = 0;     // floor codes + 4-bit round-up probabilities at prob_delta (see MXTilePack); OPTS only
+    int64_t prob_delta = 0;
 };
 
 // Scale rules. 0 is RCEIL, ceil_pow2(amax / 6): never saturates. 1-3 are Turbo's
@@ -348,8 +350,41 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
         // The scales do not depend on the draw: with draw_scales == 0 the draws share one scale plane, stored once.
         const bool store_scale = d == 0 || fly.draw_scales != 0;
         uint4_t words = {0u, 0u, 0u, 0u};
+        uint4_t pwords = {0u, 0u, 0u, 0u}; // prob4: the round-up probabilities, nibble for nibble with the codes
     #if defined(__gfx950__) && !MXFP4_ABLATE_CVT
-        if (SR && amax != 0.0f) {
+        if (OPTS && !SR && fly.prob4 && amax != 0.0f) {
+            // Stochastic rounding deferred to the receivers: each code is the E2M1 value at or below |v| / scale (the
+            // sign kept) and its nibble in `pwords` the probability of rounding up, (|v| / scale - floor) / step in
+            // sixteenths, rounded half to even; 16/16 moves the code up with probability 0. A receiver adds 1 to the
+            // magnitude when its own uniform 4-bit draw is below the probability (fp4_prob_round). The scale is the
+            // one the direct emit uses, so the expected value is the value the probability resolves.
+            const float inv_scale = 1.0f / conversion_scale; // a power of two: exact
+    #pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                uint32_t word = 0, pword = 0;
+    #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float   v   = static_cast<float>(pairs[4 * w + j / 2][j % 2]);
+                    const float   y   = fminf(fabsf(v) * inv_scale, 6.0f);
+                    const float   stp = y < 2.0f ? 0.5f : (y < 4.0f ? 1.0f : 2.0f);
+                    const float   bas = y < 2.0f ? 0.0f : (y < 4.0f ? 2.0f : 4.0f);
+                    const int32_t i0  = y < 2.0f ? 0 : (y < 4.0f ? 4 : 6);
+                    const float   t   = (y - bas) / stp; // exact: power-of-two step
+                    const float   fl  = floorf(t);
+                    int32_t       idx = i0 + static_cast<int32_t>(fl);
+                    int32_t       pr  = static_cast<int32_t>(rintf((t - fl) * 16.0f));
+                    if (pr == 16) {
+                        idx += 1;
+                        pr = 0;
+                    }
+                    const uint32_t code = static_cast<uint32_t>(idx) | (signbit(v) ? 8u : 0u);
+                    word |= code << (4 * j);
+                    pword |= static_cast<uint32_t>(pr) << (4 * j);
+                }
+                words[w]  = word;
+                pwords[w] = pword;
+            }
+        } else if (SR && amax != 0.0f) {
             // The SR conversion does not preserve the accumulator's other bytes the way the RTN
             // one does (probed on gfx950: with sel=1 byte 0 is cleared and the upper half holds
             // stale register contents), so each pair converts into byte 0 of a fresh register and
@@ -442,6 +477,9 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
                 address = (((n0 * (row_bytes / 32) + kblock) * 2 + half) * 16 + r16) * kBytesPerBlock;
             }
             *reinterpret_cast<uint4_t *>(pk + address) = words;
+            if constexpr (OPTS && LAYOUT == Layout::Tile)
+                if (fly.prob4)
+                    *reinterpret_cast<uint4_t *>(pk + fly.prob_delta + address) = pwords;
 
             // Scales. Plain: row-major [rows, K/32]. Otherwise shuffle_scale(): view (Mp/32, 2, 16,
             // Sp/8, 2, 4) -> permute (0, 3, 5, 2, 4, 1), with Sp = K/32 = 4 * nk.

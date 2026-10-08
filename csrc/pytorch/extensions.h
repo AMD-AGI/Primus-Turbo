@@ -124,11 +124,13 @@ void quantize_mxfp6_dual_out_meta(const at::Tensor input, at::Tensor row_packed,
 void quantize_mx_dual_out(const at::Tensor input, at::Tensor row_packed, at::Tensor row_scale,
                           at::Tensor col_packed, at::Tensor col_scale, const int64_t fmt,
                           const c10::optional<at::Tensor> row_c1, const int64_t draws,
-                          const int64_t draw_codes, const int64_t draw_scales);
+                          const int64_t draw_codes, const int64_t draw_scales,
+                          const c10::optional<at::Tensor> col_prob);
 void quantize_mx_dual_out_meta(const at::Tensor input, at::Tensor row_packed, at::Tensor row_scale,
                                at::Tensor col_packed, at::Tensor col_scale, const int64_t fmt,
                                const c10::optional<at::Tensor> row_c1, const int64_t draws,
-                               const int64_t draw_codes, const int64_t draw_scales);
+                               const int64_t draw_codes, const int64_t draw_scales,
+                               const c10::optional<at::Tensor> col_prob);
 void quantize_mx_dual_out_adam(at::Tensor param, const at::Tensor grad, at::Tensor exp_avg,
                                at::Tensor exp_avg_sq, at::Tensor remainder, at::Tensor row_packed,
                                at::Tensor row_scale, at::Tensor col_packed, at::Tensor col_scale,

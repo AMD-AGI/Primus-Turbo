@@ -1620,7 +1620,7 @@ namespace {
 MXTilePack               g_ts_row, g_ts_col;
 mxfp4_emit::TilePackArgs to_args(const MXTilePack &p) {
     return {p.is_b, p.nt, p.ilv, p.k128, p.rows, p.fp4_round, p.fp4_had, p.fp4_tile2d, p.kouter, p.c1_split, p.c1_delta,
-            p.draws, p.draw_codes, p.draw_scales};
+            p.draws, p.draw_codes, p.draw_scales, p.prob4, p.prob_delta};
 }
 } // namespace
 
@@ -1656,7 +1656,7 @@ void launch_dual(const dim3 grid, const dim3 block, hipStream_t stream, const DT
     // Any FP4 option set (scale rule, Hadamard, 2-D) takes the option-capable instantiation; the
     // default emit is compiled without the option paths (see mxfp4_emit_group's OPTS).
     const bool opts = row_fly.fp4_round || row_fly.fp4_had || row_fly.fp4_tile2d ||
-                      col_fly.fp4_round || col_fly.fp4_had || col_fly.fp4_tile2d;
+                      col_fly.fp4_round || col_fly.fp4_had || col_fly.fp4_tile2d || col_fly.prob4;
     auto launch = [&](auto r, auto c, auto o) {
         constexpr MXPackFmt R = decltype(r)::value;
         constexpr MXPackFmt C = decltype(c)::value;

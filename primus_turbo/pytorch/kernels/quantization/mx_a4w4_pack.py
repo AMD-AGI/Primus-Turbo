@@ -259,15 +259,20 @@ def quantize_mx_gate_mul(x, gate, want_col_sum: bool, fmt: int) -> Tuple[torch.T
 
 
 def quantize_mx_dual_out(
-    x, row_packed, row_scale, col_packed, col_scale, fmt: int, row_c1=None, draws=1, draw_codes=0, draw_scales=0
+    x, row_packed, row_scale, col_packed, col_scale, fmt: int, row_c1=None, draws=1, draw_codes=0, draw_scales=0,
+    col_prob=None,
 ) -> None:
     """``quantize_mx_dual`` into caller buffers (size them with ``mx_dir_sizes``). A direction whose two buffers are
     empty is not emitted. ``row_c1``: MXFP6 K128-blocked rows (``ts6_fmt``) with the C1 plane in its own buffer
     (``row_packed`` then holds the C0 plane). ``draws``: that many independent draws of an FP4 column direction from
     one read of ``x`` (stochastic rounding: draw d's seed derives from the launch seed and d), draw d at
-    ``d * draw_codes`` / ``d * draw_scales`` bytes past ``col_packed`` / ``col_scale`` in the same allocations."""
+    ``d * draw_codes`` / ``d * draw_scales`` bytes past ``col_packed`` / ``col_scale`` in the same allocations.
+    ``col_prob`` (a round-to-nearest FP4 tile column, one draw): the column codes are emitted rounded down and
+    ``col_prob`` (``col_packed``'s size and layout) gets each code's 4-bit round-up probability; a receiver finishes
+    the stochastic rounding with ``fp4_prob_round``."""
     _ops().quantize_mx_dual_out(
-        x.contiguous(), row_packed, row_scale, col_packed, col_scale, fmt, row_c1, draws, draw_codes, draw_scales
+        x.contiguous(), row_packed, row_scale, col_packed, col_scale, fmt, row_c1, draws, draw_codes, draw_scales,
+        col_prob,
     )
 
 
