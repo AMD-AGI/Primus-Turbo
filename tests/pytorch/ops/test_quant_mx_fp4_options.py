@@ -22,9 +22,9 @@ from primus_turbo.pytorch.kernels.quantization import mx_a4w4_pack as P
 from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import (
     TS_A,
     MX_FMT_A4W4_GRAD,
-    MX_FMT_FLY_ACT,
-    MX_FMT_FLY_GRAD,
-    MX_FMT_FLY_GRAD_SR,
+    MX_FMT_PLAIN_ACT,
+    MX_FMT_PLAIN_GRAD,
+    MX_FMT_PLAIN_GRAD_SR,
     a4w4_logical,
     ts_fmt,
     ts_operand,
@@ -147,7 +147,7 @@ def test_reference_is_the_default_packer():
     _skip()
     rows, cols = 512, 3072
     x = _rand(rows, cols, seed=1)
-    p = quantize_mx_dual(x, MX_FMT_FLY_GRAD)
+    p = quantize_mx_dual(x, MX_FMT_PLAIN_GRAD)
     _check(_plain(p, rows, cols, "row"), _ref_fp4(x), "row")
     _check(_plain(p, rows, cols, "col"), _ref_fp4(x.t()), "col")
 
@@ -155,8 +155,8 @@ def test_reference_is_the_default_packer():
 def test_all_zero_options_are_the_default():
     for fmt in (
         MX_FMT_A4W4_GRAD,
-        MX_FMT_FLY_GRAD,
-        MX_FMT_FLY_ACT,
+        MX_FMT_PLAIN_GRAD,
+        MX_FMT_PLAIN_ACT,
         ts_fmt(TS_A, TS_A),
     ):
         assert fp4_options(fmt) == fmt, hex(fmt)
@@ -173,7 +173,7 @@ def test_gradient_options_bit_exact(rows, cols, rnd, had):
         ROUNDS[(ROUNDS.index(rnd) + 1) % 4],
         HADS[(HADS.index(had) + 1) % 3],
     )
-    fmt = fp4_options(MX_FMT_FLY_GRAD, rnd, col_rnd, had, col_had)
+    fmt = fp4_options(MX_FMT_PLAIN_GRAD, rnd, col_rnd, had, col_had)
     p = quantize_mx_dual(x, fmt)
     _check(_plain(p, rows, cols, "row"), _ref_fp4(x, rnd, had), "row")
     _check(_plain(p, rows, cols, "col"), _ref_fp4(x.t(), col_rnd, col_had), "col")
@@ -191,10 +191,10 @@ def test_options_reach_every_fp4_layout(rnd, had):
     _check((_unpack(c[:rows, : cols // 2]), s[:rows, : cols // 32].cpu()), ref, "a4w4")
     f = quantize_mx_dual(x, fp4_options(ts_fmt(TS_A, TS_A), rnd, rnd, had, had))
     fc, fs = ts_operand(f[0], f[1], rows, cols)
-    assert torch.equal(_unpack(fc), ref[0]), "fly codes"
+    assert torch.equal(_unpack(fc), ref[0]), "tilescale codes"
     # The packed slab is a permutation of the scales (its layout is tested elsewhere).
     got = fs.view(torch.uint8)[: rows * cols // 32].cpu().sort().values
-    assert torch.equal(got, ref[1].reshape(-1).sort().values), "fly scales"
+    assert torch.equal(got, ref[1].reshape(-1).sort().values), "tilescale scales"
 
 
 @pytest.mark.parametrize("rnd", ROUNDS)
@@ -203,9 +203,9 @@ def test_weight_column_options_leave_fp6_rows(rnd):
     _skip()
     rows, cols = 768, 1280
     x = _rand(rows, cols, seed=5)
-    base = quantize_mx_dual(x, MX_FMT_FLY_ACT)
+    base = quantize_mx_dual(x, MX_FMT_PLAIN_ACT)
     p = quantize_mx_dual(
-        x, fp4_options(MX_FMT_FLY_ACT, col_round=rnd, col_hadamard="h16")
+        x, fp4_options(MX_FMT_PLAIN_ACT, col_round=rnd, col_hadamard="h16")
     )
     assert torch.equal(
         mxfp6_data_region(p[0], rows, cols), mxfp6_data_region(base[0], rows, cols)
@@ -225,7 +225,7 @@ def test_tile2d(rows, cols, rnd):
     """
     _skip()
     x = _rand(rows, cols, seed=6)
-    fmt = fp4_options(MX_FMT_FLY_GRAD, rnd, rnd, "none", "none", tile2d=True)
+    fmt = fp4_options(MX_FMT_PLAIN_GRAD, rnd, rnd, "none", "none", tile2d=True)
     p = quantize_mx_dual(x, fmt)
     row, col = _plain(p, rows, cols, "row"), _plain(p, rows, cols, "col")
     _check(row, _ref_fp4(x, rnd, "none", tile2d=True), "row")
@@ -239,7 +239,7 @@ def test_tile2d_single_direction():
     _skip()
     rows, cols = 512, 1280
     x = _rand(rows, cols, seed=7)
-    fmt = fp4_options(MX_FMT_FLY_GRAD, "m0", "m0", "none", "none", tile2d=True)
+    fmt = fp4_options(MX_FMT_PLAIN_GRAD, "m0", "m0", "none", "none", tile2d=True)
     dual = quantize_mx_dual(x, fmt)
     for axis, which in ((1, "row"), (0, "col")):
         c, s = quantize_mx(x, axis, fmt)
@@ -255,8 +255,8 @@ def test_sr_keeps_the_option_scale():
     rows, cols = 512, 3072
     x = _rand(rows, cols, seed=8)
     opts = dict(row_round="m0", col_round="m2", row_hadamard="none", col_hadamard="h16")
-    rtn = quantize_mx_dual(x, fp4_options(MX_FMT_FLY_GRAD, **opts))
-    sr = quantize_mx_dual(x, fp4_options(MX_FMT_FLY_GRAD_SR, **opts))
+    rtn = quantize_mx_dual(x, fp4_options(MX_FMT_PLAIN_GRAD, **opts))
+    sr = quantize_mx_dual(x, fp4_options(MX_FMT_PLAIN_GRAD_SR, **opts))
     for which in ("row", "col"):
         assert torch.equal(
             _plain(rtn, rows, cols, which)[1], _plain(sr, rows, cols, which)[1]
@@ -271,7 +271,7 @@ def test_saturating_rules_clip_and_rceil_does_not():
     x = x.to(torch.bfloat16)
     for rnd, clips in (("rceil", False), ("m1", False), ("m0", True), ("m2", True)):
         c, s = _plain(
-            quantize_mx_dual(x, fp4_options(MX_FMT_FLY_GRAD, rnd, rnd, "none", "none")),
+            quantize_mx_dual(x, fp4_options(MX_FMT_PLAIN_GRAD, rnd, rnd, "none", "none")),
             256,
             256,
             "row",
@@ -284,15 +284,15 @@ def test_bad_option_combinations_are_rejected():
     _skip()
     x = _rand(256, 256)
     with pytest.raises(RuntimeError, match="FP6"):
-        quantize_mx_dual(x, fp4_options(MX_FMT_FLY_ACT, row_round="m0"))
+        quantize_mx_dual(x, fp4_options(MX_FMT_PLAIN_ACT, row_round="m0"))
     with pytest.raises(RuntimeError, match="FP6"):
-        quantize_mx_dual(x, fp4_options(MX_FMT_FLY_ACT, row_hadamard="none"))
+        quantize_mx_dual(x, fp4_options(MX_FMT_PLAIN_ACT, row_hadamard="none"))
     with pytest.raises(RuntimeError, match="no Hadamard"):
-        quantize_mx_dual(x, fp4_options(MX_FMT_FLY_GRAD, tile2d=True))
+        quantize_mx_dual(x, fp4_options(MX_FMT_PLAIN_GRAD, tile2d=True))
     with pytest.raises(RuntimeError, match="prologue"):
         mean, mod = torch.zeros(256, device="cuda"), _rand(1, 256)
         tile2d = fp4_options(
-            MX_FMT_FLY_GRAD, "rceil", "rceil", "none", "none", tile2d=True
+            MX_FMT_PLAIN_GRAD, "rceil", "rceil", "none", "none", tile2d=True
         )
         quantize_mx_ln_modulate(x, mean, mean + 1, mod, mod, False, tile2d)
     with pytest.raises(RuntimeError, match="unknown fmt bits"):
@@ -332,10 +332,10 @@ def test_column_only_sr(row):
     assert ((mag1 - magr).abs() <= 1).all()
 
 
-def test_column_only_sr_rejected_off_fly():
+def test_column_only_sr_rejected_off_tilescale():
     _skip()
     with pytest.raises(RuntimeError, match="column-only stochastic"):
-        quantize_mx_dual(_rand(256, 256), fp4_options(MX_FMT_FLY_ACT, col_sr=True))
+        quantize_mx_dual(_rand(256, 256), fp4_options(MX_FMT_PLAIN_ACT, col_sr=True))
 
 
 @pytest.mark.parametrize("bits", [4, 2])

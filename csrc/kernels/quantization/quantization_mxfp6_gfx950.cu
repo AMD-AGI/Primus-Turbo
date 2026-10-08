@@ -32,14 +32,14 @@ void mxfp6_tile_to_fp4_col_impl(const uint8_t *c0, const uint8_t *c1, const uint
                                 const int64_t K, uint8_t *col_packed, uint8_t *col_scale, const bool sr,
                                 const uint32_t seed, hipStream_t stream) {
     PRIMUS_TURBO_CHECK(R % kGroupSize == 0 && K % 256 == 0, "mxfp6_tile_to_fp4_col: R % 32 == 0, K % 256 == 0");
-    const auto row_fly = to_args(g_ts_row), col_fly = to_args(g_ts_col);
+    const auto row_ts = to_args(g_ts_row), col_ts = to_args(g_ts_col);
     const dim3 grid(static_cast<uint32_t>(K / 256), static_cast<uint32_t>(R / kGroupSize)), block(256);
     if (sr)
         mxfp6_tile_to_fp4_col_kernel<true>
-            <<<grid, block, 0, stream>>>(c0, c1, row_scale, col_packed, col_scale, seed, row_fly, col_fly);
+            <<<grid, block, 0, stream>>>(c0, c1, row_scale, col_packed, col_scale, seed, row_ts, col_ts);
     else
         mxfp6_tile_to_fp4_col_kernel<false>
-            <<<grid, block, 0, stream>>>(c0, c1, row_scale, col_packed, col_scale, seed, row_fly, col_fly);
+            <<<grid, block, 0, stream>>>(c0, c1, row_scale, col_packed, col_scale, seed, row_ts, col_ts);
 }
 
 } // namespace primus_turbo

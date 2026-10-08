@@ -643,15 +643,15 @@ __device__ __forceinline__ void gate_mul_prologue_bf16(uint16_t (*s_tile)[LDS_PI
  * that version assembled from four lanes' strided pieces collapses to the identity
  * even[i] = v[2i], odd[i] = v[2i+1].
  */
-// OPTS (option-capable instantiation): fly.fp4_had == 1 skips the Hadamard, and `tile_amax` >= 0 replaces the
+// OPTS (option-capable instantiation): ts.fp4_had == 1 skips the Hadamard, and `tile_amax` >= 0 replaces the
 // group's amax (2-D 32x32 block scaling: the tile's amax over the same bf16 values; host-enforced with no Hadamard).
 template <bool KBLK = false, bool OPTS = false>
 __device__ __forceinline__ void
 mxfp6_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32_t group,
                  const int32_t nk_pad, uint8_t *__restrict__ packed,
-                 uint8_t *__restrict__ packed_scale, const mxfp4_emit::TilePackArgs fly = {},
+                 uint8_t *__restrict__ packed_scale, const mxfp4_emit::TilePackArgs ts = {},
                  const float tile_amax = -1.0f) {
-    if (!(OPTS && fly.fp4_had == 1)) {
+    if (!(OPTS && ts.fp4_had == 1)) {
 #pragma unroll
         for (int stage = 0; stage < 5; ++stage) {
             const int h = 1 << stage;
@@ -714,23 +714,23 @@ mxfp6_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
 #endif
 
     if constexpr (KBLK) {
-        // FlyDSL A6W6: the same 24 bytes (C0 = bytes 0..15, C1 = 16..23) stored K128-blocked so one
+        // A6W6 tilescale: the same 24 bytes (C0 = bytes 0..15, C1 = 16..23) stored K128-blocked so one
         // LDS-DMA instruction reads a contiguous KiB: C0 [rows/16, K/128, 16, 64], C1 [rows/32,
-        // K/128, 32, 32], C1 after C0 in one buffer; scales in FlyDSL's packed layout (nt 4, ilv
+        // K/128, 32, 32], C1 after C0 in one buffer; scales in the tilescale packed layout (nt 4, ilv
         // 0).
-        if (out_row >= fly.rows || group >= fly.k128 * 4)
+        if (out_row >= ts.rows || group >= ts.k128 * 4)
             return;
-        const int64_t nk = fly.k128;
+        const int64_t nk = ts.k128;
         const int64_t rpad =
-            (static_cast<int64_t>(fly.rows) + kTileRows - 1) / kTileRows * kTileRows;
+            (static_cast<int64_t>(ts.rows) + kTileRows - 1) / kTileRows * kTileRows;
         const int64_t s = group >> 2, g = group & 3;
         const int64_t c0 = (((out_row >> 4) * nk + s) * 16 + (out_row & 15)) * 64 + g * 16;
-        const int64_t c1 = (fly.c1_split ? fly.c1_delta : rpad * nk * 64) +
+        const int64_t c1 = (ts.c1_split ? ts.c1_delta : rpad * nk * 64) +
                            (((out_row >> 5) * nk + s) * 32 + (out_row & 31)) * 32 + g * 8;
         *reinterpret_cast<uint4_t *>(packed + c0) = *reinterpret_cast<const uint4_t *>(&fp6);
         *reinterpret_cast<uint2_t *>(packed + c1) =
             *reinterpret_cast<const uint2_t *>(reinterpret_cast<const uint8_t *>(&fp6) + 16);
-        packed_scale[mxfp4_emit::ts_scale_byte(out_row, group, fly)] = scale_exp;
+        packed_scale[mxfp4_emit::ts_scale_byte(out_row, group, ts)] = scale_exp;
         return;
     }
     const int32_t tile_row  = static_cast<int32_t>(out_row / kTileRows);
@@ -805,42 +805,42 @@ template <MXPackFmt FMT, bool OPTS = false>
 __device__ __forceinline__ void
 emit_group_fmt(float (&values)[kGroupSize], const int64_t out_row, const int32_t group,
                const int32_t  nk, uint8_t *__restrict__ packed, uint8_t *__restrict__ packed_scale,
-               const uint32_t sr_seed, const mxfp4_emit::TilePackArgs fly,
+               const uint32_t sr_seed, const mxfp4_emit::TilePackArgs ts,
                const float tile_amax = -1.0f) {
     if constexpr (FMT == MXPackFmt::Fp6) {
         mxfp6_emit_group(values, out_row, group, nk, packed, packed_scale);
     } else if constexpr (FMT == MXPackFmt::Fp6Tile) {
-        mxfp6_emit_group<true, OPTS>(values, out_row, group, nk, packed, packed_scale, fly, tile_amax);
+        mxfp6_emit_group<true, OPTS>(values, out_row, group, nk, packed, packed_scale, ts, tile_amax);
     } else if constexpr (FMT == MXPackFmt::Fp4Blob) {
         mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::A6W4Blob, false, OPTS>(
-            values, out_row, group, nk, packed, packed_scale, 0u, fly, tile_amax);
+            values, out_row, group, nk, packed, packed_scale, 0u, ts, tile_amax);
     } else if constexpr (FMT == MXPackFmt::Fp4A) {
         mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::A4W4A, false, OPTS>(
-            values, out_row, group, nk, packed, packed_scale, 0u, fly, tile_amax);
+            values, out_row, group, nk, packed, packed_scale, 0u, ts, tile_amax);
     } else if constexpr (FMT == MXPackFmt::Fp4ASr) {
         mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::A4W4A, true, OPTS>(
-            values, out_row, group, nk, packed, packed_scale, sr_seed, fly, tile_amax);
+            values, out_row, group, nk, packed, packed_scale, sr_seed, ts, tile_amax);
     } else if constexpr (FMT == MXPackFmt::Fp4Plain) {
         mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::Plain, false, OPTS>(
-            values, out_row, group, nk, packed, packed_scale, 0u, fly, tile_amax);
+            values, out_row, group, nk, packed, packed_scale, 0u, ts, tile_amax);
     } else if constexpr (FMT == MXPackFmt::Fp4PlainSr) {
         mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::Plain, true, OPTS>(
-            values, out_row, group, nk, packed, packed_scale, sr_seed, fly, tile_amax);
+            values, out_row, group, nk, packed, packed_scale, sr_seed, ts, tile_amax);
     } else if constexpr (FMT == MXPackFmt::Fp4BlobSr) {
         mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::A6W4Blob, true, OPTS>(
-            values, out_row, group, nk, packed, packed_scale, sr_seed, fly, tile_amax);
+            values, out_row, group, nk, packed, packed_scale, sr_seed, ts, tile_amax);
     } else if constexpr (FMT == MXPackFmt::Fp4Tile) {
         mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::Tile, false, OPTS>(
-            values, out_row, group, nk, packed, packed_scale, 0u, fly, tile_amax);
+            values, out_row, group, nk, packed, packed_scale, 0u, ts, tile_amax);
     } else if constexpr (FMT == MXPackFmt::Fp4TileSr) {
         mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::Tile, true, OPTS>(
-            values, out_row, group, nk, packed, packed_scale, sr_seed, fly, tile_amax);
+            values, out_row, group, nk, packed, packed_scale, sr_seed, ts, tile_amax);
     } else if constexpr (FMT == MXPackFmt::Fp4TileK128) {
         mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::TileK128, false, OPTS>(
-            values, out_row, group, nk, packed, packed_scale, 0u, fly, tile_amax);
+            values, out_row, group, nk, packed, packed_scale, 0u, ts, tile_amax);
     } else {
         mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::A4W4B, false, OPTS>(
-            values, out_row, group, nk, packed, packed_scale, 0u, fly, tile_amax);
+            values, out_row, group, nk, packed, packed_scale, 0u, ts, tile_amax);
     }
 }
 
@@ -869,7 +869,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
     uint8_t *__restrict__ col_packed, uint8_t *__restrict__ col_scale, float *__restrict__ col_sum,
     const int32_t M, const int32_t N, const int32_t row_nk_pad, const int32_t col_nk_pad,
     const prologue_args_t<DType, PROLOGUE> pargs, const uint32_t sr_seed,
-    const mxfp4_emit::TilePackArgs row_fly, const mxfp4_emit::TilePackArgs col_fly) {
+    const mxfp4_emit::TilePackArgs row_ts, const mxfp4_emit::TilePackArgs col_ts) {
     static_assert(TILE_N % kGroupSize == 0, "a staged patch must hold whole groups both ways");
     static_assert(TILE_N <= THREADS_PER_BLOCK,
                   "the column-sum pass assigns one column per thread");
@@ -1099,7 +1099,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                                 to_dot_operand<DType>(s_tile[local_m][n_offset + i]);
                         emit_group_fmt<ROW_FMT, FP4_OPTS>(values, tile_m + local_m,
                                                           tile_n / kGroupSize + k_block, row_nk_pad,
-                                                          row_packed, row_scale, row_seed, row_fly);
+                                                          row_packed, row_scale, row_seed, row_ts);
                     }
                 }
                 if constexpr (DO_COL) {
@@ -1112,7 +1112,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                                 s_tile[stage * kStageRows + i][col_slot]);
                         emit_group_fmt<COL_FMT, FP4_OPTS>(values, tile_n + col_slot,
                                                           tile_m / kGroupSize + stage, col_nk_pad,
-                                                          col_packed, col_scale, col_seed, col_fly);
+                                                          col_packed, col_scale, col_seed, col_ts);
                     }
                 }
             }
@@ -1534,7 +1534,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
     constexpr int    kTiles2dN = FP4_OPTS ? TILE_N / kGroupSize : 1;
     __shared__ float s_colmax2d[kTiles2dM][FP4_OPTS ? TILE_N : 1];
     __shared__ float s_tilemax2d[kTiles2dM][kTiles2dN];
-    const bool       tile2d = FP4_OPTS && (row_fly.fp4_tile2d || col_fly.fp4_tile2d);
+    const bool       tile2d = FP4_OPTS && (row_ts.fp4_tile2d || col_ts.fp4_tile2d);
     if (tile2d) {
         for (int c = slot; c < kTiles2dM * TILE_N; c += THREADS_PER_BLOCK) {
             const int mb = c / TILE_N, col = c % TILE_N;
@@ -1581,7 +1581,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
 
             emit_group_fmt<ROW_FMT, FP4_OPTS>(
                 values, tile_m + local_m, tile_n / kGroupSize + k_block, row_nk_pad, row_packed,
-                row_scale, row_seed, row_fly,
+                row_scale, row_seed, row_ts,
                 tile2d ? s_tilemax2d[local_m / kGroupSize][k_block] : -1.0f);
         }
     }
@@ -1605,7 +1605,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
 
             emit_group_fmt<COL_FMT, FP4_OPTS>(
                 values, tile_n + local_n, tile_m / kGroupSize + k_block, col_nk_pad, col_packed,
-                col_scale, col_seed, col_fly,
+                col_scale, col_seed, col_ts,
                 tile2d ? s_tilemax2d[k_block][local_n / kGroupSize] : -1.0f);
         }
     }
@@ -1661,18 +1661,18 @@ template <bool SR>
 __global__ __launch_bounds__(256) void mxfp6_tile_to_fp4_col_kernel(
     const uint8_t *__restrict__ c0, const uint8_t *__restrict__ c1, const uint8_t *__restrict__ row_scale,
     uint8_t *__restrict__ col_packed, uint8_t *__restrict__ col_scale, const uint32_t seed,
-    const mxfp4_emit::TilePackArgs row_fly, const mxfp4_emit::TilePackArgs col_fly) {
+    const mxfp4_emit::TilePackArgs row_ts, const mxfp4_emit::TilePackArgs col_ts) {
     __shared__ float tile[kGroupSize][256 + 1];
     const int32_t    r0 = blockIdx.y * kGroupSize, k0 = blockIdx.x * 256, t = threadIdx.x;
     {
         const int32_t  lr = t >> 3, g = t & 7, row = r0 + lr, group = (k0 >> 5) + g;
-        const int64_t  nk = row_fly.k128, s = group >> 2, gg = group & 3;
+        const int64_t  nk = row_ts.k128, s = group >> 2, gg = group & 3;
         const uint4    a  = *reinterpret_cast<const uint4 *>(c0 + (((int64_t(row) >> 4) * nk + s) * 16 + (row & 15)) * 64 +
                                                          gg * 16);
         const uint2    b  = *reinterpret_cast<const uint2 *>(c1 + (((int64_t(row) >> 5) * nk + s) * 32 + (row & 31)) * 32 +
                                                          gg * 8);
         const uint32_t w[7] = {a.x, a.y, a.z, a.w, b.x, b.y, 0u};
-        const uint8_t  se   = row_scale[mxfp4_emit::ts_scale_byte(row, group, row_fly)];
+        const uint8_t  se   = row_scale[mxfp4_emit::ts_scale_byte(row, group, row_ts)];
         const float    sc   = __builtin_bit_cast(float, se == 0 ? 0x00400000u : static_cast<uint32_t>(se) << 23);
 #pragma unroll
         for (int i = 0; i < kGroupSize; ++i) {
@@ -1689,7 +1689,7 @@ __global__ __launch_bounds__(256) void mxfp6_tile_to_fp4_col_kernel(
     for (int i = 0; i < kGroupSize; ++i)
         values[i] = tile[i][t];
     mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::Tile, SR, true>(values, k0 + t, r0 / kGroupSize, 0, col_packed,
-                                                                      col_scale, seed, col_fly);
+                                                                      col_scale, seed, col_ts);
 }
 } // namespace
 
@@ -1713,9 +1713,9 @@ void launch_dual(const dim3 grid, const dim3 block, hipStream_t stream, const DT
          row_fmt == MXPackFmt::Fp4BlobSr || col_fmt == MXPackFmt::Fp4BlobSr)
             ? sr_next_seed(SRStream::MXPack)
             : 0u;
-    const mxfp4_emit::TilePackArgs row_fly = to_args(mx_tile_pack_row());
-    const mxfp4_emit::TilePackArgs col_fly = to_args(mx_tile_pack_col());
-    if (row_fly.fp4_tile2d || col_fly.fp4_tile2d) {
+    const mxfp4_emit::TilePackArgs row_ts = to_args(mx_tile_pack_row());
+    const mxfp4_emit::TilePackArgs col_ts = to_args(mx_tile_pack_col());
+    if (row_ts.fp4_tile2d || col_ts.fp4_tile2d) {
         // The tile amax is taken on the staged values in the whole-tile emit path: it must see what
         // the emit converts (no prologue, no rotation), and the experimental per-stage schedule
         // (MXFP6_ASYNC_STAGE 2) has its own emit that does not take it.
@@ -1725,8 +1725,8 @@ void launch_dual(const dim3 grid, const dim3 block, hipStream_t stream, const DT
     }
     // Any FP4 option set (scale rule, Hadamard, 2-D) takes the option-capable instantiation; the
     // default emit is compiled without the option paths (see mxfp4_emit_group's OPTS).
-    const bool opts = row_fly.fp4_round || row_fly.fp4_had || row_fly.fp4_tile2d ||
-                      col_fly.fp4_round || col_fly.fp4_had || col_fly.fp4_tile2d || col_fly.prob4;
+    const bool opts = row_ts.fp4_round || row_ts.fp4_had || row_ts.fp4_tile2d ||
+                      col_ts.fp4_round || col_ts.fp4_had || col_ts.fp4_tile2d || col_ts.prob4;
     auto launch = [&](auto r, auto c, auto o) {
         constexpr MXPackFmt R = decltype(r)::value;
         constexpr MXPackFmt C = decltype(c)::value;
@@ -1735,12 +1735,12 @@ void launch_dual(const dim3 grid, const dim3 block, hipStream_t stream, const DT
             quantize_mxfp6_dual_kernel<DType, DO_ROW, DO_COL, PROLOGUE, true, TILE_N, R, C, O>
                 <<<grid, block, 0, stream>>>(input, aux, bias, row_packed, row_scale, col_packed,
                                              col_scale, col_sum, M, N, row_nk_pad, col_nk_pad,
-                                             pargs, sr_seed, row_fly, col_fly);
+                                             pargs, sr_seed, row_ts, col_ts);
         } else {
             quantize_mxfp6_dual_kernel<DType, DO_ROW, DO_COL, PROLOGUE, false, TILE_N, R, C, O>
                 <<<grid, block, 0, stream>>>(input, aux, bias, row_packed, row_scale, col_packed,
                                              col_scale, nullptr, M, N, row_nk_pad, col_nk_pad,
-                                             pargs, sr_seed, row_fly, col_fly);
+                                             pargs, sr_seed, row_ts, col_ts);
         }
     };
     auto go = [&](auto r, auto c) {
@@ -1818,14 +1818,14 @@ void launch_dual(const dim3 grid, const dim3 block, hipStream_t stream, const DT
         go(F6K{}, F4FSr{});
     else if (r == MXPackFmt::Fp4Tile && c == MXPackFmt::Fp4TileSr)
         go(F4F{}, F4FSr{});
-    else if (r == MXPackFmt::Fp4Tile && c == MXPackFmt::Fp6) // row-only fly FP4 (forward-only)
+    else if (r == MXPackFmt::Fp4Tile && c == MXPackFmt::Fp6) // row-only tilescale FP4 (forward-only)
         go(F4F{}, F6{});
     else if (r == MXPackFmt::Fp6Tile &&
-             c == MXPackFmt::Fp4Tile) // FlyDSL A6W6 forward + fly FP4 backward
+             c == MXPackFmt::Fp4Tile) // A6W6 tilescale forward + tilescale FP4 backward
         go(F6K{}, F4F{});
     else if (r == MXPackFmt::Fp6Tile && c == MXPackFmt::Fp6) // row-only (forward / eval)
         go(F6K{}, F6{});
-    // A6W4 tilescale weight: K128-blocked FP4 rows (forward B), fly FP4 columns (A4W4 dgrad B)
+    // A6W4 tilescale weight: K128-blocked FP4 rows (forward B), tilescale FP4 columns (A4W4 dgrad B)
     else if (r == MXPackFmt::Fp4TileK128 && c == MXPackFmt::Fp4TileSr)
         go(F4FK{}, F4FSr{});
     else if (r == MXPackFmt::Fp4TileK128 && c == MXPackFmt::Fp4Tile)

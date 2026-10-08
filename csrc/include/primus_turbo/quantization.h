@@ -206,7 +206,7 @@ enum class MXPackFmt : int {
     Fp4TileSr   = 8,
     Fp4BlobSr  = 9, // Fp4Blob with stochastic rounding (the A4W4 tile-blob kernels' gradient)
     Fp6Tile =
-        10, // MXFP6 for the FlyDSL A6W6 kernel: K128-blocked C0 / C1 planes + FlyDSL packed scales
+        10, // MXFP6 for the A6W6 tilescale kernels: K128-blocked C0 / C1 planes + tilescale packed scales
     Fp4TileK128 = 11 // Fp4Tile with K128-blocked codes [rows/16, K/128, 16, 64] (tilescale FP4 "k128")
 };
 

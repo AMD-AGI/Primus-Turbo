@@ -34,12 +34,12 @@ def _k128(codes, rows, k):
 
 
 @pytest.mark.parametrize("n,k", [(512, 1024), (768, 3072), (3072, 12288)])
-def test_ts4_row_pack_matches_fly_rows(n, k):
+def test_ts4_row_pack_matches_ts_rows(n, k):
     w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.02
     c_ts, s_ts = MX.quantize_mx(w, 1, MX.with_ts4_row(0))[:2]
-    c_fly, s_fly = MX.quantize_mx(w, 1, MX.ts_fmt(row=(True, 4, 0)))[:2]
-    assert torch.equal(c_ts.view(torch.uint8).reshape(n, k // 2), _k128(c_fly, n, k))
-    assert torch.equal(s_ts.view(torch.uint8).reshape(-1), s_fly.view(torch.uint8).reshape(-1))
+    c_row, s_row = MX.quantize_mx(w, 1, MX.ts_fmt(row=(True, 4, 0)))[:2]
+    assert torch.equal(c_ts.view(torch.uint8).reshape(n, k // 2), _k128(c_row, n, k))
+    assert torch.equal(s_ts.view(torch.uint8).reshape(-1), s_row.view(torch.uint8).reshape(-1))
 
 
 @pytest.mark.parametrize("col_sr", [False, True])
@@ -53,8 +53,8 @@ def test_ts4_dual_keeps_backward_column(col_sr):
     rc, rs, cc, cs = MX.quantize_mx_dual(w, MX.with_ts4_row(base))
     if not col_sr:  # SR draws a fresh seed per launch: compare the column only when deterministic
         assert torch.equal(cc, cc_ref) and torch.equal(cs, cs_ref)
-    c_fly, s_fly = MX.quantize_mx(w, 1, MX.ts_fmt(row=(True, 4, 0)))[:2]
-    assert torch.equal(rc.view(torch.uint8).reshape(n, k // 2), _k128(c_fly, n, k))
+    c_row, s_row = MX.quantize_mx(w, 1, MX.ts_fmt(row=(True, 4, 0)))[:2]
+    assert torch.equal(rc.view(torch.uint8).reshape(n, k // 2), _k128(c_row, n, k))
 
 
 SHAPES = [(512, 512, 1024, False), (512, 512, 1024, True), (1024, 768, 1536, True), (16384, 9216, 3072, True),

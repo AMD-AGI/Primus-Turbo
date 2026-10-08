@@ -9,8 +9,8 @@
 Without them the first call of a shape runs a timed sweep (swizzle / wave layout; every candidate is bit-identical),
 so which kernel runs depends on measurement noise and the first call pays the sweep. These are the configs the
 256-wide, no-split-K autotune picked for the Flux training GEMM shapes (backward and forward MXFP4) and smaller-batch
-variants of them, verified bit-exact over sustained calls; aiter's ``f4flygemm`` code objects are built from the same
-configs.
+variants of them, verified bit-exact over sustained calls; aiter's exact-shape A4W4 tilescale code objects are built
+from the same configs.
 
 (M, N, K) -> (cfg, mode): cfg = (group_m, group_n, num_xcds, wlv, elgk, taccw, coop), keyed in ``_MXFP4_CFG_CACHE`` by
 (M, N, K, row_bytes=None, out_fp16=False); mode = (k-split mode, splits), keyed in ``_MXFP4_KSPLIT_CACHE`` with

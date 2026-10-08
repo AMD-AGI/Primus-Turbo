@@ -209,7 +209,7 @@ std::pair<MXPackFmt, MXPackFmt> fmt_pair(int64_t fmt) {
 // codes [ceil(rows, 256), ceil(k, 256) / 2], scales [ceil(rows, 256), ceil(k, 256) / 32] in
 // shuffle_scale()'s layout (whose padding is exactly these).
 std::pair<int64_t, int64_t> sizes_for(const MXPackFmt f, const int64_t rows, const int64_t k,
-                                      const MXTilePack &fly = {}) {
+                                      const MXTilePack &ts = {}) {
     if (f == MXPackFmt::Fp6)
         return pack_sizes(rows, k);
     if (f == MXPackFmt::Fp4Blob || f == MXPackFmt::Fp4BlobSr) {
@@ -227,7 +227,7 @@ std::pair<int64_t, int64_t> sizes_for(const MXPackFmt f, const int64_t rows, con
     if (f == MXPackFmt::Fp4Tile || f == MXPackFmt::Fp4TileSr || f == MXPackFmt::Fp4TileK128) {
         // FlyDSL's per-tile slab (_get_mxfp4_scale_ws): ceil(rows / tile) * 256 * K/128 dwords.
         const int64_t r = cdiv(rows, kTileRows) * kTileRows, c = cdiv(k, kTileRows) * kTileRows;
-        return {r * c / 2, cdiv(rows, 64 * fly.nt) * 256 * (c / 128) * 4};
+        return {r * c / 2, cdiv(rows, 64 * ts.nt) * 256 * (c / 128) * 4};
     }
     PRIMUS_TURBO_CHECK(f == MXPackFmt::Fp4A || f == MXPackFmt::Fp4B || f == MXPackFmt::Fp4ASr ||
                            f == MXPackFmt::Fp4Plain || f == MXPackFmt::Fp4PlainSr,
@@ -272,7 +272,7 @@ std::vector<at::Tensor> run(const at::Tensor &input, const MXFP6Direction direct
 
     const auto [row_p_bytes, row_s_bytes] = sizes_for(row_fmt, M, N, ts_dir(fmt, M, N, false)); // contract N
     const auto [col_p_bytes, col_s_bytes] = sizes_for(col_fmt, N, M, ts_dir(fmt, M, N, true)); // contract M
-    MXTilePackScope fly_scope(ts_dir(fmt, M, N, false), ts_dir(fmt, M, N, true));
+    MXTilePackScope ts_scope(ts_dir(fmt, M, N, false), ts_dir(fmt, M, N, true));
 
     at::Tensor row_p = empty_blob(want_row ? row_p_bytes : 0, input);
     at::Tensor row_s = empty_blob(want_row ? row_s_bytes : 0, input);
@@ -366,7 +366,7 @@ std::vector<at::Tensor> run_fused(const at::Tensor &input, const c10::optional<a
 
     const auto [row_p_bytes, row_s_bytes] = sizes_for(row_fmt, M, N, ts_dir(fmt, M, N, false)); // contract N
     const auto [col_p_bytes, col_s_bytes] = sizes_for(col_fmt, N, M, ts_dir(fmt, M, N, true)); // contract M
-    MXTilePackScope fly_scope(ts_dir(fmt, M, N, false), ts_dir(fmt, M, N, true));
+    MXTilePackScope ts_scope(ts_dir(fmt, M, N, false), ts_dir(fmt, M, N, true));
 
     at::Tensor row_p = empty_blob(row_p_bytes, input);
     at::Tensor row_s = empty_blob(row_s_bytes, input);
@@ -471,7 +471,7 @@ run_qk_norm_rope_bwd(const at::Tensor &input, const at::Tensor &dq, const at::Te
 
     const auto [row_p_bytes, row_s_bytes] = sizes_for(row_fmt, M, N, ts_dir(fmt, M, N, false)); // contract N
     const auto [col_p_bytes, col_s_bytes] = sizes_for(col_fmt, N, M, ts_dir(fmt, M, N, true)); // contract M
-    MXTilePackScope fly_scope(ts_dir(fmt, M, N, false), ts_dir(fmt, M, N, true));
+    MXTilePackScope ts_scope(ts_dir(fmt, M, N, false), ts_dir(fmt, M, N, true));
 
     at::Tensor row_p = empty_blob(row_p_bytes, input);
     at::Tensor row_s = empty_blob(row_s_bytes, input);
@@ -552,7 +552,7 @@ std::vector<at::Tensor> run_ln_modulate(const at::Tensor &input, const at::Tenso
 
     const auto [row_p_bytes, row_s_bytes] = sizes_for(row_fmt, M, N, ts_dir(fmt, M, N, false)); // contract N
     const auto [col_p_bytes, col_s_bytes] = sizes_for(col_fmt, N, M, ts_dir(fmt, M, N, true)); // contract M
-    MXTilePackScope fly_scope(ts_dir(fmt, M, N, false), ts_dir(fmt, M, N, true));
+    MXTilePackScope ts_scope(ts_dir(fmt, M, N, false), ts_dir(fmt, M, N, true));
 
     at::Tensor row_p = empty_blob(row_p_bytes, input);
     at::Tensor row_s = empty_blob(row_s_bytes, input);
@@ -608,7 +608,7 @@ std::vector<at::Tensor> run_gate_mul(const at::Tensor &input, const at::Tensor &
 
     const auto [row_p_bytes, row_s_bytes] = sizes_for(row_fmt, M, N, ts_dir(fmt, M, N, false)); // contract N
     const auto [col_p_bytes, col_s_bytes] = sizes_for(col_fmt, N, M, ts_dir(fmt, M, N, true)); // contract M
-    MXTilePackScope fly_scope(ts_dir(fmt, M, N, false), ts_dir(fmt, M, N, true));
+    MXTilePackScope ts_scope(ts_dir(fmt, M, N, false), ts_dir(fmt, M, N, true));
 
     at::Tensor row_p = empty_blob(row_p_bytes, input);
     at::Tensor row_s = empty_blob(row_s_bytes, input);
@@ -759,7 +759,7 @@ static void dual_out_fmt(const at::Tensor input, at::Tensor row_packed, at::Tens
         col_ts.prob_delta = reinterpret_cast<intptr_t>(col_prob->data_ptr()) -
                             reinterpret_cast<intptr_t>(col_packed.data_ptr());
     }
-    MXTilePackScope fly_scope(row_ts, col_ts);
+    MXTilePackScope ts_scope(row_ts, col_ts);
     // A direction whose two buffers are both empty is not emitted (a row-only or column-only pack of the fmt).
     const bool do_row = row_bytes || row_scale.numel(), do_col = col_packed.numel() || col_scale.numel();
     TORCH_CHECK(do_row || do_col, "quantize_mx_dual_out: no direction to emit");
@@ -829,7 +829,7 @@ void mxfp6_tile_to_fp4_col(const at::Tensor c0, const at::Tensor c1, const at::T
                     col_packed.numel() == cp_bytes && col_scale.numel() == cs_bytes,
                 "mxfp6_tile_to_fp4_col: buffer sizes do not match the [R, K] layouts of fmt");
     const c10::DeviceGuard device_guard(c0.device());
-    MXTilePackScope        fly_scope(row_ts, col_ts);
+    MXTilePackScope        ts_scope(row_ts, col_ts);
     mxfp6_tile_to_fp4_col_impl(c0.data_ptr<uint8_t>(), c1.data_ptr<uint8_t>(), row_scale.data_ptr<uint8_t>(), R, K,
                                col_packed.data_ptr<uint8_t>(), col_scale.data_ptr<uint8_t>(), sr,
                                static_cast<uint32_t>(seed), at::hip::getCurrentHIPStreamMasqueradingAsCUDA());
@@ -931,7 +931,7 @@ static void fused_dual_out_fmt(const at::Tensor input, const c10::optional<at::T
     const auto [row_fmt, col_fmt]   = fmt_pair(fmt);
     const auto [rp_bytes, rs_bytes] = sizes_for(row_fmt, M, N, ts_dir(fmt, M, N, false));
     const auto [cp_bytes, cs_bytes] = sizes_for(col_fmt, N, M, ts_dir(fmt, M, N, true));
-    MXTilePackScope fly_scope(ts_dir(fmt, M, N, false), ts_dir(fmt, M, N, true));
+    MXTilePackScope ts_scope(ts_dir(fmt, M, N, false), ts_dir(fmt, M, N, true));
     TORCH_CHECK(row_packed.numel() == rp_bytes && row_scale.numel() == rs_bytes &&
                     col_packed.numel() == cp_bytes && col_scale.numel() == cs_bytes,
                 "quantize_mxfp6_fused_dual_out: buffers do not match the packed layout size");

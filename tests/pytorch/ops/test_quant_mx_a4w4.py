@@ -526,7 +526,7 @@ def test_flydsl_a4w4_matches_aiter_a4w4(m, n, k):
         (9216, 3072, 8192),
     ],
 )
-def test_fly_packed_scales_match_flydsl_repack(m, n, k):
+def test_ts_packed_scales_match_flydsl_repack(m, n, k):
     """GEMM [m, k] x [n, k]^T with the scales stored packed by the packers (a4w4=3) is bit-identical
     to the exact fp32-sum result on the same values (the A4W4 tile-blob kernel). Covers B tiles nt = 3 and 4,
     interleave 0 and 4. Operands as Primus packs them: a gradient's rows (A) and a weight's columns (B)."""
@@ -556,7 +556,7 @@ def test_fly_packed_scales_match_flydsl_repack(m, n, k):
     assert torch.equal(buf, ref)
 
 
-_FLY_SHAPES = [
+_TS_SHAPES = [
     (r, i, o)
     for rows in (8192, 16384)
     for o, i in ((9216, 3072), (3072, 3072), (12288, 3072), (3072, 12288))
@@ -564,14 +564,14 @@ _FLY_SHAPES = [
 ]
 
 
-@pytest.mark.parametrize("m,n,k", _FLY_SHAPES)
-def test_aiter_fly_matches_blob(m, n, k):
-    """a4w4=4 (aiter `gemm_a4w4_fly_asm`, assembly ports of FlyDSL's 256-wide kernel) on operands the packers
-    wrote in the fly formats is bit-identical to the tile-blob kernel on the same values (both are one exact fp32
+@pytest.mark.parametrize("m,n,k", _TS_SHAPES)
+def test_aiter_ts_matches_blob(m, n, k):
+    """a4w4=4 (aiter `gemm_a4w4_tilescale`, the 256-wide A4W4 tilescale kernels) on operands the packers
+    wrote in the tilescale formats is bit-identical to the tile-blob kernel on the same values (both are one exact fp32
     sum of the FP4 products), allocating and out variants, over repeated calls (the race the 256 tile avoids shows only
     on repeats). The Flux training shapes."""
     _skip()
-    pytest.importorskip("aiter.ops.gemm_op_a4w4_fly")
+    pytest.importorskip("aiter.ops.gemm_op_tilescale")
     gemm_a4w4_blob_asm = pytest.importorskip("aiter.ops.gemm_op_a4w4_blob").gemm_a4w4_blob_asm
 
     from primus_turbo.pytorch.core.low_precision import ScalingGranularity
@@ -599,7 +599,7 @@ def test_aiter_fly_matches_blob(m, n, k):
 
 
 @pytest.mark.parametrize("k", [3072, 8192, 9216, 12288, 16384, 512, 768, 1024, 1280])
-def test_fly_b_params_matches_flydsl(k):
+def test_ts_b_params_matches_flydsl(k):
     """`ts_b_params` computes the B layout without importing FlyDSL; it must equal FlyDSL's own rule at the 256 tile,
     and FlyDSL must never pick the racing 192 tile."""
     pytest.importorskip("flydsl")
@@ -608,11 +608,11 @@ def test_fly_b_params_matches_flydsl(k):
 
     kw = (k + 255) // 256 * 256
     assert ts_b_params(8192, 3072, k) == (True, 4, FK.mxfp4_packed_scale_ilv(kw, block_n=256))
-    for m, n, kk in _FLY_SHAPES:
+    for m, n, kk in _TS_SHAPES:
         assert FK._mxfp4_pick_block_n(m, n, kk) == 256
 
 
-def test_fly_packed_sr_gradient():
+def test_ts_packed_sr_gradient():
     _skip()
     pytest.importorskip("flydsl")
     from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import TS_A, ts_fmt
@@ -635,9 +635,9 @@ def test_plain_row_only_pack():
     assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
 
 
-@pytest.mark.parametrize("m,n,k", _FLY_SHAPES)
-def test_flydsl_exact_on_fly_shapes(m, n, k):
-    """FlyDSL's own GEMM (a4w4=2 plain scales, a4w4=3 packed) is exact on every shape in _FLY_SHAPES with the 192-wide
+@pytest.mark.parametrize("m,n,k", _TS_SHAPES)
+def test_flydsl_exact_on_ts_shapes(m, n, k):
+    """FlyDSL's own GEMM (a4w4=2 plain scales, a4w4=3 packed) is exact on every shape in _TS_SHAPES with the 192-wide
     tile and the split-K launches off: bit-identical to the exact tile-blob kernel over repeated calls."""
     _skip()
     pytest.importorskip("flydsl")
@@ -667,7 +667,7 @@ def test_flydsl_exact_on_fly_shapes(m, n, k):
         assert torch.equal(gemm_fp6_impl(fa, fas, fb, fbs, m, n, k, torch.bfloat16, gran, None, a4w4=3), ref)
 
 
-# ---- MXFP6 in the FlyDSL A6W6 GEMM's layout (ts6_fmt) ----
+# ---- MXFP6 in the A6W6 tilescale layout (ts6_fmt) ----
 
 
 def _fp6_blob_unpack(blob, sblob, rows, k):
@@ -693,7 +693,7 @@ def _fp6_blob_unpack(blob, sblob, rows, k):
 @pytest.mark.parametrize(
     "m,n,k", [(16384, 12288, 3072), (16384, 9216, 3072), (8192, 3072, 12288), (512, 768, 1024)]
 )
-def test_fly6_kblk_matches_fp6_blob(m, n, k):
+def test_ts6_kblk_matches_fp6_blob(m, n, k):
     """ts6_fmt rows (activation as A, weight as B) carry exactly the codes and scales of the MXFP6 tile blob,
     laid out as the FlyDSL A6W6 GEMM reads them: the K128-blocked C0 / C1 planes (kblk_planes of the plain-row planes)
     and FlyDSL's packed scale slab (preshuffle_mxfp6_scales, b_ilv 0). The column direction it is paired with is
@@ -716,7 +716,7 @@ def test_fly6_kblk_matches_fp6_blob(m, n, k):
     )
 
     x, w = _rand(m, k, seed=90), _rand(n, k, seed=91)  # activation [m, k]; weight as stored [out = n, in = k]
-    col_x, col_w = TS_A, ts_b_params(m, k, n)  # column directions: any fly operand (here A, and dgrad B)
+    col_x, col_w = TS_A, ts_b_params(m, k, n)  # column directions: any tilescale operand (here A, and dgrad B)
     ra, ras, ca, cas = quantize_mx_dual(x, ts_fmt(col=col_x))
     rb, rbs, cb, cbs = quantize_mx_dual(w, ts_fmt(col=col_w))
     ga, gas, gca, gcas = quantize_mx_dual(x, ts6_fmt(False, col=col_x))
@@ -745,7 +745,7 @@ def test_fly6_kblk_matches_fp6_blob(m, n, k):
         assert torch.equal(gemm_mxfp6_persistent(a0, a1, b0, b1, asp, bsp), ref)
 
 
-_A6W6_FLY_SHAPES = [
+_A6W6_TS_SHAPES = [
     (16384, 12288, 3072, False),
     (8192, 12288, 3072, False),
     (8192, 3072, 3072, False),
@@ -755,14 +755,14 @@ _A6W6_FLY_SHAPES = [
 ]
 
 
-@pytest.mark.parametrize("m,n,k,has_bias", _A6W6_FLY_SHAPES)
-def test_a6w6_fly_matches_a6w6(m, n, k, has_bias):
-    """a6w6_ts (aiter `gemm_a6w6_fly_asm`, assembly ports of the FlyDSL MXFP6 GEMM) on operands packed in
-    ts6_fmt rows -- with the fly FP4 column directions the backward reads -- is bit-identical to the A6W6
+@pytest.mark.parametrize("m,n,k,has_bias", _A6W6_TS_SHAPES)
+def test_a6w6_ts_matches_a6w6(m, n, k, has_bias):
+    """a6w6_ts (aiter `gemm_a6w6_tilescale`, the A6W6 tilescale kernels) on operands packed in
+    ts6_fmt rows -- with the tilescale FP4 column directions the backward reads -- is bit-identical to the A6W6
     tile-blob GEMM on the same tensors, allocating and out variants, bias in the epilogue, over repeated calls. The
     Flux forward shapes."""
     _skip()
-    pytest.importorskip("aiter.ops.gemm_op_a6w6_fly")
+    pytest.importorskip("aiter.ops.gemm_op_tilescale")
     from primus_turbo.pytorch.core.low_precision import ScalingGranularity
     from primus_turbo.pytorch.kernels.gemm.gemm_fp6_impl import (
         a6w6_ts_available,
@@ -776,7 +776,7 @@ def test_a6w6_fly_matches_a6w6(m, n, k, has_bias):
     )
 
     if not a6w6_ts_available(m, n, k, has_bias):
-        pytest.skip("aiter has no f6flygemm kernel for this shape")
+        pytest.skip("aiter has no A6W6 tilescale kernel for this shape")
     gran = ScalingGranularity.MX_BLOCKWISE.value
     x, w = _rand(m, k, seed=92), _rand(n, k, seed=93)
     bias = (torch.randn(n, device="cuda") * 30).to(torch.bfloat16) if has_bias else None
@@ -804,9 +804,9 @@ def test_a6w6_fly_matches_a6w6(m, n, k, has_bias):
 
 
 @pytest.mark.parametrize("row_is_b", [False, True])
-def test_row_only_fly_packs_match_dual(row_is_b):
-    """Row-only packs (eval forwards: no column direction) in the fly layouts write the same row bytes as the dual
-    packs: FP4 fly rows (forward MXFP4) and fly6 rows."""
+def test_row_only_ts_packs_match_dual(row_is_b):
+    """Row-only packs (eval forwards: no column direction) in the tilescale layouts write the same row bytes as the dual
+    packs: FP4 tilescale rows (forward MXFP4) and ts6 rows."""
     _skip()
     from primus_turbo.pytorch.kernels.quantization.mx_a4w4_pack import TS_A, ts6_fmt, ts_b_params, ts_fmt
 
@@ -823,12 +823,12 @@ def test_row_only_fly_packs_match_dual(row_is_b):
     "m,n,k",
     [(16384, 3072, 3072), (16384, 3072, 12288), (4096, 3072, 3072), (2304, 3072, 12288), (640, 3072, 3072)],
 )
-def test_a4w4_blob_fallback_matches_fly(m, n, k):
-    """a4w4=5 (aiter's tile-blob kernel on MX_FMT_BLOB rows; the fallback for a forward-FP4 GEMM with no fly code
-    object, e.g. an eval batch) is bit-identical to the fly path on the same values: a4w4=4 where aiter has the shape,
-    FlyDSL's exact 256-wide kernel (a4w4=3) where it does not; M padded to the tile."""
+def test_a4w4_blob_fallback_matches_ts(m, n, k):
+    """a4w4=5 (aiter's tile-blob kernel on MX_FMT_BLOB rows; the fallback for a forward-FP4 GEMM with no tilescale
+    code object, e.g. an eval batch) is bit-identical to the tilescale path on the same values: a4w4=4 where aiter has
+    the shape, FlyDSL's exact 256-wide kernel (a4w4=3) where it does not; M padded to the tile."""
     _skip()
-    pytest.importorskip("aiter.ops.gemm_op_a4w4_fly")
+    pytest.importorskip("aiter.ops.gemm_op_tilescale")
     pytest.importorskip("aiter.ops.gemm_op_a4w4_blob")
     from primus_turbo.pytorch.core.low_precision import ScalingGranularity
     from primus_turbo.pytorch.kernels.gemm.gemm_fp6_impl import a4w4_ts_shapes, gemm_fp6_impl
@@ -930,7 +930,7 @@ def test_a6w6_flydsl_backend_matches_aiter(m, n, k, has_bias):
 
 
 @pytest.mark.parametrize("m", [16384, 8192])
-def test_aiter_fly_softmax_d_epilogue(m):
+def test_aiter_ts_softmax_d_epilogue(m):
     """gemm_a4w4_ts_softmax_d_out, the a4w4=4 out-GEMM with the softmax_d epilogue (an attention out-projection's dgrad: n = k = 3072, sbhd rows of
     B 32, S 512): out bitwise equal to the plain call; softmax_d [B, n/128, S] the per-row, per-head fp32 sum of
     out * O within fp32 summation error of fp64. 8192 rows cover the sequence in two calls (a joint block's text

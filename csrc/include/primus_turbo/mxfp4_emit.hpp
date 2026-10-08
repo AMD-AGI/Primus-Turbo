@@ -184,8 +184,8 @@ __device__ __forceinline__ int64_t ts_scale_byte(const int64_t row, const int32_
 }
 
 // `tile_amax` >= 0 replaces the group's own amax (2-D block scaling: the caller passes the amax of
-// the 32x32 tile, taken from the same bf16 values; only valid with fly.fp4_had == kHadNone).
-// OPTS: compile the FP4 options (fly.fp4_round / fp4_had, tile_amax) in. Without them the emit is
+// the 32x32 tile, taken from the same bf16 values; only valid with ts.fp4_had == kHadNone).
+// OPTS: compile the FP4 options (ts.fp4_round / fp4_had, tile_amax) in. Without them the emit is
 // the fixed H32 + RCEIL one -- a separate instantiation because the option paths raise the register
 // count, and so lower the occupancy, of every kernel that inlines them, whether or not an option is
 // set.
@@ -194,7 +194,7 @@ __device__ __forceinline__ void
 mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32_t group,
                  const int32_t nk_pad, uint8_t *__restrict__ packed,
                  uint8_t *__restrict__ packed_scale, const uint32_t sr_seed = 0,
-                 const TilePackArgs fly = {}, const float tile_amax = -1.0f) {
+                 const TilePackArgs ts = {}, const float tile_amax = -1.0f) {
     // The normalisation goes in FIRST, before the butterfly -- which is where AITER's
     // MXFP4 packer puts it, and NOT where the MXFP6 packer puts it (MXFP6 multiplies the
     // rotated result at the end). The two orders differ in floating point, so copying the
@@ -206,7 +206,7 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
     // compiles to, and it is spelled out because the compiler's own contraction choice depends on
     // the surrounding code -- left implicit, adding the other Hadamard modes moved it and flipped
     // the sign of a few zero codes. Measured against AITER on its codes, signed zeros included.
-    if (!OPTS || fly.fp4_had == kHadH32) {
+    if (!OPTS || ts.fp4_had == kHadH32) {
 #pragma unroll
         for (int i = 0; i < kGroupSize; i += 2) {
             const float a = values[i];
@@ -230,7 +230,7 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
                 values[i1]            = x0 - x1;
             }
         }
-    } else if (fly.fp4_had == kHadH16) { // OPTS only
+    } else if (ts.fp4_had == kHadH16) { // OPTS only
         // Stages h = 1, 2, 4, 8 of the same network: two independent 16-point transforms.
 #pragma unroll
         for (int i = 0; i < kGroupSize; ++i)
@@ -303,7 +303,7 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
     }
 
     uint8_t scale_exp;
-    if (!OPTS || fly.fp4_round == kRoundRceil) {
+    if (!OPTS || ts.fp4_round == kRoundRceil) {
         // RCEIL: ceil_pow2(amax / 6). Bump the exponent whenever any mantissa bit survives
         // the divide, which is what makes it a ceiling rather than a truncation.
         const uint32_t scaled   = __builtin_bit_cast(uint32_t, amax * kFp4InvMaxPos);
@@ -314,8 +314,8 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
     } else {
         // Turbo's compute_tile_scale: exponent of (amax bits + bias) minus FP4's target max pow2
         // (2), clamped to the E8M0 range.
-        const uint32_t bias = fly.fp4_round == kRoundMode0   ? (1u << 21)
-                              : fly.fp4_round == kRoundMode1 ? (1u << 22)
+        const uint32_t bias = ts.fp4_round == kRoundMode0   ? (1u << 21)
+                              : ts.fp4_round == kRoundMode1 ? (1u << 22)
                                                              : (3u << 19);
         int32_t        e =
             static_cast<int32_t>(((__builtin_bit_cast(uint32_t, amax) + bias) >> 23) & 0x1FFu) -
@@ -339,21 +339,21 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
     // induction variable there even under `#pragma unroll`, because the constraint is
     // checked in the frontend before unrolling. Hence the explicit four, matching the
     // reference packer's `static_for` over the same range.
-    // Everything above is independent of the rounding draw. With fly.draws > 1 (SR, a column copy for several
+    // Everything above is independent of the rounding draw. With ts.draws > 1 (SR, a column copy for several
     // receivers) only the conversion and the store repeat, draw d at d * draw_codes / d * draw_scales bytes and
     // seeded from (sr_seed, d) -- draw 0 is the single-draw emit exactly.
-    const int32_t ndraws = SR ? fly.draws : 1;
+    const int32_t ndraws = SR ? ts.draws : 1;
     for (int32_t d = 0; d < ndraws; ++d) {
         const uint32_t seed_d = d == 0 ? sr_seed : sr_mix(sr_seed + 0x9e3779b9u * static_cast<uint32_t>(d));
-        uint8_t *__restrict__ pk = packed + d * fly.draw_codes;
-        uint8_t *__restrict__ ps = packed_scale + d * fly.draw_scales;
+        uint8_t *__restrict__ pk = packed + d * ts.draw_codes;
+        uint8_t *__restrict__ ps = packed_scale + d * ts.draw_scales;
         // The scales do not depend on the draw: with draw_scales == 0 the draws share one scale plane, stored once.
-        const bool store_scale = d == 0 || fly.draw_scales != 0;
+        const bool store_scale = d == 0 || ts.draw_scales != 0;
         uint4_t words = {0u, 0u, 0u, 0u};
         uint4_t pwords = {0u, 0u, 0u, 0u}; // prob4: the round-up probabilities (4 bits: nibble for nibble with the
                                            // codes; 2 bits: 2 per code, codes 0-15 in word 0, 16-31 in word 1)
     #if defined(__gfx950__) && !MXFP4_ABLATE_CVT
-        if (OPTS && !SR && fly.prob4 && amax != 0.0f) {
+        if (OPTS && !SR && ts.prob4 && amax != 0.0f) {
             // Stochastic rounding deferred to the receivers: each code is the E2M1 value at or below |v| / scale (the
             // sign kept) and its nibble in `pwords` the probability of rounding up, (|v| / scale - floor) / step in
             // sixteenths, rounded half to even; 16/16 moves the code up with probability 0. A receiver adds 1 to the
@@ -361,7 +361,7 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
             // bits the probability is in quarters. The scale is the one the direct emit uses, so the expected value
             // is the value the probability resolves.
             const float inv_scale = 1.0f / conversion_scale; // a power of two: exact
-            const int32_t pbits   = fly.prob4;
+            const int32_t pbits   = ts.prob4;
             const float   plev    = static_cast<float>(1 << pbits);
     #pragma unroll
             for (int w = 0; w < 4; ++w) {
@@ -467,8 +467,8 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
             const int64_t row_bytes = static_cast<int64_t>(nk_pad) * 64;
             int64_t       address;
             if constexpr (LAYOUT == Layout::Tile) {
-                address = fly.kouter // K256-outer: [K/256, rows_pad, 128]
-                              ? ((group >> 3) * ((int64_t(fly.rows) + 255) / 256 * 256) + out_row) * 128 +
+                address = ts.kouter // K256-outer: [K/256, rows_pad, 128]
+                              ? ((group >> 3) * ((int64_t(ts.rows) + 255) / 256 * 256) + out_row) * 128 +
                                     static_cast<int64_t>(group & 7) * kBytesPerBlock
                               : out_row * row_bytes + static_cast<int64_t>(group) * kBytesPerBlock;
             } else if constexpr (LAYOUT == Layout::A4W4A || LAYOUT == Layout::Plain) {
@@ -486,10 +486,10 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
             }
             *reinterpret_cast<uint4_t *>(pk + address) = words;
             if constexpr (OPTS && LAYOUT == Layout::Tile)
-                if (fly.prob4 == 4)
-                    *reinterpret_cast<uint4_t *>(pk + fly.prob_delta + address) = pwords;
-                else if (fly.prob4 == 2) // a quarter byte per code: half the codes' address
-                    *reinterpret_cast<uint2 *>(pk + fly.prob_delta + address / 2) = make_uint2(pwords[0], pwords[1]);
+                if (ts.prob4 == 4)
+                    *reinterpret_cast<uint4_t *>(pk + ts.prob_delta + address) = pwords;
+                else if (ts.prob4 == 2) // a quarter byte per code: half the codes' address
+                    *reinterpret_cast<uint2 *>(pk + ts.prob_delta + address / 2) = make_uint2(pwords[0], pwords[1]);
 
             // Scales. Plain: row-major [rows, K/32]. Otherwise shuffle_scale(): view (Mp/32, 2, 16,
             // Sp/8, 2, 4) -> permute (0, 3, 5, 2, 4, 1), with Sp = K/32 = 4 * nk.
@@ -500,9 +500,9 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
                 continue;
             }
             if constexpr (LAYOUT == Layout::Tile || LAYOUT == Layout::TileK128) {
-                if (out_row < fly.rows && group < fly.k128 * 4)
+                if (out_row < ts.rows && group < ts.k128 * 4)
                     if (store_scale)
-                        ps[ts_scale_byte(out_row, group, fly)] = scale_exp;
+                        ps[ts_scale_byte(out_row, group, ts)] = scale_exp;
                 continue;
             }
             const int64_t i0 = out_row / 32, i1 = (out_row % 32) / 16, i2 = out_row % 16;
