@@ -268,8 +268,9 @@ def quantize_mx_dual_out(
     one read of ``x`` (stochastic rounding: draw d's seed derives from the launch seed and d), draw d at
     ``d * draw_codes`` / ``d * draw_scales`` bytes past ``col_packed`` / ``col_scale`` in the same allocations.
     ``col_prob`` (a round-to-nearest FP4 tile column, one draw): the column codes are emitted rounded down and
-    ``col_prob`` (``col_packed``'s size and layout) gets each code's 4-bit round-up probability; a receiver finishes
-    the stochastic rounding with ``fp4_prob_round``."""
+    ``col_prob`` gets each code's round-up probability -- 4 bits if it is ``col_packed``'s size (same layout), 2 bits
+    if it is half of it (a code pair's byte at half the pair's offset); a receiver finishes the stochastic rounding
+    with ``fp4_prob_round``."""
     _ops().quantize_mx_dual_out(
         x.contiguous(), row_packed, row_scale, col_packed, col_scale, fmt, row_c1, draws, draw_codes, draw_scales,
         col_prob,

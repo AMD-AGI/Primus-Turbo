@@ -107,7 +107,7 @@ struct TilePackArgs {
     int64_t c1_delta = 0;
     int32_t draws = 1;     // independent column draws per launch (see MXTilePack)
     int64_t draw_codes = 0, draw_scales = 0;
-    int32_t prob4 = 0;     // floor codes + 4-bit round-up probabilities at prob_delta (see MXTilePack); OPTS only
+    int32_t prob4 = 0;     // round-up probability bits (4 or 2; 0 = off): floor codes + probabilities at prob_delta; OPTS only
     int64_t prob_delta = 0;
 };
 
@@ -350,15 +350,19 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
         // The scales do not depend on the draw: with draw_scales == 0 the draws share one scale plane, stored once.
         const bool store_scale = d == 0 || fly.draw_scales != 0;
         uint4_t words = {0u, 0u, 0u, 0u};
-        uint4_t pwords = {0u, 0u, 0u, 0u}; // prob4: the round-up probabilities, nibble for nibble with the codes
+        uint4_t pwords = {0u, 0u, 0u, 0u}; // prob4: the round-up probabilities (4 bits: nibble for nibble with the
+                                           // codes; 2 bits: 2 per code, codes 0-15 in word 0, 16-31 in word 1)
     #if defined(__gfx950__) && !MXFP4_ABLATE_CVT
         if (OPTS && !SR && fly.prob4 && amax != 0.0f) {
             // Stochastic rounding deferred to the receivers: each code is the E2M1 value at or below |v| / scale (the
             // sign kept) and its nibble in `pwords` the probability of rounding up, (|v| / scale - floor) / step in
             // sixteenths, rounded half to even; 16/16 moves the code up with probability 0. A receiver adds 1 to the
-            // magnitude when its own uniform 4-bit draw is below the probability (fp4_prob_round). The scale is the
-            // one the direct emit uses, so the expected value is the value the probability resolves.
+            // magnitude when its own uniform draw of as many bits is below the probability (fp4_prob_round). With 2
+            // bits the probability is in quarters. The scale is the one the direct emit uses, so the expected value
+            // is the value the probability resolves.
             const float inv_scale = 1.0f / conversion_scale; // a power of two: exact
+            const int32_t pbits   = fly.prob4;
+            const float   plev    = static_cast<float>(1 << pbits);
     #pragma unroll
             for (int w = 0; w < 4; ++w) {
                 uint32_t word = 0, pword = 0;
@@ -372,17 +376,21 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
                     const float   t   = (y - bas) / stp; // exact: power-of-two step
                     const float   fl  = floorf(t);
                     int32_t       idx = i0 + static_cast<int32_t>(fl);
-                    int32_t       pr  = static_cast<int32_t>(rintf((t - fl) * 16.0f));
-                    if (pr == 16) {
+                    int32_t       pr  = static_cast<int32_t>(rintf((t - fl) * plev));
+                    if (pr == (1 << pbits)) {
                         idx += 1;
                         pr = 0;
                     }
                     const uint32_t code = static_cast<uint32_t>(idx) | (signbit(v) ? 8u : 0u);
                     word |= code << (4 * j);
-                    pword |= static_cast<uint32_t>(pr) << (4 * j);
+                    if (pbits == 4)
+                        pword |= static_cast<uint32_t>(pr) << (4 * j);
+                    else // 2 bits: code c = 8 w + j at bits 2 (c % 16) of word c / 16
+                        pwords[w / 2] |= static_cast<uint32_t>(pr) << (2 * ((8 * w + j) % 16));
                 }
-                words[w]  = word;
-                pwords[w] = pword;
+                words[w] = word;
+                if (pbits == 4)
+                    pwords[w] = pword;
             }
         } else if (SR && amax != 0.0f) {
             // The SR conversion does not preserve the accumulator's other bytes the way the RTN
@@ -478,8 +486,10 @@ mxfp4_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32
             }
             *reinterpret_cast<uint4_t *>(pk + address) = words;
             if constexpr (OPTS && LAYOUT == Layout::Tile)
-                if (fly.prob4)
+                if (fly.prob4 == 4)
                     *reinterpret_cast<uint4_t *>(pk + fly.prob_delta + address) = pwords;
+                else if (fly.prob4 == 2) // a quarter byte per code: half the codes' address
+                    *reinterpret_cast<uint2 *>(pk + fly.prob_delta + address / 2) = make_uint2(pwords[0], pwords[1]);
 
             // Scales. Plain: row-major [rows, K/32]. Otherwise shuffle_scale(): view (Mp/32, 2, 16,
             // Sp/8, 2, 4) -> permute (0, 3, 5, 2, 4, 1), with Sp = K/32 = 4 * nk.

@@ -740,12 +740,16 @@ static void dual_out_fmt(const at::Tensor input, at::Tensor row_packed, at::Tens
         col_ts.draw_scales = draw_scales;
     }
     if (col_prob.has_value()) {
-        // Floor codes in col_packed, 4-bit round-up probabilities in col_prob (same size and layout).
-        TORCH_CHECK(col_fmt == MXPackFmt::Fp4Tile && draws == 1 && col_prob->numel() == col_packed.numel() &&
-                        col_prob->is_contiguous() && col_prob->scalar_type() == at::kByte,
+        // Floor codes in col_packed, round-up probabilities in col_prob: 4 bits per code (col_packed's size and layout)
+        // or 2 bits per code (half its size; the byte of a code pair at half the pair's offset).
+        const int32_t bits = col_prob->numel() == col_packed.numel()       ? 4
+                             : col_prob->numel() * 2 == col_packed.numel() ? 2
+                                                                           : 0;
+        TORCH_CHECK(col_fmt == MXPackFmt::Fp4Tile && draws == 1 && bits != 0 && col_prob->is_contiguous() &&
+                        col_prob->scalar_type() == at::kByte,
                     "quantize_mx_dual_out: col_prob takes a round-to-nearest FP4 tile column, one draw, and a uint8 "
-                    "buffer the size of col_packed");
-        col_ts.prob4      = 1;
+                    "buffer of col_packed's size (4-bit probabilities) or half of it (2-bit)");
+        col_ts.prob4      = bits;
         col_ts.prob_delta = reinterpret_cast<intptr_t>(col_prob->data_ptr()) -
                             reinterpret_cast<intptr_t>(col_packed.data_ptr());
     }

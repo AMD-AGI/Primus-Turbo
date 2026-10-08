@@ -234,9 +234,10 @@ struct MXTilePack {
     // The input is read once.
     int32_t draws = 1;
     int64_t draw_codes = 0, draw_scales = 0;
-    // prob4 (column direction, FP4 tile, round to nearest otherwise): emit each code rounded DOWN and, at byte offset
-    // prob_delta from the codes pointer in the same layout, a 4-bit round-up probability per code -- stochastic
-    // rounding left to whoever receives the copy (fp4_prob_round), so one copy serves every receiver.
+    // prob4 = 4 or 2 (column direction, FP4 tile, round to nearest otherwise): emit each code rounded DOWN and, at byte
+    // offset prob_delta from the codes pointer, a round-up probability per code of that many bits (4: the codes'
+    // layout; 2: half the codes' byte offset) -- stochastic rounding left to whoever receives the copy
+    // (fp4_prob_round), so one copy serves every receiver.
     int32_t prob4 = 0;
     int64_t prob_delta = 0;
 };
