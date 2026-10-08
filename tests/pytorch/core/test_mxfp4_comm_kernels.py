@@ -69,6 +69,50 @@ class TestMXFP4GatherKernel(unittest.TestCase):
                     self.assertTrue(a.is_contiguous())
                 torch.testing.assert_close(storage, original, rtol=0, atol=0)
 
+    def test_shared_2d_reconstructs_both_orientations_and_scales(self):
+        for shape in ((1, 32, 32), (3, 96, 160), (2, 128, 64), (1, 320, 96)):
+            with self.subTest(shape=shape):
+                g, n, k = shape
+                layout = self.wire.MXFP4WireLayout(shape, 2, shared_2d=True)
+                values = torch.randint(
+                    0, 16, shape, dtype=torch.uint8, generator=torch.Generator().manual_seed(481)
+                )
+                tile_scales = torch.arange(g * n * k // 1024).to(torch.uint8).reshape(g, n // 32, k // 32)
+                transposed = values.transpose(1, 2)
+                expected = (
+                    values[..., ::2] | (values[..., 1::2] << 4),
+                    tile_scales.repeat_interleave(32, dim=1),
+                    transposed[..., ::2] | (transposed[..., 1::2] << 4),
+                    tile_scales.transpose(1, 2).repeat_interleave(32, dim=1),
+                )
+                packed = layout.pack(expected)
+                self.assertEqual(packed.numel(), g * n * k * 513 // 1024)
+                for decoded, reference in zip(layout.views(packed), expected):
+                    torch.testing.assert_close(decoded, reference, rtol=0, atol=0)
+                total = g * n // 32
+                counts = [1, 0, total // 2, total - 1 - total // 2]
+                ownership, first = [], 0
+                for count in counts:
+                    ownership.append((first, count))
+                    first += count
+                offsets = [3, 17, 91, 5]
+                width = max(offset + count * (16 * k + k // 32) for offset, count in zip(offsets, counts))
+                storage = torch.full((4 * width,), 205, dtype=torch.uint8)
+                for rank, ((first, count), offset) in enumerate(zip(ownership, offsets)):
+                    if not count:
+                        continue
+                    row = expected[0].reshape(total, 32, k // 2)[first : first + count]
+                    scale = tile_scales.reshape(total, k // 32)[first : first + count]
+                    payload = torch.cat((row.flatten(), scale.flatten()))
+                    storage[rank * width + offset : rank * width + offset + payload.numel()] = payload
+                original = storage.clone()
+                plan = self.wire.MXFP4StripGatherPlan(layout, ownership, offsets, width, "cpu")
+                for actual, reference in zip(plan.assemble(storage), expected):
+                    torch.testing.assert_close(actual[..., : reference.shape[-1]], reference, rtol=0, atol=0)
+                    self.assertEqual(actual[..., reference.shape[-1] :].count_nonzero().item(), 0)
+                    self.assertTrue(actual.is_contiguous())
+                torch.testing.assert_close(storage, original, rtol=0, atol=0)
+
 
 if __name__ == "__main__":
     unittest.main()
