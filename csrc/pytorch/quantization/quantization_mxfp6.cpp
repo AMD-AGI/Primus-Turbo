@@ -113,9 +113,15 @@ void set_fp4_options(MXTilePack &p, const int64_t fmt, const bool col) {
     const auto    dirs   = fmt_pair(fmt);
     const auto    f      = col ? dirs.second : dirs.first;
     if (f == MXPackFmt::Fp6 || f == MXPackFmt::Fp6Tile) {
-        PRIMUS_TURBO_CHECK(round == 0 && had == 0,
-                           "FP4 scale rule / Hadamard options set on an FP6 ",
-                           col ? "column" : "row", " direction (fmt ", fmt, ")");
+        // FP6 directions keep their scale rule; K128-blocked FP6 rows may drop the Hadamard ("none"), and then take
+        // the 2-D 32x32 block scaling too (a weight plane whose tile scales serve both directions).
+        PRIMUS_TURBO_CHECK(round == 0 && (had == 0 || (had == 1 && f == MXPackFmt::Fp6Tile && !col)),
+                           "FP4 scale rule / Hadamard options set on an FP6 ", col ? "column" : "row",
+                           " direction (fmt ", fmt, "); K128-blocked FP6 rows take only Hadamard none");
+        if (had == 1) {
+            p.fp4_had    = 1;
+            p.fp4_tile2d = tile2d ? 1 : 0;
+        }
         return;
     }
     PRIMUS_TURBO_CHECK(had != 3, "fmt Hadamard code 3 is undefined (fmt ", fmt, ")");
@@ -804,6 +810,33 @@ void quantize_mx_dual_out(const at::Tensor input, at::Tensor row_packed, at::Ten
     dual_out_fmt(input, row_packed, row_scale, col_packed, col_scale, fmt, row_c1, draws, draw_codes,
                  draw_scales, nullptr, col_prob);
 }
+
+// The deferred FP4 dgrad copy of a gathered MXFP6 tile weight (see mxfp6_tile_to_fp4_col_impl). `fmt` is the dual
+// pack format of the [R, K] weight: K128-blocked FP6 rows (the planes given), an FP4 tile column (the output).
+void mxfp6_tile_to_fp4_col(const at::Tensor c0, const at::Tensor c1, const at::Tensor row_scale, const int64_t R,
+                           const int64_t K, at::Tensor col_packed, at::Tensor col_scale, const int64_t fmt,
+                           const bool sr, const int64_t seed) {
+    const auto [row_fmt, col_fmt] = fmt_pair(fmt);
+    TORCH_CHECK(row_fmt == MXPackFmt::Fp6Tile && (col_fmt == MXPackFmt::Fp4Tile || col_fmt == MXPackFmt::Fp4TileSr),
+                "mxfp6_tile_to_fp4_col: fmt must be K128-blocked FP6 rows with an FP4 tile column");
+    const MXTilePack row_ts = ts_dir(fmt, R, K, false), col_ts = ts_dir(fmt, R, K, true);
+    const auto [rp_bytes, rs_bytes] = sizes_for(row_fmt, R, K, row_ts);
+    const auto [cp_bytes, cs_bytes] = sizes_for(col_fmt, K, R, col_ts);
+    for (const at::Tensor *t : std::initializer_list<const at::Tensor *>{&c0, &c1, &row_scale, &col_packed, &col_scale})
+        TORCH_CHECK(t->is_contiguous() && t->scalar_type() == at::kByte && t->device() == c0.device(),
+                    "mxfp6_tile_to_fp4_col: contiguous uint8 buffers on one device");
+    TORCH_CHECK(c0.numel() * 3 == rp_bytes * 2 && c1.numel() * 3 == rp_bytes && row_scale.numel() == rs_bytes &&
+                    col_packed.numel() == cp_bytes && col_scale.numel() == cs_bytes,
+                "mxfp6_tile_to_fp4_col: buffer sizes do not match the [R, K] layouts of fmt");
+    const c10::DeviceGuard device_guard(c0.device());
+    MXTilePackScope        fly_scope(row_ts, col_ts);
+    mxfp6_tile_to_fp4_col_impl(c0.data_ptr<uint8_t>(), c1.data_ptr<uint8_t>(), row_scale.data_ptr<uint8_t>(), R, K,
+                               col_packed.data_ptr<uint8_t>(), col_scale.data_ptr<uint8_t>(), sr,
+                               static_cast<uint32_t>(seed), at::hip::getCurrentHIPStreamMasqueradingAsCUDA());
+}
+
+void mxfp6_tile_to_fp4_col_meta(const at::Tensor, const at::Tensor, const at::Tensor, const int64_t, const int64_t,
+                                at::Tensor, at::Tensor, const int64_t, const bool, const int64_t) {}
 
 void quantize_mx_dual_out_meta(const at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
                                const int64_t, const c10::optional<at::Tensor>, const int64_t,

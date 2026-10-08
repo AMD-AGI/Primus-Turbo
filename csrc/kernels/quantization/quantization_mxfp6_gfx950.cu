@@ -630,34 +630,43 @@ __device__ __forceinline__ void gate_mul_prologue_bf16(uint16_t (*s_tile)[LDS_PI
  * that version assembled from four lanes' strided pieces collapses to the identity
  * even[i] = v[2i], odd[i] = v[2i+1].
  */
-template <bool KBLK = false>
+// OPTS (option-capable instantiation): fly.fp4_had == 1 skips the Hadamard, and `tile_amax` >= 0 replaces the
+// group's amax (2-D 32x32 block scaling: the tile's amax over the same bf16 values; host-enforced with no Hadamard).
+template <bool KBLK = false, bool OPTS = false>
 __device__ __forceinline__ void
 mxfp6_emit_group(float (&values)[kGroupSize], const int64_t out_row, const int32_t group,
                  const int32_t nk_pad, uint8_t *__restrict__ packed,
-                 uint8_t *__restrict__ packed_scale, const mxfp4_emit::TilePackArgs fly = {}) {
+                 uint8_t *__restrict__ packed_scale, const mxfp4_emit::TilePackArgs fly = {},
+                 const float tile_amax = -1.0f) {
+    if (!(OPTS && fly.fp4_had == 1)) {
 #pragma unroll
-    for (int stage = 0; stage < 5; ++stage) {
-        const int h = 1 << stage;
+        for (int stage = 0; stage < 5; ++stage) {
+            const int h = 1 << stage;
 #pragma unroll
-        for (int pair = 0; pair < kGroupSize / 2; ++pair) {
-            const int   butterfly = pair / h;
-            const int   offset    = pair % h;
-            const int   i0        = butterfly * (2 * h) + offset;
-            const int   i1        = i0 + h;
-            const float x0        = values[i0];
-            const float x1        = values[i1];
-            values[i0]            = x0 + x1;
-            values[i1]            = x0 - x1;
+            for (int pair = 0; pair < kGroupSize / 2; ++pair) {
+                const int   butterfly = pair / h;
+                const int   offset    = pair % h;
+                const int   i0        = butterfly * (2 * h) + offset;
+                const int   i1        = i0 + h;
+                const float x0        = values[i0];
+                const float x1        = values[i1];
+                values[i0]            = x0 + x1;
+                values[i1]            = x0 - x1;
+            }
         }
-    }
 #pragma unroll
-    for (int i = 0; i < kGroupSize; ++i)
-        values[i] *= kHadamard32Norm;
+        for (int i = 0; i < kGroupSize; ++i)
+            values[i] *= kHadamard32Norm;
+    }
 
     float amax = 0.0f;
+    if (OPTS && tile_amax >= 0.0f) {
+        amax = tile_amax;
+    } else {
 #pragma unroll
-    for (int i = 0; i < kGroupSize; ++i)
-        amax = fmaxf(amax, fabsf(values[i]));
+        for (int i = 0; i < kGroupSize; ++i)
+            amax = fmaxf(amax, fabsf(values[i]));
+    }
 
     int32_t scale_unbiased;
     if (amax == 0.0f) {
@@ -788,7 +797,7 @@ emit_group_fmt(float (&values)[kGroupSize], const int64_t out_row, const int32_t
     if constexpr (FMT == MXPackFmt::Fp6) {
         mxfp6_emit_group(values, out_row, group, nk, packed, packed_scale);
     } else if constexpr (FMT == MXPackFmt::Fp6Tile) {
-        mxfp6_emit_group<true>(values, out_row, group, nk, packed, packed_scale, fly);
+        mxfp6_emit_group<true, OPTS>(values, out_row, group, nk, packed, packed_scale, fly, tile_amax);
     } else if constexpr (FMT == MXPackFmt::Fp4Blob) {
         mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::A6W4Blob, false, OPTS>(
             values, out_row, group, nk, packed, packed_scale, 0u, fly, tile_amax);
@@ -1622,7 +1631,56 @@ mxfp4_emit::TilePackArgs to_args(const MXTilePack &p) {
     return {p.is_b, p.nt, p.ilv, p.k128, p.rows, p.fp4_round, p.fp4_had, p.fp4_tile2d, p.kouter, p.c1_split, p.c1_delta,
             p.draws, p.draw_codes, p.draw_scales, p.prob4, p.prob_delta};
 }
+
+// E2M3 code (6 bits, sign in bit 5) -> value at scale 1.
+__device__ __forceinline__ float e2m3_value(const uint32_t c) {
+    const uint32_t m = c & 7u, e = (c >> 3) & 3u;
+    const float    mag = e == 0u ? static_cast<float>(m) * 0.125f
+                                 : __builtin_ldexpf(1.0f + static_cast<float>(m) * 0.125f, static_cast<int>(e) - 1);
+    return (c & 32u) ? -mag : mag;
+}
+
+// One block per 32 rows x 256 columns of an [R, K] weight held as K128-blocked MXFP6 rows (C0 / C1 planes, role-B
+// scale slab -- the forward B operand): decode the 32 x 256 values into LDS (thread t: row t / 8, K group t % 8; the
+// 24 bytes of a group are 32 little-endian 6-bit codes, C0 = bytes 0-15, C1 = 16-23), then each thread emits one
+// column's 32 values (contraction over the rows) through the FP4 tile emit -- exactly what the column direction of a
+// dual pack of the dequantized weight emits.
+template <bool SR>
+__global__ __launch_bounds__(256) void mxfp6_tile_to_fp4_col_kernel(
+    const uint8_t *__restrict__ c0, const uint8_t *__restrict__ c1, const uint8_t *__restrict__ row_scale,
+    uint8_t *__restrict__ col_packed, uint8_t *__restrict__ col_scale, const uint32_t seed,
+    const mxfp4_emit::TilePackArgs row_fly, const mxfp4_emit::TilePackArgs col_fly) {
+    __shared__ float tile[kGroupSize][256 + 1];
+    const int32_t    r0 = blockIdx.y * kGroupSize, k0 = blockIdx.x * 256, t = threadIdx.x;
+    {
+        const int32_t  lr = t >> 3, g = t & 7, row = r0 + lr, group = (k0 >> 5) + g;
+        const int64_t  nk = row_fly.k128, s = group >> 2, gg = group & 3;
+        const uint4    a  = *reinterpret_cast<const uint4 *>(c0 + (((int64_t(row) >> 4) * nk + s) * 16 + (row & 15)) * 64 +
+                                                         gg * 16);
+        const uint2    b  = *reinterpret_cast<const uint2 *>(c1 + (((int64_t(row) >> 5) * nk + s) * 32 + (row & 31)) * 32 +
+                                                         gg * 8);
+        const uint32_t w[7] = {a.x, a.y, a.z, a.w, b.x, b.y, 0u};
+        const uint8_t  se   = row_scale[mxfp4_emit::ts_scale_byte(row, group, row_fly)];
+        const float    sc   = __builtin_bit_cast(float, se == 0 ? 0x00400000u : static_cast<uint32_t>(se) << 23);
+#pragma unroll
+        for (int i = 0; i < kGroupSize; ++i) {
+            const int bit = 6 * i, wi = bit >> 5, sh = bit & 31;
+            uint32_t  c   = w[wi] >> sh;
+            if (sh > 26)
+                c |= w[wi + 1] << (32 - sh);
+            tile[lr][g * kGroupSize + i] = e2m3_value(c & 63u) * sc;
+        }
+    }
+    __syncthreads();
+    float values[kGroupSize];
+#pragma unroll
+    for (int i = 0; i < kGroupSize; ++i)
+        values[i] = tile[i][t];
+    mxfp4_emit::mxfp4_emit_group<mxfp4_emit::Layout::Tile, SR, true>(values, k0 + t, r0 / kGroupSize, 0, col_packed,
+                                                                      col_scale, seed, col_fly);
+}
 } // namespace
+
 
 template <typename DType, bool DO_ROW, bool DO_COL, MXFP6Prologue PROLOGUE, int TILE_N>
 void launch_dual(const dim3 grid, const dim3 block, hipStream_t stream, const DType *input,
@@ -1676,8 +1734,9 @@ void launch_dual(const dim3 grid, const dim3 block, hipStream_t stream, const DT
     auto go = [&](auto r, auto c) {
         constexpr MXPackFmt R      = decltype(r)::value;
         constexpr MXPackFmt C      = decltype(c)::value;
+        // FP4 options, or the K128-blocked FP6 rows' own (no Hadamard, 2-D scales)
         constexpr bool      has_f4 = !(R == MXPackFmt::Fp6 || R == MXPackFmt::Fp6Tile) ||
-                                !(C == MXPackFmt::Fp6 || C == MXPackFmt::Fp6Tile);
+                                !(C == MXPackFmt::Fp6 || C == MXPackFmt::Fp6Tile) || R == MXPackFmt::Fp6Tile;
         if constexpr (has_f4) {
             if (opts) {
                 launch(r, c, std::true_type{});
@@ -2101,6 +2160,20 @@ MXTilePack mx_tile_pack_row() {
 }
 MXTilePack mx_tile_pack_col() {
     return g_ts_col;
+}
+
+void mxfp6_tile_to_fp4_col_impl(const uint8_t *c0, const uint8_t *c1, const uint8_t *row_scale, const int64_t R,
+                                const int64_t K, uint8_t *col_packed, uint8_t *col_scale, const bool sr,
+                                const uint32_t seed, hipStream_t stream) {
+    PRIMUS_TURBO_CHECK(R % kGroupSize == 0 && K % 256 == 0, "mxfp6_tile_to_fp4_col: R % 32 == 0, K % 256 == 0");
+    const auto row_fly = to_args(g_ts_row), col_fly = to_args(g_ts_col);
+    const dim3 grid(static_cast<uint32_t>(K / 256), static_cast<uint32_t>(R / kGroupSize)), block(256);
+    if (sr)
+        mxfp6_tile_to_fp4_col_kernel<true>
+            <<<grid, block, 0, stream>>>(c0, c1, row_scale, col_packed, col_scale, seed, row_fly, col_fly);
+    else
+        mxfp6_tile_to_fp4_col_kernel<false>
+            <<<grid, block, 0, stream>>>(c0, c1, row_scale, col_packed, col_scale, seed, row_fly, col_fly);
 }
 
 } // namespace primus_turbo

@@ -277,6 +277,15 @@ def quantize_mx_dual_out(
     )
 
 
+def mxfp6_tile_to_fp4_col(c0, c1, row_scale, R: int, K: int, col_packed, col_scale, fmt: int, sr: bool, seed: int):
+    """The FP4 column (dgrad copy) of an [R, K] weight held as K128-blocked MXFP6 rows -- ``c0`` / ``c1`` planes and
+    role-B ``row_scale`` slab, as a dual pack with ``fmt`` writes them -- into ``col_packed`` / ``col_scale`` (the
+    sizes ``mx_dir_sizes(R, K, fmt, True)``): bitwise what that dual pack of the dequantized weight emits as its
+    column direction, stochastically rounded from ``seed`` when ``sr`` (the dual pack's column seed is its launch seed
+    ^ 0x5bd1e995)."""
+    _ops().mxfp6_tile_to_fp4_col(c0, c1, row_scale, R, K, col_packed, col_scale, fmt, sr, seed & 0xFFFFFFFF)
+
+
 def quantize_mx_dual_out_adam(
     param, grad, exp_avg, exp_avg_sq, remainder, row_packed, row_scale, col_packed, col_scale, fmt: int, *,
     lr: float, beta1: float, beta2: float, eps: float, weight_decay: float, step: int, adamw: bool = True,

@@ -385,3 +385,54 @@ def test_column_prob4_deferred_sr(rows, cols, bits):
     a, b, c = fl[2].clone(), fl[2].clone(), fl[2].clone()
     fp4_prob_round(a, prob, 5), fp4_prob_round(b, prob, 5), fp4_prob_round(c, prob, 6)
     assert torch.equal(a, b) and not torch.equal(a, c)
+
+
+@pytest.mark.parametrize("sr", [False, True])
+def test_mxfp6_tile_to_fp4_col(sr):
+    """mxfp6_tile_to_fp4_col: the FP4 column (dgrad copy) made from a weight's K128-blocked MXFP6 rows -- here an
+    unrotated plane with 2-D 32x32 tile scales -- is bitwise the column direction a dual pack of the dequantized
+    weight emits (same format, the dual pack's column seed = its launch seed ^ 0x5bd1e995), stochastic or RN."""
+    _skip()
+    from primus_turbo.flydsl.utils.gemm_helper import mxfp4_packed_scale_byte
+    from primus_turbo.pytorch.ops.quantization import set_sr_seed_next_pack
+
+    R, K = 512, 3072
+    x = _rand(R, K, seed=5)
+    base = P.with_ts6_row(P.ts_fmt(col=P.ts_b_params(16384, K, R)), True)
+    fmt = P.fp4_options(base, row_hadamard="none", col_hadamard="none", tile2d=True) | P.MX_FMT_COL_KOUTER
+    if sr:
+        fmt |= P.MX_FMT_FP4_COL_SR
+    rp, rs = P.mx_dir_sizes(R, K, fmt, False)
+    cp, cs = P.mx_dir_sizes(R, K, fmt, True)
+    nb = lambda n: torch.empty(n, dtype=torch.uint8, device="cuda")  # noqa: E731
+    c0, c1, rsc = nb(rp * 2 // 3), nb(rp // 3), nb(rs)
+    P.quantize_mx_dual_out(x, c0, rsc, nb(0), nb(0), fmt, row_c1=c1)  # the plane: rows only
+
+    # decode the plane: C0 [R/16, K/128, 16, 64], C1 [R/32, K/128, 32, 32]; a group's 24 bytes = 32 LE 6-bit codes
+    nk = K // 128
+    b0 = c0.view(R // 16, nk, 16, 64).permute(0, 2, 1, 3).reshape(R, nk, 4, 16)
+    b1 = c1.view(R // 32, nk, 32, 32).permute(0, 2, 1, 3).reshape(R, nk, 4, 8)
+    b = torch.cat([b0, b1], -1).reshape(R, K // 32, 8, 3).long()
+    word = b[..., 0] | (b[..., 1] << 8) | (b[..., 2] << 16)
+    codes = torch.stack([(word >> (6 * i)) & 63 for i in range(4)], -1).reshape(R, K)
+    m, e = codes & 7, (codes >> 3) & 3
+    mag = torch.where(e == 0, m.double() / 8, torch.exp2(e.double() - 1) * (1 + m.double() / 8))
+    val = torch.where(codes & 32 > 0, -mag, mag)
+    sidx = torch.tensor([[mxfp4_packed_scale_byte(r, g, k128=nk, b_ilv=0, is_b=True) for g in range(K // 32)]
+                         for r in range(R)], device="cuda")
+    sbyte = rsc[sidx].long()
+    w_deq = (val.view(R, K // 32, 32) * torch.exp2(sbyte.double() - 127).unsqueeze(-1)).reshape(R, K)
+    assert (sbyte.view(R // 32, 32, K // 32) == sbyte.view(R // 32, 32, K // 32)[:, :1]).all(), "tile scales"
+    assert ((w_deq - x.double()).norm() / x.double().norm()).item() < 0.05
+    wb = w_deq.to(torch.bfloat16)
+    assert torch.equal(wb.double(), w_deq), "FP6 values are exact in bf16"
+
+    seed = 1234567
+    ref_c, ref_s = nb(cp), nb(cs)
+    set_sr_seed_next_pack(seed)
+    # the dequantized weight's column direction with per-32 scales (the plane's tile2d bit would give the column its
+    # 32x32 tile scales; the receiver re-derives each column block's own, which the tile scale bounds)
+    P.quantize_mx_dual_out(wb, nb(0), nb(0), ref_c, ref_s, fmt & ~P.MX_FMT_FP4_TILE2D)
+    got_c, got_s = nb(cp), nb(cs)
+    P.mxfp6_tile_to_fp4_col(c0, c1, rsc, R, K, got_c, got_s, fmt, sr, seed ^ 0x5BD1E995)
+    assert torch.equal(got_s, ref_s) and torch.equal(got_c, ref_c)

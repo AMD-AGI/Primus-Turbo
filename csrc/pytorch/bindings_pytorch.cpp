@@ -194,6 +194,7 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "bool want_col_sum) -> Tensor[]");
     m.def("quantize_mxfp6_fused_dual_out(Tensor input, Tensor? aux, Tensor? bias, int prologue_mode, Tensor(a!) row_packed, Tensor(b!) row_scale, Tensor(c!) col_packed, Tensor(d!) col_scale, Tensor(e!)? col_sum=None) -> ()");
     m.def("quantize_mx_dual_out(Tensor input, Tensor(a!) row_packed, Tensor(b!) row_scale, Tensor(c!) col_packed, Tensor(d!) col_scale, int fmt, Tensor(e!)? row_c1=None, int draws=1, int draw_codes=0, int draw_scales=0, Tensor(f!)? col_prob=None) -> ()");
+    m.def("mxfp6_tile_to_fp4_col(Tensor c0, Tensor c1, Tensor row_scale, int R, int K, Tensor(a!) col_packed, Tensor(b!) col_scale, int fmt, bool sr, int seed) -> ()");
     m.def("quantize_mx_dual_out_adam(Tensor(p!) param, Tensor grad, Tensor(m!) exp_avg, Tensor(v!) exp_avg_sq, Tensor(r!) remainder, Tensor(a!) row_packed, Tensor(b!) row_scale, Tensor(c!) col_packed, Tensor(d!) col_scale, int fmt, Tensor(e!)? row_c1, int draws, int draw_codes, int draw_scales, float lr, float beta1, float beta2, float eps, float weight_decay, int step, bool adamw, bool bias_correction) -> ()");
     m.def("quantize_mx_fused_dual_out(Tensor input, Tensor? aux, Tensor? bias, int prologue_mode, Tensor(a!) row_packed, Tensor(b!) row_scale, Tensor(c!) col_packed, Tensor(d!) col_scale, Tensor(e!)? col_sum, int fmt) -> ()");
     m.def("quantize_mxfp6_qk_norm_rope_bwd(Tensor input, Tensor dq, Tensor dk, Tensor dv, "
@@ -249,6 +250,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("quantize_mxfp6_fused_dual", quantize_mxfp6_fused_dual);
     m.impl("quantize_mxfp6_fused_dual_out", quantize_mxfp6_fused_dual_out);
     m.impl("quantize_mx_dual_out", quantize_mx_dual_out);
+    m.impl("mxfp6_tile_to_fp4_col", mxfp6_tile_to_fp4_col);
     m.impl("quantize_mx_dual_out_adam", quantize_mx_dual_out_adam);
     m.impl("quantize_mx_fused_dual_out", quantize_mx_fused_dual_out);
     m.impl("quantize_mxfp6_qk_norm_rope_bwd", quantize_mxfp6_qk_norm_rope_bwd);
@@ -335,6 +337,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     m.impl("quantize_mxfp6_fused_dual", quantize_mxfp6_fused_dual_meta);
     m.impl("quantize_mxfp6_fused_dual_out", quantize_mxfp6_fused_dual_out_meta);
     m.impl("quantize_mx_dual_out", quantize_mx_dual_out_meta);
+    m.impl("mxfp6_tile_to_fp4_col", mxfp6_tile_to_fp4_col_meta);
     m.impl("quantize_mx_dual_out_adam", quantize_mx_dual_out_adam_meta);
     m.impl("quantize_mx_fused_dual_out", quantize_mx_fused_dual_out_meta);
     m.impl("quantize_mxfp6_qk_norm_rope_bwd", quantize_mxfp6_qk_norm_rope_bwd_meta);

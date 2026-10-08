@@ -253,6 +253,13 @@ void sr_override_next_seed(SRStream stream, uint32_t seed);
 void      mx_tile_pack_set(const MXTilePack &row, const MXTilePack &col);
 MXTilePack mx_tile_pack_row();
 MXTilePack mx_tile_pack_col();
+// The FP4 column (dgrad copy) of an [R, K] weight held as K128-blocked MXFP6 rows (C0 / C1 planes, role-B scale slab):
+// decode, then the FP4 tile emit of the column direction, with the row / column parameters of the current
+// MXTilePackScope and stochastic rounding from `seed` when `sr` -- bitwise what a dual pack of the dequantized weight
+// emits as its column direction (whose seed is the launch seed ^ 0x5bd1e995).
+void mxfp6_tile_to_fp4_col_impl(const uint8_t *c0, const uint8_t *c1, const uint8_t *row_scale, int64_t R, int64_t K,
+                                uint8_t *col_packed, uint8_t *col_scale, bool sr, uint32_t seed, hipStream_t stream);
+
 struct MXTilePackScope {
     MXTilePackScope(const MXTilePack &row, const MXTilePack &col) { mx_tile_pack_set(row, col); }
     ~MXTilePackScope() { mx_tile_pack_set(MXTilePack{}, MXTilePack{}); }
