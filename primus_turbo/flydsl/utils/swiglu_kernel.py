@@ -11,11 +11,16 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""Standalone SwiGLU forward/backward kernels (FlyDSL)."""
+"""Standalone SwiGLU forward/backward kernels (FlyDSL).
+
+The gated activation is parametrized by :class:`~primus_turbo.flydsl.utils.glu_activation.GLUActivation`
+(SiLU-SwiGLU by default, ``swigluoai`` for MiniMax-M3), baked in at compile time.
+"""
 
 from __future__ import annotations
 
 import itertools
+import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -35,20 +40,42 @@ from primus_turbo.flydsl.mega.tune_utils import (
     Config,
     autotune,
 )
+from primus_turbo.flydsl.utils.glu_activation import (
+    GLUActivation,
+    activation_constexpr,
+)
 from primus_turbo.flydsl.utils.prims import ld, st
-
-ACTIVATION_CLAMP = 10.0
 
 _VEC = 8
 _WARP = 64
 _POOL_BLOCK_M = 256  # pool-block granularity (fixed policy; matches symm_buffer.BLOCK_M)
 
 
+def _bound(value, vtype):
+    """Vector constant for a clamp bound, or None for an infinite (absent) one."""
+    return None if math.isinf(value) else fx.arith.constant_vector(value, vtype)
+
+
 def _clampv(x, lo, hi):
-    return fx.arith.minimumf(fx.arith.maximumf(x, lo), hi)
+    if lo is not None:
+        x = fx.arith.maximumf(x, lo)
+    if hi is not None:
+        x = fx.arith.minimumf(x, hi)
+    return x
 
 
-def _make_swiglu(I: int, with_scale: bool, BM: int, grid_x: int, block_threads: int):
+def _mul_const(x, c, vtype):
+    # c == 1 emits nothing, so the default spec's IR is the historical one.
+    return x if c == 1.0 else fx.arith.mulf(x, fx.arith.constant_vector(c, vtype))
+
+
+def _add_const(x, c, vtype):
+    # Skipping c == 0 is not only cheaper: -0.0 + 0.0 is +0.0, which would flip the sign of a zero.
+    return x if c == 0.0 else fx.arith.addf(x, fx.arith.constant_vector(c, vtype))
+
+
+def _make_swiglu(I: int, with_scale: bool, BM: int, grid_x: int, block_threads: int, act: tuple):
+    alpha, glu_offset, gate_lo, gate_hi, up_clamp = act
     two_I = 2 * I
     cols_per_block = _VEC * block_threads
     assert I % _VEC == 0, f"I={I} not divisible by vec width {_VEC}"
@@ -66,8 +93,8 @@ def _make_swiglu(I: int, with_scale: bool, BM: int, grid_x: int, block_threads: 
         acc_rsrc = create_buffer_resource(ACC1, max_size=True)
         act_rsrc = create_buffer_resource(ACT, max_size=True)
         scale_rsrc = create_buffer_resource(SCALE, max_size=True) if with_scale else None
-        lo = fx.arith.constant_vector(-ACTIVATION_CLAMP, f32v)
-        hi = fx.arith.constant_vector(ACTIVATION_CLAMP, f32v)
+        g_lo, g_hi = _bound(gate_lo, f32v), _bound(gate_hi, f32v)
+        u_lo, u_hi = _bound(-up_clamp, f32v), _bound(up_clamp, f32v)
         one = fx.arith.constant_vector(1.0, f32v)
         neg1 = fx.arith.constant_vector(-1.0, f32v)
 
@@ -77,9 +104,9 @@ def _make_swiglu(I: int, with_scale: bool, BM: int, grid_x: int, block_threads: 
             if not partial_tail or col < fx.Int32(I):
                 gate = buffer_load(acc_rsrc, row_base + col, vec_width=_VEC, dtype=fx.T.bf16())
                 up = buffer_load(acc_rsrc, row_base + fx.Int32(I) + col, vec_width=_VEC, dtype=fx.T.bf16())
-                g = _clampv(fx.arith.extf(f32v, gate), lo, hi)
-                u = _clampv(fx.arith.extf(f32v, up), lo, hi)
-                denom = fx.arith.addf(one, fmath.exp(fx.arith.mulf(g, neg1)))
+                g = _clampv(fx.arith.extf(f32v, gate), g_lo, g_hi)
+                u = _add_const(_clampv(fx.arith.extf(f32v, up), u_lo, u_hi), glu_offset, f32v)
+                denom = fx.arith.addf(one, fmath.exp(fx.arith.mulf(_mul_const(g, alpha, f32v), neg1)))
                 act = fx.arith.mulf(fx.arith.divf(g, denom), u)
                 if with_scale:
                     sc = buffer_load(scale_rsrc, m, vec_width=1, dtype=fx.T.f32())
@@ -106,7 +133,9 @@ def _make_swiglu_bwd(
     block_threads: int,
     with_gate: bool,
     with_act_w: bool,
+    act: tuple,
 ):
+    alpha, glu_offset, gate_lo, gate_hi, up_clamp = act
     two_I = 2 * I
     # Gate reduction folds all I columns per row; block spans multiple warps.
     if with_gate:
@@ -141,8 +170,8 @@ def _make_swiglu_bwd(
         scale_rsrc = create_buffer_resource(SCALE, max_size=True) if with_scale else None
         grad_gate_rsrc = create_buffer_resource(GRAD_GATE, max_size=True) if with_gate else None
         act_w_rsrc = create_buffer_resource(ACT_W, max_size=True) if with_act_w else None
-        lo = fx.arith.constant_vector(-ACTIVATION_CLAMP, f32v)
-        hi = fx.arith.constant_vector(ACTIVATION_CLAMP, f32v)
+        g_lo, g_hi = _bound(gate_lo, f32v), _bound(gate_hi, f32v)
+        u_lo, u_hi = _bound(-up_clamp, f32v), _bound(up_clamp, f32v)
         one = fx.arith.constant_vector(1.0, f32v)
         zero = fx.arith.constant_vector(0.0, f32v)
         neg1 = fx.arith.constant_vector(-1.0, f32v)
@@ -171,13 +200,17 @@ def _make_swiglu_bwd(
                 sc = buffer_load(scale_rsrc, m, vec_width=1, dtype=fx.T.f32())
                 d = fx.arith.mulf(d, _vector.broadcast(f32v, sc))
 
-            gc = _clampv(gate, lo, hi)
-            uc = _clampv(up, lo, hi)
-            sig = fx.arith.divf(one, fx.arith.addf(one, fmath.exp(fx.arith.mulf(gc, neg1))))
+            gc = _clampv(gate, g_lo, g_hi)
+            uc = _clampv(up, u_lo, u_hi)
+            # d(u + offset)/du = 1: only the gate side sees the offset.
+            uo = _add_const(uc, glu_offset, f32v)
+            agc = _mul_const(gc, alpha, f32v)
+            sig = fx.arith.divf(one, fx.arith.addf(one, fmath.exp(fx.arith.mulf(agc, neg1))))
             s = fx.arith.mulf(gc, sig)
             duc = fx.arith.mulf(d, s)
-            dsilu = fx.arith.mulf(sig, fx.arith.addf(one, fx.arith.mulf(gc, fx.arith.subf(one, sig))))
-            dgc = fx.arith.mulf(fx.arith.mulf(d, uc), dsilu)
+            # d/dg [g * sigmoid(alpha g)] = sig * (1 + alpha g (1 - sig))
+            dsilu = fx.arith.mulf(sig, fx.arith.addf(one, fx.arith.mulf(agc, fx.arith.subf(one, sig))))
+            dgc = fx.arith.mulf(fx.arith.mulf(d, uo), dsilu)
             mg = fx.arith.select(fx.arith.cmpf(fx.arith.CmpFPredicate.OEQ, gate, gc), one, zero)
             mu = fx.arith.select(fx.arith.cmpf(fx.arith.CmpFPredicate.OEQ, up, uc), one, zero)
             dgate = fx.arith.trunc_f(bf16v, fx.arith.mulf(dgc, mg))
@@ -189,11 +222,11 @@ def _make_swiglu_bwd(
                 buffer_store(dup, dacc_rsrc, row_base + fx.Int32(I) + col)
                 if with_act_w:
                     sc_w = buffer_load(scale_rsrc, m, vec_width=1, dtype=fx.T.f32())
-                    act_w_v = fx.arith.mulf(fx.arith.mulf(s, uc), _vector.broadcast(f32v, sc_w))
+                    act_w_v = fx.arith.mulf(fx.arith.mulf(s, uo), _vector.broadcast(f32v, sc_w))
                     buffer_store(fx.arith.trunc_f(bf16v, act_w_v), act_w_rsrc, m * fx.Int32(I) + col)
 
             if with_gate:
-                contrib = fx.arith.mulf(d_raw, fx.arith.mulf(s, uc))
+                contrib = fx.arith.mulf(d_raw, fx.arith.mulf(s, uo))
                 if guard:
                     # OOB lanes read garbage; zero them so the row sum stays clean.
                     contrib = fx.arith.select(in_bounds, contrib, zero)
@@ -268,13 +301,14 @@ def _compiled_swiglu(
     I: fx.Constexpr[int],
     with_scale: fx.Constexpr[int],
     BM: fx.Constexpr[int],
+    activation: fx.Constexpr[tuple],
     grid_x: fx.Constexpr[int],
     block_threads: fx.Constexpr[int],
     stream: fx.Stream,
 ):
     cols_per_block = _VEC * block_threads
     n_col_tiles = (I + cols_per_block - 1) // cols_per_block
-    kernel = _make_swiglu(I, bool(with_scale), BM, grid_x, block_threads)
+    kernel = _make_swiglu(I, bool(with_scale), BM, grid_x, block_threads, activation)
     kernel(ACC1, ACT, SCALE, NUM_TILE_BLOCKS).launch(
         grid=(grid_x, n_col_tiles, 1),
         block=(block_threads, 1, 1),
@@ -304,6 +338,7 @@ def _compiled_swiglu_bwd(
     BM: fx.Constexpr[int],
     with_gate: fx.Constexpr[int],
     with_act_w: fx.Constexpr[int],
+    activation: fx.Constexpr[tuple],
     grid_x: fx.Constexpr[int],
     block_threads: fx.Constexpr[int],
     stream: fx.Stream,
@@ -318,6 +353,7 @@ def _compiled_swiglu_bwd(
         block_threads,
         bool(with_gate),
         bool(with_act_w),
+        activation,
     )
     grid_y = 1 if with_gate else n_col_tiles
     # One f32 LDS slot per warp for cross-warp gate reduction.
@@ -337,6 +373,7 @@ def swiglu_backward_flydsl_kernel(
     scale: torch.Tensor | None = None,
     return_gate: bool = False,
     return_act_w: bool = False,
+    activation: GLUActivation | None = None,
 ):
     M, two_I = x.shape
     assert two_I % 2 == 0, f"x last dim must be even (gate||up), got {two_I}"
@@ -365,6 +402,7 @@ def swiglu_backward_flydsl_kernel(
         BM=_POOL_BLOCK_M,
         with_gate=int(return_gate),
         with_act_w=int(return_act_w),
+        activation=activation_constexpr(activation),
         stream=torch.cuda.current_stream(),
     )
     if return_gate and return_act_w:
@@ -381,6 +419,7 @@ def swiglu_flydsl_kernel(
     num_tile_blocks: torch.Tensor,
     scale: torch.Tensor | None = None,
     stream=None,
+    activation: GLUActivation | None = None,
 ) -> torch.Tensor:
     if stream is None:
         stream = torch.cuda.current_stream()
@@ -399,6 +438,7 @@ def swiglu_flydsl_kernel(
         I=I,
         with_scale=int(with_scale),
         BM=_POOL_BLOCK_M,
+        activation=activation_constexpr(activation),
         stream=stream,
     )
     return act

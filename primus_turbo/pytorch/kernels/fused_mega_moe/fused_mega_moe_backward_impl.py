@@ -6,7 +6,7 @@
 
 """Fused mega MoE backward custom op: conjugate of forward via Dispatch<->Combine duality (FlyDSL)."""
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch.distributed.distributed_c10d import _resolve_process_group
@@ -17,6 +17,10 @@ from primus_turbo.flydsl.mega import (
 )
 from primus_turbo.flydsl.mega.bf16.grouped_gemm_bf16_kernel import (
     grouped_gemm_bf16_variable_k_flydsl_kernel,
+)
+from primus_turbo.flydsl.utils.glu_activation import (
+    GLUActivation,
+    activation_constexpr,
 )
 from primus_turbo.flydsl.utils.swiglu_kernel import swiglu_backward_flydsl_kernel
 from primus_turbo.pytorch.core.backend import (
@@ -68,6 +72,7 @@ class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
         group,
         num_tokens: int,
         num_topk: int,
+        activation: Optional[List[float]] = None,
         **kwargs,
     ):
 
@@ -99,6 +104,7 @@ class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
             return_act_w=True,
             # bound by THIS handle's tile count (per-forward, not shared symm)
             num_tile_blocks=handle[_H_NUM_TILE_BLOCKS],
+            activation=activation,
         )
 
         dW2 = grouped_gemm_bf16_variable_k_flydsl_kernel(
@@ -177,6 +183,7 @@ def _fused_mega_moe_backward(
     num_tokens: int,
     num_topk: int,
     default_backend: int,
+    activation: Optional[List[float]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     group = _resolve_process_group(group_name)
     default_backend_choice = BackendChoice(backend=BackendType(default_backend))
@@ -193,6 +200,7 @@ def _fused_mega_moe_backward(
         group=group,
         num_tokens=num_tokens,
         num_topk=num_topk,
+        activation=activation,
     )
     return FusedMegaMoEBackwardKernelDispatcher.dispatch(default_backend_choice, None, **kwargs)
 
@@ -211,6 +219,7 @@ def _fused_mega_moe_backward_meta(
     num_tokens: int,
     num_topk: int,
     default_backend: int,
+    activation: Optional[List[float]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # eager-only path (EP rendezvous can't be traced); approximate meta for completeness.
     hidden = grad_y.shape[1]
@@ -234,6 +243,7 @@ def fused_mega_moe_backward_impl(
     num_tokens: int,
     num_topk: int,
     default_backend: int,
+    activation: Optional[GLUActivation] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused MoE backward (conjugate of forward via Dispatch<->Combine duality).
 
@@ -252,4 +262,5 @@ def fused_mega_moe_backward_impl(
         num_tokens,
         num_topk,
         default_backend,
+        None if activation is None else list(activation_constexpr(activation)),
     )

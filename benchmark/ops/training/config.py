@@ -206,6 +206,21 @@ MoEModelConfigs = {
         "seqlen": 4096,
         "num_topk": 6,
     },
+    # https://huggingface.co/MiniMaxAI/MiniMax-M3
+    #
+    # Its experts use `hidden_act: swigluoai` (GLUActivation.swigluoai() in MegaMoE), not SiLU.
+    # seqlen is the training sequence length, not max_position_embeddings (1M).
+    "MiniMax-M3": {
+        "n_routed_experts": 128,
+        "moe_intermediate_size": 3072,
+        "hidden_size": 6144,
+        # GQA attention config (MiniMax Sparse Attention is layered on top of it)
+        "num_attention_heads": 64,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "seqlen": 4096,
+        "num_topk": 4,
+    },
     # https://modelscope.cn/models/deepseek-ai/DeepSeek-V2/file/view/master/config.json
     "DeepSeek-V2": {
         "n_routed_experts": 160,
