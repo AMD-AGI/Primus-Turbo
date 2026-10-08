@@ -636,6 +636,57 @@ def a4w4_softmax_d_ok(table, m: int, n: int, k: int, batch: int, seq: int, koute
     return (kouter, m, n, k, batch, seq) in table
 
 
+@_torch_custom_op_wrapper(
+    "primus_turbo::gemm_a6w6_ts_cat_gres_out", mutates_args=("out", "h"), device_types="cuda"
+)
+def gemm_a6w6_ts_cat_gres_out(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    b_c1: Optional[torch.Tensor],
+    a2: torch.Tensor,
+    a2_scale: torch.Tensor,
+    b2: torch.Tensor,
+    b2_scale: torch.Tensor,
+    b2_c1: Optional[torch.Tensor],
+    bias: torch.Tensor,
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    out: torch.Tensor,
+    h: torch.Tensor,
+    k: int,
+    k2: int,
+) -> None:
+    """Two A6W6 tilescale GEMMs summed in one fp32 accumulator, with a gated residual in the store epilogue:
+    ``h = A @ B^T + A2 @ B2^T + bias`` (one bf16 rounding) and ``out = x + gate[r % Bt] * h``.
+
+    Each operand pair is packed exactly as for ``gemm_fp6_impl(..., a6w6_ts=True)`` (``b_c1`` / ``b2_c1``: B's C1
+    plane in its own buffer, or None). ``x`` / ``out`` / ``h`` are [M, N] bf16 in sbhd rows (row = s * Bt + b) and
+    ``gate`` is [Bt, N] bf16 with unit column stride. See ``a6w6_ts_cat_table`` for the shapes."""
+    from aiter.ops.gemm_op_tilescale import gemm_a6w6_tilescale_cat
+
+    flat = lambda t: None if t is None else t.view(torch.uint8).reshape(-1)  # noqa: E731
+    gemm_a6w6_tilescale_cat(flat(a), flat(b), flat(a_scale), flat(b_scale), flat(a2), flat(b2), flat(a2_scale),
+                            flat(b2_scale), out, h, k, k2, bias, x, gate, flat(b_c1), flat(b2_c1))
+
+
+@gemm_a6w6_ts_cat_gres_out.register_fake
+def _gemm_a6w6_ts_cat_gres_out_meta(a, a_scale, b, b_scale, b_c1, a2, a2_scale, b2, b2_scale, b2_c1, bias, x, gate,
+                                    out, h, k, k2) -> None:
+    return None
+
+
+def a6w6_ts_cat_table() -> frozenset:
+    """The shapes ``gemm_a6w6_ts_cat_gres_out`` has kernels for, as plain data for callers that decide inside
+    compiled regions (read it once, outside them): {(M, N, K, K2, Bt)}."""
+    try:
+        from aiter.ops.gemm_op_tilescale import a6w6_tilescale_cat_table
+    except ImportError:
+        return frozenset()
+    return frozenset(a6w6_tilescale_cat_table())
+
+
 def _a4w4_aiter_blob(a, a_scale, b, b_scale, m, n, k, out_dtype, bias):
     """A4W4 on aiter's tile-blob kernel (``a4w4=5``, ``gemm_a4w4_blob_asm``, its default ``stnt_allk``): both operands
     as the packers write MX_FMT_BLOB_* rows (C0 tile blob, +2 guard K tiles). M / N are padded to the 256 tile."""
