@@ -19,6 +19,14 @@ from math import prod
 import torch
 
 
+def _aligned_bf16_input(weight):
+    """Make the int32 view used by FlyDSL legal without copying aligned shards."""
+    weight = weight.contiguous()
+    # contiguous() returns the original tensor when its strides already match,
+    # even if a flat-buffer slice starts at an odd BF16 storage offset.
+    return weight.clone() if weight.storage_offset() % 2 else weight
+
+
 @dataclass(frozen=True)
 class MXFP4WireLayout:
     """Out-of-band metadata; every collective participant must use the same layout."""
@@ -83,7 +91,7 @@ class MXFP4WireLayout:
         recipe = ScalingRecipe(use_2d_block=True)
         with torch.no_grad():
             components = quantize_fp4_with_trans(
-                weight.contiguous(),
+                _aligned_bf16_input(weight),
                 float4_e2m1fn_x2,
                 ScalingGranularity.MX_BLOCKWISE,
                 block_size=32,

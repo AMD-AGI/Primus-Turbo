@@ -22,6 +22,19 @@ MXFP4WireLayout = _MODULE.MXFP4WireLayout
 
 
 class TestMXFP4WireLayout(unittest.TestCase):
+    def test_contiguous_odd_offset_is_realigned_for_int32_view(self):
+        storage = torch.arange(4098, dtype=torch.float32).to(torch.bfloat16)
+        odd = storage[1:4097].view(1, 32, 128)
+        self.assertTrue(odd.is_contiguous())
+        self.assertIs(odd.contiguous(), odd)
+        with self.assertRaises(RuntimeError):
+            odd.view(torch.int32)
+        aligned = _MODULE._aligned_bf16_input(odd)
+        torch.testing.assert_close(aligned, odd, rtol=0, atol=0)
+        self.assertEqual(aligned.view(torch.int32).shape, (1, 32, 64))
+        even = storage[2:4098].view(1, 32, 128)
+        self.assertIs(_MODULE._aligned_bf16_input(even), even)
+
     def test_rank_and_expert_order_with_padding(self):
         # N=96, K=160 exercise local padding and a different full-weight pad.
         layout = MXFP4WireLayout((3, 96, 160), scale_rounding_mode=2)
