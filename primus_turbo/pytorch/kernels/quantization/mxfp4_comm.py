@@ -64,29 +64,29 @@ def assemble_mxfp4_strips_kernel(
         tile = pid - rb - sb
         n_tile = tile % (nr // 32)
         k_tile = tile // (nr // 32) % triton.cdiv(K, 64)
-        group = tile // ((nr // 32) * triton.cdiv(K, 64))
+        tile_group = tile // ((nr // 32) * triton.cdiv(K, 64))
         out_row = k_tile * 64 + tl.arange(0, 64)
         out_column = n_tile * 32 + tl.arange(0, 32)
         if SHARED_2D:
             in_row = n_tile * 64 + tl.arange(0, 64)
             in_column = k_tile * 32 + tl.arange(0, 32)
-            strip = group * (N // 32) + in_row // 32
-            base = tl.load(strip_bases + strip, mask=in_row < N, other=0)
-            source = base[:, None] + (in_row % 32)[:, None] * (K // 2) + in_column[None, :]
+            tile_strip = tile_group * (N // 32) + in_row // 32
+            tile_base = tl.load(strip_bases + tile_strip, mask=in_row < N, other=0)
+            tile_source = tile_base[:, None] + (in_row % 32)[:, None] * (K // 2) + in_column[None, :]
             packed_rows = tl.load(
-                wire + source, mask=(in_row[:, None] < N) & (in_column[None, :] < K // 2), other=0
+                wire + tile_source, mask=(in_row[:, None] < N) & (in_column[None, :] < K // 2), other=0
             )
             values = tl.reshape(tl.join(packed_rows & 15, packed_rows >> 4), (64, 64))
             even, odd = tl.split(tl.reshape(tl.trans(values), (64, 32, 2)))
             packed_columns = even | (odd << 4)
         else:
-            strip = group * (N // 32) + out_column // 16
-            base = tl.load(strip_bases + 2 * strips + strip, mask=out_column < N // 2, other=0)
-            source = base[None, :] + out_row[:, None] * 16 + (out_column % 16)[None, :]
+            tile_strip = tile_group * (N // 32) + out_column // 16
+            tile_base = tl.load(strip_bases + 2 * strips + tile_strip, mask=out_column < N // 2, other=0)
+            tile_source = tile_base[None, :] + out_row[:, None] * 16 + (out_column % 16)[None, :]
             packed_columns = tl.load(
-                wire + source, mask=(out_row[:, None] < K) & (out_column[None, :] < N // 2), other=0
+                wire + tile_source, mask=(out_row[:, None] < K) & (out_column[None, :] < N // 2), other=0
             )
-        destination = group * K * nr + out_row[:, None] * nr + out_column[None, :]
+        destination = tile_group * K * nr + out_row[:, None] * nr + out_column[None, :]
         tl.store(output + RD + RS + destination, packed_columns, mask=out_row[:, None] < K)
     else:
         index = (pid - rb - sb - cb) * BLOCK + lane

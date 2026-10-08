@@ -6,6 +6,7 @@
 
 """CPU address tests: TRITON_INTERPRET=1 python test_mxfp4_comm_kernels.py.
 
+Without TRITON_INTERPRET, compile gfx950 code on CPU without launching it.
 The GPU training preflight separately checks this kernel on real gathered data.
 """
 
@@ -112,6 +113,41 @@ class TestMXFP4GatherKernel(unittest.TestCase):
                     self.assertEqual(actual[..., reference.shape[-1] :].count_nonzero().item(), 0)
                     self.assertTrue(actual.is_contiguous())
                 torch.testing.assert_close(storage, original, rtol=0, atol=0)
+
+
+@unittest.skipIf(os.getenv("TRITON_INTERPRET") == "1", "Compilation needs the JIT rather than interpreter")
+class TestMXFP4GatherCompilation(unittest.TestCase):
+    def test_gfx950_compiles_both_wire_formats(self):
+        import triton
+        from triton.backends.compiler import GPUTarget
+        from triton.compiler import ASTSource
+
+        module = load("mxfp4_compile_test", "primus_turbo/pytorch/kernels/quantization/mxfp4_comm.py")
+        for shape in ((32, 5760, 2880), (32, 2880, 2880), (3, 96, 160)):
+            for shared in (False, True):
+                with self.subTest(shape=shape, shared_2d=shared):
+                    g, n, k = shape
+                    source = ASTSource(
+                        module.assemble_mxfp4_strips_kernel,
+                        signature={"wire": "*u8", "strip_bases": "*i64", "output": "*u8"},
+                        constexprs=dict(
+                            G=g,
+                            N=n,
+                            K=k,
+                            RD=g * n * ((k + 127) // 128 * 64),
+                            RS=g * n * ((k + 127) // 128 * 4),
+                            CD=g * k * ((n + 127) // 128 * 64),
+                            CS=g * k * ((n + 127) // 128 * 4),
+                            BLOCK=1024,
+                            SHARED_2D=shared,
+                        ),
+                    )
+                    # Explicit target avoids GPU discovery; compile does not
+                    # initialize a runtime or execute the generated kernel.
+                    kernel = triton.compile(
+                        source, target=GPUTarget("hip", "gfx950", 64), options={"num_warps": 4}
+                    )
+                    self.assertIn("amdgcn", kernel.asm)
 
 
 if __name__ == "__main__":
