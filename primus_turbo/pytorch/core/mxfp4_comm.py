@@ -120,6 +120,46 @@ class MXFP4WireLayout:
         Cache lifetime and invalidation after optimizer updates belong to the
         caller. Autograd/main_grad bridging also belongs to the training layer.
         """
+        g, n, k = self.shape
+        return self.wrap_components(self.assemble(gathered), (g, n * gathered.shape[0], k))
+
+    def assemble_strip_shards(self, shards):
+        """Assemble (first_strip, count, wire) pieces into this full weight.
+
+        A strip is 32 complete rows. Ownership may vary by rank and cross expert
+        boundaries. Scales and both orientations are copied without quantizing.
+        """
+        g, n, k = self.shape
+        count = g * n // 32
+        pieces = sorted(shards, key=lambda shard: shard[0])
+        cursor = 0
+        for first, length, _ in pieces:
+            if first != cursor or length <= 0:
+                raise ValueError("strip shards must cover the weight exactly once")
+            cursor += length
+        if cursor != count:
+            raise ValueError("strip shards do not cover the weight")
+        components = [[], [], [], []]
+        for _first, length, payload in pieces:
+            layout = MXFP4WireLayout((length, 32, k), self.scale_rounding_mode)
+            for index, part in enumerate(layout.views(payload)):
+                components[index].append(part)
+        merged = []
+        for index, parts in enumerate(components):
+            strips = torch.cat(parts, dim=0)
+            if index < 2:
+                logical = strips.reshape(g, n, -1)
+            else:
+                logical = strips.reshape(g, n // 32, k, -1).permute(0, 2, 1, 3).reshape(g, k, -1)
+            alignment = 64 if index % 2 == 0 else 4
+            padded_size = (logical.shape[-1] + alignment - 1) // alignment * alignment
+            padded = logical.new_zeros((*logical.shape[:-1], padded_size))
+            padded[..., : logical.shape[-1]].copy_(logical)
+            merged.append(padded)
+        return tuple(merged)
+
+    def wrap_components(self, components, shape=None):
+        """Wrap already assembled kernel-layout buffers as compute operands."""
         from primus_turbo.pytorch.core.low_precision import (
             ScalingGranularity,
             ScalingRecipe,
@@ -127,10 +167,9 @@ class MXFP4WireLayout:
         )
         from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor, QuantizedTensorPair
 
-        rd, rs, cd, cs = self.assemble(gathered)
-        g, n, k = self.shape
+        rd, rs, cd, cs = components
         common = dict(
-            shape=torch.Size((g, n * gathered.shape[0], k)),
+            shape=torch.Size(self.shape if shape is None else shape),
             orig_dtype=torch.bfloat16,
             dest_dtype=float4_e2m1fn_x2,
             granularity=ScalingGranularity.MX_BLOCKWISE,

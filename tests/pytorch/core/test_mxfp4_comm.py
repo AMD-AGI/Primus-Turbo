@@ -55,6 +55,31 @@ class TestMXFP4WireLayout(unittest.TestCase):
         components[3] = components[3].view(torch.float8_e8m0fnu)
         torch.testing.assert_close(layout.pack(components), expected, rtol=0, atol=0)
 
+    def test_uneven_strip_ownership_crosses_experts(self):
+        layout = MXFP4WireLayout((3, 96, 160), 2)
+        full = [
+            torch.arange(torch.tensor(s).prod().item()).to(torch.uint8).reshape(s)
+            for s in layout.component_shapes
+        ]
+        strips = [
+            full[0].reshape(9, 32, 80),
+            full[1].reshape(9, 32, 5),
+            full[2].reshape(3, 160, 3, 16).permute(0, 2, 1, 3).reshape(9, 160, 16),
+            full[3].reshape(3, 160, 3, 1).permute(0, 2, 1, 3).reshape(9, 160, 1),
+        ]
+        pieces = []
+        for first, count in ((0, 2), (2, 5), (7, 2)):
+            part_layout = MXFP4WireLayout((count, 32, 160), 2)
+            pieces.append((first, count, part_layout.pack([s[first : first + count] for s in strips])))
+        result = layout.assemble_strip_shards(list(reversed(pieces)))
+        for actual, expected in zip(result, full):
+            torch.testing.assert_close(actual[..., : expected.shape[-1]], expected, rtol=0, atol=0)
+            self.assertEqual(actual[..., expected.shape[-1] :].count_nonzero().item(), 0)
+        with self.assertRaises(ValueError):
+            layout.assemble_strip_shards(pieces[:-1])
+        with self.assertRaises(ValueError):
+            layout.assemble_strip_shards(pieces + [pieces[-1]])
+
     def test_invalid_inputs_fail_before_transport(self):
         for shape in ((1, 31, 32), (1, 32, 33), (0, 32, 32), (32, 32)):
             with self.assertRaises(ValueError):
