@@ -421,6 +421,60 @@ def _attention_aiter_forward_impl_fake(
 
 
 @_torch_custom_op_wrapper(
+    "primus_turbo::attention_aiter_qnorm_forward_impl", mutates_args=("q_n", "q_rstd"), device_types="cuda"
+)
+def attention_aiter_qnorm_forward_impl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+    wq_a: torch.Tensor,
+    tab_a: torch.Tensor,
+    wq_b: torch.Tensor,
+    tab_b: torch.Tensor,
+    ntile_a: int,
+    eps: float,
+    q_n: torch.Tensor,
+    q_rstd: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """aiter's dense forward (non-causal, no dropout) on the *raw* q, with q's RMSNorm and interleaved RoPE applied
+    as it is loaded: writes the normalized q into ``q_n`` and its fp32 rstd into ``q_rstd`` (for the backwards) and
+    returns ``(out, softmax_lse, rng_state)`` as ``attention_aiter_forward_impl`` does for sbhd storage.
+
+    Two norm / RoPE parameter sets: the first ``ntile_a`` 256-row Q tiles (along S) use ``wq_a`` / ``tab_a``, the
+    rest ``wq_b`` / ``tab_b`` -- a joint block's two streams; a single stream passes the same set twice. ``tab_*``
+    is ``[rows, D]`` = ``cat(cos[:, 0::2], sin[:, 0::2])`` of that stream's interleaved RoPE tables (row s * B + b)."""
+    import aiter
+
+    out, lse = aiter.fmha_v3_fwd_qnorm_rope(
+        q, k, v, softmax_scale, wq_a, tab_a, wq_b, tab_b, ntile_a, eps, q_n, q_rstd
+    )
+    return out, lse, torch.zeros((2,), dtype=torch.int64, device=q.device)
+
+
+@attention_aiter_qnorm_forward_impl.register_fake
+def _attention_aiter_qnorm_forward_impl_fake(
+    q, k, v, softmax_scale, wq_a, tab_a, wq_b, tab_b, ntile_a, eps, q_n, q_rstd
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size, seq_len_q, num_heads_q, _ = q.shape
+    out = torch.empty(
+        (seq_len_q, batch_size, num_heads_q, v.shape[-1]), dtype=q.dtype, device=q.device
+    ).permute(1, 0, 2, 3)
+    softmax_lse = torch.empty((batch_size, num_heads_q, seq_len_q), dtype=torch.float32, device=q.device)
+    return out, softmax_lse, torch.empty((2,), dtype=torch.int64, device=q.device)
+
+
+def attention_aiter_qnorm_ok(b: int, s: int, h: int, d: int, ntile_a: int) -> bool:
+    """Whether aiter has the q-norm forward for this shape (plain arithmetic, safe to trace)."""
+    try:
+        import aiter
+
+        return bool(aiter.fmha_v3_fwd_qnorm_rope_ok(b, s, h, d, ntile_a))
+    except (ImportError, AttributeError):
+        return False
+
+
+@_torch_custom_op_wrapper(
     "primus_turbo::attention_aiter_backward_impl",
     mutates_args=("dq", "dk", "dv"),
     device_types="cuda",

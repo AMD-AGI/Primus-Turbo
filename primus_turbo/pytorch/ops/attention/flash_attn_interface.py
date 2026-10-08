@@ -21,6 +21,7 @@ from primus_turbo.pytorch.core.utils import get_device_compute_capability
 from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
     attention_aiter_backward_impl,
     attention_aiter_forward_impl,
+    attention_aiter_qnorm_forward_impl,
     attention_aiter_varlen_backward_impl,
     attention_aiter_varlen_forward_impl,
 )
@@ -107,11 +108,21 @@ class FlashAttnFunc(torch.autograd.Function):
         qkv_format: Optional[str] = "bshd",
         backend: BackendType = BackendType.AITER,
         softmax_d_slot: bool = False,
+        q_norm_w_a: Optional[torch.Tensor] = None,
+        q_norm_tab_a: Optional[torch.Tensor] = None,
+        q_norm_w_b: Optional[torch.Tensor] = None,
+        q_norm_tab_b: Optional[torch.Tensor] = None,
+        q_norm_ntile_a: int = 0,
+        q_norm_eps: float = 0.0,
+        q_rstd_slot: Optional[torch.Tensor] = None,
     ):
         ctx.backend = backend
         ctx.softmax_d_slot = softmax_d_slot
+        ctx.q_norm = q_norm_w_a is not None
         if softmax_d_slot and backend != BackendType.AITER:
             raise ValueError("softmax_d_slot is implemented for the aiter backend only")
+        if ctx.q_norm and (backend != BackendType.AITER or q_rstd_slot is None):
+            raise ValueError("q_norm needs the aiter backend and a q_rstd_slot")
         if backend == BackendType.TRITON:
             # The dispatcher only picks this backend when DenseAttnFwdTritonBackend.can_handle
             # said yes, but FlashAttnFunc.apply is reachable directly, and these arguments have
@@ -223,27 +234,44 @@ class FlashAttnFunc(torch.autograd.Function):
         if head_size_v_og % 8 != 0:
             v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
 
-        out_padded, softmax_lse, S_dmask, rng_state = attention_aiter_forward_impl(
-            q=q,
-            k=k,
-            v=v,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size_left=int(window_size[0]),
-            window_size_right=int(window_size[1]),
-            bias=bias,
-            alibi_slopes=alibi_slopes,
-            return_lse=True,
-            return_softmax=return_softmax and dropout_p > 0,
-            max_seqlen_q=q.size(1),
-            max_seqlen_k=k.size(1),
-            sink=sink,
-            qkv_format=qkv_format,
-        )
+        if ctx.q_norm:
+            # q is the raw projection: the forward normalizes and rotates it as it loads it and writes the result
+            # (q_n, sbhd storage like the q it replaces) and its rstd for the backwards. The backward runs on q_n,
+            # so dq is d(normalized q) -- what the producer's backward expects -- and q_rstd_slot's gradient is
+            # the rstd.
+            if dropout_p != 0.0 or causal or bias is not None or alibi_slopes is not None or sink is not None:
+                raise ValueError("q_norm supports the plain non-causal forward only")
+            B, S, H, D = q.shape
+            q_n = torch.empty((S, B, H, D), dtype=q.dtype, device=q.device).permute(1, 0, 2, 3)
+            q_rstd = torch.empty((S * B * H,), dtype=torch.float32, device=q.device)
+            out_padded, softmax_lse, rng_state = attention_aiter_qnorm_forward_impl(
+                q, k, v, softmax_scale, q_norm_w_a, q_norm_tab_a, q_norm_w_b, q_norm_tab_b, q_norm_ntile_a,
+                q_norm_eps, q_n, q_rstd,
+            )
+            S_dmask = None
+            q = q_n
+        else:
+            out_padded, softmax_lse, S_dmask, rng_state = attention_aiter_forward_impl(
+                q=q,
+                k=k,
+                v=v,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size_left=int(window_size[0]),
+                window_size_right=int(window_size[1]),
+                bias=bias,
+                alibi_slopes=alibi_slopes,
+                return_lse=True,
+                return_softmax=return_softmax and dropout_p > 0,
+                max_seqlen_q=q.size(1),
+                max_seqlen_k=k.size(1),
+                sink=sink,
+                qkv_format=qkv_format,
+            )
 
         if is_grad:
-            ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
+            ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state, *((q_rstd,) if ctx.q_norm else ()))
             ctx.dropout_p = dropout_p
             ctx.softmax_scale = softmax_scale
             ctx.causal = causal
@@ -339,7 +367,7 @@ class FlashAttnFunc(torch.autograd.Function):
         head_size_q_og = ctx.head_size_q_og
         head_size_v_og = ctx.head_size_v_og
 
-        q, k, v, out_padded, softmax_lse, rng_state = ctx.saved_tensors
+        q, k, v, out_padded, softmax_lse, rng_state, *q_rstd = ctx.saved_tensors
         qkv_format = ctx.qkv_format
         softmax_d = args[-1] if ctx.softmax_d_slot else None
         if dout is None:  # softmax_d_slot turns off grad materialisation
@@ -421,7 +449,10 @@ class FlashAttnFunc(torch.autograd.Function):
         dk = dk[..., :head_size_q_og]
         dv = dv_padded[..., :head_size_v_og]
 
-        return _flash_attn_grads(dq, dk, dv, dbias, dsink)
+        grads = _flash_attn_grads(dq, dk, dv, dbias, dsink)
+        if ctx.q_norm:  # nothing for the norm weights / tables; q_rstd_slot's gradient is the rstd
+            grads = grads + (None,) * 6 + (q_rstd[0],)
+        return grads
 
 
 class TritonFlashAttnFunc(torch.autograd.Function):
@@ -542,6 +573,7 @@ def flash_attn_func(
     return_attn_probs=False,
     sink: Optional[torch.Tensor] = None,
     return_softmax_d_slot: bool = False,
+    q_norm: Optional[tuple] = None,
 ):
     """q/k/v are ``[b, s, h, d]``-shaped; an sbhd caller passes a permuted view and permutes
     the result back. aiter reads the memory layout to allocate outputs and grads matching it;
@@ -550,12 +582,19 @@ def flash_attn_func(
     ``return_softmax_d_slot`` (aiter backend): also return a [b, h, s] fp32 placeholder, last. A consumer of the
     output that computes softmax_d = rowsum(dO * O) while producing dO (e.g. in its dgrad GEMM) returns it as this
     placeholder's gradient, and the attention backward skips computing it; with no gradient it computes it as usual.
+
+    ``q_norm`` (aiter backend, plain non-causal attention): ``(w_a, tab_a, w_b, tab_b, ntile_a, eps, q_rstd_slot)``.
+    ``q`` is then the raw projection, and the forward applies its RMSNorm (weight ``w``, ``eps``) and interleaved RoPE
+    (``tab`` = ``cat(cos[:, 0::2], sin[:, 0::2])``, row s * B + b) as it loads it -- the first ``ntile_a`` 256-row Q
+    tiles with the ``a`` set, the rest with ``b``. The backward returns d(normalized q) as q's gradient and q's fp32
+    rstd ``[s * b * h]`` as the gradient of ``q_rstd_slot`` (an input of that shape from q's producer), whose
+    backward applies the norm and RoPE chain rule. See ``attention_aiter_qnorm_ok``.
     """
     qkv_format = _infer_qkv_format(q, k, v)
     is_grad_enabled = torch.is_grad_enabled()
     needs_backward = is_grad_enabled and _any_requires_grad(q, k, v)
 
-    backend = resolve_flash_attn_backend(
+    backend = BackendType.AITER if q_norm is not None else resolve_flash_attn_backend(
         varlen=False,
         user_backend=GlobalBackendManager.get_attn_backend(_ATTN_PRECISION),
         q=q,
@@ -592,6 +631,7 @@ def flash_attn_func(
         qkv_format,
         backend,
         return_softmax_d_slot,
+        *(() if q_norm is None else q_norm),
     )
 
 
