@@ -465,19 +465,23 @@ def _write_ninja_file(
     compile_rule.append("  deps = gcc")
 
     if with_cuda:
-        nvcc_gendeps = ""
+        # Header dependencies for the kernel sources too (as the C++ rule above): without them an edit to a header
+        # (e.g. a kernel implementation shared by several translation units) leaves their objects stale -- the
+        # rebuilt library silently runs the old code.
+        nvcc_gendeps = "-MMD -MF $out.d"
+        deps = ["  depfile = $out.d", "  deps = gcc"]
         cuda_compile_rule = [
             "rule cuda_compile",
             f"  command = $nvcc {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags",
-        ]
+        ] + deps
         cuda_compile_rule_gfx942 = [
             "rule cuda_compile_gfx942",
             f"  command = $nvcc {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags_gfx942",
-        ]
+        ] + deps
         cuda_compile_rule_gfx950 = [
             "rule cuda_compile_gfx950",
             f"  command = $nvcc {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags_gfx950",
-        ]
+        ] + deps
 
     # Emit one build rule per source to enable incremental build.
     build = []
