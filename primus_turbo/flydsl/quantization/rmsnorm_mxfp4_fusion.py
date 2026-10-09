@@ -40,7 +40,7 @@ from typing import Tuple
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import arith, buffer_ops, range_constexpr, rocdl
+from flydsl.expr import arith, range_constexpr, rocdl
 from flydsl.expr import math as fm
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -54,6 +54,7 @@ from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import (
     _mxfp4_scale_rounding_bias,
     _store_words_vec4,
 )
+from primus_turbo.flydsl.utils import buffer_ops
 from primus_turbo.flydsl.utils.gemm_helper import xcd_remap_pid
 from primus_turbo.pytorch.core.low_precision import (
     MXFP4_BLOCK_SIZE,

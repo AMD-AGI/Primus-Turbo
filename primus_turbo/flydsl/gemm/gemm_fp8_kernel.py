@@ -57,12 +57,12 @@ from primus_turbo.flydsl.utils.prims import (
     _lds_barrier,
     _readfirstlane_i32,
 )
+from primus_turbo.flydsl.utils import buffer_ops as _buffer_ops
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import arith
-from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -1284,8 +1284,8 @@ def _dense_tn_reduce_rows(
     back into C. A lane takes a _TN4_RED_VEC-wide run so a row is full-width requests, and the
     bands keep C's row pitch so band j only moves the SRD base."""
     ir_ty = out_ty.ir_type
-    f32v = fx.T.VectorType.get([_TN4_RED_VEC], fx.T.f32())
-    outv = fx.T.VectorType.get([_TN4_RED_VEC], ir_ty)
+    f32v = fx.T.vec(_TN4_RED_VEC, fx.T.f32)
+    outv = fx.T.vec(_TN4_RED_VEC, ir_ty)
     lanes_per_row = bn // _TN4_RED_VEC
     rows_per_pass = nthr // lanes_per_row
     row = tid // fx.Int32(lanes_per_row)

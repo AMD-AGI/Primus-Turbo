@@ -46,14 +46,7 @@ import torch
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects import vector as _vector
 from flydsl.compiler.ast_rewriter import ASTRewriter
-from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr import const_expr, range_constexpr, rocdl
-from flydsl.expr.buffer_ops import (
-    buffer_load,
-    buffer_store,
-    create_buffer_resource,
-    create_buffer_resource_from_addr,
-)
 from flydsl.expr.rocdl import cvt_pk_f32_fp8
 from flydsl.expr.typing import Vector as Vec
 
@@ -85,6 +78,13 @@ from primus_turbo.flydsl.mega.fp8.prims import (
     st,
 )
 from primus_turbo.flydsl.mega.fp8.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
+from primus_turbo.flydsl.utils import buffer_ops as _buffer_ops
+from primus_turbo.flydsl.utils.buffer_ops import (
+    buffer_load,
+    buffer_store,
+    create_buffer_resource,
+    create_buffer_resource_from_addr,
+)
 from primus_turbo.flydsl.utils.prims import cast, read_clock, spin_timed_out
 
 # s_waitcnt vmcnt bound for the GEMM main loop; changes the emitted kernel, so it is in the flyc
@@ -171,19 +171,17 @@ class StoreCQuantMxfp8CShuffle:
             f = [fx.arith.ArithValue(vec[j].to(fx.Float32)) for j in range_constexpr(self.EPL)]
             # within-lane |max| over the 8 owned values
             av = fx.arith.ArithValue(
-                (fx.arith.ArithValue(f[0]).bitcast(fx.T.i32()) & fx.Int32(0x7FFFFFFF)).bitcast(fx.T.f32())
+                (fx.arith.ArithValue(f[0]).bitcast(fx.T.i32) & fx.Int32(0x7FFFFFFF)).bitcast(fx.T.f32)
             )
             for j in range_constexpr(1, self.EPL):
-                aj = fx.arith.ArithValue(
-                    (f[j].bitcast(fx.T.i32()) & fx.Int32(0x7FFFFFFF)).bitcast(fx.T.f32())
-                )
+                aj = fx.arith.ArithValue((f[j].bitcast(fx.T.i32) & fx.Int32(0x7FFFFFFF)).bitcast(fx.T.f32))
                 av = fx.arith.ArithValue(fx.arith.maximumf(av, aj))
             # 4-lane amax (the 4 consecutive lanes owning this row's 32-col block)
             for sh in (1, 2):
                 peer = fx.arith.ArithValue(av.shuffle_xor(sh, 64))
                 av = fx.arith.ArithValue(fx.arith.maximumf(av, peer))
             # E8M0 scale (mirror StoreCQuantFp8), target 2^8
-            amax_bits = av.bitcast(fx.T.i32())
+            amax_bits = av.bitcast(fx.T.i32)
             t = amax_bits + fx.Int32(1 << 19)
             exp = ((t >> fx.Int32(23)) & fx.Int32(0x1FF)) - fx.Int32(127 + 8)
             exp = fx.arith.select(exp < fx.Int32(-127), fx.Int32(-127), exp)
@@ -192,7 +190,7 @@ class StoreCQuantMxfp8CShuffle:
             # 1/scale from the exponent bits, not 1.0/bits(biased << 23) -- see the same reciprocal
             # in quant.py. An all-zero 32-column block gives biased 0, where the float form divides
             # by zero and quantizes every element to 0*inf = NaN.
-            inv = fx.arith.ArithValue((fx.Int32(254) - biased) << fx.Int32(23)).bitcast(fx.T.f32())
+            inv = fx.arith.ArithValue((fx.Int32(254) - biased) << fx.Int32(23)).bitcast(fx.T.f32)
             neglim = fx.arith.ArithValue(fx.arith._to_raw(fx.Float32(-448.0)))
             poslim = fx.arith.ArithValue(fx.arith._to_raw(fx.Float32(448.0)))
             # cvt 8 vals -> 2 packed i32 (4 fp8/word), coalesced 64b store
@@ -204,8 +202,8 @@ class StoreCQuantMxfp8CShuffle:
                     )
                     for k in range_constexpr(4)
                 ]
-                w = rocdl.cvt_pk_fp8_f32(fx.T.i32(), q[0], q[1], fx.Int32(0), False)
-                w = rocdl.cvt_pk_fp8_f32(fx.T.i32(), q[2], q[3], w, True)
+                w = rocdl.cvt_pk_fp8_f32(fx.T.i32, q[0], q[1], fx.Int32(0), False)
+                w = rocdl.cvt_pk_fp8_f32(fx.T.i32, q[2], q[3], w, True)
                 words.append(w)
             base_row_i = base_row + ti * 16 + row_in
             gcol = base_col + col0
@@ -220,7 +218,7 @@ class StoreCQuantMxfp8CShuffle:
             # result_names in as `biased`. Late binding is harmless here anyway -- emit_if_then
             # runs the body before the ti loop advances.
             def _emit_scale():
-                sb = fx.arith.ArithValue(biased).trunci(fx.T.i8())  # noqa: B023
+                sb = fx.arith.ArithValue(biased).trunci(fx.T.i8)  # noqa: B023
                 idx = base_row_i * fx.Int32(self.c_cols // 32) + gcol // fx.Int32(32)  # noqa: B023
                 _buffer_ops.buffer_store(sb, self.scale, idx, cache_modifier=16)
 
@@ -242,12 +240,12 @@ def _make_epoch_bump(add_combine, add_reduce):
             parity_res = create_buffer_resource(PARITY, max_size=True)
             combine_res = create_buffer_resource(COMBINE_EXP, max_size=True)
             reduce_res = create_buffer_resource(REDUCE_EXP, max_size=True)
-            new_parity = buffer_load(parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64()) ^ fx.Int64(1)
+            new_parity = buffer_load(parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64) ^ fx.Int64(1)
             buffer_store(new_parity, parity_res, fx.Int32(0))
-            idx = cast(new_parity, fx.T.i32())
-            new_combine = buffer_load(combine_res, idx, vec_width=1, dtype=fx.T.i64()) + fx.Int64(add_combine)
+            idx = cast(new_parity, fx.T.i32)
+            new_combine = buffer_load(combine_res, idx, vec_width=1, dtype=fx.T.i64) + fx.Int64(add_combine)
             buffer_store(new_combine, combine_res, idx)
-            new_reduce = buffer_load(reduce_res, idx, vec_width=1, dtype=fx.T.i64()) + fx.Int64(add_reduce)
+            new_reduce = buffer_load(reduce_res, idx, vec_width=1, dtype=fx.T.i64) + fx.Int64(add_reduce)
             buffer_store(new_reduce, reduce_res, idx)
 
     return epoch_bump_kernel
@@ -294,15 +292,15 @@ def combine_copy_fp8_tile(
         # factory, not a closure over the loop var: `emit_if_then` branch fns MUST take 0 args
         # (ReplaceIfWithDispatch injects result_names into any arg-accepting branch fn).
         def _emit_row():
-            slot = buffer_load(origin_slot_res, row, vec_width=1, dtype=fx.T.i32())
-            delta = buffer_load(signal_delta_res, origin, vec_width=1, dtype=fx.T.i64())
+            slot = buffer_load(origin_slot_res, row, vec_width=1, dtype=fx.T.i32)
+            delta = buffer_load(signal_delta_res, origin, vec_width=1, dtype=fx.T.i64)
             peer = create_buffer_resource_from_addr(comb_base + delta, num_records_bytes=comb_records)
             slot_base = slot * fx.Int32(H4)
             row_base = row * fx.Int32(H4)
             vals = []
             for c in range(num_full):
                 col = fx.Int32(c * cols_per_step) + lane * fx.Int32(4)
-                vals.append(buffer_load(l2y_fp8_res, row_base + col, vec_width=4, dtype=fx.T.i32()))
+                vals.append(buffer_load(l2y_fp8_res, row_base + col, vec_width=4, dtype=fx.T.i32))
             for c in range(num_full):
                 col = fx.Int32(c * cols_per_step) + lane * fx.Int32(4)
                 # sc0|sc1|nt: publish to a REMOTE agent, paired with the system-scope read in
@@ -313,7 +311,7 @@ def combine_copy_fp8_tile(
                 buffer_store(vals[c], peer, slot_base + col, cache_modifier=19)
 
             def _emit_scale():
-                sv = buffer_load(l2y_scale_res, row * fx.Int32(SC) + lane, vec_width=1, dtype=fx.T.i32())
+                sv = buffer_load(l2y_scale_res, row * fx.Int32(SC) + lane, vec_width=1, dtype=fx.T.i32)
                 buffer_store(
                     sv,
                     peer,
@@ -325,8 +323,8 @@ def combine_copy_fp8_tile(
             if with_gate:
                 # scatter the per-row gate gradient (d_topk_w) to origin[slot] in the MAIN-heap
                 # combine_gate; same value/slot across lanes (idempotent, like the flag store).
-                gate_value = buffer_load(grad_gate_res, row, vec_width=1, dtype=fx.T.f32())
-                gate_addr = gate_base + buffer_load(main_delta_res, origin, vec_width=1, dtype=fx.T.i64())
+                gate_value = buffer_load(grad_gate_res, row, vec_width=1, dtype=fx.T.f32)
+                gate_addr = gate_base + buffer_load(main_delta_res, origin, vec_width=1, dtype=fx.T.i64)
                 gate_peer = create_buffer_resource_from_addr(gate_addr, num_records_bytes=gate_records)
                 # sc0|sc1|nt: combine_gate is the one cross-rank payload still on the CACHED main
                 # heap (the fp8 comb payload sits in the uncached signal pad), so this store has to
@@ -345,7 +343,7 @@ def combine_copy_fp8_tile(
         base_row = block_m * fx.Int32(block_m_size) + chunk_base
         for j in range(rows_per_warp):
             row = base_row + fx.Int32(j)
-            origin = buffer_load(origin_rank_res, row, vec_width=1, dtype=fx.T.i32())
+            origin = buffer_load(origin_rank_res, row, vec_width=1, dtype=fx.T.i32)
             emit_if_then(origin >= fx.Int32(0), _make_row_emitter(row, origin))
 
     return push_block
@@ -387,13 +385,13 @@ def _make_topk_reduce_fp8(hidden, topk, combine_slots, apply_weights, with_gate)
         gate_local_res,
         d_topk_w_res,
     ):
-        _v2 = fx.T.VectorType.get([2], fx.T.f32())
-        f32_v4 = fx.T.VectorType.get([4], fx.T.f32())
-        bf16_v4 = fx.T.VectorType.get([4], fx.T.bf16())
+        _v2 = fx.T.vec(2, fx.T.f32)
+        f32_v4 = fx.T.vec(4, fx.T.f32)
+        bf16_v4 = fx.T.vec(4, fx.T.bf16)
         lane = thread_index % fx.Int32(_WARP)
         warp_id = thread_index // fx.Int32(_WARP)
         global_warp_id = base_pid * fx.Int32(_NUM_WARPS) + warp_id
-        num_tokens = buffer_load(num_tokens_res, fx.Int32(rank), vec_width=1, dtype=fx.T.i32())
+        num_tokens = buffer_load(num_tokens_res, fx.Int32(rank), vec_width=1, dtype=fx.T.i32)
         comb_res = create_buffer_resource_from_addr(comb_base, num_records_bytes=comb_records)
 
         token = global_warp_id
@@ -401,16 +399,16 @@ def _make_topk_reduce_fp8(hidden, topk, combine_slots, apply_weights, with_gate)
             valid = []
             for jj in fx.range_constexpr(topk):
                 slot = token * fx.Int32(topk) + fx.Int32(jj)
-                topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i64())
+                topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i64)
                 valid.append((topk_index >= fx.Int64(0)) & (topk_index < fx.Int64(num_experts)))
             for jj in fx.range_constexpr(topk):
                 slot = token * fx.Int32(topk) + fx.Int32(jj)
-                topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i64())
+                topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i64)
                 if topk_index >= fx.Int64(0):
                     if topk_index < fx.Int64(num_experts):
                         if lane == fx.Int32(0):
                             spin_start = read_clock()
-                            flag = ld(barrier_base, reduce_bank + slot, scope="agent", dtype=fx.T.i64())
+                            flag = ld(barrier_base, reduce_bank + slot, scope="agent", dtype=fx.T.i64)
                             while flag != expected_reduce:
                                 fx.rocdl.s_sleep(fx.Int32(1))
                                 if spin_timed_out(spin_start):
@@ -421,7 +419,7 @@ def _make_topk_reduce_fp8(hidden, topk, combine_slots, apply_weights, with_gate)
                                         slot,
                                     )
                                     spin_start = read_clock()
-                                flag = ld(barrier_base, reduce_bank + slot, scope="agent", dtype=fx.T.i64())
+                                flag = ld(barrier_base, reduce_bank + slot, scope="agent", dtype=fx.T.i64)
             _wait_mem()
 
             zero_vec = fx.arith.constant_vector(0.0, f32_v4)
@@ -437,7 +435,7 @@ def _make_topk_reduce_fp8(hidden, topk, combine_slots, apply_weights, with_gate)
                         comb_res,
                         slot * fx.Int32(H4) + w,
                         vec_width=VW,
-                        dtype=fx.T.i32(),
+                        dtype=fx.T.i32,
                         cache_modifier=19,
                     )
                     words = [Vec(pv)[v].ir_value() for v in range_constexpr(VW)] if VW > 1 else [pv]
@@ -445,14 +443,14 @@ def _make_topk_reduce_fp8(hidden, topk, combine_slots, apply_weights, with_gate)
                         comb_res,
                         fx.Int32(payload_i32_total) + slot * fx.Int32(SC) + sword_idx,
                         vec_width=1,
-                        dtype=fx.T.i32(),
+                        dtype=fx.T.i32,
                         cache_modifier=19,  # sc0|sc1|nt, as above
                     )
                     e8 = (fx.arith.ArithValue(sw) >> shift) & fx.Int32(0xFF)
-                    sf = (fx.arith.ArithValue(e8) << fx.Int32(23)).bitcast(fx.T.f32())
+                    sf = (fx.arith.ArithValue(e8) << fx.Int32(23)).bitcast(fx.T.f32)
                     coef = fx.arith.ArithValue(sf)  # UNWEIGHTED (bwd): coef = scale
                     if const_expr(apply_weights):  # WEIGHTED (fwd L2): coef = scale * topk_weight
-                        wj = buffer_load(topk_weights_res, slot, vec_width=1, dtype=fx.T.f32())
+                        wj = buffer_load(topk_weights_res, slot, vec_width=1, dtype=fx.T.f32)
                         coef = fx.arith.ArithValue(sf) * fx.arith.ArithValue(wj)
                     coef_v = _vector.broadcast(f32_v4, fx.arith._to_raw(coef))
                     for v in range_constexpr(VW):
@@ -474,7 +472,7 @@ def _make_topk_reduce_fp8(hidden, topk, combine_slots, apply_weights, with_gate)
                 # d_topk_w[slot] = combine_gate[slot] for valid routes else 0 (backward gate grad).
                 for jj in fx.range_constexpr(topk):
                     slot = token * fx.Int32(topk) + fx.Int32(jj)
-                    topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i64())
+                    topk_index = buffer_load(topk_indices_res, slot, vec_width=1, dtype=fx.T.i64)
                     if lane == fx.Int32(0):
                         # sc0|sc1|nt: system-visible non-temporal read. Written by a PEER into
                         # this rank's CACHED combine_gate, and the reduce's flag spin is only
@@ -482,7 +480,7 @@ def _make_topk_reduce_fp8(hidden, topk, combine_slots, apply_weights, with_gate)
                         # PREVIOUS combine's gate -- the earlier layers of a multi-layer backward
                         # then read the later layers' gate gradient. Mirrors the bf16 reduce.
                         gate_v = buffer_load(
-                            gate_local_res, slot, vec_width=1, dtype=fx.T.f32(), cache_modifier=19
+                            gate_local_res, slot, vec_width=1, dtype=fx.T.f32, cache_modifier=19
                         )
                         zero_f = fx.Float32(0.0)
                         v1 = fx.arith.select(topk_index < fx.Int64(num_experts), gate_v, zero_f)
@@ -630,12 +628,12 @@ def _compile(
         combine_parity_res = create_buffer_resource(COMBINE_PARITY, max_size=True)
         combine_expected_res = create_buffer_resource(COMBINE_EXPECTED, max_size=True)
         reduce_expected_res = create_buffer_resource(REDUCE_EXPECTED, max_size=True)
-        parity = cast(buffer_load(combine_parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64()), fx.T.i32())
+        parity = cast(buffer_load(combine_parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64), fx.T.i32)
         combine_bank = parity * fx.Int32(worst_case_tiles * n_blocks)
         n_blocks_i32 = fx.Int32(n_blocks)
         reduce_bank = parity * fx.Int32(combine_slots)
-        expected_combine = buffer_load(combine_expected_res, parity, vec_width=1, dtype=fx.T.i64())
-        expected_reduce = buffer_load(reduce_expected_res, parity, vec_width=1, dtype=fx.T.i64())
+        expected_combine = buffer_load(combine_expected_res, parity, vec_width=1, dtype=fx.T.i64)
+        expected_reduce = buffer_load(reduce_expected_res, parity, vec_width=1, dtype=fx.T.i64)
         l2y_fp8_res = create_buffer_resource(L2Y_FP8, max_size=True)
         l2y_scale_res = create_buffer_resource(L2Y_SCALE, max_size=True)
         signal_delta_res = create_buffer_resource_from_addr(
@@ -662,7 +660,7 @@ def _compile(
         topk_weights_res = create_buffer_resource(TOPK_WEIGHTS, max_size=True)
         grad_gate_res = create_buffer_resource(GRAD_GATE, max_size=True)
         d_topk_w_res = create_buffer_resource(D_TOPK_W, max_size=True)
-        real_tiles = buffer_load(num_tile_blocks_res, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
+        real_tiles = buffer_load(num_tile_blocks_res, fx.Int32(0), vec_width=1, dtype=fx.T.i32)
 
         if block_index < combine_cu:
             push_block = combine_copy_fp8_tile(
@@ -702,7 +700,7 @@ def _compile(
                                 combine_flag_base,
                                 flag_base + fx.Int32(bn),
                                 scope="agent",
-                                dtype=fx.T.i64(),
+                                dtype=fx.T.i64,
                             )
                             if sig == expected_combine:
                                 ready = ready + fx.Int32(1)
@@ -729,7 +727,7 @@ def _compile(
                 # has to know this build computed nothing.
                 if const_expr(not _no_gemm):
                     c_m_const = fx.Int32(num_max_pool_tokens)
-                    group_index = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
+                    group_index = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32)
                     n_tiles_a = BLOCK_M // 64
                     n_tiles_b = BLOCK_N // 128
                     c_idx_fn = lambda i, j: i * n_tiles_b + j

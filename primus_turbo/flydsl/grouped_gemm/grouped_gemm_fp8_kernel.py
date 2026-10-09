@@ -34,11 +34,11 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
-from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from primus_turbo.common.logger import logger
+from primus_turbo.flydsl.utils import buffer_ops as _buffer_ops
 from primus_turbo.flydsl.utils.gemm_epilogue_helper import (
     StoreCdSwiGLUCShuffle,
     StoreCSwiGLU,
@@ -4454,8 +4454,8 @@ def _compile_grouped_tn_wgrad_4wave(
         _out_ty = fx.Float32 if out_fp32 else (fx.Float16 if out_fp16 else fx.BFloat16)
         _ir_ty = _out_ty.ir_type
         _obytes = 4 if out_fp32 else 2  # C/band element width (fp32 under fused bgrad-accum)
-        f32v = fx.T.VectorType.get([_RED_VEC], fx.T.f32())
-        outv = fx.T.VectorType.get([_RED_VEC], _ir_ty)
+        f32v = fx.T.vec(_RED_VEC, fx.T.f32)
+        outv = fx.T.vec(_RED_VEC, _ir_ty)
         go_rs = _buffer_ops.create_buffer_resource(group_offs, max_size=False, num_records_bytes=(G + 1) * 8)
         c_base = _buffer_ops.extract_base_index(C)
         ws_base = _buffer_ops.extract_base_index(WS)

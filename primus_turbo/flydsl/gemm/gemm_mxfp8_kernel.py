@@ -66,10 +66,11 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     xcd_remap_pid,
 )
 from primus_turbo.flydsl.utils.prims import ceildiv
+from primus_turbo.flydsl.utils import buffer_ops
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec

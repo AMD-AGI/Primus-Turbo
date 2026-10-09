@@ -23,7 +23,7 @@ concurrency:
 
 env:
   # Required aiter release. Keep in sync with AITER_GIT_TAG in primus_turbo/common/aiter_utils.py.
-  AITER_VERSION: v0.1.14.post1
+  AITER_VERSION: v0.1.24.post1
 
 jobs:
   build-sdist:

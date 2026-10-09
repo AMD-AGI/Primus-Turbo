@@ -54,7 +54,6 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
-from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr import math as fm
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
@@ -72,6 +71,7 @@ from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import (
     _lds_store1,
     _sr_hash,
 )
+from primus_turbo.flydsl.utils import buffer_ops as _buffer_ops
 from primus_turbo.flydsl.utils.gemm_helper import (
     S2RLoaderTr,
     StoreCPerTensor,
@@ -1279,11 +1279,12 @@ class _EpilogueAmax:
         """Integer max on the float's bits: gfx950 has no f32 buffer atomic max."""
         bits = Vec.from_elements([_wave_max_f32(acc)], fx.Float32).bitcast(fx.Int32)[0]
         rocdl.raw_ptr_buffer_atomic_smax(
+            T.i32,
             _raw(bits),
             _raw(self.amax_rs),
             _raw(self.amax_voff),
             _raw(fx.Int32(0)),
-            _raw(fx.Int32(0)),
+            aux=ir.IntegerAttr.get(T.i32, 0),
         )
 
 

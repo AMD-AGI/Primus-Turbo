@@ -30,7 +30,7 @@ import gc
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import arith, buffer_ops, range_constexpr, rocdl
+from flydsl.expr import arith, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
@@ -45,6 +45,7 @@ from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import (
     _sr_hash,
     vf_exp_up,
 )
+from primus_turbo.flydsl.utils import buffer_ops
 from primus_turbo.flydsl.utils.gemm_helper import (
     _readfirstlane_i32,
     make_row_band_resource,

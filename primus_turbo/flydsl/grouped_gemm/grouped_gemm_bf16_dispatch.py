@@ -26,8 +26,8 @@ Why two files rather than ``if arch ==`` inside one
    lines of gfx9 MFMA/DPP/SRD primitives. Neither belongs in the other's import
    graph, and a flydsl too old to carry the gfx1250 surface must not break an
    otherwise working gfx950 install -- here that is a caught ``ImportError``,
-   not a crash. (That surface is present from flydsl 0.2.4, the version
-   ``setup.py`` pins.)
+   not a crash. (That surface is present from flydsl 0.2.4; ``setup.py`` pins
+   0.3.4.1.)
 
 2. **Almost nothing is shared.** Wave size, matrix engine, accumulator storage,
    global->LDS path, OOB mechanism and barrier primitive all differ, so an

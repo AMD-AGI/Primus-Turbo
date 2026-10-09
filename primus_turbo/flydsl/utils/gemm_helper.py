@@ -23,13 +23,13 @@ from flydsl.compiler.ast_rewriter import (
     ReplaceIfWithDispatch,
 )
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
-from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr.arith import _to_raw as _raw
-from flydsl.expr.buffer_ops import buffer_store, create_buffer_resource
 from flydsl.expr.typing import AddressSpace, PointerType, T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
 
+from primus_turbo.flydsl.utils import buffer_ops as _buffer_ops
+from primus_turbo.flydsl.utils.buffer_ops import buffer_store, create_buffer_resource
 from primus_turbo.flydsl.utils.prims import (
     _DPP_QUAD_SWAP1,
     _as_index,
@@ -1586,7 +1586,8 @@ def make_value_attrs(waves_per_eu, agpr_alloc, fwg):
             alloc = f"0,{-agpr_alloc}"
         else:
             alloc = f"{agpr_alloc},{agpr_alloc}"
-        d["passthrough"] = [
+        # gpu.func -> llvm.func lowering drops a bare "passthrough"; the "llvm." prefix carries it over.
+        d["llvm.passthrough"] = [
             ["amdgpu-agpr-alloc", alloc],
             ["amdgpu-mfma-vgpr-form", "false"],
         ]
