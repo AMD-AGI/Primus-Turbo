@@ -17,12 +17,16 @@ from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     ScalingGranularity,
 )
-from primus_turbo.pytorch.core.utils import get_device_compute_capability
+from primus_turbo.pytorch.core.utils import get_device_compute_capability, is_gfx1250
 from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
     attention_aiter_backward_impl,
     attention_aiter_forward_impl,
     attention_aiter_varlen_backward_impl,
     attention_aiter_varlen_forward_impl,
+)
+from primus_turbo.pytorch.kernels.attention.attention_flydsl_gfx1250_impl import (
+    flash_attn_flydsl_gfx1250_backward_impl,
+    flash_attn_flydsl_gfx1250_forward_impl,
 )
 from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
     flash_attn_sbhd_flydsl_backward_impl,
@@ -82,9 +86,10 @@ def _any_requires_grad(*tensors) -> bool:
 
 class FlashAttnFunc(torch.autograd.Function):
     """Dense flash attention; ``backend`` picks the implementation and ctx carries it so the
-    backward takes the same one. q/k/v arrive ``[b, s, h, d]``-shaped, so FlyDSL -- the one
-    sbhd-native backend -- takes their ``[s, b, h, d]`` permute (the original tensor, since
-    only sbhd storage is eligible) and permutes its results back."""
+    backward takes the same one. q/k/v arrive ``[b, s, h, d]``-shaped, so the sbhd-native
+    kernels -- FlyDSL's gfx950 ones and HipKittens -- take their ``[s, b, h, d]`` permute (the
+    original tensor, since only sbhd storage is eligible) and permute their results back.
+    FlyDSL's gfx1250 kernels take any byte order: their branch makes the tensors contiguous BSHD."""
 
     @staticmethod
     def forward(
@@ -108,6 +113,8 @@ class FlashAttnFunc(torch.autograd.Function):
         backend: BackendType = BackendType.AITER,
     ):
         ctx.backend = backend
+        # FLYDSL names two kernel families; the arch decides which, once, for both passes.
+        ctx.flydsl_gfx1250 = backend == BackendType.FLYDSL and is_gfx1250()
         if backend == BackendType.TRITON:
             # The dispatcher only picks this backend when DenseAttnFwdTritonBackend.can_handle
             # said yes, but FlashAttnFunc.apply is reachable directly, and these arguments have
@@ -143,7 +150,7 @@ class FlashAttnFunc(torch.autograd.Function):
             return (out, lse) if return_lse else out
 
         if backend == BackendType.HIPKITTENS:
-            # Same sbhd precondition as FlyDSL below, and for the same reason.
+            # Same sbhd precondition as FlyDSL's gfx950 kernels below, and for the same reason.
             assert _sbhd_layout(q, qkv_format), f"hipkittens dense attention is sbhd only, got {qkv_format}"
             q_s, k_s, v_s = (t.permute(1, 0, 2, 3) for t in (q, k, v))
             out_s, lse = flash_attn_sbhd_hipkittens_forward_impl(
@@ -165,11 +172,36 @@ class FlashAttnFunc(torch.autograd.Function):
             # matches the [B, Hq, Sq] every other backend hands back.
             return (out, lse.squeeze(2)) if return_lse else out
 
+        if ctx.flydsl_gfx1250:
+            # Same reasoning as the Triton branch: apply() is reachable without the gate.
+            if dropout_p != 0.0 or bias is not None or alibi_slopes is not None or sink is not None:
+                raise ValueError("gfx1250 flydsl attention does not implement dropout, bias, alibi or sink")
+            if return_softmax:
+                raise ValueError("gfx1250 flydsl attention cannot return the softmax matrix")
+            # Same rule as the gate: a right bound of 0 is a causal mask, so it needs causal=True.
+            wl, wr = int(window_size[0]), int(window_size[1])
+            if wl >= 0 or wr > 0 or (wr == 0 and not causal):
+                raise ValueError(
+                    f"gfx1250 flydsl attention has no sliding window, got {window_size} (causal={causal})"
+                )
+            # [b, s, h, d] in any byte order; the adapter makes q/k/v contiguous BSHD and the
+            # backward consumes exactly those tensors and lse [B, Hq, Sq].
+            q_c, k_c, v_c = (t.contiguous() for t in (q, k, v))
+            out, lse = flash_attn_flydsl_gfx1250_forward_impl(
+                q_c, k_c, v_c, softmax_scale=softmax_scale, causal=causal
+            )
+            if is_grad_enabled and _any_requires_grad(q, k, v):
+                ctx.save_for_backward(q_c, k_c, v_c, out, lse)
+                ctx.softmax_scale = softmax_scale
+                ctx.causal = causal
+            return (out, lse) if return_lse else out
+
         if backend == BackendType.FLYDSL:
-            # Only sbhd bytes make the [s,b,h,d] view a relabel rather than a reinterpretation.
+            # FlyDSL's gfx950 kernels (gfx1250 took the branch above), which are sbhd only:
+            # only sbhd bytes make the [s,b,h,d] view a relabel rather than a reinterpretation.
             # The dispatcher checked that before naming this backend, but apply() can be called
             # straight, and then reading bshd bytes as sbhd would just return the wrong answer.
-            assert _sbhd_layout(q, qkv_format), f"flydsl dense attention is sbhd only, got {qkv_format}"
+            assert _sbhd_layout(q, qkv_format), f"flydsl gfx950 attention is sbhd only, got {qkv_format}"
             q_s, k_s, v_s = (t.permute(1, 0, 2, 3) for t in (q, k, v))
             out_s, lse = flash_attn_sbhd_flydsl_forward_impl(
                 q_s,
@@ -302,6 +334,13 @@ class FlashAttnFunc(torch.autograd.Function):
                 window_size=ctx.window_size,
             )
             return _flash_attn_grads(dq, dk, dv, None, dsink)
+
+        if ctx.flydsl_gfx1250:
+            q, k, v, out, lse = ctx.saved_tensors
+            dq, dk, dv = flash_attn_flydsl_gfx1250_backward_impl(
+                dout, q, k, v, out, lse, softmax_scale=ctx.softmax_scale, causal=ctx.causal
+            )
+            return _flash_attn_grads(dq, dk, dv, None, None)
 
         if ctx.backend == BackendType.FLYDSL:
             q_s, k_s, v_s, out_s, lse = ctx.saved_tensors
@@ -525,8 +564,9 @@ def flash_attn_func(
     sink: Optional[torch.Tensor] = None,
 ):
     """q/k/v are ``[b, s, h, d]``-shaped; an sbhd caller passes a permuted view and permutes
-    the result back. aiter reads the memory layout to allocate outputs and grads matching it;
-    FlyDSL is sbhd-native and takes that layout only.
+    the result back. aiter reads the memory layout to allocate outputs and grads matching it.
+    FlyDSL's gfx950 kernels are sbhd-native and take that layout only; its gfx1250 kernels
+    take any byte order and return contiguous [b, s, h, d] outputs and grads.
     """
     qkv_format = _infer_qkv_format(q, k, v)
     is_grad_enabled = torch.is_grad_enabled()

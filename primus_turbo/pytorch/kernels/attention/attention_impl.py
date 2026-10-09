@@ -34,6 +34,10 @@ from primus_turbo.pytorch.kernels.attention.attention_aiter_impl import (
     attention_aiter_forward_impl,
     attention_aiter_varlen_forward_impl,
 )
+from primus_turbo.pytorch.kernels.attention.attention_flydsl_gfx1250_impl import (
+    flash_attn_flydsl_gfx1250_forward_impl,
+    flydsl_gfx1250_unsupported_reason,
+)
 from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
     flash_attn_sbhd_flydsl_forward_impl,
     flash_attn_varlen_flydsl_forward_impl,
@@ -101,7 +105,8 @@ def _flydsl_common_ok(
 
     ``sink`` and the GQA group are checked separately, where Hq is known. The arch test is
     an equality: these kernels are gfx950 code, and gfx1250 compares greater than gfx950, so
-    ``>=`` handed gfx1250 calls to a builder that raises on any other arch.
+    ``>=`` handed gfx1250 calls to a builder that raises on any other arch. gfx1250 has its
+    own kernels, gated by _flydsl_gfx1250_ok.
     """
     head_dim = q.shape[-1]
     return (
@@ -201,7 +206,46 @@ def _gluon_layout_ok(tensor: torch.Tensor, qkv_format: str) -> bool:
     return False
 
 
+def _flydsl_gfx1250_ok(
+    q,
+    k,
+    v,
+    dropout_p,
+    softmax_scale,
+    causal,
+    window_size,
+    bias,
+    alibi_slopes,
+    sink,
+    return_softmax,
+) -> bool:
+    """Eligibility for the gfx1250 FlyDSL kernels (primus_turbo/flydsl/attention/gfx1250).
+
+    bf16, head_dim 128, GQA, bottom-right causal or full attention; the shape rules (sequence
+    multiples, q and k each at most 1 GiB, sq <= skv when causal) are the kernels' own, asked
+    rather than restated, and so is the flydsl release they need. Any byte order: the tensors
+    are [b, s, h, d]-shaped and the adapter makes them contiguous.
+    """
+    if k is None or v is None or any(t.ndim != 4 for t in (q, k, v)):
+        return False
+    if not all(t.device == q.device and t.dtype == q.dtype for t in (k, v)):
+        return False
+    if dropout_p != 0.0 or return_softmax or bias is not None or alibi_slopes is not None:
+        return False
+    if sink is not None:
+        return False
+    # No sliding window: full attention, or plain causal (which may arrive as (-1, 0)).
+    wl, wr = int(window_size[0]), int(window_size[1])
+    if wl >= 0 or wr > 0 or (wr == 0 and not causal):
+        return False
+    if softmax_scale is not None and (not isinstance(softmax_scale, Real) or isinstance(softmax_scale, bool)):
+        return False
+    return flydsl_gfx1250_unsupported_reason(q, k, v, bool(causal)) is None
+
+
 class DenseAttnFwdFlydslBackend(KernelBackend):
+    """FlyDSL dense attention: gfx950 kernels on MI355X, gfx1250 kernels on MI455X."""
+
     @staticmethod
     def can_handle(
         q,
@@ -218,8 +262,23 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
         return_softmax=False,
         **kwargs,
     ) -> bool:
-        # sbhd only: the kernel is compiled to address that order and takes the [s,b,h,d]
-        # view of these [b,s,h,d]-shaped tensors with no copy. Everything else goes to aiter.
+        if is_gfx1250():
+            return _flydsl_gfx1250_ok(
+                q,
+                k,
+                v,
+                dropout_p,
+                softmax_scale,
+                causal,
+                window_size,
+                bias,
+                alibi_slopes,
+                sink,
+                return_softmax,
+            )
+        # The gfx950 kernels are sbhd only: they are compiled to address that order and take the
+        # [s,b,h,d] view of these [b,s,h,d]-shaped tensors with no copy. Everything else goes to
+        # aiter.
         if k is None or v is None or not _sbhd_layout(q, qkv_format):
             return False
         # These kernels never materialise the dropout softmax matrix, so a caller that asked
@@ -232,6 +291,9 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
 
     @staticmethod
     def execute(q, k, v, softmax_scale, causal, window_size, return_lse=True, **kwargs):
+        if is_gfx1250():
+            out, lse = flash_attn_flydsl_gfx1250_forward_impl(q, k, v, softmax_scale, causal)
+            return (out, lse) if return_lse else out
         # Under autotune, off the op layer's path, so the sbhd view is taken here too.
         q, k, v = (t.permute(1, 0, 2, 3) for t in (q, k, v))
         return flash_attn_sbhd_flydsl_forward_impl(
@@ -318,9 +380,10 @@ class DenseAttnFwdHipkittensBackend(KernelBackend):
 class DenseAttnFwdTritonBackend(KernelBackend):
     """Portable Triton attention: no CK, no aiter, no arch-specific extension.
 
-    The only dense backend that runs on gfx1250 -- FlyDSL and HipKittens target other archs,
-    and the aiter path reaches CK, whose fmha backward rejects the call at runtime after the
-    forward has succeeded. Narrow by construction, matching what the kernel asserts.
+    The broad dense backend on gfx1250: FlyDSL there covers only bf16 head_dim 128 without
+    sink or window, with q and k each at most 1 GiB, HipKittens targets another arch, and the
+    aiter path reaches CK, whose fmha backward rejects the call at runtime after the forward
+    has succeeded. Narrow by construction, matching what the kernel asserts.
     """
 
     @staticmethod
