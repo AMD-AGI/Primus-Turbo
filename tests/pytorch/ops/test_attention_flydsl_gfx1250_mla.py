@@ -146,7 +146,8 @@ def test_gate_accepts(monkeypatch, dims, kwargs, layout):
     [
         pytest.param({"dtype": torch.float16}, {}, id="fp16"),
         pytest.param({"d_v": 192}, {}, id="v_192"),
-        pytest.param({"d_qk": 128, "d_v": 128}, {}, id="head_dim_128"),
+        # Head dim 128 belongs to the other gfx1250 family (test_attention_flydsl_gfx1250.py); 64 to neither.
+        pytest.param({"d_qk": 64, "d_v": 64}, {}, id="head_dim_64"),
         pytest.param({"hkv": 1}, {}, id="gqa"),
         pytest.param({"sq": 96, "skv": 96}, {}, id="sq_not_multiple_of_64"),
         pytest.param({"skv": 288}, {}, id="skv_not_multiple_of_64"),
@@ -192,7 +193,7 @@ def test_unpinned_mla_call_resolves_to_flydsl(monkeypatch, layout):
 
 @pytest.mark.parametrize(
     "tensors",
-    [pytest.param({"sq": 96, "skv": 96}, id="sq_96"), pytest.param({"d_qk": 128, "d_v": 128}, id="hd128")],
+    [pytest.param({"sq": 96, "skv": 96}, id="sq_96"), pytest.param({"d_qk": 64, "d_v": 64}, id="hd64")],
 )
 def test_pinned_flydsl_refuses_instead_of_falling_back(monkeypatch, tensors):
     _on_gfx1250(monkeypatch)
@@ -207,7 +208,7 @@ def test_pinned_flydsl_refuses_instead_of_falling_back(monkeypatch, tensors):
         pytest.param({}, {"window_size": (128, 0)}, id="sliding_window"),
         pytest.param({}, {"return_attn_probs": True}, id="return_attn_probs"),
         pytest.param({}, {"softmax_scale": True}, id="bool_scale"),
-        pytest.param({"d_qk": 128, "d_v": 128}, {}, id="hd128"),
+        pytest.param({"d_qk": 64, "d_v": 64}, {}, id="hd64"),
         pytest.param({"skv": 288}, {}, id="skv_not_multiple_of_64"),
     ],
 )
