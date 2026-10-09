@@ -33,6 +33,7 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quantize_mxfp4_impl,
     quantize_mxfp8_impl,
 )
+from primus_turbo.pytorch.ops.moe_gather import lookup_permuted_activation_seam
 
 __all__ = [
     "quantize_fp8",
@@ -45,6 +46,7 @@ __all__ = [
     "grouped_quantize_fp8_with_trans",
     "grouped_dequantize_fp8",
     "grouped_quantize_fp4",
+    "grouped_quantize_fp4_with_trans",
     "grouped_dequantize_fp4",
 ]
 
@@ -412,6 +414,9 @@ def grouped_quantize_fp4_with_trans(
     scaling_recipe: Optional[ScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
     scale_rounding_mode: int = 0,
+    dest2src: Optional[torch.Tensor] = None,
+    permuted_probs: Optional[torch.Tensor] = None,
+    total_m: Optional[int] = None,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -437,8 +442,30 @@ def grouped_quantize_fp4_with_trans(
     group_lens_padded_col, group_offs_padded_col)`` to mirror
     :func:`grouped_quantize_fp8_with_trans`. Row-wise is tight-M, so its padded
     layout equals the original ``group_lens`` / ``group_offs``.
+
+    ``dest2src`` (the routing/permute -> MXFP4 fusion handoff): when given, ``x`` is instead
+    the PRE-permutation source activation, gathered internally as row
+    ``dest2src[row]`` per destination row -- the caller never has to materialize
+    the separately-permuted ``[total_m, N]`` buffer. ``total_m`` (the permuted row
+    count) is then required, and ``permuted_probs`` may be given to zero-fill a
+    destination row whose prob is exactly 0.0 (the routing_map padding rule).
+
+    If ``dest2src`` is not given, ``x`` is checked against the same fusion's
+    side table (see :func:`primus_turbo.pytorch.ops.moe_gather.register_permuted_activation_seam`): a
+    permute that skipped materializing its output (because nothing between it
+    and here reads that buffer's bytes) registers the real seam there instead.
+    A hit transparently resolves to the same gather this function would do had
+    the caller passed ``dest2src`` explicitly, so any existing caller of this
+    function -- including one that still calls a permute op and this function
+    as two separate, unrelated-looking steps -- keeps getting a correct result
+    without needing to know the fusion exists. A miss leaves ``x`` untouched.
     """
     assert out_dtype == float4_e2m1fn_x2, "The out_dtype must be float4_e2m1fn_x2 for MXFP4 quantization"
+    if dest2src is None:
+        _seam = lookup_permuted_activation_seam(x)
+        if _seam is not None:
+            total_m = int(x.shape[0])
+            x, dest2src, permuted_probs = _seam
     if granularity == ScalingGranularity.MX_BLOCKWISE:
         assert block_size == MXFP4_BLOCK_SIZE, (
             f"The block size must be {MXFP4_BLOCK_SIZE} for MXFP4 quantization"
@@ -456,6 +483,9 @@ def grouped_quantize_fp4_with_trans(
             scaling_recipe,
             scaling_recipe_for_trans,
             scale_rounding_mode,
+            dest2src=dest2src,
+            permuted_probs=permuted_probs,
+            total_m=total_m,
         )
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
