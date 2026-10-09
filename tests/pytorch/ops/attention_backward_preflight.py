@@ -1,3 +1,9 @@
+###############################################################################
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
 """Compare candidate gradients with the pinned baseline before a training run.
 
 The baseline file path is supplied by the workflow's immutable source bundle.
