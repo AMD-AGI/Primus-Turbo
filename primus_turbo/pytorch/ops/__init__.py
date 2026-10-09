@@ -16,7 +16,6 @@ except ImportError as e:
     warnings.warn(f"Primus-Turbo can't support Async-TP - {e}")
 
 from .activation import *
-from .adaln_gemm import *
 from .attention import *
 from .gemm import *
 from .gemm_fp4 import *

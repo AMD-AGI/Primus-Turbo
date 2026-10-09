@@ -98,6 +98,9 @@ class GlobalBackendManager:
        set_*_backend(auto_tune=True) to auto-tune a single op/precision.
     4. Code defaults
     5. Fallback: try all backends
+
+    A call whose code default is a strict backend (``BackendEntry.strict``) skips 3 and 5:
+    it runs on that backend or raises.
     """
 
     _gemm_backend: Optional[Dict[PrecisionType, BackendChoice]] = None
@@ -432,10 +435,19 @@ class BackendEntry:
         autotune: Whether this backend participates in auto-tuning.
                   Backends with autotune=False can still be selected via
                   explicit user configuration or as a fallback.
+        strict: Whether a call that names this backend as its default is
+                pinned to it. Such a call runs on this backend whenever it can
+                handle the inputs, ahead of auto-tuning, and raises when it
+                cannot instead of falling back. For backends with kernels for
+                exact shapes only: a caller names one because it requires those
+                kernels, and a silent substitute would hide a missing one. A
+                backend set by the user (code or environment) still takes
+                precedence.
     """
 
     impl: Type[KernelBackend]
     autotune: bool = True
+    strict: bool = False
 
 
 class TuneCache:
@@ -645,6 +657,12 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
                 )
             return entry.impl.execute(**kwargs)
 
+        # A strict default pins the call (see BackendEntry.strict): neither auto-tune nor a fallback replaces it.
+        default_entry = cls._backends.get(default_backend_choice.backend)
+        if default_entry is not None and default_entry.strict:
+            cls._check_strict_default(default_backend_choice.backend, default_entry, kwargs)
+            return default_entry.impl.execute(**kwargs)
+
         # 2. Auto tune
         # NOTE: Skip autotune during cuda graph capture.
         if (
@@ -658,7 +676,6 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
                 return backend_cls.execute(**kwargs)
 
         # 3. Default backend
-        default_entry = cls._backends.get(default_backend_choice.backend)
         if default_entry is not None and default_entry.impl.can_handle(**kwargs):
             return default_entry.impl.execute(**kwargs)
 
@@ -671,6 +688,14 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
         raise ValueError(
             f"No compatible backend found for {cls.__name__} with inputs: {_format_kwargs(kwargs)}"
         )
+
+    @classmethod
+    def _check_strict_default(cls, backend_enum: BackendType, entry: BackendEntry, kwargs: dict) -> None:
+        if not entry.impl.can_handle(**kwargs):
+            raise ValueError(
+                f"Default backend {backend_enum.name} of {cls.__name__} is strict and cannot handle the given inputs: "
+                f"{_format_kwargs(kwargs)}. Call it only where it can, or name another default backend."
+            )
 
     @classmethod
     def _enum_for_impl(cls, impl: Type[KernelBackend]) -> Optional[BackendType]:
@@ -705,6 +730,12 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
                 )
             return user_backend_enum
 
+        # A strict default pins the call (see BackendEntry.strict).
+        default_entry = cls._backends.get(default_backend_enum)
+        if default_entry is not None and default_entry.strict:
+            cls._check_strict_default(default_backend_enum, default_entry, kwargs)
+            return default_backend_enum
+
         # 2. Auto tune
         # NOTE: Skip autotune during cuda graph capture.
         if GlobalBackendManager.auto_tune_enabled() and not cls._is_graph_capturing():
@@ -714,7 +745,6 @@ class AutoKernelDispatcher(ABC):  # noqa: B024
                 return tuned_enum
 
         # 3. Default backend
-        default_entry = cls._backends.get(default_backend_enum)
         if default_entry is not None and default_entry.impl.can_handle(**kwargs):
             return default_backend_enum
 
