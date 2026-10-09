@@ -666,6 +666,40 @@ def grouped_quantize_mxfp8_impl(
         )
 
 
+def _mxfp4_gather_xcd(hidden: int, bk: int = 128) -> Tuple[int, int]:
+    """Band-cyclic ``(num_xcd, xcd_blk)`` for the fused permute+quant gather kernel.
+
+    Assign four destination-block runs to each XCD in a band-cyclic layout.
+    Column tiles for a destination block reuse source rows on the same XCD.
+    This geometry is selected for the tested gfx950 GPT-OSS workload; other
+    hidden sizes and token distributions need independent performance validation.
+    """
+    n_pad = (hidden + 127) // 128 * 128
+    nbk = (n_pad + bk - 1) // bk
+    return 4, 4 * nbk
+
+
+def _materialize_gathered_activation(
+    x: torch.Tensor, dest2src: torch.Tensor, permuted_probs: Optional[torch.Tensor]
+) -> torch.Tensor:
+    """Fail-closed fallback for the routing/permute -> MXFP4 fusion.
+
+    Used only when a gather is requested (``dest2src`` given) but the fused
+    kernel's ``fly_ok`` gate is False for this call's recipe/dtype (e.g. a 2D
+    block-scaled recipe, or gfx1250): materializes the real permutation via an
+    explicit gather (and the same prob==0 zero rule ``_permute_kernel``/the
+    fused kernel apply) instead of ever quantizing an ungathered source under
+    the destination-shaped name ``x``.
+    """
+    gathered = x.index_select(0, dest2src.to(torch.int64))
+    if permuted_probs is not None:
+        zero_rows = permuted_probs == 0
+        if bool(zero_rows.any()):
+            gathered = gathered.clone()
+            gathered[zero_rows] = 0
+    return gathered
+
+
 def grouped_quantize_mxfp4_impl(
     x: torch.Tensor,
     out_dtype: torch.dtype,
@@ -677,6 +711,9 @@ def grouped_quantize_mxfp4_impl(
     scaling_recipe: Optional[ScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
     scale_rounding_mode: int = 0,
+    dest2src: Optional[torch.Tensor] = None,
+    permuted_probs: Optional[torch.Tensor] = None,
+    total_m: Optional[int] = None,
 ) -> Union[
     Tuple[
         torch.Tensor,
@@ -707,11 +744,25 @@ def grouped_quantize_mxfp4_impl(
     When ``with_trans`` is False, only the single direction selected by ``axis``
     (1 -> rowwise, 0 -> colwise) is produced, returning
     ``(data, scale_inv, group_lens_padded, group_offs_padded)``.
+
+    ``dest2src`` (the routing/permute -> MXFP4 fusion seam): when given, ``x``
+    is instead the PRE-permutation SOURCE activation and the fused kernel gathers
+    row ``dest2src[row]`` per destination row, so the caller never has to
+    materialize the separately-permuted ``[total_m, N]`` buffer. Requires
+    ``with_trans``; ``total_m`` (the permuted row count) must be given alongside
+    it. ``permuted_probs`` is optional and, when given, zero-fills a destination
+    row whose prob is exactly 0.0 (the routing_map padding rule
+    ``_permute_kernel`` applies) instead of gathering it. Falls back to
+    materializing the real gather (never quantizing the ungathered source) when
+    the fused kernel can't take this call's recipe/dtype.
     """
     mxfp4_support, reason = check_mxfp4_support()
     assert mxfp4_support, reason
 
     assert block_size == MXFP4_BLOCK_SIZE, f"The block size must be {MXFP4_BLOCK_SIZE} for MXFP4 quantization"
+    assert dest2src is None or with_trans, (
+        "dest2src (gather fusion) is only wired for the with_trans dual path"
+    )
 
     scaling_recipe = ScalingRecipe() if scaling_recipe is None else scaling_recipe
 
@@ -753,6 +804,21 @@ def grouped_quantize_mxfp4_impl(
         if fly_ok:
             from primus_turbo.flydsl.quantization.mxfp4_grouped_quant import grouped_quant_mxfp4_raw
 
+            gather_kwargs = {}
+            if dest2src is not None:
+                assert total_m is not None, "total_m is required alongside dest2src"
+                num_xcd, xcd_blk = _mxfp4_gather_xcd(x.shape[-1])
+                gather_kwargs = dict(
+                    d2s=dest2src,
+                    pp=permuted_probs,
+                    total_M=total_m,
+                    nt_load=False,  # a destination row's source row repeats across its
+                    # top-k experts, so (unlike the non-gather read) it IS re-read within
+                    # the kernel's own lifetime -- nt would evict that reuse for nothing.
+                    nt_store=True,
+                    num_xcd=num_xcd,
+                    xcd_blk=xcd_blk,
+                )
             (
                 rowwise_out,
                 rowwise_scale,
@@ -770,6 +836,7 @@ def grouped_quantize_mxfp4_impl(
                 row_sr=scaling_recipe.use_sr,
                 col_sr=scaling_recipe_for_trans.use_sr,
                 scale_rounding_mode=scale_rounding_mode,
+                **gather_kwargs,
             )
             # Adapt the FlyDSL raw 6-tuple to main's 8-tuple dual contract: rowwise is
             # tight-M, so its padded layout equals the original group_lens / group_offs.
@@ -783,6 +850,11 @@ def grouped_quantize_mxfp4_impl(
                 group_lens_padded_colwise,
                 group_offs_padded_colwise,
             )
+        if dest2src is not None:
+            # Fail-closed: the fused kernel can't take this call's recipe/dtype (e.g. a
+            # 2D block-scaled recipe, or gfx1250) -- gather for real so `x` below is a
+            # genuine already-permuted activation, never the ungathered source.
+            x = _materialize_gathered_activation(x, dest2src, permuted_probs)
         return _hip()
     else:
         assert axis in (0, 1), "The axis must be 0 (colwise) or 1 (rowwise) when with_trans is False."
