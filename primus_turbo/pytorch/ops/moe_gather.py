@@ -38,7 +38,9 @@ def register_permuted_activation_seam(placeholder, src, dest2src, permuted_probs
 
 
 def lookup_permuted_activation_seam(x, include_plan=False):
-    if not isinstance(x, torch.Tensor):
+    # Only ordinary tensors can be forward placeholders. Quantized/FakeTensor
+    # wrappers may have no accessible storage and must retain their normal path.
+    if type(x) is not torch.Tensor:
         return None
     key = x.data_ptr()
     entry = _PERMUTED_ACTIVATION_SEAM_TABLE.get(key)

@@ -62,6 +62,9 @@ class TestGatherHandoff(unittest.TestCase):
     def test_ordinary_dense_tensor_has_no_handoff(self):
         self.assertIsNone(gather.lookup_permuted_activation_seam(self.source))
 
+    def test_storage_less_tensor_subclass_is_not_a_forward_placeholder(self):
+        self.assertIsNone(gather.lookup_permuted_activation_seam(self.wrapper()))
+
     def test_forward_plan_is_disabled_on_cpu(self):
         with patch.dict(
             "os.environ",
