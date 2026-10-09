@@ -630,7 +630,9 @@ def build_flash_attn_bwd_dqred_module(
     consecutive packed rows can straddle a segment boundary without sharing a band window.
     That costs nothing: the work-group count is rows*Hq*D/chunk however the rows are split.
 
-    A work-group owns ``rows_per_wg`` q rows (one q group, hence one band count) and
+    A work-group owns ``rows_per_wg`` q rows (one q group, hence one band count -- which
+    holds for a pair only when Sq and causal_offset are even; _reduce_dq_partials folds one
+    row per work-group otherwise) and
     every thread carries ``uc`` independent 16 B chunks, so that many loads per band are
     in flight -- the band loop is dynamic and cannot be unrolled. ``lpt`` matters for the
     work-group width; every (block, uc, lpt) combination returns bit-identical dQ, so
@@ -694,7 +696,9 @@ def build_flash_attn_bwd_dqred_module(
     VEC = vec
     RPW = rows_per_wg
     if block is None:
-        cands = [b for b in (512, 256, 128, 64, 32) if (RPW * HD) % (b * VEC) == 0]
+        # 16 is a last resort: it only serves one row of a narrow head (Hq*D = 128 mod 256,
+        # e.g. Hq=5 at D=128), which an odd Sq or causal offset folds alone (_reduce_dq_partials).
+        cands = [b for b in (512, 256, 128, 64, 32, 16) if (RPW * HD) % (b * VEC) == 0]
         assert cands, f"cannot tile {RPW}*{HD} elements into {VEC}-element lanes"
         block = cands[0]
     BLOCK = block
@@ -714,6 +718,9 @@ def build_flash_attn_bwd_dqred_module(
     # launch would have handed it and dQ comes out bitwise identical.
     NB = batch_size if n_bat is None else n_bat
     assert block_kv % RPW == 0 and (NB * SQ) % RPW == 0 and 0 <= bat_lo <= batch_size - NB
+    # A row pair takes its band range from its first row, which is the pair's own only when the
+    # pair sits in one batch (Sq even) and both rows see the same top band (offset even).
+    assert RPW == 1 or (SQ % RPW == 0 and causal_offset % RPW == 0), "row pairs need even Sq and offset"
     ILV = band_ilv
     RING = int(band_ring)
     BAND_BYTES = batch_size * SQ * HD * 2 * ILV
@@ -802,8 +809,8 @@ def build_flash_attn_bwd_dqred_module(
         # whole BLOCK_Q run of q together), so the low edge must be computed from the block's
         # first row q_blk, not the work-group's row0: when W is not a block_kv multiple (e.g.
         # W=2047), a per-row floor would vary inside one block and skip a band that did write.
-        # (g's per-row and per-block value coincide -- off%block_kv==0 and a BLOCK_Q block sits
-        # in one block_kv bin -- so it needs no such alignment.) Full-causal (window_left<0)
+        # (g needs no such alignment: the rows of a work-group share it, since rows are paired
+        # only when Sq and the offset are even -- see _reduce_dq_partials.) Full-causal (window_left<0)
         # keeps g_lo=0, so range(0, g+1) is unchanged and the ISA stays byte-identical.
         if const_expr(varlen):
             # Ragged: this row's segment owns both edges. The segment is the largest s with
@@ -4735,8 +4742,9 @@ def _reduce_dkdv_slots(ws_dk, ws_dv, n_slots, n_groups, stream, sub=None, out=No
     n_elems = ws_dk.numel() // (n_slots * n_groups)
     cfg = _slotred_cfg(*((sub[3], sub[0]) if sub is not None else (n_elems, n_groups)))
     if cfg is None:
-        axis = 1 if n_groups > 1 else 0
-        return ws_dk.sum(dim=axis), ws_dv.sum(dim=axis)
+        # Fold the slot axis of the same [n_groups, n_slots, n_elems] view the reduce uses: with
+        # one group the THD workspace still leads with its batch axis, so dim 0 is not the slots.
+        return tuple(w.view(n_groups, n_slots, n_elems).sum(dim=1).reshape(-1) for w in (ws_dk, ws_dv))
     if out is None:
         out = tuple(torch.empty(n_groups * n_elems, device=w.device, dtype=w.dtype) for w in (ws_dk, ws_dv))
     dk, dv = out
@@ -4811,9 +4819,12 @@ def _reduce_dq_partials(
     band_pad = _WSQ_BAND_PAD if head_dim == 128 else 0
     band_ilv = ws.shape[3] // (num_heads * head_dim)
     # Ragged rows are packed q tokens whose segment base has no alignment, so a work-group
-    # takes ONE row there (a pair could straddle a segment boundary); see the build.
+    # takes ONE row there (a pair could straddle a segment boundary); see the build. A pair
+    # also shares one band range, taken from its first row: an odd Sq lets it straddle two
+    # batches, and an odd causal offset hands the second row a diagonal band the first lacks,
+    # so those take one row per work-group as well.
     num_seg = (cu[0].numel() - 1) if cu is not None else 1
-    rpw = 1 if cu is not None else 2
+    rpw = 1 if (cu is not None or Sq % 2 or causal_offset % 2) else 2
     rpw_hd = rpw * num_heads * head_dim
     # rows_per_wg*Hq*D must tile the reduce's block*vec8*uc chunk; any tiling uc/block is
     # bitwise-identical (see build), trading only the co-resident register footprint. The
@@ -5244,11 +5255,12 @@ def _get_bwd(
     band_span=0,
     a16=False,
 ):
-    # batch_size is baked only into the SBHD seq-step stride (RD_STRIDE_*); THD takes it as a
-    # runtime kernel argument. Keeping it in the key there rebuilds the module -- and so
-    # recompiles -- for every num_seq an e2e run happens to hit.
-    if not sbhd:
-        batch_size = None
+    # batch_size stays in the key on every layout, because every body bakes it: SBHD into its
+    # seq-step stride (RD_STRIDE_*), and THD into the fused dQ workspace -- the dense body's
+    # band stride (one slab per batch) and the ragged body's reads of cu_seqlens[num_seg]
+    # (total_q) and of the band-group row one entry past the kv table. Dropping it for THD
+    # trips the builder's "fused dQ needs compile-time B" assert. THD therefore builds one
+    # module per batch size / segment count.
     key = (
         Hq,
         Hkv,

@@ -32,6 +32,10 @@ SEQLEN_PATTERNS = [
     pytest.param(([128, 256, 512, 1024], [128, 256, 512, 1024])),
     pytest.param(([57, 311, 800, 173], [57, 311, 800, 173])),
     pytest.param(([2048, 64, 64, 64], [2048, 64, 64, 64])),
+    # Odd lengths: the FlyDSL dQ reduce folds odd rows one per work-group; a batch of one with
+    # Hkv=4 also takes the dK/dV slot fold's torch fallback.
+    pytest.param(([777], [777])),
+    pytest.param(([777, 777], [777, 777])),
 ]
 
 
