@@ -31,8 +31,18 @@ from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from primus_turbo.flydsl.utils.prims import LOG2E
 
+# FlyDSL's on-disk kernel cache hashes the kernel/launcher source, helpers from their own directory
+# and closure scalars -- not this module (nor prims.py), so code emitted from here reaches that key
+# only through DualwaveSwpTraits.cache_tag. Bump it with any change here that alters a generated
+# kernel, or a warm cache keeps serving the old one.
+CODEGEN_REV = 1
+
 # Room a later key has above a tile's row max before it forces another rebase.
 REF_MARGIN = 96.0
+
+# A reference at or below this is still the -3e38 floor of a row that has met no live key yet.
+# Such a row seeds its QK with 0: seeding -reference would swamp every score it accumulates.
+SEED_FLOOR_LIMIT = -1.0e30
 
 # Slack on the Cauchy-Schwarz logit bound: the fp32 norm reductions on both sides, plus the
 SCORE_BOUND_SLACK = 1.0 + 2.0**-6
@@ -382,6 +392,7 @@ class DualwaveSwpTraits:
     @property
     def cache_tag(self):
         return (
+            CODEGEN_REV,
             self.NUM_HEADS_Q,
             self.NUM_HEADS_KV,
             self.HEAD_DIM,
@@ -574,6 +585,9 @@ class DualwaveKernelContext:
         self.SINK = SINK
         self.ScoreBound = ScoreBound
         self.use_score_bound = ScoreBound is not None and traits.HEAD_DIM <= SCORE_BOUND_HEAD_DIM_MAX
+        # Without the bound floor, a row whose prologue tile is wholly masked keeps the floor as its
+        # reference; only a left window can still hand such a row live keys in a later tile.
+        self.seed_floored = not self.use_score_bound and traits.CAUSAL and traits.WINDOW_LEFT >= 0
         self.bound_over_ref = None
         self.q_norm_sq = None
         self.Q = Q
@@ -989,7 +1003,7 @@ class DualwaveKernelContext:
         self.bound_over_ref = _wave_any(ArithValue(fx.Float32(bound) > fx.Float32(ref)))
 
     def score_acc_seed(self):
-        """QK accumulates into C, so seeding C with -reference shifts the scores for free."""
+        """QK accumulates into C, so seeding C with -seed_offset(reference) shifts the scores for free."""
         if self.ref_neg is None:
             return self.c_zero_v16f32
         if self.ref_seed_vec is None:
@@ -1003,8 +1017,19 @@ class DualwaveKernelContext:
     def lift_ref(self, m_row):
         return _fadd(m_row, fx.Float32(REF_MARGIN), self.fm_fast)
 
+    def seed_offset(self, ref):
+        """What the QK seed subtracts: the reference, or 0 while it is still the masked-row floor.
+
+        fl(3e38 + q.k) is 3e38, so seeding a floored row would hand its first live tile identical
+        scores. Seeding it with 0 keeps those scores exact; rebase_if_needed then lifts the row to
+        that tile's maximum plus REF_MARGIN, as if the tile had been the prologue."""
+        if const_expr(not self.seed_floored):
+            return ref
+        ref = fx.Float32(ref)
+        return fx.Float32(ArithValue(ref > fx.Float32(SEED_FLOOR_LIMIT)).select(ref, self.c_zero_f))
+
     def set_ref(self, ref):
-        self.ref_neg = _fsub(self.c_zero_f, ref, self.fm_fast)
+        self.ref_neg = _fsub(self.c_zero_f, self.seed_offset(ref), self.fm_fast)
         self.ref_seed_vec = None
 
     def qk(self, v_k, q_all_scaled_bf16, v_s=None, ks_range=None):
@@ -1261,10 +1286,20 @@ class DualwaveKernelContext:
         if isinstance(v_s[0], list):
             v_s = _score_lists_to_vecs(v_s)
         gated = self.bound_over_ref is not None
+        # Only a row without the score-bound floor can sit at the floor, and those take the exact trigger.
+        assert not (gated and self.seed_floored), "a floored seed needs the exact per-tile trigger"
         if const_expr(not gated):
             m_lane_always = _reduce_score_tree(v_s, _fmax, self.fm_fast)
             assert pending is None, "an exact trigger cannot pay another site's debt"
-            fired = _wave_any(ArithValue(fx.Float32(m_lane_always) > self.c_zero_f))
+            if const_expr(self.seed_floored):
+                # The scores are s - off, off being what the seed subtracted (see seed_offset). A row
+                # outruns its reference once a score clears ref - off: +0 for a seeded row, and the
+                # floor itself for one that has met no live key, which any live score clears.
+                off = _fsub(self.c_zero_f, Vec(as_mlir_value(self.score_acc_seed()))[0], self.fm_fast)
+                ref_over_off = _fsub(ref, off, self.fm_fast)
+                fired = _wave_any(ArithValue(fx.Float32(m_lane_always) > fx.Float32(ref_over_off)))
+            else:
+                fired = _wave_any(ArithValue(fx.Float32(m_lane_always) > self.c_zero_f))
         else:
             fired = self.bound_over_ref
         seed_in = self.score_acc_seed()
@@ -1277,9 +1312,19 @@ class DualwaveKernelContext:
             m_tile = _lane_pair_reduce(m_lane, _fmax, self.fm_fast)
             if const_expr(self.traits.CAUSAL):
                 m_tile = self.floor_masked_max(m_tile)
-            delta = _fmax(_fadd(m_tile, fx.Float32(REF_MARGIN), self.fm_fast), self.c_zero_f, self.fm_fast)
-            r = fx.Float32(rocdl.exp2(T.f32, _fsub(self.c_zero_f, delta, self.fm_fast)))
-            out = [_fadd(ref, delta, self.fm_fast), self.scale_l_by(l_row, r)]
+            if const_expr(self.seed_floored):
+                # New reference max(ref, off + m_tile + margin), carried relative to off. A floored
+                # row adopts its first live tile's maximum + margin (r is 0 against an empty sum);
+                # one whose tile is masked too keeps the floor, with r = 1.
+                delta = _fmax(_fadd(m_tile, fx.Float32(REF_MARGIN), self.fm_fast), ref_over_off, self.fm_fast)
+                r = fx.Float32(rocdl.exp2(T.f32, _fsub(ref_over_off, delta, self.fm_fast)))
+                out = [_fadd(off, delta, self.fm_fast), self.scale_l_by(l_row, r)]
+            else:
+                delta = _fmax(
+                    _fadd(m_tile, fx.Float32(REF_MARGIN), self.fm_fast), self.c_zero_f, self.fm_fast
+                )
+                r = fx.Float32(rocdl.exp2(T.f32, _fsub(self.c_zero_f, delta, self.fm_fast)))
+                out = [_fadd(ref, delta, self.fm_fast), self.scale_l_by(l_row, r)]
             for half in v_s:
                 out.append(
                     Vec.from_elements(
@@ -1290,9 +1335,11 @@ class DualwaveKernelContext:
                         fx.Float32,
                     ).ir_value()
                 )
+            # The next tile's seed goes through seed_offset too: a row still at the floor after a
+            # rebase other rows fired must stay unseeded.
             out.append(
                 Vec.from_elements(
-                    [as_mlir_value(_fsub(self.c_zero_f, out[0], self.fm_fast))], fx.Float32
+                    [as_mlir_value(_fsub(self.c_zero_f, self.seed_offset(out[0]), self.fm_fast))], fx.Float32
                 ).broadcast_to(16)
             )
             out += self._scale_acc(v_o, r if pending is None else pending[1])
