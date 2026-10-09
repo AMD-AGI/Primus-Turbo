@@ -1,0 +1,12 @@
+# What the image adds to the base image. Versions are pinned by constraints.txt.
+
+# TorchTitan's dependencies (third_party/torchtitan/pyproject.toml in Primus) that the base image
+# lacks. If they are not installed when training starts, Primus skips its turbo-attention patch
+# and TorchTitan's own attention then fails with an enable_gqa TypeError.
+tensorboard
+tomli
+torchdata
+tyro
+
+# The FlyDSL release Primus-Turbo's gfx1250 attention kernels need (the base image ships 0.2.4).
+flydsl==0.3.4.1
