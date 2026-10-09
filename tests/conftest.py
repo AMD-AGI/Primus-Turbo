@@ -36,6 +36,8 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_grouped_gemm.py",
     # Dense FlyDSL attention (primus_turbo/flydsl/attention/gfx1250), bf16 head_dim 128.
     "tests/pytorch/ops/test_attention_flydsl_gfx1250.py",
+    # Opt-in aten.mm layout rewrite for hipBLASLt (primus_turbo/pytorch/core/mm_layout_workaround.py).
+    "tests/pytorch/core/test_mm_layout_workaround.py",
 )
 
 
