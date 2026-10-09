@@ -19,6 +19,9 @@ Two entry points share the same kernel sequence (all FlyDSL composition lives in
     (stage2's SwiGLU^T -> stage1's combine) rides back on the gradient slot of
     ``dispatch_weights`` (a differentiable stage1 output / stage2 input), so stage2.backward
     returns it as d/d(dispatch_weights) and autograd delivers it to stage1.backward.
+
+The gated activation defaults to SiLU-SwiGLU; pass a :class:`GLUActivation` (e.g.
+``GLUActivation.swigluoai()``) to the op that owns it -- ``fused_mega_moe`` or stage2.
 """
 
 from typing import Optional, Tuple
@@ -26,6 +29,7 @@ from typing import Optional, Tuple
 import torch
 from torch.distributed import ProcessGroup
 
+from primus_turbo.flydsl.utils.glu_activation import GLUActivation
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.kernels.fused_mega_moe import (
     fused_mega_moe_backward_impl,
@@ -38,6 +42,7 @@ from primus_turbo.pytorch.kernels.fused_mega_moe import (
 
 __all__ = [
     "FusedMegaMoEFunction",
+    "GLUActivation",
     "fused_mega_moe",
     "fused_mega_moe_stage1",
     "fused_mega_moe_stage2",
@@ -56,6 +61,7 @@ class FusedMegaMoEFunction(torch.autograd.Function):
         w1: torch.Tensor,
         w2: torch.Tensor,
         group: ProcessGroup,
+        activation: Optional[GLUActivation],
     ) -> torch.Tensor:
         with torch.profiler.record_function("fused_mega_moe_forward"):
             # Validate at the op boundary so failures point here, not deep in FlyDSL.
@@ -90,6 +96,7 @@ class FusedMegaMoEFunction(torch.autograd.Function):
                 topk_weights,
                 "nt",
                 BackendType.FLYDSL.value,
+                activation,
             )
 
             # stash everything backward needs
@@ -98,6 +105,7 @@ class FusedMegaMoEFunction(torch.autograd.Function):
                 dispatch_weights_in_buf = dispatch_weights_in_buf.clone()
 
                 ctx.group = group
+                ctx.activation = activation
                 ctx.num_tokens = num_tokens
                 ctx.num_topk = num_topk
                 ctx.save_for_backward(
@@ -118,7 +126,7 @@ class FusedMegaMoEFunction(torch.autograd.Function):
         with torch.profiler.record_function("fused_mega_moe_backward"):
             # grad_y is None when the output got no grad
             if grad_y is None:
-                return (None,) * 6
+                return (None,) * 7
             saved_x, l1_out, dispatch_weights_in_buf, w1, w2, topk_idx, *handle = ctx.saved_tensors
             handle = tuple(handle)
 
@@ -136,15 +144,17 @@ class FusedMegaMoEFunction(torch.autograd.Function):
                 ctx.num_tokens,
                 ctx.num_topk,
                 BackendType.FLYDSL.value,
+                ctx.activation,
             )
 
-            # grads for (x, topk_idx, topk_weights, w1, w2, group)
+            # grads for (x, topk_idx, topk_weights, w1, w2, group, activation)
             return (
                 dx,
                 None,
                 grad_topk_weights,
                 dW1,
                 dW2,
+                None,
                 None,
             )
 
@@ -156,9 +166,13 @@ def fused_mega_moe(
     topk_weights: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
+    activation: Optional[GLUActivation] = None,
 ) -> torch.Tensor:
-    """One fully fused mega MoE forward; the symmetric buffer is fetched (and cached) internally."""
-    return FusedMegaMoEFunction.apply(x, topk_idx, topk_weights, w1, w2, group)
+    """One fully fused mega MoE forward; the symmetric buffer is fetched (and cached) internally.
+
+    ``activation`` is the gated activation between the two GEMMs; ``None`` is SiLU-SwiGLU.
+    """
+    return FusedMegaMoEFunction.apply(x, topk_idx, topk_weights, w1, w2, group, activation)
 
 
 class FusedMegaMoEStage1Function(torch.autograd.Function):
@@ -232,17 +246,19 @@ class FusedMegaMoEStage2Function(torch.autograd.Function):
         topk_weights: torch.Tensor,
         w2: torch.Tensor,
         group: ProcessGroup,
+        activation: Optional[GLUActivation],
         *handle,
     ) -> torch.Tensor:
         with torch.profiler.record_function("fused_mega_moe_stage2_forward"):
             assert w2.is_cuda and w2.dim() == 3, "w2 must be a 3D CUDA tensor"
             handle = tuple(handle)
 
-            y = fused_mega_moe_stage2_forward_impl(l1_out, w2, handle, topk_idx, topk_weights)
+            y = fused_mega_moe_stage2_forward_impl(l1_out, w2, handle, topk_idx, topk_weights, activation)
 
             ctx.set_materialize_grads(False)
             if any(ctx.needs_input_grad):
                 ctx.group = group
+                ctx.activation = activation
                 ctx.handle = handle
                 # dispatch_weights is unused in forward; saved only as the SwiGLU^T scale in backward
                 ctx.save_for_backward(l1_out, dispatch_weights, w2)
@@ -254,16 +270,16 @@ class FusedMegaMoEStage2Function(torch.autograd.Function):
         """grad l1_out (via L2 dgrad + SwiGLU^T) + dW2; grad_gate rides the dispatch_weights slot."""
         with torch.profiler.record_function("fused_mega_moe_stage2_backward"):
             handle = ctx.handle
-            n_in = 6 + len(handle)
+            n_in = 7 + len(handle)
             if grad_y is None:
                 return (None,) * n_in
             l1_out, dispatch_weights, w2 = ctx.saved_tensors
 
             grad_l1, grad_gate, dW2 = fused_mega_moe_stage2_backward_impl(
-                grad_y, l1_out, dispatch_weights, w2, handle, ctx.group
+                grad_y, l1_out, dispatch_weights, w2, handle, ctx.group, ctx.activation
             )
 
-            # grads for (l1_out, dispatch_weights, topk_idx, topk_weights, w2, group, *handle)
+            # grads for (l1_out, dispatch_weights, topk_idx, topk_weights, w2, group, activation, *handle)
             # dispatch_weights slot carries grad_gate back to stage1.backward.
             return (
                 grad_l1,
@@ -271,6 +287,7 @@ class FusedMegaMoEStage2Function(torch.autograd.Function):
                 None,
                 None,
                 dW2.to(w2.dtype),
+                None,
                 None,
                 *((None,) * len(handle)),
             )
@@ -300,8 +317,12 @@ def fused_mega_moe_stage2(
     topk_weights: torch.Tensor,
     w2: torch.Tensor,
     group: ProcessGroup,
+    activation: Optional[GLUActivation] = None,
 ) -> torch.Tensor:
-    """Stage2 gate-down. Consumes stage1's ``(l1_out, dispatch_weights, handle)``; returns y."""
+    """Stage2 gate-down. Consumes stage1's ``(l1_out, dispatch_weights, handle)``; returns y.
+
+    Stage2 owns the gated activation, so ``activation`` (``None`` = SiLU-SwiGLU) is given here only.
+    """
     return FusedMegaMoEStage2Function.apply(
-        l1_out, dispatch_weights, topk_idx, topk_weights, w2, group, *handle
+        l1_out, dispatch_weights, topk_idx, topk_weights, w2, group, activation, *handle
     )

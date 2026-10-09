@@ -37,7 +37,12 @@ from primus_turbo.flydsl.mega.bf16.symm_buffer import (  # noqa: E402
     get_symm_buffer_for_mega_moe,
 )
 from primus_turbo.pytorch.ops import grouped_gemm as _turbo_gg  # noqa: E402
-from primus_turbo.pytorch.ops.moe.fused_mega_moe import fused_mega_moe  # noqa: E402
+from primus_turbo.pytorch.ops.moe.fused_mega_moe import (  # noqa: E402
+    GLUActivation,
+    fused_mega_moe,
+    fused_mega_moe_stage1,
+    fused_mega_moe_stage2,
+)
 from tests.pytorch.test_utils import compute_snr  # noqa: E402
 
 # bf16 fused vs bf16 turbo ref; comm + split-role reduce add noise -> use MegaMoE-family SNR floor.
@@ -55,26 +60,43 @@ skip_unless_gfx950 = unittest.skipUnless(
 )
 
 
-def _weighted_swiglu(fc1_out, weights):
-    """SwiGLU with a per-token routing weight (matches Megatron weighted_bias_swiglu)."""
-    gate, up = fc1_out.chunk(2, dim=-1)
-    return F.silu(gate) * up * weights
+def _weighted_glu(fc1_out, weights, activation=None):
+    """The gated activation with a per-token routing weight.
+
+    ``None`` is SiLU-SwiGLU (matches Megatron weighted_bias_swiglu). A ``GLUActivation`` is evaluated
+    in fp32 with ``torch.clamp``, whose autograd -- gradient passes where the input is inside the
+    range -- is the reference backward, as in Megatron's ``weighted_bias_quick_geglu_impl``."""
+    if activation is None:
+        gate, up = fc1_out.chunk(2, dim=-1)
+        return F.silu(gate) * up * weights
+    a = activation
+    gate, up = fc1_out.float().chunk(2, dim=-1)
+    if a.gate_clamp_lo is not None or a.gate_clamp_hi is not None:
+        gate = gate.clamp(min=a.gate_clamp_lo, max=a.gate_clamp_hi)
+    if a.up_clamp is not None:
+        up = up.clamp(-a.up_clamp, a.up_clamp)
+    return gate * torch.sigmoid(a.alpha * gate) * (up + a.glu_offset) * weights
 
 
 def generate_inputs(
-    rank, world, *, num_tokens, hidden, inter, num_experts, num_topk, device="cuda", seed=1234
+    rank, world, *, num_tokens, hidden, inter, num_experts, num_topk, device="cuda", seed=1234, l1_gain=1.0
 ):
     """One rank's local MoE inputs: x, this rank's L1/L2 expert shard, random top-k routing.
 
     The generator is seeded here and does NOT read the ambient RNG, so two calls with the same
     ``seed`` return identical tensors however the caller seeded torch in between. Callers that want
     genuinely different data -- a second micro-batch, a second layer -- must pass a different
-    ``seed``; ``torch.manual_seed`` in front of the call does nothing."""
+    ``seed``; ``torch.manual_seed`` in front of the call does nothing.
+
+    ``l1_gain`` scales the L1 weights; the default leaves the L1 output at std ~2, and a clamped
+    activation needs it wider to land beyond its limit often enough to matter."""
     epr = num_experts // world
     g = torch.Generator(device=device).manual_seed(seed + rank)
     x = torch.randn((num_tokens, hidden), generator=g, device=device, dtype=torch.float32).bfloat16()
     l1_weight = torch.randn((epr, 2 * inter, hidden), generator=g, device=device, dtype=torch.bfloat16)
     l1_weight *= 2.0 / math.sqrt(hidden)
+    if l1_gain != 1.0:
+        l1_weight *= l1_gain
     l2_weight = torch.randn((epr, hidden, inter), generator=g, device=device, dtype=torch.bfloat16)
     l2_weight *= 2.0 / math.sqrt(inter)
 
@@ -83,7 +105,9 @@ def generate_inputs(
     return x, l1_weight, l2_weight, topk_idx.to(torch.int64), topk_weight.to(torch.float32)
 
 
-def baseline_reference(group, x, topk_idx, topk_weight, l1_weight, l2_weight, *, num_experts, num_topk):
+def baseline_reference(
+    group, x, topk_idx, topk_weight, l1_weight, l2_weight, *, num_experts, num_topk, activation=None
+):
     """Turbo DeepEP MoE forward; differentiable in x/l1/l2/topk_weight -> serves as the backward ref."""
     # scatter (differentiable) routes topk_weight grad straight back through the reference
     gate_logits = torch.zeros(x.shape[0], num_experts, device=x.device, dtype=torch.float32).scatter(
@@ -101,7 +125,7 @@ def baseline_reference(group, x, topk_idx, topk_weight, l1_weight, l2_weight, *,
     )
     group_lens = tokens_per_expert.to(device=x.device, dtype=torch.int64)
     fc1_out = _turbo_gg(permuted_hidden, l1_weight, group_lens, trans_b=True)
-    inter = _weighted_swiglu(fc1_out, permuted_probs.unsqueeze(-1)).to(x.dtype)
+    inter = _weighted_glu(fc1_out, permuted_probs.unsqueeze(-1), activation).to(x.dtype)
     fc2_out = _turbo_gg(inter, l2_weight, group_lens, trans_b=True)
     return dispatcher.token_combine(fc2_out)
 
@@ -119,8 +143,11 @@ def _test_forward_backward_impl(
     num_topk,
     enable_cudagraph=False,
     enable_torch_compile=False,
+    activation=None,
+    staged=False,
 ):
-    """tc-free fwd+bwd of fused_mega_moe vs turbo; returns (tag, actual, ref) triples, frees symm."""
+    """tc-free fwd+bwd of fused_mega_moe (or, with ``staged``, the stage1+stage2 pair training
+    drives) vs turbo; returns (tag, actual, ref) triples, frees symm."""
     try:
         # Normalize grad_out by tensor norm so gradient-independent floors remain visible.
         _gy = torch.randn(x.shape, device=x.device, dtype=torch.float32)
@@ -128,7 +155,12 @@ def _test_forward_backward_impl(
 
         # fused runner over grad-carrying inputs; topk_idx stays a constant closure
         def _fused(x, topk_weight, l1_weight, l2_weight):
-            return fused_mega_moe(group, x, topk_idx, topk_weight, l1_weight, l2_weight)
+            if staged:
+                l1_out, dwib, handle = fused_mega_moe_stage1(x, topk_idx, topk_weight, l1_weight, group)
+                return fused_mega_moe_stage2(
+                    l1_out, dwib, handle, topk_idx, topk_weight, l2_weight, group, activation
+                )
+            return fused_mega_moe(group, x, topk_idx, topk_weight, l1_weight, l2_weight, activation)
 
         runner = _fused
         if enable_torch_compile:
@@ -163,6 +195,7 @@ def _test_forward_backward_impl(
             l2_t,
             num_experts=num_experts,
             num_topk=num_topk,
+            activation=activation,
         )
         dx_t, dl1_t, dl2_t, dtw_t = torch.autograd.grad(y_t, [x_t, l1_t, l2_t, tw_t], grad_y)
 
@@ -201,7 +234,7 @@ class FusedMegaMoETestBase(MultiProcContinuousTest):
         torch.cuda.set_device(self.device)
         torch.manual_seed(42 + self.rank)
 
-    def _inputs(self, num_tokens, hidden, inter, num_experts, num_topk):
+    def _inputs(self, num_tokens, hidden, inter, num_experts, num_topk, l1_gain=1.0):
         return generate_inputs(
             self.rank,
             self.world_size,
@@ -211,6 +244,7 @@ class FusedMegaMoETestBase(MultiProcContinuousTest):
             num_experts=num_experts,
             num_topk=num_topk,
             device=self.device,
+            l1_gain=l1_gain,
         )
 
     def _symm(self, group, num_tokens, hidden, inter, num_experts, num_topk):
@@ -286,6 +320,63 @@ class FusedMegaMoETestBase(MultiProcContinuousTest):
             num_topk=num_topk,
             enable_cudagraph=enable_cudagraph,
             enable_torch_compile=enable_torch_compile,
+        )
+        for tag, actual, ref in results:
+            self._assert_snr(actual, ref, tag=tag)
+
+    # ── MiniMax-M3's swigluoai: the same comparison with the activation threaded through ──
+    # l1_gain 2.5 widens the L1 output to std ~5, so ~8% of gates land above +7, ~8% below -7 and
+    # ~16% of ups beyond +-7. SNR cannot see the gate's one-sided clamp (below -7 the gate term is
+    # ~1e-5 either way); tests/pytorch/ops/test_mega_moe_activation.py checks that per regime.
+    @skip_unless_gfx950
+    @skip_if_lt_x_gpu(8)
+    @parametrize(
+        "hidden, inter, num_experts, num_topk, num_tokens",
+        [
+            # MiniMax-M3's expert shape, at this class's token count.
+            (6144, 3072, 128, 4, 8192),
+        ],
+    )
+    @parametrize(
+        "staged, enable_cudagraph, enable_torch_compile",
+        [
+            (True, False, False),
+            (False, False, False),
+            (False, True, False),
+            (False, False, True),
+        ],
+    )
+    def test_forward_backward_swigluoai(
+        self,
+        hidden,
+        inter,
+        num_experts,
+        num_topk,
+        num_tokens,
+        staged,
+        enable_cudagraph,
+        enable_torch_compile,
+    ):
+        self._setup_device()
+        group = dist.group.WORLD
+        x, l1_weight, l2_weight, topk_idx, topk_weight = self._inputs(
+            num_tokens, hidden, inter, num_experts, num_topk, l1_gain=2.5
+        )
+        symm = self._symm(group, num_tokens, hidden, inter, num_experts, num_topk)
+        results = _test_forward_backward_impl(
+            group,
+            symm,
+            x,
+            l1_weight,
+            l2_weight,
+            topk_idx,
+            topk_weight,
+            num_experts=num_experts,
+            num_topk=num_topk,
+            enable_cudagraph=enable_cudagraph,
+            enable_torch_compile=enable_torch_compile,
+            activation=GLUActivation.swigluoai(),
+            staged=staged,
         )
         for tag, actual, ref in results:
             self._assert_snr(actual, ref, tag=tag)

@@ -83,20 +83,18 @@ static inline int get_num_cpu_timeout_secs() {
     return timeout;
 }
 
-// The cheap fence replaces the release store's system-scope write-back with a per-wave s_waitcnt
-// (st_release_sys_global in the deep_ep utils header). That waitcnt covers only the wave that
-// publishes the channel tail, while the payload rows are written by the other waves of the group,
-// and the RELAXED store drops the write-back the receiver needs -- so a receiver can see the new
-// tail while those rows still sit in the sender's L2 and read the previous round's contents
-// instead. Measured on gfx950 (EP=8, DSv3, intranode dispatch): 7 of 8 short runs carried 1-6
-// corrupted rows out of 8192, and 50-iter bf16 loss landed at 6.2066 against a 4.5206 DeepEP-off
-// reference. The corruption is silent -- it lands in gradients -- so it must not be what a caller
-// gets by default. The plain release store costs 2.7% more per step; set
-// PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE=0 to take the cheap fence back, and its hazard with it.
+// Selects how the intranode dispatch / combine channels publish their ring-buffer tails (see the
+// cheap-fence notes in the deep_ep utils header). The cheap fence, the default, has every sending
+// warp drain its own payload stores before the tail is published and reads the payload with
+// system-scope loads. The full fence instead makes the tail store a system-scope release and the
+// poll an acquire, which adds a GPU-wide L2 write-back per publish and a cache invalidate per
+// poll: on gfx950 (EP=8, DSv3 shapes, 32 CUs) that makes dispatch 23-30% and combine 35% slower,
+// and GEMMs running alongside 12% slower. Set PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE=1 for the
+// full fence; gfx1250 always uses it.
 inline static bool is_enable_cheap_fence() {
     char const *v = std::getenv("PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE");
     if (!v || v[0] == '\0')
-        return false;
+        return true;
     return std::stoi(v) == 0;
 }
 

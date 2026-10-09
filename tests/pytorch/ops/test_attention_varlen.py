@@ -14,6 +14,10 @@ from primus_turbo.pytorch.core.backend import (
     GlobalBackendManager,
     PrecisionType,
 )
+from primus_turbo.pytorch.core.utils import is_gfx950
+from primus_turbo.pytorch.kernels.attention.attention_flydsl_impl import (
+    flash_attn_varlen_flydsl_forward_impl,
+)
 from primus_turbo.pytorch.ops import flash_attn_varlen_func
 from tests.pytorch.ref.attention_ref import attention_varlen_forward_pytorch_ref_impl
 from tests.pytorch.test_utils import compute_snr, pinned_backend_takes
@@ -32,6 +36,10 @@ SEQLEN_PATTERNS = [
     pytest.param(([128, 256, 512, 1024], [128, 256, 512, 1024])),
     pytest.param(([57, 311, 800, 173], [57, 311, 800, 173])),
     pytest.param(([2048, 64, 64, 64], [2048, 64, 64, 64])),
+    # Odd lengths: the FlyDSL dQ reduce folds odd rows one per work-group; a batch of one with
+    # Hkv=4 also takes the dK/dV slot fold's torch fallback.
+    pytest.param(([777], [777])),
+    pytest.param(([777, 777], [777, 777])),
 ]
 
 
@@ -143,6 +151,83 @@ def test_flash_attn_varlen(
     assert dq_snr > 40, f"dq_snr too low: {dq_snr}"
     assert dk_snr > 40, f"dk_snr too low: {dk_snr}"
     assert dv_snr > 40, f"dv_snr too low: {dv_snr}"
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available() and is_gfx950()), reason="FlyDSL attention is gfx950-only")
+@pytest.mark.parametrize("head_dim", [64, 128])
+# Each window leaves rows whose prologue KV tile lies wholly left of it (at BLOCK_M 64 and 128 alike);
+# 300 sits off the 64-key tile grid.
+@pytest.mark.parametrize("window_size_left", [64, 127, 300])
+@pytest.mark.parametrize(
+    "seqlens_q,seqlens_k,num_head_q,num_head_kv,with_sink",
+    [
+        ([2048], [2048], 8, 1, False),  # GQA 8, merged CTA
+        ([1000, 1000], [1000, 1000], 8, 8, False),  # MHA, two segments ending in a partial q block
+        ([512], [1536], 16, 2, True),  # bottom-right cross-seqlen, with a sink
+    ],
+    ids=["gqa8", "mha-2seg", "cross-sink"],
+)
+def test_flydsl_swa_forward_lse(
+    head_dim, window_size_left, seqlens_q, seqlens_k, num_head_q, num_head_kv, with_sink
+):
+    """A left window can leave a row's prologue KV tile wholly masked; its first live tile must
+    still be scored exactly. Checks the LSE and every row: the defect this guards (head dim 128
+    has no score-bound floor) hit only such rows, and showed in the LSE before the SNR."""
+    device = "cuda"
+    torch.manual_seed(10007)
+    cu_seqlens_q, max_seqlen_q, total_q = _build_cu_seqlens(seqlens_q, device)
+    cu_seqlens_k, max_seqlen_k, total_k = _build_cu_seqlens(seqlens_k, device)
+    q = torch.randn((total_q, num_head_q, head_dim), device=device, dtype=torch.bfloat16)
+    k = torch.randn((total_k, num_head_kv, head_dim), device=device, dtype=torch.bfloat16)
+    v = torch.randn((total_k, num_head_kv, head_dim), device=device, dtype=torch.bfloat16)
+    sink = torch.randn((num_head_q,), device=device, dtype=torch.float32) if with_sink else None
+
+    out, lse = flash_attn_varlen_flydsl_forward_impl(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        causal=True,
+        window_size=(window_size_left, 0),
+        return_lse=True,
+        sink=sink,
+    )
+
+    group = num_head_q // num_head_kv
+    out_ref = torch.empty_like(out, dtype=torch.float32)
+    lse_ref = torch.empty_like(lse)
+    q0 = k0 = 0
+    for sq, skv in zip(seqlens_q, seqlens_k):
+        qh = q[q0 : q0 + sq].float().transpose(0, 1)
+        kh = k[k0 : k0 + skv].float().transpose(0, 1).repeat_interleave(group, 0)
+        vh = v[k0 : k0 + skv].float().transpose(0, 1).repeat_interleave(group, 0)
+        scores = qh @ kh.transpose(-1, -2) * head_dim ** (-0.5)
+        i = torch.arange(sq, device=device)[:, None] + (skv - sq)
+        j = torch.arange(skv, device=device)[None, :]
+        scores.masked_fill_(~((j <= i) & (j >= i - window_size_left)), float("-inf"))
+        if sink is not None:
+            # The sink is a key with logit sink[h] and a zero value.
+            scores = torch.cat([scores, sink[:, None, None].expand(-1, sq, 1)], dim=-1)
+            vh = torch.cat([vh, vh.new_zeros((num_head_q, 1, head_dim))], dim=1)
+        out_ref[q0 : q0 + sq] = (torch.softmax(scores, dim=-1) @ vh).transpose(0, 1)
+        lse_ref[q0 : q0 + sq] = torch.logsumexp(scores, dim=-1).transpose(0, 1)
+        q0, k0 = q0 + sq, k0 + skv
+
+    # Measured on these sets: the kernel's own floor (bf16-rounded scaled Q) stays under 0.006 LSE /
+    # 0.01 per row over 20 seeds, while the guarded defect gave 0.25-1.2 LSE and ~1 per row.
+    lse_err = (lse - lse_ref).abs()
+    row_err = (out.float() - out_ref).norm(dim=-1) / out_ref.norm(dim=-1)
+    worst_lse, worst_row = (
+        divmod(int(lse_err.argmax()), num_head_q),
+        divmod(int(row_err.argmax()), num_head_q),
+    )
+    assert lse_err.max() < 1e-2, f"lse max err {lse_err.max():.4g} at (token, head) {worst_lse}"
+    assert row_err.max() < 2e-2, f"row rel err {row_err.max():.4g} at (token, head) {worst_row}"
+    out_snr = compute_snr(out_ref, out)
+    assert out_snr > 40, f"out_snr too low: {out_snr}"
 
 
 def test_flash_attn_varlen_no_grad():

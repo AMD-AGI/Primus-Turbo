@@ -10,6 +10,7 @@
 #pragma once
 #include "primus_turbo/common.h"
 #include "primus_turbo/deep_ep/configs.h"
+#include "primus_turbo/device/memory.cuh"
 
 // gfx12 (gfx1250 / gfx1251, CDNA5) removed the unified `s_waitcnt`; the combined
 // LDS + VMEM wait is expressed via the split counters.
@@ -48,6 +49,9 @@
 
 #define sync_barrier_init() BARRIER_SYNC_INIT()
 #define sync_barrier(bar_id, num_threads) BARRIER_SYNC(__threadfence_block(), bar_id, num_threads)
+// The barrier in front of a channel-tail publish; see `publish_barrier_fence`.
+#define sync_barrier_before_publish(kCheapFence, bar_id, num_threads)                              \
+    BARRIER_SYNC(publish_barrier_fence<kCheapFence>(), bar_id, num_threads)
 
 #define UNROLLED_WARP_COPY(UNROLL_FACTOR, LANE_ID, N, DST, SRC, LD_FUNC, ST_FUNC)                  \
     {                                                                                              \
@@ -315,6 +319,80 @@ template <> __device__ __forceinline__ void st_na_global(const float *ptr, const
 template <> __device__ __forceinline__ void st_na_global(const int4 *ptr, const int4 &value) {
     int4 *non_const_ptr = const_cast<int4 *>(ptr);
     *non_const_ptr      = value;
+}
+
+// Cheap fence for the intranode channel ring buffers.
+//
+// A channel's payload slots are written by every warp of a rank group, and one warp then
+// publishes the new tail with a relaxed system-scope store. The full fence makes that store a
+// release and the receiver's poll an acquire, which on gfx942 / gfx950 costs a GPU-wide L2
+// write-back per publish and an L1 + L2 invalidate per poll -- both stall concurrent kernels too.
+// The cheap fence keeps neither and instead:
+//   1. has every sending warp wait for its own stores (`s_waitcnt vmcnt(0)`) before the barrier
+//      in front of the publish. The channel buffers are uncached (`hipDeviceMallocUncached`), so a
+//      store to them is acknowledged only once it has reached memory, local or peer: by the time
+//      the tail is stored, all of the group's payload is visible at system scope. A waitcnt in
+//      the publishing warp alone covers only its own stores.
+//   2. reads the payload with system-scope loads, which miss every GPU cache and so cannot return
+//      a slot's previous contents.
+// Other targets (gfx1250) encode cache policy and wait counters differently; they keep the full
+// fence.
+#if defined(__gfx942__) || defined(__gfx950__)
+constexpr bool kHasCheapFence = true;
+#else
+constexpr bool kHasCheapFence = false;
+#endif
+
+// Buffer-load cache policy on gfx942 / gfx950: SC0 (1) | SC1 (16) is system scope, NT (2) marks
+// the access as streaming.
+constexpr int32_t kSysScopeStreamCPol = 0x13;
+
+// HIP makes every call convergent, which would keep loops around this from unrolling; the
+// intrinsic itself is not.
+__device__ __attribute__((noconvergent)) device::int32x4_t
+llvm_amdgcn_raw_buffer_load_v4i32(device::int32x4_t rsrc, int32_t voffset, int32_t soffset,
+                                  int32_t cpol) __asm("llvm.amdgcn.raw.buffer.load.v4i32");
+
+// Reads of a channel's `int4` payload slots by whole warps. `base` must be the same in every
+// lane, and the element pointers handed to `ld` must lie less than 4 GiB past it.
+// `kSysScope = false` is the full fence's plain load. The system-scope variant is a buffer
+// descriptor, built with a `readfirstlane`; that is convergent and keeps a loop with a runtime
+// trip count from unrolling, so construct it outside the token loops.
+template <bool kSysScope> struct ChannelPayload {
+    __device__ __forceinline__ explicit ChannelPayload(const int4 *) {}
+
+    __device__ __forceinline__ int4 ld(const int4 *ptr) const { return ld_nc_global(ptr); }
+};
+
+template <> struct ChannelPayload<true> {
+    device::BufferSRD srd;
+    const int4       *base;
+
+    __device__ __forceinline__ explicit ChannelPayload(const int4 *base) : srd(base), base(base) {}
+    __device__ __forceinline__ int4 ld(const int4 *ptr) const {
+        auto value = llvm_amdgcn_raw_buffer_load_v4i32(
+            srd.srd, static_cast<int32_t>((ptr - base) * sizeof(int4)), 0, kSysScopeStreamCPol);
+        return *reinterpret_cast<int4 *>(&value);
+    }
+};
+
+// Scalar payload reads (`src_idx`, `topk_idx`, `topk_weights`, `x_scales`). The system-scope
+// variant is a relaxed atomic, which carries SC0 | SC1 and no waitcnt.
+template <bool kSysScope, typename dtype_t>
+__device__ __forceinline__ dtype_t ld_payload(const dtype_t *ptr) {
+    if constexpr (kSysScope)
+        return __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    else
+        return ld_nc_global(ptr);
+}
+
+template <bool kCheapFence> __device__ __forceinline__ void publish_barrier_fence() {
+    __threadfence_block();
+    if constexpr (kCheapFence) {
+        __atomic_signal_fence(__ATOMIC_SEQ_CST);
+        asm volatile(PRIMUS_TURBO_WAIT_ALL_STR ::: "memory");
+        __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    }
 }
 
 __forceinline__ __device__ void get_channel_task_range(int num_tokens, int num_sms, int sm_id,

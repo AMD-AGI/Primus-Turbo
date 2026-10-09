@@ -22,6 +22,7 @@ from typing import Optional
 import torch
 from torch.distributed import ProcessGroup
 
+from primus_turbo.flydsl.utils.glu_activation import GLUActivation
 from primus_turbo.pytorch.kernels.fused_mega_moe import (
     fused_mega_moe_stage1_backward_fp8_impl,
     fused_mega_moe_stage1_forward_fp8_impl,
@@ -171,6 +172,7 @@ class FusedMegaMoEFP8Stage2Function(torch.autograd.Function):
         w2: torch.Tensor,
         group: ProcessGroup,
         state: _Fp8StageState,
+        activation: Optional[GLUActivation],
         *handle,
     ) -> torch.Tensor:
         with torch.profiler.record_function("mega_moe_fp8_stage2_forward"):
@@ -186,12 +188,14 @@ class FusedMegaMoEFP8Stage2Function(torch.autograd.Function):
                 group,
                 topk_idx,
                 topk_weights,
+                activation,
             )
 
             ctx.set_materialize_grads(False)
             if any(ctx.needs_input_grad):
                 ctx.group = group
                 ctx.state = state
+                ctx.activation = activation
                 ctx.handle = handle
                 # dispatch_weights is unused in forward; saved only as the SwiGLU^T scale in backward
                 ctx.save_for_backward(l1, dispatch_weights, w2)
@@ -204,7 +208,7 @@ class FusedMegaMoEFP8Stage2Function(torch.autograd.Function):
         stage1 through ``ctx.state``, so the ``l1`` slot returns None."""
         with torch.profiler.record_function("mega_moe_fp8_stage2_backward"):
             handle = ctx.handle
-            n_in = 7 + len(handle)
+            n_in = 8 + len(handle)
             if grad_y is None:
                 return (None,) * n_in
             l1, dispatch_weights, w2 = ctx.saved_tensors
@@ -223,17 +227,19 @@ class FusedMegaMoEFP8Stage2Function(torch.autograd.Function):
                 handle,
                 ctx.group,
                 state.colwise_meta,
+                ctx.activation,
             )
             state.grad_l1_rowwise_fp8 = grad_l1_rowwise_fp8
             state.grad_l1_colwise_fp8 = grad_l1_colwise_fp8
 
-            # grads for (l1, dispatch_weights, topk_idx, topk_weights, w2, group, state, *handle)
+            # grads for (l1, dispatch_weights, topk_idx, topk_weights, w2, group, state, activation, *handle)
             return (
                 None,
                 grad_gate,
                 None,
                 None,
                 dW2.to(w2.dtype),
+                None,
                 None,
                 None,
                 *((None,) * len(handle)),
@@ -274,8 +280,12 @@ def fused_mega_moe_fp8_stage2(
     topk_weights: torch.Tensor,
     w2: torch.Tensor,
     group: ProcessGroup,
+    activation: Optional[GLUActivation] = None,
 ) -> torch.Tensor:
-    """Stage2 gate-down (MXFP8). Consumes stage1's forward state; returns y."""
+    """Stage2 gate-down (MXFP8). Consumes stage1's forward state; returns y.
+
+    Stage2 owns the gated activation, so ``activation`` (``None`` = SiLU-SwiGLU) is given here only.
+    """
     return FusedMegaMoEFP8Stage2Function.apply(
         l1,
         dispatch_weights,
@@ -284,5 +294,6 @@ def fused_mega_moe_fp8_stage2(
         w2,
         group,
         state,
+        activation,
         *handle,
     )

@@ -6,8 +6,6 @@
 
 from .fused_mega_moe import *
 from .fused_moe_router import *
-from .indices_converter import *
 from .moe_dispatch_combine import *
 from .moe_permute import *
-from .permutation import *
 from .tokens_per_expert_to_mask import *

@@ -1282,6 +1282,70 @@ def test_attention_fp8_with_sparse_do(batch, config, causal):
     assert dv_snr > 15, "value_grad_snr too low"
 
 
+@pytest.mark.skipif(not (torch.cuda.is_available() and is_gfx950()), reason="FlyDSL attention is gfx950-only")
+# Hq*D of 5*128 and 6*64 is 128 mod 256: one row of it only tiles a 16-thread reduce work-group.
+@pytest.mark.parametrize(
+    "head_dim,num_head_q,num_head_kv", [(64, 8, 1), (128, 8, 1), (64, 6, 6), (128, 5, 5)]
+)
+# The dQ reduce folds q rows in pairs sharing one band range: an odd Sq makes a pair straddle
+# two batches (B*Sq odd asserted, otherwise it read unwritten rows) and an odd causal offset
+# hands the second row a band the first lacks (it lost its diagonal term). Full causal only: a
+# window whose offset is off the 64-row grid is a separate, known backward issue.
+@pytest.mark.parametrize(
+    "batch,seqlen_q,seqlen_kv", [(1, 1001, 1001), (2, 1001, 1001), (2, 1023, 1024), (2, 1022, 1025)]
+)
+def test_flydsl_attention_backward_odd_rows(batch, seqlen_q, seqlen_kv, head_dim, num_head_q, num_head_kv):
+    """dQ against an fp32 backward from the kernel's own O and LSE, row by row: a lost
+    diagonal band costs a row 0.1-0.7 of the median row norm but the tensor only ~4 dB of SNR."""
+    device = "cuda"
+    torch.manual_seed(42)
+    group = num_head_q // num_head_kv
+    scale = head_dim ** (-0.5)
+    # sbhd storage, handed to the op as its [b, s, h, d] view
+    query = torch.randn((seqlen_q, batch, num_head_q, head_dim), device=device, dtype=torch.bfloat16)
+    key = torch.randn((seqlen_kv, batch, num_head_kv, head_dim), device=device, dtype=torch.bfloat16)
+    value = torch.randn((seqlen_kv, batch, num_head_kv, head_dim), device=device, dtype=torch.bfloat16)
+    grad_out = torch.randn((seqlen_q, batch, num_head_q, head_dim), device=device, dtype=torch.bfloat16)
+    query.requires_grad_()
+
+    GlobalBackendManager.set_attn_backend(BackendType.FLYDSL, PrecisionType.BF16_FP16_FP32)
+    try:
+        out, lse = flash_attn_func(
+            query.permute(1, 0, 2, 3),
+            key.permute(1, 0, 2, 3),
+            value.permute(1, 0, 2, 3),
+            softmax_scale=scale,
+            causal=True,
+            return_lse=True,
+        )
+    finally:
+        GlobalBackendManager.set_attn_backend(None, PrecisionType.BF16_FP16_FP32)
+    out.backward(grad_out.permute(1, 0, 2, 3))
+
+    # [B, H, S, D]; bottom-right causal: row i sees keys j <= i + (Skv - Sq).
+    qh = query.detach().float().permute(1, 2, 0, 3)
+    kh = key.float().permute(1, 2, 0, 3).repeat_interleave(group, 1)
+    vh = value.float().permute(1, 2, 0, 3).repeat_interleave(group, 1)
+    oh = out.detach().float().permute(0, 2, 1, 3)
+    doh = grad_out.float().permute(1, 2, 0, 3)
+    i = torch.arange(seqlen_q, device=device)[:, None] + (seqlen_kv - seqlen_q)
+    j = torch.arange(seqlen_kv, device=device)[None, :]
+    p = torch.exp(qh @ kh.transpose(-1, -2) * scale - lse.float()[..., None]).masked_fill(j > i, 0.0)
+    ds = p * (doh @ vh.transpose(-1, -2) - (doh * oh).sum(-1, keepdim=True))
+    dq_ref = ds @ kh * scale
+    dq = query.grad.float().permute(1, 2, 0, 3)
+
+    assert torch.isfinite(dq).all(), "non-finite dq"
+    # Normalised by the median row. A row seeing only a few keys has near-zero dQ and carries the
+    # kernel's bf16-rounded scaled-Q floor at up to ~0.08 of that, so the bound starts at 64 keys,
+    # where the fixed kernel stays under 0.035 and a lost band shows 0.12 or more.
+    keys_seen = torch.arange(seqlen_q, device=device) + (seqlen_kv - seqlen_q) + 1
+    row_err = (dq - dq_ref).norm(dim=-1) / dq_ref.norm(dim=-1).median()
+    row_err = torch.where(keys_seen >= 64, row_err, torch.zeros_like(row_err))
+    worst = tuple(int(x) for x in torch.unravel_index(row_err.argmax(), row_err.shape))
+    assert row_err.max() < 6e-2, f"dq row err {row_err.max():.4g} at (b, h, q) {worst}"
+
+
 @pytest.mark.parametrize("qkv_format", ["bshd", "sbhd", "bhsd"])
 def test_attention_fake_kernel_strides(qkv_format):
     """Verify that torch.compile sees correct output strides for every qkv_format.
