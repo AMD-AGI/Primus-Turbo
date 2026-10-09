@@ -455,16 +455,20 @@ class FlashAttnDenseDispatcher(AutoKernelDispatcher):
         qkv_format="bshd",
         sink=None,
         return_softmax=False,
+        dropout_p=0.0,
+        bias=None,
+        alibi_slopes=None,
         **kwargs,
     ):
         b, s, hq, d = q.shape
-        hkv = k.shape[2]
+        skv, hkv = k.shape[1], k.shape[2]
         # return_softmax belongs in the key because it decides eligibility, not just output:
         # only aiter can produce the dropout matrix, so a tuned entry cached without it would
         # hand a return_softmax call to a backend that silently drops it.
         return (
             b,
             s,
+            skv,
             hq,
             hkv,
             d,
@@ -474,6 +478,11 @@ class FlashAttnDenseDispatcher(AutoKernelDispatcher):
             qkv_format,
             sink is not None,
             bool(return_softmax),
+            # Eligibility too: FlyDSL and Triton refuse them, and a tuned entry cached
+            # without them would replay a backend that raises on the call.
+            dropout_p != 0.0,
+            bias is not None,
+            alibi_slopes is not None,
         )
 
 
