@@ -32,7 +32,6 @@ loop is chunked because K is a runtime value).
 """
 
 import functools
-from types import SimpleNamespace
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -45,7 +44,6 @@ from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.buffer_ops import (
     _create_i64_constant,
     _unwrap_value,
-    create_buffer_resource,
     create_llvm_ptr,
     get_element_ptr,
 )
@@ -67,15 +65,12 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     StoreCBf16,
     _readfirstlane_i32,
     compute_global_swizzle_nn_bf16_wide,
-    compute_global_swizzle_nn_bf16_wide_row_col,
     emit_for,
     emit_if_then,
     group_m_tile_decode,
-    load_row_idx_to_lds,
     make_bf16_buffer_tensor_rebased,
     make_bf16_fp16_tile_tensor,
     make_value_attrs,
-    read_row_idx_from_lds,
     wait_barrier,
     wave_lane_with_rank,
     wave_rank_desc_stable,
@@ -118,10 +113,6 @@ def _tail_quad_conds(q_row, q_col, out_m, out_n, half_m, half_n, mask_m, mask_n)
             conds[i, j] = arith.andi(*parts) if len(parts) == 2 else (parts[0] if parts else None)
     return conds
 
-
-# Per-wave LDS ring of gather row indices: chunk c + 4 is filled while chunk c runs, after c - 4 is consumed.
-LDS_ROW_IDX_CHUNKS = 8
-NUM_LDS_ROW_IDX_ENTRIES = 8 * LDS_ROW_IDX_CHUNKS * 4 * 8
 
 # bf16 and fp16 run the same pipeline; only the mfma operand format differs.
 _F16 = (torch.bfloat16, torch.float16)
@@ -169,18 +160,9 @@ def grouped_gemm_bf16_variable_k_tile(
     trans_c=False,
     lds_chunk_stride=1152,
     mask_m=None,
-    a_row_idx=None,
-    b_row_idx=None,
-    num_row_idx_entries=None,
-    num_gathered_rows=None,
 ):
     CHUNK = 4
     WGRAD_WAVES = 8  # fixed 8 waves per block
-    has_a_row_idx = a_row_idx is not None
-    has_b_row_idx = b_row_idx is not None
-    has_row_idx = has_a_row_idx or has_b_row_idx
-    assert not (has_a_row_idx and has_b_row_idx), "at most one operand is gathered"
-    assert NUM_LDS_ROW_IDX_ENTRIES == WGRAD_WAVES * LDS_ROW_IDX_CHUNKS * CHUNK * 8
     assert BLOCK_M >= 128 and BLOCK_N >= 64 and BLOCK_M % 128 == 0 and BLOCK_N % 64 == 0
     N_TILES_A = BLOCK_M // 128
     # A ragged OUT_M over-launches the last M block; a partitioned launch passes mask_m itself.
@@ -206,10 +188,6 @@ def grouped_gemm_bf16_variable_k_tile(
     b_base_off = _i64(m_start) * fx.Int64(OUT_N * 2)
     a_span = _i64(group_tokens) * _i64(out_m_rt) * fx.Int64(2)
     b_span = _i64(group_tokens) * _i64(out_n_rt) * fx.Int64(2)
-    if const_expr(has_a_row_idx):
-        a_base_off, a_span = fx.Int64(0), _i64(num_gathered_rows) * fx.Int64(OUT_M * 2)
-    if const_expr(has_b_row_idx):
-        b_base_off, b_span = fx.Int64(0), _i64(num_gathered_rows) * fx.Int64(OUT_N * 2)
     gA = make_bf16_buffer_tensor_rebased(A, bf16_ir, a_base_off, a_span)
     gB = make_bf16_buffer_tensor_rebased(B, bf16_ir, b_base_off, b_span)
     a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
@@ -235,44 +213,6 @@ def grouped_gemm_bf16_variable_k_tile(
     N_ACCUMS_EFF = N_ACCUMS16
     a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, bf16_ir, wave_id, chunk_stride=lds_chunk_stride)
     b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, bf16_ir, wave_id, chunk_stride=lds_chunk_stride)
-
-    if const_expr(has_row_idx):
-        gathered_steps = N_LDS_STEPS_A if has_a_row_idx else N_LDS_STEPS_B
-        gathered_cols = [
-            col for _, col in compute_global_swizzle_nn_bf16_wide_row_col(lane_id, wave_id, gathered_steps)
-        ]
-        gathered_row_stride = OUT_M if has_a_row_idx else OUT_N
-        row_idx = a_row_idx if has_a_row_idx else b_row_idx
-        row_idx_resource = create_buffer_resource(
-            row_idx, num_records_bytes=num_row_idx_entries * fx.Int32(4)
-        )
-        lds_row_idx_base = fx.Int32(fx.ptrtoint(lds.lds_row_idx.ptr)) + wave_id * (
-            LDS_ROW_IDX_CHUNKS * CHUNK * 32
-        )
-
-    def _fill_row_idx(chunk):
-        """Copy this wave's row indices of chunks ``chunk`` and ``chunk + 1`` into its LDS ring."""
-        # chunk is even, so the 2-chunk write never crosses the ring end into the next wave's ring.
-        entry = m_start + (chunk * CHUNK + lane_id // 8) * BLOCK_K + wave_id * 8 + lane_id % 8
-        load_row_idx_to_lds(
-            row_idx_resource, lds_row_idx_base + (chunk % LDS_ROW_IDX_CHUNKS) * (CHUNK * 32), entry * 4
-        )
-
-    def _gathered_offsets(k):
-        ring_byte_offset = (k % (LDS_ROW_IDX_CHUNKS * CHUNK)) * 32 + ((lane_id // 2) % 8) * 4
-        row = read_row_idx_from_lds(lds_row_idx_base + ring_byte_offset) * gathered_row_stride
-        return [row + col for col in gathered_cols]
-
-    a_feed = (a_g2s, has_a_row_idx, a_k_step)
-    b_feed = (b_g2s, has_b_row_idx, b_k_step)
-
-    def _load(feed, dst, col_offset, k, gathered_offsets):
-        g2s, is_gathered, k_step = feed
-        if const_expr(is_gathered):
-            g2s.load(dst, col_offset, gl_offsets=gathered_offsets)
-        else:
-            g2s.load(dst, col_offset + k * k_step)
-
     out_ty = fx.Float16 if out_fp16 else fx.BFloat16
     if const_expr(trans_c):
         store_c = StoreCBf16(C, G * OUT_N, OUT_M, out_ty, cache_modifier=c_cache_modifier)
@@ -315,16 +255,11 @@ def grouped_gemm_bf16_variable_k_tile(
 
     # An empty expert only has to store zero accumulators, so the whole fetch pipeline is skipped.
     def _prologue():
-        if const_expr(has_row_idx):
-            _fill_row_idx(0)
-            _fill_row_idx(2)
         wait_barrier(0)
-        offsets0 = _gathered_offsets(0) if const_expr(has_row_idx) else None
-        offsets1 = _gathered_offsets(1) if const_expr(has_row_idx) else None
-        _load(b_feed, lds.B_lds_cur_0, b0_off, 0, offsets0)
-        _load(a_feed, lds.A_lds_cur_0, a0_off, 0, offsets0)
-        _load(b_feed, lds.B_lds_cur_1, b1_off, 0, offsets0)
-        _load(a_feed, lds.A_lds_cur_1, a1_off, 0, offsets0)
+        b_g2s.load(lds.B_lds_cur_0, b0_off + 0 * b_k_step)
+        a_g2s.load(lds.A_lds_cur_0, a0_off + 0 * a_k_step)
+        b_g2s.load(lds.B_lds_cur_1, b1_off + 0 * b_k_step)
+        a_g2s.load(lds.A_lds_cur_1, a1_off + 0 * a_k_step)
         # Divergent only holds for one tile per WG; a persistent loop needs every wave to
         # stop before the next tile's g2s reuses this LDS. Cf. dense_mma_pipeline_bf16.
         if const_expr(persistent):
@@ -332,9 +267,9 @@ def grouped_gemm_bf16_variable_k_tile(
         elif wave_m == 1:
             rocdl.s_barrier()
         wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
-        _load(b_feed, lds.B_lds_next_0, b0_off, 1, offsets1)
-        _load(a_feed, lds.A_lds_next_0, a0_off, 1, offsets1)
-        _load(b_feed, lds.B_lds_next_1, b1_off, 1, offsets1)
+        b_g2s.load(lds.B_lds_next_0, b0_off + 1 * b_k_step)
+        a_g2s.load(lds.A_lds_next_0, a0_off + 1 * a_k_step)
+        b_g2s.load(lds.B_lds_next_1, b1_off + 1 * b_k_step)
         wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
 
     emit_if_then(group_tokens > 0, _prologue)
@@ -349,27 +284,19 @@ def grouped_gemm_bf16_variable_k_tile(
         a_next0, a_next1 = lds.A_lds_next_0, lds.A_lds_next_1
         b_cur0, b_cur1 = lds.B_lds_cur_0, lds.B_lds_cur_1
         b_next0, b_next1 = lds.B_lds_next_0, lds.B_lds_next_1
-        offsets_after_next = None
         for j in range_constexpr(CHUNK):
             k = chunk_idx * CHUNK + j
-            if const_expr(has_row_idx and j == 0):
-                # Issued before this step's G2S, so the step's vmcnt waits retire it no later than them.
-                emit_if_then(chunk_idx % 2 == 0, lambda: _fill_row_idx(chunk_idx + 4))
-            next_offsets = None
-            if const_expr(has_a_row_idx):
-                next_offsets = _gathered_offsets(k + 1) if const_expr(j == 0) else offsets_after_next
-            offsets_after_next = _gathered_offsets(k + 2) if const_expr(has_row_idx) else None
             # 4-buffer pipelined body: interleave s2r/g2s with the 4 mfma quadrants
             b0 = b_s2r.load(b_cur0)
             a0 = a_s2r.load(a_cur0)
-            _load(a_feed, a_next1, a1_off, k + 1, next_offsets)
+            a_g2s.load(a_next1, a1_off + (k + 1) * a_k_step)
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
             _mma_quad(acc00, a0, b0, live[0, 0])
             rocdl.sched_barrier(0)
             rocdl.s_barrier()
             b1 = b_s2r.load(b_cur1)
-            _load(b_feed, b_cur0, b0_off, k + 2, offsets_after_next)
+            b_g2s.load(b_cur0, b0_off + (k + 2) * b_k_step)
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
             _mma_quad(acc01, a0, b1, live[0, 1])
@@ -382,8 +309,8 @@ def grouped_gemm_bf16_variable_k_tile(
             rocdl.sched_barrier(0)
             rocdl.s_barrier()
             # Both k+2 refills sit in the last phase, most-urgent first; issuing earlier only ages the line.
-            _load(a_feed, a_cur0, a0_off, k + 2, offsets_after_next)
-            _load(b_feed, b_cur1, b1_off, k + 2, offsets_after_next)
+            a_g2s.load(a_cur0, a0_off + (k + 2) * a_k_step)
+            b_g2s.load(b_cur1, b1_off + (k + 2) * b_k_step)
             wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
             rocdl.sched_barrier(0)
             _mma_quad(acc11, a1, b1, live[1, 1])
@@ -467,8 +394,6 @@ def _compile_grouped_bf16_wgrad(
     group_m=1,
     xcd_band=24,
     cap_cu=0,
-    has_a_row_idx=False,
-    has_b_row_idx=False,
 ):
     # See _compile_grouped_bf16_nt: cap_cu = 0 keeps the tuned one-tile-per-WG launch.
     persistent = cap_cu > 0
@@ -478,13 +403,7 @@ def _compile_grouped_bf16_wgrad(
     TOTAL = G * TILES_PER_GROUP
     # A ragged OUT_M over-launches the last M block; its tail rows are dropped at store time.
     MASK_M = N_BLOCKS_M * BLOCK_M > OUT_M
-    has_row_idx = has_a_row_idx or has_b_row_idx
-    SharedStorage = _make_shared_storage(
-        BLOCK_M,
-        BLOCK_N,
-        chunk_stride=lds_chunk_stride,
-        num_lds_row_idx_entries=NUM_LDS_ROW_IDX_ENTRIES if has_row_idx else 0,
-    )
+    SharedStorage = _make_shared_storage(BLOCK_M, BLOCK_N, chunk_stride=lds_chunk_stride)
 
     @flyc.kernel(known_block_size=[512, 1, 1])
     def kernel_grouped_variable_k(
@@ -495,8 +414,6 @@ def _compile_grouped_bf16_wgrad(
         masked_k: fx.Tensor,
         out_m_rt: fx.Int32,
         out_n_rt: fx.Int32,
-        # Empty when dense; else a_row_idx or b_row_idx plus num_row_idx_entries and num_gathered_rows.
-        row_idx_args,
     ):
         _ = str(fx.thread_idx.x)
         go_base = fx.Int64(_ptrtoint(_get_iter(group_k_offsets)))
@@ -504,19 +421,16 @@ def _compile_grouped_bf16_wgrad(
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         # Dispatch order ranked in the prologue by a lane-resident descending rank, not a host argsort.
         # Tile-independent, so it is hoisted above the persistent loop and ranked once.
-        if const_expr(G <= 64):  # one wave's lanes hold the rank; more groups keep their natural order
-            lane = fx.Int32(fx.thread_idx.x) % fx.Int32(64)
-            in_g = lane < fx.Int32(G)
-            k_lane = _load_i32(gk_base, arith.select(in_g, lane, fx.Int32(0)) * fx.Int32(2))
-            order_rank = wave_rank_desc_stable(arith.select(in_g, k_lane, fx.Int32(-1)), lane, G)
+        lane = fx.Int32(fx.thread_idx.x) % fx.Int32(64)
+        in_g = lane < fx.Int32(G)
+        k_lane = _load_i32(gk_base, arith.select(in_g, lane, fx.Int32(0)) * fx.Int32(2))
+        order_rank = wave_rank_desc_stable(arith.select(in_g, k_lane, fx.Int32(-1)), lane, G)
 
         # Free function for the same ast-rewriter reason as the NT kernel.
         def _do_tile(pid):
             # Band-cyclic XCD assignment: runs short enough to stay inside one expert, so skew spreads.
             tile = xcd_band_remap_pid(pid, TOTAL, num_xcd, xcd_band)
-            group_idx = tile // TILES_PER_GROUP
-            if const_expr(G <= 64):
-                group_idx = wave_lane_with_rank(order_rank, group_idx)
+            group_idx = wave_lane_with_rank(order_rank, tile // TILES_PER_GROUP)
             local_tile = tile % TILES_PER_GROUP
             if const_expr(trans_c):
                 block_n, block_m = group_m_tile_decode(local_tile, N_BLOCKS_N, N_BLOCKS_M, group_m)
@@ -547,7 +461,6 @@ def _compile_grouped_bf16_wgrad(
                 lds_chunk_stride=lds_chunk_stride,
                 mask_m=MASK_M,
                 persistent=persistent,
-                **vars(row_idx_args),
             )
 
         if const_expr(persistent):
@@ -565,21 +478,9 @@ def _compile_grouped_bf16_wgrad(
         masked_k,
         out_m_rt: fx.Int32,
         out_n_rt: fx.Int32,
-        row_idx,
-        num_row_idx_entries: fx.Int32,
-        num_gathered_rows: fx.Int32,
         stream: fx.Stream,
     ):
         grid_x = fx.Int32(_grid_x(TOTAL, cap_cu))
-        # An empty namespace adds no kernel argument, so the dense kernel keeps its signature.
-        row_idx_args = SimpleNamespace()
-        if const_expr(has_a_row_idx):
-            row_idx_args = SimpleNamespace(a_row_idx=row_idx)
-        if const_expr(has_b_row_idx):
-            row_idx_args = SimpleNamespace(b_row_idx=row_idx)
-        if const_expr(has_row_idx):
-            row_idx_args.num_row_idx_entries = num_row_idx_entries
-            row_idx_args.num_gathered_rows = num_gathered_rows
         kernel_grouped_variable_k(
             A,
             B,
@@ -588,7 +489,6 @@ def _compile_grouped_bf16_wgrad(
             masked_k,
             out_m_rt,
             out_n_rt,
-            row_idx_args,
             value_attrs=make_value_attrs(waves_per_eu, agpr_alloc, "512,512"),
         ).launch(grid=(grid_x, 1, 1), block=(512, 1, 1), stream=stream)
 
@@ -648,14 +548,9 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
     # one-tile-per-WG launch. A real budget switches to a capped persistent grid.
     cap_cu: int = 0,
     trans_c: bool = False,
-    # K row r of a (or b) is read from row a_row_idx[r] (b_row_idx[r]); rows outside a (b) read 0.
-    a_row_idx: torch.Tensor = None,
-    b_row_idx: torch.Tensor = None,
 ) -> torch.Tensor:
     """Variable-K grouped wgrad: out[g]=a[g_rows].T@b[g_rows], K=[offsets[g],offsets[g]+masked_k[g])."""
-    assert a_row_idx is None or b_row_idx is None, "at most one operand is gathered"
-    assert a.dim() == 2 and b.dim() == 2
-    assert a_row_idx is not None or b_row_idx is not None or a.shape[0] == b.shape[0]
+    assert a.dim() == 2 and b.dim() == 2 and a.shape[0] == b.shape[0]
     assert a.dtype in _F16 and b.dtype == a.dtype, f"16-bit float operands only, got {a.dtype}/{b.dtype}"
     OUT_M = a.shape[1]
     OUT_N = b.shape[1]
@@ -671,14 +566,6 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
     else:
         assert masked_k.numel() == G, f"masked_k len {masked_k.numel()} != G {G}"
         masked_k_i64 = (masked_k if masked_k.dtype == torch.int64 else masked_k.to(torch.int64)).contiguous()
-    row_idx, gathered_operand = (a_row_idx, a) if a_row_idx is not None else (b_row_idx, b)
-    if row_idx is None:
-        row_idx, num_gathered_rows = masked_k_i64, 0
-    else:
-        assert row_idx.dtype == torch.int32, f"row index tables are int32, got {row_idx.dtype}"
-        num_gathered_rows = gathered_operand.shape[0]
-        bytes_with_sentinel = (num_gathered_rows + 1) * gathered_operand.shape[1] * 2
-        assert bytes_with_sentinel <= 2**31 - 1, "gathered operand exceeds the 32-bit buffer offset"
     args = (
         _ptr_only_view(a),
         _ptr_only_view(b),
@@ -687,14 +574,9 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
         masked_k_i64,
         OUT_M,
         OUT_N,
-        _ptr_only_view(row_idx),
-        row_idx.numel(),
-        num_gathered_rows,
         torch.cuda.current_stream(),
     )
-    has_a_row_idx, has_b_row_idx = a_row_idx is not None, b_row_idx is not None
     key = (OUT_M, OUT_N, G, BLOCK_M, BLOCK_N, num_xcd, group_m, xcd_band, a.dtype, out_fp16, trans_c, cap_cu)
-    key += (has_a_row_idx, has_b_row_idx)
     compiled = _COMPILED_GROUPED_GEMM_CACHE.get(key)
     if compiled is None:
         launch = _compile_grouped_bf16_wgrad(
@@ -710,8 +592,6 @@ def grouped_gemm_bf16_variable_k_flydsl_kernel(
             group_m=group_m,
             xcd_band=xcd_band,
             cap_cu=cap_cu,
-            has_a_row_idx=has_a_row_idx,
-            has_b_row_idx=has_b_row_idx,
         )
         compiled = flyc.compile(launch, *args)
         _COMPILED_GROUPED_GEMM_CACHE[key] = compiled

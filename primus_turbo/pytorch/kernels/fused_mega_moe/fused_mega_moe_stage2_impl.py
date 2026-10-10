@@ -15,12 +15,14 @@ from primus_turbo.flydsl.mega import (
     grouped_gemm_combine_bf16_flydsl_kernel,
 )
 from primus_turbo.flydsl.mega.bf16.dispatch_prologue_kernel import DispatchHandle
+from primus_turbo.flydsl.mega.bf16.grouped_gemm_bf16_kernel import (
+    grouped_gemm_bf16_variable_k_flydsl_kernel,
+)
 from primus_turbo.flydsl.utils.glu_activation import GLUActivation
 from primus_turbo.flydsl.utils.swiglu_kernel import (
     swiglu_backward_flydsl_kernel,
     swiglu_flydsl_kernel,
 )
-from primus_turbo.pytorch.kernels.fused_mega_moe.fused_mega_moe_backward_impl import compute_dW2
 
 
 def fused_mega_moe_stage2_forward_impl(
@@ -76,5 +78,13 @@ def fused_mega_moe_stage2_backward_impl(
         activation=activation,
     )
 
-    dW2 = compute_dW2(dispatch_l2_grad, act_weighted, handle)
+    # dW2 = dispatched(dy)^ @ act_weighted (variable-K)
+    dW2 = grouped_gemm_bf16_variable_k_flydsl_kernel(
+        dispatch_l2_grad,
+        act_weighted,
+        handle.num_tokens_per_expert_prefix,
+        masked_k=handle.num_tokens_per_expert,
+        trans_c=False,
+        a_row_idx=handle.pool_row_to_recv_token,
+    )
     return grad_l1, grad_gate, dW2

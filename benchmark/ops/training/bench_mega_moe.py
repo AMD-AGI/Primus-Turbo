@@ -52,20 +52,17 @@ from flydsl.expr.typing import AddressSpace, PointerType  # noqa: E402
 
 # import primus_turbo.pytorch first to dodge the mega kernels' circular import
 import primus_turbo.pytorch  # noqa: E402,F401
-from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (  # noqa: E402
-    _make_shared_storage,
-    gemm_bf16_tile,
-)
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (  # noqa: E402
     grouped_gemm_bf16_nt_flydsl_kernel,
-    grouped_gemm_bf16_variable_k_flydsl_kernel,
 )
 from primus_turbo.flydsl.mega import (  # noqa: E402  # noqa: E402
     dispatch_grouped_gemm_bf16_flydsl_kernel,
     dispatch_prologue_flydsl_kernel,
     grouped_gemm_combine_bf16_flydsl_kernel,
 )
-from primus_turbo.flydsl.mega.bf16.barrier import launch_epoch_bump  # noqa: E402
+from primus_turbo.flydsl.mega.bf16.dispatch_grouped_gemm_bf16_kernel import (  # noqa: E402
+    _make_epoch_bump,
+)
 from primus_turbo.flydsl.mega.bf16.ep_intranode import (  # noqa: E402
     _BLOCK_THREADS,
     _NUM_WARPS,
@@ -73,6 +70,13 @@ from primus_turbo.flydsl.mega.bf16.ep_intranode import (  # noqa: E402
     combine_bf16_tile,
     dispatch_bf16_block,
     topk_reduce_bf16_tile,
+)
+from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (  # noqa: E402
+    _make_shared_storage,
+    gemm_bf16_tile,
+)
+from primus_turbo.flydsl.mega.bf16.grouped_gemm_bf16_kernel import (  # noqa: E402
+    grouped_gemm_bf16_variable_k_flydsl_kernel,
 )
 from primus_turbo.flydsl.mega.bf16.symm_buffer import (  # noqa: E402
     BLOCK_M as _POOL_BLOCK_M,
@@ -334,8 +338,8 @@ def _compile_dispatch_only(
         stream: fx.Stream,
     ):
         # same epoch protocol as the fused kernel, so its flag waits stay in step
-        launch_epoch_bump(
-            stream, parity=DISPATCH_PARITY, first_expected=DISPATCH_EXPECTED, first_addend=num_ranks
+        _make_epoch_bump(int(num_ranks))(DISPATCH_PARITY, DISPATCH_EXPECTED).launch(
+            grid=(1, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream
         )
         dispatch_only_k(
             INPUT_TOKENS,

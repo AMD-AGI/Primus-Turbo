@@ -21,25 +21,29 @@ from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, const_expr
 from flydsl.expr.buffer_ops import (
     buffer_load,
+    buffer_store,
     create_buffer_resource,
     extract_base_index,
 )
 from flydsl.expr.typing import AddressSpace, PointerType
 
-from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (
-    _make_shared_storage,
-    gemm_bf16_tile,
-)
-from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
-    NUM_LDS_ROW_IDX_ENTRIES,
-    grouped_gemm_bf16_variable_k_tile,
-)
-from primus_turbo.flydsl.mega.bf16.barrier import launch_epoch_bump, spin_until_flag_reaches
 from primus_turbo.flydsl.mega.bf16.dispatch_prologue_kernel import (
     DispatchHandle,
     run_dispatch_prologue,
 )
-from primus_turbo.flydsl.mega.bf16.ep_intranode import _BLOCK_THREADS, dispatch_bf16_block
+from primus_turbo.flydsl.mega.bf16.ep_intranode import (
+    _BLOCK_THREADS,
+    dispatch_bf16_block,
+    spin_until_flag_reaches,
+)
+from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
+    _make_shared_storage,
+    gemm_bf16_tile,
+)
+from primus_turbo.flydsl.mega.bf16.grouped_gemm_bf16_kernel import (
+    NUM_LDS_ROW_IDX_ENTRIES,
+    grouped_gemm_bf16_variable_k_tile,
+)
 from primus_turbo.flydsl.mega.bf16.symm_buffer import (
     TOKEN_DTYPE,
     SymBuffer,
@@ -329,6 +333,24 @@ def _make_kernel(
     return dispatch_grouped_gemm_kernel, grid_size
 
 
+@functools.lru_cache(maxsize=4)
+def _make_epoch_bump(addend):
+    """Single-block kernel: flip parity, bump the new bank's expected by addend."""
+
+    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    def epoch_bump_kernel(PARITY: fx.Tensor, EXPECTED: fx.Tensor):
+        if fx.thread_idx.x == fx.Int32(0):
+            parity_res = create_buffer_resource(PARITY, max_size=True)
+            expected_res = create_buffer_resource(EXPECTED, max_size=True)
+            new_parity = buffer_load(parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64()) ^ fx.Int64(1)
+            buffer_store(new_parity, parity_res, fx.Int32(0))
+            idx = cast(new_parity, fx.T.i32())
+            new_exp = buffer_load(expected_res, idx, vec_width=1, dtype=fx.T.i64()) + fx.Int64(addend)
+            buffer_store(new_exp, expected_res, idx)
+
+    return epoch_bump_kernel
+
+
 @autotune(
     configs=[Config(num_dispatch_cu=cu, nt_vmcnt=3) for cu in (16, 32, 64)],
     key=[
@@ -391,8 +413,8 @@ def _compiled_dispatch_grouped_gemm(
     layout = ("nt", "nn", "tn")[int(layout_code)]
     num_xcd = 2 if layout == "tn" else 8
     # bump epoch on device (expected += num_ranks) before the GEMM; same-stream makes it visible
-    launch_epoch_bump(
-        stream, parity=DISPATCH_PARITY, first_expected=DISPATCH_EXPECTED, first_addend=num_ranks
+    _make_epoch_bump(int(num_ranks))(DISPATCH_PARITY, DISPATCH_EXPECTED).launch(
+        grid=(1, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream
     )
     kernel, grid_size = _make_kernel(
         out_features,
@@ -500,7 +522,7 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         out_features_ce, hidden_size_ce = N, hidden_size
         G, trans_c = 0, False  # nt/nn grid uses worst_case_tiles; C never transposed
 
-    # epoch tensors are bumped by launch_epoch_bump inside _compiled; just pass them through
+    # epoch tensors are bumped by _make_epoch_bump inside _compiled; just pass them through
     _compiled_dispatch_grouped_gemm(
         x_i32,
         handle.expert_send_dst_rank,

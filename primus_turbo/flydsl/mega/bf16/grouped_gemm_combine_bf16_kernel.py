@@ -19,19 +19,20 @@ import torch
 from flydsl.expr import arith
 from flydsl.expr.buffer_ops import (
     buffer_load,
+    buffer_store,
     create_buffer_resource,
     create_buffer_resource_from_addr,
     extract_base_index,
 )
 
-from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (
-    _make_shared_storage,
-    gemm_bf16_tile,
-)
-from primus_turbo.flydsl.mega.bf16.barrier import launch_epoch_bump, spin_until_flag_reaches
 from primus_turbo.flydsl.mega.bf16.ep_intranode import (
     combine_bf16_tile,
+    spin_until_flag_reaches,
     topk_reduce_bf16_tile,
+)
+from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
+    _make_shared_storage,
+    gemm_bf16_tile,
 )
 from primus_turbo.flydsl.mega.bf16.symm_buffer import (
     TOKEN_DTYPE,
@@ -145,7 +146,7 @@ def _make_grouped_gemm_combine(
             out_features,
             token_dtype=TOKEN_DTYPE,
         )
-        # read epoch (already bumped by launch_epoch_bump): parity -> bank, expected -> spin target
+        # read epoch (already bumped by the bump kernel): parity -> bank, expected -> spin target
         combine_parity_res = create_buffer_resource(COMBINE_PARITY, max_size=True)
         combine_expected_res = create_buffer_resource(COMBINE_EXPECTED, max_size=True)
         reduce_expected_res = create_buffer_resource(REDUCE_EXPECTED, max_size=True)
@@ -329,6 +330,27 @@ def _make_grouped_gemm_combine(
     return grouped_gemm_combine_kernel
 
 
+@functools.lru_cache(maxsize=4)
+def _make_epoch_bump(add_combine, add_reduce):
+    """Single-block kernel: flip parity, bump combine and reduce expected."""
+
+    @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
+    def epoch_bump_kernel(PARITY: fx.Tensor, COMBINE_EXP: fx.Tensor, REDUCE_EXP: fx.Tensor):
+        if fx.thread_idx.x == fx.Int32(0):
+            parity_res = create_buffer_resource(PARITY, max_size=True)
+            combine_res = create_buffer_resource(COMBINE_EXP, max_size=True)
+            reduce_res = create_buffer_resource(REDUCE_EXP, max_size=True)
+            new_parity = buffer_load(parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64()) ^ fx.Int64(1)
+            buffer_store(new_parity, parity_res, fx.Int32(0))
+            idx = cast(new_parity, fx.T.i32())
+            new_combine = buffer_load(combine_res, idx, vec_width=1, dtype=fx.T.i64()) + fx.Int64(add_combine)
+            buffer_store(new_combine, combine_res, idx)
+            new_reduce = buffer_load(reduce_res, idx, vec_width=1, dtype=fx.T.i64()) + fx.Int64(add_reduce)
+            buffer_store(new_reduce, reduce_res, idx)
+
+    return epoch_bump_kernel
+
+
 @flyc.jit
 def _compiled_grouped_gemm_combine(
     ACT,
@@ -395,13 +417,9 @@ def _compiled_grouped_gemm_combine(
     )
     # reduce blocks come last, so they are dispatched only after every GEMM and combine block
     grid_size = num_gemm_blocks + num_combine_cu + _NUM_REDUCE_CU
-    launch_epoch_bump(
-        stream,
-        parity=COMBINE_PARITY,
-        first_expected=COMBINE_EXPECTED,
-        first_addend=num_tiles_n,
-        second_expected=REDUCE_EXPECTED,
-        second_addend=1,
+    # bump epoch on device (combine += num_tiles_n, reduce += 1) before the GEMM; same-stream visible
+    _make_epoch_bump(int(num_tiles_n), 1)(COMBINE_PARITY, COMBINE_EXPECTED, REDUCE_EXPECTED).launch(
+        grid=(1, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream
     )
     kernel(
         ACT,

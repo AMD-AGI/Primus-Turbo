@@ -373,11 +373,10 @@ class G2SLoader:
         lds_ptr = fx.inttoptr(self.LdsPtr_t, sum_i32)
         return fx.make_view(lds_ptr, fx.make_layout(1, 1))
 
-    def load(self, lds_dst, k_offset, base_off=None, gl_offsets=None):
+    def load(self, lds_dst, k_offset, base_off=None):
         src_div, soff = self._src_div(k_offset)
-        gl_offsets = self.gl_offsets if gl_offsets is None else gl_offsets
         for step in range_constexpr(self.n_load_steps):
-            off = fx.Int32(gl_offsets[step])
+            off = fx.Int32(self.gl_offsets[step])
             if self.wm_win:
                 off = off + (step % self.wm_win) * self.chunk_stride
             src = fx.slice(src_div, (None, off))
@@ -2349,36 +2348,11 @@ def make_fp16_bf16_buffer_tensor(arg):
     return fx.rocdl.make_buffer_tensor(arg, max_size=False)
 
 
-def load_row_idx_to_lds(row_idx_resource, lds_byte_address, entry_byte_offset):
-    """Each lane copies the i32 at ``entry_byte_offset`` to LDS ``lds_byte_address + 4 * lane``."""
-    rocdl.buffer_load_to_lds(
-        row_idx_resource, _lds_ptr_from_i32(lds_byte_address), entry_byte_offset, size_bytes=4
-    )
-
-
-def read_row_idx_from_lds(lds_byte_address):
-    """One ds_read_b32; opaque asm, so the compiler does not wait on in-flight LDS DMA before it."""
-    op = _llvm.InlineAsmOp(
-        res=T.i32,
-        operands_=[_raw(_lds_ptr_from_i32(lds_byte_address))],
-        asm_string="ds_read_b32 $0, $1\ns_waitcnt lgkmcnt(0)",
-        constraints="=&v,v,~{memory}",
-        has_side_effects=True,
-    )
-    return ArithValue(op.result, signed=True)
-
-
 def compute_global_swizzle_bf16(lane_id, wave_id, K, n_rounds, row_step=1, pair_span=0):
     """Per-lane global element offsets feeding one LDS chunk of a [rows, K] operand.
     ``row_step`` strides the global row and ``pair_span`` permutes it within a group, both so a
     reader holds even and odd output columns; neither changes the rows a chunk fetches."""
-    row_cols = compute_global_swizzle_bf16_row_col(lane_id, wave_id, n_rounds, pair_span)
-    return [g_row * (row_step * K) + col for g_row, col in row_cols]
-
-
-def compute_global_swizzle_bf16_row_col(lane_id, wave_id, n_rounds, pair_span=0):
-    """(row, column) in elements of each lane's 16-byte piece, one pair per round."""
-    row_cols = []
+    offsets = []
     n_waves = fx.block_dim.x // 64
     for r in range_constexpr(n_rounds):
         row = lane_id // 8 + wave_id * 8 + r * (n_waves * 8)
@@ -2389,8 +2363,8 @@ def compute_global_swizzle_bf16_row_col(lane_id, wave_id, n_rounds, pair_span=0)
             half = pair_span // 2
             t = row % pair_span
             g_row = (row - t) + (t % half) * 2 + t // half
-        row_cols.append((g_row, c // 2))
-    return row_cols
+        offsets.append(g_row * (row_step * K) + c // 2)
+    return offsets
 
 
 def compute_global_swizzle_nn_bf16(lane_id, wave_id, c_n, n_steps):
@@ -2421,20 +2395,6 @@ def compute_global_swizzle_nn_bf16_wide(lane_id, wave_id, c_n, n_steps):
         ks8 = idx % 8
         offsets.append((ks8 * 8 + kloc) * c_n + n64 * 64 + n_in)
     return offsets
-
-
-def compute_global_swizzle_nn_bf16_wide_row_col(lane_id, wave_id, n_steps):
-    """(k-row, column) in elements of each lane's 16-byte piece, one pair per step."""
-    row_cols = []
-    n_waves = fx.block_dim.x // 64
-    kloc = (lane_id // 2) % 8
-    n_in = (lane_id // 16) * 16 + (lane_id % 2) * 8
-    for step in range_constexpr(n_steps):
-        idx = wave_id + step * n_waves
-        n64 = idx // 8
-        ks8 = idx % 8
-        row_cols.append((ks8 * 8 + kloc, n64 * 64 + n_in))
-    return row_cols
 
 
 def _packed_ds_read_tr16(base_ptr, byte_offsets):
@@ -2703,39 +2663,6 @@ class StoreCBf16:
                             rsrc,
                             off + q * col_step * 2 + j * 32,
                             mask=col_ok[q],
-                            cache_modifier=self.cache_modifier,
-                            offset_is_bytes=True,
-                        )
-
-    def store_band_merged16(self, c_frags, base_row, base_col, col_step, n_tiles_a, n_tiles_b, row_bound):
-        """``store_band16`` with adjacent column tiles merged by ``v_permlane16_swap`` into 64 B row runs."""
-        assert n_tiles_b % 2 == 0, "the merge pairs adjacent column tiles"
-        rsrc = make_row_band_resource(self.c_base, base_row, row_bound, self.c_cols, 2)
-        row_bytes = self.c_cols * 2
-        base_off = ((self.lane_id // 32) * 8) * row_bytes + (base_col + self.lane_id % 32) * 2
-        for q in range_constexpr(len(c_frags)):
-            for ti in range_constexpr(n_tiles_a):
-                vecs = [Vec(c_frags[q][ti * n_tiles_b + j]) for j in range_constexpr(n_tiles_b)]
-                packed = [
-                    [
-                        _pack_out_pair(vecs[j][2 * h], vecs[j][2 * h + 1], self.out_ty)
-                        for h in range_constexpr(2)
-                    ]
-                    for j in range_constexpr(n_tiles_b)
-                ]
-                # All swaps first, then the store burst, to keep the permlane->store hazard off-path.
-                runs = [
-                    (Vec.from_elements([fx.Int32(v)], fx.Int32).bitcast(self.out_ty), p, r, h)
-                    for h in range_constexpr(2)
-                    for p in range_constexpr(n_tiles_b // 2)
-                    for v, r in zip(_permlane16_swap(packed[2 * p][h], packed[2 * p + 1][h]), (0, 4))
-                ]
-                for pair, p, r, h in runs:
-                    for e in range_constexpr(2):
-                        buffer_store(
-                            pair[e],
-                            rsrc,
-                            base_off + (ti * 16 + r + 2 * h + e) * row_bytes + q * col_step * 2 + p * 64,
                             cache_modifier=self.cache_modifier,
                             offset_is_bytes=True,
                         )

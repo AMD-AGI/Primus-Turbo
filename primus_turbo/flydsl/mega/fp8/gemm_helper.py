@@ -11,7 +11,11 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-# MegaMoE MXFP8-owned copy of flydsl/utils/gemm_helper.py.
+# MegaMoE MXFP8-owned snapshot of flydsl/utils/gemm_helper.py (at the tip this
+# package was sealed against). MXFP8 kernels import from here only so later
+# shared-helper changes cannot change MegaMoE MXFP8 numericals. BF16 uses the
+# separate mega/bf16/gemm_helper.py pinned to f6d5ab68.
+#
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch

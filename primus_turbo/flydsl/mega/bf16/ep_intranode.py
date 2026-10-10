@@ -22,13 +22,15 @@ from flydsl.expr.buffer_ops import (
     create_buffer_resource_from_addr,
 )
 
-from primus_turbo.flydsl.mega.bf16.barrier import spin_until_flag_reaches
 from primus_turbo.flydsl.mega.bf16.symm_buffer import SymBuffer, Workspace
 from primus_turbo.flydsl.utils.prims import (
     atomic_add,
     cast,
     ceildiv,
     copy_warp,
+    ld,
+    read_clock,
+    spin_timed_out,
     st,
 )
 
@@ -40,6 +42,29 @@ _NUM_WARPS = _BLOCK_THREADS // _WARP
 _ROW_UNROLL = 4
 # per-warp ceiling on bf16x8 loads in flight in _sum_pool_rows; above it the 8-row sum spills
 _MAX_LOADS_IN_FLIGHT = 64
+
+
+@ASTRewriter.transform
+def spin_until_flag_reaches(
+    flag_base: fx.ArithValue,
+    flag_idx: fx.Int32,
+    expected: fx.Int64,
+    scope: str,
+    rank: int,
+    tag: str,
+):
+    """Spin the calling lane until the i64 flag at flag_base[flag_idx] is at least expected."""
+    message = f"[MEGA rank={rank} {tag}] flag wait timeout: flag_idx={{}} flag={{}} expected={{}}\n"
+    spin_start = read_clock()
+    fx.rocdl.s_waitcnt(0)
+    flag = ld(flag_base, flag_idx, scope=scope, dtype=fx.T.i64())
+    while flag < expected:
+        fx.rocdl.s_sleep(fx.Int32(1))
+        if spin_timed_out(spin_start):
+            fx.printf(message, flag_idx, flag, expected)
+            spin_start = read_clock()
+        fx.rocdl.s_waitcnt(0)
+        flag = ld(flag_base, flag_idx, scope=scope, dtype=fx.T.i64())
 
 
 def same_rank_order(expert_ids, topk_position, num_experts_per_rank):

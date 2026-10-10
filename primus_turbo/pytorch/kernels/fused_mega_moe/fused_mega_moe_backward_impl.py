@@ -11,14 +11,14 @@ from typing import List, Optional, Tuple
 import torch
 from torch.distributed.distributed_c10d import _resolve_process_group
 
-from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
-    grouped_gemm_bf16_variable_k_flydsl_kernel,
-)
 from primus_turbo.flydsl.mega import (
     dispatch_grouped_gemm_bf16_flydsl_kernel,
     grouped_gemm_combine_bf16_flydsl_kernel,
 )
 from primus_turbo.flydsl.mega.bf16.dispatch_prologue_kernel import DispatchHandle
+from primus_turbo.flydsl.mega.bf16.grouped_gemm_bf16_kernel import (
+    grouped_gemm_bf16_variable_k_flydsl_kernel,
+)
 from primus_turbo.flydsl.utils.glu_activation import (
     GLUActivation,
     activation_constexpr,
@@ -34,19 +34,6 @@ from primus_turbo.pytorch.core.backend import (
 )
 
 _SUPPORTED_DTYPES = (torch.bfloat16,)
-
-
-def compute_dW2(
-    dispatch_l2_grad: torch.Tensor, act_weighted: torch.Tensor, handle: DispatchHandle
-) -> torch.Tensor:
-    """dW2 = dispatched(dy)^T @ act_weighted, contracted over each expert's unpadded rows."""
-    return grouped_gemm_bf16_variable_k_flydsl_kernel(
-        dispatch_l2_grad,
-        act_weighted,
-        handle.num_tokens_per_expert_prefix,
-        masked_k=handle.num_tokens_per_expert,
-        a_row_idx=handle.pool_row_to_recv_token,
-    )
 
 
 class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
@@ -105,7 +92,14 @@ class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
             activation=activation,
         )
 
-        dW2 = compute_dW2(dispatch_l2_grad, act_weighted, handle)
+        dW2 = grouped_gemm_bf16_variable_k_flydsl_kernel(
+            dispatch_l2_grad,
+            act_weighted,
+            handle.num_tokens_per_expert_prefix,
+            masked_k=handle.num_tokens_per_expert,
+            trans_c=False,
+            a_row_idx=handle.pool_row_to_recv_token,
+        )
 
         # L1 dgrad (grad_l1 @ w1, nn) + combine PUSH + dx reduce + grad_gate scatter
         dx, grad_topk_weights_flat = grouped_gemm_combine_bf16_flydsl_kernel(
