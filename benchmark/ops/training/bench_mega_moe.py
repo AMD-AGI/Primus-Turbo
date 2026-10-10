@@ -352,7 +352,9 @@ def _compile_dispatch_only(
             DISPATCH_PARITY,
             DISPATCH_CHUNK_COUNTER,
             value_attrs=make_value_attrs(waves_per_eu, 0, "512,512"),
-        ).launch(grid=(num_dispatch_cu, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
+        ).launch(
+            grid=(num_dispatch_cu // num_ranks * num_ranks, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream
+        )
 
     return launch
 
@@ -1474,11 +1476,9 @@ def _combine_make_context(group, args, symm):
     rank = group.rank()
     real_tiles = int(inp.num_tile_blocks.item())
     M_eff = real_tiles * 256
-    # combine push bytes per rank = remote rows (source rank != rank, not padding) x H x bf16
-    recv_token_idx = inp.handle.pool_row_to_recv_token[:M_eff]
-    is_real_row = recv_token_idx < symm.num_max_recv_tokens
-    is_remote_row = recv_token_idx // symm.num_max_tokens_per_rank != rank
-    remote_rows = int((is_real_row & is_remote_row).sum().item())
+    # combine push bytes per rank = fold rows of remote segments (one row per recv token) x H x bf16
+    is_remote_segment = inp.handle.combine_recv_dst_rank != rank
+    remote_rows = int(inp.handle.combine_recv_fold_count[is_remote_segment].sum().item())
     xgmi_bytes = remote_rows * args.hidden * BF16_BYTES
     # kernel reads topk_indices as i64 (like the production forward); int32 -> OOB slot
     topk_idx_flat = inp.topk_idx.to(torch.int64).contiguous().view(-1)

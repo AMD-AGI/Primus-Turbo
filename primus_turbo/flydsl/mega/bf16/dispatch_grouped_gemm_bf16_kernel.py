@@ -98,9 +98,7 @@ def _make_kernel(
 ):
     K = hidden_size
     is_tn = layout == "tn"
-    assert num_comm % num_ranks == 0 and num_dispatch_cu % num_ranks == 0, (
-        "comm blocks split evenly per dst rank"
-    )
+    assert num_comm % num_ranks == 0 and num_dispatch_cu >= num_ranks, "every dst rank needs a comm block"
     num_chunks = num_dispatch_cu // num_ranks
     # The variable-K tile reads a padded LDS frame; the dense tiles read the unpadded one.
     lds_chunk_stride = 1152 if is_tn else 1024
@@ -194,24 +192,26 @@ def _make_kernel(
             pool_row_to_recv_token_base = _i64_base(POOL_ROW_TO_RECV_TOKEN)
 
         if block_index < comm_block_count:
-            dispatch_bf16_tile(
-                sym_buffer,
-                workspace,
-                thread_index=thread_index,
-                block_index=block_index,
-                hidden_size=hidden_size,
-                input_res=input_resource,
-                expert_send_dst_rank_res=expert_send_dst_rank_resource,
-                expert_send_count_res=expert_send_count_resource,
-                expert_send_offset_res=expert_send_offset_resource,
-                dispatched_token_idx_res=dispatched_token_idx_resource,
-                dispatch_parity=dispatch_parity,
-                dispatch_chunk_counter_ptr=dispatch_chunk_counter_ptr,
-                num_chunks=num_chunks,
-                num_ranks=num_ranks,
-                num_experts_per_rank=num_comm // num_ranks,
-                rank=rank,
-            )
+            # comm blocks past the last full set of chunks stay idle, so each dst rank gets num_chunks
+            if block_index < fx.Int32(num_chunks * num_ranks):
+                dispatch_bf16_tile(
+                    sym_buffer,
+                    workspace,
+                    thread_index=thread_index,
+                    block_index=block_index,
+                    hidden_size=hidden_size,
+                    input_res=input_resource,
+                    expert_send_dst_rank_res=expert_send_dst_rank_resource,
+                    expert_send_count_res=expert_send_count_resource,
+                    expert_send_offset_res=expert_send_offset_resource,
+                    dispatched_token_idx_res=dispatched_token_idx_resource,
+                    dispatch_parity=dispatch_parity,
+                    dispatch_chunk_counter_ptr=dispatch_chunk_counter_ptr,
+                    num_chunks=num_chunks,
+                    num_ranks=num_ranks,
+                    num_experts_per_rank=num_comm // num_ranks,
+                    rank=rank,
+                )
         elif const_expr(is_tn):
             tile_index = block_index - comm_block_count
             if tile_index < fx.Int32(TOTAL):
