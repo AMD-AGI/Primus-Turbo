@@ -28,7 +28,7 @@ class FluxSelectionTest(unittest.TestCase):
                     "FLUX_FP8_FUSE_BIAS_EPILOGUE": "1",
                     "FLUX_ATTN_FLYDSL": "1",
                 },
-                ("p3", "flux", "flux", "flux", "tuned"),
+                ("main", "flux", "flux", "flux", "tuned"),
             ),
             (
                 {"FLUX_FP4_PASSES": "dgrad,wgrad", "FLUX_FP4_H16_STOCK": "1"},
@@ -40,6 +40,10 @@ class FluxSelectionTest(unittest.TestCase):
             ),
             (
                 {"FLUX_FP4_PASSES": "dgrad,wgrad", "FLUX_FP4_DISPATCH": "host_dispatch"},
+                ("main", "flux", "stock", "stock", "tuned"),
+            ),
+            (
+                {"FLUX_FP4_PASSES": "dgrad,wgrad", "FLUX_MXFP4_P3_GEMM": "1"},
                 ("p3", "flux", "stock", "stock", "tuned"),
             ),
         ]
@@ -59,7 +63,7 @@ for name, suffix in zip(modules, sys.argv[1:]):
     m = importlib.import_module(full)
     assert m._implementation.__name__ == full + '_' + suffix, (name, suffix)
     assert not any(full + '_' + other in sys.modules
-                   for other in ('stock', 'flux', 'p3', 'pre_dual', 'v0', 'tuned')
+                   for other in ('stock', 'flux', 'main', 'p3', 'pre_dual', 'v0', 'tuned')
                    if other != suffix), full
 importlib.import_module('primus_turbo.flydsl.attention.flash_attn_bwd')
 importlib.import_module('primus_turbo.flydsl.quantization.a6w4_quant')
