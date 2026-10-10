@@ -3059,6 +3059,8 @@ def _dense_race(cache, key, args, layout, builders, beta_is_one):
         if not cands:
             raise RuntimeError(f"{layout} autotune found no working cfg for {key[:3]}")
         cache[key] = tuned = _pick_dense_candidate(cands, bargs)
+        bargs = out_view = None
+        torch.cuda.empty_cache()
     return _dense_beta1_entry(cache, key, tuned) if beta_is_one else tuned
 
 
@@ -3397,6 +3399,8 @@ def _tn_wave4_dispatch(args, M, N, K, geoms, cbsz=0, blgp=0, out_fp16=False):
         raise RuntimeError(f"TN whole-loop found no working cfg for ({M},{N},{K})")
     best = _pick_dense_candidate(cands, args)
     _TN_WAVE4_CACHE[key] = (best, cands)
+    # Same as _dense_race: release the cached per-candidate compile scratches.
+    torch.cuda.empty_cache()
     return best
 
 

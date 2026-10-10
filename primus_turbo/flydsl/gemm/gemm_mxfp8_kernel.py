@@ -975,6 +975,8 @@ def _autotune_mxfp8(
     if bks > 1 and min(_time_cfg(bm, gm, xcd, gn, ks=bks, aux=baux) for _ in range(3)) >= bus * 0.99:
         bks = 1
     best = (bm, gm, xcd, gn, bks, baux)
+    out_view = None
+    torch.cuda.empty_cache()
     _MXFP8_AUTOTUNE_CACHE[key] = best
     return best
 
