@@ -17,6 +17,7 @@ except ImportError as e:
 
 from .activation import *
 from .attention import *
+from .cross_entropy import cross_entropy
 from .deoscillation import *
 from .gemm import *
 from .gemm_fp4 import *
