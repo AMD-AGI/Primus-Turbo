@@ -11,12 +11,18 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
+import functools
+
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ASTRewriter
+from flydsl.expr import const_expr
+from flydsl.expr.buffer_ops import buffer_load, buffer_store, create_buffer_resource
 
 from primus_turbo.flydsl.mega.bf16.symm_buffer import SymBuffer, Workspace
 from primus_turbo.flydsl.utils.prims import (
     atomic_add,
+    cast,
     ld,
     memory_fence,
     read_clock,
@@ -116,3 +122,55 @@ def xgmi_barrier(
                     spin_start = read_clock()
                 signal_value = ld(signal_ptr, fx.Int32(0), scope="sys", order="acquire")
     fx.gpu.barrier()
+
+
+@ASTRewriter.transform
+def spin_until_flag_reaches(
+    flag_base: fx.ArithValue,
+    flag_idx: fx.Int32,
+    expected: fx.Int64,
+    scope: str,
+    rank: int,
+    tag: str,
+):
+    """Spin the calling lane until the i64 flag at flag_base[flag_idx] is at least expected."""
+    message = f"[MEGA rank={rank} {tag}] flag wait timeout: flag_idx={{}} flag={{}} expected={{}}\n"
+    spin_start = read_clock()
+    fx.rocdl.s_waitcnt(0)
+    flag = ld(flag_base, flag_idx, scope=scope, dtype=fx.T.i64())
+    while flag < expected:
+        fx.rocdl.s_sleep(fx.Int32(1))
+        if spin_timed_out(spin_start):
+            fx.printf(message, flag_idx, flag, expected)
+            spin_start = read_clock()
+        fx.rocdl.s_waitcnt(0)
+        flag = ld(flag_base, flag_idx, scope=scope, dtype=fx.T.i64())
+
+
+@functools.lru_cache(maxsize=16)
+def _make_epoch_bump(first_addend: int, second_addend: int):
+    @flyc.kernel(known_block_size=[64, 1, 1])
+    def epoch_bump_kernel(PARITY: fx.Tensor, FIRST_EXPECTED: fx.Tensor, SECOND_EXPECTED: fx.Tensor):
+        if fx.thread_idx.x == fx.Int32(0):
+            parity_res = create_buffer_resource(PARITY, max_size=True)
+            new_parity = buffer_load(parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64()) ^ fx.Int64(1)
+            buffer_store(new_parity, parity_res, fx.Int32(0))
+            bank = cast(new_parity, fx.T.i32())
+            first_res = create_buffer_resource(FIRST_EXPECTED, max_size=True)
+            first = buffer_load(first_res, bank, vec_width=1, dtype=fx.T.i64()) + fx.Int64(first_addend)
+            buffer_store(first, first_res, bank)
+            if const_expr(second_addend != 0):
+                second_res = create_buffer_resource(SECOND_EXPECTED, max_size=True)
+                second = buffer_load(second_res, bank, vec_width=1, dtype=fx.T.i64()) + fx.Int64(
+                    second_addend
+                )
+                buffer_store(second, second_res, bank)
+
+    return epoch_bump_kernel
+
+
+def launch_epoch_bump(stream, parity, first_expected, first_addend, second_expected=None, second_addend=0):
+    """Flip parity, then add each addend to its expected array's next bank, before the waiting kernel."""
+    kernel = _make_epoch_bump(int(first_addend), int(second_addend))
+    second_expected = first_expected if second_expected is None else second_expected
+    kernel(parity, first_expected, second_expected).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)

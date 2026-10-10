@@ -11,36 +11,20 @@
 ###############################################################################
 
 import argparse
-import os
-import sys
 import time
 
 import torch
 import torch.distributed as dist
 
-try:
-    # imported as a package member (python -m benchmark.ops.training.deep_ep.test_intranode)
-    from .utils import (
-        bench,
-        calc_diff,
-        get_deep_ep_backend,
-        init_dist,
-        inplace_unique,
-        per_token_cast_back,
-        per_token_cast_to_fp8,
-    )
-except ImportError:
-    # run as a plain script: no parent package, so put this file's dir on sys.path
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from utils import (
-        bench,
-        calc_diff,
-        get_deep_ep_backend,
-        init_dist,
-        inplace_unique,
-        per_token_cast_back,
-        per_token_cast_to_fp8,
-    )
+from .utils import (
+    bench,
+    calc_diff,
+    get_deep_ep_backend,
+    init_dist,
+    inplace_unique,
+    per_token_cast_back,
+    per_token_cast_to_fp8,
+)
 
 
 # noinspection PyShadowingNames

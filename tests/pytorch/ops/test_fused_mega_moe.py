@@ -79,7 +79,18 @@ def _weighted_glu(fc1_out, weights, activation=None):
 
 
 def generate_inputs(
-    rank, world, *, num_tokens, hidden, inter, num_experts, num_topk, device="cuda", seed=1234, l1_gain=1.0
+    rank,
+    world,
+    *,
+    num_tokens,
+    hidden,
+    inter,
+    num_experts,
+    num_topk,
+    device="cuda",
+    seed=1234,
+    l1_gain=1.0,
+    empty_experts=(),
 ):
     """One rank's local MoE inputs: x, this rank's L1/L2 expert shard, random top-k routing.
 
@@ -101,6 +112,8 @@ def generate_inputs(
     l2_weight *= 2.0 / math.sqrt(inter)
 
     logits = torch.randn(num_tokens, num_experts, generator=g, device=device, dtype=torch.float32)
+    # experts that no token routes to on any rank
+    logits[:, list(empty_experts)] = float("-inf")
     topk_weight, topk_idx = torch.topk(logits.softmax(-1), num_topk, dim=-1)
     return x, l1_weight, l2_weight, topk_idx.to(torch.int64), topk_weight.to(torch.float32)
 
@@ -177,9 +190,13 @@ def _test_forward_backward_impl(
 
         # device-side epoch flag advances per replay, so replay #2+ stays correct
         num_iters = 4
-        for _ in range(num_iters):
+        for iteration in range(num_iters):
             y_m = runner(x_m, tw_m, l1_m, l2_m)
             dx_m, dl1_m, dl2_m, dtw_m = torch.autograd.grad(y_m, [x_m, l1_m, l2_m, tw_m], grad_y)
+            if iteration == 0:
+                first_outputs = [t.clone() for t in (y_m, dx_m, dtw_m)]
+        # same inputs must reproduce y / dx / grad_topk_weights bit for bit
+        assert all(torch.equal(a, b) for a, b in zip(first_outputs, (y_m, dx_m, dtw_m))), "not deterministic"
 
         # turbo reference: topk_weight flows through scatter, so dtw is compared directly
         x_t = x.detach().requires_grad_(True)
@@ -234,7 +251,7 @@ class FusedMegaMoETestBase(MultiProcContinuousTest):
         torch.cuda.set_device(self.device)
         torch.manual_seed(42 + self.rank)
 
-    def _inputs(self, num_tokens, hidden, inter, num_experts, num_topk, l1_gain=1.0):
+    def _inputs(self, num_tokens, hidden, inter, num_experts, num_topk, l1_gain=1.0, empty_experts=()):
         return generate_inputs(
             self.rank,
             self.world_size,
@@ -245,6 +262,7 @@ class FusedMegaMoETestBase(MultiProcContinuousTest):
             num_topk=num_topk,
             device=self.device,
             l1_gain=l1_gain,
+            empty_experts=empty_experts,
         )
 
     def _symm(self, group, num_tokens, hidden, inter, num_experts, num_topk):
@@ -279,9 +297,14 @@ class FusedMegaMoETestBase(MultiProcContinuousTest):
     @skip_unless_gfx950
     @skip_if_lt_x_gpu(8)
     @parametrize(
-        "hidden, inter, num_experts, num_topk, num_tokens",
+        "hidden, inter, num_experts, num_topk, num_tokens, empty_experts",
         [
-            (7168, 2048, 256, 8, 8192),
+            (7168, 2048, 256, 8, 8192, ()),
+            # small shapes: num_topk 1/2, a 128-token batch, and empty first/middle/last local experts
+            (2048, 1024, 64, 1, 1024, ()),
+            (2048, 1024, 64, 2, 1024, ()),
+            (2048, 1024, 64, 8, 128, ()),
+            (2048, 1024, 64, 8, 1024, (0, 11, 63)),
         ],
     )
     @parametrize(
@@ -299,13 +322,14 @@ class FusedMegaMoETestBase(MultiProcContinuousTest):
         num_experts,
         num_topk,
         num_tokens,
+        empty_experts,
         enable_cudagraph,
         enable_torch_compile,
     ):
         self._setup_device()
         group = dist.group.WORLD
         x, l1_weight, l2_weight, topk_idx, topk_weight = self._inputs(
-            num_tokens, hidden, inter, num_experts, num_topk
+            num_tokens, hidden, inter, num_experts, num_topk, empty_experts=empty_experts
         )
         symm = self._symm(group, num_tokens, hidden, inter, num_experts, num_topk)
         results = _test_forward_backward_impl(
