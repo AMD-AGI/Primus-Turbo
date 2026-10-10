@@ -77,6 +77,10 @@ jobs:
         run: |
           unset AITER_ASM_DIR
           pip3 uninstall -y aiter amd-aiter primus-turbo || true
+          # pip leaves aiter's JIT-built .so behind, and aiter loads them without checking the
+          # version that built them; drop the leftovers so another AITER_VERSION's cache is never used.
+          SITE_PACKAGES=$(python3 -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+          rm -rf "${SITE_PACKAGES}/aiter" "${SITE_PACKAGES}/aiter_meta"
           pip3 install -r requirements.txt
           pip3 install "amd-aiter @ git+https://github.com/ROCm/aiter.git@${AITER_VERSION}"
           GPU_ARCHS="gfx942;gfx950" PRIMUS_TURBO_FRAMEWORK="PYTORCH" \
