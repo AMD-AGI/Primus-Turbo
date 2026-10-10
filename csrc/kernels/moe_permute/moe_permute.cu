@@ -453,9 +453,8 @@ __launch_bounds__(kBlockHiddenPacks, 4) __global__
 
     // Preprocessing stores the padding rows after all max_num_dispatched_tokens token rows, which
     // is past the routed count whenever trailing tokens are unrouted (e.g. worst-case buffers).
-    const int  row_idx  = is_padding_token
-                              ? max_num_dispatched_tokens + (token_id - actual_dispatched)
-                              : token_id;
+    const int row_idx =
+        is_padding_token ? max_num_dispatched_tokens + (token_id - actual_dispatched) : token_id;
     const int *row      = row_id_map + static_cast<int64_t>(row_idx) * row_stride;
     const int  n_routed = row[2 * E];
 
