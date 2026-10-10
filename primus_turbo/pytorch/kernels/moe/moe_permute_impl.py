@@ -32,6 +32,7 @@ __all__ = [
     "MoEPermuteBackend",
     "moe_permute_process_impl",
     "moe_permute_impl",
+    "moe_permute_routed_amax_impl",
     "moe_unpermute_impl",
 ]
 
@@ -745,6 +746,22 @@ def moe_permute_impl(
         use_fp8,
         probs_topk_stride,
         backend.value,
+    )
+
+
+def moe_permute_routed_amax_impl(
+    tokens: torch.Tensor,
+    row_id_map: torch.Tensor,
+    num_dispatched_tokens: Optional[torch.Tensor],
+    num_local_experts: int,
+) -> torch.Tensor:
+    """Abs-max partials over the tokens TURBO permute copies (TURBO ``row_id_map`` only),
+    in the ``amax_partials`` form ``quantize_fp8_tensorwise`` consumes."""
+    _assert_mask_map_layout(row_id_map, num_local_experts)
+    if num_dispatched_tokens is None:
+        num_dispatched_tokens = torch.full((1,), tokens.shape[0], dtype=torch.int32, device=tokens.device)
+    return torch.ops.primus_turbo_cpp_extension.permute_routed_amax(
+        tokens, row_id_map, num_dispatched_tokens, num_local_experts
     )
 
 

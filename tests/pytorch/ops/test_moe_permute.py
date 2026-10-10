@@ -10,6 +10,12 @@ import pytest
 import torch
 
 from primus_turbo.pytorch.core.backend import BackendType
+from primus_turbo.pytorch.core.low_precision import (
+    ScalingGranularity,
+    float8_e4m3,
+    float8_e5m2,
+)
+from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
 from primus_turbo.pytorch.ops.moe.moe_permute import moe_permute, moe_unpermute
 from tests.pytorch.ref.permuatation_ref import (
     pytorch_permute_mask_map,
@@ -888,3 +894,172 @@ def test_moe_permute_torch_compile(preallocated, backend):
     roundtrip(tokens_eager)[2].backward(grad_out)
     torch.compile(roundtrip)(tokens_compiled)[2].backward(grad_out)
     torch.testing.assert_close(tokens_compiled.grad, tokens_eager.grad, atol=0, rtol=0)
+
+
+# --- Tensorwise-FP8 permute output / unpermute gradient (TURBO) ---
+
+QUANT_DTYPES = [float8_e4m3, float8_e5m2]
+# 1000 is not a multiple of the 128-column grouped-GEMM alignment, so the FP8 rows get padded.
+QUANT_HIDDEN_SIZES = [2048, 1000]
+
+
+def _routing_with_unrouted_outlier(num_tokens, num_experts, num_topk, hidden_size, *, seed):
+    """topk_indices ending in unrouted tokens (a worst-case dispatch buffer's layout) that
+    hold values far above the rest.
+
+    Permute never copies them, so they must not reach the tensorwise scale either.
+    """
+    routing_map = generate_routing_map(num_tokens, num_experts, num_topk, seed=seed)
+    topk_indices = routing_map_to_expert_map(routing_map, num_topk, "topk_idx_int64")
+    unrouted = list(range(num_tokens - 37, num_tokens))
+    topk_indices[unrouted] = -1
+    tokens = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
+    tokens[unrouted] = 3.0e4
+    return topk_indices, tokens, unrouted
+
+
+def _assert_same_quantized(got: QuantizedTensor, want: QuantizedTensor):
+    assert got.shape == want.shape
+    assert torch.equal(got.qdata.view(torch.uint8), want.qdata.view(torch.uint8))
+    assert torch.equal(got.scale_inv, want.scale_inv)
+
+
+@pytest.mark.parametrize("quantize_dtype", QUANT_DTYPES)
+@pytest.mark.parametrize("hidden_size", QUANT_HIDDEN_SIZES)
+@pytest.mark.parametrize("pad_multiple", [0, 16])
+@pytest.mark.parametrize("with_probs", [False, True])
+def test_moe_permute_quantize_tensorwise(quantize_dtype, hidden_size, pad_multiple, with_probs):
+    """The FP8 output is bit-identical to quantizing the bf16 permute; backward is unchanged."""
+    num_tokens, num_experts, num_topk = 1024, 16, 4
+    topk_indices, tokens, unrouted = _routing_with_unrouted_outlier(
+        num_tokens, num_experts, num_topk, hidden_size, seed=91
+    )
+    probs = torch.rand((num_tokens, num_topk), dtype=torch.float32, device="cuda") if with_probs else None
+    kwargs = dict(
+        topk_indices=topk_indices,
+        num_local_experts=num_experts,
+        num_topk=num_topk,
+        pad_multiple=pad_multiple,
+        probs=probs,
+        backend=BackendType.TURBO,
+    )
+
+    ref_tokens = tokens.clone().requires_grad_(True)
+    ref, _, ref_tpe, _, _, ref_probs = moe_permute(ref_tokens, **kwargs)
+    ref_q = QuantizedTensor.quantize(
+        ref.detach(),
+        quantize_dtype,
+        ScalingGranularity.TENSORWISE,
+        axis=-1,
+        group_lens=ref_tpe,
+        pad_align_last=128,
+    )
+
+    got_tokens = tokens.clone().requires_grad_(True)
+    got, _, tokens_per_expert, _, scaling_factor, got_probs = moe_permute(
+        got_tokens, quantize_dtype=quantize_dtype, **kwargs
+    )
+    assert isinstance(got, QuantizedTensor) and got._is_grouped_tensor
+    assert scaling_factor is None
+    _assert_same_quantized(got, ref_q)
+    assert torch.equal(got.group_offs, ref_q.group_offs)
+    assert torch.equal(tokens_per_expert, ref_tpe)
+    if with_probs:
+        assert torch.equal(got_probs, ref_probs)
+
+    grad = torch.randn(ref.shape, dtype=torch.bfloat16, device="cuda")
+    ref.backward(grad)
+    got.backward(grad)
+    # TURBO unpermute leaves the gradient rows past the routed count unwritten.
+    num_routed = num_tokens - len(unrouted)
+    assert torch.equal(got_tokens.grad[:num_routed], ref_tokens.grad[:num_routed])
+
+
+class _CaptureGrad(torch.autograd.Function):
+    """Identity whose backward records the incoming gradient as-is."""
+
+    grads = []
+
+    @staticmethod
+    def forward(ctx, x):
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad):
+        _CaptureGrad.grads.append(grad)
+        return torch.zeros(grad.shape, dtype=torch.bfloat16, device=grad.device)
+
+
+@pytest.mark.parametrize("quantize_dtype", QUANT_DTYPES)
+@pytest.mark.parametrize("hidden_size", QUANT_HIDDEN_SIZES)
+@pytest.mark.parametrize("pad_multiple", [0, 16])
+def test_moe_unpermute_grad_quantize_tensorwise(quantize_dtype, hidden_size, pad_multiple):
+    """Backward hands ``permuted_tokens`` the tensorwise-FP8 cast of its bf16 gradient."""
+    num_tokens, num_experts, num_topk = 1024, 16, 4
+    topk_indices, tokens, unrouted = _routing_with_unrouted_outlier(
+        num_tokens, num_experts, num_topk, hidden_size, seed=93
+    )
+    permuted, row_id_map, _, _, _, _ = moe_permute(
+        tokens,
+        topk_indices=topk_indices,
+        num_local_experts=num_experts,
+        num_topk=num_topk,
+        pad_multiple=pad_multiple,
+        backend=BackendType.TURBO,
+    )
+    grad_out = torch.randn_like(tokens)
+    grad_out[unrouted] = 3.0e4
+    kwargs = dict(
+        restore_shape=tokens.shape,
+        num_local_experts=num_experts,
+        pad_multiple=pad_multiple,
+        backend=BackendType.TURBO,
+    )
+
+    x = permuted.detach().requires_grad_(True)
+    (ref_grad,) = torch.autograd.grad(moe_unpermute(x, row_id_map, **kwargs)[0], x, grad_out)
+    ref_q = QuantizedTensor.quantize(
+        ref_grad, quantize_dtype, ScalingGranularity.TENSORWISE, axis=-1, pad_align_last=128
+    )
+
+    _CaptureGrad.grads.clear()
+    y = _CaptureGrad.apply(permuted.detach().requires_grad_(True))
+    out, _ = moe_unpermute(y, row_id_map, grad_quantize_dtype=quantize_dtype, **kwargs)
+    out.backward(grad_out)
+    (got,) = _CaptureGrad.grads
+    assert isinstance(got, QuantizedTensor)
+    _assert_same_quantized(got, ref_q)
+
+
+def test_moe_permute_quantize_requires_turbo():
+    """Both options read the TURBO row_id_map layout; any other backend is refused."""
+    tokens = torch.randn((64, 128), dtype=torch.bfloat16, device="cuda")
+    routing_map = generate_routing_map(64, 8, 2, seed=5)
+    with pytest.raises(ValueError, match="TURBO"):
+        moe_permute(tokens, routing_map=routing_map, num_local_experts=8, quantize_dtype=float8_e4m3)
+    permuted, row_id_map, _, _, _, _ = moe_permute(tokens, routing_map=routing_map, num_local_experts=8)
+    with pytest.raises(ValueError, match="TURBO"):
+        moe_unpermute(
+            permuted,
+            row_id_map,
+            restore_shape=tokens.shape,
+            num_local_experts=8,
+            grad_quantize_dtype=float8_e4m3,
+        )
+
+
+@pytest.mark.parametrize("pad_multiple", [0, 16])
+def test_moe_permute_quantize_empty_input(pad_multiple):
+    tokens = torch.randn((0, 256), dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    topk_indices = torch.zeros((0, 2), dtype=torch.int64, device="cuda")
+    got, _, _, _, _, _ = moe_permute(
+        tokens,
+        topk_indices=topk_indices,
+        num_local_experts=4,
+        num_topk=2,
+        pad_multiple=pad_multiple,
+        backend=BackendType.TURBO,
+        quantize_dtype=float8_e4m3,
+    )
+    assert isinstance(got, QuantizedTensor)
+    assert got.shape == (0, 256) and got.qdata.shape == (0, 256)

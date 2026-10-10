@@ -293,7 +293,6 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        grad_out = _ensure_contiguous_grad_out(grad_out)
         (
             x_fp8,
             act_fp8,
@@ -310,15 +309,27 @@ class FP8GroupedMLPTensorFunc(torch.autograd.Function):
         ) = ctx.saved_tensors
 
         grad_out_dtype = _get_fp8_dtype(ctx.config.format, False)
-        quantized_grad_out = QuantizedTensor.quantize(
-            grad_out,
-            grad_out_dtype,
-            ctx.config.granularity,
-            axis=-1,
-            block_size=ctx.config.block_size,
-            group_lens=group_lens,
-            pad_align_last=_FP8_PAD_ALIGN,
-        )
+        if isinstance(grad_out, QuantizedTensor):
+            # Quantized by the consumer's backward, e.g. moe_unpermute(grad_quantize_dtype=...).
+            check_quantized_tensor(grad_out, ctx.config)
+            assert grad_out.real_dtype == grad_out_dtype, (
+                f"QuantizedTensor grad_out dtype {grad_out.real_dtype} != expected {grad_out_dtype}"
+            )
+            assert grad_out.qdata.shape[-1] % _FP8_PAD_ALIGN == 0, (
+                f"QuantizedTensor grad_out must be padded to a multiple of {_FP8_PAD_ALIGN} columns"
+            )
+            quantized_grad_out = grad_out
+        else:
+            grad_out = _ensure_contiguous_grad_out(grad_out)
+            quantized_grad_out = QuantizedTensor.quantize(
+                grad_out,
+                grad_out_dtype,
+                ctx.config.granularity,
+                axis=-1,
+                block_size=ctx.config.block_size,
+                group_lens=group_lens,
+                pad_align_last=_FP8_PAD_ALIGN,
+            )
         # H is padded on the fc2-output side (grad_out last, w2 penult, x/w1
         # contraction); real recovers tight H on every GEMM whose output or wgrad
         # feature is H. I stays tight in M1, so its real is left None.

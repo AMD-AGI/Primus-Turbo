@@ -7,6 +7,7 @@
 #include "moe_permute.cuh"
 #include "primus_turbo/arch.h"
 #include "primus_turbo/common.h"
+#include "primus_turbo/device/reduce.cuh"
 #include "primus_turbo/moe_permute.h"
 
 #include <hip/hip_runtime.h>
@@ -515,6 +516,56 @@ __launch_bounds__(kBlockHiddenPacks, 4) __global__
     }
 }
 
+// Abs-max partials over exactly the tokens permute_kernel copies (same row bound, at least
+// one real destination row), so unrouted tokens and worst-case tail rows never reach the
+// tensorwise scale. One partial per block; a max is exact and order-independent.
+template <int kNumThreads, int kTokenUnroll, typename dtype_t>
+__launch_bounds__(kNumThreads) __global__
+    void permute_routed_amax_kernel(const int4 *tokens, const int *row_id_map,
+                                    const int *num_dispatched_tokens_ptr, int num_local_experts,
+                                    int hidden_int4, float *partials) {
+    constexpr int num_eles_per_pack = sizeof(int4) / sizeof(dtype_t);
+    const int     E                 = num_local_experts;
+    const int     row_stride        = 2 * E + 1;
+    const int     num_tokens        = *num_dispatched_tokens_ptr;
+
+    float acc = 0.0f;
+    for (int base = static_cast<int>(blockIdx.x) * kTokenUnroll; base < num_tokens;
+         base += static_cast<int>(gridDim.x) * kTokenUnroll) {
+        bool routed[kTokenUnroll];
+#pragma unroll
+        for (int u = 0; u < kTokenUnroll; ++u) {
+            const int token_id = base + u;
+            routed[u]          = false;
+            if (token_id < num_tokens) {
+                const int *row      = row_id_map + static_cast<int64_t>(token_id) * row_stride;
+                const int  n_routed = row[2 * E];
+                for (int idx = 0; idx < n_routed; ++idx)
+                    routed[u] |= row[idx] > 0;
+            }
+        }
+        for (int j = static_cast<int>(threadIdx.x); j < hidden_int4; j += kNumThreads) {
+            int4 packs[kTokenUnroll];
+#pragma unroll
+            for (int u = 0; u < kTokenUnroll; ++u) {
+                packs[u] = routed[u]
+                               ? __ldg(tokens + static_cast<int64_t>(base + u) * hidden_int4 + j)
+                               : make_int4(0, 0, 0, 0);
+            }
+#pragma unroll
+            for (int u = 0; u < kTokenUnroll; ++u) {
+                const dtype_t *p = reinterpret_cast<const dtype_t *>(&packs[u]);
+#pragma unroll
+                for (int k = 0; k < num_eles_per_pack; ++k)
+                    acc = fmaxf(acc, fabsf(static_cast<float>(p[k])));
+            }
+        }
+    }
+    const float ret = BlockReduce<AbsMaxOp, float>(acc);
+    if (threadIdx.x == 0)
+        partials[blockIdx.x] = ret;
+}
+
 template <int kNumThreads, typename dtype_t, typename prob_t>
 __global__ void unpermute_kernel_e1(const int4 *permuted_tokens, int4 *tokens,
                                     const prob_t *permuted_probs, prob_t *probs,
@@ -733,6 +784,26 @@ void unpermute_impl(const dtype_t *permuted_tokens, dtype_t *tokens, const prob_
     PRIMUS_TURBO_CHECK_HIP(hipGetLastError());
 }
 
+template <typename dtype_t>
+void permute_routed_amax_impl(const dtype_t *tokens, const int *row_id_map,
+                              const int *num_dispatched_tokens_ptr, int num_local_experts,
+                              int hidden_size, int num_partials, float *partials,
+                              hipStream_t stream) {
+    constexpr int kNumThreads       = 256;
+    constexpr int kTokenUnroll      = 4;
+    constexpr int num_eles_per_pack = sizeof(int4) / sizeof(dtype_t);
+
+    PRIMUS_TURBO_CHECK(hidden_size % num_eles_per_pack == 0,
+                       "hidden_size must be a multiple of (16 / sizeof(dtype_t))");
+    PRIMUS_TURBO_CHECK(num_partials > 0, "num_partials must be > 0");
+
+    permute_routed_amax_kernel<kNumThreads, kTokenUnroll, dtype_t>
+        <<<num_partials, kNumThreads, /*shmem=*/0, stream>>>(
+            reinterpret_cast<const int4 *>(tokens), row_id_map, num_dispatched_tokens_ptr,
+            num_local_experts, hidden_size / num_eles_per_pack, partials);
+    PRIMUS_TURBO_CHECK_HIP(hipGetLastError());
+}
+
 // Explicit template instantiations consumed by csrc/pytorch/moe_permute/moe_permute.cpp.
 #define INSTANTIATE(fn, ...) template decltype(fn<__VA_ARGS__>) fn<__VA_ARGS__>
 
@@ -745,6 +816,9 @@ INSTANTIATE(permute_impl, uint16_t, float, float);
 
 INSTANTIATE(unpermute_impl, bfloat16, float);
 INSTANTIATE(unpermute_impl, float16, float);
+
+INSTANTIATE(permute_routed_amax_impl, bfloat16);
+INSTANTIATE(permute_routed_amax_impl, float16);
 
 #undef INSTANTIATE
 
