@@ -27,6 +27,7 @@ from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
 from primus_turbo.pytorch.ops.attention.attention_utils import (
     _infer_qkv_format,
     _resolve_is_v3_atomic_fp32_from_env,
+    _restore_qkv_storage,
     block_scaling_node,
     get_p_scale,
 )
@@ -837,16 +838,10 @@ def flash_attn_fp8_usp_func(
     ulysses_group=None,
     ring_group=None,
 ):
+    # q/k/v are logically [b, s, h, d] in every layout; only their storage differs,
+    # and the Triton FP8 kernel needs it bshd-contiguous.
     qkv_format = _infer_qkv_format(q, k, v)
-
-    if qkv_format == "bhsd":
-        q = q.permute(0, 2, 1, 3).contiguous()
-        k = k.permute(0, 2, 1, 3).contiguous()
-        v = v.permute(0, 2, 1, 3).contiguous()
-    elif qkv_format == "sbhd":
-        q = q.permute(1, 0, 2, 3).contiguous()
-        k = k.permute(1, 0, 2, 3).contiguous()
-        v = v.permute(1, 0, 2, 3).contiguous()
+    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
 
     # Default config: blockwise with block_size=64
     if fp8_config is None:
@@ -883,9 +878,4 @@ def flash_attn_fp8_usp_func(
         ring_group,
     )
 
-    if qkv_format == "sbhd":
-        o = o.permute(1, 0, 2, 3).contiguous()
-    elif qkv_format == "bhsd":
-        o = o.permute(0, 2, 1, 3).contiguous()
-
-    return o
+    return _restore_qkv_storage(o, qkv_format)
