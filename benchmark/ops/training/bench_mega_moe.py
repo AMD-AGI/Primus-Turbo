@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 # config + this module's helpers are same-dir (auto on the script-dir path)
 from config import gen_moe_test_cases, get_platform_info
@@ -68,7 +69,7 @@ from primus_turbo.flydsl.mega.bf16.ep_intranode import (  # noqa: E402
     _NUM_WARPS,
     _PVEC,
     combine_bf16_tile,
-    dispatch_bf16_block,
+    dispatch_bf16_tile,
     topk_reduce_bf16_tile,
 )
 from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (  # noqa: E402
@@ -305,7 +306,7 @@ def _compile_dispatch_only(
             ),
             fx.T.i32(),
         )
-        dispatch_bf16_block(
+        dispatch_bf16_tile(
             sym_buffer,
             workspace,
             thread_index=thread_index,
@@ -489,14 +490,6 @@ def dispatch_only(
         symm._dispatch_chunk_counter,
         stream=torch.cuda.current_stream(),
     )
-
-
-def _pool_rows(symm, handle):
-    """Dense [num_max_pool_tokens, H] pool gathered from the dispatch buffer; sentinel rows read 0."""
-    padded_buffer = torch.cat(
-        [symm.dispatch_token_buffer, symm.dispatch_token_buffer.new_zeros(1, symm.hidden)]
-    )
-    return padded_buffer[handle.pool_row_to_recv_token[: symm.num_max_pool_tokens].long()]
 
 
 # --------------------------------------------------------------------------- #
@@ -683,7 +676,9 @@ def generate_input(group, *, kind, symm, T, H, I, E, K, BLOCK_M, BLOCK_N, num_di
         _dispatch_and_settle(group, x, handle, symm, num_dispatch_cu=num_dispatch_cu)
         l1_out = torch.empty((symm.num_max_pool_tokens, 2 * I), dtype=torch.bfloat16, device="cuda")
         grouped_gemm_bf16_only(
-            _pool_rows(symm, handle),
+            F.pad(symm.dispatch_token_buffer, (0, 0, 0, 1))[
+                handle.pool_row_to_recv_token[: symm.num_max_pool_tokens].long()
+            ],
             W1,
             l1_out,
             tile_to_expert,
@@ -1277,7 +1272,9 @@ def _dispatch_make_comm_call(ctx, operand):
 def _dispatch_stage_fwd(runner, ctx):
     """forward (NT): N=2I, K=H; returns (metrics, check, xgmi_bytes)."""
     inp, args = ctx.inp, ctx.args
-    pool = _pool_rows(ctx.symm, inp.handle)
+    pool = F.pad(ctx.symm.dispatch_token_buffer, (0, 0, 0, 1))[
+        inp.handle.pool_row_to_recv_token[: ctx.symm.num_max_pool_tokens].long()
+    ]
     M_eff, N_fwd, K = ctx.M_eff, 2 * args.inter, args.hidden
     flops = 2.0 * M_eff * N_fwd * K
     # XGMI push bytes per rank = remote rows (dest != rank) x hidden x bf16
@@ -1302,7 +1299,12 @@ def _dispatch_stage_fwd(runner, ctx):
         fused_fn=_dispatch_make_fused_call(ctx, inp.x, inp.W1, "nt"),
         # gathered late like main's lazy pool view: a gather right after dispatch_only can see pre-push rows
         ref_fn=lambda: turbo_grouped_gemm(
-            _pool_rows(ctx.symm, inp.handle)[:M_eff].contiguous(), inp.W1, ctx.padded_group_lens, trans_b=True
+            F.pad(ctx.symm.dispatch_token_buffer, (0, 0, 0, 1))[
+                inp.handle.pool_row_to_recv_token[: ctx.symm.num_max_pool_tokens].long()
+            ][:M_eff].contiguous(),
+            inp.W1,
+            ctx.padded_group_lens,
+            trans_b=True,
         ),
         acc_slice=slice(0, M_eff),
     )
@@ -1321,7 +1323,9 @@ def _dispatch_stage_bwd_dgrad(runner, ctx):
     sync_ranks(ctx.group)
     dispatch_only(dy, inp.handle, symm)
     sync_ranks(ctx.group)
-    pool = _pool_rows(symm, inp.handle)
+    pool = F.pad(symm.dispatch_token_buffer, (0, 0, 0, 1))[
+        inp.handle.pool_row_to_recv_token[: symm.num_max_pool_tokens].long()
+    ]
 
     # accuracy: fused dispatch+GEMM(NN) vs turbo grouped_gemm. NN -> trans_b=False.
     spec = StageSpec(
@@ -1342,7 +1346,9 @@ def _dispatch_stage_bwd_dgrad(runner, ctx):
         fused_fn=_dispatch_make_fused_call(ctx, dy, inp.W2, "nn"),
         # gathered late like main's lazy pool view: a gather right after dispatch_only can see pre-push rows
         ref_fn=lambda: turbo_grouped_gemm(
-            _pool_rows(ctx.symm, inp.handle)[:M_eff].contiguous(),
+            F.pad(ctx.symm.dispatch_token_buffer, (0, 0, 0, 1))[
+                inp.handle.pool_row_to_recv_token[: ctx.symm.num_max_pool_tokens].long()
+            ][:M_eff].contiguous(),
             inp.W2,
             ctx.padded_group_lens,
             trans_b=False,
@@ -1369,7 +1375,9 @@ def _dispatch_stage_bwd_wgrad(runner, ctx):
     def _ref():
         dispatch_only(x_pool, inp.handle, symm)
         sync_ranks(ctx.group)
-        pool = _pool_rows(symm, inp.handle)
+        pool = F.pad(symm.dispatch_token_buffer, (0, 0, 0, 1))[
+            inp.handle.pool_row_to_recv_token[: symm.num_max_pool_tokens].long()
+        ]
         for expert in range(ctx.experts_per_rank):
             start, end = offs_cpu[expert], offs_cpu[expert + 1]
             if end > start:  # padded rows are zero -> contract to 0 (skip is equivalent)

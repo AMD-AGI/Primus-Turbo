@@ -99,76 +99,6 @@ def dispatch_bf16_tile(
     sym: SymBuffer,
     workspace: Workspace,
     thread_index: fx.Int32,
-    hidden_size: int,
-    input_res: fx.ArithValue,
-    expert_send_dst_rank_res: fx.ArithValue,
-    expert_send_count_res: fx.ArithValue,
-    expert_send_offset_res: fx.ArithValue,
-    dispatched_token_idx_res: fx.ArithValue,
-    task_index: fx.ArithValue,
-    dispatch_parity: fx.Int32,
-    chunk_index: fx.Int32,
-    dispatch_chunk_counter_ptr: fx.ArithValue,
-    num_chunks: int,
-    num_ranks: int,
-    rank: int,
-):
-    hidden_bytes = hidden_size * 2
-    assert hidden_bytes % 1024 == 0, "hidden*2 must be a multiple of 1024 bytes -> hidden % 512 == 0"
-    hidden_i32 = hidden_bytes // 4  # row stride in i32 words
-    row_stride = num_chunks * _NUM_WARPS
-
-    warp_id = chunk_index * fx.Int32(_NUM_WARPS) + thread_index // fx.Int32(_WARP)
-
-    dst_rank = buffer_load(expert_send_dst_rank_res, task_index, vec_width=1, dtype=fx.T.i32())
-    source_offset = buffer_load(expert_send_offset_res, task_index, vec_width=1, dtype=fx.T.i32())
-    token_count = buffer_load(expert_send_count_res, task_index, vec_width=1, dtype=fx.T.i32())
-    # hoist workspace-derived values before any dynamic control flow (rewriter can't carry Workspace)
-    token_buffer_address = sym.map(workspace.get_dispatch_token_buffer_ptr(), dst_rank)
-    dispatch_flag_address = sym.map(workspace.get_dispatch_flag_ptr(), dst_rank)
-    num_max_pool_blocks = int(workspace.num_max_pool_blocks)
-    recv_token_base = rank * int(workspace.num_max_tokens_per_rank)
-
-    local_count = (token_count - warp_id + fx.Int32(row_stride - 1)) // fx.Int32(row_stride)
-
-    for i in range(local_count):
-        token_idx = buffer_load(
-            dispatched_token_idx_res,
-            source_offset + warp_id + i * fx.Int32(row_stride),
-            vec_width=1,
-            dtype=fx.T.i32(),
-        )
-        # dst = peer dispatch_token_buffer row of this recv token, src = local input; offsets in i32 words
-        copy_warp(
-            token_buffer_address,
-            input_res,
-            hidden_bytes,
-            dst_off=(fx.Int32(recv_token_base) + token_idx) * fx.Int32(hidden_i32),
-            src_off=token_idx * fx.Int32(hidden_i32),
-            load_cache_modifier=18,  # sc1|nt: read data produced by the same agent.
-            store_cache_modifier=19,
-        )
-
-    fx.rocdl.s_waitcnt(0)
-    fx.gpu.barrier()
-    if thread_index == fx.Int32(0):
-        # each chunk's stores retired before its counter add, so the last chunk's flag add publishes them all
-        chunk_count_before_add = atomic_add(
-            dispatch_chunk_counter_ptr, task_index, fx.Int64(1), scope="agent"
-        )
-        if chunk_count_before_add == fx.Int64(num_chunks - 1):
-            # the last chunk rearms the counter, so every launch starts from 0 whatever its chunk count
-            st(dispatch_chunk_counter_ptr, task_index, fx.Int64(0), scope="agent")
-            bank = dispatch_parity * fx.Int32(num_max_pool_blocks)
-            local_expert = task_index // fx.Int32(num_ranks)
-            atomic_add(dispatch_flag_address, bank + local_expert, fx.Int64(1), scope="sys")
-
-
-@ASTRewriter.transform
-def dispatch_bf16_block(
-    sym: SymBuffer,
-    workspace: Workspace,
-    thread_index: fx.Int32,
     block_index: fx.Int32,
     hidden_size: int,
     input_res: fx.ArithValue,
@@ -184,28 +114,61 @@ def dispatch_bf16_block(
     rank: int,
 ):
     """Push this block's chunk of every expert's task to one dst rank, in ascending expert order."""
-    dst_rank = block_index % fx.Int32(num_ranks)
+    hidden_bytes = hidden_size * 2
+    assert hidden_bytes % 1024 == 0, "hidden*2 must be a multiple of 1024 bytes -> hidden % 512 == 0"
+    hidden_i32 = hidden_bytes // 4  # row stride in i32 words
+    row_stride = num_chunks * _NUM_WARPS
+    num_max_pool_blocks = int(workspace.num_max_pool_blocks)
+    recv_token_base = rank * int(workspace.num_max_tokens_per_rank)
+    # hoist workspace-derived values before any dynamic control flow (rewriter can't carry Workspace)
+    token_buffer_ptr = workspace.get_dispatch_token_buffer_ptr()
+    dispatch_flag_ptr = workspace.get_dispatch_flag_ptr()
+
+    block_dst_rank = block_index % fx.Int32(num_ranks)
     chunk_index = block_index // fx.Int32(num_ranks)
+    warp_id = chunk_index * fx.Int32(_NUM_WARPS) + thread_index // fx.Int32(_WARP)
+
     # ascending expert order: flag[g] complete implies every expert <= g landed (single-flag wait)
-    for expert_idx in range(fx.Int32(num_experts_per_rank)):
-        dispatch_bf16_tile(
-            sym,
-            workspace,
-            thread_index=thread_index,
-            hidden_size=hidden_size,
-            input_res=input_res,
-            expert_send_dst_rank_res=expert_send_dst_rank_res,
-            expert_send_count_res=expert_send_count_res,
-            expert_send_offset_res=expert_send_offset_res,
-            dispatched_token_idx_res=dispatched_token_idx_res,
-            task_index=expert_idx * fx.Int32(num_ranks) + dst_rank,
-            dispatch_parity=dispatch_parity,
-            chunk_index=chunk_index,
-            dispatch_chunk_counter_ptr=dispatch_chunk_counter_ptr,
-            num_chunks=num_chunks,
-            num_ranks=num_ranks,
-            rank=rank,
-        )
+    for local_expert in range(fx.Int32(num_experts_per_rank)):
+        task_index = local_expert * fx.Int32(num_ranks) + block_dst_rank
+        dst_rank = buffer_load(expert_send_dst_rank_res, task_index, vec_width=1, dtype=fx.T.i32())
+        source_offset = buffer_load(expert_send_offset_res, task_index, vec_width=1, dtype=fx.T.i32())
+        token_count = buffer_load(expert_send_count_res, task_index, vec_width=1, dtype=fx.T.i32())
+        token_buffer_address = sym.map(token_buffer_ptr, dst_rank)
+        dispatch_flag_address = sym.map(dispatch_flag_ptr, dst_rank)
+
+        local_count = (token_count - warp_id + fx.Int32(row_stride - 1)) // fx.Int32(row_stride)
+
+        for i in range(local_count):
+            token_idx = buffer_load(
+                dispatched_token_idx_res,
+                source_offset + warp_id + i * fx.Int32(row_stride),
+                vec_width=1,
+                dtype=fx.T.i32(),
+            )
+            # dst = peer dispatch_token_buffer row of this recv token, src = local input; offsets in i32 words
+            copy_warp(
+                token_buffer_address,
+                input_res,
+                hidden_bytes,
+                dst_off=(fx.Int32(recv_token_base) + token_idx) * fx.Int32(hidden_i32),
+                src_off=token_idx * fx.Int32(hidden_i32),
+                load_cache_modifier=18,  # sc1|nt: read data produced by the same agent.
+                store_cache_modifier=19,
+            )
+
+        fx.rocdl.s_waitcnt(0)
+        fx.gpu.barrier()
+        if thread_index == fx.Int32(0):
+            # each chunk's stores retired before its counter add, so the last chunk's flag add publishes them all
+            chunk_count_before_add = atomic_add(
+                dispatch_chunk_counter_ptr, task_index, fx.Int64(1), scope="agent"
+            )
+            if chunk_count_before_add == fx.Int64(num_chunks - 1):
+                # the last chunk rearms the counter, so every launch starts from 0 whatever its chunk count
+                st(dispatch_chunk_counter_ptr, task_index, fx.Int64(0), scope="agent")
+                bank = dispatch_parity * fx.Int32(num_max_pool_blocks)
+                atomic_add(dispatch_flag_address, bank + local_expert, fx.Int64(1), scope="sys")
 
 
 def _pool_row_resource(l2_ptr, pool_row, row_bytes, is_present=True):

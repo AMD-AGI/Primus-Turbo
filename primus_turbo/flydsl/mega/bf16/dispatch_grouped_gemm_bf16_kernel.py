@@ -33,7 +33,7 @@ from primus_turbo.flydsl.mega.bf16.dispatch_prologue_kernel import (
 )
 from primus_turbo.flydsl.mega.bf16.ep_intranode import (
     _BLOCK_THREADS,
-    dispatch_bf16_block,
+    dispatch_bf16_tile,
     spin_until_flag_reaches,
 )
 from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (
@@ -194,7 +194,7 @@ def _make_kernel(
             pool_row_to_recv_token_base = _i64_base(POOL_ROW_TO_RECV_TOKEN)
 
         if block_index < comm_block_count:
-            dispatch_bf16_block(
+            dispatch_bf16_tile(
                 sym_buffer,
                 workspace,
                 thread_index=thread_index,
