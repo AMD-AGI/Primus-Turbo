@@ -11,7 +11,7 @@
 # Adapted from NVIDIA TransformerEngine commit
 # 76ae4b0981849d4b85a528d26f39981974b409f8,
 # transformer_engine/common/triton/cross_entropy.py.
-# Changes: retain TP=1 forward/backward kernels; rename profiler symbols.
+# Changes: retain TP=1 kernels; rename profiler symbols; widen strided addressing.
 # See LICENSE-APACHE for the upstream license.
 
 """Fused cross-entropy loss/statistics and deferred gradient kernels."""
@@ -58,9 +58,13 @@ def turbo_cross_entropy_forward_kernel(
     for i in range(0, n_cols, BLOCK_SIZE):
         offsets = i + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_cols
-        x = tl.load(X_ptr + offsets * X_stride_2, mask=mask, other=float("-inf"))
         if COPY_INPUT:
+            # Preserving input also supports views whose vocabulary stride
+            # spans more than 2**31 elements. Overwrite mode is contiguous.
+            x = tl.load(X_ptr + offsets.to(tl.int64) * X_stride_2, mask=mask, other=float("-inf"))
             tl.store(saved_input_ptr + offsets, x, mask=mask)
+        else:
+            x = tl.load(X_ptr + offsets * X_stride_2, mask=mask, other=float("-inf"))
         x = x.to(tl.float32)
         block_max = tl.max(x)
         m_new = tl.maximum(m, block_max)
