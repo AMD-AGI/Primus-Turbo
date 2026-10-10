@@ -73,7 +73,35 @@ class TestGatherHandoff(unittest.TestCase):
             PRIMUS_EP="1",
             MOE_SKIP_IDENTITY_SORT="1",
         ):
-            self.assertIsNone(gather._new_backward_gather_plan(self.source, self.indices, self.rowmap))
+            self.assertIsNone(
+                gather._new_backward_gather_plan(self.source, self.indices, self.rowmap, enabled=True)
+            )
+
+    def test_forward_payload_mutation_is_rejected(self):
+        for index in range(4):
+            with self.subTest(index=index):
+                placeholder = torch.empty(1, 4).expand(4, 4)
+                payload = [self.source.clone(), self.indices.clone(), torch.ones(4), self.rowmap.clone()]
+                gather.register_permuted_activation_seam(placeholder, *payload)
+                payload[index].view(-1)[0] += 1
+                with self.assertRaisesRegex(RuntimeError, "payload was mutated"):
+                    gather.lookup_permuted_activation_seam(placeholder)
+                self.assertFalse(gather._PERMUTED_ACTIVATION_SEAM_TABLE)
+
+    def test_backward_opt_in_is_an_explicit_argument(self):
+        with patch.object(gather, "_new_backward_gather_plan", return_value=None) as factory:
+            for enabled in (False, True):
+                placeholder = torch.empty(1, 4).expand(4, 4)
+                gather.register_permuted_activation_seam(
+                    placeholder,
+                    self.source,
+                    self.indices,
+                    None,
+                    self.rowmap,
+                    fuse_backward_permute_quant=enabled,
+                )
+                self.assertEqual(factory.call_args.kwargs, {"enabled": enabled})
+                gather.lookup_permuted_activation_seam(placeholder)
 
     def test_routing_mutation_is_rejected(self):
         self.indices[0] = 0
@@ -107,7 +135,7 @@ class TestGatherHandoff(unittest.TestCase):
             expected.view(-1)[::3].zero_()
             torch.testing.assert_close(wrapper.clone(), expected, rtol=0, atol=0)
             self.assertEqual(op.call_count, 1)
-            self.assertIs(torch.add(alias, 1, out=alias), alias)
+            self.assertIs(torch.add(wrapper, 1, out=alias), alias)
             torch.testing.assert_close(wrapper.clone(), expected + 1, rtol=0, atol=0)
 
     def test_copy_returns_original_wrapper_and_updates_alias(self):

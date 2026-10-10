@@ -23,7 +23,9 @@ from torch.utils._pytree import tree_map
 _PERMUTED_ACTIVATION_SEAM_TABLE = {}
 
 
-def register_permuted_activation_seam(placeholder, src, dest2src, permuted_probs, row_id_map=None):
+def register_permuted_activation_seam(
+    placeholder, src, dest2src, permuted_probs, row_id_map=None, *, fuse_backward_permute_quant=False
+):
     key = placeholder.data_ptr()
     if key in _PERMUTED_ACTIVATION_SEAM_TABLE:
         raise RuntimeError("Unconsumed permute/quantize handoff")
@@ -33,7 +35,17 @@ def register_permuted_activation_seam(placeholder, src, dest2src, permuted_probs
         tuple(placeholder.stride()),
         placeholder.dtype,
         placeholder.device,
-        (src, dest2src, permuted_probs, _new_backward_gather_plan(src, dest2src, row_id_map)),
+        (
+            src,
+            dest2src,
+            permuted_probs,
+            _new_backward_gather_plan(src, dest2src, row_id_map, enabled=fuse_backward_permute_quant),
+        ),
+        tuple(
+            _gather_signature(t) if t is not None else None
+            for t in (src, dest2src, permuted_probs, row_id_map)
+        ),
+        row_id_map,
     )
 
 
@@ -48,7 +60,7 @@ def lookup_permuted_activation_seam(x, include_plan=False):
         if x.ndim == 2 and x.shape[0] > 1 and x.stride(0) == 0:
             raise RuntimeError("Unmaterialized permute placeholder has no gather metadata")
         return None
-    storage, shape, stride, dtype, device, payload = entry
+    storage, shape, stride, dtype, device, payload, signatures, row_id_map = entry
     if (
         storage is not x.untyped_storage()
         or shape != tuple(x.shape)
@@ -57,6 +69,10 @@ def lookup_permuted_activation_seam(x, include_plan=False):
         or device != x.device
     ):
         raise RuntimeError("Permute/quantize handoff storage or layout mismatch")
+    current = tuple(_gather_signature(t) if t is not None else None for t in (*payload[:3], row_id_map))
+    if current != signatures:
+        del _PERMUTED_ACTIVATION_SEAM_TABLE[key]
+        raise RuntimeError("Permute/quantize handoff payload was mutated")
     del _PERMUTED_ACTIVATION_SEAM_TABLE[key]
     return payload if include_plan else payload[:3]
 
@@ -102,14 +118,11 @@ class _BackwardGatherPlan:
             raise RuntimeError("Backward gather routing metadata was mutated")
 
 
-def _new_backward_gather_plan(src, d2s, rowmap):
+def _new_backward_gather_plan(src, d2s, rowmap, *, enabled=False):
     if not (
-        os.environ.get("GPTOSS_FUSED_BACKWARD_PERMUTE_QUANT") == "1"
+        enabled
         and torch.is_grad_enabled()
         and not torch.is_inference_mode_enabled()
-        and os.environ.get("PRIMUS_TP") == "1"
-        and os.environ.get("PRIMUS_EP") == "1"
-        and os.environ.get("MOE_SKIP_IDENTITY_SORT") == "1"
         and rowmap is not None
         and type(src) is torch.Tensor
         and src.dtype == torch.bfloat16
@@ -234,11 +247,9 @@ class _BackwardGatherTensor(torch.Tensor):
             "aten::unsqueeze_",
         }:
             raise RuntimeError("Metadata mutation of a deferred MoE gradient is unsupported")
-        wrappers = []
 
         def unwrap(x):
             if isinstance(x, cls):
-                wrappers.append(x)
                 return x._gather_state.dense()
             return x
 
@@ -248,10 +259,15 @@ class _BackwardGatherTensor(torch.Tensor):
         # Preserve Tensor identity for add_, copy_, and out= schemas. Ordinary
         # views may escape as dense aliases; subsequent mutations remain visible
         # because every wrapper shares the same cached dense tensor.
-        if any(a.alias_info is not None and a.alias_info.is_write for a in func._schema.arguments):
+        write_wrappers = []
+        for index, argument in enumerate(func._schema.arguments):
+            if argument.alias_info is not None and argument.alias_info.is_write:
+                value = kwargs.get(argument.name, args[index] if index < len(args) else None)
+                tree_map(lambda x: write_wrappers.append(x) if isinstance(x, cls) else None, value)
+        if write_wrappers:
 
             def restore(x):
-                for wrapper in wrappers:
+                for wrapper in write_wrappers:
                     if x is wrapper._gather_state.materialized:
                         return wrapper
                 return x
