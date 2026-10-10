@@ -419,6 +419,20 @@ def test_fake_tensors_pass_through(rewrites):
     assert rewrites == []
 
 
+def test_rms_norm_backward_passes_through():
+    """torch 2.11 lists plain torch.Tensor in ``types`` for the aten.detach of rms_norm's autograd;
+    that must not be taken for a tensor subclass (every handler returning NotImplemented)."""
+    norm = torch.nn.RMSNorm(64, dtype=torch.bfloat16)
+    x = torch.randn(4, 64, dtype=torch.bfloat16, requires_grad=True)
+    norm(x).sum().backward()
+    expected = x.grad.clone(), norm.weight.grad.clone()
+    x.grad = norm.weight.grad = None
+    with mm_layout_workaround():
+        norm(x).sum().backward()
+    assert torch.equal(x.grad, expected[0])
+    assert torch.equal(norm.weight.grad, expected[1])
+
+
 def test_gemms_inside_a_tensor_subclass_are_rewritten(rewrites):
     two_tensor = pytest.importorskip("torch.testing._internal.two_tensor")
     a1, b1 = _operands("dgrad", 96, 64, 80)

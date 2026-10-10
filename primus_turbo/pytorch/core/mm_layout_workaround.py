@@ -257,7 +257,9 @@ class _MMLayoutWorkaroundMode(TorchDispatchMode):
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
-        if types:
+        # `types` can also hold plain torch.Tensor (e.g. the aten.detach of rms_norm's autograd on
+        # torch 2.11); like torch's own modes, count only real subclasses.
+        if any(t not in (torch.Tensor, torch.nn.Parameter) for t in types):
             # A tensor subclass with its own __torch_dispatch__ (DTensor, FakeTensor, ...) is
             # never rewritten itself. With no other mode below this one, NotImplemented hands
             # the call to the subclass while this mode stays active, so the plain-tensor GEMMs
