@@ -14,6 +14,7 @@ import torch.distributed as dist
 
 import primus_turbo.pytorch as turbo
 from primus_turbo.common.constants import ENV_EP_FORCE_CURRENT_STREAM
+from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.deep_ep import Config
 from primus_turbo.pytorch.kernels.moe.moe_dispatch_combine_impl import (
     clear_backend_instances,
@@ -126,6 +127,9 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         deepep_use_comm_stream: when False, pin EP kernels to the current stream.
         deepep_num_worst_tokens: ``> 0`` enables worst-case allocation mode.
         deepep_use_cuda_num_tokens_per_expert: keep ``tokens_per_expert`` on device.
+        permute_backend: ``moe_permute`` / ``moe_unpermute`` backend. TURBO (default) is the
+            faster scatter / gather; it skips tokens past the routed count, which is safe
+            here because DeepEP receives only routed tokens (worst-case padding rows trail).
     """
 
     # C++ helper caches the env once per process; first dispatcher wins, later
@@ -150,6 +154,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         deepep_num_worst_tokens: int = 0,
         deepep_use_cuda_num_tokens_per_expert: Optional[bool] = False,
         deepep_autotune_config: Optional[Config] = None,
+        permute_backend: BackendType = BackendType.TURBO,
     ):
         super().__init__(num_experts, router_topk, ep_group, tp_group, tp_ep_group)
 
@@ -187,6 +192,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
 
         self.pad_multiple = pad_multiple
         self.permute_max_token_num = permute_max_token_num
+        self.permute_backend = permute_backend
 
         self.deepep_async_finish = deepep_async_finish
         self.deepep_allocate_on_comm_stream = deepep_allocate_on_comm_stream
@@ -343,6 +349,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
             num_permuted_tokens=num_permuted_tokens,
             probs=dispatched_probs,
             probs_layout="topk",  # dispatched_probs is [num_dispatched, router_topk]
+            backend=self.permute_backend,
         )
 
         if not self.deepep_use_cuda_num_tokens_per_expert:
@@ -361,6 +368,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
             restore_shape=self.hidden_shape_before_permute,
             num_local_experts=self.num_local_experts,
             pad_multiple=self.pad_multiple,
+            backend=self.permute_backend,
         )
         return hidden_states
 
