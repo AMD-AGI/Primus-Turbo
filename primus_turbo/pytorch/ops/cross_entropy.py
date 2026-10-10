@@ -1,5 +1,8 @@
+###############################################################################
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
 # See LICENSE for license information.
+###############################################################################
 
 """Single-rank vocabulary cross entropy with deferred gradient construction."""
 
