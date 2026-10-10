@@ -81,6 +81,16 @@ def _infer_qkv_format(
     return q_format
 
 
+def _restore_qkv_storage(o: torch.Tensor, qkv_format: str) -> torch.Tensor:
+    """Give a bshd-contiguous ``[b, s, h, d]`` output the storage layout ``qkv_format``
+    names, keeping its logical shape ``[b, s, h, d]``."""
+    if qkv_format == "sbhd":
+        return o.transpose(0, 1).contiguous().transpose(0, 1)
+    if qkv_format == "bhsd":
+        return o.transpose(1, 2).contiguous().transpose(1, 2)
+    return o
+
+
 def block_scaling_node(tensor, use_fp8, BLOCK_M=FIXED_BLOCK_M, float8_dtype=None):
     """
     Used to scale tensor in per-block mode

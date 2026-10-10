@@ -1165,6 +1165,42 @@ def test_attention_fp8(batch, dtype, config, causal):
     assert value_grad_snr > 20, "value_grad_snr too low"
 
 
+@pytest.mark.parametrize("qkv_format", ["bshd", "sbhd", "bhsd"])
+@pytest.mark.parametrize("causal", [True, False])
+def test_attention_fp8_strided_layout(qkv_format, causal):
+    device = "cuda"
+    torch.manual_seed(1234)
+    batch, seqlen, num_head_q, num_head_kv, head_dim = 2, 1024, 16, 4, 128
+
+    def make(num_head):
+        # Logical [b, s, h, d] with qkv_format storage, as callers such as Megatron pass sbhd views.
+        if qkv_format == "sbhd":
+            t = torch.randn(seqlen, batch, num_head, head_dim, device=device).transpose(0, 1)
+        elif qkv_format == "bhsd":
+            t = torch.randn(batch, num_head, seqlen, head_dim, device=device).transpose(1, 2)
+        else:
+            t = torch.randn(batch, seqlen, num_head, head_dim, device=device)
+        return t.to(torch.bfloat16).requires_grad_()
+
+    query, key, value = make(num_head_q), make(num_head_kv), make(num_head_kv)
+    grad_out = torch.randn(batch, seqlen, num_head_q, head_dim, device=device, dtype=torch.bfloat16)
+    query_ref, key_ref, value_ref = (t.detach().contiguous().requires_grad_() for t in (query, key, value))
+
+    sm_scale = head_dim ** (-0.5)
+    o_ref = attention_vanilla_forward_pytorch_ref_impl(query_ref, key_ref, value_ref, sm_scale, causal)
+    o_ref.backward(grad_out)
+    o = flash_attn_fp8_func(query, key, value, softmax_scale=sm_scale, causal=causal)
+    o.backward(grad_out)
+    torch.cuda.synchronize()
+
+    assert o.shape == o_ref.shape
+    assert _infer_qkv_format(o, o, o) == qkv_format
+    assert compute_snr(o_ref, o) > 20, "out_snr too low"
+    assert compute_snr(query_ref.grad, query.grad) > 20, "query_grad_snr too low"
+    assert compute_snr(key_ref.grad, key.grad) > 20, "key_grad_snr too low"
+    assert compute_snr(value_ref.grad, value.grad) > 20, "value_grad_snr too low"
+
+
 @pytest.mark.parametrize("batch", [4])
 @pytest.mark.parametrize("config", test_cases)
 @pytest.mark.parametrize("causal", [True, False])
