@@ -46,6 +46,24 @@ from flydsl.expr.typing import Vector as Vec
 from primus_turbo.flydsl.utils.gemm_helper import block_mn, run_compiled, xcd_remap_pid
 
 _A_ELEM = {"fp4": Float4E2M1FN, "fp6": Float6E2M3FN, "fp8": Float8E4M3FN}
+# f8f6f4 operand format codes (the MFMA's cbsz / blgp fields).
+_F8F6F4_FMT = {"fp4": 4, "fp6": 2, "fp8": 0}
+# tile_m=256 ring: m-row g's A fragment is read in group g-_VS_A_AHEAD's region.
+_VS_A_AHEAD = 2
+
+
+def _mfma_scale_agpr(src0, src1, acc, sc0, sc1, os0, os1, fmt0, fmt1):
+    """One v_mfma_scale_f32_16x16x128_f8f6f4 with D = C tied and pinned to AGPRs (tile_m=256).
+    os0/os1 pick the E8M0 byte of sc0/sc1, fmt0/fmt1 are src0/src1's format codes."""
+    v4f32 = ir.VectorType.get([4], ir.F32Type.get())
+    osel = f"op_sel:[{os0 & 1},{os1 & 1},0] op_sel_hi:[{(os0 >> 1) & 1},{(os1 >> 1) & 1},0]"
+    return _llvm.inline_asm(
+        v4f32,
+        [_to_raw(src0), _to_raw(src1), _to_raw(acc), _to_raw(sc0), _to_raw(sc1)],
+        f"v_mfma_scale_f32_16x16x128_f8f6f4 $0, $1, $2, $0, $4, $5 {osel} cbsz:{fmt0} blgp:{fmt1}",
+        "=a,v,v,0,v,v",
+        has_side_effects=False,
+    )
 
 
 def _scale_mma_atoms(a_dtype, b_first=False):
@@ -130,6 +148,8 @@ def launch_gemm(
     has_bias: Constexpr[bool],
     a_stages: Constexpr[int],
     a_pipe: Constexpr[int],
+    fi: Constexpr[int],
+    store_mode: Constexpr[int],
 ):
     """Direct @flyc.jit launcher. Operands are fx.Pointer (pass ptr_arg(t): raw data_ptr, no
     per-launch DLPack). Compile once with flyc.compile, then cf(*runtime). a_dtype fp4/fp6/fp8
@@ -160,6 +180,21 @@ def launch_gemm(
     2 (or those conditions unmet) = the double-buffered U2 loop.
     a_pipe>0 (a_stages=3 ring only): each half reads m-row mi's A fragment a_pipe m-rows ahead
     of mi's MFMAs instead of reading all A fragments before the first MFMA; 0 = the latter.
+    tile_m=256 keeps the 1x4 wave split (wave w owns the 256 x tile_n/4 C block w, so no B
+    fragment is loaded by two waves), keeps the accumulators in AGPRs through inline-asm MFMAs
+    (one wave per SIMD, so pass waves_per_eu=1) and, in the a_stages=3 ring with a_pipe=0, runs
+    each half's MFMAs as one group per m-row with the half's loads issued in the gaps between
+    the groups, reads each m-row's A fragment _VS_A_AHEAD groups ahead, and (epi=2) runs the
+    last chunk peeled with m-row g's C stores in the gap after group g+1 of its last half.
+    fi (that tile_m=256 ring only) orders the pieces of m-row group g, each between
+    sched_barrier(0) fences, with the MFMAs in the same order: 0 = the A read of m-row
+    g+_VS_A_AHEAD, the group's MFMAs, then the gap's load item; 1 = MFMA 0, A read, MFMA 1, load
+    item, the other MFMAs; 2 = MFMA 0, load item, MFMA 1, A read, the other MFMAs; 3 = A read,
+    MFMA 0, load item, the other MFMAs.
+    store_mode (epi=2 with 4 n-fragments per wave, i.e. 128 B of each C row per wave): 0 = each
+    m-row in two stores of 16 rows x 64 B, the two halves of every 128 B line in separate
+    stores; 1/2/3 = lanes j and j^8 of each 16-lane row trade halves (DPP row_ror:8), so each of
+    the two stores writes 8 full 128 B lines, cached (1), nt (2) or sc0|nt (3). Same bytes.
     """
     BM, BN, BK = tile_m, tile_n, tile_k
     if const_expr(out_dtype == "bf16"):
@@ -212,8 +247,12 @@ def launch_gemm(
     k_halves = BK // 128  # 16x16x128 MFMA k-steps per K-tile
     # e8m0 scales are 256-K granular, B 128-K: tiles_per_chunk K-tiles share a word (hi/lo 16b = 128-K half).
     tiles_per_chunk = 256 // BK  # 1 for tile_k=256, 2 for tile_k=128
+    # tile_m=256: all BM rows x BN/4 columns per wave as at tile_m=128, accumulators in AGPRs.
+    bm256 = BM == 256
     m_chunks = BM // 16
-    num_acc_n = (BN // 4) // 16  # 16-col n-subblocks per wave
+    num_acc_n = BN // 4 // 16  # 16-col n-subblocks per wave
+    n_sa_words = BM // 32  # A-scale words per 256-K chunk for the whole workgroup
+    n_sa_dma = max(1, n_sa_words // 4)  # sa_lds A-scale DMAs per wave per chunk
     _scale_chunk_dw = (K // 32 // 4 // 2) * 64  # e8m0 stride (dwords), per shuffle_scale_w4
     _scale_k0_dw = 64
     n_coop = A_REAL_B // 256 // 16  # 16B cooperative loads per thread (unpadded data volume)
@@ -221,16 +260,25 @@ def launch_gemm(
     m_pairs = max(1, m_chunks // 2)
     # U2 K loop (b_prefetch 1/2, described at the loop below): two K-tiles per 256-K scale chunk.
     u2 = b_prefetch > 0 and tiles_per_chunk == 2 and K_TILES % 2 == 0
-    # sa_lds maps A-scale word w of a chunk to wave w, so it needs m_pairs == 4 waves.
-    sa_lds_on = sa_lds > 0 and u2 and m_pairs == 4
-    SC_LDS_B = 2 * m_pairs * 256  # two chunk slots x m_pairs words x 64 lanes x 4 B
+    # sa_lds maps A-scale word w (and w + 4, .. at tile_m=256) of a chunk to wave w and every
+    # wave reads all n_sa_words words back, so it needs a multiple of 4 words.
+    sa_lds_on = sa_lds > 0 and u2 and m_pairs == n_sa_words and n_sa_words % 4 == 0
+    SC_LDS_B = 2 * n_sa_words * 256  # two chunk slots x n_sa_words words x 64 lanes x 4 B
     # a_stages=3 (sa_lds U2 loop, chunk count a multiple of 3): three A LDS slots, each its own
     # LDS symbol; the loop runs three chunks per iteration so every half addresses its slots
     # through a fixed symbol (see the loop below).
     a3 = a_stages == 3 and sa_lds_on and (K_TILES // 2) % 3 == 0
+    # tile_m=256 ring: the half's loads go between one-m-row MFMA groups, in vs_np parts of B
+    # and vs_np parts of the A DMA (see the loop below).
+    vsplit = bm256 and a3 and a_pipe == 0
+    vs_np = m_chunks // 2
+    vs_b = [list(range(p * num_acc_n // vs_np, (p + 1) * num_acc_n // vs_np)) for p in range(vs_np)]
+    vs_c = [list(range(p * n_coop // vs_np, (p + 1) * n_coop // vs_np)) for p in range(vs_np)]
 
     # Scheduler counts per loop iter: MFMAs, A LDS reads/thread (fp6/fp8 2 per (mi,kh)), gmem loads.
     sched_mfma_total = k_halves * m_chunks * num_acc_n
+    # sched_mfma hints do not match inline-asm MFMAs (tile_m=256), so none are emitted there.
+    n_mfma_hints = 0 if bm256 else sched_mfma_total
     if const_expr(a_dtype == "fp4"):
         a_ds_per = 1
     else:
@@ -278,6 +326,11 @@ def launch_gemm(
         tid = fx.Int32(fx.thread_idx.x)
         bid_x, bid_y, bid_z = fx.block_idx
         wave = rocdl.readfirstlane(T.i32, tid // 64)
+
+        def wave_col0():
+            # First C column of this wave within the tile.
+            return wave * (BN // 4)
+
         lane = tid % 64
         lane_div_16 = lane // 16
         lane_mod_16 = lane % 16
@@ -390,8 +443,9 @@ def launch_gemm(
         # -- done ONCE per call on scalar (uniform) registers, not per-lane and not per n_coop
         # fragment, versus the four wide per-lane VALU address chains (one per `n_coop` fragment)
         # this is meant to let the backend hoist out of the K loop entirely.
-        def dma_a_to_lds(kt, parity, slot_i8=None):
+        def dma_a_to_lds(kt, parity, slot_i8=None, irange=None):
             # slot_i8 (a3): the destination slot's own LDS symbol; otherwise buffer `parity` off a0.
+            # irange: issue only these cooperative loads (the tile_m=256 ring's DMA parts).
             if const_expr(slot_i8 is not None):
                 wave_b = CHUNK_B if pad16 > 0 else 64 * 16
                 lds_ptr = fx.add_offset(slot_i8, rocdl.readfirstlane(T.i32, wave * wave_b))
@@ -413,8 +467,16 @@ def launch_gemm(
                 num_records_bytes=a_nrec - kt_byte,
             )
             a_flat_div_kt = fx.logical_divide(a_flat_kt, fx.make_layout(1, 1))
+            lds_ptr0 = lds_ptr
             for i in range_constexpr(n_coop):
-                if const_expr(i > 0):
+                if const_expr(irange is not None):
+                    if const_expr(i not in irange):
+                        continue
+                    if const_expr(i > 0):
+                        lds_ptr = fx.add_offset(
+                            lds_ptr0, fx.Int32(i * (4 * CHUNK_B if pad16 > 0 else 256 * 16))
+                        )
+                elif const_expr(i > 0):
                     if const_expr(pad16 > 0):
                         lds_ptr = fx.add_offset(lds_ptr, fx.Int32(4 * CHUNK_B))
                     else:
@@ -502,7 +564,7 @@ def launch_gemm(
                         av.append(t)
             return av
 
-        n_col_base = by_n + wave * (BN // 4)
+        n_col_base = by_n + wave_col0()
         bq_views = [
             _bq_view(arg_b, n_col_base + ni * 16, KH4, K_TILES, k_halves) for ni in range_constexpr(num_acc_n)
         ]
@@ -558,11 +620,17 @@ def launch_gemm(
             a_sc_base_w = (bx_m // 32 + wave) * sca_rstride
 
         def dma_sa_to_lds(chunk_kt, slot):
-            # Wave w DMAs word w of the chunk (64 lanes x 4 B); drained like the A DMA it follows.
-            lds_ptr = fx.add_offset(sSC_i8, rocdl.readfirstlane(T.i32, slot * (m_pairs * 256) + wave * 256))
-            soff = rocdl.readfirstlane(T.i32, (a_sc_base_w + chunk_kt * _scale_k0_dw) * 4)
-            src = fx.slice(sa_flat_i8, (None, sc_lane * 4))
-            fx.copy(sc_dma_atom, src, fx.make_view(lds_ptr, fx.make_layout(1, 1)), soffset=soff)
+            # Wave w DMAs words w, w + 4, .. of the chunk (64 lanes x 4 B); drained like the A DMA
+            # it follows.
+            for r in range_constexpr(n_sa_dma):
+                word = wave if r == 0 else wave + 4 * r
+                w_base = a_sc_base_w if r == 0 else a_sc_base_w + (4 * r) * sca_rstride
+                lds_ptr = fx.add_offset(
+                    sSC_i8, rocdl.readfirstlane(T.i32, slot * (n_sa_words * 256) + word * 256)
+                )
+                soff = rocdl.readfirstlane(T.i32, (w_base + chunk_kt * _scale_k0_dw) * 4)
+                src = fx.slice(sa_flat_i8, (None, sc_lane * 4))
+                fx.copy(sc_dma_atom, src, fx.make_view(lds_ptr, fx.make_layout(1, 1)), soffset=soff)
 
         def read_sa(slot):
             sa = []
@@ -575,10 +643,12 @@ def launch_gemm(
 
         n_acc = m_chunks * num_acc_n
 
-        def load_b(kt):
-            # buffer_load_dwordx4 straight into i32[4] register fragments.
+        def load_b(kt, nis=None):
+            # buffer_load_dwordx4 straight into i32[4] register fragments; nis: only these n-frags.
             ops = []
             for ni in range_constexpr(num_acc_n):
+                if const_expr(nis is not None and ni not in nis):
+                    continue
                 for kh in range_constexpr(k_halves):
                     bf = fx.make_rmem_tensor(4, Int32)
                     fx.copy_atom_call(b_copy, bq_views[ni][lane_div_16, lane_mod_16, kt, kh, None], bf)
@@ -621,8 +691,8 @@ def launch_gemm(
             ]
             return sa, sb
 
-        def compute(accs, av, bv, sa_v, sb_v, scale_shift=None, mis=None):
-            # mis: run only these m-rows' MFMAs.
+        def compute(accs, av, bv, sa_v, sb_v, scale_shift=None, mis=None, nis=None):
+            # mis: run only these m-rows' MFMAs; nis (tile_m=256 only): only these n-fragments.
             # tile_k=128: shift the active 128-K half of the shared 256-K word into the opsel's low bytes.
             if const_expr(scale_shift is not None):
                 sa_v = [v.shrui(scale_shift) for v in sa_v]
@@ -630,6 +700,50 @@ def launch_gemm(
             # kh OUTERMOST: consecutive MFMAs hit distinct accumulators (dense issue). Each
             # scaled MFMA = fx.gemm over rank-1 i32[4] A/B frags, e8m0 word on scale_a=/scale_b=.
             mi_set = list(range(m_chunks)) if mis is None else list(mis)
+            if const_expr(bm256):
+                # The same MFMAs in the same order, as inline asm whose D = C is tied to an AGPR.
+                fmt_a = _F8F6F4_FMT[a_dtype]
+                a_vals = {}
+                for mi in mi_set:
+                    for kh in range_constexpr(k_halves):
+                        a_vals[mi * k_halves + kh] = Vec(
+                            fx.memref_load_vec(av[mi * k_halves + kh])
+                        ).ir_value()
+                b_vals = [Vec(fx.memref_load_vec(t)).ir_value() for t in bv]
+                ni_set = list(range(num_acc_n)) if nis is None else list(nis)
+                for kh in range_constexpr(k_halves):
+                    for ni in ni_set:
+                        np_i, in_b = ni // 2, ni % 2
+                        for mi in mi_set:
+                            mp_i, im = mi // 2, mi % 2
+                            idx = mi * num_acc_n + ni
+                            osa, osb = kh * 2 + im, kh * 2 + in_b
+                            a_f, b_f = a_vals[mi * k_halves + kh], b_vals[ni * k_halves + kh]
+                            if const_expr(epi == 2):
+                                accs[idx] = _mfma_scale_agpr(
+                                    b_f,
+                                    a_f,
+                                    accs[idx],
+                                    sb_v[np_i],
+                                    sa_v[mp_i],
+                                    osb,
+                                    osa,
+                                    _F8F6F4_FMT["fp4"],
+                                    fmt_a,
+                                )
+                            else:
+                                accs[idx] = _mfma_scale_agpr(
+                                    a_f,
+                                    b_f,
+                                    accs[idx],
+                                    sa_v[mp_i],
+                                    sb_v[np_i],
+                                    osa,
+                                    osb,
+                                    fmt_a,
+                                    _F8F6F4_FMT["fp4"],
+                                )
+                return accs
             c_frags = [None] * n_acc
             for mi in mi_set:
                 for ni in range_constexpr(num_acc_n):
@@ -689,7 +803,7 @@ def launch_gemm(
             # Interleave the MFMAs with the tile's vmem + A-LDS loads: preload all hints, then issue MFMAs 1-by-1.
             rocdl.sched_vmem(sched_num_gmem)
             rocdl.sched_dsrd(sched_num_ds_load)
-            for _ in range_constexpr(sched_mfma_total):
+            for _ in range_constexpr(n_mfma_hints):
                 rocdl.sched_mfma(1)
             rocdl.sched_barrier(0)
 
@@ -748,7 +862,7 @@ def launch_gemm(
             else:
                 rocdl.sched_vmem(n_coop + n_vmem)
                 rocdl.sched_dsrd(sched_num_ds_load)
-            for _ in range_constexpr(sched_mfma_total):
+            for _ in range_constexpr(n_mfma_hints):
                 rocdl.sched_mfma(1)
             rocdl.sched_barrier(0)
 
@@ -763,7 +877,7 @@ def launch_gemm(
                 rocdl.s_waitcnt(0)
 
         def sched_mfma_region():
-            for _ in range_constexpr(sched_mfma_total):
+            for _ in range_constexpr(n_mfma_hints):
                 rocdl.sched_mfma(1)
             rocdl.sched_barrier(0)
 
@@ -775,6 +889,125 @@ def launch_gemm(
             t = fx.make_rmem_tensor(4, Int32)
             t.store(Vec(v))
             return t
+
+        # epi=2 ring: the last chunk runs peeled after the loop with the C stores in its gaps.
+        epi_ov = vsplit and epi == 2 and N_CH // 3 >= 1
+
+        def vs_chunk(jj, c, accs, sb_v, bv0, store_fn=None):
+            # One chunk (two halves) of the tile_m=256 ring, see the K loop below. store_fn (the
+            # peeled last chunk): half 0 issues only B(t0+1) -- the tail scale loads, A DMA and
+            # A-scale DMA would be redundant, and the end-of-half wait counts the B loads only --
+            # and half 1 issues no loads; store_fn(accs, mi) stores m-row mi's C in the gap after
+            # the next m-row's group, once mi's accumulators are final.
+            last = store_fn is not None
+            ch = jj * 3 + c
+            t0 = ch * 2
+            nch = ch + 1
+            ch_pf = nch - nch // N_CH  # clamp the last chunk prefetch to N_CH-1
+            sc_slot = ch % 2
+            sa_v = read_sa(sc_slot)
+            la = min(_VS_A_AHEAD, m_chunks)
+
+            def a_first(sl):
+                # The first la m-rows' A fragments at the half's top, the rest group by group.
+                return {r: read_a(None, sl, [r]) for r in range(la)}
+
+            def a_group(sl, fr, g):
+                if const_expr(g + la < m_chunks):
+                    fr[g + la] = read_a(None, sl, [g + la])
+                return fr[g]
+
+            def fi_group(accs, sl, fr, g, bv, shift, item):
+                # fi>0: m-row g's MFMAs with the A read of row g+la and the gap's load item
+                # between them, each piece fenced.
+                av = fr[g]
+                if const_expr(fi == 1):
+                    seq = [("m", [0]), ("r", None), ("m", [1]), ("i", None), ("m", list(range(2, num_acc_n)))]
+                elif const_expr(fi == 2):
+                    seq = [("m", [0]), ("i", None), ("m", [1]), ("r", None), ("m", list(range(2, num_acc_n)))]
+                else:
+                    seq = [("r", None), ("m", [0]), ("i", None), ("m", list(range(1, num_acc_n)))]
+                for kind, nis in seq:
+                    rocdl.sched_barrier(0)
+                    if const_expr(kind == "m"):
+                        accs = compute(accs, av, bv, list(sa_v), list(sb_v), shift, [g], nis)
+                    elif const_expr(kind == "r"):
+                        if const_expr(g + la < m_chunks):
+                            fr[g + la] = read_a(None, sl, [g + la])
+                    else:
+                        item()
+                rocdl.sched_barrier(0)
+                return accs
+
+            sl0 = slot_i32[(2 * c) % 3]
+            fr = a_first(sl0)
+            kt_a = clamp_kt(t0 + 2)
+            bparts = [load_b(t0 + 1, vs_b[0])]
+            if const_expr(last):
+                sb_next = sb_v
+            else:
+                sa_next, sb_next = load_sc(ch_pf)
+            for g in range_constexpr(m_chunks):
+
+                def item0(g=g):
+                    if const_expr(g + 1 < vs_np):
+                        bparts.append(load_b(t0 + 1, vs_b[g + 1]))
+                    elif const_expr(g + 1 < 2 * vs_np and not last):
+                        dma_a_to_lds(kt_a, None, slot_i8[(2 * c + 2) % 3], vs_c[g + 1 - vs_np])
+                        if const_expr(g + 2 == 2 * vs_np):
+                            dma_sa_to_lds(ch_pf, fx.Int32(1) - sc_slot)
+
+                if const_expr(fi != 0):
+                    accs = fi_group(accs, sl0, fr, g, bv0, None, item0)
+                    continue
+                rocdl.sched_barrier(0)
+                av = a_group(sl0, fr, g)
+                accs = compute(accs, av, bv0, list(sa_v), list(sb_v), None, [g])
+                rocdl.sched_barrier(0)
+                item0()
+            bv1 = sum(bparts, [])
+            if const_expr(last):
+                wait_vmcnt(n_bfr)
+            else:
+                wait_vmcnt(n_bfr + n_sc + n_coop + n_sa_dma)
+            rocdl.s_barrier()
+            sl1 = slot_i32[(2 * c + 1) % 3]
+            fr = a_first(sl1)
+            kt_b = clamp_kt(t0 + 2)
+            kt_a = clamp_kt(t0 + 3)
+            bparts = [] if last else [load_b(kt_b, vs_b[0])]
+            for g in range_constexpr(m_chunks):
+
+                def item1(g=g):
+                    if const_expr(last):
+                        pass
+                    elif const_expr(g + 1 < vs_np):
+                        bparts.append(load_b(kt_b, vs_b[g + 1]))
+                    elif const_expr(g + 1 < 2 * vs_np):
+                        dma_a_to_lds(kt_a, None, slot_i8[(2 * c + 3) % 3], vs_c[g + 1 - vs_np])
+
+                if const_expr(fi != 0):
+                    accs = fi_group(accs, sl1, fr, g, bv1, fx.Int32(16), item1)
+                    if const_expr(last and g > 0):
+                        store_fn(accs, g - 1)
+                    continue
+                rocdl.sched_barrier(0)
+                av = a_group(sl1, fr, g)
+                accs = compute(accs, av, bv1, list(sa_v), list(sb_v), fx.Int32(16), [g])
+                rocdl.sched_barrier(0)
+                if const_expr(last):
+                    if const_expr(g > 0):
+                        store_fn(accs, g - 1)
+                else:
+                    item1()
+            if const_expr(last):
+                rocdl.sched_barrier(0)
+                store_fn(accs, m_chunks - 1)
+                return accs, sb_v, []
+            bv0 = sum(bparts, [])
+            wait_vmcnt(n_bfr + n_coop)
+            rocdl.s_barrier()
+            return accs, sb_next, bv0
 
         if const_expr(a3):
             dma_a_to_lds(fx.Int32(0), None, slot_i8[0])
@@ -797,7 +1030,7 @@ def launch_gemm(
                 fx.make_layout(4, 1),
             )
             bias_copy64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), out_elem)
-            col_t4 = (by_n + wave * (BN // 4) + lane_div_16 * 4) // 4
+            col_t4 = (by_n + wave_col0() + lane_div_16 * 4) // 4
             bias_t = []
             for ni in range_constexpr(num_acc_n):
                 bt = fx.make_rmem_tensor(4, out_elem)
@@ -817,7 +1050,8 @@ def launch_gemm(
             gpu.barrier()
         loop_init = accs_init + list(sa_pf0) + list(sb_pf0) + [b.load().ir_value() for b in b_pf0]
         if const_expr(a3):
-            n_iters = N_CH // 3
+            # epi_ov: the last iteration runs peeled after the loop, with the C stores in it.
+            n_iters = N_CH // 3 - (1 if epi_ov else 0)
         elif const_expr(u2):
             n_iters = N_CH
         else:
@@ -834,13 +1068,24 @@ def launch_gemm(
                 # waits on B(t+1) in half t+1 never retire that DMA (vmcnt is in order). Its drain
                 # moves one half later: the end of half t retires A(t+1), issued in half t-1,
                 # with vmcnt(<loads issued after it>): 4 B + 2 scales + 4 DMA + 1 A-scale DMA = 11
-                # after half 0, 4 B + 4 DMA = 8 after half 1 (A(t+2) and the A-scale DMA of half 0).
+                # after half 0, 4 B + 4 DMA = 8 after half 1 (A(t+2) and the A-scale DMA of half 0);
+                # 8 + 4 + 8 + 2 = 22 and 8 + 8 = 16 at tile_m=256.
                 # Slot (t+2)%3 was last read by K-tile t-1, one barrier earlier. The halves end
                 # with a bare s_barrier: the waits above already order LDS, and gpu.barrier()'s
                 # workgroup release fence would also drain the A(t+2) DMA (vmcnt(0)).
                 jj = fx.Int32(iv)
                 bv0 = [_frag(v) for v in state[n_acc + n_sc :]]
                 for c in range_constexpr(3):
+                    if const_expr(vsplit):
+                        # tile_m=256 (one wave per SIMD): m-row g's MFMAs run as group g between
+                        # sched_barrier(0) fences and the half's loads go into the gaps in their
+                        # usual order: B part 0 (and in half 0 the scales) before group 0, then one
+                        # B part per gap, then the A-DMA parts, the A-scale DMA after the last one.
+                        # Issued in one burst they stall the single wave behind a full VMEM queue.
+                        # Every load is still issued after the previous half's DMA, so the same
+                        # vmcnt counts retire the same DMAs; MFMA order per accumulator is unchanged.
+                        accs, sb_v, bv0 = vs_chunk(jj, c, accs, sb_v, bv0)
+                        continue
                     ch = jj * 3 + c
                     t0 = ch * 2
                     nch = ch + 1
@@ -861,7 +1106,7 @@ def launch_gemm(
                     else:
                         accs = compute(accs, av, bv0, list(sa_v), list(sb_v), None)
                         sched_mfma_region()
-                    wait_vmcnt(n_bfr + n_sc + n_coop + 1)
+                    wait_vmcnt(n_bfr + n_sc + n_coop + n_sa_dma)
                     rocdl.s_barrier()
                     # half 1: A(t0+1) in slot (2c+1)%3, B(t0+1), chunk ch's high scale half.
                     if const_expr(a_pipe == 0):
@@ -912,7 +1157,7 @@ def launch_gemm(
                     if const_expr(sa_lds_on):
                         dma_sa_to_lds(ch_pf, fx.Int32(1) - sc_slot)
                 accs = compute(accs, av, bv0, list(sa_v), list(sb_v), None)
-                sched_half(n_bfr + n_sc + (1 if sa_lds_on and b_prefetch != 2 else 0))
+                sched_half(n_bfr + n_sc + (n_sa_dma if sa_lds_on and b_prefetch != 2 else 0))
                 drain_half(n_bfr + n_sc)
                 gpu.barrier()
                 # half 1: A(kt1) in LDS buffer 1, B(kt1), chunk j's high scale half.
@@ -975,7 +1220,8 @@ def launch_gemm(
         )
         c_copy = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), out_elem)
         c_rstride = fx.Int32(c_stride)
-        col_w = by_n + wave * (BN // 4) + lane_mod_16
+        col_w = by_n + wave_col0() + lane_mod_16
+        bx_w = bx_m  # this wave's first C row
         # Bias joins the bf16-rounded product in fp32 and rounds again: the same bytes as a
         # separate `out + bias`, which is what the caller would otherwise launch.
         if const_expr(has_bias and epi == 2):
@@ -1011,12 +1257,20 @@ def launch_gemm(
                 fx.make_layout(8, 1),
             )
             c_copy128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), out_elem)
-            col_l = by_n + wave * (BN // 4) + (lane_div_16 % 2) * 16 + (lane_div_16 // 2) * 8
-            for mi in range_constexpr(m_chunks):
-                row_t = bx_m + mi * 16 + lane_mod_16
+            col_l = by_n + wave_col0() + (lane_div_16 % 2) * 16 + (lane_div_16 // 2) * 8
+            c_full = store_mode > 0 and num_acc_n == 4
+            if const_expr(c_full):
+                # buffer_store cache policy bits (gfx950): sc0 = 1, nt = 2.
+                c_cpol = {1: 0, 2: 2, 3: 3}[store_mode]
+                c_copy128_fl = fx.make_copy_atom(fx.rocdl.BufferCopy128b(c_cpol), out_elem)
+
+            def store_mrow(accs_s, mi, fence=False):
+                # fence: a scheduling fence after each store (the last m-row of the peeled chunk).
+                row_t = bx_w + mi * 16 + lane_mod_16
+                pair_w = []
                 for p in range_constexpr(num_acc_n // 2):
-                    va = Vec(accs[mi * num_acc_n + 2 * p])
-                    vb = Vec(accs[mi * num_acc_n + 2 * p + 1])
+                    va = Vec(accs_s[mi * num_acc_n + 2 * p])
+                    vb = Vec(accs_s[mi * num_acc_n + 2 * p + 1])
                     if const_expr(has_bias):
                         va = va.to(out_elem).to(Float32) + bias_f[2 * p]
                         vb = vb.to(out_elem).to(Float32) + bias_f[2 * p + 1]
@@ -1026,16 +1280,56 @@ def launch_gemm(
                     d_b1 = rocdl.cvt_pk_bf16_f32(vb[2], vb[3])
                     w0, w2 = _permlane16_swap(d_a0, d_b0)
                     w1, w3 = _permlane16_swap(d_a1, d_b1)
+                    if const_expr(c_full):
+                        pair_w.append([w0, w1, w2, w3])
+                        continue
                     t8 = fx.make_rmem_tensor(8, out_elem)
                     t8.store(Vec.from_elements([w0, w1, w2, w3], Int32).bitcast(out_elem))
                     off = row_t * c_rstride + col_l + p * 32
                     fx.copy(c_copy128, t8, c_flat8[None, off // 8])
+                    if const_expr(fence):
+                        rocdl.sched_barrier(0)
+                if const_expr(c_full):
+                    # Lane j of a 16-lane row holds C row j. Store 0 (rows 0-7): lanes 0-7 keep
+                    # their pair 0, lanes 8-15 take lane j-8's pair 1; store 1 (rows 8-15): lanes
+                    # 0-7 take lane j+8's pair 0, lanes 8-15 keep their pair 1.
+                    x0, x1 = pair_w
+                    lo8 = [rocdl.update_dpp(T.i32, x0[d], x1[d], 0x128, 0xF, 0xC, False) for d in range(4)]
+                    hi8 = [rocdl.update_dpp(T.i32, x1[d], x0[d], 0x128, 0xF, 0x3, False) for d in range(4)]
+                    row_f = bx_w + mi * 16 + lane_mod_16 % 8
+                    col_f = col_l + (lane_mod_16 // 8) * 32
+                    for h, w4 in ((0, lo8), (8, hi8)):
+                        t8 = fx.make_rmem_tensor(8, out_elem)
+                        t8.store(Vec.from_elements(w4, Int32).bitcast(out_elem))
+                        off = (row_f + h) * c_rstride + col_f
+                        fx.copy(c_copy128_fl, t8, c_flat8[None, off // 8])
+                        if const_expr(fence):
+                            rocdl.sched_barrier(0)
+
+            if const_expr(epi_ov):
+                # The peeled last iteration: m-row mi's accumulators are final after its group in
+                # the last half, so its stores go into the next group's gap (one group later:
+                # the hazard recognizer does not see the inline-asm MFMAs, so a read of an
+                # accumulator right behind the MFMA that writes it would get no wait states).
+                st = list(results)
+                sb_l = st[n_acc + n_sa_c : n_acc + n_sc]
+                bv_l = [_frag(v) for v in st[n_acc + n_sc :]]
+                jj_l = fx.Int32(N_CH // 3 - 1)
+
+                def store_fn(accs_s, mi):
+                    store_mrow(accs_s, mi, fence=mi == m_chunks - 1)
+
+                for c in range_constexpr(3):
+                    accs, sb_l, bv_l = vs_chunk(jj_l, c, accs, sb_l, bv_l, store_fn if c == 2 else None)
+            else:
+                for mi in range_constexpr(m_chunks):
+                    store_mrow(accs, mi)
         elif const_expr(epi == 1):
             # Lane group g holds rows 4g..4g+3, two per dword (h). Swapping fragment 2p's odd groups
             # with fragment 2p+1's even groups leaves each 32-lane half two rows of 32 consecutive
             # columns: s0 rows 2h+e (lanes 0-31) / 8+2h+e (lanes 32-63), s1 the same plus 4.
-            col_rm = by_n + wave * (BN // 4) + lane % 32
-            row_rm = bx_m + (lane // 32) * 8
+            col_rm = by_n + wave_col0() + lane % 32
+            row_rm = bx_w + (lane // 32) * 8
             for mi in range_constexpr(m_chunks):
                 for p in range_constexpr(num_acc_n // 2):
                     va = Vec(accs[mi * num_acc_n + 2 * p]).to(out_elem)
@@ -1056,7 +1350,7 @@ def launch_gemm(
                                 fx.copy(c_copy, cf, c_flat[None, off])
         else:
             for mi in range_constexpr(m_chunks):
-                row_m = bx_m + mi * 16 + lane_div_16 * 4
+                row_m = bx_w + mi * 16 + lane_div_16 * 4
                 for ni in range_constexpr(num_acc_n):
                     col = col_w + ni * 16
                     acc = Vec(accs[mi * num_acc_n + ni]).to(out_elem)
@@ -1181,21 +1475,61 @@ M_ALIGN = 256
 # four replicates (3 and 6 ahead in between; group_m 16..64 all slower than 32 on the ring). On
 # the other shapes a_pipe measured +0.4..+0.6% (double_fc2), +1.8..+2.2% (double_proj), flat
 # (double_qkv), +0.4..+0.8% (single_l2, ring) and +0.3..+1.9% (double_fc1, ring), so they keep 0.
+# single_l2 (campaign 3 R2): tile_m=256 (AGPR accumulators, 1 wave/SIMD) on the ring with the
+# half's loads spread between one-m-row MFMA groups, group_m=4 (1024-row bands; band heights
+# that do not divide its 64 M-tiles measured +6%; gm2/8/16 +2.0/+1.2/+0.3%, xcd remap +3.2%).
+# In-process against the 128x256 config, bitwise: -6.4% in short runs; in 12 s windows at the
+# 1400 W cap -6.5% at the ruler's cadence (both ~1990 MHz) and -5.0% back-to-back, where it
+# holds 1764 MHz against 1622. R4: the 1x4 wave split instead of 2x2 (the 2x2 split loaded every
+# B fragment in two waves; skipping that half of the B loads measured -7..-9%), A fragments two
+# groups ahead and the last chunk's C stores in its gaps: -2.7..-3.4% short runs, bitwise; 12 s
+# windows -2.0..-2.8% at the ruler's cadence and -3.3..-3.5% back-to-back (1674 vs 1761 MHz).
+# fi (13th field, campaign 3 R6): the order inside the tile_m=256 ring's m-row groups (see
+# launch_gemm; only that ring reads it). 2 puts the gap's load item after the group's first MFMA
+# and the A read after its second, so those issue under MFMAs instead of ahead of them. single_l2
+# against fi=0, bitwise: -3.8% cycles in a one-CU thread trace, -0.9% through the unmodified bench
+# (7 of 7 blocks, champion re-measured in each); 12 s windows at the 1400 W cap -0.5% at the
+# ruler's cadence and -1.5% back-to-back, ~45 MHz lower (1 and 3 in between). single_l1 moves to
+# that ring with fi=2 and group_m=12: -3.0..-3.3% against its 128-row row through the same bench
+# (7 of 7 blocks, bitwise); 12 s windows -2.9% at the ruler's cadence (both 1742 MHz) and -2.2%
+# back-to-back (1661 vs 1640 MHz). There fi=0 measured -1.7..-2.2%, fi 1/3 +0.1/+0.4% against 2,
+# group_m 4/8/10/14/16/20 +0.3/+1.4/+4.7/+2.8/+0.9/+1.4%; xcd remap and waves_per_eu 0/2 slower.
+# double_qkv (campaign 3 R7) moves to that ring with fi=2 and group_m=16 (12/14/18/22/24
+# +2.8/+0.1/+3.2/+2.7/+2.0% against 16; 20 -0.4..-0.6% at the ruler's cadence but +1.6..+2.3%
+# back-to-back; fi=1 +0.04%). Against its 128-row row, bitwise: -1.1% in short runs; 12 s windows
+# at the 1400 W cap -1.0% at the ruler's cadence (2226 vs 2169 MHz) and -2.0% back-to-back (1881
+# vs 1789 MHz); -1.4% through the unmodified bench on card 7 (9 of 13 paired blocks), where it is
+# bimodal in every arm (~146 vs ~153 us). double_fc1 on the same ring (group_m 16; 12/14/18/20/24
+# +0.5..+1.9%) measured -1.6..-2.2% on card 6 and -2.1/-1.7% in 12 s windows (2191 vs 2087 MHz,
+# 1753 vs 1607 MHz) but +0.9% on card 7 (5 of 13 paired blocks) with the cached half-line stores;
+# it moves to that ring with the full-line nt stores (store_mode below).
+# store_mode (14th field, campaign 3 R8): epi=2's C stores as 8 full 128 B lines each instead of
+# 16 half lines (see launch_gemm), nt (2) or sc0|nt (3). Through the unmodified bench on card 7
+# against the cached halves (7 paired blocks, bitwise), median of the per-block minima:
+# double_qkv -4.3% with 3 / -3.0% with 2 (7 / 6 of 7 blocks), double_proj -2.6% / -1.9% (7 / 7),
+# double_fc2 +0.3% / -0.7% (3 / 5), single_l1 -1.3% with either (7 / 7). single_l2 measured
+# +0.8 / +1.0% (1 / 3 of 7) and flat in 12 s windows at the 1400 W cap (27..42 MHz more clock for
+# the same time), so it keeps 0. In short runs the full-line layout alone (cached, or sc0 only)
+# is +0.0..+0.4%: the gain needs nt on the full lines. double_fc1 (R9) on the double_qkv ring
+# with nt (2), against its 128-row epi=1 row, bitwise: -5.0% through the unmodified bench on
+# card 7 (median of 6 paired blocks, 6 of 6 faster), -4.2..-5.4% on cards 0/1/4/6; 12 s windows
+# at the 1400 W cap -4.8% at the ruler's cadence (2150 vs 2096 MHz) and -1.3% back-to-back (1715
+# vs 1626 MHz); 3 (sc0|nt) measured +0.1% against 2 in short runs.
 _A6W4_CONFIGS = {
-    (9216, 3072): (128, 256, 128, 1, 5, 8, 2, 1, 2, 8, 3, 0),  # double_qkv
-    (3072, 3072): (128, 256, 128, 1, 6, 8, 2, 1, 2, 8, 3, 0),  # double_proj
-    (12288, 3072): (128, 256, 128, 1, 5, 8, 2, 1, 1, 8, 2, 0),  # double_fc1
-    (3072, 12288): (128, 256, 128, 1, 0, 8, 2, 1, 2, 1, 3, 0),  # double_fc2
-    (21504, 3072): (128, 256, 128, 0, 32, 8, 2, 1, 2, 1, 3, 4),  # single_l1
-    (3072, 15360): (128, 256, 128, 0, 2, 8, 1, 1, 2, 1, 2, 0),  # single_l2
+    (9216, 3072): (256, 256, 128, 1, 16, 8, 2, 1, 2, 1, 3, 0, 2, 3),  # double_qkv
+    (3072, 3072): (128, 256, 128, 1, 6, 8, 2, 1, 2, 8, 3, 0, 0, 3),  # double_proj
+    (12288, 3072): (256, 256, 128, 1, 16, 8, 2, 1, 2, 1, 3, 0, 2, 2),  # double_fc1
+    (3072, 12288): (128, 256, 128, 1, 0, 8, 2, 1, 2, 1, 3, 0, 0, 2),  # double_fc2
+    (21504, 3072): (256, 256, 128, 1, 12, 8, 2, 1, 2, 1, 3, 0, 2, 2),  # single_l1
+    (3072, 15360): (256, 256, 128, 1, 4, 8, 2, 1, 2, 1, 3, 0, 2, 0),  # single_l2
 }
-_A6W4_DEFAULT = (128, 256, 128, 0, 0, 0, 2, 0, 0, 1, 2, 0)
+_A6W4_DEFAULT = (128, 256, 128, 0, 0, 0, 2, 0, 0, 1, 2, 0, 0, 0)
 
 # One flyc.compile'd launch_gemm artifact per (N, K). Every Constexpr argument launch_gemm takes
 # (tile_m/n/k, a_dtype, out_dtype, batch, the five stride flags, waves_per_eu, group_m, num_xcd,
-# pad16, b_prefetch, sa_lds, epi, a_stages, a_pipe) is a pure function of (n, k) through _A6W4_CONFIGS/
-# _A6W4_DEFAULT above, while i32_m, i32_n, stream and the five operand pointers are all runtime
-# args whose FlyDSL types (Int32 / Stream / Pointer) are
+# pad16, b_prefetch, sa_lds, epi, a_stages, a_pipe, fi, store_mode) is a pure function of (n, k)
+# through _A6W4_CONFIGS/_A6W4_DEFAULT above, while i32_m, i32_n, stream and the five operand
+# pointers are all runtime args whose FlyDSL types (Int32 / Stream / Pointer) are
 # annotated-runtime-type -> type-only in the compile cache key (kb/flydsl/compilation_pipeline.md
 # S:_arg_cache_sig), so a single artifact is correct for every M at a given (N, K). Verified by
 # compiling once at M=2048 and calling the same object at M=256/2048/8192/16384: SNR 55.588/
@@ -1224,7 +1558,7 @@ def gemm_a6w4(aq, wq, sa, sb, n, k, bias=None):
 
     m = aq.shape[0]
     cfg = _A6W4_CONFIGS.get((n, k), _A6W4_DEFAULT)
-    tm, tn, tk, wpe, gm, pad16, bpf, sa_lds, epi, xcd, a_stg, a_pipe = cfg
+    tm, tn, tk, wpe, gm, pad16, bpf, sa_lds, epi, xcd, a_stg, a_pipe, fi, store_mode = cfg
     c = torch.empty(m, n, dtype=torch.bfloat16, device=aq.device)
     ptr = lambda t: flyc.from_c_void_p(fx.Uint8, t.data_ptr())
     if bias is not None:
@@ -1263,6 +1597,8 @@ def gemm_a6w4(aq, wq, sa, sb, n, k, bias=None):
         bias is not None,
         a_stg,
         a_pipe,
+        fi,
+        store_mode,
     )
     if torch.cuda.is_current_stream_capturing():
         # A flyc.compile'd object regresses under CUDA-graph capture (no recompile mid-capture);
