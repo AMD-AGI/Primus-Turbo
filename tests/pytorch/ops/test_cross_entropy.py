@@ -97,3 +97,25 @@ def test_validation():
         cross_entropy(x.half(), y)
     with pytest.raises(ValueError, match="label_smoothing"):
         cross_entropy(x, y, label_smoothing=1.1)
+
+
+def test_vocab_stride_beyond_int32():
+    # 8 GiB padding makes a signed-i32 wrap land inside allocated storage with
+    # a wrong sentinel value, rather than faulting the GPU. Only 17 logits are
+    # used; the large backing allocation tests address arithmetic, not compute.
+    if torch.cuda.mem_get_info()[0] < 10 * 1024**3:
+        pytest.skip("64-bit strided-address regression requires 10 GiB free")
+    boundary = 2**31
+    storage = torch.empty(2 * boundary + 1, device="cuda", dtype=torch.bfloat16)
+    storage[0] = 42
+    x = storage.as_strided((1, 17), (0, 2**27), storage_offset=boundary)
+    x.zero_()
+    x.requires_grad_(True)
+    target = torch.tensor([16], device="cuda", dtype=torch.int64)
+    reference = torch.zeros(1, 17, device="cuda", requires_grad=True)
+    loss = cross_entropy(x, target)
+    expected = F.cross_entropy(reference, target, reduction="none")
+    (grad,) = torch.autograd.grad(loss.sum(), x)
+    (ref_grad,) = torch.autograd.grad(expected.sum(), reference)
+    torch.testing.assert_close(loss, expected, rtol=2e-5, atol=2e-5)
+    torch.testing.assert_close(grad, ref_grad.to(x.dtype), rtol=0.008, atol=2e-6)
