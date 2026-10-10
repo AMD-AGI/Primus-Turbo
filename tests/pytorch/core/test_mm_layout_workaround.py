@@ -419,9 +419,45 @@ def test_fake_tensors_pass_through(rewrites):
     assert rewrites == []
 
 
+class _SavesItsOutput(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        out = x * 2
+        ctx.save_for_backward(out)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        (out,) = ctx.saved_tensors
+        return grad * 2 + out * 0
+
+
+class _ParameterSubclass(torch.nn.Parameter):
+    pass
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        lambda: torch.sigmoid(torch.randn(8, requires_grad=True)).sum().backward(),
+        lambda: _SavesItsOutput.apply(torch.randn(8, requires_grad=True)).sum().backward(),
+        lambda: torch.nn.Parameter(torch.randn(8)).data,
+        lambda: _ParameterSubclass(torch.randn(8)).data,
+    ],
+    ids=["sigmoid", "function_saving_its_output", "parameter_data", "parameter_subclass_data"],
+)
+def test_plain_tensor_detach_passes_through(run):
+    """With a mode active, C++ hands the shallow-copy detach of a plain tensor to the mode, with
+    that tensor's own type in ``types`` (autograd saving an op's own output, Tensor.data). Only a
+    type that overrides __torch_dispatch__ is a tensor subclass that can take the call; anything
+    else must not end with every handler returning NotImplemented."""
+    with mm_layout_workaround():
+        run()
+
+
 def test_rms_norm_backward_passes_through():
-    """torch 2.11 lists plain torch.Tensor in ``types`` for the aten.detach of rms_norm's autograd;
-    that must not be taken for a tensor subclass (every handler returning NotImplemented)."""
+    """rms_norm saves its own output for the backward (see test_plain_tensor_detach_passes_through):
+    the Llama-3.1-8B training step failed in its first RMSNorm before this was handled."""
     norm = torch.nn.RMSNorm(64, dtype=torch.bfloat16)
     x = torch.randn(4, 64, dtype=torch.bfloat16, requires_grad=True)
     norm(x).sum().backward()

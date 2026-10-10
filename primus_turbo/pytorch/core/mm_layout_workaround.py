@@ -257,9 +257,11 @@ class _MMLayoutWorkaroundMode(TorchDispatchMode):
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
-        # `types` can also hold plain torch.Tensor (e.g. the aten.detach of rms_norm's autograd on
-        # torch 2.11); like torch's own modes, count only real subclasses.
-        if any(t not in (torch.Tensor, torch.nn.Parameter) for t in types):
+        # With a mode active, C++ also hands the shallow-copy detach of a plain tensor (autograd
+        # saving an op's own output, Tensor.data) to the mode, with that tensor's own type, e.g.
+        # torch.Tensor or nn.Parameter, in `types`. Only a type that overrides
+        # __torch_dispatch__ is a tensor subclass that can take the call.
+        if any(t.__torch_dispatch__ is not torch._C._disabled_torch_dispatch_impl for t in types):
             # A tensor subclass with its own __torch_dispatch__ (DTensor, FakeTensor, ...) is
             # never rewritten itself. With no other mode below this one, NotImplemented hands
             # the call to the subclass while this mode stays active, so the plain-tensor GEMMs
