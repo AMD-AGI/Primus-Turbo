@@ -18,7 +18,6 @@ import flydsl.expr as fx
 import torch
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
-from flydsl.expr import buffer_ops as bo
 from flydsl.expr import math as fm
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.arith import _to_raw as _raw
@@ -45,6 +44,7 @@ from primus_turbo.flydsl.quantization.mxfp8_quant_flydsl import (
     fp8_params,
     grouped_qdual_grid,
 )
+from primus_turbo.flydsl.utils import buffer_ops as bo
 from primus_turbo.flydsl.utils.gemm_epilogue_helper import (
     _check_activation,
     _check_clamp_limit,

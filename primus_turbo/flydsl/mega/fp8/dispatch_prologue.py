@@ -40,14 +40,6 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr.buffer_ops import (
-    _unwrap_value,
-    buffer_load,
-    buffer_store,
-    create_buffer_resource,
-    create_buffer_resource_from_addr,
-    extract_base_index,
-)
 from flydsl.expr.primitive import get_dyn_shared
 from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
@@ -55,6 +47,14 @@ from primus_turbo.flydsl.mega.fp8.barrier import grid_sync, xgmi_barrier
 from primus_turbo.flydsl.mega.fp8.gemm_helper import run_compiled
 from primus_turbo.flydsl.mega.fp8.prims import atomic_add, ld, st
 from primus_turbo.flydsl.mega.fp8.symm_buffer import SymLayout, sym_map
+from primus_turbo.flydsl.utils.buffer_ops import (
+    _unwrap_value,
+    buffer_load,
+    buffer_store,
+    create_buffer_resource,
+    create_buffer_resource_from_addr,
+    extract_base_index,
+)
 
 # grid_blocks (== num_cu) is a caller arg (default 64). Fewer blocks => cheaper
 # self-resetting grid_sync; 48-64 is the measured sweet spot. Must stay <= num_CU so
@@ -84,7 +84,7 @@ def lds_base_addr():
 
 def _ext_i64(v):
     """Sign-extend an fx i32 value to i64 (group_lens/offs stored as int64)."""
-    return fx.arith.ArithValue(fx.arith.extsi(fx.T.i64(), _unwrap_value(v)), signed=True)
+    return fx.arith.ArithValue(fx.arith.extsi(fx.T.i64, _unwrap_value(v)), signed=True)
 
 
 # The prologue returns one flat positional handle (DeepEP-style) the dispatch/combine kernels
@@ -151,7 +151,7 @@ def _make_dispatch_prologue(
         def load_expert_id(elem_index):
             value = buffer_load(topk_resource, elem_index, vec_width=1, dtype=idx_load_dtype)
             if idx_is_i64:
-                value = fx.arith.ArithValue(fx.arith.trunci(fx.T.i32(), _unwrap_value(value)), signed=True)
+                value = fx.arith.ArithValue(fx.arith.trunci(fx.T.i32, _unwrap_value(value)), signed=True)
             return value
 
         # single scratch tensor; sub-regions addressed via WS_* offsets below
@@ -231,7 +231,7 @@ def _make_dispatch_prologue(
                         workspace_resource,
                         fx.Int32(WS_SEND) + push_expert_index,
                         vec_width=1,
-                        dtype=fx.T.i32(),
+                        dtype=fx.T.i32,
                     )
                     buffer_store(
                         send_count_value, peer_c_resource, fx.Int32(rank * num_experts) + push_expert_index
@@ -278,7 +278,7 @@ def _make_dispatch_prologue(
                         own_c_address, fx.Int32(source_rank * num_experts) + expert_index, scope="sys"
                     )
                 pool_base_value = buffer_load(
-                    workspace_resource, fx.Int32(WS_POOLBASE) + expert_index, vec_width=1, dtype=fx.T.i32()
+                    workspace_resource, fx.Int32(WS_POOLBASE) + expert_index, vec_width=1, dtype=fx.T.i32
                 )
                 buffer_store(
                     pool_base_value + preceding_count, workspace_resource, fx.Int32(WS_START) + expert_index
@@ -293,7 +293,7 @@ def _make_dispatch_prologue(
                 expert_id = destination_rank * fx.Int32(experts_per_rank) + local_expert_index
                 count_value = ld(own_c_address, fx.Int32(rank * num_experts) + expert_id, scope="sys")
                 start_value = buffer_load(
-                    workspace_resource, fx.Int32(WS_START) + expert_id, vec_width=1, dtype=fx.T.i32()
+                    workspace_resource, fx.Int32(WS_START) + expert_id, vec_width=1, dtype=fx.T.i32
                 )
                 buffer_store(destination_rank, expert_send_dst_rank_resource, comm_task_index)
                 buffer_store(start_value, expert_send_dst_row_resource, comm_task_index)
@@ -311,7 +311,7 @@ def _make_dispatch_prologue(
                             expert_send_count_resource,
                             fx.Int32(comm_task_counter),
                             vec_width=1,
-                            dtype=fx.T.i32(),
+                            dtype=fx.T.i32,
                         )
                         buffer_store(source_offset, expert_send_offset_resource, fx.Int32(comm_task_counter))
                         buffer_store(source_offset, workspace_resource, fx.Int32(WS_SROFF + expert_id))
@@ -325,7 +325,7 @@ def _make_dispatch_prologue(
                     workspace_resource,
                     fx.Int32(WS_POOLBASE + rank * experts_per_rank) + local_expert_index,
                     vec_width=1,
-                    dtype=fx.T.i32(),
+                    dtype=fx.T.i32,
                 )
                 source_counts = []
                 for source_rank in fx.range_constexpr(world_size):
@@ -370,7 +370,7 @@ def _make_dispatch_prologue(
                         block_cursor = first_block
                         while block_cursor <= last_block:
                             expected_value = buffer_load(
-                                tile_expected_resource, block_cursor, vec_width=1, dtype=fx.T.i32()
+                                tile_expected_resource, block_cursor, vec_width=1, dtype=fx.T.i32
                             )
                             buffer_store(expected_value + fx.Int32(1), tile_expected_resource, block_cursor)
                             block_cursor = block_cursor + fx.Int32(1)
@@ -442,10 +442,10 @@ def _make_dispatch_prologue(
                     + local_position
                 )
                 expert_start = buffer_load(
-                    workspace_resource, fx.Int32(WS_START) + expert_id, vec_width=1, dtype=fx.T.i32()
+                    workspace_resource, fx.Int32(WS_START) + expert_id, vec_width=1, dtype=fx.T.i32
                 )
                 expert_source_offset = buffer_load(
-                    workspace_resource, fx.Int32(WS_SROFF) + expert_id, vec_width=1, dtype=fx.T.i32()
+                    workspace_resource, fx.Int32(WS_SROFF) + expert_id, vec_width=1, dtype=fx.T.i32
                 )
                 destination_row = expert_start + within_expert_position
                 buffer_store(
@@ -454,7 +454,7 @@ def _make_dispatch_prologue(
                 buffer_store(
                     topk_slot, dispatched_topk_slot_resource, expert_source_offset + within_expert_position
                 )  # topk slot per pair
-                routing_weight = buffer_load(topk_weights_resource, pair_index, vec_width=1, dtype=fx.T.f32())
+                routing_weight = buffer_load(topk_weights_resource, pair_index, vec_width=1, dtype=fx.T.f32)
                 buffer_store(
                     routing_weight, src_token_weight_resource, expert_source_offset + within_expert_position
                 )  # routing weight per pair

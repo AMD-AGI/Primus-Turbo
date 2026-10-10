@@ -85,6 +85,15 @@ class Autotuner(_BaseAutotuner):
         with _suppress_stdout_stderr():
             return super().__call__(*args, **kwargs)
 
+    def _run_config(self, config, args, kwargs):
+        # The base class switches to the call's stream (torch.cuda.stream) on every launch, ~10 us of
+        # host time; only the reset_to_zero zeroing needs it, the kernel launches on its explicit stream.
+        if self.reset_to_zero:
+            return super()._run_config(config, args, kwargs)
+        merged = dict(kwargs)
+        merged.update(config.all_kwargs())
+        return self._run_with_hints(config.compiler_opts(), args, merged)
+
     def _lock_file(self):
         return self._cache_file.with_suffix(".lock")
 

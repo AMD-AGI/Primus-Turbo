@@ -27,11 +27,11 @@ caller does not take is never traced.
 """
 
 import flydsl.expr as fx
-from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from primus_turbo.flydsl.utils import buffer_ops as _buffer_ops
 from primus_turbo.flydsl.utils.prims import _lds_barrier, ceildiv
 
 

@@ -77,9 +77,10 @@ Known limitations (all deliberate)
   Correctness does not depend on the value, only performance.
 
 Requires the gfx1250 WMMA + TDM surface (``rocdl.WMMA`` /
-``rocdl.make_tdm_atom`` / ``flydsl.expr.tdm_ops`` / ``rocdl.ds_load_tr16_b128``).
-All four are present in **flydsl 0.2.4**, the version ``setup.py`` pins, and all
-three entry points compile and produce correct results on gfx1250 under it.
+``rocdl.make_tdm_atom`` / ``flydsl.expr.rocdl.tdm_ops`` / ``rocdl.ds_load_tr16_b128``).
+All four are present in **flydsl 0.3.4.1**, the version ``setup.py`` pins, and all
+three entry points compile for gfx1250 under it (results on gfx1250 were checked
+under 0.2.4).
 """
 
 from __future__ import annotations

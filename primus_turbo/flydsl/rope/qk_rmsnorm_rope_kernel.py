@@ -141,9 +141,11 @@ import weakref
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import arith, buffer_ops, range_constexpr
+from flydsl.expr import arith, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Vector as Vec
+
+from primus_turbo.flydsl.utils import buffer_ops
 
 # CODE-REVIEW fix: `arith` (flydsl.expr.arith, imported above) already
 # re-exports `_to_raw` as its own public (if deprecated) surface; reach
@@ -653,7 +655,7 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int, cycles: int):
         # P0b: QRSTD no longer holds per-row rstd -- it holds one cached FP32
         # eps scalar (see module docstring / `_eps_tensor`).  Every wave reads
         # the same value, so load it once here rather than per token below.
-        eps_v = fx.Float32(buffer_ops.buffer_load(qrstd_rsrc, fx.Int32(0), vec_width=1, dtype=fx.T.f32()))
+        eps_v = fx.Float32(buffer_ops.buffer_load(qrstd_rsrc, fx.Int32(0), vec_width=1, dtype=fx.T.f32))
 
         # ------------------------------------------------------------------
         # `slot` is wave-uniform, so the Q / K / V dispatch is hoisted out of
