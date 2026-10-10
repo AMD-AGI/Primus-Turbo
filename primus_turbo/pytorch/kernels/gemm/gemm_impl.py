@@ -129,13 +129,16 @@ class GEMMAiterBackend(KernelBackend):
     @classmethod
     def shapes(cls) -> frozenset:
         """The products aiter has kernels for, as {(pass, N, K)} with pass "fwd" (``x @ w.T + bias``), "dgrad"
-        (``g @ w``) or "wgrad" (``g.T @ x``). Read once; empty if the installed aiter has no ``adaln_gemm`` op."""
+        (``g @ w``) or "wgrad" (``g.T @ x``). Read once, for the current GPU's architecture; empty if the installed
+        aiter has no ``adaln_gemm`` op or no kernels for this architecture."""
         if cls._shapes is None:
             try:
                 from aiter.ops.adaln_gemm import _manifest
 
-                manifest = _manifest()
-            except ImportError:
+                # this GPU's kernels: on an architecture without them the manifest is empty and nothing is handled
+                arch = torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName.split(":")[0]
+                manifest = _manifest(arch)
+            except (ImportError, RuntimeError, AssertionError):
                 manifest = {}
             cls._shapes = frozenset(
                 (_AITER_GEMM_PASSES[p], n, k) for (p, n, k) in manifest if p in _AITER_GEMM_PASSES
@@ -226,7 +229,9 @@ class GEMMAiterBackend(KernelBackend):
 _GEMM_BACKENDS = {
     BackendType.HIPBLASLT: BackendEntry(GEMMHipBLASLtBackend),
     BackendType.TRITON: BackendEntry(GEMMTritonBackend),
-    BackendType.AITER: BackendEntry(GEMMAiterBackend, strict=True),
+    # Only where a call names it: it has kernels for a handful of 32-row shapes, and auto-tuning must not move other
+    # GEMMs that happen to match one of them onto it.
+    BackendType.AITER: BackendEntry(GEMMAiterBackend, autotune=False, strict=True),
 }
 
 
@@ -239,11 +244,13 @@ class GEMMKernelDispatcher(AutoKernelDispatcher):
         M = a.shape[1] if trans_a else a.shape[0]
         Ka = a.shape[0] if trans_a else a.shape[1]
         N = b.shape[0] if trans_b else b.shape[1]
-        # The epilogue is part of the key: not every backend has a bias, an accumulating or a store-into-out one.
+        # The epilogue is part of the key: not every backend has a bias, an accumulating or a store-into-out one, and
+        # backends differ in the bias and output dtypes and the output layouts they take.
+        bias, out = kwargs.get("bias"), kwargs.get("out")
         epilogue = (
-            kwargs.get("bias") is not None,
+            None if bias is None else bias.dtype,
             bool(kwargs.get("inplace_add_to_out", False)),
-            kwargs.get("out") is not None,
+            None if out is None else (out.dtype, out.is_contiguous()),
         )
         return (M, N, Ka, a.dtype, b.dtype, out_dtype, trans_a, trans_b, trans_c, epilogue)
 

@@ -821,6 +821,12 @@ void mxfp6_tile_to_fp4_col(const at::Tensor c0, const at::Tensor c1, const at::T
     TORCH_CHECK(row_fmt == MXPackFmt::Fp6Tile && (col_fmt == MXPackFmt::Fp4Tile || col_fmt == MXPackFmt::Fp4TileSr),
                 "mxfp6_tile_to_fp4_col: fmt must be K128-blocked FP6 rows with an FP4 tile column");
     const MXTilePack row_ts = ts_dir(fmt, R, K, false), col_ts = ts_dir(fmt, R, K, true);
+    // The kernel writes the column in the K256-outer role-B layout only, and only whole 256-row blocks of it
+    // (it leaves the padding of a partial block unwritten): reject anything else rather than emit wrong bytes.
+    TORCH_CHECK(col_ts.kouter == 1 && col_ts.is_b == 1,
+                "mxfp6_tile_to_fp4_col: fmt's column must be the K256-outer role-B FP4 layout (fmt bit 26)");
+    TORCH_CHECK(R > 0 && K > 0 && R % 256 == 0 && K % 256 == 0,
+                "mxfp6_tile_to_fp4_col: R and K must be multiples of 256");
     const auto [rp_bytes, rs_bytes] = sizes_for(row_fmt, R, K, row_ts);
     const auto [cp_bytes, cs_bytes] = sizes_for(col_fmt, K, R, col_ts);
     for (const at::Tensor *t : std::initializer_list<const at::Tensor *>{&c0, &c1, &row_scale, &col_packed, &col_scale})

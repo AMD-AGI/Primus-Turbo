@@ -239,8 +239,11 @@ class FlashAttnFunc(torch.autograd.Function):
             # (q_n, sbhd storage like the q it replaces) and its rstd for the backwards. The backward runs on q_n,
             # so dq is d(normalized q) -- what the producer's backward expects -- and q_rstd_slot's gradient is
             # the rstd.
-            if dropout_p != 0.0 or causal or bias is not None or alibi_slopes is not None or sink is not None:
-                raise ValueError("q_norm supports the plain non-causal forward only")
+            # The fused forward attends over the whole sequence; a sliding window would apply in the backward only.
+            no_window = tuple(int(w) for w in window_size) == (-1, -1)
+            if (dropout_p != 0.0 or causal or bias is not None or alibi_slopes is not None or sink is not None
+                    or not no_window):
+                raise ValueError("q_norm supports the plain non-causal forward without a sliding window only")
             B, S, H, D = q.shape
             q_n = torch.empty((S, B, H, D), dtype=q.dtype, device=q.device).permute(1, 0, 2, 3)
             q_rstd = torch.empty((S * B * H,), dtype=torch.float32, device=q.device)

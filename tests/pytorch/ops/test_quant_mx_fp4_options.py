@@ -163,7 +163,7 @@ def _check(got, ref, what):
 
 
 def test_reference_is_the_default_packer():
-    """Anchors the reference: with no options it reproduces today's plain gradient pack (H32, RCEIL)."""
+    """Anchors the reference: with no options it reproduces the plain gradient pack (H32, RCEIL)."""
     _skip()
     rows, cols = 512, 3072
     x = _rand(rows, cols, seed=1)
@@ -472,7 +472,7 @@ def test_mxfp6_rows_to_fp4_col_unrot(R, K, sr):
     original bf16 weight, at that pack's error plus the FP6 rows'."""
     _skip()
     x = _rand(R, K, seed=12)
-    # the weight pack of a dgrad GEMM [m, R] x [K, R]^T: ts6 rows (B), the FP4 column with Primus' default options
+    # the weight pack of a dgrad GEMM [m, R] x [K, R]^T: ts6 rows (B), the FP4 column with the default options (RCEIL, H32)
     fmt = P.fp4_options(
         P.with_ts6_row(P.ts_fmt(col=P.ts_b_params(256, K, R)), True), col_round="rceil", col_hadamard="h32"
     ) | P.MX_FMT_COL_KOUTER
@@ -482,7 +482,7 @@ def test_mxfp6_rows_to_fp4_col_unrot(R, K, sr):
     nb = lambda n: torch.empty(n, dtype=torch.uint8, device="cuda")  # noqa: E731
     c0, c1, rsc = nb(rp * 2 // 3), nb(rp // 3), nb(rs)
     full = [nb(cp), nb(cs)]
-    P.quantize_mx_dual_out(x, c0, rsc, *full, fmt, row_c1=c1)  # the owner's dual pack: rows + today's column
+    P.quantize_mx_dual_out(x, c0, rsc, *full, fmt, row_c1=c1)  # the owner's dual pack: rows + the direct column
 
     w_deq, _ = _decode_ts6_rows(c0, c1, rsc, R, K)
     v = w_deq.float()
@@ -512,7 +512,7 @@ def test_mxfp6_rows_to_fp4_col_unrot(R, K, sr):
         P.mxfp6_tile_to_fp4_col(c0, c1, rsc, R, K, *again, fmt | P.MX_FMT_FP4_COL_SR, sr, seed)
         assert torch.equal(again[0], got_c) and torch.equal(again[1], got_s), "one draw per seed"
 
-    # close to today's column pack of the bf16 weight: both rotated back along R, against the weight
+    # close to the direct column pack of the bf16 weight: both rotated back along R, against the weight
     hr = torch.tensor([[(-1) ** bin(i & j).count("1") for j in range(32)] for i in range(32)], device="cuda")
     hr = hr.double() / 32**0.5
 
@@ -521,13 +521,32 @@ def test_mxfp6_rows_to_fp4_col_unrot(R, K, sr):
         return ((back - ref).norm() / ref.norm()).item()
 
     xd = x.double()
-    e_got, e_today = err(gv, K, R, xd.t()), err(_decode_fp4_col(*full, R, K, ilv)[2], K, R, xd.t())
+    e_got, e_direct = err(gv, K, R, xd.t()), err(_decode_fp4_col(*full, R, K, ilv)[2], K, R, xd.t())
     e_fp6 = err(w_deq, R, K, xd)
-    print(f"\n[{R}x{K} {'sr' if sr else 'rn'}] rel err vs the bf16 weight: receiver {e_got:.4f}, today's RN column "
-          f"{e_today:.4f}, FP6 rows {e_fp6:.4f}")
     assert e_fp6 < 0.05
-    # RN: today's column error and the rows' FP6 error, independent; SR's error is about sqrt(2) RN's
-    assert e_got < (e_today**2 + e_fp6**2) ** 0.5 * (1.6 if sr else 1.02)
+    # RN: the direct column's error and the rows' FP6 error, independent; SR's error is about sqrt(2) RN's
+    assert e_got < (e_direct**2 + e_fp6**2) ** 0.5 * (1.6 if sr else 1.02)
+
+
+def test_mxfp6_rows_to_fp4_col_rejects_unsupported():
+    """The receiver writes only the K256-outer role-B column and only whole 256-row blocks: any other column format,
+    or R / K not multiples of 256, raises instead of emitting wrong bytes."""
+    _skip()
+    nb = lambda n: torch.empty(n, dtype=torch.uint8, device="cuda")  # noqa: E731
+
+    def call(R, K, kouter):
+        fmt = P.fp4_options(
+            P.with_ts6_row(P.ts_fmt(col=P.ts_b_params(256, K, R)), True), col_round="rceil", col_hadamard="h32"
+        ) | (P.MX_FMT_COL_KOUTER if kouter else 0)
+        rp, rs = P.mx_dir_sizes(R, K, fmt, False)
+        cp, cs = P.mx_dir_sizes(R, K, fmt, True)
+        P.mxfp6_tile_to_fp4_col(nb(rp * 2 // 3), nb(rp // 3), nb(rs), R, K, nb(cp), nb(cs), fmt, False, 1)
+
+    call(512, 512, True)  # supported
+    with pytest.raises(RuntimeError, match="K256-outer"):
+        call(512, 512, False)
+    with pytest.raises(RuntimeError, match="multiples of 256"):
+        call(288, 512, True)
 
 
 @pytest.mark.parametrize("sr", [False, True])
