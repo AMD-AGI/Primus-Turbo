@@ -29,7 +29,14 @@ from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     ScaleDtype,
     ScalingGranularity,
+    ScalingRecipe,
     check_mxfp8_support,
+    float8_e4m3,
+)
+from primus_turbo.pytorch.core.quantized_tensor import (
+    QuantizedTensor,
+    QuantizedTensorPair,
+    create_quantized_weight,
 )
 from primus_turbo.pytorch.core.utils import is_gfx942, is_gfx950
 from primus_turbo.pytorch.ops.grouped_mlp_fp8 import grouped_mlp_fp8
@@ -175,3 +182,46 @@ def test_grouped_mlp_mxfp8(shape, activation, clamp_limit):
     if not is_gfx950():
         pytest.skip("the fused MXFP8 GLU epilogues are gfx950-only")
     _check_mlp(shape, activation, clamp_limit, _mx_config())
+
+
+def _row_major_pair(w):
+    return QuantizedTensorPair(
+        *(
+            QuantizedTensor.quantize(
+                w,
+                float8_e4m3,
+                ScalingGranularity.MX_BLOCKWISE,
+                block_size=MXFP8_BLOCK_SIZE,
+                scaling_recipe=ScalingRecipe(use_2d_block=True),
+                axis=axis,
+            )
+            for axis in (-1, -2)
+        )
+    )
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+def test_grouped_mlp_mxfp8_k_blocked_weights(shape):
+    """Pre-quantized weights from ``create_quantized_weight`` are K-blocked; all four
+    GEMMs that read them must agree bit for bit with the row-major pair."""
+    if not is_gfx950():
+        pytest.skip("the K-blocked expert weight is gfx950-only")
+    M, K, I, G = shape
+    _, group_lens, (x, w1, w2, probs) = _mlp_leaves(M, K, I, G)
+    cotangent = torch.randn(M, K, device="cuda", generator=torch.Generator(device="cuda").manual_seed(7))
+    config = _mx_config()
+    kblk = [QuantizedTensorPair(*create_quantized_weight(w, float8_e4m3, config, True)) for w in (w1, w2)]
+    assert all(p.data.k_blocked and p.data_t.k_blocked for p in kblk)
+
+    results = []
+    for w1_pair, w2_pair in (kblk, [_row_major_pair(w1), _row_major_pair(w2)]):
+        out, (grad_x, grad_probs) = _run(
+            lambda x_, p_, w1_=w1_pair, w2_=w2_pair: _fused_mlp(
+                x_, w1_, w2_, p_, group_lens, "silu", None, config
+            ),
+            (x, probs),
+            cotangent,
+        )
+        results.append((out, grad_x, grad_probs))
+    for name, got, want in zip(("out", "grad_x", "grad_probs"), *results):
+        torch.testing.assert_close(got, want, rtol=0, atol=0, msg=name)

@@ -440,6 +440,7 @@ def grouped_gemm_mxfp8_epi_glu_quant_flydsl_kernel(
     activation: str = "silu",
     clamp_limit: "float | None" = None,
     out_dtype=torch.bfloat16,
+    b_k_blocked: bool = False,
 ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
     """Grouped GEMM, then GLU and dual quantization epilogue."""
     _check_activation(activation)
@@ -476,6 +477,7 @@ def grouped_gemm_mxfp8_epi_glu_quant_flydsl_kernel(
         group_offs_out=group_offs_out,
         out_dtype=out_dtype,
         out=l1,
+        b_k_blocked=b_k_blocked,
     )
     # stage 2: GLU and dual quantization epilogue
     epi_glu_quant_flydsl_kernel(
@@ -944,6 +946,7 @@ def grouped_gemm_mxfp8_epi_dglu_quant_flydsl_kernel(
     activation: str = "silu",
     clamp_limit: "float | None" = None,
     out_dtype=torch.bfloat16,
+    b_k_blocked: bool = False,
 ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
     """Grouped GEMM, then dGLU and dual quantization epilogue."""
     _check_activation(activation)
@@ -985,6 +988,7 @@ def grouped_gemm_mxfp8_epi_dglu_quant_flydsl_kernel(
         group_offs_out=group_offs_out,
         out_dtype=out_dtype,
         out=dact,
+        b_k_blocked=b_k_blocked,
     )
     # stage 2: dGLU and dual quantization epilogue
     epi_dglu_quant_flydsl_kernel(
