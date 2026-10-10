@@ -426,9 +426,9 @@ __launch_bounds__(kBlockHiddenPacks, 4) __global__
     void permute_kernel(const int4 *tokens, int4 *permuted_tokens, const scalar_t *scaling_factor,
                         scalar_t *permuted_scaling_factor, const prob_t *probs,
                         prob_t *permuted_probs, const int *row_id_map,
-                        const int *num_dispatched_tokens_ptr, int pad_multiple,
-                        int num_local_experts, int hidden_int4, int scales_per_token,
-                        int probs_stride) {
+                        const int *num_dispatched_tokens_ptr, int max_num_dispatched_tokens,
+                        int pad_multiple, int num_local_experts, int hidden_int4,
+                        int scales_per_token, int probs_stride) {
     const int lane_id = static_cast<int>(threadIdx.x);
     // kNumChunks == 1: collapsed form (1 block/token, strided inner loop).
     // kNumChunks >= 2: chunked form (1 block/(token,chunk), single iter/thread).
@@ -451,7 +451,11 @@ __launch_bounds__(kBlockHiddenPacks, 4) __global__
 
     const bool is_padding_token = token_id >= actual_dispatched;
 
-    const int *row      = row_id_map + token_id * row_stride;
+    // Preprocessing stores the padding rows after all max_num_dispatched_tokens token rows, which
+    // is past the routed count whenever trailing tokens are unrouted (e.g. worst-case buffers).
+    const int row_idx =
+        is_padding_token ? max_num_dispatched_tokens + (token_id - actual_dispatched) : token_id;
+    const int *row      = row_id_map + static_cast<int64_t>(row_idx) * row_stride;
     const int  n_routed = row[2 * E];
 
     const int4 zero4        = make_int4(0, 0, 0, 0);
@@ -638,8 +642,9 @@ void permute_impl(const dtype_t *tokens, dtype_t *permuted_tokens, const scalar_
     permute_kernel<(num_hidden_per_block), (NC), prob_t, scalar_t>                                 \
         <<<grid, (num_hidden_per_block), /*shmem=*/0, stream>>>(                                   \
             tokens_int4, permuted_tokens_int4, scaling_factor, permuted_scaling_factor, probs,     \
-            permuted_probs, row_id_map, num_dispatched_tokens_ptr, pad_multiple,                   \
-            num_local_experts, hidden_int4, scales_per_token, effective_probs_stride)
+            permuted_probs, row_id_map, num_dispatched_tokens_ptr,                                 \
+            num_dispatched_max - pad_multiple, pad_multiple, num_local_experts, hidden_int4,       \
+            scales_per_token, effective_probs_stride)
 
 #define LAUNCH_PERMUTE(num_hidden_per_block)                                                       \
     do {                                                                                           \
