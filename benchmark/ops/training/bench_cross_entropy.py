@@ -44,10 +44,11 @@ def main():
     }
     versions = {"torch": torch.__version__, "triton": importlib.metadata.version("triton")}
     if args.compare_te:
+        import transformer_engine
         from transformer_engine.pytorch import parallel_cross_entropy
 
         variants = {"installed_te": lambda x: parallel_cross_entropy(x, target), **variants}
-        versions["transformer_engine"] = importlib.metadata.version("transformer_engine")
+        versions["transformer_engine"] = transformer_engine.__version__
     results = {}
     for name, op in variants.items():
         forward_ms, backward_ms = [], []
