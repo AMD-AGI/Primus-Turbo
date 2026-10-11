@@ -141,6 +141,18 @@ def with_ts6_row(fmt: int, row_is_b: bool) -> int:
     return fmt | 0x1 | (int(row_is_b) << 1) | ext
 
 
+def with_ts8_row(fmt: int) -> int:
+    """``fmt`` (0 or a tilescale fmt with no row direction) with its row direction switched to tensorwise E4M3 in the
+    tilescale FP8 planes (P0 = bytes 0-15 and P1 = bytes 16-31 of every 32-value K group, both ``[rows/16, K/128, 16,
+    64]``, P1 after P0): the operand of AITER's FP8 tilescale GEMM. Pack with the ``*_f8`` ops, which take the
+    quantization multiplier and an amax slot. The column direction is kept."""
+    ext, base = fmt & ~MX_FMT_BASE_MASK, mx_fmt_base(fmt)
+    if base == 0:
+        return MX_FMT_TS | 0x2 | ext
+    assert base & MX_FMT_TS and not base & 0xF and not base & MX_FMT_TS_SR, hex(fmt)
+    return fmt | 0x2
+
+
 def with_ts4_row(fmt: int, row_is_b: bool = True) -> int:
     """``fmt`` (0 or a tilescale fmt with no row direction) with its row direction switched to MXFP4 with K128-blocked
     codes ``[rows/16, K/128, 16, 64]`` (the tilescale FP4 "k128" layout: the A6W4 tilescale GEMM's weight operand),
@@ -189,6 +201,8 @@ def _ts_dir(fmt, col):
     code = (fmt >> 4) & 0xF if col else fmt & 0xF
     if code == 0:
         return None
+    if code == 0x2:  # tensorwise FP8 in the tilescale FP8 planes (with_ts8_row)
+        return "fp8"
     if not code & 0x8:  # K128-blocked, scales at nt 4 / ilv 0: MXFP4 (with_ts4_row) or MXFP6 (ts6_fmt)
         return "k128fp4" if code & 0x4 else "kblk"
     return (bool(code & 1), 3 if code & 2 else 4, 4 if code & 4 else 0)
@@ -224,6 +238,35 @@ def quantize_mx(x: torch.Tensor, axis: int, fmt: int) -> Tuple[torch.Tensor, tor
 def quantize_mx_dual(x: torch.Tensor, fmt: int) -> Tuple[torch.Tensor, ...]:
     """``(row_codes, row_scales, col_codes, col_scales)`` from one pass over ``x``."""
     return tuple(_ops().quantize_mx_dual(x.contiguous(), fmt))
+
+
+def quantize_mx_dual_f8(x: torch.Tensor, fmt: int, row_qscale: torch.Tensor,
+                        row_amax: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+    """``quantize_mx_dual`` with a tensorwise FP8 row direction (``with_ts8_row``): ``(row_codes, row_scales (empty),
+    col_codes, col_scales)``; the rows are ``x * row_qscale`` in E4M3 (saturating), and max |x| is maxed into
+    ``row_amax`` (one fp32; zero it to start a new amax period)."""
+    return tuple(_ops().quantize_mx_dual_f8(x.contiguous(), fmt, row_qscale, row_amax))
+
+
+def quantize_mx_f8(x: torch.Tensor, fmt: int, row_qscale: torch.Tensor,
+                   row_amax: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+    """Row direction only (a forward with no backward behind it): ``(row_codes, row_scales (empty))``."""
+    return tuple(_ops().quantize_mx_f8(x.contiguous(), fmt, row_qscale, row_amax))
+
+
+def quantize_mx_fused_dual_f8(x, aux, bias, mode: int, want_col_sum: bool, fmt: int, row_qscale: torch.Tensor,
+                              row_amax: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+    """``quantize_mx_fused_dual`` with a tensorwise FP8 row direction: the four blobs and the bias-gradient partial;
+    the prologue output's amax is maxed into ``row_amax``."""
+    return tuple(_ops().quantize_mx_fused_dual_f8(x.contiguous(), _c(aux), _c(bias), mode, want_col_sum, fmt,
+                                                   row_qscale, row_amax))
+
+
+def ts8_operand(codes: torch.Tensor, rows: int, k: int) -> torch.Tensor:
+    """A ``with_ts8_row`` row direction as AITER's FP8 tilescale GEMM takes it: the flat uint8 buffer (P0 then P1).
+    Rows and K must be multiples of 256."""
+    assert rows % _TILE == 0 and k % _TILE == 0, (rows, k)
+    return codes.view(torch.uint8).reshape(-1)
 
 
 def quantize_mx_fused_dual(
@@ -361,6 +404,8 @@ def mx_dir_sizes(rows: int, k: int, fmt: int, col: bool) -> Tuple[int, int]:
 
             return mxfp6_pack_sizes(rows, k)
         rp, kp = _ceil(rows, _TILE), _ceil(k, _TILE)
+        if p == "fp8":
+            return rp * kp, 0
         if p == "kblk":
             return rp * kp * 3 // 4, -(-rows // 256) * 256 * (kp // 128) * 4
         if p == "k128fp4":

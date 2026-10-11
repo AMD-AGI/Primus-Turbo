@@ -918,3 +918,66 @@ def _a4w4_flydsl(a, a_scale, b, b_scale, m, n, k, out_dtype, bias, out=None, pac
     B, Bs = plain_operand(b, b_scale, n, k)
     res = gemm_mxfp4_flydsl_kernel(A, As.contiguous(), B, Bs.contiguous(), out_dtype=out_dtype, out=out)
     return res if bias is None else res + bias
+
+
+# ── tensorwise FP8 on aiter's tilescale kernels ────────────────────────────────────────────────────────────────────────
+# Operands as ``with_ts8_row`` packs them (``quantize_mx_*_f8``): one buffer per operand, the tilescale FP8 planes;
+# ``a_scale`` / ``b_scale`` are the one-element fp32 dequantization factors (the reciprocals of the packs'
+# quantization multipliers). ``out = (A @ B^T) * a_scale * b_scale (+ bias)`` in bf16, one rounding.
+
+
+def fp8_ts_table():
+    """aiter's FP8 tilescale kernels as plain data (read once, outside compiled regions); see
+    ``tilescale_table_has``."""
+    return tilescale_table(8, 8)
+
+
+def _fp8_ts(a, a_scale, b, b_scale, k, bias, out):
+    from aiter.ops.gemm_op_tilescale import gemm_fp8_tilescale
+
+    flat = lambda t: t.view(torch.uint8).reshape(-1)  # noqa: E731
+    gemm_fp8_tilescale(flat(a), flat(b), a_scale.reshape(1), b_scale.reshape(1), out, k, bias)
+    return out
+
+
+@_torch_custom_op_wrapper("primus_turbo::gemm_fp8_ts_impl", mutates_args=(), device_types="cuda")
+def gemm_fp8_ts_impl(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    m: int,
+    n: int,
+    k: int,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """``out[M, N] = (A @ B^T) * a_scale * b_scale (+ bias)``, bf16 (see ``fp8_ts_table``)."""
+    out = torch.empty(m, n, dtype=torch.bfloat16, device=a.device)
+    return _fp8_ts(a, a_scale, b, b_scale, k, bias, out)
+
+
+@gemm_fp8_ts_impl.register_fake
+def gemm_fp8_ts_impl_meta(a, a_scale, b, b_scale, m, n, k, bias=None):
+    return torch.empty(m, n, dtype=torch.bfloat16, device=a.device)
+
+
+@_torch_custom_op_wrapper("primus_turbo::gemm_fp8_ts_out_impl", mutates_args=("out",), device_types="cuda")
+def gemm_fp8_ts_out_impl(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    out: torch.Tensor,
+    m: int,
+    n: int,
+    k: int,
+    bias: Optional[torch.Tensor] = None,
+) -> None:
+    """``gemm_fp8_ts_impl`` into a caller-owned contiguous [M, N] buffer (beta = 0: overwrites it; a contiguous row
+    slice of a larger buffer is fine)."""
+    _fp8_ts(a, a_scale, b, b_scale, k, bias, out)
+
+
+@gemm_fp8_ts_out_impl.register_fake
+def gemm_fp8_ts_out_impl_meta(a, a_scale, b, b_scale, out, m, n, k, bias=None) -> None:
+    return None

@@ -799,6 +799,44 @@ __device__ __forceinline__ void logical_block(int32_t &bx, int32_t &by) {
     }
 }
 
+// Fp8Tw: one 32-value group as E4M3 at the launch's tensorwise multiplier (no rotation, no per-group scale), stored in
+// the tilescale FP8 planes (see MXPackFmt::Fp8Tw). The group's max |x| feeds the launch amax: read the running value
+// first and take the atomic only when this group exceeds it, so after the first blocks the atomics stop.
+__device__ __forceinline__ void fp8tw_emit_group(const float (&values)[kGroupSize], const int64_t out_row,
+                                                 const int32_t group, uint8_t *__restrict__ packed,
+                                                 const mxfp4_emit::TilePackArgs ts) {
+    if (out_row >= ts.rows || group >= ts.k128 * 4)
+        return;
+    const float qm   = *ts.tw_scale;
+    float       amax = 0.0f;
+    uint32_t    w[kGroupSize / 4];
+#pragma unroll
+    for (int i = 0; i < kGroupSize; i += 4) {
+        float q[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            amax = fmaxf(amax, fabsf(values[i + j]));
+            q[j] = fminf(fmaxf(values[i + j] * qm, -448.0f), 448.0f);
+        }
+#if defined(__gfx950__)
+        int pk = __builtin_amdgcn_cvt_pk_fp8_f32(q[0], q[1], 0, false);
+        pk     = __builtin_amdgcn_cvt_pk_fp8_f32(q[2], q[3], pk, true);
+        w[i / 4] = static_cast<uint32_t>(pk);
+#else
+        w[i / 4] = 0u;
+#endif
+    }
+    const int64_t nk   = ts.k128;
+    const int64_t rpad = (static_cast<int64_t>(ts.rows) + kTileRows - 1) / kTileRows * kTileRows;
+    const int64_t s = group >> 2, g = group & 3;
+    const int64_t p0 = (((out_row >> 4) * nk + s) * 16 + (out_row & 15)) * 64 + g * 16;
+    *reinterpret_cast<uint4_t *>(packed + p0)                   = *reinterpret_cast<const uint4_t *>(&w[0]);
+    *reinterpret_cast<uint4_t *>(packed + rpad * nk * 64 + p0) = *reinterpret_cast<const uint4_t *>(&w[4]);
+    const uint32_t bits = __builtin_bit_cast(uint32_t, amax);
+    if (bits > __hip_atomic_load(ts.tw_amax, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT))
+        __hip_atomic_fetch_max(ts.tw_amax, bits, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+
 // One emit per output format. The FP4 formats share mxfp4_emit_group's quantization and
 // differ only in the store address (see mxfp4_emit::Layout).
 template <MXPackFmt FMT, bool OPTS = false>
@@ -809,6 +847,8 @@ emit_group_fmt(float (&values)[kGroupSize], const int64_t out_row, const int32_t
                const float tile_amax = -1.0f) {
     if constexpr (FMT == MXPackFmt::Fp6) {
         mxfp6_emit_group(values, out_row, group, nk, packed, packed_scale);
+    } else if constexpr (FMT == MXPackFmt::Fp8Tw) {
+        fp8tw_emit_group(values, out_row, group, packed, ts);
     } else if constexpr (FMT == MXPackFmt::Fp6Tile) {
         mxfp6_emit_group<true, OPTS>(values, out_row, group, nk, packed, packed_scale, ts, tile_amax);
     } else if constexpr (FMT == MXPackFmt::Fp4Blob) {
@@ -1641,7 +1681,7 @@ inline bool is_a4w4(const MXPackFmt f) {
 namespace {
 mxfp4_emit::TilePackArgs to_args(const MXTilePack &p) {
     return {p.is_b, p.nt, p.ilv, p.k128, p.rows, p.fp4_round, p.fp4_had, p.fp4_tile2d, p.kouter, p.c1_split, p.c1_delta,
-            p.draws, p.draw_codes, p.draw_scales, p.prob4, p.prob_delta};
+            p.draws, p.draw_codes, p.draw_scales, p.prob4, p.prob_delta, p.tw_scale, p.tw_amax};
 }
 
 // E2M3 code (6 bits, sign in bit 5) -> value at scale 1.
@@ -1778,6 +1818,7 @@ void launch_dual(const dim3 grid, const dim3 block, hipStream_t stream, const DT
     using F4FSr    = std::integral_constant<MXPackFmt, MXPackFmt::Fp4TileSr>;
     using F6K      = std::integral_constant<MXPackFmt, MXPackFmt::Fp6Tile>;
     using F4FK     = std::integral_constant<MXPackFmt, MXPackFmt::Fp4TileK128>;
+    using F8       = std::integral_constant<MXPackFmt, MXPackFmt::Fp8Tw>;
     // A direction that is not emitted does not constrain the pair.
     const MXPackFmt r = DO_ROW ? row_fmt : MXPackFmt::Fp6;
     const MXPackFmt c = DO_COL ? col_fmt : MXPackFmt::Fp6;
@@ -1841,6 +1882,13 @@ void launch_dual(const dim3 grid, const dim3 block, hipStream_t stream, const DT
         go(F4FK{}, F4F{});
     else if (r == MXPackFmt::Fp4TileK128 && c == MXPackFmt::Fp6) // row-only (forward / eval)
         go(F4FK{}, F6{});
+    // Tensorwise FP8 forward operand (tilescale FP8 planes), tilescale FP4 columns for the A4W4 backward
+    else if (r == MXPackFmt::Fp8Tw && c == MXPackFmt::Fp4Tile)
+        go(F8{}, F4F{});
+    else if (r == MXPackFmt::Fp8Tw && c == MXPackFmt::Fp4TileSr)
+        go(F8{}, F4FSr{});
+    else if (r == MXPackFmt::Fp8Tw && c == MXPackFmt::Fp6) // row-only (forward / eval)
+        go(F8{}, F6{});
     else
         PRIMUS_TURBO_CHECK(false, "unsupported MX pack format pair (row ", int(row_fmt), ", col ",
                            int(col_fmt), ")");

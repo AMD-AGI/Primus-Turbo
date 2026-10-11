@@ -207,6 +207,12 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     // activation/weight); see fmt_pair in quantization_mxfp6.cpp.
     m.def("quantize_mx(Tensor input, int axis, int fmt) -> Tensor[]");
     m.def("quantize_mx_dual(Tensor input, int fmt) -> Tensor[]");
+    // Tensorwise FP8 rows (fmt row code 0x2): row_qscale multiplies the input before the E4M3 cast; the launch's
+    // max |input| is maxed into row_amax (one fp32 each).
+    m.def("quantize_mx_dual_f8(Tensor input, int fmt, Tensor row_qscale, Tensor(a!) row_amax) -> Tensor[]");
+    m.def("quantize_mx_f8(Tensor input, int fmt, Tensor row_qscale, Tensor(a!) row_amax) -> Tensor[]");
+    m.def("quantize_mx_fused_dual_f8(Tensor input, Tensor? aux, Tensor? bias, int mode, "
+          "bool want_col_sum, int fmt, Tensor row_qscale, Tensor(a!) row_amax) -> Tensor[]");
     m.def("quantize_mx_fused_dual(Tensor input, Tensor? aux, Tensor? bias, int mode, "
           "bool want_col_sum, int fmt) -> Tensor[]");
     m.def("quantize_mx_qk_norm_rope_bwd(Tensor input, Tensor dq, Tensor dk, Tensor dv, "
@@ -258,6 +264,9 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("quantize_mxfp6_gate_mul", quantize_mxfp6_gate_mul);
     m.impl("quantize_mx", quantize_mx);
     m.impl("quantize_mx_dual", quantize_mx_dual);
+    m.impl("quantize_mx_dual_f8", quantize_mx_dual_f8);
+    m.impl("quantize_mx_f8", quantize_mx_f8);
+    m.impl("quantize_mx_fused_dual_f8", quantize_mx_fused_dual_f8);
     m.impl("quantize_mx_fused_dual", quantize_mx_fused_dual);
     m.impl("quantize_mx_qk_norm_rope_bwd", quantize_mx_qk_norm_rope_bwd);
     m.impl("quantize_mx_ln_modulate", quantize_mx_ln_modulate);
@@ -345,6 +354,9 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     m.impl("quantize_mxfp6_gate_mul", quantize_mxfp6_gate_mul_meta);
     m.impl("quantize_mx", quantize_mx_meta);
     m.impl("quantize_mx_dual", quantize_mx_dual_meta);
+    m.impl("quantize_mx_dual_f8", quantize_mx_dual_f8_meta);
+    m.impl("quantize_mx_f8", quantize_mx_f8_meta);
+    m.impl("quantize_mx_fused_dual_f8", quantize_mx_fused_dual_f8_meta);
     m.impl("quantize_mx_fused_dual", quantize_mx_fused_dual_meta);
     m.impl("quantize_mx_qk_norm_rope_bwd", quantize_mx_qk_norm_rope_bwd_meta);
     m.impl("quantize_mx_ln_modulate", quantize_mx_ln_modulate_meta);

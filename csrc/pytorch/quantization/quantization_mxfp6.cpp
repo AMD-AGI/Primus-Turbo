@@ -58,6 +58,8 @@ std::pair<int64_t, int64_t> pack_sizes(const int64_t rows, const int64_t k) {
 // consuming GEMM operand (see MXTilePack). Gradients pass two codes, activations / weights FP6 rows.
 // Codes without 0x8: 0x1 | is_b << 1 = MXFP6 K128-blocked planes; 0x5 | is_b << 1 = MXFP4 with
 // K128-blocked codes (row direction, round to nearest); both with scales at nt 4, no interleave.
+// 0x2 = E4M3 with one fp32 scale per tensor in the tilescale FP8 planes (row direction only, the *_f8 ops, which
+// take the quantization multiplier and max the launch's amax into a caller slot; no scale slab).
 constexpr int64_t kTileFmt = 0x1000, kTileSr = 0x800;
 //
 // fmt bits 16-24: per-direction FP4 options, on top of any of the formats above, for the FP4
@@ -87,6 +89,11 @@ MXPackFmt ts_dir_fmt(int64_t fmt, const bool col) {
     const int64_t code = col ? (fmt >> 4) & 0xF : fmt & 0xF;
     if (code == 0)
         return MXPackFmt::Fp6;
+    if (code == 0x2) {
+        PRIMUS_TURBO_CHECK(!col && !(fmt & kTileSr), "tensorwise FP8 is a row direction, round to nearest (fmt ", fmt,
+                           ")");
+        return MXPackFmt::Fp8Tw;
+    }
     if (!(code & 0x8)) {
         if (code & 0x4) { // 0x5 | is_b << 1: MXFP4, K128-blocked codes + FlyDSL packed scales (nt 4, ilv 0)
             PRIMUS_TURBO_CHECK((code & 0x1) && !col, "K128-blocked FP4 is a row direction (fmt ", fmt, ")");
@@ -112,6 +119,10 @@ void set_fp4_options(MXTilePack &p, const int64_t fmt, const bool col) {
     const bool    tile2d = (fmt >> 24) & 0x1;
     const auto    dirs   = fmt_pair(fmt);
     const auto    f      = col ? dirs.second : dirs.first;
+    if (f == MXPackFmt::Fp8Tw) {
+        PRIMUS_TURBO_CHECK(round == 0 && had == 0 && !tile2d, "FP4 options set on a tensorwise FP8 row (fmt ", fmt, ")");
+        return;
+    }
     if (f == MXPackFmt::Fp6 || f == MXPackFmt::Fp6Tile) {
         // FP6 directions keep their scale rule; K128-blocked FP6 rows may drop the Hadamard ("none"), and then take
         // the 2-D 32x32 block scaling too (a weight plane whose tile scales serve both directions).
@@ -218,6 +229,11 @@ std::pair<int64_t, int64_t> sizes_for(const MXPackFmt f, const int64_t rows, con
         const int64_t rt = cdiv(rows, kTileRows), kt = cdiv(k, 128) + 2;
         return {rt * kt * 16384, rt * kt * 1024};
     }
+    if (f == MXPackFmt::Fp8Tw) {
+        // P0 [rows/16, K/128, 16, 64] then P1 the same (rows to 256, K to 256); no scale slab.
+        const int64_t r = cdiv(rows, kTileRows) * kTileRows, c = cdiv(k, kTileRows) * kTileRows;
+        return {r * c, 0};
+    }
     if (f == MXPackFmt::Fp6Tile) {
         // C0 [rows/16, K/128, 16, 64] then C1 [rows/32, K/128, 32, 32] (rows to 256, K to 256), and FlyDSL's
         // packed scale slab at nt 4.
@@ -257,8 +273,30 @@ at::Tensor empty_blob(const int64_t bytes, const at::Tensor &like) {
     return at::empty({bytes}, like.options().dtype(at::kByte));
 }
 
+// Fp8Tw rows: the multiplier tensor and the amax output, attached to the row direction's MXTilePack.
+struct F8Row {
+    const at::Tensor *qscale = nullptr;
+    const at::Tensor *amax   = nullptr;
+};
+
+MXTilePack with_f8(MXTilePack p, const F8Row &f8, const MXPackFmt row_fmt, const at::Tensor &input) {
+    PRIMUS_TURBO_CHECK((f8.qscale != nullptr) == (row_fmt == MXPackFmt::Fp8Tw),
+                       "the *_f8 ops take a tensorwise FP8 row format (fmt row code 0x2), and only they do");
+    if (f8.qscale == nullptr)
+        return p;
+    const at::Tensor &q = *f8.qscale;
+    const at::Tensor &a = *f8.amax;
+    for (const at::Tensor *t : {&q, &a})
+        PRIMUS_TURBO_CHECK(t->is_cuda() && t->device() == input.device() && t->scalar_type() == at::kFloat &&
+                               t->numel() == 1,
+                           "row_qscale and row_amax must be one-element fp32 tensors on the input's device");
+    p.tw_scale = q.data_ptr<float>();
+    p.tw_amax  = reinterpret_cast<uint32_t *>(a.data_ptr<float>());
+    return p;
+}
+
 std::vector<at::Tensor> run(const at::Tensor &input, const MXFP6Direction direction,
-                            const int64_t fmt = 0) {
+                            const int64_t fmt = 0, F8Row f8 = {}) {
     const auto [row_fmt, col_fmt] = fmt_pair(fmt);
     check_input(input);
     // Allocate and launch on the operand's device rather than the ambient one, which the
@@ -272,7 +310,8 @@ std::vector<at::Tensor> run(const at::Tensor &input, const MXFP6Direction direct
 
     const auto [row_p_bytes, row_s_bytes] = sizes_for(row_fmt, M, N, ts_dir(fmt, M, N, false)); // contract N
     const auto [col_p_bytes, col_s_bytes] = sizes_for(col_fmt, N, M, ts_dir(fmt, M, N, true)); // contract M
-    MXTilePackScope ts_scope(ts_dir(fmt, M, N, false), ts_dir(fmt, M, N, true));
+    MXTilePackScope ts_scope(with_f8(ts_dir(fmt, M, N, false), f8, want_row ? row_fmt : MXPackFmt::Fp6, input),
+                             ts_dir(fmt, M, N, true));
 
     at::Tensor row_p = empty_blob(want_row ? row_p_bytes : 0, input);
     at::Tensor row_s = empty_blob(want_row ? row_s_bytes : 0, input);
@@ -342,7 +381,7 @@ void check_bias(const at::Tensor &bias, const at::Tensor &input, const int64_t N
 std::vector<at::Tensor> run_fused(const at::Tensor &input, const c10::optional<at::Tensor> &aux,
                                   const c10::optional<at::Tensor> &bias,
                                   const MXFP6Prologue prologue, const bool want_col_sum,
-                                  const int64_t fmt = 0) {
+                                  const int64_t fmt = 0, F8Row f8 = {}) {
     const auto [row_fmt, col_fmt] = fmt_pair(fmt);
     check_input(input);
     const c10::DeviceGuard device_guard(input.device());
@@ -366,7 +405,7 @@ std::vector<at::Tensor> run_fused(const at::Tensor &input, const c10::optional<a
 
     const auto [row_p_bytes, row_s_bytes] = sizes_for(row_fmt, M, N, ts_dir(fmt, M, N, false)); // contract N
     const auto [col_p_bytes, col_s_bytes] = sizes_for(col_fmt, N, M, ts_dir(fmt, M, N, true)); // contract M
-    MXTilePackScope ts_scope(ts_dir(fmt, M, N, false), ts_dir(fmt, M, N, true));
+    MXTilePackScope ts_scope(with_f8(ts_dir(fmt, M, N, false), f8, row_fmt, input), ts_dir(fmt, M, N, true));
 
     at::Tensor row_p = empty_blob(row_p_bytes, input);
     at::Tensor row_s = empty_blob(row_s_bytes, input);
@@ -1130,6 +1169,26 @@ std::vector<at::Tensor> quantize_mx_dual(const at::Tensor input, const int64_t f
     return run(input, MXFP6Direction::Dual, fmt);
 }
 
+// Tensorwise FP8 rows (fmt row code 0x2): `row_qscale` (one fp32) multiplies x before the E4M3 cast, and the launch's
+// max |x| is maxed into `row_amax` (one fp32, atomically; the caller zeroes it when a new amax period starts). The
+// outputs and the column direction are quantize_mx_dual's / quantize_mx's / quantize_mx_fused_dual's.
+std::vector<at::Tensor> quantize_mx_dual_f8(const at::Tensor input, const int64_t fmt, const at::Tensor row_qscale,
+                                            at::Tensor row_amax) {
+    return run(input, MXFP6Direction::Dual, fmt, F8Row{&row_qscale, &row_amax});
+}
+
+std::vector<at::Tensor> quantize_mx_f8(const at::Tensor input, const int64_t fmt, const at::Tensor row_qscale,
+                                       at::Tensor row_amax) {
+    return run(input, MXFP6Direction::Row, fmt, F8Row{&row_qscale, &row_amax});
+}
+
+std::vector<at::Tensor> quantize_mx_fused_dual_f8(const at::Tensor input, const c10::optional<at::Tensor> aux,
+                                                  const c10::optional<at::Tensor> bias, const int64_t mode,
+                                                  const bool want_col_sum, const int64_t fmt,
+                                                  const at::Tensor row_qscale, at::Tensor row_amax) {
+    return run_fused(input, aux, bias, prologue_from_mode(mode), want_col_sum, fmt, F8Row{&row_qscale, &row_amax});
+}
+
 std::vector<at::Tensor> quantize_mx_fused_dual(const at::Tensor input,
                                                const c10::optional<at::Tensor> aux,
                                                const c10::optional<at::Tensor> bias,
@@ -1191,6 +1250,22 @@ std::vector<at::Tensor> quantize_mx_meta(const at::Tensor input, const int64_t a
 
 std::vector<at::Tensor> quantize_mx_dual_meta(const at::Tensor input, const int64_t fmt) {
     return with_fmt_blobs(quantize_mxfp6_dual_meta(input), input, fmt);
+}
+
+std::vector<at::Tensor> quantize_mx_dual_f8_meta(const at::Tensor input, const int64_t fmt, const at::Tensor,
+                                                 at::Tensor) {
+    return quantize_mx_dual_meta(input, fmt);
+}
+
+std::vector<at::Tensor> quantize_mx_f8_meta(const at::Tensor input, const int64_t fmt, const at::Tensor, at::Tensor) {
+    return quantize_mx_meta(input, 1, fmt);
+}
+
+std::vector<at::Tensor> quantize_mx_fused_dual_f8_meta(const at::Tensor input, const c10::optional<at::Tensor> aux,
+                                                       const c10::optional<at::Tensor> bias, const int64_t mode,
+                                                       const bool want_col_sum, const int64_t fmt, const at::Tensor,
+                                                       at::Tensor) {
+    return quantize_mx_fused_dual_meta(input, aux, bias, mode, want_col_sum, fmt);
 }
 
 std::vector<at::Tensor> quantize_mx_fused_dual_meta(const at::Tensor input,

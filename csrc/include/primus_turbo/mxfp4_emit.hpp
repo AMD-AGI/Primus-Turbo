@@ -109,6 +109,8 @@ struct TilePackArgs {
     int64_t draw_codes = 0, draw_scales = 0;
     int32_t prob4 = 0;     // round-up probability bits (4 or 2; 0 = off): floor codes + probabilities at prob_delta; OPTS only
     int64_t prob_delta = 0;
+    const float *tw_scale = nullptr; // Fp8Tw rows: quantization multiplier (see MXTilePack)
+    uint32_t    *tw_amax  = nullptr; // Fp8Tw rows: amax output
 };
 
 // Scale rules. 0 is RCEIL, ceil_pow2(amax / 6): never saturates. 1-3 are Turbo's
