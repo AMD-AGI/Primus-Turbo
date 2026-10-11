@@ -84,18 +84,26 @@ static inline int get_num_cpu_timeout_secs() {
 }
 
 // Selects how the intranode dispatch / combine channels publish their ring-buffer tails (see the
-// cheap-fence notes in the deep_ep utils header). The cheap fence, the default, has every sending
-// warp drain its own payload stores before the tail is published and reads the payload with
-// system-scope loads. The full fence instead makes the tail store a system-scope release and the
-// poll an acquire, which adds a GPU-wide L2 write-back per publish and a cache invalidate per
-// poll: on gfx950 (EP=8, DSv3 shapes, 32 CUs) that makes dispatch 23-30% and combine 35% slower,
-// and GEMMs running alongside 12% slower. Set PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE=1 for the
-// full fence; gfx1250 always uses it.
-inline static bool is_enable_cheap_fence() {
+// cheap-fence notes in the deep_ep utils header). The cheap fence, the default at low CU counts,
+// has every sending warp drain its own payload stores before the tail is published and reads the
+// payload with system-scope loads. The full fence instead makes the tail store a system-scope
+// release and the poll an acquire, which adds a GPU-wide L2 write-back per publish and a cache
+// invalidate per poll: on gfx950 (EP=8, DSv3 shapes, 32 CUs) that makes dispatch 23-30% and
+// combine 35% slower, and GEMMs running alongside 12% slower.
+//
+// #539 validated the cheap fence with concurrent GEMMs at <=80 CUs. At 160/192 CUs the Qwen3
+// FP8 full-opt stack saw intermittent NaN forward loss (~1/13 runs), so the default above
+// kCheapFenceMaxSms is the full fence. Set PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE=1 to force
+// the full fence at any CU count, or =0 to force the cheap fence (including above the cap).
+// gfx1250 always uses the full fence via kHasCheapFence.
+inline static bool is_enable_cheap_fence(int num_sms = 0) {
     char const *v = std::getenv("PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE");
-    if (!v || v[0] == '\0')
-        return true;
-    return std::stoi(v) == 0;
+    if (v && v[0] != '\0')
+        return std::stoi(v) == 0;
+    constexpr int kCheapFenceMaxSms = 80;
+    if (num_sms > kCheapFenceMaxSms)
+        return false;
+    return true;
 }
 
 // When set to 1, EP dispatch/combine kernels run on the caller's current
