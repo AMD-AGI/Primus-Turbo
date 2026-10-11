@@ -17,6 +17,7 @@ from torch.testing._internal.common_utils import (
 )
 
 import primus_turbo.pytorch as turbo
+from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.kernels.moe.moe_dispatch_combine_impl import (
     set_buffer_global_config,
 )
@@ -100,6 +101,7 @@ def _run_dispatch_combine(
     tp_size=1,
     routing_map=None,
     token_indices=None,
+    permute_backend=BackendType.TURBO,
 ):
     """Core dispatch-combine logic shared by all test variants."""
     if tp_size > 1:
@@ -121,6 +123,7 @@ def _run_dispatch_combine(
         pad_multiple=pad_multiple,
         expert_capacity_factor=expert_capacity_factor,
         deepep_use_comm_stream=deepep_use_comm_stream,
+        permute_backend=permute_backend,
     )
 
     hidden_states = torch.randn((num_tokens, hidden_size), dtype=dtype, device="cuda")
@@ -204,7 +207,10 @@ class TestTokenDispatcher(MultiProcContinuousTest):
     @parametrize("backend", _get_backends())
     @parametrize("deepep_use_cuda_num_tokens_per_expert", [False, True])
     @parametrize("expert_capacity_factor", [None, 0.5])
-    def test_basic(self, backend, deepep_use_cuda_num_tokens_per_expert, expert_capacity_factor):
+    @parametrize("permute_backend", ["TURBO", "TRITON"])
+    def test_basic(
+        self, backend, deepep_use_cuda_num_tokens_per_expert, expert_capacity_factor, permute_backend
+    ):
         self._bind_device()
         with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
             _run_dispatch_combine(
@@ -212,6 +218,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
                 dist.group.WORLD,
                 deepep_use_cuda_num_tokens_per_expert=deepep_use_cuda_num_tokens_per_expert,
                 expert_capacity_factor=expert_capacity_factor,
+                permute_backend=BackendType[permute_backend],
             )
 
     # ------------------------------------------------------------------
@@ -220,7 +227,8 @@ class TestTokenDispatcher(MultiProcContinuousTest):
 
     @parametrize("backend", _get_backends())
     @parametrize("permute_max_token_num", [0, NUM_TOKENS * 8 * ROUTER_TOPK])
-    def test_worst_tokens(self, backend, permute_max_token_num):
+    @parametrize("permute_backend", ["TURBO", "TRITON"])
+    def test_worst_tokens(self, backend, permute_max_token_num, permute_backend):
         self._bind_device()
         with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
             _run_dispatch_combine(
@@ -229,6 +237,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
                 deepep_use_cuda_num_tokens_per_expert=True,
                 deepep_num_worst_tokens=NUM_TOKENS * 8,
                 permute_max_token_num=permute_max_token_num,
+                permute_backend=BackendType[permute_backend],
             )
 
     # ------------------------------------------------------------------

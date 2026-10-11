@@ -141,23 +141,29 @@ class Workspace:
         self.hidden = hidden
         self.token_dtype = token_dtype
         self.num_max_pool_blocks = self.num_max_pool_tokens // BLOCK_M
-        self.num_combine_slots = num_max_tokens_per_rank * num_topk
+        # BLOCK_M sentinel rows past the pool let a gather prefetch read past the last real row
+        self.num_pool_row_to_recv_token_entries = self.num_max_pool_tokens + BLOCK_M
+        self.num_max_routes = num_max_tokens_per_rank * num_topk
+        self.num_max_recv_tokens = num_ranks * num_max_tokens_per_rank
+        assert self.num_max_recv_tokens * num_topk < 2**31, "recv_token_idx * num_topk must fit in i32"
 
     # each region base = previous + its size, 256B-aligned (gfx950 cross-XCD flag coherence)
-    def get_dispatch_token_pool_ptr(self):
+    def get_dispatch_token_buffer_ptr(self):
         return self.base + align(self.NUM_BARRIER_SIGNAL_BYTES, BLOCK_M)
 
     def get_l2_token_buffer_ptr(self):
-        pool_bytes = align(self.num_max_pool_tokens * self.hidden * self.token_dtype.itemsize, BLOCK_M)
-        return self.get_dispatch_token_pool_ptr() + pool_bytes
+        buffer_bytes = align(self.num_max_recv_tokens * self.hidden * self.token_dtype.itemsize, BLOCK_M)
+        return self.get_dispatch_token_buffer_ptr() + buffer_bytes
 
     def get_combine_token_buffer_ptr(self):
         pool_bytes = align(self.num_max_pool_tokens * self.hidden * self.token_dtype.itemsize, BLOCK_M)
         return self.get_l2_token_buffer_ptr() + pool_bytes
 
     def get_dispatch_flag_ptr(self):
-        combine_pool_bytes = align(self.num_combine_slots * self.hidden * self.token_dtype.itemsize, BLOCK_M)
-        return self.get_combine_token_buffer_ptr() + combine_pool_bytes
+        combine_token_buffer_bytes = align(
+            self.num_max_routes * self.hidden * self.token_dtype.itemsize, BLOCK_M
+        )
+        return self.get_combine_token_buffer_ptr() + combine_token_buffer_bytes
 
     def get_combine_flag_ptr(self):
         return self.get_dispatch_flag_ptr() + align(2 * self.num_max_pool_blocks * 8, BLOCK_M)
@@ -166,16 +172,23 @@ class Workspace:
         return self.get_combine_flag_ptr() + align(2 * self.num_max_pool_blocks * 8, BLOCK_M)
 
     def get_expert_count_buffer_ptr(self):
-        return self.get_reduce_flag_ptr() + align(2 * self.num_combine_slots * 8, BLOCK_M)
+        return self.get_reduce_flag_ptr() + align(2 * self.num_max_routes * 8, BLOCK_M)
 
-    def get_pool_src_rank_ptr(self):
-        return self.get_expert_count_buffer_ptr() + align(self.num_ranks * self.num_experts * 4, BLOCK_M)
+    def get_pool_row_to_recv_token_ptr(self):
+        return self.get_expert_count_buffer_ptr() + align(self.num_ranks * 2 * self.num_experts * 4, BLOCK_M)
 
-    def get_pool_src_slot_ptr(self):
-        return self.get_pool_src_rank_ptr() + align(self.num_max_pool_tokens * 4, BLOCK_M)
+    def get_pool_row_to_route_ptr(self):
+        return self.get_pool_row_to_recv_token_ptr() + align(
+            self.num_pool_row_to_recv_token_entries * 4, BLOCK_M
+        )
+
+    def get_recv_token_to_pool_rows_ptr(self):
+        return self.get_pool_row_to_route_ptr() + align(self.num_max_pool_tokens * 4, BLOCK_M)
 
     def get_weight_recv_buf_ptr(self):
-        return self.get_pool_src_slot_ptr() + align(self.num_max_pool_tokens * 4, BLOCK_M)
+        return self.get_recv_token_to_pool_rows_ptr() + align(
+            self.num_max_recv_tokens * self.num_topk * 4, BLOCK_M
+        )
 
     def get_combine_gate_ptr(self):
         return self.get_weight_recv_buf_ptr() + align(self.num_max_pool_tokens * 4, BLOCK_M)
@@ -233,9 +246,13 @@ def get_symm_buffer_size_for_mega_moe(
         )
         dev = buffer.device.index
         npt = workspace.num_max_pool_tokens
+        num_max_recv_tokens = workspace.num_max_recv_tokens
         return (
             _tensor_from_device_ptr(
-                int(workspace.get_dispatch_token_pool_ptr()), (npt, hidden), token_dtype, dev
+                int(workspace.get_dispatch_token_buffer_ptr()),
+                (num_max_recv_tokens, hidden),
+                token_dtype,
+                dev,
             ),
             _tensor_from_device_ptr(int(workspace.get_weight_recv_buf_ptr()), (npt,), torch.float32, dev),
             _tensor_from_device_ptr(
@@ -243,12 +260,23 @@ def get_symm_buffer_size_for_mega_moe(
             ),
             _tensor_from_device_ptr(
                 int(workspace.get_combine_token_buffer_ptr()),
-                (workspace.num_combine_slots, hidden),
+                (workspace.num_max_routes, hidden),
                 token_dtype,
                 dev,
             ),
-            _tensor_from_device_ptr(int(workspace.get_pool_src_slot_ptr()), (npt,), torch.int32, dev),
-            _tensor_from_device_ptr(int(workspace.get_pool_src_rank_ptr()), (npt,), torch.int32, dev),
+            _tensor_from_device_ptr(int(workspace.get_pool_row_to_route_ptr()), (npt,), torch.int32, dev),
+            _tensor_from_device_ptr(
+                int(workspace.get_pool_row_to_recv_token_ptr()),
+                (workspace.num_pool_row_to_recv_token_entries,),
+                torch.int32,
+                dev,
+            ),
+            _tensor_from_device_ptr(
+                int(workspace.get_recv_token_to_pool_rows_ptr()),
+                (num_max_recv_tokens, num_topk),
+                torch.int32,
+                dev,
+            ),
             _tensor_from_device_ptr(
                 int(workspace.get_dispatch_flag_ptr()), (2 * workspace.num_max_pool_blocks,), torch.int64, dev
             ),
@@ -256,7 +284,7 @@ def get_symm_buffer_size_for_mega_moe(
                 int(workspace.get_combine_flag_ptr()), (2 * workspace.num_max_pool_blocks,), torch.int64, dev
             ),
             _tensor_from_device_ptr(
-                int(workspace.get_reduce_flag_ptr()), (2 * workspace.num_combine_slots,), torch.int64, dev
+                int(workspace.get_reduce_flag_ptr()), (2 * workspace.num_max_routes,), torch.int64, dev
             ),
         )
 
@@ -279,14 +307,14 @@ class SymmBuffer:
     ) -> None:
         self.group = group
         self.rank = group.rank()
-        self.world = group.size()
+        self.num_ranks = group.size()
         self.num_experts = int(num_experts)
         self.num_max_tokens_per_rank = int(num_max_tokens_per_rank)
         self.num_topk = int(num_topk)
         self.hidden = int(hidden)
         self.intermediate_hidden = int(intermediate_hidden)
         self.key = (
-            self.world,
+            self.num_ranks,
             self.num_experts,
             self.num_max_tokens_per_rank,
             self.num_topk,
@@ -297,7 +325,7 @@ class SymmBuffer:
 
         # single layout owner: allocation size + the host-slicing hook
         self.num_bytes, slice_input_buffers = get_symm_buffer_size_for_mega_moe(
-            self.world,
+            self.num_ranks,
             self.num_experts,
             self.num_max_tokens_per_rank,
             self.num_topk,
@@ -307,7 +335,7 @@ class SymmBuffer:
         # derived pool dims for parity bookkeeping / callers
         workspace = Workspace(
             0,
-            self.world,
+            self.num_ranks,
             self.num_experts,
             self.num_max_tokens_per_rank,
             self.num_topk,
@@ -315,8 +343,8 @@ class SymmBuffer:
             token_dtype,
         )
         self.num_max_pool_tokens = workspace.num_max_pool_tokens
-        self.num_combine_slots = workspace.num_combine_slots
-        self.num_tokens = self.num_max_tokens_per_rank  # back-compat alias
+        self.num_max_routes = workspace.num_max_routes
+        self.num_max_recv_tokens = workspace.num_max_recv_tokens
 
         # allocate the single symmetric-memory heap (custom HIP IPC; ctor zeroes it, skip signal pad)
         from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
@@ -329,24 +357,26 @@ class SymmBuffer:
 
         # host-side region views, sliced by the layout owner from this rank's heap
         (
-            self.dispatch_token_pool,
+            self.dispatch_token_buffer,
             self.weight_recv_buf,
             self.l2_token_buffer,
             self.combine_token_buffer,
-            self.pool_src_slot,
-            self.pool_src_rank,
+            self.pool_row_to_route,
+            self.pool_row_to_recv_token,
+            self.recv_token_to_pool_rows,
             self.dispatch_flag,
             self.combine_flag,
             self.reduce_flag,
         ) = slice_input_buffers(heap)
 
         self.num_tokens_per_rank = torch.full(
-            (self.world,), self.num_tokens, dtype=torch.int32, device="cuda"
+            (self.num_ranks,), self.num_max_tokens_per_rank, dtype=torch.int32, device="cuda"
         )
 
         # device epoch state (parity + per-bank expected); bumped by the device bump kernel
-        self._disp_parity = torch.zeros(1, dtype=torch.int64, device="cuda")  # index into the 2 banks
-        self._disp_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
+        self._dispatch_parity = torch.zeros(1, dtype=torch.int64, device="cuda")  # index into the 2 banks
+        self._dispatch_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
+        self._dispatch_chunk_counter = torch.zeros(self.num_experts, dtype=torch.int64, device=heap.device)
         self._combine_parity = torch.zeros(1, dtype=torch.int64, device="cuda")
         self._combine_expected = torch.zeros(2, dtype=torch.int64, device="cuda")
         self._reduce_expected = torch.zeros(2, dtype=torch.int64, device="cuda")

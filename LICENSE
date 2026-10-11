@@ -77,9 +77,10 @@ Primus-Turbo uses or references the following third-party projects:
 8. NVIDIA TransformerEngine
    - License: Apache License 2.0 (full text in LICENSE-APACHE)
    - Repository: https://github.com/NVIDIA/TransformerEngine.git
-   - Note: the following file carries NVIDIA attribution and remains licensed
+   - Note: the following files carry NVIDIA attribution and remain licensed
      under Apache-2.0 rather than the MIT license above:
        primus_turbo/triton/moe/permutation.py
+       primus_turbo/triton/cross_entropy.py
 
 9. NVIDIA Megatron-LM
    - License: 3-clause BSD (full text at the end of this file)

@@ -178,6 +178,36 @@ def test_moe_permute_pad_multiple(num_topk, pad_multiple):
     assert (padded_per_expert % pad_multiple == 0).all()
 
 
+@pytest.mark.parametrize("pad_multiple", [8, 16])
+def test_moe_permute_padding_rows_zero_with_unrouted_tail(pad_multiple):
+    """Padding rows are zeroed even when the routed count is below the token rows.
+
+    A worst-case dispatch buffer ends in unrouted rows; the padding rows of row_id_map
+    still sit after every token row, not right after the routed ones.
+    """
+    num_tokens, num_routed, num_experts, num_topk, hidden_size = 1024, 300, 8, 2, 256
+    routing_map = generate_routing_map(num_tokens, num_experts, num_topk, seed=21)
+    routing_map[num_routed:] = False
+    tokens = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
+    src_token, _, total = expected_permuted_layout(routing_map, pad_multiple)
+    pad_rows = src_token < 0
+    assert pad_rows.any()
+
+    # Hand the output allocation NaN-filled memory, so an unwritten row cannot pass as zero.
+    poison = torch.full((total, hidden_size), float("nan"), dtype=torch.bfloat16, device="cuda")
+    del poison
+    permuted, _, _, _, _, _ = moe_permute(
+        tokens,
+        routing_map=routing_map,
+        num_local_experts=num_experts,
+        pad_multiple=pad_multiple,
+        backend=BackendType.TURBO,
+    )
+    assert permuted.shape[0] == total
+    assert torch.equal(permuted[pad_rows], torch.zeros_like(permuted[pad_rows]))
+    assert torch.equal(permuted[~pad_rows], tokens[src_token[~pad_rows]])
+
+
 # --- overflow_flag ---
 
 
