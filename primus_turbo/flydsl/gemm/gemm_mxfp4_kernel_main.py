@@ -795,11 +795,9 @@ class MfmaScaleFp4:
         _CST = cst is not None
         _CILV = cst_ilv
         assert not _CILV or (_CST and _CILV == ntb and ntb in (3, 4))
-        # Wide pack: the caller interleaved the two B pools every ntb columns, so a lane's
-        # 2*ntb fragments are one run and each C row leaves as a single ntb-dword store off
-        # the L descriptor (dwordx4 on the 256 tile, dwordx3 on the 192 one).
+        # Wide pack: the B pools interleave every ntb columns, so a C row is one store.
         _CRUN = bool(cst_run)
-        # A unit now needs BOTH halves' accumulators, which the half-N variant never produces.
+        # A unit needs BOTH halves' accumulators, which the half-N variant never produces.
         assert not _CRUN or (_CILV and half_n is None)
         _BSPL = bool(_CILV) and _SPLIT
         assert _BSPL == (b_base_even is not None)
@@ -1206,8 +1204,6 @@ class MfmaScaleFp4:
                 for er in range(2):
                     e = 2 * eh + er
                     for j in range(ntb):
-                        # Half a bank per row, not ntb: a MUBUF vgpr tuple has to start even
-                        # (llvm-mc rejects an odd one), and an odd ntb would alternate parity.
                         d = b + 4 * er + j
                         qs = [(c // ntb) * nq + ii * ntb + c % ntb for c in (2 * j, 2 * j + 1)]
                         src = []
@@ -2172,8 +2168,7 @@ class MfmaScaleFp4:
 # A second copy of this rule is a second thing to drift: the two would still agree byte for
 # byte on the scales, and disagree only on how to read them.
 _MXFP4_PACK_ILV = 4  # BLOCK_N // 2 // 32 at the default 256 width; out-of-tree callers quote this
-# N tiles whose fold is implemented: a lane owns 2*(BLOCK_N // 64) output columns, which the
-# folded store writes as that many dwords. Below 3 the run is one dword and the pack has no
+# N tiles whose fold is implemented: below 3 the run is one dword and the pack has no
 # pair for the odd column.
 _MXFP4_FOLD_NT = (3, 4)
 
@@ -2338,11 +2333,6 @@ def _build_mxfp4_gemm_kernel(
         and (KI % 2 == 0 or _HALF_K)
         and ((not glu) or (glu_i % 64 == 0))  # in-loop l1 store needs I on a 64-col band
         and (not dglu)  # dglu stages through LDS after the mainloop; no in-loop C store
-        # The fold needs the interleave, and the interleave needs an even run: a lane owns
-        # 2*(BLOCK_N // 64) output columns and the pack turns each adjacent pair into one
-        # dword. At 64 or 128 the run is 2 or 4 columns, narrower than the line it shares,
-        # so those widths keep their epilogue store instead (per-row alternatives measured
-        # worse: truncated bf16, or a fold that comes up one short per row).
         and (BLOCK_N // 64 in _MXFP4_FOLD_NT)
     )
     # The C store's cache policy follows its destination's lifetime: a final tile is
@@ -2402,9 +2392,8 @@ def _build_mxfp4_gemm_kernel(
     _ROWS_PER_STEP = 64 // (BPR // 16) * (256 // 64)  # n_waves = 256//64 = 4
     N_LDS_STEPS_A = BLOCK_M // _ROWS_PER_STEP
     N_LDS_STEPS_BH = LDS_BN_HALF // _ROWS_PER_STEP
-    # Wide packed B: the two pools interleave every `_BILV` columns instead of every 128, so a
-    # lane's columns from both pools join into one run and the folded C store halves its
-    # instruction count. Needs the whole N tile present (no per-lane column bound to honor).
+    # Wide packed B joins a lane's columns from both pools into one run, halving the
+    # folded C store's instruction count; it needs the whole N tile present.
     _BWIDE = bool(_BILV) and n_tail == 0 and not glu and not dglu
     _ROWSPLIT = _MXFP4_ROWSPLIT and K2A == K2B and (K2A % 128 == 64) and not coop
     _SK = 64 if _ROWSPLIT else 0
@@ -2718,7 +2707,6 @@ def _build_mxfp4_gemm_kernel(
 
         wave_m_off = wave_m * (N_TILES_A * 16)  # 0 or 128
         wave_n_off = wave_n * (N_TILES_BH * 16)  # 0 or 64
-        # Packed-scale coordinates keep the 64-column group; only C's columns follow the map.
         wave_n_off_c = wave_n * (N_TILES_BH * (32 if _BWIDE else 16))
         SC_buf = [] if _ROWSPLIT else [getattr(lds, f"SC_lds{b}") for b in range_constexpr(_NSCBUF)]
 
@@ -3516,20 +3504,9 @@ def _mxfp4_pick_block_n(M, N, K, glu=False):
     """N tile width for this shape.
 
     A narrower tile buys CU fill and sells arithmetic intensity, so it can only win where it
-    removes a whole ragged dispatch round: both grids then run the same number of rounds and
-    the narrow one's round is the shorter. Priced in tile-times: the narrow tile's k-block
-    costs the FEED ratio ``(BM + BN) / 2*BM`` -- the pessimistic end, since a tile bound by
-    its operand fill saves only 12.5% where one bound by MFMA saves 25%. ``N % BN`` must be 0:
-    a ragged N tile would put the packed scale group's boundary off the column grid the
-    preshuffle writes.
-
-    The width used to owe a second term, the exposed C store a 192 tile could not fold into
-    the peel (3 k-blocks of a 512-wide tile, fitted on 8192x3072x3072). The fold now follows
-    the tile instead of the 256 width, so both widths keep it and the term is gone -- which
-    is what re-elects the one cell whose narrowing that term had been outvoting.
-
-    This axis runs second, on the height `_mxfp4_pick_block_m` already chose, and may narrow
-    on top of it: the two are independent now that neither costs the fold.
+    removes a whole ragged dispatch round. ``N % BN`` must be 0, or a ragged N tile would put
+    the packed scale group's boundary off the column grid the preshuffle writes. Runs second,
+    on the height `_mxfp4_pick_block_m` already chose.
     """
     bn = _MXFP4_BLOCK_N_ALT
     if glu or N % bn or M % 256:
@@ -4294,8 +4271,6 @@ def _build_mxfp4_preshuffle_kernel_ab(
     NG = _MXFP4_PRESHUF_NG
     FO = _MXFP4_PRESHUF_FO
     assert not b_ilv or b_ilv in (b_nt, 2 * b_nt)
-    # Wide B pack: a lane's 2*b_nt columns span both pools, so its band is two column groups
-    # wide and r_region picks the pool inside that band instead of naming a group of its own.
     _BW = b_ilv == 2 * b_nt
     assert not _BW or not glu_i
     # B's column group narrows with the N tile (b_nt == BLOCK_N // 64) and A's row group with

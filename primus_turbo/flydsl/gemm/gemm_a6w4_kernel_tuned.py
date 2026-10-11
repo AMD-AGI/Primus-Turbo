@@ -52,9 +52,8 @@ _F8F6F4_FMT = {"fp4": 4, "fp6": 2, "fp8": 0}
 
 def _mfma_scale_agpr(src0, src1, acc, sc0, sc1, os0, os1, fmt0, fmt1, agpr=True):
     """One v_mfma_scale_f32_16x16x128_f8f6f4 with D = C tied, in the AGPR or the arch-VGPR file.
-    os0/os1 pick the E8M0 byte of sc0/sc1, fmt0/fmt1 are src0/src1's format codes. A tile wider
-    than 256 accumulator dwords per lane overflows the AGPR file, so the overflow fragments take
-    agpr=False and live in the arch VGPRs the operands do not need."""
+    os0/os1 pick the E8M0 byte of sc0/sc1, fmt0/fmt1 are src0/src1's format codes. Fragments
+    past the 256-dword AGPR file take agpr=False and live in the arch VGPRs."""
     v4f32 = ir.VectorType.get([4], ir.F32Type.get())
     osel = f"op_sel:[{os0 & 1},{os1 & 1},0] op_sel_hi:[{(os0 >> 1) & 1},{(os1 >> 1) & 1},0]"
     return _llvm.inline_asm(
@@ -198,11 +197,8 @@ def launch_gemm(
     trade halves (DPP row_ror:8) so two stores write 8 whole 128 B lines each, cached (1), nt (2)
     or sc0|nt (3). Same bytes. At tile_n=384 a wave owns 1.5 lines of each C row, so c_split
     deals it n-fragments 0..3 = its aligned line, 4..5 = the leftover half line (see c_line).
-    a_pack (a_dtype=fp6 only) picks A's packing: 0 = the FP8-padded row-major form (24 code +
-    8 zero bytes per 32 values), 1 = quant_act_a6w4's dense preshuffle (24 code bytes, rows in
-    64-row blocks whose 128-K tiles sit back to back as six 1024 B planes). Same MFMA operands
-    either way; 1 drops a quarter of A's DRAM and LDS bytes and two of its cooperative loads,
-    and the preshuffle is what keeps each load one contiguous 1024 B run per wave.
+    a_pack (a_dtype=fp6 only) picks A's packing: 0 = the FP8-padded row-major form, 1 =
+    quant_act_a6w4's dense preshuffle. Same MFMA operands either way.
     """
     BM, BN, BK = tile_m, tile_n, tile_k
     if const_expr(out_dtype == "bf16"):
@@ -221,19 +217,8 @@ def launch_gemm(
         else:  # fp6
             A_GK_I32, A_KH_I32, A_HI_OFF, A_NDW = 8, 32, 4, 6
 
-    # a_pack=1 (fp6 only, quant_act_a6w4's default): A arrives dense and preshuffled -- 24 code
-    # bytes per 32 values instead of 24 + 8 zero bytes, which never reach an MFMA operand
-    # (read_a already moves only 24 B per fragment, A_NDW=6). The FP8-padded form (a_pack=0)
-    # spends a quarter of A's DRAM bytes, a quarter of its LDS write bytes and two of its
-    # eight cooperative loads on those zeros. Both forms feed the MFMAs identical bytes, so
-    # the product is bit-for-bit the same; a_pack only moves where A sits in DRAM and LDS.
-    # The preshuffle is what makes the dense form pay: A is grouped in 64-row blocks (one
-    # wave's share of a tile), each block holding its 128-K tiles back to back, and each tile
-    # six 1024 B planes -- the four micro-blocks' low 16 B halves, then their four high 8 B
-    # halves paired. One cooperative load is then exactly one plane of one 64-row block, i.e.
-    # 1024 contiguous gmem bytes per wave, the same eight cache lines per instruction the
-    # padded row-major form gets. A plain dense row-major A instead makes a wave's 64 lanes
-    # read 64 different rows, which is markedly slower: coalescing, not bytes, sets the DMA cost.
+    # a_pack only moves where A sits in DRAM and LDS: both forms feed the MFMAs the same
+    # bytes, so the product is bit-for-bit identical either way.
     a_planes = a_pack > 0 and a_dtype == "fp6"
     if const_expr(a_planes):
         a_row_bytes, A_ROW_B = K * 3 // 4, BK * 3 // 4
@@ -249,17 +234,6 @@ def launch_gemm(
     # bytes, or the DMA would walk past the real A row. pad16==0 reduces this to the exact
     # pre-R6 dense formula (BM % CHUNK_ROWS == 0 for every tile_m used here, so the two are
     # numerically identical, not just approximately).
-    # a_planes: one LDS plane per 16 B unit of a 96 B tile row -- planes 0..3 are the four
-    # micro-blocks' low halves, planes 4/5 the high halves of micro-blocks (0,1) and (2,3).
-    # LDS is wave-major (R9): row r of plane p inside 64-row block rb sits at
-    # rb * A_RBLK_B + p * 1024 + r * 16, which is a verbatim image of the dense gmem block --
-    # the LDS step between one wave's successive cooperative loads then EQUALS the gmem step,
-    # so a single 12-bit MUBUF immediate serves both addresses (dma_a_to_lds) and M0 is written
-    # once per 4096 B window instead of once per load. The destination needs no padding and no
-    # swizzle: each cooperative load's 1024 B per wave is a plane slice, and 16 consecutive
-    # read_a lanes read 16 consecutive 16 B units, which is the LDS bank floor (vs the 2x the
-    # XOR16 swizzle leaves on the padded layout, goal.md D.1). Every stride here is a multiple
-    # of 128 B, so the bank pattern is identical to the pre-R9 plane-major order.
     N_PLANE_KH = 6  # 16 B units per 128-K tile row: 4 low halves + 2 paired high halves
     N_RBLK = BM // 64  # 64-row preshuffle blocks per A tile (one per wave at tile_m=256)
     A_RBLK_B = 64 * A_ROW_B  # bytes of one 64-row preshuffle block, gmem and LDS alike
@@ -280,9 +254,6 @@ def launch_gemm(
         assert 16 % CHUNK_ROWS == 0, "D.1 strength reduction requires CHUNK_ROWS | 16 (one mi-step)"
         A_REAL_B = BM * A_ROW_B  # real (unpadded) A-tile bytes -- drives n_coop, independent of pad16
         A_LDS_B = (BM // CHUNK_ROWS) * CHUNK_B  # padded LDS bytes per A-tile (== A_REAL_B at pad16=0)
-        # XOR16 swizzle (dma_a_to_lds write + read_a's lo/hi offsets both branch on this) is dtype-
-        # agnostic: k_blk16 = A_ROW_B//16 and the (lo_blk ^ row%k_blk16) pair hold for fp6 unchanged.
-        # fp6 was excluded here even though the formula is already correct for it (R3, goal.md B.1).
         swz_lds = True
         k_blk16 = A_ROW_B // 16
         if const_expr(pad16 > 0):
@@ -301,16 +272,9 @@ def launch_gemm(
     bm256 = BM == 256
     m_chunks = BM // 16
     num_acc_n = BN // 4 // 16  # 16-col n-subblocks per wave
-    # Accumulator dwords per lane. Past 128 the arch-VGPR file can no longer hold both them and
-    # the operands, so the MFMAs must be the inline-asm form whose D = C is pinned to an AGPR;
-    # at or below 128 the plain fx.gemm atoms are cheaper (no asm barrier for the scheduler).
-    # This is a property of the accumulator footprint, not of tile_m: (128, 512) needs AGPRs
-    # exactly as (256, 256) does, and at 192 dwords ((128, 384)) the AGPR form measured faster
-    # than the fx.gemm one, which was spilling to scratch.
+    # Past 128 accumulator dwords the arch-VGPR file cannot hold them and the operands
+    # both, so the MFMAs must be the asm form whose D = C is pinned to an AGPR.
     agpr_acc = (BM // 16) * num_acc_n * 4 > 128
-    # n-subblocks whose accumulators fit the 256-dword AGPR file; the rest spill over into arch
-    # VGPRs (tile_n=384: ni 0..3 in AGPRs, ni 4..5 in VGPRs). Splitting on ni, not on the flat
-    # fragment index, keeps every MFMA of one n-subblock in one file.
     n_agpr_ni = min(num_acc_n, 256 // ((BM // 16) * 4)) if agpr_acc else num_acc_n
     n_sa_words = BM // 32  # A-scale words per 256-K chunk for the whole workgroup
     n_sa_dma = max(1, n_sa_words // 4)  # sa_lds A-scale DMAs per wave per chunk
@@ -319,13 +283,6 @@ def launch_gemm(
     n_coop = A_REAL_B // 256 // 16  # 16B cooperative loads per thread (unpadded data volume)
     n_pairs = max(1, num_acc_n // 2)
     m_pairs = max(1, m_chunks // 2)
-    # epi=2 whole-128 B-line C stores (store_mode>0). The DPP merge in the epilogue turns the two
-    # n-fragments of a pair into whole lines only if those 64 columns are aligned to one; a wave
-    # owns BN/4 columns at wave*BN/4, which is one aligned line at tile_n=256 but 1.5 lines
-    # starting mid-line on odd waves at tile_n=384. c_split deals that wave's n-fragments line
-    # first (n_col below): ni 0..3 are its aligned 64-column line, ni 4..5 the leftover half
-    # line. Same columns per wave either way -- only which n-fragment holds which 16 of them
-    # changes -- so every product, scale and accumulation order is untouched.
     c_line = store_mode > 0 and epi == 2 and num_acc_n in (4, 6)
     c_split = c_line and num_acc_n == 6
     # U2 K loop (b_prefetch 1/2, described at the loop below): two K-tiles per 256-K scale chunk.
@@ -337,20 +294,9 @@ def launch_gemm(
     # LDS symbol; the loop runs three chunks per iteration so every half addresses its slots
     # through a fixed symbol (see the loop below).
     a3 = a_stages == 3 and sa_lds_on and (K_TILES // 2) % 3 == 0
-    # A-scale chunk slots. The ring only needs two (chunk ch reads slot ch%2 and prefetches ch+1
-    # into the other), but ch%2 alternates with the *runtime* iteration index, so every chunk's
-    # LDS address carries a runtime slot term. a3 runs three chunks per iteration, so one slot
-    # per in-iteration chunk index c makes both the read and the prefetch slot compile-time
-    # constants -- the same trick the three A LDS symbols already use -- at the cost of one extra
-    # 2 KB slot. Prefetch distance is unchanged (c writes (c+1)%3, read one chunk later).
     n_sc_slots = 3 if a3 else 2
     SC_LDS_B = n_sc_slots * n_sa_words * 256  # slots x n_sa_words words x 64 lanes x 4 B
     # tile_m=256 ring: the half's loads go between one-m-row MFMA groups, in vs_np parts of B
-    # and vs_np parts of the A DMA (see the loop below). num_acc_n B loads spread over vs_np issue
-    # points leaves some of them empty; packing them into the first num_acc_n points instead
-    # (every load then issues at least one gap earlier, free latency since the half only waits
-    # at its end) measures faster, while moving the A DMA up behind them does not: what the
-    # spread buys is a VMEM issue rate matched to the MFMA group cadence, not issue distance.
     vsplit = bm256 and a3 and a_pipe == 0
     vs_np = m_chunks // 2
     vs_b = [list(range(p * num_acc_n // vs_np, (p + 1) * num_acc_n // vs_np)) for p in range(vs_np)]
@@ -358,7 +304,6 @@ def launch_gemm(
 
     # Scheduler counts per loop iter: MFMAs, A LDS reads/thread (fp6/fp8 2 per (mi,kh)), gmem loads.
     sched_mfma_total = k_halves * m_chunks * num_acc_n
-    # sched_mfma hints do not match inline-asm MFMAs, so none are emitted on the agpr_acc path.
     n_mfma_hints = 0 if agpr_acc else sched_mfma_total
     if const_expr(a_dtype == "fp4"):
         a_ds_per = 1
@@ -407,11 +352,7 @@ def launch_gemm(
         tid = fx.Int32(fx.thread_idx.x)
         bid_x, bid_y, bid_z = fx.block_idx
         wave = rocdl.readfirstlane(T.i32, tid // 64)
-        # R4 P5: readfirstlane is convergent, so LLVM cannot hoist it out of the K loop even when
-        # its operand is loop-invariant -- every chunk re-materialized this wave-relative LDS base
-        # (and the SALU multiply feeding it). Taking it once at kernel scope costs one live SGPR.
         if const_expr(a_planes):
-            # Wave-major base: wave w owns 64-row block w % N_RBLK, plane group w // N_RBLK.
             wave_lds_b = rocdl.readfirstlane(T.i32, (wave % N_RBLK) * A_RBLK_B + (wave // N_RBLK) * 1024)
         else:
             wave_lds_b = rocdl.readfirstlane(T.i32, wave * CHUNK_B)
@@ -421,14 +362,10 @@ def launch_gemm(
             return wave * (BN // 4)
 
         if const_expr(c_split):
-            # Within this wave's 96 columns: its aligned 128 B line starts at n_line_c (0 on even
-            # waves, 32 on odd ones, since the block itself starts at wave*192 B), the leftover
-            # 64 B half line at the other end.
             n_line_c = (wave % 2) * 32
             n_half_c = 64 - n_line_c * 2
 
         def n_col(ni):
-            # First column of n-fragment ni within this wave's BN/4-column block.
             if const_expr(c_split):
                 return n_line_c + ni * 16 if ni < 4 else n_half_c + (ni - 4) * 16
             return ni * 16
@@ -478,13 +415,6 @@ def launch_gemm(
             a_rstride = fx.Int32(a_row_bytes)
             sca_rstride = fx.Int32(_scale_chunk_dw)
 
-        # A source bound, computed once: the last valid M row (ragged M OOB -> 0). R9: the
-        # K-tile step rides the MUBUF `soffset` SGPR operand instead of being baked into a
-        # per-kt rebuilt descriptor (R8) or into the per-lane voffset (pre-R8). All three keep
-        # the voffset a true loop invariant -- the point of the R8 WAR-drain fix -- but soffset
-        # costs one uniform multiply shared by every cooperative load instead of a full
-        # descriptor rebuild per call, and raw-buffer bounds checking excludes soffset, so the
-        # check still runs on the row term alone, which is exactly the ragged-M guard.
         _i8g = fx.PointerType.get(T.i8, address_space=fx.AddressSpace.Global, alignment=16)
         if const_expr(batch > 1 and a_row_stride >= 0):
             a_nrec = fx.Int64(i32_m - fx.Int32(1)) * fx.Int64(a_rstride) + fx.Int64(a_row_bytes)
@@ -504,11 +434,6 @@ def launch_gemm(
             fx.make_layout(1, 1),
         )
         if const_expr(a_planes):
-            # Cooperative load i writes LDS 16 B unit u = i * 256 + tid = plane (u // BM) of
-            # row (u % BM), and wave w owns rows [64 * (w % N_RBLK), +64) of plane
-            # i * (256 // BM) + w // N_RBLK. In the preshuffled layout that plane-of-a-64-row-
-            # block is 1024 contiguous bytes, so the wave reads it with lane * 16 and only the
-            # plane index varies between loads; the row base is a kernel-scope address.
             a_coop_base = (bx_m + (wave % N_RBLK) * 64) * a_rstride + (wave // N_RBLK) * 1024 + lane * 16
         lds = fx.SharedAllocator().allocate(SharedA).peek()
         # A-LDS modeled as i32 (16B = 4 i32): fx.copy is dtype-agnostic, only the MMA cares.
@@ -552,24 +477,10 @@ def launch_gemm(
         # (4 `s_waitcnt vmcnt(N)` drains between the A-DMA issue and the first MFMA, draining
         # 9-of-14 in-flight VMEM ops just to make those registers safe to reuse).
         #
-        # Fix: keep kt out of the per-lane address entirely. R9 carries it in the MUBUF `soffset`
-        # SGPR (memory address = base + soffset + voffset + inst_offset), so `gmem_byte` below is
-        # `(bx_m+row)*a_rstride+col` with NO kt term at all: a true loop invariant, computed from
-        # values that never change across K-tiles, exactly as under R8's per-kt descriptor -- but
-        # at the cost of one uniform multiply per call (CSEd across the ring's six parts) instead
-        # of a whole descriptor rebuild (64-bit pointer add, 64-bit subtract, buffer-descriptor
-        # pack). soffset is excluded from raw-buffer bounds checking, so the hardware still clamps
-        # on the row term alone -- which is the only ragged-M guard that was ever needed.
-        #
-        # R9 M0 amortization (a_planes): LDS is wave-major, so one wave's successive cooperative
-        # loads step by A_COOP_STEP in LDS *and* in gmem. The 12-bit MUBUF immediate feeds both
-        # addresses (LDS = M0 + inst_offset + TID*16), so a whole 4096 B window of loads shares a
-        # single M0 write -- 6 `s_mov_b32 m0` + 6 `s_nop 0` per K-tile half collapse to 2 + 2 --
-        # and the window base is folded into the voffset so the gmem address stays exact.
+        # kt rides the MUBUF soffset SGPR, keeping the per-lane address a true loop invariant.
+        # soffset escapes raw-buffer bounds checking, so the row term stays the ragged-M guard.
         def dma_a_to_lds(kt, parity, slot_i8=None, irange=None):
             # slot_i8 (a3): the destination slot's own LDS symbol; otherwise buffer `parity` off a0.
-            # irange: issue only these cooperative loads (the tile_m=256 ring's DMA parts). An
-            # empty part (a_pack=1 leaves two of the ring's eight gaps without a load) emits nothing.
             if const_expr(irange is not None and len(irange) == 0):
                 return
             if const_expr(slot_i8 is not None):
@@ -577,8 +488,6 @@ def launch_gemm(
             else:
                 base_off = rocdl.readfirstlane(T.i32, parity * lds_db) + wave_lds_b
                 lds_ptr0 = fx.add_offset(sA0_i8, base_off)
-            # a_planes: a K-tile step is one 64-row block's tile, repeated at the same offset
-            # in every block, so it is still a single constant stride.
             kt_soff = fx.Int32(kt) * fx.Int32(A_ROW_B * (64 if a_planes else 1))
             for i in range_constexpr(n_coop):
                 if const_expr(irange is not None and i not in irange):
@@ -613,16 +522,7 @@ def launch_gemm(
             fx.copy(lds_copy64, fx.make_view(fx.add_offset(base_iter, off_i32), fx.make_layout(2, 1)), t)
             return t
 
-        # D.1 (pad16>0): row//CHUNK_ROWS and the swizzle key row%k_blk16 are independent of mi
-        # (mi*16 is always a multiple of CHUNK_ROWS), so they are hoisted once per kernel instead
-        # of a fresh div+mod+mul chain per mi; LLVM already CSEs the per-mi form to nearly the
-        # same code, so this is a free strength reduction, not a measured win. Each mi then adds
-        # only a trace-time Python-int constant (mi*mi_step). pad16==0 reduces to the pre-R6
-        # dense row*A_ROW_I32 form, since mi_step is then 16*A_ROW_I32 and lane_hi is 0.
         if const_expr(a_planes):
-            # Plane base of this lane's k-group: the low half is plane lane_div_16, the high
-            # half plane 4 + lane_div_16//2 at an extra 8 B for the odd k-group. Both are
-            # per-lane kernel-scope values; mi adds 16 rows = 64 i32, a trace-time constant.
             lane_lo_off = lane_div_16 * PLANE_I32 + lane_mod_16 * 4
             lane_hi_off = (4 + lane_div_16 // 2) * PLANE_I32 + lane_mod_16 * 4 + (lane_div_16 % 2) * 2
             mi_step = 64
@@ -636,11 +536,7 @@ def launch_gemm(
             mi_step = (16 // CHUNK_ROWS) * CHUNK_I32
 
         def _a_off(mi, kh, hi_half):
-            # i32 LDS offset of m-row group mi's (kh, lane) A fragment: its lo 16 B, or the hi
-            # half the f8f6f4 ABI puts 64 K later.
             if const_expr(a_planes):
-                # Wave-major: mi's 16 rows sit in 64-row block mi // MI_PER_RBLK; both terms are
-                # Python ints, so this is still a single trace-time constant added per mi.
                 base = (
                     (lane_hi_off if hi_half else lane_lo_off)
                     + (mi // MI_PER_RBLK) * A_RBLK_I32
@@ -670,9 +566,7 @@ def launch_gemm(
                         av.append(lo16)
                         continue
                     lo = Vec(fx.memref_load_vec(lo16))
-                    # fp6/fp8: pack two halves (64 K apart, f8f6f4 ABI) into i32[A_NDW].
                     if const_expr(A_NDW == 6):
-                        # fp6: only the hi half's first 8 B are data (then the 8 B zero pad).
                         hi = Vec(fx.memref_load_vec(_read8(base_iter, _a_off(mi, kh, 1))))
                     else:
                         hi = Vec(fx.memref_load_vec(_read16(base_iter, _a_off(mi, kh, 1))))
@@ -716,13 +610,9 @@ def launch_gemm(
             ),
             fx.make_layout(1, 1),
         )
-        # R4 P5: the per-pair scale row bases are loop-invariant, so their readfirstlanes belong
-        # here -- inside load_sc the convergent op pins the whole base expression to the K loop.
         a_sc_base = [
             rocdl.readfirstlane(T.i32, (bx_m // 32 + mp) * sca_rstride) for mp in range_constexpr(m_pairs)
         ]
-        # One e8m0 word per 32 columns, i.e. per n-fragment pair -- n_col keeps every pair 32-column
-        # aligned, so c_split only permutes which word a pair reads.
         nsb = by_n // 32 + wave * (BN // 128)
         b_sc_base = [
             rocdl.readfirstlane(T.i32, (nsb + n_col(2 * np) // 32) * _scale_chunk_dw)
@@ -745,9 +635,6 @@ def launch_gemm(
             sSC_i8 = fx.recast_iter(_i8s, lds.sc.ptr)
             sSC_i32 = fx.recast_iter(Int32, lds.sc.ptr)
             a_sc_base_w = (bx_m // 32 + wave) * sca_rstride
-            # R4 P5: both halves of the A-scale DMA address are loop-invariant -- the LDS
-            # destination is wave-relative and the gmem base is row-relative -- so take their
-            # readfirstlanes once here. Only the chunk's K offset stays inside the loop.
             sa_dma_lds_b = [
                 rocdl.readfirstlane(T.i32, (wave if r == 0 else wave + 4 * r) * 256)
                 for r in range_constexpr(n_sa_dma)
@@ -761,8 +648,6 @@ def launch_gemm(
 
         def dma_sa_to_lds(chunk_kt, slot):
             # Wave w DMAs words w, w + 4, .. of the chunk (64 lanes x 4 B); drained like the A DMA
-            # it follows. slot is a compile-time chunk slot (see n_sc_slots), so its LDS byte
-            # offset folds into the invariant base above.
             koff_b = rocdl.readfirstlane(T.i32, chunk_kt * (_scale_k0_dw * 4))
             if const_expr(isinstance(slot, int)):
                 slot_b = slot * (n_sa_words * 256)
@@ -799,8 +684,6 @@ def launch_gemm(
 
         def load_sc(chunk_kt):
             # (sa, sb) e8m0 words per m-/n-pair for one 256-K chunk (uniform base -> SGPR soffset).
-            # With sa_lds the A words come from read_sa instead and sa is empty. The row bases
-            # are already readfirstlane'd at kernel scope, so only this K offset is loop-varying.
             koff = rocdl.readfirstlane(T.i32, chunk_kt * _scale_k0_dw)
             sa = (
                 []
@@ -836,10 +719,6 @@ def launch_gemm(
 
         def compute(accs, av, bv, sa_v, sb_v, scale_shift=None, mis=None, nis=None):
             # mis: run only these m-rows' MFMAs; nis (tile_m=256 only): only these n-fragments.
-            # tile_k=128: pick the active 128-K half of the shared 256-K word. A trace-time
-            # scale_shift (a plain int) does it in the MFMA's opsel field -- at tile_k=128
-            # k_halves is 1, so opsel only ever uses byte 0/1 and byte 2/3 sit idle -- which is
-            # free; a runtime one has to shift the word into the low bytes with v_lshrrev.
             os_half = 0
             if const_expr(isinstance(scale_shift, int)):
                 os_half = scale_shift // 8
@@ -1044,10 +923,6 @@ def launch_gemm(
             t.store(Vec(v))
             return t
 
-        # Half 1 of a 256-K scale chunk, i.e. the high 16 bits of every e8m0 word. At tile_k=128
-        # k_halves is 1, so the MFMA's opsel field only ever selects e8m0 byte 0/1 and byte 2/3
-        # sit idle: a plain int has compute() point opsel at them, which costs no instruction at
-        # all. Otherwise all four slots are taken and the word has to be shifted down first.
         sc_hi = 16 if const_expr(k_halves == 1) else fx.Int32(16)
 
         # epi=2 ring: the last chunk runs peeled after the loop with the C stores in its gaps.
@@ -1419,17 +1294,9 @@ def launch_gemm(
                 ),
                 fx.make_layout(8, 1),
             )
-            # buffer_store cache policy bits (gfx950): sc0 = 1, nt = 2. The hint is a property of
-            # C (never re-read on chip), not of the store geometry, so it rides every store path.
-            # nt and the full-line merge are one lever, not two: a non-temporal half-line store
-            # is the one combination the write path cannot coalesce, since the two 64 B halves of
-            # a line are what TCC would otherwise merge into one EA write. c_split (above) is what
-            # lets the merge run at tile_n=384, where a wave owns 1.5 lines of each C row.
             c_cpol = {0: 0, 1: 0, 2: 2, 3: 3}[store_mode]
             c_copy128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(c_cpol), out_elem)
             col_l = by_n + wave_col0() + (lane_div_16 % 2) * 16 + (lane_div_16 // 2) * 8
-            # First column of each n-fragment pair within this wave's block; c_split puts the two
-            # merged pairs (p 0/1) on the wave's aligned line and the leftover half line last.
             pair_col = [n_col(2 * p) for p in range_constexpr(n_pairs)]
             c_full = c_line
             n_full_pairs = 2 if c_full else 0
@@ -1441,9 +1308,6 @@ def launch_gemm(
                 # fence: a scheduling fence after each store (the last m-row of the peeled chunk).
                 row_t = bx_w + mi * 16 + lane_mod_16
                 pair_w = []
-                # The merged pairs go last: their halves have to stay live until the DPP exchange
-                # below, and this is the one point where every accumulator is still live too. It
-                # also keeps the leftover half line's store off the line the merged stores write.
                 for p in p_order:
                     va = Vec(accs_s[mi * num_acc_n + 2 * p])
                     vb = Vec(accs_s[mi * num_acc_n + 2 * p + 1])
@@ -1572,9 +1436,7 @@ def launch_gemm(
 # The caller pads M to a multiple of this and guarantees nothing more, so every tile_m
 # chosen below must divide it.
 M_ALIGN = 256
-# A's packing contract with quant_act_a6w4: 24 dense code bytes per 32 E2M3 values, in the
-# 64-row-blocked preshuffle (a_pack=1 in launch_gemm). gemm_a6w4_kernel_v0.py reads the
-# FP8-padded row-major 32 instead, so a caller that selects it asks for that form.
+# A's packing contract with quant_act_a6w4: 24 dense code bytes per 32 E2M3 values.
 A_BYTES_PER_32 = 24
 # (tile_m, tile_n, tile_k, waves_per_eu, group_m, pad16) per (N, K), from the FLUX-shape sweep on
 # MI355X. group_m (R4, goal.md SS C/B.4): per-shape L2 band raster width for the flat-grid
@@ -1695,29 +1557,6 @@ A_BYTES_PER_32 = 24
 # card 7 (median of 6 paired blocks, 6 of 6 faster), -4.2..-5.4% on cards 0/1/4/6; 12 s windows
 # at the 1400 W cap -4.8% at the ruler's cadence (2150 vs 2096 MHz) and -1.3% back-to-back (1715
 # vs 1626 MHz); 3 (sc0|nt) measured +0.1% against 2 in short runs.
-# vs_ahead (15th field): now a real Constexpr arg instead of a module global, which never
-# entered the compile cache key and made the knob untestable; 2 clears the floor on every shape.
-#
-# tile_n 256 -> 384 (all six shapes): traffic/MAC = A_row_bytes/tile_n + B_col_bytes/tile_m,
-# minimized under the accumulator cap at tile_m:tile_n = B_col_bytes:A_row_bytes = 2:3 for A6W4.
-# The 384 accumulator dwords/lane split 256 into the AGPR file and the rest into arch VGPRs
-# (n_agpr_ni above); N % 384 == 0 holds for all six shapes.
-#
-# c_cpol used to be computed only inside the c_full (num_acc_n == 4) branch, so tile_n=384
-# (num_acc_n == 6) silently dropped the nt store hint for every tile_m=256 shape; it now sits
-# above the branch so every store path gets the hint.
-#
-# c_line/c_split: tile_n=384 gives a wave 1.5 C lines, so n-fragments are dealt line-first (the
-# aligned line, then the leftover half) so the existing DPP row_ror:8 exchange still produces
-# whole lines, which is what the nt hint needs in order to pay off.
-#
-# group_m/num_xcd per shape follow the per-XCD L2 band-window cost a*BM + b*BN/2 (minimal near
-# a=4, b=8), re-swept whenever tile geometry or A's byte count changes since both rescale the
-# window.
-#
-# store_mode per shape: nt wins where the line merge applies and costs where a shape still has
-# bandwidth headroom. vs_b now packs its B loads into the first num_acc_n issue points instead
-# of spreading them across vs_np -- free latency, since the half only waits at its end.
 _A6W4_CONFIGS = {
     (9216, 3072): (256, 384, 128, 1, 0, 8, 2, 1, 2, 1, 3, 0, 2, 0, 1),  # double_qkv
     (3072, 3072): (256, 384, 128, 1, 0, 8, 2, 1, 2, 1, 3, 0, 2, 0, 1),  # double_proj

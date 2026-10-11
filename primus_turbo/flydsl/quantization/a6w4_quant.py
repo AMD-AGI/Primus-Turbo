@@ -21,12 +21,8 @@ The H16, amax and scale code is mxfp4_quant_kernel's (in-register H16 with the 0
 into the scale); the converters are gfx950's scaled pk16 FP6 / pk FP4 conversions.
 
 quant_act_a6w4 and quant_w_a6w4 return exactly what primus_turbo.flydsl.gemm.gemm_a6w4_kernel
-consumes, with every shuffle done by the stores:
-  A: dense preshuffled FP6, 3K/4 bytes a row -- 24 bytes of little-endian 6-bit code stream
-     per 32 values, grouped in 64-row blocks whose 128-K tiles sit back to back, each tile
-     six 1024 B planes (the four micro-blocks' low 16 B halves, then their four high 8 B
-     halves paired), which is the GEMM's LDS layout (a32=32 instead returns the older
-     FP8-padded row-major form: the same 24 bytes in place, then 8 zero bytes)
+  A: dense preshuffled FP6, 3K/4 bytes a row, in the GEMM's LDS layout (a32=32 instead
+     returns the older FP8-padded row-major packing)
   W: packed FP4 (even element in the low nibble) in shuffle_weight_w4(16) layout, scales in
      shuffle_scale_w4 layout
 Only the bytes are a contract; the returned tensors' shapes are not.
@@ -163,10 +159,7 @@ def _build_launch(C, act, a32=24):
         if act:
             words = _cvt_fp6(vf, scale_f32)
             if a32 == 24:
-                # Dense preshuffle, the layout gemm_a6w4 DMAs straight into LDS: rows in
-                # blocks of 64, each block its 128-K tiles back to back, each tile six 1024 B
-                # planes -- the four micro-blocks' low 16 B halves, then their four high 8 B
-                # halves paired. One GEMM cooperative load is one plane of one block.
+                # Dense preshuffle: the layout gemm_a6w4 DMAs straight into LDS.
                 osrc = _srd_at(OUT, arith.index(0), 4, fx.Int32(_NREC_MAX))
                 blk = (r >> 6) * (64 * AW) + (c >> 2) * 1536 + (r & 63) * 4
                 buffer_ops.buffer_store(Vec.from_elements(words[0:4], fx.Int32), osrc, blk + (c & 3) * 256)
@@ -233,9 +226,8 @@ def _quant(x, act, a32=24):
 def quant_act_a6w4(x, a32=24):
     """bf16 [M, K] contiguous, M % 32 == 0, K % 1024 == 0 -> (FP6 A, shuffled A scales) for gemm_a6w4.
 
-    a32 = the consumer's A_BYTES_PER_32: 24 for the dense preshuffle the tuned GEMM reads, 32
-    for the FP8-padded row-major form (24 code bytes then 8 zero bytes) the v0 GEMM reads.
-    M % 64 != 0 always returns the padded form; gemm_a6w4 tells the two apart by row length."""
+    a32 = A_BYTES_PER_32: 24 for the tuned GEMM's dense preshuffle, 32 for the v0 GEMM's
+    FP8-padded form, which M % 64 != 0 returns anyway."""
     return _quant(x, True, a32)
 
 
