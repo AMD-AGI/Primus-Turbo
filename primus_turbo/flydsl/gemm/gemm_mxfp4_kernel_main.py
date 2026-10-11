@@ -156,27 +156,42 @@ def _fp4_g2s_row(ph, wave_id, r, n_steps, rows_per_step, n_waves, wave_major):
     return ph + wave_id * rows_per_step + r * (n_waves * rows_per_step)
 
 
-def fp4_g2s_min_row(n_steps, rows_per_step, n_waves, r, ilv, wave_major):
+def fp4_g2s_min_row(n_steps, rows_per_step, n_waves, r, ilv, wave_major, wide=False):
     """Smallest SOURCE row step ``r`` reads, over every lane of every wave -- the headroom
     the immediate-offset fill has for pre-subtracting its immediate from the gmem offsets."""
     return min(
-        _fp4_g2s_src(_fp4_g2s_row(ph, w, r, n_steps, rows_per_step, n_waves, wave_major), ilv)
+        _fp4_g2s_src(_fp4_g2s_row(ph, w, r, n_steps, rows_per_step, n_waves, wave_major), ilv, wide)
         for w in range(n_waves)
         for ph in range(rows_per_step)
     )
 
 
-def _fp4_g2s_src(row, ilv):
+def _fp4_g2s_src(row, ilv, wide=False):
+    """LDS slot -> source row. ``ilv`` gives a lane ``ilv`` adjacent columns within its pool;
+    ``wide`` also spreads the pool itself every ``ilv`` columns so both pools' columns join
+    into one ``2*ilv`` run. A band is the 16*ilv LDS rows one N-wave owns."""
     if not ilv:
         return row
-    q = row % 64 if isinstance(row, int) else umod(row, 64)
+    band = 16 * ilv
+    q = row % band if isinstance(row, int) else umod(row, band)
+    grp, span = (2 * band, 2 * ilv) if wide else (band, ilv)
     if isinstance(row, int):
-        return (row // 64) * 64 + ilv * (q % 16) + q // 16
-    return udiv(row, 64) * 64 + ilv * umod(q, 16) + udiv(q, 16)
+        return (row // band) * grp + span * (q % 16) + q // 16
+    return udiv(row, band) * grp + span * umod(q, 16) + udiv(q, 16)
 
 
 def fp4_g2s_offsets(
-    lane_id, wave_id, K, n_steps, bytes_per_row, swizzle=False, ilv=0, wm=0, lds_step=0, lds_grp=0
+    lane_id,
+    wave_id,
+    K,
+    n_steps,
+    bytes_per_row,
+    swizzle=False,
+    ilv=0,
+    wm=0,
+    lds_step=0,
+    lds_grp=0,
+    wide=False,
 ):
     """Per-lane gmem byte offsets for fp4 G2S into identity LDS slots (S2R reads back
     at the same address). ``swizzle`` pre-applies the inverse bank-swizzle; ``ilv``
@@ -189,7 +204,7 @@ def fp4_g2s_offsets(
     n_waves = udiv(fx.block_dim.x, 64)
     lpr = bytes_per_row // 16  # lanes per row
     rows_per_step = 64 // lpr
-    assert not ilv or (bytes_per_row == 128 and ilv == 4)
+    assert not ilv or (bytes_per_row == 128 and ilv in (3, 4))
     # row % rows_per_step must stay == ph under either layout, or the swizzle moves.
     assert not (wm and lds_step), "wm and lds_step each restore the same immediate"
     assert not wm or (lpr == rows_per_step and n_steps % wm == 0)
@@ -199,7 +214,7 @@ def fp4_g2s_offsets(
         ph = udiv(lane_id, lpr)  # physical row slot in this lane's LDS block
         row = _fp4_g2s_row(ph, wave_id, r, n_steps, rows_per_step, n_waves, bool(wm or lds_step))
         chunk = umod(umod(lane_id, lpr) + lpr - umod(row, lpr), lpr) if swizzle else umod(lane_id, lpr)
-        off = _fp4_g2s_src(row, ilv) * (K // 2) + chunk * 16
+        off = _fp4_g2s_src(row, ilv, wide) * (K // 2) + chunk * 16
         imm = (r % wm) * G2S_CHUNK if wm else g2s_lds_imm(r, lds_step, lds_grp)
         offs.append(off - imm if imm else off)
     return offs
@@ -378,8 +393,11 @@ class StoreCPlain:
         ilv=0,
         beta_is_one=False,
         store_aux=0,
+        wide=False,
     ):
         assert not ilv or ilv == n_tiles_b
+        assert not wide or ilv
+        self.wide = wide  # a lane owns both pools' fragments as one 2*ilv column run
         self.store_aux = store_aux  # `nt` keeps a write-once C from evicting the A/B band
         self.c_rows = c_rows
         self.c_cols = c_cols
@@ -456,7 +474,7 @@ class StoreCPlain:
     def _col(self, tj):
         """Column of N sub-block ``tj`` for this lane, relative to the wave's column base."""
         if const_expr(bool(self.ilv)):
-            return self.ilv * (self.lane_id % 16) + tj
+            return (2 * self.ilv if self.wide else self.ilv) * (self.lane_id % 16) + tj
         return tj * 16 + self.lane_id % 16
 
     def fused_operands(self, base_row, base_col_l, base_col_r, n_valid=None):
@@ -674,6 +692,7 @@ class MfmaScaleFp4:
         cst_gap=0,
         cst_ilv=0,
         cst_nt=False,
+        cst_run=False,
         b_base_even=None,
         g2s_wm=None,
         apre=False,  # caller left the k=1 A slot to this prologue (its first wait then spans buf0 only)
@@ -761,6 +780,7 @@ class MfmaScaleFp4:
             cst_gap,
             cst_ilv,
             cst_nt,
+            cst_run,
             _WMA,
             _WMB,
             apre,
@@ -774,7 +794,13 @@ class MfmaScaleFp4:
         _SPLIT = split is not None
         _CST = cst is not None
         _CILV = cst_ilv
-        assert not _CILV or (_CST and _CILV == ntb and ntb == 4)
+        assert not _CILV or (_CST and _CILV == ntb and ntb in (3, 4))
+        # Wide pack: the caller interleaved the two B pools every ntb columns, so a lane's
+        # 2*ntb fragments are one run and each C row leaves as a single ntb-dword store off
+        # the L descriptor (dwordx4 on the 256 tile, dwordx3 on the 192 one).
+        _CRUN = bool(cst_run)
+        # A unit now needs BOTH halves' accumulators, which the half-N variant never produces.
+        assert not _CRUN or (_CILV and half_n is None)
         _BSPL = bool(_CILV) and _SPLIT
         assert _BSPL == (b_base_even is not None)
         # The fused store needs a g2s-free tail phase to ride (unified vmcnt): a peel or odd KI.
@@ -1172,6 +1198,34 @@ class MfmaScaleFp4:
                     )
                 return ls
 
+            def cst_wide_run(ii, eh, p, b):
+                """Both pools' fragments for C rows ``2*eh``/``2*eh+1``: the wide pack gives a
+                lane one run of 2*ntb columns, so a row leaves as a single ntb-dword store --
+                half the stores of `cst_wide` for the same lines and bytes."""
+                ls = []
+                for er in range(2):
+                    e = 2 * eh + er
+                    for j in range(ntb):
+                        # Half a bank per row, not ntb: a MUBUF vgpr tuple has to start even
+                        # (llvm-mc rejects an odd one), and an odd ntb would alternate parity.
+                        d = b + 4 * er + j
+                        qs = [(c // ntb) * nq + ii * ntb + c % ntb for c in (2 * j, 2 * j + 1)]
+                        src = []
+                        for q, t in zip(qs, (d, _CDV + 8 * _NCBK + (j % 2))):
+                            r = acc_reg(q, e)
+                            if r[0] == "a":
+                                ls.append(f"v_accvgpr_read_b32 v{t}, {r}")
+                                r = f"v{t}"
+                            src.append(r)
+                        ls.append(f"v_cvt_pk_bf16_f32 v{d}, {src[0]}, {src[1]}")
+                for er in range(2):
+                    d = b + 4 * er
+                    ls.append(
+                        f"buffer_store_dwordx{ntb} v[{d}:{d + ntb - 1}], "
+                        f"${o_crw[p][2 * eh + er]}, ${i_cl}, 0 offen" + _CNT
+                    )
+                return ls
+
             class CstSched:
                 """Paced FIFO of the accumulators the tail's MFMA stream has finished."""
 
@@ -1187,12 +1241,15 @@ class MfmaScaleFp4:
                     """This unit's 8-dword pack bank, and the WAR watermark it needs. A bank
                     no store has read yet needs none, and a unit's accumulators die as it
                     packs them, so each traded unit hands two private banks back."""
+                    _per = 2 if _CRUN else 4  # stores a unit issues off its bank
                     if self.bk:
                         b, wm = self.bk.pop(0), None
                     else:  # oldest bank back: only the newer units' stores may be in flight
-                        b, wm = self.old.pop(0), min(4 * len(self.old), 60)
+                        b, wm = self.old.pop(0), min(_per * len(self.old), 60)
                     self.old.append(b)
                     q0 = sl * nq + ii * ntb
+                    if _CRUN:  # a wide unit spans both halves; its quads die with the second
+                        return b, wm
                     # Only when the caller has promised not to read the accumulators back.
                     # A GLU caller does -- the fused store writes l1, and the epilogue then
                     # builds the activation from the same registers -- so recycling them
@@ -1202,6 +1259,12 @@ class MfmaScaleFp4:
                     return b, wm
 
                 def done(self, mi, ii, sl, ji):
+                    if _CRUN:  # one unit per row pair, fed by both halves' accumulators
+                        n = self.pend.get(ii, 0) + 1
+                        self.pend[ii] = n
+                        if n == 2 * ntb:
+                            self.q += [(mi, ii, eh, None) for eh in range(2)]
+                        return
                     if _CILV:
                         n = self.pend.get((ii, sl), 0) + 1
                         self.pend[(ii, sl)] = n
@@ -1224,7 +1287,9 @@ class MfmaScaleFp4:
                             if ii != self.cur:
                                 self.ln += cst_rows(ii, ii % 2)
                                 self.cur = ii
-                            if _CILV:
+                            if _CRUN:
+                                self.ln += cst_wide_run(ii, sl, ii % 2, _b)
+                            elif _CILV:
                                 self.ln += cst_wide(ii, sl, ii % 2, _b)
                             else:
                                 self.ln += cst_group(ii, sl, ji, ii % 2)
@@ -2106,7 +2171,11 @@ class MfmaScaleFp4:
 # MFMA stream -- so the GEMM build and the standalone scale preshuffle both read it from here.
 # A second copy of this rule is a second thing to drift: the two would still agree byte for
 # byte on the scales, and disagree only on how to read them.
-_MXFP4_PACK_ILV = 4  # BLOCK_N // 2 // 32: B's n-fragments per lane, and the packed layout's stride
+_MXFP4_PACK_ILV = 4  # BLOCK_N // 2 // 32 at the default 256 width; out-of-tree callers quote this
+# N tiles whose fold is implemented: a lane owns 2*(BLOCK_N // 64) output columns, which the
+# folded store writes as that many dwords. Below 3 the run is one dword and the pack has no
+# pair for the odd column.
+_MXFP4_FOLD_NT = (3, 4)
 
 
 def _mxfp4_cstore_on(*, out_fp16, beta_is_one, ki, half_k, cstore=True, coop=False, taccw=False):
@@ -2124,32 +2193,43 @@ def _mxfp4_cstore_on(*, out_fp16, beta_is_one, ki, half_k, cstore=True, coop=Fal
     )
 
 
-def mxfp4_packed_scale_ilv(K, *, out_fp16=False, accum=False, k_real=None, block_n=256):
+def _mxfp4_pack_ilv_of(on, block_n, n):
+    """Interleave the packed B layout carries once the store folds. An aligned N tile takes
+    the wide column map (fragments span both B pools, 2*ILV columns); a ragged N keeps the
+    narrow one. ``n=None`` quotes the wide one -- the layout every aligned N uses."""
+    if not on:
+        return 0
+    return (block_n // 64) * (1 if (n is not None and n % block_n) else 2)
+
+
+def mxfp4_packed_scale_ilv(K, *, out_fp16=False, accum=False, k_real=None, block_n=256, n=None):
     """`b_ilv` for the layout `gemm_mxfp4_flydsl_kernel(..., scales_prepacked=True)` reads.
 
     Quoted at ksplit=1, which is the only split a caller can know about. `_mxfp4_split_keeps_ilv`
     keeps the launch-mode race away from any split that would move it. The interleave packs a
-    lane's four n-fragments into one dword pair, so it only exists on the 256-wide tile.
+    lane's n-fragments into dword pairs, so it follows the tile width through `block_n`.
     """
     kr = K if k_real is None else k_real
     ki = K // 256
     half_k = ceildiv(kr, 128) == 2 * (K // 256) - 1
-    on = block_n // 64 == _MXFP4_PACK_ILV and _mxfp4_cstore_on(
+    on = block_n // 64 in _MXFP4_FOLD_NT and _mxfp4_cstore_on(
         out_fp16=out_fp16, beta_is_one=accum, ki=ki, half_k=half_k
     )
-    return _MXFP4_PACK_ILV if on else 0
+    return _mxfp4_pack_ilv_of(on, block_n, n)
 
 
-def _mxfp4_split_keeps_ilv(K, ksplit, *, out_fp16=False, accum=False, k_real=None, block_n=256):
+def _mxfp4_split_keeps_ilv(K, ksplit, *, out_fp16=False, accum=False, k_real=None, block_n=256, n=None):
     """Does this split read the packed scales the same way an unsplit launch would?"""
     kr = K if k_real is None else k_real
     ki = K // ksplit // 256
     half_k = ceildiv(kr, 128) == 2 * (K // ksplit // 256) - 1
-    on = block_n // 64 == _MXFP4_PACK_ILV and _mxfp4_cstore_on(
+    on = block_n // 64 in _MXFP4_FOLD_NT and _mxfp4_cstore_on(
         out_fp16=out_fp16, beta_is_one=accum, ki=ki, half_k=half_k
     )
-    ilv = _MXFP4_PACK_ILV if on else 0
-    return ilv == mxfp4_packed_scale_ilv(K, out_fp16=out_fp16, accum=accum, k_real=k_real, block_n=block_n)
+    ilv = _mxfp4_pack_ilv_of(on, block_n, n)
+    return ilv == mxfp4_packed_scale_ilv(
+        K, out_fp16=out_fp16, accum=accum, k_real=k_real, block_n=block_n, n=n
+    )
 
 
 def mxfp4_packed_scale_block_n(M, N, K):
@@ -2258,10 +2338,12 @@ def _build_mxfp4_gemm_kernel(
         and (KI % 2 == 0 or _HALF_K)
         and ((not glu) or (glu_i % 64 == 0))  # in-loop l1 store needs I on a 64-col band
         and (not dglu)  # dglu stages through LDS after the mainloop; no in-loop C store
-        # Without the interleave the in-loop store has no pair to pack, so it would take the
-        # accumulator's high half as-is: a truncated bf16. The epilogue rounds, so a tile
-        # narrower than the pack keeps its store there.
-        and (BLOCK_N // 64 == _MXFP4_PACK_ILV)
+        # The fold needs the interleave, and the interleave needs an even run: a lane owns
+        # 2*(BLOCK_N // 64) output columns and the pack turns each adjacent pair into one
+        # dword. At 64 or 128 the run is 2 or 4 columns, narrower than the line it shares,
+        # so those widths keep their epilogue store instead (per-row alternatives measured
+        # worse: truncated bf16, or a fold that comes up one short per row).
+        and (BLOCK_N // 64 in _MXFP4_FOLD_NT)
     )
     # The C store's cache policy follows its destination's lifetime: a final tile is
     # write-once and dead, so `nt` leaves the A/B band resident, while a split-K partial
@@ -2320,6 +2402,10 @@ def _build_mxfp4_gemm_kernel(
     _ROWS_PER_STEP = 64 // (BPR // 16) * (256 // 64)  # n_waves = 256//64 = 4
     N_LDS_STEPS_A = BLOCK_M // _ROWS_PER_STEP
     N_LDS_STEPS_BH = LDS_BN_HALF // _ROWS_PER_STEP
+    # Wide packed B: the two pools interleave every `_BILV` columns instead of every 128, so a
+    # lane's columns from both pools join into one run and the folded C store halves its
+    # instruction count. Needs the whole N tile present (no per-lane column bound to honor).
+    _BWIDE = bool(_BILV) and n_tail == 0 and not glu and not dglu
     _ROWSPLIT = _MXFP4_ROWSPLIT and K2A == K2B and (K2A % 128 == 64) and not coop
     _SK = 64 if _ROWSPLIT else 0
     _NOBUF = 3 if _ROWSPLIT else 2
@@ -2334,17 +2420,17 @@ def _build_mxfp4_gemm_kernel(
     # alone, so each stream takes the widest M0 window its own rows can pay for instead of
     # the whole fill dropping back to one `s_add_u32 m0` per step.
     _GWSTEP = (64 // (BPR // 16)) * BPR  # LDS bytes one wave writes per g2s step
-    _GSTREAM = ((N_LDS_STEPS_A, 0, K2A), (N_LDS_STEPS_BH, _BILV, K2B))
+    _GSTREAM = ((N_LDS_STEPS_A, 0, K2A, False), (N_LDS_STEPS_BH, _BILV, K2B, _BWIDE))
     _GIMM = _GWSTEP if ((_MXFP4_G2S_IMM & 2) and not _ROWSPLIT and 4096 % _GWSTEP == 0) else 0
     _GKSV = KSTEP if (_MXFP4_G2S_IMM & 1) else 0  # k-block soffset stride, known here
 
-    def _g2s_grp(n_steps, ilv, k2):
+    def _g2s_grp(n_steps, ilv, k2, wide):
         """Steps this stream can share one M0 write over: the window has to stay inside the
         12-bit immediate (the buf skew rides the same field) and inside every step's source
         headroom. 1 = an M0 write per step, which is always legal (its immediate is 0)."""
         for _g in range(min(n_steps, 4096 // _GIMM), 1, -1):
             if (_g - 1) * _GIMM + _GKSV <= 4095 and all(
-                fp4_g2s_min_row(n_steps, 64 // (BPR // 16), 4, _r, ilv, True) * k2
+                fp4_g2s_min_row(n_steps, 64 // (BPR // 16), 4, _r, ilv, True, wide) * k2
                 >= g2s_lds_imm(_r, _GIMM, _g)
                 for _r in range(n_steps)
             ):
@@ -2451,6 +2537,7 @@ def _build_mxfp4_gemm_kernel(
                 ilv=_BILV,
                 lds_step=_GIMM,
                 lds_grp=_GGRP[1],
+                wide=_BWIDE,
             )
         # Operand SRDs/loaders are rebased per-tile (_bind): the tile's row/col base exceeds int32 for large M*K/N*K.
         _ld: dict = {}
@@ -2626,10 +2713,13 @@ def _build_mxfp4_gemm_kernel(
                 ilv=_BILV,
                 beta_is_one=beta_is_one,
                 store_aux=_CST_AUX,
+                wide=_BWIDE,
             )
 
         wave_m_off = wave_m * (N_TILES_A * 16)  # 0 or 128
         wave_n_off = wave_n * (N_TILES_BH * 16)  # 0 or 64
+        # Packed-scale coordinates keep the 64-column group; only C's columns follow the map.
+        wave_n_off_c = wave_n * (N_TILES_BH * (32 if _BWIDE else 16))
         SC_buf = [] if _ROWSPLIT else [getattr(lds, f"SC_lds{b}") for b in range_constexpr(_NSCBUF)]
 
         # LDS read/g2s-dest bases + scale resources: all derived from the fixed LDS
@@ -2775,7 +2865,7 @@ def _build_mxfp4_gemm_kernel(
             a_off = fx.Int32(0)  # tile A row / B col bases folded into the SRDs; only br's
             bl_off = fx.Int32(0)  # LDS-half column shift survives as an int32-safe residual.
             # glu: R pool is the up band at +I, not the next 128 output columns.
-            br_off = fx.Int32(_RSHIFT * K2B)
+            br_off = fx.Int32((_BILV if _BWIDE else _RSHIFT) * K2B)
             sa_b = fx.Int32(bm * BLOCK_M + wave_m_off)
             # Packed-scale coordinates stay in the 256-wide layout; the glu
             # preshuffle lays each up band where the R pool already looks.
@@ -2894,6 +2984,7 @@ def _build_mxfp4_gemm_kernel(
                 cst_gap=0 if glu else LDS_BN_HALF * 2,
                 cst_ilv=_BILV,
                 cst_nt=True,  # cached C would evict A/B lines the next tiles read
+                cst_run=_BWIDE,
                 split=(a_od6, bl_od6, br_od6, qu_a6, qu_b6) if const_expr(_ROWSPLIT) else None,
                 b_base_even=b_even6,
                 apre=_APRE,
@@ -2914,7 +3005,8 @@ def _build_mxfp4_gemm_kernel(
                 base_row = base_row + _split * c_m  # write to workspace row band split*M
             if const_expr(glu):
                 return (base_row, bn * fx.Int32(_NCB) + wave_n_off)
-            return (base_row, bn * BLOCK_N + wave_n_off, bn * BLOCK_N + LDS_BN_HALF + wave_n_off)
+            _rsh = _BILV if _BWIDE else LDS_BN_HALF
+            return (base_row, bn * BLOCK_N + wave_n_off_c, bn * BLOCK_N + _rsh + wave_n_off_c)
 
         def _store(o, accL, accR, _split=None):
             if const_expr(glu):
@@ -3101,7 +3193,7 @@ def _build_mxfp4_gemm_kernel(
 
     # Return the BARE kernel (NOT a launch): the fused factory issues preshuffle + this GEMM from one host stub.
     # BN is the output-column step (128 under glu, 256 otherwise) so the fused stub's grid matches n_pids.
-    return kernel_gemm_4w, BLOCK_M, _NCB, ksplit, gemm_value_attrs, _BILV, _TPW
+    return kernel_gemm_4w, BLOCK_M, _NCB, ksplit, gemm_value_attrs, _BILV * (2 if _BWIDE else 1), _TPW
 
 
 # ── Primus-Turbo host wrapper ────────────────────────────────────────────────
@@ -3112,12 +3204,13 @@ _MXFP4_AT_CACHE: dict = {}
 _MXFP4_CFG_CACHE: dict = {}  # (M, N, K, row_bytes, out_fp16) -> (gm, gn, xcd, wlv, elgk, taccw, coop)
 
 
-def _mxfp4_nt_config(M, N, K):
-    """Per-shape (group_m, group_n, num_xcds) for the BN256 path (2D N-band L2
-    swizzle). Mirrors the standalone production recommend_config BN256 branch:
-    wide-N (nb>=96) bands nb//8; big-K down-projections band on top (K>=28672 ->
-    16 narrow aligned bands; K>=11008 -> width-4 bands); else 1D GROUP_M swizzle."""
-    nb = N // 256
+def _mxfp4_nt_config(M, N, K, block_n=256):
+    """Per-shape (group_m, group_n, num_xcds) for the 2D N-band L2 swizzle. Mirrors the
+    standalone production recommend_config BN256 branch: wide-N (nb>=96) bands nb//8; big-K
+    down-projections band on top (K>=28672 -> 16 narrow aligned bands; K>=11008 -> width-4
+    bands); else 1D GROUP_M swizzle. ``group_n`` counts TILES, so ``nb`` has to be measured in
+    the tile width this shape actually runs -- a 192 tile puts 4/3 as many of them across N."""
+    nb = N // block_n
     num_xcds = 8
     if nb >= 96:
         group_n = nb // 8
@@ -3135,16 +3228,16 @@ def _mxfp4_nt_config(M, N, K):
 _MXFP4_L2_PER_XCD = 4 << 20  # bytes of L2 one XCD sees
 
 
-def _mxfp4_l2_band(N, K):
+def _mxfp4_l2_band(N, K, block_n=256):
     """Widest power-of-two N band whose fp4 B slice still fits one XCD's L2, so the band stays
     resident while its workgroups sweep M. Returns 0 (no banding) once a single N tile already
     fills L2, because a band that cannot hold two tiles buys no residency."""
-    per_tile = 256 * ((K + 1) // 2)  # fp4 B bytes behind one N tile
-    band = min(_MXFP4_L2_PER_XCD // max(per_tile, 1), max(N // 256, 1))
+    per_tile = block_n * ((K + 1) // 2)  # fp4 B bytes behind one N tile
+    band = min(_MXFP4_L2_PER_XCD // max(per_tile, 1), max(N // block_n, 1))
     return (1 << (band.bit_length() - 1)) if band >= 2 else 0
 
 
-def _mxfp4_swizzle_candidates(M, N, K):
+def _mxfp4_swizzle_candidates(M, N, K, block_n=256):
     """L2-swizzle configs for the timed autotune, heuristic pick first (so autotune never
     regresses below it) and the speculative ones last; the caller charges the tail a margin.
     The swizzle is a pure WG->tile bijection (correctness-invariant), so widening the sweep
@@ -3154,8 +3247,8 @@ def _mxfp4_swizzle_candidates(M, N, K):
     Charged tail: the L2-sized band, which the heuristic only reaches for wide-N or big-K
     shapes, and -- where the heuristic left the physical XCD count -- a narrower interleave.
     """
-    gm, gn, xcd = _mxfp4_nt_config(M, N, K)
-    nb = max(N // 256, 1)
+    gm, gn, xcd = _mxfp4_nt_config(M, N, K, block_n)
+    nb = max(N // block_n, 1)
     cands = [(gm, gn, xcd)]
     charged = []
 
@@ -3165,7 +3258,7 @@ def _mxfp4_swizzle_candidates(M, N, K):
 
     for gn2 in (0, gn * 2 if gn else 4):
         _add(cands, (gm, gn2, xcd))
-    _add(charged, (gm, _mxfp4_l2_band(N, K), xcd))
+    _add(charged, (gm, _mxfp4_l2_band(N, K, block_n), xcd))
     if xcd != 8:
         _add(charged, (gm, gn, 2))
     return cands + charged, len(cands)
@@ -3199,7 +3292,7 @@ def _autotune_mxfp4_config(
 
     if torch.cuda.is_current_stream_capturing():
         cfg = (
-            *_mxfp4_nt_config(M, N, K),
+            *_mxfp4_nt_config(M, N, K, block_n),
             10,
             9,
             False,  # taccw: off outside the timed autotune
@@ -3210,7 +3303,7 @@ def _autotune_mxfp4_config(
 
     _try_deepwl = K >= 8192
     _wl_opts = ((10, 9), (16, 15)) if _try_deepwl else ((10, 9),)
-    _swz, _n_free = _mxfp4_swizzle_candidates(M, N, K)
+    _swz, _n_free = _mxfp4_swizzle_candidates(M, N, K, block_n)
     _free_swz = set(_swz[:_n_free])
     compiled_cands = []
     for _wlv, _elgk in _wl_opts:
@@ -3288,7 +3381,7 @@ def _autotune_mxfp4_config(
         if _teff < best_t:
             best_t, best = _teff, cfg
     if best is None:
-        best = (*_mxfp4_nt_config(M, N, K), 10, 9)
+        best = (*_mxfp4_nt_config(M, N, K, block_n), 10, 9)
     # Time the {TACCW,COOP,both} epilogue twins against the plain winner, keep the fastest.
     best = (*best, False, False)  # append (taccw, coop) = (False, False)
     _try_var = best_t < float("inf")
@@ -3417,13 +3510,6 @@ def _mxfp4_wave_eff(tiles, ncu):
 # default everywhere; 192 exists only to turn a grid whose dispatch rounds end ragged into one
 # that fills them, and pays a quarter of the tile's area for it.
 _MXFP4_BLOCK_N_ALT = 192
-# What the narrow tile also gives up, in k-blocks of its own tile: `_CSTORE` needs
-# ``BLOCK_N // 64 == _MXFP4_PACK_ILV``, so a 192 tile cannot fold its C store into the peel
-# and pays it exposed. That is a per-TILE epilogue, so it is a share of the tile that grows
-# as 1/K, which is why the trade reverses on short contractions. Solved from the one shape
-# the two widths were measured head to head on (8192x3072x3072, 12 k-blocks, 192 is 12.6%
-# slower); it then predicts the other five measured cells to within 1.6 points.
-_MXFP4_BN_ALT_CSTORE_KB = 3
 
 
 def _mxfp4_pick_block_n(M, N, K, glu=False):
@@ -3431,39 +3517,50 @@ def _mxfp4_pick_block_n(M, N, K, glu=False):
 
     A narrower tile buys CU fill and sells arithmetic intensity, so it can only win where it
     removes a whole ragged dispatch round: both grids then run the same number of rounds and
-    the narrow one's round is the shorter. Priced in tile-times, in k-blocks: the narrow
-    tile's k-block costs the FEED ratio ``(BM + BN) / 2*BM`` -- the pessimistic end, since a
-    tile bound by its operand fill saves only 12.5% where one bound by MFMA saves 25% -- plus
-    the one exposed C store it can no longer fold. ``N % BN`` must be 0: a ragged N tile would
-    put the packed scale group's boundary off the column grid the preshuffle writes.
+    the narrow one's round is the shorter. Priced in tile-times: the narrow tile's k-block
+    costs the FEED ratio ``(BM + BN) / 2*BM`` -- the pessimistic end, since a tile bound by
+    its operand fill saves only 12.5% where one bound by MFMA saves 25%. ``N % BN`` must be 0:
+    a ragged N tile would put the packed scale group's boundary off the column grid the
+    preshuffle writes.
+
+    The width used to owe a second term, the exposed C store a 192 tile could not fold into
+    the peel (3 k-blocks of a 512-wide tile, fitted on 8192x3072x3072). The fold now follows
+    the tile instead of the 256 width, so both widths keep it and the term is gone -- which
+    is what re-elects the one cell whose narrowing that term had been outvoting.
+
+    This axis runs second, on the height `_mxfp4_pick_block_m` already chose, and may narrow
+    on top of it: the two are independent now that neither costs the fold.
     """
     bn = _MXFP4_BLOCK_N_ALT
     if glu or N % bn or M % 256:
         return 256
-    mt, ncu, kb = M // 256, _mxfp4_ncu(), K // 256
+    bm, ncu = _mxfp4_pick_block_m(M, N, K, glu), _mxfp4_ncu()
+    mt = ceildiv(M, bm)
     r256 = ceildiv(mt * ceildiv(N, 256), ncu)
     ralt = ceildiv(mt * (N // bn), ncu)
-    t256 = r256 * 512 * kb
-    talt = ralt * ((256 + bn) * kb + 512 * _MXFP4_BN_ALT_CSTORE_KB)
-    return bn if talt < t256 else 256
+    return bn if ralt * (bm + bn) < r256 * (bm + 256) else 256
 
 
 def _mxfp4_pick_block_m(M, N, K, glu=False):
-    """M tile height: always 256. The narrowing trade only pays on the N axis.
+    """M tile height for this shape: the same ragged-round trade on the other axis, taken first.
 
-    A 192-high twin of `_mxfp4_pick_block_n` was built and priced the same way, and an
-    ablation over the eighteen-cell scorer says to leave it out. Against a BASE-to-BASE floor
-    of 0.16%, the four configurations read: neither axis narrow 1.0063, N only 1.0123, M only
-    1.0095, both 1.0114. **N alone beats both** -- the M gate can only fire where
-    `_mxfp4_pick_block_n` declined, so enabling it takes shapes away from the axis that serves
-    them better rather than adding any of its own.
+    Both axes buy the same rounds for the same ``(BM + BN) / 2*BM`` feed ratio, and now that
+    the fold follows the tile rather than the 256 width, both keep the folded C store too, so
+    neither owes the other anything. M goes first only to fix an order; `_mxfp4_pick_block_n`
+    then prices its own narrowing against whatever height came out of here, including a
+    second narrowing on a shape that already took this one.
 
-    Kept as a function rather than folded into its callers because the N-axis picker is a
-    genuine per-shape decision and the pair reads as one policy; if a future shape family makes
-    the M trade pay, this is where it goes back.
+    An earlier ablation picked "N alone" over narrowing both axes, back when a narrow M paid
+    the fold penalty twice over and "M only" starved shapes M cannot divide. Now that neither
+    axis costs the fold, letting each one take the shapes it fits beats N alone.
     """
-    del M, N, K, glu
-    return 256
+    bm = _MXFP4_BLOCK_N_ALT
+    if glu or M % bm or N % 256:
+        return 256
+    nt, ncu = N // 256, _mxfp4_ncu()
+    r256 = ceildiv(ceildiv(M, 256) * nt, ncu)
+    ralt = ceildiv((M // bm) * nt, ncu)
+    return bm if ralt * (256 + bm) < r256 * 512 else 256
 
 
 # Tiles one persistent WG walks.  The loop is a range_constexpr, so this is also how many
@@ -4196,11 +4293,15 @@ def _build_mxfp4_preshuffle_kernel_ab(
     n_rr = nd // n_sub
     NG = _MXFP4_PRESHUF_NG
     FO = _MXFP4_PRESHUF_FO
-    assert not b_ilv or b_ilv == nd
+    assert not b_ilv or b_ilv in (b_nt, 2 * b_nt)
+    # Wide B pack: a lane's 2*b_nt columns span both pools, so its band is two column groups
+    # wide and r_region picks the pool inside that band instead of naming a group of its own.
+    _BW = b_ilv == 2 * b_nt
+    assert not _BW or not glu_i
     # B's column group narrows with the N tile (b_nt == BLOCK_N // 64) and A's row group with
     # the M tile (a_nt == BLOCK_M // 64); the packed dword index is unchanged, the fragments
     # past the group just have no source and stay zero.
-    assert 1 <= b_nt <= nd and (b_nt == nd or not (b_ilv or glu_i))
+    assert 1 <= b_nt <= nd and (b_nt == nd or not glu_i)
     assert 1 <= a_nt <= nd and (a_nt == nd or not glu_i)
     _wide = b_nt == nd and a_nt == nd  # both groups span the full 64 rows: one shared map
     KU, BLK = _mxfp4_preshuf_geom(k128)
@@ -4255,10 +4356,17 @@ def _build_mxfp4_preshuffle_kernel_ab(
             # both A/B group maps emitted then segment-selected at runtime (trace-time Python if).
             grp_b = _mxfp4_grp_from(wi, r_region, 1)
             grp_a = _mxfp4_grp_from(wi, r_region, 0)
-            grp = arith.select(is_b, grp_b, grp_a) if _wide else None
+            grp = arith.select(is_b, grp_b, grp_a) if (_wide and not _BW) else None
             for t in range_constexpr(nd):
-                loc = arith.select(is_b, r * b_ilv + t, t * 16 + r) if b_ilv else (t * 16 + r)
-                if const_expr(_wide):
+                if const_expr(_BW):
+                    loc = t * 16 + r  # A keeps its own map, narrow group and all
+                else:
+                    loc = arith.select(is_b, r * b_ilv + t, t * 16 + r) if b_ilv else (t * 16 + r)
+                if const_expr(_BW):
+                    a_row = grp_a * (16 * a_nt) + loc if t < a_nt else rd
+                    b_row = wi * (32 * b_nt) + r * b_ilv + (r_region * b_nt + t) if t < b_nt else rd
+                    row = arith.select(is_b, b_row, a_row)
+                elif const_expr(_wide):
                     row = grp * 64 + loc
                 else:
                     # A narrow group spans 16*nt rows; fragment t past it has no source row,
@@ -4783,7 +4891,7 @@ def gemm_mxfp4_flydsl_kernel(
             cands = [
                 s
                 for s in cands
-                if _mxfp4_split_keeps_ilv(Kw, s, out_fp16=out_fp16, k_real=_k_real, block_n=_bn)
+                if _mxfp4_split_keeps_ilv(Kw, s, out_fp16=out_fp16, k_real=_k_real, block_n=_bn, n=N)
             ]
         modes = [(0, 1)] + [(1, s) for s in cands[1:]]
         # Only the smallest split gets a tail arm: at equal CU fill it moves the fewest
@@ -4915,7 +5023,7 @@ def preshuffle_mxfp4_scales(
     # and how many rows/columns one packed group covers -- so the same pick drives the pack here.
     block_n = _mxfp4_pick_block_n(M, N, Kw)
     block_m = _mxfp4_pick_block_m(M, N, Kw)
-    ilv = mxfp4_packed_scale_ilv(Kw, out_fp16=out_fp16, accum=accum, k_real=k_real, block_n=block_n)
+    ilv = mxfp4_packed_scale_ilv(Kw, out_fp16=out_fp16, accum=accum, k_real=k_real, block_n=block_n, n=N)
     k128 = Kw // 128
     sc_row = (Kw if k_real is None else k_real) // 32
     launch = _get_mxfp4_preshuffle_launch(

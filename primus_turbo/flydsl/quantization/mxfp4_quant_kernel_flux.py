@@ -3872,7 +3872,7 @@ def _turbo_packed_layout_agrees(M, N, K):
     # `_mxfp4_mm`, never the accumulating GEMM.
     Kw = (K + 255) // 256 * 256
     ilv = g.mxfp4_packed_scale_ilv(
-        Kw, out_fp16=False, accum=False, k_real=(None if K == Kw else K), block_n=256
+        Kw, out_fp16=False, accum=False, k_real=(None if K == Kw else K), block_n=256, n=N
     )
     return ilv == getattr(g, "_MXFP4_PACK_ILV", 4)
 
