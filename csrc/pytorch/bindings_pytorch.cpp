@@ -207,12 +207,16 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
     // activation/weight); see fmt_pair in quantization_mxfp6.cpp.
     m.def("quantize_mx(Tensor input, int axis, int fmt) -> Tensor[]");
     m.def("quantize_mx_dual(Tensor input, int fmt) -> Tensor[]");
-    // Tensorwise FP8 rows (fmt row code 0x2): row_qscale multiplies the input before the E4M3 cast; the launch's
-    // max |input| is maxed into row_amax (one fp32 each).
-    m.def("quantize_mx_dual_f8(Tensor input, int fmt, Tensor row_qscale, Tensor(a!) row_amax) -> Tensor[]");
-    m.def("quantize_mx_f8(Tensor input, int fmt, Tensor row_qscale, Tensor(a!) row_amax) -> Tensor[]");
+    // Tensorwise FP8 rows (fmt row code 0x2): row_qscale multiplies the input before the E4M3 cast;
+    // the launch's max |input| is maxed into row_amax (one fp32 each). Fixed-arity returns:
+    // torch.compile functionalizes the row_amax mutation only for ops returning plain Tensors.
+    m.def("quantize_mx_dual_f8(Tensor input, int fmt, Tensor row_qscale, Tensor(a!) row_amax) -> "
+          "(Tensor, Tensor, Tensor, Tensor)");
+    m.def("quantize_mx_f8(Tensor input, int fmt, Tensor row_qscale, Tensor(a!) row_amax) -> "
+          "(Tensor, Tensor)");
     m.def("quantize_mx_fused_dual_f8(Tensor input, Tensor? aux, Tensor? bias, int mode, "
-          "bool want_col_sum, int fmt, Tensor row_qscale, Tensor(a!) row_amax) -> Tensor[]");
+          "bool want_col_sum, int fmt, Tensor row_qscale, Tensor(a!) row_amax) -> (Tensor, Tensor, "
+          "Tensor, Tensor, Tensor)");
     m.def("quantize_mx_fused_dual(Tensor input, Tensor? aux, Tensor? bias, int mode, "
           "bool want_col_sum, int fmt) -> Tensor[]");
     m.def("quantize_mx_qk_norm_rope_bwd(Tensor input, Tensor dq, Tensor dk, Tensor dv, "

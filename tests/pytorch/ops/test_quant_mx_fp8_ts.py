@@ -133,3 +133,14 @@ def test_gemm_fp8_ts(bias):
     big = torch.zeros(3 * m, n, dtype=torch.bfloat16, device="cuda")
     gemm_fp8_ts_out_impl(xp, sx, wp, sw, big[m : 2 * m], m, n, k, bv)
     assert torch.equal(big[m : 2 * m], out)
+
+
+def test_compiles_with_the_amax_mutation():
+    """torch.compile functionalizes the row_amax mutation (the ops return fixed-arity tuples for that)."""
+    MX = _mx()
+    x = _data(11)
+    qs, amax = torch.tensor([3.0], device="cuda"), torch.zeros(1, device="cuda")
+    f = torch.compile(lambda t: MX.quantize_mx_dual_f8(t, _fmt(), qs, amax)[0], fullgraph=True)
+    rp = f(x)
+    assert torch.equal(rp, MX.quantize_mx_dual_f8(x, _fmt(), qs, torch.zeros(1, device="cuda"))[0])
+    assert amax.item() == x.float().abs().max().item()

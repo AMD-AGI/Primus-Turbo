@@ -1172,21 +1172,28 @@ std::vector<at::Tensor> quantize_mx_dual(const at::Tensor input, const int64_t f
 // Tensorwise FP8 rows (fmt row code 0x2): `row_qscale` (one fp32) multiplies x before the E4M3 cast, and the launch's
 // max |x| is maxed into `row_amax` (one fp32, atomically; the caller zeroes it when a new amax period starts). The
 // outputs and the column direction are quantize_mx_dual's / quantize_mx's / quantize_mx_fused_dual's.
-std::vector<at::Tensor> quantize_mx_dual_f8(const at::Tensor input, const int64_t fmt, const at::Tensor row_qscale,
-                                            at::Tensor row_amax) {
-    return run(input, MXFP6Direction::Dual, fmt, F8Row{&row_qscale, &row_amax});
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+quantize_mx_dual_f8(const at::Tensor input, const int64_t fmt, const at::Tensor row_qscale,
+                    at::Tensor row_amax) {
+    const auto o = run(input, MXFP6Direction::Dual, fmt, F8Row{&row_qscale, &row_amax});
+    return {o[0], o[1], o[2], o[3]};
 }
 
-std::vector<at::Tensor> quantize_mx_f8(const at::Tensor input, const int64_t fmt, const at::Tensor row_qscale,
-                                       at::Tensor row_amax) {
-    return run(input, MXFP6Direction::Row, fmt, F8Row{&row_qscale, &row_amax});
+std::tuple<at::Tensor, at::Tensor> quantize_mx_f8(const at::Tensor input, const int64_t fmt,
+                                                  const at::Tensor row_qscale,
+                                                  at::Tensor       row_amax) {
+    const auto o = run(input, MXFP6Direction::Row, fmt, F8Row{&row_qscale, &row_amax});
+    return {o[0], o[1]};
 }
 
-std::vector<at::Tensor> quantize_mx_fused_dual_f8(const at::Tensor input, const c10::optional<at::Tensor> aux,
-                                                  const c10::optional<at::Tensor> bias, const int64_t mode,
-                                                  const bool want_col_sum, const int64_t fmt,
-                                                  const at::Tensor row_qscale, at::Tensor row_amax) {
-    return run_fused(input, aux, bias, prologue_from_mode(mode), want_col_sum, fmt, F8Row{&row_qscale, &row_amax});
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+quantize_mx_fused_dual_f8(const at::Tensor input, const c10::optional<at::Tensor> aux,
+                          const c10::optional<at::Tensor> bias, const int64_t mode,
+                          const bool want_col_sum, const int64_t fmt, const at::Tensor row_qscale,
+                          at::Tensor row_amax) {
+    const auto o = run_fused(input, aux, bias, prologue_from_mode(mode), want_col_sum, fmt,
+                             F8Row{&row_qscale, &row_amax});
+    return {o[0], o[1], o[2], o[3], o[4]};
 }
 
 std::vector<at::Tensor> quantize_mx_fused_dual(const at::Tensor input,
@@ -1252,20 +1259,25 @@ std::vector<at::Tensor> quantize_mx_dual_meta(const at::Tensor input, const int6
     return with_fmt_blobs(quantize_mxfp6_dual_meta(input), input, fmt);
 }
 
-std::vector<at::Tensor> quantize_mx_dual_f8_meta(const at::Tensor input, const int64_t fmt, const at::Tensor,
-                                                 at::Tensor) {
-    return quantize_mx_dual_meta(input, fmt);
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+quantize_mx_dual_f8_meta(const at::Tensor input, const int64_t fmt, const at::Tensor, at::Tensor) {
+    const auto o = quantize_mx_dual_meta(input, fmt);
+    return {o[0], o[1], o[2], o[3]};
 }
 
-std::vector<at::Tensor> quantize_mx_f8_meta(const at::Tensor input, const int64_t fmt, const at::Tensor, at::Tensor) {
-    return quantize_mx_meta(input, 1, fmt);
+std::tuple<at::Tensor, at::Tensor> quantize_mx_f8_meta(const at::Tensor input, const int64_t fmt,
+                                                       const at::Tensor, at::Tensor) {
+    const auto o = quantize_mx_meta(input, 1, fmt);
+    return {o[0], o[1]};
 }
 
-std::vector<at::Tensor> quantize_mx_fused_dual_f8_meta(const at::Tensor input, const c10::optional<at::Tensor> aux,
-                                                       const c10::optional<at::Tensor> bias, const int64_t mode,
-                                                       const bool want_col_sum, const int64_t fmt, const at::Tensor,
-                                                       at::Tensor) {
-    return quantize_mx_fused_dual_meta(input, aux, bias, mode, want_col_sum, fmt);
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+quantize_mx_fused_dual_f8_meta(const at::Tensor input, const c10::optional<at::Tensor> aux,
+                               const c10::optional<at::Tensor> bias, const int64_t mode,
+                               const bool want_col_sum, const int64_t fmt, const at::Tensor,
+                               at::Tensor) {
+    const auto o = quantize_mx_fused_dual_meta(input, aux, bias, mode, want_col_sum, fmt);
+    return {o[0], o[1], o[2], o[3], o[4]};
 }
 
 std::vector<at::Tensor> quantize_mx_fused_dual_meta(const at::Tensor input,
