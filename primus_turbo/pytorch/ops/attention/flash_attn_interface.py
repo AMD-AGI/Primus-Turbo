@@ -4,6 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import os
 from typing import Optional
 
 import torch
@@ -171,7 +172,29 @@ class FlashAttnFunc(torch.autograd.Function):
             # straight, and then reading bshd bytes as sbhd would just return the wrong answer.
             assert _sbhd_layout(q, qkv_format), f"flydsl dense attention is sbhd only, got {qkv_format}"
             q_s, k_s, v_s = (t.permute(1, 0, 2, 3) for t in (q, k, v))
-            out_s, lse = flash_attn_sbhd_flydsl_forward_impl(
+            q_prep = os.getenv("PRIMUS_TURBO_ATTN_Q_PREP", "standalone")
+            if (
+                q_prep in ("forward", "forward_hybrid")
+                and is_grad_enabled
+                and _any_requires_grad(q, k, v, sink)
+                and q_s.shape[-1] == 64
+                and (q_s.shape[0] != k_s.shape[0] or q_s.shape[0] % 64)
+            ):
+                raise ValueError("experimental Q caching requires equal, 64-aligned sequence lengths")
+            save_q = (
+                (
+                    q_prep == "forward"
+                    or (
+                        q_prep == "forward_hybrid"
+                        and (window_size[0] < 0 or window_size[0] >= k_s.shape[0] - 1)
+                    )
+                )
+                and is_grad_enabled
+                and _any_requires_grad(q, k, v, sink)
+                and q_s.shape[-1] == 64
+                and q_s.shape[0] == k_s.shape[0]
+            )
+            forward_result = flash_attn_sbhd_flydsl_forward_impl(
                 q_s,
                 k_s,
                 v_s,
@@ -180,10 +203,14 @@ class FlashAttnFunc(torch.autograd.Function):
                 window_size=window_size,
                 return_lse=True,
                 sink=sink,
+                return_scaled_q=save_q,
             )
+            out_s, lse = forward_result[:2]
+            saved_q = forward_result[2] if save_q else q_s
             B, Sq, Hq = q.shape[0], q.shape[1], q.shape[2]
             if is_grad_enabled and _any_requires_grad(q, k, v, sink):
-                ctx.save_for_backward(q_s, k_s, v_s, out_s, lse)
+                ctx.save_for_backward(saved_q, k_s, v_s, out_s, lse)
+                ctx.q_is_scaled = save_q
                 ctx.softmax_scale = softmax_scale
                 ctx.causal = causal
                 ctx.window_size = window_size
@@ -321,6 +348,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 window_size=ctx.window_size,
                 sink=ctx.sink,
                 deterministic=ctx.deterministic,
+                q_is_scaled=ctx.q_is_scaled,
             )
             dq, dk, dv = (g.permute(1, 0, 2, 3) for g in grads[:3])
             # backward returns (dq,dk,dv), plus dsink when a sink was given.
