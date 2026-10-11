@@ -454,6 +454,57 @@ __launch_bounds__(BLOCK) __global__
     store_data<QType, UNROLL>(y + orow * Kp + c, st_regs);
 }
 
+// No-pad path: with K == Kp and no N pad the output keeps the input's flat layout,
+// so a fixed 16-element pack per thread keeps every lane busy for any K. The
+// row-per-block kernel above idles lanes once a row holds fewer 16-byte packs than
+// its block size (only 96 of 256 lanes work at K=768 bf16); from a full row up it
+// is as fast or faster, so the flat kernel only takes rows shorter than that.
+constexpr int32_t FLAT_BLOCK_SIZE    = 512;
+constexpr int32_t FLAT_PACK          = 16;
+constexpr int64_t FLAT_MAX_ROW_BYTES = PAD_ROW_BLOCK_SIZE * 16;
+
+template <int BLOCK, typename FType, typename QType, typename ComputeType>
+__launch_bounds__(BLOCK) __global__
+    void quantize_tensorwise_flat_kernel(const FType *__restrict__ x, QType *__restrict__ y,
+                                         const QuantTensorwiseScalePtrOp<ComputeType> op,
+                                         const int64_t npack, const int64_t n) {
+    constexpr int32_t CHUNK = 16 / sizeof(FType);
+    const ComputeType scale = op.scale_ptr[0];
+    const int64_t     tid   = static_cast<int64_t>(blockIdx.x) * BLOCK + threadIdx.x;
+    if (tid < npack) {
+        FType ld_regs[FLAT_PACK];
+#pragma unroll
+        for (int32_t c = 0; c < FLAT_PACK; c += CHUNK) {
+            load_data_nt<FType, CHUNK>(x + tid * FLAT_PACK + c, ld_regs + c);
+        }
+        quant_store_pack<FLAT_PACK>(y + tid * FLAT_PACK, ld_regs, op, scale);
+    } else {
+        const int64_t idx = npack * FLAT_PACK + (tid - npack);
+        if (idx < n) {
+            y[idx] = static_cast<QType>(op(static_cast<ComputeType>(x[idx]), scale));
+        }
+    }
+}
+
+// Returns false when the 16-byte vector preconditions do not hold.
+template <typename FType, typename QType, typename ComputeType>
+static bool launch_quantize_tensorwise_flat(const FType *x, QType *y,
+                                            const QuantTensorwiseScalePtrOp<ComputeType> &op,
+                                            const int64_t n, hipStream_t stream) {
+    if constexpr (sizeof(QType) != 1 || (FLAT_PACK * sizeof(FType)) % 16 != 0) {
+        return false;
+    } else {
+        if (reinterpret_cast<uintptr_t>(x) % 16 != 0 || reinterpret_cast<uintptr_t>(y) % 16 != 0) {
+            return false;
+        }
+        const int64_t npack  = n / FLAT_PACK;
+        const int64_t nBlock = DIVUP<int64_t>(npack + n % FLAT_PACK, FLAT_BLOCK_SIZE);
+        quantize_tensorwise_flat_kernel<FLAT_BLOCK_SIZE, FType, QType, ComputeType>
+            <<<nBlock, FLAT_BLOCK_SIZE, 0, stream>>>(x, y, op, npack, n);
+        return true;
+    }
+}
+
 // Picks the row-per-block fast path for pad when its preconditions hold.
 template <int BLOCK, int UNROLL, typename FType, typename QType, typename ComputeType>
 static void launch_quantize_tensorwise_pad(const FType *x, QType *y,
@@ -493,6 +544,7 @@ void quantize_tensorwise_pad_impl(const FType *x, const float *scale, QType *y, 
     // Unified pad path: K -> Kp always; the penultimate N -> Np only for a grouped
     // [G, N, K] weight (np_pen > n_pen). A flat [rows, K] is the degenerate
     // N == Np == rows case, so both feed one launcher -- no separate K-only kernel.
+    // When nothing is padded and rows are short, the flat no-pad kernel takes over.
     const bool    do_pad   = (n_pen > 0) && (np_pen > n_pen);
     const int64_t N        = do_pad ? n_pen : rows;
     const int64_t Np       = do_pad ? np_pen : rows;
@@ -503,6 +555,11 @@ void quantize_tensorwise_pad_impl(const FType *x, const float *scale, QType *y, 
         reinterpret_cast<const ComputeType *>(scale),
         static_cast<ComputeType>(std::numeric_limits<QType>::lowest()),
         static_cast<ComputeType>(std::numeric_limits<QType>::max())};
+
+    if (!do_pad && K == Kp && K * static_cast<int64_t>(sizeof(FType)) < FLAT_MAX_ROW_BYTES &&
+        launch_quantize_tensorwise_flat<FType, QType, ComputeType>(x, y, op, rows * K, stream)) {
+        return;
+    }
 
     constexpr int32_t BLOCK_SIZE = 512;
 
