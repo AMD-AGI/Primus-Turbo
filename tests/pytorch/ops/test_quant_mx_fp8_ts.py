@@ -144,3 +144,17 @@ def test_compiles_with_the_amax_mutation():
     rp = f(x)
     assert torch.equal(rp, MX.quantize_mx_dual_f8(x, _fmt(), qs, torch.zeros(1, device="cuda"))[0])
     assert amax.item() == x.float().abs().max().item()
+
+
+def test_fused_compiles_with_the_amax_mutation():
+    """The fused BIAS_GELU FP8 pack under torch.compile (its prologue argument must not be named ``mode``, which
+    auto_functionalized takes as its own keyword)."""
+    MX = _mx()
+    y, b = _data(12), _data(13, 1, K).view(-1)
+    qs, amax = torch.tensor([20.0], device="cuda"), torch.zeros(1, device="cuda")
+    f = torch.compile(lambda t: MX.quantize_mx_fused_dual_f8(t, None, b, 1, False, _fmt(), qs, amax)[0],
+                      fullgraph=True)
+    rp = f(y)
+    a2 = torch.zeros(1, device="cuda")
+    assert torch.equal(rp, MX.quantize_mx_fused_dual_f8(y, None, b, 1, False, _fmt(), qs, a2)[0])
+    assert amax.item() == a2.item()

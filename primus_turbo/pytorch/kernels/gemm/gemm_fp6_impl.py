@@ -981,3 +981,50 @@ def gemm_fp8_ts_out_impl(
 @gemm_fp8_ts_out_impl.register_fake
 def gemm_fp8_ts_out_impl_meta(a, a_scale, b, b_scale, out, m, n, k, bias=None) -> None:
     return None
+
+
+@_torch_custom_op_wrapper(
+    "primus_turbo::gemm_fp8_ts_cat_gres_out", mutates_args=("out", "h"), device_types="cuda"
+)
+def gemm_fp8_ts_cat_gres_out(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    a2: torch.Tensor,
+    a2_scale: torch.Tensor,
+    b2: torch.Tensor,
+    b2_scale: torch.Tensor,
+    bias: torch.Tensor,
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    out: torch.Tensor,
+    h: torch.Tensor,
+    k: int,
+    k2: int,
+) -> None:
+    """``gemm_a6w6_ts_cat_gres_out`` for tensorwise FP8: both operand pairs packed as for ``gemm_fp8_ts_impl`` (the
+    ``*_f8`` packers' rows), each segment's scales one-element fp32 dequantization factors. One fp32 accumulator,
+    rescaled between the segments: ``h = bf16(A @ B^T * s0 + A2 @ B2^T * s1) + bias`` (one rounding of the GEMM, the
+    bias added in fp32) and ``out = x + gate[r % Bt] * h``. See ``fp8_ts_cat_table`` for the shapes."""
+    from aiter.ops.gemm_op_tilescale import gemm_fp8_tilescale_cat
+
+    flat = lambda t: t.view(torch.uint8).reshape(-1)  # noqa: E731
+    gemm_fp8_tilescale_cat(flat(a), flat(b), a_scale.reshape(1), b_scale.reshape(1), flat(a2), flat(b2),
+                           a2_scale.reshape(1), b2_scale.reshape(1), out, h, k, k2, bias, x, gate)
+
+
+@gemm_fp8_ts_cat_gres_out.register_fake
+def _gemm_fp8_ts_cat_gres_out_meta(a, a_scale, b, b_scale, a2, a2_scale, b2, b2_scale, bias, x, gate, out, h, k,
+                                   k2) -> None:
+    return None
+
+
+def fp8_ts_cat_table() -> frozenset:
+    """The shapes ``gemm_fp8_ts_cat_gres_out`` has kernels for (read once, outside compiled regions):
+    {(M, N, K, K2, Bt)}."""
+    try:
+        from aiter.ops.gemm_op_tilescale import fp8_tilescale_cat_table
+    except ImportError:
+        return frozenset()
+    return frozenset(fp8_tilescale_cat_table())
