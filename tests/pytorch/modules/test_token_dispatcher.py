@@ -178,6 +178,87 @@ def _run_dispatch_combine(
     return tokens_per_expert
 
 
+class _StubExpert(torch.autograd.Function):
+    """Records its input and output gradient untouched; emits a fixed output."""
+
+    @staticmethod
+    def forward(ctx, x, out, record):
+        ctx.record = record
+        record["input"] = x
+        return out.clone()
+
+    @staticmethod
+    def backward(ctx, grad):
+        ctx.record["grad"] = grad
+        return torch.zeros(grad.shape, dtype=torch.bfloat16, device=grad.device), None, None
+
+
+def _run_fp8_permute(rank, ep_group, pad_multiple, deepep_num_worst_tokens):
+    """FP8 permute / un-permute grad through the dispatcher match quantizing the bf16 ones."""
+    from primus_turbo.pytorch.core.low_precision import (
+        ScalingGranularity,
+        float8_e4m3,
+        float8_e5m2,
+    )
+    from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
+
+    dispatcher = turbo.modules.DeepEPTokenDispatcher(
+        NUM_EXPERTS,
+        ROUTER_TOPK,
+        ep_group,
+        pad_multiple=pad_multiple,
+        deepep_num_worst_tokens=deepep_num_worst_tokens,
+        deepep_use_cuda_num_tokens_per_expert=True,
+    )
+    gen = torch.Generator(device="cuda").manual_seed(1234 + rank)
+    hidden_states = torch.randn((NUM_TOKENS, HIDDEN_SIZE), dtype=torch.bfloat16, device="cuda", generator=gen)
+    probs = torch.rand((NUM_TOKENS, NUM_EXPERTS), dtype=torch.float32, device="cuda", generator=gen)
+    grad_out = torch.randn((NUM_TOKENS, HIDDEN_SIZE), dtype=torch.bfloat16, device="cuda", generator=gen)
+
+    def run(fp8):
+        record = {}
+        h = hidden_states.clone().requires_grad_(True)
+        x, token_probs = dispatcher._pre_dispatch(h, probs)
+        x, dispatched_probs = dispatcher._exec_dispatch(x, token_probs)
+        permuted, tokens_per_expert, _ = dispatcher._post_dispatch(
+            x, dispatched_probs, quantize_dtype=float8_e4m3 if fp8 else None
+        )
+        out = torch.ones(permuted.shape, dtype=torch.bfloat16, device="cuda")
+        y = _StubExpert.apply(permuted, out, record)
+        y = dispatcher._pre_combine(y, grad_quantize_dtype=float8_e5m2 if fp8 else None)
+        dispatcher._post_combine(dispatcher._exec_combine(y)).backward(grad_out)
+        return record, tokens_per_expert
+
+    ref, ref_tpe = run(False)
+    got, tpe = run(True)
+
+    errors = []
+
+    def same(q, ref_tensor, dtype, group_lens):
+        want = QuantizedTensor.quantize(
+            ref_tensor.detach(),
+            dtype,
+            ScalingGranularity.TENSORWISE,
+            axis=-1,
+            group_lens=group_lens,
+            pad_align_last=128,
+        )
+        return (
+            isinstance(q, QuantizedTensor)
+            and q.shape == want.shape
+            and torch.equal(q.qdata.view(torch.uint8), want.qdata.view(torch.uint8))
+            and torch.equal(q.scale_inv, want.scale_inv)
+        )
+
+    if not torch.equal(tpe, ref_tpe):
+        errors.append(f"rank {rank}: tokens_per_expert differs")
+    elif not same(got["input"], ref["input"], float8_e4m3, ref_tpe):
+        errors.append(f"rank {rank}: FP8 permuted tokens differ from quantized bf16 permute")
+    if not same(got["grad"], ref["grad"], float8_e5m2, None):
+        errors.append(f"rank {rank}: FP8 expert-output grad differs from quantized bf16 grad")
+    _fail_on_all_ranks(errors)
+
+
 @instantiate_parametrized_tests
 class TestTokenDispatcher(MultiProcContinuousTest):
     # -2 tells MultiProcContinuousTest to use torch.cuda.device_count()
@@ -239,6 +320,18 @@ class TestTokenDispatcher(MultiProcContinuousTest):
                 permute_max_token_num=permute_max_token_num,
                 permute_backend=BackendType[permute_backend],
             )
+
+    # ------------------------------------------------------------------
+    # Tensorwise-FP8 permute output / un-permute grad
+    # ------------------------------------------------------------------
+
+    @parametrize("backend", _get_backends())
+    @parametrize("pad_multiple", [0, 16])
+    @parametrize("deepep_num_worst_tokens", [0, NUM_TOKENS * 8])
+    def test_fp8_permute(self, backend, pad_multiple, deepep_num_worst_tokens):
+        self._bind_device()
+        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+            _run_fp8_permute(self.rank, dist.group.WORLD, pad_multiple, deepep_num_worst_tokens)
 
     # ------------------------------------------------------------------
     # pad_multiple > 0

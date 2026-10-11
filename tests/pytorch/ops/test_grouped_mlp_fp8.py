@@ -27,12 +27,15 @@ import torch.nn.functional as F
 from primus_turbo.pytorch.core.low_precision import (
     MXFP8_BLOCK_SIZE,
     Float8QuantConfig,
+    Format,
     ScaleDtype,
     ScalingGranularity,
     check_mxfp8_support,
 )
+from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
 from primus_turbo.pytorch.core.utils import is_gfx942, is_gfx950
 from primus_turbo.pytorch.ops.grouped_mlp_fp8 import grouped_mlp_fp8
+from primus_turbo.pytorch.ops.utils import _get_fp8_dtype
 from tests.pytorch.test_utils import compute_snr
 
 # fp8 puts a floor of ~55 dB on a single GEMM; stacking two of them and their
@@ -175,3 +178,62 @@ def test_grouped_mlp_mxfp8(shape, activation, clamp_limit):
     if not is_gfx950():
         pytest.skip("the fused MXFP8 GLU epilogues are gfx950-only")
     _check_mlp(shape, activation, clamp_limit, _mx_config())
+
+
+class _QuantizeInput(torch.autograd.Function):
+    """Tensorwise-quantize the input up front (as moe_permute(quantize_dtype=...) does)."""
+
+    @staticmethod
+    def forward(ctx, x, dtype, group_lens):
+        return QuantizedTensor.quantize(
+            x, dtype, ScalingGranularity.TENSORWISE, axis=-1, group_lens=group_lens, pad_align_last=128
+        )
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad, None, None
+
+
+class _QuantizeGrad(torch.autograd.Function):
+    """Identity whose backward passes the gradient on tensorwise-quantized
+    (as moe_unpermute(grad_quantize_dtype=...) does)."""
+
+    @staticmethod
+    def forward(ctx, x, dtype):
+        ctx.dtype = dtype
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad):
+        return (
+            QuantizedTensor.quantize(
+                grad, ctx.dtype, ScalingGranularity.TENSORWISE, axis=-1, pad_align_last=128
+            ),
+            None,
+        )
+
+
+@pytest.mark.parametrize("fmt", [Format.E4M3, Format.HYBRID])
+def test_grouped_mlp_fp8_prequantized_input_and_grad(fmt):
+    """A tensorwise QuantizedTensor input and output gradient reproduce the bf16 path bit for bit."""
+    if is_gfx942():
+        pytest.skip("grouped_mlp_fp8 is not supported on gfx942 currently.")
+    M, K, I, G = SHAPES[0]
+    _, group_lens, leaves = _mlp_leaves(M, K, I, G)
+    config = Float8QuantConfig(format=fmt)
+    x_dtype, grad_dtype = _get_fp8_dtype(fmt, True), _get_fp8_dtype(fmt, False)
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    cotangent = torch.randn(M, K, device="cuda", generator=gen)
+
+    def bf16_handoff(x, w1, w2, p):
+        return _fused_mlp(x, w1, w2, p, group_lens, "silu", None, config)
+
+    def fp8_handoff(x, w1, w2, p):
+        qx = _QuantizeInput.apply(x, x_dtype, group_lens)
+        return _QuantizeGrad.apply(_fused_mlp(qx, w1, w2, p, group_lens, "silu", None, config), grad_dtype)
+
+    want, want_grads = _run(bf16_handoff, leaves, cotangent)
+    got, got_grads = _run(fp8_handoff, leaves, cotangent)
+    assert torch.equal(got, want), "out"
+    for name, g, w in zip(("grad_x", "grad_w1", "grad_w2", "grad_probs"), got_grads, want_grads):
+        assert torch.equal(g, w), name

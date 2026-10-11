@@ -313,7 +313,9 @@ class DeepEPTokenDispatcher(TokenDispatcher):
 
         return hidden_states, dispatched_probs
 
-    def _post_dispatch(self, hidden_states, dispatched_probs):
+    def _post_dispatch(self, hidden_states, dispatched_probs, quantize_dtype=None):
+        """``quantize_dtype`` (FP8): return the permuted tokens as a grouped tensorwise
+        ``QuantizedTensor`` (see ``moe_permute``); the experts must accept it."""
         # Empty when num_worst_tokens > 0; DeepEP skips the host count then.
         if self.tokens_per_expert.numel() > 0:
             if self.pad_multiple > 0:
@@ -350,6 +352,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
             probs=dispatched_probs,
             probs_layout="topk",  # dispatched_probs is [num_dispatched, router_topk]
             backend=self.permute_backend,
+            quantize_dtype=quantize_dtype,
         )
 
         if not self.deepep_use_cuda_num_tokens_per_expert:
@@ -361,7 +364,9 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         self.tokens_per_expert = None
         return hidden_states, tokens_per_expert, permuted_probs
 
-    def _pre_combine(self, hidden_states):
+    def _pre_combine(self, hidden_states, grad_quantize_dtype=None):
+        """``grad_quantize_dtype`` (FP8): backward hands the experts their output gradient as
+        a tensorwise ``QuantizedTensor`` (see ``moe_unpermute``); the experts must accept it."""
         hidden_states, _ = turbo.ops.moe_unpermute(
             hidden_states,
             self.row_id_map,
@@ -369,6 +374,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
             num_local_experts=self.num_local_experts,
             pad_multiple=self.pad_multiple,
             backend=self.permute_backend,
+            grad_quantize_dtype=grad_quantize_dtype,
         )
         return hidden_states
 
