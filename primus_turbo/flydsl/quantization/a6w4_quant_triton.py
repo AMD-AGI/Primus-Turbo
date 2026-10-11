@@ -21,8 +21,8 @@ the A6W4 emulation in fwddiag used (and converged with):
 
 quant_act_a6w4 and quant_w_a6w4 return exactly what primus_turbo.flydsl.gemm.gemm_a6w4_kernel
 consumes:
-  A: FP8-padded packed FP6 [M, K] uint8 (per 32 values, 24 bytes holding a little-endian
-     6-bit code stream, then 8 zero bytes), scales in shuffle_scale_w4 layout
+  A: dense preshuffled FP6 (a32=24, default): see dense_fp6 below for the byte layout; a32=32
+     instead returns the older FP8-padded row-major packing (24 code bytes + 8 zero bytes)
   W: packed FP4 (even element in the low nibble) in shuffle_weight_w4(16) layout, scales in
      shuffle_scale_w4 layout
 Only the bytes are a contract; the returned tensors' shapes are not.
@@ -144,10 +144,22 @@ def quant_w_fp4(w):
     return out, sc
 
 
-def quant_act_a6w4(x):
-    """bf16 [M, K] contiguous, M % 32 == 0, K % 256 == 0 -> (FP6 A, shuffled A scales) for gemm_a6w4."""
+def dense_fp6(aq):
+    """FP8-padded [M, K] -> dense preshuffled, 3K/4 bytes a row: 64-row blocks holding their
+    128-K tiles back to back, each tile six 1024 B planes (the four micro-blocks' low 16 B
+    halves, then their four high 8 B halves paired) -- gemm_a6w4's LDS layout."""
+    m, k = aq.shape
+    t = aq.view(m // 64, 64, k // 128, 4, 32)
+    lo = t[:, :, :, :, :16].permute(0, 2, 3, 1, 4)  # [m/64, k/128, 4, 64, 16]
+    hi = t[:, :, :, :, 16:24].reshape(m // 64, 64, k // 128, 2, 16).permute(0, 2, 3, 1, 4)
+    return torch.cat((lo, hi), 2).contiguous().reshape(m, -1)
+
+
+def quant_act_a6w4(x, a32=24):
+    """bf16 [M, K] contiguous, M % 32 == 0, K % 256 == 0 -> (FP6 A, shuffled A scales) for gemm_a6w4.
+    a32 = the consumer's A_BYTES_PER_32 (24 dense, 32 FP8-padded)."""
     aq, sa = quant_act_fp6(x)
-    return aq, shuffle_scale(sa)
+    return (aq if a32 == 32 else dense_fp6(aq)), shuffle_scale(sa)
 
 
 def quant_w_a6w4(w):

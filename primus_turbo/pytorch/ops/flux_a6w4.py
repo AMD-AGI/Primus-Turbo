@@ -12,6 +12,7 @@ installed as primus_turbo.flydsl.gemm.gemm_a6w4_kernel, which picks its own tile
 Both files live in Turbo's flydsl tree so forge campaigns can edit them.
 """
 
+import functools
 import os
 
 import torch
@@ -22,23 +23,26 @@ _QUANT = os.getenv("FLUX_A6W4_QUANT", "flydsl")
 
 
 def quantizers():
-    """(quant_act_a6w4, quant_w_a6w4) per FLUX_A6W4_QUANT."""
+    """(quant_act_a6w4, quant_w_a6w4) per FLUX_A6W4_QUANT, packing A the way the selected
+    GEMM reads it (A_BYTES_PER_32: 24 dense for the tuned kernel, 32 padded for v0)."""
+    from primus_turbo.flydsl.gemm.gemm_a6w4_kernel import A_BYTES_PER_32
+
     if _QUANT == "triton":
         from primus_turbo.flydsl.quantization import a6w4_quant_triton as q
 
-        def _flat(fn):
+        def _flat(fn, **kw):
             def f(t):
-                d, s = fn(t)
+                d, s = fn(t, **kw)
                 return d.reshape(t.shape[0], -1), s.reshape(-1)
 
             return f
 
-        return _flat(q.quant_act_a6w4), _flat(q.quant_w_a6w4)
+        return _flat(q.quant_act_a6w4, a32=A_BYTES_PER_32), _flat(q.quant_w_a6w4)
     if _QUANT == "flydsl":
         from primus_turbo.flydsl.quantization import a6w4_quant as q
     else:
         raise ValueError(f"FLUX_A6W4_QUANT must be flydsl or triton, got {_QUANT!r}")
-    return q.quant_act_a6w4, q.quant_w_a6w4
+    return functools.partial(q.quant_act_a6w4, a32=A_BYTES_PER_32), q.quant_w_a6w4
 
 
 def a6w4_mm(a, b, bias=None):
@@ -79,9 +83,10 @@ def a6w4_mm_qa(aq, sa, b, bias=None):
 
 def a6w4_mm_qa_prequant_w(aq, sa, wq, sb, n, bias=None):
     """a6w4_mm with both operands already quantized."""
-    from primus_turbo.flydsl.gemm.gemm_a6w4_kernel import M_ALIGN, gemm_a6w4
+    from primus_turbo.flydsl.gemm.gemm_a6w4_kernel import A_BYTES_PER_32, M_ALIGN, gemm_a6w4
 
-    m, k = aq.shape
+    m = aq.shape[0]
+    k = aq.shape[1] * 32 // A_BYTES_PER_32
     if m % M_ALIGN or n % 256 or k % 1024:
         raise ValueError(f"a6w4_mm_qa: M={m} must be a multiple of {M_ALIGN}, N={n} of 256, K={k} of 1024")
     return gemm_a6w4(aq, wq, sa, sb, n, k, bias)

@@ -508,6 +508,9 @@ def launch_gemm(
 # The caller pads M to a multiple of this and guarantees nothing more, so every tile_m
 # chosen below must divide it.
 M_ALIGN = 256
+# This kernel reads A in the FP8-padded packing (24 code + 8 zero bytes per 32 values); the
+# tuned kernel reads the dense 24. quant_act_a6w4 produces whichever its caller asks for.
+A_BYTES_PER_32 = 32
 # (tile_m, tile_n, tile_k, waves_per_eu) per (N, K), from the FLUX-shape sweep on MI355X.
 _A6W4_CONFIGS = {
     (9216, 3072): (128, 256, 128, 1),

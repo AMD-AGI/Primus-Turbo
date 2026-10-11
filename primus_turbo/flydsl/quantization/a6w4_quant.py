@@ -22,8 +22,11 @@ into the scale); the converters are gfx950's scaled pk16 FP6 / pk FP4 conversion
 
 quant_act_a6w4 and quant_w_a6w4 return exactly what primus_turbo.flydsl.gemm.gemm_a6w4_kernel
 consumes, with every shuffle done by the stores:
-  A: FP8-padded packed FP6 [M, K] uint8 (per 32 values, 24 bytes holding a little-endian
-     6-bit code stream, then 8 zero bytes), scales in shuffle_scale_w4 layout
+  A: dense preshuffled FP6, 3K/4 bytes a row -- 24 bytes of little-endian 6-bit code stream
+     per 32 values, grouped in 64-row blocks whose 128-K tiles sit back to back, each tile
+     six 1024 B planes (the four micro-blocks' low 16 B halves, then their four high 8 B
+     halves paired), which is the GEMM's LDS layout (a32=32 instead returns the older
+     FP8-padded row-major form: the same 24 bytes in place, then 8 zero bytes)
   W: packed FP4 (even element in the low nibble) in shuffle_weight_w4(16) layout, scales in
      shuffle_scale_w4 layout
 Only the bytes are a contract; the returned tensors' shapes are not.
@@ -124,14 +127,15 @@ def _srd_at(t, elem_off, elem_bytes, nrec_bytes):
     return buffer_ops.create_buffer_resource_from_addr(base_v, num_records_bytes=nr)
 
 
-def _build_launch(C, act):
+def _build_launch(C, act, a32=24):
     """Row quantizer for a [R, C] bf16 tensor, R % 32 == 0, C % 1024 == 0. One thread per
     32-element micro-block, a block per 4 rows x 32 micro-blocks, so loads and the A store
-    are contiguous per row."""
+    are contiguous per row. a32 = A bytes per 32 values (see _quant)."""
     CB = C // 32  # micro-blocks per row
     NCH = CB // _MPR
     C8 = CB // 8
     KP64 = C // 128  # 64-byte chunks per packed FP4 row
+    AW = C * a32 // 32 // 4  # A i32 words per row
 
     @flyc.kernel(known_block_size=[BLK, 1, 1])
     def _kern(X: fx.Tensor, OUT: fx.Tensor, SC: fx.Tensor, BIAS: fx.Int32):
@@ -158,12 +162,26 @@ def _build_launch(C, act):
 
         if act:
             words = _cvt_fp6(vf, scale_f32)
-            osrc = _srd_at(OUT, row0 * arith.index(C // 4), 4, fx.Int32(_RPB * C))
-            ow = lr * (C // 4) + c * 8
-            buffer_ops.buffer_store(Vec.from_elements(words[0:4], fx.Int32), osrc, ow)
-            buffer_ops.buffer_store(
-                Vec.from_elements([words[4], words[5], fx.Int32(0), fx.Int32(0)], fx.Int32), osrc, ow + 4
-            )
+            if a32 == 24:
+                # Dense preshuffle, the layout gemm_a6w4 DMAs straight into LDS: rows in
+                # blocks of 64, each block its 128-K tiles back to back, each tile six 1024 B
+                # planes -- the four micro-blocks' low 16 B halves, then their four high 8 B
+                # halves paired. One GEMM cooperative load is one plane of one block.
+                osrc = _srd_at(OUT, arith.index(0), 4, fx.Int32(_NREC_MAX))
+                blk = (r >> 6) * (64 * AW) + (c >> 2) * 1536 + (r & 63) * 4
+                buffer_ops.buffer_store(Vec.from_elements(words[0:4], fx.Int32), osrc, blk + (c & 3) * 256)
+                buffer_ops.buffer_store(
+                    Vec.from_elements(words[4:6], fx.Int32),
+                    osrc,
+                    blk + (4 + ((c & 3) >> 1)) * 256 + (c & 1) * 2,
+                )
+            else:  # FP8-padded: 24 code bytes then 8 zero bytes, in place
+                osrc = _srd_at(OUT, row0 * arith.index(AW), 4, fx.Int32(_RPB * AW * 4))
+                ow = lr * AW + c * 8
+                buffer_ops.buffer_store(Vec.from_elements(words[0:4], fx.Int32), osrc, ow)
+                buffer_ops.buffer_store(
+                    Vec.from_elements([words[4], words[5], fx.Int32(0), fx.Int32(0)], fx.Int32), osrc, ow + 4
+                )
         else:
             words = _cvt_fp4(vf, scale_f32)
             # shuffle_weight_w4(16): byte (n, kb) -> [n/16, kb/64, (kb/16)%4, n%16, kb%16]
@@ -188,29 +206,37 @@ def _build_launch(C, act):
 _COMPILED = {}
 
 
-def _quant(x, act):
+def _quant(x, act, a32=24):
     import torch
 
     r, c = x.shape
     if r % 32 or c % 1024:
         raise ValueError(f"a6w4 quant needs rows % 32 == 0 and K % 1024 == 0, got {tuple(x.shape)}")
-    out = torch.empty(r, c if act else c // 2, dtype=torch.uint8, device=x.device)
+    if act and a32 == 24 and r % 64:
+        a32 = 32  # the dense preshuffle blocks 64 rows; gemm_a6w4 reads the row shape back off A
+    out = torch.empty(r, c * a32 // 32 if act else c // 2, dtype=torch.uint8, device=x.device)
     sc = torch.empty(r * c // 32, dtype=torch.uint8, device=x.device)
     bias = 0 if act else 1 << 21
     gx = (r // _RPB) * (c // 32 // _MPR)
     xi, oi = x.view(torch.int32), out.view(torch.int32)
-    key = (int(c), bool(act))
+    key = (int(c), bool(act), int(a32))
     fn = _COMPILED.get(key)
     if fn is None:
-        fn = flyc.compile(_build_launch(int(c), bool(act)), xi, oi, sc, bias, gx, torch.cuda.current_stream())
+        fn = flyc.compile(
+            _build_launch(int(c), bool(act), int(a32)), xi, oi, sc, bias, gx, torch.cuda.current_stream()
+        )
         _COMPILED[key] = fn
     fn(xi, oi, sc, bias, gx, torch._C._cuda_getCurrentRawStream(x.device.index))
     return out, sc
 
 
-def quant_act_a6w4(x):
-    """bf16 [M, K] contiguous, M % 32 == 0, K % 1024 == 0 -> (FP6 A, shuffled A scales) for gemm_a6w4."""
-    return _quant(x, True)
+def quant_act_a6w4(x, a32=24):
+    """bf16 [M, K] contiguous, M % 32 == 0, K % 1024 == 0 -> (FP6 A, shuffled A scales) for gemm_a6w4.
+
+    a32 = the consumer's A_BYTES_PER_32: 24 for the dense preshuffle the tuned GEMM reads, 32
+    for the FP8-padded row-major form (24 code bytes then 8 zero bytes) the v0 GEMM reads.
+    M % 64 != 0 always returns the padded form; gemm_a6w4 tells the two apart by row length."""
+    return _quant(x, True, a32)
 
 
 def quant_w_a6w4(w):

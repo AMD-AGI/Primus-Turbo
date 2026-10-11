@@ -5574,7 +5574,8 @@ def a6w4_act_dual_eligible(R, C):
 def flydsl_quant_a6w4_act_dual(x_bf16):
     """One read of a bf16 [R, C] activation for both of its A6W4-recipe packs:
       (aq [R, C] uint8, sa [R*C/32] uint8)  the A6W4 fprop operand, the same bytes as
-                                             a6w4_quant.quant_act_a6w4 (E2M3, scale bias 0)
+                                             a6w4_quant.quant_act_a6w4(x, a32=32) (E2M3,
+                                             scale bias 0, FP8-padded packing)
       (co [C, R/2] fp4, cs [C, R/32] e8m0)  the Wgrad col pack, the same bytes as
                                              flydsl_quant_mxfp4_h16_col(x, fp4, 0)
     Requires a6w4_act_dual_eligible(R, C)."""
