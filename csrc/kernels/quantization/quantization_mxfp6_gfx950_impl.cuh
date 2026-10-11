@@ -800,8 +800,9 @@ __device__ __forceinline__ void logical_block(int32_t &bx, int32_t &by) {
 }
 
 // Fp8Tw: one 32-value group as E4M3 at the launch's tensorwise multiplier (no rotation, no per-group scale), stored in
-// the tilescale FP8 planes (see MXPackFmt::Fp8Tw). The group's max |x| feeds the launch amax: read the running value
-// first and take the atomic only when this group exceeds it, so after the first blocks the atomics stop.
+// the tilescale FP8 planes (see MXPackFmt::Fp8Tw). The group's max |x| is maxed into the block's LDS word; the kernel
+// flushes it to the launch amax once per block (tw_amax_flush). One global atomic per group would serialise every
+// group of the launch on one L2 address.
 __device__ __forceinline__ void fp8tw_emit_group(const float (&values)[kGroupSize], const int64_t out_row,
                                                  const int32_t group, uint8_t *__restrict__ packed,
                                                  const mxfp4_emit::TilePackArgs ts) {
@@ -832,9 +833,17 @@ __device__ __forceinline__ void fp8tw_emit_group(const float (&values)[kGroupSiz
     const int64_t p0 = (((out_row >> 4) * nk + s) * 16 + (out_row & 15)) * 64 + g * 16;
     *reinterpret_cast<uint4_t *>(packed + p0)                   = *reinterpret_cast<const uint4_t *>(&w[0]);
     *reinterpret_cast<uint4_t *>(packed + rpad * nk * 64 + p0) = *reinterpret_cast<const uint4_t *>(&w[4]);
-    const uint32_t bits = __builtin_bit_cast(uint32_t, amax);
-    if (bits > __hip_atomic_load(ts.tw_amax, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT))
-        __hip_atomic_fetch_max(ts.tw_amax, bits, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    atomicMax(ts.tw_lds, __builtin_bit_cast(uint32_t, amax));
+}
+
+// End of a block that emitted Fp8Tw rows: every thread has emitted, then one global atomic carries the block's amax.
+__device__ __forceinline__ void tw_amax_flush(const uint32_t *s_amax, uint32_t *tw_amax) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const uint32_t bits = *s_amax;
+        if (bits > __hip_atomic_load(tw_amax, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT))
+            __hip_atomic_fetch_max(tw_amax, bits, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
 }
 
 // One emit per output format. The FP4 formats share mxfp4_emit_group's quantization and
@@ -909,8 +918,17 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
     uint8_t *__restrict__ col_packed, uint8_t *__restrict__ col_scale, float *__restrict__ col_sum,
     const int32_t M, const int32_t N, const int32_t row_nk_pad, const int32_t col_nk_pad,
     const prologue_args_t<DType, PROLOGUE> pargs, const uint32_t sr_seed,
-    const mxfp4_emit::TilePackArgs row_ts, const mxfp4_emit::TilePackArgs col_ts) {
+    const mxfp4_emit::TilePackArgs row_ts_in, const mxfp4_emit::TilePackArgs col_ts) {
     static_assert(TILE_N % kGroupSize == 0, "a staged patch must hold whole groups both ways");
+    // Fp8Tw rows: the block's amax in LDS (zeroed here; every emit runs after a __syncthreads), flushed at the exits
+    constexpr bool      kTw = ROW_FMT == MXPackFmt::Fp8Tw;
+    __shared__ uint32_t s_tw_amax;
+    mxfp4_emit::TilePackArgs row_ts = row_ts_in;
+    if constexpr (kTw) {
+        if (threadIdx.x == 0)
+            s_tw_amax = 0u;
+        row_ts.tw_lds = &s_tw_amax;
+    }
     static_assert(TILE_N <= THREADS_PER_BLOCK,
                   "the column-sum pass assigns one column per thread");
     constexpr bool kQkr = PROLOGUE == MXFP6Prologue::QkNormRopeBackward;
@@ -1161,6 +1179,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                 if (threadIdx.x < TILE_N)
                     col_sum[static_cast<int64_t>(by) * N + tile_n + threadIdx.x] = col_sum_acc;
             }
+            if constexpr (kTw)
+                tw_amax_flush(&s_tw_amax, row_ts.tw_amax);
             return;
         }
     }
@@ -1649,6 +1669,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void quantize_mxfp6_dual_kernel(
                 tile2d ? s_tilemax2d[k_block][local_n / kGroupSize] : -1.0f);
         }
     }
+    if constexpr (kTw)
+        tw_amax_flush(&s_tw_amax, row_ts.tw_amax);
 }
 
 constexpr int ceil_div(const int x, const int m) {
