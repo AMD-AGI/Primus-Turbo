@@ -838,10 +838,9 @@ def flash_attn_fp8_usp_func(
     ulysses_group=None,
     ring_group=None,
 ):
-    # q/k/v are logically [b, s, h, d] in every layout; only their storage differs,
-    # and the Triton FP8 kernel needs it bshd-contiguous.
+    # q/k/v are logically [b, s, h, d] in every layout; only their storage differs.
+    # The A2A packing (combine_qkv_before_a2a) copies any storage into contiguous buffers.
     qkv_format = _infer_qkv_format(q, k, v)
-    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
 
     # Default config: blockwise with block_size=64
     if fp8_config is None:

@@ -587,10 +587,9 @@ def flash_attn_fp8_func(
     return_attn_probs=False,
     fp8_config: Optional[Float8QuantConfig] = None,
 ):
-    # q/k/v are logically [b, s, h, d] in every layout; only their storage differs,
-    # and the Triton FP8 kernel needs it bshd-contiguous.
+    # q/k/v are logically [b, s, h, d] in every layout; only their storage differs.
+    # block_scaling_node repacks any storage into the bshd-contiguous FP8 the kernel reads.
     qkv_format = _infer_qkv_format(q, k, v)
-    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
 
     # Default config: blockwise with block_size=64
     if fp8_config is None:

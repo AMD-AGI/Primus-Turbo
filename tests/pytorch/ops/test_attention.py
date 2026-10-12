@@ -1167,7 +1167,8 @@ def test_attention_fp8(batch, dtype, config, causal):
 
 @pytest.mark.parametrize("qkv_format", ["bshd", "sbhd", "bhsd"])
 @pytest.mark.parametrize("causal", [True, False])
-def test_attention_fp8_strided_layout(qkv_format, causal):
+@pytest.mark.parametrize("return_lse", [False, True])
+def test_attention_fp8_strided_layout(qkv_format, causal, return_lse):
     device = "cuda"
     torch.manual_seed(1234)
     batch, seqlen, num_head_q, num_head_kv, head_dim = 2, 1024, 16, 4, 128
@@ -1189,7 +1190,10 @@ def test_attention_fp8_strided_layout(qkv_format, causal):
     sm_scale = head_dim ** (-0.5)
     o_ref = attention_vanilla_forward_pytorch_ref_impl(query_ref, key_ref, value_ref, sm_scale, causal)
     o_ref.backward(grad_out)
-    o = flash_attn_fp8_func(query, key, value, softmax_scale=sm_scale, causal=causal)
+    o = flash_attn_fp8_func(query, key, value, softmax_scale=sm_scale, causal=causal, return_lse=return_lse)
+    if return_lse:
+        o, lse = o
+        assert lse.dtype == torch.float32 and lse.shape[:2] == (batch, num_head_q)
     o.backward(grad_out)
     torch.cuda.synchronize()
 

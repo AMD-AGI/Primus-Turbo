@@ -81,9 +81,12 @@ def _infer_qkv_format(
     return q_format
 
 
-def _restore_qkv_storage(o: torch.Tensor, qkv_format: str) -> torch.Tensor:
+def _restore_qkv_storage(o, qkv_format: str):
     """Give a bshd-contiguous ``[b, s, h, d]`` output the storage layout ``qkv_format``
-    names, keeping its logical shape ``[b, s, h, d]``."""
+    names, keeping its logical shape ``[b, s, h, d]``. With ``return_lse`` /
+    ``return_attn_probs`` the output is the first element of a tuple; the rest pass through."""
+    if isinstance(o, tuple):
+        return (_restore_qkv_storage(o[0], qkv_format), *o[1:])
     if qkv_format == "sbhd":
         return o.transpose(0, 1).contiguous().transpose(0, 1)
     if qkv_format == "bhsd":
