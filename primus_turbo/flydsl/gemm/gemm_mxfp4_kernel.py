@@ -1514,10 +1514,11 @@ class MfmaScaleFp4:
                 # right, and only a later tile on the same CU reads the previous tile's k=1.
                 L.append(f"s_waitcnt vmcnt({_NPRE}) lgkmcnt(0)")
                 L.append("s_barrier")
-                _vk1 = _NPRE if k1_watermark else 0
                 if not _PSTAGE:
                     L += emit_ds(0, 0)
-                    L.append(f"s_waitcnt vmcnt({_vk1}) lgkmcnt(0)")
+                    # Unstaged, the head phase A refills set1 from buf1 as soon as an operand's
+                    # last MFMA issues, with no watermark in between, so no caller's covers k=1.
+                    L.append("s_waitcnt vmcnt(0) lgkmcnt(0)")
                     L.append("s_barrier")
                 elif not k1_watermark:
                     L.append("s_waitcnt vmcnt(0)")

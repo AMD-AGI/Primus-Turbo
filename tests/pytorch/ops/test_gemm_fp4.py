@@ -63,6 +63,55 @@ def test_gemm_fp4_dense_quant_tail_regression():
     assert compute_snr(reference, actual) > 10
 
 
+def test_gemm_fp4_flydsl_bn192_repeat_calls_bitwise_equal(monkeypatch):
+    """Repeated calls on the 192-wide N tile must return the same bytes (#551).
+
+    The unstaged head read buf1 before the k=1 fill landed, so a later tile on the same CU
+    picked up the previous tile's k=1 block. The corrupted output still clears the 10 dB SNR
+    gates used elsewhere in this file, so the calls are compared bit for bit. No shape above
+    makes the picker choose 192, and its choice depends on the CU count, so the width is forced.
+    On 256 CUs this grid walks three tiles per workgroup, where the race hit nearly every call.
+    """
+    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
+
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    if (props.major, props.minor) != (9, 5):
+        pytest.skip("FlyDSL MXFP4 GEMM requires gfx950")
+
+    from primus_turbo.flydsl.gemm import gemm_mxfp4_kernel as kernel
+
+    monkeypatch.setattr(kernel, "_mxfp4_pick_block_n", lambda M, N, K, glu=False: 192)
+    # The tuned launch is cached per shape, not per tile width.
+    monkeypatch.setattr(kernel, "_MXFP4_CFG_CACHE", {})
+    monkeypatch.setattr(kernel, "_MXFP4_KSPLIT_CACHE", {})
+    torch.manual_seed(20261012)
+    m, n, k = 8192, 9216, 3072
+
+    def quantize(rows):
+        return QuantizedTensor.quantize(
+            torch.randn((rows, k), device="cuda", dtype=torch.bfloat16),
+            torch.float4_e2m1fn_x2,
+            ScalingGranularity.MX_BLOCKWISE,
+            block_size=32,
+            axis=1,
+            scaling_recipe=ScalingRecipe(),
+        )
+
+    qa, qb = quantize(m), quantize(n)
+
+    def call():
+        return kernel.gemm_mxfp4_flydsl_kernel(
+            qa.qdata, qa.scale_inv, qb.qdata, qb.scale_inv, trans_a=False, trans_b=True
+        )
+
+    first = call()
+    for i in range(1, 20):
+        assert torch.equal(call(), first), f"call {i} differs from call 0"
+
+
 # (backend, dtype, preshuffle): AITER is bf16-only and the only backend with preshuffle.
 MX_BACKEND_CONFIGS = [
     (BackendType.AITER, torch.bfloat16, False),
