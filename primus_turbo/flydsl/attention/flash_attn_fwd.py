@@ -22,7 +22,10 @@ the left-windowed path keeps an odd span and pairs it with a two-tile epilogue d
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import const_expr, range_constexpr
+from flydsl.expr import buffer_ops, const_expr, range_constexpr
+from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.utils.arith import ArithValue
+from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
 from primus_turbo.flydsl.utils.attn_helper import (
@@ -59,12 +62,14 @@ def build_flash_attn_dualwave_swp_module(
     gqa_merge=None,
     sbhd=False,
     has_sink=False,
+    save_scaled_q=False,
 ):
     """Build a DUALWAVE_SWP flash_attn launcher for D=64/128 bf16/f16 on gfx950.
 
     Supports dense (SBHD) and varlen packed QKV (THD) layouts. has_sink folds a learned
     per-q-head attention sink (SINK[Hq] fp32) into the online-softmax denominator.
     """
+    assert not save_scaled_q or (sbhd and not varlen and not cross_seqlen and head_dim == 64)
     gpu_arch = get_hip_arch()
 
     if not gpu_arch.startswith("gfx950"):
@@ -119,6 +124,7 @@ def build_flash_attn_dualwave_swp_module(
         BlockTable: fx.Tensor,
         SINK: fx.Tensor,
         ScoreBound: fx.Tensor,
+        ScaledQ: fx.Tensor,
         seq_len: fx.Int32,
         seq_len_kv: fx.Int32,
         stride_q_n: fx.Int32,
@@ -209,6 +215,36 @@ def build_flash_attn_dualwave_swp_module(
 
             q_all_bf16 = ctx.load_all()
             q_all_scaled_bf16 = ctx.scale_all(q_all_bf16)
+            if const_expr(save_scaled_q):
+                # Reuse the exact BF16 operands consumed by QK. Each lane owns
+                # half of one row; merged GQA waves own distinct query heads.
+                qs_rsrc = buffer_ops.create_buffer_resource(
+                    ScaledQ,
+                    max_size=False,
+                    num_records_bytes=_raw(ctx.seq_len_v * ctx.stride_q_n_v * fx.Index(2)),
+                )
+                for ks in range_constexpr(traits.K_STEPS_QK):
+                    value = Vec.from_elements(
+                        [
+                            q_all_scaled_bf16[ks * traits.MFMA_LANE_K + i]
+                            for i in range_constexpr(traits.MFMA_LANE_K)
+                        ],
+                        ctx.elem_dtype,
+                    )
+                    offset = (
+                        ctx.batch_idx * fx.Index(traits.NUM_HEADS_Q * traits.HEAD_DIM)
+                        + ctx.q_gmem_elem_offset
+                        + ctx.q_row_in_block * ctx.stride_q_n_v
+                        + fx.Index(ks * traits.K_STEP_QK)
+                        + ctx.lane_div_32 * fx.Index(traits.MFMA_LANE_K)
+                    )
+                    buffer_ops.buffer_store(
+                        value.ir_value(),
+                        qs_rsrc,
+                        offset * fx.Index(2),
+                        mask=ArithValue(ctx.q_row < ctx.seq_len_v),
+                        offset_is_bytes=True,
+                    )
 
             def _load_k_head(buf_id):
                 if const_expr(split_k_reads):
@@ -870,6 +906,7 @@ def build_flash_attn_dualwave_swp_module(
         BlockTable: fx.Tensor,
         SINK: fx.Tensor,
         ScoreBound: fx.Tensor,
+        ScaledQ: fx.Tensor,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         seq_len_kv: fx.Int32,
@@ -906,6 +943,7 @@ def build_flash_attn_dualwave_swp_module(
             BlockTable,
             SINK,
             ScoreBound,
+            ScaledQ,
             seq_len,
             seq_len_kv,
             stride_q_n,
@@ -956,6 +994,7 @@ def build_flash_attn_dualwave_swp_module(
         block_table_stride,
         sink,
         score_bound,
+        scaled_q,
     ):
         # cu_seqlens_*/block_table/sink are unused kernel-signature placeholders for dense
         # launches / has_sink=False; the kernel only reads them under const_expr(traits.VARLEN
@@ -971,6 +1010,7 @@ def build_flash_attn_dualwave_swp_module(
             O if block_table is None else block_table,
             O if sink is None else sink,
             O if score_bound is None else score_bound,
+            O if scaled_q is None else scaled_q,
             batch_size,
             seq_len,
             seq_len if seq_len_kv is None else seq_len_kv,
@@ -999,6 +1039,7 @@ def build_flash_attn_dualwave_swp_module(
         block_table_stride=None,
         sink=None,
         score_bound=None,
+        scaled_q=None,
         stream=None,
     ):
         args = _fill_defaults(
@@ -1019,11 +1060,12 @@ def build_flash_attn_dualwave_swp_module(
             block_table_stride,
             sink,
             score_bound,
+            scaled_q,
         )
-        # SINK now sits at index 8; the scalar shape/mode args (JIT cache key) start at 9.
+        # Tensor slots end at ScaledQ (index 10); scalar shape args start at 11.
         # has_sink is baked into the module (separate build), so the SINK tensor stays out
         # of the key.
-        key = args[10:] + (stream is None,)
+        key = args[11:] + (stream is None,)
         fn = _compiled.get(key)
         if fn is None:
             if len(_compiled) >= _COMPILED_MAX:
@@ -1052,6 +1094,7 @@ def build_flash_attn_dualwave_swp_module(
         block_table_stride=None,
         sink=None,
         score_bound=None,
+        scaled_q=None,
         stream=None,
     ):
         args = _fill_defaults(
@@ -1072,6 +1115,7 @@ def build_flash_attn_dualwave_swp_module(
             block_table_stride,
             sink,
             score_bound,
+            scaled_q,
         )
         with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
             return flyc.compile(launch_flash_attn_dualwave_swp, *args, fx.Stream(stream))

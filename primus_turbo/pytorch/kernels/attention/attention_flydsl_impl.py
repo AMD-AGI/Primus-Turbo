@@ -130,7 +130,9 @@ def _uniform_shape(cu_seqlens: "torch.Tensor", max_seqlen, total):
 
 
 @functools.lru_cache(maxsize=64)
-def _fwd_module(Hq, Hkv, D, causal, cross_seqlen, emit_lse, window_left, sbhd=False, has_sink=False):
+def _fwd_module(
+    Hq, Hkv, D, causal, cross_seqlen, emit_lse, window_left, sbhd=False, has_sink=False, save_scaled_q=False
+):
     # D in (64,128): stagger-off lifts MFMA utilization, and the raw 8-wave build default
     # halves occupancy. Other head dims keep the build defaults.
     cfg = {}
@@ -148,6 +150,7 @@ def _fwd_module(Hq, Hkv, D, causal, cross_seqlen, emit_lse, window_left, sbhd=Fa
         window_left=window_left,
         sbhd=sbhd,
         has_sink=has_sink,
+        save_scaled_q=save_scaled_q,
         **cfg,
     )
 
@@ -426,23 +429,25 @@ def flash_attn_varlen_flydsl_backward_impl(
     return (dq, dk, dv, dsink) if dsink.numel() else (dq, dk, dv)
 
 
-@_eager_custom_op("primus_turbo::flash_attn_sbhd_flydsl_forward")
-def _sbhd_forward_op(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    window_left: int,
-    return_lse: bool,
-    sink: Optional[torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor]:
+def _sbhd_forward_launch(q, k, v, window_left, return_lse, sink, save_scaled_q=False):
     Sq, B, Hq, D = q.shape
     Skv, _, Hkv, _ = k.shape
     sink = sink.contiguous() if sink is not None else None
 
     mod = _fwd_module(
-        Hq, Hkv, D, True, Sq != Skv, bool(return_lse), window_left, sbhd=True, has_sink=sink is not None
+        Hq,
+        Hkv,
+        D,
+        True,
+        Sq != Skv,
+        bool(return_lse),
+        window_left,
+        sbhd=True,
+        has_sink=sink is not None,
+        save_scaled_q=save_scaled_q,
     )
     out = torch.empty_like(q)
+    scaled_q = torch.empty_like(q) if save_scaled_q else None
     stream = _current_stream()
     # SBHD seq-step strides live in the runtime stride args; the SBHD trait fixes the
     # per-batch base to H*D.
@@ -452,13 +457,49 @@ def _sbhd_forward_op(
         stride_kv_n=B * Hkv * D,
         sink=sink,
         score_bound=_score_bound(k, D),
+        scaled_q=scaled_q if save_scaled_q else None,
         stream=stream,
     )
     lse = torch.empty((B * Sq, Hq) if return_lse else (0,), device=q.device, dtype=torch.float32)
     if return_lse:
         kw["debug_counts"] = lse
     mod(q, k, v, out, B, Sq, **kw)
+    return out, lse, scaled_q
+
+
+@_eager_custom_op("primus_turbo::flash_attn_sbhd_flydsl_forward")
+def _sbhd_forward_op(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    window_left: int,
+    return_lse: bool,
+    sink: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    out, lse, _ = _sbhd_forward_launch(q, k, v, window_left, return_lse, sink)
     return out, lse
+
+
+@_eager_custom_op("primus_turbo::flash_attn_sbhd_flydsl_forward_saved_q")
+def _sbhd_forward_saved_q_op(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    window_left: int,
+    return_lse: bool,
+    sink: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _sbhd_forward_launch(q, k, v, window_left, return_lse, sink, True)
+
+
+@_sbhd_forward_saved_q_op.register_fake
+def _sbhd_forward_saved_q_op_fake(q, k, v, window_left, return_lse, sink):
+    Sq, B, Hq, _ = q.shape
+    return (
+        torch.empty_like(q),
+        q.new_empty((B * Sq, Hq) if return_lse else (0,), dtype=torch.float32),
+        torch.empty_like(q),
+    )
 
 
 @_sbhd_forward_op.register_fake
@@ -477,12 +518,18 @@ def flash_attn_sbhd_flydsl_forward_impl(
     window_size=(-1, -1),
     return_lse=False,
     sink=None,
+    return_scaled_q=False,
 ):
     """SBHD forward: q [Sq,B,Hq,D], k/v [Skv,B,Hkv,D] bf16. No permute/copy -- the kernel
     addresses SBHD via a compile-time trait plus a runtime seq-step stride. Returns O (and
     LSE [B*Sq,Hq] fp32 when ``return_lse``)."""
     Hq, D = q.shape[2], q.shape[3]
     window_left = _check_fwd(q, k, v, softmax_scale, causal, window_size, sink, Hq, D, sbhd=True)
+    if return_scaled_q:
+        assert return_lse and D == 64
+        if q.shape[0] != k.shape[0] or q.shape[0] % 64:
+            raise ValueError("experimental Q caching requires equal, 64-aligned sequence lengths")
+        return _sbhd_forward_saved_q_op(q, k, v, window_left, True, sink)
     out, lse = _sbhd_forward_op(q, k, v, window_left, bool(return_lse), sink)
     return (out, lse) if return_lse else out
 
@@ -499,6 +546,7 @@ def _sbhd_backward_op(
     window_left: int,
     sink: Optional[torch.Tensor],
     deterministic: bool,
+    q_is_scaled: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     Sq, B, Hq, D = q.shape
     Skv, _, Hkv, _ = k.shape
@@ -522,13 +570,16 @@ def _sbhd_backward_op(
         sbhd=True,
         sink=sink,
         deterministic=deterministic,
+        q_is_scaled=q_is_scaled,
     )
     dsink = grads[3] if len(grads) > 3 else lse.new_empty((0,))
     return grads[0], grads[1], grads[2], dsink
 
 
 @_sbhd_backward_op.register_fake
-def _sbhd_backward_op_fake(dout, q, k, v, out, lse, softmax_scale, window_left, sink, deterministic):
+def _sbhd_backward_op_fake(
+    dout, q, k, v, out, lse, softmax_scale, window_left, sink, deterministic, q_is_scaled=False
+):
     dsink_shape = (q.shape[2],) if sink is not None else (0,)
     return (
         torch.empty_like(q),
@@ -550,6 +601,7 @@ def flash_attn_sbhd_flydsl_backward_impl(
     window_size=(-1, -1),
     sink=None,
     deterministic=False,
+    q_is_scaled=False,
 ):
     """SBHD 16x16x32 backward; ``lse`` is [B,Hq,Sq] fp32 natural-log. SBHD is addressed natively,
     with no permute or copy. ``deterministic`` puts dQ on the reproducible split-K path instead of
@@ -559,6 +611,16 @@ def flash_attn_sbhd_flydsl_backward_impl(
         q, k, v, softmax_scale, causal, window_size, sink, Hq, D, sbhd=True
     )
     dq, dk, dv, dsink = _sbhd_backward_op(
-        dout.contiguous(), q, k, v, out, lse, softmax_scale, window_left, sink, bool(deterministic)
+        dout.contiguous(),
+        q,
+        k,
+        v,
+        out,
+        lse,
+        softmax_scale,
+        window_left,
+        sink,
+        bool(deterministic),
+        bool(q_is_scaled),
     )
     return (dq, dk, dv, dsink) if sink is not None else (dq, dk, dv)
