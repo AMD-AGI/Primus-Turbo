@@ -2200,6 +2200,11 @@ def _build_mxfp4_gemm_kernel(
     persist: bool = False,  # let one WG walk several tiles (the caller divides the grid by _TPW)
     block_n: int = 256,  # N tile width; 192 trades tile area for a whole dispatch round
     block_m: int = 256,  # M tile height; the same trade on the other axis
+    # P0/B1b (ANALYZE r3): LoRA rank width folded into this GEMM's own epilogue. 0 = plain
+    # GEMM (default, no behaviour change). ACT/PROBS then carry rank_a [M, rank_seed] /
+    # rank_b [N, rank_seed] (bf16, row-major) instead of being glu-only slots -- see
+    # `_rank_prefetch`/`_rank_consume` below for the mechanism and why it forces _CSTORE off.
+    rank_seed: int = 0,
 ):
     BLOCK_M = block_m
     BLOCK_N = block_n
@@ -2220,7 +2225,13 @@ def _build_mxfp4_gemm_kernel(
     assert not (beta_is_one and ksplit > 1), "split-K accumulates in the host reduce, not the epilogue"
     # const_expr() resolves compile-time branches from LOCALS/params, not reliably from
     # module globals -> alias the per-shape epilogue selection to locals before traced use.
-    _l_taccw = taccw  # autotune-selected per shape (never-regress epilogue variant axis)
+    # TACCW's own win is timed against an UNSEEDED probe (_autotune_mxfp4_config never sees
+    # rank_a/rank_b), so a cached winner can carry taccw=True into a rank-seeded build by
+    # accident. store_tacc_wide needs acc=C^T (the MMA operand swap right below) -- measured:
+    # feeding _rank_consume's plain (non-transposed) row/col addressing a transposed
+    # accumulator drops a shape's rank-term SNR from ~101 dB to ~18 dB. Force it off here too
+    # (not just at the call site) so a rank seed can never combine with it either way.
+    _l_taccw = taccw and not rank_seed  # autotune-selected per shape (never-regress epilogue variant axis)
     _l_tacc = _l_taccw  # TACCW needs the acc=C^T MMA operand swap
     swizzle = True
     assert BLOCK_K % 128 == 0 and K % BLOCK_K == 0
@@ -2229,6 +2240,11 @@ def _build_mxfp4_gemm_kernel(
     assert K % ksplit == 0, f"K={K} not divisible by ksplit={ksplit}"
     K_loop = K // ksplit
     assert K_loop % BLOCK_K == 0, f"K/ksplit={K_loop} not a multiple of {BLOCK_K}"
+    # A rank seed owns the whole accumulator for its one shot at the epilogue -- split-K's
+    # host reduce and beta=1's read-back both add a second contribution the rank term can't
+    # see, so either would silently fold it in twice or not at all.
+    assert not (rank_seed and ksplit > 1), "a rank seed cannot be split-K reduced (adds once per split)"
+    assert not (rank_seed and beta_is_one), "a rank seed already owns the accumulate; beta=1 is for the caller's own C"
 
     NBB = const_expr(2)  # B/SC pool (unroll-2)
     NABUF = const_expr(2)  # A pool (unroll-2)
@@ -2257,6 +2273,11 @@ def _build_mxfp4_gemm_kernel(
         # accumulator's high half as-is: a truncated bf16. The epilogue rounds, so a tile
         # narrower than the pack keeps its store there.
         and (BLOCK_N // 64 == _MXFP4_PACK_ILV)
+        # The folded store's cst_nt path writes straight out of the asm block's own AGPRs
+        # with accL/accR dead (acc_dead=True) -- Python never sees real values to round and
+        # re-seed. A rank seed needs the real post-loop accumulators, so it routes through
+        # the plain StoreCPlain epilogue below instead (see `_rank_prefetch`/`_rank_consume`).
+        and not rank_seed
     )
     # The C store's cache policy follows its destination's lifetime: a final tile is
     # write-once and dead, so `nt` leaves the A/B band resident, while a split-K partial
@@ -2290,7 +2311,24 @@ def _build_mxfp4_gemm_kernel(
     # LDS of its own. The tile count comes from n_pids, so this has to be decided after
     # the decode above is known.
     _PERSIST = _CSTORE or not (glu or dglu or coop or beta_is_one or taccw)
-    _TPW = _mxfp4_tiles_per_wg(n_pids, K, persist and _PERSIST)
+    # round-09: force _TPW=1 for EVERY rank_seed build (not shape-conditional). Mechanism:
+    # `_rank_prefetch` rebuilds `ra_rs`/`rb_rs` (fresh `create_buffer_resource(ACT/PROBS,
+    # max_size=True)`) on every persistent-loop tile; rounds 4/6/7 all localised a correctness
+    # residual on `proj` (naturally _TPW=4) to exactly this tile-boundary reuse, and NEVER on
+    # `qkv` (naturally _TPW=1, where this code path is simply never reached). Two independent
+    # repeated-launch diagnostics already pointed here before this round touched any code:
+    # round-06's H5 (`km._mxfp4_tiles_per_wg = lambda *_: 1` on round-05's LDS-staged variant)
+    # measured 0/400 bad vs ~1.1% at natural _TPW=4; round-08's own garbage-operand probe (on
+    # this exact champion mechanism, before its B2 work was reverted) found the unmasked
+    # rank-seeded kernel differs 3.10% between its TPW=4 and TPW=1 compiles, while a TPW=1-vs-
+    # TPW=1 comparison came back bit-exact (0/67,108,864). Forcing TPW=1 removes the hazard's
+    # only precondition (a second tile ever sharing a workgroup with the first) instead of
+    # fencing around it the way round-07's added `vmcnt(0)` did (measured there: 5.52% -> 4.48%,
+    # a partial drain, not a removal). This is a different, earlier-round finding than the
+    # `_rank_prefetch`/`_rank_consume` load-placement fix (round-04's own note a few lines below
+    # that "forcing _TPW=1 did not remove it" refers to: that was the *original* post-asm-load
+    # hazard, fixed by relocating the loads before `_fill`/`_compute`, not this tile-boundary one).
+    _TPW = 1 if const_expr(rank_seed) else _mxfp4_tiles_per_wg(n_pids, K, persist and _PERSIST)
     N_TILES_BH = LDS_BN_HALF // 32  # 4: wave_n covers 64 N-cols/slice
     assert not glu or (glu_i > 0 and not beta_is_one and ksplit == 1 and not coop and not taccw)
     assert not glu or (mn is not None and mn[1] == glu_i), "glu needs mn=(M, I)"
@@ -2937,6 +2975,108 @@ def _build_mxfp4_gemm_kernel(
             store_c.store(accL, base_row, base_col_l, n_valid=_nv)
             store_c.store(accR, base_row, base_col_r, n_valid=_nv)
 
+        def _rank_prefetch(o, _split=None):
+            """P0/B1b (ANALYZE r3), round-04 structural diagnostic: load this tile's
+            rank_a/rank_b fragments BEFORE `_fill`/`_compute` run -- i.e. before the K-loop's
+            opaque inline-asm block -- instead of after it. round-04's repeated-same-kernel
+            probe measured intermittent corruption (same compiled kernel, same data, ~1-in-3
+            to ~1-in-2 launches) when these loads sat right after that asm block, and neither
+            a bare vmcnt(0), a memory-clobbered vmcnt(0), a full vmcnt(0)+lgkmcnt(0)+s_barrier
+            drain (x1 or x2), nor 8x s_nop 15 pipeline-settling pad removed it -- see
+            `_rank_consume` for the measured-ineffective mitigations kept as comments there.
+            Addressing reuses `_cbase`'s own base_row/base_col so it tracks the store exactly.
+            """
+            _R = const_expr(rank_seed)
+            assert _R == 16, "operand load below is hardcoded to 4 lane-groups x 4 R-values"
+            # Built fresh per tile, not hoisted above the persistent loop: round-04 measured that
+            # hoisting these so they stay live across multiple (_TPW) K-loop asm invocations turns
+            # the rare (~2%) residual hazard into a deterministic, 100%-reproducible one (proj,
+            # consistent ~2.09M/67.1M mismatches, 26.88 dB) -- the opaque asm block does not appear
+            # to leave registers safe to hold a value live across more than one of its invocations.
+            base_row, base_col_l, base_col_r = _cbase(o, _split)
+            ra_rs = buffer_ops.create_buffer_resource(ACT, max_size=True)
+            rb_rs = buffer_ops.create_buffer_resource(PROBS, max_size=True)
+            lm = umod(lane_id, 16)  # MFMA operand row-select (A: hs row; B: lora_b row)
+            lk = udiv(lane_id, 16) * fx.Int32(4)  # this lane's 4-wide slice of the R=16 axis
+
+            def _ld4(rs, row):
+                off = row * fx.Int32(_R) + lk
+                v = buffer_ops.buffer_load(rs, off, vec_width=4, dtype=fx.BFloat16.ir_type)
+                # v_mfma_*bf16_1k's A/B operands are declared i16x4 at the dialect binding
+                # (unlike the plain, non-"_1k" bf16 MFMA, which takes the bf16 vector as-is).
+                return _raw(Vec(v).bitcast(fx.Int16))
+
+            bf_l = [_ld4(rb_rs, base_col_l + fx.Int32(tj * 16) + lm) for tj in range_constexpr(N_TILES_BH)]
+            bf_r = [_ld4(rb_rs, base_col_r + fx.Int32(tj * 16) + lm) for tj in range_constexpr(N_TILES_BH)]
+            a_all = [_ld4(ra_rs, base_row + fx.Int32(ti * 16) + lm) for ti in range_constexpr(N_TILES_A)]
+            _lds_barrier(vmcnt=0)
+            return a_all, bf_l, bf_r
+
+        def _rank_consume(accL, accR, _pref):
+            """P0/B1b (ANALYZE r3): fold the prefetched LoRA rank-16 adapter product into
+            this GEMM's own accumulator, reproducing production's rounding order
+            bf16(bf16(base)+rank) bit-for-bit. r3's B1-as-built seeded the pre-loop fp32
+            accumulator instead, which computes bf16(base_fp32+rank) -- one rounding instead
+            of two, -2.74 dB SNR against the production reference. The fix rounds AFTER the
+            loop: narrow each 4-wide accumulator fragment to bf16 and back (the exact
+            narrowing `StoreCPlain` would apply at store time), then run ONE
+            v_mfma_f32_16x16x16bf16_1k per 16x16 sub-block with that rounded fragment as the
+            MFMA's own accumulate-into operand -- the add is the MFMA's, not a separate VALU
+            pass -- and let the store right after this apply production's second (and only
+            other) rounding, same as an unseeded call. Only reached when rank_seed forced
+            _CSTORE off above, so accL/accR are the real per-lane accumulators `StoreCPlain`
+            would otherwise consume directly, not the folded store's dead return
+            (acc_dead=True).
+
+            The sub-block MFMA *input* operand layout (row = lane % 16, four consecutive rank
+            columns at 4 * (lane // 16)) is the standard v_mfma_*bf16_1k operand map and is
+            unrelated to the *accumulator* layout `_store_rowaddr` uses -- the two are
+            independent by the ISA, not a copy-paste of the same formula.
+
+            Measured-ineffective mitigations tried in round-04 for the corruption this
+            replaced (all on the "loads right after the opaque K-loop asm" placement, same
+            compiled kernel + same data, failing on ~1-in-3 to ~1-in-2 repeated launches):
+            a bare `s_waitcnt vmcnt(0)` inline-asm; the same with a `~{memory}` clobber
+            (mega/fp8/prims.py's `_wait_mem` idiom); `_lds_barrier(vmcnt=0)` once and twice
+            back to back (the project's own trusted full vmcnt(0)+lgkmcnt(0)+s_barrier
+            drain -- `_store`'s dglu/glu_act_quant epilogues call it twice too); and 8x
+            `s_nop 15` pipeline-settling pad before touching any new SGPR/VGPR. Forcing
+            `_TPW` (persistent tiles-per-workgroup) to 1 also did not remove it, ruling out a
+            cross-tile-within-one-workgroup interaction. `_rank_prefetch` moving the loads to
+            before `_fill`/`_compute` is the next lever, isolating whether the corruption is
+            specific to this placement (immediately after the opaque asm) rather than any
+            property of the loads or the MFMA-consume sequence themselves."""
+            acc_ty = ir.VectorType.get([4], T.f32)
+            a_all, bf_l, bf_r = _pref
+            # Round-04: moving the loads before _fill/_compute cut the measured corruption rate
+            # from ~40-50% of launches to ~2-3% (same probe, same data, fresh compiles), but did
+            # not remove it -- the remainder has a different signature (the hs==0 idempotence
+            # check stays clean; only the real-data SNR occasionally drops), consistent with a
+            # hazard at this consume step itself (still positioned right after the opaque K-loop
+            # asm) rather than at the vmem loads. Drain here too before reading any pre-loaded
+            # value back, on the chance the hazard is any post-asm register read, not only a
+            # freshly-issued one.
+            _lds_barrier(vmcnt=0)
+            _lds_barrier(vmcnt=0)
+
+            def _half(acc, bf):
+                out = list(acc)
+                for ti in range_constexpr(N_TILES_A):
+                    a_i = a_all[ti]
+                    for tj in range_constexpr(N_TILES_BH):
+                        idx = mfma.idx(ti, tj)
+                        base_v = Vec(acc[idx])
+                        rounded = Vec.from_elements(
+                            [base_v[i].to(fx.BFloat16).to(fx.Float32) for i in range_constexpr(4)],
+                            fx.Float32,
+                        )
+                        out[idx] = Vec(
+                            rocdl.mfma_f32_16x16x16bf16_1k(acc_ty, [a_i, bf[tj], _raw(rounded), 0, 0, 0])
+                        )
+                return out
+
+            return _half(accL, bf_l), _half(accR, bf_r)
+
         def _split_shift(o, _split):
             # add this split's K-start to the A/B operand gmem offsets (row stride full-K).
             bm, bn, a_off, bl_off, br_off, sa_b, sbl_b, sbr_b = o
@@ -2953,8 +3093,12 @@ def _build_mxfp4_gemm_kernel(
             _tile = umod(_bid, _ntile)
             _split = udiv(_bid, _ntile)
             o = _split_shift(_offs(_tile), _split)
+            if const_expr(rank_seed):
+                _rank_pref = _rank_prefetch(o, _split)
             _fill(o)
             accL, accR = _compute(o, _split)
+            if const_expr(rank_seed):
+                accL, accR = _rank_consume(accL, accR, _rank_pref)
             if const_expr(glu) or const_expr(not _CSTORE):
                 _store(o, accL, accR, _split)
         else:
@@ -2969,8 +3113,12 @@ def _build_mxfp4_gemm_kernel(
                     _lds_barrier()  # the next fill overwrites the ring the last tile just read
                     _pid0 = _pid0 + fx.Int32(_NTILE // _TPW)
                 o = _offs(_pid0)
+                if const_expr(rank_seed):
+                    _rank_pref = _rank_prefetch(o)
                 _fill(o)
                 accL, accR = _compute(o)
+                if const_expr(rank_seed):
+                    accL, accR = _rank_consume(accL, accR, _rank_pref)
                 if const_expr(glu) or const_expr(not _CSTORE):
                     _store(o, accL, accR)
 
@@ -3607,6 +3755,7 @@ def _compile_mxfp4_fused(
     prepacked=False,  # caller supplies scales already in the packed layout: skip the repack
     block_n=256,  # N tile width (see _mxfp4_pick_block_n); sets B's packed scale group too
     block_m=256,  # M tile height (see _mxfp4_pick_block_m); sets A's packed scale group too
+    rank_seed=0,  # P0/B1b: LoRA rank width folded into the GEMM epilogue; 0 = plain GEMM
 ):
     """Turbo/mxfp8-style fused @flyc.jit stub: ONE host dispatch enqueues the A scale
     preshuffle, the B scale preshuffle, then the NT GEMM on the same stream (no separate
@@ -3646,6 +3795,7 @@ def _compile_mxfp4_fused(
         persist=True,
         block_n=block_n,
         block_m=block_m,
+        rank_seed=rank_seed,
     )
     pre_ab = _build_mxfp4_preshuffle_kernel_ab(
         b_ilv=_bilv,
@@ -4009,6 +4159,7 @@ def _get_mxfp4_fused_launch(
     prepacked=False,
     block_n=256,
     block_m=256,
+    rank_seed=0,  # P0/B1b: LoRA rank width folded into the GEMM epilogue; 0 = plain GEMM
 ):
     lk = (
         K,
@@ -4038,6 +4189,7 @@ def _get_mxfp4_fused_launch(
         epi_activation,
         epi_clamp_limit,
         prepacked,
+        rank_seed,
     )
     launch = _MXFP4_LAUNCH_CACHE.get(lk)
     if launch is None:
@@ -4069,6 +4221,7 @@ def _get_mxfp4_fused_launch(
             epi_activation=epi_activation,
             epi_clamp_limit=epi_clamp_limit,
             prepacked=prepacked,
+            rank_seed=rank_seed,
         )
         _MXFP4_LAUNCH_CACHE[lk] = launch
     return launch
@@ -4360,6 +4513,11 @@ def gemm_mxfp4_flydsl_kernel(
     out: "torch.Tensor | None" = None,
     scales_prepacked: bool = False,
     k: "int | None" = None,
+    # P0/B1b (ANALYZE r3): fold a LoRA rank-R adapter product into this GEMM's own epilogue,
+    # out = bf16(bf16(a @ b^T) + rank_a @ rank_b^T) -- production's own rounding order, bit
+    # for bit. rank_a is [M, R] bf16, rank_b is [N, R] bf16 (same R on both; R must be 16).
+    rank_a: "torch.Tensor | None" = None,
+    rank_b: "torch.Tensor | None" = None,
 ) -> torch.Tensor:
     """MXFP4 dense NT GEMM for gfx950: A [M, K] and B [N, K] fp4, C = a @ b^T, M/N/K on 64.
     The contraction comes from ``a_scale``/``b_scale`` (canonical E8M0, [dim, K/32]) and the
@@ -4402,6 +4560,25 @@ def gemm_mxfp4_flydsl_kernel(
     # A mid-tile M is already bounded by num_records and the store band; a mid-tile N needs n_tail's column drop.
     assert M % 64 == 0, f"M must be a multiple of 64, got {M}"
     assert N % 64 == 0, f"N must be a multiple of 64, got {N}"
+
+    # A packed-scale caller's fused stub has no ACT/PROBS slot at all (nothing to repack,
+    # nothing to fuse) -- fail loudly rather than silently drop the rank term.
+    assert not (scales_prepacked and rank_a is not None), "rank folding needs canonical (unpacked) scales"
+    _rank_seed = 0
+    if rank_a is not None:
+        assert beta == 0.0, "rank folding already owns the accumulate; beta=1.0 is for the caller's own C"
+        assert rank_b is not None, "rank_a was given without rank_b"
+        assert rank_a.dim() == 2 and rank_b.dim() == 2, "rank_a/rank_b must be 2D [rows, R]"
+        assert rank_a.shape[0] == M and rank_b.shape[0] == N, (
+            f"rank_a/rank_b rows must be M={M}/N={N}, got {rank_a.shape[0]}/{rank_b.shape[0]}"
+        )
+        assert rank_a.shape[1] == rank_b.shape[1], "rank_a/rank_b must share the same rank width"
+        assert rank_a.dtype == torch.bfloat16 and rank_b.dtype == torch.bfloat16, "rank_a/rank_b must be bf16"
+        assert rank_a.is_contiguous() and rank_b.is_contiguous(), (
+            "rank_a/rank_b are read as flat row-major [rows, R] buffers; a non-contiguous "
+            "view would address the wrong elements"
+        )
+        _rank_seed = rank_a.shape[1]
 
     stream = torch.cuda.current_stream()
     # Fused (turbo/mxfp8-style) path: a single @flyc.jit stub enqueues the A+B scale preshuffle
@@ -4451,7 +4628,10 @@ def gemm_mxfp4_flydsl_kernel(
         if scales_prepacked:
             # The packed stub has no ACT/PROBS in its signature: it never fuses a glu epilogue.
             return (a8, b8, target, a_sp, b_sp, M, N, stream)
-        return (a8, b8, target, a_raw, b_raw, a_sp, b_sp, M, N, target, target, stream)
+        # P0/B1b: a rank seed rides the same ACT/PROBS slots the glu epilogue would use.
+        act = rank_a if _rank_seed else target
+        probs = rank_b if _rank_seed else target
+        return (a8, b8, target, a_raw, b_raw, a_sp, b_sp, M, N, act, probs, stream)
 
     # Both autotunes launch the GEMM dozens of times. Against a beta=1 build that would
     # fold every one of them into the caller's buffer, so tuning runs the beta=0 build
@@ -4494,6 +4674,12 @@ def gemm_mxfp4_flydsl_kernel(
             # a later re-tune picking a twin, so the packed path pins them off, the same way
             # a split already does.
             _tw = _coop = False
+        if _rank_seed:
+            # TACCW's winning-twin cache is shared with the unseeded build (timed on an
+            # unseeded probe) and stores acc=C^T; _rank_consume's addressing assumes the
+            # plain (non-transposed) layout, so a cached TACCW win must not reach it here
+            # (_build_mxfp4_gemm_kernel forces this too -- belt and suspenders).
+            _tw = False
         launch = _get_mxfp4_fused_launch(
             Kw,
             gm,
@@ -4512,9 +4698,28 @@ def gemm_mxfp4_flydsl_kernel(
             mn=_mxfp4_mn_specialise(M, N, _bn, _bm),
             block_n=_bn,
             block_m=_bm,
+            rank_seed=_rank_seed,
         )
         # row_bytes must be in the artifact key too: one logical shape, two allocations, two kernels.
-        at_key = (M, N, K, _row_b, gm, xcd, gn, _wlv, _elgk, _tw, _coop, out_fp16, accum, scales_prepacked)
+        # rank_seed too: it is a closure-captured literal baked into an identically-sourced
+        # kernel body, which an unrelated (shape-only) key would alias against the plain build.
+        at_key = (
+            M,
+            N,
+            K,
+            _row_b,
+            gm,
+            xcd,
+            gn,
+            _wlv,
+            _elgk,
+            _tw,
+            _coop,
+            out_fp16,
+            accum,
+            scales_prepacked,
+            _rank_seed,
+        )
         fused_args = _args_for(target)
         entry = _MXFP4_AT_CACHE.get(at_key)
         if entry is None:
@@ -4768,7 +4973,10 @@ def gemm_mxfp4_flydsl_kernel(
         return (_exec_split, _exec_tail, _exec_ntail)[mode - 1](s, target, accum)
 
     _kskey = (M, N, K, _row_b, out_fp16, scales_prepacked)
-    ks = (0, 1) if K != Kw else _MXFP4_KSPLIT_CACHE.get(_kskey)
+    # A rank seed only exists on the plain path (_exec_split/_exec_tail/_exec_ntail have no
+    # ACT/PROBS to carry it, and the race below picks its mode from a cache keyed on shape
+    # alone, which a seeded call would otherwise collide with an unseeded one's answer).
+    ks = (0, 1) if (K != Kw or _rank_seed) else _MXFP4_KSPLIT_CACHE.get(_kskey)
     if ks is None:
         cands = _ksplit_candidates(M, N, K, _bn, _bm)
         if scales_prepacked:
