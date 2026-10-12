@@ -28,6 +28,8 @@ from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     F8_FWD_MAX,
     attention_triton_backward_impl,
     attention_triton_forward_impl,
+    dense_backward,
+    dense_forward,
 )
 from primus_turbo.pytorch.kernels.attention.sparse_mla_impl import (
     SparseMlaBwdDispatcher,
@@ -65,6 +67,7 @@ from tests.pytorch.ops.gluon_helper import (  # noqa: F401
 )
 from tests.pytorch.ref.attention_ref import (
     AttnConfig,
+    _construct_local_mask,
     attention_vanilla_forward_pytorch_ref_impl,
     attention_with_sink_ref_impl,
 )
@@ -1245,6 +1248,7 @@ def test_attention_fp8_with_sparse_do(batch, config, causal):
         -1,
         None,
         False,
+        None,
     )
 
     dq_fp8, dk_fp8, dv_fp8 = attention_triton_backward_impl(
@@ -1271,6 +1275,7 @@ def test_attention_fp8_with_sparse_do(batch, config, causal):
         -1,
         None,
         True,
+        None,
     )
 
     dq_snr = compute_snr(dq, dq_fp8)
@@ -1813,3 +1818,70 @@ def test_triton_dense_backend_matches_the_reference(causal, dtype):
     assert compute_snr(qr.grad, q.grad.float()) > 40.0
     assert compute_snr(kr.grad, k.grad.float()) > 40.0
     assert compute_snr(vr.grad, v.grad.float()) > 40.0
+
+
+def _lse_ref(q, k, sm_scale, causal, sink=None):
+    """fp32 logsumexp of the scaled scores, [B, Hq, Sq], causal bottom-right aligned."""
+    seqlen_q, seqlen_k = q.shape[1], k.shape[1]
+    k = k.float().repeat_interleave(q.shape[2] // k.shape[2], dim=2)
+    scores = torch.einsum("bthd,bshd->bhts", q.float() * sm_scale, k)
+    if causal:
+        mask = _construct_local_mask(seqlen_q, seqlen_k, (-1, 0), q.device)
+        scores = scores.masked_fill(mask, float("-inf"))
+    if sink is not None:
+        scores = torch.cat([scores, sink.float().view(1, -1, 1, 1).expand(*scores.shape[:3], 1)], dim=-1)
+    return torch.logsumexp(scores, dim=-1)
+
+
+@pytest.mark.parametrize(("seqlen_q", "seqlen_kv"), [(100, 100), (36, 300), (192, 192)])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("enable_sink", [False, True])
+def test_triton_dense_kernel_lse_and_grads(seqlen_q, seqlen_kv, causal, enable_sink):
+    """The Triton kernels themselves, on any arch, including seqlens that are not a whole
+    number of BLOCK_M rows -- the case the old [B, Hq, 2 * Sq] LSE/delta scratch, interleaved
+    per BLOCK_M, got wrong: its ragged tail dropped delta or wrote it over the next head's LSE."""
+    b, hq, hkv, d = 2, 4, 2, 64
+    sm_scale = d**-0.5
+    torch.manual_seed(0)
+    q = torch.randn(b, seqlen_q, hq, d, device="cuda", dtype=torch.bfloat16)
+    k, v = (torch.randn(b, seqlen_kv, hkv, d, device="cuda", dtype=torch.bfloat16) for _ in range(2))
+    do = torch.randn_like(q)
+    sink = torch.randn(hq, device="cuda", dtype=torch.float32) if enable_sink else None
+
+    out, lse = dense_forward(q, k, v, sm_scale, causal, sink=sink)
+    assert lse.shape == (b, hq, seqlen_q)
+    torch.testing.assert_close(lse, _lse_ref(q, k, sm_scale, causal, sink), atol=1e-4, rtol=1e-4)
+    dq, dk, dv, dsink = dense_backward(do, q, k, v, out, lse, sm_scale, causal, sink=sink)
+
+    qr, kr, vr = (t.float().requires_grad_(True) for t in (q, k, v))
+    sink_ref = sink.clone().requires_grad_(True) if enable_sink else None
+    out_ref = attention_with_sink_ref_impl(qr, kr, vr, sink_ref, sm_scale, causal)
+    out_ref.backward(do.float())
+
+    assert compute_snr(out_ref, out.float()) > 40.0
+    for name, ref, got in (("dq", qr.grad, dq), ("dk", kr.grad, dk), ("dv", vr.grad, dv)):
+        snr = compute_snr(ref, got.float())
+        assert snr > 40.0, f"{name} snr {snr:.2f}"
+    if enable_sink:
+        torch.testing.assert_close(dsink, sink_ref.grad, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_attention_fp8_return_lse(causal):
+    """return_lse hands back the [B, Hq, Sq] LSE, and the backward leaves it as it was."""
+    b, s, hq, hkv, d = 2, 256, 8, 2, 128
+    sm_scale = d**-0.5
+    torch.manual_seed(0)
+    q = torch.randn(b, s, hq, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k, v = (
+        torch.randn(b, s, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True) for _ in range(2)
+    )
+
+    out, lse = flash_attn_fp8_func(q, k, v, softmax_scale=sm_scale, causal=causal, return_lse=True)
+    assert lse.shape == (b, hq, s) and lse.dtype == torch.float32
+    lse_snr = compute_snr(_lse_ref(q.detach(), k.detach(), sm_scale, causal), lse)
+    assert lse_snr > 40.0, f"lse snr {lse_snr:.2f}"
+
+    lse_before = lse.clone()
+    out.backward(torch.randn_like(out))
+    assert torch.equal(lse, lse_before)
