@@ -29,6 +29,7 @@ from typing import Optional, Tuple
 import torch
 from torch.distributed import ProcessGroup
 
+from primus_turbo.flydsl.mega.bf16.dispatch_prologue_kernel import DispatchHandle
 from primus_turbo.flydsl.utils.glu_activation import GLUActivation
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.kernels.fused_mega_moe import (
@@ -87,7 +88,7 @@ class FusedMegaMoEFunction(torch.autograd.Function):
             ctx.set_materialize_grads(False)
 
             # fused MoE forward: dispatch grouped L1 GEMM (NT) + SwiGLU + grouped L2 GEMM combine (NT)
-            y, l1_out, dispatch_weights_in_buf, handle = fused_mega_moe_forward_impl(
+            y, l1_out, dispatch_weights, handle = fused_mega_moe_forward_impl(
                 x,
                 w1,
                 w2,
@@ -101,9 +102,6 @@ class FusedMegaMoEFunction(torch.autograd.Function):
 
             # stash everything backward needs
             if any(ctx.needs_input_grad):
-                # clone before a later layer overwrites the shared buffer
-                dispatch_weights_in_buf = dispatch_weights_in_buf.clone()
-
                 ctx.group = group
                 ctx.activation = activation
                 ctx.num_tokens = num_tokens
@@ -111,7 +109,7 @@ class FusedMegaMoEFunction(torch.autograd.Function):
                 ctx.save_for_backward(
                     x,
                     l1_out,
-                    dispatch_weights_in_buf,
+                    dispatch_weights,
                     w1,
                     w2,
                     topk_idx,
@@ -127,15 +125,15 @@ class FusedMegaMoEFunction(torch.autograd.Function):
             # grad_y is None when the output got no grad
             if grad_y is None:
                 return (None,) * 7
-            saved_x, l1_out, dispatch_weights_in_buf, w1, w2, topk_idx, *handle = ctx.saved_tensors
-            handle = tuple(handle)
+            saved_x, l1_out, dispatch_weights, w1, w2, topk_idx, *handle = ctx.saved_tensors
+            handle = DispatchHandle(*handle)
 
             # fused MoE backward: L2 dgrad (nn) + SwiGLU^T + dW2 + L1 dgrad combine (nn) + dW1 (tn)
             dx, grad_topk_weights, dW1, dW2 = fused_mega_moe_backward_impl(
                 grad_y,
                 saved_x,
                 l1_out,
-                dispatch_weights_in_buf,
+                dispatch_weights,
                 w1,
                 w2,
                 topk_idx,
@@ -192,6 +190,7 @@ class FusedMegaMoEStage1Function(torch.autograd.Function):
                 f"x must be 2D bf16 CUDA, got {tuple(x.shape)}/{x.dtype}"
             )
             assert w1.is_cuda and w1.dim() == 3, "w1 must be a 3D CUDA tensor"
+            topk_idx = topk_idx.to(torch.int64)
 
             l1_out, dispatch_weights, handle = fused_mega_moe_stage1_forward_impl(
                 x, w1, group, topk_idx, topk_weights
@@ -251,16 +250,17 @@ class FusedMegaMoEStage2Function(torch.autograd.Function):
     ) -> torch.Tensor:
         with torch.profiler.record_function("fused_mega_moe_stage2_forward"):
             assert w2.is_cuda and w2.dim() == 3, "w2 must be a 3D CUDA tensor"
-            handle = tuple(handle)
+            topk_idx = topk_idx.to(torch.int64)
+            handle = DispatchHandle(*handle)
 
-            y = fused_mega_moe_stage2_forward_impl(l1_out, w2, handle, topk_idx, topk_weights, activation)
+            y = fused_mega_moe_stage2_forward_impl(l1_out, w2, handle, topk_idx, dispatch_weights, activation)
 
             ctx.set_materialize_grads(False)
             if any(ctx.needs_input_grad):
                 ctx.group = group
                 ctx.activation = activation
                 ctx.handle = handle
-                # dispatch_weights is unused in forward; saved only as the SwiGLU^T scale in backward
+                # dispatch_weights scales the SwiGLU output in forward and is its SwiGLU^T scale in backward
                 ctx.save_for_backward(l1_out, dispatch_weights, w2)
             return y
 
@@ -269,10 +269,9 @@ class FusedMegaMoEStage2Function(torch.autograd.Function):
     def backward(ctx, grad_y: Optional[torch.Tensor]):
         """grad l1_out (via L2 dgrad + SwiGLU^T) + dW2; grad_gate rides the dispatch_weights slot."""
         with torch.profiler.record_function("fused_mega_moe_stage2_backward"):
-            handle = ctx.handle
-            n_in = 7 + len(handle)
             if grad_y is None:
-                return (None,) * n_in
+                return (None,) * len(ctx.needs_input_grad)
+            handle = ctx.handle
             l1_out, dispatch_weights, w2 = ctx.saved_tensors
 
             grad_l1, grad_gate, dW2 = fused_mega_moe_stage2_backward_impl(
@@ -306,13 +305,13 @@ def fused_mega_moe_stage1(
     :func:`fused_mega_moe_stage2`.
     """
     l1_out, dispatch_weights, *handle = FusedMegaMoEStage1Function.apply(x, topk_idx, topk_weights, w1, group)
-    return l1_out, dispatch_weights, tuple(handle)
+    return l1_out, dispatch_weights, DispatchHandle(*handle)
 
 
 def fused_mega_moe_stage2(
     l1_out: torch.Tensor,
     dispatch_weights: torch.Tensor,
-    handle: tuple,
+    handle: DispatchHandle,
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
     w2: torch.Tensor,
@@ -323,6 +322,7 @@ def fused_mega_moe_stage2(
 
     Stage2 owns the gated activation, so ``activation`` (``None`` = SiLU-SwiGLU) is given here only.
     """
+    # topk_weights stays for API compatibility; stage2 gets the routing weights through dispatch_weights
     return FusedMegaMoEStage2Function.apply(
         l1_out, dispatch_weights, topk_idx, topk_weights, w2, group, activation, *handle
     )

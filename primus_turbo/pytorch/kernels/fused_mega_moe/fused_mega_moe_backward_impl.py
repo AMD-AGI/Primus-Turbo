@@ -15,6 +15,7 @@ from primus_turbo.flydsl.mega import (
     dispatch_grouped_gemm_bf16_flydsl_kernel,
     grouped_gemm_combine_bf16_flydsl_kernel,
 )
+from primus_turbo.flydsl.mega.bf16.dispatch_prologue_kernel import DispatchHandle
 from primus_turbo.flydsl.mega.bf16.grouped_gemm_bf16_kernel import (
     grouped_gemm_bf16_variable_k_flydsl_kernel,
 )
@@ -33,14 +34,6 @@ from primus_turbo.pytorch.core.backend import (
 )
 
 _SUPPORTED_DTYPES = (torch.bfloat16,)
-
-# dispatch handle layout (see dispatch_prologue return + pool_src_slot snapshot):
-# 0-5 send/dispatch tables + tile_to_expert, 6 real_count_per_expert,
-# 7 num_tokens_per_expert_prefix, 8 num_tile_blocks, 9-11 combine_recv_*, 12 pool_src_slot.
-_HANDLE_LEN = 13
-_H_NUM_TILE_BLOCKS = 8
-_H_REAL_COUNT_PER_EXPERT = 6
-_H_NUM_TOKENS_PER_EXPERT_PREFIX = 7
 
 
 class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
@@ -64,7 +57,7 @@ class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
         grad_y: torch.Tensor,
         saved_x: torch.Tensor,
         l1_out: torch.Tensor,
-        dispatch_weights_in_buf: torch.Tensor,
+        dispatch_weights: torch.Tensor,
         w1: torch.Tensor,
         w2: torch.Tensor,
         topk_idx: torch.Tensor,
@@ -75,23 +68,15 @@ class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
         activation: Optional[List[float]] = None,
         **kwargs,
     ):
-
-        # ABI guard: catch a kernel return-order change loudly.
-        assert len(handle) == _HANDLE_LEN, f"dispatch handle len {len(handle)} != {_HANDLE_LEN}; ABI changed"
-        real_count_per_expert = handle[_H_REAL_COUNT_PER_EXPERT]
-        num_tokens_per_expert_prefix = handle[_H_NUM_TOKENS_PER_EXPERT_PREFIX]
-        in_handle = tuple(handle)
-
-        # int64 end-to-end (combine reads topk i64)
-        topk_idx = topk_idx.to(torch.int64)
+        handle = DispatchHandle(*handle)
         dy = grad_y.contiguous().to(torch.bfloat16)
 
         # L2 dgrad: cross-rank dispatch PUSH + grouped GEMM (nn)
-        grad_swiglu, dispatch_l2_grad, _, _ = dispatch_grouped_gemm_bf16_flydsl_kernel(
+        grad_swiglu, dispatch_l2_grad, _ = dispatch_grouped_gemm_bf16_flydsl_kernel(
             dy,
             w2,
             group,
-            handle=in_handle,
+            handle=handle,
             layout="nn",
         )
 
@@ -99,20 +84,21 @@ class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
         grad_l1, grad_gate, act_weighted = swiglu_backward_flydsl_kernel(
             grad_swiglu,
             l1_out,
-            scale=dispatch_weights_in_buf,
+            scale=dispatch_weights,
             return_gate=True,
             return_act_w=True,
             # bound by THIS handle's tile count (per-forward, not shared symm)
-            num_tile_blocks=handle[_H_NUM_TILE_BLOCKS],
+            num_tile_blocks=handle.num_tile_blocks,
             activation=activation,
         )
 
         dW2 = grouped_gemm_bf16_variable_k_flydsl_kernel(
             dispatch_l2_grad,
             act_weighted,
-            num_tokens_per_expert_prefix,
-            masked_k=real_count_per_expert,
+            handle.num_tokens_per_expert_prefix,
+            masked_k=handle.num_tokens_per_expert,
             trans_c=False,
+            a_row_idx=handle.pool_row_to_recv_token,
         )
 
         # L1 dgrad (grad_l1 @ w1, nn) + combine PUSH + dx reduce + grad_gate scatter
@@ -121,17 +107,16 @@ class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
             w1,
             handle,
             topk_indices=topk_idx.contiguous().view(-1),
-            topk_weights=None,
             grad_gate=grad_gate,
             layout="nn",
         )
 
         # dW1 = pool(x)^T @ grad_l1 (variable-K tn wgrad; re-dispatch saved x)
-        dW1, _, _, _ = dispatch_grouped_gemm_bf16_flydsl_kernel(
+        dW1, _, _ = dispatch_grouped_gemm_bf16_flydsl_kernel(
             saved_x,
             grad_l1,
             group,
-            handle=in_handle,
+            handle=handle,
             layout="tn",
             trans_c=True,
         )
@@ -174,7 +159,7 @@ def _fused_mega_moe_backward(
     grad_y: torch.Tensor,
     saved_x: torch.Tensor,
     l1_out: torch.Tensor,
-    dispatch_weights_in_buf: torch.Tensor,
+    dispatch_weights: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
     topk_idx: torch.Tensor,
@@ -192,7 +177,7 @@ def _fused_mega_moe_backward(
         grad_y=grad_y,
         saved_x=saved_x,
         l1_out=l1_out,
-        dispatch_weights_in_buf=dispatch_weights_in_buf,
+        dispatch_weights=dispatch_weights,
         w1=w1,
         w2=w2,
         topk_idx=topk_idx,
@@ -210,7 +195,7 @@ def _fused_mega_moe_backward_meta(
     grad_y: torch.Tensor,
     saved_x: torch.Tensor,
     l1_out: torch.Tensor,
-    dispatch_weights_in_buf: torch.Tensor,
+    dispatch_weights: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
     topk_idx: torch.Tensor,
@@ -234,11 +219,11 @@ def fused_mega_moe_backward_impl(
     grad_y: torch.Tensor,
     saved_x: torch.Tensor,
     l1_out: torch.Tensor,
-    dispatch_weights_in_buf: torch.Tensor,
+    dispatch_weights: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
     topk_idx: torch.Tensor,
-    handle: tuple,
+    handle: DispatchHandle,
     group: torch.distributed.group,
     num_tokens: int,
     num_topk: int,
@@ -253,7 +238,7 @@ def fused_mega_moe_backward_impl(
         grad_y,
         saved_x,
         l1_out,
-        dispatch_weights_in_buf,
+        dispatch_weights,
         w1,
         w2,
         topk_idx,

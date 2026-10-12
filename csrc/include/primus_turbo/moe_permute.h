@@ -32,4 +32,12 @@ void unpermute_impl(const dtype_t *permuted_tokens, dtype_t *tokens, const prob_
                     int num_local_experts, int hidden_size, int num_dispatched_max,
                     int probs_stride, hipStream_t stream);
 
+// One abs-max partial per block (num_partials blocks) over the tokens permute_impl
+// would copy; feeds the tensorwise FP8 scale of the permuted tokens.
+template <typename dtype_t>
+void permute_routed_amax_impl(const dtype_t *tokens, const int *row_id_map,
+                              const int *num_dispatched_tokens_ptr, int num_local_experts,
+                              int hidden_size, int num_partials, float *partials,
+                              hipStream_t stream);
+
 } // namespace primus_turbo

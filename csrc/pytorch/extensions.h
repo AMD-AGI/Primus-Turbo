@@ -423,6 +423,13 @@ void unpermute(at::Tensor permuted_tokens, at::Tensor output_tokens,
                int64_t num_local_experts, int64_t hidden_size, bool with_probs,
                int64_t probs_stride);
 
+at::Tensor permute_routed_amax(at::Tensor tokens, at::Tensor row_id_map,
+                               at::Tensor num_dispatched_token_tensor, int64_t num_local_experts);
+
+at::Tensor permute_routed_amax_meta(at::Tensor tokens, at::Tensor row_id_map,
+                                    at::Tensor num_dispatched_token_tensor,
+                                    int64_t    num_local_experts);
+
 void unpermute_meta(at::Tensor permuted_tokens, at::Tensor output_tokens,
                     c10::optional<at::Tensor> permuted_probs,
                     c10::optional<at::Tensor> output_probs, at::Tensor row_id_map,

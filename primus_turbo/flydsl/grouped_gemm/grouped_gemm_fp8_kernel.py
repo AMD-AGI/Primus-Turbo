@@ -2716,6 +2716,7 @@ def grouped_gemm_fp8_tensorwise_flydsl_kernel(
                 beta_is_one=beta_is_one,
                 n_stride=n_stride,
             )
+            torch.cuda.empty_cache()
         else:
             # Single persistent prod config (no autotune); reached only when num_cu>0 reserves CUs. Default goes to nt8w/nn8w.
             launch = _grouped_compile_cfg(
@@ -5050,6 +5051,8 @@ def grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
                 c_tight=_real[2],
                 race_beta_is_one=beta_is_one,
             )
+            # Same as the forward autotune: release the cached probe segments.
+            torch.cuda.empty_cache()
             _GROUPED_WGRAD_CFG_CACHE[at_key] = finalize
         # beta_is_one is baked into the kernel (the epilogue reads C back), so the artifact keys on it.
         entry = plan[-1] = [finalize(beta_is_one), None]

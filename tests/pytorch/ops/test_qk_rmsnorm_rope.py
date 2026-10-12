@@ -37,33 +37,46 @@ def _rope(x, freqs):
 
 def _reference(qkv, q_gamma, k_gamma, freqs, split, eps):
     q_width, k_width, v_width = split
+    D = k_width
     q, k, v = qkv.split((q_width, k_width, v_width), dim=-1)
     S, B, NG = qkv.shape[:3]
-    q = q.reshape(S, B, -1, _D)
-    k = k.reshape(S, B, NG, _D)
-    v = v.reshape(S, B, NG, _D).clone()
-    q = _rope(_rmsnorm(q, q_gamma, eps), freqs.reshape(S, _D))
-    k = _rope(_rmsnorm(k, k_gamma, eps), freqs.reshape(S, _D))
+    q = q.reshape(S, B, -1, D)
+    k = k.reshape(S, B, NG, D)
+    v = v.reshape(S, B, NG, D).clone()
+    q = _rope(_rmsnorm(q, q_gamma, eps), freqs.reshape(S, D))
+    k = _rope(_rmsnorm(k, k_gamma, eps), freqs.reshape(S, D))
     return q, k, v
 
 
-def _inputs(S=8, B=4, NG=2, NPG=8, seed=123):
+def _inputs(S=8, B=4, NG=2, NPG=8, seed=123, D=_D):
     _require_gfx950()
     gen = torch.Generator(device="cuda").manual_seed(seed)
-    split = [NPG * _D, _D, _D]
+    split = [NPG * D, D, D]
     qkv = torch.randn(S, B, NG, sum(split), device="cuda", generator=gen, dtype=torch.float32).bfloat16()
-    q_gamma = torch.randn(_D, device="cuda", generator=gen, dtype=torch.float32).bfloat16()
-    k_gamma = torch.randn(_D, device="cuda", generator=gen, dtype=torch.float32).bfloat16()
+    q_gamma = torch.randn(D, device="cuda", generator=gen, dtype=torch.float32).bfloat16()
+    k_gamma = torch.randn(D, device="cuda", generator=gen, dtype=torch.float32).bfloat16()
     # Megatron supplies duplicated rotate-half angles in [S,1,1,D].
-    half = torch.randn(S, _D // 2, device="cuda", generator=gen, dtype=torch.float32)
-    freqs = torch.cat((half, half), dim=-1).reshape(S, 1, 1, _D).contiguous()
+    half = torch.randn(S, D // 2, device="cuda", generator=gen, dtype=torch.float32)
+    freqs = torch.cat((half, half), dim=-1).reshape(S, 1, 1, D).contiguous()
     return qkv, q_gamma, k_gamma, freqs, split
 
 
-@pytest.mark.parametrize("S,B,NG,NPG", [(4, 8, 2, 8), (8, 2, 8, 8), (129, 4, 4, 8), (4, 1, 16, 1)])
-def test_fused_qkv_rmsnorm_rope_forward(S, B, NG, NPG):
+@pytest.mark.parametrize(
+    "S,B,NG,NPG,D",
+    [
+        (4, 8, 2, 8, 64),
+        (8, 2, 8, 8, 64),
+        (129, 4, 4, 8, 64),
+        (4, 1, 16, 1, 64),
+        # head_dim 128: Qwen3 GQA groups (NG=4, NPG=8), odd S, single-head groups
+        (4, 8, 4, 8, 128),
+        (129, 2, 4, 8, 128),
+        (8, 1, 8, 1, 128),
+    ],
+)
+def test_fused_qkv_rmsnorm_rope_forward(S, B, NG, NPG, D):
     eps = 1.0e-5
-    args = _inputs(S=S, B=B, NG=NG, NPG=NPG)
+    args = _inputs(S=S, B=B, NG=NG, NPG=NPG, D=D)
     actual = fused_qkv_rmsnorm_rope(*args, eps)
     expected = _reference(*args, eps)
     for got, want in zip(actual[:2], expected[:2]):
@@ -71,10 +84,13 @@ def test_fused_qkv_rmsnorm_rope_forward(S, B, NG, NPG):
     torch.testing.assert_close(actual[2], expected[2], rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("B,NG,NPG", [(2, 8, 8), (1, 16, 1)])
-def test_fused_qkv_rmsnorm_rope_backward(B, NG, NPG):
+@pytest.mark.parametrize(
+    "B,NG,NPG,D",
+    [(2, 8, 8, 64), (1, 16, 1, 64), (8, 4, 8, 128), (2, 4, 8, 128), (1, 8, 1, 128)],
+)
+def test_fused_qkv_rmsnorm_rope_backward(B, NG, NPG, D):
     eps = 1.0e-5
-    qkv, q_gamma, k_gamma, freqs, split = _inputs(S=65, B=B, NG=NG, NPG=NPG, seed=321)
+    qkv, q_gamma, k_gamma, freqs, split = _inputs(S=65, B=B, NG=NG, NPG=NPG, seed=321, D=D)
     qkv.requires_grad_()
     q_gamma.requires_grad_()
     k_gamma.requires_grad_()
@@ -97,14 +113,15 @@ def test_fused_qkv_rmsnorm_rope_backward(B, NG, NPG):
 
 
 def test_fused_qkv_rmsnorm_rope_rejects_wrong_head_dim():
-    qkv, q_gamma, k_gamma, freqs, _ = _inputs()
-    with pytest.raises(ValueError, match="unsupported input"):
-        fused_qkv_rmsnorm_rope(qkv, q_gamma, k_gamma, freqs, [8 * _D, 128, 128], 1.0e-5)
+    qkv, q_gamma, k_gamma, freqs, split = _inputs(B=8, NG=2, D=96)
+    with pytest.raises(ValueError, match="head_dim"):
+        fused_qkv_rmsnorm_rope(qkv, q_gamma, k_gamma, freqs, split, 1.0e-5)
 
 
-def test_fused_qkv_rmsnorm_rope_rejects_untileable_shape():
-    args = _inputs(S=8, B=4, NG=2)
-    with pytest.raises(ValueError, match="ROWS_PER_WAVE"):
+@pytest.mark.parametrize("B,NG,D", [(4, 2, 64), (2, 2, 128)])
+def test_fused_qkv_rmsnorm_rope_rejects_untileable_shape(B, NG, D):
+    args = _inputs(S=8, B=B, NG=NG, D=D)
+    with pytest.raises(ValueError, match="rows_per_wave"):
         fused_qkv_rmsnorm_rope(*args, 1.0e-5)
 
 

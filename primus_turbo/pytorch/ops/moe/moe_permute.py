@@ -13,13 +13,84 @@ from typing import Optional, Tuple
 import torch
 
 from primus_turbo.pytorch.core.backend import BackendType
+from primus_turbo.pytorch.core.low_precision import ScalingGranularity
+from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
+from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
+    group_offs_from_lens,
+)
 from primus_turbo.pytorch.kernels.moe.moe_permute_impl import (
     moe_permute_impl,
     moe_permute_process_impl,
+    moe_permute_routed_amax_impl,
     moe_unpermute_impl,
+)
+from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+    quantize_fp8_tensorwise_pad_impl,
 )
 
 __all__ = ["moe_permute", "moe_unpermute"]
+
+# Rows are zero-padded to this multiple, as QuantizedTensor.quantize(pad_align_last=128) pads
+# grouped-GEMM operands.
+_QUANT_PAD_ALIGN = 128
+
+
+def _permute_quantized_tensorwise(
+    tokens: torch.Tensor,
+    row_id_map: torch.Tensor,
+    num_dispatched_tokens: Optional[torch.Tensor],
+    num_permuted: int,
+    num_local_experts: int,
+    pad_multiple: int,
+    probs: Optional[torch.Tensor],
+    probs_topk_stride: int,
+    quantize_dtype: torch.dtype,
+    group_lens: Optional[torch.Tensor],
+) -> Tuple[QuantizedTensor, Optional[torch.Tensor]]:
+    """TURBO permute whose output is the tensorwise-FP8 cast of the permuted tokens.
+
+    Casts the (topk-times smaller) dispatched tokens once and moves FP8 bytes instead of
+    casting the permuted copy. Bit-identical: the cast is elementwise under one scale, padding
+    rows are zero both ways, and the amax covers exactly the tokens permute copies.
+    """
+    hidden_size = int(tokens.shape[-1])
+    if num_dispatched_tokens is None:
+        num_dispatched_tokens = torch.full((1,), tokens.shape[0], dtype=torch.int32, device=tokens.device)
+    partials = moe_permute_routed_amax_impl(tokens, row_id_map, num_dispatched_tokens, num_local_experts)
+    tokens_fp8, scale_inv = quantize_fp8_tensorwise_pad_impl(
+        tokens, quantize_dtype, k_align=_QUANT_PAD_ALIGN, amax_partials=partials
+    )
+    permuted_fp8, _, permuted_probs = moe_permute_impl(
+        BackendType.TURBO,
+        tokens_fp8,
+        row_id_map,
+        num_dispatched_tokens,
+        num_permuted,
+        num_local_experts,
+        int(tokens_fp8.shape[-1]),
+        pad_multiple,
+        None,  # scaling_factor
+        probs,
+        0,  # scales_per_token
+        True,  # use_fp8
+        probs_topk_stride,
+    )
+    group_offs = group_offs_from_lens(group_lens) if group_lens is not None else None
+    permuted = QuantizedTensor(
+        permuted_fp8,
+        scale_inv,
+        shape=torch.Size((num_permuted, hidden_size)),
+        orig_dtype=tokens.dtype,
+        dest_dtype=quantize_dtype,
+        granularity=ScalingGranularity.TENSORWISE,
+        orig_group_lens=group_lens,
+        orig_group_offs=group_offs,
+        group_lens=group_lens,
+        group_offs=group_offs,
+        is_grouped_tensor=group_lens is not None,
+        quantized_axis=-1,
+    )
+    return permuted, permuted_probs
 
 
 def _default_backend(
@@ -52,6 +123,7 @@ class _MoEPermute(torch.autograd.Function):
         use_fp8: bool,
         probs_topk_stride: int,
         backend: BackendType,
+        quantize_dtype: Optional[torch.dtype],
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -96,21 +168,36 @@ class _MoEPermute(torch.autograd.Function):
             probs,
             probs_topk_stride,
         )
-        permuted_tokens, permuted_scaling_factor, permuted_probs = moe_permute_impl(
-            backend,
-            tokens,
-            row_id_map,
-            num_dispatched_tokens,
-            num_permuted,
-            num_local_experts,
-            hidden_size,
-            pad_multiple,
-            scaling_factor,
-            backend_probs,
-            scales_per_token,
-            use_fp8,
-            backend_probs_topk_stride,
-        )
+        if quantize_dtype is not None:
+            permuted_tokens, permuted_probs = _permute_quantized_tensorwise(
+                tokens,
+                row_id_map,
+                num_dispatched_tokens,
+                num_permuted,
+                num_local_experts,
+                pad_multiple,
+                backend_probs,
+                backend_probs_topk_stride,
+                quantize_dtype,
+                tokens_per_expert,
+            )
+            permuted_scaling_factor = None
+        else:
+            permuted_tokens, permuted_scaling_factor, permuted_probs = moe_permute_impl(
+                backend,
+                tokens,
+                row_id_map,
+                num_dispatched_tokens,
+                num_permuted,
+                num_local_experts,
+                hidden_size,
+                pad_multiple,
+                scaling_factor,
+                backend_probs,
+                scales_per_token,
+                use_fp8,
+                backend_probs_topk_stride,
+            )
 
         ctx.backend = backend
         ctx.num_dispatched = num_dispatched
@@ -186,6 +273,7 @@ class _MoEPermute(torch.autograd.Function):
             None,  # use_fp8
             None,  # probs_topk_stride
             None,  # backend
+            None,  # quantize_dtype
         )
 
 
@@ -204,6 +292,7 @@ class _MoEUnpermute(torch.autograd.Function):
         probs_topk_stride: int,
         pad_multiple: int,
         backend: BackendType,
+        grad_quantize_dtype: Optional[torch.dtype],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # Unused grads reach backward as None, not zeros; dynamo cannot trace this ctx call.
         if not torch.compiler.is_compiling():
@@ -230,6 +319,7 @@ class _MoEUnpermute(torch.autograd.Function):
         ctx.has_probs = permuted_probs is not None
         ctx.probs_topk_stride = probs_topk_stride
         ctx.tokens_dtype = permuted_tokens.dtype
+        ctx.grad_quantize_dtype = grad_quantize_dtype
 
         outputs = moe_unpermute_impl(
             backend,
@@ -268,21 +358,35 @@ class _MoEUnpermute(torch.autograd.Function):
             unpermuted_probs_grad = None
 
         # Unpermute backward is permute; the row_id_map is already built.
-        grad_permuted, _, grad_permuted_probs = moe_permute_impl(
-            ctx.backend,
-            grad_unpermuted_tokens,
-            row_id_map,
-            num_dispatched_tokens_tensor,
-            ctx.num_permuted,
-            ctx.num_local_experts,
-            ctx.hidden_size,
-            ctx.pad_multiple,
-            None,  # scaling_factor
-            unpermuted_probs_grad,
-            0,  # scales_per_token
-            False,  # use_fp8
-            ctx.probs_topk_stride,
-        )
+        if ctx.grad_quantize_dtype is not None:
+            grad_permuted, grad_permuted_probs = _permute_quantized_tensorwise(
+                grad_unpermuted_tokens,
+                row_id_map,
+                num_dispatched_tokens_tensor,
+                ctx.num_permuted,
+                ctx.num_local_experts,
+                ctx.pad_multiple,
+                unpermuted_probs_grad,
+                ctx.probs_topk_stride,
+                ctx.grad_quantize_dtype,
+                None,  # group_lens
+            )
+        else:
+            grad_permuted, _, grad_permuted_probs = moe_permute_impl(
+                ctx.backend,
+                grad_unpermuted_tokens,
+                row_id_map,
+                num_dispatched_tokens_tensor,
+                ctx.num_permuted,
+                ctx.num_local_experts,
+                ctx.hidden_size,
+                ctx.pad_multiple,
+                None,  # scaling_factor
+                unpermuted_probs_grad,
+                0,  # scales_per_token
+                False,  # use_fp8
+                ctx.probs_topk_stride,
+            )
 
         return (
             grad_permuted,
@@ -294,6 +398,7 @@ class _MoEUnpermute(torch.autograd.Function):
             None,  # probs_topk_stride
             None,  # pad_multiple
             None,  # backend
+            None,  # grad_quantize_dtype
         )
 
 
@@ -312,6 +417,7 @@ def moe_permute(
     scales_per_token: int = 0,
     use_fp8: bool = False,
     backend: Optional[BackendType] = None,
+    quantize_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -325,6 +431,10 @@ def moe_permute(
     ``num_permuted_tokens`` is a capacity on TURBO (extra rows dropped, flagged in
     ``overflow_flag``) but only an upper bound on TRITON -- too small writes OOB.
     TRITON never drops, so its ``overflow_flag`` is a host-side zero tensor.
+
+    ``quantize_dtype`` (FP8, TURBO only) returns ``permuted_tokens`` as a grouped tensorwise
+    :class:`QuantizedTensor` over ``tokens_per_expert``, bit-identical to quantizing the bf16
+    result; the consumer must accept it (e.g. ``grouped_mlp_fp8``). Backward stays bf16.
     """
     if routing_map is None and topk_indices is None:
         raise ValueError("moe_permute: one of routing_map / topk_indices must be provided")
@@ -345,6 +455,11 @@ def moe_permute(
 
     if backend is None:
         backend = _default_backend(pad_multiple, use_fp8, scaling_factor)
+    if quantize_dtype is not None:
+        if use_fp8 or scaling_factor is not None:
+            raise ValueError("moe_permute: quantize_dtype needs high-precision tokens (use_fp8=False)")
+        if backend is not BackendType.TURBO:
+            raise ValueError("moe_permute: quantize_dtype requires backend=BackendType.TURBO")
 
     return _MoEPermute.apply(
         tokens,
@@ -360,6 +475,7 @@ def moe_permute(
         use_fp8,
         probs_topk_stride,
         backend,
+        quantize_dtype,
     )
 
 
@@ -375,14 +491,21 @@ def moe_unpermute(
     probs_topk_stride: int = 0,
     pad_multiple: int = 0,
     use_fp8: bool = False,
+    grad_quantize_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Unpermute back into ``restore_shape`` using the matching permute backend.
 
     ``num_dispatched_tokens_tensor`` is an optional device-side row bound letting
     TURBO skip the unrouted tail; defaults to ``restore_shape[0]``. TRITON ignores it.
+
+    ``grad_quantize_dtype`` (FP8, TURBO only) makes backward hand ``permuted_tokens`` its
+    gradient as a tensorwise :class:`QuantizedTensor`, bit-identical to quantizing the bf16
+    gradient; whatever produced ``permuted_tokens`` must accept it (e.g. ``grouped_mlp_fp8``).
     """
     if backend is None:
         backend = _default_backend(pad_multiple, use_fp8)
+    if grad_quantize_dtype is not None and backend is not BackendType.TURBO:
+        raise ValueError("moe_unpermute: grad_quantize_dtype requires backend=BackendType.TURBO")
     if backend is BackendType.TRITON and permuted_probs is not None and probs_topk_stride > 0:
         # Silently switching to TURBO here would read a foreign row_id_map layout.
         raise ValueError(
@@ -400,4 +523,5 @@ def moe_unpermute(
         probs_topk_stride,
         pad_multiple,
         backend,
+        grad_quantize_dtype,
     )

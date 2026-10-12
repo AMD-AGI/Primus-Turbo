@@ -15,6 +15,11 @@ from primus_turbo.flydsl.mega import (
     dispatch_grouped_gemm_bf16_flydsl_kernel,
     grouped_gemm_combine_bf16_flydsl_kernel,
 )
+from primus_turbo.flydsl.mega.bf16.dispatch_prologue_kernel import (
+    DISPATCH_HANDLE_DTYPES,
+    DispatchHandle,
+    run_dispatch_prologue,
+)
 from primus_turbo.flydsl.utils.glu_activation import (
     GLUActivation,
     activation_constexpr,
@@ -30,12 +35,6 @@ from primus_turbo.pytorch.core.backend import (
 )
 
 _SUPPORTED_DTYPES = (torch.bfloat16,)
-
-# dispatch handle layout (see dispatch_prologue return + pool_src_slot snapshot):
-# 0-5 send/dispatch tables + tile_to_expert, 6 real_count_per_expert,
-# 7 num_tokens_per_expert_prefix, 8 num_tile_blocks, 9-11 combine_recv_*, 12 pool_src_slot.
-_HANDLE_LEN = 13
-_H_NUM_TILE_BLOCKS = 8
 
 
 class FusedMegaMoEForwardFlyDSLBackend(KernelBackend):
@@ -67,41 +66,19 @@ class FusedMegaMoEForwardFlyDSLBackend(KernelBackend):
         **kwargs,
     ):
 
-        # int64 end-to-end (combine reads topk i64)
-        topk_idx = topk_idx.to(torch.int64)
+        handle, dispatch_weights = run_dispatch_prologue(x, w1, group, topk_idx, topk_weights)
+        l1_out, _, _ = dispatch_grouped_gemm_bf16_flydsl_kernel(x, w1, group, handle=handle, layout=layout)
 
-        # fused prologue + cross-rank dispatch PUSH + grouped L1 GEMM (nt)
-        l1_out, _, dispatch_weights_in_buf, handle = dispatch_grouped_gemm_bf16_flydsl_kernel(
-            x,
-            w1,
-            group,
-            handle=None,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
-            layout=layout,
+        # routing weight is applied to act here: sum_k w_k * W2(a_k) == sum_k W2(w_k * a_k)
+        act = swiglu_flydsl_kernel(
+            l1_out, num_tile_blocks=handle.num_tile_blocks, scale=dispatch_weights, activation=activation
         )
-
-        # bound swiglu by THIS handle's tile count (per-forward, not shared symm)
-        act = swiglu_flydsl_kernel(l1_out, num_tile_blocks=handle[_H_NUM_TILE_BLOCKS], activation=activation)
 
         # fused grouped L2 GEMM + combine PUSH + topk reduce
         y, _ = grouped_gemm_combine_bf16_flydsl_kernel(
-            act,
-            w2,
-            handle,
-            topk_indices=topk_idx.contiguous().view(-1),
-            topk_weights=topk_weights.to(torch.float32).contiguous().view(-1),
-            layout=layout,
+            act, w2, handle, topk_indices=topk_idx.contiguous().view(-1), layout=layout
         )
-
-        # ABI guard: catch a kernel return-order change loudly.
-        assert len(handle) == _HANDLE_LEN, f"dispatch handle len {len(handle)} != {_HANDLE_LEN}; ABI changed"
-        return (
-            y,
-            l1_out,
-            dispatch_weights_in_buf,
-            list(handle),
-        )
+        return y, l1_out, dispatch_weights, list(handle)
 
 
 _FUSED_MEGA_MOE_FORWARD_BACKENDS = {
@@ -182,31 +159,10 @@ def _fused_mega_moe_forward_meta(
     num_tokens = x.shape[0]
     y = x.new_empty((num_tokens, N2), dtype=torch.bfloat16)
     l1_out = x.new_empty((0, two_I), dtype=torch.bfloat16)
-    dispatch_weights_in_buf = x.new_empty((0,), dtype=torch.float32)
-
-    # Handle must have real length under compile: save_for_backward(..., *handle) fixes
-    # its length at trace time, so an empty fake -> len-0 handle in backward. Only count
-    # and dtype matter here (opaque saved activations); real shapes come from eager. See
-    # dispatch_prologue_flydsl_kernel for the ABI (0-11) + dispatch launcher (12).
-    i32 = lambda: x.new_empty((0,), dtype=torch.int32)  # noqa: E731
-    i64 = lambda: x.new_empty((0,), dtype=torch.int64)  # noqa: E731
-    handle = [
-        i32(),
-        i32(),
-        i32(),
-        i32(),  # 0-3 expert_send_dst_rank/dst_row/count/offset
-        i32(),
-        i32(),  # 4 dispatched_token_idx  5 tile_to_expert
-        i64(),
-        i64(),  # 6 real_count_per_expert  7 padded-prefix
-        i32(),  # 8 num_tile_blocks
-        i32(),
-        i32(),
-        i32(),  # 9-11 combine_recv_dst_rank/start_row/count
-        i32(),  # 12 pool_src_slot
-    ]
-    assert len(handle) == _HANDLE_LEN
-    return y, l1_out, dispatch_weights_in_buf, handle
+    dispatch_weights = x.new_empty((0,), dtype=torch.float32)
+    # save_for_backward(*handle) fixes the handle length at trace time, so the fake needs every field.
+    handle = [x.new_empty((0,), dtype=dtype) for dtype in DISPATCH_HANDLE_DTYPES]
+    return y, l1_out, dispatch_weights, handle
 
 
 def fused_mega_moe_forward_impl(
@@ -219,17 +175,9 @@ def fused_mega_moe_forward_impl(
     layout: str,
     default_backend: int,
     activation: Optional[GLUActivation] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple]:
-    """Fused MoE forward (dispatch grouped GEMM + SwiGLU + grouped GEMM combine).
-
-    Returns (y, l1_out, dispatch_weights_in_buf, handle).
-    """
-    (
-        y,
-        l1_out,
-        dispatch_weights_in_buf,
-        handle,
-    ) = _fused_mega_moe_forward(
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, DispatchHandle]:
+    """Fused MoE forward; returns ``(y, l1_out, dispatch_weights, handle)``."""
+    y, l1_out, dispatch_weights, handle = _fused_mega_moe_forward(
         x,
         w1,
         w2,
@@ -240,9 +188,4 @@ def fused_mega_moe_forward_impl(
         layout,
         None if activation is None else list(activation_constexpr(activation)),
     )
-    return (
-        y,
-        l1_out,
-        dispatch_weights_in_buf,
-        tuple(handle),
-    )
+    return y, l1_out, dispatch_weights, DispatchHandle(*handle)

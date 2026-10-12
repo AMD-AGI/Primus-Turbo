@@ -1316,6 +1316,7 @@ def grouped_gemm_mxfp8_flydsl_kernel(
     if entry is None:
         # race on canonical synthetic tensors -> needs only the static shape (args' b-side)
         bm, gm, xcd, gn = _select_nt_cfg(at_key, K, G, N, cbsz, blgp, out_fp16, persistent, _args(0))
+        torch.cuda.empty_cache()
         launch = _get_nt_launch(K, G, N, bm, gm, xcd, gn, cbsz, blgp, out_fp16, persistent)
         entry = [launch, None, bm]
         _GNT_AT_CACHE[at_key] = entry
@@ -1886,6 +1887,7 @@ def grouped_gemm_mxfp8_variable_k_flydsl_kernel(
         bm, bn, gm, xcd, gn = _select_wgrad_cfg(
             at_key, OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta_is_one, out, args
         )
+        torch.cuda.empty_cache()
         launch = _get_wgrad_launch(OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta_is_one)
         entry = [launch, None]
         _GWG_AT_CACHE[at_key] = entry

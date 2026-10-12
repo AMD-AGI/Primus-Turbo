@@ -18,7 +18,7 @@ rank owns a slice of the experts and tokens are routed directly into a peer rank
 - **Two fused operators** — `dispatch_grouped_gemm` (dispatch + L1 grouped GEMM) and
   `grouped_gemm_combine` (L2 grouped GEMM + combine); forward and backward are conjugates, with
   dispatch and combine swapping roles.
-- **Comm-compute overlap** — communication overlaps GEMM compute, reaching 85%+ of the ideal
+- **Comm-compute overlap** — communication overlaps GEMM compute, reaching 76%+ of the ideal
   roofline, 90%+ in some cases.
 - **Activation recompute** — forward saves only the original `x`; backward recomputes the
   dispatched `x`.
@@ -38,8 +38,8 @@ $\max(T_{\text{comm}}, T_{\text{gemm}})$, and the overlap efficiency is defined 
 
 $$\eta_{\text{overlap}} = \frac{\max(T_{\text{comm}},\, T_{\text{gemm}})}{T_{\text{measured}}}$$
 
-In practice $\eta_{\text{overlap}}$ reaches **85%+**, with most cases at or above **90%** — i.e.
-$T_{\text{measured}}$ exceeds the ideal time by only ~**0.3–0.5 ms**.
+In practice $\eta_{\text{overlap}}$ reaches **76%+**, with most cases at or above **84%** — i.e.
+$T_{\text{measured}}$ exceeds the ideal time by only ~**0.13–0.51 ms**.
 
 ### 2. Recompute dispatched x in backward to cut activation memory
 
@@ -64,13 +64,13 @@ The forward layer is the two fused operators with a SwiGLU in between:
 ```
 x ─▶ dispatch_grouped_gemm (L1, NT) ─▶ SwiGLU ─▶ grouped_gemm_combine (L2, NT) ─▶ y
        │  dispatch comm + L1 grouped GEMM          │  L2 grouped GEMM + combine comm
-       └─ comm overlapped with GEMM                └─ + topk reduce (weighted scatter-add)
+       └─ comm overlapped with GEMM                └─ + topk reduce (sum of per-rank rows)
 ```
 
-- **dispatch_grouped_gemm (forward):** scatter local tokens into the destination rank, then run
-  the grouped L1 GEMM tile-by-tile, overlapping comm with compute.
-- **grouped_gemm_combine (forward):** run the grouped L2 GEMM, push outputs back to origin ranks,
-  then the top-k reduce weights and sums the `num_topk` contributions per token.
+- **dispatch_grouped_gemm (forward):** send each local token once to every destination rank it
+  routes to, then run the grouped L1 GEMM tile-by-tile, overlapping comm with compute.
+- **grouped_gemm_combine (forward):** run the grouped L2 GEMM, sum each token's outputs on a rank
+  and push one row back to its origin rank, then the top-k reduce sums the per-rank rows per token.
 
 The backward pass is the **conjugate** of the forward: L2 dgrad (NN) + SwiGLUᵀ + dW2 (variable-K)
 + L1 dgrad combine (NN) + dW1 (TN). Dispatch and combine swap roles, and the dispatched `x` is
@@ -97,16 +97,16 @@ of the kernels, so it has no runtime cost, and the default reproduces the SiLU k
 
 | stage | $T_{\text{comm}}$ (ms) | $T_{\text{gemm}}$ (ms) | $T_{\text{measured}}$ (ms) | $\eta_{\text{overlap}}$ |
 | --- | --- | --- | --- | --- |
-| forward (nt) | 2.23 | 3.26 | 3.56 | 91.4% |
-| backward dgrad (nn) | 2.23 | 1.63 | 2.38 | 93.7% |
-| backward wgrad dW1 (tn) | 2.23 | 3.28 | 3.76 | 87.3% |
+| forward (nt) | 1.53 | 2.90 | 3.20 | 90.5% |
+| backward dgrad (nn) | 1.53 | 1.35 | 1.82 | 84.3% |
+| backward wgrad dW1 (tn) | 1.53 | 2.82 | 3.08 | 91.5% |
 
 ### grouped_gemm_combine
 
 | stage | $T_{\text{comm}}$ (ms) | $T_{\text{gemm}}$ (ms) | $T_{\text{measured}}$ (ms) | $\eta_{\text{overlap}}$ |
 | --- | --- | --- | --- | --- |
-| forward (nt) | 2.32 | 1.80 | 2.57 | 90.0% |
-| backward dgrad (nn) | 2.89 | 3.47 | 3.90 | 89.0% |
+| forward (nt) | 1.48 | 1.68 | 2.19 | 76.7% |
+| backward dgrad (nn) | 1.48 | 3.49 | 3.62 | 96.5% |
 
 ### Reproduce
 

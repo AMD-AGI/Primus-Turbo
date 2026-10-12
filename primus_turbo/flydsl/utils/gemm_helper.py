@@ -2647,7 +2647,10 @@ class StoreCBf16:
         rsrc = make_row_band_resource(self.c_base, base_row, row_bound, self.c_cols, 2)
         lane_col = self.lane_id % 16
         col_ok = [
-            (base_col + q * col_step + lane_col < self.c_cols) if mask_n else None
+            [
+                (base_col + q * col_step + j * 16 + lane_col < self.c_cols) if mask_n else None
+                for j in range_constexpr(n_tiles_b)
+            ]
             for q in range(len(c_frags))
         ]
         row_bytes = self.c_cols * 2
@@ -2663,7 +2666,7 @@ class StoreCBf16:
                             val,
                             rsrc,
                             off + q * col_step * 2 + j * 32,
-                            mask=col_ok[q],
+                            mask=col_ok[q][j],
                             cache_modifier=self.cache_modifier,
                             offset_is_bytes=True,
                         )

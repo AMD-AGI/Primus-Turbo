@@ -44,6 +44,13 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp4_impl import (
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     group_offs_from_lens,
 )
+from primus_turbo.pytorch.ops.moe_gather import (
+    enroll_backward_gather_output,
+    resolve_backward_gather,
+)
+from primus_turbo.pytorch.ops.moe_gather import (
+    lookup_permuted_activation_seam as _lookup_permuted_activation_seam,
+)
 from primus_turbo.pytorch.ops.quantization import (
     grouped_quantize_fp4_with_trans,
     quantize_fp4_with_trans,
@@ -201,7 +208,28 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
         # x's col-wise half is a wgrad operand, so it is the one that carries the RHT.
         x_scaling_recipe = ScalingRecipe()
         x_t_scaling_recipe = ScalingRecipe(use_rht=True)
-        if not isinstance(x, QuantizedTensor):
+        _seam = _lookup_permuted_activation_seam(x, include_plan=True)
+        ctx.backward_gather_plan = None
+        if _seam is not None:
+            # H1 fusion hit: x is a lazy placeholder for the permuted activation.
+            # Gather+quantize straight out of the real, un-permuted source instead
+            # of reading x's (possibly never-materialized) bytes.
+            _seam_src, _seam_dest2src, _seam_permuted_probs, ctx.backward_gather_plan = _seam
+            x_row, x_row_scale, x_col, x_col_scale, _, offs_row, _, _ = grouped_quantize_fp4_with_trans(
+                _seam_src,
+                float4_e2m1fn_x2,
+                ScalingGranularity.MX_BLOCKWISE,
+                group_lens,
+                group_offs,
+                block_size=MXFP4_BLOCK_SIZE,
+                scaling_recipe=x_scaling_recipe,
+                scaling_recipe_for_trans=x_t_scaling_recipe,
+                scale_rounding_mode=config.scale_rounding_mode,
+                dest2src=_seam_dest2src,
+                permuted_probs=_seam_permuted_probs,
+                total_m=int(x.shape[0]),
+            )
+        elif not isinstance(x, QuantizedTensor):
             x_row, x_row_scale, x_col, x_col_scale, _, offs_row, _, _ = grouped_quantize_fp4_with_trans(
                 x,
                 float4_e2m1fn_x2,
@@ -299,10 +327,12 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
         # the version counter saved tensors are checked against.
         ctx.w1_main_grad = w1_main_grad
         ctx.w2_main_grad = w2_main_grad
+        enroll_backward_gather_output(out, ctx.backward_gather_plan, ctx)
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
+        grad_out, _gather_kwargs = resolve_backward_gather(grad_out, ctx.backward_gather_plan)
         grad_out = _ensure_contiguous_grad_out(grad_out)
         (
             x_col,
@@ -339,6 +369,7 @@ class FP4GroupedMLPMXFunc(torch.autograd.Function):
             scaling_recipe=ScalingRecipe(use_sr=sr),
             scaling_recipe_for_trans=ScalingRecipe(use_sr=sr, use_rht=True),
             scale_rounding_mode=ctx.config.scale_rounding_mode,
+            **_gather_kwargs,
         )
 
         # grad_w2 = gradO_col(rht=T) @ act_col(rht=T)^T, contracting M.

@@ -7,8 +7,11 @@
 #include "primus_turbo/moe_permute.h"
 #include "../extensions.h"
 #include "primus_turbo/arch.h"
+#include "primus_turbo/quantization.h"
 
 #include <c10/util/Optional.h>
+
+#include <algorithm>
 
 #define SWITCH_EXPERT_MAP_TYPE(case_macro)                                                         \
     switch (expert_map.scalar_type()) {                                                            \
@@ -205,6 +208,68 @@ void permute(torch::Tensor tokens, torch::Tensor output_tokens,
             static_cast<int>(scales_per_token), num_dispatched_max, static_cast<int>(probs_stride),
             stream);
     }
+}
+
+// -----------------------------------------------------------------------------
+// permute_routed_amax
+//
+// Abs-max partials of the tokens permute() would copy, for amax_partials of
+// quantize_fp8_tensorwise: quantizing the dispatched tokens with this scale and
+// permuting the FP8 bytes equals quantizing the permuted tokens.
+//   tokens : [num_dispatched_tokens, hidden_size] (bf16/fp16)
+//   return : [min(num_dispatched_tokens, workspace)] float32
+// -----------------------------------------------------------------------------
+
+static int64_t permute_routed_amax_num_partials(const at::Tensor &tokens) {
+    return std::max<int64_t>(1,
+                             std::min<int64_t>(tokens.size(0), tensorwise_amax_workspace_elems()));
+}
+
+at::Tensor permute_routed_amax(at::Tensor tokens, at::Tensor row_id_map,
+                               at::Tensor num_dispatched_token_tensor, int64_t num_local_experts) {
+    PRIMUS_TURBO_CHECK(tokens.is_cuda() && tokens.is_contiguous() && tokens.dim() == 2,
+                       "permute_routed_amax: tokens must be a contiguous 2D CUDA tensor");
+    PRIMUS_TURBO_CHECK(tokens.scalar_type() == at::kBFloat16 || tokens.scalar_type() == at::kHalf,
+                       "permute_routed_amax: tokens must be bfloat16 or float16");
+    PRIMUS_TURBO_CHECK(row_id_map.is_cuda() && row_id_map.scalar_type() == at::kInt &&
+                           row_id_map.is_contiguous() && row_id_map.dim() == 2 &&
+                           row_id_map.size(1) == 2 * num_local_experts + 1,
+                       "permute_routed_amax: row_id_map must be a contiguous int32 CUDA tensor "
+                       "of shape [*, 2 * num_local_experts + 1]");
+    PRIMUS_TURBO_CHECK(num_dispatched_token_tensor.is_cuda() &&
+                           num_dispatched_token_tensor.scalar_type() == at::kInt &&
+                           num_dispatched_token_tensor.numel() == 1,
+                       "permute_routed_amax: num_dispatched_token_tensor must be a one-element "
+                       "int32 CUDA tensor");
+
+    const int64_t num_partials = permute_routed_amax_num_partials(tokens);
+    auto          partials     = at::empty({num_partials}, tokens.options().dtype(at::kFloat));
+    if (tokens.size(0) == 0) {
+        partials.zero_();
+        return partials;
+    }
+
+    auto      stream      = at::cuda::getCurrentCUDAStream();
+    const int hidden_size = static_cast<int>(tokens.size(1));
+    if (tokens.scalar_type() == at::kBFloat16) {
+        permute_routed_amax_impl<bfloat16>(
+            reinterpret_cast<const bfloat16 *>(tokens.data_ptr()), row_id_map.data_ptr<int>(),
+            num_dispatched_token_tensor.data_ptr<int>(), static_cast<int>(num_local_experts),
+            hidden_size, static_cast<int>(num_partials), partials.data_ptr<float>(), stream);
+    } else {
+        permute_routed_amax_impl<float16>(
+            reinterpret_cast<const float16 *>(tokens.data_ptr()), row_id_map.data_ptr<int>(),
+            num_dispatched_token_tensor.data_ptr<int>(), static_cast<int>(num_local_experts),
+            hidden_size, static_cast<int>(num_partials), partials.data_ptr<float>(), stream);
+    }
+    return partials;
+}
+
+at::Tensor permute_routed_amax_meta(at::Tensor tokens, at::Tensor /*row_id_map*/,
+                                    at::Tensor /*num_dispatched_token_tensor*/,
+                                    int64_t /*num_local_experts*/) {
+    return at::empty({permute_routed_amax_num_partials(tokens)},
+                     tokens.options().dtype(at::kFloat).device(at::kMeta));
 }
 
 // -----------------------------------------------------------------------------
