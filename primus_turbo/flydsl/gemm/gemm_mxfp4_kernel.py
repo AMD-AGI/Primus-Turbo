@@ -3372,6 +3372,7 @@ def _autotune_mxfp4_config(
                 best = (gm0, gn0, xcd0, w0, e0, _tw, _cp)
         except Exception:  # noqa: BLE001 -- a bad twin must not break the GEMM
             pass
+    torch.cuda.empty_cache()
     _MXFP4_CFG_CACHE[key] = best
     return best
 
@@ -4809,6 +4810,10 @@ def gemm_mxfp4_flydsl_kernel(
                     continue
             ks = _race_mxfp4_ksplit(arms, base=(0, 1)) if len(arms) > 1 else (0, 1)
             _MXFP4_KSPLIT_CACHE[_kskey] = ks
+            # Drop the beta=1 tuning scratch and release what the race left cached.
+            tgt = arms = None
+            _tune_ws.clear()
+            torch.cuda.empty_cache()
 
     out2 = _exec(ks[0], ks[1], out, beta_is_one)
     return out2.t().contiguous() if trans_c else out2
