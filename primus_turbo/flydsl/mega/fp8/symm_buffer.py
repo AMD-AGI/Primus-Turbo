@@ -31,9 +31,9 @@ peer's. Inspired by ``deep_gemm/mega``.
 import flydsl.expr as fx
 import torch
 from flydsl.expr import Int32, Int64, struct
-from flydsl.expr.buffer_ops import buffer_load
 from flydsl.expr.typing import Constexpr
 
+from primus_turbo.flydsl.utils.buffer_ops import buffer_load
 from primus_turbo.flydsl.utils.prims import addr_buffer_resource
 
 # NOTE: SymmetricMemory is imported lazily inside SymmBuffer.__init__ to avoid a
@@ -613,7 +613,7 @@ def _as_i64(x):
     """Sign-extend an fx i32 (or fold a python int) to an i64 ArithValue."""
     if isinstance(x, int):
         return fx.Int64(x)
-    return fx.arith.ArithValue(fx.arith.extsi(fx.T.i64(), x.ir_value()), signed=True)
+    return fx.arith.ArithValue(fx.arith.extsi(fx.T.i64, x.ir_value()), signed=True)
 
 
 def _region_ptr(sl, name, index=0, dst_rank=None):
@@ -630,14 +630,14 @@ def _region_ptr(sl, name, index=0, dst_rank=None):
         addr = addr + _as_i64(index) * fx.Int64(item)
     if dst_rank is not None:
         res = addr_buffer_resource(offsets_ptr, num_records_bytes=int(sl.num_ranks) * 8)
-        addr = addr + buffer_load(res, dst_rank, vec_width=1, dtype=fx.T.i64())
+        addr = addr + buffer_load(res, dst_rank, vec_width=1, dtype=fx.T.i64)
     return addr
 
 
 def sym_map(sl, ptr, dst_rank):
     """Translate a local MAIN-heap ptr ``ptr`` (i64) into peer ``dst_rank``."""
     res = addr_buffer_resource(sl.offsets_ptr, num_records_bytes=int(sl.num_ranks) * 8)
-    return ptr + buffer_load(res, dst_rank, vec_width=1, dtype=fx.T.i64())
+    return ptr + buffer_load(res, dst_rank, vec_width=1, dtype=fx.T.i64)
 
 
 # ---------------------------------------------------------------------------

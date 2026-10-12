@@ -24,13 +24,14 @@ import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
 from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
+from primus_turbo.flydsl.utils import buffer_ops
 from primus_turbo.flydsl.utils.gemm_helper import xcd_remap_pid
 
 _LOG2E = host_math.log2(host_math.e)
@@ -2299,7 +2300,7 @@ def build_flash_attn_bwd_dkdv_module(
             _dma_size = fx.Int32(DMA_BYTES)
             _dma_soff = fx.Int32(0)
             _dma_off = fx.Int32(0)
-            _dma_aux = fx.Int32(1)
+            _dma_aux = 1  # an i32 attribute (immediate), so a Python int: a DSL value is silently dropped
 
             def _dma_lds_ptrs(lds_byte_base):
                 # LDS write pointer is loop/head-invariant, but readfirstlane is not
@@ -4312,7 +4313,7 @@ def build_flash_attn_bwd_dkdv_module(
             value_attrs={
                 "rocdl.waves_per_eu": _wpe_dkdv,
                 "rocdl.flat_work_group_size": f"{int(flat_work_group_size)},{int(flat_work_group_size)}",
-                "passthrough": passthrough_entries,
+                "llvm.passthrough": passthrough_entries,
             },
         ).launch(
             grid=(grid_x, 1, 1),

@@ -45,11 +45,12 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     xcd_remap_pid_u,
 )
 from primus_turbo.flydsl.utils.prims import _lds_barrier, ceildiv, ceildiv_pow2, udiv, umod
+from primus_turbo.flydsl.utils import buffer_ops
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
@@ -3091,7 +3092,7 @@ def _build_mxfp4_gemm_kernel(
 
     # agpr-alloc=256 lets the backend place the 256-f32 accumulator in AGPR;
     # waves_per_eu=1 -> the full 512-VGPR file is one wave's (no spill).
-    _pt = {"passthrough": [["amdgpu-agpr-alloc", "256"]]}
+    _pt = {"llvm.passthrough": [["amdgpu-agpr-alloc", "256"]]}
     gemm_value_attrs = {"rocdl.flat_work_group_size": "256,256", "rocdl.waves_per_eu": OCC, **_pt}
 
     # Return the BARE kernel (NOT a launch): the fused factory issues preshuffle + this GEMM from one host stub.

@@ -52,7 +52,6 @@ import torch
 from flydsl._mlir.dialects import vector as _vector
 from flydsl.expr import arith, range_constexpr
 from flydsl.expr import math as fmath
-from flydsl.expr.buffer_ops import buffer_load, buffer_store, create_buffer_resource
 from flydsl.expr.rocdl import cvt_f32_fp8, cvt_pk_bf8_f32, cvt_pk_fp8_f32
 from flydsl.expr.typing import Vector as Vec
 
@@ -61,6 +60,7 @@ from primus_turbo.flydsl.mega.fp8.gemm_helper import (
     build_preshuffle_ab_kernel,
     run_compiled,
 )
+from primus_turbo.flydsl.utils.buffer_ops import buffer_load, buffer_store, create_buffer_resource
 from primus_turbo.flydsl.utils.prims import ceildiv
 
 MXFP8_BLOCK = 32  # mxfp8 block (elements per E8M0 scale)
@@ -76,7 +76,7 @@ def mxfp8_words_from_f32_subvecs(fvs):
     """Quantize one 1x32 f32 block, given as ``subs`` vectors of width ``MXFP8_VEC``, to E4M3.
 
     Returns ``(words, biased)``, the layout ``_quant_block_words`` also returns."""
-    f32v = fx.T.VectorType.get([MXFP8_VEC], fx.T.f32())
+    f32v = fx.T.vec(MXFP8_VEC, fx.T.f32)
     neg1 = fx.arith.constant_vector(-1.0, f32v)
     lim = fx.arith.constant_vector(448.0, f32v)
     neglim = fx.arith.constant_vector(-448.0, f32v)
@@ -86,15 +86,13 @@ def mxfp8_words_from_f32_subvecs(fvs):
     for s in range_constexpr(subs):
         fv = fvs[s]
         av = fx.arith.maximumf(fv, fx.arith.mulf(fv, neg1))  # |fv|
-        sub_amax.append(
-            fx.arith.ArithValue(_vector.reduction(fx.T.f32(), _vector.CombiningKind.MAXIMUMF, av))
-        )
+        sub_amax.append(fx.arith.ArithValue(_vector.reduction(fx.T.f32, _vector.CombiningKind.MAXIMUMF, av)))
     amax = sub_amax[0]
     for s in range_constexpr(1, subs):
         amax = fx.arith.maximumf(amax, sub_amax[s])
 
     # E8M0 scale: round-even exponent, target 2^8, clamp to E8M0 range.
-    amax_bits = fx.arith.ArithValue(amax).bitcast(fx.T.i32())
+    amax_bits = fx.arith.ArithValue(amax).bitcast(fx.T.i32)
     t = amax_bits + fx.Int32(1 << 19)
     exp = ((t >> fx.Int32(23)) & fx.Int32(0x1FF)) - fx.Int32(127 + 8)
     exp = fx.arith.select(exp < fx.Int32(-127), fx.Int32(-127), exp)
@@ -104,7 +102,7 @@ def mxfp8_words_from_f32_subvecs(fvs):
     # all-zero block clamps biased to 0, where the divide form gives 1.0/0.0 = inf and every
     # element quantizes to 0*inf = NaN. Loss-masked tokens have exactly-zero gradient rows, so
     # training hits that case. 2^(127-biased) is also what the stored E8M0 byte means.
-    inv_scale = fx.arith.ArithValue((fx.Int32(254) - biased) << fx.Int32(23)).bitcast(fx.T.f32())
+    inv_scale = fx.arith.ArithValue((fx.Int32(254) - biased) << fx.Int32(23)).bitcast(fx.T.f32)
     inv_v = _vector.broadcast(f32v, arith._to_raw(inv_scale))
 
     words = []
@@ -112,10 +110,10 @@ def mxfp8_words_from_f32_subvecs(fvs):
         qraw = fx.arith.mulf(fvs[s], inv_v)
         qf = Vec(fx.arith.minimumf(fx.arith.maximumf(qraw, neglim), lim))  # soft-clamp to fp8 max
         e = [qf[i] for i in range_constexpr(MXFP8_VEC)]
-        w0 = cvt_pk_fp8_f32(fx.T.i32(), e[0], e[1], fx.Int32(0), False)
-        w0 = cvt_pk_fp8_f32(fx.T.i32(), e[2], e[3], w0, True)
-        w1 = cvt_pk_fp8_f32(fx.T.i32(), e[4], e[5], fx.Int32(0), False)
-        w1 = cvt_pk_fp8_f32(fx.T.i32(), e[6], e[7], w1, True)
+        w0 = cvt_pk_fp8_f32(fx.T.i32, e[0], e[1], fx.Int32(0), False)
+        w0 = cvt_pk_fp8_f32(fx.T.i32, e[2], e[3], w0, True)
+        w1 = cvt_pk_fp8_f32(fx.T.i32, e[4], e[5], fx.Int32(0), False)
+        w1 = cvt_pk_fp8_f32(fx.T.i32, e[6], e[7], w1, True)
         words.append(w0)
         words.append(w1)
     return words, biased
@@ -126,12 +124,12 @@ def _quant_block_words(xr, base_elem):
 
     Returns ``(words, biased)``: ``words`` = 8 i32 packing the 32 E4M3 values (4 fp8/word, via
     the HW ``cvt_pk_fp8_f32``); ``biased`` = the E8M0 scale byte in an i32."""
-    f32v = fx.T.VectorType.get([MXFP8_VEC], fx.T.f32())
+    f32v = fx.T.vec(MXFP8_VEC, fx.T.f32)
     subs = MXFP8_BLOCK // MXFP8_VEC
 
     fvs = []
     for s in range_constexpr(subs):
-        vv = buffer_load(xr, base_elem + fx.Int32(s * MXFP8_VEC), vec_width=MXFP8_VEC, dtype=fx.T.bf16())
+        vv = buffer_load(xr, base_elem + fx.Int32(s * MXFP8_VEC), vec_width=MXFP8_VEC, dtype=fx.T.bf16)
         fvs.append(fx.arith.extf(f32v, vv))
     return mxfp8_words_from_f32_subvecs(fvs)
 
@@ -145,7 +143,7 @@ def _e8m0_quant_pack(vals, round_add, target_pow2, lo, hi, cvt, zero_i32):
     for fv in vals:
         a = fmath.absf(fv)
         amax = a if amax is None else fx.arith.maximumf(amax, a)
-    amax_bits = fx.arith.ArithValue(amax).bitcast(fx.T.i32())
+    amax_bits = fx.arith.ArithValue(amax).bitcast(fx.T.i32)
     t = amax_bits + fx.Int32(round_add)
     exp = ((t >> fx.Int32(23)) & fx.Int32(0x1FF)) - fx.Int32(127 + target_pow2)
     exp = fx.arith.select(exp < fx.Int32(-127), fx.Int32(-127), exp)
@@ -154,7 +152,7 @@ def _e8m0_quant_pack(vals, round_add, target_pow2, lo, hi, cvt, zero_i32):
     # scale is an exact power of two, so 1/scale = 2^(127-biased) = float bits ((254-biased) << 23):
     # bit-identical to 1.0/scale but a sub+shift instead of an fdiv. See the all-zero-block trap in
     # mxfp8_words_from_f32_subvecs.
-    inv_scale = fx.arith.ArithValue((fx.Int32(254) - biased) << fx.Int32(23)).bitcast(fx.T.f32())
+    inv_scale = fx.arith.ArithValue((fx.Int32(254) - biased) << fx.Int32(23)).bitcast(fx.T.f32)
     qs = []
     for fv in vals:
         q = fmath.clampf(fx.arith.ArithValue(fv) * inv_scale, lo, hi)
@@ -162,8 +160,8 @@ def _e8m0_quant_pack(vals, round_add, target_pow2, lo, hi, cvt, zero_i32):
     words = []
     for wi in range_constexpr(MXFP8_BLOCK // 4):
         j = wi * 4
-        w = cvt(fx.T.i32(), qs[j], qs[j + 1], zero_i32, False)
-        w = cvt(fx.T.i32(), qs[j + 2], qs[j + 3], w, True)
+        w = cvt(fx.T.i32, qs[j], qs[j + 1], zero_i32, False)
+        w = cvt(fx.T.i32, qs[j + 2], qs[j + 3], w, True)
         words.append(w)
     return words, biased
 
@@ -204,7 +202,7 @@ def _compile_quant(K: int, BT: int = 256):
             base = row * fx.Int32(K) + b * fx.Int32(MXFP8_BLOCK)
             words, biased = _quant_block_words(xr, base)
 
-            buffer_store(fx.arith.ArithValue(biased).trunci(fx.T.i8()), sr, row * fx.Int32(n_blk) + b)
+            buffer_store(fx.arith.ArithValue(biased).trunci(fx.T.i8), sr, row * fx.Int32(n_blk) + b)
 
             base_i32 = row * fx.Int32(K_fp8_i32) + b * fx.Int32(blk_i32)
             for wi in range_constexpr(blk_i32):
@@ -333,15 +331,15 @@ def _compile_colwise_quant_grouped(F: int, is_e5m2: bool, BT: int = 256):
         ofr = create_buffer_resource(OFFS, max_size=True)  # i32 [G+1] unpadded row offsets
         opr = create_buffer_resource(OFFS_PC, max_size=True)  # i32 [G+1] padded block-row offsets
 
-        lo = fx.arith.constant(-fp8_max, type=fx.T.f32())
-        hi = fx.arith.constant(fp8_max, type=fx.T.f32())
-        zero_i32 = fx.arith.constant(0, type=fx.T.i32())
+        lo = fx.arith.constant(-fp8_max, type=fx.T.f32)
+        hi = fx.arith.constant(fp8_max, type=fx.T.f32)
+        zero_i32 = fx.arith.constant(0, type=fx.T.i32)
 
         # workgroup-uniform group metadata (pmb == same for all threads in the WG).
-        g = buffer_load(b2g, pmb, vec_width=1, dtype=fx.T.i32())
-        offs_pc_g = buffer_load(opr, g, vec_width=1, dtype=fx.T.i32())
-        in_off_g = buffer_load(ofr, g, vec_width=1, dtype=fx.T.i32())
-        len_g = buffer_load(lr, g, vec_width=1, dtype=fx.T.i32())
+        g = buffer_load(b2g, pmb, vec_width=1, dtype=fx.T.i32)
+        offs_pc_g = buffer_load(opr, g, vec_width=1, dtype=fx.T.i32)
+        in_off_g = buffer_load(ofr, g, vec_width=1, dtype=fx.T.i32)
+        len_g = buffer_load(lr, g, vec_width=1, dtype=fx.T.i32)
         m_local0 = pmb * fx.Int32(MXFP8_BLOCK) - fx.arith.ArithValue(offs_pc_g)  # M-offset within group
 
         vals = []
@@ -351,15 +349,15 @@ def _compile_colwise_quant_grouped(F: int, is_e5m2: bool, BT: int = 256):
             # clamp pad rows to the group's first row (in-bounds); select 0 for the value.
             m_eff = fx.arith.select(real, m_local, fx.Int32(0))
             row = fx.arith.ArithValue(in_off_g) + fx.arith.ArithValue(m_eff)
-            v = buffer_load(xr, row * fx.Int32(F) + f, vec_width=1, dtype=fx.T.bf16())
-            fv = fx.arith.select(real, fx.arith.extf(fx.T.f32(), v), fx.Float32(0.0))
+            v = buffer_load(xr, row * fx.Int32(F) + f, vec_width=1, dtype=fx.T.bf16)
+            fv = fx.arith.select(real, fx.arith.extf(fx.T.f32, v), fx.Float32(0.0))
             vals.append(fx.arith._to_raw(fv))
 
         words, biased = _e8m0_quant_pack(vals, round_add, target_pow2, lo, hi, cvt, zero_i32)
         base_i32 = f * fx.arith.ArithValue(mpad_i32) + pmb * fx.Int32(blk_i32)
         buffer_store(Vec.from_elements(words[0:4], fx.Int32).ir_value(), qr, base_i32)
         buffer_store(Vec.from_elements(words[4:8], fx.Int32).ir_value(), qr, base_i32 + fx.Int32(4))
-        buffer_store(fx.arith.ArithValue(biased).trunci(fx.T.i8()), sr, f * fx.arith.ArithValue(npblk) + pmb)
+        buffer_store(fx.arith.ArithValue(biased).trunci(fx.T.i8), sr, f * fx.arith.ArithValue(npblk) + pmb)
 
     @flyc.jit
     def launch(X, Q, S, BLK2GRP, LENS, OFFS, OFFS_PC, mpad_i32, npblk, n_pblk, stream: fx.Stream):
@@ -503,14 +501,14 @@ def _compile_colwise_requant_grouped_fp8in(F: int, is_e5m2_out: bool, BT: int = 
         outq_lds = lds.outq
         scale_lds = lds.scale
 
-        lo = fx.arith.constant(-fp8_max, type=fx.T.f32())
-        hi = fx.arith.constant(fp8_max, type=fx.T.f32())
-        zero_i32 = fx.arith.constant(0, type=fx.T.i32())
+        lo = fx.arith.constant(-fp8_max, type=fx.T.f32)
+        hi = fx.arith.constant(fp8_max, type=fx.T.f32)
+        zero_i32 = fx.arith.constant(0, type=fx.T.i32)
 
-        g = buffer_load(b2g, pmb0, vec_width=1, dtype=fx.T.i32())
-        offs_pc_g = buffer_load(opr, g, vec_width=1, dtype=fx.T.i32())
-        in_off_g = buffer_load(ofr, g, vec_width=1, dtype=fx.T.i32())
-        len_g = buffer_load(lr, g, vec_width=1, dtype=fx.T.i32())
+        g = buffer_load(b2g, pmb0, vec_width=1, dtype=fx.T.i32)
+        offs_pc_g = buffer_load(opr, g, vec_width=1, dtype=fx.T.i32)
+        in_off_g = buffer_load(ofr, g, vec_width=1, dtype=fx.T.i32)
+        len_g = buffer_load(lr, g, vec_width=1, dtype=fx.T.i32)
         m_local0 = pmb0 * fx.Int32(MXFP8_BLOCK) - fx.arith.ArithValue(offs_pc_g)
         scol_base = ftile * fx.Int32(SCPT)  # first rowwise scale col of this F-tile
         scol_local = tid // fx.Int32(MXFP8_BLOCK)  # this column's scol within the tile
@@ -527,8 +525,8 @@ def _compile_colwise_requant_grouped_fp8in(F: int, is_e5m2_out: bool, BT: int = 
             r = e // fx.Int32(SCPT)
             j = e % fx.Int32(SCPT)
             _, srow = row_of(r)
-            se_ld = buffer_load(xsr, srow * fx.Int32(F32) + (scol_base + j), vec_width=1, dtype=fx.T.i8())
-            se_ld_i32 = fx.arith.ArithValue(se_ld).extui(fx.T.i32())
+            se_ld = buffer_load(xsr, srow * fx.Int32(F32) + (scol_base + j), vec_width=1, dtype=fx.T.i8)
+            se_ld_i32 = fx.arith.ArithValue(se_ld).extui(fx.T.i32)
             fx.make_view(fx.add_offset(scale_lds.ptr, fx.make_int_tuple(e)), fx.make_layout(1, 1)).store(
                 Vec.from_elements([fx.arith._to_raw(se_ld_i32)], fx.Int32)
             )
@@ -540,16 +538,16 @@ def _compile_colwise_requant_grouped_fp8in(F: int, is_e5m2_out: bool, BT: int = 
             for i in range_constexpr(MXFP8_BLOCK):
                 r = mb * MXFP8_BLOCK + i
                 real, row = row_of(fx.Int32(r))
-                qb = buffer_load(xqr, row * fx.Int32(F) + f, vec_width=1, dtype=fx.T.i8())
-                qb_i32 = fx.arith.ArithValue(qb).extui(fx.T.i32())
-                fq = cvt_f32_fp8(fx.T.f32(), fx.arith._to_raw(qb_i32), 0)
+                qb = buffer_load(xqr, row * fx.Int32(F) + f, vec_width=1, dtype=fx.T.i8)
+                qb_i32 = fx.arith.ArithValue(qb).extui(fx.T.i32)
+                fq = cvt_f32_fp8(fx.T.f32, fx.arith._to_raw(qb_i32), 0)
                 sv_s = Vec(
                     fx.make_view(
                         fx.add_offset(scale_lds.ptr, fx.make_int_tuple(fx.Int32(r * SCPT) + scol_local)),
                         fx.make_layout(1, 1),
                     ).load()
                 )
-                sc = (fx.arith.ArithValue(fx.Int32(sv_s[0])) << fx.Int32(23)).bitcast(fx.T.f32())
+                sc = (fx.arith.ArithValue(fx.Int32(sv_s[0])) << fx.Int32(23)).bitcast(fx.T.f32)
                 dv = fx.arith.mulf(fx.arith.ArithValue(fq), sc)
                 fv = fx.arith.select(real, dv, fx.Float32(0.0))
                 vals.append(fx.arith._to_raw(fv))
@@ -561,7 +559,7 @@ def _compile_colwise_requant_grouped_fp8in(F: int, is_e5m2_out: bool, BT: int = 
                     fx.make_layout(1, 1),
                 ).store(Vec.from_elements([words[w]], fx.Int32))
             buffer_store(
-                fx.arith.ArithValue(biased).trunci(fx.T.i8()),
+                fx.arith.ArithValue(biased).trunci(fx.T.i8),
                 sr,
                 f * fx.arith.ArithValue(npblk) + (pmb0 + fx.Int32(mb)),
             )
@@ -803,9 +801,9 @@ def compile_rowcol_dual_pack_grouped(F: int, BT: int = 256):
         srr = create_buffer_resource(SRAW, max_size=True)
         pmbr = create_buffer_resource(PMB_META, max_size=True)
         mb = pmb * fx.Int32(4)
-        in_off_g = buffer_load(pmbr, mb + fx.Int32(1), vec_width=1, dtype=fx.T.i32())
-        len_g = buffer_load(pmbr, mb + fx.Int32(2), vec_width=1, dtype=fx.T.i32())
-        m_local0 = fx.arith.ArithValue(buffer_load(pmbr, mb + fx.Int32(3), vec_width=1, dtype=fx.T.i32()))
+        in_off_g = buffer_load(pmbr, mb + fx.Int32(1), vec_width=1, dtype=fx.T.i32)
+        len_g = buffer_load(pmbr, mb + fx.Int32(2), vec_width=1, dtype=fx.T.i32)
+        m_local0 = fx.arith.ArithValue(buffer_load(pmbr, mb + fx.Int32(3), vec_width=1, dtype=fx.T.i32))
 
         flat = tid + pi * BT
         if flat < fx.Int32(n_row_pack_slots):
@@ -820,9 +818,9 @@ def compile_rowcol_dual_pack_grouped(F: int, BT: int = 256):
                 for bb in range_constexpr(4):
                     raw_b = (kkp * fx.Int32(4) + fx.Int32(bb)) * fx.Int32(4) + g_out
                     scale_byte = buffer_load(
-                        srr, global_row * fx.Int32(n_blk) + raw_b, vec_width=1, dtype=fx.T.i8()
+                        srr, global_row * fx.Int32(n_blk) + raw_b, vec_width=1, dtype=fx.T.i8
                     )
-                    b_i32 = fx.arith.extui(fx.T.i32(), scale_byte)
+                    b_i32 = fx.arith.extui(fx.T.i32, scale_byte)
                     packed = packed | ((b_i32 & fx.Int32(0xFF)) << (fx.Int32(bb) * fx.Int32(8)))
                 buffer_store(packed, aspr, _preshuffle_a_pack4_idx(global_row, kkp, g_out, K128p))
 
