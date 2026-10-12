@@ -14,8 +14,8 @@ Forward and backward dispatch independently, which is only sound because both ba
 save and consume the same ``o`` / ``lse``: either backward is correct on either forward's
 output. Pin a backend if one implementation is wanted for both passes.
 
-FLYDSL is the fast path (gfx950), TRITON the reference oracle and non-gfx950 fallback;
-the caller passes which to prefer as ``default_backend``.
+FLYDSL is the fast path (gfx950, and gfx1250 through its own wave32 kernels), TRITON the
+reference oracle and fallback; the caller passes which to prefer as ``default_backend``.
 """
 
 from typing import Optional, Tuple
@@ -23,7 +23,13 @@ from typing import Optional, Tuple
 import torch
 
 from primus_turbo.flydsl.attention.sparse_mla_bwd import sparse_mla_bwd_flydsl
+from primus_turbo.flydsl.attention.sparse_mla_bwd_gfx1250 import (
+    sparse_mla_bwd_gfx1250,
+)
 from primus_turbo.flydsl.attention.sparse_mla_fwd import sparse_mla_fwd_flydsl
+from primus_turbo.flydsl.attention.sparse_mla_fwd_gfx1250 import (
+    sparse_mla_fwd_gfx1250,
+)
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
     BackendChoice,
@@ -34,7 +40,7 @@ from primus_turbo.pytorch.core.backend import (
     PrecisionType,
     TuneCache,
 )
-from primus_turbo.pytorch.core.utils import is_gfx950
+from primus_turbo.pytorch.core.utils import is_gfx950, is_gfx1250
 from primus_turbo.triton.attention.sparse_mla import (
     sparse_mla_bwd_triton,
     sparse_mla_fwd_triton,
@@ -53,7 +59,7 @@ class SparseMlaFwdFlydslBackend(KernelBackend):
     def can_handle(q, topk_indices, **kwargs) -> bool:
         _, num_heads, d_qk = q.shape
         return (
-            is_gfx950()
+            (is_gfx950() or is_gfx1250())
             and q.dtype == torch.bfloat16
             and d_qk == _DSV4_QK_DIM
             and num_heads % 32 == 0
@@ -62,6 +68,10 @@ class SparseMlaFwdFlydslBackend(KernelBackend):
 
     @staticmethod
     def execute(q, kv, topk_indices, attn_sink, kv_lora_rank, scale, **kwargs):
+        if is_gfx1250():
+            return sparse_mla_fwd_gfx1250(
+                q, kv, topk_indices, attn_sink=attn_sink, kv_lora_rank=kv_lora_rank, scale=scale
+            )
         return sparse_mla_fwd_flydsl(
             q, kv, topk_indices, attn_sink=attn_sink, kv_lora_rank=kv_lora_rank, scale=scale
         )
@@ -95,7 +105,7 @@ class SparseMlaBwdFlydslBackend(KernelBackend):
     def can_handle(q, topk_indices, **kwargs) -> bool:
         _, num_heads, d_qk = q.shape
         return (
-            is_gfx950()
+            (is_gfx950() or (is_gfx1250() and 128 % num_heads == 0))
             and q.dtype == torch.bfloat16
             and d_qk == _DSV4_QK_DIM
             and num_heads % 32 == 0
@@ -104,6 +114,10 @@ class SparseMlaBwdFlydslBackend(KernelBackend):
 
     @staticmethod
     def execute(q, kv, o, do, topk_indices, lse, attn_sink, kv_lora_rank, scale, **kwargs):
+        if is_gfx1250():
+            return sparse_mla_bwd_gfx1250(
+                q, kv, o, do, topk_indices, lse, attn_sink=attn_sink, kv_lora_rank=kv_lora_rank, scale=scale
+            )
         return sparse_mla_bwd_flydsl(
             q, kv, o, do, topk_indices, lse, attn_sink=attn_sink, kv_lora_rank=kv_lora_rank, scale=scale
         )
