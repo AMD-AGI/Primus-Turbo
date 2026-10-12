@@ -151,19 +151,25 @@ from flydsl.expr.typing import Vector as Vec
 # implementation submodule directly.
 _raw = arith._to_raw
 
-QK_RMSNORM_ROPE_HEAD_DIM = 64
-_D = QK_RMSNORM_ROPE_HEAD_DIM
-_HALF = _D // 2
+# D=128 (Qwen3: NG=4, NPG=8) keeps the same 8-element lane chunk, so a row spans
+# 8 lanes and a wave carries 8 rows instead of 16; everything else is shared.
+QK_RMSNORM_ROPE_HEAD_DIMS = (64, 128)
 _WARP = 64
 _WAVES = 4
 _BLOCK_THREADS = _WARP * _WAVES
 
-_LANES_PER_ROW = 4
-_EPL = _HALF // _LANES_PER_ROW  # 8 elements per lane per half
-_ROWS_PER_WAVE = _WARP // _LANES_PER_ROW  # 16
+_EPL = 8  # elements per lane per half: one dwordx4 BF16 load/store
 
 
-def _check_row_tileable(S: int, B: int, NG: int, NPG: int) -> None:
+def _lanes_per_row(D: int) -> int:
+    return D // 2 // _EPL  # 4 at D=64, 8 at D=128
+
+
+def _rows_per_wave(D: int) -> int:
+    return _WARP // _lanes_per_row(D)  # 16 at D=64, 8 at D=128
+
+
+def _check_row_tileable(S: int, B: int, NG: int, NPG: int, D: int) -> None:
     """CODE-REVIEW fix: the P0a row/lane tiling packs ``_ROWS_PER_WAVE`` (16)
     head rows into one wave and derives slot counts via plain integer
     division (``q_heads // _ROWS_PER_WAVE``, ``(B * NG) // _ROWS_PER_WAVE``
@@ -179,17 +185,20 @@ def _check_row_tileable(S: int, B: int, NG: int, NPG: int) -> None:
     """
     if min(S, B, NG, NPG) <= 0:
         raise ValueError(f"qk_rmsnorm_rope: S/B/NG/NPG must be positive, got {S}/{B}/{NG}/{NPG}")
+    if D not in QK_RMSNORM_ROPE_HEAD_DIMS:
+        raise ValueError(f"qk_rmsnorm_rope: head_dim must be one of {QK_RMSNORM_ROPE_HEAD_DIMS}, got {D}")
+    rows_per_wave = _rows_per_wave(D)
     q_heads = NG * NPG
-    if q_heads % _ROWS_PER_WAVE:
+    if q_heads % rows_per_wave:
         raise ValueError(
             f"qk_rmsnorm_rope: NG*NPG={q_heads} must be a multiple of "
-            f"_ROWS_PER_WAVE={_ROWS_PER_WAVE} for the vectorized row tiling "
+            f"rows_per_wave={rows_per_wave} (head_dim {D}) for the vectorized row tiling "
             "(campaign round P0a); this shape is unsupported by the current kernel."
         )
-    if (B * NG) % _ROWS_PER_WAVE:
+    if (B * NG) % rows_per_wave:
         raise ValueError(
             f"qk_rmsnorm_rope: B*NG={B * NG} must be a multiple of "
-            f"_ROWS_PER_WAVE={_ROWS_PER_WAVE} for the vectorized row tiling "
+            f"rows_per_wave={rows_per_wave} (head_dim {D}) for the vectorized row tiling "
             "(campaign round P0a); this shape is unsupported by the current kernel."
         )
 
@@ -267,11 +276,11 @@ def _wave_sum_f32(value):
     return value
 
 
-def _row_sum_f32(value):
-    """Sum across the _LANES_PER_ROW lanes that share one head row."""
+def _row_sum_f32(value, lanes_per_row):
+    """Sum across the lanes_per_row lanes that share one head row."""
     value = fx.arith.ArithValue(value)
     distance = 1
-    while distance < _LANES_PER_ROW:
+    while distance < lanes_per_row:
         value = value.addf(fx.arith.ArithValue(value.shuffle_xor(distance, _WARP)))
         distance *= 2
     return value
@@ -301,6 +310,27 @@ def _load_f32x8(rsrc, offset):
     ]
 
 
+# A row's hi half sits half * 2 bytes past its lo half. Up to 64 bytes that is an inline
+# soffset constant (D=64). Beyond it the soffset needs an SGPR, and a dwordx4 store with an
+# SGPR soffset followed by a VALU write of its data VGPRs is a gfx950 hazard LLVM does not
+# pad: the last lanes of each 16-lane group store clobbered data. So D=128 folds the half
+# into the VGPR offset instead, which lowers to the store's immediate offset field.
+_MAX_INLINE_SOFFSET_BYTES = 64
+
+
+def _load_hi(rsrc, offset, half):
+    if half * 2 <= _MAX_INLINE_SOFFSET_BYTES:
+        return buffer_ops.buffer_load(rsrc, offset, vec_width=_EPL, dtype=fx.BFloat16, soffset_bytes=half * 2)
+    return buffer_ops.buffer_load(rsrc, offset + fx.Int32(half), vec_width=_EPL, dtype=fx.BFloat16)
+
+
+def _store_hi(data, rsrc, offset, half):
+    if half * 2 <= _MAX_INLINE_SOFFSET_BYTES:
+        buffer_ops.buffer_store(data, rsrc, offset, soffset_bytes=half * 2)
+    else:
+        buffer_ops.buffer_store(data, rsrc, offset + fx.Int32(half))
+
+
 def _store_f32_chunks(rsrc, base, vals):
     """Store a python list of f32 as the widest legal buffer_store chunks."""
     i = 0
@@ -316,7 +346,11 @@ def _store_f32_chunks(rsrc, base, vals):
         i += w
 
 
-def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float, cycles: int):
+def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, D: int, eps: float, cycles: int):
+    _D = D
+    _HALF = D // 2
+    _LANES_PER_ROW = _lanes_per_row(D)
+    _ROWS_PER_WAVE = _rows_per_wave(D)
     packed_heads = NG * (NPG + 2)
     q_heads = NG * NPG
     q_groups_per_token = q_heads // _ROWS_PER_WAVE  # 4
@@ -404,9 +438,7 @@ def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float, cycles: int)
             token = seq * fx.Int32(B) + btok
             src = token * fx.Int32(packed_heads * _D) + pack_in_token
             x_lo = buffer_ops.buffer_load(packed_rsrc, src, vec_width=_EPL, dtype=fx.BFloat16)
-            x_hi = buffer_ops.buffer_load(
-                packed_rsrc, src, vec_width=_EPL, dtype=fx.BFloat16, soffset_bytes=_HALF * 2
-            )
+            x_hi = _load_hi(packed_rsrc, src, _HALF)
 
             xl = [_f32(Vec(x_lo)[t]) for t in range_constexpr(_EPL)]
             xh = [_f32(Vec(x_hi)[t]) for t in range_constexpr(_EPL)]
@@ -415,7 +447,7 @@ def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float, cycles: int)
             for t in range_constexpr(_EPL):
                 acc = acc + xl[t] * xl[t]
                 acc = acc + xh[t] * xh[t]
-            sumsq = _row_sum_f32(acc)
+            sumsq = _row_sum_f32(acc, _LANES_PER_ROW)
             mean = fx.Float32(sumsq) / fx.Float32(float(_D))
             rstd = fx.Float32(fmath.rsqrt(mean + fx.Float32(eps), fastmath="afn"))
 
@@ -433,10 +465,10 @@ def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float, cycles: int)
             dst = token * out_heads * fx.Int32(_D) + out_in_token
             if is_q:
                 buffer_ops.buffer_store(_raw(v_lo), qout_rsrc, dst)
-                buffer_ops.buffer_store(_raw(v_hi), qout_rsrc, dst, soffset_bytes=_HALF * 2)
+                _store_hi(_raw(v_hi), qout_rsrc, dst, _HALF)
             else:
                 buffer_ops.buffer_store(_raw(v_lo), kout_rsrc, dst)
-                buffer_ops.buffer_store(_raw(v_hi), kout_rsrc, dst, soffset_bytes=_HALF * 2)
+                _store_hi(_raw(v_hi), kout_rsrc, dst, _HALF)
             # P0b: rstd is deliberately not stored -- QRSTD/KRSTD now only
             # carry the cached eps scalar the backward reads; see module
             # docstring.
@@ -446,24 +478,25 @@ def _make_fwd_kernel(S: int, B: int, NG: int, NPG: int, eps: float, cycles: int)
     return kernel, slots
 
 
-def _rows_sum_f32(value):
-    """Sum across the _ROWS_PER_WAVE rows a wave carries (lane bits 2..5)."""
+def _rows_sum_f32(value, lanes_per_row):
+    """Sum across the rows a wave carries (the lane bits above lanes_per_row)."""
     value = fx.arith.ArithValue(value)
-    distance = _LANES_PER_ROW
+    distance = lanes_per_row
     while distance < _WARP:
         value = value.addf(fx.arith.ArithValue(value.shuffle_xor(distance, _WARP)))
         distance *= 2
     return value
 
 
-def _bwd_slot_counts(B: int, NG: int, NPG: int):
-    """Derive the P0c slot layout: one wave owns _ROWS_PER_WAVE *contiguous*
-    head rows of a single sequence position instead of _ROWS_PER_WAVE
+def _bwd_slot_counts(B: int, NG: int, NPG: int, D: int):
+    """Derive the P0c slot layout: one wave owns rows_per_wave *contiguous*
+    head rows of a single sequence position instead of rows_per_wave
     token-strided rows of a single head slot."""
+    rows_per_wave = _rows_per_wave(D)
     q_heads = NG * NPG
-    q_blocks_per_token = q_heads // _ROWS_PER_WAVE  # 4
+    q_blocks_per_token = q_heads // rows_per_wave  # 4
     q_slots = B * q_blocks_per_token  # 16
-    kv_slots = (B * NG) // _ROWS_PER_WAVE  # 2
+    kv_slots = (B * NG) // rows_per_wave  # 2
     return q_blocks_per_token, q_slots, kv_slots, q_slots + 2 * kv_slots
 
 
@@ -489,9 +522,9 @@ def _xcd_chunk(block_x, nwg, chunk):
     return base + x * fx.Int32(chunk) + j
 
 
-def _accumulate_rows(rsrc, row0, rows_per_wave: int, lane):
+def _accumulate_rows(rsrc, row0, rows_per_wave: int, lane, _D: int):
     """Sum `rows_per_wave` contiguous rows of a (*, _D) f32 buffer into one
-    scalar per lane, where `lane` (0.._D) owns a fixed column.  Used by the
+    scalar per lane, where `lane` (0.._WARP) owns a fixed column.  Used by the
     Q2 dgamma fold-reduce kernel: no cross-lane or cross-wave communication
     is needed since each lane already owns a distinct column and each wave
     owns a distinct, disjoint row range.  Fully unrolled with `rows_per_wave`
@@ -512,11 +545,11 @@ def _accumulate_rows(rsrc, row0, rows_per_wave: int, lane):
     return acc
 
 
-def _fold_wave_counts(B: int, NG: int, NPG: int):
+def _fold_wave_counts(B: int, NG: int, NPG: int, D: int):
     """Row counts for the Q2 dgamma fold-reduce kernel at the current P0c
     slot layout / _BWD_GRID_CYCLES (both unchanged by this round -- only the
     *post*-processing of DQG_PART/DKG_PART changes)."""
-    _, q_slots, kv_slots, _ = _bwd_slot_counts(B, NG, NPG)
+    _, q_slots, kv_slots, _ = _bwd_slot_counts(B, NG, NPG, D)
     r_q = _BWD_GRID_CYCLES * q_slots
     r_k = _BWD_GRID_CYCLES * kv_slots
     fold_waves_q = r_q // _FOLD_ROWS_PER_WAVE
@@ -526,14 +559,17 @@ def _fold_wave_counts(B: int, NG: int, NPG: int):
     return fold_waves_q, fold_waves_k
 
 
-def _make_fold_kernel(fold_waves_q: int, fold_waves_k: int, rows_per_wave: int):
+def _make_fold_kernel(fold_waves_q: int, fold_waves_k: int, rows_per_wave: int, D: int):
     """Q2: collapse DQG_PART (fold_waves_q*rows_per_wave, D) and DKG_PART
     (fold_waves_k*rows_per_wave, D) down to (fold_waves_q, D) / (fold_waves_k,
     D) f32 tensors in one combined launch (is_q-style wave dispatch, same
     convention _make_bwd_kernel uses to combine Q/K/V in one grid).  No
-    atomics: every wave still writes a unique output row."""
+    atomics: every wave still writes a unique output row.  At D=128 each lane
+    folds two columns, lane and lane + 64."""
+    _D = D
     total_waves = fold_waves_q + fold_waves_k
     assert total_waves % _WAVES == 0
+    assert _D % _WARP == 0
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def kernel(DQG_PART: fx.Tensor, DKG_PART: fx.Tensor, DQG_SMALL: fx.Tensor, DKG_SMALL: fx.Tensor):
@@ -548,20 +584,28 @@ def _make_fold_kernel(fold_waves_q: int, fold_waves_k: int, rows_per_wave: int):
             rsrc = buffer_ops.create_buffer_resource(DQG_PART, max_size=True)
             out_rsrc = buffer_ops.create_buffer_resource(DQG_SMALL, max_size=True)
             row0 = global_wave * fx.Int32(rows_per_wave)
-            acc = _accumulate_rows(rsrc, row0, rows_per_wave, lane)
-            buffer_ops.buffer_store(acc, out_rsrc, global_wave * fx.Int32(_D) + lane)
+            for c in range_constexpr(0, _D, _WARP):
+                col = lane + fx.Int32(c)
+                acc = _accumulate_rows(rsrc, row0, rows_per_wave, col, _D)
+                buffer_ops.buffer_store(acc, out_rsrc, global_wave * fx.Int32(_D) + col)
         else:
             k_wave = global_wave - fx.Int32(fold_waves_q)
             rsrc = buffer_ops.create_buffer_resource(DKG_PART, max_size=True)
             out_rsrc = buffer_ops.create_buffer_resource(DKG_SMALL, max_size=True)
             row0 = k_wave * fx.Int32(rows_per_wave)
-            acc = _accumulate_rows(rsrc, row0, rows_per_wave, lane)
-            buffer_ops.buffer_store(acc, out_rsrc, k_wave * fx.Int32(_D) + lane)
+            for c in range_constexpr(0, _D, _WARP):
+                col = lane + fx.Int32(c)
+                acc = _accumulate_rows(rsrc, row0, rows_per_wave, col, _D)
+                buffer_ops.buffer_store(acc, out_rsrc, k_wave * fx.Int32(_D) + col)
 
     return kernel, total_waves
 
 
-def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int, cycles: int):
+def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int, D: int, cycles: int):
+    _D = D
+    _HALF = D // 2
+    _LANES_PER_ROW = _lanes_per_row(D)
+    _ROWS_PER_WAVE = _rows_per_wave(D)
     packed_heads = NG * (NPG + 2)
     q_heads = NG * NPG
     # P0c: a wave owns _ROWS_PER_WAVE rows that are CONTIGUOUS head rows of
@@ -571,7 +615,7 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int, cycles: int):
     # K/V: 8 group rows x 2 batches of one seq position.  This is the
     # forward's own mapping, measured faster on an identical grid /
     # instruction / byte-count controlled copy (campaign ANALYZE round 3).
-    q_blocks_per_token, q_slots, kv_slots, slots = _bwd_slot_counts(B, NG, NPG)
+    q_blocks_per_token, q_slots, kv_slots, slots = _bwd_slot_counts(B, NG, NPG, D)
     nwg = cycles * slots // _WAVES
     xcd_chunk = slots // _WAVES  # one cycle = 5 workgroups
 
@@ -680,13 +724,9 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int, cycles: int):
                 dst = token * fx.Int32(packed_heads * _D) + q_pack_in_tok
                 src = token * fx.Int32(q_heads * _D) + q_src_in_tok
                 gl_v = buffer_ops.buffer_load(dq_rsrc, src, vec_width=_EPL, dtype=fx.BFloat16)
-                gh_v = buffer_ops.buffer_load(
-                    dq_rsrc, src, vec_width=_EPL, dtype=fx.BFloat16, soffset_bytes=_HALF * 2
-                )
+                gh_v = _load_hi(dq_rsrc, src, _HALF)
                 xl_v = buffer_ops.buffer_load(packed_rsrc, dst, vec_width=_EPL, dtype=fx.BFloat16)
-                xh_v = buffer_ops.buffer_load(
-                    packed_rsrc, dst, vec_width=_EPL, dtype=fx.BFloat16, soffset_bytes=_HALF * 2
-                )
+                xh_v = _load_hi(packed_rsrc, dst, _HALF)
                 # P0b: recompute rstd from the packed row instead of loading
                 # it.  Identical per-row reduction order to the forward
                 # (`_row_sum_f32` over the same lo/hi pairs) and the same
@@ -699,7 +739,7 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int, cycles: int):
                     sq = sq + _xh * _xh
                 rstd = fx.Float32(
                     fmath.rsqrt(
-                        fx.Float32(_row_sum_f32(sq)) / fx.Float32(float(_D)) + eps_v,
+                        fx.Float32(_row_sum_f32(sq, _LANES_PER_ROW)) / fx.Float32(float(_D)) + eps_v,
                         fastmath="afn",
                     )
                 )
@@ -729,16 +769,14 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int, cycles: int):
                     du_lo.append(dul)
                     du_hi.append(duh)
 
-                scale = fx.Float32(_row_sum_f32(dot)) / fx.Float32(float(_D))
+                scale = fx.Float32(_row_sum_f32(dot, _LANES_PER_ROW)) / fx.Float32(float(_D))
                 dx_lo = []
                 dx_hi = []
                 for t in range_constexpr(_EPL):
                     dx_lo.append(((du_lo[t] - u_lo[t] * scale) * rstd).to(fx.BFloat16))
                     dx_hi.append(((du_hi[t] - u_hi[t] * scale) * rstd).to(fx.BFloat16))
                 buffer_ops.buffer_store(_raw(Vec.from_elements(dx_lo, fx.BFloat16)), dpacked_rsrc, dst)
-                buffer_ops.buffer_store(
-                    _raw(Vec.from_elements(dx_hi, fx.BFloat16)), dpacked_rsrc, dst, soffset_bytes=_HALF * 2
-                )
+                _store_hi(_raw(Vec.from_elements(dx_hi, fx.BFloat16)), dpacked_rsrc, dst, _HALF)
 
                 dg_lo = Vec(
                     arith.AddFOp(
@@ -765,8 +803,12 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int, cycles: int):
             # versus the old cycles * q_heads), and the un-editable wrapper's
             # `.sum(dim=0)` is agnostic to that count.
             part = (cycle * fx.Int32(q_slots) + slot) * fx.Int32(_D) + chunk
-            red_lo = [fx.Float32(_rows_sum_f32(fx.Float32(dg_lo[t]))) for t in range_constexpr(_EPL)]
-            red_hi = [fx.Float32(_rows_sum_f32(fx.Float32(dg_hi[t]))) for t in range_constexpr(_EPL)]
+            red_lo = [
+                fx.Float32(_rows_sum_f32(fx.Float32(dg_lo[t]), _LANES_PER_ROW)) for t in range_constexpr(_EPL)
+            ]
+            red_hi = [
+                fx.Float32(_rows_sum_f32(fx.Float32(dg_hi[t]), _LANES_PER_ROW)) for t in range_constexpr(_EPL)
+            ]
             _store_f32_chunks(dqg_part_rsrc, part, red_lo)
             _store_f32_chunks(dqg_part_rsrc, part + fx.Int32(_HALF), red_hi)
         elif is_k:
@@ -786,13 +828,9 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int, cycles: int):
                 dst = token * fx.Int32(packed_heads * _D) + k_pack_in_tok
                 src = token * fx.Int32(NG * _D) + kv_src_in_tok
                 gl_v = buffer_ops.buffer_load(dk_rsrc, src, vec_width=_EPL, dtype=fx.BFloat16)
-                gh_v = buffer_ops.buffer_load(
-                    dk_rsrc, src, vec_width=_EPL, dtype=fx.BFloat16, soffset_bytes=_HALF * 2
-                )
+                gh_v = _load_hi(dk_rsrc, src, _HALF)
                 xl_v = buffer_ops.buffer_load(packed_rsrc, dst, vec_width=_EPL, dtype=fx.BFloat16)
-                xh_v = buffer_ops.buffer_load(
-                    packed_rsrc, dst, vec_width=_EPL, dtype=fx.BFloat16, soffset_bytes=_HALF * 2
-                )
+                xh_v = _load_hi(packed_rsrc, dst, _HALF)
                 # P0b: recompute rstd from the packed row instead of loading
                 # it (same mechanism as the is_q branch above).
                 sq = fx.Float32(0.0)
@@ -803,7 +841,7 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int, cycles: int):
                     sq = sq + _xh * _xh
                 rstd = fx.Float32(
                     fmath.rsqrt(
-                        fx.Float32(_row_sum_f32(sq)) / fx.Float32(float(_D)) + eps_v,
+                        fx.Float32(_row_sum_f32(sq, _LANES_PER_ROW)) / fx.Float32(float(_D)) + eps_v,
                         fastmath="afn",
                     )
                 )
@@ -833,16 +871,14 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int, cycles: int):
                     du_lo.append(dul)
                     du_hi.append(duh)
 
-                scale = fx.Float32(_row_sum_f32(dot)) / fx.Float32(float(_D))
+                scale = fx.Float32(_row_sum_f32(dot, _LANES_PER_ROW)) / fx.Float32(float(_D))
                 dx_lo = []
                 dx_hi = []
                 for t in range_constexpr(_EPL):
                     dx_lo.append(((du_lo[t] - u_lo[t] * scale) * rstd).to(fx.BFloat16))
                     dx_hi.append(((du_hi[t] - u_hi[t] * scale) * rstd).to(fx.BFloat16))
                 buffer_ops.buffer_store(_raw(Vec.from_elements(dx_lo, fx.BFloat16)), dpacked_rsrc, dst)
-                buffer_ops.buffer_store(
-                    _raw(Vec.from_elements(dx_hi, fx.BFloat16)), dpacked_rsrc, dst, soffset_bytes=_HALF * 2
-                )
+                _store_hi(_raw(Vec.from_elements(dx_hi, fx.BFloat16)), dpacked_rsrc, dst, _HALF)
 
                 dg_lo = Vec(
                     arith.AddFOp(
@@ -863,8 +899,12 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int, cycles: int):
                 seq = seq + fx.Int32(cycles)
 
             part = (cycle * fx.Int32(kv_slots) + slot - fx.Int32(q_slots)) * fx.Int32(_D) + chunk
-            red_lo = [fx.Float32(_rows_sum_f32(fx.Float32(dg_lo[t]))) for t in range_constexpr(_EPL)]
-            red_hi = [fx.Float32(_rows_sum_f32(fx.Float32(dg_hi[t]))) for t in range_constexpr(_EPL)]
+            red_lo = [
+                fx.Float32(_rows_sum_f32(fx.Float32(dg_lo[t]), _LANES_PER_ROW)) for t in range_constexpr(_EPL)
+            ]
+            red_hi = [
+                fx.Float32(_rows_sum_f32(fx.Float32(dg_hi[t]), _LANES_PER_ROW)) for t in range_constexpr(_EPL)
+            ]
             _store_f32_chunks(dkg_part_rsrc, part, red_lo)
             _store_f32_chunks(dkg_part_rsrc, part + fx.Int32(_HALF), red_hi)
         else:
@@ -874,11 +914,9 @@ def _make_bwd_kernel(S: int, B: int, NG: int, NPG: int, cycles: int):
                 dst = token * fx.Int32(packed_heads * _D) + v_pack_in_tok
                 src = token * fx.Int32(NG * _D) + v_src_in_tok
                 gl_v = buffer_ops.buffer_load(dv_rsrc, src, vec_width=_EPL, dtype=fx.BFloat16)
-                gh_v = buffer_ops.buffer_load(
-                    dv_rsrc, src, vec_width=_EPL, dtype=fx.BFloat16, soffset_bytes=_HALF * 2
-                )
+                gh_v = _load_hi(dv_rsrc, src, _HALF)
                 buffer_ops.buffer_store(_raw(gl_v), dpacked_rsrc, dst)
-                buffer_ops.buffer_store(_raw(gh_v), dpacked_rsrc, dst, soffset_bytes=_HALF * 2)
+                _store_hi(_raw(gh_v), dpacked_rsrc, dst, _HALF)
                 seq = seq + fx.Int32(cycles)
 
     return kernel
@@ -899,10 +937,11 @@ def _compiled_fwd(
     B: fx.Constexpr[int],
     NG: fx.Constexpr[int],
     NPG: fx.Constexpr[int],
+    D: fx.Constexpr[int],
     EPS: fx.Constexpr[float],
     stream: fx.Stream,
 ):
-    kernel, slots = _make_fwd_kernel(S, B, NG, NPG, EPS, _FWD_GRID_CYCLES)
+    kernel, slots = _make_fwd_kernel(S, B, NG, NPG, D, EPS, _FWD_GRID_CYCLES)
     assert (_FWD_GRID_CYCLES * slots) % _WAVES == 0
     grid_x = _FWD_GRID_CYCLES * slots // _WAVES
     kernel(PACKED, QG, KG, COSINE, SINE, QOUT, KOUT, QRSTD, KRSTD).launch(
@@ -929,12 +968,13 @@ def _compiled_bwd(
     B: fx.Constexpr[int],
     NG: fx.Constexpr[int],
     NPG: fx.Constexpr[int],
+    D: fx.Constexpr[int],
     stream: fx.Stream,
 ):
-    _, _, _, slots = _bwd_slot_counts(B, NG, NPG)
+    _, _, _, slots = _bwd_slot_counts(B, NG, NPG, D)
     assert (_BWD_GRID_CYCLES * slots) % _WAVES == 0
     grid_x = _BWD_GRID_CYCLES * slots // _WAVES
-    kernel = _make_bwd_kernel(S, B, NG, NPG, _BWD_GRID_CYCLES)
+    kernel = _make_bwd_kernel(S, B, NG, NPG, D, _BWD_GRID_CYCLES)
     kernel(DQ, DK, DV, PACKED, QG, KG, COSINE, SINE, QRSTD, KRSTD, DPACKED, DQG_PART, DKG_PART).launch(
         grid=(grid_x, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream
     )
@@ -949,9 +989,10 @@ def _compiled_fold(
     FOLD_WAVES_Q: fx.Constexpr[int],
     FOLD_WAVES_K: fx.Constexpr[int],
     ROWS_PER_WAVE: fx.Constexpr[int],
+    D: fx.Constexpr[int],
     stream: fx.Stream,
 ):
-    kernel, total_waves = _make_fold_kernel(FOLD_WAVES_Q, FOLD_WAVES_K, ROWS_PER_WAVE)
+    kernel, total_waves = _make_fold_kernel(FOLD_WAVES_Q, FOLD_WAVES_K, ROWS_PER_WAVE, D)
     assert total_waves % _WAVES == 0
     grid_x = total_waves // _WAVES
     kernel(DQG_PART, DKG_PART, DQG_SMALL, DKG_SMALL).launch(
@@ -994,12 +1035,12 @@ def flydsl_qkv_rmsnorm_rope_forward(qkv, q_gamma, k_gamma, freqs, split_sizes, e
     """
     S, B, NG, _ = qkv.shape
     q_size, k_size, _ = split_sizes
-    npg = q_size // _D
-    assert k_size == _D
-    _check_row_tileable(S, B, NG, npg)
-    q = torch.empty((S, B, NG * npg, _D), device=qkv.device, dtype=qkv.dtype)
-    k = torch.empty((S, B, NG, _D), device=qkv.device, dtype=qkv.dtype)
-    v = qkv[..., -_D:].contiguous()
+    D = k_size
+    npg = q_size // D
+    _check_row_tileable(S, B, NG, npg, D)
+    q = torch.empty((S, B, NG * npg, D), device=qkv.device, dtype=qkv.dtype)
+    k = torch.empty((S, B, NG, D), device=qkv.device, dtype=qkv.dtype)
+    v = qkv[..., -D:].contiguous()
     eps_f = float(eps)
     stream = torch.cuda.current_stream(qkv.device)
     q_rstd = _eps_tensor(qkv.device, eps_f, stream)
@@ -1007,10 +1048,10 @@ def flydsl_qkv_rmsnorm_rope_forward(qkv, q_gamma, k_gamma, freqs, split_sizes, e
     # Q6: read the stream once and thread it into _cached_cos_sin (see
     # module docstring) instead of two independent current-stream queries.
     cosine, sine = _cached_cos_sin(freqs, stream)
-    args = (qkv, q_gamma, k_gamma, cosine, sine, q, k, q_rstd, k_rstd, S, B, NG, npg, eps_f, stream)
+    args = (qkv, q_gamma, k_gamma, cosine, sine, q, k, q_rstd, k_rstd, S, B, NG, npg, D, eps_f, stream)
     _launch(
         _compiled_fwd,
-        ("fwd", qkv.device.index, S, B, NG, npg, eps_f, qkv.dtype),
+        ("fwd", qkv.device.index, S, B, NG, npg, D, eps_f, qkv.dtype),
         lambda: dict(
             PACKED=qkv,
             QG=q_gamma,
@@ -1025,6 +1066,7 @@ def flydsl_qkv_rmsnorm_rope_forward(qkv, q_gamma, k_gamma, freqs, split_sizes, e
             B=B,
             NG=NG,
             NPG=npg,
+            D=D,
             EPS=eps_f,
             stream=stream,
         ),
@@ -1041,15 +1083,15 @@ def flydsl_qkv_rmsnorm_rope_backward(dq, dk, dv, qkv, q_gamma, k_gamma, freqs, q
     """
     S, B, NG, _ = qkv.shape
     q_size, k_size, _ = split_sizes
-    npg = q_size // _D
-    assert k_size == _D
-    _check_row_tileable(S, B, NG, npg)
+    D = k_size
+    npg = q_size // D
+    _check_row_tileable(S, B, NG, npg, D)
     dqkv = torch.empty_like(qkv)
     # P0c: the dgamma partial-row count is now driven by the new slot layout
     # (q_slots / kv_slots), not q_heads / NG directly -- see _bwd_slot_counts.
-    _, q_slots, kv_slots, _ = _bwd_slot_counts(B, NG, npg)
-    dqg_part = torch.empty((_BWD_GRID_CYCLES * q_slots, _D), device=qkv.device, dtype=torch.float32)
-    dkg_part = torch.empty((_BWD_GRID_CYCLES * kv_slots, _D), device=qkv.device, dtype=torch.float32)
+    _, q_slots, kv_slots, _ = _bwd_slot_counts(B, NG, npg, D)
+    dqg_part = torch.empty((_BWD_GRID_CYCLES * q_slots, D), device=qkv.device, dtype=torch.float32)
+    dkg_part = torch.empty((_BWD_GRID_CYCLES * kv_slots, D), device=qkv.device, dtype=torch.float32)
     # Q6: see flydsl_qkv_rmsnorm_rope_forward -- one stream query threaded
     # into _cached_cos_sin instead of two independent ones.
     stream = torch.cuda.current_stream(qkv.device)
@@ -1072,11 +1114,12 @@ def flydsl_qkv_rmsnorm_rope_backward(dq, dk, dv, qkv, q_gamma, k_gamma, freqs, q
         B,
         NG,
         npg,
+        D,
         stream,
     )
     _launch(
         _compiled_bwd,
-        ("bwd", qkv.device.index, S, B, NG, npg, qkv.dtype),
+        ("bwd", qkv.device.index, S, B, NG, npg, D, qkv.dtype),
         lambda: dict(
             DQ=dq,
             DK=dk,
@@ -1095,6 +1138,7 @@ def flydsl_qkv_rmsnorm_rope_backward(dq, dk, dv, qkv, q_gamma, k_gamma, freqs, q
             B=B,
             NG=NG,
             NPG=npg,
+            D=D,
             stream=stream,
         ),
         args,
@@ -1103,9 +1147,9 @@ def flydsl_qkv_rmsnorm_rope_backward(dq, dk, dv, qkv, q_gamma, k_gamma, freqs, q
     # Q2: fold-reduce the large dgamma partials down to a tiny tensor before
     # handing them to the un-editable wrapper's `.sum(dim=0).to(dtype)` --
     # see module docstring / _make_fold_kernel / _FOLD_ROWS_PER_WAVE.
-    fold_waves_q, fold_waves_k = _fold_wave_counts(B, NG, npg)
-    dqg_small = torch.empty((fold_waves_q, _D), device=qkv.device, dtype=torch.float32)
-    dkg_small = torch.empty((fold_waves_k, _D), device=qkv.device, dtype=torch.float32)
+    fold_waves_q, fold_waves_k = _fold_wave_counts(B, NG, npg, D)
+    dqg_small = torch.empty((fold_waves_q, D), device=qkv.device, dtype=torch.float32)
+    dkg_small = torch.empty((fold_waves_k, D), device=qkv.device, dtype=torch.float32)
     fold_args = (
         dqg_part,
         dkg_part,
@@ -1114,11 +1158,12 @@ def flydsl_qkv_rmsnorm_rope_backward(dq, dk, dv, qkv, q_gamma, k_gamma, freqs, q
         fold_waves_q,
         fold_waves_k,
         _FOLD_ROWS_PER_WAVE,
+        D,
         stream,
     )
     _launch(
         _compiled_fold,
-        ("fold", qkv.device.index, B, NG, npg),
+        ("fold", qkv.device.index, B, NG, npg, D),
         lambda: dict(
             DQG_PART=dqg_part,
             DKG_PART=dkg_part,
@@ -1127,6 +1172,7 @@ def flydsl_qkv_rmsnorm_rope_backward(dq, dk, dv, qkv, q_gamma, k_gamma, freqs, q
             FOLD_WAVES_Q=fold_waves_q,
             FOLD_WAVES_K=fold_waves_k,
             ROWS_PER_WAVE=_FOLD_ROWS_PER_WAVE,
+            D=D,
             stream=stream,
         ),
         fold_args,

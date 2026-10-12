@@ -4,7 +4,8 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Launch and validation helpers for GPT-OSS fused QK RMSNorm + RoPE."""
+"""Launch and validation helpers for fused QK RMSNorm + RoPE (GPT-OSS head_dim 64,
+Qwen3 head_dim 128)."""
 
 from __future__ import annotations
 
@@ -13,7 +14,7 @@ from typing import Sequence
 import torch
 
 from primus_turbo.flydsl.rope.qk_rmsnorm_rope_kernel import (
-    QK_RMSNORM_ROPE_HEAD_DIM,
+    QK_RMSNORM_ROPE_HEAD_DIMS,
     _check_row_tileable,
     flydsl_qkv_rmsnorm_rope_backward,
     flydsl_qkv_rmsnorm_rope_forward,
@@ -27,8 +28,7 @@ def qk_rmsnorm_rope_shape_error(
     freqs: torch.Tensor,
     split_sizes: Sequence[int],
 ) -> str | None:
-    """Return why this input is unsupported, or ``None`` for the GPT-OSS contract."""
-    D = QK_RMSNORM_ROPE_HEAD_DIM
+    """Return why this input is unsupported, or ``None`` when the kernels accept it."""
     if qkv.ndim != 4:
         return f"qkv must be [S,B,NG,(NPG+2)*D], got {tuple(qkv.shape)}"
     if qkv.dtype != torch.bfloat16 or not qkv.is_contiguous():
@@ -36,12 +36,15 @@ def qk_rmsnorm_rope_shape_error(
     if len(split_sizes) != 3:
         return f"split_sizes must be [q,k,v], got {list(split_sizes)}"
     q_size, k_size, v_size = split_sizes
-    if q_size <= 0 or q_size % D or k_size != D or v_size != D:
+    D = k_size
+    if D not in QK_RMSNORM_ROPE_HEAD_DIMS:
+        return f"head_dim (k width) must be one of {QK_RMSNORM_ROPE_HEAD_DIMS}, got {list(split_sizes)}"
+    if q_size <= 0 or q_size % D or v_size != D:
         return f"expected q multiple of {D} and k=v={D}, got {list(split_sizes)}"
     if qkv.shape[-1] != q_size + k_size + v_size:
         return f"packed width {qkv.shape[-1]} != q+k+v {q_size + k_size + v_size}"
     try:
-        _check_row_tileable(qkv.shape[0], qkv.shape[1], qkv.shape[2], q_size // D)
+        _check_row_tileable(qkv.shape[0], qkv.shape[1], qkv.shape[2], q_size // D, D)
     except ValueError as exc:
         return str(exc)
     if q_gamma.shape != (D,) or k_gamma.shape != (D,):
