@@ -290,6 +290,8 @@ MXTilePack with_f8(MXTilePack p, const F8Row &f8, const MXPackFmt row_fmt, const
         PRIMUS_TURBO_CHECK(t->is_cuda() && t->device() == input.device() && t->scalar_type() == at::kFloat &&
                                t->numel() == 1,
                            "row_qscale and row_amax must be one-element fp32 tensors on the input's device");
+    PRIMUS_TURBO_CHECK(q.data_ptr() != a.data_ptr(),
+                       "row_qscale and row_amax must not share storage (the kernel reads one while others max into the other)");
     p.tw_scale = q.data_ptr<float>();
     p.tw_amax  = reinterpret_cast<uint32_t *>(a.data_ptr<float>());
     return p;

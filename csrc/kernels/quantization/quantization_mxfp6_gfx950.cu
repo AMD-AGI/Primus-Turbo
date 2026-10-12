@@ -13,7 +13,9 @@
 namespace primus_turbo {
 
 namespace mxfp6_detail {
-MXTilePack g_ts_row, g_ts_col;
+// thread_local: a scope sets these and launches on the same host thread; packs launched from another thread
+// (the autograd engine's) must never see them.
+thread_local MXTilePack g_ts_row, g_ts_col;
 } // namespace mxfp6_detail
 
 // Outside the file's anonymous namespace: the op layer (another translation unit) calls these.

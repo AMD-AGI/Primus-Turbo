@@ -158,3 +158,24 @@ def test_fused_compiles_with_the_amax_mutation():
     a2 = torch.zeros(1, device="cuda")
     assert torch.equal(rp, MX.quantize_mx_fused_dual_f8(y, None, b, 1, False, _fmt(), qs, a2)[0])
     assert amax.item() == a2.item()
+
+
+def test_out_variant_rejects_the_fp8_row_format():
+    """An FP8 row format through an op that does not carry the multiplier and the amax raises, rather than launching
+    a kernel with null pointers."""
+    MX = _mx()
+    x = _data(14)
+    fmt = _fmt()
+    # buffers exactly as the FP8 op allocates them, so the call gets past the size checks to the launch
+    ref = MX.quantize_mx_dual_f8(x, fmt, torch.ones(1, device="cuda"), torch.zeros(1, device="cuda"))
+    bufs = [torch.empty_like(t) for t in ref]
+    with pytest.raises(RuntimeError, match="quantize_mx_\\*_f8"):
+        MX.quantize_mx_dual_out(x, *bufs, fmt)
+    torch.cuda.synchronize()
+
+
+def test_rejects_aliased_scale_and_amax():
+    MX = _mx()
+    t = torch.ones(1, device="cuda")
+    with pytest.raises(RuntimeError, match="share storage"):
+        MX.quantize_mx_f8(_data(15), _fmt(False), t, t)

@@ -52,7 +52,7 @@ using namespace primus_turbo::dtype;
 // The tile-pack parameters of the current launch (MXTilePackScope): one definition, in quantization_mxfp6_gfx950.cu;
 // read by the launchers of every translation unit that instantiates the packers.
 namespace mxfp6_detail {
-extern MXTilePack g_ts_row, g_ts_col;
+extern thread_local MXTilePack g_ts_row, g_ts_col;
 } // namespace mxfp6_detail
 using mxfp6_detail::g_ts_col;
 using mxfp6_detail::g_ts_row;
@@ -1786,6 +1786,11 @@ void launch_dual(const dim3 grid, const dim3 block, hipStream_t stream, const DT
             : 0u;
     const mxfp4_emit::TilePackArgs row_ts = to_args(mx_tile_pack_row());
     const mxfp4_emit::TilePackArgs col_ts = to_args(mx_tile_pack_col());
+    // Tensorwise FP8 rows read their multiplier and write their amax through these pointers; only the *_f8 ops set
+    // them (with_f8). Any other op handed an Fp8Tw row format would launch with null pointers.
+    PRIMUS_TURBO_CHECK(row_fmt != MXPackFmt::Fp8Tw || (row_ts.tw_scale != nullptr && row_ts.tw_amax != nullptr),
+                       "a tensorwise FP8 row format (fmt row code 0x2) needs the quantize_mx_*_f8 ops");
+    PRIMUS_TURBO_CHECK(col_fmt != MXPackFmt::Fp8Tw, "tensorwise FP8 is a row format only");
     if (row_ts.fp4_tile2d || col_ts.fp4_tile2d) {
         // The tile amax is taken on the staged values in the whole-tile emit path: it must see what
         // the emit converts (no prologue, no rotation), and the experimental per-stage schedule
