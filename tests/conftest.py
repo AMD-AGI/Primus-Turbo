@@ -29,12 +29,25 @@ if _worker_id is not None:
 
 
 # Suites that run on gfx1250 (MI455X). Everything else is skipped there -- see
-# pytest_collection_modifyitems. Paths are matched as suffixes of the test file path.
+# pytest_collection_modifyitems. Paths are matched as suffixes of the test file path; an
+# optional "::<prefix>" narrows an entry to the test ids starting with that prefix.
 _GFX1250_ENABLED_TESTS = (
     # bf16 grouped GEMM through the backend registry: Triton, plus the FlyDSL
     # WMMA/TDM kernels in grouped_gemm_bf16_kernel_gfx1250.py.
     "tests/pytorch/ops/test_grouped_gemm.py",
+    # Sparse MLA (sparse_mla_{fwd,bwd}_gfx1250.py); every backend it can pick runs here.
+    "tests/pytorch/ops/test_attention.py::test_sparse_mla_op",
 )
+
+
+def _gfx1250_enabled(item) -> bool:
+    path = str(getattr(item, "path", item.fspath)).replace(os.sep, "/")
+    test_id = item.nodeid.split("::", 1)[-1]
+    for enabled in _GFX1250_ENABLED_TESTS:
+        suffix, _, prefix = enabled.partition("::")
+        if path.endswith(suffix) and test_id.startswith(prefix):
+            return True
+    return False
 
 
 def pytest_addoption(parser):
@@ -79,8 +92,7 @@ def pytest_collection_modifyitems(config, items):
         # a second test_grouped_gemm.py under tests/jax/.
         skip_gfx1250 = pytest.mark.skip(reason="Not yet supported on gfx1250")
         for item in items:
-            path = str(getattr(item, "path", item.fspath)).replace(os.sep, "/")
-            if not any(path.endswith(enabled) for enabled in _GFX1250_ENABLED_TESTS):
+            if not _gfx1250_enabled(item):
                 item.add_marker(skip_gfx1250)
         # Fall through: the enabled items still need the --dist-only / --deterministic
         # filtering below.

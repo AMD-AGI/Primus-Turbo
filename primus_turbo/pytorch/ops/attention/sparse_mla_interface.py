@@ -97,6 +97,13 @@ def sparse_mla_func(
 
     Returns:
         o: (T, H, 512) bf16 (and lse (T, H) fp32 when return_lse).
+
+    Warning (gfx1250): the DSV4 bands are detected from shapes alone, without reading
+    ``topk_indices``. ``num_kv == T`` with ``topk == 128`` is taken as each token's 128-row sliding
+    window (kv rows t - 127 .. t); ``num_kv = T + P`` with ``T % P == 0``, ``T // P >= 64`` and
+    ``topk >= 128 + P`` as that window plus a causal pool (kv row T + p visible iff
+    ``t >= (T // P) * (p + 1) - 1``). Inputs with these shapes but other indices, e.g. several
+    packed sequences whose windows / pools stop at sequence boundaries, get wrong results.
     """
     return SparseMLAFunc.apply(
         q,
