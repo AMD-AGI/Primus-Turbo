@@ -139,11 +139,11 @@ def attention_triton_forward_impl(
 
     # stores LSE the log of the normalization constant / sum of expoential score(unnormalzied probablities)
     if is_varlen:
-        softmax_lse = torch.empty((q.shape[0] * 2, nheads_q), device=q.device, dtype=torch.float32)
+        softmax_lse = torch.empty((q.shape[0], nheads_q), device=q.device, dtype=torch.float32)
         stride_lse_m, stride_lse_h = softmax_lse.stride()
         stride_lse_z = 0
     else:
-        softmax_lse = torch.empty((batch, nheads_q, max_seqlens_q * 2), device=q.device, dtype=torch.float32)
+        softmax_lse = torch.empty((batch, nheads_q, max_seqlens_q), device=q.device, dtype=torch.float32)
         stride_lse_z, stride_lse_h, stride_lse_m = softmax_lse.stride()
 
     if bias is not None:
@@ -290,13 +290,15 @@ def _attention_triton_forward_impl_fake(
     else:
         exp_scores = torch.empty([], device=q.device, dtype=torch.float32)
 
-    softmax_lse = torch.empty((batch_q, nheads_q, max_seqlen_q * 2), device=q.device, dtype=torch.float32)
+    softmax_lse = torch.empty((batch_q, nheads_q, max_seqlen_q), device=q.device, dtype=torch.float32)
 
     return o, softmax_lse, exp_scores
 
 
 @_torch_custom_op_wrapper(
-    "primus_turbo::attention_triton_backward_impl", mutates_args=("dq", "dk", "dv"), device_types="cuda"
+    "primus_turbo::attention_triton_backward_impl",
+    mutates_args=("dq", "dk", "dv", "delta"),
+    device_types="cuda",
 )
 def attention_triton_backward_impl(
     do: torch.Tensor,
@@ -308,7 +310,7 @@ def attention_triton_backward_impl(
     k_descale: torch.Tensor,
     v_descale: torch.Tensor,
     p_scale: float,
-    softmax_lse_delta: torch.Tensor,
+    softmax_lse: torch.Tensor,
     dq: Optional[torch.Tensor],
     dk: Optional[torch.Tensor],
     dv: Optional[torch.Tensor],
@@ -322,7 +324,12 @@ def attention_triton_backward_impl(
     window_size_right: int,
     alibi_slopes: Optional[torch.Tensor],
     use_fp8: bool,
+    delta: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``delta`` (rowsum(o * do), shaped like ``softmax_lse``) is scratch the kernels fill;
+    pass a buffer only to read it back afterwards, e.g. for a sink gradient. It has no
+    default: the custom op bumps the version of every mutated arg by position, which fails
+    for an omitted one."""
 
     use_exp2 = True
     layout = "bshd"
@@ -388,17 +395,19 @@ def attention_triton_backward_impl(
     assert k.is_contiguous()
     assert v.is_contiguous()
     assert o.is_contiguous()
-    assert softmax_lse_delta.is_contiguous()
+    assert softmax_lse.is_contiguous()
     assert q_descale.is_contiguous()
     assert k_descale.is_contiguous()
 
-    # # init delta
-    # delta = torch.empty_like(softmax_lse)
+    # The kernels index delta with softmax_lse's strides.
+    if delta is None:
+        delta = torch.empty_like(softmax_lse)
+    assert delta.shape == softmax_lse.shape and delta.is_contiguous()
     if is_varlen:
-        stride_lse_delta_m, stride_lse_delta_h = softmax_lse_delta.stride()
+        stride_lse_delta_m, stride_lse_delta_h = softmax_lse.stride()
         stride_lse_delta_z = 0
     else:
-        stride_lse_delta_z, stride_lse_delta_h, stride_lse_delta_m = softmax_lse_delta.stride()
+        stride_lse_delta_z, stride_lse_delta_h, stride_lse_delta_m = softmax_lse.stride()
 
     if use_fp8:
         do_fp8 = torch.empty_like(do, dtype=get_f8_bwd_dtype())
@@ -433,7 +442,7 @@ def attention_triton_backward_impl(
         do,
         do_fp8,
         do_descale,
-        softmax_lse_delta,
+        delta,
         use_fp8,
         stride_oz,
         stride_oh,
@@ -484,7 +493,8 @@ def attention_triton_backward_impl(
         dq,
         dk,
         dv,
-        softmax_lse_delta,
+        softmax_lse,
+        delta,
         stride_dq_all,
         stride_qz,
         stride_qh,
@@ -565,7 +575,8 @@ def attention_triton_backward_impl(
         dq,
         dk,
         dv,
-        softmax_lse_delta,
+        softmax_lse,
+        delta,
         stride_dq_all,
         stride_qz,
         stride_qh,
@@ -661,6 +672,7 @@ def _attention_triton_backward_impl_fake(
     window_size_right: int,
     alibi_slopes: Optional[torch.Tensor],
     use_fp8: bool,
+    delta: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     dq_out, dk_out, dv_out = (
         torch.empty_like(q, dtype=bwd_torch_dtype),
@@ -684,7 +696,7 @@ def dense_forward(
     sink: Optional[torch.Tensor] = None,
     window_size: Tuple[int, int] = (-1, -1),
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Dense bshd forward. Returns (out, softmax_lse)."""
+    """Dense bshd forward. Returns (out, softmax_lse), softmax_lse being [B, Hq, Sq]."""
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
     one = torch.ones(1, device=q.device, dtype=torch.float32)
@@ -710,22 +722,7 @@ def dense_forward(
     return out, lse
 
 
-def _lse_delta_views(lse_delta: torch.Tensor, seqlen_q: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Split the [B, Hq, seqlen_q * 2] scratch into per-row (lse, delta).
-
-    The forward writes LSE at block offset ``m * BLOCK_M * 2`` and the backward preprocess
-    writes delta at ``+ BLOCK_M`` of the same block, so the two interleave per BLOCK_M rather
-    than per row. BLOCK_M is the module-level FIXED_BLOCK_M, not an autotuned value, so the
-    layout is knowable here. Both views are trimmed back to seqlen_q.
-    """
-    row = torch.arange(seqlen_q, device=lse_delta.device)
-    # Index rather than reshape: the scratch is allocated as seqlen_q * 2, which need not be
-    # a whole number of 2 * BLOCK_M blocks, so a view would be wrong on a ragged tail.
-    lse_idx = (row // FIXED_BLOCK_M) * (2 * FIXED_BLOCK_M) + (row % FIXED_BLOCK_M)
-    return lse_delta[:, :, lse_idx], lse_delta[:, :, lse_idx + FIXED_BLOCK_M]
-
-
-def dense_sink_grad(lse_delta: torch.Tensor, sink: torch.Tensor, seqlen_q: int) -> torch.Tensor:
+def dense_sink_grad(lse: torch.Tensor, delta: torch.Tensor, sink: torch.Tensor) -> torch.Tensor:
     """Gradient of the loss w.r.t. the per-head sink logits.
 
     The sink is one extra softmax term with no value vector, so ``p_sink = exp(sink - lse)``
@@ -733,9 +730,9 @@ def dense_sink_grad(lse_delta: torch.Tensor, sink: torch.Tensor, seqlen_q: int) 
     backward already computes -- which is also why dq/dk/dv need no kernel change: they read
     p back from an LSE that already includes the sink.
 
-    Call this only after the backward kernel has filled in delta.
+    ``lse`` and ``delta`` are both [B, Hq, Sq]; call this only after the backward kernel has
+    filled in delta.
     """
-    lse, delta = _lse_delta_views(lse_delta, seqlen_q)
     p_sink = torch.exp(sink.float().view(1, -1, 1) - lse)
     return -(p_sink * delta).sum(dim=(0, 2)).to(sink.dtype)
 
@@ -757,6 +754,7 @@ def dense_backward(
         softmax_scale = q.shape[-1] ** -0.5
     one = torch.ones(1, device=q.device, dtype=torch.float32)
     seqlen_q, seqlen_k = q.shape[1], k.shape[1]
+    delta = None if sink is None else torch.empty_like(softmax_lse)
     # The kernel asserts all of these are contiguous, and q/k/v arrive as the caller saved
     # them -- which is sbhd-ordered bytes whenever qkv_format said so.
     dq, dk, dv = attention_triton_backward_impl(
@@ -783,7 +781,7 @@ def dense_backward(
         window_size[1],
         None,
         False,
+        delta,
     )
-    # dsink needs delta, which the call above writes into softmax_lse in place.
-    dsink = None if sink is None else dense_sink_grad(softmax_lse, sink, seqlen_q)
+    dsink = None if sink is None else dense_sink_grad(softmax_lse, delta, sink)
     return dq, dk, dv, dsink
