@@ -48,6 +48,7 @@ from primus_turbo.flydsl.quantization.mxfp4_quant_kernel_flux import (
     _DG_KK,
 )
 from primus_turbo.flydsl.utils.gemm_epilogue_helper_main import (
+    A6W4_COL_PITCH_PAD,
     A6W4_COL_SCALE_BIAS,
     MXFP4ColQuantStore,
     MXFP6RowQuantStore,
@@ -1871,18 +1872,43 @@ _A6W4_DEFAULT = (128, 256, 128, 0, 0, 0, 2, 0, 0, 1, 2, 0, 0, 0, 2)
 _A6W4_LAUNCH_CACHE: dict = {}
 
 
-def _rq_level(m, n, k, want, a_pack=1):
-    """The fused-operand level this shape's config can actually host, at most ``want``.
+LDS_LIMIT_B = 160 * 1024
 
-    The col pack's staging band is LDS the A ring does not give back, and the FP8-padded A
-    packing (``a_pack=0``, a K-byte row) already asks for a third more of it than the dense
-    one, so the two together run the tile past the 160 KB the hardware has. Dropping to the
-    row half frees the band."""
+
+def _lds_bytes(cfg, a_pack, rq, pad16):
+    """What the tile asks of LDS: the A ring, the A-scale slots and the col pack's band.
+
+    Mirrors the kernel's own arithmetic, which is the only way the host can tell a shape
+    that will build from one that will not -- the col band is a pool the A ring does not
+    give back, and the FP8-padded A row (``a_pack=0``) is a third wider than the dense one.
+    """
+    tm, tn, tk, a_stg = cfg[0], cfg[1], cfg[2], cfg[10]
+    if a_pack > 0:  # dense FP6 planes: no chunk padding
+        a_lds = tm * (tk * 3 // 4)
+    else:
+        row_b = tk
+        chunk_rows = 1024 // row_b
+        a_lds = (tm // chunk_rows) * (chunk_rows * row_b + pad16 * 16)
+    sc_lds = (3 if a_stg == 3 else 2) * (tm // 32) * 256
+    cq_lds = 4 * 4 * ((tn // 4) // 2) * (64 + A6W4_COL_PITCH_PAD) if rq >= 2 else 0
+    return a_stg * a_lds + sc_lds + cq_lds
+
+
+def _pad16_for(cfg, a_pack, rq):
+    """The A chunk padding this tile can afford, smallest step that still fits."""
+    for pad in (cfg[5], 4, 0):
+        if pad <= cfg[5] and _lds_bytes(cfg, a_pack, rq, pad) <= LDS_LIMIT_B:
+            return pad
+    return None
+
+
+def _rq_level(m, n, k, want, a_pack=1):
+    """The fused-operand level this shape's config can actually host, at most ``want``."""
     cfg = _A6W4_CONFIGS.get((n, k), _A6W4_DEFAULT)
     tm, tn = cfg[0], cfg[1]
     a_stg, epi, store_mode = cfg[10], cfg[8], cfg[13]
     rq = int(want)
-    if rq >= 2 and not a_pack:
+    if rq >= 2 and _pad16_for(cfg, a_pack, 2) is None:
         rq = 1
     if rq and not (epi == 2 and store_mode == 0 and tm % 64 == 0 and tn % 128 == 0):
         rq = 0
@@ -1959,6 +1985,8 @@ def gemm_a6w4(
     cfg = _A6W4_CONFIGS.get((n, k), _A6W4_DEFAULT)
     tm, tn, tk, wpe, gm, pad16, bpf, sa_lds, epi, xcd, a_stg, a_pipe, fi, store_mode, ahead = cfg
     rq = _rq_level(m, n, k, 2 if row_quant is None and gelu else int(row_quant or 0), a_pack)
+    # A fused store buys its room from the A chunk padding before giving up on fusing.
+    pad16 = _pad16_for(cfg, a_pack, rq) if rq >= 2 else pad16
     c = torch.empty(m, n, dtype=torch.bfloat16, device=aq.device)
     if rq:
         # An FP6 row padded to FP8's length, scales in shuffle_scale_w4 order.

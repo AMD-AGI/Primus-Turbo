@@ -137,16 +137,17 @@ def a6w4_mm_gelu_dual_qa_prequant_w(aq, sa, wq, sb, n, bias=None, act_rounded=Fa
     return (preact, *_packs_or_build(preact, act_rounded, aq, wq, sa, sb, n, k, bias))
 
 
-def a6w4_gelu_dual_eligible(m, n, k):
-    """Whether `a6w4_mm_gelu_dual_*` would fuse at this shape, without running it.
+def a6w4_gelu_dual_eligible(m, n, k, a_pack=1):
+    """Whether `a6w4_mm_gelu_dual_*` would fuse at this shape and activation packing.
 
-    False on the v0 kernel, which has no fused store at all."""
+    ``a_pack`` is 0 for the FP8-padded row the col pack has no LDS left for. False on the v0
+    kernel, which has no fused store at all."""
     from primus_turbo.flydsl.gemm import gemm_a6w4_kernel as impl
 
     fits = getattr(impl, "gelu_dual_eligible", None)
     if fits is None:
         return False
-    return not (m % impl.M_ALIGN or n % 256 or k % 1024) and fits(m, n, k)
+    return not (m % impl.M_ALIGN or n % 256 or k % 1024) and fits(m, n, k, a_pack)
 
 
 def a6w4_mm_qa(aq, sa, b, bias=None):
