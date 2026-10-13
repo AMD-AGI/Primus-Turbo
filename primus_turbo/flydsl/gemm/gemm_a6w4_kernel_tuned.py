@@ -27,7 +27,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, gpu, math, range_constexpr, rocdl
 from flydsl.expr.arith import _to_raw
 from flydsl.expr.typing import (
     BFloat16,
@@ -43,6 +43,12 @@ from flydsl.expr.typing import (
 )
 from flydsl.expr.typing import Vector as Vec
 
+from primus_turbo.flydsl.quantization.mxfp4_quant_kernel_flux import (
+    _DG_KK,
+    _OCML_TANH_C,
+    _TORCH_GELU_KBETA,
+    _struct_f32,
+)
 from primus_turbo.flydsl.utils.gemm_helper import block_mn, run_compiled, xcd_remap_pid
 
 _A_ELEM = {"fp4": Float4E2M1FN, "fp6": Float6E2M3FN, "fp8": Float8E4M3FN}
@@ -151,6 +157,7 @@ def launch_gemm(
     store_mode: Constexpr[int],
     vs_ahead: Constexpr[int],
     a_pack: Constexpr[int],
+    gelu: Constexpr[int],
 ):
     """Direct @flyc.jit launcher. Operands are fx.Pointer (pass ptr_arg(t): raw data_ptr, no
     per-launch DLPack). Compile once with flyc.compile, then cf(*runtime). a_dtype fp4/fp6/fp8
@@ -200,6 +207,84 @@ def launch_gemm(
     a_pack (a_dtype=fp6 only) picks A's packing: 0 = the FP8-padded row-major form, 1 =
     quant_act_a6w4's dense preshuffle. Same MFMA operands either way.
     """
+
+    # The epilogue's GELU, as whole-register-fragment twins of `_gelu1_torch` and the ocml
+    # helpers it is built from. They are nested here, rather than sitting beside their scalar
+    # originals, because the JIT cache key is `_get_func_source` of *this* function plus the
+    # globals *this* code object names: `_collect_dependency_sources` does not descend into
+    # nested code objects, so a body kept outside this text would be traced into the binary
+    # while staying invisible to the key, and editing it would silently reuse the last compile.
+    def _splat(v, c):
+        """``c`` broadcast over ``v``'s shape, so a math builder sees a vector exemplar in args[0]."""
+        return Vec.filled(v.numel, c, Float32)
+
+    def _exp2_native(f):
+        """One `v_exp_f32` per element: the hardware exp2 `__ocml_exp_f32` itself issues.
+        `math.exp2` instead lowers to a denormal-range fixup around it (a compare, two selects,
+        an add and an ldexp), which is dead for the reduced argument here (|f| <= 0.5)."""
+        return Vec.from_elements(
+            [
+                _llvm.call_intrinsic(T.f32, "llvm.amdgcn.exp2.f32", [_to_raw(f[i])], [], [])
+                for i in range(f.numel)
+            ],
+            Float32,
+        )
+
+    def _ldexp_vec(v, e):
+        """``v * 2**e`` per element (one `v_ldexp_f32` each), v a f32 and e an i32 fragment."""
+        return Vec(
+            _llvm.call_intrinsic(
+                Vec.make_type(v.numel, Float32), "llvm.ldexp", [_to_raw(v), _to_raw(e)], [], []
+            ),
+            v.shape,
+            Float32,
+        )
+
+    def _exp2y_ocml_vec(y):
+        """``__ocml_exp_f32(2*y)`` over a whole register fragment, step for step, minus the two
+        range clamps it appends. Both clamps are dead for ``y >= 0``: the underflow one selects
+        the unclamped result for every 2y >= -103.28, and above 2y = 88.7228 the clamp's +inf and
+        the unclamped ldexp (which saturates) are the same value. Callers must therefore keep y
+        finite and non-negative -- `_tanh_ocml_vec` feeds it |v|, so only |v| = inf is outside the
+        domain. Writing the steps out (instead of calling `math.exp`, which scalarises) lets the
+        f32 multiplies, adds and FMAs fold into `v_pk_*` pairs.
+
+        log2(e) is split into a head and the tail of its f32 rounding, as ocml does, so the
+        reduced argument carries more than f32 of precision. Both halves are pre-doubled because
+        the only caller wants exp(2y): doubling moves an exponent field and nothing else, and 2*y
+        is itself exact, so every rounded product downstream is the one `__ocml_exp_f32(2*y)`
+        computes -- the explicit multiply by two just disappears."""
+        hi, lo = _struct_f32(0x4038AA3B), _struct_f32(0x3325705F)
+        a = y * hi
+        b = math.fma(y, _splat(y, hi), -a)
+        n = math.roundeven(a)
+        b = math.fma(_splat(y, lo), y, b)
+        f = (a - n) + b
+        return _ldexp_vec(_exp2_native(f), n.to(Int32))
+
+    def _tanh_ocml_vec(v):
+        """`_tanh_ocml` over a whole register fragment at once. Same operations in the same order
+        on every element, so each result is bit-identical to the scalar form; what changes is
+        that the f32 multiplies/adds/FMAs lower to `v_pk_*` (two elements per instruction)
+        instead of one element each. `rocdl.rcp` has no vector form, so the reciprocal stays per
+        element, and `v_pk_*` has no abs modifier, so |v| costs an explicit `v_and_b32`."""
+        y = math.absf(v)
+        x2 = v * v
+        p = _splat(v, _OCML_TANH_C[0])
+        for c in _OCML_TANH_C[1:]:
+            p = math.fma(x2, p, _splat(v, c))
+        small = math.fma(x2, y * p, y)
+        e = _exp2y_ocml_vec(y)
+        d = e + _splat(v, 1.0)
+        r = Vec.from_elements([Float32(rocdl.rcp(T.f32, _to_raw(d[i]))) for i in range(v.numel)], Float32)
+        big = math.fma(_splat(v, -2.0), r, _splat(v, 1.0))
+        return math.copysign(arith.select(y < _splat(v, 0.625), small, big), v)
+
+    def _gelu1_torch_vec(x):
+        """`_gelu1_torch` over a whole register fragment, bit-identical to calling it per element."""
+        inner = math.fma(_splat(x, _DG_KK), (x * x) * x, x) * _TORCH_GELU_KBETA
+        return (x * 0.5) * (_tanh_ocml_vec(inner) + Float32(1.0))
+
     BM, BN, BK = tile_m, tile_n, tile_k
     if const_expr(out_dtype == "bf16"):
         out_elem = BFloat16
@@ -1314,6 +1399,14 @@ def launch_gemm(
                     if const_expr(has_bias):
                         va = va.to(out_elem).to(Float32) + bias_f[2 * p]
                         vb = vb.to(out_elem).to(Float32) + bias_f[2 * p + 1]
+                    # The consumer's GELU, on the sum this epilogue already holds in f32. Inductor
+                    # folds `out + bias` into its GELU the same way, so the bytes are the ones the
+                    # separate pointwise pass would have written. Taken on the whole 4-element
+                    # fragment rather than per element: same arithmetic in the same order (so the
+                    # result is still bit-identical), but the f32 work folds into v_pk_* pairs.
+                    if const_expr(gelu):
+                        va = _gelu1_torch_vec(va)
+                        vb = _gelu1_torch_vec(vb)
                     d_a0 = rocdl.cvt_pk_bf16_f32(va[0], va[1])
                     d_a1 = rocdl.cvt_pk_bf16_f32(va[2], va[3])
                     d_b0 = rocdl.cvt_pk_bf16_f32(vb[0], vb[1])
@@ -1586,7 +1679,7 @@ _A6W4_DEFAULT = (128, 256, 128, 0, 0, 0, 2, 0, 0, 1, 2, 0, 0, 0, 2)
 _A6W4_LAUNCH_CACHE: dict = {}
 
 
-def gemm_a6w4(aq, wq, sa, sb, n, k, bias=None):
+def gemm_a6w4(aq, wq, sa, sb, n, k, bias=None, gelu=False):
     """C[M, N] bf16 = A6 @ W4^T (+ bias) for the A6W4 forward.
 
     aq    uint8 [M, 3K/4]   dense preshuffled FP6 (E2M3), A_BYTES_PER_32 bytes per 32 values
@@ -1645,11 +1738,14 @@ def gemm_a6w4(aq, wq, sa, sb, n, k, bias=None):
         store_mode,
         ahead,
         a_pack,
+        int(gelu),
     )
     if torch.cuda.is_current_stream_capturing():
         # A flyc.compile'd object regresses under CUDA-graph capture (no recompile mid-capture);
         # fall back to the raw @flyc.jit closure, same rule gemm_mxfp4_kernel.py follows.
         launch_gemm(*args)
     else:
-        run_compiled(_A6W4_LAUNCH_CACHE, (n, k, bias is not None, a_pack), launch_gemm, *args)
+        run_compiled(
+            _A6W4_LAUNCH_CACHE, (n, k, bias is not None, a_pack, bool(gelu)), launch_gemm, *args
+        )
     return c
