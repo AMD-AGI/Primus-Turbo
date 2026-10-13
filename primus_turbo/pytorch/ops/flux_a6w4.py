@@ -73,13 +73,36 @@ def a6w4_mm_prequant_w(a, wq, sb, n, bias=None):
     return c[:m] if mp != m else c
 
 
-def a6w4_mm_gelu_dual_prequant_w(a, wq, sb, n, bias=None):
+def _packs_or_build(preact, act_rounded, aq, wq, sa, sb, n, k, bias):
+    """The epilogue's operands, or the same bytes the long way when it declined the store.
+
+    Declining is a tile property, not an error: a shape whose LDS the col staging band does
+    not fit keeps the three-kernel chain. Returning the packs either way keeps the caller --
+    a custom_op, whose return type is fixed -- out of the business of knowing which it got.
+    """
+    from primus_turbo.flydsl.gemm.gemm_a6w4_kernel import gemm_a6w4
+    from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import flydsl_quant_a6w4_act_dual
+
+    packs = getattr(preact, "a6w4_dual", None)
+    if packs is not None:
+        return packs
+    src = preact if act_rounded else gemm_a6w4(aq, wq, sa, sb, n, k, None)
+    bias_f = 0.0 if act_rounded else bias.float()
+    act = torch.nn.functional.gelu(src.float() + bias_f, approximate="tanh").to(preact.dtype)
+    return flydsl_quant_a6w4_act_dual(act)
+
+
+def a6w4_mm_gelu_dual_prequant_w(a, wq, sb, n, bias=None, act_rounded=False):
     """`a6w4_mm_prequant_w` whose epilogue also builds the activation's A6W4 operands.
 
     Returns ``(preact, aq, sa, co, cs)``: ``preact`` is the GEMM's own bf16 output, which is
     what the MLP's backward differentiates, and the four packs are
     ``flydsl_quant_a6w4_act_dual(gelu(preact, approximate="tanh"))`` byte for byte -- built
     from the accumulator, so that tensor is never written or read back.
+
+    ``act_rounded`` picks which chain is being replaced: 1 for a consumer that read the
+    GEMM's biased output back, 0 for one handed the bias-free output that added the bias in
+    f32 ahead of its own GELU. They differ by one rounding and are not interchangeable.
 
     The fused store is a hint the GEMM can decline, and ``M`` is not padded here because the
     packs would cover the padding; both cases raise rather than return quietly wrong shapes,
@@ -93,26 +116,25 @@ def a6w4_mm_gelu_dual_prequant_w(a, wq, sb, n, bias=None):
     if m % M_ALIGN or n % 256 or k % 1024:
         raise ValueError(f"a6w4_mm_gelu_dual: M={m} must be a multiple of {M_ALIGN}, N={n} of 256, K={k} of 1024")
     aq_in, sa_in = quant_act_a6w4(a.to(torch.bfloat16).contiguous())
-    preact = gemm_a6w4(aq_in, wq, sa_in, sb, n, k, bias, gelu=True, keep_preact=True)
-    packs = getattr(preact, "a6w4_dual", None)
-    if packs is None:
-        raise RuntimeError(f"a6w4_mm_gelu_dual: the GEMM declined the fused store at {m}x{n}x{k}")
-    return (preact, *packs)
+    preact = gemm_a6w4(
+        aq_in, wq, sa_in, sb, n, k, bias, gelu=True, keep_preact=True, act_rounded=act_rounded
+    )
+    return (preact, *_packs_or_build(preact, act_rounded, aq_in, wq, sa_in, sb, n, k, bias))
 
 
-def a6w4_mm_gelu_dual_qa_prequant_w(aq, sa, wq, sb, n, bias=None):
+def a6w4_mm_gelu_dual_qa_prequant_w(aq, sa, wq, sb, n, bias=None, act_rounded=False):
     """`a6w4_mm_gelu_dual_prequant_w` with the activation already quantized."""
-    from primus_turbo.flydsl.gemm.gemm_a6w4_kernel import A_BYTES_PER_32, M_ALIGN, gemm_a6w4
+    from primus_turbo.flydsl.gemm.gemm_a6w4_kernel import M_ALIGN, gemm_a6w4
 
-    m = aq.shape[0]
-    k = aq.shape[1] * 32 // A_BYTES_PER_32
+    # K from the weight, not from the activation's row length: that row is either K*A/32
+    # bytes or FP8-padded to K, and only the weight is one packing.
+    m, k = aq.shape[0], wq.shape[1] * 2
     if m % M_ALIGN or n % 256 or k % 1024:
         raise ValueError(f"a6w4_mm_gelu_dual_qa: M={m} must be a multiple of {M_ALIGN}, N={n} of 256, K={k} of 1024")
-    preact = gemm_a6w4(aq, wq, sa, sb, n, k, bias, gelu=True, keep_preact=True)
-    packs = getattr(preact, "a6w4_dual", None)
-    if packs is None:
-        raise RuntimeError(f"a6w4_mm_gelu_dual_qa: the GEMM declined the fused store at {m}x{n}x{k}")
-    return (preact, *packs)
+    preact = gemm_a6w4(
+        aq, wq, sa, sb, n, k, bias, gelu=True, keep_preact=True, act_rounded=act_rounded
+    )
+    return (preact, *_packs_or_build(preact, act_rounded, aq, wq, sa, sb, n, k, bias))
 
 
 def a6w4_gelu_dual_eligible(m, n, k):

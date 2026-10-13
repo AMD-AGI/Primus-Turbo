@@ -174,6 +174,7 @@ def launch_gemm(
     a_pack: Constexpr[int],
     gelu: Constexpr[int],
     keep_preact: Constexpr[int],
+    act_rounded: Constexpr[int],
     arg_rq: fx.Pointer,
     arg_rs: fx.Pointer,
     arg_cq: fx.Pointer,
@@ -1495,8 +1496,7 @@ def launch_gemm(
                     va = _bf16_round_bias_vec(va, bias_f[2 * p])
                     vb = _bf16_round_bias_vec(vb, bias_f[2 * p + 1])
                 if const_expr(gelu and act):
-                    if const_expr(keep_preact):
-                        # The pass this replaces read C back, so the activation starts there.
+                    if const_expr(act_rounded):
                         va = _bf16_round_vec(va)
                         vb = _bf16_round_vec(vb)
                     va = _gelu1_torch_bf16_vec(va)
@@ -1871,12 +1871,19 @@ _A6W4_DEFAULT = (128, 256, 128, 0, 0, 0, 2, 0, 0, 1, 2, 0, 0, 0, 2)
 _A6W4_LAUNCH_CACHE: dict = {}
 
 
-def _rq_level(m, n, k, want):
-    """The fused-operand level this shape's config can actually host, at most ``want``."""
+def _rq_level(m, n, k, want, a_pack=1):
+    """The fused-operand level this shape's config can actually host, at most ``want``.
+
+    The col pack's staging band is LDS the A ring does not give back, and the FP8-padded A
+    packing (``a_pack=0``, a K-byte row) already asks for a third more of it than the dense
+    one, so the two together run the tile past the 160 KB the hardware has. Dropping to the
+    row half frees the band."""
     cfg = _A6W4_CONFIGS.get((n, k), _A6W4_DEFAULT)
     tm, tn = cfg[0], cfg[1]
     a_stg, epi, store_mode = cfg[10], cfg[8], cfg[13]
     rq = int(want)
+    if rq >= 2 and not a_pack:
+        rq = 1
     if rq and not (epi == 2 and store_mode == 0 and tm % 64 == 0 and tn % 128 == 0):
         rq = 0
     if rq and not (n % tn == 0 and m % 64 == 0):
@@ -1886,12 +1893,14 @@ def _rq_level(m, n, k, want):
     return rq
 
 
-def gelu_dual_eligible(m, n, k):
+def gelu_dual_eligible(m, n, k, a_pack=1):
     """Whether `gemm_a6w4(..., gelu=True)` would attach both fused operand halves here."""
-    return _rq_level(m, n, k, 2) >= 2
+    return _rq_level(m, n, k, 2, a_pack) >= 2
 
 
-def gemm_a6w4(aq, wq, sa, sb, n, k, bias=None, gelu=False, row_quant=None, keep_preact=False):
+def gemm_a6w4(
+    aq, wq, sa, sb, n, k, bias=None, gelu=False, row_quant=None, keep_preact=False, act_rounded=False
+):
     """C[M, N] bf16 = A6 @ W4^T (+ bias) for the A6W4 forward.
 
     aq    uint8 [M, 3K/4]   dense preshuffled FP6 (E2M3), A_BYTES_PER_32 bytes per 32 values
@@ -1904,10 +1913,13 @@ def gemm_a6w4(aq, wq, sa, sb, n, k, bias=None, gelu=False, row_quant=None, keep_
 
     keep_preact leaves C holding the bias-added accumulator rather than the GELU of it,
     which is the tensor the MLP's backward saves; the operands still carry the activation.
-    The activation starts from C's own rounded value, because the pass this replaces read
-    C back: `gelu=True` alone instead activates the unrounded f32 sum, which is what the
-    separate Inductor pointwise over an unbiased C computed. Only meaningful with `gelu`
-    and a level-2 `row_quant`.
+
+    act_rounded says where the activation starts, which is the only thing the two callers
+    disagree on. A consumer that read C back saw the rounded value, so it wants 1; one that
+    was handed the GEMM's bias-free output and added the bias itself, in f32 ahead of its
+    own GELU, saw the unrounded sum and wants 0. Both are byte-exact against their own
+    caller and neither is against the other's. Only meaningful with `gelu` and a level-2
+    `row_quant`.
 
     row_quant additionally writes C's own A6W4 operands -- what
     flydsl_quant_a6w4_act_dual would have produced by reading C back -- while the
@@ -1946,7 +1958,7 @@ def gemm_a6w4(aq, wq, sa, sb, n, k, bias=None, gelu=False, row_quant=None, keep_
     a_pack = 0 if aq.shape[-1] == k else 1  # a K-byte row is the older FP8-padded packing
     cfg = _A6W4_CONFIGS.get((n, k), _A6W4_DEFAULT)
     tm, tn, tk, wpe, gm, pad16, bpf, sa_lds, epi, xcd, a_stg, a_pipe, fi, store_mode, ahead = cfg
-    rq = _rq_level(m, n, k, 2 if row_quant is None and gelu else int(row_quant or 0))
+    rq = _rq_level(m, n, k, 2 if row_quant is None and gelu else int(row_quant or 0), a_pack)
     c = torch.empty(m, n, dtype=torch.bfloat16, device=aq.device)
     if rq:
         # An FP6 row padded to FP8's length, scales in shuffle_scale_w4 order.
@@ -1998,6 +2010,7 @@ def gemm_a6w4(aq, wq, sa, sb, n, k, bias=None, gelu=False, row_quant=None, keep_
         a_pack,
         int(gelu),
         int(keep_preact),
+        int(act_rounded),
         ptr(c_rq if rq else c),
         ptr(c_rs if rq else c),
         ptr(c_cq if rq >= 2 else c),
@@ -2011,7 +2024,7 @@ def gemm_a6w4(aq, wq, sa, sb, n, k, bias=None, gelu=False, row_quant=None, keep_
     else:
         run_compiled(
             _A6W4_LAUNCH_CACHE,
-            (n, k, bias is not None, a_pack, bool(gelu), rq, bool(keep_preact)),
+            (n, k, bias is not None, a_pack, bool(gelu), rq, bool(keep_preact), bool(act_rounded)),
             launch_gemm,
             *args,
         )
