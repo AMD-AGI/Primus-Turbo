@@ -489,8 +489,8 @@ def _emit_dual_body(
     The col half is unchanged. Only the plain 2D path (legpack included) supports it.
 
     ``XSTR`` (legpack only) makes X this leg's own tensor with row stride ``XSTR``, rather than
-    the shared ``[R, XPAD]`` tensor read at column ``XOFF``. ``gelu`` applies `_gelu1_torch` to
-    the loaded bf16 and rounds back to bf16 before the LDS store, so both halves see the bytes a
+    the shared ``[R, XPAD]`` tensor read at column ``XOFF``. ``gelu`` applies `_gelu1_torch_bf16`
+    to the loaded bf16 and rounds back to bf16 before the LDS store, so both halves see the bytes a
     materialised torch ``gelu(x, approximate="tanh")`` would have held. ``BIAS`` (with ``gelu``)
     is this leg's bf16 bias, added in f32 before the GELU: Inductor's fused ``gelu(x + bias)``."""
     if row_fp6 and (batched or padded or row_2d or row_sr or skip_row):
@@ -601,12 +601,11 @@ def _emit_dual_body(
             for q in range_constexpr(4):
                 v2 = _bf16_pair_to_f32(vec[q])
                 g0, g1 = fx.Float32(v2[0]), fx.Float32(v2[1])
-                gelu1 = _gelu1_torch_bf16
                 if BIAS is not None:
+                    # Outside `_gelu1_torch_bf16`'s claim, but only where no scale resolves it.
                     b2 = _bf16_pair_to_f32(bvec[q])
                     g0, g1 = g0 + fx.Float32(b2[0]), g1 + fx.Float32(b2[1])
-                    gelu1 = _gelu1_torch
-                words.append(rocdl.cvt_pk_bf16_f32(gelu1(g0), gelu1(g1)))
+                words.append(rocdl.cvt_pk_bf16_f32(_gelu1_torch_bf16(g0), _gelu1_torch_bf16(g1)))
             vec = Vec.from_elements(words, fx.Int32)
         _lds_store_vec4(lds.buf.ptr, tw, vec)
     # DS writes must retire before any thread reads the tile (a bare s_barrier
@@ -5578,10 +5577,24 @@ def flydsl_quant_a6w4_act_dual(x_bf16):
                                              scale bias 0, FP8-padded packing)
       (co [C, R/2] fp4, cs [C, R/32] e8m0)  the Wgrad col pack, the same bytes as
                                              flydsl_quant_mxfp4_h16_col(x, fp4, 0)
-    Requires a6w4_act_dual_eligible(R, C)."""
+    Requires a6w4_act_dual_eligible(R, C).
+
+    If the producing GEMM already wrote these out of its epilogue (gemm_a6w4's row_quant),
+    there is nothing left to read C back for: level 2 leaves all four packs on
+    `x_bf16.a6w4_dual` and this launches nothing, level 1 leaves the row pair on
+    `x_bf16.a6w4_row` and only the col pack is left to do, which is the col-only kernel over
+    the same input. Same bytes in every case -- that identity is what the A6W4 forward's
+    bench byte-compares."""
     import torch
 
     R, C = x_bf16.shape
+    fused = getattr(x_bf16, "a6w4_dual", None)
+    if fused is not None:
+        return fused
+    fused_row = getattr(x_bf16, "a6w4_row", None)
+    if fused_row is not None:
+        co, cs = flydsl_quant_mxfp4_h16_col(x_bf16, torch.float4_e2m1fn_x2, 0)
+        return fused_row[0], fused_row[1], co, cs
     key = (int(R), int(C))
     ent = _A6W4_DUAL.get(key)
     if ent is None:

@@ -70,6 +70,8 @@ from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import (
     _lds_load1,
     _lds_load_vec4,
     _lds_store1,
+    _mxfp4_scale_rounding_bias,
+    _rht16_pair,
     _sr_hash,
 )
 from primus_turbo.flydsl.utils.gemm_helper_main import (
@@ -549,6 +551,282 @@ class MXFP4DualQuantStore:
         self._stage(rows, grow0, row_limit)
         self._store_colwise(base_col, pad_row0)
         self._store_rowwise(base_col, grow0, row_limit)
+
+
+A6W4_ROW_BLOCK_WORDS = 8  # i32 a micro-block occupies: 24 code bytes plus 8 of padding
+
+
+def _cvt_microblock_to_fp6(vf, scale_native_f32):
+    """32 f32 -> 6 i32 of E2M3 codes, the A6W4 operand's own little-endian stream.
+
+    gfx950 converts a whole micro-block at once and has no narrower form, which is why
+    the caller has to own all 32 values. The convert interleaves its two sources -- code
+    ``2i`` comes from ``src0[i]`` and code ``2i + 1`` from ``src1[i]`` -- so the even
+    elements make one operand and the odd ones the other.
+    """
+    src = [
+        _raw(
+            Vec.from_elements(
+                [fx.Float32(_raw(vf[2 * i + h])) for i in range_constexpr(16)], fx.Float32
+            )
+        )
+        for h in range_constexpr(2)
+    ]
+    v = Vec(rocdl.cvt_scalef32_2xpk16_fp6_f32(T.vec(6, T.i32), src[0], src[1], _raw(scale_native_f32)))
+    return [v[i] for i in range_constexpr(6)]
+
+
+def _amax_tree_i32(vf):
+    """The quantiser's ``_microblock_amax_f`` as a tree rather than a chain.
+
+    ``max`` is associative and commutative (it returns one of its operands, and NaN
+    propagates whatever the order), so the bits are the chain's; only the dependence depth
+    changes, from ``len(vf) - 1`` to three. ``abs`` stays a free VOP3 source modifier, so
+    every node here is one ``v_maximum3_f32``. The depth is what matters: a GEMM epilogue at
+    one wave per SIMD has no other wave to hide a 31-deep VALU chain behind.
+
+    Ternary, not binary, because the instruction is: a binary tree leaves the backend to
+    re-pair what it can and measured 21 ``v_maximum3_f32`` per 32-element micro-block, where
+    folding three at a time by construction is 16 -- the floor, since each one retires two
+    values.
+    """
+    cur = [fm.absf(v) for v in vf]
+    while len(cur) > 2:
+        nxt = [
+            cur[3 * i].maximumf(cur[3 * i + 1]).maximumf(cur[3 * i + 2])
+            for i in range_constexpr(len(cur) // 3)
+        ]
+        nxt.extend(cur[len(cur) - len(cur) % 3 :])
+        cur = nxt
+    if len(cur) == 2:
+        cur = [cur[0].maximumf(cur[1])]
+    return Vec.from_elements([cur[0]], fx.Float32).bitcast(fx.Int32)[0]
+
+
+class MXFP6RowQuantStore:
+    """A6W4's row-wise MXFP6 operand, written straight out of a GEMM epilogue.
+
+    This is the row half of what ``flydsl_quant_a6w4_act_dual`` produces: per 32
+    columns a 2x16 Hadamard, an E8M0 scale off the transformed amax, and 32 E2M3
+    codes, padded out to 32 bytes so an FP6 row is as long as an FP8 one.
+
+    Unlike :class:`MXFP4DualQuantStore` nothing is staged through LDS. A row-wise
+    micro-block is 32 columns of one row and the FP6 convert takes all 32 at once, so
+    the caller has had to gather them into one lane already; LDS would only move them
+    a second time. What is left here is the recipe and the two stores, whose layout is
+    the A6W4 packing's rather than the GEMM's.
+    """
+
+    def __init__(self, out_addr, sc_addr, out_bytes, sc_bytes, scale_rounding_bias, cpol=0):
+        self.srb = fx.Int32(scale_rounding_bias)
+        # cpol for every store below. Leave it at 0: these stores want to coalesce in L2.
+        self.cpol = cpol
+        self.out = _buffer_ops.create_buffer_resource_from_addr(
+            _raw(out_addr), num_records_bytes=_raw(out_bytes)
+        )
+        self.sc = _buffer_ops.create_buffer_resource_from_addr(
+            _raw(sc_addr), num_records_bytes=_raw(sc_bytes)
+        )
+
+    def store_block(self, words, out_off, sc_off):
+        """One micro-block from its 16 bf16 pair words, low half the even column.
+
+        ``out_off`` is the block's first i32 of the operand and ``sc_off`` its scale
+        byte, both already in the packing's own layout -- shuffle_scale_w4 for the
+        scale -- because only the caller knows where its fragment sits in the output.
+
+        The Hadamard's trailing 1/4 is skipped and handed to the scale as ``exp_up``,
+        exactly as the standalone quantiser does, so the codes are the same bits.
+        """
+        bits = []
+        for w in words:
+            bits.append(w << 16)
+            bits.append(w & 0xFFFF0000)
+        vf = _rht16_pair(
+            [Vec.from_elements([b], fx.Int32).bitcast(fx.Float32)[0] for b in bits], post_scale=False
+        )
+        native, biased = _compute_scale_native(_amax_tree_i32(vf), self.srb, exp_up=2)
+        code = _cvt_microblock_to_fp6(vf, arith.bitcast(T.f32, native))
+        _buffer_ops.buffer_store(
+            Vec.from_elements(code[0:4], fx.Int32), self.out, out_off, cache_modifier=self.cpol
+        )
+        _buffer_ops.buffer_store(
+            Vec.from_elements([code[4], code[5], fx.Int32(0), fx.Int32(0)], fx.Int32),
+            self.out,
+            out_off + 4,
+            cache_modifier=self.cpol,
+        )
+        _buffer_ops.buffer_store(
+            arith.trunci(T.i8, biased & 0xFF), self.sc, sc_off, cache_modifier=self.cpol
+        )
+
+
+# Column pitch pad for the staging band, in dwords: staged by row and read by column, a
+# bare power-of-two pitch would put one m-row's writes all on the same bank.
+A6W4_COL_PITCH_PAD = 4
+# flydsl_quant_a6w4_act_dual's col half rounds its E8M0 scale in mode 0, the row half
+# (MXFP6RowQuantStore's call site) with no bias at all.
+A6W4_COL_SCALE_BIAS = _mxfp4_scale_rounding_bias(0)
+
+
+class MXFP4ColQuantStore:
+    """A6W4's col-wise MXFP4 operand, written out of a GEMM epilogue.
+
+    The other half of ``flydsl_quant_a6w4_act_dual``: per 32 rows of one column a 2x16
+    Hadamard, an E8M0 scale off the transformed amax, and 32 E2M1 codes, feature-major.
+
+    Where the row-wise half can be gathered inside the register file
+    (:class:`MXFP6RowQuantStore` -- a row-wise micro-block is 32 columns of one row, and
+    permlanes bring them into one lane), a col-wise micro-block has each of its 32 rows in
+    a different lane of a different accumulator fragment, so this one goes through LDS the
+    way :class:`MXFP4DualQuantStore` does.
+
+    It stages *column*-major, though, where the dual-quant kernel stages row-major, because
+    here the column is the axis read back: a lane's 32 rows then arrive as eight
+    ``ds_read_b128`` of consecutive words instead of 32 strided ones, and the stride moves
+    to the store side where it is free -- four m-rows of a word column are 16 rows apart in
+    the same staged column, so they merge into ``ds_write2_b32``.
+
+    The band is one accumulator quad of the wave's whole BM x BN/4 block, which is the
+    narrowest thing that holds a col-wise micro-block, and the C store walks quads. Sizing it
+    by the *store* face instead -- one n-fragment pair by all BM rows, so that a column's
+    whole 128 B line of the feature-major operand is in LDS and 8 lanes write it in one
+    request rather than 8 lanes touching 32 lines -- does pay on the store side (-0.9% /
+    -0.5% on the two scored shapes, measured both ways round), but it forces the epilogue to
+    walk pairs outermost, and that separates the two 64 B halves of each C line by 16 KB of
+    other stores. With C stored non-temporally that costs +5.0% on the larger shape, far more
+    than the store face is worth, so the band stays quad-sized here.
+
+    One lane converts one micro-block at a time. Holding two (the even and the odd column of
+    the words it just read) would halve the reads, but the Hadamard needs all 32 values of a
+    block live at once and a fused epilogue has no register budget for two of those.
+    """
+
+    def __init__(
+        self,
+        out_addr,
+        sc_addr,
+        out_bytes,
+        sc_bytes,
+        scale_rounding_bias,
+        lds_ptr,
+        wave_id,
+        lane_id,
+        out_w,
+        sc_w,
+        band_rows,
+        band_cols,
+        cpol=0,
+    ):
+        assert band_rows == 2 * MB, "a band is the four m-rows of one accumulator quad"
+        assert band_cols % MB == 0, "a lane takes one micro-block per 32-column stripe"
+        self.pitch = band_rows + A6W4_COL_PITCH_PAD
+        self.stripes = band_cols // MB
+        self.srb = fx.Int32(scale_rounding_bias)
+        self.cpol = cpol
+        self.lds = lds_ptr
+        self.out = _buffer_ops.create_buffer_resource_from_addr(
+            _raw(out_addr), num_records_bytes=_raw(out_bytes)
+        )
+        self.sc = _buffer_ops.create_buffer_resource_from_addr(
+            _raw(sc_addr), num_records_bytes=_raw(sc_bytes)
+        )
+        self.out_w = _readfirstlane_i32(out_w)
+        self.sc_w = _readfirstlane_i32(sc_w)
+        base = _readfirstlane_i32(wave_id * fx.Int32(self.lds_words(band_rows, band_cols)))
+        # Store side: a lane group holds eight consecutive columns, four staged words.
+        lg = lane_id // fx.Int32(16)
+        wcol0 = (lg % fx.Int32(2)) * fx.Int32(8) + (lg // fx.Int32(2)) * fx.Int32(4)
+        self.w_base = base + wcol0 * fx.Int32(self.pitch) + lane_id % fx.Int32(16)
+        self.r_blk = lane_id // fx.Int32(32)
+        self.r_col = lane_id % fx.Int32(32)
+        self.r_base = (
+            base
+            + (self.r_col // fx.Int32(2)) * fx.Int32(self.pitch)
+            + self.r_blk * fx.Int32(MB)
+        )
+        self.r_shift = (self.r_col % fx.Int32(2)) * fx.Int32(16)
+
+    @staticmethod
+    def lds_words(band_rows, band_cols):
+        """Dwords of staging band one wave needs, two columns to a word."""
+        return (band_cols // 2) * (band_rows + A6W4_COL_PITCH_PAD)
+
+    def stage(self, stripe, rows_words):
+        """Stage one n-fragment pair of the band, column-major, into 32-column ``stripe``.
+
+        ``rows_words[s][d]`` is m-row ``s``'s word ``d``: the bf16 pair of columns ``2d`` and
+        ``2d+1`` of the eight this lane holds. Every offset here is a trace-time constant off
+        one address register, which is what lets the four m-rows of a word column -- 16 rows
+        apart in the same staged column -- merge into ``ds_write2_b32``.
+        """
+        for d in range_constexpr(4):
+            for s in range_constexpr(len(rows_words)):
+                off = stripe * (MB // 2) * self.pitch + d * self.pitch + s * 16
+                _lds_store1(self.lds, self.w_base + fx.Int32(off), rows_words[s][d])
+
+    def _read_stripe(self, q):
+        """Issue one 32-column stripe's eight ``ds_read_b128``, no wait."""
+        return [
+            _lds_load_vec4(self.lds, self.r_base + fx.Int32(q * (MB // 2) * self.pitch + 4 * j))
+            for j in range_constexpr(MB // 4)
+        ]
+
+    def prefetch(self):
+        """The band's first stripe, issued as soon as staging is complete.
+
+        The band is read back through the same LDS queue it was just written through, so
+        the reads return no earlier than the writes drain; issuing them before the caller's
+        remaining work lets that work cover the turnaround instead of waiting on it.
+        """
+        wait_lgkmcnt(0)
+        return self._read_stripe(0)
+
+    def convert(self, blk0, col0, pre=None):
+        """Quantise and store the staged band's col-wise micro-blocks.
+
+        ``blk0`` is the band's first 32-row block in the operand's own row-block numbering
+        and ``col0`` the wave's first global column.
+
+        Stripe q+1's reads are issued before stripe q is used, and ``pre`` carries the
+        first stripe's in from the caller, so the LDS latency is covered by the Hadamard
+        rather than waited on: at one wave per SIMD nothing else covers it, and all four
+        waves reach this point together, so the read is contended as well as long. The
+        one ``lgkmcnt(0)`` per stripe this replaces becomes a run of partial waits
+        (measured 14, 11, 10, 9, 8) that retire the reads as the widening consumes them.
+        """
+        if pre is None:
+            wait_lgkmcnt(0)
+        blk = blk0 + self.r_blk
+        out0 = (col0 + self.r_col) * self.out_w + blk * fx.Int32(4)
+        sc0 = (col0 + self.r_col) * self.sc_w + blk
+        nxt = self._read_stripe(0) if pre is None else pre
+        for q in range_constexpr(self.stripes):
+            cur = nxt
+            nxt = self._read_stripe(q + 1) if q + 1 < self.stripes else None
+            bits = []
+            for j in range_constexpr(MB // 4):
+                v4 = cur[j]
+                for d in range_constexpr(4):
+                    bits.append(_f32bits_from_half(v4[d], self.r_shift))
+            vf = _rht16_pair(
+                [Vec.from_elements([b], fx.Int32).bitcast(fx.Float32)[0] for b in bits],
+                post_scale=False,
+            )
+            native, biased = _compute_scale_native(_amax_tree_i32(vf), self.srb, exp_up=2)
+            words = _cvt_microblock_to_fp4(vf, arith.bitcast(T.f32, native))
+            _buffer_ops.buffer_store(
+                Vec.from_elements(words, fx.Int32),
+                self.out,
+                out0 + fx.Int32(q * MB) * self.out_w,
+                cache_modifier=self.cpol,
+            )
+            _buffer_ops.buffer_store(
+                arith.trunci(T.i8, biased & 0xFF),
+                self.sc,
+                sc0 + fx.Int32(q * MB) * self.sc_w,
+                cache_modifier=self.cpol,
+            )
 
 
 DGLU_HALF_ROWS = 16  # the epilogue's sub-tile: half a col-wise micro-block
