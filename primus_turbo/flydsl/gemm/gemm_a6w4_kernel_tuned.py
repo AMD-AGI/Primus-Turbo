@@ -173,6 +173,7 @@ def launch_gemm(
     vs_ahead: Constexpr[int],
     a_pack: Constexpr[int],
     gelu: Constexpr[int],
+    keep_preact: Constexpr[int],
     arg_rq: fx.Pointer,
     arg_rs: fx.Pointer,
     arg_cq: fx.Pointer,
@@ -289,6 +290,15 @@ def launch_gemm(
             bits.append(w << 16)
             bits.append(w & 0xFFFF0000)
         return Vec.from_elements(bits, Int32).bitcast(Float32) + bias
+
+    def _bf16_round_vec(x):
+        """``x.to(out_elem).to(Float32)``, the rounding C's own store applies."""
+        bits = []
+        for i in range_constexpr(x.numel // 2):
+            w = rocdl.cvt_pk_bf16_f32(x[2 * i], x[2 * i + 1])
+            bits.append(w << 16)
+            bits.append(w & 0xFFFF0000)
+        return Vec.from_elements(bits, Int32).bitcast(Float32)
 
     def _clamp01_vec(v):
         """``min(v, 1.0)`` for a non-negative ``v``, at half an instruction per element.
@@ -1476,14 +1486,19 @@ def launch_gemm(
             if const_expr(c_full):
                 c_copy128_fl = fx.make_copy_atom(fx.rocdl.BufferCopy128b(c_cpol), out_elem)
 
-            def pair_words(accs_s, mi, p):
+            def pair_words(accs_s, mi, p, act=True):
                 # Pair p as four bf16 words: col_off 0/16/8/24 for lane group 0/1/2/3.
+                # act=False stops before the GELU, which is the pre-activation backward saves.
                 va = Vec(accs_s[mi * num_acc_n + 2 * p])
                 vb = Vec(accs_s[mi * num_acc_n + 2 * p + 1])
                 if const_expr(has_bias):
                     va = _bf16_round_bias_vec(va, bias_f[2 * p])
                     vb = _bf16_round_bias_vec(vb, bias_f[2 * p + 1])
-                if const_expr(gelu):
+                if const_expr(gelu and act):
+                    if const_expr(keep_preact):
+                        # The pass this replaces read C back, so the activation starts there.
+                        va = _bf16_round_vec(va)
+                        vb = _bf16_round_vec(vb)
                     va = _gelu1_torch_bf16_vec(va)
                     vb = _gelu1_torch_bf16_vec(vb)
                 d_a0 = rocdl.cvt_pk_bf16_f32(va[0], va[1])
@@ -1588,8 +1603,14 @@ def launch_gemm(
                     pre = None
                     for p in p_order:
                         ws = [pair_words(accs_s, m0 + s, p) for s in range_constexpr(4)]
+                        # Backward wants the GELU's input, so only the operands activate.
+                        wc = (
+                            [pair_words(accs_s, m0 + s, p, act=False) for s in range_constexpr(4)]
+                            if const_expr(gelu and keep_preact)
+                            else ws
+                        )
                         for s in range_constexpr(4):
-                            store_pair_c(ws[s], m0 + s, p)
+                            store_pair_c(wc[s], m0 + s, p)
                         if const_expr(rq >= 2):
                             cq_store.stage(pair_col[p] // 32, ws)
                             if const_expr(p == p_order[-1]):
@@ -1850,7 +1871,27 @@ _A6W4_DEFAULT = (128, 256, 128, 0, 0, 0, 2, 0, 0, 1, 2, 0, 0, 0, 2)
 _A6W4_LAUNCH_CACHE: dict = {}
 
 
-def gemm_a6w4(aq, wq, sa, sb, n, k, bias=None, gelu=False, row_quant=None):
+def _rq_level(m, n, k, want):
+    """The fused-operand level this shape's config can actually host, at most ``want``."""
+    cfg = _A6W4_CONFIGS.get((n, k), _A6W4_DEFAULT)
+    tm, tn = cfg[0], cfg[1]
+    a_stg, epi, store_mode = cfg[10], cfg[8], cfg[13]
+    rq = int(want)
+    if rq and not (epi == 2 and store_mode == 0 and tm % 64 == 0 and tn % 128 == 0):
+        rq = 0
+    if rq and not (n % tn == 0 and m % 64 == 0):
+        rq = 0
+    if rq >= 2 and not (tm == 256 and a_stg == 3 and (tn // 4) % 32 == 0):
+        rq = 1
+    return rq
+
+
+def gelu_dual_eligible(m, n, k):
+    """Whether `gemm_a6w4(..., gelu=True)` would attach both fused operand halves here."""
+    return _rq_level(m, n, k, 2) >= 2
+
+
+def gemm_a6w4(aq, wq, sa, sb, n, k, bias=None, gelu=False, row_quant=None, keep_preact=False):
     """C[M, N] bf16 = A6 @ W4^T (+ bias) for the A6W4 forward.
 
     aq    uint8 [M, 3K/4]   dense preshuffled FP6 (E2M3), A_BYTES_PER_32 bytes per 32 values
@@ -1860,6 +1901,13 @@ def gemm_a6w4(aq, wq, sa, sb, n, k, bias=None, gelu=False, row_quant=None):
     bias  bf16 [N] or None  added to the bf16 product, rounding like a separate `c + bias`
     M is a multiple of M_ALIGN; N and K are the FLUX shapes (N % 256 == 0, K % 256 == 0).
     An aq whose row is K bytes long is read as the older FP8-padded packing instead.
+
+    keep_preact leaves C holding the bias-added accumulator rather than the GELU of it,
+    which is the tensor the MLP's backward saves; the operands still carry the activation.
+    The activation starts from C's own rounded value, because the pass this replaces read
+    C back: `gelu=True` alone instead activates the unrounded f32 sum, which is what the
+    separate Inductor pointwise over an unbiased C computed. Only meaningful with `gelu`
+    and a level-2 `row_quant`.
 
     row_quant additionally writes C's own A6W4 operands -- what
     flydsl_quant_a6w4_act_dual would have produced by reading C back -- while the
@@ -1898,13 +1946,7 @@ def gemm_a6w4(aq, wq, sa, sb, n, k, bias=None, gelu=False, row_quant=None):
     a_pack = 0 if aq.shape[-1] == k else 1  # a K-byte row is the older FP8-padded packing
     cfg = _A6W4_CONFIGS.get((n, k), _A6W4_DEFAULT)
     tm, tn, tk, wpe, gm, pad16, bpf, sa_lds, epi, xcd, a_stg, a_pipe, fi, store_mode, ahead = cfg
-    rq = 2 if row_quant is None and gelu else int(row_quant or 0)
-    if rq and not (epi == 2 and store_mode == 0 and tm % 64 == 0 and tn % 128 == 0):
-        rq = 0
-    if rq and not (n % tn == 0 and m % 64 == 0):
-        rq = 0
-    if rq >= 2 and not (tm == 256 and a_stg == 3 and (tn // 4) % 32 == 0):
-        rq = 1
+    rq = _rq_level(m, n, k, 2 if row_quant is None and gelu else int(row_quant or 0))
     c = torch.empty(m, n, dtype=torch.bfloat16, device=aq.device)
     if rq:
         # An FP6 row padded to FP8's length, scales in shuffle_scale_w4 order.
@@ -1955,6 +1997,7 @@ def gemm_a6w4(aq, wq, sa, sb, n, k, bias=None, gelu=False, row_quant=None):
         ahead,
         a_pack,
         int(gelu),
+        int(keep_preact),
         ptr(c_rq if rq else c),
         ptr(c_rs if rq else c),
         ptr(c_cq if rq >= 2 else c),
@@ -1968,7 +2011,7 @@ def gemm_a6w4(aq, wq, sa, sb, n, k, bias=None, gelu=False, row_quant=None):
     else:
         run_compiled(
             _A6W4_LAUNCH_CACHE,
-            (n, k, bias is not None, a_pack, bool(gelu), rq),
+            (n, k, bias is not None, a_pack, bool(gelu), rq, bool(keep_preact)),
             launch_gemm,
             *args,
         )

@@ -73,6 +73,60 @@ def a6w4_mm_prequant_w(a, wq, sb, n, bias=None):
     return c[:m] if mp != m else c
 
 
+def a6w4_mm_gelu_dual_prequant_w(a, wq, sb, n, bias=None):
+    """`a6w4_mm_prequant_w` whose epilogue also builds the activation's A6W4 operands.
+
+    Returns ``(preact, aq, sa, co, cs)``: ``preact`` is the GEMM's own bf16 output, which is
+    what the MLP's backward differentiates, and the four packs are
+    ``flydsl_quant_a6w4_act_dual(gelu(preact, approximate="tanh"))`` byte for byte -- built
+    from the accumulator, so that tensor is never written or read back.
+
+    The fused store is a hint the GEMM can decline, and ``M`` is not padded here because the
+    packs would cover the padding; both cases raise rather than return quietly wrong shapes,
+    so the caller can keep the materialised path behind its own eligibility check.
+    """
+    from primus_turbo.flydsl.gemm.gemm_a6w4_kernel import M_ALIGN, gemm_a6w4
+
+    quant_act_a6w4 = quantizers()[0]
+
+    m, k = a.shape
+    if m % M_ALIGN or n % 256 or k % 1024:
+        raise ValueError(f"a6w4_mm_gelu_dual: M={m} must be a multiple of {M_ALIGN}, N={n} of 256, K={k} of 1024")
+    aq_in, sa_in = quant_act_a6w4(a.to(torch.bfloat16).contiguous())
+    preact = gemm_a6w4(aq_in, wq, sa_in, sb, n, k, bias, gelu=True, keep_preact=True)
+    packs = getattr(preact, "a6w4_dual", None)
+    if packs is None:
+        raise RuntimeError(f"a6w4_mm_gelu_dual: the GEMM declined the fused store at {m}x{n}x{k}")
+    return (preact, *packs)
+
+
+def a6w4_mm_gelu_dual_qa_prequant_w(aq, sa, wq, sb, n, bias=None):
+    """`a6w4_mm_gelu_dual_prequant_w` with the activation already quantized."""
+    from primus_turbo.flydsl.gemm.gemm_a6w4_kernel import A_BYTES_PER_32, M_ALIGN, gemm_a6w4
+
+    m = aq.shape[0]
+    k = aq.shape[1] * 32 // A_BYTES_PER_32
+    if m % M_ALIGN or n % 256 or k % 1024:
+        raise ValueError(f"a6w4_mm_gelu_dual_qa: M={m} must be a multiple of {M_ALIGN}, N={n} of 256, K={k} of 1024")
+    preact = gemm_a6w4(aq, wq, sa, sb, n, k, bias, gelu=True, keep_preact=True)
+    packs = getattr(preact, "a6w4_dual", None)
+    if packs is None:
+        raise RuntimeError(f"a6w4_mm_gelu_dual_qa: the GEMM declined the fused store at {m}x{n}x{k}")
+    return (preact, *packs)
+
+
+def a6w4_gelu_dual_eligible(m, n, k):
+    """Whether `a6w4_mm_gelu_dual_*` would fuse at this shape, without running it.
+
+    False on the v0 kernel, which has no fused store at all."""
+    from primus_turbo.flydsl.gemm import gemm_a6w4_kernel as impl
+
+    fits = getattr(impl, "gelu_dual_eligible", None)
+    if fits is None:
+        return False
+    return not (m % impl.M_ALIGN or n % 256 or k % 1024) and fits(m, n, k)
+
+
 def a6w4_mm_qa(aq, sa, b, bias=None):
     """a6w4_mm with the activation already quantized (quant_act_a6w4's bytes, M % M_ALIGN == 0)."""
     quant_w_a6w4 = quantizers()[1]
