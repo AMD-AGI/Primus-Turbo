@@ -62,10 +62,17 @@ Primus-Turbo uses or references the following third-party projects:
        primus_turbo/flydsl/quantization/mxfp4_grouped_quant.py
        primus_turbo/flydsl/attention/sparse_mla_fwd.py
        primus_turbo/flydsl/attention/sparse_mla_bwd.py
+       primus_turbo/flydsl/attention/gfx1250_mla/fwd.py
+       primus_turbo/flydsl/attention/gfx1250_mla/fwd_kernel.py
+       primus_turbo/flydsl/attention/gfx1250_mla/fwd_staging.py
 
 5. AITER
    - License: MIT License
    - Repository: https://github.com/ROCm/aiter.git
+   - Note: the gfx1250 MLA attention forward is adapted from aiter's gfx1250
+     FlyDSL FMHA forward prefill and carries the aiter copyright notice:
+       primus_turbo/flydsl/attention/gfx1250_mla/fwd_kernel.py
+       primus_turbo/flydsl/attention/gfx1250_mla/fwd_staging.py
 
 6. Triton-distributed
    - License: MIT License
