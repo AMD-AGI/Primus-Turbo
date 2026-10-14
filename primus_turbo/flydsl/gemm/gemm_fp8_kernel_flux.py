@@ -3329,7 +3329,7 @@ def _autotune_nt_dispatch(args, M, N, K, cbsz=0, blgp=0, out_fp16=False, beta_is
                     has_bias=True,
                 ),
             )
-            for geom, bands in _nt4_geoms(M, N, _NT4_BANDS, _NT4_RECT_BANDS)
+            for geom, bands in _nt4_geoms(M, N, beta_is_one, _NT4_BANDS, _NT4_RECT_BANDS)
             for gm, xcd in bands
         ]
         return _dense_race(_NT_AUTOTUNE_CACHE, key, args, "NT", builders, False)

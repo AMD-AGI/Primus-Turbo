@@ -401,6 +401,7 @@ class DualwaveSwpTraits:
             self.SBHD,
             self.HAS_SINK,
             self.SPLIT_LT,
+            getattr(self, "LSE_BHS", False),  # _flux_lse_bhs
         )
 
 
@@ -423,6 +424,7 @@ def _make_dualwave_swp_traits(
     sbhd=False,
     has_sink=False,
     split_lt=0,
+    lse_bhs=False,
 ):
     """Build gfx950 DUALWAVE_SWP compile-time layout traits."""
     rows_per_wave = 32
@@ -511,6 +513,7 @@ def _make_dualwave_swp_traits(
         SBHD=bool(sbhd),
         HAS_SINK=bool(has_sink),
         SPLIT_LT=int(split_lt),
+        LSE_BHS=bool(lse_bhs),
         DEFAULT_STRIDE_Q_N=num_heads * head_dim,
         DEFAULT_STRIDE_KV_N=num_kv_heads * head_dim,
         DMA_BYTES=16,
@@ -1628,7 +1631,12 @@ class DualwaveKernelContext:
                 if lane < fx.Index(32):
                     log2_l = fx.Float32(fmath.log2(as_mlir_value(fx.Float32(l_row)), fastmath=fm_fast))
                     lse = _fmul(_fadd(m_row, log2_l, fm_fast), fx.Float32(_ln2), fm_fast)
-                    elem_idx = (q_tok_base + q_row) * fx.Index(traits.NUM_HEADS_Q) + q_head_idx
+                    if const_expr(getattr(traits, "LSE_BHS", False)):
+                        elem_idx = (
+                            q_tok_base * fx.Index(traits.NUM_HEADS_Q) + q_head_idx * seqlen_q_v + q_row
+                        )
+                    else:
+                        elem_idx = (q_tok_base + q_row) * fx.Index(traits.NUM_HEADS_Q) + q_head_idx
                     _lse_f32_ir = as_mlir_value(fx.Float32(lse))
                     buffer_ops.buffer_store(_lse_f32_ir, lse_rsrc, as_mlir_value(fx.Int32(elem_idx)))
 

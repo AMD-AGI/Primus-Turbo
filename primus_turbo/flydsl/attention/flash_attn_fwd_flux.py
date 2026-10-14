@@ -21,6 +21,7 @@ the left-windowed path keeps an odd span and pairs it with a two-tile epilogue d
 
 import functools
 import math
+import os  # _flux_lse_bhs
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -64,6 +65,7 @@ def build_flash_attn_dualwave_swp_module(
     sbhd=False,
     has_sink=False,
     split_lt=0,
+    lse_bhs=False,
 ):
     """Build a DUALWAVE_SWP flash_attn launcher for D=64/128 bf16/f16 on gfx950.
 
@@ -104,7 +106,9 @@ def build_flash_attn_dualwave_swp_module(
         sbhd=sbhd,
         has_sink=has_sink,
         split_lt=split_lt,
+        lse_bhs=lse_bhs,
     )
+    assert not lse_bhs or not (varlen or sbhd)
     assert not split_lt or (split_lt % traits.BLOCK_M == 0 and not (varlen or sbhd or causal))
     _dualwave_swp_cache_tag = traits.cache_tag
 
@@ -1090,6 +1094,10 @@ def build_flash_attn_dualwave_swp_module(
     return _launch
 
 
+# [B, H, S] LSE straight from the kernel (FLUX_ATTN_LSE_BHS), the layout the backward reads.
+_LSE_BHS = os.getenv("FLUX_ATTN_LSE_BHS", "0") == "1"
+
+
 @functools.lru_cache(maxsize=8)
 def _flux_fwd_module(num_heads, head_dim):
     return build_flash_attn_dualwave_swp_module(
@@ -1100,6 +1108,7 @@ def _flux_fwd_module(num_heads, head_dim):
         waves_per_eu=2,
         dualwave_swp_enable_stagger=False,
         block_m=128,
+        lse_bhs=_LSE_BHS,
     )
 
 
@@ -1114,6 +1123,7 @@ def _flux_fwd_split_module(num_heads, head_dim, split_lt):
         dualwave_swp_enable_stagger=False,
         block_m=128,
         split_lt=split_lt,
+        lse_bhs=_LSE_BHS,
     )
 
 
@@ -1128,6 +1138,8 @@ def flux_attn_fwd_split(q, k, v, softmax_scale, split_lt):
     _flux_fwd_split_module(H, D, split_lt)(
         q, k, v, o_a, B, S, debug_counts=lse, block_table=o_b, stream=torch.cuda.current_stream()
     )
+    if _LSE_BHS:
+        return o_a, o_b, lse.view(B, H, S)
     return o_a, o_b, lse.view(B, S, H).transpose(1, 2).contiguous()
 
 
@@ -1138,4 +1150,6 @@ def flux_attn_fwd(q, k, v, softmax_scale):
     out = torch.empty_like(q)
     lse = torch.empty((B * S, H), device=q.device, dtype=torch.float32)
     _flux_fwd_module(H, D)(q, k, v, out, B, S, debug_counts=lse, stream=torch.cuda.current_stream())
+    if _LSE_BHS:
+        return out, lse.view(B, H, S)
     return out, lse.view(B, S, H).transpose(1, 2).contiguous()
