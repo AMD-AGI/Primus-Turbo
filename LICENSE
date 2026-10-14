@@ -65,6 +65,8 @@ Primus-Turbo uses or references the following third-party projects:
        primus_turbo/flydsl/attention/gfx1250_mla/fwd.py
        primus_turbo/flydsl/attention/gfx1250_mla/fwd_kernel.py
        primus_turbo/flydsl/attention/gfx1250_mla/fwd_staging.py
+       primus_turbo/flydsl/attention/gfx1250_mla/bwd.py
+       primus_turbo/flydsl/attention/gfx1250_mla/bwd_kernels.py
 
 5. AITER
    - License: MIT License
