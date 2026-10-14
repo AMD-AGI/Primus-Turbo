@@ -14,15 +14,18 @@ unmasked pairs, and the max output difference between the two.
 Cases:
   causal / window   built-in masks (Turbo's fast path, no block lists)
   band / prefix_lm  custom masks on the block-sparse path
-  inkling_*         Inkling's relative-position bias over 8K packed tokens: PyTorch
-                    (B=1 with a document mask and rel_logits captured by score_mod, as
-                    Miles trains it) vs Turbo's flex_attention_varlen_rel_bias
+  inkling_*         Inkling's relative-position bias layers (Inkling and Inkling-Small,
+                    per TP=4 rank, 8K packed tokens): Miles' PyTorch formulation vs
+                    Turbo's flex_attention_varlen_rel_bias. The workload is defined once
+                    in tests/pytorch/ref/inkling_attention_ref.py, which the tests share.
 
 Usage: python bench_flex_attention_turbo.py [--cases inkling] [--mode max-autotune-no-cudagraphs]
 """
 
 import argparse
+import os
 import statistics
+import sys
 
 import torch
 import triton
@@ -30,6 +33,10 @@ from tabulate import tabulate
 from torch.nn.attention import flex_attention as torch_flex
 
 import primus_turbo.pytorch as turbo
+
+# repo root on the path, for the workload definition shared with the tests
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")))
+from tests.pytorch.ref import inkling_attention_ref as inkling  # noqa: E402
 
 DTYPE = torch.bfloat16
 WARMUP, ROUNDS = 10, 30
@@ -107,64 +114,16 @@ def bench_dense(name, B, Hq, Hkv, S, torch_mask, turbo_mask, compiled):
     return name, flops, (t_fwd, t_fb), (o_fwd, o_fb), (t_out.float() - o_out.float()).abs().max().item()
 
 
-# Inkling per-rank attention (TP=4): global layers (Hq/Hkv 16/2, extent 1024, no window)
-# and local layers (16/4, extent = window = 512), 8K packed tokens.
-INKLING = [
-    ("inkling_global_1doc", 2, 1024, None, (8192,)),
-    ("inkling_global_5doc", 2, 1024, None, (3072, 2048, 1536, 1024, 512)),
-    ("inkling_local_1doc", 4, 512, 512, (8192,)),
-    ("inkling_local_5doc", 4, 512, 512, (3072, 2048, 1536, 1024, 512)),
-]
-
-
-def bench_inkling(name, Hkv, RE, window, seqlens, compiled):
-    Hq, D, T = 16, 128, sum(seqlens)
-    gen = torch.Generator().manual_seed(0)
-    q, k, v = (
-        torch.randn(T, h, D, generator=gen).to("cuda", DTYPE).requires_grad_(True) for h in (Hq, Hkv, Hkv)
-    )
-    rel = (torch.randn(T, Hq, RE, generator=gen) * 0.25).cuda().requires_grad_(True)
-    cu = torch.tensor((0,) + seqlens, device="cuda").cumsum(0).to(torch.int32)
-    seg = torch.repeat_interleave(
-        torch.arange(len(seqlens), device="cuda"), torch.tensor(seqlens, device="cuda")
-    )
-    rel_t = (
-        rel.detach().permute(1, 0, 2).contiguous().requires_grad_(True)
-    )  # [H, T, RE], as Miles lays it out
-
-    def score_mod(score, b, h, q_idx, kv_idx):
-        rd = q_idx - kv_idx
-        bias = rel_t[h, q_idx, torch.clamp(rd, 0, RE - 1)]
-        return torch.where((rd >= 0) & (rd < RE), score + bias.to(score.dtype), score)
-
-    def mask_mod(b, h, q_idx, kv_idx):
-        keep = (q_idx >= kv_idx) & (seg[q_idx] == seg[kv_idx])
-        return keep if window is None else keep & (q_idx - kv_idx <= window - 1)
-
-    t_mask = torch_flex.create_block_mask(mask_mod, None, None, T, T, device="cuda")
-    qt, kt, vt = (t.permute(1, 0, 2).unsqueeze(0) for t in (q, k, v))
+def bench_inkling(layer, compiled):
+    """Miles' PyTorch formulation vs Turbo on the Inkling layer (see inkling_attention_ref)."""
+    x = inkling.make_inputs(layer, dtype=DTYPE)
+    block_mask = inkling.miles_block_mask(layer, x)
     t_out, t_fwd, t_fb = time_fwd_bwd(
-        lambda: (
-            compiled(qt, kt, vt, score_mod=score_mod, block_mask=t_mask, scale=1.0 / D, enable_gqa=True)
-            .squeeze(0)
-            .permute(1, 0, 2)
-        ),
-        (q, k, v, rel_t),
+        lambda: inkling.miles_flex(layer, x, block_mask, compiled), (x.q, x.k, x.v, x.rel_logits_htr)
     )
-    o_out, o_fwd, o_fb = time_fwd_bwd(
-        lambda: turbo.ops.flex_attention_varlen_rel_bias(
-            q, k, v, rel, cu, max(seqlens), scale=1.0 / D, window_left=None if window is None else window - 1
-        ),
-        (q, k, v, rel),
-    )
-    pairs = sum(
-        L * (L + 1) // 2
-        if window is None
-        else min(window, L) * (min(window, L) + 1) // 2 + (L - min(window, L)) * window
-        for L in seqlens
-    )
-    flops = 4 * Hq * D * pairs
-    return name, flops, (t_fwd, t_fb), (o_fwd, o_fb), (t_out.float() - o_out.float()).abs().max().item()
+    o_out, o_fwd, o_fb = time_fwd_bwd(lambda: inkling.turbo_flex(layer, x), (x.q, x.k, x.v, x.rel_logits))
+    diff = (t_out.float() - o_out.float()).abs().max().item()
+    return layer.name, layer.flops(), (t_fwd, t_fb), (o_fwd, o_fb), diff
 
 
 def main():
@@ -177,7 +136,8 @@ def main():
     )
 
     rows = []
-    jobs = [(c[0], bench_dense, c) for c in dense_cases()] + [(c[0], bench_inkling, c) for c in INKLING]
+    jobs = [(c[0], bench_dense, c) for c in dense_cases()]
+    jobs += [(layer.name, bench_inkling, (layer,)) for layer in inkling.INKLING_LAYERS]
     for name, fn, case in jobs:
         if args.cases not in name:
             continue

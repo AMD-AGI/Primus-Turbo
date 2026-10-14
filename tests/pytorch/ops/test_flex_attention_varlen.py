@@ -17,6 +17,7 @@ from primus_turbo.pytorch.ops import (
     identity_score_mod_bwd,
     sliding_window_mask,
 )
+from tests.pytorch.ref import inkling_attention_ref as inkling
 from tests.pytorch.ref.flex_attention_ref import flex_attention_varlen_ref, rel_bias_ref
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a ROCm GPU")
@@ -163,6 +164,37 @@ def test_rel_bias(heads, seqlens, rel_extent, window_left):
     )
     ref = rel_bias_ref(q, k, v, rel, cu, scale=1.0 / 128, window_left=window_left)
     _check(out, ref, (q, k, v, rel))
+
+
+@pytest.mark.parametrize(
+    "layer",
+    [layer for layer in inkling.INKLING_LAYERS if not layer.name.startswith("inkling_small")],
+    ids=lambda layer: layer.name,
+)
+def test_inkling_matches_miles_flex(layer):
+    # Inkling's heads and structure at a size the references can afford: Turbo must
+    # match both the fp32 reference and Miles' own PyTorch FlexAttention formulation.
+    layer = layer.shrunk(
+        seqlens=(160, 96) if len(layer.seqlens) > 1 else (256,),
+        rel_extent=48,
+        window=48 if layer.window is not None else None,
+    )
+    x = inkling.make_inputs(layer)
+    out = inkling.turbo_flex(layer, x)
+    ref = rel_bias_ref(
+        x.q, x.k, x.v, x.rel_logits, x.cu_seqlens, scale=layer.scale, window_left=layer.window_left
+    )
+    _check(out, ref, (x.q, x.k, x.v, x.rel_logits))
+
+    out = inkling.turbo_flex(layer, x)
+    miles = inkling.miles_flex(layer, x, inkling.miles_block_mask(layer, x, compile_mask=False))
+    torch.testing.assert_close(out.float(), miles.float(), atol=TOL, rtol=TOL)
+    dout = torch.randn_like(out)
+    (drel,) = torch.autograd.grad(out, x.rel_logits, dout)
+    (drel_miles,) = torch.autograd.grad(miles, x.rel_logits_htr, dout)
+    drel_miles = drel_miles.permute(1, 0, 2)
+    scale = max(drel_miles.abs().max().item(), 1.0)
+    assert (drel - drel_miles).abs().max().item() <= 5 * TOL * scale
 
 
 def test_rel_bias_without_grad():
