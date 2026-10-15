@@ -19,10 +19,12 @@ from .flex_attention_utils import (
     AUTOTUNE,
     FWD_CONF_OVERRIDE,
     AutotuneMode,
+    apply_mask_mod,
     apply_score_mod,
     aux_kernel_args,
     bs_tensor_strides,
     get_arch,
+    mask_aux_kernel_args,
     max_block_for_lds,
     pick_knobs,
     remap_xcd,
@@ -239,6 +241,11 @@ def _attn_fwd_inner(
     AUX2=None,
     AUX3=None,
     NUM_AUX: tl.constexpr = 0,
+    MASK_AUX0=None,
+    MASK_AUX1=None,
+    MASK_AUX2=None,
+    MASK_AUX3=None,
+    NUM_MASK_AUX: tl.constexpr = 0,
 ):
     """
     Unified attention forward inner loop.
@@ -417,7 +424,18 @@ def _attn_fwd_inner(
         # and may mask positions the block-skip logic, which only knows about
         # IS_CAUSAL/WINDOW, still visits.
         if MASK_MOD is not None:
-            keep = MASK_MOD(off_z, off_h_q, offs_m[:, None], kv_offs_n[None, :])
+            keep = apply_mask_mod(
+                MASK_MOD,
+                off_z,
+                off_h_q,
+                offs_m[:, None],
+                kv_offs_n[None, :],
+                MASK_AUX0,
+                MASK_AUX1,
+                MASK_AUX2,
+                MASK_AUX3,
+                NUM_MASK_AUX,
+            )
             qk_scaled = tl.where(keep, qk_scaled, float("-inf"))
 
         # get max scores so far
@@ -835,6 +853,11 @@ def attn_fwd(
     AUX2=None,
     AUX3=None,
     NUM_AUX: tl.constexpr = 0,
+    MASK_AUX0=None,
+    MASK_AUX1=None,
+    MASK_AUX2=None,
+    MASK_AUX3=None,
+    NUM_MASK_AUX: tl.constexpr = 0,
 ):
     # set params
     ACCUMULATOR_TYPE = tl.float32
@@ -1096,6 +1119,11 @@ def attn_fwd(
                 AUX2=AUX2,
                 AUX3=AUX3,
                 NUM_AUX=NUM_AUX,
+                MASK_AUX0=MASK_AUX0,
+                MASK_AUX1=MASK_AUX1,
+                MASK_AUX2=MASK_AUX2,
+                MASK_AUX3=MASK_AUX3,
+                NUM_MASK_AUX=NUM_MASK_AUX,
                 MASK_MOD=None,
                 SPARSE_IDX=bs_full_idx_ptr,
                 BLOCK_SPARSE=True,
@@ -1145,6 +1173,11 @@ def attn_fwd(
             AUX2=AUX2,
             AUX3=AUX3,
             NUM_AUX=NUM_AUX,
+            MASK_AUX0=MASK_AUX0,
+            MASK_AUX1=MASK_AUX1,
+            MASK_AUX2=MASK_AUX2,
+            MASK_AUX3=MASK_AUX3,
+            NUM_MASK_AUX=NUM_MASK_AUX,
             MASK_MOD=MASK_MOD,
             SPARSE_IDX=bs_mask_idx_ptr,
             BLOCK_SPARSE=True,
@@ -1203,6 +1236,11 @@ def attn_fwd(
                 AUX2=AUX2,
                 AUX3=AUX3,
                 NUM_AUX=NUM_AUX,
+                MASK_AUX0=MASK_AUX0,
+                MASK_AUX1=MASK_AUX1,
+                MASK_AUX2=MASK_AUX2,
+                MASK_AUX3=MASK_AUX3,
+                NUM_MASK_AUX=NUM_MASK_AUX,
                 MASK_MOD=MASK_MOD,
             )
 
@@ -1259,6 +1297,11 @@ def attn_fwd(
                 AUX2=AUX2,
                 AUX3=AUX3,
                 NUM_AUX=NUM_AUX,
+                MASK_AUX0=MASK_AUX0,
+                MASK_AUX1=MASK_AUX1,
+                MASK_AUX2=MASK_AUX2,
+                MASK_AUX3=MASK_AUX3,
+                NUM_MASK_AUX=NUM_MASK_AUX,
                 MASK_MOD=MASK_MOD,
             )
 
@@ -1317,6 +1360,11 @@ def attn_fwd(
                 AUX2=AUX2,
                 AUX3=AUX3,
                 NUM_AUX=NUM_AUX,
+                MASK_AUX0=MASK_AUX0,
+                MASK_AUX1=MASK_AUX1,
+                MASK_AUX2=MASK_AUX2,
+                MASK_AUX3=MASK_AUX3,
+                NUM_MASK_AUX=NUM_MASK_AUX,
                 MASK_MOD=MASK_MOD,
             )
 
@@ -1430,6 +1478,7 @@ def attention_forward_prefill_triton_impl(
     out_partial=None,
     lse_partial=None,
     aux_tensors=None,
+    mask_aux_tensors=None,
 ):
     # get params, strides and shape
     IS_VARLEN = layout == "thd"
@@ -1725,6 +1774,7 @@ def attention_forward_prefill_triton_impl(
             stride_o_split=stride_o_split,
             stride_lse_split=stride_lse_split,
             **aux_kernel_args(aux_tensors),
+            **mask_aux_kernel_args(mask_aux_tensors),
             **_overrides,
         )
 

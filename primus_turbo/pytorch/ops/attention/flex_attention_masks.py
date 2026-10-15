@@ -6,12 +6,18 @@
 
 """Block masks for flex attention, modelled on ``torch.nn.attention.flex_attention``.
 
-A ``mask_mod(b, h, q_idx, kv_idx) -> bool`` is a ``@triton.jit`` function: the same
-predicate builds the block lists (``create_block_mask`` evaluates it per tile on the GPU)
-and masks individual positions of partially kept blocks inside the attention kernel.
+A ``mask_mod(b, h, q_idx, kv_idx [, *aux]) -> bool`` is a ``@triton.jit`` function: the
+same predicate builds the block lists (``create_block_mask`` evaluates it per tile on the
+GPU) and masks individual positions of partially kept blocks inside the attention kernel.
 ``q_idx`` / ``kv_idx`` are broadcastable index tiles; ``b`` and ``h`` are scalars (0 for
 a dimension the mask is broadcast over). Under varlen the indices are sequence-local and
 ``b`` is the sequence index.
+
+Tensors the mask reads (document ids, per-sample prefix lengths, ...) are passed to
+``create_block_mask(..., aux_tensors=[...])`` and appended to the ``mask_mod`` arguments
+as pointers, in order; the ``BlockMask`` carries them to the attention kernels. They are
+read-only and get no gradient. ``q_idx`` / ``kv_idx`` run past the sequence end in the
+last tile of each dimension, so guard loads indexed by them.
 
 ``causal_mask``, ``sliding_window_mask(...)`` and ``noop_mask`` are recognized: for
 equal query/key lengths they can also run on the kernel's dedicated causal / window
@@ -25,11 +31,12 @@ and input shape times the fast path and block sizes 64 / 128 separately for the 
 and the backward, and reuses the winners: the forward usually prefers big tiles, the
 backward smaller ones.
 
-Dense block masks are memoized: a ``mask_mod`` sees only indices (constants are baked
-into its source, and it cannot read tensors), so the lists depend on nothing but the
+Dense block masks without aux tensors are memoized: such a ``mask_mod`` sees only
+indices (constants are baked into its source), so the lists depend on nothing but the
 mask, the shape and the block size, and ``create_block_mask`` returns the same object
-for a repeated call. Varlen lists depend on ``cu_seqlens``, so they are rebuilt per
-call, without reading anything back from the device.
+for a repeated call. Lists that depend on tensor values -- varlen ones on
+``cu_seqlens``, and any built with aux tensors -- are rebuilt per call; varlen ones are
+built without reading anything back from the device.
 """
 
 import functools
@@ -47,6 +54,7 @@ from primus_turbo.pytorch.kernels.flex_attention.flex_attention_jit_utils import
     build_jit,
     literal_tag,
 )
+from primus_turbo.triton.flex_attention.flex_attention_utils import MAX_AUX_TENSORS
 
 __all__ = [
     "BlockMask",
@@ -115,7 +123,8 @@ class BlockMask:
     Build with :func:`create_block_mask` or :func:`create_block_mask_varlen`. The block
     lists (``kv_num_blocks``, ``kv_indices``, ``full_kv_num_blocks``,
     ``full_kv_indices``) are ``[B, H, num_q_blocks, ...]`` int32, as in PyTorch; for a
-    built-in mask on the fast path they are only computed if read.
+    built-in mask on the fast path they are only computed if read. ``aux_tensors`` are
+    the tensors ``mask_mod`` reads.
     """
 
     def __init__(
@@ -127,11 +136,13 @@ class BlockMask:
         fast_path: Optional[Tuple[bool, int, int]] = None,
         plan: Optional[BlockPlan] = None,
         cu_seqlens: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        aux_tensors: Tuple[torch.Tensor, ...] = (),
     ):
         self.mask_mod = mask_mod
         self.shape = shape
         self.BLOCK_SIZE = block_size
         self.device = device
+        self.aux_tensors = tuple(aux_tensors)
         self._fast_path = fast_path
         self._plans = {} if plan is None else {plan.block_size[0]: plan}
         self._cu_seqlens = cu_seqlens
@@ -171,6 +182,7 @@ class BlockMask:
                 kv_len=kv_len,
                 cu_seqlens_q=cu_q,
                 cu_seqlens_k=cu_k,
+                aux_tensors=self.aux_tensors,
             )
             self._plans[block_size] = BlockPlan.from_categories(
                 categories, (block_size, block_size), sync_free=self.is_varlen
@@ -227,6 +239,24 @@ def _device_key(device) -> torch.device:
     return device
 
 
+def _check_mask_aux(mask_mod, aux_tensors, device: torch.device) -> Tuple[torch.Tensor, ...]:
+    aux = tuple(aux_tensors or ())
+    if not aux:
+        return aux
+    if mask_mod in _FAST_PATH:
+        raise ValueError("built-in masks take no aux_tensors")
+    if len(aux) > MAX_AUX_TENSORS:
+        raise ValueError(f"at most {MAX_AUX_TENSORS} mask aux_tensors are supported, got {len(aux)}")
+    for i, t in enumerate(aux):
+        if not isinstance(t, torch.Tensor) or _device_key(t.device) != device:
+            raise ValueError(f"aux_tensors[{i}] must be a tensor on {device}")
+        if not t.is_contiguous():
+            raise ValueError(f"aux_tensors[{i}] must be contiguous: mask_mod indexes it as a flat pointer")
+        if t.requires_grad:
+            raise ValueError(f"aux_tensors[{i}] requires grad, but masks are not differentiable; detach it")
+    return aux
+
+
 def create_block_mask(
     mask_mod,
     B: Optional[int],
@@ -235,18 +265,25 @@ def create_block_mask(
     KV_LEN: int,
     device: Union[str, torch.device] = "cuda",
     BLOCK_SIZE: Union[int, Tuple[int, int]] = 128,
+    aux_tensors: Optional[list] = None,
 ) -> BlockMask:
     """Block mask for :func:`flex_attention`. ``B`` / ``H`` = None broadcasts the mask
-    over that dimension (``mask_mod`` then sees 0 for it).
+    over that dimension (``mask_mod`` then sees 0 for it). ``aux_tensors`` (up to 4,
+    contiguous) are appended to the ``mask_mod`` arguments.
 
-    Memoized: a repeated call with the same arguments returns the same object, along
-    with every block list it has built since (at any block size, and for the backward).
-    The cache keys on the ``mask_mod`` object, so build parameterized masks through
-    ``functools.lru_cache`` (as ``sliding_window_mask`` does) to keep hitting it.
+    Memoized when there are no ``aux_tensors``: a repeated call with the same arguments
+    returns the same object, along with every block list it has built since (at any
+    block size, and for the backward). The cache keys on the ``mask_mod`` object, so
+    build parameterized masks through ``functools.lru_cache`` (as
+    ``sliding_window_mask`` does) to keep hitting it. With ``aux_tensors`` the lists
+    depend on their values, so every call builds a new mask.
     """
     block_size = _block_size(BLOCK_SIZE)
     shape = (B or 1, H or 1, int(Q_LEN), int(KV_LEN))
     device = _device_key(device)
+    aux = _check_mask_aux(mask_mod, aux_tensors, device)
+    if aux:
+        return BlockMask(mask_mod, shape, block_size, device, aux_tensors=aux).materialize()
     key = (mask_mod, shape, block_size, device)
     mask = _DENSE_MASKS.get(key)
     if mask is not None:
@@ -271,12 +308,15 @@ def create_block_mask_varlen(
     max_seqlen_k: int,
     H: Optional[int] = None,
     BLOCK_SIZE: Union[int, Tuple[int, int]] = 128,
+    aux_tensors: Optional[list] = None,
 ) -> BlockMask:
     """Block mask for :func:`flex_attention_varlen` over packed sequences.
 
     Block indices are sequence-local, padded to the longest sequence. A built-in mask
     takes the fast path when queries and keys share one ``cu_seqlens`` tensor
-    (self-attention, so every sequence's query and key lengths agree).
+    (self-attention, so every sequence's query and key lengths agree). ``aux_tensors``
+    are appended to the ``mask_mod`` arguments; ``b`` is the sequence index, so a
+    per-sequence value is read as ``tl.load(PTR + b)``.
 
     Not memoized, since the lists depend on the ``cu_seqlens`` values. They are built
     without a device sync (index tensors span the full block grid), so a per-batch
@@ -284,13 +324,16 @@ def create_block_mask_varlen(
     """
     block_size = _block_size(BLOCK_SIZE)
     shape = (cu_seqlens_q.numel() - 1, H or 1, int(max_seqlen_q), int(max_seqlen_k))
+    device = _device_key(cu_seqlens_q.device)
+    aux = _check_mask_aux(mask_mod, aux_tensors, device)
     fast = _FAST_PATH.get(mask_mod) if cu_seqlens_q is cu_seqlens_k else None
     mask = BlockMask(
         mask_mod,
         shape,
         block_size,
-        cu_seqlens_q.device,
+        device,
         fast_path=fast,
         cu_seqlens=(cu_seqlens_q, cu_seqlens_k),
+        aux_tensors=aux,
     )
     return mask if fast is not None else mask.materialize()

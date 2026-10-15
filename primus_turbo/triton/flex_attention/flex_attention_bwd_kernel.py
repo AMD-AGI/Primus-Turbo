@@ -19,11 +19,13 @@ from .flex_attention_utils import (
     AUTOTUNE,
     DEBUG,
     AutotuneMode,
+    apply_mask_mod,
     apply_score_grad_hook,
     apply_score_mod,
     aux_kernel_args,
     bs_tensor_strides,
     get_arch,
+    mask_aux_kernel_args,
     max_block_for_lds,
     pick_knobs,
     remap_xcd,
@@ -541,6 +543,11 @@ def _bwd_dkdv_inner(
     AUX2=None,
     AUX3=None,
     NUM_AUX: tl.constexpr = 0,
+    MASK_AUX0=None,
+    MASK_AUX1=None,
+    MASK_AUX2=None,
+    MASK_AUX3=None,
+    NUM_MASK_AUX: tl.constexpr = 0,
 ):
     # if HEAD_DIM is padded
     PADDED_HEAD_QK: tl.constexpr = ACTUAL_HEAD_DIM_QK != HEAD_DIM_QK
@@ -614,7 +621,18 @@ def _bwd_dkdv_inner(
                 NUM_AUX,
             )
         if MASK_MOD is not None:
-            keep_mod = MASK_MOD(off_z, off_h_q, offs_m[None, :], offs_n[:, None])
+            keep_mod = apply_mask_mod(
+                MASK_MOD,
+                off_z,
+                off_h_q,
+                offs_m[None, :],
+                offs_n[:, None],
+                MASK_AUX0,
+                MASK_AUX1,
+                MASK_AUX2,
+                MASK_AUX3,
+                NUM_MASK_AUX,
+            )
             qkT_scaled = tl.where(keep_mod, qkT_scaled, float("-inf"))
 
         if DEBUG_TRITON_DETAIL and start_n == 256:
@@ -750,6 +768,11 @@ def _bwd_dq_inner(
     AUX2=None,
     AUX3=None,
     NUM_AUX: tl.constexpr = 0,
+    MASK_AUX0=None,
+    MASK_AUX1=None,
+    MASK_AUX2=None,
+    MASK_AUX3=None,
+    NUM_MASK_AUX: tl.constexpr = 0,
     SCORE_GRAD_HOOK: tl.constexpr = None,
     SCORE_GRAD=None,
 ):
@@ -829,7 +852,18 @@ def _bwd_dq_inner(
                 NUM_AUX,
             )
         if MASK_MOD is not None:
-            keep_mod = MASK_MOD(off_z, off_h_q, offs_m[:, None], offs_n[None, :])
+            keep_mod = apply_mask_mod(
+                MASK_MOD,
+                off_z,
+                off_h_q,
+                offs_m[:, None],
+                offs_n[None, :],
+                MASK_AUX0,
+                MASK_AUX1,
+                MASK_AUX2,
+                MASK_AUX3,
+                NUM_MASK_AUX,
+            )
             qk_scaled = tl.where(keep_mod, qk_scaled, float("-inf"))
 
         if DEBUG_TRITON_DETAIL:
@@ -1089,6 +1123,11 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
     AUX2=None,
     AUX3=None,
     NUM_AUX: tl.constexpr = 0,
+    MASK_AUX0=None,
+    MASK_AUX1=None,
+    MASK_AUX2=None,
+    MASK_AUX3=None,
+    NUM_MASK_AUX: tl.constexpr = 0,
     SCORE_GRAD_HOOK: tl.constexpr = None,
     SCORE_GRAD=None,
 ):
@@ -1264,6 +1303,11 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 AUX2=AUX2,
                 AUX3=AUX3,
                 NUM_AUX=NUM_AUX,
+                MASK_AUX0=MASK_AUX0,
+                MASK_AUX1=MASK_AUX1,
+                MASK_AUX2=MASK_AUX2,
+                MASK_AUX3=MASK_AUX3,
+                NUM_MASK_AUX=NUM_MASK_AUX,
             )
             start_m += num_steps * MASK_BLOCK_M1
             # The unmasked region runs from the diagonal to seqlen_q. With a
@@ -1333,6 +1377,11 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 AUX2=AUX2,
                 AUX3=AUX3,
                 NUM_AUX=NUM_AUX,
+                MASK_AUX0=MASK_AUX0,
+                MASK_AUX1=MASK_AUX1,
+                MASK_AUX2=MASK_AUX2,
+                MASK_AUX3=MASK_AUX3,
+                NUM_MASK_AUX=NUM_MASK_AUX,
             )
         # end of GQA/MQA of dkdv
         # Write back dV
@@ -1448,6 +1497,11 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 AUX2=AUX2,
                 AUX3=AUX3,
                 NUM_AUX=NUM_AUX,
+                MASK_AUX0=MASK_AUX0,
+                MASK_AUX1=MASK_AUX1,
+                MASK_AUX2=MASK_AUX2,
+                MASK_AUX3=MASK_AUX3,
+                NUM_MASK_AUX=NUM_MASK_AUX,
                 SCORE_GRAD_HOOK=SCORE_GRAD_HOOK,
                 SCORE_GRAD=SCORE_GRAD,
             )
@@ -1518,6 +1572,11 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 AUX2=AUX2,
                 AUX3=AUX3,
                 NUM_AUX=NUM_AUX,
+                MASK_AUX0=MASK_AUX0,
+                MASK_AUX1=MASK_AUX1,
+                MASK_AUX2=MASK_AUX2,
+                MASK_AUX3=MASK_AUX3,
+                NUM_MASK_AUX=NUM_MASK_AUX,
                 SCORE_GRAD_HOOK=SCORE_GRAD_HOOK,
                 SCORE_GRAD=SCORE_GRAD,
             )
@@ -1631,6 +1690,11 @@ def bwd_kernel_fused_noncausal(
     AUX2=None,
     AUX3=None,
     NUM_AUX: tl.constexpr = 0,
+    MASK_AUX0=None,
+    MASK_AUX1=None,
+    MASK_AUX2=None,
+    MASK_AUX3=None,
+    NUM_MASK_AUX: tl.constexpr = 0,
     SCORE_GRAD_HOOK: tl.constexpr = None,
     SCORE_GRAD=None,
 ):
@@ -1779,6 +1843,11 @@ def bwd_kernel_fused_noncausal(
                 AUX2=AUX2,
                 AUX3=AUX3,
                 NUM_AUX=NUM_AUX,
+                MASK_AUX0=MASK_AUX0,
+                MASK_AUX1=MASK_AUX1,
+                MASK_AUX2=MASK_AUX2,
+                MASK_AUX3=MASK_AUX3,
+                NUM_MASK_AUX=NUM_MASK_AUX,
                 SPARSE_IDX=bs_dkdv_idx_ptr,
                 BLOCK_SPARSE=BLOCK_SPARSE,
             )
@@ -1897,6 +1966,11 @@ def bwd_kernel_fused_noncausal(
                 AUX2=AUX2,
                 AUX3=AUX3,
                 NUM_AUX=NUM_AUX,
+                MASK_AUX0=MASK_AUX0,
+                MASK_AUX1=MASK_AUX1,
+                MASK_AUX2=MASK_AUX2,
+                MASK_AUX3=MASK_AUX3,
+                NUM_MASK_AUX=NUM_MASK_AUX,
                 SCORE_GRAD_HOOK=SCORE_GRAD_HOOK,
                 SCORE_GRAD=SCORE_GRAD,
                 SPARSE_IDX=bs_dq_idx_ptr,
@@ -1955,6 +2029,7 @@ def attention_backward_triton_impl(
     block_sparse_dkdv=None,
     block_sparse_dq=None,
     aux_tensors=None,
+    mask_aux_tensors=None,
     score_grad_hook=None,
     score_grad=None,
     dlse=None,
@@ -2341,6 +2416,7 @@ def attention_backward_triton_impl(
             SCORE_GRAD_HOOK=score_grad_hook,
             SCORE_GRAD=score_grad,
             **aux_kernel_args(aux_tensors),
+            **mask_aux_kernel_args(mask_aux_tensors),
             **bwd_block_overrides,
         )
     else:
@@ -2438,6 +2514,7 @@ def attention_backward_triton_impl(
                 SCORE_GRAD_HOOK=score_grad_hook,
                 SCORE_GRAD=score_grad,
                 **aux_kernel_args(aux_tensors),
+                **mask_aux_kernel_args(mask_aux_tensors),
                 **_overrides,
             )
 

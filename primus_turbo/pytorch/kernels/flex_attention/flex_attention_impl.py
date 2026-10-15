@@ -61,6 +61,7 @@ def flex_attention_forward_impl(
     block_plan: Optional[BlockPlan] = None,
     num_splits: int = 1,
     aux_tensors=None,
+    mask_aux_tensors=None,
 ) -> None:
     """Fill ``out`` and the natural-log ``lse`` in place.
 
@@ -105,6 +106,7 @@ def flex_attention_forward_impl(
         out_partial=out_partial,
         lse_partial=lse_partial,
         aux_tensors=aux_tensors,
+        mask_aux_tensors=mask_aux_tensors,
     )
     if num_splits > 1:
         combine_splits(out_partial, lse_partial, out, lse)
@@ -133,6 +135,7 @@ def flex_attention_backward_impl(
     score_mod_bwd=None,
     block_plan: Optional[BlockPlan] = None,
     aux_tensors=None,
+    mask_aux_tensors=None,
     score_grad_hook=None,
     score_grad: Optional[torch.Tensor] = None,
     dlse: Optional[torch.Tensor] = None,
@@ -175,6 +178,7 @@ def flex_attention_backward_impl(
         block_sparse_dkdv=bs_dkdv,
         block_sparse_dq=bs_dq,
         aux_tensors=aux_tensors,
+        mask_aux_tensors=mask_aux_tensors,
         score_grad_hook=score_grad_hook,
         score_grad=score_grad,
         dlse=dlse,

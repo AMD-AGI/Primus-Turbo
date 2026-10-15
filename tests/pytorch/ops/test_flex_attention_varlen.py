@@ -106,6 +106,29 @@ def test_custom_block_sparse_mask():
     _check(out, ref, (q, k, v))
 
 
+@triton.jit
+def _per_sequence_prefix_mask(b, h, q_idx, kv_idx, PREFIX):
+    return (kv_idx < tl.load(PREFIX + b)) | (q_idx >= kv_idx)
+
+
+def test_mask_aux_tensor_per_sequence_prefix():
+    # b is the sequence index under varlen, so a per-sequence value is PREFIX[b].
+    seqlens = (300, 212, 128)
+    cu = _cu(seqlens)
+    prefix = torch.tensor([150, 20, 128], device="cuda", dtype=torch.int32)
+    q, k, v = _packed(cu[-1].item(), cu[-1].item(), 4, 2, 64, seed=6)
+    block_mask = create_block_mask_varlen(
+        _per_sequence_prefix_mask, cu, cu, max(seqlens), max(seqlens), BLOCK_SIZE=64, aux_tensors=[prefix]
+    )
+    out = flex_attention_varlen(
+        q, k, v, cu, cu, max(seqlens), max(seqlens), block_mask=block_mask, enable_gqa=True
+    )
+    ref = flex_attention_varlen_ref(
+        q, k, v, cu, cu, keep_fn=lambda b, h, qi, ki: (ki < prefix[b]) | (qi >= ki)
+    )[0]
+    _check(out, ref, (q, k, v))
+
+
 def test_custom_mask_lists_build_without_device_sync():
     # Varlen lists are rebuilt for every batch, so building them -- forward and backward
     # -- must not read anything back from the device.

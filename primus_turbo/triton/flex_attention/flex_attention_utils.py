@@ -37,6 +37,7 @@ __all__ = [
     # Runtime info
     "get_arch",
     "aux_kernel_args",
+    "mask_aux_kernel_args",
     "bs_tensor_strides",
     "pick_knobs",
     "time_launch",
@@ -255,17 +256,22 @@ def bs_tensor_strides(prefix: str, tensor) -> dict:
 MAX_AUX_TENSORS = 4
 
 
-def aux_kernel_args(aux_tensors) -> dict:
-    """Kwargs passing up to MAX_AUX_TENSORS score_mod aux tensors to a kernel.
+def aux_kernel_args(aux_tensors, prefix: str = "AUX", count: str = "NUM_AUX") -> dict:
+    """Kwargs passing up to MAX_AUX_TENSORS aux tensors to a kernel.
 
-    Unused slots stay None, so the kernel specializes them away; NUM_AUX tells
-    apply_score_mod how many to hand to score_mod.
+    Unused slots stay None, so the kernel specializes them away; ``count`` tells
+    apply_score_mod / apply_mask_mod how many to hand to the mod. The score_mod's
+    tensors use the default names, the mask_mod's ``MASK_AUX*`` / ``NUM_MASK_AUX``.
     """
     aux = list(aux_tensors or ())
     if len(aux) > MAX_AUX_TENSORS:
         raise ValueError(f"at most {MAX_AUX_TENSORS} aux_tensors are supported, got {len(aux)}")
     slots = aux + [None] * (MAX_AUX_TENSORS - len(aux))
-    return {**{f"AUX{i}": t for i, t in enumerate(slots)}, "NUM_AUX": len(aux)}
+    return {**{f"{prefix}{i}": t for i, t in enumerate(slots)}, count: len(aux)}
+
+
+def mask_aux_kernel_args(aux_tensors) -> dict:
+    return aux_kernel_args(aux_tensors, "MASK_AUX", "NUM_MASK_AUX")
 
 
 @triton.jit
@@ -292,6 +298,33 @@ def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr = 8):
         pid = tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid
 
     return pid
+
+
+@triton.jit
+def apply_mask_mod(
+    MASK_MOD: tl.constexpr,
+    b,
+    h,
+    q_idx,
+    kv_idx,
+    MASK_AUX0,
+    MASK_AUX1,
+    MASK_AUX2,
+    MASK_AUX3,
+    NUM_MASK_AUX: tl.constexpr,
+):
+    """Call ``MASK_MOD`` with the first ``NUM_MASK_AUX`` aux tensor pointers appended."""
+    if NUM_MASK_AUX == 0:
+        keep = MASK_MOD(b, h, q_idx, kv_idx)
+    elif NUM_MASK_AUX == 1:
+        keep = MASK_MOD(b, h, q_idx, kv_idx, MASK_AUX0)
+    elif NUM_MASK_AUX == 2:
+        keep = MASK_MOD(b, h, q_idx, kv_idx, MASK_AUX0, MASK_AUX1)
+    elif NUM_MASK_AUX == 3:
+        keep = MASK_MOD(b, h, q_idx, kv_idx, MASK_AUX0, MASK_AUX1, MASK_AUX2)
+    else:
+        keep = MASK_MOD(b, h, q_idx, kv_idx, MASK_AUX0, MASK_AUX1, MASK_AUX2, MASK_AUX3)
+    return keep
 
 
 @triton.jit

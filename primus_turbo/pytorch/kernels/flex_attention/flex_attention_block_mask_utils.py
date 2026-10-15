@@ -32,6 +32,9 @@ from primus_turbo.triton.flex_attention.flex_attention_block_mask_kernel import 
     BLOCK_PARTIAL,
     classify_blocks_kernel,
 )
+from primus_turbo.triton.flex_attention.flex_attention_utils import (
+    mask_aux_kernel_args,
+)
 
 __all__ = ["BlockList", "BlockPlan", "backward_block_plans", "classify_blocks"]
 
@@ -182,11 +185,13 @@ def classify_blocks(
     kv_len: int = 0,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k: Optional[torch.Tensor] = None,
+    aux_tensors=None,
 ) -> torch.Tensor:
     """Run ``mask_mod`` over every tile and return the int8 category grid.
 
     Dense: pass ``q_len``/``kv_len``. Varlen: pass ``cu_seqlens_q``/``cu_seqlens_k``;
     ``batch`` is then the number of sequences and indices are sequence-local.
+    ``aux_tensors`` are appended to the ``mask_mod`` arguments.
     """
     out = torch.empty(batch, heads, num_q_blocks, num_kv_blocks, dtype=torch.int8, device=device)
     is_varlen = cu_seqlens_q is not None
@@ -204,6 +209,7 @@ def classify_blocks(
         BLOCK_Q=block_size[0],
         BLOCK_KV=block_size[1],
         IS_VARLEN=is_varlen,
+        **mask_aux_kernel_args(aux_tensors),
         num_warps=4,
     )
     return out

@@ -13,6 +13,8 @@ predicate drives both the block lists and the per-element masking of partial blo
 import triton
 import triton.language as tl
 
+from .flex_attention_utils import apply_mask_mod
+
 BLOCK_EMPTY = 0
 BLOCK_PARTIAL = 1
 BLOCK_FULL = 2
@@ -38,6 +40,11 @@ def classify_blocks_kernel(
     BLOCK_Q: tl.constexpr,
     BLOCK_KV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    MASK_AUX0=None,
+    MASK_AUX1=None,
+    MASK_AUX2=None,
+    MASK_AUX3=None,
+    NUM_MASK_AUX: tl.constexpr = 0,
 ):
     """One program per tile: OUT[b, h, q_block, kv_block] = EMPTY / PARTIAL / FULL.
 
@@ -58,7 +65,10 @@ def classify_blocks_kernel(
     q_idx = q_block * BLOCK_Q + tl.arange(0, BLOCK_Q)[:, None]
     kv_idx = kv_block * BLOCK_KV + tl.arange(0, BLOCK_KV)[None, :]
     in_bounds = (q_idx < seqlen_q) & (kv_idx < seqlen_k)
-    keep = (MASK_MOD(b, h, q_idx, kv_idx) & in_bounds).to(tl.int32)
+    keep = apply_mask_mod(
+        MASK_MOD, b, h, q_idx, kv_idx, MASK_AUX0, MASK_AUX1, MASK_AUX2, MASK_AUX3, NUM_MASK_AUX
+    )
+    keep = (keep & in_bounds).to(tl.int32)
     any_kept = tl.max(tl.max(keep, axis=1), axis=0)
     all_kept = tl.min(tl.min(keep, axis=1), axis=0)
     category = tl.where(all_kept == 1, _FULL, tl.where(any_kept == 1, _PARTIAL, _EMPTY))

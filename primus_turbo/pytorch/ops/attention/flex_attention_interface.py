@@ -24,7 +24,8 @@ than traced:
 * A tensor read by ``score_mod`` is passed explicitly in ``aux_tensors`` (appended to
   the ``score_mod`` arguments) and is read-only. To train it, also pass it as
   ``score_grad_target`` with a ``score_grad_hook``, which the backward calls once per
-  tile of its dQ sweep to write the gradient.
+  tile of its dQ sweep to write the gradient. A tensor read by ``mask_mod`` is passed
+  to ``create_block_mask(..., aux_tensors=...)`` and travels with the block mask.
 * ``return_aux`` supports ``lse`` but not ``max_scores``.
 """
 
@@ -81,6 +82,8 @@ class _Config:
     score_mod_bwd: object = None
     num_splits: int = 1
     aux_tensors: list = field(default_factory=list)
+    # The block mask's, bound per call (decisions are cached without them).
+    mask_aux_tensors: tuple = ()
     score_grad_hook: object = None
     cu_seqlens_q: Optional[torch.Tensor] = None
     cu_seqlens_k: Optional[torch.Tensor] = None
@@ -105,6 +108,7 @@ class _Config:
             block_plan=path.plan,
             num_splits=self.num_splits,
             aux_tensors=self.aux_tensors,
+            mask_aux_tensors=self.mask_aux_tensors if path.mask_mod is not None else (),
         )
 
     def backward_kwargs(self, path: MaskPath, score_grad=None) -> dict:
@@ -427,6 +431,7 @@ def _run(query, key, value, block_mask, score_grad_target, cfg, return_lse, retu
     needs_grad = torch.is_grad_enabled() and any(
         t is not None and t.requires_grad for t in (query, key, value, score_grad_target)
     )
+    cfg.mask_aux_tensors = () if block_mask is None else block_mask.aux_tensors
     cfg.fwd, cfg.bwd = _select_paths(block_mask, query, key, value, cfg, score_grad_target, needs_grad)
     out, lse = FlexAttentionFunc.apply(query, key, value, score_grad_target, cfg)
     return _finish(out, lse, return_lse, return_aux)

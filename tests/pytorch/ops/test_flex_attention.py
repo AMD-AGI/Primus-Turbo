@@ -179,6 +179,82 @@ def test_create_block_mask_is_memoized(monkeypatch):
     assert create_block_mask(_band_mask, None, None, 192, 192, BLOCK_SIZE=64) is not b
 
 
+# ---------------------------------------------------------------- mask_mod aux tensors
+
+AUX_S = 256
+
+
+@triton.jit
+def _doc_causal_aux_mask(b, h, q_idx, kv_idx, DOC):
+    # q_idx / kv_idx run past the sequence end in the last tile: guard the loads.
+    q_doc = tl.load(DOC + b * 256 + q_idx, mask=q_idx < 256, other=-1)
+    kv_doc = tl.load(DOC + b * 256 + kv_idx, mask=kv_idx < 256, other=-2)
+    return (q_doc == kv_doc) & (q_idx >= kv_idx)
+
+
+@triton.jit
+def _prefix_window_aux_mask(b, h, q_idx, kv_idx, PREFIX, WINDOW):
+    prefix = tl.load(PREFIX + b)
+    window = tl.load(WINDOW + b)
+    return (kv_idx < prefix) | ((q_idx >= kv_idx) & (q_idx - kv_idx <= window))
+
+
+def _doc_ids(doc_lengths):
+    """int32 ``[B, AUX_S]`` document ids, one row of document lengths per batch."""
+    rows = [torch.repeat_interleave(torch.arange(len(ls)), torch.tensor(ls)) for ls in doc_lengths]
+    return torch.stack(rows).to("cuda", torch.int32).contiguous()
+
+
+@pytest.mark.parametrize("block_size", [64, 128])
+def test_mask_aux_tensor_document_mask(block_size):
+    # Per-batch document boundaries, not tile-aligned: the mask reads them from a tensor.
+    doc = _doc_ids([[100, 156], [40, 90, 126]])
+    q, k, v = _inputs(2, 4, 2, AUX_S, AUX_S, 64, seed=7)
+    block_mask = create_block_mask(
+        _doc_causal_aux_mask, 2, None, AUX_S, AUX_S, BLOCK_SIZE=block_size, aux_tensors=[doc]
+    )
+    out = flex_attention(q, k, v, block_mask=block_mask, enable_gqa=True)
+    ref = flex_attention_ref(q, k, v, keep_fn=lambda b, h, qi, ki: (doc[b, qi] == doc[b, ki]) & (qi >= ki))[0]
+    _check(out, ref, (q, k, v))
+
+
+def test_mask_aux_tensors_two_per_batch_scalars():
+    prefix = torch.tensor([32, 100], device="cuda", dtype=torch.int32)
+    window = torch.tensor([200, 48], device="cuda", dtype=torch.int32)
+    q, k, v = _inputs(2, 4, 4, AUX_S, AUX_S, 64, seed=8)
+    block_mask = create_block_mask(
+        _prefix_window_aux_mask, 2, None, AUX_S, AUX_S, BLOCK_SIZE=64, aux_tensors=[prefix, window]
+    )
+    out = flex_attention(q, k, v, block_mask=block_mask)
+
+    def keep(b, h, qi, ki):
+        return (ki < prefix[b]) | ((qi >= ki) & (qi - ki <= window[b]))
+
+    _check(out, flex_attention_ref(q, k, v, keep_fn=keep)[0], (q, k, v))
+
+
+def test_mask_aux_masks_are_rebuilt_not_memoized():
+    doc_a = _doc_ids([[128, 128], [128, 128]])
+    doc_b = _doc_ids([[64, 192], [192, 64]])
+    a = create_block_mask(_doc_causal_aux_mask, 2, None, AUX_S, AUX_S, BLOCK_SIZE=64, aux_tensors=[doc_a])
+    a2 = create_block_mask(_doc_causal_aux_mask, 2, None, AUX_S, AUX_S, BLOCK_SIZE=64, aux_tensors=[doc_a])
+    b = create_block_mask(_doc_causal_aux_mask, 2, None, AUX_S, AUX_S, BLOCK_SIZE=64, aux_tensors=[doc_b])
+    assert a is not a2 and torch.equal(a.to_dense(), a2.to_dense())
+    assert not torch.equal(a.to_dense(), b.to_dense())
+
+
+def test_mask_aux_validation():
+    doc = _doc_ids([[128, 128]])
+    with pytest.raises(ValueError, match="built-in"):
+        create_block_mask(causal_mask, None, None, AUX_S, AUX_S, aux_tensors=[doc])
+    with pytest.raises(ValueError, match="not differentiable"):
+        create_block_mask(
+            _doc_causal_aux_mask, None, None, AUX_S, AUX_S, aux_tensors=[doc.float().requires_grad_(True)]
+        )
+    with pytest.raises(ValueError, match="contiguous"):
+        create_block_mask(_doc_causal_aux_mask, None, None, AUX_S, AUX_S, aux_tensors=[doc.expand(2, -1)[:, ::2]])
+
+
 # ---------------------------------------------------------------- execution-path selection
 
 
