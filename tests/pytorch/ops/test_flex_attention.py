@@ -61,19 +61,33 @@ def _keep_window(left, right):
     return lambda b, h, q, kv: (q - kv <= left) & (q - kv >= -right)
 
 
-SHAPES = [(2, 4, 4, 256, 256, 64), (1, 8, 2, 384, 384, 128), (1, 4, 1, 200, 200, 128)]
-BUILTINS = [
-    ("none", None, None),
-    ("causal", causal_mask, _keep_causal),
-    ("window64", sliding_window_mask(64), _keep_window(64, 0)),
-    ("window32x32", sliding_window_mask(32, 32), _keep_window(32, 32)),
-    ("noop", noop_mask, None),
+# Sequence lengths are kept to a few values -- 256 square, 384 / 640 unequal, 300 ragged
+# -- because the forward compiles one kernel per distinct length.
+MHA = (2, 4, 4, 256, 256, 64)
+GQA = (1, 8, 2, 256, 256, 128)
+MQA_RAGGED = (1, 4, 1, 300, 300, 128)
+BUILTINS = {
+    "none": (None, None),
+    "causal": (causal_mask, _keep_causal),
+    "window64": (sliding_window_mask(64), _keep_window(64, 0)),
+    "window32x32": (sliding_window_mask(32, 32), _keep_window(32, 32)),
+    "noop": (noop_mask, None),
+}
+# Each mask once, plus the causal and window paths on the ragged MQA shape.
+BUILTIN_CASES = [
+    ("none", MHA),
+    ("causal", GQA),
+    ("causal", MQA_RAGGED),
+    ("window64", GQA),
+    ("window64", MQA_RAGGED),
+    ("window32x32", MHA),
+    ("noop", GQA),
 ]
 
 
-@pytest.mark.parametrize("shape", SHAPES, ids=str)
-@pytest.mark.parametrize("name,mask_mod,keep_fn", BUILTINS, ids=[b[0] for b in BUILTINS])
-def test_builtin_masks(shape, name, mask_mod, keep_fn):
+@pytest.mark.parametrize("name,shape", BUILTIN_CASES, ids=[f"{n}-{s}" for n, s in BUILTIN_CASES])
+def test_builtin_masks(name, shape):
+    mask_mod, keep_fn = BUILTINS[name]
     B, Hq, Hkv, Sq, Skv, D = shape
     q, k, v = _inputs(B, Hq, Hkv, Sq, Skv, D)
     block_mask = None if mask_mod is None else create_block_mask(mask_mod, None, None, Sq, Skv)
@@ -87,8 +101,8 @@ def test_builtin_masks(shape, name, mask_mod, keep_fn):
 def test_causal_mask_unequal_lengths_is_top_left():
     # Sq != Skv leaves the fast path (its causal flag is bottom-right aligned) and runs
     # the mask itself, which keeps torch's top-left semantics.
-    q, k, v = _inputs(1, 4, 4, 128, 384, 64)
-    block_mask = create_block_mask(causal_mask, 1, 4, 128, 384, BLOCK_SIZE=64)
+    q, k, v = _inputs(1, 4, 4, 384, 640, 64)
+    block_mask = create_block_mask(causal_mask, 1, 4, 384, 640, BLOCK_SIZE=64)
     assert block_mask._fast_path is None
     out = flex_attention(q, k, v, block_mask=block_mask)
     _check(out, flex_attention_ref(q, k, v, keep_fn=_keep_causal)[0], (q, k, v))
@@ -118,12 +132,24 @@ CUSTOM = [
     ("prefix_lm", _prefix_lm_mask, lambda b, h, q, kv: (kv < 64) | (q >= kv)),
     ("head_checker", _head_checker_mask, lambda b, h, q, kv: ((q // 64 + kv // 64 + h) % 2) == 0),
 ]
+# Every mask at both block sizes, and every shape (square, unequal, ragged) twice.
+BLOCK_SPARSE_CASES = [
+    (CUSTOM[0], 64, 256, 256),
+    (CUSTOM[0], 128, 300, 300),
+    (CUSTOM[1], 128, 384, 640),
+    (CUSTOM[1], 64, 300, 300),
+    (CUSTOM[2], 64, 384, 640),
+    (CUSTOM[2], 128, 256, 256),
+]
 
 
-@pytest.mark.parametrize("block_size", [64, 128])
-@pytest.mark.parametrize("Sq,Skv", [(512, 512), (384, 640), (300, 300)])
-@pytest.mark.parametrize("name,mask_mod,keep_fn", CUSTOM, ids=[c[0] for c in CUSTOM])
-def test_block_sparse_masks(block_size, Sq, Skv, name, mask_mod, keep_fn):
+@pytest.mark.parametrize(
+    "custom,block_size,Sq,Skv",
+    BLOCK_SPARSE_CASES,
+    ids=[f"{c[0]}-b{bs}-{sq}x{skv}" for c, bs, sq, skv in BLOCK_SPARSE_CASES],
+)
+def test_block_sparse_masks(custom, block_size, Sq, Skv):
+    name, mask_mod, keep_fn = custom
     B, H = 2, 4
     q, k, v = _inputs(B, H, 2, Sq, Skv, 64)
     per_head = name == "head_checker"
@@ -258,17 +284,25 @@ def test_mask_aux_validation():
 # ---------------------------------------------------------------- execution-path selection
 
 
+@pytest.fixture
+def path_tuning(monkeypatch):
+    """Path tuning on, though the suite runs with autotuning off (see tests/conftest.py)."""
+    from primus_turbo.pytorch.ops.attention import flex_attention_interface as fi
+
+    monkeypatch.setattr(fi, "AUTOTUNE", "on")
+
+
 @pytest.mark.parametrize(
     "name,mask_mod,keep_fn",
     [("window64", sliding_window_mask(64), _keep_window(64, 0)), CUSTOM[1]],
     ids=["builtin_window", "custom_prefix_lm"],
 )
-def test_every_forward_backward_path_pair(name, mask_mod, keep_fn):
+def test_every_forward_backward_path_pair(path_tuning, name, mask_mod, keep_fn):
     # The forward and backward are tuned independently, so any pairing must be exact.
     from primus_turbo.pytorch.ops.attention import flex_attention_interface as fi
 
-    q, k, v = _inputs(1, 4, 2, 320, 320, 64)
-    block_mask = create_block_mask(mask_mod, None, None, 320, 320)
+    q, k, v = _inputs(1, 4, 2, 300, 300, 64)
+    block_mask = create_block_mask(mask_mod, None, None, 300, 300)
     cands = fi._candidates(block_mask, num_splits=1)
     assert len(cands) >= 2
     key = fi._tune_key(block_mask, q, k, v, 1, None, False)
@@ -288,7 +322,7 @@ def _band_mask_for_tuning(b, h, q_idx, kv_idx):
     return (d < 64) & (d > -64)
 
 
-def test_first_call_tunes_and_caches_both_passes():
+def test_first_call_tunes_and_caches_both_passes(path_tuning):
     from primus_turbo.pytorch.ops.attention import flex_attention_interface as fi
     from primus_turbo.pytorch.ops.attention import flex_attention_masks as fm
 
@@ -361,8 +395,8 @@ def test_softcap_score_mod():
 
 
 def test_lse_is_returned_and_differentiable():
-    q, k, v = _inputs(2, 4, 2, 192, 192, 64)
-    block_mask = create_block_mask(causal_mask, None, None, 192, 192)
+    q, k, v = _inputs(2, 4, 2, 256, 256, 64)
+    block_mask = create_block_mask(causal_mask, None, None, 256, 256)
     out, aux = flex_attention(
         q, k, v, block_mask=block_mask, enable_gqa=True, return_aux=AuxRequest(lse=True)
     )
@@ -386,25 +420,25 @@ def test_mla_head_dims():
 
 # ---------------------------------------------------------------- aux tensors + gradient hook
 
-PAIR = 128  # per-pair bias table [B, H, PAIR, PAIR], for sequences up to 100
+PAIR = 384  # per-pair bias table [B, H, PAIR, PAIR], for sequences up to 300
 
 
 @triton.jit
 def _pair_bias_score_mod(score, b, h, q_idx, kv_idx, BIAS):
-    offset = ((b * 2 + h) * 128 + q_idx) * 128 + kv_idx
-    return score + tl.load(BIAS + offset, mask=(q_idx < 100) & (kv_idx < 100), other=0.0)
+    offset = ((b * 2 + h) * 384 + q_idx) * 384 + kv_idx
+    return score + tl.load(BIAS + offset, mask=(q_idx < 300) & (kv_idx < 300), other=0.0)
 
 
 @triton.jit
 def _pair_bias_grad_hook(dscore, valid, b, h, q_idx, kv_idx, DBIAS, BIAS):
-    offset = ((b * 2 + h) * 128 + q_idx) * 128 + kv_idx
+    offset = ((b * 2 + h) * 384 + q_idx) * 384 + kv_idx
     tl.store(DBIAS + offset, dscore, mask=valid)
 
 
 def test_score_grad_hook_returns_captured_tensor_gradient():
     # Every (b, h, q, kv) has its own bias entry, so the hook's output must equal
     # autograd's gradient of the bias, zeros at masked and padded positions included.
-    B, H, S = 2, 2, 100
+    B, H, S = 2, 2, 300
     q, k, v = _inputs(B, H, H, S, S, 64, seed=3)
     bias = (torch.randn(B, H, PAIR, PAIR, device="cuda") * 2).requires_grad_(True)
     out = flex_attention(

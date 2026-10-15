@@ -50,20 +50,26 @@ def _check(out, ref, leaves):
         assert err <= 5 * TOL * max(scale, 1.0), f"grad {i}: max err {err} vs max |ref| {scale}"
 
 
-SEQLENS = [(256,), (150, 106, 64), (300, 212)]
+# The longest sequence is kept at 256 or 300, because the forward compiles one kernel
+# per distinct maximum length.
+BUILTINS = {
+    "none": (None, None),
+    "causal": (lambda: causal_mask, lambda b, h, q, kv: q >= kv),
+    "window100": (lambda: sliding_window_mask(100), lambda b, h, q, kv: (q >= kv) & (q - kv <= 100)),
+}
+# One sequence, several ragged ones, and two long ones, each mask on at least two.
+BUILTIN_CASES = [
+    ("none", (256, 150, 106)),
+    ("causal", (256,)),
+    ("causal", (300, 212)),
+    ("window100", (256, 150, 106)),
+    ("window100", (300, 212)),
+]
 
 
-@pytest.mark.parametrize("seqlens", SEQLENS, ids=str)
-@pytest.mark.parametrize(
-    "name,mask_fn,keep_fn",
-    [
-        ("none", None, None),
-        ("causal", lambda: causal_mask, lambda b, h, q, kv: q >= kv),
-        ("window100", lambda: sliding_window_mask(100), lambda b, h, q, kv: (q >= kv) & (q - kv <= 100)),
-    ],
-    ids=["none", "causal", "window100"],
-)
-def test_builtin_masks_self_attention(seqlens, name, mask_fn, keep_fn):
+@pytest.mark.parametrize("name,seqlens", BUILTIN_CASES, ids=[f"{n}-{s}" for n, s in BUILTIN_CASES])
+def test_builtin_masks_self_attention(name, seqlens):
+    mask_fn, keep_fn = BUILTINS[name]
     cu = _cu(seqlens)
     q, k, v = _packed(cu[-1].item(), cu[-1].item(), 8, 2, 128)
     block_mask = None
@@ -78,7 +84,7 @@ def test_builtin_masks_self_attention(seqlens, name, mask_fn, keep_fn):
 
 def test_causal_mask_with_different_key_lengths():
     # Separate cu_seqlens tensors leave the fast path; the mask runs per tile instead.
-    seq_q, seq_k = (96, 160), (224, 160)
+    seq_q, seq_k = (128, 256), (256, 256)
     cu_q, cu_k = _cu(seq_q), _cu(seq_k)
     q, k, v = _packed(cu_q[-1].item(), cu_k[-1].item(), 4, 4, 64, seed=1)
     block_mask = create_block_mask_varlen(causal_mask, cu_q, cu_k, max(seq_q), max(seq_k), BLOCK_SIZE=64)
@@ -164,7 +170,7 @@ def _packed_kv_bias_score_mod(score, b, h, q_idx, kv_idx, BIAS, CU_SEQLENS):
 
 
 def test_two_aux_tensors():
-    seqlens = (150, 106, 64)
+    seqlens = (256, 150, 106)
     cu = _cu(seqlens)
     q, k, v = _packed(cu[-1].item(), cu[-1].item(), 4, 4, 128, seed=3)
     bias = torch.randn(cu[-1].item() + 256, device="cuda") * 2  # padded for tail tiles
@@ -192,19 +198,19 @@ def test_two_aux_tensors():
     _check(out, ref, (q, k, v))
 
 
-# (seqlens, rel_extent, window_left): one tile and several, ragged tails, and windows
-# shorter than, equal to and longer than the extent.
+# (Hq/Hkv, seqlens, rel_extent, window_left): one tile and several, ragged tails, windows
+# shorter than, equal to and longer than the extent, alternating Inkling's global (16/2)
+# and local (16/4) head layouts.
 REL_BIAS_CASES = [
-    ((256,), 48, None),
-    ((160, 96), 48, 47),
-    ((150, 106), 130, None),
-    ((300, 212), 130, 199),
-    ((300, 212), 200, 129),
+    ((16, 2), (256,), 48, None),
+    ((16, 4), (256, 96), 48, 47),
+    ((16, 2), (300, 106), 130, None),
+    ((16, 4), (300, 212), 130, 199),
+    ((16, 2), (300, 212), 200, 129),
 ]
 
 
-@pytest.mark.parametrize("heads", [(16, 2), (16, 4)], ids=["global", "local"])
-@pytest.mark.parametrize("seqlens,rel_extent,window_left", REL_BIAS_CASES, ids=str)
+@pytest.mark.parametrize("heads,seqlens,rel_extent,window_left", REL_BIAS_CASES, ids=str)
 def test_rel_bias(heads, seqlens, rel_extent, window_left):
     Hq, Hkv = heads
     cu = _cu(seqlens)
@@ -227,7 +233,7 @@ def test_inkling_matches_miles_flex(layer):
     # Inkling's heads and structure at a size the references can afford: Turbo must
     # match both the fp32 reference and Miles' own PyTorch FlexAttention formulation.
     layer = layer.shrunk(
-        seqlens=(160, 96) if len(layer.seqlens) > 1 else (256,),
+        seqlens=(256, 96) if len(layer.seqlens) > 1 else (256,),
         rel_extent=48,
         window=48 if layer.window is not None else None,
     )
@@ -250,11 +256,11 @@ def test_inkling_matches_miles_flex(layer):
 
 
 def test_rel_bias_without_grad():
-    seqlens = (160, 96)
+    seqlens = (256, 96)
     cu = _cu(seqlens)
-    q, k, v = _packed(256, 256, 8, 2, 128, seed=5)
-    rel = torch.randn(256, 8, 48, device="cuda") * 0.5
+    q, k, v = _packed(352, 352, 8, 2, 128, seed=5)
+    rel = torch.randn(352, 8, 48, device="cuda") * 0.5
     with torch.no_grad():
-        out = flex_attention_varlen_rel_bias(q, k, v, rel, cu, 160, scale=1.0 / 128)
+        out = flex_attention_varlen_rel_bias(q, k, v, rel, cu, 256, scale=1.0 / 128)
     ref = rel_bias_ref(q, k, v, rel, cu, scale=1.0 / 128)
     torch.testing.assert_close(out.float(), ref, atol=TOL, rtol=TOL)
