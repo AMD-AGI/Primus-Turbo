@@ -3081,6 +3081,32 @@ def _k_depth_reason(K: int, tile_k: int, num_buffers: int) -> str | None:
     return None
 
 
+def _clamp_num_buffers(cfg, K: int):
+    """``cfg`` with ``num_buffers`` lowered to the depth ``K`` can actually fill.
+
+    A ring deeper than K has k-tiles leaves ``n_steady`` negative, which is an
+    out-of-bounds read rather than a slow kernel -- see `_k_depth_reason`. The depth
+    the rule demands is monotone in ``num_buffers``, so a short reduction is better
+    served by a SHALLOWER ring than by declining the shape: the tile geometry is
+    untouched, so the shape keeps this kernel instead of falling back, and the
+    shallower pipeline is the one a K this short could sustain anyway.
+
+    Always safe on the resource side, in the one direction that matters: the LDS
+    arena is ``max(num_buffers * pitch, c_store)``, so dropping buffers can only
+    shrink it and WG/CU can only rise. A tile the picker certified at its own depth
+    therefore still fits here, and no `_lds_arena_bytes` re-check is needed.
+
+    Capped below at `_MIN_NUM_BUFFERS`, which the launcher requires, so ``K <
+    tile_k`` is deliberately **not** rescued: one k-tile against a two-deep ring
+    still fails the depth rule, and `_nt_unsupported_reason` /
+    `nn_native_unsupported_reason` decline it.
+    """
+    nb_max = K // cfg[2] + 1
+    if cfg[5] <= nb_max:
+        return cfg
+    return (*cfg[:5], max(_MIN_NUM_BUFFERS, nb_max))
+
+
 def _nt_unsupported_reason(K: int, cfg, allow_ragged_k: bool = True) -> str | None:
     """``None`` if the NT pipeline can run ``(K, cfg)``, else why it cannot.
 
@@ -3145,6 +3171,10 @@ def _pick_config(
       64-deep tile unless ``_ragged_k_upgrade`` applies.
     * ``tile_n = 192`` cannot be built on the NN path at all, because the transposed
       B stage needs a power-of-two TDM ``pad_interval``.
+    * ``num_buffers`` is bounded above by ``K // tile_k + 1`` and is clamped to it on
+      the way out (`_clamp_num_buffers`). A rule may name whatever depth it measured;
+      it does not have to repeat that bound, and it must not assume its depth
+      survives on a short reduction.
 
     Two of the rules below are fits with no established mechanism --
     ``n_groups * ceil(avg_m/256) <= 8``, which takes the narrow tile when the whole
@@ -3157,12 +3187,16 @@ def _pick_config(
     ``avg_m = 256`` it is exactly full and wins.
     """
     cfg = _pick_config_shape(N, K, avg_m, n_groups, b_lds_transpose)
-    if not allow_ragged_k:
-        return cfg
-    wide = _wide_over_narrow_192(cfg, N, K, b_lds_transpose, a_ld, b_ld)
-    if wide is not None:
-        return wide
-    return _ragged_k_upgrade(cfg, K, b_lds_transpose, a_ld, b_ld) or cfg
+    if allow_ragged_k:
+        wide = _wide_over_narrow_192(cfg, N, K, b_lds_transpose, a_ld, b_ld)
+        if wide is not None:
+            cfg = wide
+        else:
+            cfg = _ragged_k_upgrade(cfg, K, b_lds_transpose, a_ld, b_ld) or cfg
+    # LAST, so it judges the tile_k the caller will really get: the ragged upgrade
+    # raises tile_k, which lowers the k-tile count the ring has to be filled from.
+    # A no-op on every tile whose depth K can already sustain.
+    return _clamp_num_buffers(cfg, K)
 
 
 # How much of the wide tile's N axis is allowed to be padding before the 192 tile is
@@ -3746,11 +3780,17 @@ def _pick_config_nn(N: int, K: int, avg_m: int, n_groups: int = 0, allow_ragged_
     # Both keys divide exactly -- no ragged N, and an exact reduction -- and that is
     # CHECKED rather than assumed, because a non-dividing tile_n on this path reads
     # past the allocation, which is a device fault on this part.
+    #
+    # Both pins are reduction lengths with ample k-tiles (4096/64 = 64 and
+    # 7168/64 = 112), so `_clamp_num_buffers` is a no-op on them and the shipped
+    # tuple stays byte-for-byte the one that was timed. Applied anyway, so the
+    # invariant "nothing leaves a picker with a ring K cannot fill" holds at every
+    # exit rather than at most of them.
     if _M28_ENABLED and allow_ragged_k:
         if (N, K, avg_m) == (7168, 4096, 128):  # deepseek-v3 fc1 dgrad, wide-N
-            return (128, 512, 64, 2, 2, 3)
+            return _clamp_num_buffers((128, 512, 64, 2, 2, 3), K)
         if (N, K, avg_m) == (2048, 7168, 128):  # deepseek-v3 fc2 dgrad
-            return (128, 256, 64, 2, 2, 4)
+            return _clamp_num_buffers((128, 256, 64, 2, 2, 4), K)
 
     # `b_lds_transpose=1` matters even though the ragged upgrade is asked for
     # separately below: `_pick_config_shape` reads it to keep the narrow leg's
@@ -3758,9 +3798,13 @@ def _pick_config_nn(N: int, K: int, avg_m: int, n_groups: int = 0, allow_ragged_
     # of the NN adjustments below carry it.
     cfg = _pick_config(N, K, avg_m, n_groups, allow_ragged_k=False, b_lds_transpose=1)
     cfg = _pick_config_nn_shape(cfg, K, avg_m)
-    if not allow_ragged_k:
-        return cfg
-    return _ragged_k_upgrade(cfg, K, 1) or cfg
+    if allow_ragged_k:
+        cfg = _ragged_k_upgrade(cfg, K, 1) or cfg
+    # Re-clamped here rather than relying on `_pick_config`'s own: both adjustments
+    # above can raise tile_k (the non-power-of-two leg of `_pick_config_nn_shape`
+    # goes to 128, as does the ragged upgrade), and a larger tile_k means fewer
+    # k-tiles to fill the ring from.
+    return _clamp_num_buffers(cfg, K)
 
 
 def _pick_config_nn_shape(cfg, K: int, avg_m: int):
