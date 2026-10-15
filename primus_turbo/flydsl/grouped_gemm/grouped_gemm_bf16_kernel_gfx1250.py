@@ -2551,7 +2551,7 @@ def _launch_grouped_gemm_bf16_nt(
             # -- so every fence below sees the counts it
             # always sees, and since `live` is wave-uniform every wave agrees on the trip
             # count and on the number of barriers. With a peeled tail one steady slot is
-            # kept so the peeled index is 0, never -1 (`_require_ragged_k_depth`: -1
+            # kept so the peeled index is 0, never -1 (`_k_depth_reason`: -1
             # addresses LDS outside the arena; a K tail here implies k_tail_peel=1, which
             # the host check above enforces). A runtime select, so the loop bound stays a
             # traced value and the steady loop stays a real scf.for.
@@ -3037,26 +3037,101 @@ def _ragged_k_upgrade(cfg, K: int, b_lds_transpose: int, a_ld: int = 0, b_ld: in
         if require_wg and _GFX1250_LDS_BYTES // arena < base_wg:
             continue
         if K // _RAGGED_K_TILE < nb - 1:
-            continue  # too few full tiles to fill the pipeline; see `_require_ragged_k_depth`
+            continue  # too few full tiles to fill the pipeline; see `_k_depth_reason`
         return cand
     return None
 
 
-def _require_ragged_k_depth(K: int, tile_k: int, num_buffers: int, k_tail: int, who: str):
-    """The tail tile needs a steady iteration to be prefetched from.
+# The TDM prefetch pipeline's floor: `_launch_grouped_gemm_bf16_nt` rejects anything
+# shallower, so it is also the floor any depth back-off has to respect.
+_MIN_NUM_BUFFERS = 2
 
-    The launcher peels the last steady iteration so that "is this k-tile the tail" is
-    a compile-time question, which needs ``n_steady`` to be at least 1. Checked on
-    the host rather than assumed: a peeled index of -1 would address LDS outside the
-    arena, and `gpu_recovery` reads 0 here, so that is a reboot, not a wrong number.
+
+def _k_depth_reason(K: int, tile_k: int, num_buffers: int) -> str | None:
+    """``None`` if ``K`` gives the software pipeline a legal ``n_steady``, else why not.
+
+    The launcher issues ``num_buffers - 1`` k-tiles in the prologue and then runs
+    ``n_steady = K_TILES - (num_buffers - 1)`` steady iterations, where ``K_TILES``
+    counts the full tiles plus the backed-off tail tile when there is one. Two bounds
+    apply, and they collapse into one inequality:
+
+    * ``n_steady >= 0`` **always**, or the prologue issues k-tiles that do not exist.
+      The reduction axis is dim-1 of the A/B descriptors, which carries no extent, so
+      a k-tile past K is an out-of-bounds read rather than a zero-filled one -- this
+      is why the variable-K kernel's trick of lifting ``K_TILES`` to the ring depth
+      does not carry over here.
+    * ``n_steady >= 1`` when there is a tail, because the iteration that prefetches
+      the tail is peeled out of the steady loop at index ``n_steady - 1``; -1 there
+      addresses LDS outside the arena, and `gpu_recovery` reads 0 on this part, so
+      that is a reboot rather than a wrong number.
+
+    With a tail ``K_TILES = K // tile_k + 1``, so the second bound reads
+    ``K // tile_k >= num_buffers - 1``; without one ``K_TILES = K // tile_k`` and the
+    first bound reads the same thing. One rule serves both, which is why this is
+    **not** conditioned on there being a tail.
     """
-    if k_tail and K // tile_k < num_buffers - 1:
-        raise AssertionError(
-            f"{who}: K={K} leaves only {K // tile_k} full tile_k={tile_k} tiles, and a "
-            f"{num_buffers}-buffer pipeline needs at least {num_buffers - 1} of them "
-            f"before the backed-off tail tile has a steady iteration to be prefetched "
-            f"from."
+    full = K // tile_k
+    if full < num_buffers - 1:
+        return (
+            f"K={K} gives only {full} full tile_k={tile_k} tiles, and a {num_buffers}-buffer "
+            f"pipeline needs at least {num_buffers - 1} of them: the prologue issues that "
+            f"many k-tiles before the steady loop starts, and a backed-off tail tile is "
+            f"prefetched from the last steady iteration"
         )
+    return None
+
+
+def _clamp_num_buffers(cfg, K: int):
+    """``cfg`` with ``num_buffers`` lowered to the depth ``K`` can actually fill.
+
+    A ring deeper than K has k-tiles leaves ``n_steady`` negative, which is an
+    out-of-bounds read rather than a slow kernel -- see `_k_depth_reason`. The depth
+    the rule demands is monotone in ``num_buffers``, so a short reduction is better
+    served by a SHALLOWER ring than by declining the shape: the tile geometry is
+    untouched, so the shape keeps this kernel instead of falling back, and the
+    shallower pipeline is the one a K this short could sustain anyway.
+
+    Always safe on the resource side, in the one direction that matters: the LDS
+    arena is ``max(num_buffers * pitch, c_store)``, so dropping buffers can only
+    shrink it and WG/CU can only rise. A tile the picker certified at its own depth
+    therefore still fits here, and no `_lds_arena_bytes` re-check is needed.
+
+    Capped below at `_MIN_NUM_BUFFERS`, which the launcher requires, so ``K <
+    tile_k`` is deliberately **not** rescued: one k-tile against a two-deep ring
+    still fails the depth rule, and `_nt_unsupported_reason` /
+    `nn_native_unsupported_reason` decline it.
+    """
+    nb_max = K // cfg[2] + 1
+    if cfg[5] <= nb_max:
+        return cfg
+    return (*cfg[:5], max(_MIN_NUM_BUFFERS, nb_max))
+
+
+def _nt_unsupported_reason(K: int, cfg, allow_ragged_k: bool = True) -> str | None:
+    """``None`` if the NT pipeline can run ``(K, cfg)``, else why it cannot.
+
+    The **one** copy of ``grouped_gemm_bf16_nt_flydsl_kernel``'s host-side K rules.
+    ``grouped_gemm_bf16_nt_supported`` is published as the non-throwing form of that
+    entry's preconditions, so both read the rules here rather than each restating
+    them: a second copy turns a Triton fallback into an ``AssertionError`` the moment
+    the two drift, which is exactly what happened when the ragged tail landed.
+
+    ``allow_ragged_k`` is the entry's *resolved* verdict, not its raw argument.
+    """
+    tile_k, num_buffers = cfg[2], cfg[5]
+    k_tail = K % tile_k
+    if k_tail and not allow_ragged_k:
+        return (
+            f"K={K} must be a multiple of tile_k={tile_k}. A backed-off tail tile can "
+            f"handle the remainder -- pass allow_ragged_k=1 to use it. It needs "
+            f"K % {WMMA_K_ENTRY} == 0 so the tail lands on a whole number of WMMA sub-steps."
+        )
+    if k_tail % WMMA_K_ENTRY:
+        return (
+            f"K={K} leaves a tail of {k_tail} against tile_k={tile_k}, which is not a "
+            f"multiple of {WMMA_K_ENTRY}; the tail must be a whole number of sub-steps."
+        )
+    return _k_depth_reason(K, tile_k, num_buffers)
 
 
 def _pick_config(
@@ -3096,6 +3171,10 @@ def _pick_config(
       64-deep tile unless ``_ragged_k_upgrade`` applies.
     * ``tile_n = 192`` cannot be built on the NN path at all, because the transposed
       B stage needs a power-of-two TDM ``pad_interval``.
+    * ``num_buffers`` is bounded above by ``K // tile_k + 1`` and is clamped to it on
+      the way out (`_clamp_num_buffers`). A rule may name whatever depth it measured;
+      it does not have to repeat that bound, and it must not assume its depth
+      survives on a short reduction.
 
     Two of the rules below are fits with no established mechanism --
     ``n_groups * ceil(avg_m/256) <= 8``, which takes the narrow tile when the whole
@@ -3108,12 +3187,16 @@ def _pick_config(
     ``avg_m = 256`` it is exactly full and wins.
     """
     cfg = _pick_config_shape(N, K, avg_m, n_groups, b_lds_transpose)
-    if not allow_ragged_k:
-        return cfg
-    wide = _wide_over_narrow_192(cfg, N, K, b_lds_transpose, a_ld, b_ld)
-    if wide is not None:
-        return wide
-    return _ragged_k_upgrade(cfg, K, b_lds_transpose, a_ld, b_ld) or cfg
+    if allow_ragged_k:
+        wide = _wide_over_narrow_192(cfg, N, K, b_lds_transpose, a_ld, b_ld)
+        if wide is not None:
+            cfg = wide
+        else:
+            cfg = _ragged_k_upgrade(cfg, K, b_lds_transpose, a_ld, b_ld) or cfg
+    # LAST, so it judges the tile_k the caller will really get: the ragged upgrade
+    # raises tile_k, which lowers the k-tile count the ring has to be filled from.
+    # A no-op on every tile whose depth K can already sustain.
+    return _clamp_num_buffers(cfg, K)
 
 
 # How much of the wide tile's N axis is allowed to be padding before the 192 tile is
@@ -3253,16 +3336,15 @@ def grouped_gemm_bf16_nt_supported(N: int, K: int, avg_m: int = 0, n_groups: int
 
     ``N`` is the output width and ``K`` the reduction length, i.e. ``b`` is
     ``[G, N, K]`` -- the NT entry's own convention. The non-throwing form of that
-    entry's preconditions, which are judged against the tile ``_pick_config``
-    returns: ``K % tile_k`` need not be 0, because the tail k-tile backs its read
-    window off to ``[K - tile_k, K)``, but a tail does need a steady iteration to be
-    prefetched from (``K // tile_k >= num_buffers - 1``, see
-    ``_require_ragged_k_depth``).
+    entry's preconditions, and it stays that way by **sharing** them: the rules live
+    in ``_nt_unsupported_reason`` and are read from there by this function and by the
+    entry point, so there is nothing for the two to disagree about. ``K % tile_k``
+    need not be 0, because the tail k-tile backs its read window off to
+    ``[K - tile_k, K)``; the tail must be a whole number of WMMA sub-steps, and K
+    must fill the software pipeline (``_k_depth_reason``).
     """
-    _, _, tile_k, _, _, num_buffers = _pick_config(N, K, max(1, avg_m), n_groups)
-    if K % tile_k == 0:
-        return True
-    return K // tile_k >= num_buffers - 1
+    cfg = _pick_config(N, K, max(1, avg_m), n_groups)
+    return _nt_unsupported_reason(K, cfg) is None
 
 
 def grouped_gemm_bf16_nt_flydsl_kernel(
@@ -3478,22 +3560,22 @@ def grouped_gemm_bf16_nt_flydsl_kernel(
     # `K % tile_k == 0` was a hard requirement until the backed-off tail tile existed
     # (see the launcher's `k_tail`). It is now opt-in, because the tail path is new
     # code in the K loop and that is the most dangerous place in this kernel.
-    k_tail = K % tile_k
+    #
     # `allow_ragged_k = -1` opts into a tail the picker chose, not into one an explicit
     # BLOCK_K produced: the picker only returns a ragged tile where it does not cost
     # occupancy, and nothing has measured the combinations it declines.
-    if k_tail and not (allow_ragged_k == 1 or (allow_ragged_k < 0 and not BLOCK_K)):
-        raise AssertionError(
-            f"K={K} must be a multiple of tile_k={tile_k}. A backed-off tail tile can "
-            f"handle the remainder -- pass allow_ragged_k=1 to use it. It needs "
-            f"K % 32 == 0 so the tail lands on a whole number of WMMA sub-steps."
-        )
-    if k_tail % WMMA_K_ENTRY:
-        raise AssertionError(
-            f"K={K} leaves a tail of {k_tail} against tile_k={tile_k}, which is not a "
-            f"multiple of {WMMA_K_ENTRY}; the tail must be a whole number of sub-steps."
-        )
-    _require_ragged_k_depth(K, tile_k, num_buffers, k_tail, "grouped_gemm_bf16_nt_flydsl_kernel")
+    #
+    # Every K rule below is read out of `_nt_unsupported_reason` rather than restated
+    # here, so `grouped_gemm_bf16_nt_supported` -- the published non-throwing form of
+    # these preconditions -- cannot drift away from them. It is judged against the
+    # EFFECTIVE tile, so an explicit BLOCK_K / num_buffers override is checked too.
+    k_tail = K % tile_k
+    ragged_ok = allow_ragged_k == 1 or (allow_ragged_k < 0 and not BLOCK_K)
+    why = _nt_unsupported_reason(
+        K, (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers), allow_ragged_k=ragged_ok
+    )
+    if why is not None:
+        raise AssertionError(f"grouped_gemm_bf16_nt_flydsl_kernel: {why}")
     if half_n_skip < 0:  # auto: only shapes with a wave-wide dead span qualify
         tail = N % tile_n
         half_n_skip = 1 if (tail and tail <= tile_n - tile_n // n_warp) else 0
@@ -3698,11 +3780,17 @@ def _pick_config_nn(N: int, K: int, avg_m: int, n_groups: int = 0, allow_ragged_
     # Both keys divide exactly -- no ragged N, and an exact reduction -- and that is
     # CHECKED rather than assumed, because a non-dividing tile_n on this path reads
     # past the allocation, which is a device fault on this part.
+    #
+    # Both pins are reduction lengths with ample k-tiles (4096/64 = 64 and
+    # 7168/64 = 112), so `_clamp_num_buffers` is a no-op on them and the shipped
+    # tuple stays byte-for-byte the one that was timed. Applied anyway, so the
+    # invariant "nothing leaves a picker with a ring K cannot fill" holds at every
+    # exit rather than at most of them.
     if _M28_ENABLED and allow_ragged_k:
         if (N, K, avg_m) == (7168, 4096, 128):  # deepseek-v3 fc1 dgrad, wide-N
-            return (128, 512, 64, 2, 2, 3)
+            return _clamp_num_buffers((128, 512, 64, 2, 2, 3), K)
         if (N, K, avg_m) == (2048, 7168, 128):  # deepseek-v3 fc2 dgrad
-            return (128, 256, 64, 2, 2, 4)
+            return _clamp_num_buffers((128, 256, 64, 2, 2, 4), K)
 
     # `b_lds_transpose=1` matters even though the ragged upgrade is asked for
     # separately below: `_pick_config_shape` reads it to keep the narrow leg's
@@ -3710,9 +3798,13 @@ def _pick_config_nn(N: int, K: int, avg_m: int, n_groups: int = 0, allow_ragged_
     # of the NN adjustments below carry it.
     cfg = _pick_config(N, K, avg_m, n_groups, allow_ragged_k=False, b_lds_transpose=1)
     cfg = _pick_config_nn_shape(cfg, K, avg_m)
-    if not allow_ragged_k:
-        return cfg
-    return _ragged_k_upgrade(cfg, K, 1) or cfg
+    if allow_ragged_k:
+        cfg = _ragged_k_upgrade(cfg, K, 1) or cfg
+    # Re-clamped here rather than relying on `_pick_config`'s own: both adjustments
+    # above can raise tile_k (the non-power-of-two leg of `_pick_config_nn_shape`
+    # goes to 128, as does the ragged upgrade), and a larger tile_k means fewer
+    # k-tiles to fill the ring from.
+    return _clamp_num_buffers(cfg, K)
 
 
 def _pick_config_nn_shape(cfg, K: int, avg_m: int):
@@ -3739,7 +3831,7 @@ def _pick_config_nn_shape(cfg, K: int, avg_m: int):
 
 
 def nn_native_unsupported_reason(
-    N: int, K: int, tile_n: int, tile_k: int, allow_ragged_k: bool = True
+    N: int, K: int, tile_n: int, tile_k: int, num_buffers: int = _MIN_NUM_BUFFERS, allow_ragged_k: bool = True
 ) -> str | None:
     """``None`` if the native NN pipeline can run this shape, else why it cannot.
 
@@ -3747,6 +3839,13 @@ def nn_native_unsupported_reason(
     ``[G, K, N]`` -- the NN entry's own convention, not the forward one.
     ``allow_ragged_k`` defaults to True to match that entry's default, so a caller
     gets the answer the entry will act on.
+
+    ``num_buffers`` is read by the pipeline-depth rule, which used to live only in
+    the private launch path and *raise* there -- so a shape this function admitted
+    could still blow up one call later. It defaults to the launcher's minimum rather
+    than to a tile's real depth, which makes the depth rule the weakest form that is
+    still sound (the necessary condition for ANY legal ring); pass the depth you will
+    actually run to get the exact answer. Both in-tree callers do.
     """
     if K % tile_k and not allow_ragged_k:
         return (
@@ -3758,6 +3857,9 @@ def nn_native_unsupported_reason(
             f"reduction K={K} leaves a tail of {K % tile_k} against tile_k={tile_k}, "
             f"which is not a whole number of 32-deep sub-steps"
         )
+    depth = _k_depth_reason(K, tile_k, num_buffers)
+    if depth is not None:
+        return f"reduction {depth}"
     if tile_n & (tile_n - 1):
         # The B stage's row width tile_n*EB is the TDM atom's pad_interval, which
         # the hardware requires to be a power of two. `_pick_config_nn` avoids this
@@ -3787,10 +3889,12 @@ def grouped_gemm_bf16_nn_supported(N: int, K: int, avg_m: int = 0, n_groups: int
     ``False`` does **not** mean the call would be wrong: the entry point falls back
     to materialising a transposed weight copy and warns once. It means the call
     would pay a slow parameter-sized copy, so a dispatcher should decline and leave
-    the shape on another backend. ``nn_native_unsupported_reason`` gives the reason.
+    the shape on another backend. ``nn_native_unsupported_reason`` gives the reason,
+    and it is the single copy of the rules: the entry point asks the same function,
+    so this cannot return True on a shape that then raises inside the launch.
     """
-    tile_n, tile_k = _pick_config_nn(N, K, max(1, avg_m), n_groups)[1:3]
-    return nn_native_unsupported_reason(N, K, tile_n, tile_k) is None
+    cfg = _pick_config_nn(N, K, max(1, avg_m), n_groups)
+    return nn_native_unsupported_reason(N, K, cfg[1], cfg[2], cfg[5]) is None
 
 
 def _nn_native_launch(
@@ -3859,7 +3963,12 @@ def _nn_native_launch(
     )
     TOTAL_M = a.shape[0]
     G, Kred, Nout = b.shape
-    _require_ragged_k_depth(Kred, tile_k, num_buffers, Kred % tile_k, "grouped_gemm_bf16_nn_flydsl_kernel")
+    # Belt and braces: the entry point already refused this shape through
+    # `nn_native_unsupported_reason`, which reads the same `_k_depth_reason`. Kept
+    # because a -1 peel index addresses LDS outside the arena and `gpu_recovery` is 0
+    # on this part, so the cost of being wrong here is a reboot.
+    _depth = _k_depth_reason(Kred, tile_k, num_buffers)
+    assert _depth is None, f"grouped_gemm_bf16_nn_flydsl_kernel: {_depth}"
     m_upper = m_tile_upper_bound(TOTAL_M, tile_m, G)
     if m_tiles is None:
         m_tiles = build_m_tile_map(group_offs, tile_m)
@@ -4007,9 +4116,11 @@ def grouped_gemm_bf16_nn_flydsl_kernel(
     already holds an NT-layout copy short-circuits to the NT kernel.
 
     Shape rules for the native path (``nn_native_unsupported_reason`` is the
-    predicate; a shape that misses it falls back to materialising the transpose with
-    a one-shot warning rather than raising): ``K % tile_k == 0``, ``N % 8 == 0`` and
-    ``N >= tile_n``.
+    predicate, and the **only** copy of them; a shape that misses it falls back to
+    materialising the transpose with a one-shot warning rather than raising): the
+    ``K % tile_k`` tail must be a whole number of 32-deep sub-steps (0 included), K
+    must fill the software pipeline (``_k_depth_reason``), ``tile_n`` must be a power
+    of two, ``N % 8 == 0`` and ``N >= tile_n``.
 
     .. warning::
        **On a square shape (N == K == 2880) the first one or two calls in a fresh
@@ -4054,7 +4165,9 @@ def grouped_gemm_bf16_nn_flydsl_kernel(
         # explicit BLOCK_K produced. A shape that is refused here still has the
         # materialised-transpose fallback, so this is a routing decision, not an error.
         ragged_ok = allow_ragged_k == 1 or (allow_ragged_k < 0 and not BLOCK_K)
-        why = nn_native_unsupported_reason(N, Kb, cfg[1], cfg[2], allow_ragged_k=ragged_ok)
+        # `cfg[5]`, not the picker's depth: the tuple above has already absorbed an
+        # explicit num_buffers override, and the depth rule has to judge what will run.
+        why = nn_native_unsupported_reason(N, Kb, cfg[1], cfg[2], cfg[5], allow_ragged_k=ragged_ok)
         if why is None:
             out, _ = _resolve_out_ldc(
                 out, TOTAL_M, N, out_ldc, a.device, out_dtype, "grouped_gemm_bf16_nn_flydsl_kernel"
