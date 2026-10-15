@@ -24,9 +24,16 @@ evaluate ``mask_mod`` per element. With autotuning on (the default;
 and input shape times the fast path and block sizes 64 / 128 separately for the forward
 and the backward, and reuses the winners: the forward usually prefers big tiles, the
 backward smaller ones.
+
+Dense block masks are memoized: a ``mask_mod`` sees only indices (constants are baked
+into its source, and it cannot read tensors), so the lists depend on nothing but the
+mask, the shape and the block size, and ``create_block_mask`` returns the same object
+for a repeated call. Varlen lists depend on ``cu_seqlens``, so they are rebuilt per
+call, without reading anything back from the device.
 """
 
 import functools
+from collections import OrderedDict
 from typing import Optional, Tuple, Union
 
 import torch
@@ -165,7 +172,9 @@ class BlockMask:
                 cu_seqlens_q=cu_q,
                 cu_seqlens_k=cu_k,
             )
-            self._plans[block_size] = BlockPlan.from_categories(categories, (block_size, block_size))
+            self._plans[block_size] = BlockPlan.from_categories(
+                categories, (block_size, block_size), sync_free=self.is_varlen
+            )
         return self._plans[block_size]
 
     @property
@@ -206,6 +215,18 @@ class BlockMask:
         return f"BlockMask(shape={self.shape}, BLOCK_SIZE={self.BLOCK_SIZE}, {path}{varlen})"
 
 
+# Dense masks by everything that determines their lists, least recently used first.
+_DENSE_MASKS: "OrderedDict[tuple, BlockMask]" = OrderedDict()
+_DENSE_MASK_CACHE_SIZE = 64
+
+
+def _device_key(device) -> torch.device:
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return device
+
+
 def create_block_mask(
     mask_mod,
     B: Optional[int],
@@ -216,13 +237,30 @@ def create_block_mask(
     BLOCK_SIZE: Union[int, Tuple[int, int]] = 128,
 ) -> BlockMask:
     """Block mask for :func:`flex_attention`. ``B`` / ``H`` = None broadcasts the mask
-    over that dimension (``mask_mod`` then sees 0 for it)."""
+    over that dimension (``mask_mod`` then sees 0 for it).
+
+    Memoized: a repeated call with the same arguments returns the same object, along
+    with every block list it has built since (at any block size, and for the backward).
+    The cache keys on the ``mask_mod`` object, so build parameterized masks through
+    ``functools.lru_cache`` (as ``sliding_window_mask`` does) to keep hitting it.
+    """
     block_size = _block_size(BLOCK_SIZE)
     shape = (B or 1, H or 1, int(Q_LEN), int(KV_LEN))
+    device = _device_key(device)
+    key = (mask_mod, shape, block_size, device)
+    mask = _DENSE_MASKS.get(key)
+    if mask is not None:
+        _DENSE_MASKS.move_to_end(key)
+        return mask
     fast = _FAST_PATH.get(mask_mod) if Q_LEN == KV_LEN else None
     mask = BlockMask(mask_mod, shape, block_size, device, fast_path=fast)
     # Build the lists up front, as torch does, unless the fast path never needs them.
-    return mask if fast is not None else mask.materialize()
+    if fast is None:
+        mask.materialize()
+    _DENSE_MASKS[key] = mask
+    if len(_DENSE_MASKS) > _DENSE_MASK_CACHE_SIZE:
+        _DENSE_MASKS.popitem(last=False)
+    return mask
 
 
 def create_block_mask_varlen(
@@ -239,6 +277,10 @@ def create_block_mask_varlen(
     Block indices are sequence-local, padded to the longest sequence. A built-in mask
     takes the fast path when queries and keys share one ``cu_seqlens`` tensor
     (self-attention, so every sequence's query and key lengths agree).
+
+    Not memoized, since the lists depend on the ``cu_seqlens`` values. They are built
+    without a device sync (index tensors span the full block grid), so a per-batch
+    rebuild does not stall the host.
     """
     block_size = _block_size(BLOCK_SIZE)
     shape = (cu_seqlens_q.numel() - 1, H or 1, int(max_seqlen_q), int(max_seqlen_k))

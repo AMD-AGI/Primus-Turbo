@@ -50,11 +50,19 @@ class BlockList:
     num_cols: int
 
     @classmethod
-    def from_flags(cls, flags: torch.Tensor) -> "BlockList":
-        """Build from a ``[B, H, num_rows, num_cols]`` bool grid."""
+    def from_flags(cls, flags: torch.Tensor, full_width: bool = False) -> "BlockList":
+        """Build from a ``[B, H, num_rows, num_cols]`` bool grid.
+
+        The index tensor is trimmed to the largest count, which is read back from the
+        device (one sync). With ``full_width`` it spans every column instead, so nothing
+        is read back.
+        """
         counts = flags.sum(dim=-1).to(torch.int32)
-        max_count = max(int(counts.max().item()) if counts.numel() else 0, 1)
         num_cols = flags.shape[-1]
+        if full_width:
+            max_count = max(num_cols, 1)
+        else:
+            max_count = max(int(counts.max().item()) if counts.numel() else 0, 1)
         order = torch.argsort(
             (~flags).to(torch.int32) * num_cols + torch.arange(num_cols, device=flags.device),
             dim=-1,
@@ -84,11 +92,18 @@ class BlockList:
 
 @dataclass(frozen=True)
 class BlockPlan:
-    """Which KV blocks each Q block visits. ``full`` is None when no block is fully kept."""
+    """Which KV blocks each Q block visits. ``full`` is None when no block is fully kept.
+
+    A ``sync_free`` plan, and every plan derived from it, is built without reading
+    anything back from the device: its index tensors span the full grid width and its
+    ``full`` list is always present (possibly empty). Varlen masks are rebuilt for every
+    batch, so they use this; dense masks are built once and trimmed.
+    """
 
     block_size: Tuple[int, int]
     masked: BlockList
     full: Optional[BlockList] = None
+    sync_free: bool = False
 
     # Kernel-facing names.
     @property
@@ -117,13 +132,17 @@ class BlockPlan:
         return self.num_kv_blocks * self.block_size[1] <= seqlen_k
 
     @classmethod
-    def from_categories(cls, categories: torch.Tensor, block_size: Tuple[int, int]) -> "BlockPlan":
+    def from_categories(
+        cls, categories: torch.Tensor, block_size: Tuple[int, int], sync_free: bool = False
+    ) -> "BlockPlan":
         """Build from an int8 ``[B, H, num_q_blocks, num_kv_blocks]`` category grid."""
         full = categories == BLOCK_FULL
+        has_full = sync_free or bool(full.any())
         return cls(
             block_size=tuple(block_size),
-            masked=BlockList.from_flags(categories == BLOCK_PARTIAL),
-            full=BlockList.from_flags(full) if bool(full.any()) else None,
+            masked=BlockList.from_flags(categories == BLOCK_PARTIAL, full_width=sync_free),
+            full=BlockList.from_flags(full, full_width=sync_free) if has_full else None,
+            sync_free=sync_free,
         )
 
     def expand(self, batch: int, heads: int) -> "BlockPlan":
@@ -131,6 +150,7 @@ class BlockPlan:
             self.block_size,
             self.masked.expand(batch, heads),
             None if self.full is None else self.full.expand(batch, heads),
+            self.sync_free,
         )
 
     def combined(self) -> "BlockPlan":
@@ -138,13 +158,15 @@ class BlockPlan:
         dense = self.masked.to_dense()
         if self.full is not None:
             dense = dense | self.full.to_dense()
-        return BlockPlan(self.block_size, BlockList.from_flags(dense))
+        return BlockPlan(
+            self.block_size, BlockList.from_flags(dense, full_width=self.sync_free), sync_free=self.sync_free
+        )
 
     def transposed(self) -> "BlockPlan":
         """Per-KV-block lists of the Q blocks that attend it (the dK/dV direction)."""
+        flags = self.masked.to_dense().transpose(-2, -1).contiguous()
         return BlockPlan(
-            self.block_size,
-            BlockList.from_flags(self.masked.to_dense().transpose(-2, -1).contiguous()),
+            self.block_size, BlockList.from_flags(flags, full_width=self.sync_free), sync_free=self.sync_free
         )
 
 
@@ -187,9 +209,10 @@ def classify_blocks(
     return out
 
 
-# Deriving the backward lists costs a few small kernels plus the device sync that sizes
-# the packed index tensor. Masks are built once and reused every step, so memoize per
-# plan, keyed by the identity of its index tensor and dropped when the plan is freed.
+# Deriving the backward lists costs a few small kernels, plus the device sync that sizes
+# the packed index tensor unless the plan is sync-free. A reused mask should pay that
+# once, so memoize per plan, keyed by the identity of its index tensor and dropped when
+# the plan is freed.
 _BWD_CACHE: dict = {}
 
 

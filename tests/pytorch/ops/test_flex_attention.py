@@ -147,6 +147,38 @@ def test_block_sparse_masks(block_size, Sq, Skv, name, mask_mod, keep_fn):
     _check(out, flex_attention_ref(q, k, v, keep_fn=keep_fn)[0], (q, k, v))
 
 
+def test_create_block_mask_is_memoized(monkeypatch):
+    from primus_turbo.pytorch.ops.attention import flex_attention_masks as fm
+
+    mask = create_block_mask(_band_mask, None, None, 256, 256, BLOCK_SIZE=64)
+    assert create_block_mask(_band_mask, None, None, 256, 256, BLOCK_SIZE=64) is mask
+    device = f"cuda:{torch.cuda.current_device()}"
+    assert create_block_mask(_band_mask, None, None, 256, 256, device=device, BLOCK_SIZE=64) is mask
+    others = [
+        create_block_mask(_band_mask, None, None, 256, 256, BLOCK_SIZE=128),
+        create_block_mask(_band_mask, None, None, 320, 320, BLOCK_SIZE=64),
+        create_block_mask(_band_mask, None, 2, 256, 256, BLOCK_SIZE=64),
+        create_block_mask(causal_mask, None, None, 256, 256, BLOCK_SIZE=64),
+    ]
+    assert all(other is not mask for other in others)
+
+    # A cached mask holds the same lists as a fresh build.
+    fm._DENSE_MASKS.clear()
+    fresh = create_block_mask(_band_mask, None, None, 256, 256, BLOCK_SIZE=64)
+    assert fresh is not mask
+    assert torch.equal(fresh.to_dense(), mask.to_dense())
+
+    # Bounded, least recently used out first.
+    monkeypatch.setattr(fm, "_DENSE_MASK_CACHE_SIZE", 2)
+    fm._DENSE_MASKS.clear()
+    a = create_block_mask(_band_mask, None, None, 128, 128, BLOCK_SIZE=64)
+    b = create_block_mask(_band_mask, None, None, 192, 192, BLOCK_SIZE=64)
+    assert create_block_mask(_band_mask, None, None, 128, 128, BLOCK_SIZE=64) is a
+    create_block_mask(_band_mask, None, None, 256, 256, BLOCK_SIZE=64)  # evicts b
+    assert create_block_mask(_band_mask, None, None, 128, 128, BLOCK_SIZE=64) is a
+    assert create_block_mask(_band_mask, None, None, 192, 192, BLOCK_SIZE=64) is not b
+
+
 # ---------------------------------------------------------------- execution-path selection
 
 
@@ -182,6 +214,7 @@ def _band_mask_for_tuning(b, h, q_idx, kv_idx):
 
 def test_first_call_tunes_and_caches_both_passes():
     from primus_turbo.pytorch.ops.attention import flex_attention_interface as fi
+    from primus_turbo.pytorch.ops.attention import flex_attention_masks as fm
 
     q, k, v = _inputs(1, 4, 4, 256, 256, 64)
     block_mask = create_block_mask(_band_mask_for_tuning, None, None, 256, 256)
@@ -190,8 +223,11 @@ def test_first_call_tunes_and_caches_both_passes():
         flex_attention(q, k, v, block_mask=block_mask)
     fwd, bwd = fi._TUNED[key]
     assert fwd is not None and bwd is None  # no gradient needed yet
-    # A rebuilt mask with the same mask_mod and shapes reuses the decision.
+    # A rebuilt mask (a new object, past the create_block_mask cache) with the same
+    # mask_mod and shapes reuses the decision.
+    fm._DENSE_MASKS.clear()
     rebuilt = create_block_mask(_band_mask_for_tuning, None, None, 256, 256)
+    assert rebuilt is not block_mask
     flex_attention(q, k, v, block_mask=rebuilt).sum().backward()
     fwd2, bwd2 = fi._TUNED[key]
     assert fwd2 is fwd and bwd2 is not None

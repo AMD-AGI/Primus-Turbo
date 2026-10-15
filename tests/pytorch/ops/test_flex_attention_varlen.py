@@ -106,6 +106,35 @@ def test_custom_block_sparse_mask():
     _check(out, ref, (q, k, v))
 
 
+def test_custom_mask_lists_build_without_device_sync():
+    # Varlen lists are rebuilt for every batch, so building them -- forward and backward
+    # -- must not read anything back from the device.
+    from primus_turbo.pytorch.kernels.flex_attention.flex_attention_block_mask_utils import (
+        backward_block_plans,
+    )
+
+    create_block_mask_varlen(_band_mask, _cu((64,)), _cu((64,)), 64, 64, BLOCK_SIZE=64)  # compile
+    seqlens = (300, 212, 128)
+    cu = _cu(seqlens)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        block_mask = create_block_mask_varlen(_band_mask, cu, cu, max(seqlens), max(seqlens), BLOCK_SIZE=64)
+        plan = block_mask.plan
+        dq_plan, dkdv_plan = backward_block_plans(plan)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    assert plan.mask_block_idx.shape[-1] == plan.num_kv_blocks
+    assert dkdv_plan.mask_block_idx.shape[-1] == dkdv_plan.num_kv_blocks
+
+    q, k, v = _packed(cu[-1].item(), cu[-1].item(), 4, 2, 64, seed=2)
+    out = flex_attention_varlen(
+        q, k, v, cu, cu, max(seqlens), max(seqlens), block_mask=block_mask, enable_gqa=True
+    )
+    ref = flex_attention_varlen_ref(q, k, v, cu, cu, keep_fn=lambda b, h, qi, ki: (qi - ki).abs() < 80)[0]
+    _check(out, ref, (q, k, v))
+
+
 @triton.jit
 def _packed_kv_bias_score_mod(score, b, h, q_idx, kv_idx, BIAS, CU_SEQLENS):
     return score + tl.load(BIAS + tl.load(CU_SEQLENS + b) + kv_idx)

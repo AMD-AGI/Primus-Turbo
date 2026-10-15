@@ -126,7 +126,9 @@ to build the block lists; `causal_mask` and `sliding_window_mask` can also use a
 dedicated causal/window kernel path. The first call for a given mask and input shape
 times the available paths (that kernel path, block sizes 64 and 128) separately for the
 forward and the backward and keeps the fastest; set
-`PRIMUS_TURBO_FLEX_ATTENTION_AUTOTUNE=0` to skip this and use static defaults.
+`PRIMUS_TURBO_FLEX_ATTENTION_AUTOTUNE=0` to skip this and use static defaults. Dense block
+masks are memoized, so rebuilding one every step costs nothing after the first. See
+[flex_attention.md](flex_attention.md) for every difference from PyTorch.
 ```python
 import torch
 import triton
