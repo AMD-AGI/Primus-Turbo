@@ -27,6 +27,13 @@ if _worker_id is not None:
     _gpu_id = int(_worker_id.replace("gw", "")) % _num_gpus
     os.environ["HIP_VISIBLE_DEVICES"] = str(_gpu_id)
 
+# Flex attention's results do not depend on which tile configuration or execution path
+# runs, so its tests skip the timing sweeps: one config per kernel and the static path
+# choice. The flex kernels read this when imported, so it is set here, before any test
+# module imports them; export it as 1 to run the suite with autotuning. The tests of
+# path tuning itself switch it back on (see test_flex_attention.py).
+os.environ.setdefault("PRIMUS_TURBO_FLEX_ATTENTION_AUTOTUNE", "0")
+
 
 # Suites that run on gfx1250 (MI455X). Everything else is skipped there -- see
 # pytest_collection_modifyitems. Paths are matched as suffixes of the test file path.
