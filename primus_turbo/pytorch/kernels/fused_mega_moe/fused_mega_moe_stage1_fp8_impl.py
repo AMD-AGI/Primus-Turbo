@@ -119,14 +119,20 @@ def _l1_dgrad_combine_mxfp8_flydsl_kernel(
 def prepare_dw1_pool_operand_fp8(
     pool_x_fp8: Tuple[torch.Tensor, torch.Tensor],
     handle: tuple,
+    pool_rows: Optional[int] = None,
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], dict]:
     """Turn the forward's fc1-input pool into dW1's ``b`` operand -> ``(pool_colwise, meta)``.
 
     Called from the forward while ``pool_x_fp8`` is still a live view of the symm pool: requantizing
     it there consumes the view instead of the clone the backward would need, and keeps the requant
-    off the backward critical path. ``meta`` is reused by the dual-quant, dW1 and dW2."""
+    off the backward critical path. ``meta`` is reused by the dual-quant, dW1 and dW2.
+
+    ``pool_rows`` (default: the whole pool) bounds the colwise operand's M extent; it must cover
+    the block_m-padded rows actually dispatched."""
     meta = colwise_grouped_meta(
-        handle[_HANDLE_GROUP_LENS], handle[_HANDLE_GROUP_OFFS], pool_rows=pool_x_fp8[0].shape[0]
+        handle[_HANDLE_GROUP_LENS],
+        handle[_HANDLE_GROUP_OFFS],
+        pool_rows=pool_x_fp8[0].shape[0] if pool_rows is None else pool_rows,
     )
     pool_colwise = colwise_requant_mxfp8_grouped_fp8in_flydsl(
         pool_x_fp8[0],
@@ -151,6 +157,7 @@ def fused_mega_moe_stage1_forward_fp8_impl(
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
     save_bwd: bool = True,
+    compact_save: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, tuple, Optional[Tuple[torch.Tensor, torch.Tensor]], Optional[dict]]:
     """dispatch + grouped fc1 GEMM (nt, mxfp8).
 
@@ -158,6 +165,9 @@ def fused_mega_moe_stage1_forward_fp8_impl(
     cloned because stage2's backward needs it as the SwiGLU^T scale long after later stages overwrite
     the symm buffer. ``pool_x_colwise`` / ``colwise_meta`` (None unless ``save_bwd``) are dW1's ``b``
     operand, requantized here while the fc1-input pool is still live in symm.
+
+    ``compact_save`` sizes the colwise operand and its meta (``meta["total_M_pad"]``) to the
+    block_m-padded rows actually dispatched instead of the worst-case pool, at the cost of one D2H.
     """
     # int64 end-to-end (combine reads topk i64)
     topk_idx = topk_idx.to(torch.int64)
@@ -170,8 +180,11 @@ def fused_mega_moe_stage1_forward_fp8_impl(
     )
     assert len(handle) == _HANDLE_LEN, f"fp8 dispatch handle len {len(handle)} != {_HANDLE_LEN}; ABI changed"
 
+    pool_rows = None
+    if save_bwd and compact_save:
+        pool_rows = max(int(handle[_HANDLE_GROUP_OFFS][-1].item()), 256)
     pool_x_colwise, colwise_meta = (
-        prepare_dw1_pool_operand_fp8(pool_x_fp8, handle) if save_bwd else (None, None)
+        prepare_dw1_pool_operand_fp8(pool_x_fp8, handle, pool_rows=pool_rows) if save_bwd else (None, None)
     )
     return l1, dispatch_weights.clone(), tuple(handle), pool_x_colwise, colwise_meta
 

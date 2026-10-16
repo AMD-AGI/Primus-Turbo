@@ -391,6 +391,122 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
             self.assertGreaterEqual(snr, _SNR_FLOOR_DB, f"[{name}] SNR {snr:.2f} dB < {_SNR_FLOOR_DB}")
             self.assertGreaterEqual(cos, _COSINE_FLOOR, f"[{name}] cosine {cos:.5f} < {_COSINE_FLOOR}")
 
+    @skip_unless_mxfp8
+    @skip_if_lt_x_gpu(8)
+    def test_compact_save_matches_pool(self):
+        """``compact_save`` keeps only the dispatched rows of ``l1`` and the dW1 operand. dx and dtw
+        are run-to-run deterministic and must match the pool-sized default bit for bit. The wgrads
+        are not; their relative Frobenius error against the default must stay within a margin of
+        what a rerun of the default shows. A max-abs check against one rerun would be a coin flip
+        between two equally noisy samples.
+
+        Two layers and two passes with distinct data, so each layer's backward runs after the other
+        layer's forward has reused the pool-sized transients the compact path no longer holds on to.
+        """
+        torch.cuda.set_device(self.device)
+        advance_weight_generation()
+        group = dist.group.WORLD
+        # this class's shape: a second token count trips a FlyDSL trace error in a shared process
+        hidden, inter, num_experts, num_topk, num_tokens = 7168, 2048, 256, 8, 8192
+        num_layers, num_passes = 2, 2
+
+        symm = get_symm_buffer_for_mega_moe(
+            group,
+            num_experts=num_experts,
+            num_max_tokens_per_rank=num_tokens,
+            num_topk=num_topk,
+            hidden=hidden,
+            intermediate_hidden=inter,
+            use_mxfp8=True,
+        )
+        try:
+            shape = dict(
+                num_tokens=num_tokens,
+                hidden=hidden,
+                inter=inter,
+                num_experts=num_experts,
+                num_topk=num_topk,
+                device=self.device,
+            )
+            weights = [
+                generate_inputs(self.rank, self.world_size, seed=7700 + 13 * lyr, **shape)[1:3]
+                for lyr in range(num_layers)
+            ]
+            passes = []
+            for p in range(num_passes):
+                x, _, _, topk_idx, topk_weight = generate_inputs(
+                    self.rank, self.world_size, seed=4200 + 91 * p, **shape
+                )
+                _g = torch.randn(x.shape, device=self.device, dtype=torch.float32)
+                passes.append(
+                    (x, topk_idx, topk_weight, (_g / (_g.norm() + 1e-12) * _GRAD_OUT_NORM).bfloat16())
+                )
+
+            def accumulate(compact_save):
+                ws = [
+                    (l1.detach().clone().requires_grad_(True), l2.detach().clone().requires_grad_(True))
+                    for l1, l2 in weights
+                ]
+                dx_acc = [torch.zeros(num_tokens, hidden, device=self.device) for _ in range(num_layers)]
+                dtw_acc = [torch.zeros(num_tokens, num_topk, device=self.device) for _ in range(num_layers)]
+                for x, topk_idx, topk_weight, grad_y in passes:
+                    xs, tws, ys = [], [], []
+                    for l1, l2 in ws:
+                        xs.append(x.detach().requires_grad_(True))
+                        tws.append(topk_weight.detach().requires_grad_(True))
+                        l1_out, dwib, handle, state = fused_mega_moe_fp8_stage1(
+                            xs[-1], topk_idx, tws[-1], l1, group, compact_save=compact_save
+                        )
+                        ys.append(
+                            fused_mega_moe_fp8_stage2(
+                                l1_out, dwib, handle, state, topk_idx, tws[-1], l2, group
+                            )
+                        )
+                    sum(ys).backward(grad_y)
+                    for lyr in range(num_layers):
+                        dx_acc[lyr] += xs[lyr].grad.float()
+                        dtw_acc[lyr] += tws[lyr].grad.float()
+                return [(l1.grad, l2.grad, dx_acc[lyr], dtw_acc[lyr]) for lyr, (l1, l2) in enumerate(ws)]
+
+            pool = accumulate(compact_save=False)
+            torch.cuda.synchronize()
+            group.barrier()
+            pool_again = accumulate(compact_save=False)
+            torch.cuda.synchronize()
+            group.barrier()
+            compact = accumulate(compact_save=True)
+            torch.cuda.synchronize()
+            group.barrier()
+        finally:
+            symm.destroy()
+
+        def rel_fro(a, b):
+            d = torch.stack([((a.float() - b.float()) ** 2).sum(), (b.float() ** 2).sum()]).double()
+            dist.all_reduce(d)
+            return float((d[0] / d[1]).sqrt())
+
+        def equal_on_all_ranks(a, b):
+            same = torch.tensor([float(torch.equal(a, b))], device=self.device)
+            dist.all_reduce(same, op=dist.ReduceOp.MIN)
+            return float(same) == 1.0
+
+        # rerun-to-rerun relative Frobenius error varies by <1% across reruns
+        wgrad_margin = 1.1
+        for lyr in range(num_layers):
+            for i, tag in enumerate(("dl1_weight", "dl2_weight")):
+                floor = rel_fro(pool_again[lyr][i], pool[lyr][i])
+                diff = rel_fro(compact[lyr][i], pool[lyr][i])
+                if self.rank == 0:
+                    print(f"[layer{lyr} {tag}] rel fro: compact-pool {diff:.4e} pool-pool {floor:.4e}")
+                self.assertLessEqual(
+                    diff, wgrad_margin * floor, f"[layer{lyr} {tag}] compact_save differs from pool"
+                )
+            for i, tag in ((2, "dx"), (3, "dtw")):
+                self.assertTrue(
+                    equal_on_all_ranks(compact[lyr][i], pool[lyr][i]),
+                    f"[layer{lyr} {tag}] compact_save differs from pool",
+                )
+
 
 if __name__ == "__main__":
     run_tests()

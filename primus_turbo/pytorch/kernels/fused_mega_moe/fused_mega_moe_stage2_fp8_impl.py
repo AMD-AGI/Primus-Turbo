@@ -134,12 +134,14 @@ def fused_mega_moe_stage2_backward_fp8_impl(
     group,
     colwise_meta: dict,
     activation: Optional[GLUActivation] = None,
+    pool_rows: Optional[int] = None,
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
     """L2 dgrad + fused SwiGLU^T dual-quant + dW2 (variable-K wgrad).
 
     Returns ``(grad_l1_rowwise_fp8, grad_l1_colwise_fp8, grad_gate, dW2)`` -- the rowwise pair feeds
     stage1's L1 dgrad, the colwise pair its dW1. ``colwise_meta`` is stage1's, reused here so the
-    dual-quant and dW2 skip a second D2H of the same group offsets.
+    dual-quant and dW2 skip a second D2H of the same group offsets. ``pool_rows`` is set when ``l1``
+    is the compact prefix kept by ``compact_save``.
     """
     group_lens = handle[_HANDLE_GROUP_LENS]
     group_offs = handle[_HANDLE_GROUP_OFFS]
@@ -164,6 +166,7 @@ def fused_mega_moe_stage2_backward_fp8_impl(
         _DW_FP8_FORMAT,
         meta=colwise_meta,
         activation=activation,
+        pool_rows=pool_rows,
     )
 
     # dW2 = dispatched(dy)^T @ act_weighted -- must run before anything overwrites symm.pool_fp8

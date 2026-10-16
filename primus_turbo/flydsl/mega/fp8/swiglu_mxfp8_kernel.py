@@ -691,6 +691,7 @@ def swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl(
     meta: dict = None,
     BT: int = 256,
     activation: Optional[GLUActivation] = None,
+    pool_rows: Optional[int] = None,
 ):
     """SwiGLU backward + rowwise/colwise MXFP8 dual-quant of ``grad_l1`` in one kernel.
 
@@ -698,10 +699,15 @@ def swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl(
     ever materializing ``grad_l1 [P, 2I]`` bf16.  Returns
     ``(q_row, a_sp, q_col, s_col, grad_gate, act_weighted)``, matching the two kernels'
     outputs except that rows outside every group carry 0 (not garbage) in ``grad_gate``.
+
+    ``pool_rows`` sizes the outputs when ``l1`` holds only a prefix of the pool: the kernel reads
+    ``l1`` rows below ``group_offs[-1]`` only, so a prefix that covers them is enough.
     """
     assert l1.dim() == 2 and l1.dtype == torch.bfloat16
     assert dact.dtype == torch.bfloat16 and scale.dtype == torch.float32
-    P, F = l1.shape
+    F = l1.shape[1]
+    P = l1.shape[0] if pool_rows is None else int(pool_rows)
+    assert l1.shape[0] <= P, f"l1 rows {l1.shape[0]} exceed pool_rows {P}"
     assert F % 2 == 0
     I = F // 2
     assert dact.size(1) == I, f"dact[...,I] vs l1[...,2I] mismatch: {dact.shape} {l1.shape}"
