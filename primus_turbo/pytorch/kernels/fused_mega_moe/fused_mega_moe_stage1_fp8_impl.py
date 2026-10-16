@@ -148,9 +148,6 @@ _HANDLE_GROUP_OFFS = 10  # ... and their prefix over the block_m-padded pool
 # fp8 dispatch handle: dispatch_prologue's 11 tables + num_tile_blocks appended by the L1 kernel.
 _HANDLE_LEN = 14
 
-# How the per-call row-indexed tensors are sized; see ``fused_mega_moe_fp8_stage1``.
-BUFFER_MODES = ("exact", "worst_case")
-
 
 def fused_mega_moe_stage1_forward_fp8_impl(
     x: torch.Tensor,
@@ -159,7 +156,6 @@ def fused_mega_moe_stage1_forward_fp8_impl(
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
     save_bwd: bool = True,
-    buffer_mode: str = "exact",
 ) -> Tuple[torch.Tensor, torch.Tensor, tuple, Optional[Tuple[torch.Tensor, torch.Tensor]], Optional[dict]]:
     """dispatch + grouped fc1 GEMM (nt, mxfp8).
 
@@ -168,11 +164,9 @@ def fused_mega_moe_stage1_forward_fp8_impl(
     the symm buffer. ``pool_x_colwise`` / ``colwise_meta`` (None unless ``save_bwd``) are dW1's ``b``
     operand, requantized here while the fc1-input pool is still live in symm.
 
-    ``buffer_mode="exact"`` sizes all of them, ``l1`` and the handle's row maps to the block_m-padded
-    rows actually dispatched, at the cost of one D2H after the prologue; ``"worst_case"`` sizes them
-    to the pool capacity with no host sync. ``l1.shape[0]`` is that row count either way.
+    All of them, ``l1`` and the handle's row maps span the block_m-padded rows actually dispatched
+    to this rank, read back once after the prologue; ``l1.shape[0]`` is that row count.
     """
-    assert buffer_mode in BUFFER_MODES, f"buffer_mode {buffer_mode!r} not in {BUFFER_MODES}"
     # int64 end-to-end (combine reads topk i64)
     topk_idx = topk_idx.to(torch.int64)
     l1, handle, dispatch_weights, pool_x_fp8 = dispatch_l1_fwd_mxfp8_flydsl_kernel(
@@ -181,7 +175,6 @@ def fused_mega_moe_stage1_forward_fp8_impl(
         group,
         topk_idx=topk_idx,
         topk_weights=topk_weights,
-        exact_rows=buffer_mode == "exact",
     )
     assert len(handle) == _HANDLE_LEN, f"fp8 dispatch handle len {len(handle)} != {_HANDLE_LEN}; ABI changed"
 

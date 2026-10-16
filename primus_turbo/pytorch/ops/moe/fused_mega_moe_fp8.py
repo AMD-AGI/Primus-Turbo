@@ -58,8 +58,6 @@ class _Fp8StageState:
     The forward half (``pool_x_colwise`` / ``colwise_meta``, produced by stage1's pool requant) rides
     along because stage2's dual-quant and dW2 need the same grouped meta.
 
-    ``buffer_mode`` picks how stage1 sizes the row-indexed tensors (see ``fused_mega_moe_fp8_stage1``).
-
     One instance per stage1 call; both stages hold it on their ``ctx`` until their backward is done.
     """
 
@@ -68,15 +66,13 @@ class _Fp8StageState:
         "colwise_meta",
         "grad_l1_rowwise_fp8",
         "grad_l1_colwise_fp8",
-        "buffer_mode",
     )
 
-    def __init__(self, buffer_mode: str = "exact"):
+    def __init__(self):
         self.pool_x_colwise = None
         self.colwise_meta = None
         self.grad_l1_rowwise_fp8 = None
         self.grad_l1_colwise_fp8 = None
-        self.buffer_mode = buffer_mode
 
 
 # Each backward drops the per-layer state it consumed instead of letting the graph hold it until the
@@ -125,7 +121,6 @@ class FusedMegaMoEFP8Stage1Function(torch.autograd.Function):
                 topk_idx,
                 topk_weights,
                 save_bwd=save_bwd,
-                buffer_mode=state.buffer_mode,
             )
             state.pool_x_colwise = pool_x_colwise
             state.colwise_meta = colwise_meta
@@ -278,7 +273,6 @@ def fused_mega_moe_fp8_stage1(
     topk_weights: torch.Tensor,
     w1: torch.Tensor,
     group: ProcessGroup,
-    buffer_mode: str = "exact",
 ):
     """Stage1 gate-up (MXFP8). Returns ``(l1, dispatch_weights, handle, state)`` to feed stage2.
 
@@ -286,15 +280,12 @@ def fused_mega_moe_fp8_stage1(
     :func:`fused_mega_moe_fp8_stage2`. Pass ``w1`` directly -- its mxfp8 quant is maintained
     internally by a version-keyed cache.
 
-    ``buffer_mode`` sizes every tensor indexed by dispatched row -- ``l1``, the dW1 operand, the
-    handle's row maps and the per-call intermediates of both stages, forward and backward:
-
-      * ``"exact"`` (default): after the dispatch prologue the forward reads the real row counts back
-        once (a D2H, like DeepEP's notify) and allocates everything at this rank's real rows.
-      * ``"worst_case"``: everything spans the pool capacity, which needs no host sync but keeps
-        about twice the rows a balanced routing produces.
+    After the dispatch prologue the forward reads the real row counts back once (a D2H, like
+    DeepEP's notify), so every tensor indexed by dispatched row -- ``l1``, the dW1 operand, the
+    handle's row maps and the per-call intermediates of both stages, forward and backward -- is
+    allocated at this rank's real rows. That sync also keeps the op out of CUDA graphs.
     """
-    state = _Fp8StageState(buffer_mode)
+    state = _Fp8StageState()
     l1, dispatch_weights, *handle = FusedMegaMoEFP8Stage1Function.apply(
         x,
         topk_idx,

@@ -34,7 +34,7 @@ critical path):
     ``(block_m, block_n)`` combine_flag slot (no cross-WG atomic).
 
 LOCAL fp8 L2Y buffers (``L2Y_FP8`` uint8 [rows*H], ``L2Y_SCALE`` uint8 [rows*H/32]); peer
-``comb`` holds the packed fp8 payload + E8M0 scale (fits the bf16 comb region).
+``comb`` holds the packed fp8 payload + E8M0 scale (``fp8_comb_bytes``).
 """
 
 import functools
@@ -84,7 +84,12 @@ from primus_turbo.flydsl.mega.fp8.prims import (
     ld,
     st,
 )
-from primus_turbo.flydsl.mega.fp8.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
+from primus_turbo.flydsl.mega.fp8.symm_buffer import (
+    SymLayout,
+    fp8_comb_bytes,
+    get_symm_buffer_for_mega_moe,
+    sym_layout_key,
+)
 from primus_turbo.flydsl.utils.prims import cast, read_clock, spin_timed_out
 
 # s_waitcnt vmcnt bound for the GEMM main loop; changes the emitted kernel, so it is in the flyc
@@ -572,7 +577,7 @@ def _compile(
 
     n_blocks = out_features // BLOCK_N
     worst_case_tiles = num_max_pool_tokens // BLOCK_M
-    comb_records = combine_slots * out_features * 2
+    comb_records = fp8_comb_bytes(combine_slots, out_features)
     gate_records = combine_slots * 4  # f32 gate slots per peer (backward d_topk_w scatter)
     delta_records = num_ranks * 8
     assert num_gemm_cu in (None, 0), (
@@ -1015,6 +1020,7 @@ def _combine_launch(
         apply_weights,
         with_gate,
         _COMBINE_NT_VMCNT,
+        sym_layout_key(c.sym_layout),
     )
     run_compiled(_FP8_COMBINE_COMPILED, ck, launch, *args)
     return output

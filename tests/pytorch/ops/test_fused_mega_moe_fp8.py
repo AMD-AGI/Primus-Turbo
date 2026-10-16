@@ -164,8 +164,35 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
             activation=GLUActivation.swigluoai(),
         )
 
+    @skip_unless_mxfp8
+    @skip_if_lt_x_gpu(8)
+    def test_imbalanced_routing(self):
+        """Rank 0 receives 3x the average rows, far past the old ``pool_mult=2`` pool.
+
+        That pool silently dropped the rows past its capacity; this one must land every one of
+        them, which the accuracy gate against DeepEP sees directly: a dropped row is a missing
+        expert term in y and a missing token in dW. Every pick on rank 0 (8x) needs more rows than
+        int32 indexing reaches at H=7168 / I=2048, so every rank must raise -- not hang, not drop --
+        and the next step must still run."""
+        with self.assertRaisesRegex(RuntimeError, "more than the pool capacity"):
+            self._staged_forward_backward(7168, 2048, 256, 8, 8192, hot_topk=8)
+        self._staged_forward_backward(7168, 2048, 256, 8, 8192, hot_topk=3)
+
+    def _hot_rank0_routing(self, num_tokens, num_experts, num_topk, hot_topk):
+        """``hot_topk`` of every token's picks among rank 0's experts, the rest among the others'.
+
+        Weights are the routing softmax over all experts gathered at the picks, as ``generate_inputs``
+        draws them, so only the placement differs from the balanced tests."""
+        epr = num_experts // self.world_size
+        g = torch.Generator(device=self.device).manual_seed(5150 + self.rank)
+        hot = torch.rand(num_tokens, epr, generator=g, device=self.device).argsort(-1)[:, :hot_topk]
+        cold = torch.rand(num_tokens, num_experts - epr, generator=g, device=self.device).argsort(-1)
+        topk_idx = torch.cat([hot, epr + cold[:, : num_topk - hot_topk]], -1)
+        probs = torch.randn(num_tokens, num_experts, generator=g, device=self.device).softmax(-1)
+        return topk_idx.to(torch.int64), probs.gather(1, topk_idx).to(torch.float32)
+
     def _staged_forward_backward(
-        self, hidden, inter, num_experts, num_topk, num_tokens, activation=None, l1_gain=1.0
+        self, hidden, inter, num_experts, num_topk, num_tokens, activation=None, l1_gain=1.0, hot_topk=None
     ):
         torch.cuda.set_device(self.device)
         torch.manual_seed(42 + self.rank)
@@ -182,6 +209,8 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
             device=self.device,
             l1_gain=l1_gain,
         )
+        if hot_topk is not None:
+            topk_idx, topk_weight = self._hot_rank0_routing(num_tokens, num_experts, num_topk, hot_topk)
         symm = get_symm_buffer_for_mega_moe(
             group,
             num_experts=num_experts,
@@ -201,6 +230,15 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
             l2_m = l2_weight.detach().requires_grad_(True)
             tw_m = topk_weight.detach().requires_grad_(True)
             l1_out, dwib, handle, state = fused_mega_moe_fp8_stage1(x_m, topk_idx, tw_m, l1_m, group)
+            # every row-indexed tensor spans the rows dispatched here, at least one block
+            rows = max(int(handle[10][-1]), 256)
+            self.assertEqual(
+                {l1_out.shape[0], dwib.shape[0], handle[12].shape[0], handle[13].shape[0]}, {rows}
+            )
+            if hot_topk is not None and self.rank == 0:
+                old_pool = 2 * num_tokens * num_topk + num_experts // self.world_size * 256
+                self.assertGreaterEqual(rows, self.world_size * num_tokens * hot_topk)
+                self.assertGreater(rows, old_pool)
             y_m = fused_mega_moe_fp8_stage2(
                 l1_out, dwib, handle, state, topk_idx, tw_m, l2_m, group, activation
             )
@@ -240,8 +278,12 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
         measured = [(tag, *self._metrics(a, r)) for tag, a, r in results]
         if self.rank == 0:
             act_name = "silu" if activation is None else repr(activation)
+            route = "balanced" if hot_topk is None else f"{hot_topk}/{num_topk} picks on rank 0"
             print(f"\n{'=' * 72}")
-            print(f"[staged fp8 mega MoE vs turbo DeepEP]  EP{self.world_size} T={num_tokens} act={act_name}")
+            print(
+                f"[staged fp8 mega MoE vs turbo DeepEP]  EP{self.world_size} T={num_tokens} act={act_name}"
+                f" route={route}"
+            )
             print(f"{'=' * 72}")
             for tag, snr, cos in measured:
                 print(f"  {tag:<12}: min SNR = {snr:7.2f} dB  min cos = {cos:.5f}", flush=True)
@@ -390,128 +432,6 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
         for name, snr, cos in results:
             self.assertGreaterEqual(snr, _SNR_FLOOR_DB, f"[{name}] SNR {snr:.2f} dB < {_SNR_FLOOR_DB}")
             self.assertGreaterEqual(cos, _COSINE_FLOOR, f"[{name}] cosine {cos:.5f} < {_COSINE_FLOOR}")
-
-    @skip_unless_mxfp8
-    @skip_if_lt_x_gpu(8)
-    def test_exact_matches_worst_case(self):
-        """``buffer_mode="exact"`` sizes every row-indexed tensor to the dispatched rows instead of the
-        pool capacity. dx and dtw are run-to-run deterministic and must match ``"worst_case"`` bit for
-        bit. The wgrads are not; their relative Frobenius error against worst_case must stay within a
-        margin of what a rerun of worst_case shows. A max-abs check against one rerun would be a coin
-        flip between two equally noisy samples.
-
-        Two layers and two passes with distinct data, so each layer's backward runs after the other
-        layer's forward has reused the per-call transients the caching allocator hands back.
-        """
-        torch.cuda.set_device(self.device)
-        advance_weight_generation()
-        group = dist.group.WORLD
-        # this class's shape: a second token count trips a FlyDSL trace error in a shared process
-        hidden, inter, num_experts, num_topk, num_tokens = 7168, 2048, 256, 8, 8192
-        num_layers, num_passes = 2, 2
-
-        symm = get_symm_buffer_for_mega_moe(
-            group,
-            num_experts=num_experts,
-            num_max_tokens_per_rank=num_tokens,
-            num_topk=num_topk,
-            hidden=hidden,
-            intermediate_hidden=inter,
-            use_mxfp8=True,
-        )
-        try:
-            shape = dict(
-                num_tokens=num_tokens,
-                hidden=hidden,
-                inter=inter,
-                num_experts=num_experts,
-                num_topk=num_topk,
-                device=self.device,
-            )
-            weights = [
-                generate_inputs(self.rank, self.world_size, seed=7700 + 13 * lyr, **shape)[1:3]
-                for lyr in range(num_layers)
-            ]
-            passes = []
-            for p in range(num_passes):
-                x, _, _, topk_idx, topk_weight = generate_inputs(
-                    self.rank, self.world_size, seed=4200 + 91 * p, **shape
-                )
-                _g = torch.randn(x.shape, device=self.device, dtype=torch.float32)
-                passes.append(
-                    (x, topk_idx, topk_weight, (_g / (_g.norm() + 1e-12) * _GRAD_OUT_NORM).bfloat16())
-                )
-
-            def accumulate(buffer_mode):
-                ws = [
-                    (l1.detach().clone().requires_grad_(True), l2.detach().clone().requires_grad_(True))
-                    for l1, l2 in weights
-                ]
-                dx_acc = [torch.zeros(num_tokens, hidden, device=self.device) for _ in range(num_layers)]
-                dtw_acc = [torch.zeros(num_tokens, num_topk, device=self.device) for _ in range(num_layers)]
-                for x, topk_idx, topk_weight, grad_y in passes:
-                    xs, tws, ys = [], [], []
-                    for l1, l2 in ws:
-                        xs.append(x.detach().requires_grad_(True))
-                        tws.append(topk_weight.detach().requires_grad_(True))
-                        l1_out, dwib, handle, state = fused_mega_moe_fp8_stage1(
-                            xs[-1], topk_idx, tws[-1], l1, group, buffer_mode=buffer_mode
-                        )
-                        if buffer_mode == "exact":
-                            rows = max(int(handle[10][-1]), 256)
-                            assert l1_out.shape[0] == rows < symm.num_max_pool_tokens, (
-                                f"exact l1 rows {l1_out.shape[0]} vs dispatched {rows}"
-                            )
-                            assert dwib.shape[0] == handle[12].shape[0] == handle[13].shape[0] == rows
-                        ys.append(
-                            fused_mega_moe_fp8_stage2(
-                                l1_out, dwib, handle, state, topk_idx, tws[-1], l2, group
-                            )
-                        )
-                    sum(ys).backward(grad_y)
-                    for lyr in range(num_layers):
-                        dx_acc[lyr] += xs[lyr].grad.float()
-                        dtw_acc[lyr] += tws[lyr].grad.float()
-                return [(l1.grad, l2.grad, dx_acc[lyr], dtw_acc[lyr]) for lyr, (l1, l2) in enumerate(ws)]
-
-            pool = accumulate("worst_case")
-            torch.cuda.synchronize()
-            group.barrier()
-            pool_again = accumulate("worst_case")
-            torch.cuda.synchronize()
-            group.barrier()
-            exact = accumulate("exact")
-            torch.cuda.synchronize()
-            group.barrier()
-        finally:
-            symm.destroy()
-
-        def rel_fro(a, b):
-            d = torch.stack([((a.float() - b.float()) ** 2).sum(), (b.float() ** 2).sum()]).double()
-            dist.all_reduce(d)
-            return float((d[0] / d[1]).sqrt())
-
-        def equal_on_all_ranks(a, b):
-            same = torch.tensor([float(torch.equal(a, b))], device=self.device)
-            dist.all_reduce(same, op=dist.ReduceOp.MIN)
-            return float(same) == 1.0
-
-        # rerun-to-rerun relative Frobenius error varies by <1% across reruns
-        wgrad_margin = 1.1
-        for lyr in range(num_layers):
-            for i, tag in enumerate(("dl1_weight", "dl2_weight")):
-                floor = rel_fro(pool_again[lyr][i], pool[lyr][i])
-                diff = rel_fro(exact[lyr][i], pool[lyr][i])
-                if self.rank == 0:
-                    print(f"[layer{lyr} {tag}] rel fro: exact-worst {diff:.4e} worst-worst {floor:.4e}")
-                self.assertLessEqual(
-                    diff, wgrad_margin * floor, f"[layer{lyr} {tag}] exact differs from worst_case"
-                )
-            for i, tag in ((2, "dx"), (3, "dtw")):
-                self.assertTrue(
-                    equal_on_all_ranks(exact[lyr][i], pool[lyr][i]),
-                    f"[layer{lyr} {tag}] exact differs from worst_case",
-                )
 
 
 if __name__ == "__main__":

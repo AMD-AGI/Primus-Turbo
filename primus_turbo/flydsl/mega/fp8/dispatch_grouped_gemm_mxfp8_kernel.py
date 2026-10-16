@@ -67,7 +67,11 @@ from primus_turbo.flydsl.mega.fp8.prims import (
     st,
 )
 from primus_turbo.flydsl.mega.fp8.quant import quantize_rowwise_mxfp8_flydsl
-from primus_turbo.flydsl.mega.fp8.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
+from primus_turbo.flydsl.mega.fp8.symm_buffer import (
+    SymLayout,
+    get_symm_buffer_for_mega_moe,
+    sym_layout_key,
+)
 from primus_turbo.flydsl.utils.prims import (
     cast,
     ceildiv,
@@ -744,6 +748,7 @@ def dispatch_grouped_gemm_mxfp8(
             out_fp16,
             int(GROUP_M),
             num_gemm_cu,
+            sym_layout_key(sym_layout),
         )
         run_compiled(_FUSED_COMPILED, ck, _make_raw(dc, pc), *args)
 
@@ -778,7 +783,6 @@ def dispatch_l1_fwd_mxfp8_flydsl_kernel(
     num_dispatch_cu: int = 16,
     num_preshuffle_cu: int = 16,
     num_gemm_cu: Optional[int] = None,
-    exact_rows: bool = False,
 ) -> Tuple[torch.Tensor, tuple, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Forward L1: build the symm workspace from ``topk_idx``, dispatch-PUSH ``x``, and run the
     grouped mxfp8 NT fc1 GEMM -> ``l1``. Fp8 sibling of ``dispatch_grouped_gemm_bf16_flydsl_kernel``.
@@ -793,11 +797,11 @@ def dispatch_l1_fwd_mxfp8_flydsl_kernel(
     ``handle[_H_NUM_TILE_BLOCKS]`` is the device real-tile count, which bounds the SwiGLU
     epilogue's rows.
 
-    By default everything row-indexed spans the pool capacity, which needs no host sync.
-    ``exact_rows`` reads the dispatched row counts back once after the prologue (a D2H, like
-    DeepEP's notify; the token quant runs while the host waits) and sizes ``l1``, the handle's row
-    maps and both views to this rank's block_m-padded rows. The row count of everything returned is
-    ``l1.shape[0]``."""
+    The dispatched row counts are read back once after the prologue (a D2H, like DeepEP's notify;
+    the token quant runs while the host waits), and ``l1``, the handle's row maps and both views are
+    sized to this rank's block_m-padded rows. The row count of everything returned is
+    ``l1.shape[0]``. The pool holds the worst-case routing up to what int32 indexing reaches
+    (``symm_buffer._pool_capacity``); a rank receiving more raises a RuntimeError."""
     w1q = w1_fp8[0]
     G, world = w1q.shape[0], group.size()
     T, H = x.shape
@@ -816,7 +820,7 @@ def dispatch_l1_fwd_mxfp8_flydsl_kernel(
     )
     sym_layout = symm.make_sym_layout()
     capacity = symm.num_max_pool_tokens
-    pool_rows_per_rank = torch.empty(world, dtype=torch.int32, device=x.device) if exact_rows else None
+    pool_rows_per_rank = torch.empty(world, dtype=torch.int32, device=x.device)
     prologue_handle = dispatch_prologue(
         topk_idx,
         topk_weights,
@@ -831,20 +835,19 @@ def dispatch_l1_fwd_mxfp8_flydsl_kernel(
         num_max_pool_tokens=capacity,
         pool_rows_per_rank=pool_rows_per_rank,
     )
-    rows, x_fp8 = capacity, None
-    if exact_rows:
-        host, done = _start_pool_rows_readback(pool_rows_per_rank)
-        x_fp8 = quantize_rowwise_mxfp8_flydsl(x)
-        done.synchronize()
-        rows_all = host.tolist()
-        # Every rank read the same table, so every rank raises together instead of some hanging.
-        if max(rows_all) > capacity:
-            raise RuntimeError(
-                f"mega MoE fp8 dispatch: rank {rows_all.index(max(rows_all))} receives {max(rows_all)} "
-                f"block_m-padded rows, more than the pool capacity {capacity}"
-            )
-        # at least one block so no per-call grid is empty when a rank receives nothing
-        rows = max(rows_all[symm.rank], BM)
+    host, done = _start_pool_rows_readback(pool_rows_per_rank)
+    x_fp8 = quantize_rowwise_mxfp8_flydsl(x)
+    done.synchronize()
+    rows_all = host.tolist()
+    # Every rank read the same table, so every rank raises together instead of some hanging.
+    if max(rows_all) > capacity:
+        raise RuntimeError(
+            f"mega MoE fp8 dispatch: rank {rows_all.index(max(rows_all))} receives {max(rows_all)} "
+            f"block_m-padded rows, more than the pool capacity {capacity} (int32 indexing caps it "
+            "for this expert shape; the routing is too imbalanced)"
+        )
+    # at least one block so no per-call grid is empty when a rank receives nothing
+    rows = max(rows_all[symm.rank], BM)
     handle = extend_handle(prologue_handle, symm, rows)
     l1 = dispatch_grouped_gemm_mxfp8(
         x,

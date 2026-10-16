@@ -54,7 +54,7 @@ from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 from primus_turbo.flydsl.mega.fp8.barrier import grid_sync, xgmi_barrier
 from primus_turbo.flydsl.mega.fp8.gemm_helper import run_compiled
 from primus_turbo.flydsl.mega.fp8.prims import atomic_add, ld, st
-from primus_turbo.flydsl.mega.fp8.symm_buffer import SymLayout, sym_map
+from primus_turbo.flydsl.mega.fp8.symm_buffer import SymLayout, sym_layout_key, sym_map
 
 # grid_blocks (== num_cu) is a caller arg (default 64). Fewer blocks => cheaper
 # self-resetting grid_sync; 48-64 is the measured sweet spot. Must stay <= num_CU so
@@ -162,8 +162,12 @@ def _make_dispatch_prologue(
         expert_send_dst_row_resource = create_buffer_resource(EXPERT_SEND_DST_ROW, max_size=True)
         expert_send_count_resource = create_buffer_resource(EXPERT_SEND_COUNT, max_size=True)
         expert_send_offset_resource = create_buffer_resource(EXPERT_SEND_OFFSET, max_size=True)
-        tile_to_expert_resource = create_buffer_resource(TILE_TO_EXPERT, max_size=True)
-        tile_expected_resource = create_buffer_resource(TILE_EXPECTED, max_size=True)
+        # Bounded like the origin tables: rows past the pool capacity (only reachable with a
+        # pool_mult override) are dropped by the hardware instead of landing past the tensor.
+        tile_to_expert_resource = create_buffer_resource(
+            TILE_TO_EXPERT, num_records_bytes=num_pool_blocks * 4
+        )
+        tile_expected_resource = create_buffer_resource(TILE_EXPECTED, num_records_bytes=num_pool_blocks * 4)
         dispatched_token_idx_resource = create_buffer_resource(DISPATCHED_TOKEN_IDX, max_size=True)
         dispatched_topk_slot_resource = create_buffer_resource(DISPATCHED_TOPK_SLOT, max_size=True)
         src_token_weight_resource = create_buffer_resource(SRC_TOKEN_WEIGHT, max_size=True)
@@ -702,7 +706,7 @@ def dispatch_prologue(
         pool_rows_per_rank,
         stream,
     )
-    # Same key _compile is lru_cached on, since that is what the compiled artifact depends on.
+    # The key _compile is lru_cached on plus the layout dims the region offsets compile in.
     run_compiled(
         _PROLOGUE_COMPILED,
         (
@@ -716,6 +720,7 @@ def dispatch_prologue(
             num_max_pool_tokens,
             int(num_cu),
             topk_idx.dtype,
+            sym_layout_key(sym_layout),
         ),
         launch_function,
         *kernel_arguments,
