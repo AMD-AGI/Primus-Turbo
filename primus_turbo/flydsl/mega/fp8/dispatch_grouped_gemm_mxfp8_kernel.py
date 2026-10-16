@@ -640,9 +640,9 @@ def dispatch_grouped_gemm_mxfp8(
     PUSH, ``num_preshuffle_cu=0`` the transpose, ``num_gemm_cu=0`` the tile compute -- so there is no
     flag per combination. Any of them makes the OUTPUT WRONG."""
     assert x.dtype == torch.bfloat16, f"activation must be bf16, got {x.dtype}"
-    # All four come from prepare_dispatch_weight_fp8 at the op layer: this kernel derives no weight
+    # All three come from prepare_dispatch_weight_fp8 at the op layer: this kernel derives no weight
     # state and caches none, so it cannot go stale behind an optimizer step.
-    w1q, w1s, WEIGHTS, weight_scale_ps = w1_fp8
+    w1q, WEIGHTS, weight_scale_ps = w1_fp8
     (
         expert_send_dst_rank,
         expert_send_dst_row,
@@ -787,7 +787,7 @@ def dispatch_l1_fwd_mxfp8_flydsl_kernel(
     """Forward L1: build the symm workspace from ``topk_idx``, dispatch-PUSH ``x``, and run the
     grouped mxfp8 NT fc1 GEMM -> ``l1``. Fp8 sibling of ``dispatch_grouped_gemm_bf16_flydsl_kernel``.
 
-    ``w1_fp8`` is the fc1 4-tuple from ``prepare_dispatch_weight_fp8``. This direction OWNS the
+    ``w1_fp8`` is the fc1 3-tuple from ``prepare_dispatch_weight_fp8``. This direction OWNS the
     routing: it runs the prologue and returns the handle every later stage of the step rides on --
     SwiGLU, the L2, and both dgrads. See ``dispatch_l2_dgrad_mxfp8_flydsl_kernel`` for the backward,
     which is the same NT op over that handle.
@@ -881,7 +881,7 @@ def dispatch_l2_dgrad_mxfp8_flydsl_kernel(
     """Backward L2 dgrad: dispatch-PUSH ``dy`` and run ``grad_swiglu = dy @ w2`` -- the same NT op the
     forward runs, only the input and weight differ.
 
-    ``w2t_fp8`` is the ``w2^T`` 4-tuple from ``prepare_dispatch_weight_fp8``. Takes the FORWARD's
+    ``w2t_fp8`` is the ``w2^T`` 3-tuple from ``prepare_dispatch_weight_fp8``. Takes the FORWARD's
     ``handle`` and must, so dy retraces x's routing: this direction runs no prologue and derives no
     routing of its own. Its N=I carries half the forward's FLOPs against the same push bytes, which is
     why its COMM/PRESHUFFLE default hands more of the grid to comm than the forward's does.
