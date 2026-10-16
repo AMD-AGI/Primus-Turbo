@@ -85,9 +85,6 @@ _WARP = 64
 # rows rather than mapping one block per row. 4096 blocks is 16 per CU on a 256-CU device.
 _SWIGLU_GRID_X = 4096
 
-_Q_SCRATCH: dict = {}
-_ASP_SCRATCH: dict = {}
-
 
 # Activation emitters. Kept in this file rather than shared with the bf16 kernels because the FlyDSL
 # disk cache only hashes helper sources from the kernel's own directory.
@@ -280,25 +277,16 @@ def swiglu_mxfp8_flydsl_kernel(
     assert I % MXFP8_BLOCK == 0, f"I={I} must be a multiple of mxfp8 block {MXFP8_BLOCK}"
 
     dev = x.device
-    sk3 = (M, I, dev)
-    q = _Q_SCRATCH.get(sk3)
-    if q is None:
-        q = torch.empty((M, I), dtype=torch.float8_e4m3fn, device=dev)
-        _Q_SCRATCH[sk3] = q
+    q = torch.empty((M, I), dtype=torch.float8_e4m3fn, device=dev)
     q_i32 = q.view(torch.int32)
     K128p = ceildiv(I // 128, MXFP8_SCALE_PACK)
-    a_ngrp = ceildiv(M, 64)
-    asp_sk = (a_ngrp, K128p, dev)
-    a_sp = _ASP_SCRATCH.get(asp_sk)
-    if a_sp is None:
-        a_sp = torch.empty(a_ngrp * K128p * 256, dtype=torch.int32, device=dev)
-        _ASP_SCRATCH[asp_sk] = a_sp
+    a_sp = torch.empty(ceildiv(M, 64) * K128p * 256, dtype=torch.int32, device=dev)
 
     act = activation_constexpr(activation)
     launch = _compile_swiglu_mxfp8(int(I), act)
     args = (x, q_i32, a_sp, num_tile_blocks, M, torch.cuda.current_stream())
-    ck = (M, I, act)
-    run_compiled(_SWIGLU_MXFP8_COMPILED, ck, launch, *args)
+    # M and every tensor shape are runtime arguments, so they stay out of the key
+    run_compiled(_SWIGLU_MXFP8_COMPILED, (I, act), launch, *args)
     return q, a_sp
 
 
@@ -691,7 +679,6 @@ def swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl(
     meta: dict = None,
     BT: int = 256,
     activation: Optional[GLUActivation] = None,
-    pool_rows: Optional[int] = None,
 ):
     """SwiGLU backward + rowwise/colwise MXFP8 dual-quant of ``grad_l1`` in one kernel.
 
@@ -699,15 +686,10 @@ def swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl(
     ever materializing ``grad_l1 [P, 2I]`` bf16.  Returns
     ``(q_row, a_sp, q_col, s_col, grad_gate, act_weighted)``, matching the two kernels'
     outputs except that rows outside every group carry 0 (not garbage) in ``grad_gate``.
-
-    ``pool_rows`` sizes the outputs when ``l1`` holds only a prefix of the pool: the kernel reads
-    ``l1`` rows below ``group_offs[-1]`` only, so a prefix that covers them is enough.
     """
     assert l1.dim() == 2 and l1.dtype == torch.bfloat16
     assert dact.dtype == torch.bfloat16 and scale.dtype == torch.float32
-    F = l1.shape[1]
-    P = l1.shape[0] if pool_rows is None else int(pool_rows)
-    assert l1.shape[0] <= P, f"l1 rows {l1.shape[0]} exceed pool_rows {P}"
+    P, F = l1.shape
     assert F % 2 == 0
     I = F // 2
     assert dact.size(1) == I, f"dact[...,I] vs l1[...,2I] mismatch: {dact.shape} {l1.shape}"

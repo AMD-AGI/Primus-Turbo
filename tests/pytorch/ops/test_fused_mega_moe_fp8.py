@@ -393,15 +393,15 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
 
     @skip_unless_mxfp8
     @skip_if_lt_x_gpu(8)
-    def test_compact_save_matches_pool(self):
-        """``compact_save`` keeps only the dispatched rows of ``l1`` and the dW1 operand. dx and dtw
-        are run-to-run deterministic and must match the pool-sized default bit for bit. The wgrads
-        are not; their relative Frobenius error against the default must stay within a margin of
-        what a rerun of the default shows. A max-abs check against one rerun would be a coin flip
-        between two equally noisy samples.
+    def test_exact_matches_worst_case(self):
+        """``buffer_mode="exact"`` sizes every row-indexed tensor to the dispatched rows instead of the
+        pool capacity. dx and dtw are run-to-run deterministic and must match ``"worst_case"`` bit for
+        bit. The wgrads are not; their relative Frobenius error against worst_case must stay within a
+        margin of what a rerun of worst_case shows. A max-abs check against one rerun would be a coin
+        flip between two equally noisy samples.
 
         Two layers and two passes with distinct data, so each layer's backward runs after the other
-        layer's forward has reused the pool-sized transients the compact path no longer holds on to.
+        layer's forward has reused the per-call transients the caching allocator hands back.
         """
         torch.cuda.set_device(self.device)
         advance_weight_generation()
@@ -442,7 +442,7 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
                     (x, topk_idx, topk_weight, (_g / (_g.norm() + 1e-12) * _GRAD_OUT_NORM).bfloat16())
                 )
 
-            def accumulate(compact_save):
+            def accumulate(buffer_mode):
                 ws = [
                     (l1.detach().clone().requires_grad_(True), l2.detach().clone().requires_grad_(True))
                     for l1, l2 in weights
@@ -455,8 +455,14 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
                         xs.append(x.detach().requires_grad_(True))
                         tws.append(topk_weight.detach().requires_grad_(True))
                         l1_out, dwib, handle, state = fused_mega_moe_fp8_stage1(
-                            xs[-1], topk_idx, tws[-1], l1, group, compact_save=compact_save
+                            xs[-1], topk_idx, tws[-1], l1, group, buffer_mode=buffer_mode
                         )
+                        if buffer_mode == "exact":
+                            rows = max(int(handle[10][-1]), 256)
+                            assert l1_out.shape[0] == rows < symm.num_max_pool_tokens, (
+                                f"exact l1 rows {l1_out.shape[0]} vs dispatched {rows}"
+                            )
+                            assert dwib.shape[0] == handle[12].shape[0] == handle[13].shape[0] == rows
                         ys.append(
                             fused_mega_moe_fp8_stage2(
                                 l1_out, dwib, handle, state, topk_idx, tws[-1], l2, group
@@ -468,13 +474,13 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
                         dtw_acc[lyr] += tws[lyr].grad.float()
                 return [(l1.grad, l2.grad, dx_acc[lyr], dtw_acc[lyr]) for lyr, (l1, l2) in enumerate(ws)]
 
-            pool = accumulate(compact_save=False)
+            pool = accumulate("worst_case")
             torch.cuda.synchronize()
             group.barrier()
-            pool_again = accumulate(compact_save=False)
+            pool_again = accumulate("worst_case")
             torch.cuda.synchronize()
             group.barrier()
-            compact = accumulate(compact_save=True)
+            exact = accumulate("exact")
             torch.cuda.synchronize()
             group.barrier()
         finally:
@@ -495,16 +501,16 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
         for lyr in range(num_layers):
             for i, tag in enumerate(("dl1_weight", "dl2_weight")):
                 floor = rel_fro(pool_again[lyr][i], pool[lyr][i])
-                diff = rel_fro(compact[lyr][i], pool[lyr][i])
+                diff = rel_fro(exact[lyr][i], pool[lyr][i])
                 if self.rank == 0:
-                    print(f"[layer{lyr} {tag}] rel fro: compact-pool {diff:.4e} pool-pool {floor:.4e}")
+                    print(f"[layer{lyr} {tag}] rel fro: exact-worst {diff:.4e} worst-worst {floor:.4e}")
                 self.assertLessEqual(
-                    diff, wgrad_margin * floor, f"[layer{lyr} {tag}] compact_save differs from pool"
+                    diff, wgrad_margin * floor, f"[layer{lyr} {tag}] exact differs from worst_case"
                 )
             for i, tag in ((2, "dx"), (3, "dtw")):
                 self.assertTrue(
-                    equal_on_all_ranks(compact[lyr][i], pool[lyr][i]),
-                    f"[layer{lyr} {tag}] compact_save differs from pool",
+                    equal_on_all_ranks(exact[lyr][i], pool[lyr][i]),
+                    f"[layer{lyr} {tag}] exact differs from worst_case",
                 )
 
 

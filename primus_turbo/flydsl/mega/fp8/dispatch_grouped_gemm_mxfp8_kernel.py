@@ -82,7 +82,7 @@ _H_ORIGIN_SLOT = 13  # appended by this module: per-call pool row -> owning topk
 _FUSED_COMPILED: dict = {}  # (shape key) -> compiled launch; see run_compiled
 
 
-def extend_handle(prologue_handle, symm) -> tuple:
+def extend_handle(prologue_handle, symm, pool_rows: Optional[int] = None) -> tuple:
     """Append this module's three per-call handle slots (indices 11-13) to a ``dispatch_prologue``
     handle. Every caller of ``dispatch_grouped_gemm_mxfp8`` must do this first; the plain prologue
     handle stops at index 10.
@@ -93,11 +93,15 @@ def extend_handle(prologue_handle, symm) -> tuple:
     origin_slot map each pool row back to the rank and topk slot that sent it, which is what the
     L1-dgrad push needs to return the row to its owner. Stream-ordered D2D copies, no host sync.
     (bf16 does the same with pool_src_slot.)
+
+    ``pool_rows`` (default: the whole pool) keeps only that prefix of the two row maps; it must
+    cover this call's block_m-padded rows.
     """
+    rows = symm.num_max_pool_tokens if pool_rows is None else int(pool_rows)
     return tuple(prologue_handle) + (
         symm.meta_scalars[1:2].clone(),
-        symm.origin_rank.clone(),
-        symm.origin_slot.clone(),
+        symm.origin_rank[:rows].clone(),
+        symm.origin_slot[:rows].clone(),
     )
 
 
@@ -340,7 +344,7 @@ def _compile(
         WEIGHTS: fx.Tensor,  # fp8 weights viewed int8 [G*N*K] flattened
         WEIGHT_SCALE_PS: fx.Tensor,  # host-preshuffled weight E8M0 (ScaleBComb b_sp, int32)
         POOL_SCALE_PS: fx.Tensor,  # local pool E8M0 in ScaleS2R broadcast layout a_sp (int32)
-        OUTPUT: fx.Tensor,  # bf16 [num_max_pool_tokens, N] flattened
+        OUTPUT: fx.Tensor,  # bf16 [rows, N] flattened, rows >= num_tile_blocks * BLOCK_M
         TILE_TO_GROUP: fx.Tensor,
         EXPECTED: fx.Tensor,  # (unused after epoch migration; kept for handle-plumbing stability)
         NUM_TILE_BLOCKS: fx.Tensor,
@@ -489,7 +493,8 @@ def _compile(
                     )
                     block_m = first_pid_m + (pid_in_group % group_size_m)
                     block_n = pid_in_group // group_size_m
-                    c_m_real = fx.Int32(num_max_pool_tokens)
+                    # OUTPUT may hold only the real rows, so bound by them, not by the pool.
+                    c_m_real = real_tiles * fx.Int32(BLOCK_M)
                     if (not _no_ps) and thread_index == fx.Int32(0):
                         spin_start = read_clock()
                         signal = ld(
@@ -614,11 +619,14 @@ def dispatch_grouped_gemm_mxfp8(
     GROUP_M: int = 4,
     out_dtype: torch.dtype = torch.bfloat16,
     num_gemm_cu: Optional[int] = None,
+    pool_rows: Optional[int] = None,
+    x_fp8: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Fused fp8 dispatch PUSH + grouped mxfp8 L1 GEMM (comm/preshuffle/gemm pipeline).
 
-    Rowwise-quantizes the bf16 ``x`` [T, K] in one host-side launch, then runs the
-    comm|preshuffle|gemm overlap. ``num_dispatch_cu`` / ``num_preshuffle_cu`` are used as given; each
+    Rowwise-quantizes the bf16 ``x`` [T, K] in one host-side launch (skipped when ``x_fp8``, that
+    quant's ``(xq, xs)``, is given), then runs the comm|preshuffle|gemm overlap. The output holds
+    ``pool_rows`` rows (default: the whole pool), which must cover the handle's real tiles. ``num_dispatch_cu`` / ``num_preshuffle_cu`` are used as given; each
     entry above passes its own measured pair. Nothing is searched here, and a first-call search is not
     worth reviving: the ranks are still compiling then, so candidates measured 0.8% apart against a ~5%
     steady-state gap and picked differently per run, which made fwd-only bimodal at 5.09-5.37 ms. The
@@ -652,8 +660,13 @@ def dispatch_grouped_gemm_mxfp8(
     out_fp16 = out_dtype == torch.float16
     c_n = N
 
+    rows = num_max_pool_tokens if pool_rows is None else int(pool_rows)
+    assert rows <= num_max_pool_tokens and rows % BM == 0, (
+        f"pool_rows {rows} must be a multiple of BM={BM} within the pool ({num_max_pool_tokens})"
+    )
+
     dev = x.device
-    xq, xs = quantize_rowwise_mxfp8_flydsl(x)
+    xq, xs = quantize_rowwise_mxfp8_flydsl(x) if x_fp8 is None else x_fp8
     xs = xs.view(torch.float8_e8m0fnu)
     xq_c = xq if xq.is_contiguous() else xq.contiguous()
     xs_c = xs if xs.is_contiguous() else xs.contiguous()
@@ -670,7 +683,7 @@ def dispatch_grouped_gemm_mxfp8(
     # Fresh per call, not shared scratch: l1 is the SwiGLU backward's input, so it must survive to
     # this layer's backward, and sharing lets the next layer's forward overwrite it first. Invisible
     # with one MoE layer -- 2 layers over 20 steps drifted 1.52 in loss against bf16 vs 0.07 for one.
-    output = torch.empty((num_max_pool_tokens, N), dtype=out_dtype, device=dev)
+    output = torch.empty((rows, N), dtype=out_dtype, device=dev)
     output_flat = output.view(-1)
 
     # _compile is lru_cached, so re-asking per candidate split costs one compile each, then nothing.
@@ -738,6 +751,21 @@ def dispatch_grouped_gemm_mxfp8(
     return output
 
 
+_POOL_ROWS_HOST: dict = {}  # device -> pinned int32 [world] target of the pool-rows readback
+
+
+def _start_pool_rows_readback(pool_rows_per_rank: torch.Tensor):
+    """Queue the D2H of the prologue's per-rank pool rows -> ``(host, done_event)``."""
+    host = _POOL_ROWS_HOST.get(pool_rows_per_rank.device)
+    if host is None or host.numel() != pool_rows_per_rank.numel():
+        host = torch.empty(pool_rows_per_rank.numel(), dtype=torch.int32, pin_memory=True)
+        _POOL_ROWS_HOST[pool_rows_per_rank.device] = host
+    host.copy_(pool_rows_per_rank, non_blocking=True)
+    done = torch.cuda.Event()
+    done.record()
+    return host, done
+
+
 def dispatch_l1_fwd_mxfp8_flydsl_kernel(
     x: torch.Tensor,
     w1_fp8: tuple,
@@ -750,6 +778,7 @@ def dispatch_l1_fwd_mxfp8_flydsl_kernel(
     num_dispatch_cu: int = 16,
     num_preshuffle_cu: int = 16,
     num_gemm_cu: Optional[int] = None,
+    exact_rows: bool = False,
 ) -> Tuple[torch.Tensor, tuple, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Forward L1: build the symm workspace from ``topk_idx``, dispatch-PUSH ``x``, and run the
     grouped mxfp8 NT fc1 GEMM -> ``l1``. Fp8 sibling of ``dispatch_grouped_gemm_bf16_flydsl_kernel``.
@@ -762,7 +791,13 @@ def dispatch_l1_fwd_mxfp8_flydsl_kernel(
     Returns ``(l1, handle, dispatch_weights, pool_x_fp8)``. ``dispatch_weights`` and ``pool_x_fp8``
     are LIVE views into the shared symm pool -- clone them before a later stage overwrites them.
     ``handle[_H_NUM_TILE_BLOCKS]`` is the device real-tile count, which bounds the SwiGLU
-    epilogue's rows."""
+    epilogue's rows.
+
+    By default everything row-indexed spans the pool capacity, which needs no host sync.
+    ``exact_rows`` reads the dispatched row counts back once after the prologue (a D2H, like
+    DeepEP's notify; the token quant runs while the host waits) and sizes ``l1``, the handle's row
+    maps and both views to this rank's block_m-padded rows. The row count of everything returned is
+    ``l1.shape[0]``."""
     w1q = w1_fp8[0]
     G, world = w1q.shape[0], group.size()
     T, H = x.shape
@@ -780,22 +815,37 @@ def dispatch_l1_fwd_mxfp8_flydsl_kernel(
         use_mxfp8=True,
     )
     sym_layout = symm.make_sym_layout()
-    handle = extend_handle(
-        dispatch_prologue(
-            topk_idx,
-            topk_weights,
-            sym_layout=sym_layout,
-            num_tokens=T,
-            num_topk=K,
-            num_experts=G * world,
-            world_size=world,
-            rank=symm.rank,
-            experts_per_rank=G,
-            block_m=BM,
-            num_max_pool_tokens=symm.num_max_pool_tokens,
-        ),
-        symm,
+    capacity = symm.num_max_pool_tokens
+    pool_rows_per_rank = torch.empty(world, dtype=torch.int32, device=x.device) if exact_rows else None
+    prologue_handle = dispatch_prologue(
+        topk_idx,
+        topk_weights,
+        sym_layout=sym_layout,
+        num_tokens=T,
+        num_topk=K,
+        num_experts=G * world,
+        world_size=world,
+        rank=symm.rank,
+        experts_per_rank=G,
+        block_m=BM,
+        num_max_pool_tokens=capacity,
+        pool_rows_per_rank=pool_rows_per_rank,
     )
+    rows, x_fp8 = capacity, None
+    if exact_rows:
+        host, done = _start_pool_rows_readback(pool_rows_per_rank)
+        x_fp8 = quantize_rowwise_mxfp8_flydsl(x)
+        done.synchronize()
+        rows_all = host.tolist()
+        # Every rank read the same table, so every rank raises together instead of some hanging.
+        if max(rows_all) > capacity:
+            raise RuntimeError(
+                f"mega MoE fp8 dispatch: rank {rows_all.index(max(rows_all))} receives {max(rows_all)} "
+                f"block_m-padded rows, more than the pool capacity {capacity}"
+            )
+        # at least one block so no per-call grid is empty when a rank receives nothing
+        rows = max(rows_all[symm.rank], BM)
+    handle = extend_handle(prologue_handle, symm, rows)
     l1 = dispatch_grouped_gemm_mxfp8(
         x,
         w1_fp8,
@@ -807,9 +857,10 @@ def dispatch_l1_fwd_mxfp8_flydsl_kernel(
         BM=BM,
         BN=BN,
         num_gemm_cu=num_gemm_cu,
+        pool_rows=rows,
+        x_fp8=x_fp8,
     )
-    _Px, _Hx = symm.pool_fp8.shape
-    return l1, handle, symm.weight_recv_buf, (symm.pool_fp8, symm.pool_scale.reshape(_Px, _Hx // 32))
+    return l1, handle, symm.weight_recv_buf[:rows], (symm.pool_fp8[:rows], symm.pool_scale[:rows])
 
 
 def dispatch_l2_dgrad_mxfp8_flydsl_kernel(
@@ -822,6 +873,7 @@ def dispatch_l2_dgrad_mxfp8_flydsl_kernel(
     num_dispatch_cu: int = 24,
     num_preshuffle_cu: int = 8,
     num_gemm_cu: Optional[int] = None,
+    pool_rows: Optional[int] = None,
 ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Backward L2 dgrad: dispatch-PUSH ``dy`` and run ``grad_swiglu = dy @ w2`` -- the same NT op the
     forward runs, only the input and weight differ.
@@ -833,9 +885,11 @@ def dispatch_l2_dgrad_mxfp8_flydsl_kernel(
 
     Returns ``(grad_swiglu, pool_dy_fp8)``. ``pool_dy_fp8`` is a LIVE view into the shared symm pool
     -- the rowwise-fp8 dy that dW2's ``a`` operand reads -- so clone it before a later stage
-    overwrites it."""
+    overwrites it. Both span ``pool_rows`` rows (default: the whole pool); pass the forward's
+    ``l1.shape[0]``."""
     symm = get_symm_buffer_for_mega_moe()  # live buffer the forward built
     sym_layout = symm.make_sym_layout()
+    rows = symm.num_max_pool_tokens if pool_rows is None else int(pool_rows)
     grad_swiglu = dispatch_grouped_gemm_mxfp8(
         dy,
         w2t_fp8,
@@ -847,6 +901,6 @@ def dispatch_l2_dgrad_mxfp8_flydsl_kernel(
         BM=BM,
         BN=BN,
         num_gemm_cu=num_gemm_cu,
+        pool_rows=rows,
     )
-    _Px, _Hx = symm.pool_fp8.shape
-    return grad_swiglu, (symm.pool_fp8, symm.pool_scale.reshape(_Px, _Hx // 32))
+    return grad_swiglu, (symm.pool_fp8[:rows], symm.pool_scale[:rows])

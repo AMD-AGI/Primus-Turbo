@@ -1672,7 +1672,7 @@ def _build_grouped_mxfp8_wgrad_kernel(
 # ── wgrad host wrapper ───────────────────────────────────────────────────────
 
 _GWG_FUSED_CACHE: dict = {}  # (OUT_M, OUT_N, G, bm, bn, gm, xcd, gn, cbsz, blgp, out_fp16, beta1) -> launch
-_GWG_WS_CACHE: dict = {}  # (OUT_M, OUT_N, K128, device, stream) -> (a_sp, b_sp)
+_GWG_WS_CACHE: dict = {}  # (OUT_M, OUT_N, device, stream) -> (a_sp, b_sp), sized to the largest K128 seen
 _GWG_AT_CACHE: dict = {}  # (OUT_M, OUT_N, G, cbsz, blgp, out_fp16, beta1) -> [raw, compiled]
 _GWG_CFG_CACHE: dict = {}  # at_key -> (bm, bn, gm, xcd, gn) chosen by autotune
 
@@ -1817,17 +1817,19 @@ def _compile_grouped_mxfp8_wgrad_fused(
 
 
 def _get_grouped_wgrad_workspace(OUT_M, OUT_N, K128, device, stream):
-    key = (OUT_M, OUT_N, K128, device, stream)
+    # Grow-only per (OUT_M, OUT_N): a caller whose contraction length moves every call (the mega
+    # MoE's per-call routed rows) would otherwise leave one workspace behind per distinct K128.
+    a_numel = ceildiv(OUT_M, 64) * K128 * 256
+    b_numel = ((OUT_N + 255) // 256) * 4 * K128 * 256
+    key = (OUT_M, OUT_N, device, stream)
     e = _GWG_WS_CACHE.get(key)
-    if e is None:
-        a_ngrp = ceildiv(OUT_M, 64)
-        b_ngrp = ((OUT_N + 255) // 256) * 4
+    if e is None or e[0].numel() < a_numel:
         # wgrad keeps the unpacked (pack=1) scale layout (runtime per-group ks0 offset).
-        a_sp = torch.empty(a_ngrp * K128 * 256, dtype=torch.int32, device=device)
-        b_sp = torch.empty(b_ngrp * K128 * 256, dtype=torch.int32, device=device)
+        a_sp = torch.empty(a_numel, dtype=torch.int32, device=device)
+        b_sp = torch.empty(b_numel, dtype=torch.int32, device=device)
         e = (a_sp, b_sp)
         _GWG_WS_CACHE[key] = e
-    return e
+    return e[0][:a_numel], e[1][:b_numel]
 
 
 def grouped_gemm_mxfp8_variable_k_flydsl_kernel(

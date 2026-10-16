@@ -119,7 +119,6 @@ def _l1_dgrad_combine_mxfp8_flydsl_kernel(
 def prepare_dw1_pool_operand_fp8(
     pool_x_fp8: Tuple[torch.Tensor, torch.Tensor],
     handle: tuple,
-    pool_rows: Optional[int] = None,
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], dict]:
     """Turn the forward's fc1-input pool into dW1's ``b`` operand -> ``(pool_colwise, meta)``.
 
@@ -127,12 +126,12 @@ def prepare_dw1_pool_operand_fp8(
     it there consumes the view instead of the clone the backward would need, and keeps the requant
     off the backward critical path. ``meta`` is reused by the dual-quant, dW1 and dW2.
 
-    ``pool_rows`` (default: the whole pool) bounds the colwise operand's M extent; it must cover
-    the block_m-padded rows actually dispatched."""
+    The colwise operand spans ``pool_x_fp8``'s rows, which must cover the block_m-padded rows
+    actually dispatched."""
     meta = colwise_grouped_meta(
         handle[_HANDLE_GROUP_LENS],
         handle[_HANDLE_GROUP_OFFS],
-        pool_rows=pool_x_fp8[0].shape[0] if pool_rows is None else pool_rows,
+        pool_rows=pool_x_fp8[0].shape[0],
     )
     pool_colwise = colwise_requant_mxfp8_grouped_fp8in_flydsl(
         pool_x_fp8[0],
@@ -149,6 +148,9 @@ _HANDLE_GROUP_OFFS = 10  # ... and their prefix over the block_m-padded pool
 # fp8 dispatch handle: dispatch_prologue's 11 tables + num_tile_blocks appended by the L1 kernel.
 _HANDLE_LEN = 14
 
+# How the per-call row-indexed tensors are sized; see ``fused_mega_moe_fp8_stage1``.
+BUFFER_MODES = ("exact", "worst_case")
+
 
 def fused_mega_moe_stage1_forward_fp8_impl(
     x: torch.Tensor,
@@ -157,7 +159,7 @@ def fused_mega_moe_stage1_forward_fp8_impl(
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
     save_bwd: bool = True,
-    compact_save: bool = False,
+    buffer_mode: str = "exact",
 ) -> Tuple[torch.Tensor, torch.Tensor, tuple, Optional[Tuple[torch.Tensor, torch.Tensor]], Optional[dict]]:
     """dispatch + grouped fc1 GEMM (nt, mxfp8).
 
@@ -166,9 +168,11 @@ def fused_mega_moe_stage1_forward_fp8_impl(
     the symm buffer. ``pool_x_colwise`` / ``colwise_meta`` (None unless ``save_bwd``) are dW1's ``b``
     operand, requantized here while the fc1-input pool is still live in symm.
 
-    ``compact_save`` sizes the colwise operand and its meta (``meta["total_M_pad"]``) to the
-    block_m-padded rows actually dispatched instead of the worst-case pool, at the cost of one D2H.
+    ``buffer_mode="exact"`` sizes all of them, ``l1`` and the handle's row maps to the block_m-padded
+    rows actually dispatched, at the cost of one D2H after the prologue; ``"worst_case"`` sizes them
+    to the pool capacity with no host sync. ``l1.shape[0]`` is that row count either way.
     """
+    assert buffer_mode in BUFFER_MODES, f"buffer_mode {buffer_mode!r} not in {BUFFER_MODES}"
     # int64 end-to-end (combine reads topk i64)
     topk_idx = topk_idx.to(torch.int64)
     l1, handle, dispatch_weights, pool_x_fp8 = dispatch_l1_fwd_mxfp8_flydsl_kernel(
@@ -177,14 +181,12 @@ def fused_mega_moe_stage1_forward_fp8_impl(
         group,
         topk_idx=topk_idx,
         topk_weights=topk_weights,
+        exact_rows=buffer_mode == "exact",
     )
     assert len(handle) == _HANDLE_LEN, f"fp8 dispatch handle len {len(handle)} != {_HANDLE_LEN}; ABI changed"
 
-    pool_rows = None
-    if save_bwd and compact_save:
-        pool_rows = max(int(handle[_HANDLE_GROUP_OFFS][-1].item()), 256)
     pool_x_colwise, colwise_meta = (
-        prepare_dw1_pool_operand_fp8(pool_x_fp8, handle, pool_rows=pool_rows) if save_bwd else (None, None)
+        prepare_dw1_pool_operand_fp8(pool_x_fp8, handle) if save_bwd else (None, None)
     )
     return l1, dispatch_weights.clone(), tuple(handle), pool_x_colwise, colwise_meta
 

@@ -136,6 +136,7 @@ def _make_dispatch_prologue(
         TOPK_WEIGHTS: fx.Tensor,
         NUM_TOKENS_PER_EXPERT: fx.Tensor,
         NUM_TOKENS_PER_EXPERT_PREFIX: fx.Tensor,
+        POOL_ROWS_PER_RANK: fx.Tensor,
     ):
         thread_index = fx.thread_idx.x
         block_index, _, _ = fx.block_idx
@@ -171,6 +172,7 @@ def _make_dispatch_prologue(
         num_tokens_per_expert_prefix_resource = create_buffer_resource(
             NUM_TOKENS_PER_EXPERT_PREFIX, max_size=True
         )
+        pool_rows_per_rank_resource = create_buffer_resource(POOL_ROWS_PER_RANK, max_size=True)
         meta_scalars_resource = create_buffer_resource_from_addr(sl.meta_scalars_ptr, num_records_bytes=8 * 4)
 
         # ---- Phase 0: init this rank's origin_rank to -1; padding rows stay -1 ----
@@ -268,6 +270,10 @@ def _make_dispatch_prologue(
                         + fx.Int32(local_expert_index),
                     )
                     running_pool_offset = running_pool_offset + padded_count
+                # Every rank holds the full count matrix, so every rank computes the same padded
+                # pool size for every destination: the host reads this back to size per-call
+                # tensors to the real rows and to agree on the pool capacity collectively.
+                buffer_store(running_pool_offset, pool_rows_per_rank_resource, thread_index)
             fx.gpu.barrier()
             # C2 parallel across expert (needs POOL_BASE from C1)
             expert_index = thread_index
@@ -518,6 +524,7 @@ def _make_dispatch_prologue(
         topk_weights,
         num_tokens_per_expert,
         num_tokens_per_expert_prefix,
+        pool_rows_per_rank,
         stream: fx.Stream,
     ):
         dispatch_prologue_kernel(
@@ -536,6 +543,7 @@ def _make_dispatch_prologue(
             topk_weights,
             num_tokens_per_expert,
             num_tokens_per_expert_prefix,
+            pool_rows_per_rank,
         ).launch(
             grid=(grid_blocks, 1, 1),
             block=(block_threads, 1, 1),
@@ -607,6 +615,7 @@ def dispatch_prologue(
     block_m,
     num_max_pool_tokens,
     num_cu=_DEFAULT_GRID_BLOCKS,
+    pool_rows_per_rank=None,
 ):
     """One fused-prologue kernel launch.
 
@@ -626,7 +635,13 @@ def dispatch_prologue(
     equivalent of the host ``group_lens`` / ``group_offs`` used by the variable-K wgrads:
     the lengths are the REAL per-local-expert token counts, while the prefix indexes the
     block_m-padded pool. Publishing padded lengths here would make those wgrads reduce over
-    each expert's tail padding rows, which the scatter never writes."""
+    each expert's tail padding rows, which the scatter never writes.
+
+    ``pool_rows_per_rank`` (int32 ``[world_size]``, optional) receives every rank's block_m-padded
+    pool rows, identical on all ranks; entry ``rank`` equals this rank's ``group_offs[-1]``.
+
+    ``dispatched_token_idx`` / ``dispatched_topk_slot`` / ``src_token_weight`` are indexed by this
+    rank's outgoing (token, topk) pairs, not by pool row, so they hold ``num_tokens * num_topk``."""
     # Accept int32 or int64; the kernel reads each entry at its native dtype
     # (buffer_load infers element size from the tensor's element_type).
     if topk_idx.dtype not in (torch.int32, torch.int64):
@@ -643,8 +658,12 @@ def dispatch_prologue(
         i32(num_experts) for _ in range(4)
     )
     tile_to_expert, tile_expected = i32(n_mblk), i32(n_mblk)
-    dispatched_token_idx, dispatched_topk_slot = i32(num_max_pool_tokens), i32(num_max_pool_tokens)
-    src_token_weight = torch.empty(num_max_pool_tokens, dtype=torch.float32, device=dev)
+    num_pairs = num_tokens * num_topk
+    dispatched_token_idx, dispatched_topk_slot = i32(num_pairs), i32(num_pairs)
+    src_token_weight = torch.empty(num_pairs, dtype=torch.float32, device=dev)
+    if pool_rows_per_rank is None:
+        pool_rows_per_rank = i32(world_size)
+    assert pool_rows_per_rank.dtype == torch.int32 and pool_rows_per_rank.numel() == world_size
     # block_m-padded per-local-expert group_len + its prefix (len experts_per_rank+1);
     # mirrors host group_lens / group_offs (int64 end-to-end -> no consumer cast).
     num_tokens_per_expert = torch.empty(experts_per_rank, dtype=torch.int64, device=dev)
@@ -680,6 +699,7 @@ def dispatch_prologue(
         topk_weights_flat,
         num_tokens_per_expert,
         num_tokens_per_expert_prefix,
+        pool_rows_per_rank,
         stream,
     )
     # Same key _compile is lru_cached on, since that is what the compiled artifact depends on.

@@ -33,7 +33,7 @@ critical path):
     mxfp8-quant epilogue -> LOCAL fp8 L2Y (write-through sc1) + E8M0; release-st per
     ``(block_m, block_n)`` combine_flag slot (no cross-WG atomic).
 
-LOCAL fp8 L2Y buffers (``L2Y_FP8`` uint8 [pool*H], ``L2Y_SCALE`` uint8 [pool*H/32]); peer
+LOCAL fp8 L2Y buffers (``L2Y_FP8`` uint8 [rows*H], ``L2Y_SCALE`` uint8 [rows*H/32]); peer
 ``comb`` holds the packed fp8 payload + E8M0 scale (fits the bf16 comb region).
 """
 
@@ -728,7 +728,8 @@ def _compile(
                 # still happen, so the PUSH sees the protocol it always sees and nobody downstream
                 # has to know this build computed nothing.
                 if const_expr(not _no_gemm):
-                    c_m_const = fx.Int32(num_max_pool_tokens)
+                    # ACT / L2Y may hold only the real rows, so bound by them, not by the pool.
+                    c_m_const = real_tiles * fx.Int32(BLOCK_M)
                     group_index = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
                     n_tiles_a = BLOCK_M // 64
                     n_tiles_b = BLOCK_N // 128
@@ -875,28 +876,23 @@ def _compile(
     return launch
 
 
-_L2Y_FP8_SCRATCH: dict = {}
-
-
 def _combine_ctx(handle, act_fp8):
     """Everything about a combine launch that the direction does not change.
 
     Kept in one place because the two entries would otherwise both carry it, and the handle reads
-    below are not the kind of thing that should exist in two copies that can drift."""
+    below are not the kind of thing that should exist in two copies that can drift.
+
+    ``act_fp8`` may hold only this call's real rows (``M``); the kernel is still built for the pool
+    capacity ``P``, which sizes its grid, its flag banks in symm and the empty blocks the reduce
+    rides. ``P`` is also what keys the compile and the CU tuner, so every rank keys alike."""
     aq, a_sp = act_fp8
     M, K = aq.shape  # K = I for the fc2 forward, 2I for the fc1^T dgrad
     dev = aq.device
     symm = get_symm_buffer_for_mega_moe()
     sym_layout = symm.make_sym_layout()
     H = int(sym_layout.hidden)
-    assert M == int(sym_layout.num_max_pool_tokens)
-
-    sk = (M, H, dev)
-    scratch = _L2Y_FP8_SCRATCH.get(sk)
-    if scratch is None:
-        l2y_fp8 = torch.empty(M * H, dtype=torch.uint8, device=dev)
-        l2y_scale = torch.empty(M * (H // 32), dtype=torch.uint8, device=dev)
-        _L2Y_FP8_SCRATCH[sk] = scratch = (l2y_fp8, l2y_scale)
+    P = int(sym_layout.num_max_pool_tokens)
+    assert M <= P, f"combine operand rows {M} exceed the pool capacity {P}"
 
     # Everything below that varies per call comes off the handle, never out of the live symm state.
     # A layer's backward runs long after later layers' prologues have rewritten the shared scratch,
@@ -910,6 +906,7 @@ def _combine_ctx(handle, act_fp8):
         a_sp=a_sp,
         act_flat=aq.view(torch.int8).reshape(-1),
         M=M,
+        P=P,
         K=K,
         dev=dev,
         symm=symm,
@@ -926,8 +923,9 @@ def _combine_ctx(handle, act_fp8):
         num_tile_blocks=handle[_H_NUM_TILE_BLOCKS],
         origin_rank=handle[_H_ORIGIN_RANK],
         origin_slot=handle[_H_ORIGIN_SLOT],
-        l2y_fp8=scratch[0],
-        l2y_scale=scratch[1],
+        # the GEMM role's local fp8 output, read back by the PUSH role in the same launch
+        l2y_fp8=torch.empty(M * H, dtype=torch.uint8, device=dev),
+        l2y_scale=torch.empty(M * (H // 32), dtype=torch.uint8, device=dev),
         # An unused per-role slot gets this size-1 tensor so the kernel's create_buffer_resource has a
         # valid (never-indexed) one: TOPK_WEIGHTS is only read when apply_weights, GRAD_GATE and
         # D_TOPK_W only when with_gate.
@@ -984,7 +982,7 @@ def _combine_launch(
     launch = _compile(
         c.out_features,
         c.K,
-        c.M,
+        c.P,
         BM,
         BN,
         int(combine_cu),
@@ -1002,7 +1000,7 @@ def _combine_launch(
     ck = (
         c.out_features,
         c.K,
-        c.M,
+        c.P,
         BM,
         BN,
         int(combine_cu),
@@ -1037,7 +1035,7 @@ def _tune_key(c, BM, BN, apply_weights, with_gate):
     return (
         c.out_features,
         c.K,
-        c.M,
+        c.P,
         BM,
         BN,
         c.combine_slots,
