@@ -50,6 +50,7 @@ pybind11::dict Registrations() {
     REGISTER_FFI_HANDLER(dict, ck_grouped_gemm, CKGroupedGemmHandler);
     REGISTER_FFI_HANDLER(dict, ck_grouped_gemm_variable_k, CKGroupedGemmVariableKHandler);
     REGISTER_FFI_HANDLER(dict, compute_group_offs, ComputeGroupOffsHandler);
+    REGISTER_FFI_HANDLER(dict, hipblaslt_grouped_gemm, HipblasltGroupedGemmHandler);
 
     // Grouped GEMM FP8
     REGISTER_FFI_HANDLER(dict, ck_grouped_gemm_fp8, CKGroupedGemmFP8Handler);
@@ -108,6 +109,9 @@ PYBIND11_MODULE(_C, m) {
         .value("kFloat8E8M0", DType::kFloat8E8M0);
 
     m.def("get_ck_grouped_gemm_workspace_size", &GetCKGroupedGemmWorkspaceSize);
+    m.def("get_hipblaslt_grouped_gemm_workspace_size", &GetHipblasltGroupedGemmWorkspaceSize);
+    m.def("tune_hipblaslt_grouped_gemm", &TuneHipblasltGroupedGemm);
+    m.def("register_hipblaslt_grouped_gemm_algo", &RegisterHipblasltGroupedGemmAlgo);
     m.def("get_ck_grouped_gemm_fp8_workspace_size", &GetCKGroupedGemmFP8WorkspaceSize);
     m.def("get_ck_grouped_gemm_fp8_variable_k_workspace_size",
           &GetCKGroupedGemmFP8VariableKWorkspaceSize);
