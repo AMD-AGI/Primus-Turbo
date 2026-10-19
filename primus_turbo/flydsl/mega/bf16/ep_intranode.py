@@ -16,13 +16,14 @@ from typing import Optional
 import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, const_expr, range_constexpr
-from flydsl.expr.buffer_ops import (
+from flydsl.expr.utils.arith import ArithValue
+
+from primus_turbo.flydsl.mega.bf16.symm_buffer import SymBuffer, Workspace
+from primus_turbo.flydsl.utils.buffer_ops import (
     buffer_load,
     buffer_store,
     create_buffer_resource_from_addr,
 )
-
-from primus_turbo.flydsl.mega.bf16.symm_buffer import SymBuffer, Workspace
 from primus_turbo.flydsl.utils.prims import (
     atomic_add,
     cast,
@@ -46,7 +47,7 @@ _MAX_LOADS_IN_FLIGHT = 64
 
 @ASTRewriter.transform
 def spin_until_flag_reaches(
-    flag_base: fx.ArithValue,
+    flag_base: ArithValue,
     flag_idx: fx.Int32,
     expected: fx.Int64,
     scope: str,
@@ -57,14 +58,14 @@ def spin_until_flag_reaches(
     message = f"[MEGA rank={rank} {tag}] flag wait timeout: flag_idx={{}} flag={{}} expected={{}}\n"
     spin_start = read_clock()
     fx.rocdl.s_waitcnt(0)
-    flag = ld(flag_base, flag_idx, scope=scope, dtype=fx.T.i64())
+    flag = ld(flag_base, flag_idx, scope=scope, dtype=fx.T.i64)
     while flag < expected:
         fx.rocdl.s_sleep(fx.Int32(1))
         if spin_timed_out(spin_start):
             fx.printf(message, flag_idx, flag, expected)
             spin_start = read_clock()
         fx.rocdl.s_waitcnt(0)
-        flag = ld(flag_base, flag_idx, scope=scope, dtype=fx.T.i64())
+        flag = ld(flag_base, flag_idx, scope=scope, dtype=fx.T.i64)
 
 
 def same_rank_order(expert_ids, topk_position, num_experts_per_rank):
@@ -101,13 +102,13 @@ def dispatch_bf16_tile(
     thread_index: fx.Int32,
     block_index: fx.Int32,
     hidden_size: int,
-    input_res: fx.ArithValue,
-    expert_send_dst_rank_res: fx.ArithValue,
-    expert_send_count_res: fx.ArithValue,
-    expert_send_offset_res: fx.ArithValue,
-    dispatched_token_idx_res: fx.ArithValue,
+    input_res: ArithValue,
+    expert_send_dst_rank_res: ArithValue,
+    expert_send_count_res: ArithValue,
+    expert_send_offset_res: ArithValue,
+    dispatched_token_idx_res: ArithValue,
     dispatch_parity: fx.Int32,
-    dispatch_chunk_counter_ptr: fx.ArithValue,
+    dispatch_chunk_counter_ptr: ArithValue,
     num_chunks: int,
     num_ranks: int,
     num_experts_per_rank: int,
@@ -131,9 +132,9 @@ def dispatch_bf16_tile(
     # ascending expert order: flag[g] complete implies every expert <= g landed (single-flag wait)
     for local_expert in range(fx.Int32(num_experts_per_rank)):
         task_index = local_expert * fx.Int32(num_ranks) + block_dst_rank
-        dst_rank = buffer_load(expert_send_dst_rank_res, task_index, vec_width=1, dtype=fx.T.i32())
-        source_offset = buffer_load(expert_send_offset_res, task_index, vec_width=1, dtype=fx.T.i32())
-        token_count = buffer_load(expert_send_count_res, task_index, vec_width=1, dtype=fx.T.i32())
+        dst_rank = buffer_load(expert_send_dst_rank_res, task_index, vec_width=1, dtype=fx.T.i32)
+        source_offset = buffer_load(expert_send_offset_res, task_index, vec_width=1, dtype=fx.T.i32)
+        token_count = buffer_load(expert_send_count_res, task_index, vec_width=1, dtype=fx.T.i32)
         token_buffer_address = sym.map(token_buffer_ptr, dst_rank)
         dispatch_flag_address = sym.map(dispatch_flag_ptr, dst_rank)
 
@@ -144,7 +145,7 @@ def dispatch_bf16_tile(
                 dispatched_token_idx_res,
                 source_offset + warp_id + i * fx.Int32(row_stride),
                 vec_width=1,
-                dtype=fx.T.i32(),
+                dtype=fx.T.i32,
             )
             # dst = peer dispatch_token_buffer row of this recv token, src = local input; offsets in i32 words
             copy_warp(
@@ -173,7 +174,7 @@ def dispatch_bf16_tile(
 
 def _pool_row_resource(l2_ptr, pool_row, row_bytes, is_present=True):
     """Buffer resource over one pool row; an absent row gets num_records 0, so its loads read 0 at no cost."""
-    base = l2_ptr + cast(pool_row, fx.T.i64()) * fx.Int64(row_bytes)
+    base = l2_ptr + cast(pool_row, fx.T.i64) * fx.Int64(row_bytes)
     num_records_bytes = (
         row_bytes if is_present is True else arith.select(is_present, fx.Int32(row_bytes), fx.Int32(0))
     )
@@ -182,8 +183,8 @@ def _pool_row_resource(l2_ptr, pool_row, row_bytes, is_present=True):
 
 def _sum_pool_rows(pool_rows, l2_ptr, combine_token_res, dst_base, dropped_base, lane_col, hidden):
     """Store the f32 sum of the present pool_rows (ascending, -1 absent) as one bf16 row at dst_base."""
-    f32_vec = fx.T.VectorType.get([_PVEC], fx.T.f32())
-    bf16_vec = fx.T.VectorType.get([_PVEC], fx.T.bf16())
+    f32_vec = fx.T.vec(_PVEC, fx.T.f32)
+    bf16_vec = fx.T.vec(_PVEC, fx.T.bf16)
     row_bytes = hidden * 2
     cols_per_step = _WARP * _PVEC
     num_full_chunks = hidden // cols_per_step
@@ -199,8 +200,7 @@ def _sum_pool_rows(pool_rows, l2_ptr, combine_token_res, dst_base, dropped_base,
         for row_res in row_resources:
             # sc1|nt: read the same-agent GEMM stage
             values = [
-                buffer_load(row_res, col, vec_width=_PVEC, dtype=fx.T.bf16(), cache_modifier=18)
-                for col in cols
+                buffer_load(row_res, col, vec_width=_PVEC, dtype=fx.T.bf16, cache_modifier=18) for col in cols
             ]
             for i, value in enumerate(values):
                 term = fx.arith.extf(f32_vec, value)
@@ -234,13 +234,13 @@ def combine_bf16_tile(
     segment_idx: fx.Int32,
     first_fold_row: fx.Int32,
     num_fold_rows: fx.Int32,
-    recv_dst_rank_res: fx.ArithValue,
-    pool_row_to_route_res: fx.ArithValue,
-    pool_row_to_recv_token_res: fx.ArithValue,
-    recv_token_to_pool_rows_res: fx.ArithValue,
+    recv_dst_rank_res: ArithValue,
+    pool_row_to_route_res: ArithValue,
+    pool_row_to_recv_token_res: ArithValue,
+    recv_token_to_pool_rows_res: ArithValue,
     epoch: fx.Int64,
     reduce_bank: fx.Int32,
-    grad_gate_res: Optional[fx.ArithValue] = None,
+    grad_gate_res: Optional[ArithValue] = None,
     has_grad_gate: bool = False,
 ):
     """Push each fold row in [first_fold_row, +num_fold_rows) as its recv token's sum to the primary route."""
@@ -259,7 +259,7 @@ def combine_bf16_tile(
     dropped_base = fx.Int32(num_max_routes * hidden)
     l2_ptr = workspace.get_l2_token_buffer_ptr()
 
-    dst_rank = buffer_load(recv_dst_rank_res, segment_idx, vec_width=1, dtype=fx.T.i32())
+    dst_rank = buffer_load(recv_dst_rank_res, segment_idx, vec_width=1, dtype=fx.T.i32)
     # hoist workspace-derived values before the dynamic loop (rewriter can't carry Workspace)
     combine_token_addr = sym.map(workspace.get_combine_token_buffer_ptr(), dst_rank)
     reduce_flag_addr = sym.map(workspace.get_reduce_flag_ptr(), dst_rank)
@@ -277,7 +277,7 @@ def combine_bf16_tile(
     def push_rows(fold_rows):
         # stage each index level for every row first, so the dependent loads overlap across rows
         recv_tokens = [
-            buffer_load(pool_row_to_recv_token_res, fold_row, vec_width=1, dtype=fx.T.i32())
+            buffer_load(pool_row_to_recv_token_res, fold_row, vec_width=1, dtype=fx.T.i32)
             for fold_row in fold_rows
         ]
         pool_rows_per_row = [
@@ -286,7 +286,7 @@ def combine_bf16_tile(
                     recv_token_to_pool_rows_res,
                     recv_token * fx.Int32(num_topk) + fx.Int32(k),
                     vec_width=1,
-                    dtype=fx.T.i32(),
+                    dtype=fx.T.i32,
                 )
                 for k in range_constexpr(num_topk)
             ]
@@ -294,7 +294,7 @@ def combine_bf16_tile(
         ]
         # pool_rows[0] is the primary route's row; the sum lands in that route's combine row
         dst_routes = [
-            buffer_load(pool_row_to_route_res, pool_rows[0], vec_width=1, dtype=fx.T.i32())
+            buffer_load(pool_row_to_route_res, pool_rows[0], vec_width=1, dtype=fx.T.i32)
             for pool_rows in pool_rows_per_row
         ]
         for u in range_constexpr(len(fold_rows)):
@@ -311,7 +311,7 @@ def combine_bf16_tile(
             copy_warp(
                 combine_token_addr,
                 # i64 row base: fold_row * row_words overflows i32 on large pools
-                l2_ptr + cast(fold_row, fx.T.i64()) * fx.Int64(row_bytes),
+                l2_ptr + cast(fold_row, fx.T.i64) * fx.Int64(row_bytes),
                 num_full_chunks * cols_per_step * 2,
                 dst_off=dst_route * fx.Int32(row_words),
                 load_cache_modifier=18,  # sc1|nt: read the same-agent GEMM stage.
@@ -323,7 +323,7 @@ def combine_bf16_tile(
                 fold_row_res = _pool_row_resource(l2_ptr, fold_row, row_bytes)
                 safe_col = arith.select(is_in_tail, col, fx.Int32(hidden - _PVEC))
                 tail_value = buffer_load(
-                    fold_row_res, safe_col, vec_width=_PVEC, dtype=fx.T.bf16(), cache_modifier=18
+                    fold_row_res, safe_col, vec_width=_PVEC, dtype=fx.T.bf16, cache_modifier=18
                 )
                 dst = arith.select(is_in_tail, dst_base + col, dropped_base)
                 buffer_store(tail_value, combine_token_res, dst, cache_modifier=19)
@@ -336,8 +336,8 @@ def combine_bf16_tile(
                 lane_pool_row = arith.select(lane_id == fx.Int32(k), pool_rows[k], lane_pool_row)
             is_gate_lane = (lane_id < fx.Int32(num_topk)) & (lane_pool_row >= fx.Int32(0))
             gate_row = arith.select(is_gate_lane, lane_pool_row, pool_rows[0])
-            gate_value = buffer_load(grad_gate_res, gate_row, vec_width=1, dtype=fx.T.f32())
-            gate_route = buffer_load(pool_row_to_route_res, gate_row, vec_width=1, dtype=fx.T.i32())
+            gate_value = buffer_load(grad_gate_res, gate_row, vec_width=1, dtype=fx.T.f32)
+            gate_route = buffer_load(pool_row_to_route_res, gate_row, vec_width=1, dtype=fx.T.i32)
             gate_dst = arith.select(is_gate_lane, gate_route, fx.Int32(num_max_routes))
             buffer_store(gate_value, combine_gate_res, gate_dst, cache_modifier=19)
 
@@ -365,32 +365,32 @@ def topk_reduce_bf16_tile(
     num_experts_per_rank: int,
     num_max_routes: int,
     rank: int,
-    combine_token_res: fx.ArithValue,
-    output_res: fx.ArithValue,
-    topk_indices_res: fx.ArithValue,
-    num_tokens_res: fx.ArithValue,
-    reduce_flag_base: fx.ArithValue,
+    combine_token_res: ArithValue,
+    output_res: ArithValue,
+    topk_indices_res: ArithValue,
+    num_tokens_res: ArithValue,
+    reduce_flag_base: ArithValue,
     reduce_bank: fx.Int32,
     epoch: fx.Int64,
-    combine_gate_res: Optional[fx.ArithValue] = None,
-    grad_topk_weights_res: Optional[fx.ArithValue] = None,
+    combine_gate_res: Optional[ArithValue] = None,
+    grad_topk_weights_res: Optional[ArithValue] = None,
     has_grad_gate: bool = False,
 ):
     """Sum each token's primary-route combine rows into its output row once their reduce flags reach epoch."""
-    f32_vec = fx.T.VectorType.get([_PVEC], fx.T.f32())
-    bf16_vec = fx.T.VectorType.get([_PVEC], fx.T.bf16())
+    f32_vec = fx.T.vec(_PVEC, fx.T.f32)
+    bf16_vec = fx.T.vec(_PVEC, fx.T.bf16)
     num_vec_chunks = hidden // _PVEC
     lane_id = thread_index % fx.Int32(_WARP)
     warp_id = thread_index // fx.Int32(_WARP)
-    num_tokens = buffer_load(num_tokens_res, fx.Int32(rank), vec_width=1, dtype=fx.T.i32())
+    num_tokens = buffer_load(num_tokens_res, fx.Int32(rank), vec_width=1, dtype=fx.T.i32)
     token = reduce_block_idx * fx.Int32(_NUM_WARPS) + warp_id
     while token < num_tokens:
         route_base = token * fx.Int32(num_topk)
         expert_ids = []
         for j in range_constexpr(num_topk):
-            expert_id = buffer_load(topk_indices_res, route_base + fx.Int32(j), vec_width=1, dtype=fx.T.i64())
+            expert_id = buffer_load(topk_indices_res, route_base + fx.Int32(j), vec_width=1, dtype=fx.T.i64)
             is_valid = (expert_id >= fx.Int64(0)) & (expert_id < fx.Int64(num_experts))
-            expert_ids.append(arith.select(is_valid, cast(expert_id, fx.T.i32()), fx.Int32(-1)))
+            expert_ids.append(arith.select(is_valid, cast(expert_id, fx.T.i32), fx.Int32(-1)))
         is_primary = [is_primary_route(expert_ids, j, num_experts_per_rank) for j in range(num_topk)]
         for j in range_constexpr(num_topk):
             if is_primary[j]:
@@ -418,7 +418,7 @@ def topk_reduce_bf16_tile(
                     combine_token_res,
                     route_offsets[j] + col,
                     vec_width=_PVEC,
-                    dtype=fx.T.bf16(),
+                    dtype=fx.T.bf16,
                     cache_modifier=19,  # sc0|sc1|nt: system-visible non-temporal read.
                 )
                 term = fx.arith.extf(f32_vec, value)
@@ -433,7 +433,7 @@ def topk_reduce_bf16_tile(
                         combine_gate_res,
                         route_base + fx.Int32(j),
                         vec_width=1,
-                        dtype=fx.T.f32(),
+                        dtype=fx.T.f32,
                         cache_modifier=19,
                     )
                     is_valid = expert_ids[j] >= fx.Int32(0)

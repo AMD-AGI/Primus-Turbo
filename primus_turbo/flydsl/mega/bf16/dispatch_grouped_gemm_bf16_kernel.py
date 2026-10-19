@@ -19,12 +19,6 @@ import flydsl.expr as fx
 import torch
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, const_expr
-from flydsl.expr.buffer_ops import (
-    buffer_load,
-    buffer_store,
-    create_buffer_resource,
-    extract_base_index,
-)
 from flydsl.expr.typing import AddressSpace, PointerType
 
 from primus_turbo.flydsl.mega.bf16.dispatch_prologue_kernel import (
@@ -54,6 +48,12 @@ from primus_turbo.flydsl.mega.tune_utils import (
     Config,
     autotune,
 )
+from primus_turbo.flydsl.utils.buffer_ops import (
+    buffer_load,
+    buffer_store,
+    create_buffer_resource,
+    extract_base_index,
+)
 from primus_turbo.flydsl.utils.gemm_helper import (
     make_bf16_fp16_tile_tensor,
     make_value_attrs,
@@ -71,7 +71,7 @@ def _wait_for_expert(thread_index, dispatch_flag_base, flag_idx, dispatch_expect
 
 
 def _i64_base(tensor):
-    return fx.arith.ArithValue(arith.index_cast(fx.T.i64(), extract_base_index(tensor)), signed=True)
+    return fx.arith.ArithValue(arith.index_cast(fx.T.i64, extract_base_index(tensor)), signed=True)
 
 
 @functools.lru_cache(maxsize=256)
@@ -123,7 +123,7 @@ def _make_kernel(
         n_blocks = out_features // BLOCK_N
         worst_case_tiles = num_max_pool_tokens // BLOCK_M
     num_pool_blocks = num_max_pool_tokens // BLOCK_M
-    row_idx_ptr_ty = PointerType.get(elem_ty=fx.T.i32(), address_space=AddressSpace.Global, alignment=4)
+    row_idx_ptr_ty = PointerType.get(elem_ty=fx.T.i32, address_space=AddressSpace.Global, alignment=4)
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def dispatch_grouped_gemm_kernel(
@@ -171,11 +171,11 @@ def _make_kernel(
         dispatch_parity_resource = create_buffer_resource(DISPATCH_PARITY, max_size=True)
         dispatch_expected_resource = create_buffer_resource(DISPATCH_EXPECTED, max_size=True)
         dispatch_parity = cast(
-            buffer_load(dispatch_parity_resource, fx.Int32(0), vec_width=1, dtype=fx.T.i64()), fx.T.i32()
+            buffer_load(dispatch_parity_resource, fx.Int32(0), vec_width=1, dtype=fx.T.i64), fx.T.i32
         )
         dispatch_bank_offset = dispatch_parity * fx.Int32(num_pool_blocks)
         dispatch_expected = buffer_load(
-            dispatch_expected_resource, dispatch_parity, vec_width=1, dtype=fx.T.i64()
+            dispatch_expected_resource, dispatch_parity, vec_width=1, dtype=fx.T.i64
         )
 
         input_resource = create_buffer_resource(INPUT_TOKENS, max_size=True)
@@ -224,8 +224,8 @@ def _make_kernel(
                 else:
                     block_m = local // fx.Int32(N_BLOCKS_N)
                     block_n = local % fx.Int32(N_BLOCKS_N)
-                m_start = cast(ld(num_tokens_per_expert_prefix_ptr, group_idx, dtype=fx.T.i64()), fx.T.i32())
-                num_tokens = cast(ld(num_tokens_per_expert_ptr, group_idx, dtype=fx.T.i64()), fx.T.i32())
+                m_start = cast(ld(num_tokens_per_expert_prefix_ptr, group_idx, dtype=fx.T.i64), fx.T.i32)
+                num_tokens = cast(ld(num_tokens_per_expert_ptr, group_idx, dtype=fx.T.i64), fx.T.i32)
                 # An empty expert has nothing to wait for; the tile itself stores zeros.
                 if num_tokens > fx.Int32(0):
                     _wait_for_expert(
@@ -277,7 +277,7 @@ def _make_kernel(
                 )
         else:
             tile_index = block_index - comm_block_count
-            real_tiles = buffer_load(num_tile_blocks_resource, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
+            real_tiles = buffer_load(num_tile_blocks_resource, fx.Int32(0), vec_width=1, dtype=fx.T.i32)
             real_grid = real_tiles * fx.Int32(n_blocks)
             if tile_index < real_grid:
                 num_pid_in_group = fx.Int32(GROUP_M * n_blocks)
@@ -288,9 +288,7 @@ def _make_kernel(
                 group_size_m = arith.select(remaining_m < fx.Int32(GROUP_M), remaining_m, fx.Int32(GROUP_M))
                 block_m = first_pid_m + (pid_in_group % group_size_m)
                 block_n = pid_in_group // group_size_m
-                local_expert_idx = buffer_load(
-                    tile_to_expert_resource, block_m, vec_width=1, dtype=fx.T.i32()
-                )
+                local_expert_idx = buffer_load(tile_to_expert_resource, block_m, vec_width=1, dtype=fx.T.i32)
                 _wait_for_expert(
                     thread_index,
                     dispatch_flag_base,
@@ -303,11 +301,11 @@ def _make_kernel(
                 out_base = _i64_base(OUTPUT)
                 w_base = _i64_base(WEIGHTS)
                 # Rebase per-tile B/C/row-index bases in int64; C bounds via HW num_records 0x40000000.
-                b_off = cast(local_expert_idx, fx.T.i64()) * fx.Int64(K * out_features * 2)
-                c_off = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * 2) * cast(c_n, fx.T.i64())
+                b_off = cast(local_expert_idx, fx.T.i64) * fx.Int64(K * out_features * 2)
+                c_off = cast(block_m, fx.T.i64) * fx.Int64(BLOCK_M * 2) * cast(c_n, fx.T.i64)
                 B_tile = make_bf16_fp16_tile_tensor(w_base, b_off, K * out_features)
                 C_tile = make_bf16_fp16_tile_tensor(out_base, c_off, 0x40000000)
-                row_idx_byte_offset = cast(block_m, fx.T.i64()) * fx.Int64(BLOCK_M * 4)
+                row_idx_byte_offset = cast(block_m, fx.T.i64) * fx.Int64(BLOCK_M * 4)
                 row_idx_ptr = fx.inttoptr(
                     row_idx_ptr_ty, _readfirstlane_i32(pool_row_to_recv_token_base + row_idx_byte_offset)
                 )
@@ -342,10 +340,10 @@ def _make_epoch_bump(addend):
         if fx.thread_idx.x == fx.Int32(0):
             parity_res = create_buffer_resource(PARITY, max_size=True)
             expected_res = create_buffer_resource(EXPECTED, max_size=True)
-            new_parity = buffer_load(parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64()) ^ fx.Int64(1)
+            new_parity = buffer_load(parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64) ^ fx.Int64(1)
             buffer_store(new_parity, parity_res, fx.Int32(0))
-            idx = cast(new_parity, fx.T.i32())
-            new_exp = buffer_load(expected_res, idx, vec_width=1, dtype=fx.T.i64()) + fx.Int64(addend)
+            idx = cast(new_parity, fx.T.i32)
+            new_exp = buffer_load(expected_res, idx, vec_width=1, dtype=fx.T.i64) + fx.Int64(addend)
             buffer_store(new_exp, expected_res, idx)
 
     return epoch_bump_kernel

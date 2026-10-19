@@ -17,8 +17,8 @@ from primus_turbo.common.logger import logger
 
 # Required aiter release. Keep in sync with AITER_VERSION in the ci / benchmark
 # / release workflows.
-AITER_VERSION = "0.1.14.post1"
-AITER_GIT_TAG = "v0.1.14.post1"
+AITER_VERSION = "0.1.24.post1"
+AITER_GIT_TAG = "v0.1.24.post1"
 _AITER_DIST_NAME = "amd-aiter"
 _AITER_GIT_URL = "https://github.com/ROCm/aiter.git"
 

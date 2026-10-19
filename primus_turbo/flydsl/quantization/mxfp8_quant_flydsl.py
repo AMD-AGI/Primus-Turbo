@@ -19,12 +19,12 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import arith, range_constexpr, rocdl
-from flydsl.expr import buffer_ops as bo
 from flydsl.expr import math as fm
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T as _T
 from flydsl.expr.typing import Vector as Vec
 
+from primus_turbo.flydsl.utils import buffer_ops as bo
 from primus_turbo.flydsl.utils.gemm_helper import (
     group_m_tile_decode,
     make_row_band_resource,

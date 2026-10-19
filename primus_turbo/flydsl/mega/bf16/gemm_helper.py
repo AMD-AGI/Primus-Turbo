@@ -20,11 +20,11 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.arith import _to_raw as _raw
-from flydsl.expr.buffer_ops import buffer_store
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
 
+from primus_turbo.flydsl.utils.buffer_ops import buffer_store
 from primus_turbo.flydsl.utils.gemm_helper import (
     _pack_out_pair,
     _permlane16_swap,

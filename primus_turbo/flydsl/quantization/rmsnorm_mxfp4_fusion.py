@@ -40,7 +40,7 @@ from typing import Tuple
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import arith, buffer_ops, range_constexpr, rocdl
+from flydsl.expr import arith, range_constexpr, rocdl
 from flydsl.expr import math as fm
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -54,6 +54,7 @@ from primus_turbo.flydsl.quantization.mxfp4_quant_kernel import (
     _mxfp4_scale_rounding_bias,
     _store_words_vec4,
 )
+from primus_turbo.flydsl.utils import buffer_ops
 from primus_turbo.flydsl.utils.gemm_helper import xcd_remap_pid
 from primus_turbo.pytorch.core.low_precision import (
     MXFP4_BLOCK_SIZE,
@@ -433,6 +434,12 @@ def _build_launcher():
             X, RES, GAM, XPR, RSTD, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, EPS, BIAS
         ).launch(grid=(grid_x, 1, 1), block=(_BLK, 1, 1), stream=stream)
 
+    # FlyDSL 0.3.4.1's LLVM (e2a39f50) VectorCombine rewrites scalar fp32 ops on
+    # extracted vector lanes into <2 x float> ops plus lane shuffles, which takes
+    # this full-residency design from 238 to 512 VGPR+AGPR with 346 VGPRs spilled
+    # (~2.2x slower). Disabling just that fold restores 238 VGPRs and no spills,
+    # with bit-identical outputs. ROCm/FlyDSL#1273.
+    launch.compile_hints["llvm_options"] = {"disable-binop-extract-shuffle": True}
     return launch
 
 

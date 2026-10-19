@@ -20,14 +20,6 @@ from typing import NamedTuple
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr.buffer_ops import (
-    _unwrap_value,
-    buffer_load,
-    buffer_store,
-    create_buffer_resource,
-    create_buffer_resource_from_addr,
-    extract_base_index,
-)
 from flydsl.expr.primitive import get_dyn_shared
 from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
@@ -43,6 +35,14 @@ from primus_turbo.flydsl.mega.bf16.symm_buffer import (
 from primus_turbo.flydsl.mega.tune_utils import (
     Config,
     autotune,
+)
+from primus_turbo.flydsl.utils.buffer_ops import (
+    _unwrap_value,
+    buffer_load,
+    buffer_store,
+    create_buffer_resource,
+    create_buffer_resource_from_addr,
+    extract_base_index,
 )
 from primus_turbo.flydsl.utils.prims import atomic_add, ld, st
 
@@ -138,7 +138,7 @@ def _make_dispatch_prologue(
 
     def _ext_i64(v):
         """Sign-extend an fx i32 value to i64 (group_lens/offs stored as int64)."""
-        return fx.arith.ArithValue(fx.arith.extsi(fx.T.i64(), _unwrap_value(v)), signed=True)
+        return fx.arith.ArithValue(fx.arith.extsi(fx.T.i64, _unwrap_value(v)), signed=True)
 
     @flyc.kernel(known_block_size=[block_threads, 1, 1])
     def dispatch_prologue_kernel(
@@ -186,7 +186,7 @@ def _make_dispatch_prologue(
         def load_expert_id(elem_idx):
             value = buffer_load(topk_resource, elem_idx, vec_width=1, dtype=idx_load_dtype)
             if idx_is_i64:
-                value = fx.arith.ArithValue(fx.arith.trunci(fx.T.i32(), _unwrap_value(value)), signed=True)
+                value = fx.arith.ArithValue(fx.arith.trunci(fx.T.i32, _unwrap_value(value)), signed=True)
             return value
 
         def route_order(route_idx):
@@ -208,7 +208,7 @@ def _make_dispatch_prologue(
         scratch_base = extract_base_index(SCRATCH, address_space=1)
 
         def load_scratch(field, index):
-            return buffer_load(scratch_resource, fx.Int32(field) + index, vec_width=1, dtype=fx.T.i32())
+            return buffer_load(scratch_resource, fx.Int32(field) + index, vec_width=1, dtype=fx.T.i32)
 
         def load_lds(field, index):
             return ld(lds_base, fx.Int32(field) + index, scope="workgroup", space=3)
@@ -367,7 +367,7 @@ def _make_dispatch_prologue(
                             expert_send_count_resource,
                             fx.Int32(comm_task_counter),
                             vec_width=1,
-                            dtype=fx.T.i32(),
+                            dtype=fx.T.i32,
                         )
                         buffer_store(source_offset, expert_send_offset_resource, fx.Int32(comm_task_counter))
                         buffer_store(
@@ -510,7 +510,7 @@ def _make_dispatch_prologue(
                     )
                     send_idx = load_lds(LDS_SEND_ROWS_BASE, expert_id) + send_position
                     buffer_store(token_idx, dispatched_token_idx_resource, send_idx)
-                routing_weight = buffer_load(topk_weight_resource, route_idx, vec_width=1, dtype=fx.T.f32())
+                routing_weight = buffer_load(topk_weight_resource, route_idx, vec_width=1, dtype=fx.T.f32)
                 destination_rank = expert_id // fx.Int32(num_experts_per_rank)
                 recv_token_idx = fx.Int32(rank * num_max_tokens_per_rank) + token_idx
                 # Symmetric buffers on the destination rank.

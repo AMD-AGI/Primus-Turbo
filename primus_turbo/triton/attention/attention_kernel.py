@@ -1100,7 +1100,6 @@ def get_autotune_bwd_configs():
             num_warps=4,
         ),
     ], [
-        "BLOCK_DMODEL",
         "ACTUAL_BLOCK_DMODEL_QK",
         "ACTUAL_BLOCK_DMODEL_V",
         "SEQUENCE_PARALLEL",

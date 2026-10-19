@@ -23,10 +23,11 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from primus_turbo.flydsl.utils import buffer_ops
 from primus_turbo.flydsl.utils.gemm_helper import (
     G2SLoader,
     _lane_tbl_count_le,
@@ -1074,7 +1075,7 @@ def _build_grouped_mxfp4_nt_kernel(
         ):
             _body(A, B_T, C, None, None, None, A_scale, B_scale, GO, c_m, c_n, slab_rows, None)
 
-    _pt = {"passthrough": [["amdgpu-agpr-alloc", "256"]]}
+    _pt = {"llvm.passthrough": [["amdgpu-agpr-alloc", "256"]]}
     attrs = {"rocdl.flat_work_group_size": "256,256", "rocdl.waves_per_eu": OCC, **_pt}
     return kern, attrs, NBK, _BILV
 
@@ -2054,7 +2055,7 @@ def _build_grouped_mxfp4_wgrad_kernel(
                 store_c.store_tacc_wide(accL, base_row, base_col_l, n_valid=_NV)
                 store_c.store_tacc_wide(accR, base_row, base_col_r, n_valid=_NV)
 
-    _pt = {"passthrough": [["amdgpu-agpr-alloc", "256"]]}
+    _pt = {"llvm.passthrough": [["amdgpu-agpr-alloc", "256"]]}
     attrs = {"rocdl.flat_work_group_size": "256,256", "rocdl.waves_per_eu": OCC, **_pt}
     return kern, attrs, GRID, _BILV
 

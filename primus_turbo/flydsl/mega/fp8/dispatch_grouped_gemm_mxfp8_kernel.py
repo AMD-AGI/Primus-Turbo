@@ -36,12 +36,6 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl.expr import arith
-from flydsl.expr.buffer_ops import (
-    buffer_load,
-    buffer_store,
-    create_buffer_resource,
-    create_buffer_resource_from_addr,
-)
 from flydsl.expr.typing import AddressSpace, PointerType
 from torch.distributed import ProcessGroup
 
@@ -71,6 +65,12 @@ from primus_turbo.flydsl.mega.fp8.symm_buffer import (
     SymLayout,
     get_symm_buffer_for_mega_moe,
     sym_layout_key,
+)
+from primus_turbo.flydsl.utils.buffer_ops import (
+    buffer_load,
+    buffer_store,
+    create_buffer_resource,
+    create_buffer_resource_from_addr,
 )
 from primus_turbo.flydsl.utils.prims import (
     _readfirstlane_i32,
@@ -149,12 +149,12 @@ def _make_epoch_bump(add_dispatch, add_ps):
             parity_res = create_buffer_resource(PARITY, max_size=True)
             disp_res = create_buffer_resource(DISP_EXP, max_size=True)
             ps_res = create_buffer_resource(PS_EXP, max_size=True)
-            new_parity = buffer_load(parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64()) ^ fx.Int64(1)
+            new_parity = buffer_load(parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64) ^ fx.Int64(1)
             buffer_store(new_parity, parity_res, fx.Int32(0))
-            idx = cast(new_parity, fx.T.i32())
-            new_disp = buffer_load(disp_res, idx, vec_width=1, dtype=fx.T.i64()) + fx.Int64(add_dispatch)
+            idx = cast(new_parity, fx.T.i32)
+            new_disp = buffer_load(disp_res, idx, vec_width=1, dtype=fx.T.i64) + fx.Int64(add_dispatch)
             buffer_store(new_disp, disp_res, idx)
-            new_ps = buffer_load(ps_res, idx, vec_width=1, dtype=fx.T.i64()) + fx.Int64(add_ps)
+            new_ps = buffer_load(ps_res, idx, vec_width=1, dtype=fx.T.i64) + fx.Int64(add_ps)
             buffer_store(new_ps, ps_res, idx)
 
     return epoch_bump_kernel
@@ -168,7 +168,7 @@ _VEC_I32 = 4  # 4 x i32 = 16B / lane (b128 XGMI)
 
 
 def _peer_addr(local_base, offsets_resource, dst_rank):
-    return local_base + buffer_load(offsets_resource, dst_rank, vec_width=1, dtype=fx.T.i64())
+    return local_base + buffer_load(offsets_resource, dst_rank, vec_width=1, dtype=fx.T.i64)
 
 
 def dispatch_fp8_copy_tile(
@@ -213,7 +213,7 @@ def dispatch_fp8_copy_tile(
         # task's descriptor starts at its own first row (64-bit) and spans only its rows, clipped
         # at the pool's end so rows past the capacity are still dropped by the hardware.
         base = _peer_addr(region_base, pool_offsets_resource, destination_rank)
-        base = _readfirstlane_i32(base + cast(dest_row_start, fx.T.i64()) * fx.Int64(row_bytes))
+        base = _readfirstlane_i32(base + cast(dest_row_start, fx.T.i64) * fx.Int64(row_bytes))
         rows_left = fx.Int32(num_max_pool_tokens) - dest_row_start
         rows = arith.select(token_count < rows_left, token_count, rows_left)
         rows = arith.select(rows > fx.Int32(0), rows, fx.Int32(0))
@@ -221,12 +221,10 @@ def dispatch_fp8_copy_tile(
         return create_buffer_resource_from_addr(base, num_records_bytes=nrec)
 
     def load_task(task_index):
-        destination_rank = buffer_load(
-            expert_send_dst_rank_resource, task_index, vec_width=1, dtype=fx.T.i32()
-        )
-        dest_row_start = buffer_load(expert_send_dst_row_resource, task_index, vec_width=1, dtype=fx.T.i32())
-        source_offset = buffer_load(expert_send_offset_resource, task_index, vec_width=1, dtype=fx.T.i32())
-        token_count = buffer_load(expert_send_count_resource, task_index, vec_width=1, dtype=fx.T.i32())
+        destination_rank = buffer_load(expert_send_dst_rank_resource, task_index, vec_width=1, dtype=fx.T.i32)
+        dest_row_start = buffer_load(expert_send_dst_row_resource, task_index, vec_width=1, dtype=fx.T.i32)
+        source_offset = buffer_load(expert_send_offset_resource, task_index, vec_width=1, dtype=fx.T.i32)
+        token_count = buffer_load(expert_send_count_resource, task_index, vec_width=1, dtype=fx.T.i32)
         peer_pool = _task_band(pool_fp8_base, destination_rank, dest_row_start, token_count, hidden_size)
         peer_pscale = _task_band(
             pool_scale_base, destination_rank, dest_row_start, token_count, hidden_size // 32
@@ -240,7 +238,7 @@ def dispatch_fp8_copy_tile(
         def _row(i):
             row_index = warp_id + i * fx.Int32(n_warps)
             source_row = buffer_load(
-                dispatched_token_idx_resource, source_offset + row_index, vec_width=1, dtype=fx.T.i32()
+                dispatched_token_idx_resource, source_offset + row_index, vec_width=1, dtype=fx.T.i32
             )
             vals = []
             for c in fx.range_constexpr(chunk_count):
@@ -250,7 +248,7 @@ def dispatch_fp8_copy_tile(
                         xq_resource,
                         source_row * fx.Int32(hidden_i32) + col,
                         vec_width=_VEC_I32,
-                        dtype=fx.T.i32(),
+                        dtype=fx.T.i32,
                     )
                 )
             for c in fx.range_constexpr(chunk_count):
@@ -259,7 +257,7 @@ def dispatch_fp8_copy_tile(
 
             def _one_scale():
                 sv = buffer_load(
-                    xs_resource, source_row * fx.Int32(scale_i32) + lane_id, vec_width=1, dtype=fx.T.i32()
+                    xs_resource, source_row * fx.Int32(scale_i32) + lane_id, vec_width=1, dtype=fx.T.i32
                 )
                 buffer_store(sv, peer_pscale, row_index * fx.Int32(scale_i32) + lane_id)
 
@@ -378,12 +376,10 @@ def _compile(
         disp_parity_res = create_buffer_resource(DISP_PARITY, max_size=True)
         disp_expected_res = create_buffer_resource(DISP_EXPECTED, max_size=True)
         ps_expected_res = create_buffer_resource(PS_EXPECTED, max_size=True)
-        disp_parity = cast(
-            buffer_load(disp_parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64()), fx.T.i32()
-        )
+        disp_parity = cast(buffer_load(disp_parity_res, fx.Int32(0), vec_width=1, dtype=fx.T.i64), fx.T.i32)
         bank_offset = disp_parity * fx.Int32(worst_case_tiles)
-        expected_dispatch = buffer_load(disp_expected_res, disp_parity, vec_width=1, dtype=fx.T.i64())
-        expected_ps = buffer_load(ps_expected_res, disp_parity, vec_width=1, dtype=fx.T.i64())
+        expected_dispatch = buffer_load(disp_expected_res, disp_parity, vec_width=1, dtype=fx.T.i64)
+        expected_ps = buffer_load(ps_expected_res, disp_parity, vec_width=1, dtype=fx.T.i64)
         dispatch_flag_local = sym_layout.dispatch_flag_ptr
         preshuffle_flag_local = sym_layout.preshuffle_flag_ptr
 
@@ -432,13 +428,13 @@ def _compile(
             if not _no_ps:
                 # ---- PRESHUFFLE role ----
                 ps_index = block_index - comm_block_count
-                real_tiles = buffer_load(num_tile_blocks_resource, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
+                real_tiles = buffer_load(num_tile_blocks_resource, fx.Int32(0), vec_width=1, dtype=fx.T.i32)
                 for _r in range(_ps_rounds):
                     block_m_ps = ps_index + fx.Int32(_r * num_preshuffle_cu)
                     if block_m_ps < real_tiles:
                         # Both scale planes are addressed from this tile's first row in 64-bit,
                         # so the repack's 32-bit offsets only span one tile.
-                        tile_row0 = cast(block_m_ps, fx.T.i64()) * fx.Int64(BLOCK_M)
+                        tile_row0 = cast(block_m_ps, fx.T.i64) * fx.Int64(BLOCK_M)
                         a_scale_raw_res = create_buffer_resource_from_addr(
                             _readfirstlane_i32(sym_layout.pool_scale_ptr + tile_row0 * fx.Int64(K // 32)),
                             num_records_bytes=BLOCK_M * (K // 32),
@@ -449,11 +445,11 @@ def _compile(
                             ),
                             num_records_bytes=BLOCK_M * _ps_bytes_per_row,
                         )
-                        expert_ps = buffer_load(group_resource, block_m_ps, vec_width=1, dtype=fx.T.i32())
+                        expert_ps = buffer_load(group_resource, block_m_ps, vec_width=1, dtype=fx.T.i32)
                         if (not _no_comm) and thread_index == fx.Int32(0):
                             spin_start = read_clock()
                             sig = ld(
-                                dispatch_flag_local, bank_offset + expert_ps, scope="sys", dtype=fx.T.i64()
+                                dispatch_flag_local, bank_offset + expert_ps, scope="sys", dtype=fx.T.i64
                             )
                             while sig != expected_dispatch:
                                 fx.rocdl.s_sleep(fx.Int32(2))
@@ -470,7 +466,7 @@ def _compile(
                                     dispatch_flag_local,
                                     bank_offset + expert_ps,
                                     scope="sys",
-                                    dtype=fx.T.i64(),
+                                    dtype=fx.T.i64,
                                 )
                         fx.gpu.barrier()
                         # The transpose doubles as this role's fence (-16.8% when ported from the
@@ -504,7 +500,7 @@ def _compile(
             if not _no_gemm:
                 # ---- GEMM role ----
                 tile_index = block_index - gemm_base
-                real_tiles = buffer_load(num_tile_blocks_resource, fx.Int32(0), vec_width=1, dtype=fx.T.i32())
+                real_tiles = buffer_load(num_tile_blocks_resource, fx.Int32(0), vec_width=1, dtype=fx.T.i32)
                 real_grid = real_tiles * fx.Int32(n_blocks)
                 if tile_index < real_grid:
                     num_pid_in_group = fx.Int32(GROUP_M * n_blocks)
@@ -521,9 +517,7 @@ def _compile(
                     c_m_real = real_tiles * fx.Int32(BLOCK_M)
                     if (not _no_ps) and thread_index == fx.Int32(0):
                         spin_start = read_clock()
-                        signal = ld(
-                            preshuffle_flag_local, bank_offset + block_m, scope="sys", dtype=fx.T.i64()
-                        )
+                        signal = ld(preshuffle_flag_local, bank_offset + block_m, scope="sys", dtype=fx.T.i64)
                         while signal != expected_ps:
                             fx.rocdl.s_sleep(fx.Int32(2))
                             if spin_timed_out(spin_start):
@@ -535,7 +529,7 @@ def _compile(
                                 )
                                 spin_start = read_clock()
                             signal = ld(
-                                preshuffle_flag_local, bank_offset + block_m, scope="sys", dtype=fx.T.i64()
+                                preshuffle_flag_local, bank_offset + block_m, scope="sys", dtype=fx.T.i64
                             )
                     fx.gpu.barrier()
                     # ACQUIRE for the peer-pushed pool rows / preshuffled A-scale. `buffer_inv sc1`
@@ -548,9 +542,9 @@ def _compile(
                         fx.rocdl.s_waitcnt(fx.Int32(0))
                     fx.gpu.barrier()
 
-                    g_idx = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
+                    g_idx = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32)
                     pool_ptr_ty = PointerType.get(
-                        elem_ty=fx.T.i8(), address_space=AddressSpace.Global, alignment=16
+                        elem_ty=fx.T.i8, address_space=AddressSpace.Global, alignment=16
                     )
                     # Only the base address is read: the tile rebases A per tile in 64-bit, so the
                     # extent stays a placeholder rather than P * K, which int32 cannot hold.

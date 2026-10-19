@@ -42,7 +42,6 @@ import flydsl.expr as fx
 import torch
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
-from flydsl.expr.buffer_ops import create_buffer_resource
 from flydsl.expr.primitive import get_iter as _get_iter
 from flydsl.expr.primitive import ptrtoint as _ptrtoint
 from flydsl.expr.typing import Vector as Vec
@@ -63,6 +62,7 @@ from primus_turbo.flydsl.mega.bf16.gemm_helper import (
     load_row_idx_to_lds,
     read_row_idx_from_lds,
 )
+from primus_turbo.flydsl.utils.buffer_ops import create_buffer_resource
 from primus_turbo.flydsl.utils.gemm_helper import (
     BLOCK_K,
     G2SLoader,
