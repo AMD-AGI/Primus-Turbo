@@ -3410,10 +3410,6 @@ def _mxfp4_wave_eff(tiles, ncu):
 # default everywhere; 192 exists only to turn a grid whose dispatch rounds end ragged into one
 # that fills them, and pays a quarter of the tile's area for it.
 _MXFP4_BLOCK_N_ALT = 192
-# The narrow tile is withheld until its schedule is correct. Its n_tiles_b is odd, which
-# takes the kernel off the folded C store, and that path is not bitwise reproducible: whole
-# 16-row bands of a tile come back holding operand LDS the previous tile left behind.
-_MXFP4_BLOCK_N_ALT_OK = False
 # What the narrow tile also gives up, in k-blocks of its own tile: `_CSTORE` needs
 # ``BLOCK_N // 64 == _MXFP4_PACK_ILV``, so a 192 tile cannot fold its C store into the peel
 # and pays it exposed. That is a per-TILE epilogue, so it is a share of the tile that grows
@@ -3435,7 +3431,7 @@ def _mxfp4_pick_block_n(M, N, K, glu=False):
     put the packed scale group's boundary off the column grid the preshuffle writes.
     """
     bn = _MXFP4_BLOCK_N_ALT
-    if not _MXFP4_BLOCK_N_ALT_OK or glu or N % bn or M % 256:
+    if glu or N % bn or M % 256:
         return 256
     mt, ncu, kb = M // 256, _mxfp4_ncu(), K // 256
     r256 = ceildiv(mt * ceildiv(N, 256), ncu)
