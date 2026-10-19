@@ -151,13 +151,9 @@ class Workspace:
     def get_dispatch_token_buffer_ptr(self):
         return self.base + align(self.NUM_BARRIER_SIGNAL_BYTES, BLOCK_M)
 
-    def get_l2_token_buffer_ptr(self):
+    def get_combine_token_buffer_ptr(self):
         buffer_bytes = align(self.num_max_recv_tokens * self.hidden * self.token_dtype.itemsize, BLOCK_M)
         return self.get_dispatch_token_buffer_ptr() + buffer_bytes
-
-    def get_combine_token_buffer_ptr(self):
-        pool_bytes = align(self.num_max_pool_tokens * self.hidden * self.token_dtype.itemsize, BLOCK_M)
-        return self.get_l2_token_buffer_ptr() + pool_bytes
 
     def get_dispatch_flag_ptr(self):
         combine_token_buffer_bytes = align(
@@ -255,9 +251,6 @@ def get_symm_buffer_size_for_mega_moe(
                 dev,
             ),
             _tensor_from_device_ptr(int(workspace.get_weight_recv_buf_ptr()), (npt,), torch.float32, dev),
-            _tensor_from_device_ptr(
-                int(workspace.get_l2_token_buffer_ptr()), (npt, hidden), token_dtype, dev
-            ),
             _tensor_from_device_ptr(
                 int(workspace.get_combine_token_buffer_ptr()),
                 (workspace.num_max_routes, hidden),
@@ -359,7 +352,6 @@ class SymmBuffer:
         (
             self.dispatch_token_buffer,
             self.weight_recv_buf,
-            self.l2_token_buffer,
             self.combine_token_buffer,
             self.pool_row_to_route,
             self.pool_row_to_recv_token,
