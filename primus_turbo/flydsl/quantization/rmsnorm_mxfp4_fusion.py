@@ -434,6 +434,12 @@ def _build_launcher():
             X, RES, GAM, XPR, RSTD, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, EPS, BIAS
         ).launch(grid=(grid_x, 1, 1), block=(_BLK, 1, 1), stream=stream)
 
+    # FlyDSL 0.3.4.1's LLVM (e2a39f50) VectorCombine rewrites scalar fp32 ops on
+    # extracted vector lanes into <2 x float> ops plus lane shuffles, which takes
+    # this full-residency design from 238 to 512 VGPR+AGPR with 346 VGPRs spilled
+    # (~2.2x slower). Disabling just that fold restores 238 VGPRs and no spills,
+    # with bit-identical outputs. ROCm/FlyDSL#1273.
+    launch.compile_hints["llvm_options"] = {"disable-binop-extract-shuffle": True}
     return launch
 
 

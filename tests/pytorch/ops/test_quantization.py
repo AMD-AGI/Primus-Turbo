@@ -220,6 +220,49 @@ def test_quantize_fp8_tensorwise_amax_correctness(orig_dtype, dest_dtype, granul
 
 @pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (4099, 768),  # MoE fc2 input, unaligned token count
+        (2053, 1536),  # MoE fc1 output width
+        (1, 768),
+        (37, 100),
+        (3, 5),
+        (513, 1000),
+        (8, 64, 96),
+        (1025, 2048),  # rows long enough for the row-per-block kernel (bf16 / fp16)
+        (257, 4100),
+    ],
+)
+def test_quantize_fp8_tensorwise_no_pad_rows(orig_dtype, dest_dtype, shape):
+    """No-pad [rows, K] quantization matches the reference, and the 16-byte-aligned fast
+    path is byte-identical to the fallback taken by a misaligned view of the same data."""
+    torch.manual_seed(42)
+    granularity = ScalingGranularity.TENSORWISE
+    x = torch.randn(shape, device="cuda", dtype=orig_dtype) * 4
+    storage = torch.empty(x.numel() + 1, device="cuda", dtype=orig_dtype)
+    x_unaligned = storage[1:].view(shape)
+    x_unaligned.copy_(x)
+    assert x_unaligned.data_ptr() % 16 != 0
+
+    # The kernel scales in fp32; scaling in orig_dtype would round twice and drift by an fp8 ulp.
+    x_fp8_ref, _, x_scale_inv_ref = quantize_fp8_ref(x.float(), dest_dtype, granularity)
+    x_fp8, x_scale_inv = quantize_fp8(x, dest_dtype, granularity=granularity)
+    assert x_fp8.shape == x.shape
+    torch.testing.assert_close(x_scale_inv_ref, x_scale_inv, **get_tolerances(torch.float32))
+    torch.testing.assert_close(
+        x_fp8_ref.to(torch.float32) * x_scale_inv_ref,
+        x_fp8.to(torch.float32) * x_scale_inv,
+        **get_tolerances(dest_dtype),
+    )
+
+    x_fp8_fallback, x_scale_inv_fallback = quantize_fp8(x_unaligned, dest_dtype, granularity=granularity)
+    torch.testing.assert_close(x_scale_inv, x_scale_inv_fallback, rtol=0, atol=0)
+    assert torch.equal(x_fp8.view(torch.uint8), x_fp8_fallback.view(torch.uint8))
+
+
+@pytest.mark.parametrize("orig_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("dest_dtype", [turbo.float8_e4m3, turbo.float8_e5m2])
 @pytest.mark.parametrize("axis", [-1, -2, -3, 0, 1, 2])
 @pytest.mark.parametrize("B", [1, 4])
 @pytest.mark.parametrize("M", [1, 111, 7168])

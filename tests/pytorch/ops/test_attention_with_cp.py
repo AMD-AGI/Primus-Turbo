@@ -97,8 +97,6 @@ class AttentionWithCPTestCase(MultiProcessTestCase):
             if fp8 and ring_degree != 1:
                 # Ring attention is currently not supported for FP8
                 continue
-            if fp8 and qkv_format != "bshd":
-                continue
             func = pt.ops.flash_attn_fp8_usp_func if fp8 else pt.ops.flash_attn_usp_func
             self.run_attn_with_cp(
                 func,

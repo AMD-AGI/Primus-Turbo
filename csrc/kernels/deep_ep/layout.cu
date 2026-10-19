@@ -130,11 +130,115 @@ __global__ void get_dispatch_layout(const topk_idx_t *topk_idx, int *num_tokens_
     }
 }
 
+// Intranode, one thread per token. The kernel above gives each block a few experts (or
+// ranks) and makes it scan every token, so only ~num_experts / 4 blocks run and the
+// single rank block walks all tokens alone. Here each token row is read once; counts
+// are gathered with integer atomics in shared memory (order-independent, so still
+// deterministic) and added once per block to the zeroed global counters.
+template <typename topk_idx_t, int kNumThreads, int kMaxTopk>
+__global__ void __launch_bounds__(kNumThreads)
+    get_dispatch_layout_per_token(const topk_idx_t *topk_idx, int *num_tokens_per_rank,
+                                  int *num_tokens_per_expert, bool *is_token_in_rank,
+                                  int num_tokens, int num_topk, int num_ranks, int num_experts) {
+    extern __shared__ int smem_counts[];
+    const int             num_counts    = num_experts + num_ranks;
+    int                  *expert_counts = smem_counts;
+    int                  *rank_counts   = smem_counts + num_experts;
+    for (int i = threadIdx.x; i < num_counts; i += kNumThreads)
+        smem_counts[i] = 0;
+    __syncthreads();
+
+    const int token = static_cast<int>(blockIdx.x) * kNumThreads + static_cast<int>(threadIdx.x);
+    if (token < num_tokens) {
+        // Same validity ranges as the per-expert / per-rank blocks of the kernel above.
+        const int   num_expert_per_rank = num_experts / num_ranks;
+        const int   rank_expert_end     = num_ranks * num_expert_per_rank;
+        const auto *row                 = topk_idx + static_cast<int64_t>(token) * num_topk;
+        int         rank_of[kMaxTopk];
+#pragma unroll
+        for (int j = 0; j < kMaxTopk; ++j) {
+            rank_of[j] = -1;
+            if (j < num_topk) {
+                const int expert_idx = static_cast<int>(row[j]);
+                if (0 <= expert_idx and expert_idx < num_experts)
+                    atomicAdd(expert_counts + expert_idx, 1);
+                if (0 <= expert_idx and expert_idx < rank_expert_end)
+                    rank_of[j] = expert_idx / num_expert_per_rank;
+            }
+        }
+
+#pragma unroll
+        for (int j = 0; j < kMaxTopk; ++j) {
+            const int rank_idx = rank_of[j];
+            if (rank_idx < 0)
+                continue;
+            bool first_rank = true;
+#pragma unroll
+            for (int i = 0; i < j; ++i)
+                first_rank &= rank_of[i] != rank_idx;
+            if (first_rank)
+                atomicAdd(rank_counts + rank_idx, 1);
+        }
+
+        bool *out_row = is_token_in_rank + static_cast<int64_t>(token) * num_ranks;
+        if (num_ranks % 8 == 0) {
+            // 8 ranks per 64-bit store; rows stay 8-byte aligned since num_ranks % 8 == 0.
+            for (int base = 0; base < num_ranks; base += 8) {
+                uint64_t word = 0;
+#pragma unroll
+                for (int j = 0; j < kMaxTopk; ++j) {
+                    const int r = rank_of[j] - base;
+                    if (0 <= r and r < 8)
+                        word |= 1ull << (8 * r);
+                }
+                *reinterpret_cast<uint64_t *>(out_row + base) = word;
+            }
+        } else {
+            for (int r = 0; r < num_ranks; ++r) {
+                bool in_rank = false;
+#pragma unroll
+                for (int j = 0; j < kMaxTopk; ++j)
+                    in_rank |= rank_of[j] == r;
+                out_row[r] = in_rank;
+            }
+        }
+    }
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < num_counts; i += kNumThreads) {
+        const int count = smem_counts[i];
+        if (count == 0)
+            continue;
+        if (i < num_experts)
+            atomicAdd(num_tokens_per_expert + i, count);
+        else
+            atomicAdd(num_tokens_per_rank + (i - num_experts), count);
+    }
+}
+
 template <typename topk_idx_t>
 void get_dispatch_layout(const topk_idx_t *topk_idx, int *num_tokens_per_rank,
                          int *num_tokens_per_rdma_rank, int *num_tokens_per_expert,
                          bool *is_token_in_rank, int num_tokens, int num_topk, int num_ranks,
                          int num_experts, hipStream_t stream) {
+    constexpr int kPerTokenThreads = 256, kPerTokenMaxTopk = 16;
+    const size_t  per_token_smem = static_cast<size_t>(num_experts + num_ranks) * sizeof(int);
+    if (num_tokens_per_rdma_rank == nullptr and num_topk <= kPerTokenMaxTopk and
+        per_token_smem <= 32 * 1024) {
+        PRIMUS_TURBO_CHECK_HIP(
+            hipMemsetAsync(num_tokens_per_expert, 0, num_experts * sizeof(int), stream));
+        PRIMUS_TURBO_CHECK_HIP(
+            hipMemsetAsync(num_tokens_per_rank, 0, num_ranks * sizeof(int), stream));
+        if (num_tokens == 0)
+            return;
+        get_dispatch_layout_per_token<topk_idx_t, kPerTokenThreads, kPerTokenMaxTopk>
+            <<<(num_tokens + kPerTokenThreads - 1) / kPerTokenThreads, kPerTokenThreads,
+               per_token_smem, stream>>>(topk_idx, num_tokens_per_rank, num_tokens_per_expert,
+                                         is_token_in_rank, num_tokens, num_topk, num_ranks,
+                                         num_experts);
+        return;
+    }
+
     constexpr int kNumThreads = 256, kNumExpertsPerSM = 4, kNumRanksPerSM = 8;
     int           num_sms = ((num_experts + kNumExpertsPerSM - 1) / kNumExpertsPerSM) +
                   (num_ranks + kNumRanksPerSM - 1) / kNumRanksPerSM;
