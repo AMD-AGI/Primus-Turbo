@@ -733,8 +733,10 @@ def _compile(
                 # still happen, so the PUSH sees the protocol it always sees and nobody downstream
                 # has to know this build computed nothing.
                 if const_expr(not _no_gemm):
-                    # ACT / L2Y may hold only the real rows, so bound by them, not by the pool.
-                    c_m_const = real_tiles * fx.Int32(BLOCK_M)
+                    # Keep the bound a compile-time constant even though ACT / L2Y hold only the real
+                    # rows: only real tiles reach here, so it never masks, and a runtime
+                    # real_tiles * BLOCK_M bound made the K=2048 L2 combine 46% slower (DSv3, EP8).
+                    c_m_const = fx.Int32(num_max_pool_tokens)
                     group_index = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
                     n_tiles_a = BLOCK_M // 64
                     n_tiles_b = BLOCK_N // 128
