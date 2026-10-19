@@ -1379,17 +1379,14 @@ class MfmaScaleFp4:
             # Keeps the first post-barrier issue off the cycle every wave leaves the barrier on.
             _ipend = f"s_waitcnt vmcnt({_WLV}) lgkmcnt({_ELGK})\ns_barrier\ns_nop 0"
 
-            # The quarter-N body's phase is half as long, so _WLV's timing-based slack no
-            # longer covers the g2s: measured racy at vmcnt(_WLV) even with lgkmcnt(0),
-            # clean once the drain reaches every stream the body READS.  The B right half
-            # is the only stream it does not read (half_g2s aims those loads at the left
-            # half anyway) and it issues last, so its loads are the only ones left in
-            # flight -- the drain is a count, not a delay (pitfalls/04).
+            # Every boundary body's phase is shorter than the full one _WLV was tuned on,
+            # so that timing slack no longer covers the g2s: the drain has to reach each
+            # stream the body READS, leaving only the B right half it skips in flight.
             _WLVQ = min(_WLV, nsb)
             _ipend_q = f"s_waitcnt vmcnt({_WLVQ}) lgkmcnt({_ELGK})\ns_barrier\ns_nop 0"
 
             def _ip(half):
-                return _ipend_q if (half and _QN) else _ipend
+                return _ipend_q if half else _ipend
 
             # VGPR-direct scale prefetch: emit_sc_vgpr loads scale dwords to the pinned set (no LDS/ds_read).
             _pbsc = _PINBASE  # scale VGPRs pinned first (PINSC), at PINBASE
