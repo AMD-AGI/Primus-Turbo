@@ -3043,6 +3043,26 @@ def _dense_tuned(cache, key, beta_is_one):
     return _dense_beta1_entry(cache, key, tuned) if beta_is_one else tuned
 
 
+# Repeats a candidate must return identical bytes for before it is timed at all, and the
+# megabytes flushed between them: back to back the operands stay resident and the window
+# a racing schedule needs never opens.
+_DENSE_REPRO_REPS = 64
+_DENSE_REPRO_FLUSH_MB = 512
+
+
+def _repro_ok(compiled, args, out_view):
+    """Whether a candidate returns the same bytes every time on one set of operands."""
+    ref = out_view.clone()
+    flush = torch.empty(_DENSE_REPRO_FLUSH_MB << 20, dtype=torch.uint8, device=out_view.device)
+    for _ in range(_DENSE_REPRO_REPS):
+        flush.zero_()
+        compiled(*args)
+        torch.cuda.synchronize()
+        if not torch.equal(ref, out_view):
+            return False
+    return True
+
+
 def _dense_race(cache, key, args, layout, builders, beta_is_one):
     """First-call race of ``builders`` -- (cfg, factory) pairs -- with the winner cached by
     ``key``. A candidate that fails to build, or whose output sample is not finite, is dropped
@@ -3058,6 +3078,8 @@ def _dense_race(cache, key, args, layout, builders, beta_is_one):
                 c(*bargs)
                 torch.cuda.synchronize()
                 if not torch.isfinite(out_view.view(-1)[:1024].float()).all().item():
+                    continue
+                if not _repro_ok(c, bargs, out_view):
                     continue
                 cands.append([launch, cfg, c, build])  # c: compiled, reused eager
             except Exception:
