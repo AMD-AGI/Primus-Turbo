@@ -89,7 +89,7 @@ def _compile_dense_nt(
     GROUP_M: int = 1,
     waves_per_eu: int = 2,
     agpr_alloc: int = 0,
-    nt_vmcnt: int = 3,  # end-of-iter s_waitcnt vmcnt(N): N=3 → det=0 (gfx950 G2S buffer_load_lds/ds_read LDS hazard), <=1.1% cost; N>=4 races, N<3 costlier; -1 disables
+    nt_vmcnt: int = -2,  # end-of-iter s_waitcnt vmcnt budget: -2 derives it from the streams (below), -1 disables
     num_xcd: int = 8,  # XCD-aware PID remap: cluster same-XCD WGs into contiguous logical tiles for per-XCD L2 reuse (gfx950 MI355X = 8 XCD); 1 disables
     cbsz: int = 0,  # srcA fp8 fmt: 0=E4M3, 1=E5M2
     blgp: int = 0,  # srcB fp8 fmt: 0=E4M3, 1=E5M2
@@ -126,6 +126,12 @@ def _compile_dense_nt(
     N_LDS_STEPS_A = LDS_BLOCK_M // 64
     N_LDS_STEPS_B = LDS_BLOCK_N // 64
     N_LDS_ROUNDS = max(N_LDS_STEPS_A, N_LDS_STEPS_B)
+
+    # End-of-iteration G2S drain (gfx950 buffer_load_lds/ds_read LDS hazard). The budget counts
+    # the streams the next iteration reads; a literal is read against the A stream's width,
+    # which BLOCK_M halves and which then stays in flight.
+    if nt_vmcnt == -2:
+        nt_vmcnt = N_LDS_STEPS_B
 
     a_lds_size = LDS_BLOCK_M * BLOCK_K
     b_lds_size = LDS_BLOCK_N * BLOCK_K
