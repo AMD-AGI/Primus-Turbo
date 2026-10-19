@@ -48,9 +48,10 @@ vec_width=1 or 2 (both of which leave lanes idle or under-vectorized).
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import buffer_ops, math
+from flydsl.expr import math
 
 from primus_turbo.flydsl.mega.tune_utils import Config, autotune
+from primus_turbo.flydsl.utils import buffer_ops
 
 _D = 128  # head dim (fixed for this model family)
 _HALF = _D // 2  # 64: rotate-half split point
@@ -75,7 +76,7 @@ assert 64 % _NPLANE == 0
 
 def _vec_type(base_scalar_type, width):
     """Scalar type when width==1, else an MLIR vector<width x base> type."""
-    return base_scalar_type if width == 1 else fx.T.VectorType.get([width], base_scalar_type)
+    return base_scalar_type if width == 1 else fx.T.vec(width, base_scalar_type)
 
 
 def _make_rope_kernel(
@@ -110,8 +111,8 @@ def _make_rope_kernel(
 
         @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
         def rope_kernel(PACKED: fx.Tensor, FREQS: fx.Tensor, OUT: fx.Tensor):
-            f32ty = _vec_type(fx.T.f32(), _VEC)
-            bf16ty = _vec_type(fx.T.bf16(), _VEC)
+            f32ty = _vec_type(fx.T.f32, _VEC)
+            bf16ty = _vec_type(fx.T.bf16, _VEC)
             thread_index = fx.thread_idx.x
             block_index_x, block_index_y, _ = fx.block_idx
             row_lane = thread_index // fx.Int32(_NPLANE)
@@ -133,14 +134,14 @@ def _make_rope_kernel(
                 row = row0 + row_lane
                 in_base = row * fx.Int32(pack_stride) + packed_col_base + p
                 out_base = row * fx.Int32(out_row_stride) + dest_col_base + p
-                in_lo = buffer_ops.buffer_load(packed_rsrc, in_base, vec_width=_VEC, dtype=fx.T.bf16())
+                in_lo = buffer_ops.buffer_load(packed_rsrc, in_base, vec_width=_VEC, dtype=fx.T.bf16)
                 in_hi = buffer_ops.buffer_load(
-                    packed_rsrc, in_base + fx.Int32(_HALF), vec_width=_VEC, dtype=fx.T.bf16()
+                    packed_rsrc, in_base + fx.Int32(_HALF), vec_width=_VEC, dtype=fx.T.bf16
                 )
                 # Position for the frequency table: s = row // B (B is MBS; row = s*B+b).
                 s = row // fx.Int32(B)
                 freq_off = s * fx.Int32(_D) + p
-                freq = buffer_ops.buffer_load(freq_rsrc, freq_off, vec_width=_VEC, dtype=fx.T.f32())
+                freq = buffer_ops.buffer_load(freq_rsrc, freq_off, vec_width=_VEC, dtype=fx.T.f32)
                 cos_p = math.cos(freq)
                 sin_p = math.sin(freq)
                 lo_f = fx.arith.extf(f32ty, in_lo)
@@ -181,9 +182,9 @@ def _make_rope_kernel(
                 row = row0 + row_lane
                 in_base = row * fx.Int32(pack_stride) + packed_col_base + p
                 out_base = row * fx.Int32(out_row_stride) + dest_col_base + p
-                in_lo = buffer_ops.buffer_load(packed_rsrc, in_base, vec_width=_VEC, dtype=fx.T.bf16())
+                in_lo = buffer_ops.buffer_load(packed_rsrc, in_base, vec_width=_VEC, dtype=fx.T.bf16)
                 in_hi = buffer_ops.buffer_load(
-                    packed_rsrc, in_base + fx.Int32(_HALF), vec_width=_VEC, dtype=fx.T.bf16()
+                    packed_rsrc, in_base + fx.Int32(_HALF), vec_width=_VEC, dtype=fx.T.bf16
                 )
                 buffer_ops.buffer_store(in_lo, out_rsrc, out_base)
                 buffer_ops.buffer_store(in_hi, out_rsrc, out_base + fx.Int32(_HALF))
@@ -231,8 +232,8 @@ def _make_kv_merged_kernel(NG: int, B: int, total_rows: int, npg: int, grid_x: i
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def rope_kv_kernel(PACKED: fx.Tensor, K_FREQS: fx.Tensor, K_OUT: fx.Tensor, V_OUT: fx.Tensor):
-        f32ty = _vec_type(fx.T.f32(), _VEC)
-        bf16ty = _vec_type(fx.T.bf16(), _VEC)
+        f32ty = _vec_type(fx.T.f32, _VEC)
+        bf16ty = _vec_type(fx.T.bf16, _VEC)
         thread_index = fx.thread_idx.x
         block_index_x, block_index_y, _ = fx.block_idx
         row_lane = thread_index // fx.Int32(_NPLANE)
@@ -255,9 +256,9 @@ def _make_kv_merged_kernel(NG: int, B: int, total_rows: int, npg: int, grid_x: i
                 row = row0 + row_lane
                 in_base = row * fx.Int32(pack_stride) + packed_col_base + p
                 out_base = row * fx.Int32(out_row_stride) + dest_col_base + p
-                in_lo = buffer_ops.buffer_load(packed_rsrc, in_base, vec_width=_VEC, dtype=fx.T.bf16())
+                in_lo = buffer_ops.buffer_load(packed_rsrc, in_base, vec_width=_VEC, dtype=fx.T.bf16)
                 in_hi = buffer_ops.buffer_load(
-                    packed_rsrc, in_base + fx.Int32(_HALF), vec_width=_VEC, dtype=fx.T.bf16()
+                    packed_rsrc, in_base + fx.Int32(_HALF), vec_width=_VEC, dtype=fx.T.bf16
                 )
                 buffer_ops.buffer_store(in_lo, v_out_rsrc, out_base)
                 buffer_ops.buffer_store(in_hi, v_out_rsrc, out_base + fx.Int32(_HALF))
@@ -274,13 +275,13 @@ def _make_kv_merged_kernel(NG: int, B: int, total_rows: int, npg: int, grid_x: i
                 row = row0 + row_lane
                 in_base = row * fx.Int32(pack_stride) + packed_col_base + p
                 out_base = row * fx.Int32(out_row_stride) + dest_col_base + p
-                in_lo = buffer_ops.buffer_load(packed_rsrc, in_base, vec_width=_VEC, dtype=fx.T.bf16())
+                in_lo = buffer_ops.buffer_load(packed_rsrc, in_base, vec_width=_VEC, dtype=fx.T.bf16)
                 in_hi = buffer_ops.buffer_load(
-                    packed_rsrc, in_base + fx.Int32(_HALF), vec_width=_VEC, dtype=fx.T.bf16()
+                    packed_rsrc, in_base + fx.Int32(_HALF), vec_width=_VEC, dtype=fx.T.bf16
                 )
                 s = row // fx.Int32(B)
                 freq_off = s * fx.Int32(_D) + p
-                freq = buffer_ops.buffer_load(freq_rsrc, freq_off, vec_width=_VEC, dtype=fx.T.f32())
+                freq = buffer_ops.buffer_load(freq_rsrc, freq_off, vec_width=_VEC, dtype=fx.T.f32)
                 cos_p = math.cos(freq)
                 sin_p = math.sin(freq)
                 lo_f = fx.arith.extf(f32ty, in_lo)
@@ -627,8 +628,8 @@ def _make_rope_bwd_kernel(
 
         @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
         def rope_bwd_kernel(DSPLIT: fx.Tensor, FREQS: fx.Tensor, DPACKED: fx.Tensor):
-            f32ty = _vec_type(fx.T.f32(), _VEC)
-            bf16ty = _vec_type(fx.T.bf16(), _VEC)
+            f32ty = _vec_type(fx.T.f32, _VEC)
+            bf16ty = _vec_type(fx.T.bf16, _VEC)
             thread_index = fx.thread_idx.x
             block_index_x, block_index_y, _ = fx.block_idx
             row_lane = thread_index // fx.Int32(_NPLANE)
@@ -650,14 +651,14 @@ def _make_rope_bwd_kernel(
                 row = row0 + row_lane
                 src_base = row * fx.Int32(src_row_stride) + src_col_base + p
                 dst_base = row * fx.Int32(pack_stride) + dst_col_base + p
-                in_lo = buffer_ops.buffer_load(split_rsrc, src_base, vec_width=_VEC, dtype=fx.T.bf16())
+                in_lo = buffer_ops.buffer_load(split_rsrc, src_base, vec_width=_VEC, dtype=fx.T.bf16)
                 in_hi = buffer_ops.buffer_load(
-                    split_rsrc, src_base + fx.Int32(_HALF), vec_width=_VEC, dtype=fx.T.bf16()
+                    split_rsrc, src_base + fx.Int32(_HALF), vec_width=_VEC, dtype=fx.T.bf16
                 )
                 # Position for the frequency table: s = row // B (B is MBS; row = s*B+b).
                 s = row // fx.Int32(B)
                 freq_off = s * fx.Int32(_D) + p
-                freq = buffer_ops.buffer_load(freq_rsrc, freq_off, vec_width=_VEC, dtype=fx.T.f32())
+                freq = buffer_ops.buffer_load(freq_rsrc, freq_off, vec_width=_VEC, dtype=fx.T.f32)
                 cos_p = math.cos(freq)
                 sin_p = math.sin(freq)
                 lo_f = fx.arith.extf(f32ty, in_lo)
@@ -699,9 +700,9 @@ def _make_rope_bwd_kernel(
                 row = row0 + row_lane
                 src_base = row * fx.Int32(src_row_stride) + src_col_base + p
                 dst_base = row * fx.Int32(pack_stride) + dst_col_base + p
-                lo = buffer_ops.buffer_load(split_rsrc, src_base, vec_width=_VEC, dtype=fx.T.bf16())
+                lo = buffer_ops.buffer_load(split_rsrc, src_base, vec_width=_VEC, dtype=fx.T.bf16)
                 hi = buffer_ops.buffer_load(
-                    split_rsrc, src_base + fx.Int32(_HALF), vec_width=_VEC, dtype=fx.T.bf16()
+                    split_rsrc, src_base + fx.Int32(_HALF), vec_width=_VEC, dtype=fx.T.bf16
                 )
                 buffer_ops.buffer_store(lo, packed_rsrc, dst_base)
                 buffer_ops.buffer_store(hi, packed_rsrc, dst_base + fx.Int32(_HALF))

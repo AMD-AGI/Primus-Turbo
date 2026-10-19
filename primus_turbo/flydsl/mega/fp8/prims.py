@@ -31,7 +31,7 @@ _NUM_WARPS = _BLOCK_THREADS // _WARP
 
 
 def _wait_mem():
-    llvm.inline_asm(fx.T.i32(), [], "s_waitcnt lgkmcnt(0) vmcnt(0)", "=r,~{memory}", has_side_effects=True)
+    llvm.inline_asm(fx.T.i32, [], "s_waitcnt lgkmcnt(0) vmcnt(0)", "=r,~{memory}", has_side_effects=True)
 
 
 def _fence_if_ordered(order):
@@ -42,14 +42,14 @@ def _fence_if_ordered(order):
 
 
 def l2_invalidate():
-    llvm.inline_asm(fx.T.i32(), [], "buffer_inv sc1", "=r,~{memory}", has_side_effects=True)
+    llvm.inline_asm(fx.T.i32, [], "buffer_inv sc1", "=r,~{memory}", has_side_effects=True)
 
 
 def l2_writeback():
     # Device-scope release: write dirty L2 back to the coherent point + wait, so a peer
     # (or another XCD's) reader sees the writes. Pairs with l2_invalidate on the reader.
     llvm.inline_asm(
-        fx.T.i32(), [], "buffer_wbl2 sc1\n\ts_waitcnt vmcnt(0)", "=r,~{memory}", has_side_effects=True
+        fx.T.i32, [], "buffer_wbl2 sc1\n\ts_waitcnt vmcnt(0)", "=r,~{memory}", has_side_effects=True
     )
 
 
@@ -79,7 +79,7 @@ def atomic_add(base, offset, val, scope="agent", space="global", order="relaxed"
 
 def ld(base, offset, *, scope="agent", space="global", order="relaxed", dtype=None):
     if dtype is None:
-        dtype = fx.T.i32()
+        dtype = fx.T.i32
     elif hasattr(dtype, "ir_type"):
         dtype = dtype.ir_type
     elem_bytes = dtype.width // 8

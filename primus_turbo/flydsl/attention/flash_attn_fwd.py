@@ -915,7 +915,7 @@ def build_flash_attn_dualwave_swp_module(
             value_attrs={
                 "rocdl.waves_per_eu": traits.WAVES_PER_EU,
                 "rocdl.flat_work_group_size": f"{traits.BLOCK_SIZE},{traits.BLOCK_SIZE}",
-                "passthrough": passthrough_entries,
+                "llvm.passthrough": passthrough_entries,
             },
         ).launch(
             grid=(traits.NUM_HEADS_Q // traits.Q_HEADS_PER_WG, num_q_blocks, grid_z),

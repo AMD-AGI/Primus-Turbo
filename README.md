@@ -36,7 +36,7 @@ Note: JAX support is under active development. Optim support is planned but not 
 - ROCm >= 7.0
 - Python >= 3.10
 - PyTorch >= 2.6.0 (with ROCm support)
-- [AITER](https://github.com/ROCm/aiter) (required for some operators, e.g. FlashAttention / FP8): `pip3 install "amd-aiter @ git+https://github.com/ROCm/aiter.git@v0.1.14.post1"`
+- [AITER](https://github.com/ROCm/aiter) (required for some operators, e.g. FlashAttention / FP8): `pip3 install "amd-aiter @ git+https://github.com/ROCm/aiter.git@v0.1.24.post1"`
 - [FlyDSL](https://github.com/ROCm/FlyDSL) (required; provides the FlyDSL kernel backend for GEMM / GroupedGEMM / Attention / MoE)
 - rocSHMEM (optional, required for **experimental DeepEP**). Please refer to our [DeepEP Installation Guide](primus_turbo/pytorch/deep_ep/README.md) for instructions.
 

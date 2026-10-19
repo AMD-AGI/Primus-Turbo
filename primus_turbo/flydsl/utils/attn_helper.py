@@ -22,13 +22,14 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace as _TargetAddressSpace
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
+from primus_turbo.flydsl.utils import buffer_ops
 from primus_turbo.flydsl.utils.prims import LOG2E
 
 # FlyDSL's on-disk kernel cache hashes the kernel/launcher source, helpers from their own directory

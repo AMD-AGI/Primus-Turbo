@@ -27,11 +27,12 @@ Numerics reproduce ``csrc/kernels/quantization/quantization_mxfp4.cu`` exactly:
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, buffer_ops, math, range_constexpr, rocdl
+from flydsl.expr import arith, math, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
+from primus_turbo.flydsl.utils import buffer_ops
 from primus_turbo.flydsl.utils.gemm_helper import mxfp4_packed_scale_byte, xcd_remap_pid
 
 _OOB = 0x7FFFFFFF  # word offset past any SRD -> buffer_load returns 0 / buffer_store dropped

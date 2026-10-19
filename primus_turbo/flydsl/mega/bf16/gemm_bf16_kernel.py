@@ -22,7 +22,6 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
-from flydsl.expr.buffer_ops import buffer_load, create_buffer_resource
 from flydsl.expr.typing import Vector as Vec
 
 from primus_turbo.flydsl.gemm.gemm_bf16_kernel import _quad_col_conds
@@ -31,6 +30,7 @@ from primus_turbo.flydsl.mega.bf16.gemm_helper import (
     compute_global_swizzle_bf16_row_col,
     store_band_merged16,
 )
+from primus_turbo.flydsl.utils.buffer_ops import buffer_load, create_buffer_resource
 from primus_turbo.flydsl.utils.gemm_helper import (
     BLOCK_K,
     G2SLoader,
@@ -81,7 +81,7 @@ def _make_a_g2s(a_div, a_gl_offsets, a_row_idx, lane_id, wave_id, K, n_steps, LD
         G2SLoader(
             a_div,
             [
-                buffer_load(row_idx_resource, row + half * LDS_BLOCK_M, vec_width=1, dtype=fx.T.i32())
+                buffer_load(row_idx_resource, row + half * LDS_BLOCK_M, vec_width=1, dtype=fx.T.i32)
                 * fx.Int32(K)
                 + col
                 for row, col in row_cols
