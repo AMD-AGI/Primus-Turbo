@@ -642,6 +642,11 @@ _MXFP8_NT_CANDIDATES = [
 ]
 
 
+# Repeats a candidate must return identical bytes for before it is timed at all.
+_MX_REPRO_REPS = 64
+# Enough to evict the operands a candidate just read.
+_MX_REPRO_FLUSH_MB = 512
+
 _MXFP8_AUTOTUNE_CACHE: dict = {}  # (M,N,K,out_dtype,cbsz,blgp) -> (BLOCK_M, GROUP_M, num_xcd, group_n)
 
 
@@ -886,6 +891,7 @@ def _autotune_mxfp8(
     # Race on a scratch: each candidate is run dozens of times, which a beta=1 build
     # would fold into the caller's accumulation buffer.
     out_view = torch.empty_like(out_view)
+    _repro_flush = torch.empty(_MX_REPRO_FLUSH_MB << 20, dtype=torch.uint8, device=out_view.device)
 
     def _time_cfg(bm, gm, xcd, gn, ks=1, aux=0):
         try:
@@ -930,6 +936,17 @@ def _autotune_mxfp8(
             torch.cuda.synchronize()
             if not torch.isfinite(out_view.reshape(-1)[:1024].float()).all().item():
                 return float("inf")
+            # A config whose output moves between calls on one set of operands is not a
+            # candidate at any speed: the race would otherwise rank a wrong answer first.
+            _ref = out_view.clone()
+            for _ in range(_MX_REPRO_REPS):
+                # Back to back the operands stay cached and the window the race needs never
+                # opens, so the check has to pay for a cold one.
+                _repro_flush.zero_()
+                launch(*args)
+                torch.cuda.synchronize()
+                if not torch.equal(_ref, out_view):
+                    return float("inf")
             return _robust_time(launch, args, warmup=2, reps=3, iters=20)
         except Exception:
             return float("inf")
@@ -944,6 +961,18 @@ def _autotune_mxfp8(
         if us < best_us:
             best_us = us
             best = (bm, gm, xcd, seed_gn)
+    if best is None:
+        # Every candidate at the seed band width was rejected as non-reproducible. A width
+        # that is reproducible may still exist, and a correct config at any speed beats a
+        # fast one that returns different bytes each call.
+        for _gn in _mx_nt_gn_cands(N):
+            for bm, gm, xcd in cands:
+                us = _time_cfg(bm, gm, xcd, _gn)
+                if us < best_us:
+                    best_us = us
+                    best = (bm, gm, xcd, _gn)
+            if best is not None:
+                break
     if best is None:
         raise RuntimeError(
             f"mxfp8 autotune: all candidates failed for M={M} N={N} K={K}. "
