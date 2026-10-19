@@ -22,7 +22,8 @@ rank owns a slice of the experts and tokens are routed directly into a peer rank
   roofline, 90%+ in some cases.
 - **Activation recompute** — forward saves only the original `x`; backward recomputes the
   dispatched `x`.
-- **No-Sync / CUDA Graph friendly** — no host-side sync points.
+- **Buffers sized to the routing** — one host sync per layer reads back how many rows were
+  dispatched to this rank, and every per-layer buffer is sized to them (not CUDA Graph capturable).
 - **Python API** — a single autograd op `fused_mega_moe` that takes external routing
   (`topk_idx` / `topk_weights`).
 
@@ -50,12 +51,17 @@ The key point: this recompute is not a standalone dispatch — it reuses `dispat
 the dispatch communication stays hidden behind the grouped GEMM compute. Activation memory is saved
 without adding any visible communication overhead in backward.
 
-### 3. No-Sync, CUDA Graph compatible
+### 3. Buffers sized to the dispatched rows
 
-The Mega path is fully no-sync: it relies on no host-side synchronization points, making it a
-natural fit for CUDA Graph capture and training-framework integration. Compared with the
-multi-kernel, multi-stage Turbo path, it markedly reduces launch/sync interference and is better
-suited for stable reuse across end-to-end training steps.
+The dispatch prologue counts the rows each rank receives, and the host reads this rank's count back
+once per layer (a small D2H, like DeepEP's notify). The L1 output, the SwiGLU tensors, the L2 output
+staged for the combine push and the handle's row maps are all allocated at that count, not at the
+worst-case pool capacity. Only the symmetric buffer -- the dispatch and combine token buffers, sized
+by the token count -- is allocated ahead of time, and the pool capacity stays the worst case, so no
+routing overflows it. On a DeepSeek-V3 4-layer proxy at EP8 the peak memory drops from 152.9 to
+122.3 GB, and the symmetric buffer is 1.8 GiB instead of 8.9 GiB.
+
+The sync is the price: the op is not CUDA Graph capturable.
 
 ## Pipeline
 

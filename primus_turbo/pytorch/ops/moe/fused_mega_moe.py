@@ -22,6 +22,9 @@ Two entry points share the same kernel sequence (all FlyDSL composition lives in
 
 The gated activation defaults to SiLU-SwiGLU; pass a :class:`GLUActivation` (e.g.
 ``GLUActivation.swigluoai()``) to the op that owns it -- ``fused_mega_moe`` or stage2.
+
+Each forward reads the rows dispatched to this rank back once (a D2H) and sizes every per-layer
+tensor to them, so neither entry point is CUDA-graph capturable.
 """
 
 from typing import Optional, Tuple
