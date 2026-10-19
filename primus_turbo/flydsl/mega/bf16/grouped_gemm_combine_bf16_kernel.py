@@ -461,7 +461,8 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
     assert x.dtype == torch.bfloat16 and l2_weights.dtype == torch.bfloat16
     symm = get_symm_buffer_for_mega_moe()
     sym_buffer = symm.get_sym_buffer()
-    num_max_pool_tokens, hidden_size = x.shape
+    rows, hidden_size = x.shape
+    num_max_pool_tokens = int(symm.num_max_pool_tokens)
     if layout == "nt":
         G, N, K = l2_weights.shape
     else:
@@ -471,7 +472,10 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
     assert out_features == int(symm.hidden), (
         f"out_features {out_features} != SymmBuffer hidden {int(symm.hidden)}"
     )
-    assert num_max_pool_tokens == int(symm.num_max_pool_tokens), "x rows must match SymmBuffer pool capacity"
+    # x holds the rows dispatched to this rank; the kernel is still built for the pool capacity
+    assert rows == handle.pool_row_to_route.numel() <= num_max_pool_tokens, (
+        f"x rows {rows} != the dispatched rows {handle.pool_row_to_route.numel()}"
+    )
     num_topk = int(symm.num_topk)
     num_experts = int(symm.num_experts)
     assert num_topk >= 1 and num_experts > 0, "topk reduce needs num_topk>=1 and num_experts>0"

@@ -473,7 +473,10 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
     trans_c: bool = False,
     out_dtype: torch.dtype = torch.bfloat16,
 ):
-    """Return ``(output, dispatch_token_buffer, handle)``; the buffer feeds the gathered dW2."""
+    """Return ``(output, dispatch_token_buffer, handle)``; the buffer feeds the gathered dW2.
+
+    The nt / nn ``output`` spans the block_m-padded rows dispatched to this rank, which the
+    prologue read back and trimmed the handle's row maps to."""
     if handle is None:
         assert layout == "nt" and topk_idx is not None, "handle=None runs the prologue, forward (nt) only"
         handle, _ = run_dispatch_prologue(x, l1_weights, group, topk_idx, topk_weights)
@@ -514,7 +517,8 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
             G, K, N = l1_weights.shape
             weight_flat = l1_weights.reshape(G * K, N).contiguous()
         assert K == hidden_size, f"weight K={K} != activation K={hidden_size}"
-        output = torch.empty((num_max_pool_tokens, N), dtype=x.dtype, device=x.device)
+        # the rows dispatched to this rank, which the handle's row maps already span
+        output = torch.empty((handle.pool_row_to_route.numel(), N), dtype=x.dtype, device=x.device)
         weight_arg, output_arg = flyc.from_torch_tensor(weight_flat), output
         c_n, out_m_rt, out_n_rt = N, 0, 0
         out_features_ce, hidden_size_ce = N, hidden_size
