@@ -62,9 +62,9 @@ The MXFP8 path (`fused_mega_moe_fp8_stage1` / `_stage2`) trades that for memory:
 prologue each layer reads the rows dispatched to every rank back to the host once (a small D2H,
 overlapped with the token quantization) and allocates every per-layer tensor at the rows this rank
 actually received. Only the symmetric receive pool and combine buffer, shared by all layers, are
-sized ahead of time: the pool holds the worst-case routing capped so no row-indexed tensor reaches
-2 GiB (int32 indexing), and routing past it raises on every rank rather than dropping rows. The
-MXFP8 op is not CUDA-graph capturable in any case.
+sized ahead of time: the pool holds the worst-case routing, and every row-indexed tensor is
+addressed in 64-bit, so a rank can receive all of it however far past 2 / 4 GiB that takes its
+tensors. The MXFP8 op is not CUDA-graph capturable in any case.
 
 ## Pipeline
 

@@ -55,6 +55,7 @@ import flydsl.expr as fx
 import flydsl.expr.math as fmath
 import torch
 from flydsl._mlir.dialects import vector as _vector
+from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr import range_constexpr
 from flydsl.expr.buffer_ops import (
     buffer_load,
@@ -64,7 +65,7 @@ from flydsl.expr.buffer_ops import (
 from flydsl.expr.rocdl import cvt_pk_bf8_f32, cvt_pk_fp8_f32
 from flydsl.expr.typing import Vector as Vec
 
-from primus_turbo.flydsl.mega.fp8.gemm_helper import run_compiled
+from primus_turbo.flydsl.mega.fp8.gemm_helper import make_row_band_resource, run_compiled
 from primus_turbo.flydsl.mega.fp8.quant import (
     MXFP8_BLOCK,
     MXFP8_SCALE_PACK,
@@ -160,8 +161,8 @@ def _compile_swiglu_mxfp8(I: int, act: tuple, BT: int = 256, grid_x: int = _SWIG
         tid = fx.thread_idx.x
         block_index_x, _, _ = fx.block_idx
 
-        acc_rsrc = create_buffer_resource(ACC1, max_size=True)
-        qr = create_buffer_resource(Q, max_size=True)
+        acc_base = _buffer_ops.extract_base_index(ACC1)
+        q_base = _buffer_ops.extract_base_index(Q)
         sr = create_buffer_resource(A_SP, max_size=True)
         ntb_rsrc = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
         smem = fx.SharedAllocator().allocate(StepSmem).peek().raw
@@ -176,6 +177,10 @@ def _compile_swiglu_mxfp8(I: int, act: tuple, BT: int = 256, grid_x: int = _SWIG
         m_real = buffer_load(ntb_rsrc, fx.Int32(0), vec_width=1, dtype=fx.T.i32()) * fx.Int32(_POOL_BLOCK_M)
         row0 = block_index_x * fx.Int32(ROWS)
         while row0 < fx.Int32(c_m):
+            # ACC1 / Q are addressed from this step's first row in 64-bit: either can pass 2 GiB,
+            # and the 32-bit offsets then only span the step's ROWS rows.
+            acc_rsrc = make_row_band_resource(acc_base, row0, c_m, two_I, 2, span_rows=ROWS)
+            qr = make_row_band_resource(q_base, row0, c_m, K_fp8_i32, 4, span_rows=ROWS)
             # ---- SwiGLU -> mxfp8, one 1x32 block per thread, never leaves registers ----
             for wj in range_constexpr(ceildiv(n_work, BT)):
                 widx = tid + fx.Int32(wj * BT)
@@ -184,7 +189,7 @@ def _compile_swiglu_mxfp8(I: int, act: tuple, BT: int = 256, grid_x: int = _SWIG
                     b = widx % fx.Int32(n_blk)
                     row = row0 + r_local
                     if row < m_real:
-                        gbase = row * fx.Int32(two_I) + b * fx.Int32(MXFP8_BLOCK)
+                        gbase = r_local * fx.Int32(two_I) + b * fx.Int32(MXFP8_BLOCK)
                         fvs = []
                         for s in range_constexpr(subs):
                             off = fx.Int32(s * MXFP8_VEC)
@@ -211,7 +216,7 @@ def _compile_swiglu_mxfp8(I: int, act: tuple, BT: int = 256, grid_x: int = _SWIG
                             fvs.append(fx.arith.extf(f32v, act_v))
                         words, biased = mxfp8_words_from_f32_subvecs(fvs)
                         smem[widx] = fx.arith.ArithValue(biased) & fx.Int32(0xFF)
-                        base_i32 = row * fx.Int32(K_fp8_i32) + b * fx.Int32(blk_i32)
+                        base_i32 = r_local * fx.Int32(K_fp8_i32) + b * fx.Int32(blk_i32)
                         for wi in range_constexpr(blk_i32):
                             buffer_store(words[wi], qr, base_i32 + fx.Int32(wi))
 
@@ -378,14 +383,9 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, act: tuple, BT: i
         itile = bid % fx.Int32(n_itile)
         i_col = itile * fx.Int32(BT) + tid
         fblk_local = tid // fx.Int32(MXFP8_BLOCK)
-        l1r = create_buffer_resource(L1, max_size=True)
-        dactr = create_buffer_resource(DACT, max_size=True)
         scaler = create_buffer_resource(SCALE, max_size=True)
-        qcr = create_buffer_resource(QC, max_size=True)
         scr = create_buffer_resource(SC, max_size=True)
-        qrr = create_buffer_resource(QR, max_size=True)
         srr = create_buffer_resource(SRAW, max_size=True)
-        actwr = create_buffer_resource(ACTW, max_size=True)
         gpr = create_buffer_resource(GPART, max_size=True)
         pmbr = create_buffer_resource(PMB_META, max_size=True)
 
@@ -420,6 +420,33 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, act: tuple, BT: i
         in_off_g = buffer_load(pmbr, mb + fx.Int32(1), vec_width=1, dtype=fx.T.i32())
         len_g = buffer_load(pmbr, mb + fx.Int32(2), vec_width=1, dtype=fx.T.i32())
         m_local0 = fx.arith.ArithValue(buffer_load(pmbr, mb + fx.Int32(3), vec_width=1, dtype=fx.T.i32()))
+        # The row-major tensors can pass 2 GiB, so they are addressed from this block's first pool
+        # row in 64-bit and the 32-bit offsets only span its 32 rows; QC [F, Mpad] likewise from the
+        # first F-row each half of this i-tile writes.
+        block_row0 = fx.arith.ArithValue(in_off_g) + m_local0
+        l1r = make_row_band_resource(
+            _buffer_ops.extract_base_index(L1), block_row0, prows, F, 2, span_rows=MXFP8_BLOCK
+        )
+        dactr = make_row_band_resource(
+            _buffer_ops.extract_base_index(DACT), block_row0, prows, I, 2, span_rows=MXFP8_BLOCK
+        )
+        actwr = make_row_band_resource(
+            _buffer_ops.extract_base_index(ACTW), block_row0, prows, I, 2, span_rows=MXFP8_BLOCK
+        )
+        qrr = make_row_band_resource(
+            _buffer_ops.extract_base_index(QR), block_row0, prows, F, 1, span_rows=MXFP8_BLOCK
+        )
+        qcr_halves = [
+            make_row_band_resource(
+                _buffer_ops.extract_base_index(QC),
+                itile * fx.Int32(BT) + fx.Int32(half * I),
+                fx.Int32(F),
+                mpad_i32,
+                4,
+                span_rows=BT,
+            )
+            for half in range(2)
+        ]
 
         def _biased(amax, round_add, target):
             bits = fx.arith.ArithValue(amax).bitcast(fx.T.i32()) + fx.Int32(round_add)
@@ -465,17 +492,22 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, act: tuple, BT: i
             r = fx.Int32(p * rows_per_pass) + tr
             m_local = m_local0 + fx.arith.ArithValue(r)
             real = m_local < fx.arith.ArithValue(len_g)
+            # Pad rows are zeroed below. In the banded tensors they read the block's first row,
+            # which the band clips at the last of ``prows``; SCALE is not banded, so there they read
+            # the group's first row, which is always in bounds.
+            r_eff = fx.arith.ArithValue(fx.arith.select(real, r, fx.Int32(0)))
             m_eff = fx.arith.select(real, m_local, fx.Int32(0))
-            return r, m_local, real, fx.arith.ArithValue(in_off_g) + fx.arith.ArithValue(m_eff)
+            return r, m_local, real, (r_eff, fx.arith.ArithValue(in_off_g) + fx.arith.ArithValue(m_eff))
 
-        def _issue(row):
+        def _issue(rows):
             """The four global reads of one pass, issued with nothing in between."""
+            r_eff, row = rows
             return (
-                buffer_load(l1r, row * fx.Int32(F) + gcol, vec_width=MXFP8_VEC, dtype=fx.T.bf16()),
+                buffer_load(l1r, r_eff * fx.Int32(F) + gcol, vec_width=MXFP8_VEC, dtype=fx.T.bf16()),
                 buffer_load(
-                    l1r, row * fx.Int32(F) + fx.Int32(I) + gcol, vec_width=MXFP8_VEC, dtype=fx.T.bf16()
+                    l1r, r_eff * fx.Int32(F) + fx.Int32(I) + gcol, vec_width=MXFP8_VEC, dtype=fx.T.bf16()
                 ),
-                buffer_load(dactr, row * fx.Int32(I) + gcol, vec_width=MXFP8_VEC, dtype=fx.T.bf16()),
+                buffer_load(dactr, r_eff * fx.Int32(I) + gcol, vec_width=MXFP8_VEC, dtype=fx.T.bf16()),
                 buffer_load(scaler, row, vec_width=1, dtype=fx.T.f32()),
             )
 
@@ -486,7 +518,7 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, act: tuple, BT: i
         prefetch = _issue(_pass_rows(0)[3])
 
         for p in range_constexpr(n_pass):
-            r, m_local, real, row = _pass_rows(p)
+            r, m_local, real, _rows = _pass_rows(p)
             gate_b, up_b, d_b, sc = prefetch
             if p + 1 < n_pass:
                 prefetch = _issue(_pass_rows(p + 1)[3])
@@ -541,7 +573,7 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, act: tuple, BT: i
 
             if real:
                 act_w = fx.arith.mulf(fx.arith.mulf(s, uo), scv)
-                buffer_store(fx.arith.trunc_f(bf16v, act_w), actwr, row * fx.Int32(I) + gcol)
+                buffer_store(fx.arith.trunc_f(bf16v, act_w), actwr, r * fx.Int32(I) + gcol)
 
             # grad_gate uses the UNSCALED upstream grad. Each thread folds its VEC columns,
             # then the thr_per_row lanes that share this row fold across themselves.
@@ -586,7 +618,8 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, act: tuple, BT: i
             words_u.append(c_cvt(fx.T.i32(), qs_u[2], qs_u[3], w, True))
         for half, words, biased in ((0, words_g, biased_cg), (1, words_u, biased_cu)):
             f_out = i_col + fx.Int32(half * I)
-            base_i32 = f_out * fx.arith.ArithValue(mpad_i32) + pmb * fx.Int32(blk_i32)
+            qcr = qcr_halves[half]
+            base_i32 = tid * fx.arith.ArithValue(mpad_i32) + pmb * fx.Int32(blk_i32)
             buffer_store(Vec.from_elements(words[0:4], fx.Int32).ir_value(), qcr, base_i32)
             buffer_store(Vec.from_elements(words[4:8], fx.Int32).ir_value(), qcr, base_i32 + fx.Int32(4))
             buffer_store(
@@ -628,7 +661,6 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, act: tuple, BT: i
             m_local = m_local0 + fx.Int32(r)
             real = m_local < fx.arith.ArithValue(len_g)
             if real:
-                global_row = fx.arith.ArithValue(in_off_g) + m_local
                 gv, uv = _unpack(fx.Int32(r * BT) + tid)
                 for half, val in ((0, gv), (1, uv)):
                     biased_r = _ld(rscale, fx.Int32(half * BT + r * NB) + fblk_local)
@@ -639,7 +671,7 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, act: tuple, BT: i
                     buffer_store(
                         fx.arith.ArithValue(fx.arith.ArithValue(wbyte) & fx.Int32(0xFF)).trunci(fx.T.i8()),
                         qrr,
-                        global_row * fx.Int32(F) + i_col + fx.Int32(half * I),
+                        fx.Int32(r * F) + i_col + fx.Int32(half * I),
                     )
 
     @flyc.jit

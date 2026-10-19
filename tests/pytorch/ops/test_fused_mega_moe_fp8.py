@@ -89,9 +89,8 @@ skip_unless_mxfp8 = unittest.skipUnless(
 )
 
 
-@instantiate_parametrized_tests
-class FusedMegaMoEFp8Test(MultiProcContinuousTest):
-    """EP8 accuracy for the staged mxfp8 op vs turbo DeepEP; PG comes up once per class."""
+class _StagedFp8Harness:
+    """The staged mxfp8 op vs turbo DeepEP on one EP8 shape; shared by the test classes below."""
 
     @classmethod
     def backend_str(cls) -> str:
@@ -102,81 +101,21 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
         return torch.device("cuda", self.rank)
 
     def _metrics(self, actual, ref):
-        """SNR (dB) and cosine vs ref, reduced MIN so the weakest rank governs the EP group."""
+        """SNR (dB) and cosine vs ref, reduced MIN so the weakest rank governs the EP group.
+
+        A rank whose experts received nothing has an all-zero reference wgrad, where SNR and cosine
+        are undefined; it must then be exactly zero too, and scores (inf, 1) or (-inf, 0)."""
+        if not bool((ref != 0).any()):
+            exact = not bool((actual != 0).any())
+            m = torch.tensor([float("inf") if exact else float("-inf"), float(exact)], device=self.device)
+            dist.all_reduce(m, op=dist.ReduceOp.MIN)
+            return float(m[0]), float(m[1])
         cos = torch.nn.functional.cosine_similarity(
             actual.float().flatten(), ref.float().flatten(), dim=0, eps=1e-12
         )
         m = torch.tensor([compute_snr(ref, actual), float(cos)], device=self.device)
         dist.all_reduce(m, op=dist.ReduceOp.MIN)
         return float(m[0]), float(m[1])
-
-    @skip_unless_mxfp8
-    @skip_if_lt_x_gpu(8)
-    @parametrize(
-        "hidden, inter, num_experts, num_topk, num_tokens",
-        [
-            (7168, 2048, 256, 8, 8192),
-            # deepseek_v2's expert shape. Its MegaMoE mxfp8 arm trains to loss 11.81 at iteration
-            # 20 where its bf16 arm reaches 10.39, with iteration-1 loss matching -- forward fine,
-            # backward not. inter=1536 is the only structural difference from the shape above.
-            (5120, 1536, 160, 6, 8192),
-            # Same, with hidden held at the known-good 7168, so a failure here pins it on inter
-            # alone rather than on the hidden/inter pair.
-            (7168, 1536, 256, 8, 8192),
-            # The shape above with topk 6 instead of 8. In training this is the configuration that
-            # blows up: a topk-sweep on deepseek_v3 measured iteration-1 grad norm 0.81 at topk 4
-            # and 1.43 at topk 8, against 2245 / 1529 / 1290 at topk 5 / 6 / 7 -- only powers of
-            # two survive, and only with mxfp8 experts (bf16 experts report 1.09 at topk 6). The
-            # layer's dx is correct there, so it is the weight gradients that are inflated.
-            (7168, 2048, 256, 6, 8192),
-        ],
-    )
-    def test_staged_forward_backward(self, hidden, inter, num_experts, num_topk, num_tokens):
-        """stage1 + stage2 fwd+bwd vs the bf16 turbo DeepEP reference, on identical inputs."""
-        self._staged_forward_backward(hidden, inter, num_experts, num_topk, num_tokens)
-
-    @skip_unless_mxfp8
-    @skip_if_lt_x_gpu(8)
-    @parametrize(
-        "hidden, inter, num_experts, num_topk, num_tokens",
-        [
-            # MiniMax-M3's expert shape, at this class's token count.
-            (6144, 3072, 128, 4, 8192),
-        ],
-    )
-    def test_staged_forward_backward_swigluoai(self, hidden, inter, num_experts, num_topk, num_tokens):
-        """The same comparison with MiniMax-M3's swigluoai threaded through stage2.
-
-        At this suite's L1 output (std ~2) the clamp rarely bites, so this checks the wiring (alpha,
-        offset, and that the spec reaches both fp8 kernels); the clamp semantics are checked per
-        regime by tests/pytorch/ops/test_mega_moe_activation.py, and at a clamp-heavy input by the
-        bf16 suite. Here a clamp-heavy input is not a fair gate: the fp8 L1 output moves elements
-        across the limit, where the gradient jumps between full and zero. Measured at std ~5 (8 x
-        MI355X, EP8): dx / dW1 at 17.2 / 17.3 dB with swigluoai, 17.4 / 17.6 dB with SiLU under the
-        same +-7 clamp, 21.1 / 21.5 dB with the clamp removed -- the clamp's cost, not the kernels'.
-        """
-        self._staged_forward_backward(
-            hidden,
-            inter,
-            num_experts,
-            num_topk,
-            num_tokens,
-            activation=GLUActivation.swigluoai(),
-        )
-
-    @skip_unless_mxfp8
-    @skip_if_lt_x_gpu(8)
-    def test_imbalanced_routing(self):
-        """Rank 0 receives 3x the average rows, far past the old ``pool_mult=2`` pool.
-
-        That pool silently dropped the rows past its capacity; this one must land every one of
-        them, which the accuracy gate against DeepEP sees directly: a dropped row is a missing
-        expert term in y and a missing token in dW. Every pick on rank 0 (8x) needs more rows than
-        int32 indexing reaches at H=7168 / I=2048, so every rank must raise -- not hang, not drop --
-        and the next step must still run."""
-        with self.assertRaisesRegex(RuntimeError, "more than the pool capacity"):
-            self._staged_forward_backward(7168, 2048, 256, 8, 8192, hot_topk=8)
-        self._staged_forward_backward(7168, 2048, 256, 8, 8192, hot_topk=3)
 
     def _hot_rank0_routing(self, num_tokens, num_experts, num_topk, hot_topk):
         """``hot_topk`` of every token's picks among rank 0's experts, the rest among the others'.
@@ -290,6 +229,79 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
         for tag, snr, cos in measured:
             self.assertGreaterEqual(snr, _SNR_FLOOR_DB, f"[{tag}] SNR {snr:.2f} dB < {_SNR_FLOOR_DB}")
             self.assertGreaterEqual(cos, _COSINE_FLOOR, f"[{tag}] cosine {cos:.5f} < {_COSINE_FLOOR}")
+
+
+@instantiate_parametrized_tests
+class FusedMegaMoEFp8Test(_StagedFp8Harness, MultiProcContinuousTest):
+    """EP8 accuracy for the staged mxfp8 op vs turbo DeepEP; PG comes up once per class."""
+
+    @skip_unless_mxfp8
+    @skip_if_lt_x_gpu(8)
+    @parametrize(
+        "hidden, inter, num_experts, num_topk, num_tokens",
+        [
+            (7168, 2048, 256, 8, 8192),
+            # deepseek_v2's expert shape. Its MegaMoE mxfp8 arm trains to loss 11.81 at iteration
+            # 20 where its bf16 arm reaches 10.39, with iteration-1 loss matching -- forward fine,
+            # backward not. inter=1536 is the only structural difference from the shape above.
+            (5120, 1536, 160, 6, 8192),
+            # Same, with hidden held at the known-good 7168, so a failure here pins it on inter
+            # alone rather than on the hidden/inter pair.
+            (7168, 1536, 256, 8, 8192),
+            # The shape above with topk 6 instead of 8. In training this is the configuration that
+            # blows up: a topk-sweep on deepseek_v3 measured iteration-1 grad norm 0.81 at topk 4
+            # and 1.43 at topk 8, against 2245 / 1529 / 1290 at topk 5 / 6 / 7 -- only powers of
+            # two survive, and only with mxfp8 experts (bf16 experts report 1.09 at topk 6). The
+            # layer's dx is correct there, so it is the weight gradients that are inflated.
+            (7168, 2048, 256, 6, 8192),
+        ],
+    )
+    def test_staged_forward_backward(self, hidden, inter, num_experts, num_topk, num_tokens):
+        """stage1 + stage2 fwd+bwd vs the bf16 turbo DeepEP reference, on identical inputs."""
+        self._staged_forward_backward(hidden, inter, num_experts, num_topk, num_tokens)
+
+    @skip_unless_mxfp8
+    @skip_if_lt_x_gpu(8)
+    @parametrize(
+        "hidden, inter, num_experts, num_topk, num_tokens",
+        [
+            # MiniMax-M3's expert shape, at this class's token count.
+            (6144, 3072, 128, 4, 8192),
+        ],
+    )
+    def test_staged_forward_backward_swigluoai(self, hidden, inter, num_experts, num_topk, num_tokens):
+        """The same comparison with MiniMax-M3's swigluoai threaded through stage2.
+
+        At this suite's L1 output (std ~2) the clamp rarely bites, so this checks the wiring (alpha,
+        offset, and that the spec reaches both fp8 kernels); the clamp semantics are checked per
+        regime by tests/pytorch/ops/test_mega_moe_activation.py, and at a clamp-heavy input by the
+        bf16 suite. Here a clamp-heavy input is not a fair gate: the fp8 L1 output moves elements
+        across the limit, where the gradient jumps between full and zero. Measured at std ~5 (8 x
+        MI355X, EP8): dx / dW1 at 17.2 / 17.3 dB with swigluoai, 17.4 / 17.6 dB with SiLU under the
+        same +-7 clamp, 21.1 / 21.5 dB with the clamp removed -- the clamp's cost, not the kernels'.
+        """
+        self._staged_forward_backward(
+            hidden,
+            inter,
+            num_experts,
+            num_topk,
+            num_tokens,
+            activation=GLUActivation.swigluoai(),
+        )
+
+    @skip_unless_mxfp8
+    @skip_if_lt_x_gpu(8)
+    def test_imbalanced_routing(self):
+        """Rank 0 receives 3x, then 8x, the average rows, far past the old ``pool_mult=2`` pool.
+
+        That pool silently dropped the rows past its capacity; this one must land every one of
+        them, which the accuracy gate against DeepEP sees directly: a dropped row is a missing
+        expert term in y and a missing token in dW. At 8x every pick is on rank 0, whose 528K rows
+        put l1 past 4 GiB and the fp8 pool, the L2 output and the colwise wgrad operands past 2 GiB,
+        so every one of them must be addressed in 64-bit; the other ranks' experts receive nothing,
+        and their wgrads must be exactly zero."""
+        self._staged_forward_backward(7168, 2048, 256, 8, 8192, hot_topk=3)
+        self._staged_forward_backward(7168, 2048, 256, 8, 8192, hot_topk=8)
 
     @skip_unless_mxfp8
     @skip_if_lt_x_gpu(8)
@@ -432,6 +444,19 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
         for name, snr, cos in results:
             self.assertGreaterEqual(snr, _SNR_FLOOR_DB, f"[{name}] SNR {snr:.2f} dB < {_SNR_FLOOR_DB}")
             self.assertGreaterEqual(cos, _COSINE_FLOOR, f"[{name}] cosine {cos:.5f} < {_COSINE_FLOOR}")
+
+
+class FusedMegaMoEFp8LongSequenceTest(_StagedFp8Harness, MultiProcContinuousTest):
+    """A second token count needs its own class: compiling the combine for one in the process that
+    ``FusedMegaMoEFp8Test`` runs in trips a FlyDSL trace error (see its multi-layer test)."""
+
+    @skip_unless_mxfp8
+    @skip_if_lt_x_gpu(8)
+    def test_long_sequence(self):
+        """40960 tokens per rank under balanced routing: the combine buffer (topk slots of H + H/32
+        bytes per token) and every rank's l1 pass 2 GiB, so the combine's PUSH and reduce must
+        address their slots, and the row-indexed stages their rows, in 64-bit."""
+        self._staged_forward_backward(7168, 2048, 256, 8, 40960)
 
 
 if __name__ == "__main__":

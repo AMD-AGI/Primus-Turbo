@@ -102,40 +102,22 @@ _SIGNAL_DTYPES = {
 _SIGNAL_DTYPES_MXFP8 = {**_SIGNAL_DTYPES, "comb": torch.uint8}
 
 
-# Kernels index row-indexed tensors with signed int32 offsets and FlyDSL launches carry tensor
-# shapes as int32, so each such tensor must stay under 2 GiB (counted in bytes, which also bounds
-# the element count of any view of it).
-_MAX_ROW_TENSOR_BYTES = 2**31 - 1
-
-
 def fp8_comb_bytes(combine_slots, hidden):
     """Bytes of the mxfp8 ``comb``: every slot's fp8 row, then every slot's E8M0 block scales."""
     return combine_slots * (hidden + hidden // 32)
 
 
-def _pool_capacity(
-    world_size,
-    experts_per_rank,
-    num_tokens,
-    num_topk,
-    hidden,
-    intermediate_hidden,
-    block_m,
-    pool_mult,
-    use_mxfp8,
-):
-    """Pool rows: the most any rank can receive within int32 indexing, or ``pool_mult`` x the average.
+def _pool_capacity(world_size, experts_per_rank, num_tokens, num_topk, block_m, pool_mult, use_mxfp8):
+    """Pool rows: the most any rank can receive, or ``pool_mult`` x the average.
 
     A token's top-k experts are distinct, so a rank receives at most ``min(topk, experts_per_rank)``
-    pairs per peer token; each local expert pads its rows to ``block_m``. The widest row-indexed
-    tensor -- the bf16 ``[rows, 2I]`` L1 output, or the ``[rows, H]`` fp8 pool and L2 output -- must
-    stay under ``_MAX_ROW_TENSOR_BYTES``, which caps the rows well below that worst case (2.67x the
-    average rows for Qwen3-30B-A3B at EP8). The dispatch raises past the cap instead of dropping
+    pairs per peer token; each local expert pads its rows to ``block_m``. The fp8 kernels address
+    every row-indexed tensor in 64-bit, so nothing caps that worst case. A ``pool_mult`` pool trades
+    memory for a bound the routing can pass, in which case the dispatch raises instead of dropping
     rows. The bf16 mirror keeps ``pool_mult=2``."""
     if pool_mult is None and use_mxfp8:
         rows = world_size * num_tokens * min(num_topk, experts_per_rank)
-        addressable = _MAX_ROW_TENSOR_BYTES // max(4 * intermediate_hidden, hidden) // block_m * block_m
-        return min(_align(rows + experts_per_rank * block_m, block_m), addressable)
+        return _align(rows + experts_per_rank * block_m, block_m)
     rows = (2 if pool_mult is None else pool_mult) * num_tokens * num_topk
     return _align(rows + experts_per_rank * block_m, block_m)
 
@@ -163,15 +145,7 @@ def _build_layout_spec(
     spec maps ``name -> (offset, torch_dtype, numel)``."""
     experts_per_rank = num_experts // world_size
     num_max_pool_tokens = _pool_capacity(
-        world_size,
-        experts_per_rank,
-        num_max_tokens_per_rank,
-        num_topk,
-        hidden,
-        intermediate_hidden,
-        block_m,
-        pool_mult,
-        use_mxfp8,
+        world_size, experts_per_rank, num_max_tokens_per_rank, num_topk, block_m, pool_mult, use_mxfp8
     )
     num_pool_blocks = num_max_pool_tokens // block_m
     combine_slots = num_topk * num_max_tokens_per_rank
@@ -237,7 +211,7 @@ def get_symm_buffer_size_for_mega_moe(
 
     ``activation`` is reserved (both gated ``swiglu`` and non-gated variants emit
     ``intermediate_hidden``, so it does not change sizing today). ``pool_mult=None`` sizes the
-    mxfp8 pool for the worst-case routing, capped by int32 indexing (see ``_pool_capacity``).
+    mxfp8 pool for the worst-case routing (see ``_pool_capacity``).
     """
     slice_input_buffers, _signal_spec, num_bytes, signal_bytes, meta = _build_layout_spec(
         world_size,
@@ -492,8 +466,8 @@ def get_symm_buffer_for_mega_moe(
     ``get_symm_buffer_size_for_mega_moe``; if the live buffer is missing or too small
     (main or signal heap) it is released and a fresh one is rendezvous-allocated.
     Otherwise the existing buffer is reused as-is. The mxfp8 pool defaults to the worst-case
-    routing capped by int32 indexing (``pool_mult=None``), so it is allocated once and never
-    regrown; routing past the cap raises in the dispatch.
+    routing (``pool_mult=None``), so it is allocated once and never regrown; a smaller ``pool_mult``
+    pool raises in the dispatch when the routing passes it.
 
     Called with no ``group`` it returns the live buffer -- kernels fetch the workspace
     this way instead of receiving it as a parameter; raises if none exists yet."""
