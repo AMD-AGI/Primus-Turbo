@@ -144,6 +144,7 @@ def _make_kernel(
         c_n: fx.Int32,
         out_m_rt: fx.Int32,
         out_n_rt: fx.Int32,
+        num_row_idx_entries: fx.Int32,
         DISPATCH_PARITY: fx.Tensor,
         DISPATCH_EXPECTED: fx.Tensor,
     ):
@@ -271,7 +272,9 @@ def _make_kernel(
                     BLOCK_N=BLOCK_N,
                     out_fp16=out_fp16,
                     lds_chunk_stride=lds_chunk_stride,
-                    num_row_idx_entries=fx.Int32(workspace.num_pool_row_to_recv_token_entries),
+                    # the handle's trimmed table, not the heap's: the K loop prefetches row
+                    # indices chunks past the last expert, which must read 0, not unmapped memory
+                    num_row_idx_entries=num_row_idx_entries,
                     num_gathered_rows=fx.Int32(workspace.num_max_recv_tokens),
                     **row_idx_kwargs,
                 )
@@ -385,6 +388,7 @@ def _compiled_dispatch_grouped_gemm(
     c_n: int,
     out_m_rt: int,
     out_n_rt: int,
+    num_row_idx_entries: int,
     DISPATCH_PARITY,
     DISPATCH_EXPECTED,
     out_features: fx.Constexpr[int],
@@ -453,6 +457,7 @@ def _compiled_dispatch_grouped_gemm(
         c_n,
         out_m_rt,
         out_n_rt,
+        num_row_idx_entries,
         DISPATCH_PARITY,
         DISPATCH_EXPECTED,
         value_attrs=make_value_attrs(2, 0, "512,512"),
@@ -543,6 +548,7 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         c_n,
         out_m_rt,
         out_n_rt,
+        handle.pool_row_to_recv_token.numel(),
         DISPATCH_PARITY=symm._dispatch_parity,
         DISPATCH_EXPECTED=symm._dispatch_expected,
         out_features=int(out_features_ce),
