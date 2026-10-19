@@ -677,7 +677,7 @@ class MfmaScaleFp4:
         g2s_grp=(0, 0),  # steps per M0 window, per (A, B) stream
         kstep_val=0,  # value of ``kstep`` (compile-time), so buf1's +1 block can ride that immediate
         acc_dead=False,  # caller never reads the returned accumulators, so the fused store may recycle them
-        k1_watermark=False,  # caller's loop watermark covers the k=1 fill, so the prologue need not drain it
+        k1_watermark=False,  # caller's watermark covers the k=1 fill; only a peeled head defers that read
         _cache={},  # noqa: B006 -- deliberate cross-call asm compile cache
     ):
         """WHOLE-LOOP bare-asm K-loop: one inline-asm hw-loop, unroll-2 ping-pong with
@@ -1504,18 +1504,17 @@ class MfmaScaleFp4:
                 # VGPR-direct scale prologue: set A = phase-A iter0 scales.
                 L += emit_sc_vgpr(0) + _scv_adv()
                 L += emit_g2s_pre()
-                # The k=1 fill is still the only vmem in flight and lands in the slot the loop
-                # only reads a phase later -- behind a watermark the CALLER picks. Only a caller
-                # whose watermark was computed with this fill still outstanding may skip the
-                # drain; one written against a drained prologue reads k=1 before it lands.
-                # That fault is silent: the first tile on a CU finds the slot empty and gets it
-                # right, and only a later tile on the same CU reads the previous tile's k=1.
+                # The k=1 fill is still the only vmem in flight and lands in a slot the loop
+                # reads a phase later, so it can ride behind a watermark the CALLER picks --
+                # but only where the peeled head phase stands between here and that read.
                 L.append(f"s_waitcnt vmcnt({_NPRE}) lgkmcnt(0)")
                 L.append("s_barrier")
-                _vk1 = _NPRE if k1_watermark else 0
                 if not _PSTAGE:
+                    # No head phase here: the loop's opening phase refills set1 straight out of
+                    # the k=1 slot, so this drain has to count that whole fill. A watermark over
+                    # it leaves the earliest A fragments reading the slot before the DMA lands.
                     L += emit_ds(0, 0)
-                    L.append(f"s_waitcnt vmcnt({_vk1}) lgkmcnt(0)")
+                    L.append("s_waitcnt vmcnt(0) lgkmcnt(0)")
                     L.append("s_barrier")
                 elif not k1_watermark:
                     L.append("s_waitcnt vmcnt(0)")
