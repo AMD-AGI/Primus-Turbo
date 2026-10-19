@@ -12,6 +12,9 @@
 ###############################################################################
 
 import ctypes
+import functools
+import hashlib
+import inspect
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -73,8 +76,11 @@ class SymBuffer:
         return [PointerType.get(i64, space, 8)]
 
     def __cache_signature__(self) -> tuple:
-        # only rank count specializes it; dims ride each kernel's constexpr, not the handle
-        return (type(self), self.num_ranks)
+        # dims ride each kernel's constexpr, not the handle. The region offsets do not: they come from
+        # Workspace, and FlyDSL's disk-cache key hashes the helper functions a kernel calls but not the
+        # classes, so without the layout here a layout change replays binaries that address the old
+        # regions -- a grid_sync counter clobbered by a stale prologue, then a hang.
+        return (type(self), self.num_ranks, _workspace_layout_hash())
 
     def __c_abi_spec__(self) -> list:
         def fill_offsets(a, s):
@@ -204,6 +210,11 @@ class Workspace:
 
     def get_xgmi_barrier_signal_ptr(self, phase):
         return self.base + (self.NUM_MAX_GRID_SYNC_COUNTERS + 1) * 4 + phase * 4
+
+
+@functools.lru_cache(maxsize=1)
+def _workspace_layout_hash() -> str:
+    return hashlib.sha256(inspect.getsource(Workspace).encode()).hexdigest()[:16]
 
 
 def get_symm_buffer_size_for_mega_moe(
