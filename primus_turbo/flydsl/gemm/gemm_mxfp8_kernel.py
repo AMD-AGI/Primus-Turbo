@@ -34,6 +34,8 @@ Scale tensor layout expected by this kernel (passed pre-packed from host):
 i.e. the raw uint8 E8M0 [DIM, K//32] viewed little-endian as int32.
 """
 
+import warnings
+
 import torch
 
 # isort: off
@@ -646,6 +648,20 @@ _MXFP8_NT_CANDIDATES = [
 _MX_REPRO_REPS = 64
 # Enough to evict the operands a candidate just read.
 _MX_REPRO_FLUSH_MB = 512
+_MX_REPRO_FLUSH: dict = {}
+
+
+def _repro_flush_buf(device):
+    """One flush buffer per device for the whole process. A per-autotune allocation competes
+    with the scratch output on the largest shapes, and losing it there would fail every
+    candidate; a shape that cannot spare it runs the check warm instead."""
+    if device not in _MX_REPRO_FLUSH:
+        try:
+            _MX_REPRO_FLUSH[device] = torch.empty(_MX_REPRO_FLUSH_MB << 20, dtype=torch.uint8, device=device)
+        except torch.OutOfMemoryError:
+            _MX_REPRO_FLUSH[device] = None
+    return _MX_REPRO_FLUSH[device]
+
 
 _MXFP8_AUTOTUNE_CACHE: dict = {}  # (M,N,K,out_dtype,cbsz,blgp) -> (BLOCK_M, GROUP_M, num_xcd, group_n)
 
@@ -891,9 +907,9 @@ def _autotune_mxfp8(
     # Race on a scratch: each candidate is run dozens of times, which a beta=1 build
     # would fold into the caller's accumulation buffer.
     out_view = torch.empty_like(out_view)
-    _repro_flush = torch.empty(_MX_REPRO_FLUSH_MB << 20, dtype=torch.uint8, device=out_view.device)
+    _repro_flush = _repro_flush_buf(out_view.device)
 
-    def _time_cfg(bm, gm, xcd, gn, ks=1, aux=0):
+    def _time_cfg(bm, gm, xcd, gn, ks=1, aux=0, repro=True):
         try:
             ks, head, tail = _mx_ksplit(M, N, K, out_dtype, False) if ks > 1 else (1, 0, 0)
             ws, head = (
@@ -939,10 +955,11 @@ def _autotune_mxfp8(
             # A config whose output moves between calls on one set of operands is not a
             # candidate at any speed: the race would otherwise rank a wrong answer first.
             _ref = out_view.clone()
-            for _ in range(_MX_REPRO_REPS):
+            for _ in range(_MX_REPRO_REPS if repro else 0):
                 # Back to back the operands stay cached and the window the race needs never
                 # opens, so the check has to pay for a cold one.
-                _repro_flush.zero_()
+                if _repro_flush is not None:
+                    _repro_flush.zero_()
                 launch(*args)
                 torch.cuda.synchronize()
                 if not torch.equal(_ref, out_view):
@@ -973,6 +990,21 @@ def _autotune_mxfp8(
                     best = (bm, gm, xcd, _gn)
             if best is not None:
                 break
+    if best is None:
+        # No width reproduced. Say so and rank on time alone rather than refusing the shape:
+        # this is what the kernel did before the check existed, and a warning beats a stop.
+        warnings.warn(
+            f"mxfp8 NT: no reproducible config for M={M} N={N} K={K}; ranking on time alone, "
+            "so this shape may return different results from call to call",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        for bm, gm, xcd in cands:
+            for _gn in [seed_gn] + list(_mx_nt_gn_cands(N)):
+                us = _time_cfg(bm, gm, xcd, _gn, repro=False)
+                if us < best_us:
+                    best_us = us
+                    best = (bm, gm, xcd, _gn)
     if best is None:
         raise RuntimeError(
             f"mxfp8 autotune: all candidates failed for M={M} N={N} K={K}. "
