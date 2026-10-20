@@ -55,7 +55,7 @@ import flydsl.expr as fx
 import flydsl.expr.math as fmath
 import torch
 from flydsl._mlir.dialects import vector as _vector
-from flydsl.expr import range_constexpr
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.rocdl import cvt_pk_bf8_f32, cvt_pk_fp8_f32
 from flydsl.expr.typing import Vector as Vec
 
@@ -116,7 +116,9 @@ def _add_const(x, c, vtype):
 # FORWARD: SwiGLU -> rowwise mxfp8
 # =============================================================================
 @functools.lru_cache(maxsize=16)
-def _compile_swiglu_mxfp8(I: int, act: tuple, BT: int = 256, grid_x: int = _SWIGLU_GRID_X):
+def _compile_swiglu_mxfp8(
+    I: int, act: tuple, BT: int = 256, grid_x: int = _SWIGLU_GRID_X, with_bias: bool = False
+):
     """SwiGLU + mxfp8 quant, activation kept in REGISTERS.
 
     One thread owns one whole 1x32 mxfp8 block of one row, so the SwiGLU result feeds
@@ -127,7 +129,10 @@ def _compile_swiglu_mxfp8(I: int, act: tuple, BT: int = 256, grid_x: int = _SWIG
     across blocks of a row (same idiom as ``_compile_quant_preshuffle_pack4``).
 
     The f32 activation is round-tripped through bf16 before the amax/quant so the output is
-    BIT-IDENTICAL to the global-scratch version (which stored bf16 and re-read it)."""
+    BIT-IDENTICAL to the global-scratch version (which stored bf16 and re-read it).
+
+    ``with_bias`` adds the experts' fc1 bias ``BIAS [E_local, 2I]`` to the fc1 output before the
+    clamp; row r takes expert ``TILE_TO_EXPERT[r // 256]``'s."""
     assert I % MXFP8_VEC == 0 and I % MXFP8_BLOCK == 0
     alpha, glu_offset, gate_lo, gate_hi, up_clamp = act
     two_I = 2 * I
@@ -155,6 +160,8 @@ def _compile_swiglu_mxfp8(I: int, act: tuple, BT: int = 256, grid_x: int = _SWIG
         Q: fx.Tensor,
         A_SP: fx.Tensor,
         NUM_TILE_BLOCKS: fx.Tensor,
+        BIAS: fx.Tensor,
+        TILE_TO_EXPERT: fx.Tensor,
         c_m: fx.Int32,
         grid_x: fx.Constexpr[int],
     ):
@@ -165,6 +172,8 @@ def _compile_swiglu_mxfp8(I: int, act: tuple, BT: int = 256, grid_x: int = _SWIG
         q_base = _buffer_ops.extract_base_index(Q)
         sr = create_buffer_resource(A_SP, max_size=True)
         ntb_rsrc = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
+        bias_rsrc = create_buffer_resource(BIAS, max_size=True) if with_bias else None
+        t2e_rsrc = create_buffer_resource(TILE_TO_EXPERT, max_size=True) if with_bias else None
         smem = fx.SharedAllocator().allocate(StepSmem).peek().raw
 
         f32v = fx.T.vec(MXFP8_VEC, fx.T.f32)
@@ -190,6 +199,10 @@ def _compile_swiglu_mxfp8(I: int, act: tuple, BT: int = 256, grid_x: int = _SWIG
                     row = row0 + r_local
                     if row < m_real:
                         gbase = r_local * fx.Int32(two_I) + b * fx.Int32(MXFP8_BLOCK)
+                        if const_expr(with_bias):
+                            bias_base = buffer_load(
+                                t2e_rsrc, row // fx.Int32(_POOL_BLOCK_M), vec_width=1, dtype=fx.T.i32
+                            ) * fx.Int32(two_I) + b * fx.Int32(MXFP8_BLOCK)
                         fvs = []
                         for s in range_constexpr(subs):
                             off = fx.Int32(s * MXFP8_VEC)
@@ -200,8 +213,11 @@ def _compile_swiglu_mxfp8(I: int, act: tuple, BT: int = 256, grid_x: int = _SWIG
                                 vec_width=MXFP8_VEC,
                                 dtype=fx.T.bf16,
                             )
-                            g = _clampv(fx.arith.extf(f32v, gate), g_lo, g_hi)
-                            u = _add_const(_clampv(fx.arith.extf(f32v, up), u_lo, u_hi), glu_offset, f32v)
+                            gate, up = fx.arith.extf(f32v, gate), fx.arith.extf(f32v, up)
+                            if const_expr(with_bias):
+                                gate, up = _add_bias(gate, up, bias_rsrc, bias_base + off, I, f32v)
+                            g = _clampv(gate, g_lo, g_hi)
+                            u = _add_const(_clampv(up, u_lo, u_hi), glu_offset, f32v)
                             denom = fx.arith.addf(
                                 one, fmath.exp(fx.arith.mulf(_mul_const(g, alpha, f32v), neg1))
                             )
@@ -255,15 +271,24 @@ def _compile_swiglu_mxfp8(I: int, act: tuple, BT: int = 256, grid_x: int = _SWIG
         Q: fx.Tensor,
         A_SP: fx.Tensor,
         NUM_TILE_BLOCKS: fx.Tensor,
+        BIAS: fx.Tensor,
+        TILE_TO_EXPERT: fx.Tensor,
         M: int,
         stream: fx.Stream,
         grid_x: fx.Constexpr[int] = _SWIGLU_GRID_X,
     ):
-        kern(ACC1, Q, A_SP, NUM_TILE_BLOCKS, M, grid_x).launch(
+        kern(ACC1, Q, A_SP, NUM_TILE_BLOCKS, BIAS, TILE_TO_EXPERT, M, grid_x).launch(
             grid=(grid_x, 1, 1), block=(BT, 1, 1), stream=stream
         )
 
     return launch
+
+
+def _add_bias(gate, up, bias_rsrc, offset, I: int, f32v):
+    """The fc1 output halves plus their bias, whose gate half starts at ``offset`` (up at +I)."""
+    bias_g = buffer_load(bias_rsrc, offset, vec_width=MXFP8_VEC, dtype=fx.T.bf16)
+    bias_u = buffer_load(bias_rsrc, offset + fx.Int32(I), vec_width=MXFP8_VEC, dtype=fx.T.bf16)
+    return fx.arith.addf(gate, fx.arith.extf(f32v, bias_g)), fx.arith.addf(up, fx.arith.extf(f32v, bias_u))
 
 
 _SWIGLU_MXFP8_COMPILED: dict = {}
@@ -273,13 +298,21 @@ def swiglu_mxfp8_flydsl_kernel(
     x: torch.Tensor,
     num_tile_blocks: torch.Tensor,
     activation: Optional[GLUActivation] = None,
+    bias: Optional[torch.Tensor] = None,
+    tile_to_expert: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """SwiGLU on ``x`` [M, 2I] gate||up -> mxfp8 ``(q [M,I] fp8, a_sp int32 preshuffled)``."""
+    """SwiGLU on ``x`` [M, 2I] gate||up -> mxfp8 ``(q [M,I] fp8, a_sp int32 preshuffled)``.
+
+    ``bias`` [E_local, 2I] is the experts' fc1 bias, added before the activation; row m takes
+    expert ``tile_to_expert[m // 256]``'s."""
     x = x.contiguous()
     M, two_I = x.shape
     assert two_I % 2 == 0
     I = two_I // 2
     assert I % MXFP8_BLOCK == 0, f"I={I} must be a multiple of mxfp8 block {MXFP8_BLOCK}"
+    with_bias = bias is not None
+    if with_bias:
+        assert tile_to_expert is not None and bias.dtype == torch.bfloat16 and bias.shape[1] == two_I
 
     dev = x.device
     q = torch.empty((M, I), dtype=torch.float8_e4m3fn, device=dev)
@@ -288,10 +321,12 @@ def swiglu_mxfp8_flydsl_kernel(
     a_sp = torch.empty(ceildiv(M, 64) * K128p * 256, dtype=torch.int32, device=dev)
 
     act = activation_constexpr(activation)
-    launch = _compile_swiglu_mxfp8(int(I), act)
-    args = (x, q_i32, a_sp, num_tile_blocks, M, torch.cuda.current_stream())
+    launch = _compile_swiglu_mxfp8(int(I), act, with_bias=with_bias)
+    # without a bias both bias arguments are traced out; any device tensors fill them
+    bias_args = (bias.contiguous(), tile_to_expert) if with_bias else (x, num_tile_blocks)
+    args = (x, q_i32, a_sp, num_tile_blocks, *bias_args, M, torch.cuda.current_stream())
     # M and every tensor shape are runtime arguments, so they stay out of the key
-    run_compiled(_SWIGLU_MXFP8_COMPILED, (I, act), launch, *args)
+    run_compiled(_SWIGLU_MXFP8_COMPILED, (I, act, with_bias), launch, *args)
     return q, a_sp
 
 
@@ -326,7 +361,12 @@ def _compile_gate_partial_reduce(n_part: int, BT: int = 256):
 
 
 @functools.lru_cache(maxsize=64)
-def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, act: tuple, BT: int = 256):
+def _compile_swiglu_bwd_rowcol_dual(
+    I: int, is_e5m2_col: bool, act: tuple, BT: int = 256, with_bias: bool = False
+):
+    """``with_bias``: the forward added ``BIAS [E_local, 2I]`` (expert ``BLK2GRP[pmb]`` for a 32-row
+    block) to ``L1``, so it is added here again, and each block's column sums of the gradient it
+    produces, which the bias gradient is the per-expert sum of, go to ``BIAS_PART [n_pblk, 2I]``."""
     alpha, glu_offset, gate_lo, gate_hi, up_clamp = act
     F = 2 * I
     assert I % BT == 0 and BT % MXFP8_BLOCK == 0
@@ -373,6 +413,9 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, act: tuple, BT: i
         ACTW: fx.Tensor,
         GPART: fx.Tensor,
         PMB_META: fx.Tensor,
+        BIAS: fx.Tensor,
+        BLK2GRP: fx.Tensor,
+        BIAS_PART: fx.Tensor,
         mpad_i32: fx.Int32,
         npblk: fx.Int32,
         prows: fx.Int32,
@@ -388,6 +431,8 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, act: tuple, BT: i
         srr = create_buffer_resource(SRAW, max_size=True)
         gpr = create_buffer_resource(GPART, max_size=True)
         pmbr = create_buffer_resource(PMB_META, max_size=True)
+        bias_rsrc = create_buffer_resource(BIAS, max_size=True) if with_bias else None
+        bias_part_rsrc = create_buffer_resource(BIAS_PART, max_size=True) if with_bias else None
 
         lds = fx.SharedAllocator().allocate(Smem).peek()
         tile = lds.tile
@@ -487,6 +532,16 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, act: tuple, BT: i
         i_base = itile * fx.Int32(BT)
 
         gcol = i_base + tc
+        if const_expr(with_bias):
+            # a 32-row block lies in one group, and the thread's columns are fixed across its passes
+            expert = buffer_load(
+                create_buffer_resource(BLK2GRP, max_size=True), pmb, vec_width=1, dtype=fx.T.i32
+            )
+            bias_g = buffer_load(bias_rsrc, expert * fx.Int32(F) + gcol, vec_width=MXFP8_VEC, dtype=fx.T.bf16)
+            bias_u = buffer_load(
+                bias_rsrc, expert * fx.Int32(F) + fx.Int32(I) + gcol, vec_width=MXFP8_VEC, dtype=fx.T.bf16
+            )
+            bias_g, bias_u = fx.arith.extf(f32v, bias_g), fx.arith.extf(f32v, bias_u)
 
         def _pass_rows(p):
             r = fx.Int32(p * rows_per_pass) + tr
@@ -525,6 +580,8 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, act: tuple, BT: i
 
             gate = fx.arith.extf(f32v, gate_b)
             up = fx.arith.extf(f32v, up_b)
+            if const_expr(with_bias):
+                gate, up = fx.arith.addf(gate, bias_g), fx.arith.addf(up, bias_u)
             d_raw = fx.arith.extf(f32v, d_b)
             scv = _vector.broadcast(f32v, sc)
             d = fx.arith.mulf(d_raw, scv)
@@ -598,11 +655,19 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, act: tuple, BT: i
         # Two passes (amax, then quantize) keep only the running amax live instead of the
         # 32 values per half that spilled in round 2.
         amax_cg, amax_cu = None, None
+        sum_cg, sum_cu = None, None
         for r in range_constexpr(MXFP8_BLOCK):
             gv, uv = _unpack(fx.Int32(r * BT) + tid)
             ag, au = fmath.absf(gv), fmath.absf(uv)
             amax_cg = ag if amax_cg is None else fx.arith.maximumf(amax_cg, ag)
             amax_cu = au if amax_cu is None else fx.arith.maximumf(amax_cu, au)
+            if const_expr(with_bias):
+                # pad rows were zeroed above, so the column sums cover the real rows only
+                sum_cg = gv if sum_cg is None else fx.arith.addf(sum_cg, gv)
+                sum_cu = uv if sum_cu is None else fx.arith.addf(sum_cu, uv)
+        if const_expr(with_bias):
+            buffer_store(sum_cg, bias_part_rsrc, pmb * fx.Int32(F) + i_col)
+            buffer_store(sum_cu, bias_part_rsrc, pmb * fx.Int32(F) + fx.Int32(I) + i_col)
         biased_cg, biased_cu = _biased(amax_cg, c_round, c_target), _biased(amax_cu, c_round, c_target)
         inv_cg, inv_cu = _inv_scale(biased_cg), _inv_scale(biased_cu)
         words_g, words_u = [], []
@@ -687,6 +752,9 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, act: tuple, BT: i
         ACTW,
         GPART,
         PMB_META,
+        BIAS,
+        BLK2GRP,
+        BIAS_PART,
         mpad_i32,
         npblk,
         prows,
@@ -694,7 +762,22 @@ def _compile_swiglu_bwd_rowcol_dual(I: int, is_e5m2_col: bool, act: tuple, BT: i
         stream: fx.Stream,
     ):
         swiglu_bwd_dual_kern(
-            L1, DACT, SCALE, QC, SC, QR, SRAW, ACTW, GPART, PMB_META, mpad_i32, npblk, prows
+            L1,
+            DACT,
+            SCALE,
+            QC,
+            SC,
+            QR,
+            SRAW,
+            ACTW,
+            GPART,
+            PMB_META,
+            BIAS,
+            BLK2GRP,
+            BIAS_PART,
+            mpad_i32,
+            npblk,
+            prows,
         ).launch(grid=(n_pblk * n_itile, 1, 1), block=(BT, 1, 1), stream=stream)
         launch_pack(ASP, SRAW, PMB_META, n_pblk, stream=stream)
 
@@ -711,6 +794,8 @@ def swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl(
     meta: dict = None,
     BT: int = 256,
     activation: Optional[GLUActivation] = None,
+    bias: Optional[torch.Tensor] = None,
+    bias_part: Optional[torch.Tensor] = None,
 ):
     """SwiGLU backward + rowwise/colwise MXFP8 dual-quant of ``grad_l1`` in one kernel.
 
@@ -718,6 +803,10 @@ def swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl(
     ever materializing ``grad_l1 [P, 2I]`` bf16.  Returns
     ``(q_row, a_sp, q_col, s_col, grad_gate, act_weighted)``, matching the two kernels'
     outputs except that rows outside every group carry 0 (not garbage) in ``grad_gate``.
+
+    ``bias`` [E_local, 2I] is the fc1 bias the forward added to ``l1``. With it, ``bias_part``
+    [n_pblk, 2I] f32 receives each 32-row block's column sums of ``grad_l1``; the bias gradient is
+    their sum over each group's blocks, ``[offs_pc[g] / 32, offs_pc[g + 1] / 32)`` of ``meta``.
     """
     assert l1.dim() == 2 and l1.dtype == torch.bfloat16
     assert dact.dtype == torch.bfloat16 and scale.dtype == torch.float32
@@ -743,7 +832,17 @@ def swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl(
     s_raw = torch.zeros((P, n_blk), dtype=torch.uint8, device=l1.device)
     act_w = torch.empty((P, I), dtype=torch.bfloat16, device=l1.device)
 
-    launch, n_part = _compile_swiglu_bwd_rowcol_dual(I, is_e5m2_col, activation_constexpr(activation), BT)
+    with_bias = bias is not None
+    if with_bias:
+        assert bias.dtype == torch.bfloat16 and bias.shape[1] == F, f"bias must be bf16 [E_local, {F}]"
+        assert (
+            bias_part is not None
+            and bias_part.dtype == torch.float32
+            and tuple(bias_part.shape) == (n_pblk, F)
+        )
+    launch, n_part = _compile_swiglu_bwd_rowcol_dual(
+        I, is_e5m2_col, activation_constexpr(activation), BT, with_bias
+    )
     # Zeroed so rows covered by no group fold to an exact 0 gate gradient.
     g_part = torch.zeros((n_part, P), dtype=torch.float32, device=l1.device)
     grad_gate = torch.empty((P,), dtype=torch.float32, device=l1.device)
@@ -760,6 +859,10 @@ def swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl(
         act_w,
         g_part,
         meta["pmb_meta"],
+        # traced out without a bias; any device tensors fill them
+        bias.contiguous() if with_bias else l1,
+        meta["blk2grp"] if with_bias else g_part,
+        bias_part if with_bias else g_part,
         total_M_pad // 4,
         n_pblk,
         P,

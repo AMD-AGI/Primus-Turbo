@@ -47,6 +47,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
 from primus_turbo.flydsl.utils.prims import (
     atomic_add,
     cast,
+    ceildiv,
 )
 
 _WARP = 64
@@ -97,15 +98,19 @@ def _make_grouped_gemm_combine(
     out_fp16=False,
     layout="nt",
     has_grad_gate=False,
+    has_bias=False,
 ):
     K = hidden_size
     gemm_tile = functools.partial(gemm_bf16_tile, layout, pair_n=not out_fp16)
-    assert out_features % BLOCK_N == 0, "out_features must be a multiple of BLOCK_N"
+    # the tile takes a 64- or 128-column tail (n_tail below); other remainders have no feed variant
+    assert out_features % BLOCK_N in (0, 64, 128), (
+        f"out_features % BLOCK_N must be 0, 64 or 128, got {out_features % BLOCK_N}"
+    )
     assert num_max_pool_tokens % BLOCK_M == 0, "num_max_pool_tokens must be a multiple of BLOCK_M"
     assert out_features % _PVEC == 0, "out_features must be a multiple of 8 (bf16 vec)"
     assert num_topk >= 1, "num_topk must be >= 1"
     SharedStorage = _make_shared_storage(BLOCK_M, BLOCK_N)
-    num_tiles_n = out_features // BLOCK_N
+    num_tiles_n = ceildiv(out_features, BLOCK_N)
     worst_case_tiles = num_max_pool_tokens // BLOCK_M
     num_gemm_blocks = worst_case_tiles * num_tiles_n
     combine_token_bytes = num_max_routes * out_features * 2
@@ -128,6 +133,8 @@ def _make_grouped_gemm_combine(
         NUM_TOKENS_PER_RANK: fx.Tensor,
         GRAD_GATE: fx.Tensor,
         GRAD_TOPK_WEIGHTS: fx.Tensor,
+        BIAS: fx.Tensor,  # bf16 [num_local_experts, out_features], added as BIAS[e] * BIAS_SCALE[row]
+        BIAS_SCALE: fx.Tensor,  # f32 [rows]: the routing weight of each pool row
         sym_buffer: SymBuffer,
         c_n: fx.Int32,
         COMBINE_PARITY: fx.Tensor,
@@ -192,6 +199,15 @@ def _make_grouped_gemm_combine(
         grad_topk_weights_res = (
             create_buffer_resource(GRAD_TOPK_WEIGHTS, max_size=True) if has_grad_gate else None
         )
+        bias = (
+            (
+                fx.arith.ArithValue(fx.arith.index_cast(fx.T.i64, extract_base_index(BIAS)), signed=True),
+                tile_to_expert_res,
+                create_buffer_resource(BIAS_SCALE, max_size=True),
+            )
+            if has_bias
+            else None
+        )
 
         num_lead_gemm_blocks = num_tiles_m * fx.Int32(num_tiles_n * _LEAD_GEMM_PERCENT // 100)
         is_combine, is_reduce, gemm_block_idx, combine_block_idx, reduce_block_idx = _block_role(
@@ -254,6 +270,7 @@ def _make_grouped_gemm_combine(
                         reduce_bank=reduce_bank,
                         grad_gate_res=grad_gate_res,
                         has_grad_gate=has_grad_gate,
+                        bias=bias,
                     )
         elif is_reduce:
             # reduce role: align empty tile_m flags to the never-reset expected, then sum primary routes
@@ -373,6 +390,8 @@ def _compiled_grouped_gemm_combine(
     NUM_TOKENS_PER_RANK,
     GRAD_GATE,
     GRAD_TOPK_WEIGHTS,
+    BIAS,
+    BIAS_SCALE,
     sym_buffer,
     c_n,
     COMBINE_PARITY,
@@ -396,8 +415,9 @@ def _compiled_grouped_gemm_combine(
     nt_vmcnt: fx.Constexpr[int] = 3,
     agpr_alloc: fx.Constexpr[int] = 0,
     waves: fx.Constexpr[int] = 2,
+    has_bias: fx.Constexpr[bool] = False,
 ):
-    num_tiles_n = out_features // BLOCK_N
+    num_tiles_n = ceildiv(out_features, BLOCK_N)
     num_gemm_blocks = (num_max_pool_tokens // BLOCK_M) * num_tiles_n
     num_combine_cu = (
         _NUM_COMBINE_CU_SHORT_GEMM if hidden_size <= _SHORT_GEMM_MAX_K else _NUM_COMBINE_CU_LONG_GEMM
@@ -419,6 +439,7 @@ def _compiled_grouped_gemm_combine(
         out_fp16,
         _LAYOUTS[layout_code],
         has_grad_gate,
+        has_bias,
     )
     # reduce blocks come last, so they are dispatched only after every GEMM and combine block
     grid_size = num_gemm_blocks + num_combine_cu + _NUM_REDUCE_CU
@@ -443,6 +464,8 @@ def _compiled_grouped_gemm_combine(
         NUM_TOKENS_PER_RANK,
         GRAD_GATE,
         GRAD_TOPK_WEIGHTS,
+        BIAS,
+        BIAS_SCALE,
         sym_buffer,
         c_n,
         COMBINE_PARITY,
@@ -462,7 +485,11 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
     layout="nt",
     BM=256,
     BN=256,
+    bias=None,
+    bias_scale=None,
 ):
+    """``bias`` [num_local_experts, out_features] adds ``bias[e] * bias_scale[row]`` to every pool row's
+    GEMM output before the push; ``bias_scale`` is the per-pool-row routing weight."""
     assert layout in ("nt", "nn"), f"unsupported combine layout {layout}"
     assert x.dtype == torch.bfloat16 and l2_weights.dtype == torch.bfloat16
     symm = get_symm_buffer_for_mega_moe()
@@ -486,6 +513,14 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
     num_experts = int(symm.num_experts)
     assert num_topk >= 1 and num_experts > 0, "topk reduce needs num_topk>=1 and num_experts>0"
     assert topk_indices.dtype == torch.int64, "the reduce reads topk_indices as i64"
+    has_bias = bias is not None
+    if has_bias:
+        assert bias.dtype == torch.bfloat16 and tuple(bias.shape) == (G, out_features), (
+            f"bias must be bf16 [{G}, {out_features}], got {bias.dtype} {tuple(bias.shape)}"
+        )
+        assert bias_scale is not None and bias_scale.dtype == torch.float32 and bias_scale.numel() == rows, (
+            "an fc2 bias needs the f32 routing weight of every dispatched pool row"
+        )
 
     # combine blocks spin on GEMM tiles, so they must leave CUs for the GEMM to finish
     assert _NUM_COMBINE_CU_SHORT_GEMM < torch.cuda.get_device_properties(x.device).multi_processor_count
@@ -521,6 +556,9 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
         # without a grad gate both gate arguments are traced out; any device i32 tensor fills them
         grad_gate.contiguous() if has_grad_gate else handle.num_tile_blocks,
         grad_topk_weights if has_grad_gate else handle.num_tile_blocks,
+        # traced out without a bias, like the gate arguments
+        bias.contiguous() if has_bias else handle.num_tile_blocks,
+        bias_scale.contiguous() if has_bias else handle.num_tile_blocks,
         sym_buffer,
         out_features,
         COMBINE_PARITY=symm._combine_parity,
@@ -541,5 +579,6 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
         has_grad_gate=has_grad_gate,
         out_fp16=False,
         stream=torch.cuda.current_stream(),
+        has_bias=has_bias,
     )
     return output, grad_topk_weights

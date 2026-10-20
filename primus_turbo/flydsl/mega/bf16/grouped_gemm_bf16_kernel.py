@@ -348,8 +348,9 @@ def grouped_gemm_bf16_variable_k_tile(
     if const_expr(MASK_N):
         n_in = (block_n + 1) * BLOCK_N <= fx.Int32(OUT_N)
         n_bd = (block_n + 1) * BLOCK_N > fx.Int32(OUT_N)
-        interior = n_in if interior is None else arith.andi(interior, n_in)
-        boundary = n_bd if boundary is None else arith.ori(boundary, n_bd)
+        # `&` / `|`, not arith.andi / ori: a caller's block index may be a DSL Int32, whose compares are Booleans
+        interior = n_in if interior is None else interior & n_in
+        boundary = n_bd if boundary is None else boundary | n_bd
 
     def _loop(live):
         emit_for(n_chunks, lambda iv: _chunk(iv, live))

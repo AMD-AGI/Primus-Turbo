@@ -97,6 +97,19 @@ halves. `GLUActivation.swigluoai()` is MiniMax-M3's `swigluoai` (Megatron's `qui
 1.702, offset 1, gate clamped from above only, up clamped to ±7. The spec is a compile-time constant
 of the kernels, so it has no runtime cost, and the default reproduces the SiLU kernels bit for bit.
 
+The staged ops (`fused_mega_moe_stage2`, `fused_mega_moe_fp8_stage2`) also take per-expert biases,
+`fc1_bias` [E_local, 2I] and `fc2_bias` [E_local, H], with Megatron's TEGroupedMLP semantics:
+`y = sum_k p_k (act(x @ w1ᵀ + fc1_bias) @ w2ᵀ + fc2_bias)`, the fc1 bias added before the activation's
+clamp (GPT-OSS). In BF16 the fc1 bias rides the SwiGLU kernels and the fc2 bias the combine's fold
+sum; their gradients are two-phase pool reductions in a fixed order. In MXFP8 the fc1 bias rides the
+fp8 SwiGLU kernels (the backward emits the per-32-row column sums its gradient is made of), and the
+fc2 bias is added after the reduce, on the token's own rank, from the EP-gathered bias.
+
+BF16 takes a hidden / intermediate that leaves a 64- or 128-column tail of the 256-wide GEMM tile
+(GPT-OSS's 2880). The MXFP8 kernels need hidden % 1024 == 0 and intermediate % 256 == 0; other
+shapes run zero-padded up to that grid (2880 runs as 3072), which is exact, and aligned shapes are
+untouched.
+
 ## Performance
 
 ### Test Configuration

@@ -11,7 +11,7 @@ dual-quant, and the dW2 wgrad. The dual-quant emits grad_l1 only as quantized op
 backward returns them for the op layer to hand to stage1 out of band.
 """
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 
@@ -27,6 +27,9 @@ from primus_turbo.flydsl.mega.fp8.combine_autotune import env_combine_cu
 from primus_turbo.flydsl.utils.glu_activation import GLUActivation
 from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.core.low_precision import ScalingGranularity
+from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_bias_impl import (
+    fc1_bias_backward_from_block_sums,
+)
 from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_fp8_weights import (
     _DW_FP8_FORMAT,
     _w2_fp8_cached,
@@ -39,6 +42,7 @@ from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp8_impl import (
 _HANDLE_GROUP_LENS = 9  # fp8 dispatch handle index: per-local-expert real token counts
 _HANDLE_GROUP_OFFS = 10  # ... and their prefix over the block_m-padded pool
 
+_H_TILE_TO_EXPERT = 7  # fp8 dispatch handle index of tile_to_expert (pool block -> local expert)
 _H_NUM_TILE_BLOCKS = 11  # fp8 dispatch handle index of num_tile_blocks (device real-tile count)
 
 # The L1 comm/preshuffle split is left to the dispatch kernel's signature default, whose measured
@@ -103,12 +107,21 @@ def fused_mega_moe_stage2_forward_fp8_impl(
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
     activation: Optional[GLUActivation] = None,
+    fc1_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """SwiGLU + mxfp8 quant + grouped fc2 GEMM + combine (nt). Returns y."""
+    """SwiGLU + mxfp8 quant + grouped fc2 GEMM + combine (nt). Returns y.
+
+    ``fc1_bias`` [E_local, 2I] (as wide as ``l1``) is added to ``l1`` inside the activation."""
     topk_idx = topk_idx.to(torch.int64)
 
     # bound swiglu by THIS handle's tile count (per-forward, not shared symm)
-    act_fp8, act_a_sp = swiglu_mxfp8_flydsl_kernel(l1, handle[_H_NUM_TILE_BLOCKS], activation=activation)
+    act_fp8, act_a_sp = swiglu_mxfp8_flydsl_kernel(
+        l1,
+        handle[_H_NUM_TILE_BLOCKS],
+        activation=activation,
+        bias=fc1_bias,
+        tile_to_expert=handle[_H_TILE_TO_EXPERT],
+    )
 
     w2q, w2s = _w2_fp8_cached(w2)
 
@@ -134,13 +147,15 @@ def fused_mega_moe_stage2_backward_fp8_impl(
     group,
     colwise_meta: dict,
     activation: Optional[GLUActivation] = None,
-) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
+    fc1_bias: Optional[torch.Tensor] = None,
+):
     """L2 dgrad + fused SwiGLU^T dual-quant + dW2 (variable-K wgrad).
 
-    Returns ``(grad_l1_rowwise_fp8, grad_l1_colwise_fp8, grad_gate, dW2)`` -- the rowwise pair feeds
-    stage1's L1 dgrad, the colwise pair its dW1. ``colwise_meta`` is stage1's, reused here so the
-    dual-quant and dW2 skip a second D2H of the same group offsets. Every row-indexed tensor here
-    spans the forward's rows, ``l1.shape[0]``.
+    Returns ``(grad_l1_rowwise_fp8, grad_l1_colwise_fp8, grad_gate, dW2, d_fc1_bias)`` -- the
+    rowwise pair feeds stage1's L1 dgrad, the colwise pair its dW1; ``d_fc1_bias`` is None without
+    ``fc1_bias``. ``colwise_meta`` is stage1's, reused here so the dual-quant and dW2 skip a second
+    D2H of the same group offsets. Every row-indexed tensor here spans the forward's rows,
+    ``l1.shape[0]``.
     """
     group_lens = handle[_HANDLE_GROUP_LENS]
     group_offs = handle[_HANDLE_GROUP_OFFS]
@@ -150,7 +165,13 @@ def fused_mega_moe_stage2_backward_fp8_impl(
     grad_swiglu, dispatch_l2_grad_fp8 = _dispatch_l2_dgrad_fp8(dy, w2, handle, pool_rows=l1.shape[0])
 
     # SwiGLU^T (re-inject routing weight) + gate grad, fused with grad_l1's rowwise (L1 dgrad) and
-    # colwise (dW1) quant -- grad_l1 has no other consumer, so it never reaches HBM
+    # colwise (dW1) quant -- grad_l1 has no other consumer, so it never reaches HBM; the fc1 bias
+    # gradient leaves as the kernel's per-32-row-block column sums instead
+    bias_part = (
+        None
+        if fc1_bias is None
+        else torch.empty((colwise_meta["n_pblk"], l1.shape[1]), dtype=torch.float32, device=l1.device)
+    )
     (
         gl1_q_row,
         gl1_a_sp,
@@ -165,6 +186,13 @@ def fused_mega_moe_stage2_backward_fp8_impl(
         _DW_FP8_FORMAT,
         meta=colwise_meta,
         activation=activation,
+        bias=fc1_bias,
+        bias_part=bias_part,
+    )
+    d_fc1_bias = (
+        None
+        if fc1_bias is None
+        else fc1_bias_backward_from_block_sums(bias_part, colwise_meta["offs_pc"], fc1_bias.dtype)
     )
 
     # dW2 = dispatched(dy)^T @ act_weighted -- must run before anything overwrites symm.pool_fp8
@@ -176,4 +204,4 @@ def fused_mega_moe_stage2_backward_fp8_impl(
         meta=colwise_meta,
     )
 
-    return (gl1_q_row, gl1_a_sp), (gl1_q_col, gl1_s_col), grad_gate, dW2
+    return (gl1_q_row, gl1_a_sp), (gl1_q_col, gl1_s_col), grad_gate, dW2, d_fc1_bias

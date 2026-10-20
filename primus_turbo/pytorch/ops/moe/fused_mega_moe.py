@@ -237,7 +237,9 @@ class FusedMegaMoEStage1Function(torch.autograd.Function):
 
 
 class FusedMegaMoEStage2Function(torch.autograd.Function):
-    """Stage2 gate-down: SwiGLU + grouped GEMM2 + combine (owns w2). Output is the MoE result y."""
+    """Stage2 gate-down: SwiGLU + grouped GEMM2 + combine (owns w2). Output is the MoE result y.
+
+    Stage2 also applies both expert biases (fc1's sits in front of the activation it owns)."""
 
     @staticmethod
     def forward(
@@ -247,6 +249,8 @@ class FusedMegaMoEStage2Function(torch.autograd.Function):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         w2: torch.Tensor,
+        fc1_bias: Optional[torch.Tensor],
+        fc2_bias: Optional[torch.Tensor],
         group: ProcessGroup,
         activation: Optional[GLUActivation],
         *handle,
@@ -256,7 +260,9 @@ class FusedMegaMoEStage2Function(torch.autograd.Function):
             topk_idx = topk_idx.to(torch.int64)
             handle = DispatchHandle(*handle)
 
-            y = fused_mega_moe_stage2_forward_impl(l1_out, w2, handle, topk_idx, dispatch_weights, activation)
+            y = fused_mega_moe_stage2_forward_impl(
+                l1_out, w2, handle, topk_idx, dispatch_weights, activation, fc1_bias, fc2_bias
+            )
 
             ctx.set_materialize_grads(False)
             if any(ctx.needs_input_grad):
@@ -264,7 +270,7 @@ class FusedMegaMoEStage2Function(torch.autograd.Function):
                 ctx.activation = activation
                 ctx.handle = handle
                 # dispatch_weights scales the SwiGLU output in forward and is its SwiGLU^T scale in backward
-                ctx.save_for_backward(l1_out, dispatch_weights, w2)
+                ctx.save_for_backward(l1_out, dispatch_weights, w2, fc1_bias, fc2_bias)
             return y
 
     @staticmethod
@@ -275,20 +281,22 @@ class FusedMegaMoEStage2Function(torch.autograd.Function):
             if grad_y is None:
                 return (None,) * len(ctx.needs_input_grad)
             handle = ctx.handle
-            l1_out, dispatch_weights, w2 = ctx.saved_tensors
+            l1_out, dispatch_weights, w2, fc1_bias, fc2_bias = ctx.saved_tensors
 
-            grad_l1, grad_gate, dW2 = fused_mega_moe_stage2_backward_impl(
-                grad_y, l1_out, dispatch_weights, w2, handle, ctx.group, ctx.activation
+            grad_l1, grad_gate, dW2, d_fc1_bias, d_fc2_bias = fused_mega_moe_stage2_backward_impl(
+                grad_y, l1_out, dispatch_weights, w2, handle, ctx.group, ctx.activation, fc1_bias, fc2_bias
             )
 
-            # grads for (l1_out, dispatch_weights, topk_idx, topk_weights, w2, group, activation, *handle)
-            # dispatch_weights slot carries grad_gate back to stage1.backward.
+            # grads for (l1_out, dispatch_weights, topk_idx, topk_weights, w2, fc1_bias, fc2_bias, group,
+            # activation, *handle). The dispatch_weights slot carries grad_gate back to stage1.backward.
             return (
                 grad_l1,
                 grad_gate,
                 None,
                 None,
                 dW2.to(w2.dtype),
+                d_fc1_bias,
+                d_fc2_bias,
                 None,
                 None,
                 *((None,) * len(handle)),
@@ -320,12 +328,17 @@ def fused_mega_moe_stage2(
     w2: torch.Tensor,
     group: ProcessGroup,
     activation: Optional[GLUActivation] = None,
+    fc1_bias: Optional[torch.Tensor] = None,
+    fc2_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Stage2 gate-down. Consumes stage1's ``(l1_out, dispatch_weights, handle)``; returns y.
 
     Stage2 owns the gated activation, so ``activation`` (``None`` = SiLU-SwiGLU) is given here only.
+    The optional expert biases follow Megatron's TEGroupedMLP: ``fc1_bias`` [E_local, 2I] is added to
+    the fc1 output before the activation (and its clamp), ``fc2_bias`` [E_local, H] to each expert's
+    fc2 output scaled by the routing weight, i.e. ``y = sum_k p_k (act_k @ w2^T + fc2_bias)``.
     """
     # topk_weights stays for API compatibility; stage2 gets the routing weights through dispatch_weights
     return FusedMegaMoEStage2Function.apply(
-        l1_out, dispatch_weights, topk_idx, topk_weights, w2, group, activation, *handle
+        l1_out, dispatch_weights, topk_idx, topk_weights, w2, fc1_bias, fc2_bias, group, activation, *handle
     )
