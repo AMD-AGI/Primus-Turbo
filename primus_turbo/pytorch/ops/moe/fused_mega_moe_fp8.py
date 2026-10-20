@@ -58,16 +58,28 @@ class _Fp8StageState:
     The forward half (``pool_x_colwise`` / ``colwise_meta``, produced by stage1's pool requant) rides
     along because stage2's dual-quant and dW2 need the same grouped meta.
 
-    One instance per stage1 call; both stages hold it on their ``ctx``.
+    One instance per stage1 call; both stages hold it on their ``ctx`` until their backward is done.
     """
 
-    __slots__ = ("pool_x_colwise", "colwise_meta", "grad_l1_rowwise_fp8", "grad_l1_colwise_fp8")
+    __slots__ = (
+        "pool_x_colwise",
+        "colwise_meta",
+        "grad_l1_rowwise_fp8",
+        "grad_l1_colwise_fp8",
+    )
 
     def __init__(self):
         self.pool_x_colwise = None
         self.colwise_meta = None
         self.grad_l1_rowwise_fp8 = None
         self.grad_l1_colwise_fp8 = None
+
+
+# Each backward drops the per-layer state it consumed instead of letting the graph hold it until the
+# whole step's backward is over, so the same forward cannot be backpropagated twice.
+_SECOND_BACKWARD = (
+    "fused_mega_moe_fp8: this forward was already backpropagated; retain_graph is not supported"
+)
 
 
 class FusedMegaMoEFP8Stage1Function(torch.autograd.Function):
@@ -135,25 +147,31 @@ class FusedMegaMoEFP8Stage1Function(torch.autograd.Function):
         """dx / grad_topk_weights + dW1. ``grad_l1`` is always None -- the real grad_l1 arrives
         pre-quantized through ``ctx.state``; ``grad_dispatch_weights`` couriers ``grad_gate``."""
         with torch.profiler.record_function("mega_moe_fp8_stage1_backward"):
-            state = ctx.state
-            if state.grad_l1_rowwise_fp8 is None:  # stage2.backward never ran -> nothing to do
+            state, handle = ctx.state, ctx.handle
+            if state is None:
+                raise RuntimeError(_SECOND_BACKWARD)
+            ctx.state = ctx.handle = None
+            grad_l1_rowwise_fp8, grad_l1_colwise_fp8 = state.grad_l1_rowwise_fp8, state.grad_l1_colwise_fp8
+            pool_x_colwise, colwise_meta = state.pool_x_colwise, state.colwise_meta
+            state.grad_l1_rowwise_fp8 = state.grad_l1_colwise_fp8 = None
+            state.pool_x_colwise = state.colwise_meta = None
+            if grad_l1_rowwise_fp8 is None:  # stage2.backward never ran -> nothing to do
                 return (None,) * 6
             (w1,) = ctx.saved_tensors
 
             dx, grad_topk_weights, dW1 = fused_mega_moe_stage1_backward_fp8_impl(
-                state.grad_l1_rowwise_fp8,
-                state.grad_l1_colwise_fp8,
+                grad_l1_rowwise_fp8,
+                grad_l1_colwise_fp8,
                 grad_dispatch_weights,
-                state.pool_x_colwise,
-                state.colwise_meta,
+                pool_x_colwise,
+                colwise_meta,
                 w1,
-                ctx.handle,
+                handle,
                 ctx.group,
                 ctx.topk_idx,
                 ctx.num_tokens,
                 ctx.num_topk,
             )
-            state.grad_l1_rowwise_fp8 = state.grad_l1_colwise_fp8 = None
 
             # grads for (x, topk_idx, topk_weights, w1, group, state)
             return dx, None, grad_topk_weights, dW1.to(w1.dtype), None, None
@@ -207,12 +225,15 @@ class FusedMegaMoEFP8Stage2Function(torch.autograd.Function):
         """dW2 + grad_gate (on the ``dispatch_weights`` slot). The quantized grad_l1 pair goes to
         stage1 through ``ctx.state``, so the ``l1`` slot returns None."""
         with torch.profiler.record_function("mega_moe_fp8_stage2_backward"):
-            handle = ctx.handle
+            state, handle = ctx.state, ctx.handle
+            if state is None:
+                raise RuntimeError(_SECOND_BACKWARD)
+            # stage1's ctx still holds both for its own backward
+            ctx.state = ctx.handle = None
             n_in = 8 + len(handle)
             if grad_y is None:
                 return (None,) * n_in
             l1, dispatch_weights, w2 = ctx.saved_tensors
-            state = ctx.state
 
             (
                 grad_l1_rowwise_fp8,
@@ -258,6 +279,11 @@ def fused_mega_moe_fp8_stage1(
     ``dispatch_weights``, ``handle`` and ``state`` are opaque forward state; pass them straight into
     :func:`fused_mega_moe_fp8_stage2`. Pass ``w1`` directly -- its mxfp8 quant is maintained
     internally by a version-keyed cache.
+
+    After the dispatch prologue the forward reads the real row counts back once (a D2H, like
+    DeepEP's notify), so every tensor indexed by dispatched row -- ``l1``, the dW1 operand, the
+    handle's row maps and the per-call intermediates of both stages, forward and backward -- is
+    allocated at this rank's real rows. That sync also keeps the op out of CUDA graphs.
     """
     state = _Fp8StageState()
     l1, dispatch_weights, *handle = FusedMegaMoEFP8Stage1Function.apply(

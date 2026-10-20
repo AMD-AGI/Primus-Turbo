@@ -58,8 +58,10 @@ from flydsl.expr.typing import Vector as Vec
 from primus_turbo.flydsl.mega.fp8.gemm_helper import (
     _PRESHUF_KT,
     build_preshuffle_ab_kernel,
+    make_row_band_resource,
     run_compiled,
 )
+from primus_turbo.flydsl.utils import buffer_ops as _buffer_ops
 from primus_turbo.flydsl.utils.buffer_ops import buffer_load, buffer_store, create_buffer_resource
 from primus_turbo.flydsl.utils.prims import ceildiv
 
@@ -321,10 +323,9 @@ def _compile_colwise_quant_grouped(F: int, is_e5m2: bool, BT: int = 256):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         pmb = bid // fx.Int32(n_ftile)  # padded 32-M block index
-        f = (bid % fx.Int32(n_ftile)) * fx.Int32(BT) + tid  # output column (input free-col)
+        f_base = (bid % fx.Int32(n_ftile)) * fx.Int32(BT)
+        f = f_base + tid  # output column (input free-col)
 
-        xr = create_buffer_resource(X, max_size=True)  # bf16 [total_M, F]
-        qr = create_buffer_resource(Q, max_size=True)  # fp8 [F, total_M_pad] i32 [F, mpad_i32]
         sr = create_buffer_resource(S, max_size=True)  # raw uint8 [F, npblk]
         b2g = create_buffer_resource(BLK2GRP, max_size=True)  # i32 [npblk] -> group id
         lr = create_buffer_resource(LENS, max_size=True)  # i32 [G] unpadded lens
@@ -341,20 +342,29 @@ def _compile_colwise_quant_grouped(F: int, is_e5m2: bool, BT: int = 256):
         in_off_g = buffer_load(ofr, g, vec_width=1, dtype=fx.T.i32)
         len_g = buffer_load(lr, g, vec_width=1, dtype=fx.T.i32)
         m_local0 = pmb * fx.Int32(MXFP8_BLOCK) - fx.arith.ArithValue(offs_pc_g)  # M-offset within group
+        # X [total_M, F] and Q [F, total_M_pad] can pass 2 GiB: X is addressed from this block's
+        # first row and Q from this F-tile's first row, in 64-bit, so the 32-bit offsets stay local.
+        # The block may start past X's last row (a pad block), so pad rows are masked, not read.
+        xr = make_row_band_resource(
+            _buffer_ops.extract_base_index(X),
+            fx.arith.ArithValue(in_off_g) + fx.arith.ArithValue(m_local0),
+            fx.Int32(0x7FFFFFFF),
+            F,
+            2,
+            span_rows=MXFP8_BLOCK,
+        )
+        qr = make_row_band_resource(_buffer_ops.extract_base_index(Q), f_base, F, mpad_i32, 4, span_rows=BT)
 
         vals = []
         for i in range_constexpr(MXFP8_BLOCK):
             m_local = fx.arith.ArithValue(m_local0) + fx.Int32(i)
             real = m_local < fx.arith.ArithValue(len_g)
-            # clamp pad rows to the group's first row (in-bounds); select 0 for the value.
-            m_eff = fx.arith.select(real, m_local, fx.Int32(0))
-            row = fx.arith.ArithValue(in_off_g) + fx.arith.ArithValue(m_eff)
-            v = buffer_load(xr, row * fx.Int32(F) + f, vec_width=1, dtype=fx.T.bf16)
+            v = buffer_load(xr, fx.Int32(i * F) + f, vec_width=1, dtype=fx.T.bf16, mask=real)
             fv = fx.arith.select(real, fx.arith.extf(fx.T.f32, v), fx.Float32(0.0))
             vals.append(fx.arith._to_raw(fv))
 
         words, biased = _e8m0_quant_pack(vals, round_add, target_pow2, lo, hi, cvt, zero_i32)
-        base_i32 = f * fx.arith.ArithValue(mpad_i32) + pmb * fx.Int32(blk_i32)
+        base_i32 = tid * fx.arith.ArithValue(mpad_i32) + pmb * fx.Int32(blk_i32)
         buffer_store(Vec.from_elements(words[0:4], fx.Int32).ir_value(), qr, base_i32)
         buffer_store(Vec.from_elements(words[4:8], fx.Int32).ir_value(), qr, base_i32 + fx.Int32(4))
         buffer_store(fx.arith.ArithValue(biased).trunci(fx.T.i8), sr, f * fx.arith.ArithValue(npblk) + pmb)
@@ -489,9 +499,7 @@ def _compile_colwise_requant_grouped_fp8in(F: int, is_e5m2_out: bool, BT: int = 
         f_base = ftile * fx.Int32(BT)
         pmb0 = mwg * fx.Int32(MB)  # first padded 32-M block
 
-        xqr = create_buffer_resource(XQ, max_size=True)  # fp8 (i8 view) [total_M, F]
         xsr = create_buffer_resource(XS, max_size=True)  # raw E8M0 uint8 [total_M, F//32]
-        qr = create_buffer_resource(Q, max_size=True)  # fp8 [F, total_M_pad] i32 [F, mpad_i32]
         sr = create_buffer_resource(S, max_size=True)  # raw uint8 [F, npblk]
         b2g = create_buffer_resource(BLK2GRP, max_size=True)  # i32 [npblk] -> group id
         lr = create_buffer_resource(LENS, max_size=True)  # i32 [G] unpadded lens
@@ -512,6 +520,18 @@ def _compile_colwise_requant_grouped_fp8in(F: int, is_e5m2_out: bool, BT: int = 
         m_local0 = pmb0 * fx.Int32(MXFP8_BLOCK) - fx.arith.ArithValue(offs_pc_g)
         scol_base = ftile * fx.Int32(SCPT)  # first rowwise scale col of this F-tile
         scol_local = tid // fx.Int32(MXFP8_BLOCK)  # this column's scol within the tile
+        # XQ [total_M, F] and Q [F, total_M_pad] can pass 2 GiB: XQ is addressed from this
+        # workgroup's first row and Q from its first F-row, in 64-bit. The rows may start past
+        # XQ's end (a pad block), so pad rows are masked, not read.
+        xqr = make_row_band_resource(
+            _buffer_ops.extract_base_index(XQ),
+            fx.arith.ArithValue(in_off_g) + fx.arith.ArithValue(m_local0),
+            fx.Int32(0x7FFFFFFF),
+            F,
+            1,
+            span_rows=MROWS,
+        )
+        qr = make_row_band_resource(_buffer_ops.extract_base_index(Q), f_base, F, mpad_i32, 4, span_rows=BT)
 
         def row_of(r):
             m_local = fx.arith.ArithValue(m_local0) + r
@@ -537,8 +557,8 @@ def _compile_colwise_requant_grouped_fp8in(F: int, is_e5m2_out: bool, BT: int = 
             vals = []
             for i in range_constexpr(MXFP8_BLOCK):
                 r = mb * MXFP8_BLOCK + i
-                real, row = row_of(fx.Int32(r))
-                qb = buffer_load(xqr, row * fx.Int32(F) + f, vec_width=1, dtype=fx.T.i8)
+                real, _ = row_of(fx.Int32(r))
+                qb = buffer_load(xqr, fx.Int32(r * F) + f, vec_width=1, dtype=fx.T.i8, mask=real)
                 qb_i32 = fx.arith.ArithValue(qb).extui(fx.T.i32)
                 fq = cvt_f32_fp8(fx.T.f32, fx.arith._to_raw(qb_i32), 0)
                 sv_s = Vec(
@@ -573,7 +593,7 @@ def _compile_colwise_requant_grouped_fp8in(F: int, is_e5m2_out: bool, BT: int = 
             sv = Vec(
                 fx.make_view(fx.add_offset(outq_lds.ptr, fx.make_int_tuple(k)), fx.make_layout(1, 1)).load()
             )
-            gi = (f_base + col) * fx.arith.ArithValue(mpad_i32) + pmb0 * fx.Int32(blk_i32) + j
+            gi = col * fx.arith.ArithValue(mpad_i32) + pmb0 * fx.Int32(blk_i32) + j
             buffer_store(fx.Int32(sv[0]), qr, gi)
 
     @flyc.jit

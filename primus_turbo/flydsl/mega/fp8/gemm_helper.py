@@ -599,7 +599,7 @@ class ScaleS2R:
     GROUP_ROWS = 64
     GROUP_TILES = GROUP_ROWS // 16
 
-    def __init__(self, sp_tensor, dim, K, n_tiles, pack=1, k128p=None):
+    def __init__(self, sp_tensor, dim, K, n_tiles, pack=1, k128p=None, row0=None):
         # Sub-tiles are contiguous per lane, so one buffer_load covers them only while a wave
         # stays inside a single group; n_tiles past GROUP_TILES would straddle two.
         assert n_tiles in (1, 2, 4), f"ScaleS2R n_tiles must sub-divide {self.GROUP_TILES}, got {n_tiles}"
@@ -608,17 +608,30 @@ class ScaleS2R:
         self.K128p = ceildiv(self.K128, self.PACK) if k128p is None else k128p
         self.n_tiles = n_tiles
         self.lane = fx.thread_idx.x % 64  # == (lane//16)*16 + lane%16
+        self.row0 = row0
+        group_bytes = self.K128p * 64 * self.GROUP_TILES * 4  # int32 records per 64-row group
+        if row0 is not None:
+            # ``row0`` (a GROUP_ROWS multiple, e.g. the tile's first row) bases the descriptor at
+            # its group in 64-bit, so a plane past 4 GiB stays reachable with 32-bit offsets.
+            self.rsrc = make_row_band_resource(
+                _buffer_ops.extract_base_index(sp_tensor),
+                row0 // self.GROUP_ROWS,
+                (dim + self.GROUP_ROWS - 1) // self.GROUP_ROWS,
+                group_bytes,
+                1,
+            )
+            return
         # cdiv (not floor): a non-GROUP_ROWS-multiple ``dim`` (general M) still needs the
         # partial last 64-row group resident so its valid rows read real scales; the
         # group's OOB rows were preshuffle-masked to 0 and StoreC drops their output.
-        nbytes = ceildiv(dim, self.GROUP_ROWS) * self.K128p * 64 * self.GROUP_TILES * 4  # int32 records
+        nbytes = ceildiv(dim, self.GROUP_ROWS) * group_bytes
         self.rsrc = _buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
 
     def load(self, base, k, kbase=0):
         """base: runtime global row/col base for this (region, wave). Returns n_tiles i32
         (packed dword for K-group kbase + k//PACK; caller selects byte k%PACK via MFMA
         op_sel). ``kbase``: packed-K base of the group's own region (0 = global packing)."""
-        grp = base // self.GROUP_ROWS
+        grp = (base if self.row0 is None else base - self.row0) // self.GROUP_ROWS
         idx = ((grp * self.K128p + k // self.PACK + kbase) * 64 + self.lane) * self.GROUP_TILES
         if self.n_tiles != self.GROUP_TILES:  # a full-group wave always starts at sub-tile 0
             idx = idx + (base % self.GROUP_ROWS) // 16  # first dword of the sub-tile it owns

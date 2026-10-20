@@ -44,6 +44,8 @@ __all__ = [
     "SymLayout",
     "SymmBuffer",
     "build_sym_layout",
+    "fp8_comb_bytes",
+    "sym_layout_key",
     "sym_map",
     "get_symm_buffer_size_for_mega_moe",
     "get_symm_buffer_for_mega_moe",
@@ -96,6 +98,28 @@ _SIGNAL_DTYPES = {
     "comb": torch.bfloat16,
     "reduce_flag": torch.int64,  # 2 banks x combine_slots (combine->reduce epoch gate)
 }
+# mxfp8 comb: [combine_slots * H] fp8 payload, then [combine_slots * H/32] raw E8M0 bytes
+_SIGNAL_DTYPES_MXFP8 = {**_SIGNAL_DTYPES, "comb": torch.uint8}
+
+
+def fp8_comb_bytes(combine_slots, hidden):
+    """Bytes of the mxfp8 ``comb``: every slot's fp8 row, then every slot's E8M0 block scales."""
+    return combine_slots * (hidden + hidden // 32)
+
+
+def _pool_capacity(world_size, experts_per_rank, num_tokens, num_topk, block_m, pool_mult, use_mxfp8):
+    """Pool rows: the most any rank can receive, or ``pool_mult`` x the average.
+
+    A token's top-k experts are distinct, so a rank receives at most ``min(topk, experts_per_rank)``
+    pairs per peer token; each local expert pads its rows to ``block_m``. The fp8 kernels address
+    every row-indexed tensor in 64-bit, so nothing caps that worst case. A ``pool_mult`` pool trades
+    memory for a bound the routing can pass, in which case the dispatch raises instead of dropping
+    rows. The bf16 mirror keeps ``pool_mult=2``."""
+    if pool_mult is None and use_mxfp8:
+        rows = world_size * num_tokens * min(num_topk, experts_per_rank)
+        return _align(rows + experts_per_rank * block_m, block_m)
+    rows = (2 if pool_mult is None else pool_mult) * num_tokens * num_topk
+    return _align(rows + experts_per_rank * block_m, block_m)
 
 
 def _build_layout_spec(
@@ -109,19 +133,20 @@ def _build_layout_spec(
     *,
     block_m=256,
     block_n=256,
-    pool_mult=2,
+    pool_mult=None,
     use_mxfp8=False,
 ):
     """Size both heaps directly from ``sym_layout``; attach torch dtypes for the views.
 
     Pool capacity / blocks / combine slots are the host allocation policy (driven by
-    ``block_m`` / ``pool_mult``); the byte offsets + heap totals come from
+    ``block_m`` / ``pool_mult``, see ``_pool_capacity``); the byte offsets + heap totals come from
     ``sym_layout.layout`` so host views and device addresses cannot drift apart.
     Returns ``(main_spec, signal_spec, num_bytes, signal_bytes, meta)`` where each
     spec maps ``name -> (offset, torch_dtype, numel)``."""
     experts_per_rank = num_experts // world_size
-    avg_recv_tokens = num_max_tokens_per_rank * num_topk
-    num_max_pool_tokens = _align(pool_mult * avg_recv_tokens + experts_per_rank * block_m, block_m)
+    num_max_pool_tokens = _pool_capacity(
+        world_size, experts_per_rank, num_max_tokens_per_rank, num_topk, block_m, pool_mult, use_mxfp8
+    )
     num_pool_blocks = num_max_pool_tokens // block_m
     combine_slots = num_topk * num_max_tokens_per_rank
 
@@ -139,8 +164,9 @@ def _build_layout_spec(
         use_mxfp8=int(bool(use_mxfp8)),
     )
     main_off, sig_off, num_bytes, signal_bytes = layout(sl)
+    signal_dtypes = _SIGNAL_DTYPES_MXFP8 if use_mxfp8 else _SIGNAL_DTYPES
     main_spec = {n: (off, _MAIN_DTYPES[n], numel) for n, (off, _it, numel) in main_off.items()}
-    signal_spec = {n: (off, _SIGNAL_DTYPES[n], numel) for n, (off, _it, numel) in sig_off.items()}
+    signal_spec = {n: (off, signal_dtypes[n], numel) for n, (off, _it, numel) in sig_off.items()}
     meta = dict(
         world_size=world_size,
         num_experts=num_experts,
@@ -169,7 +195,7 @@ def get_symm_buffer_size_for_mega_moe(
     *,
     block_m=256,
     block_n=256,
-    pool_mult=2,
+    pool_mult=None,
     use_mxfp8=False,
 ):
     """Size the single symmetric buffer for one fused mega MoE forward.
@@ -184,7 +210,8 @@ def get_symm_buffer_size_for_mega_moe(
     AND the cross-rank combine buffer (``comb``).
 
     ``activation`` is reserved (both gated ``swiglu`` and non-gated variants emit
-    ``intermediate_hidden``, so it does not change sizing today).
+    ``intermediate_hidden``, so it does not change sizing today). ``pool_mult=None`` sizes the
+    mxfp8 pool for the worst-case routing (see ``_pool_capacity``).
     """
     slice_input_buffers, _signal_spec, num_bytes, signal_bytes, meta = _build_layout_spec(
         world_size,
@@ -221,7 +248,7 @@ class SymmBuffer:
         intermediate_hidden,
         block_m=256,
         block_n=256,
-        pool_mult=2,
+        pool_mult=None,
         use_mxfp8=False,
     ):
         self.group = group
@@ -283,16 +310,16 @@ class SymmBuffer:
         # back-compat alias: the old layout named the grid-sync counter grid_barrier_state
         self.grid_barrier_state = self.grid_sync_count
         # reshape the matrix-shaped views
-        self.pool = self.pool.view(self.num_max_pool_tokens, self.hidden)
-        self.act = self.act.view(self.num_max_pool_tokens, self.intermediate_hidden)
-        self.l2_token_buffer = self.l2_token_buffer.view(self.num_max_pool_tokens, self.hidden)
         if self.use_mxfp8:
-            # fp8 token/act pool + raw E8M0 block scales (block=32 along the hidden/K dim).
+            # fp8 token pool + raw E8M0 block scales (block=32 along the hidden/K dim); comb stays
+            # flat because its scales follow all the payload rows rather than each row.
             self.pool_fp8 = self.pool_fp8.view(self.num_max_pool_tokens, self.hidden)
             self.pool_scale = self.pool_scale.view(self.num_max_pool_tokens, self.hidden // 32)
-            self.act_fp8 = self.act_fp8.view(self.num_max_pool_tokens, self.intermediate_hidden)
-            self.act_scale = self.act_scale.view(self.num_max_pool_tokens, self.intermediate_hidden // 32)
-        self.comb = self.comb.view(self.combine_slots, self.hidden)
+        else:
+            self.pool = self.pool.view(self.num_max_pool_tokens, self.hidden)
+            self.act = self.act.view(self.num_max_pool_tokens, self.intermediate_hidden)
+            self.l2_token_buffer = self.l2_token_buffer.view(self.num_max_pool_tokens, self.hidden)
+            self.comb = self.comb.view(self.combine_slots, self.hidden)
         # d_topk_w push slots, slot = token*topk + k -> view [num_tokens, num_topk]
         self.combine_gate = self.combine_gate.view(self.num_tokens, self.num_topk)
         # combine reduce reads only num_tokens_per_rank[rank]; it's the fixed per-rank token
@@ -311,11 +338,12 @@ class SymmBuffer:
                 device="cuda",
             )
 
-        self.pool_ptrs = _peer_ptr_table(buffer_ptrs, slice_input_buffers["pool"][0])
         if self.use_mxfp8:
             # peer tables for the fp8 dispatch push (token bytes + raw E8M0 scale bytes)
             self.pool_fp8_ptrs = _peer_ptr_table(buffer_ptrs, slice_input_buffers["pool_fp8"][0])
             self.pool_scale_ptrs = _peer_ptr_table(buffer_ptrs, slice_input_buffers["pool_scale"][0])
+        else:
+            self.pool_ptrs = _peer_ptr_table(buffer_ptrs, slice_input_buffers["pool"][0])
         # prologue addressing via prims.symm_at: one [world] i64 peer heap-base table +
         # a [5] i64 byte-offset table (rows = c_buffer / signal / origin_rank / origin_slot
         # / weight_recv_buf). Replaces the old [5, world] pre-offset peer_ptrs table.
@@ -429,7 +457,7 @@ def get_symm_buffer_for_mega_moe(
     intermediate_hidden=None,
     block_m=256,
     block_n=256,
-    pool_mult=2,
+    pool_mult=None,
     use_mxfp8=False,
 ) -> SymmBuffer:
     """Get (allocate or reuse) the single global symmetric buffer for a fused mega MoE.
@@ -437,7 +465,9 @@ def get_symm_buffer_for_mega_moe(
     Only one symmetric buffer is kept alive. The requested shape/tiling is sized via
     ``get_symm_buffer_size_for_mega_moe``; if the live buffer is missing or too small
     (main or signal heap) it is released and a fresh one is rendezvous-allocated.
-    Otherwise the existing buffer is reused as-is.
+    Otherwise the existing buffer is reused as-is. The mxfp8 pool defaults to the worst-case
+    routing (``pool_mult=None``), so it is allocated once and never regrown; a smaller ``pool_mult``
+    pool raises in the dispatch when the routing passes it.
 
     Called with no ``group`` it returns the live buffer -- kernels fetch the workspace
     this way instead of receiving it as a parameter; raises if none exists yet."""
@@ -515,21 +545,41 @@ class SymLayout:
     num_max_pool_blocks: Constexpr[int]  # num_max_pool_tokens // block_m
     combine_slots: Constexpr[int]  # num_topk * num_max_tokens_per_rank
     block_n: Constexpr[int]  # L2 GEMM N-tile width (combine_flag slots per block_m = hidden // block_n)
-    # mxfp8 forward: append fp8 pool/act data + raw E8M0 block-scale regions (1 = on).
-    # Appended AFTER every bf16 region so the bf16 (use_mxfp8=0) byte layout is unchanged.
+    # 1 = the mxfp8 layout: only the regions the fp8 kernels touch, fp8 pool + raw E8M0 scales,
+    # packed fp8 comb. 0 = the bf16 mirror, byte-identical to ``fused_mega_moe``'s.
     use_mxfp8: Constexpr[int]
 
 
 # ---------------------------------------------------------------------------
-# Memory layout: two heaps, each a 256B-aligned region packer. The region order
-# MUST mirror ``fused_mega_moe`` (``main`` list and ``_signal_regions``).
+# Memory layout: two heaps, each a 256B-aligned region packer. The bf16 layout
+# (use_mxfp8=0) MUST mirror ``fused_mega_moe`` (``main`` list and ``_signal_regions``).
 # ---------------------------------------------------------------------------
 def _main_regions(sl):
     R, E = int(sl.num_ranks), int(sl.num_experts)
     P, H, I = int(sl.num_max_pool_tokens), int(sl.hidden), int(sl.intermediate_hidden)
     CS = int(sl.combine_slots)
     EPR, T = int(sl.num_experts_per_rank), int(sl.num_max_tokens_per_rank)
-    regions = [
+    if int(getattr(sl, "use_mxfp8", 0)):
+        # The bf16 pool / act / L2 buffers and the bf16 dedup and DG dispatch indices are never
+        # read by the fp8 kernels, so the mxfp8 heap leaves them out. pool_fp8 / pool_scale are
+        # pushed cross-rank by dispatch and read by the grouped mxfp8 GEMMs. pool_scale_ps: fused
+        # quant-in-push writes the pool E8M0 scale directly in the ScaleS2R broadcast layout-1
+        # (int32, ceildiv(P,64)*(H//128)*256), so the fused L1 GEMM reads it with ScaleS2R (no
+        # preshuffle pass); the raw ``pool_scale`` feeds the wgrad requant.
+        return [
+            ("c_buffer", _I32, R * E),
+            ("signal", _I32, R),
+            ("origin_rank", _I32, P),
+            ("origin_slot", _I32, P),
+            ("weight_recv_buf", _F32, P),
+            ("combine_gate", _F32, CS),
+            ("meta_scalars", _I32, 8),
+            ("grid_sync_count", _I32, 2),
+            ("pool_fp8", 1, P * H),
+            ("pool_scale", 1, P * (H // 32)),
+            ("pool_scale_ps", _I32, ((P + 63) // 64) * (H // 128) * 256),
+        ]
+    return [
         ("pool", _BF16, P * H),
         ("c_buffer", _I32, R * E),
         ("signal", _I32, R),
@@ -550,23 +600,6 @@ def _main_regions(sl):
         # every preceding region keeps its byte offset.
         ("src_token_topk_idx", _I32, EPR * R * R * T),
     ]
-    # mxfp8 forward-only regions (fp8 = 1B/elem, E8M0 scale = 1B / 32 K-elems). Appended
-    # last (offset-stable). Pushed cross-rank by dispatch (pool_*) / written by SwiGLU
-    # (act_*); read as A operands by the grouped mxfp8 GEMM (which preshuffles internally).
-    if int(getattr(sl, "use_mxfp8", 0)):
-        # pool_scale_ps: fused quant-in-push writes the pool E8M0 scale directly in the
-        # ScaleS2R broadcast layout-1 (int32, ceildiv(P,64)*(H//128)*256), so the fused L1
-        # GEMM reads it with ScaleS2R (no preshuffle pass). The raw ``pool_scale`` is kept
-        # for the decoupled fp8 path (push raw -> grouped GEMM preshuffles internally).
-        ps_i32 = ((P + 63) // 64) * (H // 128) * 256
-        regions += [
-            ("pool_fp8", 1, P * H),
-            ("pool_scale", 1, P * (H // 32)),
-            ("act_fp8", 1, P * I),
-            ("act_scale", 1, P * (I // 32)),
-            ("pool_scale_ps", _I32, ps_i32),
-        ]
-    return regions
 
 
 def _signal_regions(sl):
@@ -574,6 +607,7 @@ def _signal_regions(sl):
     CS, H = int(sl.combine_slots), int(sl.hidden)
     BN = int(sl.block_n)
     n_l2_n = H // BN
+    comb = ("comb", 1, fp8_comb_bytes(CS, H)) if int(getattr(sl, "use_mxfp8", 0)) else ("comb", _BF16, CS * H)
     # All epoch flags (bf16-style self-reset): 2 banks (parity) x length, i64. Never host-reset;
     # each spins on a cumulative per-bank expected -> no consuming store, no cross-call reset race.
     return [
@@ -581,7 +615,7 @@ def _signal_regions(sl):
         ("dispatch_flag", _I64, 2 * NPB),  # cross-rank comm->preshuffle gate (per-expert, atomic_add)
         ("preshuffle_flag", _I64, 2 * NPB),  # local preshuffle->gemm gate (per-block, st=expected)
         ("combine_flag", _I64, 2 * NPB * n_l2_n),  # L2 GEMM->combine: per (block_m, block_n) release st
-        ("comb", _BF16, CS * H),
+        comb,
         ("reduce_flag", _I64, 2 * CS),  # L2 combine->reduce gate (per-slot, st=expected)
     ]
 
@@ -688,6 +722,31 @@ def build_sym_layout(
     )
 
 
+_SYM_LAYOUT_DIMS = (
+    "num_ranks",
+    "num_experts",
+    "num_experts_per_rank",
+    "num_max_tokens_per_rank",
+    "num_topk",
+    "hidden",
+    "intermediate_hidden",
+    "num_max_pool_tokens",
+    "num_max_pool_blocks",
+    "combine_slots",
+    "block_n",
+    "use_mxfp8",
+)
+
+
+def sym_layout_key(sl):
+    """The ``SymLayout`` dims a kernel taking it compiles in, for its ``run_compiled`` key.
+
+    Every region offset is folded to a constant from these at trace time, so a kernel cached on
+    fewer of them is reused on a layout whose regions sit elsewhere, and writes into whatever
+    region does sit there."""
+    return tuple(int(getattr(sl, name)) for name in _SYM_LAYOUT_DIMS)
+
+
 # ---------------------------------------------------------------------------
 # Convenience accessors: ``sym_layout.<region>_ptr`` -> this rank's i64 base ptr of that
 # region (a read-only property, so it is safe to read inside scf if/while regions -- a
@@ -698,25 +757,24 @@ def build_sym_layout(
 # by the per-shape specialized instances.) Names must match _main_regions / _signal_regions.
 # ---------------------------------------------------------------------------
 _REGION_ACCESSORS = (
-    "pool",
     "c_buffer",
     "signal",
     "origin_rank",
     "origin_slot",
     "weight_recv_buf",
-    "dedup_src_row",
     "combine_gate",
     "meta_scalars",
     "grid_sync_count",
+    # bf16-only (the property raises if read when use_mxfp8=1, i.e. the region is absent)
+    "pool",
+    "dedup_src_row",
     "profile",
     "act",
     "l2_token_buffer",
     "src_token_topk_idx",
-    # mxfp8-only (the property raises if read when use_mxfp8=0, i.e. the region is absent)
+    # mxfp8-only (the property raises if read when use_mxfp8=0)
     "pool_fp8",
     "pool_scale",
-    "act_fp8",
-    "act_scale",
     "pool_scale_ps",
     "dispatch_flag",
     "preshuffle_flag",
