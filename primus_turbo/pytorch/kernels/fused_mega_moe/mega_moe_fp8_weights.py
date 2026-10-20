@@ -50,16 +50,17 @@ _DW_FP8_FORMAT = torch.float8_e4m3fn
 
 
 def prepare_dispatch_weight_fp8(w: torch.Tensor) -> tuple:
-    """Prepare a grouped weight ``[G, N, K]`` for the fp8 dispatch GEMM -> ``(wq, ws, flat, b_sp)``.
+    """Prepare a grouped weight ``[G, N, K]`` for the fp8 dispatch GEMM -> ``(wq, flat, b_sp)``.
 
     Grouped mxfp8 quant + int8 flat + scale preshuffle (ScaleBComb, ``pack=1``): every weight
     derivative the dispatch GEMM contracts, so the kernel does no per-call weight work. ``flat`` is a
-    view of ``wq``, kept alongside it because the kernel still reads ``wq`` for shape and dtype.
+    view of ``wq``, kept alongside it because the kernel still reads ``wq`` for shape and dtype. The
+    raw E8M0 scales are dropped once preshuffled: the GEMM reads ``b_sp`` only.
     """
     G, N, K = w.shape
     wq, ws = quantize_grouped_weight_mxfp8_flydsl(w)
     flat = wq.contiguous().reshape(G * N, K).view(torch.int8).reshape(-1)
-    return wq, ws, flat, preshuffle_b_scale(ws, G, N, K, pack=1)
+    return wq, flat, preshuffle_b_scale(ws, G, N, K, pack=1)
 
 
 def prepare_w1_fp8(w1: torch.Tensor) -> tuple:
@@ -81,7 +82,7 @@ def prepare_w2_fp8(l2_weights: torch.Tensor) -> tuple:
 
 
 def prepare_w2t_dgrad_fp8(w2: torch.Tensor) -> tuple:
-    """``w2^T`` [G,I,H] prepped for the L2 dgrad's dispatch GEMM -> ``(wq, ws, flat, b_sp)``.
+    """``w2^T`` [G,I,H] prepped for the L2 dgrad's dispatch GEMM -> ``(wq, flat, b_sp)``.
 
     The L2 dgrad runs NT via the transposed weight, so w2 must be quantized along H (its
     contraction axis). Static weight prep; the transpose never runs inside the kernel.
@@ -186,7 +187,7 @@ def _version_keyed_weight_prep(w: torch.Tensor, attr: str, prep):
 # stashed their entry on the weight tensor, which never invalidated -- the backward computed dx from
 # step-0 weights for the whole run.
 def _w1_fp8_cached(w1: torch.Tensor) -> tuple:
-    """-> the dispatch GEMM's 4-tuple ``(w1q, w1s, flat, b_sp)``; see ``prepare_dispatch_weight_fp8``."""
+    """-> the dispatch GEMM's 3-tuple ``(w1q, flat, b_sp)``; see ``prepare_dispatch_weight_fp8``."""
     return _version_keyed_weight_prep(w1, _W1_PREP_ATTR, prepare_w1_fp8)
 
 

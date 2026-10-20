@@ -150,6 +150,7 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
             dispatch_prologue,
             extend_handle,
             get_symm_buffer_for_mega_moe,
+            quantize_grouped_weight_mxfp8_flydsl,
             quantize_rowwise_mxfp8_flydsl,
         )
 
@@ -194,7 +195,8 @@ class TestMegaMoEMxfp8(MultiProcessTestCase):
             symm,
         )
         w1_fp8 = prepare_dispatch_weight_fp8(W1)  # static weight prep (out of the timed step)
-        w1q, w1s = w1_fp8[:2]
+        # the reference dequantizes with the raw E8M0 scales, which the prep does not keep
+        w1q, w1s = quantize_grouped_weight_mxfp8_flydsl(W1)
         num_tile_blocks = symm.meta_scalars[1:2]
 
         def _l1():  # token quant (inside, bf16-x path) + fused dispatch + mxfp8 NT GEMM

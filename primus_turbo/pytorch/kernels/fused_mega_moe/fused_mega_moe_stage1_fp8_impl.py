@@ -124,9 +124,14 @@ def prepare_dw1_pool_operand_fp8(
 
     Called from the forward while ``pool_x_fp8`` is still a live view of the symm pool: requantizing
     it there consumes the view instead of the clone the backward would need, and keeps the requant
-    off the backward critical path. ``meta`` is reused by the dual-quant, dW1 and dW2."""
+    off the backward critical path. ``meta`` is reused by the dual-quant, dW1 and dW2.
+
+    The colwise operand spans ``pool_x_fp8``'s rows, which must cover the block_m-padded rows
+    actually dispatched."""
     meta = colwise_grouped_meta(
-        handle[_HANDLE_GROUP_LENS], handle[_HANDLE_GROUP_OFFS], pool_rows=pool_x_fp8[0].shape[0]
+        handle[_HANDLE_GROUP_LENS],
+        handle[_HANDLE_GROUP_OFFS],
+        pool_rows=pool_x_fp8[0].shape[0],
     )
     pool_colwise = colwise_requant_mxfp8_grouped_fp8in_flydsl(
         pool_x_fp8[0],
@@ -158,6 +163,9 @@ def fused_mega_moe_stage1_forward_fp8_impl(
     cloned because stage2's backward needs it as the SwiGLU^T scale long after later stages overwrite
     the symm buffer. ``pool_x_colwise`` / ``colwise_meta`` (None unless ``save_bwd``) are dW1's ``b``
     operand, requantized here while the fc1-input pool is still live in symm.
+
+    All of them, ``l1`` and the handle's row maps span the block_m-padded rows actually dispatched
+    to this rank, read back once after the prologue; ``l1.shape[0]`` is that row count.
     """
     # int64 end-to-end (combine reads topk i64)
     topk_idx = topk_idx.to(torch.int64)

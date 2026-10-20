@@ -74,6 +74,7 @@ def emit_gemm_mxfp8_nt_tile(
     store_c=None,
     C=None,
     out_fp16=False,
+    rebase_a_scale=False,
 ):
     """Emit one NT mxfp8 output tile MFMA main loop (grouped-reference layout).
 
@@ -83,7 +84,8 @@ def emit_gemm_mxfp8_nt_tile(
 
     B's scale is read from one flat ``[G * c_n]`` ScaleBComb plane, with the group offset
     folded into ``sb_base0``. The barrier after the initial A/B G2S is issued by the
-    ``wave_m == 1`` half only."""
+    ``wave_m == 1`` half only. ``rebase_a_scale`` addresses A's scale plane from this tile's rows
+    in 64-bit, for a plane that can pass 4 GiB (the dispatch's pool-sized one)."""
     F8_IR_t = fx.Float8E4M3FN.ir_type
     K_ITERS = K // BLOCK_K
     N_TILES_A = BLOCK_M // 64
@@ -151,7 +153,7 @@ def emit_gemm_mxfp8_nt_tile(
     b_s2r = S2RLoader(wave_n, N_TILES_B)
 
     sb_s2r = ScaleBComb(B_SCALE_RES, G * c_n, K, pack=scale_pack)
-    sa_s2r = ScaleS2R(A_SCALE_RES, c_m, K, N_TILES_A, pack=scale_pack)
+    sa_s2r = ScaleS2R(A_SCALE_RES, c_m, K, N_TILES_A, pack=scale_pack, row0=m_row if rebase_a_scale else None)
 
     def load_sb(k):
         allv = sb_s2r.load(sb_base0, k)
@@ -348,4 +350,5 @@ def gemm_mxfp8_nt_tile(
         scale_pack=1,
         C=C,
         out_fp16=out_fp16,
+        rebase_a_scale=True,
     )

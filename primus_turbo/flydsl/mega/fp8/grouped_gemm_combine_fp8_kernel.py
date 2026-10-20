@@ -33,8 +33,8 @@ critical path):
     mxfp8-quant epilogue -> LOCAL fp8 L2Y (write-through sc1) + E8M0; release-st per
     ``(block_m, block_n)`` combine_flag slot (no cross-WG atomic).
 
-LOCAL fp8 L2Y buffers (``L2Y_FP8`` uint8 [pool*H], ``L2Y_SCALE`` uint8 [pool*H/32]); peer
-``comb`` holds the packed fp8 payload + E8M0 scale (fits the bf16 comb region).
+LOCAL fp8 L2Y buffers (``L2Y_FP8`` uint8 [rows, H], ``L2Y_SCALE`` uint8 [rows, H/32]); peer
+``comb`` holds the packed fp8 payload + E8M0 scale (``fp8_comb_bytes``).
 """
 
 import functools
@@ -61,7 +61,11 @@ from primus_turbo.flydsl.mega.fp8.dispatch_grouped_gemm_mxfp8_kernel import (
     _H_ORIGIN_RANK,
     _H_ORIGIN_SLOT,
 )
-from primus_turbo.flydsl.mega.fp8.gemm_helper import emit_if_then, run_compiled
+from primus_turbo.flydsl.mega.fp8.gemm_helper import (
+    emit_if_then,
+    make_row_band_resource,
+    run_compiled,
+)
 from primus_turbo.flydsl.mega.fp8.gemm_mxfp8_tile import (
     BLOCK_K as _MXFP8_BLOCK_K,
 )
@@ -77,7 +81,12 @@ from primus_turbo.flydsl.mega.fp8.prims import (
     ld,
     st,
 )
-from primus_turbo.flydsl.mega.fp8.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
+from primus_turbo.flydsl.mega.fp8.symm_buffer import (
+    SymLayout,
+    fp8_comb_bytes,
+    get_symm_buffer_for_mega_moe,
+    sym_layout_key,
+)
 from primus_turbo.flydsl.utils import buffer_ops as _buffer_ops
 from primus_turbo.flydsl.utils.buffer_ops import (
     buffer_load,
@@ -85,7 +94,7 @@ from primus_turbo.flydsl.utils.buffer_ops import (
     create_buffer_resource,
     create_buffer_resource_from_addr,
 )
-from primus_turbo.flydsl.utils.prims import cast, read_clock, spin_timed_out
+from primus_turbo.flydsl.utils.prims import _readfirstlane_i32, cast, read_clock, spin_timed_out
 
 # s_waitcnt vmcnt bound for the GEMM main loop; changes the emitted kernel, so it is in the flyc
 # compile cache key below.
@@ -126,8 +135,23 @@ class StoreCQuantMxfp8CShuffle:
     E8M0 byte. This measures the efficient in-GEMM mxfp8 quant placement for fp8-combine."""
 
     def __init__(
-        self, C_fp8, C_scale, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, out_ty, c_lds, wave_id
+        self,
+        C_fp8,
+        C_scale,
+        c_rows,
+        c_cols,
+        c_idx_fn,
+        n_tiles_a,
+        n_tiles_b,
+        out_ty,
+        c_lds,
+        wave_id,
+        row0=None,
+        rows=None,
     ):
+        """``row0`` / ``rows`` (the wide build only): the tile's first row and row count. Both
+        outputs are then addressed from ``row0`` in 64-bit, so the 32-bit offsets only span the tile
+        however deep ``C`` is, with the descriptors built in ``store``, after the K loop."""
         self.c_rows = c_rows
         self.c_cols = c_cols
         self.lane_id = fx.thread_idx.x % 64
@@ -142,13 +166,38 @@ class StoreCQuantMxfp8CShuffle:
         self.row_stride = self.Cc
         self.wave_lds_elems = 16 * self.row_stride
         self.c_lds = c_lds
-        self.fp8 = _buffer_ops.create_buffer_resource(C_fp8, max_size=True)
-        self.scale = _buffer_ops.create_buffer_resource(C_scale, max_size=True)
+        self.row0 = row0
+        self.rows = rows
+        self.C_fp8 = C_fp8
+        self.C_scale = C_scale
+        if row0 is None:
+            self.fp8 = _buffer_ops.create_buffer_resource(C_fp8, max_size=True)
+            self.scale = _buffer_ops.create_buffer_resource(C_scale, max_size=True)
         # bf16 staging pointer (align 2 store, align 16 read).
         self._store_ptr_t = fx.PointerType.get(out_ty.ir_type, 2, 2)
         self._read_ptr_t = fx.PointerType.get(out_ty.ir_type, 2, 16)
 
     def store(self, c_frag, base_row, base_col):
+        if self.row0 is None:
+            fp8_rsrc, scale_rsrc, row_base = self.fp8, self.scale, base_row
+        else:
+            fp8_rsrc = make_row_band_resource(
+                _buffer_ops.extract_base_index(self.C_fp8),
+                self.row0,
+                self.c_rows,
+                self.c_cols,
+                1,
+                span_rows=self.rows,
+            )
+            scale_rsrc = make_row_band_resource(
+                _buffer_ops.extract_base_index(self.C_scale),
+                self.row0,
+                self.c_rows,
+                self.c_cols // 32,
+                1,
+                span_rows=self.rows,
+            )
+            row_base = base_row - self.row0
         lds_base = fx.Int32(fx.ptrtoint(self.c_lds.ptr))
         wave_off = self.wave_id * self.wave_lds_elems
         for ti in range_constexpr(self.n_tiles_a):
@@ -205,11 +254,11 @@ class StoreCQuantMxfp8CShuffle:
                 w = rocdl.cvt_pk_fp8_f32(fx.T.i32, q[0], q[1], fx.Int32(0), False)
                 w = rocdl.cvt_pk_fp8_f32(fx.T.i32, q[2], q[3], w, True)
                 words.append(w)
-            base_row_i = base_row + ti * 16 + row_in
+            base_row_i = row_base + ti * 16 + row_in
             gcol = base_col + col0
             fp8_idx = (base_row_i * fx.Int32(self.c_cols) + gcol) // fx.Int32(4)  # i32-word index
             _buffer_ops.buffer_store(
-                Vec.from_elements(words, fx.Int32).ir_value(), self.fp8, fp8_idx, cache_modifier=16
+                Vec.from_elements(words, fx.Int32).ir_value(), fp8_rsrc, fp8_idx, cache_modifier=16
             )
 
             # one E8M0 byte per 1x32 block: the lane owning col0==0 writes it. This has to stay
@@ -220,7 +269,7 @@ class StoreCQuantMxfp8CShuffle:
             def _emit_scale():
                 sb = fx.arith.ArithValue(biased).trunci(fx.T.i8)  # noqa: B023
                 idx = base_row_i * fx.Int32(self.c_cols // 32) + gcol // fx.Int32(32)  # noqa: B023
-                _buffer_ops.buffer_store(sb, self.scale, idx, cache_modifier=16)
+                _buffer_ops.buffer_store(sb, scale_rsrc, idx, cache_modifier=16)
 
             emit_if_then(col0 == fx.Int32(0), _emit_scale)
 
@@ -261,8 +310,9 @@ def combine_copy_fp8_tile(
     H4,
     SC,
     payload_i32_total,
-    l2y_fp8_res,
-    l2y_scale_res,
+    l2y_fp8,
+    l2y_scale,
+    l2y_rows,
     origin_rank_res,
     origin_slot_res,
     comb_base,
@@ -275,12 +325,17 @@ def combine_copy_fp8_tile(
     gate_base=None,
     main_delta_res=None,
     gate_records=0,
+    wide=False,
 ):
     """FP8 combine PUSH: read local fp8 L2Y row -> push packed fp8 payload + E8M0 to the peer
     ``comb[slot]``, raise the sys-scope flag. ``with_gate`` (backward L1 dgrad) additionally scatters
     the per-row gate gradient ``grad_gate[row]`` to the origin peer's ``combine_gate[slot]`` (MAIN
     heap ``main_delta``), mirroring the bf16 ``combine_bf16_tile`` gate path -- 1 f32, ~free vs the
-    hidden-wide fp8 push."""
+    hidden-wide fp8 push.
+
+    ``l2y_fp8`` / ``l2y_scale`` are buffer resources over all of L2Y, or under ``wide`` its base
+    addresses: L2Y or comb then passes 2 GiB, so each tile's rows and each row's peer slot are
+    addressed from their own base in 64-bit."""
     rows_per_warp = block_m_size // _NUM_WARPS
     lane = thread_index % fx.Int32(_WARP)
     warp_id = thread_index // fx.Int32(_WARP)
@@ -288,15 +343,33 @@ def combine_copy_fp8_tile(
     cols_per_step = _WARP * 4  # 256 i32 payload words/step (b128 copy)
     num_full = H4 // cols_per_step
 
-    def _make_row_emitter(row, origin):
+    def _make_row_emitter(row, l2y_row, l2y_fp8_res, l2y_scale_res, origin):
         # factory, not a closure over the loop var: `emit_if_then` branch fns MUST take 0 args
         # (ReplaceIfWithDispatch injects result_names into any arg-accepting branch fn).
         def _emit_row():
             slot = buffer_load(origin_slot_res, row, vec_width=1, dtype=fx.T.i32)
             delta = buffer_load(signal_delta_res, origin, vec_width=1, dtype=fx.T.i64)
-            peer = create_buffer_resource_from_addr(comb_base + delta, num_records_bytes=comb_records)
-            slot_base = slot * fx.Int32(H4)
-            row_base = row * fx.Int32(H4)
+            if wide:
+                # slot and origin are per row, so wave-uniform
+                peer_comb = comb_base + delta
+                slot64 = cast(slot, fx.T.i64)
+                peer = create_buffer_resource_from_addr(
+                    _readfirstlane_i32(peer_comb + slot64 * fx.Int64(hidden)), num_records_bytes=hidden
+                )
+                peer_scale = create_buffer_resource_from_addr(
+                    _readfirstlane_i32(
+                        peer_comb + fx.Int64(payload_i32_total * 4) + slot64 * fx.Int64(hidden // 32)
+                    ),
+                    num_records_bytes=hidden // 32,
+                )
+                slot_base = fx.Int32(0)
+                scale_base = fx.Int32(0)
+            else:
+                peer = create_buffer_resource_from_addr(comb_base + delta, num_records_bytes=comb_records)
+                peer_scale = peer
+                slot_base = slot * fx.Int32(H4)
+                scale_base = fx.Int32(payload_i32_total) + slot * fx.Int32(SC)
+            row_base = l2y_row * fx.Int32(H4)
             vals = []
             for c in range(num_full):
                 col = fx.Int32(c * cols_per_step) + lane * fx.Int32(4)
@@ -311,13 +384,8 @@ def combine_copy_fp8_tile(
                 buffer_store(vals[c], peer, slot_base + col, cache_modifier=19)
 
             def _emit_scale():
-                sv = buffer_load(l2y_scale_res, row * fx.Int32(SC) + lane, vec_width=1, dtype=fx.T.i32)
-                buffer_store(
-                    sv,
-                    peer,
-                    fx.Int32(payload_i32_total) + slot * fx.Int32(SC) + lane,
-                    cache_modifier=19,  # sc0|sc1|nt, as above
-                )
+                sv = buffer_load(l2y_scale_res, l2y_row * fx.Int32(SC) + lane, vec_width=1, dtype=fx.T.i32)
+                buffer_store(sv, peer_scale, scale_base + lane, cache_modifier=19)  # sc0|sc1|nt, as above
 
             emit_if_then(lane < fx.Int32(SC), _emit_scale)
             if with_gate:
@@ -340,17 +408,31 @@ def combine_copy_fp8_tile(
         return _emit_row
 
     def push_block(block_m):
-        base_row = block_m * fx.Int32(block_m_size) + chunk_base
+        base_row = block_m * fx.Int32(block_m_size)
+        if wide:
+            # the origin tables stay on the global row, being 4 B per row
+            l2y_fp8_res = make_row_band_resource(
+                l2y_fp8, base_row, l2y_rows, hidden, 1, span_rows=block_m_size
+            )
+            l2y_scale_res = make_row_band_resource(
+                l2y_scale, base_row, l2y_rows, hidden // 32, 1, span_rows=block_m_size
+            )
+        else:
+            l2y_fp8_res, l2y_scale_res = l2y_fp8, l2y_scale
         for j in range(rows_per_warp):
-            row = base_row + fx.Int32(j)
+            tile_row = chunk_base + fx.Int32(j)
+            row = base_row + tile_row
             origin = buffer_load(origin_rank_res, row, vec_width=1, dtype=fx.T.i32)
-            emit_if_then(origin >= fx.Int32(0), _make_row_emitter(row, origin))
+            emit_if_then(
+                origin >= fx.Int32(0),
+                _make_row_emitter(row, tile_row if wide else row, l2y_fp8_res, l2y_scale_res, origin),
+            )
 
     return push_block
 
 
 # ─────────── role REDUCE: fp8-dequant topk sum (weighted|unweighted) + optional gate fold ───────────
-def _make_topk_reduce_fp8(hidden, topk, combine_slots, apply_weights, with_gate):
+def _make_topk_reduce_fp8(hidden, topk, combine_slots, apply_weights, with_gate, wide=False):
     """FP8-dequant weighted top-k sum -> output. ``apply_weights`` (forward L2) multiplies each expert
     term by the routing weight; else (backward L1 dgrad) the weight was already folded into the input
     upstream. ``with_gate`` (backward) additionally folds the gate gradient
@@ -392,10 +474,33 @@ def _make_topk_reduce_fp8(hidden, topk, combine_slots, apply_weights, with_gate)
         warp_id = thread_index // fx.Int32(_WARP)
         global_warp_id = base_pid * fx.Int32(_NUM_WARPS) + warp_id
         num_tokens = buffer_load(num_tokens_res, fx.Int32(rank), vec_width=1, dtype=fx.T.i32)
-        comb_res = create_buffer_resource_from_addr(comb_base, num_records_bytes=comb_records)
+        # Ternaries, not if-statements: the AST rewriter scopes an if-body's assignments to it.
+        comb_all = (
+            None if wide else create_buffer_resource_from_addr(comb_base, num_records_bytes=comb_records)
+        )
 
         token = global_warp_id
         while token < num_tokens:
+            # wide: comb passes 2 GiB. A token's topk slots are contiguous, so its payload and scale
+            # descriptors start at its first slot (64-bit); token is per warp.
+            slot0 = cast(token, fx.T.i64) * fx.Int64(topk) if wide else None
+            comb_res = (
+                create_buffer_resource_from_addr(
+                    _readfirstlane_i32(comb_base + slot0 * fx.Int64(hidden)), num_records_bytes=topk * hidden
+                )
+                if wide
+                else comb_all
+            )
+            comb_scale_res = (
+                create_buffer_resource_from_addr(
+                    _readfirstlane_i32(
+                        comb_base + fx.Int64(payload_i32_total * 4) + slot0 * fx.Int64(hidden // 32)
+                    ),
+                    num_records_bytes=topk * (hidden // 32),
+                )
+                if wide
+                else comb_all
+            )
             valid = []
             for jj in fx.range_constexpr(topk):
                 slot = token * fx.Int32(topk) + fx.Int32(jj)
@@ -433,15 +538,16 @@ def _make_topk_reduce_fp8(hidden, topk, combine_slots, apply_weights, with_gate)
                     # sc0|sc1|nt: system-visible non-temporal read -- a PEER wrote this.
                     pv = buffer_load(
                         comb_res,
-                        slot * fx.Int32(H4) + w,
+                        (fx.Int32(jj * H4) if wide else slot * fx.Int32(H4)) + w,
                         vec_width=VW,
                         dtype=fx.T.i32,
                         cache_modifier=19,
                     )
                     words = [Vec(pv)[v].ir_value() for v in range_constexpr(VW)] if VW > 1 else [pv]
                     sw = buffer_load(
-                        comb_res,
-                        fx.Int32(payload_i32_total) + slot * fx.Int32(SC) + sword_idx,
+                        comb_scale_res,
+                        (fx.Int32(jj * SC) if wide else fx.Int32(payload_i32_total) + slot * fx.Int32(SC))
+                        + sword_idx,
                         vec_width=1,
                         dtype=fx.T.i32,
                         cache_modifier=19,  # sc0|sc1|nt, as above
@@ -493,6 +599,7 @@ def _make_topk_reduce_fp8(hidden, topk, combine_slots, apply_weights, with_gate)
 
 
 _FP8_COMBINE_COMPILED: dict = {}
+_I32_MAX = 2**31 - 1
 
 
 @functools.lru_cache(maxsize=64)
@@ -514,6 +621,7 @@ def _compile(
     num_groups=0,
     nt_vmcnt=_COMBINE_NT_VMCNT,
     num_gemm_cu=None,
+    wide=False,
 ):
     """Unified fp8 combine: mxfp8 GEMM (CShuffle mxfp8-quant epilogue -> local fp8 pool) + FP8 combine
     PUSH (+ optional gate scatter) + fp8-dequant top-k reduce. One kernel for BOTH:
@@ -547,7 +655,11 @@ def _compile(
     role nothing ever sets the GEMM-done flag, so the PUSH must not wait on it, and the gate is
     compiled out. Combinations that measure something: (combine, 0, None) skips the reduce,
     (0, 0, None) is the GEMM alone, (combine, 0, 0) is the PUSH alone. All but the first give
-    INCORRECT output -- they exist to attribute time, not to compute."""
+    INCORRECT output -- they exist to attribute time, not to compute.
+
+    ``wide`` builds the variant whose L2Y / ACT / ``comb`` addressing is 64-bit, for a call where one
+    of them passes 2 GiB. It is not the default because the GEMM role sits at the 256-VGPR limit:
+    the extra addressing live in this kernel spills it to scratch, ~15% on the DSv3 L2 combine."""
     K = hidden_size
     assert out_features % BLOCK_N == 0
     assert num_max_pool_tokens % BLOCK_M == 0
@@ -570,7 +682,7 @@ def _compile(
 
     n_blocks = out_features // BLOCK_N
     worst_case_tiles = num_max_pool_tokens // BLOCK_M
-    comb_records = combine_slots * out_features * 2
+    comb_records = fp8_comb_bytes(combine_slots, out_features)
     gate_records = combine_slots * 4  # f32 gate slots per peer (backward d_topk_w scatter)
     delta_records = num_ranks * 8
     assert num_gemm_cu in (None, 0), (
@@ -589,7 +701,7 @@ def _compile(
     H4 = out_features // 4
     SC = out_features // 128
     payload_i32_total = combine_slots * H4
-    reduce_fp8 = _make_topk_reduce_fp8(out_features, topk, combine_slots, apply_weights, with_gate)
+    reduce_fp8 = _make_topk_reduce_fp8(out_features, topk, combine_slots, apply_weights, with_gate, wide)
 
     @flyc.kernel(known_block_size=[_BLOCK_THREADS, 1, 1])
     def kern(
@@ -634,8 +746,8 @@ def _compile(
         reduce_bank = parity * fx.Int32(combine_slots)
         expected_combine = buffer_load(combine_expected_res, parity, vec_width=1, dtype=fx.T.i64)
         expected_reduce = buffer_load(reduce_expected_res, parity, vec_width=1, dtype=fx.T.i64)
-        l2y_fp8_res = create_buffer_resource(L2Y_FP8, max_size=True)
-        l2y_scale_res = create_buffer_resource(L2Y_SCALE, max_size=True)
+        l2y_fp8_res = None if wide else create_buffer_resource(L2Y_FP8, max_size=True)
+        l2y_scale_res = None if wide else create_buffer_resource(L2Y_SCALE, max_size=True)
         signal_delta_res = create_buffer_resource_from_addr(
             sym_layout.signal_offsets_ptr, num_records_bytes=delta_records
         )
@@ -671,8 +783,9 @@ def _compile(
                 H4=H4,
                 SC=SC,
                 payload_i32_total=payload_i32_total,
-                l2y_fp8_res=l2y_fp8_res,
-                l2y_scale_res=l2y_scale_res,
+                l2y_fp8=_buffer_ops.extract_base_index(L2Y_FP8) if wide else l2y_fp8_res,
+                l2y_scale=_buffer_ops.extract_base_index(L2Y_SCALE) if wide else l2y_scale_res,
+                l2y_rows=num_max_pool_tokens,
                 origin_rank_res=origin_rank_res,
                 origin_slot_res=origin_slot_res,
                 comb_base=comb_base,
@@ -685,6 +798,7 @@ def _compile(
                 gate_base=gate_base,
                 main_delta_res=main_delta_res,
                 gate_records=gate_records,
+                wide=wide,
             )
             local_count = (real_tiles - block_index + combine_cu - fx.Int32(1)) // combine_cu
             for tile_iter in range(local_count):
@@ -726,6 +840,9 @@ def _compile(
                 # still happen, so the PUSH sees the protocol it always sees and nobody downstream
                 # has to know this build computed nothing.
                 if const_expr(not _no_gemm):
+                    # Keep the bound a compile-time constant even though ACT / L2Y hold only the real
+                    # rows: only real tiles reach here, so it never masks, and a runtime
+                    # real_tiles * BLOCK_M bound made the K=2048 L2 combine 46% slower (DSv3, EP8).
                     c_m_const = fx.Int32(num_max_pool_tokens)
                     group_index = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32)
                     n_tiles_a = BLOCK_M // 64
@@ -742,6 +859,8 @@ def _compile(
                         fx.BFloat16,
                         lds.C_lds_shuffle,
                         thread_index // fx.Int32(64),
+                        block_m * fx.Int32(BLOCK_M) if wide else None,
+                        BLOCK_M,
                     )
                     emit_gemm_mxfp8_nt_tile(
                         ACT,
@@ -873,28 +992,28 @@ def _compile(
     return launch
 
 
-_L2Y_FP8_SCRATCH: dict = {}
-
-
 def _combine_ctx(handle, act_fp8):
     """Everything about a combine launch that the direction does not change.
 
     Kept in one place because the two entries would otherwise both carry it, and the handle reads
-    below are not the kind of thing that should exist in two copies that can drift."""
+    below are not the kind of thing that should exist in two copies that can drift.
+
+    ``act_fp8`` may hold only this call's real rows (``M``); the kernel is still built for the pool
+    capacity ``P``, which sizes its grid, its flag banks in symm and the empty blocks the reduce
+    rides. ``P`` is also what keys the compile and the CU tuner, so every rank keys alike."""
     aq, a_sp = act_fp8
     M, K = aq.shape  # K = I for the fc2 forward, 2I for the fc1^T dgrad
     dev = aq.device
     symm = get_symm_buffer_for_mega_moe()
     sym_layout = symm.make_sym_layout()
     H = int(sym_layout.hidden)
-    assert M == int(sym_layout.num_max_pool_tokens)
-
-    sk = (M, H, dev)
-    scratch = _L2Y_FP8_SCRATCH.get(sk)
-    if scratch is None:
-        l2y_fp8 = torch.empty(M * H, dtype=torch.uint8, device=dev)
-        l2y_scale = torch.empty(M * (H // 32), dtype=torch.uint8, device=dev)
-        _L2Y_FP8_SCRATCH[sk] = scratch = (l2y_fp8, l2y_scale)
+    P = int(sym_layout.num_max_pool_tokens)
+    assert M <= P, f"combine operand rows {M} exceed the pool capacity {P}"
+    CS = int(sym_layout.combine_slots)
+    # The 64-bit build only for a call one of whose L2Y / ACT / comb passes 2 GiB (see _compile).
+    # Each rank may pick its own: the two builds speak the same protocol, and the CU tuner key
+    # leaves the choice out, so the ranks' tuning collectives still pair up.
+    wide = M * max(H, K) > _I32_MAX or fp8_comb_bytes(CS, H) > _I32_MAX
 
     # Everything below that varies per call comes off the handle, never out of the live symm state.
     # A layer's backward runs long after later layers' prologues have rewritten the shared scratch,
@@ -906,15 +1025,17 @@ def _combine_ctx(handle, act_fp8):
     return SimpleNamespace(
         aq=aq,
         a_sp=a_sp,
-        act_flat=aq.view(torch.int8).reshape(-1),
+        # wide: a launch packs each dim as int32, and the flat element count passes 2^31
+        act_i8=aq.view(torch.int8) if wide else aq.view(torch.int8).reshape(-1),
         M=M,
+        P=P,
         K=K,
         dev=dev,
         symm=symm,
         sym_layout=sym_layout,
         out_features=H,
         G=int(sym_layout.num_experts_per_rank),
-        combine_slots=int(sym_layout.combine_slots),
+        combine_slots=CS,
         num_ranks=int(sym_layout.num_ranks),
         rank=int(sym_layout.rank_idx),
         topk=int(sym_layout.num_topk),
@@ -924,8 +1045,10 @@ def _combine_ctx(handle, act_fp8):
         num_tile_blocks=handle[_H_NUM_TILE_BLOCKS],
         origin_rank=handle[_H_ORIGIN_RANK],
         origin_slot=handle[_H_ORIGIN_SLOT],
-        l2y_fp8=scratch[0],
-        l2y_scale=scratch[1],
+        # the GEMM role's local fp8 output, read back by the PUSH role in the same launch
+        l2y_fp8=torch.empty((M, H) if wide else (M * H,), dtype=torch.uint8, device=dev),
+        l2y_scale=torch.empty((M, H // 32) if wide else (M * (H // 32),), dtype=torch.uint8, device=dev),
+        wide=wide,
         # An unused per-role slot gets this size-1 tensor so the kernel's create_buffer_resource has a
         # valid (never-indexed) one: TOPK_WEIGHTS is only read when apply_weights, GRAD_GATE and
         # D_TOPK_W only when with_gate.
@@ -956,7 +1079,7 @@ def _combine_launch(
     weight_flat, b_sp = weights_fp8
     output = torch.empty(c.num_tokens, c.out_features, dtype=torch.bfloat16, device=c.dev)
     args = (
-        c.act_flat,
+        c.act_i8,
         weight_flat,
         c.l2y_fp8,
         c.l2y_scale,
@@ -982,7 +1105,7 @@ def _combine_launch(
     launch = _compile(
         c.out_features,
         c.K,
-        c.M,
+        c.P,
         BM,
         BN,
         int(combine_cu),
@@ -996,11 +1119,12 @@ def _combine_launch(
         with_gate,
         num_groups=c.G,
         num_gemm_cu=num_gemm_cu,
+        wide=c.wide,
     )
     ck = (
         c.out_features,
         c.K,
-        c.M,
+        c.P,
         BM,
         BN,
         int(combine_cu),
@@ -1015,6 +1139,8 @@ def _combine_launch(
         apply_weights,
         with_gate,
         _COMBINE_NT_VMCNT,
+        sym_layout_key(c.sym_layout),
+        c.wide,
     )
     run_compiled(_FP8_COMBINE_COMPILED, ck, launch, *args)
     return output
@@ -1035,7 +1161,7 @@ def _tune_key(c, BM, BN, apply_weights, with_gate):
     return (
         c.out_features,
         c.K,
-        c.M,
+        c.P,
         BM,
         BN,
         c.combine_slots,

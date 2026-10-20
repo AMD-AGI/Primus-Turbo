@@ -56,11 +56,11 @@ __all__ = [
 ]
 
 
-def _dispatch_l2_dgrad_fp8(dy, w2, handle, *, w2t_fp8=None):
+def _dispatch_l2_dgrad_fp8(dy, w2, handle, *, w2t_fp8=None, pool_rows=None):
     """``w2^T`` prep in front of ``dispatch_l2_dgrad_mxfp8_flydsl_kernel``; the kernel needs no group,
     since the forward's handle already carries the routing."""
     w2t = w2t_fp8 if w2t_fp8 is not None else _w2t_fp8_cached(w2)
-    return dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, w2t, handle)
+    return dispatch_l2_dgrad_mxfp8_flydsl_kernel(dy, w2t, handle, pool_rows=pool_rows)
 
 
 def _mxfp8_variable_k_wgrad_dw2(a_fp8, b_bf16, group_lens, group_offs, meta=None):
@@ -139,14 +139,15 @@ def fused_mega_moe_stage2_backward_fp8_impl(
 
     Returns ``(grad_l1_rowwise_fp8, grad_l1_colwise_fp8, grad_gate, dW2)`` -- the rowwise pair feeds
     stage1's L1 dgrad, the colwise pair its dW1. ``colwise_meta`` is stage1's, reused here so the
-    dual-quant and dW2 skip a second D2H of the same group offsets.
+    dual-quant and dW2 skip a second D2H of the same group offsets. Every row-indexed tensor here
+    spans the forward's rows, ``l1.shape[0]``.
     """
     group_lens = handle[_HANDLE_GROUP_LENS]
     group_offs = handle[_HANDLE_GROUP_OFFS]
     dy = grad_y.contiguous().to(torch.bfloat16)
 
     # L2 dgrad: dispatch(dy) + fc2 -> grad_swiglu + the dispatched-dy pool (the dW2 `a` operand)
-    grad_swiglu, dispatch_l2_grad_fp8 = _dispatch_l2_dgrad_fp8(dy, w2, handle)
+    grad_swiglu, dispatch_l2_grad_fp8 = _dispatch_l2_dgrad_fp8(dy, w2, handle, pool_rows=l1.shape[0])
 
     # SwiGLU^T (re-inject routing weight) + gate grad, fused with grad_l1's rowwise (L1 dgrad) and
     # colwise (dW1) quant -- grad_l1 has no other consumer, so it never reaches HBM
