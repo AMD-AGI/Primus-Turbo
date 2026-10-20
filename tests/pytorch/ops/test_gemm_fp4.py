@@ -496,7 +496,15 @@ def test_gemm_fp4_mx_blockwise_torch_compile_backward(m, n, k, dtype):
 # ----------------------------------------------------------------------------
 # Determinism suite (run with --deterministic-only): bit-exact across repeats.
 # ----------------------------------------------------------------------------
-_DET_GEMM_FP4_MNK = [(256, 256, 256), (512, 512, 256), (1024, 1024, 512)]
+_DET_GEMM_FP4_MNK = [
+    (256, 256, 256),
+    (512, 512, 256),
+    (1024, 1024, 512),
+    # Grids whose N tile is the narrow one, and whose body therefore takes the schedule
+    # without the folded C store -- the one that was returning a different answer each call.
+    (4096, 6144, 8192),
+    (4096, 5760, 8192),
+]
 # AITER is bf16-only.
 _DET_GEMM_FP4_BACKEND_DTYPES = [
     pytest.param(BackendType.AITER, torch.bfloat16, id="AITER-bf16"),
