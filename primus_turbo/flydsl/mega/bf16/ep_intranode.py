@@ -238,12 +238,15 @@ def combine_bf16_tile(
     pool_row_to_route_res: ArithValue,
     pool_row_to_recv_token_res: ArithValue,
     recv_token_to_pool_rows_res: ArithValue,
+    l2_ptr: ArithValue,
     epoch: fx.Int64,
     reduce_bank: fx.Int32,
     grad_gate_res: Optional[ArithValue] = None,
     has_grad_gate: bool = False,
 ):
-    """Push each fold row in [first_fold_row, +num_fold_rows) as its recv token's sum to the primary route."""
+    """Push each fold row in [first_fold_row, +num_fold_rows) as its recv token's sum to the primary route.
+
+    ``l2_ptr`` (i64) is this rank's L2 GEMM output, one row per pool row; only this rank reads it."""
     hidden = int(workspace.hidden)
     num_topk = int(workspace.num_topk)
     assert num_topk <= _WARP, "lane k pushes the grad_gate of pool row k"
@@ -257,7 +260,6 @@ def combine_bf16_tile(
     lane_id = thread_index % fx.Int32(_WARP)
     lane_col = lane_id * fx.Int32(_PVEC)
     dropped_base = fx.Int32(num_max_routes * hidden)
-    l2_ptr = workspace.get_l2_token_buffer_ptr()
 
     dst_rank = buffer_load(recv_dst_rank_res, segment_idx, vec_width=1, dtype=fx.T.i32)
     # hoist workspace-derived values before the dynamic loop (rewriter can't carry Workspace)

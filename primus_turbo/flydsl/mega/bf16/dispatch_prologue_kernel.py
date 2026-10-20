@@ -690,7 +690,8 @@ def dispatch_prologue_flydsl_kernel(symm, topk_idx, topk_weight):
     expert_send_count = torch.empty(num_experts, dtype=torch.int32, device=dev)
     expert_send_offset = torch.empty(num_experts, dtype=torch.int32, device=dev)
     tile_to_expert = torch.empty(num_max_pool_tokens // BLOCK_M, dtype=torch.int32, device=dev)
-    dispatched_token_idx = torch.empty(num_max_pool_tokens, dtype=torch.int32, device=dev)
+    # send-side: one entry per (token, destination rank) it routes to
+    dispatched_token_idx = torch.empty(num_tokens * num_topk, dtype=torch.int32, device=dev)
     num_tokens_per_expert = torch.empty(num_experts_per_rank, dtype=torch.int64, device=dev)
     num_tokens_per_expert_prefix = torch.empty(num_experts_per_rank + 1, dtype=torch.int64, device=dev)
     num_tile_blocks = torch.empty(1, dtype=torch.int32, device=dev)
@@ -730,6 +731,12 @@ def dispatch_prologue_flydsl_kernel(symm, topk_idx, topk_weight):
         num_max_tokens_per_rank=symm.num_max_tokens_per_rank,
         stream=torch.cuda.current_stream(),
     )
+    # One D2H, like DeepEP's notify: the receive tables below, and every row-indexed tensor the
+    # dispatch, SwiGLU and combine allocate for this call, span the block_m-padded rows actually
+    # dispatched to this rank instead of the worst-case pool. The sync keeps the op out of CUDA graphs.
+    rows = int(num_tokens_per_expert_prefix[-1].item())
+    if rows > num_max_pool_tokens:  # only reachable with repeated experts in topk_idx
+        raise RuntimeError(f"mega MoE dispatch: {rows} pool rows exceed the capacity {num_max_pool_tokens}")
     # the receive tables and weights live in the shared heap, which the next prologue overwrites
     handle = DispatchHandle(
         expert_send_dst_rank=expert_send_dst_rank,
@@ -743,11 +750,12 @@ def dispatch_prologue_flydsl_kernel(symm, topk_idx, topk_weight):
         combine_recv_dst_rank=combine_recv_dst_rank,
         combine_recv_start_row=combine_recv_start_row,
         combine_recv_fold_count=combine_recv_fold_count,
-        pool_row_to_route=symm.pool_row_to_route.clone(),
-        pool_row_to_recv_token=symm.pool_row_to_recv_token.clone(),
+        pool_row_to_route=symm.pool_row_to_route[:rows].clone(),
+        # BLOCK_M rows past the last real one, which the gather prefetch reads
+        pool_row_to_recv_token=symm.pool_row_to_recv_token[: rows + BLOCK_M].clone(),
         recv_token_to_pool_rows=symm.recv_token_to_pool_rows.clone(),
     )
-    return handle, symm.weight_recv_buf.clone()
+    return handle, symm.weight_recv_buf[:rows].clone()
 
 
 def run_dispatch_prologue(x, w1, group, topk_idx, topk_weights):

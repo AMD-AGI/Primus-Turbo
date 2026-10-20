@@ -12,6 +12,9 @@
 ###############################################################################
 
 import ctypes
+import functools
+import hashlib
+import inspect
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -73,8 +76,11 @@ class SymBuffer:
         return [PointerType.get(i64, space, 8)]
 
     def __cache_signature__(self) -> tuple:
-        # only rank count specializes it; dims ride each kernel's constexpr, not the handle
-        return (type(self), self.num_ranks)
+        # dims ride each kernel's constexpr, not the handle. The region offsets do not: they come from
+        # Workspace, and FlyDSL's disk-cache key hashes the helper functions a kernel calls but not the
+        # classes, so without the layout here a layout change replays binaries that address the old
+        # regions -- a grid_sync counter clobbered by a stale prologue, then a hang.
+        return (type(self), self.num_ranks, _workspace_layout_hash())
 
     def __c_abi_spec__(self) -> list:
         def fill_offsets(a, s):
@@ -151,13 +157,9 @@ class Workspace:
     def get_dispatch_token_buffer_ptr(self):
         return self.base + align(self.NUM_BARRIER_SIGNAL_BYTES, BLOCK_M)
 
-    def get_l2_token_buffer_ptr(self):
+    def get_combine_token_buffer_ptr(self):
         buffer_bytes = align(self.num_max_recv_tokens * self.hidden * self.token_dtype.itemsize, BLOCK_M)
         return self.get_dispatch_token_buffer_ptr() + buffer_bytes
-
-    def get_combine_token_buffer_ptr(self):
-        pool_bytes = align(self.num_max_pool_tokens * self.hidden * self.token_dtype.itemsize, BLOCK_M)
-        return self.get_l2_token_buffer_ptr() + pool_bytes
 
     def get_dispatch_flag_ptr(self):
         combine_token_buffer_bytes = align(
@@ -210,6 +212,11 @@ class Workspace:
         return self.base + (self.NUM_MAX_GRID_SYNC_COUNTERS + 1) * 4 + phase * 4
 
 
+@functools.lru_cache(maxsize=1)
+def _workspace_layout_hash() -> str:
+    return hashlib.sha256(inspect.getsource(Workspace).encode()).hexdigest()[:16]
+
+
 def get_symm_buffer_size_for_mega_moe(
     num_ranks: int,
     num_experts: int,
@@ -255,9 +262,6 @@ def get_symm_buffer_size_for_mega_moe(
                 dev,
             ),
             _tensor_from_device_ptr(int(workspace.get_weight_recv_buf_ptr()), (npt,), torch.float32, dev),
-            _tensor_from_device_ptr(
-                int(workspace.get_l2_token_buffer_ptr()), (npt, hidden), token_dtype, dev
-            ),
             _tensor_from_device_ptr(
                 int(workspace.get_combine_token_buffer_ptr()),
                 (workspace.num_max_routes, hidden),
@@ -359,7 +363,6 @@ class SymmBuffer:
         (
             self.dispatch_token_buffer,
             self.weight_recv_buf,
-            self.l2_token_buffer,
             self.combine_token_buffer,
             self.pool_row_to_route,
             self.pool_row_to_recv_token,

@@ -123,6 +123,7 @@ def _make_grouped_gemm_combine(
         POOL_ROW_TO_RECV_TOKEN: fx.Tensor,
         RECV_TOKEN_TO_POOL_ROWS: fx.Tensor,
         OUTPUT: fx.Tensor,
+        L2_TOKENS: fx.Tensor,  # bf16 [rows, out_features]: the L2 GEMM output, staged for the push
         TOPK_INDICES: fx.Tensor,
         NUM_TOKENS_PER_RANK: fx.Tensor,
         GRAD_GATE: fx.Tensor,
@@ -160,7 +161,9 @@ def _make_grouped_gemm_combine(
 
         combine_flag_base = workspace.get_combine_flag_ptr()
         reduce_flag_base = workspace.get_reduce_flag_ptr()
-        l2_token_buffer_base = workspace.get_l2_token_buffer_ptr()
+        l2_tokens_base = fx.arith.ArithValue(
+            fx.arith.index_cast(fx.T.i64, extract_base_index(L2_TOKENS)), signed=True
+        )
         combine_token_res = create_buffer_resource_from_addr(
             workspace.get_combine_token_buffer_ptr(), num_records_bytes=combine_token_bytes
         )
@@ -246,6 +249,7 @@ def _make_grouped_gemm_combine(
                         pool_row_to_route_res=pool_row_to_route_res,
                         pool_row_to_recv_token_res=pool_row_to_recv_token_res,
                         recv_token_to_pool_rows_res=recv_token_to_pool_rows_res,
+                        l2_ptr=l2_tokens_base,
                         epoch=expected_reduce,
                         reduce_bank=reduce_bank,
                         grad_gate_res=grad_gate_res,
@@ -288,7 +292,7 @@ def _make_grouped_gemm_combine(
             tile_n = gemm_block_idx % fx.Int32(num_tiles_n)
             if tile_m < num_tiles_m:
                 expert_idx = buffer_load(tile_to_expert_res, tile_m, vec_width=1, dtype=fx.T.i32)
-                # A/B base = ACT/WEIGHTS tensors; C base = l2_token_buffer (int64 symm addr).
+                # A/B/C base = ACT/WEIGHTS/L2_TOKENS tensors.
                 act_base = fx.arith.ArithValue(
                     fx.arith.index_cast(fx.T.i64, extract_base_index(ACT)), signed=True
                 )
@@ -301,7 +305,7 @@ def _make_grouped_gemm_combine(
                 c_off = cast(tile_m, fx.T.i64) * fx.Int64(BLOCK_M * 2) * cast(c_n, fx.T.i64)
                 A_tile = make_bf16_fp16_tile_tensor(act_base, a_off, BLOCK_M * K)
                 B_tile = make_bf16_fp16_tile_tensor(w_base, b_off, K * out_features)
-                C_tile = make_bf16_fp16_tile_tensor(l2_token_buffer_base, c_off, 0x40000000)
+                C_tile = make_bf16_fp16_tile_tensor(l2_tokens_base, c_off, 0x40000000)
                 gemm_tile(
                     A_tile,
                     B_tile,
@@ -364,6 +368,7 @@ def _compiled_grouped_gemm_combine(
     POOL_ROW_TO_RECV_TOKEN,
     RECV_TOKEN_TO_POOL_ROWS,
     OUTPUT,
+    L2_TOKENS,
     TOPK_INDICES,
     NUM_TOKENS_PER_RANK,
     GRAD_GATE,
@@ -433,6 +438,7 @@ def _compiled_grouped_gemm_combine(
         POOL_ROW_TO_RECV_TOKEN,
         RECV_TOKEN_TO_POOL_ROWS,
         OUTPUT,
+        L2_TOKENS,
         TOPK_INDICES,
         NUM_TOKENS_PER_RANK,
         GRAD_GATE,
@@ -461,7 +467,8 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
     assert x.dtype == torch.bfloat16 and l2_weights.dtype == torch.bfloat16
     symm = get_symm_buffer_for_mega_moe()
     sym_buffer = symm.get_sym_buffer()
-    num_max_pool_tokens, hidden_size = x.shape
+    rows, hidden_size = x.shape
+    num_max_pool_tokens = int(symm.num_max_pool_tokens)
     if layout == "nt":
         G, N, K = l2_weights.shape
     else:
@@ -471,7 +478,10 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
     assert out_features == int(symm.hidden), (
         f"out_features {out_features} != SymmBuffer hidden {int(symm.hidden)}"
     )
-    assert num_max_pool_tokens == int(symm.num_max_pool_tokens), "x rows must match SymmBuffer pool capacity"
+    # x holds the rows dispatched to this rank; the kernel is still built for the pool capacity
+    assert rows == handle.pool_row_to_route.numel() <= num_max_pool_tokens, (
+        f"x rows {rows} != the dispatched rows {handle.pool_row_to_route.numel()}"
+    )
     num_topk = int(symm.num_topk)
     num_experts = int(symm.num_experts)
     assert num_topk >= 1 and num_experts > 0, "topk reduce needs num_topk>=1 and num_experts>0"
@@ -504,6 +514,8 @@ def grouped_gemm_combine_bf16_flydsl_kernel(
         handle.pool_row_to_recv_token,
         handle.recv_token_to_pool_rows,
         output,
+        # local only (the push reads it here, nothing reads it cross-rank): the dispatched rows
+        torch.empty((rows, out_features), dtype=torch.bfloat16, device=x.device),
         topk_indices.contiguous(),
         symm.num_tokens_per_rank,
         # without a grad gate both gate arguments are traced out; any device i32 tensor fills them

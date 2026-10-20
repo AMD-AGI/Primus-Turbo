@@ -636,10 +636,11 @@ def generate_input(group, *, kind, symm, T, H, I, E, K, BLOCK_M, BLOCK_N, num_di
 
     kind="dispatch": pool is filled by a single dispatch PUSH (real A for the L1 GEMM).
     kind="combine":  prologue + dispatch + L1 GEMM + SwiGLU -> act (real L2 input), and
-                     l2_token_buffer is filled once so combine_only has real rows."""
+                     the L2 stage (l2_tokens) is filled once so combine_only has real rows."""
     x, topk_idx, topk_weight, handle, tile_to_expert, num_tile_blocks = _get_dispatch_handle(
         symm, T=T, H=H, E=E, K=K
     )
+    rows = handle.pool_row_to_route.numel()  # the block_m-padded rows dispatched to this rank
     # this rank's expert weights: deterministic global set (fixed seed) sliced per rank -> consistent across ranks.
     g = torch.Generator(device="cuda").manual_seed(1234)
     W1_global = torch.randn((E, 2 * I, H), generator=g, device="cuda", dtype=torch.bfloat16) * (
@@ -676,11 +677,9 @@ def generate_input(group, *, kind, symm, T, H, I, E, K, BLOCK_M, BLOCK_N, num_di
     if kind == "combine":
         # combine scoreboard = monotonic combine_flag (never reset). dispatch PUSH fills pool, then grouped L1 GEMM (NT): pool[M,H]@W1 -> l1_out[M,2I].
         _dispatch_and_settle(group, x, handle, symm, num_dispatch_cu=num_dispatch_cu)
-        l1_out = torch.empty((symm.num_max_pool_tokens, 2 * I), dtype=torch.bfloat16, device="cuda")
+        l1_out = torch.empty((rows, 2 * I), dtype=torch.bfloat16, device="cuda")
         grouped_gemm_bf16_only(
-            F.pad(symm.dispatch_token_buffer, (0, 0, 0, 1))[
-                handle.pool_row_to_recv_token[: symm.num_max_pool_tokens].long()
-            ],
+            F.pad(symm.dispatch_token_buffer, (0, 0, 0, 1))[handle.pool_row_to_recv_token[:rows].long()],
             W1,
             l1_out,
             tile_to_expert,
@@ -690,12 +689,13 @@ def generate_input(group, *, kind, symm, T, H, I, E, K, BLOCK_M, BLOCK_N, num_di
         )
         # fused SwiGLU activation scaled by the routing weight -> act (L2 GEMM input)
         act = swiglu_flydsl_kernel(l1_out, num_tile_blocks, scale=symm.weight_recv_buf)
-        # fill l2_token_buffer once with the real rows (for combine_only)
+        # fill the L2 stage once with the real rows (for combine_only)
+        l2_tokens = torch.empty((rows, H), dtype=torch.bfloat16, device="cuda")
         grouped_gemm_bf16_only(
-            act, W2, symm.l2_token_buffer, tile_to_expert, num_tile_blocks, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
+            act, W2, l2_tokens, tile_to_expert, num_tile_blocks, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
         )
         # bwd L1-dgrad input: draw from the global RNG (caller re-seeds per rep for reproducibility)
-        grad_l1 = torch.randn(symm.num_max_pool_tokens, 2 * I, device="cuda", dtype=torch.bfloat16) / 8
+        grad_l1 = torch.randn(rows, 2 * I, device="cuda", dtype=torch.bfloat16) / 8
         torch.cuda.synchronize()
         group.barrier()
         return SimpleNamespace(
@@ -703,6 +703,7 @@ def generate_input(group, *, kind, symm, T, H, I, E, K, BLOCK_M, BLOCK_N, num_di
             x=x,  # raw input tokens (for the turbo full-forward reference)
             act=act,
             grad_l1=grad_l1,  # L1-dgrad input for the combine backward stage
+            l2_tokens=l2_tokens,
             handle=handle,
             num_tile_blocks=num_tile_blocks,
             topk_idx=topk_idx,
@@ -960,11 +961,15 @@ def _compile_combine_only_task(
         POOL_ROW_TO_ROUTE: fx.Tensor,
         POOL_ROW_TO_RECV_TOKEN: fx.Tensor,
         RECV_TOKEN_TO_POOL_ROWS: fx.Tensor,
+        L2_TOKENS: fx.Tensor,
         sym_buffer: SymBuffer,
     ):
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
         combine_cu = fx.Int32(num_combine_cu)
+        l2_ptr = fx.arith.ArithValue(
+            fx.arith.index_cast(fx.T.i64, extract_base_index(L2_TOKENS)), signed=True
+        )
         # build workspace (hoist heap-derived ptrs before dynamic control flow)
         workspace = Workspace(
             sym_buffer.get_base_ptr(),
@@ -998,6 +1003,7 @@ def _compile_combine_only_task(
                 pool_row_to_route_res=pool_row_to_route_res,
                 pool_row_to_recv_token_res=pool_row_to_recv_token_res,
                 recv_token_to_pool_rows_res=recv_token_to_pool_rows_res,
+                l2_ptr=l2_ptr,
                 epoch=fx.Int64(0),
                 reduce_bank=fx.Int32(0),
                 grad_gate_res=grad_gate_res,
@@ -1013,6 +1019,7 @@ def _compile_combine_only_task(
         POOL_ROW_TO_ROUTE,
         POOL_ROW_TO_RECV_TOKEN,
         RECV_TOKEN_TO_POOL_ROWS,
+        L2_TOKENS,
         sym_buffer,
         stream: fx.Stream,
     ):
@@ -1024,6 +1031,7 @@ def _compile_combine_only_task(
             POOL_ROW_TO_ROUTE,
             POOL_ROW_TO_RECV_TOKEN,
             RECV_TOKEN_TO_POOL_ROWS,
+            L2_TOKENS,
             sym_buffer,
             value_attrs=make_value_attrs(2, 0, "512,512"),
         ).launch(grid=(num_combine_cu, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
@@ -1035,6 +1043,7 @@ def combine_only(
     group,
     *,
     handle,
+    l2_tokens,
     BLOCK_M=256,
     num_combine_cu=None,
     grad_gate=None,
@@ -1061,10 +1070,11 @@ def combine_only(
         handle.pool_row_to_route,
         handle.pool_row_to_recv_token,
         handle.recv_token_to_pool_rows,
+        l2_tokens,
         symm.get_sym_buffer(),
         stream=torch.cuda.current_stream(),
     )
-    return symm.l2_token_buffer
+    return l2_tokens
 
 
 def topk_reduce_only(
@@ -1512,7 +1522,7 @@ def _combine_make_fused_call(ctx, lhs, rhs, *, layout="nt"):
 
 def _combine_make_comm_call(ctx):
     """Build the combine-only call (the comm baseline; CU count autotuned)."""
-    return lambda: combine_only(ctx.group, handle=ctx.inp.handle)
+    return lambda: combine_only(ctx.group, handle=ctx.inp.handle, l2_tokens=ctx.inp.l2_tokens)
 
 
 def _combine_stage_fwd(runner, ctx):
@@ -1528,7 +1538,7 @@ def _combine_stage_fwd(runner, ctx):
         grouped_gemm_bf16_only(
             inp.act,
             inp.W2,
-            symm.l2_token_buffer,
+            inp.l2_tokens,
             inp.tile_to_expert,
             inp.num_tile_blocks,
             BLOCK_M=256,
@@ -1536,7 +1546,7 @@ def _combine_stage_fwd(runner, ctx):
             GROUP_M=8,
         )
         sync_ranks(ctx.group)
-        combine_only(ctx.group, handle=ctx.inp.handle)
+        combine_only(ctx.group, handle=ctx.inp.handle, l2_tokens=ctx.inp.l2_tokens)
         sync_ranks(ctx.group)
         topk_reduce_only(
             ref_y,
@@ -1560,7 +1570,7 @@ def _combine_stage_fwd(runner, ctx):
         gemm_fn=lambda: grouped_gemm_bf16_only(
             inp.act,
             inp.W2,
-            symm.l2_token_buffer,
+            inp.l2_tokens,
             inp.tile_to_expert,
             inp.num_tile_blocks,
             BLOCK_M=256,
@@ -1587,7 +1597,7 @@ def _combine_stage_bwd(runner, ctx):
         grouped_gemm_bf16_only(
             grad_l1,
             inp.W1,
-            symm.l2_token_buffer,
+            inp.l2_tokens,
             inp.tile_to_expert,
             inp.num_tile_blocks,
             layout="nn",
@@ -1596,7 +1606,7 @@ def _combine_stage_bwd(runner, ctx):
             GROUP_M=8,
         )
         sync_ranks(ctx.group)
-        combine_only(ctx.group, handle=ctx.inp.handle)
+        combine_only(ctx.group, handle=ctx.inp.handle, l2_tokens=ctx.inp.l2_tokens)
         sync_ranks(ctx.group)
         topk_reduce_only(
             ref_dx,
@@ -1619,7 +1629,7 @@ def _combine_stage_bwd(runner, ctx):
         gemm_fn=lambda: grouped_gemm_bf16_only(
             grad_l1,
             inp.W1,
-            symm.l2_token_buffer,
+            inp.l2_tokens,
             inp.tile_to_expert,
             inp.num_tile_blocks,
             layout="nn",

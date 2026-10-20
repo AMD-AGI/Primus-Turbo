@@ -141,7 +141,6 @@ def _test_forward_backward_impl(
     *,
     num_experts,
     num_topk,
-    enable_cudagraph=False,
     enable_torch_compile=False,
     activation=None,
     staged=False,
@@ -171,11 +170,7 @@ def _test_forward_backward_impl(
         l2_m = l2_weight.detach().requires_grad_(True)
         tw_m = topk_weight.detach().requires_grad_(True)
 
-        # make_graphed_callables warms up then captures both forward and backward graphs
-        if enable_cudagraph:
-            runner = torch.cuda.make_graphed_callables(runner, (x_m, tw_m, l1_m, l2_m))
-
-        # device-side epoch flag advances per replay, so replay #2+ stays correct
+        # device-side epoch flags advance per call, so call #2+ must stay correct
         num_iters = 4
         for _ in range(num_iters):
             y_m = runner(x_m, tw_m, l1_m, l2_m)
@@ -275,7 +270,7 @@ class FusedMegaMoETestBase(MultiProcContinuousTest):
         self.assertGreaterEqual(snr, _SNR_THRESHOLD_DB, f"[{tag}] SNR {snr:.2f} dB < {_SNR_THRESHOLD_DB}")
         self.assertGreaterEqual(cos, _COSINE_THRESHOLD, f"[{tag}] cosine {cos:.5f} < {_COSINE_THRESHOLD}")
 
-    # ── forward + backward vs turbo DeepEP; optional cudagraph / torch.compile ──
+    # ── forward + backward vs turbo DeepEP; optional torch.compile ──
     @skip_unless_gfx950
     @skip_if_lt_x_gpu(8)
     @parametrize(
@@ -284,14 +279,7 @@ class FusedMegaMoETestBase(MultiProcContinuousTest):
             (7168, 2048, 256, 8, 8192),
         ],
     )
-    @parametrize(
-        "enable_cudagraph, enable_torch_compile",
-        [
-            (False, False),
-            (True, False),
-            (False, True),
-        ],
-    )
+    @parametrize("enable_torch_compile", [False, True])
     def test_forward_backward(
         self,
         hidden,
@@ -299,7 +287,6 @@ class FusedMegaMoETestBase(MultiProcContinuousTest):
         num_experts,
         num_topk,
         num_tokens,
-        enable_cudagraph,
         enable_torch_compile,
     ):
         self._setup_device()
@@ -318,7 +305,6 @@ class FusedMegaMoETestBase(MultiProcContinuousTest):
             topk_weight,
             num_experts=num_experts,
             num_topk=num_topk,
-            enable_cudagraph=enable_cudagraph,
             enable_torch_compile=enable_torch_compile,
         )
         for tag, actual, ref in results:
@@ -338,12 +324,11 @@ class FusedMegaMoETestBase(MultiProcContinuousTest):
         ],
     )
     @parametrize(
-        "staged, enable_cudagraph, enable_torch_compile",
+        "staged, enable_torch_compile",
         [
-            (True, False, False),
-            (False, False, False),
-            (False, True, False),
-            (False, False, True),
+            (True, False),
+            (False, False),
+            (False, True),
         ],
     )
     def test_forward_backward_swigluoai(
@@ -354,7 +339,6 @@ class FusedMegaMoETestBase(MultiProcContinuousTest):
         num_topk,
         num_tokens,
         staged,
-        enable_cudagraph,
         enable_torch_compile,
     ):
         self._setup_device()
@@ -373,7 +357,6 @@ class FusedMegaMoETestBase(MultiProcContinuousTest):
             topk_weight,
             num_experts=num_experts,
             num_topk=num_topk,
-            enable_cudagraph=enable_cudagraph,
             enable_torch_compile=enable_torch_compile,
             activation=GLUActivation.swigluoai(),
             staged=staged,
