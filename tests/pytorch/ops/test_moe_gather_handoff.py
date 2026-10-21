@@ -14,7 +14,23 @@ from unittest.mock import patch
 
 import torch
 
-_PATH = Path(__file__).resolve().parents[3] / "primus_turbo/pytorch/ops/moe_gather.py"
+_RELPATH = Path("pytorch/ops/moe_gather.py")
+
+
+def _moe_gather_path():
+    source = Path(__file__).resolve().parents[3] / "primus_turbo" / _RELPATH
+    if source.is_file():
+        return source
+    # Locating the top-level package does not execute its __init__ (which loads the extension).
+    spec = importlib.util.find_spec("primus_turbo")
+    for location in (spec.submodule_search_locations or []) if spec else []:
+        installed = Path(location) / _RELPATH
+        if installed.is_file():
+            return installed
+    raise FileNotFoundError(f"primus_turbo/{_RELPATH} is neither in the source tree nor installed")
+
+
+_PATH = _moe_gather_path()
 _SPEC = importlib.util.spec_from_file_location("moe_gather_under_test", _PATH)
 gather = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(gather)
