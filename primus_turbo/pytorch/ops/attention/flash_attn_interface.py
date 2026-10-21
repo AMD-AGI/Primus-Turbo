@@ -546,6 +546,7 @@ class TritonFlashAttnFunc(torch.autograd.Function):
             -1,
             alibi_slopes,
             ctx.use_fp8,
+            None,
         )
 
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
