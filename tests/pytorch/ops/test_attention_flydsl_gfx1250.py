@@ -266,8 +266,8 @@ def test_forward_and_backward_route_to_the_gfx1250_kernels(monkeypatch):
         calls.append(("fwd", q.is_contiguous(), k.is_contiguous(), softmax_scale, causal))
         return torch.zeros_like(q), torch.zeros(b, hq, sq)
 
-    def bwd(dout, q, k, v, out, lse, softmax_scale=None, causal=True):
-        calls.append(("bwd", tuple(lse.shape), tuple(out.shape)))
+    def bwd(dout, q, k, v, out, lse, softmax_scale=None, causal=True, deterministic=False):
+        calls.append(("bwd", tuple(lse.shape), tuple(out.shape), deterministic))
         return torch.ones_like(q), torch.ones_like(k), torch.ones_like(v)
 
     def forbidden(*args, **kwargs):
@@ -290,7 +290,7 @@ def test_forward_and_backward_route_to_the_gfx1250_kernels(monkeypatch):
         GlobalBackendManager.set_attn_backend(None, PrecisionType.BF16_FP16_FP32)
 
     assert calls[0] == ("fwd", True, True, None, True)
-    assert calls[1] == ("bwd", (b, hq, sq), (b, sq, hq, D))
+    assert calls[1] == ("bwd", (b, hq, sq), (b, sq, hq, D), False)  # flash_attn_func's default
     assert k.grad.shape == (b, skv, hkv, D) and torch.all(k.grad == 1)
 
 
@@ -706,6 +706,46 @@ def test_compiled_launchers_are_cached_per_launcher_device_and_signature(monkeyp
 
 
 @needs_flydsl
+def test_compiled_launchers_are_cached_per_constexpr_value(monkeypatch):
+    """A launcher's fx.Constexpr arguments key _run_compiled's cache: the fused backward's
+    launchers take the GQA group size as one, and a function compiled for one group size run
+    on another group's tensors would address the wrong q heads (past the end for a larger one)."""
+    import flydsl.expr as fx
+
+    from primus_turbo.flydsl.attention.gfx1250 import flash_attn_bwd_fused_kernel as fused
+    from primus_turbo.flydsl.attention.gfx1250 import flash_attn_utils as utils
+
+    def launcher(x: torch.Tensor, n: int, group: fx.Constexpr[int], stream):
+        pass
+
+    class Exe:  # a flyc.jit launcher keeps the Python function in .func
+        func = staticmethod(launcher)
+
+    exe, calls = Exe(), []
+    monkeypatch.setattr(utils, "_COMPILED", {})
+    monkeypatch.setattr(utils, "_CONSTEXPR_POS", {})
+    monkeypatch.setattr(
+        utils.flyc,
+        "compile",
+        lambda e, *args: calls.append(("compile", args[2])) or (lambda *a: calls.append(("cached", a[2]))),
+    )
+    t = torch.empty(2, 8, dtype=torch.bfloat16, device="meta")
+    for group, n, expect in (
+        (2, 5, "compile"),
+        (4, 5, "compile"),
+        (2, 7, "cached"),
+        (4, 9, "cached"),
+        (8, 5, "compile"),
+    ):
+        calls.clear()
+        utils._run_compiled(exe, t, n, group, None)
+        assert calls == [(expect, group)], (group, n)
+    # the real fused launchers declare the group as fx.Constexpr (position 20 / 22 of their arguments)
+    assert utils._constexpr_values(fused.launch_dkdv_fused, list(range(22))) == (20,)
+    assert utils._constexpr_values(fused.launch_dkdv_fused_sp, list(range(24))) == (22,)
+
+
+@needs_flydsl
 @pytest.mark.parametrize(
     ("shape", "dkdv_chain", "dq_chain"),
     [
@@ -718,7 +758,8 @@ def test_compiled_launchers_are_cached_per_launcher_device_and_signature(monkeyp
     ids=["llama3.1-8b", "small_grid", "dkdv_unsplit", "dq_unsplit", "gqa2_unsplit"],
 )
 def test_backward_kernels_and_streams(monkeypatch, shape, dkdv_chain, dq_chain):
-    """flash_attn_bwd on meta tensors with the launches and streams faked, so no GPU kernel runs:
+    """deterministic=True: flash_attn_bwd on meta tensors with the launches and streams faked, so
+    no GPU kernel runs:
     k_delta_bshd on the caller's stream, the fork, the dK/dV chain on the caller's stream and
     the dQ chain on the side stream, then the join; no record_stream. The grid sizes pick each
     chain's kernels.
@@ -762,7 +803,7 @@ def test_backward_kernels_and_streams(monkeypatch, shape, dkdv_chain, dq_chain):
     monkeypatch.setattr(torch, "empty_like", logged(torch.empty_like))
     monkeypatch.setattr(interface, "_SIDE_STREAMS", {})
     monkeypatch.setattr(interface, "_launch", launch)
-    dq, dk, dv = interface.flash_attn_bwd(q, q, k, v, q, lse, causal=True)
+    dq, dk, dv = interface.flash_attn_bwd(q, q, k, v, q, lse, causal=True, deterministic=True)
     assert [e[:3] for e in events if e[0] != "alloc"] == [
         ("launch", "delta", "caller"),
         ("wait", "side", "caller"),
@@ -841,6 +882,53 @@ def _check(got, ref, min_db=40.0):
         assert snr > min_db, f"{name}: {snr:.1f} dB"
 
 
+@needs_flydsl
+@pytest.mark.parametrize(
+    ("shape", "causal", "deterministic", "chain"),
+    [
+        ((4, 8192, 8192, 32, 8), True, False, ["delta", "dkdv_fused", "dq_cvt"]),
+        ((1, 1024, 1024, 8, 2), True, False, ["delta", "dkdv_fused_sp", "redsp", "dq_cvt"]),
+        ((1, 512, 4096, 16, 16), True, False, ["delta", "dkdv_fused", "dq_cvt"]),
+        ((4, 8192, 8192, 32, 8), False, False, None),
+        ((1, 1024, 1088, 8, 2), True, False, None),
+        ((4, 8192, 8192, 32, 8), True, True, None),
+    ],
+    ids=["llama3.1-8b", "small_grid", "sq_lt_skv", "non_causal", "skv_not_x128", "deterministic"],
+)
+def test_fused_backward_launch_plan(monkeypatch, shape, causal, deterministic, chain):
+    """Which calls take the fused backward (dQ inside the dK/dV kernel, fp32 dQ atomics): causal,
+    Skv a multiple of 128 (Sq is always one of 64 here) and not deterministic. Its launches all go to the caller's
+    stream, in order; chain None means the two-kernel path (it forks a side stream)."""
+    from primus_turbo.flydsl.attention.gfx1250 import interface
+
+    b, sq, skv, hq, hkv = shape
+    q, k, v = _meta(b, sq, skv, hq, hkv)
+    lse = torch.empty(b, hq, sq, device="meta")
+    launches = []
+
+    class FakeStream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_stream(self, other):
+            pass
+
+    caller = FakeStream("caller")
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: caller)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda device=None: FakeStream("side"))
+    monkeypatch.setattr(interface, "_SIDE_STREAMS", {})
+    monkeypatch.setattr(
+        interface, "_launch", lambda name, launcher, args: launches.append((name, args[-1].name))
+    )
+    dq, dk, dv = interface.flash_attn_bwd(q, q, k, v, q, lse, causal=causal, deterministic=deterministic)
+    if chain is None:
+        assert not any(name in ("dkdv_fused", "dkdv_fused_sp", "dq_cvt") for name, _ in launches)
+    else:
+        assert launches == [(name, "caller") for name in chain]
+    assert (dq.shape, dk.shape, dv.shape) == (q.shape, k.shape, v.shape)
+    assert dq.dtype == dk.dtype == dv.dtype == torch.bfloat16
+
+
 # (b, sq, skv, hq, hkv) of test_matches_reference, causal and not. Together they reach both
 # forward tilings at every GQA ratio and every backward path, which
 # test_numeric_shapes_reach_every_kernel_variant checks without a GPU kernel.
@@ -864,7 +952,8 @@ _NUMERIC_SHAPES = {
 @needs_flydsl
 def test_numeric_shapes_reach_every_kernel_variant(monkeypatch):
     """The shapes of test_matches_reference reach both forward tilings at every GQA ratio (the
-    tiling picked for a device of 256 CUs), split and unsplit dK/dV, and split and grouped dQ.
+    tiling picked for a device of 256 CUs), split and unsplit dK/dV, split and grouped dQ, and
+    the fused backward split and unsplit.
     Checked with the kernels and streams faked, so no GPU kernel runs."""
     from primus_turbo.flydsl.attention.gfx1250 import interface
 
@@ -886,23 +975,40 @@ def test_numeric_shapes_reach_every_kernel_variant(monkeypatch):
     for b, sq, skv, hq, hkv in _NUMERIC_SHAPES.values():
         q, k, v = _meta(b, sq, skv, hq, hkv)
         interface.flash_attn_fwd(q, k, v, causal=True)
-        interface.flash_attn_bwd(q, q, k, v, q, torch.empty(b, hq, sq, device="meta"), causal=True)
+        for deterministic in (True, False):
+            lse = torch.empty(b, hq, sq, device="meta")
+            interface.flash_attn_bwd(q, q, k, v, q, lse, causal=True, deterministic=deterministic)
     tilings = (interface._fwd.DEFAULT, interface._fwd.SMALL_GRID)
     assert forward == {(t.kernel_name, g) for t in tilings for g in interface.GQA_RATIOS}
-    assert backward == {"delta", "dkdv", "dkdv_sp", "redsp", "dqg", "dq_sp", "redsp_q"}
+    assert backward == {
+        "delta",
+        "dkdv",
+        "dkdv_sp",
+        "redsp",
+        "dqg",
+        "dq_sp",
+        "redsp_q",
+        "dkdv_fused",
+        "dkdv_fused_sp",
+        "dq_cvt",
+    }
 
 
 @needs_gfx1250
 @pytest.mark.parametrize("shape", list(_NUMERIC_SHAPES.values()), ids=list(_NUMERIC_SHAPES))
 @pytest.mark.parametrize("causal", [True, False])
-def test_matches_reference(shape, causal):
+@pytest.mark.parametrize("deterministic", [False, True], ids=["fast", "deterministic"])
+def test_matches_reference(shape, causal, deterministic):
     """Covers both forward variants (grid below / above the CU count) at every GQA ratio and the
     backward's split-K (small grids), grouped dQ (large grids) and unsplit dK/dV (dkdv_unsplit,
     whose Skv/32 * Hkv * B = 2048 kv tiles fill the machine twice; gqa2_large_grid) paths.
     both_unsplit and gqa2_large_grid run k_dkdv and k_dqg concurrently on two streams, the
-    combination of the Llama-3.1-8B training shape."""
+    combination of the Llama-3.1-8B training shape. Causal calls run twice: the default takes
+    the fused backward wherever the shape allows it, deterministic=True the two-kernel one."""
+    if deterministic and not causal:
+        pytest.skip("non-causal calls take the two-kernel backward either way")
     q, k, v, dout = _inputs(*shape)
-    _check(_run(q, k, v, dout, causal), _reference(q, k, v, dout, causal))
+    _check(_run(q, k, v, dout, causal, deterministic=deterministic), _reference(q, k, v, dout, causal))
 
 
 @needs_gfx1250
@@ -935,11 +1041,27 @@ def test_explicit_softmax_scale():
 @pytest.mark.deterministic
 def test_backward_is_deterministic():
     q, k, v, dout = _inputs(2, 1024, 1024, 32, 8)
+    first = _run(q, k, v, dout, True, deterministic=True)
+    for _ in range(3):
+        again = _run(q, k, v, dout, True, deterministic=True)
+        for a, b in zip(first, again):
+            assert torch.equal(a, b)
+
+
+@needs_gfx1250
+@pytest.mark.parametrize("shape", [(2, 1024, 1024, 32, 8), (2, 4096, 4096, 32, 8)], ids=["split", "unsplit"])
+def test_fused_backward_repeats(shape):
+    """The fused backward sums dQ with fp32 atomics in no fixed order: out, lse, dK and dV are
+    still bitwise reproducible, dQ to rounding only."""
+    q, k, v, dout = _inputs(*shape)
     first = _run(q, k, v, dout, True)
     for _ in range(3):
         again = _run(q, k, v, dout, True)
-        for a, b in zip(first, again):
-            assert torch.equal(a, b)
+        for name, a, b in zip(("out", "lse", "dq", "dk", "dv"), first, again):
+            if name == "dq":
+                assert compute_snr(a.float().cpu(), b.float().cpu()) > 70.0
+            else:
+                assert torch.equal(a, b), name
 
 
 @needs_gfx1250

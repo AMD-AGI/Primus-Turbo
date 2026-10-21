@@ -119,12 +119,13 @@ def _backward(
     lse: torch.Tensor,
     softmax_scale: float,
     causal: bool,
+    deterministic: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _interface().flash_attn_bwd(dout, q, k, v, out, lse, softmax_scale, causal)
+    return _interface().flash_attn_bwd(dout, q, k, v, out, lse, softmax_scale, causal, deterministic)
 
 
 @_backward.register_fake
-def _(dout, q, k, v, out, lse, softmax_scale, causal):
+def _(dout, q, k, v, out, lse, softmax_scale, causal, deterministic):
     return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
 
 
@@ -138,9 +139,22 @@ def flash_attn_flydsl_gfx1250_forward_impl(q, k, v, softmax_scale=None, causal=T
     return _forward(q, k, v, _scale(softmax_scale, q.shape[-1]), bool(causal))
 
 
-def flash_attn_flydsl_gfx1250_backward_impl(dout, q, k, v, out, lse, softmax_scale=None, causal=True):
+def flash_attn_flydsl_gfx1250_backward_impl(
+    dout, q, k, v, out, lse, softmax_scale=None, causal=True, deterministic=False
+):
     """Returns (dq, dk, dv), contiguous [b, s, h, d]; dk/dv have k's head count.
 
-    q/k/v/out/lse are what the forward saw and returned; only dout may arrive strided.
+    q/k/v/out/lse are what the forward saw and returned; only dout may arrive strided. Unless
+    ``deterministic``, dq may be summed with fp32 atomics (not bitwise reproducible).
     """
-    return _backward(dout.contiguous(), q, k, v, out, lse, _scale(softmax_scale, q.shape[-1]), bool(causal))
+    return _backward(
+        dout.contiguous(),
+        q,
+        k,
+        v,
+        out,
+        lse,
+        _scale(softmax_scale, q.shape[-1]),
+        bool(causal),
+        bool(deterministic),
+    )

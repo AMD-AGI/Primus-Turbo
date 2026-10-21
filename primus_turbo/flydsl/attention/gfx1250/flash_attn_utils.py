@@ -20,12 +20,15 @@ from .flydsl_version import require_flydsl
 
 require_flydsl()
 
+import inspect
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 
 # UNSTABLE(gfx1250): raw MLIR context, only to unwind the one flyc.compile leaves open on failure.
 from flydsl._mlir import ir
+from flydsl.expr.typing import Constexpr
 
 LOG2E = 1.4426950408889634
 # Lanes per wave. gfx1250 runs wave32, and every layout and reshape in these kernels assumes it;
@@ -49,8 +52,27 @@ def create_llvm_ptr(value, address_space=1):
 
 
 # The package's one compiled-function cache: (flyc.jit launcher, device, (dtype, rank) of each
-# tensor argument) -> the CompiledFunction flyc.compile returned for it.
+# tensor argument, values of its Constexpr arguments) -> the CompiledFunction flyc.compile
+# returned for it.
 _COMPILED = {}
+# Positions of each launcher's fx.Constexpr parameters.
+_CONSTEXPR_POS = {}
+
+
+def _constexpr_values(exe, args):
+    """The values of ``exe``'s ``fx.Constexpr`` arguments: each value is compiled into different
+    code, so it keys the cache like the tensor signature does."""
+    pos = _CONSTEXPR_POS.get(exe)
+    if pos is None:
+        # a flyc.jit launcher keeps the Python function in .func (its _sig is only set on first call)
+        func = getattr(exe, "func", None)
+        params = inspect.signature(func).parameters.values() if callable(func) else ()
+        pos = _CONSTEXPR_POS[exe] = tuple(
+            i
+            for i, p in enumerate(params)
+            if isinstance(p.annotation, type) and issubclass(p.annotation, Constexpr)
+        )
+    return tuple(args[i] for i in pos)
 
 
 def _run_compiled(exe, *args):
@@ -59,16 +81,18 @@ def _run_compiled(exe, *args):
     A plain ``flyc.jit`` call re-derives flydsl's whole cache key on every launch, a flat
     ~0.27 ms of host time; the ``CompiledFunction`` that ``flyc.compile`` returns only refreshes
     the argument storage. Every shape-dependent argument of these launchers is a runtime value,
-    so one compiled function serves every shape; it is cached per launcher, device and tensor
-    signature (each tensor's dtype and rank, which its argument storage is built for). flydsl's
-    own JIT cache key has no device, and driving two devices from one process is untested.
+    so one compiled function serves every shape; it is cached per launcher, device, tensor
+    signature (each tensor's dtype and rank, which its argument storage is built for) and the
+    values of the launcher's ``fx.Constexpr`` arguments (each value is different code: the
+    fused backward bakes the GQA group size in). flydsl's own JIT cache key has no device, and
+    driving two devices from one process is untested.
 
     The first call, ``flyc.compile(exe, *args)``, compiles **and** launches. Under flydsl's
     ``COMPILE_ONLY`` it only compiles and returns None, which is not cached, so every call
     compiles and none launches.
     """
     tensors = [a for a in args if isinstance(a, torch.Tensor)]
-    key = (exe, tensors[0].device, tuple((t.dtype, t.dim()) for t in tensors))
+    key = (exe, tensors[0].device, tuple((t.dtype, t.dim()) for t in tensors), _constexpr_values(exe, args))
     cf = _COMPILED.get(key)
     if cf is not None:
         cf(*args)
