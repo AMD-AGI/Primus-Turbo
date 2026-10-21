@@ -61,7 +61,7 @@ Use the pre-built AMD ROCm image from [Docker Hub](https://hub.docker.com/r/rocm
 docker pull rocm/primus:v26.8
 
 # JAX Ecosystem
-docker pull rocm/jax-training:maxtext-v26.2
+docker pull rocm/jax-training:maxtext-v26.8
 ```
 
 You can also use the official ROCm PyTorch image from [Docker Hub](https://hub.docker.com/r/rocm/pytorch).

@@ -23,6 +23,18 @@ random.seed(42)
 CLAMP_LIMIT = 1.0
 
 
+def _clamp_ref(x: torch.Tensor, min=None, max=None):
+    """``torch.clamp`` that keeps the gradient at ``x == bound``, as the Turbo and TE clamped GLU kernels do.
+
+    torch>=2.14 zeroes the ``torch.clamp`` gradient at a scalar bound (pytorch/pytorch#185831).
+    """
+    if max is not None:
+        x = torch.where(x > max, max, x)
+    if min is not None:
+        x = torch.where(x < min, min, x)
+    return x
+
+
 # NOTE: Align precision with torch.compile
 @torch.compile
 def swiglu_with_probs_ref(x: torch.Tensor, probs: torch.Tensor):
@@ -37,8 +49,8 @@ def swiglu_with_probs_ref(x: torch.Tensor, probs: torch.Tensor):
 def clamped_swiglu_with_probs_ref(x: torch.Tensor, probs: torch.Tensor, clamp_limit: float):
     dtype = x.dtype
     gate, up = torch.chunk(x, 2, dim=-1)
-    gate = torch.clamp(gate, max=clamp_limit)
-    up = torch.clamp(up, min=-clamp_limit, max=clamp_limit)
+    gate = _clamp_ref(gate, max=clamp_limit)
+    up = _clamp_ref(up, min=-clamp_limit, max=clamp_limit)
     res = F.silu(gate) * up
     return (res * probs).to(dtype)
 
@@ -73,8 +85,8 @@ def geglu_with_probs_ref(x: torch.Tensor, probs: torch.Tensor):
 def clamped_geglu_with_probs_ref(x: torch.Tensor, probs: torch.Tensor, clamp_limit: float):
     dtype = x.dtype
     gate, up = torch.chunk(x, 2, dim=-1)
-    gate = torch.clamp(gate, max=clamp_limit)
-    up = torch.clamp(up, min=-clamp_limit, max=clamp_limit)
+    gate = _clamp_ref(gate, max=clamp_limit)
+    up = _clamp_ref(up, min=-clamp_limit, max=clamp_limit)
     res = F.gelu(gate) * up
     return (res * probs).to(dtype)
 
