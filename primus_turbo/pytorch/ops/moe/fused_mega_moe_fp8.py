@@ -15,11 +15,15 @@ The fp8 counterpart of ``fused_mega_moe``, with the same two entry points:
 
 Pass ``w1`` / ``w2`` as the high-precision weights; their mxfp8 quant is maintained inside the
 impls, keyed on ``w._version``. The op is NOT CUDA-graph capturable.
+
+An expert shape off the fp8 kernels' grid (see ``fp8_padded_dims``; GPT-OSS's 2880) runs
+zero-padded: the weight preps pad the weights, and the ops here pad x / dy and slice y / dx / dW.
 """
 
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from torch.distributed import ProcessGroup
 
 from primus_turbo.flydsl.utils.glu_activation import GLUActivation
@@ -29,6 +33,61 @@ from primus_turbo.pytorch.kernels.fused_mega_moe import (
     fused_mega_moe_stage2_backward_fp8_impl,
     fused_mega_moe_stage2_forward_fp8_impl,
 )
+from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_fp8_weights import (
+    fp8_padded_dims,
+    pad_b1_fp8_dims,
+    unpad_b1_grad,
+    unpad_w1_grad,
+    unpad_w2_grad,
+)
+
+
+def _pad_cols(t: torch.Tensor, cols: int) -> torch.Tensor:
+    return t if t.shape[-1] == cols else F.pad(t, (0, cols - t.shape[-1]))
+
+
+def _slice_cols(t: torch.Tensor, cols: int) -> torch.Tensor:
+    return t if t.shape[-1] == cols else t[:, :cols].contiguous()
+
+
+class _GatheredExpertBiasFunction(torch.autograd.Function):
+    """``y + sum_k p_k * bias[topk_idx_k]`` on the token's own rank, the fc2-bias term of the experts.
+
+    The fp8 combine quantizes each expert row before it leaves the expert's rank, so the bias is
+    added after the reduce instead, where the routing weights are at hand: the EP-sharded bias is
+    small enough ([E, H]) to all-gather whole, and the term is one ``[T, E] @ [E, H]`` with the
+    routing weights scattered dense. Its backward reduce-scatters the bias gradient back to the
+    experts' owners and adds ``dy . bias[e]`` to each routing weight's gradient."""
+
+    @staticmethod
+    def forward(ctx, y, topk_idx, topk_weights, bias, group):
+        bias_full = torch.empty(
+            (bias.shape[0] * group.size(), bias.shape[1]), dtype=bias.dtype, device=bias.device
+        )
+        torch.distributed.all_gather_into_tensor(bias_full, bias.contiguous(), group=group)
+        bias_full = bias_full.float()
+        probs = torch.zeros((y.shape[0], bias_full.shape[0]), dtype=torch.float32, device=y.device)
+        probs.scatter_(1, topk_idx, topk_weights.float())
+        ctx.save_for_backward(topk_idx, probs, bias_full)
+        ctx.group, ctx.bias_dtype = group, bias.dtype
+        return torch.addmm(y.float(), probs, bias_full).to(y.dtype)
+
+    @staticmethod
+    @torch.no_grad()
+    def backward(ctx, dy):
+        topk_idx, probs, bias_full = ctx.saved_tensors
+        dy32 = dy.float()
+        d_topk_weights = (dy32 @ bias_full.t()).gather(1, topk_idx)
+        d_bias_full = probs.t() @ dy32
+        d_bias = torch.empty(
+            (d_bias_full.shape[0] // ctx.group.size(), d_bias_full.shape[1]),
+            dtype=torch.float32,
+            device=dy.device,
+        )
+        torch.distributed.reduce_scatter_tensor(d_bias, d_bias_full, group=ctx.group)
+        # grads for (y, topk_idx, topk_weights, bias, group)
+        return dy, None, d_topk_weights, d_bias.to(ctx.bias_dtype), None
+
 
 # This op file exports only its own final API (the autograd Function + its wrapper). Everything else
 # (the per-stage ``_mxfp8_*`` helpers, ``_DW_FP8_FORMAT``, and the ``prepare_w1t/w2t_dgrad_fp8``
@@ -107,6 +166,8 @@ class FusedMegaMoEFP8Stage1Function(torch.autograd.Function):
             topk_idx = topk_idx.to(torch.int64)
             ctx.set_materialize_grads(False)
             save_bwd = any(ctx.needs_input_grad)
+            hidden, inter = w1.shape[2], w1.shape[1] // 2
+            padded_hidden, _ = fp8_padded_dims(hidden, inter)
 
             (
                 l1,
@@ -115,7 +176,7 @@ class FusedMegaMoEFP8Stage1Function(torch.autograd.Function):
                 pool_x_colwise,
                 colwise_meta,
             ) = fused_mega_moe_stage1_forward_fp8_impl(
-                x,
+                _pad_cols(x, padded_hidden),
                 w1,
                 group,
                 topk_idx,
@@ -134,6 +195,7 @@ class FusedMegaMoEFP8Stage1Function(torch.autograd.Function):
                 ctx.topk_idx = topk_idx
                 ctx.num_tokens = x.shape[0]
                 ctx.num_topk = topk_idx.shape[-1]
+                ctx.hidden, ctx.inter = hidden, inter
                 ctx.save_for_backward(w1)
             # handle tensors are non-differentiable index/table tensors
             ctx.mark_non_differentiable(*handle)
@@ -173,6 +235,8 @@ class FusedMegaMoEFP8Stage1Function(torch.autograd.Function):
                 ctx.num_topk,
             )
 
+            dx = _slice_cols(dx, ctx.hidden)
+            dW1 = unpad_w1_grad(dW1, ctx.hidden, ctx.inter)
             # grads for (x, topk_idx, topk_weights, w1, group, state)
             return dx, None, grad_topk_weights, dW1.to(w1.dtype), None, None
 
@@ -188,6 +252,7 @@ class FusedMegaMoEFP8Stage2Function(torch.autograd.Function):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
         w2: torch.Tensor,
+        fc1_bias: Optional[torch.Tensor],
         group: ProcessGroup,
         state: _Fp8StageState,
         activation: Optional[GLUActivation],
@@ -198,6 +263,8 @@ class FusedMegaMoEFP8Stage2Function(torch.autograd.Function):
                 "w2 must be a 3D bf16 CUDA tensor"
             )
             handle = tuple(handle)
+            hidden, inter = w2.shape[1], w2.shape[2]
+            fc1_bias_run = None if fc1_bias is None else pad_b1_fp8_dims(fc1_bias, l1.shape[1] // 2)
 
             y = fused_mega_moe_stage2_forward_fp8_impl(
                 l1,
@@ -207,7 +274,9 @@ class FusedMegaMoEFP8Stage2Function(torch.autograd.Function):
                 topk_idx,
                 topk_weights,
                 activation,
+                fc1_bias_run,
             )
+            y = _slice_cols(y, hidden)
 
             ctx.set_materialize_grads(False)
             if any(ctx.needs_input_grad):
@@ -215,8 +284,9 @@ class FusedMegaMoEFP8Stage2Function(torch.autograd.Function):
                 ctx.state = state
                 ctx.activation = activation
                 ctx.handle = handle
+                ctx.hidden, ctx.inter = hidden, inter
                 # dispatch_weights is unused in forward; saved only as the SwiGLU^T scale in backward
-                ctx.save_for_backward(l1, dispatch_weights, w2)
+                ctx.save_for_backward(l1, dispatch_weights, w2, fc1_bias_run)
             return y
 
     @staticmethod
@@ -230,18 +300,19 @@ class FusedMegaMoEFP8Stage2Function(torch.autograd.Function):
                 raise RuntimeError(_SECOND_BACKWARD)
             # stage1's ctx still holds both for its own backward
             ctx.state = ctx.handle = None
-            n_in = 8 + len(handle)
+            n_in = 9 + len(handle)
             if grad_y is None:
                 return (None,) * n_in
-            l1, dispatch_weights, w2 = ctx.saved_tensors
+            l1, dispatch_weights, w2, fc1_bias_run = ctx.saved_tensors
 
             (
                 grad_l1_rowwise_fp8,
                 grad_l1_colwise_fp8,
                 grad_gate,
                 dW2,
+                d_fc1_bias,
             ) = fused_mega_moe_stage2_backward_fp8_impl(
-                grad_y,
+                _pad_cols(grad_y, fp8_padded_dims(ctx.hidden, ctx.inter)[0]),
                 l1,
                 dispatch_weights,
                 w2,
@@ -249,17 +320,23 @@ class FusedMegaMoEFP8Stage2Function(torch.autograd.Function):
                 ctx.group,
                 state.colwise_meta,
                 ctx.activation,
+                fc1_bias_run,
             )
             state.grad_l1_rowwise_fp8 = grad_l1_rowwise_fp8
             state.grad_l1_colwise_fp8 = grad_l1_colwise_fp8
+            dW2 = unpad_w2_grad(dW2, ctx.hidden, ctx.inter)
+            if d_fc1_bias is not None:
+                d_fc1_bias = unpad_b1_grad(d_fc1_bias, ctx.inter)
 
-            # grads for (l1, dispatch_weights, topk_idx, topk_weights, w2, group, state, activation, *handle)
+            # grads for (l1, dispatch_weights, topk_idx, topk_weights, w2, fc1_bias, group, state,
+            # activation, *handle)
             return (
                 None,
                 grad_gate,
                 None,
                 None,
                 dW2.to(w2.dtype),
+                d_fc1_bias,
                 None,
                 None,
                 None,
@@ -307,19 +384,28 @@ def fused_mega_moe_fp8_stage2(
     w2: torch.Tensor,
     group: ProcessGroup,
     activation: Optional[GLUActivation] = None,
+    fc1_bias: Optional[torch.Tensor] = None,
+    fc2_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Stage2 gate-down (MXFP8). Consumes stage1's forward state; returns y.
 
     Stage2 owns the gated activation, so ``activation`` (``None`` = SiLU-SwiGLU) is given here only.
+    The optional expert biases follow Megatron's TEGroupedMLP, as in the bf16 ``fused_mega_moe_stage2``:
+    ``fc1_bias`` [E_local, 2I] before the activation, ``fc2_bias`` [E_local, H] scaled by the routing
+    weight, i.e. ``y = sum_k p_k (act_k @ w2^T + fc2_bias)``.
     """
-    return FusedMegaMoEFP8Stage2Function.apply(
+    y = FusedMegaMoEFP8Stage2Function.apply(
         l1,
         dispatch_weights,
         topk_idx,
         topk_weights,
         w2,
+        fc1_bias,
         group,
         state,
         activation,
         *handle,
     )
+    if fc2_bias is not None:
+        y = _GatheredExpertBiasFunction.apply(y, topk_idx.to(torch.int64), topk_weights, fc2_bias, group)
+    return y

@@ -14,10 +14,12 @@
 from typing import Optional
 
 import flydsl.expr as fx
+from flydsl._mlir.dialects import vector as _vector
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.utils.arith import ArithValue
 
+from primus_turbo.flydsl.mega.bf16.symm_buffer import BLOCK_M as POOL_BLOCK_M
 from primus_turbo.flydsl.mega.bf16.symm_buffer import SymBuffer, Workspace
 from primus_turbo.flydsl.utils.buffer_ops import (
     buffer_load,
@@ -116,7 +118,7 @@ def dispatch_bf16_tile(
 ):
     """Push this block's chunk of every expert's task to one dst rank, in ascending expert order."""
     hidden_bytes = hidden_size * 2
-    assert hidden_bytes % 1024 == 0, "hidden*2 must be a multiple of 1024 bytes -> hidden % 512 == 0"
+    assert hidden_bytes % 16 == 0, "hidden*2 must be a multiple of 16 bytes -> hidden % 8 == 0"
     hidden_i32 = hidden_bytes // 4  # row stride in i32 words
     row_stride = num_chunks * _NUM_WARPS
     num_max_pool_blocks = int(workspace.num_max_pool_blocks)
@@ -181,8 +183,11 @@ def _pool_row_resource(l2_ptr, pool_row, row_bytes, is_present=True):
     return create_buffer_resource_from_addr(base, num_records_bytes=num_records_bytes)
 
 
-def _sum_pool_rows(pool_rows, l2_ptr, combine_token_res, dst_base, dropped_base, lane_col, hidden):
-    """Store the f32 sum of the present pool_rows (ascending, -1 absent) as one bf16 row at dst_base."""
+def _sum_pool_rows(pool_rows, l2_ptr, combine_token_res, dst_base, dropped_base, lane_col, hidden, bias=None):
+    """Store the f32 sum of the present pool_rows (ascending, -1 absent) as one bf16 row at dst_base.
+
+    ``bias`` = ``(bias_ptr, tile_to_expert_res, weight_res)`` adds each present row's routing weight
+    times its expert's bias row, the ``out + b * p`` Megatron applies to an expert's fc2 output."""
     f32_vec = fx.T.vec(_PVEC, fx.T.f32)
     bf16_vec = fx.T.vec(_PVEC, fx.T.bf16)
     row_bytes = hidden * 2
@@ -190,10 +195,28 @@ def _sum_pool_rows(pool_rows, l2_ptr, combine_token_res, dst_base, dropped_base,
     num_full_chunks = hidden // cols_per_step
     tail_cols = hidden % cols_per_step
     row_resources = [_pool_row_resource(l2_ptr, pool_rows[0], row_bytes)]
+    safe_rows, presence = [pool_rows[0]], [True]
     for pool_row in pool_rows[1:]:
         is_present = pool_row >= fx.Int32(0)
         safe_row = arith.select(is_present, pool_row, pool_rows[0])
         row_resources.append(_pool_row_resource(l2_ptr, safe_row, row_bytes, is_present))
+        safe_rows.append(safe_row)
+        presence.append(is_present)
+    bias_terms = []
+    if bias is not None:
+        bias_ptr, tile_to_expert_res, weight_res = bias
+        for safe_row, is_present in zip(safe_rows, presence):
+            expert = buffer_load(
+                tile_to_expert_res, safe_row // fx.Int32(POOL_BLOCK_M), vec_width=1, dtype=fx.T.i32
+            )
+            weight = buffer_load(weight_res, safe_row, vec_width=1, dtype=fx.T.f32)
+            # an absent row's bias resource is empty too, so its term reads 0
+            bias_terms.append(
+                (
+                    _pool_row_resource(bias_ptr, expert, row_bytes, is_present),
+                    _vector.broadcast(f32_vec, weight),
+                )
+            )
 
     def accumulate(cols):
         sums = [None] * len(cols)
@@ -205,10 +228,17 @@ def _sum_pool_rows(pool_rows, l2_ptr, combine_token_res, dst_base, dropped_base,
             for i, value in enumerate(values):
                 term = fx.arith.extf(f32_vec, value)
                 sums[i] = term if sums[i] is None else fx.arith.addf(sums[i], term)
+        for bias_res, weight in bias_terms:
+            values = [buffer_load(bias_res, col, vec_width=_PVEC, dtype=fx.T.bf16) for col in cols]
+            for i, value in enumerate(values):
+                sums[i] = fx.arith.addf(sums[i], fx.arith.mulf(fx.arith.extf(f32_vec, value), weight))
         return sums
 
     # passes bound the loads in flight so the sum stays inside the GEMM's VGPR budget
-    num_passes = max(1, min(num_full_chunks, ceildiv(len(pool_rows) * num_full_chunks, _MAX_LOADS_IN_FLIGHT)))
+    loads_per_chunk = len(pool_rows) + len(bias_terms)
+    num_passes = max(
+        1, min(num_full_chunks, ceildiv(loads_per_chunk * num_full_chunks, _MAX_LOADS_IN_FLIGHT))
+    )
     chunks_per_pass = max(1, ceildiv(num_full_chunks, num_passes))
     for first_chunk in range(0, num_full_chunks, chunks_per_pass):
         last_chunk = min(first_chunk + chunks_per_pass, num_full_chunks)
@@ -243,10 +273,12 @@ def combine_bf16_tile(
     reduce_bank: fx.Int32,
     grad_gate_res: Optional[ArithValue] = None,
     has_grad_gate: bool = False,
+    bias: Optional[tuple] = None,
 ):
     """Push each fold row in [first_fold_row, +num_fold_rows) as its recv token's sum to the primary route.
 
-    ``l2_ptr`` (i64) is this rank's L2 GEMM output, one row per pool row; only this rank reads it."""
+    ``l2_ptr`` (i64) is this rank's L2 GEMM output, one row per pool row; only this rank reads it.
+    ``bias``: the experts' fc2 bias, see :func:`_sum_pool_rows`."""
     hidden = int(workspace.hidden)
     num_topk = int(workspace.num_topk)
     assert num_topk <= _WARP, "lane k pushes the grad_gate of pool row k"
@@ -308,6 +340,26 @@ def combine_bf16_tile(
 
     def push_payload(fold_row, pool_rows, dst_route):
         dst_base = dst_route * fx.Int32(hidden)
+        if const_expr(bias is not None):
+            # a bias term rides the sum, so with one the single-row copy has nothing to offer
+            _sum_pool_rows(
+                pool_rows, l2_ptr, combine_token_res, dst_base, dropped_base, lane_col, hidden, bias
+            )
+        else:
+            push_rows_sum(fold_row, pool_rows, dst_route, dst_base)
+        if const_expr(has_grad_gate):
+            # lane k pushes the grad_gate of pool_rows[k] to that row's own route
+            lane_pool_row = pool_rows[0]
+            for k in range_constexpr(1, num_topk):
+                lane_pool_row = arith.select(lane_id == fx.Int32(k), pool_rows[k], lane_pool_row)
+            is_gate_lane = (lane_id < fx.Int32(num_topk)) & (lane_pool_row >= fx.Int32(0))
+            gate_row = arith.select(is_gate_lane, lane_pool_row, pool_rows[0])
+            gate_value = buffer_load(grad_gate_res, gate_row, vec_width=1, dtype=fx.T.f32)
+            gate_route = buffer_load(pool_row_to_route_res, gate_row, vec_width=1, dtype=fx.T.i32)
+            gate_dst = arith.select(is_gate_lane, gate_route, fx.Int32(num_max_routes))
+            buffer_store(gate_value, combine_gate_res, gate_dst, cache_modifier=19)
+
+    def push_rows_sum(fold_row, pool_rows, dst_route, dst_base):
         second_pool_row = pool_rows[1] if num_topk > 1 else fx.Int32(-1)
         if second_pool_row < fx.Int32(0):
             copy_warp(
@@ -331,17 +383,6 @@ def combine_bf16_tile(
                 buffer_store(tail_value, combine_token_res, dst, cache_modifier=19)
         else:
             _sum_pool_rows(pool_rows, l2_ptr, combine_token_res, dst_base, dropped_base, lane_col, hidden)
-        if const_expr(has_grad_gate):
-            # lane k pushes the grad_gate of pool_rows[k] to that row's own route
-            lane_pool_row = pool_rows[0]
-            for k in range_constexpr(1, num_topk):
-                lane_pool_row = arith.select(lane_id == fx.Int32(k), pool_rows[k], lane_pool_row)
-            is_gate_lane = (lane_id < fx.Int32(num_topk)) & (lane_pool_row >= fx.Int32(0))
-            gate_row = arith.select(is_gate_lane, lane_pool_row, pool_rows[0])
-            gate_value = buffer_load(grad_gate_res, gate_row, vec_width=1, dtype=fx.T.f32)
-            gate_route = buffer_load(pool_row_to_route_res, gate_row, vec_width=1, dtype=fx.T.i32)
-            gate_dst = arith.select(is_gate_lane, gate_route, fx.Int32(num_max_routes))
-            buffer_store(gate_value, combine_gate_res, gate_dst, cache_modifier=19)
 
     local_count = (num_fold_rows - warp_id + fx.Int32(_NUM_WARPS - 1)) // fx.Int32(_NUM_WARPS)
     num_grouped = (local_count // fx.Int32(_ROW_UNROLL)) * fx.Int32(_ROW_UNROLL)

@@ -59,6 +59,9 @@ from primus_turbo.flydsl.mega.fp8.symm_buffer import (  # noqa: E402
 from primus_turbo.pytorch.kernels.fused_mega_moe import (  # noqa: E402
     advance_weight_generation,
 )
+from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_fp8_weights import (  # noqa: E402
+    fp8_padded_dims,
+)
 from primus_turbo.pytorch.ops.moe.fused_mega_moe import GLUActivation  # noqa: E402
 from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import (  # noqa: E402
     fused_mega_moe_fp8_stage1,
@@ -131,7 +134,16 @@ class _StagedFp8Harness:
         return topk_idx.to(torch.int64), probs.gather(1, topk_idx).to(torch.float32)
 
     def _staged_forward_backward(
-        self, hidden, inter, num_experts, num_topk, num_tokens, activation=None, l1_gain=1.0, hot_topk=None
+        self,
+        hidden,
+        inter,
+        num_experts,
+        num_topk,
+        num_tokens,
+        activation=None,
+        l1_gain=1.0,
+        hot_topk=None,
+        with_bias=False,
     ):
         torch.cuda.set_device(self.device)
         torch.manual_seed(42 + self.rank)
@@ -150,13 +162,21 @@ class _StagedFp8Harness:
         )
         if hot_topk is not None:
             topk_idx, topk_weight = self._hot_rank0_routing(num_tokens, num_experts, num_topk, hot_topk)
+        fc1_bias = fc2_bias = None
+        if with_bias:
+            g = torch.Generator(device=self.device).manual_seed(4321 + self.rank)
+            epr = num_experts // self.world_size
+            fc1_bias = torch.randn((epr, 2 * inter), generator=g, device=self.device).bfloat16()
+            fc2_bias = torch.randn((epr, hidden), generator=g, device=self.device).bfloat16()
+        # the op runs an off-grid shape zero-padded, on a symm buffer of the padded dims
+        padded_hidden, padded_inter = fp8_padded_dims(hidden, inter)
         symm = get_symm_buffer_for_mega_moe(
             group,
             num_experts=num_experts,
             num_max_tokens_per_rank=num_tokens,
             num_topk=num_topk,
-            hidden=hidden,
-            intermediate_hidden=inter,
+            hidden=padded_hidden,
+            intermediate_hidden=padded_inter,
             use_mxfp8=True,
         )
         try:
@@ -178,10 +198,16 @@ class _StagedFp8Harness:
                 old_pool = 2 * num_tokens * num_topk + num_experts // self.world_size * 256
                 self.assertGreaterEqual(rows, self.world_size * num_tokens * hot_topk)
                 self.assertGreater(rows, old_pool)
-            y_m = fused_mega_moe_fp8_stage2(
-                l1_out, dwib, handle, state, topk_idx, tw_m, l2_m, group, activation
+            b1_m, b2_m = (
+                None if b is None else b.detach().requires_grad_(True) for b in (fc1_bias, fc2_bias)
             )
-            dx_m, dl1_m, dl2_m, dtw_m = torch.autograd.grad(y_m, [x_m, l1_m, l2_m, tw_m], grad_y)
+            bias_m = [b for b in (b1_m, b2_m) if b is not None]
+            y_m = fused_mega_moe_fp8_stage2(
+                l1_out, dwib, handle, state, topk_idx, tw_m, l2_m, group, activation, b1_m, b2_m
+            )
+            dx_m, dl1_m, dl2_m, dtw_m, *dbias_m = torch.autograd.grad(
+                y_m, [x_m, l1_m, l2_m, tw_m, *bias_m], grad_y
+            )
             torch.cuda.synchronize()
             group.barrier()
 
@@ -189,6 +215,11 @@ class _StagedFp8Harness:
             l1_t = l1_weight.detach().requires_grad_(True)
             l2_t = l2_weight.detach().requires_grad_(True)
             tw_t = topk_weight.detach().requires_grad_(True)
+            # f32 bias leaves, as the bf16 suite's reference wants them
+            b1_t, b2_t = (
+                None if b is None else b.detach().float().requires_grad_(True) for b in (fc1_bias, fc2_bias)
+            )
+            bias_t = [b for b in (b1_t, b2_t) if b is not None]
             y_t = baseline_reference(
                 group,
                 x_t,
@@ -199,17 +230,33 @@ class _StagedFp8Harness:
                 num_experts=num_experts,
                 num_topk=num_topk,
                 activation=activation,
+                fc1_bias=b1_t,
+                fc2_bias=b2_t,
             )
-            dx_t, dl1_t, dl2_t, dtw_t = torch.autograd.grad(y_t, [x_t, l1_t, l2_t, tw_t], grad_y)
+            dx_t, dl1_t, dl2_t, dtw_t, *dbias_t = torch.autograd.grad(
+                y_t, [x_t, l1_t, l2_t, tw_t, *bias_t], grad_y
+            )
             torch.cuda.synchronize()
             group.barrier()
 
+            bias_tags = [
+                tag for tag, b in (("dfc1_bias", fc1_bias), ("dfc2_bias", fc2_bias)) if b is not None
+            ]
             results = [
                 ("forward", y_m, y_t),
                 ("dx", dx_m, dx_t),
                 ("dl1_weight", dl1_m, dl1_t),
                 ("dl2_weight", dl2_m, dl2_t),
                 ("dtw", dtw_m, dtw_t),
+                # a bias grad is small enough for compute_snr's 1e-12 noise floor to cap it; unit-norm it
+                *(
+                    (
+                        tag,
+                        a.float() / r.float().norm().clamp_min(1e-30),
+                        r.float() / r.float().norm().clamp_min(1e-30),
+                    )
+                    for tag, a, r in zip(bias_tags, dbias_m, dbias_t)
+                ),
             ]
         finally:
             symm.destroy()
@@ -287,6 +334,30 @@ class FusedMegaMoEFp8Test(_StagedFp8Harness, MultiProcContinuousTest):
             num_topk,
             num_tokens,
             activation=GLUActivation.swigluoai(),
+        )
+
+    @skip_unless_mxfp8
+    @skip_if_lt_x_gpu(8)
+    @parametrize(
+        "hidden, inter, num_experts, num_topk, num_tokens",
+        [
+            (2880, 2880, 32, 4, 8192),  # GPT-OSS-20B
+            (2880, 2880, 128, 4, 8192),  # GPT-OSS-120B
+        ],
+    )
+    def test_staged_forward_backward_gptoss(self, hidden, inter, num_experts, num_topk, num_tokens):
+        """GPT-OSS: swigluoai, biased experts, and hidden = intermediate = 2880, off the fp8 kernels'
+        grid, so the op runs it zero-padded to 3072. At this suite's L1 output (see the swigluoai test
+        for why not a clamp-heavy one) the padding is exact: 8 x MI355X, EP8, bias-free, it measures
+        fwd 22.7, dx 21.9, dW1 22.4, dW2 23.3, dtw 23.5 dB -- the DSv3 shape's figures."""
+        self._staged_forward_backward(
+            hidden,
+            inter,
+            num_experts,
+            num_topk,
+            num_tokens,
+            activation=GLUActivation.swigluoai(),
+            with_bias=True,
         )
 
     @skip_unless_mxfp8

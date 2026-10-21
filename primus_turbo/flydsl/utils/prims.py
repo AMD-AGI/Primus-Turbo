@@ -250,17 +250,30 @@ def copy_warp(
         base = _addr_i64(operand) + _addr_i64(word_off) * fx.Int64(_I32_BYTES)
         return create_buffer_resource_from_addr(base, num_records_bytes=nbytes), fx.Int32(0)
 
-    assert nbytes % (_WARP * 16) == 0, "copy_warp nbytes must be a multiple of 1024"
+    assert nbytes % (_COPY_VEC_I32 * _I32_BYTES) == 0, "copy_warp nbytes must be a multiple of 16"
+    cols = _WARP * _COPY_VEC_I32
+    num_full_chunks = nbytes // _I32_BYTES // cols
+    tail_words = nbytes // _I32_BYTES - num_full_chunks * cols
+    # A ragged tail parks its idle lanes' stores one row past the end, which only the
+    # num_records of an address-built dst resource turns into a dropped store.
+    assert not tail_words or "ptr" not in str(_unwrap_value(dst).type), (
+        "a ragged copy needs dst as an address"
+    )
     src, src_off = _copy_operand(src, src_off, nbytes)
     dst, dst_off = _copy_operand(dst, dst_off, nbytes)
     lane_off = (fx.thread_idx.x % fx.Int32(_WARP)) * fx.Int32(_COPY_VEC_I32)
-    cols = _WARP * _COPY_VEC_I32
-    offs = [fx.Int32(c * cols) + lane_off for c in range_constexpr(nbytes // 4 // cols)]
+    offs = [fx.Int32(c * cols) + lane_off for c in range_constexpr(num_full_chunks)]
+    load_offs = list(offs)
+    if tail_words:
+        in_tail = lane_off < fx.Int32(tail_words)
+        tail_off = fx.Int32(num_full_chunks * cols) + lane_off
+        load_offs.append(arith.select(in_tail, tail_off, fx.Int32(0)))
+        offs.append(arith.select(in_tail, tail_off, fx.Int32(nbytes // _I32_BYTES)))
     vals = [
         buffer_load(
             src, src_off + o, vec_width=_COPY_VEC_I32, dtype=fx.T.i32, cache_modifier=load_cache_modifier
         )
-        for o in offs
+        for o in load_offs
     ]
     for o, v in zip(offs, vals):
         buffer_store(v, dst, dst_off + o, cache_modifier=store_cache_modifier)

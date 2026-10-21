@@ -59,7 +59,7 @@ from primus_turbo.flydsl.utils.gemm_helper import (
     make_value_attrs,
     xcd_remap_pid,
 )
-from primus_turbo.flydsl.utils.prims import _readfirstlane_i32, cast, ld
+from primus_turbo.flydsl.utils.prims import _readfirstlane_i32, cast, ceildiv, ld
 
 
 @ASTRewriter.transform
@@ -112,15 +112,18 @@ def _make_kernel(
     if is_tn:
         OUT_M, OUT_N = hidden_size, out_features
         OUT_M_g, OUT_N_g = (OUT_N, OUT_M) if trans_c else (OUT_M, OUT_N)
-        assert OUT_M_g % BLOCK_M == 0 and OUT_N_g % BLOCK_N == 0
-        N_BLOCKS_M = OUT_M_g // BLOCK_M
-        N_BLOCKS_N = OUT_N_g // BLOCK_N
+        # the variable-K tile masks a ragged OUT_M / OUT_N itself
+        N_BLOCKS_M = ceildiv(OUT_M_g, BLOCK_M)
+        N_BLOCKS_N = ceildiv(OUT_N_g, BLOCK_N)
         TILES_PER_GROUP = N_BLOCKS_M * N_BLOCKS_N
         TOTAL = G * TILES_PER_GROUP
     else:
         gemm_tile = functools.partial(gemm_bf16_tile, layout, pair_n=not out_fp16)
-        assert out_features % BLOCK_N == 0, "out_features must be a multiple of BLOCK_N"
-        n_blocks = out_features // BLOCK_N
+        # the tile takes a 64- or 128-column tail (n_tail below); other remainders have no feed variant
+        assert out_features % BLOCK_N in (0, 64, 128), (
+            f"out_features % BLOCK_N must be 0, 64 or 128, got {out_features % BLOCK_N}"
+        )
+        n_blocks = ceildiv(out_features, BLOCK_N)
         worst_case_tiles = num_max_pool_tokens // BLOCK_M
     num_pool_blocks = num_max_pool_tokens // BLOCK_M
     row_idx_ptr_ty = PointerType.get(elem_ty=fx.T.i32, address_space=AddressSpace.Global, alignment=4)

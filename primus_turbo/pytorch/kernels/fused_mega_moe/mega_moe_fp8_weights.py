@@ -27,16 +27,98 @@ from primus_turbo.flydsl.mega.fp8 import (
 
 __all__ = [
     "advance_weight_generation",
+    "fp8_padded_dims",
+    "pad_w1_fp8_dims",
+    "pad_w2_fp8_dims",
     "prepare_dispatch_weight_fp8",
     "prepare_w1_fp8",
     "prepare_w1t_combine_fp8",
     "prepare_w2_fp8",
     "prepare_w2t_dgrad_fp8",
+    "unpad_w1_grad",
+    "unpad_w2_grad",
     "weight_generation",
 ]
 
 # dW1/dW2 wgrad fp8 encoding. E4M3 measured a slightly higher dW SNR than E5M2 at DSv3 magnitudes.
 _DW_FP8_FORMAT = torch.float8_e4m3fn
+
+# ─────────────────────────── padding to the fp8 kernels' alignment ───────────────────────────
+# The fp8 token push and reduce move whole 1 KiB rows (hidden % 1024), and the fp8 GEMM tiles take
+# neither a K nor an N tail: the intermediate is a K of the fc2 GEMM and an N of the L2 dgrad
+# (% 256). An expert shape off that grid (GPT-OSS: hidden = intermediate = 2880) runs zero-padded to
+# it. That is exact: a padded gate column is 0 before and after the activation, every padded weight
+# row/column is 0, and the padded outputs and gradients are sliced off.
+_FP8_HIDDEN_ALIGN = 1024
+_FP8_INTER_ALIGN = 256
+
+
+def fp8_padded_dims(hidden: int, inter: int) -> tuple:
+    """``(hidden, intermediate)`` rounded up to what the fp8 kernels run; unchanged when aligned."""
+    return (
+        -(-hidden // _FP8_HIDDEN_ALIGN) * _FP8_HIDDEN_ALIGN,
+        -(-inter // _FP8_INTER_ALIGN) * _FP8_INTER_ALIGN,
+    )
+
+
+def pad_w1_fp8_dims(w1: torch.Tensor) -> torch.Tensor:
+    """fc1 ``[G, 2I, H]`` -> ``[G, 2Ip, Hp]``; the gate and up halves are padded separately."""
+    G, two_i, hidden = w1.shape
+    inter = two_i // 2
+    hp, ip = fp8_padded_dims(hidden, inter)
+    if (hp, ip) == (hidden, inter):
+        return w1
+    out = w1.new_zeros((G, 2 * ip, hp))
+    out[:, :inter, :hidden] = w1[:, :inter]
+    out[:, ip : ip + inter, :hidden] = w1[:, inter:]
+    return out
+
+
+def pad_w2_fp8_dims(w2: torch.Tensor) -> torch.Tensor:
+    """fc2 ``[G, H, I]`` -> ``[G, Hp, Ip]``."""
+    G, hidden, inter = w2.shape
+    hp, ip = fp8_padded_dims(hidden, inter)
+    if (hp, ip) == (hidden, inter):
+        return w2
+    out = w2.new_zeros((G, hp, ip))
+    out[:, :hidden, :inter] = w2
+    return out
+
+
+def unpad_w1_grad(dw1: torch.Tensor, hidden: int, inter: int) -> torch.Tensor:
+    """The padded fc1 gradient ``[G, 2Ip, Hp]`` back to ``[G, 2I, H]``."""
+    ip = dw1.shape[1] // 2
+    if (dw1.shape[2], ip) == (hidden, inter):
+        return dw1
+    return torch.cat((dw1[:, :inter, :hidden], dw1[:, ip : ip + inter, :hidden]), dim=1)
+
+
+def pad_b1_fp8_dims(b1: torch.Tensor, padded_inter: int) -> torch.Tensor:
+    """fc1 bias ``[G, 2I]`` -> ``[G, 2Ip]``, gate and up halves padded separately like the weight."""
+    G, two_i = b1.shape
+    inter = two_i // 2
+    if inter == padded_inter:
+        return b1
+    out = b1.new_zeros((G, 2 * padded_inter))
+    out[:, :inter] = b1[:, :inter]
+    out[:, padded_inter : padded_inter + inter] = b1[:, inter:]
+    return out
+
+
+def unpad_b1_grad(db1: torch.Tensor, inter: int) -> torch.Tensor:
+    """The padded fc1 bias gradient ``[G, 2Ip]`` back to ``[G, 2I]``."""
+    ip = db1.shape[1] // 2
+    if ip == inter:
+        return db1
+    return torch.cat((db1[:, :inter], db1[:, ip : ip + inter]), dim=1)
+
+
+def unpad_w2_grad(dw2: torch.Tensor, hidden: int, inter: int) -> torch.Tensor:
+    """The padded fc2 gradient ``[G, Hp, Ip]`` back to ``[G, H, I]``."""
+    if tuple(dw2.shape[1:]) == (hidden, inter):
+        return dw2
+    return dw2[:, :hidden, :inter].contiguous()
+
 
 # dispatch_prologue handle layout: [9]=num_tokens_per_expert, [10]=its prefix into the padded pool.
 # These MUST be the REAL unpadded lengths -- the variable-K wgrads mask each group at group_lens, so
@@ -64,16 +146,17 @@ def prepare_dispatch_weight_fp8(w: torch.Tensor) -> tuple:
 
 
 def prepare_w1_fp8(w1: torch.Tensor) -> tuple:
-    """The L1 fc1 weight ``[G, 2I, H]`` prepped for the dispatch GEMM. Thin alias of
-    :func:`prepare_dispatch_weight_fp8`, so both weights prep through one layer."""
-    return prepare_dispatch_weight_fp8(w1)
+    """The L1 fc1 weight ``[G, 2I, H]`` prepped (padded to :func:`fp8_padded_dims`) for the dispatch
+    GEMM, through :func:`prepare_dispatch_weight_fp8` so both weights prep through one layer."""
+    return prepare_dispatch_weight_fp8(pad_w1_fp8_dims(w1))
 
 
 def prepare_w2_fp8(l2_weights: torch.Tensor) -> tuple:
     """Prepare a grouped combine-GEMM weight ``[G, N, K]`` -> ``(weight_flat int8 [G*N*K], b_sp
     int32)``, exactly the two operands the mxfp8 combine GEMM consumes: grouped mxfp8 quant + scale
     preshuffle (ScaleBComb, ``pack=4``) + int8 flat, so the combine does NO per-call weight quant or
-    preshuffle. Used for the forward fc2 weight and, transposed, the L1 dgrad fc1^T combine weight."""
+    preshuffle. Used for the forward fc2 weight and, transposed, the L1 dgrad fc1^T combine weight.
+    Takes the weight as the GEMM runs it; :func:`prepare_w2_fp8_padded` pads the forward fc2 first."""
     G, N, K = l2_weights.shape
     w2q, w2s = quantize_grouped_weight_mxfp8_flydsl(l2_weights)
     b_sp = preshuffle_b_scale(w2s, G, N, K, pack=4)
@@ -81,18 +164,23 @@ def prepare_w2_fp8(l2_weights: torch.Tensor) -> tuple:
     return weight_flat, b_sp
 
 
+def prepare_w2_fp8_padded(w2: torch.Tensor) -> tuple:
+    """The forward fc2 weight ``[G, H, I]``, padded to :func:`fp8_padded_dims`, prepped for the combine."""
+    return prepare_w2_fp8(pad_w2_fp8_dims(w2))
+
+
 def prepare_w2t_dgrad_fp8(w2: torch.Tensor) -> tuple:
-    """``w2^T`` [G,I,H] prepped for the L2 dgrad's dispatch GEMM -> ``(wq, flat, b_sp)``.
+    """``w2^T`` [G,Ip,Hp] prepped for the L2 dgrad's dispatch GEMM -> ``(wq, flat, b_sp)``.
 
     The L2 dgrad runs NT via the transposed weight, so w2 must be quantized along H (its
     contraction axis). Static weight prep; the transpose never runs inside the kernel.
     """
-    return prepare_dispatch_weight_fp8(w2.transpose(1, 2).contiguous())  # [G,I,H]
+    return prepare_dispatch_weight_fp8(pad_w2_fp8_dims(w2).transpose(1, 2).contiguous())  # [G,Ip,Hp]
 
 
 def prepare_w1t_combine_fp8(w1: torch.Tensor) -> tuple:
-    """``w1^T`` [G, H, 2I] prepped for the L1 dgrad's combine GEMM (same format as the forward w2)."""
-    return prepare_w2_fp8(w1.transpose(1, 2).contiguous())
+    """``w1^T`` [G, Hp, 2Ip] prepped for the L1 dgrad's combine GEMM (same format as the forward w2)."""
+    return prepare_w2_fp8(pad_w1_fp8_dims(w1).transpose(1, 2).contiguous())
 
 
 _WEIGHT_GENERATION = [0]
@@ -192,8 +280,8 @@ def _w1_fp8_cached(w1: torch.Tensor) -> tuple:
 
 
 def _w2_fp8_cached(w2: torch.Tensor) -> tuple:
-    """-> ``(weight_flat int8 [G*H*I], b_sp int32)`` for the forward fc2 combine."""
-    return _version_keyed_weight_prep(w2, _W2_PREP_ATTR, prepare_w2_fp8)
+    """-> ``(weight_flat int8 [G*Hp*Ip], b_sp int32)`` for the forward fc2 combine."""
+    return _version_keyed_weight_prep(w2, _W2_PREP_ATTR, prepare_w2_fp8_padded)
 
 
 def _w2t_fp8_cached(w2: torch.Tensor) -> tuple:

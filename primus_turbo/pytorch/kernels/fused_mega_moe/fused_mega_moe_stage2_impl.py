@@ -23,6 +23,10 @@ from primus_turbo.flydsl.utils.swiglu_kernel import (
     swiglu_backward_flydsl_kernel,
     swiglu_flydsl_kernel,
 )
+from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_bias_impl import (
+    fc1_bias_backward,
+    fc2_bias_backward,
+)
 
 
 def fused_mega_moe_stage2_forward_impl(
@@ -32,16 +36,32 @@ def fused_mega_moe_stage2_forward_impl(
     topk_idx: torch.Tensor,
     dispatch_weights: torch.Tensor,
     activation: Optional[GLUActivation] = None,
+    fc1_bias: Optional[torch.Tensor] = None,
+    fc2_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """SwiGLU (routing-weighted) + grouped L2 GEMM + combine (nt). Returns y."""
+    """SwiGLU (routing-weighted) + grouped L2 GEMM + combine (nt). Returns y.
+
+    ``fc1_bias`` [E_local, 2I] is added to ``l1_out`` inside the activation, ``fc2_bias`` [E_local, H]
+    to each row's L2 output scaled by its routing weight, inside the combine push."""
     # bound swiglu by THIS handle's tile count (per-forward, not shared symm)
     act = swiglu_flydsl_kernel(
-        l1_out, num_tile_blocks=handle.num_tile_blocks, scale=dispatch_weights, activation=activation
+        l1_out,
+        num_tile_blocks=handle.num_tile_blocks,
+        scale=dispatch_weights,
+        activation=activation,
+        bias=fc1_bias,
+        tile_to_expert=handle.tile_to_expert,
     )
 
     # fused grouped L2 GEMM + combine PUSH + topk reduce
     y, _ = grouped_gemm_combine_bf16_flydsl_kernel(
-        act, w2, handle, topk_indices=topk_idx.contiguous().view(-1), layout="nt"
+        act,
+        w2,
+        handle,
+        topk_indices=topk_idx.contiguous().view(-1),
+        layout="nt",
+        bias=fc2_bias,
+        bias_scale=dispatch_weights,
     )
     return y
 
@@ -54,8 +74,12 @@ def fused_mega_moe_stage2_backward_impl(
     handle: DispatchHandle,
     group,
     activation: Optional[GLUActivation] = None,
+    fc1_bias: Optional[torch.Tensor] = None,
+    fc2_bias: Optional[torch.Tensor] = None,
 ):
-    """L2 dgrad (nn) + SwiGLU^T + dW2. Returns ``(grad_l1, grad_gate, dW2)``."""
+    """L2 dgrad (nn) + SwiGLU^T + dW2 (+ the bias grads).
+
+    Returns ``(grad_l1, grad_gate, dW2, d_fc1_bias, d_fc2_bias)``; a bias grad is None without its bias."""
     dy = grad_y.contiguous().to(torch.bfloat16)
 
     # L2 dgrad: cross-rank dispatch PUSH + grouped GEMM (nn)
@@ -76,6 +100,8 @@ def fused_mega_moe_stage2_backward_impl(
         return_act_w=True,
         num_tile_blocks=handle.num_tile_blocks,
         activation=activation,
+        bias=fc1_bias,
+        tile_to_expert=handle.tile_to_expert,
     )
 
     # dW2 = dispatched(dy)^ @ act_weighted (variable-K)
@@ -87,4 +113,11 @@ def fused_mega_moe_stage2_backward_impl(
         trans_c=False,
         a_row_idx=handle.pool_row_to_recv_token,
     )
-    return grad_l1, grad_gate, dW2
+    # the dispatched dy lives in the symm buffer, which stage1's backward re-dispatches x into
+    d_fc2_bias = (
+        None
+        if fc2_bias is None
+        else fc2_bias_backward(dispatch_l2_grad, handle, dispatch_weights, fc2_bias, grad_gate)
+    )
+    d_fc1_bias = None if fc1_bias is None else fc1_bias_backward(grad_l1, handle, fc1_bias.dtype)
+    return grad_l1, grad_gate, dW2, d_fc1_bias, d_fc2_bias
