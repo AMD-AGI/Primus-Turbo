@@ -70,6 +70,7 @@ Primus-Turbo uses or references the following third-party projects:
        primus_turbo/flydsl/attention/gfx1250/__init__.py
        primus_turbo/flydsl/attention/gfx1250/buffer_ops.py
        primus_turbo/flydsl/attention/gfx1250/flash_attn_bwd_kernel.py
+       primus_turbo/flydsl/attention/gfx1250/flash_attn_bwd_fused_kernel.py
        primus_turbo/flydsl/attention/gfx1250/flash_attn_fwd_kernel.py
        primus_turbo/flydsl/attention/gfx1250/flash_attn_fwd_utils.py
        primus_turbo/flydsl/attention/gfx1250/flash_attn_utils.py

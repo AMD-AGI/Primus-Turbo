@@ -36,6 +36,7 @@ from .flydsl_version import require_flydsl
 
 require_flydsl()
 
+from . import flash_attn_bwd_fused_kernel as _fused
 from . import flash_attn_bwd_kernel as _bwd
 from . import flash_attn_fwd_kernel as _fwd
 from .flash_attn_utils import _run_compiled
@@ -189,11 +190,112 @@ def _side_stream(device):
     return stream
 
 
-def flash_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True):
+# The fused backward (flash_attn_bwd_fused_kernel: dQ inside the dK/dV kernel, 5 GEMMs per unit
+# instead of 7) covers causal problems with Sq a multiple of 64 and Skv of 128. It adds dQ with
+# fp32 atomics, so dQ is not bitwise reproducible; deterministic=True keeps the two-kernel path.
+# Its split-K over the q loop aims at two dispatch waves of the 4-wave workgroups (one per CU).
+_FUSED_TARGET_WGS = 512
+_FUSED_NSP_CAP = 16
+
+
+def _fused_ok(sq, skv, causal):
+    return bool(causal) and sq % _fused.SEQLEN_Q_MULTIPLE == 0 and skv % _fused.SEQLEN_KV_MULTIPLE == 0
+
+
+def _flash_attn_bwd_fused(do, q, k, v, o, lse, scale, stream):
+    b, sq, hq, d = q.shape
+    skv, hkv = k.shape[1], k.shape[2]
+    g = hq // hkv
+    n_rows = b * sq * hq
+    delta = torch.empty((b, hq, sq), device=q.device, dtype=torch.float32)
+    _launch("delta", _bwd.launch_delta, (do, o, delta, sq, hq, n_rows, n_rows // _bwd.ROWS_DELTA, stream))
+    # fp32 dQ accumulator in the kernel's WMMA C-fragment order (k_dq_cvt de-swizzles it)
+    dqa = torch.zeros((b, hq, sq, d), device=q.device, dtype=torch.float32)
+    nblk = skv // _fused.W4_BKV
+    nsp = 1
+    while nblk * hkv * b * nsp < _FUSED_TARGET_WGS and nsp < _FUSED_NSP_CAP:
+        nsp *= 2
+    dk = torch.empty((b, skv, hkv, d), device=k.device, dtype=k.dtype)
+    dv = torch.empty_like(dk)
+    if nsp == 1:
+        _launch(
+            "dkdv_fused",
+            _fused.launch_dkdv_fused,
+            (
+                q,
+                k,
+                v,
+                do,
+                lse,
+                delta,
+                dv,
+                dk,
+                dqa,
+                scale,
+                sq,
+                skv,
+                hq,
+                hkv,
+                sq // 16,
+                skv - sq,
+                1,
+                nblk,
+                hkv,
+                b,
+                g,
+                stream,
+            ),
+        )
+    else:
+        dkp = torch.empty((nsp, b, skv, hkv, d), device=k.device, dtype=torch.float32)
+        dvp = torch.empty_like(dkp)
+        _launch(
+            "dkdv_fused_sp",
+            _fused.launch_dkdv_fused_sp,
+            (
+                q,
+                k,
+                v,
+                do,
+                lse,
+                delta,
+                dvp,
+                dkp,
+                dqa,
+                scale,
+                sq,
+                skv,
+                hq,
+                hkv,
+                sq // 16,
+                skv - sq,
+                1,
+                nblk,
+                hkv,
+                b,
+                nsp,
+                hkv * nsp,
+                g,
+                stream,
+            ),
+        )
+        n_vec = dk.numel() // _bwd.RED_VEC
+        _launch(
+            "redsp", _bwd.launch_redsp, (dkp, dvp, dk, dv, n_vec, nsp, -(-n_vec // _bwd.RED_THREADS), stream)
+        )
+    dq = torch.empty((b, sq, hq, d), device=q.device, dtype=q.dtype)
+    _launch("dq_cvt", _fused.launch_dq_cvt, (dqa, dq, sq, hq, b * hq * (sq // 32), scale, stream))
+    return dq, dk, dv
+
+
+def flash_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, deterministic=False):
     """Returns (dq, dk, dv) in q/k/v's dtype and layout; dk/dv have Hkv heads.
 
-    The GQA reduction happens inside k_dkdv (one workgroup streams every q head of its
-    kv head), so every output element is written exactly once: deterministic, no atomics.
+    Unless ``deterministic``, a causal call with Sq a multiple of 64 and Skv of 128 takes the
+    fused backward (_flash_attn_bwd_fused), whose dQ is summed with fp32 atomics: dK/dV are
+    bitwise reproducible, dQ only to rounding. Otherwise, and for every other call: the GQA
+    reduction happens inside k_dkdv (one workgroup streams every q head of its kv head), so
+    every output element is written exactly once: deterministic, no atomics.
 
     Streams: the dQ chain runs on a side stream (see _SIDE_STREAMS) that first waits for the
     caller's current stream, and the current stream waits for the side stream before this
@@ -216,6 +318,8 @@ def flash_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True):
     g = hq // hkv
     cz = int(bool(causal))
     stream = torch.cuda.current_stream()
+    if not deterministic and _fused_ok(sq, skv, causal):
+        return _flash_attn_bwd_fused(do, q, k, v, o, lse, scale, stream)
     n_rows = b * sq * hq
 
     delta = torch.empty((b, hq, sq), device=q.device, dtype=torch.float32)

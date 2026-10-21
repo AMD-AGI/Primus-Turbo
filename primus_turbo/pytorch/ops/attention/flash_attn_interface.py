@@ -226,6 +226,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 ctx.save_for_backward(*saved)
                 ctx.softmax_scale = softmax_scale
                 ctx.causal = causal
+                ctx.deterministic = deterministic
             return (out, lse) if return_lse else out
 
         if backend == BackendType.FLYDSL:
@@ -375,7 +376,15 @@ class FlashAttnFunc(torch.autograd.Function):
             else:
                 q, k, v, out, lse = ctx.saved_tensors
                 dq, dk, dv = flash_attn_flydsl_gfx1250_backward_impl(
-                    dout, q, k, v, out, lse, softmax_scale=ctx.softmax_scale, causal=ctx.causal
+                    dout,
+                    q,
+                    k,
+                    v,
+                    out,
+                    lse,
+                    softmax_scale=ctx.softmax_scale,
+                    causal=ctx.causal,
+                    deterministic=ctx.deterministic,
                 )
             return _flash_attn_grads(dq, dk, dv, None, None)
 
