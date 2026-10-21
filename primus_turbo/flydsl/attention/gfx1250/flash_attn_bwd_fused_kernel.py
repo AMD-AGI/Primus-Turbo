@@ -26,7 +26,8 @@ Per step s (one 32-query pair x one q head of the GQA group; descending pairs, h
       during step s-1 and carried in VGPRs, as are the step's LSE and delta.
   (D) softmax: exp2(S * scale * log2e - lse * log2e) as one fma; P goes to the wave's private P
       tile, the unscaled dS to the wave's columns of the shared dS buffer s % 2. dK and dQ are
-      scaled once, at the dK store and in the dQ conversion.
+      scaled once, at the dK store and in the dQ conversion. (C) and (D) run as a software
+      pipeline over four 16q x 16kv blocks.
   (E) split barrier B_s signal, after the stores and the first dV/dK operand loads.
   (F) dV/dK: 32 WMMAs; between the first and second group of 8, the 32 dQ atomics of step s-1
       as one burst (the next group's operand loads are issued before it).
@@ -414,64 +415,82 @@ def _dkdv_fused_impl(
         lds_q = lds_do + fx.Int32(32 * X_ROW_B)
         lds_ds = lds_dsb + (s % fx.Int32(2)) * fx.Int32(W4_DSBUF_B)
 
-        # (C)+(D) S^T/dP^T on the carried operands, then softmax; the 8 P/dS stores as one burst
+        # (C)+(D) S^T/dP^T on the carried operands, then softmax; the 8 P/dS stores as one burst.
+        # Four (hh, kh) blocks, software-pipelined: block b+1's WMMA chains are emitted before block
+        # b's softmax, so the softmax does not read a WMMA result right after the WMMA and the next
+        # chains do not wait for the softmax.
         stores = []
         sl2 = scale * fx.Float32(LOG2E)
+        qfr, dfr = [], []
         for hh in range_constexpr(2):
-            qfr = [
-                qd[hh * 16 + dt * 2].shuffle(qd[hh * 16 + dt * 2 + 1], list(range(16)))
-                for dt in range_constexpr(NDT)
-            ]
-            dfr = [
-                qd[hh * 16 + 8 + dt * 2].shuffle(qd[hh * 16 + 8 + dt * 2 + 1], list(range(16)))
-                for dt in range_constexpr(NDT)
-            ]
+            qfr.append(
+                [
+                    qd[hh * 16 + dt * 2].shuffle(qd[hh * 16 + dt * 2 + 1], list(range(16)))
+                    for dt in range_constexpr(NDT)
+                ]
+            )
+            dfr.append(
+                [
+                    qd[hh * 16 + 8 + dt * 2].shuffle(qd[hh * 16 + 8 + dt * 2 + 1], list(range(16)))
+                    for dt in range_constexpr(NDT)
+                ]
+            )
+        blocks = [(hh, kh) for hh in range(2) for kh in range(NKV)]
+        sp_acc = {}
+
+        def _chains(hh, kh):
+            s_acc = _ir(fx.Vector.filled(8, 0.0, fx.Float32))
+            p_acc = _ir(fx.Vector.filled(8, 0.0, fx.Float32))
+            for dt in range_constexpr(NDT):
+                s_acc = rocdl.wmma_f32_16x16x32_bf16(
+                    v8f, _ir(kf[kh][dt]), _ir(qfr[hh][dt]), s_acc, reuseA=False, reuseB=False
+                ).result
+                p_acc = rocdl.wmma_f32_16x16x32_bf16(
+                    v8f, _ir(vf[kh][dt]), _ir(dfr[hh][dt]), p_acc, reuseA=False, reuseB=False
+                ).result
+            sp_acc[(hh, kh)] = (fx.Vector(s_acc), fx.Vector(p_acc))
+
+        def _softmax(hh, kh):
+            sv, pv_ = sp_acc[(hh, kh)]
             q_glob = q0 + fx.Int32(hh * 16) + row
-            lse_q = pre[hh * 2][0]
-            del_q = pre[hh * 2 + 1][0]
-            for kh in range_constexpr(NKV):
-                s_acc = _ir(fx.Vector.filled(8, 0.0, fx.Float32))
-                p_acc = _ir(fx.Vector.filled(8, 0.0, fx.Float32))
-                for dt in range_constexpr(NDT):
-                    s_acc = rocdl.wmma_f32_16x16x32_bf16(
-                        v8f, _ir(kf[kh][dt]), _ir(qfr[dt]), s_acc, reuseA=False, reuseB=False
-                    ).result
-                    p_acc = rocdl.wmma_f32_16x16x32_bf16(
-                        v8f, _ir(vf[kh][dt]), _ir(dfr[dt]), p_acc, reuseA=False, reuseB=False
-                    ).result
-                sv, pv_ = fx.Vector(s_acc), fx.Vector(p_acc)
-                kvb = kv0 + fx.Int32(kh * 16) + half * fx.Int32(8)
-                nl2 = fx.Float32(0.0) - lse_q * fx.Float32(LOG2E)
-                arg = [fx.fma(sv[si], sl2, nl2) for si in range(8)]
-                if do_mask:
-                    arg = [
-                        ((kvb + fx.Int32(si) > q_glob + cshift) & (causal != fx.Int32(0))).select(
-                            fx.Float32(NEG), arg[si]
-                        )
-                        for si in range(8)
-                    ]
-                pf = [_exp2(arg[si]) for si in range(8)]
-                p_l = [x.to(fx.BFloat16) for x in pf]
-                ds_l = [(pf[si] * (pv_[si] - del_q)).to(fx.BFloat16) for si in range(8)]
-                stores.append(
-                    (
-                        p_l,
-                        lds_p
-                        + (fx.Int32(hh * 16) + row) * fx.Int32(S_ROW_B)
-                        + fx.Int32(kh * 32)
-                        + half * fx.Int32(16),
+            kvb = kv0 + fx.Int32(kh * 16) + half * fx.Int32(8)
+            nl2 = fx.Float32(0.0) - pre[hh * 2][0] * fx.Float32(LOG2E)
+            arg = [fx.fma(sv[si], sl2, nl2) for si in range(8)]
+            if do_mask:
+                arg = [
+                    ((kvb + fx.Int32(si) > q_glob + cshift) & (causal != fx.Int32(0))).select(
+                        fx.Float32(NEG), arg[si]
                     )
+                    for si in range(8)
+                ]
+            pf = [_exp2(arg[si]) for si in range(8)]
+            p_l = [x.to(fx.BFloat16) for x in pf]
+            ds_l = [(pf[si] * (pv_[si] - pre[hh * 2 + 1][0])).to(fx.BFloat16) for si in range(8)]
+            stores.append(
+                (
+                    p_l,
+                    lds_p
+                    + (fx.Int32(hh * 16) + row) * fx.Int32(S_ROW_B)
+                    + fx.Int32(kh * 32)
+                    + half * fx.Int32(16),
                 )
-                stores.append(
-                    (
-                        ds_l,
-                        lds_ds
-                        + (fx.Int32(hh * 16) + row) * fx.Int32(X_ROW_B)
-                        + wv * fx.Int32(64)
-                        + fx.Int32(kh * 32)
-                        + half * fx.Int32(16),
-                    )
+            )
+            stores.append(
+                (
+                    ds_l,
+                    lds_ds
+                    + (fx.Int32(hh * 16) + row) * fx.Int32(X_ROW_B)
+                    + wv * fx.Int32(64)
+                    + fx.Int32(kh * 32)
+                    + half * fx.Int32(16),
                 )
+            )
+
+        _chains(*blocks[0])
+        for bi in range(1, len(blocks)):
+            _chains(*blocks[bi])
+            _softmax(*blocks[bi - 1])
+        _softmax(*blocks[-1])
         rocdl.sched_barrier(0)
         for vals, addr in stores:
             _st8(vals, addr)
