@@ -139,6 +139,17 @@ HK1_INLINE void      lds_barrier() {
     __builtin_amdgcn_s_barrier_wait(-1);
     __builtin_amdgcn_fence(MO_ACQUIRE, "workgroup", "local");
 }
+// split form of lds_barrier() (HipKittens cdna5 barrier.cuh arrive()/wait(), rung 08 split barrier): arrive =
+// release fence (s_wait_dscnt 0: this wave's DS ops retired) + s_barrier_signal -1; wait = s_barrier_wait -1 +
+// acquire fence. Work placed between the two (pinned with sched_barrier<0>) overlaps the other wave's arrival.
+HK1_INLINE void lds_arrive() {
+    __builtin_amdgcn_fence(MO_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier_signal(-1);
+}
+HK1_INLINE void lds_wait() {
+    __builtin_amdgcn_s_barrier_wait(-1);
+    __builtin_amdgcn_fence(MO_ACQUIRE, "workgroup", "local");
+}
 // lock_simd: SCHED_MODE.DISABLE_XDL_ARB_STALL (hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1) = 1), FlyDSL
 // rocdl.disable_xdl_arb_stall() == llvm.amdgcn.s.setreg(i32 154, i32 1); the one s_setreg the
 // HK-line lint and isa_static S2 allow.

@@ -22,13 +22,15 @@
       "src": "src/k_dkdv96ds.hip",
       "extra_flags": [
         "-mllvm",
-        "-structurizecfg-skip-uniform-regions"
+        "-structurizecfg-skip-uniform-regions",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
       ],
-      "hsaco_sha256": "5698407882321aca92a5baaad8074d7cbb86a5e45218f3c448b5d04f0af30084",
+      "hsaco_sha256": "401937739b4fc949cc57b160be284f1d8a2d6f78d404d18fd036f22b00884e50",
       "block": 64,
       "kernarg_size": 120,
       "lds": 64512,
-      "vgpr": 1012,
+      "vgpr": 1015,
       "args": [
         {
           "name": "Q",
@@ -160,12 +162,15 @@
     },
     "k_dqds_c": {
       "src": "src/k_dqds_c.hip",
-      "extra_flags": [],
-      "hsaco_sha256": "8e778af52399414892bac164b0e47ffd2b9cee46ed4da9bcffaa4e26cebd9b63",
+      "extra_flags": [
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "hsaco_sha256": "af5fe0f87242a0e44974f9101efa1412dccec073f932855902d457b6c45add28",
       "block": 128,
       "kernarg_size": 68,
       "lds": 276480,
-      "vgpr": 887,
+      "vgpr": 871,
       "args": [
         {
           "name": "DS",

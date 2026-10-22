@@ -51,6 +51,45 @@ using namespace q1;
 
 #define DQ_INL __attribute__((always_inline))
 
+// ---- X4 (needs -mllvm -amdgpu-expert-scheduling-mode, manifest extra_flags):
+// * every unit but the last: split barrier P_{u+1}: arrive after the first X4_NS (x NACC / 72 on the head tile)
+//   WMMAs of run(X), wait after run(X). The ring protocol is unchanged: before the arrive the wave's op(u + 1)
+//   landed (tensorcnt 1) and its ring reads (burst(Y)) retired (dscnt 0); between arrive and wait only WMMAs;
+//   op(u + 3) and burst(X) after the wait.
+// * main-tile steady units: the operand bursts interleaved into the WMMA runs (expert scheduling: a DS read
+//   no longer waits for earlier WMMAs):
+//     region A: burst(Y, 2u + 1) under run(X) WMMAs [0, X4_NS): {X4_LA WMMA} then {1 tr16, 1 WMMA} x 36
+//     region C: burst(X, 2u + 2) under run(Y):                  {X4_LC WMMA} then {1 tr16, 1 WMMA} x 36
+// * masked units: the zero-select predicate in branch-free form (x4_ds_zero, same value as idx.h ds_zero), so
+//   the selects stay in-place v_cndmask (no scalar branches / operand copies inside the run).
+constexpr int X4_NS = 66, X4_LA = 8, X4_LC = 4;
+Q1_DEV void x4_bar_signal() {
+    __builtin_amdgcn_fence(3, "workgroup", "local"); // release
+    __builtin_amdgcn_s_barrier_signal(-1);
+}
+Q1_DEV void x4_bar_wait() {
+    __builtin_amdgcn_s_barrier_wait(-1);
+    __builtin_amdgcn_fence(2, "workgroup", "local"); // acquire
+}
+// sched_group_barrier pattern of one interleaved region: L WMMA, then {1 DS read, R WMMA} x NT, then the rest
+template <int L, int R, int NT, int NW> Q1_DEV void x4_sgb_il() {
+    static_assert(L + NT * R <= NW, "interleave pattern longer than the WMMA run");
+    if constexpr (L > 0) Q1_SGB(0x008, L);
+    sfor<0, NT>([&](auto) DQ_INL {
+        Q1_SGB(0x100, 1);
+        Q1_SGB(0x008, R);
+    });
+    if constexpr (NW - L - NT * R > 0) Q1_SGB(0x008, NW - L - NT * R);
+}
+
+// idx.h ds_zero without the short circuit (cshift >= 0, as the plan requires): r >= n32 || qp <
+// dsl_qp_first(2r) with dsl_qp_first(2r) = causal ? max(0, r - cshift / 32) : 0
+Q1_DEV bool x4_ds_zero(int qp, int r, int n32, int cshift, int causal) {
+    const int f   = r - cshift / 32;
+    const int qpf = (causal != 0) & (f > 0) ? f : 0;
+    return (bool) ((int) (r >= n32) | (int) (qp < qpf));
+}
+
 struct TdmDesc { // one TDM op's descriptor groups 0 / 1 (prepared before the barrier, issued after
                  // it)
     u32x4 g0;
@@ -153,7 +192,7 @@ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int
         sfor<0, NQW>([&](auto Q) DQ_INL {
             constexpr int h = decltype(Q)::value;
             if constexpr (decltype(MASK)::value != 0) {
-                b[h] = ds_zero(qp0w + h / 2, r, n32, cshift, causal) ? zero16 : S.ds[h];
+                b[h] = x4_ds_zero(qp0w + h / 2, r, n32, cshift, causal) ? zero16 : S.ds[h];
             } else {
                 b[h] = S.ds[h];
             }
@@ -176,6 +215,41 @@ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int
             Q1_SGB(0x008, NACC - 8 * (NQW - 1));
         }
         Q1_SCHED_BARRIER();
+    };
+
+    // X4: the WMMAs [LO, HI) of a run (the masked form selects its operands and carries the selects' pattern
+    // in the first part only)
+    auto run_rng = [&](const OpSet<NQW> &S, auto MASK, int r, auto LO, auto HI) DQ_INL {
+        constexpr int lo = decltype(LO)::value, hi = decltype(HI)::value;
+        bf16x16 b[NQW];
+        sfor<0, NQW>([&](auto Q) DQ_INL {
+            constexpr int h = decltype(Q)::value;
+            if constexpr (decltype(MASK)::value != 0) {
+                b[h] = x4_ds_zero(qp0w + h / 2, r, n32, cshift, causal) ? zero16 : S.ds[h];
+            } else {
+                b[h] = S.ds[h];
+            }
+        });
+        sfor<lo, hi>([&](auto I) DQ_INL {
+            constexpr int i = decltype(I)::value, h = i / NDT, dt = i % NDT;
+            acc[i] = wmma_bf16(S.kt[dt], b[h], acc[i]);
+        });
+        if constexpr (decltype(MASK)::value != 0 && lo == 0) {
+            Q1_SGB(0x002, 8);
+            sfor<0, hi>([&](auto I) DQ_INL {
+                Q1_SGB(0x008, 1);
+                if constexpr (decltype(I)::value < 8 * (NQW - 1)) Q1_SGB(0x002, 1);
+            });
+        }
+        Q1_SCHED_BARRIER();
+    };
+    // X4: the WMMAs [LO, HI) of a steady run (no selects, no trailing sched_barrier: interleaved regions)
+    auto run_raw = [&](const OpSet<NQW> &S, auto LO, auto HI) DQ_INL {
+        constexpr int lo = decltype(LO)::value, hi = decltype(HI)::value;
+        sfor<lo, hi>([&](auto I) DQ_INL {
+            constexpr int i = decltype(I)::value, h = i / NDT, dt = i % NDT;
+            acc[i] = wmma_bf16(S.kt[dt], S.ds[h], acc[i]);
+        });
     };
 
     // ---- this wave's role op of unit u (16-B dummy past the last unit)
@@ -220,6 +294,53 @@ Q1_DEV void dqds_body(const __bf16 *DS, const __bf16 *K, __bf16 *DQ, int Sq, int
     auto       unit = [&](int u, auto MASK, auto LAST, auto REAL) DQ_INL {
         constexpr bool last = decltype(LAST)::value != 0;
         const int      r0 = 2 * u, r1 = 2 * u + 1;
+        if constexpr (!last && decltype(MASK)::value == 0 && NQW == MAIN_NQW) {
+            constexpr int NS = X4_NS < NACC ? X4_NS : NACC;
+            // region A: burst Y (row 2u + 1, unit u's stages) under run X part 1, the descriptor SALU too
+            burst(Y, r1);
+            const TdmDesc dn = c_desc(u + 3, REAL);
+            run_raw(X, ic<0>{}, ic<NS>{});
+            x4_sgb_il<X4_LA, 1, 24 + 2 * NQW, NS>();
+            Q1_SCHED_BARRIER();
+            Q1_WAIT_TENSORCNT(C_TW);
+            Q1_WAIT_DSCNT(0);
+            x4_bar_signal(); // P_{u+1} arrive: op(u+1) landed, unit u's ring reads retired
+            Q1_SCHED_BARRIER();
+            run_raw(X, ic<NS>{}, ic<NACC>{});
+            Q1_SCHED_BARRIER();
+            x4_bar_wait(); // P_{u+1}: unit u+1 published, unit u's stages free
+            Q1_SCHED_BARRIER();
+            issue(dn); // op(u + 3) into unit u's stages
+            Q1_SCHED_BARRIER();
+            // region C: burst X (row 2u + 2, unit u + 1's stages) under run Y
+            burst(X, r1 + 1);
+            run_raw(Y, ic<0>{}, ic<NACC>{});
+            x4_sgb_il<X4_LC, 1, 24 + 2 * NQW, NACC>();
+            Q1_SCHED_BARRIER();
+            return;
+        }
+        if constexpr (!last) {
+            // head-tile steady units and all masked units: split barrier only (bursts as in the shipped
+            // kernel), arrive after X4_NS * NACC / 72 WMMAs
+            constexpr int NS = X4_NS * NACC / (MAIN_NQW * NDT);
+            burst(Y, r1);
+            Q1_SCHED_BARRIER();
+            const TdmDesc dn = c_desc(u + 3, REAL);
+            run_rng(X, MASK, r0, ic<0>{}, ic<NS>{});
+            Q1_WAIT_TENSORCNT(C_TW);
+            Q1_WAIT_DSCNT(0);
+            x4_bar_signal();
+            Q1_SCHED_BARRIER();
+            run_rng(X, MASK, r0, ic<NS>{}, ic<NACC>{});
+            x4_bar_wait();
+            Q1_SCHED_BARRIER();
+            issue(dn);
+            Q1_SCHED_BARRIER();
+            burst(X, r1 + 1);
+            Q1_SCHED_BARRIER();
+            run(Y, MASK, r1);
+            return;
+        }
         // half-step r0
         burst(Y, r1);
         Q1_SCHED_BARRIER();
