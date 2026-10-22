@@ -739,7 +739,7 @@ void unpermute_impl(const dtype_t *permuted_tokens, dtype_t *tokens, const prob_
     // unpermute_kernel_e1 hard-codes probs row width 1 (multihot only); topk path uses num_topk at
     // E=1.
     if (num_local_experts == 1 && effective_probs_stride == 1) {
-        constexpr int num_warps_e1  = kE1NumThreads / kWarpSize;
+        const int     num_warps_e1  = kE1NumThreads / primus_turbo::warp_size();
         const int     blocks_needed = (num_dispatched_max + num_warps_e1 - 1) / num_warps_e1;
         const int     e1_grid       = blocks_needed;
         unpermute_kernel_e1<kE1NumThreads, dtype_t, prob_t>

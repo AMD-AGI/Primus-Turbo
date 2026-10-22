@@ -55,6 +55,10 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
                        "rocSHMEM is disabled during compilation, please install rocSHMEM by "
                        "following docs/install_dependencies.md");
 #endif
+    // The internode kernels still assume wave64: combine NVL senders split one wave between two
+    // peers, and kWarpSize feeds kernel template arguments that differ between host and device.
+    PRIMUS_TURBO_CHECK(num_rdma_ranks == 1 or not primus_turbo::is_gfx1250(),
+                       "DeepEP internode is not supported on gfx1250 yet");
     // Get device info
     hipDeviceProp_t device_prop = {};
     PRIMUS_TURBO_CHECK_HIP(hipGetDeviceProperties(&device_prop, device_id));

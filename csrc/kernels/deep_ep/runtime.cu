@@ -31,7 +31,7 @@ void barrier(int **barrier_signal_ptrs, int rank, int num_ranks, hipStream_t str
     LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, barrier<ranks>, barrier_signal_ptrs, rank);                \
     break
 
-    SETUP_LAUNCH_CONFIG(1, kWarpSize, stream);
+    SETUP_LAUNCH_CONFIG(1, primus_turbo::warp_size(), stream);
     SWITCH_RANKS(BARRIER_LAUNCH_CASE);
 #undef BARRIER_LAUNCH_CASE
 }

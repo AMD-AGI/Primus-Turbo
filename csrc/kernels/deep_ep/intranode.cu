@@ -627,7 +627,7 @@ void cached_notify_combine(void **buffer_ptrs, int *send_head, int num_channels,
                                   barrier_signal_ptrs, rank);                                      \
     break
 
-    const int num_threads = std::max(128, kWarpSize * num_ranks);
+    const int num_threads = std::max(128, primus_turbo::warp_size() * num_ranks);
     PRIMUS_TURBO_CHECK(num_ranks <= num_threads);
     PRIMUS_TURBO_CHECK(num_threads <= 1024);
     PRIMUS_TURBO_CHECK(1 + num_channels <= num_channels * 2);
@@ -1006,7 +1006,7 @@ void combine(hipDataType type, void *recv_x, float *recv_topk_weights, const voi
 
     // Even-numbered blocks for sending, odd-numbered blocks for receiving
     PRIMUS_TURBO_CHECK(num_sms % 2 == 0);
-    PRIMUS_TURBO_CHECK(kNumThreads >= num_ranks * kWarpSize);
+    PRIMUS_TURBO_CHECK(kNumThreads >= num_ranks * primus_turbo::warp_size());
     SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
     SWITCH_TYPES(COMBINE_DTYPE_LAUNCH_CASE);
 #undef COMBINE_DTYPE_LAUNCH_CASE
