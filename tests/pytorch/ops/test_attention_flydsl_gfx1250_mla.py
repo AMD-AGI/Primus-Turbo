@@ -809,3 +809,47 @@ def test_hk_production_shape_matches_reference():
         mp.setattr(impl, "POISON", True)
         got = _run(q, k, v, dout)
     _check(got, _reference_by_heads(q, k, v, dout, MLA_SCALE))
+
+
+def test_hk_plan_head_chunks_under_a_scratch_budget():
+    """A dS scratch budget below the whole call's splits the (dkdv, dq) pair into head chunks of one
+    batch that share one scratch; no head group fitting raises ScratchBudgetError."""
+    impl = _hk_package("impl")
+    b, s, h = 2, 4096, 128
+    q, k, v = _meta(b, s, s, h)
+    o = torch.empty(b, s, h, D_V, dtype=torch.bfloat16, device="meta")
+    lse = torch.empty(b, h, s, dtype=torch.float32, device="meta")
+    full = impl._plan(o, q, k, v, o, lse, MLA_SCALE, True, None)
+    assert full["chunks"] is None and len(full["launches"]) == 3
+    half = impl._scratch_bytes(1, s, s, 64, True)
+    plan = impl._plan(o, q, k, v, o, lse, MLA_SCALE, True, None, max_scratch_bytes=half)
+    assert plan["chunks"] == [(0, 0, 64), (0, 64, 64), (1, 0, 64), (1, 64, 64)]
+    assert [x[0] for x in plan["launches"]] == ["delta"] + ["dkdv", "dq"] * 4
+    assert plan["ds_full"].numel() * 2 == half
+    assert plan["launches"][1][2][0] == (32, 43, 2) and plan["launches"][2][2][0] == (32, 11, 2)
+    with pytest.raises(impl.ScratchBudgetError):
+        impl._plan(
+            o,
+            q,
+            k,
+            v,
+            o,
+            lse,
+            MLA_SCALE,
+            True,
+            None,
+            max_scratch_bytes=impl._scratch_bytes(1, s, s, 32, True) - 1,
+        )
+
+
+@needs_hk
+def test_hk_head_chunks_are_bitwise_equal():
+    """Head-chunked calls (two chunks of 32 heads) return exactly the unchunked gradients."""
+    impl = _hk_package("impl")
+    q, k, v, dout = (t.cuda() for t in _inputs(1, 256, 256, 64, layout="bshd"))
+    out, lse = mla_impl._forward_op(q, k, v, MLA_SCALE, True)
+    full = impl.hk_attn_bwd(dout, q, k, v, out, lse, MLA_SCALE, True)
+    budget = impl._scratch_bytes(1, 256, 256, 32, True)
+    chunked = impl.hk_attn_bwd(dout, q, k, v, out, lse, MLA_SCALE, True, max_scratch_bytes=budget)
+    for a, b in zip(full, chunked):
+        assert torch.isfinite(a).all() and torch.equal(a, b)

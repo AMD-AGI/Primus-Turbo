@@ -21,9 +21,21 @@ head-group targets.
 Scratch: guard | layout | guard bf16, from the torch caching allocator on the current stream and
 referenced by this call only (4.33 GB at b2 s4096 h128, ``limits.ds_layout_bytes``); when the call
 returns the block goes back to the allocator, stream-ordered behind the two kernels that use it.
+
+Scratch budget (``max_scratch_bytes`` / ``MAX_SCRATCH_BYTES``, default None = no limit): when the
+whole call's scratch (guards included) exceeds it, the call runs in head chunks: "delta" once, then
+("dkdv", "dq") per chunk of hc consecutive heads of one batch, every chunk on the SAME scratch of hc
+regions (chunk c's dkdv overwrites it only after chunk c-1's dq, stream order). hc is the largest
+multiple of the head group dividing Hq whose scratch fits. A chunk launch is the full launch's
+argument list (Hq / Hkv unchanged, so every head and row stride stays right) with B = 1, the grid z
+cut to hc / head group, and q/k/v/do/nl/nd/dq/dk/dv passed from the chunk's first (batch, head):
+each workgroup computes what the full launch's workgroup of that head computes, so dq/dk/dv are
+bitwise identical to the unchunked call (two chunks at b2 s4096 h128: 2.16 GB, +0.75% time). When
+not even one head group fits, the call runs the FlyDSL backward instead (same results).
 """
 
 import math
+import os
 import threading
 
 import torch
@@ -43,6 +55,31 @@ PROVEN_KV_TARGETS = (0, 8, 16, 24, 32, 64, 96, 128, 256)
 PROVEN_Q_TARGETS = (0, 8, 16, 32, 64, 128, 256)
 DS_MODE = 1  # k_dkdv96ds: store dS^T with num_records = the wave's true extent (0 drops every store)
 DS_GUARD_B = 65536  # bytes before and after the layout in the scratch
+MAX_SCRATCH_BYTES_ENV = "PRIMUS_TURBO_MLA_BWD_HK_MAX_SCRATCH_BYTES"
+
+
+def _bytes_setting(name):
+    """A positive byte count from the environment (int or float syntax, e.g. 2.2e9), or None if unset."""
+    text = os.environ.get(name, "").strip()
+    if not text:
+        return None
+    try:
+        n = int(float(text))
+    except ValueError:
+        n = 0
+    if n <= 0:
+        raise ValueError(f"{name}={text!r}: expected a positive byte count")
+    return n
+
+
+# dS scratch budget of one call in bytes (guards included), read at import like the adapter's switches;
+# None = no limit (one launch pair, the default). hk_attn_bwd(max_scratch_bytes=...) overrides it per call.
+MAX_SCRATCH_BYTES = _bytes_setting(MAX_SCRATCH_BYTES_ENV)
+
+
+class ScratchBudgetError(NotImplementedError):
+    """Not even one head group's dS scratch fits the budget (hk_attn_bwd then runs the FlyDSL backward)."""
+
 
 # Validation only: allocate delta/dq/dk/dv and the whole dS scratch NaN-filled, so an element the
 # kernels never write shows up as non-finite instead of as stale memory.
@@ -63,6 +100,22 @@ def _head_group(nh, target):
         if nh % d == 0:
             return d
     return nh
+
+
+def _scratch_bytes(b, sq, skv, nh, causal):
+    """Bytes _ds_scratch allocates for b batches x nh heads: the layout plus both guards."""
+    return limits.ds_layout_bytes(b, sq, skv, nh, causal) + 2 * DS_GUARD_B
+
+
+def _chunk_heads(b, sq, skv, hq, causal, step, max_bytes):
+    """Heads per chunk under a scratch budget: None = no chunking (no budget, or the whole call fits);
+    else the largest multiple of ``step`` that divides hq and whose one-batch scratch fits, 0 if none."""
+    if max_bytes is None or _scratch_bytes(b, sq, skv, hq, causal) <= max_bytes:
+        return None
+    for hc in range(hq - hq % step, 0, -step):
+        if hq % hc == 0 and _scratch_bytes(1, sq, skv, hc, causal) <= max_bytes:
+            return hc
+    return 0
 
 
 def _check_device_once(device):
@@ -123,12 +176,14 @@ def _ds_scratch(nbytes, device):
     return t, t[DS_GUARD_B // 2 : DS_GUARD_B // 2 + nbytes // 2]
 
 
-def _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, head_group=None):
+def _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, head_group=None, max_scratch_bytes=None):
     """Every launch hk_attn_bwd makes for these inputs, in issue order, plus what it allocates.
 
-    launches: [(name, launcher, args)]: "delta" (FlyDSL launcher, its arguments), "dkdv" / "dq" (HIP
-    kernel name, (grid, block, kernel argument values)). head_group: target for both kernels (None:
-    HEAD_GROUP_KV / HEAD_GROUP_Q); one the index proofs do not replay is refused (ValueError).
+    launches: [(name, launcher, args)]: "delta" (FlyDSL launcher, its arguments), then "dkdv" / "dq"
+    (HIP kernel name, (grid, block, kernel argument values)) once, or once per head chunk. head_group:
+    target for both kernels (None: HEAD_GROUP_KV / HEAD_GROUP_Q); one the index proofs do not replay
+    is refused (ValueError). max_scratch_bytes: dS scratch budget (None: MAX_SCRATCH_BYTES); over it
+    the plan is head-chunked (module docstring), and ScratchBudgetError when no head group fits.
     Works on meta tensors (stream unused until launch).
     """
     b, sq, skv, hq, hkv = _check(do, q, k, v, o, lse)
@@ -150,6 +205,13 @@ def _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, head_group=None):
         softmax_scale = 1.0 / math.sqrt(_k.D_QK)
     scale = float(softmax_scale)
     g = hq // hkv
+    budget = MAX_SCRATCH_BYTES if max_scratch_bytes is None else int(max_scratch_bytes)
+    hc = _chunk_heads(b, sq, skv, hq, c, math.lcm(hg_kv, hg_q), budget)
+    if hc == 0:
+        raise ScratchBudgetError(
+            f"hk_attn_bwd: the dS scratch of {math.lcm(hg_kv, hg_q)} heads "
+            f"({_scratch_bytes(1, sq, skv, math.lcm(hg_kv, hg_q), c)} B) exceeds max_scratch_bytes {budget}"
+        )
     dev = q.device
     delta = _alloc((b, hq, sq), dev, torch.float32)
     nl = _alloc((b, hq, sq), dev, torch.float32)
@@ -157,39 +219,56 @@ def _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, head_group=None):
     dq = _alloc((b, sq, hq, _k.D_QK), dev, q.dtype)
     dk = _alloc((b, skv, hkv, _k.D_QK), dev, k.dtype)
     dv = _alloc((b, skv, hkv, _k.D_V), dev, v.dtype)
-    ds_bytes = limits.ds_layout_bytes(b, sq, skv, hq, c)
+    if hc is None:
+        chunks = None
+        parts = [((q, k, v, do, nl, nd, dv, dk, dq), b, ngz_kv, ngz_q)]
+        ds_bytes = limits.ds_layout_bytes(b, sq, skv, hq, c)
+    else:
+        # head chunks of one batch: views from the chunk's first (batch, head), B = 1 (MHA: k/v heads = q heads)
+        assert g == 1 and hc % hg_kv == 0 and hc % hg_q == 0, (g, hc, hg_kv, hg_q)
+        chunks = [(bi, h0, hc) for bi in range(b) for h0 in range(0, hq, hc)]
+        parts = []
+        for bi, h0, _ in chunks:
+            bshd = (slice(bi, bi + 1), slice(None), slice(h0, h0 + hc))  # [b, s, h, d] tensors
+            bhs = (slice(bi, bi + 1), slice(h0, h0 + hc))  # [b, h, s] tensors
+            views = (
+                tuple(t[bshd] for t in (q, k, v, do))
+                + (nl[bhs], nd[bhs])
+                + tuple(t[bshd] for t in (dv, dk, dq))
+            )
+            parts.append((views, 1, hc // hg_kv, hc // hg_q))
+        ds_bytes = limits.ds_layout_bytes(1, sq, skv, hc, c)
     ds_full, ds = _ds_scratch(ds_bytes, dev)
     q_off, nhead, ntile = limits.dq_split(sq)
     delta_args = (do, o, delta, lse, nl, nd, scale, sq, hq, b * sq * hq, sq // _k.ROWS_DELTA, b * hq, stream)
-    dkdv_values = (
-        q,
-        k,
-        v,
-        do,
-        nl,
-        nd,
-        dv,
-        dk,
-        ds,
-        scale,
-        sq,
-        skv,
-        hq,
-        hkv,
-        g,
-        sq // 16,
-        skv - sq,
-        c,
-        b,
-        hg_kv,
-        DS_MODE,
-    )
-    dq_values = (ds, k, dq, sq, skv, hq, hkv, g, skv // 32, skv - sq, c, q_off, ntile, hg_q)
-    launches = [
-        ("delta", _k.launch_delta, delta_args),
-        ("dkdv", "k_dkdv96ds", ((hg_kv, limits.k3_nblk(skv), ngz_kv), 64, dkdv_values)),
-        ("dq", "k_dqds_c", ((hg_q, ntile + nhead, ngz_q), 128, dq_values)),
-    ]
+    launches = [("delta", _k.launch_delta, delta_args)]
+    for (q_, k_, v_, do_, nl_, nd_, dv_, dk_, dq_), b_, gz_kv, gz_q in parts:
+        dkdv_values = (
+            q_,
+            k_,
+            v_,
+            do_,
+            nl_,
+            nd_,
+            dv_,
+            dk_,
+            ds,
+            scale,
+            sq,
+            skv,
+            hq,
+            hkv,
+            g,
+            sq // 16,
+            skv - sq,
+            c,
+            b_,
+            hg_kv,
+            DS_MODE,
+        )
+        dq_values = (ds, k_, dq_, sq, skv, hq, hkv, g, skv // 32, skv - sq, c, q_off, ntile, hg_q)
+        launches.append(("dkdv", "k_dkdv96ds", ((hg_kv, limits.k3_nblk(skv), gz_kv), 64, dkdv_values)))
+        launches.append(("dq", "k_dqds_c", ((hg_q, ntile + nhead, gz_q), 128, dq_values)))
     return {
         "launches": launches,
         "outputs": (dq, dk, dv),
@@ -200,23 +279,33 @@ def _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, head_group=None):
             "dq": launches[2][2][0],
         },
         "head_group": {"kv": hg_kv, "q": hg_q},
+        "chunks": chunks,  # None, or [(batch, first head, heads)] of every (dkdv, dq) launch pair
         "ds_layout_bytes": ds_bytes,
         "ds_full": ds_full,
     }
 
 
-def hk_attn_bwd(do, q, k, v, o, lse, softmax_scale=None, causal=True, head_group=None):
+def hk_attn_bwd(
+    do, q, k, v, o, lse, softmax_scale=None, causal=True, head_group=None, max_scratch_bytes=None
+):
     """Flash-attention backward on gfx1250, DeepSeek-V3 MLA head dims (qk 192, v 128), MHA.
 
     Same contract as ``primus_turbo.flydsl.attention.gfx1250_mla.bwd.flash_attn_mla_bwd``:
     q [B, Sq, H, 192], o/do [B, Sq, H, 128], k [B, Skv, H, 192], v [B, Skv, H, 128], bf16 contiguous;
     lse [B, H, Sq] fp32 natural log; bottom-right causal. Returns (dq, dk, dv) laid out like q/k/v.
     Also needs Sq % 384 in {0, 256} and Skv >= Sq (``limits.shape_unsupported_reason``).
+    max_scratch_bytes: dS scratch budget of this call (None: MAX_SCRATCH_BYTES, unset = no limit);
+    over it the call runs in head chunks, and on the FlyDSL backward when no head group fits.
     """
     _check_device_once(q.device)
     lse = lse.contiguous().float()
     stream = torch.cuda.current_stream()
-    plan = _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, head_group)
+    try:
+        plan = _plan(do, q, k, v, o, lse, softmax_scale, causal, stream, head_group, max_scratch_bytes)
+    except ScratchBudgetError as e:
+        logger.warning(f"{e}: this backward runs on FlyDSL", once=True)
+        scale = 1.0 / math.sqrt(_k.D_QK) if softmax_scale is None else float(softmax_scale)
+        return _fly.flash_attn_mla_bwd(do, q, k, v, o, lse, scale, causal)
     table = kernels()
     for _, fn, args in plan["launches"]:
         if isinstance(fn, str):
