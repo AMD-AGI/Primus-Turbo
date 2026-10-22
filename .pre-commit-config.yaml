@@ -6,7 +6,7 @@
 # 2. pre-commit install(the first time you download the repo, it will be cached for future use)
 
 # Vendored third-party sources stay byte-identical to their upstream (they keep their own license).
-exclude: ^primus_turbo/hipkittens/gfx1250_mla_bwd/hip/include/cdna5/
+exclude: ^primus_turbo/hipkittens/gfx1250_mla_bwd/hip/(include/cdna5|asm)/
 repos:
   - repo: local
     hooks:

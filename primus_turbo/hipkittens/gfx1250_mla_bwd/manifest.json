@@ -26,13 +26,13 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode",
         "-mllvm",
-        "-misched-prera-direction=bottomup",
-        "-mllvm",
         "-amdgpu-enable-delay-alu=false",
         "-mllvm",
-        "-disable-machine-sink"
+        "-greedy-regclass-priority-trumps-globalness"
       ],
-      "hsaco_sha256": "de541125d4c4dd56ff790493205ea5f2cd19f9c0f0e4d59c4c8f14417209035f",
+      "hsaco_sha256": "89068310a36c2d9a22da5ac9990abe3f12477f1bb76649c84a6c5afb02f6f40c",
+      "asm_patch": "asm/k_dkdv96ds.s.patch",
+      "asm_input_sha256": "85219fe5c261e670b4b1ffb2b4f66f302cab5548c93dbb140aaa76d9339a8777",
       "block": 64,
       "kernarg_size": 120,
       "lds": 64512,

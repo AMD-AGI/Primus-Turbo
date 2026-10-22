@@ -545,15 +545,24 @@ extern "C" __global__ __launch_bounds__(64) void k_dkdv96ds(
         } else {
           tdp_pend = tdm_prep(qt0 + k1_pf_q(ii, n_full, qi, gh, G), k1_pf_g(ii, n_full, qi, gh, G), cur);
         }
-        static_for<NKV>([&](auto kh) { dv_kh(kh, acc, b_do, a_pk); });
-        static_for<NKV * NDO_V>([&](auto) {
+        // (2) r3 c1: dV d-outer / kh-inner (A = b_do[d] for 3 consecutive WMMAs), the 24 Q^T tr16 of stage cur
+        // interleaved {1 WMMA : 2 tr16} behind the first 12 dV WMMAs (each dV accumulator still gets exactly one WMMA
+        // per iteration: bits unchanged). The compiler puts the Q^T targets into the b_do registers that just died,
+        // which costs an expert-mode va_vdst(0) drain per pair; manifest "asm_patch" (hip/asm/k_dkdv96ds.s.patch,
+        // applied by hsaco.py to the compiler's own .s) re-targets those tr16 pairs to registers that are free over
+        // the value's live range and recomputes the va_vdst waits with LLVM's rules (r3 c1, p4_c1.md).
+        bf16x16 b_q[NDO_QK];
+        static_for<NDO_V>([&](auto d) {
+          static_for<NKV>([&](auto kh) {
+            acc[kh * NDO_V + d] = wmma<(kh > 0), false>(b_do[d], a_pk[kh], acc[kh * NDO_V + d]);
+          });
+        });
+        static_for<NDO_QK>([&](auto d) { b_q[d] = tr(tk, 1, d); });
+        static_for<NKV * NDO_V>([&](auto i) {
           sched_group_barrier<0x008, 1, 0>();
+          if constexpr (i < NDO_QK) sched_group_barrier<0x100, 2, 0>();
           sched_group_barrier<0x004, KH0_SALU, 0>();
         });
-        sched_barrier<0>();
-        // (2) tr16 burst 2: Q^T of stage cur into the dead b_do registers
-        bf16x16 b_q[NDO_QK];
-        static_for<NDO_QK>([&](auto d) { b_q[d] = tr(tk, 1, d); });
         sched_barrier<0>();
         dk_kh(std::integral_constant<int, 0>{}, acc, b_q, a_dsk);
         // the ring barrier after the last DS read of stage cur: tensorcnt 3 retires this wave's half of
