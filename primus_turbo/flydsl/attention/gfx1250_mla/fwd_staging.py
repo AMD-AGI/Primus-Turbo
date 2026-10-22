@@ -29,7 +29,6 @@ import flydsl.expr as fx
 # FlyDSL 0.3.4.1; LDS loads/stores are raw LLVM ops on pointers built from i32 byte addresses.
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import rocdl
-from flydsl.expr.rocdl import tdm_ops
 
 from primus_turbo.flydsl.utils.buffer_ops import get_element_ptr
 
@@ -84,43 +83,64 @@ def _lds_bf16_ptr_type():
     return fx.PointerType.get(elem_ty=fx.BFloat16.ir_type, address_space=fx.AddressSpace.Shared, alignment=16)
 
 
-def issue_q_copy(*, q, stride_q_seq, stride_q_head, q_start, q_len, head, block_x, warp_idx, lds_base):
-    """TDM-copy this wave's 32 query rows into its own LDS rows and return their base; rows past
-    ``q_len`` are zero-filled. The view is (seq, head, dim) with one head: a 2-D view changes the
-    generated code."""
-    seq0 = block_x * fx.Int32(BLOCK_M) + warp_idx * fx.Int32(ROWS_PER_WAVE)
-    n_valid = fx.max(q_len - seq0, fx.Int32(0))
-    off = fx.Int64(q_start + seq0) * fx.Int64(stride_q_seq) + fx.Int64(head) * fx.Int64(stride_q_head)
-    base = fx.get_iter(q)
-    region = lds_base + warp_idx * fx.Int32(ROWS_PER_WAVE * Q_ROW_ELEMS * 2)
-    lds_ty = _lds_bf16_ptr_type()
-    for c0, w in pow2_segments(D_QK):
-        g_view = fx.Tensor(
-            fx.make_view(
-                fx.add_offset(base, off + fx.Int64(c0)), fx.make_layout((ROWS_PER_WAVE, 1, w), (w, w, 1))
+def _tdm_cfg(w, row_elems):
+    """TDM group 1 word 0 for 2-byte elements: pad (row_elems - w) elements after every w."""
+    interval_dw, amount_dw = w // 2, (row_elems - w) // 2
+    return _i32_word((1 << 16) | (1 << 20) | ((interval_dw.bit_length() - 2) << 22) | ((amount_dw - 1) << 25))
+
+
+def _tdm_rows(lds, addr, rem, w, rows, stride, cfg):
+    """Copy ``rows`` rows of ``w`` elements from global ``addr`` (row stride ``stride`` elements) to LDS
+    ``lds``; rows at or past ``rem`` are zero-filled."""
+    g1_2 = fx.Int32(0x7FFF) | (rem << fx.Int32(16))  # tensor_dim0 = 0x7FFFFFFF (no clamp)
+    g1_3 = rem.shrui(fx.Int32(16))
+    z4 = fx.as_ir_value(fx.Vector.filled(4, 0, fx.Int32))
+    z8 = fx.as_ir_value(fx.Vector.filled(8, 0, fx.Int32))
+    lo = fx.Int32(addr)
+    hi = fx.Int32(addr >> fx.Int64(32)) | fx.Int32(_i32_word(1 << 31))
+    g0 = fx.Vector.from_elements([fx.Int32(1), lds, lo, hi], fx.Int32)
+    g1 = fx.Vector.from_elements(
+        [
+            fx.Int32(cfg),
+            fx.Int32(-65536),  # tensor_dim0 [15:0]
+            g1_2,
+            fx.Int32(w << 16) | g1_3,  # tile_dim0 | tensor_dim1 [31:16]
+            fx.Int32(rows),  # tile_dim1
+            fx.Int32(stride),  # row stride (elements)
+            fx.Int32(0),
+            fx.Int32(0),
+        ],
+        fx.Int32,
+    )
+    rocdl.tensor_load_to_lds(fx.as_ir_value(g0), fx.as_ir_value(g1), z4, z4, z8, cache_policy=0)
+
+
+def issue_q_copy(
+    *, q_addr, stride_q_seq, stride_q_head, q_start, q_len, head, block_x, warp_idx, region, tile_stride
+):
+    """TDM-copy wave ``warp_idx``'s two 16-row q tiles (block rows qt * tile_stride + warp_idx * 32;
+    q at global byte address ``q_addr``) to its 32 LDS rows at ``region``; rows past ``q_len`` are
+    zero-filled."""
+    for qt in range(Q_TILES):
+        seq0 = block_x * fx.Int32(BLOCK_M) + fx.Int32(qt * tile_stride) + warp_idx * fx.Int32(ROWS_PER_WAVE)
+        n_valid = fx.max(q_len - seq0, fx.Int32(0))
+        base = q_addr + (
+            fx.Int64(q_start + seq0) * fx.Int64(stride_q_seq) + fx.Int64(head) * fx.Int64(stride_q_head)
+        ) * fx.Int64(2)
+        for c0, w in pow2_segments(D_QK):
+            _tdm_rows(
+                region + fx.Int32((qt * WMMA_M * Q_ROW_ELEMS + c0) * 2),
+                base + fx.Int64(c0 * 2),
+                n_valid,
+                w,
+                WMMA_M,
+                stride_q_seq,
+                _tdm_cfg(w, Q_ROW_ELEMS),
             )
-        )
-        atom = fx.rocdl.make_tdm_atom(
-            g_view,
-            [n_valid, None, None],
-            strides=[stride_q_seq, stride_q_head, None],
-            num_warps=1,
-            pad_interval=w,
-            pad_amount=Q_ROW_ELEMS - w,
-        )
-        l_view = fx.Tensor(
-            fx.make_view(
-                fx.inttoptr(lds_ty, region + fx.Int32(c0 * 2)),
-                fx.make_layout((ROWS_PER_WAVE, 1, w), (Q_ROW_ELEMS, Q_ROW_ELEMS, 1)),
-            )
-        )
-        fx.copy_atom_call(atom, g_view, l_view)
-    return region
 
 
 def read_q_fragments(region, lane_idx):
-    """Wait for the Q copy and read it as WMMA B operands: [tile][k-step] v16 bf16."""
-    tdm_ops.tensor_wait(0)
+    """Read this wave's Q (copied and waited for) as WMMA B operands: [tile][k-step] v16 bf16."""
     v8 = fx.Vector.make_type(_CHUNK_ELEMS, fx.BFloat16)
     lane_base = (
         region
@@ -179,7 +199,7 @@ class KVTileLoader:
             (k, stride_k_seq, stride_k_head, D_QK, K_ROW_ELEMS, 0),
             (v, stride_v_seq, stride_v_head, D_V, V_ROW_ELEMS, v_lds_off),
         ):
-            base = fx.Int64(fx.ptrtoint(fx.get_iter(src))) + (
+            base = src + (
                 fx.Int64(kv_start + r0) * fx.Int64(sseq) + fx.Int64(head) * fx.Int64(shead)
             ) * fx.Int64(2)
             row_bytes = fx.Int64(sseq) * fx.Int64(2)
@@ -289,10 +309,24 @@ class OutputWriter:
     the asynchronous LDS->global copies. Rows at or past ``q_len`` are not written.
     """
 
-    def __init__(self, *, o, stride_o_seq, stride_o_head, q_start, q_len, head, block_x, warp_idx, lane_idx):
-        self.o, self.stride_o_seq, self.stride_o_head = o, stride_o_seq, stride_o_head
+    def __init__(
+        self,
+        *,
+        o_addr,
+        stride_o_seq,
+        stride_o_head,
+        q_start,
+        q_len,
+        head,
+        block_x,
+        warp_idx,
+        lane_idx,
+        tile_stride,
+    ):
+        self.o_addr, self.stride_o_seq, self.stride_o_head = o_addr, stride_o_seq, stride_o_head
         self.q_start, self.q_len, self.head = q_start, q_len, head
         self.block_x, self.warp_idx, self.lane_idx = block_x, warp_idx, lane_idx
+        self.tile_stride = tile_stride
         self._staged = []
 
     def stage(self, lds_base, frags, qt):
@@ -326,25 +360,37 @@ class OutputWriter:
         self._staged = []
 
     def _row_addresses(self):
-        # Lane l of round r copies 16-byte chunk r * 32 + l of the wave's rows. Rows past q_len
-        # are redirected to the last valid row (an identical rewrite), so every copy issues.
+        # Lane l of round r copies 16-byte chunk r * 32 + l of the wave's rows: rounds [0, 8) are
+        # q tile 0 (block rows warp_idx * 32 + [0, 16)), rounds [8, 16) q tile 1 (tile_stride rows
+        # further). seq_len_q is a multiple of 64, so a q tile is valid or past q_len as a whole; the
+        # rows of an invalid q tile 1 are redirected to q tile 0's (an identical rewrite), so every
+        # copy issues.
         chunks_per_row = D_V // _CHUNK_ELEMS
-        o_base = fx.Int64(fx.ptrtoint(fx.get_iter(self.o)))
+        rows_per_round = WAVE_SIZE // chunks_per_row
+        o_base = self.o_addr
         valid_rows = self.q_len - self._row0
-        last_valid = fx.min(fx.max(valid_rows - fx.Int32(1), fx.Int32(0)), fx.Int32(ROWS_PER_WAVE - 1))
-        addrs = []
-        for r in range(ROWS_PER_WAVE * chunks_per_row // WAVE_SIZE):
-            c = fx.Int32(r * WAVE_SIZE) + self.lane_idx
-            row = c // fx.Int32(chunks_per_row)
-            chunk = c % fx.Int32(chunks_per_row)
-            row = fx.min(row, last_valid)
-            col = chunk * fx.Int32(_CHUNK_ELEMS)
-            src = self._region + row * fx.Int32(O_ROW_ELEMS * 2) + chunk * fx.Int32(_CHUNK_BYTES)
-            seq = self.q_start + (self._row0 + row)
+        lane_row = self.lane_idx // fx.Int32(chunks_per_row)
+        chunk = self.lane_idx % fx.Int32(chunks_per_row)
+        row_bytes = fx.Int64(self.stride_o_seq) * fx.Int64(2)
+        g = []
+        for qt in range(Q_TILES):
+            seq = self.q_start + self._row0 + fx.Int32(qt * self.tile_stride) + lane_row
             off = (
                 fx.Int64(seq) * fx.Int64(self.stride_o_seq)
                 + fx.Int64(self.head) * fx.Int64(self.stride_o_head)
-                + fx.Int64(col)
+                + fx.Int64(chunk * fx.Int32(_CHUNK_ELEMS))
             )
-            addrs.append((global_ptr(o_base + off * fx.Int64(2)), lds_ptr(src)))
+            g.append(o_base + off * fx.Int64(2))
+        l0 = self._region + lane_row * fx.Int32(O_ROW_ELEMS * 2) + chunk * fx.Int32(_CHUNK_BYTES)
+        tile1_valid = valid_rows > fx.Int32(self.tile_stride)
+        g1 = tile1_valid.select(g[1], g[0])
+        l1 = tile1_valid.select(l0 + fx.Int32(WMMA_M * O_ROW_ELEMS * 2), l0)
+        addrs = []
+        rounds_per_tile = WMMA_M // rows_per_round
+        for r in range(ROWS_PER_WAVE * chunks_per_row // WAVE_SIZE):
+            qt, rr = divmod(r, rounds_per_tile)
+            gb, lb = (g[0], l0) if qt == 0 else (g1, l1)
+            dst = gb + row_bytes * fx.Int64(rr * rows_per_round)
+            src = lb + fx.Int32(rr * rows_per_round * O_ROW_ELEMS * 2)
+            addrs.append((global_ptr(dst), lds_ptr(src)))
         return addrs, valid_rows
