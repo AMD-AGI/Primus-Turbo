@@ -11,6 +11,7 @@ on the same backend.
   - [2.1 DeepSeek-V3 MLA support matrix](#21-deepseek-v3-mla-support-matrix)
   - [2.2 FlyDSL version](#22-flydsl-version)
   - [2.3 Backward launch knobs](#23-backward-launch-knobs)
+  - [2.4 HIP backward (`PRIMUS_TURBO_MLA_BWD_IMPL=hk`)](#24-hip-backward-primus_turbo_mla_bwd_implhk)
 
 ## 1. Selecting a backend
 
@@ -105,3 +106,26 @@ setting.
 | `FLY_BWD_HEAD_GROUP` | `64` | launch order: a launch with more heads per batch than this runs them in groups of at most this many heads; `0` keeps all heads of a batch in one group |
 | `FLY_BWD_SMALL_GRID` | `1` | `0` disables the small-grid fallback (one-wave kernels when a launch would not fill the GPU) |
 | `FLY_BWD_SIDE_STREAM` | `0` | `1` runs the dQ kernels on a side stream concurrently with dK/dV (slower at DeepSeek-V3 training shapes) |
+
+### 2.4 HIP backward (`PRIMUS_TURBO_MLA_BWD_IMPL=hk`)
+
+`PRIMUS_TURBO_MLA_BWD_IMPL` (read at import) picks the MLA backward kernels: `flydsl` (default) or
+`hk`, HIP kernels in `primus_turbo/hipkittens/gfx1250_mla_bwd/` (headers from HipKittens' cdna5
+subset). The forward, the layouts and the outputs' contract are the same; any other value raises
+`ValueError` at the first MLA backward.
+
+- Kernels: FlyDSL `k_delta`, then HIP `k_dkdv96ds` (dK, dV, and the bf16 dS^T it computes, stored to
+  a per-call scratch) and HIP `k_dqds_c` (dQ = dS K from that scratch, no recompute), all on the
+  current stream. Deterministic (no atomics).
+- Memory: the dS^T scratch holds the causally live 16 x 32 blocks of every (batch, head), e.g.
+  4.33 GB at b2 s4096 h128 (`limits.ds_layout_bytes`), allocated and freed within the call through
+  the caching allocator.
+- Shapes, on top of 2.1: `seqlen_q % 384` is 0 or 256 (DeepSeek-V3's 4096 qualifies), and
+  `batch * heads * max(seqlen_q, seqlen_kv) <= 512 * 4096`.
+- Code objects: built at install time when `GPU_ARCHS` contains gfx1250
+  (`PRIMUS_TURBO_BUILD_HK_MLA_BWD=0` skips it), or with
+  `python primus_turbo/hipkittens/gfx1250_mla_bwd/hsaco.py` (`--check` verifies). The build uses
+  the flags in `manifest.json`, which also pins each code object's sha256 and the toolchain it
+  was validated with; a code object with another sha256 is never loaded.
+- A backward `hk` cannot take (shape, missing or unpinned code objects) runs on FlyDSL, with one
+  warning per reason.

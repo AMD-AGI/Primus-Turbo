@@ -41,7 +41,7 @@ needs_gfx1250 = pytest.mark.skipif(not _ON_GFX1250, reason="gfx1250 FlyDSL atten
 # The gfx1250 kernel packages; importing primus_turbo (the imports above) must not import any of them.
 _GFX1250_KERNEL_PACKAGES = tuple(
     f"primus_turbo.flydsl.attention.{p}" for p in ("gfx1250", "gfx1250_mla_fwd", "gfx1250_mla_bwd")
-)
+) + ("primus_turbo.hipkittens.gfx1250_mla_bwd",)
 
 
 def _gfx1250_kernel_modules():
@@ -945,3 +945,215 @@ def test_mla_partial_tiles_match_reference(monkeypatch, shape, layout, bwd_set):
         monkeypatch.setattr(_mla_bwd_impl(), "SMALL_GRID_WAVES", {"dkdv": 0, "dq": 0})
     q, k, v, dout = _mla_inputs(*shape, layout=layout)
     _check(_run_mla(q, k, v, dout, True), _mla_reference(q, k, v, dout, True, MLA_SCALE), min_db=48.0)
+
+
+# ---------------------------------------------------------------------------
+# MLA backward on the HIP kernels (PRIMUS_TURBO_MLA_BWD_IMPL=hk,
+# primus_turbo/hipkittens/gfx1250_mla_bwd)
+# ---------------------------------------------------------------------------
+
+
+def _mla_adapter():
+    from primus_turbo.pytorch.kernels.attention import (
+        attention_flydsl_gfx1250_mla_impl as mla_impl,
+    )
+
+    return mla_impl
+
+
+def _hk_package(name):
+    return importlib.import_module(f"primus_turbo.hipkittens.gfx1250_mla_bwd.{name}")
+
+
+@pytest.mark.parametrize(
+    ("setting", "expected"),
+    [("", "flydsl"), ("flydsl", "flydsl"), ("hk", "hk"), (" HK ", "hk"), ("hipkittens", None)],
+    ids=["unset", "flydsl", "hk", "hk_spelled_loosely", "unknown"],
+)
+def test_mla_bwd_impl_setting(monkeypatch, setting, expected):
+    mla_impl = _mla_adapter()
+    monkeypatch.setattr(mla_impl, "MLA_BWD_IMPL_SETTING", setting)
+    if expected is None:
+        with pytest.raises(ValueError, match="PRIMUS_TURBO_MLA_BWD_IMPL"):
+            mla_impl.mla_bwd_impl()
+    else:
+        assert mla_impl.mla_bwd_impl() == expected
+
+
+@needs_mla_flydsl
+@pytest.mark.parametrize(
+    "shape",
+    [(2, 4096, 4096, 128, 128), (1, 4096, 4096, 256, 256), (1, 256, 256, 2, 2), (1, 256, 384, 2, 2)],
+    ids=["dsv3_mbs2", "dsv3_mbs2_folded", "toy", "rect"],
+)
+def test_hk_mla_bwd_gate_accepts(monkeypatch, shape):
+    monkeypatch.setattr(_hk_package("hsaco"), "unavailable_reason", lambda *a: None)
+    assert _mla_adapter().hk_mla_bwd_unsupported_reason(*_meta_mla(*shape)[:3], True) is None
+
+
+@needs_mla_flydsl
+@pytest.mark.parametrize(
+    ("shape", "match"),
+    [
+        ((1, 512, 512, 2, 2), "seqlen_q % 384"),
+        ((1, 128, 128, 2, 2), "seqlen_q % 384"),
+        ((1, 256, 16384, 256, 256), "proven extent"),
+        ((1, 256, 256, 4, 2), "MHA only"),
+        ((1, 512, 256, 2, 2), "seqlen_q <= seqlen_kv"),
+    ],
+    ids=["sq512", "sq128", "beyond_proven_extent", "gqa", "sq_gt_skv"],
+)
+def test_hk_mla_bwd_gate_refuses(monkeypatch, shape, match):
+    monkeypatch.setattr(_hk_package("hsaco"), "unavailable_reason", lambda *a: None)
+    reason = _mla_adapter().hk_mla_bwd_unsupported_reason(*_meta_mla(*shape)[:3], True)
+    assert reason is not None and match in reason
+
+
+@needs_mla_flydsl
+def test_hk_mla_bwd_gate_refuses_without_the_code_objects(monkeypatch):
+    monkeypatch.setattr(
+        _hk_package("hsaco"), "unavailable_reason", lambda *a: "k_dkdv96ds.hsaco is not built"
+    )
+    reason = _mla_adapter().hk_mla_bwd_unsupported_reason(*_meta_mla(1, 256, 256, 2, 2)[:3], True)
+    assert reason == "k_dkdv96ds.hsaco is not built"
+
+
+def test_hk_mla_bwd_code_object_checks(tmp_path):
+    """unavailable_reason: a missing code object, then one with foreign bytes, are reasons."""
+    hsaco = _hk_package("hsaco")
+    assert "not built" in hsaco.unavailable_reason(tmp_path / "missing")
+    bad = tmp_path / "bad"
+    bad.mkdir()
+    for name in hsaco.load_manifest()["kernels"]:
+        (bad / f"{name}.hsaco").write_bytes(b"not a code object")
+    assert "sha256" in hsaco.unavailable_reason(bad)
+
+
+def test_hk_mla_bwd_manifest():
+    """Every kernel: its source is shipped, its arguments tile its kernarg segment in order, and the
+    flags are the device-only gfx1250 build (no KITTENS_CDNA4)."""
+    hsaco, hiprt = _hk_package("hsaco"), _hk_package("hiprt")
+    m = hsaco.load_manifest()
+    assert (
+        m["arch"] == "gfx1250"
+        and "--offload-arch=gfx1250" in m["flags"]
+        and "--cuda-device-only" in m["flags"]
+    )
+    assert not any("KITTENS_CDNA4" in f for f in m["flags"])
+    assert set(m["kernels"]) == {"k_dkdv96ds", "k_dqds_c"}
+    for name, k in m["kernels"].items():
+        assert (hsaco.HIP_DIR / k["src"]).is_file(), name
+        assert len(k["hsaco_sha256"]) == 64 and k["block"] in (64, 128)
+        last = k["args"][-1]
+        assert last["offset"] + last["size"] <= k["kernarg_size"], name
+        values = [1 if a["kind"] == "ptr" else 0 for a in k["args"]]
+        assert len(hiprt.pack_args(k["args"], values)) == last["offset"] + last["size"], name
+
+
+@needs_mla_flydsl
+def test_hk_mla_bwd_plan_on_meta_tensors():
+    """The launch plan at DeepSeek-V3's shape, on meta tensors (no GPU): three launches, the grids,
+    the dS scratch size, and argument tuples that match the manifest's kernel signatures."""
+    impl = _hk_package("impl")
+    m = _hk_package("hsaco").load_manifest()
+    b, s, h = 2, 4096, 128
+    q, k, v = _meta_mla(b, s, s, h, h)
+    o = torch.empty(b, s, h, D_V, dtype=torch.bfloat16, device="meta")
+    lse = torch.empty(b, h, s, dtype=torch.float32, device="meta")
+    plan = impl._plan(o, q, k, v, o, lse, MLA_SCALE, True, None)
+    assert [x[0] for x in plan["launches"]] == ["delta", "dkdv", "dq"]
+    assert plan["grids"]["dkdv"] == (32, 43, 8)  # 42 blocks of 96 kv rows + one 64-row tail
+    assert plan["grids"]["dq"] == (32, 11, 8)  # 10 tiles of 384 queries + the 256-query head
+    assert plan["ds_layout_bytes"] == 4_328_521_728
+    assert plan["ds_full"].numel() * 2 == 4_328_521_728 + 2 * impl.DS_GUARD_B
+    for _, name, (grid, block, values) in plan["launches"][1:]:
+        assert block == m["kernels"][name]["block"] and len(values) == len(m["kernels"][name]["args"])
+    with pytest.raises(ValueError, match="not proven"):
+        impl._plan(o, q, k, v, o, lse, MLA_SCALE, True, None, head_group=48)
+
+
+@needs_mla_flydsl
+@pytest.mark.parametrize(("s", "uses_hk"), [(256, True), (128, False)], ids=["hk", "falls_back"])
+def test_hk_mla_bwd_routes_and_falls_back(monkeypatch, s, uses_hk):
+    """PRIMUS_TURBO_MLA_BWD_IMPL=hk replaces only the backward kernels (same kernel-layout tensors);
+    a shape the HIP kernels refuse (seqlen 128) runs the FlyDSL backward. CPU: the kernels are the
+    fp32 reference."""
+    monkeypatch.setattr(attention_impl, "is_gfx1250", lambda: True)
+    monkeypatch.setattr(flash_attn_interface, "is_gfx1250", lambda: True)
+    mla_impl = _mla_adapter()
+    monkeypatch.setattr(mla_impl, "MLA_BWD_IMPL_SETTING", "hk")
+    monkeypatch.setattr(_hk_package("hsaco"), "unavailable_reason", lambda *a: None)
+    calls = []
+
+    def fwd(q, k, v, softmax_scale, causal):
+        out, lse, *_ = _mla_reference(q, k, v, torch.zeros(*q.shape[:3], D_V), causal, softmax_scale)
+        return out.to(q.dtype).contiguous(), lse.contiguous()
+
+    def bwd(tag):
+        def run(dout, q, k, v, out, lse, softmax_scale, causal):
+            calls.append((tag, tuple(q.shape)))
+            _, _, dq, dk, dv = _mla_reference(q, k, v, dout, causal, softmax_scale)
+            return tuple(g.to(q.dtype).contiguous() for g in (dq, dk, dv))
+
+        return run
+
+    monkeypatch.setattr(mla_impl, "_forward", fwd)
+    monkeypatch.setattr(mla_impl, "_backward", bwd("flydsl"))
+    monkeypatch.setattr(mla_impl, "_backward_hk", bwd("hk"))
+    b, h = 2, 2
+    q, k, v, dout = _mla_inputs(b, s, s, h, layout="sbhd")
+    qg, kg, vg = (t.requires_grad_() for t in (q, k, v))
+    with _pinned_flydsl():
+        out = flash_attn_func(qg, kg, vg, softmax_scale=MLA_SCALE, causal=True)
+    out.backward(dout)
+    assert calls == [("hk" if uses_hk else "flydsl", (1, s, b * h, D_QK))]
+    ref = _mla_reference(q, k, v, dout, True, MLA_SCALE)
+    for name, x, r in zip(("dq", "dk", "dv"), (qg.grad, kg.grad, vg.grad), ref[2:]):
+        assert compute_snr(r, x.detach().float()) > 40, name
+
+
+_HK_READY = _ON_GFX1250 and _mla_flydsl_reason() is None
+
+
+def _hk_code_objects_reason():
+    from primus_turbo.hipkittens.gfx1250_mla_bwd import hsaco
+
+    return hsaco.unavailable_reason()
+
+
+needs_hk_mla_bwd = pytest.mark.skipif(
+    not _HK_READY or _hk_code_objects_reason() is not None,
+    reason="gfx1250 + flydsl 0.3.4 + the HIP MLA backward code objects",
+)
+
+
+def _run_mla_hk(monkeypatch, q, k, v, dout):
+    mla_impl = _mla_adapter()
+    monkeypatch.setattr(mla_impl, "MLA_BWD_IMPL_SETTING", "hk")
+    calls = []
+    real = mla_impl._backward_hk
+
+    def spy(*args):
+        calls.append(tuple(args[1].shape))
+        return real(*args)
+
+    monkeypatch.setattr(mla_impl, "_backward_hk", spy)
+    got = _run_mla(q, k, v, dout, True)
+    assert len(calls) == 1, "the HIP backward was not used"
+    return got
+
+
+# The shapes the HIP kernels were validated on (one test per process, as for every new kernel).
+@needs_hk_mla_bwd
+@pytest.mark.parametrize(
+    ("shape", "layout"),
+    [((1, 256, 256, 2), "sbhd"), ((2, 256, 256, 2), "sbhd"), ((1, 256, 384, 2), "sbhd")],
+    ids=["toy", "toy_folded", "rect"],
+)
+def test_hk_mla_bwd_matches_reference_and_is_deterministic(monkeypatch, shape, layout):
+    q, k, v, dout = _mla_inputs(*shape, layout=layout)
+    got = _run_mla_hk(monkeypatch, q, k, v, dout)
+    _check(got, _mla_reference(q, k, v, dout, True, MLA_SCALE), min_db=48.0)
+    again = _run_mla_hk(monkeypatch, q, k, v, dout)
+    for a, b_ in zip(got, again):
+        assert torch.equal(a, b_)
