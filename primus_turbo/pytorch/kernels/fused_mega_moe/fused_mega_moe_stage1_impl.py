@@ -16,6 +16,7 @@ from primus_turbo.flydsl.mega.bf16.dispatch_prologue_kernel import (
     DispatchHandle,
     run_dispatch_prologue,
 )
+from primus_turbo.pytorch.core.utils import is_gfx1250
 
 
 def fused_mega_moe_stage1_forward_impl(
@@ -26,6 +27,12 @@ def fused_mega_moe_stage1_forward_impl(
     topk_weights: torch.Tensor,
 ):
     """dispatch + grouped L1 GEMM (nt). Returns ``(l1_out, dispatch_weights, handle)``."""
+    if is_gfx1250():
+        from primus_turbo.pytorch.kernels.fused_mega_moe import (
+            fused_mega_moe_gfx1250_impl as gfx1250,
+        )
+
+        return gfx1250.stage1_forward(x, w1, group, topk_idx, topk_weights)
     handle, dispatch_weights = run_dispatch_prologue(x, w1, group, topk_idx, topk_weights)
     l1_out, _, _ = dispatch_grouped_gemm_bf16_flydsl_kernel(x, w1, group, handle=handle, layout="nt")
     return l1_out, dispatch_weights, handle
@@ -47,6 +54,12 @@ def fused_mega_moe_stage1_backward_impl(
     Returns ``(dx, grad_topk_weights, dW1)``. ``grad_gate`` (from stage2's
     SwiGLU^T) is scattered into ``grad_topk_weights`` by the combine kernel.
     """
+    if is_gfx1250():
+        from primus_turbo.pytorch.kernels.fused_mega_moe import (
+            fused_mega_moe_gfx1250_impl as gfx1250,
+        )
+
+        return gfx1250.stage1_backward(grad_l1, saved_x, w1, handle, topk_idx, grad_gate)
     topk_indices_flat = topk_idx.contiguous().view(-1)
 
     # L1 dgrad (grad_l1 @ w1, nn) + combine PUSH + dx reduce + grad_gate scatter

@@ -103,6 +103,8 @@ def _launch_gemm_combine_nt(
     arg_chunk_counter: fx.Pointer,
     arg_grad_gate: fx.Pointer,
     arg_grad_topk_weights: fx.Pointer,
+    arg_bias: fx.Pointer,
+    arg_bias_scale: fx.Pointer,
     sym_buffer,
     stream: fx.Stream,
     N: Constexpr[int],
@@ -124,6 +126,7 @@ def _launch_gemm_combine_nt(
     n_warp: Constexpr[int],
     HAS_GRAD_GATE: Constexpr[bool],
     B_NN: Constexpr[bool],
+    HAS_BIAS: Constexpr[bool],
 ):
     block = m_warp * n_warp * WAVE
     arena_bytes = tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
@@ -176,6 +179,8 @@ def _launch_gemm_combine_nt(
         arg_chunk_counter: fx.Pointer,
         arg_grad_gate: fx.Pointer,
         arg_grad_topk_weights: fx.Pointer,
+        arg_bias: fx.Pointer,
+        arg_bias_scale: fx.Pointer,
         sym_buffer,
     ):
         arena = fx.SharedAllocator(static=False)
@@ -360,6 +365,15 @@ def _launch_gemm_combine_nt(
                         create_buffer_resource_from_addr(_addr(arg_grad_gate)) if HAS_GRAD_GATE else None
                     ),
                     has_grad_gate=HAS_GRAD_GATE,
+                    bias=(
+                        (
+                            _addr(arg_bias),
+                            create_buffer_resource_from_addr(_addr(arg_tile_to_expert)),
+                            create_buffer_resource_from_addr(_addr(arg_bias_scale)),
+                        )
+                        if HAS_BIAS
+                        else None
+                    ),
                     block_threads=block,
                 )
                 chunk = rocdl.readfirstlane(T.i32, ld(lds, fx.Int32(1), scope="workgroup", space=3))
@@ -446,6 +460,8 @@ def _launch_gemm_combine_nt(
         arg_chunk_counter,
         arg_grad_gate,
         arg_grad_topk_weights,
+        arg_bias,
+        arg_bias_scale,
         sym_buffer,
     ).launch(
         grid=(num_gemm_blocks + NUM_COMBINE, 1, 1), block=(block, 1, 1), stream=stream
@@ -462,7 +478,7 @@ def _chunk_counter(device: torch.device) -> torch.Tensor:
     """The combine chunk and reduce token counters; the launch's epoch bump rearms them."""
     return torch.zeros(2, dtype=torch.int32, device=device)
 
-_CONSTEXPR0 = 22
+_CONSTEXPR0 = 24
 
 
 def gemm_combine_nt_gfx1250(
@@ -476,11 +492,13 @@ def gemm_combine_nt_gfx1250(
     lead_gemm_percent: int = 25,
     tile_m: int = 256,
     tile_n: int = 256,
-    tile_k: int = 128,
+    tile_k: int = 0,
     m_warp: int = 2,
     n_warp: int = 2,
     grad_gate: torch.Tensor | None = None,
     b_nn: bool = False,
+    bias: torch.Tensor | None = None,
+    bias_scale: torch.Tensor | None = None,
 ):
     """``act`` [pool rows, K] (pool order, as the L1 + activation left it) -> ``[tokens, N]`` combined,
     ``tokens = topk_idx.shape[0]``.
@@ -490,7 +508,9 @@ def gemm_combine_nt_gfx1250(
 
     ``out[t]`` is the sum of ``act[p] @ w2[e(p)].T`` over the pool rows ``p`` of every route of
     this rank's token ``t``, on whichever rank holds them. No routing weight is applied here.
-    ``w2`` is ``[experts, N, K]``, or ``[experts, K, N]`` with ``b_nn`` (``act[p] @ w2[e(p)]``)."""
+    ``w2`` is ``[experts, N, K]``, or ``[experts, K, N]`` with ``b_nn`` (``act[p] @ w2[e(p)]``).
+    ``bias`` [experts, N] adds ``bias[e(p)] * bias_scale[p]`` to every pool row before the sum,
+    ``bias_scale`` being the rows' f32 routing weight. ``tile_k`` 0 is 128 when it divides K, else 64."""
     _require_gfx1250(act.device)
     symm = get_symm_buffer_for_mega_moe()
     G, N, K = w2.shape
@@ -498,6 +518,7 @@ def gemm_combine_nt_gfx1250(
         K, N = N, K
         assert N >= tile_n, "an NN block backs its B read off into the row, so N >= tile_n"
     rows = act.shape[0]
+    tile_k = tile_k or (128 if K % 128 == 0 else 64)
     assert act.dtype == w2.dtype == torch.bfloat16 and act.is_contiguous() and w2.is_contiguous()
     assert act.shape[1] == K and N == int(symm.hidden), "w2's output dim is the model hidden"
     assert rows == handle.pool_row_to_route.numel(), "act holds the rows dispatched to this rank"
@@ -521,6 +542,11 @@ def gemm_combine_nt_gfx1250(
         assert grad_gate.dtype == torch.float32 and grad_gate.numel() == rows, "one f32 gate grad per pool row"
         grad_gate = grad_gate.contiguous()
         grad_topk_weights = torch.empty(int(symm.num_max_routes), dtype=torch.float32, device=act.device)
+    has_bias = bias is not None
+    if has_bias:
+        assert bias.dtype == torch.bfloat16 and tuple(bias.shape) == (G, N), f"bias must be bf16 [{G}, {N}]"
+        assert bias_scale is not None and bias_scale.dtype == torch.float32 and bias_scale.numel() == rows
+        bias, bias_scale = bias.contiguous(), bias_scale.contiguous()
     # local stage of the L2 output: only this rank's combine workgroups read it
     l2 = torch.empty(rows, N, dtype=torch.bfloat16, device=act.device)
     args = (
@@ -545,6 +571,8 @@ def gemm_combine_nt_gfx1250(
         # traced out without a grad gate; any device tensor fills them
         _as_ptr(grad_gate if has_grad_gate else out),
         _as_ptr(grad_topk_weights if has_grad_gate else out),
+        _as_ptr(bias if has_bias else out),
+        _as_ptr(bias_scale if has_bias else out),
         symm.get_sym_buffer(),
         torch.cuda.current_stream(),
         N,
@@ -566,6 +594,7 @@ def gemm_combine_nt_gfx1250(
         n_warp,
         has_grad_gate,
         b_nn,
+        has_bias,
     )
     key = args[_CONSTEXPR0:]
     fn = _COMPILED.get(key)

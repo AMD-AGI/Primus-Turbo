@@ -55,6 +55,7 @@ def _reference(a_rows, b, tile_to_expert, live):
         (4096, 7168, [300, 0, 1024, 37, 512]),  # DeepSeek-V3 GateUp
         (7168, 2048, [256, 700, 0, 1]),  # DeepSeek-V3 Down
         (2880, 2048, [129, 600]),  # ragged N: 2880 = 11 * 256 + 64
+        (5760, 2880, [300, 0, 77]),  # GPT-OSS GateUp: K = 2880 takes 64-wide k-tiles, ragged N
     ],
 )
 @pytest.mark.parametrize("mode", ["gather16", "gather32", "dense"])
