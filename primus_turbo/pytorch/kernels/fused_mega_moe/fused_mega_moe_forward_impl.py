@@ -33,8 +33,10 @@ from primus_turbo.pytorch.core.backend import (
     KernelBackend,
     TuneCache,
 )
+from primus_turbo.pytorch.core.utils import is_gfx1250
 
 _SUPPORTED_DTYPES = (torch.bfloat16,)
+_GFX1250_TILE_K = 128
 
 
 class FusedMegaMoEForwardFlyDSLBackend(KernelBackend):
@@ -51,6 +53,12 @@ class FusedMegaMoEForwardFlyDSLBackend(KernelBackend):
         supported &= x.dim() == 2 and w1.dim() == 3 and w2.dim() == 3
         supported &= x.dtype in _SUPPORTED_DTYPES
         supported &= w1.dtype in _SUPPORTED_DTYPES and w2.dtype in _SUPPORTED_DTYPES
+        if is_gfx1250():
+            # the gfx1250 tiles are NT only and take K in whole 128-wide k-tiles, at least two
+            supported &= kwargs.get("layout") == "nt"
+            supported &= all(
+                k % _GFX1250_TILE_K == 0 and k >= 2 * _GFX1250_TILE_K for k in (w1.shape[2], w2.shape[2])
+            )
         return supported
 
     @staticmethod
@@ -67,6 +75,20 @@ class FusedMegaMoEForwardFlyDSLBackend(KernelBackend):
     ):
 
         handle, dispatch_weights = run_dispatch_prologue(x, w1, group, topk_idx, topk_weights)
+        if is_gfx1250():
+            from primus_turbo.flydsl.mega.bf16_gfx1250.dispatch_gemm_kernel import (
+                dispatch_gemm_nt_gfx1250,
+            )
+            from primus_turbo.flydsl.mega.bf16_gfx1250.gemm_combine_kernel import (
+                gemm_combine_nt_gfx1250,
+            )
+
+            l1_out = dispatch_gemm_nt_gfx1250(x, w1, handle)
+            act = swiglu_flydsl_kernel(
+                l1_out, num_tile_blocks=handle.num_tile_blocks, scale=dispatch_weights, activation=activation
+            )
+            y = gemm_combine_nt_gfx1250(act, w2, handle, topk_idx)
+            return y, l1_out, dispatch_weights, list(handle)
         l1_out, _, _ = dispatch_grouped_gemm_bf16_flydsl_kernel(x, w1, group, handle=handle, layout=layout)
 
         # routing weight is applied to act here: sum_k w_k * W2(a_k) == sum_k W2(w_k * a_k)
