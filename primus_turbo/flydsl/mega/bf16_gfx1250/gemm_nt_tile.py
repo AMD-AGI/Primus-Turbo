@@ -175,6 +175,7 @@ def nt_gemm_tile(
     n_warp: int,
     gather: bool,
     idx_bits: int = 16,
+    c_cache_modifier: int = 0,
 ):
     """One ``tile_m x tile_n`` NT block; must be called by all ``m_warp * n_warp`` waves.
 
@@ -184,7 +185,8 @@ def nt_gemm_tile(
     ``gather``, bounded by ``a_rows``. B is ``gB_base + b_slab`` with row stride ``ldb``; this
     block reads its rows ``blk_n ..``. C is written at byte address ``c_addr`` with row stride
     ``ldc``, ``m_rows`` rows and ``n_valid`` columns kept. ``live`` (wave-uniform i1) turns the
-    tile into a no-op.
+    tile into a no-op. ``c_cache_modifier`` is the C stores' cache policy (``cpol_device_stream()``
+    when another workgroup consumes C in the same launch).
     """
     KB = tile_k * EB
     KSB = WMMA_K * EB
@@ -380,7 +382,7 @@ def nt_gemm_tile(
         v = lds_load_b128(lds_c, row * fx.Int32(tile_n * EB) + c16 * fx.Int32(16))
         word = row * fx.Int32(ldc // 2) + c16 * fx.Int32(4)
         word = (c16 * fx.Int32(8) < n_ext).select(word, dropped)
-        buffer_store(v, c_res, word)
+        buffer_store(v, c_res, word, cache_modifier=c_cache_modifier)
 
 
 # ── standalone launcher: one tile per (pool block, N block) ──────────────────

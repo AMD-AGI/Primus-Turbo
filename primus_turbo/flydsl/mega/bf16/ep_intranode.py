@@ -21,7 +21,12 @@ from flydsl.expr.utils.arith import ArithValue
 
 from primus_turbo.flydsl.mega.bf16.symm_buffer import BLOCK_M as POOL_BLOCK_M
 from primus_turbo.flydsl.mega.bf16.symm_buffer import SymBuffer, Workspace
-from primus_turbo.flydsl.utils.arch import cpol_device_stream, cpol_system_stream
+from primus_turbo.flydsl.utils.arch import (
+    cpol_device_stream,
+    cpol_system_stream,
+    hw_wave_size,
+    is_gfx1250_target,
+)
 from primus_turbo.flydsl.utils.buffer_ops import (
     buffer_load,
     buffer_store,
@@ -188,7 +193,9 @@ def _pool_row_resource(l2_ptr, pool_row, row_bytes, is_present=True):
     return create_buffer_resource_from_addr(base, num_records_bytes=num_records_bytes)
 
 
-def _sum_pool_rows(pool_rows, l2_ptr, combine_token_res, dst_base, dropped_base, lane_col, hidden, bias=None):
+def _sum_pool_rows(
+    pool_rows, l2_ptr, combine_token_res, dst_base, dropped_base, lane_col, hidden, bias=None, warp=_WARP
+):
     """Store the f32 sum of the present pool_rows (ascending, -1 absent) as one bf16 row at dst_base.
 
     ``bias`` = ``(bias_ptr, tile_to_expert_res, weight_res)`` adds each present row's routing weight
@@ -196,7 +203,7 @@ def _sum_pool_rows(pool_rows, l2_ptr, combine_token_res, dst_base, dropped_base,
     f32_vec = fx.T.vec(_PVEC, fx.T.f32)
     bf16_vec = fx.T.vec(_PVEC, fx.T.bf16)
     row_bytes = hidden * 2
-    cols_per_step = _WARP * _PVEC
+    cols_per_step = warp * _PVEC
     num_full_chunks = hidden // cols_per_step
     tail_cols = hidden % cols_per_step
     row_resources = [_pool_row_resource(l2_ptr, pool_rows[0], row_bytes)]
@@ -285,6 +292,7 @@ def combine_bf16_tile(
     grad_gate_res: Optional[ArithValue] = None,
     has_grad_gate: bool = False,
     bias: Optional[tuple] = None,
+    block_threads: int = _BLOCK_THREADS,
 ):
     """Push each fold row in [first_fold_row, +num_fold_rows) as its recv token's sum to the primary route.
 
@@ -292,15 +300,20 @@ def combine_bf16_tile(
     ``bias``: the experts' fc2 bias, see :func:`_sum_pool_rows`."""
     hidden = int(workspace.hidden)
     num_topk = int(workspace.num_topk)
-    assert num_topk <= _WARP, "lane k pushes the grad_gate of pool row k"
+    # A copy warp is one hardware wave: a row's flag goes out after this wave's own stores
+    # retire, which on wave32 would not cover a 64-lane warp's other half.
+    warp = hw_wave_size()
+    assert num_topk <= warp, "lane k pushes the grad_gate of pool row k"
+    assert block_threads % warp == 0, "a block is a whole number of copy warps"
+    num_warps = block_threads // warp
     num_max_routes = int(workspace.num_max_routes)
     row_bytes = hidden * 2
     row_words = hidden // 2
-    cols_per_step = _WARP * _PVEC
+    cols_per_step = warp * _PVEC
     num_full_chunks = hidden // cols_per_step
     tail_cols = hidden % cols_per_step
-    warp_id = thread_index // fx.Int32(_WARP)
-    lane_id = thread_index % fx.Int32(_WARP)
+    warp_id = thread_index // fx.Int32(warp)
+    lane_id = thread_index % fx.Int32(warp)
     lane_col = lane_id * fx.Int32(_PVEC)
     dropped_base = fx.Int32(num_max_routes * hidden)
 
@@ -354,7 +367,7 @@ def combine_bf16_tile(
         if const_expr(bias is not None):
             # a bias term rides the sum, so with one the single-row copy has nothing to offer
             _sum_pool_rows(
-                pool_rows, l2_ptr, combine_token_res, dst_base, dropped_base, lane_col, hidden, bias
+                pool_rows, l2_ptr, combine_token_res, dst_base, dropped_base, lane_col, hidden, bias, warp
             )
         else:
             push_rows_sum(fold_row, pool_rows, dst_route, dst_base)
@@ -381,6 +394,7 @@ def combine_bf16_tile(
                 dst_off=dst_route * fx.Int32(row_words),
                 load_cache_modifier=cpol_device_stream(),  # read the same-agent GEMM stage
                 store_cache_modifier=cpol_system_stream(),  # publish to a remote agent
+                warp=warp,
             )
             if const_expr(tail_cols):
                 col = fx.Int32(num_full_chunks * cols_per_step) + lane_col
@@ -397,19 +411,25 @@ def combine_bf16_tile(
                 dst = arith.select(is_in_tail, dst_base + col, dropped_base)
                 buffer_store(tail_value, combine_token_res, dst, cache_modifier=cpol_system_stream())
         else:
-            _sum_pool_rows(pool_rows, l2_ptr, combine_token_res, dst_base, dropped_base, lane_col, hidden)
+            _sum_pool_rows(
+                pool_rows, l2_ptr, combine_token_res, dst_base, dropped_base, lane_col, hidden, warp=warp
+            )
 
-    local_count = (num_fold_rows - warp_id + fx.Int32(_NUM_WARPS - 1)) // fx.Int32(_NUM_WARPS)
+    local_count = (num_fold_rows - warp_id + fx.Int32(num_warps - 1)) // fx.Int32(num_warps)
     num_grouped = (local_count // fx.Int32(_ROW_UNROLL)) * fx.Int32(_ROW_UNROLL)
     for i in range(0, num_grouped, _ROW_UNROLL):
         push_rows(
             [
-                first_fold_row + warp_id + (i + fx.Int32(u)) * fx.Int32(_NUM_WARPS)
+                first_fold_row + warp_id + (i + fx.Int32(u)) * fx.Int32(num_warps)
                 for u in range_constexpr(_ROW_UNROLL)
             ]
         )
     for i in range(num_grouped, local_count):
-        push_rows([first_fold_row + warp_id + i * fx.Int32(_NUM_WARPS)])
+        push_rows([first_fold_row + warp_id + i * fx.Int32(num_warps)])
+
+
+def _steps(first: int, count: int, end: int) -> list:
+    return list(range(first, min(first + count, end)))
 
 
 @ASTRewriter.transform
@@ -433,15 +453,24 @@ def topk_reduce_bf16_tile(
     combine_gate_res: Optional[ArithValue] = None,
     grad_topk_weights_res: Optional[ArithValue] = None,
     has_grad_gate: bool = False,
+    block_threads: int = _BLOCK_THREADS,
+    vec_unroll: int = 1,
 ):
-    """Sum each token's primary-route combine rows into its output row once their reduce flags reach epoch."""
+    """Sum each token's primary-route combine rows into its output row once their reduce flags reach epoch.
+
+    ``vec_unroll`` > 1 issues the loads of that many 64-lane column steps before summing any, so
+    a warp keeps more of the row in flight; 1 is the one-step-at-a-time loop."""
     f32_vec = fx.T.vec(_PVEC, fx.T.f32)
     bf16_vec = fx.T.vec(_PVEC, fx.T.bf16)
     num_vec_chunks = hidden // _PVEC
     lane_id = thread_index % fx.Int32(_WARP)
     warp_id = thread_index // fx.Int32(_WARP)
     num_tokens = buffer_load(num_tokens_res, fx.Int32(rank), vec_width=1, dtype=fx.T.i32)
-    token = reduce_block_idx * fx.Int32(_NUM_WARPS) + warp_id
+    token = reduce_block_idx * fx.Int32(block_threads // _WARP) + warp_id
+    # A 64-lane copy warp is two waves on wave32; the barrier below can pair with another warp's
+    # (their token counts differ), so each wave's own first lane waits for the flags.
+    hw_wave = 32 if is_gfx1250_target() else 64
+    is_wave_leader = thread_index % fx.Int32(hw_wave) == fx.Int32(0)
     while token < num_tokens:
         route_base = token * fx.Int32(num_topk)
         expert_ids = []
@@ -452,11 +481,12 @@ def topk_reduce_bf16_tile(
         is_primary = [is_primary_route(expert_ids, j, num_experts_per_rank) for j in range(num_topk)]
         for j in range_constexpr(num_topk):
             if is_primary[j]:
-                if lane_id == fx.Int32(0):
+                if is_wave_leader:
                     spin_until_flag_reaches(
                         reduce_flag_base, reduce_bank + route_base + fx.Int32(j), epoch, "sys", rank, "reduce"
                     )
-        fx.gpu.barrier()
+        if const_expr(hw_wave == _WARP):
+            fx.gpu.barrier()
 
         # a non-primary route points past num_records, so its load reads 0 and moves no bytes
         route_offsets = [
@@ -467,22 +497,52 @@ def topk_reduce_bf16_tile(
             )
             for j in range(num_topk)
         ]
-        vec_idx = lane_id
-        while vec_idx < fx.Int32(num_vec_chunks):
-            col = vec_idx * fx.Int32(_PVEC)
-            row_sum = None
-            for j in range_constexpr(num_topk):
-                value = buffer_load(
-                    combine_token_res,
-                    route_offsets[j] + col,
-                    vec_width=_PVEC,
-                    dtype=fx.T.bf16,
-                    cache_modifier=cpol_system_stream(),  # system-visible non-temporal read
-                )
-                term = fx.arith.extf(f32_vec, value)
-                row_sum = term if row_sum is None else fx.arith.addf(row_sum, term)
-            buffer_store(fx.arith.trunc_f(bf16_vec, row_sum), output_res, token * fx.Int32(hidden) + col)
-            vec_idx = vec_idx + fx.Int32(_WARP)
+        if const_expr(vec_unroll > 1):
+            num_steps = ceildiv(num_vec_chunks, _WARP)
+            for first_step in range_constexpr(0, num_steps, vec_unroll):
+                vec_ids = [lane_id + fx.Int32(step * _WARP) for step in _steps(first_step, vec_unroll, num_steps)]
+                # a lane past the row's last chunk reads chunk 0 and skips its store
+                cols = [
+                    arith.select(v < fx.Int32(num_vec_chunks), v * fx.Int32(_PVEC), fx.Int32(0)) for v in vec_ids
+                ]
+                values = [
+                    [
+                        buffer_load(
+                            combine_token_res,
+                            route_offsets[j] + col,
+                            vec_width=_PVEC,
+                            dtype=fx.T.bf16,
+                            cache_modifier=cpol_system_stream(),  # system-visible non-temporal read
+                        )
+                        for j in range_constexpr(num_topk)
+                    ]
+                    for col in cols
+                ]
+                for u in range_constexpr(len(vec_ids)):
+                    row_sum = fx.arith.extf(f32_vec, values[u][0])
+                    for j in range_constexpr(1, num_topk):
+                        row_sum = fx.arith.addf(row_sum, fx.arith.extf(f32_vec, values[u][j]))
+                    if vec_ids[u] < fx.Int32(num_vec_chunks):
+                        buffer_store(
+                            fx.arith.trunc_f(bf16_vec, row_sum), output_res, token * fx.Int32(hidden) + cols[u]
+                        )
+        else:
+            vec_idx = lane_id
+            while vec_idx < fx.Int32(num_vec_chunks):
+                col = vec_idx * fx.Int32(_PVEC)
+                row_sum = None
+                for j in range_constexpr(num_topk):
+                    value = buffer_load(
+                        combine_token_res,
+                        route_offsets[j] + col,
+                        vec_width=_PVEC,
+                        dtype=fx.T.bf16,
+                        cache_modifier=cpol_system_stream(),  # system-visible non-temporal read
+                    )
+                    term = fx.arith.extf(f32_vec, value)
+                    row_sum = term if row_sum is None else fx.arith.addf(row_sum, term)
+                buffer_store(fx.arith.trunc_f(bf16_vec, row_sum), output_res, token * fx.Int32(hidden) + col)
+                vec_idx = vec_idx + fx.Int32(_WARP)
         if const_expr(has_grad_gate):
             # every valid route's dst has a primary route whose flag was awaited above
             for j in range_constexpr(num_topk):
