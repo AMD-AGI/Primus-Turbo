@@ -123,9 +123,10 @@ def _launch_gemm_combine_nt(
     m_warp: Constexpr[int],
     n_warp: Constexpr[int],
     HAS_GRAD_GATE: Constexpr[bool],
+    B_NN: Constexpr[bool],
 ):
     block = m_warp * n_warp * WAVE
-    arena_bytes = tile_geometry(tile_m, tile_n, tile_k)[3]
+    arena_bytes = tile_geometry(tile_m, tile_n, tile_k, B_NN)[3]
     if arena_bytes > GFX1250_LDS_BYTES:
         raise ValueError(f"LDS arena {arena_bytes} B exceeds {GFX1250_LDS_BYTES} B")
     num_gemm_blocks = MAX_TILES * N_BLOCKS_N
@@ -243,7 +244,7 @@ def _launch_gemm_combine_nt(
             row_idx_table=_i32_table(arg_tile_to_expert),
             row_idx_base=fx.Int32(0),
             gB_base=fx.recast_iter(fx.Int8, arg_w),
-            ldb=K,
+            ldb=N if B_NN else K,
             b_slab=fx.Int64(expert) * fx.Int64(N * K * EB),
             blk_n=blk_n,
             c_addr=l2_base + (fx.Int64(m_row) * fx.Int64(N) + fx.Int64(blk_n)) * fx.Int64(EB),
@@ -259,6 +260,8 @@ def _launch_gemm_combine_nt(
             n_warp=n_warp,
             gather=False,
             c_cache_modifier=cpol_device_stream(),  # read by combine workgroups on other CUs
+            b_nn=B_NN,
+            i32_n=fx.Int32(N),
         )
         # every wave's C stores retire before the flag; two rendezvous, which LLVM would fold
         wait_mem_all()
@@ -477,6 +480,7 @@ def gemm_combine_nt_gfx1250(
     m_warp: int = 2,
     n_warp: int = 2,
     grad_gate: torch.Tensor | None = None,
+    b_nn: bool = False,
 ):
     """``act`` [pool rows, K] (pool order, as the L1 + activation left it) -> ``[tokens, N]`` combined,
     ``tokens = topk_idx.shape[0]``.
@@ -485,13 +489,17 @@ def gemm_combine_nt_gfx1250(
     call returns ``(out, grad_topk_weights [tokens, topk])``, the backward's gate gradient.
 
     ``out[t]`` is the sum of ``act[p] @ w2[e(p)].T`` over the pool rows ``p`` of every route of
-    this rank's token ``t``, on whichever rank holds them. No routing weight is applied here."""
+    this rank's token ``t``, on whichever rank holds them. No routing weight is applied here.
+    ``w2`` is ``[experts, N, K]``, or ``[experts, K, N]`` with ``b_nn`` (``act[p] @ w2[e(p)]``)."""
     _require_gfx1250(act.device)
     symm = get_symm_buffer_for_mega_moe()
     G, N, K = w2.shape
+    if b_nn:
+        K, N = N, K
+        assert N >= tile_n, "an NN block backs its B read off into the row, so N >= tile_n"
     rows = act.shape[0]
     assert act.dtype == w2.dtype == torch.bfloat16 and act.is_contiguous() and w2.is_contiguous()
-    assert act.shape[1] == K and N == int(symm.hidden), "w2 is [experts, hidden, intermediate]"
+    assert act.shape[1] == K and N == int(symm.hidden), "w2's output dim is the model hidden"
     assert rows == handle.pool_row_to_route.numel(), "act holds the rows dispatched to this rank"
     assert tile_m == BLOCK_M, "a GEMM tile is one Mega pool block"
     assert K % tile_k == 0 and K // tile_k >= NUM_BUFFERS, "K must be a whole number of >= 2 k-tiles"
@@ -557,6 +565,7 @@ def gemm_combine_nt_gfx1250(
         m_warp,
         n_warp,
         has_grad_gate,
+        b_nn,
     )
     key = args[_CONSTEXPR0:]
     fn = _COMPILED.get(key)

@@ -11,7 +11,8 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""Mega MoE NT GEMM tile for gfx1250: ``C[pool block] = A[rows] @ B[expert].T``.
+"""Mega MoE GEMM tile for gfx1250: ``C[pool block] = A[rows] @ B[expert].T`` (NT), or
+``A[rows] @ B[expert]`` with ``b_nn`` (B stored ``[K, N]``, the backward's dgrad).
 
 One workgroup computes one ``tile_m x tile_n`` block of one 256-row pool block, the unit Mega
 schedules on. The pipeline is the shipped configuration of
@@ -24,6 +25,9 @@ with two changes Mega needs:
   with 32-bit ones. An index past ``a_rows`` -- the pool's padding rows carry -1 -- is out of
   range for the TDM engine, which leaves that LDS row unwritten; the row's output is padding
   that nothing downstream reads.
+* **B can be NN.** With ``b_nn`` the B stage is ``[tile_k, tile_n]`` as stored and its fragments
+  come out of the hardware LDS transpose read ``ds_load_tr16_b128``, the native NN path of the
+  grouped kernel: no transposed copy of the weight.
 * **The epilogue stores with plain buffer stores**, staged through LDS so every lane writes 16
   contiguous bytes. The grouped kernel's ``tensor_store_from_lds`` epilogue is the remaining
   suspect of its rare silent wrong result, so Mega does not use it.
@@ -43,6 +47,8 @@ import torch
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as std_arith
+from flydsl._mlir.dialects import llvm as _llvm
+from flydsl._mlir.dialects import rocdl as _rocdl
 from flydsl._mlir.dialects import vector
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.arith import _to_raw as _raw
@@ -55,6 +61,7 @@ from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
     _as_ptr,
     _i32_table,
     _make_lds_copy_ops,
+    _nn_b_pad,
     _pipeline_fence,
     _require_gfx1250,
     _workgroup_barrier,
@@ -73,11 +80,14 @@ NUM_BUFFERS = 2
 GFX1250_LDS_BYTES = 320 * 1024
 
 
-def tile_geometry(tile_m: int, tile_n: int, tile_k: int):
-    """(LDS row bytes, A stage bytes, buffer pitch, arena bytes) of one tile configuration."""
+def tile_geometry(tile_m: int, tile_n: int, tile_k: int, b_nn: bool = False):
+    """(LDS row bytes, A stage bytes, buffer pitch, arena bytes) of one tile configuration.
+
+    The B stage is ``tile_n`` rows of ``tile_k`` (NT) or ``tile_k`` rows of ``tile_n`` (``b_nn``)."""
     lds_row = tile_k * EB + LDS_PAD
     stage = ((tile_m * lds_row + 15) // 16) * 16
-    stage_b = ((tile_n * lds_row + 15) // 16) * 16
+    b_rows, b_row = (tile_k, tile_n * EB + _nn_b_pad(tile_n, EB)) if b_nn else (tile_n, lds_row)
+    stage_b = ((b_rows * b_row + 15) // 16) * 16
     pitch = ((stage + stage_b + 1023) // 1024) * 1024
     arena = max(NUM_BUFFERS * pitch, tile_m * tile_n * EB)
     return lds_row, stage, pitch, arena
@@ -176,14 +186,18 @@ def nt_gemm_tile(
     gather: bool,
     idx_bits: int = 16,
     c_cache_modifier: int = 0,
+    b_nn: bool = False,
+    i32_n=None,
 ):
-    """One ``tile_m x tile_n`` NT block; must be called by all ``m_warp * n_warp`` waves.
+    """One ``tile_m x tile_n`` block; must be called by all ``m_warp * n_warp`` waves.
 
     ``base_ptr`` is the LDS arena (``tile_geometry(...)[3]`` bytes). A is ``gA_base`` (Int8
     iterator) with row stride ``lda`` elements: rows ``a_row0 ..`` when dense, rows
     ``row_idx_table[row_idx_base ..][:tile_m]`` (an i32 iterator) when
     ``gather``, bounded by ``a_rows``. B is ``gB_base + b_slab`` with row stride ``ldb``; this
-    block reads its rows ``blk_n ..``. C is written at byte address ``c_addr`` with row stride
+    block reads its rows ``blk_n ..``. With ``b_nn`` B is ``[K, N]`` with row stride ``ldb``, this
+    block reads its columns ``blk_n ..``, and ``i32_n`` (N, at least ``tile_n``) bounds that
+    read. C is written at byte address ``c_addr`` with row stride
     ``ldc``, ``m_rows`` rows and ``n_valid`` columns kept. ``live`` (wave-uniform i1) turns the
     tile into a no-op. ``c_cache_modifier`` is the C stores' cache policy (``cpol_device_stream()``
     when another workgroup consumes C in the same launch).
@@ -196,7 +210,8 @@ def nt_gemm_tile(
     n_acc = wmma_m_rep * wmma_n_rep
     num_waves = m_warp * n_warp
     block = num_waves * WAVE
-    LDS_ROW, STAGE_A, PITCH, _arena = tile_geometry(tile_m, tile_n, tile_k)
+    LDS_ROW, STAGE_A, PITCH, _arena = tile_geometry(tile_m, tile_n, tile_k, b_nn)
+    LDS_B_ROW = tile_n * EB + _nn_b_pad(tile_n, EB)
     B_DELTA = STAGE_A
     R = 2  # fragment ring depth
     ROWS_PER_OP = 16 if idx_bits == 16 else 8
@@ -246,8 +261,16 @@ def nt_gemm_tile(
             early_timeout=True,
         )
 
-    gt_b = _gv(gB_base, b_slab + fx.Int64(blk_n) * ldb_b, (tile_n, KB), (KB, 1))
-    atom_b = _tdm(gt_b, n_ext, ldb_b)
+    if const_expr(b_nn):
+        # N is B's dim 1 here, and a dim-1 extent clamps a load's data but not its address: a
+        # short last block reads the in-row window [N - tile_n, N) and shifts its fragment
+        # columns by n_back instead
+        blk_n_eff = (blk_n > i32_n - fx.Int32(tile_n)).select(i32_n - fx.Int32(tile_n), blk_n)
+        n_back = blk_n - blk_n_eff
+        b_rows_ext = live.select(fx.Int32(tile_k), zero32)
+    else:
+        gt_b = _gv(gB_base, b_slab + fx.Int64(blk_n) * ldb_b, (tile_n, KB), (KB, 1))
+        atom_b = _tdm(gt_b, n_ext, ldb_b)
     if const_expr(gather):
         a_addr = fx.Int64(fx.ptrtoint(gA_base))
         # descriptors for this wave's ops: indices are K-invariant, so groups 1-3 are built once
@@ -278,7 +301,29 @@ def nt_gemm_tile(
             if wave == fx.Int32(0):
                 fx.copy(atom_a, gt_a, _lv(pa, (tile_m, KB), (LDS_ROW, 1)), imm_offset=koff)
         if wave == fx.Int32(1 % num_waves):
-            fx.copy(atom_b, gt_b, _lv(fx.add_offset(pa, B_DELTA), (tile_n, KB), (LDS_ROW, 1)), imm_offset=koff)
+            if const_expr(b_nn):
+                # k is B's row axis: fold it into the base (a TDM extent counts from imm_offset)
+                gt_bk = _gv(
+                    gB_base,
+                    b_slab + fx.Int64(kt) * fx.Int64(tile_k) * ldb_b + fx.Int64(blk_n_eff) * fx.Int64(EB),
+                    (tile_k, tile_n * EB),
+                    (ldb_b, 1),
+                )
+                atom_bk = fx.rocdl.make_tdm_atom(
+                    gt_bk,
+                    [b_rows_ext, fx.Int32(tile_n * EB)],
+                    strides=[ldb_b, None],
+                    num_warps=1,
+                    pad_interval=tile_n * EB,
+                    pad_amount=LDS_B_ROW - tile_n * EB,
+                    cache_modifier=0,
+                    early_timeout=True,
+                )
+                fx.copy(atom_bk, gt_bk, _lv(fx.add_offset(pa, B_DELTA), (tile_k, tile_n * EB), (LDS_B_ROW, 1)))
+            else:
+                fx.copy(
+                    atom_b, gt_b, _lv(fx.add_offset(pa, B_DELTA), (tile_n, KB), (LDS_ROW, 1)), imm_offset=koff
+                )
 
     wmb = wave_m * warp_tile_m
     wnb = wave_n * warp_tile_n
@@ -293,9 +338,34 @@ def nt_gemm_tile(
         row = wmb + wm * WMMA_M + lane16
         return _frag(buf, fx.Int64(row * LDS_ROW + ks * KSB + kgrp * 16))
 
-    def load_b(buf, wn, ks):
-        col = wnb + wn * WMMA_N + lane16
-        return _frag(buf, fx.Int64(B_DELTA + col * LDS_ROW + ks * KSB + kgrp * 16))
+    if const_expr(b_nn):
+        # ds_load_tr16_b128: lanes act in groups of 8, lane j of a group points at 8 consecutive
+        # elements of LDS row (reduction k) ks*32 + kgrp*8 + j, and lane l gets column l of
+        # that 8x8 block -- 8 consecutive k at output column wnb + wn*16 + lane16; a second read
+        # 16 rows down gives k + 16.. (the NT loader's fragment order)
+        l8 = lane % 8
+        hi8 = lane16 // 8
+        b_lane = (
+            (l8 + kgrp * fx.Int32(8)) * fx.Int32(LDS_B_ROW)
+            + (wnb + hi8 * fx.Int32(8) + n_back) * fx.Int32(EB)
+            + fx.Int32(B_DELTA)
+        )
+        vec8 = ir.VectorType.get([8], T.bf16)
+        ptr3 = ir.Type.parse("!llvm.ptr<3>")
+
+        def _tr(addr, const_off):
+            return Vec(_rocdl.ds_load_tr16_b128(vec8, _llvm.inttoptr(ptr3, _raw(addr + fx.Int32(const_off)))))
+
+        def load_b(buf, wn, ks):
+            addr = fx.Int32(buf) + b_lane
+            base = ks * WMMA_K * LDS_B_ROW + wn * WMMA_N * EB
+            return _tr(addr, base).shuffle(_tr(addr, base + 16 * LDS_B_ROW), list(range(16))).bitcast(fx.Int32)
+
+    else:
+
+        def load_b(buf, wn, ks):
+            col = wnb + wn * WMMA_N + lane16
+            return _frag(buf, fx.Int64(B_DELTA + col * LDS_ROW + ks * KSB + kgrp * 16))
 
     wmma_atom = fx.make_mma_atom(fx.rocdl.WMMA(WMMA_M, WMMA_N, WMMA_K, fx.BFloat16, fx.Float32))
     c_frags = [fx.make_rmem_tensor(8, fx.Float32) for _ in range_constexpr(n_acc)]
@@ -414,9 +484,10 @@ def _launch_mega_nt(
     group_m: Constexpr[int],
     gather: Constexpr[int],
     idx_bits: Constexpr[int],
+    b_nn: Constexpr[int],
 ):
     block = m_warp * n_warp * WAVE
-    arena_bytes = tile_geometry(tile_m, tile_n, tile_k)[3]
+    arena_bytes = tile_geometry(tile_m, tile_n, tile_k, bool(b_nn))[3]
     if arena_bytes > GFX1250_LDS_BYTES:
         raise ValueError(f"LDS arena {arena_bytes} B exceeds {GFX1250_LDS_BYTES} B")
 
@@ -485,6 +556,8 @@ def _launch_mega_nt(
             n_warp=n_warp,
             gather=bool(gather),
             idx_bits=idx_bits,
+            b_nn=bool(b_nn),
+            i32_n=i32_n,
         )
 
     kernel_mega_nt(
@@ -513,8 +586,10 @@ def mega_grouped_gemm_nt_gfx1250(
     n_warp: int = 2,
     group_m: int = 16,
     idx_bits: int = 0,
+    b_nn: bool = False,
 ) -> torch.Tensor:
-    """``out[p] = a[row_idx[p]] @ b[e(p)].T`` per pool row ``p`` (``a[p]`` when ``row_idx`` is None).
+    """``out[p] = a[row_idx[p]] @ b[e(p)].T`` per pool row ``p`` (``a[p]`` when ``row_idx`` is None);
+    ``b`` is ``[G, N, K]``, or ``[G, K, N]`` with ``b_nn`` (``out[p] = a[...] @ b[e(p)]``).
 
     ``out`` is the pool, ``[num_pool_rows, N]`` with ``num_pool_rows`` a multiple of ``tile_m``;
     pool block ``t`` belongs to expert ``tile_to_expert[t]``, and only the first
@@ -522,6 +597,9 @@ def mega_grouped_gemm_nt_gfx1250(
     """
     _require_gfx1250(a.device)
     G, N, K = b.shape
+    if b_nn:
+        K, N = N, K
+        assert N >= tile_n, "an NN block backs its B read off into the row, so N >= tile_n"
     pool_rows = out.shape[0]
     assert a.dtype == b.dtype == out.dtype == torch.bfloat16
     assert a.shape[1] == K and out.shape[1] == N and pool_rows % tile_m == 0
@@ -549,7 +627,7 @@ def mega_grouped_gemm_nt_gfx1250(
         pool_rows // tile_m,
         (N + tile_n - 1) // tile_n,
         K,
-        K,
+        N if b_nn else K,
         N,
         N * K,
         tile_m,
@@ -560,6 +638,7 @@ def mega_grouped_gemm_nt_gfx1250(
         group_m,
         int(gather),
         idx_bits,
+        int(b_nn),
     )
     key = args[_CONSTEXPR0:]
     fn = _COMPILED.get(key)
@@ -573,5 +652,5 @@ def mega_grouped_gemm_nt_gfx1250(
 
 
 @functools.lru_cache(maxsize=None)
-def arena_bytes(tile_m: int = 256, tile_n: int = 256, tile_k: int = 128) -> int:
-    return tile_geometry(tile_m, tile_n, tile_k)[3]
+def arena_bytes(tile_m: int = 256, tile_n: int = 256, tile_k: int = 128, b_nn: bool = False) -> int:
+    return tile_geometry(tile_m, tile_n, tile_k, b_nn)[3]
