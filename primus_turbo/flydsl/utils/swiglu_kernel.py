@@ -40,6 +40,7 @@ from primus_turbo.flydsl.utils.buffer_ops import (
     buffer_store,
     create_buffer_resource,
 )
+from primus_turbo.flydsl.utils.arch import hw_wave_size
 from primus_turbo.flydsl.utils.glu_activation import (
     GLUActivation,
     activation_constexpr,
@@ -47,7 +48,6 @@ from primus_turbo.flydsl.utils.glu_activation import (
 from primus_turbo.flydsl.utils.prims import ld, st
 
 _VEC = 8
-_WARP = 64
 _POOL_BLOCK_M = 256  # pool-block granularity (fixed policy; matches symm_buffer.BLOCK_M)
 
 
@@ -170,15 +170,16 @@ def _make_swiglu_bwd(
 ):
     alpha, glu_offset, gate_lo, gate_hi, up_clamp = act
     two_I = 2 * I
-    # Gate reduction folds all I columns per row; block spans multiple warps.
+    # Gate reduction folds all I columns per row; block spans multiple hardware waves.
+    wave = hw_wave_size()
     if with_gate:
-        assert block_threads % _WARP == 0, f"block_threads must be a multiple of {_WARP}, got {block_threads}"
+        assert block_threads % wave == 0, f"block_threads must be a multiple of {wave}, got {block_threads}"
     cols_per_block = _VEC * block_threads
     assert I % _VEC == 0, f"I={I} not divisible by vec width {_VEC}"
     # constexpr: ceil-tile columns; last tile is partial and needs lane guards.
     n_col_tiles = (I + cols_per_block - 1) // cols_per_block
     partial_tail = I % cols_per_block != 0
-    n_warps = block_threads // _WARP
+    n_warps = block_threads // wave
 
     @flyc.kernel(known_block_size=[block_threads, 1, 1])
     def swiglu_bwd_kernel(
@@ -277,12 +278,12 @@ def _make_swiglu_bwd(
                     partial = partial.addf(p)
                 # Butterfly warp reduce: every lane ends with its warp's sum.
                 wave_off = 1
-                while wave_off < 64:
-                    partial = partial.addf(fx.arith.ArithValue(partial.shuffle_xor(wave_off, 64)))
+                while wave_off < wave:
+                    partial = partial.addf(fx.arith.ArithValue(partial.shuffle_xor(wave_off, wave)))
                     wave_off = wave_off * 2
                 # Each warp leader publishes its sum; thread 0 folds across warps.
-                if thread_index % fx.Int32(_WARP) == fx.Int32(0):
-                    st(lds_base, thread_index // fx.Int32(_WARP), partial, scope="workgroup", space=3)
+                if thread_index % fx.Int32(wave) == fx.Int32(0):
+                    st(lds_base, thread_index // fx.Int32(wave), partial, scope="workgroup", space=3)
                 fx.gpu.barrier()
                 if thread_index == fx.Int32(0):
                     total = fx.arith.ArithValue(
@@ -395,7 +396,7 @@ def _compiled_swiglu_bwd(
     )
     grid_y = 1 if with_gate else n_col_tiles
     # One f32 LDS slot per warp for cross-warp gate reduction.
-    smem = (block_threads // _WARP) * 4 if with_gate else 0
+    smem = (block_threads // hw_wave_size()) * 4 if with_gate else 0
     kernel(DACT, ACC1, DACC1, SCALE, NUM_TILE_BLOCKS, GRAD_GATE, ACT_W, BIAS, TILE_TO_EXPERT).launch(
         grid=(grid_x, grid_y, 1),
         block=(block_threads, 1, 1),
