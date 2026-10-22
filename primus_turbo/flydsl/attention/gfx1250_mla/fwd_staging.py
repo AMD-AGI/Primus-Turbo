@@ -24,9 +24,9 @@ from the accumulators through padded LDS to global memory with ``global_store_as
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 
-# UNSTABLE(gfx1250): the TDM atom and tensor_wait, ds_load_tr16_b128, the async LDS->global store,
-# sched_barrier and s_wait_dscnt have no stable API in FlyDSL 0.3.4.1; LDS loads/stores are raw LLVM
-# ops on pointers built from i32 byte addresses.
+# UNSTABLE(gfx1250): the TDM atom, tensor_load_to_lds with hand-built descriptors, tensor_wait,
+# ds_load_tr16_b128, the async LDS->global store, sched_barrier and s_wait_dscnt have no stable API in
+# FlyDSL 0.3.4.1; LDS loads/stores are raw LLVM ops on pointers built from i32 byte addresses.
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import rocdl
 from flydsl.expr.rocdl import tdm_ops
@@ -140,32 +140,93 @@ def read_q_fragments(region, lane_idx):
     return frags
 
 
-def kv_copies(*, lds_base, src, stride_seq, stride_head, head, row0, valid, width, row_elems):
-    """TDM copies (atom, global view, LDS view) of one N_BLOCK x width K or V tile, split over
-    all waves. ``valid`` rows are read; the rest of the tile is zero-filled by the hardware."""
-    off = fx.Int64(row0) * fx.Int64(stride_seq) + fx.Int64(head) * fx.Int64(stride_head)
-    base = fx.get_iter(src)
-    lds_ty = _lds_bf16_ptr_type()
-    copies = []
-    for c0, w in pow2_segments(width):
-        g_view = fx.Tensor(
-            fx.make_view(fx.add_offset(base, off + fx.Int64(c0)), fx.make_layout((N_BLOCK, w), (w, 1)))
-        )
-        atom = fx.rocdl.make_tdm_atom(
-            g_view,
-            [valid, None],
-            strides=[stride_seq, None],
-            num_warps=NUM_WAVES,
-            pad_interval=w,
-            pad_amount=row_elems - w,
-        )
-        l_view = fx.Tensor(
-            fx.make_view(
-                fx.inttoptr(lds_ty, lds_base + fx.Int32(c0 * 2)), fx.make_layout((N_BLOCK, w), (row_elems, 1))
+ROWS_PER_COPY = N_BLOCK // (NUM_WAVES // 2)  # K / V tile rows each low wave (0-3) copies
+
+
+def _i32_word(x):
+    return x - (1 << 32) if x >= 1 << 31 else x
+
+
+class KVTileLoader:
+    """A low wave's share of the TDM copies of an N_BLOCK-row K / V tile.
+
+    Each low wave (0-3) copies its ROWS_PER_COPY rows of K columns [0, 128), K columns [128, 192)
+    and V, one op each (a TDM pad interval is a power of two). The descriptors are built here, once:
+    per tile only the global address and the valid-row count change, a few SALU ops instead of the
+    copy atom's whole descriptor (with a v_med3 + readfirstlane for the row clamp) on every issue.
+    Rows past the workgroup's last key are zero-filled by the hardware, as with the atom.
+    """
+
+    def __init__(
+        self,
+        *,
+        k,
+        v,
+        stride_k_seq,
+        stride_k_head,
+        stride_v_seq,
+        stride_v_head,
+        head,
+        kv_start,
+        kv_len_wg,
+        warp_idx,
+        v_lds_off,
+    ):
+        r0 = warp_idx * fx.Int32(ROWS_PER_COPY)
+        self.rem0 = kv_len_wg - r0
+        self.copies = []
+        for src, sseq, shead, width, row_elems, lds_off in (
+            (k, stride_k_seq, stride_k_head, D_QK, K_ROW_ELEMS, 0),
+            (v, stride_v_seq, stride_v_head, D_V, V_ROW_ELEMS, v_lds_off),
+        ):
+            base = fx.Int64(fx.ptrtoint(fx.get_iter(src))) + (
+                fx.Int64(kv_start + r0) * fx.Int64(sseq) + fx.Int64(head) * fx.Int64(shead)
+            ) * fx.Int64(2)
+            row_bytes = fx.Int64(sseq) * fx.Int64(2)
+            lds = r0 * fx.Int32(row_elems * 2) + fx.Int32(lds_off)
+            for c0, w in pow2_segments(width):
+                # group 1 word 0: 2-byte elements, pad (row_elems - w) elements after every w
+                interval_dw, amount_dw = w // 2, (row_elems - w) // 2
+                cfg = (1 << 16) | (1 << 20) | ((interval_dw.bit_length() - 2) << 22) | ((amount_dw - 1) << 25)
+                self.copies.append(
+                    dict(
+                        base=base + fx.Int64(c0 * 2),
+                        row_bytes=row_bytes,
+                        stride=sseq,
+                        lds=lds + fx.Int32(c0 * 2),
+                        cfg=_i32_word(cfg),
+                        w=w,
+                    )
+                )
+
+    def issue(self, slot_base, row):
+        """Copy this wave's rows of the tile at kv row ``row`` into the K / V slot at ``slot_base``."""
+        # tensor_dim1 = this wave's rows left; no upper clamp (an smin / smax pair becomes v_med3 +
+        # readfirstlane): tile_dim1 stops the copy at the slice end either way.
+        rem = fx.max(self.rem0 - row, fx.Int32(0))
+        g1_2 = fx.Int32(0x7FFF) | (rem << fx.Int32(16))  # tensor_dim0 = 0x7FFFFFFF (no clamp)
+        g1_3 = rem.shrui(fx.Int32(16))
+        z4 = fx.as_ir_value(fx.Vector.filled(4, 0, fx.Int32))
+        z8 = fx.as_ir_value(fx.Vector.filled(8, 0, fx.Int32))
+        for c in self.copies:
+            addr = c["base"] + fx.Int64(row) * c["row_bytes"]
+            lo = fx.Int32(addr)
+            hi = fx.Int32(addr >> fx.Int64(32)) | fx.Int32(_i32_word(1 << 31))
+            g0 = fx.Vector.from_elements([fx.Int32(1), slot_base + c["lds"], lo, hi], fx.Int32)
+            g1 = fx.Vector.from_elements(
+                [
+                    fx.Int32(c["cfg"]),
+                    fx.Int32(-65536),  # tensor_dim0 [15:0]
+                    g1_2,
+                    fx.Int32(c["w"] << 16) | g1_3,  # tile_dim0 | tensor_dim1 [31:16]
+                    fx.Int32(ROWS_PER_COPY),  # tile_dim1
+                    fx.Int32(c["stride"]),  # row stride (elements)
+                    fx.Int32(0),
+                    fx.Int32(0),
+                ],
+                fx.Int32,
             )
-        )
-        copies.append((atom, g_view, l_view))
-    return copies
+            rocdl.tensor_load_to_lds(fx.as_ir_value(g0), fx.as_ir_value(g1), z4, z4, z8, cache_policy=0)
 
 
 def k_read_base(lds_base, lane_idx):

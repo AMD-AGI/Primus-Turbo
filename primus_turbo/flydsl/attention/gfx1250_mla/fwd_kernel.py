@@ -52,10 +52,10 @@ from .fwd_staging import (
     WAVE_SIZE,
     WMMA_K,
     WMMA_M,
+    KVTileLoader,
     OutputWriter,
     issue_q_copy,
     k_read_base,
-    kv_copies,
     load_k,
     load_v,
     read_q_fragments,
@@ -71,6 +71,18 @@ KV_BLOCK_BYTES = 64 * 1024
 SLOT_BYTES = 2 * KV_BLOCK_BYTES
 LDS_BYTES = 320 * 1024  # a gfx1250 workgroup's whole LDS, as the source kernel takes it; the slots use 256 KB
 assert max(K_LDS_BYTES, V_LDS_BYTES) <= KV_BLOCK_BYTES and max(Q_LDS_BYTES, O_LDS_BYTES) <= SLOT_BYTES
+# LDS is 64 KB segments behind two 256 B/clk read ports that only read in the same cycle from
+# different segments. Each K / V tile straddles a segment boundary at its middle row, so the reads of
+# kv rows [0, 32) and [32, 64) alternate between two segments: K slot p is centred on (2p + 1) * 64 KB,
+# V slot p on (2p + 2) * 64 KB. Q is staged, and O leaves, through [144 KB, 244 KB).
+K_SLOT_OFF = KV_BLOCK_BYTES - K_LDS_BYTES // 2
+V_SLOT_OFF = 2 * KV_BLOCK_BYTES - V_LDS_BYTES // 2
+QO_OFF = 144 * 1024
+assert (K_LDS_BYTES // 2) % (K_ROW_ELEMS * 2) == 0 and (V_LDS_BYTES // 2) % (V_ROW_ELEMS * 2) == 0
+assert K_SLOT_OFF + K_LDS_BYTES <= V_SLOT_OFF and V_SLOT_OFF + V_LDS_BYTES <= QO_OFF
+assert QO_OFF + max(Q_LDS_BYTES, O_LDS_BYTES) <= LDS_BYTES
+assert V_SLOT_OFF + V_LDS_BYTES <= SLOT_BYTES + K_SLOT_OFF
+assert SLOT_BYTES + V_SLOT_OFF + V_LDS_BYTES <= LDS_BYTES
 # Head-grouped dispatch: KV_GROUP q blocks of KV_HEAD_CHUNK heads run together (powers of two).
 KV_GROUP = 16
 KV_HEAD_CHUNK = 16
@@ -314,11 +326,15 @@ def _softmax(*, s, m_prev, d_prev, lane_idx, c_exp2, kv_pos_base, kv_last):
     return p, m_new, d_new, corr, rescale
 
 
-@flyc.jit
-def _copy_if(cond, copies):
-    if cond:
-        for c in copies:
-            fx.copy_atom_call(*c)
+def _issue_if(cond, loader, slot_base, row):
+    """This wave's copies of the tile at kv row ``row`` into the slot at ``slot_base``, if ``cond``."""
+
+    @flyc.jit
+    def _go(cond, slot_base, row):
+        if cond:
+            loader.issue(slot_base, row)
+
+    _go(cond, slot_base, row)
 
 
 @flyc.jit
@@ -366,12 +382,14 @@ def _attention(
     seq_idx = [row0 + qt * WMMA_M + lane_idx % WMMA_M for qt in range(Q_TILES)]
 
     def k_slot(pp):
-        return lds_base + fx.Int32(pp) * fx.Int32(SLOT_BYTES)
+        return lds_base + fx.Int32(K_SLOT_OFF) + fx.Int32(pp) * fx.Int32(SLOT_BYTES)
 
     def v_slot(pp):
-        return k_slot(pp) + fx.Int32(KV_BLOCK_BYTES)
+        return lds_base + fx.Int32(V_SLOT_OFF) + fx.Int32(pp) * fx.Int32(SLOT_BYTES)
 
-    q_lds = lds_base + fx.Int32(SLOT_BYTES)
+    # Q's staging overlaps K slot 1, whose first copy is issued after the barrier that follows every
+    # wave's Q reads.
+    q_lds = lds_base + fx.Int32(QO_OFF)
     q_region = issue_q_copy(
         q=q,
         stride_q_seq=stride_q_seq,
@@ -391,42 +409,25 @@ def _attention(
     kv_len_wg = fx.max(fx.min(wg_max_seq + causal_off + window_right + fx.Int32(1), kv_len), fx.Int32(1))
     n_tiles = fx.ceildiv(kv_len_wg, fx.Int32(N_BLOCK))
 
-    def kv_valid(row):
-        return fx.min(fx.max(kv_len_wg - row, fx.Int32(0)), fx.Int32(N_BLOCK))
-
-    def tile_copies(pp, row, valid):
-        """K then V copies of the tile at kv row ``row`` into slot ``pp``."""
-        kc = kv_copies(
-            lds_base=k_slot(pp),
-            src=k,
-            stride_seq=stride_k_seq,
-            stride_head=stride_k_head,
-            head=head,
-            row0=kv_start + row,
-            valid=valid,
-            width=D_QK,
-            row_elems=K_ROW_ELEMS,
-        )
-        vc = kv_copies(
-            lds_base=v_slot(pp),
-            src=v,
-            stride_seq=stride_v_seq,
-            stride_head=stride_v_head,
-            head=head,
-            row0=kv_start + row,
-            valid=valid,
-            width=D_V,
-            row_elems=V_ROW_ELEMS,
-        )
-        return kc + vc
-
-    first = tile_copies(0, fx.Int32(0), kv_valid(fx.Int32(0)))
+    loader = KVTileLoader(
+        k=k,
+        v=v,
+        stride_k_seq=stride_k_seq,
+        stride_k_head=stride_k_head,
+        stride_v_seq=stride_v_seq,
+        stride_v_head=stride_v_head,
+        head=head,
+        kv_start=kv_start,
+        kv_len_wg=kv_len_wg,
+        warp_idx=warp_idx,
+        v_lds_off=V_SLOT_OFF - K_SLOT_OFF,
+    )
     q_frags = read_q_fragments(q_region, lane_idx)
-    for c in first:
-        fx.copy_atom_call(*c)
+    if not hi_wave:
+        loader.issue(k_slot(0), fx.Int32(0))
     # Split workgroup barrier, one arrive and one wait per tile: a wave arrives once its reads of
-    # the current slot and its share of the next tile's copy are done and waits before the next
-    # tile, so it may run one PV GEMM ahead of the slowest wave.
+    # the current slot and its share of the next tile's copy (low waves only) are done and waits
+    # before the next tile, so it may run one PV GEMM ahead of the slowest wave.
     _drain_and_arrive()
 
     c_exp2 = softmax_scale * fx.Float32(LOG2E)
@@ -456,22 +457,21 @@ def _attention(
         k_cur, k_nxt, v_cur, v_nxt = state[pb : pb + 4]
         nxt = t + fx.Int32(1)
         nxt_row = nxt * fx.Int32(N_BLOCK)
-        nxt_copies = tile_copies(nxt_pp, nxt_row, kv_valid(nxt_row))
         swapped = [k_nxt, k_cur, v_nxt, v_cur]
         if sync_only:
             _barrier_wait()
-            _copy_if(nxt < n_tiles, nxt_copies)
+            if not hi_wave:
+                _issue_if(nxt < n_tiles, loader, k_slot(nxt_pp), nxt_row)
             _drain_and_arrive()
             return swapped
         _barrier_wait()
-        # Waves i and i + 4 share a SIMD; the high half prefetches before reading K so the pair
-        # does not run the same phase in lockstep.
+        # Waves i and i + 4 share a SIMD and the high one loses issue arbitration to the low one, so
+        # it arrives last at every barrier: only the low waves copy K / V (after reading K).
         if hi_wave:
-            _copy_if(nxt < n_tiles, nxt_copies)
             k_vals = load_k(k_cur)
         else:
             k_vals = load_k(k_cur)
-            _copy_if(nxt < n_tiles, nxt_copies)
+            _issue_if(nxt < n_tiles, loader, k_slot(nxt_pp), nxt_row)
         rocdl.sched_barrier(0)
         s = _qk_gemm(k_vals, q_frags)
         rocdl.sched_barrier(0)
@@ -518,10 +518,14 @@ def _attention(
             final_ptrs = yield next_ptrs
         return final_ptrs
 
-    # Tiles [0, clean_hi) need no mask for any row of the workgroup, [clean_hi, wave_end) are
-    # masked, and [wave_end, n_tiles) are fully masked for every row of this wave.
+    # Tiles [0, clean_hi) need no mask for any row of this wave, [clean_hi, wave_end) are masked,
+    # and [wave_end, n_tiles) are fully masked for every row of this wave.
     n_last = n_tiles - fx.Int32(1)
-    qmax_min = fx.max(block_x * fx.Int32(BLOCK_M) + causal_off + window_right, fx.Int32(0))
+    # Per wave, not per workgroup: a wave's rows need no mask on a tile that ends at or before its
+    # first row's diagonal, so only its own diagonal tile (and the kv tail) runs masked. The masked
+    # softmax selects nothing on such tiles, so the result bits are the same either way.
+    wave_row0 = block_x * fx.Int32(BLOCK_M) + warp_idx * fx.Int32(ROWS_PER_WAVE)
+    qmax_min = fx.max(wave_row0 + causal_off + window_right, fx.Int32(0))
     clean_hi = fx.max(fx.min((qmax_min + fx.Int32(1)) // fx.Int32(N_BLOCK), n_last), fx.Int32(0))
     state = run_tiles(init, fx.Int32(0), clean_hi, masked=False)
     wave_max_seq = fx.min(
@@ -534,7 +538,7 @@ def _attention(
     run_sync_tiles(list(state[ptr_base:]), wave_end, n_tiles)
     _barrier_wait()
 
-    # O / d goes out through the LDS slot the last tile did not use.
+    # O goes out through Q's staging region: past the last barrier no wave reads K / V any more.
     writer = OutputWriter(
         o=o,
         stride_o_seq=stride_o_seq,
@@ -546,7 +550,7 @@ def _attention(
         warp_idx=warp_idx,
         lane_idx=lane_idx,
     )
-    o_lds = k_slot(n_tiles % fx.Int32(2))
+    o_lds = lds_base + fx.Int32(QO_OFF)
     for qt in range(Q_TILES):
         d_final = fx.Float32(state[qt * nst + 1])
         inv = (d_final > fx.Float32(0.0)).select(fx.Float32(1.0) / d_final, fx.Float32(0.0))
