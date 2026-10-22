@@ -47,6 +47,8 @@ _GFX1250_ENABLED_TESTS = (
     # runs here.
     "tests/pytorch/ops/test_attention.py::test_sparse_mla_op",
     "tests/pytorch/ops/test_attention_flydsl_gfx1250_sparse_mla.py",
+    # Buffer OOB, copy_warp and cross-XCD flag handoff of the BF16 Mega MoE EP path.
+    "tests/pytorch/ops/test_mega_bf16_gfx1250_prims.py",
 )
 
 
