@@ -48,6 +48,8 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_mega_bf16_gfx1250_dispatch_gemm.py",
     # The fused Mega L2 GEMM + combine, single GPU (EP1).
     "tests/pytorch/ops/test_mega_bf16_gfx1250_gemm_combine.py",
+    # The fused_mega_moe forward op on the gfx1250 kernels, single GPU (EP1).
+    "tests/pytorch/ops/test_mega_bf16_gfx1250_forward.py",
 )
 
 
