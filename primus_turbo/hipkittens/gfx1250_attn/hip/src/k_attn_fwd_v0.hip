@@ -43,6 +43,39 @@
 #define FWD_SGB 0
 #endif
 
+// HK_FWD_OPT_* (hk/notes/fwd_v0_opt.md): compile-time variants from the ATT analysis (hk/notes/att_v0.md section
+// 4, fwd items 1-4), each independent, default 0. With every one 0 (the manifest build) the code object is the pinned
+// v0 one, byte for byte. Kernel ABI, grid, block and LDS map are the same in every variant.
+//   RESC   the rescale decision: the common path keeps only max(x2 - m2) over the 4 q-tiles -> ONE compare ->
+//          uniform branch (no per-head s_cmp / s_cselect / v_cndmask / m2n); the per-head decision of v0 (same
+//          m2n, same corr, bit-identical results) runs inside the rarely taken block, which is laid out of line
+//          (__builtin_expect), so the common path falls through and the loop gets a bottom test.
+//   DESC   op(t+3)'s descriptor, the loop control and the LDS bases of the next stage move into the even chunk's
+//          QK run (an SGPR value fence keeps IR passes from hoisting them into region A); the tensor_dim1 clamp is
+//          32-bit SALU (f0::kv_op_dim1_s32: s_max_u32 / s_sub / s_min_u32, no v_cmp_*_i64 -> SGPR round trips);
+//          the V / K burst VGPR bases are computed one stage ahead (no VALU -> DS address stall).
+//   TAIL   the row sums of q-tiles 0..2 and the P^T pack of q-tile 2 move from the QK run (region B) into the PV
+//          run (region F), which has issue slack; B ends with the exps / packs PV needs first.
+//   MERGE  one DS burst per chunk: V(c+1) joins K(c+2) in region E (va double-buffered by chunk parity, +64
+//          VGPR); region A is gone. Same barriers, TDM ops and waits; only where V is read moves (every V read
+//          still precedes the SIGNAL that releases its stage: hk/lab/bounds/fwd_v0_check.cpp -DHK_FWD_OPT_MERGE).
+//   ALL    sets the default of every one above to 1.
+#ifndef HK_FWD_OPT_ALL
+#define HK_FWD_OPT_ALL 0
+#endif
+#ifndef HK_FWD_OPT_RESC
+#define HK_FWD_OPT_RESC HK_FWD_OPT_ALL
+#endif
+#ifndef HK_FWD_OPT_DESC
+#define HK_FWD_OPT_DESC HK_FWD_OPT_ALL
+#endif
+#ifndef HK_FWD_OPT_TAIL
+#define HK_FWD_OPT_TAIL HK_FWD_OPT_ALL
+#endif
+#ifndef HK_FWD_OPT_MERGE
+#define HK_FWD_OPT_MERGE HK_FWD_OPT_ALL
+#endif
+
 #define FWD_INL __attribute__((always_inline))
 
 using namespace hk_attn;
@@ -82,6 +115,30 @@ template <int REGION, int NG, int NWM, int NV, int NT, int NS = 0> HKA_DEV void 
     });
 }
 
+#if HK_FWD_OPT_RESC
+// identity v_mov_b32_dpp (exact): the rare block's new m2 goes through it, so InstCombine cannot push the tails'
+// fneg(m2) through the loop phi (that keeps a negated copy of m2 live and costs phi moves on the common path)
+HKA_DEV float opaque_f32(float x) {
+    return __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, x), 0xE4, 0xF, 0xF, false));
+}
+#endif
+#if HK_FWD_OPT_DESC
+// SGPR value fence (no instruction): x is "redefined" here, so nothing computed from it can be placed before this
+// point by IR passes or the DAG; it pins op(t+3)'s descriptor and the next stage's LDS bases into region B
+// (sched_barrier only constrains the machine scheduler). The only inline asm of the kernel; empty, one SGPR.
+HKA_DEV void sgpr_fence(int &x) {
+    asm volatile("" : "+s"(x));
+}
+// VGPR value fence on a loop-carried LDS base (one v_mov_b32_dpp quad_perm:[0,1,2,3], the identity): without an
+// opaque op InstCombine folds the two incoming "lane base + slot offset" adds of the phi into one add after it, i.e.
+// back to the loop head right before the burst (VALU -> DS address stall). (An empty asm "+v" also blocks the fold
+// but pins the value to v0..v255, which costs a copy at the loop head.)
+HKA_DEV const lds_u8 *vgpr_fence(const lds_u8 *p) {
+    const int x = (int) (uint32_t) (uintptr_t) p;
+    return lds_ptr((uint32_t) __builtin_amdgcn_mov_dpp(x, 0xE4, 0xF, 0xF, false));
+}
+#endif
+
 } // namespace
 
 extern "C" __global__ __launch_bounds__(f0::BLOCK) void k_attn_fwd_v0(
@@ -106,7 +163,11 @@ extern "C" __global__ __launch_bounds__(f0::BLOCK) void k_attn_fwd_v0(
     // dummy of row 0 into its own cell
     // (hot forms: scalar selects, no branch, no VGPR)
     auto c_desc = [&](int k) FWD_INL -> Tdm {
+#if HK_FWD_OPT_DESC
+        const int dim1 = f0::kv_op_dim1_s32(Skv, w, k); // 32-bit SALU clamp (no v_cmp_*_i64 -> SGPR)
+#else
         const int dim1 = f0::kv_op_dim1_hot(Skv, w, k);
+#endif
         return make_tdm(lds0 + (uint32_t) f0::kv_op_lds_hot(w, k, n),
                         kv_base + 2ull * (uint64_t) f0::kv_op_el_hot(wk.b, Skv, Hkv, hkv, w, k, n),
                         f0::kv_op_g1_hot(rv, Hkv, dim1, f0::op_real(k, n)));
@@ -130,16 +191,59 @@ extern "C" __global__ __launch_bounds__(f0::BLOCK) void k_attn_fwd_v0(
         });
     };
 
+#if HK_FWD_OPT_DESC || HK_FWD_OPT_MERGE
+    // the same bursts at a base computed ahead (lane part + slot offset: one v_add, off the DS path)
+    auto k_base = [&](int stage) FWD_INL {
+        return lds_ptr(lds0 + (uint32_t) (f0::k_slot_off(stage) + f0::k_lane(l)));
+    };
+    auto v_base = [&](int stage) FWD_INL {
+        return lds_ptr(lds0 + (uint32_t) (f0::v_slot_off(stage) + f0::v_lane(l)));
+    };
+    auto ld_k_at = [&](opnd_t(&ka)[2][NDK], const lds_u8 *kp, auto HC) FWD_INL {
+        static_for<NDK>([&](auto k) {
+            static_for<2>([&](auto kt) {
+                ka[kt][k] = cat(ds_load_b128(kp, f0::k_imm(HC, kt, k, 0)), ds_load_b128(kp, f0::k_imm(HC, kt, k, 1)));
+            });
+        });
+    };
+    auto ld_v_at = [&](opnd_t(&va)[NDT], const lds_u8 *vp, auto HC) FWD_INL {
+        static_for<NDT>([&](auto dt) {
+            va[dt] = cat(ds_load_tr16_b128(vp, f0::v_imm(HC, 0, dt)), ds_load_tr16_b128(vp, f0::v_imm(HC, 1, dt)));
+        });
+    };
+#endif
+
     // ---- state ------------------------------------------------------------------------------------------------
     opnd_t   qb[NH][NDK];     // Q^T B operands (resident)
     opnd_t   ka[2][NDK];      // K A operands of the next QK
+#if HK_FWD_OPT_MERGE
+    opnd_t   vab[2][NDT];     // V^T A operands, by chunk parity: PV(c) reads vab[c & 1], E(c) loads V(c+1)
+#else
     opnd_t   va[NDT];         // V^T A operands of the current PV
+#endif
     opnd_t   P[NH];           // P^T B operands
     acc_t    S[2][NH][2];     // S^T of chunks c (tails in place) and c + 1
     acc_t    oacc[NH][NDT];   // O^T
     f32x2    lsum[NH];        // per-lane partial row sums (halves added in the epilogue)
     float    m2[NH], m2n[NH]; // running max (log2 domain), its candidate for the next chunk
+#if HK_FWD_OPT_RESC
+    f32x2 m2p[NH / 2]; // RESC: the running max as q-tile pairs (64-bit loop phis: the tails' pk_fma broadcast one
+                       // half with op_sel instead of moves building {-m2, -m2} on the common path)
+#define M2(h) m2p[(h) >> 1][(h) & 1]
+#else
+#define M2(h) m2[h]
+#endif
     uint32_t bal[NH];         // rescale ballots (wave-uniform)
+#if HK_FWD_OPT_RESC
+    float    x2c[NH];         // column max (log2 domain) of chunk c + 1, for the rarely taken rescale block
+    uint32_t need = 0u;       // ballot of "some q-tile's max moved by > 8 nat" (wave-uniform)
+#endif
+#if HK_FWD_OPT_DESC
+    // V base of stage t (A bursts; MERGE: even E), K base of stage t + 1 (E bursts); each is advanced in place right
+    // after its last use of the stage (odd chunk: V in B after A / even E, K in F after E), so old and new value are
+    // never live together (no phi copy at the loop head)
+    const lds_u8 *vbs = v_base(0), *kbs = k_base(1);
+#endif
 
     // ---- phases ----------------------------------------------------------------------------------------------
     auto qk = [&](acc_t(&s)[NH][2]) FWD_INL { // S^T(c') = K(c') Q^T, C = 0 inline on k = 0
@@ -152,9 +256,15 @@ extern "C" __global__ __launch_bounds__(f0::BLOCK) void k_attn_fwd_v0(
             });
         });
     };
+#if HK_FWD_OPT_MERGE
+    auto pvm = [&](const opnd_t(&v)[NDT], auto H) FWD_INL { // O^T += V^T P^T of q-tile H
+        static_for<NDT>([&](auto dt) { oacc[H][dt] = wmma(v[dt], P[H], oacc[H][dt]); });
+    };
+#else
     auto pv = [&](auto H) FWD_INL { // O^T += V^T P^T of q-tile H
         static_for<NDT>([&](auto dt) { oacc[H][dt] = wmma(va[dt], P[H], oacc[H][dt]); });
     };
+#endif
     // SM1 of chunk c1 (in S buffer s): [causal mask] -> column max -> ballot of "moved by > 8 nat" -> m2n;
     // FIRST (chunk 0, prologue): m2 = max directly (O and l are 0)
     auto sm1 = [&](acc_t(&s)[NH][2], int c1, auto MASKED, auto FIRST) FWD_INL {
@@ -170,17 +280,36 @@ extern "C" __global__ __launch_bounds__(f0::BLOCK) void k_attn_fwd_v0(
             mx             = __builtin_fmaxf(mx, xhalf(mx));
             const float x2 = mx * c2;
             if constexpr (decltype(FIRST)::value != 0) {
-                m2[h] = x2;
+                M2(h) = x2;
             } else {
-                bal[h] = ballot(x2 - m2[h] > f0::TH2);
-                m2n[h] = any_set(bal[h]) ? __builtin_fmaxf(m2[h], x2) : m2[h];
+#if HK_FWD_OPT_RESC
+                x2c[h] = x2;
+#else
+                bal[h] = ballot(x2 - M2(h) > f0::TH2);
+                m2n[h] = any_set(bal[h]) ? __builtin_fmaxf(M2(h), x2) : M2(h);
+#endif
             }
         });
+#if HK_FWD_OPT_RESC
+        // one compare for the branch: max_h (x2 - m2) > TH2 <=> some q-tile's ballot of v0 is non-zero (exact: the
+        // differences are the same fp32 values, max is exact, no NaN reaches it)
+        if constexpr (decltype(FIRST)::value == 0) {
+            const float d = __builtin_fmaxf(__builtin_fmaxf(x2c[0] - M2(0), x2c[1] - M2(1)),
+                                            __builtin_fmaxf(x2c[2] - M2(2), x2c[3] - M2(3)));
+            need = ballot(d > f0::TH2);
+        }
+#endif
     };
     // tail of q-tile H of chunk c (S buffer s): p = exp2(s c2 - m2) in place, P^T pack
     auto tail = [&](acc_t(&s)[NH][2], auto H) FWD_INL {
         constexpr int h  = decltype(H)::value;
-        const f32x2   cc = {c2, c2}, nm = {-m2[h], -m2[h]};
+#if HK_FWD_OPT_RESC
+        // -m2 of the q-tile pair, then the half (op_sel broadcast + neg modifiers, no {-m2, -m2} moves)
+        const f32x2 nmp = -m2p[h >> 1], cc = {c2, c2};
+        const f32x2 nm  = __builtin_shufflevector(nmp, nmp, h & 1, h & 1);
+#else
+        const f32x2   cc = {c2, c2}, nm = {-M2(h), -M2(h)};
+#endif
         static_for<2>([&](auto kt) {
             static_for<4>([&](auto j) {
                 constexpr int jj = decltype(j)::value;
@@ -191,6 +320,31 @@ extern "C" __global__ __launch_bounds__(f0::BLOCK) void k_attn_fwd_v0(
         });
         P[h] = pack_pt_fwd(s[h][0], s[h][1]);
     };
+#if HK_FWD_OPT_TAIL
+    // the same in two parts: p = exp2(s c2 - m2) in place, then the P^T pack
+    auto tail_exp = [&](acc_t(&s)[NH][2], auto H) FWD_INL {
+        constexpr int h  = decltype(H)::value;
+#if HK_FWD_OPT_RESC
+        // -m2 of the q-tile pair, then the half (op_sel broadcast + neg modifiers, no {-m2, -m2} moves)
+        const f32x2 nmp = -m2p[h >> 1], cc = {c2, c2};
+        const f32x2 nm  = __builtin_shufflevector(nmp, nmp, h & 1, h & 1);
+#else
+        const f32x2   cc = {c2, c2}, nm = {-M2(h), -M2(h)};
+#endif
+        static_for<2>([&](auto kt) {
+            static_for<4>([&](auto j) {
+                constexpr int jj = decltype(j)::value;
+                const f32x2   a  = pk_fma(acc_pair<jj>(s[h][kt]), cc, nm);
+                s[h][kt][2 * jj]     = exp2_hw(a[0]);
+                s[h][kt][2 * jj + 1] = exp2_hw(a[1]);
+            });
+        });
+    };
+    auto tail_pack = [&](acc_t(&s)[NH][2], auto H) FWD_INL {
+        constexpr int h = decltype(H)::value;
+        P[h]            = pack_pt_fwd(s[h][0], s[h][1]);
+    };
+#endif
     // per-lane row sum of q-tile H (7 v_pk_add tree + 1 accumulate; the two halves of the pair are added
     // in the epilogue)
     auto rsum = [&](acc_t(&s)[NH][2], auto H) FWD_INL {
@@ -203,15 +357,30 @@ extern "C" __global__ __launch_bounds__(f0::BLOCK) void k_attn_fwd_v0(
     };
     // C: lazy rescale (uniform branch, rarely taken); corr = 1 exactly for q-tiles whose m2 stays
     auto rescale = [&]() FWD_INL {
+#if HK_FWD_OPT_RESC
+        // rarely taken, laid out of line; inside: v0's per-q-tile decision (same m2n and corr bits)
+        if (__builtin_expect(any_set(need), 0)) {
+            static_for<NH>([&](auto h) {
+                const uint32_t b    = ballot(x2c[h] - M2(h) > f0::TH2);
+                const float    mn   = any_set(b) ? __builtin_fmaxf(M2(h), x2c[h]) : M2(h);
+                const float    corr = exp2_hw(M2(h) - mn);
+                const f32x2    cv   = {corr, corr};
+                static_for<NDT>([&](auto dt) { oacc[h][dt] = oacc[h][dt] * corr; });
+                lsum[h] = pk_mul(lsum[h], cv);
+                M2(h)   = opaque_f32(mn);
+            });
+        }
+#else
         if (any_set(bal[0] | bal[1] | bal[2] | bal[3])) {
             static_for<NH>([&](auto h) {
-                const float corr = exp2_hw(m2[h] - m2n[h]);
+                const float corr = exp2_hw(M2(h) - m2n[h]);
                 const f32x2 cv   = {corr, corr};
                 static_for<NDT>([&](auto dt) { oacc[h][dt] = oacc[h][dt] * corr; });
                 lsum[h] = pk_mul(lsum[h], cv);
             });
         }
-        static_for<NH>([&](auto h) { m2[h] = m2n[h]; });
+        static_for<NH>([&](auto h) { M2(h) = m2n[h]; });
+#endif
     };
 
     // ---- one iteration on chunk c = 2 t + PAR -----------------------------------------------------------------
@@ -222,18 +391,40 @@ extern "C" __global__ __launch_bounds__(f0::BLOCK) void k_attn_fwd_v0(
         constexpr bool qkn = decltype(QKN)::value != 0, kb = decltype(KB)::value != 0;
         constexpr int  bar = decltype(BAR)::value, sm = decltype(SM)::value;
         const int      c   = 2 * t + par;
+#if !HK_FWD_OPT_MERGE
         // A: V(c)
+#if HK_FWD_OPT_DESC
+        ld_v_at(va, vbs, PAR);
+#else
         ld_v(va, t, PAR);
+#endif
         sched_barrier<0>();
+#endif
         // B: QK(c+1) || tails(c) h0..h2 (+ the descriptor of op(t + 3) on even c)
+#if HK_FWD_OPT_DESC
+        int tk = t; // fenced: op(t+3)'s descriptor (even c) and the next stage's V base (odd c) are computed in B
+        if constexpr (bar != 0) sgpr_fence(tk);
+        __builtin_assume(tk >= 0);
+        const Tdm dn = bar == 1 ? c_desc(tk + 3) : Tdm{};
+        if constexpr (bar == 2) vbs = vgpr_fence(v_base(tk + 1)); // stage t+1: A(2t+2) (MERGE: E(2t+1))
+#else
         const Tdm dn = bar == 1 ? c_desc(t + 3) : Tdm{};
+#endif
         if constexpr (qkn) qk(S[nx]);
+#if HK_FWD_OPT_TAIL
+        tail_exp(S[par], ic<0>{});
+        tail_pack(S[par], ic<0>{});
+        tail_exp(S[par], ic<1>{});
+        tail_pack(S[par], ic<1>{});
+        tail_exp(S[par], ic<2>{}); // h2's P^T pack and the row sums of h0..h2: region F
+#else
         tail(S[par], ic<0>{});
         rsum(S[par], ic<0>{});
         tail(S[par], ic<1>{});
         rsum(S[par], ic<1>{});
         tail(S[par], ic<2>{});
         rsum(S[par], ic<2>{});
+#endif
         if constexpr (qkn && bar == 1) {
             sgb_run<1, 15, 1, 2, 1, 1>();
             sgb_run<1, 1, 1, 2, 1>();
@@ -251,18 +442,60 @@ extern "C" __global__ __launch_bounds__(f0::BLOCK) void k_attn_fwd_v0(
         } else if constexpr (bar == 2) {
             split_signal_tdm_lds<f0::TCNT_STEADY>(); // SIGNAL(P_{t+2}): own op(t+2) landed, V(c) retired
         }
-        // E: K(c+2) (stage t+1, half PAR; ka of K(c+1) is dead after B)
-        if constexpr (kb) {
-            ld_k(ka, t + 1, PAR);
+#if HK_FWD_OPT_MERGE
+        // E: K(c+2) (stage t+1, half PAR; ka of K(c+1) is dead after B), then V(c+1) (stage (c+1)/2, half 1-PAR)
+        // into the other V set: one DS burst per chunk; both are consumed in the next iteration (QK(c+2) in B,
+        // PV(c+1) in F), V(c) of this F was loaded at E(c-1)
+        if constexpr (kb || qkn) {
+            // K before V (QK(c+2) in the next B waits on K only; the scheduler may otherwise put V first, which
+            // makes that QK run wait for the whole 32-load burst)
+#if HK_FWD_OPT_DESC
+            if constexpr (kb) ld_k_at(ka, kbs, PAR);
+            if constexpr (kb && qkn) sched_barrier<0>();
+            if constexpr (qkn) ld_v_at(vab[nx], vbs, ic<nx>{}); // odd c: vbs already advanced to stage t+1 in B
+#else
+            const lds_u8 *vp = v_base(t + par); // V(c+1)'s base before the K loads (no VALU -> DS stall between)
+            if constexpr (kb) ld_k(ka, t + 1, PAR);
+            if constexpr (kb && qkn) sched_barrier<0>();
+            if constexpr (qkn) ld_v_at(vab[nx], vp, ic<nx>{});
+#endif
             sched_barrier<0>();
         }
-        // F: PV(c) || SM1(c+1), tail h3, row sums h3
+        auto pv = [&](auto H) FWD_INL { pvm(vab[par], H); };
+#else
+        // E: K(c+2) (stage t+1, half PAR; ka of K(c+1) is dead after B)
+        if constexpr (kb) {
+#if HK_FWD_OPT_DESC
+            ld_k_at(ka, kbs, PAR);
+#else
+            ld_k(ka, t + 1, PAR);
+#endif
+            sched_barrier<0>();
+        }
+#endif
+        // F: PV(c) || SM1(c+1), tail h3, row sums h3 (TAIL: + h2's pack, row sums h0..h2)
+#if HK_FWD_OPT_DESC
+        if constexpr (bar == 2) { // K base of stage t+2 (E(2t+2), E(2t+3)), after E(2t+1)'s burst
+            int tf = t;
+            sgpr_fence(tf);
+            __builtin_assume(tf >= 0);
+            kbs = vgpr_fence(k_base(tf + 2));
+        }
+#endif
         pv(ic<0>{});
         pv(ic<1>{});
         if constexpr (sm != 0) sm1(S[nx], c + 1, ic<sm == 2>{}, ic<0>{});
         if constexpr (sm != 0) sgb_run<2, 16, 1, 4, 0>();
+#if HK_FWD_OPT_TAIL
+        tail_pack(S[par], ic<2>{});
+        rsum(S[par], ic<0>{});
+        rsum(S[par], ic<1>{});
+#endif
         pv(ic<2>{});
         tail(S[par], ic<3>{});
+#if HK_FWD_OPT_TAIL
+        rsum(S[par], ic<2>{});
+#endif
         sgb_run<2, 8, 1, 2, 2>();
         pv(ic<3>{});
         rsum(S[par], ic<3>{});
@@ -295,6 +528,9 @@ extern "C" __global__ __launch_bounds__(f0::BLOCK) void k_attn_fwd_v0(
         opnd_t k0[2][NDK];
         ld_k(k0, 0, ic<0>{}); // K(0)
         ld_k(ka, 0, ic<1>{}); // K(1), consumed by QK(1) in iteration 0
+#if HK_FWD_OPT_MERGE
+        ld_v(vab[0], 0, ic<0>{}); // V(0), consumed by PV(0) in iteration 0
+#endif
         sched_barrier<0>();
         static_for<NH>([&](auto h) {
             static_for<NDT>([&](auto dt) { oacc[h][dt] = zero_acc(); });
@@ -356,7 +592,7 @@ extern "C" __global__ __launch_bounds__(f0::BLOCK) void k_attn_fwd_v0(
     {
         const rsrc_t rl = make_rsrc(LSE, lse_bytes);
         float        lse[NH];
-        static_for<NH>([&](auto h) { lse[h] = (m2[h] + log2_hw(lt[h])) * f0::LN2; });
+        static_for<NH>([&](auto h) { lse[h] = (M2(h) + log2_hw(lt[h])) * f0::LN2; });
         const bool hi = l >= 16;
         static_for<2>([&](auto k) {
             buf_store_f32(rl, (int) f0::lse_store_b(wk.b, Hq, Sq, wk.hq4, wk.qb, w, k, l), 0,

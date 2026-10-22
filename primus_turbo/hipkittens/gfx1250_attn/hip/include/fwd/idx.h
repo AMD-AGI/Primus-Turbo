@@ -415,6 +415,16 @@ F0_HD int kv_op_dim1_hot(int Skv, int w, int k) {
     const int64_t r = (int64_t) Skv - (int64_t) kv_op_row0(w, k);
     return (int) (r < 0 ? 0 : r > OPR ? OPR : r);
 }
+// HK_FWD_OPT_DESC form of kv_op_dim1 (k_attn_fwd_v0.hip): pure 32-bit SALU. Skv >= 0 and row0 >= 0
+// (k >= 0), so the unsigned saturating difference is max(Skv - row0, 0), then an unsigned min with
+// the tile (s_max_u32, s_sub_co_i32, s_min_u32; unlike an i32 clamp it is not combined into
+// v_med3_i32, unlike the i64 form it needs no v_cmp_*_i64 -> SGPR -> SALU round trip). ==
+// kv_op_dim1 for every Skv >= 0, k >= 0 (fwd_v0_check, idx selftest).
+F0_HD int kv_op_dim1_s32(int Skv, int w, int k) {
+    const uint32_t a = (uint32_t) Skv, r0 = (uint32_t) kv_op_row0(w, k);
+    const uint32_t d = a > r0 ? a - r0 : 0u;
+    return (int) (d < (uint32_t) OPR ? d : (uint32_t) OPR);
+}
 // group 1 of op k: kv_g1(role_v, Hkv, dim1) if real, else dummy_g1(role_v) (dim1 = kv_op_dim1 of
 // the op)
 F0_HD G1 kv_op_g1_hot(int role_v, int Hkv, int dim1, bool real) {
@@ -772,8 +782,10 @@ struct Event {
 }; // E_TDM: op (-1 = Q); E_RD_K / E_RD_V: chunk; E_SIG / E_WAIT / E_BAR: phase
 
 // the program order of wave w's memory / barrier events (all waves run the same program; only the
-// op content differs by role)
-inline std::vector<Event> wave_events(int w, int n) {
+// op content differs by role). merge: k_attn_fwd_v0 built with HK_FWD_OPT_MERGE -- no A burst;
+// V(c+1) is read in E(c) right after K(c+2) (V(0) in the prologue after K(1)); barriers, TDM ops
+// and waits unchanged.
+inline std::vector<Event> wave_events(int w, int n, bool merge = false) {
     (void) w;
     std::vector<Event> e;
     e.push_back({E_TDM, -1}); // own Q op
@@ -787,8 +799,11 @@ inline std::vector<Event> wave_events(int w, int n) {
     e.push_back({E_SIG, 1});
     e.push_back({E_RD_K, 0});
     e.push_back({E_RD_K, 1});
+    if (merge)
+        e.push_back({E_RD_V, 0});
     for (int c = 0; c < 2 * n; ++c) {
-        e.push_back({E_RD_V, v_read_chunk(c)}); // A(c): before D (load-bearing for WAR)
+        if (!merge)
+            e.push_back({E_RD_V, v_read_chunk(c)}); // A(c): before D (load-bearing for WAR)
         const int bo = bar_op(c, n);
         if (bo == BAR_WAIT) {
             e.push_back({E_WAIT, bar_phase(c)});
@@ -800,16 +815,18 @@ inline std::vector<Event> wave_events(int w, int n) {
         }
         if (k_read_chunk(c, n) >= 0)
             e.push_back({E_RD_K, k_read_chunk(c, n)}); // E(c)
+        if (merge && c + 1 < 2 * n)
+            e.push_back({E_RD_V, c + 1}); // E(c), merge: V(c+1) after K(c+2)
     }
     e.push_back({E_TCNT, 0});
     e.push_back({E_WAIT, exit_phase(n)}); // exit
     return e;
 }
 
-inline int check_protocol(int n) {
+inline int check_protocol(int n, bool merge = false) {
     std::vector<Event> ev[NWAVE];
     for (int w = 0; w < NWAVE; ++w)
-        ev[w] = wave_events(w, n);
+        ev[w] = wave_events(w, n, merge);
     for (int role = 0; role < 2; ++role)
         for (int half = 0; half < 2; ++half) {
             const int a = issuer_of(role, half);
@@ -1008,7 +1025,7 @@ inline int selftest(bool verbose = false) {
     if (check_lds(verbose) || check_mask())
         return 1;
     for (int n = 1; n <= 140; ++n)
-        if (check_protocol(n))
+        if (check_protocol(n) || check_protocol(n, true))
             return 1;
     for (int n = 1; n <= 140; ++n) // kernel-side hot forms == reference forms
         for (int w = 0; w < NWAVE; ++w)
@@ -1016,7 +1033,9 @@ inline int selftest(bool verbose = false) {
                 F0_CHECK(kv_op_lds_hot(w, k, n) == kv_op_lds(w, k, n),
                          "kv_op_lds_hot n %d w %d k %d", n, w, k);
                 for (int skv = 0; skv <= 64 * n + 128; skv += 16)
-                    F0_CHECK(kv_op_dim1_hot(skv, w, k) == kv_op_dim1(skv, w, k), "kv_op_dim1_hot");
+                    F0_CHECK(kv_op_dim1_hot(skv, w, k) == kv_op_dim1(skv, w, k) &&
+                                 kv_op_dim1_s32(skv, w, k) == kv_op_dim1(skv, w, k),
+                             "kv_op_dim1_hot / _s32");
                 F0_CHECK(kv_op_el_hot(1, 64 * n + 64, 8, 3, w, k, n) ==
                              kv_op_el(1, 64 * n + 64, 8, 3, w, k, n),
                          "kv_op_el_hot");

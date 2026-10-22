@@ -51,6 +51,68 @@
 #define BWD_HOLD 0
 #endif
 
+// ---- optimisation variants of k_hk_bwd_g4 (hk/notes/bwd_v0_opt.md). Every knob defaults to 0, and with all of them
+// 0 the code object is byte-identical to the pinned v0 (manifest sha256). None changes the kernel ABI (arguments,
+// block, grid, static LDS size). hk/lab/bounds/bwd_v0_check.cpp replays each one (`-- variant <name>`).
+//   HK_BWD_OPT_MASKED    diagonal steps use the FULL step's E-operand layout: all 32 tr16 issued in P4 (every wave
+//                        kind, DEAD included) and left in flight past the signal, E WMMAs only `if (live)`
+//   HK_BWD_OPT_ATOM      dQ atomic sub-bursts: 2 = 2 x 16 (P4 | after the P8 TDM, or after the readback with
+//                        ONEPHASE), 4 = 4 x 8 (P4 before / after the E tr16 | after the TDM | after the readback)
+//   HK_BWD_OPT_TDM3      wave 3 issues a real 16-B TDM op per step into its own cell (b0opt::DUMMY_OFF) instead of
+//                        the `w < 3` role branch
+//   HK_BWD_OPT_REGS      register holds (llvm.fake.use: no instruction, any VGPR) against the WMMA-source WAR
+//                        v_nops: bit 0 = qA / dA held to the end of P2, bit 1 = dSa held to the end of P3, bit 2 =
+//                        in both step parities (else the P = 0 step only), bit 3 = in the diagonal steps too (else
+//                        FULL steps only; the diagonal loop then stays on the lambda). 7 = the variant `regs`
+//   HK_BWD_OPT_ONEPHASE  one memory phase per step: P5 signal (<= 7 E tr16 uncovered), P7 wait, P8 TDM, P9
+//                        readback, then P6 E; the op(s+3) descriptor SALU is built under P1's WMMAs
+//   HK_BWD_OPT_ATOM_LATE with HK_BWD_OPT_ATOM=2: the second sub-burst after the P9 readback + dSa loads instead
+//                        of between the P8 TDM and the readback (its issue hides under the readback latency)
+//   HK_BWD_OPT_ENTRY     s_wait_dscnt 0 after the prologue readback: the loop-entry DS state then matches the
+//                        back edge's, so the first P1 WMMAs of the step after the loop head wait for their own
+//                        2-4 loads instead of 16 more (v0: the merge with the prologue path, 40 loads pending
+//                        instead of 56, makes every first-P1 wait of that step 16 loads too deep)
+//   HK_BWD_OPT_ADDR      the LDS base VGPRs of the P4 E-operand burst (at the step start) and of the P9 readback
+//                        (under E; ONEPHASE: at the step start) computed early and pinned (empty asm, no
+//                        instruction), so no DS burst waits 17-21 cycles for its address VALU
+#ifndef HK_BWD_OPT_MASKED
+#define HK_BWD_OPT_MASKED 0
+#endif
+#ifndef HK_BWD_OPT_ATOM
+#define HK_BWD_OPT_ATOM 0
+#endif
+#ifndef HK_BWD_OPT_TDM3
+#define HK_BWD_OPT_TDM3 0
+#endif
+#ifndef HK_BWD_OPT_REGS
+#define HK_BWD_OPT_REGS 0
+#endif
+#ifndef HK_BWD_OPT_ONEPHASE
+#define HK_BWD_OPT_ONEPHASE 0
+#endif
+#ifndef HK_BWD_OPT_ATOM_LATE
+#define HK_BWD_OPT_ATOM_LATE 0
+#endif
+#ifndef HK_BWD_OPT_ENTRY
+#define HK_BWD_OPT_ENTRY 0
+#endif
+#ifndef HK_BWD_OPT_ADDR
+#define HK_BWD_OPT_ADDR 0
+#endif
+static_assert(HK_BWD_OPT_ATOM == 0 || HK_BWD_OPT_ATOM == 2 || HK_BWD_OPT_ATOM == 4, "HK_BWD_OPT_ATOM: 0, 2 or 4");
+static_assert(HK_BWD_OPT_REGS >= 0 && HK_BWD_OPT_REGS <= 15, "HK_BWD_OPT_REGS: bit mask 0..15");
+static_assert(!HK_BWD_OPT_ATOM_LATE || HK_BWD_OPT_ATOM == 2, "HK_BWD_OPT_ATOM_LATE needs HK_BWD_OPT_ATOM=2");
+#define HK_BWD_OPT_ANY                                                                                               \
+    (HK_BWD_OPT_MASKED || HK_BWD_OPT_ATOM || HK_BWD_OPT_TDM3 || HK_BWD_OPT_REGS || HK_BWD_OPT_ONEPHASE ||            \
+     HK_BWD_OPT_ENTRY || HK_BWD_OPT_ADDR)
+#if HK_BWD_OPT_ANY
+#include "bwd/opt_idx.h"
+// llvm.fake.use through an asm label (as sync.h reaches s_wait_dscnt): a register use with no instruction and no
+// register-class constraint (unlike an empty inline asm, whose "v" operands must live in v0..v255). The register
+// allocator keeps the operands' VGPRs allocated up to this point; the AsmPrinter emits only a comment.
+extern "C" __device__ void hka_llvm_fake_use(...) __asm("llvm.fake.use");
+#endif
+
 using namespace hk_attn;
 
 namespace {
@@ -81,6 +143,36 @@ template <int SKIP, int NV> HKA_DEV void interleave16() {
     });
 #endif
 }
+
+#if HK_BWD_OPT_REGS
+// HK_BWD_OPT_REGS: keep the VGPRs of the 8 WMMA A operands x[2][4] allocated up to this point (one llvm.fake.use
+// each: no instruction). Written right after a phase's closing sched_barrier, so it cannot be scheduled into the
+// phase, and the phase's softmax temporaries cannot be given the registers its last WMMAs read (4 v_nop each).
+// A macro, not a function: the inliner drops the llvm.fake.use calls of an inlined callee, so the calls must be
+// lexically in the kernel (bwd/v0_step.inc expanded at kernel scope).
+#define HK_BWD_KEEP8(x)                                                                                              \
+    do {                                                                                                             \
+        hka_llvm_fake_use((x)[0][0]);                                                                                \
+        hka_llvm_fake_use((x)[0][1]);                                                                                \
+        hka_llvm_fake_use((x)[0][2]);                                                                                \
+        hka_llvm_fake_use((x)[0][3]);                                                                                \
+        hka_llvm_fake_use((x)[1][0]);                                                                                \
+        hka_llvm_fake_use((x)[1][1]);                                                                                \
+        hka_llvm_fake_use((x)[1][2]);                                                                                \
+        hka_llvm_fake_use((x)[1][3]);                                                                                \
+    } while (0)
+#endif
+
+#if HK_BWD_OPT_ADDR
+// HK_BWD_OPT_ADDR: materialize an LDS base address in a VGPR here (empty asm with a read-write VGPR operand: no
+// instruction). Its VALU must run before this point, and later uses read the pinned copy (no rematerialization
+// next to the DS burst).
+HKA_DEV lds_u8 *pin_lds(const lds_u8 *p) {
+    uint32_t a = (uint32_t) (uintptr_t) p;
+    asm volatile("" : "+v"(a));
+    return lds_ptr(a);
+}
+#endif
 
 } // namespace
 
@@ -211,6 +303,22 @@ extern "C" __global__ __launch_bounds__(b0::BLOCK) void k_hk_bwd_g4(
 
     // ---- TDM roles: wave 0 dO, 1 Q, 2 LD records (one op per step each); wave 3 the K / V images ----------------
     const int      role = w;
+#if HK_BWD_OPT_TDM3
+    // wave 3: the per-step dummy op (b0opt::DUMMY_OFF; constant address, slot stride 0), selected once per WG
+    using T_DUM = tdm_tile<1, b0opt::DUMMY_COLS, b0opt::DUMMY_B>;
+    const bool     dum  = role == b0::ISS_KV;
+    const char    *rten = role == b0::ISS_DO ? (const char *) DO
+                          : role == b0::ISS_Q ? (const char *) Q
+                          : role == b0::ISS_LD ? (const char *) LD : (const char *) K;
+    const uint64_t rbase = (uint64_t) (uintptr_t) rten +
+                           (uint64_t) (dum ? b0opt::dummy_src_byte(wk.b, Skv, Hkv, wk.hkv, kvw0)
+                                           : b0::role_tile_byte(role, wk.b, Sq, Hq, wk.hkv, G, 0, 0));
+    const int64_t  rqstep = dum ? 0 : b0::role_qstep(role, Sq, Hq), rhstep = dum ? 0 : b0::role_hstep(role, Sq, Hq);
+    const u32x8    rg1 = dum ? tdm_g1<T_DUM>(0, 1)
+                         : role == b0::ISS_LD ? tdm_g1<T_LD>(b0::role_stride_el(role, Hq), b0::role_rows(role))
+                                              : tdm_g1<T_QDO>(b0::role_stride_el(role, Hq), b0::role_rows(role));
+    const int      rlds0 = dum ? b0opt::DUMMY_OFF : b0::role_lds0(role), rlstep = dum ? 0 : b0::role_lds_step(role);
+#else
     const char    *rten = role == b0::ISS_DO ? (const char *) DO : role == b0::ISS_Q ? (const char *) Q : (const char *) LD;
     const uint64_t rbase = (uint64_t) (uintptr_t) rten +
                            (uint64_t) b0::role_tile_byte(role, wk.b, Sq, Hq, wk.hkv, G, 0, 0);
@@ -218,6 +326,7 @@ extern "C" __global__ __launch_bounds__(b0::BLOCK) void k_hk_bwd_g4(
     const u32x8    rg1 = role == b0::ISS_LD ? tdm_g1<T_LD>(b0::role_stride_el(role, Hq), b0::role_rows(role))
                                             : tdm_g1<T_QDO>(b0::role_stride_el(role, Hq), b0::role_rows(role));
     const int      rlds0 = b0::role_lds0(role), rlstep = b0::role_lds_step(role);
+#endif
     auto           ring_g0 = [&](int k) { // group 0 of the ring op of step k (tile clamp(k)) -> slot k % 4
         const int qt = b0::tile_qt(k, n, G, nqp), gh = b0::tile_gh(k, n, G);
         return tdm_g0(lds0 + (uint32_t) b0::role_lds_at(rlds0, rlstep, k & 3),
@@ -278,6 +387,29 @@ extern "C" __global__ __launch_bounds__(b0::BLOCK) void k_hk_bwd_g4(
             });
         });
     };
+#if HK_BWD_OPT_ADDR
+    // HK_BWD_OPT_ADDR: P9 part 1 from bases computed earlier (rb_bases, pinned): the same loads as readback
+    struct RbBase {
+        const lds_u8 *q, *d, *l;
+    };
+    auto rb_bases = [&](int slot) {
+        return RbBase{pin_lds(rows_base<XP>(lds0 + b0::lds_q(slot), l)), pin_lds(rows_base<XP>(lds0 + b0::lds_do(slot), l)),
+                      pin_lds(lds_ptr(lds0 + b0::lds_ld(slot) + b0::ld_lane(l)))};
+    };
+    auto readback_at = [&](XSet &X, const RbBase &rb) {
+        static_for<4>([&](auto dt) {
+            static_for<2>([&](auto hh) {
+                X.qA[hh][dt] = load_rows<XP>(rb.q, 16 * hh, 32 * dt);
+                X.dA[hh][dt] = load_rows<XP>(rb.d, 16 * hh, 32 * dt);
+            });
+        });
+        static_for<2>([&](auto hh) {
+            static_for<4>([&](auto k) {
+                X.ld[hh][k] = __builtin_bit_cast(f32x4, ds_load_b128_u32(rb.l, b0::ld_imm(hh, k)));
+            });
+        });
+    };
+#endif
     opnd_t dSa[2][4]; // A operands of dQ(s - 1): dS(s - 1) [q][kv], read at the end of step s - 1
     auto   load_dsa = [&](int buf) { // P9 part 2
         const lds_u8 *dt_ = tr_base<SP>(lds0 + b0::lds_ds(buf), l);
@@ -301,120 +433,90 @@ extern "C" __global__ __launch_bounds__(b0::BLOCK) void k_hk_bwd_g4(
             static_for<2>([&](auto j) { atomic_add_c<512>(r_dqa, vo + b0::dqa_imm(qh, j, 0), 0, dq[qh][j]); });
         });
     };
+#if HK_BWD_OPT_ATOM
+    // HK_BWD_OPT_ATOM: one accumulator (qh, j) of dQ(s - 1) = 8 atomics (same instructions as dq_atomics); the
+    // step body puts a sched_barrier after each sub-burst so that it stays where it is placed
+    auto dq_atom8 = [&](const acc_t (&dq)[2][2], int vo, auto qh, auto j) {
+        atomic_add_c<512>(r_dqa, vo + b0::dqa_imm(qh, j, 0), 0, dq[qh][j]);
+    };
+    constexpr std::integral_constant<int, 0> A0{};
+    constexpr std::integral_constant<int, 1> A1{};
+#endif
 
     // ---- one step (KIND: 0 FULL, 1 MASKED; X = this step's set, Xn = the readback target) --------------------------
+#if !HK_BWD_OPT_REGS || !(HK_BWD_OPT_REGS & 8)
     auto step = [&](auto masked_c, auto par_c, int s, XSet &X, XSet &Xn) __attribute__((always_inline)) {
         constexpr bool MASKED = decltype(masked_c)::value;
         constexpr int  P      = decltype(par_c)::value;
-        const int      qt = b0::tile_qt(s, n, G, nqp);
-        const int      avo = voff_nonneg(voff_lane + b0::dqa_voff(0, 0, b0::atom_gh(s, n, G), b0::atom_qt(s, n, G, nqp), nqp));
-        int            kind = b0::K_FULL;
-        if constexpr (MASKED) kind = b0::wave_kind(kvw0, w, qt, cshift, causal);
-        const bool live = !MASKED || !BWD_SKIP_DEAD || kind != b0::K_DEAD;
-        acc_t      S[2][2], dP[2][2], dq[2][2];
-        u32x4      pu[2][2], du[2][2];
-        auto       sm = [&](auto hh, auto kh) { // softmax / dS of block (hh, kh), design 6.2
-            acc_t t = softmax_arg_rows(S[hh][kh], c1, X.ld[hh][0], X.ld[hh][2]);
-            if constexpr (MASKED) t = mask_col_gt_row(t, l, b0::mask_off(qt, hh, kvw0, w, kh, cshift), MASK_NEG);
-            const acc_t p = exp2_acc(t), d = dsoftmax(p, dP[hh][kh], X.ld[hh][1], X.ld[hh][3]);
-            pu[hh][kh] = cvt_pk_bf16(p);
-            du[hh][kh] = cvt_pk_bf16(d);
-        };
-        auto sdp = [&](auto kh) { // S / dP of kv tile kh: 4 independent chains over dt
-            static_for<4>([&](auto dt) {
-                static_for<2>([&](auto hh) {
-                    if constexpr (dt == 0) S[hh][kh] = wmma0(X.qA[hh][dt], kf[kh][dt]);
-                    else S[hh][kh] = wmma(X.qA[hh][dt], kf[kh][dt], S[hh][kh]);
-                });
-                static_for<2>([&](auto hh) {
-                    if constexpr (dt == 0) dP[hh][kh] = wmma0(X.dA[hh][dt], vf[kh][dt]);
-                    else dP[hh][kh] = wmma(X.dA[hh][dt], vf[kh][dt], dP[hh][kh]);
-                });
-            });
-        };
-        constexpr std::integral_constant<int, 0> I0{};
-        constexpr std::integral_constant<int, 1> I1{};
-        if (live) {
-            // P1: G0
-            sdp(I0);
-            sched_barrier<0>();
-            // P2: G1 || softmax kh 0
-            sdp(I1);
-            sm(I0, I0);
-            sm(I1, I0);
-#if BWD_HOLD >= 2
-            static_for<2>([&](auto hh) { static_for<4>([&](auto dt) { hold_vgprs(X.qA[hh][dt], du[1][0]); hold_vgprs(X.dA[hh][dt], du[1][0]); }); });
-#endif
-            interleave16<0, 4>();
-            sched_barrier<0>();
-            // P3: dQ(s - 1) || softmax kh 1
-            dq_wmma(dq);
-            sm(I0, I1);
-            sm(I1, I1);
-#if BWD_HOLD >= 1
-            static_for<2>([&](auto qh) { static_for<4>([&](auto c) { hold_vgprs(dSa[qh][c], du[1][1]); }); });
-#endif
-            interleave16<2, 4>();
-        } else {
-            dq_wmma(dq);
-            static_for<2>([&](auto hh) { static_for<2>([&](auto kh) { du[hh][kh] = zero_u32x4(); }); });
-        }
-        sched_barrier<0>();
-        // P4: dS^T stores, fence, E operands (FULL), atomics of dQ(s - 1)
-        {
-            lds_u8 *dr = rows_base<SP>(lds0 + b0::lds_ds(P) + b0::ds_rows_wave(w), l);
-            static_for<2>([&](auto kh) {
-                static_for<2>([&](auto hh) { ds_store_b128(dr, b0::ct_imm(SP, 16 * kh, 16 * hh), du[hh][kh]); });
-            });
-        }
-        order_fence();
-        opnd_t        dOT[8], QT[8];
-        const lds_u8 *dtr = tr_base<XP>(lds0 + b0::lds_do(s & 3), l), *qtr = tr_base<XP>(lds0 + b0::lds_q(s & 3), l);
-        auto          load_e = [&] {
-            static_for<8>([&](auto dt) { dOT[dt] = load_tr<XP>(dtr, 0, 16 * dt); });
-            static_for<8>([&](auto dt) { QT[dt] = load_tr<XP>(qtr, 0, 16 * dt); });
-        };
-        if constexpr (!MASKED) load_e();
-        sched_barrier<0>();
-        dq_atomics(dq, avo);
-        // P5: signal B_s
-        if constexpr (!MASKED) split_signal_tdm_dscnt<b0::TCNT_STEADY, b0::FULL_UNCOVERED>();
-        else split_signal_tdm_lds<b0::TCNT_STEADY>();
-        // P6: E (+ the SALU of the next ring op's group 0, hidden under the WMMAs)
-        const u32x4 g0n = ring_g0(s + b0::LEAD);
-        asm volatile("" ::"s"(g0n)); // materialize here (IR sinking would move it behind the wait)
-        if (live) {
-            if constexpr (MASKED) load_e();
-            const opnd_t Pb[2]  = {cat_u32(pu[0][0], pu[1][0]), cat_u32(pu[0][1], pu[1][1])};
-            const opnd_t dSb[2] = {cat_u32(du[0][0], du[1][0]), cat_u32(du[0][1], du[1][1])};
-            static_for<8>([&](auto dt) {
-                static_for<2>([&](auto kh) { dVt[dt][kh] = wmma(dOT[dt], Pb[kh], dVt[dt][kh]); });
-            });
-            static_for<8>([&](auto dt) {
-                static_for<2>([&](auto kh) { dKt[dt][kh] = wmma(QT[dt], dSb[kh], dKt[dt][kh]); });
-            });
-        }
-        // P7: wait B_s
-        split_wait_lds();
-        // P8: ring op s + 3
-        if (w < b0::ISS_KV) tdm_load(g0n, rg1);
-        sched_barrier<0>();
-        // P9: readback of tile s + 1, then dSa = dS(s)
-        readback(Xn, (s + 1) & 3);
-        sched_barrier<0>();
-        load_dsa(P);
-        sched_barrier<0>();
+#include "bwd/v0_step.inc"
     };
+#endif
 
     // ---- main loop: x2 unrolled (n, nf even), FULL steps then the diagonal steps ---------------------------------
     XSet X0, X1;
     readback(X0, 0);
     static_for<2>([&](auto qh) { static_for<4>([&](auto c) { dSa[qh][c] = opnd_t{}; }); });
+#if HK_BWD_OPT_ENTRY
+    // HK_BWD_OPT_ENTRY: retire the prologue's DS loads (once per WG), so that the loop-entry DS state is the back
+    // edge's (the 56 readback + dSa loads of the previous step) and not a merge with 40 pending prologue loads
+    sched_barrier<0>();
+    wait_dscnt<0>();
+    sched_barrier<0>();
+#endif
     constexpr auto F0 = std::false_type{};
     constexpr auto T1 = std::true_type{};
     constexpr std::integral_constant<int, 0> P0{};
     constexpr std::integral_constant<int, 1> P1{};
     int s = 0;
+#if HK_BWD_OPT_REGS
+    // the same four step instances as the #else branch, expanded at kernel scope (bwd/v0_step.inc header)
+    (void) F0, (void) P0, (void) P1;
+#define HK_BWD_STEP_AT(MASKED_, P_, S_, X_, XN_)                                                                     \
+    constexpr bool MASKED  = MASKED_;                                                                                \
+    constexpr int  P       = P_;                                                                                     \
+    const int      s_at    = S_;                                                                                     \
+    XSet          &X = X_, &Xn = XN_;
+    for (; s < nf; s += 2) {
+        {
+            HK_BWD_STEP_AT(false, 0, s, X0, X1)
+            {
+                const int s = s_at;
+#include "bwd/v0_step.inc"
+            }
+        }
+        {
+            HK_BWD_STEP_AT(false, 1, s + 1, X1, X0)
+            {
+                const int s = s_at;
+#include "bwd/v0_step.inc"
+            }
+        }
+    }
+#if HK_BWD_OPT_REGS & 8
+    for (; s < n; s += 2) {
+        {
+            HK_BWD_STEP_AT(true, 0, s, X0, X1)
+            {
+                const int s = s_at;
+#include "bwd/v0_step.inc"
+            }
+        }
+        {
+            HK_BWD_STEP_AT(true, 1, s + 1, X1, X0)
+            {
+                const int s = s_at;
+#include "bwd/v0_step.inc"
+            }
+        }
+    }
+#else
+    for (; s < n; s += 2) { // diagonal steps through the lambda (no holds; kernel scope adds ~30 v_mov per step here)
+        step(T1, P0, s, X0, X1);
+        step(T1, P1, s + 1, X1, X0);
+    }
+#endif
+#undef HK_BWD_STEP_AT
+#else
     for (; s < nf; s += 2) {
         step(F0, P0, s, X0, X1);
         step(F0, P1, s + 1, X1, X0);
@@ -423,6 +525,7 @@ extern "C" __global__ __launch_bounds__(b0::BLOCK) void k_hk_bwd_g4(
         step(T1, P0, s, X0, X1);
         step(T1, P1, s + 1, X1, X0);
     }
+#endif
 
     // ---- drain: dQ(n - 1) and its atomics; epilogue (dV, scale * dK) straight from registers; TDM drain + barrier ---
     {

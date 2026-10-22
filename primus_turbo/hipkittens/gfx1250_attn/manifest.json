@@ -111,9 +111,11 @@
         "-mllvm",
         "-structurizecfg-skip-uniform-regions",
         "-mllvm",
-        "-amdgpu-sched-strategy=coexec"
+        "-amdgpu-sched-strategy=coexec",
+        "-DHK_FWD_OPT_ALL=1",
+        "-DHK_FWD_OPT_TAIL=0"
       ],
-      "hsaco_sha256": "7e9be7f1e6395c4089320272549446cdf061219d4023fc04161316821b600e9b",
+      "hsaco_sha256": "71d2684a4809df31d8919ff26184ee84dbaaefca71c6d6fe0ff89b63dde45401",
       "block": 128,
       "args": [
         {
@@ -233,15 +235,22 @@
       ],
       "kernarg_size": 104,
       "lds": 327680,
-      "vgpr": 692,
-      "sgpr": 92,
+      "vgpr": 752,
+      "sgpr": 95,
       "wavefront_size": 32
     },
     "k_attn_bwd_v0": {
       "module": "bwd_v0",
       "src": "src/k_attn_bwd_v0.hip",
-      "extra_flags": [],
-      "hsaco_sha256": "beb27e69f19bf3e26582c382d0a555a253042d131dab8cb747061ca9e8cb602e",
+      "extra_flags": [
+        "-DHK_BWD_OPT_MASKED=1",
+        "-DHK_BWD_OPT_ATOM=4",
+        "-DHK_BWD_OPT_TDM3=1",
+        "-DHK_BWD_OPT_REGS=7",
+        "-DHK_BWD_OPT_ENTRY=1",
+        "-DHK_BWD_OPT_ADDR=1"
+      ],
+      "hsaco_sha256": "c518fcc2ff121554388989f0fe83179f7ae0cdb92a908ff3dd6bfe5b144a2d6d",
       "symbols": {
         "k_hk_bwd_prep": {
           "block": 256,
@@ -455,8 +464,8 @@
           ],
           "kernarg_size": 92,
           "lds": 266240,
-          "vgpr": 754,
-          "sgpr": 68,
+          "vgpr": 766,
+          "sgpr": 70,
           "wavefront_size": 32
         },
         "k_hk_bwd_dqcvt": {
