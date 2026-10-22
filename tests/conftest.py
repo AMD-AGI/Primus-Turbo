@@ -51,6 +51,8 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_mega_bf16_gfx1250_prims.py",
     # The BF16 Mega NT GEMM tile (gathered A, LDS-staged buffer-store epilogue).
     "tests/pytorch/ops/test_mega_bf16_gfx1250_gemm.py",
+    # The fused Mega dispatch + L1 GEMM, single GPU (EP1).
+    "tests/pytorch/ops/test_mega_bf16_gfx1250_dispatch_gemm.py",
 )
 
 

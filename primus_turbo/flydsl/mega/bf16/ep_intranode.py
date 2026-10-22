@@ -117,12 +117,15 @@ def dispatch_bf16_tile(
     num_ranks: int,
     num_experts_per_rank: int,
     rank: int,
+    block_threads: int = _BLOCK_THREADS,
 ):
     """Push this block's chunk of every expert's task to one dst rank, in ascending expert order."""
     hidden_bytes = hidden_size * 2
     assert hidden_bytes % 16 == 0, "hidden*2 must be a multiple of 16 bytes -> hidden % 8 == 0"
+    assert block_threads % _WARP == 0, "a block is a whole number of 64-lane copy warps"
+    num_warps = block_threads // _WARP
     hidden_i32 = hidden_bytes // 4  # row stride in i32 words
-    row_stride = num_chunks * _NUM_WARPS
+    row_stride = num_chunks * num_warps
     num_max_pool_blocks = int(workspace.num_max_pool_blocks)
     recv_token_base = rank * int(workspace.num_max_tokens_per_rank)
     # hoist workspace-derived values before any dynamic control flow (rewriter can't carry Workspace)
@@ -131,7 +134,7 @@ def dispatch_bf16_tile(
 
     block_dst_rank = block_index % fx.Int32(num_ranks)
     chunk_index = block_index // fx.Int32(num_ranks)
-    warp_id = chunk_index * fx.Int32(_NUM_WARPS) + thread_index // fx.Int32(_WARP)
+    warp_id = chunk_index * fx.Int32(num_warps) + thread_index // fx.Int32(_WARP)
 
     # ascending expert order: flag[g] complete implies every expert <= g landed (single-flag wait)
     for local_expert in range(fx.Int32(num_experts_per_rank)):
