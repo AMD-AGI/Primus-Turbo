@@ -62,11 +62,22 @@ NOTIFY_THREADS = 256
 # sc0 | sc1 | nt: a system-scope streaming load, which misses every GPU cache
 SYS_LOAD = 0x13
 # Bytes of a row one copy_warp call loads before it stores them (1 KiB a warp step). gfx9's vmcnt
-# counts stores too, so the loads of the next piece wait for this piece's (remote) stores: small
-# pieces keep the sender streaming, as the HIP kernel's 2-step unrolled warp copy does. Measured on
-# MI355X (8 ranks, hidden 7168): dispatch is fastest at 2 KiB, the combine sender at 8 KiB.
-DISPATCH_COPY_PIECE_BYTES = 2 * 1024
-COMBINE_COPY_PIECE_BYTES = 8 * 1024
+# counts stores too, so the loads of the next piece wait for this piece's (remote) stores. The more
+# channels push at once, the smaller the piece that keeps a sender streaming. Measured on MI355X,
+# 8 ranks, hidden 7168, a DeepEP forward + backward per step (num_sms -> best dispatch / combine):
+# 20 -> 2 KiB / 8 KiB, 40 -> 1 KiB / 2 KiB, 64 and 80 -> 1 KiB / 1 KiB.
+
+
+def dispatch_copy_piece_bytes(num_channels):
+    return 2 * 1024 if num_channels <= 10 else 1024
+
+
+def combine_copy_piece_bytes(num_channels):
+    if num_channels <= 10:
+        return 8 * 1024
+    return 2 * 1024 if num_channels <= 20 else 1024
+
+
 _INT_MAX = 0x7FFFFFFF
 
 
@@ -623,7 +634,7 @@ def _make_dispatch(
                                 _addr(x_ring, 0, dst_slot, hidden_bytes),
                                 _addr(x_base, 0, token, hidden_bytes),
                                 hidden_bytes,
-                                DISPATCH_COPY_PIECE_BYTES,
+                                dispatch_copy_piece_bytes(num_channels),
                             )
                             if lane_id == fx.Int32(0):
                                 buffer_store(token, src_idx_ring, dst_slot)
@@ -745,7 +756,7 @@ def _make_dispatch(
                         _addr(recv_x_base, 0, total_offset + chunk, hidden_bytes),
                         _addr(x_ring, 0, ring_slot, hidden_bytes),
                         hidden_bytes,
-                        DISPATCH_COPY_PIECE_BYTES,
+                        dispatch_copy_piece_bytes(num_channels),
                         load_cache_modifier=SYS_LOAD,
                     )
                     chunk = chunk + fx.Int32(warps_per_rank)
@@ -1114,7 +1125,7 @@ def _make_combine(
                         _addr(x_ring, 0, dst_slot, hidden_bytes),
                         _addr(x_base, 0, token + i, hidden_bytes),
                         hidden_bytes,
-                        COMBINE_COPY_PIECE_BYTES,
+                        combine_copy_piece_bytes(num_channels),
                     )
                     if lane_id == fx.Int32(0):
                         buffer_store(
