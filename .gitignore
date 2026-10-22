@@ -16,3 +16,5 @@ logs/
 primus_turbo/_build_info.py
 primus_turbo/_version.py
 .coverage*
+!primus_turbo/hipkittens/gfx1250_attn/hip/**/*.hip
+primus_turbo/hipkittens/gfx1250_attn/bin/
