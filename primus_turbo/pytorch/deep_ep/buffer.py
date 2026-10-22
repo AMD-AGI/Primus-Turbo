@@ -19,6 +19,11 @@ import torch.distributed as dist
 import primus_turbo.pytorch._C.deep_ep as deep_ep_cpp
 from primus_turbo.pytorch._C.deep_ep import Config, EventHandle
 
+from .flydsl_intranode import (
+    SUPPORTED_NUM_RANKS,
+    FlyDSLIntranodeRuntime,
+    get_intranode_backend,
+)
 from .utils import EventOverlap, check_nvlink_connections
 
 
@@ -51,6 +56,7 @@ class Buffer:
         allow_nvlink_for_low_latency_mode: bool = True,
         allow_mnnvl: bool = False,
         explicitly_destroy: bool = False,
+        intranode_backend: Optional[str] = None,
     ) -> None:
         """
         Initialize the communication buffer.
@@ -70,6 +76,9 @@ class Buffer:
             explicitly_destroy: If this flag is set to True, you need to explicitly call `destroy()` to release resources;
                 otherwise, the resources will be released by the destructor.
                 Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
+            intranode_backend: the kernels of the intranode path (`num_ranks <= 8`, no low-latency mode),
+                `"cpp"` (HIP) or `"flydsl"`; defaults to `PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND`, else `"cpp"`.
+                Both return interchangeable handles. The internode and low-latency paths always use `"cpp"`.
 
         Note:
             Controlled by ``PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM`` (default ``0``).
@@ -86,10 +95,20 @@ class Buffer:
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
         self.explicitly_destroy = explicitly_destroy
+        self.intranode_backend = get_intranode_backend(intranode_backend)
+        use_flydsl = (
+            self.intranode_backend == "flydsl"
+            and num_nvl_bytes > 0
+            and not low_latency_mode
+            and self.group_size in SUPPORTED_NUM_RANKS
+        )
+        if self.intranode_backend == "flydsl" and not use_flydsl:
+            self.intranode_backend = "cpp"
         self.runtime = deep_ep_cpp.Buffer(
             self.rank,
             self.group_size,
-            num_nvl_bytes,
+            # the FlyDSL runtime owns the NVL heap, the C++ one keeps only its stream / counters
+            0 if use_flydsl else num_nvl_bytes,
             num_rdma_bytes,
             low_latency_mode,
             explicitly_destroy,
@@ -149,6 +168,13 @@ class Buffer:
         self.runtime.sync(device_ids, ipc_handles, root_unique_id)
         assert self.runtime.is_available()
 
+        # Intranode kernels: the C++ runtime itself, or the FlyDSL one on its own heap
+        self.intranode_runtime = (
+            FlyDSLIntranodeRuntime(group, num_nvl_bytes, self.get_comm_stream())
+            if use_flydsl
+            else self.runtime
+        )
+
     def destroy(self):
         """
         Destroy the cpp runtime and release resources.
@@ -157,8 +183,15 @@ class Buffer:
 
         assert self.explicitly_destroy, "`explicitly_destroy` flag must be set"
 
+        if self.intranode_runtime is not self.runtime:
+            self.intranode_runtime.destroy()
+        self.intranode_runtime = None
         self.runtime.destroy()
         self.runtime = None
+
+    def _layout_runtime(self):
+        # the per-RDMA-rank counts of the internode layout come from the C++ kernel only
+        return self.runtime if self.runtime.get_num_rdma_ranks() > 1 else self.intranode_runtime
 
     @staticmethod
     def is_sm90_compiled():
@@ -234,7 +267,10 @@ class Buffer:
             offset: the offset of the beginning element.
             use_rdma_buffer: whether to return the RDMA buffer.
         """
-        tensor = self.runtime.get_local_buffer_tensor(dtype, offset, use_rdma_buffer)
+        if not use_rdma_buffer and self.intranode_runtime is not self.runtime:
+            tensor = self.intranode_runtime.get_local_buffer_tensor(dtype, offset)
+        else:
+            tensor = self.runtime.get_local_buffer_tensor(dtype, offset, use_rdma_buffer)
         if size is None:
             return tensor
 
@@ -336,7 +372,7 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
         num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, event = (
-            self.runtime.get_dispatch_layout(
+            self._layout_runtime().get_dispatch_layout(
                 topk_idx,
                 num_experts,
                 getattr(previous_event, "event", None),
@@ -451,7 +487,7 @@ class Buffer:
                 send_head,
             ) = handle
             num_recv_tokens = recv_src_idx.size(0)
-            recv_x, recv_x_scales, _, _, _, _, _, _, _, _, event = self.runtime.intranode_dispatch(
+            recv_x, recv_x_scales, _, _, _, _, _, _, _, _, event = self.intranode_runtime.intranode_dispatch(
                 x,
                 x_scales,
                 None,
@@ -495,7 +531,7 @@ class Buffer:
                 recv_src_idx,
                 send_head,
                 event,
-            ) = self.runtime.intranode_dispatch(
+            ) = self.intranode_runtime.intranode_dispatch(
                 x,
                 x_scales,
                 topk_idx,
@@ -577,7 +613,7 @@ class Buffer:
         bias_0, bias_1 = Buffer._unpack_bias(bias)
 
         # Launch the kernel
-        recv_x, recv_topk_weights, event = self.runtime.intranode_combine(
+        recv_x, recv_topk_weights, event = self.intranode_runtime.intranode_combine(
             x,
             topk_weights,
             bias_0,
