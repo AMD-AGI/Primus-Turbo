@@ -27,3 +27,5 @@ prune .cursor
 
 global-exclude *.py[cod]
 global-exclude __pycache__
+recursive-include primus_turbo/hipkittens/gfx1250_mla_bwd/hip *
+include primus_turbo/hipkittens/gfx1250_mla_bwd/manifest.json

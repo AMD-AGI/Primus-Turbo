@@ -11,6 +11,7 @@ they run anywhere. The numeric tests need a gfx1250 card; their fp32 reference r
 """
 
 import contextlib
+import importlib
 import inspect
 import sys
 
@@ -35,9 +36,11 @@ from primus_turbo.pytorch.ops import flash_attn_func
 from primus_turbo.pytorch.ops.attention import flash_attn_interface
 from tests.pytorch.test_utils import compute_snr, pinned_backend_takes
 
-_KERNELS = "primus_turbo.flydsl.attention.gfx1250_mla"
+_KERNELS = ("primus_turbo.flydsl.attention.gfx1250_mla", "primus_turbo.hipkittens.gfx1250_mla_bwd")
 # Taken when pytest imports this module, before any test runs.
-_KERNEL_MODULES_AT_IMPORT = sorted(m for m in sys.modules if m == _KERNELS or m.startswith(_KERNELS + "."))
+_KERNEL_MODULES_AT_IMPORT = sorted(
+    m for m in sys.modules if any(m == p or m.startswith(p + ".") for p in _KERNELS)
+)
 
 needs_gfx1250 = pytest.mark.skipif(
     not (torch.cuda.is_available() and is_gfx1250()), reason="needs a gfx1250 (MI455X) GPU"
@@ -595,3 +598,214 @@ def test_torch_compile_fullgraph():
     _check(got, _reference(q, k, v, dout, MLA_SCALE))
     for a, b in zip(got, eager):
         assert torch.equal(a, b)
+
+
+# ---------------------------------------------------------------------------
+# Backward on the HIP kernels (PRIMUS_TURBO_MLA_BWD_IMPL=hk, primus_turbo/hipkittens/gfx1250_mla_bwd)
+# ---------------------------------------------------------------------------
+
+
+def _hk_package(name):
+    return importlib.import_module(f"primus_turbo.hipkittens.gfx1250_mla_bwd.{name}")
+
+
+@pytest.mark.parametrize(
+    ("setting", "expected"),
+    [("", "flydsl"), ("flydsl", "flydsl"), ("hk", "hk"), (" HK ", "hk"), ("hipkittens", None)],
+    ids=["unset", "flydsl", "hk", "hk_spelled_loosely", "unknown"],
+)
+def test_mla_bwd_impl_setting(monkeypatch, setting, expected):
+    monkeypatch.setattr(mla_impl, "MLA_BWD_IMPL_SETTING", setting)
+    if expected is None:
+        with pytest.raises(ValueError, match="PRIMUS_TURBO_MLA_BWD_IMPL"):
+            mla_impl.mla_bwd_impl()
+    else:
+        assert mla_impl.mla_bwd_impl() == expected
+
+
+@pytest.mark.parametrize(
+    "dims",
+    [(2, 4096, 4096, 128), (1, 4096, 4096, 256), (1, 256, 256, 2), (1, 256, 384, 2)],
+    ids=["dsv3_mbs2", "dsv3_mbs2_folded", "toy", "rect"],
+)
+def test_hk_gate_accepts(monkeypatch, dims):
+    monkeypatch.setattr(_hk_package("hsaco"), "unavailable_reason", lambda *a: None)
+    assert mla_impl.hk_mla_bwd_unsupported_reason(*_meta(*dims), True) is None
+
+
+@pytest.mark.parametrize(
+    ("dims", "match"),
+    [
+        ((1, 512, 512, 2), "seqlen_q % 384"),
+        ((1, 128, 128, 2), "seqlen_q % 384"),
+        ((1, 256, 16384, 256), "proven extent"),
+        ((1, 256, 256, 4, 2), "MHA only"),
+        ((1, 512, 256, 2), "seqlen_q <= seqlen_kv"),
+    ],
+    ids=["sq512", "sq128", "beyond_proven_extent", "gqa", "sq_gt_skv"],
+)
+def test_hk_gate_refuses(monkeypatch, dims, match):
+    monkeypatch.setattr(_hk_package("hsaco"), "unavailable_reason", lambda *a: None)
+    reason = mla_impl.hk_mla_bwd_unsupported_reason(*_meta(*dims), True)
+    assert reason is not None and match in reason
+
+
+def test_hk_gate_refuses_without_the_code_objects(monkeypatch):
+    monkeypatch.setattr(
+        _hk_package("hsaco"), "unavailable_reason", lambda *a: "k_dkdv96ds.hsaco is not built"
+    )
+    assert (
+        mla_impl.hk_mla_bwd_unsupported_reason(*_meta(1, 256, 256, 2), True)
+        == "k_dkdv96ds.hsaco is not built"
+    )
+
+
+def test_hk_code_object_checks(tmp_path):
+    """unavailable_reason: a missing code object, then one with foreign bytes, are reasons."""
+    hsaco = _hk_package("hsaco")
+    assert "not built" in hsaco.unavailable_reason(tmp_path / "missing")
+    bad = tmp_path / "bad"
+    bad.mkdir()
+    for name in hsaco.load_manifest()["kernels"]:
+        (bad / f"{name}.hsaco").write_bytes(b"not a code object")
+    assert "sha256" in hsaco.unavailable_reason(bad)
+
+
+def test_hk_manifest():
+    """Every kernel: its source is shipped, its arguments tile its kernarg segment in order, and the
+    flags are the device-only gfx1250 build (no KITTENS_CDNA4)."""
+    hsaco, hiprt = _hk_package("hsaco"), _hk_package("hiprt")
+    m = hsaco.load_manifest()
+    assert (
+        m["arch"] == "gfx1250"
+        and "--offload-arch=gfx1250" in m["flags"]
+        and "--cuda-device-only" in m["flags"]
+    )
+    assert not any("KITTENS_CDNA4" in f for f in m["flags"])
+    assert set(m["kernels"]) == {"k_dkdv96ds", "k_dqds_c"}
+    for name, k in m["kernels"].items():
+        assert (hsaco.HIP_DIR / k["src"]).is_file(), name
+        assert len(k["hsaco_sha256"]) == 64 and k["block"] in (64, 128)
+        last = k["args"][-1]
+        assert last["offset"] + last["size"] <= k["kernarg_size"], name
+        values = [1 if a["kind"] == "ptr" else 0 for a in k["args"]]
+        assert len(hiprt.pack_args(k["args"], values)) == last["offset"] + last["size"], name
+
+
+def test_hk_plan_on_meta_tensors():
+    """The launch plan at DeepSeek-V3's shape, on meta tensors (no GPU): three launches, the grids,
+    the dS scratch size, and argument tuples that match the manifest's kernel signatures."""
+    impl = _hk_package("impl")
+    m = _hk_package("hsaco").load_manifest()
+    b, s, h = 2, 4096, 128
+    q, k, v = _meta(b, s, s, h)
+    o = torch.empty(b, s, h, D_V, dtype=torch.bfloat16, device="meta")
+    lse = torch.empty(b, h, s, dtype=torch.float32, device="meta")
+    plan = impl._plan(o, q, k, v, o, lse, MLA_SCALE, True, None)
+    assert [x[0] for x in plan["launches"]] == ["delta", "dkdv", "dq"]
+    assert plan["grids"]["dkdv"] == (32, 43, 8)  # 42 blocks of 96 kv rows + one 64-row tail
+    assert plan["grids"]["dq"] == (32, 11, 8)  # 10 tiles of 384 queries + the 256-query head
+    assert plan["ds_layout_bytes"] == 4_328_521_728
+    assert plan["ds_full"].numel() * 2 == 4_328_521_728 + 2 * impl.DS_GUARD_B
+    for _, name, (grid, block, values) in plan["launches"][1:]:
+        assert block == m["kernels"][name]["block"] and len(values) == len(m["kernels"][name]["args"])
+    with pytest.raises(ValueError, match="not proven"):
+        impl._plan(o, q, k, v, o, lse, MLA_SCALE, True, None, head_group=48)
+
+
+@pytest.mark.parametrize(("s", "uses_hk"), [(256, True), (128, False)], ids=["hk", "falls_back"])
+def test_hk_routes_and_falls_back(monkeypatch, s, uses_hk):
+    """PRIMUS_TURBO_MLA_BWD_IMPL=hk replaces only the backward kernels (same kernel-layout tensors);
+    a shape the HIP kernels refuse (seqlen 128) runs the FlyDSL backward. The kernels are replaced
+    by the CPU reference."""
+    _on_gfx1250(monkeypatch)
+    monkeypatch.setattr(mla_impl, "MLA_BWD_IMPL_SETTING", "hk")
+    monkeypatch.setattr(_hk_package("hsaco"), "unavailable_reason", lambda *a: None)
+    calls = []
+
+    def fwd(q, k, v, softmax_scale, causal):
+        out, lse, *_ = _reference(q, k, v, torch.zeros(*q.shape[:3], D_V), softmax_scale)
+        return out.to(q.dtype).contiguous(), lse.contiguous()
+
+    def bwd(tag):
+        def run(dout, q, k, v, out, lse, softmax_scale, causal):
+            calls.append((tag, tuple(q.shape)))
+            return tuple(g.to(q.dtype).contiguous() for g in _reference(q, k, v, dout, softmax_scale)[2:])
+
+        return run
+
+    monkeypatch.setattr(mla_impl, "_forward_op", fwd)
+    monkeypatch.setattr(mla_impl, "_backward_op", bwd("flydsl"))
+    monkeypatch.setattr(mla_impl, "_backward_hk_op", bwd("hk"))
+    b, h = 2, 2
+    q, k, v, dout = _inputs(b, s, s, h, layout="sbhd")
+    qg, kg, vg = (t.clone().requires_grad_() for t in (q, k, v))
+    with _pinned_flydsl():
+        out = flash_attn_func(qg, kg, vg, softmax_scale=MLA_SCALE, causal=True)
+    out.backward(dout)
+    assert calls == [("hk" if uses_hk else "flydsl", (1, s, b * h, D_QK))]
+    ref = _reference(q, k, v, dout, MLA_SCALE)
+    for name, x, r in zip(("dq", "dk", "dv"), (qg.grad, kg.grad, vg.grad), ref[2:]):
+        assert compute_snr(r, x.detach().float()) > 40, name
+
+
+def _hk_code_objects_reason():
+    return _hk_package("hsaco").unavailable_reason()
+
+
+needs_hk = pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx1250()) or _hk_code_objects_reason() is not None,
+    reason="needs a gfx1250 (MI455X) GPU and the HIP MLA backward code objects",
+)
+
+
+def _run_hk(monkeypatch, q, k, v, dout):
+    monkeypatch.setattr(mla_impl, "MLA_BWD_IMPL_SETTING", "hk")
+    calls = []
+    real = mla_impl._backward_hk_op
+
+    def spy(*args):
+        calls.append(tuple(args[1].shape))
+        return real(*args)
+
+    monkeypatch.setattr(mla_impl, "_backward_hk_op", spy)
+    got = _run(q, k, v, dout)
+    assert len(calls) == 1, "the HIP backward was not used"
+    return got
+
+
+@needs_hk
+@pytest.mark.parametrize(
+    ("dims", "layout"),
+    [
+        ((1, 256, 256, 2), "sbhd"),
+        ((2, 256, 256, 2), "sbhd"),
+        ((1, 256, 384, 2), "sbhd"),
+        ((1, 640, 640, 4), "bshd"),
+    ],
+    ids=["toy", "toy_folded", "rect", "sq640"],
+)
+def test_hk_matches_reference_and_flydsl(monkeypatch, dims, layout):
+    """The HIP backward matches the fp32 reference, is bitwise deterministic and bitwise equal to
+    the FlyDSL backward (same dS rounding and accumulation order)."""
+    q, k, v, dout = _inputs(*dims, layout=layout)
+    got = _run_hk(monkeypatch, q, k, v, dout)
+    _check(got, _reference(q, k, v, dout, MLA_SCALE))
+    again = _run_hk(monkeypatch, q, k, v, dout)
+    monkeypatch.setattr(mla_impl, "MLA_BWD_IMPL_SETTING", "flydsl")
+    fly = _run(q, k, v, dout)
+    for a, b, c in zip(got, again, fly):
+        assert torch.equal(a, b) and torch.equal(a, c)
+
+
+@needs_hk
+def test_hk_production_shape_matches_reference():
+    """(1, 4096, 4096, 16): 42 96-row kv blocks + the 64-row tail, 10 384-query dQ tiles + the
+    256-query head; with the dS scratch NaN-filled, so a block dQ reads but dK/dV never wrote fails."""
+    impl = _hk_package("impl")
+    q, k, v, dout = _inputs(1, 4096, 4096, 16, layout="bshd")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(mla_impl, "MLA_BWD_IMPL_SETTING", "hk")
+        mp.setattr(impl, "POISON", True)
+        got = _run(q, k, v, dout)
+    _check(got, _reference_by_heads(q, k, v, dout, MLA_SCALE))

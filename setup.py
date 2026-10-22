@@ -4,6 +4,7 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import importlib.util
 import os
 import platform
 import re
@@ -103,6 +104,24 @@ def check_submodules():
                 sys.exit(1)
             return
     print("[Primus-Turbo] Submodules already initialized.")
+
+
+# -------- gfx1250 MLA backward HIP code objects --------
+# Built by the package's own hsaco.py with the flags manifest.json pins (never the csrc flags, which
+# define KITTENS_CDNA4); output that is not the pinned bytes is dropped and the backward stays on
+# FlyDSL. PRIMUS_TURBO_BUILD_HK_MLA_BWD=0 skips the step.
+HK_MLA_BWD_HSACO = PROJECT_ROOT / "primus_turbo" / "hipkittens" / "gfx1250_mla_bwd" / "hsaco.py"
+
+
+def build_hk_mla_bwd_hsaco(offload_arch_list):
+    if "--offload-arch=gfx1250" not in offload_arch_list:
+        return
+    if os.environ.get("PRIMUS_TURBO_BUILD_HK_MLA_BWD", "1") == "0":
+        return
+    spec = importlib.util.spec_from_file_location("_hk_mla_bwd_hsaco", HK_MLA_BWD_HSACO)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod.build(log=lambda msg: print(f"[Primus-Turbo Setup] {msg}"))
 
 
 def get_extras_require():
@@ -527,6 +546,7 @@ if __name__ == "__main__":
     ]
 
     offload_arch_list, _ = get_offload_archs()
+    build_hk_mla_bwd_hsaco(offload_arch_list)
 
     # flydsl 0.3.4.1 does support gfx1250: the four symbols the gfx1250 kernels need
     # (rocdl.WMMA, rocdl.make_tdm_atom, rocdl.tdm_ops, rocdl.ds_load_tr16_b128) are all
@@ -557,7 +577,13 @@ if __name__ == "__main__":
         long_description=(PROJECT_ROOT / "README.md").read_text(encoding="utf-8"),
         long_description_content_type="text/markdown",
         packages=find_packages(exclude=["tests", "tests.*"]),
-        package_data={"primus_turbo": ["lib/*.so"]},
+        package_data={
+            "primus_turbo": [
+                "lib/*.so",
+                "hipkittens/gfx1250_mla_bwd/manifest.json",
+                "hipkittens/gfx1250_mla_bwd/bin/*.hsaco",
+            ]
+        },
         ext_modules=ext_modules,
         cmdclass={"build_ext": TurboBuildExt.with_options(use_ninja=True)},
         entry_points=entry_points,

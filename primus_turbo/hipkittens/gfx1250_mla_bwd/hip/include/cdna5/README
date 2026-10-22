@@ -1,0 +1,3 @@
+A subset of HipKittens (https://github.com/HazyResearch/HipKittens) include/cdna5 at commit
+be1c91841b817c9690aa3af22ea771f8e3624bf4, vendored unmodified for the gfx1250 MLA backward kernels.
+HipKittens is distributed under the MIT license in LICENSE (this directory).
