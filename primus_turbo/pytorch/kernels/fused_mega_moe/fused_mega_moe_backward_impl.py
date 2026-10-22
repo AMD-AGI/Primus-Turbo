@@ -130,9 +130,9 @@ class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
 
 
 def _backward_gfx1250(dy, saved_x, l1_out, dispatch_weights, w1, w2, topk_idx, handle, activation):
-    """The same five steps on the gfx1250 kernels, which are NT only: the two NN GEMMs run on a
-    transposed copy of the weight, and the wgrads take both operands in pool order, ordered so
-    the result lands in the weight's own layout (no ``trans_c``)."""
+    """The same five steps on the gfx1250 kernels: the two dgrad GEMMs read the weight NN as
+    stored, and the wgrads take both operands in pool order, ordered so the result lands in the
+    weight's own layout (no ``trans_c``)."""
     from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
         grouped_gemm_bf16_variable_k_flydsl_kernel as variable_k_gfx1250,
     )
@@ -150,7 +150,7 @@ def _backward_gfx1250(dy, saved_x, l1_out, dispatch_weights, w1, w2, topk_idx, h
     prefix, counts = handle.num_tokens_per_expert_prefix, handle.num_tokens_per_expert
 
     # L2 dgrad: dispatch dy, grad_act = dy @ w2[e]
-    grad_act = dispatch_gemm_nt_gfx1250(dy, w2.transpose(1, 2).contiguous(), handle)
+    grad_act = dispatch_gemm_nt_gfx1250(dy, w2, handle, b_nn=True)
     dy_pool = pool_rows_of(symm.dispatch_token_buffer, handle)
 
     grad_l1, grad_gate, act_weighted = swiglu_backward_flydsl_kernel(
@@ -167,9 +167,7 @@ def _backward_gfx1250(dy, saved_x, l1_out, dispatch_weights, w1, w2, topk_idx, h
     dW2 = variable_k_gfx1250(dy_pool, act_weighted, prefix, masked_k=counts)
 
     # L1 dgrad + combine + dx reduce + grad_gate: dx = grad_l1 @ w1[e]
-    dx, grad_topk_weights = gemm_combine_nt_gfx1250(
-        grad_l1, w1.transpose(1, 2).contiguous(), handle, topk_idx, grad_gate=grad_gate
-    )
+    dx, grad_topk_weights = gemm_combine_nt_gfx1250(grad_l1, w1, handle, topk_idx, grad_gate=grad_gate, b_nn=True)
 
     # dW1[e] = grad_l1[e].T @ x_pool[e]  -> [E, 2 * inter, hidden]; x is dispatched again
     x_pool = dispatch_only_gfx1250(saved_x.contiguous(), handle)

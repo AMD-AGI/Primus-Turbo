@@ -4,7 +4,8 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""Accuracy of the gfx1250 Mega NT GEMM tile, gathered and dense, against per-expert torch matmul.
+"""Accuracy of the gfx1250 Mega GEMM tile, gathered and dense, NT and NN, against per-expert torch
+matmul.
 
 The pool is built the way Mega lays it out: each expert's rows padded to a 256-row pool block,
 padding rows indexed -1, some experts empty, the same dispatched token feeding several pool
@@ -57,7 +58,8 @@ def _reference(a_rows, b, tile_to_expert, live):
     ],
 )
 @pytest.mark.parametrize("mode", ["gather16", "gather32", "dense"])
-def test_mega_nt_tile(N, K, group_lens, mode):
+@pytest.mark.parametrize("b_layout", ["nt", "nn"])
+def test_mega_nt_tile(N, K, group_lens, mode, b_layout):
     from primus_turbo.flydsl.mega.bf16_gfx1250.gemm_nt_tile import mega_grouped_gemm_nt_gfx1250
 
     torch.manual_seed(0)
@@ -74,14 +76,16 @@ def test_mega_nt_tile(N, K, group_lens, mode):
         a_rows = a[row_idx.clamp(min=0).cuda().long()]
         idx_arg, idx_bits = row_idx.cuda(), int(mode[len("gather") :])
     out = torch.full((pool_rows, N), float("nan"), dtype=torch.bfloat16, device="cuda")
+    b_nn = b_layout == "nn"
     mega_grouped_gemm_nt_gfx1250(
         a,
-        b,
+        b.transpose(1, 2).contiguous() if b_nn else b,  # nn stores B as [G, K, N]
         out,
         tile_to_expert.cuda(),
         torch.tensor([live], dtype=torch.int32, device="cuda"),
         idx_arg,
         idx_bits=idx_bits,
+        b_nn=b_nn,
     )
     torch.cuda.synchronize()
 
