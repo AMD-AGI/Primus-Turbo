@@ -8,7 +8,7 @@ The kernel code of DeepEP is primarily derived from ROCm internal DeepEP (it's s
 #### 1. Dependencies
 
 Hardware
-- only Supported MI300 (gfx942)
+- MI300 (gfx942) and MI355 (gfx950)
 
 #### 2. Docker (Recommended)
 
@@ -25,6 +25,22 @@ rocSHMEM is required for internode api of experimental DeepEP. Please refer to [
 
 #### 4. Install from source
 Please following [Primus-Turbo Install from Source](../../../README.md#3-install-from-source) instructions to install.
+
+### Intranode backend: HIP (C++) or FlyDSL
+
+The intranode path (a single node, `num_ranks` in {2, 4, 8}, no low-latency mode) has two kernel
+backends with the same `Buffer` API:
+
+- `cpp` (default): the HIP kernels in `csrc/kernels/deep_ep/{layout,intranode}.cu`.
+- `flydsl`: FlyDSL ports of the same kernels in `primus_turbo/flydsl/deep_ep/`
+  (`get_dispatch_layout`, `notify_dispatch`, `dispatch`, `cached_notify_combine`, `combine`).
+  It runs on gfx942 / gfx950 and owns its own uncached HIP-IPC heap of `num_nvl_bytes`.
+
+Pick one per `Buffer` with `intranode_backend="cpp" | "flydsl"`, or globally with
+`PRIMUS_TURBO_DEEPEP_INTRANODE_BACKEND=cpp|flydsl`. The two backends use the same channel
+protocol, so the returned tensors and handles are bit-identical: a handle from one backend can drive
+the other's cached dispatch or combine. Internode (rocSHMEM) and low-latency kernels stay on the C++
+path whatever the setting.
 
 ### Example
 
