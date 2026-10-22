@@ -18,6 +18,11 @@ def is_gfx1250_target() -> bool:
     return get_rocm_arch().startswith("gfx1250")
 
 
+def hw_wave_size() -> int:
+    """Lanes of one hardware wave: 32 on gfx1250, 64 on gfx9."""
+    return 32 if is_gfx1250_target() else 64
+
+
 # Buffer load / store cache policy (the ``aux`` operand of the raw buffer intrinsics).
 #
 # gfx9 spells scope with SC1:SC0 (0 CU, 1 SE, 2 device, 3 system) plus NT = 2; gfx12 spells it

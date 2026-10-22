@@ -253,6 +253,7 @@ def copy_warp(
     src_off: Union[int, ArithValue] = 0,
     load_cache_modifier: int = 0,
     store_cache_modifier: int = 0,
+    warp: int = _WARP,
 ) -> None:
     def _addr_i64(addr: Union[int, ArithValue]) -> ArithValue:
         if isinstance(addr, int):
@@ -273,7 +274,7 @@ def copy_warp(
         return create_buffer_resource_from_addr(base, num_records_bytes=nbytes), fx.Int32(0)
 
     assert nbytes % (_COPY_VEC_I32 * _I32_BYTES) == 0, "copy_warp nbytes must be a multiple of 16"
-    cols = _WARP * _COPY_VEC_I32
+    cols = warp * _COPY_VEC_I32
     num_full_chunks = nbytes // _I32_BYTES // cols
     tail_words = nbytes // _I32_BYTES - num_full_chunks * cols
     # A ragged tail parks its idle lanes' stores one row past the end, which only the
@@ -283,7 +284,7 @@ def copy_warp(
     )
     src, src_off = _copy_operand(src, src_off, nbytes)
     dst, dst_off = _copy_operand(dst, dst_off, nbytes)
-    lane_off = (fx.thread_idx.x % fx.Int32(_WARP)) * fx.Int32(_COPY_VEC_I32)
+    lane_off = (fx.thread_idx.x % fx.Int32(warp)) * fx.Int32(_COPY_VEC_I32)
     offs = [fx.Int32(c * cols) + lane_off for c in range_constexpr(num_full_chunks)]
     load_offs = list(offs)
     if tail_words:
