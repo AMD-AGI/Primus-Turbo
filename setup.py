@@ -4,6 +4,8 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import importlib.util
+import json
 import os
 import platform
 import re
@@ -103,6 +105,55 @@ def check_submodules():
                 sys.exit(1)
             return
     print("[Primus-Turbo] Submodules already initialized.")
+
+
+# -------- gfx1250 HipKittens HIP code objects --------
+# Each primus_turbo/hipkittens/gfx1250_* package with a hsaco.py (the head-dim-128 attention, and the
+# DeepSeek-V3 MLA backward where present) builds its own code objects with the flags its manifest.json
+# pins (never the csrc flags, which define KITTENS_CDNA4); output that is not the pinned bytes is
+# dropped and that kernel stays on FlyDSL. The package's variable set to 0 skips it. Never fails the
+# install: a missing compiler or a failed build only leaves the FlyDSL fallback.
+HK_GFX1250_PACKAGES = {
+    "gfx1250_attn": "PRIMUS_TURBO_BUILD_HK_ATTN",
+    "gfx1250_mla_bwd": "PRIMUS_TURBO_BUILD_HK_MLA_BWD",
+}
+
+
+def build_hk_gfx1250_hsaco(offload_arch_list):
+    if "--offload-arch=gfx1250" not in offload_arch_list:
+        return
+    for pkg, env in HK_GFX1250_PACKAGES.items():
+        hsaco_py = PROJECT_ROOT / "primus_turbo" / "hipkittens" / pkg / "hsaco.py"
+        if not hsaco_py.is_file():
+            continue
+        if os.environ.get(env, "1") == "0":
+            print(f"[Primus-Turbo Setup] {env}=0: {pkg} code objects not built")
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(f"_hk_{pkg}_hsaco", hsaco_py)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mod.build(log=lambda msg: print(f"[Primus-Turbo Setup] {msg}"))
+        except Exception as exc:  # noqa: BLE001 -- the FlyDSL kernels remain
+            print(f"[Primus-Turbo Setup] WARNING: {pkg} code objects not built: {type(exc).__name__}: {exc}")
+
+
+def hk_gfx1250_package_data():
+    """manifest.json and bin/<entry>.hsaco of every kernel entry of each gfx1250 HipKittens package's
+    manifest (only those: bin/ may hold other files; names that were not built match nothing)."""
+    data = []
+    for pkg in HK_GFX1250_PACKAGES:
+        manifest = PROJECT_ROOT / "primus_turbo" / "hipkittens" / pkg / "manifest.json"
+        data.append(f"hipkittens/{pkg}/manifest.json")
+        try:
+            kernels = json.loads(manifest.read_text())["kernels"] if manifest.is_file() else {}
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(
+                f"[Primus-Turbo Setup] WARNING: {manifest}: {type(exc).__name__}: {exc}; no code objects packaged"
+            )
+            kernels = {}
+        data += [f"hipkittens/{pkg}/bin/{name}.hsaco" for name in kernels]
+    return data
 
 
 def get_extras_require():
@@ -527,6 +578,7 @@ if __name__ == "__main__":
     ]
 
     offload_arch_list, _ = get_offload_archs()
+    build_hk_gfx1250_hsaco(offload_arch_list)
 
     # flydsl 0.3.4.1 does support gfx1250: the four symbols the gfx1250 kernels need
     # (rocdl.WMMA, rocdl.make_tdm_atom, rocdl.tdm_ops, rocdl.ds_load_tr16_b128) are all
@@ -557,7 +609,7 @@ if __name__ == "__main__":
         long_description=(PROJECT_ROOT / "README.md").read_text(encoding="utf-8"),
         long_description_content_type="text/markdown",
         packages=find_packages(exclude=["tests", "tests.*"]),
-        package_data={"primus_turbo": ["lib/*.so"]},
+        package_data={"primus_turbo": ["lib/*.so", *hk_gfx1250_package_data()]},
         ext_modules=ext_modules,
         cmdclass={"build_ext": TurboBuildExt.with_options(use_ninja=True)},
         entry_points=entry_points,

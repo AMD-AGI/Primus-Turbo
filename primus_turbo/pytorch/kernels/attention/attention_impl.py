@@ -51,11 +51,23 @@ from primus_turbo.pytorch.kernels.attention.attention_hipkittens_impl import (
     flash_attn_sbhd_hipkittens_forward_impl,
     hipkittens_attn_supported_impl,
 )
+from primus_turbo.pytorch.kernels.attention.attention_hk_gfx1250_impl import (
+    flash_attn_hk_gfx1250_forward_impl,
+    hk_gfx1250_unsupported_reason,
+)
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     dense_forward as _triton_dense_forward,
 )
 
 _GFX950 = (9, 5)
+# HipKittens on gfx1250 (primus_turbo/hipkittens/gfx1250_attn) is selectable -- pinned with
+# PRIMUS_TURBO_ATTN_BACKEND=HIPKITTENS or GlobalBackendManager.set_attn_backend -- but neither the
+# default nor an autotune candidate: an unpinned call resolves to FLYDSL. True makes HIPKITTENS the
+# gfx1250 default for the head-dim-128 calls it accepts (resolve_flash_attn_backend), and lets autotune
+# time it on the calls whose forward HK runs itself (autotune times the forward only; the backward
+# follows the chosen family); the MLA head dims and the other archs keep FLYDSL. The one switch to
+# flip once the HK kernels are validated and pinned.
+HK_GFX1250_DEFAULT = False
 # Narrowest left window the FlyDSL backward is correct on. The kv band comes from the window
 # rounded down to a power of two, and the dQ reduce takes the low edge of a whole q BLOCK's
 # band range. Below BLOCK_Q=64 a band is narrower than the block, so odd bands start mid-block
@@ -323,13 +335,41 @@ class DenseAttnFwdFlydslBackend(KernelBackend):
         )
 
 
-class DenseAttnFwdHipkittensBackend(KernelBackend):
-    """HipKittens attention, gfx950 only.
+def _hk_gfx1250_ok(
+    q,
+    k,
+    v,
+    dropout_p,
+    softmax_scale,
+    causal,
+    window_size,
+    bias,
+    alibi_slopes,
+    sink,
+    return_softmax,
+) -> bool:
+    """Eligibility for HipKittens on gfx1250: exactly the calls of FlyDSL's head-dim-128 GQA kernels
+    (not the MLA head dims, which stay on FLYDSL). The HIP kernels take a subset of those; each custom
+    op of attention_hk_gfx1250_impl runs the rest of its direction on the FlyDSL gfx1250 kernels."""
+    if k is None or v is None or any(t.ndim != 4 for t in (q, k, v)) or is_mla_head_dims(q, k, v):
+        return False
+    return _flydsl_gfx1250_ok(
+        q, k, v, dropout_p, softmax_scale, causal, window_size, bias, alibi_slopes, sink, return_softmax
+    )
 
-    A narrow backend by construction: bf16, causal, sbhd, head dim 64 or 128, Sq <= Skv, no
-    sink and no varlen. Everything outside that is refused here rather than computed wrongly
+
+class DenseAttnFwdHipkittensBackend(KernelBackend):
+    """HipKittens attention.
+
+    gfx950: a narrow backend by construction: bf16, causal, sbhd, head dim 64 or 128, Sq <= Skv,
+    no sink and no varlen. Everything outside that is refused here rather than computed wrongly
     -- these kernels read out of bounds or leave output unwritten instead of failing -- so a
     shape that does not qualify falls back to whichever backend does.
+
+    gfx1250: the HIP kernels of primus_turbo/hipkittens/gfx1250_attn for head dim 128, any byte
+    order (made contiguous BSHD), taking every call FlyDSL's gfx1250 head-dim-128 kernels take
+    (_hk_gfx1250_ok); a direction the HIP kernels cannot run goes to those FlyDSL kernels. Not an
+    autotune candidate there until HK_GFX1250_DEFAULT (see tuning_kwargs).
     """
 
     @staticmethod
@@ -348,6 +388,20 @@ class DenseAttnFwdHipkittensBackend(KernelBackend):
         return_softmax=False,
         **kwargs,
     ) -> bool:
+        if is_gfx1250():
+            return _hk_gfx1250_ok(
+                q,
+                k,
+                v,
+                dropout_p,
+                softmax_scale,
+                causal,
+                window_size,
+                bias,
+                alibi_slopes,
+                sink,
+                return_softmax,
+            )
         # Same layout gate as FlyDSL: the kernels address sbhd and take the [s,b,h,d] view of
         # these [b,s,h,d]-shaped tensors with no copy, so the bytes have to already be in that
         # order. _sbhd_layout is what decides that, rather than a stride test, because at
@@ -374,7 +428,30 @@ class DenseAttnFwdHipkittensBackend(KernelBackend):
         return ok
 
     @staticmethod
+    def tuning_kwargs(**kwargs):
+        # gfx1250: a backend that raises here is never an autotune winner (AutoKernelDispatcher.tune).
+        # Until HK_GFX1250_DEFAULT, and for calls whose forward HK would hand to FlyDSL, timing this
+        # backend would time the FlyDSL kernels a second time, and a noise win would cache it.
+        if is_gfx1250():
+            if not HK_GFX1250_DEFAULT:
+                raise RuntimeError("HIPKITTENS on gfx1250 is not an autotune candidate (HK_GFX1250_DEFAULT)")
+            reason = hk_gfx1250_unsupported_reason(
+                "fwd",
+                kwargs["q"],
+                kwargs.get("k"),
+                kwargs.get("v"),
+                kwargs.get("causal", True),
+                softmax_scale=kwargs.get("softmax_scale"),
+            )
+            if reason is not None:
+                raise RuntimeError(f"HIPKITTENS on gfx1250 would run this forward on FlyDSL ({reason})")
+        return kwargs
+
+    @staticmethod
     def execute(q, k, v, softmax_scale, causal, window_size, return_lse=True, **kwargs):
+        if is_gfx1250():
+            out, lse = flash_attn_hk_gfx1250_forward_impl(q, k, v, softmax_scale, causal)
+            return (out, lse) if return_lse else out
         # Under autotune, off the op layer's path, so the sbhd view is taken here too.
         q, k, v = (t.permute(1, 0, 2, 3) for t in (q, k, v))
         res = flash_attn_sbhd_hipkittens_forward_impl(
@@ -398,8 +475,8 @@ class DenseAttnFwdTritonBackend(KernelBackend):
 
     The general dense backend on gfx1250 -- FlyDSL there covers only the DeepSeek-V3 MLA head
     dims and bf16 head_dim 128 without sink or window (q and k each at most 1 GiB), HipKittens
-    targets another arch, and the aiter path reaches CK, whose fmha backward rejects the call at
-    runtime after the forward has succeeded. Its gate is narrow by construction, matching what
+    there takes a subset of FlyDSL's head-dim-128 calls, and the aiter path reaches CK, whose fmha
+    backward rejects the call at runtime after the forward has succeeded. Its gate is narrow by construction, matching what
     the kernel asserts.
     """
 
@@ -719,7 +796,19 @@ class FlashAttnVarlenDispatcher(AutoKernelDispatcher):
 # =============================================================================
 
 
+def _default_backend(varlen: bool, **kwargs) -> BackendType:
+    """FLYDSL; HIPKITTENS for the gfx1250 dense calls it takes once HK_GFX1250_DEFAULT is True."""
+    if (
+        HK_GFX1250_DEFAULT
+        and not varlen
+        and is_gfx1250()
+        and DenseAttnFwdHipkittensBackend.can_handle(**kwargs)
+    ):
+        return BackendType.HIPKITTENS
+    return BackendType.FLYDSL
+
+
 def resolve_flash_attn_backend(varlen: bool, user_backend: Optional[BackendType], **kwargs) -> BackendType:
     """Resolve the dense/varlen flash-attn backend enum (default FLYDSL, else AITER)."""
     dispatcher = FlashAttnVarlenDispatcher if varlen else FlashAttnDenseDispatcher
-    return dispatcher.resolve(BackendType.FLYDSL, user_backend, **kwargs)
+    return dispatcher.resolve(_default_backend(varlen, **kwargs), user_backend, **kwargs)

@@ -27,3 +27,9 @@ prune .cursor
 
 global-exclude *.py[cod]
 global-exclude __pycache__
+
+# gfx1250 HipKittens attention: HIP sources and the code-object pins (setup.py builds bin/ from them);
+# hip/tests are development tests, not shipped.
+recursive-include primus_turbo/hipkittens/gfx1250_attn/hip *
+prune primus_turbo/hipkittens/gfx1250_attn/hip/tests
+include primus_turbo/hipkittens/gfx1250_attn/manifest.json
