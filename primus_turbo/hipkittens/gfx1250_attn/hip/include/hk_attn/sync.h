@@ -20,7 +20,8 @@ extern "C" __device__ void hka_llvm_s_wait_kmcnt(short) __asm("llvm.amdgcn.s.wai
 
 namespace hk_attn {
 
-// ---- counter waits (one s_wait_* each; N = outstanding ops of this wave left in flight) --------------
+// ---- counter waits (one s_wait_* each; N = outstanding ops of this wave left in flight)
+// --------------
 template <int N> HKA_DEV void wait_dscnt() {
     hka_llvm_s_wait_dscnt((short) N);
 } // LDS (ds_*) ops
@@ -38,8 +39,9 @@ template <int N> HKA_DEV void wait_asynccnt() {
 } // async LDS<->global copies
 // wait_tensorcnt<N>: tdm.h
 
-// ---- scheduling (compile-time only; no instruction) ------------------------------------------------------
-// llvm.amdgcn.sched_group_barrier / sched_barrier masks (AMDGPU IGroupLP SchedGroupMask)
+// ---- scheduling (compile-time only; no instruction)
+// ------------------------------------------------------ llvm.amdgcn.sched_group_barrier /
+// sched_barrier masks (AMDGPU IGroupLP SchedGroupMask)
 namespace sg {
 inline constexpr int NONE = 0x000, ALU = 0x001, VALU = 0x002, SALU = 0x004, WMMA = 0x008,
                      VMEM = 0x010, VMEM_READ = 0x020, VMEM_WRITE = 0x040, DS = 0x080,
@@ -49,7 +51,8 @@ inline constexpr int NONE = 0x000, ALU = 0x001, VALU = 0x002, SALU = 0x004, WMMA
 template <int MASK = 0> HKA_DEV void sched_barrier() {
     __builtin_amdgcn_sched_barrier(MASK);
 }
-// sched_group_barrier(MASK, N, ID): the next N instructions of class MASK form a group of pipeline ID
+// sched_group_barrier(MASK, N, ID): the next N instructions of class MASK form a group of pipeline
+// ID
 template <int MASK, int N, int ID = 0> HKA_DEV void sched_group_barrier() {
     __builtin_amdgcn_sched_group_barrier(MASK, N, ID);
 }
@@ -59,13 +62,15 @@ HKA_DEV void compiler_fence() {
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
 }
 // both: no instruction; no memory access crosses it at IR level and nothing crosses it in the
-// machine schedulers (e.g. between the protocol stores and the uncovered loads of split_signal_dscnt)
+// machine schedulers (e.g. between the protocol stores and the uncovered loads of
+// split_signal_dscnt)
 HKA_DEV void order_fence() {
     compiler_fence();
     sched_barrier<0>();
 }
 
-// ---- fences ------------------------------------------------------------------------------------------------
+// ---- fences
+// ------------------------------------------------------------------------------------------------
 // C11 memory orders as values (a fence is not an atomic operation)
 inline constexpr int MO_ACQUIRE = 2, MO_RELEASE = 3;
 // workgroup release fence restricted to LDS (MMRA "local"): `s_wait_dscnt 0` only -- in-flight
@@ -75,14 +80,15 @@ HKA_DEV void lds_release() {
     __builtin_amdgcn_fence(MO_RELEASE, "workgroup", "local");
 }
 // workgroup acquire fence on LDS (explicit opt-in; no split-barrier primitive uses it): emits
-// `s_wait_dscnt 0` whenever this wave has DS ops in flight (the fence must complete its paired load,
-// so LLVM drains every one), e.g. the loads issued between a split signal and its wait. Verified in
-// the disassembly (t_sync before the review fix; probe hk/lab/prims_rev/r_wait.hip).
+// `s_wait_dscnt 0` whenever this wave has DS ops in flight (the fence must complete its paired
+// load, so LLVM drains every one), e.g. the loads issued between a split signal and its wait.
+// Verified in the disassembly (t_sync before the review fix; probe hk/lab/prims_rev/r_wait.hip).
 HKA_DEV void lds_acquire() {
     __builtin_amdgcn_fence(MO_ACQUIRE, "workgroup", "local");
 }
 
-// ---- workgroup barrier (gfx12 split barrier, barrier id -1 = the workgroup barrier) --------------------
+// ---- workgroup barrier (gfx12 split barrier, barrier id -1 = the workgroup barrier)
+// --------------------
 HKA_DEV void barrier_signal() {
     __builtin_amdgcn_s_barrier_signal(-1);
 } // s_barrier_signal -1
@@ -90,10 +96,10 @@ HKA_DEV void barrier_wait() {
     __builtin_amdgcn_s_barrier_wait((short) -1);
 } // s_barrier_wait 0xffff
 // split barrier, LDS protocol: every LDS access of this wave before the signal is complete and
-// visible to every wave after its wait. Signal = s_wait_dscnt 0 + s_barrier_signal -1 (nothing else:
-// global loads / stores / atomics and TDM stay in flight). Between signal and wait any work that
-// does not touch the LDS the barrier protects may run; a DS load issued in that window must not
-// read bytes another wave writes after its wait (nothing orders the two).
+// visible to every wave after its wait. Signal = s_wait_dscnt 0 + s_barrier_signal -1 (nothing
+// else: global loads / stores / atomics and TDM stay in flight). Between signal and wait any work
+// that does not touch the LDS the barrier protects may run; a DS load issued in that window must
+// not read bytes another wave writes after its wait (nothing orders the two).
 HKA_DEV void split_signal_lds() {
     sched_barrier<0>();
     lds_release();
@@ -118,7 +124,8 @@ HKA_DEV void split_wait_lds() {
 // guarantee silently:
 //   * the machine scheduler moves a protocol store behind a load it provably does not alias;
 //   * IR passes sink a protocol store past the loads;
-//   * a load of bytes this wave just stored is forwarded (no instruction; t_sync reads another slot);
+//   * a load of bytes this wave just stored is forwarded (no instruction; t_sync reads another
+//   slot);
 //   * a load whose result is unused is deleted, a partly used b128 is narrowed (t_sync's first
 //     version became ds_load_b32), adjacent b32 / b64 loads merge into one ds_load_2addr_*.
 // Hence: order_fence() between the last protocol DS op and the uncovered loads; uncovered loads
@@ -148,7 +155,8 @@ HKA_DEV void lds_barrier() {
     split_wait_lds();
 }
 
-// ---- wave scheduling state ------------------------------------------------------------------------------
+// ---- wave scheduling state
+// ------------------------------------------------------------------------------
 // SCHED_MODE.DISABLE_XDL_ARB_STALL = 1 (s_setreg hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1): this
 // wave issues WMMAs back to back without yielding the pipe to co-resident waves. Kernel-lifetime;
 // HK kittens::sched::lock_simd == FlyDSL rocdl.disable_xdl_arb_stall (s_setreg 154).

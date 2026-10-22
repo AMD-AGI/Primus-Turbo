@@ -15,22 +15,22 @@
 
 namespace hk_attn {
 
-typedef __bf16                                   bf16;
-typedef __bf16                                   bf16x2 __attribute__((ext_vector_type(2)));
-typedef __bf16                                   bf16x8 __attribute__((ext_vector_type(8)));
-typedef __bf16                                   bf16x16 __attribute__((ext_vector_type(16)));
-typedef float                                    f32x2 __attribute__((ext_vector_type(2)));
-typedef float                                    f32x4 __attribute__((ext_vector_type(4)));
-typedef float                                    f32x8 __attribute__((ext_vector_type(8)));
-typedef uint32_t                                 u32x2 __attribute__((ext_vector_type(2)));
-typedef uint32_t                                 u32x4 __attribute__((ext_vector_type(4)));
-typedef uint32_t                                 u32x8 __attribute__((ext_vector_type(8)));
-typedef int32_t                                  i32x4 __attribute__((ext_vector_type(4)));
-typedef int32_t                                  i32x8 __attribute__((ext_vector_type(8)));
-typedef __amdgpu_buffer_rsrc_t                   rsrc_t;
+typedef __bf16                 bf16;
+typedef __bf16                 bf16x2 __attribute__((ext_vector_type(2)));
+typedef __bf16                 bf16x8 __attribute__((ext_vector_type(8)));
+typedef __bf16                 bf16x16 __attribute__((ext_vector_type(16)));
+typedef float                  f32x2 __attribute__((ext_vector_type(2)));
+typedef float                  f32x4 __attribute__((ext_vector_type(4)));
+typedef float                  f32x8 __attribute__((ext_vector_type(8)));
+typedef uint32_t               u32x2 __attribute__((ext_vector_type(2)));
+typedef uint32_t               u32x4 __attribute__((ext_vector_type(4)));
+typedef uint32_t               u32x8 __attribute__((ext_vector_type(8)));
+typedef int32_t                i32x4 __attribute__((ext_vector_type(4)));
+typedef int32_t                i32x8 __attribute__((ext_vector_type(8)));
+typedef __amdgpu_buffer_rsrc_t rsrc_t;
 typedef __attribute__((address_space(3))) unsigned char lds_u8;
-typedef __attribute__((address_space(3))) u32x4  lds_u32x4;
-typedef __attribute__((address_space(3))) bf16x8 lds_bf16x8;
+typedef __attribute__((address_space(3))) u32x4         lds_u32x4;
+typedef __attribute__((address_space(3))) bf16x8        lds_bf16x8;
 
 // A or B operand of v_wmma_f32_16x16x32_bf16 (8 VGPRs; layout.h op_k) and its C / D accumulator
 // (8 VGPRs; layout.h c_m / c_n)
@@ -48,7 +48,8 @@ template <int N, typename F> HKA_DEV void static_for(F &&f) {
     static_for_impl(static_cast<F &&>(f), std::make_integer_sequence<int, N>{});
 }
 
-// ---- vectors (register renames only; no instruction when the halves are adjacent VGPRs) ----------
+// ---- vectors (register renames only; no instruction when the halves are adjacent VGPRs)
+// ----------
 HKA_DEV bf16x16 cat(bf16x8 lo, bf16x8 hi) {
     return __builtin_shufflevector(lo, hi, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
 }
@@ -67,11 +68,12 @@ HKA_DEV acc_t zero_acc() {
     return acc_t{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 }
 
-// ---- fp32 -> bf16 (fptrunc, round to nearest even = v_cvt_pk_bf16_f32, one per element pair) ------
-// Packed per PAIR and kept in the integer domain until an operand is formed (cat_u32): a vector
-// fptrunc of 8 followed by the operand concat is canonicalised by InstCombine into fptrunc(concat),
-// which moves the conversions from the softmax that produces them to the head of the WMMA run that
-// consumes them (REF q1/prims.h cvt_bf16x8_u32). Dword j = bf16(c[2j]) | bf16(c[2j + 1]) << 16.
+// ---- fp32 -> bf16 (fptrunc, round to nearest even = v_cvt_pk_bf16_f32, one per element pair)
+// ------ Packed per PAIR and kept in the integer domain until an operand is formed (cat_u32): a
+// vector fptrunc of 8 followed by the operand concat is canonicalised by InstCombine into
+// fptrunc(concat), which moves the conversions from the softmax that produces them to the head of
+// the WMMA run that consumes them (REF q1/prims.h cvt_bf16x8_u32). Dword j = bf16(c[2j]) |
+// bf16(c[2j + 1]) << 16.
 HKA_DEV uint32_t cvt_pk_bf16(float lo, float hi) {
     return __builtin_bit_cast(uint32_t, __builtin_convertvector(f32x2{lo, hi}, bf16x2));
 }
@@ -80,15 +82,18 @@ HKA_DEV u32x4 cvt_pk_bf16(acc_t c) {
                  cvt_pk_bf16(c[6], c[7])};
 }
 
-// ---- identity -------------------------------------------------------------------------------------
-// lane index (v_and_b32 of the 1-D workitem id; blocks are 1-D)
+// ---- identity
+// ------------------------------------------------------------------------------------- lane index
+// (v_and_b32 of the 1-D workitem id; blocks are 1-D)
 HKA_DEV int lane_id() {
     return (int) __builtin_amdgcn_workitem_id_x() & (lay::WAVE - 1);
 }
 // wave index in the workgroup as a uniform SGPR (v_readfirstlane_b32 + s_lshr_b32; an unsigned
 // shift, so LLVM knows it is non-negative when it appears in a buffer offset)
 HKA_DEV int wave_id() {
-    return (int) ((uint32_t) __builtin_amdgcn_readfirstlane((int) __builtin_amdgcn_workitem_id_x()) >> 5);
+    return (
+        int) ((uint32_t) __builtin_amdgcn_readfirstlane((int) __builtin_amdgcn_workitem_id_x()) >>
+              5);
 }
 // v_readfirstlane_b32: declares x wave-uniform (it must be: lanes other than the first are dropped)
 HKA_DEV int uniform(int x) {

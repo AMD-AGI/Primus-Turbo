@@ -24,13 +24,14 @@
 // REUSE_A (REUSE_B) from the second WMMA of a run with a fixed A (B) operand on. UNVERIFIED: the
 // bit's direction (same operand as the PREVIOUS WMMA, or kept for the NEXT one) and whether the
 // hardware trusts it or checks the registers. LLVM does not keep hinted runs adjacent: without
-// fences the scheduler interleaved both t_wmma runs (every reuse_b and the last reuse_a WMMA followed
-// one with different operand registers); dsv3 p2_x12 saw ~200 such reordered hints with bitwise
-// identical results. t_wmma now fences the order: c4 adjacent (each hinted WMMA follows one with the
-// same B) and c5 interleaved with c0..c3 (each follows one with a different A); test_prims's ISA
-// check isa_reuse_hints requires both patterns. No measured speed benefit on a pure WMMA stream
-// (p1_research: 8.00 vs 8.00 cycles), so kernels keep REUSE_A = REUSE_B = false at least until the
-// GPU t_wmma run passes (and then list their hinted WMMAs with test_prims.reuse_hint_pairs).
+// fences the scheduler interleaved both t_wmma runs (every reuse_b and the last reuse_a WMMA
+// followed one with different operand registers); dsv3 p2_x12 saw ~200 such reordered hints with
+// bitwise identical results. t_wmma now fences the order: c4 adjacent (each hinted WMMA follows one
+// with the same B) and c5 interleaved with c0..c3 (each follows one with a different A);
+// test_prims's ISA check isa_reuse_hints requires both patterns. No measured speed benefit on a
+// pure WMMA stream (p1_research: 8.00 vs 8.00 cycles), so kernels keep REUSE_A = REUSE_B = false at
+// least until the GPU t_wmma run passes (and then list their hinted WMMAs with
+// test_prims.reuse_hint_pairs).
 #pragma once
 #include "types.h"
 
@@ -43,8 +44,7 @@ HKA_DEV acc_t wmma(opnd_t a, opnd_t b, acc_t c) {
 }
 
 // D = A B with C = 0 (the zero accumulator is an inline constant: `v_wmma ..., 0`)
-template <bool REUSE_A = false, bool REUSE_B = false>
-HKA_DEV acc_t wmma0(opnd_t a, opnd_t b) {
+template <bool REUSE_A = false, bool REUSE_B = false> HKA_DEV acc_t wmma0(opnd_t a, opnd_t b) {
     return wmma<REUSE_A, REUSE_B>(a, b, zero_acc());
 }
 

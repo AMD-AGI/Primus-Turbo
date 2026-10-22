@@ -23,8 +23,8 @@
 #pragma once
 #include "frag.h"
 #include "gmem.h"
-#include "lds.h"
 #include "layout.h"
+#include "lds.h"
 #include "sync.h"
 #include "tdm.h"
 #include "types.h"

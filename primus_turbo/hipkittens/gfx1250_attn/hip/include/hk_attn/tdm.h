@@ -9,7 +9,8 @@
 //
 // Descriptor (D#), field layout as REF k_dkdv96ds / dqds and HK tdm.cuh build_tdm_descriptor_2d
 // (both proven on this GPU) and FlyDSL tdm_ops.make_tensor_descriptor_2d:
-//   group 0 (4 SGPRs, per tile): w0 = pred (1 issue, 0 = NULL descriptor: moves nothing; tdm_g0_null),
+//   group 0 (4 SGPRs, per tile): w0 = pred (1 issue, 0 = NULL descriptor: moves nothing;
+//   tdm_g0_null),
 //     w1 = LDS byte address, w2 = global byte address [31:0], w3 = address [56:32] | type 2 << 30
 //   group 1 (8 SGPRs, loop-invariant): w0 = data_size / pad (layout.h tdm_w0),
 //     w1 = tensor_dim0[15:0] << 16, w2 = tensor_dim0[31:16] | tensor_dim1[15:0] << 16,
@@ -38,10 +39,11 @@ namespace hk_attn {
 // static description of a 2-D tile of TILE_ROWS x TILE_COLS elements of ELEM_B bytes landing in LDS
 // with row pitch PITCH_B bytes
 template <int TILE_ROWS, int TILE_COLS, int PITCH_B, int ELEM_B = 2> struct tdm_tile {
-    static_assert(lay::tdm_tile_ok(TILE_COLS, PITCH_B, ELEM_B),
-                  "TDM tile: row bytes a power of two in [8, 1024], pad a multiple of 4 B <= 512 B");
+    static_assert(
+        lay::tdm_tile_ok(TILE_COLS, PITCH_B, ELEM_B),
+        "TDM tile: row bytes a power of two in [8, 1024], pad a multiple of 4 B <= 512 B");
     static_assert(TILE_ROWS > 0 && TILE_ROWS < 65536, "tile_dim1 is 16 bits");
-    static constexpr int      rows  = TILE_ROWS, cols = TILE_COLS, pitch = PITCH_B;
+    static constexpr int      rows = TILE_ROWS, cols = TILE_COLS, pitch = PITCH_B;
     static constexpr int      bytes = TILE_ROWS * PITCH_B; // LDS footprint
     static constexpr uint32_t w0    = lay::tdm_w0(TILE_COLS, PITCH_B, ELEM_B);
 };
@@ -50,7 +52,9 @@ template <int TILE_ROWS, int TILE_COLS, int PITCH_B, int ELEM_B = 2> struct tdm_
 // [0, T::rows]); tensor_dim0 = T::cols
 template <typename T> HKA_DEV u32x8 tdm_g1(int64_t stride_el, int rows_valid) {
     const uint32_t d0 = (uint32_t) T::cols;
-    const uint32_t d1 = (uint32_t) (rows_valid < 0 ? 0 : rows_valid > T::rows ? T::rows : rows_valid);
+    const uint32_t d1 = (uint32_t) (rows_valid < 0         ? 0
+                                    : rows_valid > T::rows ? T::rows
+                                                           : rows_valid);
     const uint64_t st = (uint64_t) stride_el;
     return u32x8{T::w0,
                  (d0 & 0xFFFFu) << 16,
@@ -63,17 +67,18 @@ template <typename T> HKA_DEV u32x8 tdm_g1(int64_t stride_el, int rows_valid) {
 }
 // group 0: one tile at global byte address `gaddr` into LDS byte address `lds`; pred 0 = NULL
 HKA_DEV u32x4 tdm_g0(uint32_t lds, uint64_t gaddr, uint32_t pred = 1u) {
-    return u32x4{pred, lds, (uint32_t) gaddr, ((uint32_t) (gaddr >> 32) & 0x01FFFFFFu) | (2u << 30)};
+    return u32x4{pred, lds, (uint32_t) gaddr,
+                 ((uint32_t) (gaddr >> 32) & 0x01FFFFFFu) | (2u << 30)};
 }
 // NULL descriptor (pred 0): moves no memory (HK tdm.cuh count == 0); the branch-free way to skip a
 // tail transfer (a TDM instruction cannot be EXEC-masked). Evidence on this GPU: HK GEMM rung 07
 // (count = 0 tail, wait_tdm<0> at the end) and dsv3 x6 m2d (waves 1..3 issue NULL ops; correct,
 // completes), both with the real tile address in the descriptor; t_prims t_tdm_null checks it.
-// `gaddr` must therefore be the address of a READABLE tile (e.g. the one the slot would have loaded,
-// clamped to the tensor) and g1's tensor_dim1 must keep it inside the allocation: an engine that
-// ignored pred would then copy valid bytes, never fault. Whether a NULL op occupies a TENSORCNT slot
-// is UNVERIFIED (not observable without a race): never let a partial s_wait_tensorcnt N depend on it
-// (wait counts must be right whether or not a NULL op counts).
+// `gaddr` must therefore be the address of a READABLE tile (e.g. the one the slot would have
+// loaded, clamped to the tensor) and g1's tensor_dim1 must keep it inside the allocation: an engine
+// that ignored pred would then copy valid bytes, never fault. Whether a NULL op occupies a
+// TENSORCNT slot is UNVERIFIED (not observable without a race): never let a partial
+// s_wait_tensorcnt N depend on it (wait counts must be right whether or not a NULL op counts).
 HKA_DEV u32x4 tdm_g0_null(uint32_t lds, uint64_t gaddr) {
     return tdm_g0(lds, gaddr, 0u);
 }
@@ -86,8 +91,8 @@ HKA_DEV uint64_t tdm_gaddr(const void *base, int64_t row, int64_t row_el, int64_
 HKA_DEV void tdm_load(u32x4 g0, u32x8 g1) {
     const i32x4 z4 = {0, 0, 0, 0};
     const i32x8 z8 = {0, 0, 0, 0, 0, 0, 0, 0};
-    __builtin_amdgcn_tensor_load_to_lds(__builtin_bit_cast(i32x4, g0), __builtin_bit_cast(i32x8, g1),
-                                        z4, z4, z8, 0);
+    __builtin_amdgcn_tensor_load_to_lds(__builtin_bit_cast(i32x4, g0),
+                                        __builtin_bit_cast(i32x8, g1), z4, z4, z8, 0);
 }
 // s_wait_tensorcnt N: all but the N newest TDM ops of this wave retired (their LDS writes visible
 // to this wave; other waves additionally need a barrier)
