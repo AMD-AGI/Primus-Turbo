@@ -286,7 +286,7 @@ def dispatch_gemm_nt_gfx1250(
     num_dispatch_cu: int = 64,
     tile_m: int = 256,
     tile_n: int = 256,
-    tile_k: int = 128,
+    tile_k: int = 0,
     m_warp: int = 2,
     n_warp: int = 2,
     group_m: int = 16,
@@ -296,7 +296,8 @@ def dispatch_gemm_nt_gfx1250(
 
     ``handle`` comes from ``dispatch_prologue_flydsl_kernel`` on the active Mega symmetric
     buffer; the output is ``[pool rows, N]`` in pool order, padding rows undefined. ``w1`` is
-    ``[experts, N, hidden]``, or ``[experts, hidden, N]`` with ``b_nn`` (``out = x @ w1[e]``)."""
+    ``[experts, N, hidden]``, or ``[experts, hidden, N]`` with ``b_nn`` (``out = x @ w1[e]``).
+    ``tile_k`` 0 is 128 when it divides hidden, else 64."""
     return _run(x, w1, handle, False, b_nn, num_dispatch_cu, tile_m, tile_n, tile_k, m_warp, n_warp, group_m)
 
 
@@ -307,7 +308,7 @@ def dispatch_only_gfx1250(x: torch.Tensor, handle: DispatchHandle, *, num_dispat
     G = handle.expert_send_dst_rank.numel() // int(symm.num_ranks)
     # only the GEMM's shape is read: the launch holds the comm workgroups alone
     shape_only = x.new_empty(x.shape[1]).as_strided((G, 256, x.shape[1]), (0, 0, 1))
-    _run(x, shape_only, handle, True, False, num_dispatch_cu, 256, 256, 128, 2, 2, 16)
+    _run(x, shape_only, handle, True, False, num_dispatch_cu, 256, 256, 0, 2, 2, 16)
     return pool_rows_of(symm.dispatch_token_buffer, handle)
 
 
@@ -324,6 +325,7 @@ def _run(x, w1, handle, dispatch_only, b_nn, num_dispatch_cu, tile_m, tile_n, ti
     if b_nn:
         K, N = N, K
         assert N >= tile_n, "an NN block backs its B read off into the row, so N >= tile_n"
+    tile_k = tile_k or (128 if K % 128 == 0 else 64)
     assert x.dtype == w1.dtype == torch.bfloat16 and x.is_contiguous()
     assert dispatch_only or w1.is_contiguous()
     assert K == x.shape[1] == int(symm.hidden), "w1 K, x hidden and the symmetric buffer's hidden must agree"

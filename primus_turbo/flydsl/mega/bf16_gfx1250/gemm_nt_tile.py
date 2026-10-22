@@ -581,7 +581,7 @@ def mega_grouped_gemm_nt_gfx1250(
     *,
     tile_m: int = 256,
     tile_n: int = 256,
-    tile_k: int = 128,
+    tile_k: int = 0,
     m_warp: int = 2,
     n_warp: int = 2,
     group_m: int = 16,
@@ -594,6 +594,7 @@ def mega_grouped_gemm_nt_gfx1250(
     ``out`` is the pool, ``[num_pool_rows, N]`` with ``num_pool_rows`` a multiple of ``tile_m``;
     pool block ``t`` belongs to expert ``tile_to_expert[t]``, and only the first
     ``num_tile_blocks[0]`` blocks are computed. ``row_idx`` entries < 0 mark padding rows.
+    ``tile_k`` 0 is 128 when it divides K, else 64.
     """
     _require_gfx1250(a.device)
     G, N, K = b.shape
@@ -601,6 +602,7 @@ def mega_grouped_gemm_nt_gfx1250(
         K, N = N, K
         assert N >= tile_n, "an NN block backs its B read off into the row, so N >= tile_n"
     pool_rows = out.shape[0]
+    tile_k = tile_k or (128 if K % 128 == 0 else 64)
     assert a.dtype == b.dtype == out.dtype == torch.bfloat16
     assert a.shape[1] == K and out.shape[1] == N and pool_rows % tile_m == 0
     assert K % tile_k == 0 and K // tile_k >= NUM_BUFFERS, "K must be a whole number of >= 2 k-tiles"

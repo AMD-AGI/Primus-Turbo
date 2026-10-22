@@ -130,49 +130,13 @@ class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
 
 
 def _backward_gfx1250(dy, saved_x, l1_out, dispatch_weights, w1, w2, topk_idx, handle, activation):
-    """The same five steps on the gfx1250 kernels: the two dgrad GEMMs read the weight NN as
-    stored, and the wgrads take both operands in pool order, ordered so the result lands in the
-    weight's own layout (no ``trans_c``)."""
-    from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
-        grouped_gemm_bf16_variable_k_flydsl_kernel as variable_k_gfx1250,
-    )
-    from primus_turbo.flydsl.mega.bf16.symm_buffer import get_symm_buffer_for_mega_moe
-    from primus_turbo.flydsl.mega.bf16_gfx1250.dispatch_gemm_kernel import (
-        dispatch_gemm_nt_gfx1250,
-        dispatch_only_gfx1250,
-        pool_rows_of,
-    )
-    from primus_turbo.flydsl.mega.bf16_gfx1250.gemm_combine_kernel import (
-        gemm_combine_nt_gfx1250,
+    from primus_turbo.pytorch.kernels.fused_mega_moe import (
+        fused_mega_moe_gfx1250_impl as gfx1250,
     )
 
-    symm = get_symm_buffer_for_mega_moe()
-    prefix, counts = handle.num_tokens_per_expert_prefix, handle.num_tokens_per_expert
-
-    # L2 dgrad: dispatch dy, grad_act = dy @ w2[e]
-    grad_act = dispatch_gemm_nt_gfx1250(dy, w2, handle, b_nn=True)
-    dy_pool = pool_rows_of(symm.dispatch_token_buffer, handle)
-
-    grad_l1, grad_gate, act_weighted = swiglu_backward_flydsl_kernel(
-        grad_act,
-        l1_out,
-        scale=dispatch_weights,
-        return_gate=True,
-        return_act_w=True,
-        num_tile_blocks=handle.num_tile_blocks,
-        activation=activation,
-    )
-
-    # dW2[e] = dy_pool[e].T @ act_w[e]  -> [E, hidden, inter]
-    dW2 = variable_k_gfx1250(dy_pool, act_weighted, prefix, masked_k=counts)
-
-    # L1 dgrad + combine + dx reduce + grad_gate: dx = grad_l1 @ w1[e]
-    dx, grad_topk_weights = gemm_combine_nt_gfx1250(grad_l1, w1, handle, topk_idx, grad_gate=grad_gate, b_nn=True)
-
-    # dW1[e] = grad_l1[e].T @ x_pool[e]  -> [E, 2 * inter, hidden]; x is dispatched again
-    x_pool = dispatch_only_gfx1250(saved_x.contiguous(), handle)
-    dW1 = variable_k_gfx1250(grad_l1, x_pool, prefix, masked_k=counts)
-    return dx, grad_topk_weights, dW1.to(w1.dtype), dW2.to(w2.dtype)
+    grad_l1, grad_gate, dW2, _, _ = gfx1250.stage2_backward(dy, l1_out, dispatch_weights, w2, handle, activation)
+    dx, grad_topk_weights, dW1 = gfx1250.stage1_backward(grad_l1, saved_x, w1, handle, topk_idx, grad_gate)
+    return dx, grad_topk_weights, dW1, dW2
 
 
 _FUSED_MEGA_MOE_BACKWARD_BACKENDS = {
