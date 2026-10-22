@@ -119,10 +119,20 @@ def test_fused_mega_moe_forward_ep1(ep1_group, num_tokens, hidden, inter, num_ex
         (512, 2048, 1408, 16, 4, "swigluoai"),
     ],
 )
-def test_fused_mega_moe_backward_ep1(ep1_group, num_tokens, hidden, inter, num_experts, num_topk, activation):
+@pytest.mark.parametrize("enable_torch_compile", [False, True])
+def test_fused_mega_moe_backward_ep1(
+    ep1_group, num_tokens, hidden, inter, num_experts, num_topk, activation, enable_torch_compile
+):
     from primus_turbo.pytorch.ops.moe.fused_mega_moe import fused_mega_moe
 
     activation = GLUActivation.swigluoai() if activation == "swigluoai" else None
+    torch._dynamo.reset()
+
+    def run(x, topk_idx, topk_w, w1, w2):
+        return fused_mega_moe(ep1_group, x, topk_idx, topk_w, w1, w2, activation=activation)
+
+    if enable_torch_compile:
+        run = torch.compile(run)
     torch.manual_seed(num_tokens)
     w1 = (torch.randn(num_experts, 2 * inter, hidden, device="cuda") * 2 / hidden**0.5).to(torch.bfloat16)
     w2 = (torch.randn(num_experts, hidden, inter, device="cuda") * 2 / inter**0.5).to(torch.bfloat16)
@@ -131,7 +141,7 @@ def test_fused_mega_moe_backward_ep1(ep1_group, num_tokens, hidden, inter, num_e
         topk_w, topk_idx = torch.randn(num_tokens, num_experts, device="cuda").softmax(-1).topk(num_topk, dim=-1)
         dy = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
         leaves = [t.clone().requires_grad_() for t in (x, topk_w, w1, w2)]
-        fused_mega_moe(ep1_group, leaves[0], topk_idx, *leaves[1:], activation=activation).backward(dy)
+        run(leaves[0], topk_idx, *leaves[1:]).backward(dy)
         refs = [t.detach().float().requires_grad_() for t in (x, topk_w, w1, w2)]
         _reference(refs[0], topk_idx, *refs[1:], activation).backward(dy.float())
         for name, got, want in zip(("dx", "d topk_w", "dW1", "dW2"), leaves, refs):
