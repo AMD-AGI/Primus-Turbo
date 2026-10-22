@@ -4,10 +4,11 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""The fused Mega MoE forward op on gfx1250, one GPU (EP1), against torch.
+"""The fused Mega MoE op on gfx1250, one GPU (EP1), against torch.
 
-``fused_mega_moe`` routes to the gfx1250 kernels there: dispatch + L1 GEMM, SwiGLU with the routing
-weight, L2 GEMM + combine + reduce. Forward only -- the gfx1250 backward is not wired yet.
+``fused_mega_moe`` routes to the gfx1250 kernels there. Forward: dispatch + L1 GEMM, SwiGLU with
+the routing weight, L2 GEMM + combine + reduce. Backward: dispatch dy + L2 dgrad, SwiGLU backward,
+the two wgrads, L1 dgrad + combine + reduce with the routing-weight gradient.
 """
 
 import os
@@ -43,13 +44,14 @@ def ep1_group():
 
 
 def _reference(x, topk_idx, topk_w, w1, w2, activation):
+    """fp32, differentiable in every input but ``topk_idx``."""
     inter = w2.shape[2]
     y = torch.zeros(x.shape[0], w2.shape[1], device=x.device)
     for e in range(w1.shape[0]):
         t, k = (topk_idx == e).nonzero(as_tuple=True)
         if not t.numel():
             continue
-        l1 = x[t].float() @ w1[e].float().T
+        l1 = x[t] @ w1[e].T
         gate, up = l1[:, :inter], l1[:, inter:]
         if activation is None:
             act = F.silu(gate) * up
@@ -59,8 +61,12 @@ def _reference(x, topk_idx, topk_w, w1, w2, activation):
             if a.up_clamp is not None:
                 up = up.clamp(-a.up_clamp, a.up_clamp)
             act = gate * torch.sigmoid(a.alpha * gate) * (up + a.glu_offset)
-        y.index_add_(0, t, (act * topk_w[t, k, None]) @ w2[e].float().T)
+        y = y.index_add(0, t, (act * topk_w[t, k, None]) @ w2[e].T)
     return y
+
+
+def _snr(got, want):
+    return -20 * torch.log10((got.float() - want).norm() / want.norm()).item()
 
 
 @pytest.mark.parametrize(
@@ -84,6 +90,33 @@ def test_fused_mega_moe_forward_ep1(ep1_group, num_tokens, hidden, inter, num_ex
         topk_w, topk_idx = torch.randn(num_tokens, num_experts, device="cuda").softmax(-1).topk(num_topk, dim=-1)
         with torch.no_grad():
             y = fused_mega_moe(ep1_group, x, topk_idx, topk_w, w1, w2, activation=activation)
-        ref = _reference(x, topk_idx, topk_w, w1, w2, activation)
-        snr = -20 * torch.log10((y.float() - ref).norm() / ref.norm()).item()
-        assert snr > 40, f"SNR {snr:.1f} dB"
+        ref = _reference(x.float(), topk_idx, topk_w, w1.float(), w2.float(), activation)
+        assert (snr := _snr(y, ref)) > 40, f"SNR {snr:.1f} dB"
+
+
+@pytest.mark.parametrize(
+    "num_tokens, hidden, inter, num_experts, num_topk, activation",
+    [
+        (1024, 7168, 2048, 32, 8, None),
+        (333, 2048, 1408, 16, 4, None),  # ragged tokens, a different hidden and K
+        (512, 2048, 1408, 16, 4, "swigluoai"),
+    ],
+)
+def test_fused_mega_moe_backward_ep1(ep1_group, num_tokens, hidden, inter, num_experts, num_topk, activation):
+    from primus_turbo.flydsl.utils.glu_activation import GLUActivation
+    from primus_turbo.pytorch.ops.moe.fused_mega_moe import fused_mega_moe
+
+    activation = GLUActivation.swigluoai() if activation == "swigluoai" else None
+    torch.manual_seed(num_tokens)
+    w1 = (torch.randn(num_experts, 2 * inter, hidden, device="cuda") * 2 / hidden**0.5).to(torch.bfloat16)
+    w2 = (torch.randn(num_experts, hidden, inter, device="cuda") * 2 / inter**0.5).to(torch.bfloat16)
+    for _ in range(2):
+        x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+        topk_w, topk_idx = torch.randn(num_tokens, num_experts, device="cuda").softmax(-1).topk(num_topk, dim=-1)
+        dy = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+        leaves = [t.clone().requires_grad_() for t in (x, topk_w, w1, w2)]
+        fused_mega_moe(ep1_group, leaves[0], topk_idx, *leaves[1:], activation=activation).backward(dy)
+        refs = [t.detach().float().requires_grad_() for t in (x, topk_w, w1, w2)]
+        _reference(refs[0], topk_idx, *refs[1:], activation).backward(dy.float())
+        for name, got, want in zip(("dx", "d topk_w", "dW1", "dW2"), leaves, refs):
+            assert (snr := _snr(got.grad, want.grad)) > 40, f"{name} SNR {snr:.1f} dB"

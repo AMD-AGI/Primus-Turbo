@@ -104,6 +104,7 @@ def _launch_dispatch_gemm_nt(
     n_warp: Constexpr[int],
     group_m: Constexpr[int],
     idx_bits: Constexpr[int],
+    DISPATCH_ONLY: Constexpr[bool],
 ):
     block = m_warp * n_warp * WAVE
     arena_bytes = tile_geometry(tile_m, tile_n, tile_k)[3]
@@ -261,7 +262,11 @@ def _launch_dispatch_gemm_nt(
         arg_parity,
         arg_expected,
         sym_buffer,
-    ).launch(grid=(NUM_DISPATCH_CU + MAX_TILES * N_BLOCKS_N, 1, 1), block=(block, 1, 1), stream=stream)
+    ).launch(
+        grid=(NUM_DISPATCH_CU + (0 if DISPATCH_ONLY else MAX_TILES * N_BLOCKS_N), 1, 1),
+        block=(block, 1, 1),
+        stream=stream,
+    )
 
 
 _launch_dispatch_gemm_nt.compile_hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": True}
@@ -287,10 +292,32 @@ def dispatch_gemm_nt_gfx1250(
 
     ``handle`` comes from ``dispatch_prologue_flydsl_kernel`` on the active Mega symmetric
     buffer; the output is ``[pool rows, N]`` in pool order, padding rows undefined."""
+    return _run(x, w1, handle, False, num_dispatch_cu, tile_m, tile_n, tile_k, m_warp, n_warp, group_m)
+
+
+def dispatch_only_gfx1250(x: torch.Tensor, handle: DispatchHandle, *, num_dispatch_cu: int = 64) -> torch.Tensor:
+    """Dispatch ``x`` by ``handle`` and return its rows in pool order (``[pool rows, hidden]``,
+    padding rows hold some received token)."""
+    symm = get_symm_buffer_for_mega_moe()
+    G = handle.expert_send_dst_rank.numel() // int(symm.num_ranks)
+    # only the GEMM's shape is read: the launch holds the comm workgroups alone
+    shape_only = x.new_empty(x.shape[1]).as_strided((G, 256, x.shape[1]), (0, 0, 1))
+    _run(x, shape_only, handle, True, num_dispatch_cu, 256, 256, 128, 2, 2, 16)
+    return pool_rows_of(symm.dispatch_token_buffer, handle)
+
+
+def pool_rows_of(token_buffer: torch.Tensor, handle: DispatchHandle) -> torch.Tensor:
+    """The dispatch token buffer's rows gathered into pool order; padding rows read the last row."""
+    idx = handle.pool_row_to_recv_token[: handle.pool_row_to_route.numel()].long()
+    return token_buffer[idx.clamp_(max=token_buffer.shape[0] - 1)]
+
+
+def _run(x, w1, handle, dispatch_only, num_dispatch_cu, tile_m, tile_n, tile_k, m_warp, n_warp, group_m):
     _require_gfx1250(x.device)
     symm = get_symm_buffer_for_mega_moe()
     G, N, K = w1.shape
-    assert x.dtype == w1.dtype == torch.bfloat16 and x.is_contiguous() and w1.is_contiguous()
+    assert x.dtype == w1.dtype == torch.bfloat16 and x.is_contiguous()
+    assert dispatch_only or w1.is_contiguous()
     assert K == x.shape[1] == int(symm.hidden), "w1 K, x hidden and the symmetric buffer's hidden must agree"
     assert tile_m == BLOCK_M, "a GEMM tile is one Mega pool block"
     assert K % tile_k == 0 and K // tile_k >= NUM_BUFFERS, "K must be a whole number of >= 2 k-tiles"
@@ -301,7 +328,7 @@ def dispatch_gemm_nt_gfx1250(
     a_rows = int(symm.num_max_recv_tokens)
     # the prologue marks padding rows with a_rows, out of range for the TDM gather
     idx_bits = 16 if a_rows < 0xFFFF else 32
-    out = torch.empty((handle.pool_row_to_route.numel(), N), dtype=x.dtype, device=x.device)
+    out = x.new_empty((0, N) if dispatch_only else (handle.pool_row_to_route.numel(), N))
     args = (
         _as_ptr(out),
         _as_ptr(x),
@@ -337,6 +364,7 @@ def dispatch_gemm_nt_gfx1250(
         n_warp,
         group_m,
         idx_bits,
+        dispatch_only,
     )
     key = args[_CONSTEXPR0:]
     fn = _COMPILED.get(key)

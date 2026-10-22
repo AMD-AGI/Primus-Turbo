@@ -32,6 +32,7 @@ from primus_turbo.pytorch.core.backend import (
     KernelBackend,
     TuneCache,
 )
+from primus_turbo.pytorch.core.utils import is_gfx1250
 
 _SUPPORTED_DTYPES = (torch.bfloat16,)
 
@@ -70,6 +71,8 @@ class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
     ):
         handle = DispatchHandle(*handle)
         dy = grad_y.contiguous().to(torch.bfloat16)
+        if is_gfx1250():
+            return _backward_gfx1250(dy, saved_x, l1_out, dispatch_weights, w1, w2, topk_idx, handle, activation)
 
         # L2 dgrad: cross-rank dispatch PUSH + grouped GEMM (nn)
         grad_swiglu, dispatch_l2_grad, _ = dispatch_grouped_gemm_bf16_flydsl_kernel(
@@ -124,6 +127,54 @@ class FusedMegaMoEBackwardFlyDSLBackend(KernelBackend):
         # reshape the combine-reduce gate output to [num_tokens, num_topk]
         grad_topk_weights = grad_topk_weights_flat.view(num_tokens, num_topk)
         return dx, grad_topk_weights, dW1.to(w1.dtype), dW2.to(w2.dtype)
+
+
+def _backward_gfx1250(dy, saved_x, l1_out, dispatch_weights, w1, w2, topk_idx, handle, activation):
+    """The same five steps on the gfx1250 kernels, which are NT only: the two NN GEMMs run on a
+    transposed copy of the weight, and the wgrads take both operands in pool order, ordered so
+    the result lands in the weight's own layout (no ``trans_c``)."""
+    from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
+        grouped_gemm_bf16_variable_k_flydsl_kernel as variable_k_gfx1250,
+    )
+    from primus_turbo.flydsl.mega.bf16.symm_buffer import get_symm_buffer_for_mega_moe
+    from primus_turbo.flydsl.mega.bf16_gfx1250.dispatch_gemm_kernel import (
+        dispatch_gemm_nt_gfx1250,
+        dispatch_only_gfx1250,
+        pool_rows_of,
+    )
+    from primus_turbo.flydsl.mega.bf16_gfx1250.gemm_combine_kernel import (
+        gemm_combine_nt_gfx1250,
+    )
+
+    symm = get_symm_buffer_for_mega_moe()
+    prefix, counts = handle.num_tokens_per_expert_prefix, handle.num_tokens_per_expert
+
+    # L2 dgrad: dispatch dy, grad_act = dy @ w2[e]
+    grad_act = dispatch_gemm_nt_gfx1250(dy, w2.transpose(1, 2).contiguous(), handle)
+    dy_pool = pool_rows_of(symm.dispatch_token_buffer, handle)
+
+    grad_l1, grad_gate, act_weighted = swiglu_backward_flydsl_kernel(
+        grad_act,
+        l1_out,
+        scale=dispatch_weights,
+        return_gate=True,
+        return_act_w=True,
+        num_tile_blocks=handle.num_tile_blocks,
+        activation=activation,
+    )
+
+    # dW2[e] = dy_pool[e].T @ act_w[e]  -> [E, hidden, inter]
+    dW2 = variable_k_gfx1250(dy_pool, act_weighted, prefix, masked_k=counts)
+
+    # L1 dgrad + combine + dx reduce + grad_gate: dx = grad_l1 @ w1[e]
+    dx, grad_topk_weights = gemm_combine_nt_gfx1250(
+        grad_l1, w1.transpose(1, 2).contiguous(), handle, topk_idx, grad_gate=grad_gate
+    )
+
+    # dW1[e] = grad_l1[e].T @ x_pool[e]  -> [E, 2 * inter, hidden]; x is dispatched again
+    x_pool = dispatch_only_gfx1250(saved_x.contiguous(), handle)
+    dW1 = variable_k_gfx1250(grad_l1, x_pool, prefix, masked_k=counts)
+    return dx, grad_topk_weights, dW1.to(w1.dtype), dW2.to(w2.dtype)
 
 
 _FUSED_MEGA_MOE_BACKWARD_BACKENDS = {

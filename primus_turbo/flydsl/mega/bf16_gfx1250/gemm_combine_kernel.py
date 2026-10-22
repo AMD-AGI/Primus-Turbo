@@ -101,6 +101,8 @@ def _launch_gemm_combine_nt(
     arg_combine_expected: fx.Pointer,
     arg_reduce_expected: fx.Pointer,
     arg_chunk_counter: fx.Pointer,
+    arg_grad_gate: fx.Pointer,
+    arg_grad_topk_weights: fx.Pointer,
     sym_buffer,
     stream: fx.Stream,
     N: Constexpr[int],
@@ -120,6 +122,7 @@ def _launch_gemm_combine_nt(
     tile_k: Constexpr[int],
     m_warp: Constexpr[int],
     n_warp: Constexpr[int],
+    HAS_GRAD_GATE: Constexpr[bool],
 ):
     block = m_warp * n_warp * WAVE
     arena_bytes = tile_geometry(tile_m, tile_n, tile_k)[3]
@@ -170,6 +173,8 @@ def _launch_gemm_combine_nt(
         arg_combine_expected: fx.Pointer,
         arg_reduce_expected: fx.Pointer,
         arg_chunk_counter: fx.Pointer,
+        arg_grad_gate: fx.Pointer,
+        arg_grad_topk_weights: fx.Pointer,
         sym_buffer,
     ):
         arena = fx.SharedAllocator(static=False)
@@ -194,6 +199,11 @@ def _launch_gemm_combine_nt(
         reduce_flag_base = workspace.get_reduce_flag_ptr()
         combine_token_res = create_buffer_resource_from_addr(
             workspace.get_combine_token_buffer_ptr(), num_records_bytes=num_max_routes * N * EB
+        )
+        combine_gate_res = (
+            create_buffer_resource_from_addr(workspace.get_combine_gate_ptr(), num_records_bytes=num_max_routes * 4)
+            if HAS_GRAD_GATE
+            else None
         )
         # this launch's epoch, already bumped
         parity = cast(ld(_addr(arg_parity), fx.Int32(0), dtype=fx.T.i64), fx.T.i32)
@@ -343,6 +353,10 @@ def _launch_gemm_combine_nt(
                     l2_ptr=l2_base,
                     epoch=expected_reduce,
                     reduce_bank=reduce_bank,
+                    grad_gate_res=(
+                        create_buffer_resource_from_addr(_addr(arg_grad_gate)) if HAS_GRAD_GATE else None
+                    ),
+                    has_grad_gate=HAS_GRAD_GATE,
                     block_threads=block,
                 )
                 chunk = rocdl.readfirstlane(T.i32, ld(lds, fx.Int32(1), scope="workgroup", space=3))
@@ -391,6 +405,13 @@ def _launch_gemm_combine_nt(
                         reduce_flag_base=reduce_flag_base,
                         reduce_bank=reduce_bank,
                         epoch=expected_reduce,
+                        combine_gate_res=combine_gate_res,
+                        grad_topk_weights_res=(
+                            create_buffer_resource_from_addr(_addr(arg_grad_topk_weights))
+                            if HAS_GRAD_GATE
+                            else None
+                        ),
+                        has_grad_gate=HAS_GRAD_GATE,
                         block_threads=block,
                         vec_unroll=4,
                     )
@@ -420,6 +441,8 @@ def _launch_gemm_combine_nt(
         arg_combine_expected,
         arg_reduce_expected,
         arg_chunk_counter,
+        arg_grad_gate,
+        arg_grad_topk_weights,
         sym_buffer,
     ).launch(
         grid=(num_gemm_blocks + NUM_COMBINE, 1, 1), block=(block, 1, 1), stream=stream
@@ -436,7 +459,7 @@ def _chunk_counter(device: torch.device) -> torch.Tensor:
     """The combine chunk and reduce token counters; the launch's epoch bump rearms them."""
     return torch.zeros(2, dtype=torch.int32, device=device)
 
-_CONSTEXPR0 = 20
+_CONSTEXPR0 = 22
 
 
 def gemm_combine_nt_gfx1250(
@@ -453,9 +476,13 @@ def gemm_combine_nt_gfx1250(
     tile_k: int = 128,
     m_warp: int = 2,
     n_warp: int = 2,
-) -> torch.Tensor:
+    grad_gate: torch.Tensor | None = None,
+):
     """``act`` [pool rows, K] (pool order, as the L1 + activation left it) -> ``[tokens, N]`` combined,
     ``tokens = topk_idx.shape[0]``.
+
+    With ``grad_gate`` (f32, one per pool row) each row's value also travels to its route and the
+    call returns ``(out, grad_topk_weights [tokens, topk])``, the backward's gate gradient.
 
     ``out[t]`` is the sum of ``act[p] @ w2[e(p)].T`` over the pool rows ``p`` of every route of
     this rank's token ``t``, on whichever rank holds them. No routing weight is applied here."""
@@ -481,6 +508,11 @@ def gemm_combine_nt_gfx1250(
     assert 0 < num_lead_combine < num_cu
     num_tail_combine = num_tail_combine or num_cu - num_lead_combine
     out = torch.empty(int(symm.num_max_tokens_per_rank), N, dtype=torch.bfloat16, device=act.device)
+    has_grad_gate = grad_gate is not None
+    if has_grad_gate:
+        assert grad_gate.dtype == torch.float32 and grad_gate.numel() == rows, "one f32 gate grad per pool row"
+        grad_gate = grad_gate.contiguous()
+        grad_topk_weights = torch.empty(int(symm.num_max_routes), dtype=torch.float32, device=act.device)
     # local stage of the L2 output: only this rank's combine workgroups read it
     l2 = torch.empty(rows, N, dtype=torch.bfloat16, device=act.device)
     args = (
@@ -502,6 +534,9 @@ def gemm_combine_nt_gfx1250(
         _as_ptr(symm._combine_expected),
         _as_ptr(symm._reduce_expected),
         _as_ptr(_chunk_counter(act.device)),
+        # traced out without a grad gate; any device tensor fills them
+        _as_ptr(grad_gate if has_grad_gate else out),
+        _as_ptr(grad_topk_weights if has_grad_gate else out),
         symm.get_sym_buffer(),
         torch.cuda.current_stream(),
         N,
@@ -521,13 +556,16 @@ def gemm_combine_nt_gfx1250(
         tile_k,
         m_warp,
         n_warp,
+        has_grad_gate,
     )
     key = args[_CONSTEXPR0:]
     fn = _COMPILED.get(key)
     if fn is None:
         fn = flyc.compile(_launch_gemm_combine_nt, *args)
-        if fn is None:
-            return out[:num_tokens]
-        _COMPILED[key] = fn
-    fn(*args)
+        if fn is not None:
+            _COMPILED[key] = fn
+    if fn is not None:
+        fn(*args)
+    if has_grad_gate:
+        return out[:num_tokens], grad_topk_weights[: num_tokens * topk_idx.shape[1]].view(num_tokens, -1)
     return out[:num_tokens]
