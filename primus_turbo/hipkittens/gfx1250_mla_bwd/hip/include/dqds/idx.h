@@ -146,9 +146,10 @@ DQ_HD constexpr int c_slot_b(int nqw) {
 DQ_HD constexpr int c_dsstg_b(int nqw) {
     return 2 * c_slot_b(nqw);
 } // 2 slots (kv32 rows 2u, 2u + 1)
-constexpr int LDS_C = C_DS_OFF + C_DSDEPTH * c_dsstg_b(MAIN_NQW); // 276480: one workgroup per CU
+constexpr int LDS_C = C_DS_OFF + C_DSDEPTH * c_dsstg_b(MAIN_NQW); // 276480: the rings
+constexpr int EPI_IMG_B = 16 * DQ_IMG_ROW_B; // one wave's dQ epilogue image: 16 rows x 400 B, after the rings
 DQ_HD constexpr int lds_bytes() {
-    return LDS_C;
+    return LDS_C + NWAVE * EPI_IMG_B; // 302080: one workgroup per CU
 }
 
 // ---- roles (wave-uniform): waves 0 / 3 issue dS (kv32 row 2u + half), waves 1 / 2 issue K (rows
@@ -224,12 +225,18 @@ DQ_HD constexpr int tile_q0g(int q_off, int ntile, int gy) {
 DQ_HD constexpr int head_q0g(int q_off) {
     return q_off - bqwg(HEAD_NQW);
 }
-DQ_HD constexpr int wave_q0(int q0g, int wv, int nqw) {
+// q pair (0-based in the workgroup's nbg) of the k-th pair of wave wv: snake order over the waves (main tile
+// w, 7 - w, 8 + w; head tile w, 7 - w), so the diagonal units' fully masked pairs spread over all waves
+DQ_HD constexpr int wave_pair(int wv, int k, int nqw) {
 #if DQ_MUT == 3
-    return q0g + wv * bqw(nqw) / 2; // MUTATION: waves overlap
+    return 4 * k + wv; // MUTATION: two waves share pairs
 #else
-    return q0g + wv * bqw(nqw);
+    return 4 * k + ((k & 1) ? 3 - wv : wv);
 #endif
+}
+// first query of the wave's 16-query sub-tile h (q pair h / 2, half h % 2)
+DQ_HD constexpr int subtile_q0(int q0g, int wv, int h, int nqw) {
+    return q0g + 32 * wave_pair(wv, h / 2, nqw) + 16 * (h % 2);
 }
 DQ_HD constexpr int tile_qp0(int q0g) {
     return q0g / 32;
@@ -436,22 +443,18 @@ DQ_HD constexpr int ds_row1(int slot, int nbs, int sh) {
     return slot + (nbs - sh) * DSI_BLK_B;
 #endif
 }
-// this wave's first q pair inside a slot (bytes): the workgroup's NB_G pairs land in q order, wave
-// w owns [w nbw, +nbw)
-DQ_HD constexpr int ds_wave_off(int wv, int nqw) {
-    return wv * nbw(nqw) * DSI_BLK_B;
-}
+// the workgroup's NB_G pairs land in q order in a slot; the wave's sub-tile h reads pair wave_pair(wv, h / 2)
 
-// ---- dQ epilogue (bwd_hk_q1): per-wave row-major image [BQW][400 B] at wave w*BQW*400, whole-line
-// readback ----
-DQ_HD constexpr int epi_img(int wv, int nqw) {
-    return wv * bqw(nqw) * DQ_IMG_ROW_B;
+// ---- dQ epilogue (bwd_hk_q1's, one 16-row sub-tile at a time): per-wave row-major image [16][400 B] after the
+// rings, whole-line readback ----
+DQ_HD constexpr int epi_img(int wv) {
+    return LDS_C + wv * EPI_IMG_B;
 }
 DQ_HD constexpr int epi_w_lane(int lane) {
     return lane_row(lane) * DQ_IMG_ROW_B + lane_half(lane) * 16;
 }
-DQ_HD constexpr int epi_w_imm(int qh_, int dtile) {
-    return qh_ * 16 * DQ_IMG_ROW_B + dtile * 32;
+DQ_HD constexpr int epi_w_imm(int dtile) {
+    return dtile * 32;
 }
 DQ_HD constexpr int epi_r_lane(int lane) {
     return (lane / 8) * DQ_IMG_ROW_B + (lane % 8) * 16;
@@ -463,7 +466,7 @@ DQ_HD constexpr int epi_r_imm(int rb, int li) {
     return rb * 4 * DQ_IMG_ROW_B + li * 128;
 #endif
 }
-// vec8 index of dq[bat, q0 + 4rb + l/8, qh, li*64 + (l%8)*8]
+// vec8 index of dq[bat, q0 + 4rb + l/8, qh, li*64 + (l%8)*8] (q0: the sub-tile's first query, rb < 4)
 DQ_HD constexpr int dq_vec8(int bat, int Sq, int Hq, int qh, int q0, int lane, int rb, int li) {
     return ((bat * Sq + q0 + rb * 4 + lane / 8) * Hq + qh) * DV8_QK + lane % 8 +
            li * (DQ_LINE_EL / 8);

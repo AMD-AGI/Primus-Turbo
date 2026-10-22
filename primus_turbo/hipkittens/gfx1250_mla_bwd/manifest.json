@@ -166,11 +166,11 @@
         "-mllvm",
         "-amdgpu-expert-scheduling-mode"
       ],
-      "hsaco_sha256": "af5fe0f87242a0e44974f9101efa1412dccec073f932855902d457b6c45add28",
+      "hsaco_sha256": "5e3782d65b17dfed8abfa1a1227d42fd5bf825ae52d2df55b6c20c5ce88dda2a",
       "block": 128,
       "kernarg_size": 68,
-      "lds": 276480,
-      "vgpr": 871,
+      "lds": 302080,
+      "vgpr": 934,
       "args": [
         {
           "name": "DS",
