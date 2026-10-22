@@ -11,8 +11,10 @@ they run anywhere. The numeric tests need a gfx1250 card; their fp32 reference r
 """
 
 import contextlib
+import hashlib
 import importlib
 import inspect
+import re
 import sys
 
 import pytest
@@ -690,6 +692,78 @@ def test_hk_manifest():
         assert last["offset"] + last["size"] <= k["kernarg_size"], name
         values = [1 if a["kind"] == "ptr" else 0 for a in k["args"]]
         assert len(hiprt.pack_args(k["args"], values)) == last["offset"] + last["size"], name
+
+
+_ASM_HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@$")
+# A VGPR operand; above v255 the compiler adds the true register as a comment: v[26:29] /*v[794:797]*/
+_ASM_VGPR = re.compile(r"v(\[\d+:\d+\]|\d+)(?:\s*/\*\s*v(\[\d+:\d+\]|\d+)\s*\*/)?")
+
+
+def _asm_patch_hunks(patch):
+    """[(old start, new start, [(tag, line)])] of a one-file unified diff, each hunk's counts checked."""
+    hunks = []
+    for block in patch.split("\n@@ ")[1:]:
+        header, *body = ("@@ " + block).rstrip("\n").split("\n")
+        m = _ASM_HUNK.match(header)
+        assert m and all(line[:1] in (" ", "-", "+") for line in body), header
+        ops = [(line[0], line[1:]) for line in body]
+        assert sum(t != "+" for t, _ in ops) == int(m.group(2) or 1), header
+        assert sum(t != "-" for t, _ in ops) == int(m.group(4) or 1), header
+        hunks.append((int(m.group(1)), int(m.group(3)), ops))
+    return hunks
+
+
+def _asm_vgpr_shape(line):
+    """The line with every VGPR operand replaced by its tuple size and 256-VGPR block."""
+
+    def shape(m):
+        lo, *hi = (int(n) for n in re.findall(r"\d+", m.group(2) or m.group(1)))
+        return f"v<{(hi[0] if hi else lo) - lo + 1}@{lo // 256}>"
+
+    return _ASM_VGPR.sub(shape, line)
+
+
+def test_hk_asm_patches(tmp_path):
+    """Every manifest asm_patch (tools/regen_asm_patch.py) is shipped and only renumbers VGPRs (same
+    tuple sizes, same 256-VGPR blocks, so every s_set_vgpr_msb stays valid) and changes s_wait_alu lines.
+    hsaco.py applies it to its own context only: it applies to an input rebuilt from its hunks, a
+    changed context line is rejected, and a compiler .s with another sha256 is refused before anything
+    is patched or assembled (no compiler needed)."""
+    hsaco = _hk_package("hsaco")
+    kernels = {n: k for n, k in hsaco.load_manifest()["kernels"].items() if "asm_patch" in k}
+    assert set(kernels) == {"k_dkdv96ds"}
+    for name, k in kernels.items():
+        assert re.fullmatch(r"[0-9a-f]{64}", k["asm_input_sha256"]), name
+        patch = (hsaco.HIP_DIR / k["asm_patch"]).read_text()
+        src, want, shift, renumbered = [], [], 0, 0
+        for old_start, new_start, ops in _asm_patch_hunks(patch):
+            assert old_start > len(src) and new_start == old_start + shift, (name, old_start)
+            fill = [f"\t; line {n + 1}" for n in range(len(src), old_start - 1)]
+            src += fill + [t for tag, t in ops if tag != "+"]
+            want += fill + [t for tag, t in ops if tag != "-"]
+            shift += sum(t == "+" for t, _ in ops) - sum(t == "-" for t, _ in ops)
+            old = [t for tag, t in ops if tag == "-" and "s_wait_alu" not in t]
+            new = [t for tag, t in ops if tag == "+" and "s_wait_alu" not in t]
+            assert len(old) == len(new), (name, old_start)
+            for a, b in zip(old, new):
+                assert a != b and _asm_vgpr_shape(a) == _asm_vgpr_shape(b), (name, a, b)
+            renumbered += len(new)
+        assert renumbered > 0, name
+        text = "\n".join(src + ["\ts_endpgm"]) + "\n"
+        assert hsaco._apply_unified_diff(text, patch) == "\n".join(want + ["\ts_endpgm"]) + "\n"
+        first = _asm_patch_hunks(patch)[0][0] - 1  # the first hunk's first (context) line
+        bad = "\n".join(src[:first] + [src[first] + " "] + src[first + 1 :] + ["\ts_endpgm"]) + "\n"
+        with pytest.raises(ValueError, match="does not apply"):
+            hsaco._apply_unified_diff(bad, patch)
+        saved = tmp_path / f"{name}-hip-amdgpu12.50-amd-amdhsa-gfx1250.s"  # as -save-temps=obj names it
+        saved.write_text(text)
+        with pytest.raises(RuntimeError, match="asm_input_sha256"):
+            hsaco._patch_and_reassemble(name, k, [], tmp_path)
+        saved.write_text(bad)
+        k_bad = dict(k, asm_input_sha256=hashlib.sha256(bad.encode()).hexdigest())
+        with pytest.raises(RuntimeError, match="does not apply"):
+            hsaco._patch_and_reassemble(name, k_bad, [], tmp_path)
+        assert saved.read_text() == bad
 
 
 def test_hk_plan_on_meta_tensors():

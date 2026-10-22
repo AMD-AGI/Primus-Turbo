@@ -13,7 +13,9 @@ and validated with its ``toolchain``; a code object with another sha256 (another
 sources) is never loaded, so the backward falls back to the FlyDSL kernels. ``-cuid=<kernel>``
 pins the ``__hip_cuid_*`` symbol, so a rebuild in any directory is byte-identical; ``-save-temps=obj``
 is part of that identity (the code object is assembled from the saved ``.s``, which differs in bytes
-from the integrated path), so its temporaries go to a scratch directory.
+from the integrated path), so its temporaries go to a scratch directory. A kernel with an ``asm_patch``
+(k_dkdv96ds) is assembled from that ``.s`` with the patch applied, and only from the ``.s`` whose
+sha256 is ``asm_input_sha256``; ``tools/regen_asm_patch.py`` regenerates the patch (see README.md).
 
     python primus_turbo/hipkittens/gfx1250_mla_bwd/hsaco.py [--check] [--force] [--strict] [--cxx PATH]
 
@@ -105,13 +107,19 @@ def compiler_version(cxx: str) -> str:
     return out.splitlines()[0].strip() if out else "?"
 
 
-def compile_kernel(cxx: str, name: str, out_path: Path) -> None:
-    """One kernel -> one device-only code object, cwd = hip/ (the manifest's -I paths are relative)."""
+def compile_command(cxx: str, name: str, obj: Path) -> list:
+    """The compiler command of one kernel; run it with cwd = hip/ (the manifest's -I paths are relative)."""
     m = load_manifest()
     k = m["kernels"][name]
+    return [cxx, *m["flags"], f"-cuid={name}", *k["extra_flags"], "-c", k["src"], "-o", str(obj)]
+
+
+def compile_kernel(cxx: str, name: str, out_path: Path) -> None:
+    """One kernel -> one device-only code object."""
+    k = load_manifest()["kernels"][name]
     with tempfile.TemporaryDirectory() as tmp:
         obj = Path(tmp) / f"{name}.hsaco"
-        cmd = [cxx, *m["flags"], f"-cuid={name}", *k["extra_flags"], "-c", k["src"], "-o", str(obj)]
+        cmd = compile_command(cxx, name, obj)
         r = subprocess.run(cmd, cwd=HIP_DIR, capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError(f"{name}: {' '.join(cmd)} failed ({r.returncode}):\n{r.stderr[-4000:]}")
@@ -212,7 +220,7 @@ def build(cxx: Optional[str] = None, bin_dir: Path = BIN_DIR, force: bool = Fals
             out.unlink()
             ok = False
             log(
-                f"[gfx1250_mla_bwd] WARNING: {name} sha256 {got[:16]} != manifest "
+                f"[gfx1250_mla_bwd] WARNING: {name} sha256 {got} != manifest "
                 f"{kernels[name]['hsaco_sha256'][:16]} with {compiler_version(cxx)}; removed "
                 f"(validated with: {load_manifest()['toolchain']})"
             )

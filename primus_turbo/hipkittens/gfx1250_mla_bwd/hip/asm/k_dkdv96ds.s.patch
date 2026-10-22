@@ -1,5 +1,5 @@
---- final/isa/k_dkdv96ds.compiler.s	2026-10-22 07:19:47.216124532 +0000
-+++ final/isa/k_dkdv96ds.c1.s	2026-10-22 07:27:40.461422789 +0000
+--- k_dkdv96ds.s	sha256 85219fe5c261e670b4b1ffb2b4f66f302cab5548c93dbb140aaa76d9339a8777
++++ k_dkdv96ds.s	regen_asm_patch.py
 @@ -4225,6 +4225,7 @@
  	s_lshl_b32 s2, s2, 7
  	s_add_co_i32 s2, s2, s12
