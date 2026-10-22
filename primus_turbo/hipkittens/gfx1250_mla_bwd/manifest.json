@@ -24,9 +24,15 @@
         "-mllvm",
         "-structurizecfg-skip-uniform-regions",
         "-mllvm",
-        "-amdgpu-expert-scheduling-mode"
+        "-amdgpu-expert-scheduling-mode",
+        "-mllvm",
+        "-misched-prera-direction=bottomup",
+        "-mllvm",
+        "-amdgpu-enable-delay-alu=false",
+        "-mllvm",
+        "-disable-machine-sink"
       ],
-      "hsaco_sha256": "401937739b4fc949cc57b160be284f1d8a2d6f78d404d18fd036f22b00884e50",
+      "hsaco_sha256": "de541125d4c4dd56ff790493205ea5f2cd19f9c0f0e4d59c4c8f14417209035f",
       "block": 64,
       "kernarg_size": 120,
       "lds": 64512,
