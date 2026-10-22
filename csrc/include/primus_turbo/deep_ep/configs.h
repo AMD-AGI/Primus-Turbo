@@ -39,12 +39,21 @@
 #define DEFAULT_NUM_MAX_RDMA_CHUNKED_SEND_TOKENS 6
 #define DEFAULT_NUM_MAX_RDMA_CHUNKED_RECV_TOKENS 256
 
-static constexpr int32_t kWarpSize = 64;
-// For ROCm equals to half the wave size or Nvidia warp size
-static constexpr int32_t  kEmulatedWarpSize = kWarpSize / 2;
-static constexpr uint64_t kFullWarpMask     = 0xffffffffffffffff;
-static constexpr uint64_t kFirstHalfMask    = 0x00000000ffffffff;
-static constexpr uint64_t kSecondHalfMask   = 0xffffffff00000000;
+// gfx1250 is wave32; gfx942 / gfx950 are wave64. The host pass defines no arch macro and sees 64,
+// so host-side launch geometry must use primus_turbo::warp_size() instead of kWarpSize.
+#if defined(__gfx1250__)
+static constexpr int32_t  kWarpSize       = 32;
+static constexpr uint64_t kFullWarpMask   = 0x00000000ffffffff;
+static constexpr uint64_t kFirstHalfMask  = 0x00000000ffffffff;
+static constexpr uint64_t kSecondHalfMask = 0x0000000000000000;
+#else
+static constexpr int32_t  kWarpSize       = 64;
+static constexpr uint64_t kFullWarpMask   = 0xffffffffffffffff;
+static constexpr uint64_t kFirstHalfMask  = 0x00000000ffffffff;
+static constexpr uint64_t kSecondHalfMask = 0xffffffff00000000;
+#endif
+// Nvidia warp width: half a wave64, or a whole wave32
+static constexpr int32_t kEmulatedWarpSize = 32;
 
 // Remove Torch restrictions
 #ifdef __CUDA_NO_HALF_CONVERSIONS__
