@@ -18,6 +18,7 @@ import inspect
 from typing import Callable, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 from flydsl.expr.numeric import Int64
 from flydsl.expr.typing import AddressSpace, Pointer, PointerType, address_space_from_attr
 
@@ -400,7 +401,17 @@ class SymmBuffer:
         # region views are non-owning aliases of the raw heap ptr; free the heap, then drop refs
         self._sym_buffer = None
         if self.symm_mem is not None:
+            # Collective, like the constructor. No kernel on any rank may still touch a heap, and
+            # no rank may allocate the next one while a peer still maps this one: a heap freed and
+            # re-allocated under a live peer mapping fails hipIpcGetMemHandle (invalid argument).
+            # A group already destroyed can neither be waited on nor have peers left mapping it.
+            torch.cuda.synchronize()
+            peers = self.num_ranks > 1 and self.group in dist.distributed_c10d._world.pg_map
+            if peers:
+                self.group.barrier()
             self.symm_mem.destroy()
+            if peers:
+                self.group.barrier()
         self.symm_mem = None
         self.buffer = None
 
