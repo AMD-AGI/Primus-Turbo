@@ -89,7 +89,7 @@ def _compile_dense_nt(
     GROUP_M: int = 1,
     waves_per_eu: int = 2,
     agpr_alloc: int = 0,
-    nt_vmcnt: int = 3,  # end-of-iter s_waitcnt vmcnt(N): N=3 → det=0 (gfx950 G2S buffer_load_lds/ds_read LDS hazard), <=1.1% cost; N>=4 races, N<3 costlier; -1 disables
+    nt_vmcnt: int = -2,  # end-of-iter s_waitcnt vmcnt budget: -2 derives it from the streams (below), -1 disables
     num_xcd: int = 8,  # XCD-aware PID remap: cluster same-XCD WGs into contiguous logical tiles for per-XCD L2 reuse (gfx950 MI355X = 8 XCD); 1 disables
     cbsz: int = 0,  # srcA fp8 fmt: 0=E4M3, 1=E5M2
     blgp: int = 0,  # srcB fp8 fmt: 0=E4M3, 1=E5M2
@@ -126,6 +126,12 @@ def _compile_dense_nt(
     N_LDS_STEPS_A = LDS_BLOCK_M // 64
     N_LDS_STEPS_B = LDS_BLOCK_N // 64
     N_LDS_ROUNDS = max(N_LDS_STEPS_A, N_LDS_STEPS_B)
+
+    # End-of-iteration G2S drain (gfx950 buffer_load_lds/ds_read LDS hazard). The budget counts
+    # the streams the next iteration reads; a literal is read against the A stream's width,
+    # which BLOCK_M halves and which then stays in flight.
+    if nt_vmcnt == -2:
+        nt_vmcnt = N_LDS_STEPS_B
 
     a_lds_size = LDS_BLOCK_M * BLOCK_K
     b_lds_size = LDS_BLOCK_N * BLOCK_K
@@ -3037,6 +3043,26 @@ def _dense_tuned(cache, key, beta_is_one):
     return _dense_beta1_entry(cache, key, tuned) if beta_is_one else tuned
 
 
+# Repeats a candidate must return identical bytes for before it is timed at all, and the
+# megabytes flushed between them: back to back the operands stay resident and the window
+# a racing schedule needs never opens.
+_DENSE_REPRO_REPS = 64
+_DENSE_REPRO_FLUSH_MB = 512
+
+
+def _repro_ok(compiled, args, out_view):
+    """Whether a candidate returns the same bytes every time on one set of operands."""
+    ref = out_view.clone()
+    flush = torch.empty(_DENSE_REPRO_FLUSH_MB << 20, dtype=torch.uint8, device=out_view.device)
+    for _ in range(_DENSE_REPRO_REPS):
+        flush.zero_()
+        compiled(*args)
+        torch.cuda.synchronize()
+        if not torch.equal(ref, out_view):
+            return False
+    return True
+
+
 def _dense_race(cache, key, args, layout, builders, beta_is_one):
     """First-call race of ``builders`` -- (cfg, factory) pairs -- with the winner cached by
     ``key``. A candidate that fails to build, or whose output sample is not finite, is dropped
@@ -3052,6 +3078,8 @@ def _dense_race(cache, key, args, layout, builders, beta_is_one):
                 c(*bargs)
                 torch.cuda.synchronize()
                 if not torch.isfinite(out_view.view(-1)[:1024].float()).all().item():
+                    continue
+                if not _repro_ok(c, bargs, out_view):
                     continue
                 cands.append([launch, cfg, c, build])  # c: compiled, reused eager
             except Exception:
