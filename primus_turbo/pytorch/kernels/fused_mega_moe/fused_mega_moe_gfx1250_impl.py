@@ -7,8 +7,9 @@
 """The Mega MoE stages on the gfx1250 kernels (``primus_turbo.flydsl.mega.bf16_gfx1250``).
 
 Same contracts as the gfx950 stage1 / stage2 compositions. The GEMMs read the weights as stored:
-NT for the forward, NN (``b_nn``) for the dgrads. The wgrads run the gfx1250 variable-K kernel on
-both operands gathered into pool order, ordered so the result lands in the weight's own layout.
+NT for the forward, NN (``b_nn``) for the dgrads. The wgrads run the gfx1250 variable-K kernel in
+pool order, the dispatched operand read from the dispatch token buffer through the pool's row
+table, ordered so the result lands in the weight's own layout.
 """
 
 from typing import Optional
@@ -26,7 +27,6 @@ from primus_turbo.flydsl.mega.bf16.symm_buffer import get_symm_buffer_for_mega_m
 from primus_turbo.flydsl.mega.bf16_gfx1250.dispatch_gemm_kernel import (
     dispatch_gemm_nt_gfx1250,
     dispatch_only_gfx1250,
-    pool_rows_of,
 )
 from primus_turbo.flydsl.mega.bf16_gfx1250.gemm_combine_kernel import (
     gemm_combine_nt_gfx1250,
@@ -108,7 +108,9 @@ def stage2_backward(
     token_buffer = get_symm_buffer_for_mega_moe().dispatch_token_buffer
     prefix, counts = handle.num_tokens_per_expert_prefix, handle.num_tokens_per_expert
     # dW2[e] = dy_pool[e].T @ act_w[e] -> [E, hidden, inter]
-    dW2 = _variable_k(pool_rows_of(token_buffer, handle), act_weighted, prefix, masked_k=counts)
+    dW2 = _variable_k(
+        token_buffer, act_weighted, prefix, masked_k=counts, a_index=handle.pool_row_to_recv_token
+    )
     d_fc2_bias = (
         None if fc2_bias is None else fc2_bias_backward(token_buffer, handle, dispatch_weights, fc2_bias, grad_gate)
     )
@@ -122,7 +124,7 @@ def stage1_backward(grad_l1, saved_x, w1, handle, topk_idx, grad_gate):
     Returns ``(dx, grad_topk_weights [tokens, topk], dW1)``."""
     dx, grad_topk_weights = gemm_combine_nt_gfx1250(grad_l1, w1, handle, topk_idx, grad_gate=grad_gate, b_nn=True)
     # dW1[e] = grad_l1[e].T @ x_pool[e] -> [E, 2 * inter, hidden]; x is dispatched again
-    x_pool = dispatch_only_gfx1250(saved_x.contiguous(), handle)
+    x_recv = dispatch_only_gfx1250(saved_x.contiguous(), handle)
     prefix, counts = handle.num_tokens_per_expert_prefix, handle.num_tokens_per_expert
-    dW1 = _variable_k(grad_l1, x_pool, prefix, masked_k=counts)
+    dW1 = _variable_k(grad_l1, x_recv, prefix, masked_k=counts, b_index=handle.pool_row_to_recv_token)
     return dx, grad_topk_weights, dW1.to(w1.dtype)
