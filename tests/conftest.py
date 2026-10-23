@@ -50,6 +50,8 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_mega_bf16_gfx1250_gemm_combine.py",
     # The fused_mega_moe op (forward and backward) on the gfx1250 kernels, single GPU (EP1).
     "tests/pytorch/ops/test_mega_bf16_gfx1250_fused_moe.py",
+    # The same op across every visible GPU (EP2+).
+    "tests/pytorch/ops/test_mega_bf16_gfx1250_fused_moe_ep.py",
 )
 
 
