@@ -319,9 +319,14 @@ def dispatch_gemm_nt_gfx1250(
     return _run(x, w1, handle, False, b_nn, num_dispatch_cu, tile_m, tile_n, tile_k, m_warp, n_warp, group_m)
 
 
-def dispatch_only_gfx1250(x: torch.Tensor, handle: DispatchHandle, *, num_dispatch_cu: int = 64) -> torch.Tensor:
+def dispatch_only_gfx1250(
+    x: torch.Tensor, handle: DispatchHandle, *, num_dispatch_cu: int | None = None
+) -> torch.Tensor:
     """Dispatch ``x`` by ``handle`` and return its rows in pool order (``[pool rows, hidden]``,
-    padding rows hold some received token)."""
+    padding rows hold some received token). ``num_dispatch_cu`` defaults to every CU but the one
+    the launch's waiting workgroup holds: no GEMM shares the launch."""
+    if num_dispatch_cu is None:
+        num_dispatch_cu = torch.cuda.get_device_properties(x.device).multi_processor_count - 1
     symm = get_symm_buffer_for_mega_moe()
     G = handle.expert_send_dst_rank.numel() // int(symm.num_ranks)
     # only the GEMM's shape is read: the launch holds the comm workgroups alone
