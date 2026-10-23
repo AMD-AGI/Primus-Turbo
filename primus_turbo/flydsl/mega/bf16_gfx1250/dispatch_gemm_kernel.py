@@ -86,9 +86,9 @@ def _launch_dispatch_gemm_nt(
     arg_expected: fx.Pointer,
     sym_buffer,
     stream: fx.Stream,
+    grid_size: fx.Int32,
     N: Constexpr[int],
     HIDDEN: Constexpr[int],
-    MAX_TILES: Constexpr[int],
     N_BLOCKS_N: Constexpr[int],
     NUM_DISPATCH_CU: Constexpr[int],
     NUM_CHUNKS: Constexpr[int],
@@ -283,17 +283,13 @@ def _launch_dispatch_gemm_nt(
         arg_parity,
         arg_expected,
         sym_buffer,
-    ).launch(
-        grid=(NUM_DISPATCH_CU + (1 if DISPATCH_ONLY else MAX_TILES * N_BLOCKS_N), 1, 1),
-        block=(block, 1, 1),
-        stream=stream,
-    )
+    ).launch(grid=(grid_size, 1, 1), block=(block, 1, 1), stream=stream)
 
 
 _launch_dispatch_gemm_nt.compile_hints["llvm_options"] = {"amdgpu-expert-scheduling-mode": True}
 
 _COMPILED: dict = {}
-_CONSTEXPR0 = 16
+_CONSTEXPR0 = 17
 
 
 def dispatch_gemm_nt_gfx1250(
@@ -362,6 +358,7 @@ def _run(x, w1, handle, dispatch_only, b_nn, num_dispatch_cu, tile_m, tile_n, ti
     # the prologue marks padding rows with a_rows, out of range for the TDM gather
     idx_bits = 16 if a_rows < 0xFFFF else 32
     out = x.new_empty((0, N) if dispatch_only else (handle.pool_row_to_route.numel(), N))
+    n_blocks_n = (N + tile_n - 1) // tile_n
     args = (
         _as_ptr(out),
         _as_ptr(x),
@@ -379,10 +376,12 @@ def _run(x, w1, handle, dispatch_only, b_nn, num_dispatch_cu, tile_m, tile_n, ti
         _as_ptr(symm._dispatch_expected),
         symm.get_sym_buffer(),
         torch.cuda.current_stream(),
+        # the comm workgroups, then the GEMM tiles of this call's pool (the prologue's
+        # num_tile_blocks), or dispatch-only's one waiter: masked worst-case tiles would drain last
+        num_dispatch_cu + (1 if dispatch_only else handle.pool_row_to_route.numel() // BLOCK_M * n_blocks_n),
         N,
         K,
-        int(symm.num_max_pool_tokens) // BLOCK_M,
-        (N + tile_n - 1) // tile_n,
+        n_blocks_n,
         num_dispatch_cu,
         num_dispatch_cu // num_ranks,
         num_ranks,
