@@ -27,14 +27,23 @@ put the payload in memory, and the receiver reads it with system-scope loads tha
 miss every cache.
 """
 
+import functools
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith, range_constexpr
-from flydsl.expr.primitive import get_dyn_shared
-from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
-from primus_turbo.flydsl.deep_ep.common import WARP_SIZE, load_index, tensor_addr, to_i64
+from primus_turbo.flydsl.deep_ep.common import (
+    WARP_SIZE,
+    ld_lds,
+    lds_base,
+    load_i32,
+    load_index,
+    st_lds,
+    tensor_addr,
+)
+from primus_turbo.flydsl.utils.attn_helper import _wave_any
 from primus_turbo.flydsl.utils.buffer_ops import (
     _unwrap_value,
     buffer_load,
@@ -43,6 +52,7 @@ from primus_turbo.flydsl.utils.buffer_ops import (
     create_buffer_resource_from_addr,
 )
 from primus_turbo.flydsl.utils.prims import (
+    _i64,
     _readfirstlane_i32,
     _readlane_i32,
     atomic_add,
@@ -61,74 +71,80 @@ FINISHED_SUM_TAG = 1024
 NOTIFY_THREADS = 256
 # sc0 | sc1 | nt: a system-scope streaming load, which misses every GPU cache
 SYS_LOAD = 0x13
-# Bytes of a row one copy_warp call loads before it stores them (1 KiB a warp step). gfx9's vmcnt
-# counts stores too, so the loads of the next piece wait for this piece's (remote) stores. The more
-# channels push at once, the smaller the piece that keeps a sender streaming. Measured on MI355X,
-# 8 ranks, hidden 7168, a DeepEP forward + backward per step (num_sms -> best dispatch / combine):
-# 20 -> 2 KiB / 8 KiB, 40 -> 1 KiB / 2 KiB, 64 and 80 -> 1 KiB / 1 KiB.
+_INT_MAX = 0x7FFFFFFF
 
 
 def dispatch_copy_piece_bytes(num_channels):
+    """Bytes of a row one ``copy_warp`` call loads before it stores them (1 KiB a warp step).
+
+    gfx9's vmcnt counts stores too, so the loads of the next piece wait for this piece's (remote)
+    stores; the more channels push at once, the smaller the piece that keeps a sender streaming.
+    Measured on MI355X, 8 ranks, hidden 7168, a DeepEP forward + backward per step
+    (num_sms -> best dispatch / combine): 20 -> 2 KiB / 8 KiB, 40 -> 1 KiB / 2 KiB,
+    64 and 80 -> 1 KiB / 1 KiB."""
     return 2 * 1024 if num_channels <= 10 else 1024
 
 
 def combine_copy_piece_bytes(num_channels):
+    """The combine sender's ``dispatch_copy_piece_bytes``."""
     if num_channels <= 10:
         return 8 * 1024
     return 2 * 1024 if num_channels <= 20 else 1024
 
 
-_INT_MAX = 0x7FFFFFFF
-
-
 # ── Heap layout (byte offsets from a rank's buffer base) ─────────────────────
 
 
+def _buffer_layout(first_offset, num_slots, regions):
+    """``{name: (offset, slot_bytes)}`` of regions laid out back to back, and the end offset."""
+    layout = {}
+    offset = first_offset
+    for name, slot_bytes in regions:
+        layout[name] = (offset, slot_bytes)
+        offset += num_slots * slot_bytes
+    return layout, offset
+
+
+@functools.lru_cache(maxsize=None)
 def dispatch_buffer_layout(
     num_ranks, num_channels, num_recv_buffer_tokens, hidden_bytes, num_topk, topk_idx_bytes, num_scales
 ):
-    """Region offsets and total bytes of the dispatch heap, as laid out by ``intranode::dispatch``."""
-    num_slots = num_channels * num_ranks
-    offsets = {}
-    offset = num_ranks * num_ranks * 4  # rank prefix matrix
-    for name, slot_bytes in (
-        ("start_offset", 4),
-        ("end_offset", 4),
-        ("head", 4),
-        ("tail", 4),
-        ("x", num_recv_buffer_tokens * hidden_bytes),
-        ("src_idx", num_recv_buffer_tokens * 4),
-        ("topk_idx", num_recv_buffer_tokens * num_topk * topk_idx_bytes),
-        ("topk_weights", num_recv_buffer_tokens * num_topk * 4),
-        ("x_scales", num_recv_buffer_tokens * num_scales * 4),
-    ):
-        offsets[name] = offset
-        offset += num_slots * slot_bytes
-    return offsets, offset
+    """Region layout and total bytes of the dispatch heap, as laid out by ``intranode::dispatch``:
+    the rank prefix matrix, then one slot per (channel, rank) of every region."""
+    return _buffer_layout(
+        num_ranks * num_ranks * 4,
+        num_channels * num_ranks,
+        (
+            ("start_offset", 4),
+            ("end_offset", 4),
+            ("head", 4),
+            ("tail", 4),
+            ("x", num_recv_buffer_tokens * hidden_bytes),
+            ("src_idx", num_recv_buffer_tokens * 4),
+            ("topk_idx", num_recv_buffer_tokens * num_topk * topk_idx_bytes),
+            ("topk_weights", num_recv_buffer_tokens * num_topk * 4),
+            ("x_scales", num_recv_buffer_tokens * num_scales * 4),
+        ),
+    )
 
 
+@functools.lru_cache(maxsize=None)
 def combine_buffer_layout(num_ranks, num_channels, num_recv_buffer_tokens, hidden_bytes, num_topk):
-    """Region offsets and total bytes of the combine heap, as laid out by ``intranode::combine``."""
-    num_slots = num_channels * num_ranks
-    offsets = {}
-    offset = 0
-    for name, slot_bytes in (
-        ("head", 4),
-        ("tail", 4),
-        ("x", num_recv_buffer_tokens * hidden_bytes),
-        ("src_idx", num_recv_buffer_tokens * 4),
-        ("topk_weights", num_recv_buffer_tokens * num_topk * 4),
-    ):
-        offsets[name] = offset
-        offset += num_slots * slot_bytes
-    return offsets, offset
+    """Region layout and total bytes of the combine heap, as laid out by ``intranode::combine``."""
+    return _buffer_layout(
+        0,
+        num_channels * num_ranks,
+        (
+            ("head", 4),
+            ("tail", 4),
+            ("x", num_recv_buffer_tokens * hidden_bytes),
+            ("src_idx", num_recv_buffer_tokens * 4),
+            ("topk_weights", num_recv_buffer_tokens * num_topk * 4),
+        ),
+    )
 
 
 # ── Device helpers ───────────────────────────────────────────────────────────
-
-
-def _lds_base():
-    return _unwrap_value(_fly_ptrtoint(get_dyn_shared()))
 
 
 def _load_lane_ptr(ptrs_res, rank):
@@ -149,12 +165,17 @@ def _st_sys(addr, idx, value):
     st(addr, fx.Int32(idx) if isinstance(idx, int) else idx, value, scope="sys")
 
 
-def _ld_lds(lds_base, idx):
-    return ld(lds_base, fx.Int32(idx) if isinstance(idx, int) else idx, scope="workgroup", space=3)
+def _sum_lds(lds, first, count: int):
+    """Sum of ``count`` consecutive i32 LDS words from ``first``."""
+    total = fx.Int32(0)
+    for i in range(count):
+        total = total + ld_lds(lds, first + i)
+    return total
 
 
-def _st_lds(lds_base, idx, value):
-    st(lds_base, fx.Int32(idx) if isinstance(idx, int) else idx, value, scope="workgroup", space=3)
+def _waits_on_tail(lds, lds_tail: int, lane_rank, expected_head):
+    """Whether this lane's rank has not yet published the ring slot ``expected_head`` (-1: not routed)."""
+    return (expected_head >= fx.Int32(0)) & (ld_lds(lds, fx.Int32(lds_tail) + lane_rank) <= expected_head)
 
 
 def _load_u8(res, idx):
@@ -182,8 +203,21 @@ def _addr(base, offset_bytes, index=None, stride_bytes=0):
     """``base + offset_bytes + index * stride_bytes`` in i64."""
     addr = base + fx.Int64(offset_bytes)
     if index is not None:
-        addr = addr + to_i64(index) * fx.Int64(stride_bytes)
+        addr = addr + _i64(index) * fx.Int64(stride_bytes)
     return addr
+
+
+def _region(base, layout, name, slot):
+    """Address of ``slot``'s part of heap region ``name``."""
+    offset, slot_bytes = layout[name]
+    return _addr(base, offset, slot, slot_bytes)
+
+
+def _region_res(base, layout, name, slot):
+    """Buffer resource over ``slot``'s part of heap region ``name``."""
+    return create_buffer_resource_from_addr(
+        _region(base, layout, name, slot), num_records_bytes=layout[name][1]
+    )
 
 
 def _copy_row(dst_addr, src_addr, num_bytes, piece_bytes, load_cache_modifier=0):
@@ -200,31 +234,17 @@ def _copy_row(dst_addr, src_addr, num_bytes, piece_bytes, load_cache_modifier=0)
 
 
 def _uniform_i64(value):
-    """``_uniform`` for an i64 (an address), one half at a time."""
+    """``_readfirstlane_i32`` for an i64 (an address), one half at a time. A warp-uniform value the
+    compiler cannot prove uniform (a vector load, an LDS read) stays in VGPRs, and every buffer
+    descriptor or branch built from it then pays a readfirstlane waterfall."""
     value = fx.arith.ArithValue(_unwrap_value(value), signed=True)
     low = _readfirstlane_i32(cast(value, fx.T.i32))
     high = _readfirstlane_i32(cast(value >> fx.Int64(32), fx.T.i32))
-    return (to_i64(high) << fx.Int64(32)) | (to_i64(low) & fx.Int64(0xFFFFFFFF))
-
-
-def _uniform(value):
-    """Pin a warp-uniform i32 into an SGPR. A value the compiler cannot prove uniform (a vector
-    load, an LDS read, a bit of a ballot) stays in VGPRs, and every buffer descriptor or branch
-    built from it then pays a readfirstlane waterfall."""
-    return _readfirstlane_i32(value)
-
-
-def _ballot(pred):
-    """Wave64 mask of the lanes where ``pred`` holds, as i64."""
-    return fx.arith.ArithValue(fx.rocdl.ballot(res=fx.T.i64, pred=_unwrap_value(pred)), signed=True)
-
-
-def _any_lane(pred):
-    return _ballot(pred) != fx.Int64(0)
+    return (_i64(high) << fx.Int64(32)) | (_i64(low) & fx.Int64(0xFFFFFFFF))
 
 
 @ASTRewriter.transform
-def group_barrier(lds_base, bar_id, num_arrived, num_warps_per_group: int, publish: bool = False):
+def group_barrier(lds, bar_id, num_arrived, num_warps_per_group: int, publish: bool = False):
     """Barrier over the warps of one rank group (``sync_barrier``), on an LDS arrival counter.
 
     ``num_arrived`` is the count this warp expects before this barrier; returns the next one.
@@ -234,8 +254,8 @@ def group_barrier(lds_base, bar_id, num_arrived, num_warps_per_group: int, publi
     memory_fence(order="release", scope="workgroup")
     num_arrived = num_arrived + fx.Int32(num_warps_per_group)
     if fx.lane_id() == fx.Int32(0):
-        atomic_add(lds_base, bar_id, fx.Int32(1), "workgroup", 3)
-        while _ld_lds(lds_base, bar_id) < num_arrived:
+        atomic_add(lds, bar_id, fx.Int32(1), "workgroup", 3)
+        while ld_lds(lds, bar_id) < num_arrived:
             fx.rocdl.s_sleep(fx.Int32(1))
     memory_fence(order="acquire", scope="workgroup")
     return num_arrived
@@ -335,7 +355,7 @@ def _make_notify_dispatch(num_ranks, num_experts, num_channels, num_memset_int, 
         warp_id = thread_id // fx.Int32(WARP_SIZE)
         buffer_ptrs_res = create_buffer_resource(BUFFER_PTRS, max_size=True)
         barrier_ptrs_res = create_buffer_resource(BARRIER_PTRS, max_size=True)
-        lds_base = _lds_base()
+        lds = lds_base()
 
         if block_id == fx.Int32(0):
             barrier_block(barrier_ptrs_res, rank, num_ranks, True, "notify_dispatch/enter")
@@ -348,15 +368,10 @@ def _make_notify_dispatch(num_ranks, num_experts, num_channels, num_memset_int, 
                 _st_sys(
                     peer,
                     rank * fx.Int32(num_ranks) + thread_id,
-                    buffer_load(tokens_res, thread_id, vec_width=1, dtype=fx.T.i32),
+                    load_i32(tokens_res, thread_id),
                 )
                 for i in range(num_experts_per_rank):
-                    count = buffer_load(
-                        experts_res,
-                        thread_id * fx.Int32(num_experts_per_rank) + fx.Int32(i),
-                        vec_width=1,
-                        dtype=fx.T.i32,
-                    )
+                    count = load_i32(experts_res, thread_id * fx.Int32(num_experts_per_rank) + fx.Int32(i))
                     _st_sys(
                         peer,
                         fx.Int32(num_ranks * num_ranks) + rank * fx.Int32(num_experts_per_rank) + fx.Int32(i),
@@ -416,14 +431,14 @@ def _make_notify_dispatch(num_ranks, num_experts, num_channels, num_memset_int, 
                 for offset in (32, 16, 8, 4, 2, 1):
                     count = count + fx.shuffle_xor(count, offset, WARP_SIZE)
                 if lane_id == fx.Int32(0):
-                    _st_lds(lds_base, channel, count)
+                    st_lds(lds, channel, count)
                 channel = channel + fx.Int32(NOTIFY_THREADS // WARP_SIZE)
             fx.gpu.barrier()
             if thread_id == fx.Int32(0):
                 prefix_res = create_buffer_resource(CHANNEL_PREFIX_MATRIX, max_size=True)
                 running = fx.Int32(0)
                 for c in range(num_channels):
-                    running = running + _ld_lds(lds_base, c)
+                    running = running + ld_lds(lds, c)
                     buffer_store(running, prefix_res, dst_rank * fx.Int32(num_channels) + fx.Int32(c))
 
     return notify_dispatch_kernel
@@ -479,7 +494,7 @@ def _make_cached_notify_dispatch(num_ranks, num_memset_int):
         rank_prefix_res = create_buffer_resource(RANK_PREFIX_MATRIX, max_size=True)
         i = thread_id
         while i < fx.Int32(num_ranks * num_ranks):
-            _st_sys(local, i, buffer_load(rank_prefix_res, i, vec_width=1, dtype=fx.T.i32))
+            _st_sys(local, i, load_i32(rank_prefix_res, i))
             i = i + fx.Int32(NOTIFY_THREADS)
         i = thread_id
         while i < fx.Int32(num_memset_int):
@@ -525,6 +540,7 @@ def _make_dispatch(
     warps_per_rank = threads_per_rank // WARP_SIZE
     num_experts_per_rank = num_experts // num_ranks if num_topk > 0 else 0
     assert num_topk <= WARP_SIZE
+    copy_piece_bytes = dispatch_copy_piece_bytes(num_channels)
     layout, _ = dispatch_buffer_layout(
         num_ranks, num_channels, num_recv_buffer_tokens, hidden_bytes, num_topk, topk_idx_bytes, num_scales
     )
@@ -560,27 +576,24 @@ def _make_dispatch(
         thread_in_group = thread_id % fx.Int32(threads_per_rank)
         warp_in_group = thread_in_group // fx.Int32(WARP_SIZE)
         channel = block_id // fx.Int32(2)
-        lds_base = _lds_base()
+        lds = lds_base()
         buffer_ptrs_res = create_buffer_resource(BUFFER_PTRS, max_size=True)
         local = _load_ptr(buffer_ptrs_res, rank)
 
         if thread_id < fx.Int32(2 * num_ranks):
-            _st_lds(lds_base, thread_id, fx.Int32(0))
+            st_lds(lds, thread_id, fx.Int32(0))
         fx.gpu.barrier()
 
         if block_id % fx.Int32(2) == fx.Int32(0):
             # ---- sender: this group feeds `group`'s ring for (channel, rank) ----
             peer = _load_ptr(buffer_ptrs_res, group)
             slot = channel * fx.Int32(num_ranks) + rank
-            start_offset_addr = _addr(peer, layout["start_offset"], slot, 4)
-            end_offset_addr = _addr(peer, layout["end_offset"], slot, 4)
-            head_addr = _addr(peer, layout["head"], slot, 4)
-            tail_addr = _addr(peer, layout["tail"], slot, 4)
-            x_ring = _addr(peer, layout["x"], slot, num_recv_buffer_tokens * hidden_bytes)
-            src_idx_ring = create_buffer_resource_from_addr(
-                _addr(peer, layout["src_idx"], slot, num_recv_buffer_tokens * 4),
-                num_records_bytes=num_recv_buffer_tokens * 4,
-            )
+            start_offset_addr = _region(peer, layout, "start_offset", slot)
+            end_offset_addr = _region(peer, layout, "end_offset", slot)
+            head_addr = _region(peer, layout, "head", slot)
+            tail_addr = _region(peer, layout, "tail", slot)
+            x_ring = _region(peer, layout, "x", slot)
+            src_idx_ring = _region_res(peer, layout, "src_idx", slot)
             in_rank_res = create_buffer_resource(IS_TOKEN_IN_RANK, max_size=True)
             send_head_res = create_buffer_resource(SEND_HEAD, max_size=True)
             x_base = tensor_addr(X)
@@ -590,9 +603,9 @@ def _make_dispatch(
                 prefix_res = create_buffer_resource(CHANNEL_PREFIX_MATRIX, max_size=True)
                 prefix_row = group * fx.Int32(num_channels)
                 prev_channel = arith.select(channel > fx.Int32(0), channel - fx.Int32(1), fx.Int32(0))
-                start_value = buffer_load(prefix_res, prefix_row + prev_channel, vec_width=1, dtype=fx.T.i32)
+                start_value = load_i32(prefix_res, prefix_row + prev_channel)
                 start_value = arith.select(channel > fx.Int32(0), start_value, fx.Int32(0))
-                end_value = buffer_load(prefix_res, prefix_row + channel, vec_width=1, dtype=fx.T.i32)
+                end_value = load_i32(prefix_res, prefix_row + channel)
                 _st_sys(start_offset_addr, 0, fx.Int32(-1) - start_value)
                 _st_sys(end_offset_addr, 0, fx.Int32(-1) - end_value)
 
@@ -606,7 +619,7 @@ def _make_dispatch(
                 if fx.Int32(num_recv_buffer_tokens) - (tail - prefetched_head) < fx.Int32(
                     num_max_send_tokens
                 ):
-                    prefetched_head = _uniform(
+                    prefetched_head = _readfirstlane_i32(
                         wait_free_slots(
                             head_addr,
                             tail,
@@ -634,7 +647,7 @@ def _make_dispatch(
                                 _addr(x_ring, 0, dst_slot, hidden_bytes),
                                 _addr(x_base, 0, token, hidden_bytes),
                                 hidden_bytes,
-                                dispatch_copy_piece_bytes(num_channels),
+                                copy_piece_bytes,
                             )
                             if lane_id == fx.Int32(0):
                                 buffer_store(token, src_idx_ring, dst_slot)
@@ -642,24 +655,8 @@ def _make_dispatch(
                                 if lane_id < fx.Int32(num_topk):
                                     topk_idx_res = create_buffer_resource(TOPK_IDX, max_size=True)
                                     topk_weights_res = create_buffer_resource(TOPK_WEIGHTS, max_size=True)
-                                    topk_idx_ring = create_buffer_resource_from_addr(
-                                        _addr(
-                                            peer,
-                                            layout["topk_idx"],
-                                            slot,
-                                            num_recv_buffer_tokens * num_topk * topk_idx_bytes,
-                                        ),
-                                        num_records_bytes=num_recv_buffer_tokens * num_topk * topk_idx_bytes,
-                                    )
-                                    topk_weights_ring = create_buffer_resource_from_addr(
-                                        _addr(
-                                            peer,
-                                            layout["topk_weights"],
-                                            slot,
-                                            num_recv_buffer_tokens * num_topk * 4,
-                                        ),
-                                        num_records_bytes=num_recv_buffer_tokens * num_topk * 4,
-                                    )
+                                    topk_idx_ring = _region_res(peer, layout, "topk_idx", slot)
+                                    topk_weights_ring = _region_res(peer, layout, "topk_weights", slot)
                                     elem = token * fx.Int32(num_topk) + lane_id
                                     ring_elem = dst_slot * fx.Int32(num_topk) + lane_id
                                     # the expert as a local index of `group`, -1 elsewhere
@@ -670,7 +667,7 @@ def _make_dispatch(
                                     )
                                     local_expert = arith.select(is_local, expert - expert_begin, fx.Int32(-1))
                                     if fx.const_expr(topk_idx_bytes == 8):
-                                        buffer_store(to_i64(local_expert), topk_idx_ring, ring_elem)
+                                        buffer_store(_i64(local_expert), topk_idx_ring, ring_elem)
                                     else:
                                         buffer_store(local_expert, topk_idx_ring, ring_elem)
                                     weight = buffer_load(topk_weights_res, elem, vec_width=1, dtype=fx.T.f32)
@@ -681,23 +678,13 @@ def _make_dispatch(
                                     )
                             if fx.const_expr(num_scales > 0):
                                 x_scales_res = create_buffer_resource(X_SCALES, max_size=True)
-                                x_scales_ring = create_buffer_resource_from_addr(
-                                    _addr(
-                                        peer,
-                                        layout["x_scales"],
-                                        slot,
-                                        num_recv_buffer_tokens * num_scales * 4,
-                                    ),
-                                    num_records_bytes=num_recv_buffer_tokens * num_scales * 4,
-                                )
+                                x_scales_ring = _region_res(peer, layout, "x_scales", slot)
                                 for u in range_constexpr((num_scales + WARP_SIZE - 1) // WARP_SIZE):
                                     scale_idx = lane_id + fx.Int32(u * WARP_SIZE)
                                     if scale_idx < fx.Int32(num_scales):
-                                        value = buffer_load(
+                                        value = load_i32(
                                             x_scales_res,
                                             token * scale_token_stride + scale_idx * scale_hidden_stride,
-                                            vec_width=1,
-                                            dtype=fx.T.i32,
                                         )
                                         buffer_store(
                                             value, x_scales_ring, dst_slot * fx.Int32(num_scales) + scale_idx
@@ -706,29 +693,31 @@ def _make_dispatch(
                     token = token + fx.Int32(1)
 
                 # read the next round's head here, so the publish wait covers it too
-                prefetched_head = _uniform(_ld_sys(head_addr))
-                num_arrived = group_barrier(lds_base, group, num_arrived, warps_per_rank, True)
+                prefetched_head = _readfirstlane_i32(_ld_sys(head_addr))
+                num_arrived = group_barrier(lds, group, num_arrived, warps_per_rank, True)
                 if (warp_in_group == fx.Int32(0)) & (lane_id == fx.Int32(0)):
                     _st_sys(tail_addr, 0, tail)
         else:
             # ---- receiver: this group drains the ring `group` fills for (channel, us) ----
             slot = channel * fx.Int32(num_ranks) + group
-            start_offset_addr = _addr(local, layout["start_offset"], slot, 4)
-            end_offset_addr = _addr(local, layout["end_offset"], slot, 4)
-            head_addr = _addr(local, layout["head"], slot, 4)
-            tail_addr = _addr(local, layout["tail"], slot, 4)
-            x_ring = _addr(local, layout["x"], slot, num_recv_buffer_tokens * hidden_bytes)
-            src_idx_ring = _addr(local, layout["src_idx"], slot, num_recv_buffer_tokens * 4)
+            start_offset_addr = _region(local, layout, "start_offset", slot)
+            end_offset_addr = _region(local, layout, "end_offset", slot)
+            head_addr = _region(local, layout, "head", slot)
+            tail_addr = _region(local, layout, "tail", slot)
+            x_ring = _region(local, layout, "x", slot)
+            src_idx_ring = _region(local, layout, "src_idx", slot)
             recv_x_base = tensor_addr(RECV_X)
             recv_src_idx_res = create_buffer_resource(RECV_SRC_IDX, max_size=True)
 
             rank_offset = fx.Int32(0)
             if group > fx.Int32(0):
-                rank_offset = _uniform(_ld_sys(local, (group - fx.Int32(1)) * fx.Int32(num_ranks) + rank))
-            total_offset = fx.Int32(-1) - _uniform(
+                rank_offset = _readfirstlane_i32(
+                    _ld_sys(local, (group - fx.Int32(1)) * fx.Int32(num_ranks) + rank)
+                )
+            total_offset = fx.Int32(-1) - _readfirstlane_i32(
                 wait_nonzero_sys(start_offset_addr, rank, channel, "dispatch/start")
             )
-            num_tokens_to_recv = fx.Int32(-1) - _uniform(
+            num_tokens_to_recv = fx.Int32(-1) - _readfirstlane_i32(
                 wait_nonzero_sys(end_offset_addr, rank, channel, "dispatch/end")
             )
             num_tokens_to_recv = num_tokens_to_recv - total_offset
@@ -744,9 +733,9 @@ def _make_dispatch(
                 if warp_in_group == fx.Int32(0):
                     new_tail = wait_new_tail(tail_addr, head, rank, channel, "dispatch")
                     if lane_id == fx.Int32(0):
-                        _st_lds(lds_base, fx.Int32(lds_shared_tail) + group, new_tail)
-                num_arrived = group_barrier(lds_base, group, num_arrived, warps_per_rank)
-                tail = _uniform(_ld_lds(lds_base, fx.Int32(lds_shared_tail) + group))
+                        st_lds(lds, fx.Int32(lds_shared_tail) + group, new_tail)
+                num_arrived = group_barrier(lds, group, num_arrived, warps_per_rank)
+                tail = _readfirstlane_i32(ld_lds(lds, fx.Int32(lds_shared_tail) + group))
                 num_recv = tail - head
 
                 chunk = warp_in_group
@@ -756,7 +745,7 @@ def _make_dispatch(
                         _addr(recv_x_base, 0, total_offset + chunk, hidden_bytes),
                         _addr(x_ring, 0, ring_slot, hidden_bytes),
                         hidden_bytes,
-                        dispatch_copy_piece_bytes(num_channels),
+                        copy_piece_bytes,
                         load_cache_modifier=SYS_LOAD,
                     )
                     chunk = chunk + fx.Int32(warps_per_rank)
@@ -766,12 +755,8 @@ def _make_dispatch(
                     buffer_store(value, recv_src_idx_res, total_offset + i)
                     i = i + fx.Int32(threads_per_rank)
                 if fx.const_expr(num_topk > 0):
-                    topk_idx_ring = _addr(
-                        local, layout["topk_idx"], slot, num_recv_buffer_tokens * num_topk * topk_idx_bytes
-                    )
-                    topk_weights_ring = _addr(
-                        local, layout["topk_weights"], slot, num_recv_buffer_tokens * num_topk * 4
-                    )
+                    topk_idx_ring = _region(local, layout, "topk_idx", slot)
+                    topk_weights_ring = _region(local, layout, "topk_weights", slot)
                     recv_topk_idx_res = create_buffer_resource(RECV_TOPK_IDX, max_size=True)
                     recv_topk_weights_res = create_buffer_resource(RECV_TOPK_WEIGHTS, max_size=True)
                     i = thread_in_group
@@ -792,9 +777,7 @@ def _make_dispatch(
                         )
                         i = i + fx.Int32(threads_per_rank)
                 if fx.const_expr(num_scales > 0):
-                    x_scales_ring = _addr(
-                        local, layout["x_scales"], slot, num_recv_buffer_tokens * num_scales * 4
-                    )
+                    x_scales_ring = _region(local, layout, "x_scales", slot)
                     recv_x_scales_res = create_buffer_resource(RECV_X_SCALES, max_size=True)
                     i = thread_in_group
                     while i < num_recv * fx.Int32(num_scales):
@@ -811,7 +794,7 @@ def _make_dispatch(
 
                 head = head + num_recv
                 total_offset = total_offset + num_recv
-                num_arrived = group_barrier(lds_base, group, num_arrived, warps_per_rank)
+                num_arrived = group_barrier(lds, group, num_arrived, warps_per_rank)
                 if (warp_in_group == fx.Int32(warps_per_rank - 1)) & (lane_id == fx.Int32(0)):
                     _st_sys(head_addr, 0, head)
                 num_tokens_to_recv = num_tokens_to_recv - num_recv
@@ -940,7 +923,7 @@ def _make_cached_notify_combine(num_ranks, num_channels, num_memset_int, num_thr
                     token = token_tail - lane_id
                     is_valid = token >= token_start
                     elem = arith.select(is_valid, token, token_start) * fx.Int32(num_ranks) + dst_rank
-                    head = buffer_load(send_head_res, elem, vec_width=1, dtype=fx.T.i32)
+                    head = load_i32(send_head_res, elem)
                     head = arith.select(is_valid, head, fx.Int32(-1))
                     expected_head = fx.Int32(0)
                     # lane i holds token_tail - i, so walking lanes upward walks tokens backward
@@ -998,6 +981,7 @@ def _make_combine(
     warps_per_rank = NUM_WARPS // num_ranks
     num_reduce_warps = NUM_WARPS - 1
     layout, _ = combine_buffer_layout(num_ranks, num_channels, num_recv_buffer_tokens, hidden_bytes, num_topk)
+    copy_piece_bytes = combine_copy_piece_bytes(num_channels)
     # LDS: [num_ranks] group barrier counters, [NUM_WARPS][num_ranks] per-warp heads,
     # [num_ranks] queue tails, [NUM_WARPS] retired flags
     lds_warp_head = num_ranks
@@ -1031,12 +1015,12 @@ def _make_combine(
         lane_id = thread_id % fx.Int32(WARP_SIZE)
         warp_id = thread_id // fx.Int32(WARP_SIZE)
         channel = block_id // fx.Int32(2)
-        lds_base = _lds_base()
+        lds = lds_base()
         buffer_ptrs_res = create_buffer_resource(BUFFER_PTRS, max_size=True)
 
         i = thread_id
         while i < fx.Int32(lds_words):
-            _st_lds(lds_base, i, fx.Int32(0))
+            st_lds(lds, i, fx.Int32(0))
             i = i + fx.Int32(NUM_THREADS)
         fx.gpu.barrier()
 
@@ -1046,13 +1030,10 @@ def _make_combine(
             warp_in_rank = warp_id // fx.Int32(num_ranks)
             peer = _load_ptr(buffer_ptrs_res, send_rank)
             slot = channel * fx.Int32(num_ranks) + rank
-            head_addr = _addr(peer, layout["head"], slot, 4)
-            tail_addr = _addr(peer, layout["tail"], slot, 4)
-            x_ring = _addr(peer, layout["x"], slot, num_recv_buffer_tokens * hidden_bytes)
-            src_idx_ring = create_buffer_resource_from_addr(
-                _addr(peer, layout["src_idx"], slot, num_recv_buffer_tokens * 4),
-                num_records_bytes=num_recv_buffer_tokens * 4,
-            )
+            head_addr = _region(peer, layout, "head", slot)
+            tail_addr = _region(peer, layout, "tail", slot)
+            x_ring = _region(peer, layout, "x", slot)
+            src_idx_ring = _region_res(peer, layout, "src_idx", slot)
             x_base = tensor_addr(X)
             src_idx_res = create_buffer_resource(SRC_IDX, max_size=True)
 
@@ -1060,39 +1041,20 @@ def _make_combine(
             channel_prefix_res = create_buffer_resource(CHANNEL_PREFIX_MATRIX, max_size=True)
             rank_offset = fx.Int32(0)
             if send_rank > fx.Int32(0):
-                rank_offset = _uniform(
-                    buffer_load(
-                        rank_prefix_res,
-                        (send_rank - fx.Int32(1)) * fx.Int32(num_ranks) + rank,
-                        vec_width=1,
-                        dtype=fx.T.i32,
-                    )
+                rank_offset = _readfirstlane_i32(
+                    load_i32(rank_prefix_res, (send_rank - fx.Int32(1)) * fx.Int32(num_ranks) + rank)
                 )
             num_rank_tokens = (
-                _uniform(
-                    buffer_load(
-                        rank_prefix_res, send_rank * fx.Int32(num_ranks) + rank, vec_width=1, dtype=fx.T.i32
-                    )
-                )
+                _readfirstlane_i32(load_i32(rank_prefix_res, send_rank * fx.Int32(num_ranks) + rank))
                 - rank_offset
             )
-            channel_offset = _uniform(
-                buffer_load(
-                    channel_prefix_res,
-                    send_rank * fx.Int32(num_channels) + channel,
-                    vec_width=1,
-                    dtype=fx.T.i32,
-                )
+            channel_offset = _readfirstlane_i32(
+                load_i32(channel_prefix_res, send_rank * fx.Int32(num_channels) + channel)
             )
             channel_end = num_rank_tokens
             if channel < fx.Int32(num_channels - 1):
-                channel_end = _uniform(
-                    buffer_load(
-                        channel_prefix_res,
-                        send_rank * fx.Int32(num_channels) + channel + fx.Int32(1),
-                        vec_width=1,
-                        dtype=fx.T.i32,
-                    )
+                channel_end = _readfirstlane_i32(
+                    load_i32(channel_prefix_res, send_rank * fx.Int32(num_channels) + channel + fx.Int32(1))
                 )
             token = rank_offset + channel_offset
             token_end = rank_offset + channel_end
@@ -1107,7 +1069,7 @@ def _make_combine(
                     fx.Int32(num_max_send_tokens),
                 )
                 if fx.Int32(num_recv_buffer_tokens) - (tail - prefetched_head) < num_round_tokens:
-                    prefetched_head = _uniform(
+                    prefetched_head = _readfirstlane_i32(
                         wait_free_slots(
                             head_addr,
                             tail,
@@ -1125,23 +1087,18 @@ def _make_combine(
                         _addr(x_ring, 0, dst_slot, hidden_bytes),
                         _addr(x_base, 0, token + i, hidden_bytes),
                         hidden_bytes,
-                        combine_copy_piece_bytes(num_channels),
+                        copy_piece_bytes,
                     )
                     if lane_id == fx.Int32(0):
                         buffer_store(
-                            buffer_load(src_idx_res, token + i, vec_width=1, dtype=fx.T.i32),
+                            load_i32(src_idx_res, token + i),
                             src_idx_ring,
                             dst_slot,
                         )
                     if fx.const_expr(num_topk > 0):
                         if lane_id < fx.Int32(num_topk):
                             topk_weights_res = create_buffer_resource(TOPK_WEIGHTS, max_size=True)
-                            topk_weights_ring = create_buffer_resource_from_addr(
-                                _addr(
-                                    peer, layout["topk_weights"], slot, num_recv_buffer_tokens * num_topk * 4
-                                ),
-                                num_records_bytes=num_recv_buffer_tokens * num_topk * 4,
-                            )
+                            topk_weights_ring = _region_res(peer, layout, "topk_weights", slot)
                             weight = buffer_load(
                                 topk_weights_res,
                                 (token + i) * fx.Int32(num_topk) + lane_id,
@@ -1153,8 +1110,8 @@ def _make_combine(
                 token = token + num_round_tokens
                 tail = tail + num_round_tokens
 
-                prefetched_head = _uniform(_ld_sys(head_addr))
-                num_arrived = group_barrier(lds_base, send_rank, num_arrived, warps_per_rank, True)
+                prefetched_head = _readfirstlane_i32(_ld_sys(head_addr))
+                num_arrived = group_barrier(lds, send_rank, num_arrived, warps_per_rank, True)
                 if (warp_in_rank == fx.Int32(0)) & (lane_id == fx.Int32(0)):
                     _st_sys(tail_addr, 0, tail)
         else:
@@ -1162,35 +1119,26 @@ def _make_combine(
             if warp_id == fx.Int32(0):
                 # ---- queue-head updater: lane r tracks rank r's ring ----
                 if lane_id < fx.Int32(num_ranks):
-                    head_addr = _addr(local, layout["head"], channel * fx.Int32(num_ranks) + lane_id, 4)
-                    tail_addr = _addr(local, layout["tail"], channel * fx.Int32(num_ranks) + lane_id, 4)
+                    head_addr = _region(local, layout, "head", channel * fx.Int32(num_ranks) + lane_id)
+                    tail_addr = _region(local, layout, "tail", channel * fx.Int32(num_ranks) + lane_id)
                     last_head = fx.Int32(0)
-                    num_retired = fx.Int32(0)
-                    for w in range_constexpr(1, NUM_WARPS):
-                        num_retired = num_retired + _ld_lds(lds_base, lds_retired + w)
+                    num_retired = _sum_lds(lds, lds_retired + 1, num_reduce_warps)
                     while num_retired < fx.Int32(num_reduce_warps):
                         fx.rocdl.s_waitcnt(0)
-                        _st_lds(lds_base, fx.Int32(lds_tail) + lane_id, _ld_sys(tail_addr))
+                        st_lds(lds, fx.Int32(lds_tail) + lane_id, _ld_sys(tail_addr))
                         min_head = fx.Int32(_INT_MAX)
                         for w in range_constexpr(1, NUM_WARPS):
-                            warp_head = _ld_lds(lds_base, fx.Int32(lds_warp_head + w * num_ranks) + lane_id)
-                            is_live = _ld_lds(lds_base, lds_retired + w) == fx.Int32(0)
+                            warp_head = ld_lds(lds, fx.Int32(lds_warp_head + w * num_ranks) + lane_id)
+                            is_live = ld_lds(lds, lds_retired + w) == fx.Int32(0)
                             min_head = arith.select(is_live & (warp_head < min_head), warp_head, min_head)
                         if (min_head != fx.Int32(_INT_MAX)) & (min_head > last_head):
                             last_head = min_head
                             _st_sys(head_addr, 0, min_head)
-                        num_retired = fx.Int32(0)
-                        for w in range_constexpr(1, NUM_WARPS):
-                            num_retired = num_retired + _ld_lds(lds_base, lds_retired + w)
+                        num_retired = _sum_lds(lds, lds_retired + 1, num_reduce_warps)
             else:
                 # ---- reducers: one token per warp, summed over the ranks it went to ----
                 x_rings = [
-                    _addr(
-                        local,
-                        layout["x"],
-                        channel * fx.Int32(num_ranks) + fx.Int32(r),
-                        num_recv_buffer_tokens * hidden_bytes,
-                    )
+                    _region(local, layout, "x", channel * fx.Int32(num_ranks) + fx.Int32(r))
                     for r in range(num_ranks)
                 ]
                 send_head_res = create_buffer_resource(SEND_HEAD, max_size=True)
@@ -1203,15 +1151,11 @@ def _make_combine(
                 token_start, token_end = _channel_task_range(num_recv_tokens, num_channels, channel)
                 token = token_start + warp_id - fx.Int32(1)
                 while token < token_end:
-                    expected_head = buffer_load(
-                        send_head_res, token * fx.Int32(num_ranks) + lane_rank, vec_width=1, dtype=fx.T.i32
-                    )
+                    expected_head = load_i32(send_head_res, token * fx.Int32(num_ranks) + lane_rank)
                     expected_head = arith.select(lane_id < fx.Int32(num_ranks), expected_head, fx.Int32(-1))
                     spin_start = read_clock()
-                    pending = (expected_head >= fx.Int32(0)) & (
-                        _ld_lds(lds_base, fx.Int32(lds_tail) + lane_rank) <= expected_head
-                    )
-                    while _any_lane(pending):
+                    pending = _waits_on_tail(lds, lds_tail, lane_rank, expected_head)
+                    while _wave_any(pending):
                         if spin_timed_out(spin_start):
                             if lane_id == fx.Int32(0):
                                 fx.printf(
@@ -1221,9 +1165,7 @@ def _make_combine(
                                     token,
                                 )
                             spin_start = read_clock()
-                        pending = (expected_head >= fx.Int32(0)) & (
-                            _ld_lds(lds_base, fx.Int32(lds_tail) + lane_rank) <= expected_head
-                        )
+                        pending = _waits_on_tail(lds, lds_tail, lane_rank, expected_head)
 
                     # rank r's copy of the token, or an empty resource whose loads read 0
                     row_resources = []
@@ -1264,24 +1206,16 @@ def _make_combine(
                         ]
                         sums = [None] * len(cols)
                         # bias_0 + bias_1 first, then the ranks in ascending order, as the HIP kernel adds them
-                        for bias_res in bias_resources:
-                            values = [
-                                buffer_load(bias_res, col, vec_width=vec_elems, dtype=in_dtype)
-                                for col in cols
-                            ]
-                            for k, value in enumerate(values):
-                                term = (
-                                    value if fx.const_expr(elem_bytes == 4) else fx.arith.extf(f32_vec, value)
-                                )
-                                sums[k] = term if sums[k] is None else fx.arith.addf(sums[k], term)
-                        for r in range_constexpr(num_ranks):
+                        sources = [(res, 0) for res in bias_resources]
+                        sources += [(row_resources[r], SYS_LOAD) for r in range(num_ranks)]
+                        for res, cache_modifier in sources:
                             values = [
                                 buffer_load(
-                                    row_resources[r],
+                                    res,
                                     col,
                                     vec_width=vec_elems,
                                     dtype=in_dtype,
-                                    cache_modifier=SYS_LOAD,
+                                    cache_modifier=cache_modifier,
                                 )
                                 for col in cols
                             ]
@@ -1302,11 +1236,8 @@ def _make_combine(
                         if lane_id < fx.Int32(num_topk):
                             weight = fx.Float32(0.0)
                             for r in range_constexpr(num_ranks):
-                                weights_ring = _addr(
-                                    local,
-                                    layout["topk_weights"],
-                                    channel * fx.Int32(num_ranks) + fx.Int32(r),
-                                    num_recv_buffer_tokens * num_topk * 4,
+                                weights_ring = _region(
+                                    local, layout, "topk_weights", channel * fx.Int32(num_ranks) + fx.Int32(r)
                                 )
                                 value = _ld_sys(
                                     weights_ring, ring_slots[r] * fx.Int32(num_topk) + lane_id, dtype=fx.T.f32
@@ -1321,15 +1252,15 @@ def _make_combine(
                             fx.Int32(-1) - expected_head,
                             expected_head + fx.Int32(1),
                         )
-                        _st_lds(
-                            lds_base,
+                        st_lds(
+                            lds,
                             warp_id * fx.Int32(num_ranks) + fx.Int32(lds_warp_head) + lane_id,
                             next_head,
                         )
                     token = token + fx.Int32(num_reduce_warps)
 
                 if lane_id == fx.Int32(0):
-                    _st_lds(lds_base, fx.Int32(lds_retired) + warp_id, fx.Int32(1))
+                    st_lds(lds, fx.Int32(lds_retired) + warp_id, fx.Int32(1))
 
     return combine_kernel, lds_words
 

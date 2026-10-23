@@ -17,17 +17,17 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl.expr import arith, range_constexpr
-from flydsl.expr.primitive import get_dyn_shared
-from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
-from primus_turbo.flydsl.deep_ep.common import load_index, run_launcher
-from primus_turbo.flydsl.utils.buffer_ops import (
-    _unwrap_value,
-    buffer_store,
-    create_buffer_resource,
-    extract_base_index,
+from primus_turbo.flydsl.deep_ep.common import (
+    ld_lds,
+    lds_base,
+    load_index,
+    st_lds,
+    tensor_addr,
 )
-from primus_turbo.flydsl.utils.prims import atomic_add, ld, st
+from primus_turbo.flydsl.utils.buffer_ops import buffer_store, create_buffer_resource
+from primus_turbo.flydsl.utils.launch_cache import run_launcher
+from primus_turbo.flydsl.utils.prims import atomic_add
 
 _THREADS = 256
 
@@ -49,14 +49,14 @@ def _make_layout_kernel(num_topk: int, num_ranks: int, num_experts: int):
         thread_id = fx.thread_idx.x
         block_id = fx.block_idx.x
         # LDS: [num_experts] expert counts, then [num_ranks] rank counts
-        lds_base = _unwrap_value(_fly_ptrtoint(get_dyn_shared()))
-        counts_base = extract_base_index(COUNTS, address_space=1)
+        lds = lds_base()
+        counts_base = tensor_addr(COUNTS)
         topk_res = create_buffer_resource(TOPK_IDX, max_size=True)
         in_rank_res = create_buffer_resource(IS_TOKEN_IN_RANK, max_size=True)
 
         i = thread_id
         while i < fx.Int32(num_counts):
-            st(lds_base, i, fx.Int32(0), scope="workgroup", space=3)
+            st_lds(lds, i, fx.Int32(0))
             i = i + fx.Int32(_THREADS)
         fx.gpu.barrier()
 
@@ -66,7 +66,7 @@ def _make_layout_kernel(num_topk: int, num_ranks: int, num_experts: int):
             for j in range_constexpr(num_topk):
                 expert = load_index(topk_res, token * fx.Int32(num_topk) + fx.Int32(j), TOPK_IDX.element_type)
                 if (expert >= fx.Int32(0)) & (expert < fx.Int32(num_experts)):
-                    atomic_add(lds_base, expert, fx.Int32(1), "workgroup", 3)
+                    atomic_add(lds, expert, fx.Int32(1), "workgroup", 3)
                 is_rank_expert = (expert >= fx.Int32(0)) & (expert < fx.Int32(rank_expert_end))
                 rank_of.append(
                     arith.select(is_rank_expert, expert // fx.Int32(num_experts_per_rank), fx.Int32(-1))
@@ -78,7 +78,7 @@ def _make_layout_kernel(num_topk: int, num_ranks: int, num_experts: int):
                 for k in range_constexpr(j):
                     is_first = is_first & (rank_of[k] != rank_of[j])
                 if is_first:
-                    atomic_add(lds_base, fx.Int32(num_experts) + rank_of[j], fx.Int32(1), "workgroup", 3)
+                    atomic_add(lds, fx.Int32(num_experts) + rank_of[j], fx.Int32(1), "workgroup", 3)
 
             def in_rank(r):
                 hit = rank_of[0] == fx.Int32(r)
@@ -102,7 +102,7 @@ def _make_layout_kernel(num_topk: int, num_ranks: int, num_experts: int):
         # one global add per non-zero block count; integer adds keep the result deterministic
         i = thread_id
         while i < fx.Int32(num_counts):
-            count = ld(lds_base, i, scope="workgroup", space=3)
+            count = ld_lds(lds, i)
             if count != fx.Int32(0):
                 atomic_add(counts_base, i, count, "agent", 1)
             i = i + fx.Int32(_THREADS)
@@ -142,7 +142,6 @@ def get_dispatch_layout_flydsl(topk_idx: torch.Tensor, num_ranks: int, num_exper
         in_rank_bytes = is_token_in_rank.view(torch.uint8)
         run_launcher(
             _launch_dispatch_layout,
-            (num_topk, num_ranks, num_experts),
             topk_idx,
             counts,
             in_rank_bytes.view(torch.int32) if num_ranks % 4 == 0 else in_rank_bytes,

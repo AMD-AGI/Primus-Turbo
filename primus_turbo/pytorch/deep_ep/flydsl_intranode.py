@@ -17,13 +17,14 @@ It owns its own uncached HIP-IPC heap; the handles it returns are plain tensors 
 are interchangeable with the C++ backend's.
 """
 
+import contextlib
 import os
 from typing import Optional
 
 import torch
 import torch.distributed as dist
 
-from primus_turbo.flydsl.deep_ep.common import run_launcher
+from primus_turbo.common.constants import ENV_EP_FORCE_CURRENT_STREAM
 from primus_turbo.flydsl.deep_ep.intranode_kernel import (
     combine_buffer_layout,
     dispatch_buffer_layout,
@@ -34,6 +35,7 @@ from primus_turbo.flydsl.deep_ep.intranode_kernel import (
     launch_notify_dispatch,
 )
 from primus_turbo.flydsl.deep_ep.layout_kernel import get_dispatch_layout_flydsl
+from primus_turbo.flydsl.utils.launch_cache import run_launcher
 from primus_turbo.pytorch._C.deep_ep import EventHandle
 from primus_turbo.pytorch.core.symm_mem import SymmetricMemory
 
@@ -68,8 +70,7 @@ class FlyDSLIntranodeRuntime:
         _check(num_nvl_bytes > 0, "the FlyDSL intranode backend needs num_nvl_bytes > 0")
         self.num_nvl_bytes = num_nvl_bytes
         self.comm_stream = comm_stream
-        self.force_current_stream = int(os.environ.get("PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM", "0")) != 0
-        self.cpu_timeout_secs = int(os.environ.get("PRIMUS_TURBO_DEEPEP_CPU_TIMEOUT", "100") or "100")
+        self.force_current_stream = int(os.environ.get(ENV_EP_FORCE_CURRENT_STREAM, "0")) != 0
 
         # The channel protocol leans on every heap access bypassing L2, as the C++
         # buffer's hipDeviceMallocUncached does; the barrier signals likewise.
@@ -135,8 +136,10 @@ class FlyDSLIntranodeRuntime:
                     t.record_stream(compute_stream)
         return event
 
-    def _alloc_stream(self, launch_stream, cross_stream_allocation):
-        return torch.cuda.stream(launch_stream if cross_stream_allocation else torch.cuda.current_stream())
+    @staticmethod
+    def _alloc_stream(launch_stream, cross_stream_allocation):
+        # allocations follow the launch stream only for allocate_on_comm_stream
+        return torch.cuda.stream(launch_stream) if cross_stream_allocation else contextlib.nullcontext()
 
     # ── layout ───────────────────────────────────────────────────────────────
 
@@ -250,7 +253,6 @@ class FlyDSLIntranodeRuntime:
                 channel_prefix_matrix = cached_channel_prefix_matrix
                 run_launcher(
                     launch_cached_notify_dispatch,
-                    (num_ranks, num_memset_int),
                     rank_prefix_matrix,
                     self.buffer_ptrs,
                     self.barrier_ptrs,
@@ -270,7 +272,6 @@ class FlyDSLIntranodeRuntime:
                 )
                 run_launcher(
                     launch_notify_dispatch,
-                    (num_ranks, num_experts, num_channels, num_memset_int, expert_alignment),
                     num_tokens_per_rank,
                     num_tokens_per_expert,
                     is_token_in_rank_u8,
@@ -337,17 +338,6 @@ class FlyDSLIntranodeRuntime:
         dummy_f32 = dummy_i32.view(torch.float32)
         run_launcher(
             launch_dispatch,
-            (
-                num_ranks,
-                num_channels,
-                hidden_bytes,
-                num_topk,
-                num_experts,
-                num_scales,
-                config.num_max_nvl_chunked_send_tokens,
-                config.num_max_nvl_chunked_recv_tokens,
-                topk_idx_bytes,
-            ),
             recv_x.view(torch.uint8),
             recv_x_scales if recv_x_scales is not None else dummy_i32,
             recv_src_idx,
@@ -449,7 +439,8 @@ class FlyDSLIntranodeRuntime:
         _check(src_idx.size(0) == num_tokens and send_head.size(1) == num_ranks)
         _check(tuple(rank_prefix_matrix.shape) == (num_ranks, num_ranks))
         _check(tuple(channel_prefix_matrix.shape) == (num_ranks, num_channels))
-        _check((hidden * x.element_size()) % 16 == 0, "hidden bytes must be a multiple of 16")
+        hidden_bytes = hidden * x.element_size()
+        _check(hidden_bytes % 16 == 0, "hidden bytes must be a multiple of 16")
 
         compute_stream, launch_stream, cross = self._fork(
             previous_event, async_finish, allocate_on_comm_stream
@@ -474,7 +465,7 @@ class FlyDSLIntranodeRuntime:
             num_ranks,
             num_channels,
             config.num_max_nvl_chunked_recv_tokens,
-            hidden * x.element_size(),
+            hidden_bytes,
             num_topk,
         )
         _check(
@@ -484,7 +475,6 @@ class FlyDSLIntranodeRuntime:
         # barrier, reset the queue heads / tails, and patch send_head for skipped tokens
         run_launcher(
             launch_cached_notify_combine,
-            (num_ranks, num_channels, num_channels * num_ranks * 2),
             send_head,
             self.buffer_ptrs,
             self.barrier_ptrs,
@@ -499,17 +489,6 @@ class FlyDSLIntranodeRuntime:
             dummy_f32 = rank_prefix_matrix.view(torch.float32)
             run_launcher(
                 launch_combine,
-                (
-                    num_ranks,
-                    num_channels,
-                    hidden,
-                    x.element_size(),
-                    num_topk,
-                    config.num_max_nvl_chunked_send_tokens,
-                    config.num_max_nvl_chunked_recv_tokens,
-                    bias_0 is not None,
-                    bias_1 is not None,
-                ),
                 recv_x,
                 recv_topk_weights if recv_topk_weights is not None else dummy_f32,
                 x,
