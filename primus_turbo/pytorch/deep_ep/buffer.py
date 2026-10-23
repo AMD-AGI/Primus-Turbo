@@ -18,6 +18,7 @@ import torch.distributed as dist
 
 import primus_turbo.pytorch._C.deep_ep as deep_ep_cpp
 from primus_turbo.pytorch._C.deep_ep import Config, EventHandle
+from primus_turbo.pytorch.core.utils import is_gfx1250
 
 from .utils import EventOverlap, check_nvlink_connections
 
@@ -265,8 +266,10 @@ class Buffer:
 
         # TODO: automatically tune
         config_map = {
-            2: Config(Buffer.num_sms, 24, 256, 6, 128),
-            4: Config(Buffer.num_sms, 6, 256, 6, 128),
+            # gfx1250 was measured across representative MoE shapes at 32 SMs. The larger
+            # chunk raises 2- and 4-rank dispatch bandwidth while preserving SMs for overlap.
+            2: Config(Buffer.num_sms, 128 if is_gfx1250() else 24, 256, 6, 128),
+            4: Config(Buffer.num_sms, 128 if is_gfx1250() else 6, 256, 6, 128),
             8: Config(Buffer.num_sms, 6, 256, 6, 128),
             16: Config(Buffer.num_sms, 36, 288, 20, 128),
             24: Config(Buffer.num_sms, 8, 288, 32, 128),
@@ -293,8 +296,9 @@ class Buffer:
 
         # TODO: automatically tune
         config_map = {
-            2: Config(Buffer.num_sms, 10, 256, 6, 128),
-            4: Config(Buffer.num_sms, 9, 256, 6, 128),
+            # See get_dispatch_config: keep the existing setting on wave64 parts.
+            2: Config(Buffer.num_sms, 64 if is_gfx1250() else 10, 256, 6, 128),
+            4: Config(Buffer.num_sms, 64 if is_gfx1250() else 9, 256, 6, 128),
             8: Config(Buffer.num_sms, 4, 256, 6, 128),
             16: Config(Buffer.num_sms, 4, 288, 12, 128),
             24: Config(Buffer.num_sms, 1, 288, 8, 128),
