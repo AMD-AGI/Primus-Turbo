@@ -55,6 +55,15 @@ static constexpr uint64_t kSecondHalfMask = 0xffffffff00000000;
 // Nvidia warp width: half a wave64, or a whole wave32
 static constexpr int32_t kEmulatedWarpSize = 32;
 
+// Targets on which `abort()` lowers to a bare `s_trap 2`, so trap() in the deep_ep utils header
+// emits that inline. Elsewhere trap() keeps `abort()` and the compiler's own trap sequence, which
+// can be longer (gfx1100 adds a fallback after the s_trap): check a target before adding it.
+#if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1250__)
+static constexpr bool kInlineTrap = true;
+#else
+static constexpr bool kInlineTrap = false;
+#endif
+
 // Remove Torch restrictions
 #ifdef __CUDA_NO_HALF_CONVERSIONS__
 #undef __CUDA_NO_HALF_CONVERSIONS__
