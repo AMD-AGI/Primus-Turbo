@@ -316,7 +316,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("num_max_nvl_chunked_recv_tokens")  = DEFAULT_NUM_MAX_XGMI_CHUNKED_RECV_TOKENS,
              py::arg("num_max_rdma_chunked_send_tokens") = DEFAULT_NUM_MAX_RDMA_CHUNKED_SEND_TOKENS,
              py::arg("num_max_rdma_chunked_recv_tokens") = DEFAULT_NUM_MAX_RDMA_CHUNKED_RECV_TOKENS)
-        // Read by the FlyDSL intranode backend, which launches from Python.
+        // Readable from Python: the FlyDSL intranode backend launches its kernels from there.
         .def_readonly("num_sms", &primus_turbo::deep_ep::Config::num_sms)
         .def_readonly("num_max_nvl_chunked_send_tokens",
                       &primus_turbo::deep_ep::Config::num_max_nvl_chunked_send_tokens)
