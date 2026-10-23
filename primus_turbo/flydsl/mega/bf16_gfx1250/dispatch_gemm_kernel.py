@@ -33,7 +33,7 @@ from __future__ import annotations
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import rocdl
+from flydsl.expr import const_expr, rocdl
 from flydsl.expr.typing import Constexpr, T
 
 from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
@@ -112,6 +112,8 @@ def _launch_dispatch_gemm_nt(
     if arena_bytes > GFX1250_LDS_BYTES:
         raise ValueError(f"LDS arena {arena_bytes} B exceeds {GFX1250_LDS_BYTES} B")
     num_experts_per_rank = NUM_EXPERTS // NUM_RANKS
+    if DISPATCH_ONLY and num_experts_per_rank > block:
+        raise ValueError(f"the dispatch-only wait gives each of {num_experts_per_rank} experts a lane of {block}")
 
     @flyc.kernel(known_block_size=[64, 1, 1])
     def epoch_bump(arg_parity: fx.Pointer, arg_expected: fx.Pointer):
@@ -188,6 +190,20 @@ def _launch_dispatch_gemm_nt(
         # ---- GEMM role: straight-line for every workgroup, masked by `live` ----
         pid = bid - fx.Int32(NUM_DISPATCH_CU)
         real_tiles = rocdl.readfirstlane(T.i32, _i32_table(arg_num_tile_blocks)[fx.Int32(0)])
+        if const_expr(DISPATCH_ONLY):
+            # No GEMM tile waits on the expert flags, so the one workgroup past the comm ones
+            # holds the launch open until every sender has pushed every expert of this rank: the
+            # caller reads the token buffer next, and a peer's rows may still be in flight.
+            if (pid == fx.Int32(0)) & (fx.Int32(tid) < fx.Int32(num_experts_per_rank)):
+                spin_until_flag_reaches(
+                    dispatch_flag_base,
+                    parity * fx.Int32(num_pool_blocks) + fx.Int32(tid),
+                    expected,
+                    "sys",
+                    RANK,
+                    "dispatch_only",
+                )
+            real_tiles = fx.Int32(0)
         live = (pid >= fx.Int32(0)) & (pid < real_tiles * fx.Int32(N_BLOCKS_N))
         pid = live.select(pid, fx.Int32(0))
         num_pid_in_group = fx.Int32(group_m * N_BLOCKS_N)
@@ -266,7 +282,7 @@ def _launch_dispatch_gemm_nt(
         arg_expected,
         sym_buffer,
     ).launch(
-        grid=(NUM_DISPATCH_CU + (0 if DISPATCH_ONLY else MAX_TILES * N_BLOCKS_N), 1, 1),
+        grid=(NUM_DISPATCH_CU + (1 if DISPATCH_ONLY else MAX_TILES * N_BLOCKS_N), 1, 1),
         block=(block, 1, 1),
         stream=stream,
     )
