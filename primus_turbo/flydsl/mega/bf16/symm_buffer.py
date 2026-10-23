@@ -15,6 +15,7 @@ import ctypes
 import functools
 import hashlib
 import inspect
+from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -80,8 +81,10 @@ class SymBuffer:
         # dims ride each kernel's constexpr, not the handle. The region offsets do not: they come from
         # Workspace, and FlyDSL's disk-cache key hashes the helper functions a kernel calls but not the
         # classes, so without the layout here a layout change replays binaries that address the old
-        # regions -- a grid_sync counter clobbered by a stale prologue, then a hang.
-        return (type(self), self.num_ranks, _workspace_layout_hash())
+        # regions -- a grid_sync counter clobbered by a stale prologue, then a hang. It hashes those
+        # helpers only from the launcher's own directory, so the bf16_gfx1250 launchers would replay
+        # binaries built from an old ep_intranode.py too.
+        return (type(self), self.num_ranks, _workspace_layout_hash(), _ep_intranode_hash())
 
     def __c_abi_spec__(self) -> list:
         def fill_offsets(a, s):
@@ -216,6 +219,12 @@ class Workspace:
 @functools.lru_cache(maxsize=1)
 def _workspace_layout_hash() -> str:
     return hashlib.sha256(inspect.getsource(Workspace).encode()).hexdigest()[:16]
+
+
+@functools.lru_cache(maxsize=1)
+def _ep_intranode_hash() -> str:
+    # read by path: ep_intranode imports this module
+    return hashlib.sha256(Path(__file__).with_name("ep_intranode.py").read_bytes()).hexdigest()[:16]
 
 
 def get_symm_buffer_size_for_mega_moe(
