@@ -721,7 +721,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         int prefetched_channel_head_idx = 0;
         for (int64_t token_idx = token_start_idx; token_idx < token_end_idx;) {
             // Check destination queue emptiness, or wait a buffer to be released (rare cases)
-            auto start_time = wall_clock64();
+            auto start_time = wall_clock_cycles();
             int  num_round_tokens =
                 min(num_max_send_tokens, token_end_idx - static_cast<int>(token_idx));
             bool has_free_slots =
@@ -737,7 +737,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     break;
 
                 // Rare cases to loop again
-                if (wall_clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                if (wall_clock_cycles() - start_time > NUM_TIMEOUT_CYCLES) {
                     printf(
                         "DeepEP timeout for combine senders, rank %d, responsible_channel = %d\n",
                         rank, responsible_channel);
@@ -881,11 +881,11 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 if (lane_id < kNumRanks)
                     expected_head = ld_nc_global(send_head + token_idx * kNumRanks + lane_id);
 
-                auto start_time = wall_clock64();
+                auto start_time = wall_clock_cycles();
                 while (__any_sync(kFullWarpMask, channel_tail_idx[lane_id] <= expected_head and
                                                      expected_head >= 0)) {
                     // Timeout check
-                    if (wall_clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                    if (wall_clock_cycles() - start_time > NUM_TIMEOUT_CYCLES) {
                         printf("DeepEP timeout for combine receivers, rank %d, responsible_channel "
                                "= %d, expect = %d\n",
                                rank, responsible_channel, expected_head);

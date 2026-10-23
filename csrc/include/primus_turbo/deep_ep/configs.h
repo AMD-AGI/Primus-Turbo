@@ -24,6 +24,10 @@
 #define FINISHED_SUM_TAG 1024
 
 #define NUM_CPU_TIMEOUT_SECS 300
+// NUM_TIMEOUT_CYCLES is counted in nominal 2 GHz cycles; the intranode wall-clock timeouts scale
+// the 100 MHz ticks to match (wall_clock_cycles() in the deep_ep utils header).
+// TODO: the internode loops still compare raw wall_clock64() ticks against it, which makes their
+// limit ~6000 s instead of ~300 s.
 #define NUM_TIMEOUT_CYCLES 600000000000ll // 600G cycles ~= 300s
 
 #define NUM_WAIT_NANOSECONDS 500
